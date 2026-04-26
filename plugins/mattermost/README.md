@@ -1,48 +1,108 @@
 # Mattermost Channel
 
-This Claude Code channel plugin connects a self-hosted Mattermost instance to a Claude agent through Agent Bridge.
+This plugin receives messages from a self-hosted Mattermost instance via Outgoing Webhooks and routes them to Agent Bridge agents. Agents respond using the [mattermost-mcp-server](https://github.com/mattermost/mattermost-plugin-agents) `create_post` tool.
+
+## Architecture
+
+```
+Mattermost user → Outgoing Webhook
+  → Plugin server (bridge mode, single port)
+  → Bot mention routing (@sales-bot → sales_mun agent)
+  → agb urgent <agent> (task queue)
+  → Claude agent claims task
+  → mattermost-mcp-server create_post → Mattermost
+```
+
+The plugin server runs as a standalone process (not inside Claude Code). Message reception and response use separate paths:
+
+- **Inbound**: Outgoing Webhook → plugin server → `agb urgent`
+- **Outbound**: Agent uses `mattermost-mcp-server` MCP tools (`create_post`, `read_channel`, etc.)
+
+## Setup
+
+### 1. Mattermost Bot Accounts
+
+Create a bot account per agent in Mattermost System Console:
+
+1. **System Console > Integrations > Bot Accounts > Enable Bot Account Creation**
+2. **Integrations > Bot Accounts > Add Bot Account** for each agent
+3. Copy each bot's **Access Token**
+
+### 2. Outgoing Webhooks
+
+Create one webhook per channel, all pointing to the same plugin server:
+
+1. **Integrations > Outgoing Webhooks > Add Outgoing Webhook**
+2. Callback URL: `http://<host>:3979/hooks/outgoing`
+3. Select the channel to monitor
+4. Repeat for each channel
+
+For localhost development, enable internal connections:
+**System Console > Environment > Developer > Allow untrusted internal connections**: `127.0.0.1 localhost`
+
+### 3. MCP Server for Agents
+
+Build and configure the official Mattermost MCP server:
+
+```bash
+git clone https://github.com/mattermost/mattermost-plugin-agents
+cd mattermost-plugin-agents && make mcp-server
+```
+
+Add `.mcp.json` to each agent's workdir:
+
+```json
+{
+  "mcpServers": {
+    "mattermost": {
+      "command": "/path/to/mattermost-mcp-server",
+      "env": {
+        "MM_SERVER_URL": "http://localhost:8065",
+        "MM_ACCESS_TOKEN": "<bot-access-token>"
+      }
+    }
+  }
+}
+```
+
+### 4. Plugin Server (Bridge Mode)
+
+Create a bot routes file (`bot-routes.json`):
+
+```json
+[
+  {"username": "sales-bot", "token": "<token>", "agent": "sales_mun", "system_prompt": "You are a sales assistant."},
+  {"username": "research-bot", "token": "<token>", "agent": "formulation_research", "system_prompt": "You are a formulation researcher."}
+]
+```
+
+Start the plugin server:
+
+```bash
+MATTERMOST_BRIDGE_MODE=1 \
+MATTERMOST_STANDALONE=1 \
+MATTERMOST_BOT_ROUTES=bot-routes.json \
+MATTERMOST_STATE_DIR=~/.agent-bridge/agents/<agent>/.mattermost \
+MATTERMOST_OUTGOING_WEBHOOK_TOKEN= \
+BRIDGE_HOME=~/.agent-bridge \
+bun plugins/mattermost/server.ts
+```
+
+### 5. Agent Roster
+
+Agents do not need channel plugin flags. Standard launch command is sufficient since MCP tools come from `.mcp.json`:
+
+```bash
+BRIDGE_AGENT_LAUNCH_CMD["sales_mun"]='claude --dangerously-skip-permissions'
+```
 
 ## Runtime Files
 
-By default the plugin reads:
+Per-agent state directory (`~/.agent-bridge/agents/<agent>/.mattermost/`):
 
-- `~/.claude/channels/mattermost/.env`
-- `~/.claude/channels/mattermost/access.json`
-
-When Agent Bridge starts an agent with `plugin:mattermost@agent-bridge`, it sets `MATTERMOST_STATE_DIR` to the agent-local directory, for example:
-
-```bash
-~/.agent-bridge/agents/patch/.mattermost
-```
-
-## Environment
-
-```dotenv
-MATTERMOST_URL=https://mattermost.example.com
-MATTERMOST_BOT_TOKEN=<bot-access-token>
-MATTERMOST_OUTGOING_WEBHOOK_TOKEN=<outgoing-webhook-token>
-MATTERMOST_WEBHOOK_HOST=0.0.0.0
-MATTERMOST_WEBHOOK_PORT=3979
-```
-
-### Bot Account Setup
-
-1. In Mattermost System Console, enable bot accounts: **System Console > Integrations > Bot Accounts > Enable Bot Account Creation**.
-2. Go to **Integrations > Bot Accounts > Add Bot Account**.
-3. Give it a username (e.g. `agent-bridge`) and role.
-4. Copy the generated **Bot Access Token** — this is `MATTERMOST_BOT_TOKEN`.
-
-### Outgoing Webhook Setup
-
-1. Go to **Integrations > Outgoing Webhooks > Add Outgoing Webhook**.
-2. Set the callback URL to `http://<host>:<port>/hooks/outgoing` (e.g. `http://localhost:3979/hooks/outgoing`).
-3. Choose the channel(s) or trigger word(s) to listen on.
-4. Copy the generated **Token** — this is `MATTERMOST_OUTGOING_WEBHOOK_TOKEN`.
-
-## Tools
-
-- `reply`: send a message back to a Mattermost channel that has already passed access control.
-- `fetch_messages`: read the local rolling message log captured by the plugin.
+- `.env`: `MATTERMOST_URL`, `MATTERMOST_BOT_TOKEN`, `MATTERMOST_OUTGOING_WEBHOOK_TOKEN`
+- `access.json`: user allowlists and channel policies
+- `messages.jsonl`: local rolling message log
 
 ## Access
 
@@ -54,17 +114,29 @@ MATTERMOST_WEBHOOK_PORT=3979
   "allowFrom": ["<mattermost-user-id>"],
   "channels": {
     "<channel-id>": {
-      "requireMention": true,
+      "requireMention": false,
       "allowFrom": []
     }
-  },
-  "pending": {},
-  "routes": {}
+  }
 }
 ```
 
-## Current Scope
+## Environment Variables
 
-This is the Phase 1 channel implementation: Outgoing Webhook receive, access gate, Claude channel notification, reply via Bot API, and local message fetch.
+| Variable | Description |
+|---|---|
+| `MATTERMOST_BRIDGE_MODE` | `1` to route messages via `agb urgent` |
+| `MATTERMOST_STANDALONE` | `1` to enable standalone fallback (Claude API/CLI) |
+| `MATTERMOST_BOT_ROUTES` | Path to bot routes JSON for multi-bot routing |
+| `MATTERMOST_STATE_DIR` | Agent-local state directory |
+| `MATTERMOST_WEBHOOK_PORT` | HTTP server port (default: 3979) |
+| `MATTERMOST_OUTGOING_WEBHOOK_TOKEN` | Leave empty to skip token validation |
+| `BRIDGE_HOME` | Agent Bridge home (default: `~/.agent-bridge`) |
 
-If `BRIDGE_PROMPT_GUARD_ENABLED=1` is set in the agent runtime, Mattermost inbound text is scanned before it reaches Claude and outbound `reply` text is sanitized before send.
+## Standalone Fallback
+
+When `MATTERMOST_STANDALONE=1` and bridge-send fails, the plugin falls back to generating a response directly via Claude API (`ANTHROPIC_API_KEY`) or Claude CLI (`claude --print`).
+
+## Prompt Guard
+
+If `BRIDGE_PROMPT_GUARD_ENABLED=1` is set, inbound text is scanned and outbound reply text is sanitized before send.
