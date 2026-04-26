@@ -3135,6 +3135,16 @@ bridge_agent_ms365_state_dir() {
   bridge_agent_default_ms365_state_dir "$agent"
 }
 
+bridge_agent_default_mattermost_state_dir() {
+  local agent="$1"
+  printf '%s/.mattermost' "$(bridge_agent_workdir "$agent")"
+}
+
+bridge_agent_mattermost_state_dir() {
+  local agent="$1"
+  bridge_agent_default_mattermost_state_dir "$agent"
+}
+
 bridge_agent_workdir() {
   local agent="$1"
   local explicit="${BRIDGE_AGENT_WORKDIR[$agent]-}"
@@ -3584,7 +3594,7 @@ bridge_agent_auto_accept_dev_channels_csv() {
     return 0
   fi
 
-  bridge_normalize_channels_csv "${BRIDGE_AUTO_ACCEPT_DEV_CHANNELS_DEFAULT:-plugin:teams@agent-bridge}"
+  bridge_normalize_channels_csv "${BRIDGE_AUTO_ACCEPT_DEV_CHANNELS_DEFAULT:-plugin:teams@agent-bridge,plugin:mattermost@agent-bridge}"
 }
 
 bridge_agent_uses_discord_plugin() {
@@ -3595,6 +3605,11 @@ bridge_agent_uses_discord_plugin() {
 bridge_agent_uses_teams_plugin() {
   local agent="$1"
   bridge_channel_csv_contains "$(bridge_agent_channels_csv "$agent")" "plugin:teams"
+}
+
+bridge_agent_uses_mattermost_plugin() {
+  local agent="$1"
+  bridge_channel_csv_contains "$(bridge_agent_channels_csv "$agent")" "plugin:mattermost"
 }
 
 bridge_agent_discord_channel_from_access() {
@@ -3695,6 +3710,11 @@ bridge_agent_channel_runtime_ready_for_item() {
       bridge_env_file_has_any_nonempty_key "$dir/.env" MS365_CLIENT_SECRET || return 1
       bridge_env_file_has_any_nonempty_key "$dir/.env" MS365_TENANT_ID
       ;;
+    plugin:mattermost|plugin:mattermost@*)
+      dir="$(bridge_agent_mattermost_state_dir "$agent")"
+      [[ -f "$dir/access.json" ]] || return 1
+      bridge_env_file_has_any_nonempty_key "$dir/.env" MATTERMOST_BOT_TOKEN MATTERMOST_PERSONAL_TOKEN
+      ;;
     *)
       return 0
       ;;
@@ -3747,6 +3767,9 @@ bridge_channel_state_dir_for_item() {
       ;;
     plugin:ms365|plugin:ms365@*)
       bridge_agent_ms365_state_dir "$agent"
+      ;;
+    plugin:mattermost|plugin:mattermost@*)
+      bridge_agent_mattermost_state_dir "$agent"
       ;;
     *)
       printf '%s' ""
@@ -4276,6 +4299,9 @@ bridge_plugin_mcp_identity_for_item() {
     plugin:teams|plugin:teams@*)
       printf '%s' "teams"
       ;;
+    plugin:mattermost|plugin:mattermost@*)
+      printf '%s' "mattermost"
+      ;;
     *)
       printf '%s' ""
       ;;
@@ -4606,6 +4632,19 @@ bridge_agent_runtime_channel_status_reason() {
     fi
   fi
 
+  if bridge_channel_csv_contains "$required" "plugin:mattermost"; then
+    local mattermost_dir=""
+    mattermost_dir="$(bridge_agent_mattermost_state_dir "$agent")"
+    if [[ ! -f "$mattermost_dir/access.json" ]]; then
+      printf 'missing Mattermost access file under %s (access.json required)' "$mattermost_dir"
+      return 0
+    fi
+    if ! bridge_env_file_has_any_nonempty_key "$mattermost_dir/.env" MATTERMOST_BOT_TOKEN MATTERMOST_PERSONAL_TOKEN; then
+      printf 'missing Mattermost bot token under %s (.env with MATTERMOST_BOT_TOKEN required)' "$mattermost_dir"
+      return 0
+    fi
+  fi
+
   printf '%s' ""
 }
 
@@ -4626,6 +4665,9 @@ bridge_agent_channel_setup_guidance() {
   fi
   if bridge_channel_csv_contains "$required" "plugin:teams"; then
     printf "\nRun: %s setup teams %s --app-id <TEAMS_APP_ID> --app-password <TEAMS_APP_PASSWORD> --allow-from <TEAMS_USER_ID>" "$cli" "$agent"
+  fi
+  if bridge_channel_csv_contains "$required" "plugin:mattermost"; then
+    printf "\nRun: %s setup mattermost %s --url <MATTERMOST_URL> --bot-token <BOT_TOKEN> --allow-from <USER_ID>" "$cli" "$agent"
   fi
   printf "\nIf this agent intentionally runs with fewer channels, update %s so BRIDGE_AGENT_CHANNELS[\"%s\"] matches the live runtime before restarting." "$roster_local" "$agent"
 }
@@ -5430,6 +5472,13 @@ bridge_agent_plugin_ports() {
   if [[ -n "$port" ]]; then
     printf '%s\t%s\t%s\n' "$port" "bun" "teams"
   fi
+
+  local mattermost_env=""
+  mattermost_env="$(bridge_agent_mattermost_state_dir "$agent")/.env"
+  port="$(bridge_agent_plugin_port_from_env_file "$mattermost_env" "MATTERMOST_WEBHOOK_PORT" 2>/dev/null || true)"
+  if [[ -n "$port" ]]; then
+    printf '%s\t%s\t%s\n' "$port" "bun" "mattermost"
+  fi
 }
 
 bridge_kill_port_holder_if_orphan() {
@@ -5626,6 +5675,9 @@ bridge_plugin_channel_state_dir() {
     ms365)
       bridge_agent_ms365_state_dir "$agent"
       ;;
+    mattermost)
+      bridge_agent_mattermost_state_dir "$agent"
+      ;;
     *)
       return 1
       ;;
@@ -5644,6 +5696,9 @@ bridge_plugin_port_env_key() {
       ;;
     telegram)
       printf 'TELEGRAM_WEBHOOK_PORT'
+      ;;
+    mattermost)
+      printf 'MATTERMOST_WEBHOOK_PORT'
       ;;
     *)
       return 1
