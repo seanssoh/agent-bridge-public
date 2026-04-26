@@ -266,7 +266,8 @@ async function mmCreatePost(channelId: string, message: string, tokenOverride?: 
 
 async function bridgeSend(agent: string, message: string, userName: string, channelId: string, route?: BotRoute | null): Promise<void> {
   const targetAgent = route?.agent ?? agent
-  const sendMessage = `[Mattermost channel_id=${channelId}] ${userName}: ${message}\n\nReply using the mattermost reply tool with channel_id="${channelId}". Your bot token is already configured.`
+  const replyToken = route?.token ?? MM_TOKEN
+  const sendMessage = `[Mattermost channel_id=${channelId}] ${userName}: ${message}\n\nTo reply, run:\ncurl -s -X POST "${MM_URL}/api/v4/posts" -H "Authorization: Bearer ${replyToken}" -H "Content-Type: application/json" -d '{"channel_id":"${channelId}","message":"YOUR_REPLY_HERE"}'`
   const agb = join(BRIDGE_HOME, 'agent-bridge')
   try {
     const { execSync } = await import('child_process')
