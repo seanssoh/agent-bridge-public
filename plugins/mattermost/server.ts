@@ -73,6 +73,8 @@ const STANDALONE = process.env.MATTERMOST_STANDALONE === '1'
 const STANDALONE_SYSTEM_PROMPT = process.env.MATTERMOST_SYSTEM_PROMPT ?? ''
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY ?? ''
 const CLAUDE_MODEL = process.env.MATTERMOST_CLAUDE_MODEL ?? 'claude-sonnet-4-20250514'
+const BRIDGE_MODE = process.env.MATTERMOST_BRIDGE_MODE === '1'
+const BRIDGE_AGENT = process.env.MATTERMOST_BRIDGE_AGENT ?? ''
 
 const MM_URL = process.env.MATTERMOST_URL ?? 'http://localhost:8065'
 const MM_TOKEN = process.env.MATTERMOST_BOT_TOKEN ?? process.env.MATTERMOST_PERSONAL_TOKEN ?? ''
@@ -83,6 +85,7 @@ type BotRoute = {
   token: string
   user_id?: string
   system_prompt: string
+  agent?: string
 }
 
 const BOT_ROUTES_FILE = process.env.MATTERMOST_BOT_ROUTES ?? ''
@@ -261,10 +264,30 @@ async function mmCreatePost(channelId: string, message: string, tokenOverride?: 
   return mmApiRequest('POST', '/posts', { channel_id: channelId, message })
 }
 
+async function bridgeSend(agent: string, message: string, userName: string, channelId: string, route?: BotRoute | null): Promise<void> {
+  const targetAgent = route?.agent ?? agent
+  const sendMessage = `[Mattermost channel_id=${channelId}] ${userName}: ${message}\n\nReply using the mattermost reply tool with channel_id="${channelId}". Your bot token is already configured.`
+  const agb = join(BRIDGE_HOME, 'agent-bridge')
+  try {
+    const { execSync } = await import('child_process')
+    execSync(`"${agb}" urgent "${targetAgent}" "${sendMessage.replace(/"/g, '\\"')}"`, {
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    process.stderr.write(`mattermost channel: bridge-send to ${agent} for channel ${channelId}\n`)
+  } catch (err) {
+    process.stderr.write(`mattermost channel: bridge-send failed: ${err}\n`)
+    // Fallback to standalone reply if bridge-send fails
+    if (STANDALONE) {
+      void claudeReply(message, userName, channelId, route)
+    }
+  }
+}
+
 async function claudeReply(userMessage: string, userName: string, channelId: string, route?: BotRoute | null): Promise<void> {
   const replyToken = route?.token ?? MM_TOKEN
   const replyBotName = route?.username ?? botUsername
-  const systemPrompt = route?.system_prompt ?? STANDALONE_SYSTEM_PROMPT || `You are a helpful assistant in a Mattermost channel. Respond concisely in the same language as the user. Your bot username is @${replyBotName}.`
+  const systemPrompt = route?.system_prompt ?? (STANDALONE_SYSTEM_PROMPT || `You are a helpful assistant in a Mattermost channel. Respond concisely in the same language as the user. Your bot username is @${replyBotName}.`)
 
   if (ANTHROPIC_API_KEY) {
     try {
@@ -490,7 +513,12 @@ function handleOutgoingWebhook(payload: OutgoingWebhookPayload): void {
   }
   appendMessage(stored)
 
-  if (STANDALONE) {
+  if (BRIDGE_MODE) {
+    const targetAgent = routedBot?.agent ?? routedBot?.username?.replace(/-bot$/, '').replace(/-/g, '_') ?? BRIDGE_AGENT
+    if (targetAgent) {
+      void bridgeSend(targetAgent, text, userName, channelId, routedBot)
+    }
+  } else if (STANDALONE) {
     void claudeReply(text, userName, channelId, routedBot)
   } else {
     void mcp.notification({
