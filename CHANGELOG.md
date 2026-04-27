@@ -6,6 +6,77 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.30] — 2026-04-28
+
+### Hotfix release — security + isolation regression
+
+`v0.6.30` is a fast-follow hotfix to v0.6.29 covering two v0.6.28-rooted issues
+that surfaced after the v0.6.29 cut:
+
+- **Security: redact secret env values in launch logs** (#428, PR #430).
+  v0.6.28's `bridge-run.sh` logged `MS365_CLIENT_SECRET` and other inline
+  `KEY=value` env assignments in plaintext into per-agent logs and the tmux
+  pane. v0.6.30 adds a shared launch-command redactor and routes redacted
+  copies through every log surface that exposes the launch command:
+  `bridge-run.sh --dry-run`, tmux-visible runner logs, safe-mode hints,
+  crash reports, broken-launch state, and daemon crash-report bodies. The
+  raw command is still used for execution and dev-channel picker parsing,
+  so behavior is unchanged from the operator perspective except that
+  secret values no longer appear in observable logs.
+
+  Redaction is keyed on variable-name patterns: substring match on
+  `SECRET`, `TOKEN`, `PASSWORD`, `PASSWD`, `CREDENTIAL`, `AUTH`, `BEARER`,
+  `PRIVATE`, `COOKIE`, `JWT`, plus explicit secret-context `_KEY`
+  variants (`API_KEY`, `AUTH_KEY`, `PRIVATE_KEY`, `CLIENT_KEY`,
+  `ACCESS_KEY`, `SECRET_KEY`) and a `_PWD` suffix. Bare `_KEY` is NOT a
+  redaction trigger so common non-secret names like
+  `BRIDGE_LAYOUT_MARKER_KEY` and `CACHE_KEY` remain visible.
+
+  Existing v0.6.28/v0.6.29 logs that may already contain plaintext
+  secrets are not retroactively rewritten — operators who care about the
+  historical log surface should rotate the affected credentials and
+  audit the per-agent log files. New crash-body rendering does sanitize
+  stale/raw report inputs created before the patch.
+
+- **Regression: dev-channels picker auto-accept under linux-user
+  isolation** (#429, PR #431). v0.6.28's textual picker fix from #410
+  recognized "WARNING: Loading development channels" pane text and
+  advanced the picker without verifying Claude owned the foreground
+  process group. Under linux-user isolation, the sudo / bash launch
+  chain could still be foreground when Enter was sent, causing the
+  picker to advance into the wrong context. v0.6.30 adds a tmux pane
+  foreground-process-group check (`pane_pid` → `ps -o tpgid=` → PGID
+  command scan) that recognizes `claude`, `claude-*`, `claude.*`, and
+  symlinked-claude before sending Enter. Falls back to tmux
+  `pane_current_command` when ps is unavailable.
+
+  Scope is limited to the `allow_devchannels=1` blocker path. Trust /
+  summary / login-style prompt advancement is unchanged. Synthetic
+  picker fixtures opt out of the foreground gate via
+  `BRIDGE_TMUX_DEV_CHANNELS_REQUIRE_CLAUDE_FOREGROUND=0`. The bounded
+  retry loop and timeout (`BRIDGE_TMUX_DEV_CHANNELS_MAX_ADVANCE`) are
+  preserved.
+
+### v0.6.30 upgrade / migration notes
+
+#### Auto
+
+- v0.6.29 → v0.6.30 binary upgrade is straightforward — no schema
+  changes. `agent-bridge upgrade --apply` propagates both fixes.
+- Both fixes are in shared library code (`lib/bridge-core.sh`,
+  `lib/bridge-tmux.sh`) and `bridge-run.sh`; no per-agent settings
+  migration required.
+
+#### Operator-required
+
+- **None for upgrades from v0.6.29**. The redactor activates on next
+  launch; the foreground gate activates on next dev-channel picker
+  advancement.
+- **For installs that ran v0.6.28 with secret-shaped env**: review
+  per-agent log files in `state/logs/agent-<name>/` and consider
+  rotating credentials surfaced there. The redactor is purely
+  forward-looking for already-emitted log content.
+
 ## [0.6.29] — 2026-04-28
 
 ### Highlight — isolate-v2 6-PR series complete
