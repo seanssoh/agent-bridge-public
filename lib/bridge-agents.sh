@@ -392,13 +392,49 @@ bridge_agent_session() {
 }
 
 bridge_agent_isolation_mode() {
+  # Issue #412 Track A: cross-check roster vs runtime evidence and
+  # normalize the value space to {shared, linux-user, unknown}. When the
+  # agent has an os_user set, the launcher (bridge-run.sh) wraps the
+  # session in `sudo -n -u agent-bridge-<slug>` and the runtime is
+  # genuinely linux-user-isolated regardless of what the roster declares
+  # — return linux-user so `agent show` and downstream consumers reflect
+  # the runtime, not stale roster intent. Otherwise normalize the
+  # roster-declared value: empty/shared → shared; linux-user → linux-user;
+  # anything else → unknown (was previously rendered as the raw value or
+  # `-`, leading to `no` / `-` / `shared` drift across same-install agents).
   local agent="$1"
-  printf '%s' "${BRIDGE_AGENT_ISOLATION_MODE[$agent]-shared}"
+  local roster_mode="${BRIDGE_AGENT_ISOLATION_MODE[$agent]-}"
+  local os_user="${BRIDGE_AGENT_OS_USER[$agent]-}"
+  if [[ -n "$os_user" ]]; then
+    printf 'linux-user'
+    return 0
+  fi
+  case "$roster_mode" in
+    linux-user) printf 'linux-user' ;;
+    shared|"") printf 'shared' ;;
+    *) printf 'unknown' ;;
+  esac
 }
 
 bridge_agent_os_user() {
   local agent="$1"
   printf '%s' "${BRIDGE_AGENT_OS_USER[$agent]-}"
+}
+
+bridge_agent_os_user_display() {
+  # Issue #412 Track A: stable display value for the `os_user` field in
+  # `agent show` output. Always print the actual value when set, or `-`
+  # when unset — never `no`, never empty. The legacy renderer used
+  # `${os_user:--}` which collapsed empty to `-` but other callers
+  # passed `no` through unchanged, producing the three-different-shapes
+  # drift the issue documents.
+  local agent="$1"
+  local v="${BRIDGE_AGENT_OS_USER[$agent]-}"
+  if [[ -n "$v" ]]; then
+    printf '%s' "$v"
+  else
+    printf '%s' '-'
+  fi
 }
 
 bridge_agent_default_os_user() {
@@ -2580,6 +2616,34 @@ bridge_linux_prepare_agent_isolation() {
   # Root traverse-only on the gateway root for the isolated UID prevents
   # cross-agent dir-name enumeration while keeping its own subtree reachable.
   bridge_linux_acl_add "u:${os_user}:--x" "$queue_gateway_root" >/dev/null 2>&1 || true
+
+  # Issue #412 Track B: grant the isolated UID r-- on its own queue body
+  # files. Bodies live under $BRIDGE_STATE_DIR/queue/bodies/ and are
+  # written by bridge-queue.py with mode 0600, owner = controller. The
+  # queue CLI emits the body path back to callers via TASK_BODY_PATH, and
+  # downstream flows (e.g. agb claim wrappers) cat the file directly from
+  # the isolated UID context. Without an ACL grant the read fails with
+  # EACCES even after agb claim succeeds, leaving the agent with no way
+  # to read the body of its own claimed task.
+  #
+  # Default ACL inheritance grants the same r-- on bodies created later
+  # by the controller. Legacy ACL only — under v2 (group setgid) the
+  # bridge_linux_acl_add primitive short-circuits to a no-op, and the
+  # state/queue/bodies tree inherits the ab-controller group from the
+  # state/ parent (which the isolated UID is not a member of). v2 needs
+  # a follow-up to extend the queue body share semantics to the per-agent
+  # group; until then, v2 installs see the same EACCES as before.
+  local _queue_bodies_dir
+  _queue_bodies_dir="$BRIDGE_STATE_DIR/queue/bodies"
+  bridge_linux_sudo_root mkdir -p "$_queue_bodies_dir"
+  if [[ -d "$_queue_bodies_dir" ]]; then
+    bridge_linux_acl_add "u:${os_user}:r-x" "$_queue_bodies_dir" >/dev/null 2>&1 || true
+    bridge_linux_acl_add_default_dirs_recursive \
+      "u:${os_user}:r--" "$_queue_bodies_dir" >/dev/null 2>&1 || true
+    bridge_linux_acl_add_recursive \
+      "u:${os_user}:r-X" "$_queue_bodies_dir" >/dev/null 2>&1 || true
+  fi
+
   hidden_paths+=("$BRIDGE_ROSTER_FILE" "$BRIDGE_ROSTER_LOCAL_FILE" "$BRIDGE_RUNTIME_CREDENTIALS_DIR" "$BRIDGE_RUNTIME_SECRETS_DIR" "$BRIDGE_RUNTIME_CONFIG_FILE" "$BRIDGE_TASK_DB" "${BRIDGE_LOG_DIR}/audit.jsonl")
 
   # Issue #233: every traverse_chain call used to climb unconditionally

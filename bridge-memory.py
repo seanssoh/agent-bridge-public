@@ -2379,9 +2379,30 @@ def cmd_current_session_id(args: argparse.Namespace) -> int:
     template passes `BRIDGE_AGENT_WORKDIR` for exactly that reason.
     Claude Code exposes the session id via hook stdin but has no
     documented env var for slash commands, so we read from disk.
+
+    Issue #412 Track C: under linux-user isolation `~/.claude/projects/`
+    resolves to the isolated UID's home, but `--home` is the
+    controller-side path passed in from the wrap-up command. The two
+    don't agree on what "this agent's project dir" means, so the scan
+    looks under a slug the isolated UID has never written. Callers under
+    isolation pass `--transcripts-home <isolated-home>/.claude/projects`
+    (or just `<isolated-home>`) to override the projects-dir root.
+    Mirrors the harvester's --transcripts-home pattern.
     """
     import os as _os
-    projects_dir = Path(args.claude_projects).expanduser()
+    if args.transcripts_home:
+        # Operator may pass either the projects-dir directly
+        # (`/home/<os_user>/.claude/projects`) or the user home
+        # (`/home/<os_user>`). Accept both: when the path ends in
+        # `.claude/projects` use it as-is; otherwise treat it as $HOME
+        # equivalent and append `.claude/projects`.
+        override = Path(args.transcripts_home).expanduser()
+        if override.name == "projects" and override.parent.name == ".claude":
+            projects_dir = override
+        else:
+            projects_dir = override / ".claude" / "projects"
+    else:
+        projects_dir = Path(args.claude_projects).expanduser()
     home = Path(args.home).expanduser().resolve()
     # Match Anthropic's ~/.claude/projects/ slug convention (see
     # bridge-agent.sh:bridge_ensure_auto_memory_isolation).
@@ -4010,6 +4031,17 @@ def build_parser() -> argparse.ArgumentParser:
     csi_parser.add_argument(
         "--claude-projects",
         default=str(Path.home() / ".claude" / "projects"),
+    )
+    csi_parser.add_argument(
+        "--transcripts-home",
+        help=(
+            "override base for ~/.claude/projects scan — accepts either an "
+            "explicit `<base>/.claude/projects` path or the isolated UID's "
+            "home directory. Mirrors the harvest-daily pattern; required "
+            "for current-session-id under linux-user isolation since `~` "
+            "resolves to the isolated UID's home but --home is the "
+            "controller-side path (issue #412 Track C)."
+        ),
     )
     csi_parser.set_defaults(func=cmd_current_session_id)
 
