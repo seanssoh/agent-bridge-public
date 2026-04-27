@@ -285,8 +285,12 @@ if sudo -n -u "$TEST_OS_USER" cat "$undeclared_path/server.ts" >/dev/null 2>&1; 
 fi
 
 log "verifying persisted grant-set state file recorded the channel"
-state_file="$BRIDGE_ACTIVE_AGENT_DIR/$TEST_AGENT/isolated-plugin-grants.json"
+state_file="$(bridge_isolated_plugin_grants_state_file "$TEST_AGENT")"
+legacy_state_file="$(bridge_isolated_plugin_grants_legacy_state_file "$TEST_AGENT")"
 sudo -n test -e "$state_file" || die "expected persisted grant-set at $state_file"
+if sudo -n test -e "$legacy_state_file" 2>/dev/null; then
+  die "legacy grant-set path still exists at $legacy_state_file; grant ledger must not harden runtime state dir"
+fi
 sudo -n cat "$state_file" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
