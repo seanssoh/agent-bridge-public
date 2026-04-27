@@ -334,7 +334,7 @@ _bridge_wave_dispatch_member() {
       --detail member_id="$member_id" \
       --detail track="$track" \
       --detail worker="$worker_name" \
-      --detail worktree="$worktree_root" \
+      --detail worktree_root="$worktree_root" \
       --detail branch="$branch" \
       --detail stage="queue_task_create" \
       --detail error="$task_create_out" \
@@ -350,7 +350,7 @@ _bridge_wave_dispatch_member() {
       --detail member_id="$member_id" \
       --detail track="$track" \
       --detail worker="$worker_name" \
-      --detail worktree="$worktree_root" \
+      --detail worktree_root="$worktree_root" \
       --detail branch="$branch" \
       --detail stage="task_id_parse" \
       --detail error="$task_create_out" \
@@ -370,7 +370,7 @@ _bridge_wave_dispatch_member() {
     --detail member_id="$member_id" \
     --detail track="$track" \
     --detail worker="$worker_name" \
-    --detail worktree="$worktree_root" \
+    --detail worktree_root="$worktree_root" \
     --detail branch="$branch" \
     --detail task_id="$task_id" \
     || true
@@ -415,7 +415,7 @@ _bridge_wave_dispatch_member() {
       --detail member_id="$member_id" \
       --detail track="$track" \
       --detail worker="$worker_name" \
-      --detail worktree="$worktree_root" \
+      --detail worktree_root="$worktree_root" \
       --detail branch="$branch" \
       --detail task_id="$task_id" \
       --detail stage="state_mark_running" \

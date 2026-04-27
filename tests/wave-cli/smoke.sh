@@ -341,6 +341,15 @@ assert matching, (
 assert any("worker=" in a and "task_id=12345" in a for a in matching), (
     f"audit row missing worker/task wiring; got: {matching!r}"
 )
+# All four detail keys must appear so an audit-only inspection sees the
+# full member wiring (codex r2: keep audit string + state JSON + dispatch
+# --detail flags using the same `worktree_root=` key).
+assert any("worktree_root=" in a for a in matching), (
+    f"audit row missing worktree_root=; got: {matching!r}"
+)
+assert any("branch=" in a for a in matching), (
+    f"audit row missing branch=; got: {matching!r}"
+)
 PY
 ok "state-mark-running transitions one member pending -> running and audits"
 
