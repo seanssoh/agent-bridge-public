@@ -1315,13 +1315,27 @@ print("present:other")
 PY
 }
 
+bridge_isolated_plugin_grants_state_dir() {
+  # Controller-owned ledger root for plugin-share ACL grants. Keep this out
+  # of $BRIDGE_ACTIVE_AGENT_DIR/<agent>: in legacy mode that path is also the
+  # runtime state directory, which needs the normal isolated/controller write
+  # ACL contract for agent-env.sh and session state.
+  printf '%s/isolated-plugin-grants' "$BRIDGE_STATE_DIR"
+}
+
 bridge_isolated_plugin_grants_state_file() {
-  # State file recording the channel set last granted plugin-share ACLs to
-  # an isolated agent. Lives under $BRIDGE_ACTIVE_AGENT_DIR/<agent>/ — the
-  # same per-agent state pattern used by other isolation helpers. Used by
-  # bridge_linux_share_plugin_catalog (to compute added/removed channels
-  # across reapply) and by bridge_migration_unisolate (to revoke channels
-  # the live roster may already have dropped).
+  # State file recording the channel set last granted plugin-share ACLs to an
+  # isolated agent. Used by bridge_linux_share_plugin_catalog (to compute
+  # added/removed channels across reapply) and by bridge_migration_unisolate
+  # (to revoke channels the live roster may already have dropped).
+  local agent="$1"
+  printf '%s/%s.json' "$(bridge_isolated_plugin_grants_state_dir)" "$agent"
+}
+
+bridge_isolated_plugin_grants_legacy_state_file() {
+  # v0.6.28 wrote the grant ledger under the agent runtime state directory.
+  # Keep a fallback reader/remover so upgrades can revoke stale grants and
+  # migrate the ledger without leaving the old file behind.
   local agent="$1"
   printf '%s/%s/isolated-plugin-grants.json' "$BRIDGE_ACTIVE_AGENT_DIR" "$agent"
 }
@@ -1334,8 +1348,17 @@ bridge_isolated_plugin_grants_read() {
   # write so callers can rely on stable ordering.
   local agent="$1"
   local state_file=""
+  local legacy_state_file=""
   state_file="$(bridge_isolated_plugin_grants_state_file "$agent")"
-  [[ -e "$state_file" ]] || { printf ''; return 0; }
+  legacy_state_file="$(bridge_isolated_plugin_grants_legacy_state_file "$agent")"
+  if bridge_linux_sudo_root test -e "$state_file"; then
+    :
+  elif bridge_linux_sudo_root test -e "$legacy_state_file"; then
+    state_file="$legacy_state_file"
+  else
+    printf ''
+    return 0
+  fi
   bridge_require_python
   bridge_linux_sudo_root python3 - "$state_file" <<'PY'
 import json, os, sys
@@ -1362,9 +1385,11 @@ bridge_isolated_plugin_grants_write() {
   local channels_csv="$2"
   local state_file=""
   local state_dir=""
+  local legacy_state_file=""
   local tmp_file=""
   state_file="$(bridge_isolated_plugin_grants_state_file "$agent")"
   state_dir="$(dirname "$state_file")"
+  legacy_state_file="$(bridge_isolated_plugin_grants_legacy_state_file "$agent")"
   bridge_linux_sudo_root mkdir -p "$state_dir"
   # Place the temp file in the destination dir so the mv is always within
   # one filesystem (atomic rename); see Blocking 2 in PR #302 r1.
@@ -1382,6 +1407,9 @@ PY
   bridge_linux_sudo_root chmod 0640 "$state_file"
   bridge_linux_sudo_root chown root:root "$state_dir" >/dev/null 2>&1 || true
   bridge_linux_sudo_root chmod 0750 "$state_dir" >/dev/null 2>&1 || true
+  if [[ "$legacy_state_file" != "$state_file" ]]; then
+    bridge_linux_sudo_root rm -f "$legacy_state_file" >/dev/null 2>&1 || true
+  fi
 }
 
 bridge_isolated_plugin_grants_remove() {
@@ -1389,9 +1417,16 @@ bridge_isolated_plugin_grants_remove() {
   # ACL strip completes successfully).
   local agent="$1"
   local state_file=""
+  local legacy_state_file=""
   state_file="$(bridge_isolated_plugin_grants_state_file "$agent")"
-  [[ -e "$state_file" ]] || return 0
-  bridge_linux_sudo_root rm -f "$state_file" >/dev/null 2>&1 || true
+  legacy_state_file="$(bridge_isolated_plugin_grants_legacy_state_file "$agent")"
+  if bridge_linux_sudo_root test -e "$state_file"; then
+    bridge_linux_sudo_root rm -f "$state_file" >/dev/null 2>&1 || true
+  fi
+  if [[ "$legacy_state_file" != "$state_file" ]] \
+      && bridge_linux_sudo_root test -e "$legacy_state_file"; then
+    bridge_linux_sudo_root rm -f "$legacy_state_file" >/dev/null 2>&1 || true
+  fi
 }
 
 bridge_linux_revoke_plugin_channel_grants() {
@@ -1622,7 +1657,7 @@ bridge_linux_share_plugin_catalog() {
   #
   # Reapply contract: the helper is rerun on every isolate refresh. To
   # keep the isolation boundary tight, the previously-granted channel
-  # set is persisted under $BRIDGE_ACTIVE_AGENT_DIR/<agent>/ and diffed
+  # set is persisted under a root-owned controller ledger and diffed
   # against the current channels — channels removed from the roster
   # have their ACLs and catalog symlinks revoked here, not just at
   # unisolate. (Blocking 1 in PR #302 r1.)
