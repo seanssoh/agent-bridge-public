@@ -392,13 +392,49 @@ bridge_agent_session() {
 }
 
 bridge_agent_isolation_mode() {
+  # Issue #412 Track A: cross-check roster vs runtime evidence and
+  # normalize the value space to {shared, linux-user, unknown}. When the
+  # agent has an os_user set, the launcher (bridge-run.sh) wraps the
+  # session in `sudo -n -u agent-bridge-<slug>` and the runtime is
+  # genuinely linux-user-isolated regardless of what the roster declares
+  # — return linux-user so `agent show` and downstream consumers reflect
+  # the runtime, not stale roster intent. Otherwise normalize the
+  # roster-declared value: empty/shared → shared; linux-user → linux-user;
+  # anything else → unknown (was previously rendered as the raw value or
+  # `-`, leading to `no` / `-` / `shared` drift across same-install agents).
   local agent="$1"
-  printf '%s' "${BRIDGE_AGENT_ISOLATION_MODE[$agent]-shared}"
+  local roster_mode="${BRIDGE_AGENT_ISOLATION_MODE[$agent]-}"
+  local os_user="${BRIDGE_AGENT_OS_USER[$agent]-}"
+  if [[ -n "$os_user" ]]; then
+    printf 'linux-user'
+    return 0
+  fi
+  case "$roster_mode" in
+    linux-user) printf 'linux-user' ;;
+    shared|"") printf 'shared' ;;
+    *) printf 'unknown' ;;
+  esac
 }
 
 bridge_agent_os_user() {
   local agent="$1"
   printf '%s' "${BRIDGE_AGENT_OS_USER[$agent]-}"
+}
+
+bridge_agent_os_user_display() {
+  # Issue #412 Track A: stable display value for the `os_user` field in
+  # `agent show` output. Always print the actual value when set, or `-`
+  # when unset — never `no`, never empty. The legacy renderer used
+  # `${os_user:--}` which collapsed empty to `-` but other callers
+  # passed `no` through unchanged, producing the three-different-shapes
+  # drift the issue documents.
+  local agent="$1"
+  local v="${BRIDGE_AGENT_OS_USER[$agent]-}"
+  if [[ -n "$v" ]]; then
+    printf '%s' "$v"
+  else
+    printf '%s' '-'
+  fi
 }
 
 bridge_agent_default_os_user() {
