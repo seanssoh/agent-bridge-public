@@ -81,6 +81,8 @@ if [[ -n "${CRON_REQUEST_DIR:-}" ]]; then
 else
   v2_md_root=""
   if [[ "${BRIDGE_LAYOUT:-legacy}" == "v2" ]] \
+      && [[ -n "${BRIDGE_DATA_ROOT:-}" ]] \
+      && [[ -d "${BRIDGE_DATA_ROOT}" ]] \
       && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
     v2_md_root="$BRIDGE_AGENT_ROOT_V2/$AGENT/runtime/memory-daily"
   fi
@@ -100,12 +102,28 @@ fi
 # harvester would silently keep using the legacy controller tree (issue:
 # PR-C r1 review finding P1 #1).
 v2_extra_args=()
+# Issue #418 codex r2 item 8: gate v2 extra args on data-root populated,
+# matching the sidecar gate above. Transitional installs (marker present
+# but BRIDGE_DATA_ROOT not yet populated) must fall back to legacy
+# invocation — without this check, the harvester would pass v2 paths that
+# don't exist on disk and bridge-memory.py would silently skip writes.
+# The contract is: v2 extra args only when (a) layout is v2,
+# (b) BRIDGE_DATA_ROOT is set, (c) BRIDGE_DATA_ROOT exists on disk, AND
+# (d) BRIDGE_AGENT_ROOT_V2 is set. Mirrors the wiki harvester gate at
+# scripts/wiki-daily-ingest.sh:174-176.
 if [[ "${BRIDGE_LAYOUT:-legacy}" == "v2" ]] \
+    && [[ -n "${BRIDGE_DATA_ROOT:-}" ]] \
+    && [[ -d "${BRIDGE_DATA_ROOT}" ]] \
     && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
   v2_extra_args+=(--per-agent-state-dir "$BRIDGE_AGENT_ROOT_V2/$AGENT/runtime/memory-daily")
   if [[ -n "${BRIDGE_SHARED_ROOT:-}" ]]; then
     v2_extra_args+=(--shared-aggregate-dir "$BRIDGE_SHARED_ROOT/memory-daily/aggregate")
   fi
+elif [[ "${BRIDGE_LAYOUT:-legacy}" == "v2" ]]; then
+  # Marker says v2 but data-root not populated — transitional install.
+  # Emit a debug breadcrumb so the operator can see the fallback.
+  printf '[memory-daily-harvest] data root not populated; running legacy enumeration (BRIDGE_DATA_ROOT=%s)\n' \
+    "${BRIDGE_DATA_ROOT:-unset}" >&2
 fi
 
 current_user="$(id -un 2>/dev/null || echo '')"

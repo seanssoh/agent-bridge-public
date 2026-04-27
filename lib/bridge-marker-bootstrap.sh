@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 # bridge-marker-bootstrap.sh — Read v2 layout marker
-# (BRIDGE_LAYOUT/BRIDGE_DATA_ROOT) from $BRIDGE_STATE_DIR/layout-marker.sh
+# (BRIDGE_LAYOUT/BRIDGE_DATA_ROOT) from $BRIDGE_LAYOUT_MARKER_DIR/layout-marker.sh
 # with strict validation, before bridge-isolation-v2.sh snapshots those env
 # vars. Sourced from bridge-lib.sh after bridge-core.sh (so bridge_warn is
 # available) and before bridge-isolation-v2.sh.
+#
+# Marker location is anchored on BRIDGE_LAYOUT_MARKER_DIR (default
+# $BRIDGE_HOME/state), never on BRIDGE_STATE_DIR. v2 activation may move
+# controller state to $BRIDGE_DATA_ROOT/state in a future PR, but the marker
+# must remain discoverable from a stable location across that change.
 #
 # Validation:
 #   - regular file, not symlink
@@ -18,8 +23,11 @@
 # shellcheck shell=bash disable=SC2034
 
 bridge_isolation_v2_marker_path() {
+  # Marker is anchored on BRIDGE_LAYOUT_MARKER_DIR, never BRIDGE_STATE_DIR.
+  # Falls back through env vars so isolated tempdir tests and child processes
+  # without bridge-lib.sh sourced still resolve a sensible default.
   printf '%s/layout-marker.sh' \
-    "${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+    "${BRIDGE_LAYOUT_MARKER_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
 }
 
 bridge_isolation_v2_marker_validate() {
@@ -57,7 +65,22 @@ bridge_isolation_v2_marker_validate() {
     [[ -z "${line//[[:space:]]/}" ]] && continue
     [[ "$line" =~ ^[[:space:]]*# ]] && continue
     if ! [[ "$line" =~ $allowed_re ]]; then
-      bridge_warn "layout-marker.sh ignored: disallowed line '$line'"
+      # Redact line content. A malformed marker may carry secrets-shaped
+      # KEY=value pairs (operator paste accident, attacker probe). Logging
+      # the raw line would leak the value into controller logs and any
+      # downstream report draft. Surface only the rejected key when it
+      # parses cleanly, else a generic note without the line.
+      # The disallowed key name itself is attacker-controlled bytes
+      # (the very byte string that failed the allowlist regex). Echoing
+      # it would propagate the injection into controller stderr / log
+      # scrapers / smoke harnesses. Surface only the failure category;
+      # operators inspecting the marker file directly can see the key.
+      local _disallow_key="${line%%=*}"
+      if [[ "$_disallow_key" == "$line" || -z "$_disallow_key" ]]; then
+        bridge_warn "layout-marker.sh ignored: malformed line (no KEY= prefix)"
+      else
+        bridge_warn "layout-marker.sh ignored: disallowed key (redacted)"
+      fi
       return 1
     fi
     key="${line%%=*}"
@@ -75,7 +98,9 @@ bridge_isolation_v2_marker_validate() {
 
   if (( saw_layout == 1 )) && [[ "$layout_value" == "v2" ]]; then
     if [[ -z "$data_root_value" || "${data_root_value:0:1}" != "/" ]]; then
-      bridge_warn "layout-marker.sh ignored: BRIDGE_DATA_ROOT must be absolute, got '$data_root_value'"
+      # Do not echo $data_root_value — it may carry attacker-controlled or
+      # secret bytes from a poisoned marker. Surface only the failure mode.
+      bridge_warn "layout-marker.sh ignored: BRIDGE_DATA_ROOT missing or not absolute"
       return 1
     fi
   fi
@@ -145,7 +170,8 @@ bridge_isolation_v2_marker_load() {
   done < "$path"
 }
 
-# Auto-load: bridge-lib.sh sources this module after bridge-core.sh and
-# before bridge-isolation-v2.sh, so v2 helpers see the marker values when
-# they snapshot BRIDGE_LAYOUT/BRIDGE_DATA_ROOT.
-bridge_isolation_v2_marker_load
+# NOTE: marker_load is no longer auto-invoked at source time. The layout
+# resolver (lib/bridge-layout-resolver.sh) calls it explicitly after caller
+# env validation so it can distinguish env-overrides from marker-loaded
+# values. Auto-loading here would race with the resolver's source-attribution
+# logic and surface marker-loaded layouts as source=env.

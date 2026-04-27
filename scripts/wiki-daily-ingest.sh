@@ -166,7 +166,14 @@ PYEOF
 
 declare -a AGENT_MEMORY_ROOTS=()
 
-if [[ "${BRIDGE_LAYOUT:-legacy}" == "v2" ]]; then
+# Active-contract gate: v2 path requires BRIDGE_LAYOUT=v2 AND a populated
+# BRIDGE_DATA_ROOT directory. A child env that propagates only LAYOUT=v2
+# without the data root would otherwise drop into the strict v2 enumeration
+# with no place to read from. PR-F invariant: gate on contract, not textual
+# default.
+if [[ "${BRIDGE_LAYOUT:-legacy}" == "v2" \
+      && -n "${BRIDGE_DATA_ROOT:-}" \
+      && -d "${BRIDGE_DATA_ROOT}" ]]; then
   # v2: strict workdir-aware enumeration via `agb agent list --json`.
   if [[ ! -x "$BRIDGE_AGB" ]]; then
     printf '[wiki-daily-ingest] BRIDGE_AGB not executable: %s\n' "$BRIDGE_AGB" >&2

@@ -8,9 +8,31 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/bridge-lib.sh"
 CLI_NAME="$(basename "$0")"
 
-if [[ "${1:-}" != "version" ]]; then
-  bridge_load_roster
-fi
+# Skip roster load for commands that must remain mutation-free or own their
+# own load timing. `init` defers bridge_load_roster until after argument
+# parsing + the layout resolver decision (PR-F): calling it here would
+# materialize $BRIDGE_HOME/state via bridge_init_dirs before --dry-run is
+# even checked, breaking the dry-run mutation-free invariant.
+case "${1:-}" in
+  version) ;;
+  init)
+    # bridge-isolation-v2.sh's `BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"`
+    # default fires during our bridge-lib.sh source above and exports the
+    # value into the environment we hand to the child bridge-init.sh.
+    # When that default came from the resolver returning fresh-install-
+    # candidate (BRIDGE_LAYOUT_SOURCE=fresh-install-candidate or
+    # missing-marker(existing) etc.), the child would misread it as an
+    # explicit operator override and skip the marker-write branch.
+    # Strip it so the child's resolver runs in a clean state. An
+    # operator-provided override (BRIDGE_LAYOUT_SOURCE=env) is preserved.
+    if [[ "${BRIDGE_LAYOUT_SOURCE:-}" != "env" ]]; then
+      unset BRIDGE_LAYOUT BRIDGE_DATA_ROOT
+    fi
+    ;;
+  *)
+    bridge_load_roster
+    ;;
+esac
 
 usage() {
   cat <<EOF

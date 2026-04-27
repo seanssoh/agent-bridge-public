@@ -29,6 +29,11 @@ if [[ -z "${BRIDGE_ROSTER_FILE:-}" ]]; then
 fi
 BRIDGE_ROSTER_LOCAL_FILE="${BRIDGE_ROSTER_LOCAL_FILE:-$BRIDGE_HOME/agent-roster.local.sh}"
 BRIDGE_STATE_DIR="${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}"
+# Layout marker is anchored separately from BRIDGE_STATE_DIR so v2 activation
+# never moves marker discovery. Defaults to $BRIDGE_HOME/state and is never
+# rebased onto $BRIDGE_DATA_ROOT/state — controller state may relocate in a
+# future PR, the marker location must not.
+BRIDGE_LAYOUT_MARKER_DIR="${BRIDGE_LAYOUT_MARKER_DIR:-$BRIDGE_HOME/state}"
 BRIDGE_ACTIVE_AGENT_DIR="${BRIDGE_ACTIVE_AGENT_DIR:-$BRIDGE_STATE_DIR/agents}"
 BRIDGE_HISTORY_DIR="${BRIDGE_HISTORY_DIR:-$BRIDGE_STATE_DIR/history}"
 BRIDGE_WORKTREE_META_DIR="${BRIDGE_WORKTREE_META_DIR:-$BRIDGE_STATE_DIR/worktrees}"
@@ -94,7 +99,7 @@ BRIDGE_MCP_ORPHAN_PATTERNS="${BRIDGE_MCP_ORPHAN_PATTERNS:-}"
 BRIDGE_BASH_BIN="${BRIDGE_BASH_BIN:-${BASH:-$(command -v bash)}}"
 export BRIDGE_BASH_BIN
 export BRIDGE_HOME BRIDGE_ROSTER_FILE BRIDGE_ROSTER_LOCAL_FILE
-export BRIDGE_STATE_DIR BRIDGE_ACTIVE_AGENT_DIR BRIDGE_HISTORY_DIR BRIDGE_WORKTREE_META_DIR
+export BRIDGE_STATE_DIR BRIDGE_LAYOUT_MARKER_DIR BRIDGE_ACTIVE_AGENT_DIR BRIDGE_HISTORY_DIR BRIDGE_WORKTREE_META_DIR
 export BRIDGE_ACTIVE_ROSTER_TSV BRIDGE_ACTIVE_ROSTER_MD
 export BRIDGE_DAEMON_PID_FILE BRIDGE_DAEMON_LOG BRIDGE_DAEMON_CRASH_LOG
 export BRIDGE_DAEMON_INTERVAL BRIDGE_DAEMON_START_WAIT_SECONDS
@@ -160,6 +165,10 @@ bridge_source_module "bridge-core.sh"
 # so bridge_warn is available, before bridge-agents.sh / bridge-isolation-v2.sh
 # so v2 helpers see the marker values. Safe no-op when the marker is absent.
 bridge_source_module "bridge-marker-bootstrap.sh"
+# Resolve layout (env / marker / missing-marker(existing) / fresh-install-
+# candidate / invalid-marker(fallback)) before bridge-agents.sh snapshots
+# child env defaults. Read-only — never writes the marker.
+bridge_source_module "bridge-layout-resolver.sh"
 bridge_source_module "bridge-agents.sh"
 bridge_source_module "bridge-guard.sh"
 bridge_source_module "bridge-tmux.sh"
