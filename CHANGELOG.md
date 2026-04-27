@@ -6,7 +6,27 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.29] — 2026-04-28
+
+### Highlight — isolate-v2 6-PR series complete
+
+`v0.6.29` ships the final piece of the isolate-v2 series (PR-A → PR-B → PR-C →
+PR-D → PR-E → **PR-F**, default flip). Fresh `agent-bridge init` now provisions
+the v2 layout by default; existing markerless installs stay legacy by an
+explicit invariant (not a default fall-through). See PR-F section below for the
+opt-out instruction (`BRIDGE_LAYOUT=legacy agent-bridge init`).
+
+The release also bundles a v0.6.28 P1 hotfix (linux-user `agent-bridge isolate`
+ACL mask narrowing), wave Phase 1.2 (dispatch-to-worker handoff for
+`agent-bridge wave`), three small fixes around upgrade tooling / queue/agent
+isolation / memory transcripts-home / plugin marketplace, and a daemon-side
+behavior change for dynamic-agent context-pressure noise.
+
 ### isolate-v2 PR-F — default flip via explicit layout resolver
+
+(PR #418, four review rounds)
+
+Direction agreed across plan-review rounds r1-r5 (tasks #293/#298/#300/#302/#304):
 
 Direction agreed across plan-review rounds r1-r5 (tasks #293/#298/#300/#302/#304):
 the project's default layout for **new installs** is now v2, while existing
@@ -61,6 +81,114 @@ BRIDGE_LAYOUT=legacy agent-bridge init
 Existing installs with prior usage evidence (`state/`, `logs/`, `agents/`)
 are unaffected and stay legacy automatically — the override only matters for
 fresh installs that would otherwise pick up the new v2 default.
+
+### Fixes
+
+- **`fix(isolate): plugin-grant ledger out of runtime state dir`** (#422,
+  PR #423). v0.6.28 P1: `agent-bridge isolate <agent>` partially failed on
+  Linux with `Permission denied` when writing `agent-env.sh`.
+  `bridge_isolated_plugin_grants_write` did `chmod 0750` on the ledger's
+  parent dir which (in legacy mode) is also the runtime state dir — the
+  chmod reset the POSIX ACL mask to `r-x`, capping the controller's named
+  `rwx` entry, so the subsequent `cat > agent-env.sh` failed. Fix: ledger
+  now lives at `$BRIDGE_STATE_DIR/isolated-plugin-grants/<agent>.json`,
+  isolated from the runtime state dir. Legacy fallback reader + cleanup-
+  on-write preserved for upgrade migration. r2 round added fail-loud
+  guards before legacy cleanup.
+- **`isolate: queue body ACL + agent show normalize + bridge-memory
+  transcripts-home`** (#412, PR #426). Three Track fixes for isolated
+  agents in B → A → C order. Track B grants the controller named ACL on
+  queue task body files so the worker can read its own brief through the
+  isolated path. Track A normalizes `agent show` output so the agent's
+  isolated home appears in the path columns instead of the controller's
+  view. Track C adds `--transcripts-home` override to
+  `bridge-memory.py current-session-id` and threads it through the
+  `wrap-up` slash command so the worker resolves transcripts under
+  `$HOME` (its isolated home) rather than the controller's `~/.claude`.
+- **`fix(plugin): declare ms365 in agent-bridge marketplace`** (#425,
+  PR #427). v0.6.28: `bridge-run.sh` preflight refused to start an
+  isolated agent when its allowlisted `ms365@agent-bridge` plugin
+  existed on disk and in `installed_plugins.json` but was not declared
+  in `.claude-plugin/marketplace.json`. The plugin source tree shipped
+  in the repo and channel/isolation code already referenced it; only
+  the marketplace declaration was missing. Fix: declare `ms365` in the
+  marketplace, plus a new OSS preflight check that every shipped
+  `plugins/*/.claude-plugin/plugin.json` name is declared in the
+  marketplace (so this gap can't recur silently), plus an allowlist
+  for reserved example email domains in the OSS preflight email
+  scanner so existing smoke fixtures don't mask the new check.
+- **`upgrade: agb upgrade conflicts list — read-only enumeration`**
+  (#394 PR-1 of 4, PR #421). When `agb upgrade --apply` leaves
+  `.upgrade-conflict.<sha>` files in the live tree (an operator chose
+  manual merge), there was no tooling to enumerate them. New
+  `agb upgrade conflicts list` returns the conflict files sorted by
+  modification time (newest first) for triage. Read-only — no resolve
+  / discard / adopt yet (those land in PR-2/3/4 of the sequence).
+- **`daemon: skip context-pressure task creation for dynamic agents`**
+  (#419, PR #420). Dynamic agents (e.g., `agb-dev-claude`) own their
+  own context-budget — Claude's compaction handles it autonomously,
+  not the bridge. The daemon's
+  `process_context_pressure_reports` previously emitted a queue task
+  every time a dynamic agent crossed the 90% threshold, generating
+  cron-follow-up noise on the operator's patch and on the dynamic
+  agent's own conversation. The textual rule in the system prompt
+  was insufficient on its own — daemon-side skip is the durable
+  fix. The skip emits a `daemon context_pressure_suppressed` audit
+  row with severity / agent / excerpt-hash so the suppression is
+  observable.
+
+### `agent-bridge wave dispatch` Phase 1.2
+
+- **`wave: agent-bridge wave dispatch spawns workers + queue tasks`**
+  (#276 Phase 1.2, PR #424). Phase 1.1 (CLI surface + state JSON +
+  brief writer) shipped in v0.6.18 (PR #373). Before this PR,
+  `agent-bridge wave dispatch` left every member at `pending` because
+  there was no actual worker spawn or queue task creation — operators
+  bypassed the durable state. This PR closes the dispatch-to-worker
+  handoff:
+
+  - For each pending member, spawns a worker via
+    `agent-bridge --<engine> --name <member-id> --workdir <repo>
+    --prefer new --no-attach`.
+  - Reads `WORKTREE_ROOT` / `WORKTREE_BRANCH` from the dispatcher's
+    metadata env file.
+  - Creates a high-priority queue task per member, body = the
+    member's `brief.md`.
+  - Atomically transitions state JSON `pending -> running` with
+    `worker` / `worktree_root` / `branch` / `task_id` populated.
+    Refuses to mark non-pending member running (rc=3 from
+    `bridge-wave.py state-mark-running`).
+  - All-or-rollback contract: state advances only when both spawn
+    and queue-task succeed; partial states get observable audit rows
+    (`wave_member_dispatch_partial` / `_rollback`).
+  - Emits `wave_member_queued` audit per design §10 with
+    `worker` / `task_id` / `worktree_root` / `branch` keys.
+
+  `--dry-run` stays read-only (no worker, no task, no state mutation).
+  New `--repo-root <dir>` flag lets the operator point dispatch at a
+  specific repo; non-git roots short-circuit with a warning, members
+  stay `pending`. Phases 1.3-1.6 (codex plan/review invocation, PR
+  open + close-keyword guard, completion task, close-issue
+  validation) are deferred to follow-up. Issue #276 stays open
+  through Phase 1.6.
+
+### v0.6.29 upgrade / migration notes
+
+#### Auto
+
+- v0.6.28 → v0.6.29 binary upgrade is straightforward — no schema
+  changes. `agent-bridge upgrade --apply` propagates all changes.
+- The v0.6.28 P1 isolate hotfix (PR #423) takes effect on the first
+  `agent-bridge isolate <agent>` run after upgrade. The legacy
+  ledger location is auto-cleaned-on-write; no manual migration.
+
+#### Operator-required
+
+- **None for upgrades from v0.6.28**. Existing markerless installs
+  stay legacy by the resolver's `missing-marker(existing)` invariant
+  (PR-F default flip applies to fresh installs only).
+- **Fresh installs**: `agent-bridge init` now provisions v2 by
+  default. To stay on legacy: `BRIDGE_LAYOUT=legacy agent-bridge init`.
 
 ## [0.6.28] — 2026-04-28
 
