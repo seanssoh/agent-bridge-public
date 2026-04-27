@@ -2,14 +2,18 @@
 """bridge-wave.py — JSON state + render helpers for `agent-bridge wave`.
 
 Phase 1.1: state file read/write, README render, close-keyword lint, member-id
-generation. Worker startup + queue task creation are deferred to Phase 1.2.
+generation. Phase 1.2 adds per-member state mutation (`state-list-members`,
+`state-mark-running`) so dispatch can record worker / worktree / branch /
+queue-task wiring once a worker is spawned.
 
 Subcommands invoked from `lib/bridge-wave.sh`:
 
-  bridge-wave.py state-init <wave-id> <issue-or-brief> <main-agent> <worker-engine> <tracks-csv> <state-file> [<brief-file-relative-to-shared-root>]
+  bridge-wave.py state-init <wave-id> <issue-or-brief> <main-agent> <worker-engine> <reviewer> <tracks-csv> <state-file> [<brief-file-relative-to-shared-root>]
   bridge-wave.py state-show  <state-file>
   bridge-wave.py state-list  <state-dir>
   bridge-wave.py state-render-readme <state-file> <readme-out>
+  bridge-wave.py state-list-members <state-file> [--state pending|running|...]
+  bridge-wave.py state-mark-running <state-file> <member-id> --worker <name> --worktree-root <path> --branch <name> --task-id <int>
   bridge-wave.py member-id-generate <wave-id> <track>
   bridge-wave.py wave-id-generate <issue-or-brief>
   bridge-wave.py close-keyword-scan <file>...
@@ -185,6 +189,139 @@ def cmd_state_list(args: list[str]) -> int:
     return 0
 
 
+def cmd_state_list_members(args: list[str]) -> int:
+    """List members from a wave state file as TSV rows.
+
+    Output: one row per matching member, tab-separated:
+      <member_id>\t<track>\t<absolute_brief_path>
+
+    The brief path stored in state is relative to BRIDGE_SHARED_DIR; this
+    helper joins it with the supplied shared-dir to give the bash caller an
+    absolute path it can pass to `bridge-task.sh create --body-file`.
+
+    Args (positional):
+      <state-file> <shared-dir>
+    Args (optional):
+      --state <name>   only emit members in this state (default: pending)
+    """
+    state_filter = "pending"
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--state":
+            if i + 1 >= len(args):
+                print("usage: state-list-members <state-file> <shared-dir> [--state <name>]", file=sys.stderr)
+                return 2
+            state_filter = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--state="):
+            state_filter = a.split("=", 1)[1]
+            i += 1
+            continue
+        positional.append(a)
+        i += 1
+    if len(positional) != 2:
+        print("usage: state-list-members <state-file> <shared-dir> [--state <name>]", file=sys.stderr)
+        return 2
+    state_file, shared_dir = positional
+    state = json.loads(Path(state_file).read_text(encoding="utf-8"))
+    shared_root = Path(shared_dir)
+    for m in state.get("members", []):
+        if state_filter and m.get("state") != state_filter:
+            continue
+        brief_rel = m.get("brief_path") or ""
+        brief_abs = str(shared_root / brief_rel) if brief_rel else ""
+        print(f"{m['member_id']}\t{m.get('track', '')}\t{brief_abs}")
+    return 0
+
+
+def cmd_state_mark_running(args: list[str]) -> int:
+    """Atomically transition a wave member from `pending` → `running`.
+
+    Sets state="running" and the four wiring fields (worker / worktree_root /
+    branch / task_id) on the member identified by --member-id. Appends a
+    `wave_member_queued:<member-id>` audit row and bumps `updated_at`. Atomic
+    write via _atomic_write so a partial failure can't leave the JSON
+    half-written.
+
+    Args:
+      <state-file> --member-id <id> --worker <name> --worktree-root <path>
+                   --branch <name> --task-id <int>
+    """
+    if not args:
+        print(
+            "usage: state-mark-running <state-file> --member-id <id> "
+            "--worker <name> --worktree-root <path> --branch <name> --task-id <int>",
+            file=sys.stderr,
+        )
+        return 2
+    state_file = args[0]
+    rest = args[1:]
+
+    fields: dict[str, str] = {}
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("--member-id", "--worker", "--worktree-root", "--branch", "--task-id"):
+            if i + 1 >= len(rest):
+                print(f"missing value for {a}", file=sys.stderr)
+                return 2
+            fields[a.lstrip("-")] = rest[i + 1]
+            i += 2
+            continue
+        if "=" in a and a.startswith("--"):
+            k, v = a[2:].split("=", 1)
+            fields[k] = v
+            i += 1
+            continue
+        print(f"unknown arg: {a}", file=sys.stderr)
+        return 2
+
+    required = ("member-id", "worker", "worktree-root", "branch", "task-id")
+    for r in required:
+        if r not in fields:
+            print(f"missing required: --{r}", file=sys.stderr)
+            return 2
+
+    try:
+        task_id = int(fields["task-id"])
+    except ValueError:
+        print(f"--task-id must be an integer, got: {fields['task-id']!r}", file=sys.stderr)
+        return 2
+
+    path = Path(state_file)
+    if not path.exists():
+        print(f"state file not found: {path}", file=sys.stderr)
+        return 1
+    state = json.loads(path.read_text(encoding="utf-8"))
+
+    target_id = fields["member-id"]
+    matched = None
+    for m in state.get("members", []):
+        if m["member_id"] == target_id:
+            matched = m
+            break
+    if matched is None:
+        print(f"member not found in state: {target_id}", file=sys.stderr)
+        return 1
+
+    matched["state"] = "running"
+    matched["worker"] = fields["worker"]
+    matched["worktree_root"] = fields["worktree-root"]
+    matched["branch"] = fields["branch"]
+    matched["task_id"] = task_id
+
+    state["updated_at"] = _now_iso()
+    audit = state.setdefault("audit", [])
+    audit.append(f"wave_member_queued:{target_id}")
+
+    _atomic_write(path, json.dumps(state, indent=2, ensure_ascii=False) + "\n")
+    print(json.dumps(matched, indent=2, ensure_ascii=False))
+    return 0
+
+
 def cmd_state_render_readme(args: list[str]) -> int:
     if len(args) != 2:
         print("usage: state-render-readme <state-file> <readme-out>", file=sys.stderr)
@@ -321,6 +458,8 @@ def main(argv: list[str]) -> int:
         "state-init": cmd_state_init,
         "state-show": cmd_state_show,
         "state-list": cmd_state_list,
+        "state-list-members": cmd_state_list_members,
+        "state-mark-running": cmd_state_mark_running,
         "state-render-readme": cmd_state_render_readme,
         "state-show-pretty": cmd_state_show_pretty,
         "state-list-pretty": cmd_state_list_pretty,
