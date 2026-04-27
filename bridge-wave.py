@@ -232,7 +232,12 @@ def cmd_state_list_members(args: list[str]) -> int:
         if state_filter and m.get("state") != state_filter:
             continue
         brief_rel = m.get("brief_path") or ""
-        brief_abs = str(shared_root / brief_rel) if brief_rel else ""
+        # codex r1 item 9: brief paths must be absolute regardless of the
+        # caller's CWD or whether shared_dir is relative. `.resolve()` (not
+        # `.absolute()`) also normalizes symlinks so the consumer in
+        # lib/bridge-wave.sh can pass the path to `bridge-task.sh
+        # --body-file` from any CWD without ENOENT.
+        brief_abs = str((shared_root / brief_rel).resolve()) if brief_rel else ""
         print(f"{m['member_id']}\t{m.get('track', '')}\t{brief_abs}")
     return 0
 
@@ -245,6 +250,14 @@ def cmd_state_mark_running(args: list[str]) -> int:
     `wave_member_queued:<member-id>` audit row and bumps `updated_at`. Atomic
     write via _atomic_write so a partial failure can't leave the JSON
     half-written.
+
+    Exit codes:
+      0  — member transitioned pending -> running
+      1  — state file or member not found
+      2  — required arg missing / invalid (incl. empty value for a wiring field)
+      3  — state precondition violated: the member is not in `pending` (e.g.
+           already running). Caller should treat this as "skip" rather than
+           fatal so retry / partial-rerun scenarios are idempotent.
 
     Args:
       <state-file> --member-id <id> --worker <name> --worktree-root <path>
@@ -285,6 +298,13 @@ def cmd_state_mark_running(args: list[str]) -> int:
             print(f"missing required: --{r}", file=sys.stderr)
             return 2
 
+    # codex r1 item 10: reject empty-string wiring fields up front so we
+    # never advance state to running with a blank worker / branch / etc.
+    for r in required:
+        if not fields[r].strip():
+            print(f"refusing to mark-running: empty --{r}", file=sys.stderr)
+            return 2
+
     try:
         task_id = int(fields["task-id"])
     except ValueError:
@@ -307,6 +327,18 @@ def cmd_state_mark_running(args: list[str]) -> int:
         print(f"member not found in state: {target_id}", file=sys.stderr)
         return 1
 
+    # codex r1 item 4: only `pending` -> `running` is a legal transition.
+    # Refuse with rc=3 so the bash dispatcher can interpret this as
+    # "already-advanced, skip" rather than treating it as fatal.
+    prior_state = matched.get("state")
+    if prior_state != "pending":
+        print(
+            f"refusing to mark-running: member {target_id} is in state "
+            f"{prior_state!r}, not 'pending'",
+            file=sys.stderr,
+        )
+        return 3
+
     matched["state"] = "running"
     matched["worker"] = fields["worker"]
     matched["worktree_root"] = fields["worktree-root"]
@@ -315,7 +347,15 @@ def cmd_state_mark_running(args: list[str]) -> int:
 
     state["updated_at"] = _now_iso()
     audit = state.setdefault("audit", [])
-    audit.append(f"wave_member_queued:{target_id}")
+    # codex r1 item 5: state-only inspection should still see worker / task
+    # / worktree wiring without having to cross-reference bridge_audit_log.
+    audit.append(
+        f"wave_member_queued:{target_id}"
+        f" worker={fields['worker']}"
+        f" task_id={task_id}"
+        f" worktree_root={fields['worktree-root']}"
+        f" branch={fields['branch']}"
+    )
 
     _atomic_write(path, json.dumps(state, indent=2, ensure_ascii=False) + "\n")
     print(json.dumps(matched, indent=2, ensure_ascii=False))

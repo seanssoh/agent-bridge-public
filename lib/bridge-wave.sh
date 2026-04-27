@@ -322,29 +322,49 @@ _bridge_wave_dispatch_member() {
         --priority high \
         --title "[wave $wave_id track $track] $member_id" \
         --body-file "$brief_path" 2>&1)"; then
+    # codex r1 item 3 (atomicity): the worker was spawned successfully but
+    # queue-task creation failed. Hard-killing the tmux session from here
+    # would race with the operator's own attach, so we leave the worker
+    # alive and emit a `wave_member_dispatch_partial` audit row so the
+    # leak is observable and the operator can clean it up manually
+    # (`agent-bridge worktree remove <worker>` + tmux kill-session).
     bridge_warn "wave dispatch: queue task create failed for $member_id: $task_create_out"
+    bridge_audit_log wave-orchestration wave_member_dispatch_partial "$main_agent" \
+      --detail wave_id="$wave_id" \
+      --detail member_id="$member_id" \
+      --detail track="$track" \
+      --detail worker="$worker_name" \
+      --detail worktree="$worktree_root" \
+      --detail branch="$branch" \
+      --detail stage="queue_task_create" \
+      --detail error="$task_create_out" \
+      || true
     return 1
   fi
   if [[ "$task_create_out" =~ created\ task\ \#([0-9]+) ]]; then
     task_id="${BASH_REMATCH[1]}"
   else
     bridge_warn "wave dispatch: could not parse task id from create output: $task_create_out"
+    bridge_audit_log wave-orchestration wave_member_dispatch_partial "$main_agent" \
+      --detail wave_id="$wave_id" \
+      --detail member_id="$member_id" \
+      --detail track="$track" \
+      --detail worker="$worker_name" \
+      --detail worktree="$worktree_root" \
+      --detail branch="$branch" \
+      --detail stage="task_id_parse" \
+      --detail error="$task_create_out" \
+      || true
     return 1
   fi
 
-  # 4. Atomic state transition pending -> running.
-  if ! python3 "$(bridge_wave_python_helper)" state-mark-running \
-      "$state_file" \
-      --member-id "$member_id" \
-      --worker "$worker_name" \
-      --worktree-root "$worktree_root" \
-      --branch "$branch" \
-      --task-id "$task_id" >/dev/null; then
-    bridge_warn "wave dispatch: state-mark-running failed for $member_id"
-    return 1
-  fi
-
-  # 5. Audit + console row (per design §10).
+  # 4. Detailed bridge_audit_log BEFORE state-mark-running write
+  #    (codex r1 item 5). The contract is: audit is written first, the
+  #    state file is the durable record of the transition. If the audit
+  #    write fails (`|| true`) we still proceed with the state mutation;
+  #    if the state write fails we attempt to roll the queue task back
+  #    and emit a `_rollback` audit row so the partial state is
+  #    observable.
   bridge_audit_log wave-orchestration wave_member_queued "$main_agent" \
     --detail wave_id="$wave_id" \
     --detail member_id="$member_id" \
@@ -354,6 +374,57 @@ _bridge_wave_dispatch_member() {
     --detail branch="$branch" \
     --detail task_id="$task_id" \
     || true
+
+  # 5. Atomic state transition pending -> running.
+  local mr_rc=0
+  python3 "$(bridge_wave_python_helper)" state-mark-running \
+      "$state_file" \
+      --member-id "$member_id" \
+      --worker "$worker_name" \
+      --worktree-root "$worktree_root" \
+      --branch "$branch" \
+      --task-id "$task_id" >/dev/null || mr_rc=$?
+  if (( mr_rc == 3 )); then
+    # codex r1 items 4 + 10: the member is already advanced past pending
+    # (e.g. a prior dispatch round handled it). Treat as a no-op skip:
+    # close the duplicate queue task we just opened so the worker isn't
+    # double-assigned, and consider the dispatch successful for this
+    # member.
+    bridge_warn "wave dispatch: member $member_id already advanced past 'pending'; skipping (rc=3)"
+    "$BRIDGE_BASH_BIN" "$BRIDGE_SCRIPT_DIR/bridge-task.sh" done "$task_id" \
+      --agent "$worker_name" \
+      --note "wave dispatch skipped: member already advanced past pending" \
+      >/dev/null 2>&1 || bridge_warn "wave dispatch: could not close duplicate task #$task_id (member $member_id)"
+    rm -f "$spawn_log"
+    return 0
+  fi
+  if (( mr_rc != 0 )); then
+    # codex r1 item 3 (atomicity rollback): queue task succeeded but the
+    # state-mark-running write failed. Best-effort close the queue task
+    # so the worker doesn't pick up an orphaned brief, then emit a
+    # `wave_member_dispatch_rollback` audit row.
+    bridge_warn "wave dispatch: state-mark-running failed for $member_id (rc=$mr_rc); attempting queue-task rollback"
+    local rollback_out=""
+    if ! rollback_out="$("$BRIDGE_BASH_BIN" "$BRIDGE_SCRIPT_DIR/bridge-task.sh" done "$task_id" \
+          --agent "$worker_name" \
+          --note "wave dispatch state-mark-running failed; rolled back" 2>&1)"; then
+      bridge_warn "wave dispatch: rollback close of task #$task_id failed: $rollback_out (member $member_id)"
+    fi
+    bridge_audit_log wave-orchestration wave_member_dispatch_rollback "$main_agent" \
+      --detail wave_id="$wave_id" \
+      --detail member_id="$member_id" \
+      --detail track="$track" \
+      --detail worker="$worker_name" \
+      --detail worktree="$worktree_root" \
+      --detail branch="$branch" \
+      --detail task_id="$task_id" \
+      --detail stage="state_mark_running" \
+      --detail mr_rc="$mr_rc" \
+      || true
+    return 1
+  fi
+
+  # 6. Console row (per design §10). Audit was emitted in step 4.
   printf '  %s -> worker=%s task=#%s worktree=%s\n' \
     "$member_id" "$worker_name" "$task_id" "$worktree_root"
 

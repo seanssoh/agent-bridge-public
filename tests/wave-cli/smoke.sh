@@ -273,12 +273,31 @@ list_out="$(python3 "$WAVE_PY" state-list-members "$list_members_state" "$BRIDGE
 list_count="$(printf '%s\n' "$list_out" | grep -c $'\t' || true)"
 [[ "$list_count" == 2 ]] || die "state-list-members expected 2 rows, got $list_count: $list_out"
 # Each row: <member_id>\t<track>\t<absolute_brief_path>
+# codex r1 item 11: brief paths must be absolute and exist on disk
+# regardless of caller CWD or whether shared_dir was passed as a
+# relative path.
 while IFS=$'\t' read -r m_id m_track m_brief; do
   [[ -n "$m_id" ]] || die "state-list-members row missing member_id"
   [[ -n "$m_track" ]] || die "state-list-members row missing track for $m_id"
   [[ -f "$m_brief" ]] || die "state-list-members brief path not on disk: $m_brief"
+  [[ "$m_brief" = /* ]] || die "state-list-members brief path is not absolute: $m_brief"
 done <<<"$list_out"
 ok "state-list-members emits TSV rows with absolute brief paths"
+
+# 8a'. Run state-list-members from a CWD other than the state dir with a
+# relative shared-dir path; the emitted brief paths must still be
+# absolute (codex r1 item 11 — `.resolve()` not `.absolute()` so the
+# resolution doesn't depend on the caller's CWD).
+shared_rel="$(python3 -c 'import os, sys; print(os.path.relpath(sys.argv[1], "/tmp"))' "$BRIDGE_SHARED_DIR")"
+state_rel="$(python3 -c 'import os, sys; print(os.path.relpath(sys.argv[1], "/tmp"))' "$list_members_state")"
+list_out_rel="$(cd /tmp && python3 "$WAVE_PY" state-list-members "$state_rel" "$shared_rel")"
+[[ -n "$list_out_rel" ]] || die "state-list-members from /tmp produced no rows"
+while IFS=$'\t' read -r _m_id _m_track m_brief_rel; do
+  [[ -n "$m_brief_rel" ]] || continue
+  [[ "$m_brief_rel" = /* ]] || die "state-list-members from other CWD emitted non-absolute path: $m_brief_rel"
+  [[ -f "$m_brief_rel" ]] || die "state-list-members from other CWD: brief not on disk: $m_brief_rel"
+done <<<"$list_out_rel"
+ok "state-list-members produces absolute paths even when invoked from a different CWD"
 
 # 8b. state-list-members --state running on a fresh wave returns empty.
 running_out="$(python3 "$WAVE_PY" state-list-members "$list_members_state" "$BRIDGE_SHARED_DIR" --state running)"
@@ -311,9 +330,16 @@ assert hit["branch"] == f"agent-bridge/{target}", f"branch mismatch: {hit['branc
 others = [m for m in s["members"] if m["member_id"] != target]
 assert all(m["state"] == "pending" for m in others), "non-target members should remain pending"
 # Audit row must be appended (Phase 1.1 wrote `wave_dispatched`; Phase 1.2
-# appends `wave_member_queued:<member-id>`).
-assert any(a == f"wave_member_queued:{target}" for a in s.get("audit", [])), (
-    f"audit row wave_member_queued:{target} missing; got: {s.get('audit')!r}"
+# appends `wave_member_queued:<member-id> worker=… task_id=… worktree_root=…
+# branch=…` so a state-only inspection can see the full wiring without
+# having to cross-reference bridge_audit_log).
+prefix = f"wave_member_queued:{target}"
+matching = [a for a in s.get("audit", []) if a.startswith(prefix + " ") or a == prefix]
+assert matching, (
+    f"audit row {prefix} missing; got: {s.get('audit')!r}"
+)
+assert any("worker=" in a and "task_id=12345" in a for a in matching), (
+    f"audit row missing worker/task wiring; got: {matching!r}"
 )
 PY
 ok "state-mark-running transitions one member pending -> running and audits"
@@ -359,7 +385,68 @@ log "all Phase 1.1 + 1.2 acceptance checks passed"
 # ---------------------------------------------------------------------------
 if [[ "${BRIDGE_WAVE_PHASE_1_2_LIVE_TEST:-0}" == "1" ]]; then
   log "BRIDGE_WAVE_PHASE_1_2_LIVE_TEST=1 — running live dispatch test (may launch tmux sessions)"
-  live_out="$("$AB" wave dispatch 276 --tracks A --main-agent ws-smoke --repo-root "$REPO_ROOT" 2>&1)"
+
+  # codex r1 item 12: live workers + queue tasks must be torn down on
+  # exit (success OR failure) so the smoke is rerunnable. The cleanup
+  # uses a randomized title/session prefix so concurrent invocations
+  # never collide, and is idempotent — the trap may fire twice (once
+  # from EXIT, once if we re-arm the trap) and must not error.
+  LIVE_PREFIX="wave-p12-livetest-${RANDOM}-$$"
+  LIVE_TITLE_PREFIX="[livetest ${LIVE_PREFIX}]"
+  export BRIDGE_WAVE_LIVETEST_PREFIX="$LIVE_PREFIX"
+
+  _wave_livetest_cleanup() {
+    # Idempotent — every command swallows its own errors so re-running
+    # the trap (or running it after a partial setup) is safe.
+    if command -v tmux >/dev/null 2>&1; then
+      # Find sessions whose name contains our prefix and kill them.
+      tmux list-sessions -F '#S' 2>/dev/null \
+        | grep -F "$LIVE_PREFIX" 2>/dev/null \
+        | while IFS= read -r _sess; do
+            [[ -n "$_sess" ]] || continue
+            tmux kill-session -t "$_sess" 2>/dev/null || true
+          done
+    fi
+    # Cancel any queue tasks created by this run. Best-effort: list,
+    # match by title prefix, mark done. The queue tooling tolerates
+    # repeat `done` calls on a closed task without erroring.
+    if [[ -x "$AB" ]]; then
+      "$AB" inbox --json 2>/dev/null \
+        | python3 -c '
+import json, os, sys
+prefix = os.environ.get("BRIDGE_WAVE_LIVETEST_PREFIX", "")
+if not prefix:
+    sys.exit(0)
+try:
+    data = json.loads(sys.stdin.read() or "{}")
+except Exception:
+    sys.exit(0)
+tasks = data if isinstance(data, list) else data.get("tasks", [])
+for t in tasks:
+    title = t.get("title", "") or ""
+    tid = t.get("id") or t.get("task_id")
+    if prefix in title and tid is not None:
+        print(tid)
+' 2>/dev/null \
+        | while IFS= read -r _tid; do
+            [[ -n "$_tid" ]] || continue
+            "$BRIDGE_BASH_BIN" "$REPO_ROOT/bridge-task.sh" done "$_tid" \
+              --agent ws-smoke \
+              --note "livetest cleanup ($LIVE_PREFIX)" >/dev/null 2>&1 || true
+          done
+    fi
+    # TMP_ROOT is already covered by the outer `trap … EXIT` (line ~37);
+    # this no-op is here as documentation / belt-and-braces in case the
+    # outer trap is replaced.
+    [[ -d "${TMP_ROOT:-}" ]] && rm -rf "$TMP_ROOT"/livetest-* 2>/dev/null || true
+  }
+  # Compose a trap that runs both the existing TMP_ROOT cleanup and the
+  # livetest teardown. The EXIT trap is rebound here (not added) so we
+  # have to keep the original rm -rf call too.
+  trap '_wave_livetest_cleanup; rm -rf "$TMP_ROOT" >/dev/null 2>&1 || true' EXIT
+
+  live_out="$("$AB" wave dispatch 276 --tracks "${LIVE_PREFIX}" --main-agent ws-smoke --repo-root "$REPO_ROOT" 2>&1)" \
+    || die "live dispatch failed: $live_out"
   live_wave_id="$(printf '%s\n' "$live_out" | awk '/^wave dispatched: /{print $3}')"
   [[ -n "$live_wave_id" ]] || die "live dispatch did not return wave id: $live_out"
   python3 - "$BRIDGE_STATE_DIR/waves/${live_wave_id}.json" <<'PY' || die "live dispatch did not transition member to running"
@@ -374,4 +461,9 @@ for m in running:
     assert m["branch"], f"running member missing branch: {m}"
 PY
   ok "live dispatch transitions a member to running with full wiring"
+
+  # Verify cleanup is idempotent: invoking it again must not error.
+  _wave_livetest_cleanup
+  _wave_livetest_cleanup
+  ok "live dispatch cleanup is idempotent"
 fi
