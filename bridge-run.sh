@@ -166,7 +166,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "safe_mode=$SAFE_MODE"
   echo "channels=$(bridge_agent_channels_csv "$AGENT")"
   echo "channel_status=$(bridge_agent_channel_status "$AGENT")"
-  echo "launch=$LAUNCH_CMD"
+  echo "launch=$(bridge_redact_inline_env_secrets "$LAUNCH_CMD")"
   exit 0
 fi
 
@@ -437,7 +437,7 @@ bridge_run_safe_mode_resume_hint() {
   mode="$(bridge_safe_mode_resume_mode "$AGENT")"
   admin_agent="$(bridge_require_admin_agent 2>/dev/null || true)"
   log_line "[safe-mode] booting ${AGENT} with minimal launch"
-  log_line "[safe-mode] ignored roster launch_cmd: $(bridge_agent_launch_cmd_raw "$AGENT")"
+  log_line "[safe-mode] ignored roster launch_cmd: $(bridge_redact_inline_env_secrets "$(bridge_agent_launch_cmd_raw "$AGENT")")"
   if [[ -n "$(bridge_agent_channels_csv "$AGENT")" ]]; then
     log_line "[safe-mode] suppressed channels: $(bridge_agent_channels_csv "$AGENT")"
   fi
@@ -487,6 +487,7 @@ RAPID_FAIL_WINDOW="${BRIDGE_RUN_RAPID_FAIL_WINDOW_SECONDS:-10}"
 MAX_RAPID_FAILS="${BRIDGE_RUN_MAX_RAPID_FAILS:-5}"
 HEALTHY_RUN_RESET_SECONDS="${BRIDGE_RUN_HEALTHY_RESET_SECONDS:-60}"
 while true; do
+  local_launch_cmd_display=""
   local_err_size_before=0
   local_err_size_after=0
   run_started_at=0
@@ -503,6 +504,7 @@ while true; do
     LAUNCH_CMD="$(bridge_agent_launch_cmd "$AGENT")"
   fi
   [[ -n "$LAUNCH_CMD" ]] || bridge_die "'$AGENT'의 launch command가 비어 있습니다."
+  local_launch_cmd_display="$(bridge_redact_inline_env_secrets "$LAUNCH_CMD")"
 
   if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
     bridge_run_sync_dev_plugin_cache
@@ -511,15 +513,14 @@ while true; do
     bridge_run_schedule_idle_marker_and_inbox_bootstrap
   fi
 
-  log_line "실행: ${LAUNCH_CMD}"
+  log_line "실행: ${local_launch_cmd_display}"
   if [[ -f "$ERRFILE" ]]; then
     local_err_size_before="$(wc -c <"$ERRFILE" 2>/dev/null || echo 0)"
   fi
   # v2 isolation: load per-agent launch secrets from credentials/launch-secrets.env
   # into the child shell so the child inherits them via export, NEVER via
   # composing into LAUNCH_CMD. Composing tokens into LAUNCH_CMD leaks via
-  # process listings, the `log_line` above, dry-run output, the crash-report
-  # path (bridge_agent_write_crash_report writes LAUNCH_CMD verbatim), and
+  # process listings, raw display output, crash-report paths, and
   # any tee'd stderr. Loading inside the launch subshell (not the parent)
   # also prevents stale secrets from persisting across restart-loop
   # iterations after the credentials file is rotated, emptied, or removed.
@@ -597,7 +598,7 @@ while true; do
       RAPID_FAIL_COUNT=0
     fi
     if [[ $FAIL_COUNT -eq 5 || $(( FAIL_COUNT % 10 )) -eq 0 ]]; then
-      bridge_agent_write_crash_report "$AGENT" "$ENGINE" "$FAIL_COUNT" "$EXIT_CODE" "$ERRFILE" "$LAUNCH_CMD"
+      bridge_agent_write_crash_report "$AGENT" "$ENGINE" "$FAIL_COUNT" "$EXIT_CODE" "$ERRFILE" "$local_launch_cmd_display"
       bridge_audit_log daemon crash_loop_detected "$AGENT" \
         --detail engine="$ENGINE" \
         --detail fail_count="$FAIL_COUNT" \
@@ -605,8 +606,8 @@ while true; do
         --detail stderr_file="$ERRFILE"
     fi
     if [[ $rapid_failure -eq 1 && "$RAPID_FAIL_COUNT" =~ ^[0-9]+$ && "$MAX_RAPID_FAILS" =~ ^[0-9]+$ && $RAPID_FAIL_COUNT -ge $MAX_RAPID_FAILS ]]; then
-      bridge_agent_write_crash_report "$AGENT" "$ENGINE" "$FAIL_COUNT" "$EXIT_CODE" "$ERRFILE" "$LAUNCH_CMD"
-      bridge_agent_write_broken_launch_state "$AGENT" "$ENGINE" "$FAIL_COUNT" "$EXIT_CODE" "$ERRFILE" "$LAUNCH_CMD" "$local_err_size_before"
+      bridge_agent_write_crash_report "$AGENT" "$ENGINE" "$FAIL_COUNT" "$EXIT_CODE" "$ERRFILE" "$local_launch_cmd_display"
+      bridge_agent_write_broken_launch_state "$AGENT" "$ENGINE" "$FAIL_COUNT" "$EXIT_CODE" "$ERRFILE" "$local_launch_cmd_display" "$local_err_size_before"
       bridge_audit_log daemon crash_loop_broken "$AGENT" \
         --detail engine="$ENGINE" \
         --detail fail_count="$FAIL_COUNT" \

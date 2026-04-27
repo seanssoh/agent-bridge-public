@@ -210,6 +210,31 @@ else
   log "shellcheck not installed; skipping"
 fi
 
+log "redacting sensitive inline env vars from launch display paths (#428)"
+LAUNCH_REDACTION_OUTPUT="$("$BASH4_BIN" -s "$REPO_ROOT" <<'BASH_REDACTION'
+set -euo pipefail
+repo="$1"
+source "$repo/lib/bridge-core.sh"
+bridge_redact_inline_env_secrets "MS365_CLIENT_SECRET=s3cr3t SAFE_FLAG=1 API_KEY=abc BEARER_TOKEN=zzz SERVICE_PWD=pwd DB_PASSWORD='with space' OPTIONAL_KEY=\"quoted secret\" OAUTH_TOKEN=hello\\ world ANSI_SECRET=\$'line space' claude --ok"
+BASH_REDACTION
+)"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "MS365_CLIENT_SECRET=***redacted***"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "API_KEY=***redacted***"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "BEARER_TOKEN=***redacted***"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "SERVICE_PWD=***redacted***"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "DB_PASSWORD=***redacted***"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "OPTIONAL_KEY=***redacted***"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "OAUTH_TOKEN=***redacted***"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "ANSI_SECRET=***redacted***"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "SAFE_FLAG=1"
+assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "s3cr3t"
+assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "abc"
+assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "zzz"
+assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "with space"
+assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "quoted secret"
+assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "hello"
+assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "line space"
+
 log "bridge_cron_sync_enabled reducer: any-0-disables semantics (issue #192)"
 # Regression matrix for the `BRIDGE_CRON_SYNC_ENABLED` reducer introduced
 # in #213 after the original precedence chain silently let an outer =1
@@ -1836,7 +1861,7 @@ BRIDGE_STATE_DIR="$BROKEN_LAUNCH_HOME/state" "$BASH4_BIN" -lc '
   # `bridge_load_roster` would error without a roster file; skip it — the two
   # helpers we are exercising only touch $BRIDGE_STATE_DIR.
   source "'"$REPO_ROOT"'/bridge-lib.sh"
-  bridge_agent_write_broken_launch_state "'"$BROKEN_LAUNCH_AGENT"'" "claude" 5 1 "/tmp/err.log" "bash bridge-run.sh broken-smoke" 0
+  bridge_agent_write_broken_launch_state "'"$BROKEN_LAUNCH_AGENT"'" "claude" 5 1 "/tmp/err.log" "MS365_CLIENT_SECRET=broken-secret API_KEY=broken-key bash bridge-run.sh broken-smoke" 0
 '
 BROKEN_FILE="$BROKEN_LAUNCH_HOME/state/agents/$BROKEN_LAUNCH_AGENT/broken-launch"
 [[ -s "$BROKEN_FILE" ]] || die "bridge_agent_write_broken_launch_state did not create the quarantine file"
@@ -1851,6 +1876,10 @@ assert payload.get("fail_count") == 5, payload
 assert payload.get("exit_code") == 1, payload
 assert payload.get("engine") == "claude", payload
 assert payload.get("launch_cmd"), payload
+assert "broken-secret" not in payload.get("launch_cmd", ""), payload
+assert "broken-key" not in payload.get("launch_cmd", ""), payload
+assert "MS365_CLIENT_SECRET=***redacted***" in payload.get("launch_cmd", ""), payload
+assert "API_KEY=***redacted***" in payload.get("launch_cmd", ""), payload
 assert payload.get("stderr_file") == "/tmp/err.log", payload
 assert payload.get("quarantined_at"), payload
 PY
@@ -8495,10 +8524,15 @@ cat >"$CRASH_ERRFILE" <<'EOF'
 fatal: token expired
 unable to open runtime config
 EOF
-"$BASH4_BIN" -lc "source \"$REPO_ROOT/bridge-lib.sh\"; bridge_load_roster; bridge_agent_write_crash_report \"$BROKEN_CHANNEL_AGENT\" \"claude\" \"5\" \"1\" \"$CRASH_ERRFILE\" 'claude --dangerously-skip-permissions'"
+"$BASH4_BIN" -lc "source \"$REPO_ROOT/bridge-lib.sh\"; bridge_load_roster; bridge_agent_write_crash_report \"$BROKEN_CHANNEL_AGENT\" \"claude\" \"5\" \"1\" \"$CRASH_ERRFILE\" 'MS365_CLIENT_SECRET=crash-secret API_KEY=crash-key claude --dangerously-skip-permissions'"
 bash "$REPO_ROOT/bridge-daemon.sh" sync >/dev/null
 CRASH_OPEN_ID="$(python3 "$REPO_ROOT/bridge-queue.py" find-open --agent "$SMOKE_AGENT" --title-prefix "[crash-loop] $BROKEN_CHANNEL_AGENT " 2>/dev/null || true)"
 [[ "$CRASH_OPEN_ID" =~ ^[0-9]+$ ]] || die "expected crash-loop task for $BROKEN_CHANNEL_AGENT"
+CRASH_BODY_FILE="$("$BASH4_BIN" -lc "source \"$REPO_ROOT/bridge-lib.sh\"; bridge_load_roster; bridge_agent_crash_report_body_file \"$BROKEN_CHANNEL_AGENT\"")"
+assert_contains "$(cat "$CRASH_BODY_FILE")" "MS365_CLIENT_SECRET=***redacted***"
+assert_contains "$(cat "$CRASH_BODY_FILE")" "API_KEY=***redacted***"
+assert_not_contains "$(cat "$CRASH_BODY_FILE")" "crash-secret"
+assert_not_contains "$(cat "$CRASH_BODY_FILE")" "crash-key"
 bash "$REPO_ROOT/bridge-task.sh" done "$CRASH_OPEN_ID" --agent "$SMOKE_AGENT" --note "crash report handled" >/dev/null
 CRASH_STATE_FILE="$("$BASH4_BIN" -lc "source \"$REPO_ROOT/bridge-lib.sh\"; bridge_load_roster; bridge_agent_crash_state_file \"$BROKEN_CHANNEL_AGENT\"")"
 [[ -f "$CRASH_STATE_FILE" ]] || die "expected crash state file for $BROKEN_CHANNEL_AGENT"
@@ -8507,7 +8541,6 @@ BRIDGE_CRASH_REPORT_COOLDOWN_SECONDS=0 bash "$REPO_ROOT/bridge-daemon.sh" sync >
 CRASH_OPEN_ID_AGAIN="$(python3 "$REPO_ROOT/bridge-queue.py" find-open --agent "$SMOKE_AGENT" --title-prefix "[crash-loop] $BROKEN_CHANNEL_AGENT " 2>/dev/null || true)"
 [[ -z "$CRASH_OPEN_ID_AGAIN" ]] || die "crash-loop report should stay acked while error hash is unchanged"
 "$BASH4_BIN" -lc "source \"$REPO_ROOT/bridge-lib.sh\"; bridge_load_roster; bridge_agent_clear_crash_report \"$BROKEN_CHANNEL_AGENT\""
-CRASH_BODY_FILE="$("$BASH4_BIN" -lc "source \"$REPO_ROOT/bridge-lib.sh\"; bridge_load_roster; bridge_agent_crash_report_body_file \"$BROKEN_CHANNEL_AGENT\"")"
 [[ ! -f "$CRASH_BODY_FILE" ]] || die "expected crash report body file to be removed on clear"
 
 log "directly alerting on admin crash loops"
