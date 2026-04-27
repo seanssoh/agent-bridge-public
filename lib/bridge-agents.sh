@@ -2545,6 +2545,34 @@ bridge_linux_prepare_agent_isolation() {
   # Root traverse-only on the gateway root for the isolated UID prevents
   # cross-agent dir-name enumeration while keeping its own subtree reachable.
   bridge_linux_acl_add "u:${os_user}:--x" "$queue_gateway_root" >/dev/null 2>&1 || true
+
+  # Issue #412 Track B: grant the isolated UID r-- on its own queue body
+  # files. Bodies live under $BRIDGE_STATE_DIR/queue/bodies/ and are
+  # written by bridge-queue.py with mode 0600, owner = controller. The
+  # queue CLI emits the body path back to callers via TASK_BODY_PATH, and
+  # downstream flows (e.g. agb claim wrappers) cat the file directly from
+  # the isolated UID context. Without an ACL grant the read fails with
+  # EACCES even after agb claim succeeds, leaving the agent with no way
+  # to read the body of its own claimed task.
+  #
+  # Default ACL inheritance grants the same r-- on bodies created later
+  # by the controller. Legacy ACL only — under v2 (group setgid) the
+  # bridge_linux_acl_add primitive short-circuits to a no-op, and the
+  # state/queue/bodies tree inherits the ab-controller group from the
+  # state/ parent (which the isolated UID is not a member of). v2 needs
+  # a follow-up to extend the queue body share semantics to the per-agent
+  # group; until then, v2 installs see the same EACCES as before.
+  local _queue_bodies_dir
+  _queue_bodies_dir="$BRIDGE_STATE_DIR/queue/bodies"
+  bridge_linux_sudo_root mkdir -p "$_queue_bodies_dir"
+  if [[ -d "$_queue_bodies_dir" ]]; then
+    bridge_linux_acl_add "u:${os_user}:r-x" "$_queue_bodies_dir" >/dev/null 2>&1 || true
+    bridge_linux_acl_add_default_dirs_recursive \
+      "u:${os_user}:r--" "$_queue_bodies_dir" >/dev/null 2>&1 || true
+    bridge_linux_acl_add_recursive \
+      "u:${os_user}:r-X" "$_queue_bodies_dir" >/dev/null 2>&1 || true
+  fi
+
   hidden_paths+=("$BRIDGE_ROSTER_FILE" "$BRIDGE_ROSTER_LOCAL_FILE" "$BRIDGE_RUNTIME_CREDENTIALS_DIR" "$BRIDGE_RUNTIME_SECRETS_DIR" "$BRIDGE_RUNTIME_CONFIG_FILE" "$BRIDGE_TASK_DB" "${BRIDGE_LOG_DIR}/audit.jsonl")
 
   # Issue #233: every traverse_chain call used to climb unconditionally
