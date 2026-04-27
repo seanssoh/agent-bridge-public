@@ -335,8 +335,25 @@ esac
 # materialized $BRIDGE_HOME/state and the v2 layout choice has to be honored
 # by every subsequent call site (workdir, env writer, etc.).
 init_layout_planned=""
-if [[ "${BRIDGE_LAYOUT_SOURCE:-}" == "fresh-install-candidate" ]]; then
-  fresh_data_root="${data_root_flag:-${BRIDGE_DEFAULT_DATA_ROOT:-$BRIDGE_HOME/data}}"
+# Issue #418 codex r1 #4: marker write also fires when the operator
+# explicitly sets `BRIDGE_LAYOUT=v2` in env before running init. Without
+# this, env-set v2 init runs v2 transiently but no durable marker is
+# written, so when env unsets later the install reverts to legacy on the
+# same data. The legacy env path stays no-op because legacy is the
+# default and doesn't need a marker.
+_init_should_write_marker=0
+case "${BRIDGE_LAYOUT_SOURCE:-}" in
+  fresh-install-candidate)
+    _init_should_write_marker=1
+    ;;
+  env)
+    if [[ "${BRIDGE_LAYOUT:-legacy}" == "v2" ]]; then
+      _init_should_write_marker=1
+    fi
+    ;;
+esac
+if [[ $_init_should_write_marker -eq 1 ]]; then
+  fresh_data_root="${data_root_flag:-${BRIDGE_DATA_ROOT:-${BRIDGE_DEFAULT_DATA_ROOT:-$BRIDGE_HOME/data}}}"
   if [[ "${fresh_data_root:0:1}" != "/" ]]; then
     bridge_die "--data-root must be absolute (got '$fresh_data_root')"
   fi

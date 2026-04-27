@@ -849,7 +849,12 @@ bridge_isolation_v2_migrate_status() {
       printf 'marker_valid: no\n'
     fi
     printf '---\n'
-    cat "$marker_path"
+    # Issue #418 codex r1 #7: filter marker contents to the documented
+    # schema keys before printing. Tampered or malformed lines (e.g.,
+    # injected shell comments / unrelated assignments) are dropped so
+    # operator-visible output never echoes attacker-controlled bytes.
+    grep -E '^(BRIDGE_LAYOUT_MARKER_VERSION|BRIDGE_LAYOUT|BRIDGE_DATA_ROOT|BRIDGE_LAYOUT_MARKER_CREATED_AT)=' "$marker_path" 2>/dev/null \
+      || printf 'invalid-marker(redacted)\n'
     printf '---\n'
   else
     printf 'marker_valid: absent\n'
