@@ -44,6 +44,13 @@ mkdir -p "$POPULATED/agents/foo" \
 echo "<<<< live a" >"$POPULATED/agents/foo/CLAUDE.md.upgrade-conflict"
 echo "<<<< live b" >"$POPULATED/scripts/smoke-test.sh.upgrade-conflict"
 
+# Make the alphabetically-second file the older mtime so sort-by-mtime
+# produces a different order than sort-by-path. Used by case 6 (codex r1
+# fix verification: plain-text output must sort by mtime ascending, not
+# by path).
+touch -t 202604010101 "$POPULATED/scripts/smoke-test.sh.upgrade-conflict"
+touch -t 202604271200 "$POPULATED/agents/foo/CLAUDE.md.upgrade-conflict"
+
 # One archived conflict under backups/ that must NOT be reported.
 echo "<<<< archived" >"$POPULATED/backups/upgrade-old/stale.md.upgrade-conflict"
 
@@ -136,5 +143,21 @@ if "$AB" upgrade conflicts diff /tmp/foo >/dev/null 2>&1; then
   die "expected non-zero exit for 'conflicts diff' (PR-2 not yet shipped)"
 fi
 ok "unknown 'conflicts diff' rejected"
+
+# 6. Plain-text rows are sorted by mtime ascending (codex r1 #5 regression).
+# Per the fixture above, scripts/...upgrade-conflict is older (2026-04-01)
+# than agents/foo/CLAUDE.md.upgrade-conflict (2026-04-27). Plain output
+# should list the older entry FIRST despite alphabetical ordering placing
+# agents/foo before scripts/. JSON output already passed mtime sort in
+# case 2's shape check.
+log "case 6: plain-text rows sorted by mtime ascending"
+SORT_PLAIN_OUT="$("$AB" upgrade conflicts list --target "$POPULATED" 2>/dev/null || true)"
+SORT_FIRST_PATH="$(printf '%s\n' "$SORT_PLAIN_OUT" | head -n1 | awk -F'\t' '{print $1}')"
+case "$SORT_FIRST_PATH" in
+  *"scripts/smoke-test.sh.upgrade-conflict") ok "older scripts/ entry listed first (mtime-asc sort)" ;;
+  *)
+    die "expected scripts/...upgrade-conflict (older mtime) first; got '$SORT_FIRST_PATH' — plain output sorted by path, not mtime"
+    ;;
+esac
 
 log "all cases passed"

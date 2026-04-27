@@ -589,15 +589,29 @@ results.sort(key=lambda r: r["mtime"])
 print(json.dumps({"conflicts": results, "count": len(results)}, indent=2, ensure_ascii=False))
 '
   else
+    # Issue #394 PR-1 r2 (codex r1 #5): sort plain-text rows by mtime
+    # ascending so the operator-visible order matches the documented
+    # contract (oldest first). JSON path already sorted by mtime; this
+    # aligns the plain path. Use stat's epoch-mtime (`%Y` GNU / `%m` BSD)
+    # as the sort key, then strip it before rendering so the row format
+    # stays `<path>\t<size> bytes\t<mtime-string>`.
     local count=0
-    local path size mtime
-    while IFS= read -r path; do
+    local path size mtime mtime_epoch
+    while IFS=$'\t' read -r mtime_epoch path; do
       [[ -n "$path" ]] || continue
       size="$(stat -c '%s' "$path" 2>/dev/null || stat -f '%z' "$path" 2>/dev/null || echo 0)"
       mtime="$(stat -c '%y' "$path" 2>/dev/null || stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$path" 2>/dev/null || echo unknown)"
       printf '%s\t%s bytes\t%s\n' "$path" "$size" "$mtime"
       count=$(( count + 1 ))
-    done < <(find "$target" -type f -name '*.upgrade-conflict' -not -path '*/backups/*' 2>/dev/null | sort)
+    done < <(
+      find "$target" -type f -name '*.upgrade-conflict' -not -path '*/backups/*' 2>/dev/null \
+        | while IFS= read -r _p; do
+            local _ts
+            _ts="$(stat -c '%Y' "$_p" 2>/dev/null || stat -f '%m' "$_p" 2>/dev/null || echo 0)"
+            printf '%s\t%s\n' "$_ts" "$_p"
+          done \
+        | sort -n
+    )
     printf 'total: %d conflict file(s)\n' "$count" >&2
   fi
 }
