@@ -374,6 +374,12 @@ print(json.dumps([{
 ")"
 export AGB_MOCK_AGENT_LIST_JSON
 export BRIDGE_LAYOUT=v2
+# PR-F active-contract gate: the script also checks that BRIDGE_DATA_ROOT
+# is set and exists. Provide both so the v2 path is taken; without them
+# the gate falls back to the legacy enumeration even with LAYOUT=v2.
+BRIDGE_DATA_ROOT_FIXTURE="$SMOKE_ROOT/data-v2"
+mkdir -p "$BRIDGE_DATA_ROOT_FIXTURE"
+export BRIDGE_DATA_ROOT="$BRIDGE_DATA_ROOT_FIXTURE"
 
 out_file="$(run_ingest s7 || true)"
 audit_file="$BRIDGE_WIKI_ROOT/_audit/ingest-$TODAY.md"
@@ -388,7 +394,7 @@ else
 fi
 
 # Restore env for any later scenarios.
-unset AGB_MOCK_AGENT_LIST_JSON BRIDGE_LAYOUT 2>/dev/null || true
+unset AGB_MOCK_AGENT_LIST_JSON BRIDGE_LAYOUT BRIDGE_DATA_ROOT 2>/dev/null || true
 
 # -----------------------------------------------------------------------------
 # Summary

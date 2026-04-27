@@ -208,8 +208,13 @@ bridge_resolve_layout() {
 
   # Fresh install candidate. BRIDGE_LAYOUT is intentionally NOT set to v2 —
   # bridge_isolation_v2_active must remain false until `agent-bridge init`
-  # writes the marker.
-  BRIDGE_LAYOUT_SOURCE="fresh-install-candidate"
+  # writes the marker. If we already classified the prior marker as
+  # invalid-marker(fallback), preserve that source so status output
+  # honestly reports the bad marker instead of pretending the install is
+  # fresh; the v2-active state is the same either way.
+  if [[ "${BRIDGE_LAYOUT_SOURCE:-}" != "invalid-marker(fallback)" ]]; then
+    BRIDGE_LAYOUT_SOURCE="fresh-install-candidate"
+  fi
   BRIDGE_DEFAULT_DATA_ROOT="${BRIDGE_HOME:-$HOME/.agent-bridge}/data"
   # BRIDGE_LAYOUT stays whatever bridge-isolation-v2.sh defaults it to
   # (legacy). Do not export v2 here.
@@ -254,6 +259,13 @@ bridge_layout_write_v2_marker() {
   if [[ -z "$data_root" || "${data_root:0:1}" != "/" ]]; then
     bridge_die "bridge_layout_write_v2_marker: data_root must be absolute (got '$data_root')"
   fi
+  # Reject characters the marker grammar will reject later. Catching here
+  # means a fresh `init` cannot leave a syntactically invalid marker on
+  # disk and then claim source=marker. Marker grammar allows
+  # [A-Za-z0-9_./@:+-]; anything else (space, $, `, *, etc.) is rejected.
+  if [[ ! "$data_root" =~ ^[A-Za-z0-9_./@:+-]+$ ]]; then
+    bridge_die "bridge_layout_write_v2_marker: data_root contains characters not permitted by the marker grammar (allowed: letters, digits, _ . / @ : + -)"
+  fi
 
   local marker_dir="${BRIDGE_LAYOUT_MARKER_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
   local marker_path="$marker_dir/layout-marker.sh"
@@ -270,6 +282,14 @@ BRIDGE_LAYOUT=v2
 BRIDGE_DATA_ROOT='$data_root'
 EOF
   chmod 0640 "$tmp"
+  # Validate before publishing. If the just-written marker would be
+  # rejected on the next process boot, unlink and die rather than leave
+  # a poison artifact that the resolver would later attribute to
+  # source=invalid-marker(fallback).
+  if ! bridge_isolation_v2_marker_validate "$tmp"; then
+    rm -f "$tmp"
+    bridge_die "bridge_layout_write_v2_marker: written marker failed self-validation; refusing to publish"
+  fi
   mv "$tmp" "$marker_path"
 }
 

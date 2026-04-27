@@ -8,9 +8,17 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/bridge-lib.sh"
 CLI_NAME="$(basename "$0")"
 
-if [[ "${1:-}" != "version" ]]; then
-  bridge_load_roster
-fi
+# Skip roster load for commands that must remain mutation-free or own their
+# own load timing. `init` defers bridge_load_roster until after argument
+# parsing + the layout resolver decision (PR-F): calling it here would
+# materialize $BRIDGE_HOME/state via bridge_init_dirs before --dry-run is
+# even checked, breaking the dry-run mutation-free invariant.
+case "${1:-}" in
+  version|init) ;;
+  *)
+    bridge_load_roster
+    ;;
+esac
 
 usage() {
   cat <<EOF

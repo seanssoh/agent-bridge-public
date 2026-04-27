@@ -65,7 +65,17 @@ bridge_isolation_v2_marker_validate() {
     [[ -z "${line//[[:space:]]/}" ]] && continue
     [[ "$line" =~ ^[[:space:]]*# ]] && continue
     if ! [[ "$line" =~ $allowed_re ]]; then
-      bridge_warn "layout-marker.sh ignored: disallowed line '$line'"
+      # Redact line content. A malformed marker may carry secrets-shaped
+      # KEY=value pairs (operator paste accident, attacker probe). Logging
+      # the raw line would leak the value into controller logs and any
+      # downstream report draft. Surface only the rejected key when it
+      # parses cleanly, else a generic note without the line.
+      local _redacted_key="${line%%=*}"
+      if [[ "$_redacted_key" == "$line" || -z "$_redacted_key" ]]; then
+        bridge_warn "layout-marker.sh ignored: malformed line (no KEY= prefix)"
+      else
+        bridge_warn "layout-marker.sh ignored: disallowed key '$_redacted_key'"
+      fi
       return 1
     fi
     key="${line%%=*}"
@@ -83,7 +93,9 @@ bridge_isolation_v2_marker_validate() {
 
   if (( saw_layout == 1 )) && [[ "$layout_value" == "v2" ]]; then
     if [[ -z "$data_root_value" || "${data_root_value:0:1}" != "/" ]]; then
-      bridge_warn "layout-marker.sh ignored: BRIDGE_DATA_ROOT must be absolute, got '$data_root_value'"
+      # Do not echo $data_root_value — it may carry attacker-controlled or
+      # secret bytes from a poisoned marker. Surface only the failure mode.
+      bridge_warn "layout-marker.sh ignored: BRIDGE_DATA_ROOT missing or not absolute"
       return 1
     fi
   fi

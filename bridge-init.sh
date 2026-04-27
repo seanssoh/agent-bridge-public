@@ -343,12 +343,15 @@ if [[ "${BRIDGE_LAYOUT_SOURCE:-}" == "fresh-install-candidate" ]]; then
   init_layout_planned="layout=v2 source=fresh-install data_root=$fresh_data_root"
   if [[ $dry_run -eq 0 ]]; then
     bridge_layout_write_v2_marker "$fresh_data_root"
-    # Re-load marker so subsequent code sees v2 active. The marker writer
-    # only sets BRIDGE_LAYOUT/BRIDGE_DATA_ROOT in our process; callers that
-    # rely on derived roots (BRIDGE_SHARED_ROOT, BRIDGE_AGENT_ROOT_V2,
-    # BRIDGE_CONTROLLER_STATE_ROOT) need them recomputed here.
-    bridge_isolation_v2_marker_load
-    BRIDGE_LAYOUT_SOURCE="marker"
+    # Re-resolve from scratch so BRIDGE_LAYOUT_SOURCE is attributable to the
+    # marker we just wrote (not forced to "marker" on faith). Resetting the
+    # source first ensures bridge_resolve_layout takes the marker branch
+    # rather than re-running env validation against a stale snapshot.
+    BRIDGE_LAYOUT_SOURCE=""
+    bridge_resolve_layout
+    if [[ "${BRIDGE_LAYOUT_SOURCE:-}" != "marker" ]]; then
+      bridge_die "init: marker write succeeded but resolver did not re-load it (got source=${BRIDGE_LAYOUT_SOURCE:-unknown}). Refusing to continue."
+    fi
     if [[ -n "${BRIDGE_DATA_ROOT:-}" ]]; then
       BRIDGE_SHARED_ROOT="${BRIDGE_SHARED_ROOT:-$BRIDGE_DATA_ROOT/shared}"
       BRIDGE_AGENT_ROOT_V2="${BRIDGE_AGENT_ROOT_V2:-$BRIDGE_DATA_ROOT/agents}"
@@ -362,8 +365,12 @@ fi
 
 # Now safe to load the roster. bridge_init_dirs will materialize either the
 # legacy $BRIDGE_HOME/state tree or the v2 tree depending on the marker we
-# just wrote (or didn't).
-bridge_load_roster
+# just wrote (or didn't). Skipped on --dry-run to honor the mutation-free
+# contract: bridge_init_dirs creates state/, runtime/, shared/, cron/, etc.
+# and would otherwise leave artifacts behind on a probe.
+if [[ $dry_run -eq 0 ]]; then
+  bridge_load_roster
+fi
 
 session="${session:-$admin_agent}"
 description="${description:-$admin_agent admin role}"
@@ -374,7 +381,13 @@ bridge_init_require_command tmux
 bridge_init_require_command python3
 bridge_init_require_command "$engine"
 
-if bridge_agent_exists "$admin_agent"; then
+if [[ $dry_run -eq 1 ]]; then
+  # Dry-run mutation-free contract: do not invoke `agent create` as a
+  # sub-process — its bridge-lib.sh source would call bridge_load_roster
+  # via the dispatcher and materialize $BRIDGE_HOME/{state,runtime,...}.
+  # The plan output downstream uses the user-supplied values directly.
+  created=1
+elif bridge_agent_exists "$admin_agent"; then
   bridge_require_static_agent "$admin_agent"
 else
   create_args=(agent create "$admin_agent" --engine "$engine" --session-type admin --session "$session" --display-name "$display_name" --role "$role_text" --description "$description")
@@ -390,14 +403,9 @@ else
   if [[ $always_on -eq 1 ]]; then
     create_args+=(--always-on)
   fi
-  if [[ $dry_run -eq 1 ]]; then
-    create_args+=(--dry-run)
-  fi
   "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "${create_args[@]}" >/dev/null
   created=1
-  if [[ $dry_run -eq 0 ]]; then
-    bridge_load_roster
-  fi
+  bridge_load_roster
 fi
 
 if [[ $skip_channel_setup -eq 0 ]] && [[ $dry_run -eq 0 ]]; then
@@ -478,9 +486,17 @@ else
   preflight_status="dry-run"
 fi
 
-final_engine="${BRIDGE_AGENT_ENGINE[$admin_agent]-$engine}"
-final_session="${BRIDGE_AGENT_SESSION[$admin_agent]-$session}"
-final_workdir="${BRIDGE_AGENT_WORKDIR[$admin_agent]-${workdir:-$(bridge_agent_default_home "$admin_agent")}}"
+if [[ $dry_run -eq 1 ]]; then
+  # Dry-run path skipped bridge_load_roster, so the BRIDGE_AGENT_* arrays
+  # are not declared. Use the user-supplied values directly for the plan.
+  final_engine="$engine"
+  final_session="$session"
+  final_workdir="${workdir:-$BRIDGE_HOME/agents/$admin_agent}"
+else
+  final_engine="${BRIDGE_AGENT_ENGINE[$admin_agent]-$engine}"
+  final_session="${BRIDGE_AGENT_SESSION[$admin_agent]-$session}"
+  final_workdir="${BRIDGE_AGENT_WORKDIR[$admin_agent]-${workdir:-$(bridge_agent_default_home "$admin_agent")}}"
+fi
 warnings_json="$(bridge_init_warnings_json)"
 
 if [[ $json_mode -eq 1 ]]; then
