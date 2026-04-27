@@ -347,10 +347,23 @@ if [[ "${BRIDGE_LAYOUT_SOURCE:-}" == "fresh-install-candidate" ]]; then
     # marker we just wrote (not forced to "marker" on faith). Resetting the
     # source first ensures bridge_resolve_layout takes the marker branch
     # rather than re-running env validation against a stale snapshot.
+    #
+    # Critical: bridge-isolation-v2.sh's `BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"`
+    # default fired during the initial bridge-lib.sh source. If we leave
+    # BRIDGE_LAYOUT=legacy in the environment now, the resolver's env-validate
+    # step would treat that as a valid explicit override and return
+    # source=env instead of source=marker. Unset both v2 anchor vars so the
+    # resolver only sees the marker we just wrote.
     BRIDGE_LAYOUT_SOURCE=""
+    unset BRIDGE_LAYOUT BRIDGE_DATA_ROOT
     bridge_resolve_layout
     if [[ "${BRIDGE_LAYOUT_SOURCE:-}" != "marker" ]]; then
-      bridge_die "init: marker write succeeded but resolver did not re-load it (got source=${BRIDGE_LAYOUT_SOURCE:-unknown}). Refusing to continue."
+      # The marker we just wrote is poison. Unlink it so the next init
+      # invocation starts from a clean fresh-install-candidate state
+      # rather than tripping over a stale half-init artifact.
+      _marker_path="$(bridge_isolation_v2_marker_path)"
+      [[ -f "$_marker_path" ]] && rm -f "$_marker_path"
+      bridge_die "init: marker write succeeded but resolver did not re-load it (got source=${BRIDGE_LAYOUT_SOURCE:-unknown}). Marker removed — please retry."
     fi
     if [[ -n "${BRIDGE_DATA_ROOT:-}" ]]; then
       BRIDGE_SHARED_ROOT="${BRIDGE_SHARED_ROOT:-$BRIDGE_DATA_ROOT/shared}"
