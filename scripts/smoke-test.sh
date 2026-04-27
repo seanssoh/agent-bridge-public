@@ -5630,6 +5630,38 @@ tmux kill-session -t "=$DEV_CHANNELS_SLEEP_SESSION" >/dev/null 2>&1 || true
 tmux kill-session -t "=$DEV_CHANNELS_WRAPPED_CLAUDE_SESSION" >/dev/null 2>&1 || true
 tmux kill-session -t "=$DEV_CHANNELS_WRAPPED_SLEEP_SESSION" >/dev/null 2>&1 || true
 
+log "retrying dev-channel foreground readiness until wrapped Claude appears (#429)"
+DEV_CHANNELS_RACE_SESSION="dev-channels-race-fg-$SESSION_NAME"
+DEV_CHANNELS_RACE_ACK="$TMP_ROOT/dev-channels-race-ack.txt"
+DEV_CHANNELS_RACE_SCRIPT="$TMP_ROOT/dev-channels-race.sh"
+cat >"$DEV_CHANNELS_RACE_SCRIPT" <<EOF
+#!/usr/bin/env bash
+delayed_claude() {
+  sleep 1
+  exec "$DEV_CHANNELS_CLAUDE_BIN" 2
+}
+printf 'WARNING: Loading development channels\n'
+printf 'I am using this for local development\n'
+printf 'Enter to confirm · Esc to cancel\n'
+delayed_claude &
+IFS= read -r line
+printf '%s\n' "\${line:-<enter>}" >"$DEV_CHANNELS_RACE_ACK"
+printf '❯ \n'
+sleep 1
+EOF
+chmod +x "$DEV_CHANNELS_RACE_SCRIPT"
+tmux new-session -d -s "$DEV_CHANNELS_RACE_SESSION" "$DEV_CHANNELS_RACE_SCRIPT"
+wait_for_tmux_session "$DEV_CHANNELS_RACE_SESSION" up 10 0.1
+BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_WAIT_SECONDS=5 \
+BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_POLL_SECONDS=0.2 \
+BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_MAX_CHECKS=30 \
+  "$BASH4_BIN" -c '
+    source "'"$REPO_ROOT"'/bridge-lib.sh"
+    bridge_tmux_wait_for_prompt "'"$DEV_CHANNELS_RACE_SESSION"'" claude 6 1
+  ' >/dev/null || die "expected dev-channel auto-accept to wait for delayed claude foreground"
+assert_contains "$(cat "$DEV_CHANNELS_RACE_ACK")" "<enter>"
+tmux kill-session -t "=$DEV_CHANNELS_RACE_SESSION" >/dev/null 2>&1 || true
+
 log "classifying admin foreground exit by onboarding state"
 ONBOARDING_ADMIN_WORKDIR="$TMP_ROOT/onboarding-admin"
 mkdir -p "$ONBOARDING_ADMIN_WORKDIR"
