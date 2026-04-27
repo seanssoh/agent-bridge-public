@@ -70,11 +70,16 @@ bridge_isolation_v2_marker_validate() {
       # the raw line would leak the value into controller logs and any
       # downstream report draft. Surface only the rejected key when it
       # parses cleanly, else a generic note without the line.
-      local _redacted_key="${line%%=*}"
-      if [[ "$_redacted_key" == "$line" || -z "$_redacted_key" ]]; then
+      # The disallowed key name itself is attacker-controlled bytes
+      # (the very byte string that failed the allowlist regex). Echoing
+      # it would propagate the injection into controller stderr / log
+      # scrapers / smoke harnesses. Surface only the failure category;
+      # operators inspecting the marker file directly can see the key.
+      local _disallow_key="${line%%=*}"
+      if [[ "$_disallow_key" == "$line" || -z "$_disallow_key" ]]; then
         bridge_warn "layout-marker.sh ignored: malformed line (no KEY= prefix)"
       else
-        bridge_warn "layout-marker.sh ignored: disallowed key '$_redacted_key'"
+        bridge_warn "layout-marker.sh ignored: disallowed key (redacted)"
       fi
       return 1
     fi
