@@ -53,8 +53,20 @@ else
 fi
 WORKDIR="${BRIDGE_AGENT_WORKDIR:-$AGENT_HOME}"
 
+# Issue #412 Track C: under linux-user isolation `~/.claude/projects/`
+# resolves to the isolated UID's home (where Claude actually wrote the
+# transcripts), but $WORKDIR is the controller-side path the agent was
+# spawned in. The default `--claude-projects` lookup is rooted at the
+# calling shell's $HOME, which already matches the isolated home when
+# the launcher runs us under sudo -n -u, but `--transcripts-home "$HOME"`
+# decouples the lookup from any wrapper that might reset HOME and makes
+# the isolation contract explicit. Shared-mode agents skip the override.
+CSI_ARGS=(--agent "$BRIDGE_AGENT_ID" --home "$WORKDIR")
+if [[ -n "${BRIDGE_AGENT_OS_USER:-}" ]]; then
+  CSI_ARGS+=(--transcripts-home "$HOME")
+fi
 SESSION_ID="$(python3 ~/.agent-bridge/bridge-memory.py current-session-id \
-    --agent "$BRIDGE_AGENT_ID" --home "$WORKDIR")"
+    "${CSI_ARGS[@]}")"
 python3 ~/.agent-bridge/bridge-memory.py daily-append \
     --agent "$BRIDGE_AGENT_ID" \
     --home "$AGENT_HOME" \
