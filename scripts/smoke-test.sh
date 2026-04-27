@@ -5572,12 +5572,34 @@ sleep 2
 EOF
 chmod +x "$DEV_CHANNELS_PROMPT_SCRIPT"
 tmux new-session -d -s "$DEV_CHANNELS_PROMPT_SESSION" "$DEV_CHANNELS_PROMPT_SCRIPT"
-"$BASH4_BIN" -c '
+BRIDGE_TMUX_DEV_CHANNELS_REQUIRE_CLAUDE_FOREGROUND=0 "$BASH4_BIN" -c '
   source "'"$REPO_ROOT"'/bridge-lib.sh"
   bridge_tmux_wait_for_prompt "'"$DEV_CHANNELS_PROMPT_SESSION"'" claude 5 1
 ' >/dev/null
 assert_contains "$(cat "$DEV_CHANNELS_PROMPT_ACK")" "<enter>"
 tmux kill-session -t "=$DEV_CHANNELS_PROMPT_SESSION" >/dev/null 2>&1 || true
+
+log "gating dev-channel auto-accept on Claude foreground readiness (#429)"
+DEV_CHANNELS_CLAUDE_BIN="$TMP_ROOT/claude"
+DEV_CHANNELS_CLAUDE_SESSION="dev-channels-claude-fg-$SESSION_NAME"
+DEV_CHANNELS_SLEEP_SESSION="dev-channels-sleep-fg-$SESSION_NAME"
+ln -sf "$(command -v sleep)" "$DEV_CHANNELS_CLAUDE_BIN"
+tmux new-session -d -s "$DEV_CHANNELS_CLAUDE_SESSION" "$DEV_CHANNELS_CLAUDE_BIN 2"
+tmux new-session -d -s "$DEV_CHANNELS_SLEEP_SESSION" "$(command -v sleep) 2"
+wait_for_tmux_session "$DEV_CHANNELS_CLAUDE_SESSION" up 10 0.1
+wait_for_tmux_session "$DEV_CHANNELS_SLEEP_SESSION" up 10 0.1
+"$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_tmux_pane_foreground_is_claude "'"$DEV_CHANNELS_CLAUDE_SESSION"'"
+' >/dev/null || die "expected symlinked claude foreground to be detected"
+if "$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_tmux_pane_foreground_is_claude "'"$DEV_CHANNELS_SLEEP_SESSION"'"
+' >/dev/null; then
+  die "sleep foreground must not be classified as claude"
+fi
+tmux kill-session -t "=$DEV_CHANNELS_CLAUDE_SESSION" >/dev/null 2>&1 || true
+tmux kill-session -t "=$DEV_CHANNELS_SLEEP_SESSION" >/dev/null 2>&1 || true
 
 log "classifying admin foreground exit by onboarding state"
 ONBOARDING_ADMIN_WORKDIR="$TMP_ROOT/onboarding-admin"
