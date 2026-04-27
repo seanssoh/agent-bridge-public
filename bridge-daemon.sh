@@ -2036,7 +2036,9 @@ bridge_write_crash_report_body() {
   local stderr_file="$6"
   local tail_file="$7"
   local launch_cmd="$8"
+  local launch_cmd_display=""
 
+  launch_cmd_display="$(bridge_redact_inline_env_secrets "$launch_cmd")"
   mkdir -p "$(dirname "$body_file")"
   {
     echo "# Crash Loop Report"
@@ -2052,7 +2054,7 @@ bridge_write_crash_report_body() {
     echo "## Launch Command"
     echo
     echo '```bash'
-    printf '%s\n' "$launch_cmd"
+    printf '%s\n' "$launch_cmd_display"
     echo '```'
     echo
     echo "## Stderr Tail"
