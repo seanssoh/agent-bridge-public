@@ -4,6 +4,52 @@ All notable changes to Agent Bridge are documented here. This project adheres
 loosely to [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and tracks
 version bumps via the `VERSION` file.
 
+## [Unreleased]
+
+### isolate-v2 PR-F — default flip via explicit layout resolver
+
+Direction agreed across plan-review rounds r1-r5 (tasks #293/#298/#300/#302/#304):
+the project's default layout for **new installs** is now v2, while existing
+markerless installs stay legacy by an explicit invariant (not a default
+fall-through). Controller state (`tasks.db`, daemon, cron, profiles, history)
+remains under `$BRIDGE_HOME/state` in this PR — a future migration PR will
+relocate it.
+
+- **New `lib/bridge-layout-resolver.sh`** introduces a state machine with
+  five named sources: `env`, `marker`, `missing-marker(existing)`,
+  `fresh-install-candidate`, `invalid-marker(fallback)`. The resolver is
+  read-only by contract; it never writes the marker or mutates state.
+  `BRIDGE_LAYOUT_SOURCE` exposes the source enum to callers.
+- **New `BRIDGE_LAYOUT_MARKER_DIR`** (default `$BRIDGE_HOME/state`) anchors
+  marker discovery independent of `BRIDGE_STATE_DIR`. v2 activation never
+  rebases the marker directory, so child processes continue to resolve
+  `source=marker` even if a future PR relocates controller state to
+  `$BRIDGE_DATA_ROOT/state`. Propagated through `bridge_export_env_prefix`
+  and `bridge_write_linux_agent_env_file`.
+- **`agent-bridge init` / `bridge-init.sh` ordering refactor** — init owns
+  roster-load timing so `agent-bridge init --dry-run` is mutation-free on a
+  fresh install. New `--data-root <path>` flag for explicit fresh-install
+  opt-in. Fresh installs write and re-read the v2 marker before admin role
+  creation so admin workdirs land under the v2 layout.
+- **Partial env override rejection** — `BRIDGE_LAYOUT=v2` without a valid
+  `BRIDGE_DATA_ROOT` is now reported as `ignored_partial_env=BRIDGE_LAYOUT`
+  instead of silently being honored. Stale `BRIDGE_DATA_ROOT` is also
+  cleared on `BRIDGE_LAYOUT=legacy` to prevent v2-derived roots from
+  leaking into child env.
+- **`scripts/wiki-daily-ingest.sh` and `scripts/memory-daily-harvest.sh`
+  active-contract gating** — v2 paths now also require a populated
+  `BRIDGE_DATA_ROOT` (not just `BRIDGE_LAYOUT=v2`). Closes the child env
+  corner where textual defaults would push these scripts into v2 logic
+  without a real active layout.
+- **Tests** — `tests/isolation-v2-pr-f/smoke.sh` covers the resolver state
+  machine: fresh-install-candidate not active, markerless existing stays
+  legacy, valid marker, partial env rejection, marker discoverability after
+  `BRIDGE_STATE_DIR` rebase, explicit env override.
+
+Existing legacy installs upgrading to this version see no behavior change:
+the resolver's `missing-marker(existing)` invariant keeps them on the legacy
+code path until they explicitly run `agent-bridge migrate isolation-v2 apply`.
+
 ## [0.6.28] — 2026-04-28
 
 ### Runtime enforcement — input-source ↔ output-reply matching

@@ -6,7 +6,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
-bridge_load_roster
+# bridge_load_roster is deferred until after argument parsing so that
+# `init --dry-run` is mutation-free (bridge_load_roster -> bridge_init_dirs
+# would otherwise create $BRIDGE_HOME/state on a fresh-install-candidate and
+# turn the resolver classification into missing-marker(existing) on the next
+# probe). Layout resolver has already run via bridge-lib.sh source.
 
 usage() {
   cat <<EOF
@@ -123,6 +127,7 @@ description=""
 channels=""
 channel_account=""
 runtime_config="$HOME/.agent-bridge/runtime/bridge-config.json"
+data_root_flag=""
 skip_channel_setup=0
 test_start=0
 dry_run=0
@@ -257,6 +262,11 @@ while [[ $# -gt 0 ]]; do
       runtime_config="$2"
       shift 2
       ;;
+    --data-root)
+      [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+      data_root_flag="$2"
+      shift 2
+      ;;
     --api-base-url)
       [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
       api_base_url="$2"
@@ -319,6 +329,41 @@ case "$engine" in
   claude|codex) ;;
   *) bridge_die "지원하지 않는 engine 입니다: $engine" ;;
 esac
+
+# Layout resolution + (fresh install only) marker write. This must run before
+# bridge_load_roster — once the roster is loaded, bridge_init_dirs has
+# materialized $BRIDGE_HOME/state and the v2 layout choice has to be honored
+# by every subsequent call site (workdir, env writer, etc.).
+init_layout_planned=""
+if [[ "${BRIDGE_LAYOUT_SOURCE:-}" == "fresh-install-candidate" ]]; then
+  fresh_data_root="${data_root_flag:-${BRIDGE_DEFAULT_DATA_ROOT:-$BRIDGE_HOME/data}}"
+  if [[ "${fresh_data_root:0:1}" != "/" ]]; then
+    bridge_die "--data-root must be absolute (got '$fresh_data_root')"
+  fi
+  init_layout_planned="layout=v2 source=fresh-install data_root=$fresh_data_root"
+  if [[ $dry_run -eq 0 ]]; then
+    bridge_layout_write_v2_marker "$fresh_data_root"
+    # Re-load marker so subsequent code sees v2 active. The marker writer
+    # only sets BRIDGE_LAYOUT/BRIDGE_DATA_ROOT in our process; callers that
+    # rely on derived roots (BRIDGE_SHARED_ROOT, BRIDGE_AGENT_ROOT_V2,
+    # BRIDGE_CONTROLLER_STATE_ROOT) need them recomputed here.
+    bridge_isolation_v2_marker_load
+    BRIDGE_LAYOUT_SOURCE="marker"
+    if [[ -n "${BRIDGE_DATA_ROOT:-}" ]]; then
+      BRIDGE_SHARED_ROOT="${BRIDGE_SHARED_ROOT:-$BRIDGE_DATA_ROOT/shared}"
+      BRIDGE_AGENT_ROOT_V2="${BRIDGE_AGENT_ROOT_V2:-$BRIDGE_DATA_ROOT/agents}"
+      BRIDGE_CONTROLLER_STATE_ROOT="${BRIDGE_CONTROLLER_STATE_ROOT:-$BRIDGE_DATA_ROOT/state}"
+      export BRIDGE_SHARED_ROOT BRIDGE_AGENT_ROOT_V2 BRIDGE_CONTROLLER_STATE_ROOT
+    fi
+  fi
+elif [[ -n "$data_root_flag" ]]; then
+  bridge_die "--data-root only applies on fresh installs (current layout source=${BRIDGE_LAYOUT_SOURCE:-unknown}). Use \`agent-bridge migrate isolation-v2\` to relocate an existing install."
+fi
+
+# Now safe to load the roster. bridge_init_dirs will materialize either the
+# legacy $BRIDGE_HOME/state tree or the v2 tree depending on the marker we
+# just wrote (or didn't).
+bridge_load_roster
 
 session="${session:-$admin_agent}"
 description="${description:-$admin_agent admin role}"
@@ -455,6 +500,14 @@ if [[ $json_mode -eq 1 ]]; then
 fi
 
 echo "== Bridge init =="
+if [[ -n "$init_layout_planned" ]]; then
+  if [[ $dry_run -eq 1 ]]; then
+    printf 'layout_plan: %s (dry-run, marker not written)\n' "$init_layout_planned"
+  else
+    printf 'layout_plan: %s (marker written)\n' "$init_layout_planned"
+  fi
+fi
+printf 'layout: %s\n' "$(bridge_layout_status_summary)"
 printf 'admin_agent: %s\n' "$admin_agent"
 printf 'engine: %s\n' "$final_engine"
 printf 'session: %s\n' "$final_session"

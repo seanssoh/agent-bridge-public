@@ -81,6 +81,8 @@ if [[ -n "${CRON_REQUEST_DIR:-}" ]]; then
 else
   v2_md_root=""
   if [[ "${BRIDGE_LAYOUT:-legacy}" == "v2" ]] \
+      && [[ -n "${BRIDGE_DATA_ROOT:-}" ]] \
+      && [[ -d "${BRIDGE_DATA_ROOT}" ]] \
       && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
     v2_md_root="$BRIDGE_AGENT_ROOT_V2/$AGENT/runtime/memory-daily"
   fi
