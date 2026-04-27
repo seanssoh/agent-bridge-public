@@ -44,6 +44,7 @@ Usage:
   $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents]
   $(basename "$0") analyze [--source <repo-dir>] [--target <bridge-home>] [--json]
   $(basename "$0") rollback [--target <bridge-home>] [--backup-root <dir>] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json]
+  $(basename "$0") conflicts list [--target <bridge-home>] [--json]
 
 Updates a live Agent Bridge install from a repo checkout while preserving user-owned
 customizations such as:
@@ -523,8 +524,103 @@ print("" if value is None else str(value))
 PY
 }
 
+bridge_upgrade_conflicts_list() {
+  # Read-only enumeration of *.upgrade-conflict files left behind by
+  # `agb upgrade --apply` 3-way merges. Excludes the backups/ tree so
+  # archived layers from previous upgrades don't drown out live state.
+  # See issue #394 PR-1.
+  local target="${BRIDGE_HOME:-$HOME/.agent-bridge}"
+  local json_out=0
+  while (( $# > 0 )); do
+    case "$1" in
+      --target)
+        [[ $# -lt 2 ]] && bridge_die "agb upgrade conflicts list: --target 뒤에 값을 지정하세요."
+        target="$2"
+        shift 2
+        ;;
+      --target=*)
+        target="${1#--target=}"
+        shift
+        ;;
+      --json)
+        json_out=1
+        shift
+        ;;
+      -h|--help|help)
+        printf 'Usage: agb upgrade conflicts list [--target <bridge-home>] [--json]\n'
+        return 0
+        ;;
+      -*)
+        bridge_die "agb upgrade conflicts list: 알 수 없는 옵션입니다: $1"
+        ;;
+      *)
+        bridge_die "agb upgrade conflicts list: 예기치 않은 인자입니다: $1"
+        ;;
+    esac
+  done
+
+  [[ -d "$target" ]] || bridge_die "agb upgrade conflicts list: 대상 디렉터리를 찾을 수 없습니다: $target"
+
+  if (( json_out )); then
+    bridge_require_python
+    find "$target" -type f -name '*.upgrade-conflict' -not -path '*/backups/*' 2>/dev/null \
+      | python3 -c '
+import json
+import sys
+from pathlib import Path
+
+results = []
+for line in sys.stdin:
+    raw = line.rstrip("\n")
+    if not raw:
+        continue
+    p = Path(raw)
+    try:
+        st = p.stat()
+    except OSError:
+        continue
+    results.append({
+        "path": str(p),
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+    })
+
+results.sort(key=lambda r: r["mtime"])
+print(json.dumps({"conflicts": results, "count": len(results)}, indent=2, ensure_ascii=False))
+'
+  else
+    local count=0
+    local path size mtime
+    while IFS= read -r path; do
+      [[ -n "$path" ]] || continue
+      size="$(stat -c '%s' "$path" 2>/dev/null || stat -f '%z' "$path" 2>/dev/null || echo 0)"
+      mtime="$(stat -c '%y' "$path" 2>/dev/null || stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$path" 2>/dev/null || echo unknown)"
+      printf '%s\t%s bytes\t%s\n' "$path" "$size" "$mtime"
+      count=$(( count + 1 ))
+    done < <(find "$target" -type f -name '*.upgrade-conflict' -not -path '*/backups/*' 2>/dev/null | sort)
+    printf 'total: %d conflict file(s)\n' "$count" >&2
+  fi
+}
+
 if [[ $# -gt 0 ]]; then
   case "$1" in
+    conflicts)
+      shift
+      case "${1:-list}" in
+        list)
+          shift
+          bridge_upgrade_conflicts_list "$@"
+          exit 0
+          ;;
+        -h|--help|help)
+          printf 'Usage: agb upgrade conflicts list [--target <bridge-home>] [--json]\n'
+          exit 0
+          ;;
+        *)
+          bridge_die "agb upgrade conflicts: 지원하지 않는 하위 명령입니다: $1 (현재 list만 지원하며, diff/adopt/discard는 후속 PR에서 추가됩니다)"
+          ;;
+      esac
+      ;;
     analyze|rollback)
       SUBCOMMAND="$1"
       shift
