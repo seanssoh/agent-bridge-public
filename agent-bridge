@@ -14,7 +14,21 @@ CLI_NAME="$(basename "$0")"
 # materialize $BRIDGE_HOME/state via bridge_init_dirs before --dry-run is
 # even checked, breaking the dry-run mutation-free invariant.
 case "${1:-}" in
-  version|init) ;;
+  version) ;;
+  init)
+    # bridge-isolation-v2.sh's `BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"`
+    # default fires during our bridge-lib.sh source above and exports the
+    # value into the environment we hand to the child bridge-init.sh.
+    # When that default came from the resolver returning fresh-install-
+    # candidate (BRIDGE_LAYOUT_SOURCE=fresh-install-candidate or
+    # missing-marker(existing) etc.), the child would misread it as an
+    # explicit operator override and skip the marker-write branch.
+    # Strip it so the child's resolver runs in a clean state. An
+    # operator-provided override (BRIDGE_LAYOUT_SOURCE=env) is preserved.
+    if [[ "${BRIDGE_LAYOUT_SOURCE:-}" != "env" ]]; then
+      unset BRIDGE_LAYOUT BRIDGE_DATA_ROOT
+    fi
+    ;;
   *)
     bridge_load_roster
     ;;
