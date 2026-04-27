@@ -66,26 +66,55 @@ bridge_tmux_command_name_is_claude() {
   esac
 }
 
+bridge_tmux_process_tree_has_claude() {
+  local root_pid="$1"
+  local max_procs="${BRIDGE_TMUX_PROCESS_TREE_MAX_PROCS:-128}"
+  local -a queue=()
+  local seen=" "
+  local pid=""
+  local child=""
+  local comm=""
+  local count=0
+
+  [[ "$root_pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$max_procs" =~ ^[0-9]+$ ]] || max_procs=128
+  (( max_procs > 0 )) || max_procs=128
+
+  queue=("$root_pid")
+  while ((${#queue[@]} > 0)) && (( count < max_procs )); do
+    pid="${queue[0]}"
+    queue=("${queue[@]:1}")
+    case "$seen" in
+      *" $pid "*) continue ;;
+    esac
+    seen+="$pid "
+    count=$((count + 1))
+
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null | awk '{$1=$1; print}' || true)"
+    if bridge_tmux_command_name_is_claude "$comm"; then
+      return 0
+    fi
+
+    while IFS= read -r child; do
+      [[ "$child" =~ ^[0-9]+$ ]] || continue
+      case "$seen" in
+        *" $child "*) continue ;;
+      esac
+      queue+=("$child")
+    done < <(pgrep -P "$pid" 2>/dev/null || true)
+  done
+
+  return 1
+}
+
 bridge_tmux_pane_foreground_is_claude() {
   local session="$1"
   local pane_pid=""
-  local tpgid=""
-  local pgid=""
-  local comm=""
   local pane_cmd=""
 
   pane_pid="$(bridge_tmux_session_pane_pid "$session")"
-  if [[ "$pane_pid" =~ ^[0-9]+$ ]]; then
-    tpgid="$(ps -o tpgid= -p "$pane_pid" 2>/dev/null | tr -d '[:space:]' || true)"
-    if [[ "$tpgid" =~ ^[0-9]+$ ]] && (( tpgid > 0 )); then
-      while read -r pgid comm; do
-        [[ "$pgid" == "$tpgid" ]] || continue
-        if bridge_tmux_command_name_is_claude "$comm"; then
-          return 0
-        fi
-      done < <(ps -eo pgid=,comm= 2>/dev/null || true)
-      return 1
-    fi
+  if [[ "$pane_pid" =~ ^[0-9]+$ ]] && bridge_tmux_process_tree_has_claude "$pane_pid"; then
+    return 0
   fi
 
   pane_cmd="$(tmux display-message -p -t "$(bridge_tmux_pane_target "$session")" '#{pane_current_command}' 2>/dev/null || true)"

@@ -167,6 +167,38 @@ bridge_upgrade_with_target_env() {
     "$@"
 }
 
+bridge_upgrade_should_emit_post_task() {
+  local channel="$1"
+  local apply_json="$2"
+
+  case "$channel" in
+    current|dev|ref)
+      return 1
+      ;;
+  esac
+
+  python3 - "$apply_json" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    # Fail open: a malformed apply payload should not hide an upgrade signal.
+    raise SystemExit(0)
+
+counts = payload.get("counts") or {}
+changed = 0
+for key in ("files_copied", "files_merged_clean", "files_merged_conflict", "files_mode_synced"):
+    try:
+        changed += int(counts.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        raise SystemExit(0)
+
+raise SystemExit(0 if changed > 0 else 1)
+PY
+}
+
 bridge_upgrade_collect_agent_restart_report() {
   local target_root="$1"
   local dry_run="${2:-0}"
@@ -1215,9 +1247,9 @@ fi
 # Post-upgrade admin signal: file a [upgrade-complete] task with a
 # ready-to-execute checklist. Without this the admin has to know to
 # go read docs/agent-runtime/wiki-onboarding.md; the task makes the
-# first run self-announcing. Skipped on dry-runs and when no admin
-# agent is configured.
-if [[ $DRY_RUN -eq 0 ]]; then
+# first run self-announcing. Skipped on dry-runs, dev/ref/current channel
+# upgrades, no-op applies, and when no admin agent is configured.
+if [[ $DRY_RUN -eq 0 ]] && bridge_upgrade_should_emit_post_task "$CHANNEL" "$APPLY_JSON"; then
   # Resolve admin id: explicit upgrade override → grep the target roster → skip.
   # We grep instead of sourcing because the roster files reference
   # bridge-lib arrays/functions that are not loaded in this scope;

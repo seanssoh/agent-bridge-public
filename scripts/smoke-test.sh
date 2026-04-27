@@ -3390,7 +3390,7 @@ print(last)
 PY
 )"
 [[ "$NUDGE_DROP_ACTION" == "session_nudge_dropped" ]] || die "expected session_nudge_dropped audit row, got '$NUDGE_DROP_ACTION'"
-python3 "$REPO_ROOT/bridge-queue.py" cancel "$NUDGE_DROP_TASK_ID" --agent "$REQUESTER_AGENT" --note "verify drop cleanup" >/dev/null
+python3 "$REPO_ROOT/bridge-queue.py" cancel "$NUDGE_DROP_TASK_ID" --actor "$REQUESTER_AGENT" --note "verify drop cleanup" >/dev/null
 
 log "Issue #331: marking session_nudge_sent when the task moves out of queued before the grace expires"
 NUDGE_SENT_OUTPUT="$(python3 "$REPO_ROOT/bridge-queue.py" create --to "$CODEX_CLI_AGENT" --title "verify sent oracle" --body "pickup" --from "$REQUESTER_AGENT")"
@@ -5583,23 +5583,52 @@ log "gating dev-channel auto-accept on Claude foreground readiness (#429)"
 DEV_CHANNELS_CLAUDE_BIN="$TMP_ROOT/claude"
 DEV_CHANNELS_CLAUDE_SESSION="dev-channels-claude-fg-$SESSION_NAME"
 DEV_CHANNELS_SLEEP_SESSION="dev-channels-sleep-fg-$SESSION_NAME"
+DEV_CHANNELS_WRAPPED_CLAUDE_SESSION="dev-channels-wrapped-claude-fg-$SESSION_NAME"
+DEV_CHANNELS_WRAPPED_SLEEP_SESSION="dev-channels-wrapped-sleep-fg-$SESSION_NAME"
+DEV_CHANNELS_WRAPPED_CLAUDE_SCRIPT="$TMP_ROOT/dev-channels-wrapped-claude.sh"
+DEV_CHANNELS_WRAPPED_SLEEP_SCRIPT="$TMP_ROOT/dev-channels-wrapped-sleep.sh"
 ln -sf "$(command -v sleep)" "$DEV_CHANNELS_CLAUDE_BIN"
+cat >"$DEV_CHANNELS_WRAPPED_CLAUDE_SCRIPT" <<EOF
+#!/usr/bin/env bash
+"$DEV_CHANNELS_CLAUDE_BIN" 2
+EOF
+cat >"$DEV_CHANNELS_WRAPPED_SLEEP_SCRIPT" <<EOF
+#!/usr/bin/env bash
+"$(command -v sleep)" 2
+EOF
+chmod +x "$DEV_CHANNELS_WRAPPED_CLAUDE_SCRIPT" "$DEV_CHANNELS_WRAPPED_SLEEP_SCRIPT"
 tmux new-session -d -s "$DEV_CHANNELS_CLAUDE_SESSION" "$DEV_CHANNELS_CLAUDE_BIN 2"
 tmux new-session -d -s "$DEV_CHANNELS_SLEEP_SESSION" "$(command -v sleep) 2"
+tmux new-session -d -s "$DEV_CHANNELS_WRAPPED_CLAUDE_SESSION" "$DEV_CHANNELS_WRAPPED_CLAUDE_SCRIPT"
+tmux new-session -d -s "$DEV_CHANNELS_WRAPPED_SLEEP_SESSION" "$DEV_CHANNELS_WRAPPED_SLEEP_SCRIPT"
 wait_for_tmux_session "$DEV_CHANNELS_CLAUDE_SESSION" up 10 0.1
 wait_for_tmux_session "$DEV_CHANNELS_SLEEP_SESSION" up 10 0.1
+wait_for_tmux_session "$DEV_CHANNELS_WRAPPED_CLAUDE_SESSION" up 10 0.1
+wait_for_tmux_session "$DEV_CHANNELS_WRAPPED_SLEEP_SESSION" up 10 0.1
 "$BASH4_BIN" -c '
   source "'"$REPO_ROOT"'/bridge-lib.sh"
   bridge_tmux_pane_foreground_is_claude "'"$DEV_CHANNELS_CLAUDE_SESSION"'"
 ' >/dev/null || die "expected symlinked claude foreground to be detected"
+"$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_tmux_pane_foreground_is_claude "'"$DEV_CHANNELS_WRAPPED_CLAUDE_SESSION"'"
+' >/dev/null || die "expected wrapped claude descendant to be detected"
 if "$BASH4_BIN" -c '
   source "'"$REPO_ROOT"'/bridge-lib.sh"
   bridge_tmux_pane_foreground_is_claude "'"$DEV_CHANNELS_SLEEP_SESSION"'"
 ' >/dev/null; then
   die "sleep foreground must not be classified as claude"
 fi
+if "$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_tmux_pane_foreground_is_claude "'"$DEV_CHANNELS_WRAPPED_SLEEP_SESSION"'"
+' >/dev/null; then
+  die "wrapped sleep descendant must not be classified as claude"
+fi
 tmux kill-session -t "=$DEV_CHANNELS_CLAUDE_SESSION" >/dev/null 2>&1 || true
 tmux kill-session -t "=$DEV_CHANNELS_SLEEP_SESSION" >/dev/null 2>&1 || true
+tmux kill-session -t "=$DEV_CHANNELS_WRAPPED_CLAUDE_SESSION" >/dev/null 2>&1 || true
+tmux kill-session -t "=$DEV_CHANNELS_WRAPPED_SLEEP_SESSION" >/dev/null 2>&1 || true
 
 log "classifying admin foreground exit by onboarding state"
 ONBOARDING_ADMIN_WORKDIR="$TMP_ROOT/onboarding-admin"
@@ -6469,6 +6498,33 @@ assert restart["considered"] == 0, restart
 assert "live-leak-agent" not in restart.get("restart_eligible_agents", []), restart
 assert "live-leak-agent" not in restart.get("restart_attempted_ok_agents", []), restart
 PY
+
+log "upgrade post-task signal only emits for stable upgrades with live drift (#331)"
+POST_TASK_GATE_BODY="$TMP_ROOT/upgrade-post-task-gate.sh"
+python3 - "$REPO_ROOT/bridge-upgrade.sh" "$POST_TASK_GATE_BODY" <<'PY'
+import pathlib
+import re
+import sys
+
+src = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+match = re.search(r"^bridge_upgrade_should_emit_post_task\(\) \{\n.*?^}\n", src, re.M | re.S)
+if not match:
+    raise SystemExit("bridge_upgrade_should_emit_post_task not found")
+pathlib.Path(sys.argv[2]).write_text(match.group(0), encoding="utf-8")
+PY
+POST_TASK_CHANGED='{"counts":{"files_copied":1,"files_merged_clean":0,"files_merged_conflict":0,"files_mode_synced":0}}'
+POST_TASK_NOOP='{"counts":{"files_copied":0,"files_merged_clean":0,"files_merged_conflict":0,"files_mode_synced":0,"files_skipped_noop":4}}'
+"$BASH4_BIN" -c 'source "$1"; bridge_upgrade_should_emit_post_task stable "$2"' -- "$POST_TASK_GATE_BODY" "$POST_TASK_CHANGED" \
+  || die "stable upgrade with copied files should emit post task"
+if "$BASH4_BIN" -c 'source "$1"; bridge_upgrade_should_emit_post_task stable "$2"' -- "$POST_TASK_GATE_BODY" "$POST_TASK_NOOP"; then
+  die "stable no-op upgrade must not emit post task"
+fi
+for _post_channel in current dev ref; do
+  if "$BASH4_BIN" -c 'source "$1"; bridge_upgrade_should_emit_post_task "$2" "$3"' -- "$POST_TASK_GATE_BODY" "$_post_channel" "$POST_TASK_CHANGED"; then
+    die "$_post_channel upgrade must not emit post task"
+  fi
+done
+rm -f "$POST_TASK_GATE_BODY"
 
 log "rolling back from an upgrade backup snapshot"
 ROLLBACK_ROOT="$TMP_ROOT/rollback-root"
