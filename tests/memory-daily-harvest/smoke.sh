@@ -923,6 +923,199 @@ else
 fi
 
 # =============================================================================
+# scenario PRF1 — legacy install (no v2 env) → no --per-agent-state-dir args
+# =============================================================================
+# Issue #418 codex r2 item 11: PR-F changed the v2 extra-args gate in
+# scripts/memory-daily-harvest.sh but added no smoke. PRF1 covers the
+# baseline: legacy install (BRIDGE_LAYOUT unset) must NOT emit any v2
+# extra args (--per-agent-state-dir, --shared-aggregate-dir).
+banner "PRF1 — legacy install dispatches without v2 extra-args"
+
+prf1_dir="$SMOKE_ROOT/prf1"
+mkdir -p "$prf1_dir/home" "$prf1_dir/workdir"
+cat >"$prf1_dir/agb-mock" <<MOCK
+#!/usr/bin/env bash
+cat <<'JSON'
+{
+  "agent": "prf1-agent",
+  "workdir": "$prf1_dir/workdir",
+  "profile": {"home": "$prf1_dir/home"},
+  "isolation": {"mode": "shared", "os_user": ""}
+}
+JSON
+MOCK
+chmod +x "$prf1_dir/agb-mock"
+
+cat >"$prf1_dir/python-mock" <<MOCK
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  case "\$arg" in
+    harvest-daily)
+      args_out="\${PRF_MOCK_ARGS_OUT:-/tmp/prf-mock.args}"
+      printf '%s\n' "\$@" >"\$args_out"
+      exit 0
+      ;;
+  esac
+done
+exec "$PYTHON" "\$@"
+MOCK
+chmod +x "$prf1_dir/python-mock"
+
+PRF1_ARGS_OUT="$prf1_dir/argv.log"
+env -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT -u BRIDGE_AGENT_ROOT_V2 \
+    -u BRIDGE_SHARED_ROOT -u CRON_REQUEST_DIR \
+    BRIDGE_AGB="$prf1_dir/agb-mock" \
+    BRIDGE_PYTHON="$prf1_dir/python-mock" \
+    BRIDGE_HOME="$prf1_dir/bridge-home" \
+    PRF_MOCK_ARGS_OUT="$PRF1_ARGS_OUT" \
+  "$REPO_ROOT/scripts/memory-daily-harvest.sh" --agent prf1-agent \
+  >"$prf1_dir/stdout" 2>"$prf1_dir/stderr"
+prf1_rc=$?
+
+prf1_argv="$(tr '\n' ' ' <"$PRF1_ARGS_OUT" 2>/dev/null || echo '')"
+case " $prf1_argv " in
+  *" --per-agent-state-dir "*) prf1_has_v2="yes" ;;
+  *) prf1_has_v2="no" ;;
+esac
+case " $prf1_argv " in
+  *" --shared-aggregate-dir "*) prf1_has_shared="yes" ;;
+  *) prf1_has_shared="no" ;;
+esac
+
+if [[ $prf1_rc -eq 0 && "$prf1_has_v2" == "no" && "$prf1_has_shared" == "no" ]]; then
+  pass "PRF1"
+else
+  fail "PRF1" "rc=$prf1_rc v2=$prf1_has_v2 shared=$prf1_has_shared argv='$prf1_argv'"
+fi
+
+# =============================================================================
+# scenario PRF2 — v2 install with populated data-root → emits v2 extra-args
+# =============================================================================
+# Issue #418 codex r2 item 11: contract-positive case. With BRIDGE_LAYOUT=v2
+# AND a real, on-disk BRIDGE_DATA_ROOT AND BRIDGE_AGENT_ROOT_V2, the gate
+# must permit v2 extra-args.
+banner "PRF2 — v2 install with populated data-root emits v2 extra-args"
+
+prf2_dir="$SMOKE_ROOT/prf2"
+mkdir -p "$prf2_dir/home" "$prf2_dir/workdir"
+prf2_data_root="$prf2_dir/data"
+prf2_agent_root_v2="$prf2_dir/agents-v2"
+prf2_shared_root="$prf2_dir/shared"
+mkdir -p "$prf2_data_root" "$prf2_agent_root_v2" "$prf2_shared_root"
+
+cat >"$prf2_dir/agb-mock" <<MOCK
+#!/usr/bin/env bash
+cat <<'JSON'
+{
+  "agent": "prf2-agent",
+  "workdir": "$prf2_dir/workdir",
+  "profile": {"home": "$prf2_dir/home"},
+  "isolation": {"mode": "shared", "os_user": ""}
+}
+JSON
+MOCK
+chmod +x "$prf2_dir/agb-mock"
+cp "$prf1_dir/python-mock" "$prf2_dir/python-mock"
+
+PRF2_ARGS_OUT="$prf2_dir/argv.log"
+env -u CRON_REQUEST_DIR \
+    BRIDGE_AGB="$prf2_dir/agb-mock" \
+    BRIDGE_PYTHON="$prf2_dir/python-mock" \
+    BRIDGE_HOME="$prf2_dir/bridge-home" \
+    BRIDGE_LAYOUT="v2" \
+    BRIDGE_DATA_ROOT="$prf2_data_root" \
+    BRIDGE_AGENT_ROOT_V2="$prf2_agent_root_v2" \
+    BRIDGE_SHARED_ROOT="$prf2_shared_root" \
+    PRF_MOCK_ARGS_OUT="$PRF2_ARGS_OUT" \
+  "$REPO_ROOT/scripts/memory-daily-harvest.sh" --agent prf2-agent \
+  >"$prf2_dir/stdout" 2>"$prf2_dir/stderr"
+prf2_rc=$?
+
+prf2_argv="$(tr '\n' ' ' <"$PRF2_ARGS_OUT" 2>/dev/null || echo '')"
+case " $prf2_argv " in
+  *" --per-agent-state-dir $prf2_agent_root_v2/prf2-agent/runtime/memory-daily "*) prf2_per_agent="yes" ;;
+  *) prf2_per_agent="no" ;;
+esac
+case " $prf2_argv " in
+  *" --shared-aggregate-dir $prf2_shared_root/memory-daily/aggregate "*) prf2_shared="yes" ;;
+  *) prf2_shared="no" ;;
+esac
+
+if [[ $prf2_rc -eq 0 && "$prf2_per_agent" == "yes" && "$prf2_shared" == "yes" ]]; then
+  pass "PRF2"
+else
+  fail "PRF2" "rc=$prf2_rc per_agent=$prf2_per_agent shared=$prf2_shared argv='$prf2_argv'"
+fi
+
+# =============================================================================
+# scenario PRF3 — transition: v2 marker but data-root NOT populated → fallback
+# =============================================================================
+# Issue #418 codex r2 item 8 + 11: the load-bearing gate. A child env where
+# BRIDGE_LAYOUT=v2 propagates but BRIDGE_DATA_ROOT does NOT exist on disk
+# (transitional install, mid-migration) must fall back to legacy
+# invocation: NO v2 extra-args, debug breadcrumb on stderr.
+banner "PRF3 — v2 marker + missing data-root falls back to legacy (no v2 extra-args)"
+
+prf3_dir="$SMOKE_ROOT/prf3"
+mkdir -p "$prf3_dir/home" "$prf3_dir/workdir"
+# Intentionally DO NOT create $prf3_dir/data — that's the whole point.
+prf3_missing_data_root="$prf3_dir/missing-data-root"
+prf3_agent_root_v2="$prf3_dir/agents-v2"
+mkdir -p "$prf3_agent_root_v2"
+
+cat >"$prf3_dir/agb-mock" <<MOCK
+#!/usr/bin/env bash
+cat <<'JSON'
+{
+  "agent": "prf3-agent",
+  "workdir": "$prf3_dir/workdir",
+  "profile": {"home": "$prf3_dir/home"},
+  "isolation": {"mode": "shared", "os_user": ""}
+}
+JSON
+MOCK
+chmod +x "$prf3_dir/agb-mock"
+cp "$prf1_dir/python-mock" "$prf3_dir/python-mock"
+
+PRF3_ARGS_OUT="$prf3_dir/argv.log"
+env -u CRON_REQUEST_DIR \
+    BRIDGE_AGB="$prf3_dir/agb-mock" \
+    BRIDGE_PYTHON="$prf3_dir/python-mock" \
+    BRIDGE_HOME="$prf3_dir/bridge-home" \
+    BRIDGE_LAYOUT="v2" \
+    BRIDGE_DATA_ROOT="$prf3_missing_data_root" \
+    BRIDGE_AGENT_ROOT_V2="$prf3_agent_root_v2" \
+    PRF_MOCK_ARGS_OUT="$PRF3_ARGS_OUT" \
+  "$REPO_ROOT/scripts/memory-daily-harvest.sh" --agent prf3-agent \
+  >"$prf3_dir/stdout" 2>"$prf3_dir/stderr"
+prf3_rc=$?
+
+prf3_argv="$(tr '\n' ' ' <"$PRF3_ARGS_OUT" 2>/dev/null || echo '')"
+case " $prf3_argv " in
+  *" --per-agent-state-dir "*) prf3_has_v2="yes" ;;
+  *) prf3_has_v2="no" ;;
+esac
+case " $prf3_argv " in
+  *" --shared-aggregate-dir "*) prf3_has_shared="yes" ;;
+  *) prf3_has_shared="no" ;;
+esac
+# Debug breadcrumb on stderr.
+if grep -q "data root not populated" "$prf3_dir/stderr" 2>/dev/null; then
+  prf3_breadcrumb="yes"
+else
+  prf3_breadcrumb="no"
+fi
+
+if [[ $prf3_rc -eq 0 \
+      && "$prf3_has_v2" == "no" \
+      && "$prf3_has_shared" == "no" \
+      && "$prf3_breadcrumb" == "yes" ]]; then
+  pass "PRF3"
+else
+  fail "PRF3" "rc=$prf3_rc v2=$prf3_has_v2 shared=$prf3_has_shared breadcrumb=$prf3_breadcrumb argv='$prf3_argv'"
+fi
+
+# =============================================================================
 # Summary
 # =============================================================================
 printf '\n================================\n'

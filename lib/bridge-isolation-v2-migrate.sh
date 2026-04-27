@@ -848,14 +848,48 @@ bridge_isolation_v2_migrate_status() {
     else
       printf 'marker_valid: no\n'
     fi
-    printf '---\n'
-    # Issue #418 codex r1 #7: filter marker contents to the documented
-    # schema keys before printing. Tampered or malformed lines (e.g.,
-    # injected shell comments / unrelated assignments) are dropped so
-    # operator-visible output never echoes attacker-controlled bytes.
-    grep -E '^(BRIDGE_LAYOUT_MARKER_VERSION|BRIDGE_LAYOUT|BRIDGE_DATA_ROOT|BRIDGE_LAYOUT_MARKER_CREATED_AT)=' "$marker_path" 2>/dev/null \
-      || printf 'invalid-marker(redacted)\n'
-    printf '---\n'
+    printf '%s\n' '---'
+    # Issue #418 codex r2 item 2: per-key value-level redaction (not just
+    # key-level). The earlier grep allowlist filtered keys but still
+    # echoed arbitrary `=.*` values verbatim — a tampered marker with
+    # `BRIDGE_DATA_ROOT=$(rm -rf /)` would surface attacker bytes in
+    # operator-visible output. Validate each value against an allowlist
+    # regex; drop any line whose value does not match. If nothing
+    # survives, fall back to `invalid-marker(redacted)`.
+    python3 - "$marker_path" <<'PY' || printf 'invalid-marker(redacted)\n'
+import re
+import sys
+
+path = sys.argv[1]
+allowed = {
+    "BRIDGE_LAYOUT_MARKER_VERSION": r'^[0-9]+$',
+    "BRIDGE_LAYOUT": r'^(legacy|v2)$',
+    # Path values: alphanumerics plus `_./-` only; explicitly excludes
+    # `$`, backticks, spaces, and other shell metacharacters.
+    "BRIDGE_DATA_ROOT": r'^[A-Za-z0-9_./-]+$',
+    # ISO-8601-ish timestamp (digits, `T`, `:`, `+`, `-`, `Z`).
+    "BRIDGE_LAYOUT_MARKER_CREATED_AT": r'^[0-9T:+\-Z]+$',
+}
+emitted = False
+try:
+    with open(path) as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key not in allowed:
+                continue
+            if not re.match(allowed[key], value):
+                continue
+            print(f"{key}={value}")
+            emitted = True
+except FileNotFoundError:
+    pass
+if not emitted:
+    print("invalid-marker(redacted)")
+PY
+    printf '%s\n' '---'
   else
     printf 'marker_valid: absent\n'
   fi

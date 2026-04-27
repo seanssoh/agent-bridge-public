@@ -50,6 +50,18 @@ Existing legacy installs upgrading to this version see no behavior change:
 the resolver's `missing-marker(existing)` invariant keeps them on the legacy
 code path until they explicitly run `agent-bridge migrate isolation-v2 apply`.
 
+**Opting out of v2 on a fresh install.** With the default flip, a fresh
+`agent-bridge init` now provisions the v2 layout. To stay on legacy, set
+`BRIDGE_LAYOUT=legacy` before running init:
+
+```bash
+BRIDGE_LAYOUT=legacy agent-bridge init
+```
+
+Existing installs with prior usage evidence (`state/`, `logs/`, `agents/`)
+are unaffected and stay legacy automatically — the override only matters for
+fresh installs that would otherwise pick up the new v2 default.
+
 ## [0.6.28] — 2026-04-28
 
 ### Runtime enforcement — input-source ↔ output-reply matching
