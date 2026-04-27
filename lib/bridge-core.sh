@@ -419,6 +419,12 @@ text = sys.stdin.read()
 
 def sensitive(name):
     upper = name.upper()
+    # Substring markers cover the common secret families. Note that
+    # ``AUTH``/``PRIVATE``/``SECRET`` already cover their ``*_KEY``
+    # variants by substring match; ``API_KEY``/``CLIENT_KEY``/``ACCESS_KEY``
+    # are listed explicitly so non-secret env names that merely happen to
+    # end in ``_KEY`` (e.g. ``BRIDGE_LAYOUT_MARKER_KEY``, ``CACHE_KEY``,
+    # ``STATE_KEY``) are no longer false-positive redacted (#428 r2).
     if any(
         marker in upper
         for marker in (
@@ -432,10 +438,14 @@ def sensitive(name):
             "PRIVATE",
             "COOKIE",
             "JWT",
+            "API_KEY",
+            "AUTH_KEY",
+            "PRIVATE_KEY",
+            "CLIENT_KEY",
+            "ACCESS_KEY",
+            "SECRET_KEY",
         )
     ):
-        return True
-    if re.search(r"(^|_)KEY($|_)", upper):
         return True
     if re.search(r"(^|_)PWD($|_)", upper):
         return True

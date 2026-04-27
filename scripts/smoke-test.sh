@@ -215,18 +215,24 @@ LAUNCH_REDACTION_OUTPUT="$("$BASH4_BIN" -s "$REPO_ROOT" <<'BASH_REDACTION'
 set -euo pipefail
 repo="$1"
 source "$repo/lib/bridge-core.sh"
-bridge_redact_inline_env_secrets "MS365_CLIENT_SECRET=s3cr3t SAFE_FLAG=1 API_KEY=abc BEARER_TOKEN=zzz SERVICE_PWD=pwd DB_PASSWORD='with space' OPTIONAL_KEY=\"quoted secret\" OAUTH_TOKEN=hello\\ world ANSI_SECRET=\$'line space' claude --ok"
+bridge_redact_inline_env_secrets "MS365_CLIENT_SECRET=s3cr3t SAFE_FLAG=1 MY_API_KEY=abc BEARER_TOKEN=zzz SERVICE_PWD=pwd DB_PASSWORD='with space' MY_PRIVATE_KEY=\"quoted secret\" OAUTH_TOKEN=hello\\ world ANSI_SECRET=\$'line space' BRIDGE_LAYOUT_MARKER_KEY=layout-marker CACHE_KEY=cache-val claude --ok"
 BASH_REDACTION
 )"
 assert_contains "$LAUNCH_REDACTION_OUTPUT" "MS365_CLIENT_SECRET=***redacted***"
-assert_contains "$LAUNCH_REDACTION_OUTPUT" "API_KEY=***redacted***"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "MY_API_KEY=***redacted***"
 assert_contains "$LAUNCH_REDACTION_OUTPUT" "BEARER_TOKEN=***redacted***"
 assert_contains "$LAUNCH_REDACTION_OUTPUT" "SERVICE_PWD=***redacted***"
 assert_contains "$LAUNCH_REDACTION_OUTPUT" "DB_PASSWORD=***redacted***"
-assert_contains "$LAUNCH_REDACTION_OUTPUT" "OPTIONAL_KEY=***redacted***"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "MY_PRIVATE_KEY=***redacted***"
 assert_contains "$LAUNCH_REDACTION_OUTPUT" "OAUTH_TOKEN=***redacted***"
 assert_contains "$LAUNCH_REDACTION_OUTPUT" "ANSI_SECRET=***redacted***"
 assert_contains "$LAUNCH_REDACTION_OUTPUT" "SAFE_FLAG=1"
+# #428 r2: bare ``_KEY`` no longer triggers redaction — only ``API_KEY`` /
+# ``AUTH_KEY`` / ``PRIVATE_KEY`` / ``CLIENT_KEY`` / ``ACCESS_KEY`` /
+# ``SECRET_KEY`` (and the existing substring families). Non-secret env
+# names that merely end in ``_KEY`` must round-trip unchanged.
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "BRIDGE_LAYOUT_MARKER_KEY=layout-marker"
+assert_contains "$LAUNCH_REDACTION_OUTPUT" "CACHE_KEY=cache-val"
 assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "s3cr3t"
 assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "abc"
 assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "zzz"
@@ -234,6 +240,45 @@ assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "with space"
 assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "quoted secret"
 assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "hello"
 assert_not_contains "$LAUNCH_REDACTION_OUTPUT" "line space"
+
+# #428 r2 item 2: end-to-end dry-run smoke. The focused helper test above
+# only proves bridge_redact_inline_env_secrets does the right thing in
+# isolation. This case proves bridge-run.sh's --dry-run path actually
+# routes the launch_cmd through that helper before printing
+# `launch=...`, so a future refactor cannot silently drop the redaction
+# call and reintroduce the #428 leak.
+log "bridge-run.sh --dry-run pipes launch_cmd through env-secret redactor (#428 r2)"
+LAUNCH_DRYRUN_HOME="$(mktemp -d)"
+LAUNCH_DRYRUN_WORKDIR="$LAUNCH_DRYRUN_HOME/work"
+mkdir -p "$LAUNCH_DRYRUN_WORKDIR"
+cat >"$LAUNCH_DRYRUN_HOME/agent-roster.local.sh" <<EOF
+#!/usr/bin/env bash
+# shellcheck disable=SC2034
+bridge_add_agent_id_if_missing "dryrun-redact-smoke"
+BRIDGE_AGENT_DESC["dryrun-redact-smoke"]="Dry-run redaction smoke role"
+BRIDGE_AGENT_ENGINE["dryrun-redact-smoke"]="claude"
+BRIDGE_AGENT_SESSION["dryrun-redact-smoke"]="dryrun-redact-smoke"
+BRIDGE_AGENT_WORKDIR["dryrun-redact-smoke"]="$LAUNCH_DRYRUN_WORKDIR"
+BRIDGE_AGENT_LAUNCH_CMD["dryrun-redact-smoke"]='MS365_CLIENT_SECRET=fake-secret-XYZ MY_API_TOKEN=fake-token-ABC BRIDGE_LAYOUT_MARKER_KEY=preserve-me claude --ok'
+EOF
+# Unset any inherited BRIDGE_ROSTER_* / BRIDGE_*_DIR overrides so the
+# isolated BRIDGE_HOME defaults bind to LAUNCH_DRYRUN_HOME. Without this,
+# operator-shell defaults would silently steer bridge-run.sh at the live
+# roster and the test would be a no-op (or worse, an env-pollution false
+# pass against unrelated agents).
+LAUNCH_DRYRUN_OUTPUT="$(env -u BRIDGE_ROSTER_FILE -u BRIDGE_ROSTER_LOCAL_FILE \
+  -u BRIDGE_STATE_DIR -u BRIDGE_ACTIVE_AGENT_DIR -u BRIDGE_LOG_DIR \
+  -u BRIDGE_SHARED_DIR -u BRIDGE_TASK_DB \
+  BRIDGE_HOME="$LAUNCH_DRYRUN_HOME" \
+  "$BASH4_BIN" "$REPO_ROOT/bridge-run.sh" "dryrun-redact-smoke" --dry-run 2>&1)"
+assert_contains "$LAUNCH_DRYRUN_OUTPUT" "launch=MS365_CLIENT_SECRET=***redacted***"
+assert_contains "$LAUNCH_DRYRUN_OUTPUT" "MY_API_TOKEN=***redacted***"
+# Non-secret BRIDGE_LAYOUT_MARKER_KEY must round-trip with its real value
+# (control assertion — proves the dry-run path didn't blanket-redact).
+assert_contains "$LAUNCH_DRYRUN_OUTPUT" "BRIDGE_LAYOUT_MARKER_KEY=preserve-me"
+assert_not_contains "$LAUNCH_DRYRUN_OUTPUT" "fake-secret-XYZ"
+assert_not_contains "$LAUNCH_DRYRUN_OUTPUT" "fake-token-ABC"
+rm -rf "$LAUNCH_DRYRUN_HOME"
 
 log "bridge_cron_sync_enabled reducer: any-0-disables semantics (issue #192)"
 # Regression matrix for the `BRIDGE_CRON_SYNC_ENABLED` reducer introduced
