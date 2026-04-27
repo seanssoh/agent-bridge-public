@@ -38,7 +38,7 @@ check_email_patterns() {
 
   matches="$(rg -n --color never -e '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "${scan_files[@]}" || true)"
   # Public plugin manifests may use non-routable placeholder contacts.
-  matches="$(printf '%s\n' "$matches" | grep -Ev '@(agent-bridge\.local|local\.invalid|tenant\.com)([^A-Za-z0-9.-]|$)|@odata\.(bind|id|type)' || true)"
+  matches="$(printf '%s\n' "$matches" | grep -Ev '@(agent-bridge\.local|example\.com|example\.test|local\.invalid|tenant\.com)([^A-Za-z0-9.-]|$)|@odata\.(bind|id|type)' || true)"
   if [[ -n "$matches" ]]; then
     echo "[oss] fail: email addresses in tracked content"
     echo "$matches"
@@ -62,6 +62,48 @@ fi
 check_email_patterns
 check_pattern "discord webhook URLs in tracked content" 'discord\.com/api/webhooks/'
 check_pattern "discord mention IDs in tracked content" '<@[0-9]{6,}>'
+
+echo "[oss] checking Agent Bridge marketplace declarations"
+if ! python3 - "$repo_root" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+marketplace_path = repo / ".claude-plugin" / "marketplace.json"
+try:
+    marketplace = json.loads(marketplace_path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"[oss] fail: cannot parse {marketplace_path.relative_to(repo)}: {exc}")
+    raise SystemExit(1)
+
+declared = {
+    plugin.get("name")
+    for plugin in marketplace.get("plugins", [])
+    if isinstance(plugin, dict) and isinstance(plugin.get("name"), str)
+}
+
+missing = []
+for plugin_json in sorted((repo / "plugins").glob("*/.claude-plugin/plugin.json")):
+    try:
+        payload = json.loads(plugin_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"[oss] fail: cannot parse {plugin_json.relative_to(repo)}: {exc}")
+        raise SystemExit(1)
+    name = payload.get("name")
+    if not isinstance(name, str) or not name:
+        print(f"[oss] fail: {plugin_json.relative_to(repo)} missing non-empty name")
+        raise SystemExit(1)
+    if name not in declared:
+        missing.append(name)
+
+if missing:
+    print("[oss] fail: shipped plugins missing from .claude-plugin/marketplace.json: " + ", ".join(missing))
+    raise SystemExit(1)
+PY
+then
+  fail=1
+fi
 
 if [[ -f "$local_patterns_file" ]]; then
   while IFS= read -r pattern; do
