@@ -1796,6 +1796,26 @@ process_context_pressure_reports() {
         --detail mode=hash_drift
       changed=0
     fi
+
+    # Issue #419: dynamic agents are operator-managed — admin doesn't act on
+    # context-pressure for them (the static-target task body itself instructs
+    # admin to close such tasks as no-ops). Skip task creation entirely
+    # instead of letting admin process and immediately close, same anti-pattern
+    # the v0.6.22 fix #393 closed for cron-followup memory_pressure deferrals.
+    # State is cleared so first_detected_ts doesn't accumulate indefinitely.
+    local source_kind=""
+    source_kind="$(bridge_agent_source "$agent")"
+    if [[ "$source_kind" == "dynamic" ]]; then
+      bridge_audit_log daemon context_pressure_suppressed "$agent" \
+        --detail severity="$severity" \
+        --detail reason=dynamic_agent_operator_managed \
+        --detail excerpt_hash="$excerpt_hash"
+      daemon_info "skipped context-pressure task for dynamic agent $agent (operator-managed)"
+      bridge_clear_context_pressure_state "$agent"
+      changed=0
+      continue
+    fi
+
     last_detected_ts="$now_ts"
     title="$(bridge_context_pressure_title "$agent" "$severity")"
     title_prefix="$(bridge_context_pressure_title_prefix "$agent")"
