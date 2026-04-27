@@ -1390,23 +1390,44 @@ bridge_isolated_plugin_grants_write() {
   state_file="$(bridge_isolated_plugin_grants_state_file "$agent")"
   state_dir="$(dirname "$state_file")"
   legacy_state_file="$(bridge_isolated_plugin_grants_legacy_state_file "$agent")"
-  bridge_linux_sudo_root mkdir -p "$state_dir"
+
+  # Issue #423 codex r1 fix: every write step must succeed before the
+  # legacy cleanup runs. Pre-fix, mkdir/mktemp/python/mv failure paths
+  # would still execute the `rm -f "$legacy_state_file"` below — silently
+  # deleting the only copy of the grant ledger if the new write failed.
+  # Each step now short-circuits with `|| return 1` so a failed write
+  # keeps the legacy ledger intact and the caller surfaces the failure.
+  bridge_linux_sudo_root mkdir -p "$state_dir" || return 1
   # Place the temp file in the destination dir so the mv is always within
   # one filesystem (atomic rename); see Blocking 2 in PR #302 r1.
-  tmp_file="$(bridge_linux_sudo_root mktemp "${state_file}.tmp.XXXXXX")"
+  tmp_file="$(bridge_linux_sudo_root mktemp "${state_file}.tmp.XXXXXX")" || return 1
+  [[ -n "$tmp_file" ]] || return 1
   bridge_require_python
-  bridge_linux_sudo_root python3 - "$tmp_file" "$channels_csv" <<'PY'
+  if ! bridge_linux_sudo_root python3 - "$tmp_file" "$channels_csv" <<'PY'
 import json, sys
 out_path, csv = sys.argv[1], sys.argv[2]
 channels = sorted({c.strip() for c in csv.split(",") if c.strip()})
 with open(out_path, "w") as f:
     json.dump({"channels": channels}, f, indent=2)
 PY
-  bridge_linux_sudo_root mv "$tmp_file" "$state_file"
-  bridge_linux_sudo_root chown root:root "$state_file"
-  bridge_linux_sudo_root chmod 0640 "$state_file"
+  then
+    bridge_linux_sudo_root rm -f "$tmp_file" >/dev/null 2>&1 || true
+    return 1
+  fi
+  if ! bridge_linux_sudo_root mv "$tmp_file" "$state_file"; then
+    bridge_linux_sudo_root rm -f "$tmp_file" >/dev/null 2>&1 || true
+    return 1
+  fi
+  bridge_linux_sudo_root chown root:root "$state_file" || return 1
+  bridge_linux_sudo_root chmod 0640 "$state_file" || return 1
+  # state_dir hardening stays best-effort — a chmod that no-ops on a
+  # shared/multi-tenant dir shouldn't fail the whole write.
   bridge_linux_sudo_root chown root:root "$state_dir" >/dev/null 2>&1 || true
   bridge_linux_sudo_root chmod 0750 "$state_dir" >/dev/null 2>&1 || true
+  # Only after every write step succeeded is it safe to remove the
+  # legacy ledger. This is the codex r1 fix: pre-fix the rm ran even
+  # on partial-failure paths and could leave the install with no
+  # grant-state file at all.
   if [[ "$legacy_state_file" != "$state_file" ]]; then
     bridge_linux_sudo_root rm -f "$legacy_state_file" >/dev/null 2>&1 || true
   fi
