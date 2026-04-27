@@ -50,6 +50,48 @@ bridge_tmux_session_pane_pid() {
   tmux display-message -p -t "$(bridge_tmux_pane_target "$session")" '#{pane_pid}' 2>/dev/null || true
 }
 
+bridge_tmux_command_name_is_claude() {
+  local command_name="${1:-}"
+  local base=""
+
+  [[ -n "$command_name" ]] || return 1
+  base="${command_name##*/}"
+  case "$base" in
+    claude|claude-*|claude.*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+bridge_tmux_pane_foreground_is_claude() {
+  local session="$1"
+  local pane_pid=""
+  local tpgid=""
+  local pgid=""
+  local comm=""
+  local pane_cmd=""
+
+  pane_pid="$(bridge_tmux_session_pane_pid "$session")"
+  if [[ "$pane_pid" =~ ^[0-9]+$ ]]; then
+    tpgid="$(ps -o tpgid= -p "$pane_pid" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$tpgid" =~ ^[0-9]+$ ]] && (( tpgid > 0 )); then
+      while read -r pgid comm; do
+        [[ "$pgid" == "$tpgid" ]] || continue
+        if bridge_tmux_command_name_is_claude "$comm"; then
+          return 0
+        fi
+      done < <(ps -eo pgid=,comm= 2>/dev/null || true)
+      return 1
+    fi
+  fi
+
+  pane_cmd="$(tmux display-message -p -t "$(bridge_tmux_pane_target "$session")" '#{pane_current_command}' 2>/dev/null || true)"
+  bridge_tmux_command_name_is_claude "$pane_cmd"
+}
+
 bridge_tmux_kill_session() {
   local session="$1"
   tmux kill-session -t "$(bridge_tmux_session_target "$session")"
@@ -410,6 +452,7 @@ bridge_tmux_claude_advance_blocker() {
   local allow_devchannels="${2:-0}"
   local expected_state="${3:-}"
   local state=""
+  local settle_seconds="${BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_SETTLE_SECONDS:-0.2}"
 
   state="$(bridge_tmux_claude_blocker_state "$session")"
   # If the caller specified an expected state and the live state has
@@ -429,6 +472,11 @@ bridge_tmux_claude_advance_blocker() {
       ;;
     devchannels)
       if [[ "$allow_devchannels" == "1" ]]; then
+        if [[ "${BRIDGE_TMUX_DEV_CHANNELS_REQUIRE_CLAUDE_FOREGROUND:-1}" != "0" ]]; then
+          bridge_tmux_pane_foreground_is_claude "$session" || return 1
+          [[ "$settle_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]] || settle_seconds="0.2"
+          sleep "$settle_seconds"
+        fi
         bridge_tmux_send_keys_with_timeout tmux_send_advance_blocker_devchannels \
           -t "$(bridge_tmux_pane_target "$session")" C-m
         sleep 0.3
@@ -530,6 +578,11 @@ bridge_tmux_wait_for_prompt() {
     fi
     elapsed=$(( $(date +%s) - start_ts ))
     if (( elapsed >= timeout )); then
+      if [[ "$engine" == "claude" && "$state" == "devchannels" && "$allow_devchannels" == "1" \
+          && "${BRIDGE_TMUX_DEV_CHANNELS_REQUIRE_CLAUDE_FOREGROUND:-1}" != "0" \
+          && $devchannels_actions -eq 0 ]]; then
+        bridge_warn "wait_for_prompt: devchannels picker present but pane foreground never became claude on session=${session}"
+      fi
       return 1
     fi
   done
