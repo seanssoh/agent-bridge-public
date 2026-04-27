@@ -1863,11 +1863,13 @@ bridge_agent_write_crash_report() {
   local exit_code="$4"
   local stderr_file="$5"
   local launch_cmd="$6"
+  local launch_cmd_display=""
   local report_file=""
   local tail_file=""
   local error_hash=""
   local stderr_tail=""
 
+  launch_cmd_display="$(bridge_redact_inline_env_secrets "$launch_cmd")"
   report_file="$(bridge_agent_crash_report_file "$agent")"
   tail_file="$(bridge_agent_crash_tail_file "$agent")"
   mkdir -p "$(dirname "$report_file")"
@@ -1885,7 +1887,7 @@ CRASH_FAIL_COUNT=$(printf '%q' "$fail_count")
 CRASH_EXIT_CODE=$(printf '%q' "$exit_code")
 CRASH_STDERR_FILE=$(printf '%q' "$stderr_file")
 CRASH_TAIL_FILE=$(printf '%q' "$tail_file")
-CRASH_LAUNCH_CMD=$(printf '%q' "$launch_cmd")
+CRASH_LAUNCH_CMD=$(printf '%q' "$launch_cmd_display")
 CRASH_ERROR_HASH=$(printf '%q' "$error_hash")
 CRASH_REPORTED_AT=$(printf '%q' "$(bridge_now_iso)")
 EOF
@@ -1917,11 +1919,13 @@ bridge_agent_write_broken_launch_state() {
   local launch_cmd="${6:-}"
   local err_size_before="${7:-0}"
   local file=""
+  local launch_cmd_display=""
 
+  launch_cmd_display="$(bridge_redact_inline_env_secrets "$launch_cmd")"
   file="$(bridge_agent_broken_launch_file "$agent")"
   mkdir -p "$(dirname "$file")"
   bridge_require_python
-  python3 - "$file" "$agent" "$engine" "$fail_count" "$exit_code" "$stderr_file" "$launch_cmd" "$err_size_before" <<'PY'
+  python3 - "$file" "$agent" "$engine" "$fail_count" "$exit_code" "$stderr_file" "$launch_cmd_display" "$err_size_before" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone

@@ -401,6 +401,72 @@ print(hashlib.sha1(sys.argv[1].encode("utf-8")).hexdigest())
 PY
 }
 
+bridge_redact_inline_env_secrets() {
+  local text="${1-}"
+  local redacted=""
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    printf '%s' "[redacted launch command: python3 unavailable]"
+    return 0
+  fi
+
+  if redacted="$(printf '%s' "$text" | python3 -c '
+import re
+import sys
+
+text = sys.stdin.read()
+
+
+def sensitive(name):
+    upper = name.upper()
+    if any(
+        marker in upper
+        for marker in (
+            "SECRET",
+            "TOKEN",
+            "PASSWORD",
+            "PASSWD",
+            "CREDENTIAL",
+            "AUTH",
+            "BEARER",
+            "PRIVATE",
+            "COOKIE",
+            "JWT",
+        )
+    ):
+        return True
+    if re.search(r"(^|_)KEY($|_)", upper):
+        return True
+    if re.search(r"(^|_)PWD($|_)", upper):
+        return True
+    return False
+
+
+assignment = re.compile(
+    r"(^|\s)"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+    r"(=)"
+    r"(\$'\''(?:[^'\''\\]|\\.)*'\''|\$\"(?:[^\"\\]|\\.)*\"|'\''(?:[^'\''\\]|\\.)*'\''|\"(?:[^\"\\]|\\.)*\"|(?:\\.|[^\s])*)",
+    re.MULTILINE,
+)
+
+
+def replace(match):
+    prefix, name, equals, _value = match.groups()
+    if sensitive(name):
+        return f"{prefix}{name}{equals}***redacted***"
+    return match.group(0)
+
+
+sys.stdout.write(assignment.sub(replace, text))
+' 2>/dev/null)"; then
+    printf '%s' "$redacted"
+    return 0
+  fi
+
+  printf '%s' "[redacted launch command: redaction failed]"
+}
+
 bridge_queue_cli() {
   local agent=""
 
