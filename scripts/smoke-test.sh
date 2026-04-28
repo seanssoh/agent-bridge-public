@@ -4789,14 +4789,18 @@ assert_contains "$CREATED_AGENT_RESTART_OUTPUT" "$CREATED_SESSION"
 CREATED_AGENT_RESTART_NO_ATTACH_OUTPUT="$("$REPO_ROOT/agent-bridge" agent restart "$CREATED_AGENT" --no-attach --dry-run)"
 assert_contains "$CREATED_AGENT_RESTART_NO_ATTACH_OUTPUT" "$CREATED_SESSION"
 tmux kill-session -t "$CREATED_SESSION" >/dev/null 2>&1 || true
-tmux new-session -d -s "$CREATED_SESSION" "sleep 30"
+# Keep the sentinel session alive long enough for slower CI dry-run setup
+# work. The assertion below is about restart --dry-run not killing a live
+# session, not about a short sleep completing while dry-run is still preparing
+# hooks/channel state.
+tmux new-session -d -s "$CREATED_SESSION" "sleep 300"
 CREATED_AGENT_RESTART_DRY_RUN_ACTIVE="$("$REPO_ROOT/agent-bridge" agent restart "$CREATED_AGENT" --dry-run)"
 assert_contains "$CREATED_AGENT_RESTART_DRY_RUN_ACTIVE" "$CREATED_SESSION"
 tmux has-session -t "$CREATED_SESSION" >/dev/null 2>&1 || die "restart --dry-run should not kill a running session"
 tmux kill-session -t "$CREATED_SESSION" >/dev/null 2>&1 || true
 log "blocking restart before killing a live session when channel runtime drifts"
 mv "$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.telegram/.env" "$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.telegram/.env.bak"
-tmux new-session -d -s "$CREATED_SESSION" "sleep 30"
+tmux new-session -d -s "$CREATED_SESSION" "sleep 300"
 CREATED_AGENT_RESTART_GUARD_OUTPUT="$("$REPO_ROOT/agent-bridge" agent restart "$CREATED_AGENT" 2>&1 || true)"
 assert_contains "$CREATED_AGENT_RESTART_GUARD_OUTPUT" "Restart is blocked for '$CREATED_AGENT'"
 assert_contains "$CREATED_AGENT_RESTART_GUARD_OUTPUT" "The running session was left intact to avoid downtime."
