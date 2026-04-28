@@ -2469,7 +2469,8 @@ import re
 import sys
 import time
 
-workdir = os.path.realpath(sys.argv[1])
+input_workdir = sys.argv[1]
+workdir = os.path.realpath(input_workdir)
 candidate = sys.argv[2] or ""
 try:
     max_age_hours = float(sys.argv[3])
@@ -2489,9 +2490,20 @@ def workdir_slug_candidates(path):
     return candidates
 
 
+def ordered_slug_candidates(paths):
+    candidates = []
+    seen = set()
+    for path in paths:
+        for slug in workdir_slug_candidates(path):
+            if slug not in seen:
+                seen.add(slug)
+                candidates.append(slug)
+    return candidates
+
+
 eligible = []
 seen_stems = set()
-for slug in workdir_slug_candidates(workdir):
+for slug in ordered_slug_candidates([input_workdir, workdir]):
     base = os.path.expanduser(f"~/.claude/projects/{slug}")
     if not os.path.isdir(base):
         continue
