@@ -447,7 +447,11 @@ if [[ $# -gt 0 ]]; then
             ;;
         esac
       done
-      set -- "${ADMIN_ARGS[@]}"
+      if ((${#ADMIN_ARGS[@]} > 0)); then
+        set -- "${ADMIN_ARGS[@]}"
+      else
+        set --
+      fi
 
       if [[ $ADMIN_SAFE_MODE -eq 1 ]]; then
         exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-agent.sh" safe-mode "$ADMIN_AGENT" "$@"
