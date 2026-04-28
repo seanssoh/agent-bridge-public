@@ -1,108 +1,117 @@
 # Mattermost Channel
 
-This plugin receives messages from a self-hosted Mattermost instance via Outgoing Webhooks and routes them to Agent Bridge agents. Agents respond using the [mattermost-mcp-server](https://github.com/mattermost/mattermost-plugin-agents) `create_post` tool.
+This plugin subscribes to a self-hosted Mattermost instance via the
+WebSocket gateway (`/api/v4/websocket`) and routes incoming posts to
+Agent Bridge agents. Agents respond using the
+[mattermost-mcp-server](https://github.com/mattermost/mattermost-plugin-agents)
+`create_post` tool (registered for the agent via `.mcp.json`).
 
 ## Architecture
 
 ```
-Mattermost user → Outgoing Webhook
-  → Plugin server (bridge mode, single port)
-  → Bot mention routing (@sales-bot → sales_mun agent)
-  → agb urgent <agent> (task queue)
+Mattermost user posts in channel
+  → Mattermost server broadcasts `posted` event over WS
+  → Plugin server (one WS connection per bot in BOT_ROUTES,
+    or one connection in single-bot mode)
+  → Per-route gate: dmPolicy / allowFrom / @mention check
+  → recentMessageIds dedupe (per-(post_id, route))
+  → bridge-guard prompt scan
+  → agb urgent <route.agent> "<post text>"
   → Claude agent claims task
-  → mattermost-mcp-server create_post → Mattermost
+  → Agent calls mattermost-mcp-server `create_post` to reply
 ```
 
-The plugin server runs as a standalone process (not inside Claude Code). Message reception and response use separate paths:
+The plugin runs as a single bun process. Inbound and outbound paths
+are decoupled:
 
-- **Inbound**: Outgoing Webhook → plugin server → `agb urgent`
-- **Outbound**: Agent uses `mattermost-mcp-server` MCP tools (`create_post`, `read_channel`, etc.)
+- **Inbound**: WebSocket → `handlePosted` → `agb urgent`. Outbound
+  TCP only — no inbound port to expose.
+- **Outbound**: Agent uses `mattermost-mcp-server` MCP tools
+  (`create_post`, `read_channel`, `get_thread`, …). Tokens live in
+  `.mcp.json` under `MM_ACCESS_TOKEN`.
+
+The vendored WebSocket monitor + reconnect modules (`lib/`) are
+adapted from [openclaw](https://github.com/openclaw/openclaw) under
+MIT — see `THIRD_PARTY_LICENSES.md`.
 
 ## Setup
 
-### 1. Mattermost Bot Accounts
+### 1. Bot Account(s)
 
-Create a bot account per agent in Mattermost System Console:
+In **System Console → Integrations → Bot Accounts**, enable bot
+account creation, then add one bot per agent (e.g. `buildersbot`,
+`sales-bot`). Copy each bot's **Access Token**. Invite each bot to
+the channels it should monitor.
 
-1. **System Console > Integrations > Bot Accounts > Enable Bot Account Creation**
-2. **Integrations > Bot Accounts > Add Bot Account** for each agent
-3. Copy each bot's **Access Token**
+WebSocket transport requires the bot to be a member of the channel —
+no per-channel webhook registration is needed.
 
-### 2. Outgoing Webhooks
+### 2. Mattermost MCP Server
 
-Create one webhook per channel, all pointing to the same plugin server:
-
-1. **Integrations > Outgoing Webhooks > Add Outgoing Webhook**
-2. Callback URL: `http://<host>:3979/hooks/outgoing`
-3. Select the channel to monitor
-4. Repeat for each channel
-
-For localhost development, enable internal connections:
-**System Console > Environment > Developer > Allow untrusted internal connections**: `127.0.0.1 localhost`
-
-### 3. MCP Server for Agents
-
-Build and configure the official Mattermost MCP server:
+Build the official MCP server once on the host that will run agents:
 
 ```bash
 git clone https://github.com/mattermost/mattermost-plugin-agents
 cd mattermost-plugin-agents && make mcp-server
+sudo install -m 0755 build/mattermost-mcp-server /usr/local/bin/
 ```
 
-Add `.mcp.json` to each agent's workdir:
+### 3. Run `bridge-setup.py mattermost`
 
-```json
-{
-  "mcpServers": {
-    "mattermost": {
-      "command": "/path/to/mattermost-mcp-server",
-      "env": {
-        "MM_SERVER_URL": "http://localhost:8065",
-        "MM_ACCESS_TOKEN": "<bot-access-token>"
-      }
-    }
-  }
-}
+`bridge-setup.py` writes the state dir, access policy, and `.mcp.json`
+in one shot:
+
+```bash
+python3 ~/.agent-bridge/bridge-setup.py mattermost \
+  --agent builders-bot \
+  --mattermost-dir ~/.agent-bridge/agents/builders-bot/.mattermost \
+  --url https://builders.cosmax.com \
+  --bot-token "<buildersbot-access-token>" \
+  --allow-from "<operator-user-id>" \
+  --channel "<channel-id>" \
+  --require-mention \
+  --yes
 ```
 
-### 4. Plugin Server (Bridge Mode)
+This creates:
 
-Create a bot routes file (`bot-routes.json`):
+- `~/.agent-bridge/agents/builders-bot/.mattermost/.env`
+- `~/.agent-bridge/agents/builders-bot/.mattermost/access.json`
+- `~/.agent-bridge/agents/builders-bot/.mcp.json` (mattermost MCP
+  server upserted; existing servers preserved)
 
-```json
+### 4. Multi-bot (optional)
+
+For multiple bots in a single plugin process, point at a routes file
+instead:
+
+```bash
+cat > ~/.agent-bridge/agents/.mattermost-bot-routes.json <<'EOF'
 [
-  {"username": "sales-bot", "token": "<token>", "agent": "sales_mun", "system_prompt": "You are a sales assistant."},
-  {"username": "research-bot", "token": "<token>", "agent": "formulation_research", "system_prompt": "You are a formulation researcher."}
+  {"username": "buildersbot",  "token": "...", "agent": "builders-bot",          "system_prompt": "..."},
+  {"username": "sales-bot",    "token": "...", "agent": "sales_mun",             "system_prompt": "..."},
+  {"username": "research-bot", "token": "...", "agent": "formulation_research",  "system_prompt": "..."}
 ]
+EOF
 ```
 
-Start the plugin server:
+Set `MATTERMOST_BOT_ROUTES=<that path>` in the plugin's environment.
+The plugin opens one WS connection per route. Each route is
+authenticated independently (first failure is fatal). Mention-based
+routing — `@buildersbot hello` wakes only `builders-bot` — is
+enforced inside `handlePosted` using Mattermost's server-parsed
+`data.mentions` field with a regex fallback for events that omit it.
 
-```bash
-MATTERMOST_BRIDGE_MODE=1 \
-MATTERMOST_STANDALONE=1 \
-MATTERMOST_BOT_ROUTES=bot-routes.json \
-MATTERMOST_STATE_DIR=~/.agent-bridge/agents/<agent>/.mattermost \
-MATTERMOST_OUTGOING_WEBHOOK_TOKEN= \
-BRIDGE_HOME=~/.agent-bridge \
-bun plugins/mattermost/server.ts
-```
-
-### 5. Agent Roster
-
-Agents do not need channel plugin flags. Standard launch command is sufficient since MCP tools come from `.mcp.json`:
-
-```bash
-BRIDGE_AGENT_LAUNCH_CMD["sales_mun"]='claude --dangerously-skip-permissions'
-```
-
-## Runtime Files
+## Runtime files
 
 Per-agent state directory (`~/.agent-bridge/agents/<agent>/.mattermost/`):
 
-- `.env`: `MATTERMOST_URL`, `MATTERMOST_BOT_TOKEN`, `MATTERMOST_OUTGOING_WEBHOOK_TOKEN`
-- `access.json`: user allowlists and channel policies
-- `messages.jsonl`: local rolling message log
+- `.env` — `MATTERMOST_URL`, `MATTERMOST_BOT_TOKEN`, `BRIDGE_AGENT_ID`
+- `access.json` — user allowlist and per-channel policies
+- `messages.jsonl` — local rolling message log
+
+The `.mcp.json` for the agent's own Claude/Codex session lives one
+level up at `~/.agent-bridge/agents/<agent>/.mcp.json`.
 
 ## Access
 
@@ -114,29 +123,57 @@ Per-agent state directory (`~/.agent-bridge/agents/<agent>/.mattermost/`):
   "allowFrom": ["<mattermost-user-id>"],
   "channels": {
     "<channel-id>": {
-      "requireMention": false,
+      "requireMention": true,
       "allowFrom": []
     }
   }
 }
 ```
 
-## Environment Variables
+`requireMention: true` is recommended for shared channels — the
+plugin's per-route mention gate enforces it regardless of policy, so
+this acts as a defense-in-depth.
 
-| Variable | Description |
-|---|---|
-| `MATTERMOST_BRIDGE_MODE` | `1` to route messages via `agb urgent` |
-| `MATTERMOST_STANDALONE` | `1` to enable standalone fallback (Claude API/CLI) |
-| `MATTERMOST_BOT_ROUTES` | Path to bot routes JSON for multi-bot routing |
-| `MATTERMOST_STATE_DIR` | Agent-local state directory |
-| `MATTERMOST_WEBHOOK_PORT` | HTTP server port (default: 3979) |
-| `MATTERMOST_OUTGOING_WEBHOOK_TOKEN` | Leave empty to skip token validation |
-| `BRIDGE_HOME` | Agent Bridge home (default: `~/.agent-bridge`) |
+## Environment variables
 
-## Standalone Fallback
+| Variable | Default | Description |
+|---|---|---|
+| `MATTERMOST_URL` | `http://localhost:8065` | Mattermost API base (host root, NOT team-scoped). E.g. `https://builders.cosmax.com` |
+| `MATTERMOST_BOT_TOKEN` | — | Single-bot mode: the bot's access token |
+| `MATTERMOST_BOT_ROUTES` | — | Multi-bot mode: path to JSON array of `{username, token, agent, system_prompt}` |
+| `MATTERMOST_BRIDGE_MODE` | `0` | `1` to route via `agb urgent` (production); `0` to use MCP `notifications/claude/channel` push |
+| `MATTERMOST_BRIDGE_AGENT` | — | Single-bot agent name when `BRIDGE_MODE=1` and no `BOT_ROUTES` |
+| `MATTERMOST_STATE_DIR` | `~/.claude/channels/mattermost` | Per-agent state directory; `bridge-setup.py` overrides this to `~/.agent-bridge/agents/<agent>/.mattermost` |
+| `MATTERMOST_WS_URL` | derived from `MATTERMOST_URL` | Override the WebSocket base (rarely needed) |
+| `MATTERMOST_HEALTH_CHECK_MS` | `30000` | Bot account `update_at` poll interval |
+| `MATTERMOST_WS_INITIAL_DELAY_MS` | `2000` | First reconnect backoff |
+| `MATTERMOST_WS_MAX_DELAY_MS` | `60000` | Max reconnect backoff (also used to derive multi-bot watchdog threshold = 3× this) |
+| `MATTERMOST_WS_IDLE_TIMEOUT_MS` | `120000` | If no WS frame arrives within this, terminate the connection so reconnect re-establishes. Catches silent auth-fail. |
+| `MATTERMOST_ACCESS_MODE` | (unset) | Set to `static` to load access.json once at boot instead of per-event |
+| `BRIDGE_HOME` | `~/.agent-bridge` | Agent Bridge home — `bridgeSend` invokes `${BRIDGE_HOME}/agent-bridge urgent ...` |
 
-When `MATTERMOST_STANDALONE=1` and bridge-send fails, the plugin falls back to generating a response directly via Claude API (`ANTHROPIC_API_KEY`) or Claude CLI (`claude --print`).
+## Reconnect & resilience
 
-## Prompt Guard
+- **Reconnect**: exponential backoff with jitter
+  (`MATTERMOST_WS_INITIAL_DELAY_MS` → `MATTERMOST_WS_MAX_DELAY_MS`).
+  Successful connections reset backoff to the initial value.
+- **Health check**: every `MATTERMOST_HEALTH_CHECK_MS` (default 30s)
+  the plugin polls the bot account's `update_at` timestamp. If it
+  changes, the connection is terminated to force a fresh
+  authentication challenge — catches the silent-disconnect that
+  Mattermost exhibits after a bot disable/enable cycle.
+- **Idle timeout**: if no WS frame of any kind arrives within
+  `MATTERMOST_WS_IDLE_TIMEOUT_MS` (default 2 minutes) the connection
+  is terminated. Mattermost emits periodic frames on idle channels
+  (`hello`, `typing`, `status_change`, `channel_viewed`), so prolonged
+  silence is a reliable signal of a dead connection — including the
+  silent-auth-fail mode where Mattermost accepts the WS handshake but
+  rejects `authentication_challenge` without closing the socket.
+- **Multi-bot watchdog**: when running >1 route, if every route stays
+  disconnected for longer than `3 × MATTERMOST_WS_MAX_DELAY_MS` the
+  process exits non-zero so `agb` can restart it.
 
-If `BRIDGE_PROMPT_GUARD_ENABLED=1` is set, inbound text is scanned and outbound reply text is sanitized before send.
+## Prompt guard
+
+If `BRIDGE_PROMPT_GUARD_ENABLED=1` is set, inbound text is scanned
+and outbound reply text is sanitized before send.
