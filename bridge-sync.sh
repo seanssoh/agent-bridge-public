@@ -54,7 +54,7 @@ prune_missing_dynamic_agents() {
 }
 
 refresh_missing_session_ids() {
-  local agent sid exclude_csv created_at detected key
+  local agent sid exclude_csv created_at detected key _resolved _rc
   local -a excluded
 
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
@@ -88,6 +88,18 @@ refresh_missing_session_ids() {
     if [[ -z "$detected" ]]; then
       continue
     fi
+
+    # Round-trip the detected id through the freshness resolver so a stale
+    # transcript that bridge_detect_session_id would otherwise re-register
+    # (since_epoch can be 0 for never-created agents) is filtered out.
+    _resolved=""; _rc=0
+    _resolved="$(bridge_resolve_resume_session_id \
+      "$(bridge_agent_engine "$agent")" "$agent" \
+      "$(bridge_agent_workdir "$agent")" "$detected" 2>/dev/null)" || _rc=$?
+    if [[ "$_rc" == 1 || -z "$_resolved" ]]; then
+      continue
+    fi
+    detected="$_resolved"
 
     # shellcheck disable=SC2034
     BRIDGE_AGENT_SESSION_ID["$agent"]="$detected"

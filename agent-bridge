@@ -957,7 +957,17 @@ if [[ $CONTINUE_MODE -eq 1 && -f "$HISTORY_FILE" ]]; then
   AGENT_SESSION_ID=""
   # shellcheck source=/dev/null
   source "$HISTORY_FILE"
-  SESSION_ID="${AGENT_SESSION_ID:-}"
+  # Gate the stored id through the freshness resolver. rc=0 keeps it,
+  # rc=2 swaps in a fresher in-window transcript for the same workdir,
+  # anything else means start fresh (no --resume). This is the dynamic
+  # ad-hoc analogue of the hydration sites in lib/bridge-state.sh.
+  _RESUME_RC=0
+  SESSION_ID="$(bridge_resolve_resume_session_id "$ENGINE" "$NAME" "$WORKDIR" "${AGENT_SESSION_ID:-}" 2>/dev/null)" || _RESUME_RC=$?
+  case "$_RESUME_RC" in
+    0|2) ;;
+    *)   SESSION_ID="" ;;
+  esac
+  unset _RESUME_RC
 fi
 
 bridge_add_agent_id_if_missing "$NAME"
