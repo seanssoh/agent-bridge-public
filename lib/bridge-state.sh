@@ -825,7 +825,19 @@ bridge_load_dynamic_agent_file() {
   fi
 
   if bridge_agent_exists "$AGENT_ID" && [[ "$(bridge_agent_source "$AGENT_ID")" == "static" ]]; then
-    BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="${AGENT_SESSION_ID:-${BRIDGE_AGENT_SESSION_ID[$AGENT_ID]-}}"
+    # Static-agent collision: an active dynamic env file points at an
+    # already-registered static agent. Gate the candidate id through the
+    # freshness resolver (mirrors the dynamic-load branch below) so a stale
+    # on-disk transcript cannot leak in here. Without this gate the raw
+    # AGENT_SESSION_ID from the env file would survive and be written back
+    # by later start/isolation setup before bridge-run normalises — that
+    # is the bypass dev-codex flagged in the round-4 review of #428.
+    local _accepted="" _rc=0
+    _accepted="$(bridge_resolve_resume_session_id "$AGENT_ENGINE" "${AGENT_ID:-}" "$AGENT_WORKDIR" "${AGENT_SESSION_ID:-}" 2>/dev/null)" || _rc=$?
+    case "$_rc" in
+      0|2) BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="$_accepted" ;;
+      *)   BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="${BRIDGE_AGENT_SESSION_ID[$AGENT_ID]-}" ;;
+    esac
     BRIDGE_AGENT_HISTORY_KEY["$AGENT_ID"]="${AGENT_HISTORY_KEY:-${BRIDGE_AGENT_HISTORY_KEY[$AGENT_ID]-}}"
     BRIDGE_AGENT_CREATED_AT["$AGENT_ID"]="${AGENT_CREATED_AT:-${BRIDGE_AGENT_CREATED_AT[$AGENT_ID]-}}"
     BRIDGE_AGENT_UPDATED_AT["$AGENT_ID"]="${AGENT_UPDATED_AT:-${BRIDGE_AGENT_UPDATED_AT[$AGENT_ID]-}}"
