@@ -396,6 +396,11 @@ bridge_run_schedule_dev_channels_accept() {
 
   bridge_run_should_auto_accept_dev_channels "$launch_cmd" || return 0
 
+  if [[ "${BRIDGE_CONTROLLER_DEV_CHANNELS_ACCEPT:-0}" == "1" ]]; then
+    log_line "[info] controller-side Claude development-channels auto-accept armed; skipping agent-side watcher"
+    return 0
+  fi
+
   # Operator-tunable timeout. Default 60s covers 4-plugin cold-start
   # (bun teams + bun ms365 + node cosmax-* MCP servers) on isolated
   # linux-user agents where claude takes longer than the historic 15s
