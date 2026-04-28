@@ -2,9 +2,13 @@
 /**
  * Mattermost channel for Claude Code.
  *
- * Receives messages via Mattermost Outgoing Webhooks or Bot WebSocket,
- * gates them with access.json, forwards accepted messages through Claude
- * channel notifications, and exposes reply/fetch tools over MCP.
+ * Subscribes to a self-hosted Mattermost via the WebSocket gateway
+ * (`/api/v4/websocket`), gates incoming posts with access.json, forwards
+ * accepted messages through Claude channel notifications, and exposes
+ * reply/fetch tools over MCP.
+ *
+ * The WebSocket monitor + reconnect loop are imported from ./lib/
+ * (vendored from openclaw/openclaw under MIT — see THIRD_PARTY_LICENSES.md).
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -13,8 +17,6 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { createServer } from 'http'
-import { randomUUID } from 'crypto'
 import { spawnSync } from 'child_process'
 import {
   appendFileSync,
@@ -28,6 +30,12 @@ import {
 import { homedir } from 'os'
 import { join } from 'path'
 import { createRecentMessageDeduper } from './dedupe.ts'
+import {
+  createMattermostConnectOnce,
+  type MattermostEventPayload,
+  type MattermostPost,
+} from './lib/monitor-websocket.ts'
+import { runWithReconnect } from './lib/reconnect.ts'
 
 type Access = {
   dmPolicy?: 'allowlist' | 'open' | 'disabled'
@@ -66,15 +74,23 @@ try {
   }
 } catch {}
 
-const HOST = process.env.MATTERMOST_WEBHOOK_HOST ?? '127.0.0.1'
-const PORT = Number(process.env.MATTERMOST_WEBHOOK_PORT ?? '3979')
 const STATIC = process.env.MATTERMOST_ACCESS_MODE === 'static'
 const BRIDGE_MODE = process.env.MATTERMOST_BRIDGE_MODE === '1'
 const BRIDGE_AGENT = process.env.MATTERMOST_BRIDGE_AGENT ?? ''
 
 const MM_URL = process.env.MATTERMOST_URL ?? 'http://localhost:8065'
 const MM_TOKEN = process.env.MATTERMOST_BOT_TOKEN ?? process.env.MATTERMOST_PERSONAL_TOKEN ?? ''
-const MM_WEBHOOK_TOKEN = process.env.MATTERMOST_OUTGOING_WEBHOOK_TOKEN ?? ''
+
+// WebSocket transport — `MM_URL` defines the API base; the WS endpoint
+// is derived (https→wss, http→ws) unless explicitly overridden.
+const MM_WS_URL = process.env.MATTERMOST_WS_URL
+  ?? MM_URL.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:')
+const HEALTH_CHECK_MS = Number(process.env.MATTERMOST_HEALTH_CHECK_MS ?? '30000')
+const WS_INITIAL_DELAY_MS = Number(process.env.MATTERMOST_WS_INITIAL_DELAY_MS ?? '2000')
+const WS_MAX_DELAY_MS = Number(process.env.MATTERMOST_WS_MAX_DELAY_MS ?? '60000')
+const WS_IDLE_TIMEOUT_MS = Number(process.env.MATTERMOST_WS_IDLE_TIMEOUT_MS ?? '120000')
+
+const abortController = new AbortController()
 
 type BotRoute = {
   username: string
@@ -115,10 +131,12 @@ function gracefulShutdown(reason: string): void {
   shuttingDown = true
   process.stderr.write(`mattermost channel: shutting down (${reason})\n`)
   try {
-    httpServer.close(() => process.exit(0))
+    abortController.abort()
   } catch {
-    process.exit(0)
+    /* abort can throw on certain runtime states — fall through */
   }
+  // Safety: if the abort + WS close path hangs (network limbo, etc.),
+  // force exit shortly after. Matches the Teams plugin's 1.5s safety net.
   setTimeout(() => process.exit(0), 1500).unref?.()
 }
 
@@ -366,69 +384,75 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
 })
 
-type OutgoingWebhookPayload = {
-  token?: string
-  team_id?: string
-  team_domain?: string
-  channel_id?: string
-  channel_name?: string
-  timestamp?: number
-  user_id?: string
-  user_name?: string
-  post_id?: string
-  text?: string
-  trigger_word?: string
-  file_ids?: string
+function makeSeqCounter(): () => number {
+  let seq = 1
+  return () => seq++
 }
 
-function handleOutgoingWebhook(payload: OutgoingWebhookPayload): void {
-  if (MM_WEBHOOK_TOKEN && payload.token !== MM_WEBHOOK_TOKEN) {
-    process.stderr.write(`mattermost channel: outgoing webhook token mismatch\n`)
-    return
+/**
+ * Raw `GET /api/v4/users/{userId}` returning the bot's current `update_at`.
+ * Does NOT route through `mmApiRequest` because that helper hardcodes the
+ * global `MM_TOKEN` (multi-bot per-route token-aware mmApiRequest lands in
+ * commit 3b). For 3a single-bot, the token here is `MM_TOKEN` itself.
+ */
+async function fetchBotUpdateAt(token: string, userId: string): Promise<number> {
+  const url = `${MM_URL}/api/v4/users/${userId}`
+  const resp = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'User-Agent': 'agent-bridge-mattermost/0.1',
+    },
+  })
+  if (!resp.ok) {
+    throw new Error(`get user ${userId} failed: ${resp.status}`)
   }
+  const data = (await resp.json()) as { update_at?: number }
+  return Number(data.update_at ?? 0)
+}
 
-  const channelId = String(payload.channel_id ?? '').trim()
-  const postId = String(payload.post_id ?? randomUUID()).trim()
-  const userId = String(payload.user_id ?? '').trim()
-  const userName = String(payload.user_name ?? 'mattermost-user')
-  let text = String(payload.text ?? '').trim()
-
-  if (!channelId || !text) return
-  if (userId === botUserId) return
-
-  if (recentMessageIds.seen(postId)) {
+async function handlePosted(post: MattermostPost, payload: MattermostEventPayload): Promise<void> {
+  if (recentMessageIds.seen(post.id)) {
     if (duplicateDropLogs < 10) {
-      process.stderr.write(`mattermost channel: dropped duplicate post_id=${postId}\n`)
+      process.stderr.write(`mattermost channel: dropped duplicate post_id=${post.id}\n`)
       duplicateDropLogs += 1
     }
     return
   }
+  // Self-message: bot's own posts arrive on its own WS too (via Mattermost
+  // broadcast). Filter to prevent infinite loops. Per-route self-loop
+  // prevention for multi-bot lands in commit 3b.
+  if (post.user_id === botUserId) return
 
-  const isDirect = (payload.channel_name ?? '').startsWith('__')
+  const channelId = post.channel_id
+  const userId = post.user_id
+  const userName = String(payload.data?.sender_name ?? userId).replace(/^@/, '') || 'mattermost-user'
+  let text = String(post.message ?? '').trim()
+  if (!channelId || !text) return
+
+  const isDirect = (payload.data?.channel_type ?? '') === 'D'
   const mentionedBot = botUsername ? text.includes(`@${botUsername}`) : false
 
   if (!gate(channelId, userId, isDirect, mentionedBot)) return
 
-  // Strip bot mention from text. Per-route mention routing for multi-bot
-  // is added in a follow-up commit (3b) once per-route bot identity is in
-  // place; for now, single-bot strips its own @mention.
+  // Strip bot mention from text. Per-route mention gate (with `data.mentions`
+  // primary + text fallback) lands in commit 3b once per-route bot identity
+  // is wired.
   if (botUsername) {
     text = text.replace(new RegExp(`@${botUsername}\\b`, 'g'), '').trim()
+    if (!text) return
   }
 
   const guarded = runPromptGuard('scan', text)
   if (guarded?.blocked) return
 
-  const rawTs = payload.timestamp ?? 0
-  const ts = rawTs > 1e12
-    ? new Date(rawTs).toISOString()
-    : rawTs > 0
-      ? new Date(rawTs * 1000).toISOString()
+  const ts =
+    post.create_at && post.create_at > 0
+      ? new Date(post.create_at).toISOString()
       : new Date().toISOString()
 
   const stored: StoredMessage = {
     channel_id: channelId,
-    post_id: postId,
+    post_id: post.id,
     user: userName,
     user_id: userId,
     text,
@@ -448,10 +472,10 @@ function handleOutgoingWebhook(payload: OutgoingWebhookPayload): void {
         meta: {
           source: 'mattermost',
           channel_id: channelId,
-          post_id: postId,
+          post_id: post.id,
           user: userName,
           user_id: userId,
-          team_id: String(payload.team_id ?? ''),
+          team_id: String(payload.data?.team_id ?? payload.broadcast?.team_id ?? ''),
           ts,
         },
       },
@@ -459,54 +483,31 @@ function handleOutgoingWebhook(payload: OutgoingWebhookPayload): void {
   }
 }
 
-const httpServer = createServer((req, res) => {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
-
-  if (req.method === 'GET' && url.pathname === '/health') {
-    const body = JSON.stringify({ ok: true, channel: 'mattermost', port: PORT })
-    res.writeHead(200, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) })
-    res.end(body)
-    return
-  }
-
-  if (req.method === 'POST' && url.pathname === '/hooks/outgoing') {
-    let body = ''
-    req.on('data', chunk => { body += chunk })
-    req.on('end', () => {
-      try {
-        const payload = JSON.parse(body) as OutgoingWebhookPayload
-        handleOutgoingWebhook(payload)
-      } catch (err) {
-        process.stderr.write(`mattermost channel: failed to parse webhook payload: ${err}\n`)
-      }
-      res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end('{}')
-    })
-    return
-  }
-
-  res.writeHead(404)
-  res.end()
-})
-
-httpServer.on('error', err => {
-  process.stderr.write(`mattermost channel: http listen failed on ${HOST}:${PORT}: ${err}\n`)
-  process.exit(1)
-})
-
 async function start(): Promise<void> {
+  // Boot identity check — invalid bot token is a hard fail. The plugin
+  // cannot do anything useful without a valid token, so failing fast and
+  // letting agb (or the launcher) restart is preferable to running with
+  // partial identity. Architect finding #1 — must be try/catch with exit.
+  let me: { id: string; username: string }
   try {
-    const me = await mmGetMe()
-    botUserId = me.id
-    botUsername = me.username
-    process.stderr.write(`mattermost channel: authenticated as @${botUsername} (${botUserId})\n`)
+    me = await mmGetMe()
   } catch (err) {
-    process.stderr.write(`mattermost channel: warning: could not fetch bot identity: ${err}\n`)
+    process.stderr.write(
+      `mattermost channel: FATAL: could not fetch bot identity (invalid MATTERMOST_BOT_TOKEN?): ${err}\n`,
+    )
+    process.exit(1)
   }
+  botUserId = me.id
+  botUsername = me.username
+  process.stderr.write(`mattermost channel: authenticated as @${botUsername} (${botUserId})\n`)
 
   botRoutes = loadBotRoutes()
   if (botRoutes.length > 0) {
-    // Resolve user_ids for each bot route
+    // Resolve user_ids for each bot route. NOTE: in commit 3a only the
+    // single-bot path (MM_TOKEN) is wired to WS; per-route WS connections
+    // and per-route bot identity land in commit 3b. Loading the routes
+    // here keeps the config-validation surface live so operators can
+    // confirm bot-routes JSON parses correctly without enabling multi-bot.
     for (const route of botRoutes) {
       if (!route.user_id) {
         try {
@@ -514,20 +515,56 @@ async function start(): Promise<void> {
             headers: { 'Authorization': `Bearer ${route.token}` },
           })
           if (resp.ok) {
-            const user = await resp.json() as { id: string }
+            const user = (await resp.json()) as { id: string }
             route.user_id = user.id
           }
-        } catch {}
+        } catch {
+          /* best-effort — config validation only */
+        }
       }
     }
-    process.stderr.write(`mattermost channel: loaded ${botRoutes.length} bot routes: ${botRoutes.map(r => `@${r.username}`).join(', ')}\n`)
+    process.stderr.write(
+      `mattermost channel: loaded ${botRoutes.length} bot routes (multi-bot WS wiring lands in commit 3b): ${botRoutes
+        .map(r => `@${r.username}`)
+        .join(', ')}\n`,
+    )
   }
 
-  httpServer.listen(PORT, HOST, () => {
-    process.stderr.write(`mattermost channel: listening on http://${HOST}:${PORT} (/hooks/outgoing)\n`)
+  // Single-bot WS connection. Multi-bot per-route fan-out + watchdog
+  // lands in commit 3b.
+  process.stderr.write(`mattermost channel: connecting to ${MM_WS_URL}/api/v4/websocket\n`)
+  const seq = makeSeqCounter()
+  const connectOnce = createMattermostConnectOnce({
+    wsUrl: `${MM_WS_URL}/api/v4/websocket`,
+    botToken: MM_TOKEN,
+    abortSignal: abortController.signal,
+    runtime: {
+      log: msg => process.stderr.write(`${msg}\n`),
+      error: msg => process.stderr.write(`${msg}\n`),
+    },
+    nextSeq: seq,
+    onPosted: handlePosted,
+    getBotUpdateAt: () => fetchBotUpdateAt(MM_TOKEN, botUserId),
+    healthCheckIntervalMs: HEALTH_CHECK_MS,
+    idleTimeoutMs: WS_IDLE_TIMEOUT_MS,
   })
 
-  await mcp.connect(new StdioServerTransport())
+  // Single-bot uses await: the reconnect loop only exits on abortSignal,
+  // so once shutdown signals fire (SIGTERM/SIGHUP/SIGINT/parent-died)
+  // the loop terminates and start() returns and the process exits
+  // cleanly. Architect finding #3 (single-bot half).
+  const wsLoop = runWithReconnect(connectOnce, {
+    abortSignal: abortController.signal,
+    initialDelayMs: WS_INITIAL_DELAY_MS,
+    maxDelayMs: WS_MAX_DELAY_MS,
+    jitterRatio: 0.2,
+    onError: err => process.stderr.write(`mattermost channel: ws error: ${err}\n`),
+    onReconnect: ms => process.stderr.write(`mattermost channel: ws reconnecting in ${ms}ms\n`),
+  })
+
+  // MCP stdio runs in parallel — agents reach in via stdio MCP for
+  // reply / fetch_messages tools regardless of WS state.
+  await Promise.all([mcp.connect(new StdioServerTransport()), wsLoop])
 }
 
 await start()

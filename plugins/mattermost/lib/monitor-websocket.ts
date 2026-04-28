@@ -21,6 +21,16 @@
  *   - The opened-vs-not-opened close handling — opens that close cleanly
  *     resolve so the reconnect loop resets backoff; closes before open
  *     reject so backoff increases.
+ *
+ * Local additions on top of openclaw:
+ *   - `idleTimeoutMs` — if no WS frame of any kind arrives within the
+ *     timeout, the connection is terminated so `runWithReconnect` can
+ *     re-establish it. Mitigates "silent auth fail" where Mattermost
+ *     accepts the WS handshake but then rejects the auth_challenge
+ *     silently and stops sending events; the underlying TCP looks alive
+ *     to us but no `posted` events ever arrive. Mattermost normally
+ *     emits periodic frames (channel_viewed, typing, hello, status_change)
+ *     so prolonged silence is a reliable signal of a dead connection.
  */
 
 import { randomUUID } from "node:crypto"
@@ -185,6 +195,12 @@ export type CreateMattermostConnectOnceOpts = {
    */
   getBotUpdateAt?: () => Promise<number>
   healthCheckIntervalMs?: number
+  /**
+   * If set, the WS connection is terminated when no frame of any kind
+   * arrives within this many milliseconds. The reconnect loop then
+   * re-establishes the connection. See file header for rationale.
+   */
+  idleTimeoutMs?: number
 }
 
 export const defaultMattermostWebSocketFactory: MattermostWebSocketFactory = (url) => {
@@ -224,6 +240,7 @@ export function createMattermostConnectOnce(
 ): () => Promise<void> {
   const webSocketFactory = opts.webSocketFactory ?? defaultMattermostWebSocketFactory
   const healthCheckIntervalMs = opts.healthCheckIntervalMs ?? 30_000
+  const idleTimeoutMs = opts.idleTimeoutMs ?? 0
   return async () => {
     // flowId is kept for forward-compat (was used by openclaw debug capture).
     // Logged only on errors so an operator can correlate one connection's
@@ -242,17 +259,50 @@ export function createMattermostConnectOnce(
         let healthCheckInFlight = false
         let healthCheckTimer: ReturnType<typeof setTimeout> | undefined
         let initialUpdateAt: number | undefined
+        let idleCheckTimer: ReturnType<typeof setTimeout> | undefined
+        let lastFrameReceivedAt = 0
 
         const clearTimers = () => {
           if (healthCheckTimer !== undefined) {
             clearTimeout(healthCheckTimer)
             healthCheckTimer = undefined
           }
+          if (idleCheckTimer !== undefined) {
+            clearTimeout(idleCheckTimer)
+            idleCheckTimer = undefined
+          }
         }
 
         const stopHealthChecks = () => {
           healthCheckEnabled = false
           clearTimers()
+        }
+
+        // Idle-timeout watchdog: if no WS frame arrives within idleTimeoutMs,
+        // terminate the connection so runWithReconnect re-establishes it.
+        // Polling at 1/4 the timeout means worst-case detection latency is
+        // ~timeout * 1.25, which is acceptable for the failure mode this
+        // catches (silent auth fail).
+        const scheduleIdleCheck = () => {
+          if (!idleTimeoutMs || settled) return
+          const interval = Math.max(1000, Math.floor(idleTimeoutMs / 4))
+          idleCheckTimer = setTimeout(() => {
+            idleCheckTimer = undefined
+            runIdleCheck()
+          }, interval)
+        }
+
+        const runIdleCheck = () => {
+          if (settled || !idleTimeoutMs) return
+          const idleFor = Date.now() - lastFrameReceivedAt
+          if (idleFor > idleTimeoutMs) {
+            opts.runtime.log?.(
+              `mattermost: no ws frames for ${idleFor}ms (>${idleTimeoutMs}ms idle timeout) — terminating to reconnect [flow=${flowId}]`,
+            )
+            ws.terminate()
+            return
+          }
+          scheduleIdleCheck()
         }
 
         const scheduleHealthCheck = () => {
@@ -320,6 +370,7 @@ export function createMattermostConnectOnce(
 
         ws.on("open", () => {
           opened = true
+          lastFrameReceivedAt = Date.now()
           opts.statusSink?.({
             connected: true,
             lastConnectedAt: Date.now(),
@@ -340,9 +391,15 @@ export function createMattermostConnectOnce(
           if (getBotUpdateAt) {
             void runHealthCheck()
           }
+          scheduleIdleCheck()
         })
 
         ws.on("message", async (data) => {
+          // Mark liveness for ALL frames (hello, typing, status_change,
+          // posted, …). The idle-timeout watchdog treats prolonged
+          // silence — not just absent posted events — as the failure
+          // signal.
+          lastFrameReceivedAt = Date.now()
           const raw = rawDataToString(data)
           const payload = parseMattermostEventPayload(raw)
           if (!payload) {
