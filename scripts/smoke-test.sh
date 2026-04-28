@@ -3514,7 +3514,7 @@ print(last)
 PY
 )"
 [[ "$NUDGE_DROP_ACTION" == "session_nudge_dropped" ]] || die "expected session_nudge_dropped audit row, got '$NUDGE_DROP_ACTION'"
-python3 "$REPO_ROOT/bridge-queue.py" cancel "$NUDGE_DROP_TASK_ID" --agent "$REQUESTER_AGENT" --note "verify drop cleanup" >/dev/null
+python3 "$REPO_ROOT/bridge-queue.py" cancel "$NUDGE_DROP_TASK_ID" --actor "$REQUESTER_AGENT" --note "verify drop cleanup" >/dev/null
 
 log "Issue #331: marking session_nudge_sent when the task moves out of queued before the grace expires"
 NUDGE_SENT_OUTPUT="$(python3 "$REPO_ROOT/bridge-queue.py" create --to "$CODEX_CLI_AGENT" --title "verify sent oracle" --body "pickup" --from "$REQUESTER_AGENT")"
