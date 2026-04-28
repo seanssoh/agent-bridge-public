@@ -17,6 +17,109 @@ fi
 umask 077
 
 BRIDGE_SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+bridge_early_ephemeral_tmp_root() {
+  local path="${1:-}"
+  local tmpdir="${TMPDIR:-}"
+  local rest=""
+  [[ -n "$path" ]] || return 1
+  case "$path" in
+    /tmp/tmp.*|/tmp/tmp.*/*)
+      rest="${path#/tmp/}"
+      printf '/tmp/%s' "${rest%%/*}"
+      ;;
+    /var/tmp/tmp.*|/var/tmp/tmp.*/*)
+      rest="${path#/var/tmp/}"
+      printf '/var/tmp/%s' "${rest%%/*}"
+      ;;
+    /private/tmp/tmp.*|/private/tmp/tmp.*/*)
+      rest="${path#/private/tmp/}"
+      printf '/private/tmp/%s' "${rest%%/*}"
+      ;;
+    *)
+      if [[ -n "$tmpdir" ]]; then
+        tmpdir="${tmpdir%/}"
+        case "$path" in
+          "$tmpdir"/tmp.*|"$tmpdir"/tmp.*/*)
+            rest="${path#"$tmpdir"/}"
+            printf '%s/%s' "$tmpdir" "${rest%%/*}"
+            ;;
+          *)
+            return 1
+            ;;
+        esac
+      else
+        return 1
+      fi
+      ;;
+  esac
+}
+
+bridge_sanitize_stale_ephemeral_controller_env() {
+  local name=""
+  local value=""
+  local root=""
+  local -a path_vars=(
+    BRIDGE_HOME
+    BRIDGE_ROSTER_FILE
+    BRIDGE_ROSTER_LOCAL_FILE
+    BRIDGE_STATE_DIR
+    BRIDGE_LAYOUT_MARKER_DIR
+    BRIDGE_ACTIVE_AGENT_DIR
+    BRIDGE_HISTORY_DIR
+    BRIDGE_WORKTREE_META_DIR
+    BRIDGE_ACTIVE_ROSTER_TSV
+    BRIDGE_ACTIVE_ROSTER_MD
+    BRIDGE_DAEMON_PID_FILE
+    BRIDGE_DAEMON_LOG
+    BRIDGE_DAEMON_CRASH_LOG
+    BRIDGE_TASK_DB
+    BRIDGE_PROFILE_STATE_DIR
+    BRIDGE_CRON_STATE_DIR
+    BRIDGE_CRON_HOME_DIR
+    BRIDGE_NATIVE_CRON_JOBS_FILE
+    BRIDGE_CRON_DISPATCH_WORKER_DIR
+    BRIDGE_WORKTREE_ROOT
+    BRIDGE_AGENT_HOME_ROOT
+    BRIDGE_RUNTIME_ROOT
+    BRIDGE_RUNTIME_SCRIPTS_DIR
+    BRIDGE_RUNTIME_SKILLS_DIR
+    BRIDGE_RUNTIME_SHARED_DIR
+    BRIDGE_RUNTIME_SHARED_TOOLS_DIR
+    BRIDGE_RUNTIME_SHARED_REFERENCES_DIR
+    BRIDGE_RUNTIME_MEMORY_DIR
+    BRIDGE_RUNTIME_CREDENTIALS_DIR
+    BRIDGE_RUNTIME_SECRETS_DIR
+    BRIDGE_RUNTIME_CONFIG_FILE
+    BRIDGE_HOOKS_DIR
+    BRIDGE_SHARED_DIR
+    BRIDGE_TASK_NOTE_DIR
+    BRIDGE_LOG_DIR
+    BRIDGE_DATA_ROOT
+    BRIDGE_SHARED_ROOT
+    BRIDGE_AGENT_ROOT_V2
+    BRIDGE_CONTROLLER_STATE_ROOT
+    BRIDGE_CLAUDE_CHANNELS_HOME
+    BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT
+    BRIDGE_CLAUDE_INSTALLED_PLUGINS_FILE
+  )
+
+  [[ "${BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV:-0}" == "1" ]] && return 0
+
+  for name in "${path_vars[@]}"; do
+    value="${!name:-}"
+    [[ -n "$value" ]] || continue
+    root="$(bridge_early_ephemeral_tmp_root "$value" 2>/dev/null || true)"
+    [[ -n "$root" ]] || continue
+    [[ -d "$root" ]] && continue
+    printf '[bridge-lib] [warn] unsetting stale ephemeral controller env %s=%s (missing root %s)\n' \
+      "$name" "$value" "$root" >&2
+    unset "$name"
+  done
+}
+
+bridge_sanitize_stale_ephemeral_controller_env
+
 if [[ -z "${BRIDGE_HOME:-}" ]]; then
   BRIDGE_HOME="$HOME/.agent-bridge"
 fi

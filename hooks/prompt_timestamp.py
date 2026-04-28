@@ -8,7 +8,11 @@ import json
 import os
 import sys
 
-from bridge_hook_common import agent_timestamp_enabled, prompt_timestamp_context
+from bridge_hook_common import (
+    agent_timestamp_enabled,
+    next_session_required_prompt_context,
+    prompt_timestamp_context,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -23,7 +27,9 @@ def main(argv: list[str] | None = None) -> int:
             sys.stdout.write("\n")
         return 0
 
-    context = prompt_timestamp_context(agent)
+    handoff_context = next_session_required_prompt_context(agent)
+    timestamp_context = prompt_timestamp_context(agent)
+    context = f"{handoff_context}\n{timestamp_context}" if handoff_context else timestamp_context
     if args.format == "codex":
         json.dump(
             {
