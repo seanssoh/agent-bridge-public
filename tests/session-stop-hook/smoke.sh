@@ -299,6 +299,26 @@ else
   fail 7 "settings.json validation failed"
 fi
 
+# ---------- case 8: BRIDGE_HOME unset + non-bridge fallback dir ----------
+# codex r1 PR #450: when BRIDGE_HOME is unset AND the script's parent.parent
+# is not a bridge home (no scripts/+agents/ siblings), the hook must fast-path
+# return 0 — it must NOT invoke reconcile from an arbitrary location.
+banner 8 "BRIDGE_HOME unset + non-bridge fallback path -> exit 0 fast-path"
+C8_FAKE_HOME="$(mktemp -d)"
+mkdir -p "$C8_FAKE_HOME/hooks"
+cp "$REPO_ROOT/hooks/session-stop.py" "$C8_FAKE_HOME/hooks/session-stop.py"
+# Deliberately do NOT create scripts/ or agents/ — fallback dir doesn't look
+# like a bridge home. With BRIDGE_HOME unset, hook must return 0.
+C8_ERR="$(mktemp)"
+if env -u BRIDGE_HOME BRIDGE_AGENT_ID=anyone \
+    "$PYTHON" "$C8_FAKE_HOME/hooks/session-stop.py" 2>"$C8_ERR" </dev/null; then
+  pass 8
+else
+  rc=$?
+  fail 8 "non-zero rc=$rc when BRIDGE_HOME unset + non-bridge fallback (stderr: $(cat "$C8_ERR"))"
+fi
+rm -rf "$C8_FAKE_HOME" "$C8_ERR"
+
 # ---------- summary ----------
 printf '\n=== summary: %d PASS, %d FAIL ===\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

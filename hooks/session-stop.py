@@ -59,12 +59,28 @@ import sys
 from pathlib import Path
 
 
-def _bridge_home() -> Path:
+def _bridge_home() -> Path | None:
+    """Resolve the bridge home, or None when the hook should fast-path no-op.
+
+    Resolution order:
+    1. BRIDGE_HOME env — explicit operator opt-in. Returned as-is.
+    2. <script>/.. fallback — only when that location actually looks like a
+       bridge home (contains both scripts/ and agents/). This preserves the
+       hook's resilience when invoked under the standard install layout
+       (~/.agent-bridge/hooks/session-stop.py) without requiring the env
+       var to be set, while refusing to invoke reconcile from arbitrary
+       locations (e.g., a source checkout dir, a test fixture). See codex
+       r1 review on PR #450.
+
+    Returning None signals main() to fast-path return 0.
+    """
     env_home = os.environ.get("BRIDGE_HOME")
     if env_home:
         return Path(env_home).expanduser()
-    # Hook scripts live at <bridge-home>/hooks/. Walk up.
-    return Path(__file__).resolve().parent.parent
+    fallback = Path(__file__).resolve().parent.parent
+    if (fallback / "scripts").is_dir() and (fallback / "agents").is_dir():
+        return fallback
+    return None
 
 
 def _agent_workdir(bridge_home: Path, agent_id: str) -> Path:
@@ -209,7 +225,12 @@ def main() -> int:
             return 0  # fast-path: not in a bridge agent context.
 
         bridge_home = _bridge_home()
-        if not bridge_home.is_dir():
+        if bridge_home is None or not bridge_home.is_dir():
+            # Fast-path no-op: BRIDGE_HOME unset AND fallback not recognizable
+            # as a bridge home (no scripts/ + agents/ siblings). See #390 PR-2
+            # codex r1 — this prevents reconcile from being launched in an
+            # unexpected location when the hook is invoked outside the
+            # standard install layout.
             return 0
 
         reconcile = bridge_home / "scripts" / "daily-note-reconcile.py"
