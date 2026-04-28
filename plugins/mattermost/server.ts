@@ -100,20 +100,44 @@ type BotRoute = {
   agent?: string
 }
 
+/**
+ * Per-route identity used by the WS monitor + handlePosted. One per
+ * bot. For single-bot deployments this list has length 1; for
+ * multi-bot deployments via MATTERMOST_BOT_ROUTES it has N entries
+ * with distinct tokens, user IDs, and target agents.
+ */
+type RouteIdentity = {
+  userId: string
+  username: string
+  token: string
+  agent: string
+}
+
+/**
+ * Watchdog state: per-route timestamp of when the route became
+ * disconnected. `null` means currently connected. When ALL entries
+ * have stayed disconnected for > 3× WS_MAX_DELAY_MS, the multi-bot
+ * watchdog terminates the process so agb can restart it.
+ */
+type RouteState = {
+  disconnectedSince: number | null
+}
+
 const BOT_ROUTES_FILE = process.env.MATTERMOST_BOT_ROUTES ?? ''
-let botRoutes: BotRoute[] = []
 
 function loadBotRoutes(): BotRoute[] {
   if (!BOT_ROUTES_FILE) return []
   try {
     return JSON.parse(readFileSync(BOT_ROUTES_FILE, 'utf8')) as BotRoute[]
-  } catch { return [] }
+  } catch {
+    return []
+  }
 }
 
 if (!MM_TOKEN && !BOT_ROUTES_FILE) {
   process.stderr.write(
     `mattermost channel: MATTERMOST_BOT_TOKEN or MATTERMOST_BOT_ROUTES is required\n` +
-    `  set them in ${ENV_FILE}\n`,
+      `  set them in ${ENV_FILE}\n`,
   )
   process.exit(1)
 }
@@ -238,10 +262,15 @@ function recentMessages(channelId: string, limit: number): StoredMessage[] {
   return rows.slice(-Math.max(1, Math.min(limit, 100)))
 }
 
-async function mmApiRequest(method: string, path: string, body?: unknown): Promise<unknown> {
+async function mmApiRequest(
+  method: string,
+  path: string,
+  body?: unknown,
+  tokenOverride?: string,
+): Promise<unknown> {
   const url = `${MM_URL}/api/v4${path}`
   const headers: Record<string, string> = {
-    'Authorization': `Bearer ${MM_TOKEN}`,
+    'Authorization': `Bearer ${tokenOverride ?? MM_TOKEN}`,
     'Content-Type': 'application/json',
     'User-Agent': 'agent-bridge-mattermost/0.1',
   }
@@ -299,12 +328,53 @@ async function bridgeSend(agent: string, message: string, userName: string, chan
   process.stderr.write(`mattermost channel: bridge-send to ${targetAgent} for channel ${channelId}\n`)
 }
 
-async function mmGetMe(): Promise<{ id: string; username: string }> {
-  return mmApiRequest('GET', '/users/me') as Promise<{ id: string; username: string }>
+async function mmGetMe(token?: string): Promise<{ id: string; username: string }> {
+  return mmApiRequest('GET', '/users/me', undefined, token) as Promise<{
+    id: string
+    username: string
+  }>
 }
 
-let botUserId = ''
-let botUsername = ''
+/**
+ * Server-parsed mentions: Mattermost includes `data.mentions` on `posted`
+ * events as a JSON-stringified array of user IDs that the server's own
+ * mention parser identified. This is more authoritative than re-parsing
+ * the message text — handles internationalized usernames, markdown
+ * context, etc. May be absent on some event types or older Mattermost
+ * versions, hence the fallback to text parsing in `mentionsBotUsername`.
+ */
+function extractServerParsedMentionUserIds(
+  payload: MattermostEventPayload,
+): string[] | null {
+  const raw = payload.data?.mentions
+  if (typeof raw !== 'string' || raw.length === 0) return null
+  try {
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return null
+    return parsed.filter((x): x is string => typeof x === 'string')
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Text-parsing fallback: matches `@username` with word-boundary
+ * semantics. Does NOT match `@username-foo`, `@usernameSomething`,
+ * or backtick/code-block-quoted occurrences. Used only when
+ * `data.mentions` is absent or empty (Architect iteration-2 finding).
+ */
+function mentionsBotUsername(text: string, username: string): boolean {
+  if (!text || !username) return false
+  // Mattermost username allowed chars: a-z, 0-9, dot, dash, underscore.
+  // Word boundary on right side via lookahead — anything that's not
+  // those chars terminates the username.
+  const pattern = new RegExp(`(^|[^A-Za-z0-9_.-])@${escapeRegex(username)}(?![A-Za-z0-9_.-])`, 'i')
+  return pattern.test(text)
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
 
 const recentMessageIds = createRecentMessageDeduper(256)
 let duplicateDropLogs = 0
@@ -410,37 +480,59 @@ async function fetchBotUpdateAt(token: string, userId: string): Promise<number> 
   return Number(data.update_at ?? 0)
 }
 
-async function handlePosted(post: MattermostPost, payload: MattermostEventPayload): Promise<void> {
-  if (recentMessageIds.seen(post.id)) {
+async function handlePosted(
+  post: MattermostPost,
+  payload: MattermostEventPayload,
+  route: RouteIdentity,
+): Promise<void> {
+  // Self-message check uses THIS route's userId. Multi-bot: bot A posting
+  // arrives on bot B's WS too — bot A's route filters it; bot B's route
+  // sees it as a non-self post and applies the mention gate normally.
+  if (post.user_id === route.userId) return
+
+  const channelId = post.channel_id
+  const userId = post.user_id
+  const userName =
+    String(payload.data?.sender_name ?? userId).replace(/^@/, '') || 'mattermost-user'
+  let text = String(post.message ?? '').trim()
+  if (!channelId || !text) return
+
+  // Per-route mention gate — server-parsed mention list is authoritative
+  // when present; fall back to text parsing for events that omit it.
+  const serverMentions = extractServerParsedMentionUserIds(payload)
+  const mentionedThisBot =
+    serverMentions !== null
+      ? serverMentions.includes(route.userId)
+      : mentionsBotUsername(text, route.username)
+
+  const isDirect = (payload.data?.channel_type ?? '') === 'D'
+
+  // The gate (access.json) still controls DM/channel allowlists. For
+  // multi-bot, mention-required behavior is enforced by the per-route
+  // mention gate above; if the event survives both gates it belongs to
+  // this route.
+  if (!gate(channelId, userId, isDirect, mentionedThisBot)) return
+  if (!isDirect && !mentionedThisBot) return
+
+  // Per-(post, route) dedupe — same post.id arriving on multiple WS
+  // connections (one per bot) is expected for multi-bot, and each route
+  // must be allowed to process it independently.
+  const dedupeKey = `${post.id}::${route.userId}`
+  if (recentMessageIds.seen(dedupeKey)) {
     if (duplicateDropLogs < 10) {
-      process.stderr.write(`mattermost channel: dropped duplicate post_id=${post.id}\n`)
+      process.stderr.write(
+        `mattermost channel: dropped duplicate post_id=${post.id} route=@${route.username}\n`,
+      )
       duplicateDropLogs += 1
     }
     return
   }
-  // Self-message: bot's own posts arrive on its own WS too (via Mattermost
-  // broadcast). Filter to prevent infinite loops. Per-route self-loop
-  // prevention for multi-bot lands in commit 3b.
-  if (post.user_id === botUserId) return
 
-  const channelId = post.channel_id
-  const userId = post.user_id
-  const userName = String(payload.data?.sender_name ?? userId).replace(/^@/, '') || 'mattermost-user'
-  let text = String(post.message ?? '').trim()
-  if (!channelId || !text) return
-
-  const isDirect = (payload.data?.channel_type ?? '') === 'D'
-  const mentionedBot = botUsername ? text.includes(`@${botUsername}`) : false
-
-  if (!gate(channelId, userId, isDirect, mentionedBot)) return
-
-  // Strip bot mention from text. Per-route mention gate (with `data.mentions`
-  // primary + text fallback) lands in commit 3b once per-route bot identity
-  // is wired.
-  if (botUsername) {
-    text = text.replace(new RegExp(`@${botUsername}\\b`, 'g'), '').trim()
-    if (!text) return
-  }
+  // Strip THIS route's @mention from the message body. Other bots'
+  // mentions stay in (so the agent sees that the user also addressed
+  // others — useful for cross-bot delegation context).
+  text = text.replace(new RegExp(`@${escapeRegex(route.username)}\\b`, 'gi'), '').trim()
+  if (!text) return
 
   const guarded = runPromptGuard('scan', text)
   if (guarded?.blocked) return
@@ -461,9 +553,7 @@ async function handlePosted(post: MattermostPost, payload: MattermostEventPayloa
   appendMessage(stored)
 
   if (BRIDGE_MODE) {
-    if (BRIDGE_AGENT) {
-      void bridgeSend(BRIDGE_AGENT, text, userName, channelId, null)
-    }
+    void bridgeSend(route.agent, text, userName, channelId, null)
   } else {
     void mcp.notification({
       method: 'notifications/claude/channel',
@@ -475,6 +565,7 @@ async function handlePosted(post: MattermostPost, payload: MattermostEventPayloa
           post_id: post.id,
           user: userName,
           user_id: userId,
+          bot_username: route.username,
           team_id: String(payload.data?.team_id ?? payload.broadcast?.team_id ?? ''),
           ts,
         },
@@ -483,88 +574,161 @@ async function handlePosted(post: MattermostPost, payload: MattermostEventPayloa
   }
 }
 
-async function start(): Promise<void> {
-  // Boot identity check — invalid bot token is a hard fail. The plugin
-  // cannot do anything useful without a valid token, so failing fast and
-  // letting agb (or the launcher) restart is preferable to running with
-  // partial identity. Architect finding #1 — must be try/catch with exit.
+/**
+ * Resolve the route list at boot. Two modes:
+ *   - MATTERMOST_BOT_ROUTES set + non-empty: each route is validated
+ *     by calling mmGetMe(route.token). First failure is fatal — running
+ *     with partial routes silently drops one bot's traffic.
+ *   - No BOT_ROUTES: single-bot fallback. MM_TOKEN must be set;
+ *     BRIDGE_AGENT must be set when BRIDGE_MODE=1.
+ */
+async function resolveRoutes(): Promise<RouteIdentity[]> {
+  const file = loadBotRoutes()
+  if (file.length > 0) {
+    const out: RouteIdentity[] = []
+    for (const r of file) {
+      if (!r.token || !r.username) {
+        process.stderr.write(
+          `mattermost channel: FATAL: bot route missing token/username: ${JSON.stringify({ username: r.username })}\n`,
+        )
+        process.exit(1)
+      }
+      let me: { id: string; username: string }
+      try {
+        me = await mmGetMe(r.token)
+      } catch (err) {
+        process.stderr.write(
+          `mattermost channel: FATAL: could not validate bot route @${r.username}: ${err}\n`,
+        )
+        process.exit(1)
+      }
+      const agent = r.agent ?? r.username.replace(/-bot$/, '').replace(/-/g, '_')
+      out.push({
+        userId: me.id,
+        username: me.username,
+        token: r.token,
+        agent,
+      })
+    }
+    return out
+  }
+
+  // Single-bot fallback.
+  if (!MM_TOKEN) {
+    process.stderr.write(
+      `mattermost channel: FATAL: MATTERMOST_BOT_TOKEN required when MATTERMOST_BOT_ROUTES is unset\n`,
+    )
+    process.exit(1)
+  }
   let me: { id: string; username: string }
   try {
-    me = await mmGetMe()
+    me = await mmGetMe(MM_TOKEN)
   } catch (err) {
     process.stderr.write(
       `mattermost channel: FATAL: could not fetch bot identity (invalid MATTERMOST_BOT_TOKEN?): ${err}\n`,
     )
     process.exit(1)
   }
-  botUserId = me.id
-  botUsername = me.username
-  process.stderr.write(`mattermost channel: authenticated as @${botUsername} (${botUserId})\n`)
-
-  botRoutes = loadBotRoutes()
-  if (botRoutes.length > 0) {
-    // Resolve user_ids for each bot route. NOTE: in commit 3a only the
-    // single-bot path (MM_TOKEN) is wired to WS; per-route WS connections
-    // and per-route bot identity land in commit 3b. Loading the routes
-    // here keeps the config-validation surface live so operators can
-    // confirm bot-routes JSON parses correctly without enabling multi-bot.
-    for (const route of botRoutes) {
-      if (!route.user_id) {
-        try {
-          const resp = await fetch(`${MM_URL}/api/v4/users/username/${route.username}`, {
-            headers: { 'Authorization': `Bearer ${route.token}` },
-          })
-          if (resp.ok) {
-            const user = (await resp.json()) as { id: string }
-            route.user_id = user.id
-          }
-        } catch {
-          /* best-effort — config validation only */
-        }
-      }
-    }
+  if (BRIDGE_MODE && !BRIDGE_AGENT) {
     process.stderr.write(
-      `mattermost channel: loaded ${botRoutes.length} bot routes (multi-bot WS wiring lands in commit 3b): ${botRoutes
-        .map(r => `@${r.username}`)
-        .join(', ')}\n`,
+      `mattermost channel: FATAL: MATTERMOST_BRIDGE_AGENT required when BRIDGE_MODE=1 in single-bot mode\n`,
     )
+    process.exit(1)
+  }
+  return [
+    {
+      userId: me.id,
+      username: me.username,
+      token: MM_TOKEN,
+      agent: BRIDGE_AGENT,
+    },
+  ]
+}
+
+async function start(): Promise<void> {
+  const routes = await resolveRoutes()
+  process.stderr.write(
+    `mattermost channel: ${routes.length} route(s) authenticated: ${routes.map(r => `@${r.username}→${r.agent || '(no-agent)'}`).join(', ')}\n`,
+  )
+
+  process.stderr.write(`mattermost channel: connecting to ${MM_WS_URL}/api/v4/websocket\n`)
+
+  const routeStates: RouteState[] = routes.map(() => ({ disconnectedSince: null }))
+
+  // Per-route reconnect loops. Each loop has its own auth_challenge seq
+  // counter (Mattermost expects monotonically increasing seq per WS
+  // connection — separate connections start from 1 independently).
+  const wsLoops = routes.map((route, i) => {
+    const seq = makeSeqCounter()
+    const connectOnce = createMattermostConnectOnce({
+      wsUrl: `${MM_WS_URL}/api/v4/websocket`,
+      botToken: route.token,
+      abortSignal: abortController.signal,
+      runtime: {
+        log: msg => process.stderr.write(`[@${route.username}] ${msg}\n`),
+        error: msg => process.stderr.write(`[@${route.username}] ${msg}\n`),
+      },
+      nextSeq: seq,
+      onPosted: (post, payload) => handlePosted(post, payload, route),
+      getBotUpdateAt: () => fetchBotUpdateAt(route.token, route.userId),
+      healthCheckIntervalMs: HEALTH_CHECK_MS,
+      idleTimeoutMs: WS_IDLE_TIMEOUT_MS,
+      statusSink: patch => {
+        if (patch.connected === true) {
+          routeStates[i].disconnectedSince = null
+        } else if (patch.connected === false && routeStates[i].disconnectedSince === null) {
+          routeStates[i].disconnectedSince = Date.now()
+        }
+      },
+    })
+
+    return runWithReconnect(connectOnce, {
+      abortSignal: abortController.signal,
+      initialDelayMs: WS_INITIAL_DELAY_MS,
+      maxDelayMs: WS_MAX_DELAY_MS,
+      jitterRatio: 0.2,
+      onError: err =>
+        process.stderr.write(`mattermost channel: [@${route.username}] ws error: ${err}\n`),
+      onReconnect: ms =>
+        process.stderr.write(
+          `mattermost channel: [@${route.username}] ws reconnecting in ${ms}ms\n`,
+        ),
+    })
+  })
+
+  // Multi-bot watchdog: if every route stays disconnected for longer than
+  // 3× the max reconnect backoff, the deployment has likely lost the
+  // ability to reach Mattermost entirely. Exit non-zero so agb restarts
+  // the process — letting the reconnect loops spin forever would leave
+  // a zombie agent that shows up as "alive" but answers nothing.
+  // (Single-bot is fine without this: `await runWithReconnect` ensures
+  // the process exits naturally when its abort fires.)
+  const watchdogThresholdMs = WS_MAX_DELAY_MS * 3
+  if (routes.length > 1) {
+    const watchdog = setInterval(() => {
+      const now = Date.now()
+      const allDown =
+        routeStates.length > 0 &&
+        routeStates.every(s => s.disconnectedSince !== null && now - s.disconnectedSince > watchdogThresholdMs)
+      if (allDown) {
+        clearInterval(watchdog)
+        process.stderr.write(
+          `mattermost channel: FATAL: all ${routes.length} routes disconnected > ${watchdogThresholdMs}ms — exiting for restart\n`,
+        )
+        // Trigger graceful shutdown path so MCP stdio + WS abort fire.
+        gracefulShutdown('all-routes-down')
+        setTimeout(() => process.exit(1), 1500).unref?.()
+      }
+    }, 15_000)
+    watchdog.unref?.()
   }
 
-  // Single-bot WS connection. Multi-bot per-route fan-out + watchdog
-  // lands in commit 3b.
-  process.stderr.write(`mattermost channel: connecting to ${MM_WS_URL}/api/v4/websocket\n`)
-  const seq = makeSeqCounter()
-  const connectOnce = createMattermostConnectOnce({
-    wsUrl: `${MM_WS_URL}/api/v4/websocket`,
-    botToken: MM_TOKEN,
-    abortSignal: abortController.signal,
-    runtime: {
-      log: msg => process.stderr.write(`${msg}\n`),
-      error: msg => process.stderr.write(`${msg}\n`),
-    },
-    nextSeq: seq,
-    onPosted: handlePosted,
-    getBotUpdateAt: () => fetchBotUpdateAt(MM_TOKEN, botUserId),
-    healthCheckIntervalMs: HEALTH_CHECK_MS,
-    idleTimeoutMs: WS_IDLE_TIMEOUT_MS,
-  })
-
-  // Single-bot uses await: the reconnect loop only exits on abortSignal,
-  // so once shutdown signals fire (SIGTERM/SIGHUP/SIGINT/parent-died)
-  // the loop terminates and start() returns and the process exits
-  // cleanly. Architect finding #3 (single-bot half).
-  const wsLoop = runWithReconnect(connectOnce, {
-    abortSignal: abortController.signal,
-    initialDelayMs: WS_INITIAL_DELAY_MS,
-    maxDelayMs: WS_MAX_DELAY_MS,
-    jitterRatio: 0.2,
-    onError: err => process.stderr.write(`mattermost channel: ws error: ${err}\n`),
-    onReconnect: ms => process.stderr.write(`mattermost channel: ws reconnecting in ${ms}ms\n`),
-  })
-
   // MCP stdio runs in parallel — agents reach in via stdio MCP for
-  // reply / fetch_messages tools regardless of WS state.
-  await Promise.all([mcp.connect(new StdioServerTransport()), wsLoop])
+  // reply / fetch_messages tools regardless of WS state. We await all
+  // WS loops too so that single-bot exits cleanly when its loop ends
+  // (Architect finding #3, single-bot half) and multi-bot keeps running
+  // until the watchdog or signal handler aborts.
+  await Promise.all([mcp.connect(new StdioServerTransport()), ...wsLoops])
 }
 
 await start()
