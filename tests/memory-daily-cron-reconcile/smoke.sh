@@ -127,6 +127,37 @@ case "$script" in
   *daily-note-reconcile.py)
     : "${MOCK_RECONCILE_LOG:?MOCK_RECONCILE_LOG must be set}"
     printf '%s\n' "$@" >"$MOCK_RECONCILE_LOG"
+    # Write a marker to the daily-note path so the smoke can assert
+    # reconcile actually fired with the right args (codex r1 PR #451
+    # item 9 — case 3 was only checking argv, not content).
+    if [[ "${MOCK_RECONCILE_EXIT:-0}" == "0" ]]; then
+      mock_agent=""
+      mock_jsonl=""
+      mock_i=1
+      mock_args=("$@")
+      while (( mock_i <= $# )); do
+        case "${mock_args[$((mock_i-1))]}" in
+          --agent)
+            mock_agent="${mock_args[$mock_i]:-}"
+            mock_i=$((mock_i + 2))
+            ;;
+          --jsonl)
+            mock_jsonl="${mock_args[$mock_i]:-}"
+            mock_i=$((mock_i + 2))
+            ;;
+          *)
+            mock_i=$((mock_i + 1))
+            ;;
+        esac
+      done
+      if [[ -n "$mock_agent" && -n "${BRIDGE_HOME:-}" ]]; then
+        mock_today="$(date -u +%Y-%m-%d)"
+        mock_note_dir="$BRIDGE_HOME/agents/$mock_agent/memory"
+        mkdir -p "$mock_note_dir"
+        printf '<!-- reconcile-stub-marker agent=%s jsonl=%s -->\n' \
+          "$mock_agent" "$mock_jsonl" >>"$mock_note_dir/$mock_today.md"
+      fi
+    fi
     exit "${MOCK_RECONCILE_EXIT:-0}"
     ;;
   *)
@@ -141,12 +172,22 @@ MOCK
 
 # Materialize an empty session jsonl at the slug-derived path so the
 # harvester's [[ -f $jsonl ]] check passes. Slug convention mirrors
-# bridge-memory.cmd_current_session_id: replace BOTH `/` and `.` in the
-# workdir with `-`.
+# bridge-memory.cmd_current_session_id and the r2 harvester fix: resolve
+# the workdir to its canonical absolute path FIRST (Path.resolve() /
+# os.path.realpath), then replace BOTH `/` and `.` with `-`. Without the
+# realpath step the macOS mktemp `/var/folders/...` path produces a slug
+# that doesn't match the harvester's resolved-path slug
+# (`/private/var/folders/...`) and the smoke would never find the jsonl.
 materialize_session_jsonl() {
   local transcripts_root="$1" workdir="$2" session_id="$3"
+  local resolved_workdir
+  resolved_workdir="$(/usr/bin/env python3 -c '
+import os.path, sys
+print(os.path.realpath(sys.argv[1]))
+' "$workdir" 2>/dev/null || true)"
+  [[ -n "$resolved_workdir" ]] || resolved_workdir="$workdir"
   local slug
-  slug="$(printf '%s' "$workdir" | sed 's:/:-:g; s:\.:-:g')"
+  slug="$(printf '%s' "$resolved_workdir" | sed 's:/:-:g; s:\.:-:g')"
   local dir="$transcripts_root/$slug"
   mkdir -p "$dir"
   : >"$dir/$session_id.jsonl"
@@ -166,6 +207,10 @@ make_python_mock "$C1/python-mock"
 : >"$C1/bridge-home/bridge-memory.py"
 # NO daily-note-reconcile.py at $BRIDGE_HOME/scripts/.
 
+# rc capture: explicit `rc=0` reset + `|| rc=$?` keeps the harvester's exit
+# code accurate even if the surrounding script ever toggles `set -e`. The
+# old `cmd; rc=$?` form was fragile in the same way as the production fix.
+rc=0
 env -u CRON_REQUEST_DIR -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT \
     -u BRIDGE_AGENT_ROOT_V2 -u BRIDGE_SHARED_ROOT \
     BRIDGE_AGB="$C1/agb-mock" \
@@ -177,8 +222,7 @@ env -u CRON_REQUEST_DIR -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT \
     MOCK_HARVEST_LOG="$C1/harvest.log" \
     MOCK_RECONCILE_LOG="$C1/reconcile.log" \
     "$HARVESTER" --agent c1-agent \
-    >"$C1/stdout" 2>"$C1/stderr"
-rc=$?
+    >"$C1/stdout" 2>"$C1/stderr" || rc=$?
 if [[ $rc -ne 0 ]]; then
   fail 1 "harvest exit rc=$rc; stderr=$(cat "$C1/stderr")"
 elif [[ ! -s "$C1/harvest.log" ]]; then
@@ -205,6 +249,7 @@ make_python_mock "$C2/python-mock"
 : >"$C2/bridge-home/bridge-memory.py"
 : >"$C2/bridge-home/scripts/daily-note-reconcile.py"
 
+rc=0
 env -u CRON_REQUEST_DIR -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT \
     -u BRIDGE_AGENT_ROOT_V2 -u BRIDGE_SHARED_ROOT \
     BRIDGE_AGB="$C2/agb-mock" \
@@ -216,8 +261,7 @@ env -u CRON_REQUEST_DIR -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT \
     MOCK_HARVEST_LOG="$C2/harvest.log" \
     MOCK_RECONCILE_LOG="$C2/reconcile.log" \
     "$HARVESTER" --agent c2-agent \
-    >"$C2/stdout" 2>"$C2/stderr"
-rc=$?
+    >"$C2/stdout" 2>"$C2/stderr" || rc=$?
 if [[ $rc -ne 0 ]]; then
   fail 2 "harvest exit rc=$rc; stderr=$(cat "$C2/stderr")"
 elif [[ ! -s "$C2/harvest.log" ]]; then
@@ -246,6 +290,7 @@ make_python_mock "$C3/python-mock"
 C3_JSONL="$(materialize_session_jsonl "$C3/fake-home/.claude/projects" \
   "$C3/workdir" "sess-c3")"
 
+rc=0
 env -u CRON_REQUEST_DIR -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT \
     -u BRIDGE_AGENT_ROOT_V2 -u BRIDGE_SHARED_ROOT \
     BRIDGE_AGB="$C3/agb-mock" \
@@ -258,8 +303,7 @@ env -u CRON_REQUEST_DIR -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT \
     MOCK_RECONCILE_LOG="$C3/reconcile.log" \
     MOCK_RECONCILE_EXIT="0" \
     "$HARVESTER" --agent c3-agent \
-    >"$C3/stdout" 2>"$C3/stderr"
-rc=$?
+    >"$C3/stdout" 2>"$C3/stderr" || rc=$?
 if [[ $rc -ne 0 ]]; then
   fail 3 "harvest exit rc=$rc; stderr=$(cat "$C3/stderr")"
 elif [[ ! -s "$C3/harvest.log" ]]; then
@@ -283,9 +327,23 @@ else
     # (NOT the agent profile home) — that's the wrap-up.md convention and
     # is load-bearing for slug derivation.
     case " $csi_argv " in
-      *" --home $C3/workdir "*) pass 3 ;;
-      *) fail 3 "current-session-id --home should be workdir; got: $csi_argv" ;;
+      *" --home $C3/workdir "*) c3_csi_ok="yes" ;;
+      *) c3_csi_ok="no" ;;
     esac
+    # Verify the daily-note file exists + contains the reconcile stub
+    # marker — proves the harvester wired the reconcile invocation through
+    # to a writer (codex r1 PR #451 item 9 — content verify, not just
+    # argv).
+    C3_NOTE="$C3/bridge-home/agents/c3-agent/memory/$(date -u +%Y-%m-%d).md"
+    if [[ "$c3_csi_ok" != "yes" ]]; then
+      fail 3 "current-session-id --home should be workdir; got: $csi_argv"
+    elif [[ ! -f "$C3_NOTE" ]]; then
+      fail 3 "daily note missing at $C3_NOTE — reconcile stub didn't write marker"
+    elif ! grep -q "reconcile-stub-marker agent=c3-agent" "$C3_NOTE"; then
+      fail 3 "daily note marker missing at $C3_NOTE — content: $(cat "$C3_NOTE")"
+    else
+      pass 3
+    fi
   fi
 fi
 
@@ -304,6 +362,7 @@ C4_JSONL="$(materialize_session_jsonl "$C4/fake-home/.claude/projects" \
   "$C4/workdir" "sess-c4")"
 [[ -f "$C4_JSONL" ]] || fail 4 "fixture jsonl not materialized at $C4_JSONL"
 
+rc=0
 env -u CRON_REQUEST_DIR -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT \
     -u BRIDGE_AGENT_ROOT_V2 -u BRIDGE_SHARED_ROOT \
     BRIDGE_AGB="$C4/agb-mock" \
@@ -316,8 +375,7 @@ env -u CRON_REQUEST_DIR -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT \
     MOCK_RECONCILE_LOG="$C4/reconcile.log" \
     MOCK_RECONCILE_EXIT="2" \
     "$HARVESTER" --agent c4-agent \
-    >"$C4/stdout" 2>"$C4/stderr"
-rc=$?
+    >"$C4/stdout" 2>"$C4/stderr" || rc=$?
 if [[ $rc -ne 0 ]]; then
   fail 4 "harvest exit rc=$rc despite best-effort contract; stderr=$(cat "$C4/stderr")"
 elif [[ ! -s "$C4/harvest.log" ]]; then
@@ -358,6 +416,7 @@ C5_JSONL="$(materialize_session_jsonl "$ISO_TARGET_HOME/.claude/projects" \
 # $target_home/.claude/projects.
 mkdir -p "$C5/fake-home/.claude/projects"
 
+rc=0
 env -u CRON_REQUEST_DIR -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT \
     -u BRIDGE_AGENT_ROOT_V2 -u BRIDGE_SHARED_ROOT \
     BRIDGE_AGB="$C5/agb-mock" \
@@ -371,8 +430,7 @@ env -u CRON_REQUEST_DIR -u BRIDGE_LAYOUT -u BRIDGE_DATA_ROOT \
     MOCK_RECONCILE_LOG="$C5/reconcile.log" \
     MOCK_RECONCILE_EXIT="0" \
     "$HARVESTER" --agent c5-agent \
-    >"$C5/stdout" 2>"$C5/stderr"
-rc=$?
+    >"$C5/stdout" 2>"$C5/stderr" || rc=$?
 
 if [[ $rc -ne 0 ]]; then
   fail 5 "harvest exit rc=$rc; stderr=$(cat "$C5/stderr")"

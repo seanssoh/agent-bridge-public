@@ -188,8 +188,20 @@ reconcile_jsonl_for_cron() {
     transcripts_root="$HOME/.claude/projects"
   fi
 
+  # Resolve $workdir to its canonical absolute path before slugging. Mirrors
+  # bridge-memory.py:cmd_current_session_id which does Path(home).resolve()
+  # before the str.replace transform. Without this, a symlinked or relative
+  # workdir produces a slug that doesn't match the python helper's output,
+  # and the jsonl path lookup misses (codex r1 PR #451 item 2).
+  local resolved_workdir
+  resolved_workdir="$("$BRIDGE_PYTHON" -c '
+import os.path, sys
+print(os.path.realpath(sys.argv[1]))
+' "$workdir" 2>/dev/null || true)"
+  [[ -n "$resolved_workdir" ]] || resolved_workdir="$workdir"
+
   local slug
-  slug="$(printf '%s' "$workdir" | sed 's:/:-:g; s:\.:-:g')"
+  slug="$(printf '%s' "$resolved_workdir" | sed 's:/:-:g; s:\.:-:g')"
   local jsonl="$transcripts_root/$slug/$session_id.jsonl"
 
   if [[ ! -f "$jsonl" ]]; then
