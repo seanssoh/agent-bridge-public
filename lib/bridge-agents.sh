@@ -5473,12 +5473,9 @@ bridge_agent_plugin_ports() {
     printf '%s\t%s\t%s\n' "$port" "bun" "teams"
   fi
 
-  local mattermost_env=""
-  mattermost_env="$(bridge_agent_mattermost_state_dir "$agent")/.env"
-  port="$(bridge_agent_plugin_port_from_env_file "$mattermost_env" "MATTERMOST_WEBHOOK_PORT" 2>/dev/null || true)"
-  if [[ -n "$port" ]]; then
-    printf '%s\t%s\t%s\n' "$port" "bun" "mattermost"
-  fi
+  # Mattermost plugin uses an outbound WebSocket connection (no listener),
+  # so it has no port to advertise here. Inbound HTTP listener was removed
+  # when the channel migrated from Outgoing Webhook to /api/v4/websocket.
 }
 
 bridge_kill_port_holder_if_orphan() {
@@ -5696,9 +5693,6 @@ bridge_plugin_port_env_key() {
       ;;
     telegram)
       printf 'TELEGRAM_WEBHOOK_PORT'
-      ;;
-    mattermost)
-      printf 'MATTERMOST_WEBHOOK_PORT'
       ;;
     *)
       return 1
