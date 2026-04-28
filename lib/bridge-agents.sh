@@ -2152,6 +2152,7 @@ bridge_linux_unshare_plugin_catalog() {
 bridge_tmp_ephemeral_path_is() {
   local path="${1:-}"
   local tmpdir="${TMPDIR:-}"
+  local tmpdir_real=""
 
   [[ -n "$path" ]] || return 1
   case "$path" in
@@ -2166,6 +2167,17 @@ bridge_tmp_ephemeral_path_is() {
         return 0
         ;;
     esac
+    if [[ -d "$tmpdir" ]]; then
+      tmpdir_real="$(cd -P "$tmpdir" 2>/dev/null && pwd -P || true)"
+      tmpdir_real="${tmpdir_real%/}"
+      if [[ -n "$tmpdir_real" && "$tmpdir_real" != "$tmpdir" ]]; then
+        case "$path" in
+          "$tmpdir_real"/tmp.*|"$tmpdir_real"/tmp.*/*)
+            return 0
+            ;;
+        esac
+      fi
+    fi
   fi
   return 1
 }
