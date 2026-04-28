@@ -234,6 +234,117 @@ log "asserting bridge_queue_gateway_proxy_agent is OFF for shared-mode (regressi
   fi
 ) || die "shared-mode regression guard failed"
 
+# ---------------------------------------------------------------------------
+# Issue #436 regressions: bridge_load_roster scoped-env fallback contract.
+# ---------------------------------------------------------------------------
+#
+# Bug 1: When the isolated REPL invokes a roster-loading helper (e.g. via
+# `agb inbox`) without a pre-exported BRIDGE_AGENT_ENV_FILE, the function
+# discovers the per-agent scoped env via BRIDGE_AGENT_ID +
+# BRIDGE_ACTIVE_AGENT_DIR but historically did not export the discovered
+# path. bridge_queue_gateway_proxy_agent then saw an empty env-file var,
+# returned 1, and the queue CLI fell through to direct bridge-queue.py
+# against BRIDGE_TASK_DB=/dev/null — traceback.
+#
+# Bug 2: bridge_load_roster continued into bridge_load_static_histories and
+# bridge_restore_dynamic_agents_from_history even when scoped, which iterate
+# every peer's history .env file. Isolated UIDs cannot read those, surfacing
+# "Permission denied" from `source` during routine roster loads.
+
+log "[#436] asserting scoped env fallback exports BRIDGE_AGENT_ENV_FILE"
+SCOPED_ENV_HOME="$BRIDGE_ACTIVE_AGENT_DIR/$ISOLATED_AGENT"
+mkdir -p "$SCOPED_ENV_HOME"
+SCOPED_ENV_PATH="$SCOPED_ENV_HOME/agent-env.sh"
+bridge_write_linux_agent_env_file "$ISOLATED_AGENT" "$SCOPED_ENV_PATH"
+[[ -r "$SCOPED_ENV_PATH" ]] || die "scoped env fixture not readable at $SCOPED_ENV_PATH"
+
+# shellcheck disable=SC2030,SC2031
+(
+  export BRIDGE_HOST_PLATFORM_OVERRIDE=Linux
+  unset BRIDGE_AGENT_ENV_FILE
+  export BRIDGE_AGENT_ID="$ISOLATED_AGENT"
+  # BRIDGE_ACTIVE_AGENT_DIR already exported in outer test scope.
+  bridge_load_roster
+  if [[ "${BRIDGE_AGENT_ENV_FILE:-}" != "$SCOPED_ENV_PATH" ]]; then
+    printf '[peer-routing][error] expected BRIDGE_AGENT_ENV_FILE=%s, got=%q\n' \
+      "$SCOPED_ENV_PATH" "${BRIDGE_AGENT_ENV_FILE:-}" >&2
+    exit 1
+  fi
+  result="$(bridge_queue_gateway_proxy_agent 2>/dev/null || true)"
+  if [[ "$result" != "$ISOLATED_AGENT" ]]; then
+    printf '[peer-routing][error] expected proxy_agent=%s after fallback, got=%q\n' \
+      "$ISOLATED_AGENT" "$result" >&2
+    exit 1
+  fi
+) || die "scoped env fallback failed to export BRIDGE_AGENT_ENV_FILE for proxy detection"
+
+log "[#436] asserting peer history hydration is skipped when scoped env is active"
+# Build a peer history file that, if sourced, would import a sentinel agent
+# id into the roster. Make it unreadable to mimic the cross-UID denial that
+# surfaces on Linux. macOS runs as the test invoker but chmod 000 still
+# guarantees that any source attempt errors out — perfect canary for the
+# guard.
+mkdir -p "$BRIDGE_HISTORY_DIR"
+PEER_HISTORY_FILE="$BRIDGE_HISTORY_DIR/sentinel-peer.env"
+cat > "$PEER_HISTORY_FILE" <<'PEER_HISTORY'
+AGENT_ID="sentinel-peer-from-history"
+AGENT_DESC="should never be sourced when scoped"
+AGENT_ENGINE=claude
+AGENT_SESSION=sentinel-peer-from-history
+AGENT_WORKDIR=/tmp/sentinel-peer-from-history
+PEER_HISTORY
+chmod 000 "$PEER_HISTORY_FILE"
+trap 'chmod 600 "$PEER_HISTORY_FILE" >/dev/null 2>&1 || true; rm -rf "$TMP_ROOT" >/dev/null 2>&1 || true' EXIT
+
+# shellcheck disable=SC2030,SC2031
+(
+  export BRIDGE_HOST_PLATFORM_OVERRIDE=Linux
+  unset BRIDGE_AGENT_ENV_FILE
+  export BRIDGE_AGENT_ID="$ISOLATED_AGENT"
+  # bridge_load_roster must NOT attempt to source the unreadable peer
+  # history when the scoped fallback is in play. set -e in the helper would
+  # otherwise propagate a non-zero rc from `source`.
+  if ! bridge_load_roster 2>/tmp/peer-routing-436-err.log; then
+    printf '[peer-routing][error] bridge_load_roster errored under scoped env (peer history not skipped)\n' >&2
+    cat /tmp/peer-routing-436-err.log >&2 || true
+    exit 1
+  fi
+  if grep -Fq "Permission denied" /tmp/peer-routing-436-err.log 2>/dev/null; then
+    printf '[peer-routing][error] permission-denied surfaced from peer history under scoped env\n' >&2
+    cat /tmp/peer-routing-436-err.log >&2 || true
+    exit 1
+  fi
+  # Sentinel must NOT have been hydrated.
+  if bridge_agent_exists "sentinel-peer-from-history"; then
+    printf '[peer-routing][error] peer history was hydrated despite scoped env active\n' >&2
+    exit 1
+  fi
+) || die "peer history hydration was not skipped under scoped env"
+
+log "[#436] asserting peer history hydration STILL runs in legacy controller path"
+# Inverse case: when scoped env is absent (controller / operator UID),
+# peer history hydration must continue to run so dashboards keep rebuilding
+# dynamic agents from $BRIDGE_HISTORY_DIR. Use a readable history fixture
+# matching a synthetic tmux session so the restore path's session-exists
+# guard passes (use a bridge_tmux_session_exists override hook for portability).
+chmod 600 "$PEER_HISTORY_FILE"
+# shellcheck disable=SC2030,SC2031
+(
+  unset BRIDGE_AGENT_ID BRIDGE_AGENT_ENV_FILE
+  # Stub bridge_tmux_session_exists so we don't need a live tmux session;
+  # the call site guards on it before applying the history record.
+  # shellcheck disable=SC2329  # invoked indirectly via bridge_load_roster
+  bridge_tmux_session_exists() { return 0; }
+  # shellcheck disable=SC2329  # invoked indirectly via bridge_load_roster
+  bridge_claude_session_id_exists() { return 0; }
+  bridge_load_roster
+  if ! bridge_agent_exists "sentinel-peer-from-history"; then
+    printf '[peer-routing][error] legacy path failed to hydrate peer history sentinel\n' >&2
+    exit 1
+  fi
+) || die "legacy controller path lost peer history hydration"
+chmod 000 "$PEER_HISTORY_FILE"
+
 # Linux-only: full live-isolation peer-routing roundtrip lives in
 # tests/isolation-queue-gateway-acl.sh. Skipping that here keeps this test
 # portable across macOS dev hosts.

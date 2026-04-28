@@ -1109,6 +1109,13 @@ bridge_load_roster() {
     scoped_env_file="$BRIDGE_ACTIVE_AGENT_DIR/$scoped_agent_id/agent-env.sh"
     if [[ -r "$scoped_env_file" ]]; then
       isolated_env_file="$scoped_env_file"
+      # Persist the discovered path so bridge_queue_gateway_proxy_agent
+      # (lib/bridge-core.sh) can detect proxy mode without requiring
+      # BRIDGE_AGENT_ENV_FILE to be pre-exported in the isolated REPL's
+      # env. Without this export the queue CLI falls through to the
+      # direct bridge-queue.py path against BRIDGE_TASK_DB=/dev/null
+      # and tracebacks. See issue #436.
+      export BRIDGE_AGENT_ENV_FILE="$isolated_env_file"
     fi
   fi
 
@@ -1192,8 +1199,17 @@ bridge_load_roster() {
 
   bridge_load_dynamic_agents
   if [[ "$fast_load" != "1" ]]; then
-    bridge_load_static_histories
-    bridge_restore_dynamic_agents_from_history
+    # When loading via a scoped agent-env.sh (linux-user isolation), the
+    # snapshot already carries self + sanitized peer metadata. Iterating
+    # peer history files would require read access on
+    # $BRIDGE_HISTORY_DIR/*.env, which the isolated UID lacks (they are
+    # owned by the operator UID). Sourcing one fails with "Permission
+    # denied" and surfaces in the agent's REPL during routine queue CLI
+    # use. Skip both peer-history hydration paths when scoped. See #436.
+    if [[ -z "$isolated_env_file" ]]; then
+      bridge_load_static_histories
+      bridge_restore_dynamic_agents_from_history
+    fi
     bridge_reconcile_dynamic_agents_from_tmux
   fi
 }
