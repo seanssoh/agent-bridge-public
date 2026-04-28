@@ -526,6 +526,28 @@ import shlex
 import sys
 
 agent, continue_mode, session_id, continue_fallback, original = sys.argv[1:]
+
+
+def repair_false_command(value: str) -> str:
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        return value
+    if not tokens:
+        return value
+    idx = 0
+    while idx < len(tokens):
+        key = tokens[idx].split("=", 1)[0]
+        if "=" not in tokens[idx] or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key) or tokens[idx].startswith("-"):
+            break
+        idx += 1
+    if idx < len(tokens) and tokens[idx] == "false":
+        tokens[idx] = "claude"
+        return " ".join(shlex.quote(token) for token in tokens)
+    return value
+
+
+original = repair_false_command(original)
 match = re.match(r"^(?P<prefix>.*?)(?P<command>claude(?:\s|$).*)$", original)
 if not match:
     print(original)
@@ -594,6 +616,28 @@ import shlex
 import sys
 
 agent, continue_mode, session_id, original = sys.argv[1:]
+
+
+def repair_false_command(value: str) -> str:
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        return value
+    if not tokens:
+        return value
+    idx = 0
+    while idx < len(tokens):
+        key = tokens[idx].split("=", 1)[0]
+        if "=" not in tokens[idx] or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key) or tokens[idx].startswith("-"):
+            break
+        idx += 1
+    if idx < len(tokens) and tokens[idx] == "false":
+        tokens[idx] = "claude"
+        return " ".join(shlex.quote(token) for token in tokens)
+    return value
+
+
+original = repair_false_command(original)
 match = re.match(r"^(?P<prefix>.*?)(?P<command>claude(?:\s|$).*)$", original)
 if not match:
     print(original)
@@ -1837,6 +1881,38 @@ bridge_agent_clear_next_session_state() {
   rm -f "$(bridge_agent_next_session_file "$agent")" "$(bridge_agent_next_session_marker_file "$agent")"
 }
 
+bridge_agent_archive_next_session_state() {
+  local agent="$1"
+  local next_file=""
+  local marker_file=""
+  local archive_dir=""
+  local archive_file=""
+  local digest=""
+  local digest_short=""
+  local stamp=""
+  local index=0
+
+  next_file="$(bridge_agent_next_session_file "$agent")"
+  marker_file="$(bridge_agent_next_session_marker_file "$agent")"
+  [[ -f "$next_file" ]] || return 1
+
+  digest="$(bridge_agent_next_session_digest "$agent" 2>/dev/null || true)"
+  digest_short="${digest:0:12}"
+  [[ -n "$digest_short" ]] || digest_short="unknown"
+  stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+  archive_dir="$(dirname "$next_file")/archive"
+  archive_file="$archive_dir/NEXT-SESSION.${stamp}.${digest_short}.md"
+
+  mkdir -p "$archive_dir"
+  while [[ -e "$archive_file" ]]; do
+    index=$((index + 1))
+    archive_file="$archive_dir/NEXT-SESSION.${stamp}.${digest_short}.${index}.md"
+  done
+  mv "$next_file" "$archive_file"
+  rm -f "$marker_file"
+  printf '%s' "$archive_file"
+}
+
 bridge_agent_maybe_expire_next_session() {
   local agent="$1"
   local ttl_seconds="${2:-${BRIDGE_NEXT_SESSION_AUTO_CLEAR_SECONDS:-300}}"
@@ -1847,7 +1923,7 @@ bridge_agent_maybe_expire_next_session() {
   age_seconds="$(bridge_agent_next_session_age_seconds "$agent" || echo 0)"
   [[ "$age_seconds" =~ ^[0-9]+$ ]] || age_seconds=0
   (( age_seconds >= ttl_seconds )) || return 1
-  bridge_agent_clear_next_session_state "$agent"
+  bridge_agent_archive_next_session_state "$agent" >/dev/null || return 1
   printf '%s' "$age_seconds"
 }
 
@@ -2516,19 +2592,31 @@ bridge_refresh_agent_session_id() {
   local agent="$1"
   local attempts="${2:-8}"
   local sleep_seconds="${3:-0.25}"
+  local extra_exclude_csv="${4:-}"
   local since_hint sid detected exclude_csv
   local -a excluded=()
-  local other try_index
+  local -a extra_excluded=()
+  local other try_index extra
 
   sid="$(bridge_agent_session_id "$agent")"
   if [[ -n "$sid" ]]; then
-    printf '%s' "$sid"
-    return 0
+    if ! bridge_channel_csv_contains "$extra_exclude_csv" "$sid"; then
+      printf '%s' "$sid"
+      return 0
+    fi
+  fi
+  if [[ -n "$extra_exclude_csv" ]]; then
+    IFS=',' read -r -a extra_excluded <<<"$extra_exclude_csv"
   fi
 
   since_hint="${BRIDGE_AGENT_CREATED_AT[$agent]-$(date +%s)}"
   for ((try_index = 0; try_index < attempts; try_index += 1)); do
     excluded=()
+    for extra in "${extra_excluded[@]}"; do
+      extra="$(bridge_trim_whitespace "$extra")"
+      [[ -n "$extra" ]] || continue
+      excluded+=("$extra")
+    done
     for other in "${BRIDGE_AGENT_IDS[@]}"; do
       [[ "$other" == "$agent" ]] && continue
       sid="$(bridge_agent_session_id "$other")"
