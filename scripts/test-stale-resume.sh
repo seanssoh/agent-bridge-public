@@ -243,6 +243,28 @@ else
 fi
 rm -rf "$HOME/.claude/projects/$SLUG"
 
+step "I4: static-collision rc=other does NOT preserve a pre-existing stale roster value (#446 fact-correction)"
+# bridge_load_roster runs bridge_load_dynamic_agents BEFORE
+# bridge_load_static_histories. So at the point this branch executes, any
+# pre-existing BRIDGE_AGENT_SESSION_ID is the raw roster value, NOT a
+# resolver-validated value. If the env file's candidate is also stale and
+# we "preserve existing", a stale id from the roster leaks through.
+# Round-5 had this bug; round-6 clears on rc=other.
+mk_transcript "$SLUG" "stale-I4-env" 96
+# Note: stale-I4-roster has NO transcript on disk so the resolver would
+# reject it too if we attempted to gate it. The point is the BRANCH itself
+# must clear the slot, not fall back to that ungated roster string.
+mk_env_file "$ENV_FILE" "test-static" "stale-I4-env"
+BRIDGE_AGENT_SESSION_ID["test-static"]="stale-I4-roster"
+bridge_load_dynamic_agent_file "$ENV_FILE"
+got="${BRIDGE_AGENT_SESSION_ID[test-static]:-<unset>}"
+if [[ -z "$got" || "$got" == "<unset>" ]]; then
+  ok
+else
+  err "expected empty (cleared), got '$got' — stale roster value leaked through static-collision rc=other branch"
+fi
+rm -rf "$HOME/.claude/projects/$SLUG"
+
 # --- Structural guardrail: every "promised" entry point keeps a resolver call ---
 #
 # dev-codex round-4 review #430 item 2: the resolver wiring is documented in

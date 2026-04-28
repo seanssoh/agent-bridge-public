@@ -832,11 +832,21 @@ bridge_load_dynamic_agent_file() {
     # AGENT_SESSION_ID from the env file would survive and be written back
     # by later start/isolation setup before bridge-run normalises — that
     # is the bypass dev-codex flagged in the round-4 review of #428.
+    #
+    # rc=other clears, NOT preserves: bridge_load_roster runs
+    # bridge_load_dynamic_agents BEFORE bridge_load_static_histories
+    # (lib/bridge-state.sh:1257 vs :1267), so any pre-existing
+    # BRIDGE_AGENT_SESSION_ID at this point is the raw roster/local value
+    # that has not been gated yet. Preserving it would leak a stale id
+    # from the roster on top of rejecting the env candidate. Clearing
+    # here is safe — bridge_load_static_agent_history runs later, also
+    # gated through the resolver, and is the authoritative re-hydration
+    # for static agents. Caught in dev-codex review of round 5 (#446).
     local _accepted="" _rc=0
     _accepted="$(bridge_resolve_resume_session_id "$AGENT_ENGINE" "${AGENT_ID:-}" "$AGENT_WORKDIR" "${AGENT_SESSION_ID:-}" 2>/dev/null)" || _rc=$?
     case "$_rc" in
       0|2) BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="$_accepted" ;;
-      *)   BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="${BRIDGE_AGENT_SESSION_ID[$AGENT_ID]-}" ;;
+      *)   BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="" ;;
     esac
     BRIDGE_AGENT_HISTORY_KEY["$AGENT_ID"]="${AGENT_HISTORY_KEY:-${BRIDGE_AGENT_HISTORY_KEY[$AGENT_ID]-}}"
     BRIDGE_AGENT_CREATED_AT["$AGENT_ID"]="${AGENT_CREATED_AT:-${BRIDGE_AGENT_CREATED_AT[$AGENT_ID]-}}"
