@@ -69,10 +69,6 @@ try {
 const HOST = process.env.MATTERMOST_WEBHOOK_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.MATTERMOST_WEBHOOK_PORT ?? '3979')
 const STATIC = process.env.MATTERMOST_ACCESS_MODE === 'static'
-const STANDALONE = process.env.MATTERMOST_STANDALONE === '1'
-const STANDALONE_SYSTEM_PROMPT = process.env.MATTERMOST_SYSTEM_PROMPT ?? ''
-const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY ?? ''
-const CLAUDE_MODEL = process.env.MATTERMOST_CLAUDE_MODEL ?? 'claude-sonnet-4-20250514'
 const BRIDGE_MODE = process.env.MATTERMOST_BRIDGE_MODE === '1'
 const BRIDGE_AGENT = process.env.MATTERMOST_BRIDGE_AGENT ?? ''
 
@@ -266,84 +262,23 @@ async function mmCreatePost(channelId: string, message: string, tokenOverride?: 
 
 async function bridgeSend(agent: string, message: string, userName: string, channelId: string, route?: BotRoute | null): Promise<void> {
   const targetAgent = route?.agent ?? agent
-  const replyToken = route?.token ?? MM_TOKEN
-  const sendMessage = `[Mattermost channel_id=${channelId}] ${userName}: ${message}\n\nTo reply, run:\ncurl -s -X POST "${MM_URL}/api/v4/posts" -H "Authorization: Bearer ${replyToken}" -H "Content-Type: application/json" -d '{"channel_id":"${channelId}","message":"YOUR_REPLY_HERE"}'`
+  const sendMessage =
+    `[Mattermost] channel_id=${channelId} user=${userName}\n\n${message}\n\n` +
+    `Reply via the mattermost MCP tool (mcp__mattermost__create_post) using the channel_id above.`
   const agb = join(BRIDGE_HOME, 'agent-bridge')
-  try {
-    const { execSync } = await import('child_process')
-    execSync(`"${agb}" urgent "${targetAgent}" "${sendMessage.replace(/"/g, '\\"')}"`, {
-      encoding: 'utf8',
-      timeout: 10000,
-    })
-    process.stderr.write(`mattermost channel: bridge-send to ${agent} for channel ${channelId}\n`)
-  } catch (err) {
-    process.stderr.write(`mattermost channel: bridge-send failed: ${err}\n`)
-    // Fallback to standalone reply if bridge-send fails
-    if (STANDALONE) {
-      void claudeReply(message, userName, channelId, route)
-    }
+  const result = spawnSync(agb, ['urgent', targetAgent, sendMessage], {
+    encoding: 'utf8',
+    timeout: 10000,
+  })
+  if (result.error) {
+    process.stderr.write(`mattermost channel: bridge-send spawn failed: ${result.error}\n`)
+    return
   }
-}
-
-async function claudeReply(userMessage: string, userName: string, channelId: string, route?: BotRoute | null): Promise<void> {
-  const replyToken = route?.token ?? MM_TOKEN
-  const replyBotName = route?.username ?? botUsername
-  const systemPrompt = route?.system_prompt ?? (STANDALONE_SYSTEM_PROMPT || `You are a helpful assistant in a Mattermost channel. Respond concisely in the same language as the user. Your bot username is @${replyBotName}.`)
-
-  if (ANTHROPIC_API_KEY) {
-    try {
-      const recent = recentMessages(channelId, 10)
-      const contextMessages = recent.slice(-10).map(m => ({
-        role: m.user_id === botUserId ? 'assistant' as const : 'user' as const,
-        content: m.user_id === botUserId ? m.text : `[${m.user}]: ${m.text}`,
-      }))
-      contextMessages.push({ role: 'user' as const, content: `[${userName}]: ${userMessage}` })
-
-      const response = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'x-api-key': ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          model: CLAUDE_MODEL,
-          max_tokens: 1024,
-          system: systemPrompt,
-          messages: contextMessages,
-        }),
-      })
-      if (!response.ok) {
-        const detail = await response.text()
-        process.stderr.write(`mattermost channel: Claude API error: ${response.status} ${detail}\n`)
-        return
-      }
-      const data = await response.json() as { content: Array<{ type: string; text: string }> }
-      const replyText = data.content?.filter(b => b.type === 'text').map(b => b.text).join('\n') ?? ''
-      if (replyText) {
-        await mmCreatePost(channelId, replyText, replyToken !== MM_TOKEN ? replyToken : undefined)
-        process.stderr.write(`mattermost channel: standalone reply sent to ${channelId} as @${replyBotName}\n`)
-      }
-    } catch (err) {
-      process.stderr.write(`mattermost channel: Claude API call failed: ${err}\n`)
-    }
-  } else {
-    // Fallback: use claude CLI --print mode
-    try {
-      const { execSync } = await import('child_process')
-      const prompt = `${systemPrompt}\n\nUser ${userName} says: ${userMessage}`
-      const result = execSync(`claude --print "${prompt.replace(/"/g, '\\"')}"`, {
-        encoding: 'utf8',
-        timeout: 60000,
-      }).trim()
-      if (result) {
-        await mmCreatePost(channelId, result, replyToken !== MM_TOKEN ? replyToken : undefined)
-        process.stderr.write(`mattermost channel: standalone reply (cli) sent to ${channelId} as @${replyBotName}\n`)
-      }
-    } catch (err) {
-      process.stderr.write(`mattermost channel: claude cli fallback failed: ${err}\n`)
-    }
+  if (result.status !== 0) {
+    process.stderr.write(`mattermost channel: bridge-send exit ${result.status}: ${result.stderr ?? ''}\n`)
+    return
   }
+  process.stderr.write(`mattermost channel: bridge-send to ${targetAgent} for channel ${channelId}\n`)
 }
 
 async function mmGetMe(): Promise<{ id: string; username: string }> {
@@ -474,23 +409,10 @@ function handleOutgoingWebhook(payload: OutgoingWebhookPayload): void {
 
   if (!gate(channelId, userId, isDirect, mentionedBot)) return
 
-  // Detect which bot was mentioned and route accordingly
-  let routedBot: BotRoute | null = null
-  if (STANDALONE && botRoutes.length > 0) {
-    for (const route of botRoutes) {
-      if (text.includes(`@${route.username}`)) {
-        routedBot = route
-        text = text.replace(new RegExp(`@${route.username}\\b`, 'g'), '').trim()
-        break
-      }
-    }
-    if (!routedBot) {
-      // No specific bot mentioned — use default bot or ignore
-      if (botUsername) {
-        text = text.replace(new RegExp(`@${botUsername}\\b`, 'g'), '').trim()
-      }
-    }
-  } else if (botUsername) {
+  // Strip bot mention from text. Per-route mention routing for multi-bot
+  // is added in a follow-up commit (3b) once per-route bot identity is in
+  // place; for now, single-bot strips its own @mention.
+  if (botUsername) {
     text = text.replace(new RegExp(`@${botUsername}\\b`, 'g'), '').trim()
   }
 
@@ -515,12 +437,9 @@ function handleOutgoingWebhook(payload: OutgoingWebhookPayload): void {
   appendMessage(stored)
 
   if (BRIDGE_MODE) {
-    const targetAgent = routedBot?.agent ?? routedBot?.username?.replace(/-bot$/, '').replace(/-/g, '_') ?? BRIDGE_AGENT
-    if (targetAgent) {
-      void bridgeSend(targetAgent, text, userName, channelId, routedBot)
+    if (BRIDGE_AGENT) {
+      void bridgeSend(BRIDGE_AGENT, text, userName, channelId, null)
     }
-  } else if (STANDALONE) {
-    void claudeReply(text, userName, channelId, routedBot)
   } else {
     void mcp.notification({
       method: 'notifications/claude/channel',
@@ -605,12 +524,10 @@ async function start(): Promise<void> {
   }
 
   httpServer.listen(PORT, HOST, () => {
-    process.stderr.write(`mattermost channel: listening on http://${HOST}:${PORT} (/hooks/outgoing)${STANDALONE ? ' [standalone]' : ''}\n`)
+    process.stderr.write(`mattermost channel: listening on http://${HOST}:${PORT} (/hooks/outgoing)\n`)
   })
 
-  if (!STANDALONE) {
-    await mcp.connect(new StdioServerTransport())
-  }
+  await mcp.connect(new StdioServerTransport())
 }
 
 await start()
