@@ -4764,7 +4764,12 @@ assert show_payload["profile"]["source_present"] is True
 assert show_payload["activity_state"] in {"stopped", "idle"}
 assert show_payload["notify"]["status"] == "miss"
 PY
-CREATED_START_DRY_RUN="$("$REPO_ROOT/bridge-start.sh" "$CREATED_AGENT" --dry-run)"
+# The smoke daemon is intentionally live in this section. If it races ahead
+# and starts this static role, plain --dry-run exits through the "already
+# running" reuse path before printing the launch contract below. Use
+# --replace with --dry-run so the inspection remains deterministic without
+# killing a live session.
+CREATED_START_DRY_RUN="$("$REPO_ROOT/bridge-start.sh" "$CREATED_AGENT" --dry-run --replace)"
 assert_contains "$CREATED_START_DRY_RUN" "session=$CREATED_SESSION"
 assert_contains "$CREATED_START_DRY_RUN" "channels=plugin:telegram@claude-plugins-official"
 assert_contains "$CREATED_START_DRY_RUN" "channel_status=ok"
@@ -4783,6 +4788,7 @@ CREATED_AGENT_RESTART_OUTPUT="$("$REPO_ROOT/agent-bridge" agent restart "$CREATE
 assert_contains "$CREATED_AGENT_RESTART_OUTPUT" "$CREATED_SESSION"
 CREATED_AGENT_RESTART_NO_ATTACH_OUTPUT="$("$REPO_ROOT/agent-bridge" agent restart "$CREATED_AGENT" --no-attach --dry-run)"
 assert_contains "$CREATED_AGENT_RESTART_NO_ATTACH_OUTPUT" "$CREATED_SESSION"
+tmux kill-session -t "$CREATED_SESSION" >/dev/null 2>&1 || true
 tmux new-session -d -s "$CREATED_SESSION" "sleep 30"
 CREATED_AGENT_RESTART_DRY_RUN_ACTIVE="$("$REPO_ROOT/agent-bridge" agent restart "$CREATED_AGENT" --dry-run)"
 assert_contains "$CREATED_AGENT_RESTART_DRY_RUN_ACTIVE" "$CREATED_SESSION"
