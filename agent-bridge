@@ -411,6 +411,11 @@ if [[ $# -gt 0 ]]; then
       ADMIN_ENGINE="$(bridge_agent_engine "$ADMIN_AGENT")"
       ADMIN_WORKDIR="$(bridge_agent_workdir "$ADMIN_AGENT")"
       ADMIN_SAFE_MODE=0
+      ADMIN_REPLACE_MODE=0
+      ADMIN_ATTACH_MODE=1
+      ADMIN_FAST_REUSE_ELIGIBLE=1
+      ADMIN_SESSION=""
+      ADMIN_ARGS=()
 
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -418,17 +423,52 @@ if [[ $# -gt 0 ]]; then
             ADMIN_SAFE_MODE=1
             shift
             ;;
+          --replace)
+            ADMIN_REPLACE_MODE=1
+            ADMIN_ARGS+=("$1")
+            shift
+            ;;
+          --no-attach)
+            ADMIN_ATTACH_MODE=0
+            ADMIN_ARGS+=("$1")
+            shift
+            ;;
+          --continue|--no-continue|--no-project-skill)
+            ADMIN_ARGS+=("$1")
+            shift
+            ;;
           --name|--workdir|--codex|--claude)
             bridge_die "'$CLI_NAME admin'은(는) 관리자 역할의 engine/workdir/name을 고정 사용합니다."
             ;;
           *)
+            ADMIN_FAST_REUSE_ELIGIBLE=0
+            ADMIN_ARGS+=("$@")
             break
             ;;
         esac
       done
+      if ((${#ADMIN_ARGS[@]} > 0)); then
+        set -- "${ADMIN_ARGS[@]}"
+      else
+        set --
+      fi
 
       if [[ $ADMIN_SAFE_MODE -eq 1 ]]; then
         exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-agent.sh" safe-mode "$ADMIN_AGENT" "$@"
+      fi
+
+      # Common path: `agb admin` is often just "return to the running admin".
+      # Avoid the recursive static-start path, daemon ensure, and another full
+      # roster load when the admin tmux session already exists.
+      ADMIN_SESSION="$(bridge_agent_session "$ADMIN_AGENT")"
+      if [[ $ADMIN_FAST_REUSE_ELIGIBLE -eq 1 && $ADMIN_REPLACE_MODE -eq 0 \
+          && -n "$ADMIN_SESSION" ]] \
+          && bridge_tmux_session_exists "$ADMIN_SESSION"; then
+        echo "[info] 세션 '$ADMIN_SESSION'이 이미 실행 중입니다."
+        if [[ $ADMIN_ATTACH_MODE -eq 1 ]]; then
+          bridge_attach_tmux_session "$ADMIN_SESSION"
+        fi
+        exit 0
       fi
 
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "--$ADMIN_ENGINE" --name "$ADMIN_AGENT" --workdir "$ADMIN_WORKDIR" --loop "$@"
