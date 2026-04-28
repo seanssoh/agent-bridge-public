@@ -5746,6 +5746,84 @@ tmux kill-session -t "=$DEV_CHANNELS_SLEEP_SESSION" >/dev/null 2>&1 || true
 tmux kill-session -t "=$DEV_CHANNELS_WRAPPED_SESSION" >/dev/null 2>&1 || true
 tmux kill-session -t "=$DEV_CHANNELS_DELAYED_SESSION" >/dev/null 2>&1 || true
 
+# Item 4 (PR #442 r2): exercise the *full* dispatch path end-to-end.
+# The previous case only validates the foreground detector + wait helper in
+# isolation. This case wires both into the picker dispatcher
+# (bridge_tmux_claude_advance_blocker) so a regression that re-orders the
+# wait + send-keys, drops the foreground gate, or short-circuits before
+# Enter is dispatched cannot pass without smoke-level fail.
+log "dispatching dev-channel auto-accept via advance_blocker (#442 item 4)"
+DEV_CHANNELS_DISPATCH_SESSION="dev-channels-dispatch-$SESSION_NAME"
+DEV_CHANNELS_DISPATCH_ACK="$TMP_ROOT/dev-channels-dispatch-ack.txt"
+DEV_CHANNELS_DISPATCH_BIN_DIR="$TMP_ROOT/dev-channels-dispatch-bin"
+# Synthetic claude binary lives in its own dir under exact name `claude`
+# so bridge_tmux_command_name_is_claude classifies the basename correctly
+# (the matcher accepts only `claude` / `claude-*` / `claude.*`, so a longer
+# path basename like `dev-channels-dispatch-claude` would NOT match).
+DEV_CHANNELS_DISPATCH_CLAUDE="$DEV_CHANNELS_DISPATCH_BIN_DIR/claude"
+DEV_CHANNELS_DISPATCH_PAYLOAD="$TMP_ROOT/dev-channels-dispatch-payload.sh"
+DEV_CHANNELS_DISPATCH_SCRIPT="$TMP_ROOT/dev-channels-dispatch.sh"
+rm -f "$DEV_CHANNELS_DISPATCH_ACK"
+mkdir -p "$DEV_CHANNELS_DISPATCH_BIN_DIR"
+# Synthetic claude binary: a "claude"-named symlink to bash, so when the
+# driver script execs it the pane PID's `ps -o comm=` reports "claude" and
+# bridge_tmux_pane_foreground_is_claude classifies the foreground correctly.
+ln -sf "$(command -v bash)" "$DEV_CHANNELS_DISPATCH_CLAUDE"
+# Payload script run as the bash arg under the claude symlink: reads one
+# line from its stdin and writes "<enter>" (or the literal line) to the ack
+# file. Lives long enough for the dispatcher's wait + capture + send + read.
+cat >"$DEV_CHANNELS_DISPATCH_PAYLOAD" <<EOF
+IFS= read -r line
+printf '%s\n' "\${line:-<enter>}" >"$DEV_CHANNELS_DISPATCH_ACK"
+sleep 2
+EOF
+chmod +x "$DEV_CHANNELS_DISPATCH_PAYLOAD"
+# Pane bootstrap: print the dev-channels banner so blocker_state classifies
+# as "devchannels", briefly run a non-claude foreground (sleep) so the
+# wait loop has to spin at least once, then exec the claude stub so the
+# detector sees a "claude" comm on the pane PID's process tree.
+cat >"$DEV_CHANNELS_DISPATCH_SCRIPT" <<EOF
+#!/usr/bin/env bash
+printf 'WARNING: Loading development channels\n'
+printf 'I am using this for local development\n'
+printf 'Enter to confirm · Esc to cancel\n'
+sleep 0.5
+exec "$DEV_CHANNELS_DISPATCH_CLAUDE" "$DEV_CHANNELS_DISPATCH_PAYLOAD"
+EOF
+chmod +x "$DEV_CHANNELS_DISPATCH_SCRIPT"
+tmux new-session -d -s "$DEV_CHANNELS_DISPATCH_SESSION" "$DEV_CHANNELS_DISPATCH_SCRIPT"
+wait_for_tmux_session "$DEV_CHANNELS_DISPATCH_SESSION" up 10 0.1
+# Wait until the driver has actually printed the dev-channels banner so
+# bridge_tmux_claude_blocker_state classifies the pane as "devchannels"
+# before we invoke the dispatcher. Without this wait, advance_blocker is
+# called while the pane PID is still `/usr/bin/env` and the expected_state
+# guard short-circuits with rc=1.
+DEV_CHANNELS_DISPATCH_READY=0
+for _ in {1..50}; do
+  if tmux capture-pane -p -t "=$DEV_CHANNELS_DISPATCH_SESSION:" 2>/dev/null \
+      | grep -Fq 'WARNING: Loading development channels'; then
+    DEV_CHANNELS_DISPATCH_READY=1
+    break
+  fi
+  sleep 0.1
+done
+[[ "$DEV_CHANNELS_DISPATCH_READY" == "1" ]] || die "dev-channels dispatch driver did not render banner"
+"$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_WAIT_SECONDS=5 \
+    BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_POLL_SECONDS=0.1 \
+    BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_MAX_CHECKS=50 \
+    BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_SETTLE_SECONDS=0.05 \
+    bridge_tmux_claude_advance_blocker "'"$DEV_CHANNELS_DISPATCH_SESSION"'" 1 devchannels
+' >/dev/null || die "advance_blocker dispatch did not succeed for delayed-claude pane"
+for _ in {1..40}; do
+  [[ -s "$DEV_CHANNELS_DISPATCH_ACK" ]] && break
+  sleep 0.1
+done
+[[ -s "$DEV_CHANNELS_DISPATCH_ACK" ]] || die "advance_blocker did not deliver Enter to dev-channels picker"
+assert_contains "$(cat "$DEV_CHANNELS_DISPATCH_ACK")" "<enter>"
+tmux kill-session -t "=$DEV_CHANNELS_DISPATCH_SESSION" >/dev/null 2>&1 || true
+
 log "classifying admin foreground exit by onboarding state"
 ONBOARDING_ADMIN_WORKDIR="$TMP_ROOT/onboarding-admin"
 mkdir -p "$ONBOARDING_ADMIN_WORKDIR"

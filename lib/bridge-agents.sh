@@ -864,6 +864,12 @@ bridge_linux_repair_claude_credentials_access() {
   engine="$(bridge_agent_engine "$agent")"
   [[ "$engine" == "claude" ]] || return 0
 
+  # Item 13 (PR #442 r2): repair is best-effort. Skip cleanly when sudo is
+  # unavailable (CI without sudo, dev shell without sudo) — without this
+  # guard, the inner bridge_linux_sudo_root would bridge_die on the start /
+  # daemon-health path even when the repair would otherwise be a no-op.
+  bridge_linux_have_sudo_or_skip || return 0
+
   os_user="$(bridge_agent_os_user "$agent")"
   [[ -n "$os_user" ]] || return 0
   user_home="$(getent passwd "$os_user" 2>/dev/null | cut -d: -f6 || true)"
