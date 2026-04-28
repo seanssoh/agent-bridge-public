@@ -277,6 +277,19 @@ bridge_run_refresh_roster_if_changed() {
   BRIDGE_RUN_ROSTER_SIGNATURE="$signature"
 }
 
+# Returns 0 if there is at least one open (queued/claimed/blocked) handoff
+# task for the agent. Used by bridge_run_reconcile_next_session_state to
+# preserve NEXT-SESSION.md while the next session has not yet acknowledged
+# the handoff. find-open already excludes terminal states.
+bridge_run_handoff_pending_for_agent() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  local found=""
+  found="$(bridge_queue_cli find-open --agent "$agent" \
+    --title-prefix "[bridge:handoff-pending]" --format id 2>/dev/null || true)"
+  [[ -n "$found" ]]
+}
+
 bridge_run_reconcile_next_session_state() {
   local next_file=""
   local marker_file=""
@@ -287,6 +300,11 @@ bridge_run_reconcile_next_session_state() {
   [[ $SAFE_MODE -eq 0 ]] || return 0
   next_file="$(bridge_agent_next_session_file "$AGENT")"
   [[ -f "$next_file" ]] || return 0
+
+  if bridge_run_handoff_pending_for_agent "$AGENT"; then
+    log_line "[info] NEXT-SESSION.md preserved — handoff task pending for $AGENT"
+    return 0
+  fi
 
   age_seconds="$(bridge_agent_maybe_expire_next_session "$AGENT" "$ttl_seconds" || true)"
   if [[ "$age_seconds" =~ ^[0-9]+$ ]]; then

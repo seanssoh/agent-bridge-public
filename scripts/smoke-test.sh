@@ -9157,4 +9157,10 @@ PY
 FP_STATUS_OUTPUT="$("$REPO_ROOT/agent-bridge" status --all-agents)"
 assert_contains "$FP_STATUS_OUTPUT" "context-pressure FP rate (7d): 1/1 (100%)"
 
+# Stale-resume regression: verifies the freshness-gate resolver and its
+# legacy boolean wrappers reject 96h-old transcripts (issue: agb admin
+# stale session-id resume).
+log "running stale-resume regression suite"
+bash "$REPO_ROOT/scripts/test-stale-resume.sh"
+
 log "smoke test passed"
