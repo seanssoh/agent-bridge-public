@@ -5475,11 +5475,12 @@ assert_contains "$(cat "$CLAUDE_STALE_NEXT_ARCHIVE")" "Already delivered in a pr
 
 FAKE_CLAUDE_HOME="$TMP_ROOT/fake-claude-home"
 mkdir -p "$FAKE_CLAUDE_HOME/.claude/sessions"
-mkdir -p "$FAKE_CLAUDE_HOME/.claude/projects/smoke"
+CLAUDE_STATIC_WORKDIR_SLUG="${CLAUDE_STATIC_WORKDIR//\//-}"
+mkdir -p "$FAKE_CLAUDE_HOME/.claude/projects/$CLAUDE_STATIC_WORKDIR_SLUG"
 cat >"$FAKE_CLAUDE_HOME/.claude/sessions/static-existing.json" <<EOF
 {"sessionId":"static-existing-session-id","cwd":"$CLAUDE_STATIC_WORKDIR","startedAt":1760000000000}
 EOF
-cat >"$FAKE_CLAUDE_HOME/.claude/projects/smoke/static-existing-session-id.jsonl" <<'EOF'
+cat >"$FAKE_CLAUDE_HOME/.claude/projects/$CLAUDE_STATIC_WORKDIR_SLUG/static-existing-session-id.jsonl" <<'EOF'
 {"type":"custom-title","customTitle":"claude-static","sessionId":"static-existing-session-id"}
 EOF
 CLAUDE_LAUNCH_EXISTING_SESSION="$(HOME="$FAKE_CLAUDE_HOME" "$BASH4_BIN" -c '
@@ -5555,11 +5556,12 @@ cp -R "$CLAUDE_STATIC_WORKDIR/.discord" "$REALPATH_REAL_WORKDIR/.discord"
 ln -s "$REALPATH_REAL_WORKDIR" "$REALPATH_LINK_WORKDIR"
 FAKE_CLAUDE_REALPATH_HOME="$TMP_ROOT/fake-claude-realpath-home"
 mkdir -p "$FAKE_CLAUDE_REALPATH_HOME/.claude/sessions"
-mkdir -p "$FAKE_CLAUDE_REALPATH_HOME/.claude/projects/smoke"
+REALPATH_REAL_WORKDIR_SLUG="${REALPATH_REAL_WORKDIR//\//-}"
+mkdir -p "$FAKE_CLAUDE_REALPATH_HOME/.claude/projects/$REALPATH_REAL_WORKDIR_SLUG"
 cat >"$FAKE_CLAUDE_REALPATH_HOME/.claude/sessions/realpath-existing.json" <<EOF
 {"sessionId":"realpath-session-id","cwd":"$REALPATH_REAL_WORKDIR","startedAt":1760000000200}
 EOF
-cat >"$FAKE_CLAUDE_REALPATH_HOME/.claude/projects/smoke/realpath-session-id.jsonl" <<'EOF'
+cat >"$FAKE_CLAUDE_REALPATH_HOME/.claude/projects/$REALPATH_REAL_WORKDIR_SLUG/realpath-session-id.jsonl" <<'EOF'
 {"type":"custom-title","customTitle":"claude-static","sessionId":"realpath-session-id"}
 EOF
 CLAUDE_REALPATH_REFRESH_OUTPUT="$(HOME="$FAKE_CLAUDE_REALPATH_HOME" "$BASH4_BIN" -c '
@@ -5574,7 +5576,6 @@ CLAUDE_REALPATH_REFRESH_OUTPUT="$(HOME="$FAKE_CLAUDE_REALPATH_HOME" "$BASH4_BIN"
 ')"
 assert_contains "$CLAUDE_REALPATH_REFRESH_OUTPUT" "SESSION_ID=realpath-session-id"
 FAKE_CLAUDE_NEXT_REFRESH_HOME="$TMP_ROOT/fake-claude-next-refresh-home"
-CLAUDE_STATIC_WORKDIR_SLUG="${CLAUDE_STATIC_WORKDIR//\//-}"
 mkdir -p "$FAKE_CLAUDE_NEXT_REFRESH_HOME/.claude/sessions" \
   "$FAKE_CLAUDE_NEXT_REFRESH_HOME/.claude/projects/$CLAUDE_STATIC_WORKDIR_SLUG"
 cat >"$FAKE_CLAUDE_NEXT_REFRESH_HOME/.claude/sessions/next-refresh.json" <<EOF
