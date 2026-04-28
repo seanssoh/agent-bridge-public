@@ -6,6 +6,99 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.32] — 2026-04-28
+
+### Hotfix — v0.6.30 isolated-agent residuals (5 fixes)
+
+`v0.6.32` bundles 5 distinct fixes for residual isolated-agent failures verified
+during the v0.6.30/v0.6.31 hotfix cycles. All five land in PR #439's wake to
+close out the v0.6.28-rooted isolation regressions before further feature work:
+
+- **Dev-channel auto-accept under linux-user isolation** (#437, PR #442).
+  PR #431 (in v0.6.30) added a foreground-PGID gate but that gate failed
+  under linux-user isolation because the launch chain is sudo → bash →
+  claude — at picker-show time the foreground PGID could be sudo or
+  bash, with claude spawned later as a child. PR #435 added a polling
+  foreground detector but the outer retry budget was too short (the
+  caller didn't loop long enough for claude to appear under wrappers).
+  v0.6.32 adds:
+  - `bridge_tmux_process_tree_has_claude` — walks the tmux pane's PID
+    descendants (not just foreground PGID) to find `claude`,
+    `claude-*`, or `claude.*` anywhere in the tree.
+  - `bridge_tmux_wait_for_claude_foreground` — bounded 60s/30-check
+    polling helper that returns once claude appears in the descendant
+    tree.
+  - `bridge_tmux_claude_advance_blocker` — integrates the wait helper
+    with `tmux send-keys ... Enter` for the dev-channels picker case.
+- **Direct `bridge-queue.py` proxy routing** (#436 residual, PR #442).
+  PR #439 (in v0.6.31) fixed the bash-side roster load so
+  `bridge_queue_gateway_proxy_agent` could detect proxy mode, but
+  direct Python invocations that bypass the bash dispatcher still
+  tripped on `BRIDGE_TASK_DB=/dev/null` SQLite open. v0.6.32 adds
+  proxy detection at the Python entry point in `bridge-queue.py`:
+  when `BRIDGE_GATEWAY_PROXY=1`, the CLI short-circuits to the
+  gateway client instead of opening the local DB. Gateway recursion
+  is prevented with `BRIDGE_QUEUE_GATEWAY_SERVER=1` set on
+  gateway-spawned children. `agb show/claim/done` body reads now
+  work end-to-end for isolated agents.
+- **Claude credential ACL mask repair** (#441 part 1, PR #442).
+  Claude can rewrite `~/.claude/.credentials.json` with mode 0600
+  and an ACL mask that makes the isolated UID's named-user read
+  grant ineffective, sending the isolated agent back to "Not logged
+  in". v0.6.32 adds `bridge_linux_repair_claude_credentials_access`
+  which `setfacl -m m::r--` to restore the named-user effective
+  rights. The repair runs BEFORE channel-health reads in both
+  `bridge-start.sh` and the daemon health-check path. Gated on
+  Linux + linux-user isolation effective + Claude agent + `sudo`
+  available; skipped cleanly otherwise (no hard-exit on macOS / CI
+  without sudo).
+- **`--cwd` for Teams/MS365 MCP plugin definitions** (PR #442).
+  Dev-channel MCP servers (Teams, MS365) now start from their
+  plugin cache root via Bun `--cwd`, so the per-agent isolation
+  sharing path resolves correctly.
+- **Stale `/tmp/tmp.*` controller env fail-closed** (#441 part 2,
+  PR #442). When isolated agent-env.sh generation sees stale
+  `/tmp/tmp.*` (or `/var/tmp/tmp.*` / `/private/tmp/tmp.*` /
+  `$TMPDIR/tmp.*`) controller `BRIDGE_*` paths from a contaminated
+  controller shell, the generator now refuses the write with a
+  clear operator-facing error rather than serializing ephemeral
+  controller test paths into persistent isolated env files. Guard
+  applies only during persistent agent-env writes; transient
+  exports are unaffected.
+
+### Superseded PRs closed
+
+PR #434 (integrate isolation hotfixes and quiet bootstrap noise) and PR #435
+(retry dev-channel picker foreground readiness) were closed as superseded by
+PR #442. Both were authored before v0.6.30 cut and contained partial overlap
+with PR #430/#431 plus a more polished version of the same dev-channel race
+fix that PR #442 ships.
+
+The "upgrade-bootstrap notification suppression" hunk from PR #434's `623417a`
+commit was not picked up; if still useful, can be filed as a fresh small PR
+off main.
+
+### v0.6.32 upgrade / migration notes
+
+#### Auto
+
+- v0.6.31 → v0.6.32 binary upgrade is straightforward — no schema
+  changes. `agent-bridge upgrade --apply` propagates all five fixes.
+- Credential ACL repair runs lazily on next `bridge-start` /
+  daemon health pass per agent. No manual repair needed.
+
+#### Operator-required
+
+- **None for upgrades from v0.6.31**. Isolated agents that previously
+  hit dev-channel picker timeouts, queue body-read failures, or
+  credential "Not logged in" loops start working on next start /
+  health cycle.
+- **For installs that ran v0.6.28 with stale controller env in their
+  agent-env.sh**: the new fail-closed guard will refuse to regenerate
+  agent-env.sh until the controller shell is clean. Operator action:
+  `unset BRIDGE_*` (or open a fresh terminal) and re-run isolation
+  prepare.
+
 ## [0.6.31] — 2026-04-28
 
 ### Hotfix — isolated agent queue CLI gateway proxy detection
