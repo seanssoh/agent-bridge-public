@@ -5294,7 +5294,7 @@ assert row["status"] in {"linked", "updated", "unchanged"}, row
 assert row["cache_type"] == "directory", row
 assert row["node_modules_status"] == "linked", row
 assert cache_version.is_dir() and not cache_version.is_symlink(), cache_version
-assert (cache_version / "server.ts").read_text(encoding="utf-8") == "stale cache\n"
+assert (cache_version / "server.ts").read_text(encoding="utf-8") == "source server\n"
 assert not (cache_version / ".orphaned_at").exists()
 source_node_modules = source / "node_modules"
 cache_node_modules = cache_version / "node_modules"

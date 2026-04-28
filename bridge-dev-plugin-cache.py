@@ -64,6 +64,59 @@ def remove_tree(path: Path) -> None:
         shutil.rmtree(path)
 
 
+NODE_MODULES_NAME = "node_modules"
+
+
+def _copy_file_if_changed(src: Path, dst: Path) -> bool:
+    """Copy file from src to dst when missing or content differs. Returns True if written."""
+    try:
+        if dst.is_symlink() or dst.is_file():
+            if dst.is_file() and not dst.is_symlink():
+                if dst.stat().st_size == src.stat().st_size and dst.read_bytes() == src.read_bytes():
+                    return False
+            dst.unlink(missing_ok=True)
+        elif dst.exists():
+            remove_tree(dst)
+    except OSError:
+        remove_tree(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return True
+
+
+def _overlay_dir(src: Path, dst: Path) -> bool:
+    """Recursively overlay src onto dst. Returns True if anything was written."""
+    changed = False
+    if dst.exists() and not dst.is_dir():
+        remove_tree(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    for entry in src.iterdir():
+        target = dst / entry.name
+        if entry.is_symlink() or entry.is_file():
+            if _copy_file_if_changed(entry, target):
+                changed = True
+        elif entry.is_dir():
+            if _overlay_dir(entry, target):
+                changed = True
+    return changed
+
+
+def overlay_source_to_cache(source_path: Path, cache_version_path: Path) -> bool:
+    """Mirror source files (except node_modules) onto cache. Returns True if changed."""
+    changed = False
+    for entry in source_path.iterdir():
+        if entry.name == NODE_MODULES_NAME:
+            continue
+        target = cache_version_path / entry.name
+        if entry.is_symlink() or entry.is_file():
+            if _copy_file_if_changed(entry, target):
+                changed = True
+        elif entry.is_dir():
+            if _overlay_dir(entry, target):
+                changed = True
+    return changed
+
+
 def link_source_node_modules(source_path: Path, cache_version_path: Path) -> tuple[str, str]:
     source_node_modules = source_path / "node_modules"
     cache_node_modules = cache_version_path / "node_modules"
@@ -136,9 +189,12 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
         cache_type = "symlink"
     else:
         if cache_version_path.is_dir():
-            # Real cache directories carry installed dependencies. Keep them and
-            # link only node_modules into the dev source root below.
-            status = "unchanged"
+            # Real cache directories carry installed dependencies. Overlay source
+            # files (everything except node_modules) so operator edits reach the
+            # cache, while preserving the cache's installed node_modules dir. The
+            # source root's node_modules is then linked back to the cache below.
+            changed = overlay_source_to_cache(source_path, cache_version_path)
+            status = "updated" if changed else "unchanged"
             cache_type = "directory"
         elif cache_version_path.exists():
             remove_tree(cache_version_path)
