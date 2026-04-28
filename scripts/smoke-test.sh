@@ -5262,12 +5262,23 @@ else
 fi
 
 log "syncing dev-loaded plugin cache to live marketplace sources"
+DEV_PLUGIN_MARKETPLACE_ROOT="$TMP_ROOT/dev-plugin-marketplace"
+mkdir -p "$DEV_PLUGIN_MARKETPLACE_ROOT/.claude-plugin" \
+  "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/teams" \
+  "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/ms365"
+cp "$REPO_ROOT/.claude-plugin/marketplace.json" "$DEV_PLUGIN_MARKETPLACE_ROOT/.claude-plugin/marketplace.json"
+cp "$REPO_ROOT/plugins/teams/.mcp.json" "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/teams/.mcp.json"
+cp "$REPO_ROOT/plugins/ms365/.mcp.json" "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/ms365/.mcp.json"
+printf 'source server\n' >"$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/teams/server.ts"
+printf 'source server\n' >"$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/ms365/server.ts"
 TEAMS_CACHE_VERSION_DIR="$BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT/agent-bridge/teams/0.1.0"
-mkdir -p "$TEAMS_CACHE_VERSION_DIR"
+rm -rf "$BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT/agent-bridge/teams"
+mkdir -p "$TEAMS_CACHE_VERSION_DIR/node_modules/@smoke-dep"
 printf 'stale cache\n' >"$TEAMS_CACHE_VERSION_DIR/server.ts"
+printf '{"name":"@smoke-dep"}\n' >"$TEAMS_CACHE_VERSION_DIR/node_modules/@smoke-dep/package.json"
 printf 'orphaned\n' >"$TEAMS_CACHE_VERSION_DIR/.orphaned_at"
-DEV_PLUGIN_CACHE_JSON="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:teams@agent-bridge" --json)"
-python3 - "$DEV_PLUGIN_CACHE_JSON" "$REPO_ROOT/plugins/teams" "$TEAMS_CACHE_VERSION_DIR" <<'PY'
+DEV_PLUGIN_CACHE_JSON="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:teams@agent-bridge" --root "$DEV_PLUGIN_MARKETPLACE_ROOT" --json)"
+python3 - "$DEV_PLUGIN_CACHE_JSON" "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/teams" "$TEAMS_CACHE_VERSION_DIR" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -5280,15 +5291,22 @@ assert len(results) == 1, results
 row = results[0]
 assert row["plugin"] == "teams", row
 assert row["status"] in {"linked", "updated", "unchanged"}, row
-assert cache_version.is_symlink(), cache_version
-assert cache_version.resolve() == source, (cache_version, source)
+assert row["cache_type"] == "directory", row
+assert row["node_modules_status"] == "linked", row
+assert cache_version.is_dir() and not cache_version.is_symlink(), cache_version
+assert (cache_version / "server.ts").read_text(encoding="utf-8") == "source server\n"
 assert not (cache_version / ".orphaned_at").exists()
+source_node_modules = source / "node_modules"
+cache_node_modules = cache_version / "node_modules"
+assert source_node_modules.is_symlink(), source_node_modules
+assert source_node_modules.resolve() == cache_node_modules.resolve(), (source_node_modules, cache_node_modules)
+assert (source_node_modules / "@smoke-dep" / "package.json").exists()
 mcp = json.loads((source / ".mcp.json").read_text(encoding="utf-8"))
 args = mcp["mcpServers"]["teams"]["args"]
 assert args[:2] == ["--cwd", "${CLAUDE_PLUGIN_ROOT}"], args
 assert args[2:] == ["--no-install", "${CLAUDE_PLUGIN_ROOT}/server.ts"], args
 PY
-python3 - "$REPO_ROOT/plugins/ms365/.mcp.json" <<'PY'
+python3 - "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/ms365/.mcp.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -5298,13 +5316,14 @@ args = mcp["mcpServers"]["ms365"]["args"]
 assert args[:2] == ["--cwd", "${CLAUDE_PLUGIN_ROOT}"], args
 assert args[2:] == ["--no-install", "${CLAUDE_PLUGIN_ROOT}/server.ts"], args
 PY
-DEV_PLUGIN_CACHE_JSON_AGAIN="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:teams@agent-bridge" --json)"
+DEV_PLUGIN_CACHE_JSON_AGAIN="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:teams@agent-bridge" --root "$DEV_PLUGIN_MARKETPLACE_ROOT" --json)"
 python3 - "$DEV_PLUGIN_CACHE_JSON_AGAIN" <<'PY'
 import json
 import sys
 
 payload = json.loads(sys.argv[1])
 assert payload["results"][0]["status"] == "unchanged", payload
+assert payload["results"][0]["node_modules_status"] == "unchanged", payload
 PY
 
 BOOTSTRAP_FAIL_HOME="$TMP_ROOT/bootstrap-fail-home"
