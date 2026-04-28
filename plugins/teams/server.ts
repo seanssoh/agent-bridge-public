@@ -44,6 +44,17 @@ type Access = {
   routes?: Record<string, unknown>
 }
 
+type StoredAttachment = {
+  attachment_id: string
+  name: string
+  content_type: string
+  size_bytes?: number
+  download_url?: string
+  local_path?: string
+  download_status: 'ok' | 'skipped_non_file' | 'failed'
+  download_error?: string
+}
+
 type StoredMessage = {
   chat_id: string
   message_id: string
@@ -52,6 +63,7 @@ type StoredMessage = {
   aad_object_id: string
   text: string
   ts: string
+  attachments?: StoredAttachment[]
 }
 
 type Ms365CallbackPayload = {
@@ -68,6 +80,9 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 const REFERENCES_FILE = join(STATE_DIR, 'conversations.json')
 const MESSAGES_FILE = join(STATE_DIR, 'messages.jsonl')
+const ATTACHMENTS_DIR = process.env.TEAMS_ATTACHMENTS_DIR ?? join(STATE_DIR, 'attachments')
+const ATTACHMENT_MAX_BYTES = Number(process.env.TEAMS_ATTACHMENT_MAX_BYTES ?? '52428800')
+const TEAMS_FILE_DOWNLOAD_TYPE = 'application/vnd.microsoft.teams.file.download.info'
 const MS365_CALLBACK_DIR =
   process.env.MS365_CALLBACK_SHARED_DIR ?? join(BRIDGE_HOME, 'shared', 'ms365-callbacks')
 
@@ -292,6 +307,72 @@ function appendMessage(message: StoredMessage): void {
   appendFileSync(MESSAGES_FILE, JSON.stringify(message) + '\n', { mode: 0o600 })
 }
 
+function sanitizeFilename(name: string): string {
+  const trimmed = name.replace(/[\/\\\0]/g, '_').trim()
+  return (trimmed || 'attachment').slice(0, 200)
+}
+
+async function fetchAttachmentBytes(url: string, maxBytes: number): Promise<Buffer> {
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const declared = Number(res.headers.get('content-length') ?? '0')
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    throw new Error('size_limit')
+  }
+  const buf = Buffer.from(await res.arrayBuffer())
+  if (buf.length > maxBytes) throw new Error('size_limit')
+  return buf
+}
+
+async function downloadAttachments(
+  activity: Activity,
+  messageId: string,
+): Promise<StoredAttachment[]> {
+  const items = Array.isArray(activity.attachments) ? activity.attachments : []
+  if (items.length === 0) return []
+  const results: StoredAttachment[] = []
+  for (let i = 0; i < items.length; i++) {
+    const att = items[i]
+    const rawId = String((att as any).id ?? (att as any).contentUrl ?? '').trim()
+    const attachmentId = rawId || `${messageId}-${i}`
+    const name = String(att.name ?? '').trim() || `attachment-${i}`
+    const contentType = String(att.contentType ?? '').trim()
+    const stored: StoredAttachment = {
+      attachment_id: attachmentId,
+      name,
+      content_type: contentType,
+      download_status: 'skipped_non_file',
+    }
+    let downloadUrl = ''
+    if (contentType === TEAMS_FILE_DOWNLOAD_TYPE) {
+      const content = ((att as any).content ?? {}) as { downloadUrl?: string }
+      downloadUrl = String(content.downloadUrl ?? '').trim() || String((att as any).contentUrl ?? '').trim()
+    } else if (contentType.startsWith('image/')) {
+      downloadUrl = String((att as any).contentUrl ?? '').trim()
+    }
+    if (!downloadUrl) {
+      results.push(stored)
+      continue
+    }
+    stored.download_url = downloadUrl
+    try {
+      const bytes = await fetchAttachmentBytes(downloadUrl, ATTACHMENT_MAX_BYTES)
+      const dir = join(ATTACHMENTS_DIR, messageId)
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      const localPath = join(dir, sanitizeFilename(name))
+      writeFileSync(localPath, bytes, { mode: 0o600 })
+      stored.local_path = localPath
+      stored.size_bytes = bytes.length
+      stored.download_status = 'ok'
+    } catch (err) {
+      stored.download_status = 'failed'
+      stored.download_error = String((err as Error)?.message ?? err).slice(0, 200)
+    }
+    results.push(stored)
+  }
+  return results
+}
+
 function runPromptGuard(command: 'scan' | 'sanitize', text: string): Record<string, unknown> | null {
   const script = join(BRIDGE_HOME, 'bridge-guard.py')
   const result = spawnSync(
@@ -432,6 +513,8 @@ async function handleActivity(context: TurnContext): Promise<void> {
   if (guarded?.blocked) return
   const ts = activity.timestamp instanceof Date ? activity.timestamp.toISOString() : new Date().toISOString()
 
+  const attachments = await downloadAttachments(activity, messageId)
+
   const stored: StoredMessage = {
     chat_id: chatId,
     message_id: messageId,
@@ -440,6 +523,7 @@ async function handleActivity(context: TurnContext): Promise<void> {
     aad_object_id: aad,
     text,
     ts,
+    ...(attachments.length > 0 ? { attachments } : {}),
   }
   appendMessage(stored)
 
@@ -458,6 +542,18 @@ async function handleActivity(context: TurnContext): Promise<void> {
         tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
         service_url: String(activity.serviceUrl ?? ''),
         ts,
+        ...(attachments.length > 0
+          ? {
+              attachments: attachments.map(att => ({
+                name: att.name,
+                content_type: att.content_type,
+                download_status: att.download_status,
+                ...(att.local_path ? { local_path: att.local_path } : {}),
+                ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
+                ...(att.download_error ? { download_error: att.download_error } : {}),
+              })),
+            }
+          : {}),
       },
     },
   })

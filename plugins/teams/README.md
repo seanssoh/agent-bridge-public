@@ -61,6 +61,25 @@ Agent Bridge writes this file through:
 agb setup teams <agent> --app-id ... --app-password ... --tenant-id ... --allow-from ... --messaging-endpoint https://bot.example.com/api/messages --webhook-host 0.0.0.0
 ```
 
+## Inbound Attachments
+
+When a Teams user attaches a file or image, the plugin downloads each attachment to:
+
+```
+<TEAMS_STATE_DIR>/attachments/<message_id>/<filename>
+```
+
+(directory mode 0700, file mode 0600). The Claude channel notification meta gains an `attachments` array with `name`, `content_type`, `download_status` (`ok` / `skipped_non_file` / `failed`), and — on success — `local_path` and `size_bytes`. Cards and other non-file attachment kinds are recorded with `skipped_non_file` so the agent still sees the metadata.
+
+Override the location and size cap via:
+
+```dotenv
+TEAMS_ATTACHMENTS_DIR=<absolute path>
+TEAMS_ATTACHMENT_MAX_BYTES=52428800   # default: 50 MB
+```
+
+Outbound attachments (sending files from the bot to Teams) are not yet implemented; track that work separately.
+
 ## Current Scope
 
 This is the Phase 1 channel implementation: webhook receive, access gate, Claude channel notification, reply, local message fetch, and a lightweight `/auth/callback` endpoint used by the `ms365` plugin authorization-code pairing flow. Multi-tenant user-to-agent routing is intentionally left to the Agent Bridge relay layer so one Teams bot can map many users to many timeout agents without mixing conversation state.
