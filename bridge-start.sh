@@ -25,6 +25,73 @@ CONTINUE_MODE=1
 INSTALL_PROJECT_SKILL=1
 SAFE_MODE=0
 AGENT=""
+CONTROLLER_DEV_CHANNELS_ACCEPT=0
+
+bridge_start_dev_channels_accept_timeout() {
+  local accept_timeout="${BRIDGE_START_DEV_CHANNELS_ACCEPT_TIMEOUT_SECONDS:-${BRIDGE_RUN_DEV_CHANNELS_ACCEPT_TIMEOUT_SECONDS:-60}}"
+
+  [[ "$accept_timeout" =~ ^[0-9]+$ ]] || accept_timeout=60
+  (( accept_timeout > 0 )) || accept_timeout=60
+  printf '%s' "$accept_timeout"
+}
+
+bridge_start_effective_dev_channels_csv() {
+  local agent="$1"
+  local suppress_missing="${2:-0}"
+
+  if [[ "$suppress_missing" == "1" ]]; then
+    BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS=1 bridge_agent_effective_dev_channels_csv "$agent"
+    return 0
+  fi
+
+  bridge_agent_effective_dev_channels_csv "$agent"
+}
+
+bridge_start_should_controller_accept_dev_channels() {
+  local agent="$1"
+  local suppress_missing="${2:-0}"
+  local effective=""
+
+  [[ "$ENGINE" == "claude" ]] || return 1
+  [[ $SAFE_MODE -eq 0 ]] || return 1
+  effective="$(bridge_start_effective_dev_channels_csv "$agent" "$suppress_missing")"
+  [[ -n "$effective" ]]
+}
+
+bridge_start_schedule_dev_channels_accept() {
+  local session="$1"
+  local agent="$2"
+  local accept_timeout=""
+  local log_dir=""
+  local logfile="/dev/null"
+  local errfile="/dev/null"
+
+  accept_timeout="$(bridge_start_dev_channels_accept_timeout)"
+  log_dir="$(bridge_agent_log_dir "$agent")"
+  if mkdir -p "$log_dir" 2>/dev/null; then
+    logfile="$log_dir/$(date '+%Y%m%d').log"
+    errfile="$log_dir/$(date '+%Y%m%d').err.log"
+  fi
+
+  echo "[info] controller-side Claude development-channels auto-accept armed for '$session' (timeout=${accept_timeout}s)"
+  (
+    "$BRIDGE_BASH_BIN" -lc '
+      set -euo pipefail
+      script_dir="$1"
+      session="$2"
+      agent="$3"
+      accept_timeout="$4"
+      source "$script_dir/bridge-lib.sh"
+      if bridge_tmux_wait_for_prompt "$session" claude "$accept_timeout" 1; then
+        printf "[%s] [info] controller auto-accept dev-channels completed on session=%s agent=%s\n" \
+          "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
+      else
+        printf "[%s] [warn] controller auto-accept dev-channels failed/timeout on session=%s agent=%s\n" \
+          "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" >&2
+      fi
+    ' -- "$SCRIPT_DIR" "$session" "$agent" "$accept_timeout"
+  ) </dev/null >>"$logfile" 2>>"$errfile" &
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -268,6 +335,10 @@ fi
 if [[ $SUPPRESS_MISSING_CHANNELS -eq 1 ]]; then
   SESSION_CMD="BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS=1 ${SESSION_CMD}"
 fi
+if bridge_start_should_controller_accept_dev_channels "$AGENT" "$SUPPRESS_MISSING_CHANNELS"; then
+  CONTROLLER_DEV_CHANNELS_ACCEPT=1
+  SESSION_CMD="BRIDGE_CONTROLLER_DEV_CHANNELS_ACCEPT=1 ${SESSION_CMD}"
+fi
 
 SUDO_WRAP_ACTIVE=0
 SUDO_WRAP_OS_USER=""
@@ -360,6 +431,9 @@ tmux new-session -d -s "$SESSION" -c "$WORK_DIR" "$SESSION_CMD"
 bridge_tmux_bootstrap_session_options "$SESSION"
 if [[ "$ENGINE" == "claude" ]]; then
   bridge_tmux_prepare_claude_session "$SESSION" 8 >/dev/null 2>&1 || true
+  if [[ $CONTROLLER_DEV_CHANNELS_ACCEPT -eq 1 ]]; then
+    bridge_start_schedule_dev_channels_accept "$SESSION" "$AGENT"
+  fi
   bridge_agent_mark_idle_now "$AGENT"
 fi
 if [[ -z "$(bridge_agent_session_id "$AGENT")" ]]; then
