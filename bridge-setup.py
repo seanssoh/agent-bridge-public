@@ -1200,6 +1200,212 @@ def cmd_teams(args: argparse.Namespace) -> int:
         return 1
 
 
+def build_mattermost_access(
+    existing: dict[str, Any],
+    channels: list[str],
+    allow_from: list[str],
+    require_mention: bool,
+) -> dict[str, Any]:
+    """Mattermost access.json schema differs from Teams: it uses
+    `channels` (not `groups`) keyed by Mattermost channel_id."""
+    payload = dict(existing)
+    old_channels = payload.get("channels") or {}
+    new_channels: dict[str, Any] = {}
+    for channel_id in channels:
+        old_entry = old_channels.get(channel_id) or {}
+        preserved_allow_from = normalize_id_list(old_entry.get("allowFrom") or [], "channel allow_from")
+        new_channels[channel_id] = {
+            "requireMention": require_mention,
+            "allowFrom": preserved_allow_from,
+        }
+
+    pending = payload.get("pending")
+    if not isinstance(pending, dict):
+        pending = {}
+
+    payload["dmPolicy"] = "allowlist"
+    payload["allowFrom"] = allow_from
+    payload["channels"] = new_channels
+    payload["pending"] = pending
+    return payload
+
+
+def merge_mcp_json_mattermost(
+    mcp_path: Path,
+    server_url: str,
+    bot_token: str,
+    binary_path: str,
+) -> dict[str, Any]:
+    """Read existing .mcp.json (if any), upsert the `mattermost` MCP server,
+    preserve other servers. Returns the merged document."""
+    if mcp_path.exists():
+        try:
+            with mcp_path.open("r", encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            doc = {}
+    else:
+        doc = {}
+    if not isinstance(doc, dict):
+        doc = {}
+    servers = doc.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers["mattermost"] = {
+        "command": binary_path,
+        "env": {
+            "MM_SERVER_URL": server_url,
+            "MM_ACCESS_TOKEN": bot_token,
+        },
+    }
+    doc["mcpServers"] = servers
+    return doc
+
+
+def validate_mattermost(token: str, base_url: str, agent: str) -> dict[str, Any]:
+    """Validate the bot token by calling GET /api/v4/users/me."""
+    if not token:
+        return {"status": "error", "error": "no token provided"}
+    url = f"{base_url.rstrip('/')}/api/v4/users/me"
+    req = Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "agent-bridge-setup/0.1",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(req, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+            return {
+                "status": "ok",
+                "agent": agent,
+                "bot_user_id": str(payload.get("id") or ""),
+                "bot_username": str(payload.get("username") or ""),
+            }
+    except HTTPError as exc:
+        return {"status": "error", "error": f"HTTP {exc.code}: {exc.reason}"}
+    except URLError as exc:
+        return {"status": "error", "error": f"URL error: {exc.reason}"}
+    except Exception as exc:
+        return {"status": "error", "error": f"unexpected: {exc}"}
+
+
+def print_mattermost_result(result: dict[str, Any], *, stream: Any = sys.stdout) -> None:
+    print(f"agent: {result['agent']}", file=stream)
+    print(f"mattermost_dir: {result['mattermost_dir']}", file=stream)
+    print(f"env_file: {result['env_file']}", file=stream)
+    print(f"access_file: {result['access_file']}", file=stream)
+    print(f"mcp_file: {result['mcp_file']}", file=stream)
+    print(f"server_url: {result['server_url']}", file=stream)
+    print(f"channels: {', '.join(result['channels']) if result['channels'] else '(none)'}", file=stream)
+    print(
+        f"allow_from: {', '.join(result['allow_from']) if result['allow_from'] else '(none)'}",
+        file=stream,
+    )
+    print(f"require_mention: {'yes' if result['require_mention'] else 'no'}", file=stream)
+    print(f"write_status: {result['write_status']}", file=stream)
+    validation = result.get("validation") or {}
+    print(f"validation: {validation.get('status', 'skipped')}", file=stream)
+    if validation.get("bot_username"):
+        print(f"  bot: @{validation['bot_username']} ({validation.get('bot_user_id', '')})", file=stream)
+    if validation.get("error"):
+        print(f"  error: {validation['error']}", file=stream)
+    for warning in result.get("warnings", []):
+        print(f"warning: {warning}", file=stream)
+    if result.get("error"):
+        print(f"error: {result['error']}", file=stream)
+
+
+def cmd_mattermost(args: argparse.Namespace) -> int:
+    mattermost_dir = Path(args.mattermost_dir).expanduser()
+    env_path = mattermost_dir / ".env"
+    access_path = mattermost_dir / "access.json"
+    # .mcp.json lives ONE LEVEL UP — at the agent's workdir, alongside CLAUDE.md.
+    mcp_path = mattermost_dir.parent / ".mcp.json"
+    warnings: list[str] = []
+
+    server_url = str(args.url or "").strip().rstrip("/")
+    bot_token = str(args.bot_token or "").strip()
+    allow_from = normalize_id_list(args.allow_from or [], "allow_from")
+    channels = normalize_id_list(args.channel or [], "channel")
+    require_mention = bool(args.require_mention)
+    mcp_binary = str(args.mcp_binary or "mattermost-mcp-server").strip()
+
+    result: dict[str, Any] = {
+        "agent": args.agent,
+        "mattermost_dir": str(mattermost_dir),
+        "env_file": str(env_path),
+        "access_file": str(access_path),
+        "mcp_file": str(mcp_path),
+        "server_url": server_url,
+        "channels": channels,
+        "allow_from": allow_from,
+        "require_mention": require_mention,
+        "write_status": "pending",
+        "validation": {"status": "skipped"},
+        "warnings": warnings,
+    }
+
+    try:
+        if not server_url:
+            raise SetupError("--url is required (e.g. https://builders.cosmax.com)")
+        if not bot_token:
+            raise SetupError("--bot-token is required")
+        if not allow_from and not channels:
+            warnings.append(
+                f"No allow_from or channels configured; the plugin will reject all incoming posts. "
+                f"Edit {access_path} after setup if needed."
+            )
+
+        existing_access: dict[str, Any] = {}
+        if access_path.exists():
+            try:
+                with access_path.open("r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    existing_access = loaded
+            except (OSError, json.JSONDecodeError):
+                existing_access = {}
+
+        access_doc = build_mattermost_access(existing_access, channels, allow_from, require_mention)
+        env_text = (
+            f"MATTERMOST_URL={server_url}\n"
+            f"MATTERMOST_BOT_TOKEN={bot_token}\n"
+            f"BRIDGE_AGENT_ID={args.agent}\n"
+        )
+        mcp_doc = merge_mcp_json_mattermost(mcp_path, server_url, bot_token, mcp_binary)
+
+        if args.dry_run:
+            result["write_status"] = "dry_run"
+            result["validation"] = {"status": "dry_run"}
+            print_mattermost_result(result)
+            return 0
+
+        mattermost_dir.mkdir(parents=True, exist_ok=True)
+        save_text(env_path, env_text)
+        save_json(access_path, access_doc)
+        save_json(mcp_path, mcp_doc)
+        result["write_status"] = "ok"
+
+        if args.skip_validate:
+            print_mattermost_result(result)
+            return 0
+
+        result["validation"] = validate_mattermost(bot_token, server_url, args.agent)
+        print_mattermost_result(result)
+        if result["validation"].get("status") == "error":
+            return 1
+        return 0
+    except SetupError as exc:
+        result["error"] = str(exc)
+        if result["write_status"] == "pending":
+            result["write_status"] = "skipped"
+        print_mattermost_result(result, stream=sys.stderr)
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bridge-setup.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1262,6 +1468,20 @@ def build_parser() -> argparse.ArgumentParser:
     teams_parser.add_argument("--skip-send-test", action="store_true")
     teams_parser.add_argument("--dry-run", action="store_true")
     teams_parser.set_defaults(handler=cmd_teams)
+
+    mattermost_parser = subparsers.add_parser("mattermost")
+    mattermost_parser.add_argument("--agent", required=True)
+    mattermost_parser.add_argument("--mattermost-dir", required=True)
+    mattermost_parser.add_argument("--url", default="")
+    mattermost_parser.add_argument("--bot-token", default="")
+    mattermost_parser.add_argument("--allow-from", action="append", default=[])
+    mattermost_parser.add_argument("--channel", action="append", default=[])
+    mattermost_parser.add_argument("--require-mention", action="store_true")
+    mattermost_parser.add_argument("--mcp-binary", default="mattermost-mcp-server")
+    mattermost_parser.add_argument("--yes", action="store_true")
+    mattermost_parser.add_argument("--skip-validate", action="store_true")
+    mattermost_parser.add_argument("--dry-run", action="store_true")
+    mattermost_parser.set_defaults(handler=cmd_mattermost)
 
     return parser
 
