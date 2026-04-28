@@ -341,6 +341,11 @@ else
       fail 3 "daily note missing at $C3_NOTE — reconcile stub didn't write marker"
     elif ! grep -q "reconcile-stub-marker agent=c3-agent" "$C3_NOTE"; then
       fail 3 "daily note marker missing at $C3_NOTE — content: $(cat "$C3_NOTE")"
+    elif ! grep -q "jsonl=" "$C3_NOTE"; then
+      # codex r2 PR #451: verify the jsonl arg landed in the marker too,
+      # not just the agent field. Confirms reconcile was invoked with the
+      # right --jsonl <path> argument from the harvester's slug derivation.
+      fail 3 "daily note marker missing jsonl= field — content: $(cat "$C3_NOTE")"
     else
       pass 3
     fi
