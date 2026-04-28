@@ -255,7 +255,7 @@ def _stamp_next_session_delivered(agent: str, next_session: Path) -> str | None:
 
     The bash-side `bridge_agent_maybe_expire_next_session` gates on
     `bridge_agent_next_session_is_delivered` (marker file equals the current
-    file digest). Without this writer the auto-clear path is dead code — a
+    file digest). Without this writer the auto-archive path is dead code — a
     regression introduced when `bridge_run_schedule_next_session_prompt` was
     removed in b38e584 in favour of the SessionStart hook. We restore the
     marker here so `bridge-run.sh`'s reconcile step can age out a stale
@@ -419,6 +419,35 @@ def bootstrap_artifact_context(agent: str) -> str:
 
     if not lines:
         return ""
+    return "\n".join(lines)
+
+
+def next_session_required_prompt_context(agent: str) -> str:
+    workdir = agent_workdir(agent)
+    default_home = agent_default_home(agent)
+    next_session = first_existing_path(
+        [
+            workdir / "NEXT-SESSION.md",
+            default_home / "NEXT-SESSION.md",
+        ]
+    )
+    if next_session is None:
+        return ""
+
+    lines = [
+        "<agent_bridge_next_session_required>",
+        f"NEXT-SESSION.md is still present at {next_session}.",
+        "Before answering the current user prompt or doing any other work, read this file in full and execute its checklist.",
+        "If the current user prompt conflicts with the handoff, acknowledge that the handoff is being processed first.",
+    ]
+    excerpt = short_file_excerpt(next_session)
+    if excerpt:
+        lines.append("Handoff excerpt:")
+        lines.append(excerpt)
+    digest = _stamp_next_session_delivered(agent, next_session)
+    if digest is not None:
+        _enqueue_handoff_pending(agent, next_session, digest)
+    lines.append("</agent_bridge_next_session_required>")
     return "\n".join(lines)
 
 

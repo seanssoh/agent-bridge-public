@@ -1111,6 +1111,24 @@ export BRIDGE_MCP_ORPHAN_CLEANUP_ENABLED=0
 export BRIDGE_WEBHOOK_PORT_RANGE_START=9301
 export BRIDGE_WEBHOOK_PORT_RANGE_END=9399
 
+STALE_CONTROLLER_ENV_ROOT="/tmp/tmp.agent-bridge-stale-env-$$"
+rm -rf "$STALE_CONTROLLER_ENV_ROOT"
+STALE_CONTROLLER_ENV_OUTPUT="$(
+  BRIDGE_HOME="$BRIDGE_HOME" \
+  BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=0 \
+  BRIDGE_AGENT_HOME_ROOT="$STALE_CONTROLLER_ENV_ROOT/bridge-home/agents" \
+  BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT="$STALE_CONTROLLER_ENV_ROOT/claude-plugin-cache" \
+  "$BASH4_BIN" -c '
+    source "'"$REPO_ROOT"'/bridge-lib.sh"
+    printf "agent_home=%s\n" "$BRIDGE_AGENT_HOME_ROOT"
+    printf "plugin_cache=%s\n" "${BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT-unset}"
+  ' 2>&1
+)"
+assert_contains "$STALE_CONTROLLER_ENV_OUTPUT" "unsetting stale ephemeral controller env BRIDGE_AGENT_HOME_ROOT="
+assert_contains "$STALE_CONTROLLER_ENV_OUTPUT" "unsetting stale ephemeral controller env BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT="
+assert_contains "$STALE_CONTROLLER_ENV_OUTPUT" "agent_home=$BRIDGE_HOME/agents"
+assert_contains "$STALE_CONTROLLER_ENV_OUTPUT" "plugin_cache=unset"
+
 SESSION_NAME="bridge-smoke-$$"
 REQUESTER_SESSION="bridge-requester-$$"
 CLAUDE_STATIC_SESSION="claude-static-$SESSION_NAME"
@@ -3163,6 +3181,11 @@ assert_contains "$CLAUDE_SESSION_START_OUTPUT" "Handoff present: NEXT-SESSION.md
 assert_contains "$CLAUDE_SESSION_START_OUTPUT" "Resume Checklist"
 assert_contains "$CLAUDE_SESSION_START_OUTPUT" "Onboarding pending:"
 assert_contains "$CLAUDE_SESSION_START_OUTPUT" "agb inbox claude-static"
+CLAUDE_STATIC_AGENT_HOME_ROOT="$BRIDGE_HOME/agents"
+CLAUDE_PROMPT_NEXT_SESSION_OUTPUT="$(BRIDGE_AGENT_ID="claude-static" BRIDGE_AGENT_WORKDIR="$CLAUDE_STATIC_WORKDIR" BRIDGE_AGENT_HOME_ROOT="$CLAUDE_STATIC_AGENT_HOME_ROOT" BRIDGE_HOME="$BRIDGE_HOME" python3 "$REPO_ROOT/hooks/prompt_timestamp.py")"
+assert_contains "$CLAUDE_PROMPT_NEXT_SESSION_OUTPUT" "<agent_bridge_next_session_required>"
+assert_contains "$CLAUDE_PROMPT_NEXT_SESSION_OUTPUT" "Before answering the current user prompt"
+assert_contains "$CLAUDE_PROMPT_NEXT_SESSION_OUTPUT" "Resume Checklist"
 # Issue #228: the SessionStart hook must also stamp the next-session
 # digest into the per-agent marker so bash-side
 # bridge_agent_maybe_expire_next_session can later age out the handoff.
@@ -5262,12 +5285,23 @@ else
 fi
 
 log "syncing dev-loaded plugin cache to live marketplace sources"
+DEV_PLUGIN_MARKETPLACE_ROOT="$TMP_ROOT/dev-plugin-marketplace"
+mkdir -p "$DEV_PLUGIN_MARKETPLACE_ROOT/.claude-plugin" \
+  "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/teams" \
+  "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/ms365"
+cp "$REPO_ROOT/.claude-plugin/marketplace.json" "$DEV_PLUGIN_MARKETPLACE_ROOT/.claude-plugin/marketplace.json"
+cp "$REPO_ROOT/plugins/teams/.mcp.json" "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/teams/.mcp.json"
+cp "$REPO_ROOT/plugins/ms365/.mcp.json" "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/ms365/.mcp.json"
+printf 'source server\n' >"$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/teams/server.ts"
+printf 'source server\n' >"$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/ms365/server.ts"
 TEAMS_CACHE_VERSION_DIR="$BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT/agent-bridge/teams/0.1.0"
-mkdir -p "$TEAMS_CACHE_VERSION_DIR"
+rm -rf "$BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT/agent-bridge/teams"
+mkdir -p "$TEAMS_CACHE_VERSION_DIR/node_modules/@smoke-dep"
 printf 'stale cache\n' >"$TEAMS_CACHE_VERSION_DIR/server.ts"
+printf '{"name":"@smoke-dep"}\n' >"$TEAMS_CACHE_VERSION_DIR/node_modules/@smoke-dep/package.json"
 printf 'orphaned\n' >"$TEAMS_CACHE_VERSION_DIR/.orphaned_at"
-DEV_PLUGIN_CACHE_JSON="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:teams@agent-bridge" --json)"
-python3 - "$DEV_PLUGIN_CACHE_JSON" "$REPO_ROOT/plugins/teams" "$TEAMS_CACHE_VERSION_DIR" <<'PY'
+DEV_PLUGIN_CACHE_JSON="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:teams@agent-bridge" --root "$DEV_PLUGIN_MARKETPLACE_ROOT" --json)"
+python3 - "$DEV_PLUGIN_CACHE_JSON" "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/teams" "$TEAMS_CACHE_VERSION_DIR" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -5280,15 +5314,22 @@ assert len(results) == 1, results
 row = results[0]
 assert row["plugin"] == "teams", row
 assert row["status"] in {"linked", "updated", "unchanged"}, row
-assert cache_version.is_symlink(), cache_version
-assert cache_version.resolve() == source, (cache_version, source)
+assert row["cache_type"] == "directory", row
+assert row["node_modules_status"] == "linked", row
+assert cache_version.is_dir() and not cache_version.is_symlink(), cache_version
+assert (cache_version / "server.ts").read_text(encoding="utf-8") == "source server\n"
 assert not (cache_version / ".orphaned_at").exists()
+source_node_modules = source / "node_modules"
+cache_node_modules = cache_version / "node_modules"
+assert source_node_modules.is_symlink(), source_node_modules
+assert source_node_modules.resolve() == cache_node_modules.resolve(), (source_node_modules, cache_node_modules)
+assert (source_node_modules / "@smoke-dep" / "package.json").exists()
 mcp = json.loads((source / ".mcp.json").read_text(encoding="utf-8"))
 args = mcp["mcpServers"]["teams"]["args"]
 assert args[:2] == ["--cwd", "${CLAUDE_PLUGIN_ROOT}"], args
 assert args[2:] == ["--no-install", "${CLAUDE_PLUGIN_ROOT}/server.ts"], args
 PY
-python3 - "$REPO_ROOT/plugins/ms365/.mcp.json" <<'PY'
+python3 - "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/ms365/.mcp.json" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -5298,13 +5339,14 @@ args = mcp["mcpServers"]["ms365"]["args"]
 assert args[:2] == ["--cwd", "${CLAUDE_PLUGIN_ROOT}"], args
 assert args[2:] == ["--no-install", "${CLAUDE_PLUGIN_ROOT}/server.ts"], args
 PY
-DEV_PLUGIN_CACHE_JSON_AGAIN="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:teams@agent-bridge" --json)"
+DEV_PLUGIN_CACHE_JSON_AGAIN="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:teams@agent-bridge" --root "$DEV_PLUGIN_MARKETPLACE_ROOT" --json)"
 python3 - "$DEV_PLUGIN_CACHE_JSON_AGAIN" <<'PY'
 import json
 import sys
 
 payload = json.loads(sys.argv[1])
 assert payload["results"][0]["status"] == "unchanged", payload
+assert payload["results"][0]["node_modules_status"] == "unchanged", payload
 PY
 
 BOOTSTRAP_FAIL_HOME="$TMP_ROOT/bootstrap-fail-home"
@@ -5387,6 +5429,7 @@ cat >"$CLAUDE_STATIC_WORKDIR/NEXT-SESSION.md" <<'EOF'
 
 Already delivered in a previous restart.
 EOF
+rm -rf "$CLAUDE_STATIC_WORKDIR/archive"
 CLAUDE_STATIC_NEXT_DIGEST="$("$BASH4_BIN" -c '
   source "'"$REPO_ROOT"'/bridge-lib.sh"
   bridge_load_roster
@@ -5413,9 +5456,12 @@ CLAUDE_STALE_NEXT_CLEAR_AGE="$("$BASH4_BIN" -c '
   bridge_load_roster
   bridge_agent_maybe_expire_next_session "claude-static" 300 || true
 ')"
-[[ "$CLAUDE_STALE_NEXT_CLEAR_AGE" =~ ^[0-9]+$ ]] || die "expected stale NEXT-SESSION auto-clear age"
-[[ ! -f "$CLAUDE_STATIC_WORKDIR/NEXT-SESSION.md" ]] || die "expected stale NEXT-SESSION file to be cleared"
+[[ "$CLAUDE_STALE_NEXT_CLEAR_AGE" =~ ^[0-9]+$ ]] || die "expected stale NEXT-SESSION auto-archive age"
+[[ ! -f "$CLAUDE_STATIC_WORKDIR/NEXT-SESSION.md" ]] || die "expected stale NEXT-SESSION file to be archived away from active path"
 [[ ! -f "$CLAUDE_STATIC_NEXT_MARKER_FILE" ]] || die "expected stale NEXT-SESSION marker to be cleared"
+CLAUDE_STALE_NEXT_ARCHIVE="$(find "$CLAUDE_STATIC_WORKDIR/archive" -maxdepth 1 -name 'NEXT-SESSION.*.md' -print | head -n 1)"
+[[ -n "$CLAUDE_STALE_NEXT_ARCHIVE" && -f "$CLAUDE_STALE_NEXT_ARCHIVE" ]] || die "expected stale NEXT-SESSION archive file"
+assert_contains "$(cat "$CLAUDE_STALE_NEXT_ARCHIVE")" "Already delivered in a previous restart."
 
 FAKE_CLAUDE_HOME="$TMP_ROOT/fake-claude-home"
 mkdir -p "$FAKE_CLAUDE_HOME/.claude/sessions"
@@ -5443,6 +5489,16 @@ CLAUDE_SAFE_MODE_RESUME="$(HOME="$FAKE_CLAUDE_HOME" "$BASH4_BIN" -c '
 ')"
 assert_contains "$CLAUDE_SAFE_MODE_RESUME" "claude --resume static-existing-session-id --dangerously-skip-permissions --name claude-static"
 assert_not_contains "$CLAUDE_SAFE_MODE_RESUME" "--channels"
+CLAUDE_FALSE_LAUNCH_RECOVERY="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["claude-static"]="plugin:teams@agent-bridge"
+  BRIDGE_AGENT_LAUNCH_CMD["claude-static"]="false --dangerously-load-development-channels plugin:teams@agent-bridge --dangerously-skip-permissions"
+  bridge_agent_launch_cmd "claude-static"
+')"
+assert_not_contains "$CLAUDE_FALSE_LAUNCH_RECOVERY" "false --dangerously"
+assert_contains "$CLAUDE_FALSE_LAUNCH_RECOVERY" "claude --dangerously-skip-permissions --name claude-static"
+assert_contains "$CLAUDE_FALSE_LAUNCH_RECOVERY" "--dangerously-load-development-channels plugin:teams@agent-bridge"
 FAKE_CLAUDE_STALE_HOME="$TMP_ROOT/fake-claude-stale-home"
 mkdir -p "$FAKE_CLAUDE_STALE_HOME/.claude/sessions"
 cat >"$FAKE_CLAUDE_STALE_HOME/.claude/sessions/stale-existing.json" <<EOF
@@ -5507,6 +5563,32 @@ CLAUDE_REALPATH_REFRESH_OUTPUT="$(HOME="$FAKE_CLAUDE_REALPATH_HOME" "$BASH4_BIN"
   printf "SESSION_ID=%s" "${BRIDGE_AGENT_SESSION_ID["claude-static"]-}"
 ')"
 assert_contains "$CLAUDE_REALPATH_REFRESH_OUTPUT" "SESSION_ID=realpath-session-id"
+FAKE_CLAUDE_NEXT_REFRESH_HOME="$TMP_ROOT/fake-claude-next-refresh-home"
+CLAUDE_STATIC_WORKDIR_SLUG="${CLAUDE_STATIC_WORKDIR//\//-}"
+mkdir -p "$FAKE_CLAUDE_NEXT_REFRESH_HOME/.claude/sessions" \
+  "$FAKE_CLAUDE_NEXT_REFRESH_HOME/.claude/projects/$CLAUDE_STATIC_WORKDIR_SLUG"
+cat >"$FAKE_CLAUDE_NEXT_REFRESH_HOME/.claude/sessions/next-refresh.json" <<EOF
+{"sessionId":"next-session-new-id","cwd":"$CLAUDE_STATIC_WORKDIR","startedAt":1760000000300}
+EOF
+cat >"$FAKE_CLAUDE_NEXT_REFRESH_HOME/.claude/projects/$CLAUDE_STATIC_WORKDIR_SLUG/next-session-new-id.jsonl" <<'EOF'
+{"type":"custom-title","customTitle":"claude-static","sessionId":"next-session-new-id"}
+EOF
+cat >"$FAKE_CLAUDE_NEXT_REFRESH_HOME/.claude/projects/$CLAUDE_STATIC_WORKDIR_SLUG/next-session-old-id.jsonl" <<'EOF'
+{"type":"custom-title","customTitle":"claude-static","sessionId":"next-session-old-id"}
+EOF
+CLAUDE_NEXT_REFRESH_OUTPUT="$(HOME="$FAKE_CLAUDE_NEXT_REFRESH_HOME" "$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CONTINUE["claude-static"]="1"
+  BRIDGE_AGENT_CREATED_AT["claude-static"]="1760000000"
+  BRIDGE_AGENT_SESSION_ID["claude-static"]="next-session-old-id"
+  bridge_refresh_agent_session_id "claude-static" 2 0 "next-session-old-id"
+  printf "SESSION_ID=%s PERSISTED=%s" \
+    "${BRIDGE_AGENT_SESSION_ID["claude-static"]-}" \
+    "$(bridge_agent_persisted_session_id "claude-static")"
+')"
+assert_contains "$CLAUDE_NEXT_REFRESH_OUTPUT" "SESSION_ID=next-session-new-id"
+assert_contains "$CLAUDE_NEXT_REFRESH_OUTPUT" "PERSISTED=next-session-new-id"
 CLAUDE_REALPATH_LAUNCH_OUTPUT="$(HOME="$FAKE_CLAUDE_REALPATH_HOME" "$BASH4_BIN" -c '
   source "'"$REPO_ROOT"'/bridge-lib.sh"
   bridge_load_roster

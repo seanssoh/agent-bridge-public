@@ -129,6 +129,124 @@ fi
 current_user="$(id -un 2>/dev/null || echo '')"
 current_uid="$(id -u 2>/dev/null || echo '')"
 
+# Lift target_home computation above the isolation exec branches so the
+# reconcile helper below can use it for transcripts-root resolution. The
+# existing isolation `if` block (further down) re-checks the same condition
+# and consumes the same value — keeping both in sync requires only this one
+# assignment.
+target_home=""
+if [[ "$isolation_mode" == "linux-user" \
+      && -n "$os_user" \
+      && -n "$current_user" \
+      && "$os_user" != "$current_user" \
+      && "$current_uid" != "0" ]]; then
+  target_home="${BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT:-/home}/$os_user"
+fi
+
+# ----- cron-side jsonl reconcile (#390 PR-3) -----
+#
+# Before invoking the Python harvester, merge the agent's most recent session
+# jsonl into its daily note via scripts/daily-note-reconcile.py (#390 PR-1).
+# The harvester aggregates daily notes; reconcile is what populates them in
+# the first place from the agent's running session. Without this step the
+# cron path is jsonl-blind — only the Stop hook (#390 PR-2) reconciles, and
+# only when the operator actually ends a session in time.
+#
+# The cron child has no session context, so we resolve the most recent
+# session_id via `bridge-memory.py current-session-id` (the same convention
+# used by hooks/session-stop.py and the wrap-up.md slash command). When
+# resolution fails (no session, isolated UID without ACL, jsonl missing),
+# we log to stderr and continue with the harvest — reconcile is best-effort
+# and must NOT block the cron job's primary work.
+reconcile_jsonl_for_cron() {
+  local agent="$1"
+  local workdir="$2"
+
+  local reconcile_script="$BRIDGE_HOME/scripts/daily-note-reconcile.py"
+  if [[ ! -f "$reconcile_script" ]]; then
+    # Older install without PR-1 — silently skip.
+    return 0
+  fi
+
+  # Discover session-id. cmd_current_session_id treats --home as the session
+  # workdir (per its docstring + wrap-up.md convention) — pass the agent's
+  # session cwd, not the bridge profile home. Honor PR #426 Track C
+  # transcripts-home for isolated UIDs. Failure → empty stdout → skip.
+  local session_id=""
+  if [[ -n "$target_home" ]]; then
+    session_id="$("$BRIDGE_PYTHON" "$BRIDGE_HOME/bridge-memory.py" \
+      current-session-id \
+      --agent "$agent" \
+      --home "$workdir" \
+      --transcripts-home "$target_home" 2>/dev/null || true)"
+  else
+    session_id="$("$BRIDGE_PYTHON" "$BRIDGE_HOME/bridge-memory.py" \
+      current-session-id \
+      --agent "$agent" \
+      --home "$workdir" 2>/dev/null || true)"
+  fi
+  # Defensive: trim accidental trailing newline if multiple lines were emitted.
+  session_id="${session_id%%$'\n'*}"
+
+  if [[ -z "$session_id" ]]; then
+    printf '[memory-daily-harvest] no current session for agent=%s; skipping reconcile\n' \
+      "$agent" >&2
+    return 0
+  fi
+
+  # Compose jsonl path with the same slug convention as
+  # bridge-memory.cmd_current_session_id (line ~2409): replace BOTH `/` and
+  # `.` in the workdir with `-`. The leading slash becomes a leading `-` and
+  # MUST be preserved — Anthropic's ~/.claude/projects/ slug starts with `-`
+  # for absolute paths.
+  local transcripts_root
+  if [[ -n "$target_home" && -d "$target_home/.claude/projects" ]]; then
+    transcripts_root="$target_home/.claude/projects"
+  else
+    transcripts_root="$HOME/.claude/projects"
+  fi
+
+  # Resolve $workdir to its canonical absolute path before slugging. Mirrors
+  # bridge-memory.py:cmd_current_session_id which does Path(home).resolve()
+  # before the str.replace transform. Without this, a symlinked or relative
+  # workdir produces a slug that doesn't match the python helper's output,
+  # and the jsonl path lookup misses (codex r1 PR #451 item 2).
+  local resolved_workdir
+  resolved_workdir="$("$BRIDGE_PYTHON" -c '
+import os.path, sys
+print(os.path.realpath(sys.argv[1]))
+' "$workdir" 2>/dev/null || true)"
+  [[ -n "$resolved_workdir" ]] || resolved_workdir="$workdir"
+
+  local slug
+  slug="$(printf '%s' "$resolved_workdir" | sed 's:/:-:g; s:\.:-:g')"
+  local jsonl="$transcripts_root/$slug/$session_id.jsonl"
+
+  if [[ ! -f "$jsonl" ]]; then
+    printf '[memory-daily-harvest] jsonl not found at %s; skipping reconcile\n' \
+      "$jsonl" >&2
+    return 0
+  fi
+
+  # Invoke reconcile. Best-effort — log on failure, continue.
+  # Capture the exit code in a `set -e`-safe form: `|| rc=$?` keeps the
+  # actual reconcile rc (a bare `if ! ... ; then rc=$?` would observe `$?`
+  # AFTER the test inversion and always read 0).
+  local rc=0
+  "$BRIDGE_PYTHON" "$reconcile_script" \
+    --agent "$agent" --jsonl "$jsonl" >/dev/null 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    printf '[memory-daily-harvest] reconcile failed (rc=%d) for agent=%s; continuing\n' \
+      "$rc" "$agent" >&2
+  fi
+  return 0
+}
+
+# Run reconcile before either harvest exec branch. Both branches (isolated
+# linux-user vs same-user) ultimately exec the harvester, and both need
+# the agent's daily note populated from the latest session jsonl first.
+reconcile_jsonl_for_cron "$AGENT" "$workdir"
+
 # linux-user isolation (issue #219 v1.3 design): Python harvester always runs
 # as the controller UID so queue DB reads (task_events), dedupe lookups
 # (_task_status), and backfill writes (bridge-task.sh create) remain in the
@@ -144,7 +262,6 @@ if [[ "$isolation_mode" == "linux-user" \
       && -n "$current_user" \
       && "$os_user" != "$current_user" \
       && "$current_uid" != "0" ]]; then
-  target_home="${BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT:-/home}/$os_user"
   transcripts_dir="$target_home/.claude/projects"
   if [[ -r "$transcripts_dir" && -x "$transcripts_dir" ]]; then
     exec "$BRIDGE_PYTHON" "$BRIDGE_HOME/bridge-memory.py" harvest-daily \
