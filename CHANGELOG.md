@@ -6,6 +6,68 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.31] — 2026-04-28
+
+### Hotfix — isolated agent queue CLI gateway proxy detection
+
+`v0.6.31` is a single-PR hotfix to v0.6.30 covering a v0.6.28-rooted regression
+that blocked isolated agents from using their queue CLI:
+
+- **`fix(roster): isolated agent queue CLI gateway proxy detection`**
+  (#436, PR #439). On v0.6.28 with linux-user isolation, the queue CLI
+  commands (`agb inbox`, `agb show`, `agb claim`, `agb done`) raised a
+  Python traceback or surfaced `Permission denied` on a peer agent's
+  history `.env` file when run from inside the isolated agent's Claude
+  REPL. Two related bugs in `bridge_load_roster`:
+
+  1. **Missing env export**. When `bridge_load_roster` discovered the
+     per-agent scoped `agent-env.sh` via the `BRIDGE_AGENT_ID +
+     BRIDGE_ACTIVE_AGENT_DIR` fallback (the path designed to keep
+     isolated UIDs off the 0600 global `agent-roster.local.sh`), it
+     sourced the file but did NOT export `BRIDGE_AGENT_ENV_FILE`.
+     The downstream `bridge_queue_gateway_proxy_agent` check at
+     `lib/bridge-core.sh:375` requires that env var, saw it empty,
+     returned 1, and `bridge_queue_cli` fell through to direct
+     `bridge-queue.py` against `BRIDGE_TASK_DB=/dev/null` — SQLite
+     open failed and the process exited with a traceback at the
+     outer `sys.exit(main())` entry.
+  2. **Peer history hydration in scoped roster load**. After sourcing
+     the scoped env, the function still called
+     `bridge_load_static_histories` and
+     `bridge_restore_dynamic_agents_from_history`, which iterate every
+     peer agent's history `.env` under `$BRIDGE_HISTORY_DIR`. Isolated
+     UIDs cannot read peer files (correct ACL), so `source $file`
+     failed loudly with `Permission denied`.
+
+  Fix: after the scoped-env fallback discovery, `export
+  BRIDGE_AGENT_ENV_FILE` so downstream gateway-proxy detection works.
+  Gate `bridge_load_static_histories` +
+  `bridge_restore_dynamic_agents_from_history` on `isolated_env_file`
+  being empty — the scoped env already carries self + sanitized peer
+  metadata, so peer history hydration is unnecessary and unsafe under
+  isolation. `bridge_reconcile_dynamic_agents_from_tmux` is not gated
+  (it self-guards on tmux availability).
+
+  `tests/isolation-peer-routing.sh` extended with three cases: scoped
+  env fallback exports the env-file path, scoped env active skips
+  unreadable peer history (chmod 000 fixture), inverse legacy
+  controller path still hydrates peer history (sentinel asserted).
+
+### v0.6.31 upgrade / migration notes
+
+#### Auto
+
+- v0.6.30 → v0.6.31 binary upgrade is straightforward — no schema
+  changes. `agent-bridge upgrade --apply` propagates the fix.
+- The fix takes effect on the next `bridge_load_roster` invocation
+  (i.e., next `agb` / `bridge-cli` call by an isolated agent). No
+  per-agent state migration required.
+
+#### Operator-required
+
+- **None for upgrades from v0.6.30**. Isolated agents that previously
+  could not use their queue CLI start working immediately.
+
 ## [0.6.30] — 2026-04-28
 
 ### Hotfix release — security + isolation regression
