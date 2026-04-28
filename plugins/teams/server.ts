@@ -357,11 +357,14 @@ function appendMessage(message: StoredMessage): void {
 function sanitizeMessageId(raw: string): string {
   // Teams message ids are typically guid-like, numeric, or "<guid>:<num>".
   // Strict allowlist prevents path-traversal via attacker-controlled activity.id.
+  // Dot is intentionally NOT allowed — even with the literal ".." check below,
+  // single dots could let an attacker craft segments that the filesystem
+  // resolves into traversal under some path normalization (codex r2 PR #443).
+  // Real Teams message ids in the wild are alphanumeric/colon/dash/underscore;
+  // the rare dotted format would safely fail-closed (download_status=failed).
   if (!raw || typeof raw !== 'string') return ''
   if (raw.length > 256) return ''
-  if (!/^[A-Za-z0-9_:.\-]+$/.test(raw)) return ''
-  // Defensive: any literal ".." segment is rejected even if the regex matches.
-  if (raw.includes('..')) return ''
+  if (!/^[A-Za-z0-9_:\-]+$/.test(raw)) return ''
   return raw
 }
 
