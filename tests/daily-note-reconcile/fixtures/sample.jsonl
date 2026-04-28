@@ -1,0 +1,10 @@
+{"type":"worktree-state","sessionId":"sess-fixture-A","worktreeSession":"x"}
+{"type":"user","sessionId":"sess-fixture-A","timestamp":"2026-04-01T01:00:00.000Z","message":{"role":"user","content":"<local-command-stdout>noise</local-command-stdout>"}}
+{"type":"user","sessionId":"sess-fixture-A","timestamp":"2026-04-01T01:01:00.000Z","message":{"role":"user","content":"안녕, 오늘 작업 시작합시다."}}
+{"type":"assistant","sessionId":"sess-fixture-A","timestamp":"2026-04-01T01:02:00.000Z","message":{"role":"assistant","content":[{"type":"thinking","text":"hidden chain of thought"},{"type":"text","text":"네, Phase 0 부터 시작하겠습니다."}]}}
+{"type":"assistant","sessionId":"sess-fixture-A","timestamp":"2026-04-01T01:03:00.000Z","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"user","sessionId":"sess-fixture-A","timestamp":"2026-04-01T01:03:30.000Z","message":{"role":"user","content":[{"type":"tool_result","content":"file1\nfile2\n"}]}}
+{"type":"user","sessionId":"sess-fixture-A","timestamp":"2026-03-31T23:50:00.000Z","message":{"role":"user","content":"이건 어제 메시지"}}
+{"type":"user","sessionId":"sess-fixture-A","timestamp":"2026-04-01T02:00:00.000Z","message":{"role":"user","content":"<system-reminder>scaffolding wrapper</system-reminder>"}}
+not a json line at all
+{"type":"assistant","sessionId":"sess-fixture-A","timestamp":"2026-04-01T02:30:00.000Z","message":{"role":"assistant","content":[{"type":"text","text":"완료. 결과 요약은 다음과 같습니다."}]}}
