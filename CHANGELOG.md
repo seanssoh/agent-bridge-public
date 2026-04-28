@@ -6,6 +6,119 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.34] — 2026-04-28
+
+### Highlight — memory pipeline rewiring (#390 PR-1/2/3)
+
+`v0.6.34` ships 3 of the 4 #390 memory-pipeline rewiring PRs that close the
+gaps where always-on agents' daily JSONL conversations weren't reaching wiki/
+memory. PR-4 (PreCompact threshold tuning) is operator-policy and stays a
+follow-up.
+
+The release also includes `static agent restart recovery hardening` (#447),
+`dev plugin cache source-overlay fix`, and the previously-shipped
+`v0.6.30 isolated-agent residuals hotfix series` continuation.
+
+### Memory pipeline (#390 PR-1/2/3)
+
+- **`feat(memory-pipeline): daily-note-reconcile.py`** (PR #449, #390 PR-1).
+  Ships the dependency for the rest of the rewiring sequence — a thin
+  idempotent script that merges a Claude session jsonl into the agent's
+  daily note. Per-turn sha1 fingerprints stored inside the existing
+  `bridge-daily-meta` JSON envelope under `reconciled_fingerprints`. CLI
+  exposes `--agent <id> --jsonl <path> [--date YYYY-MM-DD] [--dry-run]
+  [--memory-dir <path>] [--transcripts-home <path>] [--json]`. fcntl.flock
+  on a sentinel file spans read/modify/write so concurrent invocations
+  (cron + Stop hook) don't lose updates. Path traversal sanitization on
+  `--agent` (allowlist `[A-Za-z0-9_-]+`) and `--memory-dir` (must resolve
+  within `BRIDGE_HOME`). Manifest recovery from body when the meta-block
+  manifest is missing/corrupt — re-fingerprints existing turn blocks
+  before treating them as new (prevents duplicate-on-first-run-after-
+  manifest-loss).
+- **`feat(memory-pipeline): Stop hook → daily-note-reconcile`** (PR #450,
+  #390 PR-2). Adds `hooks/session-stop.py` that invokes the reconcile
+  script when a Claude session ends. Primary jsonl source is the Stop
+  event stdin's `transcript_path` (canonical — Claude Code passes the
+  exact jsonl path it just wrote, mirroring `surface-reply-enforce.py`);
+  fallback chain via `bridge-memory.py current-session-id` + workdir
+  slug derivation, honoring `BRIDGE_TRANSCRIPTS_HOME` and
+  `CLAUDE_PROJECT_DIR`. Hook always exits 0 — Stop hooks must not break
+  the operator's session. Registered alongside `surface-reply-enforce`
+  in `agents/_template/.claude/settings.json`'s `Stop` array, timeout 35.
+  `_bridge_home()` returns `Optional[Path]` — when `BRIDGE_HOME` is unset
+  AND the script-parent.parent fallback isn't a recognizable bridge
+  home (no `scripts/`+`agents/` siblings), the hook fast-paths return 0
+  without invoking reconcile from an unexpected location.
+- **`feat(memory-pipeline): cron-side jsonl reconcile in harvester`**
+  (PR #451, #390 PR-3). Modifies `scripts/memory-daily-harvest.sh` to
+  invoke `daily-note-reconcile.py` BEFORE the existing
+  `exec bridge-memory.py harvest-daily ...` calls. Single insertion
+  point covers all operator cron jobs — no per-job payload migration
+  needed. Session-id resolved via `bridge-memory.py current-session-id`
+  with `--home <workdir>` (matching `wrap-up.md` convention). Workdir
+  is realpath-resolved before slug derivation so symlinked or relative
+  workdirs match what the Python helper computes (slug transform:
+  `s:/:-:g; s:\.:-:g`). Reconcile failures are best-effort: logged to
+  stderr, never block the harvest.
+
+### Static agent restart recovery (#447, PR #448)
+
+- **stale env scrub**: `bridge-lib.sh` scrubs missing-root `/tmp/tmp.*`
+  / `/var/tmp/tmp.*` / `/private/tmp/tmp.*` / `$TMPDIR/tmp.*` controller
+  `BRIDGE_*` paths before defaults resolve. Composes with v0.6.32's
+  PR #442 stale-tmp guard. Opt-in escape hatch:
+  `BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1` keeps intentional smoke
+  fixtures working.
+- **NEXT-SESSION.md archive**: delivered handoffs move to
+  `archive/NEXT-SESSION.<stamp>.<digest>.md` instead of being deleted.
+  UserPromptSubmit hook reinforces active handoffs while
+  `NEXT-SESSION.md` exists, reusing the existing digest marker +
+  idempotent handoff queue path.
+- **forced session-id refresh**: fresh NEXT-SESSION Claude restart
+  excludes the previous session id from `bridge_refresh_agent_session_id`'s
+  detection so the persisted state actually rotates.
+- **`false` token recovery**: when a static Claude launch command was
+  corrupted to start with `false` (a previous-session debugging token
+  that survived a restart), the recovery rewrites that exact first
+  token to the constant `claude` while preserving env-assignment
+  prefixes and channel/plugin args. Uses `shlex.split` + re-quoting so
+  shell metacharacters in env values don't bleed into the rebuilt
+  command.
+
+### Dev plugin cache (PR #446, internal task #391)
+
+- **dev plugin source dependency link**: `bridge-dev-plugin-cache.py`
+  now overlays source code (`server.ts`, `package.json`, etc.) into
+  the cache version dir while preserving the cache's installed
+  `node_modules` directory. Source `node_modules` symlinks to cache's
+  `node_modules` so isolated agents resolve dependencies through the
+  cache without bypassing the per-agent ACL boundary. Orphan markers
+  from previous syncs are cleaned up. Idempotent on re-run.
+
+### v0.6.34 upgrade / migration notes
+
+#### Auto
+
+- v0.6.33 → v0.6.34 binary upgrade is straightforward — no schema
+  changes. `agent-bridge upgrade --apply` propagates all four PR groups.
+- Memory pipeline activates immediately on next session-stop (PR-2)
+  and next memory-daily cron tick (PR-3). The new
+  `daily-note-reconcile.py` (PR-1) is the dependency both paths call.
+- Stale-env scrub (PR #448 Fix 1) runs on next bridge command after
+  upgrade.
+
+#### Operator-required
+
+- **None for upgrades from v0.6.33**.
+- **For installs that observed measured capture-0 in the memory
+  pipeline**: PR-1/2/3 close the 3 of 4 gaps documented in #390. Gap 4
+  (PreCompact auto-compact threshold default at 83.5% rarely
+  triggering) remains a follow-up — operators wanting a lower threshold
+  can set `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=<lower>` per the operator
+  policy guidance (this is a knob, not a code change).
+- **For installs with corrupted static-agent launch commands** starting
+  with `false`: the recovery (PR #448 Fix 4) activates on next restart.
+
 ## [0.6.33] — 2026-04-28
 
 ### Teams plugin — inbound attachment capture
