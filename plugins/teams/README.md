@@ -74,9 +74,11 @@ When a Teams user attaches a file or image, the plugin downloads each attachment
 Override the location and size cap via:
 
 ```dotenv
-TEAMS_ATTACHMENTS_DIR=<absolute path>
-TEAMS_ATTACHMENT_MAX_BYTES=52428800   # default: 50 MB
+TEAMS_ATTACHMENTS_DIR=<absolute path>     # must be absolute and writable; otherwise default is used
+TEAMS_ATTACHMENT_MAX_BYTES=52428800       # default: 50 MB; clamped to 1 GB; non-numeric falls back to default
 ```
+
+Filenames and message ids are sanitized (strict allowlist) before they're joined into the on-disk path; downloads stream to disk with an in-flight byte counter so a server lying about `Content-Length` cannot bypass the cap.
 
 Outbound attachments (sending files from the bot to Teams) are not yet implemented; track that work separately.
 

@@ -19,16 +19,19 @@ import { createServer } from 'http'
 import { randomUUID } from 'crypto'
 import { spawnSync } from 'child_process'
 import {
+  accessSync,
   appendFileSync,
   chmodSync,
+  constants as fsConstants,
   existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
+import { isAbsolute as pathIsAbsolute, join, resolve as pathResolve } from 'path'
 import { createRecentMessageDeduper } from './dedupe.ts'
 
 type GroupPolicy = {
@@ -80,8 +83,52 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 const REFERENCES_FILE = join(STATE_DIR, 'conversations.json')
 const MESSAGES_FILE = join(STATE_DIR, 'messages.jsonl')
-const ATTACHMENTS_DIR = process.env.TEAMS_ATTACHMENTS_DIR ?? join(STATE_DIR, 'attachments')
-const ATTACHMENT_MAX_BYTES = Number(process.env.TEAMS_ATTACHMENT_MAX_BYTES ?? '52428800')
+function resolveAttachmentsDir(): string {
+  const override = process.env.TEAMS_ATTACHMENTS_DIR
+  if (override) {
+    if (!pathIsAbsolute(override)) {
+      process.stderr.write(
+        `teams channel: TEAMS_ATTACHMENTS_DIR not absolute, falling back to default\n`,
+      )
+    } else {
+      try {
+        accessSync(override, fsConstants.W_OK)
+        return override
+      } catch {
+        // Don't echo override path on failure to avoid leaking attacker-supplied
+        // env bytes into logs.
+        process.stderr.write(
+          `teams channel: TEAMS_ATTACHMENTS_DIR not writable, falling back to default\n`,
+        )
+      }
+    }
+  }
+  return pathResolve(STATE_DIR, 'attachments')
+}
+
+function resolveAttachmentMaxBytes(): number {
+  const DEFAULT_MAX = 50 * 1024 * 1024 // 50 MB
+  const CEILING = 1024 * 1024 * 1024 // 1 GB sanity ceiling
+  const raw = process.env.TEAMS_ATTACHMENT_MAX_BYTES
+  if (!raw) return DEFAULT_MAX
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) {
+    process.stderr.write(
+      `teams channel: TEAMS_ATTACHMENT_MAX_BYTES invalid, using default ${DEFAULT_MAX}\n`,
+    )
+    return DEFAULT_MAX
+  }
+  if (n > CEILING) {
+    process.stderr.write(
+      `teams channel: TEAMS_ATTACHMENT_MAX_BYTES exceeds ceiling ${CEILING}, using ceiling\n`,
+    )
+    return CEILING
+  }
+  return Math.floor(n)
+}
+
+const ATTACHMENTS_DIR = resolveAttachmentsDir()
+const ATTACHMENT_MAX_BYTES = resolveAttachmentMaxBytes()
 const TEAMS_FILE_DOWNLOAD_TYPE = 'application/vnd.microsoft.teams.file.download.info'
 const MS365_CALLBACK_DIR =
   process.env.MS365_CALLBACK_SHARED_DIR ?? join(BRIDGE_HOME, 'shared', 'ms365-callbacks')
@@ -307,21 +354,73 @@ function appendMessage(message: StoredMessage): void {
   appendFileSync(MESSAGES_FILE, JSON.stringify(message) + '\n', { mode: 0o600 })
 }
 
-function sanitizeFilename(name: string): string {
-  const trimmed = name.replace(/[\/\\\0]/g, '_').trim()
-  return (trimmed || 'attachment').slice(0, 200)
+function sanitizeMessageId(raw: string): string {
+  // Teams message ids are typically guid-like, numeric, or "<guid>:<num>".
+  // Strict allowlist prevents path-traversal via attacker-controlled activity.id.
+  if (!raw || typeof raw !== 'string') return ''
+  if (raw.length > 256) return ''
+  if (!/^[A-Za-z0-9_:.\-]+$/.test(raw)) return ''
+  // Defensive: any literal ".." segment is rejected even if the regex matches.
+  if (raw.includes('..')) return ''
+  return raw
 }
 
-async function fetchAttachmentBytes(url: string, maxBytes: number): Promise<Buffer> {
-  const res = await fetch(url)
-  if (!res.ok) throw new Error(`HTTP ${res.status}`)
-  const declared = Number(res.headers.get('content-length') ?? '0')
-  if (Number.isFinite(declared) && declared > maxBytes) {
-    throw new Error('size_limit')
+function sanitizeFilename(name: string): string {
+  if (!name || typeof name !== 'string') return ''
+  // Strip path-traversal segments and separators first.
+  let clean = name.replace(/\.\./g, '_').replace(/[\\/]/g, '_')
+  // Strip control chars + DEL + null bytes.
+  // eslint-disable-next-line no-control-regex
+  clean = clean.replace(/[\x00-\x1f\x7f]/g, '')
+  // Strip leading/trailing dots and whitespace.
+  clean = clean.replace(/^[.\s]+|[.\s]+$/g, '')
+  // Allowlist: alphanumerics, dot, dash, underscore, space.
+  clean = clean.replace(/[^A-Za-z0-9._\- ]/g, '_')
+  if (clean.length === 0 || clean.length > 255) return ''
+  return clean
+}
+
+async function streamDownload(
+  url: string,
+  destPath: string,
+  maxBytes: number,
+): Promise<{ ok: true; size: number } | { ok: false; error: string }> {
+  const resp = await fetch(url)
+  if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` }
+  const cl = resp.headers.get('content-length')
+  if (cl !== null) {
+    const declared = Number(cl)
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      return { ok: false, error: 'size_limit' }
+    }
   }
-  const buf = Buffer.from(await res.arrayBuffer())
-  if (buf.length > maxBytes) throw new Error('size_limit')
-  return buf
+  if (!resp.body) return { ok: false, error: 'no response body' }
+
+  let total = 0
+  // Pre-create the file with restrictive mode so the writer inherits 0600.
+  writeFileSync(destPath, '', { mode: 0o600 })
+  const writer = Bun.file(destPath).writer()
+  const reader = resp.body.getReader()
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      if (!value) continue
+      total += value.byteLength
+      if (total > maxBytes) {
+        try { await writer.end() } catch {}
+        try { unlinkSync(destPath) } catch {}
+        return { ok: false, error: 'size_limit' }
+      }
+      writer.write(value)
+    }
+    await writer.end()
+    return { ok: true, size: total }
+  } catch (err) {
+    try { await writer.end() } catch {}
+    try { unlinkSync(destPath) } catch {}
+    return { ok: false, error: String((err as Error)?.message ?? err) }
+  }
 }
 
 async function downloadAttachments(
@@ -330,6 +429,7 @@ async function downloadAttachments(
 ): Promise<StoredAttachment[]> {
   const items = Array.isArray(activity.attachments) ? activity.attachments : []
   if (items.length === 0) return []
+  const safeMessageId = sanitizeMessageId(messageId)
   const results: StoredAttachment[] = []
   for (let i = 0; i < items.length; i++) {
     const att = items[i]
@@ -355,15 +455,32 @@ async function downloadAttachments(
       continue
     }
     stored.download_url = downloadUrl
+    if (!safeMessageId) {
+      stored.download_status = 'failed'
+      stored.download_error = 'rejected message id'
+      results.push(stored)
+      continue
+    }
+    const safeName = sanitizeFilename(name)
+    if (!safeName) {
+      stored.download_status = 'failed'
+      stored.download_error = 'rejected filename'
+      results.push(stored)
+      continue
+    }
     try {
-      const bytes = await fetchAttachmentBytes(downloadUrl, ATTACHMENT_MAX_BYTES)
-      const dir = join(ATTACHMENTS_DIR, messageId)
+      const dir = join(ATTACHMENTS_DIR, safeMessageId)
       mkdirSync(dir, { recursive: true, mode: 0o700 })
-      const localPath = join(dir, sanitizeFilename(name))
-      writeFileSync(localPath, bytes, { mode: 0o600 })
-      stored.local_path = localPath
-      stored.size_bytes = bytes.length
-      stored.download_status = 'ok'
+      const localPath = join(dir, safeName)
+      const dl = await streamDownload(downloadUrl, localPath, ATTACHMENT_MAX_BYTES)
+      if (dl.ok) {
+        stored.local_path = localPath
+        stored.size_bytes = dl.size
+        stored.download_status = 'ok'
+      } else {
+        stored.download_status = 'failed'
+        stored.download_error = dl.error.slice(0, 200)
+      }
     } catch (err) {
       stored.download_status = 'failed'
       stored.download_error = String((err as Error)?.message ?? err).slice(0, 200)
