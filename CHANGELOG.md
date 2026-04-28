@@ -6,6 +6,64 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.33] — 2026-04-28
+
+### Teams plugin — inbound attachment capture
+
+`v0.6.33` ships a single feature for the Teams channel plugin:
+
+- **`feat(teams): capture and download inbound attachments`** (PR #443).
+  Before this release, the Teams plugin (`plugins/teams/server.ts`)
+  dropped `activity.attachments` and forwarded only the text body —
+  inbound PDFs, Excel files, and images never reached the agent. v0.6.33
+  adds a `StoredAttachment` typing and a `downloadAttachments()` helper
+  that downloads file-consent attachments and inline images via
+  anonymous GET to a per-message attachment directory.
+
+  - **Path**: `<TEAMS_STATE_DIR>/attachments/<message_id>/<filename>`
+    (dir 0700, file 0600).
+  - **Cap**: `TEAMS_ATTACHMENT_MAX_BYTES` env (default 50 MB). Both
+    pre-flight `Content-Length` check and in-flight byte counter abort
+    when the cap is exceeded.
+  - **Streaming**: download chunks via the response body reader (Bun
+    `Response.body`); large files never fully buffer in memory.
+  - **Sanitization**: strict allowlists for both `messageId`
+    (`[A-Za-z0-9_:\-]+`) and filename (control chars, `..` segments,
+    shell metachars all defanged). Path traversal attempts fail
+    closed with `download_status=failed`.
+  - **Env validation**: `TEAMS_ATTACHMENTS_DIR` requires absolute path
+    + writable; `TEAMS_ATTACHMENT_MAX_BYTES` bounds-checked
+    (`>0`, `<= 1 GB` ceiling). Invalid values fall back to defaults
+    with a warning instead of crashing.
+  - **Metadata persisted**: per-attachment `name`, `content_type`,
+    `download_status` (`ok` / `skipped_non_file` / `failed`),
+    `local_path`, `size_bytes`, `download_error` — written to both
+    the `StoredMessage` log and the `notifications/claude/channel`
+    meta passed to the agent.
+  - **Cards / non-file attachments**: marked
+    `download_status=skipped_non_file` so the agent still observes
+    their metadata without a download attempt.
+
+  Outbound attachments and bot-token fallback for download URLs that
+  require auth are intentionally NOT in this release — see PR #443
+  for the follow-up plan.
+
+### v0.6.33 upgrade / migration notes
+
+#### Auto
+
+- v0.6.32 → v0.6.33 binary upgrade is straightforward — no schema
+  changes. `agent-bridge upgrade --apply` propagates the change.
+- New env vars (`TEAMS_ATTACHMENTS_DIR`, `TEAMS_ATTACHMENT_MAX_BYTES`)
+  are optional; defaults work for all existing Teams installs.
+
+#### Operator-required
+
+- **None for upgrades from v0.6.32**. Teams plugin starts capturing
+  inbound attachments on next plugin restart. To customize the cap
+  or storage location, set `TEAMS_ATTACHMENT_MAX_BYTES` /
+  `TEAMS_ATTACHMENTS_DIR` in the operator's plugin env.
+
 ## [0.6.32] — 2026-04-28
 
 ### Hotfix — v0.6.30 isolated-agent residuals (5 fixes)
