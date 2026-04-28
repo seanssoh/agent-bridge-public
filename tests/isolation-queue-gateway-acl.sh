@@ -40,6 +40,7 @@ command -v userdel >/dev/null 2>&1 || skip "userdel required"
 
 # Sandbox under a temp BRIDGE_HOME so we never touch a live install.
 TMP_ROOT="$(mktemp -d -t isolate-acl-test.XXXXXX)"
+export BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1
 SAFE_TMP_PREFIX=""
 for _candidate in "${TMPDIR%/}" "/tmp" "/var/tmp"; do
   [[ -n "$_candidate" ]] || continue

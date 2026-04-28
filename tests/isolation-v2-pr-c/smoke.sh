@@ -71,6 +71,7 @@ command -v python3 >/dev/null 2>&1 || skip "python3 missing"
 TMP_ROOT="$(mktemp -d -t isolation-v2-pr-c.XXXXXX)"
 trap 'rm -rf "$TMP_ROOT" >/dev/null 2>&1 || true' EXIT
 export TMPDIR="${TMPDIR:-/tmp}"
+export BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1
 
 # ---------------------------------------------------------------------------
 # Fixture: build a minimal BRIDGE_HOME + v2 data root for the resolver
