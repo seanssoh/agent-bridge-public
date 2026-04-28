@@ -22,6 +22,15 @@
             "timeout": 5
           }
         ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 ~/.agent-bridge/hooks/session-stop.py",
+            "timeout": 35
+          }
+        ]
       }
     ]
   }
