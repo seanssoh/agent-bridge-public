@@ -42,6 +42,7 @@ fi
 
 TMP_ROOT="$(mktemp -d -t peer-routing-test.XXXXXX)"
 trap 'rm -rf "$TMP_ROOT" >/dev/null 2>&1 || true' EXIT
+export BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1
 
 export BRIDGE_HOME="$TMP_ROOT/bridge-home"
 export BRIDGE_AGENT_HOME_ROOT="$BRIDGE_HOME/agents"

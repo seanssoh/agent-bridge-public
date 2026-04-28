@@ -817,9 +817,8 @@ bridge_linux_grant_claude_credentials_access() {
     # No directory `r-x` (would let the isolated UID list ~/.claude/),
     # no default ACL on ~/.claude/ (would extend grants to every new
     # inode under there). Re-auth's atomic-rename produces a new inode
-    # without an inherited ACL — operator must re-run
-    # `agent-bridge isolate <agent>` after each Claude re-auth, which
-    # is the documented C1 contract until PR-F's per-agent claude login.
+    # without an inherited ACL, so start/daemon preflights call this helper
+    # again and explicitly restore both the named-user grant and ACL mask.
     _bridge_linux_grant_traverse_chain_unguarded "$os_user" "$controller_claude_dir" "$controller_home"
     # PR-E r2 P1#3 fix: load-bearing setfacl call must fail-loud. The
     # `|| true` of the prior version masked filesystem-ACL-disabled
@@ -830,10 +829,13 @@ bridge_linux_grant_claude_credentials_access() {
     # that retains a named-user ACL (KNOWN_ISSUES.md §16).
     bridge_linux_sudo_root setfacl -m "u:${os_user}:r--" "$controller_cred_file" \
       || bridge_die "claude cred ACL: setfacl r-- on $controller_cred_file failed (v2+claude requires functional ACLs on this surface; see KNOWN_ISSUES.md §16)"
+    bridge_linux_sudo_root setfacl -m "m::r--" "$controller_cred_file" \
+      || bridge_die "claude cred ACL: setfacl mask r-- on $controller_cred_file failed (v2+claude requires the ACL mask to preserve the isolated UID read grant)"
   else
     bridge_linux_grant_traverse_chain "$os_user" "$controller_claude_dir" "$controller_home"
     bridge_linux_acl_add "u:${os_user}:r-x" "$controller_claude_dir" >/dev/null 2>&1 || true
     bridge_linux_acl_add "u:${os_user}:r--" "$controller_cred_file" >/dev/null 2>&1 || true
+    bridge_linux_sudo_root setfacl -m "m::r--" "$controller_cred_file" >/dev/null 2>&1 || true
     bridge_linux_sudo_root setfacl -d -m "u:${os_user}:r--" "$controller_claude_dir" >/dev/null 2>&1 || true
   fi
 
@@ -848,6 +850,28 @@ bridge_linux_grant_claude_credentials_access() {
   fi
   bridge_linux_sudo_root ln -s "$controller_cred_file" "$isolated_cred_link"
   bridge_linux_sudo_root chown -h "$os_user" "$isolated_cred_link" >/dev/null 2>&1 || true
+}
+
+bridge_linux_repair_claude_credentials_access() {
+  local agent="$1"
+  local os_user=""
+  local user_home=""
+  local controller_user=""
+  local engine=""
+
+  [[ "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]] || return 0
+  bridge_agent_linux_user_isolation_effective "$agent" || return 0
+  engine="$(bridge_agent_engine "$agent")"
+  [[ "$engine" == "claude" ]] || return 0
+
+  os_user="$(bridge_agent_os_user "$agent")"
+  [[ -n "$os_user" ]] || return 0
+  user_home="$(getent passwd "$os_user" 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$user_home" ]] || return 0
+  controller_user="$(bridge_current_user)"
+  [[ -n "$controller_user" ]] || return 0
+
+  bridge_linux_grant_claude_credentials_access "$os_user" "$user_home" "$controller_user" "$engine"
 }
 
 bridge_linux_acl_add_recursive() {
@@ -2119,6 +2143,81 @@ bridge_linux_unshare_plugin_catalog() {
   fi
 }
 
+bridge_tmp_ephemeral_path_is() {
+  local path="${1:-}"
+  local tmpdir="${TMPDIR:-}"
+
+  [[ -n "$path" ]] || return 1
+  case "$path" in
+    /tmp/tmp.*|/tmp/tmp.*/*|/var/tmp/tmp.*|/var/tmp/tmp.*/*|/private/tmp/tmp.*|/private/tmp/tmp.*/*)
+      return 0
+      ;;
+  esac
+  if [[ -n "$tmpdir" ]]; then
+    tmpdir="${tmpdir%/}"
+    case "$path" in
+      "$tmpdir"/tmp.*|"$tmpdir"/tmp.*/*)
+        return 0
+        ;;
+    esac
+  fi
+  return 1
+}
+
+bridge_reject_ephemeral_controller_env_for_agent_env() {
+  local name=""
+  local value=""
+  local -a path_vars=(
+    BRIDGE_HOME
+    BRIDGE_ROSTER_FILE
+    BRIDGE_ROSTER_LOCAL_FILE
+    BRIDGE_STATE_DIR
+    BRIDGE_LAYOUT_MARKER_DIR
+    BRIDGE_ACTIVE_AGENT_DIR
+    BRIDGE_HISTORY_DIR
+    BRIDGE_WORKTREE_META_DIR
+    BRIDGE_ACTIVE_ROSTER_TSV
+    BRIDGE_ACTIVE_ROSTER_MD
+    BRIDGE_DAEMON_PID_FILE
+    BRIDGE_DAEMON_LOG
+    BRIDGE_DAEMON_CRASH_LOG
+    BRIDGE_TASK_DB
+    BRIDGE_PROFILE_STATE_DIR
+    BRIDGE_CRON_STATE_DIR
+    BRIDGE_CRON_HOME_DIR
+    BRIDGE_WORKTREE_ROOT
+    BRIDGE_AGENT_HOME_ROOT
+    BRIDGE_RUNTIME_ROOT
+    BRIDGE_RUNTIME_SCRIPTS_DIR
+    BRIDGE_RUNTIME_SKILLS_DIR
+    BRIDGE_RUNTIME_SHARED_DIR
+    BRIDGE_RUNTIME_SHARED_TOOLS_DIR
+    BRIDGE_RUNTIME_SHARED_REFERENCES_DIR
+    BRIDGE_RUNTIME_MEMORY_DIR
+    BRIDGE_RUNTIME_CREDENTIALS_DIR
+    BRIDGE_RUNTIME_SECRETS_DIR
+    BRIDGE_RUNTIME_CONFIG_FILE
+    BRIDGE_HOOKS_DIR
+    BRIDGE_SHARED_DIR
+    BRIDGE_TASK_NOTE_DIR
+    BRIDGE_LOG_DIR
+    BRIDGE_DATA_ROOT
+    BRIDGE_SHARED_ROOT
+    BRIDGE_AGENT_ROOT_V2
+    BRIDGE_CONTROLLER_STATE_ROOT
+  )
+
+  [[ "${BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV:-0}" == "1" ]] && return 0
+
+  for name in "${path_vars[@]}"; do
+    value="${!name:-}"
+    [[ -n "$value" ]] || continue
+    if bridge_tmp_ephemeral_path_is "$value"; then
+      bridge_die "refusing to write isolated agent-env.sh from ephemeral controller path ${name}=${value}; unset stale BRIDGE_* variables before running isolate/start, or set BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1 for a deliberate temp test install"
+    fi
+  done
+}
+
 bridge_write_linux_agent_env_file() {
   local agent="$1"
   local file="${2:-$(bridge_agent_linux_env_file "$agent")}"
@@ -2169,6 +2268,8 @@ bridge_write_linux_agent_env_file() {
   admin_agent="$(bridge_admin_agent_id)"
   agent_log_dir="$(bridge_agent_log_dir "$agent")"
   agent_audit_log="$(bridge_agent_audit_log_file "$agent")"
+
+  bridge_reject_ephemeral_controller_env_for_agent_env
 
   mkdir -p "$(dirname "$file")"
   # Self-heal ownership: when an earlier isolate cycle chowned the file to the
@@ -2237,6 +2338,8 @@ BRIDGE_AUDIT_LOG=$(printf '%q' "$agent_audit_log")
 BRIDGE_ROSTER_FILE=""
 BRIDGE_ROSTER_LOCAL_FILE=""
 BRIDGE_ADMIN_AGENT_ID=$(printf '%q' "$admin_agent")
+BRIDGE_AGENT_ID=$(printf '%q' "$agent")
+export BRIDGE_AGENT_ID
 BRIDGE_AGENT_IDS=()
 declare -g -A BRIDGE_AGENT_DESC=()
 declare -g -A BRIDGE_AGENT_ENGINE=()

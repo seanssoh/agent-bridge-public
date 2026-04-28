@@ -133,12 +133,16 @@ def handle_request(path: Path, queue_script: Path) -> int:
         path.unlink(missing_ok=True)
         return 1
 
+    child_env = os.environ.copy()
+    child_env["BRIDGE_QUEUE_GATEWAY_SERVER"] = "1"
+    child_env.pop("BRIDGE_GATEWAY_PROXY", None)
+
     proc = subprocess.run(
         [sys.executable, str(queue_script), *argv],
         cwd=cwd,
         capture_output=True,
         text=True,
-        env=os.environ.copy(),
+        env=child_env,
         check=False,
     )
     response = {

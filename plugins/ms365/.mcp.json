@@ -2,7 +2,7 @@
   "mcpServers": {
     "ms365": {
       "command": "bun",
-      "args": ["--no-install", "${CLAUDE_PLUGIN_ROOT}/server.ts"]
+      "args": ["--cwd", "${CLAUDE_PLUGIN_ROOT}", "--no-install", "${CLAUDE_PLUGIN_ROOT}/server.ts"]
     }
   }
 }

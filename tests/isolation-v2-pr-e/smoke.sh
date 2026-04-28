@@ -31,6 +31,7 @@ command -v python3 >/dev/null 2>&1 || skip "python3 missing"
 TMP_ROOT="$(mktemp -d -t isolation-v2-pr-e.XXXXXX)"
 trap 'rm -rf "$TMP_ROOT" >/dev/null 2>&1 || true' EXIT
 export TMPDIR="${TMPDIR:-/tmp}"
+export BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1
 
 # Issue #403 (#406): redirect the isolated-user home root into the
 # TMP_ROOT so even if a test passes an os_user that collides with a
@@ -607,6 +608,8 @@ run_in_v2 "$CR_DIR" "$CR_LOG" case_cr1 "$CR_DIR" \
   || die "CR1 case_cr1 returned non-zero"
 assert_some_setfacl "$CR_LOG" "CR1 v2 credentials helper" \
   || die "CR1 expected setfacl ≥ 1 for v2 cred exception"
+grep -q "setfacl -m m::r-- .*\.credentials\.json" "$CR_LOG" \
+  || die "CR1 expected credential ACL mask repair (m::r--)"
 ok "CR1 v2 credentials helper transitional exception (setfacl ≥ 1)"
 
 # ---------------------------------------------------------------------------

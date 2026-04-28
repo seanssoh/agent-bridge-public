@@ -319,6 +319,13 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit 0
 fi
 
+if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]] \
+    && bridge_agent_linux_user_isolation_effective "$AGENT"; then
+  if ! bridge_linux_repair_claude_credentials_access "$AGENT"; then
+    bridge_warn "Claude credential ACL repair skipped or failed for isolated agent '$AGENT'"
+  fi
+fi
+
 if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   if [[ $SUPPRESS_MISSING_CHANNELS -eq 1 ]]; then
     BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS=1 bridge_ensure_claude_launch_channel_plugins "$AGENT"

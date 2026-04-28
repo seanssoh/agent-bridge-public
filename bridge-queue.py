@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import sqlite3
+import subprocess
 import sys
 import time
 from contextlib import closing
@@ -59,6 +60,67 @@ def get_db_path() -> Path:
     db_path = Path(os.environ.get("BRIDGE_TASK_DB", str(state_dir / "tasks.db")))
     db_path.parent.mkdir(parents=True, exist_ok=True)
     return db_path
+
+
+def get_queue_gateway_root() -> Path:
+    bridge_home = Path(os.environ.get("BRIDGE_HOME", str(Path.home() / ".agent-bridge")))
+    state_dir = Path(os.environ.get("BRIDGE_STATE_DIR", str(bridge_home / "state")))
+    layout = os.environ.get("BRIDGE_LAYOUT", "").strip()
+    agent_root_v2 = os.environ.get("BRIDGE_AGENT_ROOT_V2", "").strip()
+    if layout == "v2" and agent_root_v2:
+        return Path(agent_root_v2).expanduser()
+    return state_dir / "queue-gateway"
+
+
+def queue_gateway_proxy_agent() -> str:
+    if os.environ.get("BRIDGE_QUEUE_GATEWAY_SERVER", "") == "1":
+        return ""
+    if os.environ.get("BRIDGE_GATEWAY_PROXY", "") != "1":
+        return ""
+    return os.environ.get("BRIDGE_AGENT_ID", "").strip()
+
+
+def queue_gateway_float_env(name: str, default: str) -> str:
+    raw = os.environ.get(name, default).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if value <= 0:
+        return default
+    return raw
+
+
+def should_proxy_via_queue_gateway(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    if argv[0] in {"-h", "--help"}:
+        return False
+    if len(argv) == 2 and argv[1] in {"-h", "--help"}:
+        return False
+    return bool(queue_gateway_proxy_agent())
+
+
+def proxy_via_queue_gateway(argv: list[str]) -> int:
+    agent = queue_gateway_proxy_agent()
+    if not agent:
+        return 1
+    gateway_script = Path(__file__).resolve().with_name("bridge-queue-gateway.py")
+    command = [
+        sys.executable,
+        str(gateway_script),
+        "client",
+        "--root",
+        str(get_queue_gateway_root()),
+        "--agent",
+        agent,
+        "--timeout",
+        queue_gateway_float_env("BRIDGE_QUEUE_GATEWAY_TIMEOUT_SECONDS", "45"),
+        "--poll",
+        queue_gateway_float_env("BRIDGE_QUEUE_GATEWAY_POLL_SECONDS", "0.2"),
+        *argv,
+    ]
+    return int(subprocess.run(command, check=False).returncode)
 
 
 def get_cron_state_dir() -> Path:
@@ -2068,9 +2130,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    if argv is None:
+        argv = sys.argv[1:]
+    if should_proxy_via_queue_gateway(argv):
+        return proxy_via_queue_gateway(argv)
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.command == "init":
         with closing(connect()):
             pass

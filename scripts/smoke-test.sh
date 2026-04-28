@@ -1035,6 +1035,7 @@ SPOOL_UT
 
 TMP_ROOT="$(cd "$(mktemp -d)" && pwd -P)"
 export BRIDGE_HOME="$TMP_ROOT/bridge-home"
+export BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1
 # Issue #403 fix #4: pin the isolated-user home root under TMP_ROOT so any
 # inner test path that builds `<root>/<os_user>/.agent-bridge` cannot
 # escape into the operator's $HOME — even if a future test forgets to use
@@ -1405,6 +1406,16 @@ BRIDGE_AGENT_LAUNCH_CMD["claude-static"]='DISCORD_STATE_DIR=REPLACE_CLAUDE_DISCO
 BRIDGE_AGENT_LAUNCH_CMD["$ROSTER_RELOAD_AGENT"]='ROSTER_MARK=before claude --dangerously-skip-permissions --name roster-reload'
 BRIDGE_AGENT_IDLE_TIMEOUT["$ALWAYS_ON_AGENT"]="0"
 EOF
+
+log "guarding isolated agent-env writes from stale tmp controller env (#365 follow-up)"
+STALE_ENV_GUARD_FILE="$TMP_ROOT/stale-agent-env.sh"
+STALE_ENV_GUARD_OUTPUT="$(BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=0 "$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  bridge_write_linux_agent_env_file "$1" "$2"
+' -- "$SMOKE_AGENT" "$STALE_ENV_GUARD_FILE" 2>&1 || true)"
+assert_contains "$STALE_ENV_GUARD_OUTPUT" "refusing to write isolated agent-env.sh from ephemeral controller path BRIDGE_HOME="
+[[ ! -e "$STALE_ENV_GUARD_FILE" ]] || die "stale controller env guard wrote $STALE_ENV_GUARD_FILE despite refusing"
 
 python3 - "$BRIDGE_ROSTER_LOCAL_FILE" "$CLAUDE_STATIC_WORKDIR/.discord" <<'PY'
 from pathlib import Path
@@ -2608,6 +2619,51 @@ QUEUE_TASK_ID="$(printf '%s\n' "$CREATE_OUTPUT" | sed -n 's/^created task #\([0-
 [[ "$QUEUE_TASK_ID" =~ ^[0-9]+$ ]] || die "could not parse queue task id"
 QUEUE_TASK_SHELL="$(python3 "$REPO_ROOT/bridge-queue.py" show "$QUEUE_TASK_ID" --format shell)"
 assert_contains "$QUEUE_TASK_SHELL" "TASK_BODY_PATH=$BRIDGE_SHARED_DIR/note.md"
+
+log "routing direct isolated queue commands through queue gateway (#436)"
+run_queue_gateway_proxy_smoke() {
+  local agent="gateway-proxy-$SESSION_NAME"
+  local root="$BRIDGE_STATE_DIR/queue-gateway"
+  local stdout_file="$TMP_ROOT/queue-gateway-proxy.out"
+  local stderr_file="$TMP_ROOT/queue-gateway-proxy.err"
+  local pid=""
+  local served=""
+  rm -f "$stdout_file" "$stderr_file"
+  BRIDGE_GATEWAY_PROXY=1 \
+    BRIDGE_AGENT_ID="$agent" \
+    BRIDGE_TASK_DB=/dev/null \
+    BRIDGE_STATE_DIR="$BRIDGE_STATE_DIR" \
+    BRIDGE_LAYOUT=legacy \
+    BRIDGE_AGENT_ROOT_V2= \
+    BRIDGE_QUEUE_GATEWAY_TIMEOUT_SECONDS=5 \
+    BRIDGE_QUEUE_GATEWAY_POLL_SECONDS=0.05 \
+    python3 "$REPO_ROOT/bridge-queue.py" "$@" >"$stdout_file" 2>"$stderr_file" &
+  pid=$!
+  for _ in {1..80}; do
+    if compgen -G "$root/$agent/requests/*.request.json" >/dev/null; then
+      break
+    fi
+    sleep 0.05
+  done
+  served="$(BRIDGE_TASK_DB="$BRIDGE_TASK_DB" BRIDGE_STATE_DIR="$BRIDGE_STATE_DIR" BRIDGE_LAYOUT=legacy BRIDGE_AGENT_ROOT_V2= \
+    python3 "$REPO_ROOT/bridge-queue-gateway.py" serve-once --root "$root" --queue-script "$REPO_ROOT/bridge-queue.py" --max-requests 1)"
+  [[ "$served" == "1" ]] || die "queue gateway proxy smoke did not process exactly one request for: $* (processed=$served)"
+  if ! wait "$pid"; then
+    cat "$stderr_file" >&2 || true
+    die "queue gateway proxy command failed: $*"
+  fi
+  cat "$stdout_file"
+}
+GATEWAY_PROXY_CREATE_OUTPUT="$(run_queue_gateway_proxy_smoke create --to "$SMOKE_AGENT" --title "gateway proxy smoke" --body "gateway body" --from "$REQUESTER_AGENT")"
+assert_contains "$GATEWAY_PROXY_CREATE_OUTPUT" "created task #"
+GATEWAY_PROXY_TASK_ID="$(printf '%s\n' "$GATEWAY_PROXY_CREATE_OUTPUT" | sed -n 's/^created task #\([0-9][0-9]*\).*/\1/p' | head -n1)"
+[[ "$GATEWAY_PROXY_TASK_ID" =~ ^[0-9]+$ ]] || die "could not parse queue gateway proxy task id"
+GATEWAY_PROXY_SHOW_OUTPUT="$(run_queue_gateway_proxy_smoke show "$GATEWAY_PROXY_TASK_ID")"
+assert_contains "$GATEWAY_PROXY_SHOW_OUTPUT" "gateway proxy smoke"
+GATEWAY_PROXY_CLAIM_OUTPUT="$(run_queue_gateway_proxy_smoke claim "$GATEWAY_PROXY_TASK_ID" --agent "$SMOKE_AGENT" --lease-seconds 60)"
+assert_contains "$GATEWAY_PROXY_CLAIM_OUTPUT" "claimed task #$GATEWAY_PROXY_TASK_ID"
+GATEWAY_PROXY_DONE_OUTPUT="$(run_queue_gateway_proxy_smoke done "$GATEWAY_PROXY_TASK_ID" --agent "$SMOKE_AGENT" --note "gateway proxy smoke cleanup")"
+assert_contains "$GATEWAY_PROXY_DONE_OUTPUT" "completed task #$GATEWAY_PROXY_TASK_ID"
 
 log "stabilizing ephemeral body-file payloads inside the queue"
 EPHEMERAL_BODY_FILE="$(mktemp "$TMP_ROOT/queue-body.XXXXXX.md")"
@@ -5227,6 +5283,20 @@ assert row["status"] in {"linked", "updated", "unchanged"}, row
 assert cache_version.is_symlink(), cache_version
 assert cache_version.resolve() == source, (cache_version, source)
 assert not (cache_version / ".orphaned_at").exists()
+mcp = json.loads((source / ".mcp.json").read_text(encoding="utf-8"))
+args = mcp["mcpServers"]["teams"]["args"]
+assert args[:2] == ["--cwd", "${CLAUDE_PLUGIN_ROOT}"], args
+assert args[2:] == ["--no-install", "${CLAUDE_PLUGIN_ROOT}/server.ts"], args
+PY
+python3 - "$REPO_ROOT/plugins/ms365/.mcp.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+mcp = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+args = mcp["mcpServers"]["ms365"]["args"]
+assert args[:2] == ["--cwd", "${CLAUDE_PLUGIN_ROOT}"], args
+assert args[2:] == ["--no-install", "${CLAUDE_PLUGIN_ROOT}/server.ts"], args
 PY
 DEV_PLUGIN_CACHE_JSON_AGAIN="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:teams@agent-bridge" --json)"
 python3 - "$DEV_PLUGIN_CACHE_JSON_AGAIN" <<'PY'
@@ -5628,15 +5698,43 @@ log "gating dev-channel auto-accept on Claude foreground readiness (#429)"
 DEV_CHANNELS_CLAUDE_BIN="$TMP_ROOT/claude"
 DEV_CHANNELS_CLAUDE_SESSION="dev-channels-claude-fg-$SESSION_NAME"
 DEV_CHANNELS_SLEEP_SESSION="dev-channels-sleep-fg-$SESSION_NAME"
+DEV_CHANNELS_WRAPPED_SESSION="dev-channels-wrapped-fg-$SESSION_NAME"
+DEV_CHANNELS_DELAYED_SESSION="dev-channels-delayed-fg-$SESSION_NAME"
+DEV_CHANNELS_WRAPPED_SCRIPT="$TMP_ROOT/dev-channels-wrapped.sh"
+DEV_CHANNELS_DELAYED_SCRIPT="$TMP_ROOT/dev-channels-delayed.sh"
 ln -sf "$(command -v sleep)" "$DEV_CHANNELS_CLAUDE_BIN"
 tmux new-session -d -s "$DEV_CHANNELS_CLAUDE_SESSION" "$DEV_CHANNELS_CLAUDE_BIN 2"
 tmux new-session -d -s "$DEV_CHANNELS_SLEEP_SESSION" "$(command -v sleep) 2"
+cat >"$DEV_CHANNELS_WRAPPED_SCRIPT" <<EOF
+#!/usr/bin/env bash
+"$DEV_CHANNELS_CLAUDE_BIN" 2
+EOF
+cat >"$DEV_CHANNELS_DELAYED_SCRIPT" <<EOF
+#!/usr/bin/env bash
+sleep 1
+"$DEV_CHANNELS_CLAUDE_BIN" 2
+EOF
+chmod +x "$DEV_CHANNELS_WRAPPED_SCRIPT" "$DEV_CHANNELS_DELAYED_SCRIPT"
+tmux new-session -d -s "$DEV_CHANNELS_WRAPPED_SESSION" "$DEV_CHANNELS_WRAPPED_SCRIPT"
+tmux new-session -d -s "$DEV_CHANNELS_DELAYED_SESSION" "$DEV_CHANNELS_DELAYED_SCRIPT"
 wait_for_tmux_session "$DEV_CHANNELS_CLAUDE_SESSION" up 10 0.1
 wait_for_tmux_session "$DEV_CHANNELS_SLEEP_SESSION" up 10 0.1
+wait_for_tmux_session "$DEV_CHANNELS_WRAPPED_SESSION" up 10 0.1
+wait_for_tmux_session "$DEV_CHANNELS_DELAYED_SESSION" up 10 0.1
 "$BASH4_BIN" -c '
   source "'"$REPO_ROOT"'/bridge-lib.sh"
   bridge_tmux_pane_foreground_is_claude "'"$DEV_CHANNELS_CLAUDE_SESSION"'"
 ' >/dev/null || die "expected symlinked claude foreground to be detected"
+"$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_tmux_pane_foreground_is_claude "'"$DEV_CHANNELS_WRAPPED_SESSION"'"
+' >/dev/null || die "expected wrapped claude child process to be detected"
+"$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_POLL_SECONDS=0.1 \
+    BRIDGE_TMUX_DEV_CHANNELS_FOREGROUND_MAX_CHECKS=40 \
+    bridge_tmux_wait_for_claude_foreground "'"$DEV_CHANNELS_DELAYED_SESSION"'" 5 0.1 40
+' >/dev/null || die "expected delayed wrapped claude foreground wait to succeed"
 if "$BASH4_BIN" -c '
   source "'"$REPO_ROOT"'/bridge-lib.sh"
   bridge_tmux_pane_foreground_is_claude "'"$DEV_CHANNELS_SLEEP_SESSION"'"
@@ -5645,6 +5743,8 @@ if "$BASH4_BIN" -c '
 fi
 tmux kill-session -t "=$DEV_CHANNELS_CLAUDE_SESSION" >/dev/null 2>&1 || true
 tmux kill-session -t "=$DEV_CHANNELS_SLEEP_SESSION" >/dev/null 2>&1 || true
+tmux kill-session -t "=$DEV_CHANNELS_WRAPPED_SESSION" >/dev/null 2>&1 || true
+tmux kill-session -t "=$DEV_CHANNELS_DELAYED_SESSION" >/dev/null 2>&1 || true
 
 log "classifying admin foreground exit by onboarding state"
 ONBOARDING_ADMIN_WORKDIR="$TMP_ROOT/onboarding-admin"
