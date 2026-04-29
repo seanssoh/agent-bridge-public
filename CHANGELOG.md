@@ -6,6 +6,54 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.37] — 2026-04-29
+
+### Highlight — #475 telegram-relay daemon fully wired (Phase 2 + Phase 3)
+
+`v0.6.37` finishes the #475 telegram-relay arc that v0.6.36 started. Phase 2 ships the plugin client adapter; Phase 3 ships the setup-time lifecycle wiring + status display. After this release an operator can opt-in with a single `agent-bridge setup telegram <agent> --use-relay --yes` and the SIGTERM-and-replace race in `claude-plugins-official/telegram@0.0.6` (the original #468 cascade) is closed at the architectural level for that agent.
+
+All four #475 architectural blockers are now closed:
+
+1. ✅ Cron cascade (v0.6.35 / #474)
+2. ✅ Admin dead-code instructions (v0.6.36 / #479 #472 follow-up)
+3. ✅ Daemon scaffolding (v0.6.36 / #481 phase 1)
+4. ✅ Plugin client adapter + lifecycle wiring (v0.6.37 / #483 phase 2 + #484 phase 3)
+
+### Telegram-relay plugin client adapter (#483 / #475 phase 2)
+
+- New plugin tree under `plugins/telegram-relay/` (15 files, +1740 LOC). `server.ts` (~785 LOC) is a bun entrypoint that mirrors the upstream `plugin:telegram@claude-plugins-official` MCP tool surface but does NOT call `getUpdates`. It connects to the Phase 1 daemon's unix socket and forwards inbound updates to `agb urgent <agent>` and outbound `reply` calls to the daemon's `send_message` RPC.
+- MCP tool surface: `reply` is the primary tool with `{chat_id, text, reply_to}` schema. `react`, `download_attachment`, `edit_message` are registered as explicit `unsupportedTool` placeholders so Claude sessions calling upstream tool names get a clean error rather than a missing-method failure.
+- Token security: token is read from env (`TELEGRAM_BOT_TOKEN`/`BOT_TOKEN`/`TOKEN`), never accepted on argv, never logged. The plugin passes only `--token-file <path>` to the daemon CLI.
+- Auto-bootstrap: `BRIDGE_TELEGRAM_RELAY_AUTOSPAWN=1` lets the plugin spawn the daemon if it isn't already running. `TELEGRAM_RELAY_REGISTER_TOKEN=1` (default) auto-writes the token-hash to `tokens.list`.
+- Smoke: `scripts/smoke/telegram-relay-plugin.sh` (+364 LOC) stands up the full chain — fake Telegram HTTP server → Phase 1 daemon → two plugin instances. Asserts both plugins receive the same fake update exactly once each (the core fan-out invariant), `reply` round-trips with `chat_id`/`reply_to_message_id`/`text`, plugin SIGTERM doesn't take the daemon down (`relay remains healthy after plugin SIGTERM`), and daemon-restart triggers plugin auto-reconnect with post-restart updates delivered correctly.
+
+### Telegram-relay setup lifecycle wiring + status display (#484 / #475 phase 3)
+
+- `bridge-setup.py telegram --use-relay` (or env `BRIDGE_TELEGRAM_USE_RELAY=1`) now does the full opt-in in one command: writes `.env` + `access.json` (existing data shape unchanged) PLUS a separate `relay-token` file (mode 600, raw token) PLUS registers the token-hash in `~/.agent-bridge/state/channels/telegram/tokens.list` (mode 600). All file writes go through `save_text` which does atomic temp-file rename + `os.chmod(0o600)` both before and after the rename so tokens never appear at any-readable mode even briefly. State root `~/.agent-bridge/state/channels/telegram/` is `chmod 0o700`.
+- Without `--use-relay`, `bridge-setup.py telegram` behavior is byte-for-byte unchanged — existing operators on `plugin:telegram@claude-plugins-official` are not affected. A soft stderr deprecation warning fires when an existing agent is reconfigured WITHOUT `--use-relay` after a grace-period date (`TELEGRAM_RELAY_LEGACY_WARN_AFTER`).
+- `agent-bridge status` (`bridge-status.py +311` LOC) now renders per-agent MCP plugin liveness. For `plugin:telegram-relay@agent-bridge`, four states distinguished:
+  - `not-supervised` — token-hash not in `tokens.list`.
+  - `daemon-down` — relay socket not reachable, OR `health` RPC failed.
+  - `polling-stale` — daemon reachable but `last_get_updates_ts` > 60s.
+  - `connected` — daemon reachable + recent `getUpdates` + ≥ 1 connected client.
+- `agent-bridge status --json` exposes the same liveness as a structured `plugins` field per agent so operators can script against it.
+- `plugins/telegram-relay/README.md` "Opt-In Steps" collapsed from 5 manual steps to 2 (`agent-bridge setup telegram <agent> --use-relay --yes` does the rest). `docs/agent-runtime/migration-guide.md` adds a section for migrating existing agents from `plugin:telegram@claude-plugins-official` to `plugin:telegram-relay@agent-bridge`.
+- New smoke `scripts/smoke/telegram-relay-setup.sh` (+235 LOC) covers the full setup → sync → status round-trip: setup `--use-relay` → tokens.list mode 600 + token hash + token path → `daemon-down` (before supervisor sync) → `bridge-daemon.sh sync` → `connected` → token removal → `not-supervised`. Three of the four status states are exercised in the smoke; `polling-stale` requires time-boundary mocking and is verified manually.
+
+### Operator opt-in (after this release)
+
+Single command on a managed agent:
+
+```
+agent-bridge setup telegram <agent> \
+  --token "<bot-token>" \
+  --allow-from "<user-id>" \
+  --default-chat "<chat-id>" \
+  --use-relay --yes
+```
+
+Then ensure `BRIDGE_TELEGRAM_RELAY_ENABLED=1` is set in the bridge daemon's environment and the next `bridge-daemon.sh sync` cycle will spawn the relay. `agent-bridge status --json` confirms the plugin reports `connected`.
+
 ## [0.6.36] — 2026-04-29
 
 ### Highlight — context-size auto-compact + telegram-relay daemon phase 1 + admin instruction cleanup
