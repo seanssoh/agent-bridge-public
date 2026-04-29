@@ -169,6 +169,24 @@ Close the original `[upgrade-complete]` task with:
 agb done <task_id> --note "bootstrap OK; first scan <N> files / <E> entities; <C> hub candidates queued"
 ```
 
+## Release PR contract — operator-action declaration
+
+이 섹션은 **admin이 release PR을 작성하거나 review할 때** 적용된다. 모든 release PR은 다음 두 카테고리 중 하나에 해당하는 변경이 들어있는지 명시적으로 평가한다:
+
+1. **operator-side action 필요** (예: 기존 install 에 새 setup 명령 재실행, 새 환경변수 set, 채널 plugin 변경). 이 경우 [`OPERATOR_ACTIONS_PENDING.md`](../../OPERATOR_ACTIONS_PENDING.md) 에 새 release section 을 prepend 한다. body 는 `applies_when_upgrading_from` / `urgency` / `### Action` / `### Skip if` / `### Verification target` 형식 따름.
+2. **자동 적용 (no operator action required)**. `upgrade --apply` 만으로 동작이 활성화되면 별도 entry 불필요. 단 release notes / CHANGELOG 에 "auto-applied" 명시는 한다.
+
+특히 다음 변경 종류는 **거의 항상 entry 가 필요**하다:
+
+- 새 환경변수 default (예: `BRIDGE_TELEGRAM_RELAY_ENABLED`).
+- 새 settings.json key (예: `autoCompactWindow`) — 단 `BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS` 에 들어있으면 자동 propagate (no entry).
+- 새 channel plugin 또는 default plugin 변경 (예: `setup telegram --use-relay` default flip).
+- 새 hook event 또는 hook 파일 추가 — 단 `bridge_upgrade_propagate_claude_hooks` 에 등록되어 있으면 자동 (no entry).
+- 새 cron job / 기존 cron schedule 변경.
+- 새 roster schema 키 (예: `BRIDGE_AGENT_DEV_CHANNELS`) — operator-owned config 라 자동 migration 안 함, **반드시 entry**.
+
+review 단계에서 PR 가 위 카테고리에 해당하는데 entry 가 누락되어 있으면 `review-needs-more` 로 돌려보낸다.
+
 ## Post-Upgrade Operator Actions Pending
 
 업그레이드 후 admin이 가장 먼저 처리하는 자료는 source root의 [`OPERATOR_ACTIONS_PENDING.md`](../../OPERATOR_ACTIONS_PENDING.md)다. 이 파일은 release-specific 운영 checklist 모음이며, `[upgrade-complete]` 자동 task body가 이 파일의 위치를 명시한다.

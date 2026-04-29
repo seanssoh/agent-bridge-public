@@ -43,10 +43,11 @@ Usage:
   $CLI_NAME admin [--safe-mode] [--replace] [--continue|--no-continue] [--no-attach] [--no-project-skill]
   $CLI_NAME bootstrap [bootstrap options...] [init options...]
   $CLI_NAME init [--admin <agent>] [--engine claude|codex] [--session <name>] [--channels <csv>] [--dry-run] [--json]
-  $CLI_NAME upgrade [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--pull|--no-pull] [--restart-daemon] [--dry-run] [--json] [--strict-merge]
+  $CLI_NAME upgrade [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--pull|--no-pull] [--restart-daemon] [--dry-run] [--json] [--strict-merge]
   $CLI_NAME upgrade analyze [--target <bridge-home>] [--json]
   $CLI_NAME upgrade rollback [--target <bridge-home>] [--backup-root <dir>] [--json]
   $CLI_NAME upgrade conflicts list [--target <bridge-home>] [--json]
+  $CLI_NAME daemon <ensure|status|start|stop|sync|run> ...
   $CLI_NAME escalate question --agent <agent> --question "<text>" [--context "<text>"] [--wait-seconds <seconds>] [--json]
   $CLI_NAME upstream <draft|propose|review> ...
   $CLI_NAME review <policy|request|complete> ...
@@ -570,6 +571,10 @@ PY
     upgrade)
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-upgrade.sh" "$@"
+      ;;
+    daemon)
+      shift
+      exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-daemon.sh" "$@"
       ;;
     escalate)
       shift

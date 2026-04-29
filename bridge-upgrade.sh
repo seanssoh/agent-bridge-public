@@ -43,7 +43,7 @@ SHARED_SETTINGS_RERENDER_JSON='{"mode":"skipped","count":0,"failed_count":0,"can
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents]
+  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents]
   $(basename "$0") analyze [--source <repo-dir>] [--target <bridge-home>] [--json]
   $(basename "$0") rollback [--target <bridge-home>] [--backup-root <dir>] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json]
   $(basename "$0") conflicts list [--target <bridge-home>] [--json]
@@ -169,8 +169,46 @@ bridge_upgrade_with_target_env() {
     "$@"
 }
 
+bridge_upgrade_propagate_claude_hooks() {
+  local target_root="$1"
+
+  # Re-register every Claude hook (Stop / SessionStart / UserPromptSubmit /
+  # PromptGuard / ToolPolicy) onto the shared base settings.json before the
+  # subsequent rerender-settings call merges the result into per-agent
+  # effective settings. Without this, a release that adds a new hook event
+  # ships the new script in `hooks/` but the existing per-agent settings.json
+  # never registers it — only fresh installs pick up the new hook.
+  #
+  # The ensure helpers are idempotent: an already-registered hook is left in
+  # place, missing entries are appended. They write to
+  # ~/.agent-bridge/.claude/settings.json (the shared base file), which means
+  # a single pass per upgrade is enough — every Claude agent's effective
+  # settings then inherits the new hook list via the rerender step.
+  bridge_upgrade_with_target_env "$target_root" "$BRIDGE_BASH_BIN" -lc '
+    set -euo pipefail
+    source "$1/bridge-lib.sh"
+    bridge_load_roster
+    BRIDGE_AGENT_HOME_ROOT="$1/agents"
+    workdir=""
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      [[ "$(bridge_agent_engine "$agent" 2>/dev/null || true)" == "claude" ]] || continue
+      workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+      [[ -n "$workdir" ]] || continue
+      bridge_ensure_claude_stop_hook "$workdir" >/dev/null 2>&1 || true
+      bridge_ensure_claude_session_start_hook "$workdir" >/dev/null 2>&1 || true
+      bridge_ensure_claude_prompt_hook "$workdir" >/dev/null 2>&1 || true
+      bridge_ensure_claude_prompt_guard_hook "$workdir" >/dev/null 2>&1 || true
+      bridge_ensure_claude_tool_policy_hooks "$workdir" >/dev/null 2>&1 || true
+    done
+  ' -- "$target_root"
+}
+
 bridge_upgrade_propagate_claude_shared_settings() {
   local target_root="$1"
+
+  # Hook ensure must run BEFORE rerender so the rendered effective settings
+  # include any newly-added hook entries that the release shipped (#2303 Gap 3).
+  bridge_upgrade_propagate_claude_hooks "$target_root" >/dev/null 2>&1 || true
 
   bridge_upgrade_with_target_env "$target_root" \
     "$BRIDGE_BASH_BIN" "$target_root/bridge-agent.sh" rerender-settings --apply --json
@@ -721,6 +759,10 @@ while [[ $# -gt 0 ]]; do
     --no-restart-agents)
       RESTART_AGENTS=0
       RESTART_AGENTS_EXPLICIT=1
+      shift
+      ;;
+    --apply)
+      [[ "$SUBCOMMAND" == "apply" ]] || bridge_die "--apply는 기본 upgrade 적용 경로에서만 사용할 수 있습니다."
       shift
       ;;
     --dry-run)

@@ -15,6 +15,27 @@ PR, prepend a new section; do not edit older sections in place.
 
 ---
 
+## v0.6.39 — shared Claude hooks now propagated on upgrade (no operator action required)
+
+- applies_when_upgrading_from: any version `<= 0.6.38`.
+- urgency: **none** (informational).
+
+### Background
+
+Before v0.6.39 the upgrader did not call `bridge_ensure_claude_*_hook` for existing hosts, so a release that added a new hook event (Stop / SessionStart / UserPromptSubmit / PromptGuard / ToolPolicy) shipped the new script in `hooks/` but the existing per-agent `settings.json` never registered it. Only fresh installs picked up new hooks.
+
+`v0.6.39` adds `bridge_upgrade_propagate_claude_hooks` that runs before the rerender step and ensures every Claude agent's shared base settings register the latest hook list. The subsequent rerender propagates the change into per-agent effective settings.
+
+### Action
+
+**No operator action required.** `agent-bridge upgrade --apply` from this release onward registers any newly-added hook automatically. The `shared_settings_rerender` line in upgrade output already reflects the post-rerender state.
+
+### Skip if
+
+- Always skip — informational. Behavior takes effect on the next `upgrade --apply` invocation.
+
+---
+
 ## v0.6.39 — settings rerender for hosts that upgraded before this fix
 
 - applies_when_upgrading_from: any version `0.6.33 .. 0.6.38`

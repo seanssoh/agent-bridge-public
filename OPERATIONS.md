@@ -87,12 +87,14 @@ tail -n 80 ~/.agent-bridge/state/systemd-daemon-liveness.log  # Linux liveness w
 
 ## Upgrade
 
-Use the built-in upgrade path instead of copying files by hand:
+표준 upgrade 절차는 [`UPGRADING.md`](UPGRADING.md) 에 정리되어 있다. 모든 install 에서 동일한 명령으로 진행한다:
 
 ```bash
 agb upgrade --dry-run
-agb upgrade
+agb upgrade --apply
 ```
+
+`--apply` 는 atomic — daemon stop/start, agent restart, shared settings rerender (`autoCompactWindow:400000` 등 managed default propagate), shared hooks 재등록, `_template/CLAUDE.md` sync, `[upgrade-complete]` admin task 등록 모두 포함.
 
 The upgrader preserves local runtime data by default:
 
@@ -102,6 +104,8 @@ The upgrader preserves local runtime data by default:
 - `shared/`
 - `agents/*` runtime homes
 - local backups and generated files
+
+매 release 의 후속 행동 (operator action) 은 [`OPERATOR_ACTIONS_PENDING.md`](OPERATOR_ACTIONS_PENDING.md) 의 release section 으로 surface 된다. `upgrade --apply` 가 admin agent 한테 자동 등록한 `[upgrade-complete]` task 에서 reference 됨. troubleshooting + rollback + admin host source-checkout 변형은 `UPGRADING.md` 참조.
 
 For a source checkout to live runtime deploy during development:
 
