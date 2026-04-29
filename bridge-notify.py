@@ -144,6 +144,22 @@ def send_telegram(token: str, chat_id: str, text: str, api_base_url: str) -> Non
         return
 
 
+def send_mattermost(token: str, channel_id: str, text: str, api_base_url: str) -> None:
+    payload = json.dumps({"channel_id": channel_id, "message": text}).encode("utf-8")
+    req = Request(
+        f"{api_base_url.rstrip('/')}/api/v4/posts",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "agent-bridge-notify/0.1",
+        },
+        method="POST",
+    )
+    with urlopen(req, timeout=15):
+        return
+
+
 def cmd_send(args: argparse.Namespace) -> int:
     kind = str(args.kind).strip()
     target = normalize_target(kind, args.target)
@@ -205,6 +221,11 @@ def cmd_send(args: argparse.Namespace) -> int:
             token = load_account_token(account_cfg)
             api_base_url = load_account_api_base(account_cfg, "https://api.telegram.org")
             send_telegram(token, target, text, api_base_url)
+        elif kind == "mattermost":
+            account_cfg = load_account_config(Path(args.runtime_config), kind, account)
+            token = load_account_token(account_cfg)
+            api_base_url = load_account_api_base(account_cfg, "http://localhost:8065")
+            send_mattermost(token, target, text, api_base_url)
         else:
             raise SystemExit(f"unsupported notify kind: {kind}")
     except HTTPError as exc:
@@ -223,7 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     send_parser = subparsers.add_parser("send")
     send_parser.add_argument("--agent")
-    send_parser.add_argument("--kind", required=True, choices=("discord", "discord-webhook", "telegram"))
+    send_parser.add_argument("--kind", required=True, choices=("discord", "discord-webhook", "telegram", "mattermost"))
     send_parser.add_argument("--target", required=True)
     send_parser.add_argument("--account", default="default")
     send_parser.add_argument("--runtime-config")

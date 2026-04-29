@@ -32,6 +32,14 @@
       "version": "0.1.0",
       "category": "productivity",
       "tags": ["microsoft", "m365", "graph", "mail", "calendar", "teams", "mcp"]
+    },
+    {
+      "name": "mattermost",
+      "source": "./plugins/mattermost",
+      "description": "Mattermost channel for Claude Code with Agent Bridge access control via Outgoing Webhooks and Bot API.",
+      "version": "0.1.0",
+      "category": "messaging",
+      "tags": ["mattermost", "messaging", "channel", "mcp"]
     }
   ]
 }
