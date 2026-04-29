@@ -734,6 +734,43 @@ bridge_linux_traverse_stop_for() {
   return 0
 }
 
+# Restore the controller read lens on an isolated Claude home. The memory-daily
+# harvester runs in the controller context and scans the isolated UID's
+# ~/.claude/projects tree through this lens.
+bridge_linux_repair_isolated_claude_read_lens() {
+  local os_user="$1"
+  local user_home="$2"
+  local controller_user="$3"
+  local isolated_claude_dir=""
+  local isolated_projects_dir=""
+
+  [[ -n "$os_user" && -n "$user_home" && -n "$controller_user" ]] || return 0
+  if bridge_isolation_v2_active; then
+    return 0
+  fi
+
+  isolated_claude_dir="$user_home/.claude"
+  isolated_projects_dir="$isolated_claude_dir/projects"
+
+  bridge_linux_sudo_root test -d "$isolated_claude_dir" || return 0
+  bridge_linux_sudo_root setfacl \
+    -m "u:${controller_user}:r-x" \
+    -m "m::r-x" \
+    "$isolated_claude_dir" >/dev/null 2>&1 || true
+  bridge_linux_sudo_root setfacl \
+    -d -m "u:${controller_user}:r-X" \
+    -d -m "m::r-X" \
+    "$isolated_claude_dir" >/dev/null 2>&1 || true
+
+  bridge_linux_sudo_root test -d "$isolated_projects_dir" || return 0
+  bridge_linux_sudo_root find "$isolated_projects_dir" -type d \
+    -exec setfacl -m "u:${controller_user}:r-X" -m "m::r-X" {} + >/dev/null 2>&1 || true
+  bridge_linux_sudo_root find "$isolated_projects_dir" -type d \
+    -exec setfacl -d -m "u:${controller_user}:r-X" -d -m "m::r-X" {} + >/dev/null 2>&1 || true
+  bridge_linux_sudo_root find "$isolated_projects_dir" -type f \
+    -exec setfacl -m "u:${controller_user}:r--" -m "m::r--" {} + >/dev/null 2>&1 || true
+}
+
 # Claude Code reads its auth from $CLAUDE_CONFIG_DIR/.credentials.json
 # (default $HOME/.claude/.credentials.json). Under linux-user isolation
 # the agent runs as a dedicated UID whose $HOME is /home/<os_user>/,
@@ -800,7 +837,10 @@ bridge_linux_grant_claude_credentials_access() {
 
   bridge_linux_sudo_root mkdir -p "$isolated_claude_dir"
   bridge_linux_sudo_root chown "$os_user" "$isolated_claude_dir"
-  bridge_linux_sudo_root chmod 0700 "$isolated_claude_dir"
+  if ! bridge_isolation_v2_active; then
+    bridge_linux_sudo_root chmod 0700 "$isolated_claude_dir"
+    bridge_linux_repair_isolated_claude_read_lens "$os_user" "$user_home" "$controller_user"
+  fi
 
   if bridge_isolation_v2_active; then
     # C1 exception: bypass the v2-noop public traverse chain and apply
@@ -817,9 +857,8 @@ bridge_linux_grant_claude_credentials_access() {
     # No directory `r-x` (would let the isolated UID list ~/.claude/),
     # no default ACL on ~/.claude/ (would extend grants to every new
     # inode under there). Re-auth's atomic-rename produces a new inode
-    # without an inherited ACL — operator must re-run
-    # `agent-bridge isolate <agent>` after each Claude re-auth, which
-    # is the documented C1 contract until PR-F's per-agent claude login.
+    # without an inherited ACL, so start/daemon preflights call this helper
+    # again and explicitly restore both the named-user grant and ACL mask.
     _bridge_linux_grant_traverse_chain_unguarded "$os_user" "$controller_claude_dir" "$controller_home"
     # PR-E r2 P1#3 fix: load-bearing setfacl call must fail-loud. The
     # `|| true` of the prior version masked filesystem-ACL-disabled
@@ -830,10 +869,13 @@ bridge_linux_grant_claude_credentials_access() {
     # that retains a named-user ACL (KNOWN_ISSUES.md §16).
     bridge_linux_sudo_root setfacl -m "u:${os_user}:r--" "$controller_cred_file" \
       || bridge_die "claude cred ACL: setfacl r-- on $controller_cred_file failed (v2+claude requires functional ACLs on this surface; see KNOWN_ISSUES.md §16)"
+    bridge_linux_sudo_root setfacl -m "m::r--" "$controller_cred_file" \
+      || bridge_die "claude cred ACL: setfacl mask r-- on $controller_cred_file failed (v2+claude requires the ACL mask to preserve the isolated UID read grant)"
   else
     bridge_linux_grant_traverse_chain "$os_user" "$controller_claude_dir" "$controller_home"
     bridge_linux_acl_add "u:${os_user}:r-x" "$controller_claude_dir" >/dev/null 2>&1 || true
     bridge_linux_acl_add "u:${os_user}:r--" "$controller_cred_file" >/dev/null 2>&1 || true
+    bridge_linux_sudo_root setfacl -m "m::r--" "$controller_cred_file" >/dev/null 2>&1 || true
     bridge_linux_sudo_root setfacl -d -m "u:${os_user}:r--" "$controller_claude_dir" >/dev/null 2>&1 || true
   fi
 
@@ -848,6 +890,34 @@ bridge_linux_grant_claude_credentials_access() {
   fi
   bridge_linux_sudo_root ln -s "$controller_cred_file" "$isolated_cred_link"
   bridge_linux_sudo_root chown -h "$os_user" "$isolated_cred_link" >/dev/null 2>&1 || true
+}
+
+bridge_linux_repair_claude_credentials_access() {
+  local agent="$1"
+  local os_user=""
+  local user_home=""
+  local controller_user=""
+  local engine=""
+
+  [[ "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]] || return 0
+  bridge_agent_linux_user_isolation_effective "$agent" || return 0
+  engine="$(bridge_agent_engine "$agent")"
+  [[ "$engine" == "claude" ]] || return 0
+
+  # Item 13 (PR #442 r2): repair is best-effort. Skip cleanly when sudo is
+  # unavailable (CI without sudo, dev shell without sudo) — without this
+  # guard, the inner bridge_linux_sudo_root would bridge_die on the start /
+  # daemon-health path even when the repair would otherwise be a no-op.
+  bridge_linux_have_sudo_or_skip || return 0
+
+  os_user="$(bridge_agent_os_user "$agent")"
+  [[ -n "$os_user" ]] || return 0
+  user_home="$(getent passwd "$os_user" 2>/dev/null | cut -d: -f6 || true)"
+  [[ -n "$user_home" ]] || return 0
+  controller_user="$(bridge_current_user)"
+  [[ -n "$controller_user" ]] || return 0
+
+  bridge_linux_grant_claude_credentials_access "$os_user" "$user_home" "$controller_user" "$engine"
 }
 
 bridge_linux_acl_add_recursive() {
@@ -2119,6 +2189,93 @@ bridge_linux_unshare_plugin_catalog() {
   fi
 }
 
+bridge_tmp_ephemeral_path_is() {
+  local path="${1:-}"
+  local tmpdir="${TMPDIR:-}"
+  local tmpdir_real=""
+
+  [[ -n "$path" ]] || return 1
+  case "$path" in
+    /tmp/tmp.*|/tmp/tmp.*/*|/var/tmp/tmp.*|/var/tmp/tmp.*/*|/private/tmp/tmp.*|/private/tmp/tmp.*/*)
+      return 0
+      ;;
+  esac
+  if [[ -n "$tmpdir" ]]; then
+    tmpdir="${tmpdir%/}"
+    case "$path" in
+      "$tmpdir"/tmp.*|"$tmpdir"/tmp.*/*)
+        return 0
+        ;;
+    esac
+    if [[ -d "$tmpdir" ]]; then
+      tmpdir_real="$(cd -P "$tmpdir" 2>/dev/null && pwd -P || true)"
+      tmpdir_real="${tmpdir_real%/}"
+      if [[ -n "$tmpdir_real" && "$tmpdir_real" != "$tmpdir" ]]; then
+        case "$path" in
+          "$tmpdir_real"/tmp.*|"$tmpdir_real"/tmp.*/*)
+            return 0
+            ;;
+        esac
+      fi
+    fi
+  fi
+  return 1
+}
+
+bridge_reject_ephemeral_controller_env_for_agent_env() {
+  local name=""
+  local value=""
+  local -a path_vars=(
+    BRIDGE_HOME
+    BRIDGE_ROSTER_FILE
+    BRIDGE_ROSTER_LOCAL_FILE
+    BRIDGE_STATE_DIR
+    BRIDGE_LAYOUT_MARKER_DIR
+    BRIDGE_ACTIVE_AGENT_DIR
+    BRIDGE_HISTORY_DIR
+    BRIDGE_WORKTREE_META_DIR
+    BRIDGE_ACTIVE_ROSTER_TSV
+    BRIDGE_ACTIVE_ROSTER_MD
+    BRIDGE_DAEMON_PID_FILE
+    BRIDGE_DAEMON_LOG
+    BRIDGE_DAEMON_CRASH_LOG
+    BRIDGE_TASK_DB
+    BRIDGE_PROFILE_STATE_DIR
+    BRIDGE_CRON_STATE_DIR
+    BRIDGE_CRON_HOME_DIR
+    BRIDGE_WORKTREE_ROOT
+    BRIDGE_AGENT_HOME_ROOT
+    BRIDGE_RUNTIME_ROOT
+    BRIDGE_RUNTIME_SCRIPTS_DIR
+    BRIDGE_RUNTIME_SKILLS_DIR
+    BRIDGE_RUNTIME_SHARED_DIR
+    BRIDGE_RUNTIME_SHARED_TOOLS_DIR
+    BRIDGE_RUNTIME_SHARED_REFERENCES_DIR
+    BRIDGE_RUNTIME_MEMORY_DIR
+    BRIDGE_RUNTIME_CREDENTIALS_DIR
+    BRIDGE_RUNTIME_SECRETS_DIR
+    BRIDGE_RUNTIME_CONFIG_FILE
+    BRIDGE_HOOKS_DIR
+    BRIDGE_SHARED_DIR
+    BRIDGE_TASK_NOTE_DIR
+    BRIDGE_LOG_DIR
+    BRIDGE_DATA_ROOT
+    BRIDGE_SHARED_ROOT
+    BRIDGE_AGENT_ROOT_V2
+    BRIDGE_CONTROLLER_STATE_ROOT
+  )
+
+  [[ "${BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV:-0}" == "1" ]] && return 0
+
+  for name in "${path_vars[@]}"; do
+    value="${!name:-}"
+    [[ -n "$value" ]] || continue
+    if bridge_tmp_ephemeral_path_is "$value"; then
+      bridge_die "refusing to write isolated agent-env.sh from ephemeral controller path ${name}=${value}; unset stale BRIDGE_* variables before running isolate/start, or set BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1 for a deliberate temp test install"
+    fi
+  done
+}
+
 bridge_write_linux_agent_env_file() {
   local agent="$1"
   local file="${2:-$(bridge_agent_linux_env_file "$agent")}"
@@ -2169,6 +2326,8 @@ bridge_write_linux_agent_env_file() {
   admin_agent="$(bridge_admin_agent_id)"
   agent_log_dir="$(bridge_agent_log_dir "$agent")"
   agent_audit_log="$(bridge_agent_audit_log_file "$agent")"
+
+  bridge_reject_ephemeral_controller_env_for_agent_env
 
   mkdir -p "$(dirname "$file")"
   # Self-heal ownership: when an earlier isolate cycle chowned the file to the
@@ -2237,6 +2396,8 @@ BRIDGE_AUDIT_LOG=$(printf '%q' "$agent_audit_log")
 BRIDGE_ROSTER_FILE=""
 BRIDGE_ROSTER_LOCAL_FILE=""
 BRIDGE_ADMIN_AGENT_ID=$(printf '%q' "$admin_agent")
+BRIDGE_AGENT_ID=$(printf '%q' "$agent")
+export BRIDGE_AGENT_ID
 BRIDGE_AGENT_IDS=()
 declare -g -A BRIDGE_AGENT_DESC=()
 declare -g -A BRIDGE_AGENT_ENGINE=()
@@ -2818,7 +2979,7 @@ bridge_linux_prepare_agent_isolation() {
       _ch_id="${_ch_id%%@*}"
       case "$_ch_id" in
         discord)  _ch_target="$(bridge_agent_default_discord_state_dir "$agent")"  ;;
-        telegram) _ch_target="$(bridge_agent_default_telegram_state_dir "$agent")" ;;
+        telegram|telegram-relay) _ch_target="$(bridge_agent_default_telegram_state_dir "$agent")" ;;
         teams)    _ch_target="$(bridge_agent_default_teams_state_dir "$agent")"    ;;
         ms365)    _ch_target="$(bridge_agent_default_ms365_state_dir "$agent")"    ;;
         *) continue ;;
@@ -2841,7 +3002,7 @@ bridge_linux_prepare_agent_isolation() {
   # isolated user's home and its .claude subdirectory. `/home` and `/`
   # stay untouched — the controller reaches them via base perms.
   bridge_linux_acl_add "u:${controller_user}:--x" "$user_home" >/dev/null 2>&1 || true
-  bridge_linux_acl_add "u:${controller_user}:r-x" "$isolated_claude_dir" >/dev/null 2>&1 || true
+  bridge_linux_repair_isolated_claude_read_lens "$os_user" "$user_home" "$controller_user" >/dev/null 2>&1 || true
   # Default ACL on .claude/ so any subdirectory (projects/, sessions/, ...)
   # created later by the isolated UID inherits controller read access.
   # PR-E: in v2 mode the per-agent group + setgid contract covers
@@ -3246,7 +3407,7 @@ bridge_qualify_channel_item() {
   }
 
   case "$item" in
-    plugin:discord@claude-plugins-official|plugin:telegram@claude-plugins-official)
+    plugin:discord@claude-plugins-official|plugin:telegram@claude-plugins-official|plugin:telegram-relay@agent-bridge)
       printf '%s' "$item"
       return 0
       ;;
@@ -3259,7 +3420,7 @@ bridge_qualify_channel_item() {
         printf 'plugin:%s@claude-plugins-official' "$plugin_name"
         return 0
         ;;
-      teams)
+      teams|telegram-relay)
         printf 'plugin:%s@agent-bridge' "$plugin_name"
         return 0
         ;;
@@ -3692,7 +3853,7 @@ bridge_agent_channel_runtime_ready_for_item() {
       [[ -f "$dir/access.json" ]] || return 1
       bridge_env_file_has_any_nonempty_key "$dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN
       ;;
-    plugin:telegram|plugin:telegram@*)
+    plugin:telegram|plugin:telegram@*|plugin:telegram-relay|plugin:telegram-relay@*)
       dir="$(bridge_agent_telegram_state_dir "$agent")"
       [[ -f "$dir/access.json" ]] || return 1
       bridge_env_file_has_any_nonempty_key "$dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN
@@ -3729,7 +3890,7 @@ bridge_channel_provider_for_item() {
     plugin:discord|plugin:discord@*)
       printf '%s' "discord"
       ;;
-    plugin:telegram|plugin:telegram@*)
+    plugin:telegram|plugin:telegram@*|plugin:telegram-relay|plugin:telegram-relay@*)
       printf '%s' "telegram"
       ;;
     plugin:teams|plugin:teams@*)
@@ -3759,7 +3920,7 @@ bridge_channel_state_dir_for_item() {
     plugin:discord|plugin:discord@*)
       bridge_agent_discord_state_dir "$agent"
       ;;
-    plugin:telegram|plugin:telegram@*)
+    plugin:telegram|plugin:telegram@*|plugin:telegram-relay|plugin:telegram-relay@*)
       bridge_agent_telegram_state_dir "$agent"
       ;;
     plugin:teams|plugin:teams@*)
@@ -3788,7 +3949,7 @@ bridge_channel_credentials_status_for_item() {
     plugin:discord|plugin:discord@*)
       bridge_env_file_has_any_nonempty_key "$dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN && printf '%s' "present" || printf '%s' "missing"
       ;;
-    plugin:telegram|plugin:telegram@*)
+    plugin:telegram|plugin:telegram@*|plugin:telegram-relay|plugin:telegram-relay@*)
       bridge_env_file_has_any_nonempty_key "$dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN && printf '%s' "present" || printf '%s' "missing"
       ;;
     plugin:teams|plugin:teams@*)
@@ -4293,6 +4454,9 @@ bridge_plugin_mcp_identity_for_item() {
     plugin:discord|plugin:discord@*)
       printf '%s' "discord"
       ;;
+    plugin:telegram-relay|plugin:telegram-relay@*)
+      printf '%s' "telegram-relay"
+      ;;
     plugin:telegram|plugin:telegram@*)
       printf '%s' "telegram"
       ;;
@@ -4604,7 +4768,8 @@ bridge_agent_runtime_channel_status_reason() {
     fi
   fi
 
-  if bridge_channel_csv_contains "$required" "plugin:telegram"; then
+  if bridge_channel_csv_contains "$required" "plugin:telegram" \
+      || bridge_channel_csv_contains "$required" "plugin:telegram-relay"; then
     telegram_dir="$(bridge_agent_telegram_state_dir "$agent")"
     if [[ ! -f "$telegram_dir/access.json" ]]; then
       printf 'missing Telegram access file under %s (access.json required)' "$telegram_dir"
@@ -4660,7 +4825,9 @@ bridge_agent_channel_setup_guidance() {
   if bridge_channel_csv_contains "$required" "plugin:discord"; then
     printf "\nRun: %s setup discord %s --token <DISCORD_BOT_TOKEN> --channel <DISCORD_CHANNEL_ID>" "$cli" "$agent"
   fi
-  if bridge_channel_csv_contains "$required" "plugin:telegram"; then
+  if bridge_channel_csv_contains "$required" "plugin:telegram-relay"; then
+    printf "\nRun: %s setup telegram %s --token <TELEGRAM_BOT_TOKEN> --allow-from <TELEGRAM_USER_ID> --default-chat <TELEGRAM_CHAT_ID> --use-relay" "$cli" "$agent"
+  elif bridge_channel_csv_contains "$required" "plugin:telegram"; then
     printf "\nRun: %s setup telegram %s --token <TELEGRAM_BOT_TOKEN> --allow-from <TELEGRAM_USER_ID> --default-chat <TELEGRAM_CHAT_ID>" "$cli" "$agent"
   fi
   if bridge_channel_csv_contains "$required" "plugin:teams"; then
@@ -5013,7 +5180,7 @@ bridge_ensure_claude_channel_plugins_for_csv() {
     item="$(bridge_trim_whitespace "$item")"
     [[ "$item" == plugin:* ]] || continue
     plugin_spec="${item#plugin:}"
-    if [[ "$plugin_spec" == teams@agent-bridge ]]; then
+    if [[ "$plugin_spec" == *@agent-bridge ]]; then
       bridge_ensure_agent_bridge_claude_marketplace
     fi
     bridge_ensure_claude_plugin_enabled "$plugin_spec"
@@ -5666,7 +5833,7 @@ bridge_plugin_channel_state_dir() {
     discord)
       bridge_agent_discord_state_dir "$agent"
       ;;
-    telegram)
+    telegram|telegram-relay)
       bridge_agent_telegram_state_dir "$agent"
       ;;
     ms365)

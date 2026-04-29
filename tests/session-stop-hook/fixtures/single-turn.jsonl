@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"sess-stop-A","timestamp":"2026-04-01T01:00:00.000Z","message":{"role":"user","content":"hello from stop hook smoke"}}
+{"type":"assistant","sessionId":"sess-stop-A","timestamp":"2026-04-01T01:00:30.000Z","message":{"role":"assistant","content":[{"type":"text","text":"acknowledged"}]}}

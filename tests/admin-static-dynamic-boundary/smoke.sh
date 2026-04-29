@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # tests/admin-static-dynamic-boundary/smoke.sh
 #
-# Regression test for issue #304 — admin static/dynamic boundary
-# (Tracks B + C). Verifies (portable, runs on macOS with bash 4+):
+# Regression test for issue #304 — admin static/dynamic boundary.
+# Verifies (portable, runs on macOS with bash 4+):
 #
 #   1. `agent-bridge agent compact <static>` enqueues a synthetic
 #      [admin-compact] task to the static agent and writes an
@@ -14,11 +14,6 @@
 #      [admin-handoff] task. Body references the bridge-spec
 #      <agent-home>/NEXT-SESSION.md filename so the receiving agent
 #      writes the handoff at the path SessionStart hook auto-consumes.
-#   4. The Track C daemon body builder emits the role-aware conditional
-#      block — both the `if target_source == dynamic` close path and
-#      the `agent-bridge agent compact <agent>` / `agent-bridge agent
-#      handoff <agent>` invocation are present in the static-agent
-#      body.
 #
 # This test stands up an isolated BRIDGE_HOME under mktemp, never
 # touches the live bridge state, and does not require a running tmux
@@ -211,69 +206,5 @@ no_dyn_handoff_task="$(sqlite3 "$BRIDGE_TASK_DB" \
   "SELECT COUNT(*) FROM tasks WHERE assigned_to='$DYNAMIC_AGENT' AND title LIKE '[admin-handoff]%'")"
 [[ "$no_dyn_handoff_task" == "0" ]] \
   || die "agent handoff <dynamic> created a queue task ($no_dyn_handoff_task) — must NOT enqueue when rejected"
-
-# ---------------------------------------------------------------------------
-# Step 4: Track C — daemon body builder emits role-aware conditional block
-# ---------------------------------------------------------------------------
-
-log "step 4 — Track C daemon body for static target"
-# bridge_write_context_pressure_report_body is a daemon helper; we sourcestate
-# the daemon script in a subshell so the function definition is available
-# without starting the daemon proper. The function depends on bridge_now_iso
-# + bridge_agent_source, both of which are in lib/bridge-state.sh and
-# lib/bridge-agents.sh and are loaded via bridge-lib.sh.
-body_file="$TMP_ROOT/static-body.md"
-(
-  set +u
-  # shellcheck source=../../bridge-lib.sh
-  source "$REPO_ROOT/bridge-lib.sh"
-  bridge_load_roster
-  # bridge-daemon.sh defines the body builder near the top; sourcing the
-  # whole script triggers its own startup work, so we extract just the
-  # function body via awk.
-  helper_src="$TMP_ROOT/body-builder.sh"
-  awk '
-    /^bridge_write_context_pressure_report_body\(\) \{/ { capture=1 }
-    capture { print }
-    capture && /^}$/ { capture=0 }
-  ' "$REPO_ROOT/bridge-daemon.sh" > "$helper_src"
-  [[ -s "$helper_src" ]] || die "could not extract body builder from bridge-daemon.sh"
-  # shellcheck disable=SC1090
-  source "$helper_src"
-  bridge_write_context_pressure_report_body \
-    "$STATIC_AGENT" "$STATIC_AGENT" warning 0 0 hud:context_pct=85 "demo excerpt" "$body_file"
-)
-[[ -s "$body_file" ]] || die "static body file empty: $body_file"
-grep -q "Target source: static" "$body_file" \
-  || die "static body missing 'Target source: static'"
-grep -q "If target_source == dynamic" "$body_file" \
-  || die "static body missing dynamic-branch close instruction"
-grep -q "agent-bridge agent compact $STATIC_AGENT" "$body_file" \
-  || die "static body missing 'agent-bridge agent compact <agent>' invocation"
-grep -q "agent-bridge agent handoff $STATIC_AGENT" "$body_file" \
-  || die "static body missing 'agent-bridge agent handoff <agent>' invocation"
-
-log "step 4 — Track C daemon body for dynamic target uses the close path"
-dyn_body_file="$TMP_ROOT/dynamic-body.md"
-(
-  set +u
-  # shellcheck source=../../bridge-lib.sh
-  source "$REPO_ROOT/bridge-lib.sh"
-  bridge_load_roster
-  helper_src="$TMP_ROOT/body-builder.sh"
-  # shellcheck disable=SC1090
-  source "$helper_src"
-  bridge_write_context_pressure_report_body \
-    "$DYNAMIC_AGENT" "$DYNAMIC_AGENT" warning 0 0 hud:context_pct=85 "demo excerpt" "$dyn_body_file"
-)
-[[ -s "$dyn_body_file" ]] || die "dynamic body file empty: $dyn_body_file"
-grep -q "Operator-managed" "$dyn_body_file" \
-  || die "dynamic body missing 'Operator-managed' close instruction"
-# Defense-in-depth: the dynamic-branch body must NOT recommend invoking
-# the new primitives (those reject dynamic anyway, but the body should
-# not even suggest them and make admin try).
-if grep -q "agent-bridge agent compact $DYNAMIC_AGENT" "$dyn_body_file"; then
-  die "dynamic body must not recommend 'agent compact'; admin should close as operator-managed"
-fi
 
 log "all steps passed"

@@ -13,6 +13,15 @@ from pathlib import Path
 from typing import Any
 
 
+# Claude Code 2.1.123 exposes autoCompactWindow in user settings. Avoid
+# setting CLAUDE_CODE_AUTO_COMPACT_WINDOW here because that env var takes
+# precedence over settings and would make operator overlays harder to reason
+# about.
+BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS: dict[str, Any] = {
+    "autoCompactWindow": 400000,
+}
+
+
 def load_json(path: Path) -> Any:
     if not path.exists():
         return {}
@@ -723,7 +732,8 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     if not isinstance(overlay_payload, dict):
         raise SystemExit(f"shared settings overlay must be a JSON object: {overlay_path}")
 
-    merged = merge_settings(base_payload, overlay_payload)
+    merged = merge_settings(BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS, base_payload)
+    merged = merge_settings(merged, overlay_payload)
     save_json(effective_path, merged)
 
     payload = {

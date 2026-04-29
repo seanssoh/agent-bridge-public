@@ -5,30 +5,185 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_legacy_full:
+        description: "Run archived legacy full smoke monolith"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    # Nightly KST morning run for long and environment-sensitive smoke.
+    - cron: "0 19 * * *"
 
 permissions:
   contents: read
 
+env:
+  BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
 jobs:
-  smoke:
+  syntax:
+    name: syntax
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tmux shellcheck
+        with:
+          fetch-depth: 0
 
       - name: Verify shell syntax
-        run: bash -n *.sh agent-bridge agb lib/*.sh scripts/*.sh
+        run: |
+          set -euo pipefail
+          git ls-files -z '*.sh' 'agent-bridge' 'agb' \
+            | xargs -0 -n 1 bash -n
+
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
 
       - name: Run shellcheck
-        run: shellcheck *.sh agent-bridge agb lib/*.sh scripts/*.sh agent-roster.local.example.sh
+        run: |
+          set -euo pipefail
+          shellcheck --severity=warning \
+            *.sh \
+            agent-bridge \
+            agb \
+            lib/*.sh \
+            scripts/*.sh \
+            scripts/smoke/*.sh \
+            agent-roster.local.example.sh
+
+  oss-preflight:
+    name: oss-preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Run OSS preflight
         run: bash ./scripts/oss-preflight.sh
 
-      - name: Run isolated smoke test
-        run: ./scripts/smoke-test.sh
+  unit-static-smoke:
+    name: unit/static smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs:
+      - syntax
+      - lint
+      - oss-preflight
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show selected required smoke
+        id: required-smoke
+        run: |
+          set -euo pipefail
+          selected="$(bash ./scripts/ci-select-smoke.sh --suite required --base "$BASE_SHA" --head "$HEAD_SHA")"
+          printf '%s\n' "$selected"
+          if grep -Eqx 'scripts/smoke/(telegram-relay-plugin|mattermost-plugin)\.sh' <<<"$selected"; then
+            echo "needs_bun=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "needs_bun=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Install bun
+        if: steps.required-smoke.outputs.needs_bun == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Run selected required smoke
+        run: bash ./scripts/ci-select-smoke.sh --suite required --base "$BASE_SHA" --head "$HEAD_SHA" --run
+
+  integration-smoke:
+    name: integration smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs:
+      - syntax
+      - lint
+      - oss-preflight
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show selected integration smoke
+        run: bash ./scripts/ci-select-smoke.sh --suite integration --base "$BASE_SHA" --head "$HEAD_SHA"
+
+      - name: Run selected integration smoke
+        run: bash ./scripts/ci-select-smoke.sh --suite integration --base "$BASE_SHA" --head "$HEAD_SHA" --run
+
+  live-tmux-daemon-smoke:
+    name: live/tmux/daemon smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs:
+      - syntax
+      - lint
+      - oss-preflight
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' || github.event_name == 'push'
+    continue-on-error: ${{ github.event_name != 'schedule' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install live smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+
+      - name: Show selected live smoke
+        run: bash ./scripts/ci-select-smoke.sh --suite live --base "$BASE_SHA" --head "$HEAD_SHA"
+
+      - name: Run selected live smoke
+        run: bash ./scripts/ci-select-smoke.sh --suite live --base "$BASE_SHA" --head "$HEAD_SHA" --run
+
+  legacy-full-smoke:
+    name: legacy-full-smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs:
+      - syntax
+      - lint
+      - oss-preflight
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_full == true }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install legacy smoke dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux shellcheck
+
+      - name: Run legacy full smoke
+        run: |
+          echo "legacy-full-smoke is archived and opt-in only; modular smoke jobs are the deploy/PR signal."
+          timeout 12m bash ./scripts/smoke/legacy-full-smoke.sh

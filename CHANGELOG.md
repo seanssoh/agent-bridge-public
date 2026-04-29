@@ -6,6 +6,471 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.38] — 2026-04-29
+
+### Highlight — `OPERATOR_ACTIONS_PENDING.md` mechanism
+
+`v0.6.38` ships a small but cross-cutting mechanism so that release-specific operator actions (like v0.6.37's telegram-relay opt-in) reach every install's admin automatically on the next `agent-bridge upgrade --apply`. Without this, the only way a host's admin learns about a per-release action is by reading the changelog; for low-attention hosts the action gets missed indefinitely.
+
+- **`OPERATOR_ACTIONS_PENDING.md`** at source root. Section per release, newest at top. Each section names the version range it applies to (`applies_when_upgrading_from`), the concrete action to run, the skip rule, and a verification target. The first entry is v0.6.37's telegram-relay opt-in (re-key each Telegram-using agent through `agent-bridge setup telegram <agent> --use-relay --yes` and ensure `BRIDGE_TELEGRAM_RELAY_ENABLED=1` is set in the bridge daemon's environment).
+- **`bridge-upgrade.sh`** post-task body now references the file unconditionally. The existing v0.4.0 wiki bootstrap content is preserved; the new reference is appended, not a replacement. Done-note format extended to include an `operator-actions: <summary>` field.
+- **`docs/agent-runtime/admin-protocol.md`** adds a "Post-Upgrade Operator Actions Pending" section that defines the per-section processing rule (`applies_when_upgrading_from` filter, skip rule, done-note summary). admin agents read this on every session start, so the contract is canonical from the next upgrade onward.
+
+After this release, every host that runs `agent-bridge upgrade --apply` receives an `[upgrade-complete]` task whose body points at the checklist; the admin processes each applicable section and reports back in the done note. Future release PRs update `OPERATOR_ACTIONS_PENDING.md` only — the upgrade machinery itself does not need touching again.
+
+## [0.6.37] — 2026-04-29
+
+### Highlight — #475 telegram-relay daemon fully wired (Phase 2 + Phase 3)
+
+`v0.6.37` finishes the #475 telegram-relay arc that v0.6.36 started. Phase 2 ships the plugin client adapter; Phase 3 ships the setup-time lifecycle wiring + status display. After this release an operator can opt-in with a single `agent-bridge setup telegram <agent> --use-relay --yes` and the SIGTERM-and-replace race in `claude-plugins-official/telegram@0.0.6` (the original #468 cascade) is closed at the architectural level for that agent.
+
+All four #475 architectural blockers are now closed:
+
+1. ✅ Cron cascade (v0.6.35 / #474)
+2. ✅ Admin dead-code instructions (v0.6.36 / #479 #472 follow-up)
+3. ✅ Daemon scaffolding (v0.6.36 / #481 phase 1)
+4. ✅ Plugin client adapter + lifecycle wiring (v0.6.37 / #483 phase 2 + #484 phase 3)
+
+### Telegram-relay plugin client adapter (#483 / #475 phase 2)
+
+- New plugin tree under `plugins/telegram-relay/` (15 files, +1740 LOC). `server.ts` (~785 LOC) is a bun entrypoint that mirrors the upstream `plugin:telegram@claude-plugins-official` MCP tool surface but does NOT call `getUpdates`. It connects to the Phase 1 daemon's unix socket and forwards inbound updates to `agb urgent <agent>` and outbound `reply` calls to the daemon's `send_message` RPC.
+- MCP tool surface: `reply` is the primary tool with `{chat_id, text, reply_to}` schema. `react`, `download_attachment`, `edit_message` are registered as explicit `unsupportedTool` placeholders so Claude sessions calling upstream tool names get a clean error rather than a missing-method failure.
+- Token security: token is read from env (`TELEGRAM_BOT_TOKEN`/`BOT_TOKEN`/`TOKEN`), never accepted on argv, never logged. The plugin passes only `--token-file <path>` to the daemon CLI.
+- Auto-bootstrap: `BRIDGE_TELEGRAM_RELAY_AUTOSPAWN=1` lets the plugin spawn the daemon if it isn't already running. `TELEGRAM_RELAY_REGISTER_TOKEN=1` (default) auto-writes the token-hash to `tokens.list`.
+- Smoke: `scripts/smoke/telegram-relay-plugin.sh` (+364 LOC) stands up the full chain — fake Telegram HTTP server → Phase 1 daemon → two plugin instances. Asserts both plugins receive the same fake update exactly once each (the core fan-out invariant), `reply` round-trips with `chat_id`/`reply_to_message_id`/`text`, plugin SIGTERM doesn't take the daemon down (`relay remains healthy after plugin SIGTERM`), and daemon-restart triggers plugin auto-reconnect with post-restart updates delivered correctly.
+
+### Telegram-relay setup lifecycle wiring + status display (#484 / #475 phase 3)
+
+- `bridge-setup.py telegram --use-relay` (or env `BRIDGE_TELEGRAM_USE_RELAY=1`) now does the full opt-in in one command: writes `.env` + `access.json` (existing data shape unchanged) PLUS a separate `relay-token` file (mode 600, raw token) PLUS registers the token-hash in `~/.agent-bridge/state/channels/telegram/tokens.list` (mode 600). All file writes go through `save_text` which does atomic temp-file rename + `os.chmod(0o600)` both before and after the rename so tokens never appear at any-readable mode even briefly. State root `~/.agent-bridge/state/channels/telegram/` is `chmod 0o700`.
+- Without `--use-relay`, `bridge-setup.py telegram` behavior is byte-for-byte unchanged — existing operators on `plugin:telegram@claude-plugins-official` are not affected. A soft stderr deprecation warning fires when an existing agent is reconfigured WITHOUT `--use-relay` after a grace-period date (`TELEGRAM_RELAY_LEGACY_WARN_AFTER`).
+- `agent-bridge status` (`bridge-status.py +311` LOC) now renders per-agent MCP plugin liveness. For `plugin:telegram-relay@agent-bridge`, four states distinguished:
+  - `not-supervised` — token-hash not in `tokens.list`.
+  - `daemon-down` — relay socket not reachable, OR `health` RPC failed.
+  - `polling-stale` — daemon reachable but `last_get_updates_ts` > 60s.
+  - `connected` — daemon reachable + recent `getUpdates` + ≥ 1 connected client.
+- `agent-bridge status --json` exposes the same liveness as a structured `plugins` field per agent so operators can script against it.
+- `plugins/telegram-relay/README.md` "Opt-In Steps" collapsed from 5 manual steps to 2 (`agent-bridge setup telegram <agent> --use-relay --yes` does the rest). `docs/agent-runtime/migration-guide.md` adds a section for migrating existing agents from `plugin:telegram@claude-plugins-official` to `plugin:telegram-relay@agent-bridge`.
+- New smoke `scripts/smoke/telegram-relay-setup.sh` (+235 LOC) covers the full setup → sync → status round-trip: setup `--use-relay` → tokens.list mode 600 + token hash + token path → `daemon-down` (before supervisor sync) → `bridge-daemon.sh sync` → `connected` → token removal → `not-supervised`. Three of the four status states are exercised in the smoke; `polling-stale` requires time-boundary mocking and is verified manually.
+
+### Operator opt-in (after this release)
+
+Single command on a managed agent:
+
+```
+agent-bridge setup telegram <agent> \
+  --token "<bot-token>" \
+  --allow-from "<user-id>" \
+  --default-chat "<chat-id>" \
+  --use-relay --yes
+```
+
+Then ensure `BRIDGE_TELEGRAM_RELAY_ENABLED=1` is set in the bridge daemon's environment and the next `bridge-daemon.sh sync` cycle will spawn the relay. `agent-bridge status --json` confirms the plugin reports `connected`.
+
+## [0.6.36] — 2026-04-29
+
+### Highlight — context-size auto-compact + telegram-relay daemon phase 1 + admin instruction cleanup
+
+`v0.6.36` lands the longer-tail follow-ups from the same wave that produced v0.6.35. Three of the four open #475 architectural blockers from the Sean / sales_sean Telegram disconnect investigation are now closed (cron cascade in v0.6.35; root-cause polling daemon scaffolding here; admin-side dead-code instructions cleaned up).
+
+- **Setup-time context-size lowering** (#480, closes #473). Each managed Claude agent's `~/.claude/settings.json` now ships with `autoCompactWindow: 400000` as a bridge-managed default. Operator overlays still win — the merge order is `defaults → base → settings.local.json`. Lifecycle hits all three entry points: `agent-bridge agent create`, `bridge-init.sh` admin bootstrap, and `agent-bridge upgrade --apply`. Roster-managed custom workdirs are now treated as shared-settings mode so they pick up the merge without a separate path. The 400k value matches the Claude Code maintainer's public guidance for `[1m]`-variant agents (`autoCompactWindow < 1M`, "400k is a good compromise"); after this PR, Claude Code's *native* auto-compact handles context pressure long before any pane-text pattern would have woken the deprecated daemon-side detector.
+- **Telegram polling relay daemon — Phase 1** (#481, partial close on #475). New `lib/telegram-relay.py` (~785 LOC) is a single-token-owner polling daemon supervised by `bridge-daemon.sh`. Plugin clients become thin RPC clients over a unix socket, eliminating the SIGTERM-and-replace race in the upstream `claude-plugins-official/telegram` plugin at the architectural level. The daemon is **opt-in** via `BRIDGE_TELEGRAM_RELAY_ENABLED=1` (default off) — no live behavior change in this release. Phase 2 (plugin client adapter) and Phase 3 (`bridge-setup.py` wiring + `agent-bridge status` plugin liveness) follow.
+- **Admin role instruction cleanup** (#479, #472 follow-up). `docs/agent-runtime/admin-protocol.md` static-agent maintenance bullet rewritten to make explicit that automatic context-pressure handling is delegated to setup-time context-size lowering (#473) and that `agent-bridge agent compact|handoff <agent>` are now strictly operator-initiated primitives. Closes the docs gap left by #477 deprecating the daemon-driven trigger.
+
+### Setup-time context-size lowering (#480 / #473)
+
+- New `BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS = {"autoCompactWindow": 400000}` constant in `bridge-hooks.py`. Intentionally does NOT set `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var because Claude Code 2.1.123+ has env-var precedence over settings — setting both would silently override operator overlays.
+- `bridge-hooks.py::cmd_render_shared_settings` merge layering: `merge_settings(BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS, base_payload)` → `merge_settings(merged, overlay_payload)`. Operator overlay (`~/.agent-bridge/.claude/settings.local.json`) ALWAYS wins.
+- `bridge_claude_settings_mode` (`lib/bridge-hooks.sh:55-79`) extended: previously only home-root-managed workdirs were `shared`; now also recognizes roster-managed custom workdirs (path comparison via realpath) as `shared`. New helper `bridge_hook_paths_equal` does the realpath compare via Python.
+- `bridge_ensure_claude_shared_settings_for_managed_workdir` is the single entry point that lifecycle paths now call:
+  - `bridge-agent.sh:1313` — `run_create()` after roster reload, before isolation prep, when engine is claude.
+  - `bridge-init.sh:441-446` — admin bootstrap when not in dry-run and admin engine is claude.
+  - `bridge-upgrade.sh:170-185, 1156-1158` — `bridge_upgrade_propagate_claude_shared_settings` iterates every claude-engine roster agent on `--apply`, never on dry-run.
+- New focused smoke (`scripts/smoke/hooks.sh:+125`): bridge defaults only / base wins over defaults / overlay wins over base+defaults / nested env keys preserve / isolated-root overlay preservation / custom managed workdir symlink behavior. 4 assertion helpers added.
+- Codex agents are unaffected (engine guard on every callsite); they have no `~/.claude/settings.json` to merge into.
+
+### Telegram polling relay daemon Phase 1 (#481 / #475)
+
+- **`lib/telegram-relay.py` (+785 / 0)**: single-instance-per-token polling daemon. Reads bot token from a file (mode-checked, never on argv, never logged). Long-polls Telegram `getUpdates` in one thread, fans out to clients via JSON-line RPC over `~/.agent-bridge/state/channels/telegram/<token-hash>.sock`. RPC verbs: `register {client_id, channel_filter}`, `recv {since_id, timeout_seconds}`, `send_message`, `unregister`, `health`. Per-(client, update_id) dedupe + late-join buffer replay (TTL default 24h, max 1000 entries). Cursor + buffer state under `<token-hash>/`, both protected by `state.lock` flock; buffer persist is ordered BEFORE cursor advance so a crash mid-batch can't lose ack'd updates. SIGHUP token rotation: if the new token's hash differs, daemon emits `telegram_relay_token_rotated` audit + graceful exit (supervisor respawns under new hash); same hash is in-place token reload.
+- **`bridge-daemon.sh +54`**: new supervision section reads token-hash list from `~/.agent-bridge/state/channels/telegram/tokens.list`, ensures one relay per hash, audits `telegram_relay_supervise` on spawn. Default off via `BRIDGE_TELEGRAM_RELAY_ENABLED=1` env knob.
+- **`bridge-telegram-relay.sh +54` + `agent-bridge` route**: operator CLI surface `agent-bridge telegram-relay {start|stop|status|health}`. `start --token-file <path> --foreground` for debugging; `status` lists active relays with PID, socket, cursor, client count; `health --token-hash <hash>` calls daemon's `health` RPC and pretty-prints. Token never accepted on the command line.
+- **`scripts/smoke/telegram-relay.sh +233`**: end-to-end smoke against a fake Telegram HTTP server. Asserts: two clients both receive the same update once (fan-out), `send_message` POSTs `chat_id`/`reply_to_message_id`/`text` correctly, daemon SIGTERMs cleanly within deadline (`wait_for_pid_exit` helper), cursor persisted across restart, late-joining client replays buffered updates within TTL, SIGHUP token rotation emits `telegram_relay_token_rotated` audit with `old_hash`/`new_hash` and the daemon exits 0 instead of running with mismatched state. Plus a separate fault-injection case (`BRIDGE_TELEGRAM_RELAY_FAULT_BUFFER_WRITE=1`) that proves cursor never advances past unwritten buffer state.
+- **Phase 2 / Phase 3 deferred**: plugin client adapter (so `claude-plugins-official/telegram@0.0.6/server.ts` becomes a thin RPC client) and lifecycle wiring (`bridge-setup.py telegram` registers the daemon, `agent-bridge status` shows MCP plugin liveness) ship in follow-up PRs. Until those land, `BRIDGE_TELEGRAM_RELAY_ENABLED=0` and nothing live changes.
+
+### Admin instruction cleanup (#479 / #472 follow-up)
+
+- `docs/agent-runtime/admin-protocol.md:83` (the static-agent maintenance bullet) rewritten to two bullets:
+  1. Automatic context-pressure handling is delegated to setup-time Claude Code context-size lowering (#473). The daemon no longer auto-creates `[context-pressure]` tasks (#472).
+  2. `agent-bridge agent compact|handoff <agent>` remain valid as **operator-initiated** primitives only. Both reject dynamic agents (defense in depth) and write synthetic queue tasks + audit rows on the static path.
+- Single-file doc change; no code or CI surface touched.
+
+## [0.6.35] — 2026-04-29
+
+### Highlight — Telegram disconnect mitigation + admin-compact pipeline removal + agent CLAUDE.md slim
+
+`v0.6.35` ships three independent improvements that landed in the same wave:
+
+- **Telegram MCP plugin mid-session disconnect cascade — short-term mitigation** (#474, closes #468 cron-driven path). Cron disposable children no longer auto-load MCP plugins by default, which prevents the upstream telegram plugin's stale-pid SIGTERM logic from killing the parent agent's live poller every cron tick. Net: 30-min cron-cascade-driven disconnects on `event-reminder-30min` / `librarian-watchdog` / `picker-sweep` etc. stop firing. Cron cold-start cost also drops ~49% (~22K input tokens / run on the SYRS reference install).
+- **Admin-compact queue-trigger pipeline deprecated** (#477, closes #472). The daemon-driven `[context-pressure]` → `[admin-compact]` queue chain is removed because Claude Code agents have no in-session primitive to invoke their own compaction; the chain only produced queue noise + orphan `NEXT-SESSION.md` files. Detection + audit telemetry (`context_pressure_detected`, `_suppressed`, `_recovered`) is preserved. Manual operator primitives (`agent-bridge agent compact|handoff <agent>`) stay valid. Replacement direction is setup-time `~/.claude/settings.json` context-size lowering — tracked separately in #473.
+- **`_template/CLAUDE.md` managed block slimmed** (#476, closes #471). 206 lines / 27 KB → 97 lines / 9.3 KB (≈ 64% reduction). Verbose admin-only and common-protocol bodies moved to `docs/agent-runtime/{common-instructions,admin-protocol}.md`; the per-agent template carries pointers only. `bridge-migrate.py overhead` extended with legacy inline section detection + file-side `CLAUDE.md.bak-<YYYYMMDD>-managed-block` sidecar backup on apply.
+
+### Cron MCP default flip (#474)
+
+- `bridge-cron-runner.py::disable_mcp_for_request` default flipped from `False` to `True` for non-channel cron disposable children. Channel relays (`disposable_needs_channels=True`) and explicit per-job `metadata.disableMcp=False` continue to load MCP. Existing recurring jobs (`event-reminder-30min`, `librarian-watchdog`, `picker-sweep`) automatically benefit; no manifest changes needed.
+- `--strict-mcp-config` is the only flag passed (no separate `--mcp-config <path>`). Live `claude -p` reproduction confirmed `--strict-mcp-config` alone is sufficient and `--bare` is unsuitable for cron because it skips auth.
+- Precedence chain remains: channel safety override > `BRIDGE_CRON_DISPOSABLE_DISABLE_MCP` env > per-job `metadata.disableMcp` > **default True (new)**.
+- 8-case unit harness in `scripts/smoke-test.sh` covers all paths (safety override, env, per-job opt-out/in, default flip).
+
+### Admin-compact pipeline deprecation (#477)
+
+- `bridge-daemon.sh::process_context_pressure_reports` reduced to detection-only. The 199-line static-target task creation + direct-notify + body-builder block is removed; audit rows (`context_pressure_detected` on severity edge or hash drift, `context_pressure_suppressed` for dynamic agents, `context_pressure_recovered` on empty-severity recovery) and per-agent state-file telemetry are preserved.
+- Helpers no longer used (`bridge_context_pressure_title`, `_title_prefix`, `_priority`, `_decode_excerpt`, `bridge_write_context_pressure_report_body`) deleted.
+- `bridge-cron-runner.py::notify_admin_pressure_defer` and its caller removed; cron memory-pressure deferral itself (queue lifecycle + `cron_dispatch_deferred` audit) is preserved.
+- Smoke harness updated: `scripts/smoke-test.sh` and `tests/admin-static-dynamic-boundary/smoke.sh` drop legacy `[context-pressure]` task-creation assertions; new function-level unit covers all four audit modalities (static warning, hash drift, dynamic suppression, recovery) with `bridge_queue_cli`/`bridge_notify_send` stubs wired to `exit 99` so any accidental regression hard-fails the test.
+- Manual primitives (`agent-bridge agent compact|handoff <agent>`) and `NEXT-SESSION.md` SessionStart-hook ingestion untouched. `[admin-handoff]` operator-driven path out of scope.
+- `agents/_template/CLAUDE.md` admin instruction telling the admin to call `agent compact` on `[context-pressure]` tasks is intentionally NOT modified in this PR — it follows in a small follow-up after #476's doc-slim merged. The admin-side instruction now lives in `docs/agent-runtime/admin-protocol.md` and the follow-up will drop it there.
+
+### Agent CLAUDE.md slim (#476)
+
+- `agents/_template/CLAUDE.md` managed block (`<!-- BEGIN/END AGENT BRIDGE DOC MIGRATION -->`) reduced from 206 lines / 27 KB to 97 lines / 9.3 KB. The verbose bodies of "Agent Bridge external push policy" (50 lines + JSON schema), "Autonomy & Anti-Stall" (7 lines), "Upstream Issue Policy" (10 lines), "Admin First-Run Onboarding Defaults" (~20 lines), "Admin Self-Cleanup of Own Queue" (12 lines), "Admin Static vs Dynamic Agent Boundary" (7 lines), "Admin Upgrade Protocol" (7 lines), and "Channel Setup Protocol" (12 lines) are removed. The slim block keeps `Agent Bridge Runtime Canon`, `Runtime Protocol Pointers` (new), `Queue & Delivery`, a 1-line `Task Processing Protocol`, `Change Reporting`, and `Legacy Guardrails`.
+- Backfilled into `docs/agent-runtime/common-instructions.md`: `External Push Handling`, `Channel Setup Protocol`, and the previously-missing `Change Reporting` section. Variants of "Admin First-Run Onboarding Defaults" / "Admin Self-Cleanup" / "Admin Static-vs-Dynamic" / "Admin Upgrade" already lived in `docs/agent-runtime/admin-protocol.md`.
+- `bridge-docs.py::render_agent_bridge_block` refactored to render pointer-style managed blocks. The role-filter (admin role gets `ADMIN-PROTOCOL.md` symlink + an `Admin Protocol Pointer` block) is preserved.
+- `bridge-migrate.py overhead` extended:
+  - `dry-run` reports per-agent `legacy_inline_blocks` (the headers from the slimmed list above, when found inside the managed block) alongside the byte-count diff.
+  - `apply` writes the rollback backup under `state/doc-migration/backups-<stamp>/<agent>.CLAUDE.md.bak` AND, when legacy inline sections are detected, a file-side sidecar `CLAUDE.md.bak-<YYYYMMDD>-managed-block` next to the agent's `CLAUDE.md` for operator inspection.
+  - Rollback uses the state backup; sidecar is operator-only and stays in place.
+- Smoke assertion swapped from inline `## Autonomy & Anti-Stall` text to pointer-based `## Runtime Protocol Pointers` + `COMMON-INSTRUCTIONS.md` checks (`scripts/smoke-test.sh`).
+- Net effect on a 20-agent install: managed-block bytes drop from ~540 KB to ~190 KB across all agents.
+
+### Other tracked issues
+
+- **#475 — Telegram polling: single-owner relay daemon** (registered, not implemented). Long-term root-cause fix for the #468 cascade. Moves the polling consumer for each Telegram bot token out of the per-session MCP plugin process and into a single supervised daemon owned by Agent Bridge runtime. Plugin process becomes a thin RPC client over a local socket. Closes both #468 (telegram singleton-lock cascade) and #234 (bun-based MCP parent-death) at the architectural level. Tracked for a future sprint; #474 is the short-term mitigation.
+
+## [0.6.34] — 2026-04-28
+
+### Highlight — memory pipeline rewiring (#390 PR-1/2/3)
+
+`v0.6.34` ships 3 of the 4 #390 memory-pipeline rewiring PRs that close the
+gaps where always-on agents' daily JSONL conversations weren't reaching wiki/
+memory. PR-4 (PreCompact threshold tuning) is operator-policy and stays a
+follow-up.
+
+The release also includes `static agent restart recovery hardening` (#447),
+`dev plugin cache source-overlay fix`, and the previously-shipped
+`v0.6.30 isolated-agent residuals hotfix series` continuation.
+
+### Memory pipeline (#390 PR-1/2/3)
+
+- **`feat(memory-pipeline): daily-note-reconcile.py`** (PR #449, #390 PR-1).
+  Ships the dependency for the rest of the rewiring sequence — a thin
+  idempotent script that merges a Claude session jsonl into the agent's
+  daily note. Per-turn sha1 fingerprints stored inside the existing
+  `bridge-daily-meta` JSON envelope under `reconciled_fingerprints`. CLI
+  exposes `--agent <id> --jsonl <path> [--date YYYY-MM-DD] [--dry-run]
+  [--memory-dir <path>] [--transcripts-home <path>] [--json]`. fcntl.flock
+  on a sentinel file spans read/modify/write so concurrent invocations
+  (cron + Stop hook) don't lose updates. Path traversal sanitization on
+  `--agent` (allowlist `[A-Za-z0-9_-]+`) and `--memory-dir` (must resolve
+  within `BRIDGE_HOME`). Manifest recovery from body when the meta-block
+  manifest is missing/corrupt — re-fingerprints existing turn blocks
+  before treating them as new (prevents duplicate-on-first-run-after-
+  manifest-loss).
+- **`feat(memory-pipeline): Stop hook → daily-note-reconcile`** (PR #450,
+  #390 PR-2). Adds `hooks/session-stop.py` that invokes the reconcile
+  script when a Claude session ends. Primary jsonl source is the Stop
+  event stdin's `transcript_path` (canonical — Claude Code passes the
+  exact jsonl path it just wrote, mirroring `surface-reply-enforce.py`);
+  fallback chain via `bridge-memory.py current-session-id` + workdir
+  slug derivation, honoring `BRIDGE_TRANSCRIPTS_HOME` and
+  `CLAUDE_PROJECT_DIR`. Hook always exits 0 — Stop hooks must not break
+  the operator's session. Registered alongside `surface-reply-enforce`
+  in `agents/_template/.claude/settings.json`'s `Stop` array, timeout 35.
+  `_bridge_home()` returns `Optional[Path]` — when `BRIDGE_HOME` is unset
+  AND the script-parent.parent fallback isn't a recognizable bridge
+  home (no `scripts/`+`agents/` siblings), the hook fast-paths return 0
+  without invoking reconcile from an unexpected location.
+- **`feat(memory-pipeline): cron-side jsonl reconcile in harvester`**
+  (PR #451, #390 PR-3). Modifies `scripts/memory-daily-harvest.sh` to
+  invoke `daily-note-reconcile.py` BEFORE the existing
+  `exec bridge-memory.py harvest-daily ...` calls. Single insertion
+  point covers all operator cron jobs — no per-job payload migration
+  needed. Session-id resolved via `bridge-memory.py current-session-id`
+  with `--home <workdir>` (matching `wrap-up.md` convention). Workdir
+  is realpath-resolved before slug derivation so symlinked or relative
+  workdirs match what the Python helper computes (slug transform:
+  `s:/:-:g; s:\.:-:g`). Reconcile failures are best-effort: logged to
+  stderr, never block the harvest.
+
+### Static agent restart recovery (#447, PR #448)
+
+- **stale env scrub**: `bridge-lib.sh` scrubs missing-root `/tmp/tmp.*`
+  / `/var/tmp/tmp.*` / `/private/tmp/tmp.*` / `$TMPDIR/tmp.*` controller
+  `BRIDGE_*` paths before defaults resolve. Composes with v0.6.32's
+  PR #442 stale-tmp guard. Opt-in escape hatch:
+  `BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1` keeps intentional smoke
+  fixtures working.
+- **NEXT-SESSION.md archive**: delivered handoffs move to
+  `archive/NEXT-SESSION.<stamp>.<digest>.md` instead of being deleted.
+  UserPromptSubmit hook reinforces active handoffs while
+  `NEXT-SESSION.md` exists, reusing the existing digest marker +
+  idempotent handoff queue path.
+- **forced session-id refresh**: fresh NEXT-SESSION Claude restart
+  excludes the previous session id from `bridge_refresh_agent_session_id`'s
+  detection so the persisted state actually rotates.
+- **`false` token recovery**: when a static Claude launch command was
+  corrupted to start with `false` (a previous-session debugging token
+  that survived a restart), the recovery rewrites that exact first
+  token to the constant `claude` while preserving env-assignment
+  prefixes and channel/plugin args. Uses `shlex.split` + re-quoting so
+  shell metacharacters in env values don't bleed into the rebuilt
+  command.
+
+### Dev plugin cache (PR #446, internal task #391)
+
+- **dev plugin source dependency link**: `bridge-dev-plugin-cache.py`
+  now overlays source code (`server.ts`, `package.json`, etc.) into
+  the cache version dir while preserving the cache's installed
+  `node_modules` directory. Source `node_modules` symlinks to cache's
+  `node_modules` so isolated agents resolve dependencies through the
+  cache without bypassing the per-agent ACL boundary. Orphan markers
+  from previous syncs are cleaned up. Idempotent on re-run.
+
+### v0.6.34 upgrade / migration notes
+
+#### Auto
+
+- v0.6.33 → v0.6.34 binary upgrade is straightforward — no schema
+  changes. `agent-bridge upgrade --apply` propagates all four PR groups.
+- Memory pipeline activates immediately on next session-stop (PR-2)
+  and next memory-daily cron tick (PR-3). The new
+  `daily-note-reconcile.py` (PR-1) is the dependency both paths call.
+- Stale-env scrub (PR #448 Fix 1) runs on next bridge command after
+  upgrade.
+
+#### Operator-required
+
+- **None for upgrades from v0.6.33**.
+- **For installs that observed measured capture-0 in the memory
+  pipeline**: PR-1/2/3 close the 3 of 4 gaps documented in #390. Gap 4
+  (PreCompact auto-compact threshold default at 83.5% rarely
+  triggering) remains a follow-up — operators wanting a lower threshold
+  can set `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=<lower>` per the operator
+  policy guidance (this is a knob, not a code change).
+- **For installs with corrupted static-agent launch commands** starting
+  with `false`: the recovery (PR #448 Fix 4) activates on next restart.
+
+## [0.6.33] — 2026-04-28
+
+### Teams plugin — inbound attachment capture
+
+`v0.6.33` ships a single feature for the Teams channel plugin:
+
+- **`feat(teams): capture and download inbound attachments`** (PR #443).
+  Before this release, the Teams plugin (`plugins/teams/server.ts`)
+  dropped `activity.attachments` and forwarded only the text body —
+  inbound PDFs, Excel files, and images never reached the agent. v0.6.33
+  adds a `StoredAttachment` typing and a `downloadAttachments()` helper
+  that downloads file-consent attachments and inline images via
+  anonymous GET to a per-message attachment directory.
+
+  - **Path**: `<TEAMS_STATE_DIR>/attachments/<message_id>/<filename>`
+    (dir 0700, file 0600).
+  - **Cap**: `TEAMS_ATTACHMENT_MAX_BYTES` env (default 50 MB). Both
+    pre-flight `Content-Length` check and in-flight byte counter abort
+    when the cap is exceeded.
+  - **Streaming**: download chunks via the response body reader (Bun
+    `Response.body`); large files never fully buffer in memory.
+  - **Sanitization**: strict allowlists for both `messageId`
+    (`[A-Za-z0-9_:\-]+`) and filename (control chars, `..` segments,
+    shell metachars all defanged). Path traversal attempts fail
+    closed with `download_status=failed`.
+  - **Env validation**: `TEAMS_ATTACHMENTS_DIR` requires absolute path
+    + writable; `TEAMS_ATTACHMENT_MAX_BYTES` bounds-checked
+    (`>0`, `<= 1 GB` ceiling). Invalid values fall back to defaults
+    with a warning instead of crashing.
+  - **Metadata persisted**: per-attachment `name`, `content_type`,
+    `download_status` (`ok` / `skipped_non_file` / `failed`),
+    `local_path`, `size_bytes`, `download_error` — written to both
+    the `StoredMessage` log and the `notifications/claude/channel`
+    meta passed to the agent.
+  - **Cards / non-file attachments**: marked
+    `download_status=skipped_non_file` so the agent still observes
+    their metadata without a download attempt.
+
+  Outbound attachments and bot-token fallback for download URLs that
+  require auth are intentionally NOT in this release — see PR #443
+  for the follow-up plan.
+
+### v0.6.33 upgrade / migration notes
+
+#### Auto
+
+- v0.6.32 → v0.6.33 binary upgrade is straightforward — no schema
+  changes. `agent-bridge upgrade --apply` propagates the change.
+- New env vars (`TEAMS_ATTACHMENTS_DIR`, `TEAMS_ATTACHMENT_MAX_BYTES`)
+  are optional; defaults work for all existing Teams installs.
+
+#### Operator-required
+
+- **None for upgrades from v0.6.32**. Teams plugin starts capturing
+  inbound attachments on next plugin restart. To customize the cap
+  or storage location, set `TEAMS_ATTACHMENT_MAX_BYTES` /
+  `TEAMS_ATTACHMENTS_DIR` in the operator's plugin env.
+
+## [0.6.32] — 2026-04-28
+
+### Hotfix — v0.6.30 isolated-agent residuals (5 fixes)
+
+`v0.6.32` bundles 5 distinct fixes for residual isolated-agent failures verified
+during the v0.6.30/v0.6.31 hotfix cycles. All five land in PR #439's wake to
+close out the v0.6.28-rooted isolation regressions before further feature work:
+
+- **Dev-channel auto-accept under linux-user isolation** (#437, PR #442).
+  PR #431 (in v0.6.30) added a foreground-PGID gate but that gate failed
+  under linux-user isolation because the launch chain is sudo → bash →
+  claude — at picker-show time the foreground PGID could be sudo or
+  bash, with claude spawned later as a child. PR #435 added a polling
+  foreground detector but the outer retry budget was too short (the
+  caller didn't loop long enough for claude to appear under wrappers).
+  v0.6.32 adds:
+  - `bridge_tmux_process_tree_has_claude` — walks the tmux pane's PID
+    descendants (not just foreground PGID) to find `claude`,
+    `claude-*`, or `claude.*` anywhere in the tree.
+  - `bridge_tmux_wait_for_claude_foreground` — bounded 60s/30-check
+    polling helper that returns once claude appears in the descendant
+    tree.
+  - `bridge_tmux_claude_advance_blocker` — integrates the wait helper
+    with `tmux send-keys ... Enter` for the dev-channels picker case.
+- **Direct `bridge-queue.py` proxy routing** (#436 residual, PR #442).
+  PR #439 (in v0.6.31) fixed the bash-side roster load so
+  `bridge_queue_gateway_proxy_agent` could detect proxy mode, but
+  direct Python invocations that bypass the bash dispatcher still
+  tripped on `BRIDGE_TASK_DB=/dev/null` SQLite open. v0.6.32 adds
+  proxy detection at the Python entry point in `bridge-queue.py`:
+  when `BRIDGE_GATEWAY_PROXY=1`, the CLI short-circuits to the
+  gateway client instead of opening the local DB. Gateway recursion
+  is prevented with `BRIDGE_QUEUE_GATEWAY_SERVER=1` set on
+  gateway-spawned children. `agb show/claim/done` body reads now
+  work end-to-end for isolated agents.
+- **Claude credential ACL mask repair** (#441 part 1, PR #442).
+  Claude can rewrite `~/.claude/.credentials.json` with mode 0600
+  and an ACL mask that makes the isolated UID's named-user read
+  grant ineffective, sending the isolated agent back to "Not logged
+  in". v0.6.32 adds `bridge_linux_repair_claude_credentials_access`
+  which `setfacl -m m::r--` to restore the named-user effective
+  rights. The repair runs BEFORE channel-health reads in both
+  `bridge-start.sh` and the daemon health-check path. Gated on
+  Linux + linux-user isolation effective + Claude agent + `sudo`
+  available; skipped cleanly otherwise (no hard-exit on macOS / CI
+  without sudo).
+- **`--cwd` for Teams/MS365 MCP plugin definitions** (PR #442).
+  Dev-channel MCP servers (Teams, MS365) now start from their
+  plugin cache root via Bun `--cwd`, so the per-agent isolation
+  sharing path resolves correctly.
+- **Stale `/tmp/tmp.*` controller env fail-closed** (#441 part 2,
+  PR #442). When isolated agent-env.sh generation sees stale
+  `/tmp/tmp.*` (or `/var/tmp/tmp.*` / `/private/tmp/tmp.*` /
+  `$TMPDIR/tmp.*`) controller `BRIDGE_*` paths from a contaminated
+  controller shell, the generator now refuses the write with a
+  clear operator-facing error rather than serializing ephemeral
+  controller test paths into persistent isolated env files. Guard
+  applies only during persistent agent-env writes; transient
+  exports are unaffected.
+
+### Superseded PRs closed
+
+PR #434 (integrate isolation hotfixes and quiet bootstrap noise) and PR #435
+(retry dev-channel picker foreground readiness) were closed as superseded by
+PR #442. Both were authored before v0.6.30 cut and contained partial overlap
+with PR #430/#431 plus a more polished version of the same dev-channel race
+fix that PR #442 ships.
+
+The "upgrade-bootstrap notification suppression" hunk from PR #434's `623417a`
+commit was not picked up; if still useful, can be filed as a fresh small PR
+off main.
+
+### v0.6.32 upgrade / migration notes
+
+#### Auto
+
+- v0.6.31 → v0.6.32 binary upgrade is straightforward — no schema
+  changes. `agent-bridge upgrade --apply` propagates all five fixes.
+- Credential ACL repair runs lazily on next `bridge-start` /
+  daemon health pass per agent. No manual repair needed.
+
+#### Operator-required
+
+- **None for upgrades from v0.6.31**. Isolated agents that previously
+  hit dev-channel picker timeouts, queue body-read failures, or
+  credential "Not logged in" loops start working on next start /
+  health cycle.
+- **For installs that ran v0.6.28 with stale controller env in their
+  agent-env.sh**: the new fail-closed guard will refuse to regenerate
+  agent-env.sh until the controller shell is clean. Operator action:
+  `unset BRIDGE_*` (or open a fresh terminal) and re-run isolation
+  prepare.
+
+## [0.6.31] — 2026-04-28
+
+### Hotfix — isolated agent queue CLI gateway proxy detection
+
+`v0.6.31` is a single-PR hotfix to v0.6.30 covering a v0.6.28-rooted regression
+that blocked isolated agents from using their queue CLI:
+
+- **`fix(roster): isolated agent queue CLI gateway proxy detection`**
+  (#436, PR #439). On v0.6.28 with linux-user isolation, the queue CLI
+  commands (`agb inbox`, `agb show`, `agb claim`, `agb done`) raised a
+  Python traceback or surfaced `Permission denied` on a peer agent's
+  history `.env` file when run from inside the isolated agent's Claude
+  REPL. Two related bugs in `bridge_load_roster`:
+
+  1. **Missing env export**. When `bridge_load_roster` discovered the
+     per-agent scoped `agent-env.sh` via the `BRIDGE_AGENT_ID +
+     BRIDGE_ACTIVE_AGENT_DIR` fallback (the path designed to keep
+     isolated UIDs off the 0600 global `agent-roster.local.sh`), it
+     sourced the file but did NOT export `BRIDGE_AGENT_ENV_FILE`.
+     The downstream `bridge_queue_gateway_proxy_agent` check at
+     `lib/bridge-core.sh:375` requires that env var, saw it empty,
+     returned 1, and `bridge_queue_cli` fell through to direct
+     `bridge-queue.py` against `BRIDGE_TASK_DB=/dev/null` — SQLite
+     open failed and the process exited with a traceback at the
+     outer `sys.exit(main())` entry.
+  2. **Peer history hydration in scoped roster load**. After sourcing
+     the scoped env, the function still called
+     `bridge_load_static_histories` and
+     `bridge_restore_dynamic_agents_from_history`, which iterate every
+     peer agent's history `.env` under `$BRIDGE_HISTORY_DIR`. Isolated
+     UIDs cannot read peer files (correct ACL), so `source $file`
+     failed loudly with `Permission denied`.
+
+  Fix: after the scoped-env fallback discovery, `export
+  BRIDGE_AGENT_ENV_FILE` so downstream gateway-proxy detection works.
+  Gate `bridge_load_static_histories` +
+  `bridge_restore_dynamic_agents_from_history` on `isolated_env_file`
+  being empty — the scoped env already carries self + sanitized peer
+  metadata, so peer history hydration is unnecessary and unsafe under
+  isolation. `bridge_reconcile_dynamic_agents_from_tmux` is not gated
+  (it self-guards on tmux availability).
+
+  `tests/isolation-peer-routing.sh` extended with three cases: scoped
+  env fallback exports the env-file path, scoped env active skips
+  unreadable peer history (chmod 000 fixture), inverse legacy
+  controller path still hydrates peer history (sentinel asserted).
+
+### v0.6.31 upgrade / migration notes
+
+#### Auto
+
+- v0.6.30 → v0.6.31 binary upgrade is straightforward — no schema
+  changes. `agent-bridge upgrade --apply` propagates the fix.
+- The fix takes effect on the next `bridge_load_roster` invocation
+  (i.e., next `agb` / `bridge-cli` call by an isolated agent). No
+  per-agent state migration required.
+
+#### Operator-required
+
+- **None for upgrades from v0.6.30**. Isolated agents that previously
+  could not use their queue CLI start working immediately.
+
 ## [0.6.30] — 2026-04-28
 
 ### Hotfix release — security + isolation regression

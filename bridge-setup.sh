@@ -12,7 +12,7 @@ usage() {
   cat <<EOF
 Usage:
   $(basename "$0") discord <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--channel <id>]... [--allow-from <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
-  $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+  $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--use-relay (default) | --no-relay] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") teams <agent> [--app-id <id>] [--app-password <secret>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start] [setup options...]
   $(basename "$0") admin <agent>
@@ -40,7 +40,7 @@ EOF
     telegram)
       cat <<EOF
 Usage:
-  $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+  $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--use-relay (default) | --no-relay] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
 EOF
       ;;
     teams)
@@ -387,6 +387,34 @@ bridge_setup_add_agent_channel() {
   BRIDGE_AGENT_CHANNELS["$agent"]="$merged"
 }
 
+bridge_setup_replace_agent_telegram_channel() {
+  local agent="$1"
+  local channel="$2"
+  local current=""
+  local filtered=""
+  local item=""
+  local merged=""
+  local -a items=()
+
+  channel="$(bridge_qualify_channel_item "$channel")"
+  current="$(bridge_agent_channels_csv "$agent")"
+  IFS=',' read -r -a items <<<"$current"
+  for item in "${items[@]}"; do
+    item="$(bridge_qualify_channel_item "$item")"
+    [[ -n "$item" ]] || continue
+    case "$item" in
+      plugin:telegram@claude-plugins-official|plugin:telegram-relay@agent-bridge|plugin:telegram-relay@*)
+        continue
+        ;;
+    esac
+    filtered="$(bridge_merge_channels_csv "$filtered" "$item")"
+  done
+
+  merged="$(bridge_merge_channels_csv "$filtered" "$channel")"
+  bridge_setup_write_local_assoc "BRIDGE_AGENT_CHANNELS" "$agent" "$merged" >/dev/null
+  BRIDGE_AGENT_CHANNELS["$agent"]="$merged"
+}
+
 bridge_setup_ensure_development_channels_launch_flag() {
   local agent="$1"
   local current=""
@@ -493,6 +521,7 @@ run_telegram() {
   local compat_config=""
   local channel_account=""
   local dry_run=0
+  local use_relay=1
   local py_args=()
   local base_args=()
 
@@ -506,6 +535,14 @@ run_telegram() {
   bridge_setup_require_claude_agent "$agent" "Telegram"
   runtime_config="$(bridge_compat_config_file)"
   compat_config="$(bridge_compat_config_file)"
+  case "${BRIDGE_TELEGRAM_USE_RELAY:-}" in
+    0|false|FALSE|no|NO|off|OFF)
+      use_relay=0
+      ;;
+    1|true|TRUE|yes|YES|on|ON)
+      use_relay=1
+      ;;
+  esac
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -525,6 +562,16 @@ run_telegram() {
         py_args+=("$1")
         shift
         ;;
+      --use-relay)
+        use_relay=1
+        py_args+=("$1")
+        shift
+        ;;
+      --no-relay)
+        use_relay=0
+        py_args+=("$1")
+        shift
+        ;;
       *)
         bridge_die "지원하지 않는 setup telegram 옵션입니다: $1"
         ;;
@@ -538,11 +585,23 @@ run_telegram() {
     --agent "$agent"
     --telegram-dir "$telegram_dir"
     --runtime-config "$runtime_config"
+    --bridge-state-dir "$BRIDGE_STATE_DIR"
   )
 
   bridge_setup_python "${base_args[@]}" "${py_args[@]}"
   if [[ $dry_run -eq 0 ]]; then
-    bridge_setup_add_agent_channel "$agent" "plugin:telegram"
+    if [[ $use_relay -eq 1 ]]; then
+      bridge_setup_replace_agent_telegram_channel "$agent" "plugin:telegram-relay@agent-bridge"
+      bridge_setup_write_local_scalar "BRIDGE_TELEGRAM_RELAY_ENABLED" "1" >/dev/null
+      BRIDGE_TELEGRAM_RELAY_ENABLED=1
+      if bridge_setup_ensure_development_channels_launch_flag "$agent"; then
+        bridge_info "[info] added --dangerously-load-development-channels $(bridge_agent_dev_channels_csv "$agent") to $agent launch"
+      else
+        bridge_info "[info] $agent launch already allows development channels: $(bridge_agent_dev_channels_csv "$agent")"
+      fi
+    else
+      bridge_setup_replace_agent_telegram_channel "$agent" "plugin:telegram"
+    fi
     if [[ -n "$channel_account" ]]; then
       bridge_setup_sync_runtime_account "$runtime_config" "$compat_config" "telegram" "$channel_account"
       bridge_setup_write_local_assoc "BRIDGE_AGENT_NOTIFY_ACCOUNT" "$agent" "$channel_account" >/dev/null
@@ -718,6 +777,10 @@ run_agent() {
         teams_args+=("$1")
         shift
         ;;
+      --use-relay|--no-relay)
+        telegram_args+=("$1")
+        shift
+        ;;
       *)
         bridge_die "지원하지 않는 setup agent 옵션입니다: $1"
         ;;
@@ -752,7 +815,9 @@ run_agent() {
     mapfile -t access_channels < <(bridge_setup_access_channels "$(bridge_agent_discord_state_dir "$agent")" || true)
   fi
 
-  if [[ $skip_telegram -eq 0 ]] && bridge_channel_csv_contains "$required_channels" "plugin:telegram"; then
+  if [[ $skip_telegram -eq 0 ]] \
+      && { bridge_channel_csv_contains "$required_channels" "plugin:telegram" \
+        || bridge_channel_csv_contains "$required_channels" "plugin:telegram-relay"; }; then
     echo "== Telegram setup =="
     if ! run_telegram "$agent" "${telegram_args[@]}"; then
       failures=$((failures + 1))
@@ -959,7 +1024,9 @@ run_agent() {
       warnings+=("Roster Discord channel $roster_channel is not in $(bridge_agent_discord_state_dir "$agent")/access.json. Re-run 'agent-bridge setup discord $agent' or update the allowlist.")
     fi
   fi
-  if bridge_channel_csv_contains "$required_channels" "plugin:telegram" && [[ ${#telegram_allow_from[@]} -eq 0 ]]; then
+  if { bridge_channel_csv_contains "$required_channels" "plugin:telegram" \
+      || bridge_channel_csv_contains "$required_channels" "plugin:telegram-relay"; } \
+      && [[ ${#telegram_allow_from[@]} -eq 0 ]]; then
     warnings+=("Telegram role has no allow_from ids in $(bridge_agent_telegram_state_dir "$agent")/access.json. Re-run 'agent-bridge setup telegram $agent' and add intended users.")
   fi
   if bridge_channel_csv_contains "$required_channels" "plugin:teams" && [[ ${#teams_allow_from[@]} -eq 0 && ${#teams_conversations[@]} -eq 0 ]]; then

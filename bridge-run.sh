@@ -277,6 +277,19 @@ bridge_run_refresh_roster_if_changed() {
   BRIDGE_RUN_ROSTER_SIGNATURE="$signature"
 }
 
+# Returns 0 if there is at least one open (queued/claimed/blocked) handoff
+# task for the agent. Used by bridge_run_reconcile_next_session_state to
+# preserve NEXT-SESSION.md while the next session has not yet acknowledged
+# the handoff. find-open already excludes terminal states.
+bridge_run_handoff_pending_for_agent() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  local found=""
+  found="$(bridge_queue_cli find-open --agent "$agent" \
+    --title-prefix "[bridge:handoff-pending]" --format id 2>/dev/null || true)"
+  [[ -n "$found" ]]
+}
+
 bridge_run_reconcile_next_session_state() {
   local next_file=""
   local marker_file=""
@@ -288,11 +301,16 @@ bridge_run_reconcile_next_session_state() {
   next_file="$(bridge_agent_next_session_file "$AGENT")"
   [[ -f "$next_file" ]] || return 0
 
+  if bridge_run_handoff_pending_for_agent "$AGENT"; then
+    log_line "[info] NEXT-SESSION.md preserved — handoff task pending for $AGENT"
+    return 0
+  fi
+
   age_seconds="$(bridge_agent_maybe_expire_next_session "$AGENT" "$ttl_seconds" || true)"
   if [[ "$age_seconds" =~ ^[0-9]+$ ]]; then
     marker_file="$(bridge_agent_next_session_marker_file "$AGENT")"
-    log_line "[info] auto-cleared stale NEXT-SESSION.md after ${age_seconds}s (previous handoff digest was already delivered)"
-    bridge_audit_log daemon next_session_autocleared "$AGENT" \
+    log_line "[info] auto-archived stale NEXT-SESSION.md after ${age_seconds}s (previous handoff digest was already delivered)"
+    bridge_audit_log daemon next_session_autoarchived "$AGENT" \
       --detail age_seconds="$age_seconds" \
       --detail ttl_seconds="$ttl_seconds" \
       --detail next_session_file="$next_file" \
@@ -308,6 +326,7 @@ bridge_run_reconcile_next_session_state() {
 bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
   local next_file="$WORK_DIR/NEXT-SESSION.md"
   local marker_file=""
+  local previous_session_id="${1:-}"
 
   [[ "$ENGINE" == "claude" ]] || return 0
   [[ $SAFE_MODE -eq 0 ]] || return 0
@@ -321,9 +340,12 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
       agent="$3"
       marker_file="$4"
       next_file="$5"
+      previous_session_id="$6"
       source "$script_dir/bridge-lib.sh"
       if bridge_tmux_wait_for_prompt "$session" claude 30; then
-        if [[ -z "$(bridge_agent_session_id "$agent")" ]]; then
+        if [[ -f "$next_file" && -n "$previous_session_id" ]]; then
+          bridge_refresh_agent_session_id "$agent" 24 0.5 "$previous_session_id" >/dev/null 2>&1 || true
+        elif [[ -z "$(bridge_agent_session_id "$agent")" ]]; then
           # Claude session metadata can appear after tmux startup. Refresh once
           # more at prompt-ready time so static resume state is persisted before
           # the agent later goes inactive.
@@ -344,7 +366,7 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
           printf "%s\n" "$(date +%s)" >"$marker_file"
         fi
       fi
-    ' -- "$SCRIPT_DIR" "$SESSION" "$AGENT" "$marker_file" "$next_file"
+    ' -- "$SCRIPT_DIR" "$SESSION" "$AGENT" "$marker_file" "$next_file" "$previous_session_id"
   ) >/dev/null 2>&1 &
 }
 
@@ -373,6 +395,11 @@ bridge_run_schedule_dev_channels_accept() {
   local launch_cmd="$1"
 
   bridge_run_should_auto_accept_dev_channels "$launch_cmd" || return 0
+
+  if [[ "${BRIDGE_CONTROLLER_DEV_CHANNELS_ACCEPT:-0}" == "1" ]]; then
+    log_line "[info] controller-side Claude development-channels auto-accept armed; skipping agent-side watcher"
+    return 0
+  fi
 
   # Operator-tunable timeout. Default 60s covers 4-plugin cold-start
   # (bun teams + bun ms365 + node cosmax-* MCP servers) on isolated
@@ -495,8 +522,10 @@ while true; do
   run_duration=0
   rapid_failure=0
   sleep_seconds=5
+  previous_session_id=""
   bridge_run_refresh_roster_if_changed
   export BRIDGE_AGENT_LOOP_RESTART_COUNT="$RESTART_COUNT"
+  previous_session_id="$(bridge_agent_session_id "$AGENT")"
   bridge_run_reconcile_next_session_state
   if [[ $SAFE_MODE -eq 1 ]]; then
     LAUNCH_CMD="$(bridge_build_safe_launch_cmd "$AGENT")"
@@ -510,7 +539,7 @@ while true; do
     bridge_run_sync_dev_plugin_cache
     bridge_ensure_claude_launch_channel_plugins "$AGENT"
     bridge_run_schedule_dev_channels_accept "$LAUNCH_CMD"
-    bridge_run_schedule_idle_marker_and_inbox_bootstrap
+    bridge_run_schedule_idle_marker_and_inbox_bootstrap "$previous_session_id"
   fi
 
   log_line "실행: ${local_launch_cmd_display}"

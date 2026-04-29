@@ -169,7 +169,7 @@ Python으로 빠지는 패턴이 많다.
   `bootstrap_artifact_context`)으로만 전달된다. `bridge-run.sh`에서 tmux
   send-keys로 동일 메시지를 재주입하던 경로(`bridge_run_schedule_next_session_prompt`)는
   제거됐다 — 재도입하지 말 것
-- daemon이 tmux로 밀어넣는 외부 푸시는 **metadata-only**다 (`[Agent Bridge] event=... count=... top=... title=... from=...`). 실행 동사를 인젝션에 포함시키는 옛 포맷을 되살리지 말 것. 수신 에이전트가 해석·디스패치·검증하는 계약은 `agents/_template/CLAUDE.md`의 "Agent Bridge external push policy" 섹션과 `runtime-templates/skills/external-push-handling/SKILL.md`에 있다.
+- daemon이 tmux로 밀어넣는 외부 푸시는 **metadata-only**다 (`[Agent Bridge] event=... count=... top=... title=... from=...`). 실행 동사를 인젝션에 포함시키는 옛 포맷을 되살리지 말 것. 수신 에이전트가 해석·디스패치·검증하는 계약은 `docs/agent-runtime/common-instructions.md`의 "External Push Handling" 섹션과 `runtime-templates/skills/external-push-handling/SKILL.md`에 있다.
 
 ### 3. upgrade / deploy
 

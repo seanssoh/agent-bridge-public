@@ -399,65 +399,37 @@ def emit_pressure_audit(run_id: str, target_agent: str, probe: dict[str, Any]) -
         pass
 
 
-def notify_admin_pressure_defer(run_id: str, job_name: str, probe: dict[str, Any]) -> None:
-    """Best-effort admin task creation. Failure is non-fatal — the deferred
-    status file is the durable record; this is the surfacing layer."""
-    admin_agent = os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()
-    if not admin_agent:
-        return
-    task_script = Path(__file__).resolve().parent / "bridge-task.sh"
-    if not task_script.is_file():
-        return
-    bash_bin = os.environ.get("BRIDGE_BASH_BIN") or os.environ.get("BASH") or "bash"
-    title = f"[cron-deferred] {job_name or run_id} memory pressure"
-    detail_lines = [f"- {key}: {value}" for key, value in probe.items()]
-    body = (
-        f"Cron dispatch deferred +{PRESSURE_DEFER_SECONDS // 60} min by pre-flight memory guard.\n\n"
-        f"- run_id: {run_id}\n"
-        f"- job_name: {job_name}\n"
-        + "\n".join(detail_lines)
-        + "\n\nThe disposable child was not spawned. The next scheduler tick will re-fire the slot.\n"
-    )
-    cmd = [
-        bash_bin,
-        str(task_script),
-        "create",
-        "--to",
-        admin_agent,
-        "--from",
-        "daemon",
-        "--priority",
-        "normal",
-        "--title",
-        title,
-        "--body",
-        body,
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-
 def disable_mcp_for_request(request: dict[str, Any]) -> bool:
-    """#263: decide whether the disposable child should launch with MCP disabled.
+    """#263 + #468: decide whether the disposable child should launch with MCP disabled.
 
     Order of precedence:
-      1. ``BRIDGE_CRON_DISPOSABLE_DISABLE_MCP`` env override (ops A/B switch).
+      1. ``request['disposable_needs_channels']`` — channel relays need MCP
+         servers loaded to deliver, so we never disable in that case. Safety
+         override; nothing below can flip it back.
+      2. ``BRIDGE_CRON_DISPOSABLE_DISABLE_MCP`` env override (ops A/B switch).
          Set to ``1``/``true`` to force-disable MCP for every cron child;
          ``0``/``false`` to force-enable. Unset to defer to per-job config.
-      2. ``request['disable_mcp']`` from the job's ``metadata.disableMcp``
-         (or aliases) wired through ``bridge_cron_write_request``.
-      3. ``request['disposable_needs_channels']`` — channel relays need MCP
-         servers loaded to deliver, so we never disable in that case even if
-         the per-job flag says so. This is a safety override.
+      3. ``request['disable_mcp']`` from the job's ``metadata.disableMcp``
+         (or aliases) wired through ``bridge_cron_write_request``. When
+         explicitly set (``True``/``False``) the per-job choice wins.
+      4. **Default: True.** Non-channel cron disposables disable MCP unless
+         opted in. Disabling MCP cuts cold-start cost (~22K tokens / run on
+         the SYRS reference install) and prevents a cwd
+         ``settings.local.json`` ``enabledPlugins`` entry (e.g. telegram)
+         from auto-attaching in the disposable child and stealing the
+         parent agent's MCP poller via plugin singleton-lock (issue #468).
+         If a specific cron payload genuinely needs MCP tools, set
+         ``metadata.disableMcp = False`` on that job.
     """
     if disposable_needs_channels(request):
         return False
     override = os.environ.get("BRIDGE_CRON_DISPOSABLE_DISABLE_MCP")
     if override is not None and override.strip():
         return bool_flag(override)
-    return bool_flag(request.get("disable_mcp"))
+    raw = request.get("disable_mcp")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return True
+    return bool_flag(raw)
 
 
 def build_prompt(request: dict[str, Any], payload_text: str) -> str:
@@ -817,13 +789,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Probe BEFORE materialising prompt artifacts or spawning the child. On a
     # pressured host the child cold-load is what tips the disposable run past
     # its timeout (see issue body for the event-reminder-30min stall). We skip
-    # the spawn, mark the run deferred, audit the decision, and ping admin.
-    # The next scheduler tick re-fires the slot once memory recovers.
+    # the spawn, mark the run deferred, and audit the decision. The next
+    # scheduler tick re-fires the slot once memory recovers; no admin queue
+    # nudge is emitted (issue #472).
     pressure = check_memory_pressure()
     if pressure is not None:
         deferred_at = now_iso()
         target_agent = str(request.get("target_agent") or "")
-        job_name = str(request.get("job_name") or "")
         deferred_payload: dict[str, Any] = {
             "run_id": run_id,
             "state": "deferred",
@@ -838,7 +810,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         }
         write_json(status_file, deferred_payload)
         emit_pressure_audit(run_id, target_agent, pressure)
-        notify_admin_pressure_defer(run_id, job_name, pressure)
         print(f"status: deferred")
         print(f"run_id: {run_id}")
         print(f"engine: {engine}")

@@ -125,13 +125,23 @@ type RouteState = {
 
 const BOT_ROUTES_FILE = process.env.MATTERMOST_BOT_ROUTES ?? ''
 
+function fatalConfig(message: string): never {
+  process.stderr.write(`mattermost channel: FATAL: ${message}\n`)
+  process.exit(1)
+}
+
 function loadBotRoutes(): BotRoute[] {
   if (!BOT_ROUTES_FILE) return []
+  let parsed: unknown
   try {
-    return JSON.parse(readFileSync(BOT_ROUTES_FILE, 'utf8')) as BotRoute[]
-  } catch {
-    return []
+    parsed = JSON.parse(readFileSync(BOT_ROUTES_FILE, 'utf8'))
+  } catch (err) {
+    fatalConfig(`could not read MATTERMOST_BOT_ROUTES ${BOT_ROUTES_FILE}: ${err}`)
   }
+  if (!Array.isArray(parsed)) {
+    fatalConfig(`MATTERMOST_BOT_ROUTES ${BOT_ROUTES_FILE} must contain a JSON array`)
+  }
+  return parsed as BotRoute[]
 }
 
 if (!MM_TOKEN && !BOT_ROUTES_FILE) {
@@ -150,7 +160,7 @@ process.on('uncaughtException', err => {
 })
 
 let shuttingDown = false
-function gracefulShutdown(reason: string): void {
+function gracefulShutdown(reason: string, exitCode = 0): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write(`mattermost channel: shutting down (${reason})\n`)
@@ -161,7 +171,7 @@ function gracefulShutdown(reason: string): void {
   }
   // Safety: if the abort + WS close path hangs (network limbo, etc.),
   // force exit shortly after. Matches the Teams plugin's 1.5s safety net.
-  setTimeout(() => process.exit(0), 1500).unref?.()
+  setTimeout(() => process.exit(exitCode), 1500).unref?.()
 }
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'))
@@ -716,8 +726,7 @@ async function start(): Promise<void> {
           `mattermost channel: FATAL: all ${routes.length} routes disconnected > ${watchdogThresholdMs}ms — exiting for restart\n`,
         )
         // Trigger graceful shutdown path so MCP stdio + WS abort fire.
-        gracefulShutdown('all-routes-down')
-        setTimeout(() => process.exit(1), 1500).unref?.()
+        gracefulShutdown('all-routes-down', 1)
       }
     }, 15_000)
     watchdog.unref?.()

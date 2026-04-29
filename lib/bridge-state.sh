@@ -180,8 +180,11 @@ bridge_claude_resume_session_id_for_agent() {
   local agent="$1"
   local session_id=""
   local detected=""
+  local workdir=""
 
   [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 1
+
+  workdir="$(bridge_agent_workdir "$agent")"
 
   bridge_normalize_agent_session_id "$agent"
   session_id="$(bridge_agent_session_id "$agent")"
@@ -190,9 +193,21 @@ bridge_claude_resume_session_id_for_agent() {
     return 0
   fi
 
-  detected="$(bridge_detect_claude_session_id "$(bridge_agent_workdir "$agent")" 0 "" 2>/dev/null || true)"
+  # Fallback: detect a transcript by workdir, age-bounded by the resume
+  # window. Without this gate the same stale transcript that bridge_normalize
+  # just rejected would be re-discovered (the original `agb admin` incident).
+  local _max_hours_int="${BRIDGE_RESUME_MAX_AGE_HOURS:-48}"
+  _max_hours_int="${_max_hours_int%.*}"
+  [[ "$_max_hours_int" =~ ^[0-9]+$ ]] || _max_hours_int=48
+  local _since_ms=$(( ($(date +%s) - _max_hours_int * 3600) * 1000 ))
+  detected="$(bridge_detect_claude_session_id "$workdir" "$_since_ms" "" 2>/dev/null || true)"
   [[ -n "$detected" ]] || return 1
-  printf '%s' "$detected"
+  # Belt-and-suspenders: round-trip through the resolver so a missed slug or
+  # detection-side regression cannot reintroduce a stale id past this point.
+  local _accepted="" _rc=0
+  _accepted="$(bridge_resolve_resume_session_id claude "$agent" "$workdir" "$detected" 2>/dev/null)" || _rc=$?
+  [[ "$_rc" != 1 && -n "$_accepted" ]] || return 1
+  printf '%s' "$_accepted"
 }
 
 bridge_normalize_agent_session_id() {
@@ -208,10 +223,24 @@ bridge_normalize_agent_session_id() {
 
   case "$engine" in
     claude)
-      if ! bridge_claude_session_id_exists "$session_id" "$workdir"; then
-        bridge_clear_agent_session_id "$agent"
-        return 0
-      fi
+      # Decision site: resolver may keep (rc=0), replace (rc=2), or reject (rc=1).
+      # rc=2 swaps in a fresher in-window transcript for the same workdir;
+      # we persist that replacement here, since hydration sites intentionally
+      # do not write state.
+      local _accepted="" _rc=0
+      _accepted="$(bridge_resolve_resume_session_id claude "$agent" "$workdir" "$session_id")" || _rc=$?
+      case "$_rc" in
+        0)
+          ;;
+        2)
+          BRIDGE_AGENT_SESSION_ID["$agent"]="$_accepted"
+          bridge_persist_agent_state "$agent"
+          ;;
+        *)
+          bridge_clear_agent_session_id "$agent"
+          return 0
+          ;;
+      esac
       ;;
   esac
 }
@@ -477,7 +506,13 @@ assignments = []
 
 if any(item == "plugin:discord" or item.startswith("plugin:discord@") for item in required):
     assignments.append(("DISCORD_STATE_DIR", discord_dir))
-if any(item == "plugin:telegram" or item.startswith("plugin:telegram@") for item in required):
+if any(
+    item == "plugin:telegram"
+    or item.startswith("plugin:telegram@")
+    or item == "plugin:telegram-relay"
+    or item.startswith("plugin:telegram-relay@")
+    for item in required
+):
     assignments.append(("TELEGRAM_STATE_DIR", telegram_dir))
 if any(item == "plugin:teams" or item.startswith("plugin:teams@") for item in required):
     assignments.append(("TEAMS_STATE_DIR", teams_dir))
@@ -526,6 +561,28 @@ import shlex
 import sys
 
 agent, continue_mode, session_id, continue_fallback, original = sys.argv[1:]
+
+
+def repair_false_command(value: str) -> str:
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        return value
+    if not tokens:
+        return value
+    idx = 0
+    while idx < len(tokens):
+        key = tokens[idx].split("=", 1)[0]
+        if "=" not in tokens[idx] or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key) or tokens[idx].startswith("-"):
+            break
+        idx += 1
+    if idx < len(tokens) and tokens[idx] == "false":
+        tokens[idx] = "claude"
+        return " ".join(shlex.quote(token) for token in tokens)
+    return value
+
+
+original = repair_false_command(original)
 match = re.match(r"^(?P<prefix>.*?)(?P<command>claude(?:\s|$).*)$", original)
 if not match:
     print(original)
@@ -594,6 +651,28 @@ import shlex
 import sys
 
 agent, continue_mode, session_id, original = sys.argv[1:]
+
+
+def repair_false_command(value: str) -> str:
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        return value
+    if not tokens:
+        return value
+    idx = 0
+    while idx < len(tokens):
+        key = tokens[idx].split("=", 1)[0]
+        if "=" not in tokens[idx] or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key) or tokens[idx].startswith("-"):
+            break
+        idx += 1
+    if idx < len(tokens) and tokens[idx] == "false":
+        tokens[idx] = "claude"
+        return " ".join(shlex.quote(token) for token in tokens)
+    return value
+
+
+original = repair_false_command(original)
 match = re.match(r"^(?P<prefix>.*?)(?P<command>claude(?:\s|$).*)$", original)
 if not match:
     print(original)
@@ -796,7 +875,29 @@ bridge_load_dynamic_agent_file() {
   fi
 
   if bridge_agent_exists "$AGENT_ID" && [[ "$(bridge_agent_source "$AGENT_ID")" == "static" ]]; then
-    BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="${AGENT_SESSION_ID:-${BRIDGE_AGENT_SESSION_ID[$AGENT_ID]-}}"
+    # Static-agent collision: an active dynamic env file points at an
+    # already-registered static agent. Gate the candidate id through the
+    # freshness resolver (mirrors the dynamic-load branch below) so a stale
+    # on-disk transcript cannot leak in here. Without this gate the raw
+    # AGENT_SESSION_ID from the env file would survive and be written back
+    # by later start/isolation setup before bridge-run normalises — that
+    # is the bypass dev-codex flagged in the round-4 review of #428.
+    #
+    # rc=other clears, NOT preserves: bridge_load_roster runs
+    # bridge_load_dynamic_agents BEFORE bridge_load_static_histories
+    # (lib/bridge-state.sh:1257 vs :1267), so any pre-existing
+    # BRIDGE_AGENT_SESSION_ID at this point is the raw roster/local value
+    # that has not been gated yet. Preserving it would leak a stale id
+    # from the roster on top of rejecting the env candidate. Clearing
+    # here is safe — bridge_load_static_agent_history runs later, also
+    # gated through the resolver, and is the authoritative re-hydration
+    # for static agents. Caught in dev-codex review of round 5 (#446).
+    local _accepted="" _rc=0
+    _accepted="$(bridge_resolve_resume_session_id "$AGENT_ENGINE" "${AGENT_ID:-}" "$AGENT_WORKDIR" "${AGENT_SESSION_ID:-}" 2>/dev/null)" || _rc=$?
+    case "$_rc" in
+      0|2) BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="$_accepted" ;;
+      *)   BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="" ;;
+    esac
     BRIDGE_AGENT_HISTORY_KEY["$AGENT_ID"]="${AGENT_HISTORY_KEY:-${BRIDGE_AGENT_HISTORY_KEY[$AGENT_ID]-}}"
     BRIDGE_AGENT_CREATED_AT["$AGENT_ID"]="${AGENT_CREATED_AT:-${BRIDGE_AGENT_CREATED_AT[$AGENT_ID]-}}"
     BRIDGE_AGENT_UPDATED_AT["$AGENT_ID"]="${AGENT_UPDATED_AT:-${BRIDGE_AGENT_UPDATED_AT[$AGENT_ID]-}}"
@@ -812,11 +913,16 @@ bridge_load_dynamic_agent_file() {
   BRIDGE_AGENT_META_FILE["$AGENT_ID"]="$file"
   BRIDGE_AGENT_LOOP["$AGENT_ID"]="${AGENT_LOOP:-1}"
   BRIDGE_AGENT_CONTINUE["$AGENT_ID"]="${AGENT_CONTINUE:-1}"
-  if [[ -n "$AGENT_SESSION_ID" && "$AGENT_ENGINE" == "claude" ]] && ! bridge_claude_session_id_exists "$AGENT_SESSION_ID" "$AGENT_WORKDIR"; then
-    BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]=""
-  else
-    BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="${AGENT_SESSION_ID:-}"
-  fi
+  # Hydration: gate the stored id through the freshness resolver. rc=0 keeps
+  # the candidate, rc=2 swaps in a fresher transcript for the same workdir,
+  # rc=1/other means no eligible transcript so this load leaves SESSION_ID
+  # empty. We never call clear/persist here — that is the decision-path job.
+  local _accepted="" _rc=0
+  _accepted="$(bridge_resolve_resume_session_id "$AGENT_ENGINE" "${AGENT_ID:-}" "$AGENT_WORKDIR" "${AGENT_SESSION_ID:-}" 2>/dev/null)" || _rc=$?
+  case "$_rc" in
+    0|2) BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="$_accepted" ;;
+    *)   BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="" ;;
+  esac
   BRIDGE_AGENT_HISTORY_KEY["$AGENT_ID"]="${AGENT_HISTORY_KEY:-}"
   BRIDGE_AGENT_CREATED_AT["$AGENT_ID"]="${AGENT_CREATED_AT:-}"
   BRIDGE_AGENT_UPDATED_AT["$AGENT_ID"]="${AGENT_UPDATED_AT:-}"
@@ -881,11 +987,13 @@ bridge_restore_dynamic_agents_from_history() {
     BRIDGE_AGENT_SOURCE["$AGENT_ID"]="dynamic"
     BRIDGE_AGENT_LOOP["$AGENT_ID"]="${AGENT_LOOP:-1}"
     BRIDGE_AGENT_CONTINUE["$AGENT_ID"]="${AGENT_CONTINUE:-1}"
-    if [[ -n "$AGENT_SESSION_ID" && "$AGENT_ENGINE" == "claude" ]] && ! bridge_claude_session_id_exists "$AGENT_SESSION_ID" "$AGENT_WORKDIR"; then
-      BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]=""
-    else
-      BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="${AGENT_SESSION_ID:-}"
-    fi
+    # Hydration: gate stored id through resolver (see bridge_load_dynamic_agent_file).
+    local _accepted="" _rc=0
+    _accepted="$(bridge_resolve_resume_session_id "$AGENT_ENGINE" "${AGENT_ID:-}" "$AGENT_WORKDIR" "${AGENT_SESSION_ID:-}" 2>/dev/null)" || _rc=$?
+    case "$_rc" in
+      0|2) BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="$_accepted" ;;
+      *)   BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="" ;;
+    esac
     BRIDGE_AGENT_HISTORY_KEY["$AGENT_ID"]="${AGENT_HISTORY_KEY:-}"
     BRIDGE_AGENT_CREATED_AT["$AGENT_ID"]="${AGENT_CREATED_AT:-}"
     BRIDGE_AGENT_UPDATED_AT["$AGENT_ID"]="${AGENT_UPDATED_AT:-}"
@@ -1021,11 +1129,16 @@ _bridge_register_dynamic_from_env_file() {
   BRIDGE_AGENT_SOURCE["$AGENT_ID"]="dynamic"
   BRIDGE_AGENT_LOOP["$AGENT_ID"]="${AGENT_LOOP:-1}"
   BRIDGE_AGENT_CONTINUE["$AGENT_ID"]="${AGENT_CONTINUE:-1}"
-  if [[ -n "$AGENT_SESSION_ID" && "$AGENT_ENGINE" == "claude" ]] && ! bridge_claude_session_id_exists "$AGENT_SESSION_ID" "$AGENT_WORKDIR"; then
-    BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]=""
-  else
-    BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="${AGENT_SESSION_ID:-}"
-  fi
+  # Hydration: gate the stored id through the freshness resolver. rc=0 keeps
+  # the candidate, rc=2 swaps in a fresher transcript for the same workdir,
+  # rc=1/other means no eligible transcript so this load leaves SESSION_ID
+  # empty. We never call clear/persist here — that is the decision-path job.
+  local _accepted="" _rc=0
+  _accepted="$(bridge_resolve_resume_session_id "$AGENT_ENGINE" "${AGENT_ID:-}" "$AGENT_WORKDIR" "${AGENT_SESSION_ID:-}" 2>/dev/null)" || _rc=$?
+  case "$_rc" in
+    0|2) BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="$_accepted" ;;
+    *)   BRIDGE_AGENT_SESSION_ID["$AGENT_ID"]="" ;;
+  esac
   BRIDGE_AGENT_HISTORY_KEY["$AGENT_ID"]="${AGENT_HISTORY_KEY:-}"
   BRIDGE_AGENT_CREATED_AT["$AGENT_ID"]="${AGENT_CREATED_AT:-}"
   BRIDGE_AGENT_UPDATED_AT["$AGENT_ID"]="${AGENT_UPDATED_AT:-}"
@@ -1059,9 +1172,13 @@ bridge_load_static_agent_history() {
   if [[ -n "$AGENT_SESSION_ID" ]]; then
     AGENT_ENGINE="${AGENT_ENGINE:-$(bridge_agent_engine "$agent")}"
     AGENT_WORKDIR="${AGENT_WORKDIR:-$(bridge_agent_workdir "$agent")}"
-    if [[ "$AGENT_ENGINE" != "claude" ]] || bridge_claude_session_id_exists "$AGENT_SESSION_ID" "$AGENT_WORKDIR"; then
-      BRIDGE_AGENT_SESSION_ID["$agent"]="$AGENT_SESSION_ID"
-    fi
+    # Hydration: gate stored id through resolver (see bridge_load_dynamic_agent_file).
+    local _accepted="" _rc=0
+    _accepted="$(bridge_resolve_resume_session_id "$AGENT_ENGINE" "$agent" "$AGENT_WORKDIR" "$AGENT_SESSION_ID" 2>/dev/null)" || _rc=$?
+    case "$_rc" in
+      0|2) BRIDGE_AGENT_SESSION_ID["$agent"]="$_accepted" ;;
+      *)   ;;
+    esac
   fi
   if [[ -n "$AGENT_HISTORY_KEY" ]]; then
     BRIDGE_AGENT_HISTORY_KEY["$agent"]="$AGENT_HISTORY_KEY"
@@ -1109,6 +1226,13 @@ bridge_load_roster() {
     scoped_env_file="$BRIDGE_ACTIVE_AGENT_DIR/$scoped_agent_id/agent-env.sh"
     if [[ -r "$scoped_env_file" ]]; then
       isolated_env_file="$scoped_env_file"
+      # Persist the discovered path so bridge_queue_gateway_proxy_agent
+      # (lib/bridge-core.sh) can detect proxy mode without requiring
+      # BRIDGE_AGENT_ENV_FILE to be pre-exported in the isolated REPL's
+      # env. Without this export the queue CLI falls through to the
+      # direct bridge-queue.py path against BRIDGE_TASK_DB=/dev/null
+      # and tracebacks. See issue #436.
+      export BRIDGE_AGENT_ENV_FILE="$isolated_env_file"
     fi
   fi
 
@@ -1192,8 +1316,17 @@ bridge_load_roster() {
 
   bridge_load_dynamic_agents
   if [[ "$fast_load" != "1" ]]; then
-    bridge_load_static_histories
-    bridge_restore_dynamic_agents_from_history
+    # When loading via a scoped agent-env.sh (linux-user isolation), the
+    # snapshot already carries self + sanitized peer metadata. Iterating
+    # peer history files would require read access on
+    # $BRIDGE_HISTORY_DIR/*.env, which the isolated UID lacks (they are
+    # owned by the operator UID). Sourcing one fails with "Permission
+    # denied" and surfaces in the agent's REPL during routine queue CLI
+    # use. Skip both peer-history hydration paths when scoped. See #436.
+    if [[ -z "$isolated_env_file" ]]; then
+      bridge_load_static_histories
+      bridge_restore_dynamic_agents_from_history
+    fi
     bridge_reconcile_dynamic_agents_from_tmux
   fi
 }
@@ -1821,6 +1954,38 @@ bridge_agent_clear_next_session_state() {
   rm -f "$(bridge_agent_next_session_file "$agent")" "$(bridge_agent_next_session_marker_file "$agent")"
 }
 
+bridge_agent_archive_next_session_state() {
+  local agent="$1"
+  local next_file=""
+  local marker_file=""
+  local archive_dir=""
+  local archive_file=""
+  local digest=""
+  local digest_short=""
+  local stamp=""
+  local index=0
+
+  next_file="$(bridge_agent_next_session_file "$agent")"
+  marker_file="$(bridge_agent_next_session_marker_file "$agent")"
+  [[ -f "$next_file" ]] || return 1
+
+  digest="$(bridge_agent_next_session_digest "$agent" 2>/dev/null || true)"
+  digest_short="${digest:0:12}"
+  [[ -n "$digest_short" ]] || digest_short="unknown"
+  stamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+  archive_dir="$(dirname "$next_file")/archive"
+  archive_file="$archive_dir/NEXT-SESSION.${stamp}.${digest_short}.md"
+
+  mkdir -p "$archive_dir"
+  while [[ -e "$archive_file" ]]; do
+    index=$((index + 1))
+    archive_file="$archive_dir/NEXT-SESSION.${stamp}.${digest_short}.${index}.md"
+  done
+  mv "$next_file" "$archive_file"
+  rm -f "$marker_file"
+  printf '%s' "$archive_file"
+}
+
 bridge_agent_maybe_expire_next_session() {
   local agent="$1"
   local ttl_seconds="${2:-${BRIDGE_NEXT_SESSION_AUTO_CLEAR_SECONDS:-300}}"
@@ -1831,7 +1996,7 @@ bridge_agent_maybe_expire_next_session() {
   age_seconds="$(bridge_agent_next_session_age_seconds "$agent" || echo 0)"
   [[ "$age_seconds" =~ ^[0-9]+$ ]] || age_seconds=0
   (( age_seconds >= ttl_seconds )) || return 1
-  bridge_agent_clear_next_session_state "$agent"
+  bridge_agent_archive_next_session_state "$agent" >/dev/null || return 1
   printf '%s' "$age_seconds"
 }
 
@@ -2274,21 +2439,52 @@ print(best[1] if best else "")
 PY
 }
 
-# Returns 0 (true) if the given workdir has any `~/.claude/projects/<slug>/*.jsonl`
-# transcript on disk. On first-wake (e.g. a freshly provisioned agent that has
-# never run) the directory is missing or empty and `claude --continue` would
-# fail with "No deferred tool marker found in the resumed session". Callers use
-# this to skip the `--continue` fallback until a real transcript exists.
-bridge_claude_has_resumable_session_state() {
-  local workdir="$1"
+# bridge_resolve_resume_session_id is the single source of truth for whether
+# a Claude transcript should be resumed. It is pure: callers pass everything
+# in (engine, agent, workdir, candidate_session_id [, max_age_hours]) and it
+# does not read or write BRIDGE_AGENT_* arrays. The caller owns state.
+#
+#   stdout: accepted_id (may differ from candidate; empty means "no resume").
+#   exit:   0 = candidate accepted as-is (or non-claude engine passthrough)
+#           1 = no eligible transcript at all (caller MUST NOT --continue/--resume)
+#           2 = candidate ineligible/stale, replaced with a fresher eligible id
+#   stderr: one debug-level reason line on rc=1 or rc=2 (suppressed by the
+#           legacy boolean wrappers below since they are probes).
+#
+# Eligibility: ~/.claude/projects/<workdir-slug>/<id>.jsonl exists, size > 0,
+# and mtime within `max_age_hours` (default ${BRIDGE_RESUME_MAX_AGE_HOURS:-48}).
+# When the candidate is ineligible but the workdir has another in-window
+# transcript, the freshest of those is returned (rc=2). If no in-window
+# transcript exists, rc=1.
+bridge_resolve_resume_session_id() {
+  local engine="$1"
+  local agent="${2:-}"
+  local workdir="$3"
+  local candidate="${4:-}"
+  local max_age_hours="${5:-${BRIDGE_RESUME_MAX_AGE_HOURS:-48}}"
+
+  if [[ "$engine" != "claude" ]]; then
+    if [[ -n "$candidate" ]]; then printf '%s' "$candidate"; fi
+    return 0
+  fi
   [[ -n "$workdir" ]] || return 1
 
-  python3 - "$workdir" <<'PY'
+  python3 - "$workdir" "$candidate" "$max_age_hours" "$agent" <<'PY'
 import os
 import re
 import sys
+import time
 
-workdir = os.path.realpath(sys.argv[1])
+input_workdir = sys.argv[1]
+workdir = os.path.realpath(input_workdir)
+candidate = sys.argv[2] or ""
+try:
+    max_age_hours = float(sys.argv[3])
+except ValueError:
+    max_age_hours = 48.0
+agent = sys.argv[4] or ""
+
+cutoff = time.time() - max_age_hours * 3600
 
 
 def workdir_slug_candidates(path):
@@ -2300,7 +2496,20 @@ def workdir_slug_candidates(path):
     return candidates
 
 
-for slug in workdir_slug_candidates(workdir):
+def ordered_slug_candidates(paths):
+    candidates = []
+    seen = set()
+    for path in paths:
+        for slug in workdir_slug_candidates(path):
+            if slug not in seen:
+                seen.add(slug)
+                candidates.append(slug)
+    return candidates
+
+
+eligible = []
+seen_stems = set()
+for slug in ordered_slug_candidates([input_workdir, workdir]):
     base = os.path.expanduser(f"~/.claude/projects/{slug}")
     if not os.path.isdir(base):
         continue
@@ -2311,109 +2520,75 @@ for slug in workdir_slug_candidates(workdir):
     for entry in entries:
         if not entry.endswith(".jsonl"):
             continue
+        stem = entry[: -len(".jsonl")]
+        if not stem or stem in seen_stems:
+            continue
         full = os.path.join(base, entry)
         try:
-            if os.path.isfile(full) and os.path.getsize(full) > 0:
-                raise SystemExit(0)
+            st = os.stat(full)
         except OSError:
             continue
-raise SystemExit(1)
+        if not os.path.isfile(full) or st.st_size <= 0:
+            continue
+        if st.st_mtime < cutoff:
+            continue
+        seen_stems.add(stem)
+        eligible.append((st.st_mtime, stem))
+
+if not eligible:
+    sys.stderr.write(
+        f"[debug] resume id rejected: no eligible transcript within {max_age_hours}h "
+        f"for workdir={workdir} agent={agent}\n"
+    )
+    sys.exit(1)
+
+eligible.sort(key=lambda t: t[0], reverse=True)
+freshest_stem = eligible[0][1]
+
+if candidate and candidate == freshest_stem:
+    print(candidate, end="")
+    sys.exit(0)
+
+if candidate:
+    sys.stderr.write(
+        f"[debug] resume id replaced: candidate={candidate} "
+        f"freshest={freshest_stem} workdir={workdir} agent={agent}\n"
+    )
+    print(freshest_stem, end="")
+    sys.exit(2)
+
+# Empty candidate: freshest eligible is just an acceptance, not a replacement.
+print(freshest_stem, end="")
+sys.exit(0)
 PY
 }
 
+# Returns 0 (true) if the given workdir has any in-window
+# `~/.claude/projects/<slug>/*.jsonl` transcript. Used by launch builders to
+# decide whether `claude --continue`/picker is safe to invoke. Backed by
+# bridge_resolve_resume_session_id so the freshness gate is inherited; the
+# resolver's debug stderr is suppressed because this is a probe.
+bridge_claude_has_resumable_session_state() {
+  local workdir="$1"
+  [[ -n "$workdir" ]] || return 1
+  local rc=0
+  bridge_resolve_resume_session_id claude "" "$workdir" "" >/dev/null 2>/dev/null || rc=$?
+  [[ "$rc" != 1 ]]
+}
+
+# Returns 0 (true) iff the given session id is eligible to resume for the
+# workdir under the same freshness rule the resolver applies. Kept for
+# backward-compatible callers; new code should call
+# bridge_resolve_resume_session_id directly. Resolver stderr is suppressed
+# because this is used as a boolean probe during roster hydration and launch
+# probes — those paths must not emit noisy diagnostics.
 bridge_claude_session_id_exists() {
   local session_id="$1"
   local workdir="$2"
-
   [[ -n "$session_id" && -n "$workdir" ]] || return 1
-
-  python3 - "$session_id" "$workdir" <<'PY'
-import glob
-import json
-import os
-import re
-import sys
-
-session_id = sys.argv[1]
-workdir = os.path.realpath(sys.argv[2])
-
-
-def transcript_has_session(transcript_path, session_id):
-    try:
-        if os.path.getsize(transcript_path) <= 0:
-            return False
-        with open(transcript_path, "r", encoding="utf-8") as fh:
-            seen = 0
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                seen += 1
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    if seen >= 10:
-                        break
-                    continue
-                if isinstance(obj, dict):
-                    found = obj.get("sessionId")
-                    if not found or found == session_id:
-                        return True
-                if seen >= 10:
-                    break
-    except Exception:
-        return False
-    return False
-
-
-def workdir_slug_candidates(path):
-    slash_only = path.replace("/", "-")
-    slash_and_dot = re.sub(r"[/.]", "-", path)
-    candidates = [slash_only]
-    if slash_and_dot != slash_only:
-        candidates.append(slash_and_dot)
-    return candidates
-
-
-def transcript_for_workdir(session_id, workdir):
-    for slug in workdir_slug_candidates(workdir):
-        path = os.path.expanduser(
-            f"~/.claude/projects/{slug}/{session_id}.jsonl"
-        )
-        if os.path.isfile(path) and transcript_has_session(path, session_id):
-            return path
-    pattern = os.path.expanduser(f"~/.claude/projects/**/{session_id}.jsonl")
-    for transcript in glob.glob(pattern, recursive=True):
-        if transcript_has_session(transcript, session_id):
-            return transcript
-    return None
-
-
-# Fast path: live sessions/<pid>.json record still around.
-for path in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        continue
-    if data.get("sessionId") != session_id:
-        continue
-    if os.path.realpath(str(data.get("cwd") or "")) != workdir:
-        continue
-    if not transcript_for_workdir(session_id, workdir):
-        continue
-    raise SystemExit(0)
-
-# Fallback: the process has exited so sessions/<pid>.json is gone, but the
-# transcript still lives under ~/.claude/projects/. Accept the session as
-# resumable when the transcript sits in a project dir whose slug matches
-# the agent workdir, so `continue=1` static agents can pick up where they
-# left off across stop/start cycles.
-if transcript_for_workdir(session_id, workdir):
-    raise SystemExit(0)
-
-raise SystemExit(1)
-PY
+  local accepted="" rc=0
+  accepted="$(bridge_resolve_resume_session_id claude "" "$workdir" "$session_id" 2>/dev/null)" || rc=$?
+  [[ "$rc" == 0 && "$accepted" == "$session_id" ]]
 }
 
 bridge_detect_codex_session_id() {
@@ -2500,19 +2675,31 @@ bridge_refresh_agent_session_id() {
   local agent="$1"
   local attempts="${2:-8}"
   local sleep_seconds="${3:-0.25}"
+  local extra_exclude_csv="${4:-}"
   local since_hint sid detected exclude_csv
   local -a excluded=()
-  local other try_index
+  local -a extra_excluded=()
+  local other try_index extra
 
   sid="$(bridge_agent_session_id "$agent")"
   if [[ -n "$sid" ]]; then
-    printf '%s' "$sid"
-    return 0
+    if ! bridge_channel_csv_contains "$extra_exclude_csv" "$sid"; then
+      printf '%s' "$sid"
+      return 0
+    fi
+  fi
+  if [[ -n "$extra_exclude_csv" ]]; then
+    IFS=',' read -r -a extra_excluded <<<"$extra_exclude_csv"
   fi
 
   since_hint="${BRIDGE_AGENT_CREATED_AT[$agent]-$(date +%s)}"
   for ((try_index = 0; try_index < attempts; try_index += 1)); do
     excluded=()
+    for extra in "${extra_excluded[@]}"; do
+      extra="$(bridge_trim_whitespace "$extra")"
+      [[ -n "$extra" ]] || continue
+      excluded+=("$extra")
+    done
     for other in "${BRIDGE_AGENT_IDS[@]}"; do
       [[ "$other" == "$agent" ]] && continue
       sid="$(bridge_agent_session_id "$other")"
@@ -2640,6 +2827,7 @@ bridge_write_roster_status_snapshot() {
   local wake
   local channels
   local channel_reason
+  local configured_channels
   local session
   local activity_state
   local loop_mode
@@ -2647,7 +2835,7 @@ bridge_write_roster_status_snapshot() {
   local recent
 
   {
-    echo -e "agent\tengine\tsession\tworkdir\tsource\tloop\tactive\twake\tchannels\tchannel_reason\tactivity_state"
+    echo -e "agent\tengine\tsession\tworkdir\tsource\tloop\tactive\twake\tchannels\tchannel_reason\tactivity_state\tconfigured_channels"
     for agent in "${BRIDGE_AGENT_IDS[@]}"; do
       active=0
       wake="-"
@@ -2665,6 +2853,9 @@ bridge_write_roster_status_snapshot() {
       session="$(bridge_agent_session "$agent")"
       engine="$(bridge_agent_engine "$agent")"
       loop_mode="$(bridge_agent_loop "$agent")"
+      configured_channels="$(bridge_agent_channels_csv "$agent")"
+      configured_channels="${configured_channels//$'\t'/ }"
+      configured_channels="${configured_channels//$'\n'/ }"
       if bridge_agent_is_active "$agent"; then
         active=1
         recent=""
@@ -2688,7 +2879,7 @@ bridge_write_roster_status_snapshot() {
         fi
       fi
 
-      echo -e "${agent}\t${engine}\t${session}\t$(bridge_agent_workdir "$agent")\t$(bridge_agent_source "$agent")\t${loop_mode}\t${active}\t${wake}\t${channels}\t${channel_reason}\t${activity_state}"
+      echo -e "${agent}\t${engine}\t${session}\t$(bridge_agent_workdir "$agent")\t$(bridge_agent_source "$agent")\t${loop_mode}\t${active}\t${wake}\t${channels}\t${channel_reason}\t${activity_state}\t${configured_channels}"
     done
   } >"$file"
 }

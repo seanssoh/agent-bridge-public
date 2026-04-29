@@ -58,7 +58,7 @@ Usage:
   $CLI_NAME bundle <create|show> ...
   $CLI_NAME intake <triage|show> ...
   $CLI_NAME wave <dispatch|list|show|templates|close-issue> ...
-  $CLI_NAME agent <create|list|show|start|safe-mode|stop|restart|attach|compact|handoff> ...
+  $CLI_NAME agent <create|list|show|reclassify|start|safe-mode|stop|restart|attach|compact|handoff> ...
   $CLI_NAME kill <number|all>
   $CLI_NAME attach [number|name]
   $CLI_NAME urgent <agent> "<message>" [--wait <seconds>]
@@ -73,6 +73,7 @@ Usage:
   $CLI_NAME usage <status|monitor|alerts> ...
   $CLI_NAME watchdog scan [agent...] [--json]
   $CLI_NAME discord <status|sync>
+  $CLI_NAME telegram-relay <start|stop|status|health> ...
   $CLI_NAME migrate runtime inventory [--json] [--report <path>]
   $CLI_NAME migrate runtime sync [--dry-run]
   $CLI_NAME migrate runtime rewrite-cron [--dry-run] [--json]
@@ -114,6 +115,7 @@ Usage:
   $CLI_NAME agent create <agent> [--engine claude|codex] [--session <name>] [--workdir <path>] [--always-on] [--dry-run] [--json]
   $CLI_NAME agent list [--json]
   $CLI_NAME agent show <agent> [--json]
+  $CLI_NAME agent reclassify [--agent <agent>] [--apply] [--json]
   $CLI_NAME agent start <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
   $CLI_NAME agent safe-mode <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
   $CLI_NAME agent stop <agent>
@@ -127,6 +129,7 @@ Usage:
   $CLI_NAME setup agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start]
   $CLI_NAME discord status
   $CLI_NAME discord sync
+  $CLI_NAME telegram-relay status
   $CLI_NAME cron inventory [--mode recurring|one-shot|all] [--family <family>] [--limit <count>]
   $CLI_NAME cron show <job-name-or-id>
   $CLI_NAME cron import [--source-jobs-file <path>] [--dry-run]
@@ -192,6 +195,7 @@ Examples:
   $CLI_NAME agent create reviewer --engine claude
   $CLI_NAME agent list --json
   $CLI_NAME agent show reviewer --json
+  $CLI_NAME agent reclassify --apply
   $CLI_NAME agent start reviewer --dry-run
   $CLI_NAME agent restart reviewer --attach
   $CLI_NAME agent compact static-discord-bot
@@ -411,6 +415,11 @@ if [[ $# -gt 0 ]]; then
       ADMIN_ENGINE="$(bridge_agent_engine "$ADMIN_AGENT")"
       ADMIN_WORKDIR="$(bridge_agent_workdir "$ADMIN_AGENT")"
       ADMIN_SAFE_MODE=0
+      ADMIN_REPLACE_MODE=0
+      ADMIN_ATTACH_MODE=1
+      ADMIN_FAST_REUSE_ELIGIBLE=1
+      ADMIN_SESSION=""
+      ADMIN_ARGS=()
 
       while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -418,17 +427,52 @@ if [[ $# -gt 0 ]]; then
             ADMIN_SAFE_MODE=1
             shift
             ;;
+          --replace)
+            ADMIN_REPLACE_MODE=1
+            ADMIN_ARGS+=("$1")
+            shift
+            ;;
+          --no-attach)
+            ADMIN_ATTACH_MODE=0
+            ADMIN_ARGS+=("$1")
+            shift
+            ;;
+          --continue|--no-continue|--no-project-skill)
+            ADMIN_ARGS+=("$1")
+            shift
+            ;;
           --name|--workdir|--codex|--claude)
             bridge_die "'$CLI_NAME admin'은(는) 관리자 역할의 engine/workdir/name을 고정 사용합니다."
             ;;
           *)
+            ADMIN_FAST_REUSE_ELIGIBLE=0
+            ADMIN_ARGS+=("$@")
             break
             ;;
         esac
       done
+      if ((${#ADMIN_ARGS[@]} > 0)); then
+        set -- "${ADMIN_ARGS[@]}"
+      else
+        set --
+      fi
 
       if [[ $ADMIN_SAFE_MODE -eq 1 ]]; then
         exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-agent.sh" safe-mode "$ADMIN_AGENT" "$@"
+      fi
+
+      # Common path: `agb admin` is often just "return to the running admin".
+      # Avoid the recursive static-start path, daemon ensure, and another full
+      # roster load when the admin tmux session already exists.
+      ADMIN_SESSION="$(bridge_agent_session "$ADMIN_AGENT")"
+      if [[ $ADMIN_FAST_REUSE_ELIGIBLE -eq 1 && $ADMIN_REPLACE_MODE -eq 0 \
+          && -n "$ADMIN_SESSION" ]] \
+          && bridge_tmux_session_exists "$ADMIN_SESSION"; then
+        echo "[info] 세션 '$ADMIN_SESSION'이 이미 실행 중입니다."
+        if [[ $ADMIN_ATTACH_MODE -eq 1 ]]; then
+          bridge_attach_tmux_session "$ADMIN_SESSION"
+        fi
+        exit 0
       fi
 
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "--$ADMIN_ENGINE" --name "$ADMIN_AGENT" --workdir "$ADMIN_WORKDIR" --loop "$@"
@@ -671,6 +715,10 @@ PY
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-discord-relay.sh" "$@"
       ;;
+    telegram-relay)
+      shift
+      exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-telegram-relay.sh" "$@"
+      ;;
     migrate)
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-migrate.sh" "$@"
@@ -718,7 +766,7 @@ PY
   # sqlite3 fallback path. Reject with an intent-recovery suggestion
   # before the spawn parser sees it.
   if [[ -n "${1:-}" && "${1:0:1}" != "-" ]]; then
-    _top_valid="admin bootstrap init version upgrade escalate upstream review user guard diagnose knowledge config bundle intake list status kill attach urgent task profile setup agent cron memory audit usage watchdog discord migrate wiki isolate unisolate worktree inbox show claim done cancel update handoff summary create"
+    _top_valid="admin bootstrap init version upgrade escalate upstream review user guard diagnose knowledge config bundle intake list status kill attach urgent task profile setup agent cron memory audit usage watchdog discord telegram-relay migrate wiki isolate unisolate worktree inbox show claim done cancel update handoff summary create"
     _hint="$(bridge_suggest_subcommand "$1" "$_top_valid")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 명령입니다: $1"
@@ -917,7 +965,17 @@ if [[ $CONTINUE_MODE -eq 1 && -f "$HISTORY_FILE" ]]; then
   AGENT_SESSION_ID=""
   # shellcheck source=/dev/null
   source "$HISTORY_FILE"
-  SESSION_ID="${AGENT_SESSION_ID:-}"
+  # Gate the stored id through the freshness resolver. rc=0 keeps it,
+  # rc=2 swaps in a fresher in-window transcript for the same workdir,
+  # anything else means start fresh (no --resume). This is the dynamic
+  # ad-hoc analogue of the hydration sites in lib/bridge-state.sh.
+  _RESUME_RC=0
+  SESSION_ID="$(bridge_resolve_resume_session_id "$ENGINE" "$NAME" "$WORKDIR" "${AGENT_SESSION_ID:-}" 2>/dev/null)" || _RESUME_RC=$?
+  case "$_RESUME_RC" in
+    0|2) ;;
+    *)   SESSION_ID="" ;;
+  esac
+  unset _RESUME_RC
 fi
 
 bridge_add_agent_id_if_missing "$NAME"

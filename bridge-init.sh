@@ -438,6 +438,13 @@ else
   bridge_load_roster
 fi
 
+if [[ $dry_run -eq 0 ]] && [[ "$(bridge_agent_engine "$admin_agent" 2>/dev/null || printf '%s' "$engine")" == "claude" ]]; then
+  admin_workdir="$(bridge_agent_workdir "$admin_agent" 2>/dev/null || true)"
+  if [[ -n "$admin_workdir" ]]; then
+    bridge_ensure_claude_shared_settings_for_managed_workdir "$admin_workdir" >/dev/null 2>&1 || true
+  fi
+fi
+
 if [[ $skip_channel_setup -eq 0 ]] && [[ $dry_run -eq 0 ]]; then
   channel_setup_status="ok"
   if bridge_channel_csv_contains "$channels" "plugin:discord"; then

@@ -19,16 +19,19 @@ import { createServer } from 'http'
 import { randomUUID } from 'crypto'
 import { spawnSync } from 'child_process'
 import {
+  accessSync,
   appendFileSync,
   chmodSync,
+  constants as fsConstants,
   existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
+  unlinkSync,
   writeFileSync,
 } from 'fs'
 import { homedir } from 'os'
-import { join } from 'path'
+import { isAbsolute as pathIsAbsolute, join, resolve as pathResolve } from 'path'
 import { createRecentMessageDeduper } from './dedupe.ts'
 
 type GroupPolicy = {
@@ -44,6 +47,17 @@ type Access = {
   routes?: Record<string, unknown>
 }
 
+type StoredAttachment = {
+  attachment_id: string
+  name: string
+  content_type: string
+  size_bytes?: number
+  download_url?: string
+  local_path?: string
+  download_status: 'ok' | 'skipped_non_file' | 'failed'
+  download_error?: string
+}
+
 type StoredMessage = {
   chat_id: string
   message_id: string
@@ -52,6 +66,7 @@ type StoredMessage = {
   aad_object_id: string
   text: string
   ts: string
+  attachments?: StoredAttachment[]
 }
 
 type Ms365CallbackPayload = {
@@ -68,6 +83,53 @@ const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 const REFERENCES_FILE = join(STATE_DIR, 'conversations.json')
 const MESSAGES_FILE = join(STATE_DIR, 'messages.jsonl')
+function resolveAttachmentsDir(): string {
+  const override = process.env.TEAMS_ATTACHMENTS_DIR
+  if (override) {
+    if (!pathIsAbsolute(override)) {
+      process.stderr.write(
+        `teams channel: TEAMS_ATTACHMENTS_DIR not absolute, falling back to default\n`,
+      )
+    } else {
+      try {
+        accessSync(override, fsConstants.W_OK)
+        return override
+      } catch {
+        // Don't echo override path on failure to avoid leaking attacker-supplied
+        // env bytes into logs.
+        process.stderr.write(
+          `teams channel: TEAMS_ATTACHMENTS_DIR not writable, falling back to default\n`,
+        )
+      }
+    }
+  }
+  return pathResolve(STATE_DIR, 'attachments')
+}
+
+function resolveAttachmentMaxBytes(): number {
+  const DEFAULT_MAX = 50 * 1024 * 1024 // 50 MB
+  const CEILING = 1024 * 1024 * 1024 // 1 GB sanity ceiling
+  const raw = process.env.TEAMS_ATTACHMENT_MAX_BYTES
+  if (!raw) return DEFAULT_MAX
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) {
+    process.stderr.write(
+      `teams channel: TEAMS_ATTACHMENT_MAX_BYTES invalid, using default ${DEFAULT_MAX}\n`,
+    )
+    return DEFAULT_MAX
+  }
+  if (n > CEILING) {
+    process.stderr.write(
+      `teams channel: TEAMS_ATTACHMENT_MAX_BYTES exceeds ceiling ${CEILING}, using ceiling\n`,
+    )
+    return CEILING
+  }
+  return Math.floor(n)
+}
+
+const ATTACHMENTS_DIR = resolveAttachmentsDir()
+const ATTACHMENT_MAX_BYTES = resolveAttachmentMaxBytes()
+const TEAMS_FILE_DOWNLOAD_TYPE = 'application/vnd.microsoft.teams.file.download.info'
 const MS365_CALLBACK_DIR =
   process.env.MS365_CALLBACK_SHARED_DIR ?? join(BRIDGE_HOME, 'shared', 'ms365-callbacks')
 
@@ -292,6 +354,145 @@ function appendMessage(message: StoredMessage): void {
   appendFileSync(MESSAGES_FILE, JSON.stringify(message) + '\n', { mode: 0o600 })
 }
 
+function sanitizeMessageId(raw: string): string {
+  // Teams message ids are typically guid-like, numeric, or "<guid>:<num>".
+  // Strict allowlist prevents path-traversal via attacker-controlled activity.id.
+  // Dot is intentionally NOT in the allowlist — single dots could let an
+  // attacker craft segments that the filesystem resolves into traversal
+  // under some path normalization (codex r2 PR #443). Real Teams message
+  // ids in the wild are alphanumeric/colon/dash/underscore; the rare
+  // dotted format safely fail-closes (download_status=failed).
+  if (!raw || typeof raw !== 'string') return ''
+  if (raw.length > 256) return ''
+  if (!/^[A-Za-z0-9_:\-]+$/.test(raw)) return ''
+  return raw
+}
+
+function sanitizeFilename(name: string): string {
+  if (!name || typeof name !== 'string') return ''
+  // Strip path-traversal segments and separators first.
+  let clean = name.replace(/\.\./g, '_').replace(/[\\/]/g, '_')
+  // Strip control chars + DEL + null bytes.
+  // eslint-disable-next-line no-control-regex
+  clean = clean.replace(/[\x00-\x1f\x7f]/g, '')
+  // Strip leading/trailing dots and whitespace.
+  clean = clean.replace(/^[.\s]+|[.\s]+$/g, '')
+  // Allowlist: alphanumerics, dot, dash, underscore, space.
+  clean = clean.replace(/[^A-Za-z0-9._\- ]/g, '_')
+  if (clean.length === 0 || clean.length > 255) return ''
+  return clean
+}
+
+async function streamDownload(
+  url: string,
+  destPath: string,
+  maxBytes: number,
+): Promise<{ ok: true; size: number } | { ok: false; error: string }> {
+  const resp = await fetch(url)
+  if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` }
+  const cl = resp.headers.get('content-length')
+  if (cl !== null) {
+    const declared = Number(cl)
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      return { ok: false, error: 'size_limit' }
+    }
+  }
+  if (!resp.body) return { ok: false, error: 'no response body' }
+
+  let total = 0
+  // Pre-create the file with restrictive mode so the writer inherits 0600.
+  writeFileSync(destPath, '', { mode: 0o600 })
+  const writer = Bun.file(destPath).writer()
+  const reader = resp.body.getReader()
+  try {
+    while (true) {
+      const { value, done } = await reader.read()
+      if (done) break
+      if (!value) continue
+      total += value.byteLength
+      if (total > maxBytes) {
+        try { await writer.end() } catch {}
+        try { unlinkSync(destPath) } catch {}
+        return { ok: false, error: 'size_limit' }
+      }
+      writer.write(value)
+    }
+    await writer.end()
+    return { ok: true, size: total }
+  } catch (err) {
+    try { await writer.end() } catch {}
+    try { unlinkSync(destPath) } catch {}
+    return { ok: false, error: String((err as Error)?.message ?? err) }
+  }
+}
+
+async function downloadAttachments(
+  activity: Activity,
+  messageId: string,
+): Promise<StoredAttachment[]> {
+  const items = Array.isArray(activity.attachments) ? activity.attachments : []
+  if (items.length === 0) return []
+  const safeMessageId = sanitizeMessageId(messageId)
+  const results: StoredAttachment[] = []
+  for (let i = 0; i < items.length; i++) {
+    const att = items[i]
+    const rawId = String((att as any).id ?? (att as any).contentUrl ?? '').trim()
+    const attachmentId = rawId || `${messageId}-${i}`
+    const name = String(att.name ?? '').trim() || `attachment-${i}`
+    const contentType = String(att.contentType ?? '').trim()
+    const stored: StoredAttachment = {
+      attachment_id: attachmentId,
+      name,
+      content_type: contentType,
+      download_status: 'skipped_non_file',
+    }
+    let downloadUrl = ''
+    if (contentType === TEAMS_FILE_DOWNLOAD_TYPE) {
+      const content = ((att as any).content ?? {}) as { downloadUrl?: string }
+      downloadUrl = String(content.downloadUrl ?? '').trim() || String((att as any).contentUrl ?? '').trim()
+    } else if (contentType.startsWith('image/')) {
+      downloadUrl = String((att as any).contentUrl ?? '').trim()
+    }
+    if (!downloadUrl) {
+      results.push(stored)
+      continue
+    }
+    stored.download_url = downloadUrl
+    if (!safeMessageId) {
+      stored.download_status = 'failed'
+      stored.download_error = 'rejected message id'
+      results.push(stored)
+      continue
+    }
+    const safeName = sanitizeFilename(name)
+    if (!safeName) {
+      stored.download_status = 'failed'
+      stored.download_error = 'rejected filename'
+      results.push(stored)
+      continue
+    }
+    try {
+      const dir = join(ATTACHMENTS_DIR, safeMessageId)
+      mkdirSync(dir, { recursive: true, mode: 0o700 })
+      const localPath = join(dir, safeName)
+      const dl = await streamDownload(downloadUrl, localPath, ATTACHMENT_MAX_BYTES)
+      if (dl.ok) {
+        stored.local_path = localPath
+        stored.size_bytes = dl.size
+        stored.download_status = 'ok'
+      } else {
+        stored.download_status = 'failed'
+        stored.download_error = dl.error.slice(0, 200)
+      }
+    } catch (err) {
+      stored.download_status = 'failed'
+      stored.download_error = String((err as Error)?.message ?? err).slice(0, 200)
+    }
+    results.push(stored)
+  }
+  return results
+}
+
 function runPromptGuard(command: 'scan' | 'sanitize', text: string): Record<string, unknown> | null {
   const script = join(BRIDGE_HOME, 'bridge-guard.py')
   const result = spawnSync(
@@ -432,6 +633,8 @@ async function handleActivity(context: TurnContext): Promise<void> {
   if (guarded?.blocked) return
   const ts = activity.timestamp instanceof Date ? activity.timestamp.toISOString() : new Date().toISOString()
 
+  const attachments = await downloadAttachments(activity, messageId)
+
   const stored: StoredMessage = {
     chat_id: chatId,
     message_id: messageId,
@@ -440,6 +643,7 @@ async function handleActivity(context: TurnContext): Promise<void> {
     aad_object_id: aad,
     text,
     ts,
+    ...(attachments.length > 0 ? { attachments } : {}),
   }
   appendMessage(stored)
 
@@ -458,6 +662,18 @@ async function handleActivity(context: TurnContext): Promise<void> {
         tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
         service_url: String(activity.serviceUrl ?? ''),
         ts,
+        ...(attachments.length > 0
+          ? {
+              attachments: attachments.map(att => ({
+                name: att.name,
+                content_type: att.content_type,
+                download_status: att.download_status,
+                ...(att.local_path ? { local_path: att.local_path } : {}),
+                ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
+                ...(att.download_error ? { download_error: att.download_error } : {}),
+              })),
+            }
+          : {}),
       },
     },
   })
