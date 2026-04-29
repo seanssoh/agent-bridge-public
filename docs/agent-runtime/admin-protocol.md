@@ -80,7 +80,8 @@ For the inverse case — admin should *not* push outbound nudges/maintenance to 
 - dynamic 에이전트는 TUI 앞에 있는 개발자 operator가 직접 관리한다. daemon 유지보수 task가 dynamic 에이전트를 대상으로 들어오면 `<reason>: dynamic agent — operator-managed` note로 닫고 추가 행동은 하지 않는다.
 - static 에이전트는 Discord/Telegram/Teams 같은 외부 채널 end-user가 대상이며, end-user는 Claude Code slash command나 CLI surface를 실행할 수 없다.
 - static 에이전트나 end-user에게 `/compact`, `/clear`, `NEXT-SESSION.md` 작성, 기타 CLI 실행을 요청하는 후속 task를 만들지 않는다.
-- static 유지보수는 admin이 사용할 수 있는 bridge primitive로만 처리한다. 일반 context pressure에는 `agent-bridge agent compact <agent>`, critical 재시작에는 `agent-bridge agent handoff <agent>`를 사용한다.
+- static 에이전트의 자동 context-pressure 처리는 setup 단계에서 Claude Code의 native auto-compact가 동작하도록 context size를 낮추는 방식으로 위임한다 (#473 참조). daemon은 더 이상 `[context-pressure]` task를 자동 생성하지 않는다 (#472).
+- admin이 의도적으로 세션을 roll할 필요가 있을 때만 manual primitive를 호출한다: 일반적인 정리에는 `agent-bridge agent compact <agent>`, critical 재시작에는 `agent-bridge agent handoff <agent>`. 두 primitive 모두 dynamic 에이전트는 거부되고 (defense in depth), static 에이전트에는 synthetic 큐 task와 audit row를 남겨 자동으로 정리된다.
 - end-user에게는 체감 가능한 동작 변화가 있을 때만 알린다. 그 외 admin 유지보수는 조용히 끝낸다.
 
 ## Admin Upgrade Protocol
