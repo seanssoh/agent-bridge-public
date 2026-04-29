@@ -66,6 +66,32 @@ For the inverse case — admin should *not* push outbound nudges/maintenance to 
 - 채널 setup 때문에 현재 Claude 세션을 재시작해야 하면, `exit` 안내 전에 `NEXT-SESSION.md`를 작성한다. 포함할 내용: 왜 재시작하는지, 방금 설정한 채널, 다음 세션에서 실행할 검증 명령, 성공 후 사용자에게 보낼 안내, 검증 완료 후 `NEXT-SESSION.md` 삭제.
 - admin 온보딩이 끝나면 `agent start patch`, `agent restart patch`, `start patch` 같은 표현을 사용자에게 안내하지 않는다. 대신 "현재 Claude 세션에는 새 설정이 아직 완전히 붙지 않을 수 있습니다. 이 세션에서 `exit`로 종료하면 바깥 쉘로 돌아가고, 온보딩 완료된 admin은 백그라운드에서 다시 뜹니다. 그 다음 바깥 쉘에서 `agb admin`을 다시 실행하세요."라고 안내한다.
 
+## Admin Self-Cleanup of Own Queue
+
+- 이 섹션은 `SESSION-TYPE.md`의 Session Type이 `admin`일 때만 적용된다. admin은 자기 큐의 소유자이며, 자기 큐를 닫는 책임도 자기에게 있다. 무한정 parking하지 않는다.
+- 자기 소유의 모든 `blocked` task는 `[blocked-aging]`이 발화할 때마다 또는 idle한 inbox 방문마다 task body를 처음부터 끝까지 다시 읽는다. blind refresh 금지.
+- 결정 순서: stale 전제면 `done`; 원본 에이전트가 이미 넘어갔으면 `done`; 같은 일을 다루는 active task가 있으면 handoff 또는 cross-reference 후 `done`; admin 혼자 15분 안에 끝낼 수 있으면 지금 처리; operator 결정이 필요하고 오늘 외부 채널에서 받을 수 있으면 deadline과 함께 에스컬레이션.
+- 위 어디에도 해당하지 않을 때만 "X가 일어나면 다시 본다"는 검증 가능한 trigger를 note에 적고 `blocked` refresh한다. `when free` 같은 모호한 note는 금지다.
+- 기본은 close다. Refresh는 예외이지 평형 상태가 아니다.
+
+## Admin Static vs Dynamic Agent Boundary
+
+- 이 섹션은 `SESSION-TYPE.md`의 Session Type이 `admin`일 때만 적용된다.
+- dynamic 에이전트는 TUI 앞에 있는 개발자 operator가 직접 관리한다. daemon 유지보수 task가 dynamic 에이전트를 대상으로 들어오면 `<reason>: dynamic agent — operator-managed` note로 닫고 추가 행동은 하지 않는다.
+- static 에이전트는 Discord/Telegram/Teams 같은 외부 채널 end-user가 대상이며, end-user는 Claude Code slash command나 CLI surface를 실행할 수 없다.
+- static 에이전트나 end-user에게 `/compact`, `/clear`, `NEXT-SESSION.md` 작성, 기타 CLI 실행을 요청하는 후속 task를 만들지 않는다.
+- static 유지보수는 admin이 사용할 수 있는 bridge primitive로만 처리한다. 일반 context pressure에는 `agent-bridge agent compact <agent>`, critical 재시작에는 `agent-bridge agent handoff <agent>`를 사용한다.
+- end-user에게는 체감 가능한 동작 변화가 있을 때만 알린다. 그 외 admin 유지보수는 조용히 끝낸다.
+
+## Admin Upgrade Protocol
+
+- 이 섹션은 `SESSION-TYPE.md`의 Session Type이 `admin`일 때만 적용된다.
+- 실행 중인 에이전트가 있는 호스트에서 `agent-bridge upgrade --apply`는 유일하게 허가된 업그레이드 엔트리포인트다. 업그레이더가 daemon stop, restart, 에이전트 재기동을 내부적으로 처리한다.
+- `bash bridge-daemon.sh stop`이나 `agb daemon stop`을 `upgrade --apply` 이전 단계로 분리해서 실행하지 않는다. 오래된 호스트에서 stale `AGENT_SESSION_ID` cascade를 만들 수 있다.
+- 문서가 "stop → upgrade → verify"를 분리된 단계로 보여주더라도 업그레이드는 단일 atomic 명령으로 취급한다.
+- `agent-bridge upgrade --apply`가 실패하면 daemon을 수동으로 stop하지 말고 공유 외부 채널로 사람 operator에게 실패를 보고한다. manual daemon-stop은 operator 승인 후 recovery action으로만 사용한다.
+- 업그레이드 후 daemon health 확인은 read-only 명령으로 한다: Linux에서는 `pgrep -af 'bridge-daemon\.sh run$'`, 어느 OS에서든 `agb daemon status`를 사용한다.
+
 ## Channel Setup Protocol
 
 - 사용자가 어떤 에이전트든 새로 만들거나 설정하면서 채널을 언급하면, 먼저 선택지를 명확히 확인한다: `터미널만`, `Discord`, `Telegram`, `Discord와 Telegram 둘 다`.
@@ -220,3 +246,4 @@ agb done <task_id> --note "bootstrap OK; first scan <N> files / <E> entities; <C
 - 2026-04-19: initial ratified version. `patch/CLAUDE.md`의 admin-only 섹션 2개(`Admin First-Run Onboarding Defaults`, `Channel Setup Protocol`)를 canonical로 승격. SHA-256 `3476e00ffbd9652383c9a079b3d0abbf4c74c9ec85393367dbd21b3aeaf1401f` (patch/CLAUDE.md lines 66–98) 기반. people.md single-file anchor → per-person 파일 분리 반영. Bootstrap 섹션 추가.
 - 2026-04-19 (evening): Wiki Canonical Hub Curation 섹션 추가. L2 candidacy 자동화(`wiki-hub-audit` 크론 + `[wiki-hub-candidates]` task)의 admin-facing 처리 계약을 문서화. 허브 생성은 admin 판단 게이트 유지.
 - 2026-04-21: Post-Upgrade Issue Triage와 Workaround Reconciliation 섹션 추가 (issue #186). 업그레이드 완료 후 관리자 판단 작업 두 개(발견된 이상을 upstream으로 기록, 불필요해진 로컬 workaround 원복)를 기본 경로로 문서화. `[upgrade-complete]` post-task body가 이 섹션들을 참조한다.
+- 2026-04-29: `_template/CLAUDE.md` slim managed block 작업에 맞춰 admin self-cleanup, static/dynamic boundary, upgrade protocol 본문을 이 canonical 문서로 승격.
