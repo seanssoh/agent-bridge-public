@@ -46,6 +46,19 @@ wait_for_path() {
   smoke_fail "$context: timed out waiting for $path"
 }
 
+wait_for_pid_exit() {
+  local pid="$1"
+  local context="$2"
+  local deadline=$((SECONDS + 10))
+  while (( SECONDS < deadline )); do
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  smoke_fail "$context: timed out waiting for pid $pid to exit"
+}
+
 relay_rpc() {
   local socket_path="$1"
   local request_json="$2"
@@ -76,9 +89,76 @@ if client not in update.get("delivered_to", []):
 PY
 }
 
+telegram_relay_cursor_buffer_ordering() {
+  local token_file state_dir
+
+  token_file="$SMOKE_TMP_ROOT/fault-token"
+  state_dir="$SMOKE_TMP_ROOT/fault-state"
+  printf '%s\n' "123456:fault-token" >"$token_file"
+  chmod 600 "$token_file"
+
+  python3 - "$SMOKE_REPO_ROOT/lib/telegram-relay.py" "$token_file" "$state_dir" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+module_path = Path(sys.argv[1])
+token_file = Path(sys.argv[2])
+state_dir = Path(sys.argv[3])
+spec = importlib.util.spec_from_file_location("telegram_relay", module_path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+relay = module.TelegramRelay(
+    token_file=token_file,
+    state_dir=state_dir,
+    socket_path=state_dir.parent / "fault.sock",
+    log_file=state_dir / "relay.log",
+    api_base_url="http://127.0.0.1:9",
+    poll_timeout=1,
+    buffer_ttl_seconds=86400,
+    max_buffered=1000,
+)
+
+os.environ["BRIDGE_TELEGRAM_RELAY_FAULT_BUFFER_WRITE"] = "1"
+try:
+    relay.append_update({"update_id": 7, "message": {"chat": {"id": 1}, "text": "fault"}})
+except RuntimeError as exc:
+    if "buffer write failed" not in str(exc):
+        raise
+else:
+    raise SystemExit("append_update unexpectedly succeeded with buffer write fault")
+finally:
+    os.environ.pop("BRIDGE_TELEGRAM_RELAY_FAULT_BUFFER_WRITE", None)
+
+if relay.cursor != 0:
+    raise SystemExit(f"cursor advanced in memory after buffer write fault: {relay.cursor}")
+if relay.buffer:
+    raise SystemExit(f"buffer advanced in memory after buffer write fault: {relay.buffer!r}")
+if relay.cursor_file.exists():
+    raise SystemExit(f"cursor file exists after failed buffer persist: {relay.cursor_file}")
+if relay.buffer_file.exists():
+    raw = relay.buffer_file.read_text(encoding="utf-8")
+    if '"update_id": 7' in raw:
+        raise SystemExit(f"failed update was persisted to buffer: {raw}")
+
+relay.append_update({"update_id": 7, "message": {"chat": {"id": 1}, "text": "ok"}})
+if relay.cursor != 7:
+    raise SystemExit(f"cursor did not advance after successful buffer write: {relay.cursor}")
+if relay.cursor_file.read_text(encoding="utf-8").strip() != "7":
+    raise SystemExit("cursor file did not persist after successful buffer write")
+entries = [json.loads(line) for line in relay.buffer_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+if [entry.get("update_id") for entry in entries] != [7]:
+    raise SystemExit(f"buffer file did not persist expected update: {entries!r}")
+PY
+}
+
 telegram_relay_rpc_surface() {
-  local fake_py port_file updates_file sent_file token_file token_hash socket_path cursor_file
-  local api_base relay_log response sent_count status_output
+  local fake_py port_file updates_file sent_file token_file token_hash new_token_hash socket_path cursor_file
+  local api_base relay_log response sent_count status_output audit_log
 
   fake_py="$SMOKE_TMP_ROOT/fake-telegram.py"
   port_file="$SMOKE_TMP_ROOT/fake-port"
@@ -198,9 +278,12 @@ JSON
   smoke_assert_contains "$response" '"ok": true' "send_message RPC"
   sent_count="$(wc -l <"$sent_file" | tr -d ' ')"
   smoke_assert_eq "1" "$sent_count" "fake Telegram sendMessage call count"
-  smoke_assert_contains "$(cat "$sent_file")" '"text": "relay outbound"' "fake Telegram sendMessage payload"
+  smoke_assert_contains "$(cat "$sent_file")" '"chat_id": 12345' "fake Telegram sendMessage chat_id payload"
+  smoke_assert_contains "$(cat "$sent_file")" '"reply_to_message_id": 11' "fake Telegram sendMessage reply_to payload"
+  smoke_assert_contains "$(cat "$sent_file")" '"text": "relay outbound"' "fake Telegram sendMessage text payload"
 
   kill "$RELAY_PID"
+  wait_for_pid_exit "$RELAY_PID" "relay SIGTERM"
   wait "$RELAY_PID" >/dev/null 2>&1 || true
   RELAY_PID=""
   wait_for_path "$cursor_file" "relay cursor"
@@ -218,14 +301,23 @@ JSON
   response="$(relay_rpc "$socket_path" '{"verb":"recv","client_id":"client-c","since_id":0,"timeout_seconds":2}')"
   assert_update_once "$response" "client-c"
 
-  "$SMOKE_REPO_ROOT/agent-bridge" telegram-relay stop --token-hash "$token_hash" >/dev/null
+  printf '%s\n' "654321:rotated-token" >"$token_file"
+  chmod 600 "$token_file"
+  new_token_hash="$(python3 "$SMOKE_REPO_ROOT/lib/telegram-relay.py" token-hash --token-file "$token_file")"
+  kill -HUP "$RELAY_PID"
+  wait_for_pid_exit "$RELAY_PID" "relay SIGHUP token rotation"
   wait "$RELAY_PID" >/dev/null 2>&1 || true
   RELAY_PID=""
+  audit_log="$(cat "$BRIDGE_AUDIT_LOG")"
+  smoke_assert_contains "$audit_log" '"action": "telegram_relay_token_rotated"' "SIGHUP token rotation audit action"
+  smoke_assert_contains "$audit_log" "\"old_hash\": \"$token_hash\"" "SIGHUP token rotation old hash audit"
+  smoke_assert_contains "$audit_log" "\"new_hash\": \"$new_token_hash\"" "SIGHUP token rotation new hash audit"
 }
 
 main() {
   smoke_require_cmd python3
   TMPDIR=/tmp smoke_setup_bridge_home "tg"
+  smoke_run "Telegram relay cursor/buffer write ordering" telegram_relay_cursor_buffer_ordering
   smoke_run "Telegram relay daemon RPC/fan-out/cursor smoke" telegram_relay_rpc_surface
   smoke_log "passed"
 }

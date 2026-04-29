@@ -9,6 +9,7 @@ token file; the token value is never accepted on argv.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -65,6 +66,39 @@ def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
     os.chmod(tmp, mode)
     tmp.replace(path)
     os.chmod(path, mode)
+
+
+def audit_record(
+    *,
+    action: str,
+    target: str,
+    detail: dict[str, Any] | None = None,
+) -> None:
+    audit_log = os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+    if not audit_log:
+        return
+    audit_script = Path(__file__).resolve().parent.parent / "bridge-audit.py"
+    if not audit_script.exists():
+        return
+    cmd = [
+        sys.executable,
+        str(audit_script),
+        "write",
+        "--file",
+        audit_log,
+        "--actor",
+        "telegram-relay",
+        "--action",
+        action,
+        "--target",
+        target,
+    ]
+    for key, value in sorted((detail or {}).items()):
+        cmd.extend(["--detail", f"{key}={value}"])
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=False)
+    except Exception:
+        return
 
 
 def read_json_lines(path: Path) -> list[dict[str, Any]]:
@@ -176,13 +210,15 @@ class TelegramRelay:
         self.token = read_token_file(token_file)
         self.token_hash = token_hash_for_value(self.token)
         self.cursor_file = state_dir / "cursor"
-        self.cursor_lock_file = state_dir / "cursor.lock"
+        self.state_lock_file = state_dir / "state.lock"
         self.buffer_file = state_dir / "buffered.jsonl"
         self.pid_file = state_dir / "pid"
         self.lock_file = state_dir / "relay.lock"
 
         self.stop_event = threading.Event()
+        self.reload_event = threading.Event()
         self.condition = threading.Condition()
+        self.token_lock = threading.Lock()
         self.clients: dict[str, dict[str, Any]] = {}
         self.client_cursors: dict[str, int] = {}
         self.buffer: list[dict[str, Any]] = []
@@ -217,43 +253,73 @@ class TelegramRelay:
             return False
         return True
 
-    def load_state(self) -> None:
-        if self.cursor_file.exists():
-            raw = self.cursor_file.read_text(encoding="utf-8").strip()
-            if raw.isdigit():
-                self.cursor = int(raw)
-        self.buffer = read_json_lines(self.buffer_file)
-        self.prune_buffer(force=True)
-
-    def persist_cursor(self) -> None:
-        self.cursor_lock_file.parent.mkdir(parents=True, exist_ok=True)
-        with self.cursor_lock_file.open("a+", encoding="utf-8") as lock:
+    @contextlib.contextmanager
+    def state_file_lock(self) -> Any:
+        self.state_lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with self.state_lock_file.open("a+", encoding="utf-8") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            atomic_write(self.cursor_file, f"{self.cursor}\n")
+            yield
 
-    def persist_buffer(self) -> None:
-        lines = "".join(json_dumps(entry) + "\n" for entry in self.buffer)
-        atomic_write(self.buffer_file, lines)
-
-    def prune_buffer(self, force: bool = False) -> None:
+    def pruned_buffer_entries(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
         cutoff = now_ts() - max(0, self.buffer_ttl_seconds)
-        original = len(self.buffer)
-        self.buffer = [
+        pruned = [
             entry
-            for entry in self.buffer
+            for entry in entries
             if float(entry.get("received_ts") or 0) >= cutoff
         ]
-        if len(self.buffer) > self.max_buffered:
-            self.buffer = self.buffer[-self.max_buffered :]
-        if force or len(self.buffer) != original:
-            self.persist_buffer()
+        if len(pruned) > self.max_buffered:
+            pruned = pruned[-self.max_buffered :]
+        return pruned
+
+    def load_state(self) -> None:
+        with self.state_file_lock():
+            if self.cursor_file.exists():
+                raw = self.cursor_file.read_text(encoding="utf-8").strip()
+                if raw.isdigit():
+                    self.cursor = int(raw)
+            self.buffer = read_json_lines(self.buffer_file)
+            self.prune_buffer(force=True, persist=True)
+
+    def persist_cursor(self) -> None:
+        atomic_write(self.cursor_file, f"{self.cursor}\n")
+
+    def persist_buffer(self, entries: list[dict[str, Any]] | None = None) -> None:
+        if os.environ.get("BRIDGE_TELEGRAM_RELAY_FAULT_BUFFER_WRITE") == "1":
+            raise RuntimeError("test fault: buffer write failed before cursor advance")
+        buffer_entries = self.buffer if entries is None else entries
+        lines = "".join(json_dumps(entry) + "\n" for entry in buffer_entries)
+        atomic_write(self.buffer_file, lines)
+
+    def prune_buffer(self, force: bool = False, persist: bool = True) -> None:
+        next_buffer = self.pruned_buffer_entries(self.buffer)
+        changed = next_buffer != self.buffer
+        if persist and (force or changed):
+            self.persist_buffer(next_buffer)
+        self.buffer = next_buffer
 
     def reload_token(self) -> None:
-        self.token = read_token_file(self.token_file)
+        new_token = read_token_file(self.token_file)
+        new_hash = token_hash_for_value(new_token)
+        with self.token_lock:
+            old_hash = self.token_hash
+            if new_hash != old_hash:
+                self.log(f"token hash changed after SIGHUP; stopping old_hash={old_hash} new_hash={new_hash}")
+                audit_record(
+                    action="telegram_relay_token_rotated",
+                    target=old_hash,
+                    detail={"old_hash": old_hash, "new_hash": new_hash},
+                )
+                self.stop_event.set()
+                with self.condition:
+                    self.condition.notify_all()
+                return
+            self.token = new_token
         self.log("reloaded token file after SIGHUP")
 
     def api_url(self, method: str, query: dict[str, Any] | None = None) -> str:
-        token_part = urllib.parse.quote(self.token, safe=":")
+        with self.token_lock:
+            token = self.token
+        token_part = urllib.parse.quote(token, safe=":")
         url = f"{self.api_base_url}/bot{token_part}/{method}"
         if query:
             url = f"{url}?{urllib.parse.urlencode(query)}"
@@ -302,20 +368,24 @@ class TelegramRelay:
         if update_id <= 0:
             return
         with self.condition:
-            if any(int(entry.get("update_id") or 0) == update_id for entry in self.buffer):
-                self.cursor = max(self.cursor, update_id)
+            with self.state_file_lock():
+                if any(int(entry.get("update_id") or 0) == update_id for entry in self.buffer):
+                    if update_id > self.cursor:
+                        self.cursor = update_id
+                        self.persist_cursor()
+                    return
+                entry = {
+                    "update_id": update_id,
+                    "received_ts": now_ts(),
+                    "delivered_to": [],
+                    "update": update,
+                }
+                next_buffer = self.pruned_buffer_entries([*self.buffer, entry])
+                next_cursor = max(self.cursor, update_id)
+                self.persist_buffer(next_buffer)
+                self.buffer = next_buffer
+                self.cursor = next_cursor
                 self.persist_cursor()
-                return
-            entry = {
-                "update_id": update_id,
-                "received_ts": now_ts(),
-                "delivered_to": [],
-                "update": update,
-            }
-            self.buffer.append(entry)
-            self.cursor = max(self.cursor, update_id)
-            self.persist_cursor()
-            self.prune_buffer()
             self.condition.notify_all()
 
     def poll_loop(self) -> None:
@@ -435,7 +505,8 @@ class TelegramRelay:
                     self.client_cursors[client_id] = max(self.client_cursors.get(client_id, 0), update_id)
                     changed = True
                 if changed:
-                    self.persist_buffer()
+                    with self.state_file_lock():
+                        self.persist_buffer()
                 if selected or timeout <= 0:
                     return {"ok": True, "updates": selected, "cursor": self.client_cursors.get(client_id, cursor)}
                 remaining = deadline - now_ts()
@@ -462,6 +533,9 @@ class TelegramRelay:
             self.poller_thread.start()
             self.log(f"relay started token_hash={self.token_hash} socket={self.socket_path}")
             while not self.stop_event.is_set():
+                if self.reload_event.is_set():
+                    self.reload_event.clear()
+                    self.reload_token()
                 time.sleep(0.2)
         finally:
             self.shutdown()
@@ -476,8 +550,8 @@ class TelegramRelay:
             self.server.server_close()
         if self.poller_thread is not None:
             self.poller_thread.join(timeout=2)
-        self.prune_buffer(force=True)
-        self.persist_buffer()
+        with self.state_file_lock():
+            self.prune_buffer(force=True, persist=True)
         if self.socket_path.exists():
             self.socket_path.unlink()
         if self.pid_file.exists():
@@ -534,6 +608,11 @@ def register_token(state_root: Path, token_file: Path) -> str:
             parts = line.split("\t", 1)
             if len(parts) == 2:
                 rows[parts[0]] = parts[1]
+    rows = {
+        existing_hash: existing_file
+        for existing_hash, existing_file in rows.items()
+        if existing_file != str(token_file) or existing_hash == token_hash
+    }
     rows[token_hash] = str(token_file)
     text = "".join(f"{key}\t{value}\n" for key, value in sorted(rows.items()))
     atomic_write(tokens_file, text)
@@ -557,7 +636,7 @@ def command_run(args: argparse.Namespace) -> int:
         relay.stop_event.set()
 
     def handle_hup(_signum: int, _frame: Any) -> None:
-        relay.reload_token()
+        relay.reload_event.set()
 
     signal.signal(signal.SIGTERM, handle_term)
     signal.signal(signal.SIGINT, handle_term)
