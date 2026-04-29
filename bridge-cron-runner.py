@@ -399,46 +399,6 @@ def emit_pressure_audit(run_id: str, target_agent: str, probe: dict[str, Any]) -
         pass
 
 
-def notify_admin_pressure_defer(run_id: str, job_name: str, probe: dict[str, Any]) -> None:
-    """Best-effort admin task creation. Failure is non-fatal — the deferred
-    status file is the durable record; this is the surfacing layer."""
-    admin_agent = os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()
-    if not admin_agent:
-        return
-    task_script = Path(__file__).resolve().parent / "bridge-task.sh"
-    if not task_script.is_file():
-        return
-    bash_bin = os.environ.get("BRIDGE_BASH_BIN") or os.environ.get("BASH") or "bash"
-    title = f"[cron-deferred] {job_name or run_id} memory pressure"
-    detail_lines = [f"- {key}: {value}" for key, value in probe.items()]
-    body = (
-        f"Cron dispatch deferred +{PRESSURE_DEFER_SECONDS // 60} min by pre-flight memory guard.\n\n"
-        f"- run_id: {run_id}\n"
-        f"- job_name: {job_name}\n"
-        + "\n".join(detail_lines)
-        + "\n\nThe disposable child was not spawned. The next scheduler tick will re-fire the slot.\n"
-    )
-    cmd = [
-        bash_bin,
-        str(task_script),
-        "create",
-        "--to",
-        admin_agent,
-        "--from",
-        "daemon",
-        "--priority",
-        "normal",
-        "--title",
-        title,
-        "--body",
-        body,
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-
 def disable_mcp_for_request(request: dict[str, Any]) -> bool:
     """#263 + #468: decide whether the disposable child should launch with MCP disabled.
 
@@ -829,13 +789,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     # Probe BEFORE materialising prompt artifacts or spawning the child. On a
     # pressured host the child cold-load is what tips the disposable run past
     # its timeout (see issue body for the event-reminder-30min stall). We skip
-    # the spawn, mark the run deferred, audit the decision, and ping admin.
-    # The next scheduler tick re-fires the slot once memory recovers.
+    # the spawn, mark the run deferred, and audit the decision. The next
+    # scheduler tick re-fires the slot once memory recovers; no admin queue
+    # nudge is emitted (issue #472).
     pressure = check_memory_pressure()
     if pressure is not None:
         deferred_at = now_iso()
         target_agent = str(request.get("target_agent") or "")
-        job_name = str(request.get("job_name") or "")
         deferred_payload: dict[str, Any] = {
             "run_id": run_id,
             "state": "deferred",
@@ -850,7 +810,6 @@ def cmd_run(args: argparse.Namespace) -> int:
         }
         write_json(status_file, deferred_payload)
         emit_pressure_audit(run_id, target_agent, pressure)
-        notify_admin_pressure_defer(run_id, job_name, pressure)
         print(f"status: deferred")
         print(f"run_id: {run_id}")
         print(f"engine: {engine}")

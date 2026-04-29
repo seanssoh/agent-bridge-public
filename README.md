@@ -509,9 +509,9 @@ agb status
 
 ### 복원력 마커
 
-데몬은 에이전트가 살아 있는지와 별개로 여러 복원력 상태를 marker로 추적합니다. stall, crash-loop, 채널 health, context pressure는 서로 다른 상태로 기록되고, 필요한 경우 admin 큐나 외부 채널로 에스컬레이션됩니다.
+데몬은 에이전트가 살아 있는지와 별개로 여러 복원력 상태를 marker로 추적합니다. stall, crash-loop, 채널 health, context pressure는 서로 다른 상태로 기록됩니다. stall/crash-loop/channel health는 정책에 따라 admin 큐나 외부 채널로 에스컬레이션될 수 있지만, context pressure는 감사 로그와 상태 파일만 남깁니다.
 
-특히 context pressure는 프로세스 장애가 아닙니다. 세션이 정상 실행 중이어도 대화가 길어져 compaction, `NEXT-SESSION.md` handoff, 또는 재시작이 필요한 상태를 별도로 표시합니다.
+특히 context pressure는 프로세스 장애가 아닙니다. 세션이 정상 실행 중이어도 대화가 길어져 compaction이 가까워진 상태를 별도로 표시합니다. 자동 대응은 setup-time Claude Code native auto-compact 설정(#473) 쪽에서 처리하고, daemon은 `[context-pressure]` admin task나 `[admin-compact]` queue chain을 만들지 않습니다.
 
 ### MCP 고아 프로세스 정리
 

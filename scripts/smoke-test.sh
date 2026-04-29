@@ -443,6 +443,123 @@ run_cp_case "338 B1: Welcome banner above a fresh 36% HUD -> warning silenced (b
   "" "hud:context_pct=36" \
   $'Welcome to Claude Code!\n\n> hi\n\nContext ███░░░░░░░ 36%\n'
 
+log "context-pressure daemon function: audit-only state transitions (issue #472)"
+CONTEXT_PRESSURE_UNIT_ROOT="$(mktemp -d "$TMP_ROOT/context-pressure-unit.XXXXXX")"
+CONTEXT_PRESSURE_UNIT_AUDIT="$CONTEXT_PRESSURE_UNIT_ROOT/audit.log"
+CONTEXT_PRESSURE_UNIT_STATE_DIR="$CONTEXT_PRESSURE_UNIT_ROOT/state"
+CONTEXT_PRESSURE_UNIT_HELPER="$CONTEXT_PRESSURE_UNIT_ROOT/context-pressure-functions.sh"
+mkdir -p "$CONTEXT_PRESSURE_UNIT_STATE_DIR"
+: >"$CONTEXT_PRESSURE_UNIT_AUDIT"
+awk '
+  /^bridge_clear_context_pressure_state\(\) \{/ { capture=1 }
+  capture { print }
+  capture && /^}[[:space:]]*$/ {
+    done += 1
+    if (done == 3) {
+      capture=0
+    }
+  }
+' "$REPO_ROOT/bridge-daemon.sh" >"$CONTEXT_PRESSURE_UNIT_HELPER"
+[[ -s "$CONTEXT_PRESSURE_UNIT_HELPER" ]] || die "could not extract context-pressure daemon functions"
+set +e
+CONTEXT_PRESSURE_UNIT_OUTPUT="$("$BASH4_BIN" -lc '
+set -euo pipefail
+state_dir="$1"
+audit_file="$2"
+helper="$3"
+SCRIPT_DIR="$PWD"
+export BRIDGE_CONTEXT_PRESSURE_SCAN_ENABLED=1
+export BRIDGE_CONTEXT_PRESSURE_SCAN_INTERVAL_SECONDS=0
+mkdir -p "$state_dir"
+
+analysis_severity=""
+analysis_hash=""
+analysis_pattern=""
+agent_source_mode="static"
+capture_empty=0
+
+bridge_agent_context_pressure_state_file() {
+  printf "%s/%s.env" "$state_dir" "$1"
+}
+
+bridge_audit_log() {
+  local actor="$1"
+  local action="$2"
+  local target="$3"
+  shift 3
+  {
+    printf "%s|%s|%s" "$actor" "$action" "$target"
+    for item in "$@"; do
+      printf "|%s" "$item"
+    done
+    printf "\n"
+  } >>"$audit_file"
+}
+
+bridge_tmux_session_exists() { return 0; }
+bridge_capture_recent() {
+  (( capture_empty == 1 )) && return 0
+  printf "Context remaining 8%%. Please compact soon."
+}
+bridge_with_timeout() {
+  cat >/dev/null || true
+  [[ -n "$analysis_severity" ]] || return 0
+  printf "CONTEXT_PRESSURE_SEVERITY=%q\n" "$analysis_severity"
+  printf "CONTEXT_PRESSURE_MATCHED_PATTERN=%q\n" "$analysis_pattern"
+  printf "CONTEXT_PRESSURE_EXCERPT_HASH=%q\n" "$analysis_hash"
+}
+bridge_agent_source() { printf "%s" "$agent_source_mode"; }
+bridge_queue_cli() { echo "bridge_queue_cli should not be called"; exit 99; }
+bridge_notify_send() { echo "bridge_notify_send should not be called"; exit 99; }
+daemon_info() { :; }
+
+# shellcheck disable=SC1090
+source "$helper"
+
+summary_static=$'"'"'static-agent\t0\t0\t0\t1\t0\t0\t0\tstatic-session\tclaude\t/tmp'"'"'
+summary_dynamic=$'"'"'dynamic-agent\t0\t0\t0\t1\t0\t0\t0\tdynamic-session\tclaude\t/tmp'"'"'
+
+analysis_severity=warning
+analysis_hash=hash-static
+analysis_pattern=hud:context_pct=72
+agent_source_mode=static
+process_context_pressure_reports "$summary_static" >/dev/null
+static_state="$(cat "$state_dir/static-agent.env")"
+[[ "$static_state" == *"CONTEXT_PRESSURE_SEVERITY=warning"* ]] || { echo "static severity missing"; exit 1; }
+[[ "$static_state" == *"CONTEXT_PRESSURE_EXCERPT_HASH=hash-static"* ]] || { echo "static hash missing"; exit 1; }
+[[ "$static_state" == *"CONTEXT_PRESSURE_FIRST_DETECTED_TS="* ]] || { echo "static first ts missing"; exit 1; }
+[[ "$static_state" == *"CONTEXT_PRESSURE_LAST_DETECTED_TS="* ]] || { echo "static last detected ts missing"; exit 1; }
+[[ "$static_state" == *"CONTEXT_PRESSURE_LAST_SCAN_TS="* ]] || { echo "static scan ts missing"; exit 1; }
+[[ "$static_state" != *"CONTEXT_PRESSURE_TASK_ID"* ]] || { echo "static task id persisted"; exit 1; }
+grep -q "daemon|context_pressure_detected|static-agent|--detail|severity=warning" "$audit_file" || { echo "static detected audit missing"; exit 1; }
+[[ ! -e "$state_dir/context-pressure/static-agent-warning.md" ]] || { echo "static report body created"; exit 1; }
+
+analysis_hash=hash-static-2
+process_context_pressure_reports "$summary_static" >/dev/null
+grep -q "daemon|context_pressure_detected|static-agent|--detail|severity=warning|--detail|excerpt_hash=hash-static-2|--detail|mode=hash_drift" "$audit_file" || { echo "hash drift audit missing"; exit 1; }
+
+analysis_hash=hash-dynamic
+agent_source_mode=dynamic
+bridge_note_context_pressure_state "dynamic-agent" "warning" "hash-dynamic" "10" "11" "12" "0" "hud:context_pct=72"
+process_context_pressure_reports "$summary_dynamic" >/dev/null
+[[ ! -e "$state_dir/dynamic-agent.env" ]] || { echo "dynamic state not cleared"; exit 1; }
+grep -q "daemon|context_pressure_suppressed|dynamic-agent|--detail|severity=warning|--detail|reason=dynamic_agent_operator_managed" "$audit_file" || { echo "dynamic suppressed audit missing"; exit 1; }
+! grep -q "daemon|context_pressure_detected|dynamic-agent" "$audit_file" || { echo "dynamic same-severity edge should not emit detected audit"; exit 1; }
+
+capture_empty=1
+analysis_severity=""
+agent_source_mode=static
+process_context_pressure_reports "$summary_static" >/dev/null
+[[ ! -e "$state_dir/static-agent.env" ]] || { echo "recovered state not cleared"; exit 1; }
+grep -q "daemon|context_pressure_recovered|static-agent|--detail|severity=warning|--detail|reason=no_pattern" "$audit_file" || { echo "recovered audit missing"; exit 1; }
+
+echo ok
+' _ "$CONTEXT_PRESSURE_UNIT_STATE_DIR" "$CONTEXT_PRESSURE_UNIT_AUDIT" "$CONTEXT_PRESSURE_UNIT_HELPER")"
+CONTEXT_PRESSURE_UNIT_RC=$?
+set -e
+[[ "$CONTEXT_PRESSURE_UNIT_RC" -eq 0 && "$CONTEXT_PRESSURE_UNIT_OUTPUT" == "ok" ]] || die "context-pressure daemon function unit failed: $CONTEXT_PRESSURE_UNIT_OUTPUT"
+log "  [ok] context-pressure daemon function audit/state transitions"
+
 log "stall-detector rate_limit/auth regex narrowing (#329 Track A)"
 # Self-contained classifier checks for the bare `\b429\b` / `\bunauthorized\b`
 # narrowing. Mirrors the #161 timeout fix: bare numerics/keywords now require
@@ -7540,9 +7657,7 @@ pressure_probe = {
 }
 module.check_memory_pressure = lambda: dict(pressure_probe)
 audit_calls = []
-notify_calls = []
 module.emit_pressure_audit = lambda run_id, target, probe: audit_calls.append((run_id, target, dict(probe)))
-module.notify_admin_pressure_defer = lambda run_id, job, probe: notify_calls.append((run_id, job, dict(probe)))
 subprocess.run = fake_run
 try:
     args = argparse.Namespace(request_file=request_file, dry_run=False)
@@ -7567,7 +7682,6 @@ assert not any("codex" in os.path.basename(b) for b in spawn_bins), (
 )
 assert audit_calls, "expected emit_pressure_audit to be called"
 assert audit_calls[0][2]["reason"] == "memory_pressure"
-assert notify_calls, "expected notify_admin_pressure_defer to be called"
 
 # Reset for the healthy-path probe.
 status_file.unlink(missing_ok=True)
@@ -9183,19 +9297,26 @@ BRIDGE_CONTEXT_PRESSURE_SCAN_ENABLED=1 \
 BRIDGE_CONTEXT_PRESSURE_SCAN_INTERVAL_SECONDS=0 \
 bash "$REPO_ROOT/bridge-daemon.sh" sync >/dev/null
 CONTEXT_PRESSURE_TASK_ID="$(python3 "$REPO_ROOT/bridge-queue.py" find-open --agent "$SMOKE_AGENT" --title-prefix "[context-pressure] $CONTEXT_PRESSURE_AGENT " 2>/dev/null || true)"
-[[ "$CONTEXT_PRESSURE_TASK_ID" =~ ^[0-9]+$ ]] || die "expected context-pressure report task"
+[[ ! "$CONTEXT_PRESSURE_TASK_ID" =~ ^[0-9]+$ ]] || die "context-pressure scanner should not create report task"
 CONTEXT_PRESSURE_BODY_FILE="$BRIDGE_SHARED_DIR/context-pressure/$CONTEXT_PRESSURE_AGENT-warning.md"
-[[ -f "$CONTEXT_PRESSURE_BODY_FILE" ]] || die "expected context-pressure report body"
-CONTEXT_PRESSURE_BODY="$(cat "$CONTEXT_PRESSURE_BODY_FILE")"
-assert_contains "$CONTEXT_PRESSURE_BODY" "# Context Pressure Report"
-assert_contains "$CONTEXT_PRESSURE_BODY" "severity: warning"
-assert_contains "$CONTEXT_PRESSURE_BODY" "Context remaining 8%"
+[[ ! -e "$CONTEXT_PRESSURE_BODY_FILE" ]] || die "context-pressure scanner should not write report body"
+CONTEXT_PRESSURE_STATE_FILE="$BRIDGE_ACTIVE_AGENT_DIR/$CONTEXT_PRESSURE_AGENT/context-pressure.env"
+[[ -f "$CONTEXT_PRESSURE_STATE_FILE" ]] || die "expected context-pressure telemetry state"
+CONTEXT_PRESSURE_STATE="$(cat "$CONTEXT_PRESSURE_STATE_FILE")"
+assert_contains "$CONTEXT_PRESSURE_STATE" "CONTEXT_PRESSURE_SEVERITY=warning"
+assert_not_contains "$CONTEXT_PRESSURE_STATE" "CONTEXT_PRESSURE_TASK_ID"
+CONTEXT_DETECTED_JSON="$("$REPO_ROOT/agent-bridge" audit --action context_pressure_detected --limit 20 --json)"
+python3 - "$CONTEXT_DETECTED_JSON" "$CONTEXT_PRESSURE_AGENT" <<'PY'
+import json, sys
+rows = json.loads(sys.argv[1])
+assert any(row.get("target") == sys.argv[2] for row in rows), rows
+PY
 [[ ! -s "$CONTEXT_PRESSURE_INPUT_LOG" ]] || die "context pressure scanner must not inject messages into the active session"
 BRIDGE_CONTEXT_PRESSURE_SCAN_ENABLED=1 \
 BRIDGE_CONTEXT_PRESSURE_SCAN_INTERVAL_SECONDS=0 \
 bash "$REPO_ROOT/bridge-daemon.sh" sync >/dev/null
 CONTEXT_PRESSURE_TASK_ID_AGAIN="$(python3 "$REPO_ROOT/bridge-queue.py" find-open --agent "$SMOKE_AGENT" --title-prefix "[context-pressure] $CONTEXT_PRESSURE_AGENT " 2>/dev/null || true)"
-[[ "$CONTEXT_PRESSURE_TASK_ID_AGAIN" == "$CONTEXT_PRESSURE_TASK_ID" ]] || die "expected deduped context-pressure report"
+[[ ! "$CONTEXT_PRESSURE_TASK_ID_AGAIN" =~ ^[0-9]+$ ]] || die "context-pressure scanner should remain audit-only on repeated scan"
 tmux_kill_session_exact "$CONTEXT_PRESSURE_AGENT" || true
 "$BASH4_BIN" -lc "source \"$REPO_ROOT/bridge-lib.sh\"; bridge_load_roster; bridge_agent_mark_manual_stop \"$CONTEXT_PRESSURE_AGENT\""
 BRIDGE_CONTEXT_PRESSURE_SCAN_ENABLED=1 \
@@ -9209,12 +9330,12 @@ assert any(row.get("target") == sys.argv[2] for row in rows), rows
 PY
 
 log "context-pressure FP-rate counter (#338 Track C)"
-# Fixture: emit a fake [context-pressure] critical task body (the daemon's
-# own format), seed a context_pressure_report audit row so the dashboard
-# denominator picks it up, then close the task with a "false-positive"
-# operator note via bridge-task.sh and assert (a) the audit row was
-# written by bridge-task.sh and (b) `agent-bridge status` renders the
-# 1/1 (100%) line.
+# Fixture: emit a legacy [context-pressure] critical task body and seed a
+# context_pressure_report audit row so the dashboard denominator still covers
+# historical reports. The daemon no longer emits these rows itself (#472).
+# Then close the task with a "false-positive" operator note via bridge-task.sh
+# and assert (a) the audit row was written by bridge-task.sh and (b)
+# `agent-bridge status` renders the 1/1 (100%) line.
 FP_AGENT="fp-counter-$SESSION_NAME"
 FP_BODY_DIR="$BRIDGE_SHARED_DIR/context-pressure"
 FP_BODY_FILE="$FP_BODY_DIR/$FP_AGENT-critical.md"
@@ -9244,7 +9365,7 @@ EOF
 FP_TASK_CREATE_OUTPUT="$(BRIDGE_TASK_DB="$BRIDGE_TASK_DB" python3 "$REPO_ROOT/bridge-queue.py" create --to "$SMOKE_AGENT" --from daemon --priority urgent --title "[context-pressure] $FP_AGENT (critical)" --body-file "$FP_BODY_FILE" --format shell)"
 FP_TASK_ID="$(printf '%s\n' "$FP_TASK_CREATE_OUTPUT" | sed -n "s/^TASK_ID=//p" | tr -d "'\"" | head -n1)"
 [[ "$FP_TASK_ID" =~ ^[0-9]+$ ]] || die "expected fp-counter task id, got: $FP_TASK_ID"
-# Seed the denominator row exactly as the daemon would (process_context_pressure_reports).
+# Seed the legacy denominator row that older daemon versions emitted.
 python3 "$REPO_ROOT/bridge-audit.py" write --file "$BRIDGE_AUDIT_LOG" \
   --actor daemon --action context_pressure_report --target "$SMOKE_AGENT" \
   --detail agent="$FP_AGENT" \

@@ -115,11 +115,6 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install integration dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tmux
-
       - name: Show selected integration smoke
         run: bash ./scripts/ci-select-smoke.sh --suite integration --base "$BASE_SHA" --head "$HEAD_SHA"
 
