@@ -6226,7 +6226,7 @@ CODEX_PROMPT_READY="$("$BASH4_BIN" -lc "source \"$REPO_ROOT/bridge-lib.sh\"; if 
 assert_contains "$CODEX_PROMPT_READY" "ok"
 
 log "ensuring mark-idle hook emits inbox summary context"
-HOOK_INBOX_AGENT="mark-idle-inbox-$RUN_SUFFIX"
+HOOK_INBOX_AGENT="mark-idle-inbox-$SESSION_NAME"
 HOOK_QUEUE_CREATE_OUTPUT="$(python3 "$REPO_ROOT/bridge-queue.py" create --to "$HOOK_INBOX_AGENT" --title "Follow-up task" --from smoke --priority high --body "check inbox")"
 assert_contains "$HOOK_QUEUE_CREATE_OUTPUT" "created task #"
 HOOK_CONTEXT_OUTPUT="$(BRIDGE_HOME="$REPO_ROOT" BRIDGE_STATE_DIR="$BRIDGE_STATE_DIR" BRIDGE_ACTIVE_AGENT_DIR="$BRIDGE_ACTIVE_AGENT_DIR" BRIDGE_HISTORY_DIR="$BRIDGE_HISTORY_DIR" BRIDGE_TASK_DB="$BRIDGE_TASK_DB" BRIDGE_ROSTER_FILE="$REPO_ROOT/agent-roster.sh" BRIDGE_ROSTER_LOCAL_FILE="$BRIDGE_ROSTER_LOCAL_FILE" BRIDGE_AGENT_ID="$HOOK_INBOX_AGENT" "$BASH4_BIN" "$REPO_ROOT/hooks/mark-idle.sh")"
