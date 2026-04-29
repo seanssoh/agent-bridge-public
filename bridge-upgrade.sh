@@ -43,7 +43,7 @@ SHARED_SETTINGS_RERENDER_JSON='{"mode":"skipped","count":0,"failed_count":0,"can
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents]
+  $(basename "$0") [--source <repo-dir>] [--target <bridge-home>] [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--pull|--no-pull] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json] [--allow-dirty] [--allow-dirty-source] [--strict-merge] [--no-backup] [--no-migrate-agents]
   $(basename "$0") analyze [--source <repo-dir>] [--target <bridge-home>] [--json]
   $(basename "$0") rollback [--target <bridge-home>] [--backup-root <dir>] [--restart-daemon|--no-restart-daemon] [--restart-agents|--no-restart-agents] [--dry-run] [--json]
   $(basename "$0") conflicts list [--target <bridge-home>] [--json]
@@ -759,6 +759,10 @@ while [[ $# -gt 0 ]]; do
     --no-restart-agents)
       RESTART_AGENTS=0
       RESTART_AGENTS_EXPLICIT=1
+      shift
+      ;;
+    --apply)
+      [[ "$SUBCOMMAND" == "apply" ]] || bridge_die "--apply는 기본 upgrade 적용 경로에서만 사용할 수 있습니다."
       shift
       ;;
     --dry-run)
