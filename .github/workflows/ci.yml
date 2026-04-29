@@ -21,6 +21,7 @@ jobs:
   syntax:
     name: syntax
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -36,6 +37,7 @@ jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,6 +64,7 @@ jobs:
   oss-preflight:
     name: oss-preflight
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -74,6 +77,7 @@ jobs:
   unit-static-smoke:
     name: unit/static smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs:
       - syntax
       - lint
@@ -93,6 +97,7 @@ jobs:
   integration-smoke:
     name: integration smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs:
       - syntax
       - lint
@@ -118,6 +123,7 @@ jobs:
   live-tmux-daemon-smoke:
     name: live/tmux/daemon smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs:
       - syntax
       - lint
@@ -144,6 +150,7 @@ jobs:
   legacy-full-smoke:
     name: legacy-full-smoke
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs:
       - syntax
       - lint
@@ -161,4 +168,4 @@ jobs:
           sudo apt-get install -y tmux shellcheck
 
       - name: Run legacy full smoke
-        run: bash ./scripts/smoke/legacy-full-smoke.sh
+        run: timeout 40m bash ./scripts/smoke/legacy-full-smoke.sh
