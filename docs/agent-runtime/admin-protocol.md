@@ -169,6 +169,19 @@ Close the original `[upgrade-complete]` task with:
 agb done <task_id> --note "bootstrap OK; first scan <N> files / <E> entities; <C> hub candidates queued"
 ```
 
+## Post-Upgrade Operator Actions Pending
+
+업그레이드 후 admin이 가장 먼저 처리하는 자료는 source root의 [`OPERATOR_ACTIONS_PENDING.md`](../../OPERATOR_ACTIONS_PENDING.md)다. 이 파일은 release-specific 운영 checklist 모음이며, `[upgrade-complete]` 자동 task body가 이 파일의 위치를 명시한다.
+
+규칙:
+
+1. 각 release 섹션의 `applies_when_upgrading_from` 범위가 직전 설치 버전을 포함하면 그 섹션을 처리한다 (옛 install이 v0.6.33이고 새 install이 v0.6.37이면, `<= 0.6.36`이라고 적힌 모든 섹션이 적용된다).
+2. 섹션 본문이 명시한 "operator action"을 실제로 실행하거나, "Skip if" 조건과 일치하면 done note에 `not applicable here because <이유>` 한 줄로 닫는다.
+3. 섹션 본문이 "no operator action required"라고 명시하면 추가 행동 없이 통과한다 (대부분의 minor release가 여기에 해당).
+4. 처리 결과는 `[upgrade-complete]` task의 done note에 한 줄 summary로 남긴다 (예: `operator-actions: v0.6.37 telegram-relay → opted in for patch + jjujju, skipped sales_sean`).
+
+이 파일이 source에 없거나 비어 있으면 추가 행동이 필요 없다는 뜻이다 — 다음 release까지 정적이다.
+
 ## Post-Upgrade Issue Triage
 
 업그레이드·bootstrap 과정에서 발견된 문제는 로컬에서 조용히 우회하지 않고 upstream issue로 기록한다. "Upstream Issue Policy"(common-instructions.md §Upstream Issue Policy) 경로를 그대로 따르되, 트리거는 업그레이드 세션이다.

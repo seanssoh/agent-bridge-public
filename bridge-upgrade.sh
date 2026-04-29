@@ -1377,10 +1377,21 @@ on.
 - Librarian CLAUDE.md template propagation
 - PreCompact hook registration on active claude agents (from bootstrap)
 
+## Operator actions pending (per-release admin checklist)
+
+Read \`$TARGET_ROOT/OPERATOR_ACTIONS_PENDING.md\` and execute every section
+whose \`applies_when_upgrading_from\` covers the previous installed version
+(${INSTALLED_VERSION:-unknown} → $SOURCE_VERSION). Each section is either a
+concrete action to run on this host or a clearly-marked skip rule. Close
+this task only after each applicable section is either executed or noted as
+"not applicable here because <reason>" in the done note. Sections that ship
+with no operator action (most release bumps) need no follow-up.
+
 ## Done note format
 
-When you finish the three steps above, close this task with:
-\`agb done <task_id> --note "bootstrap OK; first-scan <N> files / <M> entities; distribution report at <path>"\`
+When you finish the three steps above and processed every applicable section
+of OPERATOR_ACTIONS_PENDING.md, close this task with:
+\`agb done <task_id> --note "bootstrap OK; first-scan <N> files / <M> entities; distribution report at <path>; operator-actions: <summary>"\`
 POST_EOF
     # Persist the task body in state/ so the recovery command the
     # WARN block prints is actually rerunnable. Tempfiles vanish on
