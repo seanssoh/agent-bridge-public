@@ -15,6 +15,7 @@ Usage:
   $(basename "$0") list [--json]
   $(basename "$0") show <agent> [--json]
   $(basename "$0") reclassify [--agent <agent>] [--apply] [--json]
+  $(basename "$0") rerender-settings [<agent>...] [--apply|--dry-run] [--json]
   $(basename "$0") start <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
   $(basename "$0") safe-mode <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
   $(basename "$0") stop <agent>
@@ -56,6 +57,7 @@ Examples:
   $(basename "$0") list --json
   $(basename "$0") show reviewer --json
   $(basename "$0") reclassify --apply
+  $(basename "$0") rerender-settings --apply
   $(basename "$0") start reviewer --dry-run
   $(basename "$0") restart reviewer --attach
   $(basename "$0") safe-mode reviewer --attach
@@ -1321,6 +1323,334 @@ PY
   done <<<"$rows"
 }
 
+bridge_agent_shared_settings_plan_json() {
+  local agent="$1"
+  local workdir="$2"
+
+  bridge_agent_manage_python \
+    "$SCRIPT_DIR/bridge-hooks.py" \
+    "$agent" \
+    "$workdir" \
+    "$(bridge_hook_shared_settings_base_file)" \
+    "$(bridge_hook_shared_settings_overlay_file)" \
+    "$(bridge_hook_shared_settings_effective_file)" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+hooks_py, agent, workdir, base_file, overlay_file, effective_file = sys.argv[1:]
+spec = importlib.util.spec_from_file_location("bridge_hooks", hooks_py)
+if spec is None or spec.loader is None:
+    raise SystemExit(f"could not load {hooks_py}")
+hooks = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hooks)
+
+settings_path = Path(workdir).expanduser() / ".claude" / "settings.json"
+base_path = Path(base_file).expanduser()
+overlay_path = Path(overlay_file).expanduser()
+effective_path = Path(effective_file).expanduser()
+
+errors: list[str] = []
+
+def load_object(path: Path, label: str, *, absent_ok: bool = True) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        errors.append(f"{label} invalid JSON: {path}: {exc}")
+        return {}
+    if payload in (None, ""):
+        return {}
+    if not isinstance(payload, dict):
+        errors.append(f"{label} must be a JSON object: {path}")
+        return {}
+    return payload
+
+base_payload = load_object(base_path, "base")
+overlay_payload = load_object(overlay_path, "overlay")
+expected = hooks.merge_settings(hooks.BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS, base_payload)
+expected = hooks.merge_settings(expected, overlay_payload)
+
+current_error = ""
+try:
+    current_payload = load_object(settings_path, "current")
+except OSError as exc:
+    current_error = str(exc)
+    current_payload = {}
+
+effective_payload = load_object(effective_path, "effective")
+effective_exists = effective_path.exists()
+effective_matches = effective_exists and effective_payload == expected
+
+changes = []
+for key in hooks.BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS:
+    expected_value = expected.get(key)
+    if key not in current_payload:
+        changes.append({"key": key, "from": None, "to": expected_value, "reason": "missing"})
+    elif current_payload.get(key) != expected_value:
+        changes.append({
+            "key": key,
+            "from": current_payload.get(key),
+            "to": expected_value,
+            "reason": "differs",
+        })
+
+is_symlink = settings_path.is_symlink()
+link_target = os.readlink(settings_path) if is_symlink else ""
+link_ok = is_symlink and os.path.realpath(settings_path) == os.path.realpath(effective_path)
+needs_rerender = bool(changes) or not link_ok or not effective_matches or bool(errors) or bool(current_error)
+
+payload = {
+    "agent": agent,
+    "workdir": str(Path(workdir).expanduser()),
+    "settings_file": str(settings_path),
+    "base_settings_file": str(base_path),
+    "overlay_settings_file": str(overlay_path),
+    "effective_settings_file": str(effective_path),
+    "status": "needs-rerender" if needs_rerender else "unchanged",
+    "changes": changes,
+    "link": {
+        "ok": link_ok,
+        "is_symlink": is_symlink,
+        "target": link_target,
+    },
+    "effective": {
+        "exists": effective_exists,
+        "matches_expected": effective_matches,
+    },
+    "errors": errors,
+    "current_error": current_error,
+}
+print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+PY
+}
+
+bridge_agent_rerender_row_json() {
+  local mode="$1"
+  local before_json="$2"
+  local after_json="$3"
+  local error="$4"
+
+  bridge_agent_manage_python "$mode" "$before_json" "$after_json" "$error" <<'PY'
+import json
+import sys
+
+mode, before_raw, after_raw, error = sys.argv[1:]
+before = json.loads(before_raw)
+after = json.loads(after_raw) if after_raw else before
+row = dict(after)
+row["mode"] = mode
+row["before"] = before
+if error:
+    row["status"] = "failed"
+    row["error"] = error
+elif mode == "apply" and before.get("status") == "needs-rerender":
+    row["status"] = "rerendered" if after.get("status") == "unchanged" else after.get("status", "rerendered")
+else:
+    row["status"] = after.get("status", "unchanged")
+print(json.dumps(row, ensure_ascii=False, sort_keys=True))
+PY
+}
+
+bridge_agent_print_rerender_json() {
+  local mode="$1"
+  local rows_file="$2"
+  local failed_count="$3"
+
+  bridge_agent_manage_python "$mode" "$rows_file" "$failed_count" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+mode, rows_file, failed_count = sys.argv[1:]
+rows = []
+path = Path(rows_file)
+if path.exists():
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            rows.append(json.loads(line))
+print(json.dumps({
+    "mode": mode,
+    "count": len(rows),
+    "failed_count": int(failed_count),
+    "candidates": rows,
+}, ensure_ascii=False, indent=2))
+PY
+}
+
+bridge_agent_print_rerender_text() {
+  local mode="$1"
+  local rows_file="$2"
+  local failed_count="$3"
+
+  bridge_agent_manage_python "$mode" "$rows_file" "$failed_count" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+mode, rows_file, failed_count = sys.argv[1:]
+rows = []
+path = Path(rows_file)
+if path.exists():
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+print(f"mode: {mode}")
+if not rows:
+    print("rerender-settings: no managed Claude settings targets")
+    raise SystemExit(0)
+for row in rows:
+    changes = row.get("before", row).get("changes") or row.get("changes") or []
+    change_text = ", ".join(
+        f"{item.get('key')}: {item.get('from')!r} -> {item.get('to')!r}"
+        for item in changes
+    ) or "-"
+    link = row.get("link") or {}
+    effective = row.get("effective") or {}
+    print(
+        f"{row.get('status')}: {row.get('agent')} "
+        f"changes={change_text} "
+        f"link_ok={str(bool(link.get('ok'))).lower()} "
+        f"effective_ok={str(bool(effective.get('matches_expected'))).lower()} "
+        f"workdir={row.get('workdir')}"
+    )
+    if row.get("error"):
+        print(f"  error: {row.get('error')}")
+    for error in row.get("errors") or []:
+        print(f"  error: {error}")
+if int(failed_count):
+    print(f"failed_count: {failed_count}")
+PY
+}
+
+run_rerender_settings() {
+  local apply=0
+  local json_mode=0
+  local agent=""
+  local workdir=""
+  local canonical=""
+  local before_json=""
+  local after_json=""
+  local row_json=""
+  local apply_output=""
+  local error=""
+  local rows_file=""
+  local failed_count=0
+  local -a selected_agents=()
+  local -a targets=()
+  local -A seen_workdirs=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --apply)
+        apply=1
+        shift
+        ;;
+      --dry-run)
+        apply=0
+        shift
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -h|--help)
+        printf 'Usage: %s rerender-settings [<agent>...] [--apply|--dry-run] [--json]\n' "$(basename "$0")"
+        return 0
+        ;;
+      --*)
+        bridge_die "지원하지 않는 agent rerender-settings 옵션입니다: $1"
+        ;;
+      *)
+        selected_agents+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  add_target() {
+    local target_agent="$1"
+    local target_workdir="$2"
+    [[ -n "$target_agent" && -n "$target_workdir" ]] || return 0
+    [[ -d "$target_workdir" ]] || return 0
+    canonical="$(bridge_agent_canonical_dir "$target_workdir")"
+    [[ -n "$canonical" ]] || return 0
+    if [[ -n "${seen_workdirs[$canonical]:-}" ]]; then
+      return 0
+    fi
+    seen_workdirs["$canonical"]=1
+    targets+=("${target_agent}"$'\t'"${target_workdir}")
+  }
+
+  if [[ ${#selected_agents[@]} -gt 0 ]]; then
+    for agent in "${selected_agents[@]}"; do
+      if [[ "$agent" == "_template" ]]; then
+        add_target "$agent" "$BRIDGE_AGENT_HOME_ROOT/_template"
+        continue
+      fi
+      bridge_require_agent "$agent"
+      [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || bridge_die "Claude agent가 아닙니다: $agent"
+      add_target "$agent" "$(bridge_expand_user_path "$(bridge_agent_workdir "$agent")")"
+    done
+  else
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || continue
+      add_target "$agent" "$(bridge_expand_user_path "$(bridge_agent_workdir "$agent")")"
+    done
+
+    if [[ -d "$BRIDGE_AGENT_HOME_ROOT/_template" ]]; then
+      add_target "_template" "$BRIDGE_AGENT_HOME_ROOT/_template"
+    fi
+
+    if [[ -d "$BRIDGE_AGENT_HOME_ROOT" ]]; then
+      for workdir in "$BRIDGE_AGENT_HOME_ROOT"/*; do
+        [[ -d "$workdir" ]] || continue
+        agent="$(basename "$workdir")"
+        [[ "$agent" == ".claude" || "$agent" == "_template" ]] && continue
+        if [[ -f "$workdir/SESSION-TYPE.md" ]]; then
+          if grep -Eq 'Session Type:[[:space:]]*(admin|static-claude)' "$workdir/SESSION-TYPE.md"; then
+            add_target "$agent" "$workdir"
+          fi
+        elif [[ -e "$workdir/.claude/settings.json" ]]; then
+          add_target "$agent" "$workdir"
+        fi
+      done
+    fi
+  fi
+
+  rows_file="$(mktemp "${TMPDIR:-/tmp}/bridge-rerender-settings.XXXXXX")"
+  for target in "${targets[@]}"; do
+    agent="${target%%$'\t'*}"
+    workdir="${target#*$'\t'}"
+    before_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
+    error=""
+    if [[ $apply -eq 1 ]]; then
+      if apply_output="$(bridge_link_claude_settings_to_shared "$workdir" 2>&1)"; then
+        after_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
+        bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "shared_settings_rerendered" "$agent" \
+          --detail workdir="$workdir" >/dev/null 2>&1 || true
+      else
+        error="$apply_output"
+        after_json="$before_json"
+        failed_count=$((failed_count + 1))
+      fi
+      row_json="$(bridge_agent_rerender_row_json apply "$before_json" "$after_json" "$error")"
+    else
+      row_json="$(bridge_agent_rerender_row_json dry-run "$before_json" "" "")"
+    fi
+    printf '%s\n' "$row_json" >>"$rows_file"
+  done
+
+  if [[ $json_mode -eq 1 ]]; then
+    bridge_agent_print_rerender_json "$([[ $apply -eq 1 ]] && printf apply || printf dry-run)" "$rows_file" "$failed_count"
+  else
+    bridge_agent_print_rerender_text "$([[ $apply -eq 1 ]] && printf apply || printf dry-run)" "$rows_file" "$failed_count"
+  fi
+  rm -f "$rows_file"
+  [[ $failed_count -eq 0 ]]
+}
+
 run_create() {
   local agent="${1:-}"
   local engine="claude"
@@ -2089,6 +2419,9 @@ case "$subcommand" in
   reclassify)
     run_reclassify "$@"
     ;;
+  rerender-settings)
+    run_rerender_settings "$@"
+    ;;
   start)
     run_start "$@"
     ;;
@@ -2122,7 +2455,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create list show reclassify start safe-mode stop restart ack-crash forget-session attach compact handoff")"
+      "create list show reclassify rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;

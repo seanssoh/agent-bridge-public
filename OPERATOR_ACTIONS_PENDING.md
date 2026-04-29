@@ -15,6 +15,31 @@ PR, prepend a new section; do not edit older sections in place.
 
 ---
 
+## v0.6.39 — settings rerender for hosts that upgraded before this fix
+
+- applies_when_upgrading_from: any version `0.6.33 .. 0.6.38`
+- urgency: medium.
+
+### Action
+
+Run on the upgraded host to backfill managed Claude settings defaults that may
+not have propagated during prior upgrades:
+
+```bash
+agent-bridge agent rerender-settings --apply
+```
+
+Confirm `autoCompactWindow: 400000` is present in each managed Claude agent's
+effective settings.
+
+### Skip if
+
+- This host has no managed Claude agents.
+- `agent-bridge agent rerender-settings --dry-run` reports every target as
+  `unchanged`.
+
+---
+
 ## v0.6.37 — telegram-relay opt-in
 
 - applies_when_upgrading_from: any version `<= 0.6.36`
