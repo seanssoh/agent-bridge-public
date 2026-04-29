@@ -15,14 +15,14 @@ trap cleanup EXIT
 json_field() {
   local json="$1"
   local expr="$2"
-  python3 - "$json" "$expr" <<'PY'
+  printf '%s' "$json" | python3 -c '
 import json
 import sys
 
-payload = json.loads(sys.argv[1])
-expr = sys.argv[2]
+payload = json.load(sys.stdin)
+expr = sys.argv[1]
 print(eval(expr, {"payload": payload}))
-PY
+' "$expr"
 }
 
 agent_source() {

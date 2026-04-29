@@ -1122,16 +1122,20 @@ fi
 
 if [[ $BACKUP -eq 1 ]]; then
   backup_args=(backup-live --target-root "$TARGET_ROOT" --backup-root "$BACKUP_ROOT" --source-root "$SOURCE_ROOT")
+  _backup_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-backup-json.XXXXXX")"
   if [[ "$ANALYSIS_JSON" != "{}" ]]; then
-    backup_args+=(--analysis-json "$ANALYSIS_JSON")
+    printf '%s' "$ANALYSIS_JSON" >"$_backup_payload_dir/analysis.json"
+    backup_args+=(--analysis-json-file "$_backup_payload_dir/analysis.json")
   fi
   if [[ "$MIGRATION_PREVIEW_JSON" != "{}" ]]; then
-    backup_args+=(--migration-json "$MIGRATION_PREVIEW_JSON")
+    printf '%s' "$MIGRATION_PREVIEW_JSON" >"$_backup_payload_dir/migration.json"
+    backup_args+=(--migration-json-file "$_backup_payload_dir/migration.json")
   fi
   if [[ $DRY_RUN -eq 1 ]]; then
     backup_args+=(--dry-run)
   fi
   BACKUP_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${backup_args[@]}")"
+  rm -rf "$_backup_payload_dir"
 fi
 
 reclassify_args=(reclassify --json)
@@ -1140,12 +1144,12 @@ if [[ $DRY_RUN -eq 0 ]]; then
 fi
 SOURCE_RECLASSIFY_JSON="$(bridge_upgrade_with_target_env "$TARGET_ROOT" "$BRIDGE_BASH_BIN" "$SOURCE_ROOT/bridge-agent.sh" "${reclassify_args[@]}")"
 
-BASE_REF="$(python3 - "$ANALYSIS_JSON" <<'PY'
-import json, sys
-payload = json.loads(sys.argv[1])
+BASE_REF="$(printf '%s' "$ANALYSIS_JSON" | python3 -c '
+import json
+import sys
+payload = json.load(sys.stdin)
 print(payload.get("base_ref", ""))
-PY
-)"
+')"
 
 apply_args=(apply-live --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT")
 if [[ -n "$BASE_REF" ]]; then
@@ -1231,14 +1235,17 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
 fi
 
 if [[ $DRY_RUN -eq 0 ]]; then
+  _write_state_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-state-json.XXXXXX")"
+  printf '%s' "$ANALYSIS_JSON" >"$_write_state_payload_dir/analysis.json"
   python3 "$SOURCE_ROOT/bridge-upgrade.py" write-state \
     --source-root "$SOURCE_ROOT" \
     --target-root "$TARGET_ROOT" \
     --backup-root "$BACKUP_ROOT" \
-    --analysis-json "$ANALYSIS_JSON" \
+    --analysis-json-file "$_write_state_payload_dir/analysis.json" \
     --version "$SOURCE_VERSION" \
     --source-ref "$SOURCE_REF" \
     --channel "$CHANNEL" >/dev/null
+  rm -rf "$_write_state_payload_dir"
 fi
 
 # Post-upgrade admin signal: file a [upgrade-complete] task with a
