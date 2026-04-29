@@ -44,8 +44,8 @@ Track 1 overhead redesign, Track 2 memory hooks, and Track 3 cascade all share a
 ### PR 3 — Bulk migration CLI: `agb migrate overhead`
 
 - New file `bridge-migrate.py` with the `overhead` subcommand. Routes from `agb` → `bridge-migrate.py overhead ...`.
-- Subcommands: `--pre-migrate` (read-only inventory JSON), `--dry-run` (diff preview), `--apply --yes` (execute with backup), `--rollback --stamp`.
-- Backup convention: state backups under `state/doc-migration/backups-<stamp>/`; if legacy inline managed sections are replaced, also write `CLAUDE.md.bak-<YYYYMMDD>-managed-block` next to the file. Apply log: `state/doc-migration/apply-<stamp>.jsonl`.
+- Subcommands: `--pre-migrate` (read-only inventory JSON), `--dry-run` (byte diff preview plus detected legacy inline block names), `--apply --yes` (execute with backup), `--rollback --stamp`.
+- Backup convention: state backups under `state/doc-migration/backups-<stamp>/`; if legacy inline managed sections are replaced, also write `CLAUDE.md.bak-<YYYYMMDD>-managed-block` next to the file for operator inspection. Rollback uses the state backup. Apply log: `state/doc-migration/apply-<stamp>.jsonl`.
 - Safety interlocks: `--apply` requires `--yes`, needs a prior `--pre-migrate` JSON, refuses to run if `docs/agent-runtime/*.md` are missing, skips admin agents if `admin-protocol.md` is missing, never calls `upstream propose`, never calls `git`.
 - Verification thresholds: scaffold template ≤ 120 lines / ≤ 12 KB, per-agent `CLAUDE.md` keeps the managed block pointer-only, no legacy inline managed sections remain, no root `USER.md`, `ADMIN-PROTOCOL.md` symlink present on admin only, zero dangling symlinks at the agent home root.
 
@@ -81,7 +81,7 @@ agb migrate overhead --rollback --stamp <YYYYMMDD>
 For each agent home under `<bridge-home>/agents/`:
 
 1. **Inventory snapshot**: `CLAUDE.md` line count, managed-block byte size + SHA, root symlinks list, `USER.md` presence, `users/*/` partitions, research aggregations.
-2. **Backup**: write the rollback copy under `<bridge-home>/state/doc-migration/backups-<stamp>/<agent>.CLAUDE.md.bak`. If the managed block contains legacy inline sections, also write `CLAUDE.md.bak-<YYYYMMDD>-managed-block` beside the file for operator inspection.
+2. **Backup**: write the rollback copy under `<bridge-home>/state/doc-migration/backups-<stamp>/<agent>.CLAUDE.md.bak`. If the managed block contains legacy inline sections, also write `CLAUDE.md.bak-<YYYYMMDD>-managed-block` beside the file for operator inspection; rollback still uses the state backup.
 3. **Render new CLAUDE.md**: call `bridge_docs.normalize_claude(agent_dir, session_type=<resolved>)`. The managed block is replaced with the pointer-only body. Custom sections outside the markers are preserved byte-for-byte.
 4. **Rewire symlinks**: `bridge_docs.ensure_agent_shared_links(agent_dir, session_type)` installs `COMMON-INSTRUCTIONS.md → ../../docs/agent-runtime/common-instructions.md`, `MEMORY-SCHEMA.md → ../../docs/agent-runtime/memory-schema.md`, `CHANGE-POLICY.md → ../shared/CHANGE-POLICY.md`, `TOOLS.md → ../shared/TOOLS.md`. If admin, also `ADMIN-PROTOCOL.md → ../../docs/agent-runtime/admin-protocol.md`.
 5. **Remove deprecated**: delete root `USER.md` (file or symlink) if it was pointing at `shared/SYRS-USER.md`. Delete root `SYRS-USER.md` root-level duplicate. Move `compound/lessons.md` → `memory/lessons.md`. Delete `recent-context.md` if present.

@@ -59,6 +59,11 @@ task를 수신하면 아래 순서를 반드시 따른다:
 - 일시적 오류는 스스로 재시도하고, 장기 장애나 복구 불가 상태만 관리자/사람 채널로 올린다.
 - blocked 상태를 숨기지 않는다. 바로 `agb update ... --status blocked --note "..."` 또는 관리자 task로 표면화한다.
 
+## Change Reporting
+
+- 코드, 설정, 템플릿, 훅, 크론, 채널, 스키마 같은 기술 계약을 바꾸면 관리자 에이전트에게 무엇/왜/영향을 task로 보고한다.
+- upstream/local 분류는 `CHANGE-POLICY.md` 기준으로 맞춘다. 확신이 없으면 local 추측으로 끝내지 않는다.
+
 ## External Push Handling
 
 - daemon이 `[Agent Bridge] event=...` 라인을 주입하면 `external-push-handling` skill을 읽고 그 7-step 루틴을 따른다.
@@ -141,4 +146,5 @@ task를 수신하면 아래 순서를 반드시 따른다:
 
 - 2026-04-19: initial ratified version. 공통 블록 7,037B × 18 agents ≈ 126 KB 하드카피 제거, pointer-only SSOT로 전환. Admin-only 섹션을 분리(→ `admin-protocol.md`), legacy shared 파일 redirect, user preference promotion layer 명문화.
 - 2026-04-25: "External Tool Latency and User Visibility" 섹션 추가. 외부 MCP/원격 호출에 사전 예고 + 30s/2m/5m 가시성 단계 + silent polling 금지 + 실패 후 첫 응답 우선 규칙 명문화 (issue #271, EP `whoami` 21분 무응답 사건).
+- 2026-04-29: slim managed block 전환 중 누락되면 안 되는 Change Reporting runtime rule을 canonical 본문으로 복원.
 - 2026-04-29: `_template/CLAUDE.md` slim managed block 작업에 맞춰 external push와 channel setup 공통 포인터를 canonical 본문으로 승격.

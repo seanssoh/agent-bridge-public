@@ -8,8 +8,9 @@ Subcommands:
 
   overhead dry-run [--agent <name>|--all]
       Render what the new managed block would look like (with session_type
-      filter) and compare to the current one. Emits per-agent diff summary
-      and any legacy inline sections that will be replaced by pointers.
+      filter) and compare to the current one. Emits a per-agent byte diff
+      summary and lists detected legacy inline blocks that will be replaced
+      by pointers.
       Writes nothing to disk.
 
   overhead apply [--agent <name>|--all] [--yes]
@@ -17,8 +18,9 @@ Subcommands:
       under <bridge-home>/state/doc-migration/apply-<YYYYMMDD-HHMMSS>-<pid>.jsonl
       and backups under a matching `backups-<stamp>` directory. If the old
       managed block contains legacy inline sections, also writes a sidecar
-      CLAUDE.md.bak-<YYYYMMDD>-managed-block backup next to CLAUDE.md. The
-      PID suffix prevents collisions when two runs start in the same second.
+      CLAUDE.md.bak-<YYYYMMDD>-managed-block backup next to CLAUDE.md for
+      operator inspection. Rollback uses the state backup. The PID suffix
+      prevents collisions when two runs start in the same second.
 
   overhead rollback --stamp <YYYYMMDD-HHMMSS-<pid>>
       Replays the apply JSONL and restores each backup file.
