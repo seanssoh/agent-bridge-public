@@ -1155,7 +1155,13 @@ APPLY_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${apply_args[@]}")"
 AGENT_RESTART_JSON="$(bridge_upgrade_agent_restart_json "" 0 "$DRY_RUN")"
 
 if [[ $DRY_RUN -eq 0 ]]; then
+  set +e
   SHARED_SETTINGS_RERENDER_JSON="$(bridge_upgrade_propagate_claude_shared_settings "$TARGET_ROOT")"
+  _shared_settings_rerender_rc=$?
+  set -e
+  if [[ $_shared_settings_rerender_rc -ne 0 ]]; then
+    echo "[bridge-upgrade] WARN: shared Claude settings rerender reported failures" >&2
+  fi
   if ! python3 - "$SHARED_SETTINGS_RERENDER_JSON" <<'PY'
 import json
 import sys
@@ -1163,7 +1169,7 @@ payload = json.loads(sys.argv[1])
 raise SystemExit(0 if int(payload.get("failed_count") or 0) == 0 else 1)
 PY
   then
-    echo "[bridge-upgrade] WARN: shared Claude settings rerender failed for one or more agents" >&2
+    echo "[bridge-upgrade] WARN: shared Claude settings rerender verification failed for one or more agents" >&2
   fi
 fi
 
