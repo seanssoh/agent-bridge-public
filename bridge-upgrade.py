@@ -142,6 +142,14 @@ def read_source_version(source_root: Path) -> str:
     return version or "0.0.0-dev"
 
 
+def load_json_arg(value: str = "", file_path: str = "") -> dict[str, Any]:
+    if file_path:
+        return json.loads(Path(file_path).read_text(encoding="utf-8"))
+    if value:
+        return json.loads(value)
+    return {}
+
+
 def git_file_bytes(source_root: Path, ref: str, relpath: str) -> bytes | None:
     proc = subprocess.run(
         ["git", "-C", str(source_root), "show", f"{ref}:{relpath}"],
@@ -971,8 +979,8 @@ def cmd_backup_live(args: argparse.Namespace) -> int:
     target_root = Path(args.target_root).expanduser()
     backup_root = Path(args.backup_root).expanduser()
     source_root = Path(args.source_root).expanduser() if args.source_root else None
-    analysis_payload = json.loads(args.analysis_json) if args.analysis_json else {}
-    migration_payload = json.loads(args.migration_json) if args.migration_json else {}
+    analysis_payload = load_json_arg(args.analysis_json, args.analysis_json_file)
+    migration_payload = load_json_arg(args.migration_json, args.migration_json_file)
     entries = build_backup_entries(target_root, analysis_payload, migration_payload) if (analysis_payload or migration_payload) else []
     payload = {
         "target_root": str(target_root),
@@ -1188,8 +1196,9 @@ def cmd_write_state(args: argparse.Namespace) -> int:
         "channel": args.channel or "",
         "backup_root": str(Path(args.backup_root).expanduser()) if args.backup_root else "",
     }
-    if args.analysis_json:
-        payload["analysis"] = json.loads(args.analysis_json)
+    analysis_payload = load_json_arg(args.analysis_json, args.analysis_json_file)
+    if analysis_payload:
+        payload["analysis"] = analysis_payload
     save_json(upgrade_state_path(target_root), payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
@@ -1231,7 +1240,9 @@ def build_parser() -> argparse.ArgumentParser:
     backup.add_argument("--backup-root", required=True)
     backup.add_argument("--source-root")
     backup.add_argument("--analysis-json", default="")
+    backup.add_argument("--analysis-json-file", default="")
     backup.add_argument("--migration-json", default="")
+    backup.add_argument("--migration-json-file", default="")
     backup.add_argument("--dry-run", action="store_true")
     backup.set_defaults(handler=cmd_backup_live)
 
@@ -1279,6 +1290,7 @@ def build_parser() -> argparse.ArgumentParser:
     write_state.add_argument("--target-root", required=True)
     write_state.add_argument("--backup-root", default="")
     write_state.add_argument("--analysis-json", default="")
+    write_state.add_argument("--analysis-json-file", default="")
     write_state.add_argument("--version", default="")
     write_state.add_argument("--source-ref", default="")
     write_state.add_argument("--channel", default="")
