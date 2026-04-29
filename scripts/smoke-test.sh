@@ -7540,9 +7540,7 @@ pressure_probe = {
 }
 module.check_memory_pressure = lambda: dict(pressure_probe)
 audit_calls = []
-notify_calls = []
 module.emit_pressure_audit = lambda run_id, target, probe: audit_calls.append((run_id, target, dict(probe)))
-module.notify_admin_pressure_defer = lambda run_id, job, probe: notify_calls.append((run_id, job, dict(probe)))
 subprocess.run = fake_run
 try:
     args = argparse.Namespace(request_file=request_file, dry_run=False)
@@ -7567,7 +7565,6 @@ assert not any("codex" in os.path.basename(b) for b in spawn_bins), (
 )
 assert audit_calls, "expected emit_pressure_audit to be called"
 assert audit_calls[0][2]["reason"] == "memory_pressure"
-assert notify_calls, "expected notify_admin_pressure_defer to be called"
 
 # Reset for the healthy-path probe.
 status_file.unlink(missing_ok=True)
@@ -9183,19 +9180,26 @@ BRIDGE_CONTEXT_PRESSURE_SCAN_ENABLED=1 \
 BRIDGE_CONTEXT_PRESSURE_SCAN_INTERVAL_SECONDS=0 \
 bash "$REPO_ROOT/bridge-daemon.sh" sync >/dev/null
 CONTEXT_PRESSURE_TASK_ID="$(python3 "$REPO_ROOT/bridge-queue.py" find-open --agent "$SMOKE_AGENT" --title-prefix "[context-pressure] $CONTEXT_PRESSURE_AGENT " 2>/dev/null || true)"
-[[ "$CONTEXT_PRESSURE_TASK_ID" =~ ^[0-9]+$ ]] || die "expected context-pressure report task"
+[[ ! "$CONTEXT_PRESSURE_TASK_ID" =~ ^[0-9]+$ ]] || die "context-pressure scanner should not create report task"
 CONTEXT_PRESSURE_BODY_FILE="$BRIDGE_SHARED_DIR/context-pressure/$CONTEXT_PRESSURE_AGENT-warning.md"
-[[ -f "$CONTEXT_PRESSURE_BODY_FILE" ]] || die "expected context-pressure report body"
-CONTEXT_PRESSURE_BODY="$(cat "$CONTEXT_PRESSURE_BODY_FILE")"
-assert_contains "$CONTEXT_PRESSURE_BODY" "# Context Pressure Report"
-assert_contains "$CONTEXT_PRESSURE_BODY" "severity: warning"
-assert_contains "$CONTEXT_PRESSURE_BODY" "Context remaining 8%"
+[[ ! -e "$CONTEXT_PRESSURE_BODY_FILE" ]] || die "context-pressure scanner should not write report body"
+CONTEXT_PRESSURE_STATE_FILE="$BRIDGE_ACTIVE_AGENT_DIR/$CONTEXT_PRESSURE_AGENT/context-pressure.env"
+[[ -f "$CONTEXT_PRESSURE_STATE_FILE" ]] || die "expected context-pressure telemetry state"
+CONTEXT_PRESSURE_STATE="$(cat "$CONTEXT_PRESSURE_STATE_FILE")"
+assert_contains "$CONTEXT_PRESSURE_STATE" "CONTEXT_PRESSURE_SEVERITY=warning"
+assert_not_contains "$CONTEXT_PRESSURE_STATE" "CONTEXT_PRESSURE_TASK_ID"
+CONTEXT_DETECTED_JSON="$("$REPO_ROOT/agent-bridge" audit --action context_pressure_detected --limit 20 --json)"
+python3 - "$CONTEXT_DETECTED_JSON" "$CONTEXT_PRESSURE_AGENT" <<'PY'
+import json, sys
+rows = json.loads(sys.argv[1])
+assert any(row.get("target") == sys.argv[2] for row in rows), rows
+PY
 [[ ! -s "$CONTEXT_PRESSURE_INPUT_LOG" ]] || die "context pressure scanner must not inject messages into the active session"
 BRIDGE_CONTEXT_PRESSURE_SCAN_ENABLED=1 \
 BRIDGE_CONTEXT_PRESSURE_SCAN_INTERVAL_SECONDS=0 \
 bash "$REPO_ROOT/bridge-daemon.sh" sync >/dev/null
 CONTEXT_PRESSURE_TASK_ID_AGAIN="$(python3 "$REPO_ROOT/bridge-queue.py" find-open --agent "$SMOKE_AGENT" --title-prefix "[context-pressure] $CONTEXT_PRESSURE_AGENT " 2>/dev/null || true)"
-[[ "$CONTEXT_PRESSURE_TASK_ID_AGAIN" == "$CONTEXT_PRESSURE_TASK_ID" ]] || die "expected deduped context-pressure report"
+[[ ! "$CONTEXT_PRESSURE_TASK_ID_AGAIN" =~ ^[0-9]+$ ]] || die "context-pressure scanner should remain audit-only on repeated scan"
 tmux_kill_session_exact "$CONTEXT_PRESSURE_AGENT" || true
 "$BASH4_BIN" -lc "source \"$REPO_ROOT/bridge-lib.sh\"; bridge_load_roster; bridge_agent_mark_manual_stop \"$CONTEXT_PRESSURE_AGENT\""
 BRIDGE_CONTEXT_PRESSURE_SCAN_ENABLED=1 \
@@ -9209,12 +9213,12 @@ assert any(row.get("target") == sys.argv[2] for row in rows), rows
 PY
 
 log "context-pressure FP-rate counter (#338 Track C)"
-# Fixture: emit a fake [context-pressure] critical task body (the daemon's
-# own format), seed a context_pressure_report audit row so the dashboard
-# denominator picks it up, then close the task with a "false-positive"
-# operator note via bridge-task.sh and assert (a) the audit row was
-# written by bridge-task.sh and (b) `agent-bridge status` renders the
-# 1/1 (100%) line.
+# Fixture: emit a legacy [context-pressure] critical task body and seed a
+# context_pressure_report audit row so the dashboard denominator still covers
+# historical reports. The daemon no longer emits these rows itself (#472).
+# Then close the task with a "false-positive" operator note via bridge-task.sh
+# and assert (a) the audit row was written by bridge-task.sh and (b)
+# `agent-bridge status` renders the 1/1 (100%) line.
 FP_AGENT="fp-counter-$SESSION_NAME"
 FP_BODY_DIR="$BRIDGE_SHARED_DIR/context-pressure"
 FP_BODY_FILE="$FP_BODY_DIR/$FP_AGENT-critical.md"
@@ -9244,7 +9248,7 @@ EOF
 FP_TASK_CREATE_OUTPUT="$(BRIDGE_TASK_DB="$BRIDGE_TASK_DB" python3 "$REPO_ROOT/bridge-queue.py" create --to "$SMOKE_AGENT" --from daemon --priority urgent --title "[context-pressure] $FP_AGENT (critical)" --body-file "$FP_BODY_FILE" --format shell)"
 FP_TASK_ID="$(printf '%s\n' "$FP_TASK_CREATE_OUTPUT" | sed -n "s/^TASK_ID=//p" | tr -d "'\"" | head -n1)"
 [[ "$FP_TASK_ID" =~ ^[0-9]+$ ]] || die "expected fp-counter task id, got: $FP_TASK_ID"
-# Seed the denominator row exactly as the daemon would (process_context_pressure_reports).
+# Seed the legacy denominator row that older daemon versions emitted.
 python3 "$REPO_ROOT/bridge-audit.py" write --file "$BRIDGE_AUDIT_LOG" \
   --actor daemon --action context_pressure_report --target "$SMOKE_AGENT" \
   --detail agent="$FP_AGENT" \
