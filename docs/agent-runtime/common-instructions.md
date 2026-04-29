@@ -2,7 +2,7 @@
 
 > Canonical SSOT for every non-admin (and admin) Agent Bridge runtime. Each agent home installs this file as `COMMON-INSTRUCTIONS.md` (symlink to `docs/agent-runtime/common-instructions.md`). The `<!-- BEGIN/END AGENT BRIDGE DOC MIGRATION -->` block in every `CLAUDE.md` is a pointer that tells the agent to read this file — it is no longer a hardcopy of the body.
 >
-> Admin-only onboarding / channel-setup rules live in [`admin-protocol.md`](admin-protocol.md). Short-term session continuity + long-term wiki rules live in [`memory-schema.md`](memory-schema.md). How to migrate an existing agent into this runtime lives in [`migration-guide.md`](migration-guide.md).
+> Admin-only onboarding and admin execution details live in [`admin-protocol.md`](admin-protocol.md). Short-term session continuity + long-term wiki rules live in [`memory-schema.md`](memory-schema.md). How to migrate an existing agent into this runtime lives in [`migration-guide.md`](migration-guide.md).
 
 ## Agent Bridge Runtime Canon
 
@@ -58,6 +58,20 @@ task를 수신하면 아래 순서를 반드시 따른다:
 - rate limit, capacity, auth, network 오류를 만나면 멈추지 않는다. 재시도, 안전한 우회, 관리자 에스컬레이션 중 하나를 즉시 선택한다.
 - 일시적 오류는 스스로 재시도하고, 장기 장애나 복구 불가 상태만 관리자/사람 채널로 올린다.
 - blocked 상태를 숨기지 않는다. 바로 `agb update ... --status blocked --note "..."` 또는 관리자 task로 표면화한다.
+
+## External Push Handling
+
+- daemon이 `[Agent Bridge] event=...` 라인을 주입하면 `external-push-handling` skill을 읽고 그 7-step 루틴을 따른다.
+- 주입 라인은 metadata-only다. `top` task id를 먼저 `agb show <id>`로 읽고, title/prose만 보고 행동하지 않는다.
+- delegate가 필요하면 task body를 그대로 붙여 넣지 말고 목표, 입력, 제약, acceptance criteria를 자기 말로 정리한다.
+
+## Channel Setup Protocol
+
+- 사용자가 어떤 에이전트든 새로 만들거나 설정하면서 채널을 언급하면 먼저 선택지를 확인한다: `터미널만`, `Discord`, `Telegram`, `Discord와 Telegram 둘 다`.
+- Discord 또는 Telegram을 하나라도 선택하면 해당 에이전트는 Claude Code 엔진이어야 한다. Codex 요청과 외부 채널 요청이 충돌하면 이유를 한 문장으로 설명하고 Claude Code로 진행한다.
+- Discord/Telegram setup은 필요한 token, application/channel/user/chat id를 받은 뒤 `agent-bridge setup discord|telegram ... --yes` 경로로 처리한다.
+- setup 후에는 roster의 channel binding과 에이전트별 `.discord/` 또는 `.telegram/` state dir 파일 존재 여부를 확인한다.
+- admin 세션에서 실행하는 상세 onboarding/재시작 절차는 [`admin-protocol.md`](admin-protocol.md)를 따른다.
 
 ## External Tool Latency and User Visibility
 
@@ -127,3 +141,4 @@ task를 수신하면 아래 순서를 반드시 따른다:
 
 - 2026-04-19: initial ratified version. 공통 블록 7,037B × 18 agents ≈ 126 KB 하드카피 제거, pointer-only SSOT로 전환. Admin-only 섹션을 분리(→ `admin-protocol.md`), legacy shared 파일 redirect, user preference promotion layer 명문화.
 - 2026-04-25: "External Tool Latency and User Visibility" 섹션 추가. 외부 MCP/원격 호출에 사전 예고 + 30s/2m/5m 가시성 단계 + silent polling 금지 + 실패 후 첫 응답 우선 규칙 명문화 (issue #271, EP `whoami` 21분 무응답 사건).
+- 2026-04-29: `_template/CLAUDE.md` slim managed block 작업에 맞춰 external push와 channel setup 공통 포인터를 canonical 본문으로 승격.
