@@ -1310,6 +1310,9 @@ run_create() {
       "$isolation_mode" \
       "$os_user" >/dev/null
     bridge_load_roster
+    if [[ "$engine" == "claude" ]]; then
+      bridge_ensure_claude_shared_settings_for_managed_workdir "$workdir" >/dev/null 2>&1 || true
+    fi
     bridge_sync_skill_docs "$agent" >/dev/null 2>&1 || true
     if [[ "$isolation_mode" == "linux-user" ]]; then
       bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir"

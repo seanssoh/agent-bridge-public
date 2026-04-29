@@ -167,6 +167,24 @@ bridge_upgrade_with_target_env() {
     "$@"
 }
 
+bridge_upgrade_propagate_claude_shared_settings() {
+  local target_root="$1"
+
+  bridge_upgrade_with_target_env "$target_root" "$BRIDGE_BASH_BIN" -lc '
+    set -euo pipefail
+    source "$1/bridge-lib.sh"
+    bridge_load_roster
+    agent=""
+    workdir=""
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || continue
+      workdir="$(bridge_agent_workdir "$agent")"
+      [[ -n "$workdir" ]] || continue
+      bridge_ensure_claude_shared_settings_for_managed_workdir "$workdir" >/dev/null 2>&1 || true
+    done
+  ' -- "$target_root"
+}
+
 bridge_upgrade_collect_agent_restart_report() {
   local target_root="$1"
   local dry_run="${2:-0}"
@@ -1134,6 +1152,10 @@ if [[ $STRICT_MERGE -eq 1 ]]; then
 fi
 APPLY_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${apply_args[@]}")"
 AGENT_RESTART_JSON="$(bridge_upgrade_agent_restart_json "" 0 "$DRY_RUN")"
+
+if [[ $DRY_RUN -eq 0 ]]; then
+  bridge_upgrade_propagate_claude_shared_settings "$TARGET_ROOT" >/dev/null 2>&1 || true
+fi
 
 if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   if [[ $DRY_RUN -eq 1 ]]; then
