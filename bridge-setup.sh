@@ -12,7 +12,7 @@ usage() {
   cat <<EOF
 Usage:
   $(basename "$0") discord <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--channel <id>]... [--allow-from <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
-  $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--use-relay] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+  $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--use-relay (default) | --no-relay] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") teams <agent> [--app-id <id>] [--app-password <secret>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start] [setup options...]
   $(basename "$0") admin <agent>
@@ -40,7 +40,7 @@ EOF
     telegram)
       cat <<EOF
 Usage:
-  $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--use-relay] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+  $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--use-relay (default) | --no-relay] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
 EOF
       ;;
     teams)
@@ -521,7 +521,7 @@ run_telegram() {
   local compat_config=""
   local channel_account=""
   local dry_run=0
-  local use_relay=0
+  local use_relay=1
   local py_args=()
   local base_args=()
 
@@ -536,6 +536,9 @@ run_telegram() {
   runtime_config="$(bridge_compat_config_file)"
   compat_config="$(bridge_compat_config_file)"
   case "${BRIDGE_TELEGRAM_USE_RELAY:-}" in
+    0|false|FALSE|no|NO|off|OFF)
+      use_relay=0
+      ;;
     1|true|TRUE|yes|YES|on|ON)
       use_relay=1
       ;;
@@ -561,6 +564,11 @@ run_telegram() {
         ;;
       --use-relay)
         use_relay=1
+        py_args+=("$1")
+        shift
+        ;;
+      --no-relay)
+        use_relay=0
         py_args+=("$1")
         shift
         ;;
@@ -769,7 +777,7 @@ run_agent() {
         teams_args+=("$1")
         shift
         ;;
-      --use-relay)
+      --use-relay|--no-relay)
         telegram_args+=("$1")
         shift
         ;;

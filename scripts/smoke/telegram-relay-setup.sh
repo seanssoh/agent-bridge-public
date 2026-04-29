@@ -172,17 +172,17 @@ telegram_relay_setup_flow() {
   local api_base setup_output telegram_dir env_file access_file relay_token tokens_file socket_path roster_text
 
   api_base="$(start_fake_telegram)"
+  # Default flip (since v0.6.39): no --use-relay flag should still land on relay path.
   "$SMOKE_REPO_ROOT/agent-bridge" setup telegram test-agent \
     --token "123456:fake-token" \
     --allow-from "111111" \
     --default-chat "222222" \
-    --use-relay \
     --skip-validate \
     --skip-send-test \
     --yes \
     --api-base-url "$api_base" >"$SMOKE_TMP_ROOT/setup.out"
   setup_output="$(cat "$SMOKE_TMP_ROOT/setup.out")"
-  smoke_assert_contains "$setup_output" "relay_enabled: yes" "setup reports relay opt-in"
+  smoke_assert_contains "$setup_output" "relay_enabled: yes" "setup defaults to relay (no flag)"
 
   telegram_dir="$BRIDGE_AGENT_HOME_ROOT/test-agent/.telegram"
   env_file="$telegram_dir/.env"
@@ -228,7 +228,7 @@ main() {
   TMPDIR=/tmp smoke_setup_bridge_home "tgsetup"
   write_roster
   write_plugin_registry
-  smoke_run "Telegram relay setup lifecycle/status smoke" telegram_relay_setup_flow
+  smoke_run "Telegram relay setup lifecycle/status smoke (default flip)" telegram_relay_setup_flow
   smoke_log "passed"
 }
 
