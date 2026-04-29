@@ -95,7 +95,22 @@ jobs:
           fetch-depth: 0
 
       - name: Show selected required smoke
-        run: bash ./scripts/ci-select-smoke.sh --suite required --base "$BASE_SHA" --head "$HEAD_SHA"
+        id: required-smoke
+        run: |
+          set -euo pipefail
+          selected="$(bash ./scripts/ci-select-smoke.sh --suite required --base "$BASE_SHA" --head "$HEAD_SHA")"
+          printf '%s\n' "$selected"
+          if grep -qx 'scripts/smoke/telegram-relay-plugin.sh' <<<"$selected"; then
+            echo "needs_bun=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "needs_bun=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Install bun
+        if: steps.required-smoke.outputs.needs_bun == 'true'
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
       - name: Run selected required smoke
         run: bash ./scripts/ci-select-smoke.sh --suite required --base "$BASE_SHA" --head "$HEAD_SHA" --run
