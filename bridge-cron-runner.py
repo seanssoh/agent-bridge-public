@@ -440,24 +440,36 @@ def notify_admin_pressure_defer(run_id: str, job_name: str, probe: dict[str, Any
 
 
 def disable_mcp_for_request(request: dict[str, Any]) -> bool:
-    """#263: decide whether the disposable child should launch with MCP disabled.
+    """#263 + #468: decide whether the disposable child should launch with MCP disabled.
 
     Order of precedence:
-      1. ``BRIDGE_CRON_DISPOSABLE_DISABLE_MCP`` env override (ops A/B switch).
+      1. ``request['disposable_needs_channels']`` — channel relays need MCP
+         servers loaded to deliver, so we never disable in that case. Safety
+         override; nothing below can flip it back.
+      2. ``BRIDGE_CRON_DISPOSABLE_DISABLE_MCP`` env override (ops A/B switch).
          Set to ``1``/``true`` to force-disable MCP for every cron child;
          ``0``/``false`` to force-enable. Unset to defer to per-job config.
-      2. ``request['disable_mcp']`` from the job's ``metadata.disableMcp``
-         (or aliases) wired through ``bridge_cron_write_request``.
-      3. ``request['disposable_needs_channels']`` — channel relays need MCP
-         servers loaded to deliver, so we never disable in that case even if
-         the per-job flag says so. This is a safety override.
+      3. ``request['disable_mcp']`` from the job's ``metadata.disableMcp``
+         (or aliases) wired through ``bridge_cron_write_request``. When
+         explicitly set (``True``/``False``) the per-job choice wins.
+      4. **Default: True.** Non-channel cron disposables disable MCP unless
+         opted in. Disabling MCP cuts cold-start cost (~22K tokens / run on
+         the SYRS reference install) and prevents a cwd
+         ``settings.local.json`` ``enabledPlugins`` entry (e.g. telegram)
+         from auto-attaching in the disposable child and stealing the
+         parent agent's MCP poller via plugin singleton-lock (issue #468).
+         If a specific cron payload genuinely needs MCP tools, set
+         ``metadata.disableMcp = False`` on that job.
     """
     if disposable_needs_channels(request):
         return False
     override = os.environ.get("BRIDGE_CRON_DISPOSABLE_DISABLE_MCP")
     if override is not None and override.strip():
         return bool_flag(override)
-    return bool_flag(request.get("disable_mcp"))
+    raw = request.get("disable_mcp")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return True
+    return bool_flag(raw)
 
 
 def build_prompt(request: dict[str, Any], payload_text: str) -> str:
