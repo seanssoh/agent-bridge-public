@@ -37,6 +37,7 @@ main() {
   smoke_make_temp_root "isolation"
   smoke_run "ephemeral detector accepts physical TMPDIR paths" canonical_tmpdir_ephemeral_detector
   smoke_run "v2 isolation rootless primitives" bash "$SMOKE_REPO_ROOT/tests/isolation-v2-primitives/smoke.sh"
+  smoke_run "isolated Claude read lens mask repair" bash "$SMOKE_REPO_ROOT/tests/isolation-claude-read-lens/smoke.sh"
   smoke_log "passed"
 }
 

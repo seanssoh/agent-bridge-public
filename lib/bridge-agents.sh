@@ -734,6 +734,43 @@ bridge_linux_traverse_stop_for() {
   return 0
 }
 
+# Restore the controller read lens on an isolated Claude home. The memory-daily
+# harvester runs in the controller context and scans the isolated UID's
+# ~/.claude/projects tree through this lens.
+bridge_linux_repair_isolated_claude_read_lens() {
+  local os_user="$1"
+  local user_home="$2"
+  local controller_user="$3"
+  local isolated_claude_dir=""
+  local isolated_projects_dir=""
+
+  [[ -n "$os_user" && -n "$user_home" && -n "$controller_user" ]] || return 0
+  if bridge_isolation_v2_active; then
+    return 0
+  fi
+
+  isolated_claude_dir="$user_home/.claude"
+  isolated_projects_dir="$isolated_claude_dir/projects"
+
+  bridge_linux_sudo_root test -d "$isolated_claude_dir" || return 0
+  bridge_linux_sudo_root setfacl \
+    -m "u:${controller_user}:r-x" \
+    -m "m::r-x" \
+    "$isolated_claude_dir" >/dev/null 2>&1 || true
+  bridge_linux_sudo_root setfacl \
+    -d -m "u:${controller_user}:r-X" \
+    -d -m "m::r-X" \
+    "$isolated_claude_dir" >/dev/null 2>&1 || true
+
+  bridge_linux_sudo_root test -d "$isolated_projects_dir" || return 0
+  bridge_linux_sudo_root find "$isolated_projects_dir" -type d \
+    -exec setfacl -m "u:${controller_user}:r-X" -m "m::r-X" {} + >/dev/null 2>&1 || true
+  bridge_linux_sudo_root find "$isolated_projects_dir" -type d \
+    -exec setfacl -d -m "u:${controller_user}:r-X" -d -m "m::r-X" {} + >/dev/null 2>&1 || true
+  bridge_linux_sudo_root find "$isolated_projects_dir" -type f \
+    -exec setfacl -m "u:${controller_user}:r--" -m "m::r--" {} + >/dev/null 2>&1 || true
+}
+
 # Claude Code reads its auth from $CLAUDE_CONFIG_DIR/.credentials.json
 # (default $HOME/.claude/.credentials.json). Under linux-user isolation
 # the agent runs as a dedicated UID whose $HOME is /home/<os_user>/,
@@ -800,7 +837,10 @@ bridge_linux_grant_claude_credentials_access() {
 
   bridge_linux_sudo_root mkdir -p "$isolated_claude_dir"
   bridge_linux_sudo_root chown "$os_user" "$isolated_claude_dir"
-  bridge_linux_sudo_root chmod 0700 "$isolated_claude_dir"
+  if ! bridge_isolation_v2_active; then
+    bridge_linux_sudo_root chmod 0700 "$isolated_claude_dir"
+    bridge_linux_repair_isolated_claude_read_lens "$os_user" "$user_home" "$controller_user"
+  fi
 
   if bridge_isolation_v2_active; then
     # C1 exception: bypass the v2-noop public traverse chain and apply
@@ -2962,7 +3002,7 @@ bridge_linux_prepare_agent_isolation() {
   # isolated user's home and its .claude subdirectory. `/home` and `/`
   # stay untouched — the controller reaches them via base perms.
   bridge_linux_acl_add "u:${controller_user}:--x" "$user_home" >/dev/null 2>&1 || true
-  bridge_linux_acl_add "u:${controller_user}:r-x" "$isolated_claude_dir" >/dev/null 2>&1 || true
+  bridge_linux_repair_isolated_claude_read_lens "$os_user" "$user_home" "$controller_user" >/dev/null 2>&1 || true
   # Default ACL on .claude/ so any subdirectory (projects/, sessions/, ...)
   # created later by the isolated UID inherits controller read access.
   # PR-E: in v2 mode the per-agent group + setgid contract covers
