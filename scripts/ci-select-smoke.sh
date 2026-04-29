@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade telegram-relay telegram-relay-plugin
+  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade telegram-relay telegram-relay-plugin telegram-relay-setup
 }
 
 add_all_integration() {
@@ -176,7 +176,12 @@ select_for_path() {
       add_all_live
       ;;
 
-    bridge-queue.py|bridge-task.sh|bridge-status.sh|bridge-audit.py)
+    bridge-setup.py|bridge-setup.sh|bridge-status.py|bridge-status.sh)
+      add_required telegram-relay-setup queue
+      add_integration integration-minimal
+      ;;
+
+    bridge-queue.py|bridge-task.sh|bridge-audit.py)
       add_required queue
       add_integration integration-minimal
       ;;

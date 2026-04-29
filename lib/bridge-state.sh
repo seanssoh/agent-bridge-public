@@ -506,7 +506,13 @@ assignments = []
 
 if any(item == "plugin:discord" or item.startswith("plugin:discord@") for item in required):
     assignments.append(("DISCORD_STATE_DIR", discord_dir))
-if any(item == "plugin:telegram" or item.startswith("plugin:telegram@") for item in required):
+if any(
+    item == "plugin:telegram"
+    or item.startswith("plugin:telegram@")
+    or item == "plugin:telegram-relay"
+    or item.startswith("plugin:telegram-relay@")
+    for item in required
+):
     assignments.append(("TELEGRAM_STATE_DIR", telegram_dir))
 if any(item == "plugin:teams" or item.startswith("plugin:teams@") for item in required):
     assignments.append(("TEAMS_STATE_DIR", teams_dir))
@@ -2821,6 +2827,7 @@ bridge_write_roster_status_snapshot() {
   local wake
   local channels
   local channel_reason
+  local configured_channels
   local session
   local activity_state
   local loop_mode
@@ -2828,7 +2835,7 @@ bridge_write_roster_status_snapshot() {
   local recent
 
   {
-    echo -e "agent\tengine\tsession\tworkdir\tsource\tloop\tactive\twake\tchannels\tchannel_reason\tactivity_state"
+    echo -e "agent\tengine\tsession\tworkdir\tsource\tloop\tactive\twake\tchannels\tchannel_reason\tactivity_state\tconfigured_channels"
     for agent in "${BRIDGE_AGENT_IDS[@]}"; do
       active=0
       wake="-"
@@ -2846,6 +2853,9 @@ bridge_write_roster_status_snapshot() {
       session="$(bridge_agent_session "$agent")"
       engine="$(bridge_agent_engine "$agent")"
       loop_mode="$(bridge_agent_loop "$agent")"
+      configured_channels="$(bridge_agent_channels_csv "$agent")"
+      configured_channels="${configured_channels//$'\t'/ }"
+      configured_channels="${configured_channels//$'\n'/ }"
       if bridge_agent_is_active "$agent"; then
         active=1
         recent=""
@@ -2869,7 +2879,7 @@ bridge_write_roster_status_snapshot() {
         fi
       fi
 
-      echo -e "${agent}\t${engine}\t${session}\t$(bridge_agent_workdir "$agent")\t$(bridge_agent_source "$agent")\t${loop_mode}\t${active}\t${wake}\t${channels}\t${channel_reason}\t${activity_state}"
+      echo -e "${agent}\t${engine}\t${session}\t$(bridge_agent_workdir "$agent")\t$(bridge_agent_source "$agent")\t${loop_mode}\t${active}\t${wake}\t${channels}\t${channel_reason}\t${activity_state}\t${configured_channels}"
     done
   } >"$file"
 }
