@@ -5728,7 +5728,11 @@ text, count = pattern.subn(replacement, text, count=1)
 assert count == 1, (agent, path)
 path.write_text(text, encoding="utf-8")
 PY
-ROSTER_RELOAD_RUN_LOG="$BRIDGE_LOG_DIR/agents/$ROSTER_RELOAD_AGENT/$(date '+%Y%m%d').log"
+ROSTER_RELOAD_RUN_LOG="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  printf "%s/%s.log" "$(bridge_agent_log_dir "$1")" "$(date "+%Y%m%d")"
+' -- "$ROSTER_RELOAD_AGENT")"
 "$BASH4_BIN" "$REPO_ROOT/bridge-run.sh" "$ROSTER_RELOAD_AGENT" >/dev/null 2>&1 &
 ROSTER_RELOAD_PID=$!
 for _ in {1..40}; do
