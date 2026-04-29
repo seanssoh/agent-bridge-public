@@ -6,6 +6,32 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.39] — 2026-04-30
+
+### Highlight — operator upgrade coverage + v0.6.x migration gaps closed
+
+`v0.6.39` closes the v0.6.x migration-gap sweep that surfaced after Sean's dev host upgrade from v0.6.33 → v0.6.38. The host hit two regressions today (patch admin source flipping to `dynamic`, and the `autoCompactWindow:400000` managed default not propagating to existing agents) that revealed a class of bugs: changes that ship code but don't run for already-existing installs on `upgrade --apply`. Six suspected gap surfaces were swept; one (Gap 3, hooks) was a real confirmed-gap and is fixed here. The other five are either already covered (Gap 2, 5), clean by design (Gap 4, 6), or addressed by docs convention rather than code (Gap 4 / Gap 6 edge cases through the new release-PR contract).
+
+The release also ships a single canonical upgrade procedure (`UPGRADING.md`) and a release-PR contract that requires every release to declare operator-side actions, preventing future "shipped but not propagated" gaps from slipping through.
+
+- **Gap 3 fix — shared Claude hooks now propagated on upgrade** (#493). New `bridge_upgrade_propagate_claude_hooks` runs `bridge_ensure_claude_*_hook` (Stop / SessionStart / UserPromptSubmit / PromptGuard / ToolPolicy) once per Claude agent against the shared base settings before the rerender step. From this release onward, `agent-bridge upgrade --apply` activates any newly-added hook automatically; before this PR the new hook script was shipped to `hooks/` but the existing per-agent `settings.json` never registered it. The ensure helpers are idempotent so existing registrations are untouched.
+- **`UPGRADING.md` — standard upgrade procedure** (#493). Single canonical guide for every install. Same `agent-bridge upgrade --dry-run` → `--apply` sequence regardless of host shape (canonical-only host vs admin host with source-checkout). Covers prerequisites, pre/post checks (VERSION + daemon health + `[upgrade-complete]` task body + `OPERATOR_ACTIONS_PENDING.md` walk-through), source-checkout admin variant (`AGENT_BRIDGE_SOURCE_DIR` / `--source`), and troubleshooting (stale `AGENT_SESSION_ID` cascade prevention #314/#315, `--apply` failure recovery, rollback, conflict files, daemon not restarting).
+- **Release-PR contract — operator-action declaration** (#493). New section in `docs/agent-runtime/admin-protocol.md` lists the 6 change categories that almost always need an `OPERATOR_ACTIONS_PENDING.md` entry (new env-var defaults, channel plugin / default flips, hook events not auto-propagated, cron schedule changes, roster schema additions, settings.json keys not in `BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS`). Reviewers bounce a release PR back as `review-needs-more` if a relevant change ships without an entry.
+- **CLI surface alignment** (#493 codex review-then-fix). `agent-bridge upgrade --apply` is now an explicit alias for the default apply path (matches every UPGRADING.md / OPERATIONS.md / admin-protocol.md example). `agent-bridge daemon <subcommand>` dispatches to `bridge-daemon.sh`.
+
+Three follow-up regression fixes from today's dev-host audit are also bundled:
+
+- **Patch source regression fix** (#488 / #2292). v0.6.38 upgrader misclassified the static admin patch as `source=dynamic` because `bridge_write_role_block` overwrote source unconditionally. New `bridge_agent_has_static_admin_shape` (engine=claude + SESSION-TYPE=admin + canonical workdir + SOUL.md) detects admin shape; new `agent reclassify [--apply]` CLI is dry-run by default and self-heals already-broken installs. `upgrade --apply` runs the fixup automatically; JSON/text output adds `source_reclassify`.
+- **Shared Claude settings rerender** (#491 / #2299). v0.6.36's `autoCompactWindow:400000` managed default landed in code but the upgrader never re-rendered effective settings for existing agents. New `agent rerender-settings [--apply]` CLI is dry-run by default and emits `shared_settings_rerendered` audit row + visible failure on render/link error. `upgrade --apply` runs the rerender automatically; JSON/text adds `shared_settings_rerender`.
+- **Setup telegram default flip** (#490 / #2293). `agent-bridge setup telegram <agent>` now defaults to `--use-relay` (the architectural fix from v0.6.37 #475 phase 2/3). `--no-relay` is the transitional escape hatch. Mutually-exclusive with `--use-relay`. Fresh setups land on the architecturally-safe relay path automatically; existing legacy registrations are untouched until the operator re-runs setup.
+- **Mattermost channel plugin** (#438). External contributor (`@daejeong-cosmax`) ships the Mattermost channel plugin under `plugins/mattermost/`. Inbound transport is Mattermost's WebSocket gateway; outbound replies via `mattermost-mcp-server`. Single-bot and multi-bot routing (one plugin process opens N WebSocket connections, routes by `@username` mention). Codex review-then-fix landed five blockers before merge (Mattermost ID validator was using Discord snowflakes / `MATTERMOST_BOT_ROUTES` silent fallback / multi-bot watchdog could exit 0 / stale bun.lock / missing focused smoke).
+
+`OPERATOR_ACTIONS_PENDING.md` gains three new sections:
+
+- v0.6.39 hook propagation (informational, no action required).
+- v0.6.39 settings rerender for hosts that upgraded before #491 (run `agent-bridge agent rerender-settings --apply` to backfill).
+- v0.6.39 telegram-relay default flip (informational, no action required for existing legacy installs).
+
 ## [0.6.38] — 2026-04-29
 
 ### Highlight — `OPERATOR_ACTIONS_PENDING.md` mechanism
