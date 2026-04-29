@@ -6,6 +6,12 @@ on:
       - main
   pull_request:
   workflow_dispatch:
+    inputs:
+      run_legacy_full:
+        description: "Run archived legacy full smoke monolith"
+        required: false
+        default: false
+        type: boolean
   schedule:
     # Nightly KST morning run for long and environment-sensitive smoke.
     - cron: "0 19 * * *"
@@ -150,12 +156,12 @@ jobs:
   legacy-full-smoke:
     name: legacy-full-smoke
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 15
     needs:
       - syntax
       - lint
       - oss-preflight
-    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_full == true }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -168,4 +174,6 @@ jobs:
           sudo apt-get install -y tmux shellcheck
 
       - name: Run legacy full smoke
-        run: timeout 40m bash ./scripts/smoke/legacy-full-smoke.sh
+        run: |
+          echo "legacy-full-smoke is archived and opt-in only; modular smoke jobs are the deploy/PR signal."
+          timeout 12m bash ./scripts/smoke/legacy-full-smoke.sh
