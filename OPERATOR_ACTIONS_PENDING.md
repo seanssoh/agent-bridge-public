@@ -15,6 +15,31 @@ PR, prepend a new section; do not edit older sections in place.
 
 ---
 
+## v0.6.39 — settings rerender for hosts that upgraded before this fix
+
+- applies_when_upgrading_from: any version `0.6.33 .. 0.6.38`
+- urgency: medium.
+
+### Action
+
+Run on the upgraded host to backfill managed Claude settings defaults that may
+not have propagated during prior upgrades:
+
+```bash
+agent-bridge agent rerender-settings --apply
+```
+
+Confirm `autoCompactWindow: 400000` is present in each managed Claude agent's
+effective settings.
+
+### Skip if
+
+- This host has no managed Claude agents.
+- `agent-bridge agent rerender-settings --dry-run` reports every target as
+  `unchanged`.
+
+---
+
 ## v0.6.39 — `setup telegram` defaults to relay (no operator action required)
 
 - applies_when_upgrading_from: any version `<= 0.6.38`.
@@ -22,15 +47,22 @@ PR, prepend a new section; do not edit older sections in place.
 
 ### Background
 
-`agent-bridge setup telegram <agent>` now defaults to `--use-relay` (the architectural fix from #475 phase 2/3). The legacy `plugin:telegram@claude-plugins-official` path is still reachable via `--no-relay` as a transitional escape hatch.
+`agent-bridge setup telegram <agent>` now defaults to `--use-relay` (the
+architectural fix from #475 phase 2/3). The legacy
+`plugin:telegram@claude-plugins-official` path is still reachable via
+`--no-relay` as a transitional escape hatch.
 
 ### Action
 
-**No operator action required.** Existing agents on the legacy plugin path keep working until the operator explicitly re-runs `setup telegram`. Hosts that already have the v0.6.37 telegram-relay opt-in section processed are already on the relay path.
+**No operator action required.** Existing agents on the legacy plugin path keep
+working until the operator explicitly re-runs `setup telegram`. Hosts that
+already have the v0.6.37 telegram-relay opt-in section processed are already on
+the relay path.
 
 ### Skip if
 
-- Always skip — this is informational. The flag flip only affects new `setup telegram` invocations; existing registrations are untouched.
+- Always skip — this is informational. The flag flip only affects new
+  `setup telegram` invocations; existing registrations are untouched.
 
 ---
 

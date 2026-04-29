@@ -14,11 +14,16 @@ cleanup() {
   if [[ -n "$TOKEN_HASH" ]]; then
     "$SMOKE_REPO_ROOT/agent-bridge" telegram-relay stop --token-hash "$TOKEN_HASH" >/dev/null 2>&1 || true
   fi
+  stop_fake_telegram
+  smoke_cleanup_temp_root
+}
+
+stop_fake_telegram() {
   if [[ -n "$FAKE_PID" ]]; then
     kill "$FAKE_PID" >/dev/null 2>&1 || true
     wait "$FAKE_PID" >/dev/null 2>&1 || true
+    FAKE_PID=""
   fi
-  smoke_cleanup_temp_root
 }
 trap cleanup EXIT
 
@@ -92,15 +97,25 @@ write_roster() {
   mkdir -p "$workdir"
   cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
 bridge_add_agent_id_if_missing "test-agent"
+bridge_add_agent_id_if_missing "legacy-agent"
 BRIDGE_AGENT_DESC["test-agent"]="Telegram relay setup smoke"
+BRIDGE_AGENT_DESC["legacy-agent"]="Telegram legacy setup smoke"
 BRIDGE_AGENT_ENGINE["test-agent"]="claude"
+BRIDGE_AGENT_ENGINE["legacy-agent"]="claude"
 BRIDGE_AGENT_SESSION["test-agent"]="telegram-relay-setup-smoke"
+BRIDGE_AGENT_SESSION["legacy-agent"]="telegram-legacy-setup-smoke"
 BRIDGE_AGENT_WORKDIR["test-agent"]="$workdir"
+BRIDGE_AGENT_WORKDIR["legacy-agent"]="$BRIDGE_AGENT_HOME_ROOT/legacy-agent"
 BRIDGE_AGENT_LAUNCH_CMD["test-agent"]="claude"
+BRIDGE_AGENT_LAUNCH_CMD["legacy-agent"]="claude"
 BRIDGE_AGENT_LOOP["test-agent"]=0
+BRIDGE_AGENT_LOOP["legacy-agent"]=0
 BRIDGE_AGENT_CONTINUE["test-agent"]=0
+BRIDGE_AGENT_CONTINUE["legacy-agent"]=0
 BRIDGE_AGENT_CHANNELS["test-agent"]="plugin:telegram@claude-plugins-official"
+BRIDGE_AGENT_CHANNELS["legacy-agent"]="plugin:telegram-relay@agent-bridge"
 EOF
+  mkdir -p "$BRIDGE_AGENT_HOME_ROOT/legacy-agent"
 }
 
 write_plugin_registry() {
@@ -109,6 +124,13 @@ write_plugin_registry() {
 {
   "version": 1,
   "plugins": {
+    "telegram@claude-plugins-official": [
+      {
+        "scope": "user",
+        "installPath": "$SMOKE_TMP_ROOT/telegram-plugin",
+        "version": "0.1.0"
+      }
+    ],
     "telegram-relay@agent-bridge": [
       {
         "scope": "user",
@@ -223,11 +245,47 @@ telegram_relay_setup_flow() {
   mv "$tokens_file.bak" "$tokens_file"
 }
 
+telegram_no_relay_opt_out_replaces_channel() {
+  local api_base setup_output roster_text conflict_output
+
+  api_base="$(start_fake_telegram)"
+  "$SMOKE_REPO_ROOT/agent-bridge" setup telegram legacy-agent \
+    --token "654321:legacy-token" \
+    --allow-from "333333" \
+    --default-chat "444444" \
+    --no-relay \
+    --skip-validate \
+    --skip-send-test \
+    --yes \
+    --api-base-url "$api_base" >"$SMOKE_TMP_ROOT/no-relay.out"
+  setup_output="$(cat "$SMOKE_TMP_ROOT/no-relay.out")"
+  smoke_assert_contains "$setup_output" "relay_enabled: no" "--no-relay reports legacy mode"
+
+  roster_text="$(cat "$BRIDGE_ROSTER_LOCAL_FILE")"
+  smoke_assert_contains "$roster_text" 'BRIDGE_AGENT_CHANNELS["legacy-agent"]="plugin:telegram@claude-plugins-official"' "--no-relay replaces relay channel with legacy channel"
+  smoke_assert_not_contains "$roster_text" 'BRIDGE_AGENT_CHANNELS["legacy-agent"]="plugin:telegram-relay@agent-bridge"' "--no-relay removes relay channel registration"
+
+  if conflict_output="$("$SMOKE_REPO_ROOT/agent-bridge" setup telegram legacy-agent \
+      --token "654321:legacy-token" \
+      --allow-from "333333" \
+      --use-relay \
+      --no-relay \
+      --skip-validate \
+      --skip-send-test \
+      --yes \
+      --api-base-url "$api_base" 2>&1)"; then
+    smoke_fail "--use-relay and --no-relay should be mutually exclusive"
+  fi
+  smoke_assert_contains "$conflict_output" "not allowed with argument" "relay flag conflict surfaces argparse error"
+  stop_fake_telegram
+}
+
 main() {
   smoke_require_cmd python3
   TMPDIR=/tmp smoke_setup_bridge_home "tgsetup"
   write_roster
   write_plugin_registry
+  smoke_run "Telegram --no-relay opt-out replaces relay channel" telegram_no_relay_opt_out_replaces_channel
   smoke_run "Telegram relay setup lifecycle/status smoke (default flip)" telegram_relay_setup_flow
   smoke_log "passed"
 }

@@ -600,7 +600,7 @@ run_telegram() {
         bridge_info "[info] $agent launch already allows development channels: $(bridge_agent_dev_channels_csv "$agent")"
       fi
     else
-      bridge_setup_add_agent_channel "$agent" "plugin:telegram"
+      bridge_setup_replace_agent_telegram_channel "$agent" "plugin:telegram"
     fi
     if [[ -n "$channel_account" ]]; then
       bridge_setup_sync_runtime_account "$runtime_config" "$compat_config" "telegram" "$channel_account"
