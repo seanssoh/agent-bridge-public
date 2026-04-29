@@ -3548,6 +3548,58 @@ process_queue_gateway_requests() {
   return 1
 }
 
+bridge_telegram_relay_state_root() {
+  printf '%s/channels/telegram' "$BRIDGE_STATE_DIR"
+}
+
+bridge_telegram_relay_supervise() {
+  local state_root=""
+  local tokens_file=""
+  local token_hash=""
+  local token_file=""
+  local output=""
+  local rc=0
+  local changed=1
+
+  [[ "${BRIDGE_TELEGRAM_RELAY_ENABLED:-0}" == "1" ]] || return 1
+
+  state_root="$(bridge_telegram_relay_state_root)"
+  tokens_file="$state_root/tokens.list"
+  [[ -s "$tokens_file" ]] || return 1
+
+  while IFS=$'\t' read -r token_hash token_file; do
+    [[ -n "$token_hash" && -n "$token_file" ]] || continue
+    [[ "${token_hash:0:1}" != "#" ]] || continue
+    if [[ ! -f "$token_file" ]]; then
+      bridge_audit_log daemon telegram_relay_supervise_failed "$token_hash" \
+        --detail reason=missing_token_file >/dev/null 2>&1 || true
+      changed=0
+      continue
+    fi
+
+    output="$(python3 "$SCRIPT_DIR/lib/telegram-relay.py" start \
+      --state-root "$state_root" \
+      --token-file "$token_file" 2>&1)" || rc=$?
+    if [[ ${rc:-0} -ne 0 ]]; then
+      bridge_audit_log daemon telegram_relay_supervise_failed "$token_hash" \
+        --detail reason=start_failed \
+        --detail exit_code="${rc:-0}" >/dev/null 2>&1 || true
+      daemon_warn "telegram relay start failed for token_hash=$token_hash"
+      changed=0
+      rc=0
+      continue
+    fi
+
+    if [[ "$output" == *"started: yes"* ]]; then
+      bridge_audit_log daemon telegram_relay_supervise "$token_hash" \
+        --detail action=spawned >/dev/null 2>&1 || true
+      changed=0
+    fi
+  done <"$tokens_file"
+
+  return "$changed"
+}
+
 cmd_sync_cycle() {
   local snapshot_file
   local ready_agents_file
@@ -3571,6 +3623,8 @@ cmd_sync_cycle() {
   # Discord relay runs FIRST — lowest-latency path for DM wake
   BRIDGE_DAEMON_LAST_STEP="discord_relay"
   bridge_discord_relay_step || true
+  BRIDGE_DAEMON_LAST_STEP="telegram_relay"
+  bridge_telegram_relay_supervise || true
 
   BRIDGE_DAEMON_LAST_STEP="bridge_sync"
   "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true

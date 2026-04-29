@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade
+  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade telegram-relay
 }
 
 add_all_integration() {
@@ -201,6 +201,11 @@ select_for_path() {
 
     scripts/apply-channel-policy.sh|lib/bridge-channels.sh|lib/bridge-discord.sh|bridge-discord-relay.sh|bridge-notify.sh|runtime-templates/*)
       add_required channel-plugins
+      add_integration integration-minimal
+      ;;
+
+    bridge-telegram-relay.sh|lib/telegram-relay.py)
+      add_required telegram-relay
       add_integration integration-minimal
       ;;
 
