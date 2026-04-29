@@ -1,0 +1,16 @@
+{
+  "name": "telegram-relay",
+  "description": "Telegram channel for Claude Code through the Agent Bridge polling relay daemon. Opt-in replacement for the official polling plugin.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Agent Bridge",
+    "email": "maintainers@agent-bridge.local"
+  },
+  "keywords": [
+    "telegram",
+    "relay",
+    "messaging",
+    "channel",
+    "mcp"
+  ]
+}
