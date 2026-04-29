@@ -6,6 +6,48 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.35] — 2026-04-29
+
+### Highlight — Telegram disconnect mitigation + admin-compact pipeline removal + agent CLAUDE.md slim
+
+`v0.6.35` ships three independent improvements that landed in the same wave:
+
+- **Telegram MCP plugin mid-session disconnect cascade — short-term mitigation** (#474, closes #468 cron-driven path). Cron disposable children no longer auto-load MCP plugins by default, which prevents the upstream telegram plugin's stale-pid SIGTERM logic from killing the parent agent's live poller every cron tick. Net: 30-min cron-cascade-driven disconnects on `event-reminder-30min` / `librarian-watchdog` / `picker-sweep` etc. stop firing. Cron cold-start cost also drops ~49% (~22K input tokens / run on the SYRS reference install).
+- **Admin-compact queue-trigger pipeline deprecated** (#477, closes #472). The daemon-driven `[context-pressure]` → `[admin-compact]` queue chain is removed because Claude Code agents have no in-session primitive to invoke their own compaction; the chain only produced queue noise + orphan `NEXT-SESSION.md` files. Detection + audit telemetry (`context_pressure_detected`, `_suppressed`, `_recovered`) is preserved. Manual operator primitives (`agent-bridge agent compact|handoff <agent>`) stay valid. Replacement direction is setup-time `~/.claude/settings.json` context-size lowering — tracked separately in #473.
+- **`_template/CLAUDE.md` managed block slimmed** (#476, closes #471). 206 lines / 27 KB → 97 lines / 9.3 KB (≈ 64% reduction). Verbose admin-only and common-protocol bodies moved to `docs/agent-runtime/{common-instructions,admin-protocol}.md`; the per-agent template carries pointers only. `bridge-migrate.py overhead` extended with legacy inline section detection + file-side `CLAUDE.md.bak-<YYYYMMDD>-managed-block` sidecar backup on apply.
+
+### Cron MCP default flip (#474)
+
+- `bridge-cron-runner.py::disable_mcp_for_request` default flipped from `False` to `True` for non-channel cron disposable children. Channel relays (`disposable_needs_channels=True`) and explicit per-job `metadata.disableMcp=False` continue to load MCP. Existing recurring jobs (`event-reminder-30min`, `librarian-watchdog`, `picker-sweep`) automatically benefit; no manifest changes needed.
+- `--strict-mcp-config` is the only flag passed (no separate `--mcp-config <path>`). Live `claude -p` reproduction confirmed `--strict-mcp-config` alone is sufficient and `--bare` is unsuitable for cron because it skips auth.
+- Precedence chain remains: channel safety override > `BRIDGE_CRON_DISPOSABLE_DISABLE_MCP` env > per-job `metadata.disableMcp` > **default True (new)**.
+- 8-case unit harness in `scripts/smoke-test.sh` covers all paths (safety override, env, per-job opt-out/in, default flip).
+
+### Admin-compact pipeline deprecation (#477)
+
+- `bridge-daemon.sh::process_context_pressure_reports` reduced to detection-only. The 199-line static-target task creation + direct-notify + body-builder block is removed; audit rows (`context_pressure_detected` on severity edge or hash drift, `context_pressure_suppressed` for dynamic agents, `context_pressure_recovered` on empty-severity recovery) and per-agent state-file telemetry are preserved.
+- Helpers no longer used (`bridge_context_pressure_title`, `_title_prefix`, `_priority`, `_decode_excerpt`, `bridge_write_context_pressure_report_body`) deleted.
+- `bridge-cron-runner.py::notify_admin_pressure_defer` and its caller removed; cron memory-pressure deferral itself (queue lifecycle + `cron_dispatch_deferred` audit) is preserved.
+- Smoke harness updated: `scripts/smoke-test.sh` and `tests/admin-static-dynamic-boundary/smoke.sh` drop legacy `[context-pressure]` task-creation assertions; new function-level unit covers all four audit modalities (static warning, hash drift, dynamic suppression, recovery) with `bridge_queue_cli`/`bridge_notify_send` stubs wired to `exit 99` so any accidental regression hard-fails the test.
+- Manual primitives (`agent-bridge agent compact|handoff <agent>`) and `NEXT-SESSION.md` SessionStart-hook ingestion untouched. `[admin-handoff]` operator-driven path out of scope.
+- `agents/_template/CLAUDE.md` admin instruction telling the admin to call `agent compact` on `[context-pressure]` tasks is intentionally NOT modified in this PR — it follows in a small follow-up after #476's doc-slim merged. The admin-side instruction now lives in `docs/agent-runtime/admin-protocol.md` and the follow-up will drop it there.
+
+### Agent CLAUDE.md slim (#476)
+
+- `agents/_template/CLAUDE.md` managed block (`<!-- BEGIN/END AGENT BRIDGE DOC MIGRATION -->`) reduced from 206 lines / 27 KB to 97 lines / 9.3 KB. The verbose bodies of "Agent Bridge external push policy" (50 lines + JSON schema), "Autonomy & Anti-Stall" (7 lines), "Upstream Issue Policy" (10 lines), "Admin First-Run Onboarding Defaults" (~20 lines), "Admin Self-Cleanup of Own Queue" (12 lines), "Admin Static vs Dynamic Agent Boundary" (7 lines), "Admin Upgrade Protocol" (7 lines), and "Channel Setup Protocol" (12 lines) are removed. The slim block keeps `Agent Bridge Runtime Canon`, `Runtime Protocol Pointers` (new), `Queue & Delivery`, a 1-line `Task Processing Protocol`, `Change Reporting`, and `Legacy Guardrails`.
+- Backfilled into `docs/agent-runtime/common-instructions.md`: `External Push Handling`, `Channel Setup Protocol`, and the previously-missing `Change Reporting` section. Variants of "Admin First-Run Onboarding Defaults" / "Admin Self-Cleanup" / "Admin Static-vs-Dynamic" / "Admin Upgrade" already lived in `docs/agent-runtime/admin-protocol.md`.
+- `bridge-docs.py::render_agent_bridge_block` refactored to render pointer-style managed blocks. The role-filter (admin role gets `ADMIN-PROTOCOL.md` symlink + an `Admin Protocol Pointer` block) is preserved.
+- `bridge-migrate.py overhead` extended:
+  - `dry-run` reports per-agent `legacy_inline_blocks` (the headers from the slimmed list above, when found inside the managed block) alongside the byte-count diff.
+  - `apply` writes the rollback backup under `state/doc-migration/backups-<stamp>/<agent>.CLAUDE.md.bak` AND, when legacy inline sections are detected, a file-side sidecar `CLAUDE.md.bak-<YYYYMMDD>-managed-block` next to the agent's `CLAUDE.md` for operator inspection.
+  - Rollback uses the state backup; sidecar is operator-only and stays in place.
+- Smoke assertion swapped from inline `## Autonomy & Anti-Stall` text to pointer-based `## Runtime Protocol Pointers` + `COMMON-INSTRUCTIONS.md` checks (`scripts/smoke-test.sh`).
+- Net effect on a 20-agent install: managed-block bytes drop from ~540 KB to ~190 KB across all agents.
+
+### Other tracked issues
+
+- **#475 — Telegram polling: single-owner relay daemon** (registered, not implemented). Long-term root-cause fix for the #468 cascade. Moves the polling consumer for each Telegram bot token out of the per-session MCP plugin process and into a single supervised daemon owned by Agent Bridge runtime. Plugin process becomes a thin RPC client over a local socket. Closes both #468 (telegram singleton-lock cascade) and #234 (bun-based MCP parent-death) at the architectural level. Tracked for a future sprint; #474 is the short-term mitigation.
+
 ## [0.6.34] — 2026-04-28
 
 ### Highlight — memory pipeline rewiring (#390 PR-1/2/3)
