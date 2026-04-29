@@ -37,6 +37,7 @@ TARGET_HEAD=""
 SOURCE_VERSION=""
 SOURCE_REF=""
 SOURCE_HEAD=""
+SOURCE_RECLASSIFY_JSON='{}'
 
 usage() {
   cat <<EOF
@@ -1133,6 +1134,12 @@ if [[ $BACKUP -eq 1 ]]; then
   BACKUP_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${backup_args[@]}")"
 fi
 
+reclassify_args=(reclassify --json)
+if [[ $DRY_RUN -eq 0 ]]; then
+  reclassify_args+=(--apply)
+fi
+SOURCE_RECLASSIFY_JSON="$(bridge_upgrade_with_target_env "$TARGET_ROOT" "$BRIDGE_BASH_BIN" "$SOURCE_ROOT/bridge-agent.sh" "${reclassify_args[@]}")"
+
 BASE_REF="$(python3 - "$ANALYSIS_JSON" <<'PY'
 import json, sys
 payload = json.loads(sys.argv[1])
@@ -1447,10 +1454,11 @@ if [[ $JSON -eq 1 ]]; then
   printf '%s' "$ANALYSIS_JSON" >"$_json_payload_dir/analysis.json"
   printf '%s' "$AGENT_RESTART_JSON" >"$_json_payload_dir/agent-restart.json"
   printf '%s' "$CHANNEL_GUARD_JSON" >"$_json_payload_dir/channel-guard.json"
+  printf '%s' "$SOURCE_RECLASSIFY_JSON" >"$_json_payload_dir/source-reclassify.json"
   set +e
-  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" <<'PY'
+  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" <<'PY'
 import json, sys
-source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file = sys.argv[1:]
+source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file = sys.argv[1:]
 
 def load_json(path):
     with open(path, encoding="utf-8") as fh:
@@ -1462,6 +1470,7 @@ apply_payload = load_json(apply_json_file)
 analysis_payload = load_json(analysis_json_file)
 agent_restart_payload = load_json(agent_restart_json_file)
 channel_guard_payload = load_json(channel_guard_json_file)
+source_reclassify_payload = load_json(source_reclassify_json_file)
 payload = {
     "mode": "upgrade",
     "version": source_version,
@@ -1496,6 +1505,7 @@ payload = {
     "channel_guard": channel_guard_payload,
     "agent_restart": agent_restart_payload,
     "agent_migration": migration_payload,
+    "source_reclassify": source_reclassify_payload,
   }
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY
@@ -1536,6 +1546,15 @@ print(f"analysis_merge_required: {counts.get('merge_required', 0)}")
 print(f"analysis_unknown_base_live_diff: {counts.get('unknown_base_live_diff', 0)}")
 PY
 bridge_upgrade_print_channel_guard_summary "$CHANNEL_GUARD_JSON"
+python3 - "$SOURCE_RECLASSIFY_JSON" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+count = int(payload.get("count") or 0)
+mode = payload.get("mode") or "dry-run"
+print(f"source_reclassify: {count} candidate(s) ({mode})")
+for item in payload.get("candidates") or []:
+    print(f"  - {item.get('action')}: {item.get('agent')} old_source={item.get('old_source')} new_source={item.get('new_source')} reason={item.get('reason')}")
+PY
 python3 - "$APPLY_JSON" <<'PY'
 import json, sys
 payload = json.loads(sys.argv[1])

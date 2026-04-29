@@ -118,9 +118,10 @@ bridge_isolation_v2_marker_value_safe() {
   #   - double-quoted token: same content set
   # Anything else is rejected.
   local v="$1"
+  [[ "$v" == *\\* ]] && return 1
   case "$v" in
-    *'$('*|*'$<'*|*'$>'*|*'$['*|*'$\\'*|*'`'*|*';'*|*'&'*|*'|'* \
-      |*'>'*|*'<'*|*'\\'*|*$'\n'*|*$'\r'*|*'*'*|*'?'*|*'~'* )
+    *'$('*|*'$<'*|*'$>'*|*'$['*|*'`'*|*';'*|*'&'*|*'|'* \
+      |*'>'*|*'<'*|*$'\n'*|*$'\r'*|*'*'*|*'?'*|*'~'* )
       return 1
       ;;
   esac

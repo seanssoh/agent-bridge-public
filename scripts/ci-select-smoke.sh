@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade telegram-relay telegram-relay-plugin telegram-relay-setup
+  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation telegram-relay telegram-relay-plugin telegram-relay-setup
 }
 
 add_all_integration() {
@@ -193,7 +193,7 @@ select_for_path() {
       ;;
 
     bridge-start.sh|bridge-run.sh|bridge-send.sh|bridge-action.sh|bridge-agent.sh|agent-bridge|agb|lib/bridge-tmux.sh|lib/bridge-session-patterns.sh)
-      add_required launch tmux-injection
+      add_required launch tmux-injection upgrade-source-preservation
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -225,7 +225,7 @@ select_for_path() {
       ;;
 
     bridge-upgrade.sh|bridge-upgrade.py|scripts/export-public-snapshot.sh|VERSION)
-      add_required upgrade
+      add_required upgrade upgrade-source-preservation
       add_integration integration-minimal
       ;;
 

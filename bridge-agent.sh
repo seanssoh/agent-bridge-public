@@ -14,6 +14,7 @@ Usage:
   $(basename "$0") create <agent> [options]
   $(basename "$0") list [--json]
   $(basename "$0") show <agent> [--json]
+  $(basename "$0") reclassify [--agent <agent>] [--apply] [--json]
   $(basename "$0") start <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
   $(basename "$0") safe-mode <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
   $(basename "$0") stop <agent>
@@ -54,6 +55,7 @@ Examples:
   $(basename "$0") create ops --engine claude --channels plugin:discord@claude-plugins-official --discord-channel 123456789012345678 --json
   $(basename "$0") list --json
   $(basename "$0") show reviewer --json
+  $(basename "$0") reclassify --apply
   $(basename "$0") start reviewer --dry-run
   $(basename "$0") restart reviewer --attach
   $(basename "$0") safe-mode reviewer --attach
@@ -582,6 +584,7 @@ bridge_write_role_block() {
   local always_on="${15}"
   local isolation_mode="${16:-}"
   local os_user="${17:-}"
+  local replace_existing="${18:-0}"
 
   bridge_agent_manage_python \
     "$BRIDGE_ROSTER_LOCAL_FILE" \
@@ -601,10 +604,12 @@ bridge_write_role_block() {
     "$continue_mode" \
     "$always_on" \
     "$isolation_mode" \
-    "$os_user" <<'PY'
+    "$os_user" \
+    "$replace_existing" <<'PY'
 from pathlib import Path
 import shlex
 import sys
+import re
 
 (
     path_str,
@@ -625,6 +630,7 @@ import sys
     always_on,
     isolation_mode,
     os_user,
+    replace_existing,
 ) = sys.argv[1:]
 
 path = Path(path_str)
@@ -635,7 +641,7 @@ else:
 
 begin = f"# BEGIN AGENT BRIDGE MANAGED ROLE: {agent}"
 end = f"# END AGENT BRIDGE MANAGED ROLE: {agent}"
-if begin in text or end in text:
+if replace_existing != "1" and (begin in text or end in text):
     raise SystemExit(f"managed block already exists for {agent}: {path}")
 
 def sq(value: str) -> str:
@@ -648,6 +654,7 @@ lines = [
     f'BRIDGE_AGENT_ENGINE["{agent}"]={sq(engine)}',
     f'BRIDGE_AGENT_SESSION["{agent}"]={sq(session)}',
     f'BRIDGE_AGENT_WORKDIR["{agent}"]={sq(workdir)}',
+    f'BRIDGE_AGENT_SOURCE["{agent}"]="static"',
     f'BRIDGE_AGENT_LAUNCH_CMD["{agent}"]={sq(launch_cmd)}',
 ]
 if profile_home:
@@ -680,16 +687,181 @@ if os_user:
 lines.append(end)
 
 block = "\n".join(lines) + "\n"
-if text and not text.endswith("\n"):
-    text += "\n"
-if text and not text.endswith("\n\n"):
-    text += "\n"
-text += block
+if begin in text or end in text:
+    pattern = re.compile(
+        rf"^# BEGIN AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n.*?^# END AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n?",
+        flags=re.MULTILINE | re.DOTALL,
+    )
+    if not pattern.search(text):
+        raise SystemExit(f"managed block is malformed for {agent}: {path}")
+    text = pattern.sub(block, text)
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if text and not text.endswith("\n\n"):
+        text += "\n"
+    text += block
 
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(text, encoding="utf-8")
 print(path)
 PY
+}
+
+bridge_agent_session_type_from_home() {
+  local agent="$1"
+  local path=""
+  local line=""
+
+  for path in \
+      "$(bridge_agent_workdir "$agent")/SESSION-TYPE.md" \
+      "$(bridge_agent_default_home "$agent")/SESSION-TYPE.md" \
+      "$BRIDGE_AGENT_HOME_ROOT/$agent/SESSION-TYPE.md"; do
+    [[ -f "$path" ]] || continue
+    line="$(grep -E 'Session Type:[[:space:]]*[A-Za-z0-9._-]+' "$path" 2>/dev/null | head -n 1 || true)"
+    if [[ "$line" =~ Session[[:space:]]+Type:[[:space:]]*([A-Za-z0-9._-]+) ]]; then
+      printf '%s' "${BASH_REMATCH[1]}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+bridge_agent_canonical_dir() {
+  local path="$1"
+  if [[ -d "$path" ]]; then
+    (cd -P "$path" && pwd -P)
+  else
+    printf '%s' "$path"
+  fi
+}
+
+bridge_agent_has_static_admin_shape() {
+  local agent="$1"
+  local workdir=""
+  local default_home=""
+  local legacy_home=""
+  local session_type=""
+
+  [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 1
+  session_type="$(bridge_agent_session_type_from_home "$agent" 2>/dev/null || true)"
+  [[ "$session_type" == "admin" ]] || return 1
+
+  workdir="$(bridge_agent_canonical_dir "$(bridge_expand_user_path "$(bridge_agent_workdir "$agent")")")"
+  default_home="$(bridge_agent_canonical_dir "$(bridge_expand_user_path "$(bridge_agent_default_home "$agent")")")"
+  legacy_home="$(bridge_agent_canonical_dir "$(bridge_expand_user_path "$BRIDGE_AGENT_HOME_ROOT/$agent")")"
+  [[ -n "$workdir" && ( "$workdir" == "$default_home" || "$workdir" == "$legacy_home" ) ]] || return 1
+
+  [[ -f "$workdir/SOUL.md" || -f "$default_home/SOUL.md" || -f "$legacy_home/SOUL.md" ]] || return 1
+  return 0
+}
+
+bridge_roster_local_mentions_agent() {
+  local agent="$1"
+  local file="$BRIDGE_ROSTER_LOCAL_FILE"
+
+  bridge_agent_manage_python "$file" "$agent" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+agent = sys.argv[2]
+text = path.read_text(encoding="utf-8", errors="ignore") if path.exists() else ""
+patterns = [
+    rf"^# BEGIN AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}$",
+    rf"^BRIDGE_AGENT_[A-Z_]+\[[\"']{re.escape(agent)}[\"']\]=",
+]
+raise SystemExit(0 if any(re.search(pattern, text, re.M) for pattern in patterns) else 1)
+PY
+}
+
+bridge_roster_local_upsert_scalar() {
+  local key="$1"
+  local value="$2"
+  local file="$BRIDGE_ROSTER_LOCAL_FILE"
+
+  bridge_agent_manage_python "$file" "$key" "$value" <<'PY'
+from pathlib import Path
+import re
+import shlex
+import sys
+
+path = Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+text = path.read_text(encoding="utf-8") if path.exists() else "#!/usr/bin/env bash\n# shellcheck shell=bash disable=SC2034\n"
+rendered = f"{key}={shlex.quote(value)}"
+pattern = re.compile(rf"^{re.escape(key)}=.*$", flags=re.MULTILINE)
+if pattern.search(text):
+    text = pattern.sub(rendered, text)
+else:
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += rendered + "\n"
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(text, encoding="utf-8")
+PY
+}
+
+bridge_agent_reclassify_static_admin() {
+  local agent="$1"
+  local old_source="$2"
+  local reason="$3"
+  local description engine session workdir profile_home launch_cmd channels discord_channel
+  local notify_kind notify_target notify_account loop_mode continue_mode always_on isolation_mode os_user
+
+  description="$(bridge_agent_desc "$agent")"
+  [[ -n "$description" ]] || description="$agent static admin role"
+  engine="$(bridge_agent_engine "$agent")"
+  session="$(bridge_agent_session "$agent")"
+  [[ -n "$session" ]] || session="$agent"
+  workdir="$(bridge_expand_user_path "$(bridge_agent_workdir "$agent")")"
+  profile_home="$(bridge_expand_user_path "$(bridge_agent_profile_home "$agent")")"
+  launch_cmd="$(bridge_agent_launch_cmd_raw "$agent")"
+  [[ -n "$launch_cmd" ]] || launch_cmd="$(bridge_agent_default_launch_cmd "$engine")"
+  channels="$(bridge_agent_channels_csv "$agent")"
+  discord_channel="$(bridge_agent_discord_channel_id "$agent")"
+  notify_kind="$(bridge_agent_notify_kind "$agent")"
+  notify_target="$(bridge_agent_notify_target "$agent")"
+  notify_account="$(bridge_agent_notify_account "$agent")"
+  loop_mode="$(bridge_agent_loop "$agent")"
+  continue_mode="$(bridge_agent_continue "$agent")"
+  always_on=0
+  [[ "$(bridge_agent_idle_timeout "$agent")" == "0" ]] && always_on=1
+  isolation_mode="$(bridge_agent_isolation_mode "$agent")"
+  os_user="$(bridge_agent_os_user "$agent")"
+
+  bridge_write_role_block \
+    "$agent" \
+    "$description" \
+    "$engine" \
+    "$session" \
+    "$workdir" \
+    "$profile_home" \
+    "$launch_cmd" \
+    "$channels" \
+    "$discord_channel" \
+    "$notify_kind" \
+    "$notify_target" \
+    "$notify_account" \
+    "$loop_mode" \
+    "$continue_mode" \
+    "$always_on" \
+    "$isolation_mode" \
+    "$os_user" \
+    1 >/dev/null
+
+  BRIDGE_AGENT_SOURCE["$agent"]="static"
+  if [[ -z "${BRIDGE_ADMIN_AGENT_ID:-}" ]]; then
+    bridge_roster_local_upsert_scalar "BRIDGE_ADMIN_AGENT_ID" "$agent"
+    BRIDGE_ADMIN_AGENT_ID="$agent"
+  fi
+  bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "agent_source_reclassified" "$agent" \
+    --detail old_source="$old_source" \
+    --detail new_source=static \
+    --detail reason="$reason" >/dev/null 2>&1 || true
 }
 
 emit_create_json() {
@@ -1048,6 +1220,105 @@ PY
     printf 'session_health:\n'
     bridge_agent_session_guidance_text "$agent" | sed 's/^/  /'
   done <<<"$output"
+}
+
+run_reclassify() {
+  local selected_agent=""
+  local apply=0
+  local json_mode=0
+  local agent=""
+  local old_source=""
+  local action=""
+  local reason=""
+  local workdir=""
+  local rows=$'agent\told_source\tnew_source\taction\treason\tworkdir\n'
+  local count=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --agent)
+        [[ $# -ge 2 ]] || bridge_die "--agent 뒤에 값을 지정하세요."
+        selected_agent="$2"
+        shift 2
+        ;;
+      --apply)
+        apply=1
+        shift
+        ;;
+      --dry-run)
+        apply=0
+        shift
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      -h|--help)
+        printf 'Usage: %s reclassify [--agent <agent>] [--apply] [--json]\n' "$(basename "$0")"
+        return 0
+        ;;
+      *)
+        bridge_die "지원하지 않는 agent reclassify 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  if [[ -n "$selected_agent" ]]; then
+    bridge_require_agent "$selected_agent"
+  fi
+
+  for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+    if [[ -n "$selected_agent" && "$agent" != "$selected_agent" ]]; then
+      continue
+    fi
+
+    bridge_agent_has_static_admin_shape "$agent" || continue
+    old_source="$(bridge_agent_source "$agent")"
+    action=""
+    reason=""
+    if [[ "$old_source" == "dynamic" ]]; then
+      action="reclassify"
+      reason="static-admin-shape"
+    elif [[ "$old_source" == "static" ]] && ! bridge_roster_local_mentions_agent "$agent"; then
+      action="persist"
+      reason="static-admin-local-preserve"
+    fi
+    [[ -n "$action" ]] || continue
+
+    workdir="$(bridge_agent_workdir "$agent")"
+    rows+="${agent}"$'\t'"${old_source}"$'\t'"static"$'\t'"${action}"$'\t'"${reason}"$'\t'"${workdir}"$'\n'
+    count=$((count + 1))
+
+    if [[ $apply -eq 1 ]]; then
+      bridge_agent_reclassify_static_admin "$agent" "$old_source" "$reason"
+    fi
+  done
+
+  if [[ $json_mode -eq 1 ]]; then
+    bridge_agent_manage_python "$apply" "$rows" <<'PY'
+import csv
+import io
+import json
+import sys
+
+apply = sys.argv[1] == "1"
+rows = list(csv.DictReader(io.StringIO(sys.argv[2]), delimiter="\t"))
+print(json.dumps({"mode": "apply" if apply else "dry-run", "count": len(rows), "candidates": rows}, ensure_ascii=False, indent=2))
+PY
+    return 0
+  fi
+
+  printf 'mode: %s\n' "$([[ $apply -eq 1 ]] && printf apply || printf dry-run)"
+  if [[ $count -eq 0 ]]; then
+    echo "reclassify: no candidates"
+    return 0
+  fi
+
+  while IFS=$'\t' read -r row_agent row_old row_new row_action row_reason row_workdir; do
+    [[ "$row_agent" == "agent" || -z "$row_agent" ]] && continue
+    printf '%s: %s old_source=%s new_source=%s reason=%s workdir=%s\n' \
+      "$row_action" "$row_agent" "$row_old" "$row_new" "$row_reason" "$row_workdir"
+  done <<<"$rows"
 }
 
 run_create() {
@@ -1815,6 +2086,9 @@ case "$subcommand" in
   show)
     run_show "$@"
     ;;
+  reclassify)
+    run_reclassify "$@"
+    ;;
   start)
     run_start "$@"
     ;;
@@ -1848,7 +2122,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create list show start safe-mode stop restart ack-crash forget-session attach compact handoff")"
+      "create list show reclassify start safe-mode stop restart ack-crash forget-session attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;
