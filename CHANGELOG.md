@@ -6,6 +6,43 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.36] — 2026-04-29
+
+### Highlight — context-size auto-compact + telegram-relay daemon phase 1 + admin instruction cleanup
+
+`v0.6.36` lands the longer-tail follow-ups from the same wave that produced v0.6.35. Three of the four open #475 architectural blockers from the Sean / sales_sean Telegram disconnect investigation are now closed (cron cascade in v0.6.35; root-cause polling daemon scaffolding here; admin-side dead-code instructions cleaned up).
+
+- **Setup-time context-size lowering** (#480, closes #473). Each managed Claude agent's `~/.claude/settings.json` now ships with `autoCompactWindow: 400000` as a bridge-managed default. Operator overlays still win — the merge order is `defaults → base → settings.local.json`. Lifecycle hits all three entry points: `agent-bridge agent create`, `bridge-init.sh` admin bootstrap, and `agent-bridge upgrade --apply`. Roster-managed custom workdirs are now treated as shared-settings mode so they pick up the merge without a separate path. The 400k value matches the Claude Code maintainer's public guidance for `[1m]`-variant agents (`autoCompactWindow < 1M`, "400k is a good compromise"); after this PR, Claude Code's *native* auto-compact handles context pressure long before any pane-text pattern would have woken the deprecated daemon-side detector.
+- **Telegram polling relay daemon — Phase 1** (#481, partial close on #475). New `lib/telegram-relay.py` (~785 LOC) is a single-token-owner polling daemon supervised by `bridge-daemon.sh`. Plugin clients become thin RPC clients over a unix socket, eliminating the SIGTERM-and-replace race in the upstream `claude-plugins-official/telegram` plugin at the architectural level. The daemon is **opt-in** via `BRIDGE_TELEGRAM_RELAY_ENABLED=1` (default off) — no live behavior change in this release. Phase 2 (plugin client adapter) and Phase 3 (`bridge-setup.py` wiring + `agent-bridge status` plugin liveness) follow.
+- **Admin role instruction cleanup** (#479, #472 follow-up). `docs/agent-runtime/admin-protocol.md` static-agent maintenance bullet rewritten to make explicit that automatic context-pressure handling is delegated to setup-time context-size lowering (#473) and that `agent-bridge agent compact|handoff <agent>` are now strictly operator-initiated primitives. Closes the docs gap left by #477 deprecating the daemon-driven trigger.
+
+### Setup-time context-size lowering (#480 / #473)
+
+- New `BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS = {"autoCompactWindow": 400000}` constant in `bridge-hooks.py`. Intentionally does NOT set `CLAUDE_CODE_AUTO_COMPACT_WINDOW` env var because Claude Code 2.1.123+ has env-var precedence over settings — setting both would silently override operator overlays.
+- `bridge-hooks.py::cmd_render_shared_settings` merge layering: `merge_settings(BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS, base_payload)` → `merge_settings(merged, overlay_payload)`. Operator overlay (`~/.agent-bridge/.claude/settings.local.json`) ALWAYS wins.
+- `bridge_claude_settings_mode` (`lib/bridge-hooks.sh:55-79`) extended: previously only home-root-managed workdirs were `shared`; now also recognizes roster-managed custom workdirs (path comparison via realpath) as `shared`. New helper `bridge_hook_paths_equal` does the realpath compare via Python.
+- `bridge_ensure_claude_shared_settings_for_managed_workdir` is the single entry point that lifecycle paths now call:
+  - `bridge-agent.sh:1313` — `run_create()` after roster reload, before isolation prep, when engine is claude.
+  - `bridge-init.sh:441-446` — admin bootstrap when not in dry-run and admin engine is claude.
+  - `bridge-upgrade.sh:170-185, 1156-1158` — `bridge_upgrade_propagate_claude_shared_settings` iterates every claude-engine roster agent on `--apply`, never on dry-run.
+- New focused smoke (`scripts/smoke/hooks.sh:+125`): bridge defaults only / base wins over defaults / overlay wins over base+defaults / nested env keys preserve / isolated-root overlay preservation / custom managed workdir symlink behavior. 4 assertion helpers added.
+- Codex agents are unaffected (engine guard on every callsite); they have no `~/.claude/settings.json` to merge into.
+
+### Telegram polling relay daemon Phase 1 (#481 / #475)
+
+- **`lib/telegram-relay.py` (+785 / 0)**: single-instance-per-token polling daemon. Reads bot token from a file (mode-checked, never on argv, never logged). Long-polls Telegram `getUpdates` in one thread, fans out to clients via JSON-line RPC over `~/.agent-bridge/state/channels/telegram/<token-hash>.sock`. RPC verbs: `register {client_id, channel_filter}`, `recv {since_id, timeout_seconds}`, `send_message`, `unregister`, `health`. Per-(client, update_id) dedupe + late-join buffer replay (TTL default 24h, max 1000 entries). Cursor + buffer state under `<token-hash>/`, both protected by `state.lock` flock; buffer persist is ordered BEFORE cursor advance so a crash mid-batch can't lose ack'd updates. SIGHUP token rotation: if the new token's hash differs, daemon emits `telegram_relay_token_rotated` audit + graceful exit (supervisor respawns under new hash); same hash is in-place token reload.
+- **`bridge-daemon.sh +54`**: new supervision section reads token-hash list from `~/.agent-bridge/state/channels/telegram/tokens.list`, ensures one relay per hash, audits `telegram_relay_supervise` on spawn. Default off via `BRIDGE_TELEGRAM_RELAY_ENABLED=1` env knob.
+- **`bridge-telegram-relay.sh +54` + `agent-bridge` route**: operator CLI surface `agent-bridge telegram-relay {start|stop|status|health}`. `start --token-file <path> --foreground` for debugging; `status` lists active relays with PID, socket, cursor, client count; `health --token-hash <hash>` calls daemon's `health` RPC and pretty-prints. Token never accepted on the command line.
+- **`scripts/smoke/telegram-relay.sh +233`**: end-to-end smoke against a fake Telegram HTTP server. Asserts: two clients both receive the same update once (fan-out), `send_message` POSTs `chat_id`/`reply_to_message_id`/`text` correctly, daemon SIGTERMs cleanly within deadline (`wait_for_pid_exit` helper), cursor persisted across restart, late-joining client replays buffered updates within TTL, SIGHUP token rotation emits `telegram_relay_token_rotated` audit with `old_hash`/`new_hash` and the daemon exits 0 instead of running with mismatched state. Plus a separate fault-injection case (`BRIDGE_TELEGRAM_RELAY_FAULT_BUFFER_WRITE=1`) that proves cursor never advances past unwritten buffer state.
+- **Phase 2 / Phase 3 deferred**: plugin client adapter (so `claude-plugins-official/telegram@0.0.6/server.ts` becomes a thin RPC client) and lifecycle wiring (`bridge-setup.py telegram` registers the daemon, `agent-bridge status` shows MCP plugin liveness) ship in follow-up PRs. Until those land, `BRIDGE_TELEGRAM_RELAY_ENABLED=0` and nothing live changes.
+
+### Admin instruction cleanup (#479 / #472 follow-up)
+
+- `docs/agent-runtime/admin-protocol.md:83` (the static-agent maintenance bullet) rewritten to two bullets:
+  1. Automatic context-pressure handling is delegated to setup-time Claude Code context-size lowering (#473). The daemon no longer auto-creates `[context-pressure]` tasks (#472).
+  2. `agent-bridge agent compact|handoff <agent>` remain valid as **operator-initiated** primitives only. Both reject dynamic agents (defense in depth) and write synthetic queue tasks + audit rows on the static path.
+- Single-file doc change; no code or CI surface touched.
+
 ## [0.6.35] — 2026-04-29
 
 ### Highlight — Telegram disconnect mitigation + admin-compact pipeline removal + agent CLAUDE.md slim
