@@ -39,12 +39,52 @@ bridge_hook_shared_settings_effective_file() {
   printf '%s/.claude/settings.effective.json' "$BRIDGE_AGENT_HOME_ROOT"
 }
 
+bridge_hook_paths_equal() {
+  local left="$1"
+  local right="$2"
+
+  bridge_require_python
+  python3 - "$left" "$right" <<'PY'
+import os
+import sys
+
+left = os.path.realpath(sys.argv[1])
+right = os.path.realpath(sys.argv[2])
+print("1" if left == right else "0")
+PY
+}
+
 bridge_claude_settings_mode() {
   local workdir="$1"
+  local agent=""
+  local agent_workdir=""
+
   if [[ "$(bridge_path_is_within_root "$workdir" "$BRIDGE_AGENT_HOME_ROOT")" == "1" ]]; then
     printf 'shared'
+    return 0
+  fi
+
+  if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1; then
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      [[ "$(bridge_agent_engine "$agent" 2>/dev/null || true)" == "claude" ]] || continue
+      agent_workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+      [[ -n "$agent_workdir" ]] || continue
+      if [[ "$(bridge_hook_paths_equal "$workdir" "$agent_workdir")" == "1" ]]; then
+        printf 'shared'
+        return 0
+      fi
+    done
+  fi
+
+  printf 'local'
+}
+
+bridge_ensure_claude_shared_settings_for_managed_workdir() {
+  local workdir="$1"
+  if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
+    bridge_link_claude_settings_to_shared "$workdir"
   else
-    printf 'local'
+    return 0
   fi
 }
 
