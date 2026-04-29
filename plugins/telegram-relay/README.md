@@ -31,54 +31,32 @@ The `.env` file must contain:
 TELEGRAM_BOT_TOKEN=<telegram-bot-token>
 ```
 
-The relay daemon itself expects a raw token file, not dotenv syntax. On startup
-the plugin writes a protected `relay-token` file next to `.env`, registers that
-path in `~/.agent-bridge/state/channels/telegram/tokens.list`, and passes that
-path to daemon autospawn. The token value is never placed on argv.
+The relay daemon itself expects a raw token file, not dotenv syntax. Setup
+writes a protected `relay-token` file next to `.env`, registers that path in
+`~/.agent-bridge/state/channels/telegram/tokens.list`, and enables daemon
+supervision. The token value is never placed on argv.
 
 ## Opt-In Steps
 
-1. Configure the existing Telegram state:
+1. Configure the Telegram state and opt into relay supervision:
 
    ```bash
    agent-bridge setup telegram patch \
      --token "<telegram-bot-token>" \
      --allow-from "<telegram-user-id>" \
      --default-chat "<telegram-chat-id>" \
+     --use-relay \
      --yes
    ```
 
-2. Enable relay daemon supervision in the bridge daemon environment:
+2. Restart or sync the bridge daemon. Setup already writes `.env`,
+   `access.json`, `.telegram/relay-token`, `tokens.list`, the
+   `plugin:telegram-relay@agent-bridge` channel registration, and
+   `BRIDGE_TELEGRAM_RELAY_ENABLED=1`.
 
    ```bash
-   export BRIDGE_TELEGRAM_RELAY_ENABLED=1
-   ```
-
-3. Switch the agent channel from:
-
-   ```text
-   plugin:telegram@claude-plugins-official
-   ```
-
-   to:
-
-   ```text
-   plugin:telegram-relay@agent-bridge
-   ```
-
-4. Until Phase 3 automates setup lifecycle registration, either let the plugin
-   register its generated `relay-token` file automatically with
-   `TELEGRAM_RELAY_REGISTER_TOKEN=1` (default), or add the token hash manually
-   to:
-
-   ```text
-   ~/.agent-bridge/state/channels/telegram/tokens.list
-   ```
-
-5. Optional bootstrap: if the daemon may not already be running, set:
-
-   ```bash
-   export BRIDGE_TELEGRAM_RELAY_AUTOSPAWN=1
+   bash bridge-daemon.sh sync
+   agent-bridge status --json
    ```
 
 ## Tools

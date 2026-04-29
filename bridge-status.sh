@@ -11,7 +11,7 @@ bridge_load_roster
 
 usage() {
   cat <<EOF
-Usage: bash $SCRIPT_DIR/bridge-status.sh [--watch] [--refresh <seconds>] [--open-limit <count>] [--all-agents]
+Usage: bash $SCRIPT_DIR/bridge-status.sh [--watch] [--refresh <seconds>] [--open-limit <count>] [--all-agents] [--json]
 EOF
 }
 
@@ -19,9 +19,14 @@ WATCH_MODE=0
 REFRESH_SECONDS=2
 OPEN_LIMIT=8
 ALL_AGENTS=0
+JSON_MODE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --json)
+      JSON_MODE=1
+      shift
+      ;;
     --watch|--tui)
       WATCH_MODE=1
       shift
@@ -65,6 +70,7 @@ render_once() {
     --roster-snapshot "$roster_snapshot"
     --db "$BRIDGE_TASK_DB"
     --daemon-pid-file "$BRIDGE_DAEMON_PID_FILE"
+    --bridge-state-dir "$BRIDGE_STATE_DIR"
     --audit-log "$BRIDGE_AUDIT_LOG"
     --version "$(bridge_version)"
     --open-limit "$OPEN_LIMIT"
@@ -75,11 +81,18 @@ render_once() {
   if [[ $ALL_AGENTS -eq 1 ]]; then
     status_args+=(--all-agents)
   fi
+  if [[ $JSON_MODE -eq 1 ]]; then
+    status_args+=(--json)
+  fi
 
   bridge_require_python
   python3 "$SCRIPT_DIR/bridge-status.py" "${status_args[@]}"
   rm -f "$roster_snapshot"
 }
+
+if [[ $WATCH_MODE -eq 1 && $JSON_MODE -eq 1 ]]; then
+  bridge_die "--json cannot be combined with --watch"
+fi
 
 if [[ $WATCH_MODE -eq 1 ]]; then
   while true; do
