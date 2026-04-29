@@ -58,7 +58,7 @@ Usage:
   $CLI_NAME bundle <create|show> ...
   $CLI_NAME intake <triage|show> ...
   $CLI_NAME wave <dispatch|list|show|templates|close-issue> ...
-  $CLI_NAME agent <create|list|show|start|safe-mode|stop|restart|attach|compact|handoff> ...
+  $CLI_NAME agent <create|list|show|reclassify|start|safe-mode|stop|restart|attach|compact|handoff> ...
   $CLI_NAME kill <number|all>
   $CLI_NAME attach [number|name]
   $CLI_NAME urgent <agent> "<message>" [--wait <seconds>]
@@ -115,6 +115,7 @@ Usage:
   $CLI_NAME agent create <agent> [--engine claude|codex] [--session <name>] [--workdir <path>] [--always-on] [--dry-run] [--json]
   $CLI_NAME agent list [--json]
   $CLI_NAME agent show <agent> [--json]
+  $CLI_NAME agent reclassify [--agent <agent>] [--apply] [--json]
   $CLI_NAME agent start <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
   $CLI_NAME agent safe-mode <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
   $CLI_NAME agent stop <agent>
@@ -194,6 +195,7 @@ Examples:
   $CLI_NAME agent create reviewer --engine claude
   $CLI_NAME agent list --json
   $CLI_NAME agent show reviewer --json
+  $CLI_NAME agent reclassify --apply
   $CLI_NAME agent start reviewer --dry-run
   $CLI_NAME agent restart reviewer --attach
   $CLI_NAME agent compact static-discord-bot

@@ -174,15 +174,18 @@ source "$INTEG_EXTRACT"
 
 # Stubs for the static-collision branch's roster lookups. The test fixture
 # treats "test-static" as a pre-existing static agent and nothing else.
-declare -gA BRIDGE_AGENT_IDS_MAP=([test-static]=1)
-declare -gA BRIDGE_AGENT_SOURCE=([test-static]=static)
-declare -gA BRIDGE_AGENT_SESSION_ID=([test-static]="")
+declare -gA BRIDGE_AGENT_IDS_MAP=(["test-static"]=1)
+declare -gA BRIDGE_AGENT_SOURCE=(["test-static"]=static)
+declare -gA BRIDGE_AGENT_SESSION_ID=(["test-static"]="")
 declare -gA BRIDGE_AGENT_HISTORY_KEY=()
 declare -gA BRIDGE_AGENT_CREATED_AT=()
 declare -gA BRIDGE_AGENT_UPDATED_AT=()
 
+# shellcheck disable=SC2329
 bridge_agent_exists() { [[ -n "${BRIDGE_AGENT_IDS_MAP[$1]+x}" ]]; }
+# shellcheck disable=SC2329
 bridge_agent_source() { printf '%s' "${BRIDGE_AGENT_SOURCE[$1]:-}"; }
+# shellcheck disable=SC2329
 bridge_add_agent_id_if_missing() { :; }
 
 mk_env_file() {
@@ -282,7 +285,7 @@ rm -rf "$HOME/.claude/projects/$SLUG"
 assert_function_calls_resolver() {
   local file="$1" function_name="$2"
   step "S/${function_name}: function body contains bridge_resolve_resume_session_id (#430 item 2)"
-  python3 - "$file" "$function_name" <<'PY'
+  if python3 - "$file" "$function_name" <<'PY'
 import re
 import sys
 from pathlib import Path
@@ -306,7 +309,11 @@ if "bridge_resolve_resume_session_id" not in body:
     )
     sys.exit(1)
 PY
-  if [[ $? -eq 0 ]]; then ok; else err "missing resolver call in $function_name (see stderr)"; fi
+  then
+    ok
+  else
+    err "missing resolver call in $function_name (see stderr)"
+  fi
 }
 
 assert_function_calls_resolver "$ROOT_DIR/lib/bridge-state.sh" "bridge_load_dynamic_agent_file"
