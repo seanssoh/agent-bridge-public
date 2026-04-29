@@ -6,6 +6,18 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.38] — 2026-04-29
+
+### Highlight — `OPERATOR_ACTIONS_PENDING.md` mechanism
+
+`v0.6.38` ships a small but cross-cutting mechanism so that release-specific operator actions (like v0.6.37's telegram-relay opt-in) reach every install's admin automatically on the next `agent-bridge upgrade --apply`. Without this, the only way a host's admin learns about a per-release action is by reading the changelog; for low-attention hosts the action gets missed indefinitely.
+
+- **`OPERATOR_ACTIONS_PENDING.md`** at source root. Section per release, newest at top. Each section names the version range it applies to (`applies_when_upgrading_from`), the concrete action to run, the skip rule, and a verification target. The first entry is v0.6.37's telegram-relay opt-in (re-key each Telegram-using agent through `agent-bridge setup telegram <agent> --use-relay --yes` and ensure `BRIDGE_TELEGRAM_RELAY_ENABLED=1` is set in the bridge daemon's environment).
+- **`bridge-upgrade.sh`** post-task body now references the file unconditionally. The existing v0.4.0 wiki bootstrap content is preserved; the new reference is appended, not a replacement. Done-note format extended to include an `operator-actions: <summary>` field.
+- **`docs/agent-runtime/admin-protocol.md`** adds a "Post-Upgrade Operator Actions Pending" section that defines the per-section processing rule (`applies_when_upgrading_from` filter, skip rule, done-note summary). admin agents read this on every session start, so the contract is canonical from the next upgrade onward.
+
+After this release, every host that runs `agent-bridge upgrade --apply` receives an `[upgrade-complete]` task whose body points at the checklist; the admin processes each applicable section and reports back in the done note. Future release PRs update `OPERATOR_ACTIONS_PENDING.md` only — the upgrade machinery itself does not need touching again.
+
 ## [0.6.37] — 2026-04-29
 
 ### Highlight — #475 telegram-relay daemon fully wired (Phase 2 + Phase 3)
