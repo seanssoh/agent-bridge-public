@@ -38,6 +38,7 @@ SOURCE_VERSION=""
 SOURCE_REF=""
 SOURCE_HEAD=""
 SOURCE_RECLASSIFY_JSON='{}'
+SHARED_SETTINGS_RERENDER_JSON='{"mode":"skipped","count":0,"failed_count":0,"candidates":[]}'
 
 usage() {
   cat <<EOF
@@ -171,19 +172,8 @@ bridge_upgrade_with_target_env() {
 bridge_upgrade_propagate_claude_shared_settings() {
   local target_root="$1"
 
-  bridge_upgrade_with_target_env "$target_root" "$BRIDGE_BASH_BIN" -lc '
-    set -euo pipefail
-    source "$1/bridge-lib.sh"
-    bridge_load_roster
-    agent=""
-    workdir=""
-    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
-      [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || continue
-      workdir="$(bridge_agent_workdir "$agent")"
-      [[ -n "$workdir" ]] || continue
-      bridge_ensure_claude_shared_settings_for_managed_workdir "$workdir" >/dev/null 2>&1 || true
-    done
-  ' -- "$target_root"
+  bridge_upgrade_with_target_env "$target_root" \
+    "$BRIDGE_BASH_BIN" "$target_root/bridge-agent.sh" rerender-settings --apply --json
 }
 
 bridge_upgrade_collect_agent_restart_report() {
@@ -1165,7 +1155,16 @@ APPLY_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${apply_args[@]}")"
 AGENT_RESTART_JSON="$(bridge_upgrade_agent_restart_json "" 0 "$DRY_RUN")"
 
 if [[ $DRY_RUN -eq 0 ]]; then
-  bridge_upgrade_propagate_claude_shared_settings "$TARGET_ROOT" >/dev/null 2>&1 || true
+  SHARED_SETTINGS_RERENDER_JSON="$(bridge_upgrade_propagate_claude_shared_settings "$TARGET_ROOT")"
+  if ! python3 - "$SHARED_SETTINGS_RERENDER_JSON" <<'PY'
+import json
+import sys
+payload = json.loads(sys.argv[1])
+raise SystemExit(0 if int(payload.get("failed_count") or 0) == 0 else 1)
+PY
+  then
+    echo "[bridge-upgrade] WARN: shared Claude settings rerender failed for one or more agents" >&2
+  fi
 fi
 
 if [[ $MIGRATE_AGENTS -eq 1 ]]; then
@@ -1462,10 +1461,11 @@ if [[ $JSON -eq 1 ]]; then
   printf '%s' "$AGENT_RESTART_JSON" >"$_json_payload_dir/agent-restart.json"
   printf '%s' "$CHANNEL_GUARD_JSON" >"$_json_payload_dir/channel-guard.json"
   printf '%s' "$SOURCE_RECLASSIFY_JSON" >"$_json_payload_dir/source-reclassify.json"
+  printf '%s' "$SHARED_SETTINGS_RERENDER_JSON" >"$_json_payload_dir/shared-settings-rerender.json"
   set +e
-  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" <<'PY'
+  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" <<'PY'
 import json, sys
-source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file = sys.argv[1:]
+source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file = sys.argv[1:]
 
 def load_json(path):
     with open(path, encoding="utf-8") as fh:
@@ -1478,6 +1478,7 @@ analysis_payload = load_json(analysis_json_file)
 agent_restart_payload = load_json(agent_restart_json_file)
 channel_guard_payload = load_json(channel_guard_json_file)
 source_reclassify_payload = load_json(source_reclassify_json_file)
+shared_settings_rerender_payload = load_json(shared_settings_rerender_json_file)
 payload = {
     "mode": "upgrade",
     "version": source_version,
@@ -1513,6 +1514,7 @@ payload = {
     "agent_restart": agent_restart_payload,
     "agent_migration": migration_payload,
     "source_reclassify": source_reclassify_payload,
+    "shared_settings_rerender": shared_settings_rerender_payload,
   }
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY
@@ -1561,6 +1563,20 @@ mode = payload.get("mode") or "dry-run"
 print(f"source_reclassify: {count} candidate(s) ({mode})")
 for item in payload.get("candidates") or []:
     print(f"  - {item.get('action')}: {item.get('agent')} old_source={item.get('old_source')} new_source={item.get('new_source')} reason={item.get('reason')}")
+PY
+python3 - "$SHARED_SETTINGS_RERENDER_JSON" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+count = int(payload.get("count") or 0)
+failed = int(payload.get("failed_count") or 0)
+mode = payload.get("mode") or "skipped"
+print(f"shared_settings_rerender: {count} target(s) ({mode}), failed={failed}")
+for item in payload.get("candidates") or []:
+    status = item.get("status") or "unknown"
+    agent = item.get("agent") or "-"
+    changes = item.get("before", item).get("changes") or item.get("changes") or []
+    change_keys = ",".join(str(change.get("key")) for change in changes) or "-"
+    print(f"  - {status}: {agent} changes={change_keys}")
 PY
 python3 - "$APPLY_JSON" <<'PY'
 import json, sys
