@@ -6020,8 +6020,22 @@ assert_contains "$CIRCUIT_BREAKER_OUTPUT" "Circuit breaker opened."
 assert_contains "$CIRCUIT_BREAKER_OUTPUT" "agent-bridge agent safe-mode $CIRCUIT_AGENT"
 CIRCUIT_BROKEN_LAUNCH_FILE="$BRIDGE_STATE_DIR/agents/$CIRCUIT_AGENT/broken-launch"
 [[ -f "$CIRCUIT_BROKEN_LAUNCH_FILE" ]] || die "expected broken-launch state file for $CIRCUIT_AGENT"
-assert_contains "$(cat "$CIRCUIT_BROKEN_LAUNCH_FILE")" "broken launch smoke error"
-assert_contains "$(cat "$CIRCUIT_BROKEN_LAUNCH_FILE")" "agent-bridge agent safe-mode $CIRCUIT_AGENT"
+python3 - "$CIRCUIT_BROKEN_LAUNCH_FILE" "$CIRCUIT_AGENT" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+agent = sys.argv[2]
+assert payload["agent"] == agent, payload
+assert payload["engine"] == "claude", payload
+assert payload["fail_count"] == 3, payload
+assert payload["exit_code"] == 1, payload
+stderr_file = Path(payload["stderr_file"])
+assert stderr_file.exists(), payload
+stderr_text = stderr_file.read_text(encoding="utf-8")
+assert "broken launch smoke error" in stderr_text, stderr_text
+PY
 CIRCUIT_SHOW_JSON="$("$REPO_ROOT/agent-bridge" agent show "$CIRCUIT_AGENT" --json)"
 python3 - "$CIRCUIT_SHOW_JSON" "$CIRCUIT_BROKEN_LAUNCH_FILE" <<'PY'
 import json
