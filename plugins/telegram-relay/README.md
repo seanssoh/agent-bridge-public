@@ -36,23 +36,21 @@ writes a protected `relay-token` file next to `.env`, registers that path in
 `~/.agent-bridge/state/channels/telegram/tokens.list`, and enables daemon
 supervision. The token value is never placed on argv.
 
-## Opt-In Steps
+## Setup Steps
 
-1. Configure the Telegram state and opt into relay supervision:
+Since v0.6.39 the relay path is the default for `agent-bridge setup telegram`. The minimum sequence:
+
+1. Configure the Telegram state. `--use-relay` is the default; pass `--no-relay` only as a transitional escape hatch when a long-running legacy `plugin:telegram@claude-plugins-official` session must be preserved.
 
    ```bash
    agent-bridge setup telegram patch \
      --token "<telegram-bot-token>" \
      --allow-from "<telegram-user-id>" \
      --default-chat "<telegram-chat-id>" \
-     --use-relay \
      --yes
    ```
 
-2. Restart or sync the bridge daemon. Setup already writes `.env`,
-   `access.json`, `.telegram/relay-token`, `tokens.list`, the
-   `plugin:telegram-relay@agent-bridge` channel registration, and
-   `BRIDGE_TELEGRAM_RELAY_ENABLED=1`.
+2. Restart or sync the bridge daemon. Setup already writes `.env`, `access.json`, `.telegram/relay-token`, `tokens.list`, the `plugin:telegram-relay@agent-bridge` channel registration, and `BRIDGE_TELEGRAM_RELAY_ENABLED=1`.
 
    ```bash
    bash bridge-daemon.sh sync

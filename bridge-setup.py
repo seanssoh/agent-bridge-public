@@ -23,11 +23,17 @@ class SetupError(Exception):
     """Raised when setup validation fails with a user-facing message."""
 
 
-TELEGRAM_RELAY_LEGACY_WARN_AFTER = "2026-06-01"
 
 
-def env_flag(name: str) -> bool:
-    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+def env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def plugin_port_range() -> tuple[int, int]:
@@ -886,7 +892,11 @@ def cmd_telegram(args: argparse.Namespace) -> int:
     access_payload = inspected["access_payload"]
     warnings: list[str] = []
     interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.yes
-    use_relay = bool(args.use_relay or env_flag("BRIDGE_TELEGRAM_USE_RELAY"))
+    if args.use_relay is None:
+        env_use_relay = env_flag("BRIDGE_TELEGRAM_USE_RELAY", default=True)
+        use_relay = bool(env_use_relay)
+    else:
+        use_relay = bool(args.use_relay)
 
     result: dict[str, Any] = {
         "agent": args.agent,
@@ -967,9 +977,9 @@ def cmd_telegram(args: argparse.Namespace) -> int:
             warnings.append(
                 f"No default Telegram chat id configured for {args.agent}. Set --default-chat if you want a stable notify/test target."
             )
-        if not use_relay and datetime.now(timezone.utc).date().isoformat() >= TELEGRAM_RELAY_LEGACY_WARN_AFTER:
+        if not use_relay:
             warnings.append(
-                "Telegram relay setup is now recommended. Re-run with --use-relay to avoid Telegram getUpdates polling slot contention."
+                "Telegram relay is now the default; --no-relay opts into the legacy plugin:telegram path. Use only as a transitional escape hatch."
             )
 
         result["token_source"] = token_source or "existing:.telegram/.env"
@@ -1302,7 +1312,20 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_parser.add_argument("--allow-from", action="append", default=[])
     telegram_parser.add_argument("--default-chat", default="")
     telegram_parser.add_argument("--test-chat", default="")
-    telegram_parser.add_argument("--use-relay", action="store_true")
+    relay_group = telegram_parser.add_mutually_exclusive_group()
+    relay_group.add_argument(
+        "--use-relay",
+        dest="use_relay",
+        action="store_true",
+        default=None,
+        help="Use plugin:telegram-relay@agent-bridge (architectural fix from #475 phase 2/3). Default since v0.6.39.",
+    )
+    relay_group.add_argument(
+        "--no-relay",
+        dest="use_relay",
+        action="store_false",
+        help="Use legacy plugin:telegram@claude-plugins-official. Transitional escape hatch only.",
+    )
     telegram_parser.add_argument("--bridge-state-dir", default="")
     telegram_parser.add_argument("--yes", action="store_true")
     telegram_parser.add_argument("--skip-validate", action="store_true")
