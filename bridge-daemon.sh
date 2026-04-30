@@ -1143,6 +1143,7 @@ process_stall_reports() {
       continue
     fi
 
+    [[ "$queued" =~ ^[0-9]+$ ]] || queued=0
     [[ "$claimed" =~ ^[0-9]+$ ]] || claimed=0
     [[ "$active" =~ ^[0-9]+$ ]] || active=0
     [[ "$idle" =~ ^[0-9]+$ ]] || idle=0
@@ -1203,7 +1204,19 @@ process_stall_reports() {
             fi
           fi
           if [[ -n "$classification" ]]; then
-            (( idle >= explicit_idle )) && trigger_stall=1
+            # Issue #496: even after a positive classification, suppress the
+            # trigger when the agent has no real inbox work AND no pending
+            # daily memory refresh. A loop-mode admin agent reached this point
+            # via the `loop_mode=1` clause above, but with a fully drained inbox
+            # (queued=0 claimed=0) the classifier is only matching benign
+            # Claude UI text in the detached pane (transcript wraps, system-
+            # reminder echoes, tool-call results) and fires `[Agent Bridge]:
+            # stall detected` every ~30 min indefinitely. blocked rows are
+            # intentionally excluded -- they are stuck-with-a-reason and the
+            # nudge wording ("continue if work can proceed") does not apply.
+            if (( idle >= explicit_idle )) && (( queued > 0 || claimed > 0 || refresh_pending == 1 )); then
+              trigger_stall=1
+            fi
           elif (( claimed > 0 )) && (( idle >= unknown_idle )) && [[ -n "$excerpt_hash" ]]; then
             classification="unknown"
             trigger_stall=1
@@ -1249,6 +1262,7 @@ process_stall_reports() {
       bridge_audit_log daemon stall_detected "$agent" \
         --detail classification="$classification" \
         --detail idle_seconds="$idle" \
+        --detail queued="$queued" \
         --detail claimed="$claimed" \
         --detail excerpt_hash="$excerpt_hash" \
         --detail matched_line_hash="$matched_line_hash"
