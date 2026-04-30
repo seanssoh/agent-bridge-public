@@ -1203,26 +1203,23 @@ process_stall_reports() {
               excerpt="$(bridge_stall_decode_excerpt "$excerpt_b64")"
             fi
           fi
-          if [[ -n "$classification" ]]; then
-            # Issue #496: even after a positive classification, suppress the
-            # trigger when the agent has no real inbox work. A loop-mode admin
-            # agent reached this point via the `loop_mode=1` clause above, but
-            # with a fully drained inbox (queued=0 claimed=0) the classifier is
-            # only matching benign Claude UI text in the detached pane
-            # (transcript wraps, system-reminder echoes, tool-call results) and
-            # fires `[Agent Bridge]: stall detected` every ~30 min indefinitely.
-            # blocked rows are intentionally excluded -- they are
-            # stuck-with-a-reason and the nudge wording ("continue if work can
-            # proceed") does not apply. refresh_pending is also excluded: it
-            # can stay true for hours on an idle detached agent and would
-            # otherwise re-introduce the same false-positive cycle in a
-            # different shape; daily memory refresh has its own nudge surface
-            # and is not the stall watchdog's responsibility.
-            if (( idle >= explicit_idle )) && (( queued > 0 || claimed > 0 )); then
-              trigger_stall=1
-            fi
-          elif (( claimed > 0 )) && (( idle >= unknown_idle )) && [[ -n "$excerpt_hash" ]]; then
-            classification="unknown"
+          # Issue #496: trust the classifier. The previous `unknown`-fallback
+          # branch fired whenever (claimed > 0 && idle >= unknown_idle &&
+          # excerpt_hash != "") even though the classifier had explicitly
+          # returned an empty classification -- meaning no rate_limit, auth,
+          # network, or interactive_picker pattern matched the captured pane.
+          # Audit-log evidence on the affected host showed 29 spurious fires
+          # across 2026-04-29..2026-04-30 against an attached `patch` admin,
+          # all with classification=unknown, matched_line_hash="", and a
+          # short-lived claimed=1 produced by per-10-min cron ticks
+          # (librarian-watchdog, wiki-mention-scan, etc.) that briefly held
+          # a queue task. The classifier patterns are deliberately narrow
+          # (Issues #161, #264, #329 Track A) so an empty result should be
+          # honored as a hard "not stalled" rather than overridden by a
+          # heuristic that does not actually correlate with being stuck.
+          # Real stalls (rate_limit, auth, network, interactive_picker)
+          # still fire because the classifier still matches them.
+          if [[ -n "$classification" ]] && (( idle >= explicit_idle )); then
             trigger_stall=1
           fi
         fi
