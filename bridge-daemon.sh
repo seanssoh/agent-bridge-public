@@ -1205,16 +1205,20 @@ process_stall_reports() {
           fi
           if [[ -n "$classification" ]]; then
             # Issue #496: even after a positive classification, suppress the
-            # trigger when the agent has no real inbox work AND no pending
-            # daily memory refresh. A loop-mode admin agent reached this point
-            # via the `loop_mode=1` clause above, but with a fully drained inbox
-            # (queued=0 claimed=0) the classifier is only matching benign
-            # Claude UI text in the detached pane (transcript wraps, system-
-            # reminder echoes, tool-call results) and fires `[Agent Bridge]:
-            # stall detected` every ~30 min indefinitely. blocked rows are
-            # intentionally excluded -- they are stuck-with-a-reason and the
-            # nudge wording ("continue if work can proceed") does not apply.
-            if (( idle >= explicit_idle )) && (( queued > 0 || claimed > 0 || refresh_pending == 1 )); then
+            # trigger when the agent has no real inbox work. A loop-mode admin
+            # agent reached this point via the `loop_mode=1` clause above, but
+            # with a fully drained inbox (queued=0 claimed=0) the classifier is
+            # only matching benign Claude UI text in the detached pane
+            # (transcript wraps, system-reminder echoes, tool-call results) and
+            # fires `[Agent Bridge]: stall detected` every ~30 min indefinitely.
+            # blocked rows are intentionally excluded -- they are
+            # stuck-with-a-reason and the nudge wording ("continue if work can
+            # proceed") does not apply. refresh_pending is also excluded: it
+            # can stay true for hours on an idle detached agent and would
+            # otherwise re-introduce the same false-positive cycle in a
+            # different shape; daily memory refresh has its own nudge surface
+            # and is not the stall watchdog's responsibility.
+            if (( idle >= explicit_idle )) && (( queued > 0 || claimed > 0 )); then
               trigger_stall=1
             fi
           elif (( claimed > 0 )) && (( idle >= unknown_idle )) && [[ -n "$excerpt_hash" ]]; then
