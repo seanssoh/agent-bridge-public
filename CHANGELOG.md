@@ -6,6 +6,16 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.6.40] — 2026-04-30
+
+### Highlight — stall watchdog stops false-positive nudges
+
+`v0.6.40` is a single-fix hotfix on top of v0.6.39 that closes #496: idle admin agents (`patch` on the SYRS reference install) were receiving `[Agent Bridge]: stall detected` nudges every ~30 min indefinitely on benign Claude UI scrollback. Audit-log evidence on the affected host showed 29 spurious fires across 2026-04-29..2026-04-30 with `classification=unknown matched_line_hash=""` and a short-lived `claimed=1` produced by per-10-min cron ticks (librarian-watchdog, wiki-mention-scan, etc.) that briefly held a queue task — no actual stall was present.
+
+- **Stall-watchdog `unknown`-fallback removed** (#497). The elif branch in `process_stall_reports()` that auto-classified an agent as `unknown` whenever (`claimed > 0 && idle >= unknown_idle && excerpt_hash != ""`) overrode the classifier's empty result with a heuristic that did not actually correlate with being stuck. The classifier patterns are deliberately narrow (Issues #161, #264, #329 Track A); an empty result is now honored as a hard "not stalled". Real stalls (`rate_limit`, `auth`, `network`, `interactive_picker`) still fire because the classifier still matches them. Defense-in-depth: `queued` is now numerically normalized and included in the `stall_detected` audit detail so future regressions in this area are diagnosable without a separate inbox snapshot.
+
+No operator-side action is required. The fix lands automatically on `agent-bridge upgrade --apply` as part of the daemon restart.
+
 ## [0.6.39] — 2026-04-30
 
 ### Highlight — operator upgrade coverage + v0.6.x migration gaps closed
