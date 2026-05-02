@@ -1215,6 +1215,34 @@ PY
   fi
 fi
 
+# v0.7.0 → v0.7.1 transition cleanup. Idempotent best-effort removal of
+# residual telegram-relay state (env vars, channel entries, state files,
+# per-agent relay-token files). Was the manual job described by
+# docs/proposals/v0.7.0-install-cleanup-verification-prompt.md and
+# docs/proposals/jjujju-migration-prompt.md before v0.7.1.
+RELAY_CLEANUP_JSON=""
+if [[ $DRY_RUN -eq 0 ]]; then
+  set +e
+  RELAY_CLEANUP_JSON="$(python3 "$SOURCE_ROOT/bridge-relay-cleanup.py" \
+    --target-root "$TARGET_ROOT" --json 2>/dev/null)"
+  _relay_cleanup_rc=$?
+  set -e
+  if [[ $_relay_cleanup_rc -ne 0 ]]; then
+    echo "[bridge-upgrade] WARN: telegram-relay residue cleanup helper exited non-zero ($_relay_cleanup_rc); manual cleanup may still be required (see docs/proposals/v0.7.0-install-cleanup-verification-prompt.md)" >&2
+    RELAY_CLEANUP_JSON=""
+  fi
+  if [[ -n "$RELAY_CLEANUP_JSON" ]]; then
+    if python3 - "$RELAY_CLEANUP_JSON" <<'PY' >/dev/null 2>&1
+import json, sys
+raise SystemExit(0 if json.loads(sys.argv[1]).get("any_changes") else 1)
+PY
+    then
+      bridge_audit_log upgrade telegram_relay_residue_cleanup_applied "$TARGET_VERSION" \
+        --detail summary="$RELAY_CLEANUP_JSON" >/dev/null 2>&1 || true
+    fi
+  fi
+fi
+
 if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   if [[ $DRY_RUN -eq 1 ]]; then
     MIGRATION_JSON="$MIGRATION_PREVIEW_JSON"

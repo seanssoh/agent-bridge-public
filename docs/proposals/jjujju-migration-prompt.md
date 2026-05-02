@@ -1,8 +1,15 @@
 # 쭈쭈(jjujju) 호스트 마이그레이션 프롬프트
 
+> **v0.7.1 부터 자동화됨 — 이 프롬프트는 fallback / 수동 검증용**
+>
+> v0.7.1 의 `agent-bridge upgrade --apply` 가 `bridge-relay-cleanup.py` 를 자동으로 실행해서 채널 항목 / 환경변수 / state 파일 / 에이전트별 relay-token 을 한 번에 정리합니다. 일반적인 경우 이 프롬프트를 보낼 필요가 없습니다. 다음 두 경우에만 사용:
+>
+> 1. v0.7.1+ 으로 못 올라가는 호스트 (예: stuck on v0.7.0)
+> 2. v0.7.1 upgrade 가 `[bridge-upgrade] WARN: telegram-relay residue cleanup helper exited non-zero` 를 남기고 끝난 경우 (rare — 보통 권한 문제)
+
 **용도**: PR3(telegram-relay 폐기) 머지 후 쭈쭈 호스트에서 텔레그램 셋업을 공식 Claude Code 플러그인으로 되돌리기 위한 1회성 마이그레이션. Sean이 쭈쭈 admin/세션에 그대로 보내면 됩니다.
 
-**전제 조건**: 쭈쭈 호스트에서 `agent-bridge upgrade --apply`를 먼저 실행해서 v0.7.0 이상으로 올라간 상태여야 합니다 (PR #501 머지 commit `c96860a` 포함).
+**전제 조건**: 쭈쭈 호스트에서 `agent-bridge upgrade --apply`를 먼저 실행해서 v0.7.0 이상으로 올라간 상태여야 합니다 (PR #501 머지 commit `c96860a` 포함). v0.7.1+ 이라면 이 프롬프트 대신 자동 cleanup 결과를 audit 로그에서 확인 (`telegram_relay_residue_cleanup_applied`).
 
 ---
 
