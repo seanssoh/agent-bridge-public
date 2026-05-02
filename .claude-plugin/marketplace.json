@@ -18,14 +18,6 @@
       "tags": ["teams", "messaging", "channel", "mcp"]
     },
     {
-      "name": "telegram-relay",
-      "source": "./plugins/telegram-relay",
-      "description": "Telegram channel for Claude Code through the Agent Bridge polling relay daemon. Opt-in replacement for per-session Telegram polling.",
-      "version": "0.1.0",
-      "category": "messaging",
-      "tags": ["telegram", "relay", "messaging", "channel", "mcp"]
-    },
-    {
       "name": "ms365",
       "source": "./plugins/ms365",
       "description": "Microsoft 365 / Graph API tools for Claude Code with Agent Bridge channel state and disclosure policy integration.",
