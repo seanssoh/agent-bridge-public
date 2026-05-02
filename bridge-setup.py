@@ -25,17 +25,6 @@ class SetupError(Exception):
 
 
 
-def env_flag(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
-    if not raw:
-        return default
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return default
-
-
 def plugin_port_range() -> tuple[int, int]:
     start_raw = os.environ.get("BRIDGE_PLUGIN_PORT_RANGE_START", "").strip() or "39800"
     end_raw = os.environ.get("BRIDGE_PLUGIN_PORT_RANGE_END", "").strip() or "39999"
@@ -105,40 +94,6 @@ def save_text(path: Path, text: str) -> None:
     os.chmod(tmp, 0o600)
     tmp.replace(path)
     os.chmod(path, 0o600)
-
-
-def token_hash_for_value(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
-
-
-def telegram_relay_state_root(bridge_state_dir: str) -> Path:
-    state_dir = bridge_state_dir.strip() or os.environ.get("BRIDGE_STATE_DIR", "").strip()
-    if not state_dir:
-        state_dir = str(Path.home() / ".agent-bridge" / "state")
-    return Path(state_dir).expanduser() / "channels" / "telegram"
-
-
-def register_telegram_relay_token(state_root: Path, token_hash: str, token_file: Path) -> Path:
-    state_root.mkdir(parents=True, exist_ok=True)
-    os.chmod(state_root, 0o700)
-    tokens_file = state_root / "tokens.list"
-    rows: dict[str, str] = {}
-    if tokens_file.exists():
-        for line in tokens_file.read_text(encoding="utf-8").splitlines():
-            if not line.strip() or line.startswith("#"):
-                continue
-            parts = line.split("\t", 1)
-            if len(parts) == 2:
-                rows[parts[0]] = parts[1]
-    rows = {
-        existing_hash: existing_file
-        for existing_hash, existing_file in rows.items()
-        if existing_file != str(token_file) or existing_hash == token_hash
-    }
-    rows[token_hash] = str(token_file)
-    text = "".join(f"{key}\t{value}\n" for key, value in sorted(rows.items()))
-    save_text(tokens_file, text)
-    return tokens_file
 
 
 def load_dotenv(path: Path) -> dict[str, str]:
@@ -700,13 +655,6 @@ def print_telegram_result(result: dict[str, Any], *, stream: Any = sys.stdout) -
         print(f"default_chat: {result['default_chat']}", file=stream)
     else:
         print("default_chat: (unset)", file=stream)
-    if result.get("relay_enabled"):
-        print("relay_enabled: yes", file=stream)
-        print(f"relay_token_file: {result.get('relay_token_file', '')}", file=stream)
-        print(f"relay_token_hash: {result.get('relay_token_hash', '')}", file=stream)
-        print(f"relay_tokens_file: {result.get('relay_tokens_file', '')}", file=stream)
-    else:
-        print("relay_enabled: no", file=stream)
     print(f"write_status: {result['write_status']}", file=stream)
 
     validation = result.get("validation") or {}
@@ -908,21 +856,12 @@ def cmd_telegram(args: argparse.Namespace) -> int:
     access_payload = inspected["access_payload"]
     warnings: list[str] = []
     interactive = sys.stdin.isatty() and sys.stdout.isatty() and not args.yes
-    if args.use_relay is None:
-        env_use_relay = env_flag("BRIDGE_TELEGRAM_USE_RELAY", default=True)
-        use_relay = bool(env_use_relay)
-    else:
-        use_relay = bool(args.use_relay)
 
     result: dict[str, Any] = {
         "agent": args.agent,
         "telegram_dir": str(telegram_dir),
         "env_file": str(inspected["env_path"]),
         "access_file": str(inspected["access_path"]),
-        "relay_enabled": use_relay,
-        "relay_token_file": str(telegram_dir / "relay-token") if use_relay else "",
-        "relay_token_hash": "",
-        "relay_tokens_file": str(telegram_relay_state_root(args.bridge_state_dir) / "tokens.list") if use_relay else "",
         "token_source": "",
         "allow_from": [],
         "default_chat": "",
@@ -993,16 +932,10 @@ def cmd_telegram(args: argparse.Namespace) -> int:
             warnings.append(
                 f"No default Telegram chat id configured for {args.agent}. Set --default-chat if you want a stable notify/test target."
             )
-        if not use_relay:
-            warnings.append(
-                "Telegram relay is now the default; --no-relay opts into the legacy plugin:telegram path. Use only as a transitional escape hatch."
-            )
 
         result["token_source"] = token_source or "existing:.telegram/.env"
         result["allow_from"] = allow_from
         result["default_chat"] = default_chat
-        if use_relay:
-            result["relay_token_hash"] = token_hash_for_value(token)
 
         access_doc = dict(access_payload)
         access_doc["dmPolicy"] = "allowlist"
@@ -1024,15 +957,6 @@ def cmd_telegram(args: argparse.Namespace) -> int:
         telegram_dir.mkdir(parents=True, exist_ok=True)
         save_text(inspected["env_path"], f"TELEGRAM_BOT_TOKEN={token}\n")
         save_json(inspected["access_path"], access_doc)
-        if use_relay:
-            relay_token_file = telegram_dir / "relay-token"
-            relay_state_root = telegram_relay_state_root(args.bridge_state_dir)
-            relay_hash = token_hash_for_value(token)
-            save_text(relay_token_file, token)
-            tokens_file = register_telegram_relay_token(relay_state_root, relay_hash, relay_token_file)
-            result["relay_token_file"] = str(relay_token_file)
-            result["relay_token_hash"] = relay_hash
-            result["relay_tokens_file"] = str(tokens_file)
         result["write_status"] = "ok"
 
         if args.skip_validate:
@@ -1534,20 +1458,6 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_parser.add_argument("--allow-from", action="append", default=[])
     telegram_parser.add_argument("--default-chat", default="")
     telegram_parser.add_argument("--test-chat", default="")
-    relay_group = telegram_parser.add_mutually_exclusive_group()
-    relay_group.add_argument(
-        "--use-relay",
-        dest="use_relay",
-        action="store_true",
-        default=None,
-        help="Use plugin:telegram-relay@agent-bridge (architectural fix from #475 phase 2/3). Default since v0.6.39.",
-    )
-    relay_group.add_argument(
-        "--no-relay",
-        dest="use_relay",
-        action="store_false",
-        help="Use legacy plugin:telegram@claude-plugins-official. Transitional escape hatch only.",
-    )
     telegram_parser.add_argument("--bridge-state-dir", default="")
     telegram_parser.add_argument("--yes", action="store_true")
     telegram_parser.add_argument("--skip-validate", action="store_true")

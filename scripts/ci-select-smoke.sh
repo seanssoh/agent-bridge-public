@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate telegram-relay telegram-relay-plugin telegram-relay-setup mattermost-plugin
+  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate mattermost-plugin
 }
 
 add_all_integration() {
@@ -177,7 +177,7 @@ select_for_path() {
       ;;
 
     bridge-setup.py|bridge-setup.sh|bridge-status.py|bridge-status.sh)
-      add_required telegram-relay-setup queue
+      add_required queue
       add_integration integration-minimal
       ;;
 
@@ -211,16 +211,6 @@ select_for_path() {
 
     .claude-plugin/marketplace.json|plugins/*/.claude-plugin/plugin.json|plugins/*/.mcp.json)
       add_required channel-plugins
-      add_integration integration-minimal
-      ;;
-
-    bridge-telegram-relay.sh|lib/telegram-relay.py)
-      add_required telegram-relay
-      add_integration integration-minimal
-      ;;
-
-    plugins/telegram-relay/*|plugins/telegram-relay/*/*|plugins/telegram-relay/*/*/*)
-      add_required telegram-relay-plugin
       add_integration integration-minimal
       ;;
 

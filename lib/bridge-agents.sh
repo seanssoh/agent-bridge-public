@@ -2979,7 +2979,7 @@ bridge_linux_prepare_agent_isolation() {
       _ch_id="${_ch_id%%@*}"
       case "$_ch_id" in
         discord)  _ch_target="$(bridge_agent_default_discord_state_dir "$agent")"  ;;
-        telegram|telegram-relay) _ch_target="$(bridge_agent_default_telegram_state_dir "$agent")" ;;
+        telegram) _ch_target="$(bridge_agent_default_telegram_state_dir "$agent")" ;;
         teams)    _ch_target="$(bridge_agent_default_teams_state_dir "$agent")"    ;;
         ms365)    _ch_target="$(bridge_agent_default_ms365_state_dir "$agent")"    ;;
         *) continue ;;
@@ -3407,7 +3407,7 @@ bridge_qualify_channel_item() {
   }
 
   case "$item" in
-    plugin:discord@claude-plugins-official|plugin:telegram@claude-plugins-official|plugin:telegram-relay@agent-bridge)
+    plugin:discord@claude-plugins-official|plugin:telegram@claude-plugins-official)
       printf '%s' "$item"
       return 0
       ;;
@@ -3420,7 +3420,7 @@ bridge_qualify_channel_item() {
         printf 'plugin:%s@claude-plugins-official' "$plugin_name"
         return 0
         ;;
-      teams|telegram-relay)
+      teams)
         printf 'plugin:%s@agent-bridge' "$plugin_name"
         return 0
         ;;
@@ -3853,7 +3853,7 @@ bridge_agent_channel_runtime_ready_for_item() {
       [[ -f "$dir/access.json" ]] || return 1
       bridge_env_file_has_any_nonempty_key "$dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN
       ;;
-    plugin:telegram|plugin:telegram@*|plugin:telegram-relay|plugin:telegram-relay@*)
+    plugin:telegram|plugin:telegram@*)
       dir="$(bridge_agent_telegram_state_dir "$agent")"
       [[ -f "$dir/access.json" ]] || return 1
       bridge_env_file_has_any_nonempty_key "$dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN
@@ -3890,7 +3890,7 @@ bridge_channel_provider_for_item() {
     plugin:discord|plugin:discord@*)
       printf '%s' "discord"
       ;;
-    plugin:telegram|plugin:telegram@*|plugin:telegram-relay|plugin:telegram-relay@*)
+    plugin:telegram|plugin:telegram@*)
       printf '%s' "telegram"
       ;;
     plugin:teams|plugin:teams@*)
@@ -3920,7 +3920,7 @@ bridge_channel_state_dir_for_item() {
     plugin:discord|plugin:discord@*)
       bridge_agent_discord_state_dir "$agent"
       ;;
-    plugin:telegram|plugin:telegram@*|plugin:telegram-relay|plugin:telegram-relay@*)
+    plugin:telegram|plugin:telegram@*)
       bridge_agent_telegram_state_dir "$agent"
       ;;
     plugin:teams|plugin:teams@*)
@@ -3949,7 +3949,7 @@ bridge_channel_credentials_status_for_item() {
     plugin:discord|plugin:discord@*)
       bridge_env_file_has_any_nonempty_key "$dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN && printf '%s' "present" || printf '%s' "missing"
       ;;
-    plugin:telegram|plugin:telegram@*|plugin:telegram-relay|plugin:telegram-relay@*)
+    plugin:telegram|plugin:telegram@*)
       bridge_env_file_has_any_nonempty_key "$dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN && printf '%s' "present" || printf '%s' "missing"
       ;;
     plugin:teams|plugin:teams@*)
@@ -4454,9 +4454,6 @@ bridge_plugin_mcp_identity_for_item() {
     plugin:discord|plugin:discord@*)
       printf '%s' "discord"
       ;;
-    plugin:telegram-relay|plugin:telegram-relay@*)
-      printf '%s' "telegram-relay"
-      ;;
     plugin:telegram|plugin:telegram@*)
       printf '%s' "telegram"
       ;;
@@ -4768,8 +4765,7 @@ bridge_agent_runtime_channel_status_reason() {
     fi
   fi
 
-  if bridge_channel_csv_contains "$required" "plugin:telegram" \
-      || bridge_channel_csv_contains "$required" "plugin:telegram-relay"; then
+  if bridge_channel_csv_contains "$required" "plugin:telegram"; then
     telegram_dir="$(bridge_agent_telegram_state_dir "$agent")"
     if [[ ! -f "$telegram_dir/access.json" ]]; then
       printf 'missing Telegram access file under %s (access.json required)' "$telegram_dir"
@@ -4825,9 +4821,7 @@ bridge_agent_channel_setup_guidance() {
   if bridge_channel_csv_contains "$required" "plugin:discord"; then
     printf "\nRun: %s setup discord %s --token <DISCORD_BOT_TOKEN> --channel <DISCORD_CHANNEL_ID>" "$cli" "$agent"
   fi
-  if bridge_channel_csv_contains "$required" "plugin:telegram-relay"; then
-    printf "\nRun: %s setup telegram %s --token <TELEGRAM_BOT_TOKEN> --allow-from <TELEGRAM_USER_ID> --default-chat <TELEGRAM_CHAT_ID> --use-relay" "$cli" "$agent"
-  elif bridge_channel_csv_contains "$required" "plugin:telegram"; then
+  if bridge_channel_csv_contains "$required" "plugin:telegram"; then
     printf "\nRun: %s setup telegram %s --token <TELEGRAM_BOT_TOKEN> --allow-from <TELEGRAM_USER_ID> --default-chat <TELEGRAM_CHAT_ID>" "$cli" "$agent"
   fi
   if bridge_channel_csv_contains "$required" "plugin:teams"; then
@@ -5833,7 +5827,7 @@ bridge_plugin_channel_state_dir() {
     discord)
       bridge_agent_discord_state_dir "$agent"
       ;;
-    telegram|telegram-relay)
+    telegram)
       bridge_agent_telegram_state_dir "$agent"
       ;;
     ms365)

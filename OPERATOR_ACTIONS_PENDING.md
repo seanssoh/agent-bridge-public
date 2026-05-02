@@ -15,6 +15,44 @@ PR, prepend a new section; do not edit older sections in place.
 
 ---
 
+## v0.7.0 — telegram-relay daemon removed (operator action required on relay hosts)
+
+- applies_when_upgrading_from: any version `0.6.37 .. 0.6.x` that registered the relay daemon.
+- urgency: **high** for relay-using hosts (SYRS jjujju and any clones); **none** for hosts that never registered the relay.
+
+### Background
+
+PR3 reverts #475 phases 2/3 (the v0.6.37+ telegram-relay daemon). Outbound Telegram is now the parent agent's responsibility through the official `plugin:telegram@claude-plugins-official`. The cron inbox-only reporting contract from PR1+PR2 makes this clean: cron children write structured inbox tasks; parents forward through their own channel plugin.
+
+The following surface is removed in v0.7.0:
+
+- `agent-bridge telegram-relay <start|stop|status|health>` CLI subcommand (and the underlying `bridge-telegram-relay.sh`).
+- `lib/telegram-relay.py` daemon and the `bridge_telegram_relay_supervise` daemon step.
+- `plugins/telegram-relay/` plugin tree (the bun MCP adapter).
+- `BRIDGE_TELEGRAM_RELAY_ENABLED` env var, `bridge-setup.py telegram --use-relay` / `--no-relay` flags, and the `BRIDGE_TELEGRAM_USE_RELAY` env knob.
+- `state/channels/telegram/tokens.list` and `<token-hash>/` daemon state directories — these become orphaned but are not auto-removed; cleanup is part of the manual migration prompt below.
+- Per-agent `.telegram/.env` and `.telegram/access.json` files are **preserved** — the official `plugin:telegram@claude-plugins-official` still reads them.
+
+### Action — for hosts that registered the relay
+
+The migration is **manual** per Sean's standing instruction (Q-F 2026-05-02). The verbatim prompt to send to the affected agent on the relay host lives at [`docs/proposals/jjujju-migration-prompt.md`](docs/proposals/jjujju-migration-prompt.md). Send it as-is to the relay-host's admin/agent and wait for confirmation before declaring the host migrated.
+
+### Skip if
+
+- The host never registered the relay (`grep BRIDGE_TELEGRAM_RELAY ~/.agent-bridge/agent-roster.local.sh` returns empty AND no relay process was ever supervised).
+- The host doesn't use Telegram at all.
+
+### Verification target
+
+After running the manual migration prompt, the relay-host operator should observe:
+
+- `~/.agent-bridge/state/channels/telegram/tokens.list` is empty or absent.
+- `BRIDGE_AGENT_CHANNELS["<telegram-agent>"]` no longer contains `plugin:telegram-relay@agent-bridge`; it contains `plugin:telegram@claude-plugins-official` instead.
+- `agent-bridge status --json` no longer surfaces a `telegram-relay` plugin entry for that agent.
+- A real Telegram round-trip (cron child → main-session inbox task → parent forwards via official plugin) lands in the operator's chat.
+
+---
+
 ## v0.6.x — cron inbox-only reporting contract (PR1+PR2 — no operator action required)
 
 - applies_when_upgrading_from: any version `<= 0.6.40`.

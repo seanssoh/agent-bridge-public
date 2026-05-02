@@ -139,36 +139,17 @@ Rollback restores:
 
 From `track1_verify_checklist.md` (admin runs this after `--apply`):
 
-## Telegram Relay Plugin Opt-In
+## Telegram Relay Removal (v0.7.0+)
 
-For an existing Telegram agent that should use the relay daemon instead of one
-`getUpdates` poller per Claude session, re-run setup with `--use-relay`:
+The v0.6.37+ telegram-relay daemon was removed in v0.7.0. Telegram outbound
+flows back through `plugin:telegram@claude-plugins-official`, with cron
+children writing structured inbox tasks (PR1+PR2 of the cron inbox-only
+reporting series) and parents forwarding through their own channel plugin.
 
-```sh
-agent-bridge setup telegram <agent> \
-  --token <bot-token> \
-  --allow-from <telegram-user-id> \
-  --default-chat <chat-id> \
-  --use-relay \
-  --yes
-```
-
-Setup keeps the existing `.telegram/.env` and `.telegram/access.json` shape,
-writes `.telegram/relay-token` with mode `0600`, registers the token hash in
-`state/channels/telegram/tokens.list`, switches `BRIDGE_AGENT_CHANNELS` to
-`plugin:telegram-relay@agent-bridge`, and writes
-`BRIDGE_TELEGRAM_RELAY_ENABLED=1` for daemon sync.
-
-Run one daemon sync to start the supervised relay:
-
-```sh
-bash bridge-daemon.sh sync
-agent-bridge status --json
-```
-
-The relay plugin exposes a Telegram-compatible MCP tool surface, but it is not
-identical to `plugin:telegram@claude-plugins-official`. Test the migrated agent
-in a dev session before relying on it for production notification workflows.
+For hosts that previously opted into the relay (e.g. jjujju), see
+[`docs/proposals/jjujju-migration-prompt.md`](../proposals/jjujju-migration-prompt.md)
+and the v0.7.0 entry in [`OPERATOR_ACTIONS_PENDING.md`](../../OPERATOR_ACTIONS_PENDING.md).
+Hosts that never registered the relay require no action.
 
 | Metric | Expected post-state |
 |---|---|
