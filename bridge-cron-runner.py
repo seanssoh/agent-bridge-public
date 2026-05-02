@@ -566,9 +566,18 @@ def emit_legacy_key_audit(request: dict[str, Any], run_id: str, *, target_agent:
     """PR1.3 + PR1.4 + PR1.10 — one-line audit when a job still wires the
     deprecated `allow_channel_delivery`, `disposable_needs_channels`, or
     `payload_kind=agentTurn`. The runner honors none of these for behavior;
-    the audit gives operators a way to find and remove them."""
+    the audit gives operators a way to find and remove them.
+
+    Codex r1 P2 — `lib/bridge-cron.sh` writes both `allow_channel_delivery`
+    and `allow_structured_relay` for every request as a false-default
+    alias, so flagging on key-presence alone fires for normal no-relay
+    jobs. We now flag only the legacy enable-asymmetry: legacy key truthy
+    AND new key falsy (i.e., a request that opted into the deprecated
+    behavior without the new equivalent). Same logic for the other two:
+    only flag when the value is genuinely truthy / agentTurn-shaped.
+    """
     flagged: list[str] = []
-    if "allow_channel_delivery" in request and not request.get("allow_structured_relay"):
+    if bool_flag(request.get("allow_channel_delivery")) and not bool_flag(request.get("allow_structured_relay")):
         flagged.append("allow_channel_delivery")
     if bool_flag(request.get("disposable_needs_channels")):
         flagged.append("disposable_needs_channels")

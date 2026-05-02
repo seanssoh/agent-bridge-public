@@ -304,6 +304,25 @@ def build_job_record(job):
             or metadata.get("disposableDisableMcp")
             or metadata.get("disposable_disable_mcp")
         ),
+        # PR1.2 — per-job override on the default-silent cron reporting
+        # policy. Allowed values per Sean Q-B 2026-05-02:
+        #   default | always_main_session | always_silent
+        # Anything else falls back to `default` at the runner side.
+        "cron_reporting_policy": str(
+            metadata.get("cronReportingPolicy")
+            or metadata.get("cron_reporting_policy")
+            or metadata.get("reportingPolicy")
+            or metadata.get("reporting_policy")
+            or ""
+        ).strip(),
+        # PR1.6 — priority hint for the cron-runner-created inbox task.
+        # Allowed: normal | high | urgent. Default `normal` at runner side.
+        "cron_urgency": str(
+            metadata.get("cronUrgency")
+            or metadata.get("cron_urgency")
+            or metadata.get("urgency")
+            or ""
+        ).strip(),
         "payload_text": payload_text,
         "payload_preview": preview_text(payload_text),
         "raw": job,
@@ -419,6 +438,11 @@ def serialize_record(record, include_payload=False):
         "allow_channel_delivery": record["allow_channel_delivery"],
         "disposable_needs_channels": record["disposable_needs_channels"],
         "disable_mcp": record["disable_mcp"],
+        # PR1.2 / PR1.6 — surface per-job reporting policy + urgency hints
+        # so the dispatch path (`bridge-cron.sh`) can ferry them into the
+        # request JSON consumed by the runner.
+        "cron_reporting_policy": record.get("cron_reporting_policy", ""),
+        "cron_urgency": record.get("cron_urgency", ""),
         "payload_preview": record["payload_preview"],
     }
     if include_payload:
