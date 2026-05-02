@@ -315,7 +315,8 @@ cat >"$sidecar" <<'EOF'
   "needs_human_followup": false,
   "recommended_next_steps": [],
   "artifacts": ["state/memory-daily/test/2026-04-22.json"],
-  "confidence": "medium"
+  "confidence": "medium",
+  "delivery_intent": "silent"
 }
 EOF
 

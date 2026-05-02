@@ -1510,7 +1510,22 @@ def cmd_run(args: argparse.Namespace) -> int:
             job_name=str(request.get("job_name") or ""),
         )
 
-    if error_message or final_state not in {"success", "error", "timed_out"}:
+    # Codex r2 P1 — `silent` must mean "the cron ran, decided nothing was
+    # worth telling the parent, and exited cleanly". Anything else (engine
+    # error, timed-out, structured `status: error`, runner exception,
+    # subagent non-zero exit) MUST surface as `invalid` so the daemon's
+    # existing failure followup path picks it up. Without this guard, a
+    # cron that returns `{"status":"error","delivery_intent":"silent"}`
+    # — or one whose intent is forced to silent by `always_silent` while
+    # the underlying status is error — would be silently dropped by the
+    # daemon's silent/reported gate.
+    child_status_error = str(child_result.get("status", "")).strip().lower() == "error"
+    run_failed = (
+        bool(error_message)
+        or final_state != "success"
+        or child_status_error
+    )
+    if run_failed:
         reporting_decision = "invalid"
     elif delivery_intent == "silent":
         reporting_decision = "silent"
