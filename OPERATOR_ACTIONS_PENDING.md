@@ -15,6 +15,37 @@ PR, prepend a new section; do not edit older sections in place.
 
 ---
 
+## v0.6.x — cron inbox-only reporting contract (PR1+PR2 — no operator action required)
+
+- applies_when_upgrading_from: any version `<= 0.6.40`.
+- urgency: **none** (informational).
+
+### Background
+
+PR1 (#499) and PR2 introduce inbox-only reporting for disposable cron children. The cron-runner now writes a structured `[cron-followup]` inbox task to the cron's parent agent (the configured `target_agent` — usually the operator-attached main session) when a run produces a signal worth surfacing; otherwise the run logs and exits silently. Existing crons default to silent-on-no-signal automatically — no per-job migration needed.
+
+Per-job overrides ship via job metadata (Sean Q-B 2026-05-02):
+
+- `metadata.cronReportingPolicy = default | always_main_session | always_silent` — force a particular reporting outcome regardless of what the child decides.
+- `metadata.cronUrgency = normal | high | urgent` — set the priority of the resulting inbox task.
+
+Operator visibility:
+
+- `agb cron show <job>` now prints `last_reporting_decision`, `last_delivery_intent`, and `last_inbox_task_id` so the cron → inbox → main-session flow is traceable without grepping `state/cron/runs/`. Same trio is in `--format json` and `--format shell` output (`CRON_JOB_LAST_REPORTING_DECISION`, etc.).
+- Parent-agent handling contract lives in [`docs/agent-runtime/common-instructions.md` §"Cron Followup Handling"](docs/agent-runtime/common-instructions.md#cron-followup-handling). The frontmatter parser is `lib/bridge_cron_followup.parse_followup` (Python stdlib only).
+
+### Action
+
+**No operator action required.** Existing crons keep their current behavior; the new contract only activates on the next run. `agb cron list` may show fewer admin-side `[cron-followup]` tasks than before — this is expected and signals the new contract is working. Parent agents now own the absorption / forwarding step.
+
+The PR3 telegram-relay reversal is batched into a separate later release; that one **will** require an operator action on hosts that registered the relay daemon (e.g. jjujju). A self-contained migration prompt for that step lives at `docs/proposals/jjujju-migration-prompt.md` and is not auto-scripted into `agent-bridge upgrade --apply` per Sean Q-F.
+
+### Skip if
+
+- Always skip — informational. The contract activates on the next cron tick after upgrade. No operator action is required, period.
+
+---
+
 ## v0.6.39 — shared Claude hooks now propagated on upgrade (no operator action required)
 
 - applies_when_upgrading_from: any version `<= 0.6.38`.

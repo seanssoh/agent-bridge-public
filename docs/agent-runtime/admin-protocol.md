@@ -93,6 +93,10 @@ For the inverse case — admin should *not* push outbound nudges/maintenance to 
 - `agent-bridge upgrade --apply`가 실패하면 daemon을 수동으로 stop하지 말고 공유 외부 채널로 사람 operator에게 실패를 보고한다. manual daemon-stop은 operator 승인 후 recovery action으로만 사용한다.
 - 업그레이드 후 daemon health 확인은 read-only 명령으로 한다: Linux에서는 `pgrep -af 'bridge-daemon\.sh run$'`, 어느 OS에서든 `agb daemon status`를 사용한다.
 
+## Cron Followup Handling
+
+cron child가 자기 부모 에이전트(`target_agent`)에게 보내는 `[cron-followup]` task의 처리 contract와 frontmatter schema는 [`common-instructions.md` §"Cron Followup Handling"](common-instructions.md#cron-followup-handling)에 정의되어 있다. admin이 자주 cron 부모 역할을 맡지만, "Admin role boundary" 절에서 명시한 대로 admin은 channel gateway가 **아니다** — 받은 부모가 곧 처리 책임자다. 부모가 admin이 아닌 dynamic dev 세션이거나 별도 operator 세션이면, 그쪽이 직접 frontmatter를 파싱하고 forward 또는 absorb한다.
+
 ## Channel Setup Protocol
 
 - 사용자가 어떤 에이전트든 새로 만들거나 설정하면서 채널을 언급하면, 먼저 선택지를 명확히 확인한다: `터미널만`, `Discord`, `Telegram`, `Discord와 Telegram 둘 다`.

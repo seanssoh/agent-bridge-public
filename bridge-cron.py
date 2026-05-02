@@ -277,6 +277,17 @@ def build_job_record(job):
         "consecutive_errors": consecutive_errors,
         "last_duration_ms": state.get("lastDurationMs"),
         "last_delivery_status": state.get("lastDeliveryStatus") or "-",
+        # PR2 — surface the cron-runner reporting trio so `agb cron show`
+        # / `agb cron list --json` can trace cron → inbox → main-session
+        # without the operator grepping `state/cron/runs/<run-id>/`.
+        # Absence stays as None at this layer (Codex PR #500 r1 P2 #1):
+        # JSON consumers must distinguish "never ran" (`null`) from a
+        # legitimate "-" value, and `render_shell` already maps `None` →
+        # empty string. The "-" fallback is applied only in the human
+        # text renderer (`print_show`).
+        "last_reporting_decision": state.get("lastReportingDecision") or None,
+        "last_delivery_intent": state.get("lastDeliveryIntent") or None,
+        "last_inbox_task_id": state.get("lastInboxTaskId"),
         "session_target": job.get("sessionTarget", "-"),
         "wake_mode": job.get("wakeMode", "-"),
         "payload_kind": payload.get("kind", "-"),
@@ -429,6 +440,12 @@ def serialize_record(record, include_payload=False):
         "consecutive_errors": record["consecutive_errors"],
         "last_duration_ms": record["last_duration_ms"],
         "last_delivery_status": record["last_delivery_status"],
+        # PR2 — inbox-only reporting contract surface; mirrors the trio
+        # written by run_native_finalize(). JSON consumers see the raw
+        # dash-or-value strings just like last_delivery_status.
+        "last_reporting_decision": record["last_reporting_decision"],
+        "last_delivery_intent": record["last_delivery_intent"],
+        "last_inbox_task_id": record["last_inbox_task_id"],
         "session_target": record["session_target"],
         "wake_mode": record["wake_mode"],
         "payload_kind": record["payload_kind"],
@@ -1133,6 +1150,35 @@ def run_native_finalize(args):
     if duration_ms is not None:
         job_state["lastDurationMs"] = duration_ms
 
+    # PR2 — persist the cron-runner reporting trio onto the job state so
+    # `agb cron show` / `agb cron list --json` can trace the most recent
+    # cron → inbox → main flow without grepping `state/cron/runs/`.
+    # Both result.json and status.json carry the trio (PR1's
+    # write_status / result_payload writers); prefer result.json since
+    # the runner finalises that one last and falls back to status.json
+    # for runs that never produced a result.
+    last_reporting_decision = str(
+        result.get("reporting_decision") or status.get("reporting_decision") or ""
+    ).strip()
+    if last_reporting_decision:
+        job_state["lastReportingDecision"] = last_reporting_decision
+    last_delivery_intent = str(
+        result.get("delivery_intent") or status.get("delivery_intent") or ""
+    ).strip()
+    if last_delivery_intent:
+        job_state["lastDeliveryIntent"] = last_delivery_intent
+    last_inbox_task_id = result.get("inbox_task_id")
+    if last_inbox_task_id is None:
+        last_inbox_task_id = status.get("inbox_task_id")
+    if last_inbox_task_id is not None:
+        try:
+            job_state["lastInboxTaskId"] = int(last_inbox_task_id)
+        except (TypeError, ValueError):
+            # Non-int task ids should never reach here under PR1's writer
+            # contract, but if they do we keep the string so the dashboard
+            # can still render *something* identifying the task row.
+            job_state["lastInboxTaskId"] = str(last_inbox_task_id)
+
     if final_status == "success":
         job_state["nextRunAtMs"] = 0
         job_state["consecutiveErrors"] = 0
@@ -1546,6 +1592,12 @@ def print_show(args, records):
     print(f"last_status: {record['last_status']}")
     print(f"consecutive_errors: {record['consecutive_errors']}")
     print(f"last_delivery_status: {record['last_delivery_status']}")
+    # PR2 — human renderer applies the "-" fallback (record keeps None so
+    # JSON / shell consumers can distinguish absence from a legit value).
+    print(f"last_reporting_decision: {record['last_reporting_decision'] or '-'}")
+    print(f"last_delivery_intent: {record['last_delivery_intent'] or '-'}")
+    inbox_task_id = record["last_inbox_task_id"]
+    print(f"last_inbox_task_id: {'-' if inbox_task_id in (None, '', 0) else inbox_task_id}")
     print()
     print("payload:")
     if record["payload_text"]:

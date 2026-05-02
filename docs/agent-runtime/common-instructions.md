@@ -45,10 +45,88 @@ task를 수신하면 아래 순서를 반드시 따른다:
 - **done-note 결과 전달 금지**: 다른 에이전트가 요청자인 경우, 실제 답변/findings를 `done --note`에 묻지 않는다. note는 "<new task id>로 전달함" 포인터만 담고, 본문은 새 task에 있어야 한다.
 - **빈 note done 금지**: `--note` 없이 done 금지.
 - queue의 open status는 `queued`, `claimed`, `blocked`만 공식 상태다. 작업 시작 표시는 별도 `in_progress`가 아니라 `claim` 또는 `--status claimed`를 사용한다.
-- `[cron-followup]`에 `needs_human_followup=true` → 반드시 사용자 채널로 전달 후 done.
+- `[cron-followup]` task의 처리 방식은 [Cron Followup Handling](#cron-followup-handling) 섹션을 따른다. `delivery_intent` 프론트매터가 결정 권한을 가지고, 레거시 `needs_human_followup` 본문은 fallback이다.
 - 인프라 장애 → `agent-bridge urgent <configured-admin-agent> "..."`, 비즈니스 판단 필요 → 사람 채널로 에스컬레이션.
 - 사용자 답이 필요한 질문을 두 번째로 반복하려고 하면, 다시 묻기 전에 `~/.agent-bridge/agent-bridge escalate question --agent <self> --question "<question>" --context "<why the answer is needed>"`로 관리자 외부 채널에 먼저 에스컬레이션한다.
 - 15분 이상 blocked → `agb update <task_id> --status blocked --note "사유"`.
+
+## Cron Followup Handling
+
+이 섹션은 cron child가 자기 부모 에이전트(`target_agent`, 보통 admin / operator-attached main session)에게 보내는 `[cron-followup]` task를 어떻게 처리하는지 정의한다. cron child 자체는 외부 채널로 직접 보내지 않는다 — 부모 세션이 단일 user-facing 출구다 ([`ARCHITECTURE.md`](../../ARCHITECTURE.md) "Cron reporting contract" 참조).
+
+**이 섹션은 부모 에이전트(parent of a cron) 책임이다.** admin이 자주 부모 역할을 맡지만, `target_agent`가 admin이 아닌 dynamic dev 세션이거나 별도 operator 세션일 수도 있다. admin은 channel gateway가 **아니다** ([`admin-protocol.md`](admin-protocol.md) "Admin role boundary" 참조). 받는 쪽이 곧 처리하는 쪽이다.
+
+### Title 형식
+
+PR1이 발행하는 두 가지 형식은 다음과 같다:
+
+- `[cron-followup] <job_name> [main_session_only]` — refresh-by-job (이전 동일 job의 open task가 있으면 in-place 갱신).
+- `[cron-followup] <job_name> (run=<run_id>)` — per-run (alert는 매 발행마다 독립 task).
+
+### Body 구조 (PR1 frontmatter contract)
+
+Task body는 strict JSON-frontmatter 다음에 markdown body가 따라온다:
+
+```
+---
+{
+  "schema_version": 1,
+  "kind": "cron-followup",
+  "delivery_intent": "silent | main_session_only | forward_to_user",
+  "run_id": "...",
+  "job_id": "...",
+  "job_name": "...",
+  "family": "...",
+  "target_agent": "<parent agent>",
+  "reporting_policy": "default | always_main_session | always_silent",
+  "forward_target": { "channel": "...", "target_ref": "...", "format": "..." },
+  "summary_short": "<≤200 chars>",
+  "legacy_structured_relay": true
+}
+---
+
+# [cron-followup] <job-name>
+... markdown body ...
+```
+
+`forward_target`은 `delivery_intent = forward_to_user`일 때만 존재한다. `summary_short`는 `delivery_intent != silent`일 때 항상 채워진다. `legacy_structured_relay`는 deprecated `allow_channel_delivery` alias로 들어온 job에서만 `true`로 설정된다.
+
+### 처리 알고리즘
+
+1. inbox에서 `[cron-followup]`로 시작하는 title을 만나면 body의 frontmatter를 `lib/bridge_cron_followup.parse_followup(body_text)`로 파싱한다 (Python stdlib only — PyYAML 불필요).
+2. parser가 `None`을 반환하면 (frontmatter 누락, schema_version 불일치, malformed) **legacy followup으로 간주**한다 — body의 prose를 직접 읽고 `needs_human_followup` 류 단서로 판단한다. 이는 PR1 이전 cron이나 외부에서 손으로 만든 task를 막지 않기 위한 fallback이다.
+3. parser가 dict를 반환하면 `delivery_intent`로 분기한다.
+
+#### `delivery_intent = main_session_only`
+
+- markdown body를 읽고 모니터에 대한 내부 모델을 갱신한다. 사용자 채널로 보내지 **않는다**.
+- task 닫기: `agb done <id> --note "decision: absorbed"`.
+- 같은 job이 다시 발행되면 PR1의 refresh-by-job dedupe로 동일 task가 in-place 갱신된다 — 즉 absorbed 후에도 task가 계속 열려 있을 수 있다는 사실이 정상 흐름이다 (다음 run이 update 권한을 갖기 위함).
+
+#### `delivery_intent = forward_to_user`
+
+- `forward_target.channel`을 자기 routing config에 매핑한다. 매핑 소스는 자기 에이전트의 `settings.local.json` `enabledPlugins`와 `agent-roster.local.sh`에 기존 등록된 channel binding이다 (Sean Q-A 2026-05-02). 새 routing config schema를 발명하지 않는다.
+- `forward_target.target_ref`는 chat id나 webhook URL이 **아니다** — 논리 이름이다 (예: `"ops"`, `"oncall"`). 부모 에이전트가 이 이름을 자기 plugin 설정에서 실제 chat id / channel id로 풀어낸다.
+- `forward_target.format`이 `markdown`이면 markdown body 그대로 보낸다. `text`면 markdown 포매팅을 떼고 plain text로 보낸다.
+- 정식 channel plugin (`plugin:telegram@claude-plugins-official` / `plugin:discord@...` 등) 으로 전달한다. cron child가 직접 접근하는 경로는 PR1에서 차단됐다.
+- task 닫기: `agb done <id> --note "decision: forwarded channel=<ch> ts=<iso>"`.
+
+#### `delivery_intent = silent`
+
+- runner는 silent 결정 시 inbox task를 만들지 않으므로 이 case가 부모에 닿는 일은 정상적으로 없어야 한다. 닿았다면 노이즈로 보고 그냥 닫는다: `agb done <id> --note "decision: silent (no-op)"`.
+
+### routing 실패 시
+
+- `forward_target.target_ref`가 자기 routing config에 없으면 직접 보내려 시도하지 않는다. task를 `blocked` 상태로 넘기고 `--note "forward routing missing: <target_ref>"`로 표면화한다.
+- enabled channel plugin이 없는데 `forward_to_user`를 받았다면 동일한 `blocked` 처리. operator가 채널 setup 후 다시 처리하도록 둔다.
+
+### 레거시 task 처리
+
+PR1 이전 또는 손으로 만든 `[cron-followup]` task는 frontmatter가 없을 수 있다. parser가 `None`을 돌리면 prose body를 읽고:
+- `needs_human_followup=true` 류 단서가 있으면 사용자 채널로 전달 후 done.
+- 그렇지 않으면 main_session_only로 간주하고 absorbed 처리.
+
+이 fallback은 PR1 contract migration이 끝날 때까지만 유지된다. 새 cron은 frontmatter를 항상 동봉한다.
 
 ## Autonomy & Anti-Stall
 

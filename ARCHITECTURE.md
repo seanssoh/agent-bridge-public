@@ -137,6 +137,101 @@ If multiple writers need to act on the same git repo, `agent-bridge --prefer new
 
 Metadata for those worktrees is stored in `state/worktrees/`.
 
+## Cron Reporting Contract
+
+Disposable cron children do not own a user-facing channel and never write to one directly. The cron reports through the **inbox-only contract**: the runner emits a structured task to the cron's parent agent (`target_agent`, usually the operator-attached main session), which then decides whether to absorb it silently or forward it through its own channel plugin.
+
+```
+                     ┌──────────────────────────────────────────────┐
+                     │          parent agent (main session)         │
+                     │                                              │
+   external channels │   ↑ Telegram (in/out via official plugin)   │
+   ◀────────────────►│   ↑ Discord  (in/out via official plugin)   │
+                     │   ↑ Mattermost (in/out via plugin)          │
+                     │                                              │
+                     │   ── reads inbox tasks (from cron) ──        │
+                     │   ── routes to channel based on frontmatter ─│
+                     └──────────────────────────────────────────────┘
+                                          ▲
+                                          │ agent-bridge inbox task
+                                          │ (one per non-silent run)
+                                          │ frontmatter: delivery_intent, forward_target, …
+                                          │
+                     ┌──────────────────────────────────────────────┐
+                     │   cron child (claude -p / codex exec)        │
+                     │   - no channel plugins                       │
+                     │   - --strict-mcp-config unconditionally      │
+                     │   - if no signal → log + exit (silent)       │
+                     │   - if signal → write inbox task + exit      │
+                     └──────────────────────────────────────────────┘
+                                          ▲
+                                          │ cron schedule fires
+                                          │ bridge-cron-runner.py
+```
+
+### Result schema (PR1)
+
+`bridge-cron-runner.RESULT_SCHEMA` requires every cron child to declare:
+
+- `delivery_intent`: `silent | main_session_only | forward_to_user`. Required.
+- `summary_short`: required when `delivery_intent != silent`, ≤200 chars.
+- `forward_target`: required when `delivery_intent = forward_to_user`. Object `{channel, target_ref, format}` where `channel ∈ {telegram, discord, mattermost, …}`, `target_ref` is a logical name (not a chat id), `format ∈ {markdown, text}`.
+
+Per-job overrides live on `metadata`:
+
+- `cronReportingPolicy = default | always_main_session | always_silent` — force a particular reporting outcome regardless of what the child decided. The runner demotes any non-success `final_state` to `reporting_decision = invalid` so failures are never silently swallowed (Codex r2 fix on PR #499).
+- `cronUrgency = normal | high | urgent` — priority hint for the resulting inbox task.
+
+### Inbox task contract (PR1 + PR2)
+
+When `delivery_intent != silent`, the runner writes a `[cron-followup]` queue task to `target_agent` with a strict JSON-frontmatter body:
+
+```
+---
+{
+  "schema_version": 1,
+  "kind": "cron-followup",
+  "delivery_intent": "...",
+  "run_id": "...",
+  "job_id": "...",
+  "job_name": "...",
+  "family": "...",
+  "target_agent": "<parent>",
+  "reporting_policy": "default | always_main_session | always_silent",
+  "forward_target": { "channel": "...", "target_ref": "...", "format": "..." },
+  "summary_short": "<≤200 chars>",
+  "legacy_structured_relay": true
+}
+---
+
+# [cron-followup] <job-name>
+... markdown body ...
+```
+
+Parent agents parse this body via `lib/bridge_cron_followup.parse_followup` (Python stdlib only — PyYAML deliberately not used so the consumer matches the runner's stdlib-only constraint). On parse failure the consumer falls back to legacy prose handling — see [`docs/agent-runtime/common-instructions.md` §"Cron Followup Handling"](docs/agent-runtime/common-instructions.md#cron-followup-handling) for the full algorithm.
+
+### Dedupe semantics
+
+Two task title formats encode the dedupe rule:
+
+- `[cron-followup] <job> [main_session_only]` — refresh-by-job. The runner calls `bridge-queue.py find-open --mode refresh-by-job`; if a prior open task exists for the same job, the runner updates the body in place so the parent always sees the *current* state of this monitor (not a backlog of identical absorptions).
+- `[cron-followup] <job> (run=<run_id>)` — per-run. Every distinct human-facing alert lands as a fresh task. The runner *never* overwrites an unread `forward_to_user` task.
+
+### Audit trail
+
+The runner writes the reporting trio to both `result.json` and `status.json` under each `state/cron/runs/<run_id>/`:
+
+- `reporting_decision`: `silent | reported | invalid`
+- `delivery_intent`: same as the child's chosen / policy-overridden intent
+- `inbox_task_id`: queue task id, or `null` for silent runs
+
+`bridge-cron.py:run_native_finalize` mirrors the trio onto the job state (`lastReportingDecision`, `lastDeliveryIntent`, `lastInboxTaskId`) so `agb cron show` and `agb cron list --json` expose the cron → inbox → main flow without grepping run dirs.
+
+The daemon's followup gate (`bridge-daemon.sh` `case "$CRON_REPORTING_DECISION"`) reads the trio via `bridge_cron_load_run_shell`:
+
+- `silent` / `reported` → daemon clears `CRON_NEEDS_HUMAN_FOLLOWUP` (runner already handled or intentionally silent).
+- `invalid` / empty → daemon's existing failure-followup path runs (so a malformed result or missing field is never lost).
+
 ## Configuration Surface
 
 Important environment variables:

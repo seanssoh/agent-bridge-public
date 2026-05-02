@@ -208,6 +208,84 @@ Python으로 빠지는 패턴이 많다.
 
 이 레이어는 "보안 제품"이 아니라 shared-user runtime의 containment/audit layer다.
 
+### 6. cron with reporting
+
+cron은 disposable child가 부모 에이전트(target_agent)에게 inbox-only로 보고하는 contract다. PR1+PR2가 정의한 인터페이스의 핵심:
+
+- 모든 cron child의 result는 `delivery_intent ∈ {silent, main_session_only, forward_to_user}`을 declare해야 한다 — `bridge-cron-runner.RESULT_SCHEMA`가 schema 강제.
+- 부모는 `lib/bridge_cron_followup.parse_followup(body_text)`로 inbox task body의 frontmatter를 파싱하고, 결과 dict의 `delivery_intent`로 absorb / forward / no-op을 결정한다. 자세한 알고리즘은 [`docs/agent-runtime/common-instructions.md` §"Cron Followup Handling"](agent-runtime/common-instructions.md#cron-followup-handling).
+
+새 cron을 추가할 때 reporting을 어떻게 다룰지 결정하는 경로:
+
+기본 동작 — 결정은 child LLM이 매 run마다 결정 (default-silent on no signal):
+
+```bash
+agb cron create --agent <target> --schedule "0 9 * * *" --title "monitor-X" \
+  --payload "<몸통은 cron-runner의 PR1 prompt preamble이 자동 주입>"
+```
+
+per-job override (`metadata.cronReportingPolicy` / `metadata.cronUrgency`)는 PR2 시점에 `agb cron create` CLI flag로 노출되어 있지 않다. 두 가지 supported path:
+
+**(a) 직접 jobs.json 편집** — 가장 직관적. `agb cron create`로 job을 만든 다음, `~/.agent-bridge/cron/jobs.json` (= `$BRIDGE_NATIVE_CRON_JOBS_FILE`, 기본값 `$BRIDGE_HOME/cron/jobs.json`) 을 열어 해당 job의 `metadata` 객체에 키를 추가:
+
+```json
+{
+  "id": "heartbeat-rss-abcd",
+  "name": "heartbeat-rss",
+  "agentId": "agb-dev-claude",
+  "schedule": {"kind": "cron", "expr": "*/15 * * * *", "tz": "UTC"},
+  "payload": {"kind": "text", "text": "..."},
+  "metadata": {
+    "cronReportingPolicy": "always_main_session",
+    "cronUrgency": "urgent"
+  },
+  "state": { ... }
+}
+```
+
+다음 cron tick부터 자동 적용된다. daemon restart 불필요.
+
+**(b) source jobs file로 import** — 여러 job을 한 번에 metadata 포함해서 등록할 때:
+
+```bash
+cat > /tmp/jobs.json <<'EOF'
+{"format":"agent-bridge-cron-v1","jobs":[
+  {"id":"hb","name":"heartbeat-rss","agentId":"<target>","enabled":true,
+   "schedule":{"kind":"cron","expr":"*/15 * * * *","tz":"UTC"},
+   "payload":{"kind":"text","text":"check feed"},
+   "metadata":{"cronReportingPolicy":"always_main_session","cronUrgency":"urgent"}}
+]}
+EOF
+agb cron import --source-jobs-file /tmp/jobs.json --dry-run   # 먼저 dry-run으로 결과 확인
+agb cron import --source-jobs-file /tmp/jobs.json
+```
+
+허용 값:
+
+- `cronReportingPolicy`: `default | always_main_session | always_silent` (Sean Q-B 2026-05-02). 다른 값은 runner에서 `default`로 fallback.
+- `cronUrgency`: `normal | high | urgent`. default `normal`.
+
+(`agb cron create --metadata key=value` flag는 후속 follow-up PR으로 검토 중. PR2는 doc + helper만 다루고 CLI surface는 확장하지 않음.)
+
+운영 중 디버깅 — `agb cron show <job>`이 직접 마지막 run의 trio를 보여준다:
+
+```bash
+agb cron show <job>
+# ...
+# last_status: success
+# last_reporting_decision: reported     # silent | reported | invalid
+# last_delivery_intent: main_session_only
+# last_inbox_task_id: 12345             # parent의 inbox에서 이 id로 찾을 수 있음
+```
+
+`--format json` / `--format shell` 출력에도 같은 trio가 들어간다 (`CRON_JOB_LAST_REPORTING_DECISION`, `CRON_JOB_LAST_DELIVERY_INTENT`, `CRON_JOB_LAST_INBOX_TASK_ID`). 자세한 schema와 dedupe semantics, daemon gate 동작은 [`ARCHITECTURE.md` "Cron reporting contract"](../ARCHITECTURE.md#cron-reporting-contract).
+
+PR1+PR2 분리에서 자주 헷갈리는 지점:
+
+- runner는 silent 또는 schema-required-fail (`reporting_decision = invalid`) 시 inbox task를 **만들지 않는다**. 따라서 부모가 `[cron-followup]`을 받았다는 것 자체가 "non-silent intent로 결정됐고 schema가 통과했다"는 뜻이다.
+- 부모는 frontmatter parser가 `None`을 돌려도 죽지 않고 legacy prose handling으로 fallback한다 — PR1 이전 cron이나 손으로 만든 task를 위함이다.
+- daemon은 `reporting_decision`이 `silent` 또는 `reported`면 자기 followup 경로를 **suppress**하고, `invalid` 또는 빈 값이면 기존 failure-followup 경로를 그대로 돌린다. 즉 schema-required-fail은 반드시 사람에게 surface된다.
+
 ## 6. 개발할 때의 기본 작업 흐름
 
 ### 상태 파악
