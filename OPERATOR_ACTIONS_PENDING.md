@@ -15,6 +15,34 @@ PR, prepend a new section; do not edit older sections in place.
 
 ---
 
+## v0.7.1 — telegram-relay residue auto-cleanup (no operator action required)
+
+- applies_when_upgrading_from: any version `<= 0.7.0`.
+- urgency: **none**.
+
+### Background
+
+v0.7.0 removed the telegram-relay source surface but left it to the operator to clean up live runtime residue (`state/channels/telegram/{tokens.list,*.sock,<token-hash>/}`, per-agent `.telegram/relay-token`, channel entries containing `plugin:telegram-relay@*`, and `BRIDGE_TELEGRAM_RELAY_*` env vars). Two prompts under `docs/proposals/` covered the manual procedure.
+
+v0.7.1 automates the cleanup: `agent-bridge upgrade --apply` now runs `bridge-relay-cleanup.py` after the shared-settings rerender step, removes every residue class above idempotently, and emits a single `telegram_relay_residue_cleanup_applied` audit row when it actually changed something. Re-runs are no-ops. Per-agent `.telegram/.env` and `.telegram/access.json` are preserved — the official plugin still reads them.
+
+### Action
+
+**No operator action required for the common path.** The auto step covers every host that runs `agent-bridge upgrade --apply` to v0.7.1+.
+
+If the auto step exited non-zero (rare — usually a filesystem permissions issue), the upgrader emits a `[bridge-upgrade] WARN: telegram-relay residue cleanup helper exited non-zero` line. In that case, run the manual prompt:
+
+- All hosts: `docs/proposals/v0.7.0-install-cleanup-verification-prompt.md`
+- Relay-host migration (heavier): `docs/proposals/jjujju-migration-prompt.md`
+
+Both prompts are now fallbacks rather than first-line procedures.
+
+### Skip if
+
+- Always skip — informational; the cleanup activates automatically on the first `agent-bridge upgrade --apply` to v0.7.1+.
+
+---
+
 ## v0.7.0 — telegram-relay daemon removed (operator action required on relay hosts)
 
 - applies_when_upgrading_from: any version `0.6.37 .. 0.6.x` that registered the relay daemon.

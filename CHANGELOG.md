@@ -6,6 +6,10 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+### Added
+
+- **Auto telegram-relay residue cleanup at upgrade time.** `agent-bridge upgrade --apply` now runs `bridge-relay-cleanup.py` after the shared-settings rerender step, removing any leftover state from the v0.6.37+ relay daemon that v0.7.0 (#501) deleted the source for: `state/channels/telegram/{tokens.list,*.sock,<token-hash>/}`, per-agent `.telegram/relay-token` files, `BRIDGE_AGENT_CHANNELS["X"]` items containing `plugin:telegram-relay@*` (rewritten to `plugin:telegram@claude-plugins-official`, with unrelated channels preserved), and the `BRIDGE_TELEGRAM_RELAY_ENABLED` / `BRIDGE_TELEGRAM_USE_RELAY` scalar lines in `agent-roster.local.sh`. Stdlib-only Python helper, atomic roster rewrites, idempotent (no-op on a clean host or on re-run). Audit row `telegram_relay_residue_cleanup_applied` is emitted only when `any_changes` is true. Per-agent `.telegram/.env` and `.telegram/access.json` are preserved — the official plugin still reads them. The two operator-prompts under `docs/proposals/` (`v0.7.0-install-cleanup-verification-prompt.md` and `jjujju-migration-prompt.md`) are now fallbacks for hosts where the auto step couldn't run; OPERATOR_ACTIONS_PENDING.md v0.7.1 entry says "no operator action required" for the common path.
+
 ## [0.7.0] — 2026-05-02
 
 ### Highlight — cron inbox-only reporting series ships, telegram-relay daemon removed
