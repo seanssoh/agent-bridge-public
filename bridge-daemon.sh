@@ -3086,6 +3086,21 @@ cmd_run_cron_worker() {
     fi
   fi
 
+  # PR1.6 — when the cron-runner has already created an inbox task itself
+  # (delivery_intent in {main_session_only, forward_to_user}), skip the
+  # daemon-side followup creation so we don't double-task the parent. The
+  # `silent` decision is also honored — the cron decided not to bother the
+  # parent at all. Legacy cron jobs without a reporting_decision (PR1
+  # rollout, downgrade, manual shim) still flow through the original path.
+  if [[ -n "${CRON_REPORTING_DECISION:-}" ]]; then
+    if [[ "${CRON_INBOX_TASK_ID:-}" =~ ^[0-9]+$ ]]; then
+      daemon_info "cron-runner already wrote inbox task #${CRON_INBOX_TASK_ID} for ${CRON_JOB_NAME:-$run_id} (decision=${CRON_REPORTING_DECISION}); skipping daemon followup"
+    else
+      daemon_info "cron-runner reported decision=${CRON_REPORTING_DECISION} for ${CRON_JOB_NAME:-$run_id}; skipping daemon followup"
+    fi
+    CRON_NEEDS_HUMAN_FOLLOWUP=""
+  fi
+
   if [[ "$CRON_NEEDS_HUMAN_FOLLOWUP" == "1" ]]; then
     followup_body_file="$(bridge_cron_dispatch_followup_file_by_id "$run_id")"
     bridge_cron_write_followup_body "$run_id" "$followup_body_file"

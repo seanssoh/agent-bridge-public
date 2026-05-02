@@ -737,6 +737,19 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 def cmd_find_open(args: argparse.Namespace) -> int:
+    # PR1.7 — `--mode` selector for the cron-followup dedupe contract.
+    #   refresh-by-job (default): the existing prefix-match behavior. Used
+    #     by `delivery_intent=main_session_only` so consecutive runs
+    #     refresh a single open task ("current state of this monitor").
+    #   per-run: always returns nothing. Used by
+    #     `delivery_intent=forward_to_user` so each distinct human-facing
+    #     alert gets its own task and never overwrites an unread one.
+    mode = getattr(args, "mode", "refresh-by-job") or "refresh-by-job"
+    if mode == "per-run":
+        if getattr(args, "all", False):
+            print(json.dumps([], ensure_ascii=False))
+        return 1
+
     params: list[object] = [args.agent]
     sql = """
         SELECT *
@@ -2012,6 +2025,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--all",
         action="store_true",
         help="return all matching open tasks as a JSON array (forces JSON output with created_ts/updated_ts)",
+    )
+    find_open_parser.add_argument(
+        "--mode",
+        choices=("refresh-by-job", "per-run"),
+        default="refresh-by-job",
+        help=(
+            "PR1.7 cron-followup dedupe selector. refresh-by-job (default) "
+            "matches prior open task by title prefix; per-run always "
+            "returns nothing so each distinct alert lands as a new task."
+        ),
     )
     find_open_parser.set_defaults(handler=cmd_find_open)
 

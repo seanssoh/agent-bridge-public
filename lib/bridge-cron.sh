@@ -335,6 +335,12 @@ fields = {
         or request.get("failure_class")
         or "admin-resolvable"
     ).strip().lower() or "admin-resolvable",
+    # PR1.8 — surface the cron-runner reporting decision so the daemon can
+    # gate its own followup-task path. Empty string when the cron-runner
+    # didn't populate the field (legacy / pre-PR1 result.json).
+    "CRON_REPORTING_DECISION": str(result.get("reporting_decision") or status.get("reporting_decision") or "").strip(),
+    "CRON_DELIVERY_INTENT": str(result.get("delivery_intent") or status.get("delivery_intent") or "").strip(),
+    "CRON_INBOX_TASK_ID": str(result.get("inbox_task_id") if result.get("inbox_task_id") is not None else (status.get("inbox_task_id") if status.get("inbox_task_id") is not None else "")),
 }
 
 for key, value in fields.items():
@@ -636,7 +642,12 @@ payload = {
     "job_delivery_mode": job_delivery_mode,
     "job_delivery_channel": job_delivery_channel,
     "job_delivery_target": job_delivery_target,
+    # PR1.4 — `allow_channel_delivery` is the legacy key name. Wire the
+    # new `allow_structured_relay` alongside it so the cron-runner can
+    # read the new name preferentially while existing operator surfaces
+    # (manifest readers, audit consumers) keep seeing the old key.
     "allow_channel_delivery": allow_channel_delivery == "1",
+    "allow_structured_relay": allow_channel_delivery == "1",
     "disposable_needs_channels": disposable_needs_channels == "1",
     "slot": slot,
     "task_id": int(task_id),
@@ -714,7 +725,10 @@ payload = {
     "job_delivery_mode": job_delivery_mode,
     "job_delivery_channel": job_delivery_channel,
     "job_delivery_target": job_delivery_target,
+    # PR1.4 — wire both keys; cron-runner reads `allow_structured_relay`
+    # first and falls back to the legacy name.
     "allow_channel_delivery": allow_channel_delivery == "1",
+    "allow_structured_relay": allow_channel_delivery == "1",
     "disposable_needs_channels": disposable_needs_channels == "1",
     "disable_mcp": disable_mcp == "1",
     "slot": slot,

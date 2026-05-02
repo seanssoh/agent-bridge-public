@@ -7352,6 +7352,10 @@ assert_contains "$CHANNEL_SHELL_OUTPUT" "CRON_JOB_ALLOW_CHANNEL_DELIVERY=1"
 assert_contains "$CHANNEL_SHELL_OUTPUT" "CRON_JOB_DISPOSABLE_NEEDS_CHANNELS=0"
 
 python3 - <<'PY'
+# PR1 (cron inbox-only reporting) — the cron child no longer ever sends
+# to external channels itself, so the prompt preamble talks about
+# `delivery_intent` rather than `channel_relay`, and `--channels` /
+# `apply_channel_runtime_env` paths are gone. Tests reflect that contract.
 import importlib.util
 import subprocess
 from pathlib import Path
@@ -7373,20 +7377,128 @@ request = {
     "target_workdir": str(Path(".").resolve()),
     "target_channels": "plugin:telegram",
     "target_telegram_state_dir": "/tmp/telegram-state",
-    "allow_channel_delivery": True,
+    "allow_structured_relay": True,
     "disposable_needs_channels": False,
     "job_delivery_channel": "telegram",
     "job_delivery_target": "telegram:123",
 }
 prompt = module.build_prompt(request, "send a telegram update")
-assert "Do not send user-facing messages directly from this disposable run." in prompt
-assert "return it as a structured channel_relay object" in prompt
-assert "Target channels: plugin:telegram" in prompt
-assert "Target agent channels are informational routing metadata in this disposable run." in prompt
-env = module.apply_channel_runtime_env(request, {"PATH": "/usr/bin"})
-assert env["TELEGRAM_STATE_DIR"] == "/tmp/telegram-state"
+# PR1.2 — the policy preamble must carry the inbox-only reporting contract.
+assert "Reporting policy" in prompt
+assert "delivery_intent" in prompt
+assert "main_session_only" in prompt
+assert "forward_to_user" in prompt
+# PR1.3 — the cron child has no path to external channels at all, so the
+# prompt does not negotiate about `--channels` or relay tools. The `tester`
+# parent identity must still be surfaced (`<{parent}>`).
+assert "tester" in prompt
+# PR1.4 — when the legacy `allow_structured_relay` flag is on we still
+# acknowledge `channel_relay` as a deprecated fallback.
+assert "Legacy structured relay" in prompt or "channel_relay" in prompt
 
-normalized = module.validate_result(
+# PR1.5 — validate_result rejects results that omit delivery_intent.
+try:
+    module.validate_result(
+        {
+            "status": "completed",
+            "summary": "missing intent",
+            "findings": [],
+            "actions_taken": [],
+            "needs_human_followup": False,
+            "recommended_next_steps": [],
+            "artifacts": [],
+            "confidence": "high",
+        }
+    )
+except ValueError as exc:
+    assert "delivery_intent" in str(exc)
+else:
+    raise AssertionError("expected missing delivery_intent to fail")
+
+# silent-intent results don't need summary_short or forward_target.
+silent = module.validate_result(
+    {
+        "status": "completed",
+        "summary": "routine ok",
+        "findings": [],
+        "actions_taken": [],
+        "needs_human_followup": False,
+        "recommended_next_steps": [],
+        "artifacts": [],
+        "confidence": "high",
+        "delivery_intent": "silent",
+    }
+)
+assert silent["delivery_intent"] == "silent"
+assert "summary_short" not in silent
+assert "forward_target" not in silent
+
+# main_session_only requires summary_short.
+try:
+    module.validate_result(
+        {
+            "status": "completed",
+            "summary": "long summary",
+            "findings": [],
+            "actions_taken": [],
+            "needs_human_followup": True,
+            "recommended_next_steps": [],
+            "artifacts": [],
+            "confidence": "high",
+            "delivery_intent": "main_session_only",
+        }
+    )
+except ValueError as exc:
+    assert "summary_short" in str(exc)
+else:
+    raise AssertionError("expected missing summary_short to fail")
+
+# forward_to_user requires both summary_short and forward_target.
+try:
+    module.validate_result(
+        {
+            "status": "completed",
+            "summary": "alert",
+            "findings": [],
+            "actions_taken": [],
+            "needs_human_followup": True,
+            "recommended_next_steps": [],
+            "artifacts": [],
+            "confidence": "high",
+            "delivery_intent": "forward_to_user",
+            "summary_short": "alert!",
+        }
+    )
+except ValueError as exc:
+    assert "forward_target" in str(exc)
+else:
+    raise AssertionError("expected missing forward_target to fail")
+
+# Happy path: forward_to_user with a complete forward_target.
+forward = module.validate_result(
+    {
+        "status": "completed",
+        "summary": "Disk usage 95% on host A",
+        "findings": ["disk_full"],
+        "actions_taken": [],
+        "needs_human_followup": True,
+        "recommended_next_steps": [],
+        "artifacts": [],
+        "confidence": "high",
+        "delivery_intent": "forward_to_user",
+        "summary_short": "Disk usage 95% on host A",
+        "forward_target": {
+            "channel": "telegram",
+            "target_ref": "ops",
+            "format": "markdown",
+        },
+    }
+)
+assert forward["forward_target"]["channel"] == "telegram"
+assert forward["forward_target"]["target_ref"] == "ops"
+
+# legacy channel_relay is still honored as a deprecated alias.
+legacy = module.validate_result(
     {
         "status": "completed",
         "summary": "relay prepared",
@@ -7396,6 +7508,8 @@ normalized = module.validate_result(
         "recommended_next_steps": [],
         "artifacts": [],
         "confidence": "high",
+        "delivery_intent": "main_session_only",
+        "summary_short": "relay prepared",
         "channel_relay": {
             "body": "hello from relay",
             "transport": "telegram",
@@ -7404,9 +7518,10 @@ normalized = module.validate_result(
         },
     }
 )
-assert normalized["needs_human_followup"] is True
-assert normalized["channel_relay"]["body"] == "hello from relay"
+assert legacy["needs_human_followup"] is True
+assert legacy["channel_relay"]["body"] == "hello from relay"
 
+# PR1.5 — empty relay body is still rejected (legacy semantics preserved).
 try:
     module.validate_result(
         {
@@ -7418,6 +7533,8 @@ try:
             "recommended_next_steps": [],
             "artifacts": [],
             "confidence": "high",
+            "delivery_intent": "main_session_only",
+            "summary_short": "bad relay",
             "channel_relay": {"body": "   "},
         }
     )
@@ -7425,6 +7542,34 @@ except ValueError as exc:
     assert "channel_relay.body" in str(exc)
 else:
     raise AssertionError("expected invalid empty relay body to fail")
+
+# PR1.5 — direct-send markers in forward_target.target_ref or summary_short
+# are detected (audit-only; never raise per Sean Q-C 2026-05-02).
+markers = module.detect_direct_send_markers(
+    {
+        "delivery_intent": "forward_to_user",
+        "summary_short": "alert",
+        "forward_target": {
+            "channel": "telegram",
+            "target_ref": "tg_send chat_id=123",
+            "format": "text",
+        },
+    }
+)
+assert markers, "expected direct-send marker detection on forward_target.target_ref"
+assert markers[0]["field"] == "forward_target.target_ref"
+assert markers[0]["marker"] == "tg_send"
+
+# Markers in `summary` (free-form narrative) are deliberately NOT flagged
+# to avoid false-positives when a body legitimately quotes a webhook URL.
+no_markers = module.detect_direct_send_markers(
+    {
+        "delivery_intent": "main_session_only",
+        "summary_short": "all good",
+        "summary": "I considered tg_send but did not invoke it.",
+    }
+)
+assert not no_markers, "narrative summary should not trip marker detection"
 
 
 def fake_run(command, **kwargs):
@@ -7439,15 +7584,18 @@ def fake_run(command, **kwargs):
 module.resolve_binary = lambda name, env_var: f"/fake/{name}"
 module.subprocess.run = fake_run
 
+# PR1.3 — `--channels` is never injected and `--strict-mcp-config` is
+# always present, regardless of legacy `disposable_needs_channels` /
+# `target_channels` content in the request.
 command, _ = module.run_claude(request, prompt, 30)
-assert "--channels" not in command
+assert "--channels" not in command, command
+assert "--strict-mcp-config" in command, command
 
 opt_in_request = dict(request)
 opt_in_request["disposable_needs_channels"] = True
-opt_in_prompt = module.build_prompt(opt_in_request, "send a telegram update")
-assert "Even if channel tools are available in this run, do not use them for human delivery." in opt_in_prompt
-command, _ = module.run_claude(opt_in_request, opt_in_prompt, 30)
-assert command[2:4] == ["--channels", "plugin:telegram"]
+command, _ = module.run_claude(opt_in_request, prompt, 30)
+assert "--channels" not in command, command
+assert "--strict-mcp-config" in command, command
 PY
 
 log "honouring metadata.disableMcp on disposable cron child (#263)"
@@ -7514,6 +7662,12 @@ DEFAULT_SHELL="$(python3 "$REPO_ROOT/bridge-cron.py" show --jobs-file "$CRON_NOM
 assert_contains "$DEFAULT_SHELL" "CRON_JOB_DISABLE_MCP=0"
 
 python3 - <<'PY'
+# PR1.3 — `disable_mcp_for_request` is unconditionally True now and
+# `run_claude` always passes `--strict-mcp-config`. The legacy env override
+# (`BRIDGE_CRON_DISPOSABLE_DISABLE_MCP`) and `disposable_needs_channels`
+# safety override are intentionally dead so an existing telegram cron
+# config can never re-attach the parent's MCP poller from the disposable
+# child (#468).
 import importlib.util
 import os
 import subprocess
@@ -7539,23 +7693,21 @@ base = {
     "disposable_needs_channels": False,
 }
 
-# Default: no flag.
-assert module.disable_mcp_for_request(dict(base)) is False
-# Per-request opt-in.
-on = dict(base, disable_mcp=True)
-assert module.disable_mcp_for_request(on) is True
-# Env override forces ON.
-os.environ["BRIDGE_CRON_DISPOSABLE_DISABLE_MCP"] = "1"
 assert module.disable_mcp_for_request(dict(base)) is True
-# Env override forces OFF.
+# Legacy env override has no effect any more.
 os.environ["BRIDGE_CRON_DISPOSABLE_DISABLE_MCP"] = "0"
-assert module.disable_mcp_for_request(on) is False
-del os.environ["BRIDGE_CRON_DISPOSABLE_DISABLE_MCP"]
-# Channel relays must always keep MCP enabled, regardless of the flag.
-relay = dict(base, disable_mcp=True, disposable_needs_channels=True, target_channels="plugin:telegram")
-assert module.disable_mcp_for_request(relay) is False
+try:
+    assert module.disable_mcp_for_request(dict(base)) is True
+finally:
+    del os.environ["BRIDGE_CRON_DISPOSABLE_DISABLE_MCP"]
+# disposable_needs_channels no longer flips the gate.
+relay = dict(base, disable_mcp=False, disposable_needs_channels=True, target_channels="plugin:telegram")
+assert module.disable_mcp_for_request(relay) is True
+# Per-request opt-out is now a no-op.
+opt_out = dict(base, disable_mcp=False)
+assert module.disable_mcp_for_request(opt_out) is True
 
-# Wire-through: --strict-mcp-config flag in the spawned claude command.
+# Wire-through: --strict-mcp-config flag is always present.
 captured = {}
 real_run = subprocess.run
 
@@ -7567,13 +7719,22 @@ subprocess.run = fake_run
 try:
     module.resolve_binary = lambda name, env_var: f"/fake/{name}"
     module.run_claude(dict(base), "prompt", 30)
-    assert "--strict-mcp-config" not in captured["cmd"]
-    module.run_claude(on, "prompt", 30)
     assert "--strict-mcp-config" in captured["cmd"]
+    assert "--channels" not in captured["cmd"]
+    # Even when the legacy disposable_needs_channels + target_channels are
+    # set, --channels stays out and --strict-mcp-config stays in.
+    relay_request = dict(
+        base,
+        disposable_needs_channels=True,
+        target_channels="plugin:telegram",
+    )
+    module.run_claude(relay_request, "prompt", 30)
+    assert "--strict-mcp-config" in captured["cmd"]
+    assert "--channels" not in captured["cmd"]
 finally:
     subprocess.run = real_run
 
-print("disable_mcp wire-through OK")
+print("PR1.3 strict-mcp + no-channels wire-through OK")
 PY
 
 log "pre-flight memory guard defers cron dispatch on pressured hosts (#263 Track B)"
@@ -7705,6 +7866,10 @@ healthy_completed_payload = json.dumps(
             "recommended_next_steps": [],
             "artifacts": [],
             "confidence": "high",
+            # PR1 — delivery_intent is now schema-required. The healthy
+            # smoke path returns silent so cmd_run takes the no-inbox-task
+            # branch and we don't need to mock bridge-queue.py here.
+            "delivery_intent": "silent",
         }
     },
     ensure_ascii=True,
@@ -7747,6 +7912,204 @@ del os.environ["BRIDGE_CRON_MIN_AVAIL_MB"]
 assert module._min_avail_mb() == module.DEFAULT_MIN_AVAIL_MB
 
 print("pre-flight memory guard OK")
+PY
+
+log "PR1.9 — cron-runner end-to-end delivery_intent matrix + dedupe semantics"
+PR1_RUN_ROOT="$TMP_ROOT/pr1-cron-runs"
+PR1_TARGET_AGENT="smoke-pr1-target"
+mkdir -p "$PR1_RUN_ROOT"
+PR1_RUN_ROOT="$PR1_RUN_ROOT" \
+PR1_TARGET_AGENT="$PR1_TARGET_AGENT" \
+PR1_REPO_ROOT="$REPO_ROOT" \
+python3 - <<'PY'
+# Drive cmd_run for each delivery_intent (silent / main_session_only /
+# forward_to_user) against an isolated BRIDGE_TASK_DB, mocking the Claude
+# binary spawn but letting real bridge-queue.py + audit subprocess calls
+# go through. Verifies plan §PR1.9:
+#   - silent → no inbox task, reporting_decision=silent
+#   - main_session_only → 1 inbox task; second run with same job refreshes (refresh-by-job)
+#   - forward_to_user → fresh task per run (per-run)
+import argparse
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+run_root = Path(os.environ["PR1_RUN_ROOT"])
+target_agent = os.environ["PR1_TARGET_AGENT"]
+repo_root = Path(os.environ["PR1_REPO_ROOT"])
+
+path = repo_root / "bridge-cron-runner.py"
+spec = importlib.util.spec_from_file_location("bridge_cron_runner", path)
+module = importlib.util.module_from_spec(spec)
+assert spec.loader is not None
+spec.loader.exec_module(module)
+
+
+def make_request(run_id: str, job_name: str) -> Path:
+    run_dir = run_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    request_path = run_dir / "request.json"
+    request_path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "job_id": "pr1-test-job",
+                "job_name": job_name,
+                "family": job_name,
+                "slot": run_id,
+                "source_agent": "smoke",
+                "target_agent": target_agent,
+                "target_engine": "claude",
+                "target_workdir": str(run_dir),
+                "target_channels": "",
+                "allow_structured_relay": False,
+                "disposable_needs_channels": False,
+                "payload_file": str(run_dir / "payload.txt"),
+                "result_file": str(run_dir / "result.json"),
+                "status_file": str(run_dir / "status.json"),
+                "stdout_log": str(run_dir / "stdout.log"),
+                "stderr_log": str(run_dir / "stderr.log"),
+                "cron_urgency": "normal",
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "payload.txt").write_text("ping\n", encoding="utf-8")
+    return request_path
+
+
+def fake_claude_payload(intent: str) -> str:
+    output_dict = {
+        "status": "completed",
+        "summary": "smoke test result",
+        "findings": [],
+        "actions_taken": [],
+        "needs_human_followup": False,
+        "recommended_next_steps": [],
+        "artifacts": [],
+        "confidence": "high",
+        "delivery_intent": intent,
+    }
+    if intent != "silent":
+        output_dict["summary_short"] = f"alert ({intent})"
+    if intent == "forward_to_user":
+        output_dict["forward_target"] = {
+            "channel": "telegram",
+            "target_ref": "ops-channel",
+            "format": "markdown",
+        }
+    return json.dumps({"structured_output": output_dict})
+
+
+REAL_RUN = subprocess.run
+
+
+def make_fake_run(intent: str):
+    payload = fake_claude_payload(intent)
+
+    def fake(cmd, **kwargs):
+        if cmd and "claude" in os.path.basename(cmd[0]) and "bridge-queue" not in os.path.basename(cmd[0]):
+            return subprocess.CompletedProcess(cmd, 0, payload, "")
+        return REAL_RUN(cmd, **kwargs)
+
+    return fake
+
+
+def run_cron(run_id: str, job_name: str, intent: str) -> dict:
+    request = make_request(run_id, job_name)
+    module.resolve_binary = lambda name, env_var: "/fake/claude" if name == "claude" else f"/fake/{name}"
+    module.subprocess.run = make_fake_run(intent)
+    try:
+        rc = module.cmd_run(argparse.Namespace(request_file=str(request), dry_run=False))
+    finally:
+        module.subprocess.run = REAL_RUN
+    result_path = request.parent / "result.json"
+    return {
+        "rc": rc,
+        "result": json.loads(result_path.read_text(encoding="utf-8")),
+    }
+
+
+def open_tasks() -> list[dict]:
+    out = REAL_RUN(
+        [
+            sys.executable,
+            str(repo_root / "bridge-queue.py"),
+            "find-open",
+            "--agent",
+            target_agent,
+            "--all",
+            "--format",
+            "json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if out.returncode not in (0, 1):
+        raise AssertionError(f"find-open --all failed rc={out.returncode}: {out.stderr}")
+    return json.loads(out.stdout or "[]")
+
+
+# 1) silent — no inbox task created, reporting_decision=silent
+silent_a = run_cron("silent-A", "pr1-silent-job", "silent")
+assert silent_a["rc"] == 0, silent_a
+assert silent_a["result"]["delivery_intent"] == "silent", silent_a["result"]
+assert silent_a["result"]["reporting_decision"] == "silent", silent_a["result"]
+assert silent_a["result"].get("inbox_task_id") in (None, ""), silent_a["result"]
+silent_tasks = [t for t in open_tasks() if t["title"].startswith("[cron-followup] pr1-silent-job")]
+assert not silent_tasks, f"silent run should not create a task: {silent_tasks}"
+
+# 2) main_session_only — refresh-by-job dedupe (one task across runs)
+main1 = run_cron("main-A", "pr1-main-job", "main_session_only")
+assert main1["rc"] == 0, main1
+assert main1["result"]["delivery_intent"] == "main_session_only", main1["result"]
+assert main1["result"]["reporting_decision"] == "reported", main1["result"]
+main_id_1 = main1["result"]["inbox_task_id"]
+assert isinstance(main_id_1, int) and main_id_1 > 0, main1["result"]
+
+main2 = run_cron("main-B", "pr1-main-job", "main_session_only")
+assert main2["rc"] == 0, main2
+main_id_2 = main2["result"]["inbox_task_id"]
+assert main_id_2 == main_id_1, (
+    f"main_session_only should refresh-by-job: first={main_id_1} second={main_id_2}"
+)
+
+main_open = [t for t in open_tasks() if t["title"].startswith("[cron-followup] pr1-main-job")]
+assert len(main_open) == 1, f"expected 1 open main task, got {main_open}"
+
+# 3) forward_to_user — per-run dedupe (each run lands as a fresh task)
+fwd1 = run_cron("fwd-A", "pr1-fwd-job", "forward_to_user")
+assert fwd1["rc"] == 0, fwd1
+assert fwd1["result"]["delivery_intent"] == "forward_to_user", fwd1["result"]
+fwd_id_1 = fwd1["result"]["inbox_task_id"]
+assert isinstance(fwd_id_1, int) and fwd_id_1 > 0, fwd1["result"]
+
+fwd2 = run_cron("fwd-B", "pr1-fwd-job", "forward_to_user")
+assert fwd2["rc"] == 0, fwd2
+fwd_id_2 = fwd2["result"]["inbox_task_id"]
+assert fwd_id_2 != fwd_id_1, (
+    f"forward_to_user should produce per-run tasks: first={fwd_id_1} second={fwd_id_2}"
+)
+
+fwd_open = [t for t in open_tasks() if t["title"].startswith("[cron-followup] pr1-fwd-job")]
+assert len(fwd_open) == 2, f"expected 2 open forward tasks, got {fwd_open}"
+
+# Audit fields: each result.json carries delivery_intent + reporting_decision.
+for run_id in ("silent-A", "main-A", "main-B", "fwd-A", "fwd-B"):
+    result = json.loads((run_root / run_id / "result.json").read_text(encoding="utf-8"))
+    assert "delivery_intent" in result, (run_id, result)
+    assert "reporting_decision" in result, (run_id, result)
+    status = json.loads((run_root / run_id / "status.json").read_text(encoding="utf-8"))
+    assert "delivery_intent" in status, (run_id, status)
+    assert "reporting_decision" in status, (run_id, status)
+
+print("PR1.9 cron-runner end-to-end OK")
 PY
 
 log "bridge_check_memory_pressure bash helper handles probe failure as healthy"
