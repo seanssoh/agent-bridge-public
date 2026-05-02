@@ -16,6 +16,36 @@ from pathlib import Path
 from typing import Any
 
 
+# PR1 (cron inbox-only reporting) — RESULT_SCHEMA carries the structured
+# reporting contract. The cron child must NOT send to external channels;
+# instead it declares its `delivery_intent` and the runner relays the result
+# to the parent agent's inbox. `channel_relay` remains as a deprecated alias
+# (audit-warn on use) for one minor; replaced by `delivery_intent` +
+# `forward_target` + `summary_short`.
+DELIVERY_INTENT_VALUES = ("silent", "main_session_only", "forward_to_user")
+FORWARD_CHANNEL_VALUES = ("telegram", "discord", "mattermost")
+FORWARD_FORMAT_VALUES = ("markdown", "text")
+SUMMARY_SHORT_MAX = 200
+
+# PR1.5 — direct-send marker substrings the LLM should never emit at action
+# position (forward_target / summary_short). v1 behaviour: emit a one-line
+# `cron_audit` event with up to 80 chars of the offending substring; do NOT
+# reject (Sean Q-C 2026-05-02). Hard reject deferred to v2 once we measure
+# whether LLMs actually try this.
+DIRECT_SEND_MARKERS = (
+    "tg_send",
+    "telegram_send",
+    "discord_send",
+    "webhook_url",
+    "https://api.telegram.org",
+    "https://discord.com/api/webhooks",
+    "agb urgent",
+    "agb task create",
+    "agb task done",
+    "agb handoff",
+)
+MARKER_EXCERPT_LIMIT = 80
+
 RESULT_SCHEMA = {
     "type": "object",
     "properties": {
@@ -27,6 +57,21 @@ RESULT_SCHEMA = {
         "recommended_next_steps": {"type": "array", "items": {"type": "string"}},
         "artifacts": {"type": "array", "items": {"type": "string"}},
         "confidence": {"type": "string"},
+        "delivery_intent": {
+            "type": "string",
+            "enum": list(DELIVERY_INTENT_VALUES),
+        },
+        "forward_target": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "enum": list(FORWARD_CHANNEL_VALUES)},
+                "target_ref": {"type": "string"},
+                "format": {"type": "string", "enum": list(FORWARD_FORMAT_VALUES)},
+            },
+            "required": ["channel", "target_ref", "format"],
+            "additionalProperties": False,
+        },
+        "summary_short": {"type": "string", "maxLength": SUMMARY_SHORT_MAX},
         "channel_relay": {
             "type": "object",
             "properties": {
@@ -49,6 +94,7 @@ RESULT_SCHEMA = {
         "recommended_next_steps",
         "artifacts",
         "confidence",
+        "delivery_intent",
     ],
     "additionalProperties": False,
 }
@@ -135,6 +181,61 @@ def normalize_channel_relay(value: Any) -> dict[str, str] | None:
     return relay
 
 
+def normalize_forward_target(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("forward_target must be an object when present")
+    allowed = {"channel", "target_ref", "format"}
+    extras = sorted(set(value.keys()) - allowed)
+    if extras:
+        raise ValueError(f"forward_target contains unsupported fields: {', '.join(extras)}")
+    channel = str(value.get("channel", "")).strip().lower()
+    if channel not in FORWARD_CHANNEL_VALUES:
+        raise ValueError(
+            f"forward_target.channel must be one of {', '.join(FORWARD_CHANNEL_VALUES)}; got {channel!r}"
+        )
+    target_ref = str(value.get("target_ref", "")).strip()
+    if not target_ref:
+        raise ValueError("forward_target.target_ref must be a non-empty string")
+    fmt = str(value.get("format", "")).strip().lower()
+    if fmt not in FORWARD_FORMAT_VALUES:
+        raise ValueError(
+            f"forward_target.format must be one of {', '.join(FORWARD_FORMAT_VALUES)}; got {fmt!r}"
+        )
+    return {"channel": channel, "target_ref": target_ref, "format": fmt}
+
+
+def detect_direct_send_markers(result: dict[str, Any]) -> list[dict[str, str]]:
+    """Return one entry per detected direct-send marker at action position.
+
+    PR1.5 (Sean Q-C 2026-05-02): v1 logs only — no rejection. We sample only
+    `forward_target.target_ref` and `summary_short` because legitimate cron
+    bodies frequently quote URLs/IDs in narrative text. Markers found in
+    `summary` or `findings` would create false-positives.
+    """
+    detections: list[dict[str, str]] = []
+    sources: list[tuple[str, str]] = []
+    forward_target = result.get("forward_target") or {}
+    if isinstance(forward_target, dict):
+        ref = str(forward_target.get("target_ref") or "")
+        if ref:
+            sources.append(("forward_target.target_ref", ref))
+    summary_short = str(result.get("summary_short") or "")
+    if summary_short:
+        sources.append(("summary_short", summary_short))
+    for field, text in sources:
+        lowered = text.lower()
+        for marker in DIRECT_SEND_MARKERS:
+            idx = lowered.find(marker)
+            if idx < 0:
+                continue
+            start = max(0, idx - 8)
+            excerpt = text[start : start + MARKER_EXCERPT_LIMIT]
+            detections.append({"field": field, "marker": marker, "excerpt": excerpt})
+    return detections
+
+
 def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
     result = normalize_result(payload)
     missing = [key for key in RESULT_SCHEMA["required"] if key not in result]
@@ -142,6 +243,45 @@ def validate_result(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"result missing required fields: {', '.join(missing)}")
     if not isinstance(result["summary"], str) or not result["summary"].strip():
         raise ValueError("result summary must be a non-empty string")
+
+    intent = str(result.get("delivery_intent") or "").strip()
+    if intent not in DELIVERY_INTENT_VALUES:
+        raise ValueError(
+            f"delivery_intent must be one of {', '.join(DELIVERY_INTENT_VALUES)}; got {intent!r}"
+        )
+    result["delivery_intent"] = intent
+
+    forward_target = normalize_forward_target(result.get("forward_target"))
+    if intent == "forward_to_user":
+        if forward_target is None:
+            raise ValueError("forward_target is required when delivery_intent=forward_to_user")
+        result["forward_target"] = forward_target
+    else:
+        # Drop forward_target on silent / main_session_only — it's meaningless
+        # and would otherwise confuse the parent's routing.
+        result.pop("forward_target", None)
+
+    summary_short_raw = result.get("summary_short")
+    if intent == "silent":
+        # Empty / unset is fine. Anything non-empty is silently dropped so a
+        # cron child can fill it without breaking the silent contract.
+        result.pop("summary_short", None)
+    else:
+        if summary_short_raw is None:
+            raise ValueError(
+                f"summary_short is required when delivery_intent={intent}"
+            )
+        text = str(summary_short_raw).strip()
+        if not text:
+            raise ValueError(
+                f"summary_short must be a non-empty string when delivery_intent={intent}"
+            )
+        if len(text) > SUMMARY_SHORT_MAX:
+            raise ValueError(
+                f"summary_short exceeds {SUMMARY_SHORT_MAX} chars (was {len(text)})"
+            )
+        result["summary_short"] = text
+
     relay = normalize_channel_relay(result.get("channel_relay"))
     if relay is not None:
         result["channel_relay"] = relay
@@ -370,6 +510,29 @@ def check_memory_pressure() -> dict[str, Any] | None:
 
 def emit_pressure_audit(run_id: str, target_agent: str, probe: dict[str, Any]) -> None:
     """Best-effort audit row for a deferred dispatch. Failure is non-fatal."""
+    emit_audit_row(
+        action="cron_dispatch_deferred",
+        actor="daemon",
+        target_agent=target_agent or "daemon",
+        run_id=run_id,
+        details=probe,
+    )
+
+
+def emit_audit_row(
+    *,
+    action: str,
+    actor: str,
+    target_agent: str,
+    run_id: str,
+    details: dict[str, Any],
+) -> None:
+    """Best-effort one-line audit emission via bridge-audit.py.
+
+    Failure is non-fatal: if BRIDGE_AUDIT_LOG is unset or the helper script
+    is missing, we silently skip. The cron run itself must not be blocked
+    on audit plumbing.
+    """
     audit_log = os.environ.get("BRIDGE_AUDIT_LOG")
     if not audit_log:
         return
@@ -383,15 +546,15 @@ def emit_pressure_audit(run_id: str, target_agent: str, probe: dict[str, Any]) -
         "--file",
         audit_log,
         "--actor",
-        "daemon",
+        actor,
         "--action",
-        "cron_dispatch_deferred",
+        action,
         "--target",
         target_agent or "daemon",
         "--detail",
         f"run_id={run_id}",
     ]
-    for key, value in probe.items():
+    for key, value in details.items():
         cmd.extend(["--detail", f"{key}={value}"])
     try:
         subprocess.run(cmd, capture_output=True, text=True, timeout=10, check=False)
@@ -399,109 +562,469 @@ def emit_pressure_audit(run_id: str, target_agent: str, probe: dict[str, Any]) -
         pass
 
 
-def disable_mcp_for_request(request: dict[str, Any]) -> bool:
-    """#263 + #468: decide whether the disposable child should launch with MCP disabled.
+def emit_legacy_key_audit(request: dict[str, Any], run_id: str, *, target_agent: str) -> None:
+    """PR1.3 + PR1.4 + PR1.10 — one-line audit when a job still wires the
+    deprecated `allow_channel_delivery`, `disposable_needs_channels`, or
+    `payload_kind=agentTurn`. The runner honors none of these for behavior;
+    the audit gives operators a way to find and remove them.
 
-    Order of precedence:
-      1. ``request['disposable_needs_channels']`` — channel relays need MCP
-         servers loaded to deliver, so we never disable in that case. Safety
-         override; nothing below can flip it back.
-      2. ``BRIDGE_CRON_DISPOSABLE_DISABLE_MCP`` env override (ops A/B switch).
-         Set to ``1``/``true`` to force-disable MCP for every cron child;
-         ``0``/``false`` to force-enable. Unset to defer to per-job config.
-      3. ``request['disable_mcp']`` from the job's ``metadata.disableMcp``
-         (or aliases) wired through ``bridge_cron_write_request``. When
-         explicitly set (``True``/``False``) the per-job choice wins.
-      4. **Default: True.** Non-channel cron disposables disable MCP unless
-         opted in. Disabling MCP cuts cold-start cost (~22K tokens / run on
-         the SYRS reference install) and prevents a cwd
-         ``settings.local.json`` ``enabledPlugins`` entry (e.g. telegram)
-         from auto-attaching in the disposable child and stealing the
-         parent agent's MCP poller via plugin singleton-lock (issue #468).
-         If a specific cron payload genuinely needs MCP tools, set
-         ``metadata.disableMcp = False`` on that job.
+    Codex r1 P2 — `lib/bridge-cron.sh` writes both `allow_channel_delivery`
+    and `allow_structured_relay` for every request as a false-default
+    alias, so flagging on key-presence alone fires for normal no-relay
+    jobs. We now flag only the legacy enable-asymmetry: legacy key truthy
+    AND new key falsy (i.e., a request that opted into the deprecated
+    behavior without the new equivalent). Same logic for the other two:
+    only flag when the value is genuinely truthy / agentTurn-shaped.
     """
-    if disposable_needs_channels(request):
+    flagged: list[str] = []
+    if bool_flag(request.get("allow_channel_delivery")) and not bool_flag(request.get("allow_structured_relay")):
+        flagged.append("allow_channel_delivery")
+    if bool_flag(request.get("disposable_needs_channels")):
+        flagged.append("disposable_needs_channels")
+    if str(request.get("payload_kind") or "").strip().lower() == "agentturn":
+        flagged.append("payload_kind=agentTurn")
+    if not flagged:
+        return
+    emit_audit_row(
+        action="cron_legacy_key_used",
+        actor="cron-runner",
+        target_agent=target_agent,
+        run_id=run_id,
+        details={"keys": ",".join(flagged)},
+    )
+
+
+def apply_reporting_policy(result: dict[str, Any], policy: str) -> tuple[dict[str, Any], str | None]:
+    """PR1.2 — Per-job override on delivery_intent.
+
+    Returns (possibly-mutated result, override_note). override_note is None
+    when the policy did not change the intent, otherwise a short string
+    describing the demotion ("forced_silent", "demoted_forward_to_main", …)
+    suitable for cron_audit details.
+    """
+    if policy == "default":
+        return result, None
+    intent = str(result.get("delivery_intent") or "").strip()
+    if policy == "always_silent" and intent != "silent":
+        result = dict(result)
+        result["delivery_intent"] = "silent"
+        result.pop("forward_target", None)
+        result.pop("summary_short", None)
+        return result, f"forced_silent_from_{intent}"
+    if policy == "always_main_session" and intent != "main_session_only":
+        result = dict(result)
+        result["delivery_intent"] = "main_session_only"
+        result.pop("forward_target", None)
+        # Preserve summary_short if the child set one — still useful as a
+        # main-session digest. The main_session_only path requires it; if
+        # missing, fall back to the long summary truncated.
+        if not str(result.get("summary_short") or "").strip():
+            short = str(result.get("summary") or "")[:SUMMARY_SHORT_MAX].strip()
+            if short:
+                result["summary_short"] = short
+        return result, f"forced_main_session_from_{intent}"
+    return result, None
+
+
+def cron_followup_title(job_name: str, intent: str, run_id: str) -> str:
+    """PR1.6 dedupe-friendly title.
+
+    `main_session_only` collapses to `[cron-followup] <job> [main_session_only]`
+    so refresh-by-job dedupe (PR1.7) works on a stable prefix.
+    `forward_to_user` carries the run_id so each distinct alert is unique
+    and the per-run lookup mode never collapses two alerts.
+    """
+    safe_job = job_name or "cron"
+    if intent == "forward_to_user":
+        return f"[cron-followup] {safe_job} (run={run_id})"
+    return f"[cron-followup] {safe_job} [{intent}]"
+
+
+def write_followup_body(
+    body_path: Path,
+    *,
+    schema_version: int,
+    run_id: str,
+    job_id: str,
+    job_name: str,
+    family: str,
+    target_agent: str,
+    delivery_intent: str,
+    forward_target: dict[str, str] | None,
+    summary_short: str,
+    summary: str,
+    findings: list[str],
+    actions_taken: list[str],
+    recommended_next_steps: list[str],
+    artifacts: list[str],
+    reporting_policy_value: str,
+    structured_relay_legacy: bool,
+) -> None:
+    """PR1.6 — strict JSON-frontmatter body (parsed without PyYAML).
+
+    Frontmatter shape is part of the contract; PR2 will add a parser helper
+    in `lib/bridge_cron_followup.py` that consumes it.
+    """
+    frontmatter = {
+        "schema_version": schema_version,
+        "kind": "cron-followup",
+        "delivery_intent": delivery_intent,
+        "run_id": run_id,
+        "job_id": job_id,
+        "job_name": job_name,
+        "family": family,
+        "target_agent": target_agent,
+        "reporting_policy": reporting_policy_value,
+    }
+    if forward_target:
+        frontmatter["forward_target"] = forward_target
+    if summary_short:
+        frontmatter["summary_short"] = summary_short
+    if structured_relay_legacy:
+        frontmatter["legacy_structured_relay"] = True
+
+    lines = [
+        "---",
+        json.dumps(frontmatter, ensure_ascii=False, indent=2),
+        "---",
+        "",
+        f"# [cron-followup] {job_name or run_id}",
+        "",
+        f"- run_id: {run_id}",
+        f"- job: {job_name}",
+        f"- family: {family}",
+        f"- delivery_intent: {delivery_intent}",
+    ]
+    if summary_short:
+        lines.append(f"- summary_short: {summary_short}")
+    if forward_target:
+        lines.extend(
+            [
+                f"- forward_target.channel: {forward_target.get('channel', '')}",
+                f"- forward_target.target_ref: {forward_target.get('target_ref', '')}",
+                f"- forward_target.format: {forward_target.get('format', '')}",
+            ]
+        )
+
+    if summary.strip():
+        lines.extend(["", "## Summary", "", summary.rstrip()])
+
+    for label, items in (
+        ("Findings", findings),
+        ("Actions Taken", actions_taken),
+        ("Recommended Next Steps", recommended_next_steps),
+        ("Artifacts", artifacts),
+    ):
+        if items:
+            lines.extend(["", f"## {label}", ""])
+            for item in items:
+                lines.append(f"- {item}")
+
+    if delivery_intent == "main_session_only":
+        lines.extend(
+            [
+                "",
+                "## Action Required (main session)",
+                "",
+                "Absorb the above into your context. Update your mental model of this monitor.",
+                "Close this task with `agb done <id> --note 'absorbed'` or equivalent.",
+                "Do NOT forward to a user-facing channel — this run did not opt into user delivery.",
+            ]
+        )
+    elif delivery_intent == "forward_to_user":
+        lines.extend(
+            [
+                "",
+                "## Action Required (forward to user)",
+                "",
+                "Forward the summary above through your own channel plugin (telegram/discord/mattermost).",
+                "Resolve `forward_target.target_ref` against your routing config.",
+                "Close this task with `agb done <id> --note 'forwarded ts=...'`.",
+            ]
+        )
+
+    body_path.parent.mkdir(parents=True, exist_ok=True)
+    body_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def queue_cli_path() -> Path:
+    return Path(__file__).resolve().parent / "bridge-queue.py"
+
+
+def find_open_followup_task(
+    *, target_agent: str, title_prefix: str, mode: str
+) -> int | None:
+    """Invoke bridge-queue.py find-open. Returns task_id or None.
+
+    `mode` is `refresh-by-job` (existing prefix lookup) or `per-run`
+    (always returns None — the caller will create a fresh task). PR1.7
+    extends bridge-queue.py with a `--mode` selector that returns nothing
+    for `per-run`, so this wrapper stays consistent with that contract.
+    """
+    if mode == "per-run":
+        return None
+    cmd = [
+        sys.executable,
+        str(queue_cli_path()),
+        "find-open",
+        "--agent",
+        target_agent,
+        "--title-prefix",
+        title_prefix,
+        "--mode",
+        mode,
+        "--format",
+        "id",
+    ]
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    text = completed.stdout.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
+def queue_create_task(
+    *,
+    target_agent: str,
+    actor: str,
+    title: str,
+    body_path: Path,
+    priority: str,
+) -> int | None:
+    cmd = [
+        sys.executable,
+        str(queue_cli_path()),
+        "create",
+        "--to",
+        target_agent,
+        "--from",
+        actor,
+        "--title",
+        title,
+        "--priority",
+        priority,
+        "--body-file",
+        str(body_path),
+        "--format",
+        "shell",
+    ]
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=20, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    for line in completed.stdout.splitlines():
+        if line.startswith("TASK_ID="):
+            try:
+                return int(line.split("=", 1)[1].strip().strip("'\""))
+            except ValueError:
+                return None
+    return None
+
+
+def queue_update_task(
+    *,
+    task_id: int,
+    actor: str,
+    title: str,
+    body_path: Path,
+    priority: str,
+    note: str,
+) -> bool:
+    cmd = [
+        sys.executable,
+        str(queue_cli_path()),
+        "update",
+        str(task_id),
+        "--actor",
+        actor,
+        "--title",
+        title,
+        "--priority",
+        priority,
+        "--body-file",
+        str(body_path),
+        "--note",
+        note,
+    ]
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=20, check=False
+        )
+    except (OSError, subprocess.SubprocessError):
         return False
-    override = os.environ.get("BRIDGE_CRON_DISPOSABLE_DISABLE_MCP")
-    if override is not None and override.strip():
-        return bool_flag(override)
-    raw = request.get("disable_mcp")
-    if raw is None or (isinstance(raw, str) and not raw.strip()):
-        return True
-    return bool_flag(raw)
+    return completed.returncode == 0
+
+
+def upsert_inbox_task(
+    *,
+    target_agent: str,
+    actor: str,
+    title: str,
+    body_path: Path,
+    priority: str,
+    intent: str,
+    job_name: str,
+) -> tuple[int | None, str]:
+    """Create or refresh the inbox task per PR1.7 dedupe semantics.
+
+    Returns (task_id_or_none, action) where action is one of
+    `created | refreshed | failed`.
+    """
+    if intent == "main_session_only":
+        prefix = f"[cron-followup] {job_name or 'cron'} [main_session_only]"
+        existing = find_open_followup_task(
+            target_agent=target_agent,
+            title_prefix=prefix,
+            mode="refresh-by-job",
+        )
+        if existing is not None:
+            ok = queue_update_task(
+                task_id=existing,
+                actor=actor,
+                title=title,
+                body_path=body_path,
+                priority=priority,
+                note=f"refreshed by cron-runner (intent={intent})",
+            )
+            return (existing if ok else None, "refreshed" if ok else "failed")
+    task_id = queue_create_task(
+        target_agent=target_agent,
+        actor=actor,
+        title=title,
+        body_path=body_path,
+        priority=priority,
+    )
+    return (task_id, "created" if task_id is not None else "failed")
+
+
+def disable_mcp_for_request(request: dict[str, Any]) -> bool:
+    """PR1.3 — cron child runs in `--strict-mcp-config` mode unconditionally.
+
+    Pre-PR1 logic gated MCP loading on `disposable_needs_channels` /
+    `BRIDGE_CRON_DISPOSABLE_DISABLE_MCP` / `metadata.disableMcp`. Post-PR1
+    that gating is gone: the cron child can no longer reach external
+    channels, so there is nothing for MCP plugins to do here, and loading
+    them risks the singleton-lock collisions that #468 worked around.
+    The legacy keys are still honored as audit-only signals — see
+    `cmd_run` for the audit-warn emit when a job sets them.
+    """
+    del request  # signature retained for callers / future per-job opt-in
+    return True
+
+
+def read_structured_relay_flag(request: dict[str, Any]) -> bool:
+    """PR1.4 — `allow_structured_relay` is the new name. The old key
+    `allow_channel_delivery` is honored for one minor as an alias; callers
+    that still emit it get an audit-warn path in cmd_run.
+    """
+    if "allow_structured_relay" in request:
+        return bool_flag(request.get("allow_structured_relay"))
+    return bool_flag(request.get("allow_channel_delivery"))
+
+
+def reporting_policy(request: dict[str, Any]) -> str:
+    """PR1.2 — per-job override on the default-silent policy. Allowed:
+    `default | always_main_session | always_silent` (Sean Q-B). Anything
+    else falls back to `default` and is audit-warned upstream.
+    """
+    raw = str(request.get("cron_reporting_policy") or request.get("reporting_policy") or "default").strip().lower()
+    if raw not in {"default", "always_main_session", "always_silent"}:
+        return "default"
+    return raw
 
 
 def build_prompt(request: dict[str, Any], payload_text: str) -> str:
-    allow_channel_delivery = bool_flag(request.get("allow_channel_delivery"))
-    child_channels_enabled = disposable_needs_channels(request)
-    target_channels = csv_items(request.get("target_channels", ""))
-    channel_name = str(request.get("job_delivery_channel") or "").strip()
-    channel_target = str(request.get("job_delivery_target") or "").strip()
-    lines = [
+    parent_agent = request.get("target_agent", "")
+    parent_engine = request.get("target_engine", "")
+    policy = reporting_policy(request)
+    structured_relay = read_structured_relay_flag(request)
+
+    # PR1.2 — Policy preamble. The cron child cannot reach external channels
+    # (PR1.3 strips MCP plugins; the runner rejects results that lack a
+    # delivery_intent). The child decides intent here; the runner relays it
+    # to the parent's inbox.
+    lines: list[str] = [
         "You are a disposable cron execution worker for Agent Bridge.",
         "",
-        "Act on behalf of the parent agent below.",
-        "Do the heavy cron work in this disposable run, then return JSON only.",
+        "## Reporting policy (binding — overrides any legacy operator prompt below)",
         "",
-        "Hard rules:",
+        "- This run has NO access to Discord, Telegram, Mattermost, email, or any human channel.",
+        "- Do NOT call agb urgent / agb task create / agb task done / agb handoff for delivery.",
+        "- Do NOT call message/reply/send tools or post to webhook URLs.",
+        "- Decide a `delivery_intent` and return it in the JSON result. Allowed values:",
+        "    - `silent` — default. The work was done; the parent does not need to be told. No inbox task is created.",
+        "    - `main_session_only` — the parent agent must absorb this into context. No user-facing send. The parent updates its mental model and closes the inbox task.",
+        "    - `forward_to_user` — the run produced a human-facing alert. The parent will forward it through its own first-party channel plugin.",
+        f"- Pick `silent` when routine monitoring has no material change. Pick `main_session_only` only when the parent must know something. Pick `forward_to_user` only when a human must see it.",
+        f"- Parent agent (= main session): `{parent_agent}` ({parent_engine}).",
+        "",
+        "## Required JSON fields (in addition to the schema's existing keys)",
+        "",
+        "- `delivery_intent`: one of `silent | main_session_only | forward_to_user`. Required.",
+        "- `summary_short`: ≤ 200 chars, operator-facing summary. Required when `delivery_intent != silent`.",
+        "- `forward_target`: required when `delivery_intent = forward_to_user`. Object with:",
+        "    - `channel`: one of `telegram | discord | mattermost`.",
+        "    - `target_ref`: a logical target name (NOT a chat id, NOT a webhook URL). The parent resolves it against its own routing config.",
+        "    - `format`: `markdown` or `text`.",
+        "- For `silent`, leave `summary_short` empty/unset and do not set `forward_target`.",
     ]
-    if allow_channel_delivery:
+
+    if policy == "always_silent":
         lines.extend(
             [
-                "- Do not send user-facing messages directly from this disposable run.",
-                "- If the cron needs a human-facing message, return it as a structured channel_relay object in the JSON result.",
-                "- channel_relay must include a non-empty body field.",
-                "- channel_relay transport/target are optional hints; request metadata remains the routing authority.",
-                "- When channel_relay is present, treat needs_human_followup as true.",
+                "",
+                "## Per-job override",
+                "",
+                "- This job's reporting_policy is `always_silent`. Choose `delivery_intent = silent` regardless of what you find unless the run itself errored.",
             ]
         )
-        if child_channels_enabled:
-            lines.extend(
-                [
-                    "- Even if channel tools are available in this run, do not use them for human delivery.",
-                    f"- Preferred relay transport: {channel_name or 'configured target agent channels'}",
-                    f"- Preferred relay target: {channel_target or '(not specified)'}",
-                    "- Do not use message/reply/send tools, direct webhook helpers, or agent-bridge urgent/task create/task done/handoff for delivery.",
-                    "- The parent agent will review the relay payload and send it from the parent session.",
-                    "- Keep the summary concise and operator-facing.",
-                ]
-            )
-        else:
-            lines.extend(
-                [
-                    "- Target agent channels are informational routing metadata in this disposable run.",
-                    "- If delivery is needed, return channel_relay instead of describing a direct send in prose only.",
-                    "- Do not use agent-bridge urgent/task create/task done/handoff for delivery.",
-                    "- Keep the summary concise and operator-facing.",
-                ]
-            )
-    else:
+    elif policy == "always_main_session":
         lines.extend(
             [
-                "- Do not send user-facing messages directly.",
-                "- Do not post to Discord, Telegram, email, or any human channel.",
-                "- Do not call agent-bridge urgent/task create/task done/handoff for delivery.",
-                "- If the legacy cron would normally notify someone, record that in recommended_next_steps instead.",
-                "- Set needs_human_followup=true only when the parent agent must review, decide, or act after this run, or when the run fails.",
-                "- Routine monitoring with no material change should set needs_human_followup=false.",
-                "- If you already completed the work and no parent follow-up is required, leave recommended_next_steps empty and set needs_human_followup=false.",
-                "- Keep the summary concise and operator-facing.",
+                "",
+                "## Per-job override",
+                "",
+                "- This job's reporting_policy is `always_main_session`. Choose `delivery_intent = main_session_only` so the parent always receives a heartbeat-style update.",
             ]
         )
-    if target_channels:
-        lines.extend(["", f"Target channels: {', '.join(target_channels)}"])
+
+    if structured_relay:
+        lines.extend(
+            [
+                "",
+                "## Legacy structured relay (deprecated)",
+                "",
+                "- This job opted into the legacy `channel_relay` field. You MAY still populate it, but `delivery_intent` + `forward_target` is the authoritative contract going forward.",
+                "- If you set `channel_relay`, also set `delivery_intent = forward_to_user` and a matching `forward_target` so the parent can route consistently.",
+            ]
+        )
+
     lines.extend(
         [
             "",
-            f"Parent agent: {request['target_agent']} ({request['target_engine']})",
-            f"Job: {request['job_name']}",
-            f"Family: {request['family']}",
-            f"Slot: {request['slot']}",
-            f"Run ID: {request['run_id']}",
-            f"Payload file: {request['payload_file']}",
+            "## Run metadata",
             "",
-            "Legacy cron payload follows:",
+            f"- Job: {request.get('job_name', '')}",
+            f"- Family: {request.get('family', '')}",
+            f"- Slot: {request.get('slot', '')}",
+            f"- Run ID: {request.get('run_id', '')}",
+            f"- Payload file: {request.get('payload_file', '')}",
+            "",
+            "## Operator prompt (scoped task — runs under the policy above)",
             "",
             payload_text.rstrip(),
             "",
@@ -534,35 +1057,12 @@ def runner_env() -> dict[str, str]:
     return env
 
 
-def apply_channel_runtime_env(request: dict[str, Any], env: dict[str, str]) -> dict[str, str]:
-    channels = csv_items(request.get("target_channels", ""))
-    updated = dict(env)
-    if channel_enabled(channels, "plugin:discord"):
-        discord_dir = str(request.get("target_discord_state_dir") or "").strip()
-        if discord_dir:
-            updated["DISCORD_STATE_DIR"] = discord_dir
-    if channel_enabled(channels, "plugin:telegram"):
-        telegram_dir = str(request.get("target_telegram_state_dir") or "").strip()
-        if telegram_dir:
-            updated["TELEGRAM_STATE_DIR"] = telegram_dir
-    return updated
-
-
-def validate_channel_delivery_request(request: dict[str, Any]) -> None:
-    if not bool_flag(request.get("allow_channel_delivery")):
-        return
-
-    channels = csv_items(request.get("target_channels", ""))
-    if not channels:
-        raise RuntimeError("channel delivery is allowed for this run, but target agent has no configured channels")
-
-    preferred = str(request.get("job_delivery_channel") or "").strip().lower()
-    if preferred:
-        expected = f"plugin:{preferred}"
-        if not channel_enabled(channels, expected):
-            raise RuntimeError(
-                f"channel delivery requested for {preferred}, but target agent channels are {', '.join(channels)}"
-            )
+# PR1.3 — `apply_channel_runtime_env` and `validate_channel_delivery_request`
+# are removed: the cron child no longer ever loads channel plugins, so
+# wiring DISCORD_STATE_DIR / TELEGRAM_STATE_DIR into its env, or validating
+# that a target's channels match `job_delivery_channel`, is meaningless.
+# The legacy `allow_channel_delivery` / `disposable_needs_channels` keys
+# are honored only for audit-warn (see `cmd_run`).
 
 
 def resolve_binary(name: str, override_env: str) -> str:
@@ -615,11 +1115,14 @@ def run_codex(request: dict[str, Any], prompt: str, schema_path: Path, timeout: 
 def run_claude(request: dict[str, Any], prompt: str, timeout: int, request_file: Path | None = None) -> tuple[list[str], subprocess.CompletedProcess[str]]:
     workdir = request["target_workdir"]
     claude_bin = resolve_binary("claude", "BRIDGE_CLAUDE_BIN")
-    channels = csv_items(request.get("target_channels", ""))
+    # PR1.3 — cron child never loads channel plugins or MCP servers. The
+    # `--channels` injection and `apply_channel_runtime_env` paths are gone.
+    # `--strict-mcp-config` is unconditional (see disable_mcp_for_request).
     command = [
         claude_bin,
         "-p",
         "--no-session-persistence",
+        "--strict-mcp-config",
         "--output-format",
         "json",
         "--json-schema",
@@ -628,14 +1131,7 @@ def run_claude(request: dict[str, Any], prompt: str, timeout: int, request_file:
         "bypassPermissions",
         prompt,
     ]
-    if channels and disposable_needs_channels(request):
-        command[2:2] = ["--channels", ",".join(channels)]
-    # #263: when MCP is opt-disabled, pass --strict-mcp-config without any
-    # --mcp-config so the child loads zero MCP servers. Cuts cold-start cost
-    # for cron payloads that do not use MCP tools (the common case).
-    if disable_mcp_for_request(request):
-        command[2:2] = ["--strict-mcp-config"]
-    env = apply_channel_runtime_env(request, runner_env())
+    env = runner_env()
     if request_file is not None:
         env["CRON_REQUEST_DIR"] = str(request_file.parent)
     completed = subprocess.run(
@@ -733,6 +1229,9 @@ def write_status(
     completed_at: str | None = None,
     exit_code: int | None = None,
     error: str | None = None,
+    delivery_intent: str | None = None,
+    reporting_decision: str | None = None,
+    inbox_task_id: int | None = None,
 ) -> None:
     payload: dict[str, Any] = {
         "run_id": run_id,
@@ -750,6 +1249,14 @@ def write_status(
         payload["exit_code"] = exit_code
     if error:
         payload["error"] = error
+    # PR1.8 — silent-exit audit fields. Emitted even when the cron is
+    # silent so operators can see "we ran, decided silent, no inbox task".
+    if delivery_intent is not None:
+        payload["delivery_intent"] = delivery_intent
+    if reporting_decision is not None:
+        payload["reporting_decision"] = reporting_decision
+    if inbox_task_id is not None:
+        payload["inbox_task_id"] = inbox_task_id
     write_json(status_file, payload)
 
 
@@ -825,7 +1332,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     prompt = build_prompt(request, payload_text)
     write_text(prompt_file, prompt)
     write_json(schema_file, RESULT_SCHEMA)
-    validate_channel_delivery_request(request)
+    # PR1 — emit audit-warn for legacy keys before the child runs so that
+    # operators see exactly which deprecated knobs are still wired in
+    # production cron jobs.
+    emit_legacy_key_audit(request, run_id, target_agent=str(request.get("target_agent") or ""))
 
     timeout = int(os.environ.get("BRIDGE_CRON_SUBAGENT_TIMEOUT_SECONDS", "900"))
     started_at = now_iso()
@@ -928,7 +1438,128 @@ def cmd_run(args: argparse.Namespace) -> int:
             "recommended_next_steps": ["Inspect stdout.log and stderr.log"],
             "artifacts": [],
             "confidence": "low",
+            # PR1 — invalid result drops to silent so we don't accidentally
+            # spam the parent's inbox with malformed alerts. The audit log
+            # records the failure separately via reporting_decision=invalid.
+            "delivery_intent": "silent",
         }
+
+    # PR1.2 — apply per-job reporting_policy override (always_silent /
+    # always_main_session) and capture any demotion for the audit log.
+    policy_value = reporting_policy(request)
+    child_result, policy_override_note = apply_reporting_policy(child_result, policy_value)
+
+    delivery_intent = str(child_result.get("delivery_intent") or "silent").strip()
+    if delivery_intent not in DELIVERY_INTENT_VALUES:
+        delivery_intent = "silent"
+
+    # PR1.5 — direct-send marker detection (audit-only per Sean Q-C).
+    markers = detect_direct_send_markers(child_result)
+
+    # PR1.4 — record whether the legacy `allow_channel_delivery` key was
+    # used (vs the new `allow_structured_relay`) so the audit can quantify
+    # remaining migration work.
+    structured_relay_legacy = (
+        "allow_channel_delivery" in request and "allow_structured_relay" not in request
+    )
+
+    forward_target = child_result.get("forward_target") if delivery_intent == "forward_to_user" else None
+    summary_short = str(child_result.get("summary_short") or "") if delivery_intent != "silent" else ""
+
+    # PR1.6 — write the inbox-task body to the cron run's followup file
+    # and create / refresh the queue task. Failure is non-fatal here; the
+    # cron run itself succeeded. We mark reporting_decision accordingly.
+    inbox_task_id: int | None = None
+    inbox_action = "skipped"
+    target_agent = str(request.get("target_agent") or "")
+    cron_urgency = str(request.get("cron_urgency") or "").strip().lower()
+    if cron_urgency not in {"normal", "high", "urgent"}:
+        cron_urgency = "normal"
+    followup_body_path = run_dir / "cron-followup.md"
+
+    # Codex r2 P1 / r3 P1 — compute the failure predicate BEFORE the inbox
+    # upsert so a structurally-valid child result with `status:"error"`
+    # (or any other non-success final state) cannot create a runner-owned
+    # inbox task that the daemon then duplicates via its failure-followup
+    # path. `silent` is reserved exclusively for clean-success-no-signal;
+    # everything else surfaces as `invalid` and is left to the existing
+    # daemon-side failure-followup path.
+    child_status_error = str(child_result.get("status", "")).strip().lower() == "error"
+    run_failed = (
+        bool(error_message)
+        or final_state != "success"
+        or child_status_error
+    )
+
+    if not run_failed and delivery_intent != "silent":
+        write_followup_body(
+            followup_body_path,
+            schema_version=1,
+            run_id=run_id,
+            job_id=str(request.get("job_id") or ""),
+            job_name=str(request.get("job_name") or ""),
+            family=family,
+            target_agent=target_agent,
+            delivery_intent=delivery_intent,
+            forward_target=forward_target if isinstance(forward_target, dict) else None,
+            summary_short=summary_short,
+            summary=str(child_result.get("summary") or ""),
+            findings=list(child_result.get("findings") or []),
+            actions_taken=list(child_result.get("actions_taken") or []),
+            recommended_next_steps=list(child_result.get("recommended_next_steps") or []),
+            artifacts=list(child_result.get("artifacts") or []),
+            reporting_policy_value=policy_value,
+            structured_relay_legacy=structured_relay_legacy,
+        )
+        title = cron_followup_title(
+            str(request.get("job_name") or ""), delivery_intent, run_id
+        )
+        inbox_task_id, inbox_action = upsert_inbox_task(
+            target_agent=target_agent,
+            actor=f"cron:{request.get('source_agent', 'cron')}",
+            title=title,
+            body_path=followup_body_path,
+            priority=cron_urgency,
+            intent=delivery_intent,
+            job_name=str(request.get("job_name") or ""),
+        )
+
+    if run_failed:
+        reporting_decision = "invalid"
+    elif delivery_intent == "silent":
+        reporting_decision = "silent"
+    elif inbox_action == "failed" or inbox_task_id is None:
+        reporting_decision = "invalid"
+    else:
+        reporting_decision = "reported"
+
+    # PR1.5 — emit one cron_audit line per run summarizing the reporting
+    # decision and any direct-send markers detected. Disk-volume rule
+    # (Sean 2026-05-02): keep it to a single line, ≤80-char marker excerpt.
+    audit_details: dict[str, Any] = {
+        "intent": delivery_intent,
+        "decision": reporting_decision,
+        "task": inbox_task_id if inbox_task_id is not None else "null",
+        "markers": len(markers),
+        "policy": policy_value,
+        "inbox_action": inbox_action,
+    }
+    if policy_override_note:
+        audit_details["policy_override"] = policy_override_note
+    if markers:
+        first = markers[0]
+        excerpt = first["excerpt"][:MARKER_EXCERPT_LIMIT]
+        audit_details["marker_field"] = first["field"]
+        audit_details["marker_excerpt"] = excerpt
+    if structured_relay_legacy:
+        audit_details["legacy_relay_key"] = "allow_channel_delivery"
+    emit_audit_row(
+        action="cron_audit",
+        actor="cron-runner",
+        target_agent=target_agent or "daemon",
+        run_id=run_id,
+        details=audit_details,
+    )
 
     result_payload = {
         "run_id": run_id,
@@ -953,7 +1584,20 @@ def cmd_run(args: argparse.Namespace) -> int:
         "command": command,
         "command_pretty": " ".join(shlex.quote(part) for part in command),
         "child_exit_code": completed.returncode,
+        # PR1.8 — silent-exit audit fields (always emitted, even on silent).
+        "delivery_intent": delivery_intent,
+        "reporting_decision": reporting_decision,
+        "inbox_task_id": inbox_task_id,
+        "reporting_policy": policy_value,
     }
+    if forward_target:
+        result_payload["forward_target"] = forward_target
+    if summary_short:
+        result_payload["summary_short"] = summary_short
+    if structured_relay_legacy:
+        result_payload["legacy_structured_relay_key_used"] = True
+    if markers:
+        result_payload["direct_send_markers_count"] = len(markers)
     if sidecar_error_note:
         result_payload["sidecar_error_note"] = sidecar_error_note
     if error_message:
@@ -971,6 +1615,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         completed_at=completed_at,
         exit_code=completed.returncode,
         error=error_message,
+        delivery_intent=delivery_intent,
+        reporting_decision=reporting_decision,
+        inbox_task_id=inbox_task_id,
     )
 
     print(f"status: {final_state}")
@@ -979,6 +1626,18 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"result_file: {rel_for_output(str(result_file))}")
     print(f"status_file: {rel_for_output(str(status_file))}")
     print(f"summary: {child_result['summary']}")
+    print(f"reporting_decision: {reporting_decision}")
+    print(f"delivery_intent: {delivery_intent}")
+    if inbox_task_id is not None:
+        print(f"inbox_task_id: {inbox_task_id}")
+    # PR1.5 — schema-required reject (e.g., bad delivery_intent payload)
+    # surfaces here as reporting_decision=invalid AND error_message set;
+    # exit non-zero so the daemon's existing health path picks it up.
+    if reporting_decision == "invalid" and not error_message:
+        # We landed in "invalid" because inbox writeback failed. The cron
+        # body itself ran fine, so we still return 1 to ensure the dispatch
+        # task gets retried/raised by the daemon.
+        return 1
     return 0 if final_state == "success" else 1
 
 

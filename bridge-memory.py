@@ -3294,6 +3294,15 @@ def _build_result_payload(
         "recommended_next_steps": recommended_next_steps,
         "artifacts": artifacts,
         "confidence": confidence,
+        # PR1.1 — `delivery_intent` is schema-required by the cron-runner
+        # (`bridge-cron-runner.py:RESULT_SCHEMA`). The memory-daily harvester
+        # writes its authoritative sidecar before the disposable child
+        # returns; without this field the runner's `validate_result` would
+        # reject the sidecar (Codex r1 P1) and the daemon's session-refresh
+        # gate could miss the queue-backfill action. memory-daily reporting
+        # is intentionally silent — the daemon already owns the parent
+        # session-refresh path.
+        "delivery_intent": "silent",
     }
 
 

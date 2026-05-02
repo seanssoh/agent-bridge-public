@@ -335,6 +335,12 @@ fields = {
         or request.get("failure_class")
         or "admin-resolvable"
     ).strip().lower() or "admin-resolvable",
+    # PR1.8 — surface the cron-runner reporting decision so the daemon can
+    # gate its own followup-task path. Empty string when the cron-runner
+    # didn't populate the field (legacy / pre-PR1 result.json).
+    "CRON_REPORTING_DECISION": str(result.get("reporting_decision") or status.get("reporting_decision") or "").strip(),
+    "CRON_DELIVERY_INTENT": str(result.get("delivery_intent") or status.get("delivery_intent") or "").strip(),
+    "CRON_INBOX_TASK_ID": str(result.get("inbox_task_id") if result.get("inbox_task_id") is not None else (status.get("inbox_task_id") if status.get("inbox_task_id") is not None else "")),
 }
 
 for key, value in fields.items():
@@ -615,16 +621,20 @@ bridge_cron_write_manifest() {
   local allow_channel_delivery="${22:-0}"
   local routing_mode="${23:-}"
   local disposable_needs_channels="${24:-0}"
+  # PR1.2 / PR1.6 — per-job reporting policy override + urgency hint.
+  # Empty string means "use runner default" (silent / normal).
+  local cron_reporting_policy="${25:-}"
+  local cron_urgency="${26:-}"
 
   mkdir -p "$(dirname "$manifest_file")"
 
   bridge_require_python
-  python3 - "$manifest_file" "$job_id" "$job_name" "$family" "$source_agent" "$target" "$slot" "$task_id" "$created_at" "$body_file" "$source_file" "$run_id" "$request_file" "$payload_file" "$result_file" "$status_file" "$stdout_log" "$stderr_log" "$job_delivery_mode" "$job_delivery_channel" "$job_delivery_target" "$allow_channel_delivery" "$routing_mode" "$disposable_needs_channels" <<'PY'
+  python3 - "$manifest_file" "$job_id" "$job_name" "$family" "$source_agent" "$target" "$slot" "$task_id" "$created_at" "$body_file" "$source_file" "$run_id" "$request_file" "$payload_file" "$result_file" "$status_file" "$stdout_log" "$stderr_log" "$job_delivery_mode" "$job_delivery_channel" "$job_delivery_target" "$allow_channel_delivery" "$routing_mode" "$disposable_needs_channels" "$cron_reporting_policy" "$cron_urgency" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-(manifest_file, job_id, job_name, family, source_agent, target, slot, task_id, created_at, body_file, source_file, run_id, request_file, payload_file, result_file, status_file, stdout_log, stderr_log, job_delivery_mode, job_delivery_channel, job_delivery_target, allow_channel_delivery, routing_mode, disposable_needs_channels) = sys.argv[1:]
+(manifest_file, job_id, job_name, family, source_agent, target, slot, task_id, created_at, body_file, source_file, run_id, request_file, payload_file, result_file, status_file, stdout_log, stderr_log, job_delivery_mode, job_delivery_channel, job_delivery_target, allow_channel_delivery, routing_mode, disposable_needs_channels, cron_reporting_policy, cron_urgency) = sys.argv[1:]
 
 payload = {
     "job_id": job_id,
@@ -636,8 +646,15 @@ payload = {
     "job_delivery_mode": job_delivery_mode,
     "job_delivery_channel": job_delivery_channel,
     "job_delivery_target": job_delivery_target,
+    # PR1.4 — `allow_channel_delivery` is the legacy key name. Wire the
+    # new `allow_structured_relay` alongside it so the cron-runner can
+    # read the new name preferentially while existing operator surfaces
+    # (manifest readers, audit consumers) keep seeing the old key.
     "allow_channel_delivery": allow_channel_delivery == "1",
+    "allow_structured_relay": allow_channel_delivery == "1",
     "disposable_needs_channels": disposable_needs_channels == "1",
+    "cron_reporting_policy": cron_reporting_policy,
+    "cron_urgency": cron_urgency,
     "slot": slot,
     "task_id": int(task_id),
     "created_at": created_at,
@@ -687,16 +704,21 @@ bridge_cron_write_request() {
   local routing_mode="${28:-}"
   local disposable_needs_channels="${29:-0}"
   local disable_mcp="${30:-0}"
+  # PR1.2 / PR1.6 — per-job reporting policy + urgency hint surfaced
+  # to the runner so policy overrides actually reach build_prompt and
+  # the inbox-task creation path.
+  local cron_reporting_policy="${31:-}"
+  local cron_urgency="${32:-}"
 
   mkdir -p "$(dirname "$request_file")"
 
   bridge_require_python
-  python3 - "$request_file" "$run_id" "$job_id" "$job_name" "$family" "$source_agent" "$target" "$slot" "$task_id" "$created_at" "$body_file" "$payload_file" "$result_file" "$status_file" "$stdout_log" "$stderr_log" "$source_file" "$payload_kind" "$target_engine" "$target_workdir" "$target_channels" "$target_discord_state_dir" "$target_telegram_state_dir" "$job_delivery_mode" "$job_delivery_channel" "$job_delivery_target" "$allow_channel_delivery" "$routing_mode" "$disposable_needs_channels" "$disable_mcp" <<'PY'
+  python3 - "$request_file" "$run_id" "$job_id" "$job_name" "$family" "$source_agent" "$target" "$slot" "$task_id" "$created_at" "$body_file" "$payload_file" "$result_file" "$status_file" "$stdout_log" "$stderr_log" "$source_file" "$payload_kind" "$target_engine" "$target_workdir" "$target_channels" "$target_discord_state_dir" "$target_telegram_state_dir" "$job_delivery_mode" "$job_delivery_channel" "$job_delivery_target" "$allow_channel_delivery" "$routing_mode" "$disposable_needs_channels" "$disable_mcp" "$cron_reporting_policy" "$cron_urgency" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-(request_file, run_id, job_id, job_name, family, source_agent, target, slot, task_id, created_at, body_file, payload_file, result_file, status_file, stdout_log, stderr_log, source_file, payload_kind, target_engine, target_workdir, target_channels, target_discord_state_dir, target_telegram_state_dir, job_delivery_mode, job_delivery_channel, job_delivery_target, allow_channel_delivery, routing_mode, disposable_needs_channels, disable_mcp) = sys.argv[1:]
+(request_file, run_id, job_id, job_name, family, source_agent, target, slot, task_id, created_at, body_file, payload_file, result_file, status_file, stdout_log, stderr_log, source_file, payload_kind, target_engine, target_workdir, target_channels, target_discord_state_dir, target_telegram_state_dir, job_delivery_mode, job_delivery_channel, job_delivery_target, allow_channel_delivery, routing_mode, disposable_needs_channels, disable_mcp, cron_reporting_policy, cron_urgency) = sys.argv[1:]
 
 payload = {
     "run_id": run_id,
@@ -714,9 +736,14 @@ payload = {
     "job_delivery_mode": job_delivery_mode,
     "job_delivery_channel": job_delivery_channel,
     "job_delivery_target": job_delivery_target,
+    # PR1.4 — wire both keys; cron-runner reads `allow_structured_relay`
+    # first and falls back to the legacy name.
     "allow_channel_delivery": allow_channel_delivery == "1",
+    "allow_structured_relay": allow_channel_delivery == "1",
     "disposable_needs_channels": disposable_needs_channels == "1",
     "disable_mcp": disable_mcp == "1",
+    "cron_reporting_policy": cron_reporting_policy,
+    "cron_urgency": cron_urgency,
     "slot": slot,
     "dispatch_task_id": int(task_id),
     "created_at": created_at,

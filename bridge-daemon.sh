@@ -3086,6 +3086,33 @@ cmd_run_cron_worker() {
     fi
   fi
 
+  # PR1.6 — gate the daemon-side followup task only when the cron-runner
+  # legitimately handled reporting itself: `silent` (intentional no-op) or
+  # `reported` (cron-runner created an inbox task and recorded its id).
+  # `invalid` and any unknown decision must continue to the failure path
+  # below so a broken result, schema/validation reject, or inbox writeback
+  # failure still wakes the existing daemon-side health surfaces (Codex
+  # r1 P1 — without this, a non-zero cron run with reporting_decision=
+  # invalid was silently dropped). Legacy cron jobs without a
+  # reporting_decision (PR1 rollout, downgrade, manual shim) also flow
+  # through the original path unchanged.
+  case "${CRON_REPORTING_DECISION:-}" in
+    silent|reported)
+      if [[ "${CRON_INBOX_TASK_ID:-}" =~ ^[0-9]+$ ]]; then
+        daemon_info "cron-runner already wrote inbox task #${CRON_INBOX_TASK_ID} for ${CRON_JOB_NAME:-$run_id} (decision=${CRON_REPORTING_DECISION}); skipping daemon followup"
+      else
+        daemon_info "cron-runner reported decision=${CRON_REPORTING_DECISION} for ${CRON_JOB_NAME:-$run_id}; skipping daemon followup"
+      fi
+      CRON_NEEDS_HUMAN_FOLLOWUP=""
+      ;;
+    invalid)
+      daemon_info "cron-runner reported decision=invalid for ${CRON_JOB_NAME:-$run_id}; daemon followup path remains active so the failure surfaces"
+      ;;
+    "" | *)
+      : # empty / unknown → legacy / forward-compatible path, no gate change
+      ;;
+  esac
+
   if [[ "$CRON_NEEDS_HUMAN_FOLLOWUP" == "1" ]]; then
     followup_body_file="$(bridge_cron_dispatch_followup_file_by_id "$run_id")"
     bridge_cron_write_followup_body "$run_id" "$followup_body_file"
