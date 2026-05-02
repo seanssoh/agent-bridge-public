@@ -208,6 +208,55 @@ Python으로 빠지는 패턴이 많다.
 
 이 레이어는 "보안 제품"이 아니라 shared-user runtime의 containment/audit layer다.
 
+### 6. cron with reporting
+
+cron은 disposable child가 부모 에이전트(target_agent)에게 inbox-only로 보고하는 contract다. PR1+PR2가 정의한 인터페이스의 핵심:
+
+- 모든 cron child의 result는 `delivery_intent ∈ {silent, main_session_only, forward_to_user}`을 declare해야 한다 — `bridge-cron-runner.RESULT_SCHEMA`가 schema 강제.
+- 부모는 `lib/bridge_cron_followup.parse_followup(body_text)`로 inbox task body의 frontmatter를 파싱하고, 결과 dict의 `delivery_intent`로 absorb / forward / no-op을 결정한다. 자세한 알고리즘은 [`docs/agent-runtime/common-instructions.md` §"Cron Followup Handling"](agent-runtime/common-instructions.md#cron-followup-handling).
+
+새 cron을 추가할 때 reporting을 어떻게 다룰지 결정하는 가장 간단한 경로:
+
+```bash
+# 기본 동작 — 결정은 child LLM이 매 run마다 결정 (default-silent on no signal)
+agb cron create --agent <target> --schedule "0 9 * * *" --title "monitor-X" \
+  --payload "<몸통은 cron-runner의 PR1 prompt preamble이 자동 주입>"
+
+# 특정 cron이 항상 main_session에 알리도록 강제 (heartbeat-style)
+agb cron create --agent <target> --schedule "*/15 * * * *" \
+  --title "heartbeat-rss" --payload "..." \
+  --metadata cronReportingPolicy=always_main_session
+
+# 항상 silent로 (결과를 child가 자체 storage로 처리하는 경우)
+agb cron create --agent <target> --schedule "*/5 * * * *" \
+  --title "memory-snapshot" --payload "..." \
+  --metadata cronReportingPolicy=always_silent
+
+# 우선순위 — 결과 inbox task가 high/urgent로 큐잉되어야 할 때
+agb cron create --agent <target> --schedule "*/30 * * * *" \
+  --title "incident-watch" --payload "..." \
+  --metadata cronUrgency=urgent
+```
+
+운영 중 디버깅 — `agb cron show <job>`이 직접 마지막 run의 trio를 보여준다:
+
+```bash
+agb cron show <job>
+# ...
+# last_status: success
+# last_reporting_decision: reported     # silent | reported | invalid
+# last_delivery_intent: main_session_only
+# last_inbox_task_id: 12345             # parent의 inbox에서 이 id로 찾을 수 있음
+```
+
+`--format json` / `--format shell` 출력에도 같은 trio가 들어간다 (`CRON_JOB_LAST_REPORTING_DECISION`, `CRON_JOB_LAST_DELIVERY_INTENT`, `CRON_JOB_LAST_INBOX_TASK_ID`). 자세한 schema와 dedupe semantics, daemon gate 동작은 [`ARCHITECTURE.md` "Cron reporting contract"](../ARCHITECTURE.md#cron-reporting-contract).
+
+PR1+PR2 분리에서 자주 헷갈리는 지점:
+
+- runner는 silent 또는 schema-required-fail (`reporting_decision = invalid`) 시 inbox task를 **만들지 않는다**. 따라서 부모가 `[cron-followup]`을 받았다는 것 자체가 "non-silent intent로 결정됐고 schema가 통과했다"는 뜻이다.
+- 부모는 frontmatter parser가 `None`을 돌려도 죽지 않고 legacy prose handling으로 fallback한다 — PR1 이전 cron이나 손으로 만든 task를 위함이다.
+- daemon은 `reporting_decision`이 `silent` 또는 `reported`면 자기 followup 경로를 **suppress**하고, `invalid` 또는 빈 값이면 기존 failure-followup 경로를 그대로 돌린다. 즉 schema-required-fail은 반드시 사람에게 surface된다.
+
 ## 6. 개발할 때의 기본 작업 흐름
 
 ### 상태 파악

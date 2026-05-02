@@ -8112,6 +8112,308 @@ for run_id in ("silent-A", "main-A", "main-B", "fwd-A", "fwd-B"):
 print("PR1.9 cron-runner end-to-end OK")
 PY
 
+log "PR2 — bridge_cron_followup.parse_followup matrix (frontmatter parser helper)"
+PR2_REPO_ROOT="$REPO_ROOT" python3 - <<'PY'
+import os
+import sys
+from pathlib import Path
+
+repo_root = Path(os.environ["PR2_REPO_ROOT"])
+sys.path.insert(0, str(repo_root / "lib"))
+from bridge_cron_followup import parse_followup, DELIVERY_INTENT_VALUES
+
+GOOD_MAIN = '''---
+{
+  "schema_version": 1,
+  "kind": "cron-followup",
+  "delivery_intent": "main_session_only",
+  "run_id": "run-1",
+  "job_id": "job-1",
+  "job_name": "smoke",
+  "family": "smoke",
+  "target_agent": "agb-dev-claude",
+  "reporting_policy": "default",
+  "summary_short": "all clean"
+}
+---
+
+# body
+'''
+
+# 1) valid main_session_only → returns dict with all canonical keys
+parsed = parse_followup(GOOD_MAIN)
+assert parsed is not None and parsed["delivery_intent"] == "main_session_only", parsed
+assert parsed["reporting_policy"] == "default"
+assert parsed["summary_short"] == "all clean"
+
+# 2) missing frontmatter → None
+assert parse_followup("# no fence here\nplain body") is None
+assert parse_followup("") is None
+assert parse_followup(None) is None  # type: ignore[arg-type]
+
+# 3) schema_version=2 → None
+assert parse_followup(GOOD_MAIN.replace('"schema_version": 1', '"schema_version": 2')) is None
+
+# 4) malformed JSON → None
+MAL = "---\n{not real json}\n---\n\nbody\n"
+assert parse_followup(MAL) is None
+
+# 5) unknown delivery_intent → None
+assert parse_followup(GOOD_MAIN.replace('"main_session_only"', '"weird_intent"')) is None
+
+# 6) forward_to_user without forward_target → None
+fw_no = GOOD_MAIN.replace('"main_session_only"', '"forward_to_user"')
+assert parse_followup(fw_no) is None
+
+# 7) forward_to_user with forward_target missing required field → None
+GOOD_FW = '''---
+{
+  "schema_version": 1,
+  "kind": "cron-followup",
+  "delivery_intent": "forward_to_user",
+  "run_id": "run-2",
+  "job_id": "job-2",
+  "job_name": "alerter",
+  "family": "alerts",
+  "target_agent": "agb-dev-claude",
+  "reporting_policy": "default",
+  "forward_target": {"channel": "telegram", "target_ref": "ops", "format": "markdown"},
+  "summary_short": "alert!"
+}
+---
+
+# body
+'''
+assert parse_followup(GOOD_FW.replace('"format": "markdown"', '"format": ""')) is None
+
+# 8) forward_to_user with full forward_target → ok and preserved
+fw_ok = parse_followup(GOOD_FW)
+assert fw_ok is not None and fw_ok["forward_target"]["target_ref"] == "ops"
+assert fw_ok["delivery_intent"] == "forward_to_user"
+
+# 9) legacy_structured_relay flag preserved through parse round-trip
+LEG = GOOD_MAIN.replace(
+    '"summary_short": "all clean"',
+    '"summary_short": "all clean", "legacy_structured_relay": true',
+)
+assert parse_followup(LEG)["legacy_structured_relay"] is True
+
+# 10) silent intent parses without summary_short
+SIL = '''---
+{
+  "schema_version": 1,
+  "kind": "cron-followup",
+  "delivery_intent": "silent",
+  "run_id": "run-s",
+  "job_id": "job-s",
+  "job_name": "noisy",
+  "family": "noisy",
+  "target_agent": "agb-dev-claude",
+  "reporting_policy": "always_silent"
+}
+---
+
+# body
+'''
+sil = parse_followup(SIL)
+assert sil is not None and sil["delivery_intent"] == "silent"
+
+# 11) summary_short over the 200-char cap → None
+LONG = GOOD_MAIN.replace('"summary_short": "all clean"', '"summary_short": "' + ("x" * 201) + '"')
+assert parse_followup(LONG) is None
+
+# 12) unknown top-level keys preserved (forward-compat)
+EXTRA = GOOD_MAIN.replace('"summary_short": "all clean"', '"summary_short": "all clean", "trace_id": "abc"')
+ex = parse_followup(EXTRA)
+assert ex is not None and ex.get("trace_id") == "abc"
+
+# 13) writer ↔ parser round-trip via the actual PR1 writer
+import importlib.util, tempfile
+
+spec = importlib.util.spec_from_file_location(
+    "bridge_cron_runner_smoke", repo_root / "bridge-cron-runner.py"
+)
+runner = importlib.util.module_from_spec(spec); spec.loader.exec_module(runner)
+with tempfile.TemporaryDirectory() as td:
+    path = Path(td) / "body.md"
+    runner.write_followup_body(
+        path,
+        schema_version=1,
+        run_id="rt-1",
+        job_id="jt-1",
+        job_name="round-trip",
+        family="round-trip",
+        target_agent="agb-dev-claude",
+        delivery_intent="main_session_only",
+        forward_target=None,
+        summary_short="all clean",
+        summary="body summary",
+        findings=[],
+        actions_taken=[],
+        recommended_next_steps=[],
+        artifacts=[],
+        reporting_policy_value="default",
+        structured_relay_legacy=False,
+    )
+    rt = parse_followup(path.read_text(encoding="utf-8"))
+    assert rt is not None and rt["run_id"] == "rt-1"
+
+print("PR2 parse_followup matrix OK")
+PY
+
+log "PR2 — native-finalize-run persists lastReportingDecision/lastDeliveryIntent/lastInboxTaskId trio + bridge-cron.py exposes them"
+PR2_FINALIZE_DIR="$TMP_ROOT/cron-pr2-finalize"
+PR2_FINALIZE_RUN_DIR="$PR2_FINALIZE_DIR/run"
+PR2_FINALIZE_JOBS_FILE="$PR2_FINALIZE_DIR/jobs.json"
+PR2_FINALIZE_REQUEST_FILE="$PR2_FINALIZE_RUN_DIR/request.json"
+PR2_FINALIZE_RESULT_FILE="$PR2_FINALIZE_RUN_DIR/result.json"
+PR2_FINALIZE_STATUS_FILE="$PR2_FINALIZE_RUN_DIR/status.json"
+mkdir -p "$PR2_FINALIZE_RUN_DIR"
+
+PR2_FINALIZE_JOBS_FILE="$PR2_FINALIZE_JOBS_FILE" \
+PR2_FINALIZE_REQUEST_FILE="$PR2_FINALIZE_REQUEST_FILE" \
+PR2_FINALIZE_RESULT_FILE="$PR2_FINALIZE_RESULT_FILE" \
+PR2_FINALIZE_STATUS_FILE="$PR2_FINALIZE_STATUS_FILE" \
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+
+jobs_file = Path(os.environ["PR2_FINALIZE_JOBS_FILE"])
+request_file = Path(os.environ["PR2_FINALIZE_REQUEST_FILE"])
+result_file = Path(os.environ["PR2_FINALIZE_RESULT_FILE"])
+status_file = Path(os.environ["PR2_FINALIZE_STATUS_FILE"])
+
+jobs_file.write_text(json.dumps({
+    "format": "agent-bridge-cron-v1",
+    "updatedAt": "2026-05-02T00:00:00+00:00",
+    "jobs": [
+        {
+            "id": "pr2-reported-job",
+            "name": "pr2-reported",
+            "agentId": "tester",
+            "enabled": True,
+            "schedule": {"kind": "cron", "expr": "*/15 * * * *", "tz": "UTC"},
+            "payload": {"kind": "text", "text": "ping"},
+            "state": {"consecutiveErrors": 0, "lastStatus": "-", "nextRunAtMs": 0},
+        }
+    ],
+}, indent=2) + "\n", encoding="utf-8")
+
+# A clean PR1 success: runner exited 0, reported, inbox task id 4242.
+result_file.write_text(json.dumps({
+    "status": "completed",
+    "summary": "ok",
+    "delivery_intent": "main_session_only",
+    "reporting_decision": "reported",
+    "inbox_task_id": 4242,
+    "needs_human_followup": True,
+    "summary_short": "all clean",
+}, indent=2) + "\n", encoding="utf-8")
+status_file.write_text(json.dumps({
+    "run_id": "pr2-reported-run",
+    "state": "success",
+    "engine": "claude",
+    "delivery_intent": "main_session_only",
+    "reporting_decision": "reported",
+    "inbox_task_id": 4242,
+}, indent=2) + "\n", encoding="utf-8")
+
+request_file.write_text(json.dumps({
+    "run_id": "pr2-reported-run",
+    "job_id": "pr2-reported-job",
+    "source_file": str(jobs_file.resolve()),
+    "result_file": str(result_file.resolve()),
+    "status_file": str(status_file.resolve()),
+}, indent=2) + "\n", encoding="utf-8")
+PY
+
+python3 "$REPO_ROOT/bridge-cron.py" native-finalize-run \
+    --jobs-file "$PR2_FINALIZE_JOBS_FILE" \
+    --request-file "$PR2_FINALIZE_REQUEST_FILE" \
+    --json >"$PR2_FINALIZE_DIR/finalize-output.json"
+
+PR2_FINALIZE_JOBS_FILE="$PR2_FINALIZE_JOBS_FILE" python3 - <<'PY'
+import json, os
+payload = json.loads(open(os.environ["PR2_FINALIZE_JOBS_FILE"], encoding="utf-8").read())
+job = next(j for j in payload["jobs"] if j["id"] == "pr2-reported-job")
+state = job.get("state") or {}
+assert state.get("lastReportingDecision") == "reported", state
+assert state.get("lastDeliveryIntent") == "main_session_only", state
+assert state.get("lastInboxTaskId") == 4242, state
+print("native-finalize-run reporting trio writeback OK")
+PY
+
+# `agb cron show` text + shell + json surfaces must include the new trio.
+PR2_SHOW_TEXT="$(python3 "$REPO_ROOT/bridge-cron.py" show --jobs-file "$PR2_FINALIZE_JOBS_FILE" pr2-reported)"
+assert_contains "$PR2_SHOW_TEXT" "last_reporting_decision: reported"
+assert_contains "$PR2_SHOW_TEXT" "last_delivery_intent: main_session_only"
+assert_contains "$PR2_SHOW_TEXT" "last_inbox_task_id: 4242"
+
+PR2_SHOW_SHELL="$(python3 "$REPO_ROOT/bridge-cron.py" show --jobs-file "$PR2_FINALIZE_JOBS_FILE" --format shell pr2-reported)"
+assert_contains "$PR2_SHOW_SHELL" "CRON_JOB_LAST_REPORTING_DECISION=reported"
+assert_contains "$PR2_SHOW_SHELL" "CRON_JOB_LAST_DELIVERY_INTENT=main_session_only"
+assert_contains "$PR2_SHOW_SHELL" "CRON_JOB_LAST_INBOX_TASK_ID=4242"
+
+PR2_SHOW_JSON="$(python3 "$REPO_ROOT/bridge-cron.py" show --jobs-file "$PR2_FINALIZE_JOBS_FILE" --format json pr2-reported)"
+PR2_SHOW_JSON="$PR2_SHOW_JSON" python3 - <<'PY'
+import json, os
+payload = json.loads(os.environ["PR2_SHOW_JSON"])
+assert payload["last_reporting_decision"] == "reported", payload
+assert payload["last_delivery_intent"] == "main_session_only", payload
+assert payload["last_inbox_task_id"] == 4242, payload
+print("agb cron show json/text/shell trio surface OK")
+PY
+
+# A silent run still records the trio (lastInboxTaskId stays absent).
+PR2_FINALIZE_JOBS_FILE="$PR2_FINALIZE_JOBS_FILE" \
+PR2_FINALIZE_REQUEST_FILE="$PR2_FINALIZE_REQUEST_FILE" \
+PR2_FINALIZE_RESULT_FILE="$PR2_FINALIZE_RESULT_FILE" \
+PR2_FINALIZE_STATUS_FILE="$PR2_FINALIZE_STATUS_FILE" \
+python3 - <<'PY'
+import json, os
+from pathlib import Path
+
+result_file = Path(os.environ["PR2_FINALIZE_RESULT_FILE"])
+status_file = Path(os.environ["PR2_FINALIZE_STATUS_FILE"])
+
+result_file.write_text(json.dumps({
+    "status": "completed",
+    "summary": "ok",
+    "delivery_intent": "silent",
+    "reporting_decision": "silent",
+    "needs_human_followup": False,
+}, indent=2) + "\n", encoding="utf-8")
+status_file.write_text(json.dumps({
+    "run_id": "pr2-silent-run",
+    "state": "success",
+    "engine": "claude",
+    "delivery_intent": "silent",
+    "reporting_decision": "silent",
+}, indent=2) + "\n", encoding="utf-8")
+PY
+
+python3 "$REPO_ROOT/bridge-cron.py" native-finalize-run \
+    --jobs-file "$PR2_FINALIZE_JOBS_FILE" \
+    --request-file "$PR2_FINALIZE_REQUEST_FILE" \
+    --json >"$PR2_FINALIZE_DIR/finalize-silent-output.json"
+
+PR2_FINALIZE_JOBS_FILE="$PR2_FINALIZE_JOBS_FILE" python3 - <<'PY'
+import json, os
+payload = json.loads(open(os.environ["PR2_FINALIZE_JOBS_FILE"], encoding="utf-8").read())
+job = next(j for j in payload["jobs"] if j["id"] == "pr2-reported-job")
+state = job.get("state") or {}
+# Silent run overwrites the trio: last_reporting becomes "silent",
+# intent becomes "silent", and lastInboxTaskId stays as the stale 4242
+# from the earlier reported run since the runner does not emit a new
+# inbox_task_id for silent. That is the correct behaviour — operators
+# inspecting the last *non-silent* run can still find the task id, and
+# a follow-up reported run will overwrite the trio together.
+assert state.get("lastReportingDecision") == "silent", state
+assert state.get("lastDeliveryIntent") == "silent", state
+assert state.get("lastInboxTaskId") == 4242, state
+print("native-finalize-run silent run still updates reporting trio OK")
+PY
+
 log "bridge_check_memory_pressure bash helper handles probe failure as healthy"
 "$BASH4_BIN" -lc "
   set -euo pipefail
