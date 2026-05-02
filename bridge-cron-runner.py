@@ -1477,7 +1477,21 @@ def cmd_run(args: argparse.Namespace) -> int:
         cron_urgency = "normal"
     followup_body_path = run_dir / "cron-followup.md"
 
-    if final_state in {"success", "error", "timed_out"} and delivery_intent != "silent" and not error_message:
+    # Codex r2 P1 / r3 P1 — compute the failure predicate BEFORE the inbox
+    # upsert so a structurally-valid child result with `status:"error"`
+    # (or any other non-success final state) cannot create a runner-owned
+    # inbox task that the daemon then duplicates via its failure-followup
+    # path. `silent` is reserved exclusively for clean-success-no-signal;
+    # everything else surfaces as `invalid` and is left to the existing
+    # daemon-side failure-followup path.
+    child_status_error = str(child_result.get("status", "")).strip().lower() == "error"
+    run_failed = (
+        bool(error_message)
+        or final_state != "success"
+        or child_status_error
+    )
+
+    if not run_failed and delivery_intent != "silent":
         write_followup_body(
             followup_body_path,
             schema_version=1,
@@ -1510,21 +1524,6 @@ def cmd_run(args: argparse.Namespace) -> int:
             job_name=str(request.get("job_name") or ""),
         )
 
-    # Codex r2 P1 — `silent` must mean "the cron ran, decided nothing was
-    # worth telling the parent, and exited cleanly". Anything else (engine
-    # error, timed-out, structured `status: error`, runner exception,
-    # subagent non-zero exit) MUST surface as `invalid` so the daemon's
-    # existing failure followup path picks it up. Without this guard, a
-    # cron that returns `{"status":"error","delivery_intent":"silent"}`
-    # — or one whose intent is forced to silent by `always_silent` while
-    # the underlying status is error — would be silently dropped by the
-    # daemon's silent/reported gate.
-    child_status_error = str(child_result.get("status", "")).strip().lower() == "error"
-    run_failed = (
-        bool(error_message)
-        or final_state != "success"
-        or child_status_error
-    )
     if run_failed:
         reporting_decision = "invalid"
     elif delivery_intent == "silent":
