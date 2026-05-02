@@ -1220,26 +1220,49 @@ fi
 # per-agent relay-token files). Was the manual job described by
 # docs/proposals/v0.7.0-install-cleanup-verification-prompt.md and
 # docs/proposals/jjujju-migration-prompt.md before v0.7.1.
+#
+# Two-phase to satisfy the rollback contract: dry-run first to learn
+# which paths the helper would touch, extend the upgrade backup
+# manifest with those paths via `backup-extend-live` (mirrors the
+# bridge-docs apply step a few sections below), then apply. Without
+# the manifest extension a subsequent `upgrade rollback` would not
+# restore the pre-cleanup roster line / state file content because the
+# primary backup is built only from the tracked-file analysis.
 RELAY_CLEANUP_JSON=""
 if [[ $DRY_RUN -eq 0 ]]; then
   set +e
-  RELAY_CLEANUP_JSON="$(python3 "$SOURCE_ROOT/bridge-relay-cleanup.py" \
-    --target-root "$TARGET_ROOT" --json 2>/dev/null)"
-  _relay_cleanup_rc=$?
+  RELAY_CLEANUP_PREVIEW_JSON="$(python3 "$SOURCE_ROOT/bridge-relay-cleanup.py" \
+    --target-root "$TARGET_ROOT" --dry-run --json 2>/dev/null)"
+  _relay_cleanup_preview_rc=$?
   set -e
-  if [[ $_relay_cleanup_rc -ne 0 ]]; then
-    echo "[bridge-upgrade] WARN: telegram-relay residue cleanup helper exited non-zero ($_relay_cleanup_rc); manual cleanup may still be required (see docs/proposals/v0.7.0-install-cleanup-verification-prompt.md)" >&2
-    RELAY_CLEANUP_JSON=""
-  fi
-  if [[ -n "$RELAY_CLEANUP_JSON" ]]; then
-    if python3 - "$RELAY_CLEANUP_JSON" <<'PY' >/dev/null 2>&1
+  if [[ $_relay_cleanup_preview_rc -eq 0 && -n "$RELAY_CLEANUP_PREVIEW_JSON" ]]; then
+    if python3 - "$RELAY_CLEANUP_PREVIEW_JSON" <<'PY' >/dev/null 2>&1
 import json, sys
 raise SystemExit(0 if json.loads(sys.argv[1]).get("any_changes") else 1)
 PY
     then
-      bridge_audit_log upgrade telegram_relay_residue_cleanup_applied "$TARGET_VERSION" \
-        --detail summary="$RELAY_CLEANUP_JSON" >/dev/null 2>&1 || true
+      if [[ -n "$BACKUP_ROOT" ]]; then
+        python3 "$SOURCE_ROOT/bridge-upgrade.py" backup-extend-live \
+          --target-root "$TARGET_ROOT" \
+          --backup-root "$BACKUP_ROOT" \
+          --paths-json "$RELAY_CLEANUP_PREVIEW_JSON" >/dev/null 2>&1 || true
+      fi
+      set +e
+      RELAY_CLEANUP_JSON="$(python3 "$SOURCE_ROOT/bridge-relay-cleanup.py" \
+        --target-root "$TARGET_ROOT" --json 2>/dev/null)"
+      _relay_cleanup_rc=$?
+      set -e
+      if [[ $_relay_cleanup_rc -ne 0 ]]; then
+        echo "[bridge-upgrade] WARN: telegram-relay residue cleanup helper exited non-zero ($_relay_cleanup_rc); manual cleanup may still be required (see docs/proposals/v0.7.0-install-cleanup-verification-prompt.md)" >&2
+        RELAY_CLEANUP_JSON=""
+      fi
+      if [[ -n "$RELAY_CLEANUP_JSON" ]]; then
+        bridge_audit_log upgrade telegram_relay_residue_cleanup_applied "$TARGET_VERSION" \
+          --detail summary="$RELAY_CLEANUP_JSON" >/dev/null 2>&1 || true
+      fi
     fi
+  elif [[ $_relay_cleanup_preview_rc -ne 0 ]]; then
+    echo "[bridge-upgrade] WARN: telegram-relay residue cleanup preview exited non-zero ($_relay_cleanup_preview_rc); skipping cleanup, manual procedure may be required (see docs/proposals/v0.7.0-install-cleanup-verification-prompt.md)" >&2
   fi
 fi
 

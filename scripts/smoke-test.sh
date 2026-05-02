@@ -569,7 +569,9 @@ log "telegram-relay residue cleanup helper: detect + apply + idempotent (v0.7.1 
 # bridge-home with the four classes of v0.6.37+ relay residue (state
 # files, per-agent relay-token, channel entry, env vars), runs the
 # helper twice (first dry-run, then apply), then a third no-op pass to
-# verify idempotency.
+# verify idempotency. Also pins the roster to mode 0600 and asserts the
+# atomic write preserves it under a `umask 022` (the regression Codex
+# r1 caught against the first revision of this PR).
 RELAY_CLEANUP_ROOT="$(mktemp -d -t relay-cleanup-unit.XXXXXX)"
 mkdir -p "$RELAY_CLEANUP_ROOT/state/channels/telegram/abcd1234" \
          "$RELAY_CLEANUP_ROOT/agents/jjujju/.telegram"
@@ -585,6 +587,7 @@ BRIDGE_AGENT_CHANNELS["clean"]="plugin:discord@claude-plugins-official"
 BRIDGE_TELEGRAM_RELAY_ENABLED=1
 export BRIDGE_TELEGRAM_USE_RELAY=true
 ROSTER
+chmod 0600 "$RELAY_CLEANUP_ROOT/agent-roster.local.sh"
 
 # Round 1: dry-run must report any_changes=true and not modify anything
 RELAY_CLEANUP_DRY_JSON="$(python3 "$REPO_ROOT/bridge-relay-cleanup.py" \
@@ -594,11 +597,15 @@ RELAY_CLEANUP_DRY_ANY="$(printf '%s' "$RELAY_CLEANUP_DRY_JSON" | python3 -c 'imp
 [[ -f "$RELAY_CLEANUP_ROOT/state/channels/telegram/tokens.list" ]] || die "relay-cleanup dry-run unexpectedly removed tokens.list"
 [[ -f "$RELAY_CLEANUP_ROOT/agents/jjujju/.telegram/relay-token" ]] || die "relay-cleanup dry-run unexpectedly removed relay-token"
 grep -Fq 'BRIDGE_TELEGRAM_RELAY_ENABLED' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" || die "relay-cleanup dry-run unexpectedly stripped env var line"
-log "  [ok] dry-run reports any_changes without mutating filesystem or roster"
+RELAY_CLEANUP_DRY_PATHS="$(printf '%s' "$RELAY_CLEANUP_DRY_JSON" | python3 -c 'import json,sys; print(len(json.load(sys.stdin).get("changed_paths") or []))')"
+(( RELAY_CLEANUP_DRY_PATHS >= 4 )) || die "relay-cleanup dry-run changed_paths should list >=4 entries (roster + 3 state) but reported $RELAY_CLEANUP_DRY_PATHS: $RELAY_CLEANUP_DRY_JSON"
+log "  [ok] dry-run reports any_changes + changed_paths without mutating filesystem or roster"
 
 # Round 2: apply must remove all four residue classes and rewrite the channel line
-RELAY_CLEANUP_APPLY_JSON="$(python3 "$REPO_ROOT/bridge-relay-cleanup.py" \
-  --target-root "$RELAY_CLEANUP_ROOT" --json)"
+# under a `umask 022` (regression: Codex r1 caught the original revision
+# widening 0600 → 0644 because the helper's atomic-write didn't preserve mode).
+RELAY_CLEANUP_APPLY_JSON="$( ( umask 022 && python3 "$REPO_ROOT/bridge-relay-cleanup.py" \
+  --target-root "$RELAY_CLEANUP_ROOT" --json ) )"
 RELAY_CLEANUP_APPLY_ANY="$(printf '%s' "$RELAY_CLEANUP_APPLY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("any_changes"))')"
 [[ "$RELAY_CLEANUP_APPLY_ANY" == "True" ]] || die "relay-cleanup apply did not report any_changes: $RELAY_CLEANUP_APPLY_JSON"
 [[ ! -e "$RELAY_CLEANUP_ROOT/state/channels/telegram/tokens.list" ]] || die "relay-cleanup apply did not remove tokens.list"
@@ -612,7 +619,9 @@ grep -Fq 'plugin:telegram-relay' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" && 
 grep -Fq 'plugin:telegram@claude-plugins-official' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" || die "relay-cleanup apply did not insert plugin:telegram@claude-plugins-official into BRIDGE_AGENT_CHANNELS"
 grep -Fq 'plugin:foo' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" || die "relay-cleanup apply dropped unrelated plugin:foo channel item"
 grep -Fq 'plugin:discord@claude-plugins-official' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" || die "relay-cleanup apply touched unrelated agent channel line"
-log "  [ok] apply removed every residue class while preserving .telegram/.env and unrelated channels"
+RELAY_CLEANUP_POST_MODE="$(stat -f '%Lp' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" 2>/dev/null || stat -c '%a' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh")"
+[[ "$RELAY_CLEANUP_POST_MODE" == "600" ]] || die "relay-cleanup apply widened agent-roster.local.sh mode under umask 022: expected 600 got $RELAY_CLEANUP_POST_MODE"
+log "  [ok] apply removed every residue class, preserved .telegram/.env + unrelated channels, and kept agent-roster.local.sh at mode 0600"
 
 # Round 3: idempotent re-run must report any_changes=false
 RELAY_CLEANUP_NOOP_JSON="$(python3 "$REPO_ROOT/bridge-relay-cleanup.py" \

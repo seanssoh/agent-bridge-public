@@ -35,8 +35,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import stat
 import sys
+import tempfile
 from pathlib import Path
 
 ENV_KEYS_TO_REMOVE = (
@@ -56,9 +59,71 @@ def _load_text(path: Path) -> str | None:
 
 
 def _atomic_write(path: Path, text: str) -> None:
-    tmp = path.with_suffix(path.suffix + ".cleanup-tmp")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(path)
+    """Atomic, mode-preserving write.
+
+    Captures the existing file's permission bits + group ownership before
+    writing, then re-applies them to the new file before AND after the
+    rename so the result matches the operator's pre-write expectations
+    (e.g. a `0600` ``agent-roster.local.sh`` stays `0600` even when the
+    process inherits a default `0022` umask). Uses a randomized tmp name
+    in the parent directory to avoid both predictable-path squatting and
+    symlink-follow attacks against a stale ``.cleanup-tmp`` left from an
+    interrupted prior run.
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+
+    original_mode: int | None = None
+    original_gid: int | None = None
+    try:
+        st = path.stat()
+        original_mode = stat.S_IMODE(st.st_mode)
+        original_gid = st.st_gid
+    except (FileNotFoundError, OSError):
+        original_mode = 0o600  # private default if file is fresh
+        original_gid = None
+
+    fd, tmp_str = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".cleanup-tmp",
+        dir=str(parent),
+    )
+    tmp_path = Path(tmp_str)
+    try:
+        try:
+            os.fchmod(fd, original_mode)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        # Re-apply mode in case fchmod was clobbered by an ACL/umask layer
+        # between mkstemp and fdopen close.
+        try:
+            os.chmod(tmp_path, original_mode)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+        # Belt-and-suspenders: re-apply mode after replace in case a
+        # filesystem (or copy-on-write layer) re-derives mode from the
+        # parent ACL on rename. Some FUSE backends do this.
+        try:
+            os.chmod(path, original_mode)
+        except OSError:
+            pass
+        if original_gid is not None:
+            try:
+                os.chown(path, -1, original_gid)
+            except (PermissionError, OSError):
+                # gid preservation is best-effort; non-root cleanup
+                # cannot reassign group when the operator is not in
+                # the target group, and that is acceptable.
+                pass
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def remove_env_lines(roster_path: Path, *, dry_run: bool) -> list[str]:
@@ -264,6 +329,20 @@ def main() -> int:
             "agent_tokens_removed",
         )
     )
+
+    # Consolidated `changed_paths` for `bridge-upgrade.py backup-extend-live`
+    # consumption. The `removed:` prefix matches the convention of the
+    # existing backup-extend-live API (paths that will be deleted are
+    # recorded so rollback can restore them, identical handling to
+    # files that will be modified-in-place).
+    changed: list[str] = []
+    if agents_migrated or env_keys_removed:
+        changed.append(str(roster_file))
+    for path_str in state_files_removed:
+        changed.append(f"removed:{path_str}")
+    for path_str in agent_tokens_removed:
+        changed.append(f"removed:{path_str}")
+    summary["changed_paths"] = changed
 
     if args.json:
         print(json.dumps(summary, sort_keys=True))
