@@ -280,11 +280,13 @@ def build_job_record(job):
         # PR2 — surface the cron-runner reporting trio so `agb cron show`
         # / `agb cron list --json` can trace cron → inbox → main-session
         # without the operator grepping `state/cron/runs/<run-id>/`.
-        # Empty string = no run yet under PR1 contract; pre-PR1 jobs.json
-        # state never had these keys so the missing → "-" mapping mirrors
-        # `last_delivery_status` for consistency in human renderers.
-        "last_reporting_decision": state.get("lastReportingDecision") or "-",
-        "last_delivery_intent": state.get("lastDeliveryIntent") or "-",
+        # Absence stays as None at this layer (Codex PR #500 r1 P2 #1):
+        # JSON consumers must distinguish "never ran" (`null`) from a
+        # legitimate "-" value, and `render_shell` already maps `None` →
+        # empty string. The "-" fallback is applied only in the human
+        # text renderer (`print_show`).
+        "last_reporting_decision": state.get("lastReportingDecision") or None,
+        "last_delivery_intent": state.get("lastDeliveryIntent") or None,
         "last_inbox_task_id": state.get("lastInboxTaskId"),
         "session_target": job.get("sessionTarget", "-"),
         "wake_mode": job.get("wakeMode", "-"),
@@ -1590,8 +1592,10 @@ def print_show(args, records):
     print(f"last_status: {record['last_status']}")
     print(f"consecutive_errors: {record['consecutive_errors']}")
     print(f"last_delivery_status: {record['last_delivery_status']}")
-    print(f"last_reporting_decision: {record['last_reporting_decision']}")
-    print(f"last_delivery_intent: {record['last_delivery_intent']}")
+    # PR2 — human renderer applies the "-" fallback (record keeps None so
+    # JSON / shell consumers can distinguish absence from a legit value).
+    print(f"last_reporting_decision: {record['last_reporting_decision'] or '-'}")
+    print(f"last_delivery_intent: {record['last_delivery_intent'] or '-'}")
     inbox_task_id = record["last_inbox_task_id"]
     print(f"last_inbox_task_id: {'-' if inbox_task_id in (None, '', 0) else inbox_task_id}")
     print()

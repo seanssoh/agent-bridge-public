@@ -8364,6 +8364,49 @@ assert payload["last_inbox_task_id"] == 4242, payload
 print("agb cron show json/text/shell trio surface OK")
 PY
 
+# Codex PR #500 r1 P2 #1 — a job with no PR1/PR2 reporting history must
+# render text "-", JSON null, shell empty string. The record itself
+# keeps None for the two strings so JSON consumers can distinguish
+# absence from a legit "-" value.
+PR2_NORUN_JOBS_FILE="$PR2_FINALIZE_DIR/jobs-no-history.json"
+cat >"$PR2_NORUN_JOBS_FILE" <<'EOF'
+{
+  "format": "agent-bridge-cron-v1",
+  "updatedAt": "2026-05-02T00:00:00+00:00",
+  "jobs": [
+    {
+      "id": "pr2-no-history-job",
+      "name": "pr2-no-history",
+      "agentId": "tester",
+      "enabled": true,
+      "schedule": {"kind": "cron", "expr": "*/15 * * * *", "tz": "UTC"},
+      "payload": {"kind": "text", "text": "ping"},
+      "state": {"consecutiveErrors": 0, "lastStatus": "-", "nextRunAtMs": 0}
+    }
+  ]
+}
+EOF
+
+PR2_NORUN_TEXT="$(python3 "$REPO_ROOT/bridge-cron.py" show --jobs-file "$PR2_NORUN_JOBS_FILE" pr2-no-history)"
+assert_contains "$PR2_NORUN_TEXT" "last_reporting_decision: -"
+assert_contains "$PR2_NORUN_TEXT" "last_delivery_intent: -"
+assert_contains "$PR2_NORUN_TEXT" "last_inbox_task_id: -"
+
+PR2_NORUN_SHELL="$(python3 "$REPO_ROOT/bridge-cron.py" show --jobs-file "$PR2_NORUN_JOBS_FILE" --format shell pr2-no-history)"
+assert_contains "$PR2_NORUN_SHELL" "CRON_JOB_LAST_REPORTING_DECISION=''"
+assert_contains "$PR2_NORUN_SHELL" "CRON_JOB_LAST_DELIVERY_INTENT=''"
+assert_contains "$PR2_NORUN_SHELL" "CRON_JOB_LAST_INBOX_TASK_ID=''"
+
+PR2_NORUN_JSON="$(python3 "$REPO_ROOT/bridge-cron.py" show --jobs-file "$PR2_NORUN_JOBS_FILE" --format json pr2-no-history)"
+PR2_NORUN_JSON="$PR2_NORUN_JSON" python3 - <<'PY'
+import json, os
+payload = json.loads(os.environ["PR2_NORUN_JSON"])
+assert payload["last_reporting_decision"] is None, payload
+assert payload["last_delivery_intent"] is None, payload
+assert payload["last_inbox_task_id"] is None, payload
+print("agb cron show no-history → text '-', json null, shell '' OK")
+PY
+
 # A silent run still records the trio (lastInboxTaskId stays absent).
 PR2_FINALIZE_JOBS_FILE="$PR2_FINALIZE_JOBS_FILE" \
 PR2_FINALIZE_REQUEST_FILE="$PR2_FINALIZE_REQUEST_FILE" \
