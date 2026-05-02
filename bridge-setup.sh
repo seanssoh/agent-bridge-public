@@ -403,7 +403,11 @@ bridge_setup_replace_agent_telegram_channel() {
     item="$(bridge_qualify_channel_item "$item")"
     [[ -n "$item" ]] || continue
     case "$item" in
-      plugin:telegram@claude-plugins-official)
+      plugin:telegram@claude-plugins-official|plugin:telegram-relay@agent-bridge|plugin:telegram-relay@*)
+        # Drop both the canonical official plugin (it'll be re-added below as
+        # $channel) and any v0.6.37+ relay registration (#475 phases 2/3 were
+        # reverted in v0.7.0; existing relay-host roster entries must be
+        # stripped so setup converges back on the official plugin).
         continue
         ;;
     esac
