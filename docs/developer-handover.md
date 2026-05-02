@@ -226,7 +226,7 @@ agb cron create --agent <target> --schedule "0 9 * * *" --title "monitor-X" \
 
 per-job override (`metadata.cronReportingPolicy` / `metadata.cronUrgency`)는 PR2 시점에 `agb cron create` CLI flag로 노출되어 있지 않다. 두 가지 supported path:
 
-**(a) 직접 jobs.json 편집** — 가장 직관적. `agb cron create`로 job을 만든 다음, `~/.agent-bridge/state/cron/native-jobs.json`을 열어 해당 job의 `metadata` 객체에 키를 추가:
+**(a) 직접 jobs.json 편집** — 가장 직관적. `agb cron create`로 job을 만든 다음, `~/.agent-bridge/cron/jobs.json` (= `$BRIDGE_NATIVE_CRON_JOBS_FILE`, 기본값 `$BRIDGE_HOME/cron/jobs.json`) 을 열어 해당 job의 `metadata` 객체에 키를 추가:
 
 ```json
 {
