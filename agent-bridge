@@ -74,7 +74,6 @@ Usage:
   $CLI_NAME usage <status|monitor|alerts> ...
   $CLI_NAME watchdog scan [agent...] [--json]
   $CLI_NAME discord <status|sync>
-  $CLI_NAME telegram-relay <start|stop|status|health> ...
   $CLI_NAME migrate runtime inventory [--json] [--report <path>]
   $CLI_NAME migrate runtime sync [--dry-run]
   $CLI_NAME migrate runtime rewrite-cron [--dry-run] [--json]
@@ -130,7 +129,6 @@ Usage:
   $CLI_NAME setup agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start]
   $CLI_NAME discord status
   $CLI_NAME discord sync
-  $CLI_NAME telegram-relay status
   $CLI_NAME cron inventory [--mode recurring|one-shot|all] [--family <family>] [--limit <count>]
   $CLI_NAME cron show <job-name-or-id>
   $CLI_NAME cron import [--source-jobs-file <path>] [--dry-run]
@@ -720,10 +718,6 @@ PY
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-discord-relay.sh" "$@"
       ;;
-    telegram-relay)
-      shift
-      exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-telegram-relay.sh" "$@"
-      ;;
     migrate)
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-migrate.sh" "$@"
@@ -771,7 +765,7 @@ PY
   # sqlite3 fallback path. Reject with an intent-recovery suggestion
   # before the spawn parser sees it.
   if [[ -n "${1:-}" && "${1:0:1}" != "-" ]]; then
-    _top_valid="admin bootstrap init version upgrade escalate upstream review user guard diagnose knowledge config bundle intake list status kill attach urgent task profile setup agent cron memory audit usage watchdog discord telegram-relay migrate wiki isolate unisolate worktree inbox show claim done cancel update handoff summary create"
+    _top_valid="admin bootstrap init version upgrade escalate upstream review user guard diagnose knowledge config bundle intake list status kill attach urgent task profile setup agent cron memory audit usage watchdog discord migrate wiki isolate unisolate worktree inbox show claim done cancel update handoff summary create"
     _hint="$(bridge_suggest_subcommand "$1" "$_top_valid")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 명령입니다: $1"

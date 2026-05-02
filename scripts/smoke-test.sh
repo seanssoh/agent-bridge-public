@@ -444,7 +444,10 @@ run_cp_case "338 B1: Welcome banner above a fresh 36% HUD -> warning silenced (b
   $'Welcome to Claude Code!\n\n> hi\n\nContext ███░░░░░░░ 36%\n'
 
 log "context-pressure daemon function: audit-only state transitions (issue #472)"
-CONTEXT_PRESSURE_UNIT_ROOT="$(mktemp -d "$TMP_ROOT/context-pressure-unit.XXXXXX")"
+# This unit-style block runs before the BRIDGE_HOME / TMP_ROOT setup at
+# the bottom of the script, so it allocates its own temp root via
+# `mktemp -d` and removes it inline after the assertions complete.
+CONTEXT_PRESSURE_UNIT_ROOT="$(mktemp -d -t context-pressure-unit.XXXXXX)"
 CONTEXT_PRESSURE_UNIT_AUDIT="$CONTEXT_PRESSURE_UNIT_ROOT/audit.log"
 CONTEXT_PRESSURE_UNIT_STATE_DIR="$CONTEXT_PRESSURE_UNIT_ROOT/state"
 CONTEXT_PRESSURE_UNIT_HELPER="$CONTEXT_PRESSURE_UNIT_ROOT/context-pressure-functions.sh"
@@ -558,6 +561,7 @@ echo ok
 CONTEXT_PRESSURE_UNIT_RC=$?
 set -e
 [[ "$CONTEXT_PRESSURE_UNIT_RC" -eq 0 && "$CONTEXT_PRESSURE_UNIT_OUTPUT" == "ok" ]] || die "context-pressure daemon function unit failed: $CONTEXT_PRESSURE_UNIT_OUTPUT"
+rm -rf "$CONTEXT_PRESSURE_UNIT_ROOT"
 log "  [ok] context-pressure daemon function audit/state transitions"
 
 log "stall-detector rate_limit/auth regex narrowing (#329 Track A)"

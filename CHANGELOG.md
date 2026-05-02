@@ -6,6 +6,11 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+### Removed
+
+- **telegram-relay daemon (#475 phases 2/3 reversal)**: the v0.6.37+ telegram-relay daemon, `agent-bridge telegram-relay` CLI, `plugins/telegram-relay/`, `bridge-telegram-relay.sh`, `lib/telegram-relay.py`, `bridge-setup.py telegram --use-relay` / `--no-relay` flags, the `BRIDGE_TELEGRAM_RELAY_ENABLED` / `BRIDGE_TELEGRAM_USE_RELAY` env vars, the `bridge_telegram_relay_supervise` daemon step, and the relay status fields in `agent-bridge status` are removed. Telegram outbound now flows through `plugin:telegram@claude-plugins-official`, with cron children writing structured inbox tasks per the PR1+PR2 cron reporting contract. Per-agent `.telegram/.env` and `.telegram/access.json` are preserved — the official plugin still reads them. See `OPERATOR_ACTIONS_PENDING.md` for the manual operator migration on relay-using hosts (`docs/proposals/jjujju-migration-prompt.md`); hosts that never registered the relay require no action.
+- **Smoke harness drops `telegram-relay*` smokes**: `scripts/smoke/telegram-relay.sh`, `scripts/smoke/telegram-relay-plugin.sh`, and `scripts/smoke/telegram-relay-setup.sh` are deleted along with their `scripts/ci-select-smoke.sh` includes.
+
 ## [0.6.40] — 2026-04-30
 
 ### Highlight — stall watchdog stops false-positive nudges

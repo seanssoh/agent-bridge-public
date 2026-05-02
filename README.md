@@ -652,7 +652,7 @@ cat ~/.agent-bridge/VERSION                # 0.6.39
 
 ## 4단계 — `[upgrade-complete]` task 처리
 
-`upgrade` 가 자동 등록한 `[upgrade-complete]` task body 의 `OPERATOR_ACTIONS_PENDING.md` 안내를 따라 적용 가능한 release section 만 처리. 텔레그램 사용 host 라면 v0.6.37 telegram-relay opt-in section 확인.
+`upgrade` 가 자동 등록한 `[upgrade-complete]` task body 의 `OPERATOR_ACTIONS_PENDING.md` 안내를 따라 적용 가능한 release section 만 처리. v0.7.0 이상으로 올라가는 텔레그램 relay 사용 host 라면 telegram-relay 제거 section 도 함께 확인 (`docs/proposals/jjujju-migration-prompt.md` 의 수동 마이그레이션 prompt).
 
 ## 보고
 

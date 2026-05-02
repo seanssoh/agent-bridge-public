@@ -5,11 +5,9 @@ from __future__ import annotations
 
 import argparse
 import csv
-import hashlib
 import json
 import os
 import signal
-import socket
 import sqlite3
 import sys
 from datetime import datetime, timedelta, timezone
@@ -192,48 +190,6 @@ def telegram_token_from_state_dir(state_dir: Path) -> str:
     return ""
 
 
-def token_hash_for_value(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
-
-
-def load_telegram_relay_tokens(state_root: Path) -> dict[str, str]:
-    tokens_file = state_root / "tokens.list"
-    rows: dict[str, str] = {}
-    try:
-        lines = tokens_file.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return rows
-    for line in lines:
-        if not line.strip() or line.startswith("#"):
-            continue
-        parts = line.split("\t", 1)
-        if len(parts) == 2 and parts[0].strip():
-            rows[parts[0].strip()] = parts[1].strip()
-    return rows
-
-
-def relay_rpc_health(socket_path: Path) -> dict[str, object]:
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
-        client.settimeout(0.75)
-        client.connect(str(socket_path))
-        client.sendall(b'{"verb":"health"}\n')
-        chunks: list[bytes] = []
-        while True:
-            chunk = client.recv(4096)
-            if not chunk:
-                break
-            chunks.append(chunk)
-            if b"\n" in chunk:
-                break
-    raw = b"".join(chunks).split(b"\n", 1)[0]
-    if not raw:
-        raise RuntimeError("empty relay health response")
-    payload = json.loads(raw.decode("utf-8"))
-    if not isinstance(payload, dict):
-        raise RuntimeError("relay health response was not an object")
-    return payload
-
-
 def plugin_items_from_workdir(workdir: str) -> list[str]:
     path = Path(workdir).expanduser() / ".mcp.json"
     try:
@@ -247,9 +203,7 @@ def plugin_items_from_workdir(workdir: str) -> list[str]:
     for name in servers:
         if not isinstance(name, str) or not name.strip():
             continue
-        if name == "telegram-relay":
-            items.append("plugin:telegram-relay@agent-bridge")
-        elif "@" in name:
+        if "@" in name:
             items.append(f"plugin:{name}")
         else:
             items.append(f"plugin:{name}")
@@ -281,88 +235,18 @@ def plugin_identity(item: str) -> tuple[str, str, str]:
     return name, marketplace, f"plugin:{spec}"
 
 
-def telegram_relay_plugin_status(
-    row: dict[str, str],
-    bridge_state_dir: str,
-    now_ts: float,
-) -> dict[str, object]:
-    state_root = Path(bridge_state_dir).expanduser() / "channels" / "telegram"
-    telegram_dir = Path(row.get("workdir", "")).expanduser() / ".telegram"
-    token = telegram_token_from_state_dir(telegram_dir)
-    base: dict[str, object] = {
-        "name": "telegram-relay",
-        "id": "plugin:telegram-relay@agent-bridge",
-        "marketplace": "agent-bridge",
-        "status": "credentials-missing",
-        "state_dir": str(telegram_dir),
-        "token_hash": "",
-        "socket": "",
-        "supervised": False,
-        "connected_clients": 0,
-        "last_get_updates_ts": 0,
-    }
-    if not token:
-        return base
-
-    token_hash = token_hash_for_value(token)
-    socket_path = state_root / f"{token_hash}.sock"
-    tokens = load_telegram_relay_tokens(state_root)
-    base.update(
-        {
-            "token_hash": token_hash,
-            "socket": str(socket_path),
-            "supervised": token_hash in tokens,
-        }
-    )
-    if token_hash not in tokens:
-        base["status"] = "not-supervised"
-        return base
-    if not socket_path.exists():
-        base["status"] = "daemon-down"
-        return base
-
-    try:
-        health = relay_rpc_health(socket_path)
-    except Exception as exc:  # noqa: BLE001 - status should degrade, not crash.
-        base["status"] = "daemon-down"
-        base["error"] = str(exc)
-        return base
-
-    clients = int(health.get("connected_clients") or 0)
-    last_updates = float(health.get("last_get_updates_ts") or 0)
-    base.update(
-        {
-            "connected_clients": clients,
-            "last_get_updates_ts": last_updates,
-            "polling_cursor": int(health.get("polling_cursor") or 0),
-            "buffered_updates": int(health.get("buffered_updates") or 0),
-        }
-    )
-    if not last_updates or now_ts - last_updates > 60:
-        base["status"] = "polling-stale"
-    elif clients >= 1:
-        base["status"] = "connected"
-    else:
-        base["status"] = "waiting-for-plugin"
-    return base
-
-
-def plugins_for_agent(row: dict[str, str], bridge_state_dir: str, now_ts: float | None = None) -> list[dict[str, object]]:
-    now_value = now_ts if now_ts is not None else datetime.now(timezone.utc).timestamp()
+def plugins_for_agent(row: dict[str, str]) -> list[dict[str, object]]:
     plugins: list[dict[str, object]] = []
     for item in configured_plugin_items(row):
         name, marketplace, plugin_id = plugin_identity(item)
-        if name == "telegram-relay":
-            plugins.append(telegram_relay_plugin_status(row, bridge_state_dir, now_value))
-        else:
-            plugins.append(
-                {
-                    "name": name,
-                    "id": plugin_id,
-                    "marketplace": marketplace,
-                    "status": "unknown",
-                }
-            )
+        plugins.append(
+            {
+                "name": name,
+                "id": plugin_id,
+                "marketplace": marketplace,
+                "status": "unknown",
+            }
+        )
     return plugins
 
 
@@ -671,9 +555,8 @@ def render_dashboard(args: argparse.Namespace) -> str:
             or int(metrics.get(row["agent"], {}).get("blocked_count", 0) or 0) > 0
         ]
 
-    now_ts = datetime.now(timezone.utc).timestamp()
     plugins_by_agent = {
-        row["agent"]: plugins_for_agent(row, args.bridge_state_dir, now_ts)
+        row["agent"]: plugins_for_agent(row)
         for row in roster
     }
     visible_agents = len(roster)
@@ -844,7 +727,6 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
             metrics = fetch_agent_metrics(conn)
             totals = fetch_totals(conn)
 
-    now_ts = datetime.now(timezone.utc).timestamp()
     agents: dict[str, object] = {}
     for row in roster:
         agent = row["agent"]
@@ -880,7 +762,7 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
                     args.stale_critical_seconds,
                 ),
             },
-            "plugins": plugins_for_agent(row, args.bridge_state_dir, now_ts),
+            "plugins": plugins_for_agent(row),
         }
 
     payload = {

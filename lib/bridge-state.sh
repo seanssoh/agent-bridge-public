@@ -509,8 +509,6 @@ if any(item == "plugin:discord" or item.startswith("plugin:discord@") for item i
 if any(
     item == "plugin:telegram"
     or item.startswith("plugin:telegram@")
-    or item == "plugin:telegram-relay"
-    or item.startswith("plugin:telegram-relay@")
     for item in required
 ):
     assignments.append(("TELEGRAM_STATE_DIR", telegram_dir))
