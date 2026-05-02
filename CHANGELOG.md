@@ -6,10 +6,30 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
-### Removed
+## [0.7.0] — 2026-05-02
 
-- **telegram-relay daemon (#475 phases 2/3 reversal)**: the v0.6.37+ telegram-relay daemon, `agent-bridge telegram-relay` CLI, `plugins/telegram-relay/`, `bridge-telegram-relay.sh`, `lib/telegram-relay.py`, `bridge-setup.py telegram --use-relay` / `--no-relay` flags, the `BRIDGE_TELEGRAM_RELAY_ENABLED` / `BRIDGE_TELEGRAM_USE_RELAY` env vars, the `bridge_telegram_relay_supervise` daemon step, and the relay status fields in `agent-bridge status` are removed. Telegram outbound now flows through `plugin:telegram@claude-plugins-official`, with cron children writing structured inbox tasks per the PR1+PR2 cron reporting contract. Per-agent `.telegram/.env` and `.telegram/access.json` are preserved — the official plugin still reads them. See `OPERATOR_ACTIONS_PENDING.md` for the manual operator migration on relay-using hosts (`docs/proposals/jjujju-migration-prompt.md`); hosts that never registered the relay require no action.
+### Highlight — cron inbox-only reporting series ships, telegram-relay daemon removed
+
+`v0.7.0` closes the cron inbox-only reporting series Sean approved 2026-05-02. PR1 (#499) shipped the runner contract — disposable cron children write a structured `[cron-followup]` inbox task to their parent agent (the configured `target_agent`) when a run produces a signal, otherwise log-and-exit silently. PR2 (#500) shipped the parent-side helpers (`lib/bridge_cron_followup.py` frontmatter parser, reporting-trio fields in `agb cron show`, parent-handling docs in `common-instructions.md`/`admin-protocol.md`, ARCHITECTURE.md "Cron reporting contract" section). PR3 (#501) closes the loop by ripping out the v0.6.37+ telegram-relay daemon — outbound Telegram is back to the parent agent's responsibility through `plugin:telegram@claude-plugins-official`.
+
+### Added (PR1 + PR2)
+
+- **Cron reporting contract** (#499 PR1). New `RESULT_SCHEMA` fields `delivery_intent` / `forward_target` / `summary_short`. Default for disposable cron children flips to inbox-only ("never write external channels yourself"). Per-job overrides via job metadata: `metadata.cronReportingPolicy = default | always_main_session | always_silent` and `metadata.cronUrgency = normal | high | urgent`. Audit fields written on every run for traceability without grepping `state/cron/runs/`.
+- **Reporting trio in `agb cron show`** (#500 PR2). `last_reporting_decision` / `last_delivery_intent` / `last_inbox_task_id` exposed in human/json/shell output (record keeps `None` for absent so JSON renders `null`/shell `''`; human renderer shows `-`). `lib/bridge_cron_followup.py` is a stdlib-only frontmatter parser the parent uses to absorb forwarded cron output before deciding to forward to channels.
+- **Parent-side handling docs** (#500 PR2). New `[cron-followup]` section in `docs/agent-runtime/common-instructions.md` + cross-ref in `admin-protocol.md`. ARCHITECTURE.md gains a "Cron reporting contract" section (diagram + schema + dedupe + audit trail). `docs/developer-handover.md` walkthrough updated with the real `~/.agent-bridge/cron/jobs.json` direct-edit + `agb cron import` paths.
+
+### Removed (PR3)
+
+- **telegram-relay daemon (#475 phases 2/3 reversal, #501)**. The v0.6.37+ telegram-relay daemon, `agent-bridge telegram-relay` CLI, `plugins/telegram-relay/`, `bridge-telegram-relay.sh`, `lib/telegram-relay.py`, `bridge-setup.py telegram --use-relay` / `--no-relay` flags, the `BRIDGE_TELEGRAM_RELAY_ENABLED` / `BRIDGE_TELEGRAM_USE_RELAY` env vars, the `bridge_telegram_relay_supervise` daemon step, and the relay status fields in `agent-bridge status` are removed. Telegram outbound now flows through `plugin:telegram@claude-plugins-official`. Per-agent `.telegram/.env` and `.telegram/access.json` are preserved — the official plugin still reads them. See `OPERATOR_ACTIONS_PENDING.md` for the manual operator migration on relay-using hosts (`docs/proposals/jjujju-migration-prompt.md`); hosts that never registered the relay require no action.
 - **Smoke harness drops `telegram-relay*` smokes**: `scripts/smoke/telegram-relay.sh`, `scripts/smoke/telegram-relay-plugin.sh`, and `scripts/smoke/telegram-relay-setup.sh` are deleted along with their `scripts/ci-select-smoke.sh` includes.
+
+### Fixed (bonus, PR3)
+
+- **`scripts/smoke-test.sh:447` `TMP_ROOT`-unbound bug**. Pre-existing issue that persisted through the entire PR1+PR2 review cycle (PR1 r1-r4, PR2 r1-r3). The context-pressure unit block runs before the bottom-of-script `TMP_ROOT` setup, so it now allocates its own `mktemp -d` root and removes it inline after the assertions.
+
+### Operator action
+
+- **Relay-host migration is required.** `OPERATOR_ACTIONS_PENDING.md` v0.7.0 entry has urgency **high** for hosts that registered the v0.6.37+ relay (e.g. SYRS jjujju and any clones), urgency **none** for everyone else. Manual migration only per Sean Q-F 2026-05-02 — verbatim prompt at `docs/proposals/jjujju-migration-prompt.md`. No auto-script in `agent-bridge upgrade --apply`.
 
 ## [0.6.40] — 2026-04-30
 
