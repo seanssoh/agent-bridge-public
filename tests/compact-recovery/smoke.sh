@@ -256,6 +256,26 @@ else
   fail 7 "session_start rc=$rc; output:\n$(cat "$C7_OUT")"
 fi
 
+# ---------- case 8: cap default covers patch's 5607-byte SESSION-TYPE.md ----------
+# Issue #509 follow-up: patch's PR #510 verify report flagged that the
+# default cap (5120 bytes) was hit by patch's SESSION-TYPE.md (5607 bytes),
+# truncating the admin bootstrap content. The default was raised to 8192;
+# pin that here so a future "performance optimisation" doesn't silently
+# drop it back below the observed admin bootstrap size.
+banner 8 "default cap (>= 8192) covers a 5607-byte canonical file untruncated"
+"$PYTHON" -c "
+import sys
+sys.path.insert(0, '$REPO_ROOT/hooks')
+import bridge_hook_common as m
+import os
+for k in list(os.environ):
+    if k.startswith('BRIDGE_COMPACT_RECOVERY'):
+        del os.environ[k]
+cap = m.compact_recovery_per_file_cap()
+assert cap >= 8192, f'default cap regressed below 8192: {cap}'
+print('OK', cap)
+" >/dev/null && pass 8 || fail 8 "default cap is below 8192 (regressed below patch's observed SESSION-TYPE size)"
+
 # ---------- summary ----------
 printf '\n=== summary: %d PASS, %d FAIL ===\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

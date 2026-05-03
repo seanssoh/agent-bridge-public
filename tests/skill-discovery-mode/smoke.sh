@@ -414,6 +414,36 @@ $ok15 && run_gate "plugin-routing" "remove" "1" >/dev/null 2>&1 || { ok15=false;
 $ok15 && run_gate "disabled" "remove" "1" >/dev/null 2>&1 || { ok15=false; fail 15 "disabled gate did not remove SKILLS.md or did not record 'removed:'"; }
 $ok15 && pass 15
 
+# ---------- case 16: sync_shared_docs cleans up stale _template/SKILLS.md ----------
+# patch's PR #514 verify (#3115) found that hosts upgraded before PR #514
+# still carried agents/_template/SKILLS.md in the live runtime — source
+# deleted the file but `agent-bridge upgrade` does not propagate
+# source-side deletions. The follow-up fix has sync_shared_docs explicitly
+# clean up the stale file. Pin that here.
+banner 16 "sync_shared_docs removes stale agents/_template/SKILLS.md from live runtime"
+C16_HOME="$SMOKE_ROOT/c16"
+SOURCE_SHARED="$SMOKE_ROOT/c16-src-shared"
+mkdir -p "$C16_HOME/agents/_template" "$C16_HOME/state" "$SOURCE_SHARED"
+echo "STALE TEMPLATE SKILLS CONTENT" > "$C16_HOME/agents/_template/SKILLS.md"
+
+"$PYTHON" -c "$load_bd_preamble"$'
+import pathlib
+home = pathlib.Path("'"$C16_HOME"'")
+src = pathlib.Path("'"$SOURCE_SHARED"'")
+mod.sync_shared_docs(home, src, dry_run=False, stamp="20260503T000000Z", registry={})
+'
+
+ok16=true
+if [[ -f "$C16_HOME/agents/_template/SKILLS.md" ]]; then
+  ok16=false; fail 16 "stale _template/SKILLS.md not removed from live runtime"
+fi
+# Backup must be present so the cleanup is recoverable
+BACKUP_DIR="$C16_HOME/state/doc-migration/backups/20260503T000000Z/_template"
+if $ok16 && [[ ! -f "$BACKUP_DIR/SKILLS.md" ]]; then
+  ok16=false; fail 16 "expected backup at $BACKUP_DIR/SKILLS.md (cleanup must be recoverable). state contents:\n$(find "$C16_HOME/state" -type f 2>/dev/null)"
+fi
+$ok16 && pass 16
+
 # ---------- summary ----------
 printf '\n=== summary: %d PASS, %d FAIL ===\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

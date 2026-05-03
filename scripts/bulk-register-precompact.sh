@@ -57,24 +57,109 @@ CANARY_AGENTS=(patch)
 PHASE2_AGENTS=(newsbot syrs-calendar syrs-creative)
 
 list_all_claude_agents() {
-    # Roster rows look like: `name [...] | claude | ... | engine=... | ...`.
-    # The `agent list` CLI has a stable first column = agent name and a
-    # second column = engine (claude|codex).
-    "$AGENT_BRIDGE_BIN" agent list 2>/dev/null \
-        | awk -F '|' 'NR>1 && $2 ~ /claude/ {
-              split($1, name_parts, " ")
-              gsub(/^[ \t]+|[ \t]+$/, "", name_parts[1])
-              if (name_parts[1] != "") print name_parts[1]
-          }' \
-        | grep -Ev '^(shared|_template)$' \
-        || true
+    # Roster rows from `agent list --json` carry the live workdir for each
+    # claude agent (static or dynamic). Issue #509 phase3 finding: the prior
+    # text-parse path missed dynamic agents because their workdir lives
+    # outside $BRIDGE_HOME/agents/<name>, so register_one() saw them as
+    # "missing_home" and skipped them. Use the JSON view as the authoritative
+    # source so dynamic agents are reachable from --all (and --canary /
+    # --phase2 still resolve their static workdirs via the same path).
+    #
+    # The Python heredoc shells `agent list --json` itself (subprocess.check_output)
+    # instead of via shell pipe so the heredoc stays the only stdin consumer —
+    # same shape codex pinned in PR #512 r2 for the OPERATOR_ACTIONS_PENDING
+    # v0.7.3 snippets.
+    AGENT_BRIDGE_BIN="$AGENT_BRIDGE_BIN" "$PYTHON_BIN" - <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+cli = os.environ.get("AGENT_BRIDGE_BIN", "")
+try:
+    raw = subprocess.check_output([cli, "agent", "list", "--json"], stderr=subprocess.DEVNULL)
+except (OSError, subprocess.CalledProcessError):
+    sys.exit(0)
+try:
+    data = json.loads(raw or b"[]")
+except (ValueError, json.JSONDecodeError):
+    sys.exit(0)
+for row in data:
+    if row.get("engine") != "claude":
+        continue
+    agent = str(row.get("agent") or "").strip()
+    workdir = str(row.get("workdir") or "").strip()
+    if not agent or agent in ("shared", "_template"):
+        continue
+    if not workdir:
+        continue
+    # Tab is the field delimiter consumed by the main loop; agent ids and
+    # workdir paths never contain tabs in valid roster output.
+    print(f"{agent}\t{workdir}")
+PY
+}
+
+resolve_static_target_workdir() {
+    # For canary/phase2 (static names hardcoded above), look up the live
+    # workdir from the same JSON view. Falls back to BRIDGE_HOME/agents/<name>
+    # so a host that has not yet bootstrapped the agent still gets a deterministic
+    # path (matches the prior register_one() default).
+    local agent="$1"
+    AGENT="$agent" AGENT_BRIDGE_BIN="$AGENT_BRIDGE_BIN" "$PYTHON_BIN" - <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+cli = os.environ.get("AGENT_BRIDGE_BIN", "")
+target = os.environ.get("AGENT", "")
+try:
+    raw = subprocess.check_output([cli, "agent", "list", "--json"], stderr=subprocess.DEVNULL)
+except (OSError, subprocess.CalledProcessError):
+    sys.exit(1)
+try:
+    data = json.loads(raw or b"[]")
+except (ValueError, json.JSONDecodeError):
+    sys.exit(1)
+for row in data:
+    if row.get("agent") == target and row.get("engine") == "claude":
+        workdir = str(row.get("workdir") or "").strip()
+        if workdir:
+            print(workdir)
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
+emit_target_with_workdir() {
+    # Print "<agent>\t<workdir>" for static-phase rosters; fall back to
+    # $BRIDGE_HOME/agents/<agent> when the agent isn't in the live roster
+    # (matches register_one's pre-fix default — "missing home" cases get
+    # surfaced inside register_one rather than dropped here).
+    local agent="$1"
+    local workdir
+    workdir="$(resolve_static_target_workdir "$agent" 2>/dev/null || true)"
+    if [ -z "$workdir" ]; then
+        workdir="$BRIDGE_HOME/agents/$agent"
+    fi
+    printf '%s\t%s\n' "$agent" "$workdir"
 }
 
 pick_targets() {
     case "$PHASE" in
-        canary) printf '%s\n' "${CANARY_AGENTS[@]}" ;;
-        phase2) printf '%s\n' "${PHASE2_AGENTS[@]}" ;;
-        all)    list_all_claude_agents ;;
+        canary)
+            for agent in "${CANARY_AGENTS[@]}"; do
+                emit_target_with_workdir "$agent"
+            done
+            ;;
+        phase2)
+            for agent in "${PHASE2_AGENTS[@]}"; do
+                emit_target_with_workdir "$agent"
+            done
+            ;;
+        all)
+            list_all_claude_agents
+            ;;
     esac
 }
 
@@ -104,7 +189,7 @@ record() {
 
 backup_settings() {
     local agent="$1"
-    local settings="$BRIDGE_HOME/agents/$agent/.claude/settings.json"
+    local settings="$2"
     if [ ! -f "$settings" ]; then
         echo ""
         return 0
@@ -119,11 +204,12 @@ backup_settings() {
 
 register_one() {
     local agent="$1"
-    local settings="$BRIDGE_HOME/agents/$agent/.claude/settings.json"
+    local workdir="${2:-$BRIDGE_HOME/agents/$agent}"
+    local settings="$workdir/.claude/settings.json"
 
-    if [ ! -d "$BRIDGE_HOME/agents/$agent" ]; then
-        record "$agent" "skip" "missing_home" "" "" "no home dir"
-        echo "skip   $agent (no home)"
+    if [ ! -d "$workdir" ]; then
+        record "$agent" "skip" "missing_workdir" "" "" "no workdir: $workdir"
+        echo "skip   $agent (no workdir: $workdir)"
         return 0
     fi
 
@@ -134,13 +220,13 @@ register_one() {
     fi
 
     local backup
-    backup="$(backup_settings "$agent")"
+    backup="$(backup_settings "$agent" "$settings")"
 
     # Canonical invocation: call bridge-hooks.py directly. The top-level
     # `agent-bridge hooks` subcommand does not exist (bootstrap-memory-system.sh
     # and bridge-agent.sh's safety net both use this same direct path).
     local cmd_for_log
-    cmd_for_log="$PYTHON_BIN $BRIDGE_HOME/bridge-hooks.py ensure-pre-compact-hook --workdir $BRIDGE_HOME/agents/$agent --bridge-home $BRIDGE_HOME --python-bin $PYTHON_BIN --settings-file $settings"
+    cmd_for_log="$PYTHON_BIN $BRIDGE_HOME/bridge-hooks.py ensure-pre-compact-hook --workdir $workdir --bridge-home $BRIDGE_HOME --python-bin $PYTHON_BIN --settings-file $settings"
 
     if [ $DRY_RUN -eq 1 ]; then
         record "$agent" "register" "dry_run" "$cmd_for_log" "$backup" ""
@@ -150,7 +236,7 @@ register_one() {
 
     local out status
     if out="$("$PYTHON_BIN" "$BRIDGE_HOME/bridge-hooks.py" ensure-pre-compact-hook \
-            --workdir "$BRIDGE_HOME/agents/$agent" \
+            --workdir "$workdir" \
             --bridge-home "$BRIDGE_HOME" \
             --python-bin "$PYTHON_BIN" \
             --settings-file "$settings" 2>&1)"; then
@@ -185,10 +271,10 @@ main() {
     fi
 
     echo "# phase=$PHASE dry_run=$DRY_RUN log=$LOG_FILE"
-    local agent
-    while IFS= read -r agent; do
+    local agent workdir
+    while IFS=$'\t' read -r agent workdir; do
         [ -z "$agent" ] && continue
-        register_one "$agent"
+        register_one "$agent" "$workdir"
         # Gentle pause to avoid racing settings.json writes.
         if [ $DRY_RUN -eq 0 ] && [ "$PHASE" = "all" ]; then
             sleep 5

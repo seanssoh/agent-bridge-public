@@ -247,6 +247,58 @@ else
   fail 6 "bridge-upgrade.sh does not reference bridge_ensure_claude_pre_compact_hook (call site missing)"
 fi
 
+# ---------- case 7: bulk-register-precompact.sh enumerates dynamic agents ----------
+# Issue #509 phase3 finding: the prior text-parse path of
+# list_all_claude_agents() in scripts/bulk-register-precompact.sh skipped
+# dynamic claude agents whose workdir lives outside $BRIDGE_HOME/agents/.
+# The follow-up rewrites the enumeration to use `agent-bridge agent list
+# --json`, which exposes the live workdir directly. Pin that here.
+banner 7 "bulk-register-precompact.sh --all enumerates static + dynamic claude (issue #509 phase3)"
+C7_HOME="$SMOKE_ROOT/c7"
+mkdir -p "$C7_HOME/state" "$C7_HOME/hooks"
+cp "$REPO_ROOT/bridge-hooks.py" "$C7_HOME/bridge-hooks.py"
+# Static-style agent under BRIDGE_HOME/agents/<name>
+mkdir -p "$C7_HOME/agents/static-a/.claude"
+echo '{}' > "$C7_HOME/agents/static-a/.claude/settings.json"
+# Dynamic-style agent: workdir lives outside BRIDGE_HOME/agents/
+DYN_DIR="$SMOKE_ROOT/c7-dyn-project"
+mkdir -p "$DYN_DIR/.claude"
+echo '{}' > "$DYN_DIR/.claude/settings.json"
+
+# Stub `agent-bridge agent list --json` so the script sees a fixed roster
+# without needing the live install. The stub returns one static claude
+# (BRIDGE_HOME-rooted), one dynamic claude (project-rooted), and one
+# codex agent (must be excluded).
+STUB="$SMOKE_ROOT/c7-stub-agent-bridge"
+cat > "$STUB" <<STUB_EOF
+#!/usr/bin/env bash
+if [[ "\$1 \$2 \$3" == "agent list --json" ]]; then
+  cat <<JSON
+[
+  {"agent": "static-a", "engine": "claude", "source": "static", "workdir": "$C7_HOME/agents/static-a"},
+  {"agent": "dyn-b", "engine": "claude", "source": "dynamic", "workdir": "$DYN_DIR"},
+  {"agent": "codex-c", "engine": "codex", "source": "static", "workdir": "/tmp/codex-c"}
+]
+JSON
+fi
+STUB_EOF
+chmod +x "$STUB"
+
+C7_OUT=$(BRIDGE_HOME="$C7_HOME" AGENT_BRIDGE_BIN="$STUB" BRIDGE_PYTHON_BIN="$PYTHON" \
+         bash "$REPO_ROOT/scripts/bulk-register-precompact.sh" --all --dry-run 2>&1)
+
+ok7=true
+if ! grep -q "static-a" <<<"$C7_OUT"; then
+  ok7=false; fail 7 "static-a (BRIDGE_HOME-rooted) not enumerated. output:\n$C7_OUT"
+fi
+if $ok7 && ! grep -q "dyn-b" <<<"$C7_OUT"; then
+  ok7=false; fail 7 "dyn-b (dynamic, workdir outside BRIDGE_HOME/agents) not enumerated — phase3 regression. output:\n$C7_OUT"
+fi
+if $ok7 && grep -q "codex-c" <<<"$C7_OUT"; then
+  ok7=false; fail 7 "codex-c (engine=codex) should NOT be enumerated"
+fi
+$ok7 && pass 7
+
 # ---------- summary ----------
 printf '\n=== summary: %d PASS, %d FAIL ===\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

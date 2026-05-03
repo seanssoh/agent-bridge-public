@@ -949,6 +949,25 @@ def sync_shared_docs(bridge_home: Path, source_shared: Path, dry_run: bool, stam
             path.unlink()
         changed.append(f"removed:{path}")
 
+    # PR #514 deleted agents/_template/SKILLS.md from source (so newly
+    # scaffolded agents no longer inherit a stale catalog placeholder),
+    # but `agent-bridge upgrade` does not propagate source-side file
+    # deletions to the live runtime. Hosts that upgraded before PR #514
+    # still carry agents/_template/SKILLS.md, and the scaffolder copies
+    # everything under _template/ into a new agent home — so the stale
+    # file would re-leak into newly-created agents on those hosts.
+    # Clean up explicitly (idempotent — backups land alongside the
+    # _shared cleanup above).
+    template_skills = bridge_home / "agents" / "_template" / "SKILLS.md"
+    if template_skills.exists() or template_skills.is_symlink():
+        template_backup_root = (
+            bridge_home / "state" / "doc-migration" / "backups" / stamp / "_template"
+        )
+        backup_file(template_skills, template_backup_root, dry_run)
+        if not dry_run:
+            template_skills.unlink()
+        changed.append(f"removed:{template_skills}")
+
     source_refs = source_shared / "references"
     if source_refs.exists():
         for ref in sorted(source_refs.rglob("*")):
