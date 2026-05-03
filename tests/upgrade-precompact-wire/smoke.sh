@@ -39,6 +39,18 @@ banner() { printf '\n=== case %s — %s ===\n' "$1" "$2"; }
 SMOKE_ROOT="$(mktemp -d -t upgrade-precompact-wire.XXXXXX)"
 trap 'rm -rf "$SMOKE_ROOT" 2>/dev/null || true' EXIT
 
+# Locate a bash 4+ interpreter for sourcing lib/bridge-core.sh in case 5
+# (some helpers there use `declare -g`, which bash 3.2 — the macOS system
+# bash — does not support). Mirrors scripts/smoke-test.sh:194-203.
+BASH4_BIN=""
+for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null || true)"; do
+  [[ -n "$candidate" && -x "$candidate" ]] || continue
+  if "$candidate" -lc '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
+    BASH4_BIN="$candidate"
+    break
+  fi
+done
+
 # Build a minimal mock BRIDGE_HOME with bridge-hooks.py and a workdir.
 make_bridge_home() {
   local root="$1"
@@ -162,6 +174,77 @@ elif ! "$PYTHON" -m py_compile "$HOOK_PATH" 2>/dev/null; then
   fail 4 "hook path is not python-compilable: $HOOK_PATH"
 else
   pass 4
+fi
+
+# ---------- case 5: lib/bridge-hooks.sh wrapper is the regression pin ----------
+# Codex r1 noted that cases 1-4 only exercise bridge-hooks.py
+# ensure-pre-compact-hook directly, which existed before this PR — they
+# would still pass if `bridge_ensure_claude_pre_compact_hook` and the
+# corresponding line in `bridge_upgrade_propagate_claude_hooks` were
+# deleted. This case sources lib/bridge-hooks.sh and invokes the new
+# wrapper directly, so deleting either the wrapper definition or the
+# call site immediately fails this smoke.
+banner 5 "bridge_ensure_claude_pre_compact_hook (shell wrapper) registers via shell entry point"
+C5_HOME="$SMOKE_ROOT/c5"
+mkdir -p "$C5_HOME/hooks" "$C5_HOME/agents" "$C5_HOME/lib"
+cp "$REPO_ROOT/bridge-hooks.py" "$C5_HOME/bridge-hooks.py"
+cp "$REPO_ROOT/hooks/pre-compact.py" "$C5_HOME/hooks/pre-compact.py"
+cp "$REPO_ROOT/hooks/bridge_hook_common.py" "$C5_HOME/hooks/bridge_hook_common.py"
+cp "$REPO_ROOT/lib/bridge-core.sh" "$C5_HOME/lib/bridge-core.sh"
+cp "$REPO_ROOT/lib/bridge-hooks.sh" "$C5_HOME/lib/bridge-hooks.sh"
+chmod +x "$C5_HOME/bridge-hooks.py" "$C5_HOME/hooks/pre-compact.py"
+
+# Dynamic-style workdir lives outside BRIDGE_AGENT_HOME_ROOT so the
+# wrapper takes the local-mode branch (which we can exercise without
+# also stubbing roster + shared symlink wiring).
+C5_WORKDIR="$SMOKE_ROOT/c5-dyn-workdir"
+mkdir -p "$C5_WORKDIR/.claude"
+"$PYTHON" -c "import json, pathlib; pathlib.Path('$C5_WORKDIR/.claude/settings.json').write_text(json.dumps({}, indent=2))"
+
+if [[ -z "$BASH4_BIN" ]]; then
+  fail 5 "no bash 4+ interpreter available; install Homebrew bash or set BRIDGE_BASH_BIN"
+else
+  C5_RC=0
+  "$BASH4_BIN" -lc '
+    set -euo pipefail
+    export BRIDGE_SCRIPT_DIR="$1"
+    export BRIDGE_HOME="$1"
+    export BRIDGE_AGENT_HOME_ROOT="$1/agents"
+    export BRIDGE_HOOKS_DIR="$1/hooks"
+    # shellcheck disable=SC1091
+    source "$1/lib/bridge-core.sh"
+    # shellcheck disable=SC1091
+    source "$1/lib/bridge-hooks.sh"
+    # If the wrapper or its call site got deleted, the type check fails.
+    type -t bridge_ensure_claude_pre_compact_hook >/dev/null
+    bridge_ensure_claude_pre_compact_hook "$2" >/dev/null
+  ' -- "$C5_HOME" "$C5_WORKDIR" || C5_RC=$?
+
+  if [[ $C5_RC -ne 0 ]]; then
+    fail 5 "wrapper invocation returned rc=$C5_RC (function missing or runtime failure)"
+  else
+    N5=$(count_precompact_entries "$C5_WORKDIR/.claude/settings.json")
+    if [[ "$N5" != "1" ]]; then
+      fail 5 "wrapper did not produce exactly one PreCompact entry, got $N5. settings:\n$(cat "$C5_WORKDIR/.claude/settings.json")"
+    else
+      pass 5
+    fi
+  fi
+fi
+
+# ---------- case 6: bridge_upgrade_propagate_claude_hooks call site exists ----------
+# Static guard — the propagate function runs in a target-env subshell with
+# bridge_load_roster + BRIDGE_AGENT_IDS, which is far heavier to stub than
+# is worth doing in a smoke. Instead we grep the source: if a future
+# refactor accidentally drops the new wrapper from the propagation loop
+# the guard fails. (#510 deployment gap was exactly this kind of "loop
+# missing one entry" miss; pinning the entry by name is the cheapest
+# regression catch.)
+banner 6 "bridge_upgrade_propagate_claude_hooks calls the new wrapper"
+if grep -q 'bridge_ensure_claude_pre_compact_hook[[:space:]]' "$REPO_ROOT/bridge-upgrade.sh"; then
+  pass 6
+else
+  fail 6 "bridge-upgrade.sh does not reference bridge_ensure_claude_pre_compact_hook (call site missing)"
 fi
 
 # ---------- summary ----------

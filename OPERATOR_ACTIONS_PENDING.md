@@ -38,50 +38,92 @@ The pre-compact half — which writes a sidecar `state/agents/<agent>/compact-sn
 
 ---
 
-## v0.7.3 — manual PreCompact rollout for hosts upgraded before this fix
+## v0.7.3 — pre-v0.7.3 emergency rollout for static claude agents
 
 - applies_when_upgrading_from: any version `0.7.0 .. 0.7.2`.
-- urgency: **medium** if you operate long-running claude agents that compact frequently; **low** otherwise.
+- urgency: **medium** for hosts that need PreCompact wired *before* upgrading to v0.7.3 (e.g. a long-soak host where you don't want to run a full upgrade right now, or you upgraded to a `0.7.0..0.7.2` build and need the disaster-recovery snapshot working before the next `/compact`); **none** if you can simply run `agent-bridge upgrade --apply` to v0.7.3+ instead.
 
 ### Background
 
-Hosts that upgraded to `v0.7.0`, `v0.7.1`, or `v0.7.2` while PR #510 was already merged into `main` (or after it was) ran the propagation loop without the PreCompact entry. The pre-compact sidecar snapshot is therefore stale until either (a) the v0.7.3 upgrade runs, or (b) the operator triggers the rollout helper manually.
+Hosts that ran `agent-bridge upgrade --apply` to v0.7.0, v0.7.1, or v0.7.2 received `hooks/pre-compact.py` on disk but no `settings.json` wire — `bridge_upgrade_propagate_claude_hooks` registered five hook events but missed `PreCompact`. **The simplest fix is to upgrade to v0.7.3+**: the new release adds `bridge_ensure_claude_pre_compact_hook` to the propagation loop, so the next `upgrade --apply` registers PreCompact on every claude agent (static and dynamic — `bridge_agent_workdir` reaches both).
 
-The rollout helper is `scripts/bulk-register-precompact.sh`, already shipping in v0.7.x. It backs up each agent's `settings.json` to `state/precompact-registration/backups/<stamp>/`, registers PreCompact via the same `bridge-hooks.py ensure-pre-compact-hook` path the upgrader will use from v0.7.3 onward, and writes one ndjson row per agent to `state/precompact-registration/<stamp>.jsonl`. Idempotent — re-running on already-registered agents is a no-op.
+This section exists for hosts that need a **manual interim rollout** before they can upgrade. The rollout helper, `scripts/bulk-register-precompact.sh`, already ships in v0.7.x, so it is reachable on the affected versions.
 
-### Action
+**Important caveat — static agents only.** `scripts/bulk-register-precompact.sh` enumerates `$BRIDGE_HOME/agents/<name>` and registers PreCompact in each agent's per-home `settings.json`. It does **not** reach dynamic claude agents whose `workdir` lives outside `$BRIDGE_HOME/agents/` (e.g. `~/Projects/agent-bridge-public/.claude/settings.json`). Those agents are covered by the v0.7.3 upgrade auto-wire path, not by this helper. If you need the manual interim coverage to include dynamic agents, see "Manual coverage for dynamic agents" below.
+
+### Action — static agents
 
 ```bash
 bash "$HOME/.agent-bridge/scripts/bulk-register-precompact.sh" --all
 ```
 
-`--all` covers every claude-engine agent in the active roster (the script filters out `_template` and `shared`). For a phased rollout, use `--canary` (registers `patch` only) and `--phase2` (registers `newsbot, syrs-calendar, syrs-creative`) before `--all`.
+`--all` covers every claude-engine agent that has a home under `$BRIDGE_HOME/agents/<name>` (the script filters out `_template` and `shared`). For a phased rollout, use `--canary` (registers `patch` only) and `--phase2` (registers `newsbot, syrs-calendar, syrs-creative`) before `--all`.
 
-After the script reports `# done. log: <path>`, verify:
+### Manual coverage for dynamic agents (optional)
+
+If your install runs claude agents whose workdir is outside `$BRIDGE_HOME/agents/<name>` and you cannot wait for the v0.7.3 upgrade:
 
 ```bash
-python3 - <<'PY'
-import json, os
-home = os.path.expanduser("~/.agent-bridge")
-for agent in os.listdir(f"{home}/agents"):
-    settings = f"{home}/agents/{agent}/.claude/settings.json"
-    if not os.path.isfile(settings):
+~/.agent-bridge/agent-bridge agent list --json \
+  | python3 -c '
+import json, sys
+for row in json.load(sys.stdin):
+    if row.get("engine") != "claude":
         continue
-    cfg = json.load(open(settings))
+    workdir = row.get("workdir") or ""
+    if not workdir or workdir.startswith("'"$HOME"'/.agent-bridge/agents/"):
+        continue
+    print(f"{row[\"agent\"]} {workdir}")
+' \
+  | while read -r agent workdir; do
+      python3 ~/.agent-bridge/bridge-hooks.py ensure-pre-compact-hook \
+        --workdir "$workdir" \
+        --bridge-home "$HOME/.agent-bridge" \
+        --python-bin "$(command -v python3)" \
+        --settings-file "$workdir/.claude/settings.json"
+  done
+```
+
+This iterates dynamic claude agents (engine=claude, workdir not under `~/.agent-bridge/agents/`) and registers PreCompact directly in each project's `.claude/settings.json`. Idempotent like the bulk helper. Stop and review if any agent's settings.json is shared between hosts (e.g. a checked-in template) — the registration is host-local.
+
+### Verify (covers static + dynamic)
+
+```bash
+~/.agent-bridge/agent-bridge agent list --json \
+  | python3 - <<'PY'
+import json, os, sys
+data = json.load(sys.stdin)
+for row in data:
+    if row.get("engine") != "claude":
+        continue
+    workdir = row.get("workdir") or ""
+    settings = os.path.join(workdir, ".claude", "settings.json")
+    label = f"{row['agent']:24s} ({row.get('source','?'):8s})"
+    if not os.path.isfile(settings):
+        print(f"{label}: NO_SETTINGS_FILE ({settings})")
+        continue
+    try:
+        cfg = json.load(open(settings))
+    except Exception as e:
+        print(f"{label}: PARSE_ERROR ({e})")
+        continue
     has_pc = any(
         "pre-compact.py" in (h.get("command") or "")
         for entry in cfg.get("hooks", {}).get("PreCompact", [])
         for h in entry.get("hooks", [])
     )
-    print(f"{agent}: {'present' if has_pc else 'MISSING'}")
+    print(f"{label}: {'present' if has_pc else 'MISSING'}")
 PY
 ```
+
+This walks the live roster (so dynamic agents are not silently hidden) and prints `present | MISSING | NO_SETTINGS_FILE | PARSE_ERROR` per claude agent.
 
 ### Skip if
 
 - This host has no claude-engine agents.
-- You ran the script in a previous session and the verify block above already prints `present` for every agent.
-- You upgraded directly from `<= 0.6.x` to `>= 0.7.3` (the v0.7.3 upgrade itself ran the propagation loop with the new entry).
+- You upgraded to `v0.7.3+` and `agent-bridge upgrade --apply` completed successfully — the auto-wire path covers both static and dynamic agents.
+- You ran the actions above in a previous session and the verify block already prints `present` for every claude agent.
+- You upgraded directly from `<= 0.6.x` to `>= 0.7.3` (the v0.7.3 upgrade itself ran the propagation loop with the new entry — the static-only manual path was never relevant to your install).
 
 ---
 
