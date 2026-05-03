@@ -368,8 +368,14 @@ DEFAULT_COMPACT_RECOVERY_FILES: tuple[str, ...] = (
     "TOOLS.md",
     "MEMORY.md",
 )
-_COMPACT_RECOVERY_DEFAULT_CAP = 5120
-_COMPACT_RECOVERY_MIN_CAP = 256
+_COMPACT_RECOVERY_DEFAULT_CAP = 8192  # raised from 5120 (issue #509 follow-up):
+_COMPACT_RECOVERY_MIN_CAP = 256       # patch's SESSION-TYPE.md is 5607 bytes,
+                                      # so 5120 truncated the admin
+                                      # bootstrap content. 8192 covers all
+                                      # observed canonical files on the SYRS
+                                      # install. Total worst-case payload
+                                      # remains 5×8192 = 40 KB / ~16k tokens
+                                      # at the post-compact turn.
 
 
 def compact_recovery_enabled() -> bool:
