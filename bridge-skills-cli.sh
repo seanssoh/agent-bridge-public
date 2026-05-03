@@ -169,8 +169,16 @@ if fmt == "json":
     sys.exit(0)
 
 # table form
-if user_scope and not agent_filter:
-    print("user-scope (every agent):")
+# Codex r1 on PR #513: prior code only printed the user-scope header when
+# `--agent` was unset, so `agb skills list --agent patch` was silent on
+# user-scope plugins even though they apply to that agent. Always show
+# the user-scope header (when any user-scope plugins exist) so the
+# operator sees the same plugin universe whether or not they filtered.
+if user_scope:
+    if agent_filter:
+        print(f"user-scope (also available to {agent_filter}):")
+    else:
+        print("user-scope (every agent):")
     print("  " + ", ".join(sorted(user_scope)))
     print()
 

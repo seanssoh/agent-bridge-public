@@ -192,6 +192,89 @@ else
   pass 8
 fi
 
+# ---------- case 9: --agent table mode shows user-scope (codex r1) ----------
+banner 9 "agb skills list --agent <name> table mode shows user-scope"
+# Reuse $PLUGINS_FIX which carries shopify+frontend-design as user-scope
+# plugins. With pre-fix code the user-scope header was suppressed when
+# --agent was set; post-fix the table shows the header with a note that
+# those plugins are *also* available to the filtered agent.
+FIRST_AGENT_T=$("$REPO_ROOT/agent-bridge" agent list --json 2>/dev/null | "$PYTHON" -c "
+import json, sys
+data = json.load(sys.stdin)
+for r in data:
+    if r.get('engine') == 'claude':
+        print(r['agent']); break
+")
+if [[ -n "$FIRST_AGENT_T" ]]; then
+  TABLE_OUT=$(CLAUDE_PLUGINS_FILE="$PLUGINS_FIX" "$REPO_ROOT/agent-bridge" skills list --agent "$FIRST_AGENT_T" 2>&1)
+  if ! grep -q "user-scope" <<<"$TABLE_OUT"; then
+    fail 9 "expected user-scope header in --agent table output. got:\n$TABLE_OUT"
+  elif ! grep -q "shopify" <<<"$TABLE_OUT"; then
+    fail 9 "expected fixture user-scope plugin 'shopify' in table output"
+  else
+    pass 9
+  fi
+else
+  pass 9  # no claude agents — nothing to filter
+fi
+
+# ---------- case 10: mode-aware references in shared TOOLS.md (codex r1) ----------
+banner 10 "render_shared_tools_md mode-aware skill guide line"
+T_LEG=$(env -u BRIDGE_SKILLS_DOC_MODE "$PYTHON" -c "$load_bd_preamble"$'\nimport pathlib\nprint(mod.render_shared_tools_md(pathlib.Path("/tmp/bh")))')
+T_PR=$(BRIDGE_SKILLS_DOC_MODE=plugin-routing "$PYTHON" -c "$load_bd_preamble"$'\nimport pathlib\nprint(mod.render_shared_tools_md(pathlib.Path("/tmp/bh")))')
+T_DIS=$(BRIDGE_SKILLS_DOC_MODE=disabled "$PYTHON" -c "$load_bd_preamble"$'\nimport pathlib\nprint(mod.render_shared_tools_md(pathlib.Path("/tmp/bh")))')
+
+ok10=true
+# legacy-catalog: still references shared/SKILLS.md
+grep -q "shared/SKILLS.md" <<<"$T_LEG" || { ok10=false; fail 10 "legacy-catalog should still reference shared/SKILLS.md"; }
+# plugin-routing: must NOT reference shared/SKILLS.md, must reference skill-routing.md
+$ok10 && grep -q "shared/SKILLS.md" <<<"$T_PR" && { ok10=false; fail 10 "plugin-routing TOOLS.md still references shared/SKILLS.md"; }
+$ok10 && grep -q "skill-routing.md\|skills list" <<<"$T_PR" || { ok10=false; fail 10 "plugin-routing TOOLS.md missing skill-routing/skills list pointer"; }
+# disabled: must NOT reference shared/SKILLS.md or skill-routing.md
+$ok10 && grep -q "shared/SKILLS.md\|skill-routing.md" <<<"$T_DIS" && { ok10=false; fail 10 "disabled TOOLS.md still references shared/SKILLS.md or skill-routing.md"; }
+$ok10 && grep -q "skills list\|Skill 도구" <<<"$T_DIS" || { ok10=false; fail 10 "disabled TOOLS.md missing 'agb skills list' / 'Skill 도구' pointer"; }
+$ok10 && pass 10
+
+# ---------- case 11: agent-bridge canon block mode-aware ----------
+banner 11 "render_agent_bridge_block TOOLS+SKILLS canon line is mode-aware"
+SCRIPT='
+import importlib.util, sys, pathlib, tempfile
+spec = importlib.util.spec_from_file_location("bd", "'"$REPO_ROOT"'/bridge-docs.py")
+mod = importlib.util.module_from_spec(spec); sys.modules["bd"] = mod; spec.loader.exec_module(mod)
+tmp = pathlib.Path(tempfile.mkdtemp())
+print(mod.render_agent_bridge_block(tmp, session_type="general"))
+'
+B_LEG=$(env -u BRIDGE_SKILLS_DOC_MODE "$PYTHON" -c "$SCRIPT")
+B_PR=$(BRIDGE_SKILLS_DOC_MODE=plugin-routing "$PYTHON" -c "$SCRIPT")
+B_DIS=$(BRIDGE_SKILLS_DOC_MODE=disabled "$PYTHON" -c "$SCRIPT")
+
+ok11=true
+grep -qE "TOOLS\.md.*SKILLS\.md.*runtime reference" <<<"$B_LEG" || { ok11=false; fail 11 "legacy block must mention 'TOOLS.md와 SKILLS.md ... runtime reference'"; }
+$ok11 && grep -q "TOOLS\.md.*SKILLS\.md" <<<"$B_PR" && { ok11=false; fail 11 "plugin-routing block must drop the 'TOOLS.md와 SKILLS.md' joint phrase"; }
+$ok11 && grep -q "skill-routing\|skills list" <<<"$B_PR" || { ok11=false; fail 11 "plugin-routing block must point at skill-routing or 'agb skills list'"; }
+$ok11 && grep -q "TOOLS\.md.*SKILLS\.md" <<<"$B_DIS" && { ok11=false; fail 11 "disabled block must drop the 'TOOLS.md와 SKILLS.md' joint phrase"; }
+$ok11 && pass 11
+
+# ---------- case 12: per-agent SKILLS.md anchor line is mode-aware ----------
+banner 12 "render_agent_skills_md anchor bullet is mode-aware"
+SCRIPT='
+import importlib.util, sys, pathlib, tempfile
+spec = importlib.util.spec_from_file_location("bd", "'"$REPO_ROOT"'/bridge-docs.py")
+mod = importlib.util.module_from_spec(spec); sys.modules["bd"] = mod; spec.loader.exec_module(mod)
+tmp = pathlib.Path(tempfile.mkdtemp())
+print(mod.render_agent_skills_md(tmp, {}))
+'
+S_LEG=$(env -u BRIDGE_SKILLS_DOC_MODE "$PYTHON" -c "$SCRIPT")
+S_PR=$(BRIDGE_SKILLS_DOC_MODE=plugin-routing "$PYTHON" -c "$SCRIPT")
+S_DIS=$(BRIDGE_SKILLS_DOC_MODE=disabled "$PYTHON" -c "$SCRIPT")
+
+ok12=true
+grep -q "shared/SKILLS.md" <<<"$S_LEG" || { ok12=false; fail 12 "legacy per-agent SKILLS.md should still anchor on shared/SKILLS.md"; }
+$ok12 && grep -q "shared/SKILLS.md" <<<"$S_PR" && { ok12=false; fail 12 "plugin-routing per-agent SKILLS.md still anchors on shared/SKILLS.md"; }
+$ok12 && grep -q "skill-routing\|skills list" <<<"$S_PR" || { ok12=false; fail 12 "plugin-routing per-agent SKILLS.md must point at skill-routing or 'agb skills list'"; }
+$ok12 && grep -q "shared/SKILLS.md" <<<"$S_DIS" && { ok12=false; fail 12 "disabled per-agent SKILLS.md still anchors on shared/SKILLS.md"; }
+$ok12 && pass 12
+
 # ---------- summary ----------
 printf '\n=== summary: %d PASS, %d FAIL ===\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
