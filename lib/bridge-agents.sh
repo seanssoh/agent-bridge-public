@@ -3839,6 +3839,131 @@ bridge_env_file_has_any_nonempty_key() {
   return 1
 }
 
+# Issue #534: isolation-aware readiness probe for channel `.env` files.
+#
+# Returns one of "present" | "missing" | "unreadable" via stdout. Suppresses
+# raw grep stderr (which previously leaked `Permission denied` to the daemon
+# log on every channel-health cycle in linux-user isolation when the
+# controller-side ACL had drifted). Distinguishes:
+#
+#   - "present"    — file readable and at least one of the requested keys
+#                    has a non-empty value.
+#   - "missing"    — file absent OR file readable but no requested key is
+#                    present with a non-empty value.
+#   - "unreadable" — file exists but the controller cannot read it (EACCES);
+#                    in linux-user isolation this triggers a bounded ACL
+#                    repair retry via bridge_linux_acl_repair_channel_env_files
+#                    before giving up.
+#
+# rc=1 vs rc=2 from grep:
+#   The internal grep helper returns 1 on "no match" and 2 on file/permission
+#   error. Bash conflates these into a single non-zero exit, so we
+#   distinguish via a `[[ -r "$file" ]]` probe after the helper fails.
+#
+# Usage:
+#   case "$(bridge_channel_env_file_readiness <agent> <item> <file> <key>...)" in
+#     present)    ... ;;
+#     missing)    ... ;;
+#     unreadable) ... ;;   # caller may then call bridge_channel_env_file_acl_diagnostic
+#   esac
+bridge_channel_env_file_readiness() {
+  local agent="$1"
+  local item="$2"
+  local file="$3"
+  shift 3 || true
+  local rc=0
+
+  if [[ ! -e "$file" ]]; then
+    printf 'missing'
+    return 0
+  fi
+
+  # First read attempt as the controller; suppress stderr so EACCES does
+  # not leak to the daemon log. rc captured separately.
+  rc=0
+  bridge_env_file_has_any_nonempty_key "$file" "$@" >/dev/null 2>&1 || rc=$?
+  if [[ $rc -eq 0 ]]; then
+    printf 'present'
+    return 0
+  fi
+
+  if [[ -r "$file" ]]; then
+    # File readable; helper just didn't find a non-empty matching key.
+    printf 'missing'
+    return 0
+  fi
+
+  # Unreadable. In linux-user isolation, attempt bounded ACL repair.
+  local repair_attempts="${BRIDGE_ENV_READINESS_REPAIR_ATTEMPTS:-2}"
+  local attempt=0
+  if [[ "$(bridge_agent_isolation_mode "$agent" 2>/dev/null || printf '')" == "linux-user" ]]; then
+    while (( attempt < repair_attempts )); do
+      bridge_linux_acl_repair_channel_env_files "$agent" >/dev/null 2>&1 || true
+      attempt=$((attempt + 1))
+      if [[ -r "$file" ]]; then
+        rc=0
+        bridge_env_file_has_any_nonempty_key "$file" "$@" >/dev/null 2>&1 || rc=$?
+        if [[ $rc -eq 0 ]]; then
+          printf 'present'
+          return 0
+        fi
+        # File now readable but key not present — treat as missing rather
+        # than leaving in unreadable.
+        printf 'missing'
+        return 0
+      fi
+    done
+  fi
+
+  # Suppress unused-warning shellcheck when item is reserved for future
+  # per-channel scoped repair; ms365/teams currently share the agent-wide
+  # repair surface so item is logged rather than dispatched on.
+  : "${item}"
+  printf 'unreadable'
+  return 0
+}
+
+# Issue #534: produce a single-line diagnostic blob for an unreadable
+# channel `.env` file. Composed from `stat` and `getfacl` (Linux only;
+# Darwin lacks both POSIX named-user ACLs and a compatible getfacl).
+# Suppresses all stderr — output is one line so it fits in the existing
+# status_reason format.
+#
+# Output shape (single line):
+#   {"mode":"600","owner":"<uid>:<gid>","getfacl":"...","repair_attempts":N}
+#
+# When the file is missing or running on macOS, emits a minimal blob with
+# what is available; never returns non-zero.
+bridge_channel_env_file_acl_diagnostic() {
+  local file="$1"
+  local repair_attempts="${2:-${BRIDGE_ENV_READINESS_REPAIR_ATTEMPTS:-2}}"
+  local mode="-" owner="-" facl="-"
+
+  if [[ -e "$file" ]]; then
+    case "$(uname -s 2>/dev/null || printf '')" in
+      Linux)
+        mode="$(stat -c '%a' "$file" 2>/dev/null || printf -- '-')"
+        owner="$(stat -c '%U:%G' "$file" 2>/dev/null || printf -- '-')"
+        if command -v getfacl >/dev/null 2>&1; then
+          facl="$(getfacl --omit-header --no-effective "$file" 2>/dev/null \
+            | tr '\n' '/' | sed 's:/$::' || printf -- '-')"
+          [[ -n "$facl" ]] || facl="-"
+        fi
+        ;;
+      Darwin)
+        mode="$(stat -f '%Lp' "$file" 2>/dev/null || printf -- '-')"
+        owner="$(stat -f '%Su:%Sg' "$file" 2>/dev/null || printf -- '-')"
+        facl="darwin-acl-not-applicable"
+        ;;
+      *)
+        ;;
+    esac
+  fi
+
+  printf '{"mode":"%s","owner":"%s","getfacl":"%s","repair_attempts":%s}' \
+    "$mode" "$owner" "$facl" "$repair_attempts"
+}
+
 bridge_agent_channel_runtime_ready_for_item() {
   local agent="$1"
   local item="$2"
@@ -3847,34 +3972,39 @@ bridge_agent_channel_runtime_ready_for_item() {
   item="$(bridge_trim_whitespace "$item")"
   [[ -n "$item" ]] || return 1
 
+  # Issue #534: route through the readiness enum so unreadable .env (linux-user
+  # ACL drift) does not collapse into the same "not ready" signal as missing
+  # keys. Both unreadable and missing return 1 here (downstream readiness is
+  # boolean), but the structured reason path uses the same helper to emit a
+  # distinct status_reason.
   case "$item" in
     plugin:discord|plugin:discord@*)
       dir="$(bridge_agent_discord_state_dir "$agent")"
       [[ -f "$dir/access.json" ]] || return 1
-      bridge_env_file_has_any_nonempty_key "$dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN
+      [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN)" == "present" ]]
       ;;
     plugin:telegram|plugin:telegram@*)
       dir="$(bridge_agent_telegram_state_dir "$agent")"
       [[ -f "$dir/access.json" ]] || return 1
-      bridge_env_file_has_any_nonempty_key "$dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN
+      [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN)" == "present" ]]
       ;;
     plugin:teams|plugin:teams@*)
       dir="$(bridge_agent_teams_state_dir "$agent")"
       [[ -f "$dir/access.json" ]] || return 1
-      bridge_env_file_has_any_nonempty_key "$dir/.env" TEAMS_APP_ID MicrosoftAppId || return 1
-      bridge_env_file_has_any_nonempty_key "$dir/.env" TEAMS_APP_PASSWORD MicrosoftAppPassword
+      [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_ID MicrosoftAppId)" == "present" ]] || return 1
+      [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_PASSWORD MicrosoftAppPassword)" == "present" ]]
       ;;
     plugin:ms365|plugin:ms365@*)
       dir="$(bridge_agent_ms365_state_dir "$agent")"
       [[ -f "$dir/access.json" ]] || return 1
-      bridge_env_file_has_any_nonempty_key "$dir/.env" MS365_CLIENT_ID || return 1
-      bridge_env_file_has_any_nonempty_key "$dir/.env" MS365_CLIENT_SECRET || return 1
-      bridge_env_file_has_any_nonempty_key "$dir/.env" MS365_TENANT_ID
+      [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MS365_CLIENT_ID)" == "present" ]] || return 1
+      [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MS365_CLIENT_SECRET)" == "present" ]] || return 1
+      [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MS365_TENANT_ID)" == "present" ]]
       ;;
     plugin:mattermost|plugin:mattermost@*)
       dir="$(bridge_agent_mattermost_state_dir "$agent")"
       [[ -f "$dir/access.json" ]] || return 1
-      bridge_env_file_has_any_nonempty_key "$dir/.env" MATTERMOST_BOT_TOKEN MATTERMOST_PERSONAL_TOKEN
+      [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MATTERMOST_BOT_TOKEN MATTERMOST_PERSONAL_TOKEN)" == "present" ]]
       ;;
     *)
       return 0
@@ -3942,28 +4072,41 @@ bridge_channel_credentials_status_for_item() {
   local agent="$1"
   local item="$2"
   local dir=""
+  local r1="" r2="" r3=""
 
   item="$(bridge_qualify_channel_item "$item")"
   dir="$(bridge_channel_state_dir_for_item "$agent" "$item")"
+  # Issue #534: surface "unreadable" distinctly from "missing". When ANY
+  # required key probe reports unreadable, the overall status is unreadable
+  # (operators need to know the controller cannot read the file at all,
+  # which is actionable via ACL repair, vs. truly missing keys).
   case "$item" in
     plugin:discord|plugin:discord@*)
-      bridge_env_file_has_any_nonempty_key "$dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN && printf '%s' "present" || printf '%s' "missing"
+      r1="$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN)"
+      printf '%s' "$r1"
       ;;
     plugin:telegram|plugin:telegram@*)
-      bridge_env_file_has_any_nonempty_key "$dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN && printf '%s' "present" || printf '%s' "missing"
+      r1="$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN)"
+      printf '%s' "$r1"
       ;;
     plugin:teams|plugin:teams@*)
-      if bridge_env_file_has_any_nonempty_key "$dir/.env" TEAMS_APP_ID MicrosoftAppId \
-        && bridge_env_file_has_any_nonempty_key "$dir/.env" TEAMS_APP_PASSWORD MicrosoftAppPassword; then
+      r1="$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_ID MicrosoftAppId)"
+      r2="$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_PASSWORD MicrosoftAppPassword)"
+      if [[ "$r1" == "unreadable" || "$r2" == "unreadable" ]]; then
+        printf '%s' "unreadable"
+      elif [[ "$r1" == "present" && "$r2" == "present" ]]; then
         printf '%s' "present"
       else
         printf '%s' "missing"
       fi
       ;;
     plugin:ms365|plugin:ms365@*)
-      if bridge_env_file_has_any_nonempty_key "$dir/.env" MS365_CLIENT_ID \
-        && bridge_env_file_has_any_nonempty_key "$dir/.env" MS365_CLIENT_SECRET \
-        && bridge_env_file_has_any_nonempty_key "$dir/.env" MS365_TENANT_ID; then
+      r1="$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MS365_CLIENT_ID)"
+      r2="$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MS365_CLIENT_SECRET)"
+      r3="$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MS365_TENANT_ID)"
+      if [[ "$r1" == "unreadable" || "$r2" == "unreadable" || "$r3" == "unreadable" ]]; then
+        printf '%s' "unreadable"
+      elif [[ "$r1" == "present" && "$r2" == "present" && "$r3" == "present" ]]; then
         printf '%s' "present"
       else
         printf '%s' "missing"
@@ -4750,6 +4893,8 @@ bridge_agent_runtime_channel_status_reason() {
   local discord_dir=""
   local telegram_dir=""
   local teams_dir=""
+  local readiness=""
+  local repair_attempts="${BRIDGE_ENV_READINESS_REPAIR_ATTEMPTS:-2}"
 
   required="$(bridge_agent_required_runtime_channels_csv "$agent")"
   if [[ -z "$required" ]]; then
@@ -4763,7 +4908,16 @@ bridge_agent_runtime_channel_status_reason() {
       printf 'missing Discord access file under %s (access.json required)' "$discord_dir"
       return 0
     fi
-    if ! bridge_env_file_has_any_nonempty_key "$discord_dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN; then
+    # Issue #534: route through readiness enum so unreadable .env emits a
+    # distinct, actionable status_reason instead of the false-negative
+    # "missing token" message.
+    readiness="$(bridge_channel_env_file_readiness "$agent" "plugin:discord" "$discord_dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN)"
+    if [[ "$readiness" == "unreadable" ]]; then
+      printf 'unreadable: Discord .env under %s (ACL repair failed %s times; %s)' \
+        "$discord_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$discord_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" != "present" ]]; then
       printf 'missing Discord bot token under %s (.env with DISCORD_BOT_TOKEN required)' "$discord_dir"
       return 0
     fi
@@ -4775,7 +4929,13 @@ bridge_agent_runtime_channel_status_reason() {
       printf 'missing Telegram access file under %s (access.json required)' "$telegram_dir"
       return 0
     fi
-    if ! bridge_env_file_has_any_nonempty_key "$telegram_dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN; then
+    readiness="$(bridge_channel_env_file_readiness "$agent" "plugin:telegram" "$telegram_dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN)"
+    if [[ "$readiness" == "unreadable" ]]; then
+      printf 'unreadable: Telegram .env under %s (ACL repair failed %s times; %s)' \
+        "$telegram_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$telegram_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" != "present" ]]; then
       printf 'missing Telegram bot token under %s (.env with TELEGRAM_BOT_TOKEN required)' "$telegram_dir"
       return 0
     fi
@@ -4787,12 +4947,66 @@ bridge_agent_runtime_channel_status_reason() {
       printf 'missing Teams access file under %s (access.json required)' "$teams_dir"
       return 0
     fi
-    if ! bridge_env_file_has_any_nonempty_key "$teams_dir/.env" TEAMS_APP_ID MicrosoftAppId; then
+    readiness="$(bridge_channel_env_file_readiness "$agent" "plugin:teams" "$teams_dir/.env" TEAMS_APP_ID MicrosoftAppId)"
+    if [[ "$readiness" == "unreadable" ]]; then
+      printf 'unreadable: Teams .env under %s (ACL repair failed %s times; %s)' \
+        "$teams_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" != "present" ]]; then
       printf 'missing Teams app id under %s (.env with TEAMS_APP_ID required)' "$teams_dir"
       return 0
     fi
-    if ! bridge_env_file_has_any_nonempty_key "$teams_dir/.env" TEAMS_APP_PASSWORD MicrosoftAppPassword; then
+    readiness="$(bridge_channel_env_file_readiness "$agent" "plugin:teams" "$teams_dir/.env" TEAMS_APP_PASSWORD MicrosoftAppPassword)"
+    if [[ "$readiness" == "unreadable" ]]; then
+      printf 'unreadable: Teams .env under %s (ACL repair failed %s times; %s)' \
+        "$teams_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" != "present" ]]; then
       printf 'missing Teams app password under %s (.env with TEAMS_APP_PASSWORD required)' "$teams_dir"
+      return 0
+    fi
+  fi
+
+  # Issue #534: ms365 branch added here. Previously absent — meant ACL
+  # diagnostics for ms365 channels could never surface even with the
+  # readiness enum in place.
+  if bridge_channel_csv_contains "$required" "plugin:ms365"; then
+    local ms365_dir=""
+    ms365_dir="$(bridge_agent_ms365_state_dir "$agent")"
+    if [[ ! -f "$ms365_dir/access.json" ]]; then
+      printf 'missing MS365 access file under %s (access.json required)' "$ms365_dir"
+      return 0
+    fi
+    readiness="$(bridge_channel_env_file_readiness "$agent" "plugin:ms365" "$ms365_dir/.env" MS365_CLIENT_ID)"
+    if [[ "$readiness" == "unreadable" ]]; then
+      printf 'unreadable: MS365 .env under %s (ACL repair failed %s times; %s)' \
+        "$ms365_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" != "present" ]]; then
+      printf 'missing MS365 client id under %s (.env with MS365_CLIENT_ID required)' "$ms365_dir"
+      return 0
+    fi
+    readiness="$(bridge_channel_env_file_readiness "$agent" "plugin:ms365" "$ms365_dir/.env" MS365_CLIENT_SECRET)"
+    if [[ "$readiness" == "unreadable" ]]; then
+      printf 'unreadable: MS365 .env under %s (ACL repair failed %s times; %s)' \
+        "$ms365_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" != "present" ]]; then
+      printf 'missing MS365 client secret under %s (.env with MS365_CLIENT_SECRET required)' "$ms365_dir"
+      return 0
+    fi
+    readiness="$(bridge_channel_env_file_readiness "$agent" "plugin:ms365" "$ms365_dir/.env" MS365_TENANT_ID)"
+    if [[ "$readiness" == "unreadable" ]]; then
+      printf 'unreadable: MS365 .env under %s (ACL repair failed %s times; %s)' \
+        "$ms365_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" != "present" ]]; then
+      printf 'missing MS365 tenant id under %s (.env with MS365_TENANT_ID required)' "$ms365_dir"
       return 0
     fi
   fi
@@ -4804,7 +5018,13 @@ bridge_agent_runtime_channel_status_reason() {
       printf 'missing Mattermost access file under %s (access.json required)' "$mattermost_dir"
       return 0
     fi
-    if ! bridge_env_file_has_any_nonempty_key "$mattermost_dir/.env" MATTERMOST_BOT_TOKEN MATTERMOST_PERSONAL_TOKEN; then
+    readiness="$(bridge_channel_env_file_readiness "$agent" "plugin:mattermost" "$mattermost_dir/.env" MATTERMOST_BOT_TOKEN MATTERMOST_PERSONAL_TOKEN)"
+    if [[ "$readiness" == "unreadable" ]]; then
+      printf 'unreadable: Mattermost .env under %s (ACL repair failed %s times; %s)' \
+        "$mattermost_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$mattermost_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" != "present" ]]; then
       printf 'missing Mattermost bot token under %s (.env with MATTERMOST_BOT_TOKEN required)' "$mattermost_dir"
       return 0
     fi
