@@ -17,9 +17,12 @@
 #     live target intact.
 #  6. `conflicts archive` (manual) moves the conflict under
 #     backups/upgrade-conflict-archive/<date>/ regardless of hash.
-#  7. `bridge-status.py --json` exposes the pending count via
+#  7. `conflicts diff` emits a unified diff of live vs conflict and
+#     exits 0 even when the two files differ (since `diff -u` returns 1
+#     on differences, which the handler remaps to 0).
+#  8. `bridge-status.py --json` exposes the pending count via
 #     `pending_upgrade_conflicts`.
-#  8. adopt/discard/archive without --yes and without TTY refuses with
+#  9. adopt/discard/archive without --yes and without TTY refuses with
 #     a clear message and a non-zero exit.
 #
 # Uses BRIDGE_HOME isolation (mktemp -d) and never touches operator
@@ -214,6 +217,26 @@ assert_archive_moves_conflict() {
   [[ -n "$found" ]] || smoke_fail "archived conflict not found under $archive_root"
 }
 
+assert_diff_emits_unified_diff() {
+  drain_conflicts
+  seed_conflict_fixture "agents/_template/CLAUDE.md" "live-line-1
+live-line-2
+" "conflict-line-1
+conflict-line-2
+" "run-G"
+  local conflict_path="$BRIDGE_HOME/agents/_template/CLAUDE.md.upgrade-conflict"
+
+  local rc=0
+  local out
+  # `diff -u` exits 1 on differences; cmd_conflicts_diff remaps that to 0.
+  out="$(python3 "$UPGRADE_PY" conflicts-diff --target-root "$BRIDGE_HOME" "$conflict_path")" || rc=$?
+  [[ "$rc" -eq 0 ]] || smoke_fail "conflicts-diff should exit 0 even when files differ (got rc=$rc)"
+  smoke_assert_contains "$out" "---" "diff output contains unified-diff header for live target"
+  smoke_assert_contains "$out" "+++" "diff output contains unified-diff header for conflict file"
+  smoke_assert_contains "$out" "-live-line-1" "diff output marks the live-only line with -"
+  smoke_assert_contains "$out" "+conflict-line-1" "diff output marks the conflict-only line with +"
+}
+
 assert_status_warning_surface() {
   # Reset to a known set of 3 pending conflicts for a deterministic count.
   # `${BRIDGE_HOME:?}` guard so a misconfigured env never expands to /*.
@@ -322,6 +345,14 @@ assert_no_yes_no_tty_rejects() {
     </dev/null 2>&1 1>/dev/null)" || rc=$?
   smoke_assert_contains "$err" "refusing without confirmation" "adopt without --yes prints a clear refusal"
   [[ "$rc" -ne 0 ]] || smoke_fail "adopt without --yes should exit non-zero"
+
+  # archive also rejects (mirrors discard/adopt).
+  rc=0
+  err="$(python3 "$UPGRADE_PY" conflicts-archive --target-root "$BRIDGE_HOME" "$conflict_path" \
+    </dev/null 2>&1 1>/dev/null)" || rc=$?
+  smoke_assert_contains "$err" "refusing without confirmation" "archive without --yes prints a clear refusal"
+  [[ "$rc" -ne 0 ]] || smoke_fail "archive without --yes should exit non-zero"
+  [[ -f "$conflict_path" ]] || smoke_fail "archive without confirmation must not move the conflict file"
 }
 
 main() {
@@ -336,8 +367,9 @@ main() {
   smoke_run "adopt replaces live target and removes conflict" assert_adopt_replaces_live_and_removes_conflict
   smoke_run "discard removes conflict, live unchanged" assert_discard_removes_conflict_only
   smoke_run "archive moves conflict to backups/upgrade-conflict-archive/<date>/" assert_archive_moves_conflict
+  smoke_run "diff emits a unified diff and exits 0 on differences" assert_diff_emits_unified_diff
   smoke_run "bridge-status surfaces the pending count + WARNING line" assert_status_warning_surface
-  smoke_run "adopt/discard without --yes and no TTY refuses with a clear message" assert_no_yes_no_tty_rejects
+  smoke_run "adopt/discard/archive without --yes and no TTY refuses with a clear message" assert_no_yes_no_tty_rejects
   smoke_log "passed"
 }
 
