@@ -6,6 +6,52 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.7.3] — 2026-05-03
+
+### Highlight — issue #509 closed (compact recovery + skill discovery migration), `agb doctor` admin self-healing, `#516` settings gating
+
+`v0.7.3` ships the full plan from [#509](https://github.com/SYRS-AI/agent-bridge-public/issues/509) (Sean's "stop SKILLS.md from re-emitting itself every session + don't drop SOUL/MEMORY on auto-compaction" candidate), the [#511](https://github.com/SYRS-AI/agent-bridge-public/issues/511) `agb doctor` read-only command for admin self-healing, and the [#516](https://github.com/SYRS-AI/agent-bridge-public/issues/516) static-only gate on shared `autoCompactWindow=400000` propagation. A small UX bundle bundled with #516 closes three smaller paper-cuts surfaced from the #509 wave handoff.
+
+### Added (compact recovery — #509 P3 / C3+C4 — PR #510, deployment fix #512)
+
+- `hooks/session_start.py`: on `matcher=compact`, prepend a `## Restored Context (post-compact)` block (SOUL.md, SESSION-TYPE.md, COMMON-INSTRUCTIONS.md, TOOLS.md, MEMORY.md) ahead of the queue protocol context. Resolves symlinks live; falls back to a pre-compact sidecar snapshot when the live file is missing.
+- `hooks/pre-compact.py`: writes `state/agents/<agent>/compact-snapshot.json` before compaction, atomic, best-effort (never blocks `/compact`).
+- `BRIDGE_COMPACT_RECOVERY={on,off}`, `BRIDGE_COMPACT_RECOVERY_FILES=...` (csv basenames), `BRIDGE_COMPACT_RECOVERY_MAX_BYTES=N` (UTF-8 byte cap, default **8192** — raised from 5120 in #515 to cover patch's 5607-byte SESSION-TYPE.md).
+- `bridge_upgrade_propagate_claude_hooks` now registers PreCompact on every claude agent on every `agent-bridge upgrade --apply` (fixes the #510 deployment gap where existing agents had the new hook code but no `settings.json` wire — PR #512).
+
+### Added (skill discovery migration — #509 C1/C2/C5 — PR #513, #514)
+
+- `BRIDGE_SKILLS_DOC_MODE={legacy-catalog,plugin-routing,disabled}` (default `legacy-catalog` → strict superset of prior behaviour).
+  - `plugin-routing` emits a compact `shared/skill-routing.md` (cross-agent installed-plugin index from `~/.claude/plugins/installed_plugins.json`) and stops emitting the legacy `SKILLS.md`.
+  - `disabled` emits neither catalog file.
+  - Mode flips clean up the *other* file via `state/doc-migration/backups/<stamp>/_shared/`.
+- `agent-bridge skills list [--agent NAME] [--json]` — query CLI for "which agent has which plugin" (works in every mode). Filtered table view shows user-scope plugins as "also available to <agent>".
+- `agents/_template/SKILLS.md` removed (was a stale catalog placeholder); `_template/CLAUDE.md` and `_template/SOUL.md` no longer hard-code the SKILLS.md boot dependency. `docs/agent-runtime/common-instructions.md` SSOT phrasing made mode-agnostic.
+
+### Added (admin self-healing — #511 — PR #519)
+
+- `agent-bridge doctor [--json] [--detectors KIND[,KIND...]]` — read-only CLI surfacing stuck-state cross-cutting signals so the admin agent (`patch`) can self-heal infra by calling existing primitives (`agent-bridge agent restart`, `agent-bridge update`). Detectors: `stale-stopped-with-queue`, `stale-blocked-task` (threshold via `BRIDGE_DOCTOR_BLOCKED_THRESHOLD_SECONDS`, default 86400), `cold-restart-suspect` (#167), `abnormal-session-pane` (opt-in placeholder). Action decisions stay with the admin agent LLM; daemon adds zero policy. SQLite is opened in `mode=ro` URI mode; the only subprocess is `agent-bridge agent list --json`. Each detector runs inside its own try/except so one failing detector emits a `kind: "detector-error"` row instead of crashing the CLI; `--detectors` is also an allow-list against error rows.
+
+### Fixed (#509 follow-up tail — PR #515)
+
+- `scripts/bulk-register-precompact.sh` enumerates dynamic claude agents via `agent-bridge agent list --json` instead of text-parsing the agent list and hardcoding `$BRIDGE_HOME/agents/<name>` (skipped 3 dynamic agents on the SYRS install before this fix).
+- Stale `agents/_template/SKILLS.md` cleanup added to `bridge-docs.py:sync_shared_docs` so hosts that upgraded before PR #514 stop scaffolding new agents with the deleted placeholder.
+
+### Fixed (#516 + handoff UX bundle — PR #518)
+
+- **#516** — `bridge_claude_settings_mode` now gates the registered-workdir loop on `source=static`, and a registered-dynamic-agent exact-match short-circuit runs before the `BRIDGE_AGENT_HOME_ROOT` branch (added in r2). Dynamic claude agents whose workdir happens to live under the home root no longer inherit the static-only `autoCompactWindow=400000` shared default that inflated their context budget against operator intent.
+- **SessionStart pending-task nudging** no longer counts `blocked` tasks. `pending = queued + claimed` only. Admin agents still see blocked-task counts via the existing `admin_blocked_self_cleanup_context` path so role-separation stays clean.
+- **tool-policy hook false-positive on `.agents/` working dirs.** The substring fallback in `hooks/tool-policy.py:_bash_argv_references_system_config` (used when `shlex.split` rejects an unbalanced quote in a heredoc body) used to fire on short needles (`hooks/`, `state/cron/`) anywhere in prose. The new `_command_substring_hits_protected_needle` helper requires short needles to sit at a strict path-boundary character (`/`, `~`, `$`, `>`, `<`, `'`, `"`, `(`, `=`, `&`, `|`, `;`, `,`) or at start-of-string. Whitespace is deliberately excluded so heredoc prose mentions like `the chain at hooks/post.sh` keep passing. Project-level `.agents/` runtime working dirs are now writable via standard Edit/Write/heredoc-append tooling.
+- **Dynamic-agent `NEXT-SESSION.md` handoff path.** `hooks/bridge_hook_common.py:agent_workdir` now falls through to a memoised `agent-bridge agent list --json` lookup when neither `BRIDGE_AGENT_WORKDIR` nor the static default home is available. Cron / external invocations of the SessionStart hook for a dynamic claude agent no longer drop `Handoff present:` emits. The runtime-side leg (manual-relaunch env propagation audit) is intentionally deferred — `bridge-run.sh` already exports `BRIDGE_AGENT_WORKDIR` on every supervisor restart, so the visible managed-agent regression is closed by the hook-side safety net.
+
+### Operator action
+
+- **None for the common path.** All migration steps auto-apply on the first `agent-bridge upgrade --apply` to v0.7.3+. `BRIDGE_SKILLS_DOC_MODE` defaults to `legacy-catalog` so a host that has not opted in sees no behaviour change. Hosts on dev channel between v0.7.0..v0.7.2 who manually ran `bulk-register-precompact.sh --canary` only (covering static agents) — the v0.7.3 upgrade auto-wire path reaches the dynamic agents on the next `--apply`. Verify with the snippet in `OPERATOR_ACTIONS_PENDING.md` v0.7.3 entry.
+
+### Pair-review
+
+- 9 codex review rounds across 5 #509-wave PRs (#510 r2, #512 r3, #513 r2, #514 r2, #515 r1) all closed in the wave. PR #519 (`agb doctor`) implement-ok r1. PR #518 (#516 + UX bundle) implement-ok r2 — r1 caught two bypass classes (D2 short-needle prefix-set too narrow, E unguarded HOME_ROOT branch for dynamic-under-root) which the r2 commits closed concretely with 5 new smoke cases.
+
 ## [0.7.2] — 2026-05-03
 
 ### Highlight — daily-backup death-spiral root-cause + auto-cleanup migration
