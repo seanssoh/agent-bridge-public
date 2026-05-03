@@ -2513,6 +2513,15 @@ run_restart() {
   [[ "$verify_max_attempts" =~ ^[0-9]+$ ]] || verify_max_attempts=5
   (( verify_max_attempts >= 1 )) || verify_max_attempts=1
 
+  # Emergency operator kill-switch for the restart-internal verifier.
+  # Independent of the daemon-only BRIDGE_SKIP_PLUGIN_LIVENESS knob so
+  # operators can leave daemon liveness on while bypassing this loop
+  # during incident triage (issue #542).
+  if [[ "${BRIDGE_SKIP_RESTART_PLUGIN_LIVENESS:-0}" == "1" ]]; then
+    bridge_warn "BRIDGE_SKIP_RESTART_PLUGIN_LIVENESS=1; skipping restart-internal plugin MCP liveness verifier for '$agent'."
+    return 0
+  fi
+
   verify_attempts=1
   # Verify via descendant process probe (issue #143). The banner-based
   # verifier read only the last 80 tmux lines, so busy sessions (`--resume`
