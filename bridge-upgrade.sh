@@ -1291,6 +1291,32 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
     done
   ' -- "$SOURCE_ROOT" "$DRY_RUN"
 
+  # Issue #517: backfill the admin's sibling codex dev pair (`<admin>-dev`).
+  # Idempotent — skipped when the pair already exists. The admin CLAUDE.md
+  # managed pair-programming block is refreshed by `migrate-agents` above
+  # (admin session_type branch in migrate_agent_home), so this step only
+  # owns the agent registration. Tolerant on failure: warn and continue.
+  if [[ -n "$ADMIN_AGENT_ID" ]]; then
+    if [[ $DRY_RUN -eq 1 ]]; then
+      echo "[bridge-upgrade] plan: ensure admin codex pair ${ADMIN_AGENT_ID}-dev (idempotent)"
+    else
+      _admin_pair_output=""
+      if ! _admin_pair_output="$(
+        bridge_upgrade_with_target_env "$TARGET_ROOT" "$BRIDGE_BASH_BIN" -lc '
+          set -euo pipefail
+          source "$1/bridge-lib.sh"
+          source "$1/lib/bridge-admin-pair.sh"
+          bridge_load_roster
+          bridge_ensure_admin_codex_pair "$2"
+        ' -- "$SOURCE_ROOT" "$ADMIN_AGENT_ID" 2>&1
+      )"; then
+        echo "[bridge-upgrade] WARN: admin-pair backfill failed: $_admin_pair_output" >&2
+      else
+        [[ -n "$_admin_pair_output" ]] && printf '%s\n' "$_admin_pair_output" >&2
+      fi
+    fi
+  fi
+
   # Also propagate per-agent doc sync (bridge-docs.py apply) so
   # MEMORY-SCHEMA.md / SKILLS.md / CLAUDE.md managed blocks track the
   # canonical runtime on every upgrade. Before 2026-04-19 this hook was
