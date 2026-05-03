@@ -14,5 +14,5 @@
 - 운영 절차와 queue 규칙은 `CLAUDE.md`가 우선한다.
 - 기억 구조와 승격 규칙은 `MEMORY-SCHEMA.md`를 따른다.
 - 장기 기억은 `MEMORY.md`, `memory/`, `users/<user-id>/...`에 남긴다.
-- local runtime reference는 `TOOLS.md`, `SKILLS.md`에서 확인한다.
+- local runtime reference는 `TOOLS.md`에서 확인하고, 스킬은 시스템 리마인더의 available-skills 블록 또는 `~/.agent-bridge/agent-bridge skills list`로 본다.
 - stall 징후를 보이면 멈춰 서지 말고 재시도, 우회, 에스컬레이션 중 하나를 택한다.

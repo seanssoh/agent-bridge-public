@@ -15,7 +15,7 @@
 - `~/.agent-bridge/shared/wiki/`가 있으면 팀 전체가 공유하는 knowledge SSOT다. `index.md`와 관련 페이지만 읽고, 필요하면 `agent-bridge knowledge search`로 찾는다. Wiki graph / edge 규칙은 [`wiki-graph-rules.md`](wiki-graph-rules.md)를 따른다. 엔티티 생성·병합·redirect 규칙은 [`wiki-entity-lifecycle.md`](wiki-entity-lifecycle.md), 관측 인덱스와 분포 리포트 형식은 [`wiki-mention-index.md`](wiki-mention-index.md)에서 정의한다. Admin 세션은 업그레이드 직후 [`wiki-onboarding.md`](wiki-onboarding.md) 순서대로 부트스트랩을 돌린다.
 - `COMMON-INSTRUCTIONS.md`는 전 에이전트 공통 규칙 SSOT다 (바로 이 파일).
 - `CHANGE-POLICY.md`는 기술 변경의 upstream/downstream 분류 계약이다.
-- `TOOLS.md`와 `SKILLS.md`는 현재 bridge-native runtime reference다.
+- `TOOLS.md`는 bridge-native runtime reference다. 스킬 디스커버리는 시스템 리마인더의 available-skills 블록과 `~/.agent-bridge/agent-bridge skills list`(per-agent installed plugin)를 사용한다. `BRIDGE_SKILLS_DOC_MODE=legacy-catalog`인 install에서는 `~/.agent-bridge/shared/SKILLS.md` 카탈로그도 함께 emit된다.
 
 ## Queue & Delivery
 
