@@ -201,6 +201,12 @@ bridge_upgrade_propagate_claude_hooks() {
       bridge_ensure_claude_prompt_hook "$workdir" >/dev/null 2>&1 || true
       bridge_ensure_claude_prompt_guard_hook "$workdir" >/dev/null 2>&1 || true
       bridge_ensure_claude_tool_policy_hooks "$workdir" >/dev/null 2>&1 || true
+      # Issue #509 / PR #510 deployment gap: PreCompact was the one event
+      # the propagation loop never re-registered, so hosts that upgraded
+      # without restarting agents shipped hooks/pre-compact.py code with
+      # no settings.json wire. Adding it here closes that gap on every
+      # subsequent upgrade.
+      bridge_ensure_claude_pre_compact_hook "$workdir" >/dev/null 2>&1 || true
     done
   ' -- "$target_root"
 }
