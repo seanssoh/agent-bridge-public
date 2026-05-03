@@ -6,6 +6,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
+# shellcheck source=lib/bridge-admin-pair.sh
+source "$SCRIPT_DIR/lib/bridge-admin-pair.sh"
 # bridge_load_roster is deferred until after argument parsing so that
 # `init --dry-run` is mutation-free (bridge_load_roster -> bridge_init_dirs
 # would otherwise create $BRIDGE_HOME/state on a fresh-install-candidate and
@@ -436,6 +438,27 @@ else
   "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "${create_args[@]}" >/dev/null
   created=1
   bridge_load_roster
+fi
+
+# Issue #517: ensure the admin's sibling codex dev pair (`<admin>-dev`) and
+# inject the pair-programming SOP managed block into the admin's CLAUDE.md.
+# Applies regardless of admin engine — the pair is always engine=codex; the
+# SOP block is engine-neutral (it talks about plan/review/implement loops,
+# which apply to any orchestrator). Tolerant on failure — pair backfill must
+# never fail an otherwise-successful admin install. Skipped on --dry-run to
+# honor the mutation-free contract.
+if [[ $dry_run -eq 0 ]]; then
+  pair_output=""
+  if ! pair_output="$(bridge_ensure_admin_codex_pair "$admin_agent" 2>&1)"; then
+    bridge_init_append_warning "admin-pair backfill failed: ${pair_output}"
+  else
+    [[ -n "$pair_output" ]] && printf '%s\n' "$pair_output" >&2
+    bridge_load_roster
+    inject_output=""
+    if ! inject_output="$(python3 "$SCRIPT_DIR/bridge-upgrade.py" inject-admin-pair-block --target-root "$BRIDGE_HOME" --admin-agent "$admin_agent" 2>&1)"; then
+      bridge_init_append_warning "admin-pair CLAUDE.md inject failed: ${inject_output}"
+    fi
+  fi
 fi
 
 if [[ $dry_run -eq 0 ]] && [[ "$(bridge_agent_engine "$admin_agent" 2>/dev/null || printf '%s' "$engine")" == "claude" ]]; then

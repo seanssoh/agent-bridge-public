@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate mattermost-plugin
+  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin
 }
 
 add_all_integration() {
@@ -225,7 +225,12 @@ select_for_path() {
       ;;
 
     bridge-upgrade.sh|bridge-upgrade.py|scripts/export-public-snapshot.sh|VERSION)
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair
+      add_integration integration-minimal
+      ;;
+
+    bridge-init.sh|lib/bridge-admin-pair.sh)
+      add_required admin-codex-pair upgrade-shared-settings-propagate
       add_integration integration-minimal
       ;;
 

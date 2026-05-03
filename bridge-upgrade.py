@@ -27,6 +27,12 @@ from typing import Any, Iterator
 MANAGED_CLAUDE_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_CLAUDE_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
 
+# Issue #517: admin-only pair-programming SOP block. Generalized
+# extract/refresh helpers below take delimiter args so the same logic
+# rerenders both blocks idempotently.
+MANAGED_PAIR_START = "<!-- BEGIN MANAGED:admin-pair-programming -->"
+MANAGED_PAIR_END = "<!-- END MANAGED:admin-pair-programming -->"
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
@@ -247,21 +253,23 @@ def render_template(text: str, agent_id: str, display_name: str, role_text: str,
     return text
 
 
-def extract_managed_claude_block(text: str) -> str:
+def extract_managed_block(text: str, start_marker: str, end_marker: str) -> str:
     match = re.search(
-        rf"{re.escape(MANAGED_CLAUDE_START)}.*?{re.escape(MANAGED_CLAUDE_END)}",
+        rf"{re.escape(start_marker)}.*?{re.escape(end_marker)}",
         text,
         re.S,
     )
     return match.group(0).strip() if match else ""
 
 
-def refresh_managed_claude_block(original: str, managed_block: str) -> str:
+def refresh_managed_block(
+    original: str, managed_block: str, start_marker: str, end_marker: str
+) -> str:
     if not managed_block:
         return original
     block = managed_block.rstrip() + "\n"
     pattern = re.compile(
-        rf"{re.escape(MANAGED_CLAUDE_START)}.*?{re.escape(MANAGED_CLAUDE_END)}\n*",
+        rf"{re.escape(start_marker)}.*?{re.escape(end_marker)}\n*",
         re.S,
     )
     if pattern.search(original):
@@ -280,6 +288,48 @@ def refresh_managed_claude_block(original: str, managed_block: str) -> str:
     if normalized:
         return f"{block}\n{normalized}\n"
     return block
+
+
+def extract_managed_claude_block(text: str) -> str:
+    return extract_managed_block(text, MANAGED_CLAUDE_START, MANAGED_CLAUDE_END)
+
+
+def refresh_managed_claude_block(original: str, managed_block: str) -> str:
+    return refresh_managed_block(original, managed_block, MANAGED_CLAUDE_START, MANAGED_CLAUDE_END)
+
+
+def render_admin_pair_block(admin: str) -> str:
+    """Render the admin-pair-programming managed block for the given admin.
+
+    Issue #517. Must stay byte-identical to the bash side
+    (lib/bridge-admin-pair.sh:bridge_admin_pair_managed_block) so a fresh
+    install and an upgraded install converge on the same content.
+    """
+    pair = f"{admin}-dev"
+    return f"""{MANAGED_PAIR_START}
+## Pair Programming Protocol (with `{pair}`)
+
+This admin agent always pair-programs with `{pair}` (codex). Never commit or
+file an upstream PR without going through the loop below; never ask the operator
+to manually trigger a review.
+
+1. **Plan brief.** Write `/tmp/<task-slug>-plan.md` describing background, focus
+   checklist, expected output shape (`plan-ok` / `needs-more`). Queue:
+   `agent-bridge task create --to {pair} --title "[plan] <subject>" --body-file /tmp/...`.
+2. **Wait for plan-ok.** Implement only after `{pair}` returns
+   `plan-ok` or after a `needs-more` round resolves.
+3. **Implement** in your worktree.
+4. **Code review.** Write `/tmp/<task-slug>-codereview.md` (artifacts to review,
+   focus list). Queue: `agent-bridge task create --to {pair} --title "[review] <subject>" --body-file ...`.
+5. **Merge only on `implement-ok`.** If `needs-more`, action and resubmit as
+   r2/r3 with bumped title and a fresh brief. After 3 rounds without
+   `implement-ok`, stop and reconsider scope.
+6. **Off-hours autonomy.** When the operator delegates explicitly, `{pair}`'s
+   `implement-ok` substitutes for operator approval until the operator returns.
+
+Out of scope for this pair: business decisions, anything tagged
+`human-decision-required`. Those go to the operator channel, not `{pair}`.
+{MANAGED_PAIR_END}"""
 
 
 def discover_agent_dirs(agent_root: Path) -> list[Path]:
@@ -411,6 +461,19 @@ def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, d
                 if not dry_run:
                     claude_target.write_text(refreshed, encoding="utf-8")
 
+    # Issue #517: admin-only pair-programming SOP block. Refreshed
+    # idempotently from rendered code (no template-side substitution) so
+    # non-admin agents are never touched by this branch.
+    if session_type == "admin" and claude_target.exists():
+        pair_block = render_admin_pair_block(agent)
+        original = claude_target.read_text(encoding="utf-8", errors="ignore")
+        refreshed = refresh_managed_block(original, pair_block, MANAGED_PAIR_START, MANAGED_PAIR_END)
+        if refreshed != original:
+            if "CLAUDE.md" not in updated_files:
+                updated_files.append("CLAUDE.md")
+            if not dry_run:
+                claude_target.write_text(refreshed, encoding="utf-8")
+
     return AgentMigrationResult(
         agent=agent,
         added_files=added_files,
@@ -419,6 +482,38 @@ def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, d
         session_type=session_type,
         engine=engine,
     )
+
+
+def cmd_inject_admin_pair_block(args: argparse.Namespace) -> int:
+    """Render + refresh the admin-pair-programming managed block.
+
+    Issue #517 — invoked by bridge-init.sh after the admin agent and its
+    sibling codex pair have been registered. Idempotent: a second invocation
+    on an already-injected admin CLAUDE.md is a no-op.
+    """
+    target_root = Path(args.target_root).expanduser()
+    admin = (args.admin_agent or "").strip()
+    if not admin:
+        print(json.dumps({"error": "admin-agent required"}, ensure_ascii=False))
+        return 1
+    claude_path = target_root / "agents" / admin / "CLAUDE.md"
+    if not claude_path.exists():
+        print(json.dumps(
+            {"skipped": "admin CLAUDE.md missing", "path": str(claude_path)},
+            ensure_ascii=False,
+        ))
+        return 0
+    pair_block = render_admin_pair_block(admin)
+    original = claude_path.read_text(encoding="utf-8", errors="ignore")
+    refreshed = refresh_managed_block(original, pair_block, MANAGED_PAIR_START, MANAGED_PAIR_END)
+    changed = refreshed != original
+    if changed and not args.dry_run:
+        claude_path.write_text(refreshed, encoding="utf-8")
+    print(json.dumps(
+        {"path": str(claude_path), "changed": changed, "dry_run": bool(args.dry_run)},
+        ensure_ascii=False,
+    ))
+    return 0
 
 
 def cmd_migrate_agents(args: argparse.Namespace) -> int:
@@ -2087,6 +2182,20 @@ def build_parser() -> argparse.ArgumentParser:
     migrate.add_argument("--admin-agent", default="")
     migrate.add_argument("--dry-run", action="store_true")
     migrate.set_defaults(handler=cmd_migrate_agents)
+
+    # Issue #517: inject the admin-pair-programming managed block into the
+    # admin CLAUDE.md. Called from bridge-init.sh after admin + pair create.
+    inject_pair = subparsers.add_parser(
+        "inject-admin-pair-block",
+        help=(
+            "Refresh the admin-pair-programming managed block in the named "
+            "admin agent's CLAUDE.md. Idempotent."
+        ),
+    )
+    inject_pair.add_argument("--target-root", required=True)
+    inject_pair.add_argument("--admin-agent", required=True)
+    inject_pair.add_argument("--dry-run", action="store_true")
+    inject_pair.set_defaults(handler=cmd_inject_admin_pair_block)
 
     backup = subparsers.add_parser("backup-live")
     backup.add_argument("--target-root", required=True)
