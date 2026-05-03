@@ -187,7 +187,7 @@ select_for_path() {
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)
-      add_required daemon queue launch-dev-channels-injection
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
