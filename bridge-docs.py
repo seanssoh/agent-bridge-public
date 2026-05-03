@@ -568,6 +568,193 @@ def render_shared_change_policy_md(bridge_home: Path) -> str:
 """
 
 
+SKILLS_DOC_MODES = ("legacy-catalog", "plugin-routing", "disabled")
+
+
+def skills_doc_mode() -> str:
+    """Return the BRIDGE_SKILLS_DOC_MODE setting.
+
+    - `legacy-catalog` (default): emit the historical SKILLS.md monolithic
+      catalog. Backwards-compatible; no behaviour change for installs that
+      have not opted in.
+    - `plugin-routing`: emit a much smaller shared/skill-routing.md that
+      lists installed plugins per agent. Stops emitting SKILLS.md.
+    - `disabled`: emit neither. Operator has migrated all skill discovery
+      to Claude Code's official Skill tool / installed_plugins.json and
+      does not want any bridge-managed catalog file.
+    """
+    raw = os.environ.get("BRIDGE_SKILLS_DOC_MODE", "").strip().lower()
+    if raw in SKILLS_DOC_MODES:
+        return raw
+    return "legacy-catalog"
+
+
+def load_agent_workdirs() -> dict[str, str]:
+    """Roster-driven agent → workdir mapping.
+
+    Caller (lib/bridge-skills.sh during `bridge-docs.py apply`) injects this
+    via BRIDGE_AGENT_WORKDIR_JSON. Empty dict when unset — render functions
+    handle that gracefully.
+    """
+    raw = os.environ.get("BRIDGE_AGENT_WORKDIR_JSON", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if isinstance(v, str) and v}
+
+
+def installed_plugins_path() -> Path:
+    """Claude Code's authoritative installed-plugin record.
+
+    Honours CLAUDE_HOME for tests; defaults to ~/.claude/plugins/installed_plugins.json
+    on a normal install.
+    """
+    explicit = os.environ.get("CLAUDE_PLUGINS_FILE", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+
+
+def load_installed_plugins() -> dict[str, list[dict]]:
+    """Read installed_plugins.json. Best-effort; returns {} on any failure."""
+    path = installed_plugins_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    if not isinstance(plugins, dict):
+        return {}
+    out: dict[str, list[dict]] = {}
+    for key, entries in plugins.items():
+        if isinstance(entries, list):
+            out[str(key)] = [e for e in entries if isinstance(e, dict)]
+    return out
+
+
+def build_plugin_routing(
+    installed: dict[str, list[dict]],
+    workdirs: dict[str, str],
+) -> tuple[set[str], dict[str, set[str]]]:
+    """Split installed plugins into (user-scope, agent-scope mapping).
+
+    user-scope plugins apply to every agent on this host; surface them as
+    a single shared row rather than repeating each plugin name in every
+    agent column.
+
+    project/local-scope plugins map to a specific projectPath; we attribute
+    them to the agent whose workdir resolves to that path. Plugins whose
+    projectPath does not match any agent in the roster are dropped from
+    the cross-agent index — the plugin is still installed, just not on a
+    workspace this bridge install knows about.
+    """
+    user_plugins: set[str] = set()
+    routing: dict[str, set[str]] = {agent: set() for agent in workdirs}
+
+    resolved_workdirs: dict[str, str] = {}
+    for agent, workdir in workdirs.items():
+        try:
+            resolved_workdirs[agent] = str(Path(workdir).resolve())
+        except OSError:
+            resolved_workdirs[agent] = workdir
+
+    for full_key, entries in installed.items():
+        plugin_name = full_key.split("@", 1)[0]
+        for entry in entries:
+            scope = str(entry.get("scope") or "")
+            if scope == "user":
+                user_plugins.add(plugin_name)
+                continue
+            if scope not in {"project", "local"}:
+                continue
+            project_path = str(entry.get("projectPath") or "").strip()
+            if not project_path:
+                continue
+            try:
+                resolved_project = str(Path(project_path).resolve())
+            except OSError:
+                resolved_project = project_path
+            for agent, workdir in resolved_workdirs.items():
+                if resolved_project == workdir:
+                    routing[agent].add(plugin_name)
+                    break
+    return user_plugins, routing
+
+
+def render_shared_skill_routing_md(bridge_home: Path) -> str:
+    """plugin-routing mode: emit a compact agent → installed-plugins index.
+
+    Reads ~/.claude/plugins/installed_plugins.json (Claude Code's
+    authoritative record) and the BRIDGE_AGENT_WORKDIR_JSON roster
+    snapshot. Bridge shared skills under ~/.agent-bridge/.claude/skills/
+    are intentionally NOT included here — they are exposed via Claude
+    Code's Skill tool already, and listing them again would just
+    re-create the SKILLS.md token tax.
+    """
+    workdirs = load_agent_workdirs()
+    installed = load_installed_plugins()
+    user_plugins, routing = build_plugin_routing(installed, workdirs)
+
+    lines = [
+        "# skill-routing.md — Cross-Agent Plugin Index",
+        "",
+        "<!-- Managed by agent-bridge (BRIDGE_SKILLS_DOC_MODE=plugin-routing). -->",
+        "<!-- Use `agb skills list --json` for the structured view. -->",
+        "",
+        "Routing rule: when you need a capability, look up which agent has the plugin",
+        "installed below. Bridge shared skills under `~/.agent-bridge/.claude/skills/`",
+        "are exposed via Claude Code's Skill tool and not duplicated here.",
+        "",
+    ]
+
+    if user_plugins:
+        lines.extend(
+            [
+                "## User-scope plugins (available to every agent on this host)",
+                "",
+                ", ".join(f"`{name}`" for name in sorted(user_plugins)),
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "## Per-agent plugins (project / local scope)",
+            "",
+        ]
+    )
+
+    if not workdirs:
+        lines.extend(
+            [
+                "_No agent workdir map available. Set `BRIDGE_AGENT_WORKDIR_JSON`",
+                "in the caller env (lib/bridge-skills.sh injects this during",
+                "`bridge-docs.py apply`)._",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "| Agent | Workdir | Installed plugins |",
+                "| --- | --- | --- |",
+            ]
+        )
+        for agent in sorted(routing):
+            plugins = sorted(routing[agent])
+            cell = ", ".join(f"`{name}`" for name in plugins) if plugins else "—"
+            workdir_cell = workdirs.get(agent, "—")
+            lines.append(f"| `{agent}` | `{workdir_cell}` | {cell} |")
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 def render_shared_skills_md(bridge_home: Path, registry: dict[str, SkillEntry]) -> str:
     home = pretty_path(bridge_home)
     shared_skills = [entry for entry in registry.values() if entry.kind == "shared"]
@@ -714,12 +901,32 @@ def sync_shared_docs(bridge_home: Path, source_shared: Path, dry_run: bool, stam
                 copy_path(ref, dst, dry_run)
                 changed.append(str(dst))
 
-    generated_renderers = {
+    generated_renderers: dict[str, "object"] = {
         "TOOLS.md": render_shared_tools_md,
-        "SKILLS.md": lambda home: render_shared_skills_md(home, registry),
         "COMMON-INSTRUCTIONS.md": render_shared_common_instructions_md,
         "CHANGE-POLICY.md": render_shared_change_policy_md,
     }
+    # BRIDGE_SKILLS_DOC_MODE chooses the catalog rendering strategy.
+    # Whichever file is *not* selected gets cleaned up so a mode flip
+    # doesn't leave stale catalogs lying around.
+    mode = skills_doc_mode()
+    deprecated_skill_docs: list[str] = []
+    if mode == "legacy-catalog":
+        generated_renderers["SKILLS.md"] = lambda home: render_shared_skills_md(home, registry)
+        deprecated_skill_docs.append("skill-routing.md")
+    elif mode == "plugin-routing":
+        generated_renderers["skill-routing.md"] = render_shared_skill_routing_md
+        deprecated_skill_docs.append("SKILLS.md")
+    else:  # disabled
+        deprecated_skill_docs.extend(["SKILLS.md", "skill-routing.md"])
+    for name in deprecated_skill_docs:
+        path = target_shared / name
+        if not path.exists() and not path.is_symlink():
+            continue
+        backup_file(path, deprecated_backup_root, dry_run)
+        if not dry_run:
+            path.unlink()
+        changed.append(f"removed:{path}")
     for name, renderer in generated_renderers.items():
         dst = target_shared / name
         text = renderer(bridge_home)

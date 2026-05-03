@@ -55,6 +55,7 @@ Usage:
   $CLI_NAME guard <status|scan|sanitize> ...
   $CLI_NAME diagnose <acl> [--json]
   $CLI_NAME knowledge <init|operator|capture|promote|search|lint> ...
+  $CLI_NAME skills <list> [--agent <name>] [--json]
   $CLI_NAME config <set|get|list-protected> ...
   $CLI_NAME bundle <create|show> ...
   $CLI_NAME intake <triage|show> ...
@@ -601,6 +602,10 @@ PY
     knowledge)
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-knowledge.sh" "$@"
+      ;;
+    skills)
+      shift
+      exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-skills-cli.sh" "$@"
       ;;
     config)
       shift
