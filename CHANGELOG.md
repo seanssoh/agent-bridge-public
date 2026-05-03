@@ -6,6 +6,39 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.7.2] — 2026-05-03
+
+### Highlight — daily-backup death-spiral root-cause + auto-cleanup migration
+
+`v0.7.2` fixes the chain of bugs documented in [#507](https://github.com/SYRS-AI/agent-bridge-public/issues/507) — orphaned `*.tgz.tmp.*` files filling host disks (~110 GB observed in a single overnight window across two hosts), no preflight free-space check, and a 30-day retention default that compounded the problem. The same release addresses two adjacent issues Sean surfaced during diagnosis: `state/tasks.db` was bundled raw into every daily tarball (uncompressible, ~30× multiplier under retention), and `backups/upgrade-*/` snapshots had no prune at all.
+
+### Fixed (#507)
+
+- **Stale `*.tgz.tmp.*` reaping.** `bridge-upgrade.py:create_daily_backup_archive` glob-deletes orphaned tmp files at the start of each attempt, age-gated by `BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS` (default 180s = daemon timeout 120s + 60s grace) and serialized through an `flock`-backed lock file so a concurrent writer's tmp is never stolen. (Bug 1 in #507.)
+- **Pre-flight free-space check.** `check_daily_backup_free_space` measures `shutil.disk_usage().free` against `max(prev_largest_archive × 1.5, 100 MiB)` and short-circuits to `outcome=skipped_disk_full` when insufficient. (Bug 2 in #507.)
+- **`--retain-days` default 30 → 7.** Both `bridge-upgrade.py` argparse default and `BRIDGE_DAILY_BACKUP_RETAIN_DAYS` in `lib/bridge-state.sh` lowered. Existing operators who want the old 30-day window can set the env var explicitly. (Bug 3 in #507.)
+- **Exclude list expanded.** `resolve_daily_backup_excluded_roots` now drops `worktrees/`, `runtime/{assets,media,extensions}/`, `.claude/worktrees/`, and the new `state/backup-snapshots/` walk root from the tar walk. `should_skip_daily_backup_relpath` now skips any path containing a `node_modules` part (mirrors the existing `__pycache__` skip). Operators can extend via `BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS` (colon- or comma-separated relpaths). (Bug 4 in #507.)
+- **`~/.claude.json` corruption recovery path.** Auto-cleanup (see Added) now runs `validate_claude_config` on every upgrade and surfaces `recovery_candidate` (latest `~/.claude/backups/<…>/.claude.json`) in the `[upgrade-complete]` task body when the file fails to parse. Documented in `KNOWN_ISSUES.md`. (Bug 5 in #507.)
+- **`state/tasks.db` excluded from raw tar walk; replaced by online SQL snapshot.** `DAILY_BACKUP_RAW_SQLITE_EXCLUDES` drops `tasks.db` + `-wal`/`-shm`/`-journal` from the tar walk. `dump_sqlite_snapshot` opens `tasks.db` in `mode=ro`, runs `iterdump` through gzip into a process-private temp dir outside the tar walk, fsyncs, atomically moves into `state/backup-snapshots/tasks-YYYY-MM-DD.sql.gz`, and the tar walk explicitly adds today's dump as a single member. SQL dumps are ~10–20× smaller than raw .db, gzip well, and round-trip via `sqlite3 newdb < tasks-YYYY-MM-DD.sql`. `prune_sqlite_snapshots` mirrors `prune_daily_backup_archives` retention. (Adjacent bug, surfaced by Sean during diagnosis — not in #507's text.)
+- **Daemon failure cooldown wired to outcomes.** `cmd_daily_backup_live` now emits a structured `outcome` field (`created`, `skipped_disk_full`, `skipped_concurrent`, `skipped_no_target_root`, `error_*`). `process_daily_backup` dispatches on `outcome` instead of inferring from `created`. `bridge_note_daily_backup_failure` writes `LAST_FAILURE_TS`/`REASON`/`DETAIL`/`WARN_TS` to `state.env`. `bridge_daily_backup_due` honors a `BRIDGE_DAILY_BACKUP_FAILURE_COOLDOWN_SECONDS` (default 3600s) cooldown after any failure, with one `daemon_warn` and one audit row per cooldown window (no log spam). `bridge_daily_backup_format_epoch` uses Python instead of GNU `date -d` for portability between macOS and Linux. State.env writes are atomic (tmp+rename).
+- **Conservative `backups/upgrade-*/` prune.** `prune_upgrade_backups` keeps the in-progress `BACKUP_ROOT` plus the newest `BRIDGE_UPGRADE_BACKUP_RETAIN_COUNT=5` snapshots, then deletes anything older than `BRIDGE_UPGRADE_BACKUP_RETAIN_DAYS=14`. In `--no-backup` mode this step is skipped (operator hasn't signaled they're OK with destruction).
+
+### Added
+
+- **Auto-cleanup migration on every `agent-bridge upgrade --apply`.** New `lib/bridge-cleanup.sh::bridge_cleanup_daily_backup_residue` calls `bridge-upgrade.py cleanup-residue`, capturing a structured JSON payload (stale tmp removed, daily archives pruned, SQL snapshots pruned, upgrade-* prune outcome with preserved set, `~/.claude.json` status, `cleanup_failures` list, bytes freed). The summary plus an agent-safe verification block (`du`, `agent-bridge status`, `daily-backup state.env`, `verify-tasks-db`, `~/.claude.json` JSON parse, snapshot restore self-test on a temp DB — no raw `sqlite3` against live state) are appended to the `[upgrade-complete]` task body. `OPERATOR_ACTIONS_PENDING.md` v0.7.2 entry covers the manual fallback when `cleanup_failures > 0`.
+- **`bridge-upgrade.py verify-tasks-db`** — read-only `PRAGMA quick_check` against `state/tasks.db` via `sqlite3.connect(file:?mode=ro)`, packaged so the bridge guard policy that flags raw `sqlite3` from agents doesn't fire.
+- **`bridge-upgrade.py cleanup-residue`** — standalone CLI for the same residue cleanup the upgrade auto-runs. Useful for hosts that can't immediately upgrade or want to verify the new defaults without an upgrade cycle.
+- **New env vars** (`lib/bridge-state.sh`): `BRIDGE_DAILY_BACKUP_FAILURE_COOLDOWN_SECONDS=3600`, `BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS=180`, `BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS=` (additive), `BRIDGE_UPGRADE_BACKUP_RETAIN_COUNT=5`, `BRIDGE_UPGRADE_BACKUP_RETAIN_DAYS=14`. Documented in `OPERATIONS.md`.
+- **Test env override**: `BRIDGE_DAILY_BACKUP_FREE_BYTES_OVERRIDE` lets smoke tests inject a fake `disk_usage().free` value to exercise the `skipped_disk_full` branch deterministically.
+
+### Operator action
+
+- **None for the common path.** Auto-applied on the first `agent-bridge upgrade --apply` to v0.7.2+, then on every subsequent upgrade. Hosts where the auto step exited with `cleanup_failures > 0` should follow the manual fallback in `OPERATOR_ACTIONS_PENDING.md` v0.7.2 entry.
+
+### Pair-review
+
+- Codex (`agb-dev-codex`) plan-review r1 → `needs-more` (11 items: snapshot self-amplification, daemon cooldown wiring, concurrency safety, bug 6 scope, conservative upgrade-* prune, exclude list expansion, agent-safe verification). Plan-review r2 → `implement-ok` with 6 implementation guardrails (snapshot atomicity, missing-DB tolerance, `uuid4` not `uuid7`, GNU-only `date -d` portability, operator snippet path corrections, `agent-bridge status` not `agb status`, additional missing-tasks.db smoke case). All addressed in this commit. Subsequent code review separately.
+
 ## [0.7.1] — 2026-05-03
 
 ### Highlight — telegram-relay residue auto-cleanup at upgrade time

@@ -379,24 +379,110 @@ bridge_daily_backup_state_file() {
   printf '%s' "${BRIDGE_DAILY_BACKUP_STATE_FILE:-$BRIDGE_STATE_DIR/daily-backup/state.env}"
 }
 
+# Coerce a state.env value (which may be empty, quoted, or hostile) into a
+# safe non-negative integer for shell arithmetic. Anything non-numeric
+# becomes 0. Issue #507 portability guardrail.
+bridge_daily_backup_int() {
+  local raw="${1:-}"
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$raw"
+  else
+    printf '%s' "0"
+  fi
+}
+
+# Format a Unix epoch into a portable ISO-8601 string. macOS /bin/date
+# does not support `-d @TS`, so we route through Python (already a hard
+# dep). Falls back to printing the raw epoch if Python is missing.
+bridge_daily_backup_format_epoch() {
+  local epoch="${1:-0}"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$epoch" <<'PY' 2>/dev/null || printf '%s' "$epoch"
+import datetime
+import sys
+
+try:
+    ts = int(sys.argv[1])
+except (IndexError, ValueError):
+    print("")
+    raise SystemExit(0)
+print(datetime.datetime.fromtimestamp(ts).isoformat(timespec="seconds"))
+PY
+  else
+    printf '%s' "$epoch"
+  fi
+}
+
+# Atomic state.env writer. tmp+rename guarantees the daemon never reads a
+# half-written file mid-update (rare but real on a chronically-overloaded
+# host).
+bridge_daily_backup_write_state() {
+  local file="$1"
+  local body="$2"
+  local tmp=""
+
+  mkdir -p "$(dirname "$file")"
+  tmp="$(mktemp "${file}.XXXXXX")" || return 1
+  printf '%s' "$body" >"$tmp"
+  mv "$tmp" "$file"
+}
+
 bridge_daily_backup_due() {
   local enabled="${BRIDGE_DAILY_BACKUP_ENABLED:-1}"
   local hour="${BRIDGE_DAILY_BACKUP_HOUR:-4}"
+  local cooldown=0
   local file=""
   local today=""
+  local now=0
   local current_minutes=0
   local scheduled_minutes=0
+  local last_failure_ts=0
+  local last_warn_ts=0
+  local elapsed=0
 
   [[ "$enabled" == "1" ]] || return 1
   [[ "$hour" =~ ^[0-9]+$ ]] || hour=4
   (( hour >= 0 && hour <= 23 )) || hour=4
+  cooldown="$(bridge_daily_backup_int "${BRIDGE_DAILY_BACKUP_FAILURE_COOLDOWN_SECONDS:-3600}")"
+  (( cooldown > 0 )) || cooldown=3600
 
   file="$(bridge_daily_backup_state_file)"
   today="$(date +%F)"
+  now="$(date +%s)"
+  # Reset every loop so a stale source $file doesn't leak previous state
+  # into the next decision.
+  DAILY_BACKUP_LAST_SUCCESS_DATE=""
+  DAILY_BACKUP_LAST_FAILURE_TS=""
+  DAILY_BACKUP_LAST_FAILURE_REASON=""
+  DAILY_BACKUP_LAST_WARN_TS=""
   if [[ -f "$file" ]]; then
     # shellcheck source=/dev/null
     source "$file"
-    if [[ "${DAILY_BACKUP_LAST_SUCCESS_DATE:-}" == "$today" ]]; then
+  fi
+  if [[ "${DAILY_BACKUP_LAST_SUCCESS_DATE:-}" == "$today" ]]; then
+    return 1
+  fi
+
+  # Bug #507: cooldown branch. After a failure (disk_full / timeout /
+  # error), suppress the next attempt until the cooldown window expires.
+  # Warn + audit at most once per window so the operator sees the signal
+  # without log spam.
+  last_failure_ts="$(bridge_daily_backup_int "${DAILY_BACKUP_LAST_FAILURE_TS:-0}")"
+  if (( last_failure_ts > 0 )); then
+    elapsed=$(( now - last_failure_ts ))
+    if (( elapsed >= 0 && elapsed < cooldown )); then
+      last_warn_ts="$(bridge_daily_backup_int "${DAILY_BACKUP_LAST_WARN_TS:-0}")"
+      if (( last_warn_ts == 0 || (now - last_warn_ts) >= cooldown )); then
+        local resume_at=""
+        resume_at="$(bridge_daily_backup_format_epoch "$(( last_failure_ts + cooldown ))")"
+        daemon_warn "daily-backup in cooldown after ${DAILY_BACKUP_LAST_FAILURE_REASON:-failure}; next attempt after $resume_at"
+        bridge_audit_log daemon daily_backup_cooldown daemon \
+          --detail reason="${DAILY_BACKUP_LAST_FAILURE_REASON:-unknown}" \
+          --detail since_ts="$last_failure_ts" \
+          --detail cooldown_seconds="$cooldown" \
+          --detail resume_at="$resume_at" || true
+        bridge_daily_backup_record_warn "$file" "$now"
+      fi
       return 1
     fi
   fi
@@ -406,23 +492,117 @@ bridge_daily_backup_due() {
   (( current_minutes >= scheduled_minutes ))
 }
 
+# Update the LAST_WARN_TS in place without losing other state.env keys.
+bridge_daily_backup_record_warn() {
+  local file="$1"
+  local now="$2"
+  local body=""
+
+  body="$(bridge_daily_backup_compose_state \
+    --success-ts "${DAILY_BACKUP_LAST_SUCCESS_TS:-}" \
+    --success-date "${DAILY_BACKUP_LAST_SUCCESS_DATE:-}" \
+    --archive "${DAILY_BACKUP_LAST_ARCHIVE:-}" \
+    --pruned "${DAILY_BACKUP_LAST_PRUNED_COUNT:-}" \
+    --failure-ts "${DAILY_BACKUP_LAST_FAILURE_TS:-}" \
+    --failure-reason "${DAILY_BACKUP_LAST_FAILURE_REASON:-}" \
+    --failure-detail "${DAILY_BACKUP_LAST_FAILURE_DETAIL:-}" \
+    --warn-ts "$now")"
+  bridge_daily_backup_write_state "$file" "$body" || return 1
+  DAILY_BACKUP_LAST_WARN_TS="$now"
+}
+
+# Single source of truth for state.env body assembly. Keeps the schema in
+# one place so additions (cooldown_warn, last_archive_bytes, etc.) don't
+# get out of sync between success / failure / warn paths.
+bridge_daily_backup_compose_state() {
+  local success_ts="" success_date="" archive="" pruned=""
+  local failure_ts="" failure_reason="" failure_detail="" warn_ts=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --success-ts) success_ts="${2:-}"; shift 2 ;;
+      --success-date) success_date="${2:-}"; shift 2 ;;
+      --archive) archive="${2:-}"; shift 2 ;;
+      --pruned) pruned="${2:-}"; shift 2 ;;
+      --failure-ts) failure_ts="${2:-}"; shift 2 ;;
+      --failure-reason) failure_reason="${2:-}"; shift 2 ;;
+      --failure-detail) failure_detail="${2:-}"; shift 2 ;;
+      --warn-ts) warn_ts="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  cat <<EOF
+DAILY_BACKUP_LAST_SUCCESS_TS=${success_ts}
+DAILY_BACKUP_LAST_SUCCESS_DATE=${success_date}
+DAILY_BACKUP_LAST_ARCHIVE=$(printf '%q' "$archive")
+DAILY_BACKUP_LAST_PRUNED_COUNT=${pruned}
+DAILY_BACKUP_LAST_FAILURE_TS=${failure_ts}
+DAILY_BACKUP_LAST_FAILURE_REASON=${failure_reason}
+DAILY_BACKUP_LAST_FAILURE_DETAIL=$(printf '%q' "$failure_detail")
+DAILY_BACKUP_LAST_WARN_TS=${warn_ts}
+EOF
+}
+
 bridge_note_daily_backup_success() {
   local archive_path="$1"
   local pruned_count="$2"
   local file=""
   local now=0
   local today=""
+  local body=""
 
   file="$(bridge_daily_backup_state_file)"
-  mkdir -p "$(dirname "$file")"
   now="$(date +%s)"
   today="$(date +%F)"
-  cat >"$file" <<EOF
-DAILY_BACKUP_LAST_SUCCESS_TS=$now
-DAILY_BACKUP_LAST_SUCCESS_DATE=$today
-DAILY_BACKUP_LAST_ARCHIVE=$(printf '%q' "$archive_path")
-DAILY_BACKUP_LAST_PRUNED_COUNT=$pruned_count
-EOF
+  body="$(bridge_daily_backup_compose_state \
+    --success-ts "$now" \
+    --success-date "$today" \
+    --archive "$archive_path" \
+    --pruned "$pruned_count")"
+  bridge_daily_backup_write_state "$file" "$body" || return 1
+  bridge_audit_log daemon daily_backup_recovered daemon \
+    --detail archive_path="$archive_path" || true
+}
+
+# Bug #507 (cooldown wiring): record a backup failure so
+# bridge_daily_backup_due skips the next cycle until the cooldown window
+# elapses. Reason is one of disk_full | timeout | parse | concurrent |
+# error_<...>. Detail carries free/needed bytes or stderr snippets.
+bridge_note_daily_backup_failure() {
+  local reason="${1:-unknown}"
+  local detail="${2:-}"
+  local file=""
+  local now=0
+  local body=""
+
+  file="$(bridge_daily_backup_state_file)"
+  now="$(date +%s)"
+  # Preserve any prior success record (operator wants to know the last
+  # known good archive even after a failure) by sourcing the existing
+  # file before composing.
+  DAILY_BACKUP_LAST_SUCCESS_TS=""
+  DAILY_BACKUP_LAST_SUCCESS_DATE=""
+  DAILY_BACKUP_LAST_ARCHIVE=""
+  DAILY_BACKUP_LAST_PRUNED_COUNT=""
+  if [[ -f "$file" ]]; then
+    # shellcheck source=/dev/null
+    source "$file"
+  fi
+  body="$(bridge_daily_backup_compose_state \
+    --success-ts "${DAILY_BACKUP_LAST_SUCCESS_TS:-}" \
+    --success-date "${DAILY_BACKUP_LAST_SUCCESS_DATE:-}" \
+    --archive "${DAILY_BACKUP_LAST_ARCHIVE:-}" \
+    --pruned "${DAILY_BACKUP_LAST_PRUNED_COUNT:-}" \
+    --failure-ts "$now" \
+    --failure-reason "$reason" \
+    --failure-detail "$detail" \
+    --warn-ts "$now")"
+  bridge_daily_backup_write_state "$file" "$body" || return 1
+  daemon_warn "daily-backup failed: reason=$reason detail=$detail"
+  bridge_audit_log daemon daily_backup_failure daemon \
+    --detail reason="$reason" \
+    --detail detail="$detail" || true
 }
 
 bridge_release_paths_valid() {
@@ -715,44 +895,106 @@ PY
 
 process_daily_backup() {
   local backup_json=""
-  local created=""
+  local subprocess_rc=0
+  local outcome=""
   local archive_path=""
-  local pruned_count=""
-  local retain_days="${BRIDGE_DAILY_BACKUP_RETAIN_DAYS:-30}"
+  local pruned_count=0
+  local free_bytes=0
+  local needed_bytes=0
+  local error_detail=""
+  local retain_days="${BRIDGE_DAILY_BACKUP_RETAIN_DAYS:-7}"
 
   bridge_daily_backup_due || return 1
-  [[ "$retain_days" =~ ^[0-9]+$ ]] || retain_days=30
-  (( retain_days > 0 )) || retain_days=30
+  [[ "$retain_days" =~ ^[0-9]+$ ]] || retain_days=7
+  (( retain_days > 0 )) || retain_days=7
 
   # Issue #265 proposal A: daily-backup walks BRIDGE_HOME (large file tree on
   # long-lived installs) and writes a tarball; a hung filesystem (NFS,
   # external mount, full disk waiting on flush) would otherwise stall the
   # daemon main loop. 120s ceiling is well above the observed normal runtime.
-  if ! backup_json="$(bridge_with_timeout 120 daily_backup python3 "$SCRIPT_DIR/bridge-upgrade.py" daily-backup-live --target-root "$BRIDGE_HOME" --backup-dir "$BRIDGE_DAILY_BACKUP_DIR" --retain-days "$retain_days" 2>/dev/null)"; then
+  # Bug #507: capture stderr too (separate file) so an error_detail can be
+  # surfaced to state.env / audit instead of silently swallowed.
+  local stderr_capture=""
+  stderr_capture="$(mktemp -t bridge-daily-backup.XXXXXX.err)"
+  if ! backup_json="$(bridge_with_timeout 120 daily_backup python3 "$SCRIPT_DIR/bridge-upgrade.py" daily-backup-live --target-root "$BRIDGE_HOME" --backup-dir "$BRIDGE_DAILY_BACKUP_DIR" --retain-days "$retain_days" 2>"$stderr_capture")"; then
+    subprocess_rc=$?
+    error_detail="$(head -c 400 "$stderr_capture" 2>/dev/null | tr '\n' ' ')"
+    rm -f "$stderr_capture"
+    if (( subprocess_rc == 124 )); then
+      bridge_note_daily_backup_failure "timeout" "bridge_with_timeout 120s exceeded"
+    else
+      bridge_note_daily_backup_failure "subprocess_rc_${subprocess_rc}" "$error_detail"
+    fi
     return 1
   fi
+  rm -f "$stderr_capture"
 
-  read -r created archive_path pruned_count < <(python3 - "$backup_json" <<'PY'
+  # Bug #507: parse outcome from the structured JSON instead of relying on
+  # `created`. Outcomes other than `created` carry their own follow-up.
+  local parse_payload=""
+  if ! parse_payload="$(python3 - "$backup_json" <<'PY' 2>/dev/null
 import json
 import sys
 
-payload = json.loads(sys.argv[1])
-created = "1" if payload.get("created") else "0"
+try:
+    payload = json.loads(sys.argv[1])
+except Exception as exc:
+    print(f"PARSE_ERROR\t{type(exc).__name__}: {exc}\t\t\t\t")
+    raise SystemExit(0)
+outcome = str(payload.get("outcome") or "")
 archive_path = str(payload.get("archive_path") or "")
 pruned = payload.get("pruned") or []
-print(created, archive_path, len(pruned))
+free_bytes = payload.get("free_bytes") or 0
+needed_bytes = payload.get("needed_bytes") or 0
+error_detail = str(payload.get("error_detail") or "")
+print("\t".join([
+    outcome, error_detail, archive_path, str(len(pruned)), str(free_bytes), str(needed_bytes)
+]))
 PY
-)
+)"; then
+    bridge_note_daily_backup_failure "parse" "python3 invocation failed"
+    return 1
+  fi
+  IFS=$'\t' read -r outcome error_detail archive_path pruned_count free_bytes needed_bytes <<<"$parse_payload"
 
-  [[ "$created" == "1" ]] || return 1
-  bridge_note_daily_backup_success "$archive_path" "$pruned_count"
-  bridge_audit_log daemon daily_backup_created daemon \
-    --detail archive_path="$archive_path" \
-    --detail backup_dir="$BRIDGE_DAILY_BACKUP_DIR" \
-    --detail retain_days="$retain_days" \
-    --detail pruned_count="$pruned_count"
-  daemon_info "daily live backup created: $archive_path (pruned=$pruned_count)"
-  return 0
+  case "$outcome" in
+    PARSE_ERROR)
+      bridge_note_daily_backup_failure "parse" "$error_detail"
+      return 1
+      ;;
+    created)
+      bridge_note_daily_backup_success "$archive_path" "$pruned_count"
+      bridge_audit_log daemon daily_backup_created daemon \
+        --detail archive_path="$archive_path" \
+        --detail backup_dir="$BRIDGE_DAILY_BACKUP_DIR" \
+        --detail retain_days="$retain_days" \
+        --detail pruned_count="$pruned_count" || true
+      daemon_info "daily live backup created: $archive_path (pruned=$pruned_count)"
+      return 0
+      ;;
+    skipped_disk_full)
+      bridge_note_daily_backup_failure "disk_full" "free=${free_bytes} needed=${needed_bytes}"
+      return 1
+      ;;
+    skipped_concurrent)
+      # Another writer holds the lock right now. Don't record a failure
+      # because nothing went wrong — just skip and let the lock holder
+      # report success on its own state.env update.
+      daemon_info "daily-backup skipped: concurrent writer holds lock"
+      return 1
+      ;;
+    skipped_no_target_root|dry_run)
+      return 1
+      ;;
+    error_*)
+      bridge_note_daily_backup_failure "$outcome" "$error_detail"
+      return 1
+      ;;
+    *)
+      bridge_note_daily_backup_failure "unknown_outcome" "outcome=${outcome} detail=${error_detail}"
+      return 1
+      ;;
+  esac
 }
 
 bridge_stall_retry_seconds() {

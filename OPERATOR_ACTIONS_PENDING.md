@@ -15,6 +15,117 @@ PR, prepend a new section; do not edit older sections in place.
 
 ---
 
+## v0.7.2 — daily-backup death-spiral root-cause + auto-cleanup (no operator action required)
+
+- applies_when_upgrading_from: any version `<= 0.7.1`.
+- urgency: **medium** if the host is currently low on free disk; **none** otherwise.
+
+### Background
+
+Issue [#507](https://github.com/SYRS-AI/agent-bridge-public/issues/507) documented a chain of three bugs in the daily-backup system that, together, fill the host disk with orphaned `*.tgz.tmp.*` files (~1.9 GB each), corrupt `~/.claude.json`, and render every `claude -p` subagent inoperable. The same upgrade also addresses two adjacent problems Sean surfaced in the same diagnosis pass: `state/tasks.db` was being bundled into every daily tarball as a raw, ~uncompressible binary (so 30-day retention multiplied it ~30× with near-zero dedup), and `backups/upgrade-*/` snapshots had no prune logic at all.
+
+v0.7.2 ships:
+
+1. **Root-cause fixes (`bridge-upgrade.py`, `bridge-daemon.sh`, `lib/bridge-state.sh`):**
+   - Stale `*.tgz.tmp.*` files reaped at the start of every backup attempt (age-gated by `BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS`, default 180s, plus an `flock`-based backup lock).
+   - Pre-flight free-space check (`shutil.disk_usage` ≥ 1.5× prior largest archive, floor 100 MiB). On insufficient space, the JSON outcome is `skipped_disk_full` and the daemon records the failure.
+   - `--retain-days` default dropped 30 → 7 (CLI + daemon defaults). `BRIDGE_DAILY_BACKUP_RETAIN_DAYS=30` keeps the old behavior.
+   - `state/tasks.db` (and its `-wal`/`-shm`/`-journal` siblings) excluded from the tar walk; instead a hot online snapshot is dumped to `state/backup-snapshots/tasks-YYYY-MM-DD.sql.gz` and added back to the tarball as a single explicit member. SQL dumps are ~10–20× smaller than the raw .db, gzip well, and round-trip via `sqlite3 newdb < tasks-YYYY-MM-DD.sql`.
+   - Exclude list expanded: `worktrees/`, `runtime/{assets,media,extensions}/`, `.claude/worktrees/`, and any-depth `node_modules` (in addition to the existing `__pycache__` skip and the new `state/backup-snapshots/` walk-time skip). Operators can extend via `BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS`.
+   - Daemon failure cooldown wired to outcomes. After a failure (`disk_full`, `timeout`, `parse`, `error_*`), the next attempt is suppressed for `BRIDGE_DAILY_BACKUP_FAILURE_COOLDOWN_SECONDS` (default 3600s). One `daemon_warn` and one audit row per cooldown window, not per cycle.
+
+2. **Auto-cleanup migration (`lib/bridge-cleanup.sh` + `bridge-upgrade.sh` wire-in):**
+   - `agent-bridge upgrade --apply` now runs `bridge-upgrade.py cleanup-residue` after the shared-settings rerender. It reaps stale tmp files, prunes daily archives at the new 7-day default, prunes SQL snapshots, prunes `backups/upgrade-*/` (preserving the current upgrade's `BACKUP_ROOT`, the newest `BRIDGE_UPGRADE_BACKUP_RETAIN_COUNT=5` snapshots, and anything younger than `BRIDGE_UPGRADE_BACKUP_RETAIN_DAYS=14`), and validates `~/.claude.json`. In `--no-backup` mode the upgrade-* prune step is skipped (no signal that the operator is OK with destruction).
+   - The `[upgrade-complete]` task body now includes a "Backup residue cleanup" summary block (what cleanup actually did + bytes freed) plus an agent-safe verification block (read-only health checks: `du`, `agent-bridge status`, `daily-backup state.env`, `verify-tasks-db`, `~/.claude.json` JSON parse, snapshot restore self-test on a temp DB).
+
+### Action
+
+**No operator action required for the common path.** The auto step covers every host that runs `agent-bridge upgrade --apply` to v0.7.2+, on every subsequent upgrade.
+
+The `[upgrade-complete]` task body will tell you whether cleanup succeeded. If it ran cleanly with `cleanup_failures=0`, run the verification block to confirm post-state and close the task.
+
+### Manual cleanup (only if the auto step reported failures)
+
+If the upgrade output printed `[bridge-upgrade] WARN: backup residue cleanup completed with N failure(s)`, the upgrader could not reach one of: stale tmp removal, daily prune, SQL-snapshot prune, upgrade-* prune, or `~/.claude.json` validation. Re-run cleanup directly:
+
+```bash
+TARGET_ROOT="$HOME/.agent-bridge"   # or your install root
+
+python3 "$TARGET_ROOT/bridge-upgrade.py" cleanup-residue \
+  --target-root "$TARGET_ROOT" \
+  --backup-dir "$TARGET_ROOT/backups/daily" \
+  --upgrade-backups-dir "$TARGET_ROOT/backups"
+```
+
+If even that fails (typically because the disk is so full that even renames ENOSPC), free space first, then re-run:
+
+```bash
+TARGET_ROOT="$HOME/.agent-bridge"
+
+# 1. Reap orphaned tmp files (cheapest win — usually GBs).
+rm -f "$TARGET_ROOT/backups/daily"/*.tgz.tmp.*
+
+# 2. Drop daily archives older than 7 days.
+find "$TARGET_ROOT/backups/daily" -maxdepth 1 -type f -name 'agent-bridge-*.tgz' \
+  -mtime +7 -print -delete
+
+# 3. Drop upgrade-* snapshots older than 14 days, keeping the 5 newest.
+ls -1dt "$TARGET_ROOT/backups"/upgrade-* 2>/dev/null \
+  | tail -n +6 \
+  | while read -r path; do
+      mtime_age_days=$(( ( $(date +%s) - $(stat -f %m "$path" 2>/dev/null \
+                       || stat -c %Y "$path") ) / 86400 ))
+      if (( mtime_age_days > 14 )); then
+        echo "removing $path (age=${mtime_age_days}d)"
+        rm -rf "$path"
+      fi
+    done
+
+# 4. Rerun cleanup-residue to refresh state + revalidate ~/.claude.json.
+python3 "$TARGET_ROOT/bridge-upgrade.py" cleanup-residue --target-root "$TARGET_ROOT"
+```
+
+If `~/.claude.json` is reported corrupted, restore it from `~/.claude/backups/<latest>/.claude.json`:
+
+```bash
+LATEST_BACKUP=$(ls -1t ~/.claude/backups/*/.claude.json 2>/dev/null | head -1)
+[[ -n "$LATEST_BACKUP" ]] && cp "$LATEST_BACKUP" ~/.claude.json && echo restored: "$LATEST_BACKUP"
+```
+
+### Verification (always run)
+
+The `[upgrade-complete]` task body embeds the same agent-safe verification block; run it from there. Standalone copy:
+
+```bash
+TARGET_ROOT="$HOME/.agent-bridge"
+
+du -sh "$TARGET_ROOT/backups/daily" "$TARGET_ROOT/backups"/upgrade-* 2>/dev/null
+ls "$TARGET_ROOT/backups/daily"/*.tgz.tmp.* 2>/dev/null \
+  && echo "STALE TMP STILL PRESENT" \
+  || echo "tmp clean"
+agent-bridge status 2>/dev/null | head -20
+cat "$TARGET_ROOT/state/daily-backup/state.env" 2>/dev/null || echo "(no state yet)"
+python3 "$TARGET_ROOT/bridge-upgrade.py" verify-tasks-db --target-root "$TARGET_ROOT"
+python3 -c "import json,os; json.load(open(os.path.expanduser('~/.claude.json'))); print('.claude.json OK')" \
+  || echo ".claude.json CORRUPTED — restore from ~/.claude/backups/"
+
+LATEST=$(ls -1t "$TARGET_ROOT/state/backup-snapshots"/tasks-*.sql.gz 2>/dev/null | head -1)
+if [[ -n "$LATEST" ]]; then
+  TMPDB=$(mktemp -t agb-restore-check.XXXXXX.sqlite)
+  gunzip -c "$LATEST" | sqlite3 "$TMPDB" >/dev/null 2>&1 \
+    && echo "snapshot restorable: $LATEST" \
+    || echo "snapshot BROKEN: $LATEST"
+  rm -f "$TMPDB"
+fi
+```
+
+### Skip if
+
+- Always skip the manual cleanup section if the auto step reported `cleanup_failures=0`.
+- Always run the verification block — it's read-only and confirms post-state.
+
+---
+
 ## v0.7.1 — telegram-relay residue auto-cleanup (no operator action required)
 
 - applies_when_upgrading_from: any version `<= 0.7.0`.

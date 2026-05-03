@@ -1272,9 +1272,31 @@ bridge_load_roster() {
   : "${BRIDGE_USAGE_MONITOR_STATE_FILE:=$BRIDGE_STATE_DIR/usage/monitor-state.json}"
   : "${BRIDGE_DAILY_BACKUP_ENABLED:=1}"
   : "${BRIDGE_DAILY_BACKUP_HOUR:=4}"
-  : "${BRIDGE_DAILY_BACKUP_RETAIN_DAYS:=30}"
+  # Bug #507 (3): default dropped 30 → 7. The previous default plus the
+  # raw .db inclusion (bug 6) produced 45–60 GB baseline disk consumption
+  # on long-lived installs and triggered the disk-full death-spiral. Set
+  # the env var explicitly to 30 if you really want the old behavior.
+  : "${BRIDGE_DAILY_BACKUP_RETAIN_DAYS:=7}"
   : "${BRIDGE_DAILY_BACKUP_DIR:=$BRIDGE_HOME/backups/daily}"
   : "${BRIDGE_DAILY_BACKUP_STATE_FILE:=$BRIDGE_STATE_DIR/daily-backup/state.env}"
+  # Bug #507 (cooldown): after a backup failure, suppress retries inside
+  # this window so a chronically-full disk doesn't burn one tarball
+  # attempt per daemon cycle. One warn + one audit per window.
+  : "${BRIDGE_DAILY_BACKUP_FAILURE_COOLDOWN_SECONDS:=3600}"
+  # Bug #507 (concurrency): grace window for stale tmp reaping. Should
+  # exceed the daemon-side bridge_with_timeout ceiling (120s) plus
+  # buffer; default 180s = 120 + 60.
+  : "${BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS:=180}"
+  # Daily-backup exclude roots additive to the hardcoded list in
+  # bridge-upgrade.py (logs/, worktrees/, runtime/{assets,media,extensions},
+  # .claude/worktrees/, state/backup-snapshots/). Colon- or comma-separated.
+  : "${BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS:=}"
+  # Upgrade-time backup retention (separate from daily archives). Both
+  # gates apply: keep at least N most recent + only delete those older
+  # than D days. The current upgrade's BACKUP_ROOT is always preserved.
+  # See lib/bridge-cleanup.sh for the prune flow.
+  : "${BRIDGE_UPGRADE_BACKUP_RETAIN_COUNT:=5}"
+  : "${BRIDGE_UPGRADE_BACKUP_RETAIN_DAYS:=14}"
   : "${BRIDGE_RELEASE_CHECK_ENABLED:=1}"
   : "${BRIDGE_RELEASE_CHECK_INTERVAL_SECONDS:=86400}"
   : "${BRIDGE_RELEASE_CHECK_STATE_FILE:=$BRIDGE_STATE_DIR/release-check/monitor-state.json}"
