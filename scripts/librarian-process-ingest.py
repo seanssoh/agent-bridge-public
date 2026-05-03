@@ -135,7 +135,17 @@ def load_envelope(capture_path: Path) -> dict | None:
     """Load a capture file and return the structured envelope (schema_version='1').
 
     Supports two shapes:
-      1. pure JSON file with envelope fields at root
+      1. pure JSON file with envelope fields at root, with two sub-shapes:
+         1a. legacy / direct emitters: the v1 envelope is the top-level
+             object itself (schema_version=='1' at root).
+         1b. bridge-memory capture wrapper: cmd_capture stores the v1
+             envelope under "envelope" while keeping capture metadata
+             (agent, user, source, created_at, channel, title) at the
+             root and only promoting four fields (schema_version,
+             suggested_slug, suggested_title, session_type, trigger).
+             Required reader fields (excerpt, suggested_entities,
+             suggested_concepts) are envelope-only, so we must unwrap
+             to surface them.
       2. markdown file with a ```json ... ``` fenced envelope block
     Returns None if the envelope is missing or schema_version != '1'.
     """
@@ -149,7 +159,18 @@ def load_envelope(capture_path: Path) -> dict | None:
             data = json.loads(text)
         except json.JSONDecodeError:
             return None
-        if isinstance(data, dict) and data.get("schema_version") == SCHEMA_VERSION:
+        if not isinstance(data, dict):
+            return None
+        # shape 1b: bridge-memory wrapper with a nested v1 envelope. The
+        # wrapper promotes schema_version to root, so we must prefer the
+        # nested envelope before checking root — otherwise we would
+        # return the wrapper (missing excerpt / suggested_entities /
+        # suggested_concepts, which live envelope-only).
+        inner = data.get("envelope")
+        if isinstance(inner, dict) and inner.get("schema_version") == SCHEMA_VERSION:
+            return inner
+        # shape 1a: root-level v1 envelope (legacy / direct emitters).
+        if data.get("schema_version") == SCHEMA_VERSION:
             return data
         return None
 
