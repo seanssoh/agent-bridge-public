@@ -567,7 +567,19 @@ bridge_add_agent_id_if_missing() {
 
 bridge_validate_agent_name() {
   local name="$1"
-  [[ "$name" =~ ^[A-Za-z0-9._-]+$ ]]
+
+  # Issue #526: a leading hyphen lets `--help` / `-h` / future flag names
+  # slip through as positional <name> arguments and silently scaffold a real
+  # agent named `--help`. Require the first character to be alphanumeric so
+  # CLI flags can never bind here.
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || return 1
+
+  # Reserved-name list: bare words that look like CLI verbs.
+  case "$name" in
+    help|version) return 1 ;;
+  esac
+
+  return 0
 }
 
 bridge_join_quoted() {
