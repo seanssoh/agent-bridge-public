@@ -332,6 +332,34 @@ def context_pressure_fp_rate(audit_log: str, window_days: int = 7) -> tuple[int,
     return (fp_count, len(critical_task_ids))
 
 
+def pending_upgrade_conflict_count(bridge_home: str) -> int:
+    """Count `*.upgrade-conflict` files under `<BRIDGE_HOME>` excluding
+    archived layers (`backups/...`). Renders as the `pending
+    upgrade-conflicts` warning line on the dashboard so admin agents
+    can prompt cleanup before the count grows past the operator's
+    notice threshold (issue #394).
+
+    Returns 0 if the path does not exist or is not a directory; the
+    counter is purely additive on healthy hosts.
+    """
+    if not bridge_home:
+        return 0
+    home = Path(bridge_home).expanduser()
+    if not home.is_dir():
+        return 0
+    count = 0
+    for path in home.rglob("*.upgrade-conflict"):
+        try:
+            rel = path.relative_to(home).as_posix()
+        except ValueError:
+            continue
+        if rel.startswith("backups/"):
+            continue
+        if path.is_file():
+            count += 1
+    return count
+
+
 def config_drift_count(audit_log: str, window_days: int = 7) -> int:
     """Count `cron_human_config_drift` and `channel_health_miss` audit rows
     over the last `window_days`. Renders as the `config-drift` line on the
@@ -605,6 +633,17 @@ def render_dashboard(args: argparse.Namespace) -> str:
         lines.append(
             f"config-drift ({drift_window_days}d): {drift_count}"
         )
+    # Issue #394: pending upgrade-conflict count. The dashboard threshold
+    # defaults to 1 (any pending file → warn); operators on chronically
+    # drift-heavy hosts can raise it via
+    # BRIDGE_UPGRADE_CONFLICT_WARN_THRESHOLD or the explicit CLI flag.
+    pending_conflict_threshold = max(1, int(args.upgrade_conflict_warn_threshold))
+    pending_conflicts = pending_upgrade_conflict_count(args.bridge_home or "")
+    if pending_conflicts >= pending_conflict_threshold:
+        lines.append(
+            f"WARNING: {pending_conflicts} pending upgrade-conflict file(s); "
+            "review with 'agent-bridge upgrade conflicts list'"
+        )
     lines.append("")
     lines.append("Agents")
     lines.append("  #  agent           eng     src     loop on  state    q   c   b   garden  idle  stale wake chan  nudge  load        session        workdir")
@@ -774,6 +813,10 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
         },
         "totals": totals,
         "agents": agents,
+        # Issue #394: structured surface for the pending upgrade-conflict
+        # count so JSON consumers (dashboard / admin-bot / smoke) can
+        # observe the same number the human-facing warning line emits.
+        "pending_upgrade_conflicts": pending_upgrade_conflict_count(args.bridge_home or ""),
     }
     return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
 
@@ -801,6 +844,17 @@ def main() -> int:
     parser.add_argument("--open-limit", type=int, default=8)
     parser.add_argument("--stale-warn-seconds", type=int, default=3600)
     parser.add_argument("--stale-critical-seconds", type=int, default=14400)
+    # Issue #394: dashboard reaches into BRIDGE_HOME to count pending
+    # `*.upgrade-conflict` files. Optional — when absent, the warning
+    # line and JSON counter both report zero (counter falls back to no
+    # scan rather than guessing the path).
+    parser.add_argument("--bridge-home", default="")
+    parser.add_argument(
+        "--upgrade-conflict-warn-threshold",
+        type=int,
+        default=int(os.environ.get("BRIDGE_UPGRADE_CONFLICT_WARN_THRESHOLD", "1") or 1),
+        help="Emit the pending upgrade-conflict warning when count >= this (default 1).",
+    )
     parser.add_argument("--footer", default="")
     parser.add_argument("--all-agents", action="store_true")
     parser.add_argument("--json", action="store_true")

@@ -71,6 +71,7 @@ render_once() {
     --db "$BRIDGE_TASK_DB"
     --daemon-pid-file "$BRIDGE_DAEMON_PID_FILE"
     --bridge-state-dir "$BRIDGE_STATE_DIR"
+    --bridge-home "${BRIDGE_HOME:-$HOME/.agent-bridge}"
     --audit-log "$BRIDGE_AUDIT_LOG"
     --version "$(bridge_version)"
     --open-limit "$OPEN_LIMIT"

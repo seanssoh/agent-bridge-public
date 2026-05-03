@@ -579,116 +579,69 @@ print("" if value is None else str(value))
 PY
 }
 
-bridge_upgrade_conflicts_list() {
-  # Read-only enumeration of *.upgrade-conflict files left behind by
-  # `agb upgrade --apply` 3-way merges. Excludes the backups/ tree so
-  # archived layers from previous upgrades don't drown out live state.
-  # See issue #394 PR-1.
+bridge_upgrade_conflicts_dispatch() {
+  # Issue #394: thin shell dispatcher for the `conflicts` lifecycle
+  # subcommands. Delegates to bridge-upgrade.py so list/diff/adopt/
+  # discard/archive/reconcile share one implementation and one
+  # at-write-hash record format. The earlier PR-1 shell `list` is
+  # superseded; the python-side `list` adds the
+  # `live_target_hash_changed_since_write` column needed by the new
+  # reconcile contract.
+  local sub="${1:-list}"
+  shift || true
   local target="${BRIDGE_HOME:-$HOME/.agent-bridge}"
-  local json_out=0
+  local -a forward=()
+  local seen_target=0
   while (( $# > 0 )); do
     case "$1" in
       --target)
-        [[ $# -lt 2 ]] && bridge_die "agb upgrade conflicts list: --target 뒤에 값을 지정하세요."
+        [[ $# -lt 2 ]] && bridge_die "agb upgrade conflicts: --target 뒤에 값을 지정하세요."
         target="$2"
+        seen_target=1
         shift 2
         ;;
       --target=*)
         target="${1#--target=}"
-        shift
-        ;;
-      --json)
-        json_out=1
+        seen_target=1
         shift
         ;;
       -h|--help|help)
-        printf 'Usage: agb upgrade conflicts list [--target <bridge-home>] [--json]\n'
+        cat <<'USAGE'
+Usage:
+  agb upgrade conflicts list     [--target <bridge-home>] [--json]
+  agb upgrade conflicts diff     [--target <bridge-home>] <conflict-path>
+  agb upgrade conflicts adopt    [--target <bridge-home>] [--yes] <conflict-path>
+  agb upgrade conflicts discard  [--target <bridge-home>] [--yes] <conflict-path>
+  agb upgrade conflicts archive  [--target <bridge-home>] [--yes] <conflict-path>
+  agb upgrade conflicts reconcile [--target <bridge-home>] [--auto-archive]
+USAGE
         return 0
         ;;
-      -*)
-        bridge_die "agb upgrade conflicts list: 알 수 없는 옵션입니다: $1"
-        ;;
       *)
-        bridge_die "agb upgrade conflicts list: 예기치 않은 인자입니다: $1"
+        forward+=("$1")
+        shift
         ;;
     esac
   done
-
-  [[ -d "$target" ]] || bridge_die "agb upgrade conflicts list: 대상 디렉터리를 찾을 수 없습니다: $target"
-
-  if (( json_out )); then
-    bridge_require_python
-    find "$target" -type f -name '*.upgrade-conflict' -not -path '*/backups/*' 2>/dev/null \
-      | python3 -c '
-import json
-import sys
-from pathlib import Path
-
-results = []
-for line in sys.stdin:
-    raw = line.rstrip("\n")
-    if not raw:
-        continue
-    p = Path(raw)
-    try:
-        st = p.stat()
-    except OSError:
-        continue
-    results.append({
-        "path": str(p),
-        "size": st.st_size,
-        "mtime": st.st_mtime,
-    })
-
-results.sort(key=lambda r: r["mtime"])
-print(json.dumps({"conflicts": results, "count": len(results)}, indent=2, ensure_ascii=False))
-'
-  else
-    # Issue #394 PR-1 r2 (codex r1 #5): sort plain-text rows by mtime
-    # ascending so the operator-visible order matches the documented
-    # contract (oldest first). JSON path already sorted by mtime; this
-    # aligns the plain path. Use stat's epoch-mtime (`%Y` GNU / `%m` BSD)
-    # as the sort key, then strip it before rendering so the row format
-    # stays `<path>\t<size> bytes\t<mtime-string>`.
-    local count=0
-    local path size mtime mtime_epoch
-    while IFS=$'\t' read -r mtime_epoch path; do
-      [[ -n "$path" ]] || continue
-      size="$(stat -c '%s' "$path" 2>/dev/null || stat -f '%z' "$path" 2>/dev/null || echo 0)"
-      mtime="$(stat -c '%y' "$path" 2>/dev/null || stat -f '%Sm' -t '%Y-%m-%d %H:%M' "$path" 2>/dev/null || echo unknown)"
-      printf '%s\t%s bytes\t%s\n' "$path" "$size" "$mtime"
-      count=$(( count + 1 ))
-    done < <(
-      find "$target" -type f -name '*.upgrade-conflict' -not -path '*/backups/*' 2>/dev/null \
-        | while IFS= read -r _p; do
-            local _ts
-            _ts="$(stat -c '%Y' "$_p" 2>/dev/null || stat -f '%m' "$_p" 2>/dev/null || echo 0)"
-            printf '%s\t%s\n' "$_ts" "$_p"
-          done \
-        | sort -n
-    )
-    printf 'total: %d conflict file(s)\n' "$count" >&2
-  fi
+  (( seen_target )) || true
+  [[ -d "$target" ]] || bridge_die "agb upgrade conflicts: 대상 디렉터리를 찾을 수 없습니다: $target"
+  bridge_require_python
+  case "$sub" in
+    list|diff|adopt|discard|archive|reconcile)
+      python3 "$SOURCE_ROOT/bridge-upgrade.py" "conflicts-$sub" --target-root "$target" "${forward[@]}"
+      ;;
+    *)
+      bridge_die "agb upgrade conflicts: 지원하지 않는 하위 명령입니다: $sub (list|diff|adopt|discard|archive|reconcile)"
+      ;;
+  esac
 }
 
 if [[ $# -gt 0 ]]; then
   case "$1" in
     conflicts)
       shift
-      case "${1:-list}" in
-        list)
-          shift
-          bridge_upgrade_conflicts_list "$@"
-          exit 0
-          ;;
-        -h|--help|help)
-          printf 'Usage: agb upgrade conflicts list [--target <bridge-home>] [--json]\n'
-          exit 0
-          ;;
-        *)
-          bridge_die "agb upgrade conflicts: 지원하지 않는 하위 명령입니다: $1 (현재 list만 지원하며, diff/adopt/discard는 후속 PR에서 추가됩니다)"
-          ;;
-      esac
+      bridge_upgrade_conflicts_dispatch "$@"
+      exit $?
       ;;
     analyze|rollback)
       SUBCOMMAND="$1"
@@ -1191,7 +1144,26 @@ payload = json.load(sys.stdin)
 print(payload.get("base_ref", ""))
 ')"
 
-apply_args=(apply-live --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT")
+# Issue #394: stamp this upgrade run with a deterministic id and run a
+# pre-apply reconcile pass that auto-archives any prior `.upgrade-conflict`
+# whose live target hash hasn't changed since the conflict was written.
+# Skipped on dry-run (would print the report but not mutate). The
+# reconcile call is best-effort: if `state/upgrade-conflicts/` is empty
+# or unreadable we still continue with apply.
+UPGRADE_RUN_ID="$(date -u '+%Y%m%dT%H%M%SZ')-$$"
+RECONCILE_JSON='{"mode":"upgrade-conflicts-reconcile","skipped":true,"archived_count":0}'
+if [[ $DRY_RUN -eq 0 ]]; then
+  set +e
+  RECONCILE_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" conflicts-reconcile \
+    --target-root "$TARGET_ROOT" --auto-archive 2>/dev/null)"
+  _reconcile_rc=$?
+  set -e
+  if [[ $_reconcile_rc -ne 0 ]]; then
+    RECONCILE_JSON='{"mode":"upgrade-conflicts-reconcile","error":"reconcile failed","archived_count":0}'
+  fi
+fi
+
+apply_args=(apply-live --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT" --run-id "$UPGRADE_RUN_ID")
 if [[ -n "$BASE_REF" ]]; then
   apply_args+=(--base-ref "$BASE_REF")
 fi
@@ -1805,9 +1777,11 @@ for item in payload.get("candidates") or []:
     change_keys = ",".join(str(change.get("key")) for change in changes) or "-"
     print(f"  - {status}: {agent} changes={change_keys}")
 PY
-python3 - "$APPLY_JSON" <<'PY'
+python3 - "$APPLY_JSON" "$RECONCILE_JSON" "$UPGRADE_RUN_ID" <<'PY'
 import json, sys
 payload = json.loads(sys.argv[1])
+reconcile = json.loads(sys.argv[2])
+run_id = sys.argv[3]
 counts = payload.get("counts", {})
 print(f"files_copied: {counts.get('files_copied', 0)}")
 print(f"files_merged_clean: {counts.get('files_merged_clean', 0)}")
@@ -1821,6 +1795,18 @@ if conflicts:
         print(f"  - {path}")
     if len(conflicts) > 10:
         print(f"  ... +{len(conflicts) - 10} more")
+# Issue #394: end-of-run summary. Reports the auto-archive count from
+# the start-of-run reconcile pass and the new-conflict count from this
+# run, plus the run-id pointer to state/upgrade-conflicts/<run-id>.json
+# so operators can find the structured record and inspect at-write
+# hashes without grepping the live tree.
+auto_archived = int(reconcile.get("archived_count") or 0)
+if auto_archived:
+    print(f"auto_archived_stale_conflicts: {auto_archived}")
+print(
+    f"[bridge-upgrade] wrote {len(conflicts)} .upgrade-conflict file(s) "
+    f"(run-id={run_id}); review with: agent-bridge upgrade conflicts list"
+)
 PY
 if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   python3 - "$MIGRATION_JSON" <<'PY'
