@@ -181,6 +181,31 @@ step_missing_tasks_db() {
   smoke_log "missing_tasks_db OK"
 }
 
+step_corrupted_tasks_db_blocks_archive() {
+  setup_bridge_home
+  # Plant a non-sqlite blob at state/tasks.db. dump_sqlite_snapshot will
+  # call .backup() against it, which fails with "file is not a database".
+  # The PR #508 r3 guard must convert that into outcome=error_sqlite_snapshot
+  # rather than letting the daemon mark `created` and prune older good
+  # backups. (Codex r2 blocker reproduction.)
+  printf 'this is not a sqlite database\n' >"$BRIDGE_HOME/state/tasks.db"
+
+  local payload outcome
+  payload="$(python3 "$SMOKE_REPO_ROOT/bridge-upgrade.py" daily-backup-live \
+    --target-root "$BRIDGE_HOME" \
+    --backup-dir "$BRIDGE_HOME/backups/daily" \
+    --retain-days 7)"
+  outcome="$(printf '%s' "$payload" | python3 -c "$PYTHON_PARSE_OUTCOME")"
+  [[ "$outcome" == "error_sqlite_snapshot" ]] \
+    || smoke_fail "corrupted_tasks_db: outcome=$outcome (want error_sqlite_snapshot)"
+
+  if compgen -G "$BRIDGE_HOME/backups/daily/agent-bridge-*.tgz" >/dev/null; then
+    smoke_fail "corrupted_tasks_db: archive was created despite snapshot failure"
+  fi
+
+  smoke_log "corrupted_tasks_db_blocks_archive OK"
+}
+
 step_cleanup_residue_happy_path() {
   setup_bridge_home
 
@@ -223,6 +248,7 @@ main() {
   step_stale_tmp_reap
   step_disk_full_skip
   step_missing_tasks_db
+  step_corrupted_tasks_db_blocks_archive
   step_cleanup_residue_happy_path
   smoke_log "all daily-backup checks passed"
 }

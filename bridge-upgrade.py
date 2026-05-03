@@ -1025,6 +1025,32 @@ def create_daily_backup_archive(
             snapshots = dump_sqlite_snapshot(target_root, today, tmp_root=snap_tmp)
         result["snapshots"] = snapshots
 
+        # PR #508 r3 (Codex blocker): if a source DB exists but its
+        # snapshot failed (corruption, locked beyond timeout, FS error),
+        # the tarball would otherwise ship with neither the raw .db
+        # (excluded from the tar walk) nor the .sql.gz dump — a silently
+        # empty queue snapshot that the daemon would still mark
+        # `created`, clearing failure state and pruning prior good
+        # backups. Treat that as a hard failure: surface
+        # `error_sqlite_snapshot`, do NOT write a tarball, do NOT prune.
+        # Missing source DB (`source_present=False`) stays non-fatal —
+        # fresh installs must keep working.
+        snapshot_errors = [
+            entry for entry in snapshots
+            if entry.get("source_present") and entry.get("error")
+        ]
+        if snapshot_errors:
+            first = snapshot_errors[0]
+            result["outcome"] = "error_sqlite_snapshot"
+            result["error_detail"] = (
+                f"{first.get('src_relpath', 'unknown')}: {first.get('error', 'unknown')}"
+            )
+            result["snapshot_errors"] = [
+                {"src_relpath": e.get("src_relpath"), "error": e.get("error")}
+                for e in snapshot_errors
+            ]
+            return result
+
         tmp_path = backup_dir / f"{archive_path.name}.tmp.{os.getpid()}"
         # Erase any prior tmp owned by this exact PID (rare, but possible
         # on PID reuse after a crash between two attempts in the same

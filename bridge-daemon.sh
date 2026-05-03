@@ -603,6 +603,198 @@ bridge_note_daily_backup_failure() {
   bridge_audit_log daemon daily_backup_failure daemon \
     --detail reason="$reason" \
     --detail detail="$detail" || true
+
+  # PR #508 r3 (operator-requested): daemon log + state.env alone are
+  # invisible unless someone actively monitors them. File a task to the
+  # admin agent so the operator gets an inbox signal. The cooldown
+  # gating in bridge_daily_backup_due (default 1h) already ensures this
+  # function is invoked at most once per cooldown window per failure
+  # reason — no spam without further dedup logic.
+  bridge_emit_daily_backup_failure_admin_task "$reason" "$detail"
+}
+
+# Best-effort admin notification when daily-backup fails. No-op if
+# BRIDGE_ADMIN_AGENT_ID is unset or the bridge CLI isn't reachable.
+# Always returns 0 so a notification failure never cascades into the
+# daemon main loop.
+bridge_emit_daily_backup_failure_admin_task() {
+  local reason="${1:-unknown}"
+  local detail="${2:-}"
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local target_bridge=""
+  local body_file=""
+  local hostname_short=""
+  local cooldown=""
+  local resume_at=""
+
+  [[ -n "$admin" ]] || return 0
+
+  # Prefer the live install's CLI (operator-facing paths in the body
+  # need to match what the admin will actually run). Fall back to the
+  # source checkout's CLI if BRIDGE_HOME isn't laid out yet.
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  else
+    return 0
+  fi
+
+  hostname_short="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+  cooldown="$(bridge_daily_backup_int "${BRIDGE_DAILY_BACKUP_FAILURE_COOLDOWN_SECONDS:-3600}")"
+  (( cooldown > 0 )) || cooldown=3600
+  resume_at="$(bridge_daily_backup_format_epoch "$(( $(date +%s) + cooldown ))")"
+
+  body_file="$(mktemp -t bridge-daily-backup-fail.XXXXXX.md)"
+  case "$reason" in
+    disk_full)
+      _bridge_render_disk_full_task_body "$detail" "$resume_at" "$cooldown" >"$body_file"
+      ;;
+    *)
+      _bridge_render_generic_failure_task_body "$reason" "$detail" "$resume_at" "$cooldown" >"$body_file"
+      ;;
+  esac
+
+  if ! "$target_bridge" task create \
+       --to "$admin" --priority urgent --from daemon \
+       --title "[backup-failed:${reason}] daily-backup paused on ${hostname_short}" \
+       --body-file "$body_file" >/dev/null 2>&1; then
+    daemon_warn "failed to file [backup-failed:${reason}] task to admin=${admin}; check the admin id and try again"
+  fi
+  rm -f "$body_file"
+  return 0
+}
+
+_bridge_render_disk_full_task_body() {
+  local detail="${1:-}"
+  local resume_at="${2:-}"
+  local cooldown="${3:-3600}"
+
+  cat <<EOF
+# Daily backup paused — host disk near full
+
+The daily-backup pre-flight check refused to write today's tarball
+because free space is below 1.5× the previous archive size (or the
+100 MiB floor). The backup is **stopped**; no partial tmp file was
+created. The daemon will not retry until cooldown expires.
+
+## Symptom
+
+\`\`\`
+${detail:-(no detail)}
+\`\`\`
+
+- Cooldown: **${cooldown}s** (next attempt after **${resume_at}**)
+- Cooldown env: \`BRIDGE_DAILY_BACKUP_FAILURE_COOLDOWN_SECONDS\`
+
+## Recovery (run on this host)
+
+1. Inspect disk usage:
+
+   \`\`\`bash
+   df -h "$BRIDGE_HOME"
+   du -sh "$BRIDGE_HOME"/backups/{daily,upgrade-*} 2>/dev/null | sort -h
+   \`\`\`
+
+2. Free space (in priority order):
+
+   \`\`\`bash
+   # Reap orphaned tmp files (typically GBs).
+   rm -f "$BRIDGE_HOME"/backups/daily/*.tgz.tmp.*
+
+   # Drop daily archives older than 7 days.
+   find "$BRIDGE_HOME"/backups/daily -maxdepth 1 -type f \\
+     -name 'agent-bridge-*.tgz' -mtime +7 -print -delete
+
+   # Drop oldest upgrade-* keeping the 5 newest.
+   ls -1dt "$BRIDGE_HOME"/backups/upgrade-* 2>/dev/null \\
+     | tail -n +6 | xargs -r rm -rf
+   \`\`\`
+
+3. Run packaged cleanup (covers all of the above + ~/.claude.json validation):
+
+   \`\`\`bash
+   python3 "$BRIDGE_HOME"/bridge-upgrade.py cleanup-residue \\
+     --target-root "$BRIDGE_HOME"
+   \`\`\`
+
+4. Force a fresh attempt (re-runs preflight + clears failure state on success):
+
+   \`\`\`bash
+   python3 "$BRIDGE_HOME"/bridge-upgrade.py daily-backup-live \\
+     --target-root "$BRIDGE_HOME" \\
+     --backup-dir "$BRIDGE_HOME"/backups/daily
+   \`\`\`
+
+## Close this task
+
+Close once the next daemon cycle reports \`outcome=created\` (visible
+in \`$BRIDGE_HOME/state/daily-backup/state.env\` as a new
+\`DAILY_BACKUP_LAST_SUCCESS_DATE\`) and free space ≥ 1.5× prior archive
+size.
+EOF
+}
+
+_bridge_render_generic_failure_task_body() {
+  local reason="${1:-unknown}"
+  local detail="${2:-}"
+  local resume_at="${3:-}"
+  local cooldown="${4:-3600}"
+
+  cat <<EOF
+# Daily backup paused — failure reason: ${reason}
+
+The daily-backup attempt failed and the daemon recorded a cooldown
+window. The backup is **stopped**; the daemon will not retry until
+cooldown expires.
+
+## Symptom
+
+\`\`\`
+reason: ${reason}
+detail: ${detail:-(no detail)}
+\`\`\`
+
+- Cooldown: **${cooldown}s** (next attempt after **${resume_at}**)
+
+## What this could mean
+
+- \`timeout\`: the backup walk exceeded the 120s daemon timeout. Check whether \`$BRIDGE_HOME\` has unexpectedly large directories (e.g. an unbacked \`shared/\` or accidentally-included \`worktrees/\`). Tune \`BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS\` if needed.
+- \`parse\` / \`subprocess_rc_*\`: the python3 helper exited unexpectedly. Stderr should be in the daemon log; \`tail -n 200 $BRIDGE_HOME/state/daemon.log\`.
+- \`error_sqlite_snapshot\`: \`state/tasks.db\` exists but its hot snapshot failed (corruption, locked). Run \`python3 $BRIDGE_HOME/bridge-upgrade.py verify-tasks-db --target-root $BRIDGE_HOME\` to diagnose.
+- \`error_oserror_*\`: filesystem error from tar write or rename. Check disk health.
+
+## Recovery
+
+1. Read the daemon log for context:
+
+   \`\`\`bash
+   tail -n 200 "$BRIDGE_HOME"/state/daemon.log
+   \`\`\`
+
+2. Read the daily-backup state file:
+
+   \`\`\`bash
+   cat "$BRIDGE_HOME"/state/daily-backup/state.env
+   \`\`\`
+
+3. Run packaged cleanup (idempotent; will not retry the backup):
+
+   \`\`\`bash
+   python3 "$BRIDGE_HOME"/bridge-upgrade.py cleanup-residue \\
+     --target-root "$BRIDGE_HOME"
+   \`\`\`
+
+4. Force a fresh attempt:
+
+   \`\`\`bash
+   python3 "$BRIDGE_HOME"/bridge-upgrade.py daily-backup-live \\
+     --target-root "$BRIDGE_HOME" \\
+     --backup-dir "$BRIDGE_HOME"/backups/daily
+   \`\`\`
+
+Close the task once the next daemon cycle reports \`outcome=created\`.
+EOF
 }
 
 bridge_release_paths_valid() {
