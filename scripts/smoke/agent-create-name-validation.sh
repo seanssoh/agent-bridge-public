@@ -3,14 +3,19 @@
 #
 # Validates that `bridge-agent.sh create <name>` rejects names that look
 # like CLI flags or reserved verbs before any roster mutation, and that
-# `--help` short-circuits to the create usage banner. Six assertions:
+# `--help` short-circuits to the create usage banner. Seven assertions:
 #
 # 1. `create --help` exits 0, prints usage, does NOT scaffold an agent.
 # 2. `create -h` is treated the same way.
-# 3. `create help` is rejected as a reserved name (and no scaffold).
+# 3. `create version` is rejected as a reserved name (and no scaffold).
+#    `version` is on the reserved list but — unlike `help` — is NOT
+#    intercepted by the help-first short-circuit, so it actually exercises
+#    the reserved-name branch in bridge_validate_agent_name.
 # 4. `create ""` is rejected (Usage hint, no scaffold).
 # 5. `create 'evil"name'` is rejected by the char-class regex (no scaffold).
-# 6. Negative control: `create valid-worker --dry-run` succeeds and emits a
+# 6. Positive control: `create 9worker --dry-run` succeeds, locking in the
+#    intentional regex loosening that allows numeric-start names.
+# 7. Negative control: `create valid-worker --dry-run` succeeds and emits a
 #    role block on stdout without mutating the local roster file.
 
 set -euo pipefail
@@ -58,14 +63,15 @@ assert_help_short_circuit() {
   assert_no_scaffold "create $flag" "$flag"
 }
 
-assert_reserved_help_word() {
+assert_reserved_version_word() {
   reset_runtime
   local out
-  out="$(run_create "help")"
-  # `help` is a reserved bare verb, AND is also intercepted by the
-  # help-first short-circuit in run_create — either way no scaffold.
-  smoke_assert_contains "$out" "create <agent>" "create help short-circuits to usage"
-  assert_no_scaffold "create help" "help"
+  out="$(run_create "version")"
+  # `version` is on the reserved-name list but is NOT intercepted by the
+  # help-first short-circuit (which only handles -h/--help/help), so this
+  # actually exercises the reserved-name branch of the validator.
+  smoke_assert_contains "$out" "예약어" "create version rejected by reserved-name validator"
+  assert_no_scaffold "create version" "version"
 }
 
 assert_empty_name() {
@@ -82,6 +88,23 @@ assert_metachar_name() {
   out="$(run_create 'evil"name')"
   smoke_assert_contains "$out" "에이전트 이름" "create 'evil\"name' rejected by validator"
   assert_no_scaffold "create metachar" 'evil"name'
+}
+
+assert_numeric_start_dry_run() {
+  reset_runtime
+  local out
+  out="$(run_create 9worker --engine claude --dry-run)"
+  smoke_assert_contains "$out" "agent: 9worker" \
+    "create 9worker --dry-run accepted (numeric-start regex loosening)"
+  smoke_assert_contains "$out" "dry_run: yes" \
+    "create 9worker --dry-run flags itself as a plan, not a mutation"
+  if [[ -s "$BRIDGE_ROSTER_LOCAL_FILE" ]]; then
+    smoke_assert_not_contains "$(cat "$BRIDGE_ROSTER_LOCAL_FILE")" \
+      "MANAGED ROLE: 9worker" \
+      "create 9worker --dry-run does not mutate local roster"
+  fi
+  [[ ! -d "$BRIDGE_AGENT_HOME_ROOT/9worker" ]] || \
+    smoke_fail "create 9worker --dry-run unexpectedly created agents/9worker/"
 }
 
 assert_valid_dry_run() {
@@ -110,9 +133,10 @@ main() {
 
   smoke_run "create --help short-circuits"  assert_help_short_circuit --help
   smoke_run "create -h short-circuits"      assert_help_short_circuit -h
-  smoke_run "create help reserved-word"     assert_reserved_help_word
+  smoke_run "create version reserved-word"  assert_reserved_version_word
   smoke_run "create '' rejected"            assert_empty_name
   smoke_run "create 'evil\"name' rejected"  assert_metachar_name
+  smoke_run "create 9worker --dry-run"      assert_numeric_start_dry_run
   smoke_run "create valid-worker --dry-run" assert_valid_dry_run
 
   smoke_log "PASS"

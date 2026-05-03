@@ -192,7 +192,7 @@ select_for_path() {
       add_live live-tmux-daemon
       ;;
 
-    bridge-start.sh|bridge-run.sh|bridge-send.sh|bridge-action.sh|bridge-agent.sh|agent-bridge|agb|lib/bridge-tmux.sh|lib/bridge-session-patterns.sh)
+    bridge-start.sh|bridge-run.sh|bridge-send.sh|bridge-action.sh|bridge-agent.sh|agent-bridge|agb|lib/bridge-tmux.sh|lib/bridge-session-patterns.sh|lib/bridge-wave.sh)
       add_required launch tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation
       add_integration integration-minimal
       add_live live-tmux-daemon
