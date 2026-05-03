@@ -5,11 +5,14 @@ import os
 import re
 import secrets
 import shlex
+import signal
 import sqlite3
+import subprocess
 import sys
 import tempfile
+import time
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -22,6 +25,34 @@ FAMILY_RULES = (
     "event-reminder",
     "weekly-review",
 )
+
+# Issue #533 — retention defaults for cron run-artifact GC.
+RUN_ARTIFACTS_TIER_A_DEFAULT_DAYS = 7
+RUN_ARTIFACTS_TIER_B_DEFAULT_DAYS = 30
+ALWAYS_PRESERVE_FLOOR = 5
+
+# Surface paths are relative to the BRIDGE_HOME target_root.
+RUN_ARTIFACTS_TIER_A_SURFACES = (
+    "state/cron/runs",
+    "state/cron/workers",
+    "state/cron/dispatch",
+)
+RUN_ARTIFACTS_TIER_B_SURFACES = (
+    "shared/cron-dispatch",
+    "shared/cron-result",
+    "shared/cron-followup",
+)
+
+# Terminal state.json values for a cron run. "deferred" is intentionally NOT
+# terminal — the runner asks for re-fire and the slot is still in flight.
+_RUN_STATUS_TERMINAL_STATES = {"success", "error", "cancelled"}
+# Failed runs (state="error") are retained on the longer Tier-B clock so the
+# operator has time to triage even when the originating surface is Tier-A.
+_RUN_STATUS_FAILED_STATES = {"error"}
+
+# bridge-queue.py terminal statuses are "done" and "cancelled" only — there
+# is no "failed" queue state. Source: bridge-queue.py status enum + #533.
+_QUEUE_TERMINAL_STATUSES = {"done", "cancelled"}
 
 
 def load_jobs_payload(path):
@@ -616,7 +647,12 @@ def print_errors_report(args, records):
 
 def cleanup_candidates(records, mode):
     now = datetime.now().astimezone()
-    if mode != "expired-one-shot":
+    # ``one-shot`` is the issue #533 alias for the legacy
+    # ``expired-one-shot`` mode kept for backwards compat. ``all`` runs
+    # both the legacy expired-one-shot pass *and* the new run-artifacts
+    # pass; from the legacy pass's perspective ``all`` is just the
+    # one-shot subset, hence the alias here.
+    if mode not in ("expired-one-shot", "one-shot", "all"):
         raise ValueError(f"unsupported cleanup mode: {mode}")
     return [
         record
@@ -636,6 +672,744 @@ def format_cleanup_candidate(record):
         f"last={format_dt(record['last_run_at'])} | "
         f"status={record['last_status']}"
     )
+
+
+# -----------------------------------------------------------------------------
+# Issue #533 — run-artifact cleanup helpers.
+#
+# The 6 surfaces (3 Tier-A + 3 Tier-B) accumulate one entry per cron tick with
+# no built-in retention. The helpers below implement the combined-AND deletion
+# gate (queue-terminal AND status-terminal AND no-live-pid AND outside floor)
+# plus the always-preserve floor that protects quiet weekly jobs from losing
+# their only diagnostic.
+# -----------------------------------------------------------------------------
+
+
+def _rmtree_safe(path):
+    """Recursively delete; refuse to follow symlinks; never cross a bind mount.
+
+    Mirrors ``bridge-relay-cleanup.py:_rmtree_safe`` so the prune path matches
+    the existing telegram-relay cleanup safety contract.
+    """
+    if path.is_symlink() or not path.is_dir():
+        try:
+            path.unlink()
+        except (FileNotFoundError, IsADirectoryError):
+            pass
+        return
+    for child in path.iterdir():
+        _rmtree_safe(child)
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
+def _iter_processes_psutil():
+    """Try psutil; return None if unavailable so caller can fall back to ps."""
+    try:
+        import psutil  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    items = []
+    for proc in psutil.process_iter(["pid", "cmdline"]):
+        try:
+            cmdline = proc.info.get("cmdline") or []
+            pid = int(proc.info["pid"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not cmdline:
+            continue
+        items.append((pid, list(cmdline)))
+    return items
+
+
+def _iter_processes_ps():
+    try:
+        out = subprocess.check_output(
+            ["ps", "-eo", "pid=,args="], text=True, stderr=subprocess.DEVNULL
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+        return []
+    items = []
+    for raw_line in out.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        head, _, rest = line.partition(" ")
+        try:
+            pid = int(head)
+        except ValueError:
+            continue
+        argv = rest.strip().split()
+        if not argv:
+            continue
+        items.append((pid, argv))
+    return items
+
+
+def _iter_live_processes():
+    procs = _iter_processes_psutil()
+    if procs is None:
+        procs = _iter_processes_ps()
+    return procs
+
+
+def _argv_run_id_match(argv, run_id, target_root):
+    """Path-anchored match: argv must reference run_id under ``target_root``.
+
+    Mirrors PR #527 / ``bridge-relay-cleanup.py:_stale_relay_match``: we
+    REJECT bare-substring matches against ``run_id`` alone — a foreign
+    install on the same host whose argv happens to mention the same
+    run_id must NOT cause this install to skip cleanup. The matcher
+    insists the run_id appears as a path component under either
+    ``<target_root>/state/cron/...`` or ``<target_root>/shared/cron-...``.
+    """
+    if not argv or not run_id:
+        return False
+    target_str = str(target_root).rstrip("/")
+    if not target_str:
+        return False
+    rooted_prefixes = (
+        target_str + os.sep + "state" + os.sep + "cron" + os.sep,
+        target_str + os.sep + "shared" + os.sep + "cron-",
+    )
+    for token in argv:
+        if not token or run_id not in token:
+            continue
+        if any(token.startswith(prefix) for prefix in rooted_prefixes):
+            return True
+    return False
+
+
+def has_live_pid_for_run(run_id, target_root):
+    procs = _iter_live_processes()
+    self_pid = os.getpid()
+    for pid, argv in procs:
+        if pid == self_pid:
+            continue
+        if _argv_run_id_match(argv, run_id, target_root):
+            return True
+    return False
+
+
+def _queue_cli_path():
+    """Path to the sibling ``bridge-queue.py`` CLI."""
+    return Path(__file__).resolve().parent / "bridge-queue.py"
+
+
+def _lookup_queue_status_via_cli(task_id, *, tasks_db_path):
+    """Subprocess to ``bridge-queue.py show <task_id> --format shell`` and
+    return the queue status string, or ``None`` when the row cannot be
+    read (task not found / queue unavailable / parse error).
+
+    PR #536 r2: keeps the cleanup pass on the queue-first contract
+    (CLAUDE.md). The subprocess cost is bounded — GC runs are rare
+    (daily-ish) and each artifact requires one short read.
+    """
+    cmd = [
+        sys.executable,
+        str(_queue_cli_path()),
+        "show",
+        str(task_id),
+        "--format",
+        "shell",
+    ]
+    env = dict(os.environ)
+    # Force the direct (non-gateway) read path. The gateway adds a
+    # round-trip we don't need for a status lookup, and would require an
+    # operator agent context the cleanup pass doesn't have.
+    env.pop("BRIDGE_GATEWAY_PROXY", None)
+    env.pop("BRIDGE_AGENT_ID", None)
+    if tasks_db_path is not None:
+        env["BRIDGE_TASK_DB"] = str(tasks_db_path)
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15, check=False, env=env
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    for line in completed.stdout.splitlines():
+        if line.startswith("TASK_STATUS="):
+            # Shell-format value is shlex-quoted; for a queue status enum
+            # ("queued"/"claimed"/"done"/"cancelled"/"blocked"/"in_progress")
+            # there are no shell-special characters so a simple strip is
+            # sufficient. Use shlex.split to be safe against edge cases.
+            try:
+                parts = shlex.split(line[len("TASK_STATUS="):])
+            except ValueError:
+                return None
+            return parts[0] if parts else None
+    return None
+
+
+def queue_dispatch_terminal(run_id, target_root, *, tasks_db_path=None, run_dir=None):
+    """Return (terminal?, queue_status, dispatch_task_id) for the given run.
+
+    PR #536 r2 contract:
+      - The dispatch task_id is resolved from ``request.json`` first, then
+        falls back to extracting ``<id>`` from a ``run_id`` of the form
+        ``task-<id>`` (used by the worker-artifact surface). Without this
+        fallback, a worker artifact whose run-dir was pruned would satisfy
+        the queue gate vacuously — Codex r1 finding #1.
+      - The status lookup goes through ``bridge-queue.py show --format
+        shell`` rather than direct SQLite, honoring the queue-first
+        contract in CLAUDE.md (Codex r1 finding #2).
+      - When the task_id cannot be identified at all, the gate returns
+        ``False`` (NOT terminal). Conservative-on-missing-context: a
+        missing-context artifact stays around until the operator can
+        investigate. This trades a small amount of long-tail orphan
+        retention for safety against the active-artifact bypass.
+    """
+    if run_dir is None:
+        run_dir = Path(target_root) / "state" / "cron" / "runs" / run_id
+    request_path = Path(run_dir) / "request.json"
+
+    dispatch_task_id = None
+    request_present = request_path.is_file()
+    request_parseable = True
+    if request_present:
+        try:
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            raw_task_id = request.get("dispatch_task_id")
+            try:
+                dispatch_task_id = (
+                    int(raw_task_id) if raw_task_id is not None else None
+                )
+            except (TypeError, ValueError):
+                dispatch_task_id = None
+        except (OSError, ValueError):
+            request_parseable = False
+
+    # Worker-artifact fallback: ``state/cron/workers/task-<id>.{pid,log}``
+    # entries are keyed by the queue task id directly (see
+    # ``_run_id_from_worker_log``). When the run-dir is missing for these,
+    # we still know the task_id — extract it from the run_id rather than
+    # treating the missing request.json as "terminal".
+    if dispatch_task_id is None and run_id.startswith("task-"):
+        suffix = run_id[len("task-"):]
+        if suffix.isdigit():
+            try:
+                dispatch_task_id = int(suffix)
+            except (TypeError, ValueError):
+                dispatch_task_id = None
+
+    if dispatch_task_id is None:
+        # Cannot identify the queue row. Refuse to consider the artifact
+        # eligible — better a long-tail orphan than an active bypass.
+        if not request_present:
+            return False, "missing_task_id:no_request", None
+        if not request_parseable:
+            return False, "missing_task_id:unparseable_request", None
+        return False, "missing_task_id:no_dispatch_task_id", None
+
+    if tasks_db_path is None:
+        tasks_db_path = Path(target_root) / "state" / "tasks.db"
+    tasks_db_path = Path(tasks_db_path)
+    if not tasks_db_path.is_file():
+        # No queue DB on disk — be conservative.
+        return False, "no_tasks_db", dispatch_task_id
+
+    status = _lookup_queue_status_via_cli(
+        dispatch_task_id, tasks_db_path=tasks_db_path
+    )
+    if status is None:
+        # CLI read failed (timeout, parse error, row missing). Conservative
+        # on missing context: NOT terminal.
+        return False, "queue_lookup_failed", dispatch_task_id
+    return status in _QUEUE_TERMINAL_STATUSES, status, dispatch_task_id
+
+
+def run_status_terminal(run_id, target_root, *, run_dir=None):
+    """Return (terminal?, final_state) from state/cron/runs/<run_id>/status.json.
+
+    A run with NO status.json is NOT terminal — the runner has not finished
+    writing it yet (or never started). Caller should skip such runs.
+    """
+    if run_dir is None:
+        run_dir = Path(target_root) / "state" / "cron" / "runs" / run_id
+    status_path = Path(run_dir) / "status.json"
+    if not status_path.is_file():
+        return False, None
+    try:
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False, "unparseable_status"
+    state_value = str(status.get("state") or "")
+    return state_value in _RUN_STATUS_TERMINAL_STATES, state_value
+
+
+def cron_family_from_run_id(run_id, *, run_dir=None, target_root=None):
+    """Best-effort cron-family extraction.
+
+    Strategy:
+      1. If ``state/cron/runs/<run_id>/request.json`` exists and has a
+         ``job_name`` we can classify, prefer that — it matches the family
+         taxonomy used by ``classify_family``.
+      2. Otherwise fall back to the run_id naming convention
+         ``<safe_name>-<short_id>--<slot_token>``: the prefix before the
+         ``--<slot_token>`` separator is the slug; strip the trailing
+         ``-<short_id>`` and run that through ``classify_family``.
+
+    Returns a non-empty string. ``"<unknown>"`` if neither approach yields
+    a family — those entries land in the synthetic family of the same name
+    so the always-preserve floor still applies.
+    """
+    if not run_id:
+        return "<unknown>"
+    if run_dir is None and target_root is not None:
+        run_dir = Path(target_root) / "state" / "cron" / "runs" / run_id
+    if run_dir is not None:
+        request_path = Path(run_dir) / "request.json"
+        if request_path.is_file():
+            try:
+                request = json.loads(request_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                request = {}
+            job_name = str(
+                request.get("job_name")
+                or request.get("name")
+                or (request.get("job") or {}).get("name")
+                or ""
+            ).strip()
+            if job_name:
+                return classify_family(job_name)
+    base = run_id.split("--", 1)[0]
+    if "-" in base:
+        head, tail = base.rsplit("-", 1)
+        if head and tail and re.fullmatch(r"[0-9a-fA-F]{4,}", tail):
+            base = head
+    return classify_family(base) if base else "<unknown>"
+
+
+def _run_id_from_md(path):
+    """For ``shared/cron-{dispatch,result,followup}/<run_id>.md`` surfaces."""
+    name = path.name
+    if name.endswith(".md"):
+        return name[:-3]
+    return name
+
+
+def _run_id_from_worker_log(path):
+    """``state/cron/workers/task-<id>.log|.pid`` — keyed by queue task_id."""
+    name = path.name
+    m = re.match(r"^task-(?P<task_id>\d+)\.(log|pid)$", name)
+    if m:
+        return f"task-{m.group('task_id')}"
+    return name
+
+
+def _entries_for_runs_dir(runs_root):
+    if not runs_root.is_dir() or runs_root.is_symlink():
+        return
+    for child in sorted(runs_root.iterdir()):
+        if child.is_symlink():
+            yield {"path": child, "run_id": child.name, "is_symlink": True}
+            continue
+        if not child.is_dir():
+            continue
+        yield {"path": child, "run_id": child.name, "is_symlink": False}
+
+
+def _entries_for_workers_dir(workers_root):
+    if not workers_root.is_dir() or workers_root.is_symlink():
+        return
+    for child in sorted(workers_root.iterdir()):
+        if child.is_symlink():
+            yield {
+                "path": child,
+                "run_id": _run_id_from_worker_log(child),
+                "is_symlink": True,
+            }
+            continue
+        if not child.is_file():
+            continue
+        if not re.match(r"^task-\d+\.(log|pid)$", child.name):
+            continue
+        yield {
+            "path": child,
+            "run_id": _run_id_from_worker_log(child),
+            "is_symlink": False,
+        }
+
+
+def _entries_for_dispatch_dir(dispatch_root):
+    """``state/cron/dispatch/<job_slug>/<slot_token>.json`` — each manifest
+    file is a per-slot artifact.  Empty parent slug dirs are pruned at the
+    end of the cleanup pass."""
+    if not dispatch_root.is_dir() or dispatch_root.is_symlink():
+        return
+    for slug_dir in sorted(dispatch_root.iterdir()):
+        if slug_dir.is_symlink():
+            yield {"path": slug_dir, "run_id": slug_dir.name, "is_symlink": True}
+            continue
+        if not slug_dir.is_dir():
+            continue
+        for manifest in sorted(slug_dir.iterdir()):
+            if manifest.is_symlink():
+                yield {
+                    "path": manifest,
+                    "run_id": f"{slug_dir.name}--{manifest.stem}",
+                    "is_symlink": True,
+                }
+                continue
+            if not manifest.is_file():
+                continue
+            yield {
+                "path": manifest,
+                "run_id": f"{slug_dir.name}--{manifest.stem}",
+                "is_symlink": False,
+            }
+
+
+def _entries_for_shared_md_dir(md_root):
+    if not md_root.is_dir() or md_root.is_symlink():
+        return
+    for child in sorted(md_root.iterdir()):
+        if child.is_symlink():
+            yield {
+                "path": child,
+                "run_id": _run_id_from_md(child),
+                "is_symlink": True,
+            }
+            continue
+        if not child.is_file() or child.suffix != ".md":
+            continue
+        yield {
+            "path": child,
+            "run_id": _run_id_from_md(child),
+            "is_symlink": False,
+        }
+
+
+def _surface_entries(target_root, surface):
+    full = Path(target_root) / surface
+    if surface == "state/cron/runs":
+        yield from _entries_for_runs_dir(full)
+    elif surface == "state/cron/workers":
+        yield from _entries_for_workers_dir(full)
+    elif surface == "state/cron/dispatch":
+        yield from _entries_for_dispatch_dir(full)
+    elif surface in RUN_ARTIFACTS_TIER_B_SURFACES:
+        yield from _entries_for_shared_md_dir(full)
+
+
+def _entry_mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def collect_run_artifact_candidates(
+    target_root,
+    *,
+    tier_a_days,
+    tier_b_days,
+    tasks_db_path=None,
+    now_ts=None,
+):
+    """Walk all 6 surfaces and evaluate the combined deletion gate per entry.
+
+    Returns a list of dicts; see ``_evaluate_entry`` for the shape.
+
+    Eligibility is the combined-AND condition from the issue body:
+      (1) queue terminal  AND  (2) status terminal
+      AND  (3) no live PID  AND  (4) outside the always-preserve floor.
+    Plus a tier-aware age check (Tier-A days vs Tier-B days). For runs in
+    ``error`` state we apply only the longer Tier-B clock even on Tier-A
+    surfaces — operators get more time to triage failures.
+    The always-preserve floor is applied AFTER eligibility evaluation by
+    grouping the eligible-by-other-means entries per (surface, family) and
+    bumping the latest N=ALWAYS_PRESERVE_FLOOR back to ineligible.
+    """
+    if now_ts is None:
+        now_ts = time.time()
+    tier_a_cutoff = now_ts - (tier_a_days * 86400.0)
+    tier_b_cutoff = now_ts - (tier_b_days * 86400.0)
+    results = []
+    for surface in RUN_ARTIFACTS_TIER_A_SURFACES:
+        for entry in _surface_entries(target_root, surface):
+            results.append(
+                _evaluate_entry(
+                    target_root,
+                    surface,
+                    "A",
+                    tier_a_cutoff,
+                    tier_b_cutoff,
+                    entry,
+                    tasks_db_path=tasks_db_path,
+                )
+            )
+    for surface in RUN_ARTIFACTS_TIER_B_SURFACES:
+        for entry in _surface_entries(target_root, surface):
+            results.append(
+                _evaluate_entry(
+                    target_root,
+                    surface,
+                    "B",
+                    tier_b_cutoff,
+                    tier_b_cutoff,
+                    entry,
+                    tasks_db_path=tasks_db_path,
+                )
+            )
+    _apply_preserve_floor(results)
+    return results
+
+
+def _evaluate_entry(
+    target_root,
+    surface,
+    tier,
+    age_cutoff,
+    tier_b_cutoff,
+    entry,
+    *,
+    tasks_db_path,
+):
+    path = entry["path"]
+    run_id = entry["run_id"]
+    is_symlink = bool(entry.get("is_symlink"))
+    mtime = _entry_mtime(path)
+    record = {
+        "surface": surface,
+        "path": path,
+        "run_id": run_id,
+        "family": "<unknown>",
+        "tier": tier,
+        "mtime": mtime,
+        "is_symlink": is_symlink,
+        "eligible": False,
+        "skip_reason": None,
+        "queue_status": None,
+        "run_state": None,
+    }
+    if is_symlink:
+        record["skip_reason"] = "symlink"
+        return record
+    run_dir = Path(target_root) / "state" / "cron" / "runs" / run_id
+    record["family"] = cron_family_from_run_id(
+        run_id, run_dir=run_dir, target_root=target_root
+    )
+    queue_terminal, queue_status, _ = queue_dispatch_terminal(
+        run_id, target_root, tasks_db_path=tasks_db_path, run_dir=run_dir
+    )
+    record["queue_status"] = queue_status
+    if not queue_terminal:
+        record["skip_reason"] = f"queue_status:{queue_status}"
+        return record
+    status_terminal, run_state = run_status_terminal(
+        run_id, target_root, run_dir=run_dir
+    )
+    record["run_state"] = run_state
+    # If state/cron/runs/<run_id>/ does not exist (e.g. orphaned shared/*.md
+    # whose run dir was already purged on a prior pass), treat status as
+    # terminal — there is nothing for the runner to still be writing.
+    if not run_dir.is_dir():
+        status_terminal = True
+    if not status_terminal:
+        record["skip_reason"] = "run_state_not_terminal"
+        return record
+    effective_cutoff = age_cutoff
+    if run_state in _RUN_STATUS_FAILED_STATES:
+        effective_cutoff = min(age_cutoff, tier_b_cutoff)
+    if mtime > effective_cutoff:
+        record["skip_reason"] = "within_retention"
+        return record
+    if has_live_pid_for_run(run_id, target_root):
+        record["skip_reason"] = "live_pid"
+        return record
+    record["eligible"] = True
+    return record
+
+
+def _apply_preserve_floor(records):
+    """Bump the latest ALWAYS_PRESERVE_FLOOR entries per (surface, family) back
+    to ineligible.  This guarantees quiet weekly jobs always have at least
+    N=5 diagnostics on each surface, regardless of retention age."""
+    groups = defaultdict(list)
+    for record in records:
+        groups[(record["surface"], record["family"])].append(record)
+    for items in groups.values():
+        items.sort(key=lambda r: r["mtime"], reverse=True)
+        for record in items[:ALWAYS_PRESERVE_FLOOR]:
+            if record["eligible"]:
+                record["eligible"] = False
+                record["skip_reason"] = "preserve_floor"
+
+
+def _format_artifact_summary(records):
+    eligible = [r for r in records if r["eligible"]]
+    by_surface = Counter(r["surface"] for r in eligible)
+    by_tier = Counter(r["tier"] for r in eligible)
+    by_family = Counter(r["family"] for r in eligible)
+    skip_counts = Counter(
+        r["skip_reason"] for r in records if not r["eligible"] and r["skip_reason"]
+    )
+    return {
+        "eligible_count": len(eligible),
+        "scanned_count": len(records),
+        "by_surface": dict(by_surface),
+        "by_tier": dict(by_tier),
+        "by_family": dict(by_family),
+        "skip_reasons": dict(skip_counts),
+    }
+
+
+def _serialize_artifact_record(record, *, target_root):
+    try:
+        rel = str(Path(record["path"]).relative_to(target_root))
+    except ValueError:
+        rel = str(record["path"])
+    return {
+        "surface": record["surface"],
+        "path": rel,
+        "run_id": record["run_id"],
+        "family": record["family"],
+        "tier": record["tier"],
+        "mtime": record["mtime"],
+        "eligible": record["eligible"],
+        "skip_reason": record["skip_reason"],
+        "queue_status": record["queue_status"],
+        "run_state": record["run_state"],
+    }
+
+
+def _rel_under(target_root, path):
+    p = Path(path)
+    try:
+        return str(p.relative_to(target_root))
+    except ValueError:
+        return str(p)
+
+
+def run_cleanup_run_artifacts(args, *, dry_run):
+    """Apply path for ``cleanup-{report,prune} --mode run-artifacts``.
+
+    Audit row policy: counts only + at most 5 sample paths. Payload contents
+    are NEVER included — the issue body and the brief both pin this.
+    """
+    target_root_arg = getattr(args, "target_root", None) or os.environ.get("BRIDGE_HOME") or ""
+    target_root = Path(target_root_arg).expanduser() if target_root_arg else Path("")
+    if not target_root_arg or not target_root.is_dir():
+        payload = {
+            "status": "error",
+            "mode": "run-artifacts",
+            "error": "target_root_missing",
+            "target_root": str(target_root),
+        }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print("status: error")
+            print(f"error: target_root_missing ({target_root})")
+        return 2
+    target_root = target_root.resolve()
+    older_than_days = getattr(args, "older_than_days", None)
+    if older_than_days is not None:
+        tier_a_days = int(older_than_days)
+        tier_b_days = int(older_than_days)
+    else:
+        tier_a_days = RUN_ARTIFACTS_TIER_A_DEFAULT_DAYS
+        tier_b_days = RUN_ARTIFACTS_TIER_B_DEFAULT_DAYS
+    tasks_db_path = getattr(args, "tasks_db", None)
+    tasks_db_path = Path(tasks_db_path).expanduser() if tasks_db_path else None
+    records = collect_run_artifact_candidates(
+        target_root,
+        tier_a_days=tier_a_days,
+        tier_b_days=tier_b_days,
+        tasks_db_path=tasks_db_path,
+    )
+    summary = _format_artifact_summary(records)
+    eligible = [r for r in records if r["eligible"]]
+    sample_paths = [_rel_under(target_root, r["path"]) for r in eligible[:5]]
+    report_only = bool(getattr(args, "_report_only", False))
+
+    payload = {
+        "status": "report" if report_only else ("dry_run" if dry_run else "pruned"),
+        "mode": "run-artifacts",
+        "target_root": str(target_root),
+        "tier_a_days": tier_a_days,
+        "tier_b_days": tier_b_days,
+        "always_preserve_floor": ALWAYS_PRESERVE_FLOOR,
+        "summary": summary,
+        "sample_paths": sample_paths,
+    }
+
+    deleted = 0
+    delete_errors = []
+    if not dry_run and not report_only:
+        for record in eligible:
+            path = Path(record["path"])
+            try:
+                if path.is_symlink():
+                    # Defense-in-depth: we already filter symlinks during
+                    # the walk, but if one slipped past, refuse.
+                    continue
+                if path.is_dir():
+                    _rmtree_safe(path)
+                else:
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+                deleted += 1
+            except OSError as exc:
+                delete_errors.append({"path": str(path), "error": str(exc)})
+        # Best-effort: prune now-empty parent dirs under state/cron/dispatch.
+        dispatch_root = target_root / "state" / "cron" / "dispatch"
+        if dispatch_root.is_dir():
+            for slug_dir in list(dispatch_root.iterdir()):
+                if (
+                    slug_dir.is_dir()
+                    and not slug_dir.is_symlink()
+                    and not any(slug_dir.iterdir())
+                ):
+                    try:
+                        slug_dir.rmdir()
+                    except OSError:
+                        pass
+        payload["deleted_count"] = deleted
+        if delete_errors:
+            payload["delete_errors"] = delete_errors[:10]
+            payload["delete_error_count"] = len(delete_errors)
+
+    if getattr(args, "json", False):
+        payload["records"] = [
+            _serialize_artifact_record(r, target_root=target_root)
+            for r in records[:50]
+        ]
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    print("mode: run-artifacts")
+    print(f"target_root: {target_root}")
+    print(f"tier_a_days: {tier_a_days}")
+    print(f"tier_b_days: {tier_b_days}")
+    print(f"always_preserve_floor: {ALWAYS_PRESERVE_FLOOR}")
+    print(f"scanned: {summary['scanned_count']}")
+    print(f"eligible: {summary['eligible_count']}")
+    if summary["by_surface"]:
+        print("by_surface:")
+        for surface, count in summary["by_surface"].items():
+            print(f"- {surface}: {count}")
+    if summary["skip_reasons"]:
+        print("skip_reasons:")
+        for reason, count in summary["skip_reasons"].items():
+            print(f"- {reason}: {count}")
+    if sample_paths:
+        print("sample_paths:")
+        for sample in sample_paths:
+            print(f"- {sample}")
+    if not dry_run and not report_only:
+        print(f"deleted: {deleted}")
+        if delete_errors:
+            print(f"delete_errors: {len(delete_errors)}")
+    print(f"status: {payload['status']}")
+    return 0
 
 
 def print_cleanup_report(args, records):
@@ -1633,17 +2407,44 @@ def build_parser():
     errors_report_parser.add_argument("--limit", type=int, default=None)
     errors_report_parser.add_argument("--json", action="store_true")
 
-    cleanup_report_parser = subparsers.add_parser("cleanup-report", help="Report prune candidates for stale one-shot cron jobs.")
-    cleanup_report_parser.add_argument("--jobs-file", required=True)
-    cleanup_report_parser.add_argument("--mode", choices=("expired-one-shot",), default="expired-one-shot")
+    cleanup_report_parser = subparsers.add_parser("cleanup-report", help="Report prune candidates for stale one-shot cron jobs and/or run artifacts.")
+    # ``--jobs-file`` is required only for the legacy one-shot mode; the
+    # run-artifacts mode operates on the BRIDGE_HOME tree instead. We drop
+    # the required flag and validate per-mode in main().
+    cleanup_report_parser.add_argument("--jobs-file")
+    cleanup_report_parser.add_argument(
+        "--mode",
+        choices=("expired-one-shot", "one-shot", "run-artifacts", "all"),
+        default="expired-one-shot",
+    )
     cleanup_report_parser.add_argument("--limit", type=int, default=None)
     cleanup_report_parser.add_argument("--json", action="store_true")
+    cleanup_report_parser.add_argument("--target-root", help="BRIDGE_HOME for --mode run-artifacts/all")
+    cleanup_report_parser.add_argument("--tasks-db", help="tasks.db path for --mode run-artifacts/all")
+    cleanup_report_parser.add_argument(
+        "--older-than-days",
+        type=int,
+        default=None,
+        help="single-knob retention override (overrides both Tier-A and Tier-B defaults)",
+    )
 
-    cleanup_prune_parser = subparsers.add_parser("cleanup-prune", help="Prune stale one-shot cron jobs from jobs.json.")
-    cleanup_prune_parser.add_argument("--jobs-file", required=True)
-    cleanup_prune_parser.add_argument("--mode", choices=("expired-one-shot",), default="expired-one-shot")
+    cleanup_prune_parser = subparsers.add_parser("cleanup-prune", help="Prune stale one-shot cron jobs from jobs.json and/or run artifacts.")
+    cleanup_prune_parser.add_argument("--jobs-file")
+    cleanup_prune_parser.add_argument(
+        "--mode",
+        choices=("expired-one-shot", "one-shot", "run-artifacts", "all"),
+        default="expired-one-shot",
+    )
     cleanup_prune_parser.add_argument("--dry-run", action="store_true")
     cleanup_prune_parser.add_argument("--json", action="store_true")
+    cleanup_prune_parser.add_argument("--target-root", help="BRIDGE_HOME for --mode run-artifacts/all")
+    cleanup_prune_parser.add_argument("--tasks-db", help="tasks.db path for --mode run-artifacts/all")
+    cleanup_prune_parser.add_argument(
+        "--older-than-days",
+        type=int,
+        default=None,
+        help="single-knob retention override (overrides both Tier-A and Tier-B defaults)",
+    )
 
     native_list_parser = subparsers.add_parser("native-list", help="List bridge-native cron jobs.")
     native_list_parser.add_argument("--jobs-file", required=True)
@@ -1796,7 +2597,23 @@ def main():
             print(f"error: {exc}", file=sys.stderr)
             return 2
 
+    # Issue #533 — `cleanup-{report,prune} --mode run-artifacts` does not
+    # touch jobs.json, so it must short-circuit before the jobs-file load.
+    # `--mode all` runs both passes (one-shot first, then run-artifacts).
+    if args.command in ("cleanup-report", "cleanup-prune"):
+        mode = getattr(args, "mode", "expired-one-shot")
+        if mode == "run-artifacts":
+            args._report_only = args.command == "cleanup-report"  # noqa: SLF001
+            dry_run = args._report_only or bool(getattr(args, "dry_run", False))
+            return run_cleanup_run_artifacts(args, dry_run=dry_run)
+
     try:
+        if not getattr(args, "jobs_file", None):
+            print(
+                "error: --jobs-file is required for this command/mode",
+                file=sys.stderr,
+            )
+            return 2
         raw_payload, jobs = load_jobs_payload(args.jobs_file)
         records = [build_job_record(job) for job in jobs]
     except FileNotFoundError:
@@ -1826,10 +2643,24 @@ def main():
         if args.limit is not None and args.limit < 0:
             print("error: --limit must be >= 0", file=sys.stderr)
             return 2
-        return print_cleanup_report(args, records)
+        rc = print_cleanup_report(args, records)
+        if rc == 0 and getattr(args, "mode", "") == "all":
+            args._report_only = True  # noqa: SLF001
+            print()
+            print("--- run-artifacts ---")
+            rc = run_cleanup_run_artifacts(args, dry_run=True)
+        return rc
 
     if args.command == "cleanup-prune":
-        return run_cleanup_prune(args, raw_payload, records)
+        rc = run_cleanup_prune(args, raw_payload, records)
+        if rc == 0 and getattr(args, "mode", "") == "all":
+            print()
+            print("--- run-artifacts ---")
+            args._report_only = False  # noqa: SLF001
+            rc = run_cleanup_run_artifacts(
+                args, dry_run=bool(getattr(args, "dry_run", False))
+            )
+        return rc
 
     parser.error(f"unsupported command: {args.command}")
     return 2

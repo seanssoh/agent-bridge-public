@@ -781,6 +781,27 @@ run_sync() {
         status=1
       fi
       cleanup_json="$tmp_dir/native-cleanup.json"
+
+      # Issue #533 — opt-in periodic GC for cron run artifacts. Default OFF
+      # to preserve current sync behavior exactly. Operators can enable
+      # hands-off retention via:
+      #   BRIDGE_CRON_RUN_ARTIFACTS_GC=1 (and optional
+      #   BRIDGE_CRON_RUN_ARTIFACTS_OLDER_THAN_DAYS=<N> single-knob).
+      # Failures here do NOT flip $status — retention is best-effort and
+      # must not block scheduler tick visibility.
+      if [[ "${BRIDGE_CRON_RUN_ARTIFACTS_GC:-0}" == "1" ]]; then
+        local rga_args=(
+          cleanup-prune
+          --mode run-artifacts
+          --target-root "$BRIDGE_HOME"
+          --tasks-db "$BRIDGE_TASK_DB"
+          --json
+        )
+        if [[ -n "${BRIDGE_CRON_RUN_ARTIFACTS_OLDER_THAN_DAYS:-}" ]]; then
+          rga_args+=(--older-than-days "$BRIDGE_CRON_RUN_ARTIFACTS_OLDER_THAN_DAYS")
+        fi
+        bridge_cron_python "${rga_args[@]}" >"$tmp_dir/native-run-artifacts-cleanup.json" 2>/dev/null || true
+      fi
     fi
   fi
 
@@ -932,20 +953,32 @@ run_cleanup() {
   local cleanup_cmd="${1:-}"
   shift || true
 
-  local jobs_file
-  jobs_file="$(bridge_cron_source_jobs_file || true)"
-  bridge_require_cron_source_jobs "$jobs_file"
+  # Issue #533 — for `--mode run-artifacts` and `--mode all` the cleanup
+  # operates on BRIDGE_HOME directly and does not need a jobs file. We
+  # peek at the args to decide whether to require the source jobs file.
+  local _peek_mode="expired-one-shot"
+  local _arg
+  for _arg in "$@"; do
+    if [[ "$_arg" == "run-artifacts" || "$_arg" == "all" || "$_arg" == "one-shot" || "$_arg" == "expired-one-shot" ]]; then
+      _peek_mode="$_arg"
+    fi
+  done
+
+  local jobs_file=""
+  if [[ "$_peek_mode" != "run-artifacts" ]]; then
+    jobs_file="$(bridge_cron_source_jobs_file || true)"
+    bridge_require_cron_source_jobs "$jobs_file"
+  fi
 
   case "$cleanup_cmd" in
     report)
-      local py_args=(
-        cleanup-report
-        --jobs-file "$jobs_file"
-      )
+      local py_args=(cleanup-report)
+      [[ -n "$jobs_file" ]] && py_args+=(--jobs-file "$jobs_file")
+      py_args+=(--target-root "$BRIDGE_HOME" --tasks-db "$BRIDGE_TASK_DB")
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --mode)
-            [[ $# -lt 2 ]] && bridge_die "--mode 뒤에 값을 지정하세요."
+          --mode|--older-than-days|--target-root|--tasks-db)
+            [[ $# -lt 2 ]] && bridge_die "$1 뒤에 값을 지정하세요."
             py_args+=("$1" "$2")
             shift 2
             ;;
@@ -965,14 +998,13 @@ run_cleanup() {
       bridge_cron_python "${py_args[@]}"
       ;;
     prune)
-      local py_args=(
-        cleanup-prune
-        --jobs-file "$jobs_file"
-      )
+      local py_args=(cleanup-prune)
+      [[ -n "$jobs_file" ]] && py_args+=(--jobs-file "$jobs_file")
+      py_args+=(--target-root "$BRIDGE_HOME" --tasks-db "$BRIDGE_TASK_DB")
       while [[ $# -gt 0 ]]; do
         case "$1" in
-          --mode)
-            [[ $# -lt 2 ]] && bridge_die "--mode 뒤에 값을 지정하세요."
+          --mode|--older-than-days|--target-root|--tasks-db)
+            [[ $# -lt 2 ]] && bridge_die "$1 뒤에 값을 지정하세요."
             py_args+=("$1" "$2")
             shift 2
             ;;
