@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin
+  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip
 }
 
 add_all_integration() {
@@ -216,6 +216,11 @@ select_for_path() {
 
     plugins/mattermost/*|plugins/mattermost/*/*|plugins/mattermost/*/*/*)
       add_required mattermost-plugin
+      add_integration integration-minimal
+      ;;
+
+    hooks/pre-compact.py|bridge-memory.py|scripts/librarian-process-ingest.py)
+      add_required pre-compact-envelope-roundtrip hooks upgrade-shared-settings-propagate
       add_integration integration-minimal
       ;;
 
