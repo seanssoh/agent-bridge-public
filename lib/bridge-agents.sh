@@ -4053,8 +4053,12 @@ bridge_agent_channel_launch_allowlisted_for_item() {
   }
 
   item="$(bridge_qualify_channel_item "$item")"
+  # Mirror the real launch-builder path: bridge_agent_launch_cmd() applies
+  # bridge_claude_launch_with_channels then bridge_claude_launch_with_development_channels
+  # using bridge_agent_required_dev_channels_csv. Use the same arg here so the
+  # diagnostic surface (launch_allowlisted) matches what `claude` actually receives.
   generated="$(bridge_claude_launch_with_channels "$agent" "$(bridge_agent_launch_cmd_raw "$agent")")"
-  generated="$(bridge_claude_launch_with_development_channels "$generated" "$(bridge_agent_dev_channels_csv "$agent")")"
+  generated="$(bridge_claude_launch_with_development_channels "$generated" "$(bridge_agent_required_dev_channels_csv "$agent")")"
   effective="$(bridge_extract_channels_from_command "$generated")"
   effective_dev="$(bridge_extract_development_channels_from_command "$generated")"
   if bridge_channel_item_is_development "$item"; then

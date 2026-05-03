@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation
 }
 
 add_all_integration() {
@@ -187,13 +187,13 @@ select_for_path() {
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)
-      add_required daemon queue
+      add_required daemon queue launch-dev-channels-injection
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
 
     bridge-start.sh|bridge-run.sh|bridge-send.sh|bridge-action.sh|bridge-agent.sh|agent-bridge|agb|lib/bridge-tmux.sh|lib/bridge-session-patterns.sh|lib/bridge-wave.sh)
-      add_required launch tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation
+      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
