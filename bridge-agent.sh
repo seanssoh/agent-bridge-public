@@ -12,6 +12,7 @@ usage() {
   cat <<EOF
 Usage:
   $(basename "$0") create <agent> [options]
+  $(basename "$0") update <agent> [options]
   $(basename "$0") list [--json]
   $(basename "$0") show <agent> [--json]
   $(basename "$0") reclassify [--agent <agent>] [--apply] [--json]
@@ -24,6 +25,24 @@ Usage:
   $(basename "$0") attach <agent>
   $(basename "$0") compact <agent> [--note <text>]
   $(basename "$0") handoff <agent> [--note <text>]
+
+Update flags (typed audited mutation path for protected managed-role
+fields, issue #528). Caller must be the admin agent (BRIDGE_ADMIN_AGENT_ID)
+AND from an operator-trusted source (TTY-detected or BRIDGE_CALLER_SOURCE
+override) — same trust model as 'agent-bridge config set'. Repeatable.
+
+  --from <agent>                       caller agent id (required when
+                                       BRIDGE_AGENT_ID env is unset)
+  --set-launch-cmd <full string>       full replace of BRIDGE_AGENT_LAUNCH_CMD
+  --launch-cmd-add-env KEY=VALUE       idempotent prepend in env-prefix
+  --launch-cmd-remove-env KEY          remove every KEY=... env-prefix token
+  --launch-cmd-add-dev-channel <spec>  append --dangerously-load-development-channels <spec>
+  --launch-cmd-remove-dev-channel <spec>
+  --channels-set <csv>                 full replace of BRIDGE_AGENT_CHANNELS
+  --channels-add <token>               append unique CSV token
+  --channels-remove <token>            remove matching CSV token
+  --json                               emit JSON envelope
+  --dry-run                            do not mutate; emit planned diff
 
 Options:
   --engine claude|codex        Agent runtime engine (default: claude)
@@ -1979,6 +1998,388 @@ run_create() {
   fi
 }
 
+# run_update — typed audited update path for protected managed-role
+# fields in agent-roster.local.sh (issue #528).
+#
+# Reuses bridge_write_role_block (the same writer agent-create uses)
+# with replace_existing=1 so the managed-role block emission shape stays
+# consistent and `# BEGIN/END AGENT BRIDGE MANAGED ROLE: <agent>`
+# delimiters round-trip. Computes the new launch_cmd / channels values
+# in-memory from typed flags, then hands every other field through from
+# the loaded roster so we are not reaching into the file with regex.
+#
+# Caller validation mirrors bridge-config.py:cmd_set: caller must be the
+# admin agent AND the source must be operator-tui / operator-trusted-id.
+# Audit row mirrors cmd_set's wrapper-apply detail shape so audit verify
+# treats it the same way.
+run_update() {
+  local agent="${1:-}"
+  shift || true
+  [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") update <agent> [...]"
+  bridge_require_agent "$agent"
+
+  local from_agent=""
+  local dry_run=0
+  local json_mode=0
+  local set_launch_cmd_present=0
+  local set_launch_cmd_value=""
+  local channels_set_present=0
+  local channels_set_value=""
+  local mutation_present=0
+  # TSV streams for the two computers; assembled then piped on stdin.
+  local launch_cmd_ops=""
+  local channels_ops=""
+
+  add_launch_cmd_op() {
+    launch_cmd_ops+="$1"$'\t'"$2"$'\n'
+    mutation_present=1
+  }
+  add_channels_op() {
+    channels_ops+="$1"$'\t'"$2"$'\n'
+    mutation_present=1
+  }
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        from_agent="$2"
+        shift 2
+        ;;
+      --set-launch-cmd)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        set_launch_cmd_present=1
+        set_launch_cmd_value="$2"
+        # Encoded as a TSV op so the stream-driven applier sees it in
+        # the same path as the other launch-cmd mutations.
+        add_launch_cmd_op "set-launch-cmd" "$2"
+        shift 2
+        ;;
+      --launch-cmd-add-env)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        # Strict KEY=VALUE shape (codex r1 finding 2): the value flows
+        # through bridge_write_role_block into BRIDGE_AGENT_LAUNCH_CMD,
+        # which bridge-run.sh:574 hands to `bash -lc`. KEY must match the
+        # POSIX env-var-name rule; VALUE may be empty but cannot embed
+        # newlines or null bytes (those would corrupt the roster line and
+        # the bash -lc string). Stricter shell-metachar quoting is the
+        # writer's job (the managed-role block writer single-quotes
+        # launch_cmd on emission), so we do not reject `'`, `"`, `$`,
+        # `` ` `` here — that would refuse legitimate values such as a
+        # path containing a dollar sign.
+        if [[ ! "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+          bridge_die "--launch-cmd-add-env 는 KEY=VALUE 형식이어야 합니다 (KEY matches ^[A-Za-z_][A-Za-z0-9_]*$): $2"
+        fi
+        # Reject embedded newlines. Bash strings cannot carry literal
+        # NUL bytes (argv truncates at NUL on entry to this process), so
+        # there is no separate `*$'\0'*` arm — the kernel-level
+        # truncation already enforces the NUL floor. The `*$'\0'*` glob
+        # would degenerate to `**` and match every value.
+        case "$2" in
+          *$'\n'*)
+            bridge_die "--launch-cmd-add-env 값에 줄바꿈이 포함될 수 없습니다: $2"
+            ;;
+        esac
+        add_launch_cmd_op "add-env" "$2"
+        shift 2
+        ;;
+      --launch-cmd-remove-env)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        # Same KEY shape on the remove side so a malformed key never
+        # reaches the python applier.
+        if [[ ! "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+          bridge_die "--launch-cmd-remove-env 는 KEY 형식이어야 합니다 (^[A-Za-z_][A-Za-z0-9_]*$): $2"
+        fi
+        add_launch_cmd_op "remove-env" "$2"
+        shift 2
+        ;;
+      --launch-cmd-add-dev-channel)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        # plugin:NAME@SPEC shape (codex r1 finding 3): the spec is appended
+        # as an argv token to BRIDGE_AGENT_LAUNCH_CMD which bash -lc
+        # executes downstream. Restrict NAME and SPEC to the same
+        # `[A-Za-z0-9_.-]+` charset the existing roster fixtures and
+        # bridge_qualify_channel_item assume.
+        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
+          bridge_die "--launch-cmd-add-dev-channel 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
+        fi
+        add_launch_cmd_op "add-dev-channel" "$2"
+        shift 2
+        ;;
+      --launch-cmd-remove-dev-channel)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
+          bridge_die "--launch-cmd-remove-dev-channel 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
+        fi
+        add_launch_cmd_op "remove-dev-channel" "$2"
+        shift 2
+        ;;
+      --channels-set)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        # Per-token plugin:NAME@SPEC validation on the CSV (codex r1
+        # finding 4). Allow trailing-comma tolerance and skip empty
+        # entries, but reject any non-empty token that fails the shape.
+        bridge_agent_update_validate_channels_csv "--channels-set" "$2"
+        channels_set_present=1
+        channels_set_value="$2"
+        add_channels_op "channels-set" "$2"
+        shift 2
+        ;;
+      --channels-add)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
+          bridge_die "--channels-add 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
+        fi
+        add_channels_op "channels-add" "$2"
+        shift 2
+        ;;
+      --channels-remove)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
+          bridge_die "--channels-remove 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
+        fi
+        add_channels_op "channels-remove" "$2"
+        shift 2
+        ;;
+      --json)
+        json_mode=1
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      *)
+        bridge_die "지원하지 않는 agent update 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  # Mutual-exclusion: --set-launch-cmd is a full replace; combining it
+  # with the additive/removal flags is ambiguous. Same for --channels-set.
+  if [[ $set_launch_cmd_present -eq 1 ]]; then
+    local non_set_launch=0
+    local op=""
+    while IFS=$'\t' read -r op _; do
+      [[ -n "$op" && "$op" != "set-launch-cmd" ]] && non_set_launch=1
+    done <<<"$launch_cmd_ops"
+    [[ $non_set_launch -eq 0 ]] || \
+      bridge_die "--set-launch-cmd 는 다른 launch-cmd 변경 플래그와 함께 사용할 수 없습니다."
+  fi
+  if [[ $channels_set_present -eq 1 ]]; then
+    local non_set_channels=0
+    while IFS=$'\t' read -r op _; do
+      [[ -n "$op" && "$op" != "channels-set" ]] && non_set_channels=1
+    done <<<"$channels_ops"
+    [[ $non_set_channels -eq 0 ]] || \
+      bridge_die "--channels-set 는 다른 channels 변경 플래그와 함께 사용할 수 없습니다."
+  fi
+
+  if [[ $mutation_present -eq 0 ]]; then
+    bridge_die "agent update 변경 플래그가 하나 이상 필요합니다."
+  fi
+
+  # Capture the operation summary for the audit row (compact one-line
+  # description of what the operator asked for).
+  local operation_summary=""
+  operation_summary="$(
+    {
+      printf '%s' "$launch_cmd_ops" | sed 's/\t/=/' | sed 's/^/launch:/'
+      printf '%s' "$channels_ops" | sed 's/\t/=/' | sed 's/^/chan:/'
+    } | tr '\n' ',' | sed 's/,$//'
+  )"
+
+  # Caller validation: admin identity + operator-trusted source.
+  local caller_agent caller_source
+  caller_agent="$(bridge_agent_update_caller_agent "$from_agent")"
+  caller_source="$(bridge_agent_update_caller_source)"
+
+  local roster_path="$BRIDGE_ROSTER_LOCAL_FILE"
+  local before_sha
+  before_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
+
+  local actor_label="$caller_agent"
+  if [[ -z "$actor_label" ]]; then
+    if [[ "$caller_source" == "operator-tui" ]]; then
+      actor_label="operator"
+    else
+      actor_label="unknown"
+    fi
+  fi
+
+  local deny_reason=""
+  if [[ -z "$caller_agent" ]]; then
+    deny_reason="caller_agent unspecified — pass --from <admin-agent> or set BRIDGE_AGENT_ID before invoking 'agent-bridge agent update'"
+  elif ! bridge_agent_update_caller_is_admin "$caller_agent"; then
+    deny_reason="caller agent $caller_agent is not the admin agent — refusing managed-role mutation"
+  elif [[ "$caller_source" != "operator-tui" && "$caller_source" != "operator-trusted-id" ]]; then
+    deny_reason="caller source $caller_source is not allowed to mutate system config (need operator-tui or operator-trusted-id)"
+  fi
+
+  local before_launch_cmd
+  before_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent")"
+  local before_channels
+  before_channels="$(bridge_agent_channels_csv "$agent")"
+
+  if [[ -n "$deny_reason" ]]; then
+    bridge_agent_update_emit_audit \
+      "agent-update-deny" \
+      "$actor_label" \
+      "$caller_source" \
+      "$agent" \
+      "$roster_path" \
+      "$before_sha" \
+      "" \
+      "$operation_summary" \
+      "$deny_reason" \
+      "$before_launch_cmd" \
+      "" \
+      "$before_channels" \
+      "" \
+      "[]"
+    bridge_die "deny: $deny_reason"
+  fi
+
+  # Compute the new launch_cmd value.
+  local new_launch_cmd="$before_launch_cmd"
+  local launch_actions_json="[]"
+  if [[ -n "$launch_cmd_ops" ]]; then
+    local lc_output
+    lc_output="$(printf '%s' "$launch_cmd_ops" | bridge_agent_update_apply_launch_cmd "$before_launch_cmd")"
+    new_launch_cmd="$(printf '%s\n' "$lc_output" | sed -n '1p')"
+    launch_actions_json="$(printf '%s\n' "$lc_output" | sed -n '2p')"
+  fi
+
+  # Compute the new channels CSV value.
+  local new_channels="$before_channels"
+  local channels_actions_json="[]"
+  if [[ -n "$channels_ops" ]]; then
+    local ch_output
+    ch_output="$(printf '%s' "$channels_ops" | bridge_agent_update_apply_channels "$before_channels")"
+    new_channels="$(printf '%s\n' "$ch_output" | sed -n '1p')"
+    channels_actions_json="$(printf '%s\n' "$ch_output" | sed -n '2p')"
+  fi
+
+  # Merge actions arrays for the result envelope + audit row.
+  local merged_actions_json
+  merged_actions_json="$(
+    bridge_require_python
+    LC_JSON="$launch_actions_json" CH_JSON="$channels_actions_json" python3 - <<'PY'
+import json, os
+left = json.loads(os.environ.get("LC_JSON") or "[]")
+right = json.loads(os.environ.get("CH_JSON") or "[]")
+print(json.dumps(left + right, ensure_ascii=False))
+PY
+  )"
+
+  local changed=0
+  if [[ "$new_launch_cmd" != "$before_launch_cmd" || "$new_channels" != "$before_channels" ]]; then
+    changed=1
+  fi
+
+  local after_sha=""
+  if [[ $changed -eq 1 && $dry_run -eq 0 ]]; then
+    # Reuse the existing managed-role block writer (lines ~571-710).
+    # Pass every non-mutated field through unchanged so the rewritten
+    # block matches `agent create`'s emission shape byte-for-byte except
+    # for the LAUNCH_CMD / CHANNELS lines we are touching.
+    local description engine session workdir profile_home discord_channel
+    local notify_kind notify_target notify_account loop_mode continue_mode
+    local idle_timeout always_on isolation_mode os_user
+    description="$(bridge_agent_desc "$agent")"
+    engine="$(bridge_agent_engine "$agent")"
+    session="$(bridge_agent_session "$agent")"
+    workdir="$(bridge_agent_workdir "$agent")"
+    profile_home="$(bridge_agent_profile_home "$agent")"
+    discord_channel="$(bridge_agent_discord_channel_id "$agent")"
+    notify_kind="$(bridge_agent_notify_kind "$agent")"
+    notify_target="$(bridge_agent_notify_target "$agent")"
+    notify_account="$(bridge_agent_notify_account "$agent")"
+    loop_mode="$(bridge_agent_loop "$agent")"
+    continue_mode="$(bridge_agent_continue "$agent")"
+    idle_timeout="$(bridge_agent_idle_timeout "$agent")"
+    isolation_mode="$(bridge_agent_isolation_mode "$agent")"
+    os_user="$(bridge_agent_os_user "$agent")"
+    if [[ "$idle_timeout" == "0" ]]; then
+      always_on=1
+    else
+      always_on=0
+    fi
+    bridge_write_role_block \
+      "$agent" \
+      "$description" \
+      "$engine" \
+      "$session" \
+      "$workdir" \
+      "$profile_home" \
+      "$new_launch_cmd" \
+      "$new_channels" \
+      "$discord_channel" \
+      "$notify_kind" \
+      "$notify_target" \
+      "$notify_account" \
+      "$loop_mode" \
+      "$continue_mode" \
+      "$always_on" \
+      "$isolation_mode" \
+      "$os_user" \
+      "1" >/dev/null
+    after_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
+  else
+    after_sha="$before_sha"
+  fi
+
+  local trigger_label="agent-update-apply"
+  if [[ $dry_run -eq 1 ]]; then
+    trigger_label="agent-update-dry-run"
+  fi
+
+  bridge_agent_update_emit_audit \
+    "$trigger_label" \
+    "$actor_label" \
+    "$caller_source" \
+    "$agent" \
+    "$roster_path" \
+    "$before_sha" \
+    "$after_sha" \
+    "$operation_summary" \
+    "" \
+    "$before_launch_cmd" \
+    "$new_launch_cmd" \
+    "$before_channels" \
+    "$new_channels" \
+    "$merged_actions_json"
+
+  if [[ $json_mode -eq 1 ]]; then
+    bridge_agent_update_emit_json \
+      "$agent" \
+      "$changed" \
+      "$dry_run" \
+      "$before_launch_cmd" \
+      "$new_launch_cmd" \
+      "$before_channels" \
+      "$new_channels" \
+      "$before_sha" \
+      "$after_sha" \
+      "$merged_actions_json"
+    return 0
+  fi
+
+  printf 'agent: %s\n' "$agent"
+  printf 'changed: %s\n' "$([[ $changed -eq 1 ]] && echo yes || echo no)"
+  printf 'dry_run: %s\n' "$([[ $dry_run -eq 1 ]] && echo yes || echo no)"
+  printf 'before_launch_cmd: %s\n' "$before_launch_cmd"
+  printf 'after_launch_cmd: %s\n' "$new_launch_cmd"
+  printf 'before_channels: %s\n' "$before_channels"
+  printf 'after_channels: %s\n' "$new_channels"
+  printf 'before_sha: %s\n' "$before_sha"
+  printf 'after_sha: %s\n' "$after_sha"
+}
+
 run_start() {
   local agent="${1:-}"
   shift || true
@@ -2430,6 +2831,9 @@ case "$subcommand" in
   create)
     run_create "$@"
     ;;
+  update)
+    run_update "$@"
+    ;;
   list)
     run_list "$@"
     ;;
@@ -2475,7 +2879,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create list show reclassify rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
+      "create update list show reclassify rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;
