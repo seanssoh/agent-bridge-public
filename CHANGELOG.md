@@ -6,6 +6,51 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.7.5] — 2026-05-04
+
+### Highlight — v0.7.3 multi-host upgrade backlog cleanup
+
+`v0.7.5` bundles eight fixes that surfaced when operators upgraded multiple hosts to v0.7.3 (#394, #522, #523, #526, #528, #529, #533, #534). All auto-apply on `agent-bridge upgrade --apply`; no operator action required for the common path.
+
+### Added (#528 — PR #531)
+
+- `agent-bridge agent update <agent>` typed/audited subcommand. Admin agents can now mutate protected `agent-roster.local.sh` managed-role fields (`BRIDGE_AGENT_LAUNCH_CMD` env-prefix, `--dangerously-load-development-channels` set, `BRIDGE_AGENT_CHANNELS`) via typed flags rather than raw `Edit`/`Write` against the protected path. Caller validation requires admin (`BRIDGE_ADMIN_AGENT_ID`) AND operator-trusted source (TTY or `BRIDGE_CALLER_SOURCE`), mirroring `bridge-config.py:cmd_set` audit-chain semantics. Audit row mirrors the wrapper-apply detail keys (before/after sha256, kind, actor, actor_source, trigger, operation) plus 5 agent-update-specific fields. Reuses the existing managed-role block writer (`bridge-agent.sh:bridge_write_role_block`) so emission shape stays consistent. Typed flags include `--set-launch-cmd`, `--launch-cmd-add-env KEY=VALUE` (idempotent), `--launch-cmd-remove-env`, `--launch-cmd-{add,remove}-dev-channel`, `--channels-{set,add,remove}`. All values validated against shape regexes (`^[A-Za-z_][A-Za-z0-9_]*$` for env keys, `plugin:NAME@SPEC` for channels) before writing. New triggers: `agent-update-apply` / `agent-update-dry-run` / `agent-update-deny`.
+
+### Added (#533 — PR #536)
+
+- `agent-bridge cron cleanup --mode {one-shot,run-artifacts,all}` retention/GC for cron run artifacts. Closes the v0.7.x cron-followup pipeline gap where six artifact surfaces (`state/cron/runs/`, `state/cron/workers/`, `state/cron/dispatch/`, `shared/cron-{dispatch,result,followup}/`) grew unbounded with no built-in retention. Tier-A 7d (machine surfaces) / Tier-B 30d (human-facing) defaults; `--older-than-days N` overrides both. Always-preserve floor (latest 5 entries per cron-family per surface) protects quiet weekly jobs. Combined deletion gate: queue terminal (`done`/`cancelled`) AND `status.json` final_status terminal AND no live PID AND outside floor. Failed runs (`state="error"`) held to Tier-B 30d (operator triage window). Stale-PID matcher anchors on absolute path under `<target>/state/cron/...` or `<target>/shared/cron-...` AND run_id reference (PR #527 anti-foreign-install pattern). `--mode one-shot` aliases legacy `--mode expired-one-shot` byte-identical for backward compat. Worker-artifact entries (`task-<id>.pid|log`) look up the queue task row directly via `python3 bridge-queue.py show <id> --format shell` subprocess (queue-first contract; no direct SQLite). Symlink-safe via existing `_rmtree_safe`; audit row counts + sample paths only (no payload contents).
+
+### Added (#523 — PR #527)
+
+- `bridge-relay-cleanup.py` Gap A (rewrite `BRIDGE_AGENT_LAUNCH_CMD` lines to strip `--dangerously-load-development-channels plugin:telegram-relay@<spec>`, both whitespace and `=` forms; both `"..."` and `'...'` quoted assignment forms supported; quoting style preserved on rewrite; lines that don't parse cleanly recorded in `unparsed_launch_cmd_lines`). Gap B (versioned removal manifest deletes `lib/telegram-relay.py`, `bridge-telegram-relay.sh`, `plugins/telegram-relay/` from the live runtime — v0.7.0 deleted these from source but the upgrader is additive-only). Reorders cleanup to: rewrite launch commands → SIGTERM/SIGKILL stale relay processes (path-prefix-anchored matching only, no foreign-install collateral) → prune live files → existing state/token cleanup. Backed up via `backup-extend-live` when invoked from `bridge-upgrade.sh`, otherwise to `<target>/backups/relay-cleanup-<UTC-stamp>/`. Closes the v0.7.0–v0.7.3 residue causal loop where stale plugin tree kept recreating relay state every session.
+
+### Added (#534 — PR #535)
+
+- `bridge_channel_env_file_readiness <agent> <item> <file> <key>...` — new isolation-aware enum helper returning `present|missing|unreadable` for channel `.env` credential checks. Closes the silent diagnostic-collapse where EACCES (file unreadable to controller in linux-user isolation) was indistinguishable from "credentials missing" in `bridge_channel_credentials_status_for_item` and `bridge_agent_runtime_channel_status_reason`. Bounded ACL-repair retry (default 2 attempts via existing `bridge_linux_acl_repair_channel_env_files`) on linux-user-isolated agents. New `bridge_channel_env_file_acl_diagnostic` returns single-line structured blob (mode, owner, getfacl summary, repair attempt count). Migrates 3 callsites; `bridge_agent_runtime_channel_status_reason()` now distinguishes `unreadable: ACL repair failed N times; ...` from `credentials missing` reasons across discord/telegram/teams/mattermost/ms365 (ms365 branch newly added — was previously absent). Suppresses raw grep stderr leakage from the daemon log.
+
+### Added (#394 — PR #538)
+
+- `agent-bridge upgrade conflicts list|diff|adopt|discard|archive|reconcile` lifecycle subcommand for `.upgrade-conflict` files. Closes the gap where operators accumulated stale conflict files indefinitely (observed 11 stale files / 16 days on one host) with no built-in inventory or sweep tooling. `bridge-upgrade.py:apply_live` records each conflict-write into `state/upgrade-conflicts/<run-id>.json` with the live target's at-write `sha256` (captured pre-merge so operator-side changes are byte-accurately distinguishable from "untouched since conflict"). Start-of-run reconcile auto-archives conflict files whose live-target hash hasn't changed since the at-write capture (operator either explicitly kept the live or hadn't reviewed; either way the conflict is no longer informative); archive moves to `backups/upgrade-conflict-archive/<date>/<original-relpath>` (recoverable, not deleted). Mutation subcommands (`adopt`, `discard`, `archive`) require `--yes` OR TTY confirmation — same operator-trusted-source model as `bridge-config.py:cmd_set`. `bridge-status.py` adds `pending_upgrade_conflict_count` + dashboard `WARNING: N pending upgrade-conflict file(s)` line and JSON `pending_upgrade_conflicts` field; threshold default 1 via `BRIDGE_UPGRADE_CONFLICT_WARN_THRESHOLD` env or `--upgrade-conflict-warn-threshold` CLI override.
+
+### Fixed (#522)
+
+- `hooks/pre-compact.py` now emits the v1 envelope (`schema_version="1"`, agent, captured_at, session_type, trigger, source, custom_instructions_excerpt, suggested_entities, suggested_concepts, suggested_slug, suggested_title, excerpt, transcript_available, optional canonical_snapshot) alongside the canonical-snapshot sidecar via `bridge-memory capture --text-file`. Capture body format: `schema_version=1 | excerpt=...` head + blank line + JSON envelope. `scripts/librarian-process-ingest.py:load_envelope()` shape-1 branch unwraps a nested `envelope` field on `.json` captures so bridge-memory's wrapper shape (root capture metadata + nested envelope) reaches the librarian with all envelope-only fields (`excerpt`, `suggested_entities`, `suggested_concepts`) intact. `extract_managed_claude_block` / `refresh_managed_claude_block` generalized to take delimiter-pair args (legacy wrappers retained for back-compat).
+
+### Fixed (#526 — PR #530)
+
+- `agent-bridge agent create --help` no longer creates an agent literally named `--help`. Strengthened central `bridge_validate_agent_name` (`lib/bridge-core.sh`) with regex `^[A-Za-z0-9][A-Za-z0-9._-]*$` plus reserved-name list (`--help`, `-h`, `--version`, `--debug`, bare `help`/`version`). All three callsites inherit (`bridge-agent.sh:run_create`, `agent-bridge` dynamic spawn, `lib/bridge-wave.sh` worker dispatch). Help-first short-circuit in `agent create` so `--help`/`-h`/bare `help` print usage before positional binding. Sibling subcommands (show/start/stop/restart/attach/forget-session/compact/handoff) safely die via existing `bridge_require_agent` "not registered" branch.
+
+### Fixed (#529 — PR #532)
+
+- `BRIDGE_AGENT_CHANNELS` development-channel plugins (e.g., `plugin:foo@private-marketplace`) now actually reach `claude` argv. Closes the silent "diagnostic OK / actual launch missing" bug where `agent-bridge agent show X` reported `launch_allowlisted: yes` for every dev-channel while the real launched process loaded only operator-pasted tokens. `bridge_agent_launch_cmd()` (`lib/bridge-state.sh`) now calls `bridge_claude_launch_with_development_channels()` in every Claude branch (dynamic / resume / static / fallback); helper's existing dedup handles raw-paste operators. Diagnostic alignment: `channel_diagnostics` (`lib/bridge-agents.sh`) now feeds the simulation `bridge_agent_required_dev_channels_csv` (Claude-plugin-filtered) instead of `bridge_agent_dev_channels_csv` (raw), eliminating the simulate-vs-real drift.
+
+### Operator action
+
+- **None for the common path.** All eight fixes auto-apply on the first `agent-bridge upgrade --apply` to v0.7.5+.
+- (optional) The new `agent-bridge agent update` typed updater is the only sound mutation surface for protected `agent-roster.local.sh` managed-role fields. Operators who previously hand-edited the file via `vim` should review whether to migrate to the typed flow — same audit-chain semantics, no protected-path bypass.
+- (optional) Run `agent-bridge cron cleanup report --mode run-artifacts --older-than-days 7` on long-running hosts to preview the prune set before opting into periodic GC. Default behavior is unchanged (no automatic GC).
+- (optional) Run `agent-bridge upgrade conflicts list` on hosts that have run multiple v0.5.x+ upgrades to inventory pending `.upgrade-conflict` files. The next `agent-bridge upgrade --apply` auto-archives any whose live-target hash hasn't changed since the conflict was written; remaining entries can be reviewed with `conflicts diff/adopt/discard/archive`.
+
 ## [0.7.4] — 2026-05-03
 
 ### Highlight — admin codex pair as a standard install asset (#517)
