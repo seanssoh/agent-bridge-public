@@ -803,6 +803,7 @@ bridge_agent_launch_cmd() {
         launch_cmd="$(bridge_codex_launch_with_hooks "$launch_cmd")"
       elif [[ "$engine" == "claude" ]]; then
         launch_cmd="$(bridge_claude_launch_with_channels "$agent" "$launch_cmd")"
+        launch_cmd="$(bridge_claude_launch_with_development_channels "$launch_cmd" "$(bridge_agent_required_dev_channels_csv "$agent")")"
         launch_cmd="$(bridge_claude_launch_with_channel_state_dirs "$agent" "$launch_cmd")"
       fi
       launch_cmd="$(bridge_claude_launch_with_webhook "$agent" "$launch_cmd")"
@@ -814,6 +815,7 @@ bridge_agent_launch_cmd() {
       launch_cmd="$(bridge_codex_launch_with_hooks "$launch_cmd")"
     elif [[ "$engine" == "claude" ]]; then
       launch_cmd="$(bridge_claude_launch_with_channels "$agent" "$launch_cmd")"
+      launch_cmd="$(bridge_claude_launch_with_development_channels "$launch_cmd" "$(bridge_agent_required_dev_channels_csv "$agent")")"
       launch_cmd="$(bridge_claude_launch_with_channel_state_dirs "$agent" "$launch_cmd")"
     fi
     launch_cmd="$(bridge_claude_launch_with_webhook "$agent" "$launch_cmd")"
@@ -824,6 +826,7 @@ bridge_agent_launch_cmd() {
   fallback="${BRIDGE_AGENT_LAUNCH_CMD[$agent]-}"
   if [[ "$engine" == "claude" ]] && launch_cmd="$(bridge_build_static_claude_launch_cmd "$agent")"; then
     launch_cmd="$(bridge_claude_launch_with_channels "$agent" "$launch_cmd")"
+    launch_cmd="$(bridge_claude_launch_with_development_channels "$launch_cmd" "$(bridge_agent_required_dev_channels_csv "$agent")")"
     launch_cmd="$(bridge_claude_launch_with_channel_state_dirs "$agent" "$launch_cmd")"
     launch_cmd="$(bridge_claude_launch_with_webhook "$agent" "$launch_cmd")"
     printf '%s' "$launch_cmd"
@@ -834,6 +837,7 @@ bridge_agent_launch_cmd() {
       launch_cmd="$(bridge_codex_launch_with_hooks "$launch_cmd")"
     elif [[ "$(bridge_agent_engine "$agent")" == "claude" ]]; then
       launch_cmd="$(bridge_claude_launch_with_channels "$agent" "$launch_cmd")"
+      launch_cmd="$(bridge_claude_launch_with_development_channels "$launch_cmd" "$(bridge_agent_required_dev_channels_csv "$agent")")"
       launch_cmd="$(bridge_claude_launch_with_channel_state_dirs "$agent" "$launch_cmd")"
     fi
     launch_cmd="$(bridge_claude_launch_with_webhook "$agent" "$launch_cmd")"
@@ -845,6 +849,7 @@ bridge_agent_launch_cmd() {
     fallback="$(bridge_codex_launch_with_hooks "$fallback")"
   elif [[ "$(bridge_agent_engine "$agent")" == "claude" ]]; then
     fallback="$(bridge_claude_launch_with_channels "$agent" "$fallback")"
+    fallback="$(bridge_claude_launch_with_development_channels "$fallback" "$(bridge_agent_required_dev_channels_csv "$agent")")"
     fallback="$(bridge_claude_launch_with_channel_state_dirs "$agent" "$fallback")"
   fi
   launch_cmd="$(bridge_claude_launch_with_webhook "$agent" "$fallback")"
