@@ -4,19 +4,25 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
+import fcntl
+import gzip
 import hashlib
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import tarfile
+import uuid
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from stat import S_ISFIFO, S_ISSOCK
 import tempfile
-from typing import Any
+from typing import Any, Iterator
 
 MANAGED_CLAUDE_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_CLAUDE_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
@@ -510,6 +516,54 @@ def copy_live_backup(target_root: Path, backup_root: Path, entries: list[dict[st
             shutil.copy2(child, dst, follow_symlinks=False)
 
 
+# --- daily-backup constants -------------------------------------------------
+#
+# All daily-backup behavior funnels through `create_daily_backup_archive` and
+# `cmd_daily_backup_live` below. The constants here exist so smoke tests and
+# operators can grep the surface area in one place.
+
+# Path-prefix excludes (root-anchored under target_root). The tar walk drops
+# the entire subtree whenever a path's leading components match any tuple.
+DAILY_BACKUP_HARDCODED_ROOT_EXCLUDES: tuple[tuple[str, ...], ...] = (
+    ("logs",),
+    ("worktrees",),
+    ("runtime", "assets"),
+    ("runtime", "media"),
+    ("runtime", "extensions"),
+    (".claude", "worktrees"),
+    # state/backup-snapshots/ is excluded from the *walk* so prior days'
+    # SQL dumps do not bloat each tarball; today's dump is added back as
+    # an explicit member after the walk completes.
+    ("state", "backup-snapshots"),
+)
+
+# Path-part excludes: drop any path that contains one of these components at
+# any depth (mirrors the legacy __pycache__ skip). Cheap defense against
+# committing or backing up vendored / generated trees.
+DAILY_BACKUP_PATH_PART_EXCLUDES: tuple[str, ...] = ("__pycache__", "node_modules")
+
+# Raw sqlite databases that must never enter the tarball — they're handled
+# via online snapshot dumps instead. Keep the list small and explicit; new
+# entries should land with a deliberate review of their restore semantics.
+DAILY_BACKUP_RAW_SQLITE_EXCLUDES: tuple[str, ...] = (
+    "state/tasks.db",
+    "state/tasks.db-wal",
+    "state/tasks.db-shm",
+    "state/tasks.db-journal",
+)
+
+# (relpath under target_root, dump filename stem). One entry per database we
+# snapshot. Add new ones only after measuring size + verifying restore path.
+DAILY_BACKUP_SQLITE_SNAPSHOT_TARGETS: tuple[tuple[str, str], ...] = (
+    ("state/tasks.db", "tasks"),
+)
+
+DAILY_BACKUP_SNAPSHOT_DIR_REL = "state/backup-snapshots"
+DAILY_BACKUP_LOCK_FILENAME = ".daily-backup.lock"
+DAILY_BACKUP_TMP_GLOB = "*.tgz.tmp.*"
+DAILY_BACKUP_FREE_SPACE_FLOOR_BYTES = 100 * 1024 * 1024  # 100 MiB
+
+
 def daily_backup_archive_name(day: date) -> str:
     return f"agent-bridge-{day.isoformat()}.tgz"
 
@@ -524,31 +578,92 @@ def parse_daily_backup_archive_date(name: str) -> date | None:
         return None
 
 
-def resolve_daily_backup_excluded_roots(target_root: Path, backup_dir: Path) -> list[tuple[str, ...]]:
-    excluded: list[tuple[str, ...]] = [("logs",)]
+def daily_backup_sqlite_snapshot_filename(stem: str, day: date) -> str:
+    return f"{stem}-{day.isoformat()}.sql.gz"
+
+
+def parse_daily_backup_sqlite_snapshot_date(stem: str, name: str) -> date | None:
+    pattern = re.compile(rf"{re.escape(stem)}-(\d{{4}}-\d{{2}}-\d{{2}})\.sql\.gz")
+    match = pattern.fullmatch(name)
+    if not match:
+        return None
+    try:
+        return date.fromisoformat(match.group(1))
+    except ValueError:
+        return None
+
+
+def _parse_extra_excluded_roots(value: str | None) -> list[tuple[str, ...]]:
+    # Accepts colon- or comma-separated relpaths from
+    # BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS. Each entry is normalized into a
+    # tuple of path parts the walk-time skip can match against. Empty or
+    # whitespace-only entries are dropped.
+    if not value:
+        return []
+    raw_entries: list[str] = []
+    for piece in value.replace(",", ":").split(":"):
+        piece = piece.strip().strip("/")
+        if not piece:
+            continue
+        raw_entries.append(piece)
+    parsed: list[tuple[str, ...]] = []
+    for entry in raw_entries:
+        parts = tuple(part for part in Path(entry).parts if part not in ("", "."))
+        if parts:
+            parsed.append(parts)
+    return parsed
+
+
+def resolve_daily_backup_excluded_roots(
+    target_root: Path,
+    backup_dir: Path,
+    *,
+    extra_excludes_env: str | None = None,
+) -> list[tuple[str, ...]]:
+    excluded: list[tuple[str, ...]] = list(DAILY_BACKUP_HARDCODED_ROOT_EXCLUDES)
     try:
         relative_backup_dir = backup_dir.resolve().relative_to(target_root.resolve())
     except ValueError:
-        return excluded
-    if relative_backup_dir.parts:
+        relative_backup_dir = None
+    if relative_backup_dir is not None and relative_backup_dir.parts:
         excluded.append(relative_backup_dir.parts)
+    if extra_excludes_env is None:
+        extra_excludes_env = os.environ.get("BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS", "")
+    excluded.extend(_parse_extra_excluded_roots(extra_excludes_env))
     return excluded
 
 
-def should_skip_daily_backup_relpath(relpath: Path, excluded_roots: list[tuple[str, ...]]) -> bool:
+def should_skip_daily_backup_relpath(
+    relpath: Path,
+    excluded_roots: list[tuple[str, ...]],
+    *,
+    path_part_excludes: tuple[str, ...] = DAILY_BACKUP_PATH_PART_EXCLUDES,
+) -> bool:
     parts = relpath.parts
     if not parts:
         return False
-    if "__pycache__" in parts:
-        return True
+    for skip_part in path_part_excludes:
+        if skip_part in parts:
+            return True
+    relpath_posix = relpath.as_posix()
+    for raw_relpath in DAILY_BACKUP_RAW_SQLITE_EXCLUDES:
+        if relpath_posix == raw_relpath:
+            return True
     for root_parts in excluded_roots:
         if len(parts) >= len(root_parts) and parts[: len(root_parts)] == root_parts:
             return True
     return False
 
 
-def iter_daily_backup_members(target_root: Path, backup_dir: Path) -> list[tuple[Path, str]]:
-    excluded_roots = resolve_daily_backup_excluded_roots(target_root, backup_dir)
+def iter_daily_backup_members(
+    target_root: Path,
+    backup_dir: Path,
+    *,
+    extra_excludes_env: str | None = None,
+) -> list[tuple[Path, str]]:
+    excluded_roots = resolve_daily_backup_excluded_roots(
+        target_root, backup_dir, extra_excludes_env=extra_excludes_env
+    )
     members: list[tuple[Path, str]] = []
 
     for root, dirnames, filenames in os.walk(target_root, topdown=True, followlinks=False):
@@ -573,24 +688,437 @@ def iter_daily_backup_members(target_root: Path, backup_dir: Path) -> list[tuple
     return members
 
 
-def create_daily_backup_archive(target_root: Path, backup_dir: Path, today: date) -> Path:
+def _resolve_grace_seconds(override: int | None = None) -> int:
+    # bug #507: stale-tmp reaper must not unlink an in-flight peer's tmp
+    # file, so only files older than (daemon_timeout + grace) are removed.
+    # 180s default = 120s daemon timeout + 60s grace.
+    if override is not None:
+        return max(0, int(override))
+    raw = os.environ.get("BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS", "")
+    if raw.isdigit():
+        return max(0, int(raw))
+    return 180
+
+
+def reap_stale_daily_backup_tmp(
+    backup_dir: Path,
+    *,
+    grace_seconds: int | None = None,
+    now_ts: float | None = None,
+) -> list[str]:
+    if not backup_dir.exists():
+        return []
+    grace = _resolve_grace_seconds(grace_seconds)
+    now_ts = now_ts if now_ts is not None else _now_seconds()
+    reaped: list[str] = []
+    for path in backup_dir.glob(DAILY_BACKUP_TMP_GLOB):
+        if not path.is_file():
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if (now_ts - mtime) < grace:
+            continue
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            # Permission / busy file: leave it; cleanup helper will surface
+            # it to the operator. Don't escalate from inside the backup
+            # write path.
+            continue
+        reaped.append(str(path))
+    return reaped
+
+
+def _now_seconds() -> float:
+    # Indirected so tests can monkeypatch the clock.
+    return datetime.now(timezone.utc).timestamp()
+
+
+def _resolve_free_bytes_override() -> int | None:
+    raw = os.environ.get("BRIDGE_DAILY_BACKUP_FREE_BYTES_OVERRIDE", "")
+    if raw == "":
+        return None
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return None
+
+
+def _previous_archive_size_bytes(backup_dir: Path) -> int:
+    largest = 0
+    if not backup_dir.exists():
+        return largest
+    for path in backup_dir.iterdir():
+        if not path.is_file():
+            continue
+        if parse_daily_backup_archive_date(path.name) is None:
+            continue
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            continue
+        if size > largest:
+            largest = size
+    return largest
+
+
+def check_daily_backup_free_space(
+    backup_dir: Path,
+    *,
+    floor_bytes: int = DAILY_BACKUP_FREE_SPACE_FLOOR_BYTES,
+) -> tuple[bool, int, int]:
+    """Return (ok, free_bytes, needed_bytes).
+
+    needed = max(prev_largest_archive * 1.5, floor_bytes). On a fresh install
+    with no prior archives, the floor governs. The caller is expected to
+    short-circuit with `outcome=skipped_disk_full` when ok=False.
+    """
+    override = _resolve_free_bytes_override()
+    if override is not None:
+        free_bytes = override
+    else:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            free_bytes = shutil.disk_usage(backup_dir).free
+        except (FileNotFoundError, PermissionError):
+            free_bytes = 0
+    prev = _previous_archive_size_bytes(backup_dir)
+    needed = max(int(prev * 1.5), floor_bytes)
+    return (free_bytes >= needed, int(free_bytes), int(needed))
+
+
+@contextlib.contextmanager
+def acquire_daily_backup_lock(backup_dir: Path) -> Iterator[bool]:
+    """Yield True if exclusive lock acquired, False if another writer holds it.
+
+    Uses fcntl.flock on a sentinel file inside backup_dir. Non-blocking — a
+    contended attempt yields False and the caller should report
+    `outcome=skipped_concurrent` rather than fight the peer.
+    """
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = backup_dir / DAILY_BACKUP_LOCK_FILENAME
+    handle = None
+    try:
+        handle = open(lock_path, "a+")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                yield False
+                return
+            raise
+        yield True
+    finally:
+        if handle is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            handle.close()
+
+
+def _atomic_replace(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(src, dst)
+
+
+def _fsync_path(path: Path) -> None:
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def dump_sqlite_snapshot(
+    target_root: Path,
+    today: date,
+    *,
+    tmp_root: Path | None = None,  # kept for back-compat; ignored intentionally
+) -> list[dict[str, Any]]:
+    """Hot-snapshot each entry in DAILY_BACKUP_SQLITE_SNAPSHOT_TARGETS.
+
+    Returns a list of {src_relpath, snapshot_relpath, snapshot_path,
+    snapshot_bytes, source_present} dicts. A missing source DB (fresh
+    install) is silently skipped — daily backup must still succeed.
+
+    Implementation (PR #508 r2 fixes):
+
+    1. Use `sqlite3.Connection.backup()` into a process-private temp DB
+       first, then `iterdump` the temp copy. Raw `iterdump` against the
+       live DB issues multiple SELECTs and can interleave with concurrent
+       writer commits, producing a mixed dump. `.backup()` is the
+       canonical online snapshot API and gives us a transactionally-
+       consistent point-in-time copy.
+
+    2. The gzipped `.partial` is staged as a sibling of the final path
+       (inside `state/backup-snapshots/`), so `os.replace` is always on
+       the same filesystem — no EXDEV when `BRIDGE_DAILY_BACKUP_DIR`
+       lives on a different mount than the bridge home. The `tmp_root`
+       parameter is kept for caller-side scratch (the temp DB) and the
+       partial stays adjacent to the final.
+    """
+    snapshots: list[dict[str, Any]] = []
+    final_dir = target_root / DAILY_BACKUP_SNAPSHOT_DIR_REL
+    final_dir.mkdir(parents=True, exist_ok=True)
+    # Temp DB lives in caller's tmp_root if given (out of the tar walk),
+    # otherwise next to the final dump. Either path works because the
+    # temp DB is unlinked before this function returns.
+    db_tmp_dir = tmp_root if tmp_root is not None else final_dir
+    db_tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    for src_relpath, stem in DAILY_BACKUP_SQLITE_SNAPSHOT_TARGETS:
+        src_path = target_root / src_relpath
+        snapshot_name = daily_backup_sqlite_snapshot_filename(stem, today)
+        final_path = final_dir / snapshot_name
+        snapshot_relpath = f"{DAILY_BACKUP_SNAPSHOT_DIR_REL}/{snapshot_name}"
+        entry: dict[str, Any] = {
+            "src_relpath": src_relpath,
+            "snapshot_relpath": snapshot_relpath,
+            "snapshot_path": str(final_path),
+            "snapshot_bytes": 0,
+            "source_present": src_path.exists(),
+        }
+        if not src_path.exists():
+            # Fresh install: nothing to dump, daily backup proceeds.
+            snapshots.append(entry)
+            continue
+
+        # Sibling-of-final partial → atomic replace stays on the same fs.
+        partial_path = final_dir / f".{snapshot_name}.partial.{uuid.uuid4().hex}"
+        # Online-snapshot temp DB lives in db_tmp_dir; out of band.
+        tmp_db_path = db_tmp_dir / f".{stem}-snapshot.{uuid.uuid4().hex}.sqlite"
+        src_conn: sqlite3.Connection | None = None
+        tmp_conn: sqlite3.Connection | None = None
+        try:
+            # mode=ro so verify-tasks-db / live writers aren't disturbed
+            # by any side-effect of opening rw. .backup() works against
+            # an ro source.
+            src_uri = f"file:{src_path}?mode=ro"
+            src_conn = sqlite3.connect(src_uri, uri=True)
+            tmp_conn = sqlite3.connect(str(tmp_db_path))
+            src_conn.backup(tmp_conn)
+            # Now iterdump the consistent temp copy, not the live DB.
+            with gzip.open(partial_path, "wt", encoding="utf-8", compresslevel=6) as gz:
+                for line in tmp_conn.iterdump():
+                    gz.write(line)
+                    gz.write("\n")
+            _fsync_path(partial_path)
+            _atomic_replace(partial_path, final_path)
+            _fsync_path(final_path)
+            entry["snapshot_bytes"] = final_path.stat().st_size
+        except Exception as exc:  # pragma: no cover — surfaced to caller
+            entry["error"] = f"{type(exc).__name__}: {exc}"
+            with contextlib.suppress(FileNotFoundError):
+                partial_path.unlink()
+        finally:
+            if tmp_conn is not None:
+                with contextlib.suppress(Exception):
+                    tmp_conn.close()
+            if src_conn is not None:
+                with contextlib.suppress(Exception):
+                    src_conn.close()
+            with contextlib.suppress(FileNotFoundError):
+                tmp_db_path.unlink()
+        snapshots.append(entry)
+    return snapshots
+
+
+def prune_sqlite_snapshots(
+    target_root: Path, retain_days: int, today: date
+) -> list[str]:
+    if retain_days < 1:
+        retain_days = 1
+    final_dir = target_root / DAILY_BACKUP_SNAPSHOT_DIR_REL
+    if not final_dir.exists():
+        return []
+    cutoff = today - timedelta(days=retain_days - 1)
+    pruned: list[str] = []
+    stems = {stem for _, stem in DAILY_BACKUP_SQLITE_SNAPSHOT_TARGETS}
+    for path in sorted(final_dir.iterdir()):
+        if not path.is_file():
+            continue
+        # Only prune snapshots we recognize. Hand-placed files (e.g. an
+        # operator-saved dump) are left alone.
+        kept = False
+        for stem in stems:
+            parsed = parse_daily_backup_sqlite_snapshot_date(stem, path.name)
+            if parsed is not None:
+                if parsed < cutoff:
+                    with contextlib.suppress(FileNotFoundError):
+                        path.unlink()
+                    pruned.append(str(path))
+                kept = True
+                break
+        if not kept and path.name.endswith(".partial"):
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+            pruned.append(str(path))
+    return pruned
+
+
+def create_daily_backup_archive(
+    target_root: Path,
+    backup_dir: Path,
+    today: date,
+    *,
+    extra_excludes_env: str | None = None,
+) -> dict[str, Any]:
+    """Build today's daily archive end-to-end.
+
+    Returns a structured result with `outcome` ∈ {created, skipped_disk_full,
+    skipped_concurrent, error_<reason>}. Caller is responsible for surfacing
+    the result as JSON; this function never raises into its caller for
+    expected failure modes (disk full, lock contention, missing source DB).
+    """
     backup_dir.mkdir(parents=True, exist_ok=True)
     archive_path = backup_dir / daily_backup_archive_name(today)
-    tmp_path = backup_dir / f"{archive_path.name}.tmp.{os.getpid()}"
-    tmp_path.unlink(missing_ok=True)
 
-    with tarfile.open(tmp_path, "w:gz", format=tarfile.PAX_FORMAT, dereference=False) as archive:
-        for src_path, arcname in iter_daily_backup_members(target_root, backup_dir):
-            try:
-                stat_result = os.lstat(src_path)
-            except FileNotFoundError:
-                continue
-            if S_ISSOCK(stat_result.st_mode) or S_ISFIFO(stat_result.st_mode):
-                continue
-            archive.add(src_path, arcname=arcname, recursive=False)
+    result: dict[str, Any] = {
+        "outcome": "error_unknown",
+        "archive_path": str(archive_path),
+        "snapshots": [],
+        "free_bytes": 0,
+        "needed_bytes": 0,
+        "reaped_tmp": [],
+    }
 
-    tmp_path.replace(archive_path)
-    return archive_path
+    with acquire_daily_backup_lock(backup_dir) as got_lock:
+        if not got_lock:
+            result["outcome"] = "skipped_concurrent"
+            return result
+
+        # bug #507 (1): glob-delete stale tmp files left by killed peers,
+        # but only those older than the grace window so we don't trample
+        # an active concurrent writer (defense-in-depth — the lock above
+        # already enforces single-writer).
+        result["reaped_tmp"] = reap_stale_daily_backup_tmp(backup_dir)
+
+        # bug #507 (2): pre-flight free-space check. On a chronically-full
+        # disk every retry would otherwise spawn another GB-scale tmp file
+        # and fail.
+        ok, free_bytes, needed_bytes = check_daily_backup_free_space(backup_dir)
+        result["free_bytes"] = free_bytes
+        result["needed_bytes"] = needed_bytes
+        if not ok:
+            result["outcome"] = "skipped_disk_full"
+            return result
+
+        # bug #507 (6): hot-snapshot tasks.db (and any future sqlite in
+        # SQLITE_SNAPSHOT_TARGETS) into a temp dir outside the tar walk;
+        # the resulting .sql.gz is gzip-friendly and ~10–20× smaller than
+        # the raw .db. Today's snapshot will be added back to the tar as
+        # an explicit member after the walk.
+        with tempfile.TemporaryDirectory(
+            prefix="agb-snap-", dir=backup_dir.parent
+        ) as snap_tmp_str:
+            snap_tmp = Path(snap_tmp_str)
+            snapshots = dump_sqlite_snapshot(target_root, today, tmp_root=snap_tmp)
+        result["snapshots"] = snapshots
+
+        # PR #508 r3 (Codex blocker): if a source DB exists but its
+        # snapshot failed (corruption, locked beyond timeout, FS error),
+        # the tarball would otherwise ship with neither the raw .db
+        # (excluded from the tar walk) nor the .sql.gz dump — a silently
+        # empty queue snapshot that the daemon would still mark
+        # `created`, clearing failure state and pruning prior good
+        # backups. Treat that as a hard failure: surface
+        # `error_sqlite_snapshot`, do NOT write a tarball, do NOT prune.
+        # Missing source DB (`source_present=False`) stays non-fatal —
+        # fresh installs must keep working.
+        snapshot_errors = [
+            entry for entry in snapshots
+            if entry.get("source_present") and entry.get("error")
+        ]
+        if snapshot_errors:
+            first = snapshot_errors[0]
+            result["outcome"] = "error_sqlite_snapshot"
+            result["error_detail"] = (
+                f"{first.get('src_relpath', 'unknown')}: {first.get('error', 'unknown')}"
+            )
+            result["snapshot_errors"] = [
+                {"src_relpath": e.get("src_relpath"), "error": e.get("error")}
+                for e in snapshot_errors
+            ]
+            return result
+
+        tmp_path = backup_dir / f"{archive_path.name}.tmp.{os.getpid()}"
+        # Erase any prior tmp owned by this exact PID (rare, but possible
+        # on PID reuse after a crash between two attempts in the same
+        # second). The grace-gated reaper above won't catch a fresh tmp.
+        with contextlib.suppress(FileNotFoundError):
+            tmp_path.unlink()
+
+        try:
+            with tarfile.open(
+                tmp_path, "w:gz", format=tarfile.PAX_FORMAT, dereference=False
+            ) as archive:
+                for src_path, arcname in iter_daily_backup_members(
+                    target_root, backup_dir, extra_excludes_env=extra_excludes_env
+                ):
+                    try:
+                        stat_result = os.lstat(src_path)
+                    except FileNotFoundError:
+                        continue
+                    if S_ISSOCK(stat_result.st_mode) or S_ISFIFO(stat_result.st_mode):
+                        continue
+                    archive.add(src_path, arcname=arcname, recursive=False)
+
+                # Explicitly add today's snapshot dumps. The walk excluded
+                # state/backup-snapshots/ so prior days' dumps don't bloat
+                # this archive.
+                for entry in snapshots:
+                    snap_path = Path(entry["snapshot_path"])
+                    if not snap_path.exists():
+                        continue
+                    archive.add(
+                        snap_path,
+                        arcname=entry["snapshot_relpath"],
+                        recursive=False,
+                    )
+        except OSError as exc:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+            if exc.errno == errno.ENOSPC:
+                result["outcome"] = "skipped_disk_full"
+                # disk_usage may have raced; report what we know.
+                with contextlib.suppress(Exception):
+                    result["free_bytes"] = shutil.disk_usage(backup_dir).free
+            else:
+                result["outcome"] = f"error_oserror_{exc.errno or 'unknown'}"
+            return result
+        except Exception as exc:  # pragma: no cover — bubble for diagnostics
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+            result["outcome"] = f"error_{type(exc).__name__.lower()}"
+            result["error_detail"] = str(exc)
+            return result
+
+        try:
+            _fsync_path(tmp_path)
+            _atomic_replace(tmp_path, archive_path)
+            _fsync_path(archive_path)
+        except OSError as exc:
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+            result["outcome"] = f"error_oserror_{exc.errno or 'unknown'}"
+            return result
+
+        result["outcome"] = "created"
+        try:
+            result["archive_bytes"] = archive_path.stat().st_size
+        except FileNotFoundError:
+            result["archive_bytes"] = 0
+        return result
 
 
 def prune_daily_backup_archives(backup_dir: Path, retain_days: int, today: date) -> list[str]:
@@ -608,10 +1136,10 @@ def prune_daily_backup_archives(backup_dir: Path, retain_days: int, today: date)
         if parsed is not None and parsed < cutoff:
             path.unlink(missing_ok=True)
             pruned.append(str(path))
-            continue
-        if path.name.startswith("agent-bridge-") and ".tmp." in path.name:
-            path.unlink(missing_ok=True)
-            pruned.append(str(path))
+    # Bug #507: tmp cleanup belongs to reap_stale_daily_backup_tmp(), which
+    # is age-gated to avoid stealing a concurrent writer's in-flight file.
+    # The legacy unconditional `.tmp.*` unlink that lived here was the
+    # exact behavior that made reap's grace gate useless.
     return pruned
 
 
@@ -1156,7 +1684,7 @@ def cmd_daily_backup_live(args: argparse.Namespace) -> int:
     backup_dir = Path(args.backup_dir).expanduser()
     retain_days = max(1, int(args.retain_days))
     today = date.today()
-    payload = {
+    payload: dict[str, Any] = {
         "mode": "daily-backup-live",
         "target_root": str(target_root),
         "backup_dir": str(backup_dir),
@@ -1165,12 +1693,337 @@ def cmd_daily_backup_live(args: argparse.Namespace) -> int:
         "exists": target_root.exists(),
         "created": False,
         "pruned": [],
+        "snapshots_pruned": [],
+        "outcome": "skipped_no_target_root",
     }
-    if target_root.exists() and not args.dry_run:
-        archive_path = create_daily_backup_archive(target_root, backup_dir, today)
-        payload["archive_path"] = str(archive_path)
+    if not target_root.exists():
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    if args.dry_run:
+        payload["outcome"] = "dry_run"
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    result = create_daily_backup_archive(target_root, backup_dir, today)
+    payload["outcome"] = result["outcome"]
+    payload["archive_path"] = result.get("archive_path", payload["archive_path"])
+    payload["snapshots"] = result.get("snapshots", [])
+    payload["free_bytes"] = result.get("free_bytes", 0)
+    payload["needed_bytes"] = result.get("needed_bytes", 0)
+    payload["reaped_tmp"] = result.get("reaped_tmp", [])
+    if "archive_bytes" in result:
+        payload["archive_bytes"] = result["archive_bytes"]
+    if "error_detail" in result:
+        payload["error_detail"] = result["error_detail"]
+
+    if result["outcome"] == "created":
         payload["created"] = True
         payload["pruned"] = prune_daily_backup_archives(backup_dir, retain_days, today)
+        payload["snapshots_pruned"] = prune_sqlite_snapshots(target_root, retain_days, today)
+
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_verify_tasks_db(args: argparse.Namespace) -> int:
+    target_root = Path(args.target_root).expanduser()
+    db_path = target_root / "state/tasks.db"
+    payload: dict[str, Any] = {
+        "mode": "verify-tasks-db",
+        "target": str(db_path),
+        "exists": db_path.exists(),
+        "ok": False,
+    }
+    if not db_path.exists():
+        payload["error"] = "missing"
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        # Fresh installs don't have tasks.db until the first task is filed.
+        # Treat missing as non-fatal (exit 0); operator/agent reads `ok=false`
+        # + `error=missing` from the JSON and decides what to do.
+        return 0
+    try:
+        # mode=ro avoids any journal-mode side-effects on the live DB; the
+        # Bridge guard policy that flags raw `sqlite3 state/tasks.db` from
+        # agents does not apply to this packaged read-only helper.
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute("PRAGMA quick_check").fetchone()
+            check = row[0] if row else ""
+            payload["quick_check"] = check
+            payload["ok"] = check == "ok"
+        finally:
+            conn.close()
+    except sqlite3.DatabaseError as exc:
+        payload["error"] = f"sqlite_error: {exc}"
+    except Exception as exc:  # pragma: no cover
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0 if payload["ok"] else 1
+
+
+# --- backup residue cleanup -------------------------------------------------
+#
+# Used by `agb upgrade --apply` (via lib/bridge-cleanup.sh) and exposed as a
+# standalone subcommand so operators can run it manually:
+#
+#   python3 bridge-upgrade.py cleanup-residue --target-root ~/.agent-bridge \
+#     --backup-dir ~/.agent-bridge/backups/daily \
+#     --upgrade-backups-dir ~/.agent-bridge/backups
+#
+# Always returns exit 0 with a structured JSON payload. `cleanup_failures`
+# is non-empty when any individual step failed; the caller (upgrade flow)
+# surfaces that to the operator instead of aborting the upgrade.
+
+def _format_bytes(n: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    size = float(max(0, int(n)))
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{n} B"
+
+
+def _free_bytes(path: Path) -> int:
+    try:
+        return shutil.disk_usage(path).free
+    except (FileNotFoundError, PermissionError):
+        return 0
+
+
+def prune_upgrade_backups(
+    upgrade_backups_dir: Path,
+    *,
+    current_backup_root: Path | None,
+    retain_count: int,
+    retain_days: int,
+    today: date | None = None,
+    no_backup_mode: bool = False,
+) -> dict[str, Any]:
+    """Conservative pruner for `backups/upgrade-*/` directories.
+
+    Both gates apply:
+      - keep at least `retain_count` newest entries (by mtime)
+      - of the rest, only delete those older than `retain_days`
+      - the current upgrade's BACKUP_ROOT (if any) is always preserved
+      - in --no-backup mode, do nothing (no signal that operator is OK
+        with destruction of older backup snapshots)
+    """
+    summary: dict[str, Any] = {
+        "scanned": 0,
+        "preserved": [],
+        "pruned": [],
+        "skipped_no_backup_mode": no_backup_mode,
+    }
+    if no_backup_mode:
+        return summary
+    if not upgrade_backups_dir.exists():
+        return summary
+    today = today or date.today()
+    cutoff_ts = (
+        datetime.combine(today, datetime.min.time()).timestamp()
+        - max(0, retain_days) * 86400
+    )
+
+    candidates: list[tuple[float, Path]] = []
+    for child in sorted(upgrade_backups_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        if not child.name.startswith("upgrade-"):
+            continue
+        try:
+            mtime = child.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        candidates.append((mtime, child))
+    summary["scanned"] = len(candidates)
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    keep_paths: set[Path] = set()
+    if current_backup_root is not None:
+        try:
+            current_resolved = current_backup_root.resolve()
+        except OSError:
+            current_resolved = current_backup_root
+        for _, path in candidates:
+            try:
+                if path.resolve() == current_resolved:
+                    keep_paths.add(path)
+            except OSError:
+                continue
+
+    for _, path in candidates[: max(0, retain_count)]:
+        keep_paths.add(path)
+
+    for mtime, path in candidates:
+        if path in keep_paths:
+            summary["preserved"].append({"path": str(path), "mtime": int(mtime)})
+            continue
+        if mtime >= cutoff_ts:
+            summary["preserved"].append({"path": str(path), "mtime": int(mtime)})
+            continue
+        try:
+            shutil.rmtree(path)
+            summary["pruned"].append(str(path))
+        except OSError as exc:
+            summary.setdefault("errors", []).append(
+                {"path": str(path), "error": f"{type(exc).__name__}: {exc}"}
+            )
+    return summary
+
+
+def validate_claude_config(path: Path) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "path": str(path),
+        "exists": path.exists(),
+        "status": "missing",
+    }
+    if not path.exists():
+        return payload
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            json.load(handle)
+        payload["status"] = "ok"
+    except json.JSONDecodeError as exc:
+        payload["status"] = "corrupted"
+        payload["error"] = f"JSONDecodeError: {exc}"
+    except OSError as exc:
+        payload["status"] = "unreadable"
+        payload["error"] = f"{type(exc).__name__}: {exc}"
+    if payload["status"] == "corrupted":
+        backups_dir = Path.home() / ".claude" / "backups"
+        if backups_dir.exists():
+            backup_candidates = sorted(
+                (p for p in backups_dir.glob("**/.claude.json") if p.is_file()),
+                key=lambda p: p.stat().st_mtime if p.exists() else 0,
+                reverse=True,
+            )
+            if backup_candidates:
+                payload["recovery_candidate"] = str(backup_candidates[0])
+    return payload
+
+
+def cmd_cleanup_residue(args: argparse.Namespace) -> int:
+    target_root = Path(args.target_root).expanduser()
+    # PR #508 r2: default these to the canonical layout under target_root.
+    # Without the defaults, `cleanup-residue --target-root <root>` (the
+    # exact form in OPERATOR_ACTIONS_PENDING.md and in the upgrader's
+    # printed recovery command) would skip stale-tmp / daily-prune /
+    # upgrade-* prune entirely — defeating the manual fallback path.
+    backup_dir = (
+        Path(args.backup_dir).expanduser()
+        if args.backup_dir
+        else (target_root / "backups" / "daily")
+    )
+    upgrade_backups_dir = (
+        Path(args.upgrade_backups_dir).expanduser()
+        if args.upgrade_backups_dir
+        else (target_root / "backups")
+    )
+    current_backup_root = (
+        Path(args.current_backup_root).expanduser() if args.current_backup_root else None
+    )
+    retain_days = max(1, int(args.daily_retain_days))
+    upgrade_retain_count = max(0, int(args.upgrade_retain_count))
+    upgrade_retain_days = max(0, int(args.upgrade_retain_days))
+    today = date.today()
+
+    payload: dict[str, Any] = {
+        "mode": "cleanup-residue",
+        "target_root": str(target_root),
+        "backup_dir": str(backup_dir) if backup_dir else "",
+        "upgrade_backups_dir": str(upgrade_backups_dir) if upgrade_backups_dir else "",
+        "no_backup_mode": bool(args.no_backup_mode),
+        "stale_tmp_removed": [],
+        "daily_pruned": [],
+        "snapshots_pruned": [],
+        "upgrade_backups": {},
+        "claude_config": {},
+        "free_bytes_before": 0,
+        "free_bytes_after": 0,
+        "cleanup_failures": [],
+    }
+
+    measure_path = backup_dir if (backup_dir and backup_dir.exists()) else target_root
+    if measure_path and measure_path.exists():
+        payload["free_bytes_before"] = _free_bytes(measure_path)
+
+    # 1. stale tmp reaping (no grace gate when run from upgrade — the
+    # upgrade wouldn't proceed if the daemon were mid-write of yesterday's
+    # tarball; in fact upgrade stops the daemon before this point). Use
+    # the env-tuned grace anyway as defense in depth.
+    if backup_dir and backup_dir.exists():
+        try:
+            payload["stale_tmp_removed"] = reap_stale_daily_backup_tmp(backup_dir)
+        except Exception as exc:
+            payload["cleanup_failures"].append(
+                {"step": "stale_tmp_reap", "error": f"{type(exc).__name__}: {exc}"}
+            )
+
+    # 2. daily archive prune at the new retain default.
+    if backup_dir and backup_dir.exists():
+        try:
+            payload["daily_pruned"] = prune_daily_backup_archives(
+                backup_dir, retain_days, today
+            )
+        except Exception as exc:
+            payload["cleanup_failures"].append(
+                {"step": "daily_prune", "error": f"{type(exc).__name__}: {exc}"}
+            )
+
+    # 3. SQL snapshot prune.
+    try:
+        payload["snapshots_pruned"] = prune_sqlite_snapshots(
+            target_root, retain_days, today
+        )
+    except Exception as exc:
+        payload["cleanup_failures"].append(
+            {"step": "snapshot_prune", "error": f"{type(exc).__name__}: {exc}"}
+        )
+
+    # 4. upgrade-* prune (conservative; preserves current BACKUP_ROOT).
+    if upgrade_backups_dir is not None:
+        try:
+            payload["upgrade_backups"] = prune_upgrade_backups(
+                upgrade_backups_dir,
+                current_backup_root=current_backup_root,
+                retain_count=upgrade_retain_count,
+                retain_days=upgrade_retain_days,
+                today=today,
+                no_backup_mode=bool(args.no_backup_mode),
+            )
+            errors = payload["upgrade_backups"].get("errors") or []
+            for err in errors:
+                payload["cleanup_failures"].append(
+                    {"step": "upgrade_prune", "error": err.get("error", "unknown"),
+                     "path": err.get("path", "")}
+                )
+        except Exception as exc:
+            payload["cleanup_failures"].append(
+                {"step": "upgrade_prune", "error": f"{type(exc).__name__}: {exc}"}
+            )
+
+    # 5. ~/.claude.json validation (read-only).
+    try:
+        payload["claude_config"] = validate_claude_config(
+            Path(args.claude_config_path).expanduser()
+            if args.claude_config_path
+            else Path.home() / ".claude.json"
+        )
+    except Exception as exc:
+        payload["cleanup_failures"].append(
+            {"step": "claude_config", "error": f"{type(exc).__name__}: {exc}"}
+        )
+
+    if measure_path and measure_path.exists():
+        payload["free_bytes_after"] = _free_bytes(measure_path)
+    payload["free_bytes_before_human"] = _format_bytes(payload["free_bytes_before"])
+    payload["free_bytes_after_human"] = _format_bytes(payload["free_bytes_after"])
+    payload["bytes_freed"] = max(
+        0, payload["free_bytes_after"] - payload["free_bytes_before"]
+    )
+    payload["bytes_freed_human"] = _format_bytes(payload["bytes_freed"])
+
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
@@ -1267,9 +2120,65 @@ def build_parser() -> argparse.ArgumentParser:
     daily_backup = subparsers.add_parser("daily-backup-live")
     daily_backup.add_argument("--target-root", required=True)
     daily_backup.add_argument("--backup-dir", required=True)
-    daily_backup.add_argument("--retain-days", type=int, default=30)
+    # Bug #507 (3): default retention dropped from 30 → 7. Long-lived
+    # installs were generating 45–60 GB of baseline disk consumption from
+    # daily archives alone, which then triggered the disk-full death
+    # spiral cascade. Operators who want the old behavior set
+    # BRIDGE_DAILY_BACKUP_RETAIN_DAYS=30 (or pass --retain-days 30).
+    daily_backup.add_argument("--retain-days", type=int, default=7)
     daily_backup.add_argument("--dry-run", action="store_true")
     daily_backup.set_defaults(handler=cmd_daily_backup_live)
+
+    verify_tasks_db = subparsers.add_parser(
+        "verify-tasks-db",
+        help=(
+            "Run PRAGMA quick_check against state/tasks.db in read-only mode "
+            "and print a JSON result. Used by post-upgrade verification."
+        ),
+    )
+    verify_tasks_db.add_argument("--target-root", required=True)
+    verify_tasks_db.set_defaults(handler=cmd_verify_tasks_db)
+
+    cleanup_residue = subparsers.add_parser(
+        "cleanup-residue",
+        help=(
+            "Reap stale daily-backup tmp files, prune old archives + SQL "
+            "snapshots, prune old upgrade-* backups (conservative), and "
+            "validate ~/.claude.json. Used by `agb upgrade --apply` and "
+            "available standalone."
+        ),
+    )
+    cleanup_residue.add_argument("--target-root", required=True)
+    cleanup_residue.add_argument(
+        "--backup-dir", default="",
+        help="Daily-backup directory (default: <target-root>/backups/daily)",
+    )
+    cleanup_residue.add_argument(
+        "--upgrade-backups-dir", default="",
+        help="Parent dir holding upgrade-* snapshots (default: <target-root>/backups)",
+    )
+    cleanup_residue.add_argument(
+        "--current-backup-root", default="",
+        help="Path of the in-progress upgrade backup (always preserved).",
+    )
+    cleanup_residue.add_argument(
+        "--no-backup-mode", action="store_true",
+        help="Set when invoked from `agb upgrade --no-backup`; skip upgrade-* prune.",
+    )
+    cleanup_residue.add_argument(
+        "--daily-retain-days", type=int, default=7,
+    )
+    cleanup_residue.add_argument(
+        "--upgrade-retain-count", type=int, default=5,
+    )
+    cleanup_residue.add_argument(
+        "--upgrade-retain-days", type=int, default=14,
+    )
+    cleanup_residue.add_argument(
+        "--claude-config-path", default="",
+        help="Override path to .claude.json (default: ~/.claude.json).",
+    )
+    cleanup_residue.set_defaults(handler=cmd_cleanup_residue)
 
     apply_live_parser = subparsers.add_parser("apply-live")
     apply_live_parser.add_argument("--source-root", required=True)

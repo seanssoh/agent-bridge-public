@@ -354,3 +354,60 @@ first `agent-bridge isolate <agent>` so the controller process picks
 up the new group memberships; otherwise the harvester scan still
 fails until the operator's session refreshes. The same prerequisite
 is documented in `OPERATIONS.md`'s v2 install section.
+
+## 19. Daily-backup death-spiral on disk-full hosts (closed by v0.7.2)
+
+Symptom (pre-v0.7.2):
+
+- Overnight, `~/.agent-bridge/backups/daily/` accumulates dozens of
+  `agent-bridge-YYYY-MM-DD.tgz.tmp.<pid>` files, each ~1–2 GB. Disk
+  fills. `~/.claude.json` is partially written and reported as
+  "JSON Parse error: Unable to parse JSON string" by every subsequent
+  `claude -p` invocation, breaking wiki / cron jobs even after disk
+  space is manually recovered.
+
+Root cause (issue #507):
+
+- Stale tmp files from killed backup attempts were never reaped — the
+  cleanup line only removed the *current* PID's tmp.
+- No pre-flight free-space check; once the disk crossed ~85% full,
+  every subsequent attempt was guaranteed to fail and generate
+  another GB-scale orphan.
+- `--retain-days` defaulted to 30, so the baseline disk consumption
+  was already 45–60 GB on a long-lived install — feeding the spiral.
+- `state/tasks.db` (sqlite, binary, ~uncompressible) was bundled raw
+  into every daily tarball — multiplying retention with near-zero
+  dedup.
+
+Fix (v0.7.2):
+
+- See CHANGELOG `[0.7.2]` and OPERATOR_ACTIONS_PENDING.md
+  `v0.7.2 — daily-backup death-spiral root-cause + auto-cleanup`.
+  Briefly: glob-delete stale tmp at start of each attempt (lock +
+  age-gated), pre-flight free-space check, retain default 30 → 7,
+  exclude `worktrees/`/`runtime/{assets,media,extensions}/`/`node_modules`,
+  online sqlite snapshot to `state/backup-snapshots/tasks-*.sql.gz`
+  instead of raw .db, daemon failure cooldown wiring,
+  conservative `backups/upgrade-*/` prune, auto-cleanup migration
+  on every `agent-bridge upgrade --apply`.
+
+Recovery (only relevant if you're on a host that hasn't yet upgraded
+to v0.7.2 and is currently in the failure mode):
+
+```bash
+# 1. Free space immediately
+rm -f ~/.agent-bridge/backups/daily/*.tgz.tmp.*
+
+# 2. Restore .claude.json from Claude Code's automatic backups
+LATEST=$(ls -1t ~/.claude/backups/*/.claude.json 2>/dev/null | head -1)
+[[ -n "$LATEST" ]] && cp "$LATEST" ~/.claude.json && echo "restored: $LATEST"
+
+# 3. Upgrade to v0.7.2 to prevent recurrence
+agent-bridge upgrade --apply
+```
+
+Operator guidance:
+
+- After upgrading to v0.7.2, the `[upgrade-complete]` task body
+  contains an agent-safe verification block confirming backup
+  hygiene + daemon state + `~/.claude.json` validity. Run it.

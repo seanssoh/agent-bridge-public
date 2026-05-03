@@ -6,6 +6,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
+# shellcheck source=lib/bridge-cleanup.sh
+source "$SCRIPT_DIR/lib/bridge-cleanup.sh"
 ORIGINAL_ARGS=("$@")
 
 SOURCE_ROOT="$SCRIPT_DIR"
@@ -1346,6 +1348,51 @@ if [[ $DRY_RUN -eq 0 ]]; then
   rm -rf "$_write_state_payload_dir"
 fi
 
+# Bug #507 — auto-cleanup of daily-backup residue on every successful
+# `agb upgrade --apply`. Idempotent; reports failures via cleanup_failures
+# array. Skipped on dry-runs (no live state to mutate). Always runs before
+# the [upgrade-complete] task is filed so the summary can ride along.
+CLEANUP_JSON=""
+CLEANUP_SUMMARY_MD=""
+CLEANUP_FAILURES_COUNT=0
+if [[ $DRY_RUN -eq 0 ]]; then
+  _cleanup_no_backup_mode=0
+  if [[ $BACKUP -eq 0 ]]; then
+    _cleanup_no_backup_mode=1
+  fi
+  if BRIDGE_CLEANUP_TARGET_ROOT="$TARGET_ROOT" \
+     BRIDGE_CLEANUP_SOURCE_ROOT="$SOURCE_ROOT" \
+     BRIDGE_CLEANUP_CURRENT_BACKUP_ROOT="$BACKUP_ROOT" \
+     BRIDGE_CLEANUP_NO_BACKUP_MODE="$_cleanup_no_backup_mode" \
+     CLEANUP_JSON="$(bridge_cleanup_daily_backup_residue 2>/dev/null)"; then
+    CLEANUP_FAILURES_COUNT="$(printf '%s' "$CLEANUP_JSON" \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(len(d.get("cleanup_failures") or []))' 2>/dev/null \
+      || printf '0')"
+    CLEANUP_SUMMARY_MD="$(printf '%s' "$CLEANUP_JSON" | bridge_cleanup_render_summary 2>/dev/null || true)"
+    if [[ "$CLEANUP_FAILURES_COUNT" != "0" ]]; then
+      {
+        echo "[bridge-upgrade] WARN: backup residue cleanup completed with ${CLEANUP_FAILURES_COUNT} failure(s)."
+        echo "[bridge-upgrade] WARN: Inspect the [upgrade-complete] task body or re-run manually:"
+        echo "[bridge-upgrade] WARN:   python3 $TARGET_ROOT/bridge-upgrade.py cleanup-residue --target-root $TARGET_ROOT"
+      } >&2
+    fi
+  else
+    {
+      echo "[bridge-upgrade] WARN: backup residue cleanup helper failed to run."
+      echo "[bridge-upgrade] WARN: Manual recovery:"
+      echo "[bridge-upgrade] WARN:   python3 $TARGET_ROOT/bridge-upgrade.py cleanup-residue --target-root $TARGET_ROOT"
+    } >&2
+    CLEANUP_SUMMARY_MD="## Backup residue cleanup
+
+Cleanup helper did not run (helper invocation failed). Run manually:
+
+\`\`\`bash
+python3 $TARGET_ROOT/bridge-upgrade.py cleanup-residue --target-root $TARGET_ROOT
+\`\`\`"
+    CLEANUP_FAILURES_COUNT=1
+  fi
+fi
+
 # Post-upgrade admin signal: file a [upgrade-complete] task with a
 # ready-to-execute checklist. Without this the admin has to know to
 # go read docs/agent-runtime/wiki-onboarding.md; the task makes the
@@ -1505,6 +1552,20 @@ When you finish the three steps above and processed every applicable section
 of OPERATOR_ACTIONS_PENDING.md, close this task with:
 \`agb done <task_id> --note "bootstrap OK; first-scan <N> files / <M> entities; distribution report at <path>; operator-actions: <summary>"\`
 POST_EOF
+
+    # Bug #507: append the cleanup summary + verification block to the
+    # post-upgrade task body. The summary is what auto-cleanup actually
+    # did; the verification block is the agent-safe self-check the admin
+    # runs to confirm everything is back to normal. If cleanup failed,
+    # the recovery snippet inside CLEANUP_SUMMARY_MD points the operator
+    # at the manual command.
+    if [[ -n "$CLEANUP_SUMMARY_MD" ]]; then
+      printf '\n%s\n' "$CLEANUP_SUMMARY_MD" >>"$_post_body"
+    fi
+    {
+      printf '\n'
+      bridge_cleanup_render_verification_block "$TARGET_ROOT"
+    } >>"$_post_body"
     # Persist the task body in state/ so the recovery command the
     # WARN block prints is actually rerunnable. Tempfiles vanish on
     # exit and leave the operator with guidance instead of a command
@@ -1561,14 +1622,32 @@ if [[ $JSON -eq 1 ]]; then
   printf '%s' "$CHANNEL_GUARD_JSON" >"$_json_payload_dir/channel-guard.json"
   printf '%s' "$SOURCE_RECLASSIFY_JSON" >"$_json_payload_dir/source-reclassify.json"
   printf '%s' "$SHARED_SETTINGS_RERENDER_JSON" >"$_json_payload_dir/shared-settings-rerender.json"
+  # PR #508 r2: surface the daily-backup cleanup payload in --json output
+  # so operators / monitoring can read `cleanup_failures` programmatically
+  # (matches the OPERATIONS.md contract). Empty file when cleanup didn't
+  # run (e.g. dry-run paths that bypass the cleanup block above).
+  printf '%s' "${CLEANUP_JSON:-}" >"$_json_payload_dir/cleanup.json"
   set +e
-  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" <<'PY'
+  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" <<'PY'
 import json, sys
-source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file = sys.argv[1:]
+source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file = sys.argv[1:]
 
 def load_json(path):
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+def load_optional_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read().strip()
+    except FileNotFoundError:
+        return None
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"_raw": text, "_parse_error": True}
 
 backup_payload = load_json(backup_json_file)
 migration_payload = load_json(migration_json_file)
@@ -1578,6 +1657,7 @@ agent_restart_payload = load_json(agent_restart_json_file)
 channel_guard_payload = load_json(channel_guard_json_file)
 source_reclassify_payload = load_json(source_reclassify_json_file)
 shared_settings_rerender_payload = load_json(shared_settings_rerender_json_file)
+cleanup_payload = load_optional_json(cleanup_json_file)
 payload = {
     "mode": "upgrade",
     "version": source_version,
@@ -1614,6 +1694,7 @@ payload = {
     "agent_migration": migration_payload,
     "source_reclassify": source_reclassify_payload,
     "shared_settings_rerender": shared_settings_rerender_payload,
+    "cleanup": cleanup_payload,
   }
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY
