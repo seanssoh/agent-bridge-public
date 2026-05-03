@@ -1622,14 +1622,32 @@ if [[ $JSON -eq 1 ]]; then
   printf '%s' "$CHANNEL_GUARD_JSON" >"$_json_payload_dir/channel-guard.json"
   printf '%s' "$SOURCE_RECLASSIFY_JSON" >"$_json_payload_dir/source-reclassify.json"
   printf '%s' "$SHARED_SETTINGS_RERENDER_JSON" >"$_json_payload_dir/shared-settings-rerender.json"
+  # PR #508 r2: surface the daily-backup cleanup payload in --json output
+  # so operators / monitoring can read `cleanup_failures` programmatically
+  # (matches the OPERATIONS.md contract). Empty file when cleanup didn't
+  # run (e.g. dry-run paths that bypass the cleanup block above).
+  printf '%s' "${CLEANUP_JSON:-}" >"$_json_payload_dir/cleanup.json"
   set +e
-  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" <<'PY'
+  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" <<'PY'
 import json, sys
-source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file = sys.argv[1:]
+source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file = sys.argv[1:]
 
 def load_json(path):
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+def load_optional_json(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read().strip()
+    except FileNotFoundError:
+        return None
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {"_raw": text, "_parse_error": True}
 
 backup_payload = load_json(backup_json_file)
 migration_payload = load_json(migration_json_file)
@@ -1639,6 +1657,7 @@ agent_restart_payload = load_json(agent_restart_json_file)
 channel_guard_payload = load_json(channel_guard_json_file)
 source_reclassify_payload = load_json(source_reclassify_json_file)
 shared_settings_rerender_payload = load_json(shared_settings_rerender_json_file)
+cleanup_payload = load_optional_json(cleanup_json_file)
 payload = {
     "mode": "upgrade",
     "version": source_version,
@@ -1675,6 +1694,7 @@ payload = {
     "agent_migration": migration_payload,
     "source_reclassify": source_reclassify_payload,
     "shared_settings_rerender": shared_settings_rerender_payload,
+    "cleanup": cleanup_payload,
   }
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY

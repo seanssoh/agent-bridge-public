@@ -914,10 +914,18 @@ process_daily_backup() {
   # daemon main loop. 120s ceiling is well above the observed normal runtime.
   # Bug #507: capture stderr too (separate file) so an error_detail can be
   # surfaced to state.env / audit instead of silently swallowed.
+  #
+  # PR #508 r2: do NOT wrap the assignment in `if ! ...; then` — `$?`
+  # inside that branch is the status of the `!` operator (always 0), not
+  # the subprocess. Capture the rc directly via `set +e` / `set -e` toggle
+  # so timeouts (124) and non-zero rc map to real failure reasons.
   local stderr_capture=""
   stderr_capture="$(mktemp -t bridge-daily-backup.XXXXXX.err)"
-  if ! backup_json="$(bridge_with_timeout 120 daily_backup python3 "$SCRIPT_DIR/bridge-upgrade.py" daily-backup-live --target-root "$BRIDGE_HOME" --backup-dir "$BRIDGE_DAILY_BACKUP_DIR" --retain-days "$retain_days" 2>"$stderr_capture")"; then
-    subprocess_rc=$?
+  set +e
+  backup_json="$(bridge_with_timeout 120 daily_backup python3 "$SCRIPT_DIR/bridge-upgrade.py" daily-backup-live --target-root "$BRIDGE_HOME" --backup-dir "$BRIDGE_DAILY_BACKUP_DIR" --retain-days "$retain_days" 2>"$stderr_capture")"
+  subprocess_rc=$?
+  set -e
+  if (( subprocess_rc != 0 )); then
     error_detail="$(head -c 400 "$stderr_capture" 2>/dev/null | tr '\n' ' ')"
     rm -f "$stderr_capture"
     if (( subprocess_rc == 124 )); then

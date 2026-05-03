@@ -843,7 +843,7 @@ def dump_sqlite_snapshot(
     target_root: Path,
     today: date,
     *,
-    tmp_root: Path | None = None,
+    tmp_root: Path | None = None,  # kept for back-compat; ignored intentionally
 ) -> list[dict[str, Any]]:
     """Hot-snapshot each entry in DAILY_BACKUP_SQLITE_SNAPSHOT_TARGETS.
 
@@ -851,16 +851,30 @@ def dump_sqlite_snapshot(
     snapshot_bytes, source_present} dicts. A missing source DB (fresh
     install) is silently skipped — daily backup must still succeed.
 
-    The dump is staged in `tmp_root` (a process-private dir outside the tar
-    walk), gzipped, fsynced, then atomically moved into
-    `target_root/state/backup-snapshots/`. On failure the temp file is
-    unlinked and the entry is reported with an error string.
+    Implementation (PR #508 r2 fixes):
+
+    1. Use `sqlite3.Connection.backup()` into a process-private temp DB
+       first, then `iterdump` the temp copy. Raw `iterdump` against the
+       live DB issues multiple SELECTs and can interleave with concurrent
+       writer commits, producing a mixed dump. `.backup()` is the
+       canonical online snapshot API and gives us a transactionally-
+       consistent point-in-time copy.
+
+    2. The gzipped `.partial` is staged as a sibling of the final path
+       (inside `state/backup-snapshots/`), so `os.replace` is always on
+       the same filesystem — no EXDEV when `BRIDGE_DAILY_BACKUP_DIR`
+       lives on a different mount than the bridge home. The `tmp_root`
+       parameter is kept for caller-side scratch (the temp DB) and the
+       partial stays adjacent to the final.
     """
     snapshots: list[dict[str, Any]] = []
     final_dir = target_root / DAILY_BACKUP_SNAPSHOT_DIR_REL
     final_dir.mkdir(parents=True, exist_ok=True)
-    tmp_dir = tmp_root if tmp_root is not None else final_dir
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    # Temp DB lives in caller's tmp_root if given (out of the tar walk),
+    # otherwise next to the final dump. Either path works because the
+    # temp DB is unlinked before this function returns.
+    db_tmp_dir = tmp_root if tmp_root is not None else final_dir
+    db_tmp_dir.mkdir(parents=True, exist_ok=True)
 
     for src_relpath, stem in DAILY_BACKUP_SQLITE_SNAPSHOT_TARGETS:
         src_path = target_root / src_relpath
@@ -879,20 +893,25 @@ def dump_sqlite_snapshot(
             snapshots.append(entry)
             continue
 
-        partial_path = tmp_dir / f".{snapshot_name}.partial.{uuid.uuid4().hex}"
+        # Sibling-of-final partial → atomic replace stays on the same fs.
+        partial_path = final_dir / f".{snapshot_name}.partial.{uuid.uuid4().hex}"
+        # Online-snapshot temp DB lives in db_tmp_dir; out of band.
+        tmp_db_path = db_tmp_dir / f".{stem}-snapshot.{uuid.uuid4().hex}.sqlite"
+        src_conn: sqlite3.Connection | None = None
+        tmp_conn: sqlite3.Connection | None = None
         try:
-            # mode=ro so verify-tasks-db / live writers aren't disturbed by
-            # journal mode flips; .backup() is the canonical online snapshot
-            # API and tolerates concurrent writers.
+            # mode=ro so verify-tasks-db / live writers aren't disturbed
+            # by any side-effect of opening rw. .backup() works against
+            # an ro source.
             src_uri = f"file:{src_path}?mode=ro"
             src_conn = sqlite3.connect(src_uri, uri=True)
-            try:
-                with gzip.open(partial_path, "wt", encoding="utf-8", compresslevel=6) as gz:
-                    for line in src_conn.iterdump():
-                        gz.write(line)
-                        gz.write("\n")
-            finally:
-                src_conn.close()
+            tmp_conn = sqlite3.connect(str(tmp_db_path))
+            src_conn.backup(tmp_conn)
+            # Now iterdump the consistent temp copy, not the live DB.
+            with gzip.open(partial_path, "wt", encoding="utf-8", compresslevel=6) as gz:
+                for line in tmp_conn.iterdump():
+                    gz.write(line)
+                    gz.write("\n")
             _fsync_path(partial_path)
             _atomic_replace(partial_path, final_path)
             _fsync_path(final_path)
@@ -901,6 +920,15 @@ def dump_sqlite_snapshot(
             entry["error"] = f"{type(exc).__name__}: {exc}"
             with contextlib.suppress(FileNotFoundError):
                 partial_path.unlink()
+        finally:
+            if tmp_conn is not None:
+                with contextlib.suppress(Exception):
+                    tmp_conn.close()
+            if src_conn is not None:
+                with contextlib.suppress(Exception):
+                    src_conn.close()
+            with contextlib.suppress(FileNotFoundError):
+                tmp_db_path.unlink()
         snapshots.append(entry)
     return snapshots
 
@@ -1851,9 +1879,20 @@ def validate_claude_config(path: Path) -> dict[str, Any]:
 
 def cmd_cleanup_residue(args: argparse.Namespace) -> int:
     target_root = Path(args.target_root).expanduser()
-    backup_dir = Path(args.backup_dir).expanduser() if args.backup_dir else None
+    # PR #508 r2: default these to the canonical layout under target_root.
+    # Without the defaults, `cleanup-residue --target-root <root>` (the
+    # exact form in OPERATOR_ACTIONS_PENDING.md and in the upgrader's
+    # printed recovery command) would skip stale-tmp / daily-prune /
+    # upgrade-* prune entirely — defeating the manual fallback path.
+    backup_dir = (
+        Path(args.backup_dir).expanduser()
+        if args.backup_dir
+        else (target_root / "backups" / "daily")
+    )
     upgrade_backups_dir = (
-        Path(args.upgrade_backups_dir).expanduser() if args.upgrade_backups_dir else None
+        Path(args.upgrade_backups_dir).expanduser()
+        if args.upgrade_backups_dir
+        else (target_root / "backups")
     )
     current_backup_root = (
         Path(args.current_backup_root).expanduser() if args.current_backup_root else None
