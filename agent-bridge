@@ -54,6 +54,7 @@ Usage:
   $CLI_NAME user <set|show> ...
   $CLI_NAME guard <status|scan|sanitize> ...
   $CLI_NAME diagnose <acl> [--json]
+  $CLI_NAME doctor [--json] [--detectors <kind[,kind...]>] [--state-dir <path>] [--task-db <path>]
   $CLI_NAME knowledge <init|operator|capture|promote|search|lint> ...
   $CLI_NAME skills <list> [--agent <name>] [--json]
   $CLI_NAME config <set|get|list-protected> ...
@@ -599,6 +600,11 @@ PY
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-diagnose.sh" "$@"
       ;;
+    doctor)
+      shift
+      bridge_require_python
+      exec python3 "$SCRIPT_DIR/bridge-doctor.py" "$@"
+      ;;
     knowledge)
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-knowledge.sh" "$@"
@@ -770,7 +776,7 @@ PY
   # sqlite3 fallback path. Reject with an intent-recovery suggestion
   # before the spawn parser sees it.
   if [[ -n "${1:-}" && "${1:0:1}" != "-" ]]; then
-    _top_valid="admin bootstrap init version upgrade escalate upstream review user guard diagnose knowledge config bundle intake list status kill attach urgent task profile setup agent cron memory audit usage watchdog discord migrate wiki isolate unisolate worktree inbox show claim done cancel update handoff summary create"
+    _top_valid="admin bootstrap init version upgrade escalate upstream review user guard diagnose doctor knowledge config bundle intake list status kill attach urgent task profile setup agent cron memory audit usage watchdog discord migrate wiki isolate unisolate worktree inbox show claim done cancel update handoff summary create"
     _hint="$(bridge_suggest_subcommand "$1" "$_top_valid")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 명령입니다: $1"

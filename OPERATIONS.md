@@ -238,6 +238,7 @@ agb status
 agb status --watch
 agb summary
 agb list
+agb doctor [--json]                # surface stuck-state signals (read-only) for admin self-healing recipes (#511)
 agb cron inventory --limit 20
 agb cron inventory --mode one-shot --limit 20
 agb cron list --agent <agent>
