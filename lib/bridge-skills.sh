@@ -208,13 +208,49 @@ print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 PY
 }
 
+bridge_agent_workdir_registry_json() {
+  # Roster snapshot consumed by bridge-docs.py plugin-routing rendering
+  # (issue #509 C1). One entry per claude-engine agent: agent → live
+  # workdir. Codex agents are intentionally excluded; Claude Code's
+  # plugin tree only attributes installs to claude-engine workdirs.
+  local entries=()
+  local agent="" engine="" workdir=""
+
+  if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1; then
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+      [[ "$engine" == "claude" ]] || continue
+      workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+      [[ -n "$workdir" ]] || continue
+      entries+=("$agent=$workdir")
+    done
+  fi
+
+  bridge_require_python
+  python3 - "${entries[@]+"${entries[@]}"}" <<'PY'
+import json
+import sys
+
+payload = {}
+for raw in sys.argv[1:]:
+    agent, _, workdir = raw.partition("=")
+    if agent and workdir:
+        payload[agent] = workdir
+
+print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+PY
+}
+
 bridge_sync_skill_docs() {
-  local skills_json=""
+  local skills_json="" workdir_json=""
 
   [[ -f "$BRIDGE_SCRIPT_DIR/bridge-docs.py" ]] || return 0
   bridge_require_python
   skills_json="$(bridge_agent_skills_registry_json)"
-  BRIDGE_AGENT_SKILLS_JSON="$skills_json" python3 "$BRIDGE_SCRIPT_DIR/bridge-docs.py" apply "$@" \
+  workdir_json="$(bridge_agent_workdir_registry_json)"
+  BRIDGE_AGENT_SKILLS_JSON="$skills_json" \
+  BRIDGE_AGENT_WORKDIR_JSON="$workdir_json" \
+    python3 "$BRIDGE_SCRIPT_DIR/bridge-docs.py" apply "$@" \
     --bridge-home "$BRIDGE_HOME" \
     --target-root "$BRIDGE_AGENT_HOME_ROOT" \
     --source-shared "$BRIDGE_OPENCLAW_HOME/shared" >/dev/null
