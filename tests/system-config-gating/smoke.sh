@@ -542,7 +542,7 @@ JSON
 )
 sce7h_out="$(run_hook_pretool_payload "$sce7h_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
 if [[ "$sce7h_out" == *'"deny"'* ]]; then
-  fail "scenario 7 (D2h): heredoc prose `the chain at hooks/post.sh` falsely denied — output: $sce7h_out"
+  fail "scenario 7 (D2h): heredoc prose 'the chain at hooks/post.sh' falsely denied — output: $sce7h_out"
 else
   pass "scenario 7 (D2h): heredoc prose preceded by whitespace still passes (regression-preserve)"
 fi

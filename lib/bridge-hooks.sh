@@ -59,6 +59,33 @@ bridge_claude_settings_mode() {
   local agent=""
   local agent_workdir=""
 
+  # Issue #516 r2 (codex needs-more on PR #518): the
+  # "inside BRIDGE_AGENT_HOME_ROOT means shared" fast-path is NOT
+  # static-by-construction. Dynamic spawn defaults to the current
+  # directory and accepts arbitrary --workdir, then records
+  # source=dynamic with that workdir. If an operator passes
+  # --workdir into the home root, the dynamic agent would inherit
+  # the static autoCompactWindow=400000 default — exactly what the
+  # original Issue #516 fix tried to prevent.
+  #
+  # Short-circuit registered dynamic claude agents to `local` BEFORE
+  # the HOME_ROOT branch. Static agents under HOME_ROOT keep the
+  # existing fast path; static agents whose workdir is registered
+  # outside HOME_ROOT keep their existing handling in the second
+  # loop below.
+  if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1; then
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      [[ "$(bridge_agent_engine "$agent" 2>/dev/null || true)" == "claude" ]] || continue
+      [[ "$(bridge_agent_source "$agent" 2>/dev/null || true)" == "dynamic" ]] || continue
+      agent_workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+      [[ -n "$agent_workdir" ]] || continue
+      if [[ "$(bridge_hook_paths_equal "$workdir" "$agent_workdir")" == "1" ]]; then
+        printf 'local'
+        return 0
+      fi
+    done
+  fi
+
   if [[ "$(bridge_path_is_within_root "$workdir" "$BRIDGE_AGENT_HOME_ROOT")" == "1" ]]; then
     printf 'shared'
     return 0
