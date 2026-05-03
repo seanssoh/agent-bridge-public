@@ -472,15 +472,37 @@ def _alias_path_fragments(token: str):
 # to fire on its own — e.g. `hooks/` and `state/cron/` are short enough
 # that any heredoc body documenting the hook chain or cron layout will
 # trigger them. For such needles we require the character immediately
-# preceding the match to be a strict filesystem-prefix character (`/`,
-# `~`, `$`) so the match must look like an actual path argument
-# (``/abs/.../hooks/foo``, ``~/state/cron/``, ``$BRIDGE_HOME/hooks/x``)
-# and not prose like ``See hooks/post.sh for details`` that follows a
-# space. Longer needles (``.discord/access.json``,
-# ``agent-roster.local.sh``, etc.) are specific enough that a plain
-# substring hit is acceptable. Issue #509 D2 follow-up.
+# preceding the match to be a path-boundary / token-boundary character
+# so the match looks like an actual argv-shaped path (``>hooks/foo``,
+# ``"hooks/post.sh"``, ``FOO=hooks/x``, ``$(hooks/y)``, ``cmd|hooks/z``,
+# or start-of-string) and not prose like ``See hooks/post.sh for
+# details`` that follows whitespace. Whitespace is **deliberately
+# excluded** from the prefix set: heredoc bodies are the dominant
+# source of false-positive shlex failures, and prose mentions inside
+# them are always preceded by a space. Real argv writes always have a
+# non-whitespace boundary character (redirection ``>``, assignment
+# ``=``, quote, parenthesis, separator). Longer needles
+# (``.discord/access.json``, ``agent-roster.local.sh``, etc.) are
+# specific enough that a plain substring hit is acceptable. Issue #509
+# D2 follow-up; tightened for r2 after codex flagged
+# ``cat >hooks/foo 'unterminated`` bypassing the original three-char
+# prefix set.
 _SHORT_NEEDLE_THRESHOLD = 12
-_PATH_PREFIX_CHARS = frozenset({"/", "~", "$"})
+_PATH_PREFIX_CHARS = frozenset({
+    "/",        # absolute / relative path
+    "~",        # home expansion
+    "$",        # var expansion
+    ">",        # output redirection target (`>hooks/foo`, `&>hooks/foo`)
+    "<",        # input redirection target
+    "'",        # single-quoted token boundary
+    '"',        # double-quoted token boundary
+    "(",        # subshell / `$(...)` inner
+    "=",        # assignment value (`FOO=hooks/...`)
+    "&",        # background / fd redirect prefix (`&>hooks/...`)
+    "|",        # pipe boundary
+    ";",        # statement separator
+    ",",        # comma separator in some shell idioms
+})
 
 
 def _command_substring_hits_protected_needle(command: str) -> bool:
@@ -488,12 +510,14 @@ def _command_substring_hits_protected_needle(command: str) -> bool:
     a plausible path-argument position.
 
     Long needles (>= :data:`_SHORT_NEEDLE_THRESHOLD` chars) match on a
-    plain substring scan. Short needles only fire when preceded by a
-    strict filesystem-prefix character (`/`, `~`, `$`), which keeps the
-    fallback no weaker than the structural-argv check for real path
-    arguments while letting heredoc prose like ``It's hooks/post.sh``
-    pass — that prose is what triggered the regression operator-side
-    on 2026-05-03 (issue #509 D2 follow-up).
+    plain substring scan. Short needles fire when the needle sits at
+    start-of-string OR is preceded by a token/path-boundary character
+    (see :data:`_PATH_PREFIX_CHARS`). Whitespace is intentionally NOT a
+    boundary character so heredoc prose like ``It's hooks/post.sh``
+    pass — that prose is what triggered the regression operator-side on
+    2026-05-03 (issue #509 D2). Real argv writes such as
+    ``cat >hooks/foo 'unterminated`` still deny because ``>`` is in the
+    prefix set (#509 D2 r2 codex follow-up).
     """
     for needle in protected_literal_suffixes():
         if not needle:
@@ -507,7 +531,10 @@ def _command_substring_hits_protected_needle(command: str) -> bool:
             idx = command.find(needle, start)
             if idx < 0:
                 break
-            if idx > 0 and command[idx - 1] in _PATH_PREFIX_CHARS:
+            if idx == 0:
+                # Needle at start-of-string is path-shaped by construction.
+                return True
+            if command[idx - 1] in _PATH_PREFIX_CHARS:
                 return True
             start = idx + 1
     return False
@@ -631,11 +658,11 @@ def _bash_argv_references_system_config(command: str) -> bool:
         # `state/cron/`) match too eagerly when prose mentions them
         # mid-sentence (e.g. a handoff body that documents the hook
         # chain). Require each needle to sit at a path-boundary:
-        # start-of-string or preceded by a character that plausibly opens
-        # a filesystem token (`/`, `~`, `$`, whitespace, quote, paren, or
-        # one of the redirection prefixes). This keeps the fallback no
-        # weaker than the structural-argv check for real path arguments
-        # while letting heredoc prose pass.
+        # start-of-string or preceded by a token-boundary character
+        # (redirection `>`/`<`, quote, paren, assignment `=`, fd `&`,
+        # pipe `|`, separator `;`/`,`, plus the original `/`, `~`, `$`).
+        # Whitespace is deliberately excluded so heredoc prose preceded
+        # by a space still passes — see _PATH_PREFIX_CHARS for rationale.
         return _command_substring_hits_protected_needle(command)
 
     def _check_value(value: str) -> bool:

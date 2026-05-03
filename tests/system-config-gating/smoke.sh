@@ -452,6 +452,101 @@ else
   fail "scenario 7 (D2d): substring fallback regression — real protected path no longer denied: $sce7d_out"
 fi
 
+# D2e — Bash redirect into hooks/ with unbalanced quote MUST deny.
+# Issue #509 D2 r2 (codex needs-more): the original three-char prefix
+# set `{/,~,$}` missed the `>hooks/` form, so a malformed real write
+# slipped through the fallback. `>` is now in _PATH_PREFIX_CHARS.
+sce7e_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7e",
+  "session_id": "test-session-7e",
+  "tool_input": {
+    "command": "cat >hooks/foo 'unterminated",
+    "description": "redirect into hooks/ with unbalanced quote"
+  }
+}
+JSON
+)
+sce7e_out="$(run_hook_pretool_payload "$sce7e_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7e_out" == *'"deny"'* ]] && [[ "$sce7e_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2e): \`cat >hooks/foo 'unterminated\` denied via expanded prefix set"
+else
+  fail "scenario 7 (D2e): \`>hooks/foo\` not denied — output: $sce7e_out"
+fi
+
+# D2f — Bash redirect into state/cron/ with unbalanced quote MUST deny.
+# Reviewer's second explicit bypass for the original narrow prefix set.
+sce7f_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7f",
+  "session_id": "test-session-7f",
+  "tool_input": {
+    "command": "cat >state/cron/job.json 'unterminated",
+    "description": "redirect into state/cron/ with unbalanced quote"
+  }
+}
+JSON
+)
+sce7f_out="$(run_hook_pretool_payload "$sce7f_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7f_out" == *'"deny"'* ]] && [[ "$sce7f_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2f): \`cat >state/cron/job.json 'unterminated\` denied via expanded prefix set"
+else
+  fail "scenario 7 (D2f): \`>state/cron/job.json\` not denied — output: $sce7f_out"
+fi
+
+# D2g — short needle at start-of-string (idx==0) MUST deny.
+# Without the explicit `idx == 0` short-circuit, `hooks/post.sh ...` at
+# the very start of a malformed command would slip through because the
+# original loop required `idx > 0` and a prefix char before the needle.
+sce7g_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7g",
+  "session_id": "test-session-7g",
+  "tool_input": {
+    "command": "hooks/post.sh some-arg-with-quote'",
+    "description": "short needle at start-of-string with unbalanced quote"
+  }
+}
+JSON
+)
+sce7g_out="$(run_hook_pretool_payload "$sce7g_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7g_out" == *'"deny"'* ]] && [[ "$sce7g_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2g): short needle at start-of-string denied via idx==0 short-circuit"
+else
+  fail "scenario 7 (D2g): start-of-string needle not denied — output: $sce7g_out"
+fi
+
+# D2h — Regression-preserve: heredoc prose with `hooks/post.sh` preceded
+# by a SPACE must still NOT deny. Whitespace is deliberately excluded
+# from the expanded _PATH_PREFIX_CHARS so prose mentions inside heredoc
+# bodies keep passing. Mirrors the existing D2a case but written as an
+# explicit r2 regression-preserve check.
+sce7h_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7h",
+  "session_id": "test-session-7h",
+  "tool_input": {
+    "command": "cat >> .agents/X.md <<'EOF'\nThe chain at hooks/post.sh writes to /tmp.\nEOF",
+    "description": "heredoc prose preserve"
+  }
+}
+JSON
+)
+sce7h_out="$(run_hook_pretool_payload "$sce7h_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7h_out" == *'"deny"'* ]]; then
+  fail "scenario 7 (D2h): heredoc prose `the chain at hooks/post.sh` falsely denied — output: $sce7h_out"
+else
+  pass "scenario 7 (D2h): heredoc prose preceded by whitespace still passes (regression-preserve)"
+fi
+
 # --- Summary -------------------------------------------------------------
 printf '\n[smoke] system-config-gating: %d pass, %d fail\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
