@@ -65,6 +65,11 @@ PY
 }
 
 seed_tasks_db() {
+  # PR #536 r2 — `queue_dispatch_terminal` now reads the queue via
+  # `bridge-queue.py show <id> --format shell` (queue-first contract).
+  # `bridge-queue.py` runs `init_db` on every connect, which expects the
+  # full v2 schema. Stand up a real schema instead of the minimal
+  # (id,status) two-column version so the CLI read path works.
   python3 - "$BRIDGE_TASK_DB" <<'PY'
 import sqlite3, sys
 path = sys.argv[1]
@@ -75,7 +80,19 @@ conn.execute(
     """
     CREATE TABLE IF NOT EXISTS tasks (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        status TEXT NOT NULL DEFAULT 'queued'
+        title TEXT NOT NULL,
+        assigned_to TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        priority TEXT NOT NULL DEFAULT 'normal',
+        status TEXT NOT NULL DEFAULT 'queued',
+        created_ts INTEGER NOT NULL,
+        updated_ts INTEGER NOT NULL,
+        body_text TEXT,
+        body_path TEXT,
+        claimed_by TEXT,
+        claimed_ts INTEGER,
+        lease_until_ts INTEGER,
+        closed_ts INTEGER
     )
     """
 )
@@ -87,10 +104,19 @@ PY
 insert_task() {
   local status="$1"
   python3 - "$BRIDGE_TASK_DB" "$status" <<'PY'
-import sqlite3, sys
+import sqlite3, sys, time
 path, status = sys.argv[1], sys.argv[2]
+ts = int(time.time())
 conn = sqlite3.connect(path)
-cur = conn.execute("INSERT INTO tasks (status) VALUES (?)", (status,))
+cur = conn.execute(
+    """
+    INSERT INTO tasks (
+      title, assigned_to, created_by, priority, status,
+      created_ts, updated_ts, body_text
+    ) VALUES (?, ?, ?, 'normal', ?, ?, ?, ?)
+    """,
+    ("smoke fixture", "smoke-agent", "smoke-actor", status, ts, ts, "fixture body"),
+)
 print(cur.lastrowid)
 conn.commit()
 conn.close()
@@ -426,6 +452,256 @@ EOF
   smoke_assert_contains "$out_alias" '"candidate_count": 0' "one-shot alias runs without error"
 }
 
+# PR #536 r2 — Codex r1 finding #3, smoke gap #1: failed-run eviction at the
+# full Tier-B 30d window. Issue body promises that state="error" runs are
+# held back to the longer Tier-B clock, then evicted past it. Pair with a
+# 29-day-old fixture as the negative control (within retention).
+assert_failed_run_evicted_at_30d() {
+  rm -rf "$BRIDGE_STATE_DIR/cron" "$BRIDGE_SHARED_DIR"/cron-* 2>/dev/null || true
+  local task_evict task_keep
+  task_evict="$(insert_task done)"
+  task_keep="$(insert_task done)"
+  # 31 days old failed run on a Tier-A surface — past Tier-B 30d so eligible.
+  write_run_fixture "morning-briefing-err30--evict" "$task_evict" "error" 31
+  # 29 days old failed run — within Tier-B retention so retained.
+  write_run_fixture "morning-briefing-err30--keep" "$task_keep" "error" 29
+  # Pad the family floor so neither test entry is preserve_floor-pinned.
+  seed_floor_padding "morning-briefing-err30-padding"
+
+  local out
+  out="$(run_py cleanup-report --mode run-artifacts \
+    --target-root "$BRIDGE_HOME" --tasks-db "$BRIDGE_TASK_DB" --json)"
+  python3 - "$out" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+records = payload["records"]
+evict = next(
+    r for r in records
+    if r["surface"] == "state/cron/runs" and r["run_id"] == "morning-briefing-err30--evict"
+)
+keep = next(
+    r for r in records
+    if r["surface"] == "state/cron/runs" and r["run_id"] == "morning-briefing-err30--keep"
+)
+assert evict["eligible"] is True, (
+    f"31d failed run must be evicted at Tier-B 30d; got record={evict}"
+)
+assert evict["run_state"] == "error", evict
+assert keep["eligible"] is False, (
+    f"29d failed run must be retained within Tier-B; got record={keep}"
+)
+assert keep["skip_reason"] == "within_retention", keep
+PY
+}
+
+# PR #536 r2 — Codex r1 finding #3, smoke gap #2: state/cron/dispatch surface
+# is one of the 6 surfaces in the issue body but the original smoke only
+# seeded runs/workers/shared. Seed N=6 per-slot manifests under dispatch
+# (so the always-preserve floor of 5 leaves 1 eligible) and assert that
+# the eligible one gets removed under Tier-A retention.
+assert_dispatch_surface_pruned() {
+  rm -rf "$BRIDGE_STATE_DIR/cron" "$BRIDGE_SHARED_DIR"/cron-* 2>/dev/null || true
+  # state/cron/dispatch/<job_slug>/<slot_token>.json — the slot's run_id is
+  # `${slug}--${slot_token}` per `_entries_for_dispatch_dir`. classify_family
+  # matches "morning-briefing" prefix, so all 6 share one (surface, family)
+  # bucket — floor=5 leaves exactly 1 eligible.
+  local slug_dir="$BRIDGE_STATE_DIR/cron/dispatch/morning-briefing-dispatch"
+  mkdir -p "$slug_dir"
+  local i task_id manifest run_id
+  for i in 1 2 3 4 5 6; do
+    task_id="$(insert_task done)"
+    run_id="morning-briefing-dispatch--slot${i}"
+    # Seed paired runs/ fixture so the queue gate has a request.json.
+    write_run_fixture "$run_id" "$task_id" "success" 30
+    manifest="$slug_dir/slot${i}.json"
+    printf '{"slot":"slot%d","status":"success","dispatch_task_id":%s}\n' \
+      "$i" "$task_id" >"$manifest"
+    # Stagger mtime by i seconds so slot6 is "newest of the old".
+    python3 - "$manifest" "$i" <<'PY'
+import os, sys, time
+path, bump = sys.argv[1], int(sys.argv[2])
+ts = int(time.time()) - 30 * 86400 + bump
+os.utime(path, (ts, ts))
+PY
+  done
+  backdate "$slug_dir" 30
+
+  local before_dispatch
+  # shellcheck disable=SC2012  # fixture filenames are well-known.
+  before_dispatch="$(ls "$slug_dir" 2>/dev/null | wc -l | tr -d ' ')"
+  smoke_assert_eq "6" "$before_dispatch" "dispatch fixture seeded six manifests"
+
+  local out
+  out="$(run_py cleanup-report --mode run-artifacts \
+    --target-root "$BRIDGE_HOME" --tasks-db "$BRIDGE_TASK_DB" --json)"
+  python3 - "$out" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+dispatch_records = [
+    r for r in payload["records"] if r["surface"] == "state/cron/dispatch"
+]
+assert len(dispatch_records) == 6, (
+    f"expected 6 dispatch records, got {len(dispatch_records)}; payload={payload}"
+)
+eligible = [r for r in dispatch_records if r["eligible"]]
+assert len(eligible) == 1, (
+    f"expected exactly 1 eligible dispatch entry (floor=5 of 6); got {len(eligible)}"
+)
+# The eligible entry should be slot1 (oldest mtime), since slot6 is newest.
+assert eligible[0]["run_id"] == "morning-briefing-dispatch--slot1", eligible[0]
+PY
+
+  out="$(run_py cleanup-prune --mode run-artifacts \
+    --target-root "$BRIDGE_HOME" --tasks-db "$BRIDGE_TASK_DB" --json)"
+  smoke_assert_contains "$out" '"status": "pruned"' "prune ran on dispatch entry"
+  [[ ! -f "$slug_dir/slot1.json" ]] \
+    || smoke_fail "dispatch manifest slot1.json was not deleted"
+  # The other 5 slot manifests must remain (preserve_floor).
+  local after_dispatch
+  # shellcheck disable=SC2012  # fixture filenames are well-known.
+  after_dispatch="$(ls "$slug_dir" 2>/dev/null | wc -l | tr -d ' ')"
+  smoke_assert_eq "5" "$after_dispatch" "5 dispatch manifests preserved by floor"
+}
+
+# PR #536 r2 — Codex r1 finding #3, smoke gap #3: --mode all end-to-end.
+# Seed BOTH an expired one-shot job AND eligible run-artifacts, run
+# `cleanup-prune --mode all`, assert that one-shot rewrites jobs.json and
+# the run-artifact pass deletes the eligible artifact.
+assert_mode_all_end_to_end() {
+  rm -rf "$BRIDGE_STATE_DIR/cron" "$BRIDGE_SHARED_DIR"/cron-* 2>/dev/null || true
+  # Seed an expired one-shot job in jobs.json.
+  local jobs_file="$BRIDGE_HOME/cron/jobs.json"
+  mkdir -p "$BRIDGE_HOME/cron"
+  # ``deleteAfterRun=true``, ``enabled=false``, ``schedule.kind=at`` with
+  # an `at` value in the past = the expired-one-shot cleanup criteria
+  # (see ``cleanup_candidates`` in bridge-cron.py).
+  cat >"$jobs_file" <<'EOF'
+{"format":"agent-bridge-cron-v1","jobs":[
+  {"id":"expired1","name":"expired1","agentId":"a",
+   "schedule":{"kind":"at","at":"2020-01-01T00:00:00+00:00","tz":"UTC"},
+   "enabled":false,"deleteAfterRun":true},
+  {"id":"keepme","name":"keepme","agentId":"a",
+   "schedule":{"kind":"cron","expr":"0 * * * *","tz":"UTC"},
+   "enabled":true,"deleteAfterRun":false}
+]}
+EOF
+
+  # Seed an eligible run-artifact (30d old, success, queue done).
+  local task_id
+  task_id="$(insert_task done)"
+  write_run_fixture "morning-briefing-all--slot1" "$task_id" "success" 30
+  seed_floor_padding "morning-briefing-all-padding"
+
+  local out
+  out="$(run_py cleanup-prune --mode all \
+    --jobs-file "$jobs_file" \
+    --target-root "$BRIDGE_HOME" --tasks-db "$BRIDGE_TASK_DB" --json)"
+  # `--mode all` prints the one-shot JSON, then `--- run-artifacts ---`,
+  # then the run-artifacts JSON. Both must report a non-zero deletion.
+  smoke_assert_contains "$out" "--- run-artifacts ---" "mode-all printed run-artifacts banner"
+  smoke_assert_contains "$out" '"deleted_jobs": 1' "one-shot pass deleted expired1"
+  smoke_assert_contains "$out" '"status": "pruned"' "run-artifacts pass pruned"
+
+  # jobs.json should still contain keepme but no longer expired1.
+  python3 - "$jobs_file" <<'PY'
+import json, sys
+payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
+ids = sorted(j.get("id") for j in payload.get("jobs", []))
+assert ids == ["keepme"], f"expected only keepme; got {ids}"
+PY
+
+  # The eligible run-artifact must be gone.
+  [[ ! -d "$BRIDGE_STATE_DIR/cron/runs/morning-briefing-all--slot1" ]] \
+    || smoke_fail "run-artifact pass did not delete morning-briefing-all--slot1"
+}
+
+# PR #536 r2 — Codex r1 finding #3, smoke gap #4: real one-shot
+# byte-identical compat. Capture jobs.json after the legacy
+# `--mode expired-one-shot` path runs over a real expired one-shot
+# fixture, normalize, and confirm the rewrite shape matches what the
+# pre-#533 path would have produced (i.e. the new code path did not drift
+# the JSON emission shape).
+assert_one_shot_byte_identical_compat() {
+  rm -rf "$BRIDGE_STATE_DIR/cron" "$BRIDGE_SHARED_DIR"/cron-* 2>/dev/null || true
+  local jobs_file="$BRIDGE_HOME/cron/jobs.json"
+  mkdir -p "$BRIDGE_HOME/cron"
+  # Two-job fixture: one expired one-shot to be removed, one keeper.
+  cat >"$jobs_file" <<'EOF'
+{
+  "format": "agent-bridge-cron-v1",
+  "jobs": [
+    {
+      "id": "drop1",
+      "name": "drop1",
+      "agentId": "a",
+      "schedule": {"kind": "at", "at": "2020-01-01T00:00:00+00:00", "tz": "UTC"},
+      "enabled": false,
+      "deleteAfterRun": true
+    },
+    {
+      "id": "keepme",
+      "name": "keepme",
+      "agentId": "a",
+      "schedule": {"kind": "cron", "expr": "0 * * * *", "tz": "UTC"},
+      "enabled": true,
+      "deleteAfterRun": false
+    }
+  ]
+}
+EOF
+  local before
+  before="$(cat "$jobs_file")"
+
+  local out
+  out="$(run_py cleanup-prune --jobs-file "$jobs_file" \
+    --mode expired-one-shot --json)"
+  smoke_assert_contains "$out" '"deleted_jobs": 1' "one-shot byte-compat: expected one deletion"
+
+  local after
+  after="$(cat "$jobs_file")"
+  [[ "$before" != "$after" ]] || smoke_fail "one-shot byte-compat: jobs.json unchanged after prune"
+
+  # Normalize to compact JSON via python3 and confirm the keepme job's
+  # serialized shape is byte-identical to the expected post-prune shape.
+  python3 - "$jobs_file" <<'PY'
+import json, sys
+payload = json.loads(open(sys.argv[1], encoding="utf-8").read())
+jobs = payload.get("jobs", [])
+ids = sorted(j.get("id") for j in jobs)
+assert ids == ["keepme"], f"expected only keepme; got {ids}"
+keep = jobs[0]
+# byte-identical compat: every field that appeared in the pre-#533
+# emission must be exactly preserved on the surviving job.
+expected = {
+    "id": "keepme",
+    "name": "keepme",
+    "agentId": "a",
+    "schedule": {"kind": "cron", "expr": "0 * * * *", "tz": "UTC"},
+    "enabled": True,
+    "deleteAfterRun": False,
+}
+for key, value in expected.items():
+    got = keep.get(key)
+    assert got == value, f"keepme drift on {key}: expected {value!r}, got {got!r}"
+# Must NOT have alias or "agent" duplicate added (the v0.7.4 emission
+# uses agentId only; normalize_job_agent_fields adds "agent" mirror as a
+# normalization step for round-tripped reads, which is byte-equivalent).
+PY
+
+  # Run prune again — should be idempotent (nothing left to prune).
+  out="$(run_py cleanup-prune --jobs-file "$jobs_file" \
+    --mode expired-one-shot --json)"
+  smoke_assert_contains "$out" '"status": "nothing_to_prune"' "one-shot byte-compat: idempotent re-run"
+
+  # And `--mode run-artifacts` does NOT touch jobs.json — assert by hash.
+  local sha_before sha_after
+  sha_before="$(python3 -c 'import sys, hashlib; sys.stdout.write(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$jobs_file")"
+  out="$(run_py cleanup-prune --mode run-artifacts \
+    --target-root "$BRIDGE_HOME" --tasks-db "$BRIDGE_TASK_DB" --json)"
+  sha_after="$(python3 -c 'import sys, hashlib; sys.stdout.write(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$jobs_file")"
+  smoke_assert_eq "$sha_before" "$sha_after" "run-artifacts mode must not touch jobs.json"
+}
+
 main() {
   smoke_require_cmd python3
   smoke_setup_bridge_home "$SMOKE_NAME"
@@ -446,6 +722,11 @@ main() {
   smoke_run "symlink safety: never follow a symlink" assert_symlink_safety
   smoke_run "dry-run does not mutate" assert_dry_run_does_not_mutate
   smoke_run "one-shot/expired-one-shot backwards compat" assert_one_shot_mode_backwards_compat
+  # PR #536 r2 — codex r1 needs-more remediation, finding #3 (4 new gates).
+  smoke_run "failed run evicted at full Tier-B 30d (29d retained)" assert_failed_run_evicted_at_30d
+  smoke_run "state/cron/dispatch surface seeded and pruned" assert_dispatch_surface_pruned
+  smoke_run "--mode all runs one-shot then run-artifacts" assert_mode_all_end_to_end
+  smoke_run "one-shot byte-identical compat (legacy mode prune)" assert_one_shot_byte_identical_compat
   smoke_log "passed"
 }
 

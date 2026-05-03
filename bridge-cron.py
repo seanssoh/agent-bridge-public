@@ -793,53 +793,132 @@ def has_live_pid_for_run(run_id, target_root):
     return False
 
 
+def _queue_cli_path():
+    """Path to the sibling ``bridge-queue.py`` CLI."""
+    return Path(__file__).resolve().parent / "bridge-queue.py"
+
+
+def _lookup_queue_status_via_cli(task_id, *, tasks_db_path):
+    """Subprocess to ``bridge-queue.py show <task_id> --format shell`` and
+    return the queue status string, or ``None`` when the row cannot be
+    read (task not found / queue unavailable / parse error).
+
+    PR #536 r2: keeps the cleanup pass on the queue-first contract
+    (CLAUDE.md). The subprocess cost is bounded — GC runs are rare
+    (daily-ish) and each artifact requires one short read.
+    """
+    cmd = [
+        sys.executable,
+        str(_queue_cli_path()),
+        "show",
+        str(task_id),
+        "--format",
+        "shell",
+    ]
+    env = dict(os.environ)
+    # Force the direct (non-gateway) read path. The gateway adds a
+    # round-trip we don't need for a status lookup, and would require an
+    # operator agent context the cleanup pass doesn't have.
+    env.pop("BRIDGE_GATEWAY_PROXY", None)
+    env.pop("BRIDGE_AGENT_ID", None)
+    if tasks_db_path is not None:
+        env["BRIDGE_TASK_DB"] = str(tasks_db_path)
+    try:
+        completed = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15, check=False, env=env
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if completed.returncode != 0:
+        return None
+    for line in completed.stdout.splitlines():
+        if line.startswith("TASK_STATUS="):
+            # Shell-format value is shlex-quoted; for a queue status enum
+            # ("queued"/"claimed"/"done"/"cancelled"/"blocked"/"in_progress")
+            # there are no shell-special characters so a simple strip is
+            # sufficient. Use shlex.split to be safe against edge cases.
+            try:
+                parts = shlex.split(line[len("TASK_STATUS="):])
+            except ValueError:
+                return None
+            return parts[0] if parts else None
+    return None
+
+
 def queue_dispatch_terminal(run_id, target_root, *, tasks_db_path=None, run_dir=None):
     """Return (terminal?, queue_status, dispatch_task_id) for the given run.
 
-    Looks up ``dispatch_task_id`` from ``state/cron/runs/<run_id>/request.json``
-    and queries the SQLite tasks db directly. Reads SQLite the same way
-    ``run_reconcile_run_state`` does — we deliberately do NOT shell out to
-    ``bridge-queue.py``, since that would multiply the per-prune cost by the
-    number of run dirs.
-
-    A run with NO request.json or NO dispatch_task_id is treated as terminal
-    (no queue task to wait on). A run whose dispatch task row has been deleted
-    from the queue (e.g. a much older queue row already pruned) is also
-    treated as terminal — there is nothing keeping it alive.
+    PR #536 r2 contract:
+      - The dispatch task_id is resolved from ``request.json`` first, then
+        falls back to extracting ``<id>`` from a ``run_id`` of the form
+        ``task-<id>`` (used by the worker-artifact surface). Without this
+        fallback, a worker artifact whose run-dir was pruned would satisfy
+        the queue gate vacuously — Codex r1 finding #1.
+      - The status lookup goes through ``bridge-queue.py show --format
+        shell`` rather than direct SQLite, honoring the queue-first
+        contract in CLAUDE.md (Codex r1 finding #2).
+      - When the task_id cannot be identified at all, the gate returns
+        ``False`` (NOT terminal). Conservative-on-missing-context: a
+        missing-context artifact stays around until the operator can
+        investigate. This trades a small amount of long-tail orphan
+        retention for safety against the active-artifact bypass.
     """
     if run_dir is None:
         run_dir = Path(target_root) / "state" / "cron" / "runs" / run_id
     request_path = Path(run_dir) / "request.json"
-    if not request_path.is_file():
-        return True, "no_request", None
-    try:
-        request = json.loads(request_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return True, "unparseable_request", None
-    dispatch_task_id = request.get("dispatch_task_id")
-    try:
-        dispatch_task_id = int(dispatch_task_id) if dispatch_task_id is not None else None
-    except (TypeError, ValueError):
-        dispatch_task_id = None
+
+    dispatch_task_id = None
+    request_present = request_path.is_file()
+    request_parseable = True
+    if request_present:
+        try:
+            request = json.loads(request_path.read_text(encoding="utf-8"))
+            raw_task_id = request.get("dispatch_task_id")
+            try:
+                dispatch_task_id = (
+                    int(raw_task_id) if raw_task_id is not None else None
+                )
+            except (TypeError, ValueError):
+                dispatch_task_id = None
+        except (OSError, ValueError):
+            request_parseable = False
+
+    # Worker-artifact fallback: ``state/cron/workers/task-<id>.{pid,log}``
+    # entries are keyed by the queue task id directly (see
+    # ``_run_id_from_worker_log``). When the run-dir is missing for these,
+    # we still know the task_id — extract it from the run_id rather than
+    # treating the missing request.json as "terminal".
+    if dispatch_task_id is None and run_id.startswith("task-"):
+        suffix = run_id[len("task-"):]
+        if suffix.isdigit():
+            try:
+                dispatch_task_id = int(suffix)
+            except (TypeError, ValueError):
+                dispatch_task_id = None
+
     if dispatch_task_id is None:
-        return True, "no_dispatch_task_id", None
+        # Cannot identify the queue row. Refuse to consider the artifact
+        # eligible — better a long-tail orphan than an active bypass.
+        if not request_present:
+            return False, "missing_task_id:no_request", None
+        if not request_parseable:
+            return False, "missing_task_id:unparseable_request", None
+        return False, "missing_task_id:no_dispatch_task_id", None
 
     if tasks_db_path is None:
         tasks_db_path = Path(target_root) / "state" / "tasks.db"
     tasks_db_path = Path(tasks_db_path)
     if not tasks_db_path.is_file():
-        return True, "no_tasks_db", dispatch_task_id
+        # No queue DB on disk — be conservative.
+        return False, "no_tasks_db", dispatch_task_id
 
-    try:
-        with sqlite3.connect(tasks_db_path) as conn:
-            row = conn.execute(
-                "SELECT status FROM tasks WHERE id = ?", (dispatch_task_id,)
-            ).fetchone()
-    except sqlite3.Error:
-        return False, "queue_query_error", dispatch_task_id
-    if row is None:
-        return True, "row_missing", dispatch_task_id
-    status = row[0]
+    status = _lookup_queue_status_via_cli(
+        dispatch_task_id, tasks_db_path=tasks_db_path
+    )
+    if status is None:
+        # CLI read failed (timeout, parse error, row missing). Conservative
+        # on missing context: NOT terminal.
+        return False, "queue_lookup_failed", dispatch_task_id
     return status in _QUEUE_TERMINAL_STATUSES, status, dispatch_task_id
 
 
