@@ -688,10 +688,24 @@ for key, value in expected.items():
 # normalization step for round-tripped reads, which is byte-equivalent).
 PY
 
+  # Codex PR #536 r2 review finding #3 (r3): the JSON-field semantic
+  # checks above prove shape compat, but the original brief asked for
+  # byte-identical determinism across an idempotent re-run. Capture
+  # sha256 of jobs.json now (post-first-prune), re-run the same legacy
+  # `--mode expired-one-shot` path, then capture sha256 again. Stable
+  # output bytes prove the prune writer is fully deterministic when
+  # there is nothing left to remove.
+  local expected_sha actual_sha
+  expected_sha="$(python3 -c 'import sys, hashlib; sys.stdout.write(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$jobs_file")"
+
   # Run prune again — should be idempotent (nothing left to prune).
   out="$(run_py cleanup-prune --jobs-file "$jobs_file" \
     --mode expired-one-shot --json)"
   smoke_assert_contains "$out" '"status": "nothing_to_prune"' "one-shot byte-compat: idempotent re-run"
+
+  actual_sha="$(python3 -c 'import sys, hashlib; sys.stdout.write(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$jobs_file")"
+  smoke_assert_eq "$expected_sha" "$actual_sha" \
+    "one-shot prune output sha256 stable across idempotent reruns"
 
   # And `--mode run-artifacts` does NOT touch jobs.json — assert by hash.
   local sha_before sha_after
