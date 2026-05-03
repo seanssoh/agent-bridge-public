@@ -286,3 +286,8 @@ bridge_source_module "bridge-discord.sh"
 bridge_source_module "bridge-notify.sh"
 bridge_source_module "bridge-migration.sh"
 bridge_source_module "bridge-wave.sh"
+# bridge-agent-update.sh is the typed/audited mutation surface for the
+# protected agent-roster.local.sh managed-role fields (issue #528).
+# Sourced last because it consumes helpers from bridge-agents.sh and
+# bridge-core.sh (`bridge_admin_agent_id`, `bridge_require_python`).
+bridge_source_module "bridge-agent-update.sh"

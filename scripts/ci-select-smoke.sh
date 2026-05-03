@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update
 }
 
 add_all_integration() {
@@ -192,10 +192,18 @@ select_for_path() {
       add_live live-tmux-daemon
       ;;
 
-    bridge-start.sh|bridge-run.sh|bridge-send.sh|bridge-action.sh|bridge-agent.sh|agent-bridge|agb|lib/bridge-tmux.sh|lib/bridge-session-patterns.sh|lib/bridge-wave.sh)
-      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation
+    bridge-start.sh|bridge-run.sh|bridge-send.sh|bridge-action.sh|bridge-agent.sh|agent-bridge|agb|lib/bridge-tmux.sh|lib/bridge-session-patterns.sh|lib/bridge-wave.sh|lib/bridge-agent-update.sh)
+      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update
       add_integration integration-minimal
       add_live live-tmux-daemon
+      ;;
+
+    hooks/tool-policy.py|bridge-config.py|lib/system_config_paths.py)
+      # Issue #528: tool-policy / wrapper / protected-glob changes can
+      # alter the trust-model envelope the typed agent-update path
+      # mirrors. Run agent-update to catch drift in the contract.
+      add_required hooks agent-update
+      add_integration integration-minimal
       ;;
 
     lib/bridge-isolation*.sh|lib/bridge-migration.sh|bridge-migrate.sh|tests/isolation*)
