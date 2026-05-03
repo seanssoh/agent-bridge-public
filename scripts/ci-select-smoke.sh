@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip
+  add_required queue daemon launch tmux-injection isolation channel-plugins hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup
 }
 
 add_all_integration() {
@@ -230,7 +230,12 @@ select_for_path() {
       ;;
 
     bridge-upgrade.sh|bridge-upgrade.py|scripts/export-public-snapshot.sh|VERSION)
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair telegram-relay-residue-cleanup
+      add_integration integration-minimal
+      ;;
+
+    bridge-relay-cleanup.py)
+      add_required upgrade upgrade-shared-settings-propagate telegram-relay-residue-cleanup
       add_integration integration-minimal
       ;;
 
