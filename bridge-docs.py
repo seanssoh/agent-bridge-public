@@ -1398,12 +1398,17 @@ def sync_agent_docs(agent_dir: Path, bridge_home: Path, dry_run: bool, stamp: st
     else:
         if skills_path.exists() or skills_path.is_symlink():
             backup_file(skills_path, backup_root, dry_run)
-            if not dry_run:
-                try:
-                    skills_path.unlink()
-                except OSError:
-                    pass
-            changed.append(f"removed:{skills_path}")
+            if dry_run:
+                changed.append(f"removed:{skills_path}")
+            else:
+                # Codex r1 on PR #514: don't swallow unlink errors and
+                # then claim the file was removed — the upgrade output
+                # would lie. Let OSError propagate; the surrounding
+                # apply path already treats unlink failures during
+                # cleanup as fatal (matches DEPRECATED_SHARED_FILES
+                # handling earlier in sync_shared_docs).
+                skills_path.unlink()
+                changed.append(f"removed:{skills_path}")
 
     for name in AGENT_RUNTIME_REWRITE_FILES:
         path = agent_dir / name
