@@ -413,9 +413,18 @@ def _read_canonical_file(home: Path, name: str, cap: int) -> str:
     except OSError:
         return ""
     text = text.strip("\n")
-    if len(text) > cap:
-        text = text[:cap].rstrip() + "\n[…truncated by compact-recovery cap…]"
-    return text
+    encoded = text.encode("utf-8")
+    if len(encoded) <= cap:
+        return text
+    # Cap is named/documented as a UTF-8 BYTE cap, so truncate on a byte
+    # window. `errors="ignore"` drops a partial trailing byte sequence so
+    # we never emit a half-character; the suffix marker tells the reader
+    # the section was clipped. This matters for non-ASCII (Korean,
+    # Japanese, etc.) where 1 character = 2–4 bytes — a character-count
+    # cap would let the payload silently grow several times past the
+    # documented budget. (Codex r1 / PR #510.)
+    truncated = encoded[:cap].decode("utf-8", errors="ignore").rstrip()
+    return truncated + "\n[…truncated by compact-recovery cap…]"
 
 
 def gather_canonical_files(agent: str) -> dict[str, str]:

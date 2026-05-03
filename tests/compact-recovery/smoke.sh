@@ -216,6 +216,46 @@ else
   fail 6 "session_start rc=$rc"
 fi
 
+# ---------- case 7: BRIDGE_COMPACT_RECOVERY_MAX_BYTES is a UTF-8 byte cap ----------
+banner 7 "MAX_BYTES enforced as UTF-8 bytes, not Python char count (codex r1)"
+C7_HOME="$SMOKE_ROOT/c7"
+make_bridge_home "$C7_HOME" "tester"
+# Korean text: each char is 3 bytes in UTF-8. 300 chars = 900 bytes, well
+# above a 256-byte cap. The pre-fix code (len(text) <= cap on chars) would
+# emit the full 900 bytes; the fix must keep the raw section under cap.
+"$PYTHON" -c "
+from pathlib import Path
+Path('$C7_HOME/agents/tester/SOUL.md').write_text('안녕' * 150, encoding='utf-8')
+"
+C7_OUT="$SMOKE_ROOT/c7.out"
+if env -u BRIDGE_AGENT_WORKDIR -u BRIDGE_AGENT_HOME -u BRIDGE_AGENT_HOME_ROOT \
+    -u BRIDGE_STATE_DIR -u BRIDGE_ACTIVE_AGENT_DIR \
+    BRIDGE_HOME="$C7_HOME" BRIDGE_AGENT_ID="tester" \
+    BRIDGE_COMPACT_RECOVERY_MAX_BYTES=256 \
+    "$PYTHON" "$C7_HOME/hooks/session_start.py" --matcher compact >"$C7_OUT" 2>&1; then
+  # Extract bytes between '### SOUL.md\n' and the truncation marker.
+  RAW_BYTES=$("$PYTHON" - "$C7_OUT" <<'PY'
+import sys, pathlib, re
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+m = re.search(r"### SOUL\.md\n(.*?)\n\[…truncated by compact-recovery cap…\]", text, re.S)
+if not m:
+    print("NO_TRUNC_MARKER")
+    sys.exit(0)
+print(len(m.group(1).encode("utf-8")))
+PY
+)
+  if [[ "$RAW_BYTES" == "NO_TRUNC_MARKER" ]]; then
+    fail 7 "expected '[…truncated by compact-recovery cap…]' marker — pre-fix bug would skip truncation entirely. output:\n$(cat "$C7_OUT")"
+  elif (( RAW_BYTES > 256 )); then
+    fail 7 "raw SOUL section bytes=$RAW_BYTES exceed cap=256 (regression — char vs byte cap)"
+  else
+    pass 7
+  fi
+else
+  rc=$?
+  fail 7 "session_start rc=$rc; output:\n$(cat "$C7_OUT")"
+fi
+
 # ---------- summary ----------
 printf '\n=== summary: %d PASS, %d FAIL ===\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
