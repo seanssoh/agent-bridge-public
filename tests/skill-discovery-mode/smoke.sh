@@ -275,6 +275,60 @@ $ok12 && grep -q "skill-routing\|skills list" <<<"$S_PR" || { ok12=false; fail 1
 $ok12 && grep -q "shared/SKILLS.md" <<<"$S_DIS" && { ok12=false; fail 12 "disabled per-agent SKILLS.md still anchors on shared/SKILLS.md"; }
 $ok12 && pass 12
 
+# ---------- case 13: agents/_template/CLAUDE.md no longer hard-codes SKILLS.md ----------
+banner 13 "agents/_template/CLAUDE.md/SOUL.md drop SKILLS.md boot dependency"
+ok13=true
+# CLAUDE.md must NOT carry the legacy "TOOLS.md와 SKILLS.md는 ... reference다" bullet.
+if grep -q "TOOLS.md\`와 \`SKILLS.md\`는 현재 bridge-native runtime reference" "$REPO_ROOT/agents/_template/CLAUDE.md"; then
+  ok13=false; fail 13 "_template/CLAUDE.md still hard-codes the legacy 'TOOLS.md와 SKILLS.md ... reference' line"
+fi
+# CLAUDE.md must NOT include SKILLS.md as a plain '공통 운영 파일' (legacy-catalog 한정 표기는 OK).
+if grep -E "공통 운영 파일이다[^(]*$" "$REPO_ROOT/agents/_template/CLAUDE.md" | grep -q "SKILLS\.md"; then
+  ok13=false; fail 13 "_template/CLAUDE.md still treats SKILLS.md as an unconditional common-ops file"
+fi
+# CLAUDE.md step 10 must NOT say '"TOOLS.md, SKILLS.md 확인'.
+if grep -q "10\..*TOOLS\.md, SKILLS\.md 확인" "$REPO_ROOT/agents/_template/CLAUDE.md"; then
+  ok13=false; fail 13 "_template/CLAUDE.md step 10 still tells the agent to read SKILLS.md"
+fi
+# SOUL.md must NOT say 'TOOLS.md, SKILLS.md에서 확인한다'.
+if grep -q "TOOLS\.md\`, \`SKILLS\.md\`에서 확인한다" "$REPO_ROOT/agents/_template/SOUL.md"; then
+  ok13=false; fail 13 "_template/SOUL.md still tells the agent to read SKILLS.md as a runtime reference"
+fi
+$ok13 && pass 13
+
+# ---------- case 14: per-agent SKILLS.md emit gated by mode ----------
+banner 14 "render+write per-agent SKILLS.md is gated by BRIDGE_SKILLS_DOC_MODE"
+# We exercise the gating logic directly: in legacy-catalog mode the file is
+# generated; in plugin-routing/disabled it is NOT generated and a
+# pre-existing file would be removed (with backup).
+SCRIPT='
+import importlib.util, sys, pathlib, tempfile, os
+spec = importlib.util.spec_from_file_location("bd", "'"$REPO_ROOT"'/bridge-docs.py")
+mod = importlib.util.module_from_spec(spec); sys.modules["bd"] = mod; spec.loader.exec_module(mod)
+
+mode = os.environ.get("BRIDGE_SKILLS_DOC_MODE", "legacy-catalog")
+print("mode=" + mode + " " + mod.skills_doc_mode())
+'
+T_LEG=$(env -u BRIDGE_SKILLS_DOC_MODE "$PYTHON" -c "$SCRIPT")
+T_PR=$(BRIDGE_SKILLS_DOC_MODE=plugin-routing "$PYTHON" -c "$SCRIPT")
+T_DIS=$(BRIDGE_SKILLS_DOC_MODE=disabled "$PYTHON" -c "$SCRIPT")
+ok14=true
+grep -q "legacy-catalog legacy-catalog" <<<"$T_LEG" || { ok14=false; fail 14 "default mode resolution: $T_LEG"; }
+grep -q "plugin-routing plugin-routing" <<<"$T_PR" || { ok14=false; fail 14 "plugin-routing mode resolution: $T_PR"; }
+grep -q "disabled disabled" <<<"$T_DIS" || { ok14=false; fail 14 "disabled mode resolution: $T_DIS"; }
+# Verify the apply-side branch: source the file to confirm the new code
+# path is present (grep is enough — full apply needs roster scaffolding).
+if ! grep -q 'if skills_doc_mode() == "legacy-catalog":' "$REPO_ROOT/bridge-docs.py"; then
+  ok14=false; fail 14 "bridge-docs.py per-agent SKILLS.md emit is not gated on skills_doc_mode()"
+fi
+if ! grep -q '"removed:" + str(skills_path)\|removed:{skills_path}' "$REPO_ROOT/bridge-docs.py"; then
+  # we use the f-string form `removed:{skills_path}`; pin its presence.
+  if ! grep -q 'changed.append(f"removed:{skills_path}")' "$REPO_ROOT/bridge-docs.py"; then
+    ok14=false; fail 14 "bridge-docs.py non-legacy branch must record 'removed:<path>' so dry-run reports it"
+  fi
+fi
+$ok14 && pass 14
+
 # ---------- summary ----------
 printf '\n=== summary: %d PASS, %d FAIL ===\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

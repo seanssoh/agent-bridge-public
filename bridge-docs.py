@@ -1382,14 +1382,28 @@ def sync_agent_docs(agent_dir: Path, bridge_home: Path, dry_run: bool, stamp: st
     if normalize_claude(agent_dir, dry_run, backup_root):
         changed.append(str(agent_dir / "CLAUDE.md"))
 
+    # Per-agent SKILLS.md is only emitted in legacy-catalog mode. In
+    # plugin-routing/disabled, the per-agent file is removed (with backup)
+    # so the boot ritual no longer points at a stale doc that contradicts
+    # shared/skill-routing.md or `agb skills list`.
     skills_path = agent_dir / "SKILLS.md"
-    skills_text = render_agent_skills_md(agent_dir, registry)
-    old_skills = read_text(skills_path) if skills_path.exists() else None
-    if old_skills != skills_text:
-        if skills_path.exists():
+    if skills_doc_mode() == "legacy-catalog":
+        skills_text = render_agent_skills_md(agent_dir, registry)
+        old_skills = read_text(skills_path) if skills_path.exists() else None
+        if old_skills != skills_text:
+            if skills_path.exists():
+                backup_file(skills_path, backup_root, dry_run)
+            write_text(skills_path, skills_text, dry_run)
+            changed.append(str(skills_path))
+    else:
+        if skills_path.exists() or skills_path.is_symlink():
             backup_file(skills_path, backup_root, dry_run)
-        write_text(skills_path, skills_text, dry_run)
-        changed.append(str(skills_path))
+            if not dry_run:
+                try:
+                    skills_path.unlink()
+                except OSError:
+                    pass
+            changed.append(f"removed:{skills_path}")
 
     for name in AGENT_RUNTIME_REWRITE_FILES:
         path = agent_dir / name

@@ -11,7 +11,7 @@
 - `~/.agent-bridge/shared/wiki/`가 있으면 팀 전체가 공유하는 knowledge SSOT다. `index.md`와 관련 페이지만 읽고, 필요하면 `agent-bridge knowledge search`로 찾는다.
 - `COMMON-INSTRUCTIONS.md`는 전 에이전트 공통 규칙 SSOT다.
 - `CHANGE-POLICY.md`는 기술 변경의 upstream/downstream 분류 계약이다.
-- `TOOLS.md`와 `SKILLS.md`는 현재 bridge-native runtime reference다.
+- `TOOLS.md`는 bridge-native runtime reference다. 스킬은 시스템 리마인더의 available-skills 블록과 `~/.agent-bridge/agent-bridge skills list`(per-agent installed plugin)로 확인한다.
 
 ## Runtime Protocol Pointers
 - 공통 운영 본문은 [`COMMON-INSTRUCTIONS.md`](../../docs/agent-runtime/common-instructions.md)에 있다. queue, task 처리, autonomy, upstream issue policy, channel setup의 source of truth다.
@@ -49,7 +49,7 @@
 너는 **<Agent Name>**야. <한 줄 역할 설명>.
 
 ## Common vs Core vs Custom
-- `SOUL.md`, `SESSION-TYPE.md`, `MEMORY-SCHEMA.md`, `MEMORY.md`, `COMMON-INSTRUCTIONS.md`, `CHANGE-POLICY.md`, `TOOLS.md`, `SKILLS.md`는 공통 운영 파일이다.
+- `SOUL.md`, `SESSION-TYPE.md`, `MEMORY-SCHEMA.md`, `MEMORY.md`, `COMMON-INSTRUCTIONS.md`, `CHANGE-POLICY.md`, `TOOLS.md`는 공통 운영 파일이다. (`SKILLS.md`는 `BRIDGE_SKILLS_DOC_MODE=legacy-catalog`인 install에서만 emit된다.)
 - 위의 `<!-- BEGIN/END AGENT BRIDGE DOC MIGRATION -->` 블록은 Agent Bridge 코어 동작 정의다. 업그레이드 시 갱신될 수 있다.
 - 이 아래부터는 에이전트 고유의 커스텀 계약 영역이다. 역할, 말투, 도메인 지식, 승인 규칙은 여기서 관리한다.
 
@@ -70,7 +70,7 @@
 7. 현재 대화 상대의 `users/<user-id>/USER.md`와 최근 메모가 있으면 먼저 확인
 8. `MEMORY.md`와 `memory/` 확인
 9. `COMMON-INSTRUCTIONS.md`, `CHANGE-POLICY.md` 확인
-10. `TOOLS.md`, `SKILLS.md` 확인
+10. `TOOLS.md` 확인 (스킬은 시스템 리마인더의 available-skills 블록과 `agb skills list`로 본다)
 11. 필요하면 `HEARTBEAT.md`와 로컬 `references/` 확인
 
 ## First Session Onboarding
