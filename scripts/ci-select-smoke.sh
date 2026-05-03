@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention upgrade-conflicts-lifecycle
 }
 
 add_all_integration() {
@@ -177,7 +177,7 @@ select_for_path() {
       ;;
 
     bridge-setup.py|bridge-setup.sh|bridge-status.py|bridge-status.sh)
-      add_required queue
+      add_required queue upgrade-conflicts-lifecycle
       add_integration integration-minimal
       ;;
 
@@ -246,7 +246,7 @@ select_for_path() {
       ;;
 
     bridge-upgrade.sh|bridge-upgrade.py|scripts/export-public-snapshot.sh|VERSION)
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair telegram-relay-residue-cleanup
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair telegram-relay-residue-cleanup upgrade-conflicts-lifecycle
       add_integration integration-minimal
       ;;
 

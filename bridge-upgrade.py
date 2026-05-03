@@ -15,6 +15,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tarfile
 import uuid
 from dataclasses import asdict, dataclass
@@ -1442,7 +1443,14 @@ def merge_text_versions(base: bytes, live: bytes, upstream: bytes) -> tuple[str,
         raise RuntimeError(proc.stderr.decode("utf-8", errors="replace").strip() or "git merge-file failed")
 
 
-def apply_live(source_root: Path, target_root: Path, base_ref: str, dry_run: bool, strict_merge: bool) -> dict[str, Any]:
+def apply_live(
+    source_root: Path,
+    target_root: Path,
+    base_ref: str,
+    dry_run: bool,
+    strict_merge: bool,
+    run_id: str = "",
+) -> dict[str, Any]:
     analysis = analyze_live(source_root, target_root, base_ref)
     actions: list[dict[str, Any]] = []
     counts = {
@@ -1455,6 +1463,13 @@ def apply_live(source_root: Path, target_root: Path, base_ref: str, dry_run: boo
     }
     conflicts: list[str] = []
     conflict_backups: list[str] = []
+    # Issue #394: capture per-conflict metadata at write-time so the
+    # next upgrade can auto-archive entries whose live target hash has
+    # not changed since (operator already adopted/rejected, or hadn't
+    # touched). `live_sha256_at_write` is `live`'s sha256 immediately
+    # before the conflict file lands; "" when the live file did not
+    # exist (treated as "any subsequent presence != at-write").
+    conflict_records: list[dict[str, Any]] = []
 
     for item in analysis["files"]:
         relpath = str(item["path"])
@@ -1505,6 +1520,14 @@ def apply_live(source_root: Path, target_root: Path, base_ref: str, dry_run: boo
             conflicts.append(relpath)
             backup_path = conflict_backup_path(live_path)
             conflict_backups.append(str(backup_path))
+            conflict_records.append(
+                {
+                    "path": str(backup_path),
+                    "live_target": str(live_path),
+                    "live_target_relpath": relpath,
+                    "live_sha256_at_write": sha256_bytes(live),
+                }
+            )
             actions.append(
                 {
                     "path": relpath,
@@ -1520,6 +1543,14 @@ def apply_live(source_root: Path, target_root: Path, base_ref: str, dry_run: boo
         conflicts.append(relpath)
         backup_path = conflict_backup_path(live_path)
         conflict_backups.append(str(backup_path))
+        conflict_records.append(
+            {
+                "path": str(backup_path),
+                "live_target": str(live_path),
+                "live_target_relpath": relpath,
+                "live_sha256_at_write": sha256_bytes(live),
+            }
+        )
         actions.append(
             {
                 "path": relpath,
@@ -1587,7 +1618,152 @@ def apply_live(source_root: Path, target_root: Path, base_ref: str, dry_run: boo
         write_bytes(live_path, action["bytes"], target_mode)
 
     payload["applied"] = True
+
+    # Issue #394: emit the structured conflict record for this run so
+    # `agb upgrade conflicts list` and the next-run reconcile can find
+    # it. Stat each conflict file *after* it has been written so size
+    # and mtime are accurate; the at-write live-target hash captured
+    # above is the reconcile anchor.
+    if conflict_records and not dry_run:
+        record_run_id = run_id or _generate_run_id()
+        record_dir = target_root / "state" / "upgrade-conflicts"
+        record_dir.mkdir(parents=True, exist_ok=True)
+        rendered = []
+        for entry in conflict_records:
+            cp = Path(entry["path"])
+            try:
+                st = cp.stat()
+                size = st.st_size
+                mtime_iso = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).astimezone().isoformat(
+                    timespec="seconds"
+                )
+            except OSError:
+                size = 0
+                mtime_iso = ""
+            rendered.append(
+                {
+                    "path": entry["path"],
+                    "live_target": entry["live_target"],
+                    "live_target_relpath": entry["live_target_relpath"],
+                    "size": size,
+                    "mtime": mtime_iso,
+                    "live_target_sha256_at_write": entry["live_sha256_at_write"],
+                }
+            )
+        save_json(
+            record_dir / f"{record_run_id}.json",
+            {
+                "run_id": record_run_id,
+                "timestamp": now_iso(),
+                "target_root": str(target_root),
+                "conflict_files": rendered,
+            },
+        )
+        payload["run_id"] = record_run_id
+        payload["conflict_record_path"] = str(record_dir / f"{record_run_id}.json")
+
     return payload
+
+
+def _generate_run_id() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ-") + uuid.uuid4().hex[:8]
+
+
+def file_sha256(path: Path) -> str:
+    try:
+        with path.open("rb") as handle:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+            return digest.hexdigest()
+    except OSError:
+        return ""
+
+
+def list_conflict_records(target_root: Path) -> list[Path]:
+    record_dir = target_root / "state" / "upgrade-conflicts"
+    if not record_dir.is_dir():
+        return []
+    return sorted(p for p in record_dir.glob("*.json") if p.is_file() and not p.name.startswith("auto-archive-"))
+
+
+def list_conflict_files(target_root: Path) -> list[Path]:
+    if not target_root.is_dir():
+        return []
+    out: list[Path] = []
+    for path in target_root.rglob("*.upgrade-conflict"):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(target_root).as_posix()
+        if rel.startswith("backups/"):
+            continue
+        out.append(path)
+    return sorted(out, key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+
+
+def lookup_conflict_record(target_root: Path, conflict_path: Path) -> dict[str, Any] | None:
+    """Return the most recent upgrade-conflicts/<run-id>.json entry that
+    references `conflict_path` (matched by absolute path), or None.
+
+    The "most recent" rule is needed because the same live file can
+    accumulate multiple conflict-write events across upgrades; we want
+    the one whose `live_target_sha256_at_write` matches the *current*
+    pre-reconcile state, not an older fragment.
+    """
+    target = str(conflict_path)
+    matches: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+    for record_path in list_conflict_records(target_root):
+        try:
+            payload = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        for entry in payload.get("conflict_files") or []:
+            if entry.get("path") == target:
+                ts = record_path.stat().st_mtime if record_path.exists() else 0.0
+                matches.append((ts, payload, entry))
+                break
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item[0], reverse=True)
+    _, _payload, entry = matches[0]
+    return entry
+
+
+def archive_conflict_file(target_root: Path, conflict_path: Path) -> Path:
+    """Move `conflict_path` under `<target_root>/backups/upgrade-conflict-archive/<YYYY-MM-DD>/<original-relpath>`
+    and return the destination path. Caller is responsible for adding
+    an audit row.
+    """
+    rel = conflict_path.relative_to(target_root) if conflict_path.is_absolute() else conflict_path
+    archive_root = target_root / "backups" / "upgrade-conflict-archive" / date.today().isoformat()
+    dest = archive_root / rel
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        # Tie-break by appending a millisecond timestamp; archives must be
+        # additive, never destroy a prior archive on a same-day rerun.
+        suffix = datetime.now(timezone.utc).strftime("%H%M%S%f")
+        dest = dest.with_name(f"{dest.name}.{suffix}")
+    shutil.move(str(conflict_path), str(dest))
+    return dest
+
+
+def write_conflict_audit(target_root: Path, action: str, detail: dict[str, Any]) -> None:
+    """Append one JSONL row to `<target_root>/logs/upgrade-conflicts.log`
+    so list/diff/adopt/discard/archive/reconcile leave an inspectable
+    trail. Best-effort; failures are silent (do not break the action).
+    """
+    log_path = target_root / "logs" / "upgrade-conflicts.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": now_iso(),
+            "action": action,
+            "detail": detail,
+        }
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def cmd_analyze_live(args: argparse.Namespace) -> int:
@@ -2127,7 +2303,14 @@ def cmd_apply_live(args: argparse.Namespace) -> int:
     source_root = Path(args.source_root).expanduser()
     target_root = Path(args.target_root).expanduser()
     base_ref = resolve_base_ref(target_root, args.base_ref or "")
-    payload = apply_live(source_root, target_root, base_ref, bool(args.dry_run), bool(args.strict_merge))
+    payload = apply_live(
+        source_root,
+        target_root,
+        base_ref,
+        bool(args.dry_run),
+        bool(args.strict_merge),
+        run_id=str(getattr(args, "run_id", "") or ""),
+    )
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 2 if payload.get("aborted") else 0
 
@@ -2168,6 +2351,270 @@ def cmd_rollback_live(args: argparse.Namespace) -> int:
     if not args.dry_run:
         payload["removed_entries"] = restore_live_backup(target_root, backup_root)
         payload["restored"] = True
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _resolve_conflict_path(target_root: Path, raw: str) -> Path:
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = (target_root / candidate).resolve()
+    else:
+        candidate = candidate.resolve(strict=False)
+    return candidate
+
+
+def _confirm_or_abort(prompt: str, yes: bool) -> bool:
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        print(
+            f"refusing without confirmation: pass --yes to proceed ({prompt})",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        answer = input(f"{prompt} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in {"y", "yes"}
+
+
+def cmd_conflicts_list(args: argparse.Namespace) -> int:
+    target_root = Path(args.target_root).expanduser().resolve()
+    files = list_conflict_files(target_root)
+    rows: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
+    for path in files:
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+        record_entry = lookup_conflict_record(target_root, path)
+        live_target = ""
+        at_write = ""
+        hash_changed: bool | None = None
+        if record_entry is not None:
+            live_target = str(record_entry.get("live_target") or "")
+            at_write = str(record_entry.get("live_target_sha256_at_write") or "")
+            if live_target:
+                current = file_sha256(Path(live_target)) if Path(live_target).exists() else ""
+                if at_write:
+                    hash_changed = current != at_write
+        rows.append(
+            {
+                "path": str(path),
+                "live_target": live_target,
+                "size": st.st_size,
+                "mtime": mtime.astimezone().isoformat(timespec="seconds"),
+                "age_seconds": int(max(0, (now - mtime).total_seconds())),
+                "live_target_sha256_at_write": at_write,
+                "live_target_hash_changed_since_write": hash_changed,
+            }
+        )
+    rows.sort(key=lambda row: row["mtime"], reverse=True)
+    if args.json:
+        print(json.dumps({"conflicts": rows, "count": len(rows)}, ensure_ascii=False, indent=2))
+        return 0
+    if not rows:
+        print("(no pending .upgrade-conflict files)")
+        return 0
+    print("path\tsize\tmtime\tage\thash-changed")
+    for row in rows:
+        age = row["age_seconds"]
+        if age < 3600:
+            age_str = f"{age // 60}m"
+        elif age < 86400:
+            age_str = f"{age // 3600}h"
+        else:
+            age_str = f"{age // 86400}d"
+        hash_state = (
+            "changed"
+            if row["live_target_hash_changed_since_write"] is True
+            else (
+                "unchanged"
+                if row["live_target_hash_changed_since_write"] is False
+                else "unknown"
+            )
+        )
+        print(f"{row['path']}\t{row['size']}\t{row['mtime']}\t{age_str}\t{hash_state}")
+    print(f"total: {len(rows)} conflict file(s)")
+    return 0
+
+
+def cmd_conflicts_diff(args: argparse.Namespace) -> int:
+    target_root = Path(args.target_root).expanduser().resolve()
+    conflict = _resolve_conflict_path(target_root, args.path)
+    if not conflict.is_file():
+        print(f"not a conflict file: {conflict}", file=sys.stderr)
+        return 1
+    if not conflict.name.endswith(".upgrade-conflict"):
+        print(f"not a *.upgrade-conflict path: {conflict}", file=sys.stderr)
+        return 1
+    live = conflict.with_name(conflict.name[: -len(".upgrade-conflict")])
+    if not live.exists():
+        print(f"live target missing: {live}", file=sys.stderr)
+        return 1
+    proc = subprocess.run(
+        ["diff", "-u", "--", str(live), str(conflict)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    sys.stdout.buffer.write(proc.stdout)
+    if proc.stderr:
+        sys.stderr.buffer.write(proc.stderr)
+    return 0 if proc.returncode in {0, 1} else proc.returncode
+
+
+def cmd_conflicts_adopt(args: argparse.Namespace) -> int:
+    target_root = Path(args.target_root).expanduser().resolve()
+    conflict = _resolve_conflict_path(target_root, args.path)
+    if not conflict.is_file() or not conflict.name.endswith(".upgrade-conflict"):
+        print(f"not a *.upgrade-conflict path: {conflict}", file=sys.stderr)
+        return 1
+    live = conflict.with_name(conflict.name[: -len(".upgrade-conflict")])
+    if not _confirm_or_abort(f"adopt {conflict} → {live}?", bool(args.yes)):
+        return 1
+    shutil.copyfile(conflict, live)
+    conflict.unlink()
+    write_conflict_audit(
+        target_root,
+        "conflict_adopt",
+        {"conflict": str(conflict), "live_target": str(live)},
+    )
+    print(json.dumps({"action": "adopt", "conflict": str(conflict), "live_target": str(live)}))
+    return 0
+
+
+def cmd_conflicts_discard(args: argparse.Namespace) -> int:
+    target_root = Path(args.target_root).expanduser().resolve()
+    conflict = _resolve_conflict_path(target_root, args.path)
+    if not conflict.is_file() or not conflict.name.endswith(".upgrade-conflict"):
+        print(f"not a *.upgrade-conflict path: {conflict}", file=sys.stderr)
+        return 1
+    if not _confirm_or_abort(f"discard {conflict} (live unchanged)?", bool(args.yes)):
+        return 1
+    conflict.unlink()
+    write_conflict_audit(
+        target_root,
+        "conflict_discard",
+        {"conflict": str(conflict)},
+    )
+    print(json.dumps({"action": "discard", "conflict": str(conflict)}))
+    return 0
+
+
+def cmd_conflicts_archive(args: argparse.Namespace) -> int:
+    target_root = Path(args.target_root).expanduser().resolve()
+    conflict = _resolve_conflict_path(target_root, args.path)
+    if not conflict.is_file() or not conflict.name.endswith(".upgrade-conflict"):
+        print(f"not a *.upgrade-conflict path: {conflict}", file=sys.stderr)
+        return 1
+    if not _confirm_or_abort(f"archive {conflict} (live unchanged)?", bool(args.yes)):
+        return 1
+    dest = archive_conflict_file(target_root, conflict)
+    write_conflict_audit(
+        target_root,
+        "conflict_archive",
+        {"conflict": str(conflict), "archived_to": str(dest), "reason": "manual"},
+    )
+    print(json.dumps({"action": "archive", "conflict": str(conflict), "archived_to": str(dest)}))
+    return 0
+
+
+def cmd_conflicts_reconcile(args: argparse.Namespace) -> int:
+    """Auto-archive conflict files whose live target hash has not changed
+    since the conflict was written.
+
+    Operator semantics: an unchanged hash means the operator either
+    explicitly kept the live version (their pre-write content survived
+    the upgrade) or never touched it AND the conflict has not been
+    re-deposited by a fresh merge in the meantime — either way the
+    conflict file is no longer informative. A changed hash means the
+    operator may be mid-reconcile (adopt-in-progress, partial edit), so
+    we leave it alone.
+
+    Only `--auto-archive` actually mutates state. Without the flag this
+    is a read-only report (suitable for `agb status` integration).
+    """
+    target_root = Path(args.target_root).expanduser().resolve()
+    files = list_conflict_files(target_root)
+    actions: list[dict[str, Any]] = []
+    for conflict in files:
+        record_entry = lookup_conflict_record(target_root, conflict)
+        if record_entry is None:
+            actions.append(
+                {
+                    "conflict": str(conflict),
+                    "decision": "skip",
+                    "reason": "no structured record found",
+                }
+            )
+            continue
+        live_target = Path(str(record_entry.get("live_target") or ""))
+        at_write = str(record_entry.get("live_target_sha256_at_write") or "")
+        if not at_write:
+            actions.append(
+                {
+                    "conflict": str(conflict),
+                    "decision": "skip",
+                    "reason": "missing at-write hash",
+                }
+            )
+            continue
+        current = file_sha256(live_target) if live_target.exists() else ""
+        if current == at_write:
+            decision = "auto-archive"
+            reason = "live hash unchanged since conflict write"
+        else:
+            decision = "skip"
+            reason = "live hash changed since conflict write"
+        action = {
+            "conflict": str(conflict),
+            "live_target": str(live_target),
+            "live_target_sha256_at_write": at_write,
+            "live_target_sha256_now": current,
+            "decision": decision,
+            "reason": reason,
+        }
+        if decision == "auto-archive" and bool(args.auto_archive):
+            try:
+                dest = archive_conflict_file(target_root, conflict)
+                action["archived_to"] = str(dest)
+                write_conflict_audit(
+                    target_root,
+                    "conflict_auto_archive",
+                    {
+                        "conflict": str(conflict),
+                        "archived_to": str(dest),
+                        "live_target": str(live_target),
+                        "reason": reason,
+                    },
+                )
+            except OSError as exc:
+                action["decision"] = "skip"
+                action["reason"] = f"archive failed: {exc}"
+        actions.append(action)
+    payload = {
+        "mode": "upgrade-conflicts-reconcile",
+        "target_root": str(target_root),
+        "auto_archive": bool(args.auto_archive),
+        "actions": actions,
+        "archived_count": sum(
+            1 for entry in actions if entry.get("decision") == "auto-archive" and "archived_to" in entry
+        ),
+        "skipped_count": sum(1 for entry in actions if entry.get("decision") == "skip"),
+    }
+    if bool(args.auto_archive) and payload["archived_count"]:
+        receipt_path = (
+            target_root
+            / "state"
+            / "upgrade-conflicts"
+            / f"auto-archive-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+        )
+        save_json(receipt_path, payload)
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
@@ -2295,6 +2742,9 @@ def build_parser() -> argparse.ArgumentParser:
     apply_live_parser.add_argument("--base-ref", default="")
     apply_live_parser.add_argument("--dry-run", action="store_true")
     apply_live_parser.add_argument("--strict-merge", action="store_true")
+    # Issue #394: caller-supplied run-id stamps the structured record
+    # at state/upgrade-conflicts/<run-id>.json. Empty → auto-generated.
+    apply_live_parser.add_argument("--run-id", default="")
     apply_live_parser.set_defaults(handler=cmd_apply_live)
 
     analyze = subparsers.add_parser("analyze-live")
@@ -2319,6 +2769,43 @@ def build_parser() -> argparse.ArgumentParser:
     rollback.add_argument("--backup-root", default="")
     rollback.add_argument("--dry-run", action="store_true")
     rollback.set_defaults(handler=cmd_rollback_live)
+
+    # Issue #394: lifecycle subcommands for `*.upgrade-conflict` files.
+    # The Bash dispatcher (`bridge-upgrade.sh conflicts ...`) forwards
+    # diff/adopt/discard/archive/reconcile here; `list` is also wired
+    # in Python so callers (CI, status surface) can stay in one runtime.
+    conflicts_list = subparsers.add_parser("conflicts-list")
+    conflicts_list.add_argument("--target-root", required=True)
+    conflicts_list.add_argument("--json", action="store_true")
+    conflicts_list.set_defaults(handler=cmd_conflicts_list)
+
+    conflicts_diff = subparsers.add_parser("conflicts-diff")
+    conflicts_diff.add_argument("--target-root", required=True)
+    conflicts_diff.add_argument("path")
+    conflicts_diff.set_defaults(handler=cmd_conflicts_diff)
+
+    conflicts_adopt = subparsers.add_parser("conflicts-adopt")
+    conflicts_adopt.add_argument("--target-root", required=True)
+    conflicts_adopt.add_argument("--yes", action="store_true")
+    conflicts_adopt.add_argument("path")
+    conflicts_adopt.set_defaults(handler=cmd_conflicts_adopt)
+
+    conflicts_discard = subparsers.add_parser("conflicts-discard")
+    conflicts_discard.add_argument("--target-root", required=True)
+    conflicts_discard.add_argument("--yes", action="store_true")
+    conflicts_discard.add_argument("path")
+    conflicts_discard.set_defaults(handler=cmd_conflicts_discard)
+
+    conflicts_archive = subparsers.add_parser("conflicts-archive")
+    conflicts_archive.add_argument("--target-root", required=True)
+    conflicts_archive.add_argument("--yes", action="store_true")
+    conflicts_archive.add_argument("path")
+    conflicts_archive.set_defaults(handler=cmd_conflicts_archive)
+
+    conflicts_reconcile = subparsers.add_parser("conflicts-reconcile")
+    conflicts_reconcile.add_argument("--target-root", required=True)
+    conflicts_reconcile.add_argument("--auto-archive", action="store_true")
+    conflicts_reconcile.set_defaults(handler=cmd_conflicts_reconcile)
 
     return parser
 

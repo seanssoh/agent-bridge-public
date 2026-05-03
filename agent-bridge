@@ -46,7 +46,7 @@ Usage:
   $CLI_NAME upgrade [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--pull|--no-pull] [--restart-daemon] [--dry-run] [--json] [--strict-merge]
   $CLI_NAME upgrade analyze [--target <bridge-home>] [--json]
   $CLI_NAME upgrade rollback [--target <bridge-home>] [--backup-root <dir>] [--json]
-  $CLI_NAME upgrade conflicts list [--target <bridge-home>] [--json]
+  $CLI_NAME upgrade conflicts <list|diff|adopt|discard|archive|reconcile> [--target <bridge-home>] [--json|--yes|--auto-archive] [<conflict-path>]
   $CLI_NAME daemon <ensure|status|start|stop|sync|run> ...
   $CLI_NAME escalate question --agent <agent> --question "<text>" [--context "<text>"] [--wait-seconds <seconds>] [--json]
   $CLI_NAME upstream <draft|propose|review> ...
@@ -176,6 +176,8 @@ Examples:
   $CLI_NAME upgrade analyze --json
   $CLI_NAME upgrade rollback --json
   $CLI_NAME upgrade conflicts list --json
+  $CLI_NAME upgrade conflicts reconcile --auto-archive
+  $CLI_NAME upgrade conflicts adopt --yes <conflict-path>
   $CLI_NAME escalate question --agent reviewer --question "Should I ship this now?" --context "Second ask without a user reply."
   $CLI_NAME upstream draft --title "setup fails" --symptom "..." --why "..." --output /tmp/issue.md
   $CLI_NAME upstream propose --title "setup fails" --body-file /tmp/issue.md
