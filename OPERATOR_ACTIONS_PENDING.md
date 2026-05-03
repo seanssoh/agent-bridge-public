@@ -15,6 +15,76 @@ PR, prepend a new section; do not edit older sections in place.
 
 ---
 
+## v0.7.3 — PreCompact hooks now propagated on upgrade (no operator action required)
+
+- applies_when_upgrading_from: any version `<= 0.7.2`.
+- urgency: **none** (informational).
+
+### Background
+
+PR #510 (issue #509 C3+C4) shipped `hooks/pre-compact.py` and `hooks/session_start.py` changes that re-inject canonical agent identity files (SOUL/SESSION-TYPE/COMMON-INSTRUCTIONS/TOOLS/MEMORY) after auto-compaction. The session_start half worked on every existing host immediately (it reads canonical files live).
+
+The pre-compact half — which writes a sidecar `state/agents/<agent>/compact-snapshot.json` as a disaster-recovery fallback — was silently skipped: `bridge_upgrade_propagate_claude_hooks` registered the other five hook events but never `PreCompact`. Hosts that ran `agent-bridge upgrade --apply` without restarting their claude agents had the new code on disk but no `settings.json` wire, so `/compact` did not fire the hook.
+
+`v0.7.3` extends `bridge_upgrade_propagate_claude_hooks` with `bridge_ensure_claude_pre_compact_hook`, mirroring the five existing helpers. Subsequent `upgrade --apply` invocations register the PreCompact handler on every claude agent. Idempotent — already-wired agents remain unchanged.
+
+### Action
+
+**No operator action required.** From this release onward `agent-bridge upgrade --apply` registers the PreCompact handler automatically on every claude agent. The next natural `/compact` writes the sidecar snapshot.
+
+### Skip if
+
+- Always skip — informational. Behavior takes effect on the next `upgrade --apply` invocation.
+
+---
+
+## v0.7.3 — manual PreCompact rollout for hosts upgraded before this fix
+
+- applies_when_upgrading_from: any version `0.7.0 .. 0.7.2`.
+- urgency: **medium** if you operate long-running claude agents that compact frequently; **low** otherwise.
+
+### Background
+
+Hosts that upgraded to `v0.7.0`, `v0.7.1`, or `v0.7.2` while PR #510 was already merged into `main` (or after it was) ran the propagation loop without the PreCompact entry. The pre-compact sidecar snapshot is therefore stale until either (a) the v0.7.3 upgrade runs, or (b) the operator triggers the rollout helper manually.
+
+The rollout helper is `scripts/bulk-register-precompact.sh`, already shipping in v0.7.x. It backs up each agent's `settings.json` to `state/precompact-registration/backups/<stamp>/`, registers PreCompact via the same `bridge-hooks.py ensure-pre-compact-hook` path the upgrader will use from v0.7.3 onward, and writes one ndjson row per agent to `state/precompact-registration/<stamp>.jsonl`. Idempotent — re-running on already-registered agents is a no-op.
+
+### Action
+
+```bash
+bash "$HOME/.agent-bridge/scripts/bulk-register-precompact.sh" --all
+```
+
+`--all` covers every claude-engine agent in the active roster (the script filters out `_template` and `shared`). For a phased rollout, use `--canary` (registers `patch` only) and `--phase2` (registers `newsbot, syrs-calendar, syrs-creative`) before `--all`.
+
+After the script reports `# done. log: <path>`, verify:
+
+```bash
+python3 - <<'PY'
+import json, os
+home = os.path.expanduser("~/.agent-bridge")
+for agent in os.listdir(f"{home}/agents"):
+    settings = f"{home}/agents/{agent}/.claude/settings.json"
+    if not os.path.isfile(settings):
+        continue
+    cfg = json.load(open(settings))
+    has_pc = any(
+        "pre-compact.py" in (h.get("command") or "")
+        for entry in cfg.get("hooks", {}).get("PreCompact", [])
+        for h in entry.get("hooks", [])
+    )
+    print(f"{agent}: {'present' if has_pc else 'MISSING'}")
+PY
+```
+
+### Skip if
+
+- This host has no claude-engine agents.
+- You ran the script in a previous session and the verify block above already prints `present` for every agent.
+- You upgraded directly from `<= 0.6.x` to `>= 0.7.3` (the v0.7.3 upgrade itself ran the propagation loop with the new entry).
+
+---
+
 ## v0.7.2 — daily-backup death-spiral root-cause + auto-cleanup (no operator action required)
 
 - applies_when_upgrading_from: any version `<= 0.7.1`.

@@ -197,6 +197,24 @@ bridge_ensure_claude_tool_policy_hooks() {
   fi
 }
 
+# Same shape as the five helpers above, but for the PreCompact event.
+# Issue #509 / PR #510 added the snapshot-on-pre-compact path; without
+# this entry on the upgrade-propagation loop, existing hosts that
+# `agent-bridge upgrade --apply` (and never re-create or restart their
+# claude agents) would ship the new hooks/pre-compact.py code without ever
+# wiring it into per-agent settings.json. Restored Context still works
+# (session_start reads canonical files live), but the pre-compact sidecar
+# snapshot — the disaster-recovery fallback — never gets written.
+bridge_ensure_claude_pre_compact_hook() {
+  local workdir="$1"
+  if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
+    bridge_hooks_python ensure-pre-compact-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
+    bridge_link_claude_settings_to_shared "$workdir"
+  else
+    bridge_hooks_python ensure-pre-compact-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+  fi
+}
+
 bridge_codex_hooks_status() {
   bridge_hooks_python status-codex-hooks --codex-hooks-file "$(bridge_codex_hooks_file)"
 }
