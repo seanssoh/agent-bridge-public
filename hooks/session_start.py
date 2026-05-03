@@ -26,6 +26,7 @@ from pathlib import Path
 
 from bridge_hook_common import (
     bridge_state_dir,
+    compact_recovery_context,
     remember_session_start,
     session_start_context,
 )
@@ -153,7 +154,17 @@ def main(argv: list[str] | None = None) -> int:
         _forget_session_on_clear(agent)
     context = session_start_context(agent)
     if matcher == "compact" and _compact_note_should_emit(agent):
-        context = context + _compact_note()
+        # #509 P3 (C3): re-inject canonical identity files BEFORE the queue
+        # context so the model reads SOUL/MEMORY/etc before acting on any
+        # post-compact queue prompt. The trailing `_compact_note()` is kept
+        # as a debug marker pointing at the raw capture store.
+        restored = compact_recovery_context(agent)
+        parts: list[str] = []
+        if restored:
+            parts.append(restored)
+        parts.append(context)
+        parts.append(_compact_note().strip())
+        context = "\n\n".join(parts)
 
     if args.format == "codex":
         json.dump(
