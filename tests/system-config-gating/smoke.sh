@@ -350,6 +350,203 @@ else
   fail "scenario 6: roster file was mutated despite deny"
 fi
 
+# --- Scenario 7: tool-policy false positive on .agents/ runtime dir ------
+# Issue #509 D2 follow-up. A heredoc body whose prose contains a generic
+# directory mention like `hooks/post.sh` or `state/cron/` and an
+# unbalanced apostrophe (e.g. "the agent's hook chain at hooks/post.sh")
+# used to trip the substring fallback in `_bash_argv_references_system_config`
+# when shlex.split rejected the unbalanced quote — denying every write
+# to a project-level `.agents/` working directory. The fallback now
+# requires short needles to sit at a strict filesystem-prefix boundary
+# (`/`, `~`, `$`), so prose mentions pass while real path arguments
+# (`/abs/.../hooks/foo`) keep firing.
+
+# D2a — Bash heredoc append to .agents/foo.md MUST NOT be denied.
+sce7_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7a",
+  "session_id": "test-session-7a",
+  "tool_input": {
+    "command": "cat >> .agents/foo.md <<'EOF'\nThe agent's hook chain at hooks/post.sh writes to /tmp.\nEOF",
+    "description": "append handoff"
+  }
+}
+JSON
+)
+sce7_out="$(run_hook_pretool_payload "$sce7_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7_out" == *'"deny"'* ]]; then
+  fail "scenario 7 (D2a): heredoc append to .agents/foo.md falsely denied — output: $sce7_out"
+else
+  pass "scenario 7 (D2a): Bash heredoc append to .agents/foo.md not denied"
+fi
+
+# D2b — Bash echo redirect to .agents/handoff.md MUST NOT be denied.
+sce7b_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7b",
+  "session_id": "test-session-7b",
+  "tool_input": {
+    "command": "echo hi > .agents/handoff.md",
+    "description": "write handoff"
+  }
+}
+JSON
+)
+sce7b_out="$(run_hook_pretool_payload "$sce7b_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7b_out" == *'"deny"'* ]]; then
+  fail "scenario 7 (D2b): echo redirect to .agents/handoff.md falsely denied — output: $sce7b_out"
+else
+  pass "scenario 7 (D2b): Bash echo to .agents/handoff.md not denied"
+fi
+
+# D2c — Edit tool to <workdir>/.agents/handoff.md MUST NOT be denied.
+TMP_WORKDIR="$(mktemp -d -t agb-d2-workdir.XXXXXX)"
+mkdir -p "$TMP_WORKDIR/.agents"
+printf 'placeholder\n' >"$TMP_WORKDIR/.agents/handoff.md"
+sce7c_payload=$(cat <<JSON
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Edit",
+  "tool_use_id": "test-7c",
+  "session_id": "test-session-7c",
+  "tool_input": {
+    "file_path": "$TMP_WORKDIR/.agents/handoff.md",
+    "old_string": "placeholder",
+    "new_string": "updated"
+  }
+}
+JSON
+)
+sce7c_out="$(run_hook_pretool_payload "$sce7c_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7c_out" == *'"deny"'* ]]; then
+  fail "scenario 7 (D2c): Edit on <workdir>/.agents/handoff.md falsely denied — output: $sce7c_out"
+else
+  pass "scenario 7 (D2c): Edit on .agents/handoff.md not denied"
+fi
+rm -rf "$TMP_WORKDIR"
+
+# D2d — Regression: real protected path with unbalanced quote MUST still
+# fire via the substring fallback. The needle here (`.discord/access.json`)
+# is long enough to bypass the path-prefix-boundary requirement.
+sce7d_payload=$(cat <<JSON
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7d",
+  "session_id": "test-session-7d",
+  "tool_input": {
+    "command": "sqlite3 $BRIDGE_HOME/agents/$ADMIN_AGENT/.discord/access.json 'SELECT *",
+    "description": "unbalanced quote with real protected path"
+  }
+}
+JSON
+)
+sce7d_out="$(run_hook_pretool_payload "$sce7d_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7d_out" == *'"deny"'* ]] && [[ "$sce7d_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2d): unbalanced-quote substring fallback still fires on real protected path"
+else
+  fail "scenario 7 (D2d): substring fallback regression — real protected path no longer denied: $sce7d_out"
+fi
+
+# D2e — Bash redirect into hooks/ with unbalanced quote MUST deny.
+# Issue #509 D2 r2 (codex needs-more): the original three-char prefix
+# set `{/,~,$}` missed the `>hooks/` form, so a malformed real write
+# slipped through the fallback. `>` is now in _PATH_PREFIX_CHARS.
+sce7e_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7e",
+  "session_id": "test-session-7e",
+  "tool_input": {
+    "command": "cat >hooks/foo 'unterminated",
+    "description": "redirect into hooks/ with unbalanced quote"
+  }
+}
+JSON
+)
+sce7e_out="$(run_hook_pretool_payload "$sce7e_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7e_out" == *'"deny"'* ]] && [[ "$sce7e_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2e): \`cat >hooks/foo 'unterminated\` denied via expanded prefix set"
+else
+  fail "scenario 7 (D2e): \`>hooks/foo\` not denied — output: $sce7e_out"
+fi
+
+# D2f — Bash redirect into state/cron/ with unbalanced quote MUST deny.
+# Reviewer's second explicit bypass for the original narrow prefix set.
+sce7f_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7f",
+  "session_id": "test-session-7f",
+  "tool_input": {
+    "command": "cat >state/cron/job.json 'unterminated",
+    "description": "redirect into state/cron/ with unbalanced quote"
+  }
+}
+JSON
+)
+sce7f_out="$(run_hook_pretool_payload "$sce7f_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7f_out" == *'"deny"'* ]] && [[ "$sce7f_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2f): \`cat >state/cron/job.json 'unterminated\` denied via expanded prefix set"
+else
+  fail "scenario 7 (D2f): \`>state/cron/job.json\` not denied — output: $sce7f_out"
+fi
+
+# D2g — short needle at start-of-string (idx==0) MUST deny.
+# Without the explicit `idx == 0` short-circuit, `hooks/post.sh ...` at
+# the very start of a malformed command would slip through because the
+# original loop required `idx > 0` and a prefix char before the needle.
+sce7g_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7g",
+  "session_id": "test-session-7g",
+  "tool_input": {
+    "command": "hooks/post.sh some-arg-with-quote'",
+    "description": "short needle at start-of-string with unbalanced quote"
+  }
+}
+JSON
+)
+sce7g_out="$(run_hook_pretool_payload "$sce7g_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7g_out" == *'"deny"'* ]] && [[ "$sce7g_out" == *"system config path"* ]]; then
+  pass "scenario 7 (D2g): short needle at start-of-string denied via idx==0 short-circuit"
+else
+  fail "scenario 7 (D2g): start-of-string needle not denied — output: $sce7g_out"
+fi
+
+# D2h — Regression-preserve: heredoc prose with `hooks/post.sh` preceded
+# by a SPACE must still NOT deny. Whitespace is deliberately excluded
+# from the expanded _PATH_PREFIX_CHARS so prose mentions inside heredoc
+# bodies keep passing. Mirrors the existing D2a case but written as an
+# explicit r2 regression-preserve check.
+sce7h_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "test-7h",
+  "session_id": "test-session-7h",
+  "tool_input": {
+    "command": "cat >> .agents/X.md <<'EOF'\nThe chain at hooks/post.sh writes to /tmp.\nEOF",
+    "description": "heredoc prose preserve"
+  }
+}
+JSON
+)
+sce7h_out="$(run_hook_pretool_payload "$sce7h_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$sce7h_out" == *'"deny"'* ]]; then
+  fail "scenario 7 (D2h): heredoc prose 'the chain at hooks/post.sh' falsely denied — output: $sce7h_out"
+else
+  pass "scenario 7 (D2h): heredoc prose preceded by whitespace still passes (regression-preserve)"
+fi
+
 # --- Summary -------------------------------------------------------------
 printf '\n[smoke] system-config-gating: %d pass, %d fail\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

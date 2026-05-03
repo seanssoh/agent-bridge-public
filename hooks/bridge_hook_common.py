@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import os
@@ -82,11 +83,73 @@ def agent_default_home(agent: str) -> Path:
     return agent_home_root() / agent
 
 
+@functools.lru_cache(maxsize=None)
+def _resolve_workdir_via_roster(agent: str) -> Path | None:
+    """Best-effort lookup of an agent's live workdir via the roster CLI.
+
+    Used by :func:`agent_workdir` when neither the explicit env var nor
+    the static-home directory is available — i.e. for dynamic claude
+    agents whose workdir lives outside ``$BRIDGE_HOME/agents/<name>/``.
+    Hooks invoked from cron / external surfaces lack the env that
+    ``bridge-run.sh`` would export, so without this fallback the
+    candidate list in :func:`bootstrap_artifact_context` misses the
+    real ``<project-workdir>/NEXT-SESSION.md`` and the handoff is
+    silently dropped.
+
+    Any subprocess / parse / lookup failure returns ``None`` so the
+    caller can fall back to the prior default-home behaviour. The
+    result is memoised for the duration of the hook process.
+    """
+    cli = bridge_script_dir() / "agent-bridge"
+    try:
+        proc = subprocess.run(
+            [str(cli), "agent", "list", "--json"],
+            cwd=str(bridge_script_dir()),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    rows: list[dict[str, Any]]
+    if isinstance(payload, list):
+        rows = [row for row in payload if isinstance(row, dict)]
+    elif isinstance(payload, dict):
+        candidates = payload.get("agents") or payload.get("rows") or []
+        rows = [row for row in candidates if isinstance(row, dict)]
+    else:
+        return None
+    for row in rows:
+        if row.get("agent") != agent:
+            continue
+        workdir = row.get("workdir")
+        if isinstance(workdir, str) and workdir.strip():
+            return Path(workdir).expanduser()
+    return None
+
+
 def agent_workdir(agent: str) -> Path:
     explicit = os.environ.get("BRIDGE_AGENT_WORKDIR", "").strip()
     if explicit:
         return Path(explicit).expanduser()
-    return agent_default_home(agent)
+    default = agent_default_home(agent)
+    if default.is_dir():
+        return default
+    # Dynamic-agent fallback (issue #509 D wave): the env that
+    # bridge-run.sh exports may not be available on cron / external
+    # invocations, and the static default home does not exist for
+    # agents whose workdir is a project directory.
+    roster_workdir = _resolve_workdir_via_roster(agent)
+    if roster_workdir is not None:
+        return roster_workdir
+    return default
 
 
 def current_agent() -> str:
@@ -771,7 +834,12 @@ def queue_summary(agent: str) -> tuple[int, dict[str, Any] | None]:
     row = rows[0] if isinstance(rows[0], dict) else None
     if not row:
         return 0, None
-    pending = int(row.get("queued_count", 0)) + int(row.get("blocked_count", 0)) + int(row.get("claimed_count", 0))
+    # `blocked` tasks intentionally excluded — they wait on external unblock,
+    # not on the agent acting now. Admin agents still see blocked-task counts
+    # via `admin_blocked_self_cleanup_context` above. Without this exclusion,
+    # every `bridge-task update --status blocked` re-fires the SessionStart
+    # `[Agent Bridge] N pending task(s) … ACTION REQUIRED` nudge.
+    pending = int(row.get("queued_count", 0)) + int(row.get("claimed_count", 0))
     if pending <= 0:
         return 0, None
 
