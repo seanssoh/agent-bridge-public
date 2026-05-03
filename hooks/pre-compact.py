@@ -30,6 +30,24 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Allow `from bridge_hook_common import …` even when this hook is invoked
+# from `~/.agent-bridge/hooks/pre-compact.py` (the live-runtime layout
+# Claude Code wires through settings.json). bridge_hook_common.py sits
+# next to this file in both the source tree and the deployed runtime.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+try:
+    from bridge_hook_common import (
+        compact_recovery_enabled,
+        gather_canonical_files,
+        write_compact_snapshot,
+    )
+except ImportError:  # pragma: no cover — keep pre-compact resilient if
+    # bridge_hook_common is missing (e.g. hooks/ is partially deployed).
+    compact_recovery_enabled = None  # type: ignore[assignment]
+    gather_canonical_files = None  # type: ignore[assignment]
+    write_compact_snapshot = None  # type: ignore[assignment]
+
 
 def _bridge_home() -> Path:
     env_home = os.environ.get("BRIDGE_HOME")
@@ -67,6 +85,29 @@ def _stdin_payload() -> dict:
         return {}
 
 
+def _capture_canonical_snapshot(agent: str) -> str:
+    """Persist a pre-compact snapshot of the canonical agent files.
+
+    Returns the snapshot path as a string for inclusion in the bridge-memory
+    capture text (so an operator running `bridge-memory search` can locate
+    the sidecar later). Empty string when the feature is disabled or the
+    helpers from bridge_hook_common are unavailable.
+    """
+    if compact_recovery_enabled is None or gather_canonical_files is None or write_compact_snapshot is None:
+        return ""
+    try:
+        if not compact_recovery_enabled():
+            return ""
+        files = gather_canonical_files(agent)
+        if not any(files.values()):
+            return ""
+        path = write_compact_snapshot(agent, files)
+        return str(path) if path is not None else ""
+    except Exception:
+        # Snapshot failure must never block compaction.
+        return ""
+
+
 def main() -> int:
     try:
         agent = _agent_id()
@@ -76,11 +117,14 @@ def main() -> int:
         payload = _stdin_payload()
         trigger = str(payload.get("trigger") or payload.get("reason") or "").strip() or "unknown"
         custom = str(payload.get("custom_instructions") or "").strip()
+        snapshot_path = _capture_canonical_snapshot(agent)
         capture_text_parts = [
             f"trigger={trigger}",
             f"agent={agent}",
             f"ts={datetime.now().astimezone().isoformat(timespec='seconds')}",
         ]
+        if snapshot_path:
+            capture_text_parts.append(f"canonical_snapshot={snapshot_path}")
         if custom:
             # Keep the custom-instructions excerpt short; the full prompt
             # is in the session transcript which Claude Code handles on its

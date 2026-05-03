@@ -361,6 +361,168 @@ def _enqueue_handoff_pending(agent: str, next_session: Path, digest: str) -> Non
         return
 
 
+DEFAULT_COMPACT_RECOVERY_FILES: tuple[str, ...] = (
+    "SOUL.md",
+    "SESSION-TYPE.md",
+    "COMMON-INSTRUCTIONS.md",
+    "TOOLS.md",
+    "MEMORY.md",
+)
+_COMPACT_RECOVERY_DEFAULT_CAP = 5120
+_COMPACT_RECOVERY_MIN_CAP = 256
+
+
+def compact_recovery_enabled() -> bool:
+    raw = os.environ.get("BRIDGE_COMPACT_RECOVERY", "").strip().lower()
+    if not raw:
+        return True
+    return raw not in {"0", "false", "no", "off"}
+
+
+def compact_recovery_files() -> tuple[str, ...]:
+    raw = os.environ.get("BRIDGE_COMPACT_RECOVERY_FILES", "").strip()
+    if not raw:
+        return DEFAULT_COMPACT_RECOVERY_FILES
+    parts = [piece.strip() for piece in raw.split(",") if piece.strip()]
+    return tuple(parts) if parts else DEFAULT_COMPACT_RECOVERY_FILES
+
+
+def compact_recovery_per_file_cap() -> int:
+    raw = os.environ.get("BRIDGE_COMPACT_RECOVERY_MAX_BYTES", "").strip()
+    if not raw:
+        return _COMPACT_RECOVERY_DEFAULT_CAP
+    try:
+        value = int(raw)
+    except ValueError:
+        return _COMPACT_RECOVERY_DEFAULT_CAP
+    return max(value, _COMPACT_RECOVERY_MIN_CAP)
+
+
+def compact_snapshot_path(agent: str) -> Path:
+    return bridge_state_dir() / "agents" / agent / "compact-snapshot.json"
+
+
+def _read_canonical_file(home: Path, name: str, cap: int) -> str:
+    candidate = home / name
+    try:
+        # read_text follows symlinks, so SHARED-symlinked files resolve
+        # transparently (TOOLS.md → shared/TOOLS.md, etc.).
+        if not candidate.exists():
+            return ""
+        text = candidate.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    text = text.strip("\n")
+    encoded = text.encode("utf-8")
+    if len(encoded) <= cap:
+        return text
+    # Cap is named/documented as a UTF-8 BYTE cap, so truncate on a byte
+    # window. `errors="ignore"` drops a partial trailing byte sequence so
+    # we never emit a half-character; the suffix marker tells the reader
+    # the section was clipped. This matters for non-ASCII (Korean,
+    # Japanese, etc.) where 1 character = 2–4 bytes — a character-count
+    # cap would let the payload silently grow several times past the
+    # documented budget. (Codex r1 / PR #510.)
+    truncated = encoded[:cap].decode("utf-8", errors="ignore").rstrip()
+    return truncated + "\n[…truncated by compact-recovery cap…]"
+
+
+def gather_canonical_files(agent: str) -> dict[str, str]:
+    """Return ordered mapping of canonical filename → text content.
+
+    Reads from the agent workdir first, then falls back to the agent
+    default home for installations where the two diverge. Missing or
+    unreadable files yield empty strings — the caller decides whether to
+    skip or substitute a snapshot.
+    """
+    files = compact_recovery_files()
+    cap = compact_recovery_per_file_cap()
+    workdir = agent_workdir(agent)
+    default_home = agent_default_home(agent)
+    out: dict[str, str] = {}
+    for name in files:
+        text = _read_canonical_file(workdir, name, cap)
+        if not text and workdir != default_home:
+            text = _read_canonical_file(default_home, name, cap)
+        out[name] = text
+    return out
+
+
+def write_compact_snapshot(agent: str, payload: dict[str, str]) -> Path | None:
+    """Atomically persist canonical-file contents next to the agent state.
+
+    The session-start hook reads this file as a fallback when the live
+    canonical files have been moved/cleared between pre-compact and the
+    post-compact session resume. Best-effort — IO failures are swallowed
+    because pre-compact must never block compaction.
+    """
+    path = compact_snapshot_path(agent)
+    envelope = {
+        "agent": agent,
+        "captured_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "files": payload,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(
+            json.dumps(envelope, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+        os.chmod(path, 0o600)
+        return path
+    except OSError:
+        return None
+
+
+def load_compact_snapshot(agent: str) -> dict[str, str]:
+    path = compact_snapshot_path(agent)
+    if not path.exists():
+        return {}
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(envelope, dict):
+        return {}
+    files = envelope.get("files")
+    if not isinstance(files, dict):
+        return {}
+    return {str(k): str(v) for k, v in files.items() if isinstance(v, str)}
+
+
+def compact_recovery_context(agent: str) -> str:
+    """Return the `## Restored Context` block for compaction recovery.
+
+    Reads canonical files live (resolves symlinks). When a file is missing
+    or empty, falls back to the most recent pre-compact snapshot. Returns
+    an empty string when the feature is disabled or no content survived.
+    """
+    if not compact_recovery_enabled():
+        return ""
+    live = gather_canonical_files(agent)
+    snapshot = load_compact_snapshot(agent) if any(not v for v in live.values()) else {}
+    sections: list[str] = []
+    for name, text in live.items():
+        if not text and snapshot.get(name):
+            text = snapshot[name].rstrip() + "\n[restored from pre-compact snapshot]"
+        if not text:
+            continue
+        sections.append(f"### {name}\n{text}")
+    if not sections:
+        return ""
+    body = "\n\n".join(sections)
+    return (
+        "## Restored Context (post-compact)\n"
+        "These canonical agent files were re-injected because the previous\n"
+        "conversation was compacted. Treat them as the load-bearing identity\n"
+        "anchors for this turn before reading queue/handoff state below.\n\n"
+        + body
+    )
+
+
 def bootstrap_artifact_context(agent: str) -> str:
     workdir = agent_workdir(agent)
     default_home = agent_default_home(agent)
