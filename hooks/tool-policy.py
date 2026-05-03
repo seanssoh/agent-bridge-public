@@ -468,6 +468,51 @@ def _alias_path_fragments(token: str):
             yield fragment
 
 
+# Length below which a substring-fallback needle is considered too generic
+# to fire on its own — e.g. `hooks/` and `state/cron/` are short enough
+# that any heredoc body documenting the hook chain or cron layout will
+# trigger them. For such needles we require the character immediately
+# preceding the match to be a strict filesystem-prefix character (`/`,
+# `~`, `$`) so the match must look like an actual path argument
+# (``/abs/.../hooks/foo``, ``~/state/cron/``, ``$BRIDGE_HOME/hooks/x``)
+# and not prose like ``See hooks/post.sh for details`` that follows a
+# space. Longer needles (``.discord/access.json``,
+# ``agent-roster.local.sh``, etc.) are specific enough that a plain
+# substring hit is acceptable. Issue #509 D2 follow-up.
+_SHORT_NEEDLE_THRESHOLD = 12
+_PATH_PREFIX_CHARS = frozenset({"/", "~", "$"})
+
+
+def _command_substring_hits_protected_needle(command: str) -> bool:
+    """Return True iff *command* contains any protected literal suffix in
+    a plausible path-argument position.
+
+    Long needles (>= :data:`_SHORT_NEEDLE_THRESHOLD` chars) match on a
+    plain substring scan. Short needles only fire when preceded by a
+    strict filesystem-prefix character (`/`, `~`, `$`), which keeps the
+    fallback no weaker than the structural-argv check for real path
+    arguments while letting heredoc prose like ``It's hooks/post.sh``
+    pass — that prose is what triggered the regression operator-side
+    on 2026-05-03 (issue #509 D2 follow-up).
+    """
+    for needle in protected_literal_suffixes():
+        if not needle:
+            continue
+        if len(needle) >= _SHORT_NEEDLE_THRESHOLD:
+            if needle in command:
+                return True
+            continue
+        start = 0
+        while True:
+            idx = command.find(needle, start)
+            if idx < 0:
+                break
+            if idx > 0 and command[idx - 1] in _PATH_PREFIX_CHARS:
+                return True
+            start = idx + 1
+    return False
+
+
 def _token_matches_protected(token: str, protected: Path) -> bool:
     for fragment in _alias_path_fragments(token):
         expanded = os.path.expandvars(os.path.expanduser(fragment))
@@ -580,10 +625,18 @@ def _bash_argv_references_system_config(command: str) -> bool:
     try:
         tokens = shlex.split(command, posix=True, comments=False)
     except ValueError:
-        for needle in protected_literal_suffixes():
-            if needle and needle in command:
-                return True
-        return False
+        # Substring fallback: shlex rejected the command (commonly an
+        # unbalanced apostrophe inside a heredoc body — `It's foo` etc.).
+        # The shorter needles in protected_literal_suffixes (`hooks/`,
+        # `state/cron/`) match too eagerly when prose mentions them
+        # mid-sentence (e.g. a handoff body that documents the hook
+        # chain). Require each needle to sit at a path-boundary:
+        # start-of-string or preceded by a character that plausibly opens
+        # a filesystem token (`/`, `~`, `$`, whitespace, quote, paren, or
+        # one of the redirection prefixes). This keeps the fallback no
+        # weaker than the structural-argv check for real path arguments
+        # while letting heredoc prose pass.
+        return _command_substring_hits_protected_needle(command)
 
     def _check_value(value: str) -> bool:
         for fragment in _alias_path_fragments(value):
