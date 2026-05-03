@@ -771,7 +771,12 @@ def queue_summary(agent: str) -> tuple[int, dict[str, Any] | None]:
     row = rows[0] if isinstance(rows[0], dict) else None
     if not row:
         return 0, None
-    pending = int(row.get("queued_count", 0)) + int(row.get("blocked_count", 0)) + int(row.get("claimed_count", 0))
+    # `blocked` tasks intentionally excluded — they wait on external unblock,
+    # not on the agent acting now. Admin agents still see blocked-task counts
+    # via `admin_blocked_self_cleanup_context` above. Without this exclusion,
+    # every `bridge-task update --status blocked` re-fires the SessionStart
+    # `[Agent Bridge] N pending task(s) … ACTION REQUIRED` nudge.
+    pending = int(row.get("queued_count", 0)) + int(row.get("claimed_count", 0))
     if pending <= 0:
         return 0, None
 
