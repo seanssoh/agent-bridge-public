@@ -1304,8 +1304,15 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
       if ! _admin_pair_output="$(
         bridge_upgrade_with_target_env "$TARGET_ROOT" "$BRIDGE_BASH_BIN" -lc '
           set -euo pipefail
-          source "$1/bridge-lib.sh"
-          source "$1/lib/bridge-admin-pair.sh"
+          # bridge-admin-pair.sh:bridge_ensure_admin_codex_pair invokes
+          # "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" agent create ...,
+          # so SCRIPT_DIR must be bound before sourcing the helper. Without
+          # this the heredocs subshells set -u aborts as
+          # "SCRIPT_DIR: unbound variable" and admin-pair backfill fails on
+          # every upgrade. (Issue #517 r1 review finding 1.)
+          SCRIPT_DIR="$1"
+          source "$SCRIPT_DIR/bridge-lib.sh"
+          source "$SCRIPT_DIR/lib/bridge-admin-pair.sh"
           bridge_load_roster
           bridge_ensure_admin_codex_pair "$2"
         ' -- "$SOURCE_ROOT" "$ADMIN_AGENT_ID" 2>&1

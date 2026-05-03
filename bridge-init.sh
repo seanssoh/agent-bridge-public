@@ -442,9 +442,12 @@ fi
 
 # Issue #517: ensure the admin's sibling codex dev pair (`<admin>-dev`) and
 # inject the pair-programming SOP managed block into the admin's CLAUDE.md.
-# Tolerant on failure — pair backfill must never fail an otherwise-successful
-# admin install. Skipped on --dry-run to honor the mutation-free contract.
-if [[ $dry_run -eq 0 ]] && [[ "$engine" == "claude" ]]; then
+# Applies regardless of admin engine — the pair is always engine=codex; the
+# SOP block is engine-neutral (it talks about plan/review/implement loops,
+# which apply to any orchestrator). Tolerant on failure — pair backfill must
+# never fail an otherwise-successful admin install. Skipped on --dry-run to
+# honor the mutation-free contract.
+if [[ $dry_run -eq 0 ]]; then
   pair_output=""
   if ! pair_output="$(bridge_ensure_admin_codex_pair "$admin_agent" 2>&1)"; then
     bridge_init_append_warning "admin-pair backfill failed: ${pair_output}"

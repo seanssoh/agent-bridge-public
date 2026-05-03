@@ -58,6 +58,17 @@ bridge_ensure_admin_codex_pair() {
   rc=$?
   set -e
   if [[ $rc -ne 0 ]]; then
+    # Defensive: `agent create` can return nonzero after the roster mutation
+    # has already happened (post-register validation, env warnings, etc.).
+    # Reload the roster and let the inject step run if the pair actually
+    # made it. This keeps the install convergent on transient failures
+    # rather than leaving an admin with a registered pair but no SOP block.
+    # (Issue #517 r1 review finding 3.)
+    bridge_load_roster
+    if bridge_agent_exists "$pair_name"; then
+      printf '[admin-pair] create-partial-but-registered: %s\n%s\n' "$pair_name" "$create_output" >&2
+      return 0
+    fi
     printf '[admin-pair] create-failed: %s\n%s\n' "$pair_name" "$create_output" >&2
     return 1
   fi

@@ -33,6 +33,7 @@ cleanup() {
 trap cleanup EXIT
 
 ADMIN="testadmin"
+ADMIN_CODEX="testadmincodex"
 SENTINEL_LINE="<!-- operator-note: smoke-${RANDOM}-${RANDOM} -->"
 PRE_EXISTING_MIGRATION_LINE="## Agent Bridge Runtime Canon"
 
@@ -115,6 +116,36 @@ assert_missing_admin_home_is_skip() {
   smoke_assert_eq "admin CLAUDE.md missing" "$skipped" "missing admin home is skipped, not failed"
 }
 
+# Issue #517 r1 finding 2: bridge-init.sh dropped the engine=="claude" gate
+# so codex admins also get the SOP block. The python inject path was already
+# engine-agnostic by code reading; this fixture pins that contract — a
+# CLAUDE.md authored as a codex admin still receives the same managed block
+# markers + pair-name substitution after inject.
+write_codex_admin_fixture() {
+  local admin_home="$BRIDGE_AGENT_HOME_ROOT/$ADMIN_CODEX"
+  mkdir -p "$admin_home"
+  cat >"$admin_home/CLAUDE.md" <<'EOF'
+# testadmincodex — Admin Role (Codex CLI)
+
+너는 testadmincodex이야. Codex CLI로 동작하는 admin.
+
+EOF
+}
+
+assert_codex_admin_inject_writes_block() {
+  local output changed claude_path content
+  output="$(python3 "$SMOKE_REPO_ROOT/bridge-upgrade.py" inject-admin-pair-block \
+    --target-root "$BRIDGE_HOME" --admin-agent "$ADMIN_CODEX")"
+  changed="$(printf '%s' "$output" | python3 -c 'import json,sys; print(json.load(sys.stdin)["changed"])')"
+  smoke_assert_eq "True" "$changed" "codex-admin inject reports changed=true"
+
+  claude_path="$BRIDGE_AGENT_HOME_ROOT/$ADMIN_CODEX/CLAUDE.md"
+  content="$(cat "$claude_path")"
+  smoke_assert_contains "$content" "<!-- BEGIN MANAGED:admin-pair-programming -->" "codex-admin block start marker present"
+  smoke_assert_contains "$content" "<!-- END MANAGED:admin-pair-programming -->" "codex-admin block end marker present"
+  smoke_assert_contains "$content" "${ADMIN_CODEX}-dev" "codex-admin pair name substituted into block"
+}
+
 assert_bash_python_blocks_byte_identical() {
   local bash_block python_block
   bash_block="$(bridge_admin_pair_managed_block "$ADMIN")"
@@ -150,12 +181,14 @@ main() {
   smoke_require_cmd python3
   smoke_setup_bridge_home "admin-codex-pair"
   write_admin_fixture
+  write_codex_admin_fixture
   smoke_run "pair name helper" assert_pair_name_helper
   smoke_run "bash and python managed blocks are byte-identical" assert_bash_python_blocks_byte_identical
   smoke_run "first inject writes block + preserves overlay" assert_first_inject_writes_block
   smoke_run "second inject is a no-op (idempotent)" assert_second_inject_is_noop
   smoke_run "dry-run reports change without mutating" assert_dry_run_does_not_mutate
   smoke_run "missing admin home is skipped, not failed" assert_missing_admin_home_is_skip
+  smoke_run "codex-admin inject writes block (engine-neutral)" assert_codex_admin_inject_writes_block
   smoke_log "passed"
 }
 
