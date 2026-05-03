@@ -1256,8 +1256,16 @@ PY
           --paths-json "$RELAY_CLEANUP_PREVIEW_JSON" >/dev/null 2>&1 || true
       fi
       set +e
+      # `--no-backup`: the upgrader already extended the upgrade backup
+      # manifest with `changed_paths` from the preview JSON above
+      # (including the new `removed:<abs>/lib/telegram-relay.py` etc.
+      # entries). A second standalone backup under
+      # `<target>/backups/relay-cleanup-*/` would be redundant noise on
+      # every upgrade. Standalone (non-upgrade) invocations of
+      # `bridge-relay-cleanup.py` still produce their own backup by
+      # default; only this in-upgrade caller opts out.
       RELAY_CLEANUP_JSON="$(python3 "$SOURCE_ROOT/bridge-relay-cleanup.py" \
-        --target-root "$TARGET_ROOT" --json 2>/dev/null)"
+        --target-root "$TARGET_ROOT" --no-backup --json 2>/dev/null)"
       _relay_cleanup_rc=$?
       set -e
       if [[ $_relay_cleanup_rc -ne 0 ]]; then
