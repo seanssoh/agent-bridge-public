@@ -6,6 +6,26 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.7.4] — 2026-05-03
+
+### Highlight — admin codex pair as a standard install asset (#517)
+
+`v0.7.4` ships [#517](https://github.com/SYRS-AI/agent-bridge-public/issues/517) (operator approved 2026-05-03): every admin agent now gets a sibling `<admin>-dev` codex agent automatically, and the admin's CLAUDE.md gains a managed block codifying the pair-programming SOP — so the `AGENTS.md` "Multi-Agent Collaboration" workflow is a real install asset rather than relying on per-install custom edits or operator memory.
+
+### Added (#517 — PR #521)
+
+- `lib/bridge-admin-pair.sh` (new) — `bridge_admin_pair_name`, `bridge_ensure_admin_codex_pair`, `bridge_admin_pair_managed_block`. The pair is registered as `engine=codex`, `source=static`, `--always-on`, queue-only (no channels), workdir inherited from the admin. Idempotent: skips when the pair already exists. Tolerant on partial-create (rc!=0 with the roster mutated): reloads the roster and returns success if the pair is registered, so the SOP-block injection step still runs.
+- `bridge-init.sh` — after admin agent create, ensures `<admin>-dev` exists and injects the managed pair-programming block into the admin's CLAUDE.md (via the new `bridge-upgrade.py inject-admin-pair-block` sub-command). Applies regardless of admin engine — the pair is always engine=codex; the SOP block is engine-neutral.
+- `agent-bridge upgrade --apply` — backfills the pair on existing installs (idempotent) inside the existing `migrate-agents` branch, with the heredoc-scoped `SCRIPT_DIR` binding so the helper can locate `agent-bridge` under `set -u`.
+- Admin CLAUDE.md gains a `<!-- BEGIN/END MANAGED:admin-pair-programming -->` block codifying the 6-step SOP (plan brief → plan-ok → implement → code-review brief → merge-on-implement-ok → off-hours autonomy). Operator overlay (any text outside the managed block) is preserved across `agent-bridge upgrade --apply`.
+- `bridge-upgrade.py` — `extract_managed_claude_block` / `refresh_managed_claude_block` generalized to take delimiter-pair args (legacy wrappers retained for back-compat). `migrate_agent_home` refreshes the admin-pair block only when `session_type == "admin"`, so non-admin agents (including the new sibling codex pair) are never touched. New `inject-admin-pair-block` sub-command for the fresh-install path.
+- `scripts/smoke/admin-codex-pair.sh` (new) — 7 contracts: pair name helper; bash↔python managed-block byte-identity (caller-renderer convergence guarantee between fresh-install and upgrade-install paths); first-inject writes block + preserves operator overlay + preserves the pre-existing AGENT BRIDGE DOC MIGRATION block; second-inject is a no-op (idempotent); dry-run reports change without mutating; missing admin home is skipped (not failed); engine=codex admin path through inject-admin-pair-block (engine-neutrality contract).
+- `scripts/ci-select-smoke.sh` — `admin-codex-pair` added to `add_all_required_static`, plus path-trigger entries for `bridge-init.sh` / `lib/bridge-admin-pair.sh` and the existing `bridge-upgrade.{sh,py}` / `VERSION` group.
+
+### Operator action
+
+- **None for the common path.** Auto-applied on the first `agent-bridge upgrade --apply` to v0.7.4+. Operators with multiple admin agents per install will see one `<admin>-dev` codex agent created per admin on the next upgrade.
+
 ## [0.7.3] — 2026-05-03
 
 ### Highlight — issue #509 closed (compact recovery + skill discovery migration), `agb doctor` admin self-healing, `#516` settings gating
