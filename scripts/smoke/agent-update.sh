@@ -188,6 +188,42 @@ assert "remove-dev-channel plugin:foo@m" in payload["actions"], payload
   smoke_assert_not_contains "$after_line" "plugin:foo@m" "roster argv no longer carries dev-channel spec"
 }
 
+assert_set_launch_cmd_full_replace() {
+  # Codex r1 finding 5: --set-launch-cmd (full replace) was the only
+  # mutation flag the smoke did not exercise. Cover round-trip on the
+  # JSON envelope, the on-disk roster line, and the post-replace
+  # idempotency. The prior dev-channel test pair restored worker's
+  # launch_cmd to `claude --dangerously-skip-permissions`, so the new
+  # value asserted here is structurally distinct from the fixture.
+  local before_line after_line output
+  before_line="$(read_field "BRIDGE_AGENT_LAUNCH_CMD")"
+  output="$(run_update --set-launch-cmd "claude --dangerously-skip-permissions --resume")"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is True, payload
+assert payload["after"]["launch_cmd"] == "claude --dangerously-skip-permissions --resume", payload
+assert "set-launch-cmd" in payload["actions"], payload
+' "$output"
+  after_line="$(read_field "BRIDGE_AGENT_LAUNCH_CMD")"
+  if [[ "$before_line" == "$after_line" ]]; then
+    smoke_fail "expected BRIDGE_AGENT_LAUNCH_CMD line to change after set-launch-cmd"
+  fi
+  smoke_assert_contains "$after_line" "claude --dangerously-skip-permissions --resume" \
+    "roster line carries replaced launch_cmd"
+
+  # Idempotent re-run reports changed=false.
+  output="$(run_update --set-launch-cmd "claude --dangerously-skip-permissions --resume")"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is False, payload
+' "$output"
+
+  # Restore the fixture so downstream assertions see the original value.
+  run_update --set-launch-cmd "claude --dangerously-skip-permissions" >/dev/null
+}
+
 assert_channels_family() {
   # Add unique token, set full replace, remove one token. Each step
   # confirms the JSON envelope and the on-disk channels line move.
@@ -329,6 +365,7 @@ main() {
   smoke_run "remove-env reverts the prepend"             assert_remove_env_reverts
   smoke_run "add-dev-channel appends option/spec pair"   assert_add_dev_channel_appends_pair
   smoke_run "remove-dev-channel cleans up pair + token"  assert_remove_dev_channel_cleans_pair
+  smoke_run "set-launch-cmd full replace + idempotent"   assert_set_launch_cmd_full_replace
   smoke_run "channels add/set/remove family round-trip"  assert_channels_family
   smoke_run "dry-run does not mutate roster"             assert_dry_run_does_not_mutate
   smoke_run "non-admin caller is denied with reason"     assert_caller_validation_denies_non_admin

@@ -42,7 +42,12 @@
 # TTY detection (stdin+stdout both attached). Anything else is
 # agent-direct, which the wrapper rejects.
 bridge_agent_update_caller_source() {
+  # Strip leading/trailing whitespace before lowercasing — operators
+  # editing env files commonly leave a stray space that would otherwise
+  # silently demote the source to agent-direct. Mirrors
+  # bridge-config.py:94 (`.strip().lower()`).
   local explicit="${BRIDGE_CALLER_SOURCE:-}"
+  explicit="$(printf '%s' "$explicit" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   explicit="${explicit,,}"
   case "$explicit" in
     operator-tui|operator-trusted-id)
@@ -67,12 +72,20 @@ bridge_agent_update_caller_source() {
 # (already extracted by run_update) or BRIDGE_AGENT_ID env. Empty when
 # both are unset; the strict admin check rejects anonymous callers.
 bridge_agent_update_caller_agent() {
+  # Strip whitespace from --from value or BRIDGE_AGENT_ID env to match
+  # bridge-config.py:111 (`str(explicit).strip()` and the env strip on
+  # line 115). Without this, a trailing newline in BRIDGE_AGENT_ID
+  # passes the non-empty check but fails string equality against the
+  # admin id.
   local explicit="${1:-}"
+  explicit="$(printf '%s' "$explicit" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   if [[ -n "$explicit" ]]; then
     printf '%s' "$explicit"
     return 0
   fi
-  printf '%s' "${BRIDGE_AGENT_ID:-}"
+  local env_id="${BRIDGE_AGENT_ID:-}"
+  env_id="$(printf '%s' "$env_id" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  printf '%s' "$env_id"
 }
 
 # bridge_agent_update_caller_is_admin — strict admin identity check
@@ -81,10 +94,42 @@ bridge_agent_update_caller_agent() {
 # Anonymous callers fail even from operator-TUI; operators running from
 # a raw shell must pass --from <admin-agent> explicitly.
 bridge_agent_update_caller_is_admin() {
+  # Strip both sides before comparing — bridge-config.py:107
+  # (`os.environ.get("BRIDGE_ADMIN_AGENT_ID", "").strip()`) and the
+  # caller-id strip happen before equality. The shared
+  # bridge_admin_agent_id() helper passes through the raw env value
+  # unchanged for back-compat with other call sites; we strip locally
+  # so a trailing newline in BRIDGE_ADMIN_AGENT_ID does not silently
+  # deny every legitimate admin call.
   local agent="${1:-}"
+  agent="$(printf '%s' "$agent" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   local admin
   admin="$(bridge_admin_agent_id)"
+  admin="$(printf '%s' "$admin" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
   [[ -n "$admin" && -n "$agent" && "$agent" == "$admin" ]]
+}
+
+# bridge_agent_update_validate_channels_csv — split a --channels-set
+# CSV on `,`, strip per-token whitespace, and reject any non-empty token
+# that does not match the plugin:NAME@SPEC shape (codex r1 finding 4).
+# Trailing-comma tolerance: empty tokens are skipped silently, so an
+# operator can pass `plugin:foo@m,` without tripping the validator.
+# Calls bridge_die on the first invalid token.
+bridge_agent_update_validate_channels_csv() {
+  local flag="$1"
+  local raw="$2"
+  local _IFS_save="$IFS"
+  local -a _tokens=()
+  IFS=',' read -r -a _tokens <<<"$raw"
+  IFS="$_IFS_save"
+  local tok trimmed
+  for tok in "${_tokens[@]}"; do
+    trimmed="$(printf '%s' "$tok" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "$trimmed" ]] && continue
+    if [[ ! "$trimmed" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
+      bridge_die "$flag token invalid (need plugin:NAME@SPEC): $trimmed"
+    fi
+  done
 }
 
 bridge_agent_update_file_sha256() {

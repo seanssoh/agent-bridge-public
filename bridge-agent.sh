@@ -2057,27 +2057,69 @@ run_update() {
         ;;
       --launch-cmd-add-env)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        [[ "$2" == *"="* ]] || bridge_die "--launch-cmd-add-env 는 KEY=VALUE 형식이어야 합니다: $2"
+        # Strict KEY=VALUE shape (codex r1 finding 2): the value flows
+        # through bridge_write_role_block into BRIDGE_AGENT_LAUNCH_CMD,
+        # which bridge-run.sh:574 hands to `bash -lc`. KEY must match the
+        # POSIX env-var-name rule; VALUE may be empty but cannot embed
+        # newlines or null bytes (those would corrupt the roster line and
+        # the bash -lc string). Stricter shell-metachar quoting is the
+        # writer's job (the managed-role block writer single-quotes
+        # launch_cmd on emission), so we do not reject `'`, `"`, `$`,
+        # `` ` `` here — that would refuse legitimate values such as a
+        # path containing a dollar sign.
+        if [[ ! "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+          bridge_die "--launch-cmd-add-env 는 KEY=VALUE 형식이어야 합니다 (KEY matches ^[A-Za-z_][A-Za-z0-9_]*$): $2"
+        fi
+        # Reject embedded newlines. Bash strings cannot carry literal
+        # NUL bytes (argv truncates at NUL on entry to this process), so
+        # there is no separate `*$'\0'*` arm — the kernel-level
+        # truncation already enforces the NUL floor. The `*$'\0'*` glob
+        # would degenerate to `**` and match every value.
+        case "$2" in
+          *$'\n'*)
+            bridge_die "--launch-cmd-add-env 값에 줄바꿈이 포함될 수 없습니다: $2"
+            ;;
+        esac
         add_launch_cmd_op "add-env" "$2"
         shift 2
         ;;
       --launch-cmd-remove-env)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        # Same KEY shape on the remove side so a malformed key never
+        # reaches the python applier.
+        if [[ ! "$2" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+          bridge_die "--launch-cmd-remove-env 는 KEY 형식이어야 합니다 (^[A-Za-z_][A-Za-z0-9_]*$): $2"
+        fi
         add_launch_cmd_op "remove-env" "$2"
         shift 2
         ;;
       --launch-cmd-add-dev-channel)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        # plugin:NAME@SPEC shape (codex r1 finding 3): the spec is appended
+        # as an argv token to BRIDGE_AGENT_LAUNCH_CMD which bash -lc
+        # executes downstream. Restrict NAME and SPEC to the same
+        # `[A-Za-z0-9_.-]+` charset the existing roster fixtures and
+        # bridge_qualify_channel_item assume.
+        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
+          bridge_die "--launch-cmd-add-dev-channel 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
+        fi
         add_launch_cmd_op "add-dev-channel" "$2"
         shift 2
         ;;
       --launch-cmd-remove-dev-channel)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
+          bridge_die "--launch-cmd-remove-dev-channel 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
+        fi
         add_launch_cmd_op "remove-dev-channel" "$2"
         shift 2
         ;;
       --channels-set)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        # Per-token plugin:NAME@SPEC validation on the CSV (codex r1
+        # finding 4). Allow trailing-comma tolerance and skip empty
+        # entries, but reject any non-empty token that fails the shape.
+        bridge_agent_update_validate_channels_csv "--channels-set" "$2"
         channels_set_present=1
         channels_set_value="$2"
         add_channels_op "channels-set" "$2"
@@ -2085,11 +2127,17 @@ run_update() {
         ;;
       --channels-add)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
+          bridge_die "--channels-add 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
+        fi
         add_channels_op "channels-add" "$2"
         shift 2
         ;;
       --channels-remove)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
+          bridge_die "--channels-remove 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
+        fi
         add_channels_op "channels-remove" "$2"
         shift 2
         ;;
