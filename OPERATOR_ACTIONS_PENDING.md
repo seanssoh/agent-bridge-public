@@ -64,24 +64,28 @@ bash "$HOME/.agent-bridge/scripts/bulk-register-precompact.sh" --all
 If your install runs claude agents whose workdir is outside `$BRIDGE_HOME/agents/<name>` and you cannot wait for the v0.7.3 upgrade:
 
 ```bash
-~/.agent-bridge/agent-bridge agent list --json \
-  | python3 -c '
-import json, sys
-for row in json.load(sys.stdin):
+python3 <<'PY'
+import json, os, subprocess, sys
+home = os.path.expanduser("~/.agent-bridge")
+agents_root = os.path.join(home, "agents") + "/"
+data = json.loads(subprocess.check_output([f"{home}/agent-bridge", "agent", "list", "--json"]))
+python_bin = sys.executable or "/usr/bin/python3"
+for row in data:
     if row.get("engine") != "claude":
         continue
     workdir = row.get("workdir") or ""
-    if not workdir or workdir.startswith("'"$HOME"'/.agent-bridge/agents/"):
+    if not workdir or workdir.startswith(agents_root):
         continue
-    print(f"{row[\"agent\"]} {workdir}")
-' \
-  | while read -r agent workdir; do
-      python3 ~/.agent-bridge/bridge-hooks.py ensure-pre-compact-hook \
-        --workdir "$workdir" \
-        --bridge-home "$HOME/.agent-bridge" \
-        --python-bin "$(command -v python3)" \
-        --settings-file "$workdir/.claude/settings.json"
-  done
+    settings = os.path.join(workdir, ".claude", "settings.json")
+    print(f"registering: {row.get('agent')} -> {workdir}")
+    subprocess.run([
+        python_bin, os.path.join(home, "bridge-hooks.py"), "ensure-pre-compact-hook",
+        "--workdir", workdir,
+        "--bridge-home", home,
+        "--python-bin", python_bin,
+        "--settings-file", settings,
+    ], check=False)
+PY
 ```
 
 This iterates dynamic claude agents (engine=claude, workdir not under `~/.agent-bridge/agents/`) and registers PreCompact directly in each project's `.claude/settings.json`. Idempotent like the bulk helper. Stop and review if any agent's settings.json is shared between hosts (e.g. a checked-in template) — the registration is host-local.
@@ -89,10 +93,10 @@ This iterates dynamic claude agents (engine=claude, workdir not under `~/.agent-
 ### Verify (covers static + dynamic)
 
 ```bash
-~/.agent-bridge/agent-bridge agent list --json \
-  | python3 - <<'PY'
-import json, os, sys
-data = json.load(sys.stdin)
+python3 <<'PY'
+import json, os, subprocess
+home = os.path.expanduser("~/.agent-bridge")
+data = json.loads(subprocess.check_output([f"{home}/agent-bridge", "agent", "list", "--json"]))
 for row in data:
     if row.get("engine") != "claude":
         continue
@@ -116,7 +120,7 @@ for row in data:
 PY
 ```
 
-This walks the live roster (so dynamic agents are not silently hidden) and prints `present | MISSING | NO_SETTINGS_FILE | PARSE_ERROR` per claude agent.
+This walks the live roster (so dynamic agents are not silently hidden) and prints `present | MISSING | NO_SETTINGS_FILE | PARSE_ERROR` per claude agent. Both snippets keep the heredoc as the only stdin consumer (no pipe/heredoc conflict) and call `agent-bridge` via `subprocess.check_output` rather than a shell pipe — codex r2 caught both bugs in the prior wording.
 
 ### Skip if
 
