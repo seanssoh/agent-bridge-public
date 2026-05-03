@@ -861,7 +861,16 @@ done
 [[ -z "$NAME" ]] && bridge_die "--name은 필수입니다."
 
 if ! bridge_validate_agent_name "$NAME"; then
-  bridge_die "이름은 영문/숫자/점/밑줄/하이픈만 허용합니다: $NAME"
+  # Issue #526: same leading-dash / reserved-name rejection as `agent
+  # create`. Helps users who accidentally typed `--name --help`.
+  case "$NAME" in
+    -*)
+      bridge_die "이름이 CLI 플래그처럼 보입니다: '$NAME'. 도움말은 '$CLI_NAME --help' 를 실행하세요."
+      ;;
+    *)
+      bridge_die "이름은 영문/숫자/점/밑줄/하이픈만 허용하고 영문/숫자로 시작해야 하며 'help'/'version' 은 예약어입니다: $NAME"
+      ;;
+  esac
 fi
 
 case "$SPAWN_PREFERENCE" in

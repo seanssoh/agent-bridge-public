@@ -1680,8 +1680,28 @@ run_create() {
   local start_dry_run=""
 
   shift || true
+
+  # Issue #526: short-circuit help BEFORE the positional <agent> binding
+  # so `bridge-agent.sh create --help` (or via `agent-bridge agent create
+  # --help`) prints usage instead of scaffolding an agent named `--help`.
+  case "$agent" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+  esac
+
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") create <agent> [...]"
-  bridge_validate_agent_name "$agent" || bridge_die "에이전트 이름은 영문/숫자/._- 만 사용할 수 있습니다: $agent"
+  if ! bridge_validate_agent_name "$agent"; then
+    case "$agent" in
+      -*)
+        bridge_die "에이전트 이름이 CLI 플래그처럼 보입니다: '$agent'. 도움말을 보려면 '$(basename "$0") create --help' 를 실행하세요."
+        ;;
+      *)
+        bridge_die "에이전트 이름은 영문/숫자/._- 만 사용할 수 있고 영문/숫자로 시작해야 하며 'help'/'version' 은 예약어입니다: $agent"
+        ;;
+    esac
+  fi
   if bridge_agent_exists "$agent"; then
     bridge_die "이미 등록된 에이전트입니다: $agent"
   fi
