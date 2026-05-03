@@ -67,6 +67,13 @@ bridge_claude_settings_mode() {
   if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1; then
     for agent in "${BRIDGE_AGENT_IDS[@]}"; do
       [[ "$(bridge_agent_engine "$agent" 2>/dev/null || true)" == "claude" ]] || continue
+      # Issue #516: only static claude agents inherit the shared
+      # `autoCompactWindow=400000` defaults. Dynamic agents register their
+      # workdir in BRIDGE_AGENT_IDS too (see bridge_register_dynamic_agent
+      # in agent-bridge), so without a source gate the second branch matched
+      # any registered workdir and inflated dynamic-agent context budget
+      # against operator intent.
+      [[ "$(bridge_agent_source "$agent" 2>/dev/null || true)" == "static" ]] || continue
       agent_workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
       [[ -n "$agent_workdir" ]] || continue
       if [[ "$(bridge_hook_paths_equal "$workdir" "$agent_workdir")" == "1" ]]; then
