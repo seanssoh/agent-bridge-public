@@ -64,7 +64,7 @@ SOCKET_LINUX_ONLY_MESSAGE = (
 # Anything not in this set is collapsed to internal_error for the client.
 _PUBLIC_REASON_CODES: frozenset[str] = frozenset({
     "not_authorized",       # generic auth/ownership/visibility failure
-    "task_unavailable",     # generic existence failure (collapses task_not_found)
+    "task_unavailable",     # reserved for future generic existence failures (no current emitter)
     "unknown_option",       # argv parser rejection (already public-safe)
     "task_id_required",     # peer's own argv shape — discloses nothing new
     "invalid_argument",     # argparse / format failure
@@ -89,7 +89,10 @@ _PUBLIC_REASON_CODES: frozenset[str] = frozenset({
 # should see. Codes already in _PUBLIC_REASON_CODES are passed through.
 # Anything else falls back to internal_error.
 _PUBLIC_REASON_MAP: dict[str, str] = {
-    "task_not_found": "task_unavailable",
+    # task_not_found collapses to not_authorized (same as ownership/visibility
+    # failures) so a peer cannot distinguish "task does not exist" from "task
+    # exists but you cannot see it" — both leak task-id existence otherwise.
+    "task_not_found": "not_authorized",
     "show_not_visible": "not_authorized",
     "done_not_owner": "not_authorized",
     "claim_not_assigned": "not_authorized",

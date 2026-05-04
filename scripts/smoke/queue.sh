@@ -671,6 +671,18 @@ PY
   smoke_assert_not_contains "$denied_out" "done_not_owner" "body-file inline: detailed reason must not leak to client"
   smoke_assert_contains "$(cat "$server_log")" "reason_code=done_not_owner" "body-file inline: detailed reason recorded server-side"
 
+  # A peer hitting a task ID that does NOT exist must see the same public
+  # reason code as one hitting an existing-but-unauthorized task. Anything
+  # else lets the peer probe task-id existence across the isolation boundary.
+  set +e
+  denied_out="$(python3 "$SMOKE_REPO_ROOT/bridge-queue.py" done 2147483646 --agent forged --note "missing" 2>&1)"
+  denied_rc=$?
+  set -e
+  [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: nonexistent task done should exit 2"
+  smoke_assert_contains "$denied_out" "queue gateway denied: not_authorized" "body-file inline: nonexistent task public reason"
+  smoke_assert_not_contains "$denied_out" "task_not_found" "body-file inline: task_not_found must not leak to client"
+  smoke_assert_contains "$(cat "$server_log")" "reason_code=task_not_found" "body-file inline: task_not_found recorded server-side"
+
   queue_gateway_stop_socket_server
 }
 
