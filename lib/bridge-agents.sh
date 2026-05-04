@@ -4616,6 +4616,26 @@ bridge_plugin_mcp_identity_for_item() {
   esac
 }
 
+# Returns 0 if the channel item has a probeable plugin MCP identity
+# (currently the 4 chat providers we ship a `ps`-descendant probe for).
+# Returns 1 for plugins we ship without a probe (HTTP MCPs, marketplace
+# plugins, ms365 / generic command-MCPs, etc.) — these are reported as
+# unknown/skipped rather than missing so they cannot drive restart loops.
+# See issue #542; per-plugin-class probes (command-MCP, HTTP MCP) are
+# tracked as follow-ups and will extend this classifier.
+bridge_plugin_mcp_is_probeable_item() {
+  local item="$1"
+  local identity=""
+
+  identity="$(bridge_plugin_mcp_identity_for_item "$item")"
+  [[ -n "$identity" ]]
+}
+
+# NOTE: an empty identity from bridge_plugin_mcp_identity_for_item means
+# the plugin is *unprobeable* (we have no descendant probe for it), not
+# that it is missing. Callers should gate on bridge_plugin_mcp_is_probeable_item
+# *before* invoking this probe so unprobeable plugins do not get flagged
+# as missing and trigger restart loops (issue #542).
 bridge_plugin_mcp_descendant_ready_for_item() {
   local root_pid="$1"
   local item="$2"
@@ -4719,6 +4739,10 @@ bridge_agent_missing_plugin_mcp_channels_csv() {
   for item in "${items[@]}"; do
     item="$(bridge_trim_whitespace "$item")"
     [[ -n "$item" ]] || continue
+    # Skip plugins we cannot probe (HTTP MCPs, marketplace plugins, ms365,
+    # etc.). They are reported as unknown/skipped — not missing — so they
+    # cannot drive restart loops. See issue #542.
+    bridge_plugin_mcp_is_probeable_item "$item" || continue
     if ! bridge_agent_plugin_mcp_alive_for_item "$agent" "$item"; then
       missing="$(bridge_merge_channels_csv "$missing" "$item")"
     fi
