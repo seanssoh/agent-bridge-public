@@ -75,6 +75,24 @@ def stop_hook_command(bridge_home: Path, bash_bin: str) -> str:
     return shell_command(bash_bin, shell_path(hook_path))
 
 
+# Issue #541 PR-B: the Claude Stop event must fire three independent hooks —
+# mark-idle.sh (idle wake), surface-reply-enforce.py (assistant reply
+# guarantee), and session-stop.py (drain + transcript→daily-note reconcile).
+# Source agents/_template/.claude/settings.json already lists all three; the
+# shared base agents/.claude/settings.json carried only mark-idle.sh, so the
+# rerender path propagated the incomplete suite to every live always-on
+# Claude agent. Helpers below let the ensure path register the missing pair
+# in addition to mark-idle.sh.
+def surface_reply_enforce_hook_command(bridge_home: Path, python_bin: str) -> str:
+    hook_path = bridge_home / "hooks" / "surface-reply-enforce.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
+def session_stop_hook_command(bridge_home: Path, python_bin: str) -> str:
+    hook_path = bridge_home / "hooks" / "session-stop.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
 def session_start_hook_command(bridge_home: Path, python_bin: str, fmt: str = "text") -> str:
     hook_path = bridge_home / "hooks" / "session-start.py"
     if fmt != "text":
@@ -152,6 +170,14 @@ def hooks_list(settings: dict[str, Any], event_name: str) -> list[dict[str, Any]
 
 def is_mark_idle_hook(command: str) -> bool:
     return "mark-idle.sh" in str(command)
+
+
+def is_surface_reply_enforce_hook(command: str) -> bool:
+    return "surface-reply-enforce.py" in str(command)
+
+
+def is_session_stop_hook(command: str) -> bool:
+    return "session-stop.py" in str(command)
 
 
 def is_session_start_hook(command: str) -> bool:
@@ -237,18 +263,34 @@ def cmd_status_stop_hook(args: argparse.Namespace) -> int:
     settings_path = resolve_settings_path(args)
     settings = ensure_settings_root(settings_path)
     stop_hooks = hooks_list(settings, "Stop")
-    _group, hook = find_command_hook(stop_hooks, is_mark_idle_hook)
-    command = str(hook.get("command") or "") if hook else ""
+    _idle_group, idle_hook = find_command_hook(stop_hooks, is_mark_idle_hook)
+    _surface_group, surface_hook = find_command_hook(stop_hooks, is_surface_reply_enforce_hook)
+    _session_stop_group, session_stop_hook = find_command_hook(stop_hooks, is_session_stop_hook)
+    # mark-idle.sh keeps the legacy HOOK_STOP_HOOK / HOOK_COMMAND fields so
+    # existing operators / scripts that grep for them stay green. The
+    # HOOK_STOP_HOOK_SUITE field (#541 PR-B) reports the aggregate state so
+    # the upgrade and smoke paths can detect partial drops of the new pair.
+    command = str(idle_hook.get("command") or "") if idle_hook else ""
+    suite_present = bool(idle_hook and surface_hook and session_stop_hook)
     payload = {
         "HOOK_SETTINGS_FILE": str(settings_path),
-        "HOOK_STATUS": "present" if hook else "missing",
-        "HOOK_STOP_HOOK": "present" if hook else "missing",
+        "HOOK_STATUS": "present" if suite_present else "missing",
+        "HOOK_STOP_HOOK": "present" if idle_hook else "missing",
+        "HOOK_STOP_HOOK_SUITE": "present" if suite_present else "missing",
+        "HOOK_STOP_HOOK_MARK_IDLE": "present" if idle_hook else "missing",
+        "HOOK_STOP_HOOK_SURFACE_REPLY_ENFORCE": "present" if surface_hook else "missing",
+        "HOOK_STOP_HOOK_SESSION_STOP": "present" if session_stop_hook else "missing",
         "HOOK_PROMPT_HOOK": "",
         "HOOK_COMMAND": command,
-        "HOOK_ADDITIONAL_CONTEXT": "true" if hook and bool(hook.get("additionalContext")) else "false",
+        "HOOK_ADDITIONAL_CONTEXT": "true" if idle_hook and bool(idle_hook.get("additionalContext")) else "false",
     }
     print_payload(payload, args.format)
-    return 0 if hook else 1
+    if args.format != "shell":
+        print(f"stop_hook_suite: {'present' if suite_present else 'missing'}")
+        print(f"stop_hook_mark_idle: {'present' if idle_hook else 'missing'}")
+        print(f"stop_hook_surface_reply_enforce: {'present' if surface_hook else 'missing'}")
+        print(f"stop_hook_session_stop: {'present' if session_stop_hook else 'missing'}")
+    return 0 if suite_present else 1
 
 
 def cmd_status_session_start_hook(args: argparse.Namespace) -> int:
@@ -334,25 +376,60 @@ def ensure_command_hook(
 def cmd_ensure_stop_hook(args: argparse.Namespace) -> int:
     bridge_home = Path(args.bridge_home).expanduser()
     settings_path = resolve_settings_path(args)
-    desired_command = stop_hook_command(bridge_home, args.bash_bin)
+    # Resolve the python interpreter once. --bash-bin is the only required
+    # CLI flag historically (mark-idle.sh runs under bash), so we keep that
+    # contract and discover a python3 via PATH for the new pair. The render
+    # path that consumes this file later (bridge_link_claude_settings_to_shared)
+    # does the same dance.
+    python_bin = getattr(args, "python_bin", None) or shutil.which("python3") or "/usr/bin/python3"
+    mark_idle_command = stop_hook_command(bridge_home, args.bash_bin)
+    surface_command = surface_reply_enforce_hook_command(bridge_home, python_bin)
+    session_stop_command = session_stop_hook_command(bridge_home, python_bin)
+
+    # Issue #541 PR-B: ensure the full Stop hook suite. mark-idle.sh keeps
+    # additionalContext=true (idle-wake context); surface-reply-enforce.py
+    # and session-stop.py mirror agents/_template/.claude/settings.json
+    # (no additionalContext, timeout 5 / 35 respectively).
     changed = ensure_command_hook(
         settings_path,
         "Stop",
-        desired_command,
+        mark_idle_command,
         is_mark_idle_hook,
         timeout=3,
         additional_context=True,
     )
+    changed = ensure_command_hook(
+        settings_path,
+        "Stop",
+        surface_command,
+        is_surface_reply_enforce_hook,
+        timeout=5,
+    ) or changed
+    changed = ensure_command_hook(
+        settings_path,
+        "Stop",
+        session_stop_command,
+        is_session_stop_hook,
+        timeout=35,
+    ) or changed
 
     payload = {
         "HOOK_SETTINGS_FILE": str(settings_path),
         "HOOK_STATUS": "updated" if changed else "unchanged",
         "HOOK_STOP_HOOK": "present",
+        "HOOK_STOP_HOOK_SUITE": "present",
+        "HOOK_STOP_HOOK_MARK_IDLE": "present",
+        "HOOK_STOP_HOOK_SURFACE_REPLY_ENFORCE": "present",
+        "HOOK_STOP_HOOK_SESSION_STOP": "present",
         "HOOK_PROMPT_HOOK": "",
-        "HOOK_COMMAND": desired_command,
+        "HOOK_COMMAND": mark_idle_command,
         "HOOK_ADDITIONAL_CONTEXT": "true",
     }
     print_payload(payload, args.format)
+    if args.format != "shell":
+        print("stop_hook_suite: present")
+        print(f"surface_reply_enforce_command: {surface_command}")
+        print(f"session_stop_command: {session_stop_command}")
     return 0
 
 
@@ -874,6 +951,11 @@ def build_parser() -> argparse.ArgumentParser:
     ensure_parser.add_argument("--settings-file")
     ensure_parser.add_argument("--bridge-home", required=True)
     ensure_parser.add_argument("--bash-bin", required=True)
+    # --python-bin is optional for backward compatibility (existing callers
+    # in lib/bridge-hooks.sh only pass --bash-bin); when omitted the helper
+    # falls back to PATH-discovered python3. Required for the surface-reply
+    # and session-stop entries added by issue #541 PR-B.
+    ensure_parser.add_argument("--python-bin")
     ensure_parser.add_argument("--format", choices=("text", "shell"), default="text")
     ensure_parser.set_defaults(handler=cmd_ensure_stop_hook)
 
