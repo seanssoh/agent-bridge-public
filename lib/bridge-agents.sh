@@ -4074,7 +4074,6 @@ bridge_agent_channel_runtime_ready_for_item() {
       ;;
     plugin:ms365|plugin:ms365@*)
       dir="$(bridge_agent_ms365_state_dir "$agent")"
-      [[ -f "$dir/access.json" ]] || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MS365_CLIENT_ID)" == "present" ]] || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MS365_CLIENT_SECRET)" == "present" ]] || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MS365_TENANT_ID)" == "present" ]]
@@ -4204,6 +4203,12 @@ bridge_channel_access_status_for_item() {
   local access_file=""
 
   item="$(bridge_qualify_channel_item "$item")"
+  case "$item" in
+    plugin:ms365|plugin:ms365@*)
+      printf '%s' "n/a"
+      return 0
+      ;;
+  esac
   provider="$(bridge_channel_provider_for_item "$item")"
   dir="$(bridge_channel_state_dir_for_item "$agent" "$item")"
   [[ -n "$dir" ]] || {
@@ -5077,10 +5082,6 @@ bridge_agent_runtime_channel_status_reason() {
   if bridge_channel_csv_contains "$required" "plugin:ms365"; then
     local ms365_dir=""
     ms365_dir="$(bridge_agent_ms365_state_dir "$agent")"
-    if [[ ! -f "$ms365_dir/access.json" ]]; then
-      printf 'missing MS365 access file under %s (access.json required)' "$ms365_dir"
-      return 0
-    fi
     readiness="$(bridge_channel_env_file_readiness "$agent" "plugin:ms365" "$ms365_dir/.env" MS365_CLIENT_ID)"
     if [[ "$readiness" == "unreadable" ]]; then
       printf 'unreadable: MS365 .env under %s (ACL repair failed %s times; %s)' \

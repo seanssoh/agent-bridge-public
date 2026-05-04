@@ -280,11 +280,11 @@ assert_status_reason_unreadable_with_diagnostic() {
 
 assert_ms365_branch_covered() {
   # Set up: only ms365 required, .env present with valid keys. The new
-  # ms365 branch must process this without leaking through to the
-  # post-loop empty-string return — which historically meant ms365
-  # readiness was silently skipped.
+  # ms365 branch must process this without requiring access.json. Unlike
+  # Teams/Discord/Mattermost, ms365 is token/env based and has no allowlist
+  # access file in its runtime contract.
   mkdir -p "$MS365_DIR"
-  : >"$MS365_DIR/access.json"
+  rm -f "$MS365_DIR/access.json"
   write_present_ms365_env
   reset_repair_mock none
 
@@ -293,16 +293,19 @@ assert_ms365_branch_covered() {
 
   local reason
   reason="$(bridge_agent_runtime_channel_status_reason "$WORKER")"
-  smoke_assert_eq "" "$reason" "ms365 with all keys present produces empty status_reason (ok)"
+  smoke_assert_eq "" "$reason" "ms365 with all keys present and no access.json produces empty status_reason (ok)"
+  smoke_assert_eq "n/a" "$(bridge_channel_access_status_for_item "$WORKER" "plugin:ms365")" \
+    "ms365 reports access_status n/a because it has no access.json contract"
 
-  # Now break ms365 access.json — the new branch must surface that.
-  rm -f "$MS365_DIR/access.json"
+  # Now break the ms365 .env — the branch must surface that, proving it
+  # is not silently falling through after the access.json check was removed.
+  : >"$MS365_ENV"
   reason="$(bridge_agent_runtime_channel_status_reason "$WORKER")"
-  smoke_assert_contains "$reason" "missing MS365 access file" \
-    "ms365 branch surfaces missing access.json (proves branch is reached)"
+  smoke_assert_contains "$reason" "missing MS365 client id" \
+    "ms365 branch surfaces missing .env keys (proves branch is reached)"
 
   # Restore for unreadable-detection sub-check.
-  : >"$MS365_DIR/access.json"
+  write_present_ms365_env
   chmod 000 "$MS365_ENV"
   reset_repair_mock nop
   reason="$(bridge_agent_runtime_channel_status_reason "$WORKER")"
