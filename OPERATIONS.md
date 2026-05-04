@@ -176,6 +176,20 @@ in `agent-roster.local.sh` (env wins over settings per Claude Code's
 resolution order, so this overrides the new model-aware default and
 survives `agent-bridge upgrade --apply`).
 
+**Mixed-model installs (caveat).** The shared settings effective file
+under `$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json` is
+**install-wide** — one file symlinked from each managed agent's workdir.
+On installs where some agents launch `[1m]` and others launch pre-1M
+models, the file inherits the `autoCompactWindow` of whichever agent
+ran the last `agb upgrade --apply` / restart-rerender. Until per-agent
+effective settings lands (tracked separately), operators on mixed-model
+installs should either:
+
+- keep models homogeneous within an install, or
+- override per-agent via `CLAUDE_CODE_AUTO_COMPACT_WINDOW=<value>`
+  in the env-precedence layer (env wins over settings per Claude
+  Code's resolution order).
+
 ## Recommended Collaboration Pattern
 
 1. Start agents
