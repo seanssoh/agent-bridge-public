@@ -547,6 +547,93 @@ else
   pass "scenario 7 (D2h): heredoc prose preceded by whitespace still passes (regression-preserve)"
 fi
 
+# --- Scenario 8: stderr-suppression read-intent on protected path -------
+# Issue #574 + r2 follow-up. The three safe-redirect forms
+# (`2>/dev/null`, `2>&1`, `&>/dev/null`) must be classified as read-intent
+# so a `grep`/`cat`/`tail` on a protected file (allowed for any agent
+# under #383's read-bypass) is not falsely denied. Real writes — including
+# write redirects that *contain* a safe form, and substring-traps like
+# `2>/dev/null/extra` (a real write to a path under /dev/null/) — must
+# still deny. Each scenario reuses the protected access.json so the
+# system-config gate is the one actually tested.
+
+emit_bash_payload() {
+  # $1: tool_use_id, $2: command (single-quoted JSON-safe)
+  local id="$1" cmd="$2"
+  "$PYTHON" - "$id" "$cmd" <<'PY'
+import json, sys
+tool_use_id, command = sys.argv[1], sys.argv[2]
+print(json.dumps({
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_use_id": tool_use_id,
+    "session_id": f"test-session-{tool_use_id}",
+    "tool_input": {"command": command, "description": "574 r2 smoke"},
+}))
+PY
+}
+
+# 8a — safe-redirect read on protected path MUST be allowed (any agent)
+for form in "2>/dev/null" "2>&1" "&>/dev/null"; do
+  cmd="grep -nE x $ACCESS_PATH $form"
+  payload="$(emit_bash_payload "test-8a-$form" "$cmd")"
+  out="$(run_hook_pretool_payload "$payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+  if [[ "$out" == *'"deny"'* ]]; then
+    fail "scenario 8a: safe-redirect read \`$form\` falsely denied — output: $out"
+  else
+    pass "scenario 8a: safe-redirect read \`$form\` on protected path allowed"
+  fi
+done
+
+# 8b — real writes on protected path MUST still deny, even adjacent to a
+# safe form. `> bar` and `2>err.log` are real file writes; `2>&1` next to
+# them must not launder the classification.
+for write_cmd in \
+  "cat $ACCESS_PATH > /tmp/agb-574-bar" \
+  "cat $ACCESS_PATH > /tmp/agb-574-bar 2>&1" \
+  "cat $ACCESS_PATH 2>/tmp/agb-574-err"; do
+  payload="$(emit_bash_payload "test-8b" "$write_cmd")"
+  out="$(run_hook_pretool_payload "$payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+  if [[ "$out" == *'"deny"'* ]] && [[ "$out" == *"system config path"* ]]; then
+    pass "scenario 8b: real write denied — \`${write_cmd##* }\`"
+  else
+    fail "scenario 8b: real write not denied — cmd: $write_cmd / output: $out"
+  fi
+done
+
+# 8c — path-collision regression (THE r1 substring trap). Naive
+# `str.replace('2>/dev/null', '')` strips the substring out of
+# `2>/dev/null/extra`, hiding the real write to a path under /dev/null/.
+# The token-boundary regex (`_SAFE_REDIRECT_RE`) must keep these as write-
+# intent, so a hit on the protected path is denied.
+for trap_cmd in \
+  "cat $ACCESS_PATH 2>/dev/null/extra" \
+  "cat $ACCESS_PATH 2>/dev/null.bak"; do
+  payload="$(emit_bash_payload "test-8c" "$trap_cmd")"
+  out="$(run_hook_pretool_payload "$payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+  if [[ "$out" == *'"deny"'* ]] && [[ "$out" == *"system config path"* ]]; then
+    pass "scenario 8c: path-collision write denied — \`${trap_cmd##* }\`"
+  else
+    fail "scenario 8c: path-collision write not denied — cmd: $trap_cmd / output: $out"
+  fi
+done
+
+# 8d — compound commands carrying safe forms MUST stay read-intent so the
+# protected-path read still passes. Mixes `&&`, `;`, and `|` with the
+# three safe-redirect tokens.
+for compound_cmd in \
+  "cat $ACCESS_PATH && grep x $ACCESS_PATH 2>&1" \
+  "cat $ACCESS_PATH; grep x $ACCESS_PATH 2>/dev/null" \
+  "cat $ACCESS_PATH 2>/dev/null | grep x 2>&1"; do
+  payload="$(emit_bash_payload "test-8d" "$compound_cmd")"
+  out="$(run_hook_pretool_payload "$payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+  if [[ "$out" == *'"deny"'* ]]; then
+    fail "scenario 8d: compound read falsely denied — cmd: $compound_cmd / output: $out"
+  else
+    pass "scenario 8d: compound read allowed — \`${compound_cmd}\`"
+  fi
+done
+
 # --- Summary -------------------------------------------------------------
 printf '\n[smoke] system-config-gating: %d pass, %d fail\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

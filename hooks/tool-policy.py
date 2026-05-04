@@ -281,6 +281,17 @@ def _stage_first_token(stage: str) -> str:
 # not flip a read-intent classification (issue #574).
 _SAFE_REDIRECT_PATTERNS = ("2>/dev/null", "2>&1", "&>/dev/null")
 
+# Token-boundary regex used to strip the safe-redirect forms before
+# operator splitting. Naive `str.replace` would also strip substrings
+# like `2>/dev/null/extra` (a real write to a path *under* /dev/null/),
+# turning a write into a fake read (issue #574 r2). The lookahead
+# requires end-of-string or a shell metacharacter / whitespace after
+# the match — i.e. the form must stand on its own as a redirection
+# token, not as a prefix of a longer pathname.
+_SAFE_REDIRECT_RE = re.compile(
+    r"(?:2>/dev/null|2>&1|&>/dev/null)(?=$|[\s;&|()<>`$])"
+)
+
 
 def _is_read_intent_bash(command: str) -> bool:
     """Return True iff *command* is purely read-intent.
@@ -310,10 +321,10 @@ def _is_read_intent_bash(command: str) -> bool:
     # Strip stderr-suppression / fd-dup tokens before splitting on shell
     # operators. `_COMMAND_OPERATOR_RE` would otherwise tear `2>&1` and
     # `&>/dev/null` on the embedded `&`, hiding them from the per-token
-    # check below (issue #574).
-    sanitized = command
-    for safe in _SAFE_REDIRECT_PATTERNS:
-        sanitized = sanitized.replace(safe, " ")
+    # check below (issue #574). Matches must be token-boundary aware:
+    # `2>/dev/null/extra` is a real write to a path under /dev/null/,
+    # not a stderr discard, and must NOT be stripped (issue #574 r2).
+    sanitized = _SAFE_REDIRECT_RE.sub(" ", command)
     for stage in _COMMAND_OPERATOR_RE.split(sanitized):
         stage_stripped = stage.strip()
         if not stage_stripped:
