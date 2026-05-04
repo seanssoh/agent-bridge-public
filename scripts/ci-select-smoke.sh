@@ -201,7 +201,7 @@ select_for_path() {
       ;;
 
     bridge-start.sh|bridge-run.sh|bridge-send.sh|bridge-action.sh|bridge-agent.sh|agent-bridge|agb|lib/bridge-tmux.sh|lib/bridge-session-patterns.sh|lib/bridge-wave.sh|lib/bridge-agent-update.sh)
-      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update upgrade-conflicts-lifecycle
+      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update upgrade-conflicts-lifecycle managed-autocompact-window
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -246,7 +246,7 @@ select_for_path() {
       ;;
 
     bridge-upgrade.sh|bridge-upgrade.py|scripts/export-public-snapshot.sh|VERSION)
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair telegram-relay-residue-cleanup upgrade-conflicts-lifecycle
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window
       add_integration integration-minimal
       ;;
 
@@ -256,7 +256,7 @@ select_for_path() {
       ;;
 
     bridge-init.sh|lib/bridge-admin-pair.sh)
-      add_required admin-codex-pair upgrade-shared-settings-propagate
+      add_required admin-codex-pair upgrade-shared-settings-propagate managed-autocompact-window
       add_integration integration-minimal
       ;;
 
