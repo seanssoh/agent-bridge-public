@@ -334,6 +334,89 @@ queue_gateway_socket_acl_contract() {
   queue_gateway_stop_socket_server
 }
 
+queue_gateway_socket_acl_refresh_contract() {
+  local socket_path server_log nobody_uid acl_body current_user i
+
+  if ! command -v setfacl >/dev/null 2>&1 || ! command -v getfacl >/dev/null 2>&1; then
+    smoke_log "skip: queue gateway socket ACL refresh contract requires setfacl/getfacl"
+    return 0
+  fi
+  if ! nobody_uid="$(id -u nobody 2>/dev/null)"; then
+    smoke_log "skip: queue gateway socket ACL refresh contract requires nobody user"
+    return 0
+  fi
+
+  queue_gateway_stop_socket_server
+  queue_gateway_socket_env
+  unset BRIDGE_QUEUE_GATEWAY_PEERS
+  export BRIDGE_QUEUE_GATEWAY_ACL_REFRESH_SECONDS=1
+  current_user="$(id -un)"
+  cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
+bridge_add_agent_id_if_missing "worker-a"
+BRIDGE_AGENT_ENGINE["worker-a"]="claude"
+BRIDGE_AGENT_SESSION["worker-a"]="worker-a"
+BRIDGE_AGENT_WORKDIR["worker-a"]="$SMOKE_TMP_ROOT/worker-a"
+BRIDGE_AGENT_ISOLATION_MODE["worker-a"]="linux-user"
+BRIDGE_AGENT_OS_USER["worker-a"]="$current_user"
+EOF
+
+  BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" init >/dev/null
+  python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" ensure-runtime --bridge-home "$BRIDGE_HOME" --strict >/dev/null
+  socket_path="$(queue_gateway_socket_path)"
+  server_log="$SMOKE_TMP_ROOT/queue-gateway-socket-acl-refresh.log"
+  queue_gateway_start_socket_server "$socket_path" "$server_log"
+  acl_body="$(getfacl -cp "$socket_path")"
+  smoke_assert_not_contains "$acl_body" "user:nobody:rw-" "socket ACL starts without future peer"
+
+  cat >>"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
+bridge_add_agent_id_if_missing "worker-b"
+BRIDGE_AGENT_ENGINE["worker-b"]="claude"
+BRIDGE_AGENT_SESSION["worker-b"]="worker-b"
+BRIDGE_AGENT_WORKDIR["worker-b"]="$SMOKE_TMP_ROOT/worker-b"
+BRIDGE_AGENT_ISOLATION_MODE["worker-b"]="linux-user"
+BRIDGE_AGENT_OS_USER["worker-b"]="nobody"
+EOF
+
+  for ((i = 0; i < 30; i++)); do
+    acl_body="$(getfacl -cp "$socket_path")"
+    if [[ "$acl_body" == *"user:nobody:rw-"* ]]; then
+      queue_gateway_stop_socket_server
+      unset BRIDGE_QUEUE_GATEWAY_ACL_REFRESH_SECONDS
+      return 0
+    fi
+    sleep 0.2
+  done
+  smoke_fail "queue gateway socket ACL did not refresh for newly rostered isolated peer"
+}
+
+queue_gateway_socket_duplicate_uid_contract() {
+  local socket_path server_log duplicate_out duplicate_rc
+
+  if ! command -v timeout >/dev/null 2>&1; then
+    smoke_log "skip: queue gateway duplicate UID contract requires timeout"
+    return 0
+  fi
+
+  queue_gateway_stop_socket_server
+  queue_gateway_socket_env
+  export BRIDGE_QUEUE_GATEWAY_PEERS="$(id -u):worker-a,$(id -u):worker-b"
+  python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" ensure-runtime --bridge-home "$BRIDGE_HOME" --strict >/dev/null
+  socket_path="$(queue_gateway_socket_path)"
+  server_log="$SMOKE_TMP_ROOT/queue-gateway-socket-duplicate.log"
+
+  set +e
+  duplicate_out="$(timeout 5 python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" socket-server \
+    --bridge-home "$BRIDGE_HOME" \
+    --queue-script "$SMOKE_REPO_ROOT/bridge-queue.py" >"$server_log" 2>&1)"
+  duplicate_rc=$?
+  set -e
+  [[ "$duplicate_rc" -ne 0 ]] || smoke_fail "queue gateway socket server should reject duplicate peer UIDs"
+  [[ "$duplicate_rc" -ne 124 ]] || smoke_fail "queue gateway duplicate UID check hung"
+  duplicate_out="$(cat "$server_log")"
+  smoke_assert_contains "$duplicate_out" "duplicate peer uid" "socket gateway rejects ambiguous UID ownership"
+  [[ ! -S "$socket_path" ]] || smoke_fail "duplicate peer UID failure should not leave a socket"
+}
+
 queue_gateway_runtime_repair_contract() {
   local socket_path instance_dir
 
@@ -648,6 +731,8 @@ main() {
   if smoke_is_linux; then
     smoke_run "queue gateway socket peer auth contract" queue_gateway_socket_contract
     smoke_run "queue gateway socket peer ACL contract" queue_gateway_socket_acl_contract
+    smoke_run "queue gateway socket ACL refresh contract" queue_gateway_socket_acl_refresh_contract
+    smoke_run "queue gateway socket duplicate UID contract" queue_gateway_socket_duplicate_uid_contract
     smoke_run "queue gateway runtime repair contract" queue_gateway_runtime_repair_contract
     smoke_run "queue gateway argv-rewriting hardening" queue_gateway_argv_rewriting_contract
     smoke_run "queue gateway argv abbreviation hardening" queue_gateway_argv_abbrev_smuggling_contract
@@ -657,6 +742,8 @@ main() {
   else
     smoke_skip "queue gateway socket peer auth contract" "non-Linux"
     smoke_skip "queue gateway socket peer ACL contract" "non-Linux"
+    smoke_skip "queue gateway socket ACL refresh contract" "non-Linux"
+    smoke_skip "queue gateway socket duplicate UID contract" "non-Linux"
     smoke_skip "queue gateway runtime repair contract" "non-Linux"
     smoke_skip "queue gateway argv-rewriting hardening" "non-Linux"
     smoke_skip "queue gateway argv abbreviation hardening" "non-Linux"

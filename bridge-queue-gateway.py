@@ -46,6 +46,7 @@ LIVE_GATEWAY_RUNTIME_ROOT = "/run/agent-bridge"
 SOCKET_NAME = "queue-gateway.sock"
 MAX_SOCKET_BYTES = 2 * 1024 * 1024
 SOCKET_TIMEOUT_SECONDS = 5.0
+SOCKET_ACL_REFRESH_SECONDS = 30.0
 SOCKET_LINUX_ONLY_MESSAGE = (
     "queue gateway socket transport requires Linux (SO_PEERCRED); "
     "use BRIDGE_GATEWAY_TRANSPORT=file on this platform"
@@ -527,8 +528,15 @@ def _peer_map_from_env() -> dict[int, str]:
         uid_s = uid_s.strip()
         agent = agent.strip()
         if uid_s.isdigit() and agent:
-            peers[int(uid_s)] = agent
+            _add_peer(peers, int(uid_s), agent)
     return peers
+
+
+def _add_peer(peers: dict[int, str], uid: int, agent: str) -> None:
+    existing = peers.get(uid)
+    if existing and existing != agent:
+        raise SystemExit(f"queue gateway duplicate peer uid: uid={uid} agents={existing},{agent}")
+    peers[uid] = agent
 
 
 def _peer_map_from_roster(script_dir: Path) -> dict[int, str]:
@@ -556,17 +564,44 @@ done
         env=os.environ.copy(),
     )
     if proc.returncode != 0:
-        return {}
+        raise SystemExit("queue gateway peer roster probe failed")
     for line in proc.stdout.splitlines():
         parts = line.split("\t", 1)
         if len(parts) != 2 or not parts[0].isdigit() or not parts[1]:
             continue
-        peers[int(parts[0])] = parts[1]
+        _add_peer(peers, int(parts[0]), parts[1])
     return peers
+
+
+def _socket_acl_refresh_seconds() -> float:
+    raw = os.environ.get("BRIDGE_QUEUE_GATEWAY_ACL_REFRESH_SECONDS", str(SOCKET_ACL_REFRESH_SECONDS)).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return SOCKET_ACL_REFRESH_SECONDS
+    if value <= 0:
+        return SOCKET_ACL_REFRESH_SECONDS
+    return value
+
+
+def _run_setfacl(args: list[str], context: str) -> None:
+    proc = subprocess.run(
+        args,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or f"setfacl exited {proc.returncode}"
+        raise SystemExit(f"queue gateway socket {context} failed: {detail}")
 
 
 def _set_socket_acl(path: Path, peer_map: dict[int, str]) -> None:
     """Restrict socket access to the controller plus known isolated peer UIDs."""
+    setfacl = shutil.which("setfacl")
+    if setfacl:
+        _run_setfacl([setfacl, "-b", str(path)], "ACL reset")
     os.chmod(path, 0o600)
     current_uid = os.getuid()
     specs = []
@@ -582,20 +617,20 @@ def _set_socket_acl(path: Path, peer_map: dict[int, str]) -> None:
     if not specs:
         return
 
-    setfacl = shutil.which("setfacl")
     if not setfacl:
         raise SystemExit("queue gateway socket peer ACL requires setfacl for isolated UID peers")
 
-    proc = subprocess.run(
+    _run_setfacl(
         [setfacl, "-m", ",".join(specs + ["m::rw"]), str(path)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
+        "peer ACL",
     )
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or f"setfacl exited {proc.returncode}"
-        raise SystemExit(f"queue gateway socket peer ACL failed: {detail}")
+
+
+def _refresh_socket_acl(path: Path, peer_map: dict[int, str], script_dir: Path) -> None:
+    latest = _peer_map_from_roster(script_dir)
+    peer_map.clear()
+    peer_map.update(latest)
+    _set_socket_acl(path, peer_map)
 
 
 def _task_row(home: str, task_id: int) -> sqlite3.Row | None:
@@ -933,7 +968,10 @@ def cmd_socket_server(args: argparse.Namespace) -> int:
         return 1
     path = gateway_socket_path(home)
     queue_script = Path(args.queue_script).expanduser()
-    peer_map = _peer_map_from_roster(queue_script.resolve().parent)
+    script_dir = queue_script.resolve().parent
+    peer_map = _peer_map_from_roster(script_dir)
+    acl_refresh_seconds = _socket_acl_refresh_seconds()
+    next_acl_refresh = time.monotonic() + acl_refresh_seconds
     running = True
 
     def cleanup() -> None:
@@ -975,6 +1013,9 @@ def cmd_socket_server(args: argparse.Namespace) -> int:
             try:
                 conn, _addr = server.accept()
             except (TimeoutError, socket.timeout):
+                if time.monotonic() >= next_acl_refresh:
+                    _refresh_socket_acl(path, peer_map, script_dir)
+                    next_acl_refresh = time.monotonic() + acl_refresh_seconds
                 continue
             except OSError:
                 if running:
@@ -992,7 +1033,7 @@ def cmd_socket_server(args: argparse.Namespace) -> int:
                 with conn:
                     conn.settimeout(SOCKET_TIMEOUT_SECONDS)
                     _handle_socket_request(
-                        conn, queue_script, home, peer_map, queue_script.resolve().parent
+                        conn, queue_script, home, peer_map, script_dir
                     )
             except Exception as exc:  # noqa: BLE001 — listener survival > propagation
                 try:
