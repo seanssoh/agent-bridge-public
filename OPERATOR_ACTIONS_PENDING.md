@@ -374,8 +374,9 @@ not have propagated during prior upgrades:
 agent-bridge agent rerender-settings --apply
 ```
 
-Confirm `autoCompactWindow: 400000` is present in each managed Claude agent's
-effective settings.
+Confirm `autoCompactWindow: 1000000` is present in each managed Claude agent's
+effective settings (was `400000` pre-#570; the rerender now writes the
+unconditional 1M default).
 
 ### Skip if
 
