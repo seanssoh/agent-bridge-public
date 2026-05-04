@@ -605,10 +605,16 @@ done
 # `str.replace('2>/dev/null', '')` strips the substring out of
 # `2>/dev/null/extra`, hiding the real write to a path under /dev/null/.
 # The token-boundary regex (`_SAFE_REDIRECT_RE`) must keep these as write-
-# intent, so a hit on the protected path is denied.
+# intent, so a hit on the protected path is denied. r3: variable / command
+# substitution suffixes (`$VAR`, `` `cmd` ``) are also non-separators —
+# `2>/dev/null$SUFFIX` is a real write to a substituted path, not a
+# stderr discard, and must NOT be stripped by the safe-redirect regex.
 for trap_cmd in \
   "cat $ACCESS_PATH 2>/dev/null/extra" \
-  "cat $ACCESS_PATH 2>/dev/null.bak"; do
+  "cat $ACCESS_PATH 2>/dev/null.bak" \
+  "cat $ACCESS_PATH 2>/dev/null\$SUFFIX" \
+  "cat $ACCESS_PATH &>/dev/null\$SUFFIX" \
+  "cat $ACCESS_PATH 2>/dev/null\`cmd\`"; do
   payload="$(emit_bash_payload "test-8c" "$trap_cmd")"
   out="$(run_hook_pretool_payload "$payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
   if [[ "$out" == *'"deny"'* ]] && [[ "$out" == *"system config path"* ]]; then

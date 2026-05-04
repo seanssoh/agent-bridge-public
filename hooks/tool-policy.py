@@ -285,11 +285,13 @@ _SAFE_REDIRECT_PATTERNS = ("2>/dev/null", "2>&1", "&>/dev/null")
 # operator splitting. Naive `str.replace` would also strip substrings
 # like `2>/dev/null/extra` (a real write to a path *under* /dev/null/),
 # turning a write into a fake read (issue #574 r2). The lookahead
-# requires end-of-string or a shell metacharacter / whitespace after
-# the match — i.e. the form must stand on its own as a redirection
-# token, not as a prefix of a longer pathname.
+# requires end-of-string or a true shell token-separator after the
+# match — whitespace or one of `; & | ( ) < >`. `$` and backtick are
+# excluded because they begin variable / command substitution and are
+# not separators: `2>/dev/null$VAR` and ``2>/dev/null`cmd` `` are real
+# writes to a substituted path, not stderr discards (issue #574 r3).
 _SAFE_REDIRECT_RE = re.compile(
-    r"(?:2>/dev/null|2>&1|&>/dev/null)(?=$|[\s;&|()<>`$])"
+    r"(?:2>/dev/null|2>&1|&>/dev/null)(?=$|[\s;&|()<>])"
 )
 
 
