@@ -412,6 +412,70 @@ queue_gateway_argv_rewriting_contract() {
   queue_gateway_stop_socket_server
 }
 
+# r3 finding 2a: argparse abbreviation smuggling. Without
+# allow_abbrev=False on the inner bridge-queue.py parsers, argparse
+# silently expands `--note-f` → `--note-file` (a value-taking flag),
+# which under the r2 walker would consume the would-be assigned id
+# while the gateway authorized against the smuggled value as a bare
+# positional. The r3 contract requires both halves: bridge-queue.py
+# subparsers set allow_abbrev=False, AND the gateway walker rejects
+# unknown long options up front. This smoke confirms the gateway
+# refuses the abbreviation form, AND that the full `--note` flag still
+# works.
+queue_gateway_argv_abbrev_smuggling_contract() {
+  local socket_path server_log assigned_id denied_out denied_rc accept_out accept_rc show_out
+
+  queue_gateway_stop_socket_server
+  queue_gateway_socket_env
+  BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" init >/dev/null
+  python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" ensure-runtime --bridge-home "$BRIDGE_HOME" --strict >/dev/null
+  socket_path="$(queue_gateway_socket_path)"
+  server_log="$SMOKE_TMP_ROOT/queue-gateway-abbrev.log"
+  queue_gateway_start_socket_server "$socket_path" "$server_log"
+
+  assigned_id="$(
+    BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a --from requester \
+      --title "abbrev smuggling assigned" --body "owned" \
+      --format shell | sed -n 's/^TASK_ID=//p' | tr -d "'"
+  )"
+  python3 "$SMOKE_REPO_ROOT/bridge-queue.py" claim "$assigned_id" --agent worker-a --lease-seconds 60 >/dev/null
+
+  # Smuggle attempt: `done --note-f <assigned_id> <some_other_id> --agent forged`.
+  # Under default-on argparse abbreviation, the inner parser would expand
+  # `--note-f` → `--note-file`, swallowing <assigned_id> and operating on
+  # <some_other_id>. The gateway walker (r3) does not know `--note-f`, so
+  # it must reject as `unknown_option` BEFORE any DB lookup or argv
+  # rewriting can occur.
+  set +e
+  denied_out="$(
+    python3 "$SMOKE_REPO_ROOT/bridge-queue.py" done \
+      --note-f "$assigned_id" 999 --agent forged 2>&1
+  )"
+  denied_rc=$?
+  set -e
+  [[ "$denied_rc" -ne 0 ]] || smoke_fail "abbrev smuggling: gateway should refuse abbreviated --note-f"
+  smoke_assert_contains "$denied_out" "queue gateway denied" "abbrev smuggling: gateway emits denial"
+
+  # Sanity: the assigned task is still claimed (not flipped to done).
+  show_out="$(BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" show "$assigned_id" --format shell)"
+  smoke_assert_not_contains "$show_out" "TASK_STATUS=done" "abbrev smuggling: real task must not be marked done"
+
+  # Positive case: full --note flag still works for the legitimate owner.
+  set +e
+  accept_out="$(
+    python3 "$SMOKE_REPO_ROOT/bridge-queue.py" done \
+      "$assigned_id" --agent worker-a --note "abbrev smoke complete" 2>&1
+  )"
+  accept_rc=$?
+  set -e
+  [[ "$accept_rc" -eq 0 ]] || smoke_fail "abbrev smuggling: full --note flag must still succeed (rc=$accept_rc out=$accept_out)"
+  show_out="$(BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" show "$assigned_id" --format shell)"
+  smoke_assert_contains "$show_out" "TASK_STATUS=done" "abbrev smuggling: full-flag done succeeds"
+
+  queue_gateway_stop_socket_server
+}
+
 # r2 finding 8b: peer disconnect / partial frame must NOT kill the
 # listener. Open a socket, write a partial JSON, close. Then verify a
 # subsequent valid request still succeeds.
@@ -586,6 +650,7 @@ main() {
     smoke_run "queue gateway socket peer ACL contract" queue_gateway_socket_acl_contract
     smoke_run "queue gateway runtime repair contract" queue_gateway_runtime_repair_contract
     smoke_run "queue gateway argv-rewriting hardening" queue_gateway_argv_rewriting_contract
+    smoke_run "queue gateway argv abbreviation hardening" queue_gateway_argv_abbrev_smuggling_contract
     smoke_run "queue gateway accept-loop survival" queue_gateway_accept_loop_survival
     smoke_run "queue gateway socket-down fail-closed" queue_gateway_socket_down_contract
     smoke_run "queue gateway server-side ownership recheck" queue_gateway_server_side_ownership_contract
@@ -594,6 +659,7 @@ main() {
     smoke_skip "queue gateway socket peer ACL contract" "non-Linux"
     smoke_skip "queue gateway runtime repair contract" "non-Linux"
     smoke_skip "queue gateway argv-rewriting hardening" "non-Linux"
+    smoke_skip "queue gateway argv abbreviation hardening" "non-Linux"
     smoke_skip "queue gateway accept-loop survival" "non-Linux"
     smoke_skip "queue gateway socket-down fail-closed" "non-Linux"
     smoke_skip "queue gateway server-side ownership recheck" "non-Linux"

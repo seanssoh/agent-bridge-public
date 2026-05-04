@@ -638,27 +638,31 @@ def _has_file_arg(argv: list[str]) -> bool:
 
 
 # Per-subcommand option tables for the strict task-id walker (finding 2a,
-# r2 review). The earlier _task_id() walked the argv looking for the first
-# non-option token, which let an option *value* be misread as the
-# positional task id. Example: `done --note 60 12 --agent forged` would
-# extract 60 (the value of --note) for authorization while the real
-# bridge-queue.py invocation operated on task 12.
+# r2 + r3 review). The original walker treated any first non-option token
+# as the positional task id. r2 added the value-flag table to skip the
+# token following `--note`/`--note-file`/etc., closing `done --note 60 12
+# --agent forged`. r3 closes the prefix-abbreviation bypass: argparse's
+# default `allow_abbrev=True` lets the inner parser expand `--note-f` →
+# `--note-file`, but the gateway walker has no notion of abbreviations,
+# so under r2 the gateway saw `--note-f` as an unknown value-less flag
+# and read `60` as the positional, while the inner parser consumed `60`
+# into `--note-file` and operated on `12`. The r3 contract: bridge-queue.py
+# subparsers all set `allow_abbrev=False`, AND this walker rejects any
+# long option that is not in the known-flag set for the subcommand. Both
+# halves are required — relying on either alone re-opens the smuggling
+# window if the other side regresses.
 #
-# Each entry below names which long flags accept a value (and therefore
-# consume the following token) for the named subcommand. Boolean flags do
-# not appear here. Both `--flag value` and `--flag=value` forms must be
-# tolerated. argparse-style abbreviations are NOT honored here — the
-# gateway only forwards full flag names that the bridge-queue.py parser
-# accepts, so an unknown `--<flag>` is treated as a *value-less* flag (it
-# will fail downstream, but cannot smuggle a value into the positional
-# slot).
+# `_VALUE_FLAGS_BY_SUBCMD` lists long flags that *consume the following
+# token*. `_BOOLEAN_FLAGS_BY_SUBCMD` lists flags that do not. The union
+# is the gateway-allowed set of long options for each subcommand; any
+# other long option is rejected as `unknown_option`. Both `--flag value`
+# and `--flag=value` forms are tolerated. The `--body-file` /
+# `--note-file` value flags are also gated upstream by `_has_file_arg`,
+# but appear here so the walker is honest if that gate is ever loosened.
 #
 # This table must stay in sync with bridge-queue.py's per-subcommand
-# argparse definitions for `claim`, `done`, `cancel`, `update`, `handoff`,
-# and `show`. The `--body-file` / `--note-file` flags are intentionally
-# rejected before this walker runs (see _has_file_arg), so they are listed
-# here only to keep the walker honest if the file-arg gate is ever
-# loosened.
+# argparse definitions. When you add or rename a flag in bridge-queue.py,
+# update the matching entry below in the same change.
 _VALUE_FLAGS_BY_SUBCMD: dict[str, frozenset[str]] = {
     "claim": frozenset({"--agent", "--lease-seconds"}),
     "done": frozenset({"--agent", "--note", "--note-file"}),
@@ -676,20 +680,36 @@ _VALUE_FLAGS_BY_SUBCMD: dict[str, frozenset[str]] = {
     "show": frozenset({"--format"}),
 }
 
+_BOOLEAN_FLAGS_BY_SUBCMD: dict[str, frozenset[str]] = {
+    "claim": frozenset(),
+    "done": frozenset(),
+    "cancel": frozenset(),
+    "update": frozenset(),
+    "handoff": frozenset(),
+    "show": frozenset(),
+}
 
-def _extract_positional_task_id(argv: list[str]) -> int | None:
+
+def _extract_positional_task_id(argv: list[str]) -> tuple[int | None, str]:
     """Return the parsed positional task id for the given subcommand argv.
 
     Walks the argv with knowledge of which flags consume the next token,
-    so `done --note 60 12` returns 12, not 60. Returns None when:
-      * the argv has no recognizable subcommand (caller should reject);
-      * the first bare positional is not an integer;
-      * the argv contains no bare positional.
+    so `done --note 60 12` returns (12, "ok"). Returns:
+      * (None, "task_id_required") — no bare positional found, or the
+        first one is not an integer, or the argv is empty / has no
+        recognizable subcommand.
+      * (None, "unknown_option") — the argv contains a long option
+        that is not in the gateway-known set for this subcommand.
+        Treated fail-closed: argparse abbreviations or any other novel
+        flag must reach an explicit allow-list update before they pass.
+      * (task_id, "ok") on success.
     """
     if not argv:
-        return None
+        return None, "task_id_required"
     subcmd = argv[0]
     value_flags = _VALUE_FLAGS_BY_SUBCMD.get(subcmd, frozenset())
+    boolean_flags = _BOOLEAN_FLAGS_BY_SUBCMD.get(subcmd, frozenset())
+    known_flags = value_flags | boolean_flags
     skip_next = False
     for token in argv[1:]:
         if skip_next:
@@ -698,25 +718,36 @@ def _extract_positional_task_id(argv: list[str]) -> int | None:
         if token == "--":
             # Conservative: the queue parser does not use `--`, so treat a
             # bare `--` as no-positional rather than guessing.
-            return None
+            return None, "task_id_required"
         if token.startswith("--"):
+            # Strip an inline `=value` so `--flag=value` and `--flag` map
+            # to the same flag-name lookup.
+            flag_name = token.split("=", 1)[0]
+            if flag_name not in known_flags:
+                # r3 finding 2a: reject anything the gateway can't classify.
+                # If the inner parser (bridge-queue.py) honored argparse's
+                # default abbreviation expansion, an unknown prefix here
+                # would let a later token be smuggled into either the
+                # positional slot or a value slot. Fail closed; clients
+                # must spell flags exactly.
+                return None, "unknown_option"
             if "=" in token:
                 # `--flag=value` self-contains the value; the next token
                 # is still positional.
                 continue
-            if token in value_flags:
+            if flag_name in value_flags:
                 skip_next = True
             continue
         if token.startswith("-") and len(token) > 1:
             # Short options are not used by bridge-queue subcommands the
-            # gateway forwards. Skip without consuming a value to avoid
-            # accidentally swallowing a real positional.
-            continue
+            # gateway forwards. Reject so the walker stays in sync with
+            # what the inner parser actually accepts.
+            return None, "unknown_option"
         try:
-            return int(token)
+            return int(token), "ok"
         except ValueError:
-            return None
-    return None
+            return None, "task_id_required"
+    return None, "task_id_required"
 
 
 def authorize_and_rewrite(home: str, peer_agent: str, argv: list[str]) -> tuple[bool, str, list[str]]:
@@ -733,9 +764,9 @@ def authorize_and_rewrite(home: str, peer_agent: str, argv: list[str]) -> tuple[
     if subcmd in {"inbox", "find-open", "claim", "done"}:
         rewritten = _set_option(argv, "--agent", peer_agent)
         if subcmd in {"claim", "done"}:
-            task_id = _extract_positional_task_id(argv)
+            task_id, parse_reason = _extract_positional_task_id(argv)
             if task_id is None:
-                return False, "task_id_required", argv
+                return False, parse_reason, argv
             row = _task_row(home, task_id)
             if row is None:
                 return False, "task_not_found", argv
@@ -749,9 +780,9 @@ def authorize_and_rewrite(home: str, peer_agent: str, argv: list[str]) -> tuple[
     if subcmd == "summary":
         return True, "ok", _set_option(argv, "--agent", peer_agent)
     if subcmd == "show":
-        task_id = _extract_positional_task_id(argv)
+        task_id, parse_reason = _extract_positional_task_id(argv)
         if task_id is None:
-            return False, "task_id_required", argv
+            return False, parse_reason, argv
         row = _task_row(home, task_id)
         if row is None:
             return False, "task_not_found", argv
@@ -759,9 +790,9 @@ def authorize_and_rewrite(home: str, peer_agent: str, argv: list[str]) -> tuple[
             return False, "show_not_visible", argv
         return True, "ok", argv
     if subcmd in {"cancel", "update"}:
-        task_id = _extract_positional_task_id(argv)
+        task_id, parse_reason = _extract_positional_task_id(argv)
         if task_id is None:
-            return False, "task_id_required", argv
+            return False, parse_reason, argv
         row = _task_row(home, task_id)
         if row is None:
             return False, "task_not_found", argv
@@ -769,9 +800,9 @@ def authorize_and_rewrite(home: str, peer_agent: str, argv: list[str]) -> tuple[
             return False, f"{subcmd}_not_owner", argv
         return True, "ok", _set_option(argv, "--actor", peer_agent)
     if subcmd == "handoff":
-        task_id = _extract_positional_task_id(argv)
+        task_id, parse_reason = _extract_positional_task_id(argv)
         if task_id is None:
-            return False, "task_id_required", argv
+            return False, parse_reason, argv
         row = _task_row(home, task_id)
         if row is None:
             return False, "task_not_found", argv

@@ -2072,12 +2072,21 @@ def cmd_events(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="bridge-queue.py")
+    # PR #571 r3 finding 2a: every parser disables argparse's default
+    # prefix-abbreviation. The queue gateway authorizer (bridge-queue-gateway.py
+    # _extract_positional_task_id) walks argv with a *fixed* per-subcommand
+    # value-flag table; a long option that argparse would silently expand
+    # (e.g. `--note-f` → `--note-file`) is unknown to that walker, which
+    # then misreads the would-be value as the positional task id while
+    # this parser executes against a different positional. allow_abbrev=False
+    # forces clients to spell flags exactly so the gateway and the inner
+    # parser see the same shape.
+    parser = argparse.ArgumentParser(prog="bridge-queue.py", allow_abbrev=False)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("init")
+    subparsers.add_parser("init", allow_abbrev=False)
 
-    create_parser = subparsers.add_parser("create")
+    create_parser = subparsers.add_parser("create", allow_abbrev=False)
     create_parser.add_argument("--to", dest="assigned_to", required=True)
     create_parser.add_argument("--title", required=True)
     create_parser.add_argument("--from", dest="actor")
@@ -2089,18 +2098,18 @@ def build_parser() -> argparse.ArgumentParser:
     body_group.add_argument("--body-file")
     create_parser.set_defaults(handler=cmd_create)
 
-    inbox_parser = subparsers.add_parser("inbox")
+    inbox_parser = subparsers.add_parser("inbox", allow_abbrev=False)
     inbox_parser.add_argument("--agent", required=True)
     inbox_parser.add_argument("--status", action="append", choices=STATUS_CHOICES)
     inbox_parser.add_argument("--all", action="store_true")
     inbox_parser.set_defaults(handler=cmd_inbox)
 
-    show_parser = subparsers.add_parser("show")
+    show_parser = subparsers.add_parser("show", allow_abbrev=False)
     show_parser.add_argument("task_id", type=int)
     show_parser.add_argument("--format", choices=("text", "shell"), default="text")
     show_parser.set_defaults(handler=cmd_show)
 
-    find_open_parser = subparsers.add_parser("find-open")
+    find_open_parser = subparsers.add_parser("find-open", allow_abbrev=False)
     find_open_parser.add_argument("--agent", required=True)
     find_open_parser.add_argument("--title-prefix")
     find_open_parser.add_argument("--format", choices=("id", "text", "shell", "json"), default="id")
@@ -2121,13 +2130,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     find_open_parser.set_defaults(handler=cmd_find_open)
 
-    claim_parser = subparsers.add_parser("claim")
+    claim_parser = subparsers.add_parser("claim", allow_abbrev=False)
     claim_parser.add_argument("task_id", type=int)
     claim_parser.add_argument("--agent", required=True)
     claim_parser.add_argument("--lease-seconds", default=os.environ.get("BRIDGE_TASK_LEASE_SECONDS", "900"))
     claim_parser.set_defaults(handler=cmd_claim)
 
-    done_parser = subparsers.add_parser("done")
+    done_parser = subparsers.add_parser("done", allow_abbrev=False)
     done_parser.add_argument("task_id", type=int)
     done_parser.add_argument("--agent", required=True)
     note_group = done_parser.add_mutually_exclusive_group()
@@ -2135,7 +2144,7 @@ def build_parser() -> argparse.ArgumentParser:
     note_group.add_argument("--note-file")
     done_parser.set_defaults(handler=cmd_done)
 
-    cancel_parser = subparsers.add_parser("cancel")
+    cancel_parser = subparsers.add_parser("cancel", allow_abbrev=False)
     cancel_parser.add_argument("task_id", type=int)
     cancel_parser.add_argument("--actor")
     cancel_group = cancel_parser.add_mutually_exclusive_group()
@@ -2143,7 +2152,7 @@ def build_parser() -> argparse.ArgumentParser:
     cancel_group.add_argument("--note-file")
     cancel_parser.set_defaults(handler=cmd_cancel)
 
-    update_parser = subparsers.add_parser("update")
+    update_parser = subparsers.add_parser("update", allow_abbrev=False)
     update_parser.add_argument("task_id", type=int)
     update_parser.add_argument("--actor")
     update_parser.add_argument("--title")
@@ -2155,7 +2164,7 @@ def build_parser() -> argparse.ArgumentParser:
     update_body_group.add_argument("--body-file")
     update_parser.set_defaults(handler=cmd_update)
 
-    handoff_parser = subparsers.add_parser("handoff")
+    handoff_parser = subparsers.add_parser("handoff", allow_abbrev=False)
     handoff_parser.add_argument("task_id", type=int)
     handoff_parser.add_argument("--to", dest="assigned_to", required=True)
     handoff_parser.add_argument("--from", dest="actor")
@@ -2164,19 +2173,19 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_group.add_argument("--note-file")
     handoff_parser.set_defaults(handler=cmd_handoff)
 
-    summary_parser = subparsers.add_parser("summary")
+    summary_parser = subparsers.add_parser("summary", allow_abbrev=False)
     summary_parser.add_argument("--agent", action="append")
     summary_parser.add_argument("--format", choices=("text", "tsv", "json"), default="text")
     summary_parser.set_defaults(handler=cmd_summary)
 
-    cron_ready_parser = subparsers.add_parser("cron-ready")
+    cron_ready_parser = subparsers.add_parser("cron-ready", allow_abbrev=False)
     cron_ready_parser.add_argument("--limit", type=int, default=50)
     cron_ready_parser.add_argument("--format", choices=("text", "tsv"), default="tsv")
     cron_ready_parser.add_argument("--status-snapshot")
     cron_ready_parser.add_argument("--memory-daily-defer-seconds", type=int, default=10800)
     cron_ready_parser.set_defaults(handler=cmd_cron_ready)
 
-    daemon_parser = subparsers.add_parser("daemon-step")
+    daemon_parser = subparsers.add_parser("daemon-step", allow_abbrev=False)
     daemon_parser.add_argument("--snapshot", required=True)
     daemon_parser.add_argument("--lease-seconds", default=os.environ.get("BRIDGE_TASK_LEASE_SECONDS", "900"))
     daemon_parser.add_argument(
@@ -2216,7 +2225,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_parser.add_argument("--format", choices=("text", "tsv"), default="tsv")
     daemon_parser.set_defaults(handler=cmd_daemon_step)
 
-    nudge_parser = subparsers.add_parser("note-nudge")
+    nudge_parser = subparsers.add_parser("note-nudge", allow_abbrev=False)
     nudge_parser.add_argument("--agent", required=True)
     nudge_parser.add_argument("--key")
     nudge_parser.add_argument(
@@ -2226,7 +2235,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     nudge_parser.set_defaults(handler=cmd_note_nudge)
 
-    events_parser = subparsers.add_parser("events")
+    events_parser = subparsers.add_parser("events", allow_abbrev=False)
     events_parser.add_argument("--type", dest="event_type")
     events_parser.add_argument("--after-id", type=int, default=0)
     events_parser.add_argument("--limit", type=int, default=100)

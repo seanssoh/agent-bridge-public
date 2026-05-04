@@ -4158,18 +4158,57 @@ bridge_queue_gateway_socket_pid() {
   sed -n '1p' "$pid_file"
 }
 
+bridge_queue_gateway_socket_connect_probe() {
+  # PR #571 r3 finding 4: real liveness probe. pid+socket-file existence
+  # is necessary but not sufficient — a recycled pid plus a leftover
+  # socket file (bound by a previous listener that exited without unlink,
+  # or `touch`ed by an unrelated tool) both pass the file-only check.
+  # This connect probe asks the OS whether *something is actually
+  # listening on the socket right now*. SOCK_SEQPACKET connect() against
+  # a Unix socket file with no bound listener returns ECONNREFUSED
+  # (and against a non-socket regular file returns ENOTSOCK). On
+  # success, return 0; on any failure, return 1. The probe is
+  # short-lived and side-effect-free (it does not send a payload, so
+  # the listener does not need to read or respond).
+  local socket_path
+  socket_path="$1"
+  [[ -n "$socket_path" ]] || return 1
+  python3 - "$socket_path" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+path = sys.argv[1]
+sock_type = getattr(socket, "SOCK_SEQPACKET", None)
+if sock_type is None:
+    raise SystemExit(1)
+sock = socket.socket(socket.AF_UNIX, sock_type)
+try:
+    sock.settimeout(1.0)
+    sock.connect(path)
+except OSError:
+    raise SystemExit(1)
+finally:
+    sock.close()
+raise SystemExit(0)
+PY
+}
+
 bridge_queue_gateway_socket_is_running() {
-  # Joint liveness: pid alive AND socket exists. `kill -0 $pid` alone is
-  # unreliable on its own (pid recycling can map a stale pid to an
-  # unrelated process). Requiring the socket file to exist alongside the
-  # pid catches both halves of the typical failure modes:
-  #   * pid file present but listener crashed before socket was created
-  #     → socket missing, return 1 + caller cleans up.
-  #   * pid file present but pid was recycled to an unrelated process
-  #     → socket missing (the unrelated process did not bind it), return 1.
-  # The caller (start/stop/status) is then expected to remove stale
-  # artifacts before its decision becomes idempotent — see
-  # bridge_queue_gateway_socket_clean_stale.
+  # PR #571 r3 finding 4: defense-in-depth liveness check.
+  #   1. pid file present and parseable.
+  #   2. recorded pid is alive (`kill -0`).
+  #   3. socket file exists at the expected path.
+  #   4. connect() to the socket succeeds — i.e. the recorded pid is
+  #      *actually* the process bound to that socket, not a recycled
+  #      pid that happens to be running an unrelated program.
+  # Stages 1-3 alone admit two false-positives:
+  #   * recycled pid + leftover socket file (previous listener crashed
+  #     without unlinking the bind path; pid was reassigned).
+  #   * pid file written manually + socket file `touch`ed (no listener
+  #     ever ran).
+  # The connect probe rejects both. The caller (start/stop/status) is
+  # then expected to remove stale artifacts before its decision becomes
+  # idempotent — see bridge_queue_gateway_socket_clean_stale.
   local pid
   local socket_path
   pid="$(bridge_queue_gateway_socket_pid 2>/dev/null || true)"
@@ -4177,14 +4216,18 @@ bridge_queue_gateway_socket_is_running() {
   kill -0 "$pid" 2>/dev/null || return 1
   socket_path="$(bridge_queue_gateway_socket_path 2>/dev/null || true)"
   [[ -n "$socket_path" && -S "$socket_path" ]] || return 1
+  bridge_queue_gateway_socket_connect_probe "$socket_path" || return 1
   return 0
 }
 
 bridge_queue_gateway_socket_clean_stale() {
-  # Idempotent stale-state sweep. Removes the pid file when the listener
-  # process is gone, and removes the socket file when no listener owns
-  # the recorded pid. Safe to call from start (before deciding to spawn)
-  # and stop (before claiming success).
+  # Idempotent stale-state sweep. Removes the pid file + socket file
+  # whenever the joint liveness check reports the listener as not
+  # actually serving — either because the recorded pid is gone, OR
+  # because the connect probe (r3 finding 4) refuses, which catches
+  # recycled-pid / stale-socket false-positives that the file-only
+  # check would otherwise pass. Safe to call from start (before
+  # deciding to spawn) and stop (before claiming success).
   local pid_file
   local socket_path
   local pid
@@ -4202,6 +4245,15 @@ bridge_queue_gateway_socket_clean_stale() {
       if [[ -n "$socket_path" && -S "$socket_path" ]]; then
         rm -f "$socket_path"
       fi
+    elif [[ -n "$socket_path" && -S "$socket_path" ]] \
+        && ! bridge_queue_gateway_socket_connect_probe "$socket_path"; then
+      # pid is alive but connect refuses → recorded pid is not the
+      # process actually bound to this socket (recycled pid, or a
+      # listener that exited without unlinking). Drop both artifacts so
+      # the next start spawns fresh and the next stop does not signal
+      # an unrelated process.
+      rm -f "$pid_file"
+      rm -f "$socket_path"
     fi
   else
     # No pid recorded but a stale socket may exist from a previous run.
@@ -4272,8 +4324,15 @@ bridge_start_queue_gateway_socket_listener() {
   [[ "$wait_seconds" =~ ^[0-9]+$ ]] || wait_seconds=3
   attempts=$(( wait_seconds * 10 ))
   (( attempts > 0 )) || attempts=1
+  # PR #571 r3 finding 4: readiness requires the listener to have
+  # actually called bind+listen. `-S` flips true at bind time but a
+  # racy reader can still see it before the listener accepts; the
+  # connect probe waits for an accepting socket, so a green readiness
+  # check here is a proper liveness check, not just a "socket file
+  # appeared" check.
   for ((i = 0; i < attempts; i++)); do
-    if [[ -S "$socket_path" ]] && kill -0 "$pid" 2>/dev/null; then
+    if [[ -S "$socket_path" ]] && kill -0 "$pid" 2>/dev/null \
+        && bridge_queue_gateway_socket_connect_probe "$socket_path"; then
       bridge_audit_log daemon queue_gateway_socket_started daemon \
         --detail pid="$pid" \
         --detail socket="$socket_path" >/dev/null 2>&1 || true
@@ -4295,11 +4354,14 @@ bridge_start_queue_gateway_socket_listener() {
 }
 
 bridge_stop_queue_gateway_socket_listener() {
-  # Joint pid+socket validation: only signal the recorded pid when the
-  # socket file ALSO exists. This avoids killing an unrelated recycled
-  # pid when the listener is actually long-dead and only the pid file
-  # lingered. After signaling (or skipping), unconditionally clear both
-  # artifacts so the next start is idempotent.
+  # PR #571 r3 finding 4: only signal the recorded pid when ALL three
+  # are true: pid alive, socket file present, AND connect probe accepts.
+  # The connect probe is the line of defense against signalling an
+  # unrelated recycled pid: if pid+socket exist but no listener is
+  # bound (recycled pid, leftover socket file, or manual fixture), the
+  # recorded pid is not ours to kill — drop the artifacts and return.
+  # After signaling (or skipping), unconditionally clear both artifacts
+  # so the next start is idempotent.
   local pid_file
   local socket_path
   local pid
@@ -4309,7 +4371,8 @@ bridge_stop_queue_gateway_socket_listener() {
   socket_path="$(bridge_queue_gateway_socket_path 2>/dev/null || true)"
   pid="$(bridge_queue_gateway_socket_pid 2>/dev/null || true)"
   if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null \
-      && [[ -n "$socket_path" && -S "$socket_path" ]]; then
+      && [[ -n "$socket_path" && -S "$socket_path" ]] \
+      && bridge_queue_gateway_socket_connect_probe "$socket_path"; then
     kill "$pid" 2>/dev/null || true
     wait "$pid" >/dev/null 2>&1 || true
     for ((i = 0; i < 30; i++)); do

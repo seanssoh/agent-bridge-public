@@ -728,12 +728,15 @@ PY
 
   # Drive the helpers via an extracted-functions helper script. This
   # avoids sourcing the whole bridge-daemon.sh (which has top-level
-  # command parsing) — we just pull the four functions we need.
+  # command parsing) — we just pull the functions we need. The
+  # connect-probe helper (r3) is required because is_running and
+  # clean_stale both call it.
   helper="$SMOKE_TMP_ROOT/stale-recovery-driver.sh"
   {
     printf '#!/usr/bin/env bash\nset -euo pipefail\nPID_FILE="$1"\nSOCKET_PATH="$2"\n'
     awk '/^bridge_queue_gateway_socket_pid_file\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     awk '/^bridge_queue_gateway_socket_pid\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    awk '/^bridge_queue_gateway_socket_connect_probe\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     awk '/^bridge_queue_gateway_socket_is_running\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     awk '/^bridge_queue_gateway_socket_clean_stale\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
     cat <<'BASH'
@@ -760,6 +763,88 @@ BASH
   smoke_assert_contains "$helper_out" "ok" "stale-recovery: clean_stale removes pid+socket when listener is gone"
 }
 
+# r3 finding 4: false-positive liveness defense. Under r2's file-only
+# liveness check, a fixture where (a) the recorded pid is alive but
+# unrelated and (b) a leftover socket file exists on disk would pass
+# `is_running` even though no listener is actually serving the socket.
+# The r3 connect-probe rejects this combination because connect() to
+# an unbound socket file raises ECONNREFUSED. This smoke writes the
+# smoke runner's own pid (definitely alive, definitely NOT a queue
+# gateway listener) into the pid file, materializes a real-but-closed
+# socket file, and asserts:
+#   * is_running returns false (probe refuses the unbound socket).
+#   * clean_stale removes both artifacts so the next start is fresh.
+daemon_socket_listener_false_positive_liveness() {
+  local pid_file socket_path bridge_id helper helper_out alive_pid
+
+  : "${BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT:=$SMOKE_TMP_ROOT/daemon-socket-runtime-fp}"
+  export BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT
+  bridge_id="$(python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" print-runtime-id --bridge-home "$BRIDGE_HOME")"
+  pid_file="$BRIDGE_STATE_DIR/queue-gateway-socket-fp.pid"
+  socket_path="$BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT/$bridge_id/queue-gateway-fp.sock"
+  mkdir -p "$BRIDGE_STATE_DIR" "$(dirname "$socket_path")"
+
+  # The smoke runner's own pid: indisputably alive, indisputably not
+  # the queue gateway listener. This is the "recycled-pid" fixture.
+  alive_pid="$$"
+  printf '%s\n' "$alive_pid" >"$pid_file"
+
+  # Materialize a real Unix socket file with NO listener (bind+close
+  # leaves the file on disk; connect() will return ECONNREFUSED).
+  python3 - "$socket_path" <<'PY' >/dev/null
+import os, socket, sys
+p = sys.argv[1]
+try:
+    os.unlink(p)
+except FileNotFoundError:
+    pass
+s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+s.bind(p)
+s.close()
+PY
+  [[ -S "$socket_path" ]] || smoke_fail "false-positive liveness: pre-condition — bound socket should exist on disk"
+  kill -0 "$alive_pid" 2>/dev/null || smoke_fail "false-positive liveness: pre-condition — fixture pid must be alive"
+
+  helper="$SMOKE_TMP_ROOT/false-positive-liveness-driver.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\nPID_FILE="$1"\nSOCKET_PATH="$2"\n'
+    awk '/^bridge_queue_gateway_socket_pid_file\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    awk '/^bridge_queue_gateway_socket_pid\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    awk '/^bridge_queue_gateway_socket_connect_probe\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    awk '/^bridge_queue_gateway_socket_is_running\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    awk '/^bridge_queue_gateway_socket_clean_stale\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    cat <<'BASH'
+bridge_queue_gateway_socket_pid_file() { printf "%s" "$PID_FILE"; }
+bridge_queue_gateway_socket_path() { printf "%s" "$SOCKET_PATH"; }
+# r3: with alive pid + leftover socket but NO bound listener, the
+# connect-probe must refuse and is_running must return false.
+if bridge_queue_gateway_socket_is_running; then
+  echo "false-positive: is_running incorrectly returned true"
+  exit 1
+fi
+# clean_stale must drop both artifacts (alive pid is unrelated; we do
+# NOT signal it).
+bridge_queue_gateway_socket_clean_stale
+if [[ -f "$PID_FILE" ]]; then
+  echo "false-positive: pid file not removed"
+  exit 1
+fi
+if [[ -e "$SOCKET_PATH" ]]; then
+  echo "false-positive: socket file not removed"
+  exit 1
+fi
+echo "ok"
+BASH
+  } >"$helper"
+  chmod +x "$helper"
+  helper_out="$(bash "$helper" "$pid_file" "$socket_path" 2>&1 || true)"
+  smoke_assert_contains "$helper_out" "ok" "false-positive liveness: connect-probe rejects alive-but-unrelated pid + leftover socket"
+
+  # The unrelated alive pid (the smoke runner) MUST still be alive —
+  # confirms clean_stale did not signal it.
+  kill -0 "$alive_pid" 2>/dev/null || smoke_fail "false-positive liveness: clean_stale must NOT signal an unrelated alive pid"
+}
+
 main() {
   smoke_require_cmd awk
   smoke_require_cmd python3
@@ -777,9 +862,11 @@ main() {
   if smoke_is_linux; then
     smoke_run "queue gateway socket listener lifecycle" daemon_socket_listener_contract
     smoke_run "queue gateway socket listener stale recovery" daemon_socket_listener_stale_recovery
+    smoke_run "queue gateway socket listener false-positive liveness" daemon_socket_listener_false_positive_liveness
   else
     smoke_skip "queue gateway socket listener lifecycle" "non-Linux"
     smoke_skip "queue gateway socket listener stale recovery" "non-Linux"
+    smoke_skip "queue gateway socket listener false-positive liveness" "non-Linux"
   fi
   smoke_log "passed"
 }
