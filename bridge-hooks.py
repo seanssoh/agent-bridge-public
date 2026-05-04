@@ -851,6 +851,123 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     return 0
 
 
+# Issue #544 PR2 — render bridge-managed Claude hook entries into a
+# controller-owned `<isolated-home>/.claude/settings.effective.json` and
+# atomically symlink `<isolated-home>/.claude/settings.json` to it. Chosen
+# over a cross-UID symlink to the controller's effective file: a symlink
+# would let the isolated UID silently rewrite the file (and clobber hook
+# enforcement) on any operator action that touches `~/.claude/settings.json`
+# from inside the session. Per-home rendering keeps the hook contract
+# inside controller/root ownership while still letting the isolated UID
+# read it. Hooks themselves run as the isolated UID — that is intended.
+#
+# Pre-existing isolated-UID user keys (`enabledPlugins`,
+# `extraKnownMarketplaces`, `skipDangerousModePermissionPrompt`) are
+# extracted from any prior regular `settings.json` at that path and merged
+# into the rendered effective file so first-run user state survives the
+# transition to symlink-managed.
+ISOLATED_HOME_PRESERVED_USER_KEYS = (
+    "enabledPlugins",
+    "extraKnownMarketplaces",
+    "skipDangerousModePermissionPrompt",
+)
+
+
+def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
+    isolated_home = Path(args.isolated_home).expanduser()
+    base_path = Path(args.base_settings_file).expanduser()
+    overlay_path = Path(args.overlay_settings_file).expanduser()
+    launch_cmd = (getattr(args, "launch_cmd", "") or "") or None
+
+    target_dir = isolated_home / ".claude"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    effective_path = target_dir / "settings.effective.json"
+    settings_link = target_dir / "settings.json"
+
+    # 1. Preserve user keys. Source-of-truth selection:
+    #   - If `settings.json` is a regular (non-symlink) file, read from
+    #     it directly — that is the operator's first-run state pre-
+    #     transition, and we must capture the keys before we replace
+    #     the file with a symlink to the effective render.
+    #   - If `settings.json` is a symlink (i.e. a prior render already
+    #     ran), read the preserved keys back out of the existing
+    #     `settings.effective.json`. Without this, the second render
+    #     would silently drop the keys we preserved on the first pass,
+    #     breaking idempotency and erasing the operator's user state
+    #     on every subsequent rerender (e.g. agent restart).
+    preserved: dict[str, Any] = {}
+    preserve_source: Path | None = None
+    if settings_link.exists() and not settings_link.is_symlink():
+        preserve_source = settings_link
+    elif settings_link.is_symlink() and effective_path.exists():
+        preserve_source = effective_path
+    if preserve_source is not None:
+        try:
+            existing = load_json(preserve_source)
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+        if isinstance(existing, dict):
+            for key in ISOLATED_HOME_PRESERVED_USER_KEYS:
+                if key in existing:
+                    preserved[key] = existing[key]
+
+    # 2. Compose: managed defaults < base < overlay < preserved user keys.
+    base_payload = ensure_settings_root(base_path)
+    # `load_json` raises on empty file; treat zero-byte as `{}` so the
+    # renderer matches the operator-touch idiom (an empty overlay file
+    # is a valid "no overrides" signal).
+    if overlay_path.exists() and overlay_path.stat().st_size == 0:
+        overlay_payload: Any = {}
+    else:
+        overlay_payload = load_json(overlay_path)
+    if overlay_payload in (None, ""):
+        overlay_payload = {}
+    if not isinstance(overlay_payload, dict):
+        raise SystemExit(f"isolated overlay must be a JSON object: {overlay_path}")
+
+    managed_defaults = managed_claude_settings_defaults(launch_cmd)
+    merged = merge_settings(managed_defaults, base_payload)
+    merged = merge_settings(merged, overlay_payload)
+    if preserved:
+        merged = merge_settings(merged, preserved)
+
+    # 3. Atomic write of the effective file (mode 0644 so the isolated UID
+    # can read it; ownership stays with whoever invoked us — controller
+    # under the normal start path, root under sudo-backed reapply).
+    effective_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = effective_path.with_suffix(effective_path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8") as handle:
+        json.dump(merged, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, effective_path)
+
+    # 4. Atomic symlink: settings.json -> settings.effective.json. Replace
+    # any prior regular file (we already preserved its user keys above) or
+    # stale symlink. Use a relative target so the link survives if the
+    # isolated home moves under it.
+    if settings_link.is_symlink() or settings_link.exists():
+        settings_link.unlink()
+    settings_link.symlink_to("settings.effective.json")
+
+    payload = {
+        "isolated_home": str(isolated_home),
+        "effective_settings_file": str(effective_path),
+        "settings_file": str(settings_link),
+        "preserved_keys": ",".join(sorted(preserved.keys())),
+    }
+    if args.format == "shell":
+        for key, value in payload.items():
+            print(shell_line(key.upper(), value))
+        return 0
+
+    print(f"isolated_home: {payload['isolated_home']}")
+    print(f"effective_settings_file: {payload['effective_settings_file']}")
+    print(f"settings_file: {payload['settings_file']} -> settings.effective.json")
+    print(f"preserved_keys: [{payload['preserved_keys']}]")
+    return 0
+
+
 def cmd_link_shared_settings(args: argparse.Namespace) -> int:
     settings_path = Path(args.workdir).expanduser() / ".claude" / "settings.json"
     shared_path = Path(args.shared_settings_file).expanduser()
@@ -1097,6 +1214,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     render_shared_parser.add_argument("--format", choices=("text", "shell"), default="text")
     render_shared_parser.set_defaults(handler=cmd_render_shared_settings)
+
+    # Issue #544 PR2 — render the bridge-managed hook entries into a
+    # controller-owned settings.effective.json placed under the isolated
+    # UID's HOME, then symlink that home's settings.json to it. See
+    # cmd_render_isolated_home_settings for the integrity-boundary
+    # rationale (per-home rendered, not cross-UID symlink to controller).
+    render_isolated_parser = subparsers.add_parser("render-isolated-home-settings")
+    render_isolated_parser.add_argument("--isolated-home", required=True)
+    render_isolated_parser.add_argument("--base-settings-file", required=True)
+    render_isolated_parser.add_argument("--overlay-settings-file", required=True)
+    render_isolated_parser.add_argument(
+        "--launch-cmd",
+        default="",
+        help="Agent launch_cmd; substring '[1m]' raises autoCompactWindow default to 1_000_000 (issue #547).",
+    )
+    render_isolated_parser.add_argument("--format", choices=("text", "shell"), default="text")
+    render_isolated_parser.set_defaults(handler=cmd_render_isolated_home_settings)
 
     trust_parser = subparsers.add_parser("ensure-project-trust")
     trust_parser.add_argument("--workdir", required=True)

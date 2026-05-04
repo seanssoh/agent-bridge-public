@@ -263,6 +263,138 @@ bridge_ensure_claude_pre_compact_hook() {
   fi
 }
 
+# Issue #544 PR2 — install bridge-managed Claude hook entries into the
+# isolated UID's HOME `.claude/settings.json` (as a controller-owned
+# symlink to a controller-owned `settings.effective.json` rendered next
+# to it). No-op for non-isolated agents and on non-Linux hosts. Best-
+# effort throughout: failures here must not block agent start, since
+# the workdir-side shared settings (the path used by non-isolated
+# agents) is independent and already wired by the caller.
+#
+# Why per-home rendered, not cross-UID symlink to controller:
+# `<isolated-home>/.claude/settings.json` lives under the isolated UID
+# and Claude Code rewrites it on first-run trust + on operator
+# `claude config` actions. A symlink across UIDs would let those
+# rewrites silently mutate the controller's hook contract. Rendering a
+# fresh controller-owned file per isolated home keeps the integrity
+# boundary intact while still letting the isolated UID read the file
+# (mode 0644) and run the hook commands themselves under its own UID.
+#
+# Implementation: render to a controller-owned temp directory (the
+# isolated home's `.claude/` is mode 0700 under the isolated UID, so
+# the controller cannot write there directly), then sudo-install both
+# files into the isolated tree under root ownership. Pre-existing user
+# keys are preserved by the Python renderer reading the existing
+# `<isolated-home>/.claude/settings.json` via a sudo-backed cat into
+# the temp staging area first.
+bridge_install_isolated_home_settings() {
+  local agent="$1"
+  local launch_cmd="${2-}"
+  local os_user=""
+  local isolated_home=""
+  local target_dir=""
+  local target_effective=""
+  local target_settings=""
+  local stage_root=""
+  local stage_home=""
+  local stage_dir=""
+  local stage_settings=""
+  local stage_effective=""
+
+  [[ -n "$agent" ]] || return 0
+
+  # Predicate is fatal-on-zero for non-isolated agents and non-Linux
+  # hosts; suppress so this function remains a silent no-op when the
+  # caller (run_rerender_settings, the start path, etc.) invokes it
+  # unconditionally for every agent.
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || return 0
+
+  os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+  [[ -n "$os_user" ]] || return 0
+  isolated_home="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || true)"
+  [[ -n "$isolated_home" ]] || return 0
+
+  target_dir="$isolated_home/.claude"
+  target_effective="$target_dir/settings.effective.json"
+  target_settings="$target_dir/settings.json"
+
+  # Ensure the `.claude/` directory exists in the isolated home with
+  # isolated-UID ownership. Mirrors the convention every other isolated-
+  # home mutation in lib/bridge-agents.sh uses (sudo-backed mkdir +
+  # chown). Best-effort: if sudo is unavailable, the install below will
+  # surface the failure via bridge_warn.
+  bridge_linux_sudo_root mkdir -p "$target_dir" 2>/dev/null || {
+    bridge_warn "isolated home settings install: cannot mkdir $target_dir for $agent (sudo unavailable?)"
+    return 0
+  }
+  bridge_linux_sudo_root chown "$os_user:$os_user" "$target_dir" 2>/dev/null || true
+  bridge_linux_sudo_root chmod 0755 "$target_dir" 2>/dev/null || true
+
+  # Stage the render in a controller-owned temp directory. The renderer
+  # walks `<stage_home>/.claude/`, which mirrors the layout it expects
+  # under the live isolated home but lives entirely under the
+  # controller UID so the Python writes succeed without sudo.
+  stage_root="$(mktemp -d "${TMPDIR:-/tmp}/bridge-isolated-settings.XXXXXX")" || {
+    bridge_warn "isolated home settings install: mktemp failed for $agent"
+    return 0
+  }
+  stage_home="$stage_root/home"
+  stage_dir="$stage_home/.claude"
+  stage_settings="$stage_dir/settings.json"
+  stage_effective="$stage_dir/settings.effective.json"
+  mkdir -p "$stage_dir"
+
+  # Seed the stage with the live isolated `settings.json` so the
+  # renderer's preserve-user-keys branch sees it. We need to read it via
+  # sudo because the live file is owned by the isolated UID with mode
+  # 0700 on the parent. cat-fail is fine: the renderer treats a missing
+  # source as "no preserved keys".
+  if bridge_linux_sudo_root test -f "$target_settings" 2>/dev/null \
+      && ! bridge_linux_sudo_root test -L "$target_settings" 2>/dev/null; then
+    bridge_linux_sudo_root cat "$target_settings" >"$stage_settings" 2>/dev/null || true
+  fi
+
+  if ! bridge_hooks_python render-isolated-home-settings \
+        --isolated-home "$stage_home" \
+        --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
+        --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
+        --launch-cmd "$launch_cmd" >"$stage_root/render.out" 2>&1; then
+    bridge_warn "isolated home settings install: render failed for $agent ($(head -n1 "$stage_root/render.out" 2>/dev/null || true))"
+    rm -rf "$stage_root"
+    return 0
+  fi
+
+  # Install the staged effective file into the isolated tree with root
+  # ownership and mode 0644. The isolated UID can read but cannot
+  # mutate it (the integrity boundary). `install -m` is atomic on the
+  # destination filesystem.
+  if ! bridge_linux_sudo_root install -m 0644 -o root -g root "$stage_effective" "$target_effective" 2>/dev/null; then
+    # Older `install` builds reject `-o`/`-g` without root euid even
+    # under sudo on some hosts; fall back to install + chown.
+    if bridge_linux_sudo_root install -m 0644 "$stage_effective" "$target_effective" 2>/dev/null; then
+      bridge_linux_sudo_root chown root:root "$target_effective" 2>/dev/null || true
+    else
+      bridge_warn "isolated home settings install: install failed for $target_effective"
+      rm -rf "$stage_root"
+      return 0
+    fi
+  fi
+
+  # Atomically swap settings.json to a relative symlink pointing at the
+  # effective file. `ln -sfn` is the established pattern for replacing
+  # a symlink in place; for a regular pre-existing file we have to
+  # remove it first because `ln -sf` would refuse with "File exists".
+  if bridge_linux_sudo_root test -e "$target_settings" 2>/dev/null \
+      && ! bridge_linux_sudo_root test -L "$target_settings" 2>/dev/null; then
+    bridge_linux_sudo_root rm -f "$target_settings" 2>/dev/null || true
+  fi
+  bridge_linux_sudo_root ln -sfn "settings.effective.json" "$target_settings" 2>/dev/null || \
+    bridge_warn "isolated home settings install: symlink failed for $target_settings"
+  bridge_linux_sudo_root chown -h "$os_user:$os_user" "$target_settings" 2>/dev/null || true
+
+  rm -rf "$stage_root"
+}
+
 bridge_codex_hooks_status() {
   bridge_hooks_python status-codex-hooks --codex-hooks-file "$(bridge_codex_hooks_file)"
 }
