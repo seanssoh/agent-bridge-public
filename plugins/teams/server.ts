@@ -32,7 +32,7 @@ import {
 } from 'fs'
 import { homedir } from 'os'
 import { isAbsolute as pathIsAbsolute, join, resolve as pathResolve } from 'path'
-import { createRecentMessageDeduper } from './dedupe.ts'
+import { createRecentMessageDeduper, storedRowMatchesIncoming } from './dedupe.ts'
 
 type GroupPolicy = {
   requireMention?: boolean
@@ -377,10 +377,7 @@ function deliveredMessageSeen(chatId: string, messageId: string, revision: strin
       try {
         const row = JSON.parse(lines[i]) as Partial<StoredMessage>
         if (row.chat_id !== chatId || row.message_id !== messageId) continue
-        // Edits arrive with the same chat_id+message_id but a bumped revision.
-        // Treat a row as a "duplicate" only if the revision matches (or both
-        // sides lack one — pre-revision rows or non-edit-aware activities).
-        if ((row.revision ?? '') === (revision ?? '')) return true
+        if (storedRowMatchesIncoming(row.revision, revision)) return true
       } catch {}
     }
   } catch {}
@@ -658,7 +655,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 async function handleActivity(context: TurnContext): Promise<void> {
   const activity = context.activity
-  if (activity.type !== ActivityTypes.Message) return
+  // Supported activity types:
+  //   - Message       — new chat message from a Teams user.
+  //   - MessageUpdate — Teams edit of an existing message; reuses the
+  //                     original activity.id but bumps localTimestamp /
+  //                     timestamp. The revision-aware dedupe (below) lets
+  //                     edits flow through while still dropping retransmits.
+  // Intentionally not handled: MessageDelete (out of scope — Teams does
+  // emit these, but we don't currently propagate redactions back to the
+  // Claude session). All other activity types (typing, conversationUpdate,
+  // membersAdded, …) are ignored.
+  if (activity.type !== ActivityTypes.Message && activity.type !== ActivityTypes.MessageUpdate) return
   if (!gate(activity)) return
 
   const chatId = referenceKey(activity)

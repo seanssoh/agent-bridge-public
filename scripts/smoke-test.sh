@@ -5501,6 +5501,18 @@ PY
   assert_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "delivery already succeeded"
   # Round-2: dedupe key must include a revision so Teams edits flow through.
   assert_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "dedupeKey(chatId, messageId, revision)"
+  # Round-3 Finding A: handleActivity must route Teams edits
+  # (ActivityTypes.MessageUpdate) through the same delivery path as new
+  # messages. Without this gate change the revision-aware dedupe is dead
+  # code — edits never reach it.
+  assert_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "ActivityTypes.MessageUpdate"
+  # Round-3 Finding B: legacy messages.jsonl rows (written before r2 added
+  # the `revision` field) have no revision. New arrivals always derive a
+  # non-empty revision. The delivered-seen predicate must treat a stored
+  # row with revision === undefined as a match regardless of incoming
+  # revision; otherwise Teams retries replay legacy messages.
+  TEAMS_LEGACY_MATCH_OUTPUT="$(cd "$REPO_ROOT/plugins/teams" && bun -e 'import { storedRowMatchesIncoming } from "./dedupe.ts"; const legacyVsFresh = storedRowMatchesIncoming(undefined, "2026-01-01T00:05:00Z"); const legacyVsEmpty = storedRowMatchesIncoming(undefined, ""); const exactMatch = storedRowMatchesIncoming("2026-01-01T00:05:00Z", "2026-01-01T00:05:00Z"); const exactMismatch = storedRowMatchesIncoming("2026-01-01T00:00:00Z", "2026-01-01T00:05:00Z"); console.log(JSON.stringify([legacyVsFresh, legacyVsEmpty, exactMatch, exactMismatch]))')"
+  assert_contains "$TEAMS_LEGACY_MATCH_OUTPUT" "[true,true,true,false]"
   log "exercising ms365 human-profile disclosure helper"
   MS365_DISCLOSURE_OUTPUT="$(cd "$REPO_ROOT/plugins/ms365" && bun -e 'import { mkdtempSync } from "fs"; import { join } from "path"; import { tmpdir } from "os"; import { hasChatDisclaimerBeenSent, markChatDisclaimerSent, prependHumanOutboundDisclaimer } from "./disclosure.ts"; const root = mkdtempSync(join(tmpdir(), "ms365-disclosure-")); const statePath = join(root, "human-outbound-disclosures.json"); const text = prependHumanOutboundDisclaimer("hello", "text", "notice"); const html = prependHumanOutboundDisclaimer("<p>hello</p>", "html", "notice"); const before = hasChatDisclaimerBeenSent(statePath, "owner@example.com", "chat-1"); markChatDisclaimerSent(statePath, "owner@example.com", "chat-1", "msg-1"); const after = hasChatDisclaimerBeenSent(statePath, "owner@example.com", "chat-1"); const other = hasChatDisclaimerBeenSent(statePath, "owner@example.com", "chat-2"); console.log(JSON.stringify({ text, html, before, after, other }));')"
   python3 - "$MS365_DISCLOSURE_OUTPUT" <<'PY'

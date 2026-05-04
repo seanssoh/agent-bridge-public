@@ -13,6 +13,24 @@ export type RecentMessageDeduper = {
   forget(messageId: string): void
 }
 
+// Matches a stored messages.jsonl row against an incoming activity. Two
+// match shapes:
+//   1. exact 3-tuple (chat_id + message_id + revision) — same edit replay
+//      or same-revision retransmit.
+//   2. legacy fallback (stored.revision === undefined) — pre-revision rows
+//      written by older versions had no revision field; without this clause
+//      a fresh-revision arrival for the same (chat_id, message_id) would
+//      slip past the dedupe and double-deliver. Conservative: any row that
+//      lacks revision matches regardless of incoming revision.
+// The caller filters rows by chat_id+message_id before calling this.
+export function storedRowMatchesIncoming(
+  storedRevision: string | undefined,
+  incomingRevision: string,
+): boolean {
+  if (storedRevision === undefined) return true
+  return (storedRevision ?? '') === (incomingRevision ?? '')
+}
+
 export function createRecentMessageDeduper(limit = 256): RecentMessageDeduper {
   const queue: string[] = []
   const seenIds = new Set<string>()
