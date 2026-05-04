@@ -1965,15 +1965,13 @@ def run_migrate_payloads(args):
         "skipped_non_memory_daily": skipped_non_memory_daily,
         "backup_file": backup_file,
         "dry_run": bool(args.dry_run),
-        "jobs_file": str(jobs_path),
-        "migrated_jobs": migrated,
     }
 
     if args.json:
         print(json.dumps(payload_out, ensure_ascii=False, indent=2))
         return 0
 
-    print(f"jobs_file: {payload_out['jobs_file']}")
+    print(f"jobs_file: {jobs_path}")
     print(f"migrated: {payload_out['migrated']}")
     print(f"unchanged: {payload_out['unchanged']}")
     print(f"skipped_non_memory_daily: {payload_out['skipped_non_memory_daily']}")

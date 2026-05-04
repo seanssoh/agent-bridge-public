@@ -221,4 +221,134 @@ assert "acceptance-agent" in text, text
 PY
 smoke_log "ok: cron create --title memory-daily-* defaults to canonical jsonl-aware body"
 
+# 5. cron create --title memory-daily-* WITH explicit --payload must
+#    preserve the operator-supplied body (no canonical default substitution).
+OVERRIDE_JOBS="$SMOKE_TMP_ROOT/override-jobs.json"
+OVERRIDE_MARKER="operator-override-test-marker-$$"
+"$PY_BIN" "$REPO_ROOT/bridge-cron.py" native-create \
+  --jobs-file "$OVERRIDE_JOBS" \
+  --agent override-agent \
+  --schedule "0 3 * * *" \
+  --tz "Asia/Seoul" \
+  --title "memory-daily-override-agent" \
+  --payload "$OVERRIDE_MARKER" >/dev/null
+
+"$PY_BIN" - "$OVERRIDE_JOBS" "$REPO_ROOT" "$OVERRIDE_MARKER" <<'PY'
+import json, sys, importlib.util, os
+override_path, repo_root, marker = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location("bridge_cron", os.path.join(repo_root, "bridge-cron.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+data = json.load(open(override_path))
+assert len(data["jobs"]) == 1, data
+text = data["jobs"][0]["payload"]["text"]
+assert text == marker, f"explicit --payload not preserved verbatim: {text!r} != {marker!r}"
+canonical = mod.render_memory_daily_jsonl_aware_prompt("override-agent")
+assert text != canonical, "explicit --payload was overwritten by canonical jsonl-aware body"
+PY
+smoke_log "PASS: create with explicit --payload preserves operator override"
+
+# 6. Top-level-list jobs.json shape must round-trip: handler accepts a
+#    top-level JSON array (no {jobs: [...]} wrapper), rewrites memory-daily
+#    payloads in place, leaves non-memory-daily byte-identical, writes
+#    jobs.json.bak-<ts>, and the resulting file is still a top-level list.
+LIST_FIXTURE="$SMOKE_TMP_ROOT/list-jobs.json"
+cat >"$LIST_FIXTURE" <<'JSON'
+[
+  {
+    "id": "memory-daily-list-a-aaaaaaaa",
+    "name": "memory-daily-list-a",
+    "agentId": "list-a",
+    "enabled": true,
+    "schedule": {"kind": "cron", "expr": "0 3 * * *", "tz": "Asia/Seoul"},
+    "payload": {
+      "kind": "text",
+      "text": "bash \"$BRIDGE_HOME/scripts/memory-daily-harvest.sh\" --agent list-a\n# Pre-#390 body."
+    },
+    "metadata": {"source": "fixture"}
+  },
+  {
+    "id": "memory-daily-list-b-bbbbbbbb",
+    "name": "memory-daily-list-b",
+    "agentId": "list-b",
+    "enabled": true,
+    "schedule": {"kind": "cron", "expr": "0 3 * * *", "tz": "Asia/Seoul"},
+    "payload": {
+      "kind": "text",
+      "text": "bash \"$BRIDGE_HOME/scripts/memory-daily-harvest.sh\" --agent list-b\n# Stale, no jsonl-aware tokens."
+    },
+    "metadata": {"source": "fixture"}
+  },
+  {
+    "id": "morning-briefing-list-c-cccccccc",
+    "name": "morning-briefing-list-c",
+    "agentId": "list-c",
+    "enabled": true,
+    "schedule": {"kind": "cron", "expr": "30 8 * * *", "tz": "Asia/Seoul"},
+    "payload": {
+      "kind": "text",
+      "text": "morning briefing — top-level-list non-memory-daily; must be left alone"
+    },
+    "metadata": {"source": "fixture"}
+  }
+]
+JSON
+
+# Capture pre-apply normalized bytes of the non-memory-daily job for the
+# byte-identity check (parity with the object-shape sub-test above).
+LIST_NON_MD_BEFORE="$("$PY_BIN" - "$LIST_FIXTURE" "$REPO_ROOT" <<'PY'
+import json, sys, importlib.util, os
+fixture_path, repo_root = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("bridge_cron", os.path.join(repo_root, "bridge-cron.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+_, jobs = mod.load_jobs_payload(fixture_path)
+for job in jobs:
+    if job.get("name") == "morning-briefing-list-c":
+        print(json.dumps(job, sort_keys=True, ensure_ascii=False))
+        break
+PY
+)"
+
+LIST_APPLY_JSON="$("$PY_BIN" "$REPO_ROOT/bridge-cron.py" migrate-payloads --jsonl-aware --jobs-file "$LIST_FIXTURE" --json)"
+LIST_BACKUP_FILE="$("$PY_BIN" - "$LIST_APPLY_JSON" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["migrated"] == 2, payload
+assert payload["unchanged"] == 0, payload
+assert payload["skipped_non_memory_daily"] == 1, payload
+assert payload["dry_run"] is False, payload
+assert payload["backup_file"], payload
+print(payload["backup_file"])
+PY
+)"
+smoke_assert_file_exists "$LIST_BACKUP_FILE" "top-level-list backup file should exist after apply"
+case "$(basename "$LIST_BACKUP_FILE")" in
+  jobs.json.bak-*|list-jobs.json.bak-*) ;;
+  *) smoke_fail "top-level-list backup naming must mirror cleanup-prune (<name>.bak-<ts>); got $(basename "$LIST_BACKUP_FILE")" ;;
+esac
+
+"$PY_BIN" - "$LIST_FIXTURE" "$REPO_ROOT" "$LIST_NON_MD_BEFORE" <<'PY'
+import json, sys, importlib.util, os
+fixture_path, repo_root, non_md_before_json = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location("bridge_cron", os.path.join(repo_root, "bridge-cron.py"))
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+data = json.load(open(fixture_path))
+assert isinstance(data, list), f"top-level-list jobs.json must round-trip as a list, got {type(data).__name__}"
+md_count = 0
+non_md_after = None
+for job in data:
+    name = job.get("name", "")
+    if name.startswith("memory-daily"):
+        text = (job.get("payload") or {}).get("text") or ""
+        assert mod.memory_daily_payload_is_jsonl_aware(text), f"job {name} payload not jsonl-aware after migration: {text!r}"
+        md_count += 1
+    elif name == "morning-briefing-list-c":
+        non_md_after = json.dumps(job, sort_keys=True, ensure_ascii=False)
+assert md_count == 2, f"expected 2 migrated memory-daily jobs in list shape, got {md_count}"
+assert non_md_after == non_md_before_json, "non-memory-daily job mutated by --jsonl-aware migration in list shape"
+PY
+smoke_log "PASS: top-level-list jobs.json shape round-trips correctly"
+
 smoke_log "smoke test passed"
