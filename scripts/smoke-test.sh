@@ -5592,6 +5592,9 @@ cat > "$DEV_THIRD_MARKETPLACE_ROOT/plugins/third-plugin/.mcp.json" <<'JSON'
 }
 JSON
 printf 'third source\n' > "$DEV_THIRD_MARKETPLACE_ROOT/plugins/third-plugin/server.ts"
+DEV_THIRD_INACCESSIBLE_ROOT="$TMP_ROOT/dev-third-inaccessible"
+mkdir -p "$DEV_THIRD_INACCESSIBLE_ROOT/.claude-plugin"
+chmod 000 "$DEV_THIRD_INACCESSIBLE_ROOT"
 THIRD_CACHE_VERSION_DIR="$BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT/third-mkt/third-plugin/0.2.0"
 rm -rf "$BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT/third-mkt"
 mkdir -p "$THIRD_CACHE_VERSION_DIR"
@@ -5612,12 +5615,13 @@ chmod 0600 "$THIRD_CACHE_VERSION_DIR/.mcp.json"
 cat > "$TMP_ROOT/known_marketplaces.json" <<JSON
 {
   "third-mkt": {
-    "source": {"source": "git", "repo": "Example/third-mkt"},
-    "installLocation": "$DEV_THIRD_MARKETPLACE_ROOT"
+    "installLocation": "$DEV_THIRD_INACCESSIBLE_ROOT",
+    "source": {"source": "directory", "path": "$DEV_THIRD_MARKETPLACE_ROOT", "repo": "Example/third-mkt"}
   }
 }
 JSON
 DEV_THIRD_CACHE_JSON="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:third-plugin@third-mkt" --root "$DEV_PLUGIN_MARKETPLACE_ROOT" --json)"
+chmod 700 "$DEV_THIRD_INACCESSIBLE_ROOT"
 python3 - "$DEV_THIRD_CACHE_JSON" "$THIRD_CACHE_VERSION_DIR/.mcp.json" <<'PY'
 import json
 import sys

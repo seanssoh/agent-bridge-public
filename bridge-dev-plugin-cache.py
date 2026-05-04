@@ -100,6 +100,13 @@ def root_marketplace_name(root: Path) -> str:
     return name
 
 
+def is_marketplace_manifest_readable(root: Path) -> bool:
+    try:
+        return marketplace_path(root).is_file()
+    except OSError:
+        return False
+
+
 def resolve_marketplace_root(default_root: Path, channel: str) -> Path:
     marketplace = channel_marketplace(channel)
     if not marketplace:
@@ -129,7 +136,7 @@ def resolve_marketplace_root(default_root: Path, channel: str) -> Path:
 
     candidates.append(plugins_root / "marketplaces" / marketplace)
     for candidate in candidates:
-        if marketplace_path(candidate).is_file():
+        if is_marketplace_manifest_readable(candidate):
             return candidate.resolve()
     return default_root
 
