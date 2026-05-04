@@ -115,8 +115,9 @@ bridge_claude_settings_mode() {
 
 bridge_ensure_claude_shared_settings_for_managed_workdir() {
   local workdir="$1"
+  local launch_cmd="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
-    bridge_link_claude_settings_to_shared "$workdir"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
   else
     return 0
   fi
@@ -124,10 +125,17 @@ bridge_ensure_claude_shared_settings_for_managed_workdir() {
 
 bridge_link_claude_settings_to_shared() {
   local workdir="$1"
+  # Issue #547: launch_cmd substring '[1m]' raises the managed
+  # autoCompactWindow default from 400_000 to 1_000_000. The shared
+  # settings file is install-wide; on a mixed-model install the last
+  # rerender for an agent decides the value. The dominant case is
+  # all-Opus-4.7-[1m] (or all-pre-1M), where every rerender agrees.
+  local launch_cmd="${2-}"
   bridge_hooks_python render-shared-settings \
     --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
     --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
-    --effective-settings-file "$(bridge_hook_shared_settings_effective_file)" >/dev/null
+    --effective-settings-file "$(bridge_hook_shared_settings_effective_file)" \
+    --launch-cmd "$launch_cmd" >/dev/null
   bridge_hooks_python link-shared-settings --workdir "$workdir" --shared-settings-file "$(bridge_hook_shared_settings_effective_file)"
 }
 
@@ -183,9 +191,10 @@ bridge_claude_tool_policy_hooks_status() {
 
 bridge_ensure_claude_stop_hook() {
   local workdir="$1"
+  local launch_cmd="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-stop-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --bash-bin bash >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
   else
     bridge_hooks_python ensure-stop-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN"
   fi
@@ -193,9 +202,10 @@ bridge_ensure_claude_stop_hook() {
 
 bridge_ensure_claude_session_start_hook() {
   local workdir="$1"
+  local launch_cmd="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-session-start-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
   else
     bridge_hooks_python ensure-session-start-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi
@@ -203,9 +213,10 @@ bridge_ensure_claude_session_start_hook() {
 
 bridge_ensure_claude_prompt_hook() {
   local workdir="$1"
+  local launch_cmd="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-prompt-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --bash-bin bash --python-bin python3 >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
   else
     bridge_hooks_python ensure-prompt-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN" --python-bin "$(command -v python3)"
   fi
@@ -213,9 +224,10 @@ bridge_ensure_claude_prompt_hook() {
 
 bridge_ensure_claude_prompt_guard_hook() {
   local workdir="$1"
+  local launch_cmd="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-prompt-guard-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
   else
     bridge_hooks_python ensure-prompt-guard-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi
@@ -223,9 +235,10 @@ bridge_ensure_claude_prompt_guard_hook() {
 
 bridge_ensure_claude_tool_policy_hooks() {
   local workdir="$1"
+  local launch_cmd="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-tool-policy-hooks --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
   else
     bridge_hooks_python ensure-tool-policy-hooks --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi
@@ -241,9 +254,10 @@ bridge_ensure_claude_tool_policy_hooks() {
 # snapshot — the disaster-recovery fallback — never gets written.
 bridge_ensure_claude_pre_compact_hook() {
   local workdir="$1"
+  local launch_cmd="${2-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-pre-compact-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
   else
     bridge_hooks_python ensure-pre-compact-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi
