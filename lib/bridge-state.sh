@@ -2172,8 +2172,15 @@ bridge_agent_ack_crash_report() {
 
   report_file="$(bridge_agent_crash_report_file "$agent")"
   if [[ -f "$report_file" ]]; then
+    if ! "${BASH:-bash}" -n "$report_file" >/dev/null 2>&1; then
+      bridge_agent_clear_crash_report "$agent" >/dev/null 2>&1 || true
+      return 1
+    fi
     # shellcheck source=/dev/null
-    source "$report_file"
+    source "$report_file" 2>/dev/null || {
+      bridge_agent_clear_crash_report "$agent" >/dev/null 2>&1 || true
+      return 1
+    }
     if [[ -n "${CRASH_AGENT:-}" && "$CRASH_AGENT" != "$agent" ]]; then
       return 1
     fi
@@ -2181,8 +2188,14 @@ bridge_agent_ack_crash_report() {
 
   state_file="$(bridge_agent_crash_state_file "$agent")"
   if [[ -f "$state_file" ]]; then
-    # shellcheck source=/dev/null
-    source "$state_file"
+    if ! "${BASH:-bash}" -n "$state_file" >/dev/null 2>&1; then
+      rm -f "$state_file" >/dev/null 2>&1 || true
+    else
+      # shellcheck source=/dev/null
+      source "$state_file" 2>/dev/null || {
+        rm -f "$state_file" >/dev/null 2>&1 || true
+      }
+    fi
   fi
 
   # Fall back to whatever hash state.env last recorded when report.env
@@ -2235,7 +2248,10 @@ bridge_agent_idle_since_epoch() {
 
   file="$(bridge_agent_idle_since_file "$agent")"
   [[ -f "$file" ]] || return 1
-  value="$(<"$file")"
+  value="$(cat "$file" 2>/dev/null)" || {
+    bridge_agent_clear_idle_marker "$agent" >/dev/null 2>&1 || true
+    return 1
+  }
   [[ "$value" =~ ^[0-9]+$ ]] || return 1
   printf '%s' "$value"
 }
@@ -2252,7 +2268,10 @@ bridge_agent_manual_stop_active() {
 
   file="$(bridge_agent_manual_stop_file "$agent")"
   [[ -f "$file" ]] || return 1
-  value="$(<"$file")"
+  value="$(cat "$file" 2>/dev/null)" || {
+    bridge_agent_clear_manual_stop "$agent" >/dev/null 2>&1 || true
+    return 1
+  }
   [[ "$value" =~ ^[0-9]+$ ]]
 }
 
@@ -2314,7 +2333,10 @@ bridge_reconcile_idle_markers() {
       continue
     fi
 
-    value="$(<"$file")"
+    value="$(cat "$file" 2>/dev/null)" || {
+      bridge_agent_clear_idle_marker "$agent" >/dev/null 2>&1 || true
+      continue
+    }
     if ! [[ "$value" =~ ^[0-9]+$ ]]; then
       bridge_agent_clear_idle_marker "$agent"
     fi

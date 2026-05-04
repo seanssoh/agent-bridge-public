@@ -122,6 +122,10 @@ bridge_agent_source() { printf "%s" "$agent_source_mode"; }
 bridge_queue_cli() { echo "bridge_queue_cli should not be called"; exit 99; }
 bridge_notify_send() { echo "bridge_notify_send should not be called"; exit 99; }
 daemon_info() { :; }
+daemon_source_state_file() {
+  # shellcheck source=/dev/null
+  source "$1" 2>/dev/null
+}
 
 # shellcheck disable=SC1090
 source "$helper"
@@ -254,6 +258,132 @@ EOF
   smoke_assert_match "$reminder_id" '^[0-9]+$' "daemon blocked-aging escalation task"
 }
 
+daemon_idle_marker_permission_guard() {
+  local agent dir idle_file manual_file output rc
+
+  agent="idle-acl-agent"
+  dir="$BRIDGE_ACTIVE_AGENT_DIR/$agent"
+  idle_file="$dir/idle-since"
+  manual_file="$dir/manual-stop"
+  mkdir -p "$dir"
+
+  set +e
+  output="$("$BASH" -lc '
+set -euo pipefail
+repo_root="$1"
+agent="$2"
+idle_file="$3"
+manual_file="$4"
+# shellcheck disable=SC1090
+source "$repo_root/bridge-lib.sh"
+
+BRIDGE_AGENT_IDS=("$agent")
+bridge_agent_is_active() { return 0; }
+
+printf "123\n" >"$idle_file"
+chmod 000 "$idle_file"
+if bridge_agent_idle_since_epoch "$agent"; then
+  echo "idle epoch unexpectedly succeeded"
+  exit 1
+fi
+[[ ! -e "$idle_file" ]] || {
+  echo "unreadable idle marker was not cleared"
+  exit 1
+}
+
+mkdir -p "$(dirname "$manual_file")"
+printf "123\n" >"$manual_file"
+chmod 000 "$manual_file"
+if bridge_agent_manual_stop_active "$agent"; then
+  echo "manual-stop unexpectedly succeeded"
+  exit 1
+fi
+[[ ! -e "$manual_file" ]] || {
+  echo "unreadable manual-stop marker was not cleared"
+  exit 1
+}
+
+mkdir -p "$(dirname "$idle_file")"
+printf "123\n" >"$idle_file"
+chmod 000 "$idle_file"
+bridge_reconcile_idle_markers
+[[ ! -e "$idle_file" ]] || {
+  echo "unreadable idle marker survived reconcile"
+  exit 1
+}
+
+echo ok
+' _ "$SMOKE_REPO_ROOT" "$agent" "$idle_file" "$manual_file" 2>&1)"
+  rc=$?
+  set -e
+  chmod 600 "$idle_file" "$manual_file" >/dev/null 2>&1 || true
+  rm -f "$idle_file" "$manual_file" >/dev/null 2>&1 || true
+  [[ "$rc" -eq 0 && "$output" == "ok" ]] || smoke_fail "idle marker permission guard failed: $output"
+}
+
+daemon_source_state_file_guard() {
+  local root helper output rc bash_bin
+
+  root="$(mktemp -d "$SMOKE_TMP_ROOT/source-state-unit.XXXXXX")"
+  helper="$root/daemon-source-state-file.sh"
+  awk '
+    /^daemon_source_state_file\(\) \{/ { capture=1 }
+    capture { print }
+    capture && /^}[[:space:]]*$/ { exit }
+  ' "$SMOKE_REPO_ROOT/bridge-daemon.sh" >"$helper"
+  [[ -s "$helper" ]] || smoke_fail "source-state: could not extract daemon_source_state_file"
+
+  bash_bin="${BASH4_BIN:-}"
+  if [[ -z "$bash_bin" || ! -x "$bash_bin" ]]; then
+    bash_bin="$(command -v bash)"
+  fi
+
+  set +e
+  output="$("$bash_bin" -lc '
+set -euo pipefail
+root="$1"
+helper="$2"
+daemon_warn() { printf "warn:%s\n" "$1" >&2; }
+# shellcheck disable=SC1090
+source "$helper"
+
+state_file="$root/state.env"
+printf "STATE_NEXT_TS=123\n" >"$state_file"
+STATE_NEXT_TS=0
+daemon_source_state_file "$state_file" "unit" 1
+[[ "${STATE_NEXT_TS:-}" == "123" ]] || {
+  echo "readable state did not source"
+  exit 1
+}
+
+printf "STATE_NEXT_TS=456\n" >"$state_file"
+chmod 000 "$state_file"
+if daemon_source_state_file "$state_file" "unit" 1; then
+  echo "unreadable state unexpectedly sourced"
+  exit 1
+fi
+[[ ! -e "$state_file" ]] || {
+  echo "unreadable state was not cleared"
+  exit 1
+}
+
+printf "STATE_NEXT_TS=\$(\n" >"$state_file"
+if daemon_source_state_file "$state_file" "unit" 1; then
+  echo "invalid state unexpectedly sourced"
+  exit 1
+fi
+[[ ! -e "$state_file" ]] || {
+  echo "invalid state was not cleared"
+  exit 1
+}
+
+echo ok
+' _ "$root" "$helper" 2>/dev/null)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 && "$output" == "ok" ]] || smoke_fail "source state file guard failed: $output"
+}
+
 main() {
   smoke_require_cmd awk
   smoke_require_cmd python3
@@ -263,6 +393,8 @@ main() {
   smoke_run "context pressure audit/state transitions" daemon_context_pressure_audit_state_transitions
   smoke_run "stale claimed tasks requeue deterministically" daemon_stale_claim_requeue
   smoke_run "blocked task reminder/escalation aging" daemon_blocked_aging
+  smoke_run "idle marker permission guard" daemon_idle_marker_permission_guard
+  smoke_run "source state file guard" daemon_source_state_file_guard
   smoke_log "passed"
 }
 

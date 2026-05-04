@@ -31,6 +31,38 @@ daemon_warn() {
   printf '[%s] [warn] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$message" >&2
 }
 
+daemon_source_state_file() {
+  local file="$1"
+  local label="${2:-state}"
+  local clear_on_error="${3:-0}"
+
+  [[ -f "$file" ]] || return 1
+  if [[ ! -r "$file" ]]; then
+    daemon_warn "${label} state file is unreadable; ignoring: $file"
+    if [[ "$clear_on_error" == "1" ]]; then
+      rm -f "$file" >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+
+  if ! "${BASH:-bash}" -n "$file" >/dev/null 2>&1; then
+    daemon_warn "${label} state file has invalid shell syntax; ignoring: $file"
+    if [[ "$clear_on_error" == "1" ]]; then
+      rm -f "$file" >/dev/null 2>&1 || true
+    fi
+    return 1
+  fi
+
+  # shellcheck source=/dev/null
+  source "$file" 2>/dev/null || {
+    daemon_warn "${label} state file could not be sourced; ignoring: $file"
+    if [[ "$clear_on_error" == "1" ]]; then
+      rm -f "$file" >/dev/null 2>&1 || true
+    fi
+    return 1
+  }
+}
+
 # --- Daemon exit observability (issue #193) ----------------------------------
 # These traps guarantee every daemon exit path leaves a trail in both
 # $BRIDGE_LAUNCHAGENT_LOG and the audit log. Without this, silent exits
@@ -148,8 +180,7 @@ bridge_agent_heartbeat_due() {
   (( interval > 0 )) || return 0
   file="$(bridge_agent_heartbeat_state_file "$agent")"
   [[ -f "$file" ]] || return 0
-  # shellcheck source=/dev/null
-  source "$file"
+  daemon_source_state_file "$file" "heartbeat" 1 || return 0
   [[ "${HEARTBEAT_NEXT_TS:-0}" =~ ^[0-9]+$ ]] || return 0
   next_ts="${HEARTBEAT_NEXT_TS:-0}"
   now="$(date +%s)"
@@ -283,8 +314,7 @@ bridge_usage_due() {
   (( interval > 0 )) || return 0
   file="$(bridge_usage_poll_state_file)"
   [[ -f "$file" ]] || return 0
-  # shellcheck source=/dev/null
-  source "$file"
+  daemon_source_state_file "$file" "usage" 1 || return 0
   [[ "${USAGE_NEXT_TS:-0}" =~ ^[0-9]+$ ]] || return 0
   now="$(date +%s)"
   next_ts="${USAGE_NEXT_TS:-0}"
@@ -349,8 +379,7 @@ bridge_release_due() {
   (( interval > 0 )) || return 0
   file="$(bridge_release_poll_state_file)"
   [[ -f "$file" ]] || return 0
-  # shellcheck source=/dev/null
-  source "$file"
+  daemon_source_state_file "$file" "release" 1 || return 0
   [[ "${RELEASE_NEXT_TS:-0}" =~ ^[0-9]+$ ]] || return 0
   now="$(date +%s)"
   next_ts="${RELEASE_NEXT_TS:-0}"
@@ -456,8 +485,7 @@ bridge_daily_backup_due() {
   DAILY_BACKUP_LAST_FAILURE_REASON=""
   DAILY_BACKUP_LAST_WARN_TS=""
   if [[ -f "$file" ]]; then
-    # shellcheck source=/dev/null
-    source "$file"
+    daemon_source_state_file "$file" "daily-backup" 0 || true
   fi
   if [[ "${DAILY_BACKUP_LAST_SUCCESS_DATE:-}" == "$today" ]]; then
     return 1
@@ -586,8 +614,7 @@ bridge_note_daily_backup_failure() {
   DAILY_BACKUP_LAST_ARCHIVE=""
   DAILY_BACKUP_LAST_PRUNED_COUNT=""
   if [[ -f "$file" ]]; then
-    # shellcheck source=/dev/null
-    source "$file"
+    daemon_source_state_file "$file" "daily-backup" 0 || true
   fi
   body="$(bridge_daily_backup_compose_state \
     --success-ts "${DAILY_BACKUP_LAST_SUCCESS_TS:-}" \
@@ -1559,9 +1586,9 @@ process_stall_reports() {
     matched_pattern=""
 
     if [[ -f "$state_file" ]]; then
-      had_state=1
-      # shellcheck source=/dev/null
-      source "$state_file"
+      if daemon_source_state_file "$state_file" "stall/$agent" 1; then
+        had_state=1
+      fi
       active_classification="${STALL_ACTIVE_CLASSIFICATION:-}"
       active_hash="${STALL_ACTIVE_EXCERPT_HASH:-}"
       active_matched_line_hash="${STALL_ACTIVE_MATCHED_LINE_HASH:-}"
@@ -2026,9 +2053,9 @@ process_context_pressure_reports() {
     matched_pattern=""
 
     if [[ -f "$state_file" ]]; then
-      had_state=1
-      # shellcheck source=/dev/null
-      source "$state_file"
+      if daemon_source_state_file "$state_file" "context-pressure/$agent" 1; then
+        had_state=1
+      fi
       previous_severity="${CONTEXT_PRESSURE_SEVERITY:-}"
       previous_hash="${CONTEXT_PRESSURE_EXCERPT_HASH:-}"
       first_detected_ts="${CONTEXT_PRESSURE_FIRST_DETECTED_TS:-0}"
@@ -2181,8 +2208,7 @@ bridge_watchdog_due() {
   (( interval > 0 )) || return 0
   file="$(bridge_watchdog_state_file)"
   [[ -f "$file" ]] || return 0
-  # shellcheck source=/dev/null
-  source "$file"
+  daemon_source_state_file "$file" "watchdog" 1 || return 0
   [[ "${WATCHDOG_NEXT_TS:-0}" =~ ^[0-9]+$ ]] || return 0
   now="$(date +%s)"
   next_ts="${WATCHDOG_NEXT_TS:-0}"
@@ -2254,8 +2280,7 @@ PY
   [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=86400
   now_ts="$(date +%s)"
   if [[ -f "$(bridge_watchdog_state_file)" ]]; then
-    # shellcheck source=/dev/null
-    source "$(bridge_watchdog_state_file)"
+    daemon_source_state_file "$(bridge_watchdog_state_file)" "watchdog" 1 || true
     last_key="${WATCHDOG_LAST_KEY:-}"
     last_report_ts="${WATCHDOG_LAST_REPORT_TS:-0}"
   fi
@@ -2377,8 +2402,7 @@ process_crash_reports() {
     launch_cmd=""
     error_hash=""
     reported_at=""
-    # shellcheck source=/dev/null
-    source "$report_file"
+    daemon_source_state_file "$report_file" "crash-report/$agent" 1 || continue
     agent="${CRASH_AGENT:-$agent}"
     [[ -n "$agent" ]] || continue
     if ! bridge_agent_exists "$agent"; then
@@ -2401,8 +2425,7 @@ process_crash_reports() {
     ack_hash=""
     ack_ts=0
     if [[ -f "$state_file" ]]; then
-      # shellcheck source=/dev/null
-      source "$state_file"
+      daemon_source_state_file "$state_file" "crash-state/$agent" 1 || true
       last_hash="${CRASH_LAST_HASH:-}"
       last_report_ts="${CRASH_LAST_REPORT_TS:-0}"
       ack_hash="${CRASH_ACK_HASH:-}"
@@ -2549,8 +2572,7 @@ bridge_daemon_autostart_allowed() {
 
   file="$(bridge_daemon_autostart_state_file "$agent")"
   [[ -f "$file" ]] || return 0
-  # shellcheck source=/dev/null
-  source "$file"
+  daemon_source_state_file "$file" "autostart/$agent" 1 || return 0
   [[ "${AUTO_START_NEXT_RETRY_TS:-0}" =~ ^[0-9]+$ ]] || return 0
   next_retry_ts="${AUTO_START_NEXT_RETRY_TS:-0}"
   now="$(date +%s)"
@@ -2569,8 +2591,7 @@ bridge_daemon_note_autostart_failure() {
   file="$(bridge_daemon_autostart_state_file "$agent")"
   mkdir -p "$(dirname "$file")"
   if [[ -f "$file" ]]; then
-    # shellcheck source=/dev/null
-    source "$file"
+    daemon_source_state_file "$file" "autostart/$agent" 1 || true
   fi
   AUTO_START_FAIL_COUNT="${AUTO_START_FAIL_COUNT:-0}"
   [[ "$AUTO_START_FAIL_COUNT" =~ ^[0-9]+$ ]] || AUTO_START_FAIL_COUNT=0
@@ -2918,8 +2939,7 @@ bridge_report_channel_health_miss() {
   body_file="$(bridge_channel_health_body_file "$agent")"
 
   if [[ -f "$state_file" ]]; then
-    # shellcheck source=/dev/null
-    source "$state_file"
+    daemon_source_state_file "$state_file" "channel-health/$agent" 1 || true
     last_key="${LAST_KEY:-}"
     last_report_ts="${LAST_REPORT_TS:-0}"
   fi
@@ -3041,8 +3061,7 @@ bridge_report_plugin_liveness_miss() {
   [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=60
   state_file="$(bridge_plugin_liveness_state_file "$agent")"
   if [[ -f "$state_file" ]]; then
-    # shellcheck source=/dev/null
-    source "$state_file"
+    daemon_source_state_file "$state_file" "plugin-liveness/$agent" 1 || true
     last_key="${LAST_KEY:-}"
     last_detected_ts="${LAST_DETECTED_TS:-0}"
     last_restart_ts="${LAST_RESTART_TS:-0}"
