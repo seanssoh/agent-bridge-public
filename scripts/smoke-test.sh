@@ -10201,4 +10201,8 @@ log "running isolated-bin-agb smoke (issue #544 PR1)"
 log "isolated-bin-agb covers shim env-source/delegation/fallback only — live PATH injection requires isolate+restart"
 bash "$REPO_ROOT/scripts/smoke/isolated-bin-agb.sh"
 
+# Issue #539 — system agent class roundtrip + tool-policy gate scenarios.
+log "running system-agent-class smoke (issue #539)"
+bash "$REPO_ROOT/scripts/smoke/system-agent-class.sh"
+
 log "smoke test passed"

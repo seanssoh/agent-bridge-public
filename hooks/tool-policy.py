@@ -27,7 +27,9 @@ from bridge_hook_common import (  # noqa: E402
     agent_home_root,
     bridge_home_dir,
     current_agent,
+    current_agent_class,
     current_agent_workdir,
+    emit_system_cross_agent_read,
     path_within,
     truncate_text,
     write_audit,
@@ -351,6 +353,100 @@ def _is_read_intent_tool(tool_name: str, tool_input: dict[str, Any]) -> bool:
     return False
 
 
+# Issue #539: subpath allowlist that a class=system agent may read out of
+# another agent's home. Only the operator-curated, ingestion-friendly
+# memory subtrees are exposed; raw `state/`, `logs/`, `private/`,
+# credentials, etc. stay denied even for system-class agents. Add a new
+# subpath here ONLY when the bridge has a clear ingestion contract for
+# it — every entry expands the cross-agent privilege surface.
+_SYSTEM_CLASS_READABLE_AGENT_SUBPATHS: tuple[str, ...] = (
+    "memory/projects/",
+    "memory/decisions/",
+    "memory/shared/",
+)
+
+# Issue #539: shared/* is broadly readable by class=system agents, with
+# narrow exceptions for any operator-side curated secret/private prefix.
+# Anything operators want to keep private even from system-class agents
+# goes under one of these prefixes.
+_SHARED_FORBIDDEN_PREFIXES: tuple[str, ...] = (
+    "private/",
+    "secrets/",
+)
+
+
+def _resolve_under(path: Path, root: Path) -> Path | None:
+    """Return *path* expressed relative to *root*, or None if outside.
+
+    Resolves both sides through ``Path.resolve()`` so symlinked aliases
+    (e.g., the ``shared`` symlink under ``$BRIDGE_HOME/agents/``) and
+    ``..`` traversal are normalized before the prefix check. Returning
+    None signals "not under this root" to the caller — never an error.
+    """
+    try:
+        rel = path.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return None
+    return rel
+
+
+def _system_class_cross_agent_read_allowed(
+    path: Path,
+    self_agent: str,
+) -> tuple[bool, str]:
+    """Decide whether *path* is in the class=system Read allowlist.
+
+    Returns ``(allowed, target_agent)``. ``target_agent`` is the peer
+    whose home contains *path*, or ``""`` for shared/* matches; the
+    caller uses it for the audit row. ``allowed=False`` means the path
+    sits outside both the per-agent subpath allowlist and the shared
+    allowlist, so the cross-agent gate must continue to deny — even for
+    a system-class actor.
+
+    The check is read-only by construction: the caller (the ``Read`` /
+    ``Glob`` / ``Grep`` cross-agent gate) only invokes this for
+    read-intent tools. Bash/Edit/Write paths never reach here, so a
+    system-class agent cannot escalate to cross-agent writes through
+    this carve-out.
+    """
+    bridge_home = bridge_home_dir()
+    home_root = agent_home_root()
+
+    # shared/* allowlist (with private/ and secrets/ explicitly excluded).
+    shared_root = bridge_home / "shared"
+    rel_shared = _resolve_under(path, shared_root)
+    if rel_shared is not None:
+        rel_str = rel_shared.as_posix()
+        # Bare `shared/` (rel == ".") is allowed for directory-level reads.
+        if rel_str == ".":
+            return True, ""
+        for forbidden in _SHARED_FORBIDDEN_PREFIXES:
+            if rel_str == forbidden.rstrip("/") or rel_str.startswith(forbidden):
+                return False, ""
+        return True, ""
+
+    # agents/<other>/memory/{projects,decisions,shared}/ allowlist.
+    rel_agent = _resolve_under(path, home_root)
+    if rel_agent is not None:
+        parts = rel_agent.parts
+        if len(parts) < 2:
+            # `agents/` itself or `agents/<name>` — not enough structure
+            # to be inside the memory allowlist.
+            return False, ""
+        other_agent = parts[0]
+        # Self-home reads are allowed by the existing per-agent isolation;
+        # this carve-out is specifically for *cross*-agent Read.
+        if other_agent == self_agent:
+            return False, ""
+        rest = "/".join(parts[1:]) + "/"
+        for sub in _SYSTEM_CLASS_READABLE_AGENT_SUBPATHS:
+            if rest.startswith(sub):
+                return True, other_agent
+        return False, other_agent
+
+    return False, ""
+
+
 def protected_path_reason(
     path: Path,
     agent: str,
@@ -398,6 +494,24 @@ def protected_path_reason(
         return None
     target = target_agent_for_path(path, agent)
     if target:
+        # Issue #539: class=system agents are allowed read-only access to
+        # peer memory/{projects,decisions,shared}/ subtrees and to
+        # shared/* (excluding shared/private/, shared/secrets/). The
+        # carve-out fires only for read-intent tools (Read / Glob /
+        # Grep / NotebookRead) — Bash/Edit/Write reach this branch with
+        # read_intent=False and stay denied. Every allowed read emits a
+        # `system_cross_agent_read` audit row so the operator retains a
+        # full ledger of cross-agent access.
+        if read_intent and current_agent_class() == "system":
+            allowed, audit_target = _system_class_cross_agent_read_allowed(path, agent)
+            if allowed:
+                emit_system_cross_agent_read(
+                    agent=agent,
+                    target_path=str(path),
+                    target_agent=audit_target or target,
+                    tool="Read",
+                )
+                return None
         return f"cross-agent access is blocked: {target}"
     return None
 

@@ -176,6 +176,13 @@ export BRIDGE_ADMIN_AGENT_ID="$(bridge_admin_agent_id)"
 export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
 export BRIDGE_AGENT_ISOLATION_MODE="$(bridge_agent_isolation_mode "$AGENT")"
 export BRIDGE_AGENT_OS_USER="$(bridge_agent_os_user "$AGENT")"
+# Issue #539: privilege class consumed by hooks/tool-policy.py to gate
+# cross-agent reads. Default "user"; "system" opts in to read-only access
+# of peer memory/{projects,decisions,shared}/ trees. Exported as a
+# distinctly-named scalar (BRIDGE_AGENT_CLASS in bash is the associative
+# array of every agent's class; the hook only needs the calling agent's
+# value, so we surface a scalar alias here).
+export BRIDGE_AGENT_CLASS_FOR_HOOK="$(bridge_agent_class "$AGENT")"
 export BRIDGE_AGENT_INJECT_TIMESTAMP="$(bridge_agent_inject_timestamp "$AGENT")"
 export BRIDGE_AGENT_PROMPT_GUARD_POLICY="$(bridge_guard_policy_raw "$AGENT")"
 export BRIDGE_PROMPT_GUARD_CANARY_TOKENS="$(bridge_agent_prompt_guard_canary "$AGENT")"

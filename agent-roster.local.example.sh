@@ -142,6 +142,26 @@ BRIDGE_AGENT_ACTION["developer:clear"]="/clear"
 # BRIDGE_HEALTH_WARN_SECONDS=3600
 # BRIDGE_HEALTH_CRITICAL_SECONDS=14400
 
+# Optional: agent class — privilege boundary consumed by hooks/tool-policy.py
+# (issue #539). The closed value space is { user, system }; an unknown class
+# is a hard error at roster load.
+#
+#   user   - default. Per-agent isolation; cross-agent reads denied.
+#   system - read-only access to other agents' memory/{projects,decisions,
+#            shared}/ trees plus shared/* (excluding shared/private/ and
+#            shared/secrets/). Bash/Edit/Write outside the agent's own
+#            home stay denied even for class=system. Every cross-agent
+#            read emits a `system_cross_agent_read` row to audit.jsonl.
+#
+# Class is intended for ingestion/supervisory roles (e.g., a librarian
+# that harvests every agent's memory tree into a shared wiki, or a
+# patch/doctor that diagnoses other agents). The shipped public roster
+# declares no system-class agents — operators opt in locally.
+#
+# Example (uncomment and replace the agent name with your local role):
+# BRIDGE_AGENT_CLASS["librarian"]="system"
+# BRIDGE_AGENT_CLASS["patch"]="system"
+
 # Example: add another long-lived role.
 # bridge_add_agent_id_if_missing "reviewer"
 # BRIDGE_AGENT_DESC["reviewer"]="Code review role (Claude Code)"

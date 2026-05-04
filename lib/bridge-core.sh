@@ -513,6 +513,7 @@ bridge_reset_roster_maps() {
   unset BRIDGE_AGENT_WEBHOOK_PORT BRIDGE_LEGACY_AGENT_TARGET BRIDGE_OPENCLAW_AGENT_TARGET BRIDGE_CRON_AGENT_TARGET BRIDGE_CRON_FALLBACK_AGENT BRIDGE_AGENT_DISCORD_CHANNEL_ID BRIDGE_AGENT_CHANNELS BRIDGE_AGENT_PLUGINS BRIDGE_AGENT_AUTO_ACCEPT_DEV_CHANNELS BRIDGE_AGENT_MEMORY_DAILY_REFRESH BRIDGE_AGENT_INJECT_TIMESTAMP BRIDGE_AGENT_PROMPT_GUARD BRIDGE_CRON_ENQUEUE_FAMILIES
   unset BRIDGE_AGENT_SKILLS
   unset BRIDGE_AGENT_ISOLATION_MODE BRIDGE_AGENT_OS_USER
+  unset BRIDGE_AGENT_CLASS
 
   declare -g -a BRIDGE_AGENT_IDS=()
   declare -g -A BRIDGE_AGENT_DESC=()
@@ -549,6 +550,11 @@ bridge_reset_roster_maps() {
   declare -g -A BRIDGE_AGENT_SKILLS=()
   declare -g -A BRIDGE_AGENT_ISOLATION_MODE=()
   declare -g -A BRIDGE_AGENT_OS_USER=()
+  # Issue #539: per-agent privilege class consumed by hooks/tool-policy.py.
+  # Default-empty; bridge_agent_class normalizes missing/unknown to "user".
+  # Operators opt agents into class=system in agent-roster.local.sh; the
+  # public roster declares no system-class agents.
+  declare -g -A BRIDGE_AGENT_CLASS=()
   declare -g -a BRIDGE_CRON_ENQUEUE_FAMILIES=()
 }
 

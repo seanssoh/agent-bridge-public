@@ -1255,6 +1255,14 @@ bridge_load_roster() {
     fi
   fi
 
+  # Issue #539: validate BRIDGE_AGENT_CLASS values once the roster files
+  # have been sourced. The closed value space is {user, system}; a typo
+  # like `class=admin` must surface as a hard load error rather than
+  # silently degrading to user-class privileges.
+  if declare -F bridge_validate_agent_classes >/dev/null 2>&1; then
+    bridge_validate_agent_classes
+  fi
+
   : "${BRIDGE_LOG_DIR:=$BRIDGE_HOME/logs}"
   : "${BRIDGE_AUDIT_LOG:=$BRIDGE_LOG_DIR/audit.jsonl}"
   : "${BRIDGE_SHARED_DIR:=$BRIDGE_HOME/shared}"
