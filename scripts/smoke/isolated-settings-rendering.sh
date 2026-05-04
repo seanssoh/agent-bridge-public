@@ -2,12 +2,13 @@
 # scripts/smoke/isolated-settings-rendering.sh — Issue #544 PR2 smoke.
 #
 # Validates the `bridge-hooks.py render-isolated-home-settings` Python
-# renderer against a stub isolated home. Exercises five sub-tests:
+# renderer against a stub isolated home. Exercises seven sub-tests:
 #
 # 1. The rendered `<isolated-home>/.claude/settings.effective.json`
-#    contains the bridge hook entries (Stop / UserPromptSubmit /
-#    SessionStart / PermissionDenied — the suite shipped in
-#    agents/.claude/settings.json after PR #550).
+#    contains the full bridge hook suite (Stop / UserPromptSubmit /
+#    SessionStart / PermissionDenied / PreCompact / PreToolUse /
+#    PostToolUse — the seven event types managed by the shared base
+#    agents/.claude/settings.json after PR #561 r2).
 # 2. `<isolated-home>/.claude/settings.json` is a symlink pointing at
 #    the relative path `settings.effective.json`.
 # 3. Pre-existing user keys (`enabledPlugins`, `extraKnownMarketplaces`,
@@ -19,6 +20,13 @@
 #    place — i.e. via the staging path the bash helper uses) propagates
 #    the new value, proving the renderer re-reads each invocation
 #    rather than caching the first preserved set.
+# 6. Symlink-aware preservation: after the first install (where
+#    settings.json becomes a symlink), a second render with no fresh
+#    regular settings.json must still preserve the user keys by
+#    dereferencing through the symlink to settings.effective.json. PR
+#    #561 r1 needs-more flagged that the previous bash helper only
+#    staged when settings.json was a regular file, silently dropping
+#    keys on every subsequent rerender.
 #
 # Coverage: Python renderer logic only. Does NOT exercise:
 #   - the bash wrapper `bridge_install_isolated_home_settings`'s sudo
@@ -107,6 +115,21 @@ assert_hook_entries_present() {
     "SessionStart event present"
   smoke_assert_contains "$content" '"PermissionDenied"' \
     "PermissionDenied event present"
+  # PR #561 r2 — the shared base now carries the full 7-hook suite.
+  # PreCompact / PreToolUse / PostToolUse were missing from the isolated
+  # render before this commit because they were absent from the shared
+  # base; the renderer composes from base, so adding them there flows
+  # straight into the isolated effective file.
+  smoke_assert_contains "$content" '"PreCompact"' \
+    "PreCompact event present"
+  smoke_assert_contains "$content" '"PreToolUse"' \
+    "PreToolUse event present"
+  smoke_assert_contains "$content" '"PostToolUse"' \
+    "PostToolUse event present"
+  smoke_assert_contains "$content" 'pre-compact.py' \
+    "PreCompact points at pre-compact.py"
+  smoke_assert_contains "$content" 'tool-policy.py' \
+    "PreToolUse/PostToolUse point at tool-policy.py"
   smoke_assert_contains "$content" 'mark-idle.sh' \
     "Stop suite includes mark-idle.sh"
   smoke_assert_contains "$content" 'surface-reply-enforce.py' \
@@ -193,6 +216,54 @@ EOF
     "boolean flip on skipDangerousModePermissionPrompt propagates"
 }
 
+assert_symlink_aware_preservation() {
+  # Regression for codex r1 needs-more on PR #561 (finding #2): after
+  # the first install, settings.json is a symlink to
+  # settings.effective.json; a second render that only sees the symlink
+  # must still preserve the original user keys by dereferencing through
+  # to the effective file. The Python renderer's `cmd_render_isolated_home_settings`
+  # symlink branch reads from `<isolated-home>/.claude/settings.effective.json`
+  # when `settings.json` is a symlink — the bash wrapper
+  # `bridge_install_isolated_home_settings` mirrors the same trick by
+  # staging the symlink + the live effective file into the renderer's
+  # input tree.
+  local stage_root="$SMOKE_TMP_ROOT/stage-symlink-preserve"
+  local stage_home="$stage_root/isolated-home"
+  mkdir -p "$stage_home/.claude"
+  # Seed an effective file that already carries preserved keys (the
+  # output of the FIRST render, mirrored manually here).
+  cat >"$stage_home/.claude/settings.effective.json" <<'EOF'
+{
+  "autoMemoryEnabled": true,
+  "autoDreamEnabled": true,
+  "enabledPlugins": ["plugin-from-prior-render"],
+  "extraKnownMarketplaces": {"prior": {"source": "github:prior/marketplace"}},
+  "skipDangerousModePermissionPrompt": true,
+  "hooks": {}
+}
+EOF
+  # Stage settings.json as a symlink to settings.effective.json — the
+  # exact post-first-install state under the live isolated home.
+  ln -s "settings.effective.json" "$stage_home/.claude/settings.json"
+
+  # Re-render. The renderer must dereference and re-emit the preserved
+  # keys; without the fix, this branch silently drops them.
+  python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" render-isolated-home-settings \
+    --isolated-home "$stage_home" \
+    --base-settings-file "$FIXTURE_BRIDGE_HOME/agents/.claude/settings.json" \
+    --overlay-settings-file "$FIXTURE_BRIDGE_HOME/agents/.claude/settings.local.json" \
+    --launch-cmd "" >/dev/null
+
+  local content
+  content="$(cat "$stage_home/.claude/settings.effective.json")"
+  smoke_assert_contains "$content" '"plugin-from-prior-render"' \
+    "enabledPlugins survives second render through symlink dereference"
+  smoke_assert_contains "$content" 'github:prior/marketplace' \
+    "extraKnownMarketplaces survives second render through symlink dereference"
+  smoke_assert_contains "$content" '"skipDangerousModePermissionPrompt": true' \
+    "skipDangerousModePermissionPrompt survives second render through symlink dereference"
+}
+
 main() {
   build_fixture
 
@@ -206,6 +277,8 @@ main() {
     assert_idempotent
   smoke_run "user-key updates propagate via staged re-render" \
     assert_user_key_update_propagates
+  smoke_run "symlink-aware preservation across consecutive renders" \
+    assert_symlink_aware_preservation
 
   smoke_log "PASS"
 }

@@ -75,6 +75,41 @@
           }
         ]
       }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 ~/.agent-bridge/hooks/pre-compact.py",
+            "timeout": 20
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 ~/.agent-bridge/hooks/tool-policy.py",
+            "timeout": 5,
+            "additionalContext": true
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/python3 ~/.agent-bridge/hooks/tool-policy.py",
+            "timeout": 5,
+            "additionalContext": true
+          }
+        ]
+      }
     ]
   }
 }
