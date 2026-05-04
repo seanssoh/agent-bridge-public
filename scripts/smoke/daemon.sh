@@ -5,14 +5,20 @@
 # `./scripts/smoke/daemon.sh` direct invocation through `/usr/bin/env bash`
 # may resolve to /bin/bash. Re-exec into a Bash 4+ candidate when needed
 # so the resulting subshells (and the bridge-lib.sh re-exec guard, which
-# sees $0 as the smoke script path) all run on Bash 4+. (#576 r3 Finding 3)
+# sees $0 as the smoke script path) all run on Bash 4+. Capture
+# BASH_SOURCE[0] before any re-exec — $0 is unreliable under macOS
+# /bin/bash invocations like `bash -lc '...' _` where it expands to `_`.
+# (#576 r4 Finding 3)
+_SMOKE_DAEMON_REEXEC_TARGET="${BASH_SOURCE[0]}"
 if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
-  for smoke_candidate_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "${BASH4_BIN:-}"; do
-    [[ -n "$smoke_candidate_bash" && -x "$smoke_candidate_bash" ]] || continue
-    if "$smoke_candidate_bash" -lc '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
-      exec "$smoke_candidate_bash" "$0" "$@"
-    fi
-  done
+  if [[ -f "$_SMOKE_DAEMON_REEXEC_TARGET" ]]; then
+    for smoke_candidate_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "${BASH4_BIN:-}"; do
+      [[ -n "$smoke_candidate_bash" && -x "$smoke_candidate_bash" ]] || continue
+      if "$smoke_candidate_bash" -lc '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
+        exec "$smoke_candidate_bash" "$_SMOKE_DAEMON_REEXEC_TARGET" "$@"
+      fi
+    done
+  fi
   echo "[smoke:daemon] requires Bash 4+; install homebrew bash or set BASH4_BIN to a Bash 4+ binary." >&2
   exit 1
 fi
