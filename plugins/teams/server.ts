@@ -151,6 +151,8 @@ try {
 const HOST = process.env.TEAMS_WEBHOOK_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.TEAMS_WEBHOOK_PORT ?? '3978')
 const STATIC = process.env.TEAMS_ACCESS_MODE === 'static'
+const BRIDGE_MODE = process.env.TEAMS_BRIDGE_MODE === '1'
+const BRIDGE_AGENT = process.env.TEAMS_BRIDGE_AGENT ?? process.env.BRIDGE_AGENT_ID ?? ''
 
 const APP_ID = process.env.TEAMS_APP_ID ?? process.env.MicrosoftAppId
 const APP_PASSWORD = process.env.TEAMS_APP_PASSWORD ?? process.env.MicrosoftAppPassword
@@ -520,6 +522,38 @@ function recentMessages(chatId: string, limit: number): StoredMessage[] {
   return rows.slice(-Math.max(1, Math.min(limit, 100)))
 }
 
+function bridgeSend(agent: string, stored: StoredMessage): void {
+  const targetAgent = agent.trim()
+  if (!targetAgent) {
+    throw new Error('TEAMS_BRIDGE_MODE=1 requires TEAMS_BRIDGE_AGENT or BRIDGE_AGENT_ID')
+  }
+  const attachmentHint = stored.attachments?.length
+    ? `\nattachments=${JSON.stringify(stored.attachments.map(att => ({
+        name: att.name,
+        content_type: att.content_type,
+        download_status: att.download_status,
+        ...(att.local_path ? { local_path: att.local_path } : {}),
+        ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
+      })))}`
+    : ''
+  const sendMessage =
+    `[Teams] chat_id=${stored.chat_id} message_id=${stored.message_id} user=${stored.user}${attachmentHint}\n\n` +
+    `${stored.text}\n\n` +
+    `Reply via the teams MCP tool (mcp__teams__reply) using the chat_id above.`
+  const agb = join(BRIDGE_HOME, 'agent-bridge')
+  const result = spawnSync(agb, ['urgent', targetAgent, sendMessage], {
+    encoding: 'utf8',
+    timeout: 10000,
+  })
+  if (result.error) {
+    throw new Error(`bridge-send spawn failed: ${result.error}`)
+  }
+  if (result.status !== 0) {
+    throw new Error(`bridge-send exit ${result.status}: ${result.stderr ?? ''}`)
+  }
+  process.stderr.write(`teams channel: bridge-send to ${targetAgent} for chat ${stored.chat_id}\n`)
+}
+
 const adapter = new BotFrameworkAdapter({
   appId: APP_ID,
   appPassword: APP_PASSWORD,
@@ -647,36 +681,46 @@ async function handleActivity(context: TurnContext): Promise<void> {
   }
   appendMessage(stored)
 
-  void mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        source: 'teams',
-        chat_id: chatId,
-        conversation_id: chatId,
-        message_id: messageId,
-        user: userName,
-        user_id: stored.user_id,
-        aad_object_id: aad,
-        tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
-        service_url: String(activity.serviceUrl ?? ''),
-        ts,
-        ...(attachments.length > 0
-          ? {
-              attachments: attachments.map(att => ({
-                name: att.name,
-                content_type: att.content_type,
-                download_status: att.download_status,
-                ...(att.local_path ? { local_path: att.local_path } : {}),
-                ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
-                ...(att.download_error ? { download_error: att.download_error } : {}),
-              })),
-            }
-          : {}),
-      },
-    },
-  })
+  try {
+    if (BRIDGE_MODE) {
+      bridgeSend(BRIDGE_AGENT, stored)
+    } else {
+      await mcp.notification({
+        method: 'notifications/claude/channel',
+        params: {
+          content: text,
+          meta: {
+            source: 'teams',
+            chat_id: chatId,
+            conversation_id: chatId,
+            message_id: messageId,
+            user: userName,
+            user_id: stored.user_id,
+            aad_object_id: aad,
+            tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
+            service_url: String(activity.serviceUrl ?? ''),
+            ts,
+            ...(attachments.length > 0
+              ? {
+                  attachments: attachments.map(att => ({
+                    name: att.name,
+                    content_type: att.content_type,
+                    download_status: att.download_status,
+                    ...(att.local_path ? { local_path: att.local_path } : {}),
+                    ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
+                    ...(att.download_error ? { download_error: att.download_error } : {}),
+                  })),
+                }
+              : {}),
+          },
+        },
+      })
+    }
+  } catch (err) {
+    recentMessageIds.forget(messageId)
+    process.stderr.write(`teams channel: failed to deliver inbound message_id=${messageId}: ${err}\n`)
+    throw err
+  }
 }
 
 const httpServer = createServer((req, res) => {

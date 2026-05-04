@@ -7114,6 +7114,25 @@ SECOND_JSON="$(python3 "$REPO_ROOT/bridge-upgrade.py" apply-live --source-root "
 assert_contains "$SECOND_JSON" "\"files_mode_synced\": 0"
 assert_contains "$SECOND_JSON" "\"files_skipped_noop\": 1"
 
+log "smart upgrade repairs non-executable tracked file mode when content already matches"
+READ_ROOT="$TMP_ROOT/upgrade-mode-read-root"
+READ_REPO="$TMP_ROOT/upgrade-mode-read-repo"
+mkdir -p "$READ_ROOT" "$READ_REPO"
+git -C "$READ_REPO" init -q
+git -C "$READ_REPO" config user.email smoke-test
+git -C "$READ_REPO" config user.name "Bridge Smoke"
+printf 'library helper\n' >"$READ_REPO/helper.txt"
+chmod 0644 "$READ_REPO/helper.txt"
+git -C "$READ_REPO" add helper.txt
+git -C "$READ_REPO" commit -qm "helper tracked 100644"
+READ_BASE="$(git -C "$READ_REPO" rev-parse HEAD)"
+cp "$READ_REPO/helper.txt" "$READ_ROOT/helper.txt"
+chmod 0600 "$READ_ROOT/helper.txt"
+READ_JSON="$(python3 "$REPO_ROOT/bridge-upgrade.py" apply-live --source-root "$READ_REPO" --target-root "$READ_ROOT" --base-ref "$READ_BASE")"
+assert_contains "$READ_JSON" "\"files_mode_synced\": 1"
+mode_read="$(stat -f '%Lp' "$READ_ROOT/helper.txt" 2>/dev/null || stat -c '%a' "$READ_ROOT/helper.txt")"
+[[ "$mode_read" == "644" ]] || die "expected helper.txt to be 644 after read-mode sync, got $mode_read"
+
 log "smart upgrade trusts git index mode over working-tree stat"
 MISMATCH_REPO="$TMP_ROOT/upgrade-mode-mismatch-repo"
 MISMATCH_ROOT="$TMP_ROOT/upgrade-mode-mismatch-root"

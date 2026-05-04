@@ -1355,24 +1355,22 @@ def analyze_live(source_root: Path, target_root: Path, base_ref: str) -> dict[st
             classification = "missing_live"
             strategy = "deploy_upstream"
         elif upstream == live:
-            # Content matches. Check whether the exec bit also matches
-            # source — a mode-only drift (live 0644 vs upstream 0755 or
-            # vice versa) is still a drift worth repairing, even though
-            # the bytes agree. Without this the previous content-only
-            # classifier skipped the file entirely, leaving the live
-            # install with the wrong permission. Source-of-truth is the
-            # git index, not source_path.stat() — a dev checkout may
-            # have drifted filesystem perms (0744 / 0700) while git
-            # still tracks 100755, and using stat would propagate the
-            # bad worktree mode to every downstream install.
-            source_exec = git_tracked_exec_bits(source_root, relpath)
-            live_exec = 0
+            # Content matches. Check whether the installed file mode also
+            # matches the git-tracked mode we deploy below. A mode-only drift
+            # is still operationally significant: 0600 bridge modules are
+            # unreadable to linux-user isolated agents even when bytes match.
+            # Source-of-truth is the git index, not source_path.stat() — a dev
+            # checkout may have drifted filesystem perms (0744 / 0700) while
+            # git still tracks 100755, and using stat would propagate the bad
+            # worktree mode to every downstream install.
+            target_mode = 0o644 | git_tracked_exec_bits(source_root, relpath)
+            live_mode = target_mode
             if not live_path.is_symlink():
                 try:
-                    live_exec = live_path.stat().st_mode & 0o111
+                    live_mode = live_path.stat().st_mode & 0o777
                 except OSError:
-                    live_exec = 0
-            if source_exec != live_exec:
+                    live_mode = 0
+            if target_mode != live_mode:
                 classification = "mode_drift"
                 strategy = "sync_mode"
             else:
