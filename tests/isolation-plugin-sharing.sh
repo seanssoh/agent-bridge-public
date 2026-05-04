@@ -1220,6 +1220,87 @@ PY
 adv_run_unsafe_known_marketplaces_key "key-dot-only"        "."
 adv_run_unsafe_known_marketplaces_key "key-double-dot-only" ".."
 
+# Whitespace-embedded JSON keys (r3 finding 4b end-to-end gap): the bash
+# tokenizer in `bridge_agent_plugins_csv` / `bridge_normalize_channels_csv`
+# strips space/tab/newline/CR from agent declarations BEFORE the catalog
+# generator sees them, so `adv_run_unsafe_known_marketplaces_key` cannot
+# carry these shapes through BRIDGE_AGENT_PLUGINS. To exercise the
+# validator's whitespace-rejection branch end-to-end against the actual
+# JSON-key surface, we invoke `bridge_write_isolated_known_marketplaces_catalog`
+# directly with a hand-crafted channels_csv that bypasses the bash
+# tokenizer. The catalog writer's inline `declared_marketplaces()` does
+# call `token.strip()` on each split element, so leading/trailing
+# whitespace (e.g. `\tfoo`, `foo\n`) is collapsed before the validator
+# sees the key — those shapes are covered separately by the
+# cross-validator parity sweep below (which calls the inline lib
+# validator directly with no tokenizer/strip in the way). The cases
+# here are the embedded-whitespace shapes that survive `.strip()` and
+# reach the validator with their whitespace intact.
+adv_run_unsafe_known_marketplaces_key_bypass_tokenizer() {
+  # Stage a controller `known_marketplaces.json` whose KEY contains a
+  # whitespace-bearing sequence and pass that key verbatim to the
+  # catalog writer via channels_csv (no bash-level tokenization). Assert
+  # non-zero exit and an error message that names the offending key.
+  local label="$1" mkt_id="$2"
+  cp "$ADV_SNAP_INSTALLED" "$CONTROLLER_PLUGINS/installed_plugins.json"
+  cp "$ADV_SNAP_KNOWN" "$CONTROLLER_PLUGINS/known_marketplaces.json"
+  python3 - "$CONTROLLER_PLUGINS/known_marketplaces.json" "$mkt_id" <<'PY'
+import json, sys
+path, mkt_id = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    data = json.load(f)
+data[mkt_id] = {
+    "source": {"source": "git", "repo": "Example-Org/unsafe-mkt"},
+    "installLocation": "/nonexistent/unsafe",
+}
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+  # Hand-crafted channels_csv: the catalog writer's `declared_marketplaces()`
+  # splits on `,`, calls `token.strip()` on each element (so we MUST use
+  # embedded-whitespace shapes — leading/trailing whitespace is stripped
+  # off before the `@`-split), then takes everything after `@` as the
+  # marketplace id. We deliberately bypass `bridge_agent_channels_csv`
+  # (which would also strip embedded whitespace via its tokenizer) so
+  # the bad key reaches the validator unmodified.
+  local channels_csv="plugin:unsafe-plugin@${mkt_id}"
+  set +e
+  local out=""
+  out="$(BRIDGE_CONTROLLER_HOME_OVERRIDE="$CONTROLLER_HOME_FAKE" \
+    bridge_write_isolated_known_marketplaces_catalog \
+      "$TEST_OS_USER" "$ISOLATED_PLUGINS" "$CONTROLLER_PLUGINS" \
+      "$channels_csv" "" "$TEST_AGENT" 2>&1)"
+  local rc=$?
+  set -e
+  if [[ "$rc" -eq 0 ]]; then
+    die "Adv-3[$label]: bridge_write_isolated_known_marketplaces_catalog should have failed loud on whitespace-bearing known_marketplaces.json key $(printf '%q' "$mkt_id"); rc=0, output: $out"
+  fi
+  case "$out" in
+    *rejected*|*unsafe*|*"alias collision"*) : ;;
+    *)
+      die "Adv-3[$label]: expected 'rejected' or 'unsafe' in error for whitespace-bearing known_marketplaces.json key $(printf '%q' "$mkt_id"), got: $out"
+      ;;
+  esac
+}
+
+# Whitespace shapes that survive `.strip()` in `declared_marketplaces()`
+# and reach `alias_rejection_reason` with their whitespace bytes intact:
+#   - embedded space/tab/newline/CR (whitespace BETWEEN non-whitespace
+#     chars is preserved by `.strip()`)
+#   - leading whitespace AFTER an `@` (the strip happens before the
+#     `@`-split, so a tab between `@` and the rest of the marketplace
+#     id stays attached to the marketplace half)
+# The trailing-whitespace shape `foo\n` is collapsed to `foo` by
+# `token.strip()` (the entire token's trailing newline is stripped
+# before the `@`-split), so that case doesn't reach the validator on
+# this end-to-end path. It's covered by the cross-validator parity
+# sweep below, which calls the inline lib validator directly.
+adv_run_unsafe_known_marketplaces_key_bypass_tokenizer "key-embedded-space"   'foo bar'
+adv_run_unsafe_known_marketplaces_key_bypass_tokenizer "key-embedded-tab"     $'foo\tbar'
+adv_run_unsafe_known_marketplaces_key_bypass_tokenizer "key-embedded-newline" $'foo\nbar'
+adv_run_unsafe_known_marketplaces_key_bypass_tokenizer "key-embedded-cr"      $'foo\rbar'
+adv_run_unsafe_known_marketplaces_key_bypass_tokenizer "key-leading-tab"      $'\tfoo'
+
 # Tokenizer coverage: confirm `bridge_agent_plugins_csv` strips
 # `\n`/`\t`/space from BRIDGE_AGENT_PLUGINS values BEFORE the catalog
 # generator sees them. This pins the upstream gate that prevents
@@ -1306,19 +1387,143 @@ PY
 # regression bridge between bridge-dev-plugin-cache.py (where #3a was
 # discovered) and the lib/bridge-agents.sh inline mirror — drift here
 # would let one path block while the other passes adversarial input.
+#
+# r3 finding 4b second gap: the previous version of this block only
+# imported bridge-dev-plugin-cache.py and never exercised the inline
+# `lib/bridge-agents.sh` validator. The inline mirror is text-extracted
+# from the .sh file (the canonical block inside
+# `bridge_write_isolated_known_marketplaces_catalog`), loaded into a
+# fresh module via importlib, and compared accept/reject with the
+# dev-cache validator on a fixed input set. Reason strings differ
+# between the two (the dev-cache validator interpolates the offending
+# alias), so parity is asserted on boolean accept/reject, which is what
+# the symlink-plant gate actually keys on.
 python3 - "$REPO_ROOT" <<'PY'
-import importlib.util, pathlib, sys
+import importlib.util, pathlib, sys, tempfile
+
 repo_root = pathlib.Path(sys.argv[1])
 dev_cache_path = repo_root / "bridge-dev-plugin-cache.py"
+agents_lib_path = repo_root / "lib" / "bridge-agents.sh"
+
+# 1. Standalone validator from bridge-dev-plugin-cache.py.
 spec = importlib.util.spec_from_file_location("bridge_dev_plugin_cache", dev_cache_path)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)
-fn = mod._alias_rejection_reason
+dev_cache_fn = mod._alias_rejection_reason
+
+# 2. Extract the inline-lib validator body from lib/bridge-agents.sh by
+#    line-based slicing (regex-with-DOTALL across multiple `(...)` paren
+#    blocks risks catastrophic backtracking, so we walk lines instead).
+#    The .sh file embeds the validator as part of a python heredoc inside
+#    `bridge_known_marketplace_info` /
+#    `bridge_write_isolated_known_marketplaces_catalog` /
+#    `bridge_write_isolated_installed_plugins_manifest`. All three
+#    mirrors are kept in sync; we take the first match. Anchor on the
+#    `_SAFE_ALIAS_RE` declaration line (canonical), then walk forward
+#    through the `def alias_rejection_reason(alias):` header to the
+#    first `return ""` line that closes the function body. The block is
+#    written to a temp .py file and importlib-loaded so
+#    `alias_rejection_reason` becomes a directly-callable Python
+#    function in this process.
+agents_lib_lines = agents_lib_path.read_text().split("\n")
+_safe_alias_marker = '_SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9._-]+")'
+start_idx = None
+for i, ln in enumerate(agents_lib_lines):
+    if ln.strip() == _safe_alias_marker:
+        start_idx = i
+        break
+assert start_idx is not None, (
+    "could not locate `_SAFE_ALIAS_RE` declaration in lib/bridge-agents.sh; "
+    "the parity test slices the inline validator from that anchor — if you "
+    "renamed the constant, update the marker here."
+)
+def_idx = None
+for i in range(start_idx, len(agents_lib_lines)):
+    if agents_lib_lines[i].strip() == "def alias_rejection_reason(alias):":
+        def_idx = i
+        break
+assert def_idx is not None, (
+    "found `_SAFE_ALIAS_RE` in lib/bridge-agents.sh but no following "
+    "`def alias_rejection_reason(alias):` — the inline validator shape "
+    "changed; update the parity-test slice anchors here."
+)
+end_idx = None
+for i in range(def_idx + 1, len(agents_lib_lines)):
+    if agents_lib_lines[i].strip() == 'return ""':
+        end_idx = i
+        break
+assert end_idx is not None, (
+    "found `def alias_rejection_reason` in lib/bridge-agents.sh but no "
+    "`return \"\"` line that closes the function — update parity-test "
+    "slice here."
+)
+inline_lib_src = "import re\n" + "\n".join(agents_lib_lines[start_idx:end_idx + 1]) + "\n"
+with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tf:
+    tf.write(inline_lib_src)
+    inline_lib_tmp = tf.name
+inline_spec = importlib.util.spec_from_file_location("bridge_agents_inline_validator", inline_lib_tmp)
+inline_mod = importlib.util.module_from_spec(inline_spec)
+inline_spec.loader.exec_module(inline_mod)
+inline_lib_fn = inline_mod.alias_rejection_reason
+
+# Sanity: both validators must be live callables.
+assert callable(dev_cache_fn) and callable(inline_lib_fn)
+
+# 3. Boolean accept/reject parity sweep. Reason strings differ
+#    intentionally (the dev-cache validator interpolates the offending
+#    alias for operator legibility), so we compare `bool(reason)` only.
+parity_inputs = [
+    "foo",                  # both accept
+    ".git",                 # both accept (documented escape hatch)
+    "valid_alias-1.0",      # both accept
+    "",                     # both reject (empty)
+    ".",                    # both reject (reserved)
+    "..",                   # both reject (contains '..' / reserved)
+    "../etc",               # both reject (contains '..')
+    ".secret",              # both reject (leading dot, not .git)
+    "CON",                  # both reject (Windows reserved)
+    "com1",                 # both reject (Windows reserved, case-folded)
+    "foo bar",              # both reject (whitespace)
+    "foo\tbar",             # both reject (whitespace)
+    "foo\nbar",             # both reject (whitespace)
+    "foo\rbar",             # both reject (whitespace)
+    "foo\n",                # both reject (trailing newline — r3 #3a)
+    "bar\n",                # both reject (trailing newline)
+    "baz\r",                # both reject (trailing CR)
+    "alias\x00null",        # both reject (NUL byte)
+    "alias\x1fctrl",        # both reject (control byte)
+    "a" * 201,              # both reject (length > 200)
+    "/etc/passwd",          # both reject (slash outside charset)
+    "../../../root",        # both reject (slash + ..)
+]
+for sample in parity_inputs:
+    dev_reason = dev_cache_fn(sample)
+    lib_reason = inline_lib_fn(sample)
+    dev_rejected = bool(dev_reason)
+    lib_rejected = bool(lib_reason)
+    assert dev_rejected == lib_rejected, (
+        "validator parity drift on %r: dev-cache=%r (rejected=%s), "
+        "inline-lib=%r (rejected=%s)"
+        % (sample, dev_reason, dev_rejected, lib_reason, lib_rejected)
+    )
+
+# 4. Pin known accept set against both validators (regression bridge).
+for accept_input in ("foo", ".git", "valid_alias-1.0"):
+    assert dev_cache_fn(accept_input) == "", (
+        "dev-cache validator unexpectedly rejected %r" % accept_input
+    )
+    assert inline_lib_fn(accept_input) == "", (
+        "inline-lib validator unexpectedly rejected %r" % accept_input
+    )
+
+# 5. Pin known reject set with the same trailing-newline / control-byte
+#    samples that the original parity block used. Both validators must
+#    reject these — that's the security regression bridge for r3 #3a.
 for sample in ("foo\n", "bar\n", "baz\r", "alias\x00null", "alias\x1fctrl"):
-    r = fn(sample)
-    assert r, "bridge-dev-plugin-cache.py must reject %r (got %r)" % (sample, r)
-assert fn("foo") == "", "clean alias must pass dev-cache validator"
-assert fn(".git") == "", "documented escape hatch must pass dev-cache validator"
+    dev_reason = dev_cache_fn(sample)
+    lib_reason = inline_lib_fn(sample)
+    assert dev_reason, "bridge-dev-plugin-cache.py must reject %r (got %r)" % (sample, dev_reason)
+    assert lib_reason, "lib/bridge-agents.sh inline validator must reject %r (got %r)" % (sample, lib_reason)
 PY
 log "Adv-3 PASS"
 
