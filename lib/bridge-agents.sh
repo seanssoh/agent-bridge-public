@@ -1564,7 +1564,11 @@ def repo_slug(repo):
 
 
 # Mirror of `_alias_rejection_reason` in bridge-dev-plugin-cache.py.
-_SAFE_ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# `fullmatch` (vs `match(... + "$")`) is the security-relevant choice:
+# `$` in default mode matches just before a trailing `\n`, so an alias
+# like "foo\n" would otherwise slip through the regex gate. `fullmatch`
+# requires the entire string to match, no trailing-newline tolerance.
+_SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9._-]+")
 _ALIAS_RESERVED_NAMES = {".", ".."}
 _ALIAS_WINDOWS_RESERVED = (
     {"CON", "PRN", "AUX", "NUL"}
@@ -1580,7 +1584,7 @@ def alias_rejection_reason(alias):
         return "empty"
     if len(alias) > 200:
         return "length exceeds 200"
-    if not _SAFE_ALIAS_RE.match(alias):
+    if not _SAFE_ALIAS_RE.fullmatch(alias):
         return "contains characters outside [A-Za-z0-9._-]"
     if ".." in alias:
         return "contains '..'"
@@ -1760,7 +1764,11 @@ def repo_slug(repo):
 
 
 # Mirror of `_alias_rejection_reason` in bridge-dev-plugin-cache.py.
-_SAFE_ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# `fullmatch` (vs `match(... + "$")`) closes the trailing-newline bypass:
+# in default mode `$` matches before a trailing `\n`, so "foo\n" would
+# otherwise satisfy the regex and reach the symlink-plant step. The whole
+# alias must consume the entire string with no implicit newline tolerance.
+_SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9._-]+")
 _ALIAS_RESERVED_NAMES = {".", ".."}
 _ALIAS_WINDOWS_RESERVED = (
     {"CON", "PRN", "AUX", "NUL"}
@@ -1776,7 +1784,7 @@ def alias_rejection_reason(alias):
         return "empty"
     if len(alias) > 200:
         return "length exceeds 200"
-    if not _SAFE_ALIAS_RE.match(alias):
+    if not _SAFE_ALIAS_RE.fullmatch(alias):
         return "contains characters outside [A-Za-z0-9._-]"
     if ".." in alias:
         return "contains '..'"
@@ -2106,7 +2114,7 @@ bridge_write_isolated_installed_plugins_manifest() {
   # transiently missing manifest. (Blocking 2 in PR #302 r1.)
   manifest_tmp="$(bridge_linux_sudo_root mktemp "${manifest}.tmp.XXXXXX")"
   if ! bridge_linux_sudo_root python3 - "$controller_plugins" "$isolated_plugins" "$channels_csv" "$manifest_tmp" "$plugins_csv" <<'PY'
-import json, os, sys
+import json, os, re, sys
 
 controller_plugins, isolated_plugins, channels_csv, out_path, plugins_csv = sys.argv[1:]
 controller_manifest = os.path.join(controller_plugins, "installed_plugins.json")
@@ -2115,6 +2123,43 @@ markets_path = os.path.join(controller_plugins, "known_marketplaces.json")
 
 def warn(msg):
     sys.stderr.write("[bridge-isolate] " + msg + "\n")
+
+
+# Mirror of `_alias_rejection_reason` in bridge-dev-plugin-cache.py.
+# `fullmatch` (vs `match(... + "$")`) closes the trailing-newline bypass.
+# In the normal share flow upstream gates already validate marketplace
+# id and slug aliases before this helper runs; the validator here is
+# defense-in-depth for the path components this helper itself joins
+# (`isolated_plugins/cache/<marketplace>/<plugin>/<version>`). An
+# unsafe component reaching here means an upstream gate failed; we
+# refuse the lookup rather than silently reading from a poisoned path.
+_SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9._-]+")
+_ALIAS_RESERVED_NAMES = {".", ".."}
+_ALIAS_WINDOWS_RESERVED = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % i for i in range(1, 10)}
+    | {"LPT%d" % i for i in range(1, 10)}
+)
+
+
+def alias_rejection_reason(alias):
+    if not isinstance(alias, str):
+        return "not a string"
+    if alias == "":
+        return "empty"
+    if len(alias) > 200:
+        return "length exceeds 200"
+    if not _SAFE_ALIAS_RE.fullmatch(alias):
+        return "contains characters outside [A-Za-z0-9._-]"
+    if ".." in alias:
+        return "contains '..'"
+    if alias in _ALIAS_RESERVED_NAMES:
+        return "reserved name"
+    if alias.upper() in _ALIAS_WINDOWS_RESERVED:
+        return "reserved Windows name"
+    if alias.startswith(".") and alias != ".git":
+        return "leading dot disallowed"
+    return ""
 
 
 # Distinguish "controller manifest exists but is corrupt" (operator-
@@ -2159,6 +2204,17 @@ def directory_marketplace_path(plugin_id):
     if "@" not in plugin_id:
         return ""
     plugin_name, marketplace = plugin_id.split("@", 1)
+    # Defense-in-depth: plugin_name is about to be joined into a path.
+    # marketplace is used only as a dict key so doesn't need path-safety,
+    # but reject it too — an unsafe id here means an upstream parser bug.
+    for role, value in (("plugin name", plugin_name), ("marketplace id", marketplace)):
+        reason = alias_rejection_reason(value)
+        if reason:
+            sys.stderr.write(
+                "[bridge-isolate] directory_marketplace_path rejected %s %r (plugin_id=%r): %s\n"
+                % (role, value, plugin_id, reason)
+            )
+            raise SystemExit(2)
     entry = markets.get(marketplace, {})
     if not isinstance(entry, dict):
         return ""
@@ -2184,6 +2240,25 @@ def isolated_cache_path(plugin_id, entry):
         version = os.path.basename(install_path)
     if not version:
         return ""
+    # Defense-in-depth: every component is about to be joined into
+    # `<isolated_plugins>/cache/<marketplace>/<plugin>/<version>`. An
+    # unsafe component (newline / `..` / slash) could escape the cache
+    # root; in the normal share flow the catalog writer already filters
+    # marketplace ids upstream, but this helper runs separately and must
+    # hold the gate on its own. Fail loud — silently returning "" would
+    # mask an upstream bug.
+    for role, value in (
+        ("marketplace id", marketplace),
+        ("plugin name", plugin_name),
+        ("plugin version", version),
+    ):
+        reason = alias_rejection_reason(value)
+        if reason:
+            sys.stderr.write(
+                "[bridge-isolate] isolated_cache_path rejected %s %r (plugin_id=%r): %s\n"
+                % (role, value, plugin_id, reason)
+            )
+            raise SystemExit(2)
     candidate = os.path.join(isolated_plugins, "cache", marketplace, plugin_name, version)
     return candidate if os.path.isdir(candidate) else ""
 
@@ -2239,7 +2314,12 @@ with open(out_path, "w") as f:
 PY
   then
     bridge_linux_sudo_root rm -f "$manifest_tmp" >/dev/null 2>&1 || true
-    bridge_warn "bridge_write_isolated_installed_plugins_manifest: refused to write per-UID manifest for $os_user (controller state unparseable)"
+    # Fail-loud: SystemExit(2) covers both controller-state-unparseable
+    # and the new defense-in-depth path-component rejection in
+    # `directory_marketplace_path`/`isolated_cache_path`. The Python
+    # heredoc emits a `[bridge-isolate]` stderr line naming the offending
+    # component before exiting; surface that to the operator log.
+    bridge_warn "bridge_write_isolated_installed_plugins_manifest: refused to write per-UID manifest for $os_user (see [bridge-isolate] errors above; either controller state unparseable or a path component failed safe-alias gate)"
     return 1
   fi
 

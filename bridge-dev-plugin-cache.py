@@ -148,7 +148,15 @@ def marketplace_repo_slug(repo: str) -> str:
 # alias that escapes the marketplaces/ namespace is a privilege-escalation
 # surface. Reject loudly rather than silently sanitising — a rejected
 # input means an upstream catalog/config bug we want surfaced.
-_SAFE_ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+#
+# Use `re.fullmatch` (not `re.match(... + "$")`): in Python's default
+# (non-MULTILINE) mode, `$` matches at the end-of-string AND just before
+# a trailing newline. That means `re.match(r"^[A-Za-z0-9._-]+$", "foo\n")`
+# returns a match — letting an alias with a trailing newline slip past
+# the safety regex. `fullmatch` requires the pattern to consume the
+# entire string (no implicit trailing-`\n` allowance), which is the
+# semantic the privilege-escalation gate needs.
+_SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9._-]+")
 _ALIAS_RESERVED_NAMES = {".", ".."}
 _ALIAS_WINDOWS_RESERVED = (
     {"CON", "PRN", "AUX", "NUL"}
@@ -165,7 +173,7 @@ def _alias_rejection_reason(alias: object) -> str:
         return "empty"
     if len(alias) > 200:
         return f"length {len(alias)} exceeds 200"
-    if not _SAFE_ALIAS_RE.match(alias):
+    if not _SAFE_ALIAS_RE.fullmatch(alias):
         return "contains characters outside [A-Za-z0-9._-]"
     if ".." in alias:
         return "contains '..'"
@@ -212,12 +220,41 @@ def is_marketplace_manifest_readable(root: Path) -> bool:
         return False
 
 
+def _require_safe_path_component(value: str, *, role: str, context: str) -> None:
+    """Fail loud when a value about to become a path component is unsafe.
+
+    Mirrors the contract of `bridge_isolation_alias_rejection_reason` in
+    lib/bridge-agents.sh: any path component that escapes the documented
+    safe-alias namespace can plant a symlink/dir outside the
+    intended root, so we refuse rather than silently sanitising.
+    Raises ValueError with a concrete reason — callers higher up surface
+    this through `bridge_die`-equivalent logging or let it propagate to
+    the operator.
+    """
+    reason = _alias_rejection_reason(value)
+    if reason:
+        raise ValueError(
+            f"[bridge-dev-plugin-cache] refusing unsafe {role} {value!r} "
+            f"(context: {context}): {reason}"
+        )
+
+
 def resolve_marketplace_root(default_root: Path, channel: str) -> Path:
     marketplace = channel_marketplace(channel)
     if not marketplace:
         return default_root
     if root_marketplace_name(default_root) == marketplace:
         return default_root
+
+    # Defense-in-depth: marketplace was extracted from the channel string
+    # (`plugin:<name>@<marketplace>`) and is about to be joined into a
+    # filesystem path under `<plugins_root>/marketplaces/<marketplace>`.
+    # The bash side validates this before the catalog write, but the dev-
+    # cache pipeline reaches here independently — keep the gate explicit.
+    _require_safe_path_component(
+        marketplace, role="marketplace id",
+        context=f"resolve_marketplace_root channel={channel!r}",
+    )
 
     markets = load_known_marketplaces()
     entry = markets.get(marketplace)
@@ -237,6 +274,13 @@ def resolve_marketplace_root(default_root: Path, channel: str) -> Path:
             candidates.append(Path(source_path).expanduser())
         repo_slug = marketplace_repo_slug(str(source.get("repo") or ""))
         if repo_slug:
+            # `repo_slug` derives from operator-controlled known_marketplaces.json
+            # source.repo (org/name); validate before joining so a poisoned slug
+            # cannot land us at `<plugins_root>/marketplaces/../foo`.
+            _require_safe_path_component(
+                repo_slug, role="repo slug",
+                context=f"resolve_marketplace_root marketplace={marketplace!r}",
+            )
             candidates.append(plugins_root / "marketplaces" / repo_slug)
 
     candidates.append(plugins_root / "marketplaces" / marketplace)
@@ -448,6 +492,25 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
             "status": "missing",
             "reason": f"source-missing:{source_path}",
         }
+
+    # Defense-in-depth: every component about to be joined into the
+    # cache path is operator/marketplace-controlled (marketplace.json,
+    # channel string). Validate before `cache_root() / mkt / plug / ver`
+    # so an unsafe component (newline, `..`, slash) cannot escape the
+    # cache root via path traversal — fail loud rather than silently
+    # caching to a poisoned path.
+    _require_safe_path_component(
+        marketplace_name, role="marketplace name",
+        context=f"sync_plugin_cache channel={channel!r}",
+    )
+    _require_safe_path_component(
+        plugin_name, role="plugin name",
+        context=f"sync_plugin_cache channel={channel!r}",
+    )
+    _require_safe_path_component(
+        str(version), role="plugin version",
+        context=f"sync_plugin_cache channel={channel!r}",
+    )
 
     plugin_cache_root = cache_root() / marketplace_name / plugin_name
     cache_version_path = plugin_cache_root / version

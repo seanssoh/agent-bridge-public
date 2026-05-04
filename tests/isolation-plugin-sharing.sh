@@ -1136,113 +1136,152 @@ adv_run_unsafe_id "dotdot-mid"        "foo..bar"
 adv_run_unsafe_id "leading-slash"     "/foo"
 adv_run_unsafe_id "trailing-slash"    "foo/"
 
-# Subgroup B — control-char and empty cases. `bridge_agent_plugins_csv`
-# tokenises on `[ \t\n,]` so a literal newline/tab in BRIDGE_AGENT_PLUGINS
-# would be consumed as a separator before reaching the validator. Drive
-# the catalog-generator's validator directly with a synthesised
-# known_marketplaces.json so the bash CSV path doesn't shield us from
-# the assertion.
-adv_run_unsafe_id_via_catalog_gen() {
-  local label="$1" mkt_id="$2" alias_id="${3:-}"
-  local adv_dir="$TMP_ROOT/adv-cg-${label}"
-  rm -rf "$adv_dir" >/dev/null 2>&1 || true
-  mkdir -p "$adv_dir/isolated/plugins" "$adv_dir/controller-plugins"
-  python3 - "$adv_dir/controller-plugins/known_marketplaces.json" "$mkt_id" <<'PY'
+# Subgroup B — adversarial inputs that *cannot* enter via BRIDGE_AGENT_PLUGINS
+# (the bash tokenizer in `bridge_agent_plugins_csv` splits on `[ \t\n,]`)
+# but CAN enter via `known_marketplaces.json` keys/values, which is
+# operator-controlled JSON. The end-to-end gate is:
+#   BRIDGE_AGENT_PLUGINS  → tokenize  → catalog write  → validator
+# so the security boundary that codex r2 finding 4b challenged is whether
+# adversarial JSON content reaches the validator and is rejected.
+#
+# These cases drive `bridge_linux_share_plugin_catalog` end-to-end (the
+# real production attack surface) rather than re-implementing the
+# validator in inline Python — which was the bypass r2 flagged.
+adv_run_unsafe_known_marketplaces_key() {
+  # Stage a controller `known_marketplaces.json` whose KEY contains an
+  # adversarial sequence (newline, tab, etc.) and a clean plugin ref to
+  # ensure the catalog generator iterates the entry. Assert the share
+  # helper fails loud.
+  #
+  # Mechanism:
+  #   - The agent declares a *clean* marketplace id via
+  #     BRIDGE_AGENT_PLUGINS, but we ALSO inject an unsafe key into the
+  #     controller's known_marketplaces.json. The catalog generator
+  #     iterates `declared_marketplaces()` (filtered to declared) and
+  #     would only validate the clean id — so we additionally seed
+  #     installed_plugins.json with a `<plugin>@<unsafe_key>` entry
+  #     that the agent declares verbatim. The bash tokenizer's literal-
+  #     character split keeps `..` / `foo..bar` / `/foo` intact (these
+  #     pass the tokenizer untouched, see Subgroup A), and we use those
+  #     same shapes here against the END-to-end catalog writer.
+  #
+  # NOTE: literal `\n`/`\t` cannot enter via BRIDGE_AGENT_PLUGINS at all
+  # because the bash tokenizer eats them. The matching coverage is in
+  # the unit assertion at the bottom of this section, which targets the
+  # validator's regex/length/empty branches the way an operator would
+  # see them in a `bridge_isolate` failure log.
+  local label="$1" mkt_id="$2"
+  cp "$ADV_SNAP_INSTALLED" "$CONTROLLER_PLUGINS/installed_plugins.json"
+  cp "$ADV_SNAP_KNOWN" "$CONTROLLER_PLUGINS/known_marketplaces.json"
+  python3 - "$CONTROLLER_PLUGINS/known_marketplaces.json" "$mkt_id" <<'PY'
 import json, sys
 path, mkt_id = sys.argv[1], sys.argv[2]
+with open(path) as f:
+    data = json.load(f)
+data[mkt_id] = {
+    "source": {"source": "git", "repo": "Example-Org/unsafe-mkt"},
+    "installLocation": "/nonexistent/unsafe",
+}
 with open(path, "w") as f:
-    json.dump({
-        mkt_id: {
-            "source": {"source": "git", "repo": "Example-Org/unsafe-mkt"},
-            "installLocation": "/nonexistent/unsafe",
-        }
-    }, f)
+    json.dump(data, f, indent=2)
 PY
-  # Run the catalog-generator's Python heredoc body directly so we
-  # bypass the bash CSV tokenizer entirely. The body lives inline in
-  # bridge_write_isolated_known_marketplaces_catalog; we mirror its
-  # interface here via the SAME validator code paths.
+  python3 - "$CONTROLLER_PLUGINS/installed_plugins.json" "$mkt_id" <<'PY'
+import json, sys
+manifest_path, mkt_id = sys.argv[1], sys.argv[2]
+with open(manifest_path) as f:
+    data = json.load(f)
+data.setdefault("plugins", {})["unsafe-plugin@" + mkt_id] = [
+    {"scope": "user", "version": "0.1.0", "installPath": "/nonexistent/unsafe"}
+]
+with open(manifest_path, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+  BRIDGE_AGENT_PLUGINS["$TEST_AGENT"]="unsafe-plugin@${mkt_id}"
   set +e
   local out=""
-  out="$(python3 - "$adv_dir/controller-plugins" "$adv_dir/isolated/plugins" \
-        "" "unsafe-plugin@${mkt_id}" "$adv_dir/out.json" 2>&1 <<'PY'
-import json
-import os
-import re
-import sys
-
-controller_plugins, isolated_plugins, channels_csv, plugins_csv, out_path = sys.argv[1:]
-markets_path = os.path.join(controller_plugins, "known_marketplaces.json")
-
-_SAFE_ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]+$")
-_RES = {".", ".."}
-_WIN = ({"CON","PRN","AUX","NUL"}
-        | {"COM%d"%i for i in range(1,10)}
-        | {"LPT%d"%i for i in range(1,10)})
-def reason(a):
-    if not isinstance(a, str): return "not a string"
-    if a == "": return "empty"
-    if len(a) > 200: return "length exceeds 200"
-    if not _SAFE_ALIAS_RE.match(a): return "regex"
-    if ".." in a: return "contains '..'"
-    if a in _RES: return "reserved name"
-    if a.upper() in _WIN: return "reserved Windows name"
-    if a.startswith(".") and a != ".git": return "leading dot disallowed"
-    return ""
-
-def declared(channels_csv, plugins_csv):
-    out = set()
-    for raw in (channels_csv + "," + plugins_csv).split(","):
-        token = raw.strip()
-        if token.startswith("plugin:"):
-            token = token[len("plugin:"):]
-        if "@" not in token:
-            continue
-        _p, m = token.split("@", 1)
-        if m:
-            out.add(m)
-    return out
-
-# `BRIDGE_AGENT_PLUGINS["agent"]="unsafe-plugin@<mkt_id>"` is what the
-# operator typed; the bash CSV tokenizer would mangle whitespace, so
-# inject the marketplace id directly via declared().
-mkt_ids = declared(channels_csv, plugins_csv)
-for m in mkt_ids:
-    r = reason(m)
-    if r:
-        print("[bridge-isolate] marketplace id %r rejected: %s" % (m, r), file=sys.stderr)
-        raise SystemExit(2)
-print("[bridge-isolate] all marketplace ids passed validation: %r" % sorted(mkt_ids))
-PY
-)"
+  out="$(BRIDGE_CONTROLLER_HOME_OVERRIDE="$CONTROLLER_HOME_FAKE" \
+    bridge_linux_share_plugin_catalog "$TEST_OS_USER" "$TEST_OS_HOME" "$CONTROLLER_USER" "$TEST_AGENT" 2>&1)"
   local rc=$?
   set -e
   if [[ "$rc" -eq 0 ]]; then
-    die "Adv-3[$label]: catalog-generator validator did NOT reject mkt_id $(printf '%q' "$mkt_id"); output: $out"
+    die "Adv-3[$label]: bridge_linux_share_plugin_catalog should have failed loud on adversarial known_marketplaces.json key $(printf '%q' "$mkt_id"); rc=0, output: $out"
   fi
   case "$out" in
-    *rejected*) : ;;
-    *) die "Adv-3[$label]: expected 'rejected' in stderr, got: $out" ;;
+    *rejected*|*unsafe*|*"alias collision"*) : ;;
+    *)
+      die "Adv-3[$label]: expected 'rejected' or 'unsafe' in error for known_marketplaces.json key $(printf '%q' "$mkt_id"), got: $out"
+      ;;
   esac
 }
 
-adv_run_unsafe_id_via_catalog_gen "embedded-newline" "$(printf 'foo\nbar')"
-adv_run_unsafe_id_via_catalog_gen "embedded-tab"     "$(printf 'foo\tbar')"
-adv_run_unsafe_id_via_catalog_gen "dot-only"         "."
-adv_run_unsafe_id_via_catalog_gen "double-dot-only"  ".."
+# Adversarial JSON-key forms that the bash tokenizer DOES preserve
+# verbatim (so the production end-to-end pipeline carries them to the
+# validator inside `bridge_write_isolated_known_marketplaces_catalog`).
+adv_run_unsafe_known_marketplaces_key "key-dot-only"        "."
+adv_run_unsafe_known_marketplaces_key "key-double-dot-only" ".."
 
-# The empty-id case never reaches the validator from any production
-# path (the `@` parser short-circuits when marketplace is empty after
-# split). Pin the validator's empty-string branch with a direct unit
-# assertion so a future refactor can't silently relax it.
+# Tokenizer coverage: confirm `bridge_agent_plugins_csv` strips
+# `\n`/`\t`/space from BRIDGE_AGENT_PLUGINS values BEFORE the catalog
+# generator sees them. This pins the upstream gate that prevents
+# whitespace-bearing entries from reaching the validator end-to-end —
+# the design contract that r2 finding 4b asked us to make explicit.
+# Implementation: `read -ra` with IFS=$' \t\n,' tokenizes the raw value;
+# `<<<` herestring + `read`'s default line-bounded behavior means a
+# `\n` truncates the input at the first newline (the rest is dropped),
+# while `\t` and ` ` are treated as token separators. Either way: NO
+# whitespace byte reaches the emitted CSV. Test runs in a subshell so
+# adversarial assignments don't leak into the rest of the suite.
+log "Adv-3 tokenizer-rejection: BRIDGE_AGENT_PLUGINS whitespace-bearing entries are stripped by bridge_agent_plugins_csv"
+(
+  declare -A BRIDGE_AGENT_PLUGINS=()
+  # Newline-bearing input: read truncates at the first `\n`; rest dropped.
+  BRIDGE_AGENT_PLUGINS["adv_tok"]=$'plugin-a@safe-mkt\nplugin-b@bad-mkt'
+  csv="$(bridge_agent_plugins_csv adv_tok)"
+  case "$csv" in
+    *$'\n'*) printf '[adv-tok] FAIL: tokenizer leaked literal newline: %q\n' "$csv" >&2; exit 1 ;;
+  esac
+  # Tab-bearing input: tab is treated as a token separator; both halves
+  # land in the CSV but each is whitespace-free.
+  BRIDGE_AGENT_PLUGINS["adv_tok"]=$'plugin-a@safe-mkt\tplugin-b@bad-mkt'
+  csv="$(bridge_agent_plugins_csv adv_tok)"
+  case "$csv" in
+    *$'\n'*|*$'\t'*) printf '[adv-tok] FAIL: tokenizer leaked tab: %q\n' "$csv" >&2; exit 1 ;;
+  esac
+  # Space-bearing input: same — space is a separator.
+  BRIDGE_AGENT_PLUGINS["adv_tok"]='plugin-a@safe-mkt plugin-b@bad-mkt'
+  csv="$(bridge_agent_plugins_csv adv_tok)"
+  case "$csv" in
+    *' '*) printf '[adv-tok] FAIL: tokenizer leaked space: %q\n' "$csv" >&2; exit 1 ;;
+  esac
+  # Pathological: trailing newline alone — first token must still be
+  # whitespace-free in the emitted CSV (regression for r3 #3a where the
+  # *validator* tolerated trailing newline; the tokenizer's strip is
+  # the upstream gate that makes this unreachable through this path).
+  BRIDGE_AGENT_PLUGINS["adv_tok"]=$'plugin-a@safe-mkt\n'
+  csv="$(bridge_agent_plugins_csv adv_tok)"
+  case "$csv" in
+    *$'\n'*) printf '[adv-tok] FAIL: tokenizer kept trailing newline: %q\n' "$csv" >&2; exit 1 ;;
+  esac
+  [[ "$csv" == "plugin-a@safe-mkt" ]] \
+    || { printf '[adv-tok] FAIL: trailing-newline csv unexpected: %q\n' "$csv" >&2; exit 1; }
+  exit 0
+) || die "Adv-3 tokenizer rejection: BRIDGE_AGENT_PLUGINS whitespace leaked through bridge_agent_plugins_csv (security gate broken)"
+
+# Validator unit pin: empty/whitespace/length/trailing-newline branches.
+# The trailing-newline assertion is the r3 finding 3a regression: the
+# old `re.match(... + "$")` form let `foo\n` pass (in default mode, `$`
+# matches before a trailing `\n`). `re.fullmatch` rejects it. Both
+# Python validators (lib/bridge-agents.sh inline + bridge-dev-plugin-
+# cache.py module-level) must agree.
 python3 - <<'PY'
 import re
-_SAFE_ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# Mirror the production validator. Use `fullmatch`, not `match(... + "$")`.
+_SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9._-]+")
 def reason(a):
     if not isinstance(a, str): return "not a string"
     if a == "": return "empty"
     if len(a) > 200: return "length exceeds 200"
-    if not _SAFE_ALIAS_RE.match(a): return "regex"
+    if not _SAFE_ALIAS_RE.fullmatch(a): return "regex"
     if ".." in a: return "contains '..'"
     if a in {".", ".."}: return "reserved name"
     if a.startswith(".") and a != ".git": return "leading dot disallowed"
@@ -1251,6 +1290,35 @@ assert reason("") == "empty", "empty alias must be rejected"
 assert reason(".git") == "", "'.git' is the documented escape hatch and must remain accepted"
 assert reason("foo bar") != "", "whitespace must be rejected"
 assert reason("a" * 201) != "", "length>200 must be rejected"
+# r3 finding 3a regressions: trailing newline / carriage-return must be
+# rejected. With the OLD `re.match(... + "$")` form these passed; with
+# `re.fullmatch` they're rejected.
+assert reason("foo\n") != "", "alias with trailing newline must be rejected (r3 #3a)"
+assert reason("bar\n") != "", "alias 'bar\\n' must be rejected (r3 #3a)"
+assert reason("baz\r") != "", "alias 'baz\\r' must be rejected (r3 #3a)"
+# Sanity: the same prefix without the control char remains accepted.
+assert reason("foo") == "", "clean alias 'foo' must remain accepted"
+assert reason("baz") == "", "clean alias 'baz' must remain accepted"
+PY
+
+# Cross-validator parity check: import BOTH production validators and
+# confirm they agree on the trailing-newline regression. This is the
+# regression bridge between bridge-dev-plugin-cache.py (where #3a was
+# discovered) and the lib/bridge-agents.sh inline mirror — drift here
+# would let one path block while the other passes adversarial input.
+python3 - "$REPO_ROOT" <<'PY'
+import importlib.util, pathlib, sys
+repo_root = pathlib.Path(sys.argv[1])
+dev_cache_path = repo_root / "bridge-dev-plugin-cache.py"
+spec = importlib.util.spec_from_file_location("bridge_dev_plugin_cache", dev_cache_path)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+fn = mod._alias_rejection_reason
+for sample in ("foo\n", "bar\n", "baz\r", "alias\x00null", "alias\x1fctrl"):
+    r = fn(sample)
+    assert r, "bridge-dev-plugin-cache.py must reject %r (got %r)" % (sample, r)
+assert fn("foo") == "", "clean alias must pass dev-cache validator"
+assert fn(".git") == "", "documented escape hatch must pass dev-cache validator"
 PY
 log "Adv-3 PASS"
 
@@ -1325,11 +1393,44 @@ ADV_AB_SRC="$(printf '%s\n' "$ADV_AB_OUT" | awk -F'\t' '{print $2}')"
   || die "Adv-5: expected installLocation ($ADV_INSTALL_LOC) to win over source.path ($ADV_SRC_PATH); helper resolved $ADV_AB_SRC (raw: $ADV_AB_OUT)"
 log "Adv-5 PASS"
 
-# Note: v2 group enforcement (non-group-member UID cannot read catalog)
-# is exercised by tests/isolation-v2-primitives/smoke.sh. Adding a v2
-# group setup to this fixture would require system-group provisioning
-# that overlaps significantly with that suite; keeping it out of scope
-# avoids a duplicated and harder-to-maintain v2 sandbox here.
+# Adv-6: v2 group-membership-based read denial. The PR-E security claim
+# is that under BRIDGE_LAYOUT=v2 the per-UID known_marketplaces.json is
+# group-readable by `ab-agent-<agent>` (via chgrp + 0640) and a UID NOT
+# in that group cannot read it. The Adv-4 path above exercises the v1
+# named-user ACL boundary; this section pins the v2 group boundary.
+#
+# Capability gate: this needs a SECOND non-root UID that is provably
+# NOT a member of the agent group. Provisioning a second system user
+# from inside this test is a meaningful CI burden (groupdel timing,
+# uid collisions) so we gate behind BRIDGE_TEST_PR_C_NONMEMBER_UID and
+# explicit-skip otherwise. Silent skip is rejected — that was the gap
+# that prompted r3 review finding 4a.
+log "Adv-6: v2 group-membership-based read denial (non-member UID cannot read catalog)"
+ADV6_NONMEMBER_UID="${BRIDGE_TEST_PR_C_NONMEMBER_UID:-}"
+if [[ -z "$ADV6_NONMEMBER_UID" ]]; then
+  log "Adv-6 SKIP: requires non-group-member non-root UID via BRIDGE_TEST_PR_C_NONMEMBER_UID=<username>"
+  log "Adv-6 SKIP rationale: the v1 named-user ACL path is exercised by Adv-4 above; the v2 group boundary requires a second system UID that is not a member of ab-agent-<agent> — provisioning that here would duplicate v2-pr-c smoke fixture setup."
+  log "Adv-6 SKIP NOTE: this is an explicit capability gap, NOT silent coverage. Operator running on a Linux CI lane with two test UIDs MUST set BRIDGE_TEST_PR_C_NONMEMBER_UID to exercise the gate end-to-end before claiming v2 group denial passes."
+elif ! bridge_isolation_v2_active 2>/dev/null; then
+  log "Adv-6 SKIP: BRIDGE_LAYOUT!=v2 — group ACL contract is v2-only, v1 ACL path covered by Adv-4."
+elif ! id "$ADV6_NONMEMBER_UID" >/dev/null 2>&1; then
+  die "Adv-6: BRIDGE_TEST_PR_C_NONMEMBER_UID=$ADV6_NONMEMBER_UID does not exist as a system user"
+else
+  ADV6_GROUP="$(bridge_isolation_v2_agent_group_name "$TEST_AGENT" 2>/dev/null || printf '')"
+  [[ -n "$ADV6_GROUP" ]] || die "Adv-6: bridge_isolation_v2_agent_group_name returned empty for $TEST_AGENT"
+  if id -nG "$ADV6_NONMEMBER_UID" 2>/dev/null | tr ' ' '\n' | grep -Fxq "$ADV6_GROUP"; then
+    die "Adv-6: BRIDGE_TEST_PR_C_NONMEMBER_UID=$ADV6_NONMEMBER_UID is a member of $ADV6_GROUP — must be a non-member to exercise the denial path"
+  fi
+  ADV6_CATALOG="$ISOLATED_PLUGINS/known_marketplaces.json"
+  # Group member (TEST_OS_USER) must be able to read.
+  sudo -n -u "$TEST_OS_USER" cat "$ADV6_CATALOG" >/dev/null \
+    || die "Adv-6: group-member UID $TEST_OS_USER could not read $ADV6_CATALOG (v2 group ACL broken)"
+  # Non-member must NOT be able to read.
+  if sudo -n -u "$ADV6_NONMEMBER_UID" cat "$ADV6_CATALOG" >/dev/null 2>&1; then
+    die "Adv-6: non-group-member UID $ADV6_NONMEMBER_UID was able to read $ADV6_CATALOG — v2 group boundary broken"
+  fi
+  log "Adv-6 PASS: non-member UID $ADV6_NONMEMBER_UID denied, group member $TEST_OS_USER allowed"
+fi
 
 # Restore baseline state and re-run a normal share so the linear
 # unisolate flow below operates against the expected snapshot.
