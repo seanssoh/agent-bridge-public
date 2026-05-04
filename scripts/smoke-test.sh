@@ -515,6 +515,10 @@ bridge_agent_source() { printf "%s" "$agent_source_mode"; }
 bridge_queue_cli() { echo "bridge_queue_cli should not be called"; exit 99; }
 bridge_notify_send() { echo "bridge_notify_send should not be called"; exit 99; }
 daemon_info() { :; }
+daemon_source_state_file() {
+  # shellcheck source=/dev/null
+  source "$1" 2>/dev/null
+}
 
 # shellcheck disable=SC1090
 source "$helper"

@@ -1,15 +1,29 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash disable=SC2034
 
-if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
-  for bridge_candidate_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null || true)"; do
-    [[ -n "$bridge_candidate_bash" && -x "$bridge_candidate_bash" ]] || continue
-    if "$bridge_candidate_bash" -lc '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
-      exec "$bridge_candidate_bash" "$0" "$@"
-    fi
-  done
+# Resolve the re-exec target before any guard logic, since $0 is unreliable
+# under macOS /bin/bash invocations like `bash -lc '...' _ args` (where $0
+# is the placeholder `_`). Prefer the caller script that sourced us
+# (BASH_SOURCE[1] — e.g. bridge-daemon.sh / agent-bridge), fall back to
+# bridge-lib.sh itself if invoked directly. (#576 r4 Finding 3)
+_BRIDGE_LIB_REEXEC_TARGET="${BASH_SOURCE[1]:-${BASH_SOURCE[0]}}"
 
-  echo "[bridge-lib] Agent Bridge requires Bash 4+ (current: ${BASH_VERSION:-unknown})." >&2
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+  # Re-exec into a Bash 4+ candidate, but ONLY when the resolved target
+  # names a regular file we can hand back to the new shell. If the target
+  # cannot be resolved (e.g. sourced from `bash -c` with no caller script),
+  # fall through to the "requires Bash 4+" message rather than handing the
+  # candidate shell a path it cannot open.
+  if [[ -f "$_BRIDGE_LIB_REEXEC_TARGET" ]]; then
+    for bridge_candidate_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null || true)"; do
+      [[ -n "$bridge_candidate_bash" && -x "$bridge_candidate_bash" ]] || continue
+      if "$bridge_candidate_bash" -lc '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
+        exec "$bridge_candidate_bash" "$_BRIDGE_LIB_REEXEC_TARGET" "$@"
+      fi
+    done
+  fi
+
+  echo "[bridge-lib] Agent Bridge requires Bash 4+ (current: ${BASH_VERSION:-unknown}). Re-run with a Bash 4+ shell on PATH (e.g. \`/opt/homebrew/bin/bash <script>\`)." >&2
   exit 1
 fi
 

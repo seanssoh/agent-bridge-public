@@ -1,5 +1,28 @@
 #!/usr/bin/env bash
 
+# This smoke depends on Bash 4+ behavior in bridge-lib.sh and in helpers
+# extracted from bridge-daemon.sh. macOS ships Bash 3.2 by default, so
+# `./scripts/smoke/daemon.sh` direct invocation through `/usr/bin/env bash`
+# may resolve to /bin/bash. Re-exec into a Bash 4+ candidate when needed
+# so the resulting subshells (and the bridge-lib.sh re-exec guard, which
+# sees $0 as the smoke script path) all run on Bash 4+. Capture
+# BASH_SOURCE[0] before any re-exec — $0 is unreliable under macOS
+# /bin/bash invocations like `bash -lc '...' _` where it expands to `_`.
+# (#576 r4 Finding 3)
+_SMOKE_DAEMON_REEXEC_TARGET="${BASH_SOURCE[0]}"
+if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
+  if [[ -f "$_SMOKE_DAEMON_REEXEC_TARGET" ]]; then
+    for smoke_candidate_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "${BASH4_BIN:-}"; do
+      [[ -n "$smoke_candidate_bash" && -x "$smoke_candidate_bash" ]] || continue
+      if "$smoke_candidate_bash" -lc '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
+        exec "$smoke_candidate_bash" "$_SMOKE_DAEMON_REEXEC_TARGET" "$@"
+      fi
+    done
+  fi
+  echo "[smoke:daemon] requires Bash 4+; install homebrew bash or set BASH4_BIN to a Bash 4+ binary." >&2
+  exit 1
+fi
+
 set -euo pipefail
 
 SMOKE_NAME="daemon"
@@ -122,6 +145,10 @@ bridge_agent_source() { printf "%s" "$agent_source_mode"; }
 bridge_queue_cli() { echo "bridge_queue_cli should not be called"; exit 99; }
 bridge_notify_send() { echo "bridge_notify_send should not be called"; exit 99; }
 daemon_info() { :; }
+daemon_source_state_file() {
+  # shellcheck source=/dev/null
+  source "$1" 2>/dev/null
+}
 
 # shellcheck disable=SC1090
 source "$helper"
@@ -254,6 +281,354 @@ EOF
   smoke_assert_match "$reminder_id" '^[0-9]+$' "daemon blocked-aging escalation task"
 }
 
+daemon_idle_marker_permission_guard() {
+  local agent dir idle_file manual_file output rc
+
+  agent="idle-acl-agent"
+  dir="$BRIDGE_ACTIVE_AGENT_DIR/$agent"
+  idle_file="$dir/idle-since"
+  manual_file="$dir/manual-stop"
+  mkdir -p "$dir"
+
+  set +e
+  output="$("$BASH" -lc '
+set -euo pipefail
+repo_root="$1"
+agent="$2"
+idle_file="$3"
+manual_file="$4"
+# shellcheck disable=SC1090
+source "$repo_root/bridge-lib.sh"
+
+BRIDGE_AGENT_IDS=("$agent")
+bridge_agent_is_active() { return 0; }
+
+printf "123\n" >"$idle_file"
+chmod 000 "$idle_file"
+if bridge_agent_idle_since_epoch "$agent"; then
+  echo "idle epoch unexpectedly succeeded"
+  exit 1
+fi
+[[ ! -e "$idle_file" ]] || {
+  echo "unreadable idle marker was not cleared"
+  exit 1
+}
+
+mkdir -p "$(dirname "$manual_file")"
+printf "123\n" >"$manual_file"
+chmod 000 "$manual_file"
+if bridge_agent_manual_stop_active "$agent"; then
+  echo "manual-stop unexpectedly succeeded"
+  exit 1
+fi
+[[ ! -e "$manual_file" ]] || {
+  echo "unreadable manual-stop marker was not cleared"
+  exit 1
+}
+
+mkdir -p "$(dirname "$idle_file")"
+printf "123\n" >"$idle_file"
+chmod 000 "$idle_file"
+bridge_reconcile_idle_markers
+[[ ! -e "$idle_file" ]] || {
+  echo "unreadable idle marker survived reconcile"
+  exit 1
+}
+
+echo ok
+' _ "$SMOKE_REPO_ROOT" "$agent" "$idle_file" "$manual_file" 2>&1)"
+  rc=$?
+  set -e
+  chmod 600 "$idle_file" "$manual_file" >/dev/null 2>&1 || true
+  rm -f "$idle_file" "$manual_file" >/dev/null 2>&1 || true
+  [[ "$rc" -eq 0 && "$output" == "ok" ]] || smoke_fail "idle marker permission guard failed: $output"
+}
+
+daemon_source_state_file_guard() {
+  local root helper output rc bash_bin
+
+  root="$(mktemp -d "$SMOKE_TMP_ROOT/source-state-unit.XXXXXX")"
+  helper="$root/daemon-source-state-file.sh"
+  awk '
+    /^daemon_source_state_file\(\) \{/ { capture=1 }
+    capture { print }
+    capture && /^}[[:space:]]*$/ { exit }
+  ' "$SMOKE_REPO_ROOT/bridge-daemon.sh" >"$helper"
+  [[ -s "$helper" ]] || smoke_fail "source-state: could not extract daemon_source_state_file"
+
+  bash_bin="${BASH4_BIN:-}"
+  if [[ -z "$bash_bin" || ! -x "$bash_bin" ]]; then
+    bash_bin="$(command -v bash)"
+  fi
+
+  set +e
+  output="$("$bash_bin" -lc '
+set -euo pipefail
+root="$1"
+helper="$2"
+daemon_warn() { printf "warn:%s\n" "$1" >&2; }
+# shellcheck disable=SC1090
+source "$helper"
+
+state_file="$root/state.env"
+printf "STATE_NEXT_TS=123\n" >"$state_file"
+STATE_NEXT_TS=0
+daemon_source_state_file "$state_file" "unit" 1
+[[ "${STATE_NEXT_TS:-}" == "123" ]] || {
+  echo "readable state did not source"
+  exit 1
+}
+
+printf "STATE_NEXT_TS=456\n" >"$state_file"
+chmod 000 "$state_file"
+if daemon_source_state_file "$state_file" "unit" 1; then
+  echo "unreadable state unexpectedly sourced"
+  exit 1
+fi
+[[ ! -e "$state_file" ]] || {
+  echo "unreadable state was not cleared"
+  exit 1
+}
+
+printf "STATE_NEXT_TS=\$(\n" >"$state_file"
+if daemon_source_state_file "$state_file" "unit" 1; then
+  echo "invalid state unexpectedly sourced"
+  exit 1
+fi
+[[ ! -e "$state_file" ]] || {
+  echo "invalid state was not cleared"
+  exit 1
+}
+
+# required-vars guard: empty file passes bash -n + source but must be
+# rejected when caller declares a required variable. This is the
+# isolated-UID partial-flush case the round-1 review flagged.
+: >"$state_file"
+unset STATE_NEXT_TS
+if daemon_source_state_file "$state_file" "unit" 1 "STATE_NEXT_TS"; then
+  echo "empty state with required var unexpectedly sourced"
+  exit 1
+fi
+[[ ! -e "$state_file" ]] || {
+  echo "empty state with required var was not cleared"
+  exit 1
+}
+
+# required-vars guard: a file populated only with unrelated vars must be
+# rejected when the caller declares a different required var.
+printf "OTHER_VAR=1\n" >"$state_file"
+unset STATE_NEXT_TS
+if daemon_source_state_file "$state_file" "unit" 1 "STATE_NEXT_TS"; then
+  echo "missing required var unexpectedly sourced"
+  exit 1
+fi
+[[ ! -e "$state_file" ]] || {
+  echo "state with missing required var was not cleared"
+  exit 1
+}
+
+# required-vars guard: when the required var is present, the source
+# call must succeed and the var must be exported into the caller scope.
+printf "STATE_NEXT_TS=999\n" >"$state_file"
+unset STATE_NEXT_TS
+daemon_source_state_file "$state_file" "unit" 1 "STATE_NEXT_TS"
+[[ "${STATE_NEXT_TS:-}" == "999" ]] || {
+  echo "required var present did not source"
+  exit 1
+}
+
+# Finding 1 (#576 r3) regression: a successful source from agent A must
+# not leak vars into agent B when agent B'\''s file fails to source.
+# Mirrors the per-loop scan pattern in bridge_scan_stall_state /
+# bridge_scan_context_pressure where the post-call read happens
+# unconditionally regardless of source rc.
+agent_a="$root/agent-a.env"
+agent_b="$root/agent-b.env"
+printf "STALL_LAST_SCAN_TS=111\nSTALL_ACTIVE_CLASSIFICATION=foo\n" >"$agent_a"
+unset STALL_LAST_SCAN_TS STALL_ACTIVE_CLASSIFICATION
+daemon_source_state_file "$agent_a" "stall/A" 1 "STALL_LAST_SCAN_TS" "STALL_ACTIVE_CLASSIFICATION"
+[[ "${STALL_LAST_SCAN_TS:-}" == "111" ]] || { echo "agent-A scan-ts did not source"; exit 1; }
+[[ "${STALL_ACTIVE_CLASSIFICATION:-}" == "foo" ]] || { echo "agent-A classification did not source"; exit 1; }
+
+# Agent B does not exist. The helper must fail AND clear all sanitize_vars
+# so the post-call read does not see agent A'\''s "foo".
+if daemon_source_state_file "$agent_b" "stall/B" 0 "STALL_LAST_SCAN_TS" "STALL_ACTIVE_CLASSIFICATION"; then
+  echo "missing state file unexpectedly sourced"
+  exit 1
+fi
+[[ -z "${STALL_LAST_SCAN_TS:-}" ]] || { echo "STALL_LAST_SCAN_TS leaked from agent-A: ${STALL_LAST_SCAN_TS}"; exit 1; }
+[[ -z "${STALL_ACTIVE_CLASSIFICATION:-}" ]] || { echo "STALL_ACTIVE_CLASSIFICATION leaked from agent-A: ${STALL_ACTIVE_CLASSIFICATION}"; exit 1; }
+
+# Same pattern but with an unreadable file (the actual reproduction of
+# the live bug — isolated UID writes a 0600 file, controller cannot read).
+printf "STALL_LAST_SCAN_TS=111\nSTALL_ACTIVE_CLASSIFICATION=bar\n" >"$agent_a"
+chmod 600 "$agent_a"
+unset STALL_LAST_SCAN_TS STALL_ACTIVE_CLASSIFICATION
+daemon_source_state_file "$agent_a" "stall/A" 0 "STALL_LAST_SCAN_TS" "STALL_ACTIVE_CLASSIFICATION"
+[[ "${STALL_ACTIVE_CLASSIFICATION:-}" == "bar" ]] || { echo "agent-A re-source did not pick up bar"; exit 1; }
+
+agent_c="$root/agent-c.env"
+: >"$agent_c"
+chmod 000 "$agent_c"
+if daemon_source_state_file "$agent_c" "stall/C" 0 "STALL_LAST_SCAN_TS" "STALL_ACTIVE_CLASSIFICATION"; then
+  echo "unreadable state unexpectedly sourced (cross-agent leak case)"
+  exit 1
+fi
+[[ -z "${STALL_LAST_SCAN_TS:-}" ]] || { echo "STALL_LAST_SCAN_TS leaked across unreadable boundary: ${STALL_LAST_SCAN_TS}"; exit 1; }
+[[ -z "${STALL_ACTIVE_CLASSIFICATION:-}" ]] || { echo "STALL_ACTIVE_CLASSIFICATION leaked across unreadable boundary: ${STALL_ACTIVE_CLASSIFICATION}"; exit 1; }
+chmod 600 "$agent_c" 2>/dev/null || true
+
+echo ok
+' _ "$root" "$helper" 2>/dev/null)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 && "$output" == "ok" ]] || smoke_fail "source state file guard failed: $output"
+}
+
+daemon_acl_default_inheritance() {
+  # Verifies the core correctness claim of this PR: when the controller
+  # installs a default ACL on a runtime_state_dir / log_dir-style
+  # directory, files subsequently created inside that directory by an
+  # isolated UID inherit the default ACL and remain controller-readable.
+  # Without the default ACL, controller reads return EACCES (the bug
+  # this PR is meant to prevent).
+  #
+  # The boundary this test must demonstrate is:
+  #   non-root controller UID  --read-->  isolated-UID-owned 0700 file
+  # Root MUST NOT play either role: root bypasses POSIX ACLs entirely,
+  # which makes any negative-case `cat` succeed regardless of the ACL
+  # state and renders the positive case vacuous. Two distinct non-root
+  # UIDs are therefore required, and we need privilege (root or a
+  # passwordless sudo grant) to switch into both. Skip cleanly otherwise
+  # so the test runs on platforms that support it (linux server install)
+  # without breaking dev-box smoke runs (macOS, unprivileged CI). (#576 r3
+  # Finding 2)
+  local isolated_user="" controller_user="" root="" target_dir=""
+  local positive_file="" negative_dir="" negative_file=""
+  local rc cleanup_users=()
+
+  if ! command -v setfacl >/dev/null 2>&1; then
+    smoke_log "skipped acl default inheritance: setfacl not available (requires Linux + acl pkg)"
+    return 0
+  fi
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    smoke_log "skipped acl default inheritance: requires root (or equivalent) to switch into two non-root UIDs"
+    return 0
+  fi
+  if ! command -v sudo >/dev/null 2>&1; then
+    smoke_log "skipped acl default inheritance: sudo not available — cannot switch UIDs without bypassing the ACL"
+    return 0
+  fi
+
+  # Allow the operator to pin specific test UIDs via env (e.g. on hosts
+  # where `nobody`/`daemon` are unusable). Both must be non-root, distinct,
+  # and `sudo -n -u` must be able to switch into them.
+  local controller_candidate isolated_candidate
+  controller_candidate="${BRIDGE_ACL_SMOKE_CONTROLLER:-}"
+  isolated_candidate="${BRIDGE_ACL_SMOKE_ISOLATED:-}"
+
+  # Auto-discover from a small whitelist of unprivileged accounts that
+  # exist on most Linux distros. Avoid creating users implicitly — the
+  # round-3 brief permits creation but it's a side effect a smoke run
+  # should not leave on the host.
+  local user_candidate
+  for user_candidate in "$isolated_candidate" nobody daemon bin _unknown nfsnobody mail; do
+    [[ -n "$user_candidate" ]] || continue
+    [[ "$user_candidate" == root ]] && continue
+    id -u "$user_candidate" >/dev/null 2>&1 || continue
+    if [[ -z "$isolated_user" ]]; then
+      isolated_user="$user_candidate"
+      continue
+    fi
+    if [[ -z "$controller_user" && "$user_candidate" != "$isolated_user" ]]; then
+      controller_user="$user_candidate"
+      break
+    fi
+  done
+
+  # Operator override for the controller role takes precedence over the
+  # auto-discovered choice (lets a host pin its actual bridge admin UID).
+  if [[ -n "$controller_candidate" ]] && id -u "$controller_candidate" >/dev/null 2>&1; then
+    controller_user="$controller_candidate"
+  fi
+
+  if [[ -z "$isolated_user" || -z "$controller_user" || "$isolated_user" == "$controller_user" ]]; then
+    smoke_log "skipped acl default inheritance: need two distinct non-root UIDs (set BRIDGE_ACL_SMOKE_ISOLATED + BRIDGE_ACL_SMOKE_CONTROLLER, or ensure two of nobody/daemon/bin/_unknown exist)"
+    return 0
+  fi
+  if [[ "$isolated_user" == root || "$controller_user" == root ]]; then
+    smoke_log "skipped acl default inheritance: refusing to use root as either role (root bypasses POSIX ACLs)"
+    return 0
+  fi
+
+  # Verify both UIDs are reachable via passwordless sudo. Without this
+  # the rest of the test would prompt or hang.
+  if ! sudo -n -u "$isolated_user" /bin/true >/dev/null 2>&1; then
+    smoke_log "skipped acl default inheritance: sudo -n -u $isolated_user failed (no passwordless grant)"
+    return 0
+  fi
+  if ! sudo -n -u "$controller_user" /bin/true >/dev/null 2>&1; then
+    smoke_log "skipped acl default inheritance: sudo -n -u $controller_user failed (no passwordless grant)"
+    return 0
+  fi
+
+  root="$(mktemp -d "$SMOKE_TMP_ROOT/acl-default.XXXXXX")"
+  target_dir="$root/with-default-acl"
+  negative_dir="$root/without-default-acl"
+  mkdir -p "$target_dir" "$negative_dir"
+  # Mimic isolated-UID-only ownership: the isolated agent owns the
+  # directory and group/other have no access. Default ACLs are the only
+  # path by which the controller can ever read the contents.
+  chown "$isolated_user":"$isolated_user" "$target_dir" "$negative_dir"
+  chmod 700 "$target_dir" "$negative_dir"
+  # The controller UID must be able to traverse $root to reach
+  # $target_dir; mktemp -d defaults to 0700 owned by the smoke runner
+  # (root here). Add an ACL grant so traversal works without flipping
+  # the parent dir to 0755.
+  setfacl -m "u:${controller_user}:x" "$root" "$target_dir" "$negative_dir" \
+    || smoke_fail "acl default inheritance: setfacl traversal grant failed on $root"
+
+  # Install the default ACL on the positive-case directory. This is the
+  # exact shape lib/bridge-agents.sh::bridge_linux_acl_add_default_dirs_recursive
+  # applies (setfacl -d -m u:<controller>:rwX), narrowed to one dir.
+  setfacl -d -m "u:${controller_user}:rwX" "$target_dir" \
+    || smoke_fail "acl default inheritance: setfacl -d failed on $target_dir"
+
+  # Simulated isolated-UID write into both directories.
+  positive_file="$target_dir/idle-since"
+  negative_file="$negative_dir/idle-since"
+  sudo -n -u "$isolated_user" /bin/sh -c "printf '%s' \"123\" >'$positive_file'" \
+    || smoke_fail "acl default inheritance: isolated UID could not write positive file"
+  sudo -n -u "$isolated_user" /bin/sh -c "printf '%s' \"123\" >'$negative_file'" \
+    || smoke_fail "acl default inheritance: isolated UID could not write negative file"
+
+  # Positive case: controller (NON-root) must be able to read the file
+  # the isolated UID just created. This is the inheritance guarantee. We
+  # MUST run the read as $controller_user — running as root would bypass
+  # the ACL and make this assertion vacuous.
+  set +e
+  sudo -n -u "$controller_user" /bin/sh -c "cat '$positive_file' >/dev/null 2>&1"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] \
+    || smoke_fail "acl default inheritance: controller (${controller_user}) could not read isolated-UID file under default ACL (rc=$rc)"
+
+  # Negative case: same setup WITHOUT the default ACL must reject the
+  # non-root controller. If this passes silently, the positive case is
+  # not actually exercising the ACL. (Running as root here would always
+  # succeed — this is exactly the vacuous-test class the round-3 review
+  # called out.)
+  set +e
+  sudo -n -u "$controller_user" /bin/sh -c "cat '$negative_file' >/dev/null 2>&1"
+  rc=$?
+  set -e
+  [[ "$rc" -ne 0 ]] \
+    || smoke_fail "acl default inheritance: controller (${controller_user}) unexpectedly read file without default ACL (test setup is not exercising the ACL boundary)"
+
+  : "${cleanup_users[@]:-}"  # silence unused-var warning when cleanup empty
+  smoke_log "ok: acl default inheritance positive+negative confirmed (controller=$controller_user, isolated=$isolated_user)"
+}
+
 main() {
   smoke_require_cmd awk
   smoke_require_cmd python3
@@ -263,6 +638,9 @@ main() {
   smoke_run "context pressure audit/state transitions" daemon_context_pressure_audit_state_transitions
   smoke_run "stale claimed tasks requeue deterministically" daemon_stale_claim_requeue
   smoke_run "blocked task reminder/escalation aging" daemon_blocked_aging
+  smoke_run "idle marker permission guard" daemon_idle_marker_permission_guard
+  smoke_run "source state file guard" daemon_source_state_file_guard
+  smoke_run "acl default inheritance" daemon_acl_default_inheritance
   smoke_log "passed"
 }
 

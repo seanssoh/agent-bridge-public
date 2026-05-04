@@ -2982,7 +2982,7 @@ bridge_linux_prepare_agent_isolation() {
     bridge_linux_sudo_root setfacl -d -m "u:${controller_user}:r-X" "$queue_gateway_root" >/dev/null 2>&1 || true
   fi
   bridge_linux_acl_add_recursive "u:${controller_user}:rwX" "$runtime_state_dir" "$log_dir" "$queue_gateway_agent_dir" "$request_dir" "$response_dir" "$memory_daily_agent_dir" "$memory_daily_shared_aggregate_dir"
-  bridge_linux_acl_add_default_dirs_recursive "u:${controller_user}:rwX" "$queue_gateway_agent_dir" "$request_dir" "$response_dir"
+  bridge_linux_acl_add_default_dirs_recursive "u:${controller_user}:rwX" "$runtime_state_dir" "$log_dir" "$queue_gateway_agent_dir" "$request_dir" "$response_dir" "$memory_daily_agent_dir" "$memory_daily_shared_aggregate_dir"
 
   # memory-daily transcripts read-access (issue #219 v1.3): grant the
   # controller user r-X on the isolated user's ~/.claude/projects/ so the
