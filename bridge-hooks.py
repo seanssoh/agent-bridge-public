@@ -1211,7 +1211,7 @@ def build_parser() -> argparse.ArgumentParser:
     render_shared_parser.add_argument(
         "--launch-cmd",
         default="",
-        help="Agent launch_cmd; substring '[1m]' raises autoCompactWindow default to 1_000_000 (issue #547).",
+        help="Accepted for backwards compatibility; no longer consulted (issue #570 — managed autoCompactWindow default is unconditionally 1_000_000).",
     )
     render_shared_parser.add_argument("--format", choices=("text", "shell"), default="text")
     render_shared_parser.set_defaults(handler=cmd_render_shared_settings)
@@ -1228,7 +1228,7 @@ def build_parser() -> argparse.ArgumentParser:
     render_isolated_parser.add_argument(
         "--launch-cmd",
         default="",
-        help="Agent launch_cmd; substring '[1m]' raises autoCompactWindow default to 1_000_000 (issue #547).",
+        help="Accepted for backwards compatibility; no longer consulted (issue #570 — managed autoCompactWindow default is unconditionally 1_000_000).",
     )
     render_isolated_parser.add_argument("--format", choices=("text", "shell"), default="text")
     render_isolated_parser.set_defaults(handler=cmd_render_isolated_home_settings)

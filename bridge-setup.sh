@@ -875,13 +875,10 @@ run_agent() {
       printf 'shared_settings_effective_file: %s\n' "$(bridge_hook_shared_settings_effective_file)"
     fi
     # Issue #555 r2: resolve launch_cmd from the roster so the post-ensure
-    # relink renders the per-agent effective file with the agent's correct
-    # managed-default values (e.g. autoCompactWindow=1_000_000 for [1m]
-    # variants vs the legacy 400_000). Mirrors the pattern in
-    # bridge-start.sh:240, bridge-agent.sh:1661, and bridge-upgrade.sh:203.
-    # Without this, `agent-bridge setup agent <1m-agent>` would clobber the
-    # per-agent file to the empty-launch_cmd legacy default and regress
-    # PR #554's [1m] heuristic.
+    # relink path mirrors bridge-start.sh / bridge-agent.sh / bridge-upgrade.sh.
+    # Issue #570: managed autoCompactWindow default is unconditionally
+    # 1_000_000; launch_cmd is forwarded for caller-signature parity only
+    # (no longer consulted by the renderer).
     launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
     if hook_output="$(bridge_ensure_claude_stop_hook "$workdir" "$launch_cmd" "$agent" 2>&1)"; then
       echo "$hook_output"

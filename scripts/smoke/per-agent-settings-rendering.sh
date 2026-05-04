@@ -4,27 +4,31 @@
 # Validates that `bridge_link_claude_settings_to_shared`, when invoked
 # with an agent id (3rd arg), writes the rendered effective file at the
 # per-agent path `$BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/settings.effective.json`
-# rather than the install-wide path. Mixed-model installs no longer
-# last-rerender-wins on `autoCompactWindow` (or any future per-agent
-# managed default).
+# rather than the install-wide path. Per-agent files mean operator base /
+# overlay overrides for one agent are not last-rerender-wins clobbered by
+# a sibling rerender.
+#
+# Note (issue #570): the managed `autoCompactWindow` default is now
+# unconditionally 1_000_000 — the previous launch_cmd `[1m]` substring
+# heuristic was retired. These sub-tests assert the per-agent *path*
+# routing, not a per-launch_cmd value split.
 #
 # Sub-tests:
-#   1. agent-A (launch_cmd contains '[1m]') gets autoCompactWindow=1_000_000
-#      in its per-agent file.
-#   2. agent-B (launch_cmd lacks '[1m]') gets autoCompactWindow=400_000 in
-#      its per-agent file.
+#   1. agent-A renders its per-agent effective file with the managed
+#      autoCompactWindow=1_000_000 default.
+#   2. agent-B renders its own per-agent effective file (separate path
+#      from agent-A) with the same managed default.
 #   3. Each agent's workdir settings.json is a symlink to its own per-agent
 #      effective file (NOT to the install-wide one).
 #   4. Re-rendering agent-A AFTER agent-B does not touch agent-B's per-agent
-#      file (independence proven — the original mixed-model bug).
+#      file (independence proven via sha256 — the original mixed-model bug).
 #   5. Back-compat: when agent id is omitted, rendering still writes the
 #      install-wide file at the legacy path.
 #   6. Setup path (#555 r2): bridge-setup.sh's run_agent invokes
 #      `bridge_ensure_claude_stop_hook` / `bridge_ensure_claude_prompt_hook`
-#      after channel setup. Pre-fix it passed empty launch_cmd, clobbering
-#      the per-agent effective file back to the legacy 400_000 default.
-#      Post-fix it must resolve launch_cmd and preserve 1_000_000 for [1m]
-#      agents.
+#      after channel setup. The setup-style ensure must continue to render
+#      the per-agent effective file with the managed 1_000_000 default and
+#      not touch sibling agents.
 
 set -euo pipefail
 
@@ -94,9 +98,11 @@ invoke_setup_ensure_helpers_for_agent() {
   # Issue #555 r2: simulates bridge-setup.sh:run_agent's post-channel
   # ensure block. Drives the same two helpers (`bridge_ensure_claude_stop_hook`
   # and `bridge_ensure_claude_prompt_hook`) the way the FIXED run_agent
-  # does — with the resolved launch_cmd, so the post-ensure relink hits
-  # the renderer with the right managed-default context. Pre-fix this
-  # passed empty launch_cmd and clobbered [1m] agents back to 400_000.
+  # does, forwarding the resolved launch_cmd through. Issue #570: the
+  # managed autoCompactWindow default is unconditionally 1_000_000, so
+  # this assertion is now about per-agent *path* routing — the setup
+  # ensure must still write to the per-agent effective file, not clobber
+  # a sibling.
   local agent="$1"
   local workdir="$2"
   local launch_cmd="$3"
@@ -129,17 +135,17 @@ main() {
   printf '%s\n' '{}' >"$install_wide_dir/settings.json"
   printf '%s\n' '{}' >"$install_wide_dir/settings.local.json"
 
-  smoke_log "case 1: agent-A ([1m] launch_cmd) renders per-agent file with autoCompactWindow=1_000_000"
+  smoke_log "case 1: agent-A renders per-agent file with managed autoCompactWindow=1_000_000 default (#570)"
   invoke_link_for_agent agent-a "$agent_a_workdir" "claude --model claude-opus-4-7[1m]"
   local agent_a_effective="$agent_a_workdir/.claude/settings.effective.json"
   smoke_assert_file_exists "$agent_a_effective" "agent-A per-agent effective file rendered"
-  smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A autoCompactWindow=1_000_000 ([1m])"
+  smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A autoCompactWindow=1_000_000 (managed default)"
 
-  smoke_log "case 2: agent-B (non-[1m] launch_cmd) renders per-agent file with autoCompactWindow=400_000"
+  smoke_log "case 2: agent-B renders its OWN per-agent file (separate path from agent-A) with managed default"
   invoke_link_for_agent agent-b "$agent_b_workdir" "claude --model claude-opus-4-6"
   local agent_b_effective="$agent_b_workdir/.claude/settings.effective.json"
   smoke_assert_file_exists "$agent_b_effective" "agent-B per-agent effective file rendered"
-  smoke_assert_eq "400000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B autoCompactWindow=400_000 (pre-1M)"
+  smoke_assert_eq "1000000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B autoCompactWindow=1_000_000 (managed default)"
 
   smoke_log "case 3: each agent's workdir settings.json is a symlink to its own per-agent effective file"
   local agent_a_link="$agent_a_workdir/.claude/settings.json"
@@ -152,13 +158,13 @@ main() {
   smoke_assert_eq "$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$agent_a_effective")" "$agent_a_target" "agent-A symlink resolves to agent-A's per-agent effective file"
   smoke_assert_eq "$(python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$agent_b_effective")" "$agent_b_target" "agent-B symlink resolves to agent-B's per-agent effective file"
 
-  smoke_log "case 4: re-rendering agent-A does NOT touch agent-B's per-agent file (mixed-model independence)"
+  smoke_log "case 4: re-rendering agent-A does NOT touch agent-B's per-agent file (per-agent path independence)"
   local agent_b_sha_before
   agent_b_sha_before="$(file_sha256 "$agent_b_effective")"
   invoke_link_for_agent agent-a "$agent_a_workdir" "claude --model claude-opus-4-7[1m]"
   smoke_assert_eq "$agent_b_sha_before" "$(file_sha256 "$agent_b_effective")" "agent-B per-agent file unchanged after agent-A rerender"
   smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A still 1_000_000 after rerender"
-  smoke_assert_eq "400000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B still 400_000 after agent-A rerender"
+  smoke_assert_eq "1000000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B still 1_000_000 after agent-A rerender"
 
   smoke_log "case 5: back-compat — omitting agent id renders install-wide file"
   local install_wide_effective="$install_wide_dir/settings.effective.json"
@@ -167,23 +173,26 @@ main() {
   mkdir -p "$back_compat_workdir/.claude"
   invoke_link_install_wide "$back_compat_workdir" "claude --model claude-opus-4-7[1m]"
   smoke_assert_file_exists "$install_wide_effective" "back-compat (no agent id) renders install-wide effective file"
-  smoke_assert_eq "1000000" "$(settings_value "$install_wide_effective" autoCompactWindow)" "install-wide file picks up [1m] launch_cmd"
+  smoke_assert_eq "1000000" "$(settings_value "$install_wide_effective" autoCompactWindow)" "install-wide file lands on managed 1_000_000 default"
   # Per-agent files for agent-A/agent-B remain untouched by the back-compat call.
   smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A per-agent file unaffected by install-wide back-compat render"
-  smoke_assert_eq "400000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B per-agent file unaffected by install-wide back-compat render"
+  smoke_assert_eq "1000000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B per-agent file unaffected by install-wide back-compat render"
 
-  smoke_log "case 6: setup path preserves [1m] launch_cmd through ensure helpers (#555 r2)"
+  smoke_log "case 6: setup path renders agent-A's per-agent file via ensure helpers (#555 r2)"
   # Pre-state: agent-A's per-agent file is already at 1_000_000 (from cases 1/4).
-  smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A pre-setup baseline still 1_000_000"
+  smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A pre-setup baseline at managed 1_000_000 default"
+  # Snapshot agent-B before the setup-style ensure so we can prove agent-A's
+  # ensure does not write into a sibling's per-agent file.
+  local agent_b_sha_before_setup
+  agent_b_sha_before_setup="$(file_sha256 "$agent_b_effective")"
   # Act: simulate bridge-setup.sh:run_agent invoking the ensure helpers
-  # the way the FIX does — passing the resolved [1m] launch_cmd through.
+  # the way the FIX does, passing the resolved launch_cmd through.
   invoke_setup_ensure_helpers_for_agent agent-a "$agent_a_workdir" "claude --model claude-opus-4-7[1m]"
-  # Assert: per-agent effective file STILL holds the [1m] managed default,
-  # not the empty-launch_cmd legacy 400_000 fallback the renderer would
-  # otherwise have written.
-  smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A per-agent file STILL 1_000_000 after setup-style ensure (no clobber to 400_000)"
-  # And agent-B (the non-[1m] sibling) remains untouched — no cross-agent leak.
-  smoke_assert_eq "400000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B per-agent file unaffected by agent-A setup-style ensure"
+  # Assert: agent-A's per-agent effective file still carries the managed
+  # 1_000_000 default after the setup-style ensure rerender.
+  smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A per-agent file still at managed 1_000_000 after setup-style ensure"
+  # And agent-B's per-agent file is byte-identical (no cross-agent leak).
+  smoke_assert_eq "$agent_b_sha_before_setup" "$(file_sha256 "$agent_b_effective")" "agent-B per-agent file unaffected by agent-A setup-style ensure"
 
   smoke_log "PASS: per-agent settings.effective.json rendering (#555)"
 }

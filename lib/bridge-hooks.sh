@@ -81,8 +81,9 @@ bridge_claude_settings_mode() {
   # directory and accepts arbitrary --workdir, then records
   # source=dynamic with that workdir. If an operator passes
   # --workdir into the home root, the dynamic agent would inherit
-  # the static autoCompactWindow=400000 default — exactly what the
-  # original Issue #516 fix tried to prevent.
+  # the static managed autoCompactWindow default (1_000_000 as of
+  # issue #570) — exactly what the original Issue #516 fix tried to
+  # prevent.
   #
   # Short-circuit registered dynamic claude agents to `local` BEFORE
   # the HOME_ROOT branch. Static agents under HOME_ROOT keep the
@@ -110,12 +111,12 @@ bridge_claude_settings_mode() {
   if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1; then
     for agent in "${BRIDGE_AGENT_IDS[@]}"; do
       [[ "$(bridge_agent_engine "$agent" 2>/dev/null || true)" == "claude" ]] || continue
-      # Issue #516: only static claude agents inherit the shared
-      # `autoCompactWindow=400000` defaults. Dynamic agents register their
-      # workdir in BRIDGE_AGENT_IDS too (see bridge_register_dynamic_agent
-      # in agent-bridge), so without a source gate the second branch matched
-      # any registered workdir and inflated dynamic-agent context budget
-      # against operator intent.
+      # Issue #516: only static claude agents inherit the shared managed
+      # `autoCompactWindow` default (1_000_000 as of issue #570). Dynamic
+      # agents register their workdir in BRIDGE_AGENT_IDS too (see
+      # bridge_register_dynamic_agent in agent-bridge), so without a source
+      # gate the second branch matched any registered workdir and inflated
+      # dynamic-agent context budget against operator intent.
       [[ "$(bridge_agent_source "$agent" 2>/dev/null || true)" == "static" ]] || continue
       agent_workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
       [[ -n "$agent_workdir" ]] || continue
@@ -147,8 +148,9 @@ bridge_ensure_claude_shared_settings_for_managed_workdir() {
 
 bridge_link_claude_settings_to_shared() {
   local workdir="$1"
-  # Issue #547: launch_cmd substring '[1m]' raises the managed
-  # autoCompactWindow default from 400_000 to 1_000_000.
+  # Issue #570: launch_cmd is accepted for backwards compatibility but the
+  # managed autoCompactWindow default is unconditionally 1_000_000; the
+  # renderer no longer inspects this value.
   local launch_cmd="${2-}"
   # Issue #555: when the caller passes the agent id (3rd arg), render the
   # effective file at the per-agent path so mixed-model installs get

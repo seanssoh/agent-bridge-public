@@ -197,9 +197,9 @@ bridge_upgrade_propagate_claude_hooks() {
       [[ "$(bridge_agent_engine "$agent" 2>/dev/null || true)" == "claude" ]] || continue
       workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
       [[ -n "$workdir" ]] || continue
-      # Issue #547: forward each agent launch_cmd so the rerendered
-      # shared settings pick the right autoCompactWindow default per
-      # model variant ([1m] → 1_000_000, otherwise → 400_000).
+      # Issue #570: managed autoCompactWindow default is unconditionally
+      # 1_000_000; launch_cmd is forwarded for caller-signature parity with
+      # helpers that still accept it (no longer consulted by the renderer).
       launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
       # Issue #555: forward agent id so each ensure-*-hook helper relinks
       # the per-agent effective file (not the install-wide one). Mixed-
