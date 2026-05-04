@@ -761,12 +761,46 @@ bridge_linux_grant_engine_cli_access() {
 bridge_linux_grant_bin_dir_access() {
   local os_user="$1"
   local bin_dir="$BRIDGE_HOME/bin"
+  local grant_targets=()
+  local path=""
   [[ -n "$os_user" ]] || return 0
   [[ -d "$bin_dir" ]] || return 0
-  bridge_linux_acl_add "u:${os_user}:r-x" "$bin_dir" >/dev/null 2>&1 || true
-  if [[ -e "$bin_dir/agb" ]]; then
-    bridge_linux_acl_add "u:${os_user}:r-x" "$bin_dir/agb" >/dev/null 2>&1 || true
+
+  # PR-E: v2 uses group-mode layout and intentionally avoids named-user
+  # ACLs for this surface.
+  if bridge_isolation_v2_active; then
+    return 0
   fi
+
+  grant_targets+=("$bin_dir")
+  if [[ -e "$bin_dir/agb" ]]; then
+    grant_targets+=("$bin_dir/agb")
+  fi
+
+  # The curated shim ultimately execs ${BRIDGE_HOME}/agb -> agent-bridge,
+  # which sources bridge-lib.sh and lib/*.sh before dispatching queue
+  # commands. A stale chmod/setfacl mask on any of these files makes the
+  # isolated UID fail before it reaches the socket gateway.
+  for path in \
+    "$BRIDGE_HOME/agb" \
+    "$BRIDGE_HOME/agent-bridge" \
+    "$BRIDGE_HOME/bridge-lib.sh" \
+    "$BRIDGE_HOME/bridge-queue.py" \
+    "$BRIDGE_HOME/bridge-queue-gateway.py"
+  do
+    [[ -e "$path" ]] && grant_targets+=("$path")
+  done
+
+  if [[ -d "$BRIDGE_HOME/lib" ]]; then
+    shopt -s nullglob
+    for path in "$BRIDGE_HOME/lib/"*.sh; do
+      grant_targets+=("$path")
+    done
+    shopt -u nullglob
+  fi
+
+  ((${#grant_targets[@]} > 0)) || return 0
+  bridge_linux_sudo_root setfacl -m "u:${os_user}:r-x,m::r-x" "${grant_targets[@]}" >/dev/null 2>&1 || true
 }
 
 bridge_linux_traverse_stop_for() {
@@ -2563,6 +2597,29 @@ export BRIDGE_GATEWAY_PROXY
 BRIDGE_CONTROLLER_UID=$(printf '%q' "$_controller_uid")
 export BRIDGE_CONTROLLER_UID
 EOF
+    # Propagate non-default queue-gateway env to the isolated agent
+    # (finding 7, r2 review). Without this, an isolated agent inherits
+    # the hard-coded /run/agent-bridge default for the runtime root and
+    # cannot find the daemon's socket when the operator has overridden
+    # BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT (smoke tests, multi-instance
+    # installs, alt-mount runtimes). Same for the socket timeout and
+    # the transport selection. We only emit overrides when they differ
+    # from the bridge-lib.sh defaults so the env file stays minimal.
+    if [[ -n "${BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT:-}" \
+          && "${BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT}" != "/run/agent-bridge" ]]; then
+      printf 'BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT=%s\nexport BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT\n' \
+        "$(printf '%q' "$BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT")" >>"$file"
+    fi
+    if [[ -n "${BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS:-}" \
+          && "${BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS}" != "5" ]]; then
+      printf 'BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS=%s\nexport BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS\n' \
+        "$(printf '%q' "$BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS")" >>"$file"
+    fi
+    if [[ -n "${BRIDGE_GATEWAY_TRANSPORT:-}" \
+          && "${BRIDGE_GATEWAY_TRANSPORT}" != "file" ]]; then
+      printf 'BRIDGE_GATEWAY_TRANSPORT=%s\nexport BRIDGE_GATEWAY_TRANSPORT\n' \
+        "$(printf '%q' "$BRIDGE_GATEWAY_TRANSPORT")" >>"$file"
+    fi
   fi
   # Inject engine CLI directory into PATH for sudo-wrapped launchers when
   # isolation is active. Under sudo, PATH falls back to secure_path which

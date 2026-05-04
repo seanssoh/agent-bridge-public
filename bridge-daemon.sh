@@ -142,6 +142,8 @@ _bridge_daemon_on_exit() {
   fi
   _BRIDGE_DAEMON_EXIT_LOGGED=1
 
+  bridge_stop_queue_gateway_socket_listener >/dev/null 2>&1 || true
+
   ts="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo unknown)"
   mkdir -p "$BRIDGE_STATE_DIR" 2>/dev/null || true
   printf '[%s] [info] daemon exit pid=%d ec=%d sig=%s last_step=%s err_location=%s\n' \
@@ -4101,6 +4103,294 @@ process_queue_gateway_requests() {
   return 1
 }
 
+bridge_queue_gateway_socket_pid_file() {
+  printf '%s/queue-gateway-socket.pid' "$BRIDGE_STATE_DIR"
+}
+
+bridge_queue_gateway_socket_log_file() {
+  printf '%s/queue-gateway-socket.log' "$BRIDGE_STATE_DIR"
+}
+
+bridge_queue_gateway_listener_mode() {
+  local mode="${BRIDGE_GATEWAY_LISTENER:-auto}"
+  case "$mode" in
+    auto|on|off)
+      printf '%s' "$mode"
+      ;;
+    *)
+      daemon_warn "invalid BRIDGE_GATEWAY_LISTENER=$mode; falling back to auto"
+      printf '%s' "auto"
+      ;;
+  esac
+}
+
+bridge_queue_gateway_listener_requested() {
+  local mode
+  local transport
+
+  mode="$(bridge_queue_gateway_listener_mode)"
+  [[ "$mode" == "off" ]] && return 1
+  [[ "$mode" == "on" ]] && return 0
+  transport="$(bridge_queue_gateway_transport)"
+  [[ "$transport" == "socket" ]] && return 0
+  bridge_queue_gateway_agent_socket_transport_configured
+}
+
+bridge_queue_gateway_agent_socket_transport_configured() {
+  local agent
+  local launch_cmd
+
+  for agent in "${BRIDGE_AGENT_IDS[@]:-}"; do
+    launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+    case "$launch_cmd" in
+      *BRIDGE_GATEWAY_TRANSPORT=socket*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+bridge_queue_gateway_socket_pid() {
+  local pid_file
+  pid_file="$(bridge_queue_gateway_socket_pid_file)"
+  [[ -f "$pid_file" ]] || return 1
+  sed -n '1p' "$pid_file"
+}
+
+bridge_queue_gateway_socket_connect_probe() {
+  # PR #571 r3 finding 4: real liveness probe. pid+socket-file existence
+  # is necessary but not sufficient — a recycled pid plus a leftover
+  # socket file (bound by a previous listener that exited without unlink,
+  # or `touch`ed by an unrelated tool) both pass the file-only check.
+  # This connect probe asks the OS whether *something is actually
+  # listening on the socket right now*. SOCK_SEQPACKET connect() against
+  # a Unix socket file with no bound listener returns ECONNREFUSED
+  # (and against a non-socket regular file returns ENOTSOCK). On
+  # success, return 0; on any failure, return 1. The probe is
+  # short-lived and side-effect-free (it does not send a payload, so
+  # the listener does not need to read or respond).
+  local socket_path
+  socket_path="$1"
+  [[ -n "$socket_path" ]] || return 1
+  python3 - "$socket_path" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+path = sys.argv[1]
+sock_type = getattr(socket, "SOCK_SEQPACKET", None)
+if sock_type is None:
+    raise SystemExit(1)
+sock = socket.socket(socket.AF_UNIX, sock_type)
+try:
+    sock.settimeout(1.0)
+    sock.connect(path)
+except OSError:
+    raise SystemExit(1)
+finally:
+    sock.close()
+raise SystemExit(0)
+PY
+}
+
+bridge_queue_gateway_socket_is_running() {
+  # PR #571 r3 finding 4: defense-in-depth liveness check.
+  #   1. pid file present and parseable.
+  #   2. recorded pid is alive (`kill -0`).
+  #   3. socket file exists at the expected path.
+  #   4. connect() to the socket succeeds — i.e. the recorded pid is
+  #      *actually* the process bound to that socket, not a recycled
+  #      pid that happens to be running an unrelated program.
+  # Stages 1-3 alone admit two false-positives:
+  #   * recycled pid + leftover socket file (previous listener crashed
+  #     without unlinking the bind path; pid was reassigned).
+  #   * pid file written manually + socket file `touch`ed (no listener
+  #     ever ran).
+  # The connect probe rejects both. The caller (start/stop/status) is
+  # then expected to remove stale artifacts before its decision becomes
+  # idempotent — see bridge_queue_gateway_socket_clean_stale.
+  local pid
+  local socket_path
+  pid="$(bridge_queue_gateway_socket_pid 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  socket_path="$(bridge_queue_gateway_socket_path 2>/dev/null || true)"
+  [[ -n "$socket_path" && -S "$socket_path" ]] || return 1
+  bridge_queue_gateway_socket_connect_probe "$socket_path" || return 1
+  return 0
+}
+
+bridge_queue_gateway_socket_clean_stale() {
+  # Idempotent stale-state sweep. Removes the pid file + socket file
+  # whenever the joint liveness check reports the listener as not
+  # actually serving — either because the recorded pid is gone, OR
+  # because the connect probe (r3 finding 4) refuses, which catches
+  # recycled-pid / stale-socket false-positives that the file-only
+  # check would otherwise pass. Safe to call from start (before
+  # deciding to spawn) and stop (before claiming success).
+  local pid_file
+  local socket_path
+  local pid
+
+  pid_file="$(bridge_queue_gateway_socket_pid_file)"
+  socket_path="$(bridge_queue_gateway_socket_path 2>/dev/null || true)"
+  pid="$(bridge_queue_gateway_socket_pid 2>/dev/null || true)"
+
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    if ! kill -0 "$pid" 2>/dev/null; then
+      # Process is gone but pid file lingers → drop it. Also remove the
+      # socket because nothing is listening on it; leaving it would
+      # confuse the next start (`refuse non-socket` path).
+      rm -f "$pid_file"
+      if [[ -n "$socket_path" && -S "$socket_path" ]]; then
+        rm -f "$socket_path"
+      fi
+    elif [[ -n "$socket_path" && -S "$socket_path" ]] \
+        && ! bridge_queue_gateway_socket_connect_probe "$socket_path"; then
+      # pid is alive but connect refuses → recorded pid is not the
+      # process actually bound to this socket (recycled pid, or a
+      # listener that exited without unlinking). Drop both artifacts so
+      # the next start spawns fresh and the next stop does not signal
+      # an unrelated process.
+      rm -f "$pid_file"
+      rm -f "$socket_path"
+    fi
+  else
+    # No pid recorded but a stale socket may exist from a previous run.
+    if [[ -n "$socket_path" && -S "$socket_path" ]]; then
+      rm -f "$socket_path"
+    fi
+  fi
+}
+
+bridge_start_queue_gateway_socket_listener() {
+  local mode
+  local transport
+  local pid_file
+  local log_file
+  local socket_path
+  local pid
+  local wait_seconds
+  local attempts
+  local i
+
+  mode="$(bridge_queue_gateway_listener_mode)"
+  [[ "$mode" == "off" ]] && return 0
+  transport="$(bridge_queue_gateway_transport)"
+  if [[ "$mode" == "auto" && "$transport" != "socket" ]] \
+      && ! bridge_queue_gateway_agent_socket_transport_configured; then
+    return 0
+  fi
+  # Linux-only fail-closed: SO_PEERCRED is the only credential mechanism
+  # the gateway implements. On macOS / BSD the listener would start but
+  # silently fail every peer-auth check, so refuse to start. The Python
+  # listener has the same gate (bridge-queue-gateway.py:_socket_transport_supported)
+  # — duplicating it here keeps the startup log explicit instead of
+  # surfacing as a Python SystemExit several lines down.
+  if [[ "$(bridge_host_platform 2>/dev/null || printf '')" != "Linux" ]]; then
+    if [[ "$mode" == "on" || "$transport" == "socket" ]]; then
+      daemon_warn "queue gateway socket transport requires Linux; use BRIDGE_GATEWAY_TRANSPORT=file on this platform"
+      return 1
+    fi
+    return 0
+  fi
+  # Sweep stale pid/socket pairs left by a prior crash so the joint
+  # liveness check below makes the right decision.
+  bridge_queue_gateway_socket_clean_stale
+  if bridge_queue_gateway_socket_is_running; then
+    return 0
+  fi
+
+  if ! bridge_queue_gateway_runtime_ensure --strict >/dev/null 2>&1; then
+    daemon_warn "queue gateway socket runtime is not ready"
+    if [[ "$mode" == "on" || "$transport" == "socket" ]]; then
+      return 1
+    fi
+    return 0
+  fi
+
+  mkdir -p "$BRIDGE_STATE_DIR"
+  pid_file="$(bridge_queue_gateway_socket_pid_file)"
+  log_file="$(bridge_queue_gateway_socket_log_file)"
+  socket_path="$(bridge_queue_gateway_socket_path)"
+
+  BRIDGE_QUEUE_GATEWAY_SERVER=1 python3 "$SCRIPT_DIR/bridge-queue-gateway.py" socket-server \
+    --bridge-home "$BRIDGE_HOME" \
+    --queue-script "$SCRIPT_DIR/bridge-queue.py" >>"$log_file" 2>&1 &
+  pid="$!"
+  printf '%s\n' "$pid" >"$pid_file"
+
+  wait_seconds="${BRIDGE_QUEUE_GATEWAY_SOCKET_START_WAIT_SECONDS:-3}"
+  [[ "$wait_seconds" =~ ^[0-9]+$ ]] || wait_seconds=3
+  attempts=$(( wait_seconds * 10 ))
+  (( attempts > 0 )) || attempts=1
+  # PR #571 r3 finding 4: readiness requires the listener to have
+  # actually called bind+listen. `-S` flips true at bind time but a
+  # racy reader can still see it before the listener accepts; the
+  # connect probe waits for an accepting socket, so a green readiness
+  # check here is a proper liveness check, not just a "socket file
+  # appeared" check.
+  for ((i = 0; i < attempts; i++)); do
+    if [[ -S "$socket_path" ]] && kill -0 "$pid" 2>/dev/null \
+        && bridge_queue_gateway_socket_connect_probe "$socket_path"; then
+      bridge_audit_log daemon queue_gateway_socket_started daemon \
+        --detail pid="$pid" \
+        --detail socket="$socket_path" >/dev/null 2>&1 || true
+      daemon_info "queue gateway socket listener started (pid=$pid socket=$socket_path)"
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pid_file"
+  daemon_warn "queue gateway socket listener failed to start"
+  if [[ "$mode" == "on" || "$transport" == "socket" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+bridge_stop_queue_gateway_socket_listener() {
+  # PR #571 r3 finding 4: only signal the recorded pid when ALL three
+  # are true: pid alive, socket file present, AND connect probe accepts.
+  # The connect probe is the line of defense against signalling an
+  # unrelated recycled pid: if pid+socket exist but no listener is
+  # bound (recycled pid, leftover socket file, or manual fixture), the
+  # recorded pid is not ours to kill — drop the artifacts and return.
+  # After signaling (or skipping), unconditionally clear both artifacts
+  # so the next start is idempotent.
+  local pid_file
+  local socket_path
+  local pid
+  local i
+
+  pid_file="$(bridge_queue_gateway_socket_pid_file)"
+  socket_path="$(bridge_queue_gateway_socket_path 2>/dev/null || true)"
+  pid="$(bridge_queue_gateway_socket_pid 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null \
+      && [[ -n "$socket_path" && -S "$socket_path" ]] \
+      && bridge_queue_gateway_socket_connect_probe "$socket_path"; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" >/dev/null 2>&1 || true
+    for ((i = 0; i < 30; i++)); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    bridge_audit_log daemon queue_gateway_socket_stopped daemon \
+      --detail pid="$pid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$pid_file"
+  if [[ -n "$socket_path" && -S "$socket_path" ]]; then
+    rm -f "$socket_path"
+  fi
+}
+
 cmd_sync_cycle() {
   local snapshot_file
   local ready_agents_file
@@ -4417,6 +4707,9 @@ cmd_run() {
 
   BRIDGE_DAEMON_LAST_STEP="startup"
   echo "$$" >"$BRIDGE_DAEMON_PID_FILE"
+  BRIDGE_DAEMON_LAST_STEP="queue_gateway_socket_listener"
+  bridge_start_queue_gateway_socket_listener
+  BRIDGE_DAEMON_LAST_STEP="startup"
 
   # Issue #265: emit a periodic audit `daemon_tick` so external monitoring
   # (and bridge-supervisor) can detect a hung main loop. Without this, a
@@ -4525,6 +4818,7 @@ cmd_stop() {
   # Stop the silence watchdog *before* killing the daemon so it doesn't
   # observe the stop-induced silence and race a fresh start against ours.
   bridge_stop_silence_watchdog || true
+  bridge_stop_queue_gateway_socket_listener || true
 
   recorded_pid="$(bridge_daemon_recorded_pid)"
   while IFS= read -r entry; do
@@ -4576,10 +4870,17 @@ cmd_stop() {
 }
 
 cmd_status() {
+  local socket_status="off"
+  if bridge_queue_gateway_listener_requested; then
+    socket_status="stopped"
+    if bridge_queue_gateway_socket_is_running; then
+      socket_status="running"
+    fi
+  fi
   if bridge_daemon_is_running; then
-    echo "running pid=$(bridge_daemon_pid) interval=${BRIDGE_DAEMON_INTERVAL}s db=${BRIDGE_TASK_DB}"
+    echo "running pid=$(bridge_daemon_pid) interval=${BRIDGE_DAEMON_INTERVAL}s db=${BRIDGE_TASK_DB} socket_listener=${socket_status}"
   else
-    echo "stopped"
+    echo "stopped socket_listener=${socket_status}"
   fi
 }
 

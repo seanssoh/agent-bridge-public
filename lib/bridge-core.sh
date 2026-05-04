@@ -277,6 +277,56 @@ print(datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"))
 PY
 }
 
+bridge_runtime_id() {
+  local home="$1"
+  [[ -n "$home" ]] || {
+    echo "bridge_runtime_id: home required" >&2
+    return 2
+  }
+  bridge_require_python
+  python3 - "$home" <<'PY'
+import hashlib
+import os
+import sys
+
+canonical = os.path.realpath(os.path.expanduser(sys.argv[1]))
+print(hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:12])
+PY
+}
+
+bridge_queue_gateway_runtime_root() {
+  printf '%s' "${BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT:-/run/agent-bridge}"
+}
+
+bridge_queue_gateway_socket_path() {
+  local bridge_id
+  bridge_id="$(bridge_runtime_id "$BRIDGE_HOME")" || return $?
+  printf '%s/%s/queue-gateway.sock' "$(bridge_queue_gateway_runtime_root)" "$bridge_id"
+}
+
+bridge_queue_gateway_transport() {
+  local transport="${BRIDGE_GATEWAY_TRANSPORT:-file}"
+  case "$transport" in
+    file|socket)
+      printf '%s' "$transport"
+      ;;
+    *)
+      bridge_warn "invalid BRIDGE_GATEWAY_TRANSPORT=$transport; falling back to file"
+      printf '%s' "file"
+      ;;
+  esac
+}
+
+bridge_queue_gateway_runtime_verify() {
+  bridge_require_python
+  python3 "$BRIDGE_SCRIPT_DIR/bridge-queue-gateway.py" verify-runtime --bridge-home "$BRIDGE_HOME"
+}
+
+bridge_queue_gateway_runtime_ensure() {
+  bridge_require_python
+  python3 "$BRIDGE_SCRIPT_DIR/bridge-queue-gateway.py" ensure-runtime --bridge-home "$BRIDGE_HOME" "$@"
+}
+
 bridge_nonce() {
   bridge_require_python
   python3 - <<'PY'
@@ -479,16 +529,26 @@ sys.stdout.write(assignment.sub(replace, text))
 
 bridge_queue_cli() {
   local agent=""
+  local transport=""
 
   if agent="$(bridge_queue_gateway_proxy_agent 2>/dev/null)"; then
     bridge_require_python
-    python3 "$BRIDGE_SCRIPT_DIR/bridge-queue-gateway.py" client \
-      --root "$(bridge_queue_gateway_root)" \
-      --agent "$agent" \
-      --timeout "${BRIDGE_QUEUE_GATEWAY_TIMEOUT_SECONDS:-45}" \
-      --poll "${BRIDGE_QUEUE_GATEWAY_POLL_SECONDS:-0.2}" \
-      "$@"
-    return $?
+    transport="$(bridge_queue_gateway_transport)"
+    if [[ "$transport" == "socket" ]]; then
+      python3 "$BRIDGE_SCRIPT_DIR/bridge-queue-gateway.py" socket-client \
+        --bridge-home "$BRIDGE_HOME" \
+        --timeout "${BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS:-5}" \
+        "$@"
+      return $?
+    else
+      python3 "$BRIDGE_SCRIPT_DIR/bridge-queue-gateway.py" client \
+        --root "$(bridge_queue_gateway_root)" \
+        --agent "$agent" \
+        --timeout "${BRIDGE_QUEUE_GATEWAY_TIMEOUT_SECONDS:-45}" \
+        --poll "${BRIDGE_QUEUE_GATEWAY_POLL_SECONDS:-0.2}" \
+        "$@"
+      return $?
+    fi
   fi
 
   bridge_queue_cli_direct "$@"

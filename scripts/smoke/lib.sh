@@ -114,3 +114,13 @@ smoke_run() {
   "$@"
   smoke_log "ok: $label"
 }
+
+smoke_skip() {
+  local label="$1"
+  local reason="$2"
+  smoke_log "skip: $label ($reason)"
+}
+
+smoke_is_linux() {
+  [[ "$(uname -s 2>/dev/null || printf 'unknown')" == "Linux" ]]
+}

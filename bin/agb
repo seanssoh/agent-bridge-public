@@ -18,6 +18,21 @@
 
 set -euo pipefail
 
+# Real isolated agent env files may call this before the full bridge
+# library is loaded. Keep the shim self-contained so env sourcing works
+# from a fresh isolated UID shell.
+bridge_add_agent_id_if_missing() {
+  local agent="$1"
+  local existing=""
+
+  for existing in "${BRIDGE_AGENT_IDS[@]:-}"; do
+    if [[ "$existing" == "$agent" ]]; then
+      return 0
+    fi
+  done
+  BRIDGE_AGENT_IDS+=("$agent")
+}
+
 if [[ -n "${BRIDGE_AGENT_ENV_FILE:-}" && -r "$BRIDGE_AGENT_ENV_FILE" ]]; then
   # shellcheck disable=SC1090
   source "$BRIDGE_AGENT_ENV_FILE"
