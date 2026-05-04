@@ -1,14 +1,20 @@
 #!/usr/bin/env bash
-# Curated agb shim for isolated agents (issue #544 PR1).
+# Curated agb shim for isolated agents (issue #544 PR1 + PR4).
 #
-# - When invoked from an isolated agent's UID with BRIDGE_AGENT_ENV_FILE in
-#   env, source it first so BRIDGE_GATEWAY_PROXY=1 / BRIDGE_HOME / sentineled
-#   BRIDGE_TASK_DB are present even in fresh non-login subshells (Bash tool
-#   subprocess re-evaluating PATH, etc.).
-# - Then exec the underlying $BRIDGE_HOME/agb script.
+# - PR1: env-file sourcing + BRIDGE_HOME fallback + exec delegation.
+# - PR4: subcommand allowlist + audit when invoked from an isolated UID.
+#   Detection is STRICT: requires BRIDGE_GATEWAY_PROXY=1 (set in the
+#   agent's agent-env.sh by bridge_write_linux_agent_env_file for
+#   linux-user isolation) AND a non-empty BRIDGE_CONTROLLER_UID that
+#   differs from the running UID. Both halves must hold; there is no
+#   fallback to proxy-flag-only when the UID hint is missing. A
+#   controller shell with BRIDGE_GATEWAY_PROXY=1 exported (operator
+#   debugging gateway routing) would otherwise be incorrectly treated
+#   as isolated and have admin commands denied. Installs missing the
+#   UID hint should re-run isolated env regeneration.
 #
-# Out of scope here: subcommand allowlist / denylist enforcement (issue #544
-# PR4 design). This shim is a discovery/delivery wrapper, not a policy gate.
+# Out of scope here: arg-value capture (privacy), audit-log rotation,
+# verbose-audit env. Tracked as PR4 follow-ups.
 
 set -euo pipefail
 
@@ -41,5 +47,95 @@ if [[ -z "${BRIDGE_HOME:-}" ]]; then
   export BRIDGE_HOME
   unset _shim_self _shim_link _shim_max_hops _shim_dir
 fi
+
+# JSON-escape helper for audit-row string fields. The audit row is a
+# pure-bash printf so values containing `"`, `\`, or whitespace control
+# chars would otherwise produce invalid JSONL and break log readers.
+# Keep this minimal: escape the chars JSON requires (RFC 8259 §7) for
+# the field surface we actually emit (subcommand, agent id, ts, reason,
+# decision). Order matters: backslash MUST come first so we don't
+# double-escape escapes we just inserted.
+_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+# === PR4: isolated subcommand allowlist + audit ===
+# Apply policy only when invoked from an isolated UID context. Both gates
+# must fire STRICTLY — there is no fallback when the controller UID hint
+# is missing:
+#   1. BRIDGE_GATEWAY_PROXY=1 — set in the agent's agent-env.sh when
+#      isolation_mode == linux-user (lib/bridge-agents.sh).
+#   2. BRIDGE_CONTROLLER_UID is non-empty AND != running UID. Both halves
+#      matter. Falling back to the proxy flag alone would be unsafe: a
+#      controller shell with BRIDGE_GATEWAY_PROXY=1 exported (e.g. an
+#      operator debugging gateway routing) would otherwise be treated as
+#      isolated and have admin commands denied. Installs without the UID
+#      hint emitted should re-run isolated env regeneration rather than
+#      have the shim guess.
+_isolated_invocation=0
+_self_uid="$(id -u)"
+_controller_uid=""
+if [[ "${BRIDGE_GATEWAY_PROXY:-0}" == "1" ]]; then
+  _controller_uid="${BRIDGE_CONTROLLER_UID:-}"
+  if [[ -n "$_controller_uid" && "$_self_uid" != "$_controller_uid" ]]; then
+    _isolated_invocation=1
+  fi
+fi
+
+if (( _isolated_invocation == 1 )); then
+  _subcommand="${1:-}"
+  _agent_id="${BRIDGE_AGENT_ID:-unknown}"
+  case "$_subcommand" in
+    inbox|show|claim|done|summary|create)
+      _decision=allow
+      _reason=allowlist
+      ;;
+    *)
+      _decision=deny
+      _reason=not_on_isolated_allowlist
+      ;;
+  esac
+
+  # Audit row. Best-effort: a write failure (e.g. dir not writable) must
+  # not abort the policy decision. Schema:
+  #   ts, agent, uid, subcommand, arg_count, decision, reason
+  # NOTE: arg_count only — never arg values. Arg values may carry task
+  # IDs or note text the operator wouldn't want in plain audit.
+  _audit_dir="${BRIDGE_HOME}/logs/agents/${_agent_id}"
+  _audit_log="${_audit_dir}/audit.jsonl"
+  _ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if [[ "$#" -gt 0 ]]; then
+    _arg_count=$(( $# - 1 ))
+  else
+    _arg_count=0
+  fi
+  _audit_row="$(printf '{"ts":"%s","agent":"%s","uid":%s,"subcommand":"%s","arg_count":%d,"decision":"%s","reason":"%s","source":"isolated_cli_policy"}' \
+    "$(_json_escape "$_ts")" \
+    "$(_json_escape "$_agent_id")" \
+    "$_self_uid" \
+    "$(_json_escape "$_subcommand")" \
+    "$_arg_count" \
+    "$(_json_escape "$_decision")" \
+    "$(_json_escape "$_reason")")"
+  if mkdir -p "$_audit_dir" 2>/dev/null && [[ -w "$_audit_dir" ]]; then
+    printf '%s\n' "$_audit_row" >>"$_audit_log" 2>/dev/null || true
+  fi
+
+  if [[ "$_decision" == "deny" ]]; then
+    printf 'agb: subcommand %q is not allowed for isolated agents.\n' "$_subcommand" >&2
+    printf '     Operator/admin actions must go through the queue: agb create --to admin --title "..."\n' >&2
+    printf '     (audit row written to %s)\n' "$_audit_log" >&2
+    exit 64
+  fi
+  unset _subcommand _agent_id _decision _reason _audit_dir _audit_log _ts _arg_count _audit_row
+fi
+unset _isolated_invocation _self_uid _controller_uid
+# === end PR4 ===
 
 exec "$BRIDGE_HOME/agb" "$@"

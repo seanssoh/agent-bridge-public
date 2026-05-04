@@ -62,10 +62,16 @@ EOF
 
   # Fixture env file the shim must auto-source. Mirrors the shape
   # bridge_write_linux_agent_env_file emits for isolated agents.
+  # BRIDGE_CONTROLLER_UID matches our own UID on purpose: this smoke
+  # exercises the PR1 env-source + delegation contract only, not the
+  # PR4 isolated-CLI policy gate. Setting it equal to $(id -u) tells
+  # the shim "the writer == this UID, so don't apply policy" — which
+  # is what we want here (separate smoke covers the gate explicitly).
   AGENT_ENV_FILE="$FIXTURE_HOME/agent-env.sh"
   cat >"$AGENT_ENV_FILE" <<EOF
 export BRIDGE_HOME="$FIXTURE_HOME"
 export BRIDGE_GATEWAY_PROXY=1
+export BRIDGE_CONTROLLER_UID=$(id -u)
 export TEST_ENV_MARKER=isolated-bin-agb-smoke
 EOF
   chmod 600 "$AGENT_ENV_FILE"

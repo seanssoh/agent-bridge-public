@@ -2548,10 +2548,20 @@ EOF
   # routing from `${#BRIDGE_AGENT_IDS[@]}` so the peer-id additions above do
   # not accidentally drop the agent off the gateway. See issue #294 +
   # bridge_queue_gateway_proxy_agent.
+  #
+  # BRIDGE_CONTROLLER_UID is the writer's UID (this function runs in the
+  # controller context). The bin/agb shim uses it to confirm a strict UID
+  # mismatch before applying the isolated-CLI allowlist (issue #544 PR4) —
+  # the gateway-proxy flag alone could be spoofed by an operator who
+  # manually exports it in their own shell.
   if [[ "$isolation_mode" == "linux-user" ]]; then
-    cat >>"$file" <<'EOF'
+    local _controller_uid
+    _controller_uid="$(id -u)"
+    cat >>"$file" <<EOF
 BRIDGE_GATEWAY_PROXY=1
 export BRIDGE_GATEWAY_PROXY
+BRIDGE_CONTROLLER_UID=$(printf '%q' "$_controller_uid")
+export BRIDGE_CONTROLLER_UID
 EOF
   fi
   # Inject engine CLI directory into PATH for sudo-wrapped launchers when

@@ -437,10 +437,33 @@ agent-bridge isolate <agent> --reapply
 ownership) followed by an agent restart so `bridge-start.sh`
 regenerates the agent's `agent-env.sh` with the new PATH.
 
-Out of scope: the broader `agent-bridge` subcommand surface for
-isolated UIDs remains explicit default-deny per issue
-[#544](https://github.com/SYRS-AI/agent-bridge-public/issues/544) PR4
-design review.
+### Isolated `agb` subcommand allowlist + audit
+
+When `bin/agb` is invoked from an isolated UID context (env carries
+`BRIDGE_GATEWAY_PROXY=1` AND the running UID differs from
+`BRIDGE_CONTROLLER_UID`, both emitted by
+`bridge_write_linux_agent_env_file`), the shim enforces a curated
+allowlist:
+
+- Allowed: `inbox`, `show`, `claim`, `done`, `summary`, `create`.
+- Anything else (including `admin`, `upgrade`, `daemon`, `urgent`,
+  `kill`, `attach`, `agent start|stop|restart|create|update`,
+  `cron *`, `config set`, `setup`, `isolate`, `unisolate`, `worktree`,
+  `audit`, `wave dispatch`) returns exit `64` with a clean message
+  pointing the operator at the queue route
+  (`agb create --to admin --title "..."`).
+
+Every isolated invocation (allow or deny) appends a JSONL row to
+`${BRIDGE_HOME}/logs/agents/<agent>/audit.jsonl` carrying
+`{ts, agent, uid, subcommand, arg_count, decision, reason}`. Argument
+**values** are intentionally not captured — task IDs and note text may
+be sensitive — so audit reviewers see the call shape, not the
+operator's text. Operators who need to invoke administrative
+subcommands run `agb` from the controller shell, not from inside an
+isolated agent's tmux pane. Existing isolated agents pick up the
+controller-UID env-file emission by re-running the same
+`agent-bridge isolate <agent> --reapply` + restart sequence from the
+PR1 section above.
 
 ### Bridge-native skills under the isolated HOME
 
