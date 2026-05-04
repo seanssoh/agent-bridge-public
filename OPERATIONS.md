@@ -94,7 +94,7 @@ agb upgrade --dry-run
 agb upgrade --apply
 ```
 
-`--apply` 는 atomic — daemon stop/start, agent restart, shared settings rerender (model-aware `autoCompactWindow` 등 managed default propagate; `[1m]`-variant launches → `1_000_000`, 그 외 → `400_000` 유지, 자세한 내용은 [autoCompactWindow per model](#autocompactwindow-per-model-v076-issue-547) 참고), shared hooks 재등록, `_template/CLAUDE.md` sync, `[upgrade-complete]` admin task 등록 모두 포함.
+`--apply` 는 atomic — daemon stop/start, agent restart, shared settings rerender (managed default `autoCompactWindow=1_000_000` propagate; 자세한 내용은 [autoCompactWindow default](#autocompactwindow-default-v076-issue-570) 참고), shared hooks 재등록, `_template/CLAUDE.md` sync, `[upgrade-complete]` admin task 등록 모두 포함.
 
 The upgrader preserves local runtime data by default:
 
@@ -149,41 +149,39 @@ cd ~/.agent-bridge-source
 ./scripts/deploy-live-install.sh --target ~/.agent-bridge --restart-daemon
 ```
 
-### autoCompactWindow per model (v0.7.6+, issue #547)
+### autoCompactWindow default (v0.7.6+, issue #570)
 
-`bridge-hooks.py render-shared-settings` resolves the managed
-`autoCompactWindow` default per agent based on `BRIDGE_AGENT_LAUNCH_CMD`:
+`bridge-hooks.py render-shared-settings` writes a managed
+`autoCompactWindow` default of `1_000_000` for every managed Claude agent,
+regardless of model variant. The previous `[1m]` launch_cmd substring
+heuristic (issue #547) never fired in practice — `[1m]` is a model-id
+suffix the runtime *prints* (`claude-opus-4-7[1m]`), not a CLI argument
+the launcher passes — so agents always landed on the legacy `400_000`
+cap and `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=45` compacted at ~180K instead
+of the intended ~450K. The unconditional 1M setting is a no-regret upper
+bound: any model with a smaller native context window will compact
+earlier on its own.
 
-- launch_cmd contains `[1m]` (Opus 4.7 1M-context line) → `1_000_000`
-- everything else (Opus 4.6 / pre-1M Sonnet / Haiku) → `400_000` (preserved compromise)
-
-Threading is per-agent: every `bridge-agent.sh rerender-settings`,
-`agent-bridge upgrade --apply`, and `agent-bridge create` invocation forwards
-the resolved launch_cmd to the renderer. Operator overlays
-(`~/.agent-bridge/.claude/settings.local.json` and per-agent base
-`settings.json`) still win over the managed default.
-
-This means `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is now computed against the
-model's actual native context window for `[1m]` launches, not the
-previously-capped `400_000`. Operators who want to opt back into the legacy
-400K cap on a 1M-context agent set:
+Operator overlays (`~/.agent-bridge/.claude/settings.local.json` and
+per-agent base `settings.json`) still win over the managed default.
+Operators who want to cap a particular install at the legacy 400K
+window can set:
 
 ```sh
 export CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000
 ```
 
 in `agent-roster.local.sh` (env wins over settings per Claude Code's
-resolution order, so this overrides the new model-aware default and
-survives `agent-bridge upgrade --apply`).
+resolution order, so this overrides the managed default and survives
+`agent-bridge upgrade --apply`).
 
 **Per-agent settings.effective.json (issue #555).** As of v0.7.x+, every
 managed agent has its own `settings.effective.json` rendered at
 `$BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/settings.effective.json` and the
-agent's workdir `settings.json` symlinks to it. Per-agent values like
-`autoCompactWindow` are independent — a 1M-context Opus 4.7 `[1m]` agent
-and a pre-1M Opus 4.6 agent on the same install each see their own
-resolved value, regardless of which one ran the last
-`agb upgrade --apply` / restart-rerender.
+agent's workdir `settings.json` symlinks to it. Per-agent values are
+independent: each managed agent renders its own file, so per-agent base
+or overlay overrides are no longer clobbered by whichever sibling ran
+the last `agb upgrade --apply` / restart-rerender.
 
 The shared base (`$BRIDGE_AGENT_HOME_ROOT/.claude/settings.json`) and
 overlay (`settings.local.json`) remain install-wide and are still

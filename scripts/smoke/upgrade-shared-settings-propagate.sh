@@ -88,14 +88,15 @@ assert_apply_rerenders_and_preserves_overlay() {
   # points to that per-agent file.
   effective_file="$BRIDGE_AGENT_HOME_ROOT/patch/.claude/settings.effective.json"
   [[ -L "$settings_file" ]] || smoke_fail "rerender apply should link agent settings to per-agent effective settings"
-  smoke_assert_eq "400000" "$(settings_value "$settings_file" autoCompactWindow)" "rerender apply backfills autoCompactWindow"
+  # Issue #570: managed autoCompactWindow default is unconditionally 1_000_000.
+  smoke_assert_eq "1000000" "$(settings_value "$settings_file" autoCompactWindow)" "rerender apply backfills autoCompactWindow"
   smoke_assert_eq "yes" "$(python3 - "$settings_file" <<'PY'
 import json, sys
 from pathlib import Path
 print(json.loads(Path(sys.argv[1]).read_text()).get("env", {}).get("OVERLAY_ONLY"))
 PY
 )" "rerender apply preserves operator overlay"
-  smoke_assert_eq "400000" "$(settings_value "$effective_file" autoCompactWindow)" "per-agent effective has managed default"
+  smoke_assert_eq "1000000" "$(settings_value "$effective_file" autoCompactWindow)" "per-agent effective has managed default"
 
   audit="$(cat "$BRIDGE_AUDIT_LOG")"
   smoke_assert_contains "$audit" "shared_settings_rerendered" "rerender apply emits audit row"
@@ -126,7 +127,8 @@ assert_upgrade_runs_rerender() {
   has_patch="$(json_field "$upgrade_json" 'any(item["agent"] == "patch" for item in payload["shared_settings_rerender"]["candidates"])')"
   smoke_assert_eq "True" "$has_patch" "upgrade reports patch shared settings rerender target"
   [[ -L "$agent_home/.claude/settings.json" ]] || smoke_fail "upgrade should relink managed Claude settings"
-  smoke_assert_eq "400000" "$(settings_value "$agent_home/.claude/settings.json" autoCompactWindow)" "upgrade backfills autoCompactWindow"
+  # Issue #570: managed autoCompactWindow default is unconditionally 1_000_000.
+  smoke_assert_eq "1000000" "$(settings_value "$agent_home/.claude/settings.json" autoCompactWindow)" "upgrade backfills autoCompactWindow"
 }
 
 assert_operator_overlay_wins() {

@@ -12,7 +12,7 @@
 `--apply` 한 번에 다음이 자동으로 일어난다:
 
 - daemon stop → 새 source 복사 → daemon restart → 영향받는 agent 재기동.
-- shared Claude settings 재렌더 (`autoCompactWindow:400000` 등 managed default 가 모든 Claude agent 에 propagate).
+- shared Claude settings 재렌더 (`autoCompactWindow:1000000` 등 managed default 가 모든 Claude agent 에 propagate).
 - shared hooks 재등록 (Stop / SessionStart / UserPromptSubmit / PromptGuard / ToolPolicy 가 새 release 의 entry 로 갱신).
 - `_template/CLAUDE.md` managed block 이 모든 agent 의 `CLAUDE.md` 에 sync.
 - admin agent 한테 `[upgrade-complete]` queue task 자동 등록 (`OPERATOR_ACTIONS_PENDING.md` reference 포함).

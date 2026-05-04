@@ -118,7 +118,8 @@ claude_shared_settings_context_defaults() {
     --base-settings-file "$base" \
     --overlay-settings-file "$overlay" \
     --effective-settings-file "$effective" >/dev/null
-  assert_claude_auto_compact_window "$effective" "400000" "bridge defaults"
+  # Issue #570: managed autoCompactWindow default is unconditionally 1_000_000.
+  assert_claude_auto_compact_window "$effective" "1000000" "bridge defaults"
 
   printf '%s\n' '{"autoCompactWindow":650000,"env":{"BASE_ONLY":"yes"}}' >"$base"
   rm -f "$overlay" "$effective"
@@ -187,7 +188,8 @@ EOF
   [[ -L "$custom_workdir/.claude/settings.json" ]] || smoke_fail "custom managed workdir should use shared settings symlink"
   target="$(readlink "$custom_workdir/.claude/settings.json")"
   smoke_assert_contains "$target" "../bridge-home/agents/.claude/settings.effective.json" "custom managed settings symlink target"
-  assert_claude_auto_compact_window "$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json" "400000" "custom managed shared settings"
+  # Issue #570: managed autoCompactWindow default is unconditionally 1_000_000.
+  assert_claude_auto_compact_window "$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json" "1000000" "custom managed shared settings"
 }
 
 claude_settings_mode_source_gate() {
@@ -195,8 +197,9 @@ claude_settings_mode_source_gate() {
   # branch on source=static. Dynamic claude agents register a workdir in
   # BRIDGE_AGENT_IDS too (bulk-register, dynamic spawn), and without the
   # source check the second branch would treat any registered workdir as
-  # "shared" — inflating dynamic agents' context budget by inheriting the
-  # static-only autoCompactWindow=400000 default.
+  # "shared" — handing dynamic agents the static-only managed
+  # autoCompactWindow default (1_000_000 as of issue #570) instead of
+  # leaving them on Claude Code's own native auto-compact handling.
   local case_root static_workdir dynamic_workdir within_root_workdir bash4_bin
   local dynamic_under_root_workdir
   local mode_dynamic mode_static mode_within_root mode_dynamic_under_root

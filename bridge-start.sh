@@ -234,9 +234,9 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   fi
   # Issue #555: forward agent id (3rd arg) so each ensure-*-hook helper
   # relinks the per-agent effective file at $BRIDGE_AGENT_HOME_ROOT/<agent>/
-  # .claude/settings.effective.json. Resolve launch_cmd from the roster so
-  # the rerender picks the right autoCompactWindow default for this agent's
-  # model variant ([1m] → 1_000_000, otherwise → 400_000).
+  # .claude/settings.effective.json. Issue #570: managed autoCompactWindow
+  # default is unconditionally 1_000_000; launch_cmd is forwarded for
+  # caller-signature parity only (no longer consulted by the renderer).
   AGENT_LAUNCH_CMD="$(bridge_agent_launch_cmd_raw "$AGENT" 2>/dev/null || true)"
   if ! bridge_ensure_claude_stop_hook "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
     bridge_die "Claude Stop hook 설정에 실패했습니다: $WORK_DIR"

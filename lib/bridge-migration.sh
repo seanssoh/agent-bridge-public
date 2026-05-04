@@ -153,11 +153,11 @@ bridge_migration_isolate() {
     # unisolate→isolate cycle. Best-effort: warn but don't bail — the
     # ACL reapply above is the load-bearing step.
     if command -v bridge_install_isolated_home_settings >/dev/null 2>&1; then
-      # Issue #547 / PR #561 r1 needs-more: forward launch_cmd so the
-      # isolated-home renderer applies the [1m] autoCompactWindow
-      # heuristic too. Without this, --reapply re-rendered with the
-      # legacy 400_000 default even for 1M-context agents. Match the
-      # call shape at run_rerender_settings (bridge-agent.sh:1655-1669).
+      # Issue #570: managed autoCompactWindow default is unconditionally
+      # 1_000_000; launch_cmd is forwarded for caller-signature parity
+      # with helpers that still accept it (no longer consulted by the
+      # renderer). Match the call shape at run_rerender_settings
+      # (bridge-agent.sh:1655-1669).
       local _reapply_launch_cmd=""
       _reapply_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || printf '')"
       bridge_install_isolated_home_settings "$agent" "$_reapply_launch_cmd" \

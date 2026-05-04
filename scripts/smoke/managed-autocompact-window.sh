@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
-# scripts/smoke/managed-autocompact-window.sh — Issue #547 regression smoke.
+# scripts/smoke/managed-autocompact-window.sh — Issue #570 regression smoke.
 #
 # Covers `bridge-hooks.py render-shared-settings` resolution of the managed
-# autoCompactWindow default:
-#   - launch_cmd contains '[1m]' → 1_000_000 (Opus 4.7 1M-context line)
-#   - launch_cmd lacks '[1m]'    → 400_000  (legacy / Opus 4.6 era)
-#   - --launch-cmd omitted        → 400_000  (back-compat with pre-#547 callers)
+# autoCompactWindow default. As of issue #570 the default is unconditionally
+# 1_000_000 — the `--launch-cmd` flag is accepted for backwards compatibility
+# but is no longer consulted by the renderer.
+#
+# Cases covered:
+#   - launch_cmd containing '[1m]'    → 1_000_000 (was the only 1M case pre-#570)
+#   - launch_cmd lacking '[1m]'        → 1_000_000 (was 400_000 pre-#570)
+#   - --launch-cmd empty / omitted     → 1_000_000 (was 400_000 pre-#570)
+#   - explicit base / overlay value    → wins over the managed default
+#   - CLAUDE_CODE_AUTO_COMPACT_WINDOW   → operator escape hatch (env wins via
+#     Claude Code's resolution order; verified at the runtime layer, not in
+#     this renderer-only smoke).
 
 set -euo pipefail
 
@@ -62,38 +70,38 @@ main() {
 
   rm -f "$base" "$overlay"
 
-  smoke_log "case: launch_cmd contains '[1m]' → 1_000_000"
+  smoke_log "case: launch_cmd contains '[1m]' → 1_000_000 (managed default)"
   run_render "$base" "$overlay" "$effective" \
     --launch-cmd "claude --model claude-opus-4-7[1m]"
-  assert_window "$effective" "1000000" "1m launch_cmd raises managed default"
+  assert_window "$effective" "1000000" "[1m] launch_cmd lands on managed 1M default"
 
-  smoke_log "case: launch_cmd lacks '[1m]' → 400_000"
+  smoke_log "case: launch_cmd lacks '[1m]' → 1_000_000 (managed default, #570 unconditional)"
   run_render "$base" "$overlay" "$effective" \
     --launch-cmd "claude --model claude-opus-4-7"
-  assert_window "$effective" "400000" "non-1m launch_cmd preserves legacy default"
+  assert_window "$effective" "1000000" "non-[1m] launch_cmd lands on managed 1M default"
 
-  smoke_log "case: empty --launch-cmd → 400_000 (back-compat for unspecified)"
+  smoke_log "case: empty --launch-cmd → 1_000_000 (managed default, launch_cmd not consulted)"
   run_render "$base" "$overlay" "$effective" --launch-cmd ""
-  assert_window "$effective" "400000" "empty launch_cmd falls through to legacy default"
+  assert_window "$effective" "1000000" "empty launch_cmd lands on managed 1M default"
 
-  smoke_log "case: --launch-cmd omitted entirely → 400_000 (back-compat for pre-#547 callers)"
+  smoke_log "case: --launch-cmd omitted entirely → 1_000_000 (back-compat path, managed default)"
   run_render "$base" "$overlay" "$effective"
-  assert_window "$effective" "400000" "omitted launch_cmd flag preserves legacy default"
+  assert_window "$effective" "1000000" "omitted launch_cmd flag lands on managed 1M default"
 
-  smoke_log "case: base autoCompactWindow wins over managed default even on [1m]"
+  smoke_log "case: base autoCompactWindow wins over managed default"
   printf '%s\n' '{"autoCompactWindow":650000}' >"$base"
   run_render "$base" "$overlay" "$effective" \
     --launch-cmd "claude [1m]"
   assert_window "$effective" "650000" "explicit base value overrides managed default"
   rm -f "$base"
 
-  smoke_log "case: overlay autoCompactWindow wins over managed default on [1m]"
+  smoke_log "case: overlay autoCompactWindow wins over managed default"
   printf '%s\n' '{"autoCompactWindow":475000}' >"$overlay"
   run_render "$base" "$overlay" "$effective" \
     --launch-cmd "claude [1m]"
   assert_window "$effective" "475000" "explicit overlay value overrides managed default"
 
-  smoke_log "PASS: managed autoCompactWindow resolver matrix (#547)"
+  smoke_log "PASS: managed autoCompactWindow resolver matrix (#570)"
 }
 
 main "$@"

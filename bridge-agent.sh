@@ -1656,8 +1656,9 @@ run_rerender_settings() {
     before_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
     error=""
     if [[ $apply -eq 1 ]]; then
-      # Issue #547: forward launch_cmd so the rerender picks the right
-      # autoCompactWindow default (1_000_000 for [1m] launches, else 400_000).
+      # Issue #570: managed autoCompactWindow default is unconditionally
+      # 1_000_000; launch_cmd is forwarded only for caller-signature parity
+      # with helpers that still accept it (no longer consulted by the renderer).
       target_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
       # Issue #555: forward agent id so the rerender writes to the
       # per-agent effective file ($BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/
@@ -1981,8 +1982,9 @@ run_create() {
       "$os_user" >/dev/null
     bridge_load_roster
     if [[ "$engine" == "claude" ]]; then
-      # Issue #547: forward launch_cmd so the freshly-created agent gets
-      # the right autoCompactWindow default for its model variant.
+      # Issue #570: managed autoCompactWindow default is unconditionally
+      # 1_000_000; launch_cmd is forwarded only for caller-signature parity
+      # with helpers that still accept it (no longer consulted by the renderer).
       # Issue #555: pass agent id so the freshly-created agent gets its
       # own per-agent settings.effective.json (not the install-wide one).
       bridge_ensure_claude_shared_settings_for_managed_workdir "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
