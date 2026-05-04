@@ -152,6 +152,17 @@ const HOST = process.env.TEAMS_WEBHOOK_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.TEAMS_WEBHOOK_PORT ?? '3978')
 const STATIC = process.env.TEAMS_ACCESS_MODE === 'static'
 
+if (process.env.TEAMS_BRIDGE_MODE === '1' || process.env.TEAMS_BRIDGE_AGENT) {
+  process.stderr.write(
+    'teams channel: ignoring deprecated TEAMS_BRIDGE_MODE/TEAMS_BRIDGE_AGENT; inbound messages use notifications/claude/channel\n',
+  )
+}
+if (process.env.TEAMS_DELIVERY_MODE && process.env.TEAMS_DELIVERY_MODE !== 'channel') {
+  process.stderr.write(
+    `teams channel: unsupported TEAMS_DELIVERY_MODE=${process.env.TEAMS_DELIVERY_MODE}; using channel delivery\n`,
+  )
+}
+
 const APP_ID = process.env.TEAMS_APP_ID ?? process.env.MicrosoftAppId
 const APP_PASSWORD = process.env.TEAMS_APP_PASSWORD ?? process.env.MicrosoftAppPassword
 const TENANT_ID = process.env.TEAMS_TENANT_ID ?? process.env.MicrosoftAppTenantId ?? ''
@@ -354,6 +365,20 @@ function appendMessage(message: StoredMessage): void {
   appendFileSync(MESSAGES_FILE, JSON.stringify(message) + '\n', { mode: 0o600 })
 }
 
+function deliveredMessageSeen(chatId: string, messageId: string): boolean {
+  if (!chatId || !messageId || !existsSync(MESSAGES_FILE)) return false
+  try {
+    const lines = readFileSync(MESSAGES_FILE, 'utf8').split('\n').filter(Boolean)
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      try {
+        const row = JSON.parse(lines[i]) as Partial<StoredMessage>
+        if (row.chat_id === chatId && row.message_id === messageId) return true
+      } catch {}
+    }
+  } catch {}
+  return false
+}
+
 function sanitizeMessageId(raw: string): string {
   // Teams message ids are typically guid-like, numeric, or "<guid>:<num>".
   // Strict allowlist prevents path-traversal via attacker-controlled activity.id.
@@ -528,6 +553,16 @@ const adapter = new BotFrameworkAdapter({
 const recentMessageIds = createRecentMessageDeduper(256)
 let duplicateDropLogs = 0
 
+function dedupeKey(chatId: string, messageId: string): string {
+  return `${chatId}::${messageId}`
+}
+
+function logDuplicateDrop(chatId: string, messageId: string): void {
+  if (duplicateDropLogs >= 10) return
+  process.stderr.write(`teams channel: dropped duplicate chat_id=${chatId} message_id=${messageId}\n`)
+  duplicateDropLogs += 1
+}
+
 const mcp = new Server(
   { name: 'teams', version: '0.1.0' },
   {
@@ -615,11 +650,12 @@ async function handleActivity(context: TurnContext): Promise<void> {
 
   const chatId = referenceKey(activity)
   const messageId = String(activity.id ?? randomUUID())
-  if (recentMessageIds.seen(messageId)) {
-    if (duplicateDropLogs < 10) {
-      process.stderr.write(`teams channel: dropped duplicate message_id=${messageId}\n`)
-      duplicateDropLogs += 1
-    }
+  if (recentMessageIds.seen(dedupeKey(chatId, messageId))) {
+    logDuplicateDrop(chatId, messageId)
+    return
+  }
+  if (deliveredMessageSeen(chatId, messageId)) {
+    logDuplicateDrop(chatId, messageId)
     return
   }
 
@@ -645,38 +681,44 @@ async function handleActivity(context: TurnContext): Promise<void> {
     ts,
     ...(attachments.length > 0 ? { attachments } : {}),
   }
-  appendMessage(stored)
-
-  void mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        source: 'teams',
-        chat_id: chatId,
-        conversation_id: chatId,
-        message_id: messageId,
-        user: userName,
-        user_id: stored.user_id,
-        aad_object_id: aad,
-        tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
-        service_url: String(activity.serviceUrl ?? ''),
-        ts,
-        ...(attachments.length > 0
-          ? {
-              attachments: attachments.map(att => ({
-                name: att.name,
-                content_type: att.content_type,
-                download_status: att.download_status,
-                ...(att.local_path ? { local_path: att.local_path } : {}),
-                ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
-                ...(att.download_error ? { download_error: att.download_error } : {}),
-              })),
-            }
-          : {}),
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: text || (attachments.length > 0 ? '(attachment)' : ''),
+        meta: {
+          source: 'teams',
+          chat_id: chatId,
+          conversation_id: chatId,
+          message_id: messageId,
+          user: userName,
+          user_id: stored.user_id,
+          aad_object_id: aad,
+          tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
+          service_url: String(activity.serviceUrl ?? ''),
+          ts,
+          ...(attachments.length > 0
+            ? {
+                attachment_count: String(attachments.length),
+                attachments: attachments.map(att => ({
+                  name: att.name,
+                  content_type: att.content_type,
+                  download_status: att.download_status,
+                  ...(att.local_path ? { local_path: att.local_path } : {}),
+                  ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
+                  ...(att.download_error ? { download_error: att.download_error } : {}),
+                })),
+              }
+            : {}),
+        },
       },
-    },
-  })
+    })
+    appendMessage(stored)
+  } catch (err) {
+    recentMessageIds.forget(dedupeKey(chatId, messageId))
+    process.stderr.write(`teams channel: failed to deliver inbound message_id=${messageId}: ${err}\n`)
+    throw err
+  }
 }
 
 const httpServer = createServer((req, res) => {

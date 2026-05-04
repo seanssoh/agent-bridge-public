@@ -1,5 +1,6 @@
 export type RecentMessageDeduper = {
   seen(messageId: string): boolean
+  forget(messageId: string): void
 }
 
 export function createRecentMessageDeduper(limit = 256): RecentMessageDeduper {
@@ -19,6 +20,12 @@ export function createRecentMessageDeduper(limit = 256): RecentMessageDeduper {
         if (removed) seenIds.delete(removed)
       }
       return false
+    },
+    forget(messageId: string): void {
+      const id = String(messageId || '').trim()
+      if (!id || !seenIds.delete(id)) return
+      const idx = queue.indexOf(id)
+      if (idx >= 0) queue.splice(idx, 1)
     },
   }
 }

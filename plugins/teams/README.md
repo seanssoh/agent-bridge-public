@@ -82,6 +82,12 @@ Filenames and message ids are sanitized (strict allowlist) before they're joined
 
 Outbound attachments (sending files from the bot to Teams) are not yet implemented; track that work separately.
 
+## Delivery Mode
+
+By default, inbound Teams messages are delivered to Claude Code with `notifications/claude/channel`, and the server waits for the MCP stdio write before acknowledging the Teams webhook. If the MCP write fails, the webhook returns an error so Teams can retry.
+
+Legacy `TEAMS_BRIDGE_MODE` / `TEAMS_BRIDGE_AGENT` settings are ignored. Teams inbound delivery must not create Agent Bridge queue tasks; it should enter the active Claude Code session as a channel message. Accepted messages are written to the local log only after Claude Code accepts the channel notification, so Teams webhook retries can still recover from delivery failures without duplicating already delivered messages.
+
 ## Current Scope
 
 This is the Phase 1 channel implementation: webhook receive, access gate, Claude channel notification, reply, local message fetch, and a lightweight `/auth/callback` endpoint used by the `ms365` plugin authorization-code pairing flow. Multi-tenant user-to-agent routing is intentionally left to the Agent Bridge relay layer so one Teams bot can map many users to many timeout agents without mixing conversation state.

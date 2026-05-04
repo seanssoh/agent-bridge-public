@@ -5376,6 +5376,8 @@ assert_contains "$SETUP_TEAMS_OUTPUT" "--dangerously-load-development-channels p
 assert_contains "$(cat "$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams/.env")" "TEAMS_APP_ID=smoke-teams-app-id"
 assert_contains "$(cat "$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams/.env")" "TEAMS_WEBHOOK_HOST=0.0.0.0"
 assert_contains "$(cat "$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams/.env")" "TEAMS_WEBHOOK_PORT=3978"
+assert_not_contains "$(cat "$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams/.env")" "TEAMS_BRIDGE_MODE"
+assert_not_contains "$(cat "$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams/.env")" "TEAMS_BRIDGE_AGENT"
 assert_contains "$(cat "$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams/access.json")" "19:smoke@thread.v2"
 assert_contains "$(cat "$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams/state.json")" "\"status\": \"ok\""
 CREATED_TEAMS_LAUNCH="$("$BASH4_BIN" -c '
@@ -5476,6 +5478,9 @@ PY
     die "Teams plugin unexpectedly stayed alive on duplicate port bind"
   fi
   assert_contains "$(cat "$TEAMS_PLUGIN_CONFLICT_LOG")" "teams channel: http listen failed on 0.0.0.0:$TEAMS_SMOKE_PORT"
+  assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "agent-bridge urgent"
+  assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "spawnSync(agb, ['urgent'"
+  assert_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "ignoring deprecated TEAMS_BRIDGE_MODE"
   TEAMS_DEDUPE_OUTPUT="$(cd "$REPO_ROOT/plugins/teams" && bun -e 'import { createRecentMessageDeduper } from "./dedupe.ts"; const dedupe = createRecentMessageDeduper(2); console.log(JSON.stringify([dedupe.seen("1775901127484"), dedupe.seen("1775901127484"), dedupe.seen("1775901127485"), dedupe.seen("1775901127486"), dedupe.seen("1775901127484")]))')"
   assert_contains "$TEAMS_DEDUPE_OUTPUT" "[false,true,false,false,false]"
   log "exercising ms365 human-profile disclosure helper"
@@ -7113,6 +7118,25 @@ mode_after="$(stat -f '%Lp' "$MODE_ROOT/tool.sh" 2>/dev/null || stat -c '%a' "$M
 SECOND_JSON="$(python3 "$REPO_ROOT/bridge-upgrade.py" apply-live --source-root "$MODE_REPO" --target-root "$MODE_ROOT" --base-ref "$MODE_BASE")"
 assert_contains "$SECOND_JSON" "\"files_mode_synced\": 0"
 assert_contains "$SECOND_JSON" "\"files_skipped_noop\": 1"
+
+log "smart upgrade repairs non-executable tracked file mode when content already matches"
+READ_ROOT="$TMP_ROOT/upgrade-mode-read-root"
+READ_REPO="$TMP_ROOT/upgrade-mode-read-repo"
+mkdir -p "$READ_ROOT" "$READ_REPO"
+git -C "$READ_REPO" init -q
+git -C "$READ_REPO" config user.email smoke-test
+git -C "$READ_REPO" config user.name "Bridge Smoke"
+printf 'library helper\n' >"$READ_REPO/helper.txt"
+chmod 0644 "$READ_REPO/helper.txt"
+git -C "$READ_REPO" add helper.txt
+git -C "$READ_REPO" commit -qm "helper tracked 100644"
+READ_BASE="$(git -C "$READ_REPO" rev-parse HEAD)"
+cp "$READ_REPO/helper.txt" "$READ_ROOT/helper.txt"
+chmod 0600 "$READ_ROOT/helper.txt"
+READ_JSON="$(python3 "$REPO_ROOT/bridge-upgrade.py" apply-live --source-root "$READ_REPO" --target-root "$READ_ROOT" --base-ref "$READ_BASE")"
+assert_contains "$READ_JSON" "\"files_mode_synced\": 1"
+mode_read="$(stat -f '%Lp' "$READ_ROOT/helper.txt" 2>/dev/null || stat -c '%a' "$READ_ROOT/helper.txt")"
+[[ "$mode_read" == "644" ]] || die "expected helper.txt to be 644 after read-mode sync, got $mode_read"
 
 log "smart upgrade trusts git index mode over working-tree stat"
 MISMATCH_REPO="$TMP_ROOT/upgrade-mode-mismatch-repo"
