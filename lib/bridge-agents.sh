@@ -761,12 +761,46 @@ bridge_linux_grant_engine_cli_access() {
 bridge_linux_grant_bin_dir_access() {
   local os_user="$1"
   local bin_dir="$BRIDGE_HOME/bin"
+  local grant_targets=()
+  local path=""
   [[ -n "$os_user" ]] || return 0
   [[ -d "$bin_dir" ]] || return 0
-  bridge_linux_acl_add "u:${os_user}:r-x" "$bin_dir" >/dev/null 2>&1 || true
-  if [[ -e "$bin_dir/agb" ]]; then
-    bridge_linux_acl_add "u:${os_user}:r-x" "$bin_dir/agb" >/dev/null 2>&1 || true
+
+  # PR-E: v2 uses group-mode layout and intentionally avoids named-user
+  # ACLs for this surface.
+  if bridge_isolation_v2_active; then
+    return 0
   fi
+
+  grant_targets+=("$bin_dir")
+  if [[ -e "$bin_dir/agb" ]]; then
+    grant_targets+=("$bin_dir/agb")
+  fi
+
+  # The curated shim ultimately execs ${BRIDGE_HOME}/agb -> agent-bridge,
+  # which sources bridge-lib.sh and lib/*.sh before dispatching queue
+  # commands. A stale chmod/setfacl mask on any of these files makes the
+  # isolated UID fail before it reaches the socket gateway.
+  for path in \
+    "$BRIDGE_HOME/agb" \
+    "$BRIDGE_HOME/agent-bridge" \
+    "$BRIDGE_HOME/bridge-lib.sh" \
+    "$BRIDGE_HOME/bridge-queue.py" \
+    "$BRIDGE_HOME/bridge-queue-gateway.py"
+  do
+    [[ -e "$path" ]] && grant_targets+=("$path")
+  done
+
+  if [[ -d "$BRIDGE_HOME/lib" ]]; then
+    shopt -s nullglob
+    for path in "$BRIDGE_HOME/lib/"*.sh; do
+      grant_targets+=("$path")
+    done
+    shopt -u nullglob
+  fi
+
+  ((${#grant_targets[@]} > 0)) || return 0
+  bridge_linux_sudo_root setfacl -m "u:${os_user}:r-x,m::r-x" "${grant_targets[@]}" >/dev/null 2>&1 || true
 }
 
 bridge_linux_traverse_stop_for() {

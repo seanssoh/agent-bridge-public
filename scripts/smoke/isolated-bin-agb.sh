@@ -4,9 +4,10 @@
 # Validates the curated bin/agb shim that lets isolated agents call `agb`
 # bare from a Bash tool subprocess. Three assertions:
 #
-# 1. The shim auto-sources BRIDGE_AGENT_ENV_FILE before delegating, so
-#    flags emitted into the env file (BRIDGE_GATEWAY_PROXY=1, custom
-#    BRIDGE_TASK_DB, peer-id arrays, etc.) reach the resulting agb
+# 1. The shim auto-sources BRIDGE_AGENT_ENV_FILE before delegating, including
+#    the minimal helper real generated env files call while constructing the
+#    roster array. Flags emitted into the env file (BRIDGE_GATEWAY_PROXY=1,
+#    custom BRIDGE_TASK_DB, peer-id arrays, etc.) reach the resulting agb
 #    invocation even from a fresh non-login subshell.
 # 2. The shim exec's the underlying ${BRIDGE_HOME}/agb script, not some
 #    other agb on PATH.
@@ -54,6 +55,7 @@ build_fixture() {
   printf 'BRIDGE_HOME=%s\n' "\${BRIDGE_HOME:-<unset>}"
   printf 'BRIDGE_GATEWAY_PROXY=%s\n' "\${BRIDGE_GATEWAY_PROXY:-<unset>}"
   printf 'TEST_ENV_MARKER=%s\n' "\${TEST_ENV_MARKER:-<unset>}"
+  printf 'TEST_AGENT_IDS=%s\n' "\${TEST_AGENT_IDS:-<unset>}"
   printf 'STUB_AGB_PATH=%s\n' "\$0"
 } >>"$STUB_LOG"
 exit "\${STUB_EXIT_CODE:-0}"
@@ -70,6 +72,10 @@ EOF
   AGENT_ENV_FILE="$FIXTURE_HOME/agent-env.sh"
   cat >"$AGENT_ENV_FILE" <<EOF
 export BRIDGE_HOME="$FIXTURE_HOME"
+BRIDGE_AGENT_IDS=()
+bridge_add_agent_id_if_missing smoke_agent
+bridge_add_agent_id_if_missing smoke_peer
+export TEST_AGENT_IDS="\${BRIDGE_AGENT_IDS[*]}"
 export BRIDGE_GATEWAY_PROXY=1
 export BRIDGE_CONTROLLER_UID=$(id -u)
 export TEST_ENV_MARKER=isolated-bin-agb-smoke
@@ -99,6 +105,8 @@ assert_shim_sources_env_and_delegates() {
     "shim propagates BRIDGE_GATEWAY_PROXY=1 from the env file"
   smoke_assert_contains "$out" "TEST_ENV_MARKER=isolated-bin-agb-smoke" \
     "shim sources arbitrary env-file exports"
+  smoke_assert_contains "$out" "TEST_AGENT_IDS=smoke_agent smoke_peer" \
+    "shim provides the roster helper used by generated env files"
   smoke_assert_contains "$out" "STUB_AGB_PATH=$FIXTURE_HOME/agb" \
     "shim exec's the underlying \${BRIDGE_HOME}/agb (not some PATH lookup)"
 }
