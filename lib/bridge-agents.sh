@@ -714,6 +714,24 @@ bridge_linux_grant_engine_cli_access() {
   fi
 }
 
+# Grant the isolated UID r-x on the curated $BRIDGE_HOME/bin directory and
+# the agb shim inside it (issue #544 PR1). Mirrors the engine-cli grant:
+# best-effort, idempotent, and re-applied via `agent-bridge isolate <agent>
+# --reapply`. PATH injection happens in bridge_write_linux_agent_env_file.
+#
+# Out of scope: broader subcommand allowlist/denylist enforcement (issue
+# #544 PR4 design). This helper is a discovery/delivery grant only.
+bridge_linux_grant_bin_dir_access() {
+  local os_user="$1"
+  local bin_dir="$BRIDGE_HOME/bin"
+  [[ -n "$os_user" ]] || return 0
+  [[ -d "$bin_dir" ]] || return 0
+  bridge_linux_acl_add "u:${os_user}:r-x" "$bin_dir" >/dev/null 2>&1 || true
+  if [[ -e "$bin_dir/agb" ]]; then
+    bridge_linux_acl_add "u:${os_user}:r-x" "$bin_dir/agb" >/dev/null 2>&1 || true
+  fi
+}
+
 bridge_linux_traverse_stop_for() {
   # Return a safe stop_path for traversing ancestors of $target. Prefers
   # the operator's home when $target sits under it (that's the case that
@@ -2504,14 +2522,24 @@ EOF
   # would die with "command not found". Resolving on every start picks up
   # CLI upgrades automatically; the matching ACL grant lives in
   # bridge_linux_grant_engine_cli_access (one-shot at isolate time).
-  if [[ "$isolation_mode" == "linux-user" && -n "$engine" ]]; then
-    local _engine_cli _engine_dir
-    _engine_cli="$(bridge_resolve_engine_cli "$engine" 2>/dev/null || printf '')"
-    if [[ -n "$_engine_cli" ]]; then
-      _engine_dir="$(dirname "$_engine_cli")"
-      printf '\nexport PATH=%s:"${PATH:-/usr/local/bin:/usr/bin:/bin}"\n' \
-        "$(printf '%q' "$_engine_dir")" >>"$file"
+  if [[ "$isolation_mode" == "linux-user" ]]; then
+    if [[ -n "$engine" ]]; then
+      local _engine_cli _engine_dir
+      _engine_cli="$(bridge_resolve_engine_cli "$engine" 2>/dev/null || printf '')"
+      if [[ -n "$_engine_cli" ]]; then
+        _engine_dir="$(dirname "$_engine_cli")"
+        printf '\nexport PATH=%s:"${PATH:-/usr/local/bin:/usr/bin:/bin}"\n' \
+          "$(printf '%q' "$_engine_dir")" >>"$file"
+      fi
     fi
+    # Curated bridge bin dir (issue #544 PR1). Lets the isolated UID call
+    # `agb` bare from a Bash tool subprocess. Only the curated shim at
+    # ${BRIDGE_HOME}/bin/agb is exposed here — broader agent-bridge
+    # subcommand surface stays gated behind PR4's default-deny design.
+    # Matching ACL grant lives in bridge_linux_grant_bin_dir_access
+    # (one-shot at isolate time).
+    printf '\nexport PATH=%s:"${PATH:-/usr/local/bin:/usr/bin:/bin}"\n' \
+      "$(printf '%q' "$BRIDGE_HOME/bin")" >>"$file"
   fi
   chmod 600 "$file"
   # PR-E: in v2 mode, replace the named-user ACL grant pair with a
@@ -2854,6 +2882,7 @@ bridge_linux_prepare_agent_isolation() {
   done
   shopt -u nullglob
   bridge_linux_grant_engine_cli_access "$os_user" "$(bridge_agent_engine "$agent")"
+  bridge_linux_grant_bin_dir_access "$os_user"
   bridge_linux_grant_claude_credentials_access "$os_user" "$user_home" "$controller_user" "$(bridge_agent_engine "$agent")"
   bridge_linux_acl_add_recursive "u:${os_user}:r-X" "${recursive_read_paths[@]}"
   bridge_linux_acl_add_recursive "u:${os_user}:rwX" "${recursive_write_paths[@]}"
