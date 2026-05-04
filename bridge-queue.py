@@ -80,6 +80,46 @@ def queue_gateway_proxy_agent() -> str:
     return os.environ.get("BRIDGE_AGENT_ID", "").strip()
 
 
+def _running_under_queue_gateway_server() -> bool:
+    """True when this bridge-queue.py invocation is the gateway-server child.
+
+    The gateway socket-server sets BRIDGE_QUEUE_GATEWAY_SERVER=1 before
+    spawning bridge-queue.py (see run_queue() in bridge-queue-gateway.py).
+    Any direct handler that mutates a task can use this flag to demand a
+    second-line ownership check, even if the gateway authorizer was wrong
+    or future-bypassed (defense-in-depth, finding 2b r2 review).
+    """
+    return os.environ.get("BRIDGE_QUEUE_GATEWAY_SERVER", "") == "1"
+
+
+def _gateway_server_authorize(task: sqlite3.Row, actor: str, op: str) -> None:
+    """Server-side ownership re-check for cancel/update/handoff.
+
+    The gateway authorizer (bridge-queue-gateway.py:authorize_and_rewrite)
+    is the primary gate. This is a *second* gate: if the gateway parser
+    is ever wrong (e.g. the round-1 argv-rewriting bypass that misread
+    `done --note 60 12` as task 60), the server should still refuse to
+    mutate a task whose ownership the actor cannot prove.
+
+    Allow when actor is one of {assigned_to, created_by, claimed_by}.
+    Deny otherwise with a recognizable error so smoke tests / audits can
+    fingerprint the second-line refusal.
+    """
+    if not actor:
+        raise SystemExit(f"queue gateway server denied {op}: empty actor")
+    owners = {
+        str(task["assigned_to"] or ""),
+        str(task["created_by"] or ""),
+        str(task["claimed_by"] or ""),
+    }
+    owners.discard("")
+    if actor not in owners:
+        raise SystemExit(
+            f"queue gateway server denied {op}: actor {actor!r} is not an owner of "
+            f"task #{task['id']}"
+        )
+
+
 def queue_gateway_float_env(name: str, default: str) -> str:
     raw = os.environ.get(name, default).strip()
     try:
@@ -956,6 +996,10 @@ def cmd_cancel(args: argparse.Namespace) -> int:
 
     with closing(connect()) as conn, conn:
         task = require_task(conn, args.task_id)
+        if _running_under_queue_gateway_server():
+            # Defense-in-depth: even if the gateway authorizer is wrong,
+            # the server refuses to cancel a task the actor does not own.
+            _gateway_server_authorize(task, actor, "cancel")
         if task["status"] == "cancelled":
             print(f"task #{args.task_id} already cancelled")
             return 0
@@ -1002,6 +1046,10 @@ def cmd_update(args: argparse.Namespace) -> int:
 
     with closing(connect()) as conn, conn:
         task = require_task(conn, args.task_id)
+        if _running_under_queue_gateway_server():
+            # Defense-in-depth: refuse to mutate a task the actor does
+            # not own, even if the gateway authorizer was wrong.
+            _gateway_server_authorize(task, actor, "update")
         if task["status"] in ("done", "cancelled"):
             raise SystemExit(f"task #{args.task_id} is already closed (status={task['status']})")
 
@@ -1054,6 +1102,22 @@ def cmd_handoff(args: argparse.Namespace) -> int:
 
     with closing(connect()) as conn, conn:
         task = require_task(conn, args.task_id)
+        if _running_under_queue_gateway_server():
+            # Defense-in-depth: refuse to hand off a task the actor does
+            # not own. The gateway only allows assigned_to/claimed_by to
+            # hand off; this re-check accepts created_by too because the
+            # task creator can also redirect their own work — narrower
+            # than the gateway's policy is fine, broader is not.
+            owners = {
+                str(task["assigned_to"] or ""),
+                str(task["claimed_by"] or ""),
+            }
+            owners.discard("")
+            if actor not in owners:
+                raise SystemExit(
+                    f"queue gateway server denied handoff: actor {actor!r} is not "
+                    f"the assignee or claimer of task #{task['id']}"
+                )
         if task["status"] in ("done", "cancelled"):
             raise SystemExit(f"task #{args.task_id} is already closed (status={task['status']})")
 

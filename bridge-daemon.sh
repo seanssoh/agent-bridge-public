@@ -4159,10 +4159,56 @@ bridge_queue_gateway_socket_pid() {
 }
 
 bridge_queue_gateway_socket_is_running() {
+  # Joint liveness: pid alive AND socket exists. `kill -0 $pid` alone is
+  # unreliable on its own (pid recycling can map a stale pid to an
+  # unrelated process). Requiring the socket file to exist alongside the
+  # pid catches both halves of the typical failure modes:
+  #   * pid file present but listener crashed before socket was created
+  #     → socket missing, return 1 + caller cleans up.
+  #   * pid file present but pid was recycled to an unrelated process
+  #     → socket missing (the unrelated process did not bind it), return 1.
+  # The caller (start/stop/status) is then expected to remove stale
+  # artifacts before its decision becomes idempotent — see
+  # bridge_queue_gateway_socket_clean_stale.
   local pid
+  local socket_path
   pid="$(bridge_queue_gateway_socket_pid 2>/dev/null || true)"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  kill -0 "$pid" 2>/dev/null
+  kill -0 "$pid" 2>/dev/null || return 1
+  socket_path="$(bridge_queue_gateway_socket_path 2>/dev/null || true)"
+  [[ -n "$socket_path" && -S "$socket_path" ]] || return 1
+  return 0
+}
+
+bridge_queue_gateway_socket_clean_stale() {
+  # Idempotent stale-state sweep. Removes the pid file when the listener
+  # process is gone, and removes the socket file when no listener owns
+  # the recorded pid. Safe to call from start (before deciding to spawn)
+  # and stop (before claiming success).
+  local pid_file
+  local socket_path
+  local pid
+
+  pid_file="$(bridge_queue_gateway_socket_pid_file)"
+  socket_path="$(bridge_queue_gateway_socket_path 2>/dev/null || true)"
+  pid="$(bridge_queue_gateway_socket_pid 2>/dev/null || true)"
+
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    if ! kill -0 "$pid" 2>/dev/null; then
+      # Process is gone but pid file lingers → drop it. Also remove the
+      # socket because nothing is listening on it; leaving it would
+      # confuse the next start (`refuse non-socket` path).
+      rm -f "$pid_file"
+      if [[ -n "$socket_path" && -S "$socket_path" ]]; then
+        rm -f "$socket_path"
+      fi
+    fi
+  else
+    # No pid recorded but a stale socket may exist from a previous run.
+    if [[ -n "$socket_path" && -S "$socket_path" ]]; then
+      rm -f "$socket_path"
+    fi
+  fi
 }
 
 bridge_start_queue_gateway_socket_listener() {
@@ -4183,6 +4229,22 @@ bridge_start_queue_gateway_socket_listener() {
       && ! bridge_queue_gateway_agent_socket_transport_configured; then
     return 0
   fi
+  # Linux-only fail-closed: SO_PEERCRED is the only credential mechanism
+  # the gateway implements. On macOS / BSD the listener would start but
+  # silently fail every peer-auth check, so refuse to start. The Python
+  # listener has the same gate (bridge-queue-gateway.py:_socket_transport_supported)
+  # — duplicating it here keeps the startup log explicit instead of
+  # surfacing as a Python SystemExit several lines down.
+  if [[ "$(bridge_host_platform 2>/dev/null || printf '')" != "Linux" ]]; then
+    if [[ "$mode" == "on" || "$transport" == "socket" ]]; then
+      daemon_warn "queue gateway socket transport requires Linux; use BRIDGE_GATEWAY_TRANSPORT=file on this platform"
+      return 1
+    fi
+    return 0
+  fi
+  # Sweep stale pid/socket pairs left by a prior crash so the joint
+  # liveness check below makes the right decision.
+  bridge_queue_gateway_socket_clean_stale
   if bridge_queue_gateway_socket_is_running; then
     return 0
   fi
@@ -4233,6 +4295,11 @@ bridge_start_queue_gateway_socket_listener() {
 }
 
 bridge_stop_queue_gateway_socket_listener() {
+  # Joint pid+socket validation: only signal the recorded pid when the
+  # socket file ALSO exists. This avoids killing an unrelated recycled
+  # pid when the listener is actually long-dead and only the pid file
+  # lingered. After signaling (or skipping), unconditionally clear both
+  # artifacts so the next start is idempotent.
   local pid_file
   local socket_path
   local pid
@@ -4241,7 +4308,8 @@ bridge_stop_queue_gateway_socket_listener() {
   pid_file="$(bridge_queue_gateway_socket_pid_file)"
   socket_path="$(bridge_queue_gateway_socket_path 2>/dev/null || true)"
   pid="$(bridge_queue_gateway_socket_pid 2>/dev/null || true)"
-  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null \
+      && [[ -n "$socket_path" && -S "$socket_path" ]]; then
     kill "$pid" 2>/dev/null || true
     wait "$pid" >/dev/null 2>&1 || true
     for ((i = 0; i < 30; i++)); do

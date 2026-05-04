@@ -4,6 +4,19 @@
 The legacy transport is file-backed and remains the default.  The socket
 transport is opt-in via BRIDGE_GATEWAY_TRANSPORT=socket and is served by the
 bridge daemon over a Unix domain SOCK_SEQPACKET socket.
+
+Platform contract — socket transport is Linux-only and fail-closed:
+  * Peer authentication relies on SO_PEERCRED, which is Linux-only.  macOS /
+    BSD provide LOCAL_PEERCRED / getpeereid with different semantics; we do
+    NOT attempt cross-platform peer auth here.  Both the listener and the
+    socket-client refuse to start on non-Linux hosts so credential checks
+    cannot silently pass.  Operators on non-Linux hosts must use the file
+    transport (BRIDGE_GATEWAY_TRANSPORT=file, the default).
+  * Socket transport is also a Linux-system-mode install: the runtime root
+    (/run/agent-bridge by default) is owned by root, provisioned via
+    tmpfiles.d, and managed by the bridge daemon.  Non-root operators
+    running socket transport in live mode are not supported — verification
+    will fail because the tmpfiles entry expects root ownership.
 """
 
 from __future__ import annotations
@@ -33,6 +46,21 @@ LIVE_GATEWAY_RUNTIME_ROOT = "/run/agent-bridge"
 SOCKET_NAME = "queue-gateway.sock"
 MAX_SOCKET_BYTES = 2 * 1024 * 1024
 SOCKET_TIMEOUT_SECONDS = 5.0
+SOCKET_LINUX_ONLY_MESSAGE = (
+    "queue gateway socket transport requires Linux (SO_PEERCRED); "
+    "use BRIDGE_GATEWAY_TRANSPORT=file on this platform"
+)
+
+
+def _socket_transport_supported() -> bool:
+    """Linux-only fail-closed gate for the socket transport.
+
+    SO_PEERCRED is the only credential mechanism this gateway implements;
+    it is Linux-specific.  Returning False on any other platform forces
+    callers to either fall back to the file transport or fail with a
+    recognizable error rather than silently bypass peer auth.
+    """
+    return sys.platform.startswith("linux") and hasattr(socket, "SO_PEERCRED")
 
 
 def now_iso() -> str:
@@ -293,11 +321,38 @@ def _conf_paths(home: str) -> tuple[Path, Path]:
 
 
 def _conf_contents(home: str) -> tuple[str, str]:
+    """Render the tmpfiles.d config pair for the runtime root + instance.
+
+    Live mode (gateway_runtime_root() == /run/agent-bridge) is the
+    supported deployment: the parent is owned by root, provisioned by
+    systemd-tmpfiles, and the bridge daemon runs the listener under the
+    controller uid. Verification (verify_runtime_layout) requires
+    parent_uid == 0 in this mode, so the tmpfiles emit must match.
+
+    Smoke / dev mode (BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT pointed at a
+    user-writable path) is the test-only path. systemd-tmpfiles is NOT
+    invoked here; _apply_tmpfiles_shim chmod/chown the dirs as the
+    current uid. Emit a config that matches what the shim actually does
+    so the file is internally consistent — this keeps the contradiction
+    (finding 6, r2 review) from re-surfacing if the smoke fixture is
+    ever copied to a real /etc/tmpfiles.d.
+    """
     root = gateway_runtime_root()
     inst = gateway_instance_dir(home)
     user = _user_name(os.getuid())
     group = _group_name(os.getgid())
-    parent = f"d {root} 0755 root root -\n"
+    if str(root) == LIVE_GATEWAY_RUNTIME_ROOT:
+        # Live mode: parent must be root-owned (verification enforces this).
+        # Non-root operators choosing socket transport in live mode is
+        # explicitly unsupported; the verify path will fail loudly.
+        parent_user = "root"
+        parent_group = "root"
+    else:
+        # Smoke / dev mode: the shim cannot chown to root unless euid==0,
+        # so the tmpfiles content tracks the actual on-disk state.
+        parent_user = user
+        parent_group = group
+    parent = f"d {root} 0755 {parent_user} {parent_group} -\n"
     child = f"d {inst} 0711 {user} {group} -\n"
     return parent, child
 
@@ -416,6 +471,32 @@ def _send_json(conn: socket.socket, payload: dict[str, Any]) -> None:
             ensure_ascii=False,
         ).encode("utf-8")
     conn.sendall(data)
+
+
+def _safe_send_json(conn: socket.socket, payload: dict[str, Any]) -> None:
+    """Send a JSON response, swallowing peer-disconnect errors.
+
+    Peers can vanish between accept() and the response (Ctrl-C, crash,
+    request timeout, partial-frame followed by close). _send_json() will
+    raise OSError / BrokenPipeError / ConnectionResetError in that case,
+    and the listener used to bubble it up — re-entering an error path
+    that itself called _send_json() would compound the failure and could
+    kill the accept loop. Treat any send failure as terminal-for-this-
+    peer only, log it once, and keep serving.
+    """
+    try:
+        _send_json(conn, payload)
+    except OSError as exc:
+        request_id = str(payload.get("id") or "-")
+        try:
+            print(
+                f"queue_gateway send_failed peer_gone={type(exc).__name__} "
+                f"request_id={request_id}",
+                file=sys.stderr,
+                flush=True,
+            )
+        except OSError:
+            pass
 
 
 def _recv_json(conn: socket.socket) -> dict[str, Any]:
@@ -556,9 +637,80 @@ def _has_file_arg(argv: list[str]) -> bool:
     return False
 
 
-def _task_id(argv: list[str]) -> int | None:
+# Per-subcommand option tables for the strict task-id walker (finding 2a,
+# r2 review). The earlier _task_id() walked the argv looking for the first
+# non-option token, which let an option *value* be misread as the
+# positional task id. Example: `done --note 60 12 --agent forged` would
+# extract 60 (the value of --note) for authorization while the real
+# bridge-queue.py invocation operated on task 12.
+#
+# Each entry below names which long flags accept a value (and therefore
+# consume the following token) for the named subcommand. Boolean flags do
+# not appear here. Both `--flag value` and `--flag=value` forms must be
+# tolerated. argparse-style abbreviations are NOT honored here — the
+# gateway only forwards full flag names that the bridge-queue.py parser
+# accepts, so an unknown `--<flag>` is treated as a *value-less* flag (it
+# will fail downstream, but cannot smuggle a value into the positional
+# slot).
+#
+# This table must stay in sync with bridge-queue.py's per-subcommand
+# argparse definitions for `claim`, `done`, `cancel`, `update`, `handoff`,
+# and `show`. The `--body-file` / `--note-file` flags are intentionally
+# rejected before this walker runs (see _has_file_arg), so they are listed
+# here only to keep the walker honest if the file-arg gate is ever
+# loosened.
+_VALUE_FLAGS_BY_SUBCMD: dict[str, frozenset[str]] = {
+    "claim": frozenset({"--agent", "--lease-seconds"}),
+    "done": frozenset({"--agent", "--note", "--note-file"}),
+    "cancel": frozenset({"--actor", "--note", "--note-file"}),
+    "update": frozenset({
+        "--actor",
+        "--title",
+        "--status",
+        "--priority",
+        "--note",
+        "--body",
+        "--body-file",
+    }),
+    "handoff": frozenset({"--from", "--to", "--note", "--note-file"}),
+    "show": frozenset({"--format"}),
+}
+
+
+def _extract_positional_task_id(argv: list[str]) -> int | None:
+    """Return the parsed positional task id for the given subcommand argv.
+
+    Walks the argv with knowledge of which flags consume the next token,
+    so `done --note 60 12` returns 12, not 60. Returns None when:
+      * the argv has no recognizable subcommand (caller should reject);
+      * the first bare positional is not an integer;
+      * the argv contains no bare positional.
+    """
+    if not argv:
+        return None
+    subcmd = argv[0]
+    value_flags = _VALUE_FLAGS_BY_SUBCMD.get(subcmd, frozenset())
+    skip_next = False
     for token in argv[1:]:
-        if token.startswith("-"):
+        if skip_next:
+            skip_next = False
+            continue
+        if token == "--":
+            # Conservative: the queue parser does not use `--`, so treat a
+            # bare `--` as no-positional rather than guessing.
+            return None
+        if token.startswith("--"):
+            if "=" in token:
+                # `--flag=value` self-contains the value; the next token
+                # is still positional.
+                continue
+            if token in value_flags:
+                skip_next = True
+            continue
+        if token.startswith("-") and len(token) > 1:
+            # Short options are not used by bridge-queue subcommands the
+            # gateway forwards. Skip without consuming a value to avoid
+            # accidentally swallowing a real positional.
             continue
         try:
             return int(token)
@@ -581,7 +733,7 @@ def authorize_and_rewrite(home: str, peer_agent: str, argv: list[str]) -> tuple[
     if subcmd in {"inbox", "find-open", "claim", "done"}:
         rewritten = _set_option(argv, "--agent", peer_agent)
         if subcmd in {"claim", "done"}:
-            task_id = _task_id(argv)
+            task_id = _extract_positional_task_id(argv)
             if task_id is None:
                 return False, "task_id_required", argv
             row = _task_row(home, task_id)
@@ -597,7 +749,7 @@ def authorize_and_rewrite(home: str, peer_agent: str, argv: list[str]) -> tuple[
     if subcmd == "summary":
         return True, "ok", _set_option(argv, "--agent", peer_agent)
     if subcmd == "show":
-        task_id = _task_id(argv)
+        task_id = _extract_positional_task_id(argv)
         if task_id is None:
             return False, "task_id_required", argv
         row = _task_row(home, task_id)
@@ -607,7 +759,7 @@ def authorize_and_rewrite(home: str, peer_agent: str, argv: list[str]) -> tuple[
             return False, "show_not_visible", argv
         return True, "ok", argv
     if subcmd in {"cancel", "update"}:
-        task_id = _task_id(argv)
+        task_id = _extract_positional_task_id(argv)
         if task_id is None:
             return False, "task_id_required", argv
         row = _task_row(home, task_id)
@@ -617,7 +769,7 @@ def authorize_and_rewrite(home: str, peer_agent: str, argv: list[str]) -> tuple[
             return False, f"{subcmd}_not_owner", argv
         return True, "ok", _set_option(argv, "--actor", peer_agent)
     if subcmd == "handoff":
-        task_id = _task_id(argv)
+        task_id = _extract_positional_task_id(argv)
         if task_id is None:
             return False, "task_id_required", argv
         row = _task_row(home, task_id)
@@ -665,29 +817,29 @@ def _handle_socket_request(
         cwd = str(request.get("cwd") or os.getcwd())
         if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
             gateway_log(subcmd, peer_uid, peer_agent, "deny", "invalid_argv", request_id)
-            _send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
+            _safe_send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
             return
         subcmd = argv[0] if argv else "-"
         if not peer_agent:
             gateway_log(subcmd, peer_uid, peer_agent, "deny", "unknown_peer", request_id)
-            _send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
+            _safe_send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
             return
         ok, reason, rewritten = authorize_and_rewrite(home, peer_agent, argv)
         if not ok:
             gateway_log(subcmd, peer_uid, peer_agent, "deny", reason, request_id)
-            _send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
+            _safe_send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
             return
         gateway_log(subcmd, peer_uid, peer_agent, "allow", reason, request_id)
         response = {"id": request_id}
         response.update(run_queue(queue_script, rewritten, cwd))
-        _send_json(conn, response)
+        _safe_send_json(conn, response)
     except ValueError as exc:
         reason = "oversize" if str(exc) == "oversize" else "invalid_payload"
         gateway_log(subcmd, peer_uid, peer_agent, "deny", reason, request_id)
-        _send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
+        _safe_send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
     except Exception:
         gateway_log(subcmd, peer_uid, peer_agent, "deny", "exception", request_id)
-        _send_json(conn, {"id": request_id, "exit_code": 1, "stdout": "", "stderr": "queue gateway error\n"})
+        _safe_send_json(conn, {"id": request_id, "exit_code": 1, "stdout": "", "stderr": "queue gateway error\n"})
 
 
 def _socket_type() -> int:
@@ -698,6 +850,12 @@ def _socket_type() -> int:
 
 
 def cmd_socket_client(args: argparse.Namespace) -> int:
+    if not _socket_transport_supported():
+        # Fail-closed on non-Linux: peer auth on the listener side cannot
+        # work, so refuse here too. Operators must select the file
+        # transport (BRIDGE_GATEWAY_TRANSPORT=file) on this platform.
+        print(f"queue gateway socket unavailable: {SOCKET_LINUX_ONLY_MESSAGE}", file=sys.stderr)
+        return 1
     home = bridge_home(args.bridge_home)
     path = gateway_socket_path(home)
     request_id = f"{int(time.time() * 1000)}-{os.getpid()}-{secrets.token_hex(6)}"
@@ -734,6 +892,11 @@ def cmd_socket_client(args: argparse.Namespace) -> int:
 
 
 def cmd_socket_server(args: argparse.Namespace) -> int:
+    if not _socket_transport_supported():
+        # Fail-closed on non-Linux: SO_PEERCRED is the only credential
+        # mechanism implemented here. Refuse to start so credential
+        # checks cannot silently bypass.
+        raise SystemExit(SOCKET_LINUX_ONLY_MESSAGE)
     home = bridge_home(args.bridge_home)
     if not ensure_runtime_layout(home, strict=True):
         return 1
@@ -786,9 +949,29 @@ def cmd_socket_server(args: argparse.Namespace) -> int:
                 if running:
                     raise
                 break
-            with conn:
-                conn.settimeout(SOCKET_TIMEOUT_SECONDS)
-                _handle_socket_request(conn, queue_script, home, peer_map, queue_script.resolve().parent)
+            # Per-peer scope: a single bad peer (oversize frame, partial
+            # frame followed by close, broken pipe on response) MUST NOT
+            # kill the accept loop. _handle_socket_request swallows its
+            # own send failures via _safe_send_json; this outer guard
+            # catches anything else (peer disconnect raised inside
+            # _recv_json, an unexpected exception in authorize_and_rewrite,
+            # etc.) so the listener stays up. The `with conn:` context
+            # ensures the fd is closed even on exception.
+            try:
+                with conn:
+                    conn.settimeout(SOCKET_TIMEOUT_SECONDS)
+                    _handle_socket_request(
+                        conn, queue_script, home, peer_map, queue_script.resolve().parent
+                    )
+            except Exception as exc:  # noqa: BLE001 — listener survival > propagation
+                try:
+                    print(
+                        f"queue_gateway handler_error type={type(exc).__name__}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except OSError:
+                    pass
     cleanup()
     return 0
 

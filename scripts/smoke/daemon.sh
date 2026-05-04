@@ -689,6 +689,77 @@ EOF
   [[ ! -S "$socket_path" ]] || smoke_fail "daemon exit should remove queue socket"
 }
 
+# r2 finding 4: daemon listener lifecycle joint pid+socket validation.
+# A stale pid file (process gone, no socket) plus a stale socket file
+# (no owning pid) must both be cleaned up before the next start, so the
+# `is_running` decision is honest and `stop` does not signal an
+# unrelated recycled pid. This test simulates both halves and asserts
+# that bridge_queue_gateway_socket_is_running returns false and that
+# bridge_queue_gateway_socket_clean_stale removes the leftover artifacts.
+daemon_socket_listener_stale_recovery() {
+  local pid_file socket_path stale_pid bridge_id helper helper_out
+
+  : "${BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT:=$SMOKE_TMP_ROOT/daemon-socket-runtime}"
+  export BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT
+  bridge_id="$(python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" print-runtime-id --bridge-home "$BRIDGE_HOME")"
+  pid_file="$BRIDGE_STATE_DIR/queue-gateway-socket.pid"
+  socket_path="$BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT/$bridge_id/queue-gateway.sock"
+  mkdir -p "$BRIDGE_STATE_DIR" "$(dirname "$socket_path")"
+
+  # Definitely-dead pid: fork a process that exits immediately, then wait.
+  ( exec true ) &
+  stale_pid="$!"
+  wait "$stale_pid" >/dev/null 2>&1 || true
+  printf '%s\n' "$stale_pid" >"$pid_file"
+
+  # Real bound socket file, then close it (file remains on disk until cleanup).
+  python3 - "$socket_path" <<'PY' >/dev/null
+import os, socket, sys
+p = sys.argv[1]
+try:
+    os.unlink(p)
+except FileNotFoundError:
+    pass
+s = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+s.bind(p)
+s.close()
+PY
+  [[ -S "$socket_path" ]] || smoke_fail "stale-recovery: pre-condition — bound socket should exist on disk"
+
+  # Drive the helpers via an extracted-functions helper script. This
+  # avoids sourcing the whole bridge-daemon.sh (which has top-level
+  # command parsing) — we just pull the four functions we need.
+  helper="$SMOKE_TMP_ROOT/stale-recovery-driver.sh"
+  {
+    printf '#!/usr/bin/env bash\nset -euo pipefail\nPID_FILE="$1"\nSOCKET_PATH="$2"\n'
+    awk '/^bridge_queue_gateway_socket_pid_file\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    awk '/^bridge_queue_gateway_socket_pid\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    awk '/^bridge_queue_gateway_socket_is_running\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    awk '/^bridge_queue_gateway_socket_clean_stale\(\) \{/,/^}$/' "$SMOKE_REPO_ROOT/bridge-daemon.sh"
+    cat <<'BASH'
+bridge_queue_gateway_socket_pid_file() { printf "%s" "$PID_FILE"; }
+bridge_queue_gateway_socket_path() { printf "%s" "$SOCKET_PATH"; }
+if bridge_queue_gateway_socket_is_running; then
+  echo "running-before-clean"
+  exit 1
+fi
+bridge_queue_gateway_socket_clean_stale
+if [[ -f "$PID_FILE" ]]; then
+  echo "pid file not removed"
+  exit 1
+fi
+if [[ -e "$SOCKET_PATH" ]]; then
+  echo "socket not removed"
+  exit 1
+fi
+echo "ok"
+BASH
+  } >"$helper"
+  chmod +x "$helper"
+  helper_out="$(bash "$helper" "$pid_file" "$socket_path" 2>&1 || true)"
+  smoke_assert_contains "$helper_out" "ok" "stale-recovery: clean_stale removes pid+socket when listener is gone"
+}
+
 main() {
   smoke_require_cmd awk
   smoke_require_cmd python3
@@ -701,7 +772,15 @@ main() {
   smoke_run "idle marker permission guard" daemon_idle_marker_permission_guard
   smoke_run "source state file guard" daemon_source_state_file_guard
   smoke_run "acl default inheritance" daemon_acl_default_inheritance
-  smoke_run "queue gateway socket listener lifecycle" daemon_socket_listener_contract
+  # Socket listener is Linux-only fail-closed (SO_PEERCRED). Skip on
+  # non-Linux so the daemon smoke stays green on operator workstations.
+  if smoke_is_linux; then
+    smoke_run "queue gateway socket listener lifecycle" daemon_socket_listener_contract
+    smoke_run "queue gateway socket listener stale recovery" daemon_socket_listener_stale_recovery
+  else
+    smoke_skip "queue gateway socket listener lifecycle" "non-Linux"
+    smoke_skip "queue gateway socket listener stale recovery" "non-Linux"
+  fi
   smoke_log "passed"
 }
 

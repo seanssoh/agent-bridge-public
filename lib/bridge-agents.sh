@@ -2597,6 +2597,29 @@ export BRIDGE_GATEWAY_PROXY
 BRIDGE_CONTROLLER_UID=$(printf '%q' "$_controller_uid")
 export BRIDGE_CONTROLLER_UID
 EOF
+    # Propagate non-default queue-gateway env to the isolated agent
+    # (finding 7, r2 review). Without this, an isolated agent inherits
+    # the hard-coded /run/agent-bridge default for the runtime root and
+    # cannot find the daemon's socket when the operator has overridden
+    # BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT (smoke tests, multi-instance
+    # installs, alt-mount runtimes). Same for the socket timeout and
+    # the transport selection. We only emit overrides when they differ
+    # from the bridge-lib.sh defaults so the env file stays minimal.
+    if [[ -n "${BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT:-}" \
+          && "${BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT}" != "/run/agent-bridge" ]]; then
+      printf 'BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT=%s\nexport BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT\n' \
+        "$(printf '%q' "$BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT")" >>"$file"
+    fi
+    if [[ -n "${BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS:-}" \
+          && "${BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS}" != "5" ]]; then
+      printf 'BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS=%s\nexport BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS\n' \
+        "$(printf '%q' "$BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS")" >>"$file"
+    fi
+    if [[ -n "${BRIDGE_GATEWAY_TRANSPORT:-}" \
+          && "${BRIDGE_GATEWAY_TRANSPORT}" != "file" ]]; then
+      printf 'BRIDGE_GATEWAY_TRANSPORT=%s\nexport BRIDGE_GATEWAY_TRANSPORT\n' \
+        "$(printf '%q' "$BRIDGE_GATEWAY_TRANSPORT")" >>"$file"
+    fi
   fi
   # Inject engine CLI directory into PATH for sudo-wrapped launchers when
   # isolation is active. Under sudo, PATH falls back to secure_path which
