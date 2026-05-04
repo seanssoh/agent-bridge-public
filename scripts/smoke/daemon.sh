@@ -31,6 +31,10 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib.sh"
 
 cleanup() {
+  if [[ -n "${DAEMON_SOCKET_PID:-}" ]]; then
+    kill "$DAEMON_SOCKET_PID" >/dev/null 2>&1 || true
+    wait "$DAEMON_SOCKET_PID" >/dev/null 2>&1 || true
+  fi
   smoke_cleanup_temp_root
 }
 trap cleanup EXIT
@@ -629,6 +633,62 @@ daemon_acl_default_inheritance() {
   smoke_log "ok: acl default inheritance positive+negative confirmed (controller=$controller_user, isolated=$isolated_user)"
 }
 
+daemon_socket_listener_contract() {
+  local bridge_id socket_path daemon_log create_out task_id show_out i
+
+  export BRIDGE_GATEWAY_TRANSPORT=file
+  export BRIDGE_GATEWAY_LISTENER=auto
+  export BRIDGE_AGENT_ID=""
+  export BRIDGE_AGENT_ENV_FILE=""
+  export BRIDGE_QUEUE_GATEWAY_PEERS="$(id -u):worker-a"
+  export BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT="$SMOKE_TMP_ROOT/daemon-socket-runtime"
+  export BRIDGE_TMPFILES_DIR="$SMOKE_TMP_ROOT/tmpfiles.d"
+  export BRIDGE_TMPFILES_DRIVER=shim
+  export BRIDGE_QUEUE_GATEWAY_SOCKET_START_WAIT_SECONDS=2
+  export BRIDGE_DAEMON_INTERVAL=60
+
+  bridge_id="$(python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" print-runtime-id --bridge-home "$BRIDGE_HOME")"
+  socket_path="$BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT/$bridge_id/queue-gateway.sock"
+  daemon_log="$SMOKE_TMP_ROOT/daemon-run.log"
+  cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
+bridge_add_agent_id_if_missing "worker-a"
+BRIDGE_AGENT_ENGINE["worker-a"]="claude"
+BRIDGE_AGENT_SESSION["worker-a"]="worker-a"
+BRIDGE_AGENT_WORKDIR["worker-a"]="$SMOKE_TMP_ROOT/worker-a"
+BRIDGE_AGENT_LAUNCH_CMD["worker-a"]="BRIDGE_GATEWAY_TRANSPORT=socket claude"
+BRIDGE_AGENT_ISOLATION_MODE["worker-a"]="linux-user"
+BRIDGE_AGENT_OS_USER["worker-a"]="agent-bridge-worker-a"
+EOF
+  mkdir -p "$SMOKE_TMP_ROOT/worker-a"
+  bash "$SMOKE_REPO_ROOT/bridge-daemon.sh" run >"$daemon_log" 2>&1 &
+  DAEMON_SOCKET_PID="$!"
+
+  for ((i = 0; i < 50; i++)); do
+    if [[ -S "$socket_path" ]] && kill -0 "$DAEMON_SOCKET_PID" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  [[ -S "$socket_path" ]] || smoke_fail "daemon did not start queue socket listener; log=$(cat "$daemon_log" 2>/dev/null || true)"
+
+  create_out="$(
+    BRIDGE_GATEWAY_PROXY=1 BRIDGE_AGENT_ID=worker-a BRIDGE_GATEWAY_TRANSPORT=socket python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a \
+      --from forged \
+      --title "daemon socket listener smoke" \
+      --body "daemon socket body" \
+      --format shell
+  )"
+  task_id="$(smoke_shell_field TASK_ID "$create_out")"
+  show_out="$(BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" show "$task_id" --format shell)"
+  smoke_assert_contains "$show_out" "TASK_CREATED_BY=worker-a" "daemon socket listener proxies as peer"
+
+  kill "$DAEMON_SOCKET_PID" >/dev/null 2>&1 || true
+  wait "$DAEMON_SOCKET_PID" >/dev/null 2>&1 || true
+  DAEMON_SOCKET_PID=""
+  [[ ! -S "$socket_path" ]] || smoke_fail "daemon exit should remove queue socket"
+}
+
 main() {
   smoke_require_cmd awk
   smoke_require_cmd python3
@@ -641,6 +701,7 @@ main() {
   smoke_run "idle marker permission guard" daemon_idle_marker_permission_guard
   smoke_run "source state file guard" daemon_source_state_file_guard
   smoke_run "acl default inheritance" daemon_acl_default_inheritance
+  smoke_run "queue gateway socket listener lifecycle" daemon_socket_listener_contract
   smoke_log "passed"
 }
 

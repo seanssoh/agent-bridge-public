@@ -142,6 +142,8 @@ _bridge_daemon_on_exit() {
   fi
   _BRIDGE_DAEMON_EXIT_LOGGED=1
 
+  bridge_stop_queue_gateway_socket_listener >/dev/null 2>&1 || true
+
   ts="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || echo unknown)"
   mkdir -p "$BRIDGE_STATE_DIR" 2>/dev/null || true
   printf '[%s] [info] daemon exit pid=%d ec=%d sig=%s last_step=%s err_location=%s\n' \
@@ -4101,6 +4103,163 @@ process_queue_gateway_requests() {
   return 1
 }
 
+bridge_queue_gateway_socket_pid_file() {
+  printf '%s/queue-gateway-socket.pid' "$BRIDGE_STATE_DIR"
+}
+
+bridge_queue_gateway_socket_log_file() {
+  printf '%s/queue-gateway-socket.log' "$BRIDGE_STATE_DIR"
+}
+
+bridge_queue_gateway_listener_mode() {
+  local mode="${BRIDGE_GATEWAY_LISTENER:-auto}"
+  case "$mode" in
+    auto|on|off)
+      printf '%s' "$mode"
+      ;;
+    *)
+      daemon_warn "invalid BRIDGE_GATEWAY_LISTENER=$mode; falling back to auto"
+      printf '%s' "auto"
+      ;;
+  esac
+}
+
+bridge_queue_gateway_listener_requested() {
+  local mode
+  local transport
+
+  mode="$(bridge_queue_gateway_listener_mode)"
+  [[ "$mode" == "off" ]] && return 1
+  [[ "$mode" == "on" ]] && return 0
+  transport="$(bridge_queue_gateway_transport)"
+  [[ "$transport" == "socket" ]] && return 0
+  bridge_queue_gateway_agent_socket_transport_configured
+}
+
+bridge_queue_gateway_agent_socket_transport_configured() {
+  local agent
+  local launch_cmd
+
+  for agent in "${BRIDGE_AGENT_IDS[@]:-}"; do
+    launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+    case "$launch_cmd" in
+      *BRIDGE_GATEWAY_TRANSPORT=socket*)
+        return 0
+        ;;
+    esac
+  done
+  return 1
+}
+
+bridge_queue_gateway_socket_pid() {
+  local pid_file
+  pid_file="$(bridge_queue_gateway_socket_pid_file)"
+  [[ -f "$pid_file" ]] || return 1
+  sed -n '1p' "$pid_file"
+}
+
+bridge_queue_gateway_socket_is_running() {
+  local pid
+  pid="$(bridge_queue_gateway_socket_pid 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null
+}
+
+bridge_start_queue_gateway_socket_listener() {
+  local mode
+  local transport
+  local pid_file
+  local log_file
+  local socket_path
+  local pid
+  local wait_seconds
+  local attempts
+  local i
+
+  mode="$(bridge_queue_gateway_listener_mode)"
+  [[ "$mode" == "off" ]] && return 0
+  transport="$(bridge_queue_gateway_transport)"
+  if [[ "$mode" == "auto" && "$transport" != "socket" ]] \
+      && ! bridge_queue_gateway_agent_socket_transport_configured; then
+    return 0
+  fi
+  if bridge_queue_gateway_socket_is_running; then
+    return 0
+  fi
+
+  if ! bridge_queue_gateway_runtime_ensure --strict >/dev/null 2>&1; then
+    daemon_warn "queue gateway socket runtime is not ready"
+    if [[ "$mode" == "on" || "$transport" == "socket" ]]; then
+      return 1
+    fi
+    return 0
+  fi
+
+  mkdir -p "$BRIDGE_STATE_DIR"
+  pid_file="$(bridge_queue_gateway_socket_pid_file)"
+  log_file="$(bridge_queue_gateway_socket_log_file)"
+  socket_path="$(bridge_queue_gateway_socket_path)"
+
+  BRIDGE_QUEUE_GATEWAY_SERVER=1 python3 "$SCRIPT_DIR/bridge-queue-gateway.py" socket-server \
+    --bridge-home "$BRIDGE_HOME" \
+    --queue-script "$SCRIPT_DIR/bridge-queue.py" >>"$log_file" 2>&1 &
+  pid="$!"
+  printf '%s\n' "$pid" >"$pid_file"
+
+  wait_seconds="${BRIDGE_QUEUE_GATEWAY_SOCKET_START_WAIT_SECONDS:-3}"
+  [[ "$wait_seconds" =~ ^[0-9]+$ ]] || wait_seconds=3
+  attempts=$(( wait_seconds * 10 ))
+  (( attempts > 0 )) || attempts=1
+  for ((i = 0; i < attempts; i++)); do
+    if [[ -S "$socket_path" ]] && kill -0 "$pid" 2>/dev/null; then
+      bridge_audit_log daemon queue_gateway_socket_started daemon \
+        --detail pid="$pid" \
+        --detail socket="$socket_path" >/dev/null 2>&1 || true
+      daemon_info "queue gateway socket listener started (pid=$pid socket=$socket_path)"
+      return 0
+    fi
+    sleep 0.1
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pid_file"
+  daemon_warn "queue gateway socket listener failed to start"
+  if [[ "$mode" == "on" || "$transport" == "socket" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+bridge_stop_queue_gateway_socket_listener() {
+  local pid_file
+  local socket_path
+  local pid
+  local i
+
+  pid_file="$(bridge_queue_gateway_socket_pid_file)"
+  socket_path="$(bridge_queue_gateway_socket_path 2>/dev/null || true)"
+  pid="$(bridge_queue_gateway_socket_pid 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" >/dev/null 2>&1 || true
+    for ((i = 0; i < 30; i++)); do
+      kill -0 "$pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    bridge_audit_log daemon queue_gateway_socket_stopped daemon \
+      --detail pid="$pid" >/dev/null 2>&1 || true
+  fi
+  rm -f "$pid_file"
+  if [[ -n "$socket_path" && -S "$socket_path" ]]; then
+    rm -f "$socket_path"
+  fi
+}
+
 cmd_sync_cycle() {
   local snapshot_file
   local ready_agents_file
@@ -4417,6 +4576,9 @@ cmd_run() {
 
   BRIDGE_DAEMON_LAST_STEP="startup"
   echo "$$" >"$BRIDGE_DAEMON_PID_FILE"
+  BRIDGE_DAEMON_LAST_STEP="queue_gateway_socket_listener"
+  bridge_start_queue_gateway_socket_listener
+  BRIDGE_DAEMON_LAST_STEP="startup"
 
   # Issue #265: emit a periodic audit `daemon_tick` so external monitoring
   # (and bridge-supervisor) can detect a hung main loop. Without this, a
@@ -4525,6 +4687,7 @@ cmd_stop() {
   # Stop the silence watchdog *before* killing the daemon so it doesn't
   # observe the stop-induced silence and race a fresh start against ours.
   bridge_stop_silence_watchdog || true
+  bridge_stop_queue_gateway_socket_listener || true
 
   recorded_pid="$(bridge_daemon_recorded_pid)"
   while IFS= read -r entry; do
@@ -4576,10 +4739,17 @@ cmd_stop() {
 }
 
 cmd_status() {
+  local socket_status="off"
+  if bridge_queue_gateway_listener_requested; then
+    socket_status="stopped"
+    if bridge_queue_gateway_socket_is_running; then
+      socket_status="running"
+    fi
+  fi
   if bridge_daemon_is_running; then
-    echo "running pid=$(bridge_daemon_pid) interval=${BRIDGE_DAEMON_INTERVAL}s db=${BRIDGE_TASK_DB}"
+    echo "running pid=$(bridge_daemon_pid) interval=${BRIDGE_DAEMON_INTERVAL}s db=${BRIDGE_TASK_DB} socket_listener=${socket_status}"
   else
-    echo "stopped"
+    echo "stopped socket_listener=${socket_status}"
   fi
 }
 

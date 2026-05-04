@@ -91,6 +91,13 @@ def queue_gateway_float_env(name: str, default: str) -> str:
     return raw
 
 
+def queue_gateway_transport() -> str:
+    transport = os.environ.get("BRIDGE_GATEWAY_TRANSPORT", "file").strip().lower()
+    if transport not in {"file", "socket"}:
+        return "file"
+    return transport
+
+
 def should_proxy_via_queue_gateway(argv: list[str]) -> bool:
     if not argv:
         return False
@@ -106,20 +113,32 @@ def proxy_via_queue_gateway(argv: list[str]) -> int:
     if not agent:
         return 1
     gateway_script = Path(__file__).resolve().with_name("bridge-queue-gateway.py")
-    command = [
-        sys.executable,
-        str(gateway_script),
-        "client",
-        "--root",
-        str(get_queue_gateway_root()),
-        "--agent",
-        agent,
-        "--timeout",
-        queue_gateway_float_env("BRIDGE_QUEUE_GATEWAY_TIMEOUT_SECONDS", "45"),
-        "--poll",
-        queue_gateway_float_env("BRIDGE_QUEUE_GATEWAY_POLL_SECONDS", "0.2"),
-        *argv,
-    ]
+    if queue_gateway_transport() == "socket":
+        command = [
+            sys.executable,
+            str(gateway_script),
+            "socket-client",
+            "--bridge-home",
+            os.environ.get("BRIDGE_HOME", str(Path.home() / ".agent-bridge")),
+            "--timeout",
+            queue_gateway_float_env("BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS", "5"),
+            *argv,
+        ]
+    else:
+        command = [
+            sys.executable,
+            str(gateway_script),
+            "client",
+            "--root",
+            str(get_queue_gateway_root()),
+            "--agent",
+            agent,
+            "--timeout",
+            queue_gateway_float_env("BRIDGE_QUEUE_GATEWAY_TIMEOUT_SECONDS", "45"),
+            "--poll",
+            queue_gateway_float_env("BRIDGE_QUEUE_GATEWAY_POLL_SECONDS", "0.2"),
+            *argv,
+        ]
     return int(subprocess.run(command, check=False).returncode)
 
 
