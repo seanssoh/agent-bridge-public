@@ -10201,4 +10201,11 @@ log "running isolated-bin-agb smoke (issue #544 PR1)"
 log "isolated-bin-agb covers shim env-source/delegation/fallback only — live PATH injection requires isolate+restart"
 bash "$REPO_ROOT/scripts/smoke/isolated-bin-agb.sh"
 
+# Issue #544 PR2 — render bridge hook entries into isolated home
+# settings.json + symlink. Renderer-only coverage; live sudo
+# install/symlink-swap requires isolate+restart on a Linux host.
+log "running isolated-settings-rendering smoke (issue #544 PR2)"
+log "isolated-settings-rendering covers Python renderer only — live install/symlink-swap requires isolate+restart"
+bash "$REPO_ROOT/scripts/smoke/isolated-settings-rendering.sh"
+
 log "smoke test passed"

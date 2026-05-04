@@ -138,6 +138,15 @@ bridge_migration_isolate() {
     fi
     bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir" "$(bridge_current_user)" || \
       bridge_warn "bridge_linux_prepare_agent_isolation returned non-zero for $agent; re-run isolate or check acceptance runbook §2"
+    # Issue #544 PR2 — refresh the per-isolated-home Claude
+    # settings.json + settings.effective.json so existing isolated
+    # agents pick up the bridge hook entries on `--reapply` without an
+    # unisolate→isolate cycle. Best-effort: warn but don't bail — the
+    # ACL reapply above is the load-bearing step.
+    if command -v bridge_install_isolated_home_settings >/dev/null 2>&1; then
+      bridge_install_isolated_home_settings "$agent" \
+        || bridge_warn "isolated-home settings install returned non-zero for $agent; re-run isolate --reapply or check OPERATIONS.md isolated-agent section"
+    fi
     printf '[done] ACL reapply complete for %s\n' "$agent"
     return 0
   fi
@@ -212,6 +221,14 @@ bridge_migration_isolate() {
   if [[ "$dry_run" != "1" ]]; then
     bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir" "$(bridge_current_user)" || \
       bridge_warn "bridge_linux_prepare_agent_isolation returned non-zero for $agent; re-run isolate or check acceptance runbook §2"
+    # Issue #544 PR2 — install bridge hook entries into the freshly
+    # provisioned isolated HOME so SessionStart, UserPromptSubmit, Stop,
+    # PermissionDenied, PreToolUse/PostToolUse all fire from first
+    # session. Best-effort; failure here doesn't block migration.
+    if command -v bridge_install_isolated_home_settings >/dev/null 2>&1; then
+      bridge_install_isolated_home_settings "$agent" \
+        || bridge_warn "isolated-home settings install returned non-zero for $agent; re-run isolate --reapply"
+    fi
   fi
 
   if [[ "$install_sudoers" == "1" ]]; then

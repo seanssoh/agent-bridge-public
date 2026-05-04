@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention cron-migrate-payloads upgrade-conflicts-lifecycle managed-autocompact-window
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-settings-rendering channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention cron-migrate-payloads upgrade-conflicts-lifecycle managed-autocompact-window
 }
 
 add_all_integration() {
@@ -217,7 +217,7 @@ select_for_path() {
       ;;
 
     lib/bridge-isolation*.sh|lib/bridge-migration.sh|bridge-migrate.sh|tests/isolation*)
-      add_required isolation isolated-bin-agb launch
+      add_required isolation isolated-bin-agb isolated-settings-rendering launch
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -249,7 +249,11 @@ select_for_path() {
       ;;
 
     hooks/*|bridge-hooks.py|lib/bridge-hooks.sh)
-      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window
+      # Issue #544 PR2 — bridge-hooks.py grew the
+      # `render-isolated-home-settings` subcommand and lib/bridge-hooks.sh
+      # grew `bridge_install_isolated_home_settings`. Pull the new smoke
+      # in whenever either touches.
+      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering
       add_integration integration-minimal
       ;;
 

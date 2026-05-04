@@ -442,6 +442,37 @@ isolated UIDs remains explicit default-deny per issue
 [#544](https://github.com/SYRS-AI/agent-bridge-public/issues/544) PR4
 design review.
 
+### Bridge hooks under the isolated HOME (settings.json rendering)
+
+Claude Code under the isolated UID reads `~/.claude/settings.json` from
+the isolated UID's HOME, not from the workdir — so the workdir-side
+shared-settings symlink installed for non-isolated agents is invisible
+there. The bridge installs hook entries (Stop, UserPromptSubmit,
+SessionStart, PermissionDenied, PreToolUse/PostToolUse) into the
+isolated HOME by rendering a controller-owned
+`<isolated-home>/.claude/settings.effective.json` and pointing
+`<isolated-home>/.claude/settings.json` at it via a symlink.
+
+Integrity contract: the effective file is owned by `root:root` mode
+`0644`; the symlink is owned by the isolated UID but the underlying
+target is not. The isolated UID can read the hook contract but cannot
+mutate it from inside its own session. Pre-existing user keys
+(`enabledPlugins`, `extraKnownMarketplaces`,
+`skipDangerousModePermissionPrompt`) from any prior regular
+`settings.json` are preserved across the transition.
+
+The render runs on agent isolate, restart,
+`agent-bridge isolate <agent> --reapply`, and `agb agent
+rerender-settings --apply`. Operators on existing installs pick up the
+hook entries by:
+
+```bash
+agent-bridge isolate <agent> --reapply
+```
+
+then restarting the agent so the next session reads the rendered
+settings.
+
 ## Migrating to layout v2
 
 The v2 layout (PR-A/B/C, shipped in v0.6.19) replaces named-ACL access on
