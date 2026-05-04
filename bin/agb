@@ -18,12 +18,28 @@ if [[ -n "${BRIDGE_AGENT_ENV_FILE:-}" && -r "$BRIDGE_AGENT_ENV_FILE" ]]; then
 fi
 
 # Resolve BRIDGE_HOME with two fallbacks: explicit env (preferred) > derived
-# from this shim's own location (bin/agb -> ../agb).
+# from this shim's REAL location (resolves symlinks; bin/agb -> ../agb).
+# Operators may symlink the shim from a non-standard PATH location
+# (e.g. /usr/local/bin/agb -> ${BRIDGE_HOME}/bin/agb). Without symlink
+# resolution the fallback would point at the symlink's parent and
+# `exec "$BRIDGE_HOME/agb"` would target the wrong root.
 if [[ -z "${BRIDGE_HOME:-}" ]]; then
-  _shim_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-  BRIDGE_HOME="$(cd -P "$_shim_dir/.." && pwd -P)"
+  _shim_self="${BASH_SOURCE[0]}"
+  # Walk symlinks until we hit the real file. Bounded loop guards against
+  # cycles. Portable across macOS bash 3.2 (no `readlink -f`) and Linux.
+  _shim_max_hops=16
+  while [[ -L "$_shim_self" && "$_shim_max_hops" -gt 0 ]]; do
+    _shim_link="$(readlink "$_shim_self")"
+    case "$_shim_link" in
+      /*) _shim_self="$_shim_link" ;;
+      *)  _shim_self="$(cd -P "$(dirname "$_shim_self")" 2>/dev/null && pwd -P)/$_shim_link" ;;
+    esac
+    _shim_max_hops=$(( _shim_max_hops - 1 ))
+  done
+  _shim_dir="$(cd -P "$(dirname "$_shim_self")" 2>/dev/null && pwd -P)"
+  BRIDGE_HOME="$(cd -P "$_shim_dir/.." 2>/dev/null && pwd -P)"
   export BRIDGE_HOME
-  unset _shim_dir
+  unset _shim_self _shim_link _shim_max_hops _shim_dir
 fi
 
 exec "$BRIDGE_HOME/agb" "$@"

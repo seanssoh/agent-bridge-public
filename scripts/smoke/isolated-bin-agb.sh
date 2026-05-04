@@ -12,6 +12,15 @@
 #    other agb on PATH.
 # 3. The shim exits non-zero (bubbled from the underlying agb) when the
 #    delegate fails — i.e. it doesn't swallow the exit code.
+#
+# Coverage: shim env-source ordering, exec delegation, BRIDGE_HOME fallback
+# derivation (including symlinked invocation). Does NOT exercise:
+#   - live `bridge_write_linux_agent_env_file` PATH injection (requires
+#     `agent-bridge isolate <agent>` against a real linux-user UID).
+#   - live ACL access from the isolated UID to ${BRIDGE_HOME}/bin
+#     (requires sudo + named-user ACL on a Linux host).
+# End-to-end coverage is operator-side via OPERATIONS.md migration step
+# (`agent-bridge isolate <agent> --reapply` + agent restart).
 
 set -euo pipefail
 
