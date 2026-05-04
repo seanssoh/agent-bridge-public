@@ -10,7 +10,7 @@ version bumps via the `VERSION` file.
 
 ### Highlight — linux-user isolated agents end-to-end + system agent class + per-agent settings architecture
 
-`v0.7.6` makes linux-user-isolated agents (`agent-bridge agent create … --isolation linux-user`) actually usable by closing the four-piece gap that left them silently mis-configured (#544). Adds a first-class `system` agent class for ingestion/supervisory roles like `librarian`/`patch` (#539). Replaces the install-wide single shared `settings.effective.json` with per-agent rendered files so mixed-model installs (some Opus 4.7 `[1m]`, some pre-1M) no longer race on `autoCompactWindow` (#555/#547). Plus a small batch of correctness fixes that surfaced during the wave (#541, #542, #543, #545, plus a tmux ghost-input fix #1393).
+`v0.7.6` makes linux-user-isolated agents (`agent-bridge agent create … --isolation linux-user`) actually usable by closing the four-piece gap that left them silently mis-configured (#544). Adds a first-class `system` agent class for ingestion/supervisory roles like `librarian`/`patch` (#539). Replaces the install-wide single shared `settings.effective.json` with per-agent rendered files so mixed-model installs (some Opus 4.7 `[1m]`, some pre-1M) no longer race on `autoCompactWindow` (#555/#547). Plus a small batch of correctness fixes that surfaced during the wave (#541, #542, #543, #545, plus a tmux Claude dim ghost-input fix in PR #566).
 
 All changes auto-apply on the first `agent-bridge upgrade --apply` to v0.7.6+. Existing isolated agents pick up the new hooks/skills/settings on the next `agent-bridge isolate <agent> --reapply` (idempotent — only re-applies the ACL/sync contract; doesn't mutate ownership) followed by an agent restart.
 
