@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention cron-migrate-payloads upgrade-conflicts-lifecycle
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention cron-migrate-payloads upgrade-conflicts-lifecycle
 }
 
 add_all_integration() {
@@ -217,9 +217,15 @@ select_for_path() {
       ;;
 
     lib/bridge-isolation*.sh|lib/bridge-migration.sh|bridge-migrate.sh|tests/isolation*)
-      add_required isolation launch
+      add_required isolation isolated-bin-agb launch
       add_integration integration-minimal
       add_live live-tmux-daemon
+      ;;
+
+    bin/agb|bin/*)
+      # Issue #544 PR1 — curated bin/ shim for isolated agents.
+      add_required isolated-bin-agb isolation launch
+      add_integration integration-minimal
       ;;
 
     scripts/apply-channel-policy.sh|lib/bridge-channels.sh|lib/bridge-discord.sh|bridge-discord-relay.sh|bridge-notify.sh|runtime-templates/*)

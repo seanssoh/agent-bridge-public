@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Curated agb shim for isolated agents (issue #544 PR1).
+#
+# - When invoked from an isolated agent's UID with BRIDGE_AGENT_ENV_FILE in
+#   env, source it first so BRIDGE_GATEWAY_PROXY=1 / BRIDGE_HOME / sentineled
+#   BRIDGE_TASK_DB are present even in fresh non-login subshells (Bash tool
+#   subprocess re-evaluating PATH, etc.).
+# - Then exec the underlying $BRIDGE_HOME/agb script.
+#
+# Out of scope here: subcommand allowlist / denylist enforcement (issue #544
+# PR4 design). This shim is a discovery/delivery wrapper, not a policy gate.
+
+set -euo pipefail
+
+if [[ -n "${BRIDGE_AGENT_ENV_FILE:-}" && -r "$BRIDGE_AGENT_ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$BRIDGE_AGENT_ENV_FILE"
+fi
+
+# Resolve BRIDGE_HOME with two fallbacks: explicit env (preferred) > derived
+# from this shim's own location (bin/agb -> ../agb).
+if [[ -z "${BRIDGE_HOME:-}" ]]; then
+  _shim_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  BRIDGE_HOME="$(cd -P "$_shim_dir/.." && pwd -P)"
+  export BRIDGE_HOME
+  unset _shim_dir
+fi
+
+exec "$BRIDGE_HOME/agb" "$@"

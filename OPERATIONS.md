@@ -380,6 +380,27 @@ emits when `BRIDGE_AGENT_ISOLATION_MODE=linux-user`. See issue
 > A2A queue tasks from those sessions stop routing through the gateway
 > until they pick up the new env.
 
+### Picking up the curated `bin/` after upgrade
+
+After v0.7.6+, isolated agents can call `agb` bare from their Bash tool
+because the launcher prepends `${BRIDGE_HOME}/bin` to the agent's PATH
+and the curated `bin/agb` shim auto-sources `BRIDGE_AGENT_ENV_FILE`
+before delegating to the underlying `${BRIDGE_HOME}/agb`. Existing
+isolated agents pick this up by re-running:
+
+```bash
+agent-bridge isolate <agent> --reapply
+```
+
+(idempotent; only re-installs the ACL contract, doesn't mutate
+ownership) followed by an agent restart so `bridge-start.sh`
+regenerates the agent's `agent-env.sh` with the new PATH.
+
+Out of scope: the broader `agent-bridge` subcommand surface for
+isolated UIDs remains explicit default-deny per issue
+[#544](https://github.com/SYRS-AI/agent-bridge-public/issues/544) PR4
+design review.
+
 ## Migrating to layout v2
 
 The v2 layout (PR-A/B/C, shipped in v0.6.19) replaces named-ACL access on
