@@ -442,6 +442,31 @@ isolated UIDs remains explicit default-deny per issue
 [#544](https://github.com/SYRS-AI/agent-bridge-public/issues/544) PR4
 design review.
 
+### Bridge-native skills under the isolated HOME
+
+Bridge-native Claude skills (`agent-bridge-runtime`, `cron-manager`,
+`memory-wiki`, `patch-permission-approval`) are synced into
+`<isolated-home>/.claude/skills/<skill>/` on agent isolate, restart,
+`agent-bridge isolate <agent> --reapply`, and `agb upgrade`. Claude Code
+running under the isolated UID reads `~/.claude/skills/` from that home,
+so the workdir-side symlinks used by shared agents are not visible
+there — the bridge installs a parallel rendered copy into the isolated
+home instead. Skill body text is normalized at sync time so every
+`~/.agent-bridge/agb` and `~/.agent-bridge/agent-bridge` reference
+becomes the absolute `${BRIDGE_HOME}/agb` (resp. `${BRIDGE_HOME}/agent-bridge`)
+path. This decouples skill commands from `~` resolution under the
+isolated UID and from the per-home `~/.agent-bridge` symlink, so they
+work even on installs where that symlink is missing or the operator-home
+parent path differs from `BRIDGE_HOME`.
+
+Operators on existing installs pick this up by re-running:
+
+```bash
+agent-bridge isolate <agent> --reapply
+```
+
+then restarting the agent so the next session loads the synced skills.
+
 ## Migrating to layout v2
 
 The v2 layout (PR-A/B/C, shipped in v0.6.19) replaces named-ACL access on

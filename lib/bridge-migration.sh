@@ -138,6 +138,15 @@ bridge_migration_isolate() {
     fi
     bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir" "$(bridge_current_user)" || \
       bridge_warn "bridge_linux_prepare_agent_isolation returned non-zero for $agent; re-run isolate or check acceptance runbook §2"
+    # Issue #544 PR3 — refresh the bridge-native skills under the
+    # isolated HOME (.claude/skills/) so existing isolated agents pick
+    # up new/changed skills on `--reapply` without unisolate→isolate.
+    # Best-effort: warn but don't bail out — the ACL reapply above is
+    # the load-bearing step.
+    if command -v bridge_sync_isolated_home_claude_skills >/dev/null 2>&1; then
+      bridge_sync_isolated_home_claude_skills "$agent" \
+        || bridge_warn "isolated-home skills sync returned non-zero for $agent; re-run isolate --reapply or check OPERATIONS.md isolated-agent section"
+    fi
     printf '[done] ACL reapply complete for %s\n' "$agent"
     return 0
   fi
@@ -212,6 +221,16 @@ bridge_migration_isolate() {
   if [[ "$dry_run" != "1" ]]; then
     bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir" "$(bridge_current_user)" || \
       bridge_warn "bridge_linux_prepare_agent_isolation returned non-zero for $agent; re-run isolate or check acceptance runbook §2"
+    # Issue #544 PR3 — install bridge-native skills into the freshly
+    # provisioned isolated HOME so SessionStart/UserPromptSubmit hooks
+    # (PR2 surface) and the agent itself can discover the
+    # agent-bridge-runtime / cron-manager / memory-wiki /
+    # patch-permission-approval skills under the isolated UID.
+    # Best-effort: failure here doesn't block migration.
+    if command -v bridge_sync_isolated_home_claude_skills >/dev/null 2>&1; then
+      bridge_sync_isolated_home_claude_skills "$agent" \
+        || bridge_warn "isolated-home skills sync returned non-zero for $agent; re-run isolate --reapply"
+    fi
   fi
 
   if [[ "$install_sudoers" == "1" ]]; then

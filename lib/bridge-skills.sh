@@ -181,7 +181,170 @@ bridge_bootstrap_claude_shared_skills() {
 
   if [[ -n "$agent" ]]; then
     bridge_sync_claude_runtime_skills "$agent" "$workdir"
+    # Issue #544 PR3 — isolated agents read ~/.claude/skills/ from the
+    # isolated UID's HOME, not from $workdir. The workdir symlinks above
+    # serve shared agents only; isolated agents need a parallel rendered
+    # copy under the isolated HOME with `~/.agent-bridge/` rewritten to
+    # the absolute BRIDGE_HOME path so skill commands resolve regardless
+    # of how `~` resolves under the isolated UID. Best-effort: silently
+    # skips non-isolated agents and never blocks the start path.
+    bridge_sync_isolated_home_claude_skills "$agent" >/dev/null 2>&1 || true
   fi
+}
+
+# Issue #544 PR3 — list of bridge-native skills that must be present in an
+# isolated agent's HOME `.claude/skills/` directory. This is the parallel
+# of the workdir symlink set installed by `bridge_bootstrap_claude_shared_skills`,
+# extended with `patch-permission-approval` so admin agents under isolation
+# also get the escalation runbook. New shared skills should be added here.
+bridge_isolated_home_shared_skill_names() {
+  printf '%s\n' \
+    "agent-bridge-runtime" \
+    "cron-manager" \
+    "memory-wiki" \
+    "patch-permission-approval"
+}
+
+# Render one skill text file from the controller-side source into the
+# isolated home copy, substituting `~/.agent-bridge/` with the absolute
+# BRIDGE_HOME path so the skill body's `agb` / `agent-bridge` commands
+# resolve under the isolated UID regardless of how `~` resolves there.
+# Atomic install via temp file + replace.
+bridge_render_skill_file_for_isolated() {
+  local source_file="$1"
+  local target_file="$2"
+  local bridge_home_resolved="$3"
+
+  bridge_require_python
+  python3 - "$source_file" "$target_file" "$bridge_home_resolved" <<'PY'
+import os
+import sys
+
+src, dst, home = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(src, "r", encoding="utf-8") as fh:
+    content = fh.read()
+# Normalize trailing slash on the home path so substitution is exact.
+home_norm = home.rstrip("/") + "/"
+content = content.replace("~/.agent-bridge/", home_norm)
+tmp = dst + ".tmp"
+os.makedirs(os.path.dirname(dst), exist_ok=True)
+with open(tmp, "w", encoding="utf-8") as fh:
+    fh.write(content)
+os.replace(tmp, dst)
+PY
+}
+
+# Decide whether a file under a skill directory is a UTF-8 text file the
+# renderer should rewrite, or an opaque binary that should be copied
+# verbatim. Heuristic: try to decode as UTF-8; on failure treat as binary.
+# Returns 0 (text) or 1 (binary).
+bridge_skill_file_is_text() {
+  local path="$1"
+  bridge_require_python
+  python3 - "$path" <<'PY'
+import sys
+try:
+    with open(sys.argv[1], "rb") as fh:
+        chunk = fh.read(8192)
+    if b"\x00" in chunk:
+        sys.exit(1)
+    chunk.decode("utf-8")
+    sys.exit(0)
+except (OSError, UnicodeDecodeError):
+    sys.exit(1)
+PY
+}
+
+# Sync the bridge-native skill set into the isolated UID's HOME
+# `.claude/skills/<skill>/` so Claude Code can discover them under the
+# isolated UID. No-op for non-isolated agents.
+#
+# Path text in SKILL.md (and other UTF-8 text files) is normalized:
+# `~/.agent-bridge/` → `${BRIDGE_HOME}/` (absolute) so the skill body's
+# `agb` / `agent-bridge` references resolve correctly under the isolated
+# UID regardless of `~` semantics or per-home symlink presence.
+#
+# Best-effort: returns 0 silently when the agent is not isolated, when
+# the controller cannot sudo to root, when sources are missing, or when
+# any individual skill fails to render. Failures inside the loop emit a
+# warning but do not abort sibling skills or block the caller.
+bridge_sync_isolated_home_claude_skills() {
+  local agent="$1"
+  local os_user=""
+  local isolated_home=""
+  local skills_root=""
+  local skill_name=""
+  local source_dir=""
+  local target_dir=""
+  local source_file=""
+  local rel=""
+  local target_file=""
+
+  [[ -n "$agent" ]] || return 0
+
+  # Predicate is fatal-on-zero for non-isolated agents; suppress so this
+  # remains a silent no-op when called unconditionally from the start path.
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || return 0
+
+  os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+  [[ -n "$os_user" ]] || return 0
+  isolated_home="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || true)"
+  [[ -n "$isolated_home" ]] || return 0
+
+  skills_root="$isolated_home/.claude/skills"
+
+  # Ensure the skills root exists with isolated-UID ownership. The parent
+  # `.claude` may already be owned by the isolated UID; mkdir -p as root
+  # is the safe primitive (sudo wrap matches every other isolated-home
+  # mutation in lib/bridge-agents.sh).
+  bridge_linux_sudo_root mkdir -p "$skills_root" 2>/dev/null || {
+    bridge_warn "isolated skills sync: cannot mkdir $skills_root for $agent (sudo unavailable?)"
+    return 0
+  }
+  bridge_linux_sudo_root chown "$os_user:$os_user" "$skills_root" 2>/dev/null || true
+  bridge_linux_sudo_root chmod 0755 "$skills_root" 2>/dev/null || true
+
+  while IFS= read -r skill_name; do
+    [[ -n "$skill_name" ]] || continue
+    source_dir="$(bridge_shared_claude_skill_source_dir "$skill_name")"
+    if [[ ! -d "$source_dir" ]]; then
+      bridge_warn "isolated skills sync: source missing for skill '$skill_name' (looked under $source_dir)"
+      continue
+    fi
+    target_dir="$skills_root/$skill_name"
+    bridge_linux_sudo_root mkdir -p "$target_dir" 2>/dev/null || {
+      bridge_warn "isolated skills sync: cannot mkdir $target_dir"
+      continue
+    }
+
+    # Walk every regular file under the source skill dir and either
+    # render (text) or copy verbatim (binary). Preserve subdirectory
+    # structure under references/ etc.
+    while IFS= read -r -d '' source_file; do
+      rel="${source_file#"$source_dir/"}"
+      target_file="$target_dir/$rel"
+      bridge_linux_sudo_root mkdir -p "$(dirname "$target_file")" 2>/dev/null || continue
+      if bridge_skill_file_is_text "$source_file" 2>/dev/null; then
+        # Render to a controller-owned temp file, then sudo-move into
+        # the isolated tree. Two-step is required because the renderer
+        # writes as the controller UID.
+        local _tmp_rendered=""
+        _tmp_rendered="$(mktemp)" || continue
+        if bridge_render_skill_file_for_isolated "$source_file" "$_tmp_rendered" "$BRIDGE_HOME"; then
+          bridge_linux_sudo_root install -m 0644 "$_tmp_rendered" "$target_file" 2>/dev/null \
+            || bridge_warn "isolated skills sync: install failed for $target_file"
+        else
+          bridge_warn "isolated skills sync: render failed for $source_file"
+        fi
+        rm -f "$_tmp_rendered"
+      else
+        bridge_linux_sudo_root install -m 0644 "$source_file" "$target_file" 2>/dev/null \
+          || bridge_warn "isolated skills sync: copy failed for $target_file"
+      fi
+    done < <(find "$source_dir" -type f -print0 2>/dev/null)
+
+    bridge_linux_sudo_root chown -R "$os_user:$os_user" "$target_dir" 2>/dev/null || true
+  done < <(bridge_isolated_home_shared_skill_names)
 }
 
 bridge_agent_skills_registry_json() {

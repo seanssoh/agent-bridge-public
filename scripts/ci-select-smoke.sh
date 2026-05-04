@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention cron-migrate-payloads upgrade-conflicts-lifecycle managed-autocompact-window
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention cron-migrate-payloads upgrade-conflicts-lifecycle managed-autocompact-window
 }
 
 add_all_integration() {
@@ -217,7 +217,7 @@ select_for_path() {
       ;;
 
     lib/bridge-isolation*.sh|lib/bridge-migration.sh|bridge-migrate.sh|tests/isolation*)
-      add_required isolation isolated-bin-agb launch
+      add_required isolation isolated-bin-agb isolated-skills-sync launch
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -225,6 +225,14 @@ select_for_path() {
     bin/agb|bin/*)
       # Issue #544 PR1 — curated bin/ shim for isolated agents.
       add_required isolated-bin-agb isolation launch
+      add_integration integration-minimal
+      ;;
+
+    lib/bridge-skills.sh|.claude/skills/*)
+      # Issue #544 PR3 — bridge-native skill sync into isolated HOME.
+      # Path text rewrite + tree walk live in lib/bridge-skills.sh and
+      # the source skill bodies are the rewrite input.
+      add_required isolated-skills-sync isolation launch
       add_integration integration-minimal
       ;;
 

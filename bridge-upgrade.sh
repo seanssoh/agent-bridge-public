@@ -1273,6 +1273,13 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
     for agent in "${BRIDGE_AGENT_IDS[@]}"; do
       [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || continue
       bridge_sync_claude_runtime_skills "$agent" "$(bridge_agent_workdir "$agent")" "$dry_run" >/dev/null 2>&1 || true
+      # Issue #544 PR3 — refresh bridge-native skills under each
+      # isolated agent HOME on upgrade. No-op for non-isolated agents.
+      # Honors --dry-run: only run the live sync when dry_run != 1.
+      if [[ "$dry_run" != "1" ]] \
+          && command -v bridge_sync_isolated_home_claude_skills >/dev/null 2>&1; then
+        bridge_sync_isolated_home_claude_skills "$agent" >/dev/null 2>&1 || true
+      fi
     done
   ' -- "$SOURCE_ROOT" "$DRY_RUN"
 

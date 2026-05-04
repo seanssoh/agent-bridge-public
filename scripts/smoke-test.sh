@@ -10201,4 +10201,10 @@ log "running isolated-bin-agb smoke (issue #544 PR1)"
 log "isolated-bin-agb covers shim env-source/delegation/fallback only — live PATH injection requires isolate+restart"
 bash "$REPO_ROOT/scripts/smoke/isolated-bin-agb.sh"
 
+# Issue #544 PR3 — bridge-native skills sync into isolated HOME with
+# `~/.agent-bridge/` → absolute BRIDGE_HOME path normalization.
+log "running isolated-skills-sync smoke (issue #544 PR3)"
+log "isolated-skills-sync covers helper render/rewrite only — live sudo + ACL grants require isolate+restart on a Linux host"
+bash "$REPO_ROOT/scripts/smoke/isolated-skills-sync.sh"
+
 log "smoke test passed"
