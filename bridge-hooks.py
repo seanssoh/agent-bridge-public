@@ -18,20 +18,21 @@ from typing import Any
 # precedence over settings and would make operator overlays harder to reason
 # about.
 #
-# The default is launch_cmd-aware (issue #547): on 1M-context Opus 4.7 [1m]
-# the legacy 400_000 cap silently rescaled CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
-# (operator setting pct=45 expecting compact at ~450K of 1M was getting
-# compact at 180K). Sub-string match on `[1m]` is sufficient for the
-# dominant case; a roster-level BRIDGE_AGENT_MODEL field is deferred per
-# issue #547 recommendation 2.
-BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW_LEGACY = 400_000
-BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW_1M = 1_000_000
+# Default to the 1M-context window (issue #570): the previous launch_cmd
+# `[1m]` substring heuristic (issue #547) never fired in practice because
+# `[1m]` is a model-id suffix the runtime prints (`claude-opus-4-7[1m]`),
+# not a CLI argument — agents always launched with the 400_000 legacy cap,
+# making `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=45` compact at ~180K instead of
+# the intended ~450K. Setting 1_000_000 is a no-regret upper bound: any
+# model with smaller native context will compact earlier on its own.
+BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW = 1_000_000
 
 
 def resolve_managed_autocompact_window(launch_cmd: str | None) -> int:
-    if launch_cmd and "[1m]" in launch_cmd:
-        return BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW_1M
-    return BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW_LEGACY
+    # launch_cmd is accepted for backwards compatibility with callers but is
+    # no longer consulted; see issue #570.
+    del launch_cmd
+    return BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW
 
 
 def managed_claude_settings_defaults(launch_cmd: str | None) -> dict[str, Any]:
