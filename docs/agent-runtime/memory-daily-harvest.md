@@ -36,13 +36,24 @@ agent (see [§12 — Static-only contract](#12-static-only-contract)):
   ```
   bash "$BRIDGE_HOME/scripts/memory-daily-harvest.sh" --agent <agent>
 
-  # The harvester writes the authoritative RESULT_SCHEMA JSON to
+  # This harvester reconciles the agent's most recent jsonl session
+  # transcript (resolved via session_id under ~/.claude/projects/) into the
+  # agent's daily note at memory/daily/<YYYY-MM-DD>.md by invoking
+  # scripts/daily-note-reconcile.py before the harvest pass. The harvester
+  # then writes the authoritative RESULT_SCHEMA JSON to
   # $CRON_REQUEST_DIR/authoritative-memory-daily.json. The runner reads that
   # file directly. Your structured_output is a secondary relay.
   # Do NOT re-interpret status / summary / actions_taken — the harvester is authoritative.
   ```
 
-The inline `Do NOT re-interpret` comment is load-bearing. The cron runner
+This body is the canonical source; `bridge-cron.py`
+`MEMORY_DAILY_JSONL_AWARE_PROMPT_TEMPLATE` and the embedded literal in
+`bootstrap-memory-system.sh:step_memory_daily_cron_one` mirror it. The
+`jsonl` / `session_id` / `daily-note-reconcile` keywords are load-bearing:
+`agb cron migrate-payloads --jsonl-aware` (issue #541 PR-A) uses them as
+the predicate for whether an existing payload needs rewriting.
+
+The inline `Do NOT re-interpret` pragma is load-bearing. The cron runner
 forwards payload text to a Claude subagent as the prompt body; without the
 override the subagent could paraphrase `actions_taken`, which would defeat the
 daemon refresh-gating contract in §7.

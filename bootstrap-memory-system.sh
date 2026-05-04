@@ -650,10 +650,20 @@ step_memory_daily_cron_one() {
   # $CRON_REQUEST_DIR/authoritative-memory-daily.json and the runner reads that
   # file directly. The subagent's structured_output is a secondary relay and
   # MUST NOT re-interpret status / summary / actions_taken.
+  #
+  # Issue #541 PR-A — this body must stay byte-identical to the canonical
+  # MEMORY_DAILY_JSONL_AWARE_PROMPT_TEMPLATE in bridge-cron.py (with `{agent}`
+  # substituted) so `agb cron migrate-payloads --jsonl-aware` treats freshly
+  # bootstrapped jobs as `unchanged`. If you edit one, edit the other and
+  # docs/agent-runtime/memory-daily-harvest.md §2 in the same change.
   local payload
   payload="bash \"\$BRIDGE_HOME/scripts/memory-daily-harvest.sh\" --agent $agent
 
-# The harvester writes the authoritative RESULT_SCHEMA JSON to
+# This harvester reconciles the agent's most recent jsonl session
+# transcript (resolved via session_id under ~/.claude/projects/) into the
+# agent's daily note at memory/daily/<YYYY-MM-DD>.md by invoking
+# scripts/daily-note-reconcile.py before the harvest pass. The harvester
+# then writes the authoritative RESULT_SCHEMA JSON to
 # \$CRON_REQUEST_DIR/authoritative-memory-daily.json. The runner reads that
 # file directly. Your structured_output is a secondary relay.
 # Do NOT re-interpret status / summary / actions_taken — the harvester is authoritative."

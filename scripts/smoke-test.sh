@@ -10192,4 +10192,8 @@ assert_contains "$FP_STATUS_OUTPUT" "context-pressure FP rate (7d): 1/1 (100%)"
 log "running stale-resume regression suite"
 bash "$REPO_ROOT/scripts/test-stale-resume.sh"
 
+# Issue #541 PR-A — memory-daily payload jsonl-aware migration regression.
+log "running cron-migrate-payloads smoke (issue #541 PR-A)"
+bash "$REPO_ROOT/scripts/smoke/cron-migrate-payloads.sh"
+
 log "smoke test passed"

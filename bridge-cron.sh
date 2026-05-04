@@ -18,6 +18,7 @@ Usage:
   $(basename "$0") update <job-id> [--agent <bridge-agent>] [--schedule "<cron-expr>" | --at "<iso-datetime>"] [--title "<title>"] [--payload "<text>" | --payload-file <path>] [--tz <iana-tz>] [--enable|--disable] [--delete-after-run|--keep-after-run]
   $(basename "$0") delete <job-id>
   $(basename "$0") rebalance-memory-daily [--jobs-file <path>] [--schedule "<cron-expr>"] [--tz <iana-tz>] [--dry-run] [--json]
+  $(basename "$0") migrate-payloads --jsonl-aware [--jobs-file <path>] [--dry-run] [--json]
   $(basename "$0") enqueue <job-name-or-id> [--slot <slot-key>] [--target <bridge-agent>] [--from <actor>] [--priority normal|high] [--dry-run]
   $(basename "$0") sync [--dry-run] [--json] [--since <iso-datetime>] [--now <iso-datetime>]
   $(basename "$0") run-subagent <run-id> [--dry-run]
@@ -261,6 +262,38 @@ run_rebalance_memory_daily() {
         ;;
       *)
         bridge_die "지원하지 않는 rebalance-memory-daily 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  py_args+=(--jobs-file "$jobs_file")
+  bridge_cron_python "${py_args[@]}"
+}
+
+# Issue #541 PR-A — operator-driven migration of memory-daily payloads to
+# the canonical jsonl-aware body. Mirrors the cleanup-prune surface
+# (jobs.json.bak-<timestamp> backup, --dry-run, --json).
+run_migrate_payloads() {
+  local jobs_file="$BRIDGE_NATIVE_CRON_JOBS_FILE"
+  local py_args=(migrate-payloads)
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --jobs-file)
+        [[ $# -lt 2 ]] && bridge_die "$1 뒤에 값을 지정하세요."
+        jobs_file="$2"
+        shift 2
+        ;;
+      --jsonl-aware|--dry-run|--json)
+        py_args+=("$1")
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        bridge_die "지원하지 않는 migrate-payloads 옵션입니다: $1"
         ;;
     esac
   done
@@ -1057,6 +1090,9 @@ case "$subcommand" in
   rebalance-memory-daily)
     run_rebalance_memory_daily "$@"
     ;;
+  migrate-payloads)
+    run_migrate_payloads "$@"
+    ;;
   enqueue)
     run_enqueue "$@"
     ;;
@@ -1082,7 +1118,7 @@ case "$subcommand" in
     # Issue #163: attach an intent-recovery suggestion before dying so the
     # caller sees "혹시 X?" instead of just the bare rejection.
     _hint="$(bridge_suggest_subcommand "cron $subcommand" \
-      "inventory show import list create update delete rebalance-memory-daily enqueue sync run-subagent finalize-run errors cleanup")"
+      "inventory show import list create update delete rebalance-memory-daily migrate-payloads enqueue sync run-subagent finalize-run errors cleanup")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 cron 명령입니다: $subcommand"
     ;;
