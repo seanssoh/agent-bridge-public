@@ -32,7 +32,7 @@ import {
 } from 'fs'
 import { homedir } from 'os'
 import { isAbsolute as pathIsAbsolute, join, resolve as pathResolve } from 'path'
-import { createRecentMessageDeduper } from './dedupe.ts'
+import { createRecentMessageDeduper, storedRowMatchesIncoming } from './dedupe.ts'
 
 type GroupPolicy = {
   requireMention?: boolean
@@ -66,6 +66,10 @@ type StoredMessage = {
   aad_object_id: string
   text: string
   ts: string
+  // Edit indicator: Teams reuses message_id on edits but bumps
+  // localTimestamp/timestamp. Stored so deliveredMessageSeen can let edits
+  // through while still dropping pure retransmits.
+  revision?: string
   attachments?: StoredAttachment[]
 }
 
@@ -151,6 +155,17 @@ try {
 const HOST = process.env.TEAMS_WEBHOOK_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.TEAMS_WEBHOOK_PORT ?? '3978')
 const STATIC = process.env.TEAMS_ACCESS_MODE === 'static'
+
+if (process.env.TEAMS_BRIDGE_MODE === '1' || process.env.TEAMS_BRIDGE_AGENT) {
+  process.stderr.write(
+    'teams channel: ignoring deprecated TEAMS_BRIDGE_MODE/TEAMS_BRIDGE_AGENT; inbound messages use notifications/claude/channel\n',
+  )
+}
+if (process.env.TEAMS_DELIVERY_MODE && process.env.TEAMS_DELIVERY_MODE !== 'channel') {
+  process.stderr.write(
+    `teams channel: unsupported TEAMS_DELIVERY_MODE=${process.env.TEAMS_DELIVERY_MODE}; using channel delivery\n`,
+  )
+}
 
 const APP_ID = process.env.TEAMS_APP_ID ?? process.env.MicrosoftAppId
 const APP_PASSWORD = process.env.TEAMS_APP_PASSWORD ?? process.env.MicrosoftAppPassword
@@ -354,6 +369,21 @@ function appendMessage(message: StoredMessage): void {
   appendFileSync(MESSAGES_FILE, JSON.stringify(message) + '\n', { mode: 0o600 })
 }
 
+function deliveredMessageSeen(chatId: string, messageId: string, revision: string): boolean {
+  if (!chatId || !messageId || !existsSync(MESSAGES_FILE)) return false
+  try {
+    const lines = readFileSync(MESSAGES_FILE, 'utf8').split('\n').filter(Boolean)
+    for (let i = lines.length - 1; i >= 0; i -= 1) {
+      try {
+        const row = JSON.parse(lines[i]) as Partial<StoredMessage>
+        if (row.chat_id !== chatId || row.message_id !== messageId) continue
+        if (storedRowMatchesIncoming(row.revision, revision)) return true
+      } catch {}
+    }
+  } catch {}
+  return false
+}
+
 function sanitizeMessageId(raw: string): string {
   // Teams message ids are typically guid-like, numeric, or "<guid>:<num>".
   // Strict allowlist prevents path-traversal via attacker-controlled activity.id.
@@ -528,6 +558,21 @@ const adapter = new BotFrameworkAdapter({
 const recentMessageIds = createRecentMessageDeduper(256)
 let duplicateDropLogs = 0
 
+// dedupeKey: chat scopes the id (Teams reuses message ids across conversations
+// for thread replies); revision distinguishes edits — Teams keeps the same
+// activity.id when a user edits a message but bumps localTimestamp/timestamp,
+// so including the revision lets edits through while still dropping pure
+// retransmits of the original payload.
+function dedupeKey(chatId: string, messageId: string, revision: string): string {
+  return revision ? `${chatId}::${messageId}::${revision}` : `${chatId}::${messageId}`
+}
+
+function logDuplicateDrop(chatId: string, messageId: string): void {
+  if (duplicateDropLogs >= 10) return
+  process.stderr.write(`teams channel: dropped duplicate chat_id=${chatId} message_id=${messageId}\n`)
+  duplicateDropLogs += 1
+}
+
 const mcp = new Server(
   { name: 'teams', version: '0.1.0' },
   {
@@ -610,16 +655,34 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 async function handleActivity(context: TurnContext): Promise<void> {
   const activity = context.activity
-  if (activity.type !== ActivityTypes.Message) return
+  // Supported activity types:
+  //   - Message       — new chat message from a Teams user.
+  //   - MessageUpdate — Teams edit of an existing message; reuses the
+  //                     original activity.id but bumps localTimestamp /
+  //                     timestamp. The revision-aware dedupe (below) lets
+  //                     edits flow through while still dropping retransmits.
+  // Intentionally not handled: MessageDelete (out of scope — Teams does
+  // emit these, but we don't currently propagate redactions back to the
+  // Claude session). All other activity types (typing, conversationUpdate,
+  // membersAdded, …) are ignored.
+  if (activity.type !== ActivityTypes.Message && activity.type !== ActivityTypes.MessageUpdate) return
   if (!gate(activity)) return
 
   const chatId = referenceKey(activity)
   const messageId = String(activity.id ?? randomUUID())
-  if (recentMessageIds.seen(messageId)) {
-    if (duplicateDropLogs < 10) {
-      process.stderr.write(`teams channel: dropped duplicate message_id=${messageId}\n`)
-      duplicateDropLogs += 1
-    }
+  // Bot Framework bumps localTimestamp on edited messages (and timestamp
+  // tracks server-side receive time). Either is a stable enough edit
+  // indicator to keep edits from being dropped as duplicates.
+  const revision = String(
+    (activity as any).localTimestamp ??
+      (activity.timestamp instanceof Date ? activity.timestamp.toISOString() : activity.timestamp ?? ''),
+  )
+  if (recentMessageIds.seen(dedupeKey(chatId, messageId, revision))) {
+    logDuplicateDrop(chatId, messageId)
+    return
+  }
+  if (deliveredMessageSeen(chatId, messageId, revision)) {
+    logDuplicateDrop(chatId, messageId)
     return
   }
 
@@ -643,40 +706,58 @@ async function handleActivity(context: TurnContext): Promise<void> {
     aad_object_id: aad,
     text,
     ts,
+    ...(revision ? { revision } : {}),
     ...(attachments.length > 0 ? { attachments } : {}),
   }
-  appendMessage(stored)
-
-  void mcp.notification({
-    method: 'notifications/claude/channel',
-    params: {
-      content: text,
-      meta: {
-        source: 'teams',
-        chat_id: chatId,
-        conversation_id: chatId,
-        message_id: messageId,
-        user: userName,
-        user_id: stored.user_id,
-        aad_object_id: aad,
-        tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
-        service_url: String(activity.serviceUrl ?? ''),
-        ts,
-        ...(attachments.length > 0
-          ? {
-              attachments: attachments.map(att => ({
-                name: att.name,
-                content_type: att.content_type,
-                download_status: att.download_status,
-                ...(att.local_path ? { local_path: att.local_path } : {}),
-                ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
-                ...(att.download_error ? { download_error: att.download_error } : {}),
-              })),
-            }
-          : {}),
+  // Channel delivery and local log append are split: a delivery failure must
+  // surface as a non-2xx so Teams retries, but a successful delivery followed
+  // by a failed log append (disk full, EACCES, …) should NOT cause Teams to
+  // retry — the message is already in the active Claude session. The only
+  // observable consequence of a log-append failure is that fetch_messages
+  // can't replay this entry from the local audit log.
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: text || (attachments.length > 0 ? '(attachment)' : ''),
+        meta: {
+          source: 'teams',
+          chat_id: chatId,
+          conversation_id: chatId,
+          message_id: messageId,
+          user: userName,
+          user_id: stored.user_id,
+          aad_object_id: aad,
+          tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
+          service_url: String(activity.serviceUrl ?? ''),
+          ts,
+          ...(revision ? { revision } : {}),
+          ...(attachments.length > 0
+            ? {
+                attachment_count: String(attachments.length),
+                attachments: attachments.map(att => ({
+                  name: att.name,
+                  content_type: att.content_type,
+                  download_status: att.download_status,
+                  ...(att.local_path ? { local_path: att.local_path } : {}),
+                  ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
+                  ...(att.download_error ? { download_error: att.download_error } : {}),
+                })),
+              }
+            : {}),
+        },
       },
-    },
-  })
+    })
+  } catch (err) {
+    recentMessageIds.forget(dedupeKey(chatId, messageId, revision))
+    process.stderr.write(`teams channel: failed to deliver inbound message_id=${messageId}: ${err}\n`)
+    throw err
+  }
+  try {
+    appendMessage(stored)
+  } catch (err) {
+    process.stderr.write(`teams channel: failed to append local log message_id=${messageId} (delivery already succeeded): ${err}\n`)
+  }
 }
 
 const httpServer = createServer((req, res) => {
