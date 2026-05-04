@@ -94,7 +94,7 @@ agb upgrade --dry-run
 agb upgrade --apply
 ```
 
-`--apply` 는 atomic — daemon stop/start, agent restart, shared settings rerender (`autoCompactWindow:400000` 등 managed default propagate), shared hooks 재등록, `_template/CLAUDE.md` sync, `[upgrade-complete]` admin task 등록 모두 포함.
+`--apply` 는 atomic — daemon stop/start, agent restart, shared settings rerender (model-aware `autoCompactWindow` 등 managed default propagate; `[1m]`-variant launches → `1_000_000`, 그 외 → `400_000` 유지, 자세한 내용은 [autoCompactWindow per model](#autocompactwindow-per-model-v076-issue-547) 참고), shared hooks 재등록, `_template/CLAUDE.md` sync, `[upgrade-complete]` admin task 등록 모두 포함.
 
 The upgrader preserves local runtime data by default:
 
@@ -148,6 +148,47 @@ cd ~/.agent-bridge-source
 ./scripts/deploy-live-install.sh --dry-run --target ~/.agent-bridge
 ./scripts/deploy-live-install.sh --target ~/.agent-bridge --restart-daemon
 ```
+
+### autoCompactWindow per model (v0.7.6+, issue #547)
+
+`bridge-hooks.py render-shared-settings` resolves the managed
+`autoCompactWindow` default per agent based on `BRIDGE_AGENT_LAUNCH_CMD`:
+
+- launch_cmd contains `[1m]` (Opus 4.7 1M-context line) → `1_000_000`
+- everything else (Opus 4.6 / pre-1M Sonnet / Haiku) → `400_000` (preserved compromise)
+
+Threading is per-agent: every `bridge-agent.sh rerender-settings`,
+`agent-bridge upgrade --apply`, and `agent-bridge create` invocation forwards
+the resolved launch_cmd to the renderer. Operator overlays
+(`~/.agent-bridge/.claude/settings.local.json` and per-agent base
+`settings.json`) still win over the managed default.
+
+This means `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` is now computed against the
+model's actual native context window for `[1m]` launches, not the
+previously-capped `400_000`. Operators who want to opt back into the legacy
+400K cap on a 1M-context agent set:
+
+```sh
+export CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000
+```
+
+in `agent-roster.local.sh` (env wins over settings per Claude Code's
+resolution order, so this overrides the new model-aware default and
+survives `agent-bridge upgrade --apply`).
+
+**Mixed-model installs (caveat).** The shared settings effective file
+under `$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json` is
+**install-wide** — one file symlinked from each managed agent's workdir.
+On installs where some agents launch `[1m]` and others launch pre-1M
+models, the file inherits the `autoCompactWindow` of whichever agent
+ran the last `agb upgrade --apply` / restart-rerender. Until per-agent
+effective settings lands (tracked separately), operators on mixed-model
+installs should either:
+
+- keep models homogeneous within an install, or
+- override per-agent via `CLAUDE_CODE_AUTO_COMPACT_WINDOW=<value>`
+  in the env-precedence layer (env wins over settings per Claude
+  Code's resolution order).
 
 ## Recommended Collaboration Pattern
 

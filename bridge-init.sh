@@ -464,7 +464,8 @@ fi
 if [[ $dry_run -eq 0 ]] && [[ "$(bridge_agent_engine "$admin_agent" 2>/dev/null || printf '%s' "$engine")" == "claude" ]]; then
   admin_workdir="$(bridge_agent_workdir "$admin_agent" 2>/dev/null || true)"
   if [[ -n "$admin_workdir" ]]; then
-    bridge_ensure_claude_shared_settings_for_managed_workdir "$admin_workdir" >/dev/null 2>&1 || true
+    admin_launch_cmd="$(bridge_agent_launch_cmd_raw "$admin_agent" 2>/dev/null || true)"
+    bridge_ensure_claude_shared_settings_for_managed_workdir "$admin_workdir" "$admin_launch_cmd" >/dev/null 2>&1 || true
   fi
 fi
 

@@ -1345,6 +1345,8 @@ PY
 bridge_agent_shared_settings_plan_json() {
   local agent="$1"
   local workdir="$2"
+  local launch_cmd
+  launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
 
   bridge_agent_manage_python \
     "$SCRIPT_DIR/bridge-hooks.py" \
@@ -1352,14 +1354,15 @@ bridge_agent_shared_settings_plan_json() {
     "$workdir" \
     "$(bridge_hook_shared_settings_base_file)" \
     "$(bridge_hook_shared_settings_overlay_file)" \
-    "$(bridge_hook_shared_settings_effective_file)" <<'PY'
+    "$(bridge_hook_shared_settings_effective_file)" \
+    "$launch_cmd" <<'PY'
 import importlib.util
 import json
 import os
 import sys
 from pathlib import Path
 
-hooks_py, agent, workdir, base_file, overlay_file, effective_file = sys.argv[1:]
+hooks_py, agent, workdir, base_file, overlay_file, effective_file, launch_cmd = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("bridge_hooks", hooks_py)
 if spec is None or spec.loader is None:
     raise SystemExit(f"could not load {hooks_py}")
@@ -1390,7 +1393,8 @@ def load_object(path: Path, label: str, *, absent_ok: bool = True) -> dict:
 
 base_payload = load_object(base_path, "base")
 overlay_payload = load_object(overlay_path, "overlay")
-expected = hooks.merge_settings(hooks.BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS, base_payload)
+managed_defaults = hooks.managed_claude_settings_defaults(launch_cmd or None)
+expected = hooks.merge_settings(managed_defaults, base_payload)
 expected = hooks.merge_settings(expected, overlay_payload)
 
 current_error = ""
@@ -1405,7 +1409,7 @@ effective_exists = effective_path.exists()
 effective_matches = effective_exists and effective_payload == expected
 
 changes = []
-for key in hooks.BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS:
+for key in managed_defaults:
     expected_value = expected.get(key)
     if key not in current_payload:
         changes.append({"key": key, "from": None, "to": expected_value, "reason": "missing"})
@@ -1556,6 +1560,7 @@ run_rerender_settings() {
   local error=""
   local rows_file=""
   local failed_count=0
+  local target_launch_cmd=""
   local -a selected_agents=()
   local -a targets=()
   local -A seen_workdirs=()
@@ -1645,7 +1650,10 @@ run_rerender_settings() {
     before_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
     error=""
     if [[ $apply -eq 1 ]]; then
-      if apply_output="$(bridge_link_claude_settings_to_shared "$workdir" 2>&1)"; then
+      # Issue #547: forward launch_cmd so the rerender picks the right
+      # autoCompactWindow default (1_000_000 for [1m] launches, else 400_000).
+      target_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+      if apply_output="$(bridge_link_claude_settings_to_shared "$workdir" "$target_launch_cmd" 2>&1)"; then
         after_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
         bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "shared_settings_rerendered" "$agent" \
           --detail workdir="$workdir" >/dev/null 2>&1 || true
@@ -1951,7 +1959,9 @@ run_create() {
       "$os_user" >/dev/null
     bridge_load_roster
     if [[ "$engine" == "claude" ]]; then
-      bridge_ensure_claude_shared_settings_for_managed_workdir "$workdir" >/dev/null 2>&1 || true
+      # Issue #547: forward launch_cmd so the freshly-created agent gets
+      # the right autoCompactWindow default for its model variant.
+      bridge_ensure_claude_shared_settings_for_managed_workdir "$workdir" "$launch_cmd" >/dev/null 2>&1 || true
     fi
     bridge_sync_skill_docs "$agent" >/dev/null 2>&1 || true
     if [[ "$isolation_mode" == "linux-user" ]]; then
