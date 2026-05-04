@@ -907,10 +907,36 @@ expect_idle() {
     printf '[smoke]   [ok] %s\n' "$label"
   fi
 }
+expect_pending_ansi() {
+  local label="$1"
+  local text="$2"
+  local ansi="$3"
+  if bridge_tmux_session_has_pending_input_from_text claude "$text" "$ansi"; then
+    printf '[smoke]   [ok] %s\n' "$label"
+  else
+    fail "expected PENDING for: $label"
+  fi
+}
+expect_idle_ansi() {
+  local label="$1"
+  local text="$2"
+  local ansi="$3"
+  if bridge_tmux_session_has_pending_input_from_text claude "$text" "$ansi"; then
+    fail "expected idle for: $label"
+  else
+    printf '[smoke]   [ok] %s\n' "$label"
+  fi
+}
 expect_pending "operator composing single word (> glyph)" \
   $'some prior agent output\n> hello'
 expect_pending "operator composing (❯ glyph)" \
   $'some prior agent output\n❯ thinking about this...'
+expect_pending_ansi "operator composing with ANSI color is still pending" \
+  $'some prior agent output\n❯ 응답 오면 알려줘' \
+  $'some prior agent output\n\e[39m❯ \e[97m응답 오면 알려줘\e[39m'
+expect_idle_ansi "Claude ghost suggestion is idle even when text varies" \
+  $'some prior agent output\n❯ 응답 오면 알려줘' \
+  $'some prior agent output\n\e[39m❯ \e[7m응\e[0;2m답 오면 알려줘\e[0m\e[39m'
 expect_pending "operator composing after scrollback quote" \
   $'agent output\n> an earlier quoted line\nmore agent output\n> typed input'
 expect_idle "empty input box at bottom" \
