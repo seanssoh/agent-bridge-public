@@ -203,9 +203,9 @@ done
 [[ -n "$BASH4_BIN" ]] || die "missing bash 4+ interpreter"
 
 log "linting shell entry points"
-"$BASH4_BIN" -n "$REPO_ROOT"/*.sh "$REPO_ROOT"/agent-bridge "$REPO_ROOT"/agb "$REPO_ROOT"/scripts/smoke-test.sh
+"$BASH4_BIN" -n "$REPO_ROOT"/*.sh "$REPO_ROOT"/agent-bridge "$REPO_ROOT"/agb "$REPO_ROOT"/bin/agb "$REPO_ROOT"/scripts/smoke-test.sh
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck "$REPO_ROOT"/*.sh "$REPO_ROOT"/agent-bridge "$REPO_ROOT"/agb "$REPO_ROOT"/scripts/smoke-test.sh "$REPO_ROOT"/agent-roster.local.example.sh
+  shellcheck "$REPO_ROOT"/*.sh "$REPO_ROOT"/agent-bridge "$REPO_ROOT"/agb "$REPO_ROOT"/bin/agb "$REPO_ROOT"/scripts/smoke-test.sh "$REPO_ROOT"/agent-roster.local.example.sh
 else
   log "shellcheck not installed; skipping"
 fi
@@ -10195,5 +10195,10 @@ bash "$REPO_ROOT/scripts/test-stale-resume.sh"
 # Issue #541 PR-A — memory-daily payload jsonl-aware migration regression.
 log "running cron-migrate-payloads smoke (issue #541 PR-A)"
 bash "$REPO_ROOT/scripts/smoke/cron-migrate-payloads.sh"
+
+# Issue #544 PR1 — curated bin/agb shim for isolated agents.
+log "running isolated-bin-agb smoke (issue #544 PR1)"
+log "isolated-bin-agb covers shim env-source/delegation/fallback only — live PATH injection requires isolate+restart"
+bash "$REPO_ROOT/scripts/smoke/isolated-bin-agb.sh"
 
 log "smoke test passed"
