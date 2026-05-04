@@ -873,13 +873,17 @@ run_agent() {
       printf 'shared_settings_base_file: %s\n' "$(bridge_hook_shared_settings_base_file)"
       printf 'shared_settings_effective_file: %s\n' "$(bridge_hook_shared_settings_effective_file)"
     fi
-    if hook_output="$(bridge_ensure_claude_stop_hook "$workdir" 2>&1)"; then
+    # Issue #555: forward agent id (3rd arg) so the post-ensure relink
+    # writes the per-agent effective file. launch_cmd left empty — setup
+    # only verifies hook wiring; actual managed-default values come from
+    # the rerender path which has the full launch_cmd context.
+    if hook_output="$(bridge_ensure_claude_stop_hook "$workdir" "" "$agent" 2>&1)"; then
       echo "$hook_output"
     else
       echo "$hook_output"
       failures=$((failures + 1))
     fi
-    if prompt_hook_output="$(bridge_ensure_claude_prompt_hook "$workdir" 2>&1)"; then
+    if prompt_hook_output="$(bridge_ensure_claude_prompt_hook "$workdir" "" "$agent" 2>&1)"; then
       echo "$prompt_hook_output"
     else
       echo "$prompt_hook_output"

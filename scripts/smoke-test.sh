@@ -10223,4 +10223,10 @@ bash "$REPO_ROOT/scripts/smoke/isolated-cli-policy.sh"
 log "running system-agent-class smoke (issue #539)"
 bash "$REPO_ROOT/scripts/smoke/system-agent-class.sh"
 
+# Issue #555 — per-agent settings.effective.json rendering for managed
+# (non-isolated) agents. Mixed-model installs no longer last-rerender-wins
+# on `autoCompactWindow` (or any future per-agent managed default).
+log "running per-agent-settings-rendering smoke (issue #555)"
+bash "$REPO_ROOT/scripts/smoke/per-agent-settings-rendering.sh"
+
 log "smoke test passed"

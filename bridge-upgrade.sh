@@ -201,17 +201,21 @@ bridge_upgrade_propagate_claude_hooks() {
       # shared settings pick the right autoCompactWindow default per
       # model variant ([1m] → 1_000_000, otherwise → 400_000).
       launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
-      bridge_ensure_claude_stop_hook "$workdir" "$launch_cmd" >/dev/null 2>&1 || true
-      bridge_ensure_claude_session_start_hook "$workdir" "$launch_cmd" >/dev/null 2>&1 || true
-      bridge_ensure_claude_prompt_hook "$workdir" "$launch_cmd" >/dev/null 2>&1 || true
-      bridge_ensure_claude_prompt_guard_hook "$workdir" "$launch_cmd" >/dev/null 2>&1 || true
-      bridge_ensure_claude_tool_policy_hooks "$workdir" "$launch_cmd" >/dev/null 2>&1 || true
+      # Issue #555: forward agent id so each ensure-*-hook helper relinks
+      # the per-agent effective file (not the install-wide one). Mixed-
+      # model installs no longer last-rerender-wins on per-agent managed
+      # defaults like `autoCompactWindow`.
+      bridge_ensure_claude_stop_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
+      bridge_ensure_claude_session_start_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
+      bridge_ensure_claude_prompt_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
+      bridge_ensure_claude_prompt_guard_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
+      bridge_ensure_claude_tool_policy_hooks "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
       # Issue #509 / PR #510 deployment gap: PreCompact was the one event
       # the propagation loop never re-registered, so hosts that upgraded
       # without restarting agents shipped hooks/pre-compact.py code with
       # no settings.json wire. Adding it here closes that gap on every
       # subsequent upgrade.
-      bridge_ensure_claude_pre_compact_hook "$workdir" "$launch_cmd" >/dev/null 2>&1 || true
+      bridge_ensure_claude_pre_compact_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
     done
   ' -- "$target_root"
 }

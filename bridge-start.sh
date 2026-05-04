@@ -232,19 +232,25 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   if ! bridge_ensure_claude_project_trust "$WORK_DIR" >/dev/null 2>&1; then
     bridge_warn "Claude project trust seed failed: $WORK_DIR"
   fi
-  if ! bridge_ensure_claude_stop_hook "$WORK_DIR" >/dev/null; then
+  # Issue #555: forward agent id (3rd arg) so each ensure-*-hook helper
+  # relinks the per-agent effective file at $BRIDGE_AGENT_HOME_ROOT/<agent>/
+  # .claude/settings.effective.json. Resolve launch_cmd from the roster so
+  # the rerender picks the right autoCompactWindow default for this agent's
+  # model variant ([1m] → 1_000_000, otherwise → 400_000).
+  AGENT_LAUNCH_CMD="$(bridge_agent_launch_cmd_raw "$AGENT" 2>/dev/null || true)"
+  if ! bridge_ensure_claude_stop_hook "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
     bridge_die "Claude Stop hook 설정에 실패했습니다: $WORK_DIR"
   fi
-  if ! bridge_ensure_claude_session_start_hook "$WORK_DIR" >/dev/null; then
+  if ! bridge_ensure_claude_session_start_hook "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
     bridge_die "Claude SessionStart hook 설정에 실패했습니다: $WORK_DIR"
   fi
-  if ! bridge_ensure_claude_prompt_hook "$WORK_DIR" >/dev/null; then
+  if ! bridge_ensure_claude_prompt_hook "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
     bridge_die "Claude UserPromptSubmit hook 설정에 실패했습니다: $WORK_DIR"
   fi
-  if ! bridge_ensure_claude_prompt_guard_hook "$WORK_DIR" >/dev/null; then
+  if ! bridge_ensure_claude_prompt_guard_hook "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
     bridge_die "Claude prompt guard hook 설정에 실패했습니다: $WORK_DIR"
   fi
-  if ! bridge_ensure_claude_tool_policy_hooks "$WORK_DIR" >/dev/null; then
+  if ! bridge_ensure_claude_tool_policy_hooks "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
     bridge_die "Claude tool policy hook 설정에 실패했습니다: $WORK_DIR"
   fi
   if ! bridge_disable_claude_webhook_channel "$AGENT" "$WORK_DIR" >/dev/null 2>&1; then

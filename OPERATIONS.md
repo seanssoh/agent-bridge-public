@@ -176,19 +176,27 @@ in `agent-roster.local.sh` (env wins over settings per Claude Code's
 resolution order, so this overrides the new model-aware default and
 survives `agent-bridge upgrade --apply`).
 
-**Mixed-model installs (caveat).** The shared settings effective file
-under `$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json` is
-**install-wide** — one file symlinked from each managed agent's workdir.
-On installs where some agents launch `[1m]` and others launch pre-1M
-models, the file inherits the `autoCompactWindow` of whichever agent
-ran the last `agb upgrade --apply` / restart-rerender. Until per-agent
-effective settings lands (tracked separately), operators on mixed-model
-installs should either:
+**Per-agent settings.effective.json (issue #555).** As of v0.7.x+, every
+managed agent has its own `settings.effective.json` rendered at
+`$BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/settings.effective.json` and the
+agent's workdir `settings.json` symlinks to it. Per-agent values like
+`autoCompactWindow` are independent — a 1M-context Opus 4.7 `[1m]` agent
+and a pre-1M Opus 4.6 agent on the same install each see their own
+resolved value, regardless of which one ran the last
+`agb upgrade --apply` / restart-rerender.
 
-- keep models homogeneous within an install, or
-- override per-agent via `CLAUDE_CODE_AUTO_COMPACT_WINDOW=<value>`
-  in the env-precedence layer (env wins over settings per Claude
-  Code's resolution order).
+The shared base (`$BRIDGE_AGENT_HOME_ROOT/.claude/settings.json`) and
+overlay (`settings.local.json`) remain install-wide and are still
+authoritative for hook wiring and operator overrides; only the *effective*
+output (managed defaults + base + overlay) is split per agent.
+
+Existing installs migrate automatically on the next `agb upgrade --apply`:
+the per-agent loop renders each agent's per-agent effective file and
+re-points its workdir symlink. The old install-wide
+`$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json` becomes
+orphaned but harmless after migration (no symlink references it);
+operators may delete it manually after verifying the per-agent files
+exist and contain the expected `autoCompactWindow` value.
 
 ## Recommended Collaboration Pattern
 
