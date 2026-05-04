@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -70,11 +71,115 @@ def load_marketplace(root: Path) -> tuple[str, dict[str, dict[str, str]]]:
     return marketplace_name, plugins
 
 
+# Mirrored in lib/bridge-agents.sh (`bridge_known_marketplace_info` and
+# `bridge_write_isolated_known_marketplaces_catalog`). Any change to the
+# accepted forms or the produced slug must be applied to both, otherwise
+# the bash side and the Python side will disagree on the alias for the
+# same source and Claude will fail to resolve the marketplace.
+_GITHUB_URL_PREFIXES = (
+    "https://github.com/",
+    "http://github.com/",
+    "git://github.com/",
+)
+_GITHUB_SSH_PREFIX = "git@github.com:"
+
+
+def _github_repo_slug(source: str) -> str:
+    """Return an `<org>-<repo>` alias when source names a GitHub repo.
+
+    Accepted forms:
+        https://github.com/<org>/<repo>          → <org>-<repo>
+        https://github.com/<org>/<repo>.git      → <org>-<repo>
+        git@github.com:<org>/<repo>.git          → <org>-<repo>
+        <org>/<repo>                             → <org>-<repo>
+        <org>/<repo>.git                         → <org>-<repo>
+
+    Non-GitHub URLs (`https://gitlab.com/...`, `git@example.com:...`,
+    archive URLs, paths) return "" so the caller can fall back to the
+    simple slugify or skip aliasing entirely.
+    """
+    s = (source or "").strip()
+    if not s:
+        return ""
+    lowered = s.lower()
+    matched_prefix = ""
+    for prefix in _GITHUB_URL_PREFIXES:
+        if lowered.startswith(prefix):
+            matched_prefix = prefix
+            break
+    if matched_prefix:
+        s = s[len(matched_prefix):]
+    elif lowered.startswith(_GITHUB_SSH_PREFIX):
+        s = s[len(_GITHUB_SSH_PREFIX):]
+    elif "://" in s or "@" in s.split("/", 1)[0]:
+        # Looks like a URL or SSH spec but not GitHub — refuse rather
+        # than producing a slug like `https:-gitlab.com`.
+        return ""
+    elif s.startswith("/"):
+        # Looks like a filesystem path (`/local/path/...`) — refuse so
+        # the simple-slugify fallback handles the path-style input
+        # rather than producing a misleading `<root>-<dir>` alias.
+        return ""
+    s = s.strip().strip("/")
+    if s.endswith(".git"):
+        s = s[: -len(".git")]
+    parts = [p for p in s.split("/") if p]
+    if len(parts) < 2:
+        return ""
+    org, repo = parts[0], parts[1]
+    if not org or not repo:
+        return ""
+    return f"{org}-{repo}"
+
+
 def marketplace_repo_slug(repo: str) -> str:
-    repo = repo.strip().strip("/")
+    """Back-compat shim: prefer GitHub-aware parsing, then bare org/repo."""
+    slug = _github_repo_slug(repo)
+    if slug:
+        return slug
+    repo = (repo or "").strip().strip("/")
     if not repo or "/" not in repo:
         return ""
     return repo.replace("/", "-")
+
+
+# Mirrored in lib/bridge-agents.sh. Aliases land under
+# `<plugins_root>/marketplaces/<alias>` as root-owned symlinks, so any
+# alias that escapes the marketplaces/ namespace is a privilege-escalation
+# surface. Reject loudly rather than silently sanitising — a rejected
+# input means an upstream catalog/config bug we want surfaced.
+_SAFE_ALIAS_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_ALIAS_RESERVED_NAMES = {".", ".."}
+_ALIAS_WINDOWS_RESERVED = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+
+
+def _alias_rejection_reason(alias: object) -> str:
+    """Return an empty string when alias is safe, else a human-readable reason."""
+    if not isinstance(alias, str):
+        return f"not a string ({type(alias).__name__})"
+    if alias == "":
+        return "empty"
+    if len(alias) > 200:
+        return f"length {len(alias)} exceeds 200"
+    if not _SAFE_ALIAS_RE.match(alias):
+        return "contains characters outside [A-Za-z0-9._-]"
+    if ".." in alias:
+        return "contains '..'"
+    if alias in _ALIAS_RESERVED_NAMES:
+        return f"reserved name '{alias}'"
+    if alias.upper() in _ALIAS_WINDOWS_RESERVED:
+        return f"reserved Windows name '{alias}'"
+    if alias.startswith(".") and alias != ".git":
+        return f"leading dot disallowed ('{alias}')"
+    return ""
+
+
+def _is_safe_alias(alias: object) -> bool:
+    return _alias_rejection_reason(alias) == ""
 
 
 def load_known_marketplaces() -> dict[str, object]:
