@@ -377,9 +377,10 @@ bridge_tmux_session_has_prompt_from_text() {
 bridge_tmux_session_has_pending_input_from_text() {
   local engine="$1"
   local recent="$2"
-  # Issue #195 follow-up: optional 3rd arg carries an ANSI-preserving
-  # capture of the same pane. Used for codex placeholder detection — see
-  # bridge_tmux_codex_last_prompt_is_placeholder.
+  # Issue #195/#1393 follow-up: optional 3rd arg carries an
+  # ANSI-preserving capture of the same pane. Used for prompt ghost-text
+  # detection, because Claude/Codex render suggestions as SGR 2 (dim)
+  # while real typed input is not dimmed.
   local ansi_recent="${3:-}"
   local line=""
   local trimmed=""
@@ -390,6 +391,16 @@ bridge_tmux_session_has_pending_input_from_text() {
 
   if [[ "$engine" == "claude" ]]; then
     if [[ "$(bridge_tmux_claude_blocker_state_from_text "$recent")" != "none" ]]; then
+      return 1
+    fi
+  fi
+
+  # Claude Code renders the inline auto-complete/guide text in the composer
+  # with SGR 2 (dim). Plain tmux capture makes that ghost text look exactly
+  # like user input (`❯ suggestion...`), so reject it before the generic
+  # non-empty-remainder test below marks the session busy forever.
+  if [[ "$engine" == "claude" && -n "$ansi_recent" ]]; then
+    if bridge_tmux_claude_last_prompt_is_ghost_text "$ansi_recent"; then
       return 1
     fi
   fi
@@ -461,12 +472,12 @@ bridge_tmux_session_has_pending_input() {
   # of view between daemon passes.
   recent="$(bridge_capture_recent "$session" 40 join 2>/dev/null || true)"
   [[ -n "$recent" ]] || return 1
-  # Issue #195 follow-up: codex placeholder ghost text is visually
+  # Issue #195/#1393 follow-up: Claude/Codex ghost text is visually
   # indistinguishable from real typed input once ANSI escapes are stripped.
   # Grab an ANSI-preserving capture too so the detector can reject lines
   # rendered with SGR 2 (dim) as non-pending — otherwise inject_busy flips
   # true and daemon nudges get silently spooled instead of delivered.
-  if [[ "$engine" == "codex" ]]; then
+  if [[ "$engine" == "claude" || "$engine" == "codex" ]]; then
     ansi_recent="$(bridge_capture_recent_ansi "$session" 40 2>/dev/null || true)"
   fi
   bridge_tmux_session_has_pending_input_from_text "$engine" "$recent" "$ansi_recent"
@@ -1289,7 +1300,7 @@ bridge_capture_recent() {
 }
 
 bridge_capture_recent_ansi() {
-  # ANSI-preserving capture. Needed to distinguish codex's placeholder
+  # ANSI-preserving capture. Needed to distinguish Claude/Codex placeholder
   # ghost text — rendered as SGR 2 (dim) — from real typed input that
   # looks textually identical once ANSI escapes are stripped (issue #195
   # follow-up). Kept as a separate helper so existing callers keep their
@@ -1297,6 +1308,34 @@ bridge_capture_recent_ansi() {
   local session="$1"
   local lines="${2:-30}"
   tmux capture-pane -t "$(bridge_tmux_pane_target "$session")" -p -e -J -S "-$lines"
+}
+
+bridge_tmux_line_has_sgr_dim() {
+  local line="$1"
+  case "$line" in
+    *$'\x1b[2m'*|*$'\x1b[0;2m'*|*$'\x1b[22;2m'*|*$'\x1b[2;'*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+bridge_tmux_claude_last_prompt_is_ghost_text() {
+  # Scan an ANSI-preserving capture for the last Claude composer prompt and
+  # return 0 (true) if it carries SGR 2 (dim). Claude Code renders inline
+  # auto-complete/guide text this way. The suggestion text itself changes
+  # constantly, so style is the only stable signal.
+  local ansi_text="$1"
+  [[ -n "$ansi_text" ]] || return 1
+  local last_line=""
+  local line=""
+  while IFS= read -r line; do
+    if [[ "$line" == *❯* || "$line" == *'>'* ]]; then
+      last_line="$line"
+    fi
+  done <<<"$ansi_text"
+  [[ -n "$last_line" ]] || return 1
+  bridge_tmux_line_has_sgr_dim "$last_line"
 }
 
 bridge_tmux_codex_last_prompt_is_placeholder() {
@@ -1321,12 +1360,7 @@ bridge_tmux_codex_last_prompt_is_placeholder() {
   # Match the SGR 2 (dim) forms codex is known to emit. Narrow patterns
   # avoid false positives against 24-bit color sequences like `38;2;r;g;b`
   # which coincidentally contain ";2;" but do not enable dim.
-  case "$last_line" in
-    *$'\x1b[2m'*|*$'\x1b[0;2m'*|*$'\x1b[22;2m'*|*$'\x1b[2;'*)
-      return 0
-      ;;
-  esac
-  return 1
+  bridge_tmux_line_has_sgr_dim "$last_line"
 }
 
 bridge_sanitize_text() {

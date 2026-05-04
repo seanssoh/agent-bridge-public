@@ -27,6 +27,16 @@ tmux_pending_input_detection() {
   if bridge_tmux_session_has_pending_input_from_text claude $'> old scrollback\nassistant response\n❯ '; then
     smoke_fail "tmux pending-input detection: old scrollback prompt overrode final empty prompt"
   fi
+  if ! bridge_tmux_session_has_pending_input_from_text claude \
+      $'assistant response\n❯ 응답 오면 알려줘' \
+      $'assistant response\n\e[39m❯ \e[97m응답 오면 알려줘\e[39m'; then
+    smoke_fail "tmux pending-input detection: expected real Claude prompt text to be busy"
+  fi
+  if bridge_tmux_session_has_pending_input_from_text claude \
+      $'assistant response\n❯ 응답 오면 알려줘' \
+      $'assistant response\n\e[39m❯ \e[7m응\e[0;2m답 오면 알려줘\e[0m\e[39m'; then
+    smoke_fail "tmux pending-input detection: Claude dim ghost text was treated as busy"
+  fi
   if ! bridge_tmux_session_has_pending_input_from_text codex $'› operator draft'; then
     smoke_fail "tmux pending-input detection: expected Codex prompt text to be busy"
   fi
