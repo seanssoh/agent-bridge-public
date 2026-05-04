@@ -111,6 +111,18 @@ run_uid_match_shim() {
     bash "$FIXTURE_HOME/bin/agb" "$@"
 }
 
+run_proxy_no_controller_shim() {
+  # BRIDGE_GATEWAY_PROXY=1 but BRIDGE_CONTROLLER_UID is unset/empty →
+  # strict gate must NOT fire (no fallback to proxy-flag-only).
+  env -i \
+    PATH="/usr/bin:/bin" \
+    HOME="$SMOKE_TMP_ROOT" \
+    BRIDGE_HOME="$FIXTURE_HOME" \
+    BRIDGE_GATEWAY_PROXY=1 \
+    BRIDGE_AGENT_ID=test-agent \
+    bash "$FIXTURE_HOME/bin/agb" "$@"
+}
+
 last_audit_row() {
   [[ -f "$AUDIT_LOG" ]] || return 0
   tail -n 1 "$AUDIT_LOG"
@@ -221,6 +233,70 @@ assert_audit_redaction_drops_arg_values() {
     "audit redaction: flag names NOT emitted (only arg_count)"
 }
 
+assert_proxy_without_controller_uid_skips_gate() {
+  # Strict isolated detection: BRIDGE_GATEWAY_PROXY=1 alone (no
+  # BRIDGE_CONTROLLER_UID hint) must NOT trigger the gate. Falling back
+  # to proxy-flag-only would deny operator-class commands in a
+  # controller shell that happens to have the proxy flag exported (e.g.
+  # operator debugging gateway routing). admin is a denylist subcommand
+  # if the gate fires; if it pops through cleanly we've confirmed the
+  # gate stayed off.
+  : >"$STUB_LOG"
+  : >"$AUDIT_LOG"
+  run_proxy_no_controller_shim admin --some-arg
+  smoke_assert_contains "$(cat "$STUB_LOG")" "INVOKED:admin --some-arg" \
+    "BRIDGE_GATEWAY_PROXY=1 + BRIDGE_CONTROLLER_UID unset bypasses policy (strict gate)"
+  local audit_size
+  audit_size="$(wc -c <"$AUDIT_LOG" | tr -d ' ')"
+  smoke_assert_eq "0" "$audit_size" \
+    "BRIDGE_GATEWAY_PROXY=1 + BRIDGE_CONTROLLER_UID unset writes NO audit row"
+}
+
+assert_audit_row_is_valid_jsonl() {
+  # Subcommand carrying a literal `"` would break the audit row if the
+  # shim's printf didn't json-escape the value. Use a denylist
+  # subcommand (anything outside the allowlist) so the row goes through
+  # the deny branch — both branches share the same printf.
+  : >"$STUB_LOG"
+  : >"$AUDIT_LOG"
+  local rc=0
+  run_isolated_shim 'foo"bar' >/dev/null 2>&1 || rc=$?
+  smoke_assert_eq "64" "$rc" \
+    "JSONL escape: quote-bearing subcommand still hits deny branch (exit 64)"
+
+  # Validate every row in the audit log parses as JSON.
+  if ! python3 -c '
+import json, sys
+with open(sys.argv[1]) as fh:
+    for i, line in enumerate(fh, 1):
+        line = line.strip()
+        if not line:
+            continue
+        json.loads(line)
+' "$AUDIT_LOG" 2>/dev/null; then
+    smoke_fail "JSONL escape: audit row containing quote in subcommand is not valid JSONL"
+  else
+    smoke_log "JSONL escape: audit row with quote-bearing subcommand parses as valid JSONL"
+  fi
+
+  # And confirm the escaped subcommand round-trips correctly.
+  local extracted
+  extracted="$(python3 -c '
+import json, sys
+with open(sys.argv[1]) as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        row = json.loads(line)
+        if row.get("subcommand") == "foo\"bar":
+            print("MATCH")
+            break
+' "$AUDIT_LOG" 2>/dev/null)"
+  smoke_assert_eq "MATCH" "$extracted" \
+    "JSONL escape: subcommand value preserved through json.loads round-trip"
+}
+
 main() {
   build_fixture
 
@@ -234,6 +310,10 @@ main() {
     assert_uid_match_skips_gate
   smoke_run "audit row redacts arg values (arg_count only)" \
     assert_audit_redaction_drops_arg_values
+  smoke_run "strict gate: proxy flag + unset CONTROLLER_UID bypasses policy" \
+    assert_proxy_without_controller_uid_skips_gate
+  smoke_run "audit row remains valid JSONL when subcommand contains a quote" \
+    assert_audit_row_is_valid_jsonl
 
   smoke_log "PASS"
 }

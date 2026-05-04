@@ -3,12 +3,15 @@
 #
 # - PR1: env-file sourcing + BRIDGE_HOME fallback + exec delegation.
 # - PR4: subcommand allowlist + audit when invoked from an isolated UID.
-#   Detection requires both BRIDGE_GATEWAY_PROXY=1 (set in the agent's
-#   agent-env.sh by bridge_write_linux_agent_env_file for linux-user
-#   isolation) AND a UID mismatch against BRIDGE_CONTROLLER_UID. Either
-#   gate alone is insufficient: the env flag could be exported manually
-#   in a controller shell, and the UID hint may be missing on installs
-#   that haven't refreshed the env file yet.
+#   Detection is STRICT: requires BRIDGE_GATEWAY_PROXY=1 (set in the
+#   agent's agent-env.sh by bridge_write_linux_agent_env_file for
+#   linux-user isolation) AND a non-empty BRIDGE_CONTROLLER_UID that
+#   differs from the running UID. Both halves must hold; there is no
+#   fallback to proxy-flag-only when the UID hint is missing. A
+#   controller shell with BRIDGE_GATEWAY_PROXY=1 exported (operator
+#   debugging gateway routing) would otherwise be incorrectly treated
+#   as isolated and have admin commands denied. Installs missing the
+#   UID hint should re-run isolated env regeneration.
 #
 # Out of scope here: arg-value capture (privacy), audit-log rotation,
 # verbose-audit env. Tracked as PR4 follow-ups.
@@ -45,24 +48,42 @@ if [[ -z "${BRIDGE_HOME:-}" ]]; then
   unset _shim_self _shim_link _shim_max_hops _shim_dir
 fi
 
+# JSON-escape helper for audit-row string fields. The audit row is a
+# pure-bash printf so values containing `"`, `\`, or whitespace control
+# chars would otherwise produce invalid JSONL and break log readers.
+# Keep this minimal: escape the chars JSON requires (RFC 8259 §7) for
+# the field surface we actually emit (subcommand, agent id, ts, reason,
+# decision). Order matters: backslash MUST come first so we don't
+# double-escape escapes we just inserted.
+_json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
 # === PR4: isolated subcommand allowlist + audit ===
 # Apply policy only when invoked from an isolated UID context. Both gates
-# must fire:
+# must fire STRICTLY — there is no fallback when the controller UID hint
+# is missing:
 #   1. BRIDGE_GATEWAY_PROXY=1 — set in the agent's agent-env.sh when
 #      isolation_mode == linux-user (lib/bridge-agents.sh).
-#   2. running UID != BRIDGE_CONTROLLER_UID (also emitted into the same
-#      env file). Guards against an operator who manually exports
-#      BRIDGE_GATEWAY_PROXY=1 in their controller shell.
-# When BRIDGE_CONTROLLER_UID is missing (env file from <0.7.6+ that
-# hasn't been rewritten yet), fall back to the proxy flag alone — that's
-# the behaviour the existing gateway-routing code already trusts.
+#   2. BRIDGE_CONTROLLER_UID is non-empty AND != running UID. Both halves
+#      matter. Falling back to the proxy flag alone would be unsafe: a
+#      controller shell with BRIDGE_GATEWAY_PROXY=1 exported (e.g. an
+#      operator debugging gateway routing) would otherwise be treated as
+#      isolated and have admin commands denied. Installs without the UID
+#      hint emitted should re-run isolated env regeneration rather than
+#      have the shim guess.
 _isolated_invocation=0
 _self_uid="$(id -u)"
+_controller_uid=""
 if [[ "${BRIDGE_GATEWAY_PROXY:-0}" == "1" ]]; then
   _controller_uid="${BRIDGE_CONTROLLER_UID:-}"
   if [[ -n "$_controller_uid" && "$_self_uid" != "$_controller_uid" ]]; then
-    _isolated_invocation=1
-  elif [[ -z "$_controller_uid" ]]; then
     _isolated_invocation=1
   fi
 fi
@@ -95,7 +116,13 @@ if (( _isolated_invocation == 1 )); then
     _arg_count=0
   fi
   _audit_row="$(printf '{"ts":"%s","agent":"%s","uid":%s,"subcommand":"%s","arg_count":%d,"decision":"%s","reason":"%s","source":"isolated_cli_policy"}' \
-    "$_ts" "$_agent_id" "$_self_uid" "$_subcommand" "$_arg_count" "$_decision" "$_reason")"
+    "$(_json_escape "$_ts")" \
+    "$(_json_escape "$_agent_id")" \
+    "$_self_uid" \
+    "$(_json_escape "$_subcommand")" \
+    "$_arg_count" \
+    "$(_json_escape "$_decision")" \
+    "$(_json_escape "$_reason")")"
   if mkdir -p "$_audit_dir" 2>/dev/null && [[ -w "$_audit_dir" ]]; then
     printf '%s\n' "$_audit_row" >>"$_audit_log" 2>/dev/null || true
   fi
