@@ -132,6 +132,40 @@ assert_shim_propagates_exit_code() {
     "shim propagates underlying agb exit code (no swallow)"
 }
 
+assert_shim_resolves_symlinked_invocation() {
+  : >"$STUB_LOG"
+  # Operators may symlink the shim from a non-standard PATH location
+  # (e.g. /usr/local/bin/agb -> ${BRIDGE_HOME}/bin/agb). When invoked via
+  # such a symlink with BRIDGE_HOME unset, the shim must walk the symlink
+  # back to its real parent and derive the underlying $BRIDGE_HOME/agb
+  # from there — not from the symlink's directory.
+  #
+  # macOS TMPDIR is itself a /var -> /private/var symlink, so the
+  # fixture path must be canonicalized via `cd -P && pwd -P` before
+  # comparing against what the shim's own resolution emits.
+  local fixture_real
+  fixture_real="$(cd -P "$FIXTURE_HOME" && pwd -P)"
+  mkdir -p "$FIXTURE_HOME/symlink"
+  ln -sf "$FIXTURE_HOME/bin/agb" "$FIXTURE_HOME/symlink/agb"
+
+  env -i \
+    PATH="/usr/bin:/bin" \
+    HOME="$SMOKE_TMP_ROOT" \
+    bash "$FIXTURE_HOME/symlink/agb" symlink-arg
+
+  smoke_assert_file_exists "$STUB_LOG" "stub agb log written for symlinked invocation"
+  local out
+  out="$(cat "$STUB_LOG")"
+  smoke_assert_contains "$out" "argv:symlink-arg" \
+    "shim forwards args when invoked via symlink"
+  smoke_assert_contains "$out" "BRIDGE_HOME=$fixture_real" \
+    "shim resolves BRIDGE_HOME through the symlink to the real parent"
+  smoke_assert_contains "$out" "STUB_AGB_PATH=$FIXTURE_HOME/agb" \
+    "shim delegates to the real sibling agb (not symlink-dir/agb)"
+  smoke_assert_not_contains "$out" "BRIDGE_HOME=$FIXTURE_HOME/symlink" \
+    "shim does NOT use the symlink directory as BRIDGE_HOME"
+}
+
 main() {
   build_fixture
 
@@ -141,6 +175,8 @@ main() {
     assert_shim_works_without_env_file
   smoke_run "shim propagates exit code" \
     assert_shim_propagates_exit_code
+  smoke_run "shim resolves symlinked invocation to real BRIDGE_HOME" \
+    assert_shim_resolves_symlinked_invocation
 
   smoke_log "PASS"
 }
