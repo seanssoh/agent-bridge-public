@@ -492,11 +492,41 @@ def protected_path_reason(
         return SYSTEM_CONFIG_DENY_REASON
     if admin:
         return None
+    # Issue #539 r2: shared/* is NOT a peer-agent path, so
+    # target_agent_for_path() returns None for it and the original
+    # `if target:` block below never fired for shared reads. Evaluate
+    # the system-class shared/* gate first, before peer-agent
+    # resolution, so:
+    #   - shared/private/*, shared/secrets/* → DENY for system class
+    #     (operators may put credentials/secrets here that even
+    #     ingestion agents must not see).
+    #   - shared/<anything else> → ALLOW + audit for system class.
+    # User class shared/* behavior is unchanged: target stays None,
+    # the function returns None below, and the read passes without
+    # audit (matches pre-#539 behavior — out of #539 scope).
+    if read_intent and current_agent_class() == "system":
+        rel_shared = _resolve_under(path, bridge_home_dir() / "shared")
+        if rel_shared is not None:
+            rel_str = rel_shared.as_posix()
+            if rel_str != "." and any(
+                rel_str == forbidden.rstrip("/") or rel_str.startswith(forbidden)
+                for forbidden in _SHARED_FORBIDDEN_PREFIXES
+            ):
+                return (
+                    "cross-agent access is blocked: shared/private and "
+                    "shared/secrets are off-limits even for system-class agents"
+                )
+            emit_system_cross_agent_read(
+                agent=agent,
+                target_path=str(path),
+                target_agent="",
+                tool="Read",
+            )
+            return None
     target = target_agent_for_path(path, agent)
     if target:
         # Issue #539: class=system agents are allowed read-only access to
-        # peer memory/{projects,decisions,shared}/ subtrees and to
-        # shared/* (excluding shared/private/, shared/secrets/). The
+        # peer memory/{projects,decisions,shared}/ subtrees. The
         # carve-out fires only for read-intent tools (Read / Glob /
         # Grep / NotebookRead) — Bash/Edit/Write reach this branch with
         # read_intent=False and stay denied. Every allowed read emits a
