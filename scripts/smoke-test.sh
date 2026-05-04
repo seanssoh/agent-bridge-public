@@ -10214,6 +10214,11 @@ log "running isolated-settings-rendering smoke (issue #544 PR2)"
 log "isolated-settings-rendering covers Python renderer only — live install/symlink-swap requires isolate+restart"
 bash "$REPO_ROOT/scripts/smoke/isolated-settings-rendering.sh"
 
+# Issue #544 PR4 — isolated subcommand allowlist + audit on bin/agb shim.
+log "running isolated-cli-policy smoke (issue #544 PR4)"
+log "isolated-cli-policy covers shim allowlist/denylist gate + audit redaction — live BRIDGE_CONTROLLER_UID emission requires isolate+restart on a Linux host"
+bash "$REPO_ROOT/scripts/smoke/isolated-cli-policy.sh"
+
 # Issue #539 — system agent class roundtrip + tool-policy gate scenarios.
 log "running system-agent-class smoke (issue #539)"
 bash "$REPO_ROOT/scripts/smoke/system-agent-class.sh"
