@@ -465,7 +465,11 @@ if [[ $dry_run -eq 0 ]] && [[ "$(bridge_agent_engine "$admin_agent" 2>/dev/null 
   admin_workdir="$(bridge_agent_workdir "$admin_agent" 2>/dev/null || true)"
   if [[ -n "$admin_workdir" ]]; then
     admin_launch_cmd="$(bridge_agent_launch_cmd_raw "$admin_agent" 2>/dev/null || true)"
-    bridge_ensure_claude_shared_settings_for_managed_workdir "$admin_workdir" "$admin_launch_cmd" >/dev/null 2>&1 || true
+    # Issue #555: pass admin agent id so the rendered effective file
+    # lives at $BRIDGE_AGENT_HOME_ROOT/<admin>/.claude/settings.effective.json
+    # (per-agent), not the install-wide path that would later be overwritten
+    # by other managed agents' rerenders.
+    bridge_ensure_claude_shared_settings_for_managed_workdir "$admin_workdir" "$admin_launch_cmd" "$admin_agent" >/dev/null 2>&1 || true
   fi
 fi
 

@@ -1348,13 +1348,19 @@ bridge_agent_shared_settings_plan_json() {
   local launch_cmd
   launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
 
+  # Issue #555: the rerender now writes the effective file at the
+  # per-agent path ($BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/
+  # settings.effective.json). The plan/diff helper must compare the
+  # workdir symlink against the same per-agent target it will be
+  # relinked to — comparing against the install-wide path would
+  # forever report `needs-rerender` after a successful apply.
   bridge_agent_manage_python \
     "$SCRIPT_DIR/bridge-hooks.py" \
     "$agent" \
     "$workdir" \
     "$(bridge_hook_shared_settings_base_file)" \
     "$(bridge_hook_shared_settings_overlay_file)" \
-    "$(bridge_hook_shared_settings_effective_file)" \
+    "$(bridge_hook_per_agent_settings_effective_file "$agent")" \
     "$launch_cmd" <<'PY'
 import importlib.util
 import json
@@ -1653,7 +1659,12 @@ run_rerender_settings() {
       # Issue #547: forward launch_cmd so the rerender picks the right
       # autoCompactWindow default (1_000_000 for [1m] launches, else 400_000).
       target_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
-      if apply_output="$(bridge_link_claude_settings_to_shared "$workdir" "$target_launch_cmd" 2>&1)"; then
+      # Issue #555: forward agent id so the rerender writes to the
+      # per-agent effective file ($BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/
+      # settings.effective.json). Mixed-model installs no longer fight
+      # over a single install-wide file; each agent's autoCompactWindow
+      # (and any future per-agent managed default) is independent.
+      if apply_output="$(bridge_link_claude_settings_to_shared "$workdir" "$target_launch_cmd" "$agent" 2>&1)"; then
         after_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
         bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "shared_settings_rerendered" "$agent" \
           --detail workdir="$workdir" >/dev/null 2>&1 || true
@@ -1972,7 +1983,9 @@ run_create() {
     if [[ "$engine" == "claude" ]]; then
       # Issue #547: forward launch_cmd so the freshly-created agent gets
       # the right autoCompactWindow default for its model variant.
-      bridge_ensure_claude_shared_settings_for_managed_workdir "$workdir" "$launch_cmd" >/dev/null 2>&1 || true
+      # Issue #555: pass agent id so the freshly-created agent gets its
+      # own per-agent settings.effective.json (not the install-wide one).
+      bridge_ensure_claude_shared_settings_for_managed_workdir "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
     fi
     bridge_sync_skill_docs "$agent" >/dev/null 2>&1 || true
     if [[ "$isolation_mode" == "linux-user" ]]; then

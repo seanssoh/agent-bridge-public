@@ -39,6 +39,22 @@ bridge_hook_shared_settings_effective_file() {
   printf '%s/.claude/settings.effective.json' "$BRIDGE_AGENT_HOME_ROOT"
 }
 
+# Issue #555: per-agent rendering target for managed (non-isolated) agents.
+# `bridge_link_claude_settings_to_shared` writes to this path when the caller
+# passes the agent id, eliminating the "last rerender wins" mixed-model
+# behavior on per-agent managed defaults like `autoCompactWindow`. The base
+# (.claude/settings.json) and overlay (.claude/settings.local.json) under
+# $BRIDGE_AGENT_HOME_ROOT remain install-wide; only the *effective* output
+# is per-agent and lives inside that agent's managed workdir
+# ($BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/), next to the symlinked
+# settings.json. After migration, the install-wide
+# `$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json` becomes orphaned
+# but harmless — operators may delete it manually after verifying.
+bridge_hook_per_agent_settings_effective_file() {
+  local agent="$1"
+  printf '%s/%s/.claude/settings.effective.json' "$BRIDGE_AGENT_HOME_ROOT" "$agent"
+}
+
 bridge_hook_paths_equal() {
   local left="$1"
   local right="$2"
@@ -116,8 +132,14 @@ bridge_claude_settings_mode() {
 bridge_ensure_claude_shared_settings_for_managed_workdir() {
   local workdir="$1"
   local launch_cmd="${2-}"
+  # Issue #555: optional 3rd arg switches to per-agent rendering. Forward
+  # it through so callers that already know the agent id (start path,
+  # rerender loop, upgrade propagate, admin-pair init) get independent
+  # `settings.effective.json` files; callers that don't (back-compat) keep
+  # the legacy install-wide render.
+  local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
-    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
     return 0
   fi
@@ -126,17 +148,26 @@ bridge_ensure_claude_shared_settings_for_managed_workdir() {
 bridge_link_claude_settings_to_shared() {
   local workdir="$1"
   # Issue #547: launch_cmd substring '[1m]' raises the managed
-  # autoCompactWindow default from 400_000 to 1_000_000. The shared
-  # settings file is install-wide; on a mixed-model install the last
-  # rerender for an agent decides the value. The dominant case is
-  # all-Opus-4.7-[1m] (or all-pre-1M), where every rerender agrees.
+  # autoCompactWindow default from 400_000 to 1_000_000.
   local launch_cmd="${2-}"
+  # Issue #555: when the caller passes the agent id (3rd arg), render the
+  # effective file at the per-agent path so mixed-model installs get
+  # independent values for `autoCompactWindow` (and any future per-agent
+  # managed default). When omitted (legacy callers), fall back to the
+  # install-wide render so the helper remains backwards-compatible.
+  local agent="${3-}"
+  local effective_file
+  if [[ -n "$agent" ]]; then
+    effective_file="$(bridge_hook_per_agent_settings_effective_file "$agent")"
+  else
+    effective_file="$(bridge_hook_shared_settings_effective_file)"
+  fi
   bridge_hooks_python render-shared-settings \
     --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
     --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
-    --effective-settings-file "$(bridge_hook_shared_settings_effective_file)" \
+    --effective-settings-file "$effective_file" \
     --launch-cmd "$launch_cmd" >/dev/null
-  bridge_hooks_python link-shared-settings --workdir "$workdir" --shared-settings-file "$(bridge_hook_shared_settings_effective_file)"
+  bridge_hooks_python link-shared-settings --workdir "$workdir" --shared-settings-file "$effective_file"
 }
 
 bridge_ensure_claude_project_trust() {
@@ -192,9 +223,12 @@ bridge_claude_tool_policy_hooks_status() {
 bridge_ensure_claude_stop_hook() {
   local workdir="$1"
   local launch_cmd="${2-}"
+  # Issue #555: optional 3rd arg routes the post-ensure relink to the
+  # per-agent effective file when the caller knows the agent id.
+  local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-stop-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --bash-bin bash >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
     bridge_hooks_python ensure-stop-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN"
   fi
@@ -203,9 +237,10 @@ bridge_ensure_claude_stop_hook() {
 bridge_ensure_claude_session_start_hook() {
   local workdir="$1"
   local launch_cmd="${2-}"
+  local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-session-start-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
     bridge_hooks_python ensure-session-start-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi
@@ -214,9 +249,10 @@ bridge_ensure_claude_session_start_hook() {
 bridge_ensure_claude_prompt_hook() {
   local workdir="$1"
   local launch_cmd="${2-}"
+  local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-prompt-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --bash-bin bash --python-bin python3 >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
     bridge_hooks_python ensure-prompt-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin "$BRIDGE_BASH_BIN" --python-bin "$(command -v python3)"
   fi
@@ -225,9 +261,10 @@ bridge_ensure_claude_prompt_hook() {
 bridge_ensure_claude_prompt_guard_hook() {
   local workdir="$1"
   local launch_cmd="${2-}"
+  local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-prompt-guard-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
     bridge_hooks_python ensure-prompt-guard-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi
@@ -236,9 +273,10 @@ bridge_ensure_claude_prompt_guard_hook() {
 bridge_ensure_claude_tool_policy_hooks() {
   local workdir="$1"
   local launch_cmd="${2-}"
+  local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-tool-policy-hooks --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
     bridge_hooks_python ensure-tool-policy-hooks --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi
@@ -255,9 +293,10 @@ bridge_ensure_claude_tool_policy_hooks() {
 bridge_ensure_claude_pre_compact_hook() {
   local workdir="$1"
   local launch_cmd="${2-}"
+  local agent="${3-}"
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-pre-compact-hook --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
-    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd"
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
   else
     bridge_hooks_python ensure-pre-compact-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi

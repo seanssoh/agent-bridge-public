@@ -83,8 +83,11 @@ assert_apply_rerenders_and_preserves_overlay() {
   smoke_assert_eq "rerendered" "$status" "rerender apply status"
 
   settings_file="$BRIDGE_AGENT_HOME_ROOT/patch/.claude/settings.json"
-  effective_file="$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json"
-  [[ -L "$settings_file" ]] || smoke_fail "rerender apply should link agent settings to shared effective settings"
+  # Issue #555: rerender writes per-agent effective file under each
+  # agent's workdir, not the install-wide path; the workdir symlink
+  # points to that per-agent file.
+  effective_file="$BRIDGE_AGENT_HOME_ROOT/patch/.claude/settings.effective.json"
+  [[ -L "$settings_file" ]] || smoke_fail "rerender apply should link agent settings to per-agent effective settings"
   smoke_assert_eq "400000" "$(settings_value "$settings_file" autoCompactWindow)" "rerender apply backfills autoCompactWindow"
   smoke_assert_eq "yes" "$(python3 - "$settings_file" <<'PY'
 import json, sys
@@ -92,7 +95,7 @@ from pathlib import Path
 print(json.loads(Path(sys.argv[1]).read_text()).get("env", {}).get("OVERLAY_ONLY"))
 PY
 )" "rerender apply preserves operator overlay"
-  smoke_assert_eq "400000" "$(settings_value "$effective_file" autoCompactWindow)" "shared effective has managed default"
+  smoke_assert_eq "400000" "$(settings_value "$effective_file" autoCompactWindow)" "per-agent effective has managed default"
 
   audit="$(cat "$BRIDGE_AUDIT_LOG")"
   smoke_assert_contains "$audit" "shared_settings_rerendered" "rerender apply emits audit row"
@@ -102,7 +105,8 @@ assert_upgrade_runs_rerender() {
   local agent_home upgrade_json has_patch
 
   agent_home="$BRIDGE_AGENT_HOME_ROOT/patch"
-  rm -f "$agent_home/.claude/settings.json" "$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json"
+  # Issue #555: per-agent effective file lives under <agent>/.claude/.
+  rm -f "$agent_home/.claude/settings.json" "$agent_home/.claude/settings.effective.json"
   printf '%s\n' '{"env":{"BASE_ONLY":"yes-again"}}' >"$agent_home/.claude/settings.json"
 
   upgrade_json="$(
@@ -129,7 +133,8 @@ assert_operator_overlay_wins() {
   local agent_home output status
 
   agent_home="$BRIDGE_AGENT_HOME_ROOT/patch"
-  rm -f "$agent_home/.claude/settings.json" "$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json"
+  # Issue #555: per-agent effective file lives under <agent>/.claude/.
+  rm -f "$agent_home/.claude/settings.json" "$agent_home/.claude/settings.effective.json"
   printf '%s\n' '{"autoCompactWindow":600000,"env":{"OVERLAY_ONLY":"yes"}}' >"$BRIDGE_AGENT_HOME_ROOT/.claude/settings.local.json"
   printf '%s\n' '{"env":{"STALE_AGENT":"yes"}}' >"$agent_home/.claude/settings.json"
 
