@@ -355,6 +355,7 @@ bridge_sync_isolated_home_claude_skills() {
               bridge_warn "isolated skills sync: atomic mv failed for $target_file"
             }
           else
+            bridge_linux_sudo_root rm -f "$_tmp_target" 2>/dev/null || true
             bridge_warn "isolated skills sync: install failed for $target_file"
           fi
         else
@@ -368,6 +369,7 @@ bridge_sync_isolated_home_claude_skills() {
             bridge_warn "isolated skills sync: atomic mv failed for $target_file"
           }
         else
+          bridge_linux_sudo_root rm -f "$_tmp_target" 2>/dev/null || true
           bridge_warn "isolated skills sync: copy failed for $target_file"
         fi
       fi
