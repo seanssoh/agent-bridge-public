@@ -55,6 +55,59 @@ _RUN_STATUS_FAILED_STATES = {"error"}
 _QUEUE_TERMINAL_STATUSES = {"done", "cancelled"}
 
 
+# Canonical memory-daily prompt body template (issue #541 PR-A).
+#
+# Both `agb cron create --family memory-daily` (via title-detection) and
+# `agb cron migrate-payloads --jsonl-aware` write this exact text, with
+# `{agent}` substituted, into the memory-daily job payloads. Keep this in
+# sync with bootstrap-memory-system.sh:step_memory_daily_cron_one and
+# docs/agent-runtime/memory-daily-harvest.md §2.
+#
+# The first line is load-bearing: the cron runner forwards the payload text
+# to a Claude subagent as the prompt body, and the subagent invokes the
+# harvester via Bash (see docs/agent-runtime/memory-daily-harvest.md §3).
+# The harvester itself runs scripts/daily-note-reconcile.py against the
+# agent's most recent jsonl session before the harvest pass; the comment
+# block exists so the subagent's pattern-matching surfaces the right
+# context (jsonl / session_id / daily-note-reconcile keywords) and so
+# operator-readers can audit jsonl-awareness from the cron payload alone.
+# The "Do NOT re-interpret" pragma is also load-bearing — without it the
+# subagent could paraphrase actions_taken and break the daemon
+# refresh-gating contract documented in §7 of the same doc.
+MEMORY_DAILY_JSONL_AWARE_PROMPT_TEMPLATE = (
+    'bash "$BRIDGE_HOME/scripts/memory-daily-harvest.sh" --agent {agent}\n'
+    "\n"
+    "# This harvester reconciles the agent's most recent jsonl session\n"
+    "# transcript (resolved via session_id under ~/.claude/projects/) into the\n"
+    "# agent's daily note at memory/daily/<YYYY-MM-DD>.md by invoking\n"
+    "# scripts/daily-note-reconcile.py before the harvest pass. The harvester\n"
+    "# then writes the authoritative RESULT_SCHEMA JSON to\n"
+    "# $CRON_REQUEST_DIR/authoritative-memory-daily.json. The runner reads that\n"
+    "# file directly. Your structured_output is a secondary relay.\n"
+    "# Do NOT re-interpret status / summary / actions_taken — the harvester is authoritative."
+)
+
+
+def render_memory_daily_jsonl_aware_prompt(agent):
+    """Materialize MEMORY_DAILY_JSONL_AWARE_PROMPT_TEMPLATE for one agent."""
+    return MEMORY_DAILY_JSONL_AWARE_PROMPT_TEMPLATE.format(agent=agent)
+
+
+# Tokens that together prove a memory-daily payload is jsonl-aware. The
+# canonical body above contains all three; hand-edited operator overrides
+# that lack any of them are flagged for migration.
+_MEMORY_DAILY_JSONL_AWARE_TOKENS = ("jsonl", "session_id", "daily-note-reconcile")
+
+
+def memory_daily_payload_is_jsonl_aware(text):
+    """True iff the payload text references jsonl + session_id + the
+    canonical reconciler (daily-note-reconcile.py) — see issue #541 PR-A."""
+    if not text:
+        return False
+    lowered = text.lower()
+    return all(token in lowered for token in _MEMORY_DAILY_JSONL_AWARE_TOKENS)
+
+
 def load_jobs_payload(path):
     raw = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
     jobs = raw.get("jobs") if isinstance(raw, dict) else raw
@@ -1631,6 +1684,16 @@ def run_native_create(args):
     actor = args.actor or os.environ.get("USER", "unknown")
     title = args.title.strip()
     payload_text = read_payload_argument(args.payload, args.payload_file)
+    # Issue #541 PR-A — default memory-daily payloads to the canonical
+    # jsonl-aware body when the operator did not supply one explicitly.
+    # Operator-provided payloads (--payload / --payload-file) pass through
+    # unchanged so existing override workflows keep working.
+    if (
+        args.payload is None
+        and args.payload_file is None
+        and classify_family(title) == "memory-daily"
+    ):
+        payload_text = render_memory_daily_jsonl_aware_prompt(args.agent)
     base_slug = slugify_title(title)
     job_id = f"{base_slug}-{secrets.token_hex(4)}"
 
@@ -1831,6 +1894,96 @@ def run_native_rebalance_memory_daily(args):
                     new_tz=tz_name,
                 )
             )
+    return 0
+
+
+def run_migrate_payloads(args):
+    """Rewrite memory-daily job payloads to the canonical jsonl-aware body.
+
+    Issue #541 PR-A. Idempotent: jobs whose payload already passes
+    memory_daily_payload_is_jsonl_aware() are counted as `unchanged` and
+    are not modified. Non-memory-daily jobs are left strictly untouched
+    (counted as `skipped_non_memory_daily`). On any mutation a
+    jobs.json.bak-<timestamp> backup is written first, mirroring the
+    cleanup-prune convention.
+    """
+    raw_payload, jobs = load_jobs_payload(args.jobs_file)
+    jobs_path = Path(args.jobs_file).expanduser()
+
+    migrated = []
+    unchanged = []
+    skipped_non_memory_daily = 0
+    updated_jobs = []
+
+    for job in jobs:
+        name = str(job.get("name") or "")
+        if classify_family(name) != "memory-daily":
+            skipped_non_memory_daily += 1
+            updated_jobs.append(job)
+            continue
+
+        payload = job.get("payload") or {}
+        text = payload.get("text") or payload.get("message") or ""
+        if memory_daily_payload_is_jsonl_aware(text):
+            unchanged.append({"id": job.get("id"), "name": name})
+            updated_jobs.append(job)
+            continue
+
+        agent = job.get("agentId") or job.get("agent") or ""
+        canonical = render_memory_daily_jsonl_aware_prompt(agent)
+        updated = dict(job)
+        updated_payload = dict(payload)
+        updated_payload["text"] = canonical
+        # Preserve the original payload kind ("text") if it was set, else
+        # default to "text" — the runner reads .text either way (see
+        # native_job_payload()), but write the kind explicitly for parity
+        # with build_native_job().
+        if not updated_payload.get("kind"):
+            updated_payload["kind"] = "text"
+        updated["payload"] = updated_payload
+        updated_jobs.append(updated)
+        migrated.append({"id": updated.get("id"), "name": name, "agent": agent})
+
+    backup_file = None
+    will_write = bool(migrated) and not args.dry_run
+
+    if will_write:
+        backup_path = backup_path_for(jobs_path)
+        backup_path.write_text(jobs_path.read_text(encoding="utf-8"), encoding="utf-8")
+        backup_file = str(backup_path)
+        if isinstance(raw_payload, dict):
+            next_payload = dict(raw_payload)
+            next_payload["jobs"] = updated_jobs
+            next_payload["updatedAt"] = datetime.now().astimezone().isoformat()
+        else:
+            next_payload = updated_jobs
+        atomic_write_jobs(jobs_path, next_payload)
+
+    payload_out = {
+        "migrated": len(migrated),
+        "unchanged": len(unchanged),
+        "skipped_non_memory_daily": skipped_non_memory_daily,
+        "backup_file": backup_file,
+        "dry_run": bool(args.dry_run),
+        "jobs_file": str(jobs_path),
+        "migrated_jobs": migrated,
+    }
+
+    if args.json:
+        print(json.dumps(payload_out, ensure_ascii=False, indent=2))
+        return 0
+
+    print(f"jobs_file: {payload_out['jobs_file']}")
+    print(f"migrated: {payload_out['migrated']}")
+    print(f"unchanged: {payload_out['unchanged']}")
+    print(f"skipped_non_memory_daily: {payload_out['skipped_non_memory_daily']}")
+    print(f"dry_run: {'yes' if payload_out['dry_run'] else 'no'}")
+    if backup_file:
+        print(f"backup_file: {backup_file}")
+    if migrated:
+        print("migrated_jobs:")
+        for item in migrated:
+            print(f"  - {item['id']} {item['name']} ({item['agent']})")
     return 0
 
 
@@ -2500,6 +2653,22 @@ def build_parser():
     native_rebalance_parser.add_argument("--dry-run", action="store_true")
     native_rebalance_parser.add_argument("--json", action="store_true")
 
+    # Issue #541 PR-A — rewrite memory-daily payloads to the canonical
+    # jsonl-aware body. Idempotent; backs up jobs.json before any mutation.
+    migrate_payloads_parser = subparsers.add_parser(
+        "migrate-payloads",
+        help="Migrate cron job payloads. Currently supports --jsonl-aware for memory-daily.",
+    )
+    migrate_payloads_parser.add_argument("--jobs-file", required=True)
+    migrate_payloads_parser.add_argument(
+        "--jsonl-aware",
+        action="store_true",
+        required=True,
+        help="Rewrite memory-daily job payloads to the canonical jsonl-aware body.",
+    )
+    migrate_payloads_parser.add_argument("--dry-run", action="store_true")
+    migrate_payloads_parser.add_argument("--json", action="store_true")
+
     native_import_parser = subparsers.add_parser("native-import", help="Import cron jobs into the bridge-native store.")
     native_import_parser.add_argument("--jobs-file", required=True)
     native_import_parser.add_argument("--source-jobs-file", required=True)
@@ -2567,6 +2736,16 @@ def main():
             print(f"error: {exc}", file=sys.stderr)
             return 2
         except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+
+    if args.command == "migrate-payloads":
+        try:
+            return run_migrate_payloads(args)
+        except FileNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        except (ValueError, json.JSONDecodeError) as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
 

@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention upgrade-conflicts-lifecycle
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention cron-migrate-payloads upgrade-conflicts-lifecycle
 }
 
 add_all_integration() {
@@ -196,7 +196,9 @@ select_for_path() {
       # Issue #533 — cron run-artifact retention/GC contract lives in
       # bridge-cron.py. Cover its smoke directly when any cron-side
       # python file moves.
-      add_required cron-run-artifacts-retention queue
+      # Issue #541 PR-A — memory-daily payload migration also lives in
+      # bridge-cron.py; pull its smoke in for the same trigger set.
+      add_required cron-run-artifacts-retention cron-migrate-payloads queue
       add_integration integration-minimal
       ;;
 
