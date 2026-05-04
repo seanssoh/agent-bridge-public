@@ -400,7 +400,11 @@ EXISTING_CRONS_JSON="$(mktemp -t bootstrap-crons.XXXXXX.json)"
 "$BRIDGE_AGB" cron list --agent "$BRIDGE_ADMIN_AGENT" --json >"$EXISTING_CRONS_JSON" 2>/dev/null || echo '[]' > "$EXISTING_CRONS_JSON"
 
 cron_lookup() {
-  # cron_lookup <title> — prints "id<TAB>schedule<TAB>tz" or empty.
+  # cron_lookup <title> — prints "id<TAB>schedule<TAB>tz<TAB>payload_preview"
+  # or empty. payload_preview is the truncated payload string surfaced by
+  # `agent-bridge cron list --json`; sufficient for the legacy
+  # `[cron-dispatch]` prefix check used by the payload-migration branch in
+  # step_cron_one.
   local title="$1"
   "$BRIDGE_PYTHON" - "$EXISTING_CRONS_JSON" "$title" <<'PY'
 import json, sys
@@ -438,7 +442,13 @@ for j in jobs:
         sched = j.get("schedule") or j.get("schedule_text") or ""
         tz = j.get("tz") or j.get("timezone") or j.get("schedule_tz") or ""
         jid = j.get("id") or j.get("job_id") or ""
-        print(f"{jid}\t{sched}\t{tz}")
+        # payload_preview is a ~100-char truncation; we only need the
+        # leading prefix to gate the `[cron-dispatch]` migration branch.
+        preview = j.get("payload_preview") or ""
+        # Strip tab/newline so awk -F'\t' parsing in bash doesn't split
+        # a multiline payload across columns.
+        preview = preview.replace("\t", " ").replace("\n", " ").replace("\r", " ")
+        print(f"{jid}\t{sched}\t{tz}\t{preview}")
         break
 PY
 }
@@ -478,6 +488,61 @@ step_cron_one() {
     local effective_existing_tz="${existing_tz:-$trailing_tz}"
     norm_expected="$sched"
     if [[ "$norm_existing" == "$norm_expected" && "$effective_existing_tz" == "$tz" ]]; then
+      # schedule + tz match. The payload may still be stale: older
+      # bootstraps registered these jobs as `[cron-dispatch] ...`
+      # natural-language briefs aimed at the admin agent, while the
+      # canonical payload (line ~549 below) is `bash $installed_script`.
+      # That mismatch wakes the admin's 1M-context Opus session every
+      # firing just to invoke a deterministic shell script.
+      #
+      # Migrate stale managed payloads to match the canonical bootstrap
+      # payload. Only fires when the existing payload starts with the
+      # `[cron-dispatch]` prefix (operator-customized payloads keep their
+      # text). Same 3-mode pattern as the wiki-daily-ingest schedule
+      # migration block below.
+      local existing_id existing_payload canonical_payload
+      existing_id="$(printf '%s' "$found" | awk -F'\t' '{print $1}')"
+      existing_payload="$(printf '%s' "$found" | awk -F'\t' '{print $4}')"
+      canonical_payload="bash $installed_script"
+      if [[ "$existing_payload" == "[cron-dispatch]"* ]]; then
+        if [[ "$MODE" == "check" ]]; then
+          record "$BRIDGE_ADMIN_AGENT" "cron:$title" "drift-payload-pending" \
+            "id=$existing_id existing-prefix=[cron-dispatch] want=bash"
+          note_drift
+          return 0
+        fi
+        if [[ "$MODE" == "dry-run" ]]; then
+          record "$BRIDGE_ADMIN_AGENT" "cron:$title" "would-migrate-payload" \
+            "id=$existing_id [cron-dispatch] → bash $installed_script"
+          return 0
+        fi
+        if [[ -z "$existing_id" ]]; then
+          record "$BRIDGE_ADMIN_AGENT" "cron:$title" "migrate-payload-failed" \
+            "no id from cron_lookup; existing-prefix=[cron-dispatch]"
+          note_drift
+          return 0
+        fi
+        if [[ ! -x "$installed_script" ]]; then
+          # Script not yet installed (apply-step bootstrap_install_scripts
+          # may run after this). Defer: leave the stale payload, emit
+          # drift so the next run picks it up.
+          record "$BRIDGE_ADMIN_AGENT" "cron:$title" "migrate-payload-deferred" \
+            "id=$existing_id installed_script=$installed_script not-yet-executable"
+          note_drift
+          return 0
+        fi
+        if "$BRIDGE_AGB" cron update "$existing_id" \
+              --payload "$canonical_payload" \
+              >/dev/null 2>&1; then
+          record "$BRIDGE_ADMIN_AGENT" "cron:$title" "migrated-payload" \
+            "id=$existing_id [cron-dispatch] → bash"
+        else
+          record "$BRIDGE_ADMIN_AGENT" "cron:$title" "migrate-payload-failed" \
+            "id=$existing_id"
+          note_drift
+        fi
+        return 0
+      fi
       record "$BRIDGE_ADMIN_AGENT" "cron:$title" "already-registered" "$existing_sched tz=$effective_existing_tz"
       return 0
     fi
