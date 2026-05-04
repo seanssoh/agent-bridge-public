@@ -6,6 +6,96 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.7.6] — 2026-05-04
+
+### Highlight — linux-user isolated agents end-to-end + system agent class + per-agent settings architecture
+
+`v0.7.6` makes linux-user-isolated agents (`agent-bridge agent create … --isolation linux-user`) actually usable by closing the four-piece gap that left them silently mis-configured (#544). Adds a first-class `system` agent class for ingestion/supervisory roles like `librarian`/`patch` (#539). Replaces the install-wide single shared `settings.effective.json` with per-agent rendered files so mixed-model installs (some Opus 4.7 `[1m]`, some pre-1M) no longer race on `autoCompactWindow` (#555/#547). Plus a small batch of correctness fixes that surfaced during the wave (#541, #542, #543, #545, plus a tmux ghost-input fix #1393).
+
+All changes auto-apply on the first `agent-bridge upgrade --apply` to v0.7.6+. Existing isolated agents pick up the new hooks/skills/settings on the next `agent-bridge isolate <agent> --reapply` (idempotent — only re-applies the ACL/sync contract; doesn't mutate ownership) followed by an agent restart.
+
+### Added (#544 PR1 — PR #556)
+
+- `bin/agb` curated shim for isolated agents. Sources `BRIDGE_AGENT_ENV_FILE` (when set) before exec'ing `${BRIDGE_HOME}/agb` so Bash subprocess invocations from the isolated UID see `BRIDGE_GATEWAY_PROXY=1` / `BRIDGE_HOME` / sentineled `BRIDGE_TASK_DB` even in fresh non-login subshells. Robust to symlinked invocation: bounded `readlink` walk (16-hop cycle guard) + `cd -P / pwd -P` canonicalization handles macOS `/var → /private/var` `TMPDIR` indirection.
+- `lib/bridge-agents.sh:bridge_write_linux_agent_env_file` now prepends `${BRIDGE_HOME}/bin` to PATH for `linux-user` isolated agents alongside the existing engine CLI directory injection. Curated `bin/` stays the only directory exposed (option B chosen over the broader `${BRIDGE_HOME}` PATH); the broader `agent-bridge` subcommand surface remains explicit default-deny per PR4.
+- `bridge_linux_grant_bin_dir_access` ACL helper grants the isolated UID r-x on `bin/` and `bin/agb` (best-effort; mirrors `bridge_linux_grant_engine_cli_access` pattern). Idempotent via `agent-bridge isolate <agent> --reapply`.
+- New regression smoke `scripts/smoke/isolated-bin-agb.sh` (4 sub-tests: env-source ordering, exec delegation, BRIDGE_HOME fallback, **including symlinked invocation** with negative-assertion that the symlink path does not leak into the resolved BRIDGE_HOME).
+
+### Added (#544 PR2 — PR #564)
+
+- `bridge-hooks.py:cmd_render_isolated_home_settings` renders bridge-managed Claude hook entries into per-isolated-home `<isolated-home>/.claude/settings.effective.json` (controller/root-owned). `<isolated-home>/.claude/settings.json` is then atomically symlinked to it. Preserves operator's `enabledPlugins`, `extraKnownMarketplaces`, `skipDangerousModePermissionPrompt` user keys — symlink-aware: dereferences existing symlinked `settings.json` to read prior preserved keys from `settings.effective.json` on every re-run. Atomic install (tmp + `os.replace` for JSON; tmp + `mv -f` for symlink).
+- `<isolated-home>/.claude/` parent dir is now controller-owned (`chown root:$os_user` + `chmod 0750`) so the isolated UID has group r-x but cannot unlink/replace root-owned children — preserves the integrity boundary the issue body explicitly requires.
+- `agents/.claude/settings.json` (shared base) now carries the full 7-event Claude hook suite: Stop, UserPromptSubmit, SessionStart, PermissionDenied, **PreCompact, PreToolUse, PostToolUse** (the last three were missing pre-PR2; smoke asserts all 7 present in the rendered output).
+- Both `--reapply` and first-isolate paths in `lib/bridge-migration.sh` resolve `bridge_agent_launch_cmd_raw` and forward it to the install helper, so isolated renders pick up the `[1m]` heuristic from PR #554.
+- New regression smoke `scripts/smoke/isolated-settings-rendering.sh` (6 sub-tests including symlink-aware preservation regression).
+
+### Added (#544 PR3 — PR #559)
+
+- `lib/bridge-skills.sh:bridge_sync_isolated_home_claude_skills(agent)` syncs the 4 bridge-native skills (`agent-bridge-runtime`, `cron-manager`, `memory-wiki`, `patch-permission-approval`) into `<isolated-home>/.claude/skills/`. SKILL.md text is rendered with `~/.agent-bridge/` → canonical absolute `${BRIDGE_HOME}/` substitution at sync time (handles trailing slash + double slash + symlinked `BRIDGE_HOME` variants via `os.path.realpath(os.path.normpath(home))` before the trailing-slash strip). Atomic install (tmp + `mv -f` with `rm -f` cleanup on every failure path — both rendered text and binary copy paths). Source `.claude/skills/<skill>/SKILL.md` files unchanged (canonical for shared agents).
+- `--reapply` integration runs the skill sync so existing isolated agents pick up bridge-native skills without unisolate→isolate.
+- New regression smoke `scripts/smoke/isolated-skills-sync.sh` (6 sub-tests including 3 canonicalization variants).
+
+### Added (#544 PR4 — PR #565)
+
+- Isolated `agb` subcommand allowlist + audit. `bin/agb` shim now distinguishes isolated invocations (strict gate: `BRIDGE_GATEWAY_PROXY=1` AND non-empty `BRIDGE_CONTROLLER_UID` AND `$(id -u) != $BRIDGE_CONTROLLER_UID` — all three required; defends against operator-shell debugging false-positives) and applies an explicit allowlist (`inbox|show|claim|done|summary|create`). Anything else exits 64 with a clean message redirecting operators to queue task creation. Every invocation (allow + deny) appends a JSONL audit row to `${BRIDGE_HOME}/logs/agents/<agent>/audit.jsonl` with `subcommand` + `arg_count` (NOT arg values, for privacy) and a `_json_escape` helper for safe JSON serialization (RFC 8259 §7 escape ordering).
+- `lib/bridge-agents.sh:bridge_write_linux_agent_env_file` emits `BRIDGE_CONTROLLER_UID` into the per-agent `agent-env.sh` so the shim's strict gate has the explicit hint it requires.
+- New regression smoke `scripts/smoke/isolated-cli-policy.sh` (7 sub-tests: allowlist allow + deny exit 64 + non-isolated bypass + UID-matching bypass + arg redaction + proxy-without-controller bypass + JSONL escape round-trip).
+
+### Added (#539 — PR #562)
+
+- First-class `class=` field on agents (default `user`, opt-in `system`). Validated at roster load against the closed `{user, system}` set (unknown class is a hard error). New `BRIDGE_AGENT_CLASS` associative array + `bridge_agent_class()` getter; class is exported to per-agent env file (scalar alias `BRIDGE_AGENT_CLASS_FOR_HOOK`) so per-agent hooks running as the isolated UID can consult it.
+- `hooks/tool-policy.py`: when `class=system`, cross-agent Read into `agents/<other>/memory/{projects,decisions,shared}/` AND `shared/*` (excluding `shared/private/`, `shared/secrets/`) is allowed; every such read emits `system_cross_agent_read` to `audit.jsonl` with `target_agent` distinguishing peer-agent reads (`target_agent="<other>"`) from shared-resource reads (`target_agent=""`). Bash/Edit/Write outside own home stays denied for system class — read-only by design.
+- `agent-roster.local.example.sh`: documents the `class=` field. Public roster ships zero default `class=system` agents — operators add `class=system` to their librarian / patch / similar ingestion roles locally.
+- New regression smoke `scripts/smoke/system-agent-class.sh` covering class roundtrip + unknown-class rejection + 4 peer-agent gate scenarios + 3 shared/* gate scenarios + audit count assertion.
+
+### Added (#555 — PR #567)
+
+- Per-agent `settings.effective.json`. Replaces the install-wide single `${BRIDGE_AGENT_HOME_ROOT}/.claude/settings.effective.json` with one rendered file per managed agent at `${BRIDGE_AGENT_HOME_ROOT}/<agent>/.claude/settings.effective.json`. Each managed agent's workdir symlink (`<workdir>/.claude/settings.json`) now points at its OWN per-agent file. Mixed-model installs (some `[1m]`, some pre-1M) no longer race on `autoCompactWindow` — agent-A `[1m]` resolves to 1_000_000, agent-B pre-1M resolves to 400_000, independent regardless of rerender order.
+- `lib/bridge-hooks.sh`: new `bridge_hook_per_agent_settings_effective_file(agent)` helper; `bridge_link_claude_settings_to_shared(workdir, launch_cmd, [agent_id])` extended with optional 3rd arg switching to per-agent rendering target. Back-compat preserved: legacy callers without `agent_id` continue to render the install-wide file.
+- All call sites plumb the agent_id through: `bridge-agent.sh:run_rerender_settings`, `bridge-agent.sh:run_create`, `bridge-init.sh`, `bridge-upgrade.sh`, `bridge-start.sh`, `bridge-setup.sh`. `bridge_agent_shared_settings_plan_json` updated to compare against the per-agent target so post-apply status doesn't stay needs-rerender.
+- New regression smoke `scripts/smoke/per-agent-settings-rendering.sh` (6 sub-tests including mixed-model independence + setup-path launch_cmd preservation).
+- `OPERATIONS.md`: replaced the mixed-model caveat (added in v0.7.5 PR #554 r2) with the new per-agent contract; auto-migration documented (next `agb upgrade --apply` per-agent loop creates per-agent files; orphan install-wide file becomes harmless).
+
+### Fixed (#542 — PR #546)
+
+- Plugin MCP liveness identity-mapping gap. `bridge_plugin_mcp_identity_for_item` only recognized 4 chat providers (`discord/telegram/teams/mattermost`); every other declared plugin (ms365, marketplace plugins, HTTP MCPs) fell through to identity=`""` and got flagged `missing` downstream, driving a 5-attempt restart loop on `agent-bridge agent restart` and the same false-positive in `bridge-daemon.sh:process_plugin_liveness`. Splits probeable / unprobeable: new `bridge_plugin_mcp_is_probeable_item` classifier; `bridge_agent_missing_plugin_mcp_channels_csv` skips unprobeable items so unknown/skipped plugins cannot drive restart triggers. New `BRIDGE_SKIP_RESTART_PLUGIN_LIVENESS=1` operator kill-switch for the restart-internal verifier (independent of the existing daemon-only `BRIDGE_SKIP_PLUGIN_LIVENESS`).
+
+### Fixed (#543 — PR #549)
+
+- `bridge-start.sh` restart path now mirrors the daemon's `bridge_linux_acl_repair_channel_env_files` preflight — calls it inside the existing `claude+!safe+linux-isolation` gate immediately after `bridge_linux_repair_claude_credentials_access` and before `bridge_agent_channel_status_reason`. Restart on isolated agents no longer aborts via `bridge_die` when a transient ACL drift leaves a channel `.env` unreadable to the controller. Soft-launch on `unreadable:` reasons remains an explicit follow-up (separate review thread).
+
+### Fixed (#541 PR-A — PR #551)
+
+- `agb cron migrate-payloads --jsonl-aware [--dry-run] [--json]` migration command for memory-daily cron job payloads. Closes the `#390` PR-3 commit-message promise that never landed (live runtime `cron/jobs.json` accumulated 22 memory-daily jobs whose payload bodies predate the `daily-note-reconcile.py` pipeline). Idempotent (already-jsonl-aware jobs are no-ops). Backup pattern `jobs.json.bak-<timestamp>` mirrors `cleanup-prune` exactly. Both list-shape and `{jobs:[...]}` object-shape `jobs.json` round-trip correctly.
+- New canonical `MEMORY_DAILY_JSONL_AWARE_PROMPT_TEMPLATE` constant in `bridge-cron.py`; `agb cron create --family memory-daily` now defaults to it when no explicit payload is supplied (operator override preserved). `bootstrap-memory-system.sh` + `docs/agent-runtime/memory-daily-harvest.md` synced to mirror the canonical body.
+- New regression smoke `scripts/smoke/cron-migrate-payloads.sh` (dry-run / apply / idempotency / backup / non-memory-daily byte-identity / create-override / list-shape round-trip).
+
+### Fixed (#541 PR-B — PR #550)
+
+- Full Claude Stop hook suite now landed in the shared base `agents/.claude/settings.json`: `mark-idle.sh` (existing — idle wake) + `surface-reply-enforce.py` (timeout 5) + `session-stop.py` (timeout 35). Pre-PR-B the shared base carried only `mark-idle.sh`, so per-agent rerender propagated the (incomplete) base correctly and live always-on agents had no drain or transcript→daily-note reconcile firing on Stop. `bridge-hooks.py` ensure/status helpers extended to manage all three; existing per-agent `run_rerender_settings` + `bridge_link_claude_settings_to_shared` propagation fixes the inputs and now propagates correctly.
+- New regression smoke `scripts/smoke/upgrade-shared-settings-propagate.sh` asserts all three Stop hooks land in the shared base after the ensure path runs.
+
+### Fixed (#547 — PR #554)
+
+- Model-aware `autoCompactWindow` default. Pre-PR #554 `bridge-hooks.py` shipped a static `BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS["autoCompactWindow"] = 400000` that was correct on Opus 4.6 (400K native context) but actively capped Opus 4.7 `[1m]` (1M native context). Combined with how Claude Code computes `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` (pct multiplied by the capped window, not model native capacity), operators setting `pct=45` on a 1M session were getting compact at 180K instead of the intended ~450K. Replaced the static constant with `resolve_managed_autocompact_window(launch_cmd)` — heuristic on `[1m]` substring → 1_000_000; everything else → 400_000 (preserved). New optional `--launch-cmd` flag on `bridge-hooks.py render-shared-settings` (back-compat: omitting → legacy default). Three call-site updates (`bridge-agent.sh`, `bridge-init.sh`, `bridge-upgrade.sh`) pass the resolved launch_cmd through. Operator escape hatch: `CLAUDE_CODE_AUTO_COMPACT_WINDOW=400000` in env (env wins over settings) for any 1M agent that wants the legacy cap.
+
+### Fixed (tmux ghost text — PR #566)
+
+- Claude Code composer ghost text (`SGR 2` dim ANSI auto-complete suggestions) no longer flips the bridge's pending-input detector to "busy". Pre-fix: plain tmux capture stripped the dim style, making the suggestion text look textually identical to real typed input → daemon nudges got silently spooled into `pending-attention.env`. Now: ANSI-preserving capture is requested for both `claude` and `codex` engines (was codex-only); new `bridge_tmux_claude_last_prompt_is_ghost_text` predicate scans for `❯`/`>` last line and rejects it if dim. Refactors the existing 4-pattern dim-style match into shared `bridge_tmux_line_has_sgr_dim` (codex's existing placeholder detector now delegates).
+
+### Documentation (#545 — PR #548)
+
+- `shared/TOOLS.md` (rendered by `bridge-docs.py:render_shared_tools_md()`) now documents Discord/Telegram MCP timestamp UTC handling. The MCP plugins return ISO 8601 UTC timestamps (`Z` suffix); without explicit guidance, bridge-managed agents quoted `ts` raw to operators (off by KST offset + occasional date-boundary flip on UTC ≥15:00). Section includes the conversion rule (`KST = UTC + 09:00`), the prompt-hook `now: ... KST` vs MCP UTC mismatch warning, and a worked failure example (2026-05-04 `syrs-sns` incident).
+
+### Operator action
+
+- **None for the common path.** All changes auto-apply on `agent-bridge upgrade --apply` to v0.7.6+.
+- **Existing linux-user isolated agents**: run `agent-bridge isolate <agent> --reapply` (idempotent; re-installs ACL contract + syncs skills + renders isolated settings) → `agent-bridge agent restart <agent>` (regenerates `agent-env.sh` with new PATH; isolated UID picks up new hooks). Required so the agent actually starts seeing the new bridge hooks / skills / `agb` PATH that PR #544 wired up.
+- (optional) Run `agb cron migrate-payloads --jsonl-aware --dry-run --json` first to preview, then drop `--dry-run` to apply. Migrates existing `memory-daily-*` cron job payloads to the canonical jsonl-aware body. Backup at `~/.agent-bridge/cron/jobs.json.bak-<timestamp>`.
+- (optional) Local-install ingestion agents (`librarian`, `patch`, similar) can opt into `class=system` in `agent-roster.local.sh` to grant scoped read-only cross-agent access. The mechanism ships dormant — public roster gets nothing extra by default.
+- (optional) Mixed-model installs that previously used `CLAUDE_CODE_AUTO_COMPACT_WINDOW=<value>` env override per-agent to work around the install-wide settings file can now drop the override — per-agent `settings.effective.json` rendering means each agent gets its own correct value.
+- (optional) Existing installs may have an orphan install-wide `${BRIDGE_AGENT_HOME_ROOT}/.claude/settings.effective.json` after the per-agent migration. It's harmless (no symlink references it) but operators may delete it manually after verifying the per-agent rendering is correct.
+
 ## [0.7.5] — 2026-05-04
 
 ### Highlight — v0.7.3 multi-host upgrade backlog cleanup
