@@ -139,6 +139,99 @@ assert_operator_overlay_wins() {
   smoke_assert_eq "600000" "$(settings_value "$agent_home/.claude/settings.json" autoCompactWindow)" "operator overlay overrides managed default"
 }
 
+assert_stop_hook_suite_propagates() {
+  # Issue #541 PR-B: ensure-stop-hook on the shared base must register the
+  # full suite (mark-idle.sh + surface-reply-enforce.py + session-stop.py),
+  # and the rendered effective settings (consumed by every per-agent symlink
+  # via bridge_link_claude_settings_to_shared) must carry all three.
+  local base effective stop_count
+  local has_mark_idle has_surface has_session_stop
+
+  base="$BRIDGE_AGENT_HOME_ROOT/.claude/settings.json"
+  effective="$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json"
+
+  # Reset the shared base and overlay to a "pre-fix" shape: only
+  # mark-idle.sh registered, mirroring v0.7.3 reference install state.
+  mkdir -p "$BRIDGE_AGENT_HOME_ROOT/.claude"
+  rm -f "$BRIDGE_AGENT_HOME_ROOT/.claude/settings.local.json" "$effective"
+  printf '%s\n' '{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"bash ~/.agent-bridge/hooks/mark-idle.sh","timeout":3,"additionalContext":true}]}]}}' >"$base"
+
+  python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" ensure-stop-hook \
+    --settings-file "$base" \
+    --bridge-home "$BRIDGE_HOME" \
+    --bash-bin bash >/dev/null
+
+  stop_count="$(python3 - "$base" <<'PY'
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text())
+stop = data.get("hooks", {}).get("Stop", [])
+flat = [h.get("command","") for grp in stop for h in grp.get("hooks", [])]
+print(len(flat))
+PY
+)"
+  smoke_assert_eq "3" "$stop_count" "shared base Stop array has 3 entries after ensure-stop-hook"
+
+  has_mark_idle="$(python3 - "$base" mark-idle.sh <<'PY'
+import json, sys
+from pathlib import Path
+needle = sys.argv[2]
+data = json.loads(Path(sys.argv[1]).read_text())
+stop = data.get("hooks", {}).get("Stop", [])
+flat = [h.get("command","") for grp in stop for h in grp.get("hooks", [])]
+print("yes" if any(needle in c for c in flat) else "no")
+PY
+)"
+  has_surface="$(python3 - "$base" surface-reply-enforce.py <<'PY'
+import json, sys
+from pathlib import Path
+needle = sys.argv[2]
+data = json.loads(Path(sys.argv[1]).read_text())
+stop = data.get("hooks", {}).get("Stop", [])
+flat = [h.get("command","") for grp in stop for h in grp.get("hooks", [])]
+print("yes" if any(needle in c for c in flat) else "no")
+PY
+)"
+  has_session_stop="$(python3 - "$base" session-stop.py <<'PY'
+import json, sys
+from pathlib import Path
+needle = sys.argv[2]
+data = json.loads(Path(sys.argv[1]).read_text())
+stop = data.get("hooks", {}).get("Stop", [])
+flat = [h.get("command","") for grp in stop for h in grp.get("hooks", [])]
+print("yes" if any(needle in c for c in flat) else "no")
+PY
+)"
+  smoke_assert_eq "yes" "$has_mark_idle" "shared base Stop suite includes mark-idle.sh"
+  smoke_assert_eq "yes" "$has_surface" "shared base Stop suite includes surface-reply-enforce.py"
+  smoke_assert_eq "yes" "$has_session_stop" "shared base Stop suite includes session-stop.py"
+
+  # status-stop-hook must agree (suite present, exit 0)
+  local status_out
+  status_out="$(python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" status-stop-hook --settings-file "$base" --bridge-home "$BRIDGE_HOME" --bash-bin bash --format shell)"
+  smoke_assert_contains "$status_out" "HOOK_STOP_HOOK_SUITE=present" "status-stop-hook reports suite present"
+  smoke_assert_contains "$status_out" "HOOK_STOP_HOOK_SURFACE_REPLY_ENFORCE=present" "status-stop-hook reports surface-reply-enforce.py present"
+  smoke_assert_contains "$status_out" "HOOK_STOP_HOOK_SESSION_STOP=present" "status-stop-hook reports session-stop.py present"
+
+  # render-shared-settings must propagate the suite into the effective file
+  python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" render-shared-settings \
+    --base-settings-file "$base" \
+    --overlay-settings-file "$BRIDGE_AGENT_HOME_ROOT/.claude/settings.local.json" \
+    --effective-settings-file "$effective" >/dev/null
+
+  local effective_count
+  effective_count="$(python3 - "$effective" <<'PY'
+import json, sys
+from pathlib import Path
+data = json.loads(Path(sys.argv[1]).read_text())
+stop = data.get("hooks", {}).get("Stop", [])
+flat = [h.get("command","") for grp in stop for h in grp.get("hooks", [])]
+print(len(flat))
+PY
+)"
+  smoke_assert_eq "3" "$effective_count" "effective settings carries 3-entry Stop suite (rerender-consumed)"
+}
+
 main() {
   smoke_require_cmd python3
   smoke_setup_bridge_home "upgrade-settings"
@@ -148,6 +241,7 @@ main() {
   smoke_run "rerender apply links shared settings and audits" assert_apply_rerenders_and_preserves_overlay
   smoke_run "upgrade apply rerenders shared Claude settings" assert_upgrade_runs_rerender
   smoke_run "operator overlay wins over managed default" assert_operator_overlay_wins
+  smoke_run "Stop hook suite propagates from shared base (#541 PR-B)" assert_stop_hook_suite_propagates
   smoke_log "passed"
 }
 
