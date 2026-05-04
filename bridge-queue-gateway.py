@@ -47,6 +47,8 @@ SOCKET_NAME = "queue-gateway.sock"
 MAX_SOCKET_BYTES = 2 * 1024 * 1024
 SOCKET_TIMEOUT_SECONDS = 5.0
 SOCKET_ACL_REFRESH_SECONDS = 30.0
+INLINE_OVERHEAD_BYTES = 64 * 1024
+INLINE_BODY_CAP_BYTES = MAX_SOCKET_BYTES - INLINE_OVERHEAD_BYTES
 SOCKET_LINUX_ONLY_MESSAGE = (
     "queue gateway socket transport requires Linux (SO_PEERCRED); "
     "use BRIDGE_GATEWAY_TRANSPORT=file on this platform"
@@ -516,6 +518,98 @@ def _peer_credentials(conn: socket.socket) -> tuple[int, int, int]:
     return int(pid), int(uid), int(gid)
 
 
+class ClientPreflightError(Exception):
+    def __init__(self, reason_code: str, message: str = "") -> None:
+        super().__init__(message or reason_code)
+        self.reason_code = reason_code
+        self.message = message or reason_code
+
+
+_INLINE_FILE_FLAGS: dict[str, tuple[str, str]] = {
+    "create": ("--body-file", "--body"),
+    "update": ("--body-file", "--body"),
+    "done": ("--note-file", "--note"),
+    "cancel": ("--note-file", "--note"),
+    "handoff": ("--note-file", "--note"),
+}
+
+
+def _client_preflight_error(reason_code: str, message: str = "") -> ClientPreflightError:
+    return ClientPreflightError(reason_code, message)
+
+
+def _read_inline_text(path_text: str) -> str:
+    if not path_text:
+        raise _client_preflight_error("invalid_argv", "empty file path")
+    path = Path(path_text).expanduser()
+    try:
+        st = path.stat()
+    except FileNotFoundError as exc:
+        raise _client_preflight_error("body_file_not_found", "file does not exist") from exc
+    except PermissionError as exc:
+        raise _client_preflight_error("body_file_unreadable", "file is not readable") from exc
+    except OSError as exc:
+        raise _client_preflight_error("body_file_unreadable", "file cannot be read") from exc
+
+    if st.st_size > INLINE_BODY_CAP_BYTES:
+        raise _client_preflight_error("body_file_too_large", f"file exceeds inline cap ({INLINE_BODY_CAP_BYTES} bytes)")
+
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise _client_preflight_error("body_file_not_found", "file does not exist") from exc
+    except PermissionError as exc:
+        raise _client_preflight_error("body_file_unreadable", "file is not readable") from exc
+    except OSError as exc:
+        raise _client_preflight_error("body_file_unreadable", "file cannot be read") from exc
+
+    if len(raw) > INLINE_BODY_CAP_BYTES:
+        raise _client_preflight_error("body_file_too_large", f"file exceeds inline cap ({INLINE_BODY_CAP_BYTES} bytes)")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _client_preflight_error("body_file_not_utf8", "file is not valid UTF-8") from exc
+
+
+def client_argv_normalize(argv: list[str]) -> list[str]:
+    if not argv:
+        return list(argv)
+
+    file_flag, inline_flag = _INLINE_FILE_FLAGS.get(argv[0], ("", ""))
+    if not file_flag:
+        return list(argv)
+
+    matches = [
+        token
+        for token in argv[1:]
+        if token == file_flag or token.startswith(file_flag + "=")
+    ]
+    if len(matches) > 1:
+        raise _client_preflight_error("duplicate_file_arg", "duplicate file argument")
+
+    out = [argv[0]]
+    i = 1
+    while i < len(argv):
+        token = argv[i]
+        if token == file_flag:
+            if i + 1 >= len(argv):
+                raise _client_preflight_error("invalid_argv", "missing file path")
+            out.extend([inline_flag, _read_inline_text(argv[i + 1])])
+            i += 2
+            continue
+        if token.startswith(file_flag + "="):
+            path_text = token.split("=", 1)[1]
+            if not path_text:
+                raise _client_preflight_error("invalid_argv", "empty file path")
+            out.extend([inline_flag, _read_inline_text(path_text)])
+            i += 1
+            continue
+        out.append(token)
+        i += 1
+
+    return out
+
+
 def _peer_map_from_env() -> dict[int, str]:
     raw = os.environ.get("BRIDGE_QUEUE_GATEWAY_PEERS", "").strip()
     peers: dict[int, str] = {}
@@ -663,11 +757,16 @@ def _set_option(argv: list[str], option: str, value: str) -> list[str]:
     return out
 
 
+def _is_file_arg_token(token: str) -> bool:
+    flag_name = token.split("=", 1)[0]
+    if flag_name in {"--body-file", "--note-file"}:
+        return True
+    return flag_name.startswith("--body-f") or flag_name.startswith("--note-f")
+
+
 def _has_file_arg(argv: list[str]) -> bool:
     for token in argv[1:]:
-        if token in {"--body-file", "--note-file"}:
-            return True
-        if token.startswith("--body-file=") or token.startswith("--note-file="):
+        if _is_file_arg_token(token):
             return True
     return False
 
@@ -860,6 +959,18 @@ def gateway_log(subcmd: str, peer_uid: int, peer_agent: str, decision: str, reas
     print("queue_gateway " + " ".join(f"{key}={value}" for key, value in fields.items()), file=sys.stderr, flush=True)
 
 
+def _deny_response(request_id: str, reason_code: str, exit_code: int = 2) -> dict[str, Any]:
+    return {
+        "id": request_id,
+        "request_id": request_id,
+        "exit_code": exit_code,
+        "stdout": "",
+        "stderr": "queue gateway denied\n",
+        "decision": "deny",
+        "reason_code": reason_code,
+    }
+
+
 def _handle_socket_request(
     conn: socket.socket,
     queue_script: Path,
@@ -883,29 +994,29 @@ def _handle_socket_request(
         cwd = str(request.get("cwd") or os.getcwd())
         if not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
             gateway_log(subcmd, peer_uid, peer_agent, "deny", "invalid_argv", request_id)
-            _safe_send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
+            _safe_send_json(conn, _deny_response(request_id, "invalid_argv"))
             return
         subcmd = argv[0] if argv else "-"
         if not peer_agent:
             gateway_log(subcmd, peer_uid, peer_agent, "deny", "unknown_peer", request_id)
-            _safe_send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
+            _safe_send_json(conn, _deny_response(request_id, "unknown_peer"))
             return
         ok, reason, rewritten = authorize_and_rewrite(home, peer_agent, argv)
         if not ok:
             gateway_log(subcmd, peer_uid, peer_agent, "deny", reason, request_id)
-            _safe_send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
+            _safe_send_json(conn, _deny_response(request_id, reason))
             return
         gateway_log(subcmd, peer_uid, peer_agent, "allow", reason, request_id)
         response = {"id": request_id}
         response.update(run_queue(queue_script, rewritten, cwd))
         _safe_send_json(conn, response)
     except ValueError as exc:
-        reason = "oversize" if str(exc) == "oversize" else "invalid_payload"
+        reason = "oversize_payload" if str(exc) == "oversize" else "invalid_payload"
         gateway_log(subcmd, peer_uid, peer_agent, "deny", reason, request_id)
-        _safe_send_json(conn, {"id": request_id, "exit_code": 2, "stdout": "", "stderr": "queue gateway denied\n"})
+        _safe_send_json(conn, _deny_response(request_id, reason))
     except Exception:
         gateway_log(subcmd, peer_uid, peer_agent, "deny", "exception", request_id)
-        _safe_send_json(conn, {"id": request_id, "exit_code": 1, "stdout": "", "stderr": "queue gateway error\n"})
+        _safe_send_json(conn, _deny_response(request_id, "exception", exit_code=1))
 
 
 def _socket_type() -> int:
@@ -925,15 +1036,22 @@ def cmd_socket_client(args: argparse.Namespace) -> int:
     home = bridge_home(args.bridge_home)
     path = gateway_socket_path(home)
     request_id = f"{int(time.time() * 1000)}-{os.getpid()}-{secrets.token_hex(6)}"
+    try:
+        normalized_argv = client_argv_normalize(list(args.argv))
+    except ClientPreflightError as exc:
+        print(f"queue gateway client preflight: {exc.reason_code}", file=sys.stderr)
+        return 2
+
     payload = {
         "id": request_id,
-        "argv": list(args.argv),
+        "argv": normalized_argv,
         "cwd": os.getcwd(),
         "created_at": now_iso(),
     }
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     if len(data) > MAX_SOCKET_BYTES:
-        raise SystemExit("queue gateway request too large")
+        print("queue gateway client preflight: body_file_too_large", file=sys.stderr)
+        return 2
 
     try:
         with socket.socket(socket.AF_UNIX, _socket_type()) as sock:
@@ -952,7 +1070,9 @@ def cmd_socket_client(args: argparse.Namespace) -> int:
     stderr = str(response.get("stderr", ""))
     if stdout:
         sys.stdout.write(stdout)
-    if stderr:
+    if response.get("decision") == "deny" and response.get("reason_code"):
+        sys.stderr.write(f"queue gateway denied: {response.get('reason_code')}\n")
+    elif stderr:
         sys.stderr.write(stderr)
     return int(response.get("exit_code", 1))
 

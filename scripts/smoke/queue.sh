@@ -417,6 +417,296 @@ queue_gateway_socket_duplicate_uid_contract() {
   [[ ! -S "$socket_path" ]] || smoke_fail "duplicate peer UID failure should not leave a socket"
 }
 
+queue_gateway_body_file_inlining_contract() {
+  local socket_path server_log body_file update_file note_file secret update_secret note_secret
+  local create_out task_id show_out other_out other_id handoff_id cancel_id denied_out denied_rc
+  local big_file unreadable_dir non_utf8_file before_lines after_lines
+
+  queue_gateway_stop_socket_server
+  queue_gateway_socket_env
+  BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" init >/dev/null
+  python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" ensure-runtime --bridge-home "$BRIDGE_HOME" --strict >/dev/null
+  socket_path="$(queue_gateway_socket_path)"
+  server_log="$SMOKE_TMP_ROOT/queue-gateway-body-file.log"
+  queue_gateway_start_socket_server "$socket_path" "$server_log"
+
+  secret="INLINE_BODY_SECRET_DO_NOT_LOG"
+  body_file="$SMOKE_TMP_ROOT/body-0600.md"
+  printf '%s\n' "$secret" >"$body_file"
+  chmod 0600 "$body_file"
+  create_out="$(
+    python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a \
+      --title "body-file inline create" \
+      --body-file "$body_file" \
+      --format shell
+  )"
+  task_id="$(smoke_shell_field TASK_ID "$create_out")"
+  show_out="$(BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" show "$task_id")"
+  smoke_assert_contains "$show_out" "$secret" "socket client inlines create --body-file"
+  smoke_assert_not_contains "$show_out" "$body_file" "socket client does not persist client body-file path"
+
+  update_secret="INLINE_UPDATE_SECRET_DO_NOT_LOG"
+  update_file="$SMOKE_TMP_ROOT/update-0600.md"
+  printf '%s\n' "$update_secret" >"$update_file"
+  chmod 0600 "$update_file"
+  python3 "$SMOKE_REPO_ROOT/bridge-queue.py" update "$task_id" --body-file "$update_file" >/dev/null
+  show_out="$(BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" show "$task_id")"
+  smoke_assert_contains "$show_out" "$update_secret" "socket client inlines update --body-file"
+  smoke_assert_not_contains "$show_out" "$update_file" "socket update does not persist client body-file path"
+
+  note_secret="INLINE_NOTE_SECRET_DO_NOT_LOG"
+  note_file="$SMOKE_TMP_ROOT/note-0600.md"
+  printf '%s\n' "$note_secret" >"$note_file"
+  chmod 0600 "$note_file"
+  other_out="$(
+    BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a --from requester \
+      --title "note-file inline done" --body "done target" \
+      --format shell
+  )"
+  other_id="$(smoke_shell_field TASK_ID "$other_out")"
+  python3 "$SMOKE_REPO_ROOT/bridge-queue.py" claim "$other_id" --agent forged --lease-seconds 60 >/dev/null
+  python3 "$SMOKE_REPO_ROOT/bridge-queue.py" done "$other_id" --agent forged --note-file "$note_file" >/dev/null
+  show_out="$(BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" show "$other_id")"
+  smoke_assert_contains "$show_out" "$note_secret" "socket client inlines done --note-file"
+  smoke_assert_not_contains "$show_out" "$note_file" "socket done does not persist client note-file path"
+
+  handoff_id="$(
+    BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a --from requester \
+      --title "note-file inline handoff" --body "handoff target" \
+      --format shell | sed -n 's/^TASK_ID=//p' | tr -d "'"
+  )"
+  python3 "$SMOKE_REPO_ROOT/bridge-queue.py" handoff "$handoff_id" --to worker-b --from forged --note-file "$note_file" >/dev/null
+  show_out="$(BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" show "$handoff_id")"
+  smoke_assert_contains "$show_out" "$note_secret" "socket client inlines handoff --note-file"
+
+  cancel_id="$(
+    BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a --from requester \
+      --title "note-file inline cancel" --body "cancel target" \
+      --format shell | sed -n 's/^TASK_ID=//p' | tr -d "'"
+  )"
+  python3 "$SMOKE_REPO_ROOT/bridge-queue.py" cancel "$cancel_id" --actor forged --note-file "$note_file" >/dev/null
+  show_out="$(BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" show "$cancel_id")"
+  smoke_assert_contains "$show_out" "$note_secret" "socket client inlines cancel --note-file"
+
+  before_lines="$(wc -l <"$server_log")"
+  big_file="$SMOKE_TMP_ROOT/too-large.md"
+  python3 - "$big_file" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_bytes(b"x" * (2 * 1024 * 1024 - 65536 + 1))
+PY
+  set +e
+  denied_out="$(
+    python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a --title "too large" --body-file "$big_file" 2>&1
+  )"
+  denied_rc=$?
+  set -e
+  [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: too-large preflight should exit 2 (rc=$denied_rc out=$denied_out)"
+  smoke_assert_contains "$denied_out" "body_file_too_large" "body-file inline: too large reason"
+  after_lines="$(wc -l <"$server_log")"
+  smoke_assert_eq "$before_lines" "$after_lines" "body-file inline: too-large preflight should not hit server"
+
+  set +e
+  denied_out="$(
+    python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a --title "missing" --body-file "$SMOKE_TMP_ROOT/missing.md" 2>&1
+  )"
+  denied_rc=$?
+  set -e
+  [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: missing preflight should exit 2"
+  smoke_assert_contains "$denied_out" "body_file_not_found" "body-file inline: missing reason"
+
+  unreadable_dir="$SMOKE_TMP_ROOT/body-is-dir"
+  mkdir -p "$unreadable_dir"
+  set +e
+  denied_out="$(
+    python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a --title "unreadable" --body-file "$unreadable_dir" 2>&1
+  )"
+  denied_rc=$?
+  set -e
+  [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: unreadable preflight should exit 2"
+  smoke_assert_contains "$denied_out" "body_file_unreadable" "body-file inline: unreadable reason"
+
+  non_utf8_file="$SMOKE_TMP_ROOT/body-not-utf8.bin"
+  python3 - "$non_utf8_file" <<'PY'
+from pathlib import Path
+import sys
+Path(sys.argv[1]).write_bytes(b"\xff\xfe\xfd")
+PY
+  set +e
+  denied_out="$(
+    python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a --title "not utf8" --body-file "$non_utf8_file" 2>&1
+  )"
+  denied_rc=$?
+  set -e
+  [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: non-UTF8 preflight should exit 2"
+  smoke_assert_contains "$denied_out" "body_file_not_utf8" "body-file inline: non-UTF8 reason"
+
+  set +e
+  denied_out="$(
+    python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a --title "empty" --body-file= 2>&1
+  )"
+  denied_rc=$?
+  set -e
+  [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: empty path preflight should exit 2"
+  smoke_assert_contains "$denied_out" "invalid_argv" "body-file inline: empty path reason"
+
+  set +e
+  denied_out="$(
+    python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a --title "duplicate" \
+      --body-file="$SMOKE_TMP_ROOT/missing-a.md" \
+      --body-file="$SMOKE_TMP_ROOT/missing-b.md" 2>&1
+  )"
+  denied_rc=$?
+  set -e
+  [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: duplicate preflight should exit 2"
+  smoke_assert_contains "$denied_out" "duplicate_file_arg" "body-file inline: duplicate reason before read"
+
+  set +e
+  denied_out="$(python3 "$SMOKE_REPO_ROOT/bridge-queue.py" events --format json 2>&1)"
+  denied_rc=$?
+  set -e
+  [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: server deny should preserve exit 2"
+  smoke_assert_contains "$denied_out" "queue gateway denied: events_denied" "body-file inline: server reason code surfaces"
+  python3 - "$socket_path" <<'PY'
+import json
+import socket
+import sys
+
+path = sys.argv[1]
+sock_type = getattr(socket, "SOCK_SEQPACKET", None)
+if sock_type is None:
+    raise SystemExit("missing SOCK_SEQPACKET")
+request = {
+    "id": "protocol-deny-check",
+    "argv": ["events"],
+    "cwd": ".",
+    "created_at": "smoke",
+}
+with socket.socket(socket.AF_UNIX, sock_type) as client:
+    client.connect(path)
+    client.sendall(json.dumps(request).encode("utf-8"))
+    response = json.loads(client.recv(2 * 1024 * 1024).decode("utf-8"))
+expected = {
+    "decision": "deny",
+    "reason_code": "events_denied",
+    "request_id": request["id"],
+}
+for key, value in expected.items():
+    if response.get(key) != value:
+        raise SystemExit(f"{key}={response.get(key)!r}, expected {value!r}")
+PY
+
+  set +e
+  denied_out="$(python3 "$SMOKE_REPO_ROOT/bridge-queue.py" done --note-f "$note_file" "$task_id" --agent forged 2>&1)"
+  denied_rc=$?
+  set -e
+  [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: abbreviated note-file should exit 2"
+  smoke_assert_contains "$denied_out" "queue gateway denied: file_arg_denied" "body-file inline: abbreviated file flag stays server denied"
+
+  other_out="$(
+    BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to other-agent --from requester \
+      --title "body-file done not owner" --body "not owned" \
+      --format shell
+  )"
+  other_id="$(smoke_shell_field TASK_ID "$other_out")"
+  set +e
+  denied_out="$(python3 "$SMOKE_REPO_ROOT/bridge-queue.py" done --note "$task_id" "$other_id" --agent forged 2>&1)"
+  denied_rc=$?
+  set -e
+  [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: positional smuggling should exit 2"
+  smoke_assert_contains "$denied_out" "queue gateway denied: done_not_owner" "body-file inline: positional smuggling reason"
+
+  queue_gateway_stop_socket_server
+}
+
+queue_gateway_inline_argv_privacy_contract() {
+  local socket_path secret secret_file payload_log server_log client_out client_err cmdline
+  local dummy_pid client_pid i
+
+  queue_gateway_stop_socket_server
+  queue_gateway_socket_env
+  python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" ensure-runtime --bridge-home "$BRIDGE_HOME" --strict >/dev/null
+  socket_path="$(queue_gateway_socket_path)"
+  secret="ARGV_PRIVACY_SECRET_DO_NOT_EXPOSE"
+  secret_file="$SMOKE_TMP_ROOT/argv-privacy.md"
+  payload_log="$SMOKE_TMP_ROOT/argv-privacy-payload.json"
+  server_log="$SMOKE_TMP_ROOT/argv-privacy-server.log"
+  client_out="$SMOKE_TMP_ROOT/argv-privacy-client.out"
+  client_err="$SMOKE_TMP_ROOT/argv-privacy-client.err"
+  printf '%s\n' "$secret" >"$secret_file"
+  chmod 0600 "$secret_file"
+
+  python3 - "$socket_path" "$payload_log" <<'PY' >"$server_log" 2>&1 &
+import os
+import socket
+import stat
+import sys
+import time
+from pathlib import Path
+
+path = Path(sys.argv[1])
+payload_log = Path(sys.argv[2])
+path.unlink(missing_ok=True)
+sock_type = getattr(socket, "SOCK_SEQPACKET", None)
+if sock_type is None:
+    raise SystemExit(0)
+with socket.socket(socket.AF_UNIX, sock_type) as server:
+    server.bind(str(path))
+    os.chmod(path, 0o600)
+    server.listen(1)
+    conn, _ = server.accept()
+    with conn:
+        payload_log.write_bytes(conn.recv(2 * 1024 * 1024))
+        time.sleep(10)
+PY
+  dummy_pid="$!"
+  for ((i = 0; i < 50; i++)); do
+    if [[ -S "$socket_path" ]] && kill -0 "$dummy_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  [[ -S "$socket_path" ]] || smoke_fail "argv privacy: dummy socket server did not start; log=$(cat "$server_log" 2>/dev/null || true)"
+
+  python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" socket-client \
+    --bridge-home "$BRIDGE_HOME" \
+    --timeout 5 \
+    create --to worker-a --title "argv privacy" --body-file "$secret_file" \
+    --format shell >"$client_out" 2>"$client_err" &
+  client_pid="$!"
+  for ((i = 0; i < 50; i++)); do
+    [[ -s "$payload_log" ]] && break
+    sleep 0.1
+  done
+  [[ -s "$payload_log" ]] || smoke_fail "argv privacy: socket-client did not send payload; err=$(cat "$client_err" 2>/dev/null || true)"
+  [[ -r "/proc/$client_pid/cmdline" ]] || smoke_fail "argv privacy: expected /proc cmdline for socket-client"
+  cmdline="$(tr '\0' ' ' <"/proc/$client_pid/cmdline")"
+  smoke_assert_not_contains "$cmdline" "$secret" "argv privacy: inline body must not appear in process argv"
+  smoke_assert_contains "$cmdline" "--body-file" "argv privacy: process argv keeps file flag, not inline body"
+  if ! grep -q "$secret" "$payload_log"; then
+    smoke_fail "argv privacy: socket payload should contain inline body"
+  fi
+  if grep -q "$secret_file" "$payload_log"; then
+    smoke_fail "argv privacy: socket payload should not contain client file path after inlining"
+  fi
+
+  kill "$client_pid" "$dummy_pid" >/dev/null 2>&1 || true
+  wait "$client_pid" >/dev/null 2>&1 || true
+  wait "$dummy_pid" >/dev/null 2>&1 || true
+  rm -f "$socket_path"
+}
+
 queue_gateway_runtime_repair_contract() {
   local socket_path instance_dir
 
@@ -733,6 +1023,8 @@ main() {
     smoke_run "queue gateway socket peer ACL contract" queue_gateway_socket_acl_contract
     smoke_run "queue gateway socket ACL refresh contract" queue_gateway_socket_acl_refresh_contract
     smoke_run "queue gateway socket duplicate UID contract" queue_gateway_socket_duplicate_uid_contract
+    smoke_run "queue gateway body-file inlining contract" queue_gateway_body_file_inlining_contract
+    smoke_run "queue gateway inline argv privacy contract" queue_gateway_inline_argv_privacy_contract
     smoke_run "queue gateway runtime repair contract" queue_gateway_runtime_repair_contract
     smoke_run "queue gateway argv-rewriting hardening" queue_gateway_argv_rewriting_contract
     smoke_run "queue gateway argv abbreviation hardening" queue_gateway_argv_abbrev_smuggling_contract
@@ -744,6 +1036,8 @@ main() {
     smoke_skip "queue gateway socket peer ACL contract" "non-Linux"
     smoke_skip "queue gateway socket ACL refresh contract" "non-Linux"
     smoke_skip "queue gateway socket duplicate UID contract" "non-Linux"
+    smoke_skip "queue gateway body-file inlining contract" "non-Linux"
+    smoke_skip "queue gateway inline argv privacy contract" "non-Linux"
     smoke_skip "queue gateway runtime repair contract" "non-Linux"
     smoke_skip "queue gateway argv-rewriting hardening" "non-Linux"
     smoke_skip "queue gateway argv abbreviation hardening" "non-Linux"
