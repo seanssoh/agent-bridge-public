@@ -459,13 +459,36 @@ isolated UID and from the per-home `~/.agent-bridge` symlink, so they
 work even on installs where that symlink is missing or the operator-home
 parent path differs from `BRIDGE_HOME`.
 
-Operators on existing installs pick this up by re-running:
+### Bridge hooks under the isolated HOME (settings.json rendering)
+
+Claude Code under the isolated UID reads `~/.claude/settings.json` from
+the isolated UID's HOME, not from the workdir — so the workdir-side
+shared-settings symlink installed for non-isolated agents is invisible
+there. The bridge installs hook entries (Stop, UserPromptSubmit,
+SessionStart, PermissionDenied, PreToolUse/PostToolUse) into the
+isolated HOME by rendering a controller-owned
+`<isolated-home>/.claude/settings.effective.json` and pointing
+`<isolated-home>/.claude/settings.json` at it via a symlink.
+
+Integrity contract: the effective file is owned by `root:root` mode
+`0644`; the symlink is owned by the isolated UID but the underlying
+target is not. The isolated UID can read the hook contract but cannot
+mutate it from inside its own session. Pre-existing user keys
+(`enabledPlugins`, `extraKnownMarketplaces`,
+`skipDangerousModePermissionPrompt`) from any prior regular
+`settings.json` are preserved across the transition.
+
+The render runs on agent isolate, restart,
+`agent-bridge isolate <agent> --reapply`, and `agb agent
+rerender-settings --apply`. Operators on existing installs pick up the
+synced skills and hook entries by re-running:
 
 ```bash
 agent-bridge isolate <agent> --reapply
 ```
 
-then restarting the agent so the next session loads the synced skills.
+then restarting the agent so the next session loads the synced skills
+and reads the rendered settings.
 
 ## Migrating to layout v2
 

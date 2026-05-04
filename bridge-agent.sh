@@ -1657,6 +1657,17 @@ run_rerender_settings() {
         after_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
         bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "shared_settings_rerendered" "$agent" \
           --detail workdir="$workdir" >/dev/null 2>&1 || true
+        # Issue #544 PR2 — also render the per-isolated-home
+        # `<isolated-home>/.claude/settings.effective.json` + symlink so
+        # isolated agents pick up the bridge hook entries on rerender.
+        # No-op for non-isolated agents and on non-Linux hosts.
+        # Best-effort: a failure here is logged via bridge_warn inside
+        # the helper and does not flip this row to error — the workdir
+        # shared rerender (above) already succeeded.
+        if [[ "$agent" != "_template" ]] \
+            && command -v bridge_install_isolated_home_settings >/dev/null 2>&1; then
+          bridge_install_isolated_home_settings "$agent" "$target_launch_cmd" >/dev/null 2>&1 || true
+        fi
       else
         error="$apply_output"
         after_json="$before_json"
