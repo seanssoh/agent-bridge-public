@@ -275,6 +275,26 @@ def _stage_first_token(stage: str) -> str:
     return ""
 
 
+# Stderr-suppression / fd-dup forms that *look* like write redirection
+# but cannot mutate the filesystem: `2>/dev/null` discards fd-2,
+# `2>&1` merges fd-2 into fd-1, `&>/dev/null` discards both. These must
+# not flip a read-intent classification (issue #574).
+_SAFE_REDIRECT_PATTERNS = ("2>/dev/null", "2>&1", "&>/dev/null")
+
+# Token-boundary regex used to strip the safe-redirect forms before
+# operator splitting. Naive `str.replace` would also strip substrings
+# like `2>/dev/null/extra` (a real write to a path *under* /dev/null/),
+# turning a write into a fake read (issue #574 r2). The lookahead
+# requires end-of-string or a true shell token-separator after the
+# match — whitespace or one of `; & | ( ) < >`. `$` and backtick are
+# excluded because they begin variable / command substitution and are
+# not separators: `2>/dev/null$VAR` and ``2>/dev/null`cmd` `` are real
+# writes to a substituted path, not stderr discards (issue #574 r3).
+_SAFE_REDIRECT_RE = re.compile(
+    r"(?:2>/dev/null|2>&1|&>/dev/null)(?=$|[\s;&|()<>])"
+)
+
+
 def _is_read_intent_bash(command: str) -> bool:
     """Return True iff *command* is purely read-intent.
 
@@ -289,6 +309,9 @@ def _is_read_intent_bash(command: str) -> bool:
       a token starting with that prefix and disqualifies the pipeline,
       even if the leading command is otherwise a read tool. ``cat >x``
       writes to *x* — the destination path could be the protected one.
+      Stderr-suppression / fd-dup tokens in
+      :data:`_SAFE_REDIRECT_PATTERNS` are exempt: they don't mutate the
+      filesystem (issue #574).
     - Input redirection (``<``) is fine; it only opens the file for
       reading.
     - A single write-intent or unknown leading command anywhere in the
@@ -297,13 +320,24 @@ def _is_read_intent_bash(command: str) -> bool:
     """
     if not command.strip():
         return False
-    for stage in _COMMAND_OPERATOR_RE.split(command):
+    # Strip stderr-suppression / fd-dup tokens before splitting on shell
+    # operators. `_COMMAND_OPERATOR_RE` would otherwise tear `2>&1` and
+    # `&>/dev/null` on the embedded `&`, hiding them from the per-token
+    # check below (issue #574). Matches must be token-boundary aware:
+    # `2>/dev/null/extra` is a real write to a path under /dev/null/,
+    # not a stderr discard, and must NOT be stripped (issue #574 r2).
+    sanitized = _SAFE_REDIRECT_RE.sub(" ", command)
+    for stage in _COMMAND_OPERATOR_RE.split(sanitized):
         stage_stripped = stage.strip()
         if not stage_stripped:
             continue
         # Reject output-redirection anywhere in the stage. Input redir
         # (`<file`) is fine; write redir (`>`, `>>`, `&>`, `2>`) is not.
+        # Stderr-suppression forms (`2>/dev/null`, `2>&1`, `&>/dev/null`)
+        # were stripped above and don't reach this loop (issue #574).
         for tok in stage_stripped.split():
+            if tok in _SAFE_REDIRECT_PATTERNS:
+                continue
             for prefix in ("&>", "2>", ">>", ">"):
                 if tok.startswith(prefix):
                     return False
