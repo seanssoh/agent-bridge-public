@@ -189,6 +189,7 @@ queue_gateway_runtime_id_contract() {
 queue_gateway_socket_contract() {
   local socket_path server_log create_out task_id show_out assigned_id denied_out denied_rc secret log_body
   local other_out other_id instance_dir oversize_out oversize_rc
+  local socket_mode
 
   queue_gateway_socket_env
   BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" init >/dev/null
@@ -196,6 +197,12 @@ queue_gateway_socket_contract() {
   socket_path="$(queue_gateway_socket_path)"
   server_log="$SMOKE_TMP_ROOT/queue-gateway-socket.log"
   queue_gateway_start_socket_server "$socket_path" "$server_log"
+  socket_mode="$(stat -c '%a' "$socket_path")"
+  case "$socket_mode" in
+    *[1-7])
+      smoke_fail "queue gateway socket must not be world-writable/readable; mode=$socket_mode"
+      ;;
+  esac
 
   secret="QUEUE_SOCKET_SMOKE_SECRET_DO_NOT_LOG"
   create_out="$(
@@ -283,8 +290,48 @@ PY
   [[ -d "$instance_dir" ]] || smoke_fail "runtime instance dir should survive listener restart"
   queue_gateway_start_socket_server "$socket_path" "$server_log"
   [[ -S "$socket_path" ]] || smoke_fail "socket should exist after listener restart"
+  socket_mode="$(stat -c '%a' "$socket_path")"
+  case "$socket_mode" in
+    *[1-7])
+      smoke_fail "queue gateway socket restart must not be world-writable/readable; mode=$socket_mode"
+      ;;
+  esac
   log_body="$(cat "$server_log")"
   smoke_assert_not_contains "$log_body" "${secret}" "socket gateway log stays payload-free after restart"
+}
+
+queue_gateway_socket_acl_contract() {
+  local socket_path server_log nobody_uid acl_body socket_mode
+
+  if ! command -v setfacl >/dev/null 2>&1 || ! command -v getfacl >/dev/null 2>&1; then
+    smoke_log "skip: queue gateway socket peer ACL contract requires setfacl/getfacl"
+    return 0
+  fi
+  if ! nobody_uid="$(id -u nobody 2>/dev/null)"; then
+    smoke_log "skip: queue gateway socket peer ACL contract requires nobody user"
+    return 0
+  fi
+
+  queue_gateway_stop_socket_server
+  queue_gateway_socket_env
+  export BRIDGE_QUEUE_GATEWAY_PEERS="$(id -u):worker-a,${nobody_uid}:worker-b"
+  BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" init >/dev/null
+  python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" ensure-runtime --bridge-home "$BRIDGE_HOME" --strict >/dev/null
+  socket_path="$(queue_gateway_socket_path)"
+  server_log="$SMOKE_TMP_ROOT/queue-gateway-socket-acl.log"
+  queue_gateway_start_socket_server "$socket_path" "$server_log"
+
+  socket_mode="$(stat -c '%a' "$socket_path")"
+  case "$socket_mode" in
+    *[1-7])
+      smoke_fail "queue gateway ACL socket must not be world-writable/readable; mode=$socket_mode"
+      ;;
+  esac
+  acl_body="$(getfacl -cp "$socket_path")"
+  smoke_assert_contains "$acl_body" "user:nobody:rw-" "socket ACL grants known non-controller peer UID"
+  smoke_assert_contains "$acl_body" "other::---" "socket ACL denies unknown users at filesystem layer"
+
+  queue_gateway_stop_socket_server
 }
 
 queue_gateway_runtime_repair_contract() {
@@ -314,6 +361,7 @@ main() {
   smoke_run "queue daemon-step nudge selection" queue_daemon_step_contract
   smoke_run "queue gateway runtime id contract" queue_gateway_runtime_id_contract
   smoke_run "queue gateway socket peer auth contract" queue_gateway_socket_contract
+  smoke_run "queue gateway socket peer ACL contract" queue_gateway_socket_acl_contract
   smoke_run "queue gateway runtime repair contract" queue_gateway_runtime_repair_contract
   smoke_log "passed"
 }

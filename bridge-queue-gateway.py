@@ -17,6 +17,7 @@ import os
 import pwd
 import secrets
 import signal
+import shutil
 import socket
 import sqlite3
 import stat
@@ -483,6 +484,39 @@ done
     return peers
 
 
+def _set_socket_acl(path: Path, peer_map: dict[int, str]) -> None:
+    """Restrict socket access to the controller plus known isolated peer UIDs."""
+    os.chmod(path, 0o600)
+    current_uid = os.getuid()
+    specs = []
+    for uid, agent in sorted(peer_map.items()):
+        if uid == current_uid:
+            continue
+        try:
+            user = pwd.getpwuid(uid).pw_name
+        except KeyError as exc:
+            raise SystemExit(f"queue gateway socket peer has no local user: uid={uid} agent={agent}") from exc
+        specs.append(f"u:{user}:rw")
+
+    if not specs:
+        return
+
+    setfacl = shutil.which("setfacl")
+    if not setfacl:
+        raise SystemExit("queue gateway socket peer ACL requires setfacl for isolated UID peers")
+
+    proc = subprocess.run(
+        [setfacl, "-m", ",".join(specs + ["m::rw"]), str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or f"setfacl exited {proc.returncode}"
+        raise SystemExit(f"queue gateway socket peer ACL failed: {detail}")
+
+
 def _task_row(home: str, task_id: int) -> sqlite3.Row | None:
     db = task_db_path(home)
     conn = sqlite3.connect(db)
@@ -734,8 +768,12 @@ def cmd_socket_server(args: argparse.Namespace) -> int:
             raise SystemExit(f"refuse non-socket at {path}")
 
     with socket.socket(socket.AF_UNIX, _socket_type()) as server:
-        server.bind(str(path))
-        os.chmod(path, 0o666)
+        old_umask = os.umask(0o177)
+        try:
+            server.bind(str(path))
+        finally:
+            os.umask(old_umask)
+        _set_socket_acl(path, peer_map)
         server.listen(64)
         server.settimeout(1.0)
         print(f"queue_gateway_listener socket={path}", file=sys.stderr, flush=True)
