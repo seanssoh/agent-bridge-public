@@ -19,6 +19,12 @@
 #      file (independence proven — the original mixed-model bug).
 #   5. Back-compat: when agent id is omitted, rendering still writes the
 #      install-wide file at the legacy path.
+#   6. Setup path (#555 r2): bridge-setup.sh's run_agent invokes
+#      `bridge_ensure_claude_stop_hook` / `bridge_ensure_claude_prompt_hook`
+#      after channel setup. Pre-fix it passed empty launch_cmd, clobbering
+#      the per-agent effective file back to the legacy 400_000 default.
+#      Post-fix it must resolve launch_cmd and preserve 1_000_000 for [1m]
+#      agents.
 
 set -euo pipefail
 
@@ -84,6 +90,24 @@ invoke_link_install_wide() {
   ' -- "$SMOKE_REPO_ROOT" "$workdir" "$launch_cmd" >/dev/null
 }
 
+invoke_setup_ensure_helpers_for_agent() {
+  # Issue #555 r2: simulates bridge-setup.sh:run_agent's post-channel
+  # ensure block. Drives the same two helpers (`bridge_ensure_claude_stop_hook`
+  # and `bridge_ensure_claude_prompt_hook`) the way the FIXED run_agent
+  # does — with the resolved launch_cmd, so the post-ensure relink hits
+  # the renderer with the right managed-default context. Pre-fix this
+  # passed empty launch_cmd and clobbered [1m] agents back to 400_000.
+  local agent="$1"
+  local workdir="$2"
+  local launch_cmd="$3"
+  "$BRIDGE_BASH_BIN_OR_DEFAULT" -lc '
+    set -euo pipefail
+    source "$1/bridge-lib.sh"
+    bridge_ensure_claude_stop_hook "$2" "$3" "$4" >/dev/null
+    bridge_ensure_claude_prompt_hook "$2" "$3" "$4" >/dev/null
+  ' -- "$SMOKE_REPO_ROOT" "$workdir" "$launch_cmd" "$agent" >/dev/null
+}
+
 main() {
   smoke_require_cmd python3
   smoke_setup_bridge_home "$SMOKE_NAME"
@@ -147,6 +171,19 @@ main() {
   # Per-agent files for agent-A/agent-B remain untouched by the back-compat call.
   smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A per-agent file unaffected by install-wide back-compat render"
   smoke_assert_eq "400000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B per-agent file unaffected by install-wide back-compat render"
+
+  smoke_log "case 6: setup path preserves [1m] launch_cmd through ensure helpers (#555 r2)"
+  # Pre-state: agent-A's per-agent file is already at 1_000_000 (from cases 1/4).
+  smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A pre-setup baseline still 1_000_000"
+  # Act: simulate bridge-setup.sh:run_agent invoking the ensure helpers
+  # the way the FIX does — passing the resolved [1m] launch_cmd through.
+  invoke_setup_ensure_helpers_for_agent agent-a "$agent_a_workdir" "claude --model claude-opus-4-7[1m]"
+  # Assert: per-agent effective file STILL holds the [1m] managed default,
+  # not the empty-launch_cmd legacy 400_000 fallback the renderer would
+  # otherwise have written.
+  smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A per-agent file STILL 1_000_000 after setup-style ensure (no clobber to 400_000)"
+  # And agent-B (the non-[1m] sibling) remains untouched — no cross-agent leak.
+  smoke_assert_eq "400000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B per-agent file unaffected by agent-A setup-style ensure"
 
   smoke_log "PASS: per-agent settings.effective.json rendering (#555)"
 }

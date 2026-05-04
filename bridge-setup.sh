@@ -672,6 +672,7 @@ run_agent() {
   local claude_path=""
   local hook_output=""
   local prompt_hook_output=""
+  local launch_cmd=""
   local webhook_cleanup_output=""
   local wake_status=""
   local settings_mode=""
@@ -873,17 +874,22 @@ run_agent() {
       printf 'shared_settings_base_file: %s\n' "$(bridge_hook_shared_settings_base_file)"
       printf 'shared_settings_effective_file: %s\n' "$(bridge_hook_shared_settings_effective_file)"
     fi
-    # Issue #555: forward agent id (3rd arg) so the post-ensure relink
-    # writes the per-agent effective file. launch_cmd left empty — setup
-    # only verifies hook wiring; actual managed-default values come from
-    # the rerender path which has the full launch_cmd context.
-    if hook_output="$(bridge_ensure_claude_stop_hook "$workdir" "" "$agent" 2>&1)"; then
+    # Issue #555 r2: resolve launch_cmd from the roster so the post-ensure
+    # relink renders the per-agent effective file with the agent's correct
+    # managed-default values (e.g. autoCompactWindow=1_000_000 for [1m]
+    # variants vs the legacy 400_000). Mirrors the pattern in
+    # bridge-start.sh:240, bridge-agent.sh:1661, and bridge-upgrade.sh:203.
+    # Without this, `agent-bridge setup agent <1m-agent>` would clobber the
+    # per-agent file to the empty-launch_cmd legacy default and regress
+    # PR #554's [1m] heuristic.
+    launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+    if hook_output="$(bridge_ensure_claude_stop_hook "$workdir" "$launch_cmd" "$agent" 2>&1)"; then
       echo "$hook_output"
     else
       echo "$hook_output"
       failures=$((failures + 1))
     fi
-    if prompt_hook_output="$(bridge_ensure_claude_prompt_hook "$workdir" "" "$agent" 2>&1)"; then
+    if prompt_hook_output="$(bridge_ensure_claude_prompt_hook "$workdir" "$launch_cmd" "$agent" 2>&1)"; then
       echo "$prompt_hook_output"
     else
       echo "$prompt_hook_output"
