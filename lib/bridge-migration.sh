@@ -144,7 +144,14 @@ bridge_migration_isolate() {
     # unisolate→isolate cycle. Best-effort: warn but don't bail — the
     # ACL reapply above is the load-bearing step.
     if command -v bridge_install_isolated_home_settings >/dev/null 2>&1; then
-      bridge_install_isolated_home_settings "$agent" \
+      # Issue #547 / PR #561 r1 needs-more: forward launch_cmd so the
+      # isolated-home renderer applies the [1m] autoCompactWindow
+      # heuristic too. Without this, --reapply re-rendered with the
+      # legacy 400_000 default even for 1M-context agents. Match the
+      # call shape at run_rerender_settings (bridge-agent.sh:1655-1669).
+      local _reapply_launch_cmd=""
+      _reapply_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || printf '')"
+      bridge_install_isolated_home_settings "$agent" "$_reapply_launch_cmd" \
         || bridge_warn "isolated-home settings install returned non-zero for $agent; re-run isolate --reapply or check OPERATIONS.md isolated-agent section"
     fi
     printf '[done] ACL reapply complete for %s\n' "$agent"
@@ -226,7 +233,10 @@ bridge_migration_isolate() {
     # PermissionDenied, PreToolUse/PostToolUse all fire from first
     # session. Best-effort; failure here doesn't block migration.
     if command -v bridge_install_isolated_home_settings >/dev/null 2>&1; then
-      bridge_install_isolated_home_settings "$agent" \
+      # Same launch_cmd forward as the --reapply branch above.
+      local _isolate_launch_cmd=""
+      _isolate_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || printf '')"
+      bridge_install_isolated_home_settings "$agent" "$_isolate_launch_cmd" \
         || bridge_warn "isolated-home settings install returned non-zero for $agent; re-run isolate --reapply"
     fi
   fi
