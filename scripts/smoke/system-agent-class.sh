@@ -134,6 +134,18 @@ EOF
     "$BRIDGE_AGENT_HOME_ROOT/beta/memory/projects"
   : >"$BRIDGE_AGENT_HOME_ROOT/alpha/memory/projects/foo.md"
   : >"$BRIDGE_AGENT_HOME_ROOT/alpha/state/foo.db"
+
+  # Issue #539 r2: shared/* fixtures so the new shared-path sub-tests
+  # have a real on-disk target. The hook resolves shared paths via
+  # `bridge_home_dir() / "shared"` and runs them through Path.resolve(),
+  # which requires the file to exist for the prefix comparison to work.
+  mkdir -p \
+    "$BRIDGE_HOME/shared/wiki" \
+    "$BRIDGE_HOME/shared/private" \
+    "$BRIDGE_HOME/shared/secrets"
+  : >"$BRIDGE_HOME/shared/wiki/foo.md"
+  : >"$BRIDGE_HOME/shared/private/secret.md"
+  : >"$BRIDGE_HOME/shared/secrets/key.txt"
 }
 
 # Run hooks/tool-policy.py once with the supplied actor class + tool
@@ -247,11 +259,33 @@ tool_policy_gate_scenarios() {
   out="$(run_policy_hook "alpha" "user" "Read" "$BRIDGE_AGENT_HOME_ROOT/beta/memory/projects/foo.md")"
   assert_policy_denied "alpha user Read of beta memory/projects/foo.md" "$out"
 
-  # Audit ledger — only Scenario A should have emitted the
-  # system_cross_agent_read event.
+  # Issue #539 r2 — shared/* sub-tests. Codex r2 caught that shared/*
+  # paths bypassed both the system-class allowlist and the audit row
+  # because they sat inside the `if target:` peer-agent block (which
+  # only fires when target_agent_for_path() resolves the path to a
+  # peer home — shared/* never does). The fix lifts shared/* eval
+  # above the peer-agent block.
+
+  # Scenario E — beta (system) Read of shared/wiki/foo.md → ALLOW + audit.
+  out="$(run_policy_hook "beta" "system" "Read" "$BRIDGE_HOME/shared/wiki/foo.md")"
+  assert_policy_allowed "beta system Read of shared/wiki/foo.md" "$out"
+
+  # Scenario F — beta (system) Read of shared/private/secret.md → DENY.
+  out="$(run_policy_hook "beta" "system" "Read" "$BRIDGE_HOME/shared/private/secret.md")"
+  assert_policy_denied "beta system Read of shared/private/secret.md" "$out"
+
+  # Scenario G — beta (system) Read of shared/secrets/key.txt → DENY.
+  out="$(run_policy_hook "beta" "system" "Read" "$BRIDGE_HOME/shared/secrets/key.txt")"
+  assert_policy_denied "beta system Read of shared/secrets/key.txt" "$out"
+
+  # Audit ledger — Scenario A (peer-agent ALLOW) and Scenario E
+  # (shared/* ALLOW) should both have emitted system_cross_agent_read.
+  # The two DENY scenarios for shared/private and shared/secrets do
+  # not emit this row (they emit agent_tool_denied via the standard
+  # block path).
   local count
   count="$(count_audit_events "system_cross_agent_read")"
-  smoke_assert_eq "1" "$count" "system_cross_agent_read audit event count"
+  smoke_assert_eq "2" "$count" "system_cross_agent_read audit event count"
 }
 
 main() {
