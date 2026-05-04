@@ -15,7 +15,8 @@ source "$REPO_ROOT/lib/bridge-session-patterns.sh"
 # daemon, drop dynamic agent sessions, and trash live state. See issue #207.
 if [[ -n "${BRIDGE_HOME:-}" ]]; then
   _smoke_allowed_tmp_prefix=""
-  for _smoke_tmp_candidate in "${TMPDIR%/}" "/tmp" "/private/tmp" "/var/folders"; do
+  for _smoke_tmp_candidate in "${TMPDIR:-}" "/tmp" "/private/tmp" "/var/folders"; do
+    _smoke_tmp_candidate="${_smoke_tmp_candidate%/}"
     [[ -n "$_smoke_tmp_candidate" ]] || continue
     case "$BRIDGE_HOME" in
       "$_smoke_tmp_candidate"|"$_smoke_tmp_candidate"/*)
@@ -42,7 +43,8 @@ fi
 # value — see tests/isolation-v2-pr-e/smoke.sh.)
 if [[ -n "${BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT:-}" ]]; then
   _smoke_iso_allowed=""
-  for _smoke_iso_candidate in "${TMPDIR%/}" "/tmp" "/private/tmp" "/var/folders" "/private/var/folders"; do
+  for _smoke_iso_candidate in "${TMPDIR:-}" "/tmp" "/private/tmp" "/var/folders" "/private/var/folders"; do
+    _smoke_iso_candidate="${_smoke_iso_candidate%/}"
     [[ -n "$_smoke_iso_candidate" ]] || continue
     case "$BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT" in
       "$_smoke_iso_candidate"|"$_smoke_iso_candidate"/*)
@@ -623,7 +625,7 @@ grep -Fq 'plugin:telegram-relay' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" && 
 grep -Fq 'plugin:telegram@claude-plugins-official' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" || die "relay-cleanup apply did not insert plugin:telegram@claude-plugins-official into BRIDGE_AGENT_CHANNELS"
 grep -Fq 'plugin:foo' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" || die "relay-cleanup apply dropped unrelated plugin:foo channel item"
 grep -Fq 'plugin:discord@claude-plugins-official' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" || die "relay-cleanup apply touched unrelated agent channel line"
-RELAY_CLEANUP_POST_MODE="$(stat -f '%Lp' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" 2>/dev/null || stat -c '%a' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh")"
+RELAY_CLEANUP_POST_MODE="$(stat -c '%a' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh" 2>/dev/null || stat -f '%Lp' "$RELAY_CLEANUP_ROOT/agent-roster.local.sh")"
 [[ "$RELAY_CLEANUP_POST_MODE" == "600" ]] || die "relay-cleanup apply widened agent-roster.local.sh mode under umask 022: expected 600 got $RELAY_CLEANUP_POST_MODE"
 log "  [ok] apply removed every residue class, preserved .telegram/.env + unrelated channels, and kept agent-roster.local.sh at mode 0600"
 
@@ -5628,6 +5630,81 @@ assert payload["results"][0]["status"] == "unchanged", payload
 assert payload["results"][0]["node_modules_status"] == "unchanged", payload
 PY
 
+log "syncing third-party dev-loaded plugin cache via known_marketplaces.json"
+DEV_THIRD_MARKETPLACE_ROOT="$TMP_ROOT/dev-third-marketplace"
+mkdir -p "$DEV_THIRD_MARKETPLACE_ROOT/.claude-plugin" \
+  "$DEV_THIRD_MARKETPLACE_ROOT/plugins/third-plugin"
+cat > "$DEV_THIRD_MARKETPLACE_ROOT/.claude-plugin/marketplace.json" <<'JSON'
+{
+  "name": "third-mkt",
+  "metadata": {"version": "0.2.0"},
+  "plugins": [
+    {"name": "third-plugin", "source": "./plugins/third-plugin", "version": "0.2.0"}
+  ]
+}
+JSON
+cat > "$DEV_THIRD_MARKETPLACE_ROOT/plugins/third-plugin/.mcp.json" <<'JSON'
+{
+  "mcpServers": {
+    "third-plugin": {
+      "type": "http",
+      "url": "https://updated.example.invalid/mcp",
+      "headers": {
+        "Authorization": "Bearer __TOKEN_PLACEHOLDER__"
+      }
+    }
+  }
+}
+JSON
+printf 'third source\n' > "$DEV_THIRD_MARKETPLACE_ROOT/plugins/third-plugin/server.ts"
+DEV_THIRD_INACCESSIBLE_ROOT="$TMP_ROOT/dev-third-inaccessible"
+mkdir -p "$DEV_THIRD_INACCESSIBLE_ROOT/.claude-plugin"
+chmod 000 "$DEV_THIRD_INACCESSIBLE_ROOT"
+THIRD_CACHE_VERSION_DIR="$BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT/third-mkt/third-plugin/0.2.0"
+rm -rf "$BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT/third-mkt"
+mkdir -p "$THIRD_CACHE_VERSION_DIR"
+cat > "$THIRD_CACHE_VERSION_DIR/.mcp.json" <<'JSON'
+{
+  "mcpServers": {
+    "third-plugin": {
+      "type": "http",
+      "url": "https://old.example.invalid/mcp",
+      "headers": {
+        "Authorization": "Bearer live-secret"
+      }
+    }
+  }
+}
+JSON
+chmod 0600 "$THIRD_CACHE_VERSION_DIR/.mcp.json"
+cat > "$TMP_ROOT/known_marketplaces.json" <<JSON
+{
+  "third-mkt": {
+    "installLocation": "$DEV_THIRD_INACCESSIBLE_ROOT",
+    "source": {"source": "directory", "path": "$DEV_THIRD_MARKETPLACE_ROOT", "repo": "Example/third-mkt"}
+  }
+}
+JSON
+DEV_THIRD_CACHE_JSON="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:third-plugin@third-mkt" --root "$DEV_PLUGIN_MARKETPLACE_ROOT" --json)"
+chmod 700 "$DEV_THIRD_INACCESSIBLE_ROOT"
+python3 - "$DEV_THIRD_CACHE_JSON" "$THIRD_CACHE_VERSION_DIR/.mcp.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(sys.argv[1])
+row = payload["results"][0]
+assert row["plugin"] == "third-plugin", row
+assert row["marketplace"] == "third-mkt", row
+assert row["status"] in {"linked", "updated", "unchanged"}, row
+mcp = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+server = mcp["mcpServers"]["third-plugin"]
+assert server["url"] == "https://updated.example.invalid/mcp", server
+assert server["headers"]["Authorization"] == "Bearer live-secret", server
+PY
+THIRD_CACHE_MCP_MODE="$(stat -c '%a' "$THIRD_CACHE_VERSION_DIR/.mcp.json" 2>/dev/null || stat -f '%Lp' "$THIRD_CACHE_VERSION_DIR/.mcp.json")"
+[[ "$THIRD_CACHE_MCP_MODE" == "600" ]] || die "third-party dev cache .mcp.json mode widened during secret-preserving overlay: got $THIRD_CACHE_MCP_MODE"
+
 BOOTSTRAP_FAIL_HOME="$TMP_ROOT/bootstrap-fail-home"
 mkdir -p "$BOOTSTRAP_FAIL_HOME"
 BOOTSTRAP_FAIL_OUTPUT="$(HOME="$BOOTSTRAP_FAIL_HOME" BRIDGE_CLAUDE_CHANNELS_HOME="$TMP_ROOT/empty-claude-channels" "$REPO_ROOT/agent-bridge" bootstrap --admin bootstrap-fail --engine claude --session bootstrap-fail --channels plugin:telegram --allow-from 123456789 --default-chat 123456789 --rcfile "$TMP_ROOT/bootstrap-fail.rc" --skip-daemon --skip-launchagent 2>&1 || true)"
@@ -6914,10 +6991,10 @@ DAEMON_DAILY_OUTPUT="$(
     process_daily_backup >/dev/null
     archive="$(find "'"$DAEMON_BACKUP_HOME"'/backups/daily" -maxdepth 1 -name "agent-bridge-*.tgz" | head -n 1)"
     [[ -n "$archive" && -f "$archive" ]] || exit 1
-    before="$(stat -f "%m" "$archive" 2>/dev/null || stat -c "%Y" "$archive")"
+    before="$(stat -c "%Y" "$archive" 2>/dev/null || stat -f "%m" "$archive")"
     sleep 1
     process_daily_backup >/dev/null || true
-    after="$(stat -f "%m" "$archive" 2>/dev/null || stat -c "%Y" "$archive")"
+    after="$(stat -c "%Y" "$archive" 2>/dev/null || stat -f "%m" "$archive")"
     printf "ARCHIVE=%s\nBEFORE=%s\nAFTER=%s\n" "$archive" "$before" "$after"
   '
 )"
@@ -7172,7 +7249,7 @@ APPLY_JSON="$(python3 "$REPO_ROOT/bridge-upgrade.py" apply-live --source-root "$
 assert_contains "$APPLY_JSON" "\"files_mode_synced\": 1"
 assert_contains "$APPLY_JSON" "\"applied\": true"
 # apply-live stamps the source's exec bits onto the live file.
-mode_after="$(stat -f '%Lp' "$MODE_ROOT/tool.sh" 2>/dev/null || stat -c '%a' "$MODE_ROOT/tool.sh")"
+mode_after="$(stat -c '%a' "$MODE_ROOT/tool.sh" 2>/dev/null || stat -f '%Lp' "$MODE_ROOT/tool.sh")"
 [[ "$mode_after" == "755" ]] || die "expected tool.sh to be 755 after mode sync, got $mode_after"
 # A second pass is idempotent (no drift, no rewrites).
 SECOND_JSON="$(python3 "$REPO_ROOT/bridge-upgrade.py" apply-live --source-root "$MODE_REPO" --target-root "$MODE_ROOT" --base-ref "$MODE_BASE")"
@@ -7220,7 +7297,7 @@ cp "$MISMATCH_REPO/tool.sh" "$MISMATCH_ROOT/tool.sh"
 chmod 0644 "$MISMATCH_ROOT/tool.sh"
 MISMATCH_JSON="$(python3 "$REPO_ROOT/bridge-upgrade.py" apply-live --source-root "$MISMATCH_REPO" --target-root "$MISMATCH_ROOT" --base-ref "$MISMATCH_BASE")"
 assert_contains "$MISMATCH_JSON" "\"files_mode_synced\": 1"
-mode_mismatch="$(stat -f '%Lp' "$MISMATCH_ROOT/tool.sh" 2>/dev/null || stat -c '%a' "$MISMATCH_ROOT/tool.sh")"
+mode_mismatch="$(stat -c '%a' "$MISMATCH_ROOT/tool.sh" 2>/dev/null || stat -f '%Lp' "$MISMATCH_ROOT/tool.sh")"
 [[ "$mode_mismatch" == "755" ]] || die "expected tool.sh to be 755 from git index (100755), got $mode_mismatch (worktree drift must not leak)"
 
 log "smart upgrade propagates exec-bit removal from source"
@@ -7242,7 +7319,7 @@ git -C "$REMOVE_REPO" commit -qm "tool script without exec bit"
 REMOVE_BASE="$(git -C "$REMOVE_REPO" rev-parse HEAD)"
 REMOVE_JSON="$(python3 "$REPO_ROOT/bridge-upgrade.py" apply-live --source-root "$REMOVE_REPO" --target-root "$REMOVE_ROOT" --base-ref "$REMOVE_BASE")"
 assert_contains "$REMOVE_JSON" "\"files_mode_synced\": 1"
-mode_removed="$(stat -f '%Lp' "$REMOVE_ROOT/tool.sh" 2>/dev/null || stat -c '%a' "$REMOVE_ROOT/tool.sh")"
+mode_removed="$(stat -c '%a' "$REMOVE_ROOT/tool.sh" 2>/dev/null || stat -f '%Lp' "$REMOVE_ROOT/tool.sh")"
 [[ "$mode_removed" == "644" ]] || die "expected tool.sh to be 644 after exec-bit removal, got $mode_removed"
 
 log "strict merge aborts on conflict without touching live file"

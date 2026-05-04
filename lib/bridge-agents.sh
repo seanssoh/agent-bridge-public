@@ -1510,6 +1510,522 @@ print("present:other")
 PY
 }
 
+bridge_isolation_alias_rejection_reason() {
+  # Bash-side mirror of `_alias_rejection_reason` in
+  # bridge-dev-plugin-cache.py. Returns the empty string on stdout when
+  # the alias is safe to plant as a `marketplaces/<alias>` symlink under
+  # the isolated home (root is the writer, so an unsafe alias is a
+  # privilege-escalation surface). Otherwise prints a short reason.
+  #
+  # Acceptance criteria (must match the Python helpers):
+  #   - non-empty, length <= 200
+  #   - matches ^[A-Za-z0-9._-]+$ (no slash, no control char, no whitespace)
+  #   - does not contain '..'
+  #   - not '.' / '..'
+  #   - not a Windows reserved name (CON/PRN/AUX/NUL/COM1-9/LPT1-9)
+  #   - if it starts with '.', must equal '.git'
+  local alias="$1"
+  local upper=""
+  if [[ -z "$alias" ]]; then
+    printf 'empty'
+    return 0
+  fi
+  if (( ${#alias} > 200 )); then
+    printf 'length exceeds 200'
+    return 0
+  fi
+  if ! [[ "$alias" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    printf "contains characters outside [A-Za-z0-9._-]"
+    return 0
+  fi
+  if [[ "$alias" == *..* ]]; then
+    printf "contains '..'"
+    return 0
+  fi
+  if [[ "$alias" == "." || "$alias" == ".." ]]; then
+    printf 'reserved name'
+    return 0
+  fi
+  upper="$(printf '%s' "$alias" | tr '[:lower:]' '[:upper:]')"
+  case "$upper" in
+    CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])
+      printf 'reserved Windows name'
+      return 0
+      ;;
+  esac
+  if [[ "$alias" == .* && "$alias" != ".git" ]]; then
+    printf 'leading dot disallowed'
+    return 0
+  fi
+  printf ''
+  return 0
+}
+
+bridge_isolation_alias_safe() {
+  # Convenience wrapper: returns 0 when the alias is safe, 1 otherwise.
+  local reason
+  reason="$(bridge_isolation_alias_rejection_reason "$1")"
+  [[ -z "$reason" ]]
+}
+
+bridge_known_marketplace_info() {
+  # Return marketplace source information from known_marketplaces.json.
+  #
+  # Output protocol:
+  #   present:<kind>\t<source-dir>\t<alias>[ \t<alias>...]
+  #   missing
+  #   unparseable
+  #   unsafe                    (alias rejected by the safe-alias validator)
+  #
+  # `source-dir` is the controller-side marketplace tree to expose read-only
+  # to the isolated UID. Aliases include the marketplace id plus Claude Code's
+  # newer github `<org>-<repo>` clone dirname when source.repo is present.
+  local marketplace_id="$1"
+  local plugins_root="$2"
+  local marketplaces_json="$plugins_root/known_marketplaces.json"
+
+  bridge_require_python
+  python3 - "$marketplace_id" "$plugins_root" "$marketplaces_json" <<'PY'
+import json
+import os
+import re
+import sys
+
+marketplace_id, plugins_root, marketplaces_path = sys.argv[1:]
+
+
+# Mirror of `_github_repo_slug` in bridge-dev-plugin-cache.py. Keep the
+# accepted URL forms in sync — the bash side here and the dev-cache
+# helper must produce identical aliases for the same input or Claude
+# will land on different marketplace dirs in the controller and isolated
+# trees.
+_GITHUB_URL_PREFIXES = (
+    "https://github.com/",
+    "http://github.com/",
+    "git://github.com/",
+)
+_GITHUB_SSH_PREFIX = "git@github.com:"
+
+
+def github_repo_slug(source):
+    s = (source or "").strip()
+    if not s:
+        return ""
+    lowered = s.lower()
+    matched = ""
+    for prefix in _GITHUB_URL_PREFIXES:
+        if lowered.startswith(prefix):
+            matched = prefix
+            break
+    if matched:
+        s = s[len(matched):]
+    elif lowered.startswith(_GITHUB_SSH_PREFIX):
+        s = s[len(_GITHUB_SSH_PREFIX):]
+    elif "://" in s or "@" in s.split("/", 1)[0]:
+        # Looks like a URL or SSH spec but not GitHub — refuse rather
+        # than producing a slug like `https:-gitlab.com`.
+        return ""
+    elif s.startswith("/"):
+        # Looks like a filesystem path — refuse so the simple-slugify
+        # fallback handles the path-style input rather than producing a
+        # misleading `<root>-<dir>` alias.
+        return ""
+    s = s.strip().strip("/")
+    if s.endswith(".git"):
+        s = s[: -len(".git")]
+    parts = [p for p in s.split("/") if p]
+    if len(parts) < 2:
+        return ""
+    org, repo = parts[0], parts[1]
+    if not org or not repo:
+        return ""
+    return "%s-%s" % (org, repo)
+
+
+def repo_slug(repo):
+    slug = github_repo_slug(repo)
+    if slug:
+        return slug
+    repo = (repo or "").strip().strip("/")
+    if "/" not in repo:
+        return ""
+    return repo.replace("/", "-")
+
+
+# Mirror of `_alias_rejection_reason` in bridge-dev-plugin-cache.py.
+# `fullmatch` (vs `match(... + "$")`) is the security-relevant choice:
+# `$` in default mode matches just before a trailing `\n`, so an alias
+# like "foo\n" would otherwise slip through the regex gate. `fullmatch`
+# requires the entire string to match, no trailing-newline tolerance.
+_SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9._-]+")
+_ALIAS_RESERVED_NAMES = {".", ".."}
+_ALIAS_WINDOWS_RESERVED = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % i for i in range(1, 10)}
+    | {"LPT%d" % i for i in range(1, 10)}
+)
+
+
+def alias_rejection_reason(alias):
+    if not isinstance(alias, str):
+        return "not a string"
+    if alias == "":
+        return "empty"
+    if len(alias) > 200:
+        return "length exceeds 200"
+    if not _SAFE_ALIAS_RE.fullmatch(alias):
+        return "contains characters outside [A-Za-z0-9._-]"
+    if ".." in alias:
+        return "contains '..'"
+    if alias in _ALIAS_RESERVED_NAMES:
+        return "reserved name"
+    if alias.upper() in _ALIAS_WINDOWS_RESERVED:
+        return "reserved Windows name"
+    if alias.startswith(".") and alias != ".git":
+        return "leading dot disallowed"
+    return ""
+
+
+def emit(*parts):
+    print("\t".join(parts))
+
+
+if not os.path.isfile(marketplaces_path):
+    emit("unparseable")
+    raise SystemExit(0)
+
+try:
+    with open(marketplaces_path) as f:
+        markets = json.load(f)
+    if not isinstance(markets, dict):
+        raise ValueError("expected JSON object")
+except (OSError, ValueError):
+    emit("unparseable")
+    raise SystemExit(0)
+
+entry = markets.get(marketplace_id)
+if not isinstance(entry, dict):
+    emit("missing")
+    raise SystemExit(0)
+
+source = entry.get("source")
+kind = "other"
+repo = ""
+if isinstance(source, dict):
+    kind = source.get("source") or "other"
+    repo = source.get("repo") or ""
+
+slug = repo_slug(repo)
+aliases = []
+for item in (marketplace_id, slug):
+    if not item or item in aliases:
+        continue
+    reason = alias_rejection_reason(item)
+    if reason:
+        sys.stderr.write(
+            "[bridge-isolate] marketplace %r alias %r rejected: %s — refusing to plant unsafe symlink\n"
+            % (marketplace_id, item, reason)
+        )
+        emit("unsafe", "", "")
+        raise SystemExit(2)
+    aliases.append(item)
+
+candidates = []
+if marketplace_id:
+    candidates.append(os.path.join(plugins_root, "marketplaces", marketplace_id))
+if slug:
+    candidates.append(os.path.join(plugins_root, "marketplaces", slug))
+
+install_location = entry.get("installLocation")
+source_path = source.get("path") if isinstance(source, dict) else ""
+for candidate in (install_location, source_path):
+    if not isinstance(candidate, str) or not candidate.strip():
+        continue
+    candidate = candidate.strip()
+    # Directory-source marketplaces can point at a broad source checkout
+    # (for example a repo root containing multiple plugins). Do not expose
+    # that whole tree as the marketplace alias unless it is Agent Bridge's
+    # own marketplace; third-party directory marketplaces should provide a
+    # mirror under ~/.claude/plugins/marketplaces/<id>.
+    if kind == "directory" and marketplace_id != "agent-bridge":
+        continue
+    candidates.append(candidate)
+
+source_dir = ""
+for candidate in candidates:
+    if os.path.isdir(candidate):
+        source_dir = os.path.abspath(candidate)
+        break
+
+emit("present:%s" % kind, source_dir, *aliases)
+PY
+}
+
+bridge_write_isolated_known_marketplaces_catalog() {
+  # Write a filtered per-UID known_marketplaces.json instead of symlinking the
+  # controller's full file. This keeps undeclared marketplaces out of isolated
+  # Claude's loader and rewrites installLocation/source.path to isolated-home
+  # aliases that bridge controls read-only.
+  local os_user="$1"
+  local isolated_plugins="$2"
+  local controller_plugins="$3"
+  local channels_csv="$4"
+  local plugins_csv="${5-}"
+  local agent="${6-}"
+  local catalog="$isolated_plugins/known_marketplaces.json"
+  local catalog_tmp=""
+
+  bridge_require_python
+  catalog_tmp="$(bridge_linux_sudo_root mktemp "${catalog}.tmp.XXXXXX")"
+  if ! bridge_linux_sudo_root python3 - "$controller_plugins" "$isolated_plugins" "$channels_csv" "$plugins_csv" "$catalog_tmp" <<'PY'
+import copy
+import json
+import os
+import re
+import sys
+
+controller_plugins, isolated_plugins, channels_csv, plugins_csv, out_path = sys.argv[1:]
+markets_path = os.path.join(controller_plugins, "known_marketplaces.json")
+
+
+def warn(msg):
+    sys.stderr.write("[bridge-isolate] " + msg + "\n")
+
+
+def fail(msg):
+    sys.stderr.write("[bridge-isolate] " + msg + "\n")
+    raise SystemExit(2)
+
+
+# Mirror of `_github_repo_slug` in bridge-dev-plugin-cache.py. Keep
+# accepted forms in sync.
+_GITHUB_URL_PREFIXES = (
+    "https://github.com/",
+    "http://github.com/",
+    "git://github.com/",
+)
+_GITHUB_SSH_PREFIX = "git@github.com:"
+
+
+def github_repo_slug(source):
+    s = (source or "").strip()
+    if not s:
+        return ""
+    lowered = s.lower()
+    matched = ""
+    for prefix in _GITHUB_URL_PREFIXES:
+        if lowered.startswith(prefix):
+            matched = prefix
+            break
+    if matched:
+        s = s[len(matched):]
+    elif lowered.startswith(_GITHUB_SSH_PREFIX):
+        s = s[len(_GITHUB_SSH_PREFIX):]
+    elif "://" in s or "@" in s.split("/", 1)[0]:
+        # Looks like a URL or SSH spec but not GitHub — refuse rather
+        # than producing a slug like `https:-gitlab.com`.
+        return ""
+    elif s.startswith("/"):
+        # Looks like a filesystem path — refuse so the simple-slugify
+        # fallback handles the path-style input rather than producing a
+        # misleading `<root>-<dir>` alias.
+        return ""
+    s = s.strip().strip("/")
+    if s.endswith(".git"):
+        s = s[: -len(".git")]
+    parts = [p for p in s.split("/") if p]
+    if len(parts) < 2:
+        return ""
+    org, repo = parts[0], parts[1]
+    if not org or not repo:
+        return ""
+    return "%s-%s" % (org, repo)
+
+
+def repo_slug(repo):
+    slug = github_repo_slug(repo)
+    if slug:
+        return slug
+    repo = (repo or "").strip().strip("/")
+    if "/" not in repo:
+        return ""
+    return repo.replace("/", "-")
+
+
+# Mirror of `_alias_rejection_reason` in bridge-dev-plugin-cache.py.
+# `fullmatch` (vs `match(... + "$")`) closes the trailing-newline bypass:
+# in default mode `$` matches before a trailing `\n`, so "foo\n" would
+# otherwise satisfy the regex and reach the symlink-plant step. The whole
+# alias must consume the entire string with no implicit newline tolerance.
+_SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9._-]+")
+_ALIAS_RESERVED_NAMES = {".", ".."}
+_ALIAS_WINDOWS_RESERVED = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % i for i in range(1, 10)}
+    | {"LPT%d" % i for i in range(1, 10)}
+)
+
+
+def alias_rejection_reason(alias):
+    if not isinstance(alias, str):
+        return "not a string"
+    if alias == "":
+        return "empty"
+    if len(alias) > 200:
+        return "length exceeds 200"
+    if not _SAFE_ALIAS_RE.fullmatch(alias):
+        return "contains characters outside [A-Za-z0-9._-]"
+    if ".." in alias:
+        return "contains '..'"
+    if alias in _ALIAS_RESERVED_NAMES:
+        return "reserved name"
+    if alias.upper() in _ALIAS_WINDOWS_RESERVED:
+        return "reserved Windows name"
+    if alias.startswith(".") and alias != ".git":
+        return "leading dot disallowed"
+    return ""
+
+
+def marketplace_source_info(marketplace, entry):
+    source = entry.get("source")
+    kind = source.get("source") if isinstance(source, dict) else ""
+    slug = repo_slug(str(source.get("repo") or "")) if isinstance(source, dict) else ""
+    candidates = [
+        os.path.join(controller_plugins, "marketplaces", marketplace),
+    ]
+    if slug:
+        candidates.append(os.path.join(controller_plugins, "marketplaces", slug))
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate, slug
+    if marketplace == "agent-bridge":
+        for candidate in (
+            entry.get("installLocation"),
+            source.get("path") if isinstance(source, dict) else "",
+        ):
+            if isinstance(candidate, str) and candidate.strip() and os.path.isdir(candidate.strip()):
+                return candidate.strip(), slug
+    warn("marketplace %s is declared but no controller-side mirror exists under %s/marketplaces — omitting from isolated catalog" % (marketplace, controller_plugins))
+    return "", slug
+
+
+def declared_marketplaces():
+    declared = set()
+    for raw in (channels_csv + "," + plugins_csv).split(","):
+        token = raw.strip()
+        if token.startswith("plugin:"):
+            token = token[len("plugin:"):]
+        if "@" not in token:
+            continue
+        _plugin, marketplace = token.split("@", 1)
+        if marketplace:
+            declared.add(marketplace)
+    return declared
+
+
+try:
+    with open(markets_path) as f:
+        source_markets = json.load(f)
+    if not isinstance(source_markets, dict):
+        raise ValueError("expected JSON object at root, got %r" % type(source_markets).__name__)
+except (OSError, ValueError) as exc:
+    warn("controller known_marketplaces.json unparseable (%s): %s — writing empty per-UID marketplace catalog" % (type(exc).__name__, markets_path))
+    source_markets = {}
+
+out = {}
+marketplaces_root = os.path.join(isolated_plugins, "marketplaces")
+
+# Pre-pass: validate every alias and detect collisions across declared
+# marketplaces before writing anything. Two distinct marketplace ids that
+# reduce to the same alias would silently overwrite each other on the
+# symlink-plant step (root is the writer, so no permission failure
+# stops it). Fail-loud here is the only way to surface the input bug.
+alias_owners = {}  # alias -> list of marketplace ids that claim it
+declared_entries = []
+for marketplace in sorted(declared_marketplaces()):
+    # Reject the marketplace id itself before anything else — it will
+    # become an alias under marketplaces/ and an unsafe id is a
+    # privilege-escalation surface (root plants the symlink).
+    reason = alias_rejection_reason(marketplace)
+    if reason:
+        fail(
+            "marketplace id %r rejected: %s — refusing to write per-UID catalog. "
+            "Rename the marketplace upstream or remove it from the agent's channel/plugins set."
+            % (marketplace, reason)
+        )
+    entry = source_markets.get(marketplace)
+    if not isinstance(entry, dict):
+        continue
+    source_dir, slug = marketplace_source_info(marketplace, entry)
+    if not source_dir:
+        continue
+    alias = slug or marketplace
+    reason = alias_rejection_reason(alias)
+    if reason:
+        fail(
+            "marketplace %r derived alias %r rejected: %s — refusing to write per-UID catalog"
+            % (marketplace, alias, reason)
+        )
+    alias_owners.setdefault(alias, []).append(marketplace)
+    declared_entries.append((marketplace, entry, source_dir, slug, alias))
+
+collisions = {a: owners for a, owners in alias_owners.items() if len(owners) > 1}
+if collisions:
+    detail = "; ".join(
+        "%r ← %s" % (alias, ", ".join(repr(o) for o in sorted(owners)))
+        for alias, owners in sorted(collisions.items())
+    )
+    fail(
+        "marketplace alias collision detected — multiple marketplaces would land at "
+        "the same `marketplaces/<alias>` symlink and silently overwrite each other. "
+        "Rename or namespace the colliding marketplaces upstream. Colliders: " + detail
+    )
+
+for marketplace, entry, source_dir, slug, alias in declared_entries:
+    rewritten = copy.deepcopy(entry)
+    source = rewritten.get("source")
+    isolated_location = os.path.join(marketplaces_root, alias)
+    rewritten["installLocation"] = isolated_location
+    if isinstance(source, dict) and source.get("source") == "directory":
+        source["path"] = isolated_location
+    out[marketplace] = rewritten
+
+with open(out_path, "w") as f:
+    json.dump(out, f, indent=2)
+PY
+  then
+    bridge_linux_sudo_root rm -f "$catalog_tmp" >/dev/null 2>&1 || true
+    # Fail-loud: the catalog generator surfaces alias collisions and
+    # unsafe alias inputs (regex / `..` / reserved name / control char)
+    # via SystemExit(2). Silent skip would leave isolated agents running
+    # against an outdated/empty catalog while the underlying input bug
+    # stays hidden. Operator must rename the colliding marketplace or
+    # remove the offending entry before re-running isolation prepare.
+    bridge_die "bridge_write_isolated_known_marketplaces_catalog: refused to write per-UID catalog for $os_user (see [bridge-isolate] errors above)"
+  fi
+
+  bridge_linux_sudo_root chown root:root "$catalog_tmp"
+  bridge_linux_sudo_root chmod 0640 "$catalog_tmp"
+  if bridge_isolation_v2_active; then
+    if [[ -n "$agent" ]]; then
+      local _v2_grp
+      _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
+        || _v2_grp=""
+      if [[ -n "$_v2_grp" ]]; then
+        bridge_linux_sudo_root chgrp "$_v2_grp" "$catalog_tmp" \
+          || bridge_die "isolation v2: chgrp '$_v2_grp' on marketplace catalog '$catalog_tmp' failed"
+      else
+        bridge_die "isolation v2: cannot resolve agent group for marketplace catalog '$catalog_tmp'"
+      fi
+    else
+      bridge_die "isolation v2: bridge_write_isolated_known_marketplaces_catalog requires agent id"
+    fi
+  else
+    bridge_linux_acl_add "u:${os_user}:r--" "$catalog_tmp"
+  fi
+  bridge_linux_sudo_root mv "$catalog_tmp" "$catalog"
+}
+
 bridge_isolated_plugin_grants_state_dir() {
   # Controller-owned ledger root for plugin-share ACL grants. Keep this out
   # of $BRIDGE_ACTIVE_AGENT_DIR/<agent>: in legacy mode that path is also the
@@ -1686,16 +2202,53 @@ bridge_write_isolated_installed_plugins_manifest() {
   # copy+unlink and a concurrent reader can see a half-written or
   # transiently missing manifest. (Blocking 2 in PR #302 r1.)
   manifest_tmp="$(bridge_linux_sudo_root mktemp "${manifest}.tmp.XXXXXX")"
-  if ! bridge_linux_sudo_root python3 - "$controller_plugins" "$channels_csv" "$manifest_tmp" "$plugins_csv" <<'PY'
-import json, os, sys
+  if ! bridge_linux_sudo_root python3 - "$controller_plugins" "$isolated_plugins" "$channels_csv" "$manifest_tmp" "$plugins_csv" <<'PY'
+import json, os, re, sys
 
-controller_plugins, channels_csv, out_path, plugins_csv = sys.argv[1:]
+controller_plugins, isolated_plugins, channels_csv, out_path, plugins_csv = sys.argv[1:]
 controller_manifest = os.path.join(controller_plugins, "installed_plugins.json")
 markets_path = os.path.join(controller_plugins, "known_marketplaces.json")
 
 
 def warn(msg):
     sys.stderr.write("[bridge-isolate] " + msg + "\n")
+
+
+# Mirror of `_alias_rejection_reason` in bridge-dev-plugin-cache.py.
+# `fullmatch` (vs `match(... + "$")`) closes the trailing-newline bypass.
+# In the normal share flow upstream gates already validate marketplace
+# id and slug aliases before this helper runs; the validator here is
+# defense-in-depth for the path components this helper itself joins
+# (`isolated_plugins/cache/<marketplace>/<plugin>/<version>`). An
+# unsafe component reaching here means an upstream gate failed; we
+# refuse the lookup rather than silently reading from a poisoned path.
+_SAFE_ALIAS_RE = re.compile(r"[A-Za-z0-9._-]+")
+_ALIAS_RESERVED_NAMES = {".", ".."}
+_ALIAS_WINDOWS_RESERVED = (
+    {"CON", "PRN", "AUX", "NUL"}
+    | {"COM%d" % i for i in range(1, 10)}
+    | {"LPT%d" % i for i in range(1, 10)}
+)
+
+
+def alias_rejection_reason(alias):
+    if not isinstance(alias, str):
+        return "not a string"
+    if alias == "":
+        return "empty"
+    if len(alias) > 200:
+        return "length exceeds 200"
+    if not _SAFE_ALIAS_RE.fullmatch(alias):
+        return "contains characters outside [A-Za-z0-9._-]"
+    if ".." in alias:
+        return "contains '..'"
+    if alias in _ALIAS_RESERVED_NAMES:
+        return "reserved name"
+    if alias.upper() in _ALIAS_WINDOWS_RESERVED:
+        return "reserved Windows name"
+    if alias.startswith(".") and alias != ".git":
+        return "leading dot disallowed"
+    return ""
 
 
 # Distinguish "controller manifest exists but is corrupt" (operator-
@@ -1740,6 +2293,17 @@ def directory_marketplace_path(plugin_id):
     if "@" not in plugin_id:
         return ""
     plugin_name, marketplace = plugin_id.split("@", 1)
+    # Defense-in-depth: plugin_name is about to be joined into a path.
+    # marketplace is used only as a dict key so doesn't need path-safety,
+    # but reject it too — an unsafe id here means an upstream parser bug.
+    for role, value in (("plugin name", plugin_name), ("marketplace id", marketplace)):
+        reason = alias_rejection_reason(value)
+        if reason:
+            sys.stderr.write(
+                "[bridge-isolate] directory_marketplace_path rejected %s %r (plugin_id=%r): %s\n"
+                % (role, value, plugin_id, reason)
+            )
+            raise SystemExit(2)
     entry = markets.get(marketplace, {})
     if not isinstance(entry, dict):
         return ""
@@ -1755,10 +2319,46 @@ def directory_marketplace_path(plugin_id):
     return guess if os.path.isdir(guess) else ""
 
 
+def isolated_cache_path(plugin_id, entry):
+    if "@" not in plugin_id:
+        return ""
+    plugin_name, marketplace = plugin_id.split("@", 1)
+    version = str((entry or {}).get("version") or "").strip()
+    if not version:
+        install_path = str((entry or {}).get("installPath") or "").rstrip("/")
+        version = os.path.basename(install_path)
+    if not version:
+        return ""
+    # Defense-in-depth: every component is about to be joined into
+    # `<isolated_plugins>/cache/<marketplace>/<plugin>/<version>`. An
+    # unsafe component (newline / `..` / slash) could escape the cache
+    # root; in the normal share flow the catalog writer already filters
+    # marketplace ids upstream, but this helper runs separately and must
+    # hold the gate on its own. Fail loud — silently returning "" would
+    # mask an upstream bug.
+    for role, value in (
+        ("marketplace id", marketplace),
+        ("plugin name", plugin_name),
+        ("plugin version", version),
+    ):
+        reason = alias_rejection_reason(value)
+        if reason:
+            sys.stderr.write(
+                "[bridge-isolate] isolated_cache_path rejected %s %r (plugin_id=%r): %s\n"
+                % (role, value, plugin_id, reason)
+            )
+            raise SystemExit(2)
+    candidate = os.path.join(isolated_plugins, "cache", marketplace, plugin_name, version)
+    return candidate if os.path.isdir(candidate) else ""
+
+
 def resolve(plugin_id):
     # Preserve controller entry metadata (version, gitCommitSha, etc.) when
     # we can; only rewrite installPath if it is missing or stale.
     for entry in source.get("plugins", {}).get(plugin_id, []):
+        isolated_path = isolated_cache_path(plugin_id, entry)
+        if isolated_path:
+            return entry, isolated_path
         ip = entry.get("installPath")
         if ip and os.path.isdir(ip):
             return entry, ip
@@ -1803,7 +2403,12 @@ with open(out_path, "w") as f:
 PY
   then
     bridge_linux_sudo_root rm -f "$manifest_tmp" >/dev/null 2>&1 || true
-    bridge_warn "bridge_write_isolated_installed_plugins_manifest: refused to write per-UID manifest for $os_user (controller state unparseable)"
+    # Fail-loud: SystemExit(2) covers both controller-state-unparseable
+    # and the new defense-in-depth path-component rejection in
+    # `directory_marketplace_path`/`isolated_cache_path`. The Python
+    # heredoc emits a `[bridge-isolate]` stderr line naming the offending
+    # component before exiting; surface that to the operator log.
+    bridge_warn "bridge_write_isolated_installed_plugins_manifest: refused to write per-UID manifest for $os_user (see [bridge-isolate] errors above; either controller state unparseable or a path component failed safe-alias gate)"
     return 1
   fi
 
@@ -1964,18 +2569,32 @@ bridge_linux_share_plugin_catalog() {
   fi
 
   # 2. plugins/data/: isolated UID owns this so plugin runtime state writes work.
+  local os_group=""
+  os_group="$(id -gn "$os_user" 2>/dev/null || printf '%s' "$os_user")"
   bridge_linux_sudo_root mkdir -p "$isolated_plugins/data"
-  bridge_linux_sudo_root chown "$os_user" "$isolated_plugins/data"
+  bridge_linux_sudo_root chown "$os_user:$os_group" "$isolated_plugins/data"
   bridge_linux_sudo_root chmod 0700 "$isolated_plugins/data"
+
+  local channels_csv=""
+  local plugins_csv=""
+  channels_csv="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
+  plugins_csv="$(bridge_agent_plugins_csv "$agent" 2>/dev/null || true)"
 
   # 3. Read-only catalog metadata symlinks. Always remove the prior dst
   #    first (independent of source presence) so a controller-side delete
   #    invalidates the isolated symlink rather than leaving it dangling at
   #    a now-stale target. (Risk 1 in PR #302 r1.)
+  #
+  #    known_marketplaces.json is intentionally excluded from this symlink
+  #    loop. Claude Code now tries to clone every visible marketplace when
+  #    rendering `/plugin`; exposing the controller's full marketplace file
+  #    makes isolated agents attempt writes under their root-owned
+  #    marketplaces/ dir. Step 4 writes a filtered per-UID copy instead.
   local catalog_file=""
   local src=""
   local dst=""
   for catalog_file in "${BRIDGE_ISOLATION_SHARED_CATALOG_READ_FILES[@]}"; do
+    [[ "$catalog_file" == "known_marketplaces.json" ]] && continue
     src="$controller_plugins/$catalog_file"
     dst="$isolated_plugins/$catalog_file"
     bridge_linux_sudo_root rm -f "$dst" >/dev/null 2>&1 || true
@@ -1986,18 +2605,20 @@ bridge_linux_share_plugin_catalog() {
     bridge_linux_acl_add "u:${os_user}:r--" "$src"
   done
 
-  # 4. Per-UID installed_plugins.json — declared plugins only (union of
+  # 4. Filtered per-UID known_marketplaces.json — declared marketplaces only,
+  #    with installLocation/source.path rewritten to isolated-home aliases.
+  bridge_write_isolated_known_marketplaces_catalog \
+    "$os_user" "$isolated_plugins" "$controller_plugins" \
+    "$channels_csv" "$plugins_csv" "$agent"
+
+  # 5. Per-UID installed_plugins.json — declared plugins only (union of
   #    BRIDGE_AGENT_CHANNELS plugin entries and BRIDGE_AGENT_PLUGINS allowlist
   #    per #348 / #272), real install paths.
-  local channels_csv=""
-  local plugins_csv=""
-  channels_csv="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
-  plugins_csv="$(bridge_agent_plugins_csv "$agent" 2>/dev/null || true)"
   bridge_write_isolated_installed_plugins_manifest \
     "$os_user" "$isolated_plugins" "$controller_plugins" \
     "$channels_csv" "$plugins_csv" "$agent"
 
-  # 5. Compute the channel diff against the persisted grant set so we can
+  # 6. Compute the channel diff against the persisted grant set so we can
   #    revoke channels that were previously granted but are no longer in
   #    the roster (Blocking 1 in PR #302 r1). The "current" set is the
   #    union of BRIDGE_AGENT_CHANNELS `plugin:<id>` tokens and
@@ -2052,7 +2673,7 @@ bridge_linux_share_plugin_catalog() {
     done
   fi
 
-  # 5a. Revoke removed entries (in prior set but not in current set).
+  # 6a. Revoke removed entries (in prior set but not in current set).
   #     This covers both channel removals and BRIDGE_AGENT_PLUGINS
   #     removals — both are persisted in the same `plugin:<id>` form.
   local _prior_entry=""
@@ -2069,7 +2690,7 @@ bridge_linux_share_plugin_catalog() {
     fi
   done
 
-  # 5b. Grant current plugin install paths + traverse chain (channel-declared
+  # 6b. Grant current plugin install paths + traverse chain (channel-declared
   #     plus BRIDGE_AGENT_PLUGINS allowlist entries).
   local channel=""
   local plugin_id=""
@@ -2085,7 +2706,7 @@ bridge_linux_share_plugin_catalog() {
     bridge_linux_acl_add_recursive "u:${os_user}:r-X" "$install_path"
   done
 
-  # 5b'. Marketplace symlinks (#348). For every union plugin in
+  # 6b'. Marketplace symlinks (#348). For every union plugin in
   #     `<plugin>@<marketplace>` form whose marketplace is registered
   #     in the controller's `known_marketplaces.json` AND whose mirror
   #     tree exists at `~/.claude/plugins/marketplaces/<marketplace>`,
@@ -2106,8 +2727,32 @@ bridge_linux_share_plugin_catalog() {
   local _mkt_id=""
   local _mkt_src=""
   local _mkt_dst=""
-  local _mkt_lookup=""
+  local _mkt_info=""
+  local _mkt_status=""
+  local _mkt_alias=""
+  local _mkt_alias_reason=""
+  local -a _mkt_info_parts=()
   local _mkt_block_disabled=0
+  # Collision-detection ledger for the symlink pre-pass. Each alias keeps
+  # a `\x1f`-separated list of marketplace ids that resolved to it; if
+  # any list grows past one entry, we fail loudly before planting any
+  # symlink. Without this gate, two marketplace ids that reduce to the
+  # same alias (e.g. `foo/bar-baz` and `foo-bar/baz` both → `foo-bar-baz`)
+  # would silently overwrite each other under the root-owned
+  # marketplaces/ dir — the catalog would end up pointing the wrong repo
+  # for one of them with zero error signal.
+  local _alias_collision_marker=$'\x1f'
+  declare -A _alias_owners=()
+  declare -A _mkt_resolved_src=()
+  declare -A _mkt_resolved_aliases=()
+  local _alias_collision_detail=""
+  local -a _mkt_unique_ids=()
+  bridge_linux_sudo_root bash -c "if [[ -d \"$_isolated_marketplaces\" || -L \"$_isolated_marketplaces\" ]]; then shopt -s nullglob dotglob; for entry in \"$_isolated_marketplaces\"/*; do [[ -L \"\$entry\" ]] && rm -f \"\$entry\"; done; fi" >/dev/null 2>&1 || true
+
+  # Pass 1 — discovery + validation. Collect (mkt_id, src, aliases) for
+  # every unique marketplace the agent declares, validate each alias
+  # (defense in depth: bridge_known_marketplace_info also rejects unsafe
+  # aliases), and build the alias-owner map for collision detection.
   for _channel_full in "${_current_plugin_channels[@]+"${_current_plugin_channels[@]}"}"; do
     (( _mkt_block_disabled == 0 )) || break
     plugin_id="${_channel_full#plugin:}"
@@ -2119,16 +2764,29 @@ bridge_linux_share_plugin_catalog() {
     esac
     _mkt_seen="${_mkt_seen}${_seen_marker}${_mkt_id}${_seen_marker}"
     # Source-of-truth gate: marketplace must be registered in
-    # known_marketplaces.json. On `unparseable` we abandon the whole
-    # 5b' block; the manifest writer at :1183-1186 already logged the
-    # canonical warning earlier in the same share pass, so the helper
-    # itself stays silent (no duplicate stderr line per share pass —
-    # #348 r3).
-    _mkt_lookup="$(bridge_known_marketplaces_lookup "$_mkt_id" "$controller_plugins")"
-    case "$_mkt_lookup" in
+    # known_marketplaces.json. The helper also returns Claude Code's newer
+    # github repo-slug alias (`org-repo`) so bridge can preplant both names
+    # without making the isolated marketplaces/ root writable.
+    _mkt_info="$(bridge_known_marketplace_info "$_mkt_id" "$controller_plugins")" || {
+      # The Python helper exits 2 when an alias fails the safety check.
+      # Surface that as a fail-loud condition rather than a silent skip:
+      # an unsafe alias is operator input that escapes the marketplaces/
+      # namespace under root's write authority.
+      bridge_die "marketplace ${_mkt_id}: known_marketplaces.json lookup rejected an unsafe alias (see [bridge-isolate] errors above). Refusing to plant any marketplace symlink for this agent until the input is fixed."
+    }
+    IFS=$'\t' read -r -a _mkt_info_parts <<<"$_mkt_info"
+    _mkt_status="${_mkt_info_parts[0]:-}"
+    _mkt_src="${_mkt_info_parts[1]:-}"
+    case "$_mkt_status" in
       unparseable)
         _mkt_block_disabled=1
         break
+        ;;
+      unsafe)
+        # Defense in depth: the helper also exits 0 with `unsafe` when
+        # the safety check trips. Treat it the same as the SystemExit(2)
+        # path above.
+        bridge_die "marketplace ${_mkt_id}: known_marketplaces.json carries an unsafe alias (see [bridge-isolate] errors above)."
         ;;
       missing|"")
         # marketplace not registered → silent skip, no broken symlink.
@@ -2137,7 +2795,6 @@ bridge_linux_share_plugin_catalog() {
       present:*) ;;  # fall through to the symlink path
       *) continue ;;
     esac
-    _mkt_src="$controller_plugins/marketplaces/$_mkt_id"
     # Even when known_marketplaces.json carries an entry, the on-disk
     # mirror tree may not yet exist (common for git-source marketplaces
     # on a fresh checkout, or directory-source marketplaces whose cache
@@ -2148,6 +2805,70 @@ bridge_linux_share_plugin_catalog() {
       bridge_warn "marketplace ${_mkt_id} is in known_marketplaces.json but the controller-side tree at ${_mkt_src} is missing — declared plugins from this marketplace will not load. Operator must run \`/plugin marketplace add\` once with credentials, then re-run isolation prepare."
       continue
     fi
+    # Defense-in-depth alias validation. The Python helper rejected
+    # unsafe aliases above; if a future caller bypasses that path the
+    # symlink loop must still refuse to plant a name that escapes the
+    # marketplaces/ namespace.
+    local _mkt_alias_list=""
+    for _mkt_alias in "${_mkt_info_parts[@]:2}"; do
+      [[ -n "$_mkt_alias" ]] || continue
+      _mkt_alias_reason="$(bridge_isolation_alias_rejection_reason "$_mkt_alias")"
+      if [[ -n "$_mkt_alias_reason" ]]; then
+        bridge_die "marketplace ${_mkt_id}: alias '${_mkt_alias}' rejected (${_mkt_alias_reason}). Refusing to plant unsafe symlink under ${_isolated_marketplaces}/."
+      fi
+      # Append owner to the per-alias ledger.
+      local _existing="${_alias_owners[$_mkt_alias]:-}"
+      if [[ -n "$_existing" ]]; then
+        _alias_owners[$_mkt_alias]="${_existing}${_alias_collision_marker}${_mkt_id}"
+      else
+        _alias_owners[$_mkt_alias]="${_mkt_id}"
+      fi
+      if [[ -n "$_mkt_alias_list" ]]; then
+        _mkt_alias_list="${_mkt_alias_list}${_alias_collision_marker}${_mkt_alias}"
+      else
+        _mkt_alias_list="$_mkt_alias"
+      fi
+    done
+    if [[ -z "$_mkt_alias_list" ]]; then
+      # No usable alias — bridge_known_marketplace_info already filters
+      # this case (the marketplace id itself goes in first), but guard
+      # anyway so downstream pass-2 always has at least one alias.
+      continue
+    fi
+    _mkt_resolved_src[$_mkt_id]="$_mkt_src"
+    _mkt_resolved_aliases[$_mkt_id]="$_mkt_alias_list"
+    _mkt_unique_ids+=("$_mkt_id")
+  done
+
+  # Pass 1.5 — collision detection. Two distinct marketplace ids that
+  # reduce to the same alias would each plant a symlink at
+  # `<isolated>/marketplaces/<alias>`; the second `ln -s` (with `rm -f`
+  # in front) silently overwrites the first under root's write authority,
+  # so the catalog ends up pointing the wrong source for one of them.
+  # Fail-loud listing every collider lets the operator rename or
+  # namespace upstream rather than chase a silent misroute.
+  if (( ${#_alias_owners[@]} > 0 )); then
+    local _coll_alias=""
+    for _coll_alias in "${!_alias_owners[@]}"; do
+      local _coll_owners="${_alias_owners[$_coll_alias]}"
+      if [[ "$_coll_owners" == *"${_alias_collision_marker}"* ]]; then
+        local _coll_pretty="${_coll_owners//${_alias_collision_marker}/, }"
+        if [[ -n "$_alias_collision_detail" ]]; then
+          _alias_collision_detail="${_alias_collision_detail}; '${_coll_alias}' ← ${_coll_pretty}"
+        else
+          _alias_collision_detail="'${_coll_alias}' ← ${_coll_pretty}"
+        fi
+      fi
+    done
+  fi
+  if [[ -n "$_alias_collision_detail" ]]; then
+    bridge_die "marketplace alias collision detected — multiple marketplaces would land at the same '<isolated>/marketplaces/<alias>' symlink and silently overwrite each other under root's write authority. Rename or namespace the colliding marketplaces upstream. Colliders: ${_alias_collision_detail}"
+  fi
+
+  # Pass 2 — plant symlinks + ACLs. By this point every (mkt_id, src,
+  # alias) triple has been validated and proven collision-free.
+  for _mkt_id in "${_mkt_unique_ids[@]+"${_mkt_unique_ids[@]}"}"; do
+    _mkt_src="${_mkt_resolved_src[$_mkt_id]}"
     if (( _marketplaces_root_created == 0 )); then
       bridge_linux_sudo_root mkdir -p "$_isolated_marketplaces"
       if bridge_isolation_v2_active; then
@@ -2164,10 +2885,15 @@ bridge_linux_share_plugin_catalog() {
       fi
       _marketplaces_root_created=1
     fi
-    _mkt_dst="$_isolated_marketplaces/$_mkt_id"
-    bridge_linux_sudo_root rm -f "$_mkt_dst" >/dev/null 2>&1 || true
-    bridge_linux_sudo_root ln -s "$_mkt_src" "$_mkt_dst"
-    bridge_linux_sudo_root chown -h root:root "$_mkt_dst" >/dev/null 2>&1 || true
+    local -a _alias_arr=()
+    IFS="${_alias_collision_marker}" read -ra _alias_arr <<<"${_mkt_resolved_aliases[$_mkt_id]}"
+    for _mkt_alias in "${_alias_arr[@]}"; do
+      [[ -n "$_mkt_alias" ]] || continue
+      _mkt_dst="$_isolated_marketplaces/$_mkt_alias"
+      bridge_linux_sudo_root rm -f "$_mkt_dst" >/dev/null 2>&1 || true
+      bridge_linux_sudo_root ln -s "$_mkt_src" "$_mkt_dst"
+      bridge_linux_sudo_root chown -h root:root "$_mkt_dst" >/dev/null 2>&1 || true
+    done
     # r#362: end-to-end readability for the symlinked marketplace tree.
     # Without all three steps, the symlink is planted but EACCES on first
     # read and Claude silently drops the plugin from the session. Order
@@ -2185,7 +2911,7 @@ bridge_linux_share_plugin_catalog() {
       bridge_die "marketplace tree: failed to set default ACL inheritance on $_mkt_src"
   done
 
-  # 5c. Persist the new grant set so the next reapply / unisolate sees
+  # 6c. Persist the new grant set so the next reapply / unisolate sees
   #     exactly what we touched here. Persisted entries cover both the
   #     channel-derived and BRIDGE_AGENT_PLUGINS-derived plugins (both
   #     stored in `plugin:<id>` form), so the unisolate revoke loop in
@@ -2197,7 +2923,7 @@ bridge_linux_share_plugin_catalog() {
   fi
   bridge_isolated_plugin_grants_write "$agent" "$_persist_csv"
 
-  # 5d. Audit row so operators can confirm exactly which plugins landed
+  # 6d. Audit row so operators can confirm exactly which plugins landed
   #     on the isolated UID after each reapply (#348). The detail rows
   #     carry the union list (channel + allowlist) and its size so a
   #     follow-up `bridge-audit` query can surface domain-plugin
@@ -2227,13 +2953,15 @@ bridge_linux_unshare_plugin_catalog() {
 
   local isolated_plugins="$user_home/.claude/plugins"
   [[ -n "$user_home" ]] || return 0
-  [[ -d "$isolated_plugins" ]] || return 0
+  bridge_linux_sudo_root test -d "$isolated_plugins" || return 0
 
   local catalog_file=""
   local link=""
   for catalog_file in "${BRIDGE_ISOLATION_SHARED_CATALOG_READ_FILES[@]}"; do
     link="$isolated_plugins/$catalog_file"
-    [[ -e "$link" || -L "$link" ]] || continue
+    bridge_linux_sudo_root test -e "$link" 2>/dev/null \
+      || bridge_linux_sudo_root test -L "$link" 2>/dev/null \
+      || continue
     bridge_migration_print_step "$dry_run" "rm $link (isolated catalog symlink)"
     if [[ "$dry_run" != "1" ]]; then
       bridge_linux_sudo_root rm -f "$link" >/dev/null 2>&1 || true
@@ -2241,7 +2969,7 @@ bridge_linux_unshare_plugin_catalog() {
   done
 
   local manifest="$isolated_plugins/installed_plugins.json"
-  if [[ -e "$manifest" ]]; then
+  if bridge_linux_sudo_root test -e "$manifest" 2>/dev/null; then
     bridge_migration_print_step "$dry_run" "rm $manifest (per-UID installed_plugins.json)"
     if [[ "$dry_run" != "1" ]]; then
       bridge_linux_sudo_root rm -f "$manifest" >/dev/null 2>&1 || true
@@ -2254,7 +2982,8 @@ bridge_linux_unshare_plugin_catalog() {
   # marketplaces/ dir if it ends up empty so the outer rmdir below can
   # also tear down plugins/. plugins/data/ remains untouched.
   local isolated_marketplaces="$isolated_plugins/marketplaces"
-  if [[ -d "$isolated_marketplaces" || -L "$isolated_marketplaces" ]]; then
+  if bridge_linux_sudo_root test -d "$isolated_marketplaces" 2>/dev/null \
+      || bridge_linux_sudo_root test -L "$isolated_marketplaces" 2>/dev/null; then
     bridge_migration_print_step "$dry_run" "rm $isolated_marketplaces/* symlinks (isolated marketplace symlinks)"
     if [[ "$dry_run" != "1" ]]; then
       bridge_linux_sudo_root bash -c "shopt -s nullglob dotglob; for entry in \"$isolated_marketplaces\"/*; do [[ -L \"\$entry\" ]] && rm -f \"\$entry\"; done" >/dev/null 2>&1 || true
