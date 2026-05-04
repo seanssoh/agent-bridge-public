@@ -2,14 +2,23 @@
 # shellcheck shell=bash disable=SC2034
 
 if (( ${BASH_VERSINFO[0]:-0} < 4 )); then
-  for bridge_candidate_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null || true)"; do
-    [[ -n "$bridge_candidate_bash" && -x "$bridge_candidate_bash" ]] || continue
-    if "$bridge_candidate_bash" -lc '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
-      exec "$bridge_candidate_bash" "$0" "$@"
-    fi
-  done
+  # Re-exec into a Bash 4+ candidate, but ONLY when $0 names a regular file
+  # we can hand back to the new shell. When bridge-lib.sh is sourced from a
+  # `bash -lc '...' _ args` invocation (e.g. inside scripts/smoke/daemon.sh
+  # subshells), $0 is `_`, which isn't a script — exec'ing it produces the
+  # cryptic `_: No such file or directory` from the candidate shell instead
+  # of the real "requires Bash 4+" message. Fail loud in that path. (#576 r3
+  # Finding 3)
+  if [[ -f "$0" ]]; then
+    for bridge_candidate_bash in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null || true)"; do
+      [[ -n "$bridge_candidate_bash" && -x "$bridge_candidate_bash" ]] || continue
+      if "$bridge_candidate_bash" -lc '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
+        exec "$bridge_candidate_bash" "$0" "$@"
+      fi
+    done
+  fi
 
-  echo "[bridge-lib] Agent Bridge requires Bash 4+ (current: ${BASH_VERSION:-unknown})." >&2
+  echo "[bridge-lib] Agent Bridge requires Bash 4+ (current: ${BASH_VERSION:-unknown}). Re-run with a Bash 4+ shell on PATH (e.g. \`/opt/homebrew/bin/bash <script>\`)." >&2
   exit 1
 fi
 

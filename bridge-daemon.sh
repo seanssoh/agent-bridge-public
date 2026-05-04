@@ -42,7 +42,22 @@ daemon_source_state_file() {
   # Callsites that genuinely tolerate "missing fields" (e.g. first-run
   # daily-backup state) omit this argument.
   local required_vars="${4:-}"
+  # Optional 5th positional: whitespace-separated names of every variable
+  # the file is expected to define. These are unset BEFORE sourcing so a
+  # failed source (unreadable, invalid syntax, missing required var, or
+  # missing field) cannot leak previously-sourced values from an earlier
+  # caller (e.g. a different agent in the same per-loop-iteration scan)
+  # into the post-call read. The required_vars list is implicitly part of
+  # this set; callers may list it in either argument. (#576 r3 Finding 1)
+  local sanitize_vars="${5:-}"
   local var
+
+  # Sanitize required + caller-declared family BEFORE any of the early-return
+  # paths below: an unreadable / syntactically invalid file must not leave
+  # stale values from a prior successful source still in scope.
+  for var in $required_vars $sanitize_vars; do
+    unset "$var"
+  done
 
   [[ -f "$file" ]] || return 1
   if [[ ! -r "$file" ]]; then
@@ -1606,7 +1621,8 @@ process_stall_reports() {
     matched_pattern=""
 
     if [[ -f "$state_file" ]]; then
-      if daemon_source_state_file "$state_file" "stall/$agent" 1 "STALL_LAST_SCAN_TS"; then
+      if daemon_source_state_file "$state_file" "stall/$agent" 1 "STALL_LAST_SCAN_TS" \
+          "STALL_ACTIVE_CLASSIFICATION STALL_ACTIVE_EXCERPT_HASH STALL_ACTIVE_MATCHED_LINE_HASH STALL_FIRST_DETECTED_TS STALL_LAST_DETECTED_TS STALL_NUDGE_COUNT STALL_LAST_NUDGE_TS STALL_ESCALATED_TS STALL_TASK_ID STALL_MATCHED_PATTERN"; then
         had_state=1
       fi
       active_classification="${STALL_ACTIVE_CLASSIFICATION:-}"
@@ -2073,7 +2089,8 @@ process_context_pressure_reports() {
     matched_pattern=""
 
     if [[ -f "$state_file" ]]; then
-      if daemon_source_state_file "$state_file" "context-pressure/$agent" 1 "CONTEXT_PRESSURE_LAST_SCAN_TS"; then
+      if daemon_source_state_file "$state_file" "context-pressure/$agent" 1 "CONTEXT_PRESSURE_LAST_SCAN_TS" \
+          "CONTEXT_PRESSURE_SEVERITY CONTEXT_PRESSURE_EXCERPT_HASH CONTEXT_PRESSURE_FIRST_DETECTED_TS CONTEXT_PRESSURE_LAST_DETECTED_TS CONTEXT_PRESSURE_LAST_REPORT_TS CONTEXT_PRESSURE_MATCHED_PATTERN"; then
         had_state=1
       fi
       previous_severity="${CONTEXT_PRESSURE_SEVERITY:-}"
@@ -2445,7 +2462,9 @@ process_crash_reports() {
     ack_hash=""
     ack_ts=0
     if [[ -f "$state_file" ]]; then
-      daemon_source_state_file "$state_file" "crash-state/$agent" 1 "CRASH_LAST_REPORT_TS" || true
+      daemon_source_state_file "$state_file" "crash-state/$agent" 1 "CRASH_LAST_REPORT_TS" \
+          "CRASH_LAST_HASH CRASH_ACK_HASH CRASH_ACK_TS" \
+        || true
       last_hash="${CRASH_LAST_HASH:-}"
       last_report_ts="${CRASH_LAST_REPORT_TS:-0}"
       ack_hash="${CRASH_ACK_HASH:-}"
@@ -2611,7 +2630,14 @@ bridge_daemon_note_autostart_failure() {
   file="$(bridge_daemon_autostart_state_file "$agent")"
   mkdir -p "$(dirname "$file")"
   if [[ -f "$file" ]]; then
-    daemon_source_state_file "$file" "autostart/$agent" 1 "AUTO_START_NEXT_RETRY_TS" || true
+    daemon_source_state_file "$file" "autostart/$agent" 1 "AUTO_START_NEXT_RETRY_TS" \
+        "AUTO_START_FAIL_COUNT AUTO_START_LAST_REASON" \
+      || true
+  else
+    # No state file means a fresh agent or a cleared backoff — wipe any
+    # AUTO_START_* values left over from a different agent in this same
+    # daemon process so the new fail_count counter starts at 0. (#576 r3)
+    unset AUTO_START_FAIL_COUNT AUTO_START_NEXT_RETRY_TS AUTO_START_LAST_REASON
   fi
   AUTO_START_FAIL_COUNT="${AUTO_START_FAIL_COUNT:-0}"
   [[ "$AUTO_START_FAIL_COUNT" =~ ^[0-9]+$ ]] || AUTO_START_FAIL_COUNT=0
@@ -2959,7 +2985,9 @@ bridge_report_channel_health_miss() {
   body_file="$(bridge_channel_health_body_file "$agent")"
 
   if [[ -f "$state_file" ]]; then
-    daemon_source_state_file "$state_file" "channel-health/$agent" 1 "LAST_REPORT_TS" || true
+    daemon_source_state_file "$state_file" "channel-health/$agent" 1 "LAST_REPORT_TS" \
+        "LAST_KEY" \
+      || true
     last_key="${LAST_KEY:-}"
     last_report_ts="${LAST_REPORT_TS:-0}"
   fi
@@ -3081,7 +3109,9 @@ bridge_report_plugin_liveness_miss() {
   [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=60
   state_file="$(bridge_plugin_liveness_state_file "$agent")"
   if [[ -f "$state_file" ]]; then
-    daemon_source_state_file "$state_file" "plugin-liveness/$agent" 1 "LAST_DETECTED_TS" || true
+    daemon_source_state_file "$state_file" "plugin-liveness/$agent" 1 "LAST_DETECTED_TS" \
+        "LAST_KEY LAST_RESTART_TS" \
+      || true
     last_key="${LAST_KEY:-}"
     last_detected_ts="${LAST_DETECTED_TS:-0}"
     last_restart_ts="${LAST_RESTART_TS:-0}"
