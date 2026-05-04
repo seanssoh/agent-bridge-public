@@ -448,6 +448,14 @@ def render_shared_tools_md(bridge_home: Path) -> str:
 - 레거시 direct-send CLI를 직접 호출하지 않는다.
 - 브리지 알림이 필요하면 queue 또는 bridge notify path를 사용한다.
 
+## External Channel Timestamp Handling
+Discord/Telegram MCP가 `fetch_messages`·channel webhook으로 반환하는 timestamp(`ts`, `<channel ... ts="...">`)는 모두 **ISO 8601 UTC** 포맷이다 (`Z` suffix, 예: `2026-05-03T22:29:18.928Z`).
+- 사용자에게 시간을 인용·비교·보고할 때 반드시 **로컬 timezone(KST = UTC+9)** 으로 변환한 뒤 표기한다.
+- UTC 시간이 15:00 이후이면 KST 날짜는 다음 날로 넘어간다(날짜 boundary 주의).
+- prompt hook의 `now: ... KST`와 MCP `ts (UTC)`는 다른 timezone이라 그대로 빼면 안 된다.
+- 변환 검산: `KST = UTC + 09:00` (서머타임 없음, 항상 일정).
+- **오류 사례 (2026-05-04 syrs-sns):** Discord MCP가 `ts="2026-05-03T22:29:18.928Z"`를 반환했는데 에이전트가 "22:29에 보내신 메시지"로 그대로 인용함 → 실제로는 `2026-05-04 07:29 KST`였고 날짜·시각 모두 어긋남. UTC→KST 변환을 빠뜨리면 +9h + 날짜 경계 flip이 동시에 일어난다.
+
 ## Cron
 - inventory/list/create/update/delete: `{home}/agent-bridge cron ...`
 - 옛 cron helper 예시는 더 이상 기준이 아니다.
