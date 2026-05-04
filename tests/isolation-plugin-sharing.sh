@@ -1476,10 +1476,12 @@ parity_inputs = [
     "foo",                  # both accept
     ".git",                 # both accept (documented escape hatch)
     "valid_alias-1.0",      # both accept
+    "foo.git",              # both accept (".git" escape only applies when alias == ".git", not as a suffix)
     "",                     # both reject (empty)
     ".",                    # both reject (reserved)
     "..",                   # both reject (contains '..' / reserved)
     "../etc",               # both reject (contains '..')
+    "foo..bar",             # both reject (contains '..' mid-string, no slash)
     ".secret",              # both reject (leading dot, not .git)
     "CON",                  # both reject (Windows reserved)
     "com1",                 # both reject (Windows reserved, case-folded)
@@ -1490,6 +1492,8 @@ parity_inputs = [
     "foo\n",                # both reject (trailing newline — r3 #3a)
     "bar\n",                # both reject (trailing newline)
     "baz\r",                # both reject (trailing CR)
+    "foo\r",                # both reject (trailing CR — codex r4 sample)
+    "foo\t",                # both reject (trailing TAB — codex r4 sample)
     "alias\x00null",        # both reject (NUL byte)
     "alias\x1fctrl",        # both reject (control byte)
     "a" * 201,              # both reject (length > 200)
