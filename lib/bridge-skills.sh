@@ -223,8 +223,14 @@ import sys
 src, dst, home = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(src, "r", encoding="utf-8") as fh:
     content = fh.read()
-# Normalize trailing slash on the home path so substitution is exact.
-home_norm = home.rstrip("/") + "/"
+# Canonicalize BRIDGE_HOME so that trailing-slash, doubled-slash, and
+# symlinked variants of the same logical path all produce identical
+# rendered output. realpath resolves symlinks (so a fixture pointing
+# BRIDGE_HOME at a symlink renders the underlying real path), normpath
+# collapses double slashes, and the trailing-slash strip + re-append
+# produces an exact `<canonical>/` substitution string.
+home_canonical = os.path.realpath(os.path.normpath(home))
+home_norm = home_canonical.rstrip("/") + "/"
 content = content.replace("~/.agent-bridge/", home_norm)
 tmp = dst + ".tmp"
 os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -324,22 +330,46 @@ bridge_sync_isolated_home_claude_skills() {
       rel="${source_file#"$source_dir/"}"
       target_file="$target_dir/$rel"
       bridge_linux_sudo_root mkdir -p "$(dirname "$target_file")" 2>/dev/null || continue
+      # Atomic install via tmp + mv -f inside the isolated tree so any
+      # concurrent reader (e.g. an isolated agent already mid-launch)
+      # never observes a truncated file. The renderer / source-copy
+      # writes a controller-owned temp file, which is sudo-installed to
+      # `${target_file}.tmp.$$` (same directory as the final target so
+      # the rename stays within one filesystem), and only then renamed
+      # over `$target_file`. `mv -f` on POSIX is an atomic rename within
+      # a filesystem; if it fails the tmp sibling is removed so the
+      # isolated tree never carries a stale `.tmp.$$` artifact. Mirrors
+      # the controller-side os.replace pattern used by
+      # bridge_render_skill_file_for_isolated.
+      local _tmp_target="${target_file}.tmp.$$"
       if bridge_skill_file_is_text "$source_file" 2>/dev/null; then
-        # Render to a controller-owned temp file, then sudo-move into
-        # the isolated tree. Two-step is required because the renderer
-        # writes as the controller UID.
+        # Render to a controller-owned temp file, then sudo-stage into
+        # the isolated tree's tmp sibling. Two-step is required because
+        # the renderer writes as the controller UID.
         local _tmp_rendered=""
         _tmp_rendered="$(mktemp)" || continue
         if bridge_render_skill_file_for_isolated "$source_file" "$_tmp_rendered" "$BRIDGE_HOME"; then
-          bridge_linux_sudo_root install -m 0644 "$_tmp_rendered" "$target_file" 2>/dev/null \
-            || bridge_warn "isolated skills sync: install failed for $target_file"
+          if bridge_linux_sudo_root install -m 0644 "$_tmp_rendered" "$_tmp_target" 2>/dev/null; then
+            bridge_linux_sudo_root mv -f "$_tmp_target" "$target_file" 2>/dev/null || {
+              bridge_linux_sudo_root rm -f "$_tmp_target" 2>/dev/null || true
+              bridge_warn "isolated skills sync: atomic mv failed for $target_file"
+            }
+          else
+            bridge_warn "isolated skills sync: install failed for $target_file"
+          fi
         else
           bridge_warn "isolated skills sync: render failed for $source_file"
         fi
         rm -f "$_tmp_rendered"
       else
-        bridge_linux_sudo_root install -m 0644 "$source_file" "$target_file" 2>/dev/null \
-          || bridge_warn "isolated skills sync: copy failed for $target_file"
+        if bridge_linux_sudo_root install -m 0644 "$source_file" "$_tmp_target" 2>/dev/null; then
+          bridge_linux_sudo_root mv -f "$_tmp_target" "$target_file" 2>/dev/null || {
+            bridge_linux_sudo_root rm -f "$_tmp_target" 2>/dev/null || true
+            bridge_warn "isolated skills sync: atomic mv failed for $target_file"
+          }
+        else
+          bridge_warn "isolated skills sync: copy failed for $target_file"
+        fi
       fi
     done < <(find "$source_dir" -type f -print0 2>/dev/null)
 

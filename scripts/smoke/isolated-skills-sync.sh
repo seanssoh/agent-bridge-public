@@ -176,6 +176,121 @@ assert_subdir_preserved() {
     "subdir SKILL reference rewrites bridge path to absolute BRIDGE_HOME"
 }
 
+# Render a single skill with `BRIDGE_HOME=$1`, into an isolated home
+# unique to that run. The variant tests run after the main sync and
+# therefore re-use the seeded source tree under $FIXTURE_BRIDGE_HOME
+# (a real path with no quirks). The non-canonical input is what the
+# variant feeds to the helper as BRIDGE_HOME — the renderer must
+# canonicalize it to the same `$FIXTURE_BRIDGE_HOME` text in the
+# rendered SKILL.md.
+invoke_sync_with_bridge_home() {
+  local bridge_home_input="$1"
+  local isolated_home_root="$2"
+  local os_user="$3"
+
+  local repo_root="$SMOKE_REPO_ROOT"
+  local bash_bin="${BRIDGE_BASH_BIN:-bash}"
+
+  BRIDGE_HOME="$bridge_home_input" \
+  BRIDGE_HOST_PLATFORM_OVERRIDE=Linux \
+  BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT="$isolated_home_root" \
+  "$bash_bin" -c "
+    set -uo pipefail
+    source '$repo_root/bridge-lib.sh'
+
+    bridge_reset_roster_maps
+
+    BRIDGE_AGENT_IDS+=($FIXTURE_AGENT)
+    BRIDGE_AGENT_ENGINE[$FIXTURE_AGENT]=claude
+    BRIDGE_AGENT_ISOLATION_MODE[$FIXTURE_AGENT]=linux-user
+    BRIDGE_AGENT_OS_USER[$FIXTURE_AGENT]=$os_user
+
+    bridge_linux_sudo_root() {
+      \"\$@\"
+    }
+
+    bridge_sync_isolated_home_claude_skills '$FIXTURE_AGENT'
+  "
+}
+
+# Render with BRIDGE_HOME ending in a trailing slash. Canonicalization
+# must produce the same absolute path as the canonical fixture, with no
+# `//` doubled separator in the rewritten text.
+assert_canonicalize_trailing_slash() {
+  local home_trailing="$FIXTURE_BRIDGE_HOME/"
+  local iso_root="$SMOKE_TMP_ROOT/home-trailing"
+  local iso_user="agent-bridge-smoke-trailing"
+  local iso_home="$iso_root/$iso_user"
+
+  mkdir -p "$iso_home"
+  invoke_sync_with_bridge_home "$home_trailing" "$iso_root" "$iso_user"
+
+  local target="$iso_home/.claude/skills/agent-bridge-runtime/SKILL.md"
+  smoke_assert_file_exists "$target" \
+    "trailing-slash variant: rendered SKILL.md exists"
+  smoke_assert_contains \
+    "$(cat "$target")" \
+    "$FIXTURE_BRIDGE_HOME/agb inbox" \
+    "trailing-slash variant: rewrite produces canonical BRIDGE_HOME path"
+  smoke_assert_not_contains \
+    "$(cat "$target")" \
+    "$FIXTURE_BRIDGE_HOME//" \
+    "trailing-slash variant: no doubled '//' separator in rendered output"
+}
+
+# Render with BRIDGE_HOME containing an embedded doubled slash. normpath
+# collapses the duplicate; the rewritten text must match the canonical
+# single-slash absolute form.
+assert_canonicalize_doubled_slash() {
+  local home_double
+  home_double="$(dirname "$FIXTURE_BRIDGE_HOME")//$(basename "$FIXTURE_BRIDGE_HOME")"
+  local iso_root="$SMOKE_TMP_ROOT/home-double"
+  local iso_user="agent-bridge-smoke-double"
+  local iso_home="$iso_root/$iso_user"
+
+  mkdir -p "$iso_home"
+  invoke_sync_with_bridge_home "$home_double" "$iso_root" "$iso_user"
+
+  local target="$iso_home/.claude/skills/agent-bridge-runtime/SKILL.md"
+  smoke_assert_file_exists "$target" \
+    "doubled-slash variant: rendered SKILL.md exists"
+  smoke_assert_contains \
+    "$(cat "$target")" \
+    "$FIXTURE_BRIDGE_HOME/agb inbox" \
+    "doubled-slash variant: rewrite produces canonical BRIDGE_HOME path"
+  smoke_assert_not_contains \
+    "$(cat "$target")" \
+    "$FIXTURE_BRIDGE_HOME//" \
+    "doubled-slash variant: doubled '//' collapsed to single '/'"
+}
+
+# Render with BRIDGE_HOME pointing at a symlink to the real bridge home.
+# realpath must resolve the symlink so the rewritten text reflects the
+# underlying real path, not the symlink string.
+assert_canonicalize_symlink() {
+  local link_path="$SMOKE_TMP_ROOT/bridge-home-symlink"
+  ln -s "$FIXTURE_BRIDGE_HOME" "$link_path"
+
+  local iso_root="$SMOKE_TMP_ROOT/home-symlink"
+  local iso_user="agent-bridge-smoke-symlink"
+  local iso_home="$iso_root/$iso_user"
+
+  mkdir -p "$iso_home"
+  invoke_sync_with_bridge_home "$link_path" "$iso_root" "$iso_user"
+
+  local target="$iso_home/.claude/skills/agent-bridge-runtime/SKILL.md"
+  smoke_assert_file_exists "$target" \
+    "symlink variant: rendered SKILL.md exists"
+  smoke_assert_contains \
+    "$(cat "$target")" \
+    "$FIXTURE_BRIDGE_HOME/agb inbox" \
+    "symlink variant: rewrite resolves to real BRIDGE_HOME path"
+  smoke_assert_not_contains \
+    "$(cat "$target")" \
+    "$link_path/agb" \
+    "symlink variant: symlink string does not appear in rendered output"
+}
+
 main() {
   build_fixture
   invoke_sync
@@ -186,6 +301,17 @@ main() {
     assert_path_normalization
   smoke_run "skill subdirectory structure preserved" \
     assert_subdir_preserved
+
+  # Canonicalization sub-tests (issue #544 PR3 r2). Each variant feeds
+  # the helper a non-canonical BRIDGE_HOME spelling and asserts the
+  # rendered SKILL.md contains the same canonical absolute path the
+  # main fixture produces. Without realpath+normpath these diverge.
+  smoke_run "trailing-slash BRIDGE_HOME canonicalizes to bare path" \
+    assert_canonicalize_trailing_slash
+  smoke_run "doubled-slash BRIDGE_HOME canonicalizes to single slash" \
+    assert_canonicalize_doubled_slash
+  smoke_run "symlinked BRIDGE_HOME canonicalizes to real path" \
+    assert_canonicalize_symlink
 
   smoke_log "PASS"
 }
