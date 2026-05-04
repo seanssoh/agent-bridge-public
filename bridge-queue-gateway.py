@@ -525,6 +525,10 @@ class ClientPreflightError(Exception):
         self.message = message or reason_code
 
 
+def _format_client_preflight_error(exc: ClientPreflightError) -> str:
+    return f"body file {exc.message} ({exc.reason_code})"
+
+
 _INLINE_FILE_FLAGS: dict[str, tuple[str, str]] = {
     "create": ("--body-file", "--body"),
     "update": ("--body-file", "--body"),
@@ -540,35 +544,41 @@ def _client_preflight_error(reason_code: str, message: str = "") -> ClientPrefli
 
 def _read_inline_text(path_text: str) -> str:
     if not path_text:
-        raise _client_preflight_error("invalid_argv", "empty file path")
+        raise _client_preflight_error("invalid_argv", "invalid argv: file path is empty")
     path = Path(path_text).expanduser()
     try:
         st = path.stat()
     except FileNotFoundError as exc:
-        raise _client_preflight_error("body_file_not_found", "file does not exist") from exc
+        raise _client_preflight_error("body_file_not_found", f"not found: {path_text}") from exc
     except PermissionError as exc:
-        raise _client_preflight_error("body_file_unreadable", "file is not readable") from exc
+        raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
     except OSError as exc:
-        raise _client_preflight_error("body_file_unreadable", "file cannot be read") from exc
+        raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
 
     if st.st_size > INLINE_BODY_CAP_BYTES:
-        raise _client_preflight_error("body_file_too_large", f"file exceeds inline cap ({INLINE_BODY_CAP_BYTES} bytes)")
+        raise _client_preflight_error(
+            "body_file_too_large",
+            f"too large for inline transport: {st.st_size} > {INLINE_BODY_CAP_BYTES}",
+        )
 
     try:
         raw = path.read_bytes()
     except FileNotFoundError as exc:
-        raise _client_preflight_error("body_file_not_found", "file does not exist") from exc
+        raise _client_preflight_error("body_file_not_found", f"not found: {path_text}") from exc
     except PermissionError as exc:
-        raise _client_preflight_error("body_file_unreadable", "file is not readable") from exc
+        raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
     except OSError as exc:
-        raise _client_preflight_error("body_file_unreadable", "file cannot be read") from exc
+        raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
 
     if len(raw) > INLINE_BODY_CAP_BYTES:
-        raise _client_preflight_error("body_file_too_large", f"file exceeds inline cap ({INLINE_BODY_CAP_BYTES} bytes)")
+        raise _client_preflight_error(
+            "body_file_too_large",
+            f"too large for inline transport: {len(raw)} > {INLINE_BODY_CAP_BYTES}",
+        )
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise _client_preflight_error("body_file_not_utf8", "file is not valid UTF-8") from exc
+        raise _client_preflight_error("body_file_not_utf8", f"is not valid UTF-8: {exc}") from exc
 
 
 def client_argv_normalize(argv: list[str]) -> list[str]:
@@ -585,7 +595,7 @@ def client_argv_normalize(argv: list[str]) -> list[str]:
         if token == file_flag or token.startswith(file_flag + "=")
     ]
     if len(matches) > 1:
-        raise _client_preflight_error("duplicate_file_arg", "duplicate file argument")
+        raise _client_preflight_error("duplicate_file_arg", f"duplicate flag: {file_flag} specified more than once")
 
     out = [argv[0]]
     i = 1
@@ -593,14 +603,14 @@ def client_argv_normalize(argv: list[str]) -> list[str]:
         token = argv[i]
         if token == file_flag:
             if i + 1 >= len(argv):
-                raise _client_preflight_error("invalid_argv", "missing file path")
+                raise _client_preflight_error("invalid_argv", f"invalid argv: {file_flag} requires a path")
             out.extend([inline_flag, _read_inline_text(argv[i + 1])])
             i += 2
             continue
         if token.startswith(file_flag + "="):
             path_text = token.split("=", 1)[1]
             if not path_text:
-                raise _client_preflight_error("invalid_argv", "empty file path")
+                raise _client_preflight_error("invalid_argv", f"invalid argv: {file_flag}= requires a path")
             out.extend([inline_flag, _read_inline_text(path_text)])
             i += 1
             continue
@@ -1039,7 +1049,7 @@ def cmd_socket_client(args: argparse.Namespace) -> int:
     try:
         normalized_argv = client_argv_normalize(list(args.argv))
     except ClientPreflightError as exc:
-        print(f"queue gateway client preflight: {exc.reason_code}", file=sys.stderr)
+        print(_format_client_preflight_error(exc), file=sys.stderr)
         return 2
 
     payload = {
@@ -1050,7 +1060,11 @@ def cmd_socket_client(args: argparse.Namespace) -> int:
     }
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     if len(data) > MAX_SOCKET_BYTES:
-        print("queue gateway client preflight: body_file_too_large", file=sys.stderr)
+        exc = _client_preflight_error(
+            "body_file_too_large",
+            f"too large for inline transport: request payload {len(data)} > {MAX_SOCKET_BYTES}",
+        )
+        print(_format_client_preflight_error(exc), file=sys.stderr)
         return 2
 
     try:

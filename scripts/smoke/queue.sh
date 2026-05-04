@@ -417,6 +417,20 @@ queue_gateway_socket_duplicate_uid_contract() {
   [[ ! -S "$socket_path" ]] || smoke_fail "duplicate peer UID failure should not leave a socket"
 }
 
+queue_gateway_assert_body_file_preflight() {
+  local output="$1"
+  local reason_code="$2"
+  local context="$3"
+  local first_line message
+
+  first_line="${output%%$'\n'*}"
+  [[ "$first_line" == body\ file\ * ]] || smoke_fail "$context: expected body file prefix, got: $output"
+  smoke_assert_contains "$first_line" "$reason_code" "$context: stable reason code"
+  [[ "$first_line" == *": "* ]] || smoke_fail "$context: expected message separator, got: $output"
+  message="${first_line#*: }"
+  [[ "$message" != "$first_line" && -n "$message" ]] || smoke_fail "$context: expected non-empty stable message, got: $output"
+}
+
 queue_gateway_body_file_inlining_contract() {
   local socket_path server_log body_file update_file note_file secret update_secret note_secret
   local create_out task_id show_out other_out other_id handoff_id cancel_id denied_out denied_rc
@@ -507,7 +521,7 @@ PY
   denied_rc=$?
   set -e
   [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: too-large preflight should exit 2 (rc=$denied_rc out=$denied_out)"
-  smoke_assert_contains "$denied_out" "body_file_too_large" "body-file inline: too large reason"
+  queue_gateway_assert_body_file_preflight "$denied_out" "body_file_too_large" "body-file inline: too large reason"
   after_lines="$(wc -l <"$server_log")"
   smoke_assert_eq "$before_lines" "$after_lines" "body-file inline: too-large preflight should not hit server"
 
@@ -519,7 +533,7 @@ PY
   denied_rc=$?
   set -e
   [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: missing preflight should exit 2"
-  smoke_assert_contains "$denied_out" "body_file_not_found" "body-file inline: missing reason"
+  queue_gateway_assert_body_file_preflight "$denied_out" "body_file_not_found" "body-file inline: missing reason"
 
   unreadable_dir="$SMOKE_TMP_ROOT/body-is-dir"
   mkdir -p "$unreadable_dir"
@@ -531,7 +545,7 @@ PY
   denied_rc=$?
   set -e
   [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: unreadable preflight should exit 2"
-  smoke_assert_contains "$denied_out" "body_file_unreadable" "body-file inline: unreadable reason"
+  queue_gateway_assert_body_file_preflight "$denied_out" "body_file_unreadable" "body-file inline: unreadable reason"
 
   non_utf8_file="$SMOKE_TMP_ROOT/body-not-utf8.bin"
   python3 - "$non_utf8_file" <<'PY'
@@ -547,7 +561,7 @@ PY
   denied_rc=$?
   set -e
   [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: non-UTF8 preflight should exit 2"
-  smoke_assert_contains "$denied_out" "body_file_not_utf8" "body-file inline: non-UTF8 reason"
+  queue_gateway_assert_body_file_preflight "$denied_out" "body_file_not_utf8" "body-file inline: non-UTF8 reason"
 
   set +e
   denied_out="$(
@@ -557,7 +571,7 @@ PY
   denied_rc=$?
   set -e
   [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: empty path preflight should exit 2"
-  smoke_assert_contains "$denied_out" "invalid_argv" "body-file inline: empty path reason"
+  queue_gateway_assert_body_file_preflight "$denied_out" "invalid_argv" "body-file inline: empty path reason"
 
   set +e
   denied_out="$(
@@ -569,7 +583,7 @@ PY
   denied_rc=$?
   set -e
   [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: duplicate preflight should exit 2"
-  smoke_assert_contains "$denied_out" "duplicate_file_arg" "body-file inline: duplicate reason before read"
+  queue_gateway_assert_body_file_preflight "$denied_out" "duplicate_file_arg" "body-file inline: duplicate reason before read"
 
   set +e
   denied_out="$(python3 "$SMOKE_REPO_ROOT/bridge-queue.py" events --format json 2>&1)"
