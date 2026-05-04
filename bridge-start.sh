@@ -295,6 +295,9 @@ fi
 if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]] \
     && bridge_agent_linux_user_isolation_effective "$AGENT"; then
   bridge_linux_repair_claude_credentials_access "$AGENT" >/dev/null 2>&1 || true
+  # Issue #543: mirror daemon channel-health preflight (bridge-daemon.sh) so a
+  # transient ACL drift on .<channel>/.env does not bridge_die the restart path.
+  bridge_linux_acl_repair_channel_env_files "$AGENT" >/dev/null 2>&1 || true
 fi
 
 if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
