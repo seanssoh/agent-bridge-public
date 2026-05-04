@@ -377,11 +377,134 @@ fi
   exit 1
 }
 
+# required-vars guard: empty file passes bash -n + source but must be
+# rejected when caller declares a required variable. This is the
+# isolated-UID partial-flush case the round-1 review flagged.
+: >"$state_file"
+unset STATE_NEXT_TS
+if daemon_source_state_file "$state_file" "unit" 1 "STATE_NEXT_TS"; then
+  echo "empty state with required var unexpectedly sourced"
+  exit 1
+fi
+[[ ! -e "$state_file" ]] || {
+  echo "empty state with required var was not cleared"
+  exit 1
+}
+
+# required-vars guard: a file populated only with unrelated vars must be
+# rejected when the caller declares a different required var.
+printf "OTHER_VAR=1\n" >"$state_file"
+unset STATE_NEXT_TS
+if daemon_source_state_file "$state_file" "unit" 1 "STATE_NEXT_TS"; then
+  echo "missing required var unexpectedly sourced"
+  exit 1
+fi
+[[ ! -e "$state_file" ]] || {
+  echo "state with missing required var was not cleared"
+  exit 1
+}
+
+# required-vars guard: when the required var is present, the source
+# call must succeed and the var must be exported into the caller scope.
+printf "STATE_NEXT_TS=999\n" >"$state_file"
+unset STATE_NEXT_TS
+daemon_source_state_file "$state_file" "unit" 1 "STATE_NEXT_TS"
+[[ "${STATE_NEXT_TS:-}" == "999" ]] || {
+  echo "required var present did not source"
+  exit 1
+}
+
 echo ok
 ' _ "$root" "$helper" 2>/dev/null)"
   rc=$?
   set -e
   [[ "$rc" -eq 0 && "$output" == "ok" ]] || smoke_fail "source state file guard failed: $output"
+}
+
+daemon_acl_default_inheritance() {
+  # Verifies the core correctness claim of this PR: when the controller
+  # installs a default ACL on a runtime_state_dir / log_dir-style
+  # directory, files subsequently created inside that directory by an
+  # isolated UID inherit the default ACL and remain controller-readable.
+  # Without the default ACL, controller reads return EACCES (the bug
+  # this PR is meant to prevent).
+  #
+  # Two-UID + setfacl is required, and elevated privileges (root or a
+  # configured sudoers entry) to switch UIDs. Skip cleanly otherwise so
+  # the test runs on platforms that support it (linux server install)
+  # without breaking dev-box smoke runs (macOS, unprivileged CI).
+  local isolated_user="" controller_user="" root="" target_dir=""
+  local positive_file="" negative_dir="" negative_file=""
+  local rc
+
+  if ! command -v setfacl >/dev/null 2>&1; then
+    smoke_log "skipped acl default inheritance: setfacl not available (requires Linux + acl pkg)"
+    return 0
+  fi
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    smoke_log "skipped acl default inheritance: requires root to switch UIDs"
+    return 0
+  fi
+  controller_user="$(id -un)"
+  for candidate in nobody daemon bin; do
+    if id -u "$candidate" >/dev/null 2>&1; then
+      isolated_user="$candidate"
+      break
+    fi
+  done
+  if [[ -z "$isolated_user" ]]; then
+    smoke_log "skipped acl default inheritance: no isolated user candidate (nobody/daemon/bin) on this host"
+    return 0
+  fi
+  if [[ "$isolated_user" == "$controller_user" ]]; then
+    smoke_log "skipped acl default inheritance: controller user matches isolated user"
+    return 0
+  fi
+
+  root="$(mktemp -d "$SMOKE_TMP_ROOT/acl-default.XXXXXX")"
+  target_dir="$root/with-default-acl"
+  negative_dir="$root/without-default-acl"
+  mkdir -p "$target_dir" "$negative_dir"
+  # Mimic isolated-UID-only ownership: the isolated agent owns the
+  # directory and group/other have no access. Default ACLs are the only
+  # path by which the controller can ever read the contents.
+  chown "$isolated_user":"$isolated_user" "$target_dir" "$negative_dir"
+  chmod 700 "$target_dir" "$negative_dir"
+
+  # Install the default ACL on the positive-case directory. This is the
+  # exact shape lib/bridge-agents.sh::bridge_linux_acl_add_default_dirs_recursive
+  # applies (setfacl -d -m u:<controller>:rwX), narrowed to one dir.
+  setfacl -d -m "u:${controller_user}:rwX" "$target_dir" \
+    || smoke_fail "acl default inheritance: setfacl -d failed on $target_dir"
+
+  # Simulated isolated-UID write into both directories.
+  positive_file="$target_dir/idle-since"
+  negative_file="$negative_dir/idle-since"
+  sudo -n -u "$isolated_user" /bin/sh -c "printf '%s' \"123\" >'$positive_file'" \
+    || smoke_fail "acl default inheritance: isolated UID could not write positive file"
+  sudo -n -u "$isolated_user" /bin/sh -c "printf '%s' \"123\" >'$negative_file'" \
+    || smoke_fail "acl default inheritance: isolated UID could not write negative file"
+
+  # Positive case: controller (test driver) must be able to read the
+  # file the isolated UID just created. This is the inheritance guarantee.
+  set +e
+  cat "$positive_file" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] \
+    || smoke_fail "acl default inheritance: controller could not read isolated-UID file under default ACL (rc=$rc)"
+
+  # Negative case: same setup without the default ACL must reject the
+  # controller. If this passes silently, the positive case is not
+  # actually exercising the ACL — it's just chmod 755 by accident.
+  set +e
+  cat "$negative_file" >/dev/null 2>&1
+  rc=$?
+  set -e
+  [[ "$rc" -ne 0 ]] \
+    || smoke_fail "acl default inheritance: controller unexpectedly read file without default ACL (test setup is not exercising ACL)"
+
+  smoke_log "ok: acl default inheritance positive+negative confirmed (controller=$controller_user, isolated=$isolated_user)"
 }
 
 main() {
@@ -395,6 +518,7 @@ main() {
   smoke_run "blocked task reminder/escalation aging" daemon_blocked_aging
   smoke_run "idle marker permission guard" daemon_idle_marker_permission_guard
   smoke_run "source state file guard" daemon_source_state_file_guard
+  smoke_run "acl default inheritance" daemon_acl_default_inheritance
   smoke_log "passed"
 }
 
