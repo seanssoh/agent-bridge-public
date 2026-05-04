@@ -17,9 +17,27 @@ from typing import Any
 # setting CLAUDE_CODE_AUTO_COMPACT_WINDOW here because that env var takes
 # precedence over settings and would make operator overlays harder to reason
 # about.
-BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS: dict[str, Any] = {
-    "autoCompactWindow": 400000,
-}
+#
+# The default is launch_cmd-aware (issue #547): on 1M-context Opus 4.7 [1m]
+# the legacy 400_000 cap silently rescaled CLAUDE_AUTOCOMPACT_PCT_OVERRIDE
+# (operator setting pct=45 expecting compact at ~450K of 1M was getting
+# compact at 180K). Sub-string match on `[1m]` is sufficient for the
+# dominant case; a roster-level BRIDGE_AGENT_MODEL field is deferred per
+# issue #547 recommendation 2.
+BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW_LEGACY = 400_000
+BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW_1M = 1_000_000
+
+
+def resolve_managed_autocompact_window(launch_cmd: str | None) -> int:
+    if launch_cmd and "[1m]" in launch_cmd:
+        return BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW_1M
+    return BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW_LEGACY
+
+
+def managed_claude_settings_defaults(launch_cmd: str | None) -> dict[str, Any]:
+    return {
+        "autoCompactWindow": resolve_managed_autocompact_window(launch_cmd),
+    }
 
 
 def load_json(path: Path) -> Any:
@@ -809,7 +827,9 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     if not isinstance(overlay_payload, dict):
         raise SystemExit(f"shared settings overlay must be a JSON object: {overlay_path}")
 
-    merged = merge_settings(BRIDGE_MANAGED_CLAUDE_SETTINGS_DEFAULTS, base_payload)
+    launch_cmd = (getattr(args, "launch_cmd", "") or "") or None
+    managed_defaults = managed_claude_settings_defaults(launch_cmd)
+    merged = merge_settings(managed_defaults, base_payload)
     merged = merge_settings(merged, overlay_payload)
     save_json(effective_path, merged)
 
@@ -1070,6 +1090,11 @@ def build_parser() -> argparse.ArgumentParser:
     render_shared_parser.add_argument("--base-settings-file", required=True)
     render_shared_parser.add_argument("--overlay-settings-file", required=True)
     render_shared_parser.add_argument("--effective-settings-file", required=True)
+    render_shared_parser.add_argument(
+        "--launch-cmd",
+        default="",
+        help="Agent launch_cmd; substring '[1m]' raises autoCompactWindow default to 1_000_000 (issue #547).",
+    )
     render_shared_parser.add_argument("--format", choices=("text", "shell"), default="text")
     render_shared_parser.set_defaults(handler=cmd_render_shared_settings)
 
