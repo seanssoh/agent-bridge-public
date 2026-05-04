@@ -275,6 +275,13 @@ def _stage_first_token(stage: str) -> str:
     return ""
 
 
+# Stderr-suppression / fd-dup forms that *look* like write redirection
+# but cannot mutate the filesystem: `2>/dev/null` discards fd-2,
+# `2>&1` merges fd-2 into fd-1, `&>/dev/null` discards both. These must
+# not flip a read-intent classification (issue #574).
+_SAFE_REDIRECT_PATTERNS = ("2>/dev/null", "2>&1", "&>/dev/null")
+
+
 def _is_read_intent_bash(command: str) -> bool:
     """Return True iff *command* is purely read-intent.
 
@@ -289,6 +296,9 @@ def _is_read_intent_bash(command: str) -> bool:
       a token starting with that prefix and disqualifies the pipeline,
       even if the leading command is otherwise a read tool. ``cat >x``
       writes to *x* — the destination path could be the protected one.
+      Stderr-suppression / fd-dup tokens in
+      :data:`_SAFE_REDIRECT_PATTERNS` are exempt: they don't mutate the
+      filesystem (issue #574).
     - Input redirection (``<``) is fine; it only opens the file for
       reading.
     - A single write-intent or unknown leading command anywhere in the
@@ -297,13 +307,24 @@ def _is_read_intent_bash(command: str) -> bool:
     """
     if not command.strip():
         return False
-    for stage in _COMMAND_OPERATOR_RE.split(command):
+    # Strip stderr-suppression / fd-dup tokens before splitting on shell
+    # operators. `_COMMAND_OPERATOR_RE` would otherwise tear `2>&1` and
+    # `&>/dev/null` on the embedded `&`, hiding them from the per-token
+    # check below (issue #574).
+    sanitized = command
+    for safe in _SAFE_REDIRECT_PATTERNS:
+        sanitized = sanitized.replace(safe, " ")
+    for stage in _COMMAND_OPERATOR_RE.split(sanitized):
         stage_stripped = stage.strip()
         if not stage_stripped:
             continue
         # Reject output-redirection anywhere in the stage. Input redir
         # (`<file`) is fine; write redir (`>`, `>>`, `&>`, `2>`) is not.
+        # Stderr-suppression forms (`2>/dev/null`, `2>&1`, `&>/dev/null`)
+        # were stripped above and don't reach this loop (issue #574).
         for tok in stage_stripped.split():
+            if tok in _SAFE_REDIRECT_PATTERNS:
+                continue
             for prefix in ("&>", "2>", ">>", ">"):
                 if tok.startswith(prefix):
                     return False
