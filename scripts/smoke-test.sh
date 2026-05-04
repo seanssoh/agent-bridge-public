@@ -10198,6 +10198,7 @@ bash "$REPO_ROOT/scripts/smoke/cron-migrate-payloads.sh"
 
 # Issue #544 PR1 — curated bin/agb shim for isolated agents.
 log "running isolated-bin-agb smoke (issue #544 PR1)"
+log "isolated-bin-agb covers shim env-source/delegation/fallback only — live PATH injection requires isolate+restart"
 bash "$REPO_ROOT/scripts/smoke/isolated-bin-agb.sh"
 
 log "smoke test passed"
