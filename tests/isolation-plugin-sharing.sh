@@ -51,7 +51,8 @@ command -v userdel >/dev/null 2>&1 || skip "userdel required"
 
 TMP_ROOT="$(mktemp -d -t isolate-plugin-test.XXXXXX)"
 SAFE_TMP_PREFIX=""
-for _candidate in "${TMPDIR%/}" "/tmp" "/var/tmp"; do
+for _candidate in "${TMPDIR:-}" "/tmp" "/var/tmp"; do
+  _candidate="${_candidate%/}"
   [[ -n "$_candidate" ]] || continue
   case "$TMP_ROOT" in
     "$_candidate"|"$_candidate"/*) SAFE_TMP_PREFIX="$_candidate"; break ;;
@@ -86,9 +87,11 @@ CONTROLLER_PLUGINS="$CONTROLLER_HOME_FAKE/.claude/plugins"
 mkdir -p "$CONTROLLER_PLUGINS/cache/td-mkt/declared-plugin/0.1.0" \
          "$CONTROLLER_PLUGINS/cache/td-mkt/undeclared-plugin/0.1.0" \
          "$CONTROLLER_PLUGINS/data" \
-         "$CONTROLLER_PLUGINS/marketplaces"
+         "$CONTROLLER_PLUGINS/marketplaces/td-mkt"
 echo 'declared plugin source' > "$CONTROLLER_PLUGINS/cache/td-mkt/declared-plugin/0.1.0/index.js"
 echo 'undeclared plugin source' > "$CONTROLLER_PLUGINS/cache/td-mkt/undeclared-plugin/0.1.0/index.js"
+echo '{"name":"td-mkt","plugins":["declared-plugin","undeclared-plugin"]}' \
+  > "$CONTROLLER_PLUGINS/marketplaces/td-mkt/marketplace.json"
 cat > "$CONTROLLER_PLUGINS/installed_plugins.json" <<JSON
 {
   "version": 2,
@@ -122,11 +125,13 @@ mkdir -p "$BRIDGE_HOME/plugins/declared-plugin" "$BRIDGE_HOME/plugins/undeclared
 echo 'declared plugin (dir-marketplace)' > "$BRIDGE_HOME/plugins/declared-plugin/server.ts"
 echo 'undeclared plugin (dir-marketplace)' > "$BRIDGE_HOME/plugins/undeclared-plugin/server.ts"
 
-# Make the controller-side plugin tree readable by everyone so the
-# isolated UID can actually traverse it once we grant the per-UID ACLs.
-# (The traverse chain stamps `--x` on parents up to controller_home;
-#  base mode bits also need to allow read on files we explicitly grant.)
-chmod -R o+rX "$CONTROLLER_HOME_FAKE" "$BRIDGE_HOME/plugins"
+# Make controller-side catalog fixtures readable while keeping the synthetic
+# plugin install tree private. The isolated UID gets parent traverse via a
+# named ACL after the temp user exists; per-plugin read comes only from the
+# bridge helper under test.
+chmod o+x "$TMP_ROOT" "$BRIDGE_HOME"
+chmod -R o+rX "$CONTROLLER_HOME_FAKE"
+chmod -R go-rwx "$BRIDGE_HOME/plugins"
 
 TEST_AGENT="qpa-test"
 TEST_OS_USER="agent-bridge-${TEST_AGENT}"
@@ -169,6 +174,11 @@ fi
 sudo -n mkdir -p "$TEST_OS_HOME"
 sudo -n chown "$TEST_OS_USER:$TEST_OS_USER" "$TEST_OS_HOME"
 sudo -n chmod 0700 "$TEST_OS_HOME"
+sudo -n mkdir -p "$TEST_OS_HOME/.claude"
+sudo -n chown "$TEST_OS_USER:$TEST_OS_USER" "$TEST_OS_HOME/.claude"
+sudo -n chmod 0700 "$TEST_OS_HOME/.claude"
+sudo -n setfacl -m "u:${TEST_OS_USER}:--x" "$TMP_ROOT" "$BRIDGE_HOME" "$BRIDGE_HOME/plugins" \
+  || die "failed to grant temp plugin parent traverse ACL to $TEST_OS_USER"
 
 TEST_WORKDIR="$BRIDGE_AGENT_HOME_ROOT/$TEST_AGENT"
 mkdir -p "$TEST_WORKDIR"
@@ -246,10 +256,25 @@ entry = m["plugins"]["declared-plugin@td-mkt"][0]
 assert "installPath" in entry and entry["installPath"], "missing installPath"
 ' || die "per-UID manifest contents do not match the channel boundary"
 
-log "verifying catalog symlinks resolve to controller copies"
-for catalog in known_marketplaces.json install-counts-cache.json blocklist.json; do
+log "verifying generated known_marketplaces.json is per-UID filtered"
+sudo -n python3 - "$ISOLATED_PLUGINS/known_marketplaces.json" "$ISOLATED_PLUGINS" <<'PY'
+import json
+import sys
+
+path, isolated_plugins = sys.argv[1:]
+with open(path) as f:
+    data = json.load(f)
+assert sorted(data) == ["td-mkt"], data
+entry = data["td-mkt"]
+expected = f"{isolated_plugins}/marketplaces/td-mkt"
+assert entry.get("installLocation") == expected, entry
+assert entry.get("source", {}).get("path") == expected, entry
+PY
+
+log "verifying non-marketplace catalog symlinks resolve to controller copies"
+for catalog in install-counts-cache.json blocklist.json; do
   link="$ISOLATED_PLUGINS/$catalog"
-  [[ -L "$link" ]] || die "expected $link to be a symlink"
+  sudo -n test -L "$link" || die "expected $link to be a symlink"
   resolved="$(sudo -n readlink -f "$link" 2>/dev/null || true)"
   expected="$CONTROLLER_PLUGINS/$catalog"
   [[ "$resolved" == "$expected" ]] || die "catalog symlink $link resolved to $resolved (expected $expected)"
@@ -320,7 +345,8 @@ echo '{"name":"allowlist-mkt","plugins":["allowlisted-plugin"]}' \
 mkdir -p "$BRIDGE_HOME/plugins/allowlisted-plugin"
 echo 'allowlisted plugin (dir-marketplace)' \
   > "$BRIDGE_HOME/plugins/allowlisted-plugin/server.ts"
-chmod -R o+rX "$CONTROLLER_HOME_FAKE" "$BRIDGE_HOME/plugins"
+chmod -R o+rX "$CONTROLLER_HOME_FAKE"
+chmod -R go-rwx "$BRIDGE_HOME/plugins/allowlisted-plugin"
 
 python3 - "$CONTROLLER_PLUGINS/installed_plugins.json" "$BRIDGE_HOME/plugins/allowlisted-plugin" <<'PY'
 import json, sys
@@ -400,12 +426,69 @@ allowlisted_mkt_expected="$CONTROLLER_PLUGINS/marketplaces/allowlist-mkt"
 sudo -n -u "$TEST_OS_USER" cat "$allowlisted_mkt_expected/marketplace.json" >/dev/null \
   || die "isolated UID should be able to read allowlisted marketplace metadata"
 
+log "verifying git-source marketplace also gets Claude repo-slug alias"
+mkdir -p "$CONTROLLER_PLUGINS/cache/git-mkt/git-plugin/0.1.0" \
+         "$CONTROLLER_PLUGINS/marketplaces/git-mkt"
+echo 'git marketplace plugin source (cache)' \
+  > "$CONTROLLER_PLUGINS/cache/git-mkt/git-plugin/0.1.0/index.js"
+echo '{"name":"git-mkt","plugins":["git-plugin"]}' \
+  > "$CONTROLLER_PLUGINS/marketplaces/git-mkt/marketplace.json"
+chmod -R o+rX "$CONTROLLER_HOME_FAKE"
+
+python3 - "$CONTROLLER_PLUGINS/installed_plugins.json" "$CONTROLLER_PLUGINS/cache/git-mkt/git-plugin/0.1.0" <<'PY'
+import json, sys
+manifest_path, install_path = sys.argv[1], sys.argv[2]
+with open(manifest_path) as f:
+    data = json.load(f)
+data.setdefault("plugins", {})["git-plugin@git-mkt"] = [
+    {"scope": "user", "version": "0.1.0", "installPath": install_path}
+]
+with open(manifest_path, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+python3 - "$CONTROLLER_PLUGINS/known_marketplaces.json" "$CONTROLLER_PLUGINS/marketplaces/git-mkt" <<'PY'
+import json, sys
+markets_path, install_location = sys.argv[1], sys.argv[2]
+with open(markets_path) as f:
+    data = json.load(f)
+data["git-mkt"] = {
+    "source": {"source": "git", "repo": "Example-Org/example-marketplace"},
+    "installLocation": install_location,
+}
+with open(markets_path, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+BRIDGE_AGENT_PLUGINS["$TEST_AGENT"]='allowlisted-plugin@allowlist-mkt,git-plugin@git-mkt'
+BRIDGE_CONTROLLER_HOME_OVERRIDE="$CONTROLLER_HOME_FAKE" \
+  bridge_linux_share_plugin_catalog "$TEST_OS_USER" "$TEST_OS_HOME" "$CONTROLLER_USER" "$TEST_AGENT"
+
+git_mkt_link="$ISOLATED_PLUGINS/marketplaces/git-mkt"
+git_mkt_slug_link="$ISOLATED_PLUGINS/marketplaces/Example-Org-example-marketplace"
+for link in "$git_mkt_link" "$git_mkt_slug_link"; do
+  sudo -n test -L "$link" || die "expected git marketplace alias symlink at $link"
+  resolved="$(sudo -n readlink -f "$link" 2>/dev/null || true)"
+  [[ "$resolved" == "$CONTROLLER_PLUGINS/marketplaces/git-mkt" ]] \
+    || die "git marketplace alias $link resolved to $resolved"
+done
+sudo -n python3 - "$ISOLATED_PLUGINS/known_marketplaces.json" "$ISOLATED_PLUGINS" <<'PY'
+import json
+import sys
+
+path, isolated_plugins = sys.argv[1:]
+with open(path) as f:
+    data = json.load(f)
+entry = data["git-mkt"]
+expected = f"{isolated_plugins}/marketplaces/Example-Org-example-marketplace"
+assert entry.get("installLocation") == expected, entry
+assert entry.get("source", {}).get("repo") == "Example-Org/example-marketplace", entry
+PY
+
 log "verifying persisted grant-set carries union (allowlist promoted to plugin:<id>)"
 sudo -n cat "$state_file" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
 chans = sorted(data.get("channels", []))
-expected = ["plugin:allowlisted-plugin@allowlist-mkt", "plugin:declared-plugin@td-mkt"]
+expected = ["plugin:allowlisted-plugin@allowlist-mkt", "plugin:declared-plugin@td-mkt", "plugin:git-plugin@git-mkt"]
 assert chans == expected, f"unexpected persisted channels: {chans!r} (expected {expected!r})"
 ' || die "persisted grant-set did not include BRIDGE_AGENT_PLUGINS allowlist entry (#348)"
 
@@ -429,6 +512,7 @@ ids = sorted(filter(None, plugins_csv.split(",")))
 expected = sorted([
     "plugin:allowlisted-plugin@allowlist-mkt",
     "plugin:declared-plugin@td-mkt",
+    "plugin:git-plugin@git-mkt",
 ])
 assert ids == expected, f"audit plugins mismatch: {ids!r} (expected {expected!r})"
 count = detail.get("plugin_count")
@@ -457,7 +541,8 @@ echo 'unregistered plugin (no known_marketplaces entry)' \
 mkdir -p "$CONTROLLER_PLUGINS/marketplaces/unregistered-mkt"
 echo '{"name":"unregistered-mkt","plugins":["unregistered-plugin"]}' \
   > "$CONTROLLER_PLUGINS/marketplaces/unregistered-mkt/marketplace.json"
-chmod -R o+rX "$CONTROLLER_HOME_FAKE" "$BRIDGE_HOME/plugins"
+chmod -R o+rX "$CONTROLLER_HOME_FAKE"
+chmod -R go-rwx "$BRIDGE_HOME/plugins/unregistered-plugin"
 
 python3 - "$CONTROLLER_PLUGINS/installed_plugins.json" "$BRIDGE_HOME/plugins/unregistered-plugin" <<'PY'
 import json, sys
@@ -490,6 +575,9 @@ fi
 log "verifying allowlist-mkt symlink still landed (registered marketplace path)"
 sudo -n test -L "$ISOLATED_PLUGINS/marketplaces/allowlist-mkt" \
   || die "expected allowlist-mkt symlink to remain after r2 gate"
+if sudo -n test -e "$git_mkt_slug_link" 2>/dev/null || sudo -n test -L "$git_mkt_slug_link" 2>/dev/null; then
+  die "expected removed git marketplace alias symlink to be pruned after allowlist change"
+fi
 
 log "verifying audit row still carries the unregistered-mkt plugin id"
 python3 - "$audit_log_file" "$TEST_AGENT" <<'PY' \
@@ -547,7 +635,7 @@ THIRD_PLUGIN_ID="third-party-plugin@third-marketplace"
 mkdir -p "$BRIDGE_HOME/plugins/third-party-plugin"
 echo 'third-party plugin (dir-marketplace)' \
   > "$BRIDGE_HOME/plugins/third-party-plugin/server.ts"
-chmod -R o+rX "$BRIDGE_HOME/plugins"
+chmod -R go-rwx "$BRIDGE_HOME/plugins/third-party-plugin"
 
 # Add the third-party plugin entry to the controller's manifest with a
 # valid installPath, but DO NOT add 'third-marketplace' to
@@ -699,7 +787,8 @@ echo 'replacement plugin source (cache)' \
 mkdir -p "$BRIDGE_HOME/plugins/replacement-plugin"
 echo 'replacement plugin (dir-marketplace)' \
   > "$BRIDGE_HOME/plugins/replacement-plugin/server.ts"
-chmod -R o+rX "$CONTROLLER_HOME_FAKE" "$BRIDGE_HOME/plugins"
+chmod -R o+rX "$CONTROLLER_HOME_FAKE"
+chmod -R go-rwx "$BRIDGE_HOME/plugins/replacement-plugin"
 
 python3 - "$CONTROLLER_PLUGINS/installed_plugins.json" "$BRIDGE_HOME/plugins/replacement-plugin" <<'PY'
 import json, sys

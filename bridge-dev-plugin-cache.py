@@ -26,6 +26,20 @@ def cache_root() -> Path:
     return Path.home() / ".claude" / "plugins" / "cache"
 
 
+def claude_plugins_root() -> Path:
+    explicit = os.environ.get("BRIDGE_CLAUDE_PLUGINS_ROOT", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    root = cache_root()
+    if root.name == "cache":
+        return root.parent
+    return Path.home() / ".claude" / "plugins"
+
+
+def known_marketplaces_path() -> Path:
+    return claude_plugins_root() / "known_marketplaces.json"
+
+
 def normalize_channels(raw: str) -> list[str]:
     items: list[str] = []
     seen: set[str] = set()
@@ -56,6 +70,70 @@ def load_marketplace(root: Path) -> tuple[str, dict[str, dict[str, str]]]:
     return marketplace_name, plugins
 
 
+def marketplace_repo_slug(repo: str) -> str:
+    repo = repo.strip().strip("/")
+    if not repo or "/" not in repo:
+        return ""
+    return repo.replace("/", "-")
+
+
+def load_known_marketplaces() -> dict[str, object]:
+    path = known_marketplaces_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def channel_marketplace(channel: str) -> str:
+    if not channel.startswith("plugin:") or "@" not in channel:
+        return ""
+    return channel[len("plugin:") :].split("@", 1)[1].strip()
+
+
+def root_marketplace_name(root: Path) -> str:
+    try:
+        name, _plugins = load_marketplace(root)
+    except (OSError, ValueError, SystemExit):
+        return ""
+    return name
+
+
+def resolve_marketplace_root(default_root: Path, channel: str) -> Path:
+    marketplace = channel_marketplace(channel)
+    if not marketplace:
+        return default_root
+    if root_marketplace_name(default_root) == marketplace:
+        return default_root
+
+    markets = load_known_marketplaces()
+    entry = markets.get(marketplace)
+    if not isinstance(entry, dict):
+        return default_root
+
+    plugins_root = claude_plugins_root()
+    candidates: list[Path] = []
+    install_location = str(entry.get("installLocation") or "").strip()
+    if install_location:
+        candidates.append(Path(install_location).expanduser())
+
+    source = entry.get("source")
+    if isinstance(source, dict):
+        source_path = str(source.get("path") or "").strip()
+        if source_path:
+            candidates.append(Path(source_path).expanduser())
+        repo_slug = marketplace_repo_slug(str(source.get("repo") or ""))
+        if repo_slug:
+            candidates.append(plugins_root / "marketplaces" / repo_slug)
+
+    candidates.append(plugins_root / "marketplaces" / marketplace)
+    for candidate in candidates:
+        if marketplace_path(candidate).is_file():
+            return candidate.resolve()
+    return default_root
+
+
 def remove_tree(path: Path) -> None:
     if path.is_symlink() or path.is_file():
         path.unlink(missing_ok=True)
@@ -65,11 +143,97 @@ def remove_tree(path: Path) -> None:
 
 
 NODE_MODULES_NAME = "node_modules"
+MCP_CONFIG_NAME = ".mcp.json"
+SENSITIVE_KEY_PARTS = (
+    "authorization",
+    "api_key",
+    "apikey",
+    "app_password",
+    "client_secret",
+    "password",
+    "secret",
+    "token",
+)
+
+
+def is_sensitive_key(key: str) -> bool:
+    lowered = key.lower().replace("-", "_")
+    return any(part in lowered for part in SENSITIVE_KEY_PARTS)
+
+
+def is_placeholder_secret(value: str) -> bool:
+    stripped = value.strip()
+    upper = stripped.upper()
+    return (
+        "PLACEHOLDER" in upper
+        or upper in {"REDACTED", "<REDACTED>"}
+        or stripped.startswith("__")
+        and stripped.endswith("__")
+    )
+
+
+def merge_secret_placeholders(source: object, current: object, sensitive: bool = False) -> tuple[object, bool]:
+    if isinstance(source, dict) and isinstance(current, dict):
+        changed = False
+        merged: dict[str, object] = {}
+        for key, value in source.items():
+            next_sensitive = sensitive or is_sensitive_key(str(key))
+            if key in current:
+                merged_value, item_changed = merge_secret_placeholders(value, current[key], next_sensitive)
+                merged[key] = merged_value
+                changed = changed or item_changed
+            else:
+                merged[key] = value
+        return merged, changed
+
+    if isinstance(source, list) and isinstance(current, list):
+        changed = False
+        merged = []
+        for idx, value in enumerate(source):
+            if idx < len(current):
+                merged_value, item_changed = merge_secret_placeholders(value, current[idx], sensitive)
+                merged.append(merged_value)
+                changed = changed or item_changed
+            else:
+                merged.append(value)
+        return merged, changed
+
+    if (
+        sensitive
+        and isinstance(source, str)
+        and isinstance(current, str)
+        and is_placeholder_secret(source)
+        and current.strip()
+        and not is_placeholder_secret(current)
+    ):
+        return current, True
+
+    return source, False
+
+
+def maybe_render_mcp_with_preserved_secrets(src: Path, dst: Path) -> bytes | None:
+    if src.name != MCP_CONFIG_NAME or not dst.is_file() or dst.is_symlink():
+        return None
+    try:
+        source_payload = json.loads(src.read_text(encoding="utf-8"))
+        current_payload = json.loads(dst.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    merged, changed = merge_secret_placeholders(source_payload, current_payload)
+    if not changed:
+        return None
+    return (json.dumps(merged, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
 def _copy_file_if_changed(src: Path, dst: Path) -> bool:
     """Copy file from src to dst when missing or content differs. Returns True if written."""
     try:
+        rendered = maybe_render_mcp_with_preserved_secrets(src, dst)
+        if rendered is not None:
+            if dst.read_bytes() == rendered:
+                return False
+            dst.write_bytes(rendered)
+            return True
         if dst.is_symlink() or dst.is_file():
             if dst.is_file() and not dst.is_symlink():
                 if dst.stat().st_size == src.stat().st_size and dst.read_bytes() == src.read_bytes():
@@ -244,7 +408,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     root = Path(args.root).expanduser().resolve()
-    results = [sync_plugin_cache(root, item) for item in normalize_channels(args.channels)]
+    results = [
+        sync_plugin_cache(resolve_marketplace_root(root, item), item)
+        for item in normalize_channels(args.channels)
+    ]
     if args.json:
         json.dump({"results": results}, sys.stdout, ensure_ascii=False)
         sys.stdout.write("\n")
