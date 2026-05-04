@@ -55,6 +55,64 @@ SOCKET_LINUX_ONLY_MESSAGE = (
 )
 
 
+# Public reason codes the gateway is willing to disclose to *any* peer.
+# Detailed internal reason codes (e.g. task_not_found, done_not_owner) leak
+# task existence / ownership across the isolation boundary; map them to one
+# of these public codes before sending to the client. The detailed code is
+# still recorded server-side via gateway_log() for operator triage.
+#
+# Anything not in this set is collapsed to internal_error for the client.
+_PUBLIC_REASON_CODES: frozenset[str] = frozenset({
+    "not_authorized",       # generic auth/ownership/visibility failure
+    "task_unavailable",     # generic existence failure (collapses task_not_found)
+    "unknown_option",       # argv parser rejection (already public-safe)
+    "task_id_required",     # peer's own argv shape — discloses nothing new
+    "invalid_argument",     # argparse / format failure
+    "invalid_argv",         # peer's own argv was malformed
+    "invalid_payload",      # peer's own JSON payload was malformed
+    "oversize_payload",     # peer sent a too-large payload
+    "duplicate_file_arg",   # peer's own argv had a duplicate flag
+    "empty_argv",           # peer sent an empty argv
+    "file_arg_denied",      # peer used a *_file flag (gateway never forwards)
+    "subcmd_denied",        # generic subcommand denial (peer-known)
+    "init_denied",          # subcmd-shaped denials of internal-only commands
+    "cron-ready_denied",
+    "daemon-step_denied",
+    "note-nudge_denied",
+    "events_denied",
+    "unknown_peer",         # peer's own UID is not in the roster
+    "internal_error",       # generic catch-all for unexpected
+})
+
+
+# Map detailed (leaky) reason codes to the public-safe code that the client
+# should see. Codes already in _PUBLIC_REASON_CODES are passed through.
+# Anything else falls back to internal_error.
+_PUBLIC_REASON_MAP: dict[str, str] = {
+    "task_not_found": "task_unavailable",
+    "show_not_visible": "not_authorized",
+    "done_not_owner": "not_authorized",
+    "claim_not_assigned": "not_authorized",
+    "cancel_not_owner": "not_authorized",
+    "update_not_owner": "not_authorized",
+    "handoff_not_owner": "not_authorized",
+    "exception": "internal_error",
+}
+
+
+def _public_reason_code(detailed_reason: str) -> str:
+    """Map an internal reason code to the client-visible public code.
+
+    Public codes pass through; known leaky codes are mapped via
+    _PUBLIC_REASON_MAP; anything unrecognised falls back to internal_error
+    so a future detailed reason cannot accidentally leak across the
+    isolation boundary without an explicit allow-list update.
+    """
+    if detailed_reason in _PUBLIC_REASON_CODES:
+        return detailed_reason
+    return _PUBLIC_REASON_MAP.get(detailed_reason, "internal_error")
+
+
 def _socket_transport_supported() -> bool:
     """Linux-only fail-closed gate for the socket transport.
 
@@ -526,7 +584,10 @@ class ClientPreflightError(Exception):
 
 
 def _format_client_preflight_error(exc: ClientPreflightError) -> str:
-    return f"body file {exc.message} ({exc.reason_code})"
+    # Format contract (r3 spec): "body file <reason_code>: <message>".
+    # The smoke harness greps for the leading "body file " prefix and the
+    # reason_code; keep both stable.
+    return f"body file {exc.reason_code}: {exc.message}"
 
 
 _INLINE_FILE_FLAGS: dict[str, tuple[str, str]] = {
@@ -546,29 +607,57 @@ def _read_inline_text(path_text: str) -> str:
     if not path_text:
         raise _client_preflight_error("invalid_argv", "invalid argv: file path is empty")
     path = Path(path_text).expanduser()
+
+    # O_NOFOLLOW: refuse to follow a symlink at the body-file path.
+    # O_NONBLOCK: required so that opening a FIFO returns immediately
+    # without waiting for a writer (a FIFO open without O_NONBLOCK blocks
+    # indefinitely). For regular files O_NONBLOCK is a no-op.
+    # Combined with the S_ISREG check below this rejects FIFOs, devices,
+    # sockets, and symlink redirection in one shot — read_bytes() on a
+    # FIFO can hang indefinitely and on /dev/zero would read until
+    # INLINE_BODY_CAP_BYTES.
+    open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        st = path.stat()
+        fd = os.open(str(path), open_flags)
     except FileNotFoundError as exc:
         raise _client_preflight_error("body_file_not_found", f"not found: {path_text}") from exc
     except PermissionError as exc:
         raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
     except OSError as exc:
+        # O_NOFOLLOW on a symlink raises ELOOP; treat as unreadable rather
+        # than disclose the symlink shape.
         raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
-
-    if st.st_size > INLINE_BODY_CAP_BYTES:
-        raise _client_preflight_error(
-            "body_file_too_large",
-            f"too large for inline transport: {st.st_size} > {INLINE_BODY_CAP_BYTES}",
-        )
 
     try:
-        raw = path.read_bytes()
-    except FileNotFoundError as exc:
-        raise _client_preflight_error("body_file_not_found", f"not found: {path_text}") from exc
-    except PermissionError as exc:
-        raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
-    except OSError as exc:
-        raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
+        try:
+            st = os.fstat(fd)
+        except OSError as exc:
+            raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
+
+        if not stat.S_ISREG(st.st_mode):
+            # FIFO / device / socket / directory — read_bytes() would block
+            # or read unbounded. Reject before any I/O.
+            raise _client_preflight_error("body_file_unreadable", f"not a regular file: {path_text}")
+
+        if st.st_size > INLINE_BODY_CAP_BYTES:
+            raise _client_preflight_error(
+                "body_file_too_large",
+                f"too large for inline transport: {st.st_size} > {INLINE_BODY_CAP_BYTES}",
+            )
+
+        # Bounded read: cap+1 bytes is enough to detect "would exceed cap"
+        # if a racing writer grew the file between fstat and read. This is
+        # defense-in-depth against the S_ISREG check being bypassed on an
+        # exotic filesystem.
+        try:
+            raw = os.read(fd, INLINE_BODY_CAP_BYTES + 1)
+        except OSError as exc:
+            raise _client_preflight_error("body_file_unreadable", f"unreadable under client UID: {exc.strerror}") from exc
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
     if len(raw) > INLINE_BODY_CAP_BYTES:
         raise _client_preflight_error(
@@ -970,6 +1059,10 @@ def gateway_log(subcmd: str, peer_uid: int, peer_agent: str, decision: str, reas
 
 
 def _deny_response(request_id: str, reason_code: str, exit_code: int = 2) -> dict[str, Any]:
+    # The reason_code on the wire MUST be a public-safe code; leaky internal
+    # codes (e.g. task_not_found, done_not_owner) are mapped here so callers
+    # don't need to remember to map at every emit site. The detailed code is
+    # still recorded server-side via gateway_log() for operator triage.
     return {
         "id": request_id,
         "request_id": request_id,
@@ -977,7 +1070,7 @@ def _deny_response(request_id: str, reason_code: str, exit_code: int = 2) -> dic
         "stdout": "",
         "stderr": "queue gateway denied\n",
         "decision": "deny",
-        "reason_code": reason_code,
+        "reason_code": _public_reason_code(reason_code),
     }
 
 
@@ -1080,15 +1173,40 @@ def cmd_socket_client(args: argparse.Namespace) -> int:
         print("queue gateway socket returned an invalid response", file=sys.stderr)
         return 1
 
+    # defense-in-depth: the local server is trusted by the security model,
+    # but we still validate its protocol output before printing or using it.
+    # A malicious or replaced local server (or a future protocol bug) must
+    # not be able to inject arbitrary stderr text or crash the client with a
+    # non-int exit_code.
     stdout = str(response.get("stdout", ""))
     stderr = str(response.get("stderr", ""))
     if stdout:
         sys.stdout.write(stdout)
     if response.get("decision") == "deny" and response.get("reason_code"):
-        sys.stderr.write(f"queue gateway denied: {response.get('reason_code')}\n")
+        raw_reason = str(response.get("reason_code") or "")
+        if raw_reason in _PUBLIC_REASON_CODES:
+            shown_reason = raw_reason
+        else:
+            print(
+                f"queue_gateway client_unknown_reason raw={raw_reason!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+            shown_reason = "internal_error"
+        sys.stderr.write(f"queue gateway denied: {shown_reason}\n")
     elif stderr:
         sys.stderr.write(stderr)
-    return int(response.get("exit_code", 1))
+
+    raw_exit = response.get("exit_code", 1)
+    try:
+        return int(raw_exit)
+    except (TypeError, ValueError):
+        print(
+            f"queue_gateway client_invalid_exit_code raw={raw_exit!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 1
 
 
 def cmd_socket_server(args: argparse.Namespace) -> int:

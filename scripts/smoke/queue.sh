@@ -425,6 +425,11 @@ queue_gateway_assert_body_file_preflight() {
 
   first_line="${output%%$'\n'*}"
   [[ "$first_line" == body\ file\ * ]] || smoke_fail "$context: expected body file prefix, got: $output"
+  # Format contract: "body file <reason_code>: <message>". Pin both the
+  # leading prefix shape and the reason-code-followed-by-colon shape so any
+  # future drift (e.g. swapping reason and message) is caught here.
+  [[ "$first_line" == "body file ${reason_code}: "* ]] \
+    || smoke_fail "$context: expected 'body file ${reason_code}: ' prefix, got: $output"
   smoke_assert_contains "$first_line" "$reason_code" "$context: stable reason code"
   [[ "$first_line" == *": "* ]] || smoke_fail "$context: expected message separator, got: $output"
   message="${first_line#*: }"
@@ -434,7 +439,7 @@ queue_gateway_assert_body_file_preflight() {
 queue_gateway_body_file_inlining_contract() {
   local socket_path server_log body_file update_file note_file secret update_secret note_secret
   local create_out task_id show_out other_out other_id handoff_id cancel_id denied_out denied_rc
-  local big_file unreadable_dir non_utf8_file before_lines after_lines
+  local big_file unreadable_dir non_utf8_file before_lines after_lines fifo_path
 
   queue_gateway_stop_socket_server
   queue_gateway_socket_env
@@ -547,6 +552,25 @@ PY
   [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: unreadable preflight should exit 2"
   queue_gateway_assert_body_file_preflight "$denied_out" "body_file_unreadable" "body-file inline: unreadable reason"
 
+  # Regular-file enforcement: a FIFO at the body-file path must be rejected
+  # at preflight (read_bytes() on a FIFO would block indefinitely). The
+  # preflight uses os.fstat()+S_ISREG, so this exercises that gate.
+  if command -v mkfifo >/dev/null 2>&1 && command -v timeout >/dev/null 2>&1; then
+    fifo_path="$SMOKE_TMP_ROOT/body-is-fifo"
+    rm -f "$fifo_path"
+    mkfifo "$fifo_path"
+    set +e
+    denied_out="$(
+      timeout 5 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+        --to worker-a --title "fifo body" --body-file "$fifo_path" 2>&1
+    )"
+    denied_rc=$?
+    set -e
+    [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: FIFO preflight should exit 2 (rc=$denied_rc out=$denied_out)"
+    queue_gateway_assert_body_file_preflight "$denied_out" "body_file_unreadable" "body-file inline: FIFO rejected as non-regular"
+    rm -f "$fifo_path"
+  fi
+
   non_utf8_file="$SMOKE_TMP_ROOT/body-not-utf8.bin"
   python3 - "$non_utf8_file" <<'PY'
 from pathlib import Path
@@ -639,7 +663,13 @@ PY
   denied_rc=$?
   set -e
   [[ "$denied_rc" -eq 2 ]] || smoke_fail "body-file inline: positional smuggling should exit 2"
-  smoke_assert_contains "$denied_out" "queue gateway denied: done_not_owner" "body-file inline: positional smuggling reason"
+  # Public reason-code mapping: detailed `done_not_owner` collapses to the
+  # public-safe `not_authorized` for the client (avoids leaking task
+  # existence/ownership across the isolation boundary), while the server
+  # log still records the detailed reason for operator triage.
+  smoke_assert_contains "$denied_out" "queue gateway denied: not_authorized" "body-file inline: positional smuggling public reason"
+  smoke_assert_not_contains "$denied_out" "done_not_owner" "body-file inline: detailed reason must not leak to client"
+  smoke_assert_contains "$(cat "$server_log")" "reason_code=done_not_owner" "body-file inline: detailed reason recorded server-side"
 
   queue_gateway_stop_socket_server
 }
