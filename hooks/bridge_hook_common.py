@@ -156,6 +156,52 @@ def current_agent() -> str:
     return os.environ.get("BRIDGE_AGENT_ID", "").strip()
 
 
+# Issue #539: the calling agent's privilege class. The closed value space
+# is {"user", "system"}; missing or unknown values normalize to "user" so
+# the default-deny posture for cross-agent reads is preserved. The bash
+# roster loader (lib/bridge-state.sh::bridge_load_roster) hard-fails on
+# unknown class values, so seeing one here means an out-of-band shell
+# corrupted the env file — fall back conservatively rather than escalate.
+#
+# The exported env var is BRIDGE_AGENT_CLASS_FOR_HOOK (a scalar alias);
+# the bare name BRIDGE_AGENT_CLASS in bash is the associative array of
+# every agent's class, which would collide with a scalar export.
+# bridge-run.sh:178-184 sets the alias for the calling agent.
+@functools.lru_cache(maxsize=1)
+def current_agent_class() -> str:
+    raw = os.environ.get("BRIDGE_AGENT_CLASS_FOR_HOOK", "").strip().lower()
+    if raw in {"user", "system"}:
+        return raw
+    return "user"
+
+
+# Issue #539: standardized audit event for every cross-agent file read by
+# a class=system agent. Mirrors the write_audit envelope (ts/host/uid/etc.)
+# but exposes a stable detail shape — `target_path` (the absolute or
+# bridge-relative path the agent attempted to read), `target_agent` (the
+# peer whose home contains the path, or "" for shared/* reads), and
+# `tool` (the Claude tool name that drove the access). Operators audit
+# every system-class read by grepping audit.jsonl for
+# `"action":"system_cross_agent_read"`.
+def emit_system_cross_agent_read(
+    *,
+    agent: str,
+    target_path: str,
+    target_agent: str,
+    tool: str,
+) -> None:
+    write_audit(
+        "system_cross_agent_read",
+        agent or "unknown",
+        {
+            "agent": agent or "unknown",
+            "target_path": target_path,
+            "target_agent": target_agent,
+            "tool": tool,
+        },
+    )
+
+
 def current_isolated_agent() -> str | None:
     agent = current_agent()
     if not agent:

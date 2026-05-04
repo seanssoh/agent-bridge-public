@@ -10207,4 +10207,8 @@ log "running isolated-skills-sync smoke (issue #544 PR3)"
 log "isolated-skills-sync covers helper render/rewrite only — live sudo + ACL grants require isolate+restart on a Linux host"
 bash "$REPO_ROOT/scripts/smoke/isolated-skills-sync.sh"
 
+# Issue #539 — system agent class roundtrip + tool-policy gate scenarios.
+log "running system-agent-class smoke (issue #539)"
+bash "$REPO_ROOT/scripts/smoke/system-agent-class.sh"
+
 log "smoke test passed"

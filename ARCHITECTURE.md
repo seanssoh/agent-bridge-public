@@ -232,6 +232,35 @@ The daemon's followup gate (`bridge-daemon.sh` `case "$CRON_REPORTING_DECISION"`
 - `silent` / `reported` → daemon clears `CRON_NEEDS_HUMAN_FOLLOWUP` (runner already handled or intentionally silent).
 - `invalid` / empty → daemon's existing failure-followup path runs (so a malformed result or missing field is never lost).
 
+## Hooks / Tool Policy
+
+`hooks/tool-policy.py` is the per-tool-call gate that enforces per-agent
+isolation, audited mutation of protected paths, and prompt-guard
+sanitization. Together with `hooks/bridge_hook_common.py` it is the
+containment/audit layer (not a sandbox — see CLAUDE.md "High-Risk
+Areas" item 5).
+
+### Agent class
+
+Each agent has a class (`user` by default; `system` opt-in via roster).
+
+- `user` — per-agent isolation; cross-agent reads denied.
+- `system` — read-only access to other agents' `memory/{projects,
+  decisions,shared}/` subtrees and to `shared/*` (excluding
+  `shared/private/` and `shared/secrets/`). `Bash`, `Edit`, and `Write`
+  outside the agent's own home stay denied even for `system`. Every
+  cross-agent read emits a `system_cross_agent_read` row to
+  `audit.jsonl` so the operator retains a full ledger.
+
+Class is declared in the roster (`BRIDGE_AGENT_CLASS["<agent>"]="system"`
+in `agent-roster.local.sh`) — runtime cannot change it. Unknown class
+values hard-fail at roster load. The shipped public roster declares
+no system-class agents; operators add `BRIDGE_AGENT_CLASS["…"]="system"`
+to their librarian / patch agents locally. The bash side exposes the
+value via `bridge_agent_class`; the calling agent's class is exported
+to hook subprocesses as the `BRIDGE_AGENT_CLASS_FOR_HOOK` scalar
+(distinct name to avoid colliding with the bash associative array).
+
 ## Configuration Surface
 
 Important environment variables:
