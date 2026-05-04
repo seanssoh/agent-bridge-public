@@ -386,6 +386,43 @@ bridge_agent_source() {
   printf '%s' "${BRIDGE_AGENT_SOURCE[$agent]-static}"
 }
 
+# Issue #539: agent class is the privilege boundary consumed by
+# hooks/tool-policy.py. The closed value space is {user, system}; any
+# unknown value (including the empty string written by older roster
+# snapshots) is normalized to "user" so the default-deny posture for
+# cross-agent reads is preserved on rosters that predate this field.
+# Validation of operator-supplied class= values happens at roster-load
+# time via bridge_validate_agent_class — this getter is the read-side
+# fallback.
+bridge_agent_class() {
+  local agent="$1"
+  local cls="${BRIDGE_AGENT_CLASS[$agent]-user}"
+  case "$cls" in
+    user|system) ;;
+    *) cls="user" ;;
+  esac
+  printf '%s' "$cls"
+}
+
+# Validate every BRIDGE_AGENT_CLASS entry currently present in the roster
+# maps. Called from bridge_load_roster after sourcing the roster files so
+# typos like `class=admin` or `class=System` surface as a hard error
+# rather than silently falling back to user-class. The closed value space
+# matches bridge_agent_class above; future classes must extend both the
+# value list AND the tool-policy gate.
+bridge_validate_agent_classes() {
+  declare -p BRIDGE_AGENT_CLASS >/dev/null 2>&1 || return 0
+  local agent cls
+  for agent in "${!BRIDGE_AGENT_CLASS[@]}"; do
+    cls="${BRIDGE_AGENT_CLASS[$agent]}"
+    [[ -n "$cls" ]] || continue
+    case "$cls" in
+      user|system) ;;
+      *) bridge_die "unknown agent class '$cls' for agent '$agent'; valid: user, system" ;;
+    esac
+  done
+}
+
 bridge_agent_session() {
   local agent="$1"
   printf '%s' "${BRIDGE_AGENT_SESSION[$agent]-}"
@@ -2443,6 +2480,7 @@ declare -g -A BRIDGE_AGENT_MODEL=()
 declare -g -A BRIDGE_AGENT_EFFORT=()
 declare -g -A BRIDGE_AGENT_PERMISSION_MODE=()
 declare -g -A BRIDGE_AGENT_PROMPT_GUARD=()
+declare -g -A BRIDGE_AGENT_CLASS=()
 EOF
   # Self entry first: full record including LAUNCH_CMD (the calling agent's
   # own launch command may legitimately carry tokens; ACLs already restrict
@@ -2471,6 +2509,7 @@ BRIDGE_AGENT_CHANNELS[$(printf '%q' "$agent")]=$(printf '%q' "$channels")
 BRIDGE_AGENT_ISOLATION_MODE[$(printf '%q' "$agent")]=$(printf '%q' "$isolation_mode")
 BRIDGE_AGENT_OS_USER[$(printf '%q' "$agent")]=$(printf '%q' "$os_user")
 BRIDGE_AGENT_PROMPT_GUARD[$(printf '%q' "$agent")]=$(printf '%q' "${BRIDGE_AGENT_PROMPT_GUARD[$agent]-}")
+BRIDGE_AGENT_CLASS[$(printf '%q' "$agent")]=$(printf '%q' "$(bridge_agent_class "$agent")")
 EOF
   # Peer entries: id + non-secret metadata. NEVER emit a peer's LAUNCH_CMD
   # (token-bearing) or PROMPT_GUARD policy (canary tokens at
