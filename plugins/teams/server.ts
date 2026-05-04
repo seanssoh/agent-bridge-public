@@ -66,6 +66,10 @@ type StoredMessage = {
   aad_object_id: string
   text: string
   ts: string
+  // Edit indicator: Teams reuses message_id on edits but bumps
+  // localTimestamp/timestamp. Stored so deliveredMessageSeen can let edits
+  // through while still dropping pure retransmits.
+  revision?: string
   attachments?: StoredAttachment[]
 }
 
@@ -365,14 +369,18 @@ function appendMessage(message: StoredMessage): void {
   appendFileSync(MESSAGES_FILE, JSON.stringify(message) + '\n', { mode: 0o600 })
 }
 
-function deliveredMessageSeen(chatId: string, messageId: string): boolean {
+function deliveredMessageSeen(chatId: string, messageId: string, revision: string): boolean {
   if (!chatId || !messageId || !existsSync(MESSAGES_FILE)) return false
   try {
     const lines = readFileSync(MESSAGES_FILE, 'utf8').split('\n').filter(Boolean)
     for (let i = lines.length - 1; i >= 0; i -= 1) {
       try {
         const row = JSON.parse(lines[i]) as Partial<StoredMessage>
-        if (row.chat_id === chatId && row.message_id === messageId) return true
+        if (row.chat_id !== chatId || row.message_id !== messageId) continue
+        // Edits arrive with the same chat_id+message_id but a bumped revision.
+        // Treat a row as a "duplicate" only if the revision matches (or both
+        // sides lack one — pre-revision rows or non-edit-aware activities).
+        if ((row.revision ?? '') === (revision ?? '')) return true
       } catch {}
     }
   } catch {}
@@ -553,8 +561,13 @@ const adapter = new BotFrameworkAdapter({
 const recentMessageIds = createRecentMessageDeduper(256)
 let duplicateDropLogs = 0
 
-function dedupeKey(chatId: string, messageId: string): string {
-  return `${chatId}::${messageId}`
+// dedupeKey: chat scopes the id (Teams reuses message ids across conversations
+// for thread replies); revision distinguishes edits — Teams keeps the same
+// activity.id when a user edits a message but bumps localTimestamp/timestamp,
+// so including the revision lets edits through while still dropping pure
+// retransmits of the original payload.
+function dedupeKey(chatId: string, messageId: string, revision: string): string {
+  return revision ? `${chatId}::${messageId}::${revision}` : `${chatId}::${messageId}`
 }
 
 function logDuplicateDrop(chatId: string, messageId: string): void {
@@ -650,11 +663,18 @@ async function handleActivity(context: TurnContext): Promise<void> {
 
   const chatId = referenceKey(activity)
   const messageId = String(activity.id ?? randomUUID())
-  if (recentMessageIds.seen(dedupeKey(chatId, messageId))) {
+  // Bot Framework bumps localTimestamp on edited messages (and timestamp
+  // tracks server-side receive time). Either is a stable enough edit
+  // indicator to keep edits from being dropped as duplicates.
+  const revision = String(
+    (activity as any).localTimestamp ??
+      (activity.timestamp instanceof Date ? activity.timestamp.toISOString() : activity.timestamp ?? ''),
+  )
+  if (recentMessageIds.seen(dedupeKey(chatId, messageId, revision))) {
     logDuplicateDrop(chatId, messageId)
     return
   }
-  if (deliveredMessageSeen(chatId, messageId)) {
+  if (deliveredMessageSeen(chatId, messageId, revision)) {
     logDuplicateDrop(chatId, messageId)
     return
   }
@@ -679,8 +699,15 @@ async function handleActivity(context: TurnContext): Promise<void> {
     aad_object_id: aad,
     text,
     ts,
+    ...(revision ? { revision } : {}),
     ...(attachments.length > 0 ? { attachments } : {}),
   }
+  // Channel delivery and local log append are split: a delivery failure must
+  // surface as a non-2xx so Teams retries, but a successful delivery followed
+  // by a failed log append (disk full, EACCES, …) should NOT cause Teams to
+  // retry — the message is already in the active Claude session. The only
+  // observable consequence of a log-append failure is that fetch_messages
+  // can't replay this entry from the local audit log.
   try {
     await mcp.notification({
       method: 'notifications/claude/channel',
@@ -697,6 +724,7 @@ async function handleActivity(context: TurnContext): Promise<void> {
           tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
           service_url: String(activity.serviceUrl ?? ''),
           ts,
+          ...(revision ? { revision } : {}),
           ...(attachments.length > 0
             ? {
                 attachment_count: String(attachments.length),
@@ -713,11 +741,15 @@ async function handleActivity(context: TurnContext): Promise<void> {
         },
       },
     })
-    appendMessage(stored)
   } catch (err) {
-    recentMessageIds.forget(dedupeKey(chatId, messageId))
+    recentMessageIds.forget(dedupeKey(chatId, messageId, revision))
     process.stderr.write(`teams channel: failed to deliver inbound message_id=${messageId}: ${err}\n`)
     throw err
+  }
+  try {
+    appendMessage(stored)
+  } catch (err) {
+    process.stderr.write(`teams channel: failed to append local log message_id=${messageId} (delivery already succeeded): ${err}\n`)
   }
 }
 

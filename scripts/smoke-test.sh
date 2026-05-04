@@ -5483,6 +5483,24 @@ PY
   assert_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "ignoring deprecated TEAMS_BRIDGE_MODE"
   TEAMS_DEDUPE_OUTPUT="$(cd "$REPO_ROOT/plugins/teams" && bun -e 'import { createRecentMessageDeduper } from "./dedupe.ts"; const dedupe = createRecentMessageDeduper(2); console.log(JSON.stringify([dedupe.seen("1775901127484"), dedupe.seen("1775901127484"), dedupe.seen("1775901127485"), dedupe.seen("1775901127486"), dedupe.seen("1775901127484")]))')"
   assert_contains "$TEAMS_DEDUPE_OUTPUT" "[false,true,false,false,false]"
+  # Round-2: channel-failure path — forget() must roll back the dedupe entry
+  # so a Teams retry of the same activity is allowed through after a delivery
+  # error. Without forget() the retry would be silently dropped.
+  TEAMS_DEDUPE_FORGET_OUTPUT="$(cd "$REPO_ROOT/plugins/teams" && bun -e 'import { createRecentMessageDeduper } from "./dedupe.ts"; const dedupe = createRecentMessageDeduper(8); const a = dedupe.seen("chat-1::msg-1::rev-1"); const b = dedupe.seen("chat-1::msg-1::rev-1"); dedupe.forget("chat-1::msg-1::rev-1"); const c = dedupe.seen("chat-1::msg-1::rev-1"); console.log(JSON.stringify([a, b, c]))')"
+  assert_contains "$TEAMS_DEDUPE_FORGET_OUTPUT" "[false,true,false]"
+  # Round-2: edit-aware key — same chat_id+message_id with a bumped revision
+  # must not collide. Teams edits keep the activity id but bump
+  # localTimestamp/timestamp.
+  TEAMS_DEDUPE_EDIT_OUTPUT="$(cd "$REPO_ROOT/plugins/teams" && bun -e 'import { createRecentMessageDeduper } from "./dedupe.ts"; const dedupe = createRecentMessageDeduper(8); const original = dedupe.seen("chat-1::msg-1::2026-01-01T00:00:00Z"); const edit = dedupe.seen("chat-1::msg-1::2026-01-01T00:05:00Z"); const replay = dedupe.seen("chat-1::msg-1::2026-01-01T00:00:00Z"); console.log(JSON.stringify([original, edit, replay]))')"
+  assert_contains "$TEAMS_DEDUPE_EDIT_OUTPUT" "[false,false,true]"
+  # Round-2: catch-block scope — channel delivery and local log append must
+  # use separate try blocks so a successful delivery followed by an
+  # appendMessage failure does NOT cause Teams to retry an already-delivered
+  # message.
+  assert_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "failed to append local log"
+  assert_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "delivery already succeeded"
+  # Round-2: dedupe key must include a revision so Teams edits flow through.
+  assert_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "dedupeKey(chatId, messageId, revision)"
   log "exercising ms365 human-profile disclosure helper"
   MS365_DISCLOSURE_OUTPUT="$(cd "$REPO_ROOT/plugins/ms365" && bun -e 'import { mkdtempSync } from "fs"; import { join } from "path"; import { tmpdir } from "os"; import { hasChatDisclaimerBeenSent, markChatDisclaimerSent, prependHumanOutboundDisclaimer } from "./disclosure.ts"; const root = mkdtempSync(join(tmpdir(), "ms365-disclosure-")); const statePath = join(root, "human-outbound-disclosures.json"); const text = prependHumanOutboundDisclaimer("hello", "text", "notice"); const html = prependHumanOutboundDisclaimer("<p>hello</p>", "html", "notice"); const before = hasChatDisclaimerBeenSent(statePath, "owner@example.com", "chat-1"); markChatDisclaimerSent(statePath, "owner@example.com", "chat-1", "msg-1"); const after = hasChatDisclaimerBeenSent(statePath, "owner@example.com", "chat-1"); const other = hasChatDisclaimerBeenSent(statePath, "owner@example.com", "chat-2"); console.log(JSON.stringify({ text, html, before, after, other }));')"
   python3 - "$MS365_DISCLOSURE_OUTPUT" <<'PY'

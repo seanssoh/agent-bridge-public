@@ -1,3 +1,13 @@
+// Bounded in-memory deduper for inbound channel webhooks. The caller is
+// responsible for choosing the key shape; the Teams server passes
+// `${chat_id}::${message_id}::${revision}` so:
+//   - chat_id scopes the id (Teams reuses message ids across conversations
+//     for thread replies, so a bare message id can collide).
+//   - message_id is the activity's stable id, the primary dedupe field.
+//   - revision (Bot Framework localTimestamp / timestamp) lets Teams edits
+//     through — edits keep the same message_id but bump localTimestamp.
+// `forget` is exposed so the caller can roll back the dedupe entry when
+// channel delivery fails and the message must be allowed to retry.
 export type RecentMessageDeduper = {
   seen(messageId: string): boolean
   forget(messageId: string): void
