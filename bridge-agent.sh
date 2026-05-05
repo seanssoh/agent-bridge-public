@@ -6,6 +6,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
+
+# Issue #598 Track 1 r2: the `agent registry` endpoint must be read-only,
+# but bridge_load_roster runs unconditionally at script load. Detect the
+# registry subcommand early and export BRIDGE_REGISTRY_READ_ONLY=1 so the
+# guards in lib/bridge-state.sh skip the dynamic active-env writes that
+# the recovery loaders would otherwise perform during registry enumeration.
+if [[ "${1:-}" == "registry" ]]; then
+  export BRIDGE_REGISTRY_READ_ONLY=1
+fi
+
 bridge_load_roster
 
 usage() {

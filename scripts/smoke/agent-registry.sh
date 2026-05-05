@@ -251,10 +251,88 @@ test_jq_parseable() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# T6 — registry endpoint is read-only (Issue #598 Track 1 r2).
+#
+# Codex r1 review flagged that `agent registry --json` inherits 3
+# bridge_write_dynamic_agent_file calls from the recovery code in
+# lib/bridge-state.sh (the dynamic-history, tmux-recovered, and
+# history-restored paths). The fix: gate those persistence sites behind
+# BRIDGE_REGISTRY_READ_ONLY=1, exported by bridge-agent.sh before
+# bridge_load_roster runs when the subcommand is `registry`.
+#
+# The 3 gated writes only fire when there is a live tmux session that
+# matches a history entry — out of reach in a portable smoke fixture.
+# So this T6 uses the env-var-flag-passthrough variant from the brief:
+#   - Override bridge_write_dynamic_agent_file inside the roster-local
+#     file so any call records the value of BRIDGE_REGISTRY_READ_ONLY
+#     and the call count to a probe file.
+#   - The override also hooks into a synthetic call from the roster
+#     itself, which runs inside bridge_load_roster (the same call window
+#     where the gated recovery loaders run). This proves the flag is in
+#     scope at the persistence-site call boundary for `agent registry`,
+#     and is NOT in scope for `agent list`.
+# ---------------------------------------------------------------------------
+test_registry_read_only_flag_in_scope() {
+  local probe="$SMOKE_TMP_ROOT/registry-readonly-probe.log"
+  : >"$probe"
+  rm -rf "$BRIDGE_ACTIVE_AGENT_DIR"
+  mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR"
+
+  cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
+bridge_add_agent_id_if_missing "alpha"
+BRIDGE_AGENT_ENGINE["alpha"]="claude"
+BRIDGE_AGENT_SESSION["alpha"]="alpha"
+BRIDGE_AGENT_WORKDIR["alpha"]="$BRIDGE_AGENT_HOME_ROOT/alpha"
+
+# Override bridge_write_dynamic_agent_file so any call during this
+# bridge_load_roster invocation records the BRIDGE_REGISTRY_READ_ONLY
+# value visible at that moment. Re-defining inside the roster file is
+# safe — lib/bridge-state.sh has already been sourced by the time
+# bridge_load_roster runs the local roster, so this override is the one
+# the recovery loaders see.
+bridge_write_dynamic_agent_file() {
+  printf 'flag=%s call=%s\n' "\${BRIDGE_REGISTRY_READ_ONLY:-unset}" "\$1" >>"$probe"
+  return 0
+}
+
+# Synthetic call inside the roster-load window. This stands in for the
+# 3 recovery-path call sites (1013, 1088, 1165) that, in production,
+# are reached via live tmux + history files we cannot reproduce in a
+# smoke fixture. The flag must be visible here for the real gates to fire.
+bridge_write_dynamic_agent_file "synthetic" "$BRIDGE_ACTIVE_AGENT_DIR/synthetic.env"
+EOF
+
+  # Run via `agent registry --json` — flag MUST be set during roster load.
+  agent_registry_json >/dev/null
+  smoke_assert_file_exists "$probe" "T6 probe captured registry roster load"
+
+  local registry_line
+  registry_line="$(grep '^flag=' "$probe" | head -n 1)"
+  if [[ "$registry_line" != *"flag=1"* ]]; then
+    smoke_fail "T6 registry call did not export BRIDGE_REGISTRY_READ_ONLY=1; probe line: $registry_line"
+  fi
+
+  # Reset probe and run via `agent list` — flag MUST NOT be set, so the
+  # other callers continue persisting as today.
+  : >"$probe"
+  "$BASH4_BIN" "$REPO_ROOT/bridge-agent.sh" list --json >/dev/null
+
+  local list_line
+  list_line="$(grep '^flag=' "$probe" | head -n 1)"
+  if [[ "$list_line" == *"flag=1"* ]]; then
+    smoke_fail "T6 'agent list' leaked BRIDGE_REGISTRY_READ_ONLY=1; probe line: $list_line"
+  fi
+  if [[ "$list_line" != *"flag=unset"* && "$list_line" != *"flag=0"* ]]; then
+    smoke_fail "T6 'agent list' probe missing or unexpected; probe line: $list_line"
+  fi
+}
+
 smoke_run "T1 static + dynamic mix"           test_static_plus_dynamic
 smoke_run "T2 system-class precedence"        test_system_class_precedence
 smoke_run "T3 empty roster"                   test_empty_roster
 smoke_run "T4 stable sort"                    test_stable_sort
 smoke_run "T5 jq parseable"                   test_jq_parseable
+smoke_run "T6 registry read-only flag"        test_registry_read_only_flag_in_scope
 
 smoke_log "all checks passed"

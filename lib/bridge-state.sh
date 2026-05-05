@@ -1010,7 +1010,13 @@ bridge_restore_dynamic_agents_from_history() {
 
     active_file="$(bridge_dynamic_agent_file_for "$AGENT_ID")"
     BRIDGE_AGENT_META_FILE["$AGENT_ID"]="$active_file"
-    bridge_write_dynamic_agent_file "$AGENT_ID" "$active_file"
+    # Issue #598 Track 1 r2: when BRIDGE_REGISTRY_READ_ONLY=1 is set by the
+    # registry endpoint, skip the persistence side-effect to keep the registry
+    # read truly read-only. The in-memory state (BRIDGE_AGENT_*) is still
+    # populated for the registry's enumeration.
+    if [[ "${BRIDGE_REGISTRY_READ_ONLY:-0}" != "1" ]]; then
+      bridge_write_dynamic_agent_file "$AGENT_ID" "$active_file"
+    fi
   done
   shopt -u nullglob
 }
@@ -1085,7 +1091,13 @@ bridge_reconcile_dynamic_agents_from_tmux() {
 
     active_file="$(bridge_dynamic_agent_file_for "$session")"
     BRIDGE_AGENT_META_FILE["$session"]="$active_file"
-    bridge_write_dynamic_agent_file "$session" "$active_file"
+    # Issue #598 Track 1 r2: when BRIDGE_REGISTRY_READ_ONLY=1 is set by the
+    # registry endpoint, skip the persistence side-effect to keep the registry
+    # read truly read-only. The in-memory state (BRIDGE_AGENT_*) is still
+    # populated for the registry's enumeration.
+    if [[ "${BRIDGE_REGISTRY_READ_ONLY:-0}" != "1" ]]; then
+      bridge_write_dynamic_agent_file "$session" "$active_file"
+    fi
   done < <(tmux list-sessions -F '#{session_name}' 2>/dev/null || true)
 }
 
@@ -1162,7 +1174,13 @@ _bridge_register_dynamic_from_env_file() {
 
   active_file="$(bridge_dynamic_agent_file_for "$AGENT_ID")"
   BRIDGE_AGENT_META_FILE["$AGENT_ID"]="$active_file"
-  bridge_write_dynamic_agent_file "$AGENT_ID" "$active_file"
+  # Issue #598 Track 1 r2: when BRIDGE_REGISTRY_READ_ONLY=1 is set by the
+  # registry endpoint, skip the persistence side-effect to keep the registry
+  # read truly read-only. The in-memory state (BRIDGE_AGENT_*) is still
+  # populated for the registry's enumeration.
+  if [[ "${BRIDGE_REGISTRY_READ_ONLY:-0}" != "1" ]]; then
+    bridge_write_dynamic_agent_file "$AGENT_ID" "$active_file"
+  fi
 }
 
 bridge_load_static_agent_history() {
