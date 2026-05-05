@@ -13,6 +13,7 @@ usage() {
 Usage:
   $(basename "$0") create <agent> [options]
   $(basename "$0") update <agent> [options]
+  $(basename "$0") delete <agent> [--from <admin>] [--force] [--orphan-tasks] [--purge-home] [--purge-crons] [--dry-run] [--json]
   $(basename "$0") list [--json]
   $(basename "$0") show <agent> [--json]
   $(basename "$0") reclassify [--agent <agent>] [--apply] [--json]
@@ -2416,6 +2417,468 @@ PY
   printf 'after_sha: %s\n' "$after_sha"
 }
 
+# run_delete — issue #580 Track 1. Admin-only audited removal of a static
+# managed-role block from agent-roster.local.sh. Trust model mirrors
+# run_update (admin agent identity + operator-trusted source). Safety
+# gates: refuse if agent missing, refuse self-delete of admin, refuse
+# active session without --force, refuse open inbox tasks without
+# --orphan-tasks. Optional --purge-home / --purge-crons cleanup.
+run_delete() {
+  local agent=""
+  local from_agent=""
+  local force=0
+  local orphan_tasks=0
+  local purge_home=0
+  local purge_crons=0
+  local dry_run=0
+  local json_output=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        from_agent="$2"
+        shift 2
+        ;;
+      --force)
+        force=1
+        shift
+        ;;
+      --orphan-tasks)
+        orphan_tasks=1
+        shift
+        ;;
+      --purge-home)
+        purge_home=1
+        shift
+        ;;
+      --purge-crons)
+        purge_crons=1
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --json)
+        json_output=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        bridge_die "지원하지 않는 agent delete 옵션입니다: $1"
+        ;;
+      *)
+        if [[ -z "$agent" ]]; then
+          agent="$1"
+          shift
+        else
+          bridge_die "agent delete: 추가 위치 인자는 허용되지 않습니다: $1"
+        fi
+        ;;
+    esac
+  done
+
+  [[ -n "$agent" ]] || bridge_die "agent delete: <name> 인자가 필요합니다."
+
+  # Existence — must already be in the local roster (the only file the
+  # delete subcommand mutates). bridge_roster_local_mentions_agent is
+  # the same probe `reclassify` uses for static-source detection.
+  if ! bridge_roster_local_mentions_agent "$agent"; then
+    bridge_die "deny: agent '$agent' is not present in the local roster — nothing to delete"
+  fi
+
+  # Caller validation — same shape as run_update (#528).
+  local caller_agent caller_source
+  caller_agent="$(bridge_agent_update_caller_agent "$from_agent")"
+  caller_source="$(bridge_agent_update_caller_source)"
+
+  local roster_path="$BRIDGE_ROSTER_LOCAL_FILE"
+  local before_sha
+  before_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
+
+  local actor_label="$caller_agent"
+  if [[ -z "$actor_label" ]]; then
+    if [[ "$caller_source" == "operator-tui" ]]; then
+      actor_label="operator"
+    else
+      actor_label="unknown"
+    fi
+  fi
+
+  local deny_reason=""
+  if [[ -z "$caller_agent" ]]; then
+    deny_reason="caller_agent unspecified — pass --from <admin-agent> or set BRIDGE_AGENT_ID before invoking 'agent-bridge agent delete'"
+  elif ! bridge_agent_update_caller_is_admin "$caller_agent"; then
+    deny_reason="caller agent $caller_agent is not the admin agent — refusing managed-role mutation"
+  elif [[ "$caller_source" != "operator-tui" && "$caller_source" != "operator-trusted-id" ]]; then
+    deny_reason="caller source $caller_source is not allowed to mutate system config (need operator-tui or operator-trusted-id)"
+  fi
+
+  # Refuse-if-admin-self: cannot delete the configured admin role from
+  # inside it. Strip both sides before comparing — mirror the pattern in
+  # lib/bridge-agent-update.sh:104 so a trailing newline / whitespace in
+  # BRIDGE_ADMIN_AGENT_ID does not silently bypass the self-delete guard.
+  # The admin id may be unset (early bootstrap); in that case there is
+  # nothing to refuse.
+  if [[ -z "$deny_reason" ]]; then
+    local admin_id agent_id
+    admin_id="$(bridge_admin_agent_id)"
+    admin_id="$(printf '%s' "$admin_id" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    agent_id="$(printf '%s' "$agent" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ -n "$admin_id" && "$agent_id" == "$admin_id" ]]; then
+      deny_reason="cannot delete the configured admin agent ($admin_id) from itself — clear BRIDGE_ADMIN_AGENT_ID first"
+    fi
+  fi
+
+  # Refuse-if-active: only when --force is absent. Reuse the same
+  # tmux-backed probe `agent stop` and the daemon use.
+  if [[ -z "$deny_reason" && $force -eq 0 ]]; then
+    if bridge_agent_is_active "$agent" 2>/dev/null; then
+      deny_reason="agent '$agent' has an active session — stop it first or pass --force"
+    fi
+  fi
+
+  # Refuse-if-open-tasks: count rows in BRIDGE_TASK_DB whose
+  # assigned_to=<agent> and status is not terminal, mirroring the queue
+  # summary's filters (exclude [cron-dispatch] noise).
+  local open_count=0
+  if [[ -z "$deny_reason" ]]; then
+    if [[ -f "$BRIDGE_TASK_DB" ]]; then
+      bridge_require_python
+      open_count="$(python3 - "$BRIDGE_TASK_DB" "$agent" <<'PY' 2>/dev/null || printf 0
+import sqlite3
+import sys
+
+db_path, agent = sys.argv[1], sys.argv[2]
+try:
+    conn = sqlite3.connect(db_path)
+    row = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM tasks
+        WHERE assigned_to = ?
+          AND status IN ('queued', 'claimed', 'blocked')
+          AND title NOT LIKE '[cron-dispatch]%'
+        """,
+        (agent,),
+    ).fetchone()
+    print(int(row[0] or 0))
+finally:
+    try:
+        conn.close()
+    except Exception:
+        pass
+PY
+)"
+    fi
+    [[ "$open_count" =~ ^[0-9]+$ ]] || open_count=0
+    if [[ "$open_count" -gt 0 && $orphan_tasks -eq 0 ]]; then
+      deny_reason="agent '$agent' has $open_count open inbox task(s) — pass --orphan-tasks to mark them blocked"
+    fi
+  fi
+
+  # Capture before-state (used in both deny and apply audit rows).
+  local before_launch_cmd before_channels
+  before_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+  before_channels="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
+
+  if [[ -n "$deny_reason" ]]; then
+    bridge_agent_update_emit_audit \
+      "agent-delete-deny" \
+      "$actor_label" \
+      "$caller_source" \
+      "$agent" \
+      "$roster_path" \
+      "$before_sha" \
+      "" \
+      "delete" \
+      "$deny_reason" \
+      "$before_launch_cmd" \
+      "" \
+      "$before_channels" \
+      "" \
+      "[]"
+    bridge_die "deny: $deny_reason"
+  fi
+
+  if [[ $dry_run -eq 1 ]]; then
+    bridge_agent_update_emit_audit \
+      "agent-delete-dry-run" \
+      "$actor_label" \
+      "$caller_source" \
+      "$agent" \
+      "$roster_path" \
+      "$before_sha" \
+      "$before_sha" \
+      "delete" \
+      "" \
+      "$before_launch_cmd" \
+      "" \
+      "$before_channels" \
+      "" \
+      "[]"
+
+    if [[ $json_output -eq 1 ]]; then
+      bridge_require_python
+      AGENT="$agent" CALLER_SOURCE="$caller_source" OPEN_COUNT="$open_count" \
+      ORPHAN_TASKS="$orphan_tasks" PURGE_HOME="$purge_home" PURGE_CRONS="$purge_crons" \
+      python3 - <<'PY'
+import json
+import os
+
+payload = {
+    "agent": os.environ["AGENT"],
+    "deleted": False,
+    "dry_run": True,
+    "purge_home": os.environ["PURGE_HOME"] == "1",
+    "purge_crons": os.environ["PURGE_CRONS"] == "1",
+    "orphan_tasks": os.environ["ORPHAN_TASKS"] == "1",
+    "open_inbox_tasks": int(os.environ["OPEN_COUNT"] or 0),
+    "caller_source": os.environ["CALLER_SOURCE"],
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+    else
+      printf 'agent: %s\n' "$agent"
+      printf 'deleted: no\n'
+      printf 'dry_run: yes\n'
+      printf 'open_inbox_tasks: %s\n' "$open_count"
+      printf 'orphan_tasks: %s\n' "$([[ $orphan_tasks -eq 1 ]] && echo yes || echo no)"
+      printf 'purge_home: %s\n' "$([[ $purge_home -eq 1 ]] && echo yes || echo no)"
+      printf 'purge_crons: %s\n' "$([[ $purge_crons -eq 1 ]] && echo yes || echo no)"
+    fi
+    return 0
+  fi
+
+  # Side effects, in order: orphan tasks → remove roster block →
+  # optional purges. Failures in optional purges are best-effort and
+  # logged but do not roll back the roster mutation.
+
+  if [[ $orphan_tasks -eq 1 && "$open_count" -gt 0 && -f "$BRIDGE_TASK_DB" ]]; then
+    bridge_require_python
+    local _orphan_err
+    _orphan_err="$(mktemp -t agb-orphan-err.XXXXXX)"
+    if ! python3 - "$BRIDGE_TASK_DB" "$agent" "agent retired via 'agent delete'" <<'PY' 2>"$_orphan_err"
+import sqlite3
+import sys
+import time
+
+db_path, agent, note = sys.argv[1], sys.argv[2], sys.argv[3]
+now_ts = int(time.time())
+conn = sqlite3.connect(db_path)
+try:
+    with conn:
+        rows = conn.execute(
+            """
+            SELECT id FROM tasks
+            WHERE assigned_to = ?
+              AND status IN ('queued', 'claimed')
+              AND title NOT LIKE '[cron-dispatch]%'
+            """,
+            (agent,),
+        ).fetchall()
+        for (task_id,) in rows:
+            # `blocked` is an open status (bridge-queue.py:22), so leave
+            # closed_ts untouched — only cancelled/done set it. Restrict
+            # the UPDATE WHERE to the same queued/claimed set so already
+            # blocked rows are not redundantly bumped (idempotent).
+            conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'blocked', updated_ts = ?
+                WHERE id = ?
+                  AND status IN ('queued', 'claimed')
+                  AND title NOT LIKE '[cron-dispatch]%'
+                """,
+                (now_ts, task_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO task_events (
+                  task_id, event_type, actor, created_ts, note_text,
+                  note_path, from_agent, to_agent
+                ) VALUES (?, 'blocked', 'agent-delete', ?, ?, NULL, NULL, ?)
+                """,
+                (task_id, now_ts, note, agent),
+            )
+finally:
+    conn.close()
+PY
+    then
+      local _orphan_err_text
+      _orphan_err_text="$(cat "$_orphan_err" 2>/dev/null || true)"
+      rm -f "$_orphan_err"
+      bridge_die "agent delete: failed to mark inbox tasks blocked for '$agent'${_orphan_err_text:+ ($_orphan_err_text)}"
+    fi
+    rm -f "$_orphan_err"
+  fi
+
+  # Remove the managed-role block from the roster file. Same regex the
+  # block writer in bridge_write_role_block uses, with re.sub("") to
+  # excise instead of replace.
+  bridge_agent_manage_python "$roster_path" "$agent" >/dev/null <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+agent = sys.argv[2]
+text = path.read_text(encoding="utf-8")
+begin = f"# BEGIN AGENT BRIDGE MANAGED ROLE: {agent}"
+end = f"# END AGENT BRIDGE MANAGED ROLE: {agent}"
+if begin not in text or end not in text:
+    raise SystemExit(f"managed block not found for {agent}: {path}")
+pattern = re.compile(
+    rf"^# BEGIN AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n.*?^# END AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n?",
+    flags=re.MULTILINE | re.DOTALL,
+)
+# Mirror bridge-agent.sh:717 — verify the regex matches before writing.
+# subn returns (new_text, count); refuse to write unless exactly one
+# managed block was excised.
+new_text, count = pattern.subn("", text, count=1)
+if count != 1:
+    raise SystemExit(
+        f"managed block not found or matched {count} times for {agent}: {path}"
+    )
+text = new_text
+# Collapse the triple-newline left behind by block removal (cosmetic).
+text = re.sub(r"\n{3,}", "\n\n", text)
+path.write_text(text, encoding="utf-8")
+print(path)
+PY
+
+  if [[ $purge_crons -eq 1 ]]; then
+    # Best-effort: list native crons for this agent and delete each.
+    # Failures are non-fatal — the roster block is already gone and
+    # operators can retry the purge.
+    bridge_require_python
+    BRIDGE_BASH_BIN="$BRIDGE_BASH_BIN" SCRIPT_DIR="$SCRIPT_DIR" \
+    python3 - "$agent" <<'PY' || \
+      bridge_warn "agent delete: cron purge encountered errors for '$agent' (best-effort)"
+import json
+import os
+import subprocess
+import sys
+
+agent = sys.argv[1]
+bash_bin = os.environ.get("BRIDGE_BASH_BIN", "bash")
+script_dir = os.environ["SCRIPT_DIR"]
+cron_sh = os.path.join(script_dir, "bridge-cron.sh")
+
+list_proc = subprocess.run(
+    [bash_bin, cron_sh, "list", "--agent", agent, "--json"],
+    capture_output=True,
+    text=True,
+)
+if list_proc.returncode != 0:
+    sys.exit(0)
+try:
+    data = json.loads(list_proc.stdout or "{}")
+except json.JSONDecodeError:
+    sys.exit(0)
+for job in data.get("jobs", []) or []:
+    if job.get("agent") != agent:
+        continue
+    job_id = job.get("id")
+    if not job_id:
+        continue
+    subprocess.run(
+        [bash_bin, cron_sh, "delete", str(job_id)],
+        check=False,
+    )
+PY
+  fi
+
+  if [[ $purge_home -eq 1 ]]; then
+    # Resolve via the canonical helper so v1 (`$BRIDGE_AGENT_HOME_ROOT/$agent`)
+    # and v2 (`$BRIDGE_AGENT_ROOT_V2/$agent/home`) layouts both work.
+    local home_dir
+    home_dir="$(bridge_agent_default_home "$agent")"
+    # Validate the resolved path is under one of the known agent roots
+    # before recursive rm — anything outside is a resolver bug, refuse
+    # rather than rm. Roster mutation has already succeeded, so an rm
+    # failure is best-effort: warn but do not abort the subcommand.
+    case "$home_dir" in
+      "$BRIDGE_AGENT_HOME_ROOT"/*|"${BRIDGE_AGENT_ROOT_V2:-/dev/null}"/*)
+        if [[ -d "$home_dir" ]]; then
+          if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+            bridge_linux_sudo_root rm -rf -- "$home_dir" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $home_dir"
+          else
+            rm -rf -- "$home_dir" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $home_dir"
+          fi
+        fi
+        ;;
+      *)
+        bridge_warn "agent delete: --purge-home refused: resolved home outside expected agent roots: $home_dir"
+        ;;
+    esac
+  fi
+
+  local after_sha
+  after_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
+
+  bridge_agent_update_emit_audit \
+    "agent-delete" \
+    "$actor_label" \
+    "$caller_source" \
+    "$agent" \
+    "$roster_path" \
+    "$before_sha" \
+    "$after_sha" \
+    "delete" \
+    "" \
+    "$before_launch_cmd" \
+    "" \
+    "$before_channels" \
+    "" \
+    "[]"
+
+  if [[ $json_output -eq 1 ]]; then
+    bridge_require_python
+    AGENT="$agent" CALLER_SOURCE="$caller_source" OPEN_COUNT="$open_count" \
+    ORPHAN_TASKS="$orphan_tasks" PURGE_HOME="$purge_home" PURGE_CRONS="$purge_crons" \
+    BEFORE_SHA="$before_sha" AFTER_SHA="$after_sha" \
+    python3 - <<'PY'
+import json
+import os
+
+payload = {
+    "agent": os.environ["AGENT"],
+    "deleted": True,
+    "dry_run": False,
+    "purge_home": os.environ["PURGE_HOME"] == "1",
+    "purge_crons": os.environ["PURGE_CRONS"] == "1",
+    "orphan_tasks": os.environ["ORPHAN_TASKS"] == "1",
+    "open_inbox_tasks": int(os.environ["OPEN_COUNT"] or 0),
+    "caller_source": os.environ["CALLER_SOURCE"],
+    "before_sha": os.environ["BEFORE_SHA"],
+    "after_sha": os.environ["AFTER_SHA"],
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+  else
+    printf 'agent: %s\n' "$agent"
+    printf 'deleted: yes\n'
+    printf 'dry_run: no\n'
+    printf 'before_sha: %s\n' "$before_sha"
+    printf 'after_sha: %s\n' "$after_sha"
+    printf 'open_inbox_tasks: %s\n' "$open_count"
+    printf 'orphan_tasks: %s\n' "$([[ $orphan_tasks -eq 1 ]] && echo yes || echo no)"
+    printf 'purge_home: %s\n' "$([[ $purge_home -eq 1 ]] && echo yes || echo no)"
+    printf 'purge_crons: %s\n' "$([[ $purge_crons -eq 1 ]] && echo yes || echo no)"
+  fi
+}
+
 run_start() {
   local agent="${1:-}"
   shift || true
@@ -2879,6 +3342,9 @@ case "$subcommand" in
   update)
     run_update "$@"
     ;;
+  delete)
+    run_delete "$@"
+    ;;
   list)
     run_list "$@"
     ;;
@@ -2924,7 +3390,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create update list show reclassify rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
+      "create update delete list show reclassify rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;
