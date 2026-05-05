@@ -266,7 +266,32 @@ touched_other=$(printf '%s' "$touched_other" | sed '/^$/d' | sort -u)
 other_count=$(printf '%s\n' "$touched_other" | grep -c '[^[:space:]]' || true)
 other_count=${other_count:-0}
 
-non_daily_total=$(( research_count + other_count ))
+# PreCompact raw envelopes touched in last 24h. Issue #582: hooks/pre-compact.py
+# routes through `bridge-memory.py capture`, which writes schema_version=1
+# JSON envelopes to <agent_home>/raw/captures/inbox/. Until this loop existed,
+# those captures landed on disk and never reached `[librarian-ingest]`.
+# scripts/librarian-process-ingest.py::load_envelope already reads .json
+# captures and is idempotent (rejects duplicates by hash), so files inside the
+# 24h window can be re-enqueued safely across overlapping daily runs.
+#
+# Each AGENT_MEMORY_ROOTS entry has the shape `<agent_home>/memory`, so the
+# agent home root is the parent directory; the raw inbox lives one level over
+# at `<agent_home>/raw/captures/inbox`. Reusing the existing roots keeps both
+# the legacy and v2 enumeration paths in sync without inventing a new resolver.
+touched_raw=""
+for _root in "${AGENT_MEMORY_ROOTS[@]}"; do
+  _agent_home_dir="$(dirname -- "$_root")"
+  _raw_inbox="$_agent_home_dir/raw/captures/inbox"
+  [[ -d "$_raw_inbox" ]] || continue
+  while IFS= read -r _f; do
+    [[ -n "$_f" ]] && touched_raw+="$_f"$'\n'
+  done < <(find "$_raw_inbox" -type f \( -name '*.json' -o -name '*.md' \) -mtime -1 2>/dev/null)
+done
+touched_raw=$(printf '%s' "$touched_raw" | sed '/^$/d' | sort -u)
+raw_count=$(printf '%s\n' "$touched_raw" | grep -c '[^[:space:]]' || true)
+raw_count=${raw_count:-0}
+
+non_daily_total=$(( research_count + other_count + raw_count ))
 
 # Audit log — always written.
 {
@@ -287,6 +312,9 @@ non_daily_total=$(( research_count + other_count ))
   echo ""
   echo "### Other projects/shared/decisions ($other_count)"
   echo "$touched_other" | while read -r f; do [ -n "$f" ] && echo "- $f"; done
+  echo ""
+  echo "### Raw envelopes ($raw_count)"
+  echo "$touched_raw" | while read -r f; do [ -n "$f" ] && echo "- $f"; done
 } > "$LOG"
 
 # Queue librarian task only for non-daily work. Lane A already handled
@@ -311,4 +339,4 @@ if [ "$copy_rc" -eq 0 ] && [ "$copy_errors" = "0" ]; then
   write_watermark_atomic "$DATE" || true
 fi
 
-echo "wiki-daily-ingest: date=$DATE since=$YESTERDAY lane-a ${copy_summary} lane-b research=$research_count other=$other_count total=$non_daily_total log=$LOG"
+echo "wiki-daily-ingest: date=$DATE since=$YESTERDAY lane-a ${copy_summary} lane-b research=$research_count other=$other_count raw=$raw_count total=$non_daily_total log=$LOG"
