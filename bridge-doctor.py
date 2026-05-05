@@ -14,6 +14,10 @@ Detectors:
 - abnormal-session-pane    : tmux pane scrollback matches login/trust/blocker UI patterns
                              (placeholder — emits detector-error until pattern reuse from
                              bridge-stall.py is factored cleanly; see PR notes)
+- daemon-log-split         : BRIDGE_DAEMON_LOG frozen while launchagent.log is active (#590)
+- orphan-agent-dir         : directories under $BRIDGE_AGENT_HOME_ROOT that are not in
+                             `agent registry --json` (#598 Track 2). Report-only;
+                             emits a manual quarantine recipe in suggested_action.
 
 Read-only contract: the CLI never mutates queue/state/tmux. `suggested_action`
 is a string the admin agent LLM parses and decides whether to execute.
@@ -42,7 +46,27 @@ DETECTOR_KINDS = (
     "cold-restart-suspect",
     "abnormal-session-pane",
     "daemon-log-split",
+    "orphan-agent-dir",
 )
+
+
+# Issue #598 Track 2: directories under $BRIDGE_AGENT_HOME_ROOT whose
+# basename starts with one of these prefixes (or ends with `-repro-<digits>`)
+# are flagged `is_test_artifact: true` so the operator can triage in one
+# pass. Mirrors lib/bridge-core.sh:BRIDGE_TEST_ARTIFACT_PREFIXES (Track 4)
+# — keep the two lists in lockstep.
+ORPHAN_TEST_ARTIFACT_PREFIXES = (
+    "smoke-",
+    "test-",
+    "bootstrap-",
+    "created-agent-",
+    "pref-",
+)
+ORPHAN_TEST_ARTIFACT_REPRO_REGEX = re.compile(r"-repro-\d+$")
+
+# Directory basenames under $BRIDGE_AGENT_HOME_ROOT that are bridge-managed
+# infrastructure rather than per-agent homes; the detector skips them.
+ORPHAN_SKIP_NAMES = frozenset({"_template", "shared"})
 
 
 def iso_now() -> str:
@@ -62,6 +86,24 @@ def resolve_state_dir(arg_value: str | None) -> Path:
     home = os.environ.get("BRIDGE_HOME", "").strip()
     base = Path(home).expanduser() if home else (Path.home() / ".agent-bridge")
     return base / "state"
+
+
+def resolve_agent_home_root(arg_value: str | None) -> Path:
+    """Resolve `BRIDGE_AGENT_HOME_ROOT` for the orphan-agent-dir detector.
+
+    Mirrors `lib/bridge-agents.sh`: arg > $BRIDGE_AGENT_HOME_ROOT >
+    $BRIDGE_HOME/agents > ~/.agent-bridge/agents. Does not require the
+    directory to exist; the detector itself handles the missing-dir case
+    (graceful skip, no findings).
+    """
+    if arg_value:
+        return Path(arg_value).expanduser()
+    explicit = os.environ.get("BRIDGE_AGENT_HOME_ROOT", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    home = os.environ.get("BRIDGE_HOME", "").strip()
+    base = Path(home).expanduser() if home else (Path.home() / ".agent-bridge")
+    return base / "agents"
 
 
 def resolve_task_db(arg_value: str | None, state_dir: Path) -> Path:
@@ -133,6 +175,63 @@ def load_agent_list(args: argparse.Namespace) -> list[dict[str, Any]]:
         raise SystemExit(f"agent-bridge agent list --json: invalid JSON ({exc})") from exc
     if not isinstance(data, list):
         raise SystemExit("agent-bridge agent list --json: expected JSON array")
+    return data
+
+
+def load_agent_registry(args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Load the agent registry snapshot via `agent-bridge agent registry --json`.
+
+    Issue #598 Track 1 (PR #603) added the registry endpoint that exposes
+    static + dynamic + system ids together with provenance. The orphan
+    detector subtracts this set from the `BRIDGE_AGENT_HOME_ROOT` listing to
+    decide what is unowned.
+
+    Tests inject `--agent-registry-json <file>` to skip the subprocess.
+    """
+    if args.agent_registry_json:
+        path = Path(args.agent_registry_json).expanduser()
+        if not path.is_file():
+            raise SystemExit(f"--agent-registry-json file not found: {path}")
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, list):
+            raise SystemExit("--agent-registry-json must contain a JSON array")
+        return data
+
+    binary = args.agent_bridge or os.environ.get("BRIDGE_AGENT_BRIDGE_BIN", "").strip()
+    if not binary:
+        sibling = Path(__file__).resolve().parent / "agent-bridge"
+        if sibling.is_file():
+            binary = str(sibling)
+        else:
+            located = shutil.which("agent-bridge")
+            if not located:
+                raise SystemExit(
+                    "agent-bridge binary not found; pass --agent-bridge or "
+                    "--agent-registry-json"
+                )
+            binary = located
+
+    try:
+        proc = subprocess.run(
+            [binary, "agent", "registry", "--json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(
+            f"agent-bridge agent registry --json failed (rc={exc.returncode}): "
+            f"{(exc.stderr or '').strip()}"
+        ) from exc
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(
+            f"agent-bridge agent registry --json: invalid JSON ({exc})"
+        ) from exc
+    if not isinstance(data, list):
+        raise SystemExit("agent-bridge agent registry --json: expected JSON array")
     return data
 
 
@@ -564,6 +663,205 @@ def detect_daemon_log_split(
     return findings
 
 
+def _is_test_artifact_name(name: str) -> bool:
+    for prefix in ORPHAN_TEST_ARTIFACT_PREFIXES:
+        if name.startswith(prefix):
+            return True
+    return bool(ORPHAN_TEST_ARTIFACT_REPRO_REGEX.search(name))
+
+
+def _best_effort_dir_size(path: Path) -> int | None:
+    """Walk `path` and sum file sizes. Returns None if the walk cannot start.
+
+    Best-effort: errors on individual entries (permission denied on a single
+    subdir) are swallowed so the detector still reports the orphan rather
+    than crashing. A None return signals the operator that size_bytes could
+    not be computed at all (top-level directory is unreadable).
+    """
+    total = 0
+    try:
+        iterator = os.walk(path, onerror=lambda _e: None)
+    except OSError:
+        return None
+    saw_anything = False
+    for root, _dirs, files in iterator:
+        saw_anything = True
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            try:
+                total += os.path.getsize(fpath)
+            except OSError:
+                continue
+    if not saw_anything:
+        # os.walk yielded nothing — either the path is unreadable or empty.
+        # Distinguish: if path is a readable directory we report 0; otherwise
+        # signal failure with None.
+        try:
+            if not os.access(path, os.R_OK | os.X_OK):
+                return None
+        except OSError:
+            return None
+        return 0
+    return total
+
+
+def _best_effort_last_active(path: Path) -> float | None:
+    """Latest mtime under `path/{raw,memory,state}` recursively, fallback to
+    the dir mtime. Returns None if even the dir mtime cannot be read."""
+    candidates: list[float] = []
+    for sub in ("raw", "memory", "state"):
+        sub_path = path / sub
+        if not sub_path.is_dir():
+            continue
+        try:
+            for root, _dirs, files in os.walk(sub_path, onerror=lambda _e: None):
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    try:
+                        candidates.append(os.path.getmtime(fpath))
+                    except OSError:
+                        continue
+                # Also consider the dir mtime so empty subtrees still count.
+                try:
+                    candidates.append(os.path.getmtime(root))
+                except OSError:
+                    continue
+        except OSError:
+            continue
+    if candidates:
+        return max(candidates)
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def _format_size(size_bytes: int) -> str:
+    if size_bytes < 1024:
+        return f"{size_bytes}B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        size_bytes /= 1024  # type: ignore[assignment]
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f}{unit}"
+    return f"{size_bytes:.1f}PB"
+
+
+def _iso_from_epoch(epoch: float | None) -> str:
+    if epoch is None:
+        return ""
+    try:
+        return (
+            datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+            .astimezone()
+            .isoformat(timespec="seconds")
+        )
+    except (OSError, ValueError, OverflowError):
+        return ""
+
+
+def detect_orphan_agent_dir(
+    registry: list[dict[str, Any]],
+    home_root: Path,
+    ts: str,
+) -> list[dict[str, Any]]:
+    """Issue #598 Track 2: surface directories under $BRIDGE_AGENT_HOME_ROOT
+    that are not registered in `agent registry --json`.
+
+    Report-only. Each finding includes a manual quarantine recipe in
+    `suggested_action` (the eventual `agent retire` primitive — Track 3 —
+    will replace the recipe when it lands). Test-artifact prefixes get
+    `evidence.is_test_artifact = true` so an operator can triage in one
+    pass.
+    """
+    findings: list[dict[str, Any]] = []
+    if not home_root.is_dir():
+        return findings
+
+    known: set[str] = set()
+    for row in registry:
+        if not isinstance(row, dict):
+            continue
+        agent_id = str(row.get("id") or "").strip()
+        if agent_id:
+            known.add(agent_id)
+
+    try:
+        entries = sorted(home_root.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return findings
+
+    for entry in entries:
+        name = entry.name
+        if name in ORPHAN_SKIP_NAMES:
+            continue
+        if name.startswith(".claude") or name.startswith("."):
+            continue
+        # Per spec: match by basename, not by `home` equality (dynamic agents
+        # can place their workdir anywhere). The registry `id` IS the
+        # directory basename for any home-root-resident agent.
+        if name in known:
+            continue
+        if not entry.is_dir():
+            continue
+        # Skip symlinks that don't point at an actual agent home (live
+        # `shared/` link, stale convenience symlinks). A dir-shaped symlink
+        # whose target is a real directory is still walked — that's the
+        # `--prefer new` worktree case where the agent home is a real dir.
+        try:
+            if entry.is_symlink():
+                resolved = entry.resolve(strict=False)
+                if not resolved.is_dir():
+                    continue
+        except OSError:
+            continue
+
+        try:
+            dir_mtime = os.path.getmtime(entry)
+        except OSError:
+            dir_mtime = None
+        size_bytes = _best_effort_dir_size(entry)
+        last_active = _best_effort_last_active(entry)
+        is_test_artifact = _is_test_artifact_name(name)
+
+        evidence: dict[str, Any] = {
+            "dir": str(entry),
+            "mtime": _iso_from_epoch(dir_mtime),
+            "last_active_at": _iso_from_epoch(last_active),
+            "is_test_artifact": is_test_artifact,
+            "registry_checked": "agent registry --json",
+        }
+        if size_bytes is not None:
+            evidence["size_bytes"] = int(size_bytes)
+        size_human = _format_size(size_bytes) if size_bytes is not None else "unknown"
+        mtime_iso = evidence["mtime"] or "unknown"
+        # NOTE: Track 3's `agent retire <name> [--purge-home]` will replace
+        # the manual recipe below. Until then, recommend a quarantine move
+        # so the operator preserves the dir for postmortem and the orphan
+        # set drops out of the next doctor run.
+        suggested = (
+            f"Orphan agent dir at {entry} (size {size_human}, mtime {mtime_iso}). "
+            "Not registered in `agent registry --json`. Manual quarantine: "
+            f'mv "{entry}" '
+            f'"$BRIDGE_HOME/archive/orphans-$(date +%Y%m%d-%H%M%S)-{name}". '
+            "If this is a test artifact (smoke-/test-/bootstrap-/"
+            "created-agent-/pref-/*-repro-N), confirm via "
+            "`--detectors orphan-agent-dir --json | jq` and quarantine in "
+            "batch. `agent retire` (issue #598 Track 3) will replace this "
+            "manual recipe when it lands."
+        )
+
+        findings.append(
+            {
+                "ts": ts,
+                "kind": "orphan-agent-dir",
+                "agent": name,
+                "evidence": evidence,
+                "suggested_action": suggested,
+            }
+        )
+    return findings
+
+
 # --- rendering -------------------------------------------------------------
 
 
@@ -636,6 +934,23 @@ def main() -> int:
         help=(
             "Override the Claude transcripts root for cold-restart-suspect "
             "(default: ~/.claude/projects)."
+        ),
+    )
+    parser.add_argument(
+        "--agent-registry-json",
+        default=None,
+        help=(
+            "Path to a JSON file with `agent-bridge agent registry --json` "
+            "output. Used by tests to skip the subprocess (Issue #598 Track 2)."
+        ),
+    )
+    parser.add_argument(
+        "--agent-home-root",
+        default=None,
+        help=(
+            "Override BRIDGE_AGENT_HOME_ROOT (default: env / "
+            "$BRIDGE_HOME/agents / ~/.agent-bridge/agents). Used by the "
+            "orphan-agent-dir detector."
         ),
     )
     args = parser.parse_args()
@@ -738,6 +1053,32 @@ def main() -> int:
     if conn is not None:
         conn.close()
 
+    # Issue #598 Track 2: lazy-load `agent registry --json` only when the
+    # orphan-agent-dir detector is enabled. The detector closure captures
+    # the deferred loader so a registry failure surfaces as a per-detector
+    # detector-error rather than failing the whole doctor run.
+    enabled_set_pre = set(enabled)
+    home_root = resolve_agent_home_root(args.agent_home_root)
+    if "orphan-agent-dir" in enabled_set_pre:
+        try:
+            registry = load_agent_registry(args)
+        except SystemExit as exc:
+            registry = []
+            findings.append(
+                {
+                    "ts": ts,
+                    "kind": "detector-error",
+                    "agent": "",
+                    "evidence": {
+                        "detector": "orphan-agent-dir",
+                        "error": str(exc),
+                    },
+                    "suggested_action": "",
+                }
+            )
+    else:
+        registry = []
+
     abnormal_explicit = bool(args.detectors)
     detector_runs: list[tuple[str, Any]] = [
         (
@@ -759,6 +1100,10 @@ def main() -> int:
         (
             "daemon-log-split",
             lambda: detect_daemon_log_split(state_dir, ts),
+        ),
+        (
+            "orphan-agent-dir",
+            lambda: detect_orphan_agent_dir(registry, home_root, ts),
         ),
     ]
 
