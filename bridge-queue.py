@@ -265,6 +265,14 @@ def init_db(conn: sqlite3.Connection) -> None:
         ensure_column(conn, "agent_state", "last_nudge_key", "TEXT")
         ensure_column(conn, "agent_state", "nudge_fail_count", "INTEGER NOT NULL DEFAULT 0")
         ensure_column(conn, "agent_state", "zombie", "INTEGER NOT NULL DEFAULT 0")
+        # Issue #589: prompt-ready latch columns. The daemon writes these
+        # via cmd_daemon_step from the session snapshot. The auto-stop
+        # idle anchor in print_summary uses prompt_ready_ts in preference
+        # to session_activity_ts so the boot window is not counted as
+        # idle time.
+        ensure_column(conn, "agent_state", "prompt_ready_ts", "INTEGER")
+        ensure_column(conn, "agent_state", "prompt_ready_session", "TEXT")
+        ensure_column(conn, "agent_state", "prompt_ready_source", "TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assigned_status ON tasks(assigned_to, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_claimed_status ON tasks(claimed_by, status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_lease ON tasks(status, lease_until_ts)")
@@ -521,7 +529,10 @@ def agent_summary_rows(conn: sqlite3.Connection, agents: Iterable[str] | None) -
           agent_state.zombie,
           COALESCE(agent_state.session, '') AS session,
           COALESCE(agent_state.engine, '') AS engine,
-          COALESCE(agent_state.workdir, '') AS workdir
+          COALESCE(agent_state.workdir, '') AS workdir,
+          agent_state.prompt_ready_ts,
+          COALESCE(agent_state.prompt_ready_session, '') AS prompt_ready_session,
+          COALESCE(agent_state.prompt_ready_source, '') AS prompt_ready_source
         FROM agent_names
         LEFT JOIN assigned ON assigned.agent = agent_names.agent
         LEFT JOIN claimed ON claimed.agent = agent_names.agent
@@ -531,12 +542,75 @@ def agent_summary_rows(conn: sqlite3.Connection, agents: Iterable[str] | None) -
     return conn.execute(sql, params).fetchall()
 
 
+def _row_get(row: sqlite3.Row, key: str, default: object = None) -> object:
+    """Tolerantly read a column from a sqlite3.Row.
+
+    Older rows (or rows from queries that pre-date a column add) may not
+    expose newly added columns. Returning a default keeps the summary path
+    backward-compatible during the rolling upgrade.
+    """
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
+
+
+def _latched_idle_seconds(row: sqlite3.Row, current_ts: int) -> int:
+    """Compute auto-stop idle seconds with the prompt-ready latch (issue #589).
+
+    Effective anchor = max(session_activity_ts, prompt_ready_ts).
+    When no latch has fired yet AND the boot window is still within the
+    grace ceiling, idle is reported as 0 — the agent is still booting,
+    so it has no pending idle time. Past the grace window without a
+    latch, fall back to the legacy session_activity_ts anchor so a
+    misconfigured or stuck agent still ages out instead of staying alive
+    forever (worst-plausible-regression safety net per spec part D).
+
+    Operators can disable the latch entirely with
+    BRIDGE_DAEMON_IDLE_LATCH_DISABLED=1; in that case idle reverts to the
+    legacy session_activity_ts anchor.
+    """
+    activity_ts = int(_row_get(row, "session_activity_ts", 0) or 0)
+    last_seen_ts = int(_row_get(row, "last_seen_ts", 0) or 0)
+    legacy_anchor = activity_ts or last_seen_ts or 0
+
+    if os.environ.get("BRIDGE_DAEMON_IDLE_LATCH_DISABLED", "0") == "1":
+        if not legacy_anchor:
+            return -1
+        return max(0, current_ts - legacy_anchor)
+
+    prompt_ready_ts = int(_row_get(row, "prompt_ready_ts", 0) or 0)
+
+    try:
+        grace = int(os.environ.get("BRIDGE_IDLE_LATCH_GRACE_SECONDS", "3600"))
+    except ValueError:
+        grace = 3600
+    if grace < 0:
+        grace = 3600
+
+    if prompt_ready_ts:
+        # Latch already fired — anchor on whichever is newer (real activity
+        # post-prompt-ready, or the latch itself).
+        effective_anchor = max(legacy_anchor, prompt_ready_ts)
+        return max(0, current_ts - effective_anchor)
+
+    # No latch yet. If we're still within the boot grace window, suppress
+    # idle accumulation — the agent is booting, not idling.
+    if legacy_anchor and current_ts - legacy_anchor < grace:
+        return 0
+    if not legacy_anchor:
+        return -1
+    # Past the grace window without a latch. Fall back to legacy behavior
+    # so a stuck agent eventually times out.
+    return max(0, current_ts - legacy_anchor)
+
+
 def print_summary(rows: list[sqlite3.Row], fmt: str) -> None:
+    current_ts = now_ts()
     if fmt == "json":
         payload = []
         for row in rows:
-            activity_ts = row["session_activity_ts"] or row["last_seen_ts"] or 0
-            idle_seconds = max(0, now_ts() - int(activity_ts)) if activity_ts else -1
+            idle_seconds = _latched_idle_seconds(row, current_ts)
             payload.append(
                 {
                     "agent": str(row["agent"] or ""),
@@ -550,6 +624,8 @@ def print_summary(rows: list[sqlite3.Row], fmt: str) -> None:
                     "session": str(row["session"] or ""),
                     "engine": str(row["engine"] or ""),
                     "workdir": str(row["workdir"] or ""),
+                    "prompt_ready_ts": int(_row_get(row, "prompt_ready_ts", 0) or 0),
+                    "prompt_ready_source": str(_row_get(row, "prompt_ready_source", "") or ""),
                 }
             )
         print(json.dumps(payload, ensure_ascii=False))
@@ -557,8 +633,7 @@ def print_summary(rows: list[sqlite3.Row], fmt: str) -> None:
 
     if fmt == "tsv":
         for row in rows:
-            activity_ts = row["session_activity_ts"] or row["last_seen_ts"] or 0
-            idle_seconds = max(0, now_ts() - int(activity_ts)) if activity_ts else -1
+            idle_seconds = _latched_idle_seconds(row, current_ts)
             fields = [
                 row["agent"],
                 str(row["queued_count"]),
@@ -581,13 +656,12 @@ def print_summary(rows: list[sqlite3.Row], fmt: str) -> None:
 
     print("agent       queued  claimed  blocked  active  idle  session")
     for row in rows:
-        activity_ts = row["session_activity_ts"] or row["last_seen_ts"] or 0
-        idle_seconds = max(0, now_ts() - int(activity_ts)) if activity_ts else -1
+        idle_seconds = _latched_idle_seconds(row, current_ts)
         idle_label = "-" if idle_seconds < 0 else f"{idle_seconds}s"
         print(
             f"{row['agent']:<10} {row['queued_count']:>6}  {row['claimed_count']:>7}  "
             f"{row['blocked_count']:>7}  {row['active']:>6}  {idle_label:>5}  {row['session'] or '-'}"
-    )
+        )
 
 
 def maybe_cancel_cron_run(task: sqlite3.Row, current_ts: int) -> None:
@@ -1660,11 +1734,20 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
         for row in snapshot_rows:
             active = 1 if str(row.get("active", "0")) == "1" else 0
             activity_ts = int(row.get("session_activity_ts") or 0)
+            # Issue #589: prompt-ready latch propagation. The bash side writes
+            # marker files; bridge_write_agent_snapshot mirrors them into the
+            # snapshot row so we can upsert here. None values keep the column
+            # NULL when no marker exists — _latched_idle_seconds treats that
+            # as "no latch yet" and falls through to the grace window logic.
+            prompt_ready_ts = int(row.get("prompt_ready_ts") or 0)
+            prompt_ready_session = str(row.get("prompt_ready_session") or "")
+            prompt_ready_source = str(row.get("prompt_ready_source") or "")
             conn.execute(
                 """
                 INSERT INTO agent_state (
-                  agent, engine, session, workdir, active, last_seen_ts, last_heartbeat_ts, session_activity_ts
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                  agent, engine, session, workdir, active, last_seen_ts, last_heartbeat_ts, session_activity_ts,
+                  prompt_ready_ts, prompt_ready_session, prompt_ready_source
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(agent) DO UPDATE SET
                   engine = excluded.engine,
                   session = excluded.session,
@@ -1672,7 +1755,10 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
                   active = excluded.active,
                   last_seen_ts = excluded.last_seen_ts,
                   last_heartbeat_ts = excluded.last_heartbeat_ts,
-                  session_activity_ts = excluded.session_activity_ts
+                  session_activity_ts = excluded.session_activity_ts,
+                  prompt_ready_ts = excluded.prompt_ready_ts,
+                  prompt_ready_session = excluded.prompt_ready_session,
+                  prompt_ready_source = excluded.prompt_ready_source
                 """,
                 (
                     row["agent"],
@@ -1683,6 +1769,9 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
                     current_ts if active else None,
                     current_ts,
                     activity_ts or None,
+                    prompt_ready_ts or None,
+                    prompt_ready_session or None,
+                    prompt_ready_source or None,
                 ),
             )
 

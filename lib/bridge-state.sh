@@ -1894,6 +1894,111 @@ bridge_agent_manual_stop_file() {
   printf '%s/manual-stop' "$(bridge_agent_idle_marker_dir "$agent")"
 }
 
+# Issue #589: prompt-ready latch.
+# Records when an agent's tmux session first reached a usable Claude/Codex
+# prompt during the current session. The auto-stop idle anchor in
+# bridge-queue.py reads this so the boot window is not mis-attributed as
+# idle time. The marker is sourceable env-var format so both shell and
+# python (via shlex) callers can consume it without parsing complexity.
+# Format:
+#   PROMPT_READY_TS=<epoch-seconds>
+#   PROMPT_READY_SESSION=<tmux session id at latch time>
+#   PROMPT_READY_ENGINE=<claude|codex|...>
+#   PROMPT_READY_SOURCE=<send-path|daemon-poll>
+bridge_agent_prompt_ready_file() {
+  local agent="$1"
+  printf '%s/prompt-ready.env' "$(bridge_agent_runtime_state_dir "$agent")"
+}
+
+bridge_agent_note_prompt_ready() {
+  # Usage: bridge_agent_note_prompt_ready <agent> <source>
+  local agent="$1"
+  local source_label="${2:-send-path}"
+  local file=""
+  local dir=""
+  local engine=""
+  local session=""
+  local ts=""
+
+  [[ -n "$agent" ]] || return 1
+  # Kill switch (#589): operators can disable the latch entirely if it ever
+  # backfires in production; absent the latch, idle counter falls back to
+  # session_activity_ts as before.
+  if [[ "${BRIDGE_DAEMON_IDLE_LATCH_DISABLED:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  file="$(bridge_agent_prompt_ready_file "$agent")"
+  dir="$(dirname "$file")"
+  engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+  session="$(bridge_agent_session "$agent" 2>/dev/null || true)"
+  ts="$(date +%s)"
+  mkdir -p "$dir"
+
+  # Idempotency: if a marker already exists for the current session, don't
+  # overwrite it. The latch is a one-shot per session — we want the first
+  # observed prompt-ready, not the most recent. send-path and daemon-poll
+  # both call this on every cycle; keeping the original timestamp matters
+  # for accurate boot-window measurement.
+  if [[ -f "$file" ]]; then
+    local existing_session=""
+    # shellcheck disable=SC1090
+    existing_session="$(grep '^PROMPT_READY_SESSION=' "$file" 2>/dev/null | head -n1 | cut -d= -f2-)"
+    if [[ -n "$existing_session" && "$existing_session" == "$session" ]]; then
+      return 0
+    fi
+  fi
+
+  {
+    printf 'PROMPT_READY_TS=%s\n' "$ts"
+    printf 'PROMPT_READY_SESSION=%s\n' "$session"
+    printf 'PROMPT_READY_ENGINE=%s\n' "$engine"
+    printf 'PROMPT_READY_SOURCE=%s\n' "$source_label"
+  } >"$file"
+}
+
+bridge_agent_prompt_ready_epoch() {
+  # Usage: bridge_agent_prompt_ready_epoch <agent>
+  # Prints the epoch when the agent's current session first reached prompt-
+  # ready, or "0" if no marker exists / the marker is stale (different
+  # session id than the agent's currently-recorded session). Stale-session
+  # validation prevents a leftover marker from a prior tmux session leaking
+  # into a fresh boot window.
+  local agent="$1"
+  local file=""
+  local current_session=""
+  local marker_session=""
+  local marker_ts=""
+
+  [[ -n "$agent" ]] || { printf '0'; return 0; }
+  file="$(bridge_agent_prompt_ready_file "$agent")"
+  if [[ ! -f "$file" ]]; then
+    printf '0'
+    return 0
+  fi
+
+  marker_ts="$(grep '^PROMPT_READY_TS=' "$file" 2>/dev/null | head -n1 | cut -d= -f2-)"
+  marker_session="$(grep '^PROMPT_READY_SESSION=' "$file" 2>/dev/null | head -n1 | cut -d= -f2-)"
+  current_session="$(bridge_agent_session "$agent" 2>/dev/null || true)"
+
+  [[ "$marker_ts" =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+  if [[ -n "$current_session" && -n "$marker_session" && "$marker_session" != "$current_session" ]]; then
+    printf '0'
+    return 0
+  fi
+
+  printf '%s' "$marker_ts"
+}
+
+bridge_agent_clear_prompt_ready() {
+  local agent="$1"
+  local file=""
+
+  [[ -n "$agent" ]] || return 0
+  file="$(bridge_agent_prompt_ready_file "$agent")"
+  rm -f "$file" 2>/dev/null || true
+}
+
 bridge_agent_memory_daily_refresh_file() {
   local agent="$1"
   printf '%s/session-refresh.env' "$(bridge_agent_runtime_state_dir "$agent")"
@@ -2858,9 +2963,17 @@ bridge_write_agent_snapshot() {
   local active
   local session
   local activity
+  local prompt_ready_ts
+  local prompt_ready_session
+  local prompt_ready_source
+  local prompt_ready_file
 
   {
-    echo -e "agent\tengine\tsession\tworkdir\tactive\tsession_activity_ts"
+    # Issue #589: extended snapshot format adds three trailing columns for
+    # the prompt-ready latch (timestamp, session-id, source). Older daemon
+    # consumers that read only the first six columns are unaffected; the
+    # python upsert path uses .get() with default empty for the new keys.
+    echo -e "agent\tengine\tsession\tworkdir\tactive\tsession_activity_ts\tprompt_ready_ts\tprompt_ready_session\tprompt_ready_source"
     for agent in "${BRIDGE_AGENT_IDS[@]}"; do
       active=0
       session="$(bridge_agent_session "$agent")"
@@ -2870,7 +2983,26 @@ bridge_write_agent_snapshot() {
         activity="$(bridge_tmux_session_activity_ts "$session")"
       fi
 
-      echo -e "${agent}\t$(bridge_agent_engine "$agent")\t${session}\t$(bridge_agent_workdir "$agent")\t${active}\t${activity}"
+      prompt_ready_ts=""
+      prompt_ready_session=""
+      prompt_ready_source=""
+      prompt_ready_file="$(bridge_agent_prompt_ready_file "$agent")"
+      if [[ -f "$prompt_ready_file" ]]; then
+        prompt_ready_ts="$(grep '^PROMPT_READY_TS=' "$prompt_ready_file" 2>/dev/null | head -n1 | cut -d= -f2-)"
+        prompt_ready_session="$(grep '^PROMPT_READY_SESSION=' "$prompt_ready_file" 2>/dev/null | head -n1 | cut -d= -f2-)"
+        prompt_ready_source="$(grep '^PROMPT_READY_SOURCE=' "$prompt_ready_file" 2>/dev/null | head -n1 | cut -d= -f2-)"
+        # Stale-session guard: if the marker session id doesn't match the
+        # agent's current session, drop the latch values. The python path
+        # would compute the same suppression but only if it had access to
+        # the live session id, which it doesn't.
+        if [[ -n "$prompt_ready_session" && -n "$session" && "$prompt_ready_session" != "$session" ]]; then
+          prompt_ready_ts=""
+          prompt_ready_session=""
+          prompt_ready_source=""
+        fi
+      fi
+
+      echo -e "${agent}\t$(bridge_agent_engine "$agent")\t${session}\t$(bridge_agent_workdir "$agent")\t${active}\t${activity}\t${prompt_ready_ts}\t${prompt_ready_session}\t${prompt_ready_source}"
     done
   } >"$file"
 }

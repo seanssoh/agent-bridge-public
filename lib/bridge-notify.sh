@@ -255,6 +255,20 @@ bridge_dispatch_notification() {
       fi
       if ! bridge_claude_session_can_wake "$agent" "$session"; then
         if ! bridge_claude_session_try_mark_prompt_ready "$agent" "$session"; then
+          # Issue #589 Part B: the session exists but the wake-channel marker
+          # has not been written yet (Claude is still booting). Today this
+          # branch returns 2, the daemon treats it as a soft skip, and the
+          # nudge is dropped — the original task stays queued and 547+ of
+          # these warnings can accumulate over a 16-min boot. Spool the
+          # payload so the daemon's flush loop re-delivers it once the
+          # session reaches the prompt. Returning 0 here marks the dispatch
+          # as successful for `nudge_agent_session`'s last_nudge_key dup-
+          # suppression, so the same queued task ids do not produce repeat
+          # spool entries on every 5s tick.
+          if bridge_tmux_spool_enabled "$agent"; then
+            bridge_tmux_pending_attention_append "$agent" "$text"
+            return 0
+          fi
           return 2
         fi
       fi

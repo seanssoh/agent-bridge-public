@@ -2838,6 +2838,67 @@ PY
   daemon_info "nudged ${agent} (queued=${live_queued}, claimed=${live_claimed}, idle=${idle}s)"
 }
 
+reconcile_prompt_ready_latches() {
+  # Issue #589: daemon-poll branch of the prompt-ready latch (Option C).
+  # During each sync cycle, for each active agent without a recorded
+  # prompt-ready marker, capture the recent pane text and check whether
+  # the engine's prompt is showing. If so, write the latch via the
+  # daemon-poll source label so the auto-stop idle anchor in
+  # bridge-queue.py:_latched_idle_seconds can use it. This is the
+  # fallback for agents that booted but haven't received an inject yet
+  # (so the send-path latch hasn't fired).
+  #
+  # Audit volume note (Open Q3): only the daemon-poll path emits an
+  # audit row. The send-path latch fires on every successful inject, so
+  # auditing it would inflate volume on a healthy install — and the
+  # consumer side (auto-stop decision) is already audited separately.
+  local agent
+  local engine
+  local session
+  local recent
+  local existing
+  local marker_file
+
+  if [[ "${BRIDGE_DAEMON_IDLE_LATCH_DISABLED:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+    engine="$(bridge_agent_engine "$agent")"
+    [[ -n "$engine" ]] || continue
+    # The latch is only meaningful for engines that have a prompt concept;
+    # bridge_tmux_engine_requires_prompt covers claude/codex and returns
+    # success (0) for engines that don't require a prompt — skip those.
+    if bridge_tmux_engine_requires_prompt "$engine"; then
+      :
+    else
+      continue
+    fi
+    session="$(bridge_agent_session "$agent")"
+    [[ -n "$session" ]] || continue
+    bridge_tmux_session_exists "$session" || continue
+
+    marker_file="$(bridge_agent_prompt_ready_file "$agent")"
+    if [[ -f "$marker_file" ]]; then
+      existing="$(grep '^PROMPT_READY_SESSION=' "$marker_file" 2>/dev/null | head -n1 | cut -d= -f2-)"
+      if [[ -n "$existing" && "$existing" == "$session" ]]; then
+        # Already latched for this session — nothing to do.
+        continue
+      fi
+    fi
+
+    recent="$(bridge_capture_recent "$session" 20 2>/dev/null || true)"
+    [[ -n "$recent" ]] || continue
+    if bridge_tmux_session_has_prompt_from_text "$engine" "$recent"; then
+      bridge_agent_note_prompt_ready "$agent" daemon-poll || true
+      bridge_audit_log daemon prompt_ready_latched "$agent" \
+        --detail engine="$engine" \
+        --detail session="$session" \
+        --detail source=daemon-poll
+    fi
+  done
+}
+
 flush_pending_attention_spools() {
   # Issue #132a: per-sync-pass flush of the per-agent pending-attention spool.
   # Covers every engine that the tmux inject gate applies to (claude + codex)
@@ -4437,6 +4498,11 @@ cmd_sync_cycle() {
   bridge_reconcile_idle_markers || true
   BRIDGE_DAEMON_LAST_STEP="bootstrap_recovery"
   recover_claude_bootstrap_blockers || true
+  # Issue #589: prompt-ready latch reconciliation runs BEFORE the
+  # attention-spool flush so an agent whose prompt just became visible
+  # gets latched and its spooled wakes drain in the same sync tick.
+  BRIDGE_DAEMON_LAST_STEP="prompt_ready_reconcile"
+  reconcile_prompt_ready_latches || true
   BRIDGE_DAEMON_LAST_STEP="attention_flush"
   flush_pending_attention_spools || true
   BRIDGE_DAEMON_LAST_STEP="channel_health"

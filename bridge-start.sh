@@ -420,6 +420,10 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
 fi
 
 bridge_agent_clear_idle_marker "$AGENT"
+# Issue #589: clear prompt-ready latch from any prior session. The marker
+# is per-session; once the new session boots and its tmux pane reaches the
+# Claude/Codex prompt, send-path or daemon-poll will rewrite it.
+bridge_agent_clear_prompt_ready "$AGENT"
 
 # #256 Gap 2: an explicit operator start/safe-mode here is the documented
 # way out of a rapid-fail quarantine. Clear the broken-launch marker only
