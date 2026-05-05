@@ -97,6 +97,16 @@ def _agent_home() -> Path | None:
     env_home = os.environ.get("BRIDGE_AGENT_HOME")
     if env_home:
         return Path(env_home)
+    # Issue #582 r2: under v2 layout, bridge-run.sh exports BRIDGE_AGENT_WORKDIR
+    # (not BRIDGE_AGENT_HOME). The v2 workdir is the agent's effective home for
+    # raw/captures/inbox/ writes — and it matches what wiki-daily-ingest.sh's
+    # raw enumeration walks (`<workdir>/raw/captures/inbox`). Without this
+    # fallback, v2 PreCompact envelopes land under <BRIDGE_HOME>/agents/<agent>/
+    # while the enumeration looks under the workdir, so the daily report misses
+    # them. Preferring BRIDGE_AGENT_HOME first keeps legacy/v1 behavior intact.
+    env_workdir = os.environ.get("BRIDGE_AGENT_WORKDIR")
+    if env_workdir:
+        return Path(env_workdir)
     agent = _agent_id()
     if not agent:
         return None
