@@ -574,6 +574,7 @@ bridge_reset_roster_maps() {
   unset BRIDGE_AGENT_SKILLS
   unset BRIDGE_AGENT_ISOLATION_MODE BRIDGE_AGENT_OS_USER
   unset BRIDGE_AGENT_CLASS
+  unset BRIDGE_AGENT_PROVENANCE
 
   declare -g -a BRIDGE_AGENT_IDS=()
   declare -g -A BRIDGE_AGENT_DESC=()
@@ -615,6 +616,14 @@ bridge_reset_roster_maps() {
   # Operators opt agents into class=system in agent-roster.local.sh; the
   # public roster declares no system-class agents.
   declare -g -A BRIDGE_AGENT_CLASS=()
+  # Issue #598 Track 1: provenance tag set by each loader path so the
+  # registry endpoint can report which registry made the agent id known
+  # (`static-roster`, `dynamic-active-env`, `dynamic-history-live-session`,
+  # `dynamic-tmux-recovered`). Default-empty; consumers fall back to
+  # `static-roster` when the tag is missing — that matches the historical
+  # implicit behavior of any id present in BRIDGE_AGENT_IDS without a
+  # dynamic loader having claimed it.
+  declare -g -A BRIDGE_AGENT_PROVENANCE=()
   declare -g -a BRIDGE_CRON_ENQUEUE_FAMILIES=()
 }
 

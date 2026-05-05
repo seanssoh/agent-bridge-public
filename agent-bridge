@@ -61,7 +61,7 @@ Usage:
   $CLI_NAME bundle <create|show> ...
   $CLI_NAME intake <triage|show> ...
   $CLI_NAME wave <dispatch|list|show|templates|close-issue> ...
-  $CLI_NAME agent <create|update|list|show|reclassify|start|safe-mode|stop|restart|attach|compact|handoff> ...
+  $CLI_NAME agent <create|update|delete|list|registry|show|reclassify|start|safe-mode|stop|restart|attach|compact|handoff> ...
   $CLI_NAME kill <number|all>
   $CLI_NAME attach [number|name]
   $CLI_NAME urgent <agent> "<message>" [--wait <seconds>]
@@ -116,6 +116,7 @@ Usage:
   $CLI_NAME profile deploy <agent> [--dry-run] [--force]
   $CLI_NAME agent create <agent> [--engine claude|codex] [--session <name>] [--workdir <path>] [--always-on] [--dry-run] [--json]
   $CLI_NAME agent list [--json]
+  $CLI_NAME agent registry [--json]
   $CLI_NAME agent show <agent> [--json]
   $CLI_NAME agent reclassify [--agent <agent>] [--apply] [--json]
   $CLI_NAME agent start <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
@@ -197,6 +198,7 @@ Examples:
   $CLI_NAME kill all
   $CLI_NAME agent create reviewer --engine claude
   $CLI_NAME agent list --json
+  $CLI_NAME agent registry --json
   $CLI_NAME agent show reviewer --json
   $CLI_NAME agent reclassify --apply
   $CLI_NAME agent start reviewer --dry-run
