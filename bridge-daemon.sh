@@ -3811,42 +3811,26 @@ for k in keys:
     return 0
   fi
 
-  # Update EMA stats once per event_id. The completion-recorded flag prevents
-  # follow-up retries from re-incrementing the counter / re-blending the EMA
-  # when the send fails repeatedly (see r2 of #611). Compute duration locally
-  # so a skipped record-call still produces the right value for rendering.
+  # Stats mutation + per-event dedup flag are deferred until AFTER a successful
+  # follow-up send (see r3 of #611). Rationale: writing the flag and mutating
+  # precompact-stats.json before the send means a retry-loop on send failure
+  # would either re-blend the EMA (no flag yet) or skip stats entirely while
+  # the marker stays pending (flag already present). Both outcomes are wrong.
+  # The correct invariant is "stats + flag move iff send succeeded once",
+  # implemented by short-circuiting on the flag here and writing it inside
+  # the success branch below. Duration is computed locally so the followup
+  # body renders correctly even when stats have not yet been recorded.
   local recorded_flag_dir="$agent_state_dir/precompact-completion-recorded"
   local recorded_flag="$recorded_flag_dir/$pending_event_id.flag"
   local duration_secs=$(( completed_ts - pending_started_ts ))
   (( duration_secs >= 0 )) || duration_secs=0
 
-  if [[ ! -f "$recorded_flag" ]]; then
-    local stats_output=""
-    stats_output="$(bridge_with_timeout 10 precompact_stats_record python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" \
-      record-precompact-completion \
-      --agent "$agent" \
-      --trigger "$pending_trigger" \
-      --started-ts "$pending_started_ts" \
-      --completed-ts "$completed_ts" \
-      --bridge-state-dir "$BRIDGE_STATE_DIR" \
-      --format shell 2>/dev/null)" || stats_output=""
-
-    local PRECOMPACT_STATS_DURATION_SECONDS=""
-    local PRECOMPACT_STATS_EXPECTED_SECONDS=""
-    local PRECOMPACT_STATS_ALPHA=""
-    if [[ -n "$stats_output" ]]; then
-      # shellcheck disable=SC1090
-      source /dev/stdin <<<"$stats_output"
-    fi
-
-    if [[ "${PRECOMPACT_STATS_DURATION_SECONDS:-}" =~ ^[0-9]+$ ]]; then
-      duration_secs="$PRECOMPACT_STATS_DURATION_SECONDS"
-    fi
-
-    # Mark EMA as recorded for this event regardless of send outcome below;
-    # the stats file has already been mutated and a retry must not re-blend.
-    mkdir -p "$recorded_flag_dir" 2>/dev/null || true
-    : >"$recorded_flag" 2>/dev/null || true
+  if [[ -f "$recorded_flag" ]]; then
+    # Already processed this event_id (flag survives across retries). Tidy up
+    # any stale completed-marker copy and exit; pending JSON was archived to
+    # history at the time of the original successful send.
+    mv -f "$marker" "$processed_dir/$marker_basename" 2>/dev/null || true
+    return 0
   fi
 
   # Render the follow-up body.
@@ -3985,6 +3969,27 @@ if isinstance(data, dict):
   fi
 
   # Followup succeeded — finalize pending and archive history.
+  #
+  # Order matters for crash-restart correctness (see r3 of #611):
+  #   1. Write the per-event flag FIRST so a crash between flag and stats
+  #      leaves the flag present; the next sync short-circuits at the entry
+  #      block and never re-blends the EMA. Stats are slightly under-counted
+  #      by one sample in that narrow window, which is acceptable; double
+  #      counting is not.
+  #   2. Run record-precompact-completion to mutate precompact-stats.json.
+  #   3. Update the pending JSON in place, then archive + move the marker.
+  mkdir -p "$recorded_flag_dir" 2>/dev/null || true
+  : >"$recorded_flag" 2>/dev/null || true
+
+  bridge_with_timeout 10 precompact_stats_record python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" \
+    record-precompact-completion \
+    --agent "$agent" \
+    --trigger "$pending_trigger" \
+    --started-ts "$pending_started_ts" \
+    --completed-ts "$completed_ts" \
+    --bridge-state-dir "$BRIDGE_STATE_DIR" \
+    --format shell >/dev/null 2>&1 || true
+
   python3 -c '
 import json, sys
 path = sys.argv[1]

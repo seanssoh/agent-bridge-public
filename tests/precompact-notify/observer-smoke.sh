@@ -531,50 +531,52 @@ EOF
   pass "T7 BRIDGE_PRECOMPACT_NOTIFY_DISABLED=1 short-circuits the helper"
 }
 
-# -- T8: follow-up send failure does NOT inflate EMA across retries -----------
+# -- T8: stats + flag mutate iff follow-up send succeeds ----------------------
 #
-# Regression for r2 of #611: the original Track B observer recorded the EMA
-# sample BEFORE attempting the follow-up send and left the completed marker in
-# place on failure, so each retry sync re-entered record-precompact-completion
-# and re-blended the agent's EMA. The fix gates the EMA call behind a per
-# event_id flag under precompact-completion-recorded/. This test exercises the
-# repeated-failure case end-to-end by routing follow-up through the teams
-# adapter (which structurally returns track_c_pending) and asserts the agent's
-# stats sample count stays at exactly 1 across three retry cycles.
+# Regression for r3 of #611: the original Track B observer recorded the EMA
+# sample BEFORE attempting the follow-up send. r2 moved only the flag write,
+# leaving record-precompact-completion in place on every retry. The correct
+# invariant is "stats + flag advance iff the send succeeded once, ever".
+# This test drives that invariant by running:
+#   * 3 failure cycles (teams adapter → track_c_pending) — flag absent,
+#     EMA count stays at 0, marker stays in completed/.
+#   * 1 success cycle (discord adapter + dry-run) — flag written, EMA count
+#     becomes exactly 1, marker moves to processed/.
+#   * 1 sanity sync after success — nothing further happens; flag still
+#     present, stats unchanged, marker stays in processed/.
 
-t8_followup_failure_no_ema_inflation() {
+t8_followup_stats_iff_success() {
   local home="$ROOT/t8-home"
   local state_dir="$home/state"
   local agent="dev"
-  local plugin="teams"
   local channel_id="t8-channel"
 
   mkdir -p "$home" "$state_dir/agents/$agent"
   mkdir -p "$state_dir/precompact-events/$agent/completed"
 
+  # Roster fixture; same shape works for both adapters since the daemon picks
+  # plugin from the pending JSON, not from BRIDGE_AGENT_CHANNELS.
   cat >"$home/agent-env.sh" <<EOF
 declare -ga BRIDGE_AGENT_IDS=("$agent")
 declare -gA BRIDGE_AGENT_ENGINE=([${agent}]="claude")
 declare -gA BRIDGE_AGENT_SOURCE=([${agent}]="static")
-declare -gA BRIDGE_AGENT_CHANNELS=([${agent}]="plugin:${plugin}")
+declare -gA BRIDGE_AGENT_CHANNELS=([${agent}]="plugin:teams")
 declare -gA BRIDGE_AGENT_DESC=([${agent}]="t8 fixture")
 declare -gA BRIDGE_AGENT_SESSION=([${agent}]="$agent")
 declare -gA BRIDGE_AGENT_PRECOMPACT_NOTIFY=([${agent}]="1")
 EOF
 
-  # Synthesize a pending notice that points at the teams adapter (track_c_pending).
-  # We bypass the notice-send path so the failure scenario is purely the
-  # follow-up branch; dry_run is intentionally 0 so the followup hits the
-  # real adapter dispatcher and fails with a structured error.
+  # Pending notice using the teams adapter for cycles 1-3 (structural failure).
   local now_ts
   now_ts="$(date +%s)"
   local started_ts=$((now_ts - 60))
   local event_id="t8-event-1"
-  cat >"$state_dir/agents/$agent/precompact-notice-pending.json" <<EOF
+  local pending="$state_dir/agents/$agent/precompact-notice-pending.json"
+  cat >"$pending" <<EOF
 {
   "event_id": "$event_id",
   "agent": "$agent",
-  "plugin": "$plugin",
+  "plugin": "teams",
   "channel_id": "$channel_id",
   "reply_to_message_id": "",
   "notice_message_id": "notice-1",
@@ -588,9 +590,12 @@ EOF
 }
 EOF
 
-  # Drop a completed marker the daemon will pair with the pending notice.
+  # Single completed marker — the daemon should keep this in place across the
+  # failure cycles and only move it to processed/ on the success cycle.
   local completed_ts=$((started_ts + 30))
-  cat >"$state_dir/precompact-events/$agent/completed/${completed_ts}-1.json" <<EOF
+  local marker_basename="${completed_ts}-1.json"
+  local marker_path="$state_dir/precompact-events/$agent/completed/$marker_basename"
+  cat >"$marker_path" <<EOF
 {
   "schema_version": "1",
   "agent": "$agent",
@@ -601,7 +606,11 @@ EOF
 }
 EOF
 
-  # Helper: run one daemon sync cycle in an isolated env.
+  # Helper: run one daemon sync cycle in an isolated env. We deliberately do
+  # NOT set BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN here — pending JSON's dry_run
+  # field drives the dry-run flag instead, so cycles 1-3 hit the real teams
+  # adapter (track_c_pending → failure) and cycle 4 flips dry_run=true to
+  # force a clean dry-run success.
   local daemon_run='
     env -i \
       PATH="$PATH" HOME="$HOME" \
@@ -616,34 +625,78 @@ EOF
       bash "'"$DAEMON"'" sync >/dev/null 2>&1 || true
   '
 
-  # Run three sync cycles; the followup should fail every time.
+  local audit_log="$home/logs/audit.jsonl"
+  local flag="$state_dir/agents/$agent/precompact-completion-recorded/$event_id.flag"
+  local stats_file="$state_dir/precompact-stats.json"
+  local processed_marker="$state_dir/precompact-events/$agent/processed/$marker_basename"
+
+  # --- Cycles 1-3: failures (teams adapter, dry_run=false in JSON) -----------
   local i
   for i in 1 2 3; do
     eval "$daemon_run"
   done
 
-  # Pending must still be in place (within retry window).
-  if [[ ! -f "$state_dir/agents/$agent/precompact-notice-pending.json" ]]; then
-    fail "T8 expected pending notice to remain across retry cycles"
+  if [[ ! -f "$pending" ]]; then
+    fail "T8 expected pending notice to remain across failure cycles"
+    return
+  fi
+  if [[ ! -f "$marker_path" ]]; then
+    fail "T8 expected completed marker to stay in place across failure cycles"
+    return
+  fi
+  if [[ -f "$flag" ]]; then
+    fail "T8 flag must NOT exist after failure-only cycles" \
+         "$(ls -la "$state_dir/agents/$agent/precompact-completion-recorded" 2>/dev/null || true)"
+    return
+  fi
+  if [[ -f "$audit_log" ]] && ! grep -q precompact_followup_failed "$audit_log"; then
+    fail "T8 expected at least one precompact_followup_failed row after failures" \
+         "$(cat "$audit_log")"
+    return
+  fi
+  local count_before
+  count_before="$("$PYTHON" -c '
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    print(0); sys.exit(0)
+agent = data.get("agents", {}).get("dev", {})
+print(agent.get("count", 0))
+' "$stats_file" 2>/dev/null || echo 0)"
+  if [[ "$count_before" != "0" ]]; then
+    fail "T8 EMA count must be 0 after failure-only cycles; got $count_before" \
+         "$(cat "$stats_file" 2>/dev/null || echo no-stats)"
     return
   fi
 
-  # Audit log must contain at least one followup_failed row with a structured
-  # (non-send_failed) error_class.
-  local audit_log="$home/logs/audit.jsonl"
-  if [[ ! -f "$audit_log" ]]; then
-    fail "T8 expected audit log at $audit_log"
-    return
-  fi
-  if ! grep -q precompact_followup_failed "$audit_log"; then
-    fail "T8 expected at least one precompact_followup_failed row" "$(cat "$audit_log")"
-    return
-  fi
+  # --- Cycle 4: success (flip pending plugin to discord + dry-run) -----------
+  "$PYTHON" -c '
+import json, sys
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as fh:
+    data = json.load(fh)
+data["plugin"] = "discord"
+data["dry_run"] = True
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, ensure_ascii=False, indent=2)
+    fh.write("\n")
+' "$pending"
 
-  # Critical assertion: the EMA sample counter must be exactly 1, not 3.
-  # If it's >1 the EMA is double-counting on retry.
-  local count
-  count="$("$PYTHON" -c '
+  eval "$daemon_run"
+
+  if ! grep -q precompact_followup_sent "$audit_log"; then
+    fail "T8 expected precompact_followup_sent audit row after success cycle" \
+         "$(cat "$audit_log")"
+    return
+  fi
+  if [[ ! -f "$flag" ]]; then
+    fail "T8 flag must be present after success cycle" \
+         "$(ls -la "$state_dir/agents/$agent/precompact-completion-recorded" 2>/dev/null || true)"
+    return
+  fi
+  local count_after
+  count_after="$("$PYTHON" -c '
 import json, sys
 try:
     data = json.load(open(sys.argv[1]))
@@ -651,22 +704,62 @@ except Exception:
     print("missing"); sys.exit(0)
 agent = data.get("agents", {}).get("dev", {})
 print(agent.get("count", 0))
-' "$state_dir/precompact-stats.json" 2>/dev/null || echo missing)"
-  if [[ "$count" != "1" ]]; then
-    fail "T8 EMA count should be 1 across 3 retries; got $count" \
-         "$(cat "$state_dir/precompact-stats.json" 2>/dev/null || echo no-stats)"
+' "$stats_file" 2>/dev/null || echo missing)"
+  if [[ "$count_after" != "1" ]]; then
+    fail "T8 EMA count must be exactly 1 after success cycle; got $count_after" \
+         "$(cat "$stats_file" 2>/dev/null || echo no-stats)"
+    return
+  fi
+  if [[ -f "$marker_path" ]]; then
+    fail "T8 completed marker must move to processed/ after success cycle"
+    return
+  fi
+  if [[ ! -f "$processed_marker" ]]; then
+    fail "T8 expected processed marker at $processed_marker"
     return
   fi
 
-  # And the per-event flag should be present so subsequent retries skip the
-  # record-precompact-completion call.
-  local flag="$state_dir/agents/$agent/precompact-completion-recorded/$event_id.flag"
+  # --- Cycle 5: sanity (drop a duplicate completed marker; flag must short
+  # circuit and the stats must not be re-mutated) ----------------------------
+  local stray_marker="$state_dir/precompact-events/$agent/completed/${completed_ts}-stray.json"
+  cat >"$stray_marker" <<EOF
+{
+  "schema_version": "1",
+  "agent": "$agent",
+  "completed_ts": $completed_ts,
+  "completed_iso": "1970-01-01T00:00:00+00:00",
+  "hook_pid": 1,
+  "matcher": "compact"
+}
+EOF
+
+  eval "$daemon_run"
+
   if [[ ! -f "$flag" ]]; then
-    fail "T8 expected precompact-completion-recorded flag at $flag" \
-         "$(ls -la "$state_dir/agents/$agent/precompact-completion-recorded" 2>/dev/null || true)"
+    fail "T8 flag should still be present on sanity sync"
     return
   fi
-  pass "T8 follow-up retries do not inflate EMA (count stays at 1, flag present)"
+  if [[ -f "$stray_marker" ]]; then
+    fail "T8 stray marker should be archived to processed/ via flag short-circuit"
+    return
+  fi
+  local count_sanity
+  count_sanity="$("$PYTHON" -c '
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    print("missing"); sys.exit(0)
+agent = data.get("agents", {}).get("dev", {})
+print(agent.get("count", 0))
+' "$stats_file" 2>/dev/null || echo missing)"
+  if [[ "$count_sanity" != "1" ]]; then
+    fail "T8 EMA count must remain 1 after sanity sync; got $count_sanity" \
+         "$(cat "$stats_file" 2>/dev/null || echo no-stats)"
+    return
+  fi
+
+  pass "T8 stats + flag advance iff follow-up send succeeded (count=1 once, flag set on success only)"
 }
 
 # -- T9: structured error class preserved in audit ----------------------------
@@ -785,7 +878,7 @@ t4_send_dry_run
 t5_record_ema
 t6_observer_e2e
 t7_kill_switch
-t8_followup_failure_no_ema_inflation
+t8_followup_stats_iff_success
 t9_followup_error_class_preserved
 
 printf '\n[smoke][summary] passes=%d fails=%d\n' "$PASS" "$FAIL"
