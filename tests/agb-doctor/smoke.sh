@@ -22,6 +22,9 @@
 #                                               row; never a hard crash
 #   D5   --detectors stale-blocked-task       -> only that kind survives
 #   D6   daemon-level finding (agent="")      -> renders cleanly in table
+#   D7a  cold-restart-suspect, prior /exit    -> 0 findings (#588 clean exit)
+#   D7b  cold-restart-suspect, no exit marker -> 1 finding (real cold restart)
+#   D7c  cold-restart-suspect, prior /clear   -> 0 findings (#588 clean clear)
 #
 # Uses an isolated mktemp BRIDGE_HOME — never touches the live install.
 
@@ -337,6 +340,97 @@ if [[ "$out_d6_tbl" == *"detector-error"* ]] && [[ "$out_d6_tbl" == *"-"* ]]; th
 else
   fail "D6 table render did not contain expected fields: $out_d6_tbl"
 fi
+
+# --- D7: cold-restart-suspect clean-exit skip (#588) -------------------
+#
+# Each scenario builds:
+#   - $dir/workdir            — agent's workdir (slug = "-...workdir")
+#   - $dir/projects/<slug>/<current_sid>.jsonl  (stub, present so the
+#                                                detector sees current_present)
+#   - $dir/projects/<slug>/<prior_sid>.jsonl    (prior; mtime fresh; tail
+#                                                may or may not contain a
+#                                                clean-exit slash-command)
+#
+# The roster fixture pins workdir + session_id so the detector locates the
+# slug deterministically.
+
+# slug_for(workdir) — mirror workdir_slug_candidates() in bridge-doctor.py
+slug_for() {
+  printf '%s' "$1" | tr '/' '-'
+}
+
+# build_cold_restart_fixture <dir> <prior-tail>
+#   <dir>       — case dir; tasks.db + agents.json + projects/ live here
+#   <prior-tail>— bytes appended to the prior jsonl (use "" for no marker)
+build_cold_restart_fixture() {
+  local dir="$1"
+  local prior_tail="$2"
+  mkdir -p "$dir"
+  init_db "$dir/tasks.db"
+  local workdir="$dir/workdir"
+  mkdir -p "$workdir"
+  local slug
+  slug="$(slug_for "$workdir")"
+  local proj_dir="$dir/projects/$slug"
+  mkdir -p "$proj_dir"
+  local current_sid="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+  local prior_sid="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+  # Current session jsonl — content irrelevant, just must exist.
+  printf '{"type":"user"}\n' >"$proj_dir/$current_sid.jsonl"
+  # Prior session jsonl — optionally seeded with the clean-exit marker.
+  printf '{"type":"user"}\n%s' "$prior_tail" >"$proj_dir/$prior_sid.jsonl"
+  # Make both files mtime fresh (within 7d window).
+  touch "$proj_dir/$current_sid.jsonl" "$proj_dir/$prior_sid.jsonl"
+  # Roster: one active claude agent with the pinned session_id + workdir.
+  "$PYTHON" - "$dir/agents.json" "$workdir" "$current_sid" <<'PY'
+import json, sys
+out, workdir, sid = sys.argv[1], sys.argv[2], sys.argv[3]
+roster = [{
+    "agent": "patch",
+    "engine": "claude",
+    "active": True,
+    "activity_state": "idle",
+    "loop": 1,
+    "session_id": sid,
+    "workdir": workdir,
+    "queue": {"queued": 0, "blocked": 0, "claimed": 0},
+}]
+with open(out, "w", encoding="utf-8") as fh:
+    json.dump(roster, fh)
+PY
+}
+
+# run_doctor_with_projects <dir>
+run_doctor_with_projects() {
+  local dir="$1"
+  "$PYTHON" "$DOCTOR" \
+    --json \
+    --agent-list-json "$dir/agents.json" \
+    --task-db "$dir/tasks.db" \
+    --projects-root "$dir/projects" \
+    --detectors cold-restart-suspect
+}
+
+# D7a: prior jsonl ends with /exit -> finding suppressed
+D7a="$ROOT/d7a"
+build_cold_restart_fixture "$D7a" '{"type":"user","message":{"content":"<command-name>/exit</command-name>"}}'$'\n'
+out_d7a="$(run_doctor_with_projects "$D7a")"
+json_assert "$out_d7a" kind_absent \
+  "D7a clean /exit suppresses cold-restart-suspect (#588)" cold-restart-suspect
+
+# D7b: prior jsonl has no clean-exit marker -> finding still emitted
+D7b="$ROOT/d7b"
+build_cold_restart_fixture "$D7b" '{"type":"user","message":{"content":"plain user text"}}'$'\n'
+out_d7b="$(run_doctor_with_projects "$D7b")"
+json_assert "$out_d7b" cold_restart_for_agent \
+  "D7b real cold restart still emits finding" patch
+
+# D7c: prior jsonl ends with /clear -> finding suppressed
+D7c="$ROOT/d7c"
+build_cold_restart_fixture "$D7c" '{"type":"user","message":{"content":"<command-name>/clear</command-name>"}}'$'\n'
+out_d7c="$(run_doctor_with_projects "$D7c")"
+json_assert "$out_d7c" kind_absent \
+  "D7c clean /clear suppresses cold-restart-suspect (#588)" cold-restart-suspect
 
 # --- Summary ------------------------------------------------------------
 printf '\n[smoke] agb-doctor: %d pass, %d fail\n' "$PASS" "$FAIL"

@@ -316,6 +316,27 @@ def workdir_slug_candidates(workdir: str) -> list[str]:
     return candidates
 
 
+def _is_clean_exit(prior_path: Path) -> bool:
+    """Return True if the prior jsonl tail shows an operator-driven clean end.
+
+    Reads up to the last 8 KiB of the file and looks for the slash-command
+    markers Claude Code writes when the operator types `/exit` or `/clear`.
+    Both are clean session ends, not cold restarts (#588). Any I/O error is
+    treated as "not clean" so the detector remains best-effort.
+    """
+    try:
+        size = prior_path.stat().st_size
+        with prior_path.open("rb") as fh:
+            fh.seek(max(0, size - 8192))
+            tail_bytes = fh.read()
+    except OSError:
+        return False
+    return (
+        b"<command-name>/exit</command-name>" in tail_bytes
+        or b"<command-name>/clear</command-name>" in tail_bytes
+    )
+
+
 def detect_cold_restart_suspect(
     agents: list[dict[str, Any]],
     ts: str,
@@ -327,7 +348,9 @@ def detect_cold_restart_suspect(
     least one prior jsonl in the same workdir-slug directory whose mtime is
     fresh (within the last 7 days) and whose stem differs from the active
     session_id. The 7d window keeps long-archived transcripts from triggering
-    false positives.
+    false positives. Prior transcripts ending in a `/exit` or `/clear`
+    slash-command are skipped — those are clean operator-driven ends, not
+    cold restarts (#588).
     """
     findings: list[dict[str, Any]] = []
     if not projects_root.is_dir():
@@ -376,6 +399,8 @@ def detect_cold_restart_suspect(
         if not current_present or prior is None:
             continue
         prior_sid, prior_path, prior_mtime = prior
+        if _is_clean_exit(Path(prior_path)):
+            continue
         findings.append(
             {
                 "ts": ts,

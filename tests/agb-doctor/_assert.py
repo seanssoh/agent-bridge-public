@@ -198,6 +198,27 @@ def kinds_superset(payload: str, args: list[str]) -> bool:
     return True
 
 
+def cold_restart_for_agent(payload: str, args: list[str]) -> bool:
+    """Assert exactly one cold-restart-suspect finding exists for <agent>."""
+    if not args:
+        print("cold_restart_for_agent requires <agent>", file=sys.stderr)
+        return False
+    agent = args[0]
+    findings = _load(payload)
+    matches = [
+        f for f in findings
+        if f.get("kind") == "cold-restart-suspect" and f.get("agent") == agent
+    ]
+    if len(matches) != 1:
+        print(
+            f"expected 1 cold-restart-suspect for {agent!r}, "
+            f"got {len(matches)} (kinds={[f.get('kind') for f in findings]})",
+            file=sys.stderr,
+        )
+        return False
+    return True
+
+
 def only_kind(payload: str, args: list[str]) -> bool:
     if not args:
         print("only_kind requires <kind>", file=sys.stderr)
@@ -228,6 +249,7 @@ CHECKS = {
     "abnormal_pane_placeholder": abnormal_pane_placeholder,
     "kinds_superset": kinds_superset,
     "only_kind": only_kind,
+    "cold_restart_for_agent": cold_restart_for_agent,
 }
 
 
