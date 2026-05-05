@@ -16,6 +16,16 @@ vector slips past the timeout layer, audit silence is the durable signal
 and an automated restart contains the blast radius without operator
 intervention.
 
+Trust model (issue #591):
+    `BRIDGE_DAEMON_PID_FILE` MUST resolve to a path under `BRIDGE_HOME`.
+    The watchdog supervises only the daemon launched from the same
+    `BRIDGE_HOME` tree; a cross-home configuration (e.g. a dev shell that
+    leaked the live host's pid file path while pointing `BRIDGE_HOME` at
+    a temp dir) lets a stale watchdog SIGTERM the live daemon. The
+    validator at startup (`_validate_cross_home`) refuses to run in that
+    shape and exits with code 2, distinct from the normal "no daemon
+    running" path.
+
 Usage:
     python3 bridge-watchdog-silence.py run [--once]
     python3 bridge-watchdog-silence.py status
@@ -24,7 +34,7 @@ Environment:
     BRIDGE_HOME                                       runtime root
     BRIDGE_AUDIT_LOG                                  audit JSONL path
     BRIDGE_STATE_DIR                                  state dir for cooldown file
-    BRIDGE_DAEMON_PID_FILE                            daemon pid file
+    BRIDGE_DAEMON_PID_FILE                            daemon pid file (must be under BRIDGE_HOME)
     BRIDGE_DAEMON_HEARTBEAT_SECONDS                   if 0, watchdog disables itself
     BRIDGE_DAEMON_SILENCE_THRESHOLD_SECONDS           default 600
     BRIDGE_DAEMON_SILENCE_POLL_INTERVAL_SECONDS       default 60
@@ -63,6 +73,34 @@ COOLDOWN_FILE = Path(
 DAEMON_SCRIPT = Path(
     os.environ.get("BRIDGE_DAEMON_SCRIPT", SCRIPT_DIR / "bridge-daemon.sh")
 )
+
+
+def _validate_cross_home() -> None:
+    """Refuse to run if `BRIDGE_DAEMON_PID_FILE` is outside `BRIDGE_HOME`.
+
+    Issue #591 / #592: a watchdog inheriting `BRIDGE_DAEMON_PID_FILE` from a
+    parent shell while `BRIDGE_HOME` points at a temp dir will read its own
+    (empty) audit log, conclude the live daemon is silent, and SIGTERM the
+    live PID. The legitimate use case (a test bridge-home shutting down its
+    own daemon) is preserved because that test's pid file lives under its
+    own BRIDGE_HOME — only the *cross-home* shape is unsafe.
+
+    `.resolve()` is called on both paths so symlinked BRIDGE_HOME layouts
+    (e.g. `~/.agent-bridge` -> `~/.agent-bridge-home`) compare correctly.
+    """
+    pid_file = BRIDGE_DAEMON_PID_FILE.resolve()
+    home = BRIDGE_HOME.resolve()
+    try:
+        pid_file.relative_to(home)
+    except ValueError:
+        log.error(
+            "refusing to run: BRIDGE_DAEMON_PID_FILE=%s is outside BRIDGE_HOME=%s "
+            "(cross-home configuration is unsafe; the watchdog can only supervise "
+            "a daemon whose pid file lives under its own BRIDGE_HOME). "
+            "Unset BRIDGE_DAEMON_PID_FILE or set BRIDGE_HOME to match.",
+            pid_file, home,
+        )
+        sys.exit(2)  # exit code distinct from normal "no daemon running" paths
 
 
 def _env_int(name: str, default: int) -> int:
@@ -427,6 +465,10 @@ def main() -> int:
     status_p.set_defaults(handler=cmd_status)
 
     args = parser.parse_args()
+    # Issue #591: refuse to run with a cross-home pid file before any state
+    # read or audit peek so a leaked-env orphan terminates itself instead of
+    # cross-home killing the live daemon.
+    _validate_cross_home()
     return int(args.handler(args))
 
 
