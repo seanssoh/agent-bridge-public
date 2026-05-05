@@ -24,6 +24,7 @@ Usage:
   $(basename "$0") create <agent> [options]
   $(basename "$0") update <agent> [options]
   $(basename "$0") delete <agent> [--from <admin>] [--force] [--orphan-tasks] [--purge-home] [--purge-crons] [--dry-run] [--json]
+  $(basename "$0") retire <agent> [--purge-home] [--reason <text>] [--dry-run] [--json]
   $(basename "$0") list [--json]
   $(basename "$0") registry [--json]
   $(basename "$0") show <agent> [--json]
@@ -3053,6 +3054,289 @@ PY
   fi
 }
 
+# run_retire — Issue #598 Track 3 cleanup primitive.
+#
+# Companion to `agent delete` (#580 Track 1). Where `delete` mutates the
+# local roster (managed-role removal + optional purges) and is admin-gated,
+# `retire` operates purely on RUNTIME artifacts of agents that are NOT in
+# the static roster: dynamic-registered agents and orphan home dirs left
+# behind by reaped/test-fixture sessions. It never touches the roster
+# file, so it does not require operator-tui trust — but it always emits
+# an audit row so the action is visible.
+#
+# Default behavior quarantines the home dir to
+# `$BRIDGE_HOME/archive/retired-agents/<timestamp>-<agent>/`. Pass
+# `--purge-home` to delete instead.
+#
+# Refusal cases (per #598 spec Part C):
+#   1. Not in registry AND no on-disk home  → nothing to retire.
+#   2. privilege_class=system OR agent_source=static → static-roster
+#      mutation is #580 Track 2 territory.
+#   3. is_alive=true → operator must `agent stop <agent>` first.
+#   4. resolved home outside $BRIDGE_AGENT_HOME_ROOT → resolver bug;
+#      refuse rather than rm/mv.
+run_retire() {
+  local agent=""
+  local from_agent=""
+  local purge_home=0
+  local dry_run=0
+  local json_output=0
+  local reason="manual"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        from_agent="$2"
+        shift 2
+        ;;
+      --purge-home)
+        purge_home=1
+        shift
+        ;;
+      --reason)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        reason="$2"
+        shift 2
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      --json)
+        json_output=1
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        bridge_die "지원하지 않는 agent retire 옵션입니다: $1"
+        ;;
+      *)
+        if [[ -z "$agent" ]]; then
+          agent="$1"
+          shift
+        else
+          bridge_die "agent retire: 추가 위치 인자는 허용되지 않습니다: $1"
+        fi
+        ;;
+    esac
+  done
+
+  [[ -n "$agent" ]] || bridge_die "agent retire: <name> 인자가 필요합니다."
+
+  # Caller label for audit (informational only — no admin gate).
+  local caller_agent=""
+  if [[ -n "$from_agent" ]]; then
+    caller_agent="$from_agent"
+  elif [[ -n "${BRIDGE_AGENT_ID:-}" ]]; then
+    caller_agent="$BRIDGE_AGENT_ID"
+  else
+    caller_agent="operator"
+  fi
+
+  # Step 1: source resolution.
+  # - "dynamic": agent is in BRIDGE_AGENT_IDS via dynamic loader.
+  # - "static": agent is in BRIDGE_AGENT_IDS via static roster — refuse.
+  # - "unregistered": not in registry, but a home dir exists on disk
+  #   (the orphan-agent-dir case from #598 Track 2).
+  local agent_source=""
+  local privilege_class=""
+  local home_dir=""
+  local is_alive="0"
+
+  if bridge_agent_exists "$agent"; then
+    agent_source="$(bridge_agent_source "$agent")"
+    privilege_class="$(bridge_agent_class "$agent")"
+    home_dir="$(bridge_agent_default_home "$agent")"
+    if bridge_agent_is_active "$agent"; then
+      is_alive="1"
+    fi
+  else
+    # Not in registry — fall back to the v1 home root layout (orphan
+    # detector enumerates `$BRIDGE_AGENT_HOME_ROOT/*`, so any orphan we
+    # could be asked to retire lives directly under that root).
+    agent_source="unregistered"
+    privilege_class="user"
+    home_dir="$BRIDGE_AGENT_HOME_ROOT/$agent"
+  fi
+
+  # Step 2: refuse if neither registry nor disk has anything to retire.
+  if [[ "$agent_source" == "unregistered" && ! -d "$home_dir" ]]; then
+    bridge_die "deny: agent '$agent' is not in the registry and no home dir exists at $home_dir — nothing to retire"
+  fi
+
+  # Step 3: refuse static-class. Static roster mutation is #580 Track 2
+  # territory; retire is for dynamic + orphan only.
+  if [[ "$agent_source" == "static" ]]; then
+    bridge_die "deny: agent '$agent' is static-roster — use \`agent-bridge agent delete '$agent'\` (admin-gated) instead"
+  fi
+  # privilege_class=system is also out-of-scope for retire (issue #539).
+  if [[ "$privilege_class" == "system" ]]; then
+    bridge_die "deny: agent '$agent' has privilege_class=system — system agents are not retireable"
+  fi
+
+  # Step 4: refuse if alive — operator must stop the session first.
+  if [[ "$is_alive" == "1" ]]; then
+    bridge_die "deny: agent '$agent' has an active tmux session — run \`agent-bridge agent stop '$agent'\` first"
+  fi
+
+  # Step 5: --purge-home path validation. Resolved home must live under
+  # one of the known agent roots; anything else is a resolver bug, refuse.
+  case "$home_dir" in
+    "$BRIDGE_AGENT_HOME_ROOT"/*|"${BRIDGE_AGENT_ROOT_V2:-/dev/null}"/*) ;;
+    *)
+      bridge_die "deny: agent retire refused — resolved home is outside expected agent roots: $home_dir"
+      ;;
+  esac
+
+  # Compute pre-state for audit + JSON (best-effort; the home dir may not
+  # exist yet for a registry-only agent that was reaped before its home
+  # was scaffolded).
+  local pre_size_bytes="0"
+  if [[ -d "$home_dir" ]]; then
+    pre_size_bytes="$(du -sk -- "$home_dir" 2>/dev/null | awk '{print $1*1024}')"
+    [[ "$pre_size_bytes" =~ ^[0-9]+$ ]] || pre_size_bytes="0"
+  fi
+
+  # Quarantine target lives under $BRIDGE_HOME/archive/retired-agents/.
+  # Stamped with UTC timestamp to avoid collisions when the same agent id
+  # is retired more than once across a host's lifetime.
+  local stamp
+  stamp="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || date +%s)"
+  local archive_root="$BRIDGE_HOME/archive/retired-agents"
+  local quarantine_path="$archive_root/${stamp}-${agent}"
+
+  # Step 6: dry-run prints the plan and exits.
+  if [[ $dry_run -eq 1 ]]; then
+    if [[ $json_output -eq 1 ]]; then
+      bridge_require_python
+      AGENT="$agent" PURGE_HOME="$purge_home" QUARANTINE="$quarantine_path" \
+      python3 - <<'PY'
+import json
+import os
+
+payload = {
+    "status": "would-retire",
+    "agent": os.environ["AGENT"],
+    "purged_home": os.environ["PURGE_HOME"] == "1",
+    "quarantined_to": None if os.environ["PURGE_HOME"] == "1" else os.environ["QUARANTINE"],
+    "audit_recorded": False,
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+    else
+      printf 'agent: %s\n' "$agent"
+      printf 'status: would-retire\n'
+      printf 'agent_source: %s\n' "$agent_source"
+      printf 'home_path: %s\n' "$home_dir"
+      printf 'pre_size_bytes: %s\n' "$pre_size_bytes"
+      if [[ $purge_home -eq 1 ]]; then
+        printf 'plan: rm -rf %s\n' "$home_dir"
+      else
+        printf 'plan: mv %s -> %s\n' "$home_dir" "$quarantine_path"
+      fi
+    fi
+    return 0
+  fi
+
+  # Step 7 (dynamic only): archive state + remove dynamic-active env file
+  # + clear runtime markers. Best-effort; failures are warned but do not
+  # abort the home-dir step.
+  if [[ "$agent_source" == "dynamic" ]]; then
+    bridge_archive_dynamic_agent "$agent" >/dev/null 2>&1 || \
+      bridge_warn "agent retire: failed to archive dynamic state for '$agent' (best-effort)"
+    bridge_remove_dynamic_agent_file "$agent" >/dev/null 2>&1 || \
+      bridge_warn "agent retire: failed to remove dynamic active-env file for '$agent' (best-effort)"
+    bridge_agent_clear_idle_marker "$agent" >/dev/null 2>&1 || true
+    bridge_agent_clear_prompt_ready "$agent" >/dev/null 2>&1 || true
+  fi
+
+  # Step 8: quarantine OR purge the home dir.
+  # Only escalate via bridge_linux_sudo_root when the agent was actually
+  # under linux-user isolation — otherwise sudo prompts (macOS) or fails
+  # closed (Linux without cached creds) for no reason. The fallback is a
+  # plain rm/mv as the controller user.
+  local needs_sudo=0
+  if [[ "$agent_source" == "dynamic" ]] && \
+     command -v bridge_agent_linux_user_isolation_requested >/dev/null 2>&1; then
+    if bridge_agent_linux_user_isolation_requested "$agent" 2>/dev/null; then
+      needs_sudo=1
+    fi
+  fi
+  local final_quarantine_path=""
+  if [[ -d "$home_dir" ]]; then
+    if [[ $purge_home -eq 1 ]]; then
+      if (( needs_sudo == 1 )); then
+        bridge_linux_sudo_root rm -rf -- "$home_dir" || \
+          bridge_warn "agent retire: --purge-home best-effort rm failed: $home_dir"
+      else
+        rm -rf -- "$home_dir" || \
+          bridge_warn "agent retire: --purge-home best-effort rm failed: $home_dir"
+      fi
+    else
+      mkdir -p "$archive_root"
+      if (( needs_sudo == 1 )); then
+        bridge_linux_sudo_root mv -- "$home_dir" "$quarantine_path" && \
+          final_quarantine_path="$quarantine_path" || \
+          bridge_warn "agent retire: quarantine mv failed for $home_dir → $quarantine_path"
+      else
+        if mv -- "$home_dir" "$quarantine_path" 2>/dev/null; then
+          final_quarantine_path="$quarantine_path"
+        else
+          bridge_warn "agent retire: quarantine mv failed for $home_dir → $quarantine_path"
+        fi
+      fi
+    fi
+  fi
+
+  # Step 9: audit row.
+  local audit_quarantine="${final_quarantine_path:-}"
+  bridge_audit_log agent agent_retired "$agent" \
+    --detail reason="$reason" \
+    --detail purge_home="$([[ $purge_home -eq 1 ]] && printf true || printf false)" \
+    --detail pre_size_bytes="$pre_size_bytes" \
+    --detail home_path="$home_dir" \
+    --detail quarantine_path="$audit_quarantine" \
+    --detail agent_source="$agent_source" \
+    --detail privilege_class="$privilege_class" \
+    --detail caller="$caller_agent" \
+    2>/dev/null || true
+
+  if [[ $json_output -eq 1 ]]; then
+    bridge_require_python
+    AGENT="$agent" PURGE_HOME="$purge_home" QUARANTINE="$audit_quarantine" \
+    python3 - <<'PY'
+import json
+import os
+
+quarantined = os.environ["QUARANTINE"]
+payload = {
+    "status": "retired",
+    "agent": os.environ["AGENT"],
+    "purged_home": os.environ["PURGE_HOME"] == "1",
+    "quarantined_to": quarantined if quarantined else None,
+    "audit_recorded": True,
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+  else
+    printf 'agent: %s\n' "$agent"
+    printf 'status: retired\n'
+    printf 'purge_home: %s\n' "$([[ $purge_home -eq 1 ]] && echo yes || echo no)"
+    if [[ -n "$audit_quarantine" ]]; then
+      printf 'quarantined_to: %s\n' "$audit_quarantine"
+    fi
+    printf 'audit_recorded: yes\n'
+  fi
+}
+
 run_start() {
   local agent="${1:-}"
   shift || true
@@ -3519,6 +3803,9 @@ case "$subcommand" in
   delete)
     run_delete "$@"
     ;;
+  retire)
+    run_retire "$@"
+    ;;
   list)
     run_list "$@"
     ;;
@@ -3567,7 +3854,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create update delete list registry show reclassify rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
+      "create update delete retire list registry show reclassify rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;
