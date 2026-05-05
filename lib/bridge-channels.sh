@@ -6,6 +6,28 @@ bridge_channels_python() {
   python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" "$@"
 }
 
+# Resolve the best PreCompact reply target for an opt-in static agent.
+# Echoes shell-format assignments (`CHANNEL_ROUTE_PLUGIN=...`,
+# `CHANNEL_ROUTE_CHANNEL_ID=...`, `CHANNEL_ROUTE_REPLY_TO_MESSAGE_ID=...`,
+# `CHANNEL_ROUTE_LAST_USER_INBOUND_TS=...`, optional `CHANNEL_ROUTE_THREAD_ID=...`)
+# on success; exits non-zero with no stdout when there is no eligible route.
+# The daemon observer (Track B) consumes this via `eval` and skips silently
+# on non-zero exit.
+bridge_channel_precompact_target() {
+  local agent="$1"
+  local channels_csv="$2"
+  local recency_seconds="${3:-${BRIDGE_PRECOMPACT_NOTIFY_RECENCY_SECONDS:-1800}}"
+  local now_ts="${4:-$(date +%s)}"
+
+  bridge_channels_python route-precompact-target \
+    --agent "$agent" \
+    --channels-csv "$channels_csv" \
+    --bridge-state-dir "$BRIDGE_STATE_DIR" \
+    --recency-seconds "$recency_seconds" \
+    --now-ts "$now_ts" \
+    --format shell
+}
+
 bridge_channel_server_script_path() {
   local live_path="$BRIDGE_HOME/bridge-channel-server.py"
 
