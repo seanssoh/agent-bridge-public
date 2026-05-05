@@ -132,6 +132,19 @@ mkdir -p "$(dirname "$PLIST_PATH")" "$(dirname "$LOG_PATH")"
 printf '%s\n' "$PLIST_CONTENT" >"$PLIST_PATH"
 echo "[info] wrote LaunchAgent plist: $PLIST_PATH"
 
+# Issue #590 r2: persist the launchd config so bridge-lib.sh can resolve the
+# correct log path under custom --label/--plist/--log-path installs without
+# guessing. The marker doubles as the "we are launchd-managed" signal.
+LAUNCHAGENT_CONFIG_PATH="$BRIDGE_HOME_TARGET/state/launchagent.config"
+mkdir -p "$(dirname "$LAUNCHAGENT_CONFIG_PATH")"
+{
+  printf 'BRIDGE_LAUNCHAGENT_LABEL=%q\n' "$LABEL"
+  printf 'BRIDGE_LAUNCHAGENT_PLIST=%q\n'  "$PLIST_PATH"
+  printf 'BRIDGE_LAUNCHAGENT_LOG=%q\n'    "$LOG_PATH"
+} >"$LAUNCHAGENT_CONFIG_PATH"
+chmod 0600 "$LAUNCHAGENT_CONFIG_PATH"
+echo "[info] wrote launchagent config: $LAUNCHAGENT_CONFIG_PATH"
+
 if [[ $LOAD -eq 1 ]]; then
   launchctl bootout "gui/$UID/$LABEL" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$UID" "$PLIST_PATH"

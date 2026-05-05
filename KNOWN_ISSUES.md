@@ -423,12 +423,20 @@ Symptom:
 
 Current behavior (post #590):
 
-- `BRIDGE_DAEMON_LOG` defaults to `state/launchagent.log` automatically
-  when the launchd plist is present on macOS, and to `state/daemon.log`
-  otherwise (Linux systemd/nohup). Operators can override via env.
-- `agb daemon status` prints both `log=` and `launchagent_log=` lines
-  under launchd so it answers "where is the daemon writing?" directly.
+- `BRIDGE_DAEMON_LOG` defaults to the launchagent log path recorded in
+  `state/launchagent.config` when that marker is present, and to
+  `state/daemon.log` otherwise. The marker is written by
+  `scripts/install-daemon-launchagent.sh --apply` from this version
+  forward and captures the actual `--label`/`--plist`/`--log-path` the
+  operator chose. Pre-v0.7.X installs need to rerun `--apply` once to
+  pick up the new default; operators can also set `BRIDGE_DAEMON_LOG`
+  in their environment to override at any time.
+- `agb daemon status` prints `log=` always and adds `launchagent_log=`
+  only when the operator's `BRIDGE_DAEMON_LOG` resolves to a file
+  different from the configured launchagent log, so the status output
+  never duplicates itself.
 - `bridge-doctor.py` ships a `daemon-log-split` detector that fires when
   the configured log is older than 7 days while `launchagent.log` is
   active, with a `BRIDGE_DAEMON_LOG=...` fix hint in the suggested
-  action.
+  action. The detector reads the launchagent path from
+  `state/launchagent.config` when present.

@@ -91,8 +91,16 @@ On launchd-managed macOS installs the daemon writes its stdout/stderr to
 launchd takes over. `BRIDGE_DAEMON_LOG` defaults to `state/launchagent.log`
 automatically when that plist is present; on Linux (systemd/nohup) it stays
 on `state/daemon.log`. Override the env var to relocate either path.
-`agb daemon status` prints both `log=` and `launchagent_log=` lines under
-launchd so you can confirm where output is landing without guessing.
+On installs where `state/launchagent.config` is present (written by
+`scripts/install-daemon-launchagent.sh --apply` from this version forward),
+the default resolves to the configured launchagent log path — including
+custom `--label`/`--plist`/`--log-path` installs. Operators on pre-v0.7.X
+installs can either rerun `--apply` once or set `BRIDGE_DAEMON_LOG` in
+their environment.
+`agb daemon status` prints both `log=` and `launchagent_log=` lines when
+the operator's `BRIDGE_DAEMON_LOG` resolves to a file other than the
+configured launchagent log, so you can confirm where output is landing
+without guessing.
 
 ## Upgrade
 

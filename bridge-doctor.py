@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -497,7 +498,23 @@ def detect_daemon_log_split(
         return findings
     env_log = os.environ.get("BRIDGE_DAEMON_LOG", "").strip()
     daemon_log = Path(env_log).expanduser() if env_log else (state_dir / "daemon.log")
+    # Resolve launchagent log from installer-written marker when present
+    # (issue #590 PR #599 r2). Falls back to the conventional path on
+    # installs that have not yet run `install-daemon-launchagent.sh --apply`
+    # under the new code.
     launchagent_log = state_dir / "launchagent.log"
+    config_path = state_dir / "launchagent.config"
+    if config_path.is_file():
+        try:
+            for line in config_path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("BRIDGE_LAUNCHAGENT_LOG="):
+                    # shell-quoted via printf %q; shlex.split unquotes it
+                    parts = shlex.split(line.split("=", 1)[1])
+                    if parts:
+                        launchagent_log = Path(parts[0])
+                    break
+        except OSError:
+            pass
     # No split possible if BRIDGE_DAEMON_LOG already points at the launchagent
     # stream; the new default does this on launchd-managed macOS installs.
     try:
@@ -513,9 +530,11 @@ def detect_daemon_log_split(
         launchagent_age = now - int(launchagent_log.stat().st_mtime)
     except OSError:
         return findings
-    if daemon_age <= 7 * 86400:
+    # Detector wants `daemon log >7 days old AND launchagent log <1 day old`.
+    # Use strict inequalities so the boundary matches the literal threshold.
+    if daemon_age < 7 * 86400:
         return findings
-    if launchagent_age > 86400:
+    if launchagent_age >= 86400:
         return findings
     daemon_age_days = daemon_age // 86400
     findings.append(

@@ -157,19 +157,28 @@ BRIDGE_WORKTREE_META_DIR="${BRIDGE_WORKTREE_META_DIR:-$BRIDGE_STATE_DIR/worktree
 BRIDGE_ACTIVE_ROSTER_TSV="${BRIDGE_ACTIVE_ROSTER_TSV:-$BRIDGE_STATE_DIR/active-roster.tsv}"
 BRIDGE_ACTIVE_ROSTER_MD="${BRIDGE_ACTIVE_ROSTER_MD:-$BRIDGE_STATE_DIR/active-roster.md}"
 BRIDGE_DAEMON_PID_FILE="${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}"
-# Issue #590: under launchd-managed installs the daemon's stdout/stderr is
-# redirected to launchagent.log by the plist; daemon.log freezes the moment
-# launchd takes over. When the plist is present on macOS, default
-# BRIDGE_DAEMON_LOG to launchagent.log so `tail $BRIDGE_DAEMON_LOG` follows the
-# active stream. Linux (systemd/nohup) installs keep daemon.log as the SSOT.
-# Operators can still override via env.
+# Issue #590 / PR #599 r2: prefer the installer-written launchagent.config
+# marker so custom --label/--plist/--log-path installs resolve correctly.
+# The marker's presence is the "launchd-managed" signal — we don't need
+# to guess plist filenames or pin to the default label. Linux (systemd/
+# nohup) installs simply lack the marker and fall through to daemon.log.
+# Operators can still override BRIDGE_DAEMON_LOG via env.
 __bridge_default_daemon_log() {
-  local plist="$HOME/Library/LaunchAgents/ai.agent-bridge.daemon.plist"
-  if [[ -f "$plist" && "$(uname)" == "Darwin" ]]; then
-    printf '%s' "$BRIDGE_STATE_DIR/launchagent.log"
-  else
-    printf '%s' "$BRIDGE_STATE_DIR/daemon.log"
+  local config_path="$BRIDGE_STATE_DIR/launchagent.config"
+  if [[ -f "$config_path" ]]; then
+    local launchagent_log_from_config=""
+    launchagent_log_from_config="$(
+      set -e
+      # shellcheck disable=SC1090
+      source "$config_path"
+      printf '%s' "${BRIDGE_LAUNCHAGENT_LOG:-}"
+    )"
+    if [[ -n "$launchagent_log_from_config" ]]; then
+      printf '%s' "$launchagent_log_from_config"
+      return
+    fi
   fi
+  printf '%s' "$BRIDGE_STATE_DIR/daemon.log"
 }
 BRIDGE_DAEMON_LOG="${BRIDGE_DAEMON_LOG:-$(__bridge_default_daemon_log)}"
 BRIDGE_DAEMON_CRASH_LOG="${BRIDGE_DAEMON_CRASH_LOG:-$BRIDGE_STATE_DIR/daemon-crash.log}"

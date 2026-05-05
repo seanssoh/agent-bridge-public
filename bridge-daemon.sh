@@ -4882,14 +4882,27 @@ cmd_status() {
   else
     echo "stopped socket_listener=${socket_status}"
   fi
-  # Issue #590: surface every log path the operator may need so
-  # `agent-bridge daemon status` answers "where is the daemon writing?"
-  # directly. launchagent_log only prints under launchd-managed installs
-  # (plist present on macOS); on Linux/nohup it is omitted to avoid noise.
+  # Issue #590 / PR #599 r2: surface every log path the operator may need
+  # so `agent-bridge daemon status` answers "where is the daemon writing?"
+  # directly. The launchagent.config marker (written by
+  # scripts/install-daemon-launchagent.sh --apply) is the launchd-managed
+  # signal; without it we omit launchagent_log= to avoid noise on
+  # Linux/nohup installs. When BRIDGE_DAEMON_LOG already resolves to the
+  # configured launchagent log we also skip the line to avoid duplicating
+  # `log=`.
   echo "log=${BRIDGE_DAEMON_LOG}"
-  local _plist="$HOME/Library/LaunchAgents/ai.agent-bridge.daemon.plist"
-  if [[ -f "$_plist" && "$(uname)" == "Darwin" ]]; then
-    echo "launchagent_log=${BRIDGE_LAUNCHAGENT_LOG}"
+  local _config_path="$BRIDGE_STATE_DIR/launchagent.config"
+  local _launchagent_log=""
+  if [[ -f "$_config_path" ]]; then
+    _launchagent_log="$(
+      set -e
+      # shellcheck disable=SC1090
+      source "$_config_path"
+      printf '%s' "${BRIDGE_LAUNCHAGENT_LOG:-}"
+    )"
+  fi
+  if [[ -n "$_launchagent_log" && "$_launchagent_log" != "$BRIDGE_DAEMON_LOG" ]]; then
+    echo "launchagent_log=${_launchagent_log}"
   fi
 }
 
