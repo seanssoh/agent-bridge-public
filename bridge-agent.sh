@@ -1347,7 +1347,18 @@ bridge_agent_shared_settings_plan_json() {
   local agent="$1"
   local workdir="$2"
   local launch_cmd
+  local agent_class=""
   launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+  # Issue #593: pass the agent's source class through to the resolver so
+  # the plan/diff helper computes the same managed default the renderer
+  # will (static→400_000, dynamic→1_000_000). Without this the doctor
+  # path would always evaluate the unknown-class fallback (1_000_000) and
+  # report `needs-rerender` for every static agent on every run. Gate
+  # the lookup so the helper still works when callers haven't loaded
+  # the roster (the inline plan-json subprocess treats empty as unknown).
+  if declare -p BRIDGE_AGENT_SOURCE >/dev/null 2>&1; then
+    agent_class="$(bridge_agent_source "$agent" 2>/dev/null || true)"
+  fi
 
   # Issue #555: the rerender now writes the effective file at the
   # per-agent path ($BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/
@@ -1362,14 +1373,15 @@ bridge_agent_shared_settings_plan_json() {
     "$(bridge_hook_shared_settings_base_file)" \
     "$(bridge_hook_shared_settings_overlay_file)" \
     "$(bridge_hook_per_agent_settings_effective_file "$agent")" \
-    "$launch_cmd" <<'PY'
+    "$launch_cmd" \
+    "$agent_class" <<'PY'
 import importlib.util
 import json
 import os
 import sys
 from pathlib import Path
 
-hooks_py, agent, workdir, base_file, overlay_file, effective_file, launch_cmd = sys.argv[1:]
+hooks_py, agent, workdir, base_file, overlay_file, effective_file, launch_cmd, agent_class = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("bridge_hooks", hooks_py)
 if spec is None or spec.loader is None:
     raise SystemExit(f"could not load {hooks_py}")
@@ -1400,7 +1412,7 @@ def load_object(path: Path, label: str, *, absent_ok: bool = True) -> dict:
 
 base_payload = load_object(base_path, "base")
 overlay_payload = load_object(overlay_path, "overlay")
-managed_defaults = hooks.managed_claude_settings_defaults(launch_cmd or None)
+managed_defaults = hooks.managed_claude_settings_defaults(launch_cmd or None, agent_class or None)
 expected = hooks.merge_settings(managed_defaults, base_payload)
 expected = hooks.merge_settings(expected, overlay_payload)
 
