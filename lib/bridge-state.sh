@@ -1949,12 +1949,17 @@ bridge_agent_note_prompt_ready() {
     fi
   fi
 
+  # Atomic write: stage to a per-writer tmp path and rename into place so a
+  # concurrent reader (bridge-queue.py, daemon poll) never observes a
+  # partially-populated marker if the writer is interrupted mid-print.
+  local tmp="${file}.tmp.$$"
   {
     printf 'PROMPT_READY_TS=%s\n' "$ts"
     printf 'PROMPT_READY_SESSION=%s\n' "$session"
     printf 'PROMPT_READY_ENGINE=%s\n' "$engine"
     printf 'PROMPT_READY_SOURCE=%s\n' "$source_label"
-  } >"$file"
+  } >"$tmp"
+  mv -f "$tmp" "$file"
 }
 
 bridge_agent_prompt_ready_epoch() {

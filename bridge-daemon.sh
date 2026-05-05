@@ -2866,9 +2866,11 @@ reconcile_prompt_ready_latches() {
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
     engine="$(bridge_agent_engine "$agent")"
     [[ -n "$engine" ]] || continue
-    # The latch is only meaningful for engines that have a prompt concept;
-    # bridge_tmux_engine_requires_prompt covers claude/codex and returns
-    # success (0) for engines that don't require a prompt — skip those.
+    # The latch is only meaningful for engines that have a prompt concept.
+    # bridge_tmux_engine_requires_prompt returns 0 (success) for engines
+    # that DO require a prompt (claude/codex) and 1 for engines that don't.
+    # Latch only when it returns 0; otherwise skip — the agent doesn't have
+    # a prompt-ready concept to observe.
     if bridge_tmux_engine_requires_prompt "$engine"; then
       :
     else
