@@ -2523,12 +2523,17 @@ run_delete() {
   fi
 
   # Refuse-if-admin-self: cannot delete the configured admin role from
-  # inside it. The admin id may be unset (early bootstrap); in that case
-  # there is nothing to refuse.
+  # inside it. Strip both sides before comparing — mirror the pattern in
+  # lib/bridge-agent-update.sh:104 so a trailing newline / whitespace in
+  # BRIDGE_ADMIN_AGENT_ID does not silently bypass the self-delete guard.
+  # The admin id may be unset (early bootstrap); in that case there is
+  # nothing to refuse.
   if [[ -z "$deny_reason" ]]; then
-    local admin_id
+    local admin_id agent_id
     admin_id="$(bridge_admin_agent_id)"
-    if [[ -n "$admin_id" && "$agent" == "$admin_id" ]]; then
+    admin_id="$(printf '%s' "$admin_id" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    agent_id="$(printf '%s' "$agent" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ -n "$admin_id" && "$agent_id" == "$admin_id" ]]; then
       deny_reason="cannot delete the configured admin agent ($admin_id) from itself — clear BRIDGE_ADMIN_AGENT_ID first"
     fi
   fi
@@ -2560,7 +2565,7 @@ try:
         SELECT COUNT(*)
         FROM tasks
         WHERE assigned_to = ?
-          AND status NOT IN ('done', 'blocked')
+          AND status IN ('queued', 'claimed', 'blocked')
           AND title NOT LIKE '[cron-dispatch]%'
         """,
         (agent,),
@@ -2659,8 +2664,9 @@ PY
 
   if [[ $orphan_tasks -eq 1 && "$open_count" -gt 0 && -f "$BRIDGE_TASK_DB" ]]; then
     bridge_require_python
-    python3 - "$BRIDGE_TASK_DB" "$agent" "agent retired via 'agent delete'" <<'PY' || \
-      bridge_warn "agent delete: failed to mark inbox tasks blocked for '$agent'"
+    local _orphan_err
+    _orphan_err="$(mktemp -t agb-orphan-err.XXXXXX)"
+    if ! python3 - "$BRIDGE_TASK_DB" "$agent" "agent retired via 'agent delete'" <<'PY' 2>"$_orphan_err"
 import sqlite3
 import sys
 import time
@@ -2674,19 +2680,25 @@ try:
             """
             SELECT id FROM tasks
             WHERE assigned_to = ?
-              AND status NOT IN ('done', 'blocked')
+              AND status IN ('queued', 'claimed')
               AND title NOT LIKE '[cron-dispatch]%'
             """,
             (agent,),
         ).fetchall()
         for (task_id,) in rows:
+            # `blocked` is an open status (bridge-queue.py:22), so leave
+            # closed_ts untouched — only cancelled/done set it. Restrict
+            # the UPDATE WHERE to the same queued/claimed set so already
+            # blocked rows are not redundantly bumped (idempotent).
             conn.execute(
                 """
                 UPDATE tasks
-                SET status = 'blocked', updated_ts = ?, closed_ts = ?
+                SET status = 'blocked', updated_ts = ?
                 WHERE id = ?
+                  AND status IN ('queued', 'claimed')
+                  AND title NOT LIKE '[cron-dispatch]%'
                 """,
-                (now_ts, now_ts, task_id),
+                (now_ts, task_id),
             )
             conn.execute(
                 """
@@ -2700,6 +2712,13 @@ try:
 finally:
     conn.close()
 PY
+    then
+      local _orphan_err_text
+      _orphan_err_text="$(cat "$_orphan_err" 2>/dev/null || true)"
+      rm -f "$_orphan_err"
+      bridge_die "agent delete: failed to mark inbox tasks blocked for '$agent'${_orphan_err_text:+ ($_orphan_err_text)}"
+    fi
+    rm -f "$_orphan_err"
   fi
 
   # Remove the managed-role block from the roster file. Same regex the
@@ -2721,7 +2740,15 @@ pattern = re.compile(
     rf"^# BEGIN AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n.*?^# END AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n?",
     flags=re.MULTILINE | re.DOTALL,
 )
-text = pattern.sub("", text)
+# Mirror bridge-agent.sh:717 — verify the regex matches before writing.
+# subn returns (new_text, count); refuse to write unless exactly one
+# managed block was excised.
+new_text, count = pattern.subn("", text, count=1)
+if count != 1:
+    raise SystemExit(
+        f"managed block not found or matched {count} times for {agent}: {path}"
+    )
+text = new_text
 # Collapse the triple-newline left behind by block removal (cosmetic).
 text = re.sub(r"\n{3,}", "\n\n", text)
 path.write_text(text, encoding="utf-8")
@@ -2771,10 +2798,30 @@ PY
   fi
 
   if [[ $purge_home -eq 1 ]]; then
-    local home_dir="$BRIDGE_AGENT_HOME_ROOT/$agent"
-    if [[ -d "$home_dir" ]]; then
-      rm -rf -- "$home_dir"
-    fi
+    # Resolve via the canonical helper so v1 (`$BRIDGE_AGENT_HOME_ROOT/$agent`)
+    # and v2 (`$BRIDGE_AGENT_ROOT_V2/$agent/home`) layouts both work.
+    local home_dir
+    home_dir="$(bridge_agent_default_home "$agent")"
+    # Validate the resolved path is under one of the known agent roots
+    # before recursive rm — anything outside is a resolver bug, refuse
+    # rather than rm. Roster mutation has already succeeded, so an rm
+    # failure is best-effort: warn but do not abort the subcommand.
+    case "$home_dir" in
+      "$BRIDGE_AGENT_HOME_ROOT"/*|"${BRIDGE_AGENT_ROOT_V2:-/dev/null}"/*)
+        if [[ -d "$home_dir" ]]; then
+          if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+            bridge_linux_sudo_root rm -rf -- "$home_dir" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $home_dir"
+          else
+            rm -rf -- "$home_dir" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $home_dir"
+          fi
+        fi
+        ;;
+      *)
+        bridge_warn "agent delete: --purge-home refused: resolved home outside expected agent roots: $home_dir"
+        ;;
+    esac
   fi
 
   local after_sha
