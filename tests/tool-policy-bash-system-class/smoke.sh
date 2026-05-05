@@ -257,6 +257,17 @@ assert_deny "scenario 5 (system read shared/private)" "$out" "shared/private"
 out="$(run_hook "$SYSTEM_AGENT" system "cat $SHARED_SECRETS_FILE" 2>/dev/null)"
 assert_deny "scenario 6 (system read shared/secrets)" "$out" "shared/secrets"
 
+# --- Scenario 6a: bare directory `ls .../shared/private` (no trailing slash)
+# patch-dev review of 94711d3 caught that the slash-only alias variants in
+# `_shared_forbidden_aliases()` let `ls $BRIDGE_HOME/shared/private` slip
+# past Stage A. Pin the no-trailing-slash form here.
+out="$(run_hook "$SYSTEM_AGENT" system "ls $BRIDGE_HOME/shared/private" 2>/dev/null)"
+assert_deny "scenario 6a (bare directory shared/private no trailing slash)" "$out" "shared/private"
+
+# --- Scenario 6b: same regression, secrets root, no trailing slash
+out="$(run_hook "$SYSTEM_AGENT" system "ls $BRIDGE_HOME/shared/secrets" 2>/dev/null)"
+assert_deny "scenario 6b (bare directory shared/secrets no trailing slash)" "$out" "shared/secrets"
+
 # --- Scenario 7: user-class read on peer/projects -> DENY
 out="$(run_hook "$USER_AGENT" user "cat $PROJECTS_FILE" 2>/dev/null)"
 assert_deny "scenario 7 (user-class peer read)" "$out" "cross-agent"

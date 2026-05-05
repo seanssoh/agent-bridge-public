@@ -789,7 +789,10 @@ def _peer_alias_list(agent: str) -> list[str]:
 def _shared_forbidden_aliases() -> list[str]:
     """Return the substring-deny list for ``shared/private/`` and
     ``shared/secrets/``. Includes absolute, ``~``, and ``$HOME``
-    variants so substitution rendering doesn't slip past the gate.
+    variants — both with and without a trailing slash — so a bare
+    directory reference (``ls $BRIDGE_HOME/shared/private``) cannot
+    bypass the gate. patch-dev review of 94711d3 caught the
+    no-slash variant gap.
     """
     bridge_home = bridge_home_dir()
     aliases: list[str] = []
@@ -798,8 +801,11 @@ def _shared_forbidden_aliases() -> list[str]:
         aliases.extend(
             (
                 f"{bridge_home}/shared/{rel}/",
+                f"{bridge_home}/shared/{rel}",
                 f"~/.agent-bridge/shared/{rel}/",
+                f"~/.agent-bridge/shared/{rel}",
                 f"$HOME/.agent-bridge/shared/{rel}/",
+                f"$HOME/.agent-bridge/shared/{rel}",
             )
         )
     return aliases
