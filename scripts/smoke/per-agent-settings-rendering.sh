@@ -8,14 +8,17 @@
 # overlay overrides for one agent are not last-rerender-wins clobbered by
 # a sibling rerender.
 #
-# Note (issue #570): the managed `autoCompactWindow` default is now
-# unconditionally 1_000_000 — the previous launch_cmd `[1m]` substring
-# heuristic was retired. These sub-tests assert the per-agent *path*
-# routing, not a per-launch_cmd value split.
+# Note (issue #593): the managed `autoCompactWindow` default is now
+# class-aware (static→400_000, dynamic→1_000_000). This fixture drives
+# `bridge_link_claude_settings_to_shared` directly without sourcing the
+# roster, so `BRIDGE_AGENT_SOURCE` is unset and the renderer falls back
+# to the unknown-class default (1_000_000) — the back-compat path. The
+# assertions here therefore stay at 1_000_000 and validate per-agent
+# *path* routing, not the class-aware value split.
 #
 # Sub-tests:
 #   1. agent-A renders its per-agent effective file with the managed
-#      autoCompactWindow=1_000_000 default.
+#      autoCompactWindow=1_000_000 default (unknown-class fallback).
 #   2. agent-B renders its own per-agent effective file (separate path
 #      from agent-A) with the same managed default.
 #   3. Each agent's workdir settings.json is a symlink to its own per-agent
@@ -98,11 +101,12 @@ invoke_setup_ensure_helpers_for_agent() {
   # Issue #555 r2: simulates bridge-setup.sh:run_agent's post-channel
   # ensure block. Drives the same two helpers (`bridge_ensure_claude_stop_hook`
   # and `bridge_ensure_claude_prompt_hook`) the way the FIXED run_agent
-  # does, forwarding the resolved launch_cmd through. Issue #570: the
-  # managed autoCompactWindow default is unconditionally 1_000_000, so
-  # this assertion is now about per-agent *path* routing — the setup
-  # ensure must still write to the per-agent effective file, not clobber
-  # a sibling.
+  # does, forwarding the resolved launch_cmd through. Issue #593: the
+  # renderer is class-aware, but this fixture leaves BRIDGE_AGENT_SOURCE
+  # unset, so the resolver falls back to the unknown-class default
+  # (1_000_000). The assertion is therefore about per-agent *path*
+  # routing — the setup ensure must still write to the per-agent
+  # effective file, not clobber a sibling.
   local agent="$1"
   local workdir="$2"
   local launch_cmd="$3"
@@ -135,17 +139,20 @@ main() {
   printf '%s\n' '{}' >"$install_wide_dir/settings.json"
   printf '%s\n' '{}' >"$install_wide_dir/settings.local.json"
 
-  smoke_log "case 1: agent-A renders per-agent file with managed autoCompactWindow=1_000_000 default (#570)"
+  # BRIDGE_AGENT_SOURCE is unset in this fixture (the helper is invoked
+  # without sourcing the roster), so the renderer falls back to the
+  # unknown-class default (1_000_000) per issue #593 back-compat.
+  smoke_log "case 1: agent-A renders per-agent file with managed autoCompactWindow=1_000_000 default (#593 back-compat)"
   invoke_link_for_agent agent-a "$agent_a_workdir" "claude --model claude-opus-4-7[1m]"
   local agent_a_effective="$agent_a_workdir/.claude/settings.effective.json"
   smoke_assert_file_exists "$agent_a_effective" "agent-A per-agent effective file rendered"
-  smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A autoCompactWindow=1_000_000 (managed default)"
+  smoke_assert_eq "1000000" "$(settings_value "$agent_a_effective" autoCompactWindow)" "agent-A autoCompactWindow=1_000_000 (unknown class → 1M fallback, #593)"
 
   smoke_log "case 2: agent-B renders its OWN per-agent file (separate path from agent-A) with managed default"
   invoke_link_for_agent agent-b "$agent_b_workdir" "claude --model claude-opus-4-6"
   local agent_b_effective="$agent_b_workdir/.claude/settings.effective.json"
   smoke_assert_file_exists "$agent_b_effective" "agent-B per-agent effective file rendered"
-  smoke_assert_eq "1000000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B autoCompactWindow=1_000_000 (managed default)"
+  smoke_assert_eq "1000000" "$(settings_value "$agent_b_effective" autoCompactWindow)" "agent-B autoCompactWindow=1_000_000 (unknown class → 1M fallback, #593)"
 
   smoke_log "case 3: each agent's workdir settings.json is a symlink to its own per-agent effective file"
   local agent_a_link="$agent_a_workdir/.claude/settings.json"

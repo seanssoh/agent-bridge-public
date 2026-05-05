@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# scripts/smoke/managed-autocompact-window.sh — Issue #570 regression smoke.
+# scripts/smoke/managed-autocompact-window.sh — Issue #570 / #593 regression smoke.
 #
 # Covers `bridge-hooks.py render-shared-settings` resolution of the managed
-# autoCompactWindow default. As of issue #570 the default is unconditionally
-# 1_000_000 — the `--launch-cmd` flag is accepted for backwards compatibility
-# but is no longer consulted by the renderer.
+# autoCompactWindow default. Issue #593 made the resolver class-aware:
+# static→400_000, dynamic→1_000_000, unknown/missing→1_000_000 (back-compat).
+# The `--launch-cmd` flag is still accepted for backwards compatibility but
+# is no longer consulted; the new `--agent-class` flag drives the decision.
 #
 # Cases covered:
-#   - launch_cmd containing '[1m]'    → 1_000_000 (was the only 1M case pre-#570)
-#   - launch_cmd lacking '[1m]'        → 1_000_000 (was 400_000 pre-#570)
-#   - --launch-cmd empty / omitted     → 1_000_000 (was 400_000 pre-#570)
-#   - explicit base / overlay value    → wins over the managed default
-#   - CLAUDE_CODE_AUTO_COMPACT_WINDOW   → operator escape hatch (env wins via
-#     Claude Code's resolution order; verified at the runtime layer, not in
-#     this renderer-only smoke).
+#   - launch_cmd containing '[1m]', no --agent-class → 1_000_000 (unknown→1M)
+#   - launch_cmd lacking '[1m]', no --agent-class    → 1_000_000 (unknown→1M)
+#   - --launch-cmd empty / omitted                   → 1_000_000 (unknown→1M)
+#   - --agent-class static                            → 400_000 (#593)
+#   - --agent-class dynamic                           → 1_000_000 (#593)
+#   - explicit base / overlay value                  → wins over managed default
+#   - CLAUDE_CODE_AUTO_COMPACT_WINDOW                 → operator escape hatch (env
+#     wins via Claude Code's resolution order; verified at the runtime layer,
+#     not in this renderer-only smoke).
 
 set -euo pipefail
 
@@ -88,6 +91,16 @@ main() {
   run_render "$base" "$overlay" "$effective"
   assert_window "$effective" "1000000" "omitted launch_cmd flag lands on managed 1M default"
 
+  smoke_log "case: --agent-class static → 400_000 (#593 class-aware default)"
+  run_render "$base" "$overlay" "$effective" \
+    --launch-cmd "" --agent-class "static"
+  assert_window "$effective" "400000" "static class lands on 400_000 (#593)"
+
+  smoke_log "case: --agent-class dynamic → 1_000_000 (#593 class-aware default)"
+  run_render "$base" "$overlay" "$effective" \
+    --launch-cmd "" --agent-class "dynamic"
+  assert_window "$effective" "1000000" "dynamic class lands on 1_000_000 (#593)"
+
   smoke_log "case: base autoCompactWindow wins over managed default"
   printf '%s\n' '{"autoCompactWindow":650000}' >"$base"
   run_render "$base" "$overlay" "$effective" \
@@ -101,7 +114,7 @@ main() {
     --launch-cmd "claude [1m]"
   assert_window "$effective" "475000" "explicit overlay value overrides managed default"
 
-  smoke_log "PASS: managed autoCompactWindow resolver matrix (#570)"
+  smoke_log "PASS: managed autoCompactWindow resolver matrix (#570 / #593)"
 }
 
 main "$@"
