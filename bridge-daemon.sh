@@ -4882,6 +4882,15 @@ cmd_status() {
   else
     echo "stopped socket_listener=${socket_status}"
   fi
+  # Issue #590: surface every log path the operator may need so
+  # `agent-bridge daemon status` answers "where is the daemon writing?"
+  # directly. launchagent_log only prints under launchd-managed installs
+  # (plist present on macOS); on Linux/nohup it is omitted to avoid noise.
+  echo "log=${BRIDGE_DAEMON_LOG}"
+  local _plist="$HOME/Library/LaunchAgents/ai.agent-bridge.daemon.plist"
+  if [[ -f "$_plist" && "$(uname)" == "Darwin" ]]; then
+    echo "launchagent_log=${BRIDGE_LAUNCHAGENT_LOG}"
+  fi
 }
 
 while [[ $# -gt 0 ]]; do

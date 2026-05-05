@@ -411,3 +411,24 @@ Operator guidance:
 - After upgrading to v0.7.2, the `[upgrade-complete]` task body
   contains an agent-safe verification block confirming backup
   hygiene + daemon state + `~/.claude.json` validity. Run it.
+
+## 20. `daemon.log` frozen on launchd-managed installs (issue #590)
+
+Symptom:
+
+- On macOS hosts where `ai.agent-bridge.daemon` is launchd-managed, the
+  plist redirects stdout/stderr to `state/launchagent.log`. Activity
+  follows that file; `state/daemon.log` freezes the moment launchd takes
+  over and an operator who tails `daemon.log` sees nothing.
+
+Current behavior (post #590):
+
+- `BRIDGE_DAEMON_LOG` defaults to `state/launchagent.log` automatically
+  when the launchd plist is present on macOS, and to `state/daemon.log`
+  otherwise (Linux systemd/nohup). Operators can override via env.
+- `agb daemon status` prints both `log=` and `launchagent_log=` lines
+  under launchd so it answers "where is the daemon writing?" directly.
+- `bridge-doctor.py` ships a `daemon-log-split` detector that fires when
+  the configured log is older than 7 days while `launchagent.log` is
+  active, with a `BRIDGE_DAEMON_LOG=...` fix hint in the suggested
+  action.

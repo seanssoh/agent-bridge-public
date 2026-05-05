@@ -85,6 +85,15 @@ tail -n 80 ~/.agent-bridge/state/launchagent-liveness.log     # macOS liveness w
 tail -n 80 ~/.agent-bridge/state/systemd-daemon-liveness.log  # Linux liveness watcher
 ```
 
+On launchd-managed macOS installs the daemon writes its stdout/stderr to
+`state/launchagent.log` (the `StandardOut/ErrorPath` redirect target of the
+`ai.agent-bridge.daemon` plist), so `state/daemon.log` freezes at the moment
+launchd takes over. `BRIDGE_DAEMON_LOG` defaults to `state/launchagent.log`
+automatically when that plist is present; on Linux (systemd/nohup) it stays
+on `state/daemon.log`. Override the env var to relocate either path.
+`agb daemon status` prints both `log=` and `launchagent_log=` lines under
+launchd so you can confirm where output is landing without guessing.
+
 ## Upgrade
 
 표준 upgrade 절차는 [`UPGRADING.md`](UPGRADING.md) 에 정리되어 있다. 모든 install 에서 동일한 명령으로 진행한다:

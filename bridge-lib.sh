@@ -157,7 +157,21 @@ BRIDGE_WORKTREE_META_DIR="${BRIDGE_WORKTREE_META_DIR:-$BRIDGE_STATE_DIR/worktree
 BRIDGE_ACTIVE_ROSTER_TSV="${BRIDGE_ACTIVE_ROSTER_TSV:-$BRIDGE_STATE_DIR/active-roster.tsv}"
 BRIDGE_ACTIVE_ROSTER_MD="${BRIDGE_ACTIVE_ROSTER_MD:-$BRIDGE_STATE_DIR/active-roster.md}"
 BRIDGE_DAEMON_PID_FILE="${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}"
-BRIDGE_DAEMON_LOG="${BRIDGE_DAEMON_LOG:-$BRIDGE_STATE_DIR/daemon.log}"
+# Issue #590: under launchd-managed installs the daemon's stdout/stderr is
+# redirected to launchagent.log by the plist; daemon.log freezes the moment
+# launchd takes over. When the plist is present on macOS, default
+# BRIDGE_DAEMON_LOG to launchagent.log so `tail $BRIDGE_DAEMON_LOG` follows the
+# active stream. Linux (systemd/nohup) installs keep daemon.log as the SSOT.
+# Operators can still override via env.
+__bridge_default_daemon_log() {
+  local plist="$HOME/Library/LaunchAgents/ai.agent-bridge.daemon.plist"
+  if [[ -f "$plist" && "$(uname)" == "Darwin" ]]; then
+    printf '%s' "$BRIDGE_STATE_DIR/launchagent.log"
+  else
+    printf '%s' "$BRIDGE_STATE_DIR/daemon.log"
+  fi
+}
+BRIDGE_DAEMON_LOG="${BRIDGE_DAEMON_LOG:-$(__bridge_default_daemon_log)}"
 BRIDGE_DAEMON_CRASH_LOG="${BRIDGE_DAEMON_CRASH_LOG:-$BRIDGE_STATE_DIR/daemon-crash.log}"
 BRIDGE_DAEMON_INTERVAL="${BRIDGE_DAEMON_INTERVAL:-5}"
 BRIDGE_DAEMON_START_WAIT_SECONDS="${BRIDGE_DAEMON_START_WAIT_SECONDS:-3}"
