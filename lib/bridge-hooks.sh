@@ -149,8 +149,8 @@ bridge_ensure_claude_shared_settings_for_managed_workdir() {
 bridge_link_claude_settings_to_shared() {
   local workdir="$1"
   # Issue #570: launch_cmd is accepted for backwards compatibility but the
-  # managed autoCompactWindow default is unconditionally 1_000_000; the
-  # renderer no longer inspects this value.
+  # managed autoCompactWindow default is no longer derived from it; the
+  # renderer keys off --agent-class instead (issue #593).
   local launch_cmd="${2-}"
   # Issue #555: when the caller passes the agent id (3rd arg), render the
   # effective file at the per-agent path so mixed-model installs get
@@ -159,8 +159,19 @@ bridge_link_claude_settings_to_shared() {
   # install-wide render so the helper remains backwards-compatible.
   local agent="${3-}"
   local effective_file
+  local agent_class=""
   if [[ -n "$agent" ]]; then
     effective_file="$(bridge_hook_per_agent_settings_effective_file "$agent")"
+    # Issue #593: source class drives the managed autoCompactWindow default
+    # (static→400_000, dynamic→1_000_000). Gate the lookup behind a
+    # declare-check on BRIDGE_AGENT_SOURCE so callers that haven't sourced
+    # the roster (smoke fixtures, back-compat callers) keep working — when
+    # the array is missing, agent_class stays empty and the renderer falls
+    # back to the unknown-class default (1_000_000). Mirrors the same
+    # gating bridge_claude_settings_mode uses for BRIDGE_AGENT_IDS above.
+    if declare -p BRIDGE_AGENT_SOURCE >/dev/null 2>&1; then
+      agent_class="$(bridge_agent_source "$agent" 2>/dev/null || true)"
+    fi
   else
     effective_file="$(bridge_hook_shared_settings_effective_file)"
   fi
@@ -168,7 +179,8 @@ bridge_link_claude_settings_to_shared() {
     --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
     --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
     --effective-settings-file "$effective_file" \
-    --launch-cmd "$launch_cmd" >/dev/null
+    --launch-cmd "$launch_cmd" \
+    --agent-class "$agent_class" >/dev/null
   bridge_hooks_python link-shared-settings --workdir "$workdir" --shared-settings-file "$effective_file"
 }
 
@@ -343,6 +355,15 @@ bridge_install_isolated_home_settings() {
   local stage_dir=""
   local stage_settings=""
   local stage_effective=""
+  # Issue #593: pass the agent's source class through to the renderer so
+  # the isolated-home effective file matches the per-agent shared render.
+  # Gate the lookup so the helper still works when called from contexts
+  # that haven't loaded the roster (BRIDGE_AGENT_SOURCE absent → empty
+  # agent_class → renderer falls back to the unknown-class default).
+  local agent_class=""
+  if declare -p BRIDGE_AGENT_SOURCE >/dev/null 2>&1; then
+    agent_class="$(bridge_agent_source "$agent" 2>/dev/null || true)"
+  fi
 
   [[ -n "$agent" ]] || return 0
 
@@ -431,7 +452,8 @@ bridge_install_isolated_home_settings() {
         --isolated-home "$stage_home" \
         --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
         --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
-        --launch-cmd "$launch_cmd" >"$stage_root/render.out" 2>&1; then
+        --launch-cmd "$launch_cmd" \
+        --agent-class "$agent_class" >"$stage_root/render.out" 2>&1; then
     bridge_warn "isolated home settings install: render failed for $agent ($(head -n1 "$stage_root/render.out" 2>/dev/null || true))"
     rm -rf "$stage_root"
     return 0

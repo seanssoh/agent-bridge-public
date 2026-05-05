@@ -18,26 +18,48 @@ from typing import Any
 # precedence over settings and would make operator overlays harder to reason
 # about.
 #
-# Default to the 1M-context window (issue #570): the previous launch_cmd
-# `[1m]` substring heuristic (issue #547) never fired in practice because
-# `[1m]` is a model-id suffix the runtime prints (`claude-opus-4-7[1m]`),
-# not a CLI argument — agents always launched with the 400_000 legacy cap,
-# making `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=45` compact at ~180K instead of
-# the intended ~450K. Setting 1_000_000 is a no-regret upper bound: any
-# model with smaller native context will compact earlier on its own.
-BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW = 1_000_000
+# Token budgets are class-aware (issue #593):
+# - static-class agents (long-lived, registered in agent-roster.local.sh)
+#   compact at 400_000 tokens — the legacy default that protects 8GB-RAM
+#   hosts from the worst-case 1M-context restore.
+# - dynamic agents (--prefer new, ad hoc, --codex --name … spawns)
+#   compact at 1_000_000 tokens — they're disposable and benefit from
+#   the full window.
+# Unknown / missing class falls back to 1_000_000 (safer per issue #570:
+# the prior launch_cmd `[1m]` substring heuristic from #547 never fired in
+# practice — `[1m]` is a model-id suffix the runtime prints, not a CLI
+# argument — and 1_000_000 is a no-regret upper bound because models with
+# smaller native context will compact earlier on their own).
+BRIDGE_AUTOCOMPACT_WINDOW_STATIC = 400_000
+BRIDGE_AUTOCOMPACT_WINDOW_DYNAMIC = 1_000_000
+BRIDGE_AUTOCOMPACT_WINDOW_DEFAULT = BRIDGE_AUTOCOMPACT_WINDOW_DYNAMIC
+# Back-compat alias for any external caller that imported the pre-#593
+# constant name; same value as the unknown-class fallback.
+BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW = BRIDGE_AUTOCOMPACT_WINDOW_DEFAULT
 
 
-def resolve_managed_autocompact_window(launch_cmd: str | None) -> int:
-    # launch_cmd is accepted for backwards compatibility with callers but is
-    # no longer consulted; see issue #570.
+def resolve_managed_autocompact_window(
+    launch_cmd: str | None,
+    agent_class: str | None = None,
+) -> int:
+    # launch_cmd is retained for ABI compatibility with callers that still
+    # pass it positionally; the substring heuristic was removed in #570 and
+    # the resolver now keys off agent_class instead (issue #593).
     del launch_cmd
-    return BRIDGE_DEFAULT_AUTOCOMPACT_WINDOW
+    cls = (agent_class or "").strip().lower()
+    if cls == "static":
+        return BRIDGE_AUTOCOMPACT_WINDOW_STATIC
+    if cls == "dynamic":
+        return BRIDGE_AUTOCOMPACT_WINDOW_DYNAMIC
+    return BRIDGE_AUTOCOMPACT_WINDOW_DEFAULT
 
 
-def managed_claude_settings_defaults(launch_cmd: str | None) -> dict[str, Any]:
+def managed_claude_settings_defaults(
+    launch_cmd: str | None,
+    agent_class: str | None = None,
+) -> dict[str, Any]:
     return {
-        "autoCompactWindow": resolve_managed_autocompact_window(launch_cmd),
+        "autoCompactWindow": resolve_managed_autocompact_window(launch_cmd, agent_class),
     }
 
 
@@ -829,7 +851,8 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
         raise SystemExit(f"shared settings overlay must be a JSON object: {overlay_path}")
 
     launch_cmd = (getattr(args, "launch_cmd", "") or "") or None
-    managed_defaults = managed_claude_settings_defaults(launch_cmd)
+    agent_class = (getattr(args, "agent_class", "") or "") or None
+    managed_defaults = managed_claude_settings_defaults(launch_cmd, agent_class)
     merged = merge_settings(managed_defaults, base_payload)
     merged = merge_settings(merged, overlay_payload)
     save_json(effective_path, merged)
@@ -879,6 +902,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     base_path = Path(args.base_settings_file).expanduser()
     overlay_path = Path(args.overlay_settings_file).expanduser()
     launch_cmd = (getattr(args, "launch_cmd", "") or "") or None
+    agent_class = (getattr(args, "agent_class", "") or "") or None
 
     target_dir = isolated_home / ".claude"
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -926,7 +950,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     if not isinstance(overlay_payload, dict):
         raise SystemExit(f"isolated overlay must be a JSON object: {overlay_path}")
 
-    managed_defaults = managed_claude_settings_defaults(launch_cmd)
+    managed_defaults = managed_claude_settings_defaults(launch_cmd, agent_class)
     merged = merge_settings(managed_defaults, base_payload)
     merged = merge_settings(merged, overlay_payload)
     if preserved:
@@ -1211,7 +1235,12 @@ def build_parser() -> argparse.ArgumentParser:
     render_shared_parser.add_argument(
         "--launch-cmd",
         default="",
-        help="Accepted for backwards compatibility; no longer consulted (issue #570 — managed autoCompactWindow default is unconditionally 1_000_000).",
+        help="Accepted for backwards compatibility; no longer consulted (issue #570 — managed autoCompactWindow default keys off --agent-class instead).",
+    )
+    render_shared_parser.add_argument(
+        "--agent-class",
+        default="",
+        help="static|dynamic — drives the autoCompactWindow default (issue #593: static=400_000, dynamic=1_000_000, unknown=1_000_000).",
     )
     render_shared_parser.add_argument("--format", choices=("text", "shell"), default="text")
     render_shared_parser.set_defaults(handler=cmd_render_shared_settings)
@@ -1228,7 +1257,12 @@ def build_parser() -> argparse.ArgumentParser:
     render_isolated_parser.add_argument(
         "--launch-cmd",
         default="",
-        help="Accepted for backwards compatibility; no longer consulted (issue #570 — managed autoCompactWindow default is unconditionally 1_000_000).",
+        help="Accepted for backwards compatibility; no longer consulted (issue #570 — managed autoCompactWindow default keys off --agent-class instead).",
+    )
+    render_isolated_parser.add_argument(
+        "--agent-class",
+        default="",
+        help="static|dynamic — drives the autoCompactWindow default (issue #593: static=400_000, dynamic=1_000_000, unknown=1_000_000).",
     )
     render_isolated_parser.add_argument("--format", choices=("text", "shell"), default="text")
     render_isolated_parser.set_defaults(handler=cmd_render_isolated_home_settings)
