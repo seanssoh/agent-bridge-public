@@ -6,6 +6,71 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.7.7] — 2026-05-05
+
+### Highlight — channel/queue resilience + isolation hardening + tool-policy boundary fixes
+
+`v0.7.7` consolidates eight fixes across the channel, queue gateway, isolation, and tool-policy boundaries. Headline: a new opt-in Unix-socket transport for the queue gateway with peer-UID auth (#571), a security-boundary rebuild of per-agent isolated marketplace catalogs (#557), and a daemon-survival fix that closes a real production crash path (#576). Smaller correctness wins: ms365 channel readiness now matches its env-only token model (#573), Teams edits route through Claude channels with edit-aware dedupe (#569), and tool-policy no longer denies stderr-suppressed read commands on protected paths (#577, fixes #574). Two operator-facing defaults flip: managed agents get `autoCompactWindow=1_000_000` unconditionally (#575, fixes #570), and bootstrap migrates the legacy `[cron-dispatch]` cron payload form to canonical `bash $script` (#572).
+
+All changes auto-apply on `agent-bridge upgrade --apply` to v0.7.7+. PR #571's socket transport is opt-in via `BRIDGE_GATEWAY_TRANSPORT=socket` on Linux + root installs; the default file-drop transport is unchanged.
+
+### Added (#571 — PR #571)
+
+- Unix domain `SOCK_SEQPACKET` queue gateway transport with peer-UID authorization via `SO_PEERCRED`. Linux-only fail-closed (refuses to start on non-Linux); root-installed system mode (tmpfiles.d, `root:root` runtime). Per-command argv strict parser rejects unknown long options as `unknown_option`; argparse `allow_abbrev=False` on the top-level parser plus 16 subparsers prevents abbreviation bypass. Server-side ownership re-check on `do_cancel` / `do_update` / `do_handoff` (defense-in-depth). Connect-probe (AF_UNIX SOCK_SEQPACKET, 1.0s timeout) replaces pid+file-existence liveness check; recycled-pid + leftover-socket false-positives now report not-running. Public reason-code allow-list (`_PUBLIC_REASON_MAP` frozenset) collapses task-existence / ownership leaks to `not_authorized`; detailed code stays in server log only. Body-file inlining uses `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` + `S_ISREG` check + bounded read (rejects FIFO / symlink / dir; FIFO no longer hangs). Client validates `reason_code` against the allow-list and coerces `exit_code` with fallback `1`. Daemon writes `BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT`, `BRIDGE_QUEUE_GATEWAY_SOCKET_TIMEOUT_SECONDS`, and `BRIDGE_GATEWAY_TRANSPORT` into isolated agent env files when the operator selects non-default values.
+
+### Added (#572 — PR #572)
+
+- Bootstrap legacy cron payload migration. `bootstrap-memory-system.sh` now detects five managed wiki/librarian crons whose payloads start with the literal `[cron-dispatch]` prefix and migrates them to the canonical `bash $installed_script` form during `--apply`. `cron_lookup` extended from 3 → 4 columns (added `payload_preview`). Three modes: `--check` records `drift-payload-pending`, `--dry-run` reports `would-migrate-payload`, `--apply` migrates via `agb cron update --payload`.
+
+### Added (#557 — PR #557)
+
+- Per-agent filtered `known_marketplaces.json` catalog instead of exposing the controller catalog wholesale (security boundary). GitHub URL alias parsing (`_github_repo_slug`) handles five URL forms (`https://github.com/<org>/<repo>(.git)?`, `git://`, `git@github.com:<org>/<repo>(.git)?`, bare `<org>/<repo>(.git)?`) and produces a consistent `<org>-<repo>` slug. Alias collision detection: pre-pass builds the map and fails loud listing every collider before any symlink is planted. Marketplace-id sanitization uses `re.fullmatch(^[A-Za-z0-9._-]+$)` (not `re.match($)` — catches the trailing-newline bypass), enforces length ≤ 200, blocks reserved names (CON/NUL/etc.) and leading-dot names except `.git`. `bridge_die` fail-loud on rejection (no silent skip). Validator wired into `bridge-dev-plugin-cache.py` production path-build sites and `bridge_write_isolated_installed_plugins_manifest`. Pre-creates read-only marketplace aliases (root-owned `0640` catalog; isolated UID can read but not write/unlink). 26-input cross-validator parity sweep ensures `bridge-dev-plugin-cache.py` and inline `lib/bridge-agents.sh` validators agree on accept/reject. v2 non-member group denial test capability-gated on `BRIDGE_TEST_PR_C_NONMEMBER_UID`. Whitespace-key e2e bypass-tokenizer helper covers space, tab, newline, CR, leading tab.
+
+### Added (#576 — PR #576)
+
+- `daemon_source_state_file` per-callsite required-vars check + pre-source unset prevents stale uppercase-var leak across six callsites (STALL_*, CONTEXT_PRESSURE_*, CRASH_*, AUTO_START_*, LAST_*). Empty/truncated env files now caught (not just permission/syntax). Default ACL inheritance for `runtime_state_dir`, `log_dir`, queue gateway dirs, and memory daily agent/shared dirs. New ACL inheritance smoke with positive + negative cases, capability-gated explicit-skip on macOS / no-`setfacl` hosts. Two-non-root-UID validation gate for v2 group denial (operator-side `BRIDGE_TEST_PR_C_NONMEMBER_UID`).
+
+### Changed (#575 — PR #575) — closes #570
+
+- Managed agent `autoCompactWindow` default raised to `1_000_000` unconditionally. `bridge-hooks.py:resolve_managed_autocompact_window` no longer attempts the legacy `[1m]` substring match against `launch_cmd` — `[1m]` is a model-id PRINT suffix and never appears in any agent's launch_cmd, so the heuristic was dead code on every install. Operators on Opus 4.7 with `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=45` now get a 450k effective compact window (was 180k due to the legacy 400k default). Four smoke files updated; eight-plus stale `[1m]` / launch_cmd references cleaned from CLI parser help, `OPERATIONS.md`, `UPGRADING.md`, `OPERATOR_ACTIONS_PENDING.md`, `lib/bridge-hooks.sh`, `lib/bridge-migration.sh`, `bridge-agent.sh`, `bridge-start.sh`, `bridge-upgrade.sh`, and `bridge-setup.sh`.
+
+### Changed (#573 — PR #573)
+
+- `plugin:ms365` channel readiness reports `n/a` for access status, matching the env-only token runtime contract. No longer requires `.ms365/access.json`. Other channel plugins (Discord, Telegram, Teams, Mattermost) still require `access.json` — no incorrect reclassification. The smoke detects a real missing `.env` case; diagnostic clarity is preserved.
+
+### Changed (#569 — PR #569)
+
+- Teams plugin delivers inbound via `notifications/claude/channel` directly; the queue-sender path (`agent-bridge urgent`) is removed. `ActivityTypes.MessageUpdate` (Teams edits) is routed alongside `Message`; `MessageDelete` is intentionally out of scope. Edit-aware dedupe key `chatId::messageId::revision` (revision = `activity.localTimestamp ?? activity.timestamp`) with backward-compat fallback for legacy `messages.jsonl` rows lacking `revision`. Catch block split: channel delivery rethrows on failure (Teams retries); log-append failure logs a warning and returns 2xx. Migration tradeoff: legacy rows without `revision` suppress edits-on-top during the migration window — preserves idempotency at the cost of a one-time edit loss for pre-existing messages. Supersedes #558.
+
+### Fixed (#577 — PR #577) — closes #574
+
+- `hooks/tool-policy.py::_is_read_intent_bash` correctly classifies `2>/dev/null`, `2>&1`, and `&>/dev/null` as read-intent on protected paths. Boundary-aware regex sanitization only strips when the suppression form is followed by EOS, whitespace, or an actual shell separator (`; & | ( ) < >`); rejects when followed by a path char (`/`), word char (`.`), variable expansion (`$`), or command substitution (backtick). Real writes still blocked even when adjacent to safe forms (`> bar`, `>> bar`, `2>err.log`, `> bar 2>&1`). Eleven codified regression assertions live in `tests/system-config-gating/smoke.sh` Scenario 8 (8a allow, 8b deny, 8c path-collision, 8d compound).
+
+### Fixed (#576 — PR #576)
+
+- macOS `/bin/bash` re-exec preserves script identity via `BASH_SOURCE` capture — `bridge-lib.sh` and `scripts/smoke/daemon.sh` now snapshot `BASH_SOURCE` before the exec re-launch (was failing because `$0=_` after exec on macOS).
+- Empty/truncated daemon state env files no longer pass `bash -n` + `source` silently into the daemon under `set -e`.
+- Stale uppercase-var leak across six daemon callsites after a failed source resolved via pre-source unset.
+
+### Security (#557 — PR #557)
+
+- Marketplace-id sanitization closes the path-traversal / control-char attack surface; collision detection fails loud naming every collider before any symlink is planted.
+
+### Security (#576 — PR #576)
+
+- Default ACL inheritance grants controller readability on isolated-UID-created files in runtime / log / memory state dirs (closes the daemon crash path observed at 2026-05-04T15:47:17Z; #538-class).
+
+### Security (#571 — PR #571)
+
+- Public reason-code allow-list prevents task-existence / ownership info leak across the isolation boundary; detailed codes stay in the server log only.
+- argparse `allow_abbrev=False` plus strict per-subcommand value-flag tables prevent argv smuggling (`done --note-f 60 12 --agent forged` no longer authorizes 60 while executing 12).
+
+### Operator action
+
+- **None for the common path.** All changes auto-apply on `agent-bridge upgrade --apply` to v0.7.7+.
+- (optional) Linux + root installs that want the new socket gateway transport set `BRIDGE_GATEWAY_TRANSPORT=socket` and run the daemon under root; default file-drop transport is unchanged.
+- (optional) Run `bootstrap-memory-system.sh --check` then `--dry-run` to preview legacy `[cron-dispatch]` payload migrations before `--apply` rewrites them.
+
 ## [0.7.6] — 2026-05-04
 
 ### Highlight — linux-user isolated agents end-to-end + system agent class + per-agent settings architecture
