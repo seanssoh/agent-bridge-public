@@ -431,7 +431,7 @@ function loadTeamsActivityIndex(path: string, agent: string): TeamsActivityIndex
 
 let teamsRecordedTail = 0
 
-function writeTeamsActivityIndex(
+export function writeTeamsActivityIndex(
   agent: string,
   channelId: string,
   messageId: string,
@@ -869,11 +869,45 @@ async function handleActivity(context: TurnContext): Promise<void> {
 
   // PreCompact channel auto-notify activity-index write — issue #597 Track C.
   // Best-effort; failures are logged inside the helper and never bubble up.
+  //
+  // Bot-self exclusion: only record inbound activity from a real user. Teams'
+  // Bot Framework can echo bot-authored messages back through the inbound
+  // pipeline (proactive sends from continueConversation, multi-bot crosstalk
+  // in shared channels). Recording those would point the daemon's
+  // route-precompact-target at the bot's own posts, breaking the "reply to
+  // the user who last spoke" contract. The most reliable Bot Framework signal
+  // is `from.role === 'bot'`; we also defense-in-depth against self-echo where
+  // `from.id` matches the bot's recipient id. See codex r1 review of #610.
   const agentForIndex = process.env.BRIDGE_AGENT_ID ?? ''
-  if (agentForIndex) {
+  if (agentForIndex && !isInboundFromBotOrSelf(activity)) {
     const inboundDate = activity.timestamp instanceof Date ? activity.timestamp : new Date()
     writeTeamsActivityIndex(agentForIndex, chatId, messageId, stored.user_id, inboundDate)
   }
+}
+
+/**
+ * True when an inbound activity is from a bot or a self-echo of the bot's own
+ * outbound message. Used to skip activity-index updates that would otherwise
+ * point the PreCompact route lookup at bot posts instead of the last user
+ * inbound.
+ *
+ * Signals (in order of reliability):
+ *   1. `from.role === 'bot'` — Bot Framework convention; emitted by Teams for
+ *      proactive sends and bot-to-bot messages.
+ *   2. `from.id === recipient.id` — self-echo: the bot is identified as both
+ *      the sender and the recipient on the same activity.
+ *   3. `from.id === APP_ID` — the bot's app id appears as the sender.
+ *
+ * Exported for the precompact-notify smoke harness.
+ */
+export function isInboundFromBotOrSelf(activity: Partial<Activity> & { from?: { id?: string; role?: string }; recipient?: { id?: string } }): boolean {
+  const from = activity.from
+  if (!from) return false
+  if (from.role === 'bot') return true
+  const recipientId = activity.recipient?.id ?? ''
+  if (from.id && recipientId && from.id === recipientId) return true
+  if (APP_ID && from.id && from.id === APP_ID) return true
+  return false
 }
 
 const httpServer = createServer((req, res) => {
@@ -991,6 +1025,49 @@ const CLI_SUBCOMMAND = (process.argv[2] ?? '').trim()
 if (CLI_SUBCOMMAND === 'send-managed') {
   const code = await runSendManagedCli()
   process.exit(code)
+}
+
+// Internal smoke harness — exercised only by tests/precompact-notify/teams-mattermost-adapter.sh.
+// `_smoke-record-activity` invokes writeTeamsActivityIndex directly so the
+// smoke can validate the activity-index file schema without spinning up a
+// full Bot Framework adapter. `_smoke-should-record` reports whether a
+// synthesized activity would be skipped by the bot-self filter. Both
+// short-circuit before httpServer.listen.
+if (CLI_SUBCOMMAND === '_smoke-record-activity' || CLI_SUBCOMMAND === '_smoke-should-record') {
+  const argv = process.argv.slice(3)
+  const flags: Record<string, string> = {}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (!arg.startsWith('--')) continue
+    const key = arg.slice(2)
+    const value = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : ''
+    if (value) i++
+    flags[key] = value
+  }
+  if (CLI_SUBCOMMAND === '_smoke-record-activity') {
+    const agent = String(flags['agent'] ?? '').trim()
+    const channelId = String(flags['channel-id'] ?? '').trim()
+    const messageId = String(flags['message-id'] ?? '').trim()
+    const userId = String(flags['user-id'] ?? '').trim()
+    const tsMs = Number(flags['ts-ms'] ?? Date.now())
+    if (!agent || !channelId || !messageId) {
+      process.stderr.write('teams _smoke-record-activity: --agent, --channel-id, --message-id required\n')
+      process.exit(2)
+    }
+    writeTeamsActivityIndex(agent, channelId, messageId, userId, new Date(tsMs))
+    process.exit(0)
+  }
+  // _smoke-should-record
+  const fromId = String(flags['from-id'] ?? '').trim()
+  const fromRole = String(flags['from-role'] ?? '').trim()
+  const recipientId = String(flags['recipient-id'] ?? '').trim()
+  const fakeActivity: any = {
+    from: { id: fromId, role: fromRole || undefined },
+    recipient: { id: recipientId },
+  }
+  const isBotOrSelf = isInboundFromBotOrSelf(fakeActivity)
+  process.stdout.write(JSON.stringify({ should_skip: isBotOrSelf }) + '\n')
+  process.exit(0)
 }
 
 httpServer.listen(PORT, HOST, () => {

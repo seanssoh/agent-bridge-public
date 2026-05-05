@@ -901,10 +901,34 @@ async function runSendManagedCli(): Promise<number> {
   if (agent && !process.env.BRIDGE_AGENT_ID) {
     process.env.BRIDGE_AGENT_ID = agent
   }
-  if (!MM_TOKEN) {
+
+  // Resolve the per-agent route token so managed sends preserve bot identity
+  // in multi-bot deployments. MATTERMOST_BOT_ROUTES maps each route to a
+  // distinct bot account (token + username); send-managed should post as the
+  // bot configured for `--agent` rather than the global MM_TOKEN. Falls back
+  // to MM_TOKEN when no route matches (preserves behavior for installs that
+  // haven't set up multi-agent routing). See codex r1 review of #610.
+  let routeToken = ''
+  if (agent) {
+    try {
+      const routes = loadBotRoutes()
+      for (const r of routes) {
+        const routeAgent = r.agent ?? r.username.replace(/-bot$/, '').replace(/-/g, '_')
+        if (routeAgent === agent && r.token) {
+          routeToken = r.token
+          break
+        }
+      }
+    } catch (err) {
+      process.stderr.write(`mattermost send-managed: bot-routes lookup failed: ${err}\n`)
+    }
+  }
+  const sendToken = routeToken || MM_TOKEN
+  if (!sendToken) {
     process.stderr.write(
-      'mattermost send-managed: MATTERMOST_BOT_TOKEN required for managed sends; ' +
-        `set it in ${ENV_FILE}\n`,
+      'mattermost send-managed: no token available for agent ' +
+        (agent || '(unspecified)') +
+        '; set MATTERMOST_BOT_TOKEN or MATTERMOST_BOT_ROUTES in ' + ENV_FILE + '\n',
     )
     return 2
   }
@@ -924,7 +948,7 @@ async function runSendManagedCli(): Promise<number> {
   // shape, Mattermost resolves equivalently.
   let posted: unknown
   try {
-    posted = await mmCreatePost(channelId, sanitizedBody, undefined, replyToMessageId || undefined)
+    posted = await mmCreatePost(channelId, sanitizedBody, sendToken, replyToMessageId || undefined)
   } catch (err) {
     process.stderr.write(`mattermost send-managed: send failed: ${err}\n`)
     return 1
