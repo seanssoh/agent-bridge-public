@@ -146,10 +146,15 @@ resolve_bash4() {
 }
 
 assert_helper_plumbing() {
-  # Source the helper directly to verify the prefix/suffix matcher is
-  # canonical and that the spawn-side --test-fixture flag plumbs into
-  # TEST_FIXTURE=1 without invoking tmux. This is the boundary this
-  # fixture owns; driving the full spawn path would require live tmux.
+  # Two-part assertion (codex r1 of #604 caught the original T8 only
+  # exercising the helper directly):
+  #   1. Helper-level: positive + negative prefix coverage via direct
+  #      sourcing of lib/bridge-core.sh.
+  #   2. End-to-end: drive `agent-bridge --codex --name smoke-x
+  #      --test-fixture --no-attach` so the dynamic-spawn entrypoint's
+  #      policy check passes and the audit row lands. The --no-attach
+  #      flag stops short of an interactive tmux attach, but the policy
+  #      check + audit emission run before the tmux step regardless.
   local bash4
   if ! bash4="$(resolve_bash4)"; then
     smoke_skip "helper plumbing" "no Bash 4+ binary on PATH (lib/bridge-core.sh uses declare -g)"
@@ -187,13 +192,32 @@ HELPER
     smoke_fail "helper plumbing: $out"
   smoke_assert_contains "$out" "OK" "helper matcher canonical (positive + negative)"
 
-  # Argparse plumbing: scan the agent-bridge entry point to confirm
-  # --test-fixture is wired (cheap textual contract — keeps T8 honest
-  # without booting tmux).
-  smoke_assert_contains \
-    "$(cat "$SMOKE_REPO_ROOT/agent-bridge")" \
-    "TEST_FIXTURE=1" \
-    "agent-bridge wires --test-fixture into TEST_FIXTURE=1"
+  # End-to-end spawn-with-fixture: drive the actual `agent-bridge` entry
+  # point so we exercise the same argparse + policy + audit path the
+  # operator hits. We don't assert an exit code — downstream tmux setup
+  # is allowed to fail in a smoke environment without a live tmux server
+  # — but we DO assert that:
+  #   (a) the test-artifact-pattern refusal NEVER appears (proving the
+  #       policy passed), and
+  #   (b) the audit log records `agent_test_fixture_created` with
+  #       entrypoint=spawn.
+  reset_runtime
+  local spawn_out
+  spawn_out="$(run_agent_bridge --codex --name smoke-x --test-fixture --no-attach 2>&1)" || true
+  smoke_assert_not_contains "$spawn_out" "test-artifact pattern" \
+    "spawn smoke-x --test-fixture: policy did NOT refuse"
+  smoke_assert_file_exists "$BRIDGE_AUDIT_LOG" \
+    "spawn --test-fixture: audit log file exists"
+  local spawn_audit
+  spawn_audit="$(cat "$BRIDGE_AUDIT_LOG")"
+  smoke_assert_contains "$spawn_audit" "agent_test_fixture_created" \
+    "spawn --test-fixture writes agent_test_fixture_created audit row"
+  smoke_assert_contains "$spawn_audit" "smoke-x" \
+    "spawn audit row carries the agent name"
+  smoke_assert_contains "$spawn_audit" "test-fixture-flag" \
+    "spawn audit row carries reason=test-fixture-flag"
+  smoke_assert_contains "$spawn_audit" "spawn" \
+    "spawn audit row carries entrypoint=spawn"
 }
 
 main() {
