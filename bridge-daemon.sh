@@ -3374,6 +3374,33 @@ process_precompact_events() {
   shopt -u nullglob
 }
 
+# Parse error_class out of bridge-channels.py send-managed-message stderr.
+# The send primitive emits "send-managed-message error: <code>: <message>"
+# (see bridge-channels.py SendAdapterError handler). Codes include
+# track_c_pending (Teams/Mattermost), missing_credentials, platform_error,
+# network_error, http_error, malformed_response, unsupported_plugin.
+# Falls back to "send_failed" when the stderr is empty or unparseable so the
+# audit row always carries a non-empty error_class.
+_bridge_precompact_parse_error_class() {
+  local stderr_text="${1:-}"
+  local fallback="send_failed"
+  if [[ -z "$stderr_text" ]]; then
+    printf '%s' "$fallback"
+    return 0
+  fi
+  local parsed=""
+  parsed="$(printf '%s' "$stderr_text" \
+    | grep -E 'send-managed-message error:' \
+    | head -1 \
+    | sed -E 's/^.*send-managed-message error: *([A-Za-z0-9_-]+).*/\1/' \
+    || true)"
+  if [[ -n "$parsed" && "$parsed" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    printf '%s' "$parsed"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
 # Internal: process every started marker for one agent. Each marker either
 # becomes a sent notice (with pending state) or is skipped; in both cases the
 # marker moves to processed/ so the daemon does not reconsider it. Malformed
@@ -3580,7 +3607,14 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
   fi
   local send_output=""
   local send_rc=0
-  send_output="$(bridge_with_timeout 30 precompact_send python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" "${send_args[@]}" 2>/dev/null)" || send_rc=$?
+  local send_stderr_file
+  send_stderr_file="$(mktemp 2>/dev/null || printf '%s/precompact-notice-stderr.%s' "${TMPDIR:-/tmp}" "$$")"
+  send_output="$(bridge_with_timeout 30 precompact_send python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" "${send_args[@]}" 2>"$send_stderr_file")" || send_rc=$?
+  local send_stderr=""
+  if [[ -f "$send_stderr_file" ]]; then
+    send_stderr="$(cat "$send_stderr_file" 2>/dev/null || true)"
+    rm -f "$send_stderr_file" 2>/dev/null || true
+  fi
 
   local CHANNEL_SEND_STATUS="" CHANNEL_SEND_PLUGIN="" CHANNEL_SEND_CHANNEL_ID=""
   local CHANNEL_SEND_REPLY_TO_MESSAGE_ID="" CHANNEL_SEND_MESSAGE_ID=""
@@ -3591,6 +3625,8 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
   fi
 
   if (( send_rc != 0 )) || [[ "$CHANNEL_SEND_STATUS" != "ok" ]]; then
+    local error_class
+    error_class="$(_bridge_precompact_parse_error_class "$send_stderr")"
     bridge_audit_log daemon precompact_notice_failed "$agent" \
       --detail event_id="$event_id" \
       --detail plugin="$CHANNEL_ROUTE_PLUGIN" \
@@ -3600,7 +3636,7 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
       --detail trigger="$trigger" \
       --detail started_ts="$started_ts" \
       --detail send_rc="$send_rc" \
-      --detail error_class="send_failed" 2>/dev/null || true
+      --detail error_class="$error_class" 2>/dev/null || true
     mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
     return 0
   fi
@@ -3775,27 +3811,43 @@ for k in keys:
     return 0
   fi
 
-  # Update EMA stats and resolve duration / expected_seconds for the followup.
-  local stats_output=""
-  stats_output="$(bridge_with_timeout 10 precompact_stats_record python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" \
-    record-precompact-completion \
-    --agent "$agent" \
-    --trigger "$pending_trigger" \
-    --started-ts "$pending_started_ts" \
-    --completed-ts "$completed_ts" \
-    --bridge-state-dir "$BRIDGE_STATE_DIR" \
-    --format shell 2>/dev/null)" || stats_output=""
+  # Update EMA stats once per event_id. The completion-recorded flag prevents
+  # follow-up retries from re-incrementing the counter / re-blending the EMA
+  # when the send fails repeatedly (see r2 of #611). Compute duration locally
+  # so a skipped record-call still produces the right value for rendering.
+  local recorded_flag_dir="$agent_state_dir/precompact-completion-recorded"
+  local recorded_flag="$recorded_flag_dir/$pending_event_id.flag"
+  local duration_secs=$(( completed_ts - pending_started_ts ))
+  (( duration_secs >= 0 )) || duration_secs=0
 
-  local PRECOMPACT_STATS_DURATION_SECONDS=""
-  local PRECOMPACT_STATS_EXPECTED_SECONDS=""
-  local PRECOMPACT_STATS_ALPHA=""
-  if [[ -n "$stats_output" ]]; then
-    # shellcheck disable=SC1090
-    source /dev/stdin <<<"$stats_output"
+  if [[ ! -f "$recorded_flag" ]]; then
+    local stats_output=""
+    stats_output="$(bridge_with_timeout 10 precompact_stats_record python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" \
+      record-precompact-completion \
+      --agent "$agent" \
+      --trigger "$pending_trigger" \
+      --started-ts "$pending_started_ts" \
+      --completed-ts "$completed_ts" \
+      --bridge-state-dir "$BRIDGE_STATE_DIR" \
+      --format shell 2>/dev/null)" || stats_output=""
+
+    local PRECOMPACT_STATS_DURATION_SECONDS=""
+    local PRECOMPACT_STATS_EXPECTED_SECONDS=""
+    local PRECOMPACT_STATS_ALPHA=""
+    if [[ -n "$stats_output" ]]; then
+      # shellcheck disable=SC1090
+      source /dev/stdin <<<"$stats_output"
+    fi
+
+    if [[ "${PRECOMPACT_STATS_DURATION_SECONDS:-}" =~ ^[0-9]+$ ]]; then
+      duration_secs="$PRECOMPACT_STATS_DURATION_SECONDS"
+    fi
+
+    # Mark EMA as recorded for this event regardless of send outcome below;
+    # the stats file has already been mutated and a retry must not re-blend.
+    mkdir -p "$recorded_flag_dir" 2>/dev/null || true
+    : >"$recorded_flag" 2>/dev/null || true
   fi
-
-  local duration_secs="${PRECOMPACT_STATS_DURATION_SECONDS:-0}"
-  [[ "$duration_secs" =~ ^[0-9]+$ ]] || duration_secs=0
 
   # Render the follow-up body.
   local render_output=""
@@ -3837,6 +3889,7 @@ for k in keys:
 
   local send_rc=0
   local send_output=""
+  local send_stderr=""
   if [[ -z "$body" ]]; then
     send_rc=1
   else
@@ -3858,7 +3911,13 @@ for k in keys:
     if [[ "${BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN:-0}" == "1" ]]; then
       fu_send_args+=(--dry-run)
     fi
-    send_output="$(bridge_with_timeout 30 precompact_send_followup python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" "${fu_send_args[@]}" 2>/dev/null)" || send_rc=$?
+    local fu_stderr_file
+    fu_stderr_file="$(mktemp 2>/dev/null || printf '%s/precompact-followup-stderr.%s' "${TMPDIR:-/tmp}" "$$")"
+    send_output="$(bridge_with_timeout 30 precompact_send_followup python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" "${fu_send_args[@]}" 2>"$fu_stderr_file")" || send_rc=$?
+    if [[ -f "$fu_stderr_file" ]]; then
+      send_stderr="$(cat "$fu_stderr_file" 2>/dev/null || true)"
+      rm -f "$fu_stderr_file" 2>/dev/null || true
+    fi
   fi
 
   if [[ "$pending_dry_run" == "1" ]]; then
@@ -3879,13 +3938,15 @@ for k in keys:
     # BRIDGE_PRECOMPACT_FOLLOWUP_RETRY_SECONDS; otherwise archive and give up.
     local retry_window="${BRIDGE_PRECOMPACT_FOLLOWUP_RETRY_SECONDS:-600}"
     [[ "$retry_window" =~ ^[0-9]+$ ]] || retry_window=600
+    local fu_error_class
+    fu_error_class="$(_bridge_precompact_parse_error_class "$send_stderr")"
     bridge_audit_log daemon precompact_followup_failed "$agent" \
       --detail event_id="$pending_event_id" \
       --detail plugin="$pending_plugin" \
       --detail channel_id="$pending_channel_id" \
       --detail duration_seconds="$duration_secs" \
       --detail send_rc="$send_rc" \
-      --detail error_class="send_failed" 2>/dev/null || true
+      --detail error_class="$fu_error_class" 2>/dev/null || true
 
     # Update pending followup_attempt_ts and decide whether to expire.
     local notice_sent_ts=0

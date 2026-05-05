@@ -531,6 +531,251 @@ EOF
   pass "T7 BRIDGE_PRECOMPACT_NOTIFY_DISABLED=1 short-circuits the helper"
 }
 
+# -- T8: follow-up send failure does NOT inflate EMA across retries -----------
+#
+# Regression for r2 of #611: the original Track B observer recorded the EMA
+# sample BEFORE attempting the follow-up send and left the completed marker in
+# place on failure, so each retry sync re-entered record-precompact-completion
+# and re-blended the agent's EMA. The fix gates the EMA call behind a per
+# event_id flag under precompact-completion-recorded/. This test exercises the
+# repeated-failure case end-to-end by routing follow-up through the teams
+# adapter (which structurally returns track_c_pending) and asserts the agent's
+# stats sample count stays at exactly 1 across three retry cycles.
+
+t8_followup_failure_no_ema_inflation() {
+  local home="$ROOT/t8-home"
+  local state_dir="$home/state"
+  local agent="dev"
+  local plugin="teams"
+  local channel_id="t8-channel"
+
+  mkdir -p "$home" "$state_dir/agents/$agent"
+  mkdir -p "$state_dir/precompact-events/$agent/completed"
+
+  cat >"$home/agent-env.sh" <<EOF
+declare -ga BRIDGE_AGENT_IDS=("$agent")
+declare -gA BRIDGE_AGENT_ENGINE=([${agent}]="claude")
+declare -gA BRIDGE_AGENT_SOURCE=([${agent}]="static")
+declare -gA BRIDGE_AGENT_CHANNELS=([${agent}]="plugin:${plugin}")
+declare -gA BRIDGE_AGENT_DESC=([${agent}]="t8 fixture")
+declare -gA BRIDGE_AGENT_SESSION=([${agent}]="$agent")
+declare -gA BRIDGE_AGENT_PRECOMPACT_NOTIFY=([${agent}]="1")
+EOF
+
+  # Synthesize a pending notice that points at the teams adapter (track_c_pending).
+  # We bypass the notice-send path so the failure scenario is purely the
+  # follow-up branch; dry_run is intentionally 0 so the followup hits the
+  # real adapter dispatcher and fails with a structured error.
+  local now_ts
+  now_ts="$(date +%s)"
+  local started_ts=$((now_ts - 60))
+  local event_id="t8-event-1"
+  cat >"$state_dir/agents/$agent/precompact-notice-pending.json" <<EOF
+{
+  "event_id": "$event_id",
+  "agent": "$agent",
+  "plugin": "$plugin",
+  "channel_id": "$channel_id",
+  "reply_to_message_id": "",
+  "notice_message_id": "notice-1",
+  "thread_id": "",
+  "trigger": "auto",
+  "started_ts": $started_ts,
+  "notice_sent_ts": $now_ts,
+  "expected_seconds": 60,
+  "lang": "en",
+  "dry_run": false
+}
+EOF
+
+  # Drop a completed marker the daemon will pair with the pending notice.
+  local completed_ts=$((started_ts + 30))
+  cat >"$state_dir/precompact-events/$agent/completed/${completed_ts}-1.json" <<EOF
+{
+  "schema_version": "1",
+  "agent": "$agent",
+  "completed_ts": $completed_ts,
+  "completed_iso": "1970-01-01T00:00:00+00:00",
+  "hook_pid": 1,
+  "matcher": "compact"
+}
+EOF
+
+  # Helper: run one daemon sync cycle in an isolated env.
+  local daemon_run='
+    env -i \
+      PATH="$PATH" HOME="$HOME" \
+      BRIDGE_HOME="'"$home"'" \
+      BRIDGE_STATE_DIR="'"$state_dir"'" \
+      BRIDGE_AGENT_ENV_FILE="'"$home"'/agent-env.sh" \
+      BRIDGE_PRECOMPACT_NOTIFY_RECENCY_SECONDS=3600 \
+      BRIDGE_PRECOMPACT_FOLLOWUP_RETRY_SECONDS=3600 \
+      BRIDGE_DAEMON_NOTIFY_DRY_RUN=1 \
+      BRIDGE_DISCORD_RELAY_ENABLED=0 \
+      BRIDGE_CRON_SYNC_ENABLED=0 \
+      bash "'"$DAEMON"'" sync >/dev/null 2>&1 || true
+  '
+
+  # Run three sync cycles; the followup should fail every time.
+  local i
+  for i in 1 2 3; do
+    eval "$daemon_run"
+  done
+
+  # Pending must still be in place (within retry window).
+  if [[ ! -f "$state_dir/agents/$agent/precompact-notice-pending.json" ]]; then
+    fail "T8 expected pending notice to remain across retry cycles"
+    return
+  fi
+
+  # Audit log must contain at least one followup_failed row with a structured
+  # (non-send_failed) error_class.
+  local audit_log="$home/logs/audit.jsonl"
+  if [[ ! -f "$audit_log" ]]; then
+    fail "T8 expected audit log at $audit_log"
+    return
+  fi
+  if ! grep -q precompact_followup_failed "$audit_log"; then
+    fail "T8 expected at least one precompact_followup_failed row" "$(cat "$audit_log")"
+    return
+  fi
+
+  # Critical assertion: the EMA sample counter must be exactly 1, not 3.
+  # If it's >1 the EMA is double-counting on retry.
+  local count
+  count="$("$PYTHON" -c '
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    print("missing"); sys.exit(0)
+agent = data.get("agents", {}).get("dev", {})
+print(agent.get("count", 0))
+' "$state_dir/precompact-stats.json" 2>/dev/null || echo missing)"
+  if [[ "$count" != "1" ]]; then
+    fail "T8 EMA count should be 1 across 3 retries; got $count" \
+         "$(cat "$state_dir/precompact-stats.json" 2>/dev/null || echo no-stats)"
+    return
+  fi
+
+  # And the per-event flag should be present so subsequent retries skip the
+  # record-precompact-completion call.
+  local flag="$state_dir/agents/$agent/precompact-completion-recorded/$event_id.flag"
+  if [[ ! -f "$flag" ]]; then
+    fail "T8 expected precompact-completion-recorded flag at $flag" \
+         "$(ls -la "$state_dir/agents/$agent/precompact-completion-recorded" 2>/dev/null || true)"
+    return
+  fi
+  pass "T8 follow-up retries do not inflate EMA (count stays at 1, flag present)"
+}
+
+# -- T9: structured error class preserved in audit ----------------------------
+#
+# Regression for r2 of #611: the daemon used to redirect send-primitive stderr
+# to /dev/null and hardcode error_class="send_failed", swallowing the
+# track_c_pending signal that bridge-channels.py emits for Teams/Mattermost.
+# This test verifies the parser captures the structured code from stderr and
+# stamps it onto the audit detail.
+
+t9_followup_error_class_preserved() {
+  local home="$ROOT/t9-home"
+  local state_dir="$home/state"
+  local agent="dev"
+  local plugin="teams"
+  local channel_id="t9-channel"
+
+  mkdir -p "$home" "$state_dir/agents/$agent"
+  mkdir -p "$state_dir/precompact-events/$agent/completed"
+
+  cat >"$home/agent-env.sh" <<EOF
+declare -ga BRIDGE_AGENT_IDS=("$agent")
+declare -gA BRIDGE_AGENT_ENGINE=([${agent}]="claude")
+declare -gA BRIDGE_AGENT_SOURCE=([${agent}]="static")
+declare -gA BRIDGE_AGENT_CHANNELS=([${agent}]="plugin:${plugin}")
+declare -gA BRIDGE_AGENT_DESC=([${agent}]="t9 fixture")
+declare -gA BRIDGE_AGENT_SESSION=([${agent}]="$agent")
+declare -gA BRIDGE_AGENT_PRECOMPACT_NOTIFY=([${agent}]="1")
+EOF
+
+  local now_ts
+  now_ts="$(date +%s)"
+  local started_ts=$((now_ts - 60))
+  local event_id="t9-event-1"
+  cat >"$state_dir/agents/$agent/precompact-notice-pending.json" <<EOF
+{
+  "event_id": "$event_id",
+  "agent": "$agent",
+  "plugin": "$plugin",
+  "channel_id": "$channel_id",
+  "reply_to_message_id": "",
+  "notice_message_id": "notice-1",
+  "thread_id": "",
+  "trigger": "auto",
+  "started_ts": $started_ts,
+  "notice_sent_ts": $now_ts,
+  "expected_seconds": 60,
+  "lang": "en",
+  "dry_run": false
+}
+EOF
+
+  local completed_ts=$((started_ts + 30))
+  cat >"$state_dir/precompact-events/$agent/completed/${completed_ts}-1.json" <<EOF
+{
+  "schema_version": "1",
+  "agent": "$agent",
+  "completed_ts": $completed_ts,
+  "completed_iso": "1970-01-01T00:00:00+00:00",
+  "hook_pid": 1,
+  "matcher": "compact"
+}
+EOF
+
+  env -i \
+    PATH="$PATH" HOME="$HOME" \
+    BRIDGE_HOME="$home" \
+    BRIDGE_STATE_DIR="$state_dir" \
+    BRIDGE_AGENT_ENV_FILE="$home/agent-env.sh" \
+    BRIDGE_PRECOMPACT_NOTIFY_RECENCY_SECONDS=3600 \
+    BRIDGE_PRECOMPACT_FOLLOWUP_RETRY_SECONDS=3600 \
+    BRIDGE_DAEMON_NOTIFY_DRY_RUN=1 \
+    BRIDGE_DISCORD_RELAY_ENABLED=0 \
+    BRIDGE_CRON_SYNC_ENABLED=0 \
+    bash "$DAEMON" sync >/dev/null 2>&1 || true
+
+  local audit_log="$home/logs/audit.jsonl"
+  if [[ ! -f "$audit_log" ]]; then
+    fail "T9 expected audit log at $audit_log"
+    return
+  fi
+
+  local error_class
+  error_class="$("$PYTHON" -c '
+import json, sys
+target = ""
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if row.get("action") == "precompact_followup_failed":
+            detail = row.get("detail") or {}
+            target = str(detail.get("error_class") or "")
+print(target)
+' "$audit_log")"
+
+  if [[ "$error_class" != "track_c_pending" ]]; then
+    fail "T9 expected error_class=track_c_pending; got '$error_class'" \
+         "$(grep precompact_followup_failed "$audit_log" 2>/dev/null || true)"
+    return
+  fi
+  pass "T9 structured error_class=track_c_pending preserved in audit detail"
+}
+
 # -- run all ------------------------------------------------------------------
 
 t1_started_marker
@@ -540,6 +785,8 @@ t4_send_dry_run
 t5_record_ema
 t6_observer_e2e
 t7_kill_switch
+t8_followup_failure_no_ema_inflation
+t9_followup_error_class_preserved
 
 printf '\n[smoke][summary] passes=%d fails=%d\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then
