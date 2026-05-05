@@ -705,7 +705,17 @@ PY
 step_memory_daily_cron_one() {
   local agent="$1"
   local title="memory-daily-$agent"
-  local sched="0 3 * * *"
+  # Auto-jitter the daily cron minute by a stable hash of the agent name so
+  # that 20+ memory-daily crons don't fan out at the same wall-clock minute.
+  # Issue #579: identical-minute fan-out + BRIDGE_CRON_DISPATCH_MAX_PARALLEL=2
+  # starves small-RAM hosts via cron memory-pressure deferrals. Hash is
+  # deterministic so a re-applied bootstrap maps the same agent to the same
+  # minute (no drift). The conflict-refuse path below preserves any
+  # already-registered schedule — operators migrate manually with
+  # `agent-bridge cron update --schedule` when they want to adopt the spread.
+  local jitter_min
+  jitter_min="$(printf '%s' "$agent" | cksum | awk '{print $1 % 60}')"
+  local sched="$jitter_min 3 * * *"
   local tz="Asia/Seoul"
   local installed_script="$BRIDGE_HOME/scripts/memory-daily-harvest.sh"
 
