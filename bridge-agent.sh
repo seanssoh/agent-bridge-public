@@ -69,6 +69,9 @@ Options:
   --continue|--no-continue     explicit continue mode (default: continue)
   --dry-run                    print the planned role block without writing
   --json                       emit JSON instead of human text
+  --test-fixture               opt into test-artifact name patterns
+                               (smoke-/test-/bootstrap-/created-agent-/pref-,
+                               *-repro-<N>); cleanup tooling may reap these
 
 Examples:
   $(basename "$0") create reviewer --engine claude
@@ -1741,6 +1744,8 @@ run_create() {
   local users_json=""
   local default_home=""
   local start_dry_run=""
+  # Issue #598 Track 4: opt-in for test-artifact-prefix names.
+  local test_fixture=0
 
   shift || true
 
@@ -1884,11 +1889,36 @@ run_create() {
         json_mode=1
         shift
         ;;
+      --test-fixture)
+        # Issue #598 Track 4: opt into test-artifact-prefix policy.
+        test_fixture=1
+        shift
+        ;;
       *)
         bridge_die "지원하지 않는 agent create 옵션입니다: $1"
         ;;
     esac
   done
+
+  # Issue #598 Track 4: refuse names that match a test-artifact pattern
+  # (smoke-, test-, bootstrap-, created-agent-, pref-, *-repro-<N>) unless
+  # the operator opted in with --test-fixture. Cleanup tooling (Track 2
+  # orphan-agent-dir detector) treats these as test fixtures and may
+  # report/reap them.
+  if bridge_validate_agent_name_test_artifact "$agent"; then
+    if [[ $test_fixture -eq 0 ]]; then
+      bridge_die "agent-bridge agent create '$agent' refused: name matches test-artifact pattern.
+Use \`--test-fixture\` if this is intentional test setup; cleanup tooling may
+report and reap test-fixture agents per their pattern."
+    else
+      # Audit row so operators (and the future orphan-agent-dir detector)
+      # can identify which test-fixture agents to reap.
+      bridge_audit_log agent agent_test_fixture_created "$agent" \
+        --detail reason=test-fixture-flag \
+        --detail entrypoint=create \
+        2>/dev/null || true
+    fi
+  fi
 
   case "$engine" in
     claude|codex) ;;

@@ -161,7 +161,7 @@ Usage:
   $CLI_NAME migrate workspace plan <agent>
   $CLI_NAME migrate workspace copy <agent> [--dry-run]
   $CLI_NAME migrate workspace cutover <agent> --dry-run
-  $CLI_NAME --codex|--claude --name <agent> [--loop] [--no-continue] [--workdir <dir>] [--replace] [--no-attach] [--no-project-skill] [--prefer wake|new|shared]
+  $CLI_NAME --codex|--claude --name <agent> [--loop] [--no-continue] [--workdir <dir>] [--replace] [--no-attach] [--no-project-skill] [--prefer wake|new|shared] [--test-fixture]
 
 Examples:
   $CLI_NAME status
@@ -796,6 +796,8 @@ ATTACH_MODE=1
 REPLACE_MODE=0
 INSTALL_PROJECT_SKILL=1
 SPAWN_PREFERENCE=""
+# Issue #598 Track 4: opt-in for test-artifact name patterns.
+TEST_FIXTURE=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -849,6 +851,11 @@ while [[ $# -gt 0 ]]; do
       SPAWN_PREFERENCE="$2"
       shift 2
       ;;
+    --test-fixture)
+      # Issue #598 Track 4: opt into test-artifact-prefix policy.
+      TEST_FIXTURE=1
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -889,6 +896,28 @@ if ! bridge_agent_exists "$NAME"; then
   if RESOLVED_AGENT="$(bridge_agent_id_for_session "$NAME")"; then
     echo "[info] 세션 '$NAME'은(는) 역할 '$RESOLVED_AGENT'에 연결됩니다."
     NAME="$RESOLVED_AGENT"
+  fi
+fi
+
+# Issue #598 Track 4: refuse names that match a test-artifact pattern
+# (smoke-, test-, bootstrap-, created-agent-, pref-, *-repro-<N>) on
+# truly-new dynamic spawns unless the operator opted in with
+# --test-fixture. Existing static/dynamic agents are grandfathered:
+# the check only fires when the name does not already resolve to a
+# known agent. Cleanup tooling (Track 2 orphan-agent-dir detector)
+# treats test-fixture agents as reapable.
+if ! bridge_agent_exists "$NAME"; then
+  if bridge_validate_agent_name_test_artifact "$NAME"; then
+    if [[ $TEST_FIXTURE -eq 0 ]]; then
+      bridge_die "agent-bridge --name '$NAME' refused: name matches test-artifact pattern.
+Use \`--test-fixture\` if this is intentional test setup; cleanup tooling may
+report and reap test-fixture agents per their pattern."
+    else
+      bridge_audit_log agent agent_test_fixture_created "$NAME" \
+        --detail reason=test-fixture-flag \
+        --detail entrypoint=spawn \
+        2>/dev/null || true
+    fi
   fi
 fi
 

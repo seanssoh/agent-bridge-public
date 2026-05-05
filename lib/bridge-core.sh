@@ -648,6 +648,39 @@ bridge_validate_agent_name() {
   return 0
 }
 
+# Issue #598 Track 4: test-artifact name patterns. Cleanup detectors and
+# operator hygiene depend on this list staying canonical between `agent
+# create` / dynamic-spawn refusal and the future `orphan-agent-dir`
+# detector (Track 2). Keep BRIDGE_TEST_ARTIFACT_PREFIXES + the trailing
+# `-repro-<digits>` regex in lockstep with `bridge-doctor.py` if/when
+# Track 2 lands.
+BRIDGE_TEST_ARTIFACT_PREFIXES=(
+  "smoke-"
+  "test-"
+  "bootstrap-"
+  "created-agent-"
+  "pref-"
+)
+
+# bridge_validate_agent_name_test_artifact <name>
+#   Returns 0 when the name matches a known test-artifact pattern (a
+#   leading prefix from BRIDGE_TEST_ARTIFACT_PREFIXES OR a trailing
+#   `-repro-<digits>` suffix). Returns 1 otherwise. Callers use this to
+#   refuse `create` / dynamic-spawn unless `--test-fixture` is passed.
+bridge_validate_agent_name_test_artifact() {
+  local name="$1"
+  local prefix
+  for prefix in "${BRIDGE_TEST_ARTIFACT_PREFIXES[@]}"; do
+    if [[ "$name" == "$prefix"* ]]; then
+      return 0
+    fi
+  done
+  if [[ "$name" =~ -repro-[0-9]+$ ]]; then
+    return 0
+  fi
+  return 1
+}
+
 bridge_join_quoted() {
   local out=""
   local arg
