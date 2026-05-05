@@ -408,6 +408,19 @@ def state_key_for_run(run: DueRun) -> dict[str, str]:
     }
 
 
+def final_cursor_key_for_run(last_safe_run: DueRun | None) -> dict[str, str] | None:
+    """Issue #581 (r2): preserve the per-run dedup key on the all-success final
+    write when a due run was processed this sync. The next sync's rolled-back
+    cursor (``select_cursor`` minute-boundary anchor) re-enumerates the just-
+    fired minute, but ``filter_due_runs_from_state`` uses this key to drop the
+    duplicate. Returns ``None`` for a genuinely empty window, where re-enumerating
+    nothing is harmless and matches the legacy state shape.
+    """
+    if last_safe_run is None:
+        return None
+    return state_key_for_run(last_safe_run)
+
+
 def summarize_results(results: list[dict[str, Any]], counters: dict[str, int]) -> dict[str, int]:
     return {
         "due_occurrences": counters.get("due_occurrences", 0),
@@ -613,7 +626,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             state_file,
             build_state_payload(
                 cursor_dt=now_dt,
-                cursor_key=None,
+                cursor_key=final_cursor_key_for_run(last_safe_run),
                 bootstrap_lookback=args.bootstrap_lookback,
                 max_occurrences_per_job=args.max_occurrences_per_job,
                 counters=counters,
@@ -689,6 +702,37 @@ def _self_test_581() -> int:
     now_c = datetime(2026, 4, 30, 14, 0, 30, tzinfo=tz)
     occ_c = enumerate_cron_occurrences(job_c, select_cursor(state_c, now_c, 3600), now_c)
     assert any(o.astimezone(tz).minute == 0 for o in occ_c), f"(c) missed 14:00 firing: {occ_c}"
+    # (d) r2 regression: post-cmd_sync all-success state shape must preserve the
+    #     dedup key when a due run was processed. Reproduces the live final-write
+    #     payload via final_cursor_key_for_run + build_state_payload (i.e. exactly
+    #     what cmd_sync persists at lines ~611-622), then re-runs the next-sync
+    #     enumerate + filter pipeline. Pre-r2 always wrote cursor_key=None on the
+    #     all-success path, so the next sync's rolled-back cursor would re-enqueue
+    #     the just-fired minute as a duplicate; the assertion below detects that.
+    fired_d = occ_a[0]
+    last_safe_d = DueRun("j", "wiki-hub-audit", family, "a", "cron",
+                         fired_d, derive_slot(family, fired_d, job))
+    final_key_d = final_cursor_key_for_run(last_safe_d)
+    assert final_key_d is not None, "(d) final-write key dropped on all-success path with due_runs"
+    payload_d = build_state_payload(
+        cursor_dt=now_a,
+        cursor_key=final_key_d,
+        bootstrap_lookback=3600,
+        max_occurrences_per_job=10,
+        counters={},
+        results=[],
+    )
+    assert payload_d.get("last_sync_key") is not None, "(d) state payload must carry last_sync_key"
+    # Empty-window path keeps cursor_key=None so re-enumeration of nothing stays harmless.
+    assert final_cursor_key_for_run(None) is None, "(d) empty-window cursor_key must remain None"
+    # Next sync at 23:01:00 with the fixed final-write state must NOT re-enqueue 23:00.
+    state_d = dict(payload_d)
+    now_d = datetime(2026, 4, 30, 23, 1, 0, tzinfo=tz)
+    occ_d = enumerate_cron_occurrences(job, select_cursor(state_d, now_d, 3600), now_d)
+    runs_d = [DueRun("j", "wiki-hub-audit", family, "a", "cron", o, derive_slot(family, o, job))
+              for o in occ_d]
+    assert filter_due_runs_from_state(runs_d, state_d) == [], \
+        "(d) post-cmd_sync state failed to dedup the just-fired boundary minute"
     print("self-test #581: OK")
     return 0
 
