@@ -274,17 +274,23 @@ def _load_activity_index(state_dir: Path, plugin: str, agent: str) -> dict[str, 
 def _candidate_inbound_ms(entry: dict[str, Any]) -> int | None:
     """Compute the candidate's last_user_inbound timestamp in milliseconds.
 
-    Prefers ``last_user_inbound_ts_ms`` when it is a positive integer;
-    otherwise multiplies ``last_user_inbound_ts`` by 1000.
-    Returns ``None`` if neither field is present/valid.
+    Both ``last_user_inbound_ts`` (epoch seconds) and the optional
+    ``last_user_inbound_ts_ms`` (epoch milliseconds) must agree on
+    "this entry has a recorded user inbound." If ``last_user_inbound_ts``
+    is missing or non-positive the candidate is filtered out — feeders
+    that can only emit `_ms` should also emit `_ts = _ms // 1000` so the
+    schema invariant holds (codex review of #601 r1 caught this gap).
+
+    When both are present, prefer `_ms` for resolution; fall back to
+    `_ts * 1000` when `_ms` is absent or invalid.
     """
+    ts_raw = entry.get("last_user_inbound_ts")
+    if not (isinstance(ts_raw, (int, float)) and ts_raw > 0):
+        return None
     ms_raw = entry.get("last_user_inbound_ts_ms")
     if isinstance(ms_raw, (int, float)) and ms_raw > 0:
         return int(ms_raw)
-    ts_raw = entry.get("last_user_inbound_ts")
-    if isinstance(ts_raw, (int, float)) and ts_raw > 0:
-        return int(ts_raw * 1000)
-    return None
+    return int(ts_raw * 1000)
 
 
 def _candidate_recorded_ns(entry: dict[str, Any]) -> int:
@@ -351,19 +357,34 @@ def _collect_route_candidates(
     return candidates
 
 
-def _select_route(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
-    """Argmax over inbound_ms; tie-break by ns, plugin, channel_id, message_id.
+_TIE_WINDOW_MS = 1000
 
-    The 1-second tie window is implicit in argmax-on-ms when feeders only
-    write second-precision timestamps; ns-precision feeders effectively
-    never tie at the ms level. Either way the deterministic chain wins.
+
+def _select_route(candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Pick the most-recent inbound channel with a deterministic 1-second tie window.
+
+    The spec contract is "tie-break when two candidates differ by less
+    than one second" — sorting on exact ts_ms first would let a candidate
+    1 ms newer beat a same-second peer that has a higher recorded_ns
+    (codex review of #601 r1 caught this).
+
+    Algorithm:
+    1. Find the maximum ts_ms (call it ``leader_ms``).
+    2. Group all candidates with ``ts_ms >= leader_ms - 1000`` (the tie
+       window). Anything older than the window is excluded — it lost on
+       inbound time, not on tie-break.
+    3. Within the tie window, sort by ``recorded_ns`` desc, then lexical
+       ``plugin``, ``channel_id``, ``reply_to_message_id``.
+    4. Return the first.
     """
     if not candidates:
         return None
+    leader_ms = max(int(c["last_user_inbound_ts_ms"]) for c in candidates)
+    floor_ms = leader_ms - _TIE_WINDOW_MS
+    tie_window = [c for c in candidates if int(c["last_user_inbound_ts_ms"]) >= floor_ms]
     return min(
-        candidates,
+        tie_window,
         key=lambda c: (
-            -int(c["last_user_inbound_ts_ms"]),
             -int(c["last_user_inbound_recorded_ns"]),
             c["plugin"],
             c["channel_id"],

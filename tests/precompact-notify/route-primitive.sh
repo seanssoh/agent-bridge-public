@@ -224,14 +224,19 @@ EOF
 
 # ---------- T3: tie-break by recorded_ns then lexical plugin --------------
 t3() {
-  local case="T3 ms-tie → ns wins, then lexical plugin"
+  local case="T3 sub-second tie window → ns wins, then lexical plugin; older-than-window excluded"
   local sd="$ROOT/t3"
   local now=2000000000
   local agent="alpha"
-  local same_ms=$(( (now - 30) * 1000 ))
+  # discord at -30s minus 700 ms; telegram at -30s exactly. Inside the
+  # 1-second tie window, so ns must decide — NOT exact ts_ms (codex r1
+  # caught the implementation sorting on ts_ms first, which would have
+  # let telegram win 700 ms newer and bypass the ns/lexical chain).
+  local discord_ms=$(( (now - 30) * 1000 - 700 ))
+  local telegram_ms=$(( (now - 30) * 1000 ))
 
-  # Two candidates with identical inbound_ms; discord has higher recorded_ns
-  # so it wins on the ns tie-break.
+  # discord is 700 ms older than telegram BUT has higher recorded_ns;
+  # within the 1-second tie window, ns precedence must put discord first.
   write_activity "$sd" discord "$agent" "$(cat <<EOF
 {
   "schema_version": 1, "agent": "$agent", "plugin": "discord",
@@ -240,7 +245,7 @@ t3() {
     "C-D-1": {
       "channel_id": "C-D-1",
       "last_user_inbound_ts": $((now - 30)),
-      "last_user_inbound_ts_ms": $same_ms,
+      "last_user_inbound_ts_ms": $discord_ms,
       "last_user_inbound_message_id": "MSG-D-1",
       "last_user_inbound_recorded_ns": 999000000
     }
@@ -256,7 +261,7 @@ EOF
     "C-T-1": {
       "channel_id": "C-T-1",
       "last_user_inbound_ts": $((now - 30)),
-      "last_user_inbound_ts_ms": $same_ms,
+      "last_user_inbound_ts_ms": $telegram_ms,
       "last_user_inbound_message_id": "MSG-T-1",
       "last_user_inbound_recorded_ns": 100000000
     }
@@ -271,12 +276,62 @@ EOF
     return
   fi
   if ! grep -qF 'CHANNEL_ROUTE_PLUGIN="discord"' <<<"$ROUTE_OUT"; then
-    fail "$case (ns)" "expected discord (higher recorded_ns); got: $ROUTE_OUT"
+    fail "$case (ns)" "expected discord (higher ns within 1s tie window); got: $ROUTE_OUT"
     return
   fi
 
-  # Now flip ns to be equal — fall through to lexical plugin (discord < telegram).
+  # Sub-case: same setup but discord shifted to 1500 ms older — outside
+  # the 1-second window. telegram must win on inbound_ms now; the ns
+  # tie-break is not consulted.
   rm -rf "$sd"
+  local discord_old_ms=$(( (now - 30) * 1000 - 1500 ))
+  write_activity "$sd" discord "$agent" "$(cat <<EOF
+{
+  "schema_version": 1, "agent": "$agent", "plugin": "discord",
+  "updated_ts": $((now - 30)),
+  "channels": {
+    "C-D-1": {
+      "channel_id": "C-D-1",
+      "last_user_inbound_ts": $((now - 30)),
+      "last_user_inbound_ts_ms": $discord_old_ms,
+      "last_user_inbound_message_id": "MSG-D-1",
+      "last_user_inbound_recorded_ns": 999000000
+    }
+  }
+}
+EOF
+)"
+  write_activity "$sd" telegram "$agent" "$(cat <<EOF
+{
+  "schema_version": 1, "agent": "$agent", "plugin": "telegram",
+  "updated_ts": $((now - 30)),
+  "channels": {
+    "C-T-1": {
+      "channel_id": "C-T-1",
+      "last_user_inbound_ts": $((now - 30)),
+      "last_user_inbound_ts_ms": $telegram_ms,
+      "last_user_inbound_message_id": "MSG-T-1",
+      "last_user_inbound_recorded_ns": 100000000
+    }
+  }
+}
+EOF
+)"
+
+  run_route "$agent" "plugin:discord,plugin:telegram" "$sd" 1800 "$now"
+  if [[ "$ROUTE_EXIT" -ne 0 ]]; then
+    fail "$case (window)" "expected exit 0; got $ROUTE_EXIT"
+    return
+  fi
+  if ! grep -qF 'CHANNEL_ROUTE_PLUGIN="telegram"' <<<"$ROUTE_OUT"; then
+    fail "$case (window)" "expected telegram (discord >1s older, outside tie window); got: $ROUTE_OUT"
+    return
+  fi
+
+  # Sub-case: equal ts_ms within window, equal ns — fall through to lexical
+  # plugin order (discord < telegram).
+  rm -rf "$sd"
+  local same_ms=$telegram_ms
   write_activity "$sd" discord "$agent" "$(cat <<EOF
 {
   "schema_version": 1, "agent": "$agent", "plugin": "discord",
