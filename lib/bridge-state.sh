@@ -914,6 +914,9 @@ bridge_load_dynamic_agent_file() {
   BRIDGE_AGENT_WORKDIR["$AGENT_ID"]="$AGENT_WORKDIR"
   BRIDGE_AGENT_SOURCE["$AGENT_ID"]="dynamic"
   BRIDGE_AGENT_META_FILE["$AGENT_ID"]="$file"
+  # Issue #598 Track 1: tag provenance so `agent registry --json` can
+  # report which loader made this id known.
+  BRIDGE_AGENT_PROVENANCE["$AGENT_ID"]="dynamic-active-env"
   BRIDGE_AGENT_LOOP["$AGENT_ID"]="${AGENT_LOOP:-1}"
   BRIDGE_AGENT_CONTINUE["$AGENT_ID"]="${AGENT_CONTINUE:-1}"
   # Hydration: gate the stored id through the freshness resolver. rc=0 keeps
@@ -988,6 +991,10 @@ bridge_restore_dynamic_agents_from_history() {
     BRIDGE_AGENT_SESSION["$AGENT_ID"]="$AGENT_SESSION"
     BRIDGE_AGENT_WORKDIR["$AGENT_ID"]="$AGENT_WORKDIR"
     BRIDGE_AGENT_SOURCE["$AGENT_ID"]="dynamic"
+    # Issue #598 Track 1: history-restored entries are gated above on
+    # bridge_tmux_session_exists, so this path only fires for agents
+    # whose tmux session is currently live.
+    BRIDGE_AGENT_PROVENANCE["$AGENT_ID"]="dynamic-history-live-session"
     BRIDGE_AGENT_LOOP["$AGENT_ID"]="${AGENT_LOOP:-1}"
     BRIDGE_AGENT_CONTINUE["$AGENT_ID"]="${AGENT_CONTINUE:-1}"
     # Hydration: gate stored id through resolver (see bridge_load_dynamic_agent_file).
@@ -1066,6 +1073,9 @@ bridge_reconcile_dynamic_agents_from_tmux() {
     BRIDGE_AGENT_SESSION["$session"]="$session"
     BRIDGE_AGENT_WORKDIR["$session"]="$pane_path"
     BRIDGE_AGENT_SOURCE["$session"]="dynamic"
+    # Issue #598 Track 1: pane-derived recovery — neither active env nor
+    # history file produced a registration, so the only signal is tmux.
+    BRIDGE_AGENT_PROVENANCE["$session"]="dynamic-tmux-recovered"
     BRIDGE_AGENT_LOOP["$session"]="1"
     BRIDGE_AGENT_CONTINUE["$session"]="1"
     BRIDGE_AGENT_SESSION_ID["$session"]=""
@@ -1130,6 +1140,10 @@ _bridge_register_dynamic_from_env_file() {
   BRIDGE_AGENT_SESSION["$AGENT_ID"]="$AGENT_SESSION"
   BRIDGE_AGENT_WORKDIR["$AGENT_ID"]="$AGENT_WORKDIR"
   BRIDGE_AGENT_SOURCE["$AGENT_ID"]="dynamic"
+  # Issue #598 Track 1: this helper is only called from
+  # bridge_reconcile_dynamic_agents_from_tmux (tmux session is the
+  # discovery signal; the history env file just supplies engine/workdir).
+  BRIDGE_AGENT_PROVENANCE["$AGENT_ID"]="dynamic-tmux-recovered"
   BRIDGE_AGENT_LOOP["$AGENT_ID"]="${AGENT_LOOP:-1}"
   BRIDGE_AGENT_CONTINUE["$AGENT_ID"]="${AGENT_CONTINUE:-1}"
   # Hydration: gate the stored id through the freshness resolver. rc=0 keeps
@@ -1341,6 +1355,13 @@ bridge_load_roster() {
 
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
     BRIDGE_AGENT_SOURCE["$agent"]="${BRIDGE_AGENT_SOURCE[$agent]-static}"
+    # Issue #598 Track 1: any id surfaced by the roster files (without an
+    # explicit dynamic loader claiming it later) is static — tag default.
+    # The dynamic loaders below overwrite this with their own provenance
+    # tag when they recognise the id.
+    if [[ "${BRIDGE_AGENT_SOURCE[$agent]}" == "static" ]]; then
+      BRIDGE_AGENT_PROVENANCE["$agent"]="${BRIDGE_AGENT_PROVENANCE[$agent]-static-roster}"
+    fi
     BRIDGE_AGENT_LOOP["$agent"]="${BRIDGE_AGENT_LOOP[$agent]-1}"
     BRIDGE_AGENT_CONTINUE["$agent"]="${BRIDGE_AGENT_CONTINUE[$agent]-1}"
     BRIDGE_AGENT_HISTORY_KEY["$agent"]="${BRIDGE_AGENT_HISTORY_KEY[$agent]-$(bridge_history_key_for "$(bridge_agent_engine "$agent")" "$agent" "$(bridge_agent_workdir "$agent")")}"

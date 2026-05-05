@@ -314,6 +314,23 @@ agb cron cleanup report
 status, activity age, and stale-session health. Stale health is based on local
 tmux activity and recorded bridge state, not on model calls.
 
+For tooling that needs the full agent enumeration plus provenance and
+privilege-class together (cleanup detectors, retirement scripts,
+third-party housekeeping helpers), use `agb agent registry --json`. It
+returns one JSON record per agent id known on this host (static +
+dynamic + system) with `class` (`system|dynamic|static` — system wins
+over the static/dynamic split for cleanup callers), `agent_source`
+(raw `static|dynamic`), `privilege_class` (raw `user|system`), `home`,
+`workdir`, `engine`, `session`, `is_alive` (tmux session present), and
+`source` (which loader path made the id known: `static-roster`,
+`dynamic-active-env`, `dynamic-history-live-session`,
+`dynamic-tmux-recovered`). Output is sorted by id for stable diffs.
+This is the recommended endpoint for any cleanup tool that needs to
+subtract the live dynamic-agent set before flagging directories as
+orphan — `agb agent list` does not surface dynamic agents, which is
+why naive cleanup rules historically false-positived live `--prefer
+new` workers.
+
 When changing cron behavior, inspect jobs before modifying them:
 
 ```bash

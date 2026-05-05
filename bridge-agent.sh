@@ -15,6 +15,7 @@ Usage:
   $(basename "$0") update <agent> [options]
   $(basename "$0") delete <agent> [--from <admin>] [--force] [--orphan-tasks] [--purge-home] [--purge-crons] [--dry-run] [--json]
   $(basename "$0") list [--json]
+  $(basename "$0") registry [--json]
   $(basename "$0") show <agent> [--json]
   $(basename "$0") reclassify [--agent <agent>] [--apply] [--json]
   $(basename "$0") rerender-settings [<agent>...] [--apply|--dry-run] [--json]
@@ -1159,6 +1160,127 @@ for item in items:
         f"{item.get('session','')} | "
         f"{item.get('workdir','')}"
     )
+PY
+}
+
+# run_registry — issue #598 Track 1. Read-only enumeration of every
+# agent id known on this host (static + dynamic + system) with the
+# provenance tag for the loader that surfaced each id. Intended for
+# tooling that needs class + provenance together (cleanup detectors,
+# retirement scripts) without re-implementing roster parsing. Sibling
+# to `agent list` — does not modify state and does not replace
+# `agent list`'s human/JSON shape.
+#
+# Output schema (JSON array sorted by `id` for stable diffs):
+#   id              agent name
+#   class           cleanup-class: system > dynamic > static
+#                   (system wins so cleanup tools never reap a
+#                   privileged static agent purely on source=static)
+#   agent_source    raw bridge_agent_source: static | dynamic
+#   privilege_class raw bridge_agent_class: user | system
+#   home            bridge_agent_default_home (live agent home root)
+#   workdir         bridge_agent_workdir
+#   engine          bridge_agent_engine
+#   session         bridge_agent_session
+#   is_alive        bridge_agent_is_active (tmux session exists)
+#   source          provenance: static-roster | dynamic-active-env |
+#                   dynamic-history-live-session | dynamic-tmux-recovered
+run_registry() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json)
+        # Currently the only output mode. Accept the flag for
+        # symmetry with `agent list --json` so callers can keep a
+        # single argv shape across both endpoints.
+        shift
+        ;;
+      *)
+        bridge_die "지원하지 않는 agent registry 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  local agent
+  local agent_source
+  local privilege_class
+  local cleanup_class
+  local home
+  local workdir
+  local engine
+  local session
+  local provenance
+  local is_alive
+  local rows=""
+
+  if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 && (( ${#BRIDGE_AGENT_IDS[@]} > 0 )); then
+    for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+      agent_source="$(bridge_agent_source "$agent")"
+      privilege_class="$(bridge_agent_class "$agent")"
+      # cleanup_class: system > dynamic > static. Operators consuming
+      # `class` to decide reap-or-keep see "system" for privileged
+      # agents regardless of how the roster surfaced them. The raw
+      # static/dynamic split stays available via agent_source.
+      if [[ "$privilege_class" == "system" ]]; then
+        cleanup_class="system"
+      elif [[ "$agent_source" == "dynamic" ]]; then
+        cleanup_class="dynamic"
+      else
+        cleanup_class="static"
+      fi
+      home="$(bridge_agent_default_home "$agent")"
+      workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || printf '')"
+      engine="$(bridge_agent_engine "$agent")"
+      session="$(bridge_agent_session "$agent")"
+      provenance="$(bridge_agent_provenance "$agent")"
+      if bridge_agent_is_active "$agent"; then
+        is_alive="1"
+      else
+        is_alive="0"
+      fi
+      rows+=$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$agent" \
+        "$cleanup_class" \
+        "$agent_source" \
+        "$privilege_class" \
+        "$home" \
+        "$workdir" \
+        "$engine" \
+        "$session" \
+        "$is_alive" \
+        "$provenance")
+      rows+=$'\n'
+    done
+  fi
+
+  bridge_agent_manage_python "$rows" <<'PY'
+import json
+import sys
+
+raw = sys.argv[1] if len(sys.argv) > 1 else ""
+records = []
+for line in raw.splitlines():
+    if not line.strip():
+        continue
+    parts = line.split("\t")
+    if len(parts) < 10:
+        continue
+    (id_, cls, agent_source, privilege_class, home, workdir,
+     engine, session, is_alive, source) = parts[:10]
+    records.append({
+        "id": id_,
+        "class": cls,
+        "agent_source": agent_source,
+        "privilege_class": privilege_class,
+        "home": home,
+        "workdir": workdir,
+        "engine": engine,
+        "session": session,
+        "is_alive": is_alive == "1",
+        "source": source,
+    })
+
+records.sort(key=lambda r: r["id"])
+print(json.dumps(records, ensure_ascii=False, indent=2))
 PY
 }
 
@@ -3360,6 +3482,9 @@ case "$subcommand" in
   list)
     run_list "$@"
     ;;
+  registry)
+    run_registry "$@"
+    ;;
   show)
     run_show "$@"
     ;;
@@ -3402,7 +3527,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create update delete list show reclassify rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
+      "create update delete list registry show reclassify rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;

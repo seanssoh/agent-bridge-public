@@ -386,6 +386,17 @@ bridge_agent_source() {
   printf '%s' "${BRIDGE_AGENT_SOURCE[$agent]-static}"
 }
 
+# Issue #598 Track 1: which loader path made this agent id known.
+# Closed value space: {static-roster, dynamic-active-env,
+# dynamic-history-live-session, dynamic-tmux-recovered}. Falls back to
+# `static-roster` when the loader did not tag the agent — that matches
+# the historical implicit behavior of any id in BRIDGE_AGENT_IDS that
+# only has BRIDGE_AGENT_SOURCE=static.
+bridge_agent_provenance() {
+  local agent="$1"
+  printf '%s' "${BRIDGE_AGENT_PROVENANCE[$agent]-static-roster}"
+}
+
 # Issue #539: agent class is the privilege boundary consumed by
 # hooks/tool-policy.py. The closed value space is {user, system}; any
 # unknown value (including the empty string written by older roster
