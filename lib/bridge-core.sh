@@ -575,6 +575,8 @@ bridge_reset_roster_maps() {
   unset BRIDGE_AGENT_ISOLATION_MODE BRIDGE_AGENT_OS_USER
   unset BRIDGE_AGENT_CLASS
   unset BRIDGE_AGENT_PROVENANCE
+  # Issue #597 Track B: PreCompact channel auto-notify opt-in maps.
+  unset BRIDGE_AGENT_PRECOMPACT_NOTIFY BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG
 
   declare -g -a BRIDGE_AGENT_IDS=()
   declare -g -A BRIDGE_AGENT_DESC=()
@@ -624,7 +626,32 @@ bridge_reset_roster_maps() {
   # implicit behavior of any id present in BRIDGE_AGENT_IDS without a
   # dynamic loader having claimed it.
   declare -g -A BRIDGE_AGENT_PROVENANCE=()
+  # Issue #597 Track B: per-agent opt-in for PreCompact channel auto-notify.
+  # Default OFF (any unset entry is treated as 0). Opt in per-agent in
+  # agent-roster.local.sh: BRIDGE_AGENT_PRECOMPACT_NOTIFY[<agent>]="1".
+  declare -g -A BRIDGE_AGENT_PRECOMPACT_NOTIFY=()
+  # Issue #597 Track B: per-agent language override for PreCompact notice
+  # template. Falls back to BRIDGE_PRECOMPACT_NOTIFY_LANG (env, default "en").
+  declare -g -A BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG=()
   declare -g -a BRIDGE_CRON_ENQUEUE_FAMILIES=()
+
+  # Issue #597 Track B: scalar envs for the auto-notify pipeline. Each is
+  # honored at daemon-cycle time; the kill switch lets operators disable
+  # all sends without redeploy.
+  : "${BRIDGE_PRECOMPACT_NOTIFY_RECENCY_SECONDS:=1800}"
+  : "${BRIDGE_PRECOMPACT_NOTICE_DEDUP_SECONDS:=300}"
+  : "${BRIDGE_PRECOMPACT_EMA_ALPHA:=0.30}"
+  : "${BRIDGE_PRECOMPACT_NOTIFY_DISABLED:=0}"
+  : "${BRIDGE_PRECOMPACT_NOTIFY_LANG:=en}"
+  : "${BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN:=0}"
+  : "${BRIDGE_PRECOMPACT_FOLLOWUP_RETRY_SECONDS:=600}"
+  export BRIDGE_PRECOMPACT_NOTIFY_RECENCY_SECONDS \
+    BRIDGE_PRECOMPACT_NOTICE_DEDUP_SECONDS \
+    BRIDGE_PRECOMPACT_EMA_ALPHA \
+    BRIDGE_PRECOMPACT_NOTIFY_DISABLED \
+    BRIDGE_PRECOMPACT_NOTIFY_LANG \
+    BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN \
+    BRIDGE_PRECOMPACT_FOLLOWUP_RETRY_SECONDS
 }
 
 bridge_add_agent_id_if_missing() {

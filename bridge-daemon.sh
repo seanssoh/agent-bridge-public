@@ -3333,6 +3333,698 @@ process_channel_health() {
   done
 }
 
+# Issue #597 Track B: PreCompact channel auto-notify observer.
+#
+# Each daemon sync cycle:
+#   1. Walk every started marker under
+#      $BRIDGE_STATE_DIR/precompact-events/<agent>/started/.
+#      For each eligible agent (opt-in, static source, claude engine, auto
+#      trigger, declared channels, dedup window respected) resolve a route
+#      via bridge_channel_precompact_target, render a notice template, and
+#      send via bridge_channel_send_managed_message wrapped in
+#      bridge_with_timeout.
+#   2. Walk every completed marker under
+#      $BRIDGE_STATE_DIR/precompact-events/<agent>/completed/. If a pending
+#      notice exists for that agent (and follow-up has not already been
+#      sent), update the EMA stats and send a "back online" follow-up
+#      threaded against the original notice when possible.
+#   3. Move processed markers to the agent's processed/ subdirectory; move
+#      malformed markers to invalid/ silently.
+#
+# Network sends are wrapped in bridge_with_timeout so a stuck Discord/
+# Telegram POST cannot block the daemon's main loop. The kill switch
+# BRIDGE_PRECOMPACT_NOTIFY_DISABLED=1 short-circuits the entire helper.
+process_precompact_events() {
+  if [[ "${BRIDGE_PRECOMPACT_NOTIFY_DISABLED:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  local events_root="$BRIDGE_STATE_DIR/precompact-events"
+  [[ -d "$events_root" ]] || return 0
+
+  local agent_dir agent
+  shopt -s nullglob
+  for agent_dir in "$events_root"/*; do
+    [[ -d "$agent_dir" ]] || continue
+    agent="$(basename "$agent_dir")"
+    [[ -n "$agent" ]] || continue
+    _bridge_precompact_process_started_markers "$agent" "$agent_dir" || true
+    _bridge_precompact_process_completed_markers "$agent" "$agent_dir" || true
+  done
+  shopt -u nullglob
+}
+
+# Parse error_class out of bridge-channels.py send-managed-message stderr.
+# The send primitive emits "send-managed-message error: <code>: <message>"
+# (see bridge-channels.py SendAdapterError handler). Codes include
+# track_c_pending (Teams/Mattermost), missing_credentials, platform_error,
+# network_error, http_error, malformed_response, unsupported_plugin.
+# Falls back to "send_failed" when the stderr is empty or unparseable so the
+# audit row always carries a non-empty error_class.
+_bridge_precompact_parse_error_class() {
+  local stderr_text="${1:-}"
+  local fallback="send_failed"
+  if [[ -z "$stderr_text" ]]; then
+    printf '%s' "$fallback"
+    return 0
+  fi
+  local parsed=""
+  parsed="$(printf '%s' "$stderr_text" \
+    | grep -E 'send-managed-message error:' \
+    | head -1 \
+    | sed -E 's/^.*send-managed-message error: *([A-Za-z0-9_-]+).*/\1/' \
+    || true)"
+  if [[ -n "$parsed" && "$parsed" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    printf '%s' "$parsed"
+  else
+    printf '%s' "$fallback"
+  fi
+}
+
+# Internal: process every started marker for one agent. Each marker either
+# becomes a sent notice (with pending state) or is skipped; in both cases the
+# marker moves to processed/ so the daemon does not reconsider it. Malformed
+# JSON files move to invalid/.
+_bridge_precompact_process_started_markers() {
+  local agent="$1"
+  local agent_dir="$2"
+  local started_dir="$agent_dir/started"
+  [[ -d "$started_dir" ]] || return 0
+
+  local marker
+  shopt -s nullglob
+  for marker in "$started_dir"/*.json; do
+    _bridge_precompact_handle_started "$agent" "$agent_dir" "$marker" || true
+  done
+  shopt -u nullglob
+}
+
+_bridge_precompact_handle_started() {
+  local agent="$1"
+  local agent_dir="$2"
+  local marker="$3"
+
+  local processed_dir="$agent_dir/processed"
+  local invalid_dir="$agent_dir/invalid"
+  mkdir -p "$processed_dir" "$invalid_dir"
+
+  local marker_basename
+  marker_basename="$(basename "$marker")"
+
+  # Parse the marker JSON via python so we never have to grep raw JSON.
+  local parsed
+  parsed="$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(2)
+if not isinstance(data, dict):
+    sys.exit(2)
+print("event_id\t" + str(data.get("event_id") or ""))
+print("trigger\t" + str(data.get("trigger") or ""))
+print("started_ts\t" + str(data.get("started_ts") or 0))
+print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
+' "$marker" 2>/dev/null)" || {
+    mv -f "$marker" "$invalid_dir/$marker_basename" 2>/dev/null || true
+    return 0
+  }
+
+  local event_id="" trigger="" started_ts="" raw_trigger=""
+  local key="" val=""
+  while IFS=$'\t' read -r key val; do
+    case "$key" in
+      event_id) event_id="$val" ;;
+      trigger) trigger="$val" ;;
+      started_ts) started_ts="$val" ;;
+      raw_trigger) raw_trigger="$val" ;;
+    esac
+  done <<<"$parsed"
+
+  if [[ -z "$event_id" ]]; then
+    mv -f "$marker" "$invalid_dir/$marker_basename" 2>/dev/null || true
+    return 0
+  fi
+
+  # Eligibility checks. Any silent skip moves the marker to processed/ so we
+  # don't reconsider it on every cycle.
+  if ! _bridge_precompact_is_agent_eligible "$agent"; then
+    mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
+    return 0
+  fi
+  if [[ "$trigger" != "auto" ]]; then
+    # Manual /compact never gets an auto-notice (operator typed the command).
+    mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
+    return 0
+  fi
+
+  local agent_state_dir="$BRIDGE_STATE_DIR/agents/$agent"
+  mkdir -p "$agent_state_dir"
+
+  # Dedup: skip when the same event_id was already processed.
+  local last_event_file="$agent_state_dir/precompact-notice-last-event-id"
+  if [[ -f "$last_event_file" ]]; then
+    local last_event=""
+    last_event="$(<"$last_event_file")" 2>/dev/null || last_event=""
+    if [[ "$last_event" == "$event_id" ]]; then
+      mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
+      return 0
+    fi
+  fi
+
+  # Dedup: skip when the previous notice was sent within the dedup window.
+  local last_ts_file="$agent_state_dir/precompact-notice-last-ts"
+  local now_ts
+  now_ts="$(date +%s 2>/dev/null || echo 0)"
+  local dedup_window="${BRIDGE_PRECOMPACT_NOTICE_DEDUP_SECONDS:-300}"
+  [[ "$dedup_window" =~ ^[0-9]+$ ]] || dedup_window=300
+  if [[ -f "$last_ts_file" ]]; then
+    local last_ts=""
+    last_ts="$(<"$last_ts_file")" 2>/dev/null || last_ts=""
+    if [[ "$last_ts" =~ ^[0-9]+$ ]] && (( now_ts - last_ts < dedup_window )); then
+      mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
+      return 0
+    fi
+  fi
+
+  local channels_csv=""
+  channels_csv="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
+  if [[ -z "$channels_csv" ]]; then
+    mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
+    return 0
+  fi
+
+  # Resolve the channel route. Non-zero exit = no recent inbound = silent skip.
+  # Invoke python3 directly (bridge_with_timeout wraps timeout(1), which can
+  # only wrap external commands — not the bash function bridge_channel_precompact_target).
+  local route_output=""
+  local route_rc=0
+  route_output="$(bridge_with_timeout 15 precompact_route python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" \
+    route-precompact-target \
+    --agent "$agent" \
+    --channels-csv "$channels_csv" \
+    --bridge-state-dir "$BRIDGE_STATE_DIR" \
+    --recency-seconds "${BRIDGE_PRECOMPACT_NOTIFY_RECENCY_SECONDS:-1800}" \
+    --now-ts "$now_ts" \
+    --format shell 2>/dev/null)" || route_rc=$?
+  if (( route_rc != 0 )) || [[ -z "$route_output" ]]; then
+    mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
+    return 0
+  fi
+
+  local CHANNEL_ROUTE_PLUGIN="" CHANNEL_ROUTE_CHANNEL_ID=""
+  local CHANNEL_ROUTE_REPLY_TO_MESSAGE_ID="" CHANNEL_ROUTE_LAST_USER_INBOUND_TS=""
+  local CHANNEL_ROUTE_THREAD_ID=""
+  # shellcheck disable=SC1090
+  source /dev/stdin <<<"$route_output"
+
+  if [[ -z "$CHANNEL_ROUTE_PLUGIN" || -z "$CHANNEL_ROUTE_CHANNEL_ID" ]]; then
+    mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
+    return 0
+  fi
+
+  # Render the notice body.
+  local lang
+  lang="$(bridge_agent_precompact_notify_lang "$agent")"
+  local render_output=""
+  render_output="$(bridge_with_timeout 10 precompact_render python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" \
+    render-precompact-message \
+    --agent "$agent" \
+    --kind notice \
+    --lang "$lang" \
+    --plugin "$CHANNEL_ROUTE_PLUGIN" \
+    --channel-id "$CHANNEL_ROUTE_CHANNEL_ID" \
+    --trigger "$trigger" \
+    --started-ts "$started_ts" \
+    --bridge-state-dir "$BRIDGE_STATE_DIR" \
+    --read-stats \
+    --format shell 2>/dev/null)" || {
+    bridge_audit_log daemon precompact_notice_failed "$agent" \
+      --detail event_id="$event_id" \
+      --detail plugin="$CHANNEL_ROUTE_PLUGIN" \
+      --detail channel_id="$CHANNEL_ROUTE_CHANNEL_ID" \
+      --detail error_class="render_failed" 2>/dev/null || true
+    mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
+    return 0
+  }
+
+  local PRECOMPACT_BODY_B64="" PRECOMPACT_EXPECTED_SECONDS=""
+  local PRECOMPACT_LANG="" PRECOMPACT_KIND="" PRECOMPACT_DURATION_SECONDS=""
+  # shellcheck disable=SC1090
+  source /dev/stdin <<<"$render_output"
+  local body=""
+  if [[ -n "$PRECOMPACT_BODY_B64" ]]; then
+    body="$(printf '%s' "$PRECOMPACT_BODY_B64" | base64 -d 2>/dev/null || true)"
+  fi
+  if [[ -z "$body" ]]; then
+    bridge_audit_log daemon precompact_notice_failed "$agent" \
+      --detail event_id="$event_id" \
+      --detail error_class="empty_body" 2>/dev/null || true
+    mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
+    return 0
+  fi
+
+  # Send the notice. Invoke python3 directly (bridge_with_timeout wraps
+  # timeout(1), which can only wrap external commands).
+  local -a send_args=(
+    send-managed-message
+    --plugin "$CHANNEL_ROUTE_PLUGIN"
+    --agent "$agent"
+    --channel-id "$CHANNEL_ROUTE_CHANNEL_ID"
+    --body "$body"
+    --kind notice
+    --bridge-home "$BRIDGE_HOME"
+    --bridge-state-dir "$BRIDGE_STATE_DIR"
+    --correlation-id "$event_id"
+    --format shell
+  )
+  if [[ -n "$CHANNEL_ROUTE_REPLY_TO_MESSAGE_ID" ]]; then
+    send_args+=(--reply-to-message-id "$CHANNEL_ROUTE_REPLY_TO_MESSAGE_ID")
+  fi
+  if [[ "${BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN:-0}" == "1" ]]; then
+    send_args+=(--dry-run)
+  fi
+  local send_output=""
+  local send_rc=0
+  local send_stderr_file
+  send_stderr_file="$(mktemp 2>/dev/null || printf '%s/precompact-notice-stderr.%s' "${TMPDIR:-/tmp}" "$$")"
+  send_output="$(bridge_with_timeout 30 precompact_send python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" "${send_args[@]}" 2>"$send_stderr_file")" || send_rc=$?
+  local send_stderr=""
+  if [[ -f "$send_stderr_file" ]]; then
+    send_stderr="$(cat "$send_stderr_file" 2>/dev/null || true)"
+    rm -f "$send_stderr_file" 2>/dev/null || true
+  fi
+
+  local CHANNEL_SEND_STATUS="" CHANNEL_SEND_PLUGIN="" CHANNEL_SEND_CHANNEL_ID=""
+  local CHANNEL_SEND_REPLY_TO_MESSAGE_ID="" CHANNEL_SEND_MESSAGE_ID=""
+  local CHANNEL_SEND_THREAD_ID="" CHANNEL_SEND_DRY_RUN=""
+  if [[ -n "$send_output" ]]; then
+    # shellcheck disable=SC1090
+    source /dev/stdin <<<"$send_output"
+  fi
+
+  if (( send_rc != 0 )) || [[ "$CHANNEL_SEND_STATUS" != "ok" ]]; then
+    local error_class
+    error_class="$(_bridge_precompact_parse_error_class "$send_stderr")"
+    bridge_audit_log daemon precompact_notice_failed "$agent" \
+      --detail event_id="$event_id" \
+      --detail plugin="$CHANNEL_ROUTE_PLUGIN" \
+      --detail channel_id="$CHANNEL_ROUTE_CHANNEL_ID" \
+      --detail reply_to_message_id="$CHANNEL_ROUTE_REPLY_TO_MESSAGE_ID" \
+      --detail expected_seconds="$PRECOMPACT_EXPECTED_SECONDS" \
+      --detail trigger="$trigger" \
+      --detail started_ts="$started_ts" \
+      --detail send_rc="$send_rc" \
+      --detail error_class="$error_class" 2>/dev/null || true
+    mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
+    return 0
+  fi
+
+  # Persist dedup state and pending-notice JSON for the follow-up handler.
+  printf '%s\n' "$now_ts" >"$last_ts_file" 2>/dev/null || true
+  printf '%s\n' "$event_id" >"$last_event_file" 2>/dev/null || true
+
+  local pending_path="$agent_state_dir/precompact-notice-pending.json"
+  python3 -c '
+import json, sys
+data = {
+    "event_id": sys.argv[1],
+    "agent": sys.argv[2],
+    "plugin": sys.argv[3],
+    "channel_id": sys.argv[4],
+    "reply_to_message_id": sys.argv[5],
+    "notice_message_id": sys.argv[6],
+    "thread_id": sys.argv[7],
+    "trigger": sys.argv[8],
+    "started_ts": int(sys.argv[9] or 0),
+    "notice_sent_ts": int(sys.argv[10] or 0),
+    "expected_seconds": int(sys.argv[11] or 0),
+    "lang": sys.argv[12],
+    "dry_run": sys.argv[13] == "1",
+}
+with open(sys.argv[14], "w", encoding="utf-8") as fh:
+    json.dump(data, fh, ensure_ascii=False, indent=2)
+    fh.write("\n")
+' \
+    "$event_id" \
+    "$agent" \
+    "$CHANNEL_ROUTE_PLUGIN" \
+    "$CHANNEL_ROUTE_CHANNEL_ID" \
+    "$CHANNEL_ROUTE_REPLY_TO_MESSAGE_ID" \
+    "$CHANNEL_SEND_MESSAGE_ID" \
+    "$CHANNEL_SEND_THREAD_ID" \
+    "$trigger" \
+    "$started_ts" \
+    "$now_ts" \
+    "$PRECOMPACT_EXPECTED_SECONDS" \
+    "$PRECOMPACT_LANG" \
+    "${CHANNEL_SEND_DRY_RUN:-0}" \
+    "$pending_path" 2>/dev/null || true
+
+  bridge_audit_log daemon precompact_notice_sent "$agent" \
+    --detail event_id="$event_id" \
+    --detail plugin="$CHANNEL_ROUTE_PLUGIN" \
+    --detail channel_id="$CHANNEL_ROUTE_CHANNEL_ID" \
+    --detail reply_to_message_id="$CHANNEL_ROUTE_REPLY_TO_MESSAGE_ID" \
+    --detail notice_message_id="$CHANNEL_SEND_MESSAGE_ID" \
+    --detail expected_seconds="$PRECOMPACT_EXPECTED_SECONDS" \
+    --detail trigger="$trigger" \
+    --detail started_ts="$started_ts" \
+    --detail dry_run="${CHANNEL_SEND_DRY_RUN:-0}" 2>/dev/null || true
+
+  mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
+  : "$raw_trigger"  # silence unused warning under set -u
+  return 0
+}
+
+_bridge_precompact_is_agent_eligible() {
+  local agent="$1"
+
+  bridge_agent_precompact_notify_enabled "$agent" || return 1
+  [[ "$(bridge_agent_source "$agent" 2>/dev/null)" == "static" ]] || return 1
+  [[ "$(bridge_agent_engine "$agent" 2>/dev/null)" == "claude" ]] || return 1
+  return 0
+}
+
+_bridge_precompact_process_completed_markers() {
+  local agent="$1"
+  local agent_dir="$2"
+  local completed_dir="$agent_dir/completed"
+  [[ -d "$completed_dir" ]] || return 0
+
+  local marker
+  shopt -s nullglob
+  for marker in "$completed_dir"/*.json; do
+    _bridge_precompact_handle_completed "$agent" "$agent_dir" "$marker" || true
+  done
+  shopt -u nullglob
+}
+
+_bridge_precompact_handle_completed() {
+  local agent="$1"
+  local agent_dir="$2"
+  local marker="$3"
+
+  local processed_dir="$agent_dir/processed"
+  local invalid_dir="$agent_dir/invalid"
+  mkdir -p "$processed_dir" "$invalid_dir"
+
+  local marker_basename
+  marker_basename="$(basename "$marker")"
+
+  local completed_ts=""
+  completed_ts="$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    print(int(data.get("completed_ts") or 0))
+except Exception:
+    sys.exit(2)
+' "$marker" 2>/dev/null)" || {
+    mv -f "$marker" "$invalid_dir/$marker_basename" 2>/dev/null || true
+    return 0
+  }
+
+  local agent_state_dir="$BRIDGE_STATE_DIR/agents/$agent"
+  local pending_path="$agent_state_dir/precompact-notice-pending.json"
+  if [[ ! -f "$pending_path" ]]; then
+    # No pending notice => nothing to follow up. Move on silently.
+    mv -f "$marker" "$processed_dir/$marker_basename" 2>/dev/null || true
+    return 0
+  fi
+
+  # Load pending state.
+  local pending_parsed
+  pending_parsed="$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(2)
+if not isinstance(data, dict):
+    sys.exit(2)
+keys = ("event_id", "plugin", "channel_id", "reply_to_message_id",
+        "notice_message_id", "trigger", "started_ts", "lang", "dry_run",
+        "followup_sent_ts")
+for k in keys:
+    v = data.get(k, "")
+    if isinstance(v, bool):
+        v = "1" if v else "0"
+    print(f"{k}\t{v}")
+' "$pending_path" 2>/dev/null)" || {
+    mv -f "$marker" "$invalid_dir/$marker_basename" 2>/dev/null || true
+    return 0
+  }
+
+  local pending_event_id="" pending_plugin="" pending_channel_id=""
+  local pending_reply_to="" pending_notice_msg_id="" pending_trigger=""
+  local pending_started_ts="0" pending_lang="" pending_dry_run="0"
+  local pending_followup_sent_ts=""
+  local pkey="" pval=""
+  while IFS=$'\t' read -r pkey pval; do
+    case "$pkey" in
+      event_id) pending_event_id="$pval" ;;
+      plugin) pending_plugin="$pval" ;;
+      channel_id) pending_channel_id="$pval" ;;
+      reply_to_message_id) pending_reply_to="$pval" ;;
+      notice_message_id) pending_notice_msg_id="$pval" ;;
+      trigger) pending_trigger="$pval" ;;
+      started_ts) pending_started_ts="$pval" ;;
+      lang) pending_lang="$pval" ;;
+      dry_run) pending_dry_run="$pval" ;;
+      followup_sent_ts) pending_followup_sent_ts="$pval" ;;
+    esac
+  done <<<"$pending_parsed"
+
+  if [[ -n "$pending_followup_sent_ts" && "$pending_followup_sent_ts" != "0" ]]; then
+    # Already sent followup for this pending notice — completion marker is
+    # for a later compaction; archive it.
+    mv -f "$marker" "$processed_dir/$marker_basename" 2>/dev/null || true
+    return 0
+  fi
+
+  if [[ -z "$pending_event_id" || -z "$pending_plugin" || -z "$pending_channel_id" ]]; then
+    mv -f "$marker" "$processed_dir/$marker_basename" 2>/dev/null || true
+    return 0
+  fi
+
+  # Stats mutation + per-event dedup flag are deferred until AFTER a successful
+  # follow-up send (see r3 of #611). Rationale: writing the flag and mutating
+  # precompact-stats.json before the send means a retry-loop on send failure
+  # would either re-blend the EMA (no flag yet) or skip stats entirely while
+  # the marker stays pending (flag already present). Both outcomes are wrong.
+  # The correct invariant is "stats + flag move iff send succeeded once",
+  # implemented by short-circuiting on the flag here and writing it inside
+  # the success branch below. Duration is computed locally so the followup
+  # body renders correctly even when stats have not yet been recorded.
+  local recorded_flag_dir="$agent_state_dir/precompact-completion-recorded"
+  local recorded_flag="$recorded_flag_dir/$pending_event_id.flag"
+  local duration_secs=$(( completed_ts - pending_started_ts ))
+  (( duration_secs >= 0 )) || duration_secs=0
+
+  if [[ -f "$recorded_flag" ]]; then
+    # Already processed this event_id (flag survives across retries). Tidy up
+    # any stale completed-marker copy and exit; pending JSON was archived to
+    # history at the time of the original successful send.
+    mv -f "$marker" "$processed_dir/$marker_basename" 2>/dev/null || true
+    return 0
+  fi
+
+  # Render the follow-up body.
+  local render_output=""
+  render_output="$(bridge_with_timeout 10 precompact_render_followup python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" \
+    render-precompact-message \
+    --agent "$agent" \
+    --kind followup \
+    --lang "${pending_lang:-en}" \
+    --plugin "$pending_plugin" \
+    --channel-id "$pending_channel_id" \
+    --trigger "$pending_trigger" \
+    --duration-seconds "$duration_secs" \
+    --started-ts "$pending_started_ts" \
+    --completed-ts "$completed_ts" \
+    --bridge-state-dir "$BRIDGE_STATE_DIR" \
+    --format shell 2>/dev/null)" || render_output=""
+
+  local PRECOMPACT_BODY_B64="" PRECOMPACT_EXPECTED_SECONDS=""
+  local PRECOMPACT_LANG="" PRECOMPACT_KIND="" PRECOMPACT_DURATION_SECONDS=""
+  if [[ -n "$render_output" ]]; then
+    # shellcheck disable=SC1090
+    source /dev/stdin <<<"$render_output"
+  fi
+  local body=""
+  if [[ -n "$PRECOMPACT_BODY_B64" ]]; then
+    body="$(printf '%s' "$PRECOMPACT_BODY_B64" | base64 -d 2>/dev/null || true)"
+  fi
+
+  local followup_thread_anchor="$pending_notice_msg_id"
+  if [[ -z "$followup_thread_anchor" ]]; then
+    followup_thread_anchor="$pending_reply_to"
+  fi
+
+  # Honor pending dry-run state to keep notice + followup symmetric in CI.
+  local saved_dry_run="${BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN:-0}"
+  if [[ "$pending_dry_run" == "1" ]]; then
+    export BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN=1
+  fi
+
+  local send_rc=0
+  local send_output=""
+  local send_stderr=""
+  if [[ -z "$body" ]]; then
+    send_rc=1
+  else
+    local -a fu_send_args=(
+      send-managed-message
+      --plugin "$pending_plugin"
+      --agent "$agent"
+      --channel-id "$pending_channel_id"
+      --body "$body"
+      --kind followup
+      --bridge-home "$BRIDGE_HOME"
+      --bridge-state-dir "$BRIDGE_STATE_DIR"
+      --correlation-id "$pending_event_id"
+      --format shell
+    )
+    if [[ -n "$followup_thread_anchor" ]]; then
+      fu_send_args+=(--reply-to-message-id "$followup_thread_anchor")
+    fi
+    if [[ "${BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN:-0}" == "1" ]]; then
+      fu_send_args+=(--dry-run)
+    fi
+    local fu_stderr_file
+    fu_stderr_file="$(mktemp 2>/dev/null || printf '%s/precompact-followup-stderr.%s' "${TMPDIR:-/tmp}" "$$")"
+    send_output="$(bridge_with_timeout 30 precompact_send_followup python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" "${fu_send_args[@]}" 2>"$fu_stderr_file")" || send_rc=$?
+    if [[ -f "$fu_stderr_file" ]]; then
+      send_stderr="$(cat "$fu_stderr_file" 2>/dev/null || true)"
+      rm -f "$fu_stderr_file" 2>/dev/null || true
+    fi
+  fi
+
+  if [[ "$pending_dry_run" == "1" ]]; then
+    export BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN="$saved_dry_run"
+  fi
+
+  local CHANNEL_SEND_STATUS="" CHANNEL_SEND_MESSAGE_ID="" CHANNEL_SEND_DRY_RUN=""
+  if [[ -n "$send_output" ]]; then
+    # shellcheck disable=SC1090
+    source /dev/stdin <<<"$send_output"
+  fi
+
+  local now_ts
+  now_ts="$(date +%s 2>/dev/null || echo 0)"
+
+  if (( send_rc != 0 )) || [[ "$CHANNEL_SEND_STATUS" != "ok" ]]; then
+    # Honor the retry window: keep pending in place if we're still inside
+    # BRIDGE_PRECOMPACT_FOLLOWUP_RETRY_SECONDS; otherwise archive and give up.
+    local retry_window="${BRIDGE_PRECOMPACT_FOLLOWUP_RETRY_SECONDS:-600}"
+    [[ "$retry_window" =~ ^[0-9]+$ ]] || retry_window=600
+    local fu_error_class
+    fu_error_class="$(_bridge_precompact_parse_error_class "$send_stderr")"
+    bridge_audit_log daemon precompact_followup_failed "$agent" \
+      --detail event_id="$pending_event_id" \
+      --detail plugin="$pending_plugin" \
+      --detail channel_id="$pending_channel_id" \
+      --detail duration_seconds="$duration_secs" \
+      --detail send_rc="$send_rc" \
+      --detail error_class="$fu_error_class" 2>/dev/null || true
+
+    # Update pending followup_attempt_ts and decide whether to expire.
+    local notice_sent_ts=0
+    notice_sent_ts="$(python3 -c '
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    print(int(data.get("notice_sent_ts") or 0))
+except Exception:
+    sys.exit(2)
+' "$pending_path" 2>/dev/null || echo 0)"
+
+    if [[ "$notice_sent_ts" =~ ^[0-9]+$ ]] && (( now_ts - notice_sent_ts > retry_window )); then
+      mkdir -p "$agent_state_dir/precompact-notice-history"
+      mv -f "$pending_path" "$agent_state_dir/precompact-notice-history/$pending_event_id.json" 2>/dev/null || true
+      mv -f "$marker" "$processed_dir/$marker_basename" 2>/dev/null || true
+    else
+      python3 -c '
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(0)
+if isinstance(data, dict):
+    data["followup_attempt_ts"] = int(sys.argv[2])
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+' "$pending_path" "$now_ts" 2>/dev/null || true
+      # Leave the completed marker in place for the next sync cycle to retry.
+    fi
+    return 0
+  fi
+
+  # Followup succeeded — finalize pending and archive history.
+  #
+  # Order matters for crash-restart correctness (see r3 of #611):
+  #   1. Write the per-event flag FIRST so a crash between flag and stats
+  #      leaves the flag present; the next sync short-circuits at the entry
+  #      block and never re-blends the EMA. Stats are slightly under-counted
+  #      by one sample in that narrow window, which is acceptable; double
+  #      counting is not.
+  #   2. Run record-precompact-completion to mutate precompact-stats.json.
+  #   3. Update the pending JSON in place, then archive + move the marker.
+  mkdir -p "$recorded_flag_dir" 2>/dev/null || true
+  : >"$recorded_flag" 2>/dev/null || true
+
+  bridge_with_timeout 10 precompact_stats_record python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" \
+    record-precompact-completion \
+    --agent "$agent" \
+    --trigger "$pending_trigger" \
+    --started-ts "$pending_started_ts" \
+    --completed-ts "$completed_ts" \
+    --bridge-state-dir "$BRIDGE_STATE_DIR" \
+    --format shell >/dev/null 2>&1 || true
+
+  python3 -c '
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except Exception:
+    sys.exit(0)
+if isinstance(data, dict):
+    data["completed_ts"] = int(sys.argv[2])
+    data["duration_seconds"] = int(sys.argv[3])
+    data["followup_sent_ts"] = int(sys.argv[4])
+    data["followup_message_id"] = sys.argv[5]
+    data["stats_updated"] = 1
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+' "$pending_path" "$completed_ts" "$duration_secs" "$now_ts" "$CHANNEL_SEND_MESSAGE_ID" 2>/dev/null || true
+
+  bridge_audit_log daemon precompact_followup_sent "$agent" \
+    --detail event_id="$pending_event_id" \
+    --detail plugin="$pending_plugin" \
+    --detail channel_id="$pending_channel_id" \
+    --detail reply_to_message_id="$pending_reply_to" \
+    --detail notice_message_id="$pending_notice_msg_id" \
+    --detail followup_message_id="$CHANNEL_SEND_MESSAGE_ID" \
+    --detail duration_seconds="$duration_secs" \
+    --detail dry_run="${CHANNEL_SEND_DRY_RUN:-0}" 2>/dev/null || true
+
+  mkdir -p "$agent_state_dir/precompact-notice-history"
+  mv -f "$pending_path" "$agent_state_dir/precompact-notice-history/$pending_event_id.json" 2>/dev/null || true
+  mv -f "$marker" "$processed_dir/$marker_basename" 2>/dev/null || true
+  return 0
+}
+
 cron_worker_running_count() {
   local worker_dir
   local pid_file
@@ -4488,6 +5180,13 @@ cmd_sync_cycle() {
   # Discord relay runs FIRST — lowest-latency path for DM wake
   BRIDGE_DAEMON_LAST_STEP="discord_relay"
   bridge_discord_relay_step || true
+
+  # Issue #597 Track B: PreCompact channel auto-notify observer. Runs after
+  # the Discord relay (so any inbound user activity is already mirrored into
+  # the activity index when the route lookup runs) and before bridge-sync,
+  # which is the cheap "I/O is mostly done for this cycle" boundary.
+  BRIDGE_DAEMON_LAST_STEP="precompact_events"
+  process_precompact_events || true
 
   BRIDGE_DAEMON_LAST_STEP="bridge_sync"
   "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true
