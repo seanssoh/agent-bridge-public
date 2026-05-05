@@ -395,6 +395,36 @@ mkdir -p ~/.agent-bridge/state ~/.agent-bridge/logs ~/.agent-bridge/shared
 Do not delete `agent-roster.local.sh` unless you intentionally want to remove
 local static roles.
 
+### Test-artifact name policy (issue #598 Track 4)
+
+Agent names matching test-artifact patterns are refused at create time and
+on dynamic spawn unless the operator explicitly opts in with
+`--test-fixture`. The blocked patterns are:
+
+- prefix `smoke-`
+- prefix `test-`
+- prefix `bootstrap-`
+- prefix `created-agent-`
+- prefix `pref-`
+- suffix `-repro-<N>` (digits)
+
+```bash
+# refused (no flag, looks like a leftover smoke fixture)
+agent-bridge agent create smoke-foo
+
+# accepted (explicit opt-in; cleanup tooling may reap this agent)
+agent-bridge agent create smoke-foo --test-fixture
+
+# same policy on dynamic spawn
+agent-bridge --codex --name smoke-x --test-fixture
+```
+
+When `--test-fixture` is used, an `agent_test_fixture_created` audit row
+records the opt-in so cleanup tooling can identify which agents were
+created intentionally as test fixtures. Existing agents already in the
+roster are grandfathered — the policy only fires at the create / new-spawn
+entry point.
+
 ## Platform Scope
 
 Agent Bridge runs on both macOS and Linux, but the two hosts have
