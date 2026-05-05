@@ -45,6 +45,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -82,6 +83,77 @@ ENTITY_KIND_PREFIXES = {
 }
 DEFAULT_KIND = "operating-rules"
 SUMMARY_MAX_CHARS = 2000
+
+# Issue #582 r2: content-hash dedup. The original PR claimed the librarian
+# was idempotent, but `process_one` only deduped within a single task body.
+# A re-enqueue of the same envelope (the common case for raw captures that
+# linger in `<agent_home>/raw/captures/inbox/` across daily runs, and also
+# for `memory/projects/` files re-listed by overlapping wiki-daily-ingest
+# windows) re-promoted the content unconditionally because
+# `bridge-knowledge.py` appends every promotion.
+#
+# We dedupe on a stable sha256 of the capture file bytes, recorded in
+# `<shared_root>/wiki/_audit/promoted-hashes.log` (one hex digest per line,
+# append-only). Hashes are recorded only after a non-dry-run promote
+# succeeds; canaries and forced --dry-run runs never write the marker, so
+# a real first promote still happens after a dry-run preview. The marker
+# is generic over content blob — not raw-specific — so it equally protects
+# the existing `memory/projects/` re-enqueue case.
+PROMOTED_HASHES_RELPATH = ("wiki", "_audit", "promoted-hashes.log")
+
+
+def compute_content_hash(capture_path: Path) -> str:
+    """Stable sha256 over the capture file bytes.
+
+    Returns "" when the file cannot be read (caller treats as "no hash, do
+    not dedupe", which preserves the legacy non-idempotent behavior for
+    that one capture rather than silently skipping it).
+    """
+    try:
+        h = hashlib.sha256()
+        with capture_path.open("rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except OSError:
+        return ""
+
+
+def promoted_hashes_path(shared_root: Path) -> Path:
+    return shared_root.joinpath(*PROMOTED_HASHES_RELPATH)
+
+
+def load_promoted_hashes(shared_root: Path) -> set[str]:
+    path = promoted_hashes_path(shared_root)
+    if not path.exists():
+        return set()
+    out: set[str] = set()
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            digest = line.strip()
+            if digest:
+                out.add(digest)
+    except OSError:
+        return set()
+    return out
+
+
+def record_promoted_hash(shared_root: Path, content_hash: str) -> None:
+    """Append `content_hash` to the promoted-hashes log.
+
+    Best-effort: a write failure here just means the next run may
+    re-promote, which is the pre-PR behavior. We never fail a successful
+    promote because the audit log was unwritable.
+    """
+    if not content_hash:
+        return
+    path = promoted_hashes_path(shared_root)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(content_hash + "\n")
+    except OSError:
+        return
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -411,6 +483,7 @@ def process_one(
     template_root: Path,
     team_name: str,
     dry_run: bool,
+    promoted_hashes: set[str] | None = None,
 ) -> dict:
     result: dict = {
         "capture": str(capture_path),
@@ -430,6 +503,25 @@ def process_one(
             "capture path is agent daily note (memory/YYYY-MM-DD.md); "
             "wiki-daily-copy.py handles these, not promote"
         )
+        return result
+
+    # Issue #582 r2: content-hash dedup. Computed before envelope parsing
+    # so it covers JSON, fenced markdown, and fallback shapes uniformly.
+    # Only consults the marker store on real (non-dry-run) promotes —
+    # canary dry-runs must still flow through bridge-knowledge so the
+    # batch's pipeline-health check is real even when the content was
+    # already promoted on a prior day.
+    content_hash = compute_content_hash(capture_path)
+    if content_hash:
+        result["content_hash"] = content_hash
+    if (
+        not dry_run
+        and content_hash
+        and promoted_hashes is not None
+        and content_hash in promoted_hashes
+    ):
+        result["status"] = "duplicate"
+        result["reason"] = "content-hash-already-promoted"
         return result
 
     envelope = load_envelope(capture_path)
@@ -481,6 +573,12 @@ def process_one(
             result["related_pages"] = payload.get("related_pages", [])
         except json.JSONDecodeError:
             result["target"] = ""
+        # Record the hash only after a real (non-dry-run) success. Dry-runs
+        # don't write to the wiki, so they must not poison the marker store.
+        if not dry_run and content_hash:
+            record_promoted_hash(shared_root, content_hash)
+            if promoted_hashes is not None:
+                promoted_hashes.add(content_hash)
     else:
         result["status"] = "failed"
         result["error"] = (stderr or stdout or "").strip()[:400]
@@ -511,10 +609,19 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"status": "empty", "deferred": len(deferred)}))
         return 0
 
+    # Issue #582 r2: load the content-hash marker store once per run and
+    # thread the live set through every process_one call. record_promoted_
+    # _hash both appends to disk and updates this in-memory set, so a
+    # mid-batch duplicate (same content shows up twice in one task body)
+    # is also caught.
+    promoted_hashes = load_promoted_hashes(shared_root)
+    duplicate_count = 0
+
     # Canary: first call MUST be dry-run unless the whole run is dry.
     canary_cap = batch[0]
     canary_result = process_one(canary_cap, bridge_knowledge, shared_root,
-                                template_root, team_name, dry_run=True)
+                                template_root, team_name, dry_run=True,
+                                promoted_hashes=promoted_hashes)
     canary_result["canary"] = True
     print(json.dumps(canary_result, ensure_ascii=False))
     sys.stdout.flush()
@@ -532,7 +639,10 @@ def main(argv: list[str]) -> int:
         if i > 0:
             time.sleep(max(0.0, args.sleep))
         res = process_one(batch[i], bridge_knowledge, shared_root,
-                          template_root, team_name, dry_run=args.dry_run)
+                          template_root, team_name, dry_run=args.dry_run,
+                          promoted_hashes=promoted_hashes)
+        if res.get("status") == "duplicate":
+            duplicate_count += 1
         print(json.dumps(res, ensure_ascii=False))
         sys.stdout.flush()
 
@@ -541,6 +651,11 @@ def main(argv: list[str]) -> int:
             "status": "deferred",
             "deferred": [str(p) for p in deferred[:20]],
             "deferred_count": len(deferred),
+        }, ensure_ascii=False))
+    if duplicate_count:
+        print(json.dumps({
+            "status": "summary",
+            "duplicate_count": duplicate_count,
         }, ensure_ascii=False))
     return 0
 

@@ -396,6 +396,223 @@ fi
 # Restore env for any later scenarios.
 unset AGB_MOCK_AGENT_LIST_JSON BRIDGE_LAYOUT BRIDGE_DATA_ROOT 2>/dev/null || true
 
+# =============================================================================
+# Scenario 8 — Issue #582: legacy (v1) raw PreCompact envelope enumeration.
+# Drop a schema_version=1 JSON envelope under the install-root layout
+# `<agent_home>/raw/captures/inbox/`. Lane B in legacy mode (no
+# BRIDGE_LAYOUT) must include it in the audit log under the new
+# `### Raw envelopes` section, count it as raw=1, and add it to the
+# non-daily total. This is the regression test for the loop that PR #585
+# added: prior to that PR these envelopes landed on disk and never reached
+# the librarian.
+# =============================================================================
+banner "8 — Lane B legacy raw envelope enumeration counts schema_version=1 JSON"
+reset_runtime
+unset BRIDGE_LAYOUT 2>/dev/null || true
+write_note "$TODAY" "# $TODAY note"
+
+mkdir -p "$AGENT_HOME/raw/captures/inbox"
+cat >"$AGENT_HOME/raw/captures/inbox/precompact-v1.json" <<EOF
+{
+  "schema_version": "1",
+  "agent": "$AGENT",
+  "captured_at": "${TODAY}T00:00:00Z",
+  "session_type": "default",
+  "trigger": "manual",
+  "source": "pre-compact-hook",
+  "custom_instructions_excerpt": "",
+  "suggested_entities": ["projects/raw-envelope-v1-smoke"],
+  "suggested_concepts": [],
+  "suggested_slug": "raw-envelope-v1-smoke",
+  "suggested_title": "raw envelope v1 smoke",
+  "excerpt": "pre-compact trigger=manual agent=$AGENT v1 smoke",
+  "transcript_available": false
+}
+EOF
+touch "$AGENT_HOME/raw/captures/inbox/precompact-v1.json"
+
+out_file="$(run_ingest s8 || true)"
+audit_file="$BRIDGE_WIKI_ROOT/_audit/ingest-$TODAY.md"
+if [[ ! -f "$audit_file" ]]; then
+  fail "8" "audit log missing: $audit_file"
+elif ! grep -q "Raw envelopes (1)" "$audit_file"; then
+  fail "8" "expected 'Raw envelopes (1)' in audit; got: $(head -c 400 "$audit_file")"
+elif ! grep -q "precompact-v1.json" "$audit_file"; then
+  fail "8" "raw envelope path missing from audit; got: $(head -c 400 "$audit_file")"
+elif ! grep -q "raw=1" "$out_file"; then
+  fail "8" "expected raw=1 on stdout summary; got: $(head -c 400 "$out_file")"
+else
+  pass "8"
+fi
+
+# =============================================================================
+# Scenario 9 — Issue #582 r2 / Finding 1: v2 workdir raw envelope path.
+# After the pre-compact.py fix, BRIDGE_AGENT_WORKDIR is the producer's home,
+# and wiki-daily-ingest.sh's v2 enumeration also walks `<workdir>/raw/
+# captures/inbox`. Drop an envelope under the v2 workdir, run with
+# BRIDGE_LAYOUT=v2 + populated agent list, and assert the audit picks it up
+# from the v2 path (not from install-root, which we leave empty here).
+# =============================================================================
+banner "9 — Lane B v2 strict raw envelope enumeration uses agb agent list workdir"
+reset_runtime
+write_note "$TODAY" "# $TODAY note"
+
+V2_WORKDIR="$SMOKE_ROOT/data-v2/agents/$AGENT/workdir"
+mkdir -p "$V2_WORKDIR/memory"
+mkdir -p "$V2_WORKDIR/raw/captures/inbox"
+cat >"$V2_WORKDIR/raw/captures/inbox/precompact-v2.json" <<EOF
+{
+  "schema_version": "1",
+  "agent": "$AGENT",
+  "captured_at": "${TODAY}T00:00:00Z",
+  "session_type": "default",
+  "trigger": "manual",
+  "source": "pre-compact-hook",
+  "custom_instructions_excerpt": "",
+  "suggested_entities": ["projects/raw-envelope-v2-smoke"],
+  "suggested_concepts": [],
+  "suggested_slug": "raw-envelope-v2-smoke",
+  "suggested_title": "raw envelope v2 smoke",
+  "excerpt": "pre-compact trigger=manual agent=$AGENT v2 smoke",
+  "transcript_available": false
+}
+EOF
+touch "$V2_WORKDIR/raw/captures/inbox/precompact-v2.json"
+
+AGB_MOCK_AGENT_LIST_JSON="$("$PYTHON" -c "
+import json
+print(json.dumps([{
+    'agent': '$AGENT',
+    'engine': 'claude',
+    'active': True,
+    'workdir': '$V2_WORKDIR',
+}]))
+")"
+export AGB_MOCK_AGENT_LIST_JSON
+export BRIDGE_LAYOUT=v2
+BRIDGE_DATA_ROOT_FIXTURE="$SMOKE_ROOT/data-v2"
+mkdir -p "$BRIDGE_DATA_ROOT_FIXTURE"
+export BRIDGE_DATA_ROOT="$BRIDGE_DATA_ROOT_FIXTURE"
+
+out_file="$(run_ingest s9 || true)"
+audit_file="$BRIDGE_WIKI_ROOT/_audit/ingest-$TODAY.md"
+if [[ ! -f "$audit_file" ]]; then
+  fail "9" "audit log missing: $audit_file"
+elif ! grep -q "Raw envelopes (1)" "$audit_file"; then
+  fail "9" "expected 'Raw envelopes (1)' in audit; got: $(head -c 400 "$audit_file")"
+elif ! grep -q "precompact-v2.json" "$audit_file"; then
+  fail "9" "v2 raw envelope path missing from audit; got: $(head -c 400 "$audit_file")"
+elif ! grep -q "$V2_WORKDIR/raw/captures/inbox/precompact-v2.json" "$audit_file"; then
+  fail "9" "audit path is not the v2 workdir raw inbox: $(head -c 400 "$audit_file")"
+elif ! grep -q "raw=1" "$out_file"; then
+  fail "9" "expected raw=1 on stdout summary; got: $(head -c 400 "$out_file")"
+else
+  pass "9"
+fi
+
+unset AGB_MOCK_AGENT_LIST_JSON BRIDGE_LAYOUT BRIDGE_DATA_ROOT 2>/dev/null || true
+
+# =============================================================================
+# Scenario 10 — Issue #582 r2 / Finding 2: librarian content-hash dedup.
+# Drives `scripts/librarian-process-ingest.py` directly with a fake
+# bridge-knowledge that always succeeds. Run twice on the same task body /
+# capture file and assert:
+#   - first run promotes (status=ok, recorded into promoted-hashes.log)
+#   - second run reports status=duplicate (no fresh promote call) and
+#     emits a duplicate_count summary line.
+# This is the proof for the original PR's idempotency claim, which prior to
+# r2 was vacuous because process_one only deduped within one task body.
+# =============================================================================
+banner "10 — librarian content-hash dedup short-circuits a re-ingest of the same envelope"
+
+LIBRARIAN_PY="$REPO_ROOT/scripts/librarian-process-ingest.py"
+S10_DIR="$SMOKE_ROOT/s10"
+S10_SHARED="$S10_DIR/shared"
+S10_CAPTURE="$S10_DIR/capture-dedup.json"
+S10_TASK_BODY="$S10_DIR/task-body.md"
+S10_BK_LOG="$S10_DIR/fake-bk.log"
+mkdir -p "$S10_DIR" "$S10_SHARED"
+
+# Fake bridge-knowledge.py: prints a minimal promote payload as JSON and
+# exits 0 so the canary + real promote both succeed, then the script
+# records the content hash. We log every invocation so we can assert how
+# many times the second run actually called bridge-knowledge (must be 1:
+# only the canary dry-run; the real path is skipped via duplicate).
+cat >"$S10_DIR/fake-bk.py" <<'PY'
+#!/usr/bin/env python3
+import json, os, sys
+log = os.environ.get("FAKE_BK_LOG", "")
+if log:
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(" ".join(sys.argv) + "\n")
+print(json.dumps({"relative_path": "operating-rules/raw-dedup-smoke.md",
+                  "related_pages": []}))
+PY
+chmod +x "$S10_DIR/fake-bk.py"
+
+cat >"$S10_CAPTURE" <<EOF
+{
+  "schema_version": "1",
+  "agent": "$AGENT",
+  "captured_at": "${TODAY}T00:00:00Z",
+  "session_type": "default",
+  "trigger": "manual",
+  "source": "pre-compact-hook",
+  "custom_instructions_excerpt": "",
+  "suggested_entities": ["shared/raw-dedup-smoke"],
+  "suggested_concepts": [],
+  "suggested_slug": "raw-dedup-smoke",
+  "suggested_title": "raw dedup smoke",
+  "excerpt": "pre-compact trigger=manual agent=$AGENT dedup smoke",
+  "transcript_available": false
+}
+EOF
+
+cat >"$S10_TASK_BODY" <<EOF
+# fake librarian-ingest body for dedup smoke
+
+### Raw envelopes (1)
+- $S10_CAPTURE
+EOF
+
+run_librarian() {
+  local label="$1"
+  FAKE_BK_LOG="$S10_BK_LOG" "$PYTHON" "$LIBRARIAN_PY" \
+    --task-body "$S10_TASK_BODY" \
+    --shared-root "$S10_SHARED" \
+    --template-root "$S10_DIR" \
+    --team-name "smoke" \
+    --bridge-knowledge "$S10_DIR/fake-bk.py" \
+    --sleep 0 \
+    >"$SMOKE_ROOT/$label.out" 2>"$SMOKE_ROOT/$label.err"
+}
+
+: >"$S10_BK_LOG"
+run_librarian s10-r1
+r1_rc=$?
+hashes_log="$S10_SHARED/wiki/_audit/promoted-hashes.log"
+if [[ "$r1_rc" -ne 0 ]]; then
+  fail "10-r1" "librarian first-run rc=$r1_rc stderr=$(tr '\n' ' ' <"$SMOKE_ROOT/s10-r1.err" | head -c 200)"
+elif ! grep -q '"status": "ok"' "$SMOKE_ROOT/s10-r1.out"; then
+  fail "10-r1" "expected status=ok on first run; got: $(head -c 400 "$SMOKE_ROOT/s10-r1.out")"
+elif [[ ! -s "$hashes_log" ]]; then
+  fail "10-r1" "promoted-hashes.log was not written under $S10_SHARED/wiki/_audit/"
+else
+  run_librarian s10-r2
+  r2_rc=$?
+  if [[ "$r2_rc" -ne 0 ]]; then
+    fail "10-r2" "librarian second-run rc=$r2_rc stderr=$(tr '\n' ' ' <"$SMOKE_ROOT/s10-r2.err" | head -c 200)"
+  elif ! grep -q '"status": "duplicate"' "$SMOKE_ROOT/s10-r2.out"; then
+    fail "10-r2" "expected status=duplicate on second run; got: $(head -c 400 "$SMOKE_ROOT/s10-r2.out")"
+  elif ! grep -q '"duplicate_count": 1' "$SMOKE_ROOT/s10-r2.out"; then
+    fail "10-r2" "expected duplicate_count=1 in summary; got: $(head -c 400 "$SMOKE_ROOT/s10-r2.out")"
+  elif grep -q '"reason": "content-hash-already-promoted"' "$SMOKE_ROOT/s10-r2.out"; then
+    pass "10"
+  else
+    fail "10-r2" "duplicate result missing reason marker; got: $(head -c 400 "$SMOKE_ROOT/s10-r2.out")"
+  fi
+fi
+
 # -----------------------------------------------------------------------------
 # Summary
 # -----------------------------------------------------------------------------
