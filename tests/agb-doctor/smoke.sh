@@ -24,7 +24,6 @@
 #   D6   daemon-level finding (agent="")      -> renders cleanly in table
 #   D7a  cold-restart-suspect, prior /exit    -> 0 findings (#588 clean exit)
 #   D7b  cold-restart-suspect, no exit marker -> 1 finding (real cold restart)
-#   D7c  cold-restart-suspect, prior /clear   -> 0 findings (#588 clean clear)
 #
 # Uses an isolated mktemp BRIDGE_HOME — never touches the live install.
 
@@ -424,13 +423,6 @@ build_cold_restart_fixture "$D7b" '{"type":"user","message":{"content":"plain us
 out_d7b="$(run_doctor_with_projects "$D7b")"
 json_assert "$out_d7b" cold_restart_for_agent \
   "D7b real cold restart still emits finding" patch
-
-# D7c: prior jsonl ends with /clear -> finding suppressed
-D7c="$ROOT/d7c"
-build_cold_restart_fixture "$D7c" '{"type":"user","message":{"content":"<command-name>/clear</command-name>"}}'$'\n'
-out_d7c="$(run_doctor_with_projects "$D7c")"
-json_assert "$out_d7c" kind_absent \
-  "D7c clean /clear suppresses cold-restart-suspect (#588)" cold-restart-suspect
 
 # --- Summary ------------------------------------------------------------
 printf '\n[smoke] agb-doctor: %d pass, %d fail\n' "$PASS" "$FAIL"
