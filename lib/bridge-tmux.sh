@@ -1008,6 +1008,15 @@ bridge_tmux_send_and_submit() {
     fi
     return 1
   fi
+  # Issue #589: send-path branch of the prompt-ready latch. Once
+  # bridge_tmux_wait_for_prompt confirms the prompt is live, record it so
+  # the daemon's auto-stop idle counter anchors at prompt-ready time
+  # rather than session-spawn time. Only emit when we know the agent id
+  # (4th arg, omitted by the spool replay path on purpose to avoid
+  # re-latching from a deferred entry).
+  if [[ -n "$spool_agent" ]]; then
+    bridge_agent_note_prompt_ready "$spool_agent" send-path 2>/dev/null || true
+  fi
   if bridge_tmux_session_inject_busy "$session" "$engine" "$inject_grace"; then
     if bridge_tmux_spool_enabled "$spool_agent"; then
       bridge_tmux_pending_attention_append "$spool_agent" "$text"

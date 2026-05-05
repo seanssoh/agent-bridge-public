@@ -440,3 +440,17 @@ Current behavior (post #590):
   active, with a `BRIDGE_DAEMON_LOG=...` fix hint in the suggested
   action. The detector reads the launchagent path from
   `state/launchagent.config` when present.
+
+## 21. pending-attention spool can grow unbounded for permanently-stuck agents (#589)
+
+The PreCompact-aware spool re-delivery path (PR #605, refs #589) appends
+to `state/agents/<agent>/pending-attention.env` whenever a nudge fires
+against a live tmux session that hasn't reached prompt-ready. Existing
+deferred-handling marks entries past `BRIDGE_TMUX_INJECT_MAX_DEFER_SECONDS`
+as `[deferred]` but does not truncate.
+
+If an agent is permanently stuck (hardware failure, broken Claude binary,
+glyph regression preventing prompt detection) AND a cron keeps queuing
+tasks against it, the spool file grows without bound. Mitigation: stop
+the offending cron, or run `agent-bridge agent stop <agent>` to clear
+the spool. Future hardening: a max-line guard on the append helper.
