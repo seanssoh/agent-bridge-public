@@ -61,6 +61,7 @@ type StoredMessage = {
 
 const STATE_DIR = process.env.MATTERMOST_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'mattermost')
 const BRIDGE_HOME = process.env.BRIDGE_HOME ?? join(homedir(), '.agent-bridge')
+const BRIDGE_STATE_DIR = process.env.BRIDGE_STATE_DIR ?? join(BRIDGE_HOME, 'state')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 const MESSAGES_FILE = join(STATE_DIR, 'messages.jsonl')
@@ -245,6 +246,112 @@ function appendMessage(message: StoredMessage): void {
   appendFileSync(MESSAGES_FILE, JSON.stringify(message) + '\n', { mode: 0o600 })
 }
 
+// PreCompact channel auto-notify activity index — issue #597 Track C.
+//
+// Writes $BRIDGE_STATE_DIR/channels/mattermost/<agent>.json so the daemon's
+// route-precompact-target lookup can pick the most recent inbound channel
+// to notify on context compaction. Best-effort: any failure is logged and
+// swallowed so a state-dir glitch never breaks live message delivery.
+
+type MattermostActivityChannelEntry = {
+  channel_id: string
+  reply_kind: string
+  last_seen_id?: string
+  last_seen_ts?: number
+  last_user_inbound_ts: number
+  last_user_inbound_ts_ms: number
+  last_user_inbound_message_id: string
+  last_user_inbound_user_id: string
+  last_user_inbound_recorded_ns: number
+  thread_id?: string
+}
+
+type MattermostActivityIndex = {
+  schema_version: number
+  agent: string
+  plugin: 'mattermost'
+  updated_ts: number
+  channels: Record<string, MattermostActivityChannelEntry>
+}
+
+function sanitizeAgentForPath(raw: string): string {
+  if (!raw || typeof raw !== 'string') return ''
+  if (raw.length > 64) return ''
+  if (!/^[a-zA-Z0-9_-]+$/.test(raw)) return ''
+  return raw
+}
+
+function mattermostActivityIndexPath(agent: string): string {
+  return join(BRIDGE_STATE_DIR, 'channels', 'mattermost', `${agent}.json`)
+}
+
+function loadMattermostActivityIndex(path: string, agent: string): MattermostActivityIndex {
+  try {
+    const raw = readFileSync(path, 'utf8')
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && parsed.channels && typeof parsed.channels === 'object') {
+      return parsed as MattermostActivityIndex
+    }
+  } catch {}
+  return {
+    schema_version: 1,
+    agent,
+    plugin: 'mattermost',
+    updated_ts: 0,
+    channels: {},
+  }
+}
+
+let mattermostRecordedTail = 0
+
+function writeMattermostActivityIndex(
+  agent: string,
+  channelId: string,
+  postId: string,
+  userId: string,
+  inboundDate: Date,
+  rootId: string,
+): void {
+  const safeAgent = sanitizeAgentForPath(agent)
+  if (!safeAgent || !channelId || !postId) return
+  try {
+    const path = mattermostActivityIndexPath(safeAgent)
+    const dir = join(BRIDGE_STATE_DIR, 'channels', 'mattermost')
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const index = loadMattermostActivityIndex(path, safeAgent)
+    const tsMs = inboundDate.getTime()
+    const tsSec = Math.floor(tsMs / 1000)
+    // recorded_ns: see writeTeamsActivityIndex — ms-precision packed into the
+    // upper digits, per-process counter into the lower three digits, kept
+    // under Number.MAX_SAFE_INTEGER. Used only for tie-break ordering.
+    const nowNs = tsMs * 1_000 + (mattermostRecordedTail++ % 1_000)
+    index.schema_version = 1
+    index.agent = safeAgent
+    index.plugin = 'mattermost'
+    index.updated_ts = tsSec
+    const entry: MattermostActivityChannelEntry = {
+      channel_id: channelId,
+      reply_kind: rootId ? 'thread' : 'root',
+      last_seen_id: postId,
+      last_seen_ts: tsSec,
+      last_user_inbound_ts: tsSec,
+      last_user_inbound_ts_ms: tsMs,
+      last_user_inbound_message_id: postId,
+      last_user_inbound_user_id: userId,
+      last_user_inbound_recorded_ns: nowNs,
+    }
+    if (rootId) {
+      entry.thread_id = rootId
+    }
+    index.channels[channelId] = entry
+    const tmp = `${path}.tmp`
+    writeFileSync(tmp, JSON.stringify(index, null, 2) + '\n', { mode: 0o600 })
+    renameSync(tmp, path)
+  } catch (err) {
+    process.stderr.write(`mattermost channel: activity-index write failed: ${err}\n`)
+  }
+}
+
 function runPromptGuard(command: 'scan' | 'sanitize', text: string): Record<string, unknown> | null {
   const script = join(BRIDGE_HOME, 'bridge-guard.py')
   const result = spawnSync(
@@ -296,7 +403,22 @@ async function mmApiRequest(
   return text ? JSON.parse(text) : null
 }
 
-async function mmCreatePost(channelId: string, message: string, tokenOverride?: string): Promise<unknown> {
+async function mmCreatePost(
+  channelId: string,
+  message: string,
+  tokenOverride?: string,
+  rootId?: string,
+): Promise<unknown> {
+  // root_id: when set, this post becomes a thread reply rooted at the given
+  // post id. Mattermost's threading model is "post inside the same channel
+  // with root_id == the original post id"; if the original was already
+  // inside a thread, callers should pass that thread's root id (the same
+  // root_id that lives on the inbound post.root_id), not the inbound's own
+  // post id. Issue #597 Track C uses this for managed PreCompact replies.
+  const body: Record<string, string> = { channel_id: channelId, message }
+  if (rootId && typeof rootId === 'string' && rootId.length > 0) {
+    body.root_id = rootId
+  }
   if (tokenOverride) {
     const url = `${MM_URL}/api/v4/posts`
     const response = await fetch(url, {
@@ -306,7 +428,7 @@ async function mmCreatePost(channelId: string, message: string, tokenOverride?: 
         'Content-Type': 'application/json',
         'User-Agent': 'agent-bridge-mattermost/0.1',
       },
-      body: JSON.stringify({ channel_id: channelId, message }),
+      body: JSON.stringify(body),
     })
     if (!response.ok) {
       const detail = await response.text()
@@ -314,7 +436,7 @@ async function mmCreatePost(channelId: string, message: string, tokenOverride?: 
     }
     return response.text().then(t => t ? JSON.parse(t) : null)
   }
-  return mmApiRequest('POST', '/posts', { channel_id: channelId, message })
+  return mmApiRequest('POST', '/posts', body)
 }
 
 async function bridgeSend(agent: string, message: string, userName: string, channelId: string, route?: BotRoute | null): Promise<void> {
@@ -562,6 +684,19 @@ async function handlePosted(
   }
   appendMessage(stored)
 
+  // PreCompact channel auto-notify activity-index write — issue #597 Track C.
+  // Best-effort; failures are logged inside the helper and never bubble up.
+  // root_id: thread continuation. If the inbound post is already inside a
+  // thread (post.root_id set), a reply uses that root; otherwise replying
+  // with root_id=post.id starts a thread under the inbound post.
+  const agentForIndex = route.agent || process.env.BRIDGE_AGENT_ID || ''
+  if (agentForIndex) {
+    const inboundDate =
+      post.create_at && post.create_at > 0 ? new Date(post.create_at) : new Date()
+    const rootForIndex = String(post.root_id ?? '').trim() || post.id
+    writeMattermostActivityIndex(agentForIndex, channelId, post.id, userId, inboundDate, rootForIndex)
+  }
+
   if (BRIDGE_MODE) {
     void bridgeSend(route.agent, text, userName, channelId, null)
   } else {
@@ -738,6 +873,109 @@ async function start(): Promise<void> {
   // (Architect finding #3, single-bot half) and multi-bot keeps running
   // until the watchdog or signal handler aborts.
   await Promise.all([mcp.connect(new StdioServerTransport()), ...wsLoops])
+}
+
+// CLI mode: `node server.js send-managed --agent ... --channel-id ...`.
+// Used by the daemon's send-managed-message wrapper for PreCompact notify
+// (issue #597). Short-circuits the daemon WS startup so a one-shot outbound
+// reply never spins up the inbound listener path.
+async function runSendManagedCli(): Promise<number> {
+  const argv = process.argv.slice(3)
+  const flags: Record<string, string> = {}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (!arg.startsWith('--')) continue
+    const key = arg.slice(2)
+    const value = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : ''
+    if (value) i++
+    flags[key] = value
+  }
+  const channelId = String(flags['channel-id'] ?? '').trim()
+  const replyToMessageId = String(flags['reply-to-message-id'] ?? '').trim()
+  const body = String(flags['body'] ?? '')
+  const agent = String(flags['agent'] ?? '').trim()
+  if (!channelId || !body) {
+    process.stderr.write('mattermost send-managed: --channel-id and --body are required\n')
+    return 2
+  }
+  if (agent && !process.env.BRIDGE_AGENT_ID) {
+    process.env.BRIDGE_AGENT_ID = agent
+  }
+
+  // Resolve the per-agent route token so managed sends preserve bot identity
+  // in multi-bot deployments. MATTERMOST_BOT_ROUTES maps each route to a
+  // distinct bot account (token + username); send-managed should post as the
+  // bot configured for `--agent` rather than the global MM_TOKEN. Falls back
+  // to MM_TOKEN when no route matches (preserves behavior for installs that
+  // haven't set up multi-agent routing). See codex r1 review of #610.
+  let routeToken = ''
+  if (agent) {
+    try {
+      const routes = loadBotRoutes()
+      for (const r of routes) {
+        const routeAgent = r.agent ?? r.username.replace(/-bot$/, '').replace(/-/g, '_')
+        if (routeAgent === agent && r.token) {
+          routeToken = r.token
+          break
+        }
+      }
+    } catch (err) {
+      process.stderr.write(`mattermost send-managed: bot-routes lookup failed: ${err}\n`)
+    }
+  }
+  const sendToken = routeToken || MM_TOKEN
+  if (!sendToken) {
+    process.stderr.write(
+      'mattermost send-managed: no token available for agent ' +
+        (agent || '(unspecified)') +
+        '; set MATTERMOST_BOT_TOKEN or MATTERMOST_BOT_ROUTES in ' + ENV_FILE + '\n',
+    )
+    return 2
+  }
+
+  let sanitizedBody = body
+  const guarded = runPromptGuard('sanitize', body)
+  if (guarded?.blocked) {
+    sanitizedBody = '[Agent Bridge] outbound reply blocked by prompt guard.'
+  } else if (guarded?.was_modified && typeof guarded.sanitized_text === 'string') {
+    sanitizedBody = guarded.sanitized_text
+  }
+
+  // Mattermost threading: pass the inbound post id as root_id so the reply
+  // surfaces in the same thread. The daemon's --reply-to-message-id is the
+  // inbound post id from the activity index. If the original post was
+  // already a thread reply, callers may pass its root_id instead — same
+  // shape, Mattermost resolves equivalently.
+  let posted: unknown
+  try {
+    posted = await mmCreatePost(channelId, sanitizedBody, sendToken, replyToMessageId || undefined)
+  } catch (err) {
+    process.stderr.write(`mattermost send-managed: send failed: ${err}\n`)
+    return 1
+  }
+
+  const postedRow = posted as { id?: string; root_id?: string } | null
+  const sentId = String(postedRow?.id ?? '').trim()
+  const threadId = String(postedRow?.root_id ?? '').trim() || replyToMessageId || ''
+  // best_effort_threading=false — Mattermost natively supports message-
+  // granular threading via root_id, which we used.
+  const out = {
+    status: 'sent',
+    plugin: 'mattermost',
+    channel_id: channelId,
+    message_id: sentId,
+    thread_id: threadId || null,
+    best_effort_threading: false,
+  }
+  process.stdout.write(JSON.stringify(out) + '\n')
+  return 0
+}
+
+const CLI_SUBCOMMAND = (process.argv[2] ?? '').trim()
+
+if (CLI_SUBCOMMAND === 'send-managed') {
+  const code = await runSendManagedCli()
+  process.exit(code)
 }
 
 await start()

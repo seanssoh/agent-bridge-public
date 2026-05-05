@@ -83,6 +83,7 @@ type Ms365CallbackPayload = {
 
 const STATE_DIR = process.env.TEAMS_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'teams')
 const BRIDGE_HOME = process.env.BRIDGE_HOME ?? join(homedir(), '.agent-bridge')
+const BRIDGE_STATE_DIR = process.env.BRIDGE_STATE_DIR ?? join(BRIDGE_HOME, 'state')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 const REFERENCES_FILE = join(STATE_DIR, 'conversations.json')
@@ -367,6 +368,113 @@ function storeReference(activity: Activity): void {
 function appendMessage(message: StoredMessage): void {
   ensureStateDir()
   appendFileSync(MESSAGES_FILE, JSON.stringify(message) + '\n', { mode: 0o600 })
+}
+
+// PreCompact channel auto-notify activity index — issue #597 Track C.
+//
+// Writes $BRIDGE_STATE_DIR/channels/teams/<agent>.json so the daemon's
+// route-precompact-target lookup can pick the most recent inbound chat
+// to notify on context compaction. Best-effort: any failure is logged and
+// swallowed so a state-dir glitch never breaks live message delivery.
+
+type TeamsActivityChannelEntry = {
+  channel_id: string
+  reply_kind: string
+  last_seen_id?: string
+  last_seen_ts?: number
+  last_user_inbound_ts: number
+  last_user_inbound_ts_ms: number
+  last_user_inbound_message_id: string
+  last_user_inbound_user_id: string
+  last_user_inbound_recorded_ns: number
+  thread_id?: string
+}
+
+type TeamsActivityIndex = {
+  schema_version: number
+  agent: string
+  plugin: 'teams'
+  updated_ts: number
+  channels: Record<string, TeamsActivityChannelEntry>
+}
+
+function sanitizeAgentForPath(raw: string): string {
+  // Activity-index files live at $BRIDGE_STATE_DIR/channels/teams/<agent>.json.
+  // The agent name comes from BRIDGE_AGENT_ID, but we still defense-in-depth
+  // against path traversal — same allowlist as bridge-agents.sh agent ids.
+  if (!raw || typeof raw !== 'string') return ''
+  if (raw.length > 64) return ''
+  if (!/^[a-zA-Z0-9_-]+$/.test(raw)) return ''
+  return raw
+}
+
+function teamsActivityIndexPath(agent: string): string {
+  return join(BRIDGE_STATE_DIR, 'channels', 'teams', `${agent}.json`)
+}
+
+function loadTeamsActivityIndex(path: string, agent: string): TeamsActivityIndex {
+  try {
+    const raw = readFileSync(path, 'utf8')
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && parsed.channels && typeof parsed.channels === 'object') {
+      return parsed as TeamsActivityIndex
+    }
+  } catch {}
+  return {
+    schema_version: 1,
+    agent,
+    plugin: 'teams',
+    updated_ts: 0,
+    channels: {},
+  }
+}
+
+let teamsRecordedTail = 0
+
+export function writeTeamsActivityIndex(
+  agent: string,
+  channelId: string,
+  messageId: string,
+  userId: string,
+  inboundDate: Date,
+): void {
+  const safeAgent = sanitizeAgentForPath(agent)
+  if (!safeAgent || !channelId || !messageId) return
+  try {
+    const path = teamsActivityIndexPath(safeAgent)
+    const dir = join(BRIDGE_STATE_DIR, 'channels', 'teams')
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const index = loadTeamsActivityIndex(path, safeAgent)
+    const tsMs = inboundDate.getTime()
+    const tsSec = Math.floor(tsMs / 1000)
+    // recorded_ns must be a JSON number (the route primitive int-coerces it).
+    // Real epoch nanoseconds (~1.7e18) exceed Number.MAX_SAFE_INTEGER, so we
+    // pack ms-precision into the upper digits and a per-process monotonic
+    // tail into the lower digits. The route primitive only consults this for
+    // tie-break ordering inside a 1-second window, so monotonicity within a
+    // process is the only invariant that matters.
+    const nowNs = tsMs * 1_000 + (teamsRecordedTail++ % 1_000)
+    index.schema_version = 1
+    index.agent = safeAgent
+    index.plugin = 'teams'
+    index.updated_ts = tsSec
+    index.channels[channelId] = {
+      channel_id: channelId,
+      reply_kind: 'conversation',
+      last_seen_id: messageId,
+      last_seen_ts: tsSec,
+      last_user_inbound_ts: tsSec,
+      last_user_inbound_ts_ms: tsMs,
+      last_user_inbound_message_id: messageId,
+      last_user_inbound_user_id: userId,
+      last_user_inbound_recorded_ns: nowNs,
+    }
+    const tmp = `${path}.tmp`
+    writeFileSync(tmp, JSON.stringify(index, null, 2) + '\n', { mode: 0o600 })
+    renameSync(tmp, path)
+  } catch (err) {
+    process.stderr.write(`teams channel: activity-index write failed: ${err}\n`)
+  }
 }
 
 function deliveredMessageSeen(chatId: string, messageId: string, revision: string): boolean {
@@ -758,6 +866,48 @@ async function handleActivity(context: TurnContext): Promise<void> {
   } catch (err) {
     process.stderr.write(`teams channel: failed to append local log message_id=${messageId} (delivery already succeeded): ${err}\n`)
   }
+
+  // PreCompact channel auto-notify activity-index write — issue #597 Track C.
+  // Best-effort; failures are logged inside the helper and never bubble up.
+  //
+  // Bot-self exclusion: only record inbound activity from a real user. Teams'
+  // Bot Framework can echo bot-authored messages back through the inbound
+  // pipeline (proactive sends from continueConversation, multi-bot crosstalk
+  // in shared channels). Recording those would point the daemon's
+  // route-precompact-target at the bot's own posts, breaking the "reply to
+  // the user who last spoke" contract. The most reliable Bot Framework signal
+  // is `from.role === 'bot'`; we also defense-in-depth against self-echo where
+  // `from.id` matches the bot's recipient id. See codex r1 review of #610.
+  const agentForIndex = process.env.BRIDGE_AGENT_ID ?? ''
+  if (agentForIndex && !isInboundFromBotOrSelf(activity)) {
+    const inboundDate = activity.timestamp instanceof Date ? activity.timestamp : new Date()
+    writeTeamsActivityIndex(agentForIndex, chatId, messageId, stored.user_id, inboundDate)
+  }
+}
+
+/**
+ * True when an inbound activity is from a bot or a self-echo of the bot's own
+ * outbound message. Used to skip activity-index updates that would otherwise
+ * point the PreCompact route lookup at bot posts instead of the last user
+ * inbound.
+ *
+ * Signals (in order of reliability):
+ *   1. `from.role === 'bot'` — Bot Framework convention; emitted by Teams for
+ *      proactive sends and bot-to-bot messages.
+ *   2. `from.id === recipient.id` — self-echo: the bot is identified as both
+ *      the sender and the recipient on the same activity.
+ *   3. `from.id === APP_ID` — the bot's app id appears as the sender.
+ *
+ * Exported for the precompact-notify smoke harness.
+ */
+export function isInboundFromBotOrSelf(activity: Partial<Activity> & { from?: { id?: string; role?: string }; recipient?: { id?: string } }): boolean {
+  const from = activity.from
+  if (!from) return false
+  if (from.role === 'bot') return true
+  const recipientId = activity.recipient?.id ?? ''
+  if (from.id && recipientId && from.id === recipientId) return true
+  if (APP_ID && from.id && from.id === APP_ID) return true
+  return false
 }
 
 const httpServer = createServer((req, res) => {
@@ -792,6 +942,133 @@ httpServer.on('error', err => {
   process.stderr.write(`teams channel: http listen failed on ${HOST}:${PORT}: ${err}\n`)
   process.exit(1)
 })
+
+// CLI mode: `node server.js send-managed --agent ... --channel-id ...`.
+// Used by the daemon's send-managed-message wrapper for PreCompact notify
+// (issue #597). Short-circuits the daemon HTTP/WS startup so a one-shot
+// outbound reply never spins up the inbound listener path.
+async function runSendManagedCli(): Promise<number> {
+  const argv = process.argv.slice(3)
+  const flags: Record<string, string> = {}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (!arg.startsWith('--')) continue
+    const key = arg.slice(2)
+    const value = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : ''
+    if (value) i++
+    flags[key] = value
+  }
+  const channelId = String(flags['channel-id'] ?? '').trim()
+  const replyToMessageId = String(flags['reply-to-message-id'] ?? '').trim()
+  const body = String(flags['body'] ?? '')
+  const agent = String(flags['agent'] ?? '').trim()
+  if (!channelId || !body) {
+    process.stderr.write('teams send-managed: --channel-id and --body are required\n')
+    return 2
+  }
+  // Surface the agent id to runPromptGuard via env so the guard line uses
+  // the same agent the daemon claims to be sending on behalf of.
+  if (agent && !process.env.BRIDGE_AGENT_ID) {
+    process.env.BRIDGE_AGENT_ID = agent
+  }
+
+  let sanitizedBody = body
+  const guarded = runPromptGuard('sanitize', body)
+  if (guarded?.blocked) {
+    sanitizedBody = '[Agent Bridge] outbound reply blocked by prompt guard.'
+  } else if (guarded?.was_modified && typeof guarded.sanitized_text === 'string') {
+    sanitizedBody = guarded.sanitized_text
+  }
+
+  const refs = loadJson<Record<string, ConversationReference>>(REFERENCES_FILE, {})
+  const ref = refs[channelId]
+  if (!ref) {
+    process.stderr.write(
+      `teams send-managed: conversation reference not found for ${channelId}; ` +
+      `wait for an inbound Teams message first\n`,
+    )
+    return 3
+  }
+
+  let sentId = ''
+  try {
+    await adapter.continueConversation(ref, async context => {
+      const sent = await context.sendActivity(sanitizedBody)
+      if (sent && typeof sent === 'object' && 'id' in sent && typeof sent.id === 'string') {
+        sentId = sent.id
+      }
+    })
+  } catch (err) {
+    process.stderr.write(`teams send-managed: send failed: ${err}\n`)
+    return 1
+  }
+
+  // Q3: Teams' continueConversation posts into the same conversation, but
+  // Bot Framework does not surface true per-message threading at this API
+  // level — there is no replyToId parameter on sendActivity that maps to a
+  // user message id. The output marks best_effort_threading=true so the
+  // daemon can audit the limitation per the orchestrator's Track C spec.
+  const out = {
+    status: 'sent',
+    plugin: 'teams',
+    channel_id: channelId,
+    message_id: sentId || '',
+    thread_id: replyToMessageId || null,
+    best_effort_threading: true,
+  }
+  process.stdout.write(JSON.stringify(out) + '\n')
+  return 0
+}
+
+const CLI_SUBCOMMAND = (process.argv[2] ?? '').trim()
+
+if (CLI_SUBCOMMAND === 'send-managed') {
+  const code = await runSendManagedCli()
+  process.exit(code)
+}
+
+// Internal smoke harness — exercised only by tests/precompact-notify/teams-mattermost-adapter.sh.
+// `_smoke-record-activity` invokes writeTeamsActivityIndex directly so the
+// smoke can validate the activity-index file schema without spinning up a
+// full Bot Framework adapter. `_smoke-should-record` reports whether a
+// synthesized activity would be skipped by the bot-self filter. Both
+// short-circuit before httpServer.listen.
+if (CLI_SUBCOMMAND === '_smoke-record-activity' || CLI_SUBCOMMAND === '_smoke-should-record') {
+  const argv = process.argv.slice(3)
+  const flags: Record<string, string> = {}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (!arg.startsWith('--')) continue
+    const key = arg.slice(2)
+    const value = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : ''
+    if (value) i++
+    flags[key] = value
+  }
+  if (CLI_SUBCOMMAND === '_smoke-record-activity') {
+    const agent = String(flags['agent'] ?? '').trim()
+    const channelId = String(flags['channel-id'] ?? '').trim()
+    const messageId = String(flags['message-id'] ?? '').trim()
+    const userId = String(flags['user-id'] ?? '').trim()
+    const tsMs = Number(flags['ts-ms'] ?? Date.now())
+    if (!agent || !channelId || !messageId) {
+      process.stderr.write('teams _smoke-record-activity: --agent, --channel-id, --message-id required\n')
+      process.exit(2)
+    }
+    writeTeamsActivityIndex(agent, channelId, messageId, userId, new Date(tsMs))
+    process.exit(0)
+  }
+  // _smoke-should-record
+  const fromId = String(flags['from-id'] ?? '').trim()
+  const fromRole = String(flags['from-role'] ?? '').trim()
+  const recipientId = String(flags['recipient-id'] ?? '').trim()
+  const fakeActivity: any = {
+    from: { id: fromId, role: fromRole || undefined },
+    recipient: { id: recipientId },
+  }
+  const isBotOrSelf = isInboundFromBotOrSelf(fakeActivity)
+  process.stdout.write(JSON.stringify({ should_skip: isBotOrSelf }) + '\n')
+  process.exit(0)
+}
 
 httpServer.listen(PORT, HOST, () => {
   process.stderr.write(`teams channel: listening on http://${HOST}:${PORT} (/api/messages, /auth/callback)\n`)
