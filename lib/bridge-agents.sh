@@ -397,6 +397,30 @@ bridge_agent_provenance() {
   printf '%s' "${BRIDGE_AGENT_PROVENANCE[$agent]-static-roster}"
 }
 
+# Issue #597 Track B: PreCompact channel auto-notify opt-in.
+#
+# Returns 0 (success) when the agent is opted in, 1 otherwise. The daemon
+# observer should consult this rather than reading BRIDGE_AGENT_PRECOMPACT_NOTIFY
+# directly so any future normalization (e.g. yes/on/true acceptance) lands in
+# one place. Default is OFF — only the literal value "1" enables the notice.
+bridge_agent_precompact_notify_enabled() {
+  local agent="$1"
+  local val="${BRIDGE_AGENT_PRECOMPACT_NOTIFY[$agent]-0}"
+  [[ "$val" == "1" ]]
+}
+
+# Issue #597 Track B: PreCompact notice language (en|ko).
+#
+# Resolution order: per-agent map → global BRIDGE_PRECOMPACT_NOTIFY_LANG env
+# → "en" fallback. Unknown values pass through; the Python template renderer
+# normalizes anything outside {en, ko} back to "en".
+bridge_agent_precompact_notify_lang() {
+  local agent="$1"
+  local lang="${BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG[$agent]-${BRIDGE_PRECOMPACT_NOTIFY_LANG:-en}}"
+  [[ -n "$lang" ]] || lang="en"
+  printf '%s' "$lang"
+}
+
 # Issue #539: agent class is the privilege boundary consumed by
 # hooks/tool-policy.py. The closed value space is {user, system}; any
 # unknown value (including the empty string written by older roster

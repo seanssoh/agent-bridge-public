@@ -142,6 +142,30 @@ BRIDGE_AGENT_ACTION["developer:clear"]="/clear"
 # BRIDGE_HEALTH_WARN_SECONDS=3600
 # BRIDGE_HEALTH_CRITICAL_SECONDS=14400
 
+# Issue #597 Track B: PreCompact channel auto-notify (Claude /compact only).
+#
+# When Claude Code starts an auto-compact on a static, channel-bound agent,
+# the daemon can post a "I'm compacting now, back in ~Ns" message in the
+# most recently active bound channel and a "back online" follow-up once the
+# session returns. Default is OFF for every agent — opt in here.
+#
+# Eligibility requires ALL of:
+#   - BRIDGE_AGENT_PRECOMPACT_NOTIFY[<agent>]="1"
+#   - agent is engine=claude AND source=static (declared in this file)
+#   - BRIDGE_AGENT_CHANNELS[<agent>] resolves to >=1 plugin channel
+#   - the trigger is "auto" (operator /compact is intentionally silent)
+#   - the most recent inbound user message is within
+#     BRIDGE_PRECOMPACT_NOTIFY_RECENCY_SECONDS (default 1800s).
+#
+# BRIDGE_AGENT_PRECOMPACT_NOTIFY["developer"]="1"
+# BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG["developer"]="ko"
+#
+# Global controls (env or roster):
+#   BRIDGE_PRECOMPACT_NOTIFY_DISABLED=1        # kill switch (overrides per-agent)
+#   BRIDGE_PRECOMPACT_NOTIFY_LANG="ko"         # fleet default language (en|ko)
+#   BRIDGE_PRECOMPACT_NOTIFY_RECENCY_SECONDS=1800
+#   BRIDGE_PRECOMPACT_NOTICE_DEDUP_SECONDS=300
+
 # Optional: agent class — privilege boundary consumed by hooks/tool-policy.py
 # (issue #539). The closed value space is { user, system }; an unknown class
 # is a hard error at roster load.

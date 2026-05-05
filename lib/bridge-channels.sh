@@ -28,6 +28,68 @@ bridge_channel_precompact_target() {
     --format shell
 }
 
+# Send a managed channel message (PreCompact notice or follow-up) — Track B
+# of issue #597. The daemon observer calls this after `bridge_channel_precompact_target`
+# resolves a route and the Python adapter renders the localized template.
+#
+# Args (positional):
+#   plugin              - "discord" | "telegram" | "teams" | "mattermost"
+#   agent               - bridge agent id (used to locate per-agent plugin
+#                         credentials under <BRIDGE_HOME>/agents/<agent>/.<plugin>/)
+#   channel_id          - platform channel/conversation id from the route
+#   reply_to_message_id - platform message id to thread the reply against
+#                         (may be empty when the route lacks a per-message
+#                         anchor; the Python adapter then sends a plain reply
+#                         in the channel and returns no thread id)
+#   body                - rendered notice/followup text
+#   kind                - "notice" (default) | "followup"; lets adapters
+#                         distinguish the two for telemetry only
+#   correlation_id      - opaque id propagated into adapter logs (optional)
+#
+# On success: emits CHANNEL_SEND_* shell assignments on stdout, exit 0.
+# On failure: returns non-zero with no partial-success output. The daemon
+# catches the non-zero exit and emits a precompact_notice_failed audit row.
+#
+# BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN=1 routes the call through the Python
+# adapter's --dry-run path so CI/smoke can exercise the shell wrapper
+# without performing real network sends.
+bridge_channel_send_managed_message() {
+  local plugin="${1:-}"
+  local agent="${2:-}"
+  local channel_id="${3:-}"
+  local reply_to_message_id="${4:-}"
+  local body="${5:-}"
+  local kind="${6:-notice}"
+  local correlation_id="${7:-}"
+
+  if [[ -z "$plugin" || -z "$agent" || -z "$channel_id" || -z "$body" ]]; then
+    return 2
+  fi
+
+  local -a args=(
+    send-managed-message
+    --plugin "$plugin"
+    --agent "$agent"
+    --channel-id "$channel_id"
+    --body "$body"
+    --kind "$kind"
+    --bridge-home "$BRIDGE_HOME"
+    --bridge-state-dir "$BRIDGE_STATE_DIR"
+    --format shell
+  )
+  if [[ -n "$reply_to_message_id" ]]; then
+    args+=(--reply-to-message-id "$reply_to_message_id")
+  fi
+  if [[ -n "$correlation_id" ]]; then
+    args+=(--correlation-id "$correlation_id")
+  fi
+  if [[ "${BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN:-0}" == "1" ]]; then
+    args+=(--dry-run)
+  fi
+
+  bridge_channels_python "${args[@]}"
+}
+
 bridge_channel_server_script_path() {
   local live_path="$BRIDGE_HOME/bridge-channel-server.py"
 

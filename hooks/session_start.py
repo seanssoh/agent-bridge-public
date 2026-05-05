@@ -21,7 +21,9 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from bridge_hook_common import (
@@ -30,6 +32,11 @@ from bridge_hook_common import (
     remember_session_start,
     session_start_context,
 )
+
+# Issue #597 Track B: schema for the completed-marker the daemon observer
+# pairs with the started marker emitted by hooks/pre-compact.py. Bumped
+# only when the layout changes in a way the observer needs to branch on.
+_COMPLETED_MARKER_SCHEMA_VERSION = "1"
 
 
 _KNOWN_MATCHERS = {"startup", "resume", "clear", "compact"}
@@ -95,6 +102,59 @@ def _compact_note_should_emit(agent: str, now_epoch: int | None = None) -> bool:
     return True
 
 
+def _write_compact_completed_marker(agent: str, matcher: str) -> None:
+    """Write a best-effort completion marker for the daemon observer.
+
+    Issue #597 Track B. The daemon's `process_precompact_events` pairs this
+    completion marker with the `started` marker that `hooks/pre-compact.py`
+    wrote when compaction began so it can (a) send the operator a
+    "back online" follow-up message and (b) update the per-agent EMA of
+    compaction duration used to render the "I'll be back in ~Ns" notice.
+
+    The hook stays exit-0 / non-blocking — every error is swallowed and the
+    SessionStart contract is preserved.
+    """
+    try:
+        completed_ts = int(time.time())
+        completed_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        hook_pid = os.getpid()
+        # Marker filename uses <completed_ts>-<pid>.json so the observer can
+        # process completions in chronological order without parsing JSON;
+        # pid breaks ties on the unlikely same-second double-fire.
+        target_dir = bridge_state_dir() / "precompact-events" / agent / "completed"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        marker_name = f"{completed_ts}-{hook_pid}.json"
+        target = target_dir / marker_name
+        marker = {
+            "schema_version": _COMPLETED_MARKER_SCHEMA_VERSION,
+            "agent": agent,
+            "completed_ts": completed_ts,
+            "completed_iso": completed_iso,
+            "hook_pid": hook_pid,
+            "matcher": matcher,
+        }
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(target_dir),
+            prefix=f".{marker_name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            json.dump(marker, fh, ensure_ascii=False)
+            fh.write("\n")
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+            tmp_path = fh.name
+        os.replace(tmp_path, target)
+    except Exception:
+        # Hook stays exit-0; missing marker just means no follow-up gets sent.
+        pass
+
+
 def _forget_session_on_clear(agent: str) -> None:
     """Auto-forget the persisted resume id when /clear forks the session.
 
@@ -154,6 +214,13 @@ def main(argv: list[str] | None = None) -> int:
         _forget_session_on_clear(agent)
     context = session_start_context(agent)
     if matcher == "compact" and _compact_note_should_emit(agent):
+        # Issue #597 Track B: leave a completion marker for the daemon
+        # observer BEFORE doing the (synchronous) canonical recovery work
+        # below. The marker write is best-effort — if the state dir is not
+        # writable, the daemon simply won't send a follow-up and compaction
+        # behavior is unchanged.
+        _write_compact_completed_marker(agent, matcher)
+
         # #509 P3 (C3): re-inject canonical identity files BEFORE the queue
         # context so the model reads SOUL/MEMORY/etc before acting on any
         # post-compact queue prompt. The trailing `_compact_note()` is kept

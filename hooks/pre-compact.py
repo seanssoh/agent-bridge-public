@@ -53,14 +53,21 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import tempfile
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 SCHEMA_VERSION = "1"
 CUSTOM_EXCERPT_LIMIT = 500
+# Issue #597 Track B: schema for the precompact-events/started/<event_id>.json
+# marker the daemon observer consumes. Bumped only when the marker layout
+# changes in a way the observer needs to branch on; readers must tolerate a
+# missing/older schema_version by treating it as 1.
+MARKER_SCHEMA_VERSION = "1"
 
 # Allow `from bridge_hook_common import …` even when this hook is invoked
 # from `~/.agent-bridge/hooks/pre-compact.py` (the live-runtime layout
@@ -143,6 +150,83 @@ def _read_session_type(home: Path) -> str:
         return ""
     raw = match.group(1).strip().strip("`")
     return raw.split()[0] if raw else ""
+
+
+def _state_dir() -> Path:
+    """Resolve $BRIDGE_STATE_DIR; defaults to <bridge-home>/state.
+
+    The daemon observer reads markers from the same location, so the hook
+    and daemon agree on the path even when BRIDGE_STATE_DIR is unset.
+    """
+    env_state = os.environ.get("BRIDGE_STATE_DIR")
+    if env_state:
+        return Path(env_state)
+    return _bridge_home() / "state"
+
+
+def _new_event_id() -> str:
+    """Generate a sortable event id: <epoch-ms>-<8-hex>.
+
+    Sortable prefix lets the daemon observer process markers in
+    started-time order without parsing the JSON; the random suffix
+    keeps two near-simultaneous compactions on the same agent
+    (vanishingly unlikely but plausible during reproduction tests)
+    from colliding on the same path.
+    """
+    return f"{int(time.time() * 1000):013d}-{secrets.token_hex(4)}"
+
+
+def _write_started_marker(agent: str, payload: dict, trigger: str) -> None:
+    """Write a best-effort started marker for the daemon observer.
+
+    Issue #597 Track B. The marker tells `process_precompact_events` (in
+    bridge-daemon.sh) that a compaction has just begun on this agent so
+    the daemon can resolve a channel route and send the user a "back in
+    ~Ns" notice. The hook stays exit-0 / non-blocking — every error here
+    is swallowed and compaction proceeds exactly as before.
+    """
+    try:
+        event_id = _new_event_id()
+        started_ts = int(time.time())
+        started_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        marker = {
+            "schema_version": MARKER_SCHEMA_VERSION,
+            "event_id": event_id,
+            "agent": agent,
+            "trigger": trigger,
+            "raw_trigger": str(payload.get("trigger") or payload.get("reason") or ""),
+            "started_ts": started_ts,
+            "started_iso": started_iso,
+            "hook_pid": os.getpid(),
+        }
+        if isinstance(payload, dict) and payload:
+            marker["payload_keys"] = sorted(k for k in payload.keys() if isinstance(k, str))
+
+        target_dir = _state_dir() / "precompact-events" / agent / "started"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / f"{event_id}.json"
+        # Atomic temp-then-replace so a half-written marker can never be
+        # read by the daemon mid-write.
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(target_dir),
+            prefix=f".{event_id}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            json.dump(marker, fh, ensure_ascii=False)
+            fh.write("\n")
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+            tmp_path = fh.name
+        os.replace(tmp_path, target)
+    except Exception:
+        # Hook stays exit-0; missing marker just means no notice gets sent.
+        pass
 
 
 def _normalize_trigger(payload: dict) -> str:
@@ -273,6 +357,14 @@ def main() -> int:
         if not agent or home is None:
             return 0
         payload = _stdin_payload()
+
+        # Issue #597 Track B: write the daemon-observer marker BEFORE the
+        # synchronous capture path. The capture flow is best-effort and may
+        # block briefly on bridge-memory; writing the marker first keeps
+        # notice latency bounded by daemon interval rather than capture
+        # duration. The marker write is itself best-effort/exit-0.
+        _write_started_marker(agent, payload, _normalize_trigger(payload))
+
         snapshot_path = _capture_canonical_snapshot(agent)
         envelope = _build_envelope(agent, home, payload, snapshot_path)
 

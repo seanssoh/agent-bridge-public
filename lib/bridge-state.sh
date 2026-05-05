@@ -1384,6 +1384,11 @@ bridge_load_roster() {
     BRIDGE_AGENT_CONTINUE["$agent"]="${BRIDGE_AGENT_CONTINUE[$agent]-1}"
     BRIDGE_AGENT_HISTORY_KEY["$agent"]="${BRIDGE_AGENT_HISTORY_KEY[$agent]-$(bridge_history_key_for "$(bridge_agent_engine "$agent")" "$agent" "$(bridge_agent_workdir "$agent")")}"
     BRIDGE_AGENT_IDLE_TIMEOUT["$agent"]="${BRIDGE_AGENT_IDLE_TIMEOUT[$agent]-$BRIDGE_ON_DEMAND_IDLE_SECONDS}"
+    # Issue #597 Track B: default OFF for PreCompact auto-notify. Per-agent
+    # opt-in lives in agent-roster.local.sh; the language map falls back to
+    # the global BRIDGE_PRECOMPACT_NOTIFY_LANG env (default "en").
+    BRIDGE_AGENT_PRECOMPACT_NOTIFY["$agent"]="${BRIDGE_AGENT_PRECOMPACT_NOTIFY[$agent]-0}"
+    BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG["$agent"]="${BRIDGE_AGENT_PRECOMPACT_NOTIFY_LANG[$agent]-${BRIDGE_PRECOMPACT_NOTIFY_LANG:-en}}"
   done
 
   bridge_load_dynamic_agents
