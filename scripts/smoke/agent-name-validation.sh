@@ -97,8 +97,8 @@ assert_test_fixture_create() {
     "audit row carries the agent name"
   smoke_assert_contains "$audit_text" "test-fixture-flag" \
     "audit row carries reason=test-fixture-flag"
-  smoke_assert_contains "$audit_text" "create" \
-    "audit row carries entrypoint=create"
+  smoke_assert_contains "$audit_text" '"entrypoint": "create"' \
+    "audit row carries entrypoint=create (JSON detail field)"
 }
 
 assert_positive_control_dry_run() {
@@ -216,8 +216,8 @@ HELPER
     "spawn audit row carries the agent name"
   smoke_assert_contains "$spawn_audit" "test-fixture-flag" \
     "spawn audit row carries reason=test-fixture-flag"
-  smoke_assert_contains "$spawn_audit" "spawn" \
-    "spawn audit row carries entrypoint=spawn"
+  smoke_assert_contains "$spawn_audit" '"entrypoint": "spawn"' \
+    "spawn audit row carries entrypoint=spawn (JSON detail field)"
 }
 
 main() {
