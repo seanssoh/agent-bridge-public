@@ -298,7 +298,14 @@ bridge_write_idle_ready_agents() {
 
     case "$engine" in
       claude)
-        bridge_agent_idle_marker_exists "$agent" || continue
+        if ! bridge_agent_idle_marker_exists "$agent"; then
+          # A missing marker most often means a turn aborted before the
+          # Stop hook fired (Anthropic 429 quota cap, network drop, etc.).
+          # Reuse the visual-prompt probe that bridge_dispatch_notification
+          # already calls at dispatch time so the agent rejoins the ready
+          # list as soon as its tmux pane is back at a Claude prompt.
+          bridge_claude_session_try_mark_prompt_ready "$agent" "$session" || continue
+        fi
         ;;
       codex)
         bridge_tmux_session_has_prompt "$session" "$engine" || continue

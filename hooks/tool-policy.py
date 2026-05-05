@@ -732,6 +732,245 @@ def _token_matches_protected(token: str, protected: Path) -> bool:
     return False
 
 
+# === Issue #539 follow-up: Bash carve-out for system-class read-intent ===
+
+# Shell-language constructs that can hide text from shlex argv
+# decomposition. When *any* of these is present we refuse to apply the
+# system-class peer/shared read carve-out, because a visible allowed
+# peer path could mask a smuggled forbidden read inside a `$(...)` body
+# or here-string. patch-dev review of plan r3/r4 (2026-05-06) — see PR
+# body for the detailed `cat <<< "$(cat .../private/secret.md)"` vector.
+#
+# Pipes / `&&` / `||` / `;` are deliberately NOT considered embeddings:
+# each shell stage stays individually visible to shlex (and to
+# `_is_read_intent_bash`, which already classifies stage-by-stage).
+_SHELL_EMBEDDING_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"\$\("),       # command substitution `$(...)`
+    re.compile(r"`"),          # backticks
+    re.compile(r"<\("),        # process substitution (read)
+    re.compile(r">\("),        # process substitution (write)
+    re.compile(r"<<"),         # heredoc / here-string (covers <<-, <<<)
+)
+
+
+def _command_has_shell_embedding(text: str) -> bool:
+    """True iff *text* contains shell-language constructs that can hide
+    text from shlex argv decomposition.
+
+    The check runs against the raw text — the embedding tokens (``<<``,
+    ``<<<``, ``<(``, ``>(``) are themselves the signals we want to
+    catch, so we deliberately do NOT pre-strip safe redirect noise.
+    """
+    return any(pat.search(text) for pat in _SHELL_EMBEDDING_PATTERNS)
+
+
+def _peer_alias_list(agent: str) -> list[str]:
+    """Return the substring-deny needle list for cross-agent home
+    references. Each peer agent contributes six variants (with/without
+    trailing slash, expanded vs ``~`` vs ``$HOME``). Stable order so
+    deny messages are deterministic.
+    """
+    home_root = agent_home_root()
+    aliases: list[str] = []
+    for other in other_agent_homes(agent):
+        aliases.extend(
+            (
+                f"{home_root}/{other.name}/",
+                f"{home_root}/{other.name}",
+                f"~/.agent-bridge/agents/{other.name}/",
+                f"~/.agent-bridge/agents/{other.name}",
+                f"$HOME/.agent-bridge/agents/{other.name}/",
+                f"$HOME/.agent-bridge/agents/{other.name}",
+            )
+        )
+    return aliases
+
+
+def _shared_forbidden_aliases() -> list[str]:
+    """Return the substring-deny list for ``shared/private/`` and
+    ``shared/secrets/``. Includes absolute, ``~``, and ``$HOME``
+    variants so substitution rendering doesn't slip past the gate.
+    """
+    bridge_home = bridge_home_dir()
+    aliases: list[str] = []
+    for forbidden in _SHARED_FORBIDDEN_PREFIXES:
+        rel = forbidden.rstrip("/")
+        aliases.extend(
+            (
+                f"{bridge_home}/shared/{rel}/",
+                f"~/.agent-bridge/shared/{rel}/",
+                f"$HOME/.agent-bridge/shared/{rel}/",
+            )
+        )
+    return aliases
+
+
+def _bash_token_resolved_paths(token: str) -> list[Path]:
+    """Return resolved Paths for the path-shaped fragments of *token*.
+
+    Mirrors `_token_matches_protected`'s expansion logic but yields
+    Path objects instead of running an equality check, so the caller
+    can run any decision against them.
+    """
+    out: list[Path] = []
+    for fragment in _alias_path_fragments(token):
+        expanded = os.path.expandvars(os.path.expanduser(fragment))
+        if not expanded:
+            continue
+        try:
+            out.append(Path(expanded))
+        except Exception:
+            continue
+    return out
+
+
+def _bash_argv_protected_decisions(
+    text: str,
+    agent: str,
+) -> tuple[list[tuple[Path, str, str]], bool] | None:
+    """Walk shlex tokens in *text* with the same skip / treat-as-value
+    rules as `_bash_argv_references_path`. For every non-skipped token,
+    resolve to one or more Paths. For Paths that land in another
+    agent's home, run `_system_class_cross_agent_read_allowed` and
+    record the decision.
+
+    Returns ``None`` when shlex.split() raises (caller falls through to
+    the substring deny). Otherwise returns ``(decisions, all_allowed)``:
+
+    - ``decisions`` is a list of ``(path, audit_target, peer_key)``
+      triples for every peer-agent token the carve-out admits.
+      ``peer_key`` is the peer agent name — a stable string used by the
+      text-occurrence proof step to compare counts without depending on
+      symlink-resolved absolute paths (e.g. macOS ``/var`` →
+      ``/private/var``).
+    - ``all_allowed`` is False as soon as one resolved peer token sits
+      outside the carve-out (peer outside ``memory/{projects,decisions,
+      shared}/``).
+
+    Shared/* tokens are deliberately NOT collected: shared/non-forbidden
+    is broadly readable across classes (the file-tool carve-out emits
+    audits for system-class shared reads — Bash-side shared audits are
+    follow-up scope). Shared/private|shared/secrets are caught earlier
+    by the unconditional Stage A substring deny.
+    """
+    home_root = agent_home_root()
+
+    try:
+        tokens = shlex.split(text, posix=True, comments=False)
+    except ValueError:
+        return None
+
+    decisions: list[tuple[Path, str, str]] = []
+    all_allowed = True
+
+    def _classify_peer(path: Path) -> tuple[bool, str, str] | None:
+        """Return (allowed, audit_target, peer_key) for cross-agent peer
+        paths; None for paths outside the cross-agent territory."""
+        rel_agent = _resolve_under(path, home_root)
+        if rel_agent is None:
+            return None
+        parts = rel_agent.parts
+        if not parts:
+            return None
+        peer = parts[0]
+        if peer == agent:
+            return None  # self-home, not a cross-agent reference
+        allowed, audit_target = _system_class_cross_agent_read_allowed(
+            path, agent
+        )
+        return allowed, audit_target, peer
+
+    def _process_value(value: str) -> None:
+        nonlocal all_allowed
+        for path in _bash_token_resolved_paths(value):
+            verdict = _classify_peer(path)
+            if verdict is None:
+                continue
+            allowed, audit_target, peer_key = verdict
+            if not allowed:
+                all_allowed = False
+                continue
+            decisions.append((path, audit_target, peer_key))
+
+    skip_next_payload = False
+    treat_next_as_value = False
+    for tok in tokens:
+        if skip_next_payload:
+            skip_next_payload = False
+            continue
+        if treat_next_as_value:
+            treat_next_as_value = False
+            _process_value(tok)
+            continue
+        if tok in _STRING_PAYLOAD_FLAGS:
+            skip_next_payload = True
+            continue
+        if tok in _FILE_VALUED_FLAGS:
+            treat_next_as_value = True
+            continue
+        if tok.startswith("--") and "=" in tok:
+            flag, _, value = tok.partition("=")
+            if flag in _STRING_PAYLOAD_FLAGS:
+                continue
+            _process_value(value)
+            continue
+        _process_value(tok)
+
+    return decisions, all_allowed
+
+
+def _argv_occurrences_explain_text(
+    text: str,
+    peer_aliases: list[str],
+    decisions: list[tuple[Path, str, str]],
+) -> bool:
+    """Return True iff every peer-alias substring occurrence in *text*
+    is exactly accounted for by a decision in *decisions*.
+
+    Both sides key on the peer agent name (the last segment of the
+    alias, also `decisions[*][2]`). Multiple alias variants pointing at
+    the same peer collapse to the same key. Counts must match — if
+    text mentions peer X twice but only one argv token resolved to
+    peer X, a smuggle (e.g. second occurrence inside a quoted blob the
+    argv parser cannot surface) is suspected.
+
+    Variants overlap (the no-trailing-slash form is a prefix of the
+    trailing-slash form). We sort by length descending and "consume"
+    matched ranges with NUL so the shorter form doesn't double-count.
+    """
+    sorted_aliases = sorted(peer_aliases, key=len, reverse=True)
+
+    def _peer_for_alias(alias: str) -> str:
+        return alias.rstrip("/").rsplit("/", 1)[-1]
+
+    consumed = list(text)
+    text_count: dict[str, int] = {}
+    for alias in sorted_aliases:
+        peer = _peer_for_alias(alias)
+        if not peer:
+            continue
+        n = len(alias)
+        i = 0
+        while True:
+            joined = "".join(consumed)
+            idx = joined.find(alias, i)
+            if idx < 0:
+                break
+            for k in range(idx, idx + n):
+                consumed[k] = "\0"
+            text_count[peer] = text_count.get(peer, 0) + 1
+            i = idx + n
+
+    decision_count: dict[str, int] = {}
+    for _path, _audit, peer_key in decisions:
+        decision_count[peer_key] = decision_count.get(peer_key, 0) + 1
+
+    for peer in set(text_count) | set(decision_count):
+        if text_count.get(peer, 0) != decision_count.get(peer, 0):
+            return False
+    return True
+
+
 def _bash_argv_references_path(command: str, protected: Path) -> bool:
     """Return True if *command*, interpreted as shell argv, names
     *protected* as a filesystem argument — either positionally or as the
@@ -931,43 +1170,53 @@ def protected_alias_reason(text: str, agent: str) -> str | None:
         return SYSTEM_CONFIG_DENY_REASON
     if admin:
         return None
-    aliases = [
-        f"{home_root}/{other.name}/"
-        for other in other_agent_homes(agent)
-    ]
-    aliases.extend(
-        [
-            f"{home_root}/{other.name}"
-            for other in other_agent_homes(agent)
-        ]
-    )
-    aliases.extend(
-        [
-            f"~/.agent-bridge/agents/{other.name}/"
-            for other in other_agent_homes(agent)
-        ]
-    )
-    aliases.extend(
-        [
-            f"~/.agent-bridge/agents/{other.name}"
-            for other in other_agent_homes(agent)
-        ]
-    )
-    aliases.extend(
-        [
-            f"$HOME/.agent-bridge/agents/{other.name}/"
-            for other in other_agent_homes(agent)
-        ]
-    )
-    aliases.extend(
-        [
-            f"$HOME/.agent-bridge/agents/{other.name}"
-            for other in other_agent_homes(agent)
-        ]
-    )
-    for alias in aliases:
-        if alias in text:
-            return f"cross-agent access is blocked: {alias}"
+
+    # Issue #539 follow-up — Stage A: shared/private/ and shared/secrets/
+    # are off-limits for every non-admin agent regardless of class.
+    # Substring deny because the path can ride inside a heredoc body or
+    # a quoted blob the argv parser cannot surface as a clean token.
+    for forbidden_alias in _shared_forbidden_aliases():
+        if forbidden_alias in text:
+            return (
+                "cross-agent access is blocked: shared/private and "
+                "shared/secrets are off-limits"
+            )
+
+    # Stage B: peer-agent-home substring deny with a system-class
+    # read-intent exception path. The default stance is deny: a system-
+    # class agent earns the carve-out only when (1) the command is
+    # smuggle-free and (2) every alias substring in raw text is
+    # explained by a clean argv token whose resolved Path satisfies
+    # `_system_class_cross_agent_read_allowed`.
+    peer_aliases = _peer_alias_list(agent)
+    matched_alias = next((a for a in peer_aliases if a in text), None)
+    if matched_alias is None:
+        return None
+
+    if not (read_intent and current_agent_class() == "system"):
+        return f"cross-agent access is blocked: {matched_alias}"
+
+    if _command_has_shell_embedding(text):
+        return f"cross-agent access is blocked: {matched_alias}"
+
+    decisions_and_flag = _bash_argv_protected_decisions(text, agent)
+    if decisions_and_flag is None:
+        return f"cross-agent access is blocked: {matched_alias}"
+
+    decisions, all_allowed = decisions_and_flag
+    if not all_allowed:
+        return f"cross-agent access is blocked: {matched_alias}"
+
+    if not _argv_occurrences_explain_text(text, peer_aliases, decisions):
+        return f"cross-agent access is blocked: {matched_alias}"
+
+    for path, audit_target, _peer_key in decisions:
+        emit_system_cross_agent_read(
+            agent=agent,
+            target_path=str(path),
+            target_agent=audit_target,
+            tool="Bash",
+        )
     return None
 
 
