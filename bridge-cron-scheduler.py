@@ -144,8 +144,10 @@ def load_state(path: Path) -> dict[str, Any]:
 def select_cursor(state: dict[str, Any], now_dt: datetime, bootstrap_seconds: int) -> datetime:
     cursor = parse_iso(state.get("last_sync_at"))
     if cursor is not None:
-        if isinstance(state.get("last_sync_key"), dict):
-            cursor -= timedelta(milliseconds=1)
+        # Issue #581: anchor cursor to start-of-minute - 1ms so the firing
+        # minute that lands on last_sync_at is not skipped by the strict
+        # `current > start_local` check in enumerate_cron_occurrences.
+        cursor = cursor.replace(second=0, microsecond=0) - timedelta(milliseconds=1)
         if cursor > now_dt:
             return now_dt
         return cursor
@@ -660,5 +662,38 @@ def main(argv: list[str] | None = None) -> int:
     return args.func(args)
 
 
+def _self_test_581() -> int:
+    """Issue #581 regression: cursor on a firing-minute boundary must not skip the firing."""
+    tz = timezone(timedelta(hours=9))
+    iso = lambda dt: dt.isoformat(timespec="milliseconds")  # noqa: E731
+    job = {"id": "j", "name": "wiki-hub-audit", "agentId": "a", "enabled": True,
+           "schedule": {"kind": "cron", "expr": "0 23 * * 4", "tz": "Asia/Seoul"}}
+    # (a) Boundary minute: prev sync at 23:00:00 with key=None must still find the 23:00 firing.
+    state_a = {"last_sync_at": iso(datetime(2026, 4, 30, 23, 0, 0, tzinfo=tz))}
+    now_a = datetime(2026, 4, 30, 23, 0, 30, tzinfo=tz)
+    occ_a = enumerate_cron_occurrences(job, select_cursor(state_a, now_a, 3600), now_a)
+    assert len(occ_a) == 1, f"(a) expected boundary firing, got {occ_a}"
+    # (b) Dedup: with last_sync_key set for the just-fired slot, must NOT re-enqueue.
+    fired = occ_a[0]
+    family = classify_family(job["name"])
+    state_b = {"last_sync_at": iso(fired),
+               "last_sync_key": {"agent": "a", "job_name": "wiki-hub-audit",
+                                 "slot": derive_slot(family, fired, job), "job_id": "j"}}
+    now_b = datetime(2026, 4, 30, 23, 1, 0, tzinfo=tz)
+    occ_b = enumerate_cron_occurrences(job, select_cursor(state_b, now_b, 3600), now_b)
+    runs_b = [DueRun("j", "wiki-hub-audit", family, "a", "cron", o, derive_slot(family, o, job)) for o in occ_b]
+    assert filter_due_runs_from_state(runs_b, state_b) == [], "(b) duplicate slipped through dedup"
+    # (c) Sub-minute cursor for high-frequency spec still catches the boundary firing.
+    job_c = {**job, "schedule": {"kind": "cron", "expr": "*/10 * * * *", "tz": "Asia/Seoul"}}
+    state_c = {"last_sync_at": iso(datetime(2026, 4, 30, 14, 0, 15, tzinfo=tz))}
+    now_c = datetime(2026, 4, 30, 14, 0, 30, tzinfo=tz)
+    occ_c = enumerate_cron_occurrences(job_c, select_cursor(state_c, now_c, 3600), now_c)
+    assert any(o.astimezone(tz).minute == 0 for o in occ_c), f"(c) missed 14:00 firing: {occ_c}"
+    print("self-test #581: OK")
+    return 0
+
+
 if __name__ == "__main__":
+    if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
+        raise SystemExit(_self_test_581())
     raise SystemExit(main())
