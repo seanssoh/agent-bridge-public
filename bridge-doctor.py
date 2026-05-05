@@ -25,6 +25,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -40,6 +41,7 @@ DETECTOR_KINDS = (
     "stale-blocked-task",
     "cold-restart-suspect",
     "abnormal-session-pane",
+    "daemon-log-split",
 )
 
 
@@ -451,6 +453,117 @@ def detect_abnormal_session_pane(ts: str, explicit: bool) -> list[dict[str, Any]
     ]
 
 
+def _daemon_pid_alive(state_dir: Path) -> bool:
+    """Best-effort: True iff state/daemon.pid exists and the PID is alive."""
+    pid_file = state_dir / "daemon.pid"
+    try:
+        raw = pid_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    if not raw:
+        return False
+    try:
+        pid = int(raw.split()[0])
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def detect_daemon_log_split(
+    state_dir: Path,
+    ts: str,
+) -> list[dict[str, Any]]:
+    """Issue #590: BRIDGE_DAEMON_LOG frozen while launchagent.log is active.
+
+    Fires when ALL of the following hold:
+    - daemon process is running (pid file present, PID alive)
+    - the configured BRIDGE_DAEMON_LOG mtime is older than 7 days
+    - launchagent.log exists in the same state dir AND its mtime is within
+      the last 1 day
+
+    Skipped when the configured BRIDGE_DAEMON_LOG already points at
+    launchagent.log (the post-fix default on launchd installs) — there is
+    no split to flag in that case.
+    """
+    findings: list[dict[str, Any]] = []
+    if not state_dir.is_dir():
+        return findings
+    if not _daemon_pid_alive(state_dir):
+        return findings
+    env_log = os.environ.get("BRIDGE_DAEMON_LOG", "").strip()
+    daemon_log = Path(env_log).expanduser() if env_log else (state_dir / "daemon.log")
+    # Resolve launchagent log from installer-written marker when present
+    # (issue #590 PR #599 r2). Falls back to the conventional path on
+    # installs that have not yet run `install-daemon-launchagent.sh --apply`
+    # under the new code.
+    launchagent_log = state_dir / "launchagent.log"
+    config_path = state_dir / "launchagent.config"
+    if config_path.is_file():
+        try:
+            for line in config_path.read_text(encoding="utf-8").splitlines():
+                if line.startswith("BRIDGE_LAUNCHAGENT_LOG="):
+                    # shell-quoted via printf %q; shlex.split unquotes it.
+                    # ValueError covers malformed quoting (e.g. an unclosed
+                    # quote in the marker file) — a corrupted marker is a
+                    # separate operational problem, so fall back to the
+                    # conventional path rather than surface a detector-error.
+                    parts = shlex.split(line.split("=", 1)[1])
+                    if parts:
+                        launchagent_log = Path(parts[0])
+                    break
+        except (OSError, ValueError):
+            pass
+    # No split possible if BRIDGE_DAEMON_LOG already points at the launchagent
+    # stream; the new default does this on launchd-managed macOS installs.
+    try:
+        if daemon_log.resolve() == launchagent_log.resolve():
+            return findings
+    except OSError:
+        pass
+    if not daemon_log.is_file() or not launchagent_log.is_file():
+        return findings
+    now = now_ts()
+    try:
+        daemon_age = now - int(daemon_log.stat().st_mtime)
+        launchagent_age = now - int(launchagent_log.stat().st_mtime)
+    except OSError:
+        return findings
+    # Detector wants `daemon log >7 days old AND launchagent log <1 day old`.
+    # Use strict inequalities so the boundary matches the literal threshold.
+    if daemon_age < 7 * 86400:
+        return findings
+    if launchagent_age >= 86400:
+        return findings
+    daemon_age_days = daemon_age // 86400
+    findings.append(
+        {
+            "ts": ts,
+            "kind": "daemon-log-split",
+            "agent": "",
+            "evidence": {
+                "bridge_daemon_log": str(daemon_log),
+                "bridge_daemon_log_age_seconds": int(daemon_age),
+                "launchagent_log": str(launchagent_log),
+                "launchagent_log_age_seconds": int(launchagent_age),
+            },
+            "suggested_action": (
+                f"BRIDGE_DAEMON_LOG ({daemon_log}) has not been written to in "
+                f"{daemon_age_days} days; daemon appears launchd-managed and is "
+                f"writing to {launchagent_log}. Set "
+                f"BRIDGE_DAEMON_LOG={launchagent_log} or run "
+                "'agent-bridge daemon status' to confirm both paths."
+            ),
+        }
+    )
+    return findings
+
+
 # --- rendering -------------------------------------------------------------
 
 
@@ -500,7 +613,7 @@ def main() -> int:
         "--detectors",
         default="",
         help=(
-            "Comma-separated allow-list of detector kinds. Default: all four. "
+            "Comma-separated allow-list of detector kinds. Default: all. "
             f"Valid: {','.join(DETECTOR_KINDS)}."
         ),
     )
@@ -642,6 +755,10 @@ def main() -> int:
         (
             "abnormal-session-pane",
             lambda: detect_abnormal_session_pane(ts, abnormal_explicit),
+        ),
+        (
+            "daemon-log-split",
+            lambda: detect_daemon_log_split(state_dir, ts),
         ),
     ]
 

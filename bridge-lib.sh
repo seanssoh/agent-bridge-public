@@ -157,7 +157,41 @@ BRIDGE_WORKTREE_META_DIR="${BRIDGE_WORKTREE_META_DIR:-$BRIDGE_STATE_DIR/worktree
 BRIDGE_ACTIVE_ROSTER_TSV="${BRIDGE_ACTIVE_ROSTER_TSV:-$BRIDGE_STATE_DIR/active-roster.tsv}"
 BRIDGE_ACTIVE_ROSTER_MD="${BRIDGE_ACTIVE_ROSTER_MD:-$BRIDGE_STATE_DIR/active-roster.md}"
 BRIDGE_DAEMON_PID_FILE="${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}"
-BRIDGE_DAEMON_LOG="${BRIDGE_DAEMON_LOG:-$BRIDGE_STATE_DIR/daemon.log}"
+# Issue #590 / PR #599 r2: prefer the installer-written launchagent.config
+# marker so custom --label/--plist/--log-path installs resolve correctly.
+# The marker's presence is the "launchd-managed" signal — we don't need
+# to guess plist filenames or pin to the default label. Linux (systemd/
+# nohup) installs simply lack the marker and fall through to daemon.log.
+# Operators can still override BRIDGE_DAEMON_LOG via env.
+#
+# r3 (PR #599): the marker-read is split into __bridge_resolve_launchagent_log
+# so bridge-daemon.sh can reuse the same precedence for BRIDGE_LAUNCHAGENT_LOG
+# (otherwise the EXIT-trap append at bridge-daemon.sh:147-151 lands in the
+# wrong file on custom --log-path installs).
+__bridge_resolve_launchagent_log() {
+  local config_path="$BRIDGE_STATE_DIR/launchagent.config"
+  if [[ ! -f "$config_path" ]]; then
+    printf ''
+    return
+  fi
+  (
+    set -e
+    # shellcheck disable=SC1090
+    source "$config_path"
+    printf '%s' "${BRIDGE_LAUNCHAGENT_LOG:-}"
+  )
+}
+
+__bridge_default_daemon_log() {
+  local resolved
+  resolved="$(__bridge_resolve_launchagent_log)"
+  if [[ -n "$resolved" ]]; then
+    printf '%s' "$resolved"
+  else
+    printf '%s' "$BRIDGE_STATE_DIR/daemon.log"
+  fi
+}
+BRIDGE_DAEMON_LOG="${BRIDGE_DAEMON_LOG:-$(__bridge_default_daemon_log)}"
 BRIDGE_DAEMON_CRASH_LOG="${BRIDGE_DAEMON_CRASH_LOG:-$BRIDGE_STATE_DIR/daemon-crash.log}"
 BRIDGE_DAEMON_INTERVAL="${BRIDGE_DAEMON_INTERVAL:-5}"
 BRIDGE_DAEMON_START_WAIT_SECONDS="${BRIDGE_DAEMON_START_WAIT_SECONDS:-3}"

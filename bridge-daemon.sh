@@ -103,7 +103,18 @@ daemon_source_state_file() {
 # $BRIDGE_LAUNCHAGENT_LOG and the audit log. Without this, silent exits
 # (signals, `set -e` aborts, unhandled errors) block root-cause of crash-
 # restart cycles (see issues #190, #194).
-BRIDGE_LAUNCHAGENT_LOG="${BRIDGE_LAUNCHAGENT_LOG:-$BRIDGE_STATE_DIR/launchagent.log}"
+#
+# Issue #590 PR #599 r3: BRIDGE_LAUNCHAGENT_LOG follows the same precedence
+# as BRIDGE_DAEMON_LOG — env override wins, otherwise the installer-written
+# marker (resolved via __bridge_resolve_launchagent_log from bridge-lib.sh),
+# otherwise the conventional default. Without this, the EXIT trap below
+# writes to the wrong file on custom --log-path installs.
+if [[ -z "${BRIDGE_LAUNCHAGENT_LOG:-}" ]]; then
+  BRIDGE_LAUNCHAGENT_LOG="$(__bridge_resolve_launchagent_log)"
+  if [[ -z "$BRIDGE_LAUNCHAGENT_LOG" ]]; then
+    BRIDGE_LAUNCHAGENT_LOG="$BRIDGE_STATE_DIR/launchagent.log"
+  fi
+fi
 BRIDGE_LAST_SIGNAL="${BRIDGE_LAST_SIGNAL:-none}"
 BRIDGE_DAEMON_LAST_STEP="${BRIDGE_DAEMON_LAST_STEP:-init}"
 BRIDGE_DAEMON_ERR_LOCATION="${BRIDGE_DAEMON_ERR_LOCATION:-}"
@@ -4881,6 +4892,19 @@ cmd_status() {
     echo "running pid=$(bridge_daemon_pid) interval=${BRIDGE_DAEMON_INTERVAL}s db=${BRIDGE_TASK_DB} socket_listener=${socket_status}"
   else
     echo "stopped socket_listener=${socket_status}"
+  fi
+  # Issue #590 / PR #599 r2: surface every log path the operator may need
+  # so `agent-bridge daemon status` answers "where is the daemon writing?"
+  # directly. r3: BRIDGE_LAUNCHAGENT_LOG is now resolved from the same
+  # marker-aware precedence at line 106-122 above, so we just compare the
+  # two resolved variables — no second marker read here. When the marker
+  # resolves both vars to the same path, only `log=` prints; when the
+  # operator overrode BRIDGE_DAEMON_LOG (or there is no marker at all and
+  # BRIDGE_LAUNCHAGENT_LOG fell back to its conventional default), the
+  # second line surfaces the divergence.
+  echo "log=${BRIDGE_DAEMON_LOG}"
+  if [[ "$BRIDGE_LAUNCHAGENT_LOG" != "$BRIDGE_DAEMON_LOG" ]]; then
+    echo "launchagent_log=${BRIDGE_LAUNCHAGENT_LOG}"
   fi
 }
 
