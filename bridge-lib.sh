@@ -163,22 +163,33 @@ BRIDGE_DAEMON_PID_FILE="${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}"
 # to guess plist filenames or pin to the default label. Linux (systemd/
 # nohup) installs simply lack the marker and fall through to daemon.log.
 # Operators can still override BRIDGE_DAEMON_LOG via env.
-__bridge_default_daemon_log() {
+#
+# r3 (PR #599): the marker-read is split into __bridge_resolve_launchagent_log
+# so bridge-daemon.sh can reuse the same precedence for BRIDGE_LAUNCHAGENT_LOG
+# (otherwise the EXIT-trap append at bridge-daemon.sh:147-151 lands in the
+# wrong file on custom --log-path installs).
+__bridge_resolve_launchagent_log() {
   local config_path="$BRIDGE_STATE_DIR/launchagent.config"
-  if [[ -f "$config_path" ]]; then
-    local launchagent_log_from_config=""
-    launchagent_log_from_config="$(
-      set -e
-      # shellcheck disable=SC1090
-      source "$config_path"
-      printf '%s' "${BRIDGE_LAUNCHAGENT_LOG:-}"
-    )"
-    if [[ -n "$launchagent_log_from_config" ]]; then
-      printf '%s' "$launchagent_log_from_config"
-      return
-    fi
+  if [[ ! -f "$config_path" ]]; then
+    printf ''
+    return
   fi
-  printf '%s' "$BRIDGE_STATE_DIR/daemon.log"
+  (
+    set -e
+    # shellcheck disable=SC1090
+    source "$config_path"
+    printf '%s' "${BRIDGE_LAUNCHAGENT_LOG:-}"
+  )
+}
+
+__bridge_default_daemon_log() {
+  local resolved
+  resolved="$(__bridge_resolve_launchagent_log)"
+  if [[ -n "$resolved" ]]; then
+    printf '%s' "$resolved"
+  else
+    printf '%s' "$BRIDGE_STATE_DIR/daemon.log"
+  fi
 }
 BRIDGE_DAEMON_LOG="${BRIDGE_DAEMON_LOG:-$(__bridge_default_daemon_log)}"
 BRIDGE_DAEMON_CRASH_LOG="${BRIDGE_DAEMON_CRASH_LOG:-$BRIDGE_STATE_DIR/daemon-crash.log}"

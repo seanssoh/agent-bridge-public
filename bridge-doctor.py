@@ -508,12 +508,16 @@ def detect_daemon_log_split(
         try:
             for line in config_path.read_text(encoding="utf-8").splitlines():
                 if line.startswith("BRIDGE_LAUNCHAGENT_LOG="):
-                    # shell-quoted via printf %q; shlex.split unquotes it
+                    # shell-quoted via printf %q; shlex.split unquotes it.
+                    # ValueError covers malformed quoting (e.g. an unclosed
+                    # quote in the marker file) — a corrupted marker is a
+                    # separate operational problem, so fall back to the
+                    # conventional path rather than surface a detector-error.
                     parts = shlex.split(line.split("=", 1)[1])
                     if parts:
                         launchagent_log = Path(parts[0])
                     break
-        except OSError:
+        except (OSError, ValueError):
             pass
     # No split possible if BRIDGE_DAEMON_LOG already points at the launchagent
     # stream; the new default does this on launchd-managed macOS installs.

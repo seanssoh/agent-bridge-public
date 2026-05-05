@@ -88,15 +88,15 @@ tail -n 80 ~/.agent-bridge/state/systemd-daemon-liveness.log  # Linux liveness w
 On launchd-managed macOS installs the daemon writes its stdout/stderr to
 `state/launchagent.log` (the `StandardOut/ErrorPath` redirect target of the
 `ai.agent-bridge.daemon` plist), so `state/daemon.log` freezes at the moment
-launchd takes over. `BRIDGE_DAEMON_LOG` defaults to `state/launchagent.log`
-automatically when that plist is present; on Linux (systemd/nohup) it stays
-on `state/daemon.log`. Override the env var to relocate either path.
-On installs where `state/launchagent.config` is present (written by
-`scripts/install-daemon-launchagent.sh --apply` from this version forward),
-the default resolves to the configured launchagent log path — including
-custom `--label`/`--plist`/`--log-path` installs. Operators on pre-v0.7.X
-installs can either rerun `--apply` once or set `BRIDGE_DAEMON_LOG` in
-their environment.
+launchd takes over. On installs where `state/launchagent.config` exists
+(written by `scripts/install-daemon-launchagent.sh --apply` from this
+version forward), `BRIDGE_DAEMON_LOG` defaults to the configured launchagent
+log path recorded in that marker — including custom `--label`/`--plist`/
+`--log-path` installs. Operators on Linux (systemd/nohup) installs, and on
+pre-marker macOS installs that have not yet rerun `--apply`, keep
+`state/daemon.log` as the SSOT. Setting `BRIDGE_DAEMON_LOG` in env always
+wins. Operators on pre-v0.7.X installs can either rerun `--apply` once or
+set `BRIDGE_DAEMON_LOG` in their environment.
 `agb daemon status` prints both `log=` and `launchagent_log=` lines when
 the operator's `BRIDGE_DAEMON_LOG` resolves to a file other than the
 configured launchagent log, so you can confirm where output is landing
