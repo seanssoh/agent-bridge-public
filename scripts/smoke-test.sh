@@ -10390,4 +10390,13 @@ bash "$REPO_ROOT/scripts/smoke/system-agent-class.sh"
 log "running per-agent-settings-rendering smoke (issue #555)"
 bash "$REPO_ROOT/scripts/smoke/per-agent-settings-rendering.sh"
 
+# Issue #597 Track D — precompact-notify suite. Exercises the Discord
+# relay activity-index writer, the Track A route-primitive end-to-end
+# with the writer-populated index, and the pre-compact.py hook
+# resilience contract. Tracks B (daemon observer) and C (Teams/
+# Mattermost TS adapters) cases are deferred — the fixture documents
+# which assertions are still pending.
+log "running precompact-notify suite smoke (issue #597 Track D)"
+bash "$REPO_ROOT/tests/precompact-notify/smoke.sh"
+
 log "smoke test passed"

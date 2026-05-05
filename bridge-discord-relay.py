@@ -4,17 +4,149 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+
+
+# Discord snowflakes encode milliseconds since 2015-01-01T00:00:00Z in the
+# upper 42 bits. Used as the canonical inbound timestamp for activity
+# index entries — derived directly from the message id, no separate API
+# call required.
+_DISCORD_EPOCH_MS = 1420070400000
+
+
+def _snowflake_to_ms(snowflake: str | int | None) -> int:
+    """Decode a Discord snowflake into epoch milliseconds.
+
+    Returns 0 if the value cannot be parsed.
+    """
+    if snowflake is None:
+        return 0
+    try:
+        as_int = int(str(snowflake))
+    except (TypeError, ValueError):
+        return 0
+    if as_int <= 0:
+        return 0
+    return (as_int >> 22) + _DISCORD_EPOCH_MS
+
+
+def _record_user_inbound_activity(
+    state_dir: Path | None,
+    agent: str,
+    channel_id: str,
+    message: dict[str, Any],
+    now_ts: int,
+    *,
+    reply_kind: str = "message",
+    thread_id: str | None = None,
+) -> None:
+    """Write a normalized inbound entry into the precompact activity index.
+
+    Schema is the one produced/consumed by issue #597 Track A:
+    `$BRIDGE_STATE_DIR/channels/discord/<agent>.json`.
+
+    Writes are best-effort; any error is swallowed so a malformed state
+    dir or filesystem hiccup never breaks the wake relay.
+    """
+    if not state_dir or not agent or not channel_id or not isinstance(message, dict):
+        return
+    message_id = message.get("id")
+    if not message_id:
+        return
+    author = message.get("author") or {}
+    if author.get("bot"):
+        # Defensive — caller already filters human messages, but never
+        # poison the index with a bot-self echo.
+        return
+    user_id = str(author.get("id") or "")
+    inbound_ms = _snowflake_to_ms(message_id)
+    if inbound_ms <= 0:
+        inbound_ms = int(now_ts) * 1000
+    inbound_ts = inbound_ms // 1000
+    try:
+        recorded_ns = time.time_ns()
+    except AttributeError:  # pragma: no cover — Python <3.7
+        recorded_ns = int(time.time() * 1_000_000_000)
+
+    target = state_dir / "channels" / "discord" / f"{agent}.json"
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = target.with_name(target.name + ".lock")
+        with lock_path.open("a") as lock_handle:
+            try:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+                payload: dict[str, Any] = {}
+                if target.exists():
+                    try:
+                        with target.open("r", encoding="utf-8") as handle:
+                            existing = json.load(handle)
+                        if isinstance(existing, dict):
+                            payload = existing
+                    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                        payload = {}
+                payload["schema_version"] = 1
+                payload["agent"] = agent
+                payload["plugin"] = "discord"
+                payload["updated_ts"] = int(now_ts)
+                channels_map = payload.get("channels")
+                if not isinstance(channels_map, dict):
+                    channels_map = {}
+                entry = channels_map.get(channel_id)
+                if not isinstance(entry, dict):
+                    entry = {}
+                entry["channel_id"] = channel_id
+                entry["reply_kind"] = reply_kind
+                entry["last_seen_id"] = str(message_id)
+                entry["last_seen_ts"] = int(now_ts)
+                entry["last_user_inbound_ts"] = int(inbound_ts)
+                entry["last_user_inbound_ts_ms"] = int(inbound_ms)
+                entry["last_user_inbound_message_id"] = str(message_id)
+                if user_id:
+                    entry["last_user_inbound_user_id"] = user_id
+                entry["last_user_inbound_recorded_ns"] = int(recorded_ns)
+                if thread_id:
+                    entry["thread_id"] = str(thread_id)
+                channels_map[channel_id] = entry
+                payload["channels"] = channels_map
+
+                tmp = tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    dir=str(target.parent),
+                    prefix=f".{target.name}.",
+                    suffix=".tmp",
+                    delete=False,
+                )
+                try:
+                    json.dump(payload, tmp, ensure_ascii=False, indent=2)
+                    tmp.write("\n")
+                    tmp.flush()
+                    os.fsync(tmp.fileno())
+                finally:
+                    tmp.close()
+                os.chmod(tmp.name, 0o600)
+                os.replace(tmp.name, target)
+            finally:
+                try:
+                    fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+    except OSError:
+        # Activity index is advisory — never break the relay on write
+        # failures.
+        return
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -295,6 +427,11 @@ def cmd_sync(args: argparse.Namespace) -> int:
     channels = state.setdefault("channels", {})
     dm_channels = state.setdefault("dm_channels", {})
     now_ts = int(time.time())
+    # Activity index lives under $BRIDGE_STATE_DIR/channels/discord/. The
+    # relay's --state-file is rooted in the same state dir; deriving from
+    # its parent keeps the writer in sync with whatever isolated runtime
+    # the operator points the relay at.
+    activity_state_dir = state_path.parent
     registered_agents = load_registered_agents(bridge_home)
 
     try:
@@ -337,6 +474,23 @@ def cmd_sync(args: argparse.Namespace) -> int:
             channel_state["last_seen_id"] = latest_id
             channel_state["last_seen_ts"] = now_ts
 
+            human_messages = [item for item in new_messages if not ((item.get("author") or {}).get("bot"))]
+
+            # Mirror the most recent USER inbound into the precompact
+            # activity index so the daemon's notify routing primitive
+            # (issue #597 Track A) can find a reply target. Done before
+            # the registered/live/cooldown skips so a recently-active
+            # human inbound is still routable when the agent comes back
+            # online.
+            if human_messages:
+                _record_user_inbound_activity(
+                    activity_state_dir,
+                    row["agent"],
+                    channel_id,
+                    human_messages[-1],
+                    now_ts,
+                )
+
             if registered_agents is not None and row["agent"] not in registered_agents:
                 note_relay_issue(channel_state, now_ts, "unknown_agent", row["agent"])
                 continue
@@ -345,7 +499,6 @@ def cmd_sync(args: argparse.Namespace) -> int:
             if live_active:
                 continue
 
-            human_messages = [item for item in new_messages if not ((item.get("author") or {}).get("bot"))]
             if not human_messages:
                 continue
 
@@ -446,11 +599,25 @@ def cmd_sync(args: argparse.Namespace) -> int:
                 dm_state["last_seen_id"] = latest_id
                 dm_state["last_seen_ts"] = now_ts
 
+                human_messages = [item for item in new_messages if not ((item.get("author") or {}).get("bot"))]
+
+                # Same activity-index mirror as the channel path above —
+                # DM channels reuse the same $BRIDGE_STATE_DIR/channels
+                # /discord/<agent>.json file, keyed by the platform DM
+                # channel id.
+                if human_messages:
+                    _record_user_inbound_activity(
+                        activity_state_dir,
+                        agent,
+                        channel_id,
+                        human_messages[-1],
+                        now_ts,
+                    )
+
                 session_name = session_by_agent.get(agent, agent)
                 if tmux_session_active(session_name):
                     continue
 
-                human_messages = [item for item in new_messages if not ((item.get("author") or {}).get("bot"))]
                 if not human_messages:
                     continue
 

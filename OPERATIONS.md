@@ -213,6 +213,38 @@ orphaned but harmless after migration (no symlink references it);
 operators may delete it manually after verifying the per-agent files
 exist and contain the expected `autoCompactWindow` value.
 
+### PreCompact channel auto-notify (issue #597, in-flight)
+
+Agent Bridge can post a one-line notice to the channel that most
+recently messaged a static Claude agent when the agent enters auto
+compaction, and a follow-up when compaction completes. The feature is
+**default OFF** and lands in tracks: Track A (route primitive) and
+Track D (Discord relay activity-index writer + smoke fixture) are
+shipped; Track B (daemon observer + send primitive + EMA stats) and
+Track C (Teams/Mattermost TS plugin writers) follow.
+
+Operator surface, once all tracks land:
+
+- Per-agent opt-in (in `agent-roster.local.sh`):
+  `BRIDGE_AGENT_PRECOMPACT_NOTIFY["<agent>"]="1"`. The agent must be
+  static, Claude-engine, channel-bound, and have received a recent user
+  inbound (default 30 min) on at least one bound plugin channel.
+- Global kill switch (no redeploy): `BRIDGE_PRECOMPACT_NOTIFY_DISABLED=1`
+  in the daemon's environment, then restart or HUP the daemon.
+- Recency window override:
+  `BRIDGE_PRECOMPACT_NOTIFY_RECENCY_SECONDS=<seconds>` (default `1800`).
+- Dry-run for CI / smoke verification:
+  `BRIDGE_PRECOMPACT_NOTIFY_DRY_RUN=1` skips real network sends.
+
+Activity index files live at
+`$BRIDGE_STATE_DIR/channels/<plugin>/<agent>.json` and are populated by
+the Discord wake relay (`bridge-discord-relay.py`) and, once Track C
+ships, by the Teams and Mattermost MCP plugins. The route primitive
+(`bridge-channels.py route-precompact-target`) is consumer-only and
+returns exit 1 with empty stdout when no eligible recent inbound
+exists, so a missing or empty index is a silent skip — never a hard
+failure.
+
 ## Recommended Collaboration Pattern
 
 1. Start agents
