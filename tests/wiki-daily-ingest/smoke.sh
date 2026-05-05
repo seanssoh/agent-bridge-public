@@ -123,6 +123,17 @@ reset_runtime() {
   rm -rf "$BRIDGE_WIKI_ROOT/_audit" 2>/dev/null || true
   rm -f "$WIKI_WATERMARK_FILE" 2>/dev/null || true
   rm -rf "$AGENT_HOME/memory" 2>/dev/null || true
+  # Issue #582 / #583 Track C: scenarios that seed `$AGENT_HOME/raw/` (raw
+  # PreCompact envelopes) must not bleed across into later scenarios — the
+  # legacy walk iterates `$AGENTS_ROOT/*` and picks up any leftover envelope.
+  # Clean both the raw/ subtree and any stray data-v2/ fixtures the v2
+  # scenarios create under SMOKE_ROOT, so each `reset_runtime` returns a
+  # genuinely empty AGENT_HOME and a clean v2 root.
+  rm -rf "$AGENT_HOME/raw" 2>/dev/null || true
+  if [[ -n "${SMOKE_ROOT:-}" && -d "$SMOKE_ROOT/data-v2" ]]; then
+    chmod -R u+rwX "$SMOKE_ROOT/data-v2" 2>/dev/null || true
+    rm -rf "$SMOKE_ROOT/data-v2" 2>/dev/null || true
+  fi
   mkdir -p "$BRIDGE_WIKI_ROOT/_audit" "$AGENT_HOME/memory"
 }
 
@@ -671,6 +682,345 @@ else
     pass "10"
   fi
 fi
+
+# =============================================================================
+# Scenario 11 — Issue #583 Track C: linux-user-isolated agent is skipped from
+# Lane B before any filesystem read AND recorded in the audit log + stdout
+# under the stable reason `isolated_private_root_unreadable_by_design`.
+#
+# We populate a 0700-mode private memory root for an "isolated" agent (the
+# operator UID still owns it in this hermetic smoke, but the test asserts
+# the SKIP path triggers regardless of whether the operator could actually
+# read it — the Track C contract is "don't even try"). The mock returns
+# isolation.mode=linux-user for this agent in `agb agent list --json`. The
+# audit log must show "Skipped (isolated private root) (1)" with the
+# stable reason string and must NOT enumerate the projects file. The
+# stdout summary must include `skipped-isolated=1` and the literal reason.
+#
+# Renumbered from scenario 8 to 11 to avoid colliding with PR #585's
+# scenarios 8/9/10 (raw envelope enumeration + dedup) on `main`.
+# =============================================================================
+banner "11 — Track C: linux-user agent is skipped explicitly with stable reason"
+reset_runtime
+write_note "$TODAY" "# $TODAY note"
+
+ISO_AGENT="iso-agent"
+ISO_WORKDIR="$SMOKE_ROOT/data-v2/agents/$ISO_AGENT/workdir"
+mkdir -p "$ISO_WORKDIR/memory/projects"
+echo "# would-be-promote" >"$ISO_WORKDIR/memory/projects/foo.md"
+touch "$ISO_WORKDIR/memory/projects/foo.md"
+chmod 0700 "$ISO_WORKDIR/memory/projects" 2>/dev/null || true
+chmod 0700 "$ISO_WORKDIR/memory" 2>/dev/null || true
+
+# Mock returns one active claude agent flagged isolation.mode=linux-user.
+AGB_MOCK_AGENT_LIST_JSON="$("$PYTHON" -c "
+import json, sys
+print(json.dumps([{
+    'agent': '$ISO_AGENT',
+    'engine': 'claude',
+    'active': True,
+    'workdir': '$ISO_WORKDIR',
+    'isolation': {'mode': 'linux-user'},
+}]))
+")"
+export AGB_MOCK_AGENT_LIST_JSON
+
+export BRIDGE_LAYOUT=v2
+BRIDGE_DATA_ROOT_FIXTURE="$SMOKE_ROOT/data-v2"
+mkdir -p "$BRIDGE_DATA_ROOT_FIXTURE"
+export BRIDGE_DATA_ROOT="$BRIDGE_DATA_ROOT_FIXTURE"
+
+# Issue #583 Track C r2: capture every `task create` invocation the mock
+# observes during this scenario. The Track C contract requires that NO
+# [librarian-ingest] task is created when every active agent is
+# linux-user-isolated (Lane B has nothing to enumerate, so the librarian
+# call site is short-circuited).
+S11_TASK_LOG="$SMOKE_ROOT/s11.task-log"
+: >"$S11_TASK_LOG"
+export AGB_MOCK_TASK_LOG="$S11_TASK_LOG"
+
+out_file="$(run_ingest s11 || true)"
+audit_file="$BRIDGE_WIKI_ROOT/_audit/ingest-$TODAY.md"
+err_file="$SMOKE_ROOT/s11.err"
+if [[ ! -f "$audit_file" ]]; then
+  fail "11" "audit log missing: $audit_file"
+elif grep -qiE "permission denied|EACCES" "$err_file" "$out_file"; then
+  fail "11" "EACCES leaked into ingest output (stderr or stdout); err=$(head -c 200 "$err_file") out=$(head -c 200 "$out_file")"
+elif ! grep -q "Skipped (isolated private root) (1)" "$audit_file"; then
+  fail "11" "audit log missing 'Skipped (isolated private root) (1)' header; body: $(head -c 400 "$audit_file")"
+elif ! grep -q "$ISO_AGENT — reason: isolated_private_root_unreadable_by_design" "$audit_file"; then
+  fail "11" "audit log missing skipped agent + reason line; body: $(head -c 400 "$audit_file")"
+elif grep -q "projects/foo.md" "$audit_file"; then
+  fail "11" "private root was enumerated despite linux-user isolation; body: $(head -c 400 "$audit_file")"
+elif ! grep -q "skipped-isolated=1" "$out_file"; then
+  fail "11" "stdout missing skipped-isolated=1 counter; got: $(head -c 200 "$out_file")"
+elif ! grep -q "skipped-isolated-reason=isolated_private_root_unreadable_by_design" "$out_file"; then
+  fail "11" "stdout missing stable reason literal; got: $(head -c 200 "$out_file")"
+elif ! grep -q "skipped-isolated-agents=$ISO_AGENT" "$out_file"; then
+  fail "11" "stdout missing isolated agent name; got: $(head -c 200 "$out_file")"
+elif grep -q '\[librarian-ingest\]' "$S11_TASK_LOG"; then
+  fail "11" "[librarian-ingest] task was created for skipped isolated agent; task-log: $(head -c 200 "$S11_TASK_LOG")"
+else
+  pass "11"
+fi
+
+# Restore mode so the EXIT trap can rm -rf without permission errors.
+chmod -R u+rwX "$ISO_WORKDIR" 2>/dev/null || true
+unset AGB_MOCK_AGENT_LIST_JSON BRIDGE_LAYOUT BRIDGE_DATA_ROOT AGB_MOCK_TASK_LOG 2>/dev/null || true
+
+# =============================================================================
+# Scenario 12 — Issue #583 Track C: non-isolated (shared) agent is unaffected.
+# Same shape as scenario 7, but explicitly assert that an agent without
+# isolation.mode=linux-user is enumerated as before AND that the audit log's
+# Track C section reports zero skips. This proves the filter is gated on the
+# isolation field and does not regress the existing path.
+#
+# Renumbered from scenario 9 to 12 to avoid colliding with PR #585's
+# scenarios 8/9/10 on `main`.
+# =============================================================================
+banner "12 — Track C: shared (non-isolated) agent is enumerated as before"
+reset_runtime
+write_note "$TODAY" "# $TODAY note"
+
+SHARED_WORKDIR="$SMOKE_ROOT/data-v2/agents/$AGENT/workdir"
+mkdir -p "$SHARED_WORKDIR/memory/projects"
+echo "# shared probe" >"$SHARED_WORKDIR/memory/projects/bar.md"
+touch "$SHARED_WORKDIR/memory/projects/bar.md"
+
+AGB_MOCK_AGENT_LIST_JSON="$("$PYTHON" -c "
+import json, sys
+print(json.dumps([{
+    'agent': '$AGENT',
+    'engine': 'claude',
+    'active': True,
+    'workdir': '$SHARED_WORKDIR',
+    'isolation': {'mode': 'shared'},
+}]))
+")"
+export AGB_MOCK_AGENT_LIST_JSON
+export BRIDGE_LAYOUT=v2
+mkdir -p "$BRIDGE_DATA_ROOT_FIXTURE"
+export BRIDGE_DATA_ROOT="$BRIDGE_DATA_ROOT_FIXTURE"
+
+# Issue #583 Track C r2: companion to scenario 11. The shared-agent
+# passthrough must still produce exactly one [librarian-ingest] task — this
+# is the regression sentinel that proves the Track C filter does not
+# accidentally suppress task creation for non-isolated agents.
+S12_TASK_LOG="$SMOKE_ROOT/s12.task-log"
+: >"$S12_TASK_LOG"
+export AGB_MOCK_TASK_LOG="$S12_TASK_LOG"
+
+out_file="$(run_ingest s12 || true)"
+audit_file="$BRIDGE_WIKI_ROOT/_audit/ingest-$TODAY.md"
+if [[ ! -f "$audit_file" ]]; then
+  fail "12" "audit log missing: $audit_file"
+elif ! grep -q "projects/bar.md" "$audit_file"; then
+  fail "12" "shared agent's projects/bar.md was NOT enumerated; body: $(head -c 400 "$audit_file")"
+elif ! grep -q "Skipped (isolated private root) (0)" "$audit_file"; then
+  fail "12" "audit log expected 'Skipped (isolated private root) (0)' header; body: $(head -c 400 "$audit_file")"
+elif ! grep -q "skipped-isolated=0" "$out_file"; then
+  fail "12" "stdout missing skipped-isolated=0 counter; got: $(head -c 200 "$out_file")"
+elif ! grep -q "skipped-isolated-agents=none" "$out_file"; then
+  fail "12" "stdout expected skipped-isolated-agents=none; got: $(head -c 200 "$out_file")"
+elif ! grep -q '\[librarian-ingest\]' "$S12_TASK_LOG"; then
+  fail "12" "shared-agent passthrough did NOT create a [librarian-ingest] task; task-log: $(head -c 200 "$S12_TASK_LOG")"
+else
+  pass "12"
+fi
+
+unset AGB_MOCK_AGENT_LIST_JSON BRIDGE_LAYOUT BRIDGE_DATA_ROOT AGB_MOCK_TASK_LOG 2>/dev/null || true
+
+# =============================================================================
+# Scenario 13 — Issue #583 Track C r2: legacy-path isolated agent is skipped
+# BEFORE any stat into its memory subdir.
+#
+# This is the Finding-1 load-bearing case. The legacy iteration must:
+#   - record the isolated agent under SKIPPED_ISOLATED_AGENTS via deny-list
+#   - NOT enumerate $AGENTS_ROOT/<iso>/memory at all
+#
+# We deliberately give the isolated agent a memory subtree containing a
+# research file. With the correct r2 ordering (deny-list BEFORE memory
+# `[[ -d ]]`) the file is not enumerated and the agent is recorded as
+# skipped. The pre-r2 ordering (memory `[[ -d ]]` first, then deny-list)
+# would also avoid enumerating because the deny-list still runs before
+# AGENT_MEMORY_ROOTS+=, but the stat into the private memory subdir would
+# already have happened — which is exactly the contract violation Finding 1
+# called out. To observe the difference *behaviorally* in this hermetic
+# smoke, we exercise the case where the isolated agent has NO memory
+# subdir: r2 still records the skip via deny-list, while r1 (which gates on
+# `[[ -d "$_legacy_dir" ]]` first) silently drops the agent before the
+# deny-list runs and reports zero skips.
+#
+# Renumbered from scenario 10 to 13 to avoid colliding with PR #585's
+# scenarios 8/9/10 on `main`.
+# =============================================================================
+banner "13 — Track C r2: legacy-path isolated agent skip is recorded even without memory/"
+reset_runtime
+unset BRIDGE_LAYOUT 2>/dev/null || true
+write_note "$TODAY" "# $TODAY note"
+
+ISO_LEGACY_AGENT="iso-legacy-agent"
+# Create the agent home but intentionally NO memory subdir. Under r2 the
+# deny-list short-circuits before the memory `[[ -d ]]` test, so the skip
+# is still recorded. Under r1 the missing memory subdir caused the iter
+# body to `continue` before the deny-list ran, so the skip went unrecorded.
+mkdir -p "$BRIDGE_AGENTS_ROOT/$ISO_LEGACY_AGENT"
+
+# Mock declares this agent linux-user-isolated.
+AGB_MOCK_AGENT_LIST_JSON="$("$PYTHON" -c "
+import json, sys
+print(json.dumps([{
+    'agent': '$ISO_LEGACY_AGENT',
+    'engine': 'claude',
+    'active': True,
+    'isolation': {'mode': 'linux-user'},
+}]))
+")"
+export AGB_MOCK_AGENT_LIST_JSON
+
+S13_TASK_LOG="$SMOKE_ROOT/s13.task-log"
+: >"$S13_TASK_LOG"
+export AGB_MOCK_TASK_LOG="$S13_TASK_LOG"
+
+out_file="$(run_ingest s13 || true)"
+audit_file="$BRIDGE_WIKI_ROOT/_audit/ingest-$TODAY.md"
+if [[ ! -f "$audit_file" ]]; then
+  fail "13" "audit log missing: $audit_file"
+elif ! grep -q "Skipped (isolated private root) (1)" "$audit_file"; then
+  fail "13" "audit log missing 'Skipped (isolated private root) (1)' for legacy iso agent; body: $(head -c 400 "$audit_file")"
+elif ! grep -q "$ISO_LEGACY_AGENT — reason: isolated_private_root_unreadable_by_design" "$audit_file"; then
+  fail "13" "audit log missing skipped legacy agent + reason line; body: $(head -c 400 "$audit_file")"
+elif ! grep -q "skipped-isolated=1" "$out_file"; then
+  fail "13" "stdout missing skipped-isolated=1 for legacy iso agent; got: $(head -c 200 "$out_file")"
+elif ! grep -q "skipped-isolated-agents=$ISO_LEGACY_AGENT" "$out_file"; then
+  fail "13" "stdout missing legacy isolated agent name; got: $(head -c 200 "$out_file")"
+elif grep -q '\[librarian-ingest\]' "$S13_TASK_LOG"; then
+  fail "13" "[librarian-ingest] task created for legacy-path isolated agent; task-log: $(head -c 200 "$S13_TASK_LOG")"
+else
+  pass "13"
+fi
+
+unset AGB_MOCK_AGENT_LIST_JSON AGB_MOCK_TASK_LOG 2>/dev/null || true
+
+# =============================================================================
+# Scenario 14 — Issue #583 Track C ∩ Issue #582: an isolated agent with a
+# raw PreCompact envelope under `<workdir>/raw/captures/inbox/` is skipped
+# from BOTH Lane B walks (memory + raw envelope) without an EACCES leak.
+#
+# This is the load-bearing assertion for the Track C extension to PR #585's
+# raw envelope walk. We seed:
+#   - a 0700/2750 isolated workdir for an agent flagged
+#     `isolation.mode=linux-user` in `agb agent list --json`,
+#   - a schema_version=1 raw envelope at
+#     `<workdir>/raw/captures/inbox/precompact-isolated.json`.
+#
+# Track C requires that AGENT_MEMORY_ROOTS exclude this agent before either
+# the memory walk or the new raw envelope walk runs. The audit log must
+# therefore:
+#   - report `Raw envelopes (0)` (the raw inbox is NEVER stat'd),
+#   - NOT mention `precompact-isolated.json`,
+#   - record `Skipped (isolated private root) (1)` with the stable reason,
+#   - mention the isolated agent ONCE (no double-count for memory + raw).
+# Stdout: `raw=0`, `skipped-isolated=1`. No EACCES on either stream.
+# No `[librarian-ingest]` task is created for the isolated agent.
+#
+# Pre-extension verification: with the raw-walk loop unguarded by the
+# AGENT_MEMORY_ROOTS filter (e.g., walking the install-root or workdir
+# directly), the envelope would be enumerated and `Raw envelopes (1)` /
+# `raw=1` would appear — making this scenario fail. With the extension in
+# place (the raw walk reuses the already-filtered AGENT_MEMORY_ROOTS), the
+# envelope is invisible to Lane B.
+# =============================================================================
+banner "14 — Track C: isolated agent's raw envelope inbox is skipped without EACCES"
+reset_runtime
+write_note "$TODAY" "# $TODAY note"
+
+ISO_RAW_AGENT="iso-raw-agent"
+ISO_RAW_WORKDIR="$SMOKE_ROOT/data-v2/agents/$ISO_RAW_AGENT/workdir"
+mkdir -p "$ISO_RAW_WORKDIR/memory/projects"
+mkdir -p "$ISO_RAW_WORKDIR/raw/captures/inbox"
+echo "# would-be-promote" >"$ISO_RAW_WORKDIR/memory/projects/foo.md"
+touch "$ISO_RAW_WORKDIR/memory/projects/foo.md"
+
+# Seed a raw PreCompact envelope under the isolated workdir. If the Track C
+# raw-walk skip is missing, this file would be picked up.
+cat >"$ISO_RAW_WORKDIR/raw/captures/inbox/precompact-isolated.json" <<EOF
+{
+  "schema_version": "1",
+  "agent": "$ISO_RAW_AGENT",
+  "captured_at": "${TODAY}T00:00:00Z",
+  "session_type": "default",
+  "trigger": "manual",
+  "source": "pre-compact-hook",
+  "custom_instructions_excerpt": "",
+  "suggested_entities": ["projects/iso-raw-smoke"],
+  "suggested_concepts": [],
+  "suggested_slug": "iso-raw-smoke",
+  "suggested_title": "iso raw smoke",
+  "excerpt": "pre-compact trigger=manual agent=$ISO_RAW_AGENT iso-raw smoke",
+  "transcript_available": false
+}
+EOF
+touch "$ISO_RAW_WORKDIR/raw/captures/inbox/precompact-isolated.json"
+# 2750 mirrors the production isolated layout (sgid + group-traverse, owner-
+# only read). `chmod 0700` on memory + raw mirrors the per-UID lockdown.
+chmod 0700 "$ISO_RAW_WORKDIR/memory" 2>/dev/null || true
+chmod 0700 "$ISO_RAW_WORKDIR/raw" 2>/dev/null || true
+chmod 0700 "$ISO_RAW_WORKDIR/raw/captures" 2>/dev/null || true
+chmod 0700 "$ISO_RAW_WORKDIR/raw/captures/inbox" 2>/dev/null || true
+
+AGB_MOCK_AGENT_LIST_JSON="$("$PYTHON" -c "
+import json
+print(json.dumps([{
+    'agent': '$ISO_RAW_AGENT',
+    'engine': 'claude',
+    'active': True,
+    'workdir': '$ISO_RAW_WORKDIR',
+    'isolation': {'mode': 'linux-user'},
+}]))
+")"
+export AGB_MOCK_AGENT_LIST_JSON
+export BRIDGE_LAYOUT=v2
+BRIDGE_DATA_ROOT_FIXTURE="$SMOKE_ROOT/data-v2"
+mkdir -p "$BRIDGE_DATA_ROOT_FIXTURE"
+export BRIDGE_DATA_ROOT="$BRIDGE_DATA_ROOT_FIXTURE"
+
+S14_TASK_LOG="$SMOKE_ROOT/s14.task-log"
+: >"$S14_TASK_LOG"
+export AGB_MOCK_TASK_LOG="$S14_TASK_LOG"
+
+out_file="$(run_ingest s14 || true)"
+audit_file="$BRIDGE_WIKI_ROOT/_audit/ingest-$TODAY.md"
+err_file="$SMOKE_ROOT/s14.err"
+if [[ ! -f "$audit_file" ]]; then
+  fail "14" "audit log missing: $audit_file"
+elif grep -qiE "permission denied|EACCES" "$err_file" "$out_file"; then
+  fail "14" "EACCES leaked into ingest output (stderr or stdout); err=$(head -c 200 "$err_file") out=$(head -c 200 "$out_file")"
+elif grep -q "precompact-isolated.json" "$audit_file"; then
+  fail "14" "isolated agent's raw envelope was enumerated despite linux-user isolation; body: $(head -c 400 "$audit_file")"
+elif ! grep -q "Raw envelopes (0)" "$audit_file"; then
+  fail "14" "audit log expected 'Raw envelopes (0)' for skipped isolated agent; body: $(head -c 400 "$audit_file")"
+elif ! grep -q "Skipped (isolated private root) (1)" "$audit_file"; then
+  fail "14" "audit log missing 'Skipped (isolated private root) (1)' header; body: $(head -c 400 "$audit_file")"
+elif ! grep -q "$ISO_RAW_AGENT — reason: isolated_private_root_unreadable_by_design" "$audit_file"; then
+  fail "14" "audit log missing skipped agent + reason line; body: $(head -c 400 "$audit_file")"
+elif ! grep -q "raw=0" "$out_file"; then
+  fail "14" "stdout expected raw=0 for skipped isolated agent; got: $(head -c 200 "$out_file")"
+elif ! grep -q "skipped-isolated=1" "$out_file"; then
+  fail "14" "stdout missing skipped-isolated=1 counter; got: $(head -c 200 "$out_file")"
+elif ! grep -q "skipped-isolated-agents=$ISO_RAW_AGENT" "$out_file"; then
+  fail "14" "stdout missing isolated agent name; got: $(head -c 200 "$out_file")"
+elif grep -q '\[librarian-ingest\]' "$S14_TASK_LOG"; then
+  fail "14" "[librarian-ingest] task was created for skipped isolated raw-walk agent; task-log: $(head -c 200 "$S14_TASK_LOG")"
+elif [[ "$(grep -c "$ISO_RAW_AGENT — reason:" "$audit_file" || true)" -ne 1 ]]; then
+  fail "14" "skipped isolated agent listed more than once in audit log (memory + raw should dedup); body: $(head -c 400 "$audit_file")"
+else
+  pass "14"
+fi
+
+# Restore mode so the EXIT trap can rm -rf without permission errors.
+chmod -R u+rwX "$ISO_RAW_WORKDIR" 2>/dev/null || true
+unset AGB_MOCK_AGENT_LIST_JSON BRIDGE_LAYOUT BRIDGE_DATA_ROOT AGB_MOCK_TASK_LOG 2>/dev/null || true
 
 # -----------------------------------------------------------------------------
 # Summary

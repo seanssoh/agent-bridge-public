@@ -159,12 +159,32 @@ PYEOF
 #   - 정상 + 진짜 0 active claude agent  → silent OK, Lane B 0 카운트
 # 모든 fail 경로는 `_lane_b_stderr` 임시파일을 명시적으로 rm 한 뒤 exit
 # (기존 line ~101 의 COPY_JSON EXIT trap 을 손상하지 않기 위해 별도 trap 미사용).
+#
+# Isolated-agent skip (issue #583 Track C):
+#   Agents created with `--isolation linux-user` own their `memory/` subtree
+#   under a per-UID 0700 root. The librarian (running as the operator UID)
+#   cannot read those paths, so any [librarian-ingest] task pointed at them
+#   completes with "cross-agent access blocked" and the same files re-queue
+#   the next day forever. We classify isolation up-front from operator-UID-
+#   readable metadata only (`agb agent list --json` reads the roster, never
+#   the agent's private root) and skip such agents from Lane B entirely
+#   before any `find`/`ls` touches their tree. Skipped agents are recorded
+#   in the audit log AND the stdout summary with the stable reason string
+#   `isolated_private_root_unreadable_by_design` so log consumers can grep
+#   on it. Track A (ACL grant on the private root) is rejected by operator
+#   policy after isolate-v2; Track B (push-to-staging) is the long-term
+#   fix and ships separately.
 # -------------------------------------------------------------------------
 
 : "${BRIDGE_AGB:=$BRIDGE_HOME/agent-bridge}"
 : "${BRIDGE_PYTHON:=python3}"
 
+# Stable identifier for the skip reason. Keep this literal in sync with
+# any downstream log consumers / dashboards that grep on it.
+readonly LANE_B_ISOLATED_SKIP_REASON="isolated_private_root_unreadable_by_design"
+
 declare -a AGENT_MEMORY_ROOTS=()
+declare -a SKIPPED_ISOLATED_AGENTS=()
 
 # Active-contract gate: v2 path requires BRIDGE_LAYOUT=v2 AND a populated
 # BRIDGE_DATA_ROOT directory. A child env that propagates only LAYOUT=v2
@@ -191,6 +211,10 @@ if [[ "${BRIDGE_LAYOUT:-legacy}" == "v2" \
     exit 2
   fi
 
+  # Emit "<agent>\t<workdir>\t<isolation_mode>" per active claude agent.
+  # isolation_mode is read from the JSON only — the roster is the source of
+  # truth and the operator UID can read it; we never touch the agent's
+  # private root to determine isolation status (issue #583 Track C).
   agents_tsv="$("$BRIDGE_PYTHON" - "$agent_list_json" <<'PY' 2>"$_lane_b_stderr"
 import json, sys
 try:
@@ -210,7 +234,9 @@ for a in data:
     wd = a.get("workdir") or ""
     if not name or not wd:
         continue
-    print(f"{name}\t{wd}")
+    isolation = a.get("isolation") or {}
+    mode = (isolation.get("mode") if isinstance(isolation, dict) else "") or "shared"
+    print(f"{name}\t{wd}\t{mode}")
 PY
 )"
   parse_exit=$?
@@ -223,8 +249,15 @@ PY
   rm -f "$_lane_b_stderr"
 
   if [[ -n "$agents_tsv" ]]; then
-    while IFS=$'\t' read -r _agent _workdir; do
+    while IFS=$'\t' read -r _agent _workdir _isolation; do
       [[ -n "$_agent" && -n "$_workdir" ]] || continue
+      # Issue #583 Track C: skip linux-user-isolated agents BEFORE any
+      # filesystem read. The classifier above used only operator-UID-
+      # readable metadata so this branch never opens the private root.
+      if [[ "$_isolation" == "linux-user" ]]; then
+        SKIPPED_ISOLATED_AGENTS+=("$_agent")
+        continue
+      fi
       [[ -d "$_workdir/memory" ]] || continue
       AGENT_MEMORY_ROOTS+=("$_workdir/memory")
     done <<< "$agents_tsv"
@@ -232,36 +265,119 @@ PY
 else
   # Legacy: original find-based enumeration over $AGENTS_ROOT/*/memory.
   # Each install-root agent dir with a memory/ subtree contributes a root.
+  #
+  # Issue #583 Track C: ask `agb agent list --json` (operator-UID-readable
+  # roster only — does not touch any agent's private root) for the
+  # isolation mode of each agent and skip linux-user agents before the
+  # find walk reaches their tree. Best-effort: if BRIDGE_AGB is missing
+  # or the call fails / returns malformed JSON, the deny-list stays
+  # empty and the legacy path runs exactly as before. This preserves the
+  # legacy default-off invariant while giving the skip path a chance to
+  # work on every install where the CLI is healthy.
+  #
+  # Bash 3.2 compatibility: macOS system bash lacks associative arrays,
+  # so the deny-list is held as a newline-delimited string with leading
+  # and trailing delimiters and tested via `[[ ... == *NL$name$NL* ]]`.
+  # bridge_validate_agent_name already restricts agent names to
+  # alphanumerics/dash/underscore so a name cannot contain a literal
+  # newline that would defeat the membership test.
+  _legacy_iso_deny_list=$'\n'
+  if [[ -x "$BRIDGE_AGB" ]]; then
+    _legacy_iso_json="$("$BRIDGE_AGB" agent list --json 2>/dev/null || true)"
+    if [[ -n "$_legacy_iso_json" ]]; then
+      _legacy_iso_tsv="$("$BRIDGE_PYTHON" - "$_legacy_iso_json" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if not isinstance(data, list):
+    sys.exit(0)
+for a in data:
+    if not isinstance(a, dict):
+        continue
+    name = a.get("agent") or ""
+    if not name:
+        continue
+    isolation = a.get("isolation") or {}
+    mode = (isolation.get("mode") if isinstance(isolation, dict) else "") or "shared"
+    if mode == "linux-user":
+        print(name)
+PY
+)"
+      while IFS= read -r _iso_name; do
+        [[ -n "$_iso_name" ]] || continue
+        _legacy_iso_deny_list+="$_iso_name"$'\n'
+      done <<< "$_legacy_iso_tsv"
+    fi
+  fi
+
   if [[ -d "$AGENTS_ROOT" ]]; then
-    for _legacy_dir in "$AGENTS_ROOT"/*/memory; do
-      [[ -d "$_legacy_dir" ]] || continue
-      AGENT_MEMORY_ROOTS+=("$_legacy_dir")
+    # Issue #583 Track C r2: glob $AGENTS_ROOT/* (the operator-UID-readable
+    # parent), derive the agent name from the path, run the deny-list check
+    # FIRST, and only then `[[ -d "$_legacy_agent_dir/memory" ]]`. The
+    # previous shape stat'd the agent's memory subdir before the deny-list
+    # check, which could trip permissions on installs where the agent home
+    # itself is per-UID owned. The "skip BEFORE any read attempt into a
+    # possibly-private path" contract requires the deny-list to gate even
+    # the directory-existence test on $_legacy_agent_dir/memory.
+    for _legacy_agent_dir in "$AGENTS_ROOT"/*; do
+      # Stat the parent (operator-UID-readable in v1 layout). Skip non-dir
+      # entries like stray files or broken symlinks.
+      [[ -d "$_legacy_agent_dir" ]] || continue
+      _legacy_agent="${_legacy_agent_dir##*/}"
+      if [[ "$_legacy_iso_deny_list" == *$'\n'"$_legacy_agent"$'\n'* ]]; then
+        SKIPPED_ISOLATED_AGENTS+=("$_legacy_agent")
+        continue
+      fi
+      _legacy_memory_dir="$_legacy_agent_dir/memory"
+      [[ -d "$_legacy_memory_dir" ]] || continue
+      AGENT_MEMORY_ROOTS+=("$_legacy_memory_dir")
     done
   fi
 fi
 
+# Deduplicate the skipped-agent list and sort for deterministic output.
+# Bash 3.2 compatibility: avoid mapfile (bash 4) by using a portable read
+# loop into a temporary array, then reassigning.
+if (( ${#SKIPPED_ISOLATED_AGENTS[@]} > 0 )); then
+  _skipped_sorted=()
+  while IFS= read -r _name; do
+    [[ -n "$_name" ]] && _skipped_sorted+=("$_name")
+  done < <(printf '%s\n' "${SKIPPED_ISOLATED_AGENTS[@]}" | sort -u)
+  SKIPPED_ISOLATED_AGENTS=("${_skipped_sorted[@]}")
+fi
+skipped_isolated_count=${#SKIPPED_ISOLATED_AGENTS[@]}
+
 # Research files touched in last 24h (across all active agent memory roots).
+# Issue #583 Track C: AGENT_MEMORY_ROOTS may legitimately be empty when every
+# active agent is linux-user-isolated (and therefore skipped). Use the
+# defined-fallback expansion so `set -u` does not trip on the empty array.
 touched_research=""
-for _root in "${AGENT_MEMORY_ROOTS[@]}"; do
-  [[ -d "$_root/research" ]] || continue
-  while IFS= read -r _f; do
-    [[ -n "$_f" ]] && touched_research+="$_f"$'\n'
-  done < <(find "$_root/research" -type f -name '*.md' -mtime -1 2>/dev/null)
-done
+if (( ${#AGENT_MEMORY_ROOTS[@]} > 0 )); then
+  for _root in "${AGENT_MEMORY_ROOTS[@]}"; do
+    [[ -d "$_root/research" ]] || continue
+    while IFS= read -r _f; do
+      [[ -n "$_f" ]] && touched_research+="$_f"$'\n'
+    done < <(find "$_root/research" -type f -name '*.md' -mtime -1 2>/dev/null)
+  done
+fi
 touched_research=$(printf '%s' "$touched_research" | sed '/^$/d' | sort -u)
 research_count=$(printf '%s\n' "$touched_research" | grep -c '[^[:space:]]' || true)
 research_count=${research_count:-0}
 
 # projects/shared/decisions files touched in last 24h.
 touched_other=""
-for _root in "${AGENT_MEMORY_ROOTS[@]}"; do
-  for _sub in projects shared decisions; do
-    [[ -d "$_root/$_sub" ]] || continue
-    while IFS= read -r _f; do
-      [[ -n "$_f" ]] && touched_other+="$_f"$'\n'
-    done < <(find "$_root/$_sub" -type f -name '*.md' -mtime -1 2>/dev/null)
+if (( ${#AGENT_MEMORY_ROOTS[@]} > 0 )); then
+  for _root in "${AGENT_MEMORY_ROOTS[@]}"; do
+    for _sub in projects shared decisions; do
+      [[ -d "$_root/$_sub" ]] || continue
+      while IFS= read -r _f; do
+        [[ -n "$_f" ]] && touched_other+="$_f"$'\n'
+      done < <(find "$_root/$_sub" -type f -name '*.md' -mtime -1 2>/dev/null)
+    done
   done
-done
+fi
 touched_other=$(printf '%s' "$touched_other" | sed '/^$/d' | sort -u)
 other_count=$(printf '%s\n' "$touched_other" | grep -c '[^[:space:]]' || true)
 other_count=${other_count:-0}
@@ -278,15 +394,28 @@ other_count=${other_count:-0}
 # agent home root is the parent directory; the raw inbox lives one level over
 # at `<agent_home>/raw/captures/inbox`. Reusing the existing roots keeps both
 # the legacy and v2 enumeration paths in sync without inventing a new resolver.
+#
+# Issue #583 Track C: AGENT_MEMORY_ROOTS is already filtered to exclude
+# linux-user-isolated agents (the deny-list runs during root construction
+# above), so this loop transparently inherits the skip. The raw inbox under
+# an isolated agent's `<agent_home>/raw/captures/inbox` is never stat'd for
+# the same reason its `<agent_home>/memory/...` is never stat'd: the deny-
+# list short-circuits before either path is reached. A skipped agent
+# therefore contributes ONE skip line to the audit log (not two — memory
+# and raw are deduped through the shared roots array).
+# Same empty-array guard as the research/other walks: every active agent
+# may legitimately be linux-user-isolated, leaving AGENT_MEMORY_ROOTS empty.
 touched_raw=""
-for _root in "${AGENT_MEMORY_ROOTS[@]}"; do
-  _agent_home_dir="$(dirname -- "$_root")"
-  _raw_inbox="$_agent_home_dir/raw/captures/inbox"
-  [[ -d "$_raw_inbox" ]] || continue
-  while IFS= read -r _f; do
-    [[ -n "$_f" ]] && touched_raw+="$_f"$'\n'
-  done < <(find "$_raw_inbox" -type f \( -name '*.json' -o -name '*.md' \) -mtime -1 2>/dev/null)
-done
+if (( ${#AGENT_MEMORY_ROOTS[@]} > 0 )); then
+  for _root in "${AGENT_MEMORY_ROOTS[@]}"; do
+    _agent_home_dir="$(dirname -- "$_root")"
+    _raw_inbox="$_agent_home_dir/raw/captures/inbox"
+    [[ -d "$_raw_inbox" ]] || continue
+    while IFS= read -r _f; do
+      [[ -n "$_f" ]] && touched_raw+="$_f"$'\n'
+    done < <(find "$_raw_inbox" -type f \( -name '*.json' -o -name '*.md' \) -mtime -1 2>/dev/null)
+  done
+fi
 touched_raw=$(printf '%s' "$touched_raw" | sed '/^$/d' | sort -u)
 raw_count=$(printf '%s\n' "$touched_raw" | grep -c '[^[:space:]]' || true)
 raw_count=${raw_count:-0}
@@ -315,6 +444,18 @@ non_daily_total=$(( research_count + other_count + raw_count ))
   echo ""
   echo "### Raw envelopes ($raw_count)"
   echo "$touched_raw" | while read -r f; do [ -n "$f" ] && echo "- $f"; done
+  echo ""
+  # Issue #583 Track C: explicit listing of agents whose private root was
+  # not enumerated. Stable reason string — keep in sync with
+  # $LANE_B_ISOLATED_SKIP_REASON above. A skipped agent is recorded once
+  # here regardless of whether the gate fired against the memory walk or
+  # the raw envelope walk; both share AGENT_MEMORY_ROOTS as their input.
+  echo "### Skipped (isolated private root) ($skipped_isolated_count)"
+  if (( skipped_isolated_count > 0 )); then
+    for _skipped in "${SKIPPED_ISOLATED_AGENTS[@]}"; do
+      echo "- $_skipped — reason: $LANE_B_ISOLATED_SKIP_REASON"
+    done
+  fi
 } > "$LOG"
 
 # Queue librarian task only for non-daily work. Lane A already handled
@@ -339,4 +480,14 @@ if [ "$copy_rc" -eq 0 ] && [ "$copy_errors" = "0" ]; then
   write_watermark_atomic "$DATE" || true
 fi
 
-echo "wiki-daily-ingest: date=$DATE since=$YESTERDAY lane-a ${copy_summary} lane-b research=$research_count other=$other_count raw=$raw_count total=$non_daily_total log=$LOG"
+# Stdout summary. The skipped-isolated counter is always present so log
+# consumers can grep on it without conditional lookups; the agent list
+# uses the LANE_B_ISOLATED_SKIP_REASON literal so the grep contract is
+# stable across both surfaces (audit log + stdout). The raw=$raw_count
+# field is the #585 raw envelope counter and stays adjacent to the other
+# Lane B lane counters.
+skipped_isolated_csv=""
+if (( skipped_isolated_count > 0 )); then
+  skipped_isolated_csv="$(IFS=,; echo "${SKIPPED_ISOLATED_AGENTS[*]}")"
+fi
+echo "wiki-daily-ingest: date=$DATE since=$YESTERDAY lane-a ${copy_summary} lane-b research=$research_count other=$other_count raw=$raw_count total=$non_daily_total skipped-isolated=$skipped_isolated_count skipped-isolated-reason=$LANE_B_ISOLATED_SKIP_REASON skipped-isolated-agents=${skipped_isolated_csv:-none} log=$LOG"
