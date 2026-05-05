@@ -1059,11 +1059,13 @@ def main() -> int:
     # detector-error rather than failing the whole doctor run.
     enabled_set_pre = set(enabled)
     home_root = resolve_agent_home_root(args.agent_home_root)
+    registry_load_failed = False
     if "orphan-agent-dir" in enabled_set_pre:
         try:
             registry = load_agent_registry(args)
         except SystemExit as exc:
             registry = []
+            registry_load_failed = True
             findings.append(
                 {
                     "ts": ts,
@@ -1103,7 +1105,12 @@ def main() -> int:
         ),
         (
             "orphan-agent-dir",
-            lambda: detect_orphan_agent_dir(registry, home_root, ts),
+            # Short-circuit when registry-load failed so we don't flood the
+            # operator with every-dir-is-orphan false positives. The
+            # detector-error row was already emitted above; the empty
+            # known-set otherwise treats every dir under BRIDGE_AGENT_HOME_ROOT
+            # as orphan.
+            lambda: [] if registry_load_failed else detect_orphan_agent_dir(registry, home_root, ts),
         ),
     ]
 

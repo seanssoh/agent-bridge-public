@@ -303,7 +303,12 @@ test_unreadable_subdir_partial_finding() {
 # ---------------------------------------------------------------------------
 test_repro_suffix_artifact() {
   reset_home_root
+  # codex r1 noted that `created-agent-repro-44925` matches the
+  # `created-agent-` prefix branch first, so the regex path is never
+  # reached. Add a pure-regex name (no matching prefix) to isolate the
+  # ORPHAN_TEST_ARTIFACT_REPRO_REGEX branch.
   mkdir -p "$BRIDGE_AGENT_HOME_ROOT/created-agent-repro-44925"
+  mkdir -p "$BRIDGE_AGENT_HOME_ROOT/worker-repro-42"
   local registry="$SMOKE_TMP_ROOT/registry.t7.json"
   write_registry "$registry"
 
@@ -312,7 +317,10 @@ test_repro_suffix_artifact() {
   local is_test
   is_test="$(finding_field "$out" "created-agent-repro-44925" "is_test_artifact")"
   smoke_assert_eq "true" "$is_test" \
-    "T7 *-repro-<digits> suffix flagged is_test_artifact"
+    "T7 (a) *-repro-<digits> suffix flagged is_test_artifact (prefix branch)"
+  is_test="$(finding_field "$out" "worker-repro-42" "is_test_artifact")"
+  smoke_assert_eq "true" "$is_test" \
+    "T7 (b) regex-only -repro-<digits> match (no prefix overlap)"
 }
 
 # ---------------------------------------------------------------------------
