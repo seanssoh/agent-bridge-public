@@ -323,10 +323,22 @@ class ShellStreamCollector:
             pass
 
     def _run(self) -> None:
+        # Use `read1` so each iteration returns whatever bytes are
+        # currently available on the pipe rather than blocking until
+        # the buffer fills (`read(_CHUNK)` waits for either _CHUNK
+        # bytes OR EOF). With `read`, a child that prints a small
+        # burst then sleeps holds the cap-trip back until the child
+        # eventually closes stdout — which is exactly the
+        # SIGTERM-ignoring child case in finding 2 of PR #625 r2
+        # review. `read1` lets the cap fire as soon as the first
+        # over-cap chunk arrives.
+        reader = getattr(self._source, "read1", None)
+        if reader is None:
+            reader = self._source.read
         try:
             with self._dest_path.open("wb") as fh:
                 while True:
-                    chunk = self._source.read(self._CHUNK)
+                    chunk = reader(self._CHUNK)
                     if not chunk:
                         return
                     if self.truncated:
@@ -1708,13 +1720,56 @@ def _validate_shell_script(script_path: Path, run_uid: int) -> None:
         )
 
 
-def cmd_run_shell(request: dict[str, Any], request_file: Path, args: argparse.Namespace) -> int:
+def _extract_shell_lock_key(request_file: Path) -> tuple[str, str, str | None]:
+    """Minimal parse to derive the per-job lock key + run_id.
+
+    Reads ONLY enough of the request body to know which lock to take —
+    no artifact-trust validation, no script validation, no env build.
+    The full re-parse + validation runs under the flock in
+    `cmd_run_shell`. This keeps the lock-acquired-before-validation
+    invariant intact (finding 1 of PR #625 r2 review).
+
+    Returns (lock_key, run_id, error). `error` is None on success.
+    """
+    fallback_run_id = run_dir_id(request_file.parent)
+    try:
+        data = json.loads(request_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return "", fallback_run_id, f"request_artifact_corrupted: {type(exc).__name__}: {exc}"
+    if not isinstance(data, dict):
+        return "", fallback_run_id, "request_artifact_corrupted: non_dict_top_level"
+    run_id = str(data.get("run_id") or fallback_run_id)
+    lock_key = str(data.get("job_id") or run_id)
+    return lock_key, run_id, None
+
+
+def cmd_run_shell(request_file: Path, args: argparse.Namespace) -> int:
     run_dir = request_file.parent
-    run_id = str(request.get("run_id") or run_dir_id(run_dir))
     result_file = (run_dir / "result.json").resolve()
     status_file = (run_dir / "status.json").resolve()
     stdout_log = (run_dir / "stdout.log").resolve()
     stderr_log = (run_dir / "stderr.log").resolve()
+
+    # Minimal pre-lock parse — lock key + run_id only. The full body
+    # is re-read under the flock below for validation + exec, so this
+    # parse intentionally inspects nothing else.
+    lock_key, run_id, lock_key_error = _extract_shell_lock_key(request_file)
+    if lock_key_error is not None:
+        # Match the existing terminal-error contract: status.runner_error
+        # carries the full classifier string (e.g. "request_artifact_corrupted:
+        # non_dict_top_level") so smoke assertions can grep for both halves.
+        write_shell_terminal_error(
+            request_file,
+            runner_error=lock_key_error,
+            summary=lock_key_error,
+            run_id=run_id,
+        )
+        print("status: error")
+        print(f"run_id: {run_id}")
+        print("engine: shell")
+        # Header line uses the short prefix so operators see a stable token.
+        print(f"runner_error: {lock_key_error.split(':', 1)[0]}")
+        return 1
 
     if args.dry_run:
         print("status: dry_run")
@@ -1725,16 +1780,14 @@ def cmd_run_shell(request: dict[str, Any], request_file: Path, args: argparse.Na
         print(f"status_file: {rel_for_output(str(status_file))}")
         return 0
 
-    audit_target_agent = str(request.get("target_agent") or "daemon")
-
-    # Derive the per-job lock path from the parsed request BEFORE any
-    # artifact validation, so we can hold the flock across validation +
-    # exec (finding 1 of PR #625 r2 review — TOCTOU window between
-    # validate and exec when validation ran outside the flock).
+    # Derive the per-job lock path from the minimal pre-parse so we
+    # can hold the flock across the full re-parse + artifact/script
+    # validation + exec (finding 1 of PR #625 r2 review — body must
+    # not be parsed/validated outside the flock).
     try:
         lock_dir = cron_state_dir_from_env(run_dir) / "locks"
         lock_dir.mkdir(parents=True, exist_ok=True)
-        lock_file = lock_dir / f"{str(request.get('job_id') or run_id)}.lock"
+        lock_file = lock_dir / f"{lock_key}.lock"
     except Exception as exc:  # noqa: BLE001
         error_message = f"lock_path_unavailable: {exc}"
         write_shell_terminal_error(
@@ -1742,7 +1795,6 @@ def cmd_run_shell(request: dict[str, Any], request_file: Path, args: argparse.Na
             runner_error=error_message,
             summary=error_message,
             run_id=run_id,
-            audit_target_agent=audit_target_agent,
         )
         print("status: error")
         print(f"run_id: {run_id}")
@@ -1784,6 +1836,85 @@ def cmd_run_shell(request: dict[str, Any], request_file: Path, args: argparse.Na
             print("engine: shell")
             print("summary: lock_held")
             return 0
+
+        # Re-read the request body from disk UNDER the flock (finding 1
+        # of PR #625 r2 review). The pre-lock minimal parse only
+        # extracted the lock key; the full parse + artifact-trust +
+        # script validation must all run while we hold the per-job
+        # flock so an attacker cannot swap the body or script between
+        # validate and exec.
+        try:
+            request: dict[str, Any] = read_json(request_file)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            error_message = f"request_artifact_corrupted: {type(exc).__name__}"
+            write_shell_terminal_error(
+                request_file,
+                runner_error=error_message,
+                summary=f"{error_message}: {exc}",
+                run_id=run_id,
+            )
+            print("status: error")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print(f"runner_error: {error_message}")
+            return 1
+        if not isinstance(request, dict):
+            error_message = "request_artifact_corrupted: non_dict_top_level"
+            write_shell_terminal_error(
+                request_file,
+                runner_error=error_message,
+                summary=error_message,
+                run_id=run_id,
+            )
+            print("status: error")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print(f"runner_error: {error_message}")
+            return 1
+        if not is_shell_request_payload(request):
+            error_message = "request_artifact_tampered: payload_kind no longer shell after lock"
+            write_shell_terminal_error(
+                request_file,
+                runner_error="request_artifact_tampered",
+                summary=error_message,
+                run_id=run_id,
+                audit_target_agent=str(request.get("target_agent") or "daemon"),
+            )
+            print("status: error")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print("runner_error: request_artifact_tampered")
+            return 1
+
+        # Confirm the post-lock job_id matches the lock we acquired.
+        # If an attacker swapped the body's job_id between the pre-lock
+        # minimal parse and the post-lock re-read, we'd otherwise be
+        # holding the wrong lock — a different runner could legitimately
+        # be holding the now-correct lock and exec'ing the same job
+        # body in parallel. Treat the mismatch as tampering.
+        post_lock_run_id = str(request.get("run_id") or run_dir_id(run_dir))
+        post_lock_lock_key = str(request.get("job_id") or post_lock_run_id)
+        if post_lock_lock_key != lock_key:
+            error_message = (
+                "request_artifact_tampered: job_id changed between pre-lock parse and lock acquisition"
+            )
+            write_shell_terminal_error(
+                request_file,
+                runner_error="request_artifact_tampered",
+                summary=error_message,
+                run_id=run_id,
+                audit_target_agent=str(request.get("target_agent") or "daemon"),
+            )
+            print("status: error")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print("runner_error: request_artifact_tampered")
+            return 1
+
+        # `audit_target_agent` is derived from the freshly re-read
+        # body so audit attribution always reflects what is on disk
+        # under the lock — never the stale pre-lock dict.
+        audit_target_agent = str(request.get("target_agent") or "daemon")
 
         # Validate request artifacts UNDER the flock so a swap between
         # validation and exec must contend with the same lock.
@@ -1881,18 +2012,31 @@ def cmd_run_shell(request: dict[str, Any], request_file: Path, args: argparse.Na
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+        # Capture the process group id at spawn-time. Looking it up
+        # later via `os.getpgid(process.pid)` fails on some platforms
+        # once the immediate Popen child has been reaped — but the
+        # pgid keeps living as long as descendants remain (e.g. a
+        # SIGTERM-ignoring Python grandchild). We need the pgid to
+        # SIGKILL those descendants in `escalate_after_grace`.
+        try:
+            process_pgid = os.getpgid(process.pid)
+        except OSError:
+            process_pgid = process.pid
         timed_out = False
         cap_exceeded = False
         kill_lock = threading.Lock()
         kill_state = {"sigterm_sent": False, "sigkill_sent": False}
+        # cap_event interlocks the cap-collector threads with the main
+        # waiter so a cap-trip starts the SIGKILL grace immediately
+        # (finding 2 of PR #625 r2 review). Pre-r3 the main thread sat
+        # in `process.wait(timeout=timeout_seconds)`, so a TERM-ignoring
+        # child kept running until the full cron timeout, then another
+        # 5s grace — instead of cap-fire + 5s.
+        cap_event = threading.Event()
 
         def killpg_signal(sig: int) -> None:
             try:
-                pgid = os.getpgid(process.pid)
-            except OSError:
-                return
-            try:
-                os.killpg(pgid, sig)
+                os.killpg(process_pgid, sig)
             except OSError:
                 pass
 
@@ -1910,6 +2054,7 @@ def cmd_run_shell(request: dict[str, Any], request_file: Path, args: argparse.Na
         def on_cap_exceeded(label: str) -> None:
             nonlocal cap_exceeded
             cap_exceeded = True
+            cap_event.set()
             trigger_kill(label)
 
         stdout_collector = ShellStreamCollector(
@@ -1929,35 +2074,56 @@ def cmd_run_shell(request: dict[str, Any], request_file: Path, args: argparse.Na
         stdout_collector.start()
         stderr_collector.start()
 
-        try:
-            process.wait(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            trigger_kill("timeout")
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                with kill_lock:
-                    kill_state["sigkill_sent"] = True
-                killpg_signal(signal.SIGKILL)
+        # Single waiter loop — wake on cap_event, process exit, or the
+        # cron timeout deadline (finding 2 of PR #625 r2 review).
+        # Reuses kill_lock from r2 so SIGTERM/SIGKILL escalation
+        # remains serialized.
+        timeout_deadline = start_monotonic + float(timeout_seconds)
+
+        def escalate_after_grace(grace_seconds: float = 5.0) -> None:
+            # SIGTERM has already been issued via trigger_kill().
+            # Wait up to `grace_seconds` for the immediate child to
+            # exit, then SIGKILL the entire process group so any
+            # descendants that ignored SIGTERM (or were spawned in
+            # `start_new_session=True` and outlived the bash parent)
+            # are also reaped. Without the pgid SIGKILL, a Python
+            # child that traps SIGTERM survives the grace because
+            # `process.poll()` only reflects the immediate Popen
+            # child (typically bash) — descendants in the same
+            # pgid stay alive holding stdout open.
+            grace_deadline = time.monotonic() + grace_seconds
+            while time.monotonic() < grace_deadline:
+                if process.poll() is not None:
+                    break
+                time.sleep(0.1)
+            with kill_lock:
+                kill_state["sigkill_sent"] = True
+            killpg_signal(signal.SIGKILL)
+            if process.poll() is None:
                 try:
                     process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
 
-        # If a cap-trip already issued SIGTERM, escalate to SIGKILL on
-        # any process that ignored it before we close pipes.
-        if cap_exceeded and process.returncode is None:
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                with kill_lock:
-                    kill_state["sigkill_sent"] = True
-                killpg_signal(signal.SIGKILL)
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
+        while True:
+            if process.poll() is not None:
+                break
+            if cap_event.is_set():
+                # Cap tripped — SIGTERM was already issued by
+                # on_cap_exceeded → trigger_kill. Start the SIGKILL
+                # grace from cap-fire, not from cron timeout.
+                escalate_after_grace(5.0)
+                break
+            now = time.monotonic()
+            if now >= timeout_deadline:
+                timed_out = True
+                trigger_kill("timeout")
+                escalate_after_grace(5.0)
+                break
+            # Sleep at most ~0.5s OR until cap_event fires OR until
+            # the timeout deadline, whichever comes first.
+            wait_slice = min(0.5, max(0.0, timeout_deadline - now))
+            cap_event.wait(timeout=wait_slice)
 
         # Drain the collector threads so logs are fully flushed before we
         # write result/status. The child has exited (or been SIGKILLed),
@@ -2069,55 +2235,34 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("runner_error: request_artifact_tampered")
         return 1
 
-    request: Any
     if route == "shell":
-        try:
-            request = read_json(request_file)
-        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            error_message = f"request_artifact_corrupted: {type(exc).__name__}"
-            write_shell_terminal_error(
-                request_file,
-                runner_error=error_message,
-                summary=f"{error_message}: {exc}",
-                run_id=run_dir_id(request_file.parent),
-            )
-            print("status: error")
-            print(f"run_id: {run_dir_id(request_file.parent)}")
-            print("engine: shell")
-            print(f"runner_error: {error_message}")
-            return 1
-        if not isinstance(request, dict):
-            error_message = "request_artifact_corrupted: non_dict_top_level"
-            write_shell_terminal_error(
-                request_file,
-                runner_error=error_message,
-                summary=error_message,
-                run_id=run_dir_id(request_file.parent),
-            )
-            print("status: error")
-            print(f"run_id: {run_dir_id(request_file.parent)}")
-            print("engine: shell")
-            print(f"runner_error: {error_message}")
-            return 1
-    else:
-        request = read_json(request_file)
+        # Shell-route artifacts are controller-private. Hand off to
+        # `cmd_run_shell` which acquires the per-job flock BEFORE any
+        # body parse/validation (finding 1 of PR #625 r2 review).
+        # The corrupted-JSON / non-dict / payload_kind cross-check
+        # path now runs inside the flock so a body swap between
+        # validate and exec must contend with the lock.
+        return cmd_run_shell(request_file, args)
 
+    # Non-shell route: legacy text path. The artifacts are not
+    # controller-private here, so we treat the body as untrusted —
+    # parse it just enough to reject any cross-route shell payload
+    # (loose-mode dir holding a shell body is tampering).
+    request = read_json(request_file)
     if isinstance(request, dict) and is_shell_request_payload(request):
-        if route != "shell":
-            error_message = "request_artifact_tampered: shell request artifacts are not controller-private"
-            write_shell_terminal_error(
-                request_file,
-                runner_error="request_artifact_tampered",
-                summary=error_message,
-                run_id=str(request.get("run_id") or run_dir_id(request_file.parent)),
-                audit_target_agent=str(request.get("target_agent") or "daemon"),
-            )
-            print("status: error")
-            print(f"run_id: {str(request.get('run_id') or run_dir_id(request_file.parent))}")
-            print("engine: shell")
-            print("runner_error: request_artifact_tampered")
-            return 1
-        return cmd_run_shell(request, request_file, args)
+        error_message = "request_artifact_tampered: shell request artifacts are not controller-private"
+        write_shell_terminal_error(
+            request_file,
+            runner_error="request_artifact_tampered",
+            summary=error_message,
+            run_id=str(request.get("run_id") or run_dir_id(request_file.parent)),
+            audit_target_agent=str(request.get("target_agent") or "daemon"),
+        )
+        print("status: error")
+        print(f"run_id: {str(request.get('run_id') or run_dir_id(request_file.parent))}")
+        print("engine: shell")
+        print("runner_error: request_artifact_tampered")
+        return 1
 
     engine = request.get("target_engine", "")
     run_id = request.get("run_id", "")
