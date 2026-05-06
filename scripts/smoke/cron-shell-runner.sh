@@ -334,6 +334,67 @@ smoke_t39b_invalid_json_tamper_terminal() {
   smoke_assert_eq "request_artifact_tampered" "$(json_field "$status" runner_error)" "T39b terminal runner_error"
 }
 
+smoke_t39e_corrupted_controller_private_json_terminal() {
+  local run_dir request status result out runner_error
+
+  run_dir="$BRIDGE_CRON_STATE_DIR/runs/t39e-array-run"
+  mkdir -p "$run_dir"
+  request="$run_dir/request.json"
+  printf '[]\n' >"$request"
+  chmod 0700 "$run_dir"
+  chmod 0600 "$request"
+  if run_runner "$request" >/tmp/cron-shell-t39e-array.out 2>&1; then
+    smoke_fail "T39e expected array request corruption"
+  fi
+  out="$(cat /tmp/cron-shell-t39e-array.out)"
+  smoke_assert_not_contains "$out" "Traceback" "T39e array no traceback"
+  status="$run_dir/status.json"
+  result="$run_dir/result.json"
+  runner_error="$(json_field "$status" runner_error)"
+  smoke_assert_eq "error" "$(json_field "$status" state)" "T39e array status error"
+  smoke_assert_contains "$runner_error" "request_artifact_corrupted" "T39e array runner_error"
+  smoke_assert_contains "$runner_error" "non_dict_top_level" "T39e array runner_error category"
+  smoke_assert_eq "error" "$(json_field "$result" status)" "T39e array result error"
+
+  run_dir="$BRIDGE_CRON_STATE_DIR/runs/t39e-null-run"
+  mkdir -p "$run_dir"
+  request="$run_dir/request.json"
+  printf 'null\n' >"$request"
+  chmod 0700 "$run_dir"
+  chmod 0600 "$request"
+  if run_runner "$request" >/tmp/cron-shell-t39e-null.out 2>&1; then
+    smoke_fail "T39e expected scalar request corruption"
+  fi
+  out="$(cat /tmp/cron-shell-t39e-null.out)"
+  smoke_assert_not_contains "$out" "Traceback" "T39e scalar no traceback"
+  status="$run_dir/status.json"
+  result="$run_dir/result.json"
+  runner_error="$(json_field "$status" runner_error)"
+  smoke_assert_eq "error" "$(json_field "$status" state)" "T39e scalar status error"
+  smoke_assert_contains "$runner_error" "request_artifact_corrupted" "T39e scalar runner_error"
+  smoke_assert_contains "$runner_error" "non_dict_top_level" "T39e scalar runner_error category"
+  smoke_assert_eq "error" "$(json_field "$result" status)" "T39e scalar result error"
+
+  run_dir="$BRIDGE_CRON_STATE_DIR/runs/t39e-binary-run"
+  mkdir -p "$run_dir"
+  request="$run_dir/request.json"
+  printf '\377\376\000\001' >"$request"
+  chmod 0700 "$run_dir"
+  chmod 0600 "$request"
+  if run_runner "$request" >/tmp/cron-shell-t39e-binary.out 2>&1; then
+    smoke_fail "T39e expected binary request corruption"
+  fi
+  out="$(cat /tmp/cron-shell-t39e-binary.out)"
+  smoke_assert_not_contains "$out" "Traceback" "T39e binary no traceback"
+  status="$run_dir/status.json"
+  result="$run_dir/result.json"
+  runner_error="$(json_field "$status" runner_error)"
+  smoke_assert_eq "error" "$(json_field "$status" state)" "T39e binary status error"
+  smoke_assert_contains "$runner_error" "request_artifact_corrupted" "T39e binary runner_error"
+  smoke_assert_contains "$runner_error" "UnicodeDecodeError" "T39e binary runner_error category"
+  smoke_assert_eq "error" "$(json_field "$result" status)" "T39e binary result error"
+}
+
 smoke_t39c_update_revalidates_shell_script() {
   local script_path job_id out
   if [[ "$(id -u)" == "0" ]]; then
@@ -423,5 +484,6 @@ smoke_run "T39 tamper rejection" smoke_t39_tamper_rejected
 smoke_run "T39b invalid JSON tamper writes terminal status" smoke_t39b_invalid_json_tamper_terminal
 smoke_run "T39c update revalidates shell script" smoke_t39c_update_revalidates_shell_script
 smoke_run "T39d validation failure writes terminal status" smoke_t39d_validation_failure_terminal
+smoke_run "T39e corrupted controller-private JSON writes terminal status" smoke_t39e_corrupted_controller_private_json_terminal
 
 smoke_log "all cron shell runner checks passed"
