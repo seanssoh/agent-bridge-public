@@ -10422,4 +10422,11 @@ bash "$REPO_ROOT/tests/precompact-notify/smoke.sh"
 log "running codex-task-mode-policy-comprehensive smoke (issue #639)"
 bash "$REPO_ROOT/scripts/smoke/codex-task-mode-policy-comprehensive.sh"
 
+# Issue #619 — `agent doctor` CRUD self-check. Exercises the 7-step
+# create/update/registry/show/reclassify/retire/delete matrix under
+# isolated BRIDGE_HOME, the admin caller gate, the concurrent-doctor
+# lock, and the JSON envelope shape.
+log "running agent-doctor smoke (issue #619)"
+bash "$REPO_ROOT/scripts/smoke/agent-doctor.sh"
+
 log "smoke test passed"
