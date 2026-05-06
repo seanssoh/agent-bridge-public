@@ -2063,6 +2063,42 @@ def run_native_finalize(args):
         final_status = "success"
     else:
         final_status = "error"
+
+    # #627: A deferral that lands after the operator disables the job
+    # must not mutate state — disable should be idempotent. The dispatcher
+    # contract says only enabled jobs get scheduled, so a deferred slot
+    # finishing on a disabled job is an inflight-after-disable race.
+    # Drop the deferral provenance update entirely (no lastDeferredAtMs,
+    # nextRunAtMs, or updatedAtMs bump) so `agb cron show` keeps showing
+    # the disable timestamp as the last mutation. The success/error paths
+    # are intentionally NOT gated here — they carry consecutive-error
+    # accounting that operators may still want recorded; #628 (audit gap)
+    # tracks broader trace coverage separately.
+    if final_status == "deferred" and not job.get("enabled", True):
+        print(
+            f"info: dropping deferred state writer for disabled job "
+            f"{job_id} run={run_id}",
+            file=sys.stderr,
+        )
+        payload = {
+            "status": "skipped",
+            "reason": "job_disabled",
+            "job_id": job_id,
+            "run_id": run_id,
+            "final_status": final_status,
+            "jobs_file": str(jobs_path),
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print("status: skipped")
+            print("reason: job_disabled")
+            print(f"job_id: {job_id}")
+            print(f"run_id: {run_id}")
+            print(f"final_status: {final_status}")
+            print(f"jobs_file: {jobs_path}")
+        return 0
+
     duration_ms = result.get("duration_ms")
     try:
         duration_ms = int(duration_ms) if duration_ms not in (None, "") else None
