@@ -634,9 +634,18 @@ bridge_isolation_v2_migrate_mirror_one() {
   # needs immediate cleanup so runtime does not double-read v1+v2 paths
   # for the same logical resource. Manifest still records the row so
   # rollback can reverse it.
+  #
+  # v0.8.3 amend: cross-UID legacy_src (linux-user-isolated agent's
+  # files owned by agent-bridge-<n>) requires sudo for rm too —
+  # without it sean cannot enter the parent dir to remove children.
   if [[ "$delete_eligible" == "1" && "$legacy_src" != "$v2_dst" ]]; then
-    rm -rf -- "$legacy_src" 2>/dev/null \
-      || bridge_warn "mirror_one: failed to remove $legacy_src after successful mirror"
+    if (( use_sudo == 1 )); then
+      sudo -n rm -rf -- "$legacy_src" 2>/dev/null \
+        || bridge_warn "mirror_one: failed to remove $legacy_src after successful mirror"
+    else
+      rm -rf -- "$legacy_src" 2>/dev/null \
+        || bridge_warn "mirror_one: failed to remove $legacy_src after successful mirror"
+    fi
   fi
   return 0
 }
