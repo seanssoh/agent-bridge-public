@@ -767,8 +767,24 @@ who set this should report the underlying issue upstream so v2 can be
 fixed; long-term operation without isolation is unsupported in v0.8.0.
 
 ```bash
-# Set in the daemon environment, then restart.
-BRIDGE_DISABLE_ISOLATION=1 ./agent-bridge daemon restart
+# Inline env on a single command line is NOT inherited by the spawned daemon.
+# Export it in the shell that owns the daemon process, OR set it on the
+# launchd / systemd unit, then restart.
+
+# Operator-shell-managed daemon:
+export BRIDGE_DISABLE_ISOLATION=1
+./agent-bridge daemon restart
+
+# systemd-managed daemon (Linux):
+# Edit the unit file and add: Environment=BRIDGE_DISABLE_ISOLATION=1
+# systemctl daemon-reload
+# systemctl restart agent-bridge
+
+# launchd-managed daemon (macOS):
+# Edit the plist and add an EnvironmentVariables key:
+#   <key>EnvironmentVariables</key>
+#   <dict><key>BRIDGE_DISABLE_ISOLATION</key><string>1</string></dict>
+# launchctl unload <plist> && launchctl load <plist>
 ```
 
 ### Editing profile / skills / memory after activation
