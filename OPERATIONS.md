@@ -309,6 +309,40 @@ the defaults above. Set `BRIDGE_AGENT_PERMISSION_MODE["agent"]="legacy"`
 to explicitly pin the historical blanket-bypass shape (e.g. for sandboxed
 offline roles).
 
+### Admin agent CRUD policy
+
+Admin operates exclusively through typed `agent <verb>` subcommands. Direct
+edits to protected-roster files (`$BRIDGE_ROSTER_LOCAL_FILE`, by default
+`~/.agent-bridge/agent-roster.local.sh`) are intentionally blocked because
+the audit chain depends on the typed-write path. Any out-of-band edits will
+be reverted by the daemon's reconciliation pass on next sync — bring
+changes through `agent update` (or `agent-bridge config set` for global
+settings) instead.
+
+Typed verbs available today (run `agent-bridge agent --help` for the full
+listing):
+
+- `create` — scaffold a new static role (agent home + roster block).
+- `update` — typed audited mutation of protected managed-role fields
+  (`--desc`, `--engine`, `--workdir`, `--loop on|off`,
+  `--continue on|off`, `--class user|system`, `--set-launch-cmd`,
+  `--launch-cmd-add-env`/`--launch-cmd-remove-env`,
+  `--launch-cmd-add-dev-channel`/`--launch-cmd-remove-dev-channel`,
+  `--channels-set`/`--channels-add`/`--channels-remove`).
+- `delete` — remove a static role (with optional `--purge-home` /
+  `--purge-crons`).
+- `retire` — retire a static role with quarantine + audit trail.
+- `list` — inventory of registered agents.
+- `registry` — read-only JSON inventory.
+- `show` — roster + runtime state for one agent.
+- `reclassify` — promote a runtime-detected admin to a static role.
+- `rerender-settings` — re-render per-agent `settings.effective.json`.
+
+Caller validation matches `config set`: caller must be the admin agent
+(`BRIDGE_ADMIN_AGENT_ID`) and the source must be operator-trusted
+(`operator-tui` / `operator-trusted-id`). Mutations that fail this gate
+are denied with an audit row and never touch the roster file.
+
 ## Worktree Workers
 
 When multiple agents may edit the same git repository, prefer isolated managed
