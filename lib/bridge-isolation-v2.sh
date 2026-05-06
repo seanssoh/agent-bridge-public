@@ -79,9 +79,18 @@
 # 1. opt-in flag and path variables
 # ---------------------------------------------------------------------------
 
-# Layout selector. Legacy installs leave this empty/unset. New installs and
-# migrated installs set BRIDGE_LAYOUT=v2. Tests may set it to "v2" via env.
-BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"
+# Layout selector. v0.8.0 hard-cut: the only accepted value is `v2`. The
+# resolver in lib/bridge-layout-resolver.sh fail-fasts on anything else
+# (including unset / legacy / v1 / arbitrary strings) BEFORE this module
+# is sourced, so by the time we read BRIDGE_LAYOUT here it is either
+# `v2` or the process has already exited via bridge_die. We deliberately
+# do NOT default to `legacy` anymore — the legacy-fallback default was
+# the v1 ACL-isolation entry point and v0.8.0 removed v1.
+#
+# Tests that source this file standalone (without going through
+# bridge-lib.sh + the resolver) must export BRIDGE_LAYOUT=v2 themselves;
+# leaving it unset is no longer a valid runtime state.
+BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-}"
 
 # Data root for v2 layout. When unset, v2 helpers no-op (legacy mode).
 # Default suggestion when an operator opts in: /srv/agent-bridge.
@@ -103,7 +112,15 @@ BRIDGE_AGENT_GROUP_PREFIX="${BRIDGE_AGENT_GROUP_PREFIX:-ab-agent-}"
 
 bridge_isolation_v2_active() {
   # Returns 0 (active) when BRIDGE_LAYOUT=v2 and BRIDGE_DATA_ROOT is set.
-  # All v2 helpers should gate on this so they no-op for legacy installs.
+  #
+  # v0.8.0 hard-cut: this is now an invariant/status helper, not a
+  # runtime branching primitive. The layout resolver fail-fasts at
+  # startup if v2 is not active, so any code path that reaches a
+  # v2-helper call site is already guaranteed to be running under v2.
+  # Callers should treat a `false` return here as a programmer error
+  # surface (e.g. status reporting, smoke tests sourcing the module
+  # standalone), not a signal to fall back to v1/ACL behavior — the
+  # v1/ACL code paths were removed.
   [[ "$BRIDGE_LAYOUT" == "v2" ]] || return 1
   [[ -n "$BRIDGE_DATA_ROOT" ]] || return 1
   return 0

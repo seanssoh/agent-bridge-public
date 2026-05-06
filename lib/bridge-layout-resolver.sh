@@ -114,15 +114,6 @@ bridge_layout_resolver_validate_env() {
       # No env override at all — let marker / evidence flow handle it.
       return 1
       ;;
-    legacy)
-      # legacy override — clear any stale v2-derived roots so they don't
-      # leak into child env.
-      if [[ -n "$data_root" ]]; then
-        unset BRIDGE_DATA_ROOT
-      fi
-      BRIDGE_LAYOUT_SOURCE="env"
-      return 0
-      ;;
     v2)
       if [[ -z "$data_root" ]]; then
         # Partial — ignore the v2 hint, fall through.
@@ -140,12 +131,22 @@ bridge_layout_resolver_validate_env() {
       BRIDGE_LAYOUT_SOURCE="env"
       return 0
       ;;
+    legacy|v1)
+      # v0.8.0 hard-cut: ACL-based isolation (v1) was removed. The only
+      # accepted BRIDGE_LAYOUT value is now `v2`. Fail-fast so operators
+      # who scripted `BRIDGE_LAYOUT=legacy` (or `=v1`) discover the
+      # required migration immediately instead of silently running on a
+      # half-removed code path.
+      bridge_die "Agent Bridge v0.8.0 requires isolation-v2 (POSIX group + setgid).
+  current_layout=${layout}
+  remediation: run \`agent-bridge upgrade --apply\` to migrate, or roll back to v0.7.x.
+  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
+      ;;
     *)
-      bridge_warn "BRIDGE_LAYOUT='$layout' is invalid (expected 'legacy' or 'v2') — ignoring env override"
-      BRIDGE_LAYOUT_IGNORED_PARTIAL_ENV="BRIDGE_LAYOUT"
-      unset BRIDGE_LAYOUT
-      [[ -z "$data_root" ]] || unset BRIDGE_DATA_ROOT
-      return 1
+      bridge_die "Agent Bridge v0.8.0 requires isolation-v2 (POSIX group + setgid).
+  current_layout=${layout}
+  remediation: unset BRIDGE_LAYOUT or set BRIDGE_LAYOUT=v2 (only accepted value).
+  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
       ;;
   esac
 }
@@ -187,9 +188,17 @@ bridge_resolve_layout() {
         BRIDGE_LAYOUT_SOURCE="marker"
         return 0
       fi
-      if [[ "${BRIDGE_LAYOUT:-}" == "legacy" ]]; then
-        BRIDGE_LAYOUT_SOURCE="marker"
-        return 0
+      if [[ "${BRIDGE_LAYOUT:-}" == "legacy" || "${BRIDGE_LAYOUT:-}" == "v1" ]]; then
+        # v0.8.0 hard-cut: a marker pinning the install to the legacy/v1
+        # layout is no longer a valid runtime state. The migration tool
+        # (T3) rewrites the marker to v2; surface the same remediation as
+        # the env-override path so operators don't silently run on a
+        # half-removed code path.
+        bridge_die "Agent Bridge v0.8.0 requires isolation-v2 (POSIX group + setgid).
+  current_layout=${BRIDGE_LAYOUT}
+  marker=${marker_path}
+  remediation: run \`agent-bridge upgrade --apply\` to migrate, or roll back to v0.7.x.
+  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
       fi
     fi
     # Marker is on disk but failed validation — bridge_warn already fired
@@ -201,24 +210,34 @@ bridge_resolve_layout() {
   # Step 3/4 — no env, no valid marker. Evidence-based classification.
   if bridge_layout_resolver_has_existing_evidence; then
     [[ -n "${BRIDGE_LAYOUT_SOURCE:-}" ]] || BRIDGE_LAYOUT_SOURCE="missing-marker(existing)"
-    # Existing markerless install is legacy by invariant.
-    BRIDGE_LAYOUT="legacy"
-    return 0
+    # v0.8.0 hard-cut: existing markerless installs were previously pinned
+    # to the legacy layout. With v1 removed, there is no longer a runtime
+    # path that can serve them — the operator must run the migration tool
+    # exactly once. Operators upgrading from v0.7.x will hit this on the
+    # first invocation after the upgrade, and the migration tool (T3)
+    # writes the v2 marker so subsequent boots take the marker branch.
+    bridge_die "Agent Bridge v0.8.0 requires isolation-v2 (POSIX group + setgid).
+  current_layout=markerless(existing-install)
+  remediation: run \`agent-bridge upgrade --apply\` to migrate this install to v2, or roll back to v0.7.x.
+  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
   fi
 
-  # Fresh install candidate. BRIDGE_LAYOUT is intentionally NOT set to v2 —
-  # bridge_isolation_v2_active must remain false until `agent-bridge init`
-  # writes the marker. If we already classified the prior marker as
-  # invalid-marker(fallback), preserve that source so status output
-  # honestly reports the bad marker instead of pretending the install is
-  # fresh; the v2-active state is the same either way.
+  # Fresh install candidate. Pre-v0.8.0 this branch left BRIDGE_LAYOUT
+  # unset until `agent-bridge init` wrote the marker; with v1 removed,
+  # the only honest behavior is to refuse and point the operator at the
+  # migration / init tool. We still set BRIDGE_DEFAULT_DATA_ROOT so the
+  # init helper can compute its default before bridge_die fires —
+  # callers that legitimately need to inspect the unwritten layout
+  # (e.g. `agent-bridge init` itself) gate on BRIDGE_LAYOUT_SOURCE
+  # before invoking the resolver in fail-fast mode.
   if [[ "${BRIDGE_LAYOUT_SOURCE:-}" != "invalid-marker(fallback)" ]]; then
     BRIDGE_LAYOUT_SOURCE="fresh-install-candidate"
   fi
   BRIDGE_DEFAULT_DATA_ROOT="${BRIDGE_HOME:-$HOME/.agent-bridge}/data"
-  # BRIDGE_LAYOUT stays whatever bridge-isolation-v2.sh defaults it to
-  # (legacy). Do not export v2 here.
-  return 0
+  bridge_die "Agent Bridge v0.8.0 requires isolation-v2 (POSIX group + setgid).
+  current_layout=markerless(${BRIDGE_LAYOUT_SOURCE})
+  remediation: run \`agent-bridge upgrade --apply\` to migrate this install to v2, or roll back to v0.7.x.
+  background: ACL-based isolation (v1) was removed in v0.8.0. See https://github.com/SYRS-AI/agent-bridge-public/blob/main/docs/isolation-migration-guide.md for details."
 }
 
 # ---------------------------------------------------------------------------
