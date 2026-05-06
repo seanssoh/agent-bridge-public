@@ -709,16 +709,35 @@ bridge_cron_write_request() {
   # the inbox-task creation path.
   local cron_reporting_policy="${31:-}"
   local cron_urgency="${32:-}"
+  local shell_script="${33:-}"
+  local shell_args_json="${34:-[]}"
+  local shell_env_json="${35:-{}}"
+  local shell_run_as_agent="${36:-}"
+  local shell_os_user="${37:-}"
+  local shell_uid="${38:-}"
+  local shell_gid="${39:-}"
+  local shell_home="${40:-}"
+  local shell_agent_env_file="${41:-}"
+  local shell_env_snapshot_json="${42:-{}}"
+  local shell_timeout_seconds="${43:-}"
+  local shell_output_cap_bytes="${44:-}"
 
   mkdir -p "$(dirname "$request_file")"
 
   bridge_require_python
-  python3 - "$request_file" "$run_id" "$job_id" "$job_name" "$family" "$source_agent" "$target" "$slot" "$task_id" "$created_at" "$body_file" "$payload_file" "$result_file" "$status_file" "$stdout_log" "$stderr_log" "$source_file" "$payload_kind" "$target_engine" "$target_workdir" "$target_channels" "$target_discord_state_dir" "$target_telegram_state_dir" "$job_delivery_mode" "$job_delivery_channel" "$job_delivery_target" "$allow_channel_delivery" "$routing_mode" "$disposable_needs_channels" "$disable_mcp" "$cron_reporting_policy" "$cron_urgency" <<'PY'
+  python3 - "$request_file" "$run_id" "$job_id" "$job_name" "$family" "$source_agent" "$target" "$slot" "$task_id" "$created_at" "$body_file" "$payload_file" "$result_file" "$status_file" "$stdout_log" "$stderr_log" "$source_file" "$payload_kind" "$target_engine" "$target_workdir" "$target_channels" "$target_discord_state_dir" "$target_telegram_state_dir" "$job_delivery_mode" "$job_delivery_channel" "$job_delivery_target" "$allow_channel_delivery" "$routing_mode" "$disposable_needs_channels" "$disable_mcp" "$cron_reporting_policy" "$cron_urgency" "$shell_script" "$shell_args_json" "$shell_env_json" "$shell_run_as_agent" "$shell_os_user" "$shell_uid" "$shell_gid" "$shell_home" "$shell_agent_env_file" "$shell_env_snapshot_json" "$shell_timeout_seconds" "$shell_output_cap_bytes" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-(request_file, run_id, job_id, job_name, family, source_agent, target, slot, task_id, created_at, body_file, payload_file, result_file, status_file, stdout_log, stderr_log, source_file, payload_kind, target_engine, target_workdir, target_channels, target_discord_state_dir, target_telegram_state_dir, job_delivery_mode, job_delivery_channel, job_delivery_target, allow_channel_delivery, routing_mode, disposable_needs_channels, disable_mcp, cron_reporting_policy, cron_urgency) = sys.argv[1:]
+(request_file, run_id, job_id, job_name, family, source_agent, target, slot, task_id, created_at, body_file, payload_file, result_file, status_file, stdout_log, stderr_log, source_file, payload_kind, target_engine, target_workdir, target_channels, target_discord_state_dir, target_telegram_state_dir, job_delivery_mode, job_delivery_channel, job_delivery_target, allow_channel_delivery, routing_mode, disposable_needs_channels, disable_mcp, cron_reporting_policy, cron_urgency, shell_script, shell_args_json, shell_env_json, shell_run_as_agent, shell_os_user, shell_uid, shell_gid, shell_home, shell_agent_env_file, shell_env_snapshot_json, shell_timeout_seconds, shell_output_cap_bytes) = sys.argv[1:]
+
+def decode_json(value, fallback):
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return fallback
+    return decoded
 
 payload = {
     "run_id": run_id,
@@ -756,6 +775,25 @@ payload = {
     "stderr_log": stderr_log,
     "source_file": source_file,
 }
+if payload_kind == "shell":
+    shell_payload = {
+        "kind": "shell",
+        "script": shell_script,
+        "args": decode_json(shell_args_json, []),
+        "env": decode_json(shell_env_json, {}),
+        "timeoutSeconds": int(shell_timeout_seconds or 900),
+        "outputCapBytes": int(shell_output_cap_bytes or 65536),
+    }
+    payload["payload"] = shell_payload
+    payload["execution"] = {
+        "run_as_agent": shell_run_as_agent,
+        "os_user": shell_os_user,
+        "uid": int(shell_uid),
+        "gid": int(shell_gid),
+        "home": shell_home,
+        "agent_env_file": shell_agent_env_file,
+        "env_snapshot": decode_json(shell_env_snapshot_json, {}),
+    }
 
 Path(request_file).write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 PY
@@ -794,6 +832,28 @@ if error_message:
 
 Path(status_file).write_text(json.dumps(payload, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
 PY
+}
+
+bridge_cron_normalize_shell_run_artifacts() {
+  local run_dir="$1"
+  shift || true
+  [[ -n "$run_dir" && -d "$run_dir" ]] || return 0
+
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -b -k "$run_dir" >/dev/null 2>&1 || true
+    local artifact
+    for artifact in "$@"; do
+      [[ -n "$artifact" && -e "$artifact" ]] || continue
+      setfacl -b "$artifact" >/dev/null 2>&1 || true
+    done
+  fi
+
+  chmod 0700 "$run_dir" >/dev/null 2>&1 || true
+  local file
+  for file in "$@"; do
+    [[ -n "$file" && -e "$file" ]] || continue
+    chmod 0600 "$file" >/dev/null 2>&1 || true
+  done
 }
 
 bridge_cron_run_dir_grant_isolation() {

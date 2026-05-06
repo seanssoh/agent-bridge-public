@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
+import pwd
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 import sys
 import time
@@ -106,6 +110,10 @@ COMMON_BIN_DIRS = [
     Path("/opt/homebrew/bin"),
     Path("/usr/local/bin"),
 ]
+SHELL_RESULT_STATUS_VALUES = {"success", "error"}
+SHELL_PAYLOAD_ENV_PREFIXES = ("POLL_", "SCRIPT_")
+SHELL_PROTECTED_ENV_EXACT = {"HOME", "PATH"}
+SHELL_PROTECTED_ENV_PREFIXES = ("BRIDGE_", "CRON_")
 
 
 def now_iso() -> str:
@@ -142,6 +150,231 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def run_dir_id(run_dir: Path) -> str:
+    return run_dir.name
+
+
+def mode_has_group_or_other_write(path: Path) -> bool:
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return True
+    return bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def path_acl_has_write_exposure(path: Path, *, include_default: bool = True) -> bool:
+    getfacl = shutil.which("getfacl")
+    if not getfacl:
+        return False
+    try:
+        completed = subprocess.run(
+            [getfacl, "-cp", str(path)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return False
+    if completed.returncode != 0:
+        return False
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(":")
+        is_default = fields[0] == "default"
+        if is_default and not include_default:
+            continue
+        if is_default:
+            fields = fields[1:]
+        if len(fields) < 3:
+            continue
+        tag, qualifier, perms = fields[0], fields[1], fields[2]
+        effective = perms
+        if "#effective:" in line:
+            effective = line.rsplit("#effective:", 1)[1].strip()
+        if tag == "user" and qualifier == "":
+            continue
+        if tag in {"user", "group", "mask", "other"} and "w" in effective:
+            if tag == "mask":
+                continue
+            return True
+    return False
+
+
+def validate_shell_request_artifacts(request_file: Path) -> tuple[bool, str | None]:
+    run_dir = request_file.parent
+    controller_uid = os.getuid()
+    for path in (run_dir, request_file):
+        try:
+            st = path.stat()
+        except OSError as exc:
+            return False, f"request_artifact_tampered: stat failed for {path}: {exc}"
+        if st.st_uid != controller_uid:
+            return False, f"request_artifact_tampered: owner uid mismatch for {path}"
+        if mode_has_group_or_other_write(path):
+            return False, f"request_artifact_tampered: group/other writable mode on {path}"
+        if path_acl_has_write_exposure(path, include_default=path.is_dir()):
+            return False, f"request_artifact_tampered: ACL write exposure on {path}"
+    return True, None
+
+
+def truncate_output(data: bytes, cap: int) -> tuple[str, bool]:
+    if len(data) <= cap:
+        return data.decode("utf-8", errors="replace"), False
+    truncated = data[:cap].decode("utf-8", errors="replace")
+    return truncated + f"\n[agent-bridge] output truncated at {cap} bytes\n", True
+
+
+def cron_state_dir_from_env(run_dir: Path) -> Path:
+    value = os.environ.get("BRIDGE_CRON_STATE_DIR")
+    if value:
+        return Path(value).expanduser().resolve()
+    return run_dir.parent.parent
+
+
+def shell_payload_env(payload: dict[str, Any]) -> dict[str, str]:
+    env = payload.get("env") or {}
+    if not isinstance(env, dict):
+        raise ValueError("payload.env must be an object")
+    clean: dict[str, str] = {}
+    for raw_key, raw_value in env.items():
+        key = str(raw_key)
+        if key in SHELL_PROTECTED_ENV_EXACT or key.startswith(SHELL_PROTECTED_ENV_PREFIXES):
+            raise ValueError(f"protected env var cannot be set by shell cron payload: {key}")
+        if not key.startswith(SHELL_PAYLOAD_ENV_PREFIXES):
+            raise ValueError(f"shell cron env var must start with POLL_ or SCRIPT_: {key}")
+        clean[key] = str(raw_value)
+    return clean
+
+
+def shell_command_for_execution(execution: dict[str, Any], env: dict[str, str], script: str, args: list[str]) -> list[str]:
+    os_user = str(execution.get("os_user") or "")
+    uid = int(execution.get("uid"))
+    gid = int(execution.get("gid"))
+    env_parts = [f"{key}={value}" for key, value in sorted(env.items())]
+    current_uid = os.geteuid()
+    try:
+        current_name = pwd.getpwuid(current_uid).pw_name
+    except KeyError:
+        current_name = ""
+    if current_uid == uid and (not os_user or os_user == current_name):
+        return ["env", "-i", *env_parts, script, *args]
+    sudo = shutil.which("sudo")
+    if sudo and os_user:
+        return [sudo, "-n", "-H", "-u", os_user, "env", "-i", *env_parts, script, *args]
+    setpriv = shutil.which("setpriv")
+    if setpriv:
+        return [setpriv, "--reuid", str(uid), "--regid", str(gid), "--init-groups", "env", "-i", *env_parts, script, *args]
+    raise RuntimeError("no supported UID drop helper found (sudo or setpriv)")
+
+
+def redact_shell_command(command: list[str]) -> list[str]:
+    redacted: list[str] = []
+    for part in command:
+        if "=" in part and not part.startswith(("/", "./")):
+            key = part.split("=", 1)[0]
+            if key and all(ch.isalnum() or ch == "_" for ch in key):
+                redacted.append(f"{key}=<redacted>")
+                continue
+        redacted.append(part)
+    return redacted
+
+
+def write_shell_status(
+    status_file: Path,
+    *,
+    run_id: str,
+    state: str,
+    request_file: Path,
+    result_file: Path,
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    duration_ms: int | None = None,
+    exit_code: int | None = None,
+    runner_error: str | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "state": state,
+        "engine": "shell",
+        "updated_at": now_iso(),
+        "request_file": str(request_file),
+        "result_file": str(result_file),
+        "delivery_intent": "silent",
+        "reporting_decision": "silent",
+    }
+    if started_at:
+        payload["started_at"] = started_at
+    if completed_at:
+        payload["completed_at"] = completed_at
+    if duration_ms is not None:
+        payload["duration_ms"] = duration_ms
+    if exit_code is not None:
+        payload["exit_code"] = exit_code
+    if runner_error:
+        payload["runner_error"] = runner_error
+        payload["error"] = runner_error
+    write_json(status_file, payload)
+
+
+def write_shell_result(
+    result_file: Path,
+    *,
+    run_id: str,
+    status: str,
+    summary: str,
+    request_file: Path,
+    stdout_log: Path,
+    stderr_log: Path,
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    duration_ms: int | None = None,
+    exit_code: int | None = None,
+    runner_error: str | None = None,
+    command: list[str] | None = None,
+    stdout_truncated: bool = False,
+    stderr_truncated: bool = False,
+) -> None:
+    if status not in SHELL_RESULT_STATUS_VALUES:
+        status = "error"
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "engine": "shell",
+        "status": status,
+        "summary": summary,
+        "findings": [],
+        "actions_taken": [],
+        "needs_human_followup": False,
+        "recommended_next_steps": [],
+        "artifacts": [str(stdout_log), str(stderr_log)],
+        "confidence": "high" if status == "success" else "medium",
+        "delivery_intent": "silent",
+        "reporting_decision": "silent",
+        "request_file": str(request_file),
+        "stdout_log": str(stdout_log),
+        "stderr_log": str(stderr_log),
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+    }
+    if started_at:
+        payload["started_at"] = started_at
+    if completed_at:
+        payload["completed_at"] = completed_at
+    if duration_ms is not None:
+        payload["duration_ms"] = duration_ms
+    if exit_code is not None:
+        payload["child_exit_code"] = exit_code
+    if runner_error:
+        payload["runner_error"] = runner_error
+    if command:
+        safe_command = redact_shell_command(command)
+        payload["command"] = safe_command
+        payload["command_pretty"] = " ".join(shlex.quote(part) for part in safe_command)
+    write_json(result_file, payload)
 
 
 def normalize_result(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1260,6 +1493,241 @@ def write_status(
     write_json(status_file, payload)
 
 
+def cmd_run_shell(request: dict[str, Any], request_file: Path, args: argparse.Namespace) -> int:
+    run_dir = request_file.parent
+    run_id = str(request.get("run_id") or run_dir_id(run_dir))
+    result_file = (run_dir / "result.json").resolve()
+    status_file = (run_dir / "status.json").resolve()
+    stdout_log = (run_dir / "stdout.log").resolve()
+    stderr_log = (run_dir / "stderr.log").resolve()
+
+    if args.dry_run:
+        print("status: dry_run")
+        print(f"run_id: {run_id}")
+        print("engine: shell")
+        print(f"request_file: {rel_for_output(str(request_file))}")
+        print(f"result_file: {rel_for_output(str(result_file))}")
+        print(f"status_file: {rel_for_output(str(status_file))}")
+        return 0
+
+    trusted, trust_error = validate_shell_request_artifacts(request_file)
+    if not trusted:
+        error_message = trust_error or "request_artifact_tampered"
+        completed_at = now_iso()
+        write_text(stdout_log, "")
+        write_text(stderr_log, error_message + "\n")
+        write_shell_result(
+            result_file,
+            run_id=run_id,
+            status="error",
+            summary=error_message,
+            request_file=request_file,
+            stdout_log=stdout_log,
+            stderr_log=stderr_log,
+            completed_at=completed_at,
+            exit_code=1,
+            runner_error="request_artifact_tampered",
+        )
+        write_shell_status(
+            status_file,
+            run_id=run_id,
+            state="error",
+            request_file=request_file,
+            result_file=result_file,
+            completed_at=completed_at,
+            exit_code=1,
+            runner_error="request_artifact_tampered",
+        )
+        print("status: error")
+        print(f"run_id: {run_id}")
+        print("engine: shell")
+        print("runner_error: request_artifact_tampered")
+        return 1
+
+    payload = request.get("payload") or {}
+    if not isinstance(payload, dict):
+        raise RuntimeError("shell request payload must be an object")
+    execution = request.get("execution") or {}
+    if not isinstance(execution, dict):
+        raise RuntimeError("shell request execution block must be an object")
+    script = str(payload.get("script") or "")
+    if not script:
+        raise RuntimeError("shell request missing payload.script")
+    script_path = Path(script).expanduser().resolve()
+    if not script_path.is_file() or not os.access(script_path, os.X_OK):
+        raise RuntimeError(f"shell script is not executable: {script_path}")
+    run_uid = int(execution.get("uid"))
+    script_stat = script_path.stat()
+    if script_stat.st_uid not in {os.getuid(), run_uid}:
+        raise RuntimeError(f"shell script owner must be controller uid or run-as uid: {script_path}")
+    if script_stat.st_mode & 0o022:
+        raise RuntimeError(f"shell script must not be group/other writable: {script_path}")
+    script_args = payload.get("args") or []
+    if not isinstance(script_args, list):
+        raise RuntimeError("payload.args must be an array")
+    argv = [str(item) for item in script_args]
+    timeout_seconds = int(payload.get("timeoutSeconds") or 900)
+    output_cap_bytes = int(payload.get("outputCapBytes") or 65536)
+    if timeout_seconds <= 0:
+        raise RuntimeError("payload.timeoutSeconds must be positive")
+    if output_cap_bytes <= 0:
+        raise RuntimeError("payload.outputCapBytes must be positive")
+
+    env_snapshot = execution.get("env_snapshot") or {}
+    if not isinstance(env_snapshot, dict):
+        raise RuntimeError("execution.env_snapshot must be an object")
+    child_env = {str(key): str(value) for key, value in env_snapshot.items()}
+    child_env.update(shell_payload_env(payload))
+    child_env["HOME"] = str(execution.get("home") or child_env.get("HOME") or str(Path.home()))
+    child_env["CRON_RUN_ID"] = run_id
+    child_env["CRON_JOB_ID"] = str(request.get("job_id") or "")
+    child_env["CRON_JOB_NAME"] = str(request.get("job_name") or "")
+    child_env["CRON_SLOT"] = str(request.get("slot") or "")
+    child_env["CRON_REQUEST_FILE"] = str(request_file)
+    child_env["CRON_RUN_DIR"] = str(run_dir)
+
+    command = shell_command_for_execution(execution, child_env, str(script_path), argv)
+    lock_dir = cron_state_dir_from_env(run_dir) / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_dir / f"{str(request.get('job_id') or run_id)}.lock"
+
+    with lock_file.open("w", encoding="utf-8") as lock_handle:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            completed_at = now_iso()
+            write_text(stdout_log, "")
+            write_text(stderr_log, "lock_held\n")
+            write_shell_result(
+                result_file,
+                run_id=run_id,
+                status="success",
+                summary="lock_held",
+                request_file=request_file,
+                stdout_log=stdout_log,
+                stderr_log=stderr_log,
+                completed_at=completed_at,
+                exit_code=0,
+                runner_error="lock_held",
+                command=command,
+            )
+            write_shell_status(
+                status_file,
+                run_id=run_id,
+                state="success",
+                request_file=request_file,
+                result_file=result_file,
+                completed_at=completed_at,
+                exit_code=0,
+                runner_error="lock_held",
+            )
+            print("status: success")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print("summary: lock_held")
+            return 0
+
+        started_at = now_iso()
+        start_monotonic = time.monotonic()
+        write_shell_status(
+            status_file,
+            run_id=run_id,
+            state="running",
+            request_file=request_file,
+            result_file=result_file,
+            started_at=started_at,
+        )
+
+        process = subprocess.Popen(
+            command,
+            cwd=str(run_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        timed_out = False
+        try:
+            stdout_bytes, stderr_bytes = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            try:
+                stdout_bytes, stderr_bytes = process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                stdout_bytes, stderr_bytes = process.communicate()
+
+        completed_at = now_iso()
+        duration_ms = int((time.monotonic() - start_monotonic) * 1000)
+        stdout_text, stdout_truncated = truncate_output(stdout_bytes or b"", output_cap_bytes)
+        stderr_text, stderr_truncated = truncate_output(stderr_bytes or b"", output_cap_bytes)
+        if stdout_truncated or stderr_truncated:
+            stderr_text += "[agent-bridge] one or more streams were truncated\n"
+        write_text(stdout_log, stdout_text)
+        write_text(stderr_log, stderr_text)
+
+        if timed_out:
+            final_state = "timed_out"
+            result_status = "error"
+            error_message = f"timed out after {timeout_seconds}s"
+            exit_code = 124
+        else:
+            exit_code = int(process.returncode)
+            if exit_code == 0:
+                final_state = "success"
+                result_status = "success"
+                error_message = None
+            else:
+                final_state = "error"
+                result_status = "error"
+                error_message = f"script exited {exit_code}"
+
+        write_shell_result(
+            result_file,
+            run_id=run_id,
+            status=result_status,
+            summary="shell cron completed" if result_status == "success" else (error_message or "shell cron failed"),
+            request_file=request_file,
+            stdout_log=stdout_log,
+            stderr_log=stderr_log,
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_ms=duration_ms,
+            exit_code=exit_code,
+            runner_error=error_message,
+            command=command,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
+        )
+        write_shell_status(
+            status_file,
+            run_id=run_id,
+            state=final_state,
+            request_file=request_file,
+            result_file=result_file,
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_ms=duration_ms,
+            exit_code=exit_code,
+            runner_error=error_message,
+        )
+
+    print(f"status: {final_state}")
+    print(f"run_id: {run_id}")
+    print("engine: shell")
+    print(f"result_file: {rel_for_output(str(result_file))}")
+    print(f"status_file: {rel_for_output(str(status_file))}")
+    if error_message:
+        print(f"runner_error: {error_message}")
+    return 0 if final_state == "success" else 1
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     request_file = Path(args.request_file).expanduser().resolve()
     if not request_file.is_file():
@@ -1267,6 +1735,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         return 2
 
     request = read_json(request_file)
+    request_payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
+    if request.get("payload_kind") == "shell" or request_payload.get("kind") == "shell":
+        return cmd_run_shell(request, request_file, args)
+
     engine = request.get("target_engine", "")
     run_id = request.get("run_id", "")
     workdir = request.get("target_workdir", "")
