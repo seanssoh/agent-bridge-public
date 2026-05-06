@@ -21,6 +21,7 @@ bridge_load_roster
 usage() {
   cat <<EOF
 Usage:
+  $(basename "$0") create <agent> [options]
   $(basename "$0") <verb> [<agent>] [options]
 
 Subcommands:
