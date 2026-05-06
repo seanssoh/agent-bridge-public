@@ -573,6 +573,18 @@ bridge_agent_linux_env_file() {
 }
 
 bridge_linux_sudo_root() {
+  # Linux-user isolation only escalates via sudo on Linux. On other
+  # platforms (notably macOS), the helper falls through to a direct
+  # invocation as the controller user. Without this guard `sudo -n` runs
+  # under the calling user's policy and silently fails non-interactively
+  # on hosts with no passwordless sudoers entry — which is the macOS
+  # default — so callers like `agent delete --purge-home` would log
+  # `best-effort rm failed` and leak paths. Issue #620.
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    "$@"
+    return $?
+  fi
+
   if [[ "$(id -u)" == "0" ]]; then
     "$@"
     return $?
