@@ -167,7 +167,6 @@ run_list() {
 bridge_cron_validate_shell_run_config() {
   local run_as_agent="$1"
   local script_path="${2:-}"
-  local mode="${3:-create}"
 
   [[ -n "$run_as_agent" ]] || bridge_die "--run-as-agent is required for --kind shell"
   bridge_load_roster
@@ -182,10 +181,7 @@ bridge_cron_validate_shell_run_config() {
     bridge_die "--run-as-agent must be an agent id, not a numeric UID/user"
   fi
 
-  if [[ -z "$script_path" && "$mode" == "update" ]]; then
-    return 0
-  fi
-
+  [[ -n "$script_path" ]] || bridge_die "--script is required for --kind shell"
   local resolved_script="$script_path"
   case "$resolved_script" in
     '$BRIDGE_HOME'|'$BRIDGE_HOME'/*)
@@ -260,8 +256,10 @@ run_update() {
     native-update
     --jobs-file "$BRIDGE_NATIVE_CRON_JOBS_FILE"
   )
+  local kind=""
   local run_as_agent=""
   local script_path=""
+  local shell_option_seen=0
 
   shift || true
   [[ -n "$job_ref" ]] || bridge_die "Usage: $(basename "$0") update <job-id> [--agent <bridge-agent>] [--schedule <cron-expr>|--at <iso-datetime>] [--title <title>] [--payload <text>|--payload-file <path>] [--tz <iana-tz>] [--enable|--disable] [--delete-after-run|--keep-after-run]"
@@ -272,8 +270,14 @@ run_update() {
       --agent|--schedule|--at|--title|--payload|--payload-file|--tz|--actor|--kind|--script|--script-arg|--script-env|--run-as-agent|--timeout|--output-cap)
         [[ $# -lt 2 ]] && bridge_die "$1 뒤에 값을 지정하세요."
         case "$1" in
+          --kind) kind="$2" ;;
           --run-as-agent) run_as_agent="$2" ;;
           --script) script_path="$2" ;;
+        esac
+        case "$1" in
+          --kind|--script|--script-arg|--script-env|--run-as-agent|--timeout|--output-cap)
+            shell_option_seen=1
+            ;;
         esac
         py_args+=("$1" "$2")
         shift 2
@@ -292,8 +296,24 @@ run_update() {
     esac
   done
 
-  if [[ -n "$run_as_agent" ]]; then
-    bridge_cron_validate_shell_run_config "$run_as_agent" "$script_path" "update"
+  local existing_shell_payload=""
+  local existing_payload_kind=""
+  local existing_script_path=""
+  local existing_run_as_agent=""
+  existing_shell_payload="$(bridge_cron_python show --jobs-file "$BRIDGE_NATIVE_CRON_JOBS_FILE" --format shell "$job_ref" 2>/dev/null || true)"
+  if [[ -n "$existing_shell_payload" ]]; then
+    local CRON_JOB_PAYLOAD_KIND=""
+    local CRON_JOB_PAYLOAD_SHELL_SCRIPT=""
+    local CRON_JOB_EXECUTION_RUN_AS_AGENT=""
+    # shellcheck disable=SC1090
+    source <(printf '%s\n' "$existing_shell_payload")
+    existing_payload_kind="$CRON_JOB_PAYLOAD_KIND"
+    existing_script_path="$CRON_JOB_PAYLOAD_SHELL_SCRIPT"
+    existing_run_as_agent="$CRON_JOB_EXECUTION_RUN_AS_AGENT"
+  fi
+
+  if [[ "$existing_payload_kind" == "shell" || "$kind" == "shell" || $shell_option_seen -eq 1 ]]; then
+    bridge_cron_validate_shell_run_config "${run_as_agent:-$existing_run_as_agent}" "${script_path:-$existing_script_path}" "update"
   fi
 
   bridge_cron_python "${py_args[@]}"
