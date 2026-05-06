@@ -793,6 +793,111 @@ bridge_isolation_v2_layout_summary() {
 }
 
 # ---------------------------------------------------------------------------
+# 6b. launchd lifecycle helpers (macOS upgrade) - v0.8.3
+# ---------------------------------------------------------------------------
+#
+# `bridge_isolation_v2_migrate_wait_daemon_gone` polls 10s for an empty
+# `bridge_daemon_all_pids` after `bridge-daemon.sh stop`. On macOS hosts
+# installed via `scripts/install-daemon-launchagent.sh` the daemon is
+# supervised by launchd with `KeepAlive=true`, so the unit respawns
+# within 1-2 seconds of the kill. The poll never sees a clean window
+# and the migration aborts with "daemon stop verification failed".
+#
+# Modern macOS (10.11+) deprecated `launchctl load`; the reliable
+# lifecycle is `launchctl bootout` / `launchctl bootstrap` against the
+# `gui/<uid>` domain. KeepAlive plist edits are not equivalent because
+# they don't catch the dict-form `KeepAlive.AfterInitialDemand` or the
+# legacy `OnDemand` key.
+#
+# State is recorded under `$BRIDGE_STATE_DIR/migration/launchd-restore.json`
+# so a migration that crashes between bootout and bootstrap can be
+# recovered on the next run via `restore_if_needed`.
+
+bridge_isolation_v2_launchd_plist_path() {
+  printf '%s/Library/LaunchAgents/%s.plist' \
+    "$HOME" "${BRIDGE_DAEMON_LAUNCHAGENT_LABEL:-ai.agent-bridge.daemon}"
+}
+
+bridge_isolation_v2_launchd_restore_file() {
+  printf '%s/migration/launchd-restore.json' "${BRIDGE_STATE_DIR}"
+}
+
+bridge_isolation_v2_launchd_unload() {
+  [[ "$(uname)" == "Darwin" ]] || return 0
+
+  local plist_path
+  plist_path="$(bridge_isolation_v2_launchd_plist_path)"
+  [[ -f "$plist_path" ]] || return 0  # not launchd-managed
+
+  local restore_file
+  restore_file="$(bridge_isolation_v2_launchd_restore_file)"
+  install -d -m 0755 "$(dirname "$restore_file")" 2>/dev/null \
+    || mkdir -p "$(dirname "$restore_file")"
+
+  local uid
+  uid="$(id -u)"
+
+  # Record what we're about to do so a crash can recover.
+  printf '{"plist_path":"%s","uid":%s,"unloaded_at":"%s","restored_at":null}\n' \
+    "$plist_path" "$uid" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$restore_file"
+
+  # Best-effort bootout. Tolerate "service not loaded" - modern launchctl
+  # returns non-zero in that case but the post-condition (unit not
+  # loaded) is what we want regardless.
+  launchctl bootout "gui/${uid}" "$plist_path" 2>/dev/null || true
+
+  # Verify daemon process actually gone - KeepAlive race window is
+  # ~1-2s, so 50 attempts at 0.2s = 10s ceiling matches the existing
+  # wait_daemon_gone budget.
+  local attempt
+  for attempt in $(seq 1 50); do
+    if [[ -z "$(bridge_daemon_all_pids 2>/dev/null || true)" ]]; then
+      return 0
+    fi
+    sleep 0.2
+  done
+  bridge_warn "launchd_unload: daemon still alive after bootout - may need manual launchctl bootout"
+  return 1
+}
+
+bridge_isolation_v2_launchd_bootstrap() {
+  [[ "$(uname)" == "Darwin" ]] || return 0
+
+  local plist_path
+  plist_path="$(bridge_isolation_v2_launchd_plist_path)"
+  [[ -f "$plist_path" ]] || return 0
+
+  local restore_file
+  restore_file="$(bridge_isolation_v2_launchd_restore_file)"
+  local uid
+  uid="$(id -u)"
+
+  if ! launchctl bootstrap "gui/${uid}" "$plist_path" 2>/dev/null; then
+    bridge_warn "launchd_bootstrap: bootstrap failed; daemon may need manual restart"
+    return 1
+  fi
+
+  # Mark restore complete by removing the save file.
+  if [[ -f "$restore_file" ]]; then
+    rm -f "$restore_file" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Recovery hook: call from the migrate apply path BEFORE bootout, so a
+# previous-run leftover bootout (no bootstrap yet) gets restored first.
+# This is the cross-run safety net for the case where the EXIT trap in
+# `apply_for_upgrade` did not fire (SIGKILL / power loss / OOM).
+bridge_isolation_v2_launchd_restore_if_needed() {
+  [[ "$(uname)" == "Darwin" ]] || return 0
+  local restore_file
+  restore_file="$(bridge_isolation_v2_launchd_restore_file)"
+  [[ -f "$restore_file" ]] || return 0
+  bridge_warn "launchd: detected stale unload from prior run - restoring before retry"
+  bridge_isolation_v2_launchd_bootstrap
+}
+
+# ---------------------------------------------------------------------------
 # 7. exports
 # ---------------------------------------------------------------------------
 
