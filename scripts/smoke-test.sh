@@ -10444,4 +10444,13 @@ bash "$REPO_ROOT/scripts/smoke/agent-doctor.sh"
 log "running isolation-v2-migrate-lock-portability smoke (v0.8.1 hotfix)"
 bash "$REPO_ROOT/scripts/smoke/isolation-v2-migrate-lock-portability.sh"
 
+# v0.8.2 hotfix regression smoke (issue #652) — verifies cmd_migrate_agents
+# does NOT abort the multi-agent loop when one agent home is owned by a
+# different UID (controller cannot stat into 0700 memory tree). Two
+# layers covered: (1) template-side skip of `memory/` subtree in
+# migrate_agent_home, (2) defensive PermissionError catch in
+# cmd_migrate_agents that records a structured `skipped_isolated` entry.
+log "running upgrade-isolated-agent-migrate smoke (v0.8.2 hotfix, issue #652)"
+bash "$REPO_ROOT/scripts/smoke/upgrade-isolated-agent-migrate.sh"
+
 log "smoke test passed"
