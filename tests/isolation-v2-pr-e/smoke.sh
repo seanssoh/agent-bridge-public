@@ -474,6 +474,15 @@ ok "UM2 legacy shared → helper inert (umask stays 0077)"
 
 # ---------------------------------------------------------------------------
 # UM4: helper sets 0007 for legacy linux-user isolation
+#
+# Two assertions, both required:
+#   1. probe-text — `umask` reports 0007 (catches helper body regressions)
+#   2. real-file mode — a file created *after* the helper has mode 0660
+#      (catches regressions where the probe still says 0007 but something
+#      strips group bits or umask isn't actually applied to creates).
+# A future change could fool the probe alone (e.g. set then reset, or
+# print the right value without applying it); the create+stat closes
+# that gap and is the actual permission contract operators care about.
 # ---------------------------------------------------------------------------
 case_um4() {
   bridge_load_roster
@@ -483,6 +492,22 @@ case_um4() {
   BRIDGE_AGENT_ISOLATION_MODE["smoke-um4"]="linux-user"
   BRIDGE_AGENT_OS_USER["smoke-um4"]="ec2-user"
   smoke_bridge_run_apply_v2_umask_if_needed "smoke-um4"
+  # Real-file mode-bit assertion. Must run inside the same subshell as
+  # the helper so the umask actually applies to the create. Use the
+  # case-scoped fixture dir passed in via the first positional arg.
+  local fixture_dir="$1"
+  local probe_file="$fixture_dir/created-after-umask"
+  : >"$probe_file" || { echo "case_um4: failed to create probe file at $probe_file" >&2; return 31; }
+  local mode
+  if mode=$(stat -c '%a' "$probe_file" 2>/dev/null); then :;
+  elif mode=$(stat -f '%Lp' "$probe_file" 2>/dev/null); then :;
+  else
+    echo "case_um4: stat unsupported on this platform" >&2
+    return 32
+  fi
+  # Strip leading zeros so 0660 / 660 both match.
+  mode="${mode#0}"
+  [[ "$mode" == "660" ]] || { echo "case_um4: expected file mode 660, got $mode" >&2; return 33; }
 }
 log "case: UM4 bridge_run_apply_v2_umask_if_needed in legacy linux-user"
 UM4_DIR="$TMP_ROOT/um4"
@@ -490,11 +515,11 @@ UM4_LOG="$UM4_DIR/sudo.log"
 UM4_PROBE="$UM4_DIR/umask.probe"
 mkdir -p "$UM4_DIR"
 : >"$UM4_PROBE"
-BRIDGE_RUN_UMASK_PROBE_FILE="$UM4_PROBE" run_in_legacy "$UM4_DIR" "$UM4_LOG" case_um4 \
+BRIDGE_RUN_UMASK_PROBE_FILE="$UM4_PROBE" run_in_legacy "$UM4_DIR" "$UM4_LOG" case_um4 "$UM4_DIR" \
   || die "UM4 case_um4 returned non-zero"
 um4_recorded="$(cat "$UM4_PROBE" 2>/dev/null || true)"
 [[ "$um4_recorded" == "0007" ]] || die "UM4 expected probe=0007 (legacy + linux-user), got: '$um4_recorded'"
-ok "UM4 legacy linux-user → bridge-run.sh helper sets umask 0007"
+ok "UM4 legacy linux-user → bridge-run.sh helper sets umask 0007 + created file mode 0660"
 
 # ---------------------------------------------------------------------------
 # UM3: real bridge-run.sh entrypoint applies umask 0007 in v2 (PR #399 r2 FAIL #14)
