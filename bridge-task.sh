@@ -232,6 +232,7 @@ cmd_create() {
   local body_was_set=0
   local body_file=""
   local allow_empty_body=0
+  local skip_companion_validate=0
   local guard_threshold=""
   local guard_shell=""
   local severity=""
@@ -281,6 +282,10 @@ cmd_create() {
         allow_empty_body=1
         shift
         ;;
+      --skip-companion-validate)
+        skip_companion_validate=1
+        shift
+        ;;
       -h|--help)
         usage
         exit 0
@@ -298,6 +303,53 @@ cmd_create() {
   explicit_actor="$actor"
   actor="$(infer_actor_if_possible "$actor")"
   emit_inferred_actor_hint "$explicit_actor" "$actor"
+
+  # Companion-role validation: when sending a [plan] / [review] task to a
+  # codex-engine recipient, require the body to carry a focus checklist and
+  # an expected-output mention. The shell layer is the right gate because it
+  # already knows roster engine; bridge-queue.py validate-companion-body is
+  # a pure helper. Skip via --skip-companion-validate (or env var) when a
+  # short brief is intentional. Recipients on non-codex engines, or titles
+  # without a companion prefix, are not validated.
+  if [[ "${BRIDGE_TASK_SKIP_COMPANION_VALIDATE:-0}" == "1" ]]; then
+    skip_companion_validate=1
+  fi
+  if [[ "$skip_companion_validate" -eq 0 ]]; then
+    local recipient_engine=""
+    recipient_engine="$(bridge_agent_engine "$target" 2>/dev/null || true)"
+    if [[ "$recipient_engine" == "codex" ]]; then
+      # Always pass an explicit body source (--body or --body-file).
+      # Letting the validator fall through to stdin would let a piped
+      # valid brief pass while the actually-enqueued task body is empty
+      # (`echo "[plan] valid" | agb task create --to <codex> --title ...`).
+      # We must validate exactly what gets stored: when no body shape is
+      # provided here, the queue insert below also has no body, so we
+      # validate an empty string — the validator will return rc=2 and the
+      # operator gets the same structured error as any other empty brief.
+      local companion_args=(--title "$title" --format json)
+      if [[ "$body_was_set" -eq 1 ]]; then
+        companion_args+=(--body "$body")
+      elif [[ -n "$body_file" && -f "$body_file" ]]; then
+        companion_args+=(--body-file "$body_file")
+      else
+        companion_args+=(--body "")
+      fi
+      local companion_result=""
+      local companion_rc=0
+      companion_result="$(python3 "$BRIDGE_SCRIPT_DIR/bridge-queue.py" \
+        validate-companion-body "${companion_args[@]}" </dev/null 2>/dev/null)" || companion_rc=$?
+      if [[ "$companion_rc" -eq 2 ]]; then
+        bridge_die "task body validation failed for codex companion-role review:
+${companion_result}
+
+Required sections:
+- focus checklist (a '## Focus checklist' or '## focus list' section)
+- expected output shape (mention 'plan-ok' / 'implement-ok' / 'needs-more', or an 'Expected output:' line)
+
+Bypass with --skip-companion-validate (or BRIDGE_TASK_SKIP_COMPANION_VALIDATE=1) when a short brief is intentional."
+      fi
+    fi
+  fi
 
   if bridge_agent_prompt_guard_enabled "$target"; then
     guard_threshold="$(bridge_agent_prompt_guard_min_block "$target" task_body)"
