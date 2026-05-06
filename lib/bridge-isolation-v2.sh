@@ -647,22 +647,67 @@ bridge_isolation_v2_acl_scrub() {
   # would override v2 group permissions in a way the operator can not
   # see from `ls -l`. Linux uses `setfacl -bR`; macOS has no `setfacl`,
   # so `chmod -R -P -N` (`-P` = no-symlink-follow, `-N` = remove ACL).
-  # Best-effort: a tree that has no ACLs is a no-op on both platforms.
+  #
+  # r2 review fix: the migration writes an err log on the controller and
+  # then advances the global v2 marker after this scrub. If we silently
+  # swallowed scrub failures, the install would land in an "isolation-v2
+  # marker present + leftover ACLs override the new POSIX bits" state —
+  # the contract break codex flagged. We now propagate the scrub rc and
+  # the migration caller turns that into a `bridge_die` so the marker is
+  # never advanced on a half-scrubbed tree.
+  #
+  # Errors from the scrub command itself are captured in a temp file and
+  # echoed via bridge_warn so operators have something to grep when they
+  # rerun. The err-file path is opportunistic; if mktemp itself fails we
+  # still surface the rc.
   local root="$1"
   [[ -n "$root" ]] || {
     bridge_warn "acl_scrub: root required"
     return 1
   }
   [[ -d "$root" ]] || return 0
+  local _scrub_err _rc
+  _scrub_err="$(mktemp 2>/dev/null || printf '/dev/null')"
   if [[ "$(uname)" == "Darwin" ]]; then
     _bridge_isolation_v2_run_root_or_sudo \
-      chmod -R -P -N "$root" 2>/dev/null || true
+      chmod -R -P -N "$root" 2>"$_scrub_err"
+    _rc=$?
+    if (( _rc != 0 )); then
+      bridge_warn "acl_scrub: chmod -R -P -N failed at $root (rc=${_rc}); see ${_scrub_err}"
+      return 1
+    fi
+    [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
     return 0
   fi
-  if command -v setfacl >/dev/null 2>&1; then
-    _bridge_isolation_v2_run_root_or_sudo \
-      setfacl -bR "$root" 2>/dev/null || true
+  if ! command -v setfacl >/dev/null 2>&1; then
+    # No setfacl on this Linux box — POSIX ACLs cannot be present without
+    # the toolchain that creates them, so a missing setfacl is treated as
+    # "nothing to scrub". Do NOT silently bypass when setfacl IS present
+    # but fails — that's the contract break we're closing.
+    [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
+    return 0
   fi
+  # Pre-check: when getfacl is available, treat "tree has no extended
+  # ACLs" as a no-op. This avoids tripping on distros where `setfacl -b`
+  # on a clean tree returns non-zero. Best-effort — when getfacl is
+  # missing we fall through to the direct scrub.
+  if command -v getfacl >/dev/null 2>&1; then
+    local _ext_acls
+    _ext_acls="$(getfacl --skip-base -R "$root" 2>/dev/null \
+      | grep -v '^[[:space:]]*$' | grep -v '^#' | head -n 1 || true)"
+    if [[ -z "$_ext_acls" ]]; then
+      [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
+      return 0
+    fi
+  fi
+  _bridge_isolation_v2_run_root_or_sudo \
+    setfacl -bR "$root" 2>"$_scrub_err"
+  _rc=$?
+  if (( _rc != 0 )); then
+    bridge_warn "acl_scrub: setfacl -bR failed at $root (rc=${_rc}); see ${_scrub_err}"
+    return 1
+  fi
+  [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
   return 0
 }
 

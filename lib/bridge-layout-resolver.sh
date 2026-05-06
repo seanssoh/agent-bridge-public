@@ -152,6 +152,66 @@ bridge_layout_resolver_validate_env() {
 }
 
 # ---------------------------------------------------------------------------
+# T3 bypass handshake — verifies the upgrade migration is actually the
+# entity that armed the resolver bypass. Both parts have to match:
+#
+#   1. BRIDGE_LAYOUT_RESOLVER_BYPASS starts with `upgrade-migrate:<nonce>`
+#      so a static env value (e.g. someone documenting the var in a
+#      shell rc) cannot pose as the upgrader.
+#   2. Current process is a descendant of BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID
+#      (the upgrade.sh's $$). A leaked env crossing into a sibling
+#      process tree therefore fails — only the upgrade chain wins.
+#
+# Returns 0 when the bypass is honored, non-zero otherwise. The non-zero
+# case falls through to normal resolution (and the v0.8.0 fail-fast).
+# ---------------------------------------------------------------------------
+
+_bridge_layout_resolver_bypass_active() {
+  local val="${BRIDGE_LAYOUT_RESOLVER_BYPASS:-}"
+  [[ "$val" == upgrade-migrate:* ]] || return 1
+  # Reject the empty-suffix form so a stale "upgrade-migrate:" without
+  # a nonce body cannot disarm the resolver.
+  [[ "${val#upgrade-migrate:}" != "" ]] || return 1
+  local owner_pid="${BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID:-}"
+  [[ -n "$owner_pid" ]] || return 1
+  # Owner pid must be a positive integer >= 2. Anything else is hostile —
+  # PID 1 (init) is the universal ancestor of every process, so accepting
+  # it as owner would let a forged env pass the descendant walk trivially.
+  [[ "$owner_pid" =~ ^[0-9]+$ ]] || return 1
+  (( owner_pid >= 2 )) || return 1
+  # Owner pid must point at a live process whose command line reveals it
+  # really IS bridge-upgrade.sh. A leaked env crossing into another
+  # process tree (or a re-used PID after upgrade.sh exited) fails this
+  # check because the unrelated process's argv won't match. Both ps
+  # variants are tried (Linux ps -o args=, macOS ps -o command=) so the
+  # check works on both platforms.
+  local owner_cmd=""
+  owner_cmd="$(ps -o args= -p "$owner_pid" 2>/dev/null | head -n 1)"
+  if [[ -z "$owner_cmd" ]]; then
+    owner_cmd="$(ps -o command= -p "$owner_pid" 2>/dev/null | head -n 1)"
+  fi
+  [[ -n "$owner_cmd" ]] || return 1
+  [[ "$owner_cmd" == *"bridge-upgrade.sh"* ]] || return 1
+  # Caller must be a descendant of owner_pid. Walk up the process tree
+  # bounded to 64 levels — well above any realistic shell-nesting depth
+  # and prevents a pathological tree from trapping us in a loop.
+  local p=$$ steps=0
+  while (( steps < 64 )); do
+    if [[ "$p" == "$owner_pid" ]]; then
+      return 0
+    fi
+    [[ "$p" == "1" || "$p" == "0" ]] && return 1
+    local parent
+    parent="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+    [[ -n "$parent" && "$parent" != "0" ]] || return 1
+    [[ "$parent" =~ ^[0-9]+$ ]] || return 1
+    p="$parent"
+    steps=$((steps + 1))
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Main resolver
 # ---------------------------------------------------------------------------
 
@@ -177,7 +237,15 @@ bridge_resolve_layout() {
   # invoking the migration tool itself; once the migration writes the v2
   # marker, subsequent boots take the normal `marker` source branch and
   # this bypass becomes a no-op.
-  if [[ "${BRIDGE_LAYOUT_RESOLVER_BYPASS:-}" == "upgrade-migrate" ]]; then
+  #
+  # r2 review fix: the bypass is gated behind a process-tree handshake.
+  # Just owning the env var is not sufficient — the resolver requires
+  # the value to start with `upgrade-migrate:<nonce>` and the current
+  # process to be a descendant of BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID
+  # (set by bridge-upgrade.sh to its own $$). A leaked / copied env that
+  # crosses out of the upgrade process tree therefore fails the check,
+  # restoring the v0.8.0 hard-cut for everything but the upgrade flow.
+  if _bridge_layout_resolver_bypass_active; then
     BRIDGE_LAYOUT_SOURCE="upgrade-migrate-deferred"
     BRIDGE_DEFAULT_DATA_ROOT="${BRIDGE_HOME:-$HOME/.agent-bridge}/data"
     return 0

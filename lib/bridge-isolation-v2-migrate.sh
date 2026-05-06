@@ -146,10 +146,21 @@ bridge_isolation_v2_migrate_capture_all_agents_snapshot() {
       for entry in "$BRIDGE_AGENT_HOME_ROOT"/*/; do
         [[ -d "$entry" ]] || continue
         name="$(basename "$entry")"
-        # Skip dotfiles and well-known non-agent dirs.
+        # Skip dotfiles and well-known non-agent dirs. r2 review fix:
+        # `agents-archive` was missing from the denylist. The filter
+        # also requires a `home/` child to confirm this really is an
+        # agent root — orphan dirs (e.g. half-deleted agents, operator
+        # scratch) get skipped instead of accidentally enrolled into
+        # the v2 group/perm pass.
         case "$name" in
-          .*|backups|state|logs|shared|worktrees) continue ;;
+          .*|backups|state|logs|shared|worktrees|agents-archive)
+            continue
+            ;;
         esac
+        if [[ ! -d "$entry/home" ]]; then
+          bridge_warn "isolation-v2 migration: skipping non-agent dir $entry (no home/ subdir)"
+          continue
+        fi
         printf '%s\n' "$name"
       done
     fi
@@ -1169,7 +1180,24 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
   # writes correct group ownership for every agent root, mirrored or
   # not). Run scrub first so leftover v1 ACLs don't override the new
   # POSIX group bits.
-  bridge_isolation_v2_acl_scrub "$data_root" 2>/dev/null || true
+  #
+  # r2 review fix: scrub failures are no longer swallowed. A failed
+  # scrub means leftover ACLs may still override the v2 group bits —
+  # writing the global marker on top of that would silently break the
+  # isolation contract. Treat as fatal and bail BEFORE the marker is
+  # advanced; idempotent re-run remains safe because no new state was
+  # written past this point.
+  if ! bridge_isolation_v2_acl_scrub "$data_root"; then
+    {
+      printf '{"mode":"isolation-v2-migrate","status":"error","reason":"acl-scrub",'
+      printf '"last_error":"ACL scrub failed at %s; marker NOT advanced",' "$data_root"
+      printf '"remediation":"inspect bridge_warn output (chmod -P -N / setfacl -bR rc) and rerun once the underlying ACL state is correctable",'
+      printf '"no_v080_code_installed":"yes"}\n'
+    } >"$err_log"
+    [[ "$active_count" -gt 0 ]] && bridge_isolation_v2_migrate_orchestrate_restart "$active_snapshot"
+    cat "$err_log"
+    return 1
+  fi
   if ! bridge_isolation_v2_migrate_normalize_layout "$all_snapshot" "$data_root"; then
     {
       printf '{"mode":"isolation-v2-migrate","status":"error","reason":"normalize",'

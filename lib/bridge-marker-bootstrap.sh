@@ -30,13 +30,39 @@ bridge_isolation_v2_marker_path() {
     "${BRIDGE_LAYOUT_MARKER_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
 }
 
+# Portable stat shims — GNU coreutils uses `-c <fmt>`, BSD/macOS uses
+# `-f <fmt>`. The marker validator is load-bearing on macOS upgrades, so
+# the GNU-only invocation is no longer acceptable. r2 review fix.
+bridge_marker_stat_uid() {
+  local path="$1"
+  [[ -n "$path" ]] || return 1
+  if [[ "$(uname)" == "Darwin" ]]; then
+    stat -f '%u' "$path" 2>/dev/null
+  else
+    stat -c '%u' "$path" 2>/dev/null
+  fi
+}
+
+bridge_marker_stat_mode() {
+  # %Lp on BSD prints the file mode in octal without leading zero, which
+  # matches GNU `stat -c '%a'` so the caller's `8#$mode_oct` arithmetic
+  # works unchanged.
+  local path="$1"
+  [[ -n "$path" ]] || return 1
+  if [[ "$(uname)" == "Darwin" ]]; then
+    stat -f '%Lp' "$path" 2>/dev/null
+  else
+    stat -c '%a' "$path" 2>/dev/null
+  fi
+}
+
 bridge_isolation_v2_marker_validate() {
   local path="${1:-}"
   [[ -n "$path" ]] || return 1
   [[ -f "$path" && ! -L "$path" ]] || return 1
 
   local owner_uid mode_oct mode_int
-  owner_uid="$(stat -c '%u' "$path" 2>/dev/null)"
+  owner_uid="$(bridge_marker_stat_uid "$path")"
   if [[ -z "$owner_uid" ]]; then
     return 1
   fi
@@ -49,7 +75,7 @@ bridge_isolation_v2_marker_validate() {
     fi
   fi
 
-  mode_oct="$(stat -c '%a' "$path" 2>/dev/null)"
+  mode_oct="$(bridge_marker_stat_mode "$path")"
   if [[ -z "$mode_oct" ]]; then
     return 1
   fi
