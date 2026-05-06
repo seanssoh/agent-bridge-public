@@ -45,14 +45,19 @@ RUN_ARTIFACTS_TIER_B_SURFACES = (
 
 # Terminal state.json values for a cron run. "deferred" is intentionally NOT
 # terminal — the runner asks for re-fire and the slot is still in flight.
-_RUN_STATUS_TERMINAL_STATES = {"success", "error", "cancelled"}
+_RUN_STATUS_TERMINAL_STATES = {"success", "error", "timed_out", "cancelled"}
 # Failed runs (state="error") are retained on the longer Tier-B clock so the
 # operator has time to triage even when the originating surface is Tier-A.
-_RUN_STATUS_FAILED_STATES = {"error"}
+_RUN_STATUS_FAILED_STATES = {"error", "timed_out"}
 
 # bridge-queue.py terminal statuses are "done" and "cancelled" only — there
 # is no "failed" queue state. Source: bridge-queue.py status enum + #533.
 _QUEUE_TERMINAL_STATUSES = {"done", "cancelled"}
+
+SHELL_PAYLOAD_ENV_PREFIXES = ("POLL_", "SCRIPT_")
+SHELL_PROTECTED_ENV_EXACT = {"HOME", "PATH"}
+SHELL_PROTECTED_ENV_PREFIXES = ("BRIDGE_", "CRON_")
+SHELL_ARG_FORBIDDEN_RE = re.compile(r"[\x00\r\n;&|<>`]")
 
 
 # Canonical memory-daily prompt body template (issue #541 PR-A).
@@ -225,6 +230,13 @@ def preview_text(value, limit=120):
     return flattened[: limit - 3].rstrip() + "..."
 
 
+def preview_shell_payload(payload, limit=120):
+    script = str(payload.get("script") or "").strip()
+    args = payload.get("args") if isinstance(payload.get("args"), list) else []
+    flattened = " ".join([script, *[str(item) for item in args]]).strip()
+    return preview_text(flattened, limit=limit)
+
+
 def classify_family(name):
     for rule in FAMILY_RULES:
         if name.startswith(rule) or rule in name:
@@ -340,7 +352,13 @@ def build_job_record(job):
     name = job.get("name", "<unnamed>")
     last_status = state.get("lastStatus") or state.get("lastRunStatus") or "-"
     consecutive_errors = int(state.get("consecutiveErrors") or 0)
+    payload_kind = payload.get("kind", "-")
     payload_text = payload.get("text") or payload.get("message") or ""
+    if payload_kind == "shell":
+        payload_text = ""
+        payload_preview = preview_shell_payload(payload)
+    else:
+        payload_preview = preview_text(payload_text)
     last_error = parse_epoch_ms(state.get("lastErrorAtMs"))
     if last_error is None and (consecutive_errors > 0 or last_status not in ("-", "ok", "success")):
         last_error = last_run
@@ -374,7 +392,13 @@ def build_job_record(job):
         "last_inbox_task_id": state.get("lastInboxTaskId"),
         "session_target": job.get("sessionTarget", "-"),
         "wake_mode": job.get("wakeMode", "-"),
-        "payload_kind": payload.get("kind", "-"),
+        "payload_kind": payload_kind,
+        "payload_shell_script": payload.get("script", ""),
+        "payload_shell_args": payload.get("args") if isinstance(payload.get("args"), list) else [],
+        "payload_shell_env": payload.get("env") if isinstance(payload.get("env"), dict) else {},
+        "payload_shell_timeout_seconds": payload.get("timeoutSeconds", ""),
+        "payload_shell_output_cap_bytes": payload.get("outputCapBytes", ""),
+        "execution_run_as_agent": (job.get("execution") or {}).get("runAsAgent", ""),
         "job_delivery_mode": delivery.get("mode", ""),
         "job_delivery_channel": delivery.get("channel", ""),
         "job_delivery_target": delivery.get("to", ""),
@@ -419,7 +443,7 @@ def build_job_record(job):
             or ""
         ).strip(),
         "payload_text": payload_text,
-        "payload_preview": preview_text(payload_text),
+        "payload_preview": payload_preview,
         "raw": job,
     }
 
@@ -533,6 +557,12 @@ def serialize_record(record, include_payload=False):
         "session_target": record["session_target"],
         "wake_mode": record["wake_mode"],
         "payload_kind": record["payload_kind"],
+        "payload_shell_script": record.get("payload_shell_script", ""),
+        "payload_shell_args": record.get("payload_shell_args", []),
+        "payload_shell_env": record.get("payload_shell_env", {}),
+        "payload_shell_timeout_seconds": record.get("payload_shell_timeout_seconds", ""),
+        "payload_shell_output_cap_bytes": record.get("payload_shell_output_cap_bytes", ""),
+        "execution_run_as_agent": record.get("execution_run_as_agent", ""),
         "job_delivery_mode": record["job_delivery_mode"],
         "job_delivery_channel": record["job_delivery_channel"],
         "job_delivery_target": record["job_delivery_target"],
@@ -1652,6 +1682,93 @@ def read_payload_argument(payload_text, payload_file):
     return ""
 
 
+def parse_shell_env(values):
+    env = {}
+    for raw in values or []:
+        if "=" not in raw:
+            raise ValueError("--script-env must be KEY=VALUE")
+        key, value = raw.split("=", 1)
+        if not re.match(r"^[A-Z_][A-Z0-9_]*$", key):
+            raise ValueError(f"invalid --script-env key: {key}")
+        if key in SHELL_PROTECTED_ENV_EXACT or key.startswith(SHELL_PROTECTED_ENV_PREFIXES):
+            raise ValueError(f"protected env var cannot be set by shell cron payload: {key}")
+        if not key.startswith(SHELL_PAYLOAD_ENV_PREFIXES):
+            allowed = ", ".join(f"{prefix}*" for prefix in SHELL_PAYLOAD_ENV_PREFIXES)
+            raise ValueError(f"shell cron env var must use one of these prefixes: {allowed}: {key}")
+        env[key] = value
+    return env
+
+
+def resolve_shell_script(path_value):
+    raw = str(path_value or "").strip()
+    if not raw:
+        raise ValueError("--script is required for --kind shell")
+    bridge_home_value = os.environ.get("BRIDGE_HOME")
+    if raw == "$BRIDGE_HOME" or raw.startswith("$BRIDGE_HOME/"):
+        if not bridge_home_value:
+            raise ValueError("--script uses $BRIDGE_HOME but BRIDGE_HOME is not set")
+        raw = bridge_home_value + raw[len("$BRIDGE_HOME") :]
+    elif "$" in raw:
+        raise ValueError("--script contains an unresolved environment variable")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ValueError("--script must resolve to an absolute path")
+    path = path.resolve()
+    try:
+        stat_result = path.stat()
+    except OSError as exc:
+        raise ValueError(f"--script is not accessible: {path}") from exc
+    if not path.is_file():
+        raise ValueError(f"--script must be a regular file: {path}")
+    if not os.access(path, os.X_OK):
+        raise ValueError(f"--script must be executable: {path}")
+    if stat_result.st_mode & 0o022:
+        raise ValueError(f"--script must not be group/other writable: {path}")
+    return str(path)
+
+
+def validate_shell_args(values):
+    args = []
+    for raw in values or []:
+        value = str(raw)
+        if SHELL_ARG_FORBIDDEN_RE.search(value):
+            raise ValueError(f"--script-arg contains shell metacharacters: {value!r}")
+        if "$(" in value or "${" in value:
+            raise ValueError(f"--script-arg contains shell expansion syntax: {value!r}")
+        args.append(value)
+    return args
+
+
+def build_native_job_shell_payload(args, existing_payload=None, existing_execution=None):
+    existing_payload = existing_payload or {}
+    existing_execution = existing_execution or {}
+    script = args.script if args.script is not None else existing_payload.get("script")
+    run_as_agent = args.run_as_agent or existing_execution.get("runAsAgent")
+    env_values = args.script_env or []
+    arg_values = args.script_arg if args.script_arg is not None else None
+    timeout = args.timeout if args.timeout is not None else existing_payload.get("timeoutSeconds", 900)
+    output_cap = args.output_cap if args.output_cap is not None else existing_payload.get("outputCapBytes", 65536)
+
+    if not run_as_agent:
+        raise ValueError("--run-as-agent is required for --kind shell")
+    if str(run_as_agent).isdigit():
+        raise ValueError("--run-as-agent must be an agent id, not a numeric UID/user")
+    if timeout is None or int(timeout) <= 0:
+        raise ValueError("--timeout must be a positive integer")
+    if output_cap is None or int(output_cap) <= 0:
+        raise ValueError("--output-cap must be a positive integer")
+
+    payload = {
+        "kind": "shell",
+        "script": resolve_shell_script(script),
+        "args": validate_shell_args(arg_values if arg_values is not None else existing_payload.get("args", [])),
+        "env": parse_shell_env(env_values) if env_values else dict(existing_payload.get("env") or {}),
+        "timeoutSeconds": int(timeout),
+        "outputCapBytes": int(output_cap),
+    }
+    return payload, {"runAsAgent": run_as_agent}
+
+
 def parse_at_datetime(value):
     parsed = parse_iso_datetime(value)
     if parsed is None:
@@ -1681,6 +1798,8 @@ def build_native_job(
     actor,
     delete_after_run,
     existing_job=None,
+    payload=None,
+    execution=None,
 ):
     now_ms_value = now_epoch_ms()
     if at_value is not None:
@@ -1695,6 +1814,13 @@ def build_native_job(
             "tz": tz_name or default_tz_name(),
         }
     job = dict(existing_job or {})
+    if payload is None:
+        payload = {
+            "kind": "text",
+            "text": payload_text,
+        }
+    if execution is None:
+        execution = dict(job.get("execution") or {})
     job.update(
         {
             "id": job_id,
@@ -1705,10 +1831,8 @@ def build_native_job(
             "updatedAtMs": now_ms_value,
             "schedule": schedule,
             "deleteAfterRun": bool(delete_after_run),
-            "payload": {
-                "kind": "text",
-                "text": payload_text,
-            },
+            "payload": payload,
+            "execution": execution,
             "sessionTarget": "agent-bridge",
             "wakeMode": "queue-dispatch",
             "state": dict(job.get("state") or {}),
@@ -1777,12 +1901,23 @@ def run_native_create(args):
     records = [build_job_record(job) for job in jobs]
     actor = args.actor or os.environ.get("USER", "unknown")
     title = args.title.strip()
-    payload_text = read_payload_argument(args.payload, args.payload_file)
+    payload_text = ""
+    payload = None
+    execution = None
+    payload_kind = args.kind or "text"
+    if payload_kind == "shell":
+        if args.payload is not None or args.payload_file is not None:
+            raise ValueError("--payload/--payload-file cannot be used with --kind shell")
+        payload, execution = build_native_job_shell_payload(args)
+    else:
+        payload_text = read_payload_argument(args.payload, args.payload_file)
     # Issue #541 PR-A — default memory-daily payloads to the canonical
     # jsonl-aware body when the operator did not supply one explicitly.
     # Operator-provided payloads (--payload / --payload-file) pass through
     # unchanged so existing override workflows keep working.
     if (
+        payload_kind == "text"
+        and
         args.payload is None
         and args.payload_file is None
         and classify_family(title) == "memory-daily"
@@ -1806,6 +1941,8 @@ def run_native_create(args):
         enabled=not args.disabled,
         actor=actor,
         delete_after_run=args.delete_after_run,
+        payload=payload,
+        execution=execution,
     )
     jobs.append(job)
     raw_payload["jobs"] = jobs
@@ -1848,6 +1985,8 @@ def run_native_update(args):
         return 2
 
     existing = dict(jobs[job_index])
+    existing_payload = dict(existing.get("payload") or {})
+    existing_payload_kind = existing_payload.get("kind") or "text"
     title = args.title.strip() if args.title is not None else existing.get("name", record["name"])
     agent = args.agent or existing.get("agentId") or existing.get("agent") or record["agent"]
     schedule = existing.get("schedule") or {}
@@ -1855,9 +1994,41 @@ def run_native_update(args):
     schedule_expr = args.schedule or (schedule.get("expr") if schedule_kind == "cron" else "") or ""
     at_value = args.at or (schedule.get("at") if schedule_kind == "at" else None)
     tz_name = args.tz or schedule.get("tz") or default_tz_name()
+    requested_kind = args.kind
+    shell_fields_present = any(
+        value is not None
+        for value in (args.script, args.run_as_agent, args.timeout, args.output_cap)
+    ) or bool(args.script_arg) or bool(args.script_env)
+    text_fields_present = args.payload is not None or args.payload_file is not None
+    if requested_kind is None:
+        if shell_fields_present:
+            requested_kind = "shell"
+        elif text_fields_present:
+            requested_kind = "text"
+        else:
+            requested_kind = existing_payload_kind
+    if requested_kind != existing_payload_kind and not args.allow_kind_transition:
+        raise ValueError(
+            f"payload kind transition {existing_payload_kind!r} -> {requested_kind!r} requires --allow-kind-transition"
+        )
+    if requested_kind == "shell" and text_fields_present:
+        raise ValueError("--payload/--payload-file cannot be used with --kind shell")
+    if requested_kind == "text" and shell_fields_present:
+        raise ValueError("shell payload options require --kind shell")
+
     payload_text = native_job_payload(existing)
-    if args.payload is not None or args.payload_file is not None:
-        payload_text = read_payload_argument(args.payload, args.payload_file)
+    payload = None
+    execution = None
+    if requested_kind == "shell":
+        payload, execution = build_native_job_shell_payload(
+            args,
+            existing_payload=existing_payload if existing_payload_kind == "shell" else None,
+            existing_execution=existing.get("execution") or {},
+        )
+    else:
+        execution = {}
+        if text_fields_present:
+            payload_text = read_payload_argument(args.payload, args.payload_file)
 
     enabled = existing.get("enabled", True)
     if args.enable:
@@ -1882,6 +2053,8 @@ def run_native_update(args):
         actor=actor,
         delete_after_run=delete_after_run,
         existing_job=existing,
+        payload=payload,
+        execution=execution,
     )
     jobs[job_index] = updated_job
     raw_payload["jobs"] = jobs
@@ -2865,6 +3038,13 @@ def build_parser():
     native_payload_group = native_create_parser.add_mutually_exclusive_group()
     native_payload_group.add_argument("--payload")
     native_payload_group.add_argument("--payload-file")
+    native_create_parser.add_argument("--kind", choices=("text", "shell"), default="text")
+    native_create_parser.add_argument("--script")
+    native_create_parser.add_argument("--script-arg", action="append", default=[])
+    native_create_parser.add_argument("--script-env", action="append", default=[])
+    native_create_parser.add_argument("--run-as-agent")
+    native_create_parser.add_argument("--timeout", type=int)
+    native_create_parser.add_argument("--output-cap", type=int)
     native_create_parser.add_argument("--tz", default=default_tz_name())
     native_create_parser.add_argument("--actor")
     native_create_parser.add_argument("--disabled", action="store_true")
@@ -2881,6 +3061,14 @@ def build_parser():
     native_update_payload_group = native_update_parser.add_mutually_exclusive_group()
     native_update_payload_group.add_argument("--payload")
     native_update_payload_group.add_argument("--payload-file")
+    native_update_parser.add_argument("--kind", choices=("text", "shell"))
+    native_update_parser.add_argument("--script")
+    native_update_parser.add_argument("--script-arg", action="append")
+    native_update_parser.add_argument("--script-env", action="append", default=[])
+    native_update_parser.add_argument("--run-as-agent")
+    native_update_parser.add_argument("--timeout", type=int)
+    native_update_parser.add_argument("--output-cap", type=int)
+    native_update_parser.add_argument("--allow-kind-transition", action="store_true")
     native_update_parser.add_argument("--tz")
     native_update_parser.add_argument("--actor")
     delete_after_run_group = native_update_parser.add_mutually_exclusive_group()

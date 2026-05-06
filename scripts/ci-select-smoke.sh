@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys
 }
 
 add_all_integration() {
@@ -187,7 +187,7 @@ select_for_path() {
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -199,7 +199,8 @@ select_for_path() {
       # Issue #541 PR-A — memory-daily payload migration also lives in
       # bridge-cron.py; pull its smoke in for the same trigger set.
       # Issue #628 — cron mutation audit emission ditto.
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit queue
+      # Native cron shell payload runner regression.
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner queue
       add_integration integration-minimal
       ;;
 
