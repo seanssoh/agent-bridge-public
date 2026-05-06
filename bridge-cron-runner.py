@@ -138,7 +138,7 @@ def rel_for_output(path_value: str) -> str:
     return str(path)
 
 
-def read_json(path: Path) -> dict[str, Any]:
+def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -1836,27 +1836,40 @@ def cmd_run(args: argparse.Namespace) -> int:
         print("runner_error: request_artifact_tampered")
         return 1
 
-    request: dict[str, Any]
+    request: Any
     if route == "shell":
         try:
             request = read_json(request_file)
-        except json.JSONDecodeError as exc:
-            error_message = f"request_artifact_corrupted: {exc}"
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            error_message = f"request_artifact_corrupted: {type(exc).__name__}"
             write_shell_terminal_error(
                 request_file,
-                runner_error="request_artifact_corrupted",
+                runner_error=error_message,
+                summary=f"{error_message}: {exc}",
+                run_id=run_dir_id(request_file.parent),
+            )
+            print("status: error")
+            print(f"run_id: {run_dir_id(request_file.parent)}")
+            print("engine: shell")
+            print(f"runner_error: {error_message}")
+            return 1
+        if not isinstance(request, dict):
+            error_message = "request_artifact_corrupted: non_dict_top_level"
+            write_shell_terminal_error(
+                request_file,
+                runner_error=error_message,
                 summary=error_message,
                 run_id=run_dir_id(request_file.parent),
             )
             print("status: error")
             print(f"run_id: {run_dir_id(request_file.parent)}")
             print("engine: shell")
-            print("runner_error: request_artifact_corrupted")
+            print(f"runner_error: {error_message}")
             return 1
     else:
         request = read_json(request_file)
 
-    if is_shell_request_payload(request):
+    if isinstance(request, dict) and is_shell_request_payload(request):
         if route != "shell":
             error_message = "request_artifact_tampered: shell request artifacts are not controller-private"
             write_shell_terminal_error(
