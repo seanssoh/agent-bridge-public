@@ -451,6 +451,56 @@ out_gitdir_sep="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_gitdir
   BRIDGE_CODEX_TASK_MODE_POLICY block)"
 smoke_assert_eq "" "$out_gitdir_sep" "5p git --git-dir <path> status allowed"
 
+# 5q. (D1 r3) `patch -p1 -i /tmp/fix.patch`: pre-fix the classifier treated
+# `/tmp/fix.patch` as the write target (since `patch` was in the first-arg
+# heads set), letting the global /tmp carve-out allow it. But `patch` reads
+# the diff from `-i FILE` and writes to files named INSIDE the diff,
+# typically into cwd. Post-fix the target is cwd → blocks.
+event_patch_in='{"tool_name":"Bash","tool_input":{"command":"patch -p1 -i /tmp/fix.patch"}}'
+out_patch_in="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_patch_in" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_patch_in" '"decision": "block"' "5q patch -i /tmp/diff blocks (target is cwd)"
+
+# 5r. (D1 r3) `patch -p1 -i /tmp/diff -o /tmp/out`: `-o <output>` redirects
+# the patched result to a single named file. With the output in /tmp the
+# carve-out applies and the call is allowed.
+event_patch_out='{"tool_name":"Bash","tool_input":{"command":"patch -p1 -i /tmp/diff -o /tmp/out"}}'
+out_patch_out="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_patch_out" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_eq "" "$out_patch_out" "5r patch -o /tmp/out allowed (output in /tmp)"
+
+# 5s. (D1 r3) `install -t /etc/systemd /tmp/foo.service`: `-t <dest>` puts
+# the destination directory in the FLAG VALUE, not the last positional. Pre-
+# fix the classifier walked positionals from the right and returned
+# `/tmp/foo.service` (a source) as the write target → false-allowed by /tmp
+# carve-out. Post-fix `-t` is consumed and the destination /etc/systemd is
+# classified as the target → blocks.
+event_install_t_repo='{"tool_name":"Bash","tool_input":{"command":"install -t /etc/systemd /tmp/foo.service"}}'
+out_install_t_repo="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_install_t_repo" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_install_t_repo" '"decision": "block"' "5s install -t /etc/... blocks"
+
+# 5t. (D1 r3) `install -t /tmp/dest /etc/foo`: `-t /tmp/dest` is the write
+# target. Source comes from /etc but the destination /tmp/dest is in the
+# carve-out, so the call is allowed.
+event_install_t_tmp='{"tool_name":"Bash","tool_input":{"command":"install -t /tmp/dest /etc/foo"}}'
+out_install_t_tmp="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_install_t_tmp" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_eq "" "$out_install_t_tmp" "5t install -t /tmp/dest allowed"
+
+# 5u. (D1 r3) Mirror for cp / mv: `cp -t /etc /tmp/foo` and
+# `mv --target-directory=/etc /tmp/foo` must classify the destination
+# directory as the write target.
+event_cp_t='{"tool_name":"Bash","tool_input":{"command":"cp -t /etc /tmp/foo"}}'
+out_cp_t="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_cp_t" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_cp_t" '"decision": "block"' "5u cp -t /etc blocks"
+
+event_mv_long='{"tool_name":"Bash","tool_input":{"command":"mv --target-directory=/etc /tmp/foo"}}'
+out_mv_long="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_mv_long" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_mv_long" '"decision": "block"' "5u mv --target-directory=/etc blocks"
+
 # 5j. ambiguous claimed task — fail-open with audit row.
 AMBIG_AGENT="codex-ambig-smoke"
 python3 - <<PY

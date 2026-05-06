@@ -42,12 +42,12 @@ WRITE_SHAPED_TOOLS = {"Edit", "Write", "NotebookEdit", "MultiEdit"}
 # below because their destination is the LAST positional arg (cp/mv/install/
 # ln) or the `of=path` keyword (dd). git/make/pip/npm/yarn are mixed-mode
 # (read OR write depending on subcommand) — see _GIT_WRITE_SUBCOMMANDS and
-# _git_write_target. For [review] tasks `git status|diff|show|log|grep|
-# ls-files|rev-parse` must remain allowed even in block mode, otherwise the
-# reviewer cannot do their job.
+# _git_write_target. `patch` is its own shape (the diff content names the
+# write targets, not the args) — see _patch_write_target. For [review] tasks
+# `git status|diff|show|log|grep|ls-files|rev-parse` must remain allowed even
+# in block mode, otherwise the reviewer cannot do their job.
 WRITE_SHAPED_BASH_TOKEN_HEADS = {
     "rm", "mkdir", "touch", "tee", "chmod", "chown",
-    "patch",
 }
 # git subcommands that mutate the worktree, index, refs, or remote. First
 # non-flag arg after `git` is matched against this set.
@@ -249,6 +249,51 @@ def _dd_of_target(tokens: list[str]) -> str | None:
     return None
 
 
+def _target_directory_flag(tokens: list[str]) -> str | None:
+    """Return the value of `-t <dest>` / `--target-directory=<dest>` if present.
+
+    Used by cp / mv / install. When `-t` (or its long form) appears, the
+    write target is the FLAG VALUE, not the last positional arg — those
+    positionals are sources. `install -t /etc/systemd /tmp/foo.service` would
+    otherwise be misclassified by `_last_positional` as a /tmp write and
+    false-allowed.
+    """
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "-t" and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if tok == "--target-directory" and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if tok.startswith("--target-directory="):
+            return tok[len("--target-directory="):]
+        i += 1
+    return None
+
+
+def _patch_write_target(tokens: list[str]) -> str:
+    """Return the resolved write target for `patch <args>`.
+
+    `patch` reads a diff (from `-i FILE` or stdin) and applies it to files
+    named *inside the diff* — the diff path is INPUT, not the write target.
+    The conservative target is therefore the cwd. Honor `-o <output>` /
+    `--output=<output>` because that form redirects the patched result to a
+    single named file instead of touching cwd; if it points at /tmp the
+    outer carve-out will allow it.
+    """
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "-o" and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if tok == "--output" and i + 1 < len(tokens):
+            return tokens[i + 1]
+        if tok.startswith("--output="):
+            return tok[len("--output="):]
+        i += 1
+    return str(Path.cwd())
+
+
 def _git_write_subcommand(tokens: list[str]) -> str | None:
     """Return the git write subcommand name if `git <args>` mutates state.
 
@@ -318,9 +363,21 @@ def _classify_bash_write(command: str) -> Path | None:
     target_str: str | None = None
 
     if head in _WRITE_HEADS_LAST_ARG_DEST:
-        # cp / mv / install / ln — destination is the LAST positional arg.
-        # `cp /tmp/src /repo/dst` writes to /repo/dst, not /tmp/src.
-        target_str = _last_positional(tokens[1:])
+        # cp / mv / install / ln — destination is the LAST positional arg in
+        # the bare form, but `cp -t <dir> <src>...`, `mv -t <dir> <src>...`,
+        # and `install -t <dir> <src>...` (also `--target-directory=<dir>`)
+        # put the destination in a flag value. Check the flag form first so
+        # `install -t /etc/systemd /tmp/foo.service` is classified as a
+        # write to /etc/systemd, not /tmp/foo.service.
+        target_str = _target_directory_flag(tokens[1:])
+        if target_str is None:
+            target_str = _last_positional(tokens[1:])
+    elif head == "patch":
+        # `patch` reads a diff and writes to files named in the diff. The
+        # diff path itself (`-i FILE` or stdin) is INPUT, never the target.
+        # The conservative target is cwd; `-o <out>` overrides to a single
+        # named output file (which the /tmp carve-out can still allow).
+        target_str = _patch_write_target(tokens[1:])
     elif head == "dd":
         # `dd if=/tmp/src of=/repo/dst` — destination is the of= keyword.
         target_str = _dd_of_target(tokens[1:])
@@ -338,8 +395,8 @@ def _classify_bash_write(command: str) -> Path | None:
             return None
         return Path.cwd().resolve(strict=False)
     elif head in WRITE_SHAPED_BASH_TOKEN_HEADS:
-        # rm / mkdir / touch / tee / chmod / chown / patch — first non-flag
-        # token after the head is the conventional target.
+        # rm / mkdir / touch / tee / chmod / chown — first non-flag token
+        # after the head is the conventional target.
         for token in tokens[1:]:
             if token.startswith("-"):
                 continue
