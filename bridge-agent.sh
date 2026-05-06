@@ -21,23 +21,44 @@ bridge_load_roster
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") create <agent> [options]
-  $(basename "$0") update <agent> [options]
-  $(basename "$0") delete <agent> [--from <admin>] [--force] [--orphan-tasks] [--purge-home] [--purge-crons] [--dry-run] [--json]
-  $(basename "$0") retire <agent> [--purge-home] [--reason <text>] [--dry-run] [--json]
-  $(basename "$0") list [--json]
-  $(basename "$0") registry [--json]
-  $(basename "$0") show <agent> [--json]
-  $(basename "$0") reclassify [--agent <agent>] [--apply] [--json]
-  $(basename "$0") rerender-settings [<agent>...] [--apply|--dry-run] [--json]
-  $(basename "$0") start <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
-  $(basename "$0") safe-mode <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
-  $(basename "$0") stop <agent>
-  $(basename "$0") restart <agent> [--attach|--no-attach] [--continue|--no-continue] [--dry-run]
-  $(basename "$0") forget-session <agent>
-  $(basename "$0") attach <agent>
-  $(basename "$0") compact <agent> [--note <text>]
-  $(basename "$0") handoff <agent> [--note <text>]
+  $(basename "$0") <verb> [<agent>] [options]
+
+Subcommands:
+  create             Scaffold a new static role (agent home + roster block).
+  update             Typed audited mutation of protected managed-role fields.
+  delete             Remove a static role (with optional --purge-home / --purge-crons).
+  retire             Retire a static role with quarantine + audit trail.
+  list               List registered agents.
+  registry           Read-only JSON inventory of registered agents.
+  show               Show one agent's roster + runtime state.
+  reclassify         Promote a runtime-detected admin to a static role.
+  rerender-settings  Re-render per-agent settings.effective.json.
+  start              Launch <agent> in tmux.
+  safe-mode          Launch <agent> in safe-mode (no auto-resume).
+  stop               Stop <agent>'s tmux session.
+  restart            Restart <agent> with channel-banner verification.
+  forget-session     Clear the persisted Claude/Codex resume id.
+  attach             Attach to <agent>'s tmux session.
+  compact            Trigger an admin-driven /compact for <agent>.
+  handoff            Capture a handoff note for <agent>.
+  ack-crash          Clear the crash-state marker for <agent>.
+
+Examples:
+  $(basename "$0") create reviewer --engine claude
+  $(basename "$0") create coder --engine codex --session codex-main --always-on
+  $(basename "$0") create ops --engine claude --channels plugin:discord@claude-plugins-official --discord-channel 123456789012345678 --json
+  $(basename "$0") list --json
+  $(basename "$0") registry --json
+  $(basename "$0") show reviewer --json
+  $(basename "$0") reclassify --apply
+  $(basename "$0") rerender-settings --apply
+  $(basename "$0") start reviewer --dry-run
+  $(basename "$0") restart reviewer --attach
+  $(basename "$0") safe-mode reviewer --attach
+  $(basename "$0") stop reviewer
+  $(basename "$0") attach reviewer
+  $(basename "$0") compact reviewer
+  $(basename "$0") handoff reviewer --note "context critical"
 
 Update flags (typed audited mutation path for protected managed-role
 fields, issue #528). Caller must be the admin agent (BRIDGE_ADMIN_AGENT_ID)
@@ -54,10 +75,16 @@ override) — same trust model as 'agent-bridge config set'. Repeatable.
   --channels-set <csv>                 full replace of BRIDGE_AGENT_CHANNELS
   --channels-add <token>               append unique CSV token
   --channels-remove <token>            remove matching CSV token
+  --desc <text>                        set BRIDGE_AGENT_DESC
+  --engine claude|codex                set BRIDGE_AGENT_ENGINE
+  --workdir <path>                     set BRIDGE_AGENT_WORKDIR
+  --loop on|off                        set BRIDGE_AGENT_LOOP (off persists explicitly)
+  --continue on|off                    set BRIDGE_AGENT_CONTINUE
+  --class user|system                  set BRIDGE_AGENT_CLASS (privilege boundary)
   --json                               emit JSON envelope
   --dry-run                            do not mutate; emit planned diff
 
-Options:
+Create options:
   --engine claude|codex        Agent runtime engine (default: claude)
   --session <name>             tmux session name (default: <agent>)
   --workdir <path>             live home / workdir (default: \$BRIDGE_AGENT_HOME_ROOT/<agent>)
@@ -85,21 +112,11 @@ Options:
                                (smoke-/test-/bootstrap-/created-agent-/pref-,
                                *-repro-<N>); cleanup tooling may reap these
 
-Examples:
-  $(basename "$0") create reviewer --engine claude
-  $(basename "$0") create coder --engine codex --session codex-main --always-on
-  $(basename "$0") create ops --engine claude --channels plugin:discord@claude-plugins-official --discord-channel 123456789012345678 --json
-  $(basename "$0") list --json
-  $(basename "$0") show reviewer --json
-  $(basename "$0") reclassify --apply
-  $(basename "$0") rerender-settings --apply
-  $(basename "$0") start reviewer --dry-run
-  $(basename "$0") restart reviewer --attach
-  $(basename "$0") safe-mode reviewer --attach
-  $(basename "$0") stop reviewer
-  $(basename "$0") attach reviewer
-  $(basename "$0") compact reviewer
-  $(basename "$0") handoff reviewer --note "context critical"
+Policy: admin operates exclusively through these typed verbs. Direct edits
+to protected-roster files (\$BRIDGE_ROSTER_LOCAL_FILE) are intentionally
+blocked because the audit chain depends on the typed-write path. Any
+out-of-band edits will be reverted by the daemon's reconciliation pass on
+next sync — bring changes through 'agent update' / 'config set' instead.
 EOF
 }
 
@@ -622,6 +639,12 @@ bridge_write_role_block() {
   local isolation_mode="${16:-}"
   local os_user="${17:-}"
   local replace_existing="${18:-0}"
+  # Issue #580 Track 2: optional positionals 19/20 used by `agent update`.
+  # Existing callers that pass <19 args MUST continue to produce
+  # byte-identical role-block output, so both default to empty/0 and the
+  # writer below preserves the legacy emission shape when they are unset.
+  local agent_class="${19:-}"
+  local loop_explicit_off="${20:-0}"
 
   bridge_agent_manage_python \
     "$BRIDGE_ROSTER_LOCAL_FILE" \
@@ -642,7 +665,9 @@ bridge_write_role_block() {
     "$always_on" \
     "$isolation_mode" \
     "$os_user" \
-    "$replace_existing" <<'PY'
+    "$replace_existing" \
+    "$agent_class" \
+    "$loop_explicit_off" <<'PY'
 from pathlib import Path
 import shlex
 import sys
@@ -668,6 +693,8 @@ import re
     isolation_mode,
     os_user,
     replace_existing,
+    agent_class,
+    loop_explicit_off,
 ) = sys.argv[1:]
 
 path = Path(path_str)
@@ -708,6 +735,16 @@ if notify_account:
     lines.append(f'BRIDGE_AGENT_NOTIFY_ACCOUNT["{agent}"]={sq(notify_account)}')
 if loop_mode == "1":
     lines.append(f'BRIDGE_AGENT_LOOP["{agent}"]="1"')
+elif loop_explicit_off == "1":
+    # Issue #580 Track 2: `agent update --loop off` opt-in. The legacy
+    # writer only emitted LOOP="1" and silently dropped LOOP="0", which
+    # made `--loop off` a no-op against bridge_agent_loop's default-1
+    # fallback (lib/bridge-agents.sh:6439). Emit the explicit-off line
+    # only when the caller opted in via the new positional, so existing
+    # `agent create` / `reclassify` callers (which pass <19 args or
+    # leave loop_explicit_off empty) keep producing byte-identical role
+    # blocks.
+    lines.append(f'BRIDGE_AGENT_LOOP["{agent}"]="0"')
 if continue_mode == "1":
     lines.append(f'BRIDGE_AGENT_CONTINUE["{agent}"]="1"')
 else:
@@ -721,6 +758,12 @@ if isolation_mode:
     lines.append(f'BRIDGE_AGENT_ISOLATION_MODE["{agent}"]={sq(isolation_mode)}')
 if os_user:
     lines.append(f'BRIDGE_AGENT_OS_USER["{agent}"]={sq(os_user)}')
+if agent_class:
+    # Issue #580 Track 2: agent class is the privilege boundary
+    # (lib/bridge-agents.sh:397-405). Operator-supplied values are
+    # validated against bridge_validate_agent_classes (closed
+    # {user, system}); the writer only sees pre-validated input.
+    lines.append(f'BRIDGE_AGENT_CLASS["{agent}"]={sq(agent_class)}')
 lines.append(end)
 
 block = "\n".join(lines) + "\n"
@@ -2242,6 +2285,24 @@ run_update() {
   local launch_cmd_ops=""
   local channels_ops=""
 
+  # Issue #580 Track 2: typed-flag completion. Each flag tracks
+  # presence + value; presence drives whether the writer overrides the
+  # current roster value. Loop is encoded as a tri-state (unset / "1" /
+  # "0") because the writer needs the explicit-off bit (positional 20)
+  # to actually emit LOOP="0" — see bridge_write_role_block.
+  local desc_present=0
+  local desc_value=""
+  local engine_present=0
+  local engine_value=""
+  local workdir_present=0
+  local workdir_value=""
+  local loop_present=0
+  local loop_value=""        # "1" (on) | "0" (off)
+  local continue_present=0
+  local continue_value=""    # "1" (on) | "0" (off)
+  local class_present=0
+  local class_value=""
+
   add_launch_cmd_op() {
     launch_cmd_ops+="$1"$'\t'"$2"$'\n'
     mutation_present=1
@@ -2361,6 +2422,96 @@ run_update() {
         dry_run=1
         shift
         ;;
+      --desc)
+        # Description flows verbatim into BRIDGE_AGENT_DESC[...] which
+        # is rendered as a single roster line; reject embedded
+        # newlines for the same reason --launch-cmd-add-env does
+        # (managed-role block is line-oriented).
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        case "$2" in
+          *$'\n'*)
+            bridge_die "--desc 값에 줄바꿈이 포함될 수 없습니다."
+            ;;
+        esac
+        desc_present=1
+        desc_value="$2"
+        mutation_present=1
+        shift 2
+        ;;
+      --engine)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        case "$2" in
+          claude|codex) ;;
+          *) bridge_die "--engine 는 claude|codex 만 가능합니다: $2" ;;
+        esac
+        engine_present=1
+        engine_value="$2"
+        mutation_present=1
+        shift 2
+        ;;
+      --workdir)
+        # Empty workdir is ambiguous and would break bridge-run.sh's
+        # `cd "$WORKDIR"` step; refuse it at parse time. We do not
+        # validate existence here because `agent create` also accepts
+        # not-yet-created paths (it scaffolds them); update keeps the
+        # same loose-validation contract.
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        if [[ -z "$2" ]]; then
+          bridge_die "--workdir 값이 비어 있습니다."
+        fi
+        case "$2" in
+          *$'\n'*)
+            bridge_die "--workdir 값에 줄바꿈이 포함될 수 없습니다."
+            ;;
+        esac
+        workdir_present=1
+        workdir_value="$2"
+        mutation_present=1
+        shift 2
+        ;;
+      --loop)
+        # `on|off` only. Production reader (bridge_agent_loop) defaults
+        # to "1", treats anything truthy as "on". `--loop off` opts the
+        # writer into emitting BRIDGE_AGENT_LOOP="0" via positional 20
+        # (loop_explicit_off=1). Time-window seconds are intentionally
+        # out of scope for Track 2 — there is no production reader for
+        # them today.
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        case "$2" in
+          on)  loop_value="1" ;;
+          off) loop_value="0" ;;
+          *)   bridge_die "--loop 는 on|off 만 가능합니다: $2" ;;
+        esac
+        loop_present=1
+        mutation_present=1
+        shift 2
+        ;;
+      --continue)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        case "$2" in
+          on)  continue_value="1" ;;
+          off) continue_value="0" ;;
+          *)   bridge_die "--continue 는 on|off 만 가능합니다: $2" ;;
+        esac
+        continue_present=1
+        mutation_present=1
+        shift 2
+        ;;
+      --class)
+        # Closed value space matches bridge_validate_agent_classes
+        # (lib/bridge-agents.sh:413). Operator-supplied values that
+        # would later trip the load-time validator must be refused at
+        # parse time so a bad write never lands.
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        case "$2" in
+          user|system) ;;
+          *) bridge_die "--class 는 user|system 만 가능합니다: $2" ;;
+        esac
+        class_present=1
+        class_value="$2"
+        mutation_present=1
+        shift 2
+        ;;
       -h|--help)
         usage
         return 0
@@ -2402,6 +2553,21 @@ run_update() {
     {
       printf '%s' "$launch_cmd_ops" | sed 's/\t/=/' | sed 's/^/launch:/'
       printf '%s' "$channels_ops" | sed 's/\t/=/' | sed 's/^/chan:/'
+      # Issue #580 Track 2: surface typed-flag mutations in the audit
+      # operation summary so audit-log readers see the same shape they
+      # do for launch/channel mutations. `if/fi` (rather than `[[ ... ]] &&`)
+      # so the trailing test does not exit-1 the command substitution
+      # subshell under `set -e` when the flag is absent.
+      if [[ $desc_present     -eq 1 ]]; then printf 'desc=set\n'; fi
+      if [[ $engine_present   -eq 1 ]]; then printf 'engine=%s\n' "$engine_value"; fi
+      if [[ $workdir_present  -eq 1 ]]; then printf 'workdir=set\n'; fi
+      if [[ $loop_present     -eq 1 ]]; then
+        if [[ "$loop_value" == "1" ]]; then printf 'loop=on\n'; else printf 'loop=off\n'; fi
+      fi
+      if [[ $continue_present -eq 1 ]]; then
+        if [[ "$continue_value" == "1" ]]; then printf 'continue=on\n'; else printf 'continue=off\n'; fi
+      fi
+      if [[ $class_present    -eq 1 ]]; then printf 'class=%s\n' "$class_value"; fi
     } | tr '\n' ',' | sed 's/,$//'
   )"
 
@@ -2488,31 +2654,56 @@ print(json.dumps(left + right, ensure_ascii=False))
 PY
   )"
 
+  # Issue #580 Track 2: capture before/after values for the typed-flag
+  # set so changed-detection and the audit row reflect the full surface.
+  local before_desc before_engine before_workdir before_loop before_continue before_class
+  before_desc="$(bridge_agent_desc "$agent")"
+  before_engine="$(bridge_agent_engine "$agent")"
+  before_workdir="$(bridge_agent_workdir "$agent")"
+  before_loop="$(bridge_agent_loop "$agent")"
+  before_continue="$(bridge_agent_continue "$agent")"
+  before_class="$(bridge_agent_class "$agent")"
+
+  local new_desc="$before_desc"
+  local new_engine="$before_engine"
+  local new_workdir="$before_workdir"
+  local new_loop="$before_loop"
+  local new_continue="$before_continue"
+  local new_class="$before_class"
+  [[ $desc_present -eq 1 ]]     && new_desc="$desc_value"
+  [[ $engine_present -eq 1 ]]   && new_engine="$engine_value"
+  [[ $workdir_present -eq 1 ]]  && new_workdir="$workdir_value"
+  [[ $loop_present -eq 1 ]]     && new_loop="$loop_value"
+  [[ $continue_present -eq 1 ]] && new_continue="$continue_value"
+  [[ $class_present -eq 1 ]]    && new_class="$class_value"
+
   local changed=0
-  if [[ "$new_launch_cmd" != "$before_launch_cmd" || "$new_channels" != "$before_channels" ]]; then
+  if [[ "$new_launch_cmd" != "$before_launch_cmd" \
+        || "$new_channels" != "$before_channels" \
+        || "$new_desc" != "$before_desc" \
+        || "$new_engine" != "$before_engine" \
+        || "$new_workdir" != "$before_workdir" \
+        || "$new_loop" != "$before_loop" \
+        || "$new_continue" != "$before_continue" \
+        || "$new_class" != "$before_class" ]]; then
     changed=1
   fi
 
   local after_sha=""
   if [[ $changed -eq 1 && $dry_run -eq 0 ]]; then
-    # Reuse the existing managed-role block writer (lines ~571-710).
+    # Reuse the existing managed-role block writer (lines ~606-740).
     # Pass every non-mutated field through unchanged so the rewritten
     # block matches `agent create`'s emission shape byte-for-byte except
-    # for the LAUNCH_CMD / CHANNELS lines we are touching.
-    local description engine session workdir profile_home discord_channel
-    local notify_kind notify_target notify_account loop_mode continue_mode
+    # for the lines we are touching.
+    local session profile_home discord_channel
+    local notify_kind notify_target notify_account
     local idle_timeout always_on isolation_mode os_user
-    description="$(bridge_agent_desc "$agent")"
-    engine="$(bridge_agent_engine "$agent")"
     session="$(bridge_agent_session "$agent")"
-    workdir="$(bridge_agent_workdir "$agent")"
     profile_home="$(bridge_agent_profile_home "$agent")"
     discord_channel="$(bridge_agent_discord_channel_id "$agent")"
     notify_kind="$(bridge_agent_notify_kind "$agent")"
     notify_target="$(bridge_agent_notify_target "$agent")"
     notify_account="$(bridge_agent_notify_account "$agent")"
-    loop_mode="$(bridge_agent_loop "$agent")"
-    continue_mode="$(bridge_agent_continue "$agent")"
     idle_timeout="$(bridge_agent_idle_timeout "$agent")"
     isolation_mode="$(bridge_agent_isolation_mode "$agent")"
     os_user="$(bridge_agent_os_user "$agent")"
@@ -2521,12 +2712,23 @@ PY
     else
       always_on=0
     fi
+    # The explicit-off bit must be set both when this call requested
+    # `--loop off` AND when the current roster already has the
+    # explicit-off line set. Without the latter, a second update on an
+    # already-loop-off agent would lose the LOOP="0" line and silently
+    # flip back to the reader's default-1 behavior on the next load.
+    # Other paths (legacy callers, agent create) keep the byte-identical
+    # emission shape because they never reach this code site.
+    local loop_explicit_off_arg=0
+    if [[ "$new_loop" == "0" ]]; then
+      loop_explicit_off_arg=1
+    fi
     bridge_write_role_block \
       "$agent" \
-      "$description" \
-      "$engine" \
+      "$new_desc" \
+      "$new_engine" \
       "$session" \
-      "$workdir" \
+      "$new_workdir" \
       "$profile_home" \
       "$new_launch_cmd" \
       "$new_channels" \
@@ -2534,12 +2736,14 @@ PY
       "$notify_kind" \
       "$notify_target" \
       "$notify_account" \
-      "$loop_mode" \
-      "$continue_mode" \
+      "$new_loop" \
+      "$new_continue" \
       "$always_on" \
       "$isolation_mode" \
       "$os_user" \
-      "1" >/dev/null
+      "1" \
+      "$new_class" \
+      "$loop_explicit_off_arg" >/dev/null
     after_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
   else
     after_sha="$before_sha"
