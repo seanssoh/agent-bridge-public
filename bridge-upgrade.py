@@ -420,6 +420,16 @@ def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, d
         rel = path.relative_to(template_root)
         if rel.parts and rel.parts[0] == "session-types":
             continue
+        # v0.8.2 (#652): skip the `memory/` subtree. The per-agent memory
+        # wiki is the agent's working data, not template content — it is
+        # created on first agent launch by the agent's own initializer.
+        # For per-UID isolated agents the controller cannot stat into the
+        # 0700-mode `memory/` tree at all (PermissionError on
+        # `target.exists()`), which would otherwise abort the entire
+        # multi-agent migration loop in `cmd_migrate_agents` before any
+        # other agent gets touched.
+        if rel.parts and rel.parts[0] == "memory":
+            continue
         target = agent_dir / rel
         if path.is_dir():
             if not target.exists():
@@ -521,9 +531,30 @@ def cmd_migrate_agents(args: argparse.Namespace) -> int:
     template_root = Path(args.source_root).expanduser() / "agents" / "_template"
     agent_root = Path(args.target_root).expanduser() / "agents"
     admin_agent = (args.admin_agent or "").strip()
-    results = [migrate_agent_home(path, template_root, admin_agent, args.dry_run) for path in discover_agent_dirs(agent_root)]
+    results: list[AgentMigrationResult] = []
+    skipped_isolated: list[dict[str, str]] = []
+    for path in discover_agent_dirs(agent_root):
+        try:
+            results.append(migrate_agent_home(path, template_root, admin_agent, args.dry_run))
+        except PermissionError as exc:
+            # v0.8.2 (#652): per-UID isolated agent home is not stat-able
+            # by the controller. Skip with a structured result instead of
+            # aborting the entire multi-agent loop. The agent's own first
+            # launch under v0.8.0+ rebuilds whatever it needs in its
+            # memory tree; the upgrader's contract for isolated agents is
+            # that the controller never enters per-agent owner-only
+            # subtrees. The `memory/` template-skip above prevents the
+            # common path; this catch is defense-in-depth for any future
+            # template addition that re-introduces a 0700 path.
+            skipped_isolated.append({
+                "agent": path.name,
+                "reason": f"PermissionError: {exc.filename or '<unknown path>'} (per-UID isolated tree)",
+            })
     payload = {
-        "agent_count": len(results),
+        "agent_count": len(results) + len(skipped_isolated),
+        "migrated_count": len(results),
+        "skipped_isolated_count": len(skipped_isolated),
+        "skipped_isolated": skipped_isolated,
         "agents_with_additions": sum(1 for item in results if item.added_files or item.created_dirs or item.updated_files),
         "added_files": sum(len(item.added_files) for item in results),
         "created_dirs": sum(len(item.created_dirs) for item in results),

@@ -6,6 +6,40 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.8.2] — 2026-05-06
+
+### Highlight — emergency hotfix: Linux per-UID isolated upgrade unblocked
+
+`v0.8.2` is an emergency hotfix on top of v0.8.1 (which itself unblocked macOS upgrade earlier the same day). v0.8.0 + v0.8.1 `agent-bridge upgrade --apply` still failed on Linux hosts that contained at least one per-UID isolated agent: the T3 migration tool's `cmd_migrate_agents` walked every agent home as the controller UID and called `Path.exists()` on paths inside the isolated agent's `0700`-mode `memory/` subtree, which the controller cannot stat. The list-comprehension at `bridge-upgrade.py:524` then propagated `PermissionError` and aborted the entire multi-agent migration loop before any other agent could be touched. This wedged the host: T1's hard-cut to v2 means v0.8.0+ refuses to run normally until the migration completes, and the migration could not complete while a single isolated agent existed.
+
+v0.8.2 fixes the migration tool with a two-layer change: (1) `migrate_agent_home` no longer walks the `memory/` subtree of `agents/_template/` — per-agent memory wiki is agent-owned data, not template content, and is created on first agent launch; (2) `cmd_migrate_agents` wraps each `migrate_agent_home` call in a try/except for `PermissionError` and records a structured `skipped_isolated` entry (with `agent` + `reason`) in the JSON output so a single denied agent never aborts the multi-agent loop. The downstream payload retains every field that pre-v0.8.2 consumers parse (`agent_count`, `agents_with_additions`, `added_files`, `created_dirs`, `updated_files`, `agents`); three new fields — `migrated_count`, `skipped_isolated_count`, `skipped_isolated` — are additive.
+
+Operators on Linux hosts who attempted v0.8.0 / v0.8.1 upgrade and got blocked: re-run `agent-bridge upgrade --apply` after pulling v0.8.2. The migration is idempotent. v0.8.2 includes both v0.8.1's macOS `flock` fix and this Linux per-UID fix.
+
+### Fixed
+
+- `bridge-upgrade.py:migrate_agent_home` no longer enumerates the `memory/` subtree of the template tree. The skip happens at the top of the `template_root.rglob("*")` loop, parallel to the existing `session-types` skip. The per-agent memory wiki layout is created by the agent's own initializer on first launch under v0.8.0+; the upgrader's contract for isolated agents is that the controller does not enter per-agent owner-only subtrees. Closes #652.
+- `bridge-upgrade.py:cmd_migrate_agents` catches `PermissionError` per-agent and records `{"agent": "<name>", "reason": "PermissionError: <path> (per-UID isolated tree)"}` in a new `skipped_isolated` JSON field. Defense in depth — covers any future template addition that re-introduces a 0700 path under an isolated agent's home.
+
+### Added
+
+- New JSON fields on `bridge-upgrade.py migrate-agents` output: `migrated_count` (number of agents whose homes were touched), `skipped_isolated_count` (number of agents the controller could not stat), `skipped_isolated` (list of `{agent, reason}` entries for operator visibility). All existing fields are unchanged.
+- `scripts/smoke/upgrade-isolated-agent-migrate.sh` — regression smoke covering: T1 normal agent migration with `memory/` skipped from the template walk; T2 0000-mode agent home reported as `skipped_isolated` with no abort; T3 mixed run keeps the normal agent's migration intact while recording the locked one. Uses chmod-only on macOS + Linux; the controller-side `Path.exists()` failure path is identical with or without cross-UID, so chmod-only is sufficient regression coverage.
+- `scripts/smoke-test.sh` and `scripts/ci-select-smoke.sh` — wire the new smoke into the required suite + the `bridge-upgrade.py|bridge-upgrade.sh|VERSION` trigger row.
+
+### Operator notes
+
+- Linux hosts that hit the v0.8.0 / v0.8.1 `PermissionError: [Errno 13] ... agents/<a>/memory/.gitkeep` block: re-run `agent-bridge upgrade --apply` after pulling v0.8.2. No manual filesystem cleanup required — the new code never enters `memory/` and the second-layer try/except absorbs any residual unreachable subtree.
+- Per-agent `memory/` tree was never meant to be controller-managed in v2; v0.8.2 codifies that. If your operator workflow depended on the upgrader populating `memory/.gitkeep` under an agent home, that responsibility moves to the agent's first-launch initializer (which already creates the wiki layout for new agents).
+- `skipped_isolated_count > 0` in the migration JSON is informational, not a failure. An entry there means the upgrader observed an isolated agent home that the controller cannot stat into; the agent's own next launch will rebuild whatever it needs.
+
+### Verified
+
+- `python3 -m py_compile bridge-upgrade.py` clean.
+- `bash -n scripts/smoke/upgrade-isolated-agent-migrate.sh` clean; `shellcheck` clean.
+- New smoke 3/3 PASS on macOS (chmod-only simulation): normal-agent migrated; 0000-mode locked-agent reported as `skipped_isolated`; mixed run keeps both behaviors.
+- No code changes outside `bridge-upgrade.py:migrate_agent_home`, `bridge-upgrade.py:cmd_migrate_agents`, the new smoke, the smoke-test wiring, `VERSION`, and this CHANGELOG entry.
+
 ## [0.8.1] — 2026-05-06
 
 ### Highlight — emergency hotfix: macOS upgrade unblocked
