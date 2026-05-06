@@ -4,12 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
+import pwd
 import shlex
 import shutil
+import signal
+import stat
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +111,10 @@ COMMON_BIN_DIRS = [
     Path("/opt/homebrew/bin"),
     Path("/usr/local/bin"),
 ]
+SHELL_RESULT_STATUS_VALUES = {"success", "error"}
+SHELL_PAYLOAD_ENV_PREFIXES = ("POLL_", "SCRIPT_")
+SHELL_PROTECTED_ENV_EXACT = {"HOME", "PATH"}
+SHELL_PROTECTED_ENV_PREFIXES = ("BRIDGE_", "CRON_")
 
 
 def now_iso() -> str:
@@ -130,7 +139,7 @@ def rel_for_output(path_value: str) -> str:
     return str(path)
 
 
-def read_json(path: Path) -> dict[str, Any]:
+def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
@@ -142,6 +151,437 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 def write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+
+
+def run_dir_id(run_dir: Path) -> str:
+    return run_dir.name
+
+
+def mode_has_group_or_other_write(path: Path) -> bool:
+    try:
+        mode = path.stat().st_mode
+    except OSError:
+        return True
+    return bool(mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
+def path_acl_has_write_exposure(path: Path, *, include_default: bool = True) -> bool:
+    getfacl = shutil.which("getfacl")
+    if not getfacl:
+        return False
+    try:
+        completed = subprocess.run(
+            [getfacl, "-cp", str(path)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return False
+    if completed.returncode != 0:
+        return False
+    for raw_line in completed.stdout.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split(":")
+        is_default = fields[0] == "default"
+        if is_default and not include_default:
+            continue
+        if is_default:
+            fields = fields[1:]
+        if len(fields) < 3:
+            continue
+        tag, qualifier, perms = fields[0], fields[1], fields[2]
+        effective = perms
+        if "#effective:" in line:
+            effective = line.rsplit("#effective:", 1)[1].strip()
+        if tag == "user" and qualifier == "":
+            continue
+        if tag in {"user", "group", "mask", "other"} and "w" in effective:
+            if tag == "mask":
+                continue
+            return True
+    return False
+
+
+def validate_shell_request_artifacts(request_file: Path) -> tuple[bool, str | None]:
+    run_dir = request_file.parent
+    controller_uid = os.getuid()
+    for path in (run_dir, request_file):
+        try:
+            st = path.stat()
+        except OSError as exc:
+            return False, f"request_artifact_tampered: stat failed for {path}: {exc}"
+        if st.st_uid != controller_uid:
+            return False, f"request_artifact_tampered: owner uid mismatch for {path}"
+        if mode_has_group_or_other_write(path):
+            return False, f"request_artifact_tampered: group/other writable mode on {path}"
+        if path_acl_has_write_exposure(path, include_default=path.is_dir()):
+            return False, f"request_artifact_tampered: ACL write exposure on {path}"
+    return True, None
+
+
+def shell_artifact_route(request_file: Path) -> tuple[str, str | None]:
+    """Classify request artifacts before reading untrusted request JSON.
+
+    Shell jobs are dispatched with controller-private artifacts
+    (run_dir=0700, request.json=0600, no named/default ACL write exposure).
+    Group/other writable artifacts are treated as tampered before JSON parse.
+    Named/default ACL write exposure disqualifies the shell convention but is
+    only terminal once the parsed request actually declares a shell payload,
+    preserving legacy text runs that intentionally carry per-run ACL grants.
+    """
+    run_dir = request_file.parent
+    controller_uid = os.getuid()
+    states: list[tuple[Path, os.stat_result]] = []
+    for path in (run_dir, request_file):
+        try:
+            states.append((path, path.stat()))
+        except OSError as exc:
+            return "tampered", f"request_artifact_tampered: stat failed for {path}: {exc}"
+    acl_write_exposed = False
+    for path, st in states:
+        if st.st_uid != controller_uid:
+            return "tampered", f"request_artifact_tampered: owner uid mismatch for {path}"
+        if mode_has_group_or_other_write(path):
+            return "tampered", f"request_artifact_tampered: group/other writable mode on {path}"
+        if path_acl_has_write_exposure(path, include_default=path.is_dir()):
+            acl_write_exposed = True
+
+    run_mode = stat.S_IMODE(states[0][1].st_mode)
+    request_mode = stat.S_IMODE(states[1][1].st_mode)
+    if run_mode == 0o700 and request_mode == 0o600 and not acl_write_exposed:
+        return "shell", None
+    return "text", None
+
+
+def truncate_output(data: bytes, cap: int) -> tuple[str, bool]:
+    if len(data) <= cap:
+        return data.decode("utf-8", errors="replace"), False
+    truncated = data[:cap].decode("utf-8", errors="replace")
+    return truncated + f"\n[agent-bridge] output truncated at {cap} bytes\n", True
+
+
+class ShellStreamCollector:
+    """Stream a child process pipe to a file with a hard byte cap.
+
+    Streams bytes from `source` to `dest_path`, accumulates a byte counter,
+    and stops writing once `cap_bytes` is exceeded. When the cap trips,
+    `on_cap_exceeded` is invoked (best-effort, once) so the caller can kill
+    the child's process group. The remainder of the pipe is drained but
+    discarded so the child does not block on a full pipe buffer.
+
+    Drives finding 2 of PR #625 r2 review: replaces the unbounded
+    `process.communicate()` collector that allowed a noisy script to OOM
+    the controller before the cap fired.
+    """
+
+    _CHUNK = 65536
+
+    def __init__(
+        self,
+        source: Any,
+        dest_path: Path,
+        cap_bytes: int,
+        on_cap_exceeded: Any,
+        label: str,
+    ) -> None:
+        self._source = source
+        self._dest_path = dest_path
+        self._cap_bytes = cap_bytes
+        self._on_cap_exceeded = on_cap_exceeded
+        self._label = label
+        self.bytes_written = 0
+        self.truncated = False
+        self._notified = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"shell-{label}-collector",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._dest_path.parent.mkdir(parents=True, exist_ok=True)
+        self._thread.start()
+
+    def join(self, timeout: float | None = None) -> None:
+        self._thread.join(timeout=timeout)
+
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def _notify_once(self) -> None:
+        if self._notified:
+            return
+        self._notified = True
+        try:
+            self._on_cap_exceeded(self._label)
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
+
+    def _run(self) -> None:
+        # Use `read1` so each iteration returns whatever bytes are
+        # currently available on the pipe rather than blocking until
+        # the buffer fills (`read(_CHUNK)` waits for either _CHUNK
+        # bytes OR EOF). With `read`, a child that prints a small
+        # burst then sleeps holds the cap-trip back until the child
+        # eventually closes stdout — which is exactly the
+        # SIGTERM-ignoring child case in finding 2 of PR #625 r2
+        # review. `read1` lets the cap fire as soon as the first
+        # over-cap chunk arrives.
+        reader = getattr(self._source, "read1", None)
+        if reader is None:
+            reader = self._source.read
+        try:
+            with self._dest_path.open("wb") as fh:
+                while True:
+                    chunk = reader(self._CHUNK)
+                    if not chunk:
+                        return
+                    if self.truncated:
+                        # Drain remaining bytes so the child never blocks
+                        # on a full pipe; do not write them to disk.
+                        continue
+                    remaining = self._cap_bytes - self.bytes_written
+                    if remaining <= 0:
+                        # Defensive — should have been caught last iter.
+                        self.truncated = True
+                        self._notify_once()
+                        continue
+                    if len(chunk) > remaining:
+                        fh.write(chunk[:remaining])
+                        self.bytes_written += remaining
+                        self.truncated = True
+                        self._notify_once()
+                        continue
+                    fh.write(chunk)
+                    self.bytes_written += len(chunk)
+        except Exception:  # noqa: BLE001 — best-effort streaming
+            return
+        finally:
+            try:
+                self._source.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def append_truncation_marker(self) -> None:
+        if not self.truncated:
+            return
+        try:
+            with self._dest_path.open("ab") as fh:
+                marker = (
+                    f"\n[agent-bridge] output truncated at {self._cap_bytes} bytes\n"
+                ).encode("utf-8")
+                fh.write(marker)
+        except OSError:
+            pass
+
+
+def cron_state_dir_from_env(run_dir: Path) -> Path:
+    value = os.environ.get("BRIDGE_CRON_STATE_DIR")
+    if value:
+        return Path(value).expanduser().resolve()
+    return run_dir.parent.parent
+
+
+def shell_payload_env(payload: dict[str, Any]) -> dict[str, str]:
+    env = payload.get("env") or {}
+    if not isinstance(env, dict):
+        raise ValueError("payload.env must be an object")
+    clean: dict[str, str] = {}
+    for raw_key, raw_value in env.items():
+        key = str(raw_key)
+        if key in SHELL_PROTECTED_ENV_EXACT or key.startswith(SHELL_PROTECTED_ENV_PREFIXES):
+            raise ValueError(f"protected env var cannot be set by shell cron payload: {key}")
+        if not key.startswith(SHELL_PAYLOAD_ENV_PREFIXES):
+            raise ValueError(f"shell cron env var must start with POLL_ or SCRIPT_: {key}")
+        clean[key] = str(raw_value)
+    return clean
+
+
+def shell_command_for_execution(execution: dict[str, Any], env: dict[str, str], script: str, args: list[str]) -> list[str]:
+    os_user = str(execution.get("os_user") or "")
+    uid = int(execution.get("uid"))
+    gid = int(execution.get("gid"))
+    env_parts = [f"{key}={value}" for key, value in sorted(env.items())]
+    current_uid = os.geteuid()
+    try:
+        current_name = pwd.getpwuid(current_uid).pw_name
+    except KeyError:
+        current_name = ""
+    if current_uid == uid and (not os_user or os_user == current_name):
+        return ["env", "-i", *env_parts, script, *args]
+    sudo = shutil.which("sudo")
+    if sudo and os_user:
+        return [sudo, "-n", "-H", "-u", os_user, "env", "-i", *env_parts, script, *args]
+    setpriv = shutil.which("setpriv")
+    if setpriv:
+        return [setpriv, "--reuid", str(uid), "--regid", str(gid), "--init-groups", "env", "-i", *env_parts, script, *args]
+    raise RuntimeError("no supported UID drop helper found (sudo or setpriv)")
+
+
+def redact_shell_command(command: list[str]) -> list[str]:
+    redacted: list[str] = []
+    for part in command:
+        if "=" in part and not part.startswith(("/", "./")):
+            key = part.split("=", 1)[0]
+            if key and all(ch.isalnum() or ch == "_" for ch in key):
+                redacted.append(f"{key}=<redacted>")
+                continue
+        redacted.append(part)
+    return redacted
+
+
+def write_shell_status(
+    status_file: Path,
+    *,
+    run_id: str,
+    state: str,
+    request_file: Path,
+    result_file: Path,
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    duration_ms: int | None = None,
+    exit_code: int | None = None,
+    runner_error: str | None = None,
+) -> None:
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "state": state,
+        "engine": "shell",
+        "updated_at": now_iso(),
+        "request_file": str(request_file),
+        "result_file": str(result_file),
+        "delivery_intent": "silent",
+        "reporting_decision": "silent",
+    }
+    if started_at:
+        payload["started_at"] = started_at
+    if completed_at:
+        payload["completed_at"] = completed_at
+    if duration_ms is not None:
+        payload["duration_ms"] = duration_ms
+    if exit_code is not None:
+        payload["exit_code"] = exit_code
+    if runner_error:
+        payload["runner_error"] = runner_error
+        payload["error"] = runner_error
+    write_json(status_file, payload)
+
+
+def write_shell_result(
+    result_file: Path,
+    *,
+    run_id: str,
+    status: str,
+    summary: str,
+    request_file: Path,
+    stdout_log: Path,
+    stderr_log: Path,
+    started_at: str | None = None,
+    completed_at: str | None = None,
+    duration_ms: int | None = None,
+    exit_code: int | None = None,
+    runner_error: str | None = None,
+    command: list[str] | None = None,
+    stdout_truncated: bool = False,
+    stderr_truncated: bool = False,
+) -> None:
+    if status not in SHELL_RESULT_STATUS_VALUES:
+        status = "error"
+    payload: dict[str, Any] = {
+        "run_id": run_id,
+        "engine": "shell",
+        "status": status,
+        "summary": summary,
+        "findings": [],
+        "actions_taken": [],
+        "needs_human_followup": False,
+        "recommended_next_steps": [],
+        "artifacts": [str(stdout_log), str(stderr_log)],
+        "confidence": "high" if status == "success" else "medium",
+        "delivery_intent": "silent",
+        "reporting_decision": "silent",
+        "request_file": str(request_file),
+        "stdout_log": str(stdout_log),
+        "stderr_log": str(stderr_log),
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+    }
+    if started_at:
+        payload["started_at"] = started_at
+    if completed_at:
+        payload["completed_at"] = completed_at
+    if duration_ms is not None:
+        payload["duration_ms"] = duration_ms
+    if exit_code is not None:
+        payload["child_exit_code"] = exit_code
+    if runner_error:
+        payload["runner_error"] = runner_error
+    if command:
+        safe_command = redact_shell_command(command)
+        payload["command"] = safe_command
+        payload["command_pretty"] = " ".join(shlex.quote(part) for part in safe_command)
+    write_json(result_file, payload)
+
+
+def is_shell_request_payload(request: dict[str, Any]) -> bool:
+    request_payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
+    return request.get("payload_kind") == "shell" or request_payload.get("kind") == "shell"
+
+
+def write_shell_terminal_error(
+    request_file: Path,
+    *,
+    runner_error: str,
+    summary: str | None = None,
+    run_id: str | None = None,
+    started_at: str | None = None,
+    audit_target_agent: str = "daemon",
+) -> None:
+    run_dir = request_file.parent
+    resolved_run_id = run_id or run_dir_id(run_dir)
+    result_file = (run_dir / "result.json").resolve()
+    status_file = (run_dir / "status.json").resolve()
+    stdout_log = (run_dir / "stdout.log").resolve()
+    stderr_log = (run_dir / "stderr.log").resolve()
+    completed_at = now_iso()
+    write_text(stdout_log, "")
+    write_text(stderr_log, (summary or runner_error) + "\n")
+    write_shell_result(
+        result_file,
+        run_id=resolved_run_id,
+        status="error",
+        summary=summary or runner_error,
+        request_file=request_file,
+        stdout_log=stdout_log,
+        stderr_log=stderr_log,
+        started_at=started_at,
+        completed_at=completed_at,
+        exit_code=1,
+        runner_error=runner_error,
+    )
+    write_shell_status(
+        status_file,
+        run_id=resolved_run_id,
+        state="error",
+        request_file=request_file,
+        result_file=result_file,
+        started_at=started_at,
+        completed_at=completed_at,
+        exit_code=1,
+        runner_error=runner_error,
+    )
+    emit_audit_row(
+        action="cron_shell_runner_error",
+        actor="cron-runner",
+        target_agent=audit_target_agent or "daemon",
+        run_id=resolved_run_id,
+        details={"runner_error": runner_error},
+    )
 
 
 def normalize_result(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1260,13 +1700,570 @@ def write_status(
     write_json(status_file, payload)
 
 
+def _validate_shell_script(script_path: Path, run_uid: int) -> None:
+    """Re-runnable script validation. Used both pre- and post-flock.
+
+    Drives finding 1 of PR #625 r2 review: the same checks fire while the
+    flock is held immediately before exec, so an attacker swapping the
+    script after enqueue but before exec is caught.
+    """
+    if not script_path.is_file() or not os.access(script_path, os.X_OK):
+        raise RuntimeError(f"not regular/executable file: {script_path}")
+    script_stat = script_path.stat()
+    if script_stat.st_uid not in {os.getuid(), run_uid}:
+        raise RuntimeError(
+            f"shell script owner must be controller uid or run-as uid: {script_path}"
+        )
+    if script_stat.st_mode & 0o022:
+        raise RuntimeError(
+            f"shell script must not be group/other writable: {script_path}"
+        )
+
+
+def _extract_shell_lock_key(request_file: Path) -> tuple[str, str, str | None]:
+    """Minimal parse to derive the per-job lock key + run_id.
+
+    Reads ONLY enough of the request body to know which lock to take —
+    no artifact-trust validation, no script validation, no env build.
+    The full re-parse + validation runs under the flock in
+    `cmd_run_shell`. This keeps the lock-acquired-before-validation
+    invariant intact (finding 1 of PR #625 r2 review).
+
+    Returns (lock_key, run_id, error). `error` is None on success.
+    """
+    fallback_run_id = run_dir_id(request_file.parent)
+    try:
+        data = json.loads(request_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        return "", fallback_run_id, f"request_artifact_corrupted: {type(exc).__name__}: {exc}"
+    if not isinstance(data, dict):
+        return "", fallback_run_id, "request_artifact_corrupted: non_dict_top_level"
+    run_id = str(data.get("run_id") or fallback_run_id)
+    lock_key = str(data.get("job_id") or run_id)
+    return lock_key, run_id, None
+
+
+def cmd_run_shell(request_file: Path, args: argparse.Namespace) -> int:
+    run_dir = request_file.parent
+    result_file = (run_dir / "result.json").resolve()
+    status_file = (run_dir / "status.json").resolve()
+    stdout_log = (run_dir / "stdout.log").resolve()
+    stderr_log = (run_dir / "stderr.log").resolve()
+
+    # Minimal pre-lock parse — lock key + run_id only. The full body
+    # is re-read under the flock below for validation + exec, so this
+    # parse intentionally inspects nothing else.
+    lock_key, run_id, lock_key_error = _extract_shell_lock_key(request_file)
+    if lock_key_error is not None:
+        # Match the existing terminal-error contract: status.runner_error
+        # carries the full classifier string (e.g. "request_artifact_corrupted:
+        # non_dict_top_level") so smoke assertions can grep for both halves.
+        write_shell_terminal_error(
+            request_file,
+            runner_error=lock_key_error,
+            summary=lock_key_error,
+            run_id=run_id,
+        )
+        print("status: error")
+        print(f"run_id: {run_id}")
+        print("engine: shell")
+        # Header line uses the short prefix so operators see a stable token.
+        print(f"runner_error: {lock_key_error.split(':', 1)[0]}")
+        return 1
+
+    if args.dry_run:
+        print("status: dry_run")
+        print(f"run_id: {run_id}")
+        print("engine: shell")
+        print(f"request_file: {rel_for_output(str(request_file))}")
+        print(f"result_file: {rel_for_output(str(result_file))}")
+        print(f"status_file: {rel_for_output(str(status_file))}")
+        return 0
+
+    # Derive the per-job lock path from the minimal pre-parse so we
+    # can hold the flock across the full re-parse + artifact/script
+    # validation + exec (finding 1 of PR #625 r2 review — body must
+    # not be parsed/validated outside the flock).
+    try:
+        lock_dir = cron_state_dir_from_env(run_dir) / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = lock_dir / f"{lock_key}.lock"
+    except Exception as exc:  # noqa: BLE001
+        error_message = f"lock_path_unavailable: {exc}"
+        write_shell_terminal_error(
+            request_file,
+            runner_error=error_message,
+            summary=error_message,
+            run_id=run_id,
+        )
+        print("status: error")
+        print(f"run_id: {run_id}")
+        print("engine: shell")
+        print(f"runner_error: {error_message}")
+        return 1
+
+    with lock_file.open("w", encoding="utf-8") as lock_handle:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            completed_at = now_iso()
+            write_text(stdout_log, "")
+            write_text(stderr_log, "lock_held\n")
+            write_shell_result(
+                result_file,
+                run_id=run_id,
+                status="success",
+                summary="lock_held",
+                request_file=request_file,
+                stdout_log=stdout_log,
+                stderr_log=stderr_log,
+                completed_at=completed_at,
+                exit_code=0,
+                runner_error="lock_held",
+            )
+            write_shell_status(
+                status_file,
+                run_id=run_id,
+                state="success",
+                request_file=request_file,
+                result_file=result_file,
+                completed_at=completed_at,
+                exit_code=0,
+                runner_error="lock_held",
+            )
+            print("status: success")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print("summary: lock_held")
+            return 0
+
+        # Re-read the request body from disk UNDER the flock (finding 1
+        # of PR #625 r2 review). The pre-lock minimal parse only
+        # extracted the lock key; the full parse + artifact-trust +
+        # script validation must all run while we hold the per-job
+        # flock so an attacker cannot swap the body or script between
+        # validate and exec.
+        try:
+            request: dict[str, Any] = read_json(request_file)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            error_message = f"request_artifact_corrupted: {type(exc).__name__}"
+            write_shell_terminal_error(
+                request_file,
+                runner_error=error_message,
+                summary=f"{error_message}: {exc}",
+                run_id=run_id,
+            )
+            print("status: error")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print(f"runner_error: {error_message}")
+            return 1
+        if not isinstance(request, dict):
+            error_message = "request_artifact_corrupted: non_dict_top_level"
+            write_shell_terminal_error(
+                request_file,
+                runner_error=error_message,
+                summary=error_message,
+                run_id=run_id,
+            )
+            print("status: error")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print(f"runner_error: {error_message}")
+            return 1
+        if not is_shell_request_payload(request):
+            error_message = "request_artifact_tampered: payload_kind no longer shell after lock"
+            write_shell_terminal_error(
+                request_file,
+                runner_error="request_artifact_tampered",
+                summary=error_message,
+                run_id=run_id,
+                audit_target_agent=str(request.get("target_agent") or "daemon"),
+            )
+            print("status: error")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print("runner_error: request_artifact_tampered")
+            return 1
+
+        # Confirm the post-lock job_id matches the lock we acquired.
+        # If an attacker swapped the body's job_id between the pre-lock
+        # minimal parse and the post-lock re-read, we'd otherwise be
+        # holding the wrong lock — a different runner could legitimately
+        # be holding the now-correct lock and exec'ing the same job
+        # body in parallel. Treat the mismatch as tampering.
+        post_lock_run_id = str(request.get("run_id") or run_dir_id(run_dir))
+        post_lock_lock_key = str(request.get("job_id") or post_lock_run_id)
+        if post_lock_lock_key != lock_key:
+            error_message = (
+                "request_artifact_tampered: job_id changed between pre-lock parse and lock acquisition"
+            )
+            write_shell_terminal_error(
+                request_file,
+                runner_error="request_artifact_tampered",
+                summary=error_message,
+                run_id=run_id,
+                audit_target_agent=str(request.get("target_agent") or "daemon"),
+            )
+            print("status: error")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print("runner_error: request_artifact_tampered")
+            return 1
+
+        # `audit_target_agent` is derived from the freshly re-read
+        # body so audit attribution always reflects what is on disk
+        # under the lock — never the stale pre-lock dict.
+        audit_target_agent = str(request.get("target_agent") or "daemon")
+
+        # Validate request artifacts UNDER the flock so a swap between
+        # validation and exec must contend with the same lock.
+        trusted, trust_error = validate_shell_request_artifacts(request_file)
+        if not trusted:
+            error_message = trust_error or "request_artifact_tampered"
+            write_shell_terminal_error(
+                request_file,
+                runner_error="request_artifact_tampered",
+                summary=error_message,
+                run_id=run_id,
+                audit_target_agent=audit_target_agent,
+            )
+            print("status: error")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print("runner_error: request_artifact_tampered")
+            return 1
+
+        try:
+            payload = request.get("payload") or {}
+            if not isinstance(payload, dict):
+                raise RuntimeError("shell request payload must be an object")
+            execution = request.get("execution") or {}
+            if not isinstance(execution, dict):
+                raise RuntimeError("shell request execution block must be an object")
+            script = str(payload.get("script") or "")
+            if not script:
+                raise RuntimeError("shell request missing payload.script")
+            script_path = Path(script).expanduser().resolve()
+            run_uid = int(execution.get("uid"))
+            _validate_shell_script(script_path, run_uid)
+            script_args = payload.get("args") or []
+            if not isinstance(script_args, list):
+                raise RuntimeError("payload.args must be an array")
+            argv = [str(item) for item in script_args]
+            timeout_seconds = int(payload.get("timeoutSeconds") or 900)
+            output_cap_bytes = int(payload.get("outputCapBytes") or 65536)
+            if timeout_seconds <= 0:
+                raise RuntimeError("payload.timeoutSeconds must be positive")
+            if output_cap_bytes <= 0:
+                raise RuntimeError("payload.outputCapBytes must be positive")
+
+            env_snapshot = execution.get("env_snapshot") or {}
+            if not isinstance(env_snapshot, dict):
+                raise RuntimeError("execution.env_snapshot must be an object")
+            child_env = {str(key): str(value) for key, value in env_snapshot.items()}
+            child_env.update(shell_payload_env(payload))
+            child_env["HOME"] = str(execution.get("home") or child_env.get("HOME") or str(Path.home()))
+            child_env["CRON_RUN_ID"] = run_id
+            child_env["CRON_JOB_ID"] = str(request.get("job_id") or "")
+            child_env["CRON_JOB_NAME"] = str(request.get("job_name") or "")
+            child_env["CRON_SLOT"] = str(request.get("slot") or "")
+            child_env["CRON_REQUEST_FILE"] = str(request_file)
+            child_env["CRON_RUN_DIR"] = str(run_dir)
+
+            command = shell_command_for_execution(execution, child_env, str(script_path), argv)
+
+            # Re-run the script owner/mode probe immediately before exec.
+            # We are still inside the flock; the controller-private lock
+            # serializes parallel runs, and re-validation here closes the
+            # window that previously sat between argv construction and
+            # subprocess.Popen (finding 1 of PR #625 r2 review).
+            _validate_shell_script(script_path, run_uid)
+        except Exception as exc:  # noqa: BLE001
+            error_message = f"script_validation_failed: {exc}"
+            write_shell_terminal_error(
+                request_file,
+                runner_error=error_message,
+                summary=error_message,
+                run_id=run_id,
+                audit_target_agent=audit_target_agent,
+            )
+            print("status: error")
+            print(f"run_id: {run_id}")
+            print("engine: shell")
+            print(f"runner_error: {error_message}")
+            return 1
+
+        started_at = now_iso()
+        start_monotonic = time.monotonic()
+        write_shell_status(
+            status_file,
+            run_id=run_id,
+            state="running",
+            request_file=request_file,
+            result_file=result_file,
+            started_at=started_at,
+        )
+
+        process = subprocess.Popen(
+            command,
+            cwd=str(run_dir),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        # Capture the process group id at spawn-time. Looking it up
+        # later via `os.getpgid(process.pid)` fails on some platforms
+        # once the immediate Popen child has been reaped — but the
+        # pgid keeps living as long as descendants remain (e.g. a
+        # SIGTERM-ignoring Python grandchild). We need the pgid to
+        # SIGKILL those descendants in `escalate_after_grace`.
+        try:
+            process_pgid = os.getpgid(process.pid)
+        except OSError:
+            process_pgid = process.pid
+        timed_out = False
+        cap_exceeded = False
+        kill_lock = threading.Lock()
+        kill_state = {"sigterm_sent": False, "sigkill_sent": False}
+        # cap_event interlocks the cap-collector threads with the main
+        # waiter so a cap-trip starts the SIGKILL grace immediately
+        # (finding 2 of PR #625 r2 review). Pre-r3 the main thread sat
+        # in `process.wait(timeout=timeout_seconds)`, so a TERM-ignoring
+        # child kept running until the full cron timeout, then another
+        # 5s grace — instead of cap-fire + 5s.
+        cap_event = threading.Event()
+
+        def killpg_signal(sig: int) -> None:
+            try:
+                os.killpg(process_pgid, sig)
+            except OSError:
+                pass
+
+        def trigger_kill(reason: str) -> None:
+            # `reason` is informational ("stdout"/"stderr"/"timeout") so a
+            # future log can attribute the SIGTERM. Today we only need
+            # to ensure SIGTERM fires once per kill request.
+            del reason
+            with kill_lock:
+                if kill_state["sigterm_sent"]:
+                    return
+                kill_state["sigterm_sent"] = True
+            killpg_signal(signal.SIGTERM)
+
+        def on_cap_exceeded(label: str) -> None:
+            nonlocal cap_exceeded
+            cap_exceeded = True
+            cap_event.set()
+            trigger_kill(label)
+
+        stdout_collector = ShellStreamCollector(
+            process.stdout,
+            stdout_log,
+            output_cap_bytes,
+            on_cap_exceeded,
+            "stdout",
+        )
+        stderr_collector = ShellStreamCollector(
+            process.stderr,
+            stderr_log,
+            output_cap_bytes,
+            on_cap_exceeded,
+            "stderr",
+        )
+        stdout_collector.start()
+        stderr_collector.start()
+
+        # Single waiter loop — wake on cap_event, process exit, or the
+        # cron timeout deadline (finding 2 of PR #625 r2 review).
+        # Reuses kill_lock from r2 so SIGTERM/SIGKILL escalation
+        # remains serialized.
+        timeout_deadline = start_monotonic + float(timeout_seconds)
+
+        def escalate_after_grace(grace_seconds: float = 5.0) -> None:
+            # SIGTERM has already been issued via trigger_kill().
+            # Wait up to `grace_seconds` for the immediate child to
+            # exit, then SIGKILL the entire process group so any
+            # descendants that ignored SIGTERM (or were spawned in
+            # `start_new_session=True` and outlived the bash parent)
+            # are also reaped. Without the pgid SIGKILL, a Python
+            # child that traps SIGTERM survives the grace because
+            # `process.poll()` only reflects the immediate Popen
+            # child (typically bash) — descendants in the same
+            # pgid stay alive holding stdout open.
+            grace_deadline = time.monotonic() + grace_seconds
+            while time.monotonic() < grace_deadline:
+                if process.poll() is not None:
+                    break
+                time.sleep(0.1)
+            with kill_lock:
+                kill_state["sigkill_sent"] = True
+            killpg_signal(signal.SIGKILL)
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+
+        while True:
+            if process.poll() is not None:
+                break
+            if cap_event.is_set():
+                # Cap tripped — SIGTERM was already issued by
+                # on_cap_exceeded → trigger_kill. Start the SIGKILL
+                # grace from cap-fire, not from cron timeout.
+                escalate_after_grace(5.0)
+                break
+            now = time.monotonic()
+            if now >= timeout_deadline:
+                timed_out = True
+                trigger_kill("timeout")
+                escalate_after_grace(5.0)
+                break
+            # Sleep at most ~0.5s OR until cap_event fires OR until
+            # the timeout deadline, whichever comes first.
+            wait_slice = min(0.5, max(0.0, timeout_deadline - now))
+            cap_event.wait(timeout=wait_slice)
+
+        # Drain the collector threads so logs are fully flushed before we
+        # write result/status. The child has exited (or been SIGKILLed),
+        # so EOF on the pipes is imminent; bound the wait defensively.
+        stdout_collector.join(timeout=10)
+        stderr_collector.join(timeout=10)
+
+        stdout_truncated = stdout_collector.truncated
+        stderr_truncated = stderr_collector.truncated
+        stdout_collector.append_truncation_marker()
+        stderr_collector.append_truncation_marker()
+        if stdout_truncated or stderr_truncated:
+            try:
+                with stderr_log.open("ab") as fh:
+                    fh.write(b"[agent-bridge] one or more streams were truncated\n")
+            except OSError:
+                pass
+
+        completed_at = now_iso()
+        duration_ms = int((time.monotonic() - start_monotonic) * 1000)
+
+        if cap_exceeded:
+            final_state = "error"
+            result_status = "error"
+            error_message = f"output_cap_exceeded: cap={output_cap_bytes} bytes"
+            exit_code = int(process.returncode) if process.returncode is not None else -1
+            runner_error_field = "output_cap_exceeded"
+            summary_text = error_message
+        elif timed_out:
+            final_state = "timed_out"
+            result_status = "error"
+            error_message = f"timed out after {timeout_seconds}s"
+            exit_code = 124
+            runner_error_field = error_message
+            summary_text = error_message
+        else:
+            exit_code = int(process.returncode) if process.returncode is not None else -1
+            if exit_code == 0:
+                final_state = "success"
+                result_status = "success"
+                error_message = None
+                runner_error_field = None
+                summary_text = "shell cron completed"
+            else:
+                final_state = "error"
+                result_status = "error"
+                error_message = f"script exited {exit_code}"
+                runner_error_field = error_message
+                summary_text = error_message
+
+        write_shell_result(
+            result_file,
+            run_id=run_id,
+            status=result_status,
+            summary=summary_text,
+            request_file=request_file,
+            stdout_log=stdout_log,
+            stderr_log=stderr_log,
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_ms=duration_ms,
+            exit_code=exit_code,
+            runner_error=runner_error_field,
+            command=command,
+            stdout_truncated=stdout_truncated,
+            stderr_truncated=stderr_truncated,
+        )
+        write_shell_status(
+            status_file,
+            run_id=run_id,
+            state=final_state,
+            request_file=request_file,
+            result_file=result_file,
+            started_at=started_at,
+            completed_at=completed_at,
+            duration_ms=duration_ms,
+            exit_code=exit_code,
+            runner_error=runner_error_field,
+        )
+
+    print(f"status: {final_state}")
+    print(f"run_id: {run_id}")
+    print("engine: shell")
+    print(f"result_file: {rel_for_output(str(result_file))}")
+    print(f"status_file: {rel_for_output(str(status_file))}")
+    if error_message:
+        print(f"runner_error: {error_message}")
+    return 0 if final_state == "success" else 1
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     request_file = Path(args.request_file).expanduser().resolve()
     if not request_file.is_file():
         print(f"error: request file not found: {request_file}", file=sys.stderr)
         return 2
 
+    route, route_error = shell_artifact_route(request_file)
+    if route == "tampered":
+        error_message = route_error or "request_artifact_tampered"
+        write_shell_terminal_error(
+            request_file,
+            runner_error="request_artifact_tampered",
+            summary=error_message,
+            run_id=run_dir_id(request_file.parent),
+        )
+        print("status: error")
+        print(f"run_id: {run_dir_id(request_file.parent)}")
+        print("engine: shell")
+        print("runner_error: request_artifact_tampered")
+        return 1
+
+    if route == "shell":
+        # Shell-route artifacts are controller-private. Hand off to
+        # `cmd_run_shell` which acquires the per-job flock BEFORE any
+        # body parse/validation (finding 1 of PR #625 r2 review).
+        # The corrupted-JSON / non-dict / payload_kind cross-check
+        # path now runs inside the flock so a body swap between
+        # validate and exec must contend with the lock.
+        return cmd_run_shell(request_file, args)
+
+    # Non-shell route: legacy text path. The artifacts are not
+    # controller-private here, so we treat the body as untrusted —
+    # parse it just enough to reject any cross-route shell payload
+    # (loose-mode dir holding a shell body is tampering).
     request = read_json(request_file)
+    if isinstance(request, dict) and is_shell_request_payload(request):
+        error_message = "request_artifact_tampered: shell request artifacts are not controller-private"
+        write_shell_terminal_error(
+            request_file,
+            runner_error="request_artifact_tampered",
+            summary=error_message,
+            run_id=str(request.get("run_id") or run_dir_id(request_file.parent)),
+            audit_target_agent=str(request.get("target_agent") or "daemon"),
+        )
+        print("status: error")
+        print(f"run_id: {str(request.get('run_id') or run_dir_id(request_file.parent))}")
+        print("engine: shell")
+        print("runner_error: request_artifact_tampered")
+        return 1
+
     engine = request.get("target_engine", "")
     run_id = request.get("run_id", "")
     workdir = request.get("target_workdir", "")

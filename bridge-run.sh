@@ -7,15 +7,13 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 
-# PR-E: in v2 mode + linux-user isolation, switch the runtime umask from
-# bridge-lib.sh's default 0077 (private) to 0007 (group-writable). The v2
-# group-setgid layout (PR-A/B/C) gives new files the right group, but the
-# mode bits depend on umask. Without 0007, a setgid 2770 channel/runtime
-# dir would still hold 0600 files that the controller (group member) can
-# only read because of the inherited group ownership combined with chmod
-# at directory creation; agent-created channel state .env files would
-# lack group rw and the daemon's controller-side health probes would
-# silently see EACCES.
+# PR-E (revised): linux-user isolation requires umask 0007 in both
+# legacy ACL-backed isolation and v2 group/setgid isolation. Without
+# 0007, umask-governed creates land with group bits=0, which can collapse
+# the POSIX ACL mask to `---` and mask named-user entries such as the
+# controller's rwX grant. This caused 2026-05-04/05 daily-backup EACCES
+# regressions on isolated agent homes. Scope is the umask-governed create
+# path only; application-level chmod 0600 remains out of scope.
 #
 # Called twice from this script: once after the first bridge_require_agent
 # at startup, and once from bridge_run_refresh_roster_if_changed after the
@@ -31,8 +29,7 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 # /proc/<pid>/status. Inert when unset.
 bridge_run_apply_v2_umask_if_needed() {
   local agent="$1"
-  if bridge_isolation_v2_active 2>/dev/null \
-      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+  if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
     umask 007
   fi
   if [[ -n "${BRIDGE_RUN_UMASK_PROBE_FILE:-}" ]]; then
@@ -118,9 +115,9 @@ fi
 
 bridge_require_agent "$AGENT"
 
-# PR-E: apply v2 umask before any runtime mkdir/plugin sync/launch work.
-# bridge-lib.sh:17 unconditionally set 0077; this helper only changes it
-# when BRIDGE_LAYOUT=v2 and the agent is linux-user-isolated.
+# PR-E: apply the isolation launch umask before any runtime mkdir/plugin
+# sync/launch work. bridge-lib.sh:17 unconditionally sets 0077; this
+# helper changes it only when the agent is linux-user-isolated.
 bridge_run_apply_v2_umask_if_needed "$AGENT"
 
 if [[ $CONTINUE_EXPLICIT -eq 1 ]]; then
@@ -266,9 +263,9 @@ bridge_run_refresh_roster_if_changed() {
 
   bridge_load_roster
   bridge_require_agent "$AGENT"
-  # PR-E: re-apply v2 umask after roster reload — bridge-lib.sh's umask 077
-  # is sticky across the process but a defensive re-set guards against any
-  # subshell that may have reset it during the refresh.
+  # PR-E: re-apply isolation umask after roster reload — bridge-lib.sh's
+  # umask 077 is sticky across the process but a defensive re-set guards
+  # against any subshell that may have reset it during the refresh.
   bridge_run_apply_v2_umask_if_needed "$AGENT"
   if [[ $CONTINUE_EXPLICIT -eq 1 ]]; then
     BRIDGE_AGENT_CONTINUE["$AGENT"]="$CONTINUE_MODE"

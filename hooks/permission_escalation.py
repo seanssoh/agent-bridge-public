@@ -21,18 +21,28 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
-from bridge_guard_common import sanitize_text  # noqa: E402
+# Import bridge_hook_common from hooks/ directly; ROOT may have only ``--x``
+# ACL for isolated UIDs (see bridge_hook_common.load_guard_module docstring).
+_HOOKS_DIR = Path(__file__).resolve().parent
+if str(_HOOKS_DIR) not in sys.path:
+    sys.path.insert(0, str(_HOOKS_DIR))
+
 from bridge_hook_common import (  # noqa: E402
     bridge_home_dir,
     bridge_script_dir,
     current_agent,
     current_agent_workdir,
+    load_guard_module,
     truncate_text,
     write_audit,
 )
+
+_guard = load_guard_module(ROOT, required_attrs=("sanitize_text",))
+if _guard is None:
+    sys.exit(0)
+
+sanitize_text = _guard.sanitize_text
 
 
 RECURSION_ENV = "BRIDGE_HOOK_PERMISSION_ESCALATION_ACTIVE"

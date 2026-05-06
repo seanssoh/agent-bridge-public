@@ -194,3 +194,18 @@ BRIDGE_AGENT_ACTION["developer:clear"]="/clear"
 # BRIDGE_AGENT_WORKDIR["reviewer"]="$HOME/some-project"
 # BRIDGE_AGENT_LAUNCH_CMD["reviewer"]='claude --dangerously-skip-permissions'
 # BRIDGE_AGENT_ACTION["reviewer:resume"]="/resume"
+
+# Optional: Codex companion-role hooks (audit-only by default).
+#
+# codex-task-mode-policy.py (PreToolUse) blocks source writes during
+# [plan]/[review] tasks. codex-review-output-shape.py (Stop) enforces that
+# review responses start with `plan-ok` / `implement-ok` / `needs-more`.
+# Both hooks ship in audit-only mode: they emit per-agent audit rows but
+# never block. Promote to blocking after observing a week of audit traffic
+# with zero unintended denials.
+#
+# Set both env vars to `block`, or leave unset / set to `audit` (default).
+# Restart codex agents (`agent-bridge agent restart <agent>`) after changing.
+#
+# export BRIDGE_CODEX_TASK_MODE_POLICY=block
+# export BRIDGE_CODEX_OUTPUT_SHAPE_ENFORCE=block

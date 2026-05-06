@@ -213,6 +213,34 @@ orphaned but harmless after migration (no symlink references it);
 operators may delete it manually after verifying the per-agent files
 exist and contain the expected `autoCompactWindow` value.
 
+### promptSuggestionEnabled default (v0.7.x+, issue #630)
+
+`bridge-hooks.py render-shared-settings` writes a managed
+`promptSuggestionEnabled: false` default for every managed Claude
+agent, alongside `autoCompactWindow`. This disables Claude Code's
+inline composer ghost text — the dimmed "Try asking …" suggestion
+that appears in the input box after a turn completes.
+
+Why this is a managed default: the daemon's pending-input detector
+(`bridge_tmux_session_inject_busy` →
+`bridge_tmux_line_has_sgr_dim`, `lib/bridge-tmux.sh:1322`) reads the
+ghost text as real typed input and defers the first send of every
+queued task until the nudge fallback fires (~30s–1min latency). PR
+\#566 added an SGR-2 (dim) detector to filter the dim form, but
+newer Claude Code builds render the suggestion with other ANSI
+shapes (24-bit gray, 256-color faint, `\x1b[90m`) the narrow
+detector misses (#630). Disabling the feature at the settings layer
+is the stable fix — bridge-managed agents are operated through the
+queue, not by a human typing in the composer, so the suggestion has
+no value here.
+
+Operator opt-out (re-enable for an agent you attach to interactively):
+add `"promptSuggestionEnabled": true` to the per-agent overlay
+(`settings.local.json`) or to the install-wide overlay
+(`$BRIDGE_AGENT_HOME_ROOT/.claude/settings.local.json`). Overlay wins
+over managed defaults via the renderer's
+`managed defaults < base < overlay < preserved user keys` order.
+
 ### PreCompact channel auto-notify (issue #597, in-flight)
 
 Agent Bridge can post a one-line notice to the channel that most
@@ -308,6 +336,40 @@ one field opts the agent into the new shape; remaining fields fall back to
 the defaults above. Set `BRIDGE_AGENT_PERMISSION_MODE["agent"]="legacy"`
 to explicitly pin the historical blanket-bypass shape (e.g. for sandboxed
 offline roles).
+
+### Admin agent CRUD policy
+
+Admin operates exclusively through typed `agent <verb>` subcommands. Direct
+edits to protected-roster files (`$BRIDGE_ROSTER_LOCAL_FILE`, by default
+`~/.agent-bridge/agent-roster.local.sh`) are intentionally blocked because
+the audit chain depends on the typed-write path. Any out-of-band edits will
+be reverted by the daemon's reconciliation pass on next sync — bring
+changes through `agent update` (or `agent-bridge config set` for global
+settings) instead.
+
+Typed verbs available today (run `agent-bridge agent --help` for the full
+listing):
+
+- `create` — scaffold a new static role (agent home + roster block).
+- `update` — typed audited mutation of protected managed-role fields
+  (`--desc`, `--engine`, `--workdir`, `--loop on|off`,
+  `--continue on|off`, `--class user|system`, `--set-launch-cmd`,
+  `--launch-cmd-add-env`/`--launch-cmd-remove-env`,
+  `--launch-cmd-add-dev-channel`/`--launch-cmd-remove-dev-channel`,
+  `--channels-set`/`--channels-add`/`--channels-remove`).
+- `delete` — remove a static role (with optional `--purge-home` /
+  `--purge-crons`).
+- `retire` — retire a static role with quarantine + audit trail.
+- `list` — inventory of registered agents.
+- `registry` — read-only JSON inventory.
+- `show` — roster + runtime state for one agent.
+- `reclassify` — promote a runtime-detected admin to a static role.
+- `rerender-settings` — re-render per-agent `settings.effective.json`.
+
+Caller validation matches `config set`: caller must be the admin agent
+(`BRIDGE_ADMIN_AGENT_ID`) and the source must be operator-trusted
+(`operator-tui` / `operator-trusted-id`). Mutations that fail this gate
+are denied with an audit row and never touch the roster file.
 
 ## Worktree Workers
 

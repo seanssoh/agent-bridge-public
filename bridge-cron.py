@@ -45,14 +45,19 @@ RUN_ARTIFACTS_TIER_B_SURFACES = (
 
 # Terminal state.json values for a cron run. "deferred" is intentionally NOT
 # terminal — the runner asks for re-fire and the slot is still in flight.
-_RUN_STATUS_TERMINAL_STATES = {"success", "error", "cancelled"}
+_RUN_STATUS_TERMINAL_STATES = {"success", "error", "timed_out", "cancelled"}
 # Failed runs (state="error") are retained on the longer Tier-B clock so the
 # operator has time to triage even when the originating surface is Tier-A.
-_RUN_STATUS_FAILED_STATES = {"error"}
+_RUN_STATUS_FAILED_STATES = {"error", "timed_out"}
 
 # bridge-queue.py terminal statuses are "done" and "cancelled" only — there
 # is no "failed" queue state. Source: bridge-queue.py status enum + #533.
 _QUEUE_TERMINAL_STATUSES = {"done", "cancelled"}
+
+SHELL_PAYLOAD_ENV_PREFIXES = ("POLL_", "SCRIPT_")
+SHELL_PROTECTED_ENV_EXACT = {"HOME", "PATH"}
+SHELL_PROTECTED_ENV_PREFIXES = ("BRIDGE_", "CRON_")
+SHELL_ARG_FORBIDDEN_RE = re.compile(r"[\x00\r\n;&|<>`]")
 
 
 # Canonical memory-daily prompt body template (issue #541 PR-A).
@@ -225,6 +230,13 @@ def preview_text(value, limit=120):
     return flattened[: limit - 3].rstrip() + "..."
 
 
+def preview_shell_payload(payload, limit=120):
+    script = str(payload.get("script") or "").strip()
+    args = payload.get("args") if isinstance(payload.get("args"), list) else []
+    flattened = " ".join([script, *[str(item) for item in args]]).strip()
+    return preview_text(flattened, limit=limit)
+
+
 def classify_family(name):
     for rule in FAMILY_RULES:
         if name.startswith(rule) or rule in name:
@@ -340,7 +352,13 @@ def build_job_record(job):
     name = job.get("name", "<unnamed>")
     last_status = state.get("lastStatus") or state.get("lastRunStatus") or "-"
     consecutive_errors = int(state.get("consecutiveErrors") or 0)
+    payload_kind = payload.get("kind", "-")
     payload_text = payload.get("text") or payload.get("message") or ""
+    if payload_kind == "shell":
+        payload_text = ""
+        payload_preview = preview_shell_payload(payload)
+    else:
+        payload_preview = preview_text(payload_text)
     last_error = parse_epoch_ms(state.get("lastErrorAtMs"))
     if last_error is None and (consecutive_errors > 0 or last_status not in ("-", "ok", "success")):
         last_error = last_run
@@ -374,7 +392,13 @@ def build_job_record(job):
         "last_inbox_task_id": state.get("lastInboxTaskId"),
         "session_target": job.get("sessionTarget", "-"),
         "wake_mode": job.get("wakeMode", "-"),
-        "payload_kind": payload.get("kind", "-"),
+        "payload_kind": payload_kind,
+        "payload_shell_script": payload.get("script", ""),
+        "payload_shell_args": payload.get("args") if isinstance(payload.get("args"), list) else [],
+        "payload_shell_env": payload.get("env") if isinstance(payload.get("env"), dict) else {},
+        "payload_shell_timeout_seconds": payload.get("timeoutSeconds", ""),
+        "payload_shell_output_cap_bytes": payload.get("outputCapBytes", ""),
+        "execution_run_as_agent": (job.get("execution") or {}).get("runAsAgent", ""),
         "job_delivery_mode": delivery.get("mode", ""),
         "job_delivery_channel": delivery.get("channel", ""),
         "job_delivery_target": delivery.get("to", ""),
@@ -419,7 +443,7 @@ def build_job_record(job):
             or ""
         ).strip(),
         "payload_text": payload_text,
-        "payload_preview": preview_text(payload_text),
+        "payload_preview": payload_preview,
         "raw": job,
     }
 
@@ -533,6 +557,12 @@ def serialize_record(record, include_payload=False):
         "session_target": record["session_target"],
         "wake_mode": record["wake_mode"],
         "payload_kind": record["payload_kind"],
+        "payload_shell_script": record.get("payload_shell_script", ""),
+        "payload_shell_args": record.get("payload_shell_args", []),
+        "payload_shell_env": record.get("payload_shell_env", {}),
+        "payload_shell_timeout_seconds": record.get("payload_shell_timeout_seconds", ""),
+        "payload_shell_output_cap_bytes": record.get("payload_shell_output_cap_bytes", ""),
+        "execution_run_as_agent": record.get("execution_run_as_agent", ""),
         "job_delivery_mode": record["job_delivery_mode"],
         "job_delivery_channel": record["job_delivery_channel"],
         "job_delivery_target": record["job_delivery_target"],
@@ -1545,6 +1575,100 @@ def atomic_write_jobs(jobs_path, raw_payload):
     os.replace(temp_path, jobs_path)
 
 
+def _audit_log_path():
+    """Resolve the bridge audit log path.
+
+    Mirrors `bridge-config.py:audit_log_path()` and the SSOT default in
+    `lib/bridge-state.sh:1267` (`$BRIDGE_LOG_DIR/audit.jsonl`). Returns
+    `None` only when neither `BRIDGE_AUDIT_LOG` nor `BRIDGE_HOME`/`BRIDGE_LOG_DIR`
+    is set — in that case the caller should silently skip the emission so
+    smoke fixtures and `--help` invocations do not fail.
+    """
+    explicit = os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    log_dir = os.environ.get("BRIDGE_LOG_DIR", "").strip()
+    if log_dir:
+        return Path(log_dir).expanduser() / "audit.jsonl"
+    home = os.environ.get("BRIDGE_HOME", "").strip()
+    if home:
+        return Path(home).expanduser() / "logs" / "audit.jsonl"
+    return None
+
+
+def _audit_actor():
+    """Caller agent id for audit attribution.
+
+    Prefers `BRIDGE_AGENT_ID` so multi-admin installs can disambiguate
+    operator-driven mutations; falls back to `USER` so single-operator
+    boxes still record something useful. Matches the convention used in
+    `bridge-config.py:115` (`current_agent_id()`).
+    """
+    agent = os.environ.get("BRIDGE_AGENT_ID", "").strip()
+    if agent:
+        return agent
+    return os.environ.get("USER", "unknown") or "unknown"
+
+
+def emit_cron_mutation_audit(action, target, detail):
+    """Append a `cron.<verb>` row to the bridge audit log.
+
+    Routes through `bridge-audit.py write` so the hash chain stays intact
+    with hook / config / daemon rows. Best-effort: a failed audit write
+    never raises, mirroring the contract documented in
+    `bridge-watchdog-silence.py:emit_audit` and `bridge-config.py:write_audit`.
+
+    Issue #628 — operator-driven cron CRUD (`create`, `edit`, `enable`,
+    `disable`, `delete`) was previously absent from `audit.jsonl`,
+    forcing transcript fishing to recover mutation provenance. Runner
+    finalize and bulk admin paths (rebalance / migrate / import) stay
+    out of scope; only the four operator verbs go through here.
+    """
+    audit_path = _audit_log_path()
+    if audit_path is None:
+        return
+    actor = _audit_actor()
+    detail_payload = dict(detail or {})
+    detail_payload.setdefault("cron_id", target)
+    audit_script = Path(__file__).resolve().parent / "bridge-audit.py"
+    cmd = [
+        sys.executable,
+        str(audit_script),
+        "write",
+        "--file",
+        str(audit_path),
+        "--actor",
+        actor,
+        "--action",
+        action,
+        "--target",
+        target,
+        "--detail-json",
+        json.dumps(detail_payload, ensure_ascii=True, sort_keys=True),
+    ]
+    try:
+        subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError):
+        # Audit emission is best-effort — never let it crash a successful
+        # cron mutation. Fall back to a direct append so a missing python
+        # interpreter doesn't silently swallow the row (matches
+        # bridge-config.py:write_audit's fallback contract).
+        try:
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "actor": actor,
+                "action": action,
+                "target": target,
+                "detail": detail_payload,
+                "pid": os.getpid(),
+            }
+            with audit_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=True) + "\n")
+        except OSError:
+            pass
+
+
 def slugify_title(value):
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-").lower()
     return slug or "job"
@@ -1556,6 +1680,93 @@ def read_payload_argument(payload_text, payload_file):
     if payload_file is not None:
         return Path(payload_file).expanduser().read_text(encoding="utf-8")
     return ""
+
+
+def parse_shell_env(values):
+    env = {}
+    for raw in values or []:
+        if "=" not in raw:
+            raise ValueError("--script-env must be KEY=VALUE")
+        key, value = raw.split("=", 1)
+        if not re.match(r"^[A-Z_][A-Z0-9_]*$", key):
+            raise ValueError(f"invalid --script-env key: {key}")
+        if key in SHELL_PROTECTED_ENV_EXACT or key.startswith(SHELL_PROTECTED_ENV_PREFIXES):
+            raise ValueError(f"protected env var cannot be set by shell cron payload: {key}")
+        if not key.startswith(SHELL_PAYLOAD_ENV_PREFIXES):
+            allowed = ", ".join(f"{prefix}*" for prefix in SHELL_PAYLOAD_ENV_PREFIXES)
+            raise ValueError(f"shell cron env var must use one of these prefixes: {allowed}: {key}")
+        env[key] = value
+    return env
+
+
+def resolve_shell_script(path_value):
+    raw = str(path_value or "").strip()
+    if not raw:
+        raise ValueError("--script is required for --kind shell")
+    bridge_home_value = os.environ.get("BRIDGE_HOME")
+    if raw == "$BRIDGE_HOME" or raw.startswith("$BRIDGE_HOME/"):
+        if not bridge_home_value:
+            raise ValueError("--script uses $BRIDGE_HOME but BRIDGE_HOME is not set")
+        raw = bridge_home_value + raw[len("$BRIDGE_HOME") :]
+    elif "$" in raw:
+        raise ValueError("--script contains an unresolved environment variable")
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise ValueError("--script must resolve to an absolute path")
+    path = path.resolve()
+    try:
+        stat_result = path.stat()
+    except OSError as exc:
+        raise ValueError(f"--script is not accessible: {path}") from exc
+    if not path.is_file():
+        raise ValueError(f"--script must be a regular file: {path}")
+    if not os.access(path, os.X_OK):
+        raise ValueError(f"--script must be executable: {path}")
+    if stat_result.st_mode & 0o022:
+        raise ValueError(f"--script must not be group/other writable: {path}")
+    return str(path)
+
+
+def validate_shell_args(values):
+    args = []
+    for raw in values or []:
+        value = str(raw)
+        if SHELL_ARG_FORBIDDEN_RE.search(value):
+            raise ValueError(f"--script-arg contains shell metacharacters: {value!r}")
+        if "$(" in value or "${" in value:
+            raise ValueError(f"--script-arg contains shell expansion syntax: {value!r}")
+        args.append(value)
+    return args
+
+
+def build_native_job_shell_payload(args, existing_payload=None, existing_execution=None):
+    existing_payload = existing_payload or {}
+    existing_execution = existing_execution or {}
+    script = args.script if args.script is not None else existing_payload.get("script")
+    run_as_agent = args.run_as_agent or existing_execution.get("runAsAgent")
+    env_values = args.script_env or []
+    arg_values = args.script_arg if args.script_arg is not None else None
+    timeout = args.timeout if args.timeout is not None else existing_payload.get("timeoutSeconds", 900)
+    output_cap = args.output_cap if args.output_cap is not None else existing_payload.get("outputCapBytes", 65536)
+
+    if not run_as_agent:
+        raise ValueError("--run-as-agent is required for --kind shell")
+    if str(run_as_agent).isdigit():
+        raise ValueError("--run-as-agent must be an agent id, not a numeric UID/user")
+    if timeout is None or int(timeout) <= 0:
+        raise ValueError("--timeout must be a positive integer")
+    if output_cap is None or int(output_cap) <= 0:
+        raise ValueError("--output-cap must be a positive integer")
+
+    payload = {
+        "kind": "shell",
+        "script": resolve_shell_script(script),
+        "args": validate_shell_args(arg_values if arg_values is not None else existing_payload.get("args", [])),
+        "env": parse_shell_env(env_values) if env_values else dict(existing_payload.get("env") or {}),
+        "timeoutSeconds": int(timeout),
+        "outputCapBytes": int(output_cap),
+    }
+    return payload, {"runAsAgent": run_as_agent}
 
 
 def parse_at_datetime(value):
@@ -1587,6 +1798,8 @@ def build_native_job(
     actor,
     delete_after_run,
     existing_job=None,
+    payload=None,
+    execution=None,
 ):
     now_ms_value = now_epoch_ms()
     if at_value is not None:
@@ -1601,6 +1814,13 @@ def build_native_job(
             "tz": tz_name or default_tz_name(),
         }
     job = dict(existing_job or {})
+    if payload is None:
+        payload = {
+            "kind": "text",
+            "text": payload_text,
+        }
+    if execution is None:
+        execution = dict(job.get("execution") or {})
     job.update(
         {
             "id": job_id,
@@ -1611,10 +1831,8 @@ def build_native_job(
             "updatedAtMs": now_ms_value,
             "schedule": schedule,
             "deleteAfterRun": bool(delete_after_run),
-            "payload": {
-                "kind": "text",
-                "text": payload_text,
-            },
+            "payload": payload,
+            "execution": execution,
             "sessionTarget": "agent-bridge",
             "wakeMode": "queue-dispatch",
             "state": dict(job.get("state") or {}),
@@ -1683,12 +1901,23 @@ def run_native_create(args):
     records = [build_job_record(job) for job in jobs]
     actor = args.actor or os.environ.get("USER", "unknown")
     title = args.title.strip()
-    payload_text = read_payload_argument(args.payload, args.payload_file)
+    payload_text = ""
+    payload = None
+    execution = None
+    payload_kind = args.kind or "text"
+    if payload_kind == "shell":
+        if args.payload is not None or args.payload_file is not None:
+            raise ValueError("--payload/--payload-file cannot be used with --kind shell")
+        payload, execution = build_native_job_shell_payload(args)
+    else:
+        payload_text = read_payload_argument(args.payload, args.payload_file)
     # Issue #541 PR-A — default memory-daily payloads to the canonical
     # jsonl-aware body when the operator did not supply one explicitly.
     # Operator-provided payloads (--payload / --payload-file) pass through
     # unchanged so existing override workflows keep working.
     if (
+        payload_kind == "text"
+        and
         args.payload is None
         and args.payload_file is None
         and classify_family(title) == "memory-daily"
@@ -1712,6 +1941,8 @@ def run_native_create(args):
         enabled=not args.disabled,
         actor=actor,
         delete_after_run=args.delete_after_run,
+        payload=payload,
+        execution=execution,
     )
     jobs.append(job)
     raw_payload["jobs"] = jobs
@@ -1719,6 +1950,20 @@ def run_native_create(args):
     jobs_path = Path(args.jobs_file).expanduser()
     jobs_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_jobs(jobs_path, raw_payload)
+
+    # Issue #628 — emit operator-mutation audit row only after the write
+    # succeeds so failed creates do not appear in the audit log.
+    emit_cron_mutation_audit(
+        "cron.create",
+        job_id,
+        {
+            "agent": args.agent,
+            "title": title,
+            "schedule": dict(job.get("schedule") or {}),
+            "enabled": bool(job.get("enabled", True)),
+            "delete_after_run": bool(job.get("deleteAfterRun")),
+        },
+    )
 
     print(f"created native cron job {job_id} for {args.agent}")
     return 0
@@ -1740,6 +1985,8 @@ def run_native_update(args):
         return 2
 
     existing = dict(jobs[job_index])
+    existing_payload = dict(existing.get("payload") or {})
+    existing_payload_kind = existing_payload.get("kind") or "text"
     title = args.title.strip() if args.title is not None else existing.get("name", record["name"])
     agent = args.agent or existing.get("agentId") or existing.get("agent") or record["agent"]
     schedule = existing.get("schedule") or {}
@@ -1747,9 +1994,41 @@ def run_native_update(args):
     schedule_expr = args.schedule or (schedule.get("expr") if schedule_kind == "cron" else "") or ""
     at_value = args.at or (schedule.get("at") if schedule_kind == "at" else None)
     tz_name = args.tz or schedule.get("tz") or default_tz_name()
+    requested_kind = args.kind
+    shell_fields_present = any(
+        value is not None
+        for value in (args.script, args.run_as_agent, args.timeout, args.output_cap)
+    ) or bool(args.script_arg) or bool(args.script_env)
+    text_fields_present = args.payload is not None or args.payload_file is not None
+    if requested_kind is None:
+        if shell_fields_present:
+            requested_kind = "shell"
+        elif text_fields_present:
+            requested_kind = "text"
+        else:
+            requested_kind = existing_payload_kind
+    if requested_kind != existing_payload_kind and not args.allow_kind_transition:
+        raise ValueError(
+            f"payload kind transition {existing_payload_kind!r} -> {requested_kind!r} requires --allow-kind-transition"
+        )
+    if requested_kind == "shell" and text_fields_present:
+        raise ValueError("--payload/--payload-file cannot be used with --kind shell")
+    if requested_kind == "text" and shell_fields_present:
+        raise ValueError("shell payload options require --kind shell")
+
     payload_text = native_job_payload(existing)
-    if args.payload is not None or args.payload_file is not None:
-        payload_text = read_payload_argument(args.payload, args.payload_file)
+    payload = None
+    execution = None
+    if requested_kind == "shell":
+        payload, execution = build_native_job_shell_payload(
+            args,
+            existing_payload=existing_payload if existing_payload_kind == "shell" else None,
+            existing_execution=existing.get("execution") or {},
+        )
+    else:
+        execution = {}
+        if text_fields_present:
+            payload_text = read_payload_argument(args.payload, args.payload_file)
 
     enabled = existing.get("enabled", True)
     if args.enable:
@@ -1774,11 +2053,72 @@ def run_native_update(args):
         actor=actor,
         delete_after_run=delete_after_run,
         existing_job=existing,
+        payload=payload,
+        execution=execution,
     )
     jobs[job_index] = updated_job
     raw_payload["jobs"] = jobs
     raw_payload["updatedAt"] = datetime.now().astimezone().isoformat()
     atomic_write_jobs(Path(args.jobs_file).expanduser(), raw_payload)
+
+    # Issue #628 — pick the audit verb based on what actually changed.
+    # `--enable` / `--disable` flips alone get a dedicated `cron.enable`
+    # or `cron.disable` row; everything else (schedule / title / payload /
+    # tz / agent / delete-after-run) records as `cron.edit` with prev/next
+    # snapshots so multi-admin installs can attribute the change.
+    prev_enabled = bool(existing.get("enabled", True))
+    next_enabled = bool(enabled)
+    prev_schedule = dict(existing.get("schedule") or {})
+    next_schedule = dict(updated_job.get("schedule") or {})
+    prev_title = existing.get("name") or record.get("name") or ""
+    next_title = updated_job.get("name") or title
+    prev_agent = existing.get("agentId") or existing.get("agent") or record.get("agent") or ""
+    next_agent = updated_job.get("agentId") or updated_job.get("agent") or agent
+    prev_delete_after = bool(existing.get("deleteAfterRun"))
+    next_delete_after = bool(updated_job.get("deleteAfterRun"))
+    non_enable_changed = (
+        prev_schedule != next_schedule
+        or prev_title != next_title
+        or prev_agent != next_agent
+        or prev_delete_after != next_delete_after
+        or args.payload is not None
+        or args.payload_file is not None
+    )
+    if not non_enable_changed and prev_enabled != next_enabled:
+        action = "cron.enable" if next_enabled else "cron.disable"
+        emit_cron_mutation_audit(
+            action,
+            record["id"],
+            {
+                "agent": next_agent,
+                "title": next_title,
+                "prev_enabled": prev_enabled,
+                "next_enabled": next_enabled,
+            },
+        )
+    else:
+        emit_cron_mutation_audit(
+            "cron.edit",
+            record["id"],
+            {
+                "agent": next_agent,
+                "title": next_title,
+                "prev": {
+                    "schedule": prev_schedule,
+                    "enabled": prev_enabled,
+                    "title": prev_title,
+                    "agent": prev_agent,
+                    "delete_after_run": prev_delete_after,
+                },
+                "next": {
+                    "schedule": next_schedule,
+                    "enabled": next_enabled,
+                    "title": next_title,
+                    "agent": next_agent,
+                    "delete_after_run": next_delete_after,
+                },
+            },
+        )
 
     print(f"updated native cron job {record['id']}")
     return 0
@@ -1798,9 +2138,25 @@ def run_native_delete(args):
         print(f"error: native job not found: {args.job_ref}", file=sys.stderr)
         return 2
 
+    deleted_job = next((job for job in jobs if job.get("id") == record["id"]), None) or {}
     raw_payload["jobs"] = remaining_jobs
     raw_payload["updatedAt"] = datetime.now().astimezone().isoformat()
     atomic_write_jobs(Path(args.jobs_file).expanduser(), raw_payload)
+
+    # Issue #628 — capture the deleted job's identity in the audit row so
+    # operators can reconstruct what was removed without re-reading the
+    # backup file.
+    emit_cron_mutation_audit(
+        "cron.delete",
+        record["id"],
+        {
+            "agent": deleted_job.get("agentId") or deleted_job.get("agent") or record.get("agent") or "",
+            "title": deleted_job.get("name") or record.get("name") or "",
+            "schedule": dict(deleted_job.get("schedule") or {}),
+            "enabled": bool(deleted_job.get("enabled", True)),
+        },
+    )
+
     print(f"deleted native cron job {record['id']}")
     return 0
 
@@ -2063,6 +2419,42 @@ def run_native_finalize(args):
         final_status = "success"
     else:
         final_status = "error"
+
+    # #627: A deferral that lands after the operator disables the job
+    # must not mutate state — disable should be idempotent. The dispatcher
+    # contract says only enabled jobs get scheduled, so a deferred slot
+    # finishing on a disabled job is an inflight-after-disable race.
+    # Drop the deferral provenance update entirely (no lastDeferredAtMs,
+    # nextRunAtMs, or updatedAtMs bump) so `agb cron show` keeps showing
+    # the disable timestamp as the last mutation. The success/error paths
+    # are intentionally NOT gated here — they carry consecutive-error
+    # accounting that operators may still want recorded; #628 (audit gap)
+    # tracks broader trace coverage separately.
+    if final_status == "deferred" and not job.get("enabled", True):
+        print(
+            f"info: dropping deferred state writer for disabled job "
+            f"{job_id} run={run_id}",
+            file=sys.stderr,
+        )
+        payload = {
+            "status": "skipped",
+            "reason": "job_disabled",
+            "job_id": job_id,
+            "run_id": run_id,
+            "final_status": final_status,
+            "jobs_file": str(jobs_path),
+        }
+        if args.json:
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+        else:
+            print("status: skipped")
+            print("reason: job_disabled")
+            print(f"job_id: {job_id}")
+            print(f"run_id: {run_id}")
+            print(f"final_status: {final_status}")
+            print(f"jobs_file: {jobs_path}")
+        return 0
+
     duration_ms = result.get("duration_ms")
     try:
         duration_ms = int(duration_ms) if duration_ms not in (None, "") else None
@@ -2646,6 +3038,13 @@ def build_parser():
     native_payload_group = native_create_parser.add_mutually_exclusive_group()
     native_payload_group.add_argument("--payload")
     native_payload_group.add_argument("--payload-file")
+    native_create_parser.add_argument("--kind", choices=("text", "shell"), default="text")
+    native_create_parser.add_argument("--script")
+    native_create_parser.add_argument("--script-arg", action="append", default=[])
+    native_create_parser.add_argument("--script-env", action="append", default=[])
+    native_create_parser.add_argument("--run-as-agent")
+    native_create_parser.add_argument("--timeout", type=int)
+    native_create_parser.add_argument("--output-cap", type=int)
     native_create_parser.add_argument("--tz", default=default_tz_name())
     native_create_parser.add_argument("--actor")
     native_create_parser.add_argument("--disabled", action="store_true")
@@ -2662,6 +3061,14 @@ def build_parser():
     native_update_payload_group = native_update_parser.add_mutually_exclusive_group()
     native_update_payload_group.add_argument("--payload")
     native_update_payload_group.add_argument("--payload-file")
+    native_update_parser.add_argument("--kind", choices=("text", "shell"))
+    native_update_parser.add_argument("--script")
+    native_update_parser.add_argument("--script-arg", action="append")
+    native_update_parser.add_argument("--script-env", action="append", default=[])
+    native_update_parser.add_argument("--run-as-agent")
+    native_update_parser.add_argument("--timeout", type=int)
+    native_update_parser.add_argument("--output-cap", type=int)
+    native_update_parser.add_argument("--allow-kind-transition", action="store_true")
     native_update_parser.add_argument("--tz")
     native_update_parser.add_argument("--actor")
     delete_after_run_group = native_update_parser.add_mutually_exclusive_group()

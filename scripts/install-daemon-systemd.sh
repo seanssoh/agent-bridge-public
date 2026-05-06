@@ -90,6 +90,13 @@ WorkingDirectory=${BRIDGE_HOME_TARGET}
 Environment=BRIDGE_HOME=${BRIDGE_HOME_TARGET}
 Restart=always
 RestartSec=5
+# Without KillMode=process the default control-group mode SIGKILLs every
+# child in the daemon's service cgroup on every restart — tmux servers,
+# claude, codex, plugin processes — which makes "stop the daemon" silently
+# mean "kill every running agent on this host." KillMode=process limits the
+# kill to the daemon process itself; agent children stay up across daemon
+# restarts initiated by the upgrader, the silence watchdog, or admin tooling.
+KillMode=process
 StandardOutput=append:${LOG_PATH}
 StandardError=append:${LOG_PATH}
 

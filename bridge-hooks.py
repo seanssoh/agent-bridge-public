@@ -58,8 +58,26 @@ def managed_claude_settings_defaults(
     launch_cmd: str | None,
     agent_class: str | None = None,
 ) -> dict[str, Any]:
+    # `promptSuggestionEnabled: False` disables Claude Code's inline
+    # composer ghost text (the dimmed "Try asking …" suggestion that
+    # appears in the input box after a turn completes). On bridge-managed
+    # agents the daemon's pending-input detector
+    # (`bridge_tmux_session_inject_busy` → `bridge_tmux_line_has_sgr_dim`,
+    # `lib/bridge-tmux.sh:1322`) reads that ghost text as real typed
+    # input and defers the first send of every queued task until the
+    # nudge fallback fires (~30s–1min latency). PR #566 added an SGR-2
+    # detector to filter the dim form, but newer Claude Code builds
+    # render the suggestion with other ANSI shapes (24-bit gray,
+    # 256-color faint, `\x1b[90m`) the narrow detector misses (#630).
+    # Disabling the feature at the settings layer is the stable fix —
+    # bridge-managed agents are operated through the queue, not by a
+    # human typing in the composer, so the suggestion has no value here.
+    # Operators who attach interactively and want it back can set
+    # `promptSuggestionEnabled: true` in the per-agent overlay
+    # (`settings.local.json`) — overlay wins over managed defaults.
     return {
         "autoCompactWindow": resolve_managed_autocompact_window(launch_cmd, agent_class),
+        "promptSuggestionEnabled": False,
     }
 
 
@@ -178,6 +196,16 @@ def codex_stop_hook_command(bridge_home: Path, python_bin: str) -> str:
     return shell_command(python_bin, shell_path(hook_path), "--format", "codex")
 
 
+def codex_task_mode_policy_hook_command(bridge_home: Path, python_bin: str) -> str:
+    hook_path = bridge_home / "hooks" / "codex-task-mode-policy.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
+def codex_review_output_shape_hook_command(bridge_home: Path, python_bin: str) -> str:
+    hook_path = bridge_home / "hooks" / "codex-review-output-shape.py"
+    return shell_command(python_bin, shell_path(hook_path))
+
+
 def resolve_settings_path(args: argparse.Namespace) -> Path:
     settings_file = getattr(args, "settings_file", None)
     if settings_file:
@@ -257,6 +285,14 @@ def is_codex_stop_hook(command: str) -> bool:
 
 def is_codex_prompt_hook(command: str) -> bool:
     return is_prompt_timestamp_hook(command)
+
+
+def is_codex_task_mode_policy_hook(command: str) -> bool:
+    return "codex-task-mode-policy.py" in str(command)
+
+
+def is_codex_review_output_shape_hook(command: str) -> bool:
+    return "codex-review-output-shape.py" in str(command)
 
 
 def find_command_hook(
@@ -756,25 +792,41 @@ def cmd_status_codex_hooks(args: argparse.Namespace) -> int:
     session_hooks = hooks_list(settings, "SessionStart")
     stop_hooks = hooks_list(settings, "Stop")
     prompt_hooks = hooks_list(settings, "UserPromptSubmit")
+    pretool_hooks = hooks_list(settings, "PreToolUse")
     _session_group, session_hook = find_command_hook(session_hooks, is_codex_session_start_hook)
     _stop_group, stop_hook = find_command_hook(stop_hooks, is_codex_stop_hook)
     _prompt_group, prompt_hook = find_command_hook(prompt_hooks, is_codex_prompt_hook)
+    _task_mode_group, task_mode_hook = find_command_hook(pretool_hooks, is_codex_task_mode_policy_hook)
+    _output_shape_group, output_shape_hook = find_command_hook(stop_hooks, is_codex_review_output_shape_hook)
+    core_present = bool(session_hook and stop_hook and prompt_hook)
+    companion_present = bool(task_mode_hook and output_shape_hook)
     payload = {
         "CODEX_HOOKS_FILE": str(hooks_path),
-        "CODEX_HOOK_STATUS": "present" if session_hook and stop_hook and prompt_hook else "missing",
+        "CODEX_HOOK_STATUS": "present" if core_present else "missing",
         "CODEX_SESSION_START_HOOK": "present" if session_hook else "missing",
         "CODEX_STOP_HOOK": "present" if stop_hook else "missing",
         "CODEX_PROMPT_HOOK": "present" if prompt_hook else "missing",
+        "CODEX_TASK_MODE_POLICY_HOOK": "present" if task_mode_hook else "missing",
+        "CODEX_REVIEW_OUTPUT_SHAPE_HOOK": "present" if output_shape_hook else "missing",
+        "CODEX_COMPANION_HOOKS_STATUS": "present" if companion_present else "missing",
         "CODEX_SESSION_START_COMMAND": str(session_hook.get("command") or "") if session_hook else "",
         "CODEX_STOP_COMMAND": str(stop_hook.get("command") or "") if stop_hook else "",
         "CODEX_PROMPT_COMMAND": str(prompt_hook.get("command") or "") if prompt_hook else "",
+        "CODEX_TASK_MODE_POLICY_COMMAND": str(task_mode_hook.get("command") or "") if task_mode_hook else "",
+        "CODEX_REVIEW_OUTPUT_SHAPE_COMMAND": str(output_shape_hook.get("command") or "") if output_shape_hook else "",
     }
     print_codex_payload(payload, args.format)
     if args.format != "shell":
         print(f"prompt_hook: {'present' if prompt_hook else 'missing'}")
         if prompt_hook:
             print(f"prompt_command: {str(prompt_hook.get('command') or '')}")
-    return 0 if session_hook and stop_hook and prompt_hook else 1
+        print(f"task_mode_policy_hook: {'present' if task_mode_hook else 'missing'}")
+        if task_mode_hook:
+            print(f"task_mode_policy_command: {str(task_mode_hook.get('command') or '')}")
+        print(f"review_output_shape_hook: {'present' if output_shape_hook else 'missing'}")
+        if output_shape_hook:
+            print(f"review_output_shape_command: {str(output_shape_hook.get('command') or '')}")
+    return 0 if core_present else 1
 
 
 def cmd_ensure_codex_hooks(args: argparse.Namespace) -> int:
@@ -811,20 +863,52 @@ def cmd_ensure_codex_hooks(args: argparse.Namespace) -> int:
         status_message="Injecting Agent Bridge timestamp context",
     ) or changed
 
+    # Companion-role hooks (Codex). Both ship audit-only by default; operators
+    # promote to blocking via BRIDGE_CODEX_TASK_MODE_POLICY=block /
+    # BRIDGE_CODEX_OUTPUT_SHAPE_ENFORCE=block in agent-roster.local.sh after
+    # observing audit logs. Codex CLIs predating PreToolUse / Stop support
+    # the entries cleanly: unknown event keys are ignored without hard-fail.
+    task_mode_command = codex_task_mode_policy_hook_command(bridge_home, args.python_bin)
+    output_shape_command = codex_review_output_shape_hook_command(bridge_home, args.python_bin)
+    changed = ensure_command_hook(
+        hooks_path,
+        "PreToolUse",
+        task_mode_command,
+        is_codex_task_mode_policy_hook,
+        timeout=3,
+        status_message="Checking Codex task-mode policy",
+    ) or changed
+    changed = ensure_command_hook(
+        hooks_path,
+        "Stop",
+        output_shape_command,
+        is_codex_review_output_shape_hook,
+        timeout=3,
+        status_message="Validating Codex review output shape",
+    ) or changed
+
     payload = {
         "CODEX_HOOKS_FILE": str(hooks_path),
         "CODEX_HOOK_STATUS": "updated" if changed else "unchanged",
         "CODEX_SESSION_START_HOOK": "present",
         "CODEX_STOP_HOOK": "present",
         "CODEX_PROMPT_HOOK": "present",
+        "CODEX_TASK_MODE_POLICY_HOOK": "present",
+        "CODEX_REVIEW_OUTPUT_SHAPE_HOOK": "present",
         "CODEX_SESSION_START_COMMAND": session_command,
         "CODEX_STOP_COMMAND": stop_command,
         "CODEX_PROMPT_COMMAND": prompt_command,
+        "CODEX_TASK_MODE_POLICY_COMMAND": task_mode_command,
+        "CODEX_REVIEW_OUTPUT_SHAPE_COMMAND": output_shape_command,
     }
     print_codex_payload(payload, args.format)
     if args.format != "shell":
         print("prompt_hook: present")
         print(f"prompt_command: {prompt_command}")
+        print("task_mode_policy_hook: present")
+        print(f"task_mode_policy_command: {task_mode_command}")
+        print("review_output_shape_hook: present")
+        print(f"review_output_shape_command: {output_shape_command}")
     return 0
 
 
