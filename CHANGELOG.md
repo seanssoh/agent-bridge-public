@@ -6,6 +6,86 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.7.8] — 2026-05-06
+
+### Highlight — surface-reply-enforce + linux-user umask + macOS sudo guard
+
+`v0.7.8` is a bug-fix release on the v0.7.x line consolidating 17 PRs across hooks, daemon, channels, isolation, cron, and the doctor surface. Three headlines: surface-reply-enforce now matches `plugin:<x>:<y>` source tags, closing a 30-day silent-pass regression that let Discord/Telegram/Teams channel replies bypass the enforcement hook (#602); `bridge-run` applies the linux-user isolation umask `0007` regardless of layout, preventing POSIX ACL mask collapse on legacy ACL-backed isolation (#608); and `bridge_linux_sudo_root` now guards on platform so `agent delete --purge-home` actually deletes on macOS instead of failing through a Linux-only sudo path (#620). The release also lands #597 Tracks A–D (precompact route primitive + activity-index, daemon observer + send primitive + EMA, Teams/Mattermost managed-send adapters, Discord relay activity-index) and #598 Tracks 1–4 (`agent registry --json`, orphan-agent-dir doctor detector, `agent retire` primitive with quarantine + audit, test-fixture name validation), plus correctness fixes for daemon log SSOT, autocompact static/dynamic windows, idle-counter latch, per-agent settings preservation, deferred-retry cron scheduling, and system-class Bash carve-outs.
+
+All changes auto-apply on `agent-bridge upgrade --apply` to v0.7.8+. No operator action required for the common path.
+
+### Added (#597 Track A — PR #601)
+
+- Precompact route primitive + activity-index schema. Channel route layer for precompact envelopes lands ahead of the daemon observer (Track B), giving downstream adapters a stable target before the producer ships.
+
+### Added (#597 Track B — PR #611)
+
+- Precompact daemon observer + send primitive + EMA. Daemon now produces precompact envelopes through the route primitive established in Track A; EMA-based pacing throttles bursty producers.
+
+### Added (#597 Track C — PR #610)
+
+- Teams + Mattermost managed-send adapters. Both channels gain the managed-send path required for the precompact route, alongside the existing Discord/Telegram coverage.
+
+### Added (#597 Track D — PR #609)
+
+- Discord relay activity-index + suite smoke. Closes the activity-index parity gap and adds a relay-suite smoke that exercises the new envelope shape end-to-end.
+
+### Added (#598 Track 1 — PR #603)
+
+- `agent registry --json` endpoint. Structured registry inventory for tooling; replaces ad-hoc grep against roster files.
+
+### Added (#598 Track 2 — PR #606)
+
+- Orphan-agent-dir doctor detector. New doctor check flags `agents/<name>/` directories whose owning roster entry was removed, surfacing isolation-cleanup gaps that previously went unnoticed.
+
+### Added (#598 Track 3 — PR #607)
+
+- `agent retire` primitive with quarantine + audit. Operator-grade retirement flow: agent is moved to a quarantine directory rather than deleted, and the operation appends to the audit log so retire/restore is reversible.
+
+### Added (#598 Track 4 — PR #604)
+
+- Test-fixture name validation. `agent create` now refuses test-artifact names without `--test-fixture`, preventing operator-facing rosters from accidentally ingesting names reserved for smoke fixtures.
+
+### Fixed (#590 — PR #599)
+
+- Daemon log SSOT. `BRIDGE_DAEMON_LOG` now defaults to `launchagent.log` on launchd installs so operators see a single canonical log instead of a per-invocation split. Closes the diagnostic-divergence path where daemon and launchd logs reported the same run differently.
+
+### Fixed (#593 — PR #600)
+
+- Class-aware `autoCompactWindow` defaults. Static agents resolve to 400k, dynamic agents to 1M, and the unknown/fallback case defaults to 1M (was previously inheriting the static cap). Closes the regression where dynamic Opus 4.7 `[1m]` agents inherited the static 400k window despite the v0.7.6 per-agent rendering work.
+
+### Fixed (#589 — PR #605)
+
+- Idle counter latch — hybrid send + poll + grace + spool re-delivery. Closes the silent-drop path where a daemon nudge fired between an agent's prompt-ready transition and the latch capture, leaving the nudge queued in `pending-attention.env` indefinitely. New hybrid model combines the existing send path with a bounded poll plus a grace window before declaring the agent unresponsive; spool re-delivery handles the prompt-ready transition mid-flight.
+
+### Fixed (#612 — PR #612)
+
+- System-class Bash carve-out + idle-since marker self-heal. `class=system` agents (librarian, patch, similar ingestion roles) gain the targeted Bash carve-out required for their cross-agent read scope without re-opening the broader Bash gate. Idle-since marker now self-heals when the daemon detects a stale value.
+
+### Fixed (#613 — PR #617)
+
+- Preserve per-agent user keys in `cmd_render_shared_settings` (parity with isolated renderer). The shared/managed renderer now mirrors the isolated renderer's preservation of `enabledPlugins`, `extraKnownMarketplaces`, and `skipDangerousModePermissionPrompt` user keys across rerender. Pre-fix, operator-set user keys on shared (non-isolated) agents were silently overwritten on every rerender.
+
+### Fixed (#614 — PR #616)
+
+- Scheduler honors deferred-retry `nextRunAtMs` for daily/weekly cron. Cron jobs that recorded a deferred-retry timestamp via the existing failure path were ignored by the scheduler's daily/weekly cursor, causing the retry to fire at the next natural cadence boundary rather than at the requested deferral time. The scheduler now consults `nextRunAtMs` before the cadence cursor.
+
+### Fixed (#602 — 28a91673)
+
+- `surface-reply-enforce` matches `plugin:<x>:<y>` source tags. Pre-fix, the hook's source-tag regex rejected the `plugin:<provider>:<channel>` shape that Discord/Telegram/Teams channels emit, so every channel-sourced reply silently passed enforcement for ~30 days. The match now accepts the two-segment form alongside the legacy one-segment form.
+
+### Fixed (#620 — PR #623)
+
+- `bridge_linux_sudo_root` only invokes sudo on Linux. `agent delete --purge-home` now actually deletes on macOS instead of failing through a Linux-only sudo invocation. The helper short-circuits to a non-sudo path on Darwin while preserving the Linux sudo gating for isolated-UID-owned trees.
+
+### Fixed (#608 — PR #608)
+
+- Apply linux-user isolation umask `0007` regardless of layout. Pre-fix, the umask was scoped to the v2 layout path, leaving legacy ACL-backed isolation hosts open to POSIX ACL mask collapse when child processes inherited the controller's umask. The umask now applies whenever linux-user isolation is in effect.
+
+### Operator action
+
+- **None for the common path.** All changes auto-apply on `agent-bridge upgrade --apply` to v0.7.8+.
+
 ## [0.7.7] — 2026-05-05
 
 ### Highlight — channel/queue resilience + isolation hardening + tool-policy boundary fixes
