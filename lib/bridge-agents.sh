@@ -707,21 +707,6 @@ PY
   bridge_linux_sudo_root chown -h "$os_user" "$target" >/dev/null 2>&1 || true
 }
 
-bridge_linux_acl_add() {
-  local spec="$1"
-  shift || true
-  (($# > 0)) || return 0
-  # PR-E: in v2 mode the per-agent group + setgid layout (PR-A/B/C) covers
-  # what named-user ACLs used to cover, so this primitive is a no-op when
-  # bridge_isolation_v2_active. The Claude credential exception
-  # (bridge_linux_grant_claude_credentials_access) calls setfacl directly
-  # and does not route through this primitive — see r6 plan-ok.
-  if bridge_isolation_v2_active; then
-    return 0
-  fi
-  bridge_linux_sudo_root setfacl -m "$spec" "$@"
-}
-
 # Resolve the absolute path of an engine CLI (claude/codex) on the
 # controller's PATH. Returns empty string if not found.
 bridge_resolve_engine_cli() {
@@ -730,124 +715,6 @@ bridge_resolve_engine_cli() {
     claude|codex) command -v "$engine" 2>/dev/null || true ;;
     *) printf '' ;;
   esac
-}
-
-# Engine binaries are typically installed under the operator's home
-# (e.g. ~/.local/bin/claude -> ~/.local/share/claude/versions/X). The
-# isolated UID has no PATH entry pointing there and no traverse/read
-# perms on the chain, so `claude --continue` fails with "command not
-# found" inside the sudo wrap. Grant the isolated UID exec on both the
-# symlink path and its realpath, plus traverse on every parent dir of
-# both. PATH injection happens in bridge_write_linux_agent_env_file.
-bridge_linux_grant_engine_cli_access() {
-  local os_user="$1"
-  local engine="$2"
-  local cli_path=""
-  local cli_real=""
-  local stop_path=""
-
-  cli_path="$(bridge_resolve_engine_cli "$engine")"
-  [[ -n "$cli_path" ]] || return 0
-  cli_real="$(readlink -f "$cli_path" 2>/dev/null || printf '%s' "$cli_path")"
-
-  # PR-E: in v2 mode the engine CLI must be in a base-readable path
-  # (`other::r-x`), because the v2 group contract has no path INTO the
-  # operator's home for the isolated UID. Reject controller-home paths
-  # for both the symlink path AND its readlink target — a base-readable
-  # symlink (e.g. /usr/local/bin/claude → ~/.local/share/claude/...) can
-  # otherwise resolve into a private dir and fail at runtime.
-  if bridge_isolation_v2_active; then
-    local _bad=""
-    if [[ -n "$(bridge_linux_traverse_stop_for "$cli_path")" ]]; then
-      _bad="$cli_path (under controller home)"
-    elif [[ -n "$cli_real" && "$cli_real" != "$cli_path" \
-            && -n "$(bridge_linux_traverse_stop_for "$cli_real")" ]]; then
-      _bad="$cli_real (realpath of $cli_path under controller home)"
-    fi
-    if [[ -n "$_bad" ]]; then
-      bridge_die "isolation v2 requires engine CLI ('$engine') in a base-readable path; got: $_bad. Move '$engine' to /usr/local/bin or another path with 'other::r-x'."
-    fi
-    # Optional execute probe — only if direct sudo to os_user is wired
-    # up. nested sudo (sudo -n -u $os_user via bridge_linux_sudo_root)
-    # would mask probe failures behind the wrapper, so probe directly.
-    # Probe failure is fail-fast because PR-E's v2 contract assumes the
-    # isolated UID can launch the engine without any ACL help.
-    if [[ -n "$os_user" ]] && bridge_linux_can_sudo_to "$os_user"; then
-      sudo -n -u "$os_user" -- test -x "$cli_real" \
-        || bridge_die "isolation v2: '$os_user' cannot exec '$cli_real' (base perms or ancestor traversal blocks). Re-check engine CLI install."
-    fi
-    return 0
-  fi
-
-  # Only chain-grant when the CLI lives inside the operator's home
-  # (chmod 0700 blocks base-perm traversal there). System paths like
-  # /usr/bin/claude already have `r-x` for `other` so the isolated UID
-  # can open them without any ACL help. Walking all the way to `/` for
-  # those was pure noise and the trigger for issue #233's ACL residue.
-  stop_path="$(bridge_linux_traverse_stop_for "$cli_path")"
-  if [[ -n "$stop_path" ]]; then
-    bridge_linux_grant_traverse_chain "$os_user" "$cli_path" "$stop_path"
-  fi
-  bridge_linux_acl_add "u:${os_user}:r-x" "$cli_path" >/dev/null 2>&1 || true
-  if [[ -n "$cli_real" && "$cli_real" != "$cli_path" ]]; then
-    stop_path="$(bridge_linux_traverse_stop_for "$cli_real")"
-    if [[ -n "$stop_path" ]]; then
-      bridge_linux_grant_traverse_chain "$os_user" "$cli_real" "$stop_path"
-    fi
-    bridge_linux_acl_add "u:${os_user}:r-x" "$cli_real" >/dev/null 2>&1 || true
-  fi
-}
-
-# Grant the isolated UID r-x on the curated $BRIDGE_HOME/bin directory and
-# the agb shim inside it (issue #544 PR1). Mirrors the engine-cli grant:
-# best-effort, idempotent, and re-applied via `agent-bridge isolate <agent>
-# --reapply`. PATH injection happens in bridge_write_linux_agent_env_file.
-#
-# Out of scope: broader subcommand allowlist/denylist enforcement (issue
-# #544 PR4 design). This helper is a discovery/delivery grant only.
-bridge_linux_grant_bin_dir_access() {
-  local os_user="$1"
-  local bin_dir="$BRIDGE_HOME/bin"
-  local grant_targets=()
-  local path=""
-  [[ -n "$os_user" ]] || return 0
-  [[ -d "$bin_dir" ]] || return 0
-
-  # PR-E: v2 uses group-mode layout and intentionally avoids named-user
-  # ACLs for this surface.
-  if bridge_isolation_v2_active; then
-    return 0
-  fi
-
-  grant_targets+=("$bin_dir")
-  if [[ -e "$bin_dir/agb" ]]; then
-    grant_targets+=("$bin_dir/agb")
-  fi
-
-  # The curated shim ultimately execs ${BRIDGE_HOME}/agb -> agent-bridge,
-  # which sources bridge-lib.sh and lib/*.sh before dispatching queue
-  # commands. A stale chmod/setfacl mask on any of these files makes the
-  # isolated UID fail before it reaches the socket gateway.
-  for path in \
-    "$BRIDGE_HOME/agb" \
-    "$BRIDGE_HOME/agent-bridge" \
-    "$BRIDGE_HOME/bridge-lib.sh" \
-    "$BRIDGE_HOME/bridge-queue.py" \
-    "$BRIDGE_HOME/bridge-queue-gateway.py"
-  do
-    [[ -e "$path" ]] && grant_targets+=("$path")
-  done
-
-  if [[ -d "$BRIDGE_HOME/lib" ]]; then
-    shopt -s nullglob
-    for path in "$BRIDGE_HOME/lib/"*.sh; do
-      grant_targets+=("$path")
-    done
-    shopt -u nullglob
-  fi
-
-  ((${#grant_targets[@]} > 0)) || return 0
-  bridge_linux_sudo_root setfacl -m "u:${os_user}:r-x,m::r-x" "${grant_targets[@]}" >/dev/null 2>&1 || true
 }
 
 bridge_linux_traverse_stop_for() {
@@ -868,312 +735,6 @@ bridge_linux_traverse_stop_for() {
   # No safe stop_path — caller must skip the grant. Never return '/',
   # '/home', or similar shared roots (issue #233).
   return 0
-}
-
-# Restore the controller read lens on an isolated Claude home. The memory-daily
-# harvester runs in the controller context and scans the isolated UID's
-# ~/.claude/projects tree through this lens.
-bridge_linux_repair_isolated_claude_read_lens() {
-  local os_user="$1"
-  local user_home="$2"
-  local controller_user="$3"
-  local isolated_claude_dir=""
-  local isolated_projects_dir=""
-
-  [[ -n "$os_user" && -n "$user_home" && -n "$controller_user" ]] || return 0
-  if bridge_isolation_v2_active; then
-    return 0
-  fi
-
-  isolated_claude_dir="$user_home/.claude"
-  isolated_projects_dir="$isolated_claude_dir/projects"
-
-  bridge_linux_sudo_root test -d "$isolated_claude_dir" || return 0
-  bridge_linux_sudo_root setfacl \
-    -m "u:${controller_user}:r-x" \
-    -m "m::r-x" \
-    "$isolated_claude_dir" >/dev/null 2>&1 || true
-  bridge_linux_sudo_root setfacl \
-    -d -m "u:${controller_user}:r-X" \
-    -d -m "m::r-X" \
-    "$isolated_claude_dir" >/dev/null 2>&1 || true
-
-  bridge_linux_sudo_root test -d "$isolated_projects_dir" || return 0
-  bridge_linux_sudo_root find "$isolated_projects_dir" -type d \
-    -exec setfacl -m "u:${controller_user}:r-X" -m "m::r-X" {} + >/dev/null 2>&1 || true
-  bridge_linux_sudo_root find "$isolated_projects_dir" -type d \
-    -exec setfacl -d -m "u:${controller_user}:r-X" -d -m "m::r-X" {} + >/dev/null 2>&1 || true
-  bridge_linux_sudo_root find "$isolated_projects_dir" -type f \
-    -exec setfacl -m "u:${controller_user}:r--" -m "m::r--" {} + >/dev/null 2>&1 || true
-}
-
-# Claude Code reads its auth from $CLAUDE_CONFIG_DIR/.credentials.json
-# (default $HOME/.claude/.credentials.json). Under linux-user isolation
-# the agent runs as a dedicated UID whose $HOME is /home/<os_user>/,
-# and the operator's `.credentials.json` is not present there — Claude
-# falls back to the first-launch login picker and the agent cannot
-# process work. Fix (#125):
-#
-# - Symlink /home/<os_user>/.claude/.credentials.json to the
-#   controller's credentials file so Claude on the isolated UID resolves
-#   `$HOME/.claude/.credentials.json` to the operator's file.
-# - Grant the isolated UID traverse + read-exec ACL on the controller's
-#   `.claude/` and r-- on the file itself.
-# - Set a default ACL (u:<os_user>:r--) on the controller's `.claude/`
-#   so a re-auth — which Claude performs via atomic rename, producing a
-#   new inode — still inherits the grant without another `isolate` run.
-#
-# Intentionally does NOT share the whole `.claude/` via
-# `CLAUDE_CONFIG_DIR`: projects/, sessions/, plugins/, and
-# settings.json benefit from per-agent write isolation. Only the
-# credentials file is shared across the controller's agents, matching
-# the reality that there is one Claude account per controller.
-bridge_linux_grant_claude_credentials_access() {
-  local os_user="$1"
-  local user_home="$2"
-  local controller_user="$3"
-  local engine="$4"
-  local controller_home=""
-  local controller_claude_dir=""
-  local controller_cred_file=""
-  local isolated_claude_dir=""
-  local isolated_cred_link=""
-  local current_target=""
-
-  [[ "$engine" == "claude" ]] || return 0
-  [[ -n "$os_user" && -n "$user_home" && -n "$controller_user" ]] || return 0
-
-  controller_home="$(getent passwd "$controller_user" 2>/dev/null | cut -d: -f6 || true)"
-  [[ -n "$controller_home" && -d "$controller_home" ]] || return 0
-
-  controller_claude_dir="$controller_home/.claude"
-  controller_cred_file="$controller_claude_dir/.credentials.json"
-  isolated_claude_dir="$user_home/.claude"
-  isolated_cred_link="$isolated_claude_dir/.credentials.json"
-
-  if [[ ! -f "$controller_cred_file" ]]; then
-    bridge_warn "claude credentials not found at $controller_cred_file — run 'claude login' as the operator, then re-run 'agent-bridge isolate <agent>' to wire them into the isolated UID"
-    return 0
-  fi
-
-  # PR-E: in v2 mode, the v2 layout has no path INTO the operator's
-  # ~/.claude. C1 transitional exception — keep ACL access to the single
-  # controller credential file via the unguarded traverse helper +
-  # direct setfacl. This is the *only* v2 surface that retains
-  # named-user ACLs; all other v2 helpers route through the ACL
-  # primitives which short-circuit. C2 (per-agent `claude login`) is
-  # the eventual replacement and lives in a future PR.
-  #
-  # Helper-level setfacl gate so silent failures cannot reach the
-  # symlink-plant step below — `bridge_linux_require_setfacl` is the
-  # sudo-aware presence check used elsewhere in linux-user isolation.
-  if bridge_isolation_v2_active; then
-    bridge_linux_require_setfacl
-  fi
-
-  bridge_linux_sudo_root mkdir -p "$isolated_claude_dir"
-  bridge_linux_sudo_root chown "$os_user" "$isolated_claude_dir"
-  if ! bridge_isolation_v2_active; then
-    bridge_linux_sudo_root chmod 0700 "$isolated_claude_dir"
-    bridge_linux_repair_isolated_claude_read_lens "$os_user" "$user_home" "$controller_user"
-  fi
-
-  if bridge_isolation_v2_active; then
-    # C1 exception: bypass the v2-noop public traverse chain and apply
-    # the grant directly. Same safety body via _bridge_linux_grant_traverse_paths.
-    #
-    # Scope is intentionally narrow per PR #399 r1 FAIL #13 — only what
-    # the kernel needs to resolve the symlink at
-    # `$user_home/.claude/.credentials.json` to
-    # `$controller_home/.claude/.credentials.json`:
-    #   1. traverse `--x` along every ancestor up to controller_home
-    #      (the unguarded helper above grants this on each ancestor,
-    #      including controller_claude_dir itself).
-    #   2. read `r--` on the credential file inode.
-    # No directory `r-x` (would let the isolated UID list ~/.claude/),
-    # no default ACL on ~/.claude/ (would extend grants to every new
-    # inode under there). Re-auth's atomic-rename produces a new inode
-    # without an inherited ACL, so start/daemon preflights call this helper
-    # again and explicitly restore both the named-user grant and ACL mask.
-    _bridge_linux_grant_traverse_chain_unguarded "$os_user" "$controller_claude_dir" "$controller_home"
-    # PR-E r2 P1#3 fix: load-bearing setfacl call must fail-loud. The
-    # `|| true` of the prior version masked filesystem-ACL-disabled
-    # mounts, sudo failures, and missing-kernel-feature errors and let
-    # the symlink-plant step below succeed against an unreadable target —
-    # producing the exact runtime login-picker / EACCES failure this
-    # surface is meant to make fail-fast. This is the only v2 surface
-    # that retains a named-user ACL (KNOWN_ISSUES.md §16).
-    bridge_linux_sudo_root setfacl -m "u:${os_user}:r--" "$controller_cred_file" \
-      || bridge_die "claude cred ACL: setfacl r-- on $controller_cred_file failed (v2+claude requires functional ACLs on this surface; see KNOWN_ISSUES.md §16)"
-    bridge_linux_sudo_root setfacl -m "m::r--" "$controller_cred_file" \
-      || bridge_die "claude cred ACL: setfacl mask r-- on $controller_cred_file failed (v2+claude requires the ACL mask to preserve the isolated UID read grant)"
-  else
-    bridge_linux_grant_traverse_chain "$os_user" "$controller_claude_dir" "$controller_home"
-    bridge_linux_acl_add "u:${os_user}:r-x" "$controller_claude_dir" >/dev/null 2>&1 || true
-    bridge_linux_acl_add "u:${os_user}:r--" "$controller_cred_file" >/dev/null 2>&1 || true
-    bridge_linux_sudo_root setfacl -m "m::r--" "$controller_cred_file" >/dev/null 2>&1 || true
-    bridge_linux_sudo_root setfacl -d -m "u:${os_user}:r--" "$controller_claude_dir" >/dev/null 2>&1 || true
-  fi
-
-  if [[ -L "$isolated_cred_link" ]]; then
-    current_target="$(readlink "$isolated_cred_link" 2>/dev/null || printf '')"
-    if [[ "$current_target" == "$controller_cred_file" ]]; then
-      return 0
-    fi
-    bridge_linux_sudo_root rm -f "$isolated_cred_link"
-  elif [[ -e "$isolated_cred_link" ]]; then
-    bridge_linux_sudo_root rm -f "$isolated_cred_link"
-  fi
-  bridge_linux_sudo_root ln -s "$controller_cred_file" "$isolated_cred_link"
-  bridge_linux_sudo_root chown -h "$os_user" "$isolated_cred_link" >/dev/null 2>&1 || true
-}
-
-bridge_linux_repair_claude_credentials_access() {
-  local agent="$1"
-  local os_user=""
-  local user_home=""
-  local controller_user=""
-  local engine=""
-
-  [[ "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]] || return 0
-  bridge_agent_linux_user_isolation_effective "$agent" || return 0
-  engine="$(bridge_agent_engine "$agent")"
-  [[ "$engine" == "claude" ]] || return 0
-
-  # Item 13 (PR #442 r2): repair is best-effort. Skip cleanly when sudo is
-  # unavailable (CI without sudo, dev shell without sudo) — without this
-  # guard, the inner bridge_linux_sudo_root would bridge_die on the start /
-  # daemon-health path even when the repair would otherwise be a no-op.
-  bridge_linux_have_sudo_or_skip || return 0
-
-  os_user="$(bridge_agent_os_user "$agent")"
-  [[ -n "$os_user" ]] || return 0
-  user_home="$(getent passwd "$os_user" 2>/dev/null | cut -d: -f6 || true)"
-  [[ -n "$user_home" ]] || return 0
-  controller_user="$(bridge_current_user)"
-  [[ -n "$controller_user" ]] || return 0
-
-  bridge_linux_grant_claude_credentials_access "$os_user" "$user_home" "$controller_user" "$engine"
-}
-
-bridge_linux_acl_add_recursive() {
-  local spec="$1"
-  shift || true
-  (($# > 0)) || return 0
-  if bridge_isolation_v2_active; then
-    return 0
-  fi
-  bridge_linux_sudo_root setfacl -R -m "$spec" "$@"
-}
-
-bridge_linux_acl_remove_recursive() {
-  local spec="$1"
-  shift || true
-  (($# > 0)) || return 0
-  if bridge_isolation_v2_active; then
-    return 0
-  fi
-  bridge_linux_sudo_root setfacl -R -x "$spec" "$@" >/dev/null 2>&1 || true
-}
-
-bridge_linux_acl_add_default_dirs_recursive() {
-  local spec="$1"
-  shift || true
-  local path=""
-
-  if bridge_isolation_v2_active; then
-    return 0
-  fi
-  for path in "$@"; do
-    [[ -d "$path" ]] || continue
-    bridge_linux_sudo_root find "$path" -type d -exec setfacl -d -m "$spec" {} +
-  done
-}
-
-# Iterate the agent's declared channel state .env files and re-apply the
-# controller named-user ACL plus mask::rwX. Recovers from two observed
-# failure modes in v0.6.17:
-#   - POSIX ACL mask drifted to `---` after an unrelated chmod elsewhere
-#     reset the mask to the file's group bits (group is 0 on these .env
-#     files), which silently nullifies all named-user entries' effective
-#     bits. Daemon's grep against the file then returns EACCES, the
-#     channel status reads "miss", and a noisy channel-health task is
-#     enqueued every cycle.
-#   - The controller named-user entry was lost entirely (a fresh write
-#     of the file by an external tool dropped the named-user ACL).
-#
-# Scope is intentionally narrow: known channel state .env files for one
-# isolated agent. Other files and other agents are out of scope so the
-# blast radius stays bounded. Helper is best-effort throughout (any
-# setfacl failure is swallowed) so the caller can still fall through to
-# the existing miss/credentials path on a real credentials problem.
-#
-# bridge_plugin_channel_state_dir lookup is sidestepped here so this
-# helper works whether or not PR #363's ms365 case has merged into the
-# tree being deployed: each declared `plugin:<id>` channel is mapped
-# directly to `${workdir}/.<id>` for the four channel kinds we ship.
-bridge_linux_acl_repair_channel_env_files() {
-  local agent="$1"
-
-  # PR-E: v2 mode does not use named-user ACLs on channel state files
-  # (the per-agent group + 2770 channel target dir + umask 007 covers
-  # both isolated and controller access), so the ACL mask drift class
-  # this helper exists to recover from cannot occur. Early-return before
-  # any sudo/controller/workdir resolve so the daemon stays cheap.
-  if bridge_isolation_v2_active; then
-    return 0
-  fi
-
-  bridge_linux_have_sudo_or_skip || return 0
-
-  local controller_user
-  controller_user="$(bridge_current_user 2>/dev/null || true)"
-  [[ -n "$controller_user" ]] || return 0
-
-  local workdir
-  workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
-  [[ -n "$workdir" ]] || return 0
-
-  local channels_csv
-  channels_csv="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
-  [[ -n "$channels_csv" ]] || return 0
-
-  local IFS=',' tokens=()
-  read -ra tokens <<<"$channels_csv"
-
-  local token id state_dir env_file
-  for token in "${tokens[@]}"; do
-    token="${token// /}"
-    [[ "$token" == plugin:* ]] || continue
-    id="${token#plugin:}"
-    id="${id%%@*}"
-    case "$id" in
-      discord|telegram|teams|ms365) ;;
-      *) continue ;;
-    esac
-    state_dir="$workdir/.$id"
-
-    # Use sudo test, not bash `[[ -d ... ]]`, because the controller
-    # named-user traverse on the workdir may have drifted too — the
-    # check needs to succeed via root.
-    bridge_linux_sudo_root test -d "$state_dir" || continue
-
-    # Repair the state dir's ACL too (small hardening — mask drift on
-    # the dir would make file-level repair unreachable on the next
-    # daemon read).
-    bridge_linux_sudo_root setfacl \
-      -m "u:${controller_user}:rwX" \
-      -m "m::rwX" \
-      "$state_dir" >/dev/null 2>&1 || true
-
-    env_file="$state_dir/.env"
-    bridge_linux_sudo_root test -f "$env_file" || continue
-
-    bridge_linux_sudo_root setfacl \
-      -m "u:${controller_user}:rw-" \
-      -m "m::rwX" \
-      "$env_file" >/dev/null 2>&1 || true
-  done
 }
 
 # Emit ACL metadata (not file contents) for each declared channel state
@@ -1246,145 +807,12 @@ bridge_agent_channel_acl_diagnostics_text() {
   fi
 }
 
-# PR-E refactor: emit the traversal path list (one per line, root-to-leaf
-# order). Owns the `/` reject, missing-stop reject, Python normalization,
-# and ancestor-of-target check. Public + private wrappers below share this
-# emitter so the v2 credential exception cannot drift away from the
-# traversal safety guards.
-_bridge_linux_grant_traverse_paths() {
-  local target="$1"
-  local stop_path="${2:-}"
-
-  if [[ -z "$stop_path" ]]; then
-    bridge_warn "_bridge_linux_grant_traverse_paths: missing stop_path for target=$target (skipping grant to avoid ancestor poisoning)"
-    return 0
-  fi
-  case "$stop_path" in
-    "/"|"")
-      bridge_warn "_bridge_linux_grant_traverse_paths: refusing stop_path=\"$stop_path\" for target=$target (would poison filesystem root)"
-      return 0
-      ;;
-  esac
-
-  python3 - "$target" "$stop_path" <<'PY'
-from pathlib import Path
-import sys
-
-target = Path(sys.argv[1]).expanduser().resolve()
-stop_raw = Path(sys.argv[2]).expanduser().resolve()
-
-# Stop can be a file — walk terminates at its parent directory.
-stop = stop_raw if stop_raw.is_dir() else stop_raw.parent
-
-if target != stop and stop not in target.parents:
-    sys.exit(0)
-
-items = []
-current = target
-while True:
-    items.append(str(current))
-    if current == stop:
-        break
-    if current.parent == current:
-        break
-    current = current.parent
-
-for item in reversed(items):
-    print(item)
-PY
-}
-
-bridge_linux_grant_traverse_chain() {
-  # Grant `u:${os_user}:--x` on every directory from $target up to
-  # (and including) $stop_path. Callers must pass an explicit stop_path
-  # — it used to default to `/`, which is how issue #233 happened.
-  # `/` is always rejected as a stop_path so an accidental empty-string
-  # or regressed caller cannot reinstate the bug.
-  #
-  # PR-E: in v2 mode this is a no-op via bridge_linux_acl_add. The
-  # Claude credential exception uses _bridge_linux_grant_traverse_chain_unguarded
-  # below, which shares the path emitter but bypasses the v2 guard.
-  local os_user="$1"
-  local target="$2"
-  local stop_path="${3:-}"
-  local path=""
-
-  while IFS= read -r path; do
-    [[ -d "$path" ]] || continue
-    bridge_linux_acl_add "u:${os_user}:--x" "$path"
-  done < <(_bridge_linux_grant_traverse_paths "$target" "$stop_path")
-}
-
-# PR-E private helper — grant traversal directly via setfacl, bypassing
-# the public v2 short-circuit. ONLY for use by the Claude credential
-# exception (bridge_linux_grant_claude_credentials_access). Shares the
-# safety body above so the `/` reject, missing-stop reject, Python
-# normalization, and ancestor check stay in lockstep with the public path.
-_bridge_linux_grant_traverse_chain_unguarded() {
-  local os_user="$1"
-  local target="$2"
-  local stop_path="${3:-}"
-  local path=""
-
-  while IFS= read -r path; do
-    [[ -d "$path" ]] || continue
-    bridge_linux_sudo_root setfacl -m "u:${os_user}:--x" "$path" >/dev/null 2>&1 || true
-  done < <(_bridge_linux_grant_traverse_paths "$target" "$stop_path")
-}
-
 bridge_linux_revoke_traverse_chain() {
-  # Mirror of bridge_linux_grant_traverse_chain: remove `u:${os_user}` from
-  # every directory between $target and $stop_path (inclusive). Stop_path
-  # follows the same `/` and empty-string guards as the grant function so
-  # an accidental call cannot strip ACLs from filesystem ancestors.
-  #
-  # PR-E: v2 mode has no named-user ACLs to revoke (group-setgid contract),
-  # so this is a no-op when bridge_isolation_v2_active.
-  if bridge_isolation_v2_active; then
-    return 0
-  fi
-  local os_user="$1"
-  local target="$2"
-  local stop_path="${3:-}"
-
-  if [[ -z "$stop_path" ]]; then
-    bridge_warn "bridge_linux_revoke_traverse_chain: missing stop_path for target=$target (skipping)"
-    return 0
-  fi
-  case "$stop_path" in
-    "/"|"")
-      bridge_warn "bridge_linux_revoke_traverse_chain: refusing stop_path=\"$stop_path\" for target=$target"
-      return 0
-      ;;
-  esac
-
-  bridge_require_python
-  local path=""
-  while IFS= read -r path; do
-    [[ -d "$path" ]] || continue
-    bridge_linux_sudo_root setfacl -x "u:${os_user}" "$path" >/dev/null 2>&1 || true
-  done < <(python3 - "$target" "$stop_path" <<'PY'
-from pathlib import Path
-import sys
-
-target = Path(sys.argv[1]).expanduser().resolve()
-stop_raw = Path(sys.argv[2]).expanduser().resolve()
-stop = stop_raw if stop_raw.is_dir() else stop_raw.parent
-if target != stop and stop not in target.parents:
-    sys.exit(0)
-items = []
-current = target
-while True:
-    items.append(str(current))
-    if current == stop:
-        break
-    if current.parent == current:
-        break
-    current = current.parent
-for item in reversed(items):
-    print(item)
-PY
-)
+  # v2 hard-cut: per-agent group + setgid layout has no named-user ACLs to
+  # revoke. Retained as a no-op stub so v1-era callers (lib/bridge-migration.sh
+  # unisolate path, lib/bridge-agents.sh:bridge_linux_revoke_plugin_channel_grants)
+  # link cleanly without each caller having to be re-plumbed in this PR.
+  return 0
 }
 
 bridge_resolve_plugin_install_path() {
@@ -2053,22 +1481,18 @@ PY
 
   bridge_linux_sudo_root chown root:root "$catalog_tmp"
   bridge_linux_sudo_root chmod 0640 "$catalog_tmp"
-  if bridge_isolation_v2_active; then
-    if [[ -n "$agent" ]]; then
-      local _v2_grp
-      _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
-        || _v2_grp=""
-      if [[ -n "$_v2_grp" ]]; then
-        bridge_linux_sudo_root chgrp "$_v2_grp" "$catalog_tmp" \
-          || bridge_die "isolation v2: chgrp '$_v2_grp' on marketplace catalog '$catalog_tmp' failed"
-      else
-        bridge_die "isolation v2: cannot resolve agent group for marketplace catalog '$catalog_tmp'"
-      fi
+  if [[ -n "$agent" ]]; then
+    local _v2_grp
+    _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
+      || _v2_grp=""
+    if [[ -n "$_v2_grp" ]]; then
+      bridge_linux_sudo_root chgrp "$_v2_grp" "$catalog_tmp" \
+        || bridge_die "isolation v2: chgrp '$_v2_grp' on marketplace catalog '$catalog_tmp' failed"
     else
-      bridge_die "isolation v2: bridge_write_isolated_known_marketplaces_catalog requires agent id"
+      bridge_die "isolation v2: cannot resolve agent group for marketplace catalog '$catalog_tmp'"
     fi
   else
-    bridge_linux_acl_add "u:${os_user}:r--" "$catalog_tmp"
+    bridge_die "isolation v2: bridge_write_isolated_known_marketplaces_catalog requires agent id"
   fi
   bridge_linux_sudo_root mv "$catalog_tmp" "$catalog"
 }
@@ -2188,29 +1612,11 @@ bridge_isolated_plugin_grants_remove() {
 }
 
 bridge_linux_revoke_plugin_channel_grants() {
-  # Strip the per-channel install-path ACL + traverse-chain + isolated
-  # catalog symlink for one plugin channel. Mirror of the per-channel
-  # grant block in bridge_linux_share_plugin_catalog and the per-channel
-  # strip block in bridge_migration_unisolate; factored here so both
-  # reapply (when a channel is removed mid-run) and unisolate (full
-  # teardown) share one implementation.
-  #
-  # PR-E: in v2 mode there are no named-user ACL grants to revoke
-  # (the v2 group-setgid contract handles isolation via group membership),
-  # so this is a no-op when bridge_isolation_v2_active.
-  if bridge_isolation_v2_active; then
-    return 0
-  fi
-  local os_user="$1"
-  local plugin_id="$2"
-  local controller_plugins="$3"
-  local controller_home="$4"
-  local install_path=""
-  install_path="$(bridge_resolve_plugin_install_path "$plugin_id" "$controller_plugins")"
-  if [[ -n "$install_path" && -d "$install_path" ]]; then
-    bridge_linux_sudo_root setfacl -Rx "u:${os_user}" "$install_path" >/dev/null 2>&1 || true
-    bridge_linux_revoke_traverse_chain "$os_user" "$install_path" "$controller_home"
-  fi
+  # v2 hard-cut: per-agent group + setgid layout has no named-user ACL grants
+  # to revoke; the per-channel strip step in unisolate is now handled entirely
+  # by group-membership teardown. Retained as a no-op stub so existing callers
+  # (bridge_migration_unisolate, reapply path) link cleanly.
+  return 0
 }
 
 bridge_write_isolated_installed_plugins_manifest() {
@@ -2466,26 +1872,21 @@ PY
   # (Blocking 2 in PR #302 r2.)
   bridge_linux_sudo_root chown root:root "$manifest_tmp"
   bridge_linux_sudo_root chmod 0640 "$manifest_tmp"
-  if bridge_isolation_v2_active; then
-    # PR-E: replace the named-user ACL with chgrp ab-agent-<name>. The
-    # isolated UID is a member of that group (PR-C ensure_user_in_group)
-    # and the manifest mode 0640 grants group r--. Owner stays root so
-    # the agent cannot tamper with which plugins it loads.
-    if [[ -n "$agent" ]]; then
-      local _v2_grp
-      _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
-        || _v2_grp=""
-      if [[ -n "$_v2_grp" ]]; then
-        bridge_linux_sudo_root chgrp "$_v2_grp" "$manifest_tmp" \
-          || bridge_die "isolation v2: chgrp '$_v2_grp' on manifest '$manifest_tmp' failed"
-      else
-        bridge_die "isolation v2: cannot resolve agent group for manifest '$manifest_tmp'"
-      fi
+  # v2: chgrp ab-agent-<name>. The isolated UID is a member of that group
+  # (PR-C ensure_user_in_group) and the manifest mode 0640 grants group r--.
+  # Owner stays root so the agent cannot tamper with which plugins it loads.
+  if [[ -n "$agent" ]]; then
+    local _v2_grp
+    _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
+      || _v2_grp=""
+    if [[ -n "$_v2_grp" ]]; then
+      bridge_linux_sudo_root chgrp "$_v2_grp" "$manifest_tmp" \
+        || bridge_die "isolation v2: chgrp '$_v2_grp' on manifest '$manifest_tmp' failed"
     else
-      bridge_die "isolation v2: bridge_write_isolated_installed_plugins_manifest requires agent id (PR-E signature change)"
+      bridge_die "isolation v2: cannot resolve agent group for manifest '$manifest_tmp'"
     fi
   else
-    bridge_linux_acl_add "u:${os_user}:r--" "$manifest_tmp"
+    bridge_die "isolation v2: bridge_write_isolated_installed_plugins_manifest requires agent id (PR-E signature change)"
   fi
   bridge_linux_sudo_root mv "$manifest_tmp" "$manifest"
 }
@@ -2562,15 +1963,15 @@ bridge_linux_share_plugin_catalog() {
   local controller_plugins=""
   if controller_plugins="$(bridge_isolation_v2_shared_plugins_root 2>/dev/null)"; then
     :
-  elif bridge_isolation_v2_active; then
-    # PR-E r3 P2#4 (narrow): in v2 mode the legacy controller_home
-    # fallback is unsafe — traverse_chain and acl_add no-op, so
-    # symlinks under controller_home would be unreadable for the
-    # isolated UID. BUT: if the agent has nothing to share (empty
-    # channel-plugin union and empty plugin allowlist), there is no
-    # symlink to plant and no manifest to write. Codex / no-plugin
-    # Claude agents must not be blocked by an empty cache. Compute the
-    # union here and short-circuit before failing loud.
+  else
+    # v2 hard-cut: shared plugin cache is the only supported source of plugin
+    # catalog metadata. The legacy controller_home/.claude/plugins fallback is
+    # unsafe in v2 because the per-agent group has no traverse path under
+    # controller_home. BUT: if the agent has nothing to share (empty channel-plugin
+    # union and empty plugin allowlist), there is no symlink to plant and no
+    # manifest to write. Codex / no-plugin Claude agents must not be blocked
+    # by an empty cache. Compute the union here and short-circuit before
+    # failing loud.
     local _v2_pcg_channels="" _v2_pcg_plugins=""
     _v2_pcg_channels="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
     _v2_pcg_plugins="$(bridge_agent_plugins_csv "$agent" 2>/dev/null || true)"
@@ -2580,40 +1981,25 @@ bridge_linux_share_plugin_catalog() {
         && [[ -z "$_v2_pcg_plugins" ]]; then
       return 0
     fi
-    bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) but agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries. The legacy controller_home/.claude/plugins fallback is unsafe in v2 mode because the traverse/ACL helpers no-op and would plant unreadable symlinks. Populate the shared plugins cache (\`agb bundle install\` or seed installed_plugins.json into \$BRIDGE_SHARED_ROOT/plugins-cache) before starting v2-isolated agents that require plugins."
-  elif [[ -n "$controller_home" && -d "$controller_home/.claude/plugins" ]]; then
-    controller_plugins="$controller_home/.claude/plugins"
-  else
-    return 0
+    bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) but agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries. Populate the shared plugins cache (\`agb bundle install\` or seed installed_plugins.json into \$BRIDGE_SHARED_ROOT/plugins-cache) before starting v2-isolated agents that require plugins."
   fi
 
   local isolated_plugins="$user_home/.claude/plugins"
 
-  # PR-E: resolve the v2 agent group once for plugin root + marketplaces +
-  # manifest writer. Empty in legacy mode.
+  # Resolve the v2 agent group once for plugin root + marketplaces + manifest writer.
   local _v2_grp=""
-  if bridge_isolation_v2_active; then
-    _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
-      || _v2_grp=""
-    [[ -n "$_v2_grp" ]] || bridge_die "isolation v2: cannot resolve agent group for plugin catalog of '$agent'"
-  fi
+  _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
+    || _v2_grp=""
+  [[ -n "$_v2_grp" ]] || bridge_die "isolation v2: cannot resolve agent group for plugin catalog of '$agent'"
 
   # 1. plugins/ root: root-owned, group-traversable.
-  #    - legacy: chmod 0750 + named-user ACL grants the isolated UID r-x.
-  #    - v2:     chown root:ab-agent-<name>, chmod 2750. setgid bit means
-  #              new children inherit ab-agent-<name>; the isolated UID
-  #              reaches the dir via group r-x (no ACL needed).
+  #    chown root:ab-agent-<name>, chmod 2750. setgid bit means new children
+  #    inherit ab-agent-<name>; the isolated UID reaches the dir via group r-x.
   bridge_linux_sudo_root mkdir -p "$isolated_plugins"
-  if bridge_isolation_v2_active; then
-    bridge_linux_sudo_root chown "root:${_v2_grp}" "$isolated_plugins" \
-      || bridge_die "isolation v2: chown root:${_v2_grp} on '$isolated_plugins' failed"
-    bridge_linux_sudo_root chmod 2750 "$isolated_plugins" \
-      || bridge_die "isolation v2: chmod 2750 on '$isolated_plugins' failed"
-  else
-    bridge_linux_sudo_root chown root:root "$isolated_plugins"
-    bridge_linux_sudo_root chmod 0750 "$isolated_plugins"
-    bridge_linux_acl_add "u:${os_user}:r-x" "$isolated_plugins"
-  fi
+  bridge_linux_sudo_root chown "root:${_v2_grp}" "$isolated_plugins" \
+    || bridge_die "isolation v2: chown root:${_v2_grp} on '$isolated_plugins' failed"
+  bridge_linux_sudo_root chmod 2750 "$isolated_plugins" \
+    || bridge_die "isolation v2: chmod 2750 on '$isolated_plugins' failed"
 
   # 2. plugins/data/: isolated UID owns this so plugin runtime state writes work.
   local os_group=""
@@ -2648,8 +2034,9 @@ bridge_linux_share_plugin_catalog() {
     [[ -e "$src" ]] || continue
     bridge_linux_sudo_root ln -s "$src" "$dst"
     bridge_linux_sudo_root chown -h root:root "$dst" >/dev/null 2>&1 || true
-    bridge_linux_grant_traverse_chain "$os_user" "$src" "$controller_home"
-    bridge_linux_acl_add "u:${os_user}:r--" "$src"
+    # v2: shared-plugins-cache root is base-readable (`other::r-x`); no
+    # named-user ACL needed. Group r-X on the source dir + setgid layout
+    # already covers the isolated UID.
   done
 
   # 4. Filtered per-UID known_marketplaces.json — declared marketplaces only,
@@ -2737,8 +2124,11 @@ bridge_linux_share_plugin_catalog() {
     fi
   done
 
-  # 6b. Grant current plugin install paths + traverse chain (channel-declared
-  #     plus BRIDGE_AGENT_PLUGINS allowlist entries).
+  # 6b. v2: plugin install paths live under the shared plugins cache
+  # (group ab-shared, base-readable), so the isolated UID reaches them
+  # via group r-x without any per-plugin named-user ACL or traverse-chain
+  # grant. Iterate the channels purely so the persisted grant-set in step
+  # 6c stays accurate.
   local channel=""
   local plugin_id=""
   local install_path=""
@@ -2746,11 +2136,6 @@ bridge_linux_share_plugin_catalog() {
     plugin_id="${channel#plugin:}"
     install_path="$(bridge_resolve_plugin_install_path "$plugin_id" "$controller_plugins")"
     [[ -n "$install_path" && -d "$install_path" ]] || continue
-    # Order matters: traverse_chain stamps `--x` on every node from target up
-    # to controller_home (including target). The recursive r-X grant must run
-    # AFTER so target/<file> entries end up with r--/r-x rather than --x.
-    bridge_linux_grant_traverse_chain "$os_user" "$install_path" "$controller_home"
-    bridge_linux_acl_add_recursive "u:${os_user}:r-X" "$install_path"
   done
 
   # 6b'. Marketplace symlinks (#348). For every union plugin in
@@ -2918,18 +2303,12 @@ bridge_linux_share_plugin_catalog() {
     _mkt_src="${_mkt_resolved_src[$_mkt_id]}"
     if (( _marketplaces_root_created == 0 )); then
       bridge_linux_sudo_root mkdir -p "$_isolated_marketplaces"
-      if bridge_isolation_v2_active; then
-        # PR-E: same group-mode contract as the plugins/ root above —
-        # root:ab-agent-<name> 2750 + setgid for new children.
-        bridge_linux_sudo_root chown "root:${_v2_grp}" "$_isolated_marketplaces" \
-          || bridge_die "isolation v2: chown root:${_v2_grp} on '$_isolated_marketplaces' failed"
-        bridge_linux_sudo_root chmod 2750 "$_isolated_marketplaces" \
-          || bridge_die "isolation v2: chmod 2750 on '$_isolated_marketplaces' failed"
-      else
-        bridge_linux_sudo_root chown root:root "$_isolated_marketplaces"
-        bridge_linux_sudo_root chmod 0750 "$_isolated_marketplaces"
-        bridge_linux_acl_add "u:${os_user}:r-x" "$_isolated_marketplaces"
-      fi
+      # v2: same group-mode contract as the plugins/ root above —
+      # root:ab-agent-<name> 2750 + setgid for new children.
+      bridge_linux_sudo_root chown "root:${_v2_grp}" "$_isolated_marketplaces" \
+        || bridge_die "isolation v2: chown root:${_v2_grp} on '$_isolated_marketplaces' failed"
+      bridge_linux_sudo_root chmod 2750 "$_isolated_marketplaces" \
+        || bridge_die "isolation v2: chmod 2750 on '$_isolated_marketplaces' failed"
       _marketplaces_root_created=1
     fi
     local -a _alias_arr=()
@@ -2941,21 +2320,10 @@ bridge_linux_share_plugin_catalog() {
       bridge_linux_sudo_root ln -s "$_mkt_src" "$_mkt_dst"
       bridge_linux_sudo_root chown -h root:root "$_mkt_dst" >/dev/null 2>&1 || true
     done
-    # r#362: end-to-end readability for the symlinked marketplace tree.
-    # Without all three steps, the symlink is planted but EACCES on first
-    # read and Claude silently drops the plugin from the session. Order
-    # matters: traverse_chain stamps `--x` on every node from target up
-    # to controller_home (including target). The recursive r-X grant
-    # must run AFTER so target/<file> entries end up with r--/r-x rather
-    # than --x. Default-ACL inheritance covers files added on the next
-    # marketplace refresh. Fail-loud throughout: a partially-applied ACL
-    # leaves the symlink planted but unusable, which defeats the fix.
-    bridge_linux_grant_traverse_chain "$os_user" "$_mkt_src" "$controller_home" || \
-      bridge_die "marketplace tree: failed to grant traverse chain to $_mkt_src"
-    bridge_linux_acl_add_recursive "u:${os_user}:r-X" "$_mkt_src" || \
-      bridge_die "marketplace tree: failed to grant recursive r-X ACL on $_mkt_src"
-    bridge_linux_acl_add_default_dirs_recursive "u:${os_user}:r-X" "$_mkt_src" || \
-      bridge_die "marketplace tree: failed to set default ACL inheritance on $_mkt_src"
+    # v2: marketplace source dirs live under $BRIDGE_SHARED_ROOT/plugins-cache
+    # (base-readable, group-readable). The setgid/group-mode chain on the
+    # shared cache root covers read access for the isolated UID without any
+    # named-user ACL or ancestor traverse grant.
   done
 
   # 6c. Persist the new grant set so the next reapply / unisolate sees
@@ -3402,8 +2770,10 @@ EOF
   # almost never contains the operator's per-user bin (e.g.
   # ~/.local/bin/claude), so the launcher's bare `claude` / `codex` call
   # would die with "command not found". Resolving on every start picks up
-  # CLI upgrades automatically; the matching ACL grant lives in
-  # bridge_linux_grant_engine_cli_access (one-shot at isolate time).
+  # CLI upgrades automatically. v2 still requires the engine CLI to
+  # live in a base-readable path (`other::r-x`); controller-home
+  # symlinks fail at runtime with `command not found` (no prepare-time
+  # check post-v0.8.0 — see KNOWN_ISSUES #17).
   if [[ "$isolation_mode" == "linux-user" ]]; then
     if [[ -n "$engine" ]]; then
       local _engine_cli _engine_dir
@@ -3418,8 +2788,7 @@ EOF
     # `agb` bare from a Bash tool subprocess. Only the curated shim at
     # ${BRIDGE_HOME}/bin/agb is exposed here — broader agent-bridge
     # subcommand surface stays gated behind PR4's default-deny design.
-    # Matching ACL grant lives in bridge_linux_grant_bin_dir_access
-    # (one-shot at isolate time).
+    # v2: $BRIDGE_HOME/bin is base-readable, no per-agent ACL needed.
     printf '\nexport PATH=%s:"${PATH:-/usr/local/bin:/usr/bin:/bin}"\n' \
       "$(printf '%q' "$BRIDGE_HOME/bin")" >>"$file"
   fi
@@ -3434,35 +2803,16 @@ EOF
   if [[ "$isolation_mode" == "linux-user" \
         && -n "$os_user" \
         && "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]]; then
-    if bridge_isolation_v2_active; then
-      local _v2_grp
-      _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
-        || _v2_grp=""
-      if [[ -n "$_v2_grp" ]]; then
-        bridge_linux_sudo_root chgrp "$_v2_grp" "$file" \
-          || bridge_die "isolation v2: chgrp '$_v2_grp' on env file '$file' failed"
-        bridge_linux_sudo_root chmod 0640 "$file" \
-          || bridge_die "isolation v2: chmod 0640 on env file '$file' failed"
-      else
-        bridge_die "isolation v2: cannot resolve agent group for env file '$file'"
-      fi
+    local _v2_grp
+    _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
+      || _v2_grp=""
+    if [[ -n "$_v2_grp" ]]; then
+      bridge_linux_sudo_root chgrp "$_v2_grp" "$file" \
+        || bridge_die "isolation v2: chgrp '$_v2_grp' on env file '$file' failed"
+      bridge_linux_sudo_root chmod 0640 "$file" \
+        || bridge_die "isolation v2: chmod 0640 on env file '$file' failed"
     else
-      # `chmod 600` maps to mask::--- on a file that already carries named-user
-      # ACLs (POSIX ACL: chmod's group bits drive the mask when named entries
-      # exist). isolate originally grants the isolated UID `u:<os_user>:r--` so
-      # it can read agent-env.sh under sudo-wrap, but the mask wipe makes that
-      # entry effective `---`, so subsequent `agent start` cycles fail silently
-      # — bridge-run.sh sources nothing, sees an empty roster, and exits before
-      # tmux is created. Re-apply the named-user ACL so setfacl recomputes the
-      # mask back to rw- (or whatever covers the named entries).
-      if command -v bridge_linux_acl_add >/dev/null 2>&1; then
-        local _controller_user
-        _controller_user="$(bridge_current_user 2>/dev/null || printf '')"
-        bridge_linux_acl_add "u:${os_user}:r--" "$file" >/dev/null 2>&1 || true
-        if [[ -n "$_controller_user" ]]; then
-          bridge_linux_acl_add "u:${_controller_user}:rw-" "$file" >/dev/null 2>&1 || true
-        fi
-      fi
+      bridge_die "isolation v2: cannot resolve agent group for env file '$file'"
     fi
   fi
 }
@@ -3480,27 +2830,21 @@ bridge_linux_prepare_agent_isolation() {
   local history_file=""
   local request_dir=""
   local response_dir=""
-  local other=""
-  local other_workdir=""
-  local other_queue_dir=""
-  local -a recursive_read_paths=()
-  local -a recursive_write_paths=()
-  local -a hidden_paths=()
 
   [[ "$(bridge_host_platform)" == "Linux" ]] || return 0
   [[ -n "$os_user" ]] || bridge_die "linux-user isolation requires os_user"
 
-  # PR-E r2 P1#2 fix: in v2 mode, the channel symlink + workdir mutations
-  # downstream perform check-then-mutate sequences on paths whose parent
-  # is owned by the isolated UID. A running agent could win a swap race
-  # between guard and mutation. Require the agent's tmux session to be
-  # quiesced before prepare/reapply so the isolated UID cannot race.
+  # v2: channel symlink + workdir mutations downstream perform
+  # check-then-mutate sequences on paths whose parent is owned by the
+  # isolated UID. A running agent could win a swap race between guard and
+  # mutation. Require the agent's tmux session to be quiesced before
+  # prepare/reapply so the isolated UID cannot race.
   # Install path (fresh agent) has no session yet → loop no-ops.
   # Reapply / migration path (running agent) → operator must stop first.
   # BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING is an opt-out for sandboxed
   # smoke fixtures that simulate isolation prepare without a real tmux
   # binary on the host.
-  if bridge_isolation_v2_active && [[ "${BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING:-0}" != "1" ]]; then
+  if [[ "${BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING:-0}" != "1" ]]; then
     local _quiesce_session=""
     _quiesce_session="$(bridge_agent_session "$agent" 2>/dev/null || printf '')"
     if [[ -n "$_quiesce_session" ]] \
@@ -3510,15 +2854,8 @@ bridge_linux_prepare_agent_isolation() {
     fi
   fi
 
-  # PR-E: setfacl is the legacy-mode prerequisite. v2 mode replaces named-
-  # user ACLs with group setgid except for the Claude credential exception
-  # (bridge_linux_grant_claude_credentials_access), so v2 still requires
-  # setfacl when engine=claude. v2 + non-claude can skip the package.
-  if ! bridge_isolation_v2_active; then
-    bridge_linux_require_setfacl
-  elif [[ "$(bridge_agent_engine "$agent")" == "claude" ]]; then
-    bridge_linux_require_setfacl
-  fi
+  # v2: all isolation surfaces use group setgid; no named-user ACLs are
+  # applied during prepare. setfacl is no longer a hard prereq here.
   user_home="$(bridge_agent_linux_user_home "$os_user")"
   env_file="$(bridge_agent_linux_env_file "$agent")"
   runtime_state_dir="$(bridge_agent_runtime_state_dir "$agent")"
@@ -3546,276 +2883,82 @@ bridge_linux_prepare_agent_isolation() {
   # The root mode 2750 means unrelated UIDs cannot traverse/list the
   # private root; the isolated UID enters via group r-x but cannot write
   # at the root level — so it cannot rm/mv `credentials/` or its file.
-  if bridge_isolation_v2_active; then
-    local _v2_agent_group _v2_agent_root _v2_credentials_dir _v2_subdir
-    _v2_agent_group="$(bridge_isolation_v2_agent_group_name "$agent")" \
-      || bridge_die "isolation v2: invalid agent name '$agent' for group composition"
-    bridge_isolation_v2_ensure_group "$_v2_agent_group" \
-      || bridge_die "isolation v2: cannot ensure group '$_v2_agent_group'"
-    bridge_isolation_v2_ensure_user_in_group "$os_user" "$_v2_agent_group" \
-      || bridge_die "isolation v2: cannot add '$os_user' to '$_v2_agent_group'"
-    bridge_isolation_v2_ensure_user_in_group "$controller_user" "$_v2_agent_group" \
-      || bridge_die "isolation v2: cannot add controller '$controller_user' to '$_v2_agent_group'"
+  local _v2_agent_group _v2_agent_root _v2_credentials_dir _v2_subdir
+  _v2_agent_group="$(bridge_isolation_v2_agent_group_name "$agent")" \
+    || bridge_die "isolation v2: invalid agent name '$agent' for group composition"
+  bridge_isolation_v2_ensure_group "$_v2_agent_group" \
+    || bridge_die "isolation v2: cannot ensure group '$_v2_agent_group'"
+  bridge_isolation_v2_ensure_user_in_group "$os_user" "$_v2_agent_group" \
+    || bridge_die "isolation v2: cannot add '$os_user' to '$_v2_agent_group'"
+  bridge_isolation_v2_ensure_user_in_group "$controller_user" "$_v2_agent_group" \
+    || bridge_die "isolation v2: cannot add controller '$controller_user' to '$_v2_agent_group'"
 
-    # PR-E: shared-group membership. PR-C migration adds existing agents
-    # to ab-shared, but a new/reapplied agent through prepare must also
-    # join so bridge_linux_share_plugin_catalog can read the shared
-    # plugin cache. ensure_group is idempotent. Controller missing from
-    # ab-shared is recoverable iff the operator's own context can still
-    # read the shared plugin cache (group bit on a session that already
-    # had ab-shared, or shared-group home with `other` bit), so escalate
-    # the warn to die only when readability fails.
-    local _v2_shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
-    bridge_isolation_v2_ensure_group "$_v2_shared_grp" \
-      || bridge_die "isolation v2: cannot ensure shared group '$_v2_shared_grp'"
-    bridge_isolation_v2_ensure_user_in_group "$os_user" "$_v2_shared_grp" \
-      || bridge_die "isolation v2: cannot add '$os_user' to shared group '$_v2_shared_grp'"
-    if ! bridge_isolation_v2_ensure_user_in_group "$controller_user" "$_v2_shared_grp"; then
-      bridge_warn "isolation v2: controller '$controller_user' membership update for '$_v2_shared_grp' failed; verifying shared plugin cache readability"
-      local _v2_shared_plugins_root
-      _v2_shared_plugins_root="$(bridge_isolation_v2_shared_plugins_root 2>/dev/null || printf '')"
-      if [[ -n "$_v2_shared_plugins_root" && -e "$_v2_shared_plugins_root" \
-            && ! -r "$_v2_shared_plugins_root" ]]; then
-        bridge_die "isolation v2: controller cannot read shared plugin cache '$_v2_shared_plugins_root'; group membership update for '$_v2_shared_grp' must succeed (re-login the controller after manual usermod, then retry)"
-      fi
-    fi
-
-    _v2_agent_root="$(bridge_isolation_v2_agent_root "$agent")" \
-      || bridge_die "isolation v2: cannot resolve per-agent root for '$agent'"
-    bridge_linux_sudo_root mkdir -p "$_v2_agent_root"
-    bridge_linux_sudo_root chown root: "$_v2_agent_root"
-    bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_agent_root"
-    bridge_linux_sudo_root chmod 2750 "$_v2_agent_root"
-    for _v2_subdir in home workdir runtime logs requests responses; do
-      bridge_linux_sudo_root mkdir -p "$_v2_agent_root/$_v2_subdir"
-      bridge_linux_sudo_root chown "$os_user" "$_v2_agent_root/$_v2_subdir"
-      bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_agent_root/$_v2_subdir"
-      bridge_linux_sudo_root chmod 2770 "$_v2_agent_root/$_v2_subdir"
-    done
-    _v2_credentials_dir="$(bridge_isolation_v2_agent_credentials_dir "$agent")"
-    bridge_linux_sudo_root mkdir -p "$_v2_credentials_dir"
-    bridge_linux_sudo_root chown "$controller_user" "$_v2_credentials_dir"
-    bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_credentials_dir"
-    bridge_linux_sudo_root chmod 2750 "$_v2_credentials_dir"
-    # If a launch-secrets.env already exists (carried over from a previous
-    # prepare cycle or seeded by migration), normalize its ownership/mode.
-    # We do not create it here — the operator/migration tool plants it.
-    local _v2_secrets_file
-    _v2_secrets_file="$(bridge_isolation_v2_agent_secret_env_file "$agent")"
-    if bridge_linux_sudo_root test -f "$_v2_secrets_file"; then
-      bridge_linux_sudo_root chown "$controller_user" "$_v2_secrets_file"
-      bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_secrets_file"
-      bridge_linux_sudo_root chmod 0640 "$_v2_secrets_file"
+  # Shared-group membership. PR-C migration adds existing agents to
+  # ab-shared, but a new/reapplied agent through prepare must also join so
+  # bridge_linux_share_plugin_catalog can read the shared plugin cache.
+  # ensure_group is idempotent. Controller missing from ab-shared is
+  # recoverable iff the operator's own context can still read the shared
+  # plugin cache, so escalate the warn to die only when readability fails.
+  local _v2_shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
+  bridge_isolation_v2_ensure_group "$_v2_shared_grp" \
+    || bridge_die "isolation v2: cannot ensure shared group '$_v2_shared_grp'"
+  bridge_isolation_v2_ensure_user_in_group "$os_user" "$_v2_shared_grp" \
+    || bridge_die "isolation v2: cannot add '$os_user' to shared group '$_v2_shared_grp'"
+  if ! bridge_isolation_v2_ensure_user_in_group "$controller_user" "$_v2_shared_grp"; then
+    bridge_warn "isolation v2: controller '$controller_user' membership update for '$_v2_shared_grp' failed; verifying shared plugin cache readability"
+    local _v2_shared_plugins_root
+    _v2_shared_plugins_root="$(bridge_isolation_v2_shared_plugins_root 2>/dev/null || printf '')"
+    if [[ -n "$_v2_shared_plugins_root" && -e "$_v2_shared_plugins_root" \
+          && ! -r "$_v2_shared_plugins_root" ]]; then
+      bridge_die "isolation v2: controller cannot read shared plugin cache '$_v2_shared_plugins_root'; group membership update for '$_v2_shared_grp' must succeed (re-login the controller after manual usermod, then retry)"
     fi
   fi
 
-  recursive_read_paths+=("$BRIDGE_HOOKS_DIR" "$BRIDGE_SHARED_DIR")
-  [[ -d "$BRIDGE_RUNTIME_ROOT" ]] && recursive_read_paths+=("$BRIDGE_RUNTIME_ROOT")
-  [[ -d "$BRIDGE_HOME/.claude" ]] && recursive_read_paths+=("$BRIDGE_HOME/.claude")
-  [[ -d "$BRIDGE_HOME/lib" ]] && recursive_read_paths+=("$BRIDGE_HOME/lib")
-  # Note: $BRIDGE_HOME/plugins (directory-marketplace source for agent-bridge
-  # plugins like teams/ms365) is intentionally NOT in the broad recursive_read
-  # set. bridge_linux_share_plugin_catalog grants r-X to declared plugin code
-  # paths only, keyed off BRIDGE_AGENT_CHANNELS, so each isolated UID sees
-  # only its own plugins.
-  [[ -d "$BRIDGE_HOME/scripts" ]] && recursive_read_paths+=("$BRIDGE_HOME/scripts")
-  [[ -d "$BRIDGE_AGENT_HOME_ROOT/.claude" ]] && recursive_read_paths+=("$BRIDGE_AGENT_HOME_ROOT/.claude")
-  bridge_linux_acl_remove_recursive "u:${os_user}" "$BRIDGE_STATE_DIR" "$BRIDGE_LOG_DIR"
+  _v2_agent_root="$(bridge_isolation_v2_agent_root "$agent")" \
+    || bridge_die "isolation v2: cannot resolve per-agent root for '$agent'"
+  bridge_linux_sudo_root mkdir -p "$_v2_agent_root"
+  bridge_linux_sudo_root chown root: "$_v2_agent_root"
+  bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_agent_root"
+  bridge_linux_sudo_root chmod 2750 "$_v2_agent_root"
+  for _v2_subdir in home workdir runtime logs requests responses; do
+    bridge_linux_sudo_root mkdir -p "$_v2_agent_root/$_v2_subdir"
+    bridge_linux_sudo_root chown "$os_user" "$_v2_agent_root/$_v2_subdir"
+    bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_agent_root/$_v2_subdir"
+    bridge_linux_sudo_root chmod 2770 "$_v2_agent_root/$_v2_subdir"
+  done
+  _v2_credentials_dir="$(bridge_isolation_v2_agent_credentials_dir "$agent")"
+  bridge_linux_sudo_root mkdir -p "$_v2_credentials_dir"
+  bridge_linux_sudo_root chown "$controller_user" "$_v2_credentials_dir"
+  bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_credentials_dir"
+  bridge_linux_sudo_root chmod 2750 "$_v2_credentials_dir"
+  # If a launch-secrets.env already exists (carried over from a previous
+  # prepare cycle or seeded by migration), normalize its ownership/mode.
+  # We do not create it here — the operator/migration tool plants it.
+  local _v2_secrets_file
+  _v2_secrets_file="$(bridge_isolation_v2_agent_secret_env_file "$agent")"
+  if bridge_linux_sudo_root test -f "$_v2_secrets_file"; then
+    bridge_linux_sudo_root chown "$controller_user" "$_v2_secrets_file"
+    bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_secrets_file"
+    bridge_linux_sudo_root chmod 0640 "$_v2_secrets_file"
+  fi
+
   bridge_linux_sudo_root mkdir -p "$runtime_state_dir" "$log_dir" "$queue_gateway_root" "$queue_gateway_agent_dir" "$request_dir" "$response_dir" "$(dirname "$history_file")"
   bridge_linux_sudo_root touch "$audit_file" "$history_file"
 
   # memory-daily state trees for the harvester (issue #219):
-  #   <state>/memory-daily/                         — traverse only (r-x)
-  #   <state>/memory-daily/<agent>/                 — per-agent rwX
-  #   <state>/memory-daily/shared/aggregate/        — shared rwX (all isolated
-  #     agents write to the fcntl.flock-guarded aggregate files; no cross-agent
-  #     directory-entry tampering because peer <agent>/ dirs remain un-ACL'd)
-  local memory_daily_root memory_daily_agent_dir memory_daily_shared_aggregate_dir
-  if bridge_isolation_v2_active; then
-    # v2 layout: per-agent memory-daily lives inside the per-agent root
-    # (group-isolated), shared aggregate lives under BRIDGE_SHARED_ROOT
-    # so other agents' harvesters can read it via ab-shared. The legacy
-    # `memory_daily_root` aggregate (BRIDGE_STATE_DIR/memory-daily) is no
-    # longer the source of truth in v2 — we keep an empty value so any
-    # later legacy-only ACL grant on it short-circuits below.
-    memory_daily_root=""
-    memory_daily_agent_dir="$(bridge_isolation_v2_agent_memory_daily_root "$agent")"
-    memory_daily_shared_aggregate_dir="$(bridge_isolation_v2_memory_daily_shared_aggregate_dir)"
-  else
-    memory_daily_root="$BRIDGE_STATE_DIR/memory-daily"
-    memory_daily_agent_dir="$memory_daily_root/$agent"
-    memory_daily_shared_aggregate_dir="$memory_daily_root/shared/aggregate"
-  fi
+  # v2 layout: per-agent memory-daily lives inside the per-agent root
+  # (group-isolated), shared aggregate lives under BRIDGE_SHARED_ROOT so
+  # other agents' harvesters can read it via ab-shared. Group setgid +
+  # 2770 covers both isolated UID writes to the per-agent dir and
+  # controller reads of the shared aggregate; no named-user ACL needed.
+  local memory_daily_agent_dir memory_daily_shared_aggregate_dir
+  memory_daily_agent_dir="$(bridge_isolation_v2_agent_memory_daily_root "$agent")"
+  memory_daily_shared_aggregate_dir="$(bridge_isolation_v2_memory_daily_shared_aggregate_dir)"
   bridge_linux_sudo_root mkdir -p "$memory_daily_agent_dir" "$memory_daily_shared_aggregate_dir"
-
-  # One-shot legacy aggregate migration — runs as sudo-root here so it has
-  # write access on the memory-daily root even though the new ACL contract
-  # only grants isolated UIDs r-x on the root. Idempotent + safe to re-run.
-  # In v2 layout the legacy `<state>/memory-daily/` root is no longer the
-  # source of truth, so this one-shot is skipped.
-  if [[ -n "$memory_daily_root" ]]; then
-    local _agg_name
-    for _agg_name in admin-aggregate-skip.json admin-aggregate-escalated.json; do
-      if [[ -f "$memory_daily_root/$_agg_name" && ! -f "$memory_daily_shared_aggregate_dir/$_agg_name" ]]; then
-        bridge_linux_sudo_root mv "$memory_daily_root/$_agg_name" "$memory_daily_shared_aggregate_dir/$_agg_name"
-      fi
-      if [[ -f "$memory_daily_root/$_agg_name.lock" && ! -f "$memory_daily_shared_aggregate_dir/$_agg_name.lock" ]]; then
-        bridge_linux_sudo_root mv "$memory_daily_root/$_agg_name.lock" "$memory_daily_shared_aggregate_dir/$_agg_name.lock"
-      fi
-    done
-  fi
-
-  if bridge_isolation_v2_active; then
-    # v2 split: the per-agent root (= queue_gateway_agent_dir in v2) is
-    # root-owned mode 2750 and MUST stay outside the isolated UID's
-    # rwX grant set; only the writable subtrees are listed. The isolated
-    # UID still reaches requests/responses through ab-agent-<name> group
-    # traverse on the parent root.
-    #
-    # PR-C r3 review P2: $memory_daily_shared_aggregate_dir is removed
-    # from the v2 write set. The shared aggregate sits under ab-shared
-    # (read-only public per the v2 contract) and the harvester writes it
-    # in controller context — isolated UIDs only need read/execute, not
-    # write/delete. Granting rwX recursively here would let any isolated
-    # agent corrupt the shared admin aggregate.
-    recursive_read_paths+=("$memory_daily_shared_aggregate_dir")
-    recursive_write_paths+=("$workdir" "$runtime_state_dir" "$log_dir" "$request_dir" "$response_dir" "$memory_daily_agent_dir")
-  else
-    recursive_write_paths+=("$workdir" "$runtime_state_dir" "$log_dir" "$queue_gateway_agent_dir" "$request_dir" "$response_dir" "$memory_daily_agent_dir" "$memory_daily_shared_aggregate_dir")
-  fi
-  # Issue: per-agent queue-gateway dir was missing isolated/controller ACLs
-  # because only its children (requests/, responses/) were granted. The
-  # daemon's controller-side glob of the queue-gateway root and the
-  # isolated UID's own inbox traversal both fail without these grants.
-  # Root traverse-only on the gateway root for the isolated UID prevents
-  # cross-agent dir-name enumeration while keeping its own subtree reachable.
-  bridge_linux_acl_add "u:${os_user}:--x" "$queue_gateway_root" >/dev/null 2>&1 || true
-
-  # Issue #412 Track B: grant the isolated UID r-- on its own queue body
-  # files. Bodies live under $BRIDGE_STATE_DIR/queue/bodies/ and are
-  # written by bridge-queue.py with mode 0600, owner = controller. The
-  # queue CLI emits the body path back to callers via TASK_BODY_PATH, and
-  # downstream flows (e.g. agb claim wrappers) cat the file directly from
-  # the isolated UID context. Without an ACL grant the read fails with
-  # EACCES even after agb claim succeeds, leaving the agent with no way
-  # to read the body of its own claimed task.
-  #
-  # Default ACL inheritance grants the same r-- on bodies created later
-  # by the controller. Legacy ACL only — under v2 (group setgid) the
-  # bridge_linux_acl_add primitive short-circuits to a no-op, and the
-  # state/queue/bodies tree inherits the ab-controller group from the
-  # state/ parent (which the isolated UID is not a member of). v2 needs
-  # a follow-up to extend the queue body share semantics to the per-agent
-  # group; until then, v2 installs see the same EACCES as before.
-  local _queue_bodies_dir
-  _queue_bodies_dir="$BRIDGE_STATE_DIR/queue/bodies"
-  bridge_linux_sudo_root mkdir -p "$_queue_bodies_dir"
-  if [[ -d "$_queue_bodies_dir" ]]; then
-    bridge_linux_acl_add "u:${os_user}:r-x" "$_queue_bodies_dir" >/dev/null 2>&1 || true
-    bridge_linux_acl_add_default_dirs_recursive \
-      "u:${os_user}:r--" "$_queue_bodies_dir" >/dev/null 2>&1 || true
-    bridge_linux_acl_add_recursive \
-      "u:${os_user}:r-X" "$_queue_bodies_dir" >/dev/null 2>&1 || true
-  fi
-
-  hidden_paths+=("$BRIDGE_ROSTER_FILE" "$BRIDGE_ROSTER_LOCAL_FILE" "$BRIDGE_RUNTIME_CREDENTIALS_DIR" "$BRIDGE_RUNTIME_SECRETS_DIR" "$BRIDGE_RUNTIME_CONFIG_FILE" "$BRIDGE_TASK_DB" "${BRIDGE_LOG_DIR}/audit.jsonl")
-
-  # Issue #233: every traverse_chain call used to climb unconditionally
-  # to `/` and stamp `u:${os_user}:--x` on each ancestor, including
-  # `/home` and `/`. Pass an explicit stop_path so the walk terminates
-  # inside the controller's home. Ancestors above that (`/home`, `/`)
-  # already have base `r-x` for `other`, so no named entry is needed —
-  # and inserting one would strip the operator's own read access via
-  # POSIX ACL override, which is exactly the #233 regression.
-  #
-  # The $user_home chain is intentionally dropped here: the isolated
-  # UID owns its own home outright, and the ancestors `/home` + `/`
-  # are already reachable via base permissions.
-  local controller_home_for_traverse=""
-  controller_home_for_traverse="$(getent passwd "$controller_user" 2>/dev/null | cut -d: -f6 || true)"
-  if [[ -n "$controller_home_for_traverse" && -d "$controller_home_for_traverse" ]]; then
-    bridge_linux_grant_traverse_chain "$os_user" "$BRIDGE_HOME" "$controller_home_for_traverse"
-    bridge_linux_grant_traverse_chain "$os_user" "$workdir" "$controller_home_for_traverse"
-    bridge_linux_grant_traverse_chain "$os_user" "$runtime_state_dir" "$controller_home_for_traverse"
-    bridge_linux_grant_traverse_chain "$os_user" "$log_dir" "$controller_home_for_traverse"
-    bridge_linux_grant_traverse_chain "$os_user" "$history_file" "$controller_home_for_traverse"
-    bridge_linux_grant_traverse_chain "$os_user" "$request_dir" "$controller_home_for_traverse"
-    bridge_linux_grant_traverse_chain "$os_user" "$response_dir" "$controller_home_for_traverse"
-    bridge_linux_grant_traverse_chain "$os_user" "$memory_daily_agent_dir" "$controller_home_for_traverse"
-    bridge_linux_grant_traverse_chain "$os_user" "$memory_daily_shared_aggregate_dir" "$controller_home_for_traverse"
-  else
-    bridge_warn "controller_user=$controller_user has no passwd entry / home; traverse grants skipped (isolated agent may hit EACCES)"
-  fi
-  if [[ -n "$memory_daily_root" ]]; then
-    bridge_linux_acl_add "u:${os_user}:r-x" "$memory_daily_root" "$memory_daily_root/shared" >/dev/null 2>&1 || true
-  fi
-
-  bridge_linux_acl_add "u:${os_user}:r-x" "$BRIDGE_HOME" "$BRIDGE_AGENT_HOME_ROOT"
-  bridge_linux_acl_add "u:${os_user}:r-x" "$BRIDGE_HOME/agent-bridge" "$BRIDGE_HOME/agb" "$BRIDGE_HOME/VERSION" >/dev/null 2>&1 || true
-  # Root-level Bash and Python helpers (bridge-*.sh, bridge-*.py) live next
-  # to agent-bridge/agb. lib/scripts/ are already covered by recursive_read_paths,
-  # but root helpers like bridge-dev-plugin-cache.py default to mode 600 and
-  # have no ACL grant, so things like dev-plugin-cache sync fail with EACCES
-  # under the sudo wrap during agent start.
-  local _bridge_root_helper
-  shopt -s nullglob
-  for _bridge_root_helper in "$BRIDGE_HOME"/bridge-*.sh "$BRIDGE_HOME"/bridge-*.py; do
-    bridge_linux_acl_add "u:${os_user}:r-x" "$_bridge_root_helper" >/dev/null 2>&1 || true
-  done
-  shopt -u nullglob
-  bridge_linux_grant_engine_cli_access "$os_user" "$(bridge_agent_engine "$agent")"
-  bridge_linux_grant_bin_dir_access "$os_user"
-  bridge_linux_grant_claude_credentials_access "$os_user" "$user_home" "$controller_user" "$(bridge_agent_engine "$agent")"
-  bridge_linux_acl_add_recursive "u:${os_user}:r-X" "${recursive_read_paths[@]}"
-  bridge_linux_acl_add_recursive "u:${os_user}:rwX" "${recursive_write_paths[@]}"
-  if bridge_isolation_v2_active; then
-    # Match the recursive_write_paths v2 split: queue_gateway_agent_dir
-    # (= per-agent root, root-owned 2750) is intentionally absent so the
-    # isolated UID never inherits a default rwX over its credentials/.
-    # $memory_daily_shared_aggregate_dir is also absent here (PR-C r3 P2):
-    # default rwX would let new files inside the shared aggregate inherit
-    # isolated UID write, defeating the read-only-shared contract.
-    bridge_linux_acl_add_default_dirs_recursive "u:${os_user}:rwX" "$runtime_state_dir" "$log_dir" "$request_dir" "$response_dir" "$memory_daily_agent_dir"
-  else
-    bridge_linux_acl_add_default_dirs_recursive "u:${os_user}:rwX" "$runtime_state_dir" "$log_dir" "$queue_gateway_agent_dir" "$request_dir" "$response_dir" "$memory_daily_agent_dir" "$memory_daily_shared_aggregate_dir"
-  fi
-  bridge_linux_acl_add "u:${os_user}:rw-" "$history_file"
-
-  for other in "${BRIDGE_AGENT_IDS[@]}"; do
-    [[ "$other" == "$agent" ]] && continue
-    other_workdir="$(bridge_agent_workdir "$other")"
-    other_queue_dir="$(bridge_queue_gateway_agent_dir "$other")"
-    [[ "$other_workdir" == "$workdir" ]] && continue
-    [[ -d "$other_workdir" ]] || continue
-    bridge_linux_acl_remove_recursive "u:${os_user}" "$other_workdir"
-    [[ -d "$other_queue_dir" ]] && bridge_linux_acl_remove_recursive "u:${os_user}" "$other_queue_dir"
-  done
-
-  for other in "${hidden_paths[@]}"; do
-    [[ -e "$other" ]] || continue
-    bridge_linux_acl_remove_recursive "u:${os_user}" "$other"
-  done
 
   bridge_linux_sudo_root chown -R "$os_user" "$workdir"
   bridge_linux_sudo_root chown -R "$os_user" "$runtime_state_dir" "$log_dir"
   bridge_linux_sudo_root chown "$os_user" "$audit_file" "$history_file"
-  bridge_linux_acl_add_recursive "u:${controller_user}:rwX" "$workdir"
-  bridge_linux_acl_add_default_dirs_recursive "u:${controller_user}:rwX" "$workdir"
-  # Controller (daemon) needs to glob the queue-gateway root to find
-  # per-agent requests; r-x on the root + rwX on the agent dir + default
-  # ACLs on both keep the daemon's pathlib glob working without exposing
-  # other agents' dir contents to isolated UIDs.
-  bridge_linux_acl_add "u:${controller_user}:r-x" "$queue_gateway_root"
-  # PR-E: in v2 mode the queue-gateway root + per-agent dir live under
-  # the v2 group-setgid contract (controller is in the agent group),
-  # so the named-user default ACL is redundant and the recursive grant
-  # bodies short-circuit via the v2-noop primitives. Skip the lone
-  # direct setfacl that bypasses those primitives.
-  if ! bridge_isolation_v2_active; then
-    bridge_linux_sudo_root setfacl -d -m "u:${controller_user}:r-X" "$queue_gateway_root" >/dev/null 2>&1 || true
-  fi
-  bridge_linux_acl_add_recursive "u:${controller_user}:rwX" "$runtime_state_dir" "$log_dir" "$queue_gateway_agent_dir" "$request_dir" "$response_dir" "$memory_daily_agent_dir" "$memory_daily_shared_aggregate_dir"
-  bridge_linux_acl_add_default_dirs_recursive "u:${controller_user}:rwX" "$runtime_state_dir" "$log_dir" "$queue_gateway_agent_dir" "$request_dir" "$response_dir" "$memory_daily_agent_dir" "$memory_daily_shared_aggregate_dir"
 
   # memory-daily transcripts read-access (issue #219 v1.3): grant the
   # controller user r-X on the isolated user's ~/.claude/projects/ so the
@@ -3828,30 +2971,20 @@ bridge_linux_prepare_agent_isolation() {
   # without the controller r-X inheritance, and the next harvester run
   # would fall back to --skipped-permission until the next reapply.
   local isolated_claude_dir="$user_home/.claude"
-  local isolated_projects_dir="$isolated_claude_dir/projects"
   bridge_linux_sudo_root mkdir -p "$isolated_claude_dir"
   bridge_linux_sudo_root chown "$os_user" "$isolated_claude_dir" >/dev/null 2>&1 || true
-  # PR-E r2 (FAIL #15): under v2 the legacy ACL grant on this dir is
-  # no-op'd (`bridge_linux_acl_add` short-circuits in v2), but the dir
-  # itself was still chmod 0700 — group has no traverse, so the
-  # controller (group member of ab-agent-<name>) cannot reach
-  # ~/.claude/projects/ for the memory-daily harvester. Mirror the
-  # group-mode replacements applied to ~/.claude/plugins (lines around
-  # 1666-1670) and ~/.claude/plugins/marketplaces: chgrp the v2 agent
-  # group + chmod 2750 (setgid so new subdirs like projects/ inherit
-  # the group). Legacy keeps 0700 + named-user ACL.
-  if bridge_isolation_v2_active; then
-    local _claude_v2_grp=""
-    _claude_v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
-    [[ -n "$_claude_v2_grp" ]] \
-      || bridge_die "isolation v2: cannot resolve agent group for ~/.claude of '$agent'"
-    bridge_linux_sudo_root chgrp "$_claude_v2_grp" "$isolated_claude_dir" \
-      || bridge_die "isolation v2: chgrp $_claude_v2_grp on '$isolated_claude_dir' failed"
-    bridge_linux_sudo_root chmod 2750 "$isolated_claude_dir" \
-      || bridge_die "isolation v2: chmod 2750 on '$isolated_claude_dir' failed"
-  else
-    bridge_linux_sudo_root chmod 0700 "$isolated_claude_dir" >/dev/null 2>&1 || true
-  fi
+  # v2: chgrp ab-agent-<name> + chmod 2750 (setgid so new subdirs like
+  # projects/ inherit the group) so the controller (group member of
+  # ab-agent-<name>) can reach ~/.claude/projects/ for the memory-daily
+  # harvester without any named-user ACL.
+  local _claude_v2_grp=""
+  _claude_v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+  [[ -n "$_claude_v2_grp" ]] \
+    || bridge_die "isolation v2: cannot resolve agent group for ~/.claude of '$agent'"
+  bridge_linux_sudo_root chgrp "$_claude_v2_grp" "$isolated_claude_dir" \
+    || bridge_die "isolation v2: chgrp $_claude_v2_grp on '$isolated_claude_dir' failed"
+  bridge_linux_sudo_root chmod 2750 "$isolated_claude_dir" \
+    || bridge_die "isolation v2: chmod 2750 on '$isolated_claude_dir' failed"
   # Channel-ownership-aware plugin sharing. Without this the isolated UID's
   # ~/.claude/plugins/ is empty and Claude starts with no MCP servers loaded
   # (Teams/ms365/cosmax-* all silently missing). The helper writes a per-UID
@@ -3902,38 +3035,13 @@ bridge_linux_prepare_agent_isolation() {
     done
   fi
 
-  # Issue #233: the previous `bridge_linux_grant_traverse_chain
-  # $controller_user $isolated_claude_dir` call walked from
-  # /home/agent-bridge-<agent>/.claude all the way up to / and left
-  # `user:<controller>:--x` entries on `/home` and `/`. Under POSIX ACL
-  # that named entry *reduced* the operator's own read access, because
-  # the named entry overrides `other::r-x`. That's the exact mechanism
-  # that silenced bun-based plugins. Grant search access only on the
-  # two directories the controller actually needs to traverse: the
-  # isolated user's home and its .claude subdirectory. `/home` and `/`
-  # stay untouched — the controller reaches them via base perms.
-  bridge_linux_acl_add "u:${controller_user}:--x" "$user_home" >/dev/null 2>&1 || true
-  bridge_linux_repair_isolated_claude_read_lens "$os_user" "$user_home" "$controller_user" >/dev/null 2>&1 || true
-  # Default ACL on .claude/ so any subdirectory (projects/, sessions/, ...)
-  # created later by the isolated UID inherits controller read access.
-  # PR-E: in v2 mode the per-agent group + setgid contract covers
-  # controller access; skip the direct named-user default ACL.
-  if ! bridge_isolation_v2_active; then
-    bridge_linux_sudo_root setfacl -d -m "u:${controller_user}:r-X" "$isolated_claude_dir" >/dev/null 2>&1 || true
-  fi
-  if [[ -d "$isolated_projects_dir" ]]; then
-    bridge_linux_acl_add_recursive "u:${controller_user}:r-X" "$isolated_projects_dir" >/dev/null 2>&1 || true
-    bridge_linux_acl_add_default_dirs_recursive "u:${controller_user}:r-X" "$isolated_projects_dir" >/dev/null 2>&1 || true
-  fi
-  bridge_linux_acl_add "u:${controller_user}:rw-" "$history_file" "$audit_file"
+  # v2: ~/.claude is chgrp'd to ab-agent-<name> + chmod 2750 above, and
+  # the isolated UID is the directory owner. The controller is a member
+  # of ab-agent-<name> per PR-C, so it reaches user_home/.claude/projects/
+  # via group r-x without any named-user ACL or ancestor traverse grant.
   bridge_write_linux_agent_env_file "$agent" "$env_file"
-  # Leave env_file owned by the controller so subsequent starts can chmod it.
-  # Previously we chowned it to $os_user, which made the operator-run start
-  # path hit EPERM on the trailing `chmod 600` (file ownership is an
-  # owner-only op; rwX ACL doesn't cover it). Grant the isolated user read
-  # access via ACL instead — the agent only needs to read this file.
-  bridge_linux_acl_add "u:${os_user}:r--" "$env_file"
-  bridge_linux_acl_add "u:${controller_user}:rw-" "$env_file"
+  # env_file ownership: chgrp/chmod is handled inside bridge_write_linux_agent_env_file's
+  # v2 branch (chown controller, chgrp ab-agent-<name>, chmod 0640).
 }
 bridge_linux_install_isolated_channel_symlink() {
   # Plant a root-owned symlink at $user_home/.claude/channels/<channel>
@@ -3955,8 +3063,8 @@ bridge_linux_install_isolated_channel_symlink() {
 
   [[ -n "$os_user" && -n "$user_home" && -n "$controller_user" && -n "$channel" && -n "$target" ]] \
     || { bridge_warn "bridge_linux_install_isolated_channel_symlink: missing arg"; return 1; }
-  if bridge_isolation_v2_active && [[ -z "$agent" ]]; then
-    bridge_warn "bridge_linux_install_isolated_channel_symlink: v2 mode requires the agent argument (PR-E signature change)"
+  if [[ -z "$agent" ]]; then
+    bridge_warn "bridge_linux_install_isolated_channel_symlink: v2 mode requires the agent argument"
     return 1
   fi
 
@@ -4009,7 +3117,8 @@ bridge_linux_install_isolated_channel_symlink() {
   if bridge_linux_sudo_root test -L "$channels_root"; then
     bridge_die "channels parent: raced into a symlink after chmod at $channels_root"
   fi
-  bridge_linux_acl_add "u:${os_user}:r-x" "$channels_root" >/dev/null 2>&1 || true
+  # v2: $channels_root is mode 0755 root-owned; isolated UID reaches it
+  # via base-readable `other::r-x`. No named-user ACL needed.
 
   # Target dir: create on demand for declared channels whose `.<channel>`
   # has not yet been initialized (typical for fresh isolated agents that
@@ -4042,53 +3151,35 @@ bridge_linux_install_isolated_channel_symlink() {
       bridge_warn "isolation channel symlink: chown target $target failed"
       return 1
     }
-    if bridge_isolation_v2_active; then
-      :  # v2 mode/group is normalized in the dedicated block below.
-    else
-      bridge_linux_sudo_root chmod 0700 "$target" || {
-        bridge_warn "isolation channel symlink: chmod target $target failed"
-        return 1
-      }
-      # r2: target ACLs are load-bearing for the symlink to be useful. A
-      # best-effort silent-skip leaves the symlink planted but the controller
-      # can't read through it -- exactly the failure mode this PR set out to
-      # fix. Fail loud so the operator quarantines the partial state instead
-      # of getting a runtime that pretends to work.
-      bridge_linux_acl_add "u:${controller_user}:rwX" "$target" >/dev/null 2>&1 \
-        || bridge_die "channel target dir: failed to grant controller rwX ACL on $target"
-      bridge_linux_acl_add_default_dirs_recursive "u:${controller_user}:rwX" "$target" >/dev/null 2>&1 \
-        || bridge_die "channel target dir: failed to set default ACL inheritance on $target"
-    fi
+    # v2 mode/group/setgid is normalized in the dedicated block below.
   fi
 
-  # PR-E v2 normalize block — applies whether $target was just created or
+  # v2 normalize block — applies whether $target was just created or
   # already existed. setgid (2770) ensures new files inside inherit
   # ab-agent-<name>; combined with the agent-launch umask 007 wired into
   # bridge-run.sh (`bridge_run_apply_v2_umask_if_needed`), files created
   # by the isolated process land at 0660/group=ab-agent-<name>, giving
   # both controller and isolated UID rw access through the group contract.
-  if bridge_isolation_v2_active; then
-    # r4.4 TOCTOU guard: refuse to mutate a symlink even though `test -d`
-    # earlier passed (a symlink-to-dir slips through that check).
-    if bridge_linux_sudo_root test -L "$target"; then
-      bridge_warn "isolation v2 channel target: $target is a symlink, refusing to chgrp/chmod (target may be attacker-controlled)"
-      return 1
-    fi
-    if ! bridge_linux_sudo_root test -d "$target"; then
-      bridge_warn "isolation v2 channel target: $target disappeared between checks"
-      return 1
-    fi
-    local _v2_grp
-    _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
-      || _v2_grp=""
-    [[ -n "$_v2_grp" ]] || bridge_die "isolation v2: cannot resolve agent group for channel target '$target'"
-    bridge_linux_sudo_root chown "$os_user" "$target" \
-      || bridge_die "isolation v2: chown $os_user on channel target '$target' failed"
-    bridge_linux_sudo_root chgrp "$_v2_grp" "$target" \
-      || bridge_die "isolation v2: chgrp $_v2_grp on channel target '$target' failed"
-    bridge_linux_sudo_root chmod 2770 "$target" \
-      || bridge_die "isolation v2: chmod 2770 on channel target '$target' failed"
+  # r4.4 TOCTOU guard: refuse to mutate a symlink even though `test -d`
+  # earlier passed (a symlink-to-dir slips through that check).
+  if bridge_linux_sudo_root test -L "$target"; then
+    bridge_warn "isolation v2 channel target: $target is a symlink, refusing to chgrp/chmod (target may be attacker-controlled)"
+    return 1
   fi
+  if ! bridge_linux_sudo_root test -d "$target"; then
+    bridge_warn "isolation v2 channel target: $target disappeared between checks"
+    return 1
+  fi
+  local _v2_grp
+  _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
+    || _v2_grp=""
+  [[ -n "$_v2_grp" ]] || bridge_die "isolation v2: cannot resolve agent group for channel target '$target'"
+  bridge_linux_sudo_root chown "$os_user" "$target" \
+    || bridge_die "isolation v2: chown $os_user on channel target '$target' failed"
+  bridge_linux_sudo_root chgrp "$_v2_grp" "$target" \
+    || bridge_die "isolation v2: chgrp $_v2_grp on channel target '$target' failed"
+  bridge_linux_sudo_root chmod 2770 "$target" \
+    || bridge_die "isolation v2: chmod 2770 on channel target '$target' failed"
 
   # Link path: only replace a pre-existing symlink. A real file or directory
   # at this path likely contains uncommitted state (e.g. an isolated-local
@@ -4114,7 +3205,7 @@ bridge_linux_install_isolated_channel_symlink() {
 
 bridge_agent_default_home() {
   local agent="$1"
-  if bridge_isolation_v2_active && [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
     printf '%s/%s/home' "$BRIDGE_AGENT_ROOT_V2" "$agent"
     return 0
   fi
@@ -4157,10 +3248,8 @@ bridge_agent_default_profile_home() {
   # (bridge-skills.sh:230, bridge-setup.sh:90/823, bridge-agent.sh:1275)
   # reads CLAUDE.md from workdir, so the deploy target (this function)
   # must point at workdir too, otherwise `agent-bridge profile deploy`
-  # would land in v2 home/ where nothing reads it. PR-A/B/C made
-  # bridge_agent_default_home v2-aware but left this profile alias
-  # passing through to it. PR-D closes that gap.
-  if bridge_isolation_v2_active && [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  # would land in v2 home/ where nothing reads it.
+  if [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
     printf '%s/%s/workdir' "$BRIDGE_AGENT_ROOT_V2" "$agent"
     return 0
   fi
@@ -4229,7 +3318,7 @@ bridge_agent_workdir() {
   # privacy. Static rosters that need a non-default location should set
   # BRIDGE_DATA_ROOT (which moves the v2 anchor for every agent), not
   # BRIDGE_AGENT_WORKDIR per-agent.
-  if bridge_isolation_v2_active && [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
     printf '%s/%s/workdir' "$BRIDGE_AGENT_ROOT_V2" "$agent"
     return 0
   fi
@@ -4761,10 +3850,11 @@ bridge_env_file_has_any_nonempty_key() {
 #                    has a non-empty value.
 #   - "missing"    — file absent OR file readable but no requested key is
 #                    present with a non-empty value.
-#   - "unreadable" — file exists but the controller cannot read it (EACCES);
-#                    in linux-user isolation this triggers a bounded ACL
-#                    repair retry via bridge_linux_acl_repair_channel_env_files
-#                    before giving up.
+#   - "unreadable" — file exists but the controller cannot read it (EACCES).
+#                    Under v2 the per-agent group + setgid contract covers
+#                    controller access; a persistent unreadable result here
+#                    means a non-ACL filesystem issue (mode drift, ownership
+#                    drift) and the caller surfaces it as a channel-health miss.
 #
 # rc=1 vs rc=2 from grep:
 #   The internal grep helper returns 1 on "no match" and 2 on file/permission
@@ -4804,27 +3894,9 @@ bridge_channel_env_file_readiness() {
     return 0
   fi
 
-  # Unreadable. In linux-user isolation, attempt bounded ACL repair.
-  local repair_attempts="${BRIDGE_ENV_READINESS_REPAIR_ATTEMPTS:-2}"
-  local attempt=0
-  if [[ "$(bridge_agent_isolation_mode "$agent" 2>/dev/null || printf '')" == "linux-user" ]]; then
-    while (( attempt < repair_attempts )); do
-      bridge_linux_acl_repair_channel_env_files "$agent" >/dev/null 2>&1 || true
-      attempt=$((attempt + 1))
-      if [[ -r "$file" ]]; then
-        rc=0
-        bridge_env_file_has_any_nonempty_key "$file" "$@" >/dev/null 2>&1 || rc=$?
-        if [[ $rc -eq 0 ]]; then
-          printf 'present'
-          return 0
-        fi
-        # File now readable but key not present — treat as missing rather
-        # than leaving in unreadable.
-        printf 'missing'
-        return 0
-      fi
-    done
-  fi
+  # v2: no ACL repair retry. The per-agent group + setgid contract
+  # handles controller access; a persistent unreadable result here is
+  # a non-ACL filesystem drift the caller surfaces as channel-health miss.
 
   # Suppress unused-warning shellcheck when item is reserved for future
   # per-channel scoped repair; ms365/teams currently share the agent-wide

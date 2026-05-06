@@ -291,21 +291,6 @@ if [[ $CONTINUE_EXPLICIT -eq 1 && "$CONTINUE_MODE" == "0" ]]; then
   unset _persisted_session_id
 fi
 
-# Item 10 (PR #442 r2): repair Claude credential ACL BEFORE the channel
-# health read. Without this, an unrelated chmod under ~/.claude can leave
-# mask=--- on credentials.json so bridge_agent_channel_status_reason gets
-# EACCES on first call after a Claude re-auth and the start path bails out
-# with a false-negative "Not logged in"/credential-unreadable diagnostic.
-# Helper is best-effort and silently skips on macOS / non-isolated /
-# non-claude / no-sudo cases (see bridge_linux_repair_claude_credentials_access).
-if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]] \
-    && bridge_agent_linux_user_isolation_effective "$AGENT"; then
-  bridge_linux_repair_claude_credentials_access "$AGENT" >/dev/null 2>&1 || true
-  # Issue #543: mirror daemon channel-health preflight (bridge-daemon.sh) so a
-  # transient ACL drift on .<channel>/.env does not bridge_die the restart path.
-  bridge_linux_acl_repair_channel_env_files "$AGENT" >/dev/null 2>&1 || true
-fi
-
 if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   CHANNEL_REASON="$(bridge_agent_channel_status_reason "$AGENT")"
   if [[ -n "$CHANNEL_REASON" ]]; then
