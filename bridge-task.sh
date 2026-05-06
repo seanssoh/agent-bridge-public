@@ -318,16 +318,26 @@ cmd_create() {
     local recipient_engine=""
     recipient_engine="$(bridge_agent_engine "$target" 2>/dev/null || true)"
     if [[ "$recipient_engine" == "codex" ]]; then
+      # Always pass an explicit body source (--body or --body-file).
+      # Letting the validator fall through to stdin would let a piped
+      # valid brief pass while the actually-enqueued task body is empty
+      # (`echo "[plan] valid" | agb task create --to <codex> --title ...`).
+      # We must validate exactly what gets stored: when no body shape is
+      # provided here, the queue insert below also has no body, so we
+      # validate an empty string — the validator will return rc=2 and the
+      # operator gets the same structured error as any other empty brief.
       local companion_args=(--title "$title" --format json)
-      if [[ "$body_was_set" -eq 1 && -n "$body" ]]; then
+      if [[ "$body_was_set" -eq 1 ]]; then
         companion_args+=(--body "$body")
       elif [[ -n "$body_file" && -f "$body_file" ]]; then
         companion_args+=(--body-file "$body_file")
+      else
+        companion_args+=(--body "")
       fi
       local companion_result=""
       local companion_rc=0
       companion_result="$(python3 "$BRIDGE_SCRIPT_DIR/bridge-queue.py" \
-        validate-companion-body "${companion_args[@]}" 2>/dev/null)" || companion_rc=$?
+        validate-companion-body "${companion_args[@]}" </dev/null 2>/dev/null)" || companion_rc=$?
       if [[ "$companion_rc" -eq 2 ]]; then
         bridge_die "task body validation failed for codex companion-role review:
 ${companion_result}

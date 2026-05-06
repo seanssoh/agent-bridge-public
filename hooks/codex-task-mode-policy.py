@@ -57,7 +57,23 @@ _GIT_WRITE_SUBCOMMANDS = {
     "restore", "revert", "rm", "stash", "switch", "tag",
 }
 # Bash redirection markers that imply a write target.
-_REDIR_RE = re.compile(r"(\>\>|\>|\&\>|\>\&)")
+#
+# Matches plain `>`, `>>`, `&>` (stderr+stdout to file), `>&` (dup-fd), and
+# explicit fd redirections `1>`, `2>`, `1>>`, `2>>`, etc. The trailing
+# `(?!=)` negative lookahead keeps test-shape comparisons (`>=`) and dup-fd
+# completions (`>&2`) from being read as write targets — the latter still
+# matches via the `>&` alternative which is left intact.
+_REDIR_RE = re.compile(r"(?:(?:[0-9]+|&)?>>?(?!=)|>&)")
+# Closed allowlist of git long flags that DO take a separate-token value.
+# `git --no-pager checkout main` would otherwise have `--no-pager` swallow
+# `checkout` and hide the mutating subcommand. Anything not in this set is
+# assumed no-arg, including `--paginate`, `--bare`, `--literal-pathspecs`,
+# `--noglob-pathspecs`, etc. The `--flag=value` form is independent: the
+# `=` keeps the value within a single token, so the value never leaks into
+# the next token and no allowlist check is needed there.
+_GIT_VALUE_TAKING_LONG_FLAGS = frozenset(
+    {"--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
+)
 
 
 def _read_event() -> dict[str, Any]:
@@ -241,21 +257,42 @@ def _git_write_subcommand(tokens: list[str]) -> str | None:
     read-only subcommands (status, diff, show, log, grep, ls-files,
     rev-parse, blame, ...) — those must stay allowed in block mode so a
     [review] task can actually inspect the tree.
+
+    Long flags use a closed allowlist (``_GIT_VALUE_TAKING_LONG_FLAGS``):
+    only those flags consume a following token as a value. Other long
+    flags like ``--no-pager`` or ``--paginate`` are no-arg, so the next
+    positional really is the subcommand and is classified normally.
     """
-    skip_value_for = {"-C", "-c"}
+    short_value_for = {"-C", "-c"}
     i = 0
     while i < len(tokens):
         tok = tokens[i]
-        if tok in skip_value_for:
-            i += 2
-            continue
-        if tok.startswith("--") and "=" not in tok and tok != "--":
-            i += 2  # `--git-dir <path>` form
-            continue
-        if tok.startswith("-"):
+        if tok == "--":
             i += 1
             continue
-        if tok == "--":
+        if tok in short_value_for:
+            # `-C path` / `-c key=val` — consume flag + value pair.
+            i += 2
+            continue
+        if tok.startswith("--"):
+            # `--flag=value` keeps the value within the same token; no
+            # following-token consumption needed.
+            if "=" in tok:
+                i += 1
+                continue
+            if tok in _GIT_VALUE_TAKING_LONG_FLAGS:
+                i += 2
+                continue
+            # Unknown long flag: assume no-arg so the next positional is
+            # still classified. This is conservative for our use case
+            # (block-mode write detection): if a hostile invocation tried
+            # to use a fabricated `--frobnicate value` long flag whose
+            # value happened to be a write subcommand name, we would
+            # block — fail-closed in block mode is the correct posture.
+            i += 1
+            continue
+        if tok.startswith("-"):
+            # Short single-dash flags other than `-C`/`-c`: assume no-arg.
             i += 1
             continue
         return tok if tok in _GIT_WRITE_SUBCOMMANDS else None

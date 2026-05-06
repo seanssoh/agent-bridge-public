@@ -177,6 +177,20 @@ rc=0
 out_2f="$(create_task "[bug] codex-target" "$weak_body" codex-recipient 2>&1)" || rc=$?
 smoke_assert_eq "0" "$rc" "2f non-companion title skips gate"
 
+# 2g. (D4 r2) Piped stdin must NOT be consumed by the validator. A bypass
+# attempt — `echo "[plan] valid body" | agb task create --to <codex>
+# --title '[plan] foo'` (no --body / --body-file) — used to pass validation
+# (validator read stdin) while the queue stored an empty body. Post-fix the
+# validator is invoked with explicit `--body ""` and `</dev/null`, so the
+# stored body and the validated body are the same empty string and rc=2.
+rc=0
+stdin_bypass_out="$(printf '%s' "[plan] valid body" | bash "$REPO_ROOT/bridge-task.sh" create \
+  --to codex-recipient \
+  --title '[plan] stdin-bypass' \
+  --from smoke-actor 2>&1)" || rc=$?
+[[ "$rc" -ne 0 ]] || smoke_fail "2g: expected stdin-piped body to be rejected, got rc=0 / out=${stdin_bypass_out}"
+smoke_assert_contains "$stdin_bypass_out" "task body validation failed" "2g stdin not consumed"
+
 # ---------------------------------------------------------------------------
 # Test 3 — ensure-codex-hooks adds companion hooks + idempotent
 # ---------------------------------------------------------------------------
@@ -398,6 +412,44 @@ event_git_c_w='{"tool_name":"Bash","tool_input":{"command":"git -C /tmp/repo che
 out_git_c_w="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_git_c_w" \
   BRIDGE_CODEX_TASK_MODE_POLICY block)"
 smoke_assert_contains "$out_git_c_w" '"decision": "block"' "5m git -C ... checkout blocks"
+
+# 5n. (D1 r2) Explicit fd redirections must be classified as writes.
+# Pre-fix `_REDIR_RE` only matched plain `>`/`>>`/`&>`/`>&`, so
+# `echo X 1>/repo/file` and `echo X 2>/repo/file` slipped through and
+# reached the queue. Post-fix the regex catches `<digit>>` / `<digit>>>`.
+event_fd1='{"tool_name":"Bash","tool_input":{"command":"echo hostile 1>/Users/somewhere/repo/file"}}'
+out_fd1="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_fd1" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_fd1" '"decision": "block"' "5n stdout fd redirection (1>) blocks"
+
+event_fd2='{"tool_name":"Bash","tool_input":{"command":"echo hostile 2>/Users/somewhere/repo/file"}}'
+out_fd2="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_fd2" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_fd2" '"decision": "block"' "5n stderr fd redirection (2>) blocks"
+
+# 5o. (D1 r2) Long-flag bypass: `git --no-pager checkout main`. Pre-fix
+# `--no-pager` was treated as value-taking (next-token consumed), so
+# `checkout` was hidden and the call reached "no write subcommand → allow".
+# Post-fix the closed allowlist of value-taking long flags excludes
+# `--no-pager`, so `checkout` is correctly classified as a mutation.
+event_long='{"tool_name":"Bash","tool_input":{"command":"git --no-pager checkout main"}}'
+out_long="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_long" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_long" '"decision": "block"' "5o git --no-pager checkout blocks"
+
+# 5p. (D1 r2) Allowlisted value-taking long flags continue to consume
+# their value: `git --git-dir=... status` (joined form) and
+# `git --git-dir <path> status` (separated form) must both classify
+# `status` as the subcommand and remain allowed.
+event_gitdir_eq='{"tool_name":"Bash","tool_input":{"command":"git --git-dir=/tmp/repo status"}}'
+out_gitdir_eq="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_gitdir_eq" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_eq "" "$out_gitdir_eq" "5p git --git-dir=... status allowed"
+
+event_gitdir_sep='{"tool_name":"Bash","tool_input":{"command":"git --git-dir /tmp/repo status"}}'
+out_gitdir_sep="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_gitdir_sep" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_eq "" "$out_gitdir_sep" "5p git --git-dir <path> status allowed"
 
 # 5j. ambiguous claimed task — fail-open with audit row.
 AMBIG_AGENT="codex-ambig-smoke"
