@@ -78,7 +78,7 @@ All changes auto-apply on `agent-bridge upgrade --apply` to v0.7.8+. No operator
 
 - Scheduler honors deferred-retry `nextRunAtMs` for daily/weekly cron. Cron jobs that recorded a deferred-retry timestamp via the existing failure path were ignored by the scheduler's daily/weekly cursor, causing the retry to fire at the next natural cadence boundary rather than at the requested deferral time. The scheduler now consults `nextRunAtMs` before the cadence cursor.
 
-### Fixed (#602 — 28a9167)
+### Fixed (#602 — PR #602, 28a9167)
 
 - `surface-reply-enforce` matches `plugin:<x>:<y>` source tags. Pre-fix, the hook's source-tag regex rejected the `plugin:<provider>:<channel>` shape that Discord/Telegram/Teams channels emit, so every channel-sourced reply silently passed enforcement for ~30 days. The match now accepts the two-segment form alongside the legacy one-segment form.
 
