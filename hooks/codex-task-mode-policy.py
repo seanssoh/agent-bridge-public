@@ -258,16 +258,21 @@ def _target_directory_flag(tokens: list[str]) -> str | None:
     otherwise be misclassified by `_last_positional` as a /tmp write and
     false-allowed.
 
-    Three short-flag shapes for `-t`:
+    Short-flag shapes recognized for `-t`:
     - separated: `-t /etc/dest` (consume next token)
     - attached:  `-t/etc/dest` (value baked into the same token; common in
       GNU coreutils because POSIX `getopt` accepts it)
+    - combined cluster: `-rt /etc/dest` / `-rvt /etc/dest` / `-rt/etc/dest`
+      (POSIX clustering of single-letter flags; coreutils accepts an option
+      that takes a value as the LAST letter of a cluster, with the value
+      either as the next token or attached to the same token after the `t`).
     - The `--target-directory` long form takes the value either as the next
       token or after `=` in the same token.
 
     Without the attached-form branch, `install -t/etc/systemd /tmp/foo` falls
     through to `_last_positional` and `/tmp/foo` is reported as the write
-    target (false allow via the /tmp carve-out).
+    target (false allow via the /tmp carve-out). Same false-allow occurs for
+    cluster forms like `cp -rt /etc /tmp/foo`.
     """
     i = 0
     while i < len(tokens):
@@ -283,6 +288,35 @@ def _target_directory_flag(tokens: list[str]) -> str | None:
             return tokens[i + 1]
         if tok.startswith("--target-directory="):
             return tok[len("--target-directory="):]
+        # Combined short-option cluster: `-rt`, `-rvt`, `-fvt`, `-rt/dest`,
+        # etc. POSIX getopt allows clustering single-letter flags, with the
+        # last-letter option's value following either as the next token
+        # (cluster ends at `t`) or attached after the `t` in the same token.
+        # Without this branch `cp -rt /etc /tmp/foo` would walk past the
+        # cluster as a flag and `_last_positional` would return `/tmp/foo`
+        # (a SOURCE), false-allowing the call via the /tmp carve-out.
+        if (
+            tok.startswith("-")
+            and not tok.startswith("--")
+            and len(tok) > 2
+            and "t" in tok[1:]
+        ):
+            t_idx = tok.index("t", 1)
+            # `t` is the final letter of the cluster (`-rt`, `-rvt`): value
+            # is the next token (separated form).
+            if t_idx == len(tok) - 1:
+                if i + 1 < len(tokens):
+                    return tokens[i + 1]
+            else:
+                # `t` is followed by characters in the same token; treat the
+                # suffix as the attached value (`-rt/etc`, `-rvt/etc/dest`).
+                # If those characters are themselves option letters
+                # (e.g. `-tr` where `t` happens to land before `r`), this is
+                # a benign false-positive: we'd return `r` as the destination
+                # and the resolver downstream would treat `r` as a relative
+                # path — fail-closed in block mode is the correct posture
+                # for ambiguous coreutils invocations.
+                return tok[t_idx + 1:]
         i += 1
     return None
 

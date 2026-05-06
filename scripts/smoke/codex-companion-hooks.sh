@@ -548,6 +548,48 @@ out_patch_attached_tmp="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$even
   BRIDGE_CODEX_TASK_MODE_POLICY block)"
 smoke_assert_eq "" "$out_patch_attached_tmp" "5w patch -o/tmp/result attached allowed"
 
+# 5x. (D1 r5) Combined short-option cluster `-rt` / `-rvt` / `-ft`.
+# Pre-fix `_target_directory_flag` only matched `-t` at index 1 of the token
+# (`tok == "-t"` or `tok.startswith("-t")`), so coreutils-style clustering
+# like `cp -rt /etc /tmp/foo` walked past the cluster as a generic flag and
+# `_last_positional` returned `/tmp/foo` (a SOURCE) — false-allowed by the
+# /tmp carve-out. Post-fix the cluster branch finds `t` anywhere in the
+# single-dash cluster, consumes the next token (or attached suffix) as the
+# destination, and classifies the destination correctly.
+event_cp_cluster_repo='{"tool_name":"Bash","tool_input":{"command":"cp -rt /etc /tmp/foo"}}'
+out_cp_cluster_repo="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_cp_cluster_repo" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_cp_cluster_repo" '"decision": "block"' "5x.D1.14 cp -rt /etc cluster blocks"
+
+# Cluster destination INSIDE /tmp must still be allowed (carve-out).
+event_cp_cluster_tmp='{"tool_name":"Bash","tool_input":{"command":"cp -rt /tmp/dest /tmp/src"}}'
+out_cp_cluster_tmp="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_cp_cluster_tmp" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_eq "" "$out_cp_cluster_tmp" "5x.D1.15 cp -rt /tmp/dest cluster allowed"
+
+# Cluster + attached value: `cp -rt/etc /tmp/foo`.
+event_cp_cluster_attached='{"tool_name":"Bash","tool_input":{"command":"cp -rt/etc /tmp/foo"}}'
+out_cp_cluster_attached="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_cp_cluster_attached" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_cp_cluster_attached" '"decision": "block"' "5x cp -rt/etc cluster attached blocks"
+
+# Mirror with mv / install — cluster forms equally affected pre-fix.
+event_mv_cluster='{"tool_name":"Bash","tool_input":{"command":"mv -rt /etc /tmp/foo"}}'
+out_mv_cluster="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_mv_cluster" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_mv_cluster" '"decision": "block"' "5x mv -rt /etc cluster blocks"
+
+event_install_cluster='{"tool_name":"Bash","tool_input":{"command":"install -rt /etc /tmp/foo"}}'
+out_install_cluster="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_install_cluster" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_install_cluster" '"decision": "block"' "5x install -rt /etc cluster blocks"
+
+# Longer cluster (multiple flags before `t`): `-rvt`.
+event_cp_rvt='{"tool_name":"Bash","tool_input":{"command":"cp -rvt /etc /tmp/foo"}}'
+out_cp_rvt="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_cp_rvt" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_cp_rvt" '"decision": "block"' "5x cp -rvt /etc cluster blocks"
+
 # 5j. ambiguous claimed task — fail-open with audit row.
 AMBIG_AGENT="codex-ambig-smoke"
 python3 - <<PY
