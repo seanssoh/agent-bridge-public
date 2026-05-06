@@ -1938,6 +1938,19 @@ bridge_agent_manual_stop_file() {
   printf '%s/manual-stop' "$(bridge_agent_idle_marker_dir "$agent")"
 }
 
+# Issue #629: missing-marker recovery probe retry counter.
+# bridge_write_idle_ready_agents falls back to a single prompt-ready probe
+# when the idle-since marker is absent. If that probe keeps failing (429
+# stall, dialog overlay, copy-mode), the agent stays excluded indefinitely.
+# This counter tracks consecutive probe failures across daemon cycles so
+# the dispatcher can escalate to a synthetic marker after a bounded number
+# of attempts. The file lives under the agent's idle marker dir so it is
+# cleaned up automatically by bridge_agent_clear_idle_marker.
+bridge_agent_missing_marker_retries_file() {
+  local agent="$1"
+  printf '%s/missing-marker-retries' "$(bridge_agent_idle_marker_dir "$agent")"
+}
+
 # Issue #589: prompt-ready latch.
 # Records when an agent's tmux session first reached a usable Claude/Codex
 # prompt during the current session. The auto-stop idle anchor in
@@ -2459,6 +2472,10 @@ bridge_agent_clear_idle_marker() {
   file="$(bridge_agent_idle_since_file "$agent")"
   dir="$(bridge_agent_idle_marker_dir "$agent")"
   rm -f "$file"
+  # Issue #629: drop the missing-marker retry counter so a future stale
+  # marker scenario starts fresh — otherwise the counter could ratchet
+  # the synthetic-marker fallback in earlier than warranted.
+  rm -f "$(bridge_agent_missing_marker_retries_file "$agent")"
   rmdir "$dir" >/dev/null 2>&1 || true
 }
 
