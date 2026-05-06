@@ -9,11 +9,29 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
-from bridge_guard_common import analyze_text, prompt_guard_enabled, threshold_for_surface  # noqa: E402
-from bridge_hook_common import current_agent, write_audit  # noqa: E402
+# Import bridge_hook_common from hooks/ directly; ROOT may have only ``--x``
+# ACL for isolated UIDs (see bridge_hook_common.load_guard_module docstring).
+_HOOKS_DIR = Path(__file__).resolve().parent
+if str(_HOOKS_DIR) not in sys.path:
+    sys.path.insert(0, str(_HOOKS_DIR))
+
+from bridge_hook_common import (  # noqa: E402
+    current_agent,
+    load_guard_module,
+    write_audit,
+)
+
+_guard = load_guard_module(
+    ROOT,
+    required_attrs=("analyze_text", "prompt_guard_enabled", "threshold_for_surface"),
+)
+if _guard is None:
+    sys.exit(0)
+
+analyze_text = _guard.analyze_text
+prompt_guard_enabled = _guard.prompt_guard_enabled
+threshold_for_surface = _guard.threshold_for_surface
 
 
 def main() -> int:
