@@ -6,6 +6,64 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-05-06
+
+### Highlight — isolation v2 hard-cut + first-class diagnostic + write-shape redesign
+
+`v0.8.0` is the long-planned cut-over from ACL-based isolation (v1) to POSIX-group-based isolation (v2). Operators upgrading from v0.7.x will run an automatic migration during `agent-bridge upgrade --apply` that creates per-agent groups, scrubs extended ACLs, and switches every isolated agent's home to `2770` setgid. The v1 ACL helper surface (`bridge_linux_grant_*`, `bridge_linux_acl_*`, `bridge_linux_repair_*`) is fully deleted (~1000 LoC removed). Three release headlines: a closed-loop `agent doctor` CRUD self-check addressing the constraints that hit PR #615's 4-round cap (#619 → #646), a write-shape detector redesign for Codex companion role hooks that replaces the brittle r1-r5 patches with a default-deny block-mode allowlist + maintained common-shape parser (#639 → #642), and a cross-class isolated read closure for the librarian × isolated-UID memory read failure (#583 → #645). `BRIDGE_DISABLE_ISOLATION=1` is available as a runtime rollback hatch in case v2 hits unforeseen issues post-deploy (T5).
+
+Breaking change for v0.7.x → v0.8.0 upgraders: see KNOWN_ISSUES #16 (Claude first-launch login flow on v2 Linux) and #17 (engine-CLI runtime-only path validation). The migration tool surfaces `migration_requires_relogin=yes` to the upgrade output when macOS supplemental group cache requires re-login.
+
+### Changed (T1 — PR #622, `266d604`)
+
+- Layout resolver hard-cut: `BRIDGE_LAYOUT=v1` and `legacy` now fail-fast at `bridge_resolve_layout()` with a `bridge_die` migration message. v2 is the only accepted layout. See `lib/bridge-layout-resolver.sh:135-160`.
+
+### Removed (T2 — PR #641, `6a546a2`)
+
+- 11 v1 ACL helper definitions deleted from `lib/bridge-agents.sh`: `bridge_linux_grant_engine_cli_access`, `bridge_linux_grant_bin_dir_access`, `bridge_linux_grant_claude_credentials_access`, `bridge_linux_grant_traverse_chain`, `bridge_linux_acl_add`, `bridge_linux_acl_add_recursive`, `bridge_linux_acl_remove_recursive`, `bridge_linux_acl_add_default_dirs_recursive`, `bridge_linux_acl_repair_channel_env_files`, `bridge_linux_repair_isolated_claude_read_lens`, `bridge_linux_repair_claude_credentials_access`. 38 `bridge_isolation_v2_active` runtime branches flattened to v2-only. ACL preflight blocks deleted from `bridge-start.sh:294-308` and `bridge-daemon.sh:3046-3047`. Net: ~1000 LoC removed.
+
+### Added (T3 — PR #640, `2911cb9`)
+
+- Upgrade-integrated v2 migration. `agent-bridge upgrade --apply` now invokes `bridge_isolation_v2_migrate_apply_for_upgrade` between the conflicts-reconcile and apply-live phases. Per-agent enumeration walks `roster ∪ $TARGET_ROOT/agents/*/home` (not active-only), creates `ab-agent-<n>` groups, adds controller UID via `usermod -aG` (Linux) / `dseditgroup` (Darwin), scrubs extended ACLs (`setfacl -bR` Linux / `chmod -R -P -N` Darwin), then chmods to v2 contract (`2750/2770/0660/0640`). Per-agent completion markers at `$BRIDGE_STATE_DIR/migration/isolation-v2/agents/<n>.env` with atomic write; global marker only when all per-agent markers present. Privilege preflight with `no_v080_code_installed=yes` remediation hint on permission failure. Bypass scope hardening: `BRIDGE_LAYOUT_RESOLVER_BYPASS=upgrade-migrate:<nonce>` + `OWNER_PID` handshake validates caller is descendant of bridge-upgrade.sh process tree (rejects external env, init pid 1, non-bridge-upgrade owner cmd). Portable stat shim (`bridge_marker_stat_uid` / `bridge_marker_stat_mode`) handles macOS `stat -f` vs Linux `stat -c`. Surfaces `migration_requires_relogin=yes` to the upgrade output for macOS supplemental group cache.
+
+### Added (T4 — PR #645, `64fc342`)
+
+- `scripts/smoke/v2-cross-class-read.sh` — Linux + passwordless sudo gated smoke verifying that v2 isolation lets controller UID + system-class agents read isolated agents' `memory/projects/`, `memory/shared/`, `memory/decisions/` via `ab-agent-<n>` group permission. Negative case: unrelated UID denied. POSIX-only assertion: no extended ACLs (`getfacl --skip-base` empty). **Closes #583.**
+
+### Added (T5 — PR #648, `e5afd5d`)
+
+- `BRIDGE_DISABLE_ISOLATION=1` runtime rollback hatch via `lib/bridge-isolation-runtime.sh`. Short-circuits v2 secret-env wrap and umask 007 in `bridge-run.sh`; skips v2 isolation prep in `bridge-start.sh`. Status surface emits `isolation=disabled-by-env` in `agent show` and `agent list`. Narrow scope: no v1 ACL re-enable, no marker mutation, no `migrate commit`. Daemon unchanged — env propagates through cron worker spawn naturally. See OPERATIONS.md "Rollback hatch" section.
+
+### Added (#619 — PR #646, `c0e0882`)
+
+- `agent doctor` CRUD self-check (`lib/bridge-doctor.sh`, ~970 lines). Centralized `bridge_doctor_invoke_agent` wrapper isolates `BRIDGE_AGENT_HOME_ROOT` per child via subshell + exec. Closed denial enumeration with strict 3-pattern already-gone subset (matches production strings verbatim at `bridge-agent.sh:2879`, `lib/bridge-agents.sh:318`, `bridge-agent.sh:3381`). Pinned-path final safety net via `rm -rf -- "${root:?}/${fixture:?}"` with verify-gone. Step-7 self-assertion: `delete rc=0 + path-still-exists → fail` propagates to overall exit. 7-step CRUD coverage matrix (create/update/registry/show/reclassify/retire/delete) with pass/fail/n/a + structured JSON envelope. Smoke at `scripts/smoke/agent-doctor.sh` covers admin gate, JSON envelope, concurrent refusal, inherited-env isolation. **Closes #619.** Production `agent delete --purge-home` semantics unchanged.
+
+### Added (#639 — PR #642, `7524f6d`)
+
+- codex-task-mode-policy.py write-shape detector redesign (Option C: default-deny block-mode allowlist + maintained common-shape parser). Replaces PR #636 r1-r5 brittle classifier patches. Closed allowlist of read-only commands (`git status/diff/log/show/ls-files`, `ls`, `cat`, `head`, `tail`, `grep`, `find` without `-exec/-delete`, `wc`, `python -c` with read-only AST validator). Common-shape write-target extractor for 15 verbs (rm, cp, mv, install, touch, sed -i, chmod, chown, dd, ln, mkdir, rmdir, truncate, tee, patch). Multi-command splitting (`;`/`&&`/`||`/`|`). exec/bash/sh recursion bounded at depth 4. Grant grammar (`write:` / `shell:`) preserved with shape grant matcher tightened (head must match runtime command). Substitution detection fail-closed in block mode. Heredoc fail-closed (scanner doesn't consume body). PR #636 r1-r5 fixes preserved (fd redirection, git long flags, patch -i/install -t, attached -tDEST/-oFILE, combined-cluster -rt). Audit-only default `BRIDGE_CODEX_TASK_MODE_POLICY=audit` retained. Comprehensive smoke at `scripts/smoke/codex-task-mode-policy-comprehensive.sh` (64 cases) + 53/53 PR #636 §5 regression replay. **Closes #639.** No new Python dependency.
+
+### Added (v0.7.9 prep rollup — merged into release/v0.8.0 at `5d2ad9a`)
+
+- 9 commits from the deferred v0.7.9 prep cycle landed alongside v0.8.0 work: PR #624 (absolute-path guard load), #634 (lint cleanup), #632 (cron disable idempotent), #631 (ghost text disable via settings), #635 (cron mutation audit), #633 (nudge marker recovery), #638 (systemd KillMode=process), #625 (cron payload.kind=shell runner), #636 (codex companion-role policy + output shape + brief validator).
+
+### Operator notes
+
+- Run `agent-bridge upgrade --apply` from any v0.7.x install. Migration is automatic; markers persist under `$BRIDGE_STATE_DIR/migration/isolation-v2/`.
+- macOS upgraders may need to log out + back in for `ab-agent-*` group membership to take effect for already-running shells. The migration surfaces `migration_requires_relogin=yes` when this applies.
+- Linux Claude agents on first launch will see the Claude login picker — run `claude login` once per isolated UID, OR pre-populate `$BRIDGE_AGENT_ROOT_V2/<agent>/home/credentials/launch-secrets.env` with `ANTHROPIC_API_KEY=...`.
+- Engine CLI (claude/codex) must be in a base-readable path (`/usr/local/bin`, `/opt/...`). Controller-home installs (`~/.local/bin`) silently fail at runtime with `command not found` (KNOWN_ISSUES #17).
+- If v2 hits unforeseen issues, set `BRIDGE_DISABLE_ISOLATION=1` in the daemon env and restart. See OPERATIONS.md.
+- Cosmetic follow-ups filed: #644 (codex-task-mode-policy audit-log accuracy), #647 (agent doctor cosmetic nits), #649 (rollback hatch polish).
+
+### Verified
+
+- `bash -n` clean across all touched .sh files
+- `shellcheck` clean of new errors
+- 64-case comprehensive smoke for #639 passes; 53/53 r1-r5 regression replay passes
+- `agent-doctor` smoke 6/6 (T3 self-assertion case deferred per spec)
+- T4 cross-class read smoke verified by inspection (Linux+sudo CI canonical)
+- Codex pair-review on every PR (T2 r2 + T3 r2 closed all blockers; T4 / #619 / #639 r1 implement-ok)
+
 ## [0.7.8] — 2026-05-06
 
 ### Highlight — surface-reply-enforce + linux-user umask + macOS sudo guard

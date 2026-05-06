@@ -260,65 +260,78 @@ A follow-up PR (PR-G review) is expected to flip `_common.sh` to fail-closed
 and adjust each caller, replacing the local strict block in
 `wiki-daily-ingest.sh` with the shared helper at that point.
 
-## 16. Layout v2 retains a single named-user ACL surface for Claude credentials
+## 16. Layout v2 — Claude first-launch login required (PR #641 / v0.8.0)
 
-PR-E removed named-user POSIX ACLs from layout v2 in favor of group
-ownership + setgid for every artifact under the v2 layout (per-agent
-root, agent-env.sh, plugin catalog, channel symlink target, manifest).
-The one surface that still uses ACLs in v2 is
-`bridge_linux_grant_claude_credentials_access`, which reaches into the
-operator's `~/.claude/.credentials.json` (outside the v2 layout) to give
-the isolated UID a symlink to a single shared credential file.
+PR-E (v0.7.x) introduced a transitional ACL-grant surface
+(`bridge_linux_grant_claude_credentials_access`) that symlinked the
+operator's `~/.claude/.credentials.json` into each isolated agent's
+home and granted the per-agent UID an `r--` ACL on the file plus `--x`
+traverse on every ancestor up to `controller_home`. PR #641 (v0.8.0,
+T2) deletes that helper as part of the v1 ACL hard-cut; the v2 layout
+now has no named-user ACL surface at all.
 
-This is an intentional, named, fail-loud transitional exception:
+Effect on first launch of a v0.8.0 v2-isolated Linux Claude agent:
 
-- The helper requires `setfacl` even in v2 mode and `bridge_die`s if it
-  is missing, so the symlink is never planted in a half-broken state.
-- `bridge_linux_prepare_agent_isolation` keeps the `acl` package
-  prerequisite for v2 + Claude (and skips it for v2 + non-Claude).
-- The v2 ACL grants are exactly: `r--` on the credential file
-  (`controller_home/.claude/.credentials.json`) plus `--x` traverse on
-  every ancestor up to `controller_home` (inclusive of
-  `controller_home/.claude/`). No directory-list `r-x` and no default
-  ACL on `controller_home/.claude/` — re-auth (atomic rename → new
-  inode) requires re-running `agent-bridge isolate <agent>` to refresh
-  the file ACL on the new inode. No other v2 artifact uses ACLs.
+- The isolated UID's `$HOME/.claude/` no longer contains a
+  `.credentials.json` symlink (or any credentials inherited from the
+  operator).
+- `agent start` launches `claude` and the binary presents its
+  interactive login picker — this is acceptable UX, not a hard fail.
+- Operators have two options to seed credentials:
+  - run `claude login` once per isolated UID (the planned end-state),
+    which writes `$BRIDGE_AGENT_ROOT_V2/<agent>/home/.claude/.credentials.json`
+    owned by the per-agent UID; or
+  - pre-populate `$BRIDGE_AGENT_ROOT_V2/<agent>/home/credentials/launch-secrets.env`
+    with `ANTHROPIC_API_KEY=…` before the first launch, in which case
+    the launcher consumes the env-var path and skips the picker.
 
-Plan: PR-F or a future PR is expected to switch v2 to per-agent
-`claude login` (each isolated UID gets its own credential file inside
-`$BRIDGE_AGENT_ROOT_V2/<agent>/home/.claude/.credentials.json`),
-removing this last ACL surface and dropping the `acl` package
-prerequisite entirely. The cost of doing it now would have been an
-operator workflow change inside a contract-cleanup PR; PR-E split that
-out as a deliberate scope decision.
+This is the planned end-state described in the PR-E plan — the
+credential file lives entirely inside the v2 layout, no path reaches
+back into the operator's home, and the `acl` package prerequisite is
+dropped for v2 + Claude. The named-user ACL surface that entry 16
+previously documented is gone.
 
-## 17. Layout v2 requires the engine CLI to be in a base-readable path
+Rollback: operators on v0.7.x with the legacy ACL-grant surface can
+stay on v0.7.x; v0.8.0 is the cut-over and there is no per-agent
+auto-migration of the operator's credential file.
+
+## 17. Layout v2 requires the engine CLI in a base-readable path (enforcement deferred to runtime)
+
+The v2 group contract has no path INTO the operator's home. If
+`which claude` resolves to `~/.local/bin/claude` (or any path under
+the operator's chmod-0700 home) on a v2 install, the isolated agent
+process cannot resolve the binary — the launcher exec's, the bare
+`claude` / `codex` invocation hits a non-readable PATH segment, and
+the agent dies with `command not found`.
 
 PR-E's engine-CLI fail-fast (in
-`bridge_linux_grant_engine_cli_access`) rejects controller-home paths
-under v2 mode because the v2 group contract has no path INTO the
-operator's home. If `which claude` resolves to `~/.local/bin/claude`
-(or any path under the operator's chmod-0700 home) on a v2 install,
-`agent-bridge isolate <agent>` will `bridge_die` with a message like:
+`bridge_linux_grant_engine_cli_access`) used to catch this at
+`agent-bridge isolate <agent>` time and `bridge_die` with an explicit
+"move `claude` to /usr/local/bin" message. PR #641 (v0.8.0, T2)
+deleted that helper as part of the v1 ACL hard-cut. The check is now
+exclusively runtime — operators see a launcher failure instead of a
+prepare-time `bridge_die`, and there is no `bridge_isolation_v2_active`
+guard left in `bridge_write_linux_agent_env_file` that warns about the
+path either.
 
-```
-isolation v2 requires engine CLI ('claude') in a base-readable path;
-got: /home/ec2-user/.local/bin/claude (under controller home).
-Move 'claude' to /usr/local/bin or another path with 'other::r-x'.
-```
+Workaround for v2 installs (unchanged): install Claude/Codex
+system-wide (`/usr/local/bin`, `/opt/…`, or any path with no
+controller-home ancestor). The `npm install -g @anthropic-ai/claude-cli`
+flow lands in `/usr/local/lib/node_modules/…` with a
+`/usr/local/bin/claude` symlink, which works.
 
-The check looks at both the symlink path and its `readlink -f` target,
-so a symlink under `/usr/local/bin` that resolves into the operator's
-home is also caught.
+Diagnostic: if `agent start` fails with the launcher reporting
+`claude: command not found` (or `codex: command not found`), run
+`which claude` as the isolated UID — if the result is under
+`/home/<controller>/…` (or any path the per-agent UID cannot read),
+the install is in a non-v2-readable location and must be moved.
 
-Workaround for v2 installs: install Claude/Codex system-wide
-(`/usr/local/bin`, `/opt/...`, or any path with no controller-home
-ancestor). The `npm install -g @anthropic-ai/claude-cli` flow lands in
-`/usr/local/lib/node_modules/...` with a `/usr/local/bin/claude`
-symlink, which passes the v2 check.
+A future PR may re-introduce the prepare-time fail-fast inline in
+`bridge_linux_prepare_agent_isolation`; until then this is a runtime
+failure mode.
 
-Legacy mode is unaffected — the controller-home traverse-chain ACL
-grants still cover that path.
+Legacy v1 mode is gone in v0.8.0 — there is no fallback ACL
+traverse-chain that covers the controller-home path.
 
 ## 18. Layout v2 swaps the isolated UID's `~/.claude` from 0700 to 2750 group-mode
 
@@ -454,3 +467,24 @@ glyph regression preventing prompt detection) AND a cron keeps queuing
 tasks against it, the spool file grows without bound. Mitigation: stop
 the offending cron, or run `agent-bridge agent stop <agent>` to clear
 the spool. Future hardening: a max-line guard on the append helper.
+
+## 22. Layout v2 — rollback hatch via `BRIDGE_DISABLE_ISOLATION=1`
+
+v0.8.0 hard-cuts v1 (named-ACL) isolation: T1 fails fast on legacy
+markers, T2 deletes the v1 helpers, T3 wires the migration. If v2
+isolation hits an unforeseen issue post-deploy on a specific install,
+operators can set `BRIDGE_DISABLE_ISOLATION=1` in the controller
+environment and restart the daemon + affected agents to keep work
+flowing while debugging.
+
+The hatch disables v2 wraps at runtime — agents run as the controller
+UID with no group/setgid contract. The configured `isolation_mode`
+stays in the roster, the layout marker is not mutated, and v2 resumes
+when the env is unset and the daemon + agents restart. Operations
+status surface (`agent-bridge agent show <agent>`, `agent list`)
+reports `isolation: disabled-by-env` while the hatch is active.
+
+This is a debugging escape, not a permanent operating mode.
+Long-term operation without isolation is unsupported in v0.8.0.
+Report the underlying v2 issue upstream. Full operator notes:
+[`OPERATIONS.md` "Rollback hatch — `BRIDGE_DISABLE_ISOLATION=1`"](OPERATIONS.md).

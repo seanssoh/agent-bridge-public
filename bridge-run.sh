@@ -29,6 +29,17 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 # /proc/<pid>/status. Inert when unset.
 bridge_run_apply_v2_umask_if_needed() {
   local agent="$1"
+  # v0.8.0 T5: BRIDGE_DISABLE_ISOLATION=1 short-circuits the umask 007
+  # wrap so the child inherits bridge-lib.sh's default 0077. With the
+  # boundary off, the agent runs as the controller UID and private mode
+  # (controller-only readable) is the correct contract — group bits do
+  # not need to be set for a peer UID that no longer exists.
+  if bridge_isolation_disabled_by_env; then
+    if [[ -n "${BRIDGE_RUN_UMASK_PROBE_FILE:-}" ]]; then
+      umask >"$BRIDGE_RUN_UMASK_PROBE_FILE" 2>/dev/null || true
+    fi
+    return 0
+  fi
   if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
     umask 007
   fi
@@ -557,8 +568,17 @@ while true; do
   # any tee'd stderr. Loading inside the launch subshell (not the parent)
   # also prevents stale secrets from persisting across restart-loop
   # iterations after the credentials file is rotated, emptied, or removed.
+  #
+  # v0.8.0 T5: BRIDGE_DISABLE_ISOLATION=1 short-circuits the secret-env
+  # wrap. Skipping this means the child does NOT see launch secrets
+  # placed under credentials/launch-secrets.env — operators using the
+  # rollback hatch must inject any required secrets through the
+  # controller environment directly. We log once per launch so the
+  # boundary drop is visible in agent stderr/logs, not silent.
   _v2_secret_file=""
-  if bridge_isolation_v2_active; then
+  if bridge_isolation_disabled_by_env; then
+    bridge_warn "BRIDGE_DISABLE_ISOLATION=1 — running '${AGENT}' without v2 isolation (security boundary disabled, secret-env wrap skipped)"
+  elif bridge_isolation_v2_active; then
     _v2_secret_file="$(bridge_isolation_v2_agent_secret_env_file "$AGENT" 2>/dev/null || true)"
     [[ -n "$_v2_secret_file" && -f "$_v2_secret_file" ]] || _v2_secret_file=""
   fi

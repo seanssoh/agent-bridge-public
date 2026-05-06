@@ -857,52 +857,11 @@ bridge_cron_normalize_shell_run_artifacts() {
 }
 
 bridge_cron_run_dir_grant_isolation() {
-  # Grant the target agent's isolated OS user rwX on a freshly-created cron
-  # per-run dir. Return contract (issue #219):
-  #   - 0 when the target is not linux-user isolated (no-op by design).
-  #   - 0 when every grant succeeds for an isolated target.
-  #   - 1 when setfacl/helper is missing or any grant fails for an isolated
-  #     target. The caller decides how strict to be.
-  # Under v1.3 the memory-daily harvester runs as the controller UID and
-  # does NOT require the isolated UID to own the per-run dir. The default
-  # caller (`dispatch_cron_run`) therefore treats failure as best-effort
-  # (`|| true`) so dispatch cannot be blocked by a host without passwordless
-  # root sudo. Other callers that do need the grant can branch on the
-  # return code.
-  local run_dir="$1"
-  local target="$2"
-
-  [[ -n "$run_dir" && -d "$run_dir" ]] || return 0
-  [[ -n "$target" ]] || return 0
-  command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 || return 0
-  bridge_agent_linux_user_isolation_effective "$target" || return 0
-  command -v bridge_agent_os_user >/dev/null 2>&1 || return 1
-
-  local os_user
-  os_user="$(bridge_agent_os_user "$target")"
-  [[ -n "$os_user" ]] || return 1
-
-  command -v bridge_linux_acl_add_recursive >/dev/null 2>&1 || return 1
-  # setfacl availability: needed for linux-user isolation. bridge_linux_*
-  # helpers already sudo-wrap; failures are structured below.
-  local rc=0
-  if ! bridge_linux_acl_add_recursive "u:${os_user}:rwX" "$run_dir" 2>/dev/null; then
-    rc=1
-  fi
-  if ! bridge_linux_acl_add_default_dirs_recursive "u:${os_user}:rwX" "$run_dir" 2>/dev/null; then
-    rc=1
-  fi
-  # Issue #233: the traverse chain call must carry an explicit stop_path
-  # now (the old implicit walk-to-`/` was the root cause of the ACL
-  # poison on `/` and `/home`). Derive the stop from the controller's
-  # home — the run_dir sits under $BRIDGE_STATE_DIR, which is itself
-  # under the controller's home on every shipped install.
-  local _traverse_stop
-  _traverse_stop="$(bridge_linux_traverse_stop_for "$run_dir")"
-  if [[ -n "$_traverse_stop" ]]; then
-    bridge_linux_grant_traverse_chain "$os_user" "$run_dir" "$_traverse_stop" >/dev/null 2>&1 || true
-  fi
-  return "$rc"
+  # v2 hard-cut: the per-agent group + setgid contract on the per-agent
+  # root covers cron per-run dirs reachable by the isolated UID. No
+  # per-run-dir named-user ACL grant is applied. Retained as a no-op
+  # stub so callers (`dispatch_cron_run`) link cleanly.
+  return 0
 }
 
 bridge_cron_update_request_task_id() {

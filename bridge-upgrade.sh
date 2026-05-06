@@ -4,6 +4,25 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# v0.8.0 T3 — the layout resolver fails fast on markerless / legacy
+# installs. The upgrader is the migration vehicle for those installs,
+# so we MUST be able to source the v0.8.0 lib stack against a v0.7.x
+# target. Set the resolver bypass before sourcing bridge-lib.sh; the
+# migration call below clears it once the v2 marker has been written.
+# Operators never set this directly — it's an internal upgrader handshake.
+#
+# Bypass scope is defended by a process-tree check (r2 review fix):
+# the bypass value carries a unique nonce, and the resolver only honors
+# it when the calling process is a descendant of the upgrade owner PID.
+# A leaked or copied env var alone is therefore not enough to disarm the
+# v0.8.0 fail-fast guard from outside the upgrade flow.
+_BRIDGE_UPGRADE_BYPASS_NONCE="$(date -u '+%Y%m%dT%H%M%SZ')-$$-${RANDOM}${RANDOM}"
+export BRIDGE_LAYOUT_RESOLVER_BYPASS="upgrade-migrate:${_BRIDGE_UPGRADE_BYPASS_NONCE}"
+export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
+# Always clear the bypass at exit so a crashed / interrupted upgrade
+# can never leave the env in a state that disarms the resolver for
+# subsequent shells in the same process tree.
+trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 # shellcheck source=lib/bridge-cleanup.sh
@@ -168,6 +187,8 @@ bridge_upgrade_with_target_env() {
     BRIDGE_TASK_NOTE_DIR="$target_root/shared/tasks" \
     BRIDGE_DASHBOARD_STATE_FILE="$target_root/state/dashboard.json" \
     BRIDGE_DISCORD_RELAY_STATE_FILE="$target_root/state/discord-relay.json" \
+    BRIDGE_LAYOUT_RESOLVER_BYPASS="${BRIDGE_LAYOUT_RESOLVER_BYPASS:-}" \
+    BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID="${BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID:-}" \
     "$@"
 }
 
@@ -1170,6 +1191,70 @@ if [[ $DRY_RUN -eq 0 ]]; then
   if [[ $_reconcile_rc -ne 0 ]]; then
     RECONCILE_JSON='{"mode":"upgrade-conflicts-reconcile","error":"reconcile failed","archived_count":0}'
   fi
+fi
+
+# v0.8.0 T3 — isolation-v2 migration. Runs between reconcile and apply-live
+# so any markerless v0.7.x install is migrated forward as part of the
+# standard upgrade path. Skipped on dry-run; idempotent (skipped when
+# the v2 marker is already present + valid). Failure aborts the upgrade
+# before apply-live touches the install — the `no_v080_code_installed=yes`
+# remediation hint tells the operator they can safely retry.
+ISOLATION_V2_MIGRATION_JSON='{"mode":"isolation-v2-migrate","skipped":true,"reason":"dry-run"}'
+if [[ $DRY_RUN -eq 0 ]]; then
+  # Run the migration in a child shell whose env is scoped to TARGET_ROOT
+  # via bridge_upgrade_with_target_env. This guarantees BRIDGE_HOME,
+  # BRIDGE_STATE_DIR, BRIDGE_AGENT_HOME_ROOT, and the marker dir all
+  # resolve to the install we are upgrading — even if this upgrader was
+  # invoked from a different live install (per-controller workstations,
+  # multi-install operator boxes). bridge_upgrade_with_target_env
+  # forwards BRIDGE_LAYOUT_RESOLVER_BYPASS{,_OWNER_PID} explicitly so
+  # the resolver inside the child still validates the handshake — the
+  # process-tree walk traverses env → bash → upgrade.sh and matches.
+  set +e
+  ISOLATION_V2_MIGRATION_JSON="$(
+    bridge_upgrade_with_target_env "$TARGET_ROOT" \
+      "$BRIDGE_BASH_BIN" -s -- "$SOURCE_ROOT" "$TARGET_ROOT" <<'EOF'
+set -euo pipefail
+source_root="$1"
+target_root="$2"
+# shellcheck source=/dev/null
+source "$source_root/bridge-lib.sh"
+bridge_load_roster
+# shellcheck source=lib/bridge-isolation-v2-migrate.sh
+source "$source_root/lib/bridge-isolation-v2-migrate.sh"
+bridge_isolation_v2_migrate_apply_for_upgrade --target-root "$target_root" --json
+EOF
+  )"
+  _migrate_rc=$?
+  set -e
+  if [[ $_migrate_rc -ne 0 ]]; then
+    bridge_die "isolation-v2 migration failed during upgrade
+  rc=${_migrate_rc}
+  detail: ${ISOLATION_V2_MIGRATION_JSON}
+  remediation: see ${TARGET_ROOT}/state/migration/isolation-v2/last-error.json
+  no_v080_code_installed=yes  (apply-live did NOT run; safe to retry after fix)"
+  fi
+  # Surface the macOS supplemental-group cache caveat to the operator.
+  # The migration JSON carries `migration_requires_relogin` regardless of
+  # success — we only print on success because failure already aborts.
+  _relogin_required="$(printf '%s' "$ISOLATION_V2_MIGRATION_JSON" | python3 -c '
+import json, sys
+try:
+  data = json.loads(sys.stdin.read().splitlines()[-1])
+  print("yes" if data.get("migration_requires_relogin") else "no")
+except Exception:
+  print("no")
+' 2>/dev/null || printf 'no')"
+  if [[ "$_relogin_required" == "yes" ]]; then
+    bridge_warn "isolation-v2 migration: macOS supplemental group cache requires re-login. Log out + back in for ab-agent-* group membership to take effect for already-running shells."
+  fi
+  # Migration succeeded — the v2 marker is now on disk. Drop the resolver
+  # bypass so any subprocesses spawned by the rest of the upgrade flow
+  # (apply-live, daemon restart, agent restart) take the normal `marker`
+  # source path. Leaving the bypass set would re-enter the deferred
+  # state and BRIDGE_LAYOUT would stay empty, which downstream v2
+  # helpers treat as legacy.
+  unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID
 fi
 
 apply_args=(apply-live --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT" --run-id "$UPGRADE_RUN_ID")

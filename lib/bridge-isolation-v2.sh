@@ -79,9 +79,18 @@
 # 1. opt-in flag and path variables
 # ---------------------------------------------------------------------------
 
-# Layout selector. Legacy installs leave this empty/unset. New installs and
-# migrated installs set BRIDGE_LAYOUT=v2. Tests may set it to "v2" via env.
-BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"
+# Layout selector. v0.8.0 hard-cut: the only accepted value is `v2`. The
+# resolver in lib/bridge-layout-resolver.sh fail-fasts on anything else
+# (including unset / legacy / v1 / arbitrary strings) BEFORE this module
+# is sourced, so by the time we read BRIDGE_LAYOUT here it is either
+# `v2` or the process has already exited via bridge_die. We deliberately
+# do NOT default to `legacy` anymore — the legacy-fallback default was
+# the v1 ACL-isolation entry point and v0.8.0 removed v1.
+#
+# Tests that source this file standalone (without going through
+# bridge-lib.sh + the resolver) must export BRIDGE_LAYOUT=v2 themselves;
+# leaving it unset is no longer a valid runtime state.
+BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-}"
 
 # Data root for v2 layout. When unset, v2 helpers no-op (legacy mode).
 # Default suggestion when an operator opts in: /srv/agent-bridge.
@@ -103,7 +112,15 @@ BRIDGE_AGENT_GROUP_PREFIX="${BRIDGE_AGENT_GROUP_PREFIX:-ab-agent-}"
 
 bridge_isolation_v2_active() {
   # Returns 0 (active) when BRIDGE_LAYOUT=v2 and BRIDGE_DATA_ROOT is set.
-  # All v2 helpers should gate on this so they no-op for legacy installs.
+  #
+  # v0.8.0 hard-cut: this is now an invariant/status helper, not a
+  # runtime branching primitive. The layout resolver fail-fasts at
+  # startup if v2 is not active, so any code path that reaches a
+  # v2-helper call site is already guaranteed to be running under v2.
+  # Callers should treat a `false` return here as a programmer error
+  # surface (e.g. status reporting, smoke tests sourcing the module
+  # standalone), not a signal to fall back to v1/ACL behavior — the
+  # v1/ACL code paths were removed.
   [[ "$BRIDGE_LAYOUT" == "v2" ]] || return 1
   [[ -n "$BRIDGE_DATA_ROOT" ]] || return 1
   return 0
@@ -381,10 +398,85 @@ bridge_isolation_v2_agent_group_name() {
 # ---------------------------------------------------------------------------
 
 bridge_isolation_v2_group_exists() {
-  # Returns 0 if the named group exists in nss. Works without root.
+  # Returns 0 if the named group exists. Works without root. Dispatches by
+  # `uname` so macOS (no getent) uses dscl. The Darwin path probes
+  # /Local/Default first; OD-bound directories (corp LDAP) would also
+  # need a `dscl /Search` fallback but that is not in the v0.8.0 scope.
   local name="$1"
   [[ -n "$name" ]] || return 1
+  if [[ "$(uname)" == "Darwin" ]]; then
+    bridge_isolation_v2_darwin_group_exists "$name"
+    return $?
+  fi
   getent group "$name" >/dev/null 2>&1
+}
+
+bridge_isolation_v2_darwin_group_exists() {
+  local name="$1"
+  [[ -n "$name" ]] || return 1
+  dscl . -read "/Groups/$name" PrimaryGroupID >/dev/null 2>&1
+}
+
+bridge_isolation_v2_darwin_group_gid() {
+  local name="$1"
+  [[ -n "$name" ]] || return 1
+  dscl . -read "/Groups/$name" PrimaryGroupID 2>/dev/null \
+    | awk '/^PrimaryGroupID:/ {print $2}'
+}
+
+bridge_isolation_v2_darwin_ensure_group() {
+  # Idempotent group create on macOS via `dseditgroup`. `-o create -r
+  # <real-name>` requires admin; we try direct first then sudo -n. The
+  # `-r` value is the human-readable RealName attribute — the spec
+  # suggests "Agent Bridge agent <n>" so DS browsers show provenance.
+  local name="$1"
+  local realname="${2:-Agent Bridge group $name}"
+  [[ -n "$name" ]] || {
+    bridge_warn "darwin_ensure_group: name required"
+    return 1
+  }
+  if bridge_isolation_v2_darwin_group_exists "$name"; then
+    return 0
+  fi
+  if dseditgroup -o create -r "$realname" -t group "$name" 2>/dev/null; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    if sudo -n dseditgroup -o create -r "$realname" -t group "$name" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  bridge_warn "darwin_ensure_group: cannot create '$name' (need admin or passwordless sudo)"
+  return 1
+}
+
+bridge_isolation_v2_darwin_ensure_user_in_group() {
+  # Idempotent supplementary membership add on macOS via `dseditgroup
+  # edit -a <user> -t user <group>`. Like Linux, already-running shells
+  # do NOT pick up the new membership — operators must re-login or
+  # caller must restart the relevant process trees.
+  local user="$1"
+  local group="$2"
+  [[ -n "$user" && -n "$group" ]] || {
+    bridge_warn "darwin_ensure_user_in_group: user and group required"
+    return 1
+  }
+  # Check membership via `dseditgroup -o checkmember`. Returns 0 with
+  # "yes <user> is a member of <group>" on stdout when present.
+  if dseditgroup -o checkmember -m "$user" "$group" 2>/dev/null \
+      | grep -q '^yes'; then
+    return 0
+  fi
+  if dseditgroup -o edit -a "$user" -t user "$group" 2>/dev/null; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    if sudo -n dseditgroup -o edit -a "$user" -t user "$group" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  bridge_warn "darwin_ensure_user_in_group: cannot add '$user' to '$group' (need admin or passwordless sudo)"
+  return 1
 }
 
 bridge_isolation_v2_user_in_group() {
@@ -399,8 +491,10 @@ bridge_isolation_v2_user_in_group() {
 }
 
 bridge_isolation_v2_ensure_group() {
-  # Idempotent: create the group if it does not exist. Requires root or
-  # passwordless `sudo groupadd`. Returns 0 on success or pre-existing.
+  # Idempotent: create the group if it does not exist. On Linux requires
+  # root or passwordless `sudo groupadd`; on macOS requires admin or
+  # passwordless `sudo dseditgroup` (handled by darwin helper). Returns
+  # 0 on success or pre-existing.
   local name="$1"
   [[ -n "$name" ]] || {
     bridge_warn "bridge_isolation_v2_ensure_group: name required"
@@ -408,6 +502,10 @@ bridge_isolation_v2_ensure_group() {
   }
   if bridge_isolation_v2_group_exists "$name"; then
     return 0
+  fi
+  if [[ "$(uname)" == "Darwin" ]]; then
+    bridge_isolation_v2_darwin_ensure_group "$name"
+    return $?
   fi
   # groupadd -r returns 9 when the group already exists. The pre-check
   # above covers the common case but a TOCTOU window between
@@ -434,8 +532,11 @@ bridge_isolation_v2_ensure_group() {
 bridge_isolation_v2_ensure_user_in_group() {
   # Idempotent: add user to group as a supplementary member if not
   # already present. WARNING: already-running shells/daemons do NOT
-  # pick up new supplementary groups. Caller must restart the relevant
-  # process trees for the new membership to take effect.
+  # pick up new supplementary groups. On macOS the supplementary group
+  # cache is per-login, so changes only take effect after the affected
+  # user re-logins (handled by the migration tool's
+  # migration_requires_relogin flag). Caller must restart the relevant
+  # process trees on Linux.
   local user="$1"
   local group="$2"
   [[ -n "$user" && -n "$group" ]] || {
@@ -444,6 +545,10 @@ bridge_isolation_v2_ensure_user_in_group() {
   }
   if bridge_isolation_v2_user_in_group "$user" "$group"; then
     return 0
+  fi
+  if [[ "$(uname)" == "Darwin" ]]; then
+    bridge_isolation_v2_darwin_ensure_user_in_group "$user" "$group"
+    return $?
   fi
   if [[ "$(id -u)" -eq 0 ]]; then
     usermod -aG "$group" "$user"
@@ -530,6 +635,106 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type f -exec chgrp "$group" {} + || return 1
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type d -exec chmod "$dir_mode" {} + || return 1
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type f -exec chmod "$file_mode" {} + || return 1
+}
+
+# ---------------------------------------------------------------------------
+# 4b. ACL scrub — strip pre-v2 ACL entries before the chmod pass
+# ---------------------------------------------------------------------------
+
+bridge_isolation_v2_acl_scrub() {
+  # Recursively remove every named ACL entry on the tree. Required by the
+  # migration tool: pre-v2 (v1) installs left ACLs on agent paths that
+  # would override v2 group permissions in a way the operator can not
+  # see from `ls -l`. Linux uses `setfacl -bR`; macOS has no `setfacl`,
+  # so `chmod -R -P -N` (`-P` = no-symlink-follow, `-N` = remove ACL).
+  #
+  # r2 review fix: the migration writes an err log on the controller and
+  # then advances the global v2 marker after this scrub. If we silently
+  # swallowed scrub failures, the install would land in an "isolation-v2
+  # marker present + leftover ACLs override the new POSIX bits" state —
+  # the contract break codex flagged. We now propagate the scrub rc and
+  # the migration caller turns that into a `bridge_die` so the marker is
+  # never advanced on a half-scrubbed tree.
+  #
+  # Errors from the scrub command itself are captured in a temp file and
+  # echoed via bridge_warn so operators have something to grep when they
+  # rerun. The err-file path is opportunistic; if mktemp itself fails we
+  # still surface the rc.
+  local root="$1"
+  [[ -n "$root" ]] || {
+    bridge_warn "acl_scrub: root required"
+    return 1
+  }
+  [[ -d "$root" ]] || return 0
+  local _scrub_err _rc
+  _scrub_err="$(mktemp 2>/dev/null || printf '/dev/null')"
+  if [[ "$(uname)" == "Darwin" ]]; then
+    _bridge_isolation_v2_run_root_or_sudo \
+      chmod -R -P -N "$root" 2>"$_scrub_err"
+    _rc=$?
+    if (( _rc != 0 )); then
+      bridge_warn "acl_scrub: chmod -R -P -N failed at $root (rc=${_rc}); see ${_scrub_err}"
+      return 1
+    fi
+    [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
+    return 0
+  fi
+  if ! command -v setfacl >/dev/null 2>&1; then
+    # No setfacl on this Linux box — POSIX ACLs cannot be present without
+    # the toolchain that creates them, so a missing setfacl is treated as
+    # "nothing to scrub". Do NOT silently bypass when setfacl IS present
+    # but fails — that's the contract break we're closing.
+    [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
+    return 0
+  fi
+  # Pre-check: when getfacl is available, treat "tree has no extended
+  # ACLs" as a no-op. This avoids tripping on distros where `setfacl -b`
+  # on a clean tree returns non-zero. Best-effort — when getfacl is
+  # missing we fall through to the direct scrub.
+  if command -v getfacl >/dev/null 2>&1; then
+    local _ext_acls
+    _ext_acls="$(getfacl --skip-base -R "$root" 2>/dev/null \
+      | grep -v '^[[:space:]]*$' | grep -v '^#' | head -n 1 || true)"
+    if [[ -z "$_ext_acls" ]]; then
+      [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
+      return 0
+    fi
+  fi
+  _bridge_isolation_v2_run_root_or_sudo \
+    setfacl -bR "$root" 2>"$_scrub_err"
+  _rc=$?
+  if (( _rc != 0 )); then
+    bridge_warn "acl_scrub: setfacl -bR failed at $root (rc=${_rc}); see ${_scrub_err}"
+    return 1
+  fi
+  [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 4c. privilege preflight — used by migration / upgrade callers
+# ---------------------------------------------------------------------------
+
+bridge_isolation_v2_privilege_preflight() {
+  # Returns 0 when the caller has sufficient privilege to run the group
+  # / membership / chmod mutations. Returns non-zero with bridge_warn
+  # describing the missing capability — caller composes the
+  # bridge_die remediation and decides whether to abort or skip.
+  #
+  # Linux: need root or passwordless sudo (groupadd / usermod / chmod
+  # passes go through `_bridge_isolation_v2_run_root_or_sudo`).
+  # Darwin: need passwordless sudo for `dseditgroup -o create/edit`
+  # (admin members can technically run dseditgroup direct, but the
+  # group-create path almost always needs sudo because system-managed
+  # group ranges are protected).
+  if [[ "$(id -u)" -eq 0 ]]; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    return 0
+  fi
+  bridge_warn "isolation-v2 migration requires root or passwordless sudo (current uid=$(id -u))"
+  return 1
 }
 
 # ---------------------------------------------------------------------------

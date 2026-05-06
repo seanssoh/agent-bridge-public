@@ -116,6 +116,134 @@ bridge_isolation_v2_migrate_capture_active_snapshot() {
   bridge_active_agent_ids > "$snapshot"
 }
 
+bridge_isolation_v2_migrate_all_agents_snapshot_path() {
+  printf '%s/all-agents.snapshot' "$(bridge_isolation_v2_migrate_state_dir)"
+}
+
+bridge_isolation_v2_migrate_capture_all_agents_snapshot() {
+  # Q3 spec: enumerate roster ∪ $TARGET_ROOT/agents/*/home, NOT
+  # active-only. Every agent that has ever existed needs migration even
+  # if currently inactive — otherwise a stopped agent would re-launch
+  # against unmigrated paths and get kicked by the v2 fail-fast guard.
+  #
+  # Reads BRIDGE_AGENT_IDS (roster) and the agents/<n>/home directory
+  # listing under the v1 install root ($BRIDGE_AGENT_HOME_ROOT). The
+  # union is deduplicated via sort -u; output is one agent id per line.
+  bridge_isolation_v2_migrate_mkstate
+  local snapshot
+  snapshot="$(bridge_isolation_v2_migrate_all_agents_snapshot_path)"
+
+  {
+    if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1; then
+      local id
+      for id in "${BRIDGE_AGENT_IDS[@]}"; do
+        [[ -n "$id" ]] || continue
+        printf '%s\n' "$id"
+      done
+    fi
+    if [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" && -d "$BRIDGE_AGENT_HOME_ROOT" ]]; then
+      local entry name
+      for entry in "$BRIDGE_AGENT_HOME_ROOT"/*/; do
+        [[ -d "$entry" ]] || continue
+        name="$(basename "$entry")"
+        # Skip dotfiles and well-known non-agent dirs. r2 review fix:
+        # `agents-archive` was missing from the denylist. The filter
+        # also requires a `home/` child to confirm this really is an
+        # agent root — orphan dirs (e.g. half-deleted agents, operator
+        # scratch) get skipped instead of accidentally enrolled into
+        # the v2 group/perm pass.
+        case "$name" in
+          .*|backups|state|logs|shared|worktrees|agents-archive)
+            continue
+            ;;
+        esac
+        if [[ ! -d "$entry/home" ]]; then
+          bridge_warn "isolation-v2 migration: skipping non-agent dir $entry (no home/ subdir)"
+          continue
+        fi
+        printf '%s\n' "$name"
+      done
+    fi
+  } | sort -u >"$snapshot"
+}
+
+bridge_isolation_v2_migrate_per_agent_marker_dir() {
+  printf '%s/isolation-v2/agents' "$(bridge_isolation_v2_migrate_state_dir)"
+}
+
+bridge_isolation_v2_migrate_per_agent_marker_path() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  printf '%s/%s.env' "$(bridge_isolation_v2_migrate_per_agent_marker_dir)" "$agent"
+}
+
+bridge_isolation_v2_migrate_per_agent_marker_present() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  local marker
+  marker="$(bridge_isolation_v2_migrate_per_agent_marker_path "$agent")"
+  [[ -f "$marker" ]]
+}
+
+bridge_isolation_v2_migrate_per_agent_marker_write() {
+  # Write a per-agent completion marker after the agent's group +
+  # path-perms pass. Atomic write via tmpfile + mv. Format:
+  #   ISOLATION_V2_MIGRATED_AT=<iso8601>
+  #   ISOLATION_V2_GROUP=<group_name>
+  #   ISOLATION_V2_GID=<gid>           (optional; empty when query fails)
+  #   ISOLATION_V2_RELOGIN_REQUIRED=<0|1>
+  local agent="$1"
+  local group="$2"
+  local relogin_required="${3:-0}"
+  [[ -n "$agent" && -n "$group" ]] || {
+    bridge_warn "per_agent_marker_write: agent and group required"
+    return 1
+  }
+
+  local dir
+  dir="$(bridge_isolation_v2_migrate_per_agent_marker_dir)"
+  install -d -m 0750 "$dir" 2>/dev/null || mkdir -p "$dir"
+
+  local marker tmp gid ts
+  marker="$(bridge_isolation_v2_migrate_per_agent_marker_path "$agent")"
+  tmp="${marker}.tmp.$$"
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+  if [[ "$(uname)" == "Darwin" ]]; then
+    gid="$(bridge_isolation_v2_darwin_group_gid "$group" 2>/dev/null || true)"
+  else
+    gid="$(getent group "$group" 2>/dev/null | awk -F: '{print $3}')"
+  fi
+
+  {
+    printf 'ISOLATION_V2_MIGRATED_AT=%s\n' "$ts"
+    printf 'ISOLATION_V2_GROUP=%s\n' "$group"
+    printf 'ISOLATION_V2_GID=%s\n' "${gid:-}"
+    printf 'ISOLATION_V2_RELOGIN_REQUIRED=%s\n' "$relogin_required"
+  } > "$tmp"
+  chmod 0640 "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$marker" || {
+    rm -f "$tmp"
+    bridge_warn "per_agent_marker_write: mv failed for $marker"
+    return 1
+  }
+  return 0
+}
+
+bridge_isolation_v2_migrate_all_per_agent_markers_present() {
+  # Returns 0 when every id in $1 (newline-separated snapshot) has its
+  # per-agent completion marker present. Used by the upgrade wrapper to
+  # gate the global marker write.
+  local snapshot_path="$1"
+  [[ -f "$snapshot_path" ]] || return 1
+  local agent
+  while IFS= read -r agent; do
+    [[ -n "$agent" ]] || continue
+    bridge_isolation_v2_migrate_per_agent_marker_present "$agent" || return 1
+  done < "$snapshot_path"
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # 3. profile_home override preflight
 # ---------------------------------------------------------------------------
@@ -908,6 +1036,225 @@ PY
   else
     printf 'manifest: (none)\n'
   fi
+}
+
+# ---------------------------------------------------------------------------
+# 11b. Upgrade-integrated wrapper
+# ---------------------------------------------------------------------------
+
+bridge_isolation_v2_migrate_apply_for_upgrade() {
+  # Wrapper called from `bridge-upgrade.sh` between RECONCILE and
+  # APPLY_JSON. Differs from `bridge_isolation_v2_migrate_apply` in that
+  # it:
+  #   1. Skips no-op when v2 is already active (existing marker valid +
+  #      agent-class memberships in place) — re-running `agent-bridge
+  #      upgrade --apply` after a successful migration is a no-op.
+  #   2. Auto-derives BRIDGE_DATA_ROOT (defaults to TARGET_ROOT —
+  #      markerless installs keep the existing canonical path).
+  #   3. Runs in unattended mode (no --yes prompt; the operator has
+  #      already confirmed via `agent-bridge upgrade --apply`).
+  #   4. Emits a single JSON object on stdout summarizing the outcome,
+  #      and writes detailed per-step state under
+  #      $BRIDGE_STATE_DIR/migration/isolation-v2/.
+  #
+  # Args:
+  #   --target-root <path>   absolute path to the live bridge home (TARGET_ROOT)
+  #   --json                 (currently ignored; output is always JSON)
+  #
+  # Exit code:
+  #   0 — applied or skipped (idempotent)
+  #   non-zero — fatal; caller should die with the JSON body's
+  #              `last_error` field as remediation.
+  local target_root=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --target-root) target_root="$2"; shift 2 ;;
+      --json) shift ;;  # accepted for forward-compat
+      *) bridge_warn "apply_for_upgrade: unknown arg: $1"; return 2 ;;
+    esac
+  done
+  [[ -n "$target_root" && "${target_root:0:1}" == "/" ]] || {
+    bridge_warn "apply_for_upgrade: --target-root <abs-path> required"
+    return 2
+  }
+
+  local data_root="${BRIDGE_DATA_ROOT:-$target_root}"
+  local marker_path
+  marker_path="$(bridge_isolation_v2_marker_path 2>/dev/null || \
+    printf '%s/state/layout-marker.sh' "$target_root")"
+
+  # Idempotent skip: marker already present + valid -> already migrated.
+  if [[ -f "$marker_path" ]] \
+      && bridge_isolation_v2_marker_validate "$marker_path" 2>/dev/null; then
+    printf '{"mode":"isolation-v2-migrate","skipped":true,"reason":"marker-present","marker":"%s","data_root":"%s"}\n' \
+      "$marker_path" "$data_root"
+    return 0
+  fi
+
+  # Privilege preflight before any mutation.
+  if ! bridge_isolation_v2_privilege_preflight; then
+    local err
+    err='isolation-v2 migration requires root or passwordless sudo'
+    printf '{"mode":"isolation-v2-migrate","status":"error","reason":"privilege","last_error":"%s","remediation":"rerun agent-bridge upgrade --apply as root or configure passwordless sudo","no_v080_code_installed":"yes"}\n' \
+      "$err"
+    return 1
+  fi
+
+  # Lock + capture both snapshots. Active = stop/restart subset; All =
+  # group/perm/marker subset.
+  bridge_isolation_v2_migrate_acquire_lock
+  bridge_isolation_v2_migrate_capture_active_snapshot
+  bridge_isolation_v2_migrate_capture_all_agents_snapshot
+
+  local active_snapshot all_snapshot
+  active_snapshot="$(bridge_isolation_v2_migrate_active_snapshot_path)"
+  all_snapshot="$(bridge_isolation_v2_migrate_all_agents_snapshot_path)"
+
+  local active_count all_count
+  active_count="$(wc -l < "$active_snapshot" 2>/dev/null | tr -d ' ' || printf 0)"
+  all_count="$(wc -l < "$all_snapshot" 2>/dev/null | tr -d ' ' || printf 0)"
+
+  # Set BRIDGE_LAYOUT=v2 + BRIDGE_DATA_ROOT in the function-local env so
+  # the existing apply path's preconditions are satisfied. Caller env
+  # is unaffected.
+  local _saved_layout="${BRIDGE_LAYOUT:-}"
+  local _saved_data_root="${BRIDGE_DATA_ROOT:-}"
+  BRIDGE_LAYOUT="v2"
+  BRIDGE_DATA_ROOT="$data_root"
+  export BRIDGE_LAYOUT BRIDGE_DATA_ROOT
+
+  local err_log
+  err_log="$(bridge_isolation_v2_migrate_state_dir)/last-error.json"
+
+  # Run the existing apply pipeline. We do NOT call
+  # bridge_isolation_v2_migrate_apply directly because it acquires its
+  # own lock (we already hold one) and re-captures the active snapshot;
+  # instead inline the post-lock steps. This stays within the
+  # established review boundaries — same primitives, same order.
+  install -d -m 0755 "$data_root" 2>/dev/null || mkdir -p "$data_root"
+
+  if [[ "$active_count" -gt 0 ]]; then
+    bridge_isolation_v2_migrate_self_stop_guard "$active_snapshot" || {
+      printf '{"mode":"isolation-v2-migrate","status":"error","reason":"self-stop-guard","last_error":"caller is one of the active agents — re-run from an out-of-band controller shell","no_v080_code_installed":"yes"}\n' >"$err_log"
+      cat "$err_log"
+      return 1
+    }
+    bridge_isolation_v2_migrate_orchestrate_stop "$active_snapshot"
+  fi
+
+  # Group + membership ensure for the FULL agent set, not active-only.
+  if ! bridge_isolation_v2_migrate_ensure_groups_and_memberships "$all_snapshot"; then
+    {
+      printf '{"mode":"isolation-v2-migrate","status":"error","reason":"groups-ensure",'
+      printf '"last_error":"group create / membership ensure failed",'
+      printf '"remediation":"check sudo / dseditgroup permissions and rerun",'
+      printf '"no_v080_code_installed":"yes"}\n'
+    } >"$err_log"
+    [[ "$active_count" -gt 0 ]] && bridge_isolation_v2_migrate_orchestrate_restart "$active_snapshot"
+    cat "$err_log"
+    return 1
+  fi
+
+  # Mirror legacy -> v2 paths (active set only — inactive agents have
+  # nothing to mirror; their group + perms still get applied via the
+  # full snapshot below).
+  local manifest
+  manifest="$(bridge_isolation_v2_migrate_manifest_path)"
+  if [[ "$active_count" -gt 0 ]]; then
+    if ! bridge_isolation_v2_migrate_mirror_all "$data_root" "$active_snapshot" "$manifest"; then
+      {
+        printf '{"mode":"isolation-v2-migrate","status":"error","reason":"mirror",'
+        printf '"last_error":"mirror reported failures","manifest":"%s",' "$manifest"
+        printf '"remediation":"inspect manifest verify_status column and rerun",'
+        printf '"no_v080_code_installed":"yes"}\n'
+      } >"$err_log"
+      bridge_isolation_v2_migrate_orchestrate_restart "$active_snapshot"
+      cat "$err_log"
+      return 1
+    fi
+  else
+    : > "$manifest"
+  fi
+
+  # ACL scrub + chgrp+setgid+chmod on data_root tree (the all-snapshot
+  # writes correct group ownership for every agent root, mirrored or
+  # not). Run scrub first so leftover v1 ACLs don't override the new
+  # POSIX group bits.
+  #
+  # r2 review fix: scrub failures are no longer swallowed. A failed
+  # scrub means leftover ACLs may still override the v2 group bits —
+  # writing the global marker on top of that would silently break the
+  # isolation contract. Treat as fatal and bail BEFORE the marker is
+  # advanced; idempotent re-run remains safe because no new state was
+  # written past this point.
+  if ! bridge_isolation_v2_acl_scrub "$data_root"; then
+    {
+      printf '{"mode":"isolation-v2-migrate","status":"error","reason":"acl-scrub",'
+      printf '"last_error":"ACL scrub failed at %s; marker NOT advanced",' "$data_root"
+      printf '"remediation":"inspect bridge_warn output (chmod -P -N / setfacl -bR rc) and rerun once the underlying ACL state is correctable",'
+      printf '"no_v080_code_installed":"yes"}\n'
+    } >"$err_log"
+    [[ "$active_count" -gt 0 ]] && bridge_isolation_v2_migrate_orchestrate_restart "$active_snapshot"
+    cat "$err_log"
+    return 1
+  fi
+  if ! bridge_isolation_v2_migrate_normalize_layout "$all_snapshot" "$data_root"; then
+    {
+      printf '{"mode":"isolation-v2-migrate","status":"error","reason":"normalize",'
+      printf '"last_error":"layout normalize failed","manifest":"%s",' "$manifest"
+      printf '"remediation":"verify chgrp/chmod permissions on %s and rerun",' "$data_root"
+      printf '"no_v080_code_installed":"yes"}\n'
+    } >"$err_log"
+    [[ "$active_count" -gt 0 ]] && bridge_isolation_v2_migrate_orchestrate_restart "$active_snapshot"
+    cat "$err_log"
+    return 1
+  fi
+
+  # Per-agent completion markers — all_snapshot, one marker each.
+  # macOS supplemental group cache: dseditgroup-driven membership only
+  # takes effect after re-login, so flag every Darwin-side agent.
+  local relogin_flag=0
+  [[ "$(uname)" == "Darwin" ]] && relogin_flag=1
+  local agent agent_grp
+  while IFS= read -r agent; do
+    [[ -n "$agent" ]] || continue
+    agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+    [[ -n "$agent_grp" ]] || continue
+    bridge_isolation_v2_migrate_per_agent_marker_write \
+      "$agent" "$agent_grp" "$relogin_flag" || true
+  done < "$all_snapshot"
+
+  # Global marker only after all per-agent markers landed.
+  if ! bridge_isolation_v2_migrate_all_per_agent_markers_present "$all_snapshot"; then
+    {
+      printf '{"mode":"isolation-v2-migrate","status":"error","reason":"per-agent-marker-incomplete",'
+      printf '"last_error":"one or more per-agent markers missing under %s/isolation-v2/agents/",' \
+        "$(bridge_isolation_v2_migrate_state_dir)"
+      printf '"remediation":"inspect bridge_warn output and rerun",'
+      printf '"no_v080_code_installed":"yes"}\n'
+    } >"$err_log"
+    [[ "$active_count" -gt 0 ]] && bridge_isolation_v2_migrate_orchestrate_restart "$active_snapshot"
+    cat "$err_log"
+    return 1
+  fi
+
+  bridge_isolation_v2_migrate_marker_write "$data_root"
+
+  if [[ "$active_count" -gt 0 ]]; then
+    bridge_isolation_v2_migrate_orchestrate_restart "$active_snapshot"
+  fi
+
+  # Success — JSON. relogin field surfaces the macOS supplemental-group
+  # cache caveat to the upgrade output so operators don't get
+  # confusing "permission denied" until they re-login.
+  printf '{"mode":"isolation-v2-migrate","status":"applied","data_root":"%s","manifest":"%s","active_agents":%s,"all_agents":%s,"migration_requires_relogin":%s}\n' \
+    "$data_root" "$manifest" "$active_count" "$all_count" \
+    "$([[ "$relogin_flag" -eq 1 ]] && printf 'true' || printf 'false')"
+
+  # Restore caller env (no-op when caller had nothing).
+  if [[ -z "$_saved_layout" ]]; then unset BRIDGE_LAYOUT; else BRIDGE_LAYOUT="$_saved_layout"; fi
+  if [[ -z "$_saved_data_root" ]]; then unset BRIDGE_DATA_ROOT; else BRIDGE_DATA_ROOT="$_saved_data_root"; fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------

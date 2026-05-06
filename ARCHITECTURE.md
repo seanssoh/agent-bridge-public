@@ -289,15 +289,21 @@ Use them for isolated testing and for machine-specific installs.
 - Multi-tenant per-UID isolation is Linux-only; macOS runs shared mode
   plus hook-layer hardening only (see
   [`docs/platform-support.md`](./docs/platform-support.md))
-- Linux-user isolation has two access-control modes governed by
-  `bridge_isolation_v2_active`:
-  - **legacy**: per-isolated-UID named-user POSIX ACLs (`u:agent-bridge-<name>:r-x`
-    + traversal chains). Requires the `acl` package on every agent host.
-  - **v2 (PR-A → PR-E)**: per-agent group + setgid (`ab-agent-<name>`,
-    chmod 2750/2770) plus `umask 007` on agent launches. v2 retains a
-    single named-user ACL surface for Claude credentials
-    (`bridge_linux_grant_claude_credentials_access`) because the
-    operator's `~/.claude/.credentials.json` lives outside the v2
-    layout — see `OPERATIONS.md` "v2 ACL contract (PR-E)" for scope and
-    `KNOWN_ISSUES.md` §16/§17 for the transitional exception and the
-    base-readable engine CLI prerequisite.
+- Linux-user isolation uses POSIX group + setgid exclusively (v2). v0.8.0
+  hard-cut the legacy named-user-ACL mode (v1): `bridge_resolve_layout()`
+  fails fast on `BRIDGE_LAYOUT=v1`/`legacy` and the v1 ACL helper surface
+  (`bridge_linux_grant_*`, `bridge_linux_acl_*`,
+  `bridge_linux_repair_*`) is fully removed in T2 (PR #641). Runtime
+  contract: per-agent group `ab-agent-<name>`, isolated home at
+  chmod 2750/2770 setgid, agent launches under `umask 007`, controller
+  UID joined to every per-agent group via `usermod -aG` (Linux) or
+  `dseditgroup` (Darwin). The `acl` package is no longer required and
+  no named-user ACL surface remains for Claude credentials — operators
+  seed credentials with `claude login` per isolated UID or pre-populate
+  `$BRIDGE_AGENT_ROOT_V2/<agent>/home/credentials/launch-secrets.env`.
+  See `OPERATIONS.md` "Layout v2 migration" for the upgrade-integrated
+  migration tool (PR #640) and "Rollback hatch — `BRIDGE_DISABLE_ISOLATION=1`"
+  for the runtime escape (PR #648). `KNOWN_ISSUES.md` §16/§17 cover
+  the Claude first-launch login flow and the base-readable engine CLI
+  prerequisite. The v2 isolation runtime lives in
+  `lib/bridge-isolation-v2.sh` + `lib/bridge-isolation-runtime.sh`.

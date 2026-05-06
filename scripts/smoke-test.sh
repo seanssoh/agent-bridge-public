@@ -10394,6 +10394,15 @@ bash "$REPO_ROOT/scripts/smoke/isolated-cli-policy.sh"
 log "running system-agent-class smoke (issue #539)"
 bash "$REPO_ROOT/scripts/smoke/system-agent-class.sh"
 
+# Issue #583 (v0.8.0 T4) — v2 cross-class isolated read closure smoke.
+# Verifies the v2 layout (POSIX group ab-agent-<n> + setgid 2770) lets a
+# controller UID read isolated agents' memory/{projects,shared,decisions}
+# via group permission, without any ACL fallback. Linux + passwordless
+# sudo only — skips cleanly on macOS / unprivileged CI.
+log "running v2-cross-class-read smoke (issue #583 closure)"
+log "v2-cross-class-read covers POSIX group + setgid permission boundary only — skips on macOS / no-sudo"
+bash "$REPO_ROOT/scripts/smoke/v2-cross-class-read.sh"
+
 # Issue #555 — per-agent settings.effective.json rendering for managed
 # (non-isolated) agents. Mixed-model installs no longer last-rerender-wins
 # on `autoCompactWindow` (or any future per-agent managed default).
@@ -10414,5 +10423,19 @@ bash "$REPO_ROOT/scripts/smoke/shared-settings-preserve-user-keys.sh"
 # which assertions are still pending.
 log "running precompact-notify suite smoke (issue #597 Track D)"
 bash "$REPO_ROOT/tests/precompact-notify/smoke.sh"
+
+# Issue #639 — codex-task-mode-policy.py write-shape detector redesign
+# (default-deny block-mode allow-list + common-shape parser). Covers all
+# 6 D1 gaps (multi-command, substitution, quoting, exec/bash recursion,
+# tool exotics, heredoc) plus PR #636 r1-r5 regression + grant grammar.
+log "running codex-task-mode-policy-comprehensive smoke (issue #639)"
+bash "$REPO_ROOT/scripts/smoke/codex-task-mode-policy-comprehensive.sh"
+
+# Issue #619 — `agent doctor` CRUD self-check. Exercises the 7-step
+# create/update/registry/show/reclassify/retire/delete matrix under
+# isolated BRIDGE_HOME, the admin caller gate, the concurrent-doctor
+# lock, and the JSON envelope shape.
+log "running agent-doctor smoke (issue #619)"
+bash "$REPO_ROOT/scripts/smoke/agent-doctor.sh"
 
 log "smoke test passed"
