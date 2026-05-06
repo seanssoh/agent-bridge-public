@@ -442,7 +442,16 @@ bridge_isolation_v2_migrate_emit_plan() {
 
 bridge_isolation_v2_migrate_emit_row() {
   local mapping_id="$1" legacy_src="$2" v2_dst="$3" delete_eligible="$4"
-  [[ -e "$legacy_src" ]] || return 0
+  # v0.8.3 amend: existence check tolerates linux-user-isolated paths.
+  # Without sudo, sean can't traverse `agents/<bob>/` (mode 2750 owned
+  # by agent-bridge-<bob>:ab-agent-<bob>) on a fresh migration since
+  # supplementary group membership from ensure_groups isn't yet active
+  # in the controller's process. Fall back to `sudo -n test -e` so
+  # isolated agents' rows still get emitted; mirror_one's sudo wrap
+  # handles the actual rsync.
+  if [[ ! -e "$legacy_src" ]]; then
+    sudo -n test -e "$legacy_src" 2>/dev/null || return 0
+  fi
   # v0.8.3: src==dst guard. When BRIDGE_DATA_ROOT == TARGET_ROOT
   # (markerless default) some v1 paths coincide with v2 paths
   # (e.g. agents/<n>/credentials → agents/<n>/credentials). Emitting
@@ -450,6 +459,20 @@ bridge_isolation_v2_migrate_emit_row() {
   # combined with delete_eligible=1 cleanup, would delete the very
   # content we just "mirrored" to itself.
   [[ "$legacy_src" == "$v2_dst" ]] && return 0
+  # v0.8.3 amend: skip empty-tree global rows. The runtime_shared
+  # mapping (runtime/shared -> shared) emits even when runtime/shared
+  # is empty subdirs only and dst already populated; rsync hits
+  # transient partial-transfer (rc=23) edge cases that abort the
+  # migration despite zero load-bearing data. Recursive find for any
+  # regular file or symlink: if absent, the row contributes nothing
+  # and is safe to skip.
+  if [[ -d "$legacy_src" ]]; then
+    local _has_content
+    _has_content="$(sudo -n find "$legacy_src" -mindepth 1 \( -type f -o -type l \) -print -quit 2>/dev/null \
+                    || find "$legacy_src" -mindepth 1 \( -type f -o -type l \) -print -quit 2>/dev/null \
+                    || printf '')"
+    [[ -n "$_has_content" ]] || return 0
+  fi
   printf '%s\t%s\t%s\t%s\n' "$mapping_id" "$legacy_src" "$v2_dst" "$delete_eligible"
 }
 
