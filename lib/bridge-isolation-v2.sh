@@ -382,12 +382,17 @@ bridge_isolation_v2_agent_group_name() {
   # Linux groupadd accepts [a-z_][a-z0-9_-]* with total length <= 32.
   # Reject early so _ensure_group does not fail opaquely later.
   if [[ ! "$agent" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-    bridge_warn "agent_group_name: '$agent' has invalid chars for a Linux group name (allowed: [a-z_][a-z0-9_-]*)"
+    bridge_warn "agent_group_name: '$agent' has invalid chars for a group name (allowed: [a-z_][a-z0-9_-]*)"
     return 1
   fi
   local composed="${BRIDGE_AGENT_GROUP_PREFIX}${agent}"
-  if (( ${#composed} > 32 )); then
-    bridge_warn "agent_group_name: '$composed' exceeds 32-char Linux group-name limit"
+  # v0.8.3: platform-branched length limit. Linux groupadd is 32-char;
+  # macOS dseditgroup tolerates much longer names. The previous
+  # unconditional 32-char check rejected long-named agents on macOS too.
+  local _limit=32
+  [[ "$(uname)" == "Darwin" ]] && _limit=255
+  if (( ${#composed} > _limit )); then
+    bridge_warn "agent_group_name: '$composed' exceeds ${_limit}-char group-name limit on $(uname)"
     return 1
   fi
   printf '%s' "$composed"
