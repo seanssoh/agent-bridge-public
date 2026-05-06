@@ -39,6 +39,15 @@
 # the function frame has been popped; locals would be unbound by then
 # and `set -u` would fault. State lives in the BRIDGE_AGENT_DOCTOR_*
 # globals seeded by bridge_agent_doctor_run.
+#
+# Codex r1 (PR #615) — D5 robustness: a leaked fixture is itself a
+# doctor failure. Cleanup uses the admin caller already validated by
+# the run function (do not re-resolve from env in the trap; env may
+# have been mutated mid-run). Cleanup passes --force so an active
+# fixture session does not block delete (run_delete:2993-2998). If
+# cleanup itself fails, the trap forces the process to exit non-zero
+# so the operator does not get a green doctor with a residual roster
+# block / home directory.
 # shellcheck disable=SC2329
 _bridge_agent_doctor_cleanup() {
   [[ "${BRIDGE_AGENT_DOCTOR_CLEANED:-0}" == "1" ]] && return 0
@@ -50,13 +59,30 @@ _bridge_agent_doctor_cleanup() {
   local bash_bin="${BRIDGE_AGENT_DOCTOR_BASH_BIN:-bash}"
   local caller="${BRIDGE_AGENT_DOCTOR_CALLER:-}"
   [[ -n "$script_dir" ]] || return 0
-  # Best-effort: ignore everything. If create never succeeded, delete
-  # refuses harmlessly; otherwise --orphan-tasks + --purge-home wipes
-  # the fixture's roster row and home dir together.
-  local cleanup_args=(delete "$fixture" --orphan-tasks --purge-home)
+  # The caller was validated (admin + trusted source) before fixture
+  # creation, so it is guaranteed non-empty here. Pass --force because
+  # delete refuses active sessions without it (bridge-agent.sh:2993-2998)
+  # and the fixture session may still be alive if a mid-stream check
+  # aborted before step 7.
+  local cleanup_args=(delete "$fixture" --orphan-tasks --purge-home --force)
   [[ -n "$caller" ]] && cleanup_args+=(--from "$caller")
-  "$bash_bin" "$script_dir/bridge-agent.sh" "${cleanup_args[@]}" \
-    >/dev/null 2>&1 || true
+  local cleanup_out cleanup_rc=0
+  cleanup_out="$("$bash_bin" "$script_dir/bridge-agent.sh" "${cleanup_args[@]}" 2>&1)" || cleanup_rc=$?
+  if [[ $cleanup_rc -ne 0 ]]; then
+    # If the explicit step-7 delete already removed the fixture, the
+    # follow-up retry will fail with "agent not found" — that is not a
+    # leak. Recognise the not-found shape and exit clean.
+    case "$cleanup_out" in
+      *"not found"*|*"존재하지"*|*"없습니다"*)
+        return 0
+        ;;
+    esac
+    printf '[doctor] fail: cleanup — fixture=%s rc=%d out=%s\n' \
+      "$fixture" "$cleanup_rc" "$(printf '%s' "$cleanup_out" | head -c 240)" >&2
+    # Force the process to exit non-zero so a leaked fixture is
+    # surfaced as a doctor failure, not a swallowed warning.
+    exit 1
+  fi
 }
 
 # bridge_agent_doctor_run — entry point invoked by run_doctor in
@@ -88,8 +114,12 @@ Usage: agent-bridge agent doctor [--from <admin>] [--keep-fixture] [--json]
 Run an admin CRUD self-check against an ephemeral test-fixture agent.
 Each step prints `[doctor] pass:` / `[doctor] fail:` / `[doctor] n/a:`.
 The fixture is removed on exit (even on failure) unless --keep-fixture
-is passed. --from <admin> is forwarded to the audited mutations
-(create / update / delete) — required when BRIDGE_AGENT_ID is unset.
+is passed.
+
+doctor is admin-only by construction: it exercises update/delete which
+are admin-gated. The caller is resolved from --from <admin> first, then
+BRIDGE_AGENT_ID. doctor refuses to create a fixture if no admin caller
+can be resolved or the caller is not the configured admin agent.
 EOF
         return 0
         ;;
@@ -99,11 +129,25 @@ EOF
     esac
   done
 
-  # Resolve a caller-id to forward into update/delete. The doctor itself
-  # does not enforce admin identity (it is operator-facing, not
-  # agent-facing) — but the underlying update/delete writers do, so we
-  # propagate whichever id the operator provided.
-  local doctor_caller="${from_agent:-${BRIDGE_AGENT_ID:-}}"
+  # Codex r1 (PR #615) — D5 robustness: enforce the admin gate UPFRONT,
+  # before any fixture is created. The doctor exercises update/delete
+  # which are both admin-gated (bridge-agent.sh:2968-2974), so a doctor
+  # run that cannot pass that gate would silently downgrade those steps
+  # to n/a, exit 0, and leave the fixture's roster row + home behind.
+  # Make caller resolution fail-fast against the same predicates the
+  # production gate uses: admin identity and operator-trusted source.
+  local doctor_caller doctor_caller_source
+  doctor_caller="$(bridge_agent_update_caller_agent "$from_agent")"
+  doctor_caller_source="$(bridge_agent_update_caller_source)"
+  if [[ -z "$doctor_caller" ]]; then
+    bridge_die "agent doctor: caller_agent unspecified — pass --from <admin-agent> or set BRIDGE_AGENT_ID before running 'agent doctor'. Aborted before fixture creation."
+  fi
+  if ! bridge_agent_update_caller_is_admin "$doctor_caller"; then
+    bridge_die "agent doctor: caller agent $doctor_caller is not the admin agent — doctor is admin-only by construction. Aborted before fixture creation."
+  fi
+  if [[ "$doctor_caller_source" != "operator-tui" && "$doctor_caller_source" != "operator-trusted-id" ]]; then
+    bridge_die "agent doctor: caller source $doctor_caller_source is not allowed to mutate system config (need operator-tui or operator-trusted-id). Aborted before fixture creation."
+  fi
 
   # Pick a unique fixture name. The `smoke-` prefix matches
   # BRIDGE_TEST_ARTIFACT_PREFIXES so create requires --test-fixture
@@ -192,34 +236,21 @@ EOF
   fi
 
   # ---- 2. update -------------------------------------------------------
-  # The update path is admin-gated, so the caller must be the admin
-  # agent. If we have no admin caller, mark the entire update step n/a
-  # rather than fail — the issue #580 brief explicitly notes that a
-  # non-admin invocation of the doctor is still useful (it exercises
-  # the create / read / delete paths). When --from is provided, we
-  # forward it to the writer.
+  # Caller was validated as admin upfront (D5 robustness fix), so update
+  # must succeed unless the production writer regressed. We always
+  # forward --from since doctor_caller is guaranteed non-empty here.
   local update_args=(update "$fixture"
     --desc "doctor self-check fixture"
     --loop on
     --continue on
-    --class user)
-  [[ -n "$doctor_caller" ]] && update_args+=(--from "$doctor_caller")
+    --class user
+    --from "$doctor_caller")
   local update_out update_rc=0
   update_out="$("$bash_bin" "$script_dir/bridge-agent.sh" "${update_args[@]}" 2>&1)" || update_rc=$?
   if [[ $update_rc -eq 0 ]]; then
     _doctor_record pass "update" "desc/loop/continue/class persisted"
   else
-    # Distinguish "no admin caller" from "real failure" by sniffing the
-    # deny reason. The deny message is a stable string from
-    # lib/bridge-agent-update.sh.
-    case "$update_out" in
-      *"is not the admin agent"*|*"caller_agent unspecified"*|*"is not allowed to mutate system config"*)
-        _doctor_record n/a "update" "skipped: caller is not the admin agent (pass --from <admin>)"
-        ;;
-      *)
-        _doctor_record fail "update" "rc=$update_rc out=$(printf '%s' "$update_out" | head -c 240)"
-        ;;
-    esac
+    _doctor_record fail "update" "rc=$update_rc out=$(printf '%s' "$update_out" | head -c 240)"
   fi
 
   # ---- 3. registry --json (read-back) ---------------------------------
@@ -353,27 +384,22 @@ PY
   esac
 
   # ---- 7. delete ------------------------------------------------------
-  # The success-path final step. We pass --orphan-tasks (the fixture
-  # cannot have real tasks, but the doctor must not refuse on a
-  # leftover row from a previous run) and --purge-home (we own the home
-  # we just scaffolded). The cleanup trap will be a no-op if this
-  # succeeds because of the cleaned=1 short-circuit.
-  local del_args=(delete "$fixture" --orphan-tasks --purge-home)
-  [[ -n "$doctor_caller" ]] && del_args+=(--from "$doctor_caller")
+  # Success-path final step. We pass --orphan-tasks (the fixture cannot
+  # have real tasks, but the doctor must not refuse on a leftover row
+  # from a previous run), --purge-home (we own the home we just
+  # scaffolded), and --force (the fixture has no live session under the
+  # doctor itself, but --force keeps step 7 symmetric with the trap's
+  # cleanup so a session that some external process attached to the
+  # fixture name does not block delete here). Caller is guaranteed
+  # admin (validated upfront), so we always forward --from.
+  local del_args=(delete "$fixture" --orphan-tasks --purge-home --force --from "$doctor_caller")
   local del_out del_rc=0
   del_out="$("$bash_bin" "$script_dir/bridge-agent.sh" "${del_args[@]}" 2>&1)" || del_rc=$?
   if [[ $del_rc -eq 0 ]]; then
     _doctor_record pass "delete" "fixture removed + home purged"
     BRIDGE_AGENT_DOCTOR_CLEANED=1   # trap is a no-op now
   else
-    case "$del_out" in
-      *"is not the admin agent"*|*"caller_agent unspecified"*|*"is not allowed to mutate system config"*)
-        _doctor_record n/a "delete" "skipped: caller is not the admin agent (pass --from <admin>)"
-        ;;
-      *)
-        _doctor_record fail "delete" "rc=$del_rc out=$(printf '%s' "$del_out" | head -c 240)"
-        ;;
-    esac
+    _doctor_record fail "delete" "rc=$del_rc out=$(printf '%s' "$del_out" | head -c 240)"
   fi
 
   bridge_agent_doctor_emit "$results" "$pass_count" "$fail_count" "$na_count" "$json_mode" "$fixture"
