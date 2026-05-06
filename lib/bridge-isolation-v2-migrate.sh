@@ -530,13 +530,44 @@ bridge_isolation_v2_migrate_mirror_one() {
   # --no-links — it disables symlink copying entirely, which previously
   # let symlink-bearing trees pass verify_status=ok with the symlinks
   # silently dropped (caught by the dev-codex r1 review).
-  local rc=0
+  #
+  # v0.8.3 amend: detect linux-user-isolated paths (src owned by a
+  # different uid than the current process) and run rsync via sudo so
+  # the mirror can read the isolated tree. Without this, an isolated
+  # agent's `agents/<n>/CLAUDE.md` (mode 0600 owned by agent-bridge-<n>)
+  # is invisible to the controller's rsync — emit_row's `[[ -e ... ]]`
+  # passes if the parent dir is traversable but rsync fails to read
+  # the actual content. The migration already requires sudo via the
+  # privilege_preflight gate so this doesn't add new prerequisites.
+  #
+  # v0.8.3 amend: drop --delete-excluded — without an --exclude pattern
+  # the flag is a no-op for per-agent rows but pairs destructively
+  # with the global runtime_shared mapping where dst contains content
+  # not present in src (rsync_fail_23 in v0.7.8 -> v0.8.3 VM repro).
+  local rc=0 src_uid current_uid use_sudo=0
+  current_uid="$(id -u)"
+  src_uid="$(stat -c '%u' "$legacy_src" 2>/dev/null \
+              || stat -f '%u' "$legacy_src" 2>/dev/null \
+              || printf '%s' "$current_uid")"
+  if [[ -n "$src_uid" && "$src_uid" != "$current_uid" ]]; then
+    use_sudo=1
+  fi
   if [[ -d "$legacy_src" ]]; then
-    rsync -aHX --numeric-ids --delete-excluded \
-      "$legacy_src/" "$v2_dst/" >/dev/null 2>&1 || rc=$?
+    if (( use_sudo == 1 )); then
+      sudo -n rsync -aHX --numeric-ids \
+        "$legacy_src/" "$v2_dst/" >/dev/null 2>&1 || rc=$?
+    else
+      rsync -aHX --numeric-ids \
+        "$legacy_src/" "$v2_dst/" >/dev/null 2>&1 || rc=$?
+    fi
   else
-    rsync -aHX --numeric-ids \
-      "$legacy_src" "$v2_dst" >/dev/null 2>&1 || rc=$?
+    if (( use_sudo == 1 )); then
+      sudo -n rsync -aHX --numeric-ids \
+        "$legacy_src" "$v2_dst" >/dev/null 2>&1 || rc=$?
+    else
+      rsync -aHX --numeric-ids \
+        "$legacy_src" "$v2_dst" >/dev/null 2>&1 || rc=$?
+    fi
   fi
   if (( rc != 0 )); then
     verify="rsync_fail_$rc"
