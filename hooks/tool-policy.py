@@ -1159,7 +1159,6 @@ def _bash_argv_references_system_config(command: str) -> bool:
 
 
 def protected_alias_reason(text: str, agent: str) -> str | None:
-    home_root = agent_home_root()
     admin = is_admin_agent(agent)
     # The two checks below use shlex argv matching rather than substring
     # matching (closes #252). A Bash invocation that actually opens the
