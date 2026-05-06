@@ -10438,4 +10438,10 @@ bash "$REPO_ROOT/scripts/smoke/codex-task-mode-policy-comprehensive.sh"
 log "running agent-doctor smoke (issue #619)"
 bash "$REPO_ROOT/scripts/smoke/agent-doctor.sh"
 
+# v0.8.1 hotfix regression smoke — verifies isolation-v2 migrate lock
+# acquire/release works without `flock` on PATH (macOS default), live
+# owner blocks second acquire, and stale PID file is auto-cleaned.
+log "running isolation-v2-migrate-lock-portability smoke (v0.8.1 hotfix)"
+bash "$REPO_ROOT/scripts/smoke/isolation-v2-migrate-lock-portability.sh"
+
 log "smoke test passed"

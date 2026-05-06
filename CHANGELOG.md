@@ -6,6 +6,36 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-05-06
+
+### Highlight — emergency hotfix: macOS upgrade unblocked
+
+`v0.8.1` is an emergency hotfix on top of the v0.8.0 release shipped 6 hours earlier. The v0.8.0 isolation-v2 migration acquired its lock with `flock(1)`, which macOS does not ship by default — every `agent-bridge upgrade --apply` on macOS bailed out at `lib/bridge-isolation-v2-migrate.sh:107` with `flock: command not found` and a confusing "another isolation-v2 migrate operation is in progress" follow-up because the failed `exec 9>"$lock"` left a 0-byte lock file behind. v0.8.1 replaces the `flock`-based primitive with a portable `mkdir`-based atomic lock + PID-file stale-owner detection that works on macOS / Linux / Bash 3.2 baseline with zero external dependencies.
+
+Operators on macOS hosts who attempted v0.8.0 upgrade and got blocked: re-run `agent-bridge upgrade --apply` after pulling v0.8.1. The migration is idempotent and `no_v080_code_installed=yes` on the v0.8.0 failure means apply-live did NOT run, so retry is safe. No manual lock cleanup required — the new code auto-detects stale owners.
+
+### Fixed
+
+- `lib/bridge-isolation-v2-migrate.sh:bridge_isolation_v2_migrate_acquire_lock` no longer depends on `flock(1)`. The lock is now an atomic `mkdir` of `<state>/migration/migrate-isolation-v2.lock.d/`, with `owner.pid` written inside for stale detection. If a prior holder died without releasing, the next acquirer reads `owner.pid`, runs `kill -0` on it, and on a dead PID removes the lock dir + retries once. Race-after-cleanup falls through to a clean `bridge_die`.
+- `bridge_isolation_v2_migrate_release_lock` (new helper) plus an EXIT trap ensure the lock dir is cleaned on normal exit AND on crashes (best-effort `rm -rf`; failure is tolerated since the next acquirer's stale-detection handles it).
+
+### Added
+
+- `scripts/smoke/isolation-v2-migrate-lock-portability.sh` — regression smoke verifying lock acquire/release works without `flock` on PATH, that a live owner blocks a second acquirer, and that a stale PID file (dead process) is auto-cleaned + the lock reacquirable. Exercised on every PR via `scripts/smoke-test.sh`.
+
+### Operator notes
+
+- macOS hosts that hit the v0.8.0 `flock: command not found` block: re-run `agent-bridge upgrade --apply` after pulling v0.8.1. No manual lock file cleanup required.
+- If the migration was somehow partially applied: the per-agent markers under `$BRIDGE_STATE_DIR/migration/isolation-v2/agents/` are atomic + idempotent. Re-running picks up where it left off.
+- The new lock is at `<state>/migration/migrate-isolation-v2.lock.d/` (directory, was a file in v0.8.0). The old `migrate-isolation-v2.lock` 0-byte file is harmless and can be deleted at leisure (`rm $BRIDGE_STATE_DIR/migration/migrate-isolation-v2.lock`).
+
+### Verified
+
+- Unit-tested (Bash 5.x): first-acquire, release, re-acquire, live-owner-blocks-second-acquire, stale-PID-cleanup. All pass.
+- Smoke `scripts/smoke/isolation-v2-migrate-lock-portability.sh` 3/3 pass with `flock` stripped from PATH.
+- `bash -n` and `shellcheck` clean.
+- No code changes outside the lock primitive (acquire/release helpers + 1 trap line).
+
 ## [0.8.0] — 2026-05-06
 
 ### Highlight — isolation v2 hard-cut + first-class diagnostic + write-shape redesign
