@@ -238,6 +238,32 @@ test_max_retries_env_override() {
   assert_counter_eq "$agent" "absent" "env-override: counter cleared on synthesis"
 }
 
+# --- octal-shape decimal: BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS=08/09 -----
+#
+# Issue #633 codex r2 finding: `08`/`09` pass the regex `^[0-9]+$` but Bash
+# treats them as invalid octal in `(( ... ))`. Without `10#$value` decimal
+# coercion at lib/bridge-channels.sh:363 and :406, the cycle aborts with
+# `value too great for base (error token is "08")`. r3 adds `10#` coercion
+# at both sites; this test ensures no abort and the cycle progresses.
+test_max_retries_env_octal_decimal_no_abort() {
+  local value="$1"
+  load_recovery_test_env
+
+  local agent="syrs-fi"
+  local ready_file="$SMOKE_TMP_ROOT/ready-octal-${value}.txt"
+
+  rm -rf "$(bridge_agent_idle_marker_dir "$agent")"
+
+  PROBE_SHOULD_SUCCEED=0
+  # Without `10#` coercion, this would abort with "value too great for base".
+  # With the fix, threshold is honored as decimal value (8 or 9).
+  BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS="$value" run_cycle "$ready_file"
+  if grep -q "^${agent}$" "$ready_file"; then
+    smoke_fail "octal-decimal=${value}: agent should be excluded on cycle 1 (max=${value})"
+  fi
+  assert_counter_eq "$agent" "1" "octal-decimal=${value}: counter=1 after cycle 1 (no abort)"
+}
+
 # --- env validation: invalid BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS --------
 #
 # Issue #633 codex r1 finding: an invalid override
@@ -300,6 +326,16 @@ main() {
 
   smoke_run "env validation: BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS='' (empty)" \
     test_max_retries_env_invalid_fallback "" "empty"
+
+  # Bash treats `08`/`09` as invalid octal in `(( ... ))`. Without `10#$value`
+  # decimal coercion at lib/bridge-channels.sh:363 and :406, these would abort
+  # the daemon nudge_scan with `value too great for base (error token is "08")`.
+  # Codex r2 found this corner case after r1 added the regex/range validator.
+  smoke_run "env validation: BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS=08 (octal-shape decimal)" \
+    test_max_retries_env_octal_decimal_no_abort "08"
+
+  smoke_run "env validation: BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS=09 (octal-shape decimal)" \
+    test_max_retries_env_octal_decimal_no_abort "09"
 
   smoke_log "PASS: nudge-marker-recovery (#629 missing-marker bounded retry)"
 }

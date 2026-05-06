@@ -360,7 +360,7 @@ bridge_write_idle_ready_agents() {
   # cycle. Fall back silently to the documented default 3 — the operator
   # set the env var, so a one-time stderr warn surfaces the typo without
   # spamming the daemon log on every cycle.
-  if ! [[ "$max_retries" =~ ^[0-9]+$ ]] || (( max_retries < 1 )); then
+  if ! [[ "$max_retries" =~ ^[0-9]+$ ]] || (( 10#$max_retries < 1 )); then
     if [[ -z "${BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS_WARNED:-}" ]]; then
       bridge_warn "BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS='${BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS:-}' is not a positive integer; falling back to default 3 (issue #629/#633)"
       export BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS_WARNED=1
@@ -403,7 +403,7 @@ bridge_write_idle_ready_agents() {
               [[ "$retries" =~ ^[0-9]+$ ]] || retries=0
             fi
             retries=$((retries + 1))
-            if (( retries >= max_retries )); then
+            if (( retries >= 10#$max_retries )); then
               bridge_agent_mark_idle_now "$agent"
               rm -f "$retries_file"
               bridge_audit_log daemon nudge_marker_synthesized "$agent" \
