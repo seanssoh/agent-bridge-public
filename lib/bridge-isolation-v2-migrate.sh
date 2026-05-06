@@ -38,7 +38,10 @@
 #     untrusted (warm-cache problem). Postflight probes each agent UID and
 #     the controller via fresh `sudo -u <user> id -nG`.
 #   * Self-cleanup in this module never installs a long-lived EXIT trap
-#     (would clobber the existing COPY_JSON trap conventions in scripts/).
+#     (would clobber the existing COPY_JSON trap conventions in scripts/),
+#     with one exception: the v0.8.3 macOS launchd-restore trap installed
+#     in apply_for_upgrade and apply chains the prior trap body so the
+#     existing convention is preserved.
 #
 # shellcheck shell=bash disable=SC2034
 
@@ -747,6 +750,14 @@ bridge_isolation_v2_migrate_wait_daemon_present() {
 bridge_isolation_v2_migrate_orchestrate_stop() {
   local snapshot_path="$1"
 
+  # v0.8.3: on macOS, unload the launchd unit BEFORE per-agent stop so
+  # the KeepAlive=true daemon doesn't respawn during the 10s
+  # wait_daemon_gone window. restore_if_needed handles the case where a
+  # previous migration crashed between bootout and bootstrap. Both are
+  # no-ops on Linux/non-launchd hosts.
+  bridge_isolation_v2_launchd_restore_if_needed
+  bridge_isolation_v2_launchd_unload
+
   # Per-agent stop.
   local agent
   while IFS= read -r agent; do
@@ -771,9 +782,21 @@ bridge_isolation_v2_migrate_orchestrate_stop() {
 bridge_isolation_v2_migrate_orchestrate_restart() {
   local snapshot_path="$1"
 
-  "$BRIDGE_BASH_BIN" "$BRIDGE_SCRIPT_DIR/bridge-daemon.sh" start >/dev/null 2>&1 \
-    || bridge_die "daemon restart failed"
-  bridge_isolation_v2_migrate_wait_daemon_present 10
+  # v0.8.3: on macOS, bring the daemon back under launchd supervision
+  # via `launchctl bootstrap` instead of `bridge-daemon.sh start`. The
+  # latter would race a future launchd respawn once the unit is
+  # re-loaded. On Linux/non-launchd hosts, fall through to the plain
+  # daemon start.
+  if [[ "$(uname)" == "Darwin" ]] \
+      && [[ -f "$(bridge_isolation_v2_launchd_plist_path)" ]]; then
+    bridge_isolation_v2_launchd_bootstrap \
+      || bridge_die "daemon restart failed (launchctl bootstrap)"
+    bridge_isolation_v2_migrate_wait_daemon_present 10
+  else
+    "$BRIDGE_BASH_BIN" "$BRIDGE_SCRIPT_DIR/bridge-daemon.sh" start >/dev/null 2>&1 \
+      || bridge_die "daemon restart failed"
+    bridge_isolation_v2_migrate_wait_daemon_present 10
+  fi
 
   local agent
   while IFS= read -r agent; do
@@ -900,6 +923,21 @@ bridge_isolation_v2_migrate_apply() {
   fi
 
   install -d -m 0755 "$data_root" 2>/dev/null || mkdir -p "$data_root"
+
+  # v0.8.3: see apply_for_upgrade for rationale. The EXIT trap fires
+  # only on uncaught crashes; normal-path errors call orchestrate_restart
+  # (which invokes launchd_bootstrap) before returning.
+  if [[ "$(uname)" == "Darwin" ]]; then
+    local _prior_exit_trap
+    _prior_exit_trap="$(trap -p EXIT 2>/dev/null \
+      | sed -E "s/^trap -- '(.*)' EXIT\$/\\1/")"
+    if [[ -n "$_prior_exit_trap" ]]; then
+      # shellcheck disable=SC2064
+      trap "bridge_isolation_v2_launchd_bootstrap >/dev/null 2>&1 || true; ${_prior_exit_trap}" EXIT
+    else
+      trap 'bridge_isolation_v2_launchd_bootstrap >/dev/null 2>&1 || true' EXIT
+    fi
+  fi
 
   bridge_isolation_v2_migrate_orchestrate_stop "$snapshot"
 
@@ -1182,6 +1220,25 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
   # instead inline the post-lock steps. This stays within the
   # established review boundaries — same primitives, same order.
   install -d -m 0755 "$data_root" 2>/dev/null || mkdir -p "$data_root"
+
+  # v0.8.3: install an EXIT trap that re-bootstraps the launchd unit on
+  # macOS if the upgrade process crashes between `orchestrate_stop`
+  # (which calls launchd_unload) and `orchestrate_restart` (which calls
+  # launchd_bootstrap). The bootstrap helper is a no-op on Linux and on
+  # macOS hosts where the restore file is already gone. `bridge-upgrade.sh`
+  # already installs an EXIT trap; preserve it by capturing and re-running
+  # the prior trap body inside the new trap.
+  if [[ "$(uname)" == "Darwin" ]]; then
+    local _prior_exit_trap
+    _prior_exit_trap="$(trap -p EXIT 2>/dev/null \
+      | sed -E "s/^trap -- '(.*)' EXIT\$/\\1/")"
+    if [[ -n "$_prior_exit_trap" ]]; then
+      # shellcheck disable=SC2064
+      trap "bridge_isolation_v2_launchd_bootstrap >/dev/null 2>&1 || true; ${_prior_exit_trap}" EXIT
+    else
+      trap 'bridge_isolation_v2_launchd_bootstrap >/dev/null 2>&1 || true' EXIT
+    fi
+  fi
 
   if [[ "$active_count" -gt 0 ]]; then
     bridge_isolation_v2_migrate_self_stop_guard "$active_snapshot" || {
