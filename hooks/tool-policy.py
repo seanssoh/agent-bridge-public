@@ -12,17 +12,15 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
-from bridge_guard_common import (  # noqa: E402
-    analyze_text,
-    is_builtin_tool,
-    prompt_guard_enabled,
-    sanitize_text,
-    threshold_for_surface,
-    tool_output_text,
-)
+# Import bridge_hook_common from this hooks/ directory directly. ROOT (the
+# bridge home) cannot be added to sys.path under linux-user isolation because
+# the isolated UID may have only ``--x`` ACL on it, so listdir() based finders
+# fail. hooks/ remains readable+executable for isolated UIDs.
+_HOOKS_DIR = Path(__file__).resolve().parent
+if str(_HOOKS_DIR) not in sys.path:
+    sys.path.insert(0, str(_HOOKS_DIR))
+
 from bridge_hook_common import (  # noqa: E402
     agent_home_root,
     bridge_home_dir,
@@ -30,10 +28,36 @@ from bridge_hook_common import (  # noqa: E402
     current_agent_class,
     current_agent_workdir,
     emit_system_cross_agent_read,
+    load_guard_module,
     path_within,
     truncate_text,
     write_audit,
 )
+
+_guard = load_guard_module(
+    ROOT,
+    required_attrs=(
+        "analyze_text",
+        "is_builtin_tool",
+        "prompt_guard_enabled",
+        "sanitize_text",
+        "threshold_for_surface",
+        "tool_output_text",
+    ),
+)
+if _guard is None:
+    # Guard module unavailable (missing/unreadable/syntax/missing-symbol).
+    # Exit silently rather than tracebacking every hook invocation; a broken
+    # guard module is a corrupt install state for the operator to diagnose,
+    # not a reason to brick every Claude session.
+    sys.exit(0)
+
+analyze_text = _guard.analyze_text
+is_builtin_tool = _guard.is_builtin_tool
+prompt_guard_enabled = _guard.prompt_guard_enabled
+sanitize_text = _guard.sanitize_text
+threshold_for_surface = _guard.threshold_for_surface
+tool_output_text = _guard.tool_output_text
 
 # Importing the system-config protected-path SSOT requires lib/ on sys.path.
 # Keep this scoped to tool-policy.py rather than mutating bridge_hook_common

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import functools
 import hashlib
+import importlib.util
 import json
 import os
 import pwd
@@ -14,7 +15,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Optional
 
 PRIORITY_ORDER = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
 
@@ -932,3 +933,58 @@ def codex_stop_reason(agent: str, row: dict[str, Any]) -> str:
         f"Run ~/.agent-bridge/agb inbox {agent} now, inspect the open tasks, "
         f"and claim the highest-priority queued task before ending the session."
     )
+
+
+_GUARD_MODULE_NAME = "bridge_guard_common"
+
+
+def load_guard_module(
+    bridge_root: Path,
+    required_attrs: Iterable[str],
+) -> Optional[Any]:
+    # Absolute-path module loader for ``bridge_guard_common.py``. Used by hooks
+    # that must keep functioning under linux-user isolation, where the parent
+    # ``BRIDGE_HOME`` directory may have only ``--x`` ACL traversal for the
+    # isolated UID and Python's path-based finder fails to listdir it.
+    #
+    # Returns the loaded module on success. Returns ``None`` (silent no-op)
+    # when the guard module cannot be located, read, parsed, or is missing one
+    # of ``required_attrs``. Silent fallback is the safer posture for hooks:
+    # if the guard is unreachable the Claude session keeps running without the
+    # extra guard layer rather than failing every hook invocation.
+    name = _GUARD_MODULE_NAME
+    guard_path = bridge_root / "bridge_guard_common.py"
+    required = tuple(required_attrs)
+
+    cached = sys.modules.get(name)
+    if cached is not None:
+        try:
+            for attr in required:
+                getattr(cached, attr)
+            return cached
+        except AttributeError:
+            sys.modules.pop(name, None)
+
+    try:
+        spec = importlib.util.spec_from_file_location(name, guard_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+    except (OSError, ImportError, ValueError):
+        return None
+
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        return None
+
+    try:
+        for attr in required:
+            getattr(module, attr)
+    except AttributeError:
+        sys.modules.pop(name, None)
+        return None
+
+    return module
