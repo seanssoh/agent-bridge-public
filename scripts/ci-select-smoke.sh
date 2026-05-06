@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys
 }
 
 add_all_integration() {
@@ -214,12 +214,20 @@ select_for_path() {
       # Issue #528: tool-policy / wrapper / protected-glob changes can
       # alter the trust-model envelope the typed agent-update path
       # mirrors. Run agent-update to catch drift in the contract.
-      add_required hooks agent-update
+      # Issue #583 (v0.8.0 T4): tool-policy.py's system-class allowlist
+      # for cross-agent reads is the v1 partial fix that v2's group
+      # permission model supersedes; cover the v2 closure smoke so
+      # changes to the allowlist don't silently regress the v2 path.
+      add_required hooks agent-update v2-cross-class-read
       add_integration integration-minimal
       ;;
 
     lib/bridge-isolation*.sh|lib/bridge-migration.sh|bridge-migrate.sh|tests/isolation*)
-      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy launch
+      # Issue #583 closure smoke (v0.8.0 T4): the cross-class read
+      # boundary depends directly on lib/bridge-isolation-v2.sh
+      # primitives (group + setgid model), so cover it whenever any
+      # isolation lib moves.
+      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read launch
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
