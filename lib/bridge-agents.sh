@@ -2770,9 +2770,10 @@ EOF
   # almost never contains the operator's per-user bin (e.g.
   # ~/.local/bin/claude), so the launcher's bare `claude` / `codex` call
   # would die with "command not found". Resolving on every start picks up
-  # CLI upgrades automatically. v2 requires the engine CLI to live in a
-  # base-readable path (`other::r-x`) — controller-home symlinks are
-  # rejected at prepare time.
+  # CLI upgrades automatically. v2 still requires the engine CLI to
+  # live in a base-readable path (`other::r-x`); controller-home
+  # symlinks fail at runtime with `command not found` (no prepare-time
+  # check post-v0.8.0 — see KNOWN_ISSUES #17).
   if [[ "$isolation_mode" == "linux-user" ]]; then
     if [[ -n "$engine" ]]; then
       local _engine_cli _engine_dir
