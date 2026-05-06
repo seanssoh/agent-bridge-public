@@ -299,6 +299,61 @@ printf "%080d\n" 1')"
   smoke_assert_eq "error" "$(json_field "$result" status)" "T36 result error"
 }
 
+smoke_t36b_cap_grace_sigterm_ignoring() {
+  # T36b verifies that the cap-exceeded SIGKILL grace fires from cap-fire,
+  # not from the cron timeout (finding 2 of PR #625 r2 review). The child
+  # ignores SIGTERM and prints 80 bytes (cap=16) before sleeping forever.
+  # Pre-r3 the runner waited the full timeoutSeconds before SIGKILL grace
+  # started, so this took ~13s with timeout=8 + 5s grace. After r3 the
+  # waiter wakes on cap_event, SIGTERMs immediately, then SIGKILLs after
+  # at most 5s — total ≤ ~6s under load.
+  local script_path request result status duration_ms duration_s child_pid_file child_pid attempts
+  script_path="$(make_script t36b.sh '#!/usr/bin/env bash
+python3 -c "
+import os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+with open(os.environ[\"CRON_RUN_DIR\"] + \"/t36b-child.pid\", \"w\") as fh:
+    fh.write(str(os.getpid()))
+sys.stdout.write(\"x\" * 80 + \"\\n\")
+sys.stdout.flush()
+time.sleep(60)
+"')"
+  request="$(write_request t36b-run t36b-job "$script_path" 8 16)"
+  if run_runner "$request" >/tmp/cron-shell-t36b.out 2>&1; then
+    smoke_fail "T36b expected output_cap_exceeded non-zero exit"
+  fi
+  result="${request%/*}/result.json"
+  status="${request%/*}/status.json"
+  smoke_assert_eq "error" "$(json_field "$status" state)" "T36b status error"
+  smoke_assert_eq "output_cap_exceeded" "$(json_field "$status" runner_error)" "T36b runner_error"
+  smoke_assert_eq "error" "$(json_field "$result" status)" "T36b result error"
+  # Wall-clock budget: cap fires almost immediately, SIGTERM is ignored,
+  # 5s grace, SIGKILL. Allow up to 7s of total wall time so a slow CI
+  # box still passes; pre-r3 this was ~13.1s.
+  duration_ms="$(json_field "$result" duration_ms)"
+  duration_s="$(python3 -c "print(${duration_ms} / 1000.0)")"
+  if python3 -c "import sys; sys.exit(0 if ${duration_s} <= 7.0 else 1)"; then
+    :
+  else
+    smoke_fail "T36b duration ${duration_s}s exceeds cap-grace budget (≤ 7s expected)"
+  fi
+  # The SIGTERM-ignoring child should be dead after SIGKILL; allow a
+  # short reap window after the runner returns.
+  child_pid_file="${request%/*}/t36b-child.pid"
+  if [[ ! -s "$child_pid_file" ]]; then
+    smoke_fail "T36b child PID file missing or empty"
+  fi
+  child_pid="$(cat "$child_pid_file")"
+  attempts=0
+  while (( attempts < 20 )) && kill -0 "$child_pid" 2>/dev/null; do
+    sleep 0.25
+    attempts=$((attempts + 1))
+  done
+  if kill -0 "$child_pid" 2>/dev/null; then
+    smoke_fail "T36b SIGTERM-ignoring child $child_pid survived cap-grace SIGKILL"
+  fi
+}
+
 smoke_t37_no_model_child() {
   local script_path request status
   script_path="$(make_script t37.sh '#!/usr/bin/env bash
@@ -526,6 +581,7 @@ smoke_run "T32 silent success" smoke_t32_success_silent
 smoke_run "T33 script creates queue task" smoke_t33_script_can_create_queue_task
 smoke_run "T34 timeout killpg" smoke_t34_timeout_killpg
 smoke_run "T36 output cap" smoke_t36_output_cap
+smoke_run "T36b cap grace fires from cap-trip not cron timeout" smoke_t36b_cap_grace_sigterm_ignoring
 smoke_run "T37 no Claude/Codex child" smoke_t37_no_model_child
 smoke_run "T38 lock contention is silent success" smoke_t38_lock_held_success
 smoke_run "T39 tamper rejection" smoke_t39_tamper_rejected
