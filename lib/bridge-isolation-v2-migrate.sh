@@ -100,13 +100,63 @@ not from inside an Agent Bridge agent session. No state has been mutated."
 # ---------------------------------------------------------------------------
 
 bridge_isolation_v2_migrate_acquire_lock() {
+  # mkdir-based atomic lock + PID stale-owner detection.
+  #
+  # macOS does not ship `flock(1)` by default (it's Linux util-linux); we
+  # also can't require Homebrew `flock` as an upgrade prerequisite. mkdir
+  # is atomic on every supported FS and works in Bash 3.2 baseline with
+  # no external deps. The owner-pid file gives us crash-recovery: if the
+  # previous holder died without rmdir'ing, the next acquirer detects the
+  # stale pid (via `kill -0`), removes the lock dir, and retries once.
+  #
+  # Lock layout:
+  #   $BRIDGE_STATE_DIR/migration/migrate-isolation-v2.lock.d/   (dir)
+  #   $BRIDGE_STATE_DIR/migration/migrate-isolation-v2.lock.d/owner.pid
   bridge_isolation_v2_migrate_mkstate
-  local lock_path
+  local lock_path lock_dir owner_pid_file existing_pid
   lock_path="$(bridge_isolation_v2_migrate_lock_path)"
-  exec 9>"$lock_path"
-  if ! flock -n 9; then
-    bridge_die "another isolation-v2 migrate operation is in progress (lock=$lock_path)"
+  lock_dir="${lock_path}.d"
+  owner_pid_file="${lock_dir}/owner.pid"
+
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s\n' "$$" >"$owner_pid_file" 2>/dev/null || true
+    BRIDGE_ISOLATION_V2_MIGRATE_LOCK_DIR="$lock_dir"
+    trap 'bridge_isolation_v2_migrate_release_lock' EXIT
+    return 0
   fi
+
+  # mkdir failed → either another live process holds the lock, or a stale
+  # lock dir is left behind from a crashed prior run. Inspect owner.pid.
+  existing_pid=""
+  if [[ -f "$owner_pid_file" ]]; then
+    existing_pid="$(cat "$owner_pid_file" 2>/dev/null | tr -d '[:space:]' || true)"
+  fi
+  if [[ -n "$existing_pid" ]] && [[ "$existing_pid" =~ ^[0-9]+$ ]] \
+      && kill -0 "$existing_pid" 2>/dev/null; then
+    bridge_die "another isolation-v2 migrate operation is in progress (lock=$lock_dir, owner_pid=$existing_pid)"
+  fi
+
+  # Stale: pid file missing, unreadable, malformed, or pointing at a dead
+  # process. Remove the dir + retry once. Failure to rmdir means a live
+  # writer raced us between the readdir and rmdir — treat as live owner.
+  if ! rm -rf -- "$lock_dir" 2>/dev/null; then
+    bridge_die "another isolation-v2 migrate operation is in progress (lock=$lock_dir, stale-cleanup-failed)"
+  fi
+  if mkdir "$lock_dir" 2>/dev/null; then
+    printf '%s\n' "$$" >"$owner_pid_file" 2>/dev/null || true
+    BRIDGE_ISOLATION_V2_MIGRATE_LOCK_DIR="$lock_dir"
+    trap 'bridge_isolation_v2_migrate_release_lock' EXIT
+    return 0
+  fi
+  bridge_die "another isolation-v2 migrate operation is in progress (lock=$lock_dir, race-after-cleanup)"
+}
+
+bridge_isolation_v2_migrate_release_lock() {
+  # Idempotent: trap may fire after explicit release in normal flow.
+  local lock_dir="${BRIDGE_ISOLATION_V2_MIGRATE_LOCK_DIR:-}"
+  [[ -n "$lock_dir" ]] || return 0
+  rm -rf -- "$lock_dir" 2>/dev/null || true
+  BRIDGE_ISOLATION_V2_MIGRATE_LOCK_DIR=""
 }
 
 bridge_isolation_v2_migrate_capture_active_snapshot() {
