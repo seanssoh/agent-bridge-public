@@ -10357,6 +10357,12 @@ bash "$REPO_ROOT/scripts/test-stale-resume.sh"
 log "running cron-migrate-payloads smoke (issue #541 PR-A)"
 bash "$REPO_ROOT/scripts/smoke/cron-migrate-payloads.sh"
 
+# Issues #581 / #614 — bridge-cron-scheduler.py in-process regression suite
+# (cursor-boundary + deferred-slot retry). The Python `--self-test` entry
+# point is fully self-contained; the smoke wrapper just routes it to CI.
+log "running cron-scheduler-self-test smoke (issues #581 / #614)"
+bash "$REPO_ROOT/scripts/smoke/cron-scheduler-self-test.sh"
+
 # Issue #544 PR1 — curated bin/agb shim for isolated agents.
 log "running isolated-bin-agb smoke (issue #544 PR1)"
 log "isolated-bin-agb covers shim env-source/delegation/fallback only — live PATH injection requires isolate+restart"

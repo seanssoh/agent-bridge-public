@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention cron-migrate-payloads upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update cron-run-artifacts-retention cron-migrate-payloads cron-scheduler-self-test upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering
 }
 
 add_all_integration() {
@@ -198,7 +198,11 @@ select_for_path() {
       # python file moves.
       # Issue #541 PR-A — memory-daily payload migration also lives in
       # bridge-cron.py; pull its smoke in for the same trigger set.
-      add_required cron-run-artifacts-retention cron-migrate-payloads queue
+      # Issues #581 / #614 — bridge-cron-scheduler.py carries an in-process
+      # `--self-test` regression suite for cursor-boundary (#581) and
+      # deferred-slot retry (#614). Route it to CI on every cron-side
+      # python change so neither contract regresses silently.
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-scheduler-self-test queue
       add_integration integration-minimal
       ;;
 
