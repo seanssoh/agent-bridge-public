@@ -48,6 +48,19 @@
 # cleanup itself fails, the trap forces the process to exit non-zero
 # so the operator does not get a green doctor with a residual roster
 # block / home directory.
+#
+# Codex r2 (PR #615) — D5 face 2: the cleanup `delete --purge-home`
+# resolves the home target via `bridge_agent_default_home`, which falls
+# back to `$BRIDGE_AGENT_HOME_ROOT/$agent`. In a normal Codex/agent
+# shell, `BRIDGE_AGENT_HOME_ROOT` is already exported to the live
+# install root; when only `BRIDGE_HOME` is overridden for an isolated
+# test, the cleanup landed in the live root (no-op) and the fixture
+# directory under the isolated `BRIDGE_HOME/agents` leaked. The doctor
+# pins the create target to `$BRIDGE_HOME/agents/<fixture>` (see step 1
+# below), so the cleanup must land in the same place by construction.
+# Run the child `bridge-agent.sh` with `BRIDGE_AGENT_HOME_ROOT` pinned
+# to `$BRIDGE_HOME/agents` so any inherited value is overridden for
+# this child only — the parent shell's env is unchanged.
 # shellcheck disable=SC2329
 _bridge_agent_doctor_cleanup() {
   [[ "${BRIDGE_AGENT_DOCTOR_CLEANED:-0}" == "1" ]] && return 0
@@ -58,6 +71,7 @@ _bridge_agent_doctor_cleanup() {
   local script_dir="${BRIDGE_AGENT_DOCTOR_SCRIPT_DIR:-}"
   local bash_bin="${BRIDGE_AGENT_DOCTOR_BASH_BIN:-bash}"
   local caller="${BRIDGE_AGENT_DOCTOR_CALLER:-}"
+  local fixture_home_root="${BRIDGE_AGENT_DOCTOR_HOME_ROOT:-}"
   [[ -n "$script_dir" ]] || return 0
   # The caller was validated (admin + trusted source) before fixture
   # creation, so it is guaranteed non-empty here. Pass --force because
@@ -67,13 +81,25 @@ _bridge_agent_doctor_cleanup() {
   local cleanup_args=(delete "$fixture" --orphan-tasks --purge-home --force)
   [[ -n "$caller" ]] && cleanup_args+=(--from "$caller")
   local cleanup_out cleanup_rc=0
-  cleanup_out="$("$bash_bin" "$script_dir/bridge-agent.sh" "${cleanup_args[@]}" 2>&1)" || cleanup_rc=$?
+  if [[ -n "$fixture_home_root" ]]; then
+    cleanup_out="$(BRIDGE_AGENT_HOME_ROOT="$fixture_home_root" "$bash_bin" "$script_dir/bridge-agent.sh" "${cleanup_args[@]}" 2>&1)" || cleanup_rc=$?
+  else
+    cleanup_out="$("$bash_bin" "$script_dir/bridge-agent.sh" "${cleanup_args[@]}" 2>&1)" || cleanup_rc=$?
+  fi
   if [[ $cleanup_rc -ne 0 ]]; then
     # If the explicit step-7 delete already removed the fixture, the
     # follow-up retry will fail with "agent not found" — that is not a
     # leak. Recognise the not-found shape and exit clean.
     case "$cleanup_out" in
       *"not found"*|*"존재하지"*|*"없습니다"*)
+        # Roster row was gone, but the home directory may still be
+        # present if the prior delete used a mismatched HOME_ROOT. Do
+        # a best-effort rm of the pinned fixture path before returning.
+        # SC2115 is suppressed by the `:?` guards: both vars are
+        # validated non-empty above; expansion to `/` is impossible.
+        if [[ -n "$fixture_home_root" && -d "$fixture_home_root/$fixture" ]]; then
+          rm -rf -- "${fixture_home_root:?}/${fixture:?}" || true
+        fi
         return 0
         ;;
     esac
@@ -81,6 +107,15 @@ _bridge_agent_doctor_cleanup() {
       "$fixture" "$cleanup_rc" "$(printf '%s' "$cleanup_out" | head -c 240)" >&2
     # Force the process to exit non-zero so a leaked fixture is
     # surfaced as a doctor failure, not a swallowed warning.
+    exit 1
+  fi
+  # Final safety net: even when the child returned 0, double-check the
+  # pinned fixture home was actually removed. This catches resolver
+  # drift (e.g. a future refactor of bridge_agent_default_home that
+  # silently changes layout) before the operator sees a leaked dir.
+  if [[ -n "$fixture_home_root" && -d "$fixture_home_root/$fixture" ]]; then
+    printf '[doctor] fail: cleanup leaked fixture home — path=%s\n' \
+      "$fixture_home_root/$fixture" >&2
     exit 1
   fi
 }
@@ -167,6 +202,19 @@ EOF
   script_dir="${SCRIPT_DIR:-$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)}"
   bash_bin="${BRIDGE_BASH_BIN:-bash}"
 
+  # Pin the fixture's home root to `$BRIDGE_HOME/agents` for every
+  # child `bridge-agent.sh` invocation the doctor makes. The doctor
+  # already pins the fixture's create target (`fixture_workdir`) to
+  # this same path; pinning it for the child env makes the cleanup
+  # target match the create target by construction. Without this,
+  # `bridge_agent_default_home` falls back to whatever
+  # `BRIDGE_AGENT_HOME_ROOT` the parent shell exported (typically the
+  # live install root, even when `BRIDGE_HOME` is overridden for an
+  # isolated test), and `delete --purge-home` rm's the wrong path,
+  # leaving the isolated fixture leaked. The override is scoped to
+  # each child invocation; the parent shell's env is unchanged.
+  local fixture_home_root="${BRIDGE_HOME:-$HOME/.agent-bridge}/agents"
+
   # Cleanup trap: best-effort delete + purge-home so the fixture is gone
   # whether the doctor passed or failed mid-stream. Skipped when
   # --keep-fixture is set.
@@ -183,6 +231,7 @@ EOF
   BRIDGE_AGENT_DOCTOR_CALLER="$doctor_caller"
   BRIDGE_AGENT_DOCTOR_SCRIPT_DIR="$script_dir"
   BRIDGE_AGENT_DOCTOR_BASH_BIN="$bash_bin"
+  BRIDGE_AGENT_DOCTOR_HOME_ROOT="$fixture_home_root"
   trap _bridge_agent_doctor_cleanup EXIT INT TERM
 
   # Each check appends "STATUS\tNAME\tDETAIL" to a TSV stream;
@@ -208,14 +257,12 @@ EOF
   # ---- 1. create -------------------------------------------------------
   # Issue #185: when BRIDGE_HOME is ephemeral, the agent workdir must
   # also live under that root or the auto-memory seeder refuses. The
-  # doctor must therefore pin the fixture workdir to
-  # `$BRIDGE_HOME/agents/<fixture>` directly — NOT to
-  # `$BRIDGE_AGENT_HOME_ROOT` because that env var may have been set by
-  # an outer agent's launcher to a live path even after BRIDGE_HOME was
-  # rerouted to a tmp root for an isolated test. Deriving from
-  # BRIDGE_HOME is the canonical mapping bridge-lib.sh uses when no
-  # explicit override is in play.
-  local fixture_home_root="${BRIDGE_HOME:-$HOME/.agent-bridge}/agents"
+  # doctor pins the fixture workdir to `$BRIDGE_HOME/agents/<fixture>`
+  # directly — NOT to `$BRIDGE_AGENT_HOME_ROOT` because that env var
+  # may have been set by an outer agent's launcher to a live path even
+  # after BRIDGE_HOME was rerouted to a tmp root for an isolated test.
+  # The same `fixture_home_root` is also pinned in the child env (see
+  # the BRIDGE_AGENT_HOME_ROOT override below) so cleanup lands here.
   local fixture_workdir="$fixture_home_root/$fixture"
   local create_args=(create "$fixture"
     --engine claude
@@ -226,7 +273,13 @@ EOF
   # non-zero subshell exit, so each child invocation in this doctor is
   # guarded with `|| true` and the rc is captured via `${PIPESTATUS[0]}`
   # (works for both pipelined and unpipelined runs).
-  create_out="$("$bash_bin" "$script_dir/bridge-agent.sh" "${create_args[@]}" 2>&1)" || create_rc=$?
+  #
+  # Every child `bridge-agent.sh` invocation runs with
+  # `BRIDGE_AGENT_HOME_ROOT="$fixture_home_root"` pinned in its env so
+  # `bridge_agent_default_home` (used by `delete --purge-home`) lands
+  # in the same place as the create target, regardless of any value
+  # the parent shell may have inherited from a live install.
+  create_out="$(BRIDGE_AGENT_HOME_ROOT="$fixture_home_root" "$bash_bin" "$script_dir/bridge-agent.sh" "${create_args[@]}" 2>&1)" || create_rc=$?
   if [[ $create_rc -eq 0 ]]; then
     _doctor_record pass "create" "fixture=$fixture"
   else
@@ -246,7 +299,7 @@ EOF
     --class user
     --from "$doctor_caller")
   local update_out update_rc=0
-  update_out="$("$bash_bin" "$script_dir/bridge-agent.sh" "${update_args[@]}" 2>&1)" || update_rc=$?
+  update_out="$(BRIDGE_AGENT_HOME_ROOT="$fixture_home_root" "$bash_bin" "$script_dir/bridge-agent.sh" "${update_args[@]}" 2>&1)" || update_rc=$?
   if [[ $update_rc -eq 0 ]]; then
     _doctor_record pass "update" "desc/loop/continue/class persisted"
   else
@@ -260,7 +313,7 @@ EOF
   # to the `show` step (registry only exposes id/class/source/etc., not
   # the BRIDGE_AGENT_DESC payload).
   local reg_out reg_rc=0
-  reg_out="$("$bash_bin" "$script_dir/bridge-agent.sh" registry --json 2>&1)" || reg_rc=$?
+  reg_out="$(BRIDGE_AGENT_HOME_ROOT="$fixture_home_root" "$bash_bin" "$script_dir/bridge-agent.sh" registry --json 2>&1)" || reg_rc=$?
   if [[ $reg_rc -ne 0 ]]; then
     _doctor_record fail "registry" "rc=$reg_rc out=$(printf '%s' "$reg_out" | head -c 240)"
   else
@@ -304,7 +357,7 @@ PY
   # only enumerator that surfaces the BRIDGE_AGENT_DESC payload, so
   # this is where we assert the typed-flag mutation round-tripped.
   local show_out show_rc=0
-  show_out="$("$bash_bin" "$script_dir/bridge-agent.sh" show "$fixture" --json 2>&1)" || show_rc=$?
+  show_out="$(BRIDGE_AGENT_HOME_ROOT="$fixture_home_root" "$bash_bin" "$script_dir/bridge-agent.sh" show "$fixture" --json 2>&1)" || show_rc=$?
   if [[ $show_rc -ne 0 ]]; then
     _doctor_record fail "show" "rc=$show_rc out=$(printf '%s' "$show_out" | head -c 240)"
   elif [[ "$update_rc" -eq 0 ]]; then
@@ -351,7 +404,7 @@ PY
   # candidate — that's the correct success shape. Report n/a so the
   # operator sees the path was exercised but had nothing to do.
   local recl_out recl_rc=0
-  recl_out="$("$bash_bin" "$script_dir/bridge-agent.sh" reclassify --agent "$fixture" --apply 2>&1)" || recl_rc=$?
+  recl_out="$(BRIDGE_AGENT_HOME_ROOT="$fixture_home_root" "$bash_bin" "$script_dir/bridge-agent.sh" reclassify --agent "$fixture" --apply 2>&1)" || recl_rc=$?
   if [[ $recl_rc -eq 0 ]]; then
     case "$recl_out" in
       *"no candidates"*)
@@ -369,7 +422,7 @@ PY
   # Static-roster agents are out-of-scope for retire (#607); the deny
   # is the correct shape. Report n/a.
   local ret_out ret_rc=0
-  ret_out="$("$bash_bin" "$script_dir/bridge-agent.sh" retire "$fixture" --dry-run 2>&1)" || ret_rc=$?
+  ret_out="$(BRIDGE_AGENT_HOME_ROOT="$fixture_home_root" "$bash_bin" "$script_dir/bridge-agent.sh" retire "$fixture" --dry-run 2>&1)" || ret_rc=$?
   case "$ret_out" in
     *"is static-roster"*|*"static-roster"*)
       _doctor_record n/a "retire" "fixture is static-roster (delete owns this path — expected)"
@@ -394,10 +447,21 @@ PY
   # admin (validated upfront), so we always forward --from.
   local del_args=(delete "$fixture" --orphan-tasks --purge-home --force --from "$doctor_caller")
   local del_out del_rc=0
-  del_out="$("$bash_bin" "$script_dir/bridge-agent.sh" "${del_args[@]}" 2>&1)" || del_rc=$?
+  del_out="$(BRIDGE_AGENT_HOME_ROOT="$fixture_home_root" "$bash_bin" "$script_dir/bridge-agent.sh" "${del_args[@]}" 2>&1)" || del_rc=$?
   if [[ $del_rc -eq 0 ]]; then
-    _doctor_record pass "delete" "fixture removed + home purged"
-    BRIDGE_AGENT_DOCTOR_CLEANED=1   # trap is a no-op now
+    # Self-policing post-condition (codex r2): a leaked fixture home is
+    # itself a doctor failure. Even if the child returned 0, double-check
+    # the pinned fixture path was actually removed. This catches resolver
+    # drift (e.g. a future refactor of bridge_agent_default_home that
+    # silently changes layout, or an inherited BRIDGE_AGENT_HOME_ROOT
+    # that defeated our pin) before the operator sees a green doctor
+    # with residue under `$BRIDGE_HOME/agents/`.
+    if [[ -d "$fixture_workdir" ]]; then
+      _doctor_record fail "delete" "leaked fixture home: $fixture_workdir still present after --purge-home"
+    else
+      _doctor_record pass "delete" "fixture removed + home purged"
+      BRIDGE_AGENT_DOCTOR_CLEANED=1   # trap is a no-op now
+    fi
   else
     _doctor_record fail "delete" "rc=$del_rc out=$(printf '%s' "$del_out" | head -c 240)"
   fi
