@@ -183,6 +183,21 @@ bridge_isolation_v2_migrate_capture_all_agents_snapshot() {
   local snapshot
   snapshot="$(bridge_isolation_v2_migrate_all_agents_snapshot_path)"
 
+  # v0.8.3: build a roster lookup so the dir-walk pass can distinguish
+  # v1-layout agents (in roster, no home/ yet — will migrate) from
+  # genuinely orphan dirs (not in roster, no home/ — operator scratch).
+  # The former should be silent; only the latter should warn.
+  local roster_lookup
+  roster_lookup="$(bridge_isolation_v2_migrate_state_dir)/roster.lookup.$$"
+  : > "$roster_lookup"
+  if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1; then
+    local _rid
+    for _rid in "${BRIDGE_AGENT_IDS[@]}"; do
+      [[ -n "$_rid" ]] || continue
+      printf '%s\n' "$_rid" >> "$roster_lookup"
+    done
+  fi
+
   {
     if declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1; then
       local id
@@ -208,13 +223,20 @@ bridge_isolation_v2_migrate_capture_all_agents_snapshot() {
             ;;
         esac
         if [[ ! -d "$entry/home" ]]; then
-          bridge_warn "isolation-v2 migration: skipping non-agent dir $entry (no home/ subdir)"
+          # v0.8.3: silent for v1-layout agents in roster (they will
+          # migrate via the roster path above and emit_plan rows). Warn
+          # only for genuinely orphan dirs that are NOT in BRIDGE_AGENT_IDS.
+          if ! grep -qFx "$name" "$roster_lookup" 2>/dev/null; then
+            bridge_warn "isolation-v2 migration: skipping orphan dir $entry (not in roster, no home/ subdir)"
+          fi
           continue
         fi
         printf '%s\n' "$name"
       done
     fi
   } | sort -u >"$snapshot"
+
+  rm -f "$roster_lookup" 2>/dev/null || true
 }
 
 bridge_isolation_v2_migrate_per_agent_marker_dir() {
@@ -420,7 +442,37 @@ bridge_isolation_v2_migrate_emit_plan() {
 
 bridge_isolation_v2_migrate_emit_row() {
   local mapping_id="$1" legacy_src="$2" v2_dst="$3" delete_eligible="$4"
-  [[ -e "$legacy_src" ]] || return 0
+  # v0.8.3 amend: existence check tolerates linux-user-isolated paths.
+  # Without sudo, sean can't traverse `agents/<bob>/` (mode 2750 owned
+  # by agent-bridge-<bob>:ab-agent-<bob>) on a fresh migration since
+  # supplementary group membership from ensure_groups isn't yet active
+  # in the controller's process. Fall back to `sudo -n test -e` so
+  # isolated agents' rows still get emitted; mirror_one's sudo wrap
+  # handles the actual rsync.
+  if [[ ! -e "$legacy_src" ]]; then
+    sudo -n test -e "$legacy_src" 2>/dev/null || return 0
+  fi
+  # v0.8.3: src==dst guard. When BRIDGE_DATA_ROOT == TARGET_ROOT
+  # (markerless default) some v1 paths coincide with v2 paths
+  # (e.g. agents/<n>/credentials → agents/<n>/credentials). Emitting
+  # those would queue a no-op rsync that pollutes the manifest and,
+  # combined with delete_eligible=1 cleanup, would delete the very
+  # content we just "mirrored" to itself.
+  [[ "$legacy_src" == "$v2_dst" ]] && return 0
+  # v0.8.3 amend: skip empty-tree global rows. The runtime_shared
+  # mapping (runtime/shared -> shared) emits even when runtime/shared
+  # is empty subdirs only and dst already populated; rsync hits
+  # transient partial-transfer (rc=23) edge cases that abort the
+  # migration despite zero load-bearing data. Recursive find for any
+  # regular file or symlink: if absent, the row contributes nothing
+  # and is safe to skip.
+  if [[ -d "$legacy_src" ]]; then
+    local _has_content
+    _has_content="$(sudo -n find "$legacy_src" -mindepth 1 \( -type f -o -type l \) -print -quit 2>/dev/null \
+                    || find "$legacy_src" -mindepth 1 \( -type f -o -type l \) -print -quit 2>/dev/null \
+                    || printf '')"
+    [[ -n "$_has_content" ]] || return 0
+  fi
   printf '%s\t%s\t%s\t%s\n' "$mapping_id" "$legacy_src" "$v2_dst" "$delete_eligible"
 }
 
@@ -486,13 +538,36 @@ bridge_isolation_v2_migrate_mirror_one() {
   bytes="$(bridge_isolation_v2_migrate_bytes_of "$legacy_src")"
   sha_legacy="$(bridge_isolation_v2_migrate_sha256_of "$legacy_src")"
 
-  # Make destination parent.
+  # Detect cross-UID source FIRST (used both for mkdir + rsync).
+  local src_uid current_uid use_sudo=0
+  current_uid="$(id -u)"
+  src_uid="$(stat -c '%u' "$legacy_src" 2>/dev/null \
+              || stat -f '%u' "$legacy_src" 2>/dev/null \
+              || sudo -n stat -c '%u' "$legacy_src" 2>/dev/null \
+              || sudo -n stat -f '%u' "$legacy_src" 2>/dev/null \
+              || printf '%s' "$current_uid")"
+  if [[ -n "$src_uid" && "$src_uid" != "$current_uid" ]]; then
+    use_sudo=1
+  fi
+
+  # Make destination parent. v0.8.3 amend: when src is cross-UID
+  # (linux-user-isolated), the dst parent (e.g. agents/<bob>/) is
+  # owned by the isolated UID, so sean's mkdir fails with EACCES.
+  # Use sudo when escalation is needed.
   local dst_parent
   if [[ -d "$legacy_src" ]]; then
-    mkdir -p "$v2_dst" 2>/dev/null
+    if (( use_sudo == 1 )); then
+      sudo -n mkdir -p "$v2_dst" 2>/dev/null
+    else
+      mkdir -p "$v2_dst" 2>/dev/null
+    fi
   else
     dst_parent="$(dirname "$v2_dst")"
-    mkdir -p "$dst_parent" 2>/dev/null
+    if (( use_sudo == 1 )); then
+      sudo -n mkdir -p "$dst_parent" 2>/dev/null
+    else
+      mkdir -p "$dst_parent" 2>/dev/null
+    fi
   fi
 
   # Real copy. -a preserves perm/owner/time AND symlinks (-l is part of
@@ -501,13 +576,38 @@ bridge_isolation_v2_migrate_mirror_one() {
   # --no-links — it disables symlink copying entirely, which previously
   # let symlink-bearing trees pass verify_status=ok with the symlinks
   # silently dropped (caught by the dev-codex r1 review).
+  #
+  # v0.8.3 amend: detect linux-user-isolated paths (src owned by a
+  # different uid than the current process) and run rsync via sudo so
+  # the mirror can read the isolated tree. Without this, an isolated
+  # agent's `agents/<n>/CLAUDE.md` (mode 0600 owned by agent-bridge-<n>)
+  # is invisible to the controller's rsync — emit_row's `[[ -e ... ]]`
+  # passes if the parent dir is traversable but rsync fails to read
+  # the actual content. The migration already requires sudo via the
+  # privilege_preflight gate so this doesn't add new prerequisites.
+  #
+  # v0.8.3 amend: drop --delete-excluded — without an --exclude pattern
+  # the flag is a no-op for per-agent rows but pairs destructively
+  # with the global runtime_shared mapping where dst contains content
+  # not present in src (rsync_fail_23 in v0.7.8 -> v0.8.3 VM repro).
+  # use_sudo + src_uid already detected above (shared with mkdir).
   local rc=0
   if [[ -d "$legacy_src" ]]; then
-    rsync -aHX --numeric-ids --delete-excluded \
-      "$legacy_src/" "$v2_dst/" >/dev/null 2>&1 || rc=$?
+    if (( use_sudo == 1 )); then
+      sudo -n rsync -aHX --numeric-ids \
+        "$legacy_src/" "$v2_dst/" >/dev/null 2>&1 || rc=$?
+    else
+      rsync -aHX --numeric-ids \
+        "$legacy_src/" "$v2_dst/" >/dev/null 2>&1 || rc=$?
+    fi
   else
-    rsync -aHX --numeric-ids \
-      "$legacy_src" "$v2_dst" >/dev/null 2>&1 || rc=$?
+    if (( use_sudo == 1 )); then
+      sudo -n rsync -aHX --numeric-ids \
+        "$legacy_src" "$v2_dst" >/dev/null 2>&1 || rc=$?
+    else
+      rsync -aHX --numeric-ids \
+        "$legacy_src" "$v2_dst" >/dev/null 2>&1 || rc=$?
+    fi
   fi
   if (( rc != 0 )); then
     verify="rsync_fail_$rc"
@@ -527,6 +627,26 @@ bridge_isolation_v2_migrate_mirror_one() {
     >> "$manifest_path"
 
   [[ "$verify" == "ok" ]] || return 1
+
+  # v0.8.3: delete legacy_src after a verified mirror when the row is
+  # delete_eligible=1. Previously commit was a separate operator-invoked
+  # phase (`migrate isolation-v2 commit`), but the upgrade hot path
+  # needs immediate cleanup so runtime does not double-read v1+v2 paths
+  # for the same logical resource. Manifest still records the row so
+  # rollback can reverse it.
+  #
+  # v0.8.3 amend: cross-UID legacy_src (linux-user-isolated agent's
+  # files owned by agent-bridge-<n>) requires sudo for rm too —
+  # without it sean cannot enter the parent dir to remove children.
+  if [[ "$delete_eligible" == "1" && "$legacy_src" != "$v2_dst" ]]; then
+    if (( use_sudo == 1 )); then
+      sudo -n rm -rf -- "$legacy_src" 2>/dev/null \
+        || bridge_warn "mirror_one: failed to remove $legacy_src after successful mirror"
+    else
+      rm -rf -- "$legacy_src" 2>/dev/null \
+        || bridge_warn "mirror_one: failed to remove $legacy_src after successful mirror"
+    fi
+  fi
   return 0
 }
 
@@ -775,9 +895,27 @@ bridge_isolation_v2_migrate_orchestrate_restart() {
     || bridge_die "daemon restart failed"
   bridge_isolation_v2_migrate_wait_daemon_present 10
 
-  local agent
+  # v0.8.3: skip restart for agents whose tmux session has an attached
+  # operator. The dry-run pass in bridge-upgrade.sh already reports these
+  # as `agent_restart_skipped_attached`; mirroring the same predicate
+  # here prevents the apply step from yanking the rug out from under a
+  # live operator session.
+  local agent session attached
   while IFS= read -r agent; do
     [[ -n "$agent" ]] || continue
+    session=""
+    attached=0
+    if declare -F bridge_agent_session >/dev/null 2>&1; then
+      session="$(bridge_agent_session "$agent" 2>/dev/null || printf '')"
+    fi
+    if [[ -n "$session" ]] && declare -F bridge_tmux_session_attached_count >/dev/null 2>&1; then
+      attached="$(bridge_tmux_session_attached_count "$session" 2>/dev/null || printf '0')"
+      [[ "$attached" =~ ^[0-9]+$ ]] || attached=0
+    fi
+    if (( attached > 0 )); then
+      bridge_warn "restart skipped for agent '$agent' (operator attached to session '$session') — restart manually after detaching"
+      continue
+    fi
     "$BRIDGE_BASH_BIN" "$BRIDGE_SCRIPT_DIR/bridge-agent.sh" start "$agent" >/dev/null 2>&1 \
       || bridge_warn "restart failed for agent '$agent' — operator will need to start manually"
   done < "$snapshot_path"
@@ -882,8 +1020,10 @@ bridge_isolation_v2_migrate_apply() {
 
   bridge_isolation_v2_migrate_acquire_lock
   bridge_isolation_v2_migrate_capture_active_snapshot
-  local snapshot
+  bridge_isolation_v2_migrate_capture_all_agents_snapshot
+  local snapshot all_snapshot
   snapshot="$(bridge_isolation_v2_migrate_active_snapshot_path)"
+  all_snapshot="$(bridge_isolation_v2_migrate_all_agents_snapshot_path)"
 
   # Empty active snapshot — no-op cleanly rather than silently mirroring
   # zero rows. Operators expect a clear signal when there are no active
@@ -903,18 +1043,22 @@ bridge_isolation_v2_migrate_apply() {
 
   bridge_isolation_v2_migrate_orchestrate_stop "$snapshot"
 
-  bridge_isolation_v2_migrate_ensure_groups_and_memberships "$snapshot" \
+  bridge_isolation_v2_migrate_ensure_groups_and_memberships "$all_snapshot" \
     || bridge_die "group ensure / membership failed"
 
+  # v0.8.3: mirror across the FULL agent set (active + inactive). Using
+  # active-only previously left inactive agents' v1 content stranded
+  # while the marker still flipped — silent context loss. emit_row
+  # short-circuits when legacy_src is absent so no spurious rows.
   local manifest
   manifest="$(bridge_isolation_v2_migrate_manifest_path)"
-  if ! bridge_isolation_v2_migrate_mirror_all "$data_root" "$snapshot" "$manifest"; then
+  if ! bridge_isolation_v2_migrate_mirror_all "$data_root" "$all_snapshot" "$manifest"; then
     bridge_warn "mirror reported failures — marker NOT written; legacy tree intact; restarting agents on legacy"
     bridge_isolation_v2_migrate_orchestrate_restart "$snapshot"
     bridge_die "apply aborted at mirror step (manifest=$manifest)"
   fi
 
-  if ! bridge_isolation_v2_migrate_normalize_layout "$snapshot" "$data_root"; then
+  if ! bridge_isolation_v2_migrate_normalize_layout "$all_snapshot" "$data_root"; then
     bridge_warn "layout normalize failed — marker NOT written; legacy tree intact; restarting agents on legacy"
     bridge_isolation_v2_migrate_orchestrate_restart "$snapshot"
     bridge_die "apply aborted at normalize step (manifest=$manifest)"
@@ -950,6 +1094,44 @@ bridge_isolation_v2_migrate_rollback() {
 
   bridge_isolation_v2_migrate_orchestrate_stop "$snapshot"
   bridge_isolation_v2_migrate_marker_remove
+
+  # v0.8.3: reverse the file relocation. Iterate manifest in reverse so
+  # nested-dir rows undo in dependency order (children before parents).
+  # Only restore rows that succeeded the original mirror+delete cycle:
+  # verify_status=ok AND delete_eligible=1. Skip rows where legacy_src
+  # already exists (operator likely retried) or v2_dst is gone.
+  local manifest
+  manifest="$(bridge_isolation_v2_migrate_manifest_path)"
+  if [[ -f "$manifest" ]]; then
+    local ts mapping_id legacy_src v2_dst bytes sha_legacy sha_v2 verify_status delete_eligible
+    while IFS=$'\t' read -r ts mapping_id legacy_src v2_dst bytes sha_legacy sha_v2 verify_status delete_eligible; do
+      [[ "$verify_status" == "ok" && "$delete_eligible" == "1" ]] || continue
+      [[ -n "$legacy_src" && -n "$v2_dst" ]] || continue
+      [[ "$legacy_src" == "$v2_dst" ]] && continue
+      [[ -e "$v2_dst" ]] || continue
+      [[ -e "$legacy_src" ]] && continue
+
+      mkdir -p -- "$(dirname "$legacy_src")" 2>/dev/null || true
+      if mv -- "$v2_dst" "$legacy_src" 2>/dev/null; then
+        :
+      elif [[ -d "$v2_dst" ]]; then
+        if rsync -aHX --numeric-ids -- "$v2_dst/" "$legacy_src/" >/dev/null 2>&1; then
+          rm -rf -- "$v2_dst" 2>/dev/null \
+            || bridge_warn "rollback: failed to remove $v2_dst after rsync to $legacy_src"
+        else
+          bridge_warn "rollback: failed to reverse $v2_dst -> $legacy_src"
+        fi
+      else
+        if rsync -aHX --numeric-ids -- "$v2_dst" "$legacy_src" >/dev/null 2>&1; then
+          rm -f -- "$v2_dst" 2>/dev/null \
+            || bridge_warn "rollback: failed to remove $v2_dst after rsync to $legacy_src"
+        else
+          bridge_warn "rollback: failed to reverse $v2_dst -> $legacy_src"
+        fi
+      fi
+    done < <(tac "$manifest" 2>/dev/null || tail -r "$manifest" 2>/dev/null)
+  fi
+
   bridge_isolation_v2_migrate_orchestrate_restart "$snapshot"
 
   printf 'rollback ok: marker removed; legacy tree intact\n'
@@ -1205,20 +1387,23 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
     return 1
   fi
 
-  # Mirror legacy -> v2 paths (active set only — inactive agents have
-  # nothing to mirror; their group + perms still get applied via the
-  # full snapshot below).
+  # Mirror legacy -> v2 paths for ALL agents (active + inactive). v0.8.3:
+  # previously this used $active_snapshot, which meant inactive agents'
+  # files (CLAUDE.md, memory/, .claude/, etc.) were never relocated —
+  # marker flipped, runtime pointed at empty v2 workdir, silent context
+  # loss. emit_row in emit_plan already returns 0 when legacy_src is
+  # absent, so this is a no-op for agents with nothing to mirror.
   local manifest
   manifest="$(bridge_isolation_v2_migrate_manifest_path)"
-  if [[ "$active_count" -gt 0 ]]; then
-    if ! bridge_isolation_v2_migrate_mirror_all "$data_root" "$active_snapshot" "$manifest"; then
+  if [[ "$all_count" -gt 0 ]]; then
+    if ! bridge_isolation_v2_migrate_mirror_all "$data_root" "$all_snapshot" "$manifest"; then
       {
         printf '{"mode":"isolation-v2-migrate","status":"error","reason":"mirror",'
         printf '"last_error":"mirror reported failures","manifest":"%s",' "$manifest"
         printf '"remediation":"inspect manifest verify_status column and rerun",'
         printf '"no_v080_code_installed":"yes"}\n'
       } >"$err_log"
-      bridge_isolation_v2_migrate_orchestrate_restart "$active_snapshot"
+      [[ "$active_count" -gt 0 ]] && bridge_isolation_v2_migrate_orchestrate_restart "$active_snapshot"
       cat "$err_log"
       return 1
     fi
