@@ -22,7 +22,16 @@ CURRENT_UID="$(id -u)"
 CURRENT_GID="$(id -g)"
 JOBS_FILE="$BRIDGE_HOME/cron/jobs.json"
 export CURRENT_USER CURRENT_UID CURRENT_GID JOBS_FILE
+export BRIDGE_NATIVE_CRON_JOBS_FILE="$JOBS_FILE"
 printf '{"format":"agent-bridge-cron-v1","jobs":[]}\n' >"$JOBS_FILE"
+cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
+bridge_add_agent_id_if_missing "smoke-agent"
+BRIDGE_AGENT_DESC["smoke-agent"]="Smoke isolated agent"
+BRIDGE_AGENT_ENGINE["smoke-agent"]="claude"
+BRIDGE_AGENT_SESSION["smoke-agent"]="smoke-agent"
+BRIDGE_AGENT_ISOLATION_MODE["smoke-agent"]="linux-user"
+BRIDGE_AGENT_OS_USER["smoke-agent"]="$CURRENT_USER"
+EOF
 
 make_script() {
   local name="$1"
@@ -307,6 +316,100 @@ exit 0')"
   fi
 }
 
+smoke_t39b_invalid_json_tamper_terminal() {
+  local run_dir request status out
+  run_dir="$BRIDGE_CRON_STATE_DIR/runs/t39b-run"
+  mkdir -p "$run_dir"
+  request="$run_dir/request.json"
+  printf '{not-json\n' >"$request"
+  chmod 0770 "$run_dir"
+  chmod 0660 "$request"
+  if run_runner "$request" >/tmp/cron-shell-t39b.out 2>&1; then
+    smoke_fail "T39b expected invalid JSON/tamper rejection"
+  fi
+  out="$(cat /tmp/cron-shell-t39b.out)"
+  smoke_assert_not_contains "$out" "Traceback" "T39b no traceback"
+  status="$run_dir/status.json"
+  smoke_assert_eq "error" "$(json_field "$status" state)" "T39b status error"
+  smoke_assert_eq "request_artifact_tampered" "$(json_field "$status" runner_error)" "T39b terminal runner_error"
+}
+
+smoke_t39c_update_revalidates_shell_script() {
+  local script_path job_id out
+  if [[ "$(id -u)" == "0" ]]; then
+    smoke_skip "T39c root-owned script rejection" "current uid is root"
+    return 0
+  fi
+  script_path="$(make_script t39c.sh '#!/usr/bin/env bash
+exit 0')"
+  python3 "$SMOKE_REPO_ROOT/bridge-cron.py" native-create \
+    --jobs-file "$JOBS_FILE" \
+    --agent smoke-agent \
+    --schedule '* * * * *' \
+    --title shell-update-validate \
+    --kind shell \
+    --script "$script_path" \
+    --run-as-agent smoke-agent >/dev/null
+  job_id="$(python3 - "$JOBS_FILE" <<'PY'
+import json, sys
+jobs = json.load(open(sys.argv[1], encoding="utf-8"))["jobs"]
+print(next(job["id"] for job in jobs if job["name"] == "shell-update-validate"))
+PY
+)"
+  if bash "$SMOKE_REPO_ROOT/bridge-cron.sh" update "$job_id" --script /bin/true >/tmp/cron-shell-t39c-root.out 2>&1; then
+    smoke_fail "T39c expected root-owned script update rejection"
+  fi
+  out="$(cat /tmp/cron-shell-t39c-root.out)"
+  smoke_assert_contains "$out" "owner must be controller uid or run-as uid" "T39c root-owned script rejection reason"
+
+  chmod 0775 "$script_path"
+  if bash "$SMOKE_REPO_ROOT/bridge-cron.sh" update "$job_id" --schedule '*/5 * * * *' >/tmp/cron-shell-t39c-mode.out 2>&1; then
+    smoke_fail "T39c expected existing unsafe script revalidation rejection"
+  fi
+  out="$(cat /tmp/cron-shell-t39c-mode.out)"
+  smoke_assert_contains "$out" "must not be group/other writable" "T39c existing script mode rejection reason"
+}
+
+smoke_t39d_validation_failure_terminal() {
+  local script_path request status result out
+  script_path="$(make_script t39d.sh '#!/usr/bin/env bash
+exit 0')"
+  request="$(write_request t39d-run t39d-job "$script_path")"
+  chmod 0775 "$script_path"
+  if run_runner "$request" >/tmp/cron-shell-t39d.out 2>&1; then
+    smoke_fail "T39d expected script validation failure"
+  fi
+  out="$(cat /tmp/cron-shell-t39d.out)"
+  smoke_assert_not_contains "$out" "Traceback" "T39d no traceback"
+  status="${request%/*}/status.json"
+  result="${request%/*}/result.json"
+  smoke_assert_eq "error" "$(json_field "$status" state)" "T39d status error"
+  smoke_assert_contains "$(json_field "$status" runner_error)" "script_validation_failed:" "T39d status runner_error"
+  smoke_assert_eq "error" "$(json_field "$result" status)" "T39d result error"
+
+  script_path="$(make_script t39d-env.sh '#!/usr/bin/env bash
+exit 0')"
+  request="$(write_request t39d-env-run t39d-env-job "$script_path")"
+  python3 - "$request" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+data = json.load(open(path, encoding="utf-8"))
+data["payload"]["env"] = {"BRIDGE_HOME": "override"}
+with open(path, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, ensure_ascii=True, indent=2)
+    fh.write("\n")
+PY
+  if run_runner "$request" >/tmp/cron-shell-t39d-env.out 2>&1; then
+    smoke_fail "T39d expected protected env validation failure"
+  fi
+  out="$(cat /tmp/cron-shell-t39d-env.out)"
+  smoke_assert_not_contains "$out" "Traceback" "T39d env no traceback"
+  status="${request%/*}/status.json"
+  smoke_assert_contains "$(json_field "$status" runner_error)" "script_validation_failed:" "T39d env terminal runner_error"
+}
+
 smoke_run "T30 schema + update preservation" smoke_t30_schema_and_update
 smoke_run "T35 argv injection rejection" smoke_t35_reject_argv_injection
 smoke_run "T31 UID-drop access contract" smoke_t31_uid_drop_access_contract
@@ -317,5 +420,8 @@ smoke_run "T36 output cap" smoke_t36_output_cap
 smoke_run "T37 no Claude/Codex child" smoke_t37_no_model_child
 smoke_run "T38 lock contention is silent success" smoke_t38_lock_held_success
 smoke_run "T39 tamper rejection" smoke_t39_tamper_rejected
+smoke_run "T39b invalid JSON tamper writes terminal status" smoke_t39b_invalid_json_tamper_terminal
+smoke_run "T39c update revalidates shell script" smoke_t39c_update_revalidates_shell_script
+smoke_run "T39d validation failure writes terminal status" smoke_t39d_validation_failure_terminal
 
 smoke_log "all cron shell runner checks passed"

@@ -222,6 +222,40 @@ def validate_shell_request_artifacts(request_file: Path) -> tuple[bool, str | No
     return True, None
 
 
+def shell_artifact_route(request_file: Path) -> tuple[str, str | None]:
+    """Classify request artifacts before reading untrusted request JSON.
+
+    Shell jobs are dispatched with controller-private artifacts
+    (run_dir=0700, request.json=0600, no named/default ACL write exposure).
+    Group/other writable artifacts are treated as tampered before JSON parse.
+    Named/default ACL write exposure disqualifies the shell convention but is
+    only terminal once the parsed request actually declares a shell payload,
+    preserving legacy text runs that intentionally carry per-run ACL grants.
+    """
+    run_dir = request_file.parent
+    controller_uid = os.getuid()
+    states: list[tuple[Path, os.stat_result]] = []
+    for path in (run_dir, request_file):
+        try:
+            states.append((path, path.stat()))
+        except OSError as exc:
+            return "tampered", f"request_artifact_tampered: stat failed for {path}: {exc}"
+    acl_write_exposed = False
+    for path, st in states:
+        if st.st_uid != controller_uid:
+            return "tampered", f"request_artifact_tampered: owner uid mismatch for {path}"
+        if mode_has_group_or_other_write(path):
+            return "tampered", f"request_artifact_tampered: group/other writable mode on {path}"
+        if path_acl_has_write_exposure(path, include_default=path.is_dir()):
+            acl_write_exposed = True
+
+    run_mode = stat.S_IMODE(states[0][1].st_mode)
+    request_mode = stat.S_IMODE(states[1][1].st_mode)
+    if run_mode == 0o700 and request_mode == 0o600 and not acl_write_exposed:
+        return "shell", None
+    return "text", None
+
+
 def truncate_output(data: bytes, cap: int) -> tuple[str, bool]:
     if len(data) <= cap:
         return data.decode("utf-8", errors="replace"), False
@@ -375,6 +409,62 @@ def write_shell_result(
         payload["command"] = safe_command
         payload["command_pretty"] = " ".join(shlex.quote(part) for part in safe_command)
     write_json(result_file, payload)
+
+
+def is_shell_request_payload(request: dict[str, Any]) -> bool:
+    request_payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
+    return request.get("payload_kind") == "shell" or request_payload.get("kind") == "shell"
+
+
+def write_shell_terminal_error(
+    request_file: Path,
+    *,
+    runner_error: str,
+    summary: str | None = None,
+    run_id: str | None = None,
+    started_at: str | None = None,
+    audit_target_agent: str = "daemon",
+) -> None:
+    run_dir = request_file.parent
+    resolved_run_id = run_id or run_dir_id(run_dir)
+    result_file = (run_dir / "result.json").resolve()
+    status_file = (run_dir / "status.json").resolve()
+    stdout_log = (run_dir / "stdout.log").resolve()
+    stderr_log = (run_dir / "stderr.log").resolve()
+    completed_at = now_iso()
+    write_text(stdout_log, "")
+    write_text(stderr_log, (summary or runner_error) + "\n")
+    write_shell_result(
+        result_file,
+        run_id=resolved_run_id,
+        status="error",
+        summary=summary or runner_error,
+        request_file=request_file,
+        stdout_log=stdout_log,
+        stderr_log=stderr_log,
+        started_at=started_at,
+        completed_at=completed_at,
+        exit_code=1,
+        runner_error=runner_error,
+    )
+    write_shell_status(
+        status_file,
+        run_id=resolved_run_id,
+        state="error",
+        request_file=request_file,
+        result_file=result_file,
+        started_at=started_at,
+        completed_at=completed_at,
+        exit_code=1,
+        runner_error=runner_error,
+    )
+    emit_audit_row(
+        action="cron_shell_runner_error",
+        actor="cron-runner",
+        target_agent=audit_target_agent or "daemon",
+        run_id=resolved_run_id,
+        details={"runner_error": runner_error},
+    )
 
 
 def normalize_result(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1513,30 +1603,12 @@ def cmd_run_shell(request: dict[str, Any], request_file: Path, args: argparse.Na
     trusted, trust_error = validate_shell_request_artifacts(request_file)
     if not trusted:
         error_message = trust_error or "request_artifact_tampered"
-        completed_at = now_iso()
-        write_text(stdout_log, "")
-        write_text(stderr_log, error_message + "\n")
-        write_shell_result(
-            result_file,
-            run_id=run_id,
-            status="error",
+        write_shell_terminal_error(
+            request_file,
+            runner_error="request_artifact_tampered",
             summary=error_message,
-            request_file=request_file,
-            stdout_log=stdout_log,
-            stderr_log=stderr_log,
-            completed_at=completed_at,
-            exit_code=1,
-            runner_error="request_artifact_tampered",
-        )
-        write_shell_status(
-            status_file,
             run_id=run_id,
-            state="error",
-            request_file=request_file,
-            result_file=result_file,
-            completed_at=completed_at,
-            exit_code=1,
-            runner_error="request_artifact_tampered",
+            audit_target_agent=str(request.get("target_agent") or "daemon"),
         )
         print("status: error")
         print(f"run_id: {run_id}")
@@ -1544,52 +1616,67 @@ def cmd_run_shell(request: dict[str, Any], request_file: Path, args: argparse.Na
         print("runner_error: request_artifact_tampered")
         return 1
 
-    payload = request.get("payload") or {}
-    if not isinstance(payload, dict):
-        raise RuntimeError("shell request payload must be an object")
-    execution = request.get("execution") or {}
-    if not isinstance(execution, dict):
-        raise RuntimeError("shell request execution block must be an object")
-    script = str(payload.get("script") or "")
-    if not script:
-        raise RuntimeError("shell request missing payload.script")
-    script_path = Path(script).expanduser().resolve()
-    if not script_path.is_file() or not os.access(script_path, os.X_OK):
-        raise RuntimeError(f"shell script is not executable: {script_path}")
-    run_uid = int(execution.get("uid"))
-    script_stat = script_path.stat()
-    if script_stat.st_uid not in {os.getuid(), run_uid}:
-        raise RuntimeError(f"shell script owner must be controller uid or run-as uid: {script_path}")
-    if script_stat.st_mode & 0o022:
-        raise RuntimeError(f"shell script must not be group/other writable: {script_path}")
-    script_args = payload.get("args") or []
-    if not isinstance(script_args, list):
-        raise RuntimeError("payload.args must be an array")
-    argv = [str(item) for item in script_args]
-    timeout_seconds = int(payload.get("timeoutSeconds") or 900)
-    output_cap_bytes = int(payload.get("outputCapBytes") or 65536)
-    if timeout_seconds <= 0:
-        raise RuntimeError("payload.timeoutSeconds must be positive")
-    if output_cap_bytes <= 0:
-        raise RuntimeError("payload.outputCapBytes must be positive")
+    try:
+        payload = request.get("payload") or {}
+        if not isinstance(payload, dict):
+            raise RuntimeError("shell request payload must be an object")
+        execution = request.get("execution") or {}
+        if not isinstance(execution, dict):
+            raise RuntimeError("shell request execution block must be an object")
+        script = str(payload.get("script") or "")
+        if not script:
+            raise RuntimeError("shell request missing payload.script")
+        script_path = Path(script).expanduser().resolve()
+        if not script_path.is_file() or not os.access(script_path, os.X_OK):
+            raise RuntimeError(f"not regular/executable file: {script_path}")
+        run_uid = int(execution.get("uid"))
+        script_stat = script_path.stat()
+        if script_stat.st_uid not in {os.getuid(), run_uid}:
+            raise RuntimeError(f"shell script owner must be controller uid or run-as uid: {script_path}")
+        if script_stat.st_mode & 0o022:
+            raise RuntimeError(f"shell script must not be group/other writable: {script_path}")
+        script_args = payload.get("args") or []
+        if not isinstance(script_args, list):
+            raise RuntimeError("payload.args must be an array")
+        argv = [str(item) for item in script_args]
+        timeout_seconds = int(payload.get("timeoutSeconds") or 900)
+        output_cap_bytes = int(payload.get("outputCapBytes") or 65536)
+        if timeout_seconds <= 0:
+            raise RuntimeError("payload.timeoutSeconds must be positive")
+        if output_cap_bytes <= 0:
+            raise RuntimeError("payload.outputCapBytes must be positive")
 
-    env_snapshot = execution.get("env_snapshot") or {}
-    if not isinstance(env_snapshot, dict):
-        raise RuntimeError("execution.env_snapshot must be an object")
-    child_env = {str(key): str(value) for key, value in env_snapshot.items()}
-    child_env.update(shell_payload_env(payload))
-    child_env["HOME"] = str(execution.get("home") or child_env.get("HOME") or str(Path.home()))
-    child_env["CRON_RUN_ID"] = run_id
-    child_env["CRON_JOB_ID"] = str(request.get("job_id") or "")
-    child_env["CRON_JOB_NAME"] = str(request.get("job_name") or "")
-    child_env["CRON_SLOT"] = str(request.get("slot") or "")
-    child_env["CRON_REQUEST_FILE"] = str(request_file)
-    child_env["CRON_RUN_DIR"] = str(run_dir)
+        env_snapshot = execution.get("env_snapshot") or {}
+        if not isinstance(env_snapshot, dict):
+            raise RuntimeError("execution.env_snapshot must be an object")
+        child_env = {str(key): str(value) for key, value in env_snapshot.items()}
+        child_env.update(shell_payload_env(payload))
+        child_env["HOME"] = str(execution.get("home") or child_env.get("HOME") or str(Path.home()))
+        child_env["CRON_RUN_ID"] = run_id
+        child_env["CRON_JOB_ID"] = str(request.get("job_id") or "")
+        child_env["CRON_JOB_NAME"] = str(request.get("job_name") or "")
+        child_env["CRON_SLOT"] = str(request.get("slot") or "")
+        child_env["CRON_REQUEST_FILE"] = str(request_file)
+        child_env["CRON_RUN_DIR"] = str(run_dir)
 
-    command = shell_command_for_execution(execution, child_env, str(script_path), argv)
-    lock_dir = cron_state_dir_from_env(run_dir) / "locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_file = lock_dir / f"{str(request.get('job_id') or run_id)}.lock"
+        command = shell_command_for_execution(execution, child_env, str(script_path), argv)
+        lock_dir = cron_state_dir_from_env(run_dir) / "locks"
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_file = lock_dir / f"{str(request.get('job_id') or run_id)}.lock"
+    except Exception as exc:  # noqa: BLE001
+        error_message = f"script_validation_failed: {exc}"
+        write_shell_terminal_error(
+            request_file,
+            runner_error=error_message,
+            summary=error_message,
+            run_id=run_id,
+            audit_target_agent=str(request.get("target_agent") or "daemon"),
+        )
+        print("status: error")
+        print(f"run_id: {run_id}")
+        print("engine: shell")
+        print(f"runner_error: {error_message}")
+        return 1
 
     with lock_file.open("w", encoding="utf-8") as lock_handle:
         try:
@@ -1734,9 +1821,56 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"error: request file not found: {request_file}", file=sys.stderr)
         return 2
 
-    request = read_json(request_file)
-    request_payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
-    if request.get("payload_kind") == "shell" or request_payload.get("kind") == "shell":
+    route, route_error = shell_artifact_route(request_file)
+    if route == "tampered":
+        error_message = route_error or "request_artifact_tampered"
+        write_shell_terminal_error(
+            request_file,
+            runner_error="request_artifact_tampered",
+            summary=error_message,
+            run_id=run_dir_id(request_file.parent),
+        )
+        print("status: error")
+        print(f"run_id: {run_dir_id(request_file.parent)}")
+        print("engine: shell")
+        print("runner_error: request_artifact_tampered")
+        return 1
+
+    request: dict[str, Any]
+    if route == "shell":
+        try:
+            request = read_json(request_file)
+        except json.JSONDecodeError as exc:
+            error_message = f"request_artifact_corrupted: {exc}"
+            write_shell_terminal_error(
+                request_file,
+                runner_error="request_artifact_corrupted",
+                summary=error_message,
+                run_id=run_dir_id(request_file.parent),
+            )
+            print("status: error")
+            print(f"run_id: {run_dir_id(request_file.parent)}")
+            print("engine: shell")
+            print("runner_error: request_artifact_corrupted")
+            return 1
+    else:
+        request = read_json(request_file)
+
+    if is_shell_request_payload(request):
+        if route != "shell":
+            error_message = "request_artifact_tampered: shell request artifacts are not controller-private"
+            write_shell_terminal_error(
+                request_file,
+                runner_error="request_artifact_tampered",
+                summary=error_message,
+                run_id=str(request.get("run_id") or run_dir_id(request_file.parent)),
+                audit_target_agent=str(request.get("target_agent") or "daemon"),
+            )
+            print("status: error")
+            print(f"run_id: {str(request.get('run_id') or run_dir_id(request_file.parent))}")
+            print("engine: shell")
+            print("runner_error: request_artifact_tampered")
+            return 1
         return cmd_run_shell(request, request_file, args)
 
     engine = request.get("target_engine", "")
