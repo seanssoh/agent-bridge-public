@@ -351,6 +351,9 @@ bridge_write_idle_ready_agents() {
   local agent=""
   local session=""
   local engine=""
+  local retries_file=""
+  local retries=0
+  local max_retries="${BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS:-3}"
 
   : >"$file"
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
@@ -366,7 +369,41 @@ bridge_write_idle_ready_agents() {
           # Reuse the visual-prompt probe that bridge_dispatch_notification
           # already calls at dispatch time so the agent rejoins the ready
           # list as soon as its tmux pane is back at a Claude prompt.
-          bridge_claude_session_try_mark_prompt_ready "$agent" "$session" || continue
+          retries_file="$(bridge_agent_missing_marker_retries_file "$agent")"
+          if bridge_claude_session_try_mark_prompt_ready "$agent" "$session"; then
+            # Probe succeeded — marker now written, reset the retry counter.
+            rm -f "$retries_file"
+          else
+            # Issue #629: a single probe failure used to exclude the agent
+            # from the nudge list; if the probe kept failing across cycles
+            # (dialog overlay, copy-mode, post-429 stall), the agent went
+            # silent indefinitely (SYRS librarian observed 5h+ silent on
+            # 5/5). Persist a per-agent retry counter and, after
+            # max_retries consecutive failures, synthesize an idle-since
+            # marker so the dispatcher's normal nudge logic can take over.
+            # The synthetic marker is conservative: at worst one nudge
+            # lands on a non-ready pane (recoverable); indefinite silence
+            # is worse.
+            retries=0
+            if [[ -f "$retries_file" ]]; then
+              retries="$(cat "$retries_file" 2>/dev/null || printf '0')"
+              [[ "$retries" =~ ^[0-9]+$ ]] || retries=0
+            fi
+            retries=$((retries + 1))
+            if (( retries >= max_retries )); then
+              bridge_agent_mark_idle_now "$agent"
+              rm -f "$retries_file"
+              bridge_audit_log daemon nudge_marker_synthesized "$agent" \
+                --detail consecutive_probe_failures="$retries" \
+                --detail max_retries="$max_retries" \
+                --detail session="$session" 2>/dev/null || true
+              bridge_warn "missing idle-since marker for '$agent' after ${retries} probe failures; synthesized current-timestamp marker so nudge dispatch can resume (issue #629)"
+            else
+              mkdir -p "$(bridge_agent_idle_marker_dir "$agent")"
+              printf '%s\n' "$retries" >"$retries_file"
+              continue
+            fi
+          fi
         fi
         ;;
       codex)
