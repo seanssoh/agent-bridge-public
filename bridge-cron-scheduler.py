@@ -46,6 +46,14 @@ class DueRun:
     schedule_kind: str
     occurrence_at: datetime
     slot: str
+    # Issue #614: synthetic re-fire of a slot the runner previously deferred
+    # (e.g. #263 Track B memory pressure). The scheduler's global cursor was
+    # already advanced by the original natural slot, so this run must bypass
+    # `filter_due_runs_from_state`'s cursor check and must NOT re-advance the
+    # cursor on success. The slot string carries a `-deferred-retry-<ms>`
+    # suffix so the run_id (and the on-disk run_dir) cannot collide with the
+    # original deferred slot or with any natural occurrence.
+    is_deferred_retry: bool = False
 
 
 def classify_family(name: str) -> str:
@@ -368,6 +376,83 @@ def enumerate_due_runs(
     return due_runs, dict(counters)
 
 
+def enumerate_pending_deferred_retries(
+    jobs: list[dict[str, Any]],
+    now_dt: datetime,
+) -> tuple[list[DueRun], dict[str, int]]:
+    """Issue #614: emit synthetic DueRuns for slots the runner previously
+    deferred and whose `state.nextRunAtMs` has now elapsed.
+
+    The runner's #263 Track B memory-pressure path writes
+    ``state.lastStatus="deferred"`` and ``state.nextRunAtMs=now+deferred_seconds*1000``
+    to defer a slot. The scheduler's natural enumeration ignores
+    ``nextRunAtMs`` (it only walks cron expressions), and the global cursor
+    has already advanced past the original occurrence — so without this
+    sibling pass the deferred slot is silently lost on the next tick. High-
+    frequency cron (every-15min) recovers via the next natural slot, but
+    daily/weekly/monthly cron permanently loses the slot. Operator
+    confirmed real losses on 2026-05-02 and 2026-05-03 morning-briefing
+    runs.
+
+    Synthetic runs carry ``is_deferred_retry=True`` so
+    ``filter_due_runs_from_state`` skips the cursor comparison and so
+    ``cmd_sync`` does not re-advance the cursor on the synthetic run.
+    """
+    retries: list[DueRun] = []
+    counters = Counter()
+    now_ms = int(now_dt.timestamp() * 1000)
+
+    for job in jobs:
+        if not job_enabled(job):
+            continue
+        if not job_is_schedulable(job):
+            continue
+
+        state = job.get("state") or {}
+        last_status = str(state.get("lastStatus") or state.get("lastRunStatus") or "")
+        if last_status != "deferred":
+            continue
+
+        try:
+            next_run_at_ms = int(state.get("nextRunAtMs") or 0)
+        except (TypeError, ValueError):
+            continue
+        if next_run_at_ms <= 0 or next_run_at_ms > now_ms:
+            counters["deferred_pending"] += 1
+            continue
+
+        retry_dt = datetime.fromtimestamp(next_run_at_ms / 1000, tz=timezone.utc).astimezone(LOCAL_TZ)
+        family = classify_family(job.get("name", ""))
+        natural_slot = derive_slot(family, retry_dt, job)
+        # Slot uniqueness driver: the runner's bridge-cron.sh derives the
+        # on-disk run_dir from `<job-slug>--<safe(slot)>`. The
+        # `-deferred-retry-<ms>` suffix guarantees the run_dir cannot
+        # collide with the original (deferred) run or any natural
+        # occurrence. `bridge_cron_safe_component` only collapses
+        # non-[A-Za-z0-9._-] runs to '-', so the digits + ASCII suffix
+        # survive intact.
+        retry_slot = f"{natural_slot}-deferred-retry-{next_run_at_ms}"
+        schedule = job.get("schedule") or {}
+        kind = schedule.get("kind") or ""
+
+        retries.append(
+            DueRun(
+                job_id=job.get("id", ""),
+                job_name=job.get("name", "<unnamed>"),
+                family=family,
+                source_agent=job.get("agentId") or job.get("agent") or "<unknown>",
+                schedule_kind=kind,
+                occurrence_at=retry_dt,
+                slot=retry_slot,
+                is_deferred_retry=True,
+            )
+        )
+        counters["deferred_retries"] += 1
+
+    retries.sort(key=lambda item: (item.occurrence_at, item.source_agent, item.job_name, item.slot))
+    return retries, dict(counters)
+
+
 def due_run_sort_key(run: DueRun) -> tuple[datetime, str, str, str, str]:
     return (
         run.occurrence_at,
@@ -396,7 +481,14 @@ def filter_due_runs_from_state(due_runs: list[DueRun], state: dict[str, Any]) ->
     checkpoint = state_sort_key(state)
     if checkpoint is None:
         return due_runs
-    return [run for run in due_runs if due_run_sort_key(run) > checkpoint]
+    # Issue #614: synthetic deferred-retry runs carry their own uniqueness
+    # in the slot suffix and target a slot whose original occurrence has
+    # already advanced the cursor. They must bypass the cursor comparison
+    # (otherwise they would always be filtered out).
+    return [
+        run for run in due_runs
+        if run.is_deferred_retry or due_run_sort_key(run) > checkpoint
+    ]
 
 
 def state_key_for_run(run: DueRun) -> dict[str, str]:
@@ -540,6 +632,8 @@ def print_human_summary(
     print(f"due_occurrences: {counters.get('due_occurrences', 0)}")
     print(f"truncated_jobs: {counters.get('truncated_jobs', 0)}")
     print(f"truncated_occurrences: {counters.get('truncated_occurrences', 0)}")
+    print(f"deferred_retries: {counters.get('deferred_retries', 0)}")
+    print(f"deferred_pending: {counters.get('deferred_pending', 0)}")
     print(f"created: {result_counts.get(STATUS_CREATED, 0)}")
     print(f"dry_run_items: {result_counts.get('dry_run', 0)}")
     print(f"already_enqueued: {result_counts.get(STATUS_ALREADY, 0)}")
@@ -570,6 +664,21 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
     jobs = load_jobs(jobs_file)
     due_runs, counters = enumerate_due_runs(jobs, start_dt, now_dt, args.max_occurrences_per_job)
+    # Issue #614: a sibling enumeration pass picks up slots the runner
+    # previously deferred (state.lastStatus=="deferred") whose
+    # state.nextRunAtMs has elapsed. These synthetic runs are merged with
+    # the natural pass and processed by occurrence_at order; they bypass
+    # the cursor filter (which would otherwise drop them, since the
+    # original natural slot already advanced last_sync_at) and they do
+    # NOT re-advance the cursor on success.
+    deferred_retries, retry_counters = enumerate_pending_deferred_retries(jobs, now_dt)
+    if deferred_retries:
+        due_runs = sorted(
+            list(due_runs) + list(deferred_retries),
+            key=lambda item: (item.occurrence_at, item.source_agent, item.job_name, item.slot),
+        )
+    for key, value in retry_counters.items():
+        counters[key] = counters.get(key, 0) + value
     due_runs = filter_due_runs_from_state(due_runs, state)
     counters["due_occurrences"] = len(due_runs)
 
@@ -585,7 +694,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
             failures += 1
             saw_failure = True
             continue
-        if not args.dry_run and not saw_failure:
+        # Issue #614: synthetic deferred-retry runs target a slot the cursor
+        # already passed. Advancing the cursor to their occurrence_at would
+        # rewind the cursor relative to the natural slot's checkpoint, so
+        # skip the per-iteration cursor write for synthetic runs. The
+        # success-side state reset for the underlying job (nextRunAtMs=0,
+        # lastStatus="success") still happens via finalize-run in
+        # bridge-cron.py:2107-2111 once the runner reports success.
+        if not args.dry_run and not saw_failure and not run.is_deferred_retry:
             last_safe_run = run
             write_json(
                 state_file,
@@ -737,7 +853,114 @@ def _self_test_581() -> int:
     return 0
 
 
+def _self_test_614() -> int:
+    """Issue #614 regression: deferred-retry sibling enumeration must re-fire
+    a slot whose ``state.nextRunAtMs`` has elapsed, must bypass the
+    `filter_due_runs_from_state` cursor check, and must NOT regress the
+    natural-slot cursor advance for non-deferred jobs.
+    """
+    tz = timezone(timedelta(hours=9))
+    iso = lambda dt: dt.isoformat(timespec="milliseconds")  # noqa: E731
+
+    # Daily morning-briefing (matches the live-loss family). state declares
+    # the runner deferred 06:00 to 06:15; now is 06:20 local.
+    now_dt = datetime(2026, 5, 6, 6, 20, 0, tzinfo=tz)
+    deferred_at_dt = datetime(2026, 5, 6, 6, 0, 0, tzinfo=tz)
+    next_run_at_ms = int(datetime(2026, 5, 6, 6, 15, 0, tzinfo=tz).timestamp() * 1000)
+    job_daily = {
+        "id": "daily-job-id",
+        "name": "morning-briefing",
+        "agentId": "operator",
+        "enabled": True,
+        "schedule": {"kind": "cron", "expr": "0 6 * * *", "tz": "Asia/Seoul"},
+        "state": {
+            "lastStatus": "deferred",
+            "lastRunAtMs": int(deferred_at_dt.timestamp() * 1000),
+            "nextRunAtMs": next_run_at_ms,
+        },
+    }
+    # (a) The sibling enumeration emits exactly one synthetic DueRun for
+    #     the elapsed deferred slot.
+    retries_a, counters_a = enumerate_pending_deferred_retries([job_daily], now_dt)
+    assert len(retries_a) == 1, f"(a) expected 1 retry, got {retries_a}"
+    retry_a = retries_a[0]
+    assert retry_a.is_deferred_retry, "(a) synthetic run must carry is_deferred_retry=True"
+    assert retry_a.slot.endswith(f"-deferred-retry-{next_run_at_ms}"), \
+        f"(a) slot suffix missing: {retry_a.slot}"
+    assert counters_a.get("deferred_retries") == 1, f"(a) counter not bumped: {counters_a}"
+
+    # (b) Cursor bypass: state.last_sync_key is set to the original 06:00
+    #     natural slot (cursor advanced past it at original enqueue time).
+    #     filter_due_runs_from_state must KEEP the synthetic retry despite
+    #     the synthetic run sorting equal/earlier than the cursor key.
+    family = classify_family(job_daily["name"])
+    original_slot = derive_slot(family, deferred_at_dt, job_daily)
+    state_with_cursor = {
+        "last_sync_at": iso(deferred_at_dt),
+        "last_sync_key": {
+            "agent": "operator",
+            "job_name": "morning-briefing",
+            "slot": original_slot,
+            "job_id": "daily-job-id",
+        },
+    }
+    filtered_b = filter_due_runs_from_state(retries_a, state_with_cursor)
+    assert filtered_b == retries_a, "(b) cursor filter must not drop deferred-retry runs"
+
+    # (c) Pending-but-not-yet-elapsed nextRunAtMs is NOT emitted (still
+    #     waiting for the deferral window). Natural cron must not synth
+    #     before time.
+    job_pending = dict(job_daily)
+    job_pending["state"] = dict(job_daily["state"])
+    job_pending["state"]["nextRunAtMs"] = int((now_dt + timedelta(minutes=5)).timestamp() * 1000)
+    retries_c, counters_c = enumerate_pending_deferred_retries([job_pending], now_dt)
+    assert retries_c == [], f"(c) future nextRunAtMs must not emit: {retries_c}"
+    assert counters_c.get("deferred_pending") == 1, f"(c) pending counter not bumped: {counters_c}"
+
+    # (d) lastStatus != "deferred" never emits, even with nextRunAtMs set
+    #     (defensive: paranoia against a future regression that leaves
+    #     a stale nextRunAtMs after a non-deferred state).
+    job_success = dict(job_daily)
+    job_success["state"] = dict(job_daily["state"])
+    job_success["state"]["lastStatus"] = "success"
+    retries_d, _ = enumerate_pending_deferred_retries([job_success], now_dt)
+    assert retries_d == [], f"(d) non-deferred lastStatus must not emit: {retries_d}"
+
+    # (e) High-frequency cron regression check: an every-15min job whose
+    #     last natural slot succeeded must NOT be picked up by the sibling
+    #     pass (state.lastStatus="success" + state.nextRunAtMs=0 from the
+    #     bridge-cron.py:2108 success reset). The natural enumeration
+    #     pathway is unchanged for this case.
+    job_high_freq = {
+        "id": "freq-job-id",
+        "name": "wiki-hub-audit",
+        "agentId": "operator",
+        "enabled": True,
+        "schedule": {"kind": "cron", "expr": "*/15 * * * *", "tz": "Asia/Seoul"},
+        "state": {"lastStatus": "success", "nextRunAtMs": 0},
+    }
+    retries_e, _ = enumerate_pending_deferred_retries([job_high_freq], now_dt)
+    assert retries_e == [], f"(e) success-state high-freq job must not emit: {retries_e}"
+
+    # (f) Slot uniqueness vs. natural occurrences in the same job_id: the
+    #     synthetic slot's `-deferred-retry-<ms>` suffix must NOT compare
+    #     equal to any natural cron slot string for the same job. (We only
+    #     need one inequality check; the suffix guarantees uniqueness for
+    #     all natural slots since `derive_slot` never emits that token.)
+    natural_now_slot = derive_slot(family, now_dt, job_daily)
+    assert retry_a.slot != natural_now_slot, \
+        "(f) synthetic slot must not collide with any natural slot for the same job"
+    assert "-deferred-retry-" in retry_a.slot, \
+        "(f) synthetic slot must carry the deferred-retry token"
+
+    print("self-test #614: OK")
+    return 0
+
+
 if __name__ == "__main__":
     if len(sys.argv) == 2 and sys.argv[1] == "--self-test":
-        raise SystemExit(_self_test_581())
+        rc = _self_test_581()
+        if rc == 0:
+            rc = _self_test_614()
+        raise SystemExit(rc)
     raise SystemExit(main())
