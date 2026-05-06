@@ -780,6 +780,11 @@ bridge_export_env_prefix() {
     BRIDGE_DISCORD_RELAY_COOLDOWN_SECONDS
     BRIDGE_CODEX_TASK_MODE_POLICY
     BRIDGE_CODEX_OUTPUT_SHAPE_ENFORCE
+    # v0.8.0 T5: rollback hatch must propagate from the controller env
+    # into the per-agent SESSION_CMD child so bridge-run.sh sees the
+    # same value the daemon does (otherwise the wrap-skip logic would
+    # fire only at start time, not on subsequent runtime restarts).
+    BRIDGE_DISABLE_ISOLATION
   )
 
   for name in "${names[@]}"; do

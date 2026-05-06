@@ -1095,8 +1095,16 @@ bridge_agent_records_tsv() {
 emit_agent_records_json() {
   local mode="$1"
   local tsv="$2"
+  # v0.8.0 T5: snapshot the runtime isolation state once per emit (it
+  # is a controller-process-wide value, not per-agent) and pass it as a
+  # third argv so every JSON record carries the same string. The
+  # alternative — adding a TSV column — would touch the schema in 4
+  # places (header, row builder, local-var declaration, JSON
+  # conversion) for a value that is identical across all rows.
+  local runtime_state
+  runtime_state="$(bridge_isolation_runtime_state)"
 
-  bridge_agent_manage_python "$mode" "$tsv" <<'PY'
+  bridge_agent_manage_python "$mode" "$tsv" "$runtime_state" <<'PY'
 import csv
 import io
 import json
@@ -1104,6 +1112,7 @@ import sys
 
 mode = sys.argv[1]
 rows = list(csv.DictReader(io.StringIO(sys.argv[2]), delimiter="\t"))
+runtime_state = sys.argv[3] if len(sys.argv) > 3 else ""
 bool_fields = {"active", "profile_source", "always_on", "admin"}
 int_fields = {"loop", "continue", "idle_timeout", "queue_queued", "queue_claimed", "queue_blocked"}
 
@@ -1152,6 +1161,7 @@ def convert_row(row: dict) -> dict:
         "isolation": {
             "mode": converted["isolation_mode"],
             "os_user": converted["os_user"],
+            "runtime_state": runtime_state,
         },
         "queue": {
             "queued": converted["queue_queued"],
@@ -1205,6 +1215,14 @@ for item in items:
     mode = isolation.get("mode") or "shared"
     os_user = isolation.get("os_user") or ""
     iso_text = f"{mode}:{os_user}" if os_user else mode
+    # v0.8.0 T5: when the runtime hatch is on, override the iso column
+    # so a glance at `agent-bridge agent list` makes it obvious the
+    # boundary is off across the whole controller. The configured
+    # isolation_mode stays available in the JSON form and in `agent
+    # show` for operators who want both fields.
+    runtime_state = isolation.get("runtime_state") or ""
+    if runtime_state == "disabled-by-env":
+        iso_text = "disabled-by-env"
     queue = item.get("queue", {}) or {}
     notify = item.get("notify", {}) or {}
     channels = item.get("channels", {}) or {}
@@ -1418,6 +1436,13 @@ PY
     printf 'channels: %s\n' "${channels:--}"
     printf 'discord_channel_id: %s\n' "${discord_channel_id:--}"
     printf 'isolation_mode: %s\n' "${isolation_mode:--}"
+    # v0.8.0 T5: surface the runtime isolation state alongside the
+    # configured isolation_mode. `disabled-by-env` indicates that
+    # `BRIDGE_DISABLE_ISOLATION=1` is in the controller environment and
+    # the v2 wraps are short-circuited; `v2-active` is the normal
+    # post-migration state. Field is additive — existing parsers ignore
+    # unknown keys.
+    printf 'isolation: %s\n' "$(bridge_isolation_runtime_state)"
     printf 'os_user: %s\n' "${os_user:--}"
     printf 'queue: queued=%s claimed=%s blocked=%s\n' "$queue_queued" "$queue_claimed" "$queue_blocked"
     printf 'actions: %s\n' "$actions"
