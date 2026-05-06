@@ -167,6 +167,22 @@ bridge_resolve_layout() {
   # exports BRIDGE_LAYOUT/BRIDGE_DATA_ROOT when a valid marker is read. We
   # detect that here by comparing the env state to the pre-resolver snapshot.
 
+  # T3 bypass: `agent-bridge upgrade --apply` from a v0.7.x install must be
+  # able to source the v0.8.0 lib stack to reach the migration tool, but
+  # the install is by definition still markerless at that point. Without
+  # this bypass the resolver would fail-fast before the migration ever
+  # runs (T1 ↔ T3 chicken-and-egg). The bypass is opt-in via env var,
+  # never via marker, so a stale runtime cannot accidentally enter the
+  # deferred state. Caller (bridge-upgrade.sh) is responsible for
+  # invoking the migration tool itself; once the migration writes the v2
+  # marker, subsequent boots take the normal `marker` source branch and
+  # this bypass becomes a no-op.
+  if [[ "${BRIDGE_LAYOUT_RESOLVER_BYPASS:-}" == "upgrade-migrate" ]]; then
+    BRIDGE_LAYOUT_SOURCE="upgrade-migrate-deferred"
+    BRIDGE_DEFAULT_DATA_ROOT="${BRIDGE_HOME:-$HOME/.agent-bridge}/data"
+    return 0
+  fi
+
   local marker_path
   marker_path="$(bridge_isolation_v2_marker_path)"
 

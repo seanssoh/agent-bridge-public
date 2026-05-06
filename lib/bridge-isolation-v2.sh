@@ -398,10 +398,85 @@ bridge_isolation_v2_agent_group_name() {
 # ---------------------------------------------------------------------------
 
 bridge_isolation_v2_group_exists() {
-  # Returns 0 if the named group exists in nss. Works without root.
+  # Returns 0 if the named group exists. Works without root. Dispatches by
+  # `uname` so macOS (no getent) uses dscl. The Darwin path probes
+  # /Local/Default first; OD-bound directories (corp LDAP) would also
+  # need a `dscl /Search` fallback but that is not in the v0.8.0 scope.
   local name="$1"
   [[ -n "$name" ]] || return 1
+  if [[ "$(uname)" == "Darwin" ]]; then
+    bridge_isolation_v2_darwin_group_exists "$name"
+    return $?
+  fi
   getent group "$name" >/dev/null 2>&1
+}
+
+bridge_isolation_v2_darwin_group_exists() {
+  local name="$1"
+  [[ -n "$name" ]] || return 1
+  dscl . -read "/Groups/$name" PrimaryGroupID >/dev/null 2>&1
+}
+
+bridge_isolation_v2_darwin_group_gid() {
+  local name="$1"
+  [[ -n "$name" ]] || return 1
+  dscl . -read "/Groups/$name" PrimaryGroupID 2>/dev/null \
+    | awk '/^PrimaryGroupID:/ {print $2}'
+}
+
+bridge_isolation_v2_darwin_ensure_group() {
+  # Idempotent group create on macOS via `dseditgroup`. `-o create -r
+  # <real-name>` requires admin; we try direct first then sudo -n. The
+  # `-r` value is the human-readable RealName attribute — the spec
+  # suggests "Agent Bridge agent <n>" so DS browsers show provenance.
+  local name="$1"
+  local realname="${2:-Agent Bridge group $name}"
+  [[ -n "$name" ]] || {
+    bridge_warn "darwin_ensure_group: name required"
+    return 1
+  }
+  if bridge_isolation_v2_darwin_group_exists "$name"; then
+    return 0
+  fi
+  if dseditgroup -o create -r "$realname" -t group "$name" 2>/dev/null; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    if sudo -n dseditgroup -o create -r "$realname" -t group "$name" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  bridge_warn "darwin_ensure_group: cannot create '$name' (need admin or passwordless sudo)"
+  return 1
+}
+
+bridge_isolation_v2_darwin_ensure_user_in_group() {
+  # Idempotent supplementary membership add on macOS via `dseditgroup
+  # edit -a <user> -t user <group>`. Like Linux, already-running shells
+  # do NOT pick up the new membership — operators must re-login or
+  # caller must restart the relevant process trees.
+  local user="$1"
+  local group="$2"
+  [[ -n "$user" && -n "$group" ]] || {
+    bridge_warn "darwin_ensure_user_in_group: user and group required"
+    return 1
+  }
+  # Check membership via `dseditgroup -o checkmember`. Returns 0 with
+  # "yes <user> is a member of <group>" on stdout when present.
+  if dseditgroup -o checkmember -m "$user" "$group" 2>/dev/null \
+      | grep -q '^yes'; then
+    return 0
+  fi
+  if dseditgroup -o edit -a "$user" -t user "$group" 2>/dev/null; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    if sudo -n dseditgroup -o edit -a "$user" -t user "$group" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  bridge_warn "darwin_ensure_user_in_group: cannot add '$user' to '$group' (need admin or passwordless sudo)"
+  return 1
 }
 
 bridge_isolation_v2_user_in_group() {
@@ -416,8 +491,10 @@ bridge_isolation_v2_user_in_group() {
 }
 
 bridge_isolation_v2_ensure_group() {
-  # Idempotent: create the group if it does not exist. Requires root or
-  # passwordless `sudo groupadd`. Returns 0 on success or pre-existing.
+  # Idempotent: create the group if it does not exist. On Linux requires
+  # root or passwordless `sudo groupadd`; on macOS requires admin or
+  # passwordless `sudo dseditgroup` (handled by darwin helper). Returns
+  # 0 on success or pre-existing.
   local name="$1"
   [[ -n "$name" ]] || {
     bridge_warn "bridge_isolation_v2_ensure_group: name required"
@@ -425,6 +502,10 @@ bridge_isolation_v2_ensure_group() {
   }
   if bridge_isolation_v2_group_exists "$name"; then
     return 0
+  fi
+  if [[ "$(uname)" == "Darwin" ]]; then
+    bridge_isolation_v2_darwin_ensure_group "$name"
+    return $?
   fi
   # groupadd -r returns 9 when the group already exists. The pre-check
   # above covers the common case but a TOCTOU window between
@@ -451,8 +532,11 @@ bridge_isolation_v2_ensure_group() {
 bridge_isolation_v2_ensure_user_in_group() {
   # Idempotent: add user to group as a supplementary member if not
   # already present. WARNING: already-running shells/daemons do NOT
-  # pick up new supplementary groups. Caller must restart the relevant
-  # process trees for the new membership to take effect.
+  # pick up new supplementary groups. On macOS the supplementary group
+  # cache is per-login, so changes only take effect after the affected
+  # user re-logins (handled by the migration tool's
+  # migration_requires_relogin flag). Caller must restart the relevant
+  # process trees on Linux.
   local user="$1"
   local group="$2"
   [[ -n "$user" && -n "$group" ]] || {
@@ -461,6 +545,10 @@ bridge_isolation_v2_ensure_user_in_group() {
   }
   if bridge_isolation_v2_user_in_group "$user" "$group"; then
     return 0
+  fi
+  if [[ "$(uname)" == "Darwin" ]]; then
+    bridge_isolation_v2_darwin_ensure_user_in_group "$user" "$group"
+    return $?
   fi
   if [[ "$(id -u)" -eq 0 ]]; then
     usermod -aG "$group" "$user"
@@ -547,6 +635,61 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type f -exec chgrp "$group" {} + || return 1
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type d -exec chmod "$dir_mode" {} + || return 1
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type f -exec chmod "$file_mode" {} + || return 1
+}
+
+# ---------------------------------------------------------------------------
+# 4b. ACL scrub — strip pre-v2 ACL entries before the chmod pass
+# ---------------------------------------------------------------------------
+
+bridge_isolation_v2_acl_scrub() {
+  # Recursively remove every named ACL entry on the tree. Required by the
+  # migration tool: pre-v2 (v1) installs left ACLs on agent paths that
+  # would override v2 group permissions in a way the operator can not
+  # see from `ls -l`. Linux uses `setfacl -bR`; macOS has no `setfacl`,
+  # so `chmod -R -P -N` (`-P` = no-symlink-follow, `-N` = remove ACL).
+  # Best-effort: a tree that has no ACLs is a no-op on both platforms.
+  local root="$1"
+  [[ -n "$root" ]] || {
+    bridge_warn "acl_scrub: root required"
+    return 1
+  }
+  [[ -d "$root" ]] || return 0
+  if [[ "$(uname)" == "Darwin" ]]; then
+    _bridge_isolation_v2_run_root_or_sudo \
+      chmod -R -P -N "$root" 2>/dev/null || true
+    return 0
+  fi
+  if command -v setfacl >/dev/null 2>&1; then
+    _bridge_isolation_v2_run_root_or_sudo \
+      setfacl -bR "$root" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# 4c. privilege preflight — used by migration / upgrade callers
+# ---------------------------------------------------------------------------
+
+bridge_isolation_v2_privilege_preflight() {
+  # Returns 0 when the caller has sufficient privilege to run the group
+  # / membership / chmod mutations. Returns non-zero with bridge_warn
+  # describing the missing capability — caller composes the
+  # bridge_die remediation and decides whether to abort or skip.
+  #
+  # Linux: need root or passwordless sudo (groupadd / usermod / chmod
+  # passes go through `_bridge_isolation_v2_run_root_or_sudo`).
+  # Darwin: need passwordless sudo for `dseditgroup -o create/edit`
+  # (admin members can technically run dseditgroup direct, but the
+  # group-create path almost always needs sudo because system-managed
+  # group ranges are protected).
+  if [[ "$(id -u)" -eq 0 ]]; then
+    return 0
+  fi
+  if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    return 0
+  fi
+  bridge_warn "isolation-v2 migration requires root or passwordless sudo (current uid=$(id -u))"
+  return 1
 }
 
 # ---------------------------------------------------------------------------

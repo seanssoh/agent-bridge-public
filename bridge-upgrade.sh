@@ -4,6 +4,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# v0.8.0 T3 — the layout resolver fails fast on markerless / legacy
+# installs. The upgrader is the migration vehicle for those installs,
+# so we MUST be able to source the v0.8.0 lib stack against a v0.7.x
+# target. Set the resolver bypass before sourcing bridge-lib.sh; the
+# migration call below clears it once the v2 marker has been written.
+# Operators never set this directly — it's an internal upgrader handshake.
+export BRIDGE_LAYOUT_RESOLVER_BYPASS="${BRIDGE_LAYOUT_RESOLVER_BYPASS:-upgrade-migrate}"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 # shellcheck source=lib/bridge-cleanup.sh
@@ -1170,6 +1177,43 @@ if [[ $DRY_RUN -eq 0 ]]; then
   if [[ $_reconcile_rc -ne 0 ]]; then
     RECONCILE_JSON='{"mode":"upgrade-conflicts-reconcile","error":"reconcile failed","archived_count":0}'
   fi
+fi
+
+# v0.8.0 T3 — isolation-v2 migration. Runs between reconcile and apply-live
+# so any markerless v0.7.x install is migrated forward as part of the
+# standard upgrade path. Skipped on dry-run; idempotent (skipped when
+# the v2 marker is already present + valid). Failure aborts the upgrade
+# before apply-live touches the install — the `no_v080_code_installed=yes`
+# remediation hint tells the operator they can safely retry.
+ISOLATION_V2_MIGRATION_JSON='{"mode":"isolation-v2-migrate","skipped":true,"reason":"dry-run"}'
+if [[ $DRY_RUN -eq 0 ]]; then
+  # Source the migration tool from the SOURCE checkout. bridge-lib.sh has
+  # already loaded bridge-isolation-v2.sh, so the helpers used by the
+  # migration tool (group / membership / chgrp / acl-scrub) are
+  # available. We source under the upgrade-migrate bypass so the v2
+  # resolver did not fail-fast on a markerless target.
+  # shellcheck source=lib/bridge-isolation-v2-migrate.sh
+  source "$SOURCE_ROOT/lib/bridge-isolation-v2-migrate.sh"
+  set +e
+  ISOLATION_V2_MIGRATION_JSON="$(BRIDGE_LAYOUT_RESOLVER_BYPASS=upgrade-migrate \
+    bridge_isolation_v2_migrate_apply_for_upgrade \
+    --target-root "$TARGET_ROOT" --json 2>&1)"
+  _migrate_rc=$?
+  set -e
+  if [[ $_migrate_rc -ne 0 ]]; then
+    bridge_die "isolation-v2 migration failed during upgrade
+  rc=${_migrate_rc}
+  detail: ${ISOLATION_V2_MIGRATION_JSON}
+  remediation: see ${TARGET_ROOT}/state/migration/isolation-v2/last-error.json
+  no_v080_code_installed=yes  (apply-live did NOT run; safe to retry after fix)"
+  fi
+  # Migration succeeded — the v2 marker is now on disk. Drop the resolver
+  # bypass so any subprocesses spawned by the rest of the upgrade flow
+  # (apply-live, daemon restart, agent restart) take the normal `marker`
+  # source path. Leaving the bypass set would re-enter the deferred
+  # state and BRIDGE_LAYOUT would stay empty, which downstream v2
+  # helpers treat as legacy.
+  unset BRIDGE_LAYOUT_RESOLVER_BYPASS
 fi
 
 apply_args=(apply-live --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT" --run-id "$UPGRADE_RUN_ID")
