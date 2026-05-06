@@ -349,3 +349,8 @@ bridge_source_module "bridge-wave.sh"
 # Sourced last because it consumes helpers from bridge-agents.sh and
 # bridge-core.sh (`bridge_admin_agent_id`, `bridge_require_python`).
 bridge_source_module "bridge-agent-update.sh"
+# bridge-agent-doctor.sh is the CRUD self-check for the typed-write
+# surface (issue #580 Track 2). Sourced after bridge-agent-update.sh
+# because the doctor exercises every documented admin-CRUD verb and
+# relies on the same bridge_die / bridge_require_python helpers.
+bridge_source_module "bridge-agent-doctor.sh"

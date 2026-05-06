@@ -309,6 +309,65 @@ the defaults above. Set `BRIDGE_AGENT_PERMISSION_MODE["agent"]="legacy"`
 to explicitly pin the historical blanket-bypass shape (e.g. for sandboxed
 offline roles).
 
+## Admin agent CRUD policy
+
+Admin agents (the role configured as `BRIDGE_ADMIN_AGENT_ID`) operate on
+managed roles **exclusively** through the typed
+`agent-bridge agent <verb>` surface:
+
+```
+agent-bridge agent create   <name> [...]   # scaffold + write managed block
+agent-bridge agent update   <name> [...]   # typed full-replace mutations
+agent-bridge agent delete   <name> [...]   # admin-audited removal (#580 Track 1)
+agent-bridge agent retire   <name> [...]   # quarantine for dynamic / orphan only
+agent-bridge agent doctor                  # CRUD self-check (#580 Track 2)
+```
+
+Direct `Edit` / `Write` against `agent-roster.local.sh` is intentionally
+blocked by `hooks/tool-policy.py` even when the caller is the admin
+agent. The block is not a sandbox — it is the audit-chain contract. The
+typed verbs above:
+
+- emit a `system_config_mutation` row to `audit.jsonl` for every apply,
+  deny, or dry-run (see `lib/bridge-agent-update.sh:bridge_agent_update_emit_audit`),
+- enforce the operator-trusted-source check (TTY-detected or
+  `BRIDGE_CALLER_SOURCE` override) before mutating,
+- round-trip every non-touched field byte-for-byte through
+  `bridge_write_role_block` so the BEGIN/END managed-block shape is
+  stable across releases.
+
+A hand-edit that bypasses these gates will be reverted by the daemon's
+next reconciliation pass. If the typed surface lacks a flag for a field
+you need to mutate, file an issue rather than reaching around — the gap
+is bug, not policy.
+
+`agent-bridge agent doctor` exists specifically to verify this surface
+end-to-end. It scaffolds an ephemeral `smoke-doctor-*` fixture, runs
+create / update / registry / show / reclassify / retire / delete in
+sequence, and reports each step as `pass` / `fail` / `n/a` (the latter
+when the path is structurally inapplicable to the fixture, e.g. retire
+on a static-roster row). The fixture is removed on exit even if the
+self-check fails. Run it after every install upgrade and after any
+local change to the admin-CRUD code paths.
+
+Update flags currently exposed on `agent update`:
+
+| flag | field | issue |
+|---|---|---|
+| `--set-launch-cmd`, `--launch-cmd-add-env`, `--launch-cmd-remove-env`, `--launch-cmd-add-dev-channel`, `--launch-cmd-remove-dev-channel` | `BRIDGE_AGENT_LAUNCH_CMD` | #528 |
+| `--channels-set`, `--channels-add`, `--channels-remove` | `BRIDGE_AGENT_CHANNELS` | #528 |
+| `--desc <text>` | `BRIDGE_AGENT_DESC` | #580 Track 2 |
+| `--engine claude\|codex` | `BRIDGE_AGENT_ENGINE` | #580 Track 2 |
+| `--workdir <path>` | `BRIDGE_AGENT_WORKDIR` | #580 Track 2 |
+| `--loop on\|off` | `BRIDGE_AGENT_LOOP` | #580 Track 2 |
+| `--continue on\|off` | `BRIDGE_AGENT_CONTINUE` | #580 Track 2 |
+| `--class user\|system` | `BRIDGE_AGENT_CLASS` (privilege boundary, #539) | #580 Track 2 |
+
+`--class` follows the closed value space `{user, system}` enforced by
+`bridge_validate_agent_classes` at roster load. Operator-named classes
+("operator", "isolated", etc.) are not part of the privilege boundary
+and are refused at parse time.
+
 ## Worktree Workers
 
 When multiple agents may edit the same git repository, prefer isolated managed
