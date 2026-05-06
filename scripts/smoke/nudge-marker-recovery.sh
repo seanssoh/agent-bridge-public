@@ -238,6 +238,45 @@ test_max_retries_env_override() {
   assert_counter_eq "$agent" "absent" "env-override: counter cleared on synthesis"
 }
 
+# --- env validation: invalid BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS --------
+#
+# Issue #633 codex r1 finding: an invalid override
+# (BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS=abc) used to trip set -u at the
+# arithmetic compare in bridge_write_idle_ready_agents, aborting the entire
+# daemon nudge_scan cycle. The validation must fall back to the default
+# threshold (3) and allow the cycle to complete normally.
+test_max_retries_env_invalid_fallback() {
+  local invalid_value="$1"
+  local label="$2"
+  load_recovery_test_env
+
+  local agent="syrs-fi"
+  local ready_file="$SMOKE_TMP_ROOT/ready-invalid.txt"
+
+  rm -rf "$(bridge_agent_idle_marker_dir "$agent")"
+  unset BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS_WARNED
+
+  PROBE_SHOULD_SUCCEED=0
+
+  # With invalid override, threshold must fall back to default 3 — this
+  # used to abort the function under `set -u`. Three failing cycles must
+  # complete without abort and progress counter→synth on cycle 3.
+  BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS="$invalid_value" run_cycle "$ready_file"
+  assert_counter_eq "$agent" "1" "$label: cycle 1 counter (default-3 fallback)"
+
+  BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS="$invalid_value" run_cycle "$ready_file"
+  assert_counter_eq "$agent" "2" "$label: cycle 2 counter (default-3 fallback)"
+
+  BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS="$invalid_value" run_cycle "$ready_file"
+  if ! grep -q "^${agent}$" "$ready_file"; then
+    smoke_fail "$label: agent should be INCLUDED on cycle 3 (synthetic marker via default-3 fallback)"
+  fi
+  if ! bridge_agent_idle_marker_exists "$agent"; then
+    smoke_fail "$label: synthetic marker should exist on cycle 3 with default-3 fallback"
+  fi
+  assert_counter_eq "$agent" "absent" "$label: counter cleared after synthesis"
+}
+
 main() {
   smoke_setup_bridge_home "$SMOKE_NAME"
 
@@ -249,6 +288,18 @@ main() {
 
   smoke_run "env override (BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS=2)" \
     test_max_retries_env_override
+
+  smoke_run "env validation: BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS=abc (non-numeric)" \
+    test_max_retries_env_invalid_fallback "abc" "non-numeric"
+
+  smoke_run "env validation: BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS=0 (zero)" \
+    test_max_retries_env_invalid_fallback "0" "zero"
+
+  smoke_run "env validation: BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS=-3 (negative)" \
+    test_max_retries_env_invalid_fallback "-3" "negative"
+
+  smoke_run "env validation: BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS='' (empty)" \
+    test_max_retries_env_invalid_fallback "" "empty"
 
   smoke_log "PASS: nudge-marker-recovery (#629 missing-marker bounded retry)"
 }

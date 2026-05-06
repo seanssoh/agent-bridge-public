@@ -354,6 +354,19 @@ bridge_write_idle_ready_agents() {
   local retries_file=""
   local retries=0
   local max_retries="${BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS:-3}"
+  # Issue #633 codex r1 finding: an invalid override (non-numeric, empty,
+  # or <1) used to trip `set -u` at the arithmetic compare below
+  # (`abc: unbound variable`), aborting the entire daemon nudge_scan
+  # cycle. Fall back silently to the documented default 3 — the operator
+  # set the env var, so a one-time stderr warn surfaces the typo without
+  # spamming the daemon log on every cycle.
+  if ! [[ "$max_retries" =~ ^[0-9]+$ ]] || (( max_retries < 1 )); then
+    if [[ -z "${BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS_WARNED:-}" ]]; then
+      bridge_warn "BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS='${BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS:-}' is not a positive integer; falling back to default 3 (issue #629/#633)"
+      export BRIDGE_NUDGE_RECOVER_MAX_PROBE_FAILS_WARNED=1
+    fi
+    max_retries=3
+  fi
 
   : >"$file"
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
