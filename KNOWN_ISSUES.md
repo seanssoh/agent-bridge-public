@@ -467,3 +467,24 @@ glyph regression preventing prompt detection) AND a cron keeps queuing
 tasks against it, the spool file grows without bound. Mitigation: stop
 the offending cron, or run `agent-bridge agent stop <agent>` to clear
 the spool. Future hardening: a max-line guard on the append helper.
+
+## 22. Layout v2 — rollback hatch via `BRIDGE_DISABLE_ISOLATION=1`
+
+v0.8.0 hard-cuts v1 (named-ACL) isolation: T1 fails fast on legacy
+markers, T2 deletes the v1 helpers, T3 wires the migration. If v2
+isolation hits an unforeseen issue post-deploy on a specific install,
+operators can set `BRIDGE_DISABLE_ISOLATION=1` in the controller
+environment and restart the daemon + affected agents to keep work
+flowing while debugging.
+
+The hatch disables v2 wraps at runtime — agents run as the controller
+UID with no group/setgid contract. The configured `isolation_mode`
+stays in the roster, the layout marker is not mutated, and v2 resumes
+when the env is unset and the daemon + agents restart. Operations
+status surface (`agent-bridge agent show <agent>`, `agent list`)
+reports `isolation: disabled-by-env` while the hatch is active.
+
+This is a debugging escape, not a permanent operating mode.
+Long-term operation without isolation is unsupported in v0.8.0.
+Report the underlying v2 issue upstream. Full operator notes:
+[`OPERATIONS.md` "Rollback hatch — `BRIDGE_DISABLE_ISOLATION=1`"](OPERATIONS.md).

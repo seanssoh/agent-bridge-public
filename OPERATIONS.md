@@ -733,6 +733,44 @@ otherwise):
    agent-bridge migrate isolation-v2 commit --yes
    ```
 
+### Rollback hatch — `BRIDGE_DISABLE_ISOLATION=1`
+
+If v2 isolation hits an unforeseen issue post-deploy, set
+`BRIDGE_DISABLE_ISOLATION=1` in the controller environment (the daemon
+unit, the operator's shell, or both — anywhere the bridge entry points
+read the env), and restart the daemon plus any affected agents.
+
+What it does:
+
+- Skips the v2 secret-env exec wrap and the `umask 007` wrap in
+  `bridge-run.sh`. The agent runs under the controller UID with the
+  default 0077 umask.
+- Skips the v2 group/sudo prep in `bridge-start.sh`. SUDO_WRAP stays
+  inactive, no per-agent `agent-env.sh` is written, no Claude
+  credential repair is attempted.
+- Surfaces `isolation: disabled-by-env` in `agent-bridge agent show
+  <agent>` and replaces the iso column in `agent-bridge agent list`
+  with `disabled-by-env`. The configured `isolation_mode` is left in
+  place so the JSON form still carries both fields.
+
+What it does NOT do:
+
+- Does NOT re-enable v1 ACL helpers — they are deleted in v0.8.0.
+- Does NOT mutate the layout marker or any per-agent `isolation_mode`.
+  v2 resumes the moment the env is unset and the daemon + agents
+  restart.
+- Does NOT call `agent-bridge migrate isolation-v2 commit`. Legacy
+  paths (if any remain) are preserved.
+
+This is a debugging escape, not a permanent operating mode. Operators
+who set this should report the underlying issue upstream so v2 can be
+fixed; long-term operation without isolation is unsupported in v0.8.0.
+
+```bash
+# Set in the daemon environment, then restart.
+BRIDGE_DISABLE_ISOLATION=1 ./agent-bridge daemon restart
+```
+
 ### Editing profile / skills / memory after activation
 
 After v2 activation, runtime resolvers (`bridge-skills.sh`,

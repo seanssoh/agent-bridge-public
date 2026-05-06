@@ -338,6 +338,10 @@ bridge_source_module "bridge-hooks.sh"
 bridge_source_module "bridge-channels.sh"
 bridge_source_module "bridge-state.sh"
 bridge_source_module "bridge-isolation-v2.sh"
+# v0.8.0 T5: runtime-only `BRIDGE_DISABLE_ISOLATION=1` escape hatch.
+# Sourced after bridge-isolation-v2.sh so bridge_isolation_v2_active is
+# already defined (the runtime state helper composes the two).
+bridge_source_module "bridge-isolation-runtime.sh"
 bridge_source_module "bridge-profiles.sh"
 bridge_source_module "bridge-cron.sh"
 bridge_source_module "bridge-discord.sh"

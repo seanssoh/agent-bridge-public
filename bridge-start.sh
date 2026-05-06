@@ -303,7 +303,9 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   fi
 fi
 
-if bridge_agent_linux_user_isolation_effective "$AGENT"; then
+if bridge_isolation_disabled_by_env; then
+  bridge_warn "BRIDGE_DISABLE_ISOLATION=1 — skipping v2 isolation prep for '$AGENT' (security boundary disabled, agent will run as controller UID without sudo wrap or per-agent env file)"
+elif bridge_agent_linux_user_isolation_effective "$AGENT"; then
   AGENT_ENV_FILE="$(bridge_agent_linux_env_file "$AGENT")"
   bridge_write_linux_agent_env_file "$AGENT" "$AGENT_ENV_FILE"
 fi
@@ -337,7 +339,13 @@ fi
 SUDO_WRAP_ACTIVE=0
 SUDO_WRAP_OS_USER=""
 SUDO_WRAP_FALLBACK_REASON=""
-if bridge_agent_linux_user_isolation_effective "$AGENT"; then
+# v0.8.0 T5: BRIDGE_DISABLE_ISOLATION=1 short-circuits the sudo wrap so
+# the SESSION_CMD runs unwrapped under the controller UID. The earlier
+# env-file guard already emitted the operator warning; this branch
+# stays silent to avoid a duplicate per-restart log line.
+if bridge_isolation_disabled_by_env; then
+  :
+elif bridge_agent_linux_user_isolation_effective "$AGENT"; then
   SUDO_WRAP_OS_USER="$(bridge_agent_os_user "$AGENT")"
   if [[ "$(id -u)" == "0" ]]; then
     SUDO_WRAP_FALLBACK_REASON="controller is root; sudo wrap skipped"
