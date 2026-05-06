@@ -6,6 +6,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
+# shellcheck source=lib/bridge-doctor.sh
+source "$SCRIPT_DIR/lib/bridge-doctor.sh"
 
 # Issue #598 Track 1 r2: the `agent registry` endpoint must be read-only,
 # but bridge_load_roster runs unconditionally at script load. Detect the
@@ -33,6 +35,8 @@ Subcommands:
   registry           Read-only JSON inventory of registered agents.
   show               Show one agent's roster + runtime state.
   reclassify         Promote a runtime-detected admin to a static role.
+  doctor             Run a 7-step CRUD self-check (create/update/registry/
+                     show/reclassify/retire/delete) against an isolated fixture.
   rerender-settings  Re-render per-agent settings.effective.json.
   start              Launch <agent> in tmux.
   safe-mode          Launch <agent> in safe-mode (no auto-resume).
@@ -4023,6 +4027,9 @@ case "$subcommand" in
   reclassify)
     run_reclassify "$@"
     ;;
+  doctor)
+    bridge_doctor_run "$@"
+    ;;
   rerender-settings)
     run_rerender_settings "$@"
     ;;
@@ -4059,7 +4066,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create update delete retire list registry show reclassify rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
+      "create update delete retire list registry show reclassify doctor rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;
