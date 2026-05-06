@@ -538,13 +538,36 @@ bridge_isolation_v2_migrate_mirror_one() {
   bytes="$(bridge_isolation_v2_migrate_bytes_of "$legacy_src")"
   sha_legacy="$(bridge_isolation_v2_migrate_sha256_of "$legacy_src")"
 
-  # Make destination parent.
+  # Detect cross-UID source FIRST (used both for mkdir + rsync).
+  local src_uid current_uid use_sudo=0
+  current_uid="$(id -u)"
+  src_uid="$(stat -c '%u' "$legacy_src" 2>/dev/null \
+              || stat -f '%u' "$legacy_src" 2>/dev/null \
+              || sudo -n stat -c '%u' "$legacy_src" 2>/dev/null \
+              || sudo -n stat -f '%u' "$legacy_src" 2>/dev/null \
+              || printf '%s' "$current_uid")"
+  if [[ -n "$src_uid" && "$src_uid" != "$current_uid" ]]; then
+    use_sudo=1
+  fi
+
+  # Make destination parent. v0.8.3 amend: when src is cross-UID
+  # (linux-user-isolated), the dst parent (e.g. agents/<bob>/) is
+  # owned by the isolated UID, so sean's mkdir fails with EACCES.
+  # Use sudo when escalation is needed.
   local dst_parent
   if [[ -d "$legacy_src" ]]; then
-    mkdir -p "$v2_dst" 2>/dev/null
+    if (( use_sudo == 1 )); then
+      sudo -n mkdir -p "$v2_dst" 2>/dev/null
+    else
+      mkdir -p "$v2_dst" 2>/dev/null
+    fi
   else
     dst_parent="$(dirname "$v2_dst")"
-    mkdir -p "$dst_parent" 2>/dev/null
+    if (( use_sudo == 1 )); then
+      sudo -n mkdir -p "$dst_parent" 2>/dev/null
+    else
+      mkdir -p "$dst_parent" 2>/dev/null
+    fi
   fi
 
   # Real copy. -a preserves perm/owner/time AND symlinks (-l is part of
@@ -567,14 +590,8 @@ bridge_isolation_v2_migrate_mirror_one() {
   # the flag is a no-op for per-agent rows but pairs destructively
   # with the global runtime_shared mapping where dst contains content
   # not present in src (rsync_fail_23 in v0.7.8 -> v0.8.3 VM repro).
-  local rc=0 src_uid current_uid use_sudo=0
-  current_uid="$(id -u)"
-  src_uid="$(stat -c '%u' "$legacy_src" 2>/dev/null \
-              || stat -f '%u' "$legacy_src" 2>/dev/null \
-              || printf '%s' "$current_uid")"
-  if [[ -n "$src_uid" && "$src_uid" != "$current_uid" ]]; then
-    use_sudo=1
-  fi
+  # use_sudo + src_uid already detected above (shared with mkdir).
+  local rc=0
   if [[ -d "$legacy_src" ]]; then
     if (( use_sudo == 1 )); then
       sudo -n rsync -aHX --numeric-ids \
