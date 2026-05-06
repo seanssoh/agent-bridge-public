@@ -3,7 +3,7 @@
 
 Runs once at Stop. If the latest user turn carries
 `<channel source="<surface>" chat_id="<id>" message_id="<id>" ...>` tags,
-the assistant turn must invoke `mcp__plugin_<surface>__reply` with a
+the assistant turn must invoke `mcp__plugin_<namespace>__reply` with a
 matching chat_id, OR the assistant text must include an explicit
 `<no-reply-needed source="<surface>" chat_id="<id>" reason="..." />`
 marker. Otherwise emit `{"decision": "block", "reason": "..."}` so
@@ -13,6 +13,14 @@ the reply.
 Issue #415 — textual rule from #342 kept regressing within 24h on the
 originating agent. Stop hook is the runtime boundary that doesn't rely
 on the LLM remembering the rule.
+
+Issue #20739 (2026-05-05) — production channel tags arrive as
+`source="plugin:<plugin_name>:<server_name>"` (e.g. "plugin:discord:discord")
+and reply tools are exposed as `mcp__plugin_<plugin>_<server>__reply`
+(e.g. `mcp__plugin_discord_discord__reply`). The previous
+`SUPPORTED_SURFACES = ("discord", ...)` membership check rejected the
+prefixed form, so the hook silent-passed every channel-sourced turn for
+roughly 30 days. `_parse_source` now normalizes both shapes.
 """
 from __future__ import annotations
 
@@ -22,11 +30,10 @@ import re
 import sys
 
 
-# Channel-source surfaces we enforce. Each maps to the mcp tool name
-# the agent must invoke to send the reply. Keep this list aligned with
-# the plugins that ship a `*__reply` tool (discord/telegram/teams).
-# ms365 plugin uses a different reply shape (email-send) and is not
-# enforced here.
+# Surface short-names we enforce. Each maps to the mcp reply tool name.
+# Keep this list aligned with the plugins that ship a `*__reply` tool
+# (discord/telegram/teams). ms365 plugin uses a different reply shape
+# (email-send) and is not enforced here.
 SUPPORTED_SURFACES = ("discord", "telegram", "teams")
 
 CHANNEL_TAG_RE = re.compile(
@@ -37,6 +44,33 @@ NO_REPLY_MARKER_RE = re.compile(
     r'<no-reply-needed\s+source="([^"]+)"\s+chat_id="([^"]+)"',
     re.IGNORECASE,
 )
+
+
+def _parse_source(raw: str):
+    """Parse a channel-tag source string → (surface, mcp_namespace).
+
+    Accepts both the legacy short form and the current MCP plugin form:
+
+    - "discord"                 → ("discord", "discord")
+    - "plugin:discord:discord"  → ("discord", "discord_discord")
+    - "plugin:telegram:telegram"→ ("telegram", "telegram_telegram")
+    - "plugin:foo"   (2 segs)   → ("foo", "foo")
+    - any other shape           → None
+
+    `surface` is the membership key for SUPPORTED_SURFACES; `mcp_namespace`
+    is the segment that goes into f"mcp__plugin_{namespace}__reply".
+    """
+    if not raw:
+        return None
+    s = raw.lower()
+    if s.startswith("plugin:"):
+        parts = s.split(":")
+        if len(parts) == 3:
+            return parts[1], f"{parts[1]}_{parts[2]}"
+        if len(parts) == 2:
+            return parts[1], parts[1]
+        return None
+    return s, s
 
 
 def load_event() -> dict:
@@ -82,10 +116,12 @@ def _extract_text(message_content) -> str:
 
 
 def _latest_pending_channel_input(entries: list[dict]):
-    """Walk entries in reverse and return the most recent user turn's
-    (source, chat_id, message_id, index) tuple where `index` is the
-    position of that user turn inside `entries`. Returns None if no
-    channel-source user turn is found in the trailing block."""
+    """Walk entries in reverse and return
+    (raw_source, surface, namespace, chat_id, message_id, index) for the
+    most recent user turn carrying a supported channel tag. Returns None
+    if the latest user turn isn't channel-sourced (matches existing
+    contract: enforcement applies only when the most recent user turn is
+    channel-bound)."""
     for idx in range(len(entries) - 1, -1, -1):
         entry = entries[idx]
         if entry.get("type") != "user":
@@ -93,29 +129,48 @@ def _latest_pending_channel_input(entries: list[dict]):
         text = _extract_text((entry.get("message") or {}).get("content"))
         match = CHANNEL_TAG_RE.search(text)
         if match:
-            source = match.group(1).lower()
-            if source in SUPPORTED_SURFACES:
-                return (source, match.group(2), match.group(3), idx)
-        # No supported channel tag on this user turn -> stop walking; we only
-        # enforce when the latest user turn was channel-sourced.
+            raw_source = match.group(1)
+            parsed = _parse_source(raw_source)
+            if parsed is not None:
+                surface, namespace = parsed
+                if surface in SUPPORTED_SURFACES:
+                    return (
+                        raw_source.lower(),
+                        surface,
+                        namespace,
+                        match.group(2),
+                        match.group(3),
+                        idx,
+                    )
+        # No supported channel tag on this user turn -> stop walking; we
+        # only enforce when the latest user turn was channel-sourced.
         return None
     return None
 
 
 def _assistant_replies_for_surface(
     entries: list[dict],
-    source: str,
+    raw_source: str,
+    surface: str,
+    namespace: str,
     chat_id: str,
     user_idx: int,
 ) -> bool:
     """Walk forward from the latest channel-source user turn (anchored at
     `user_idx`); return True when an assistant tool_use of
-    mcp__plugin_<source>__reply with matching chat_id is found, OR when an
-    explicit <no-reply-needed source=.. chat_id=..> marker appears in the
-    assistant text. Codex r1 fix #415: anchoring on user_idx (not the first
-    same-chat user turn from the start of transcript) prevents an older
-    reply from satisfying a newer unanswered message in the same chat."""
-    expected_tool = f"mcp__plugin_{source}__reply"
+    mcp__plugin_<namespace>__reply with matching chat_id is found, OR when
+    an explicit <no-reply-needed source=.. chat_id=..> marker appears in
+    the assistant text.
+
+    Marker matching accepts two `source` forms:
+      1. exact `raw_source` (e.g. "plugin:discord:discord") — preferred
+      2. legacy short surface ("discord", "telegram", "teams") for
+         backward compatibility.
+
+    Anything else in the marker source field is rejected to avoid
+    accepting unrelated `plugin:<x>:<y>` variants.
+    """
+    expected_tool = f"mcp__plugin_{namespace}__reply"
     for entry in entries[user_idx + 1:]:
         if entry.get("type") != "assistant":
             continue
@@ -136,7 +191,11 @@ def _assistant_replies_for_surface(
             if ptype == "text":
                 text = str(part.get("text") or "")
                 for nm in NO_REPLY_MARKER_RE.finditer(text):
-                    if nm.group(1).lower() == source and nm.group(2) == chat_id:
+                    nm_source = nm.group(1).lower()
+                    nm_chat = nm.group(2)
+                    if nm_chat != chat_id:
+                        continue
+                    if nm_source == raw_source or nm_source == surface:
                         return True
     return False
 
@@ -165,16 +224,19 @@ def main() -> int:
     if pending is None:
         return 0
 
-    source, chat_id, message_id, user_idx = pending
-    if _assistant_replies_for_surface(entries, source, chat_id, user_idx):
+    raw_source, surface, namespace, chat_id, message_id, user_idx = pending
+    if _assistant_replies_for_surface(
+        entries, raw_source, surface, namespace, chat_id, user_idx,
+    ):
         return 0
 
+    expected_tool = f"mcp__plugin_{namespace}__reply"
     reason = (
-        f"{source} chat_id={chat_id} message_id={message_id} "
-        f"입력에 대한 답변이 mcp__plugin_{source}__reply 호출로 전송되지 않았습니다. "
+        f"{raw_source} chat_id={chat_id} message_id={message_id} "
+        f"입력에 대한 답변이 {expected_tool} 호출로 전송되지 않았습니다. "
         f"답변 본문 작성 후 reply tool 호출 후 다시 종료하세요. "
         f"(답변이 불필요하면 assistant text에 "
-        f'<no-reply-needed source="{source}" chat_id="{chat_id}" reason="..." /> 마커 추가)'
+        f'<no-reply-needed source="{raw_source}" chat_id="{chat_id}" reason="..." /> 마커 추가)'
     )
     response = {"decision": "block", "reason": reason}
     sys.stdout.write(json.dumps(response, ensure_ascii=False))
