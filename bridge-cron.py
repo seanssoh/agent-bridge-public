@@ -1545,6 +1545,100 @@ def atomic_write_jobs(jobs_path, raw_payload):
     os.replace(temp_path, jobs_path)
 
 
+def _audit_log_path():
+    """Resolve the bridge audit log path.
+
+    Mirrors `bridge-config.py:audit_log_path()` and the SSOT default in
+    `lib/bridge-state.sh:1267` (`$BRIDGE_LOG_DIR/audit.jsonl`). Returns
+    `None` only when neither `BRIDGE_AUDIT_LOG` nor `BRIDGE_HOME`/`BRIDGE_LOG_DIR`
+    is set — in that case the caller should silently skip the emission so
+    smoke fixtures and `--help` invocations do not fail.
+    """
+    explicit = os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    log_dir = os.environ.get("BRIDGE_LOG_DIR", "").strip()
+    if log_dir:
+        return Path(log_dir).expanduser() / "audit.jsonl"
+    home = os.environ.get("BRIDGE_HOME", "").strip()
+    if home:
+        return Path(home).expanduser() / "logs" / "audit.jsonl"
+    return None
+
+
+def _audit_actor():
+    """Caller agent id for audit attribution.
+
+    Prefers `BRIDGE_AGENT_ID` so multi-admin installs can disambiguate
+    operator-driven mutations; falls back to `USER` so single-operator
+    boxes still record something useful. Matches the convention used in
+    `bridge-config.py:115` (`current_agent_id()`).
+    """
+    agent = os.environ.get("BRIDGE_AGENT_ID", "").strip()
+    if agent:
+        return agent
+    return os.environ.get("USER", "unknown") or "unknown"
+
+
+def emit_cron_mutation_audit(action, target, detail):
+    """Append a `cron.<verb>` row to the bridge audit log.
+
+    Routes through `bridge-audit.py write` so the hash chain stays intact
+    with hook / config / daemon rows. Best-effort: a failed audit write
+    never raises, mirroring the contract documented in
+    `bridge-watchdog-silence.py:emit_audit` and `bridge-config.py:write_audit`.
+
+    Issue #628 — operator-driven cron CRUD (`create`, `edit`, `enable`,
+    `disable`, `delete`) was previously absent from `audit.jsonl`,
+    forcing transcript fishing to recover mutation provenance. Runner
+    finalize and bulk admin paths (rebalance / migrate / import) stay
+    out of scope; only the four operator verbs go through here.
+    """
+    audit_path = _audit_log_path()
+    if audit_path is None:
+        return
+    actor = _audit_actor()
+    detail_payload = dict(detail or {})
+    detail_payload.setdefault("cron_id", target)
+    audit_script = Path(__file__).resolve().parent / "bridge-audit.py"
+    cmd = [
+        sys.executable,
+        str(audit_script),
+        "write",
+        "--file",
+        str(audit_path),
+        "--actor",
+        actor,
+        "--action",
+        action,
+        "--target",
+        target,
+        "--detail-json",
+        json.dumps(detail_payload, ensure_ascii=True, sort_keys=True),
+    ]
+    try:
+        subprocess.run(cmd, check=False, capture_output=True, text=True, timeout=10)
+    except (subprocess.SubprocessError, OSError):
+        # Audit emission is best-effort — never let it crash a successful
+        # cron mutation. Fall back to a direct append so a missing python
+        # interpreter doesn't silently swallow the row (matches
+        # bridge-config.py:write_audit's fallback contract).
+        try:
+            audit_path.parent.mkdir(parents=True, exist_ok=True)
+            record = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "actor": actor,
+                "action": action,
+                "target": target,
+                "detail": detail_payload,
+                "pid": os.getpid(),
+            }
+            with audit_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=True) + "\n")
+        except OSError:
+            pass
+
+
 def slugify_title(value):
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip()).strip("-").lower()
     return slug or "job"
@@ -1720,6 +1814,20 @@ def run_native_create(args):
     jobs_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_jobs(jobs_path, raw_payload)
 
+    # Issue #628 — emit operator-mutation audit row only after the write
+    # succeeds so failed creates do not appear in the audit log.
+    emit_cron_mutation_audit(
+        "cron.create",
+        job_id,
+        {
+            "agent": args.agent,
+            "title": title,
+            "schedule": dict(job.get("schedule") or {}),
+            "enabled": bool(job.get("enabled", True)),
+            "delete_after_run": bool(job.get("deleteAfterRun")),
+        },
+    )
+
     print(f"created native cron job {job_id} for {args.agent}")
     return 0
 
@@ -1780,6 +1888,65 @@ def run_native_update(args):
     raw_payload["updatedAt"] = datetime.now().astimezone().isoformat()
     atomic_write_jobs(Path(args.jobs_file).expanduser(), raw_payload)
 
+    # Issue #628 — pick the audit verb based on what actually changed.
+    # `--enable` / `--disable` flips alone get a dedicated `cron.enable`
+    # or `cron.disable` row; everything else (schedule / title / payload /
+    # tz / agent / delete-after-run) records as `cron.edit` with prev/next
+    # snapshots so multi-admin installs can attribute the change.
+    prev_enabled = bool(existing.get("enabled", True))
+    next_enabled = bool(enabled)
+    prev_schedule = dict(existing.get("schedule") or {})
+    next_schedule = dict(updated_job.get("schedule") or {})
+    prev_title = existing.get("name") or record.get("name") or ""
+    next_title = updated_job.get("name") or title
+    prev_agent = existing.get("agentId") or existing.get("agent") or record.get("agent") or ""
+    next_agent = updated_job.get("agentId") or updated_job.get("agent") or agent
+    prev_delete_after = bool(existing.get("deleteAfterRun"))
+    next_delete_after = bool(updated_job.get("deleteAfterRun"))
+    non_enable_changed = (
+        prev_schedule != next_schedule
+        or prev_title != next_title
+        or prev_agent != next_agent
+        or prev_delete_after != next_delete_after
+        or args.payload is not None
+        or args.payload_file is not None
+    )
+    if not non_enable_changed and prev_enabled != next_enabled:
+        action = "cron.enable" if next_enabled else "cron.disable"
+        emit_cron_mutation_audit(
+            action,
+            record["id"],
+            {
+                "agent": next_agent,
+                "title": next_title,
+                "prev_enabled": prev_enabled,
+                "next_enabled": next_enabled,
+            },
+        )
+    else:
+        emit_cron_mutation_audit(
+            "cron.edit",
+            record["id"],
+            {
+                "agent": next_agent,
+                "title": next_title,
+                "prev": {
+                    "schedule": prev_schedule,
+                    "enabled": prev_enabled,
+                    "title": prev_title,
+                    "agent": prev_agent,
+                    "delete_after_run": prev_delete_after,
+                },
+                "next": {
+                    "schedule": next_schedule,
+                    "enabled": next_enabled,
+                    "title": next_title,
+                    "agent": next_agent,
+                    "delete_after_run": next_delete_after,
+                },
+            },
+        )
+
     print(f"updated native cron job {record['id']}")
     return 0
 
@@ -1798,9 +1965,25 @@ def run_native_delete(args):
         print(f"error: native job not found: {args.job_ref}", file=sys.stderr)
         return 2
 
+    deleted_job = next((job for job in jobs if job.get("id") == record["id"]), None) or {}
     raw_payload["jobs"] = remaining_jobs
     raw_payload["updatedAt"] = datetime.now().astimezone().isoformat()
     atomic_write_jobs(Path(args.jobs_file).expanduser(), raw_payload)
+
+    # Issue #628 — capture the deleted job's identity in the audit row so
+    # operators can reconstruct what was removed without re-reading the
+    # backup file.
+    emit_cron_mutation_audit(
+        "cron.delete",
+        record["id"],
+        {
+            "agent": deleted_job.get("agentId") or deleted_job.get("agent") or record.get("agent") or "",
+            "title": deleted_job.get("name") or record.get("name") or "",
+            "schedule": dict(deleted_job.get("schedule") or {}),
+            "enabled": bool(deleted_job.get("enabled", True)),
+        },
+    )
+
     print(f"deleted native cron job {record['id']}")
     return 0
 
