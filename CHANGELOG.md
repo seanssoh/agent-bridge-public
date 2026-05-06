@@ -6,6 +6,61 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.8.3] — 2026-05-07
+
+### Highlight — fixes silent data loss on v0.7.x → v0.8.x upgrade
+
+`v0.8.3` is the working version on the v0.8.x line. v0.8.0 / v0.8.1 / v0.8.2 silently lost agent context on every upgrade because `apply_for_upgrade` never invoked `emit_plan` — the migration wrote markers and created v2 directories but never moved v1 files into them. Operators saw "running" agents post-upgrade with empty `workdir/` while CLAUDE.md, MEMORY.md, memory/, .claude/, and skills/ sat orphaned at the v1 paths.
+
+**Operators on v0.8.0 / v0.8.1 / v0.8.2: skip those releases. Upgrade v0.7.x → v0.8.3 directly.** Most v0.8.x installs that hit the silent data loss can be recovered: the v1 content is still on disk at `agents/<n>/` because v0.8.x never deleted it. Reset by removing `state/layout-marker.sh`, deleting `state/migration/`, removing `ab-agent-*` groups, then re-deploy v0.7.8 source first to flatten v0.8.x binary residue, then upgrade to v0.8.3.
+
+### Fixed
+
+- **Silent data loss** (`lib/bridge-isolation-v2-migrate.sh:apply_for_upgrade` and `apply`): the upgrade hot path now invokes `emit_plan` to generate proper 4-col `(mapping_id, legacy_src, v2_dst, delete_eligible)` rows for `mirror_all`. Files now actually relocate from v1 paths (`agents/<n>/CLAUDE.md`) to v2 paths (`agents/<n>/workdir/CLAUDE.md`, `agents/<n>/home/.claude/`, etc.). Verified via OrbStack VM end-to-end on Oracle Linux 9.7. (#660)
+- **linux-user-isolated agents now mirror correctly** (`mirror_one`, `emit_row`): cross-UID source detection via `stat`; sudo-wrapped `mkdir`/`rsync`/`rm` so the controller can read isolated agent files without supplementary group membership being active in its current process. Without this, `agents/<isolated>/.claude` (mode 0600 owned by `agent-bridge-<n>`) was invisible to the controller's mirror. (#660)
+- **macOS launchd KeepAlive race** (`lib/bridge-isolation-v2.sh`, `orchestrate_stop/restart`): the daemon respawned within 1-2s of `bridge-daemon.sh stop`, racing the migration's 10s `wait_daemon_gone` poll and aborting every macOS upgrade. v0.8.3 uses `launchctl bootout` / `launchctl bootstrap` (modern macOS lifecycle, NOT deprecated `launchctl load`) to fully unload the daemon during migration. Cross-run recovery via `state/migration/launchd-restore.json`. Linux unaffected. (#661)
+- **32-char group-name limit was Linux-only but enforced everywhere** (`bridge_isolation_v2_agent_group_name`): macOS `dseditgroup` tolerates 255+ chars; the Linux `groupadd` 32-char ceiling was rejecting long-named agents on macOS unnecessarily. Branch the cap by `uname`. (#658)
+- **Misleading `non-agent dir` warning for v1-layout agents** (`capture_all_agents_snapshot`): the `home/` subdir filter now distinguishes v1-layout-in-roster (silent — they migrate via the roster path) from genuinely-orphan dirs (warned). (#660)
+- **Rollback never reversed file relocation** (`bridge_isolation_v2_migrate_rollback`): now iterates the manifest in reverse for `delete_eligible=1 && verify_status=ok` rows, restoring v1 paths via `mv` (same-fs) or `rsync + rm` (cross-fs). `tac` (Linux) / `tail -r` (BSD) for portability. (#660)
+- **Rollback restart yanked attached agents** (`orchestrate_restart`): now respects the same attached-agent skip the dry-run pass already reported. (#660)
+- **Empty-source global rows aborted the migration** (`emit_row`): the `runtime_shared` mapping (empty `runtime/shared` tree → populated `shared/`) hit transient `rsync_fail_23` and aborted the entire migration over zero load-bearing content. Skip global rows where the source dir contains no files or symlinks. (#660)
+
+### Operator notes
+
+**v0.7.x → v0.8.3 upgrade flow**:
+
+1. `agent-bridge upgrade --apply` from any v0.7.x install. Migration is automatic.
+2. **First run may exit with rc=1** with downstream Python warnings about `shared Claude settings rerender failed for <isolated-agent>`. This is a known v0.8.3 limitation — the migration itself succeeded (manifest reports 0 mirror failures, marker is written, files are relocated), but the post-migration Python helper hits permission errors on isolated agents' `home/.claude/settings.json` because supplementary group membership isn't yet active in its process. **Re-run `agent-bridge upgrade --apply`** — second run is idempotent and exits rc=0 cleanly.
+3. macOS hosts: launchd integration is automatic. No manual `launchctl` required.
+4. Linux per-UID isolated agents: passwordless sudo required. The migration uses sudo for cross-UID `mkdir`, `rsync`, `rm`, `setfacl`, `chgrp`.
+5. After migration: agents' content lives at `agents/<n>/workdir/` (CLAUDE.md, MEMORY.md, memory/, skills/, users/) and `agents/<n>/home/.claude/`. v1 paths for `delete_eligible=0` rows (CLAUDE.md, MEMORY.md, etc.) are retained for dual-read until a future commit step.
+
+**Recovering from v0.8.0 / v0.8.1 / v0.8.2 partial state**:
+
+```bash
+sudo systemctl stop agent-bridge   # or: agent-bridge daemon stop
+sudo rm -f ~/.agent-bridge/state/layout-marker.sh
+sudo rm -rf ~/.agent-bridge/state/migration ~/.agent-bridge/state/isolation-v2
+sudo groupdel ab-agent-* 2>/dev/null || true
+sudo groupdel ab-shared ab-controller 2>/dev/null || true
+# Re-deploy v0.7.8 to flatten v0.8.x binary residue:
+git -C ~/.agent-bridge-source checkout v0.7.8
+bash ~/.agent-bridge-source/scripts/deploy-live-install.sh
+# Then upgrade to v0.8.3:
+git -C ~/.agent-bridge-source fetch origin && git -C ~/.agent-bridge-source checkout v0.8.3
+~/.agent-bridge/agent-bridge upgrade --source ~/.agent-bridge-source --version 0.8.3 --apply
+# (re-run if rc=1 — second run is idempotent)
+```
+
+### Known limitation (v0.8.4 follow-up)
+
+`bridge-agent.sh rerender-settings` and `bridge-upgrade.py:cmd_migrate_agents` hit `Permission denied` reading isolated agents' v2-located config files even after migration completes, because supplementary group membership for the controller's process is frozen at process start. Workaround: re-run `agent-bridge upgrade --apply` (idempotent; second run succeeds rc=0 because group membership has propagated to a fresh subshell). v0.8.4 will fix the Python helpers to use sudo when reading cross-UID paths.
+
+### Verified
+
+- VM smoke (Oracle Linux 9.7, kernel 6.19, Bash 5.1): v0.7.8 → v0.8.3 upgrade with 1 shared agent + 1 linux-user-isolated agent. Manifest 26 rows, 0 mirror failures. `agents/<n>/workdir/` populated with full v1 content. `agents/<n>/home/.claude/` migrated. Layout marker written. agent list works.
+- bash -n / shellcheck clean across all touched files.
+
 ## [0.8.2] — 2026-05-06
 
 ### Highlight — emergency hotfix: Linux per-UID isolated upgrade unblocked
