@@ -1231,6 +1231,111 @@ def cmd_summary(args: argparse.Namespace) -> int:
     return 0
 
 
+_COMPANION_FOCUS_HEADINGS = (
+    "## focus checklist",
+    "## focus list",
+    "## focus",
+    "### focus",
+    "focus checklist:",
+    "focus list:",
+)
+_COMPANION_OUTPUT_TOKENS = (
+    "plan-ok",
+    "implement-ok",
+    "needs-more",
+    "expected output",
+)
+
+
+def companion_title_prefix_match(title: str) -> bool:
+    """Return True iff the title's first bracket matches a companion-role prefix.
+
+    Matches `[plan]`, `[review]`, `[review r2]`, `[review r3]`, etc. Anything
+    after the first whitespace following the bracket is the subject and is
+    ignored. Case-insensitive.
+    """
+    stripped = (title or "").strip().lower()
+    if not stripped.startswith("["):
+        return False
+    end = stripped.find("]")
+    if end <= 0:
+        return False
+    inner = stripped[1:end].strip()
+    if not inner:
+        return False
+    head = inner.split(None, 1)[0]
+    return head in {"plan", "review"}
+
+
+def companion_body_missing_sections(body_text: str) -> list[str]:
+    """Return the list of missing companion-role brief sections.
+
+    A companion-role review brief must contain (a) a focus checklist (or
+    focus list / focus heading) AND (b) an explicit expected-output mention
+    naming `plan-ok`, `implement-ok`, `needs-more`, or "expected output".
+    Returns an empty list if both are present, otherwise the missing names.
+    """
+    missing: list[str] = []
+    haystack = (body_text or "").lower()
+    if not any(token in haystack for token in _COMPANION_FOCUS_HEADINGS):
+        missing.append("focus checklist")
+    if not any(token in haystack for token in _COMPANION_OUTPUT_TOKENS):
+        missing.append("expected output shape")
+    return missing
+
+
+def cmd_validate_companion_body(args: argparse.Namespace) -> int:
+    """Pure validator helper: prefix + body → OK or structured missing-list.
+
+    Roster awareness lives in the shell caller (`bridge-task.sh cmd_create`),
+    which knows the recipient engine/class. This helper is engine-agnostic
+    and can be invoked from smoke tests directly.
+
+    Exit codes:
+      0 — body validates (or title prefix is not a companion-role prefix)
+      2 — body is missing required sections
+      1 — usage / IO error
+    """
+    title = args.title or ""
+    body_text = ""
+    if args.body_file:
+        try:
+            body_text = Path(args.body_file).expanduser().read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"error: cannot read body file: {exc}", file=sys.stderr)
+            return 1
+    elif args.body is not None:
+        body_text = args.body
+    else:
+        body_text = sys.stdin.read() if not sys.stdin.isatty() else ""
+
+    if not companion_title_prefix_match(title):
+        if args.format == "json":
+            print(json.dumps({"status": "skip", "reason": "title-not-companion-prefix"}))
+        else:
+            print("skip: title prefix is not a companion-role prefix")
+        return 0
+
+    missing = companion_body_missing_sections(body_text)
+    if not missing:
+        if args.format == "json":
+            print(json.dumps({"status": "ok"}))
+        else:
+            print("ok")
+        return 0
+
+    payload = {
+        "status": "missing",
+        "missing": missing,
+        "title": title.strip(),
+    }
+    if args.format == "json":
+        print(json.dumps(payload))
+    else:
+        print(f"missing: {', '.join(missing)}", file=sys.stderr)
+    return 2
+
+
 def cmd_cron_ready(args: argparse.Namespace) -> int:
     sql = """
         SELECT id, assigned_to, priority, title, body_path, created_ts
@@ -2261,6 +2366,22 @@ def build_parser() -> argparse.ArgumentParser:
     handoff_group.add_argument("--note")
     handoff_group.add_argument("--note-file")
     handoff_parser.set_defaults(handler=cmd_handoff)
+
+    validate_companion_parser = subparsers.add_parser(
+        "validate-companion-body",
+        allow_abbrev=False,
+        help="Validate a companion-role review brief body for required sections.",
+    )
+    validate_companion_parser.add_argument("--title", required=True)
+    body_group = validate_companion_parser.add_mutually_exclusive_group()
+    body_group.add_argument("--body")
+    body_group.add_argument("--body-file")
+    validate_companion_parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+    )
+    validate_companion_parser.set_defaults(handler=cmd_validate_companion_body)
 
     summary_parser = subparsers.add_parser("summary", allow_abbrev=False)
     summary_parser.add_argument("--agent", action="append")
