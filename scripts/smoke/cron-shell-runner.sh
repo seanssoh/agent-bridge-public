@@ -238,9 +238,19 @@ python3 \"$SMOKE_REPO_ROOT/bridge-queue.py\" create --to worker-a --from cron-sh
 }
 
 smoke_t34_timeout_killpg() {
-  local script_path request status result
+  # T34 verifies the timeout path issues `killpg` against the child's
+  # process group, not just the direct parent — without this, a script
+  # that backgrounds work would leak children past the cron timeout.
+  # The script forks a background `sleep`, persists its PID under the
+  # run dir via $CRON_RUN_DIR, and waits on it. After the runner
+  # times out we assert that the background PID is no longer alive.
+  local script_path request status result child_pid_file child_pid attempts
   script_path="$(make_script t34.sh '#!/usr/bin/env bash
-sleep 30')"
+set -u
+sleep 30 &
+child_pid=$!
+printf "%s" "$child_pid" >"$CRON_RUN_DIR/t34-child.pid"
+wait "$child_pid"')"
   request="$(write_request t34-run t34-job "$script_path" 1)"
   if run_runner "$request" >/tmp/cron-shell-t34.out 2>&1; then
     smoke_fail "T34 expected timeout exit"
@@ -249,17 +259,44 @@ sleep 30')"
   result="${request%/*}/result.json"
   smoke_assert_eq "timed_out" "$(json_field "$status" state)" "T34 status timed_out"
   smoke_assert_contains "$(json_field "$result" runner_error)" "timed out after 1s" "T34 timeout result"
+
+  child_pid_file="${request%/*}/t34-child.pid"
+  if [[ ! -s "$child_pid_file" ]]; then
+    smoke_fail "T34 background child PID file missing or empty"
+  fi
+  child_pid="$(cat "$child_pid_file")"
+  # Bound the post-timeout drain — the runner SIGTERMs and then waits up
+  # to ~5s before SIGKILL, after which the kernel may take a moment to
+  # reap. 20 retries x 0.25s caps total wait at ~5s past runner exit.
+  attempts=0
+  while (( attempts < 20 )) && kill -0 "$child_pid" 2>/dev/null; do
+    sleep 0.25
+    attempts=$((attempts + 1))
+  done
+  if kill -0 "$child_pid" 2>/dev/null; then
+    smoke_fail "T34 background child $child_pid survived process-group kill"
+  fi
 }
 
 smoke_t36_output_cap() {
-  local script_path request result
+  # T36 verifies output cap enforcement. Per finding 2 of PR #625 r2 review,
+  # cap-exceeded is now a terminal error (`runner_error=output_cap_exceeded`)
+  # rather than a silent success — so the runner exits non-zero and the
+  # status/result reflect the cap trip.
+  local script_path request result status
   script_path="$(make_script t36.sh '#!/usr/bin/env bash
 printf "%080d\n" 1')"
   request="$(write_request t36-run t36-job "$script_path" 5 16)"
-  run_runner "$request" >/dev/null
+  if run_runner "$request" >/tmp/cron-shell-t36.out 2>&1; then
+    smoke_fail "T36 expected output_cap_exceeded non-zero exit"
+  fi
   result="${request%/*}/result.json"
+  status="${request%/*}/status.json"
   smoke_assert_eq "True" "$(json_field "$result" stdout_truncated)" "T36 stdout truncated flag"
   smoke_assert_contains "$(cat "${request%/*}/stdout.log")" "output truncated" "T36 truncation marker"
+  smoke_assert_eq "error" "$(json_field "$status" state)" "T36 status error"
+  smoke_assert_eq "output_cap_exceeded" "$(json_field "$status" runner_error)" "T36 runner_error"
+  smoke_assert_eq "error" "$(json_field "$result" status)" "T36 result error"
 }
 
 smoke_t37_no_model_child() {
@@ -399,6 +436,17 @@ smoke_t39c_update_revalidates_shell_script() {
   local script_path job_id out
   if [[ "$(id -u)" == "0" ]]; then
     smoke_skip "T39c root-owned script rejection" "current uid is root"
+    return 0
+  fi
+  # T39c exercises the `bridge-cron.sh update` wrapper, which requires
+  # linux-user isolation to be effective on the run-as agent. Off Linux,
+  # `bridge_agent_linux_user_isolation_effective` returns false and the
+  # wrapper dies before any update logic runs, so the assertions below
+  # cannot be exercised on macOS hosts. Gate the test on Linux to keep
+  # the smoke suite green on operator workstations (finding 4 of PR #625
+  # r2 review).
+  if ! smoke_is_linux; then
+    smoke_skip "T39c update revalidates shell script" "non-Linux (linux-user isolation not effective)"
     return 0
   fi
   script_path="$(make_script t39c.sh '#!/usr/bin/env bash
