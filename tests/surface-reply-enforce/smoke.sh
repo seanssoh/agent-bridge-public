@@ -122,6 +122,41 @@ write_transcript_unsupported_plugin() {
 JSONL
 }
 
+# ──────────────────────────────────────────────────────────────────────
+# Multi-surface coverage (issue #20739 codex r2): SUPPORTED_SURFACES is
+# {discord, telegram, teams}; _parse_source handles all three via the
+# same plugin:<x>:<y> shape. Add telegram + teams production-format
+# fixtures so the membership gate is exercised beyond discord.
+# ──────────────────────────────────────────────────────────────────────
+
+write_transcript_telegram_with_reply() {
+  cat >"$1" <<'JSONL'
+{"type":"user","message":{"content":[{"type":"text","text":"<channel source=\"plugin:telegram:telegram\" chat_id=\"T123\" message_id=\"M999\" />\nhello"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"sending"},{"type":"tool_use","name":"mcp__plugin_telegram_telegram__reply","input":{"chat_id":"T123","content":"hi back"}}]}}
+JSONL
+}
+
+write_transcript_telegram_missing_reply() {
+  cat >"$1" <<'JSONL'
+{"type":"user","message":{"content":[{"type":"text","text":"<channel source=\"plugin:telegram:telegram\" chat_id=\"T123\" message_id=\"M999\" />\nhello"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"prose only, no reply tool"}]}}
+JSONL
+}
+
+write_transcript_teams_with_reply() {
+  cat >"$1" <<'JSONL'
+{"type":"user","message":{"content":[{"type":"text","text":"<channel source=\"plugin:teams:teams\" chat_id=\"TM123\" message_id=\"M999\" />\nhello"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"sending"},{"type":"tool_use","name":"mcp__plugin_teams_teams__reply","input":{"chat_id":"TM123","content":"hi back"}}]}}
+JSONL
+}
+
+write_transcript_teams_missing_reply() {
+  cat >"$1" <<'JSONL'
+{"type":"user","message":{"content":[{"type":"text","text":"<channel source=\"plugin:teams:teams\" chat_id=\"TM123\" message_id=\"M999\" />\nhello"}]}}
+{"type":"assistant","message":{"content":[{"type":"text","text":"prose only, no reply tool"}]}}
+JSONL
+}
+
 write_transcript_unparseable_prefix() {
   # 4 segments — _parse_source returns None.
   cat >"$1" <<'JSONL'
@@ -249,5 +284,51 @@ write_transcript_unparseable_prefix "$T"
 out="$(run_hook "$T" "agent-foo")"
 [[ -z "$out" ]] || die "case (j) expected no output (unparseable 4-segment prefix), got: $out"
 pass "(j) plugin:a:b:c (4-segment) -> silent"
+
+# ---- Case (k) telegram production format + matching reply -> silent -----
+T="$TMP/k.jsonl"
+write_transcript_telegram_with_reply "$T"
+out="$(run_hook "$T" "agent-foo")"
+[[ -z "$out" ]] || die "case (k) expected no output, got: $out"
+pass "(k) plugin:telegram:telegram input + matching reply -> silent"
+
+# ---- Case (k2) telegram production format + missing reply -> block ------
+T="$TMP/k2.jsonl"
+write_transcript_telegram_missing_reply "$T"
+out="$(run_hook "$T" "agent-foo")"
+[[ -n "$out" ]] || die "case (k2) expected block JSON, got empty"
+echo "$out" | python3 -c '
+import json, sys
+data = json.loads(sys.stdin.read())
+assert data.get("decision") == "block", data
+reason = data.get("reason", "")
+assert "plugin:telegram:telegram" in reason.lower(), "reason missing raw_source: " + reason
+assert "T123" in reason, "reason missing chat_id: " + reason
+assert "mcp__plugin_telegram_telegram__reply" in reason, "reason missing tool: " + reason
+' || die "case (k2) JSON shape mismatch"
+pass "(k2) plugin:telegram:telegram input + missing reply -> block (with telegram_telegram tool name)"
+
+# ---- Case (l) teams production format + matching reply -> silent --------
+T="$TMP/l.jsonl"
+write_transcript_teams_with_reply "$T"
+out="$(run_hook "$T" "agent-foo")"
+[[ -z "$out" ]] || die "case (l) expected no output, got: $out"
+pass "(l) plugin:teams:teams input + matching reply -> silent"
+
+# ---- Case (l2) teams production format + missing reply -> block ---------
+T="$TMP/l2.jsonl"
+write_transcript_teams_missing_reply "$T"
+out="$(run_hook "$T" "agent-foo")"
+[[ -n "$out" ]] || die "case (l2) expected block JSON, got empty"
+echo "$out" | python3 -c '
+import json, sys
+data = json.loads(sys.stdin.read())
+assert data.get("decision") == "block", data
+reason = data.get("reason", "")
+assert "plugin:teams:teams" in reason.lower(), "reason missing raw_source: " + reason
+assert "TM123" in reason, "reason missing chat_id: " + reason
+assert "mcp__plugin_teams_teams__reply" in reason, "reason missing tool: " + reason
+' || die "case (l2) JSON shape mismatch"
+pass "(l2) plugin:teams:teams input + missing reply -> block (with teams_teams tool name)"
 
 log "all cases passed"
