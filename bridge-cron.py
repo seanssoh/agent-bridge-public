@@ -2109,6 +2109,12 @@ def run_native_finalize(args):
         job_state["consecutiveErrors"] = 0
         job_state.pop("lastErrorAtMs", None)
         job_state.pop("lastError", None)
+        # Issue #614: clear deferred-retry provenance so the next deferral
+        # captures a fresh original slot.
+        job_state.pop("deferredRetryOfSlot", None)
+        job_state.pop("deferredRetryOfOccurrenceAt", None)
+        job_state.pop("deferredRetryAttempt", None)
+        job_state.pop("deferredFirstAt", None)
     elif final_status == "deferred":
         # #263 Track B: the runner asked us to defer this slot for
         # `deferred_seconds`. Push nextRunAtMs forward by that window so
@@ -2125,8 +2131,34 @@ def run_native_finalize(args):
         deferred_reason = str(status.get("deferred_reason") or "").strip()
         if deferred_reason:
             job_state["lastDeferredReason"] = deferred_reason
+
+        # Issue #614: persist deferred-retry provenance so the scheduler can
+        # re-fire the slot with a new transport identity (slot/run_id).
+        # Reusing the original slot is unsafe — `bridge-cron.sh:516-575` keys
+        # run_id, request.json, and the dispatch manifest off slot, and an
+        # existing manifest with `dispatch_task_id` returns
+        # `status: already_enqueued`. So the retry needs a *new* slot, but
+        # the original slot/occurrence must be preserved as provenance for
+        # audit and so the scheduler can clear nextRunAtMs cleanly on success.
+        request_slot = str(request.get("slot") or "").strip()
+        if request_slot and "deferredRetryOfSlot" not in job_state:
+            job_state["deferredRetryOfSlot"] = request_slot
+            job_state["deferredRetryOfOccurrenceAt"] = request_slot
+        try:
+            previous_attempt = int(job_state.get("deferredRetryAttempt") or 0)
+        except (TypeError, ValueError):
+            previous_attempt = 0
+        job_state["deferredRetryAttempt"] = previous_attempt + 1
+        if "deferredFirstAt" not in job_state:
+            job_state["deferredFirstAt"] = datetime.now().astimezone().isoformat(timespec="seconds")
     else:
         job_state["nextRunAtMs"] = 0
+        # Issue #614: clear deferred-retry provenance so a future deferral
+        # captures a fresh original slot.
+        job_state.pop("deferredRetryOfSlot", None)
+        job_state.pop("deferredRetryOfOccurrenceAt", None)
+        job_state.pop("deferredRetryAttempt", None)
+        job_state.pop("deferredFirstAt", None)
         try:
             previous_errors = int(job_state.get("consecutiveErrors") or 0)
         except (TypeError, ValueError):
