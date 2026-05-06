@@ -10363,6 +10363,10 @@ bash "$REPO_ROOT/scripts/smoke/cron-migrate-payloads.sh"
 log "running cron-mutation-audit smoke (issue #628)"
 bash "$REPO_ROOT/scripts/smoke/cron-mutation-audit.sh"
 
+# Native cron shell payload runner regression.
+log "running cron-shell-runner smoke"
+bash "$REPO_ROOT/scripts/smoke/cron-shell-runner.sh"
+
 # Issue #544 PR1 — curated bin/agb shim for isolated agents.
 log "running isolated-bin-agb smoke (issue #544 PR1)"
 log "isolated-bin-agb covers shim env-source/delegation/fallback only — live PATH injection requires isolate+restart"

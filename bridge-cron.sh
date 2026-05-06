@@ -14,8 +14,8 @@ Usage:
   $(basename "$0") show <job-name-or-id> [--json]
   $(basename "$0") import [--source-jobs-file <path>] [--dry-run]
   $(basename "$0") list [--agent <bridge-agent>] [--enabled yes|no|all] [--limit <count>] [--json]
-  $(basename "$0") create --agent <bridge-agent> (--schedule "<cron-expr>" | --at "<iso-datetime>") --title "<title>" [--payload "<text>" | --payload-file <path>] [--tz <iana-tz>] [--delete-after-run]
-  $(basename "$0") update <job-id> [--agent <bridge-agent>] [--schedule "<cron-expr>" | --at "<iso-datetime>"] [--title "<title>"] [--payload "<text>" | --payload-file <path>] [--tz <iana-tz>] [--enable|--disable] [--delete-after-run|--keep-after-run]
+  $(basename "$0") create --agent <bridge-agent> (--schedule "<cron-expr>" | --at "<iso-datetime>") --title "<title>" [--payload "<text>" | --payload-file <path>] [--kind text|shell --script <path> --run-as-agent <agent> [--script-arg <arg>] [--script-env KEY=VALUE] [--timeout <seconds>] [--output-cap <bytes>]] [--tz <iana-tz>] [--delete-after-run]
+  $(basename "$0") update <job-id> [--agent <bridge-agent>] [--schedule "<cron-expr>" | --at "<iso-datetime>"] [--title "<title>"] [--payload "<text>" | --payload-file <path>] [--kind text|shell --script <path> --run-as-agent <agent> [--script-arg <arg>] [--script-env KEY=VALUE] [--timeout <seconds>] [--output-cap <bytes>] [--allow-kind-transition]] [--tz <iana-tz>] [--enable|--disable] [--delete-after-run|--keep-after-run]
   $(basename "$0") delete <job-id>
   $(basename "$0") rebalance-memory-daily [--jobs-file <path>] [--schedule "<cron-expr>"] [--tz <iana-tz>] [--dry-run] [--json]
   $(basename "$0") migrate-payloads --jsonl-aware [--jobs-file <path>] [--dry-run] [--json]
@@ -164,16 +164,68 @@ run_list() {
   bridge_cron_python "${py_args[@]}"
 }
 
+bridge_cron_validate_shell_run_config() {
+  local run_as_agent="$1"
+  local script_path="${2:-}"
+
+  [[ -n "$run_as_agent" ]] || bridge_die "--run-as-agent is required for --kind shell"
+  bridge_load_roster
+  bridge_require_agent "$run_as_agent"
+  bridge_agent_linux_user_isolation_effective "$run_as_agent" \
+    || bridge_die "--run-as-agent must name a linux-user isolated agent: $run_as_agent"
+
+  local os_user
+  os_user="$(bridge_agent_os_user "$run_as_agent")"
+  [[ -n "$os_user" ]] || bridge_die "--run-as-agent has no os_user: $run_as_agent"
+  if [[ "$run_as_agent" =~ ^[0-9]+$ || "$os_user" =~ ^[0-9]+$ ]]; then
+    bridge_die "--run-as-agent must be an agent id, not a numeric UID/user"
+  fi
+
+  [[ -n "$script_path" ]] || bridge_die "--script is required for --kind shell"
+  local resolved_script="$script_path"
+  case "$resolved_script" in
+    '$BRIDGE_HOME'|'$BRIDGE_HOME'/*)
+      resolved_script="${BRIDGE_HOME}${resolved_script#'$BRIDGE_HOME'}"
+      ;;
+    *'$'*)
+      bridge_die "--script contains an unresolved environment variable: $script_path"
+      ;;
+  esac
+  [[ "$resolved_script" = /* ]] || bridge_die "--script must resolve to an absolute path: $script_path"
+  [[ -f "$resolved_script" && -x "$resolved_script" ]] || bridge_die "--script must be an executable file: $resolved_script"
+
+  local owner_uid run_uid controller_uid mode_bits
+  owner_uid="$(stat -c '%u' "$resolved_script" 2>/dev/null || true)"
+  mode_bits="$(stat -c '%a' "$resolved_script" 2>/dev/null || true)"
+  run_uid="$(id -u "$os_user" 2>/dev/null || true)"
+  controller_uid="$(id -u)"
+  [[ -n "$owner_uid" && -n "$run_uid" ]] || bridge_die "could not resolve --script owner or --run-as-agent uid"
+  if [[ "$owner_uid" != "$controller_uid" && "$owner_uid" != "$run_uid" ]]; then
+    bridge_die "--script owner must be controller uid or run-as uid: $resolved_script"
+  fi
+  if (( (8#$mode_bits) & 0022 )); then
+    bridge_die "--script must not be group/other writable: $resolved_script"
+  fi
+}
+
 run_create() {
   local py_args=(
     native-create
     --jobs-file "$BRIDGE_NATIVE_CRON_JOBS_FILE"
   )
+  local kind="text"
+  local run_as_agent=""
+  local script_path=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --agent|--schedule|--at|--title|--payload|--payload-file|--tz|--actor)
+      --agent|--schedule|--at|--title|--payload|--payload-file|--tz|--actor|--kind|--script|--script-arg|--script-env|--run-as-agent|--timeout|--output-cap)
         [[ $# -lt 2 ]] && bridge_die "$1 뒤에 값을 지정하세요."
+        case "$1" in
+          --kind) kind="$2" ;;
+          --run-as-agent) run_as_agent="$2" ;;
+          --script) script_path="$2" ;;
+        esac
         py_args+=("$1" "$2")
         shift 2
         ;;
@@ -191,6 +243,10 @@ run_create() {
     esac
   done
 
+  if [[ "$kind" == "shell" ]]; then
+    bridge_cron_validate_shell_run_config "$run_as_agent" "$script_path"
+  fi
+
   bridge_cron_python "${py_args[@]}"
 }
 
@@ -200,6 +256,10 @@ run_update() {
     native-update
     --jobs-file "$BRIDGE_NATIVE_CRON_JOBS_FILE"
   )
+  local kind=""
+  local run_as_agent=""
+  local script_path=""
+  local shell_option_seen=0
 
   shift || true
   [[ -n "$job_ref" ]] || bridge_die "Usage: $(basename "$0") update <job-id> [--agent <bridge-agent>] [--schedule <cron-expr>|--at <iso-datetime>] [--title <title>] [--payload <text>|--payload-file <path>] [--tz <iana-tz>] [--enable|--disable] [--delete-after-run|--keep-after-run]"
@@ -207,12 +267,22 @@ run_update() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --agent|--schedule|--at|--title|--payload|--payload-file|--tz|--actor)
+      --agent|--schedule|--at|--title|--payload|--payload-file|--tz|--actor|--kind|--script|--script-arg|--script-env|--run-as-agent|--timeout|--output-cap)
         [[ $# -lt 2 ]] && bridge_die "$1 뒤에 값을 지정하세요."
+        case "$1" in
+          --kind) kind="$2" ;;
+          --run-as-agent) run_as_agent="$2" ;;
+          --script) script_path="$2" ;;
+        esac
+        case "$1" in
+          --kind|--script|--script-arg|--script-env|--run-as-agent|--timeout|--output-cap)
+            shell_option_seen=1
+            ;;
+        esac
         py_args+=("$1" "$2")
         shift 2
         ;;
-      --enable|--disable|--delete-after-run|--keep-after-run)
+      --enable|--disable|--delete-after-run|--keep-after-run|--allow-kind-transition)
         py_args+=("$1")
         shift
         ;;
@@ -225,6 +295,26 @@ run_update() {
         ;;
     esac
   done
+
+  local existing_shell_payload=""
+  local existing_payload_kind=""
+  local existing_script_path=""
+  local existing_run_as_agent=""
+  existing_shell_payload="$(bridge_cron_python show --jobs-file "$BRIDGE_NATIVE_CRON_JOBS_FILE" --format shell "$job_ref" 2>/dev/null || true)"
+  if [[ -n "$existing_shell_payload" ]]; then
+    local CRON_JOB_PAYLOAD_KIND=""
+    local CRON_JOB_PAYLOAD_SHELL_SCRIPT=""
+    local CRON_JOB_EXECUTION_RUN_AS_AGENT=""
+    # shellcheck disable=SC1090
+    source <(printf '%s\n' "$existing_shell_payload")
+    existing_payload_kind="$CRON_JOB_PAYLOAD_KIND"
+    existing_script_path="$CRON_JOB_PAYLOAD_SHELL_SCRIPT"
+    existing_run_as_agent="$CRON_JOB_EXECUTION_RUN_AS_AGENT"
+  fi
+
+  if [[ "$existing_payload_kind" == "shell" || "$kind" == "shell" || $shell_option_seen -eq 1 ]]; then
+    bridge_cron_validate_shell_run_config "${run_as_agent:-$existing_run_as_agent}" "${script_path:-$existing_script_path}" "update"
+  fi
 
   bridge_cron_python "${py_args[@]}"
 }
@@ -379,6 +469,44 @@ write_dispatch_body() {
   } >"$body_file"
 }
 
+build_shell_env_snapshot_json() {
+  local run_as_agent="$1"
+  local os_user="$2"
+  local run_home="$3"
+  local agent_env_file="$4"
+
+  (
+    set -a
+    if [[ -f "$agent_env_file" ]]; then
+      # shellcheck source=/dev/null
+      source "$agent_env_file"
+    fi
+    set +a
+    export HOME="$run_home"
+    export USER="$os_user"
+    export LOGNAME="$os_user"
+    export BRIDGE_AGENT_ID="$run_as_agent"
+    export BRIDGE_AGENT_NAME="$run_as_agent"
+    export BRIDGE_AGENT_ENV_FILE="$agent_env_file"
+    export BRIDGE_CONTROLLER_UID="${BRIDGE_CONTROLLER_UID:-$(id -u)}"
+    export BRIDGE_GATEWAY_PROXY=1
+    bridge_require_python
+    python3 - <<'PY'
+import json
+import os
+
+exact = {
+    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM", "LANG", "LC_ALL",
+}
+payload = {}
+for key, value in os.environ.items():
+    if key in exact or key.startswith("BRIDGE_"):
+        payload[key] = value
+print(json.dumps(payload, ensure_ascii=True, sort_keys=True))
+PY
+  )
+}
+
 run_enqueue() {
   local job_ref=""
   local jobs_file
@@ -421,6 +549,13 @@ run_enqueue() {
   local target_channels=""
   local target_discord_state_dir=""
   local target_telegram_state_dir=""
+  local shell_run_as_agent=""
+  local shell_os_user=""
+  local shell_uid=""
+  local shell_gid=""
+  local shell_home=""
+  local shell_agent_env_file=""
+  local shell_env_snapshot_json="{}"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -477,6 +612,12 @@ run_enqueue() {
   local CRON_JOB_NEXT_RUN_AT=""
   local CRON_JOB_PAYLOAD_KIND=""
   local CRON_JOB_PAYLOAD_TEXT=""
+  local CRON_JOB_PAYLOAD_SHELL_SCRIPT=""
+  local CRON_JOB_PAYLOAD_SHELL_ARGS="[]"
+  local CRON_JOB_PAYLOAD_SHELL_ENV="{}"
+  local CRON_JOB_PAYLOAD_SHELL_TIMEOUT_SECONDS=""
+  local CRON_JOB_PAYLOAD_SHELL_OUTPUT_CAP_BYTES=""
+  local CRON_JOB_EXECUTION_RUN_AS_AGENT=""
 
   shell_payload="$(bridge_cron_python show --jobs-file "$jobs_file" --format shell "$job_ref")" || exit $?
   # shellcheck disable=SC1090
@@ -539,6 +680,33 @@ run_enqueue() {
   # = use runner-side defaults (default policy, normal priority).
   cron_reporting_policy="${CRON_JOB_CRON_REPORTING_POLICY:-}"
   cron_urgency="${CRON_JOB_CRON_URGENCY:-}"
+  shell_run_as_agent=""
+  shell_os_user=""
+  shell_uid=""
+  shell_gid=""
+  shell_home=""
+  shell_agent_env_file=""
+  shell_env_snapshot_json="{}"
+  if [[ "$CRON_JOB_PAYLOAD_KIND" == "shell" ]]; then
+    shell_run_as_agent="${CRON_JOB_EXECUTION_RUN_AS_AGENT:-}"
+    [[ -n "$shell_run_as_agent" ]] || bridge_die "shell cron job is missing execution.runAsAgent: $CRON_JOB_NAME"
+    bridge_require_agent "$shell_run_as_agent"
+    bridge_agent_linux_user_isolation_effective "$shell_run_as_agent" \
+      || bridge_die "shell cron run_as_agent must be linux-user isolated: $shell_run_as_agent"
+    shell_os_user="$(bridge_agent_os_user "$shell_run_as_agent")"
+    [[ -n "$shell_os_user" ]] || bridge_die "shell cron run_as_agent has no os_user: $shell_run_as_agent"
+    [[ ! "$shell_run_as_agent" =~ ^[0-9]+$ && ! "$shell_os_user" =~ ^[0-9]+$ ]] \
+      || bridge_die "shell cron run_as_agent must be an agent id, not numeric UID/user"
+    shell_uid="$(id -u "$shell_os_user")"
+    shell_gid="$(id -g "$shell_os_user")"
+    shell_home="$(getent passwd "$shell_os_user" | awk -F: '{print $6}' | head -n1)"
+    [[ -n "$shell_home" ]] || shell_home="$(bridge_agent_linux_user_home "$shell_os_user")"
+    shell_agent_env_file="$(bridge_agent_linux_env_file "$shell_run_as_agent")"
+    if [[ ! -f "$shell_agent_env_file" ]] && command -v bridge_write_linux_agent_env_file >/dev/null 2>&1; then
+      bridge_write_linux_agent_env_file "$shell_run_as_agent" "$shell_agent_env_file"
+    fi
+    shell_env_snapshot_json="$(build_shell_env_snapshot_json "$shell_run_as_agent" "$shell_os_user" "$shell_home" "$shell_agent_env_file")"
+  fi
   request_rel="${request_file#$BRIDGE_HOME/}"
   result_rel="${result_file#$BRIDGE_HOME/}"
   status_rel="${status_file#$BRIDGE_HOME/}"
@@ -610,16 +778,21 @@ except Exception:
   # task_id=0 is a sentinel placeholder; real queue id is patched in below
   # via bridge_cron_update_*_task_id once the queue record exists.
   created_at="$(bridge_now_iso)"
-  bridge_cron_write_request "$request_file" "$run_id" "$CRON_JOB_ID" "$CRON_JOB_NAME" "$CRON_JOB_FAMILY" "$CRON_JOB_AGENT" "$target" "$slot" "0" "$created_at" "$body_file" "$payload_file" "$result_file" "$status_file" "$stdout_log" "$stderr_log" "$jobs_file" "$CRON_JOB_PAYLOAD_KIND" "$target_engine" "$target_workdir" "$target_channels" "$target_discord_state_dir" "$target_telegram_state_dir" "$job_delivery_mode" "$job_delivery_channel" "$job_delivery_target" "$allow_channel_delivery" "$delivery_mode" "$disposable_needs_channels" "$disable_mcp" "$cron_reporting_policy" "$cron_urgency"
+  bridge_cron_write_request "$request_file" "$run_id" "$CRON_JOB_ID" "$CRON_JOB_NAME" "$CRON_JOB_FAMILY" "$CRON_JOB_AGENT" "$target" "$slot" "0" "$created_at" "$body_file" "$payload_file" "$result_file" "$status_file" "$stdout_log" "$stderr_log" "$jobs_file" "$CRON_JOB_PAYLOAD_KIND" "$target_engine" "$target_workdir" "$target_channels" "$target_discord_state_dir" "$target_telegram_state_dir" "$job_delivery_mode" "$job_delivery_channel" "$job_delivery_target" "$allow_channel_delivery" "$delivery_mode" "$disposable_needs_channels" "$disable_mcp" "$cron_reporting_policy" "$cron_urgency" "$CRON_JOB_PAYLOAD_SHELL_SCRIPT" "$CRON_JOB_PAYLOAD_SHELL_ARGS" "$CRON_JOB_PAYLOAD_SHELL_ENV" "$shell_run_as_agent" "$shell_os_user" "$shell_uid" "$shell_gid" "$shell_home" "$shell_agent_env_file" "$shell_env_snapshot_json" "$CRON_JOB_PAYLOAD_SHELL_TIMEOUT_SECONDS" "$CRON_JOB_PAYLOAD_SHELL_OUTPUT_CAP_BYTES"
   bridge_cron_write_status "$status_file" "$run_id" "queued" "$target_engine" "$request_file" "$result_file" "$created_at"
   bridge_cron_write_manifest "$manifest_file" "$CRON_JOB_ID" "$CRON_JOB_NAME" "$CRON_JOB_FAMILY" "$CRON_JOB_AGENT" "$target" "$slot" "0" "$created_at" "$body_file" "$jobs_file" "$run_id" "$request_file" "$payload_file" "$result_file" "$status_file" "$stdout_log" "$stderr_log" "$job_delivery_mode" "$job_delivery_channel" "$job_delivery_target" "$allow_channel_delivery" "$delivery_mode" "$disposable_needs_channels" "$cron_reporting_policy" "$cron_urgency"
+  if [[ "$CRON_JOB_PAYLOAD_KIND" == "shell" ]]; then
+    bridge_cron_normalize_shell_run_artifacts "$(bridge_cron_run_dir_by_id "$run_id")" "$request_file" "$status_file" "$payload_file"
+  fi
   # Per-run ACL grant is best-effort under v1.3 (#219): the memory-daily
   # harvester now runs as the controller UID, so it does not need the
   # isolated os_user to own/rwX the per-run dir. Other families that do
   # spawn isolated subprocesses can still rely on the grant when sudo/acl
   # infrastructure is available; failure here is non-fatal and does NOT
   # remove the pre-queue artifacts.
-  bridge_cron_run_dir_grant_isolation "$(bridge_cron_run_dir_by_id "$run_id")" "$target" >/dev/null 2>&1 || true
+  if [[ "$CRON_JOB_PAYLOAD_KIND" != "shell" ]]; then
+    bridge_cron_run_dir_grant_isolation "$(bridge_cron_run_dir_by_id "$run_id")" "$target" >/dev/null 2>&1 || true
+  fi
 
   create_output="$(bridge_queue_cli create --to "$target" --title "$title" --from "$actor" --priority "$priority" --body-file "$body_file")"
   printf '%s\n' "$create_output"
@@ -632,6 +805,9 @@ except Exception:
 
   bridge_cron_update_request_task_id "$request_file" "$task_id"
   bridge_cron_update_manifest_task_id "$manifest_file" "$task_id"
+  if [[ "$CRON_JOB_PAYLOAD_KIND" == "shell" ]]; then
+    bridge_cron_normalize_shell_run_artifacts "$(bridge_cron_run_dir_by_id "$run_id")" "$request_file" "$status_file" "$payload_file"
+  fi
 
   printf 'run_id: %s\n' "$run_id"
   printf 'request_file: %s\n' "$request_rel"
