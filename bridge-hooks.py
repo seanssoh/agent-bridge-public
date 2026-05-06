@@ -58,8 +58,26 @@ def managed_claude_settings_defaults(
     launch_cmd: str | None,
     agent_class: str | None = None,
 ) -> dict[str, Any]:
+    # `promptSuggestionEnabled: False` disables Claude Code's inline
+    # composer ghost text (the dimmed "Try asking …" suggestion that
+    # appears in the input box after a turn completes). On bridge-managed
+    # agents the daemon's pending-input detector
+    # (`bridge_tmux_session_inject_busy` → `bridge_tmux_line_has_sgr_dim`,
+    # `lib/bridge-tmux.sh:1322`) reads that ghost text as real typed
+    # input and defers the first send of every queued task until the
+    # nudge fallback fires (~30s–1min latency). PR #566 added an SGR-2
+    # detector to filter the dim form, but newer Claude Code builds
+    # render the suggestion with other ANSI shapes (24-bit gray,
+    # 256-color faint, `\x1b[90m`) the narrow detector misses (#630).
+    # Disabling the feature at the settings layer is the stable fix —
+    # bridge-managed agents are operated through the queue, not by a
+    # human typing in the composer, so the suggestion has no value here.
+    # Operators who attach interactively and want it back can set
+    # `promptSuggestionEnabled: true` in the per-agent overlay
+    # (`settings.local.json`) — overlay wins over managed defaults.
     return {
         "autoCompactWindow": resolve_managed_autocompact_window(launch_cmd, agent_class),
+        "promptSuggestionEnabled": False,
     }
 
 
