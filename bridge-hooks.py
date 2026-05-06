@@ -838,6 +838,44 @@ def next_backup_path(path: Path) -> Path:
     return candidate
 
 
+# User-owned keys that bridge renderers must preserve across rerenders.
+# Rationale: the shared and isolated renderers both compose
+# `managed defaults < base < overlay` and overwrite the effective settings
+# file on every call (`agent restart`, `agent rerender-settings --apply`,
+# `bridge-init.sh` install, `agb upgrade propagate`). Without explicit
+# preservation, per-agent user state — plugin enable/disable, marketplace
+# pins, danger-prompt skip — is silently wiped on the next render even
+# though it lives in the same JSON file Claude itself reads.
+#
+# (Issue #544 PR2 originally introduced this for the isolated renderer to
+# survive the `settings.json` → `settings.effective.json` symlink
+# transition. Issue #613 generalized it to the shared renderer after
+# operators hit the same silent-clobber on every `--apply`.)
+PRESERVED_USER_KEYS = (
+    "enabledPlugins",
+    "extraKnownMarketplaces",
+    "skipDangerousModePermissionPrompt",
+)
+
+
+def _load_preserved_user_keys(effective_path: Path) -> dict[str, Any]:
+    """Read the user-owned subset of an existing effective settings file.
+
+    Returns an empty dict if the file is missing, unreadable, malformed,
+    or not a JSON object. Callers merge the result *last* so user keys
+    win over base/overlay/managed defaults.
+    """
+    if not effective_path.exists():
+        return {}
+    try:
+        existing = load_json(effective_path)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(existing, dict):
+        return {}
+    return {k: existing[k] for k in PRESERVED_USER_KEYS if k in existing}
+
+
 def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     base_path = Path(args.base_settings_file).expanduser()
     overlay_path = Path(args.overlay_settings_file).expanduser()
@@ -853,8 +891,15 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     launch_cmd = (getattr(args, "launch_cmd", "") or "") or None
     agent_class = (getattr(args, "agent_class", "") or "") or None
     managed_defaults = managed_claude_settings_defaults(launch_cmd, agent_class)
+    # Compose: managed defaults < base < overlay < preserved user keys.
+    # Preserved keys merge last so per-agent edits to the effective file
+    # (e.g. operator-disabled plugins) survive every rerender. See
+    # `PRESERVED_USER_KEYS` rationale above.
+    preserved = _load_preserved_user_keys(effective_path)
     merged = merge_settings(managed_defaults, base_payload)
     merged = merge_settings(merged, overlay_payload)
+    if preserved:
+        merged = merge_settings(merged, preserved)
     save_json(effective_path, merged)
 
     payload = {
@@ -862,6 +907,7 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
         "overlay_settings_file": str(overlay_path),
         "effective_settings_file": str(effective_path),
         "overlay_present": "true" if overlay_path.exists() else "false",
+        "preserved_keys": ",".join(sorted(preserved.keys())),
     }
     if args.format == "shell":
         for key, value in payload.items():
@@ -872,6 +918,7 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     print(f"overlay_settings_file: {payload['overlay_settings_file']}")
     print(f"effective_settings_file: {payload['effective_settings_file']}")
     print(f"overlay_present: {payload['overlay_present']}")
+    print(f"preserved_keys: [{payload['preserved_keys']}]")
     return 0
 
 
@@ -885,18 +932,10 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
 # inside controller/root ownership while still letting the isolated UID
 # read it. Hooks themselves run as the isolated UID — that is intended.
 #
-# Pre-existing isolated-UID user keys (`enabledPlugins`,
-# `extraKnownMarketplaces`, `skipDangerousModePermissionPrompt`) are
+# Pre-existing isolated-UID user keys (see `PRESERVED_USER_KEYS`) are
 # extracted from any prior regular `settings.json` at that path and merged
 # into the rendered effective file so first-run user state survives the
 # transition to symlink-managed.
-ISOLATED_HOME_PRESERVED_USER_KEYS = (
-    "enabledPlugins",
-    "extraKnownMarketplaces",
-    "skipDangerousModePermissionPrompt",
-)
-
-
 def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     isolated_home = Path(args.isolated_home).expanduser()
     base_path = Path(args.base_settings_file).expanduser()
@@ -921,20 +960,10 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     #     breaking idempotency and erasing the operator's user state
     #     on every subsequent rerender (e.g. agent restart).
     preserved: dict[str, Any] = {}
-    preserve_source: Path | None = None
     if settings_link.exists() and not settings_link.is_symlink():
-        preserve_source = settings_link
-    elif settings_link.is_symlink() and effective_path.exists():
-        preserve_source = effective_path
-    if preserve_source is not None:
-        try:
-            existing = load_json(preserve_source)
-        except (OSError, json.JSONDecodeError):
-            existing = {}
-        if isinstance(existing, dict):
-            for key in ISOLATED_HOME_PRESERVED_USER_KEYS:
-                if key in existing:
-                    preserved[key] = existing[key]
+        preserved = _load_preserved_user_keys(settings_link)
+    elif settings_link.is_symlink():
+        preserved = _load_preserved_user_keys(effective_path)
 
     # 2. Compose: managed defaults < base < overlay < preserved user keys.
     base_payload = ensure_settings_root(base_path)

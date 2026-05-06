@@ -10390,6 +10390,12 @@ bash "$REPO_ROOT/scripts/smoke/system-agent-class.sh"
 log "running per-agent-settings-rendering smoke (issue #555)"
 bash "$REPO_ROOT/scripts/smoke/per-agent-settings-rendering.sh"
 
+# Issue #613 — shared renderer must preserve operator-edited user keys
+# (enabledPlugins, extraKnownMarketplaces, skipDangerousModePermissionPrompt)
+# on every rerender, matching the long-standing isolated-renderer contract.
+log "running shared-settings-preserve-user-keys smoke (issue #613)"
+bash "$REPO_ROOT/scripts/smoke/shared-settings-preserve-user-keys.sh"
+
 # Issue #597 Track D — precompact-notify suite. Exercises the Discord
 # relay activity-index writer, the Track A route-primitive end-to-end
 # with the writer-populated index, and the pre-compact.py hook
