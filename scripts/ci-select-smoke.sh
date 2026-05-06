@@ -259,6 +259,17 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
+    hooks/codex-task-mode-policy.py|hooks/codex-review-output-shape.py)
+      # Issue #639 — codex companion-role policy hook redesign
+      # (default-deny block-mode allow-list + common-shape parser). The
+      # comprehensive smoke covers all 6 D1 gaps + PR #636 r1-r5 regression
+      # + grant grammar; the original codex-companion-hooks.sh remains the
+      # source-of-truth for the queue-time validator and ensure-codex-hooks
+      # wiring. Pull both in for any change to either codex companion hook.
+      add_required hooks codex-task-mode-policy-comprehensive codex-companion-hooks
+      add_integration integration-minimal
+      ;;
+
     hooks/*|bridge-hooks.py|lib/bridge-hooks.sh)
       # Issue #544 PR2 — bridge-hooks.py grew the
       # `render-isolated-home-settings` subcommand and lib/bridge-hooks.sh

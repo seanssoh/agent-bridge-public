@@ -10415,4 +10415,11 @@ bash "$REPO_ROOT/scripts/smoke/shared-settings-preserve-user-keys.sh"
 log "running precompact-notify suite smoke (issue #597 Track D)"
 bash "$REPO_ROOT/tests/precompact-notify/smoke.sh"
 
+# Issue #639 — codex-task-mode-policy.py write-shape detector redesign
+# (default-deny block-mode allow-list + common-shape parser). Covers all
+# 6 D1 gaps (multi-command, substitution, quoting, exec/bash recursion,
+# tool exotics, heredoc) plus PR #636 r1-r5 regression + grant grammar.
+log "running codex-task-mode-policy-comprehensive smoke (issue #639)"
+bash "$REPO_ROOT/scripts/smoke/codex-task-mode-policy-comprehensive.sh"
+
 log "smoke test passed"

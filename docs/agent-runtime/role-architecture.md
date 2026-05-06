@@ -53,11 +53,23 @@ The hooks below address Codex-specific failure modes. Implementation order is ri
 
 **Failure mode it addresses.** A Codex task tagged `[plan]` or `[review]` is supposed to be read-only — write your conclusions, do not edit source. Manual discipline drifts: reviewers occasionally start editing files in the primary checkout when the task title clearly said "plan" or "review."
 
-**Behavior.** Reads the currently claimed task (deterministic lookup: `status='claimed' AND claimed_by=<agent>`; ambiguity or absence → fail-open with audit). If that task title carries a plan/review prefix, denies any tool use that writes to the primary checkout (structured tool fields for `Edit`/`Write`/`NotebookEdit`; `shlex`-tokenized + path-normalized write detection for `Bash`, borrowing patterns from `tool-policy.py`). The default is read-only. Carve-outs are **structured-only**:
-- `/tmp/` scratch writes are always allowed.
-- Isolated-worktree writes are allowed only when the task body contains an explicit, structured grant: a line of the form `implement-permission: <absolute-or-relative-path>`. The hook normalizes both the granted path and the tool's target path and allows only when the target is contained in the grant. A free-text phrase like "implement in <path>" does **not** grant write permission. Multiple grants may appear; each is parsed independently.
+**Behavior.** Reads the currently claimed task (deterministic lookup: `status='claimed' AND claimed_by=<agent>`; ambiguity or absence → fail-open with audit). If that task title carries a plan/review prefix, denies any tool use that writes to the primary checkout. Structured tool fields cover `Edit`/`Write`/`NotebookEdit`/`MultiEdit`. **Bash classification (issue #639 redesign — Option C)** is now default-deny in block mode:
 
-**Stage.** Land in dry-run/audit-only mode first; flip to blocking after smoke proves no false-positives over a week of normal pair-programming traffic.
+1. **Closed read-only allow-list.** Routine review commands (`git status|diff|show|log|grep|ls-files|rev-parse|blame|...`, `ls`, `cat`, `head`, `tail`, `wc`, `stat`, `file`, `du`, `rg`, `grep`, `find` without `-exec`/`-delete`, `python -c <code>` whose AST contains no `open`/`write_text`/`os.remove`/etc., plus `echo`/`printf`/`true`/`false`/`test`) are allow-listed and need no grant. New entries are policy changes — they require comments explaining read-only-ness, plus block-allow and block-deny smoke coverage.
+2. **Common-shape write detector.** A small, named verb set (`rm`, `cp`, `mv`, `install`, `touch`, `sed -i`, `chmod`, `chown`, `dd`, `mkdir`, `rmdir`, `tee`, `patch`, `git` mutating subcommands, output redirections like `>file`, `1>file`, `>>file`, `&>file`) is parsed into structured `(head, target_paths)` for grant matching. PR #636 r1-r5 fixes (fd redirection, git long-flag mutating subcommands, `patch -i`/`install -t` target rules, attached `-tDEST`/`-oFILE`, combined-cluster `-rt`) are preserved.
+3. **Default-deny in block mode.** Anything that is neither allow-listed nor a recognized write shape (`cargo build`, `npm install`, `awk` scripts, `bash -c "$DYNAMIC"`, command substitution, heredocs feeding interpreters, etc.) is `UNKNOWN_SHELL`. In block mode this denies; in audit mode it logs and allows. This is what closes the multi-command, substitution, exotic-interpreter, and heredoc gaps that PR #636 r1-r5 deferred.
+
+**Carve-outs and grants.**
+- `/tmp/` scratch writes are always allowed (structured tool target or every Bash write target under `/tmp/`).
+- Legacy `implement-permission: <path>` grant in the task body remains supported (path-prefix containment).
+- Proposed `[grants]` block in the task body:
+  - `write: <path>` — equivalent to `implement-permission`.
+  - `write: <known-write-command...>` — shape grant, matches when runtime command's head equals the grant's head AND every resolved write target is contained in the grant's resolved target. Example: `write: rm /Users/somewhere/build` lets `rm /Users/somewhere/build/x` through but not `cp ... /Users/somewhere/build/x`.
+  - `shell: <exact command>` — exact-command escape hatch for unknown shell, exotic interpreters, heredoc bodies, and substitutions. Whitespace-normalized equality.
+- Path/write grants accept `~`, `$WORKDIR`, `$PWD`, and `$TMPDIR` env expansion. Unknown variables make the grant invalid (audit warning, not a literal match).
+- Free-text phrases like "implement in `<path>`" still do **not** grant write permission.
+
+**Stage.** Land in audit-only mode first; flip to blocking after smoke proves no false-positives over a week of normal pair-programming traffic. Block-mode promotion is a separate operator decision (see "Operator: how to promote to blocking mode" below) — the issue #639 redesign **enables** safe block-mode promotion but does not change the default.
 
 ### Priority 2 — `codex-review-output-shape.py` (Stop)
 
