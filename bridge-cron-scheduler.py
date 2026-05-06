@@ -368,6 +368,96 @@ def enumerate_due_runs(
     return due_runs, dict(counters)
 
 
+# Issue #614: marker prefix on retry slot strings so audit / dashboards can
+# tell a deferred-retry occurrence apart from a natural cron occurrence
+# without having to dig into job state. Format: "<prefix><iso-of-retry-time>".
+RETRY_SLOT_PREFIX = "deferred-retry-"
+
+
+def derive_retry_slot(occurrence_at: datetime) -> str:
+    return f"{RETRY_SLOT_PREFIX}{occurrence_at.isoformat(timespec='minutes')}"
+
+
+def enumerate_pending_retries(
+    jobs: list[dict[str, Any]],
+    now_dt: datetime,
+) -> tuple[list[DueRun], dict[str, int]]:
+    """Issue #614 — second-pass enumerator for deferred-retry slots.
+
+    `enumerate_due_runs` only walks the cron / every / at expression. When
+    `bridge-cron-runner.py` defers a slot (e.g. memory-pressure pre-flight),
+    `bridge-cron.py` writes `state.nextRunAtMs` forward by `deferred_seconds`
+    and tags `state.lastStatus = deferred`. Nothing else reads that state.
+    For high-frequency jobs the next natural occurrence catches up; for
+    daily / weekly / monthly cron and one-shot `at`, the deferred slot is
+    silently lost.
+
+    This helper synthesises a `DueRun` at `parse_epoch_ms(nextRunAtMs)` so
+    the existing enqueue path can re-fire the slot. The retry carries:
+
+    - `occurrence_at = retry fire time` (NOT the original slot time). That
+      keeps `due_run_sort_key` strictly monotonic against the cursor, so
+      `filter_due_runs_from_state` accepts it without a special bypass.
+    - `slot = derive_retry_slot(occurrence_at)` — a unique transport slot
+      that does not collide with the original (whose request/manifest may
+      still be on disk and would otherwise return `already_enqueued`).
+    - `family / source_agent / job_id / job_name` from the job, so audit
+      and delivery routing match the original.
+
+    The original slot / occurrence is preserved in `job_state` (written by
+    `bridge-cron.py` on the deferred-finalize path) under
+    `deferredRetryOfSlot` / `deferredRetryOfOccurrenceAt`. Operators reading
+    the dashboard can correlate the retry back to its origin without the
+    scheduler having to encode the original slot inside the retry's slot
+    string.
+    """
+    counters: Counter = Counter()
+    retries: list[DueRun] = []
+
+    for job in jobs:
+        if not job_enabled(job):
+            counters["disabled"] += 1
+            continue
+
+        state = job.get("state") or {}
+        last_status = str(state.get("lastStatus") or state.get("lastRunStatus") or "")
+        if last_status != "deferred":
+            counters["not_deferred"] += 1
+            continue
+
+        retry_dt = parse_epoch_ms(state.get("nextRunAtMs"))
+        if retry_dt is None:
+            counters["no_next_run"] += 1
+            continue
+        if retry_dt > now_dt:
+            counters["retry_in_future"] += 1
+            continue
+
+        schedule = job.get("schedule") or {}
+        kind = str(schedule.get("kind") or "")
+        if kind not in ("cron", "every", "at"):
+            counters["unsupported_kind"] += 1
+            continue
+
+        slot = derive_retry_slot(retry_dt)
+        family = classify_family(job.get("name", ""))
+        retries.append(
+            DueRun(
+                job_id=job.get("id", ""),
+                job_name=job.get("name", "<unnamed>"),
+                family=family,
+                source_agent=job.get("agentId") or job.get("agent") or "<unknown>",
+                schedule_kind=kind,
+                occurrence_at=retry_dt,
+                slot=slot,
+            )
+        )
+        counters["retry_due"] += 1
+
+    retries.sort(key=lambda item: (item.occurrence_at, item.source_agent, item.job_name, item.slot))
+    return retries, dict(counters)
+
+
 def due_run_sort_key(run: DueRun) -> tuple[datetime, str, str, str, str]:
     return (
         run.occurrence_at,
@@ -571,6 +661,23 @@ def cmd_sync(args: argparse.Namespace) -> int:
     jobs = load_jobs(jobs_file)
     due_runs, counters = enumerate_due_runs(jobs, start_dt, now_dt, args.max_occurrences_per_job)
     due_runs = filter_due_runs_from_state(due_runs, state)
+    # Issue #614: synthesise deferred-retry slots whose `nextRunAtMs` has
+    # arrived. These are appended *after* the cursor filter — their
+    # occurrence_at is strictly later than the original deferred slot
+    # (= original_slot_time + deferred_seconds), so the cursor naturally
+    # accepts them. Dedup against the same job's natural occurrence is by
+    # (occurrence_at, slot, job_id) tuple uniqueness; the retry slot uses
+    # `derive_retry_slot()` which never collides with cron expression slots.
+    pending_retries, retry_counters = enumerate_pending_retries(jobs, now_dt)
+    if pending_retries:
+        existing_keys = {due_run_sort_key(run) for run in due_runs}
+        for retry in pending_retries:
+            if due_run_sort_key(retry) in existing_keys:
+                continue
+            due_runs.append(retry)
+            existing_keys.add(due_run_sort_key(retry))
+        due_runs.sort(key=lambda item: (item.occurrence_at, item.source_agent, item.job_name, item.slot))
+    counters["pending_retries"] = retry_counters.get("retry_due", 0)
     counters["due_occurrences"] = len(due_runs)
 
     results: list[dict[str, Any]] = []
