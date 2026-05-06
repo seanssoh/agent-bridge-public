@@ -250,19 +250,35 @@ def _dd_of_target(tokens: list[str]) -> str | None:
 
 
 def _target_directory_flag(tokens: list[str]) -> str | None:
-    """Return the value of `-t <dest>` / `--target-directory=<dest>` if present.
+    """Return the value of `-t <dest>` / `-tDEST` / `--target-directory=<dest>`.
 
     Used by cp / mv / install. When `-t` (or its long form) appears, the
     write target is the FLAG VALUE, not the last positional arg — those
     positionals are sources. `install -t /etc/systemd /tmp/foo.service` would
     otherwise be misclassified by `_last_positional` as a /tmp write and
     false-allowed.
+
+    Three short-flag shapes for `-t`:
+    - separated: `-t /etc/dest` (consume next token)
+    - attached:  `-t/etc/dest` (value baked into the same token; common in
+      GNU coreutils because POSIX `getopt` accepts it)
+    - The `--target-directory` long form takes the value either as the next
+      token or after `=` in the same token.
+
+    Without the attached-form branch, `install -t/etc/systemd /tmp/foo` falls
+    through to `_last_positional` and `/tmp/foo` is reported as the write
+    target (false allow via the /tmp carve-out).
     """
     i = 0
     while i < len(tokens):
         tok = tokens[i]
         if tok == "-t" and i + 1 < len(tokens):
             return tokens[i + 1]
+        # `-tDEST` attached short form. Guard against `--target-directory`
+        # (also starts with `-t`) by excluding any token that begins with
+        # the long-flag prefix `--`.
+        if tok.startswith("-t") and not tok.startswith("--") and len(tok) > 2:
+            return tok[2:]
         if tok == "--target-directory" and i + 1 < len(tokens):
             return tokens[i + 1]
         if tok.startswith("--target-directory="):
@@ -277,15 +293,29 @@ def _patch_write_target(tokens: list[str]) -> str:
     `patch` reads a diff (from `-i FILE` or stdin) and applies it to files
     named *inside the diff* — the diff path is INPUT, not the write target.
     The conservative target is therefore the cwd. Honor `-o <output>` /
-    `--output=<output>` because that form redirects the patched result to a
-    single named file instead of touching cwd; if it points at /tmp the
-    outer carve-out will allow it.
+    `-oFILE` (attached short form) / `--output=<output>` because those
+    redirect the patched result to a single named file instead of touching
+    cwd; if it points at /tmp the outer carve-out will allow it.
+
+    Without the attached-form branch, `patch -p1 -i /tmp/diff -o/etc/result`
+    falls through to the cwd default; if cwd is the /tmp BRIDGE_HOME (or any
+    /tmp-rooted scratch dir) the global carve-out then false-allows the
+    write to /etc/result. Recognizing `-oFILE` here forces the explicit
+    target to be classified.
     """
     i = 0
     while i < len(tokens):
         tok = tokens[i]
         if tok == "-o" and i + 1 < len(tokens):
             return tokens[i + 1]
+        # `-oFILE` attached short form. Exclude `--output*` long flags
+        # (those start with `--`, which by definition does not match `-o`
+        # alone — `--output` starts with `--`, not `-o`-as-short-flag — but
+        # the explicit `not startswith("--")` guard makes the intent clear
+        # and is robust against future flag additions like a hypothetical
+        # `--o…` long flag).
+        if tok.startswith("-o") and not tok.startswith("--") and len(tok) > 2:
+            return tok[2:]
         if tok == "--output" and i + 1 < len(tokens):
             return tokens[i + 1]
         if tok.startswith("--output="):

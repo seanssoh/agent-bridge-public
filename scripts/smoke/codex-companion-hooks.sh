@@ -501,6 +501,53 @@ out_mv_long="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_mv_long" 
   BRIDGE_CODEX_TASK_MODE_POLICY block)"
 smoke_assert_contains "$out_mv_long" '"decision": "block"' "5u mv --target-directory=/etc blocks"
 
+# 5v. (D1 r4 / D8a) Attached short-option forms: `-tDEST` and `-oFILE` (no
+# space between flag and value). Pre-fix `_target_directory_flag` only
+# matched `tok == "-t"` plus a separated value or `--target-directory[=...]`.
+# The attached form `install -t/etc/systemd /tmp/foo.service` therefore
+# fell through to `_last_positional` and reported `/tmp/foo.service` as the
+# write target (a SOURCE), which the /tmp carve-out then false-allowed.
+# Same gap existed for `-oFILE` in `_patch_write_target`. Post-fix both
+# helpers strip the attached value and classify the destination correctly.
+event_install_attached='{"tool_name":"Bash","tool_input":{"command":"install -t/etc/systemd /tmp/foo.service"}}'
+out_install_attached="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_install_attached" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_install_attached" '"decision": "block"' "5v install -t/etc/... attached blocks"
+
+# Mirror with cp/mv attached forms — destination outside /tmp.
+event_cp_attached='{"tool_name":"Bash","tool_input":{"command":"cp -t/etc /tmp/foo"}}'
+out_cp_attached="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_cp_attached" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_cp_attached" '"decision": "block"' "5v cp -t/etc attached blocks"
+
+event_mv_attached='{"tool_name":"Bash","tool_input":{"command":"mv -t/etc /tmp/foo"}}'
+out_mv_attached="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_mv_attached" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_mv_attached" '"decision": "block"' "5v mv -t/etc attached blocks"
+
+# Attached-form destination INSIDE /tmp must still be allowed (carve-out).
+event_install_attached_tmp='{"tool_name":"Bash","tool_input":{"command":"install -t/tmp/dest /etc/foo"}}'
+out_install_attached_tmp="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_install_attached_tmp" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_eq "" "$out_install_attached_tmp" "5v install -t/tmp/dest attached allowed"
+
+# 5w. (D1 r4 / D8a) `patch -p1 -i /tmp/diff -o/etc/result`: attached `-oFILE`.
+# Pre-fix the helper only matched separated `-o <path>` and `--output[=...]`,
+# so `-o/etc/result` was treated as just another flag token (or worse,
+# silently ignored) and the write target fell back to cwd; if cwd was a /tmp
+# BRIDGE_HOME the global carve-out false-allowed the call. Post-fix the
+# attached form is stripped and `/etc/result` is classified as the target.
+event_patch_attached_outside='{"tool_name":"Bash","tool_input":{"command":"patch -p1 -i /tmp/diff -o/etc/result"}}'
+out_patch_attached_outside="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_patch_attached_outside" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_contains "$out_patch_attached_outside" '"decision": "block"' "5w patch -o/etc/... attached blocks"
+
+# Attached `-oFILE` pointing inside /tmp must still be allowed (carve-out).
+event_patch_attached_tmp='{"tool_name":"Bash","tool_input":{"command":"patch -p1 -i /tmp/diff -o/tmp/result"}}'
+out_patch_attached_tmp="$(run_hook "$HOOKS_DIR/codex-task-mode-policy.py" "$event_patch_attached_tmp" \
+  BRIDGE_CODEX_TASK_MODE_POLICY block)"
+smoke_assert_eq "" "$out_patch_attached_tmp" "5w patch -o/tmp/result attached allowed"
+
 # 5j. ambiguous claimed task — fail-open with audit row.
 AMBIG_AGENT="codex-ambig-smoke"
 python3 - <<PY
