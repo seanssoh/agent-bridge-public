@@ -510,11 +510,11 @@ bridge_migration_unisolate() {
     fi
   fi
 
-  # Remove the per-UID Claude credentials symlink installed by
-  # bridge_linux_grant_claude_credentials_access (#125). The ACL on the
-  # controller's ~/.claude/.credentials.json is intentionally kept — other
-  # isolated agents on the same host may still rely on it, and the entry
-  # is per-UID so it is harmless once this agent's UID is no longer in use.
+  # Remove the per-UID Claude credentials symlink (legacy v1 artifact —
+  # may exist on installs migrated from pre-v0.8.0). The named-user ACL
+  # on the controller's ~/.claude/.credentials.json (also legacy) is left
+  # alone here since the entry is per-UID and harmless once this agent's
+  # UID is no longer in use.
   local isolated_cred_link=""
   isolated_cred_link="$(bridge_migration_user_home "$os_user")/.claude/.credentials.json"
   if [[ -L "$isolated_cred_link" ]]; then
@@ -637,11 +637,10 @@ bridge_migration_unisolate() {
   done
   # `setfacl -R -x` strips access entries on every file and directory
   # under the target. It does NOT touch default ACLs — those are a
-  # separate attribute stored only on directories, installed by
-  # `bridge_linux_acl_add_default_dirs_recursive` (lib/bridge-agents.sh:1017)
-  # and inherited by every new child. Remove them with a `find -type d`
-  # sweep so post-unisolate file creations do not keep inheriting the
-  # isolated UID's grants.
+  # separate attribute stored only on directories (legacy v1 inheritance,
+  # may still be present on installs migrated from pre-v0.8.0). Remove
+  # them with a `find -type d` sweep so post-unisolate file creations do
+  # not keep inheriting the isolated UID's grants.
   for _acl_target in "${acl_strip_paths_recursive[@]}"; do
     [[ -n "$_acl_target" ]] || continue
     bridge_migration_print_step "$dry_run" "setfacl -R -x u:${os_user} ${_acl_target}"

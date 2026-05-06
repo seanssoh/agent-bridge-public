@@ -3031,22 +3031,6 @@ bridge_report_channel_health_miss() {
   bridge_agent_exists "$admin_agent" || return 0
   [[ "$admin_agent" != "$agent" ]] || return 0
 
-  # Preflight: repair sticky POSIX ACL mask drift on channel state .env
-  # files and Claude credentials for Linux-isolated agents BEFORE evaluating
-  # channel status.
-  # Without this preflight, an unrelated chmod elsewhere can leave
-  # mask=--- on .teams/.env / .ms365/.env, the daemon's grep against
-  # those files returns EACCES, the status reads "miss", and we enqueue
-  # a noisy channel-health task even though the only thing wrong is
-  # the ACL mask. Repair recovers both a dropped mask and a missing
-  # controller named-user entry; helper is best-effort, so a real
-  # credentials problem still falls through to the existing miss path.
-  if bridge_agent_linux_user_isolation_requested "$agent" 2>/dev/null \
-      && [[ "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]]; then
-    bridge_linux_acl_repair_channel_env_files "$agent" >/dev/null 2>&1 || true
-    bridge_linux_repair_claude_credentials_access "$agent" >/dev/null 2>&1 || true
-  fi
-
   status="$(bridge_agent_channel_status "$agent")"
   if [[ "$status" != "miss" ]]; then
     bridge_clear_channel_health_state "$agent"
