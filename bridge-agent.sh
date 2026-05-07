@@ -402,6 +402,53 @@ bridge_scaffold_agent_home() {
   local rel=""
   local target=""
 
+  # v0.8.5 #677: when the agent will be linux-user isolated under v2,
+  # `$home` lives under `$BRIDGE_AGENT_ROOT_V2/<agent>/...`. The
+  # `agents/` ancestor is root-owned (mode 755) and a stale per-agent
+  # root from a prior failed `agent create` may already exist as
+  # root:ab-agent-<name> mode 2750 — neither gives the controller mkdir
+  # permission, so the plain `mkdir -p "$home"` below would fail with
+  # `Permission denied` and abort the scaffold before
+  # `bridge_linux_prepare_agent_isolation` (which normally lays this
+  # tree down via sudo) ever runs.
+  #
+  # Pre-create the per-agent root and `$home` via sudo with controller
+  # ownership so the rest of the scaffold (template renders, mkdirs,
+  # chmods) executes as plain controller writes. `bridge_linux_prepare_agent_isolation`
+  # runs after scaffold (bridge-agent.sh:2287) and normalizes
+  # ownership/mode to the canonical `root:ab-agent-<name> 2750` per-agent
+  # root + `<isolated>:ab-agent-<name> 2770` subdirs, then `chown -R
+  # $os_user $workdir` transfers the scaffolded contents to the
+  # isolated UID. Mirrors PR #675's `bridge_state_sudo_install_v2_file`
+  # sudo-handoff pattern in lib/bridge-state.sh.
+  if [[ -n "$home" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+    local _scaffold_v2_root=""
+    local _scaffold_controller=""
+    if command -v bridge_isolation_v2_agent_root >/dev/null 2>&1; then
+      _scaffold_v2_root="$(bridge_isolation_v2_agent_root "$agent" 2>/dev/null || printf '')"
+    fi
+    _scaffold_controller="$(bridge_current_user 2>/dev/null || id -un 2>/dev/null || printf '')"
+    if [[ -n "$_scaffold_v2_root" && -n "$_scaffold_controller" ]]; then
+      # Per-agent root: idempotent. If a prior failed run left it as
+      # root:ab-agent-<name> 2750, retake it as controller-owned 0755 so
+      # we (and any nested mkdirs) can write into it. Prepare will reset
+      # ownership/mode to the canonical contract.
+      bridge_linux_sudo_root mkdir -p "$_scaffold_v2_root" 2>/dev/null || true
+      bridge_linux_sudo_root chown "$_scaffold_controller" "$_scaffold_v2_root" 2>/dev/null || true
+      bridge_linux_sudo_root chmod 0755 "$_scaffold_v2_root" 2>/dev/null || true
+      # Scaffold target ($home is typically $_scaffold_v2_root/home but
+      # may be overridden via BRIDGE_AGENT_WORKDIR). Pre-create via sudo
+      # in case it lives under a path the controller cannot mkdir
+      # directly (same parent-owned-by-root problem as above).
+      bridge_linux_sudo_root mkdir -p "$home" 2>/dev/null || true
+      bridge_linux_sudo_root chown "$_scaffold_controller" "$home" 2>/dev/null || true
+      bridge_linux_sudo_root chmod 0755 "$home" 2>/dev/null || true
+    fi
+  fi
+
   mkdir -p "$home"
   [[ -d "$template_root" ]] || bridge_die "agent template root가 없습니다: $template_root"
   [[ -f "$session_template" ]] || bridge_die "session type template가 없습니다: $session_type"
