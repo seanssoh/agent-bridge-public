@@ -190,7 +190,13 @@ _bridge_layout_resolver_fresh_install_bypass_active() {
   local val="${BRIDGE_LAYOUT_RESOLVER_BYPASS:-}"
   [[ "$val" == fresh-install:* ]] || return 1
   [[ "${val#fresh-install:}" != "" ]] || return 1
-  _bridge_layout_resolver_handshake_check "bridge-init.sh" "bridge-bootstrap.sh"
+  # `agent-bridge` accepted in addition to the underlying scripts because the
+  # public CLI wrapper sources bridge-lib.sh (which fires the resolver)
+  # BEFORE it execs to bridge-init.sh / bridge-bootstrap.sh. The wrapper
+  # arms the bypass for fresh-install-creating subcommands so that first
+  # resolver call passes; subsequent boots inside bridge-init.sh /
+  # bridge-bootstrap.sh re-arm with their own argv and still match.
+  _bridge_layout_resolver_handshake_check "bridge-init.sh" "bridge-bootstrap.sh" "agent-bridge"
 }
 
 _bridge_layout_resolver_handshake_check() {
