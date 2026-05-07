@@ -6,6 +6,10 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **#682 v0.7→v0.8 migration emits invalid `--json` on failure + leaves `installed_version` stale at 0.7.7** (`bridge-upgrade.sh`): two related findings from v0.8.4 OrbStack VM E2E retest task #4195 Scenario C. (a) `agent-bridge upgrade --apply --json` rc=1 path now emits a single valid JSON envelope on stdout with `error: { reason, detail, remediation }`, the `isolation_v2_migration` payload, and the version fields — instead of dropping out of the JSON contract entirely on `bridge_die` / `set -e` aborts. Wired through an EXIT trap that fires when `JSON=1` and `_BRIDGE_UPGRADE_JSON_EMITTED=0`; the migration block populates `_BRIDGE_UPGRADE_DIE_{REASON,DETAIL,REMEDIATION}` so the envelope carries actionable detail rather than just `rc=1`. (b) `installed_version` / `installed_ref` / `installed_head` (the metadata under `state/upgrade/last-upgrade.json`) now advances atomically with the live `VERSION` write — the `write-state` call moved from the very end of the apply path to immediately after `apply-live`, so any subsequent helper failure (shared-settings rerender, migrate-agents, daemon-restart-blocked-by-supplemental-group-cache) cannot leave the two states desynchronized. The previous tail position produced the observed `live VERSION=0.8.4 + installed_version=0.7.7` mismatch on rc=1 paths.
+
 ## [0.8.4] — 2026-05-07
 
 ### Highlight — closes 5 release-blocker regressions surfaced by v0.8.3 OrbStack VM E2E
