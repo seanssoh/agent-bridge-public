@@ -6,6 +6,10 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **#680 `bridge-init.sh` first-run on fresh install exited rc=1 with empty log** (`bridge-agent.sh::run_create`): on a fresh v2 install, `agent create` invoked `bridge-start.sh <agent> --dry-run` purely as informational diagnostic capture, but `bridge_agent_workdir` resolves to `<agent-root>/workdir/` while `bridge_scaffold_agent_home` materializes `<agent-root>/home/` — the dry-run failed `workdir가 없습니다`, command-substitution propagated rc=1 to `set -e`, and `agent create` aborted silently before printing anything. `bridge-init.sh` redirected create's stdout to `/dev/null`, leaving operators with rc=1 + empty log on first-run init while the rerun (which short-circuits via `bridge_agent_exists`) succeeded. The dry-run capture now tolerates non-zero rc and surfaces the actual rc through the printed `start_dry_run:` field; first-run `bridge-init.sh` exits rc=0 on a clean home, idempotent rerun preserved, the underlying scaffold-vs-resolver mismatch remains visible in the create output for follow-up. (refs #680)
+
 ## [0.8.4] — 2026-05-07
 
 ### Highlight — closes 5 release-blocker regressions surfaced by v0.8.3 OrbStack VM E2E

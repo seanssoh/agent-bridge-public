@@ -1986,6 +1986,7 @@ run_create() {
   local users_json=""
   local default_home=""
   local start_dry_run=""
+  local start_dry_run_status="ok"
   # Issue #598 Track 4: opt-in for test-artifact-prefix names.
   local test_fixture=0
 
@@ -2286,7 +2287,21 @@ report and reap test-fixture agents per their pattern."
     if [[ "$isolation_mode" == "linux-user" ]]; then
       bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir"
     fi
-    start_dry_run="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --dry-run 2>&1)"
+    # Issue #680: bridge-start.sh --dry-run is purely informational here — its
+    # output is reprinted to the user as `start_dry_run:` for diagnostic
+    # context. Letting its rc propagate via command-substitution + set -e
+    # silently aborts agent-create whenever dry-run reports a non-fatal
+    # warning (e.g. v2 fresh-install where the workdir path resolver expects
+    # `<agent-root>/workdir/` but bridge_scaffold_agent_home materializes
+    # `<agent-root>/home/`). Capture rc separately and surface a clear
+    # status field so a real first-run init no longer exits rc=1 with an
+    # empty log; the underlying scaffold-vs-resolver mismatch remains visible
+    # in the printed start_dry_run output for follow-up.
+    if start_dry_run="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --dry-run 2>&1)"; then
+      start_dry_run_status="ok"
+    else
+      start_dry_run_status="warn (rc=$?)"
+    fi
   fi
 
   if [[ $json_mode -eq 1 ]]; then
@@ -2319,7 +2334,7 @@ report and reap test-fixture agents per their pattern."
     echo "dry_run: yes"
   else
     echo "create: ok"
-    echo "start_dry_run: ok"
+    echo "start_dry_run: $start_dry_run_status"
     echo "$start_dry_run"
     echo "next_steps:"
     echo "  - agent-bridge setup agent $agent"
