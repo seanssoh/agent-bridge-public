@@ -22,7 +22,24 @@ export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
 # Always clear the bypass at exit so a crashed / interrupted upgrade
 # can never leave the env in a state that disarms the resolver for
 # subsequent shells in the same process tree.
-trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
+# Issue #682: emit a JSON failure envelope on stdout when --json is set
+# and the script is exiting non-zero without having already emitted JSON
+# (bridge_die, set -e abort, external helper rc!=0). The emit body is
+# defined later (`bridge_upgrade_emit_failure_json`); the trap is
+# installed up here so very-early bridge_die calls (option parsing, dirty
+# source check) still produce a JSON envelope when --json was passed.
+_bridge_upgrade_exit_handler() {
+  local rc=$?
+  unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID
+  if [[ $rc -ne 0 \
+        && "${JSON:-0}" == "1" \
+        && "${_BRIDGE_UPGRADE_JSON_EMITTED:-0}" != "1" ]] \
+      && declare -F bridge_upgrade_emit_failure_json >/dev/null 2>&1; then
+    bridge_upgrade_emit_failure_json "$rc" || true
+  fi
+  return "$rc"
+}
+trap _bridge_upgrade_exit_handler EXIT
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 # shellcheck source=lib/bridge-cleanup.sh
@@ -60,6 +77,26 @@ SOURCE_REF=""
 SOURCE_HEAD=""
 SOURCE_RECLASSIFY_JSON='{}'
 SHARED_SETTINGS_RERENDER_JSON='{"mode":"skipped","count":0,"failed_count":0,"candidates":[]}'
+ISOLATION_V2_MIGRATION_JSON=""
+
+# Issue #682: every exit path from `apply` must emit a single valid JSON
+# document on stdout when --json is set. The success/dry-run paths emit
+# at the bottom of the script (search for `mode": "upgrade"`); the
+# bridge_die / set -e / external-helper-rc!=0 paths previously dropped
+# straight to text on stderr and an empty stdout, breaking the contract
+# for programmatic operators (issue #682 Finding 1, surfaced by the
+# v0.7.7 → v0.8.4 OrbStack VM E2E retest, task #4195 Scenario C).
+#
+# `_BRIDGE_UPGRADE_JSON_EMITTED` flips to 1 once the success-path
+# envelope prints; the EXIT trap emits a `rc != 0 + error{...}` envelope
+# only when the flag is still 0. `_BRIDGE_UPGRADE_DIE_REASON` /
+# `_BRIDGE_UPGRADE_DIE_DETAIL` / `_BRIDGE_UPGRADE_DIE_REMEDIATION` are
+# populated by the migration block so the emitted envelope carries
+# actionable detail rather than just "rc=1".
+_BRIDGE_UPGRADE_JSON_EMITTED=0
+_BRIDGE_UPGRADE_DIE_REASON=""
+_BRIDGE_UPGRADE_DIE_DETAIL=""
+_BRIDGE_UPGRADE_DIE_REMEDIATION=""
 
 usage() {
   cat <<EOF
@@ -80,6 +117,97 @@ The repo checkout remains source of truth for core code. Live-only operator chan
 When run from an installed live copy without --source, the last recorded source checkout is reused and pulled automatically.
 Default channel is stable: the latest vX.Y.Z tag is used when one exists. Use --channel dev to track main, or --channel current/--source to deploy the current checkout.
 EOF
+}
+
+# Issue #682: emit a single valid JSON envelope on stdout when --json is
+# set and the script is exiting non-zero before the success/dry-run JSON
+# emission point. Idempotent: the EXIT trap calls this only when
+# `_BRIDGE_UPGRADE_JSON_EMITTED` is still 0. Best-effort: any internal
+# failure falls back to a hardcoded minimal envelope so the caller
+# always gets parseable JSON.
+#
+# Args:
+#   $1  exit code (rc)
+bridge_upgrade_emit_failure_json() {
+  local rc="${1:-1}"
+  local reason="${_BRIDGE_UPGRADE_DIE_REASON:-}"
+  local detail="${_BRIDGE_UPGRADE_DIE_DETAIL:-}"
+  local remediation="${_BRIDGE_UPGRADE_DIE_REMEDIATION:-}"
+  if [[ -z "$reason" ]]; then
+    reason="upgrade aborted (rc=${rc})"
+  fi
+  if [[ -z "$detail" ]]; then
+    detail="agent-bridge upgrade exited with rc=${rc} before reaching the success/dry-run JSON emission point. See stderr for the textual error."
+  fi
+  if [[ -z "$remediation" ]]; then
+    remediation="re-run with --json --dry-run to inspect the planned changes; consult agent-bridge logs / stderr for the underlying failure."
+  fi
+  # Pass values via argv (escapes safely for any input — newlines, quotes,
+  # unicode). Empty strings are forwarded as-is and rendered as null in the
+  # envelope when the corresponding bash var was empty.
+  if ! python3 - \
+        "$rc" \
+        "$reason" \
+        "$detail" \
+        "$remediation" \
+        "${SOURCE_VERSION:-}" \
+        "${SOURCE_ROOT:-}" \
+        "${SOURCE_REF:-}" \
+        "${SOURCE_HEAD:-}" \
+        "${TARGET_ROOT:-}" \
+        "${CHANNEL:-}" \
+        "${TARGET_REF:-}" \
+        "${TARGET_VERSION:-}" \
+        "${TARGET_HEAD:-}" \
+        "${DRY_RUN:-0}" \
+        "${ISOLATION_V2_MIGRATION_JSON:-}" \
+        <<'PY' 2>/dev/null
+import json, sys
+
+(rc, reason, detail, remediation,
+ source_version, source_root, source_ref, source_head,
+ target_root, channel, target_ref, target_version, target_head,
+ dry_run, iso_v2_json) = sys.argv[1:16]
+
+def _or_none(s):
+    return s if s else None
+
+def _load_json_str(s):
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except (ValueError, TypeError):
+        return {"_raw": s, "_parse_error": True}
+
+payload = {
+    "mode": "upgrade",
+    "rc": int(rc),
+    "error": {
+        "reason": reason,
+        "detail": detail,
+        "remediation": remediation,
+    },
+    "version": _or_none(source_version),
+    "source_root": _or_none(source_root),
+    "source_ref": _or_none(source_ref),
+    "source_head": _or_none(source_head),
+    "target_root": _or_none(target_root),
+    "channel": _or_none(channel),
+    "target_ref": _or_none(target_ref),
+    "target_version": _or_none(target_version),
+    "target_head": _or_none(target_head),
+    "dry_run": dry_run == "1",
+    "isolation_v2_migration": _load_json_str(iso_v2_json),
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+  then
+    # Fallback: minimal hand-rolled JSON if python invocation fails
+    # entirely. Operators still get a parseable envelope.
+    printf '{"mode":"upgrade","rc":%d,"error":{"reason":"emit-helper-failed","detail":"python3 emission of bridge_upgrade_emit_failure_json failed","remediation":"inspect bridge-upgrade stderr"}}\n' "$rc"
+  fi
+  _BRIDGE_UPGRADE_JSON_EMITTED=1
 }
 
 bridge_upgrade_version_from_file() {
@@ -1228,6 +1356,13 @@ EOF
   _migrate_rc=$?
   set -e
   if [[ $_migrate_rc -ne 0 ]]; then
+    # Issue #682: populate structured failure fields so the EXIT trap's
+    # --json emit carries actionable detail (apply-live did NOT run at
+    # this point; live VERSION + installed_version both still match the
+    # pre-upgrade state).
+    _BRIDGE_UPGRADE_DIE_REASON="isolation-v2 migration failed (rc=${_migrate_rc})"
+    _BRIDGE_UPGRADE_DIE_DETAIL="${ISOLATION_V2_MIGRATION_JSON}"
+    _BRIDGE_UPGRADE_DIE_REMEDIATION="see ${TARGET_ROOT}/state/migration/isolation-v2/last-error.json; apply-live did NOT run, safe to retry after fix"
     bridge_die "isolation-v2 migration failed during upgrade
   rc=${_migrate_rc}
   detail: ${ISOLATION_V2_MIGRATION_JSON}
@@ -1268,6 +1403,34 @@ if [[ $STRICT_MERGE -eq 1 ]]; then
   apply_args+=(--strict-merge)
 fi
 APPLY_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${apply_args[@]}")"
+
+# Issue #682 Finding 2: advance the `installed_version` / `installed_ref`
+# / `installed_head` metadata atomically with the live VERSION write.
+# apply-live above writes the live VERSION file (plus every other tracked
+# release file) by treating it as a normal text merge target; subsequent
+# steps (shared-settings rerender, migrate-agents, daemon restart) can
+# fail under `set -e` after VERSION has already advanced. write-state
+# previously sat at the very end of the apply path, which produced the
+# observed "live VERSION=0.8.4 + installed_version=0.7.7" mismatch when a
+# downstream helper exited non-zero. Running it here pins the invariant:
+# if the live VERSION file moved, last-upgrade.json moved with it. The
+# call is itself a single small JSON write (state/upgrade/last-upgrade.json)
+# and is safe to re-run — re-invoking the upgrader idempotently re-writes
+# the same payload.
+if [[ $DRY_RUN -eq 0 ]]; then
+  _write_state_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-state-json.XXXXXX")"
+  printf '%s' "$ANALYSIS_JSON" >"$_write_state_payload_dir/analysis.json"
+  python3 "$SOURCE_ROOT/bridge-upgrade.py" write-state \
+    --source-root "$SOURCE_ROOT" \
+    --target-root "$TARGET_ROOT" \
+    --backup-root "$BACKUP_ROOT" \
+    --analysis-json-file "$_write_state_payload_dir/analysis.json" \
+    --version "$SOURCE_VERSION" \
+    --source-ref "$SOURCE_REF" \
+    --channel "$CHANNEL" >/dev/null
+  rm -rf "$_write_state_payload_dir"
+fi
+
 AGENT_RESTART_JSON="$(bridge_upgrade_agent_restart_json "" 0 "$DRY_RUN")"
 
 if [[ $DRY_RUN -eq 0 ]]; then
@@ -1454,19 +1617,6 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
 fi
 
-if [[ $DRY_RUN -eq 0 ]]; then
-  _write_state_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-state-json.XXXXXX")"
-  printf '%s' "$ANALYSIS_JSON" >"$_write_state_payload_dir/analysis.json"
-  python3 "$SOURCE_ROOT/bridge-upgrade.py" write-state \
-    --source-root "$SOURCE_ROOT" \
-    --target-root "$TARGET_ROOT" \
-    --backup-root "$BACKUP_ROOT" \
-    --analysis-json-file "$_write_state_payload_dir/analysis.json" \
-    --version "$SOURCE_VERSION" \
-    --source-ref "$SOURCE_REF" \
-    --channel "$CHANNEL" >/dev/null
-  rm -rf "$_write_state_payload_dir"
-fi
 
 # Bug #507 — auto-cleanup of daily-backup residue on every successful
 # `agb upgrade --apply`. Idempotent; reports failures via cleanup_failures
@@ -1836,6 +1986,13 @@ PY
   _json_rc=$?
   set -e
   rm -rf "$_json_payload_dir"
+  # Issue #682: mark the success-path JSON envelope as emitted so the
+  # EXIT trap does not double-print a failure envelope when `exit
+  # "$_json_rc"` itself is non-zero (rare — the python heredoc above
+  # already produced output; a second envelope would corrupt the
+  # contract). On _json_rc != 0, the trap fires, sees the flag=1, and
+  # skips emit; operator still gets the raw python stderr.
+  _BRIDGE_UPGRADE_JSON_EMITTED=1
   exit "$_json_rc"
 fi
 
