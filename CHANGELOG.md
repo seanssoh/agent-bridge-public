@@ -6,6 +6,14 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.8.5] — 2026-05-08
+
+### Highlight — closes 16 release-blocker findings surfaced by the v0.8.4 OrbStack VM E2E retest chain
+
+`v0.8.4` shipped on 2026-05-07. Follow-up OrbStack Linux VM end-to-end verification (Debian 12 + Oracle 9.7) found a 4-wave chain of release-blocker regressions: silent failed-upgrade JSON, daemon stop/start/status disagreement, scaffold predicate misfire on `agent create --isolate`, partial-state status/show/doctor crashes, v2 layout `home/`-vs-`workdir/` divergence, admin-pair backfill spurious warning, and v0.7→v0.8 migration aborts on long-running agent sessions. Wave-5 closes the 3 follow-up findings the Wave-4 retest surfaced: fresh-init missing live CLI, scaffold sudo silent-failure masking, and isolated-agent rerender state-surface mismatch. v0.8.5 is the first v0.8.x release where the OrbStack VM E2E acceptance gate (3 scenarios: fresh Debian install, Oracle 9.7 v0.8.x→v0.8.x upgrade, v0.7.7 → v0.8.x migration) passes deterministically.
+
+**Operators on v0.8.4: upgrade to v0.8.5.** No separate v0.8.4 stop is required; `agent-bridge upgrade --apply` from a v0.8.4 install converges to v0.8.5 in one pass.
+
 ### Fixed
 
 - **fresh `agent-bridge init` left no live CLI under `$BRIDGE_HOME`** (`bridge-init.sh::bridge_init_ensure_live_cli`): on a non-dry-run init from a source checkout, `~/.agent-bridge/agent-bridge` was never materialized — `bridge-init.sh` only scaffolded `state/`, `runtime/`, `shared/`, the v2 marker, and the admin/admin-pair role blocks; the only code that copies tracked source into `$BRIDGE_HOME` was the standalone `scripts/deploy-live-install.sh` (documented in `OPERATIONS.md` as the upgrade path, never wired into fresh init). Operators and the OrbStack VM E2E retest harness (task #4280 Scenario A) followed the documented post-clone flow `git clone … && bash bridge-init.sh && ~/.agent-bridge/agent-bridge agent create …` and got `~/.agent-bridge/agent-bridge: No such file or directory`. The new `bridge_init_ensure_live_cli` step runs after preflight on the non-dry-run path, short-circuits when the live CLI already exists or when `$SCRIPT_DIR == $BRIDGE_HOME` (re-init / self-deploy), and otherwise dispatches `scripts/deploy-live-install.sh --target $BRIDGE_HOME` through `bridge_init_run_step` so a deploy failure fail-fasts the whole init rather than swallowing into a silent partial state. `agent-bridge init` is now a single self-contained post-clone entry point. Closes the front-line CLI-path failure surfaced repeatedly across Wave-3 / Wave-4 retests (#4226 noted as known limitation, #4280 escalated).
