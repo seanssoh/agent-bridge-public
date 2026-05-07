@@ -3068,11 +3068,20 @@ bridge_daemon_pid() {
   local pid=""
   local candidate=""
   local pattern=""
+  local cmdline=""
 
   pid="$(bridge_daemon_recorded_pid)"
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-    printf '%s' "$pid"
-    return 0
+    # Issue #683: pid recycling guard. A stale pid file plus a recycled
+    # OS pid would let `kill -0` succeed for a totally unrelated process,
+    # yielding "running pid=NNNN" from cmd_status that contradicts the
+    # live-listener probes. Verify cmdline before trusting the recorded pid;
+    # fall through to the pgrep-by-pattern path on mismatch.
+    cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    if [[ -z "$cmdline" || "$cmdline" == *"bridge-daemon.sh run"* ]]; then
+      printf '%s' "$pid"
+      return 0
+    fi
   fi
 
   pattern="$BRIDGE_HOME/bridge-daemon.sh run"

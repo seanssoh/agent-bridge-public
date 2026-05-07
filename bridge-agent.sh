@@ -2066,6 +2066,11 @@ run_create() {
   local start_dry_run_status="ok"
   # Issue #598 Track 4: opt-in for test-artifact-prefix names.
   local test_fixture=0
+  # Issue #691: opt-in for callers that legitimately share a workdir with
+  # another already-managed agent (e.g. the admin-pair backfill spawning
+  # `<admin>-dev` into the admin's workdir, where bootstrap_project_skill has
+  # already populated `.agents/`). Skips the non-empty-workdir guard.
+  local allow_shared_workdir=0
 
   shift || true
 
@@ -2214,6 +2219,14 @@ run_create() {
         test_fixture=1
         shift
         ;;
+      --allow-shared-workdir)
+        # Issue #691: skip the non-empty-workdir guard. Sanctioned for the
+        # admin-pair backfill (admin + admin-dev share the same workdir per
+        # their roles) and any future caller that legitimately layers on top
+        # of an existing managed scaffold.
+        allow_shared_workdir=1
+        shift
+        ;;
       *)
         bridge_die "지원하지 않는 agent create 옵션입니다: $1"
         ;;
@@ -2315,6 +2328,10 @@ report and reap test-fixture agents per their pattern."
       if [[ -d "$workdir" ]] && [[ -z "$(find "$workdir" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]]; then
         :
       elif [[ -d "$workdir" && -f "$workdir/CLAUDE.md" ]]; then
+        :
+      elif [[ -d "$workdir" && $allow_shared_workdir -eq 1 ]]; then
+        # Issue #691: caller (admin-pair backfill) explicitly opts into
+        # layering onto an existing managed workdir scaffold.
         :
       else
         bridge_die "workdir가 이미 존재하고 비어 있지 않습니다: $workdir"
