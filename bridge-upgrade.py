@@ -155,6 +155,24 @@ def read_source_version(source_root: Path) -> str:
     return version or "0.0.0-dev"
 
 
+def read_target_version(target_root: Path) -> str:
+    """Read the live install's `VERSION` file, mirror of `read_source_version`.
+
+    Returns "" when the file is missing or empty so callers can distinguish
+    "no live VERSION recorded" (fresh / corrupt install) from a real
+    semver string. Issue #666: used by `analyze_live` to recover from a
+    missing/unreachable `base_ref` on a real cross-version upgrade by
+    treating content-drifted files as `upstream_only` instead of
+    `unknown_base_live_diff` (which silently keeps live and never copies).
+    """
+    version_path = target_root / "VERSION"
+    try:
+        version = version_path.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (FileNotFoundError, IndexError, OSError):
+        return ""
+    return version
+
+
 def load_json_arg(value: str = "", file_path: str = "") -> dict[str, Any]:
     if file_path:
         return json.loads(Path(file_path).read_text(encoding="utf-8"))
@@ -1373,6 +1391,21 @@ def analyze_live(source_root: Path, target_root: Path, base_ref: str) -> dict[st
         "mode_drift": 0,
     }
 
+    # Issue #666: when the source release ref differs from the live VERSION
+    # (a real cross-version upgrade) but `base_ref` could not be resolved
+    # / its commit is unreachable in this source clone, the previous
+    # classifier sent every content-drifted file to `unknown_base_live_diff`
+    # → `keep_live` and copied 0 files. Result: rc=0 + installed metadata
+    # bumped + live runtime stayed on the prior version (silent failed
+    # upgrade). Compute the version-mismatch flag once up-front so per-file
+    # classification can fall back to `upstream_only` (deploy_upstream)
+    # when there is no usable `base` *and* we know upstream is a different
+    # release — preserving the "rerun same version → keep operator edits"
+    # contract by gating on the version mismatch, not just on `base is None`.
+    source_version = read_source_version(source_root)
+    target_version = read_target_version(target_root)
+    versions_differ = bool(target_version) and source_version != target_version
+
     for relpath in tracked_files(source_root):
         if should_skip_relpath(relpath):
             continue
@@ -1410,8 +1443,20 @@ def analyze_live(source_root: Path, target_root: Path, base_ref: str) -> dict[st
                 classification = "unchanged"
                 strategy = "noop"
         elif not base_ref or base is None:
-            classification = "unknown_base_live_diff"
-            strategy = "keep_live"
+            # Issue #666: no usable base for this file. If the source
+            # release ref is a different version from the live install,
+            # treat as a forward-rolling upgrade and deploy upstream
+            # (release-shipped files like VERSION, bridge-upgrade.py,
+            # lib/bridge-isolation-v2*.sh must actually land). On a
+            # same-version rerun (e.g. re-applying v0.8.3 over v0.8.3
+            # without recorded base_ref), keep_live still wins —
+            # operator-edited content is preserved.
+            if versions_differ:
+                classification = "upstream_only"
+                strategy = "deploy_upstream"
+            else:
+                classification = "unknown_base_live_diff"
+                strategy = "keep_live"
         elif base == live:
             classification = "upstream_only"
             strategy = "deploy_upstream"
