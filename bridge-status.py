@@ -341,6 +341,15 @@ def pending_upgrade_conflict_count(bridge_home: str) -> int:
 
     Returns 0 if the path does not exist or is not a directory; the
     counter is purely additive on healthy hosts.
+
+    v0.8.5 #681: tolerate `PermissionError`/`OSError` raised mid-walk
+    when a partial isolated agent (e.g. broken `agent create
+    --isolate`) leaves a `data/agents/<agent>/workdir` subtree the
+    controller cannot read. Without this guard `Path.rglob` propagates
+    the first such EACCES out and crashes `agent-bridge status
+    --all-agents` — operators lose dashboard observability of the very
+    state they need to triage. We walk manually so a single denied
+    branch only excludes that subtree, not the whole count.
     """
     if not bridge_home:
         return 0
@@ -348,15 +357,45 @@ def pending_upgrade_conflict_count(bridge_home: str) -> int:
     if not home.is_dir():
         return 0
     count = 0
-    for path in home.rglob("*.upgrade-conflict"):
+    stack: list[Path] = [home]
+    while stack:
+        current = stack.pop()
         try:
-            rel = path.relative_to(home).as_posix()
-        except ValueError:
+            entries = list(os.scandir(current))
+        except (PermissionError, OSError):
+            # Partial isolated-agent state, missing dir, or any other
+            # filesystem drift. Skip this subtree only — keep counting.
             continue
-        if rel.startswith("backups/"):
-            continue
-        if path.is_file():
-            count += 1
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if is_dir:
+                # Prune `backups/` at the BRIDGE_HOME root before
+                # descending — same exclusion the rglob/relative_to
+                # branch enforced previously.
+                try:
+                    rel = Path(entry.path).relative_to(home).as_posix()
+                except ValueError:
+                    rel = ""
+                if rel == "backups" or rel.startswith("backups/"):
+                    continue
+                stack.append(Path(entry.path))
+                continue
+            if entry.name.endswith(".upgrade-conflict"):
+                try:
+                    rel = Path(entry.path).relative_to(home).as_posix()
+                except ValueError:
+                    continue
+                if rel.startswith("backups/"):
+                    continue
+                try:
+                    is_file = entry.is_file(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_file:
+                    count += 1
     return count
 
 

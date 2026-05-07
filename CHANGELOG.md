@@ -6,6 +6,11 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **#677 isolated agent scaffold Permission denied on `agent create`** (`bridge-agent.sh::bridge_scaffold_agent_home`): scaffold now uses sudo-handoff (`bridge_linux_sudo_root mkdir/chown/chmod`) to pre-create the per-agent v2 root and `$home` with controller ownership when `bridge_agent_linux_user_isolation_effective` returns true, so the rest of the scaffold (template renders, mkdirs, chmods) runs as plain controller writes. `bridge_linux_prepare_agent_isolation` (which runs after scaffold) then normalizes ownership/mode to the canonical `root:ab-agent-<name> 2750` per-agent root + `<isolated>:ab-agent-<name> 2770` subdirs and `chown -R $os_user $workdir` transfers scaffolded contents to the isolated UID. Closes the front-line failure that PR #675 had scope-controlled out — fresh `agent create <name> --engine codex --isolate --os-user <u>` on Debian / Oracle Linux now completes rc=0 with no Permission denied. Mirrors PR #675's `bridge_state_sudo_install_v2_file` sudo-handoff pattern in `lib/bridge-state.sh`.
+- **#681 `agent-bridge status --all-agents` PermissionError crash on partial isolated agent state** (`bridge-status.py::pending_upgrade_conflict_count`): the `home.rglob("*.upgrade-conflict")` walk used by the dashboard's `pending upgrade-conflicts` warning line propagated the first `PermissionError` raised by an unreadable `data/agents/<broken-agent>/workdir/` subtree out of the function, crashing the entire status render. Replaced with an explicit `os.scandir` stack walk that catches `PermissionError`/`OSError` per directory: a single denied subtree is skipped, iteration continues, and operators retain dashboard observability of the partial-create state they need to triage. `backups/...` exclusion behavior preserved.
+
 ## [0.8.4] — 2026-05-07
 
 ### Highlight — closes 5 release-blocker regressions surfaced by v0.8.3 OrbStack VM E2E
