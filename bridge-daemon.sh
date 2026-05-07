@@ -5417,6 +5417,33 @@ bridge_stop_silence_watchdog() {
 
 cmd_start() {
   local start_deadline
+  local recorded_pid=""
+  local recorded_cmdline=""
+
+  # Issue #683: post-upgrade verification (start → status) reported
+  # contradictory state — start said "already running pid=NNNN", status said
+  # "stopped socket_listener=off". Two failure modes converge here:
+  #   1. Stale pid file from a prior daemon that exited without cleanup
+  #      (kill -0 returns 1).
+  #   2. Pid recycling: kill -0 succeeds for a recorded pid that the OS has
+  #      reassigned to an unrelated process (different cmdline).
+  # Reap the pid file in both cases before deferring to bridge_daemon_is_running
+  # so start and status agree on daemon-up determination.
+  recorded_pid="$(bridge_daemon_recorded_pid)"
+  if [[ -n "$recorded_pid" ]]; then
+    if ! kill -0 "$recorded_pid" 2>/dev/null; then
+      daemon_info "stale pid file (pid=${recorded_pid} no longer alive), starting fresh"
+      rm -f "$BRIDGE_DAEMON_PID_FILE"
+      recorded_pid=""
+    else
+      recorded_cmdline="$(ps -p "$recorded_pid" -o args= 2>/dev/null || true)"
+      if [[ -n "$recorded_cmdline" && "$recorded_cmdline" != *"bridge-daemon.sh run"* ]]; then
+        daemon_info "stale pid file (pid=${recorded_pid} belongs to non-bridge process), starting fresh"
+        rm -f "$BRIDGE_DAEMON_PID_FILE"
+        recorded_pid=""
+      fi
+    fi
+  fi
 
   if bridge_daemon_is_running; then
     daemon_info "bridge daemon already running (pid=$(bridge_daemon_pid))"
