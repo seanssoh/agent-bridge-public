@@ -395,6 +395,22 @@ bridge_scaffold_agent_home() {
   local role_text="$4"
   local engine="$5"
   local session_type="$6"
+  # v0.8.5 #693 (Wave-3): explicit isolation_mode + os_user passed by the
+  # caller (run_create) so the scaffold's sudo-handoff predicate does not
+  # rely on the in-memory roster. At scaffold time the new agent has not
+  # yet been written to agent-roster.local.sh (bridge_write_role_block
+  # runs AFTER scaffold) and `bridge_load_roster` has not been re-invoked,
+  # so `bridge_agent_linux_user_isolation_effective` — which reads
+  # `BRIDGE_AGENT_ISOLATION_MODE[<agent>]` / `BRIDGE_AGENT_OS_USER[<agent>]`
+  # — always returns false for a fresh `agent create --isolate ...` and
+  # the entire PR #688 sudo-handoff block (added for #677) silently
+  # no-ops. Plain `mkdir -p "$home"` then fails with `Permission denied`
+  # because `data/agents/` is `root:root mode 755`. Surface the values
+  # directly from the caller so the predicate works regardless of when
+  # the roster reload happens. Defaults preserve the legacy single-param
+  # signature for any internal callsite that does not (yet) opt in.
+  local explicit_isolation_mode="${7:-}"
+  local explicit_os_user="${8:-}"
   local template_root="$SCRIPT_DIR/agents/_template"
   local session_template="$template_root/session-types/$session_type.md"
   local session_files_root="$template_root/session-type-files/$session_type"
@@ -438,9 +454,27 @@ bridge_scaffold_agent_home() {
   # $os_user $workdir` transfers the scaffolded contents to the
   # isolated UID. Mirrors PR #675's `bridge_state_sudo_install_v2_file`
   # sudo-handoff pattern in lib/bridge-state.sh.
+  # v0.8.5 #693 (Wave-3): replicate `bridge_agent_linux_user_isolation_effective`
+  # using the explicitly-passed args + host-platform check, instead of
+  # querying the in-memory roster which has not yet seen this agent (see
+  # the "explicit_isolation_mode" comment block above). Falls back to the
+  # roster-driven predicate when the caller did not pass explicit args
+  # (any pre-#693 callsite), so the legacy code path keeps functioning
+  # for callers that already had the agent registered before scaffold
+  # (admin-pair backfill via `agent create --allow-shared-workdir`, etc.).
+  local _scaffold_isolation_active=0
+  if [[ -n "$explicit_isolation_mode" || -n "$explicit_os_user" ]]; then
+    if [[ "$explicit_isolation_mode" == "linux-user" ]] \
+        && [[ -n "$explicit_os_user" ]] \
+        && [[ "$(bridge_host_platform 2>/dev/null || uname -s 2>/dev/null || printf '')" == "Linux" ]]; then
+      _scaffold_isolation_active=1
+    fi
+  elif command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    _scaffold_isolation_active=1
+  fi
   if [[ -n "$home" ]] \
-      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
-      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && [[ $_scaffold_isolation_active -eq 1 ]] \
       && command -v bridge_linux_sudo_root >/dev/null 2>&1; then
     local _scaffold_v2_root=""
     local _scaffold_controller=""
@@ -2337,7 +2371,12 @@ report and reap test-fixture agents per their pattern."
         bridge_die "workdir가 이미 존재하고 비어 있지 않습니다: $workdir"
       fi
     fi
-    bridge_scaffold_agent_home "$agent" "$workdir" "$display_name" "$role_text" "$engine" "$session_type"
+    # v0.8.5 #693 (Wave-3): pass isolation_mode + os_user so scaffold's
+    # sudo-handoff predicate (added by PR #688 for #677) actually fires
+    # on `agent create --isolate ...`. Without these explicit args, the
+    # in-roster lookup inside scaffold would short-circuit the sudo path
+    # — see the comment on `bridge_scaffold_agent_home`'s signature.
+    bridge_scaffold_agent_home "$agent" "$workdir" "$display_name" "$role_text" "$engine" "$session_type" "$isolation_mode" "$os_user"
     bridge_scaffold_user_partitions "$workdir" "$users_json"
     if [[ "$engine" == "claude" ]]; then
       bridge_ensure_project_claude_guidance "$workdir" >/dev/null 2>&1 || true
