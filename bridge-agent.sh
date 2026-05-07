@@ -1882,12 +1882,40 @@ run_rerender_settings() {
       # 1_000_000; launch_cmd is forwarded only for caller-signature parity
       # with helpers that still accept it (no longer consulted by the renderer).
       target_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+      # Issue #669: for v2 linux-user-isolated agents the `<workdir>/.claude/`
+      # tree lives under the foreign UID (mode 0700), so the controller
+      # cannot create or symlink files there. The workdir-side render is
+      # also dead work for these agents — the running Claude session reads
+      # `<isolated-home>/.claude/settings.json` from its own HOME, not the
+      # workdir. Skip the workdir-side render and route directly to the
+      # cross-UID handler (`bridge_install_isolated_home_settings`, which
+      # uses `bridge_linux_sudo_root` to write under the foreign UID).
+      # Net effect: rc=0 on first run for cross-UID isolated agents,
+      # which is what the v0.8.3 release-note "idempotent on rerun" promise
+      # was supposed to deliver but didn't (it stayed rc=1 → rc=1 because
+      # this branch never had a cross-UID path).
+      #
+      # `bridge_install_isolated_home_settings` is best-effort by contract
+      # (warns + returns 0 on internal failures so a missing-sudo host
+      # doesn't bridge_die the rerender loop). We let stderr flow through
+      # to the operator (matching the existing line ~1903 call pattern)
+      # rather than capturing it into apply_output, so warnings remain
+      # visible. The rerender row reports `rerendered`/`unchanged` —
+      # consistent with the v0.8.3 CHANGELOG promise that re-running
+      # converges to rc=0.
+      if [[ "$agent" != "_template" ]] \
+          && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+          && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+        bridge_install_isolated_home_settings "$agent" "$target_launch_cmd" >/dev/null || true
+        after_json="$before_json"
+        bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "shared_settings_rerendered" "$agent" \
+          --detail workdir="$workdir" --detail strategy=cross_uid_isolated_home >/dev/null 2>&1 || true
       # Issue #555: forward agent id so the rerender writes to the
       # per-agent effective file ($BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/
       # settings.effective.json). Mixed-model installs no longer fight
       # over a single install-wide file; each agent's autoCompactWindow
       # (and any future per-agent managed default) is independent.
-      if apply_output="$(bridge_link_claude_settings_to_shared "$workdir" "$target_launch_cmd" "$agent" 2>&1)"; then
+      elif apply_output="$(bridge_link_claude_settings_to_shared "$workdir" "$target_launch_cmd" "$agent" 2>&1)"; then
         after_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
         bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "shared_settings_rerendered" "$agent" \
           --detail workdir="$workdir" >/dev/null 2>&1 || true
