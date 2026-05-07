@@ -122,6 +122,37 @@ bridge_init_run_step() {
   fi
 }
 
+bridge_init_ensure_live_cli() {
+  # Issue #4282 Wave-5: on a non-dry-run init, deploy the live CLI under
+  # $BRIDGE_HOME so the operator's next command (`~/.agent-bridge/agent-bridge
+  # agent create ...`, the canonical post-init flow documented in the
+  # OrbStack VM E2E retest brief) finds the binary it expects. Without
+  # this, `bridge-init.sh` from a fresh source checkout returned rc=0 with
+  # only state/runtime/shared/ scaffolded — the `agent-bridge` script
+  # itself stayed under $SCRIPT_DIR (which is $HOME/.agent-bridge-source,
+  # not $BRIDGE_HOME), and operators / VM retest harnesses fell off the
+  # documented path with `~/.agent-bridge/agent-bridge: No such file or
+  # directory`. The only existing code that materializes the CLI under
+  # $BRIDGE_HOME was the standalone `scripts/deploy-live-install.sh` —
+  # tracked in OPERATIONS.md as the upgrade path, never wired into the
+  # fresh-init dispatch. Wire it here so `agent-bridge init` is the single
+  # post-clone entry point operators need.
+  #
+  # Idempotent: short-circuits when the CLI already exists at the live
+  # path (re-init / partial-state recovery) and when init was invoked
+  # from $BRIDGE_HOME directly (self-deploy would overwrite live state
+  # we are still initializing). Errors fail-fast through
+  # `bridge_init_run_step` rather than warn-and-continue, since a
+  # missing live CLI breaks the whole operator workflow.
+  [[ $dry_run -eq 0 ]] || return 0
+  [[ -x "$BRIDGE_HOME/agent-bridge" ]] && return 0
+  local script_dir_canonical bridge_home_canonical
+  script_dir_canonical="$(cd -P "$SCRIPT_DIR" 2>/dev/null && pwd -P || printf '%s' "$SCRIPT_DIR")"
+  bridge_home_canonical="$(cd -P "$BRIDGE_HOME" 2>/dev/null && pwd -P || printf '%s' "$BRIDGE_HOME")"
+  [[ "$script_dir_canonical" != "$bridge_home_canonical" ]] || return 0
+  bridge_init_run_step "live install deploy" "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/deploy-live-install.sh" --target "$BRIDGE_HOME"
+}
+
 bridge_init_warnings_json() {
   bridge_require_python
   python3 - "${WARNINGS[@]}" <<'PY'
@@ -575,6 +606,9 @@ else
   final_session="${BRIDGE_AGENT_SESSION[$admin_agent]-$session}"
   final_workdir="${BRIDGE_AGENT_WORKDIR[$admin_agent]-${workdir:-$(bridge_agent_default_home "$admin_agent")}}"
 fi
+
+bridge_init_ensure_live_cli
+
 warnings_json="$(bridge_init_warnings_json)"
 
 if [[ $json_mode -eq 1 ]]; then
