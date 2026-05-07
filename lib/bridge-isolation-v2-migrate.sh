@@ -901,6 +901,7 @@ bridge_isolation_v2_migrate_orchestrate_stop() {
 
 bridge_isolation_v2_migrate_orchestrate_restart() {
   local snapshot_path="$1"
+  local daemon_up=0
 
   # v0.8.3: on macOS, bring the daemon back under launchd supervision
   # via `launchctl bootstrap` instead of `bridge-daemon.sh start`. The
@@ -912,10 +913,28 @@ bridge_isolation_v2_migrate_orchestrate_restart() {
     bridge_isolation_v2_launchd_bootstrap \
       || bridge_die "daemon restart failed (launchctl bootstrap)"
     bridge_isolation_v2_migrate_wait_daemon_present 10
+    daemon_up=1
   else
-    "$BRIDGE_BASH_BIN" "$BRIDGE_SCRIPT_DIR/bridge-daemon.sh" start >/dev/null 2>&1 \
-      || bridge_die "daemon restart failed"
-    bridge_isolation_v2_migrate_wait_daemon_present 10
+    # Issue #668: on Linux (and non-launchd Darwin) the migration runs as
+    # a non-root operator with passwordless sudo. usermod just added the
+    # operator to the new ab-controller group, but supplemental group
+    # membership in an already-running shell is cached — until the next
+    # login, this process and its children still see the OLD group set.
+    # Spawning the daemon from this shell therefore inherits stale groups
+    # and the daemon dies the moment it tries to write to a 2770/ab-
+    # controller controller-state path. Treat both `bridge-daemon.sh
+    # start` and the `wait_daemon_present` poll as best-effort: warn,
+    # continue, and surface the relogin requirement in the caller's
+    # JSON. The caller (apply_for_upgrade) advances the marker and
+    # returns success so apply-live can install the v0.8.x code; the
+    # operator finishes the restart by re-logging in (which refreshes
+    # the supplemental-group cache) and running `agb daemon start`.
+    if "$BRIDGE_BASH_BIN" "$BRIDGE_SCRIPT_DIR/bridge-daemon.sh" start >/dev/null 2>&1 \
+        && bridge_isolation_v2_migrate_wait_daemon_present 10 2>/dev/null; then
+      daemon_up=1
+    else
+      bridge_warn "daemon restart deferred — supplemental-group cache requires a fresh login. Re-login and run 'agb daemon start' to finish bringing the daemon up."
+    fi
   fi
 
   # v0.8.3: skip restart for agents whose tmux session has an attached
@@ -923,6 +942,16 @@ bridge_isolation_v2_migrate_orchestrate_restart() {
   # as `agent_restart_skipped_attached`; mirroring the same predicate
   # here prevents the apply step from yanking the rug out from under a
   # live operator session.
+  #
+  # Issue #668: when the daemon could not be brought up (Linux relogin
+  # path), per-agent restarts would just fail, polluting the upgrade
+  # output with N copies of the same root cause. Defer them to the
+  # operator's post-relogin `agb daemon start` follow-up.
+  if (( daemon_up == 0 )); then
+    bridge_warn "per-agent restart deferred — re-login then run 'agb daemon start' to bring agents back up"
+    return 0
+  fi
+
   local agent session attached
   while IFS= read -r agent; do
     [[ -n "$agent" ]] || continue
@@ -1503,10 +1532,17 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
   fi
 
   # Per-agent completion markers — all_snapshot, one marker each.
-  # macOS supplemental group cache: dseditgroup-driven membership only
-  # takes effect after re-login, so flag every Darwin-side agent.
+  # Supplemental-group cache: both macOS dseditgroup membership AND
+  # Linux usermod -aG additions only take effect after re-login, so
+  # flag every agent regardless of platform when the migration ran as
+  # a non-root user (the only path that actually adds groups to the
+  # caller via usermod / dseditgroup). Issue #668: this was previously
+  # macOS-only, leaving the Linux upgrader to omit the relogin caveat
+  # even though the same group cache pitfall applies.
   local relogin_flag=0
-  [[ "$(uname)" == "Darwin" ]] && relogin_flag=1
+  if [[ "$(id -u)" -ne 0 ]]; then
+    relogin_flag=1
+  fi
   local agent agent_grp
   while IFS= read -r agent; do
     [[ -n "$agent" ]] || continue

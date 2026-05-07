@@ -4,6 +4,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Issue #665: the layout resolver fails fast on markerless installs. On a
+# fresh install the marker does not yet exist, so we MUST arm the
+# fresh-install bypass before sourcing bridge-lib.sh. The resolver only
+# honors the bypass when classification is fresh-install-candidate
+# (no existing-install evidence) — an existing markerless install still
+# trips the v0.8.0 fail-fast and is sent to `agent-bridge upgrade --apply`.
+# The bypass value carries a unique nonce, and the resolver only honors
+# it when the calling process is a descendant of the init owner PID, so
+# a leaked or copied env var alone cannot disarm the fail-fast guard.
+_BRIDGE_INIT_BYPASS_NONCE="$(date -u '+%Y%m%dT%H%M%SZ')-$$-${RANDOM}${RANDOM}"
+export BRIDGE_LAYOUT_RESOLVER_BYPASS="fresh-install:${_BRIDGE_INIT_BYPASS_NONCE}"
+export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
+trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 # shellcheck source=lib/bridge-admin-pair.sh

@@ -4,6 +4,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Issue #665: arm the fresh-install resolver bypass before sourcing
+# bridge-lib.sh. See bridge-init.sh for the rationale and contract — the
+# resolver only honors the bypass when classification is
+# fresh-install-candidate, so an existing markerless install still trips
+# the v0.8.0 fail-fast. The trap clears the bypass on exit so a crashed
+# bootstrap does not leave the env in a state that disarms the resolver
+# for sibling shells.
+_BRIDGE_BOOTSTRAP_BYPASS_NONCE="$(date -u '+%Y%m%dT%H%M%SZ')-$$-${RANDOM}${RANDOM}"
+export BRIDGE_LAYOUT_RESOLVER_BYPASS="fresh-install:${_BRIDGE_BOOTSTRAP_BYPASS_NONCE}"
+export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
+trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 
