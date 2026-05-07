@@ -1668,6 +1668,9 @@ bridge_agent_shared_settings_plan_json() {
   local workdir="$2"
   local launch_cmd
   local agent_class=""
+  local effective_file
+  local settings_path_override=""
+  local _isolated_active=0
   launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
   # Issue #593: pass the agent's source class through to the resolver so
   # the plan/diff helper computes the same managed default the renderer
@@ -1680,35 +1683,76 @@ bridge_agent_shared_settings_plan_json() {
     agent_class="$(bridge_agent_source "$agent" 2>/dev/null || true)"
   fi
 
+  effective_file="$(bridge_hook_per_agent_settings_effective_file "$agent")"
+
+  # Wave-5 #4282 Scenario B: for v2 linux-user-isolated agents the
+  # canonical post-apply settings live under `<isolated-home>/.claude/`,
+  # not under `$workdir`. `bridge_install_isolated_home_settings`
+  # writes both `settings.json` (root-owned symlink) and
+  # `settings.effective.json` (root-owned regular file) into the foreign
+  # UID's home, mode 0750 root:os_user — the controller (other) cannot
+  # stat or read it without sudo. Reading the workdir-relative paths
+  # would always return `link.ok=false` and `effective.matches_expected
+  # =false`, so the rerender row reports `needs-rerender` after every
+  # successful apply (task #4280 Scenario B `bob` agent surfaced this:
+  # rerender --apply rc=0 twice, but bob still showed needs-rerender /
+  # link_ok=false / effective_ok=false). Override the python's read
+  # targets to the isolated paths and run under sudo so the plan
+  # reports the actual post-install state.
+  if [[ "$agent" != "_template" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    local _os_user _isolated_home
+    _os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    if [[ -n "$_os_user" ]]; then
+      _isolated_home="$(bridge_agent_linux_user_home "$_os_user" 2>/dev/null || true)"
+      if [[ -n "$_isolated_home" ]] \
+          && command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+        settings_path_override="$_isolated_home/.claude/settings.json"
+        effective_file="$_isolated_home/.claude/settings.effective.json"
+        _isolated_active=1
+      fi
+    fi
+  fi
+
   # Issue #555: the rerender now writes the effective file at the
   # per-agent path ($BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/
-  # settings.effective.json). The plan/diff helper must compare the
-  # workdir symlink against the same per-agent target it will be
-  # relinked to — comparing against the install-wide path would
+  # settings.effective.json) for non-isolated agents. For isolated
+  # agents the path is overridden to <isolated-home>/.claude/
+  # settings.effective.json by the Wave-5 block above. In either case
+  # the plan/diff helper must compare against the path the renderer
+  # writes to — comparing against the install-wide path would
   # forever report `needs-rerender` after a successful apply.
-  bridge_agent_manage_python \
-    "$SCRIPT_DIR/bridge-hooks.py" \
-    "$agent" \
-    "$workdir" \
-    "$(bridge_hook_shared_settings_base_file)" \
-    "$(bridge_hook_shared_settings_overlay_file)" \
-    "$(bridge_hook_per_agent_settings_effective_file "$agent")" \
-    "$launch_cmd" \
-    "$agent_class" <<'PY'
+  #
+  # Wave-5 #4282: stage the python body to a temp file so the
+  # isolated branch (which must traverse the foreign UID's home and
+  # therefore runs the read under sudo) and the non-isolated branch
+  # share a single source of truth. Without this the bash function
+  # would either duplicate the python verbatim across both branches
+  # (which drifts) or only one branch would benefit from future
+  # python-side fixes.
+  local _plan_py
+  _plan_py="$(mktemp "${TMPDIR:-/tmp}/bridge-rerender-plan.XXXXXX.py")" || return 1
+  cat >"$_plan_py" <<'PY'
 import importlib.util
 import json
 import os
 import sys
 from pathlib import Path
 
-hooks_py, agent, workdir, base_file, overlay_file, effective_file, launch_cmd, agent_class = sys.argv[1:]
+argv = sys.argv[1:]
+hooks_py, agent, workdir, base_file, overlay_file, effective_file, launch_cmd, agent_class = argv[:8]
+settings_path_override = argv[8] if len(argv) > 8 else ""
 spec = importlib.util.spec_from_file_location("bridge_hooks", hooks_py)
 if spec is None or spec.loader is None:
     raise SystemExit(f"could not load {hooks_py}")
 hooks = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hooks)
 
-settings_path = Path(workdir).expanduser() / ".claude" / "settings.json"
+if settings_path_override:
+    settings_path = Path(settings_path_override).expanduser()
+else:
+    settings_path = Path(workdir).expanduser() / ".claude" / "settings.json"
 base_path = Path(base_file).expanduser()
 overlay_path = Path(overlay_file).expanduser()
 effective_path = Path(effective_file).expanduser()
@@ -1788,6 +1832,37 @@ payload = {
 }
 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 PY
+
+  local _plan_rc=0
+  if [[ $_isolated_active -eq 1 ]]; then
+    bridge_require_python
+    bridge_linux_sudo_root python3 "$_plan_py" \
+      "$SCRIPT_DIR/bridge-hooks.py" \
+      "$agent" \
+      "$workdir" \
+      "$(bridge_hook_shared_settings_base_file)" \
+      "$(bridge_hook_shared_settings_overlay_file)" \
+      "$effective_file" \
+      "$launch_cmd" \
+      "$agent_class" \
+      "$settings_path_override"
+    _plan_rc=$?
+  else
+    bridge_require_python
+    python3 "$_plan_py" \
+      "$SCRIPT_DIR/bridge-hooks.py" \
+      "$agent" \
+      "$workdir" \
+      "$(bridge_hook_shared_settings_base_file)" \
+      "$(bridge_hook_shared_settings_overlay_file)" \
+      "$effective_file" \
+      "$launch_cmd" \
+      "$agent_class" \
+      "$settings_path_override"
+    _plan_rc=$?
+  fi
+  rm -f "$_plan_py"
+  return $_plan_rc
 }
 
 bridge_agent_rerender_row_json() {
@@ -2021,7 +2096,15 @@ run_rerender_settings() {
           && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
           && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
         if apply_output="$(bridge_install_isolated_home_settings "$agent" "$target_launch_cmd" 2>&1)"; then
-          after_json="$before_json"
+          # Wave-5 #4282 Scenario B: re-probe via the isolation-aware
+          # plan_json so the row reports the actual post-install state
+          # (link.ok / effective.matches_expected / status). Prior to
+          # Wave-5 the success branch reused `before_json` verbatim,
+          # which left the row stuck at `needs-rerender` even after the
+          # install converged — bob agent on task #4280 retest reported
+          # rerender --apply rc=0 twice with link_ok=false /
+          # effective_ok=false on both runs.
+          after_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
           bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "shared_settings_rerendered" "$agent" \
             --detail workdir="$workdir" --detail strategy=cross_uid_isolated_home >/dev/null 2>&1 || true
         else
