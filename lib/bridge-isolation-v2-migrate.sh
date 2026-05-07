@@ -745,8 +745,15 @@ bridge_isolation_v2_migrate_normalize_layout() {
   # MUST NOT have group write at the root, otherwise it could rename or
   # delete credentials/ even though credentials/ itself is 2750). r3
   # review caught the broad recursive 2770 pass making the root
-  # writable. Spec: lib/bridge-isolation-v2.sh:45-59 +
-  # lib/bridge-agents.sh:2116-2152 (`# 2750 — isolated UID r-x at root`).
+  # writable. v0.8.4 r2 reaffirmed 2750 after a brief 2770 detour:
+  # group write at the root broke credentials isolation (POSIX requires
+  # write on the *parent* directory to delete or rename an entry inside
+  # it). Controller writes under per-agent root that must land outside
+  # the prepare codepath (notably `runtime/history.env`) go through a
+  # sudo-handoff helper in lib/bridge-state.sh instead of relying on
+  # group write at the root. Spec: lib/bridge-isolation-v2.sh:45-59 +
+  # lib/bridge-agents.sh `# 2750 — isolated UID r-x at root` comment in
+  # the prepare path.
   local agent agent_grp agent_root sub
   local writable_subs=(home workdir runtime logs requests responses)
   while IFS= read -r agent; do
@@ -1354,9 +1361,49 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
     printf '%s/state/layout-marker.sh' "$target_root")"
 
   # Idempotent skip: marker already present + valid -> already migrated.
+  # v0.8.4 r2: even on the skip path, run normalize_layout so existing
+  # v0.8.0~v0.8.3 isolated installs (which may carry drifted modes,
+  # including the brief r1 2770 root) get re-pinned to the v0.8.4
+  # canonical 2750 per-agent root + 2770 writable subdirs + 2750
+  # credentials/. The pass is idempotent on already-canonical layouts
+  # (chgrp + chmod to current values is a no-op). Failures here are
+  # warned but not fatal: the operator can rerun `upgrade --apply` once
+  # the underlying problem (e.g. a missing agent group) is corrected,
+  # and a stale-mode install is strictly safer than aborting an
+  # otherwise-successful upgrade — the upgrade has not advanced any
+  # state at this point. The full migrate path below has its own
+  # normalize_layout call with stricter error handling.
   if [[ -f "$marker_path" ]] \
       && bridge_isolation_v2_marker_validate "$marker_path" 2>/dev/null; then
-    printf '{"mode":"isolation-v2-migrate","skipped":true,"reason":"marker-present","marker":"%s","data_root":"%s"}\n' \
+    if bridge_isolation_v2_privilege_preflight 2>/dev/null \
+        && bridge_isolation_v2_active 2>/dev/null; then
+      bridge_isolation_v2_migrate_mkstate
+      bridge_isolation_v2_migrate_capture_all_agents_snapshot
+      local _norm_snapshot
+      _norm_snapshot="$(bridge_isolation_v2_migrate_all_agents_snapshot_path)"
+      local _saved_layout_norm="${BRIDGE_LAYOUT:-}"
+      local _saved_data_root_norm="${BRIDGE_DATA_ROOT:-}"
+      BRIDGE_LAYOUT="v2"
+      BRIDGE_DATA_ROOT="$data_root"
+      export BRIDGE_LAYOUT BRIDGE_DATA_ROOT
+      if ! bridge_isolation_v2_migrate_normalize_layout \
+            "$_norm_snapshot" "$data_root"; then
+        bridge_warn "apply_for_upgrade: normalize_layout pass on already-migrated install reported failures; layout may carry drifted modes (rerun \`agent-bridge upgrade --apply\` after addressing the warned cause)"
+      fi
+      BRIDGE_LAYOUT="$_saved_layout_norm"
+      BRIDGE_DATA_ROOT="$_saved_data_root_norm"
+      if [[ -n "$_saved_layout_norm" ]]; then
+        export BRIDGE_LAYOUT
+      else
+        unset BRIDGE_LAYOUT
+      fi
+      if [[ -n "$_saved_data_root_norm" ]]; then
+        export BRIDGE_DATA_ROOT
+      else
+        unset BRIDGE_DATA_ROOT
+      fi
+    fi
+    printf '{"mode":"isolation-v2-migrate","skipped":true,"reason":"marker-present","marker":"%s","data_root":"%s","normalize_refresh":"attempted"}\n' \
       "$marker_path" "$data_root"
     return 0
   fi

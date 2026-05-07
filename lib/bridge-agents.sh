@@ -2880,9 +2880,22 @@ bridge_linux_prepare_agent_isolation() {
   #   │   requests/, responses/                 owner=isolated, group=ab-agent-<name>, mode 2770
   #   └── credentials/                          owner=controller, group=ab-agent-<name>, mode 2750
   #       └── launch-secrets.env                owner=controller, group=ab-agent-<name>, mode 0640
-  # The root mode 2750 means unrelated UIDs cannot traverse/list the
-  # private root; the isolated UID enters via group r-x but cannot write
-  # at the root level — so it cannot rm/mv `credentials/` or its file.
+  # Root mode 2750 (group r-x, no group write) is load-bearing: the
+  # isolated UID is in the agent group, so any group-write at the root
+  # would let it `rmdir credentials/` or `mv credentials creds.bak`
+  # regardless of credentials/'s own mode (POSIX requires write on the
+  # *parent* directory to delete or rename an entry inside it). 2750
+  # blocks that. The credentials/ subdir's own 2750 + controller-owner
+  # then prevents writes *inside* credentials/.
+  # Trade-off: the controller — also a group member, but not the owner —
+  # cannot directly `mkdir runtime/` from non-prepare codepaths under
+  # 2750 either. Controller writes that must land under the per-agent
+  # root (notably `runtime/history.env` via
+  # `bridge_load_static_agent_history` ->
+  # `bridge_write_agent_state_file`) therefore go through a sudo-handoff
+  # helper in lib/bridge-state.sh, mirroring the
+  # `bridge_install_isolated_home_settings` cross-UID write pattern in
+  # lib/bridge-hooks.sh.
   local _v2_agent_group _v2_agent_root _v2_credentials_dir _v2_subdir
   _v2_agent_group="$(bridge_isolation_v2_agent_group_name "$agent")" \
     || bridge_die "isolation v2: invalid agent name '$agent' for group composition"
@@ -2919,6 +2932,13 @@ bridge_linux_prepare_agent_isolation() {
   bridge_linux_sudo_root mkdir -p "$_v2_agent_root"
   bridge_linux_sudo_root chown root: "$_v2_agent_root"
   bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_agent_root"
+  # 2750 (root-owner, group r-x, no group write at the root level): the
+  # isolated UID — in the agent group — cannot rmdir/rename
+  # credentials/ here, so the credentials isolation contract holds.
+  # Controller writes under per-agent root that previously relied on
+  # group write at the root (mkdir runtime/, etc.) now go through the
+  # sudo-handoff helpers (see lib/bridge-state.sh
+  # bridge_state_sudo_install_v2_file). See the layout comment above.
   bridge_linux_sudo_root chmod 2750 "$_v2_agent_root"
   for _v2_subdir in home workdir runtime logs requests responses; do
     bridge_linux_sudo_root mkdir -p "$_v2_agent_root/$_v2_subdir"

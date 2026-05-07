@@ -170,8 +170,14 @@ bridge_isolation_v2_agent_credentials_dir() {
   # Controller-owned subtree under the per-agent root. Mode 2750: the
   # isolated UID can read launch-secrets.env via group r-x but cannot
   # write/rm/mv anything inside it. Parent (per-agent root) is also
-  # mode 2750 root-owned so the credentials/ directory itself cannot
-  # be renamed/removed by the isolated UID.
+  # mode 2750 root-owned, so the isolated UID has only group r-x at
+  # the root level — it cannot rmdir/rename `credentials/` either,
+  # even though it shares the agent group, because POSIX requires
+  # write on the *parent* directory to remove or rename an entry
+  # inside it. Controller writes that need to land under the
+  # per-agent root (e.g. `runtime/history.env`) go through the
+  # sudo-handoff path in lib/bridge-state.sh rather than relying on
+  # group-write at the root.
   local agent="$1"
   local root
   root="$(bridge_isolation_v2_agent_root "$agent")" || return 1
@@ -386,16 +392,74 @@ bridge_isolation_v2_agent_group_name() {
     return 1
   fi
   local composed="${BRIDGE_AGENT_GROUP_PREFIX}${agent}"
-  # v0.8.3: platform-branched length limit. Linux groupadd is 32-char;
-  # macOS dseditgroup tolerates much longer names. The previous
-  # unconditional 32-char check rejected long-named agents on macOS too.
-  local _limit=32
-  [[ "$(uname)" == "Darwin" ]] && _limit=255
-  if (( ${#composed} > _limit )); then
-    bridge_warn "agent_group_name: '$composed' exceeds ${_limit}-char group-name limit on $(uname)"
+  # v0.8.4: platform-branched length policy.
+  # - macOS: dseditgroup tolerates 255-char names; pass through unchanged.
+  # - Linux: groupadd hard-caps at 32 chars. v0.8.3 hard-rejected; v0.8.4
+  #   deterministically hash-truncates so any name accepted by `agent
+  #   create` composes to a unique <=32-char group. The agent name
+  #   segment is reduced to `<first-N-chars>-<7-char-sha256>` where the
+  #   hash is taken over the full untruncated name; two agents whose
+  #   names share the first N chars but differ later still get distinct
+  #   group names because the hash discriminates.
+  if [[ "$(uname)" == "Darwin" ]]; then
+    if (( ${#composed} > 255 )); then
+      bridge_warn "agent_group_name: '$composed' exceeds 255-char group-name limit on Darwin"
+      return 1
+    fi
+    printf '%s' "$composed"
+    return 0
+  fi
+  if (( ${#composed} <= 32 )); then
+    printf '%s' "$composed"
+    return 0
+  fi
+  local _prefix_len=${#BRIDGE_AGENT_GROUP_PREFIX}
+  local _avail=$(( 32 - _prefix_len ))
+  # Need at least 1 char + '-' + 7-char hash = 9 chars for the segment.
+  if (( _avail < 9 )); then
+    bridge_warn "agent_group_name: BRIDGE_AGENT_GROUP_PREFIX '$BRIDGE_AGENT_GROUP_PREFIX' leaves no room (${_avail}) for a hash-truncated agent segment under the 32-char Linux limit"
     return 1
   fi
-  printf '%s' "$composed"
+  local _keep=$(( _avail - 1 - 7 ))
+  local _hash
+  _hash="$(bridge_isolation_v2_short_sha256 "$agent" 7)" || {
+    bridge_warn "agent_group_name: short-sha256 hash failed for '$agent'"
+    return 1
+  }
+  local _head="${agent:0:_keep}"
+  # Tail dashes/underscores before the inserted '-' would produce '--' or
+  # '_-'; both are still valid for groupadd ([a-z_][a-z0-9_-]*) but the
+  # leading char of $_head is taken from the original agent name which
+  # already passed the [a-z_] anchor regex above, so the composed name
+  # remains policy-compliant.
+  printf '%s%s-%s' "$BRIDGE_AGENT_GROUP_PREFIX" "$_head" "$_hash"
+}
+
+bridge_isolation_v2_short_sha256() {
+  # Emit the first <len> hex chars of sha256(<text>). Used by
+  # bridge_isolation_v2_agent_group_name to compose a deterministic
+  # collision-resistant suffix when the raw agent name plus prefix would
+  # exceed Linux's 32-char group-name limit.
+  local text="$1"
+  local len="${2:-7}"
+  [[ "$len" =~ ^[0-9]+$ ]] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$text" "$len" <<'PY'
+import hashlib, sys
+text, length = sys.argv[1], int(sys.argv[2])
+print(hashlib.sha256(text.encode("utf-8")).hexdigest()[:length])
+PY
+    return $?
+  fi
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$text" | shasum -a 256 | cut -c "1-${len}"
+    return $?
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$text" | sha256sum | cut -c "1-${len}"
+    return $?
+  fi
+  return 1
 }
 
 # ---------------------------------------------------------------------------

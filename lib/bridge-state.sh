@@ -1558,6 +1558,85 @@ bridge_dynamic_agent_ids() {
   done
 }
 
+bridge_state_v2_isolated_target() {
+  # v0.8.4 r2: predicate for "this controller-side write must land
+  # under the v2 per-agent root because the agent is linux-user
+  # isolated". Used by bridge_write_agent_state_file to pick between
+  # the direct-write fast path and the sudo-handoff slow path.
+  #
+  # The slow path is only required when:
+  #   - the host is Linux (no-op on macOS / mock hosts)
+  #   - isolation v2 is active for this install
+  #   - the target path lives under $BRIDGE_AGENT_ROOT_V2/<agent>/
+  #   - the agent is configured with linux-user isolation effectively
+  #     (BRIDGE_AGENT_ISOLATION_MODE[<agent>] resolves to linux-user)
+  # Anything else (shared-mode agent in a v2 install, dynamic agent
+  # whose env file lives under controller-owned state/agents/) keeps
+  # the direct-write fast path so non-isolated codepaths are
+  # unaffected.
+  local agent="$1"
+  local target="$2"
+
+  [[ -n "$agent" && -n "$target" ]] || return 1
+  [[ "$(bridge_host_platform 2>/dev/null || uname)" == "Linux" ]] || return 1
+  bridge_isolation_v2_active 2>/dev/null || return 1
+  [[ -n "$BRIDGE_AGENT_ROOT_V2" ]] || return 1
+  case "$target" in
+    "$BRIDGE_AGENT_ROOT_V2"/"$agent"/*) ;;
+    *) return 1 ;;
+  esac
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || return 1
+  return 0
+}
+
+bridge_state_sudo_install_v2_file() {
+  # v0.8.4 r2: stage `$content` into a controller-owned tempfile, then
+  # `bridge_linux_sudo_root install -m <mode> -o <owner> -g <group>`
+  # the staged file into the per-agent root. Mirrors the cross-UID
+  # write pattern PR #673 added in lib/bridge-hooks.sh
+  # (bridge_install_isolated_home_settings).
+  #
+  # This is the controller-side escape hatch for files whose final
+  # location is under $BRIDGE_AGENT_ROOT_V2/<agent>/ but whose author
+  # is the controller, not the isolated UID — runtime/history.env is
+  # the canonical example. The per-agent root mode 2750 (group r-x,
+  # no group write) prevents the controller — a group member but not
+  # the owner — from creating the parent dir or replacing the file
+  # via the direct path; sudo with the right `install` invocation
+  # bypasses that without weakening the root mode.
+  local target="$1"
+  local mode="$2"
+  local owner="$3"
+  local group="$4"
+  local content="$5"
+
+  [[ -n "$target" && -n "$mode" && -n "$owner" && -n "$group" ]] \
+    || return 2
+
+  local tmp=""
+  tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-state-v2.XXXXXX")" || return 1
+  printf '%s' "$content" >"$tmp" || { rm -f "$tmp"; return 1; }
+
+  bridge_linux_sudo_root mkdir -p "$(dirname "$target")" 2>/dev/null || {
+    rm -f "$tmp"
+    return 1
+  }
+  if ! bridge_linux_sudo_root install -m "$mode" -o "$owner" -g "$group" "$tmp" "$target" 2>/dev/null; then
+    # Older `install` builds reject `-o`/`-g` even under sudo; fall back
+    # to plain install + chown.
+    if ! bridge_linux_sudo_root install -m "$mode" "$tmp" "$target" 2>/dev/null; then
+      rm -f "$tmp"
+      return 1
+    fi
+    bridge_linux_sudo_root chown "$owner:$group" "$target" 2>/dev/null || {
+      rm -f "$tmp"
+      return 1
+    }
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
 bridge_write_agent_state_file() {
   local agent="$1"
   local file="$2"
@@ -1576,8 +1655,8 @@ bridge_write_agent_state_file() {
 
   BRIDGE_AGENT_UPDATED_AT["$agent"]="$updated_at"
 
-  mkdir -p "$(dirname "$file")"
-  cat >"$file" <<EOF
+  local content
+  content="$(cat <<EOF
 AGENT_ID=$(printf '%q' "$agent")
 AGENT_DESC=$(printf '%q' "$desc")
 AGENT_ENGINE=$(printf '%q' "$engine")
@@ -1590,6 +1669,31 @@ AGENT_HISTORY_KEY=$(printf '%q' "$history_key")
 AGENT_CREATED_AT=$(printf '%q' "$created_at")
 AGENT_UPDATED_AT=$(printf '%q' "$updated_at")
 EOF
+)"
+
+  # v0.8.4 r2: when the target lives under the v2 per-agent root and
+  # the agent is linux-user isolated, the controller — group member
+  # but not the owner of the 2750 root — cannot mkdir/replace the file
+  # directly. Route through the sudo-handoff helper. The file lands
+  # owned by the isolated UID with mode 0640 + group=ab-agent-<name>,
+  # matching what bridge_linux_prepare_agent_isolation seeds for
+  # history.env (touch + chown $os_user) so the isolated UID can
+  # read/rewrite it from inside its session and the controller can
+  # read it via group r--.
+  if bridge_state_v2_isolated_target "$agent" "$file"; then
+    local _v2_owner _v2_group
+    _v2_owner="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    _v2_group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+    if [[ -n "$_v2_owner" && -n "$_v2_group" ]] \
+        && bridge_state_sudo_install_v2_file \
+            "$file" 0640 "$_v2_owner" "$_v2_group" "$content"; then
+      return 0
+    fi
+    bridge_warn "bridge_write_agent_state_file: sudo-handoff write failed for $file (agent=$agent); falling back to direct write — expect Permission denied if the per-agent root is not writable to the controller"
+  fi
+
+  mkdir -p "$(dirname "$file")"
+  printf '%s' "$content" >"$file"
 }
 
 bridge_write_dynamic_agent_file() {
