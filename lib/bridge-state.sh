@@ -1196,6 +1196,26 @@ bridge_load_static_agent_history() {
 
   file="$(bridge_history_file_for_agent "$agent")"
   [[ -f "$file" ]] || return 0
+  # v0.8.5 #694 (Wave-3): partial isolated agent state (failed `agent
+  # create --isolate ...`) leaves `runtime/history.env` owned by the
+  # isolated UID with mode 0640 group=ab-agent-<name>. The controller is
+  # added to that group at `agent create` time, but supplementary group
+  # membership is cached at process credential time — until the operator
+  # re-logs in (or runs a fresh shell), the running `agent show` /
+  # `agent doctor` / roster-load process cannot read the file via group
+  # r--, even though `[[ -f "$file" ]]` succeeds (the parent dir
+  # traversal works because intermediate modes are 2750/2770 with group
+  # r-x and that group bit is checked at stat-time, but the actual file
+  # read uses the cached effective group set). `source "$file"` then
+  # bombs with `Permission denied` and crashes `bridge_load_roster` —
+  # taking out every command that runs at `bridge-agent.sh` load time
+  # (status, show, doctor, list, ...). Skip silently when the file is
+  # not readable to this process; downstream behavior is identical to
+  # the "history file absent" case (the static agent comes up without a
+  # restored AGENT_SESSION_ID, and the next session-id rewrite restores
+  # the entry). Mirrors the graceful-degrade pattern PR #688 added to
+  # `bridge-status.py::pending_upgrade_conflict_count`.
+  [[ -r "$file" ]] || return 0
 
   # shellcheck source=/dev/null
   source "$file"

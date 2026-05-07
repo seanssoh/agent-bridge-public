@@ -109,12 +109,30 @@ def workdir_display(path: str) -> str:
     # Issue #305 Track C: surface a missing workdir at the dashboard layer so a
     # leaked smoke-fixture roster block (or any deleted/renamed/expired
     # registration) is visible without opening agent-roster.local.sh manually.
+    #
+    # v0.8.5 #694 (Wave-3): on Linux v2 partial-isolated-agent state, a
+    # broken `agent create --isolate ...` leaves `data/agents/<agent>/`
+    # as `root:ab-agent-<name> mode 2750`. The controller is in the
+    # group on disk but its process credentials don't include the new
+    # group until re-login, so `Path.is_dir()` raises `PermissionError`
+    # (errno 13) when the kernel checks the cached group set against
+    # the directory's group bits. That uncaught raise crashes the
+    # entire `agent-bridge status --all-agents` render. Treat any
+    # OSError (PermissionError is a subclass) as "unreadable" and tag
+    # the row so operators see the partial state rather than losing
+    # observability of every agent on the host. The same graceful
+    # pattern PR #688 added to `pending_upgrade_conflict_count`'s
+    # walk; this is the second site (`row.get('workdir')` per-agent
+    # row render) that issue #694 surfaced.
     short = short_path(path)
     if not path or short == "-":
         return short
     expanded = str(Path(path).expanduser())
-    if not Path(expanded).is_dir():
-        return f"{short}  [missing]"
+    try:
+        if not Path(expanded).is_dir():
+            return f"{short}  [missing]"
+    except OSError:
+        return f"{short}  [unreadable]"
     return short
 
 
