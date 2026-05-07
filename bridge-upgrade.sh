@@ -1747,10 +1747,18 @@ if [[ $JSON -eq 1 ]]; then
   # (matches the OPERATIONS.md contract). Empty file when cleanup didn't
   # run (e.g. dry-run paths that bypass the cleanup block above).
   printf '%s' "${CLEANUP_JSON:-}" >"$_json_payload_dir/cleanup.json"
+  # Issue #668 (r2): surface the isolation-v2 migration payload in --json
+  # output so operators reading the JSON envelope can detect the macOS
+  # supplemental-group cache caveat (`migration_requires_relogin`) and the
+  # Linux daemon-restart deferred path. The payload is emitted by
+  # lib/bridge-isolation-v2-migrate.sh:1578 on apply, and a dry-run-shaped
+  # placeholder on dry-run. Always-present so JSON consumers can branch on
+  # the field's contents instead of having to handle missing-key vs value.
+  printf '%s' "${ISOLATION_V2_MIGRATION_JSON:-}" >"$_json_payload_dir/isolation-v2-migration.json"
   set +e
-  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" <<'PY'
+  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" "$_json_payload_dir/isolation-v2-migration.json" <<'PY'
 import json, sys
-source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file = sys.argv[1:]
+source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file, isolation_v2_migration_json_file = sys.argv[1:]
 
 def load_json(path):
     with open(path, encoding="utf-8") as fh:
@@ -1778,6 +1786,12 @@ channel_guard_payload = load_json(channel_guard_json_file)
 source_reclassify_payload = load_json(source_reclassify_json_file)
 shared_settings_rerender_payload = load_json(shared_settings_rerender_json_file)
 cleanup_payload = load_optional_json(cleanup_json_file)
+# Always include the isolation-v2 migration field so JSON consumers can
+# branch on the contents (status="applied" + migration_requires_relogin,
+# skipped="dry-run", etc.) without missing-key handling. Falls back to
+# null when the variable was empty (defensive — current code paths always
+# set ISOLATION_V2_MIGRATION_JSON before reaching the JSON envelope).
+isolation_v2_migration_payload = load_optional_json(isolation_v2_migration_json_file)
 payload = {
     "mode": "upgrade",
     "version": source_version,
@@ -1812,6 +1826,7 @@ payload = {
     "channel_guard": channel_guard_payload,
     "agent_restart": agent_restart_payload,
     "agent_migration": migration_payload,
+    "isolation_v2_migration": isolation_v2_migration_payload,
     "source_reclassify": source_reclassify_payload,
     "shared_settings_rerender": shared_settings_rerender_payload,
     "cleanup": cleanup_payload,
