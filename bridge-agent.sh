@@ -1895,21 +1895,29 @@ run_rerender_settings() {
       # was supposed to deliver but didn't (it stayed rc=1 → rc=1 because
       # this branch never had a cross-UID path).
       #
-      # `bridge_install_isolated_home_settings` is best-effort by contract
-      # (warns + returns 0 on internal failures so a missing-sudo host
-      # doesn't bridge_die the rerender loop). We let stderr flow through
-      # to the operator (matching the existing line ~1903 call pattern)
-      # rather than capturing it into apply_output, so warnings remain
-      # visible. The rerender row reports `rerendered`/`unchanged` —
-      # consistent with the v0.8.3 CHANGELOG promise that re-running
-      # converges to rc=0.
+      # PR #673 r2 (codex BLOCKING, refs #669/#666):
+      # `bridge_install_isolated_home_settings` now returns 1 on real
+      # internal failure (mkdir/render/install/mv). On the rerender
+      # path the install IS the load-bearing step (the workdir-side
+      # render is dead work for cross-UID isolated agents — see the
+      # comment block above), so a nonzero rc must flip this row to
+      # error and increment `failed_count`, mirroring the non-isolated
+      # branch. Capture stderr so the warn line surfaces in the row's
+      # error field. On success, audit the rerender as
+      # `cross_uid_isolated_home` strategy (matches the v0.8.3
+      # CHANGELOG promise that re-runs converge to rc=0).
       if [[ "$agent" != "_template" ]] \
           && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
           && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
-        bridge_install_isolated_home_settings "$agent" "$target_launch_cmd" >/dev/null || true
-        after_json="$before_json"
-        bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "shared_settings_rerendered" "$agent" \
-          --detail workdir="$workdir" --detail strategy=cross_uid_isolated_home >/dev/null 2>&1 || true
+        if apply_output="$(bridge_install_isolated_home_settings "$agent" "$target_launch_cmd" 2>&1)"; then
+          after_json="$before_json"
+          bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "shared_settings_rerendered" "$agent" \
+            --detail workdir="$workdir" --detail strategy=cross_uid_isolated_home >/dev/null 2>&1 || true
+        else
+          error="$apply_output"
+          after_json="$before_json"
+          failed_count=$((failed_count + 1))
+        fi
       # Issue #555: forward agent id so the rerender writes to the
       # per-agent effective file ($BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/
       # settings.effective.json). Mixed-model installs no longer fight

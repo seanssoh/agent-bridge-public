@@ -402,9 +402,19 @@ bridge_install_isolated_home_settings() {
   # Switching the parent to root-owned + 0750 closes that gap. The
   # isolated UID can still create files at `<isolated-home>/foo` (its
   # own home), just not under `.claude/`.
+  # Internal failure (mkdir/render/install/mv): return 1 so the caller
+  # can flag the rerender row as failed. The early predicate-style
+  # returns above (lines ~368-379) stay `return 0` because they mean
+  # "this agent is not in scope for isolated install" — not a failure.
+  # Callers in the migration path (`lib/bridge-migration.sh`) already
+  # handle nonzero with `|| bridge_warn …` so they continue best-effort
+  # while surfacing the failure. The rerender path (`bridge-agent.sh`,
+  # PR #673) catches rc and increments `failed_count`. (Issue #669 r2:
+  # codex BLOCKING — silent `return 0` was the same silent-failure
+  # pattern as #666.)
   bridge_linux_sudo_root mkdir -p "$target_dir" 2>/dev/null || {
     bridge_warn "isolated home settings install: cannot mkdir $target_dir for $agent (sudo unavailable?)"
-    return 0
+    return 1
   }
   bridge_linux_sudo_root chown "root:$os_user" "$target_dir" 2>/dev/null || true
   bridge_linux_sudo_root chmod 0750 "$target_dir" 2>/dev/null || true
@@ -415,7 +425,7 @@ bridge_install_isolated_home_settings() {
   # controller UID so the Python writes succeed without sudo.
   stage_root="$(mktemp -d "${TMPDIR:-/tmp}/bridge-isolated-settings.XXXXXX")" || {
     bridge_warn "isolated home settings install: mktemp failed for $agent"
-    return 0
+    return 1
   }
   stage_home="$stage_root/home"
   stage_dir="$stage_home/.claude"
@@ -456,7 +466,7 @@ bridge_install_isolated_home_settings() {
         --agent-class "$agent_class" >"$stage_root/render.out" 2>&1; then
     bridge_warn "isolated home settings install: render failed for $agent ($(head -n1 "$stage_root/render.out" 2>/dev/null || true))"
     rm -rf "$stage_root"
-    return 0
+    return 1
   fi
 
   # Atomic install of the effective file. Stage to a same-directory
@@ -476,14 +486,14 @@ bridge_install_isolated_home_settings() {
       bridge_warn "isolated home settings install: install failed for $target_effective"
       bridge_linux_sudo_root rm -f "$target_effective_tmp" 2>/dev/null || true
       rm -rf "$stage_root"
-      return 0
+      return 1
     fi
   fi
   if ! bridge_linux_sudo_root mv -f "$target_effective_tmp" "$target_effective" 2>/dev/null; then
     bridge_warn "isolated home settings install: atomic mv failed for $target_effective"
     bridge_linux_sudo_root rm -f "$target_effective_tmp" 2>/dev/null || true
     rm -rf "$stage_root"
-    return 0
+    return 1
   fi
 
   # Atomic swap of the symlink. Create a tmp symlink in the same
@@ -496,17 +506,18 @@ bridge_install_isolated_home_settings() {
     bridge_warn "isolated home settings install: symlink staging failed for $target_settings"
     bridge_linux_sudo_root rm -f "$target_settings_tmp" 2>/dev/null || true
     rm -rf "$stage_root"
-    return 0
+    return 1
   }
   if ! bridge_linux_sudo_root mv -f "$target_settings_tmp" "$target_settings" 2>/dev/null; then
     bridge_warn "isolated home settings install: atomic symlink swap failed for $target_settings"
     bridge_linux_sudo_root rm -f "$target_settings_tmp" 2>/dev/null || true
     rm -rf "$stage_root"
-    return 0
+    return 1
   fi
   bridge_linux_sudo_root chown -h "$os_user:$os_user" "$target_settings" 2>/dev/null || true
 
   rm -rf "$stage_root"
+  return 0
 }
 
 bridge_codex_hooks_status() {
