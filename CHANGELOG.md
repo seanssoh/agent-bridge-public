@@ -6,6 +6,33 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.8.4] — 2026-05-07
+
+### Highlight — closes 5 release-blocker regressions surfaced by v0.8.3 OrbStack VM E2E
+
+`v0.8.3` shipped on 2026-05-07 with the silent-data-loss fix for v0.7.x → v0.8.x upgrades, but follow-up OrbStack Linux VM end-to-end verification (Debian 12 + Oracle 9.7) found 5 release-blocker regressions: fresh install rejection, silent failed upgrade, broken Linux isolation, broken v0.7.x → v0.8.3 migration, and non-idempotent rerender. v0.8.4 closes all five plus a host regression in `agent-bridge agent doctor`.
+
+**Operators on v0.8.3: upgrade to v0.8.4.** Operators on v0.7.x → v0.8.3 migrations that aborted on Linux: re-run `agent-bridge upgrade --apply` after upgrading to v0.8.4 source.
+
+### Fixed
+
+- **#665 fresh install rejected on markerless install** (`bridge-init.sh`, `bridge-bootstrap.sh`, `agent-bridge`, `lib/bridge-layout-resolver.sh`): both the underlying scripts and the public `agent-bridge init` / `agent-bridge bootstrap` CLI wrappers now arm a one-shot `BRIDGE_LAYOUT_RESOLVER_BYPASS=fresh-install:<nonce>` env so the v0.8.0 fail-fast guard accepts a clean home as a fresh install while still rejecting `markerless(existing-install)`. Trap on EXIT prevents env leakage to sibling shells. Resolver argv handshake updated to accept the wrapper argv pattern. (#674)
+- **#666 silent failed upgrade — `rc=0 + files_copied=0 + version mismatch`** (`bridge-upgrade.py::analyze_live`): the per-file classifier now force-deploys (`upstream_only`) on cross-version upgrade when `base_ref` is not resolvable, instead of falling back to `keep_live`. Same-version reruns (operator drift) and missing-VERSION corner stay on `keep_live`. Dev clones with `0.0.0-dev` source sentinel correctly classify as unknown-skip. (#671)
+- **#667 Linux isolation v2 broken** (`lib/bridge-isolation-v2.sh`, `lib/bridge-agents.sh`, `lib/bridge-isolation-v2-migrate.sh`, `lib/bridge-state.sh`): two layered fixes. (a) `bridge_isolation_v2_agent_group_name` on Linux now hash-truncates long agent names instead of hard-rejecting (`<first-N-chars>-<7-char-sha256>`). Darwin keeps full 255-char names. (b) Per-agent root mode stays at `2750` (was 2750→2770 attempt in r1, reverted) — `2770` would break the credentials/ isolation guarantee because group rwx on parent lets group members `rmdir credentials/`. Controller-write sites under `BRIDGE_AGENT_ROOT_V2/<agent>/` (e.g., `runtime/history.env`) now route through the sudo-handoff helper `bridge_state_sudo_install_v2_file` (mirrors PR #673's cross-UID install pattern). `apply_for_upgrade` runs `normalize_layout` before the marker-present skip so existing v0.8.0~v0.8.3 installs get re-pinned to canonical modes. (#675)
+- **#668 v0.7.7 → v0.8.3 migration aborted on Linux daemon restart** (`lib/bridge-isolation-v2-migrate.sh::orchestrate_restart`, `bridge-upgrade.sh`): root cause was supplemental-group-cache — `usermod` adds the operator to the new `ab-controller` group but the running shell's group set is cached until next login, so spawning the daemon from this shell inherits stale groups and dies. The non-launchd branch now treats `bridge-daemon.sh start` + `wait_daemon_present` as best-effort: warns + advances the marker + lets `apply-live` install v0.8.x code. Operator finishes by re-login + `agb daemon start`. The `upgrade --json` payload now surfaces `migration_requires_relogin: true` via the `isolation_v2_migration` field for JSON-mode operators. (#674)
+- **#669 rerender cross-UID Permission denied not idempotent** (`bridge-agent.sh::run_rerender_settings`, `lib/bridge-hooks.sh`): for v2 linux-user-isolated agents, the rerender helper now detects `bridge_agent_linux_user_isolation_effective` up-front and routes through `bridge_install_isolated_home_settings` (sudo-handoff, foreign-UID atomic install), instead of the original `bridge_link_claude_settings_to_shared` path that hit `PermissionError` on `<workdir>/.claude/`. The previous `|| true` swallow at the rerender call site is dropped — internal helper failures (mkdir/render/install/atomic-mv/symlink) now propagate `rc=1` + increment `failed_count` + surface in audit JSON instead of silently reporting success. Migration callsites still use `|| bridge_warn` for best-effort. (#673)
+- **#670 agent-doctor leaked stale temporary BRIDGE_HOME hook paths into `~/.codex/hooks.json`** (`lib/bridge-doctor.sh::bridge_doctor_invoke_agent`): every doctor child invocation (CRUD steps + cleanup-trap delete) now exports `BRIDGE_CODEX_HOOKS_FILE=$BRIDGE_HOME/.codex/hooks.json` inside the wrapper subshell only. Codex CLI then reads/writes the doctor's isolated hooks.json instead of the operator's real `~/.codex/hooks.json`. The redirected hooks.json dies with the temp BRIDGE_HOME on exit. Operator's global config sha256 byte-identical before/after doctor run. (#672)
+
+### Known issues / v0.8.5 follow-up
+
+- **`bridge_scaffold_agent_home` Permission denied for short-name isolated agents on `agent create`**: a separate failure point from #667. The scaffold path runs before `bridge_linux_prepare_agent_isolation` and may still hit `mkdir: cannot create directory data/agents/<agent>: Permission denied` on Linux. Fix scope-controlled out of v0.8.4 r2 to keep PR size bounded; tracked for v0.8.5.
+- **non-blocking migration warnings** (deferred from #668): non-launchd daemon-start errors are uniformly labeled supplemental-group-cache (unrelated daemon failures get swallowed); systemd path is not distinguished from no-init fallback; `tests/isolation-v2-pr-f/smoke.sh` is stale relative to current v0.8.0 rejection behavior; concurrent init invocations on different `--data-root` race without an init-level lock.
+
+### Operator notes
+
+- **v0.8.3 was not OrbStack-VM-verified** despite the release notes claiming end-to-end coverage. v0.8.4 should be the first v0.8.x release where the OrbStack VM E2E (3 scenarios: fresh Debian install, Oracle 9.7 v0.8.x→v0.8.x upgrade, v0.7.7 → v0.8.x migration) passes end-to-end. Wave-end VM retest pending.
+- The wave that produced v0.8.4 used 1 ephemeral `upstream-issue-fixer` per track + `codex:codex-rescue` review per PR, with `orchestrator-direct` review fallback when the codex broker hit the `'mode,'` model config error mid-wave (memory `feedback_codex_review_parallel_subagent.md`).
+
 ## [0.8.3] — 2026-05-07
 
 ### Highlight — fixes silent data loss on v0.7.x → v0.8.x upgrade
