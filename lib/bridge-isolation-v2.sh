@@ -44,7 +44,7 @@
 #   │   ├── skills/, docs/
 #   ├── agents/                             owner=root,       group=root,         mode 755
 #   │   └── <agent>/                        owner=root,
-#   │                                       group=ab-agent-<name>,                mode 2770
+#   │                                       group=ab-agent-<name>,                mode 2750
 #   │       ├── home/                       owner=agent-bridge-<name>,
 #   │       │                               group=ab-agent-<name>,                mode 2770
 #   │       ├── workdir/                    owner=agent-bridge-<name>,
@@ -169,10 +169,15 @@ bridge_isolation_v2_agent_root() {
 bridge_isolation_v2_agent_credentials_dir() {
   # Controller-owned subtree under the per-agent root. Mode 2750: the
   # isolated UID can read launch-secrets.env via group r-x but cannot
-  # write/rm/mv anything inside it. v0.8.4: parent (per-agent root) is
-  # now mode 2770 (was 2750) so the controller can mkdir subdirs as a
-  # group member; credentials/ keeps its 2750 + controller-owner so the
-  # isolated UID still cannot rename/remove the file inside.
+  # write/rm/mv anything inside it. Parent (per-agent root) is also
+  # mode 2750 root-owned, so the isolated UID has only group r-x at
+  # the root level — it cannot rmdir/rename `credentials/` either,
+  # even though it shares the agent group, because POSIX requires
+  # write on the *parent* directory to remove or rename an entry
+  # inside it. Controller writes that need to land under the
+  # per-agent root (e.g. `runtime/history.env`) go through the
+  # sudo-handoff path in lib/bridge-state.sh rather than relying on
+  # group-write at the root.
   local agent="$1"
   local root
   root="$(bridge_isolation_v2_agent_root "$agent")" || return 1
