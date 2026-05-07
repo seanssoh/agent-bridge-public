@@ -1404,7 +1404,21 @@ def analyze_live(source_root: Path, target_root: Path, base_ref: str) -> dict[st
     # contract by gating on the version mismatch, not just on `base is None`.
     source_version = read_source_version(source_root)
     target_version = read_target_version(target_root)
-    versions_differ = bool(target_version) and source_version != target_version
+    # `read_source_version` falls back to the dev sentinel "0.0.0-dev" when
+    # the source checkout has no `VERSION` file (a dev clone, not a real
+    # release). Treating that as a real version would flip every
+    # content-drifted file to `upstream_only` on a same-version rerun from
+    # a dev clone, force-deploying over operator edits. Treat the sentinel
+    # as "unknown" for `versions_differ` only; do NOT change the function's
+    # return value because other callers (payload["version"], the
+    # `--version` default in cmd_perform_replace) still need a non-empty
+    # string.
+    versions_differ = (
+        bool(source_version)
+        and bool(target_version)
+        and source_version != target_version
+        and source_version != "0.0.0-dev"
+    )
 
     for relpath in tracked_files(source_root):
         if should_skip_relpath(relpath):
