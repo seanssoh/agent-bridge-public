@@ -76,15 +76,24 @@ bridge_isolation_v2_migrate_mkstate() {
     || mkdir -p "$(bridge_isolation_v2_migrate_state_dir)"
 }
 
+# Issue #698: cross-call channel so apply_for_upgrade can surface the
+# force-killed agent list in its success JSON envelope without re-reading
+# the sidecar (sidecar is best-effort + may have been overwritten by a
+# concurrent retry). Reset at the top of every orchestrate_stop call.
+# Read by apply_for_upgrade only on the success path.
+BRIDGE_ISOLATION_V2_MIGRATE_FORCE_KILLED_AGENTS=""
+
 # Issue #698: append the list of agent ids whose tmux sessions had to be
 # force-killed by the per-agent stop loop fallback to a sidecar JSON in
 # the migration state dir, so post-migration audit can see which sessions
 # were stopped non-cooperatively. Best-effort: write failures must not
 # block the migration, since the in-memory abort path in the caller is
-# already the authoritative gate.
+# already the authoritative gate. Returns the agents-as-JSON-array body
+# on stdout so the caller can also embed the same list in its own
+# envelope (success payload + failure err_log).
 bridge_isolation_v2_migrate_record_force_killed() {
   local -a forced=("$@")
-  (( ${#forced[@]} > 0 )) || return 0
+  (( ${#forced[@]} > 0 )) || { printf ''; return 0; }
 
   bridge_isolation_v2_migrate_mkstate
   local sidecar
@@ -109,6 +118,8 @@ bridge_isolation_v2_migrate_record_force_killed() {
     printf '{"timestamp":"%s","force_killed_sessions":[%s]}\n' \
       "$stamp" "$agents_json"
   } > "$sidecar" 2>/dev/null || true
+
+  printf '%s' "$agents_json"
 }
 
 # ---------------------------------------------------------------------------
@@ -912,6 +923,11 @@ bridge_isolation_v2_migrate_wait_daemon_present() {
 bridge_isolation_v2_migrate_orchestrate_stop() {
   local snapshot_path="$1"
 
+  # Issue #698 (r2): reset the cross-call channel for the success-path
+  # WARN surface in apply_for_upgrade. Stays empty unless force-kill
+  # actually fires + at least one session is killed.
+  BRIDGE_ISOLATION_V2_MIGRATE_FORCE_KILLED_AGENTS=""
+
   # v0.8.3: on macOS, unload the launchd unit BEFORE per-agent stop so
   # the KeepAlive=true daemon doesn't respawn during the 10s
   # wait_daemon_gone window. restore_if_needed handles the case where a
@@ -962,10 +978,53 @@ bridge_isolation_v2_migrate_orchestrate_stop() {
       fi
     done
 
-    bridge_isolation_v2_migrate_record_force_killed "${force_killed[@]+"${force_killed[@]}"}"
+    # record_force_killed echoes the agent list as a JSON-array body
+    # ("a","b") so the failure envelope (below) and apply_for_upgrade's
+    # success envelope can embed the same list without re-encoding.
+    local force_killed_json_body
+    force_killed_json_body="$(bridge_isolation_v2_migrate_record_force_killed \
+      "${force_killed[@]+"${force_killed[@]}"}")"
+
+    # Issue #698 (r2): expose the successfully force-killed list to
+    # apply_for_upgrade via a module-scoped channel so its success
+    # JSON envelope can surface `force_killed_sessions`. Empty when
+    # force-kill never fired.
+    BRIDGE_ISOLATION_V2_MIGRATE_FORCE_KILLED_AGENTS="$force_killed_json_body"
 
     remaining="$(bridge_active_agent_ids | wc -l | tr -d ' ')"
     if [[ "$remaining" =~ ^[0-9]+$ ]] && (( remaining > 0 )); then
+      # Issue #698 (r2): emit a structured JSON envelope on stdout AND
+      # write last-error.json BEFORE bridge_die. bridge-upgrade.sh
+      # captures only stdout from the migration child into
+      # ISOLATION_V2_MIGRATION_JSON, and bridge_die exits before any
+      # caller-side err_log write site is reached. Without this block
+      # the upgrade --json failure envelope's `isolation_v2_migration`
+      # / `error.detail` fields receive only the previous (success)
+      # JSON or empty — JSON-mode operators cannot triage which
+      # sessions remained stuck.
+      bridge_isolation_v2_migrate_mkstate
+      local _err_log
+      _err_log="$(bridge_isolation_v2_migrate_state_dir)/last-error.json"
+      # Encode forced_pairs as a JSON string array. Agent ids + tmux
+      # session names in this codebase are ASCII (validated upstream),
+      # so naive quote-strip + literal quoting matches the existing
+      # record_force_killed convention; no full JSON encoder needed.
+      local _pairs_json="" _pair_sep="" _pair _pair_clean
+      for _pair in "${forced_pairs[@]}"; do
+        _pair_clean="${_pair//\"/}"
+        _pairs_json+="${_pair_sep}\"${_pair_clean}\""
+        _pair_sep=","
+      done
+      {
+        printf '{"mode":"isolation-v2-migrate","status":"error","reason":"force-kill-failed",'
+        printf '"last_error":"agents still active after force-kill fallback: %s",' "$remaining"
+        printf '"remaining_count":%s,' "$remaining"
+        printf '"forced_pairs":[%s],' "$_pairs_json"
+        printf '"force_killed_sessions":[%s],' "$force_killed_json_body"
+        printf '"remediation":"manually `tmux kill-session` for each stuck session listed in forced_pairs, then re-run agent-bridge upgrade --apply",'
+        printf '"no_v080_code_installed":"yes"}\n'
+      } >"$_err_log"
+      cat "$_err_log"
       bridge_die "agents still active after force-kill fallback: $remaining (sessions: ${forced_pairs[*]})"
     fi
   fi
@@ -1692,9 +1751,24 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
   # Success — JSON. relogin field surfaces the macOS supplemental-group
   # cache caveat to the upgrade output so operators don't get
   # confusing "permission denied" until they re-login.
-  printf '{"mode":"isolation-v2-migrate","status":"applied","data_root":"%s","manifest":"%s","active_agents":%s,"all_agents":%s,"migration_requires_relogin":%s}\n' \
+  #
+  # Issue #698 (r2): when orchestrate_stop's force-kill fallback fired
+  # AND succeeded, surface the killed-session list + sidecar path in
+  # the success envelope so JSON-only operators can tell non-cooperative
+  # tmux kills happened (the cooperative per-agent stop loop is the
+  # default; force-kill is the v0.7.7-daemon-spawned-zombie fallback).
+  # Sidecar path is target-root-relative so the field is portable
+  # across operators reading the JSON from a different host.
+  local _force_killed_body="${BRIDGE_ISOLATION_V2_MIGRATE_FORCE_KILLED_AGENTS:-}"
+  local _force_killed_suffix=""
+  if [[ -n "$_force_killed_body" ]]; then
+    _force_killed_suffix=",\"force_killed_sessions\":[${_force_killed_body}]"
+    _force_killed_suffix+=",\"force_killed_sidecar\":\"state/migration/force-killed-sessions.json\""
+  fi
+  printf '{"mode":"isolation-v2-migrate","status":"applied","data_root":"%s","manifest":"%s","active_agents":%s,"all_agents":%s,"migration_requires_relogin":%s%s}\n' \
     "$data_root" "$manifest" "$active_count" "$all_count" \
-    "$([[ "$relogin_flag" -eq 1 ]] && printf 'true' || printf 'false')"
+    "$([[ "$relogin_flag" -eq 1 ]] && printf 'true' || printf 'false')" \
+    "$_force_killed_suffix"
 
   # Restore caller env (no-op when caller had nothing).
   if [[ -z "$_saved_layout" ]]; then unset BRIDGE_LAYOUT; else BRIDGE_LAYOUT="$_saved_layout"; fi
