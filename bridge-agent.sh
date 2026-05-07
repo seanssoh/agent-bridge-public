@@ -2166,6 +2166,14 @@ report and reap test-fixture agents per their pattern."
       isolation_mode="shared"
       os_user=""
     else
+      # v0.8.4: enforce the group-name char policy upfront so a name
+      # accepted by `agent create` will always compose to a valid Linux
+      # group name (length is hash-truncated separately by
+      # bridge_isolation_v2_agent_group_name; the chars must still be
+      # [a-z_][a-z0-9_-]* per groupadd).
+      if [[ ! "$agent" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        bridge_die "linux-user isolation requires agent name to match [a-z_][a-z0-9_-]* (groupadd policy): '$agent'"
+      fi
       os_user="${os_user:-$(bridge_agent_default_os_user "$agent")}"
     fi
   fi

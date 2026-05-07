@@ -2875,14 +2875,19 @@ bridge_linux_prepare_agent_isolation() {
 
   # v2 layout: lay down the per-agent private root before any ACL grants
   # touch its children. The contract is:
-  #   $BRIDGE_AGENT_ROOT_V2/<agent>            owner=root, group=ab-agent-<name>, mode 2750
+  #   $BRIDGE_AGENT_ROOT_V2/<agent>            owner=root, group=ab-agent-<name>, mode 2770
   #   ├── home/, workdir/, runtime/, logs/,
   #   │   requests/, responses/                 owner=isolated, group=ab-agent-<name>, mode 2770
   #   └── credentials/                          owner=controller, group=ab-agent-<name>, mode 2750
   #       └── launch-secrets.env                owner=controller, group=ab-agent-<name>, mode 0640
-  # The root mode 2750 means unrelated UIDs cannot traverse/list the
-  # private root; the isolated UID enters via group r-x but cannot write
-  # at the root level — so it cannot rm/mv `credentials/` or its file.
+  # The root mode 2770 (v0.8.4): both controller and isolated UID are
+  # group members. Group rwx + setgid lets the controller `mkdir runtime/`
+  # and write `runtime/history.env` from outside the prepare codepath
+  # (e.g. `bridge_load_static_agent_history` -> `bridge_write_agent_state_file`),
+  # which previously failed with Permission denied under mode 2750.
+  # Trade-off: the isolated UID can also write at the per-agent root, so
+  # `credentials/` is protected by its own owner=controller + 2750
+  # subdir mode (group r-x, isolated UID cannot write inside).
   local _v2_agent_group _v2_agent_root _v2_credentials_dir _v2_subdir
   _v2_agent_group="$(bridge_isolation_v2_agent_group_name "$agent")" \
     || bridge_die "isolation v2: invalid agent name '$agent' for group composition"
@@ -2919,7 +2924,10 @@ bridge_linux_prepare_agent_isolation() {
   bridge_linux_sudo_root mkdir -p "$_v2_agent_root"
   bridge_linux_sudo_root chown root: "$_v2_agent_root"
   bridge_linux_sudo_root chgrp "$_v2_agent_group" "$_v2_agent_root"
-  bridge_linux_sudo_root chmod 2750 "$_v2_agent_root"
+  # v0.8.4: 2770 (was 2750) so the controller — group member, not owner —
+  # can mkdir subdirs (e.g. runtime/) from non-prepare codepaths. See
+  # the layout comment above for the credentials/ protection contract.
+  bridge_linux_sudo_root chmod 2770 "$_v2_agent_root"
   for _v2_subdir in home workdir runtime logs requests responses; do
     bridge_linux_sudo_root mkdir -p "$_v2_agent_root/$_v2_subdir"
     bridge_linux_sudo_root chown "$os_user" "$_v2_agent_root/$_v2_subdir"
@@ -3311,7 +3319,7 @@ bridge_agent_workdir() {
   local explicit="${BRIDGE_AGENT_WORKDIR[$agent]-}"
 
   # v2 takes precedence over explicit roster workdirs: the per-agent private
-  # root (root-owned, group r-x, mode 2750) IS the isolation contract. An
+  # root (root-owned, group rwx, mode 2770 in v0.8.4+) IS the isolation contract. An
   # explicit workdir outside that root would launch the agent into a
   # directory the per-agent group cannot reach — or worse, a directory that
   # other isolated UIDs can reach — silently breaking PR-C's per-agent

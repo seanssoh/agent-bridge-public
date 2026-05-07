@@ -741,12 +741,15 @@ bridge_isolation_v2_migrate_normalize_layout() {
       || { bridge_warn "normalize_layout: state/ chgrp_setgid_recursive failed"; return 1; }
   fi
 
-  # Per-agent root must be 2750 (isolated UID enters via group r-x but
-  # MUST NOT have group write at the root, otherwise it could rename or
-  # delete credentials/ even though credentials/ itself is 2750). r3
-  # review caught the broad recursive 2770 pass making the root
-  # writable. Spec: lib/bridge-isolation-v2.sh:45-59 +
-  # lib/bridge-agents.sh:2116-2152 (`# 2750 — isolated UID r-x at root`).
+  # v0.8.4: per-agent root is 2770 (was 2750). The controller is a group
+  # member but NOT the owner, so under 2750 (group r-x, no write) it
+  # could not `mkdir runtime/` from non-prepare codepaths and the
+  # `runtime/history.env` writer failed with Permission denied. 2770
+  # gives the group write + setgid; credentials/ is protected by its
+  # own owner=controller + 2750 subdir mode so the isolated UID still
+  # cannot mutate launch secrets even with group write at the root.
+  # Spec: lib/bridge-isolation-v2.sh:45-59 +
+  # lib/bridge-agents.sh `# 2770 (was 2750)` comment in the prepare path.
   local agent agent_grp agent_root sub
   local writable_subs=(home workdir runtime logs requests responses)
   while IFS= read -r agent; do
@@ -755,8 +758,8 @@ bridge_isolation_v2_migrate_normalize_layout() {
     agent_root="$data_root/agents/$agent"
     [[ -d "$agent_root" ]] || continue
 
-    # Per-agent root: SINGLE-DIR normalize at 2750. No recursion.
-    bridge_isolation_v2_chgrp_setgid_dir "$agent_grp" 2750 "$agent_root" \
+    # Per-agent root: SINGLE-DIR normalize at 2770. No recursion.
+    bridge_isolation_v2_chgrp_setgid_dir "$agent_grp" 2770 "$agent_root" \
       || { bridge_warn "normalize_layout: agents/$agent root chgrp_setgid_dir failed"; return 1; }
 
     # Writable children: 2770/0660 recursive (group rwx + setgid +
