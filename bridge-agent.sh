@@ -402,6 +402,23 @@ bridge_scaffold_agent_home() {
   local rel=""
   local target=""
 
+  # v2 layout (issue #686): bridge_agent_workdir resolves to a sibling
+  # `workdir/` next to `home/` when BRIDGE_AGENT_ROOT_V2 is active. The
+  # canonical ASCII art at the top of lib/bridge-isolation-v2.sh lists
+  # both as required per-agent subdirs (`home/` is the isolated process
+  # HOME, `workdir/` is the project tree the agent operates in). Without
+  # this, every fresh `agent create` on v2 leaves `<agent-root>/workdir`
+  # missing, so `bridge-start.sh --dry-run` (and any resolver-relative
+  # tooling like doctor/status) bombs with `workdir가 없습니다`.
+  # Compute the v2 workdir target up-front so the isolated/non-isolated
+  # branches below can both pre-create it alongside `$home`. Legacy
+  # installs (no BRIDGE_AGENT_ROOT_V2) keep `home == workdir` per
+  # bridge_agent_workdir's fallback, so this stays empty and is a no-op.
+  local _scaffold_v2_workdir=""
+  if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
+    _scaffold_v2_workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
+  fi
+
   # v0.8.5 #677: when the agent will be linux-user isolated under v2,
   # `$home` lives under `$BRIDGE_AGENT_ROOT_V2/<agent>/...`. The
   # `agents/` ancestor is root-owned (mode 755) and a stale per-agent
@@ -446,10 +463,23 @@ bridge_scaffold_agent_home() {
       bridge_linux_sudo_root mkdir -p "$home" 2>/dev/null || true
       bridge_linux_sudo_root chown "$_scaffold_controller" "$home" 2>/dev/null || true
       bridge_linux_sudo_root chmod 0755 "$home" 2>/dev/null || true
+      # v2 sibling workdir/ (issue #686) — same parent-owned-by-root
+      # problem applies. Pre-create via sudo with controller ownership
+      # so the resolver lookup succeeds; prepare's `chown -R $os_user
+      # $workdir` will retake ownership for the isolated UID after
+      # scaffold completes.
+      if [[ -n "$_scaffold_v2_workdir" ]]; then
+        bridge_linux_sudo_root mkdir -p "$_scaffold_v2_workdir" 2>/dev/null || true
+        bridge_linux_sudo_root chown "$_scaffold_controller" "$_scaffold_v2_workdir" 2>/dev/null || true
+        bridge_linux_sudo_root chmod 0755 "$_scaffold_v2_workdir" 2>/dev/null || true
+      fi
     fi
   fi
 
   mkdir -p "$home"
+  if [[ -n "$_scaffold_v2_workdir" ]]; then
+    mkdir -p "$_scaffold_v2_workdir"
+  fi
   [[ -d "$template_root" ]] || bridge_die "agent template root가 없습니다: $template_root"
   [[ -f "$session_template" ]] || bridge_die "session type template가 없습니다: $session_type"
 
