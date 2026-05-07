@@ -6,6 +6,8 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+- `feat(scripts): add opt-in picker-sweep utility for auto-unsticking Claude Code interactive pickers` — new `scripts/picker-sweep.sh` scans every tmux session, detects rate-limit / resume-from-summary pickers, and presses Enter on the default option. Default disabled (`BRIDGE_PICKER_SWEEP_ENABLED=0`); operators opt in via OS crontab or bridge-native cron. Strict line-anchored regex defends against false-positives from PR bodies / docs / logs that quote picker text. Test seams allow `scripts/smoke/picker-sweep.sh` to exercise the script with mock tmux + mock queue without touching live state. See `OPERATIONS.md` "picker-sweep utility" for registration paths.
+
 ## [0.8.3] — 2026-05-07
 
 ### Highlight — fixes silent data loss on v0.7.x → v0.8.x upgrade

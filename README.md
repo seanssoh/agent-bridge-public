@@ -677,7 +677,7 @@ final_version=0.6.39, reclassify=<count|no-op>, rerender=<count|no-op>, operator
 - [UPGRADING.md](./UPGRADING.md) — 표준 업그레이드 절차 (사전조건 / dry-run / apply / troubleshooting / rollback)
 - [OPERATOR_ACTIONS_PENDING.md](./OPERATOR_ACTIONS_PENDING.md) — release-specific 후속 행동 catalog
 - [ARCHITECTURE.md](./ARCHITECTURE.md) — 내부 아키텍처
-- [OPERATIONS.md](./OPERATIONS.md) — 운영 가이드
+- [OPERATIONS.md](./OPERATIONS.md) — 운영 가이드 (`picker-sweep` auto-unstick utility 포함)
 - [RELEASE.md](./RELEASE.md) — 릴리즈와 업그레이드 정책
 - [KNOWN_ISSUES.md](./KNOWN_ISSUES.md) — 알려진 이슈
 - [CONTRIBUTING.md](./CONTRIBUTING.md) — 기여 가이드

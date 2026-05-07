@@ -536,6 +536,127 @@ created intentionally as test fixtures. Existing agents already in the
 roster are grandfathered — the policy only fires at the create / new-spawn
 entry point.
 
+## picker-sweep utility (auto-unstick stuck Claude Code pickers)
+
+Claude Code occasionally stops on an interactive picker (rate-limit options,
+resume-from-summary, etc.) waiting for a human keypress. For long-running
+tmux-managed agents nobody is watching, this freezes the session indefinitely.
+`scripts/picker-sweep.sh` scans every tmux session, detects a picker that
+matches a closed pattern allow-list, and presses Enter on the default option.
+
+The utility is **opt-in**: it is shipped in the repo but does nothing unless
+both the cron registration *and* the `BRIDGE_PICKER_SWEEP_ENABLED=1` flag are
+present.
+
+### Required environment
+
+| Variable | Purpose |
+| --- | --- |
+| `BRIDGE_PICKER_SWEEP_ENABLED` | Set to `1` to enable the sweep. Default `0` (no-op). |
+| `BRIDGE_PICKER_SWEEP_SELF` | Agent name to skip when scanning. Set this to the agent that *runs* the sweep so its own pane (which often contains picker text in PR bodies, docs, or logs) is not auto-Entered. Empty = no self-skip. |
+| `BRIDGE_PICKER_SWEEP_NOTIFY` | Admin agent ID. When non-empty, picker-sweep enqueues a queue task summarising auto-unstick events. Empty = log-only. |
+
+There is no fallback to `BRIDGE_ADMIN_AGENT_ID` — both knobs must be set
+explicitly so a misconfigured operator does not silently lose the self-skip
+defence.
+
+### Registration paths
+
+Three options, ordered by safety. Pick one.
+
+#### A. OS crontab (recommended)
+
+The OS scheduler invokes the script as a plain bash process, completely
+bypassing claude/codex. There is no possibility of self-recursion if the
+admin's own session ever stalls on a picker.
+
+The crontab entry **must be one physical line** — `crontab(5)` does not
+honor shell backslash continuation:
+
+```cron
+*/10 * * * * BRIDGE_PICKER_SWEEP_ENABLED=1 BRIDGE_PICKER_SWEEP_SELF=admin BRIDGE_PICKER_SWEEP_NOTIFY=admin bash /full/path/.agent-bridge/scripts/picker-sweep.sh >> /full/path/.agent-bridge/logs/picker-sweep.log 2>&1
+```
+
+Replace `admin` with the actual admin agent's ID and `/full/path/` with the
+absolute path to your `~/.agent-bridge` directory.
+
+If the long inline form is hard to maintain, drop the env vars + path into
+a small wrapper script and crontab the wrapper instead — only the crontab
+entry has the one-line restriction:
+
+```bash
+# /full/path/.agent-bridge/scripts/picker-sweep-wrapper.sh
+#!/usr/bin/env bash
+export BRIDGE_PICKER_SWEEP_ENABLED=1
+export BRIDGE_PICKER_SWEEP_SELF=admin
+export BRIDGE_PICKER_SWEEP_NOTIFY=admin
+exec bash "$(dirname "$0")/picker-sweep.sh"
+```
+
+Make the wrapper executable, then crontab it:
+
+```bash
+chmod +x /full/path/.agent-bridge/scripts/picker-sweep-wrapper.sh
+```
+
+```cron
+*/10 * * * * /full/path/.agent-bridge/scripts/picker-sweep-wrapper.sh >> /full/path/.agent-bridge/logs/picker-sweep.log 2>&1
+```
+
+#### B. Bridge-native cron with a Codex target
+
+The bridge cron runner currently wraps every payload in `claude -p` (or
+`codex exec`), so the cron registration must target an agent whose engine is
+not blocked by the very picker the sweep is meant to clear. Pick a Codex
+agent (or any non-Claude target) for `--agent`:
+
+```bash
+agent-bridge cron create \
+    --agent <codex-admin> \
+    --schedule '*/10 * * * *' \
+    --title picker-sweep \
+    --payload 'BRIDGE_PICKER_SWEEP_ENABLED=1 BRIDGE_PICKER_SWEEP_SELF=<admin> BRIDGE_PICKER_SWEEP_NOTIFY=<admin> bash $BRIDGE_HOME/scripts/picker-sweep.sh'
+```
+
+#### C. Bridge-native cron with a `payload_kind=shell` (future)
+
+Once the upstream `payload_kind=shell` mode lands (tracked in the cron-runner
+shell-payload bypass issue), the bridge-native registration becomes safe with
+any agent target because the runner will execute the payload directly:
+
+```bash
+agent-bridge cron create \
+    --agent <admin> \
+    --schedule '*/10 * * * *' \
+    --title picker-sweep \
+    --payload-kind shell \
+    --payload 'BRIDGE_PICKER_SWEEP_ENABLED=1 BRIDGE_PICKER_SWEEP_SELF=<admin> BRIDGE_PICKER_SWEEP_NOTIFY=<admin> bash $BRIDGE_HOME/scripts/picker-sweep.sh'
+```
+
+Until that lands, prefer A.
+
+### Limits and known gotchas
+
+- The picker pattern allow-list is hardcoded. If Anthropic ships new picker
+  shapes or rewords the existing options, update
+  `_PICKER_OPTION_LINE_RE` in `scripts/picker-sweep.sh` and add a smoke case.
+- The sweep presses Enter for the **default** option. For the rate-limit
+  picker the default is "Stop and wait for limit to reset" (safe). For the
+  resume-from-summary picker the default is "Resume from summary
+  (recommended)". Both are conservative.
+- If the same agent shows up across multiple sweeps in a row, the picker is
+  not the root cause — it is a symptom of a deeper plan-level issue (rate
+  limit window saturated, broken summary, etc). Investigate manually.
+
+### Verifying
+
+```bash
+bash scripts/smoke/picker-sweep.sh
+```
+
+The smoke runs in an isolated `BRIDGE_HOME` with mock tmux + mock queue
+seams; it does not touch a live tmux server or live queue state.
+
 ## Platform Scope
 
 Agent Bridge runs on both macOS and Linux, but the two hosts have
