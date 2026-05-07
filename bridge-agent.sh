@@ -483,29 +483,69 @@ bridge_scaffold_agent_home() {
     fi
     _scaffold_controller="$(bridge_current_user 2>/dev/null || id -un 2>/dev/null || printf '')"
     if [[ -n "$_scaffold_v2_root" && -n "$_scaffold_controller" ]]; then
+      # Wave-5 #4282 hardening: every sudo-handoff step here is now
+      # strict. Pre-Wave-5 the block silenced stderr and `|| true`-
+      # swallowed every failure (mkdir/chown/chmod) and fell through to
+      # the plain `mkdir -p "$home"` below. On a fresh install where
+      # sudo NOPASSWD does not whitelist `mkdir/chown/chmod` (the
+      # `bridge_migration_install_sudoers` entry only whitelists
+      # `tmux + bash`), the entire block silently no-op'd and the plain
+      # mkdir surfaced raw `Permission denied` instead of an actionable
+      # "sudo configuration is wrong for v2 isolation" error. Surface
+      # each failure via `bridge_die` so the caller can fix the
+      # underlying sudo policy rather than chasing the secondary mkdir
+      # symptom (Scenario A.b root cause analysis, task #4282 retest).
+      #
+      # Scope is intentionally limited to the per-agent root +
+      # `$home` + v2 sibling workdir/ — i.e., paths the predicate has
+      # ALREADY confirmed are isolated-managed. The v2 ancestor parents
+      # (`$BRIDGE_DATA_ROOT`, `$BRIDGE_AGENT_ROOT_V2`) are NOT
+      # normalized here even though the canonical contract in
+      # lib/bridge-isolation-v2.sh:36-47 says `agents/` should be
+      # `root:root 0755`. Locking the parents to root:root would break
+      # the non-isolated v2 path: `bridge_agent_default_home`
+      # (lib/bridge-agents.sh:3226-3232) resolves shared-mode agents'
+      # home to `$BRIDGE_AGENT_ROOT_V2/<agent>/home` too, and the
+      # non-isolated branch reaches plain `mkdir -p "$home"` below
+      # without a sudo handoff — that mkdir would suddenly require
+      # write on a root-owned parent. The pre-Wave-5 `bridge_init_dirs`
+      # umask-derived parent perms (typically `sean:sean 0700` or
+      # `0755`) keep the non-isolated path working. Operators who want
+      # the full canonical layout should use the migration tool, which
+      # owns parent normalization (#4282 codex review, PR #701 r2).
+      #
       # Per-agent root: idempotent. If a prior failed run left it as
       # root:ab-agent-<name> 2750, retake it as controller-owned 0755 so
       # we (and any nested mkdirs) can write into it. Prepare will reset
       # ownership/mode to the canonical contract.
-      bridge_linux_sudo_root mkdir -p "$_scaffold_v2_root" 2>/dev/null || true
-      bridge_linux_sudo_root chown "$_scaffold_controller" "$_scaffold_v2_root" 2>/dev/null || true
-      bridge_linux_sudo_root chmod 0755 "$_scaffold_v2_root" 2>/dev/null || true
+      bridge_linux_sudo_root mkdir -p "$_scaffold_v2_root" \
+        || bridge_die "scaffold sudo mkdir failed: $_scaffold_v2_root (verify sudo NOPASSWD whitelist for the controller)"
+      bridge_linux_sudo_root chown "$_scaffold_controller" "$_scaffold_v2_root" \
+        || bridge_die "scaffold sudo chown $_scaffold_controller failed: $_scaffold_v2_root"
+      bridge_linux_sudo_root chmod 0755 "$_scaffold_v2_root" \
+        || bridge_die "scaffold sudo chmod 0755 failed: $_scaffold_v2_root"
       # Scaffold target ($home is typically $_scaffold_v2_root/home but
       # may be overridden via BRIDGE_AGENT_WORKDIR). Pre-create via sudo
       # in case it lives under a path the controller cannot mkdir
       # directly (same parent-owned-by-root problem as above).
-      bridge_linux_sudo_root mkdir -p "$home" 2>/dev/null || true
-      bridge_linux_sudo_root chown "$_scaffold_controller" "$home" 2>/dev/null || true
-      bridge_linux_sudo_root chmod 0755 "$home" 2>/dev/null || true
+      bridge_linux_sudo_root mkdir -p "$home" \
+        || bridge_die "scaffold sudo mkdir failed: $home"
+      bridge_linux_sudo_root chown "$_scaffold_controller" "$home" \
+        || bridge_die "scaffold sudo chown $_scaffold_controller failed: $home"
+      bridge_linux_sudo_root chmod 0755 "$home" \
+        || bridge_die "scaffold sudo chmod 0755 failed: $home"
       # v2 sibling workdir/ (issue #686) — same parent-owned-by-root
       # problem applies. Pre-create via sudo with controller ownership
       # so the resolver lookup succeeds; prepare's `chown -R $os_user
       # $workdir` will retake ownership for the isolated UID after
       # scaffold completes.
       if [[ -n "$_scaffold_v2_workdir" ]]; then
-        bridge_linux_sudo_root mkdir -p "$_scaffold_v2_workdir" 2>/dev/null || true
-        bridge_linux_sudo_root chown "$_scaffold_controller" "$_scaffold_v2_workdir" 2>/dev/null || true
-        bridge_linux_sudo_root chmod 0755 "$_scaffold_v2_workdir" 2>/dev/null || true
+        bridge_linux_sudo_root mkdir -p "$_scaffold_v2_workdir" \
+          || bridge_die "scaffold sudo mkdir failed: $_scaffold_v2_workdir"
+        bridge_linux_sudo_root chown "$_scaffold_controller" "$_scaffold_v2_workdir" \
+          || bridge_die "scaffold sudo chown $_scaffold_controller failed: $_scaffold_v2_workdir"
+        bridge_linux_sudo_root chmod 0755 "$_scaffold_v2_workdir" \
+          || bridge_die "scaffold sudo chmod 0755 failed: $_scaffold_v2_workdir"
       fi
     fi
   fi
