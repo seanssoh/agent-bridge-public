@@ -76,6 +76,41 @@ bridge_isolation_v2_migrate_mkstate() {
     || mkdir -p "$(bridge_isolation_v2_migrate_state_dir)"
 }
 
+# Issue #698: append the list of agent ids whose tmux sessions had to be
+# force-killed by the per-agent stop loop fallback to a sidecar JSON in
+# the migration state dir, so post-migration audit can see which sessions
+# were stopped non-cooperatively. Best-effort: write failures must not
+# block the migration, since the in-memory abort path in the caller is
+# already the authoritative gate.
+bridge_isolation_v2_migrate_record_force_killed() {
+  local -a forced=("$@")
+  (( ${#forced[@]} > 0 )) || return 0
+
+  bridge_isolation_v2_migrate_mkstate
+  local sidecar
+  sidecar="$(bridge_isolation_v2_migrate_state_dir)/force-killed-sessions.json"
+
+  local stamp
+  stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'unknown')"
+
+  local agents_json="" sep="" agent
+  for agent in "${forced[@]}"; do
+    [[ -n "$agent" ]] || continue
+    # Quote the agent id naively — agent ids in this codebase are kebab/
+    # snake-case ASCII (validated upstream), so we don't need a full JSON
+    # encoder. If a stray quote ever appears, drop it rather than emit
+    # malformed JSON.
+    agent="${agent//\"/}"
+    agents_json+="${sep}\"${agent}\""
+    sep=","
+  done
+
+  {
+    printf '{"timestamp":"%s","force_killed_sessions":[%s]}\n' \
+      "$stamp" "$agents_json"
+  } > "$sidecar" 2>/dev/null || true
+}
+
 # ---------------------------------------------------------------------------
 # 1. self-stop guard
 # ---------------------------------------------------------------------------
@@ -893,11 +928,46 @@ bridge_isolation_v2_migrate_orchestrate_stop() {
       || bridge_warn "stop failed for agent '$agent' — continuing; will be skipped at restart"
   done < "$snapshot_path"
 
-  # Verify zero active.
+  # Issue #698: a v0.7.7 daemon-spawned tmux session occasionally outlives
+  # the per-agent stop loop (CLI holding the foreground, tmux server still
+  # tracking attached client). Before this hotfix we aborted right here,
+  # which blocked the v0.7→v0.8 migration on any host where the operator
+  # hadn't pre-stopped every agent. Fall back to `tmux kill-session` for
+  # the still-active set, audit-log the force-killed session list, then
+  # re-verify. Only abort if force-kill ALSO fails to clear the set.
   local remaining
   remaining="$(bridge_active_agent_ids | wc -l | tr -d ' ')"
   if [[ "$remaining" =~ ^[0-9]+$ ]] && (( remaining > 0 )); then
-    bridge_die "agents still active after per-agent stop loop: $remaining"
+    local -a stuck_agents=()
+    mapfile -t stuck_agents < <(bridge_active_agent_ids)
+
+    local -a forced_pairs=()
+    local stuck_session
+    for agent in "${stuck_agents[@]}"; do
+      [[ -n "$agent" ]] || continue
+      stuck_session=""
+      if declare -F bridge_agent_session >/dev/null 2>&1; then
+        stuck_session="$(bridge_agent_session "$agent" 2>/dev/null || printf '')"
+      fi
+      forced_pairs+=("${agent}/${stuck_session:--}")
+    done
+
+    bridge_warn "migration: force-stopping ${#stuck_agents[@]} active tmux session(s) before apply-live (sessions: ${forced_pairs[*]})"
+
+    local -a force_killed=()
+    for agent in "${stuck_agents[@]}"; do
+      [[ -n "$agent" ]] || continue
+      if bridge_kill_agent_session "$agent" >/dev/null 2>&1; then
+        force_killed+=("$agent")
+      fi
+    done
+
+    bridge_isolation_v2_migrate_record_force_killed "${force_killed[@]+"${force_killed[@]}"}"
+
+    remaining="$(bridge_active_agent_ids | wc -l | tr -d ' ')"
+    if [[ "$remaining" =~ ^[0-9]+$ ]] && (( remaining > 0 )); then
+      bridge_die "agents still active after force-kill fallback: $remaining (sessions: ${forced_pairs[*]})"
+    fi
   fi
 
   # Plain daemon stop (active=0 now → no --force needed).
