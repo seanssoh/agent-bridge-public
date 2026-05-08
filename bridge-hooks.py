@@ -1406,6 +1406,224 @@ def cmd_ensure_project_trust(args: argparse.Namespace) -> int:
     return 0
 
 
+# Issue #730 — agent profile shared-doc/skill symlinks created on pre-v0.8
+# layouts resolve to non-existent paths after the v0.8 home/workdir split.
+# `cmd_relink_agent_profile_paths` iterates a closed set of expected link
+# sites and replaces each broken symlink with one pointing at the correct
+# relative target. Real files (non-symlinks) are skipped to avoid clobbering
+# operator content. See bridge-watchdog.collect_broken_links — that scan
+# surfaces the drift; this command remediates it. The relink contract is
+# intentionally narrow:
+#   * workdir/<DOC>.md → ../../../shared/<DOC>.md
+#       (3 levels up from <bridge_home>/agents/<agent>/workdir/ → <bridge_home>;
+#        canonical shared/ tree lives under BRIDGE_HOME).
+#   * home/.claude/skills/<skill> → ../../../../../.claude/skills/<skill>
+#       (5 levels up from <bridge_home>/agents/<agent>/home/.claude/skills/ →
+#        <bridge_home>; bridge-managed skills mirror lives at
+#        BRIDGE_HOME/.claude/skills/<skill>, not $HOME/.claude/skills/.)
+# Anything else is left untouched. Profile-link layout owners (docs, skills)
+# control this list; new link sites must be added here explicitly.
+PROFILE_SHARED_DOC_NAMES = (
+    "COMMON-INSTRUCTIONS.md",
+    "CHANGE-POLICY.md",
+    "TOOLS.md",
+)
+
+
+def _relink_one(
+    link: Path,
+    desired_rel_target: str,
+    os_user: str | None,
+) -> tuple[str, str]:
+    """Resolve a single profile link and repair if broken.
+
+    Returns ``(state, detail)`` where ``state`` is one of:
+      * ``"already_ok"`` — link present, resolves to an existing path with the
+        desired relative target (or any target that exists; we trust the
+        operator's prior placement when it works).
+      * ``"repaired"`` — link was missing, broken, or pointed at the wrong
+        relative target; replaced with ``desired_rel_target`` via ``ln -sfn``.
+      * ``"skipped"`` — a real (non-symlink) file/dir sits at ``link``; we
+        do not clobber it. Caller should warn.
+      * ``"failed"`` — relink attempt errored even after sudo fallback.
+
+    ``detail`` carries a short human-readable note (existing target,
+    expected target, exception class) for the JSON payload.
+    """
+    # Use lexists so a broken symlink registers as present.
+    if os.path.lexists(link):
+        is_symlink = os.path.islink(link)
+        if not is_symlink:
+            return ("skipped", "non-symlink path occupies link site")
+        existing = os.readlink(link)
+        # If the link resolves (target exists), leave it alone — the
+        # operator may have a different but functioning relative target.
+        # We only repair when the link is broken or already points at a
+        # non-resolvable place.
+        if os.path.exists(link) and existing == desired_rel_target:
+            return ("already_ok", f"target={existing}")
+        if os.path.exists(link) and existing != desired_rel_target:
+            # Resolves, but not via the canonical relative form. Leave it —
+            # less risky than rewriting a working link. Surface the drift
+            # so an operator can decide.
+            return ("already_ok", f"target={existing} (non-canonical, resolves)")
+    # Replace (or create) the symlink atomically. `ln -sfn` is the
+    # idempotent shell idiom — no readlink-then-unlink-then-symlink race.
+    try:
+        # Direct controller-side `ln -sfn`. Falls back to sudo on
+        # PermissionError for isolated workdirs (#714 / #694 shape).
+        rc = subprocess.run(
+            ["ln", "-sfn", desired_rel_target, str(link)],
+            check=False,
+        ).returncode
+        if rc != 0 and os_user is not None:
+            rc = _sudo_run_as(os_user, "ln", "-sfn", desired_rel_target, str(link))
+        if rc != 0:
+            return ("failed", f"ln -sfn rc={rc}")
+    except OSError as exc:
+        return ("failed", f"{type(exc).__name__}: {exc}")
+    return ("repaired", f"target={desired_rel_target}")
+
+
+def _relink_agent_profile_paths(agent_home: Path, home_dir: Path) -> dict[str, list[str]]:
+    """Resolve every expected profile link under ``agent_home``.
+
+    ``agent_home`` is ``<bridge_home>/agents/<agent>``; ``home_dir`` is
+    ``$HOME`` (passed in so tests can redirect via env without touching
+    Path.home()).
+    """
+    result: dict[str, list[str]] = {
+        "repaired": [],
+        "already_ok": [],
+        "skipped": [],
+        "failed": [],
+    }
+
+    workdir = agent_home / "workdir"
+    home_root = agent_home / "home"
+
+    # Per-link-class isolation owner detection. workdir/ and home/ are both
+    # owned by agent-bridge-<name> under v2 layout; check each independently
+    # because shared-mode agents have neither subdir owned by an isolated
+    # user (helper returns None).
+    workdir_user = _isolated_workdir_owner(workdir) if workdir.exists() else None
+    home_user = _isolated_workdir_owner(home_root) if home_root.exists() else None
+
+    # Shared-doc links: workdir/<DOC>.md → ../../../shared/<DOC>.md.
+    # 3 levels up from <bridge_home>/agents/<agent>/workdir/ lands at
+    # <bridge_home>; the canonical shared/ tree lives directly under it.
+    if workdir.exists():
+        for name in PROFILE_SHARED_DOC_NAMES:
+            link = workdir / name
+            desired = f"../../../shared/{name}"
+            state, detail = _relink_one(link, desired, workdir_user)
+            result[state].append(f"workdir/{name}: {detail}")
+
+    # Skill links: home/.claude/skills/<skill> → ../../../../../.claude/skills/<skill>.
+    # 5 levels up from <bridge_home>/agents/<agent>/home/.claude/skills/
+    # lands at $HOME; we relink every entry that already exists in the
+    # agent's skills dir (operator's source of truth for which skills the
+    # agent should see). Missing-source skills (operator removed the
+    # ~/.claude/skills/<skill> dir) still get the corrected link target —
+    # if the operator restores the skill later the link will resolve.
+    skills_dir = home_root / ".claude" / "skills"
+    if skills_dir.is_dir():
+        for entry in sorted(skills_dir.iterdir()):
+            link = skills_dir / entry.name
+            # Only consider symlink entries — directories created locally
+            # by the agent (not bridge-managed) shouldn't be rewritten.
+            if not os.path.islink(link):
+                # Real dir — surface as skipped but don't clobber.
+                if entry.is_dir():
+                    result["skipped"].append(
+                        f"home/.claude/skills/{entry.name}: real directory occupies link site"
+                    )
+                continue
+            desired = f"../../../../../.claude/skills/{entry.name}"
+            state, detail = _relink_one(link, desired, home_user)
+            result[state].append(f"home/.claude/skills/{entry.name}: {detail}")
+    elif skills_dir.exists() and not skills_dir.is_dir():
+        result["skipped"].append("home/.claude/skills: not a directory")
+
+    return result
+
+
+def _resolve_agent_home_root(args: argparse.Namespace) -> Path:
+    """Return the directory under which `<agent>/` agent homes live."""
+    if getattr(args, "agent_home_root", None):
+        return Path(args.agent_home_root).expanduser()
+    bridge_home = (
+        getattr(args, "bridge_home", None)
+        or os.environ.get("BRIDGE_HOME")
+        or str(Path.home() / ".agent-bridge")
+    )
+    return Path(bridge_home).expanduser() / "agents"
+
+
+def cmd_relink_agent_profile_paths(args: argparse.Namespace) -> int:
+    agent_home_root = _resolve_agent_home_root(args)
+    home_dir = Path(os.environ.get("HOME") or str(Path.home())).expanduser()
+
+    selected: list[str] = []
+    if getattr(args, "all_agents", False):
+        if agent_home_root.is_dir():
+            for entry in sorted(agent_home_root.iterdir()):
+                if not entry.is_dir():
+                    continue
+                if entry.name.startswith(".") or entry.name in {"_template", "shared"}:
+                    continue
+                selected.append(entry.name)
+    elif getattr(args, "agent", None):
+        selected = [args.agent]
+    else:
+        print(
+            "[bridge-hooks] relink-profile-paths requires --agent <name> or --all-agents",
+            file=sys.stderr,
+        )
+        return 2
+
+    agents_payload: list[dict[str, Any]] = []
+    overall_failed = 0
+    for agent in selected:
+        agent_home = agent_home_root / agent
+        if not agent_home.is_dir():
+            agents_payload.append(
+                {
+                    "agent": agent,
+                    "repaired": [],
+                    "already_ok": [],
+                    "skipped": [f"agent home not found: {agent_home}"],
+                    "failed": [],
+                }
+            )
+            continue
+        report = _relink_agent_profile_paths(agent_home, home_dir)
+        overall_failed += len(report["failed"])
+        agents_payload.append({"agent": agent, **report})
+
+    if getattr(args, "json", False):
+        print(json.dumps({"agents": agents_payload}, ensure_ascii=False, indent=2))
+    else:
+        for entry in agents_payload:
+            agent = entry["agent"]
+            print(
+                f"agent={agent} "
+                f"repaired={len(entry['repaired'])} "
+                f"already_ok={len(entry['already_ok'])} "
+                f"skipped={len(entry['skipped'])} "
+                f"failed={len(entry['failed'])}"
+            )
+            for line in entry["repaired"]:
+                print(f"  repaired: {line}")
+            for line in entry["skipped"]:
+                print(f"  skipped: {line}")
+            for line in entry["failed"]:
+                print(f"  failed: {line}")
+    # Non-zero exit only when relink itself errored (not when paths were
+    # skipped or already ok). The upgrader treats this as informational.
+    return 1 if overall_failed else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="bridge-hooks.py")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1574,6 +1792,30 @@ def build_parser() -> argparse.ArgumentParser:
     trust_parser.add_argument("--claude-user-file")
     trust_parser.add_argument("--format", choices=("text", "shell"), default="text")
     trust_parser.set_defaults(handler=cmd_ensure_project_trust)
+
+    # Issue #730 — repair v0.8 layout shared-doc/skill profile symlinks.
+    relink_profile_parser = subparsers.add_parser("relink-profile-paths")
+    relink_target = relink_profile_parser.add_mutually_exclusive_group(required=True)
+    relink_target.add_argument("--agent", help="Single agent name under <bridge-home>/agents/")
+    relink_target.add_argument(
+        "--all-agents",
+        action="store_true",
+        help="Iterate every agent directory under <bridge-home>/agents/",
+    )
+    relink_profile_parser.add_argument(
+        "--bridge-home",
+        help="Override BRIDGE_HOME; defaults to env BRIDGE_HOME or ~/.agent-bridge.",
+    )
+    relink_profile_parser.add_argument(
+        "--agent-home-root",
+        help="Override the agents root directly (defaults to <bridge-home>/agents).",
+    )
+    relink_profile_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit a JSON payload instead of the human-readable summary.",
+    )
+    relink_profile_parser.set_defaults(handler=cmd_relink_agent_profile_paths)
 
     return parser
 

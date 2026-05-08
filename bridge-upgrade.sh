@@ -1610,6 +1610,48 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
     >/dev/null 2>&1 || true
 fi
 
+# Issue #730 — repair v0.8 layout shared-doc/skill profile symlinks. Pre-v0.8
+# installs created links like `agents/<agent>/workdir/COMMON-INSTRUCTIONS.md ->
+# ../shared/COMMON-INSTRUCTIONS.md` that resolve to a non-existent path after
+# the home/workdir split. `bridge-hooks.py relink-profile-paths` re-resolves
+# each known link site to the correct relative target and replaces only the
+# broken ones (real files are skipped, no clobber). Runs before daemon
+# restart so the next session sees the corrected profile view immediately.
+# Skipped on --dry-run; failures are non-fatal (warn only) so an unexpected
+# error in the relinker never blocks the upgrade.
+RELINK_PROFILE_JSON='{"mode":"skipped","count":0}'
+if [[ $DRY_RUN -eq 0 ]]; then
+  RELINK_PROFILE_JSON="$(python3 "$TARGET_ROOT/bridge-hooks.py" relink-profile-paths --all-agents --json --bridge-home "$TARGET_ROOT" 2>&1 || true)"
+  python3 - "$RELINK_PROFILE_JSON" <<'PY' || true
+import json, sys
+raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+if not raw or not raw.startswith("{"):
+    print(
+        "[bridge-upgrade] WARN: relink-profile-paths returned non-JSON; "
+        f"raw preview: {raw[:200]}",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError as exc:
+    print(
+        f"[bridge-upgrade] WARN: relink-profile-paths JSON decode error: {exc}",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+agents = payload.get("agents", []) or []
+total_repaired = sum(len(a.get("repaired", []) or []) for a in agents)
+total_skipped = sum(len(a.get("skipped", []) or []) for a in agents)
+total_failed = sum(len(a.get("failed", []) or []) for a in agents)
+print(
+    f"[bridge-upgrade] profile symlinks repaired: {total_repaired} "
+    f"(skipped={total_skipped}, failed={total_failed}, "
+    f"agents={len(agents)})"
+)
+PY
+fi
+
 if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   # --force: the upgrader is the sanctioned daemon stop+restart path
   # (issue #314 Layer 3 / #315 Track 3). Bypass the active-agent guard.
