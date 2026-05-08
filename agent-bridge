@@ -543,8 +543,12 @@ if [[ $# -gt 0 ]]; then
       # spawned tmux session dies inside the post-launch verify window.
       # Propagate that signal here (instead of `exec`-ing) so we can append
       # an admin-targeted remediation hint after the child's own log tail.
-      "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "--$ADMIN_ENGINE" --name "$ADMIN_AGENT" --workdir "$ADMIN_WORKDIR" --loop "$@"
-      _admin_rc=$?
+      # NOTE: `set -e` at the top of this script would terminate before
+      # `_admin_rc=$?` runs on a nonzero child; the `|| _admin_rc=$?`
+      # tail keeps the heredoc + exit-propagation reachable.
+      _admin_rc=0
+      "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "--$ADMIN_ENGINE" --name "$ADMIN_AGENT" --workdir "$ADMIN_WORKDIR" --loop "$@" \
+        || _admin_rc=$?
       if [[ $_admin_rc -ne 0 ]]; then
         cat >&2 <<EOF
 [오류] '$ADMIN_AGENT' 어드민 세션이 시작 직후 종료되었습니다.
