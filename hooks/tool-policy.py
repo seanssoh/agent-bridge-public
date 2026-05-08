@@ -1158,6 +1158,98 @@ def _bash_argv_references_system_config(command: str) -> bool:
     return False
 
 
+def _is_config_set_wrapper(text: str) -> bool:
+    """True iff *text* is the sanctioned ``agent-bridge config set`` /
+    ``agb config set`` wrapper invocation as a single, side-effect-free
+    shell command.
+
+    The hook normally denies any Bash command whose argv mentions a
+    protected path. That blocks the very wrapper #341 prescribes:
+    ``agent-bridge config set --path <protected> --change ...`` was
+    routed through `_bash_argv_references_path()` and rejected because
+    the protected path appears as the wrapper's argument — wrapper
+    self-block deadlock, even for admin (the deny message itself points
+    operators back at the same wrapper they were trying to call).
+
+    The wrapper layers its own gate (`bridge-config.py:detect_caller_source`
+    + before/after sha256 audit row), so once we let it through the hook
+    the only thing that changes is "audit chain stops being doubled".
+    A non-operator caller still gets denied at the wrapper.
+
+    Match shape (strict — codex r2 #726):
+
+    - The text contains *no* shell separators (`;` / `&&` / `||` / `|` /
+      `&` / newline). Multi-command pipelines drop straight back to the
+      regular path-argv gate so a trailing `; sqlite3 .../tasks.db
+      .dump` cannot ride through.
+    - The text contains *no* shell embeddings — command substitution
+      (``$(...)`` / backticks), process substitution (``<(...)`` /
+      ``>(...)``), heredoc / here-string (``<<`` / ``<<<``).
+      ``--change foo=$(sqlite3 .../tasks.db .dump)`` would otherwise
+      let the shell read the queue DB before the wrapper even starts.
+    - The text contains *no* I/O redirection tokens (``>`` / ``>>`` /
+      ``<`` / ``&>``, 2>`` other than the SAFE stderr-discard forms).
+      ``... > ~/.agent-bridge/agent-roster.local.sh`` would otherwise
+      let the shell open/truncate the protected file before any
+      argv-side gate runs.
+    - shlex tokens[0] leaf is ``agent-bridge`` or ``agb`` (path prefix
+      tolerated).
+    - Subcommand sits at the strict positional ``tokens[1] == "config"``
+      and ``tokens[2] == "set"``. A later embedded ``config set`` inside
+      a different subcommand's argv (e.g. ``agent-bridge wave run config
+      set``) does not fire the carve-out.
+
+    ``config get`` / ``config list-protected`` keep the existing
+    read-intent carve-out — this helper is only for the write surface
+    that the path-argv gate would otherwise self-block.
+    """
+    # Reject shell embeddings on raw text first. `_command_has_shell_embedding`
+    # catches `$(...)`, backticks, `<(...)`, `>(...)`, `<<` / `<<<` — these
+    # are the signals we want, so we deliberately don't pre-sanitize. Same
+    # threat shape as multi-command pipelines: the shell evaluates the
+    # embedded command before the wrapper process even runs, so
+    # bridge-config.py cannot guard the file the subshell opens (codex
+    # r2 #726).
+    if _command_has_shell_embedding(text):
+        return False
+    # Strip the safe stderr-suppression / fd-dup tokens BEFORE the
+    # multi-command and redirection checks. `2>&1` legitimately contains
+    # the `&` token-boundary character that `_COMMAND_OPERATOR_RE` would
+    # otherwise read as a backgrounding signal, and `2>/dev/null` looks
+    # like output redirection but cannot mutate the filesystem. The safe
+    # forms must remain allowed for the carve-out to be useful in
+    # `2>/dev/null`-suffixed wrapper invocations.
+    sanitized = _SAFE_REDIRECT_RE.sub(" ", text)
+    # Reject *any* remaining `<` / `>` after the safe-redirect strip.
+    # bash accepts arbitrary numeric file-descriptor prefixes
+    # (`1>`, `0<`, `3<`, `9>>`, `3<>`, ...) — the codex r3 #726 review
+    # caught that the previous per-token `tok.startswith(">")` check
+    # missed `1>`, `0<`, etc. and let the shell open/truncate/read a
+    # protected path before the wrapper started. Any `<` or `>` outside
+    # the safe-redirect forms means the shell is doing I/O the wrapper
+    # cannot guard.
+    if "<" in sanitized or ">" in sanitized:
+        return False
+    # Reject multi-command pipelines. shlex does not treat shell
+    # operators as separators — `agent-bridge config set --path X;
+    # sqlite3 .../tasks.db .dump` arrives as one shlex run, and a naive
+    # leaf check would hand the whole text a None reason and let the
+    # second command bypass the queue-DB / system-config gates. The
+    # carve-out only applies when the wrapper invocation stands alone.
+    if _COMMAND_OPERATOR_RE.search(sanitized):
+        return False
+    try:
+        tokens = shlex.split(sanitized, posix=True, comments=False)
+    except ValueError:
+        return False
+    if len(tokens) < 3:
+        return False
+    leaf = tokens[0].rsplit("/", 1)[-1]
+    if leaf not in {"agent-bridge", "agb"}:
+        return False
+    return tokens[1] == "config" and tokens[2] == "set"
+
+
 def protected_alias_reason(text: str, agent: str) -> str | None:
     admin = is_admin_agent(agent)
     # The two checks below use shlex argv matching rather than substring
@@ -1180,6 +1272,17 @@ def protected_alias_reason(text: str, agent: str) -> str | None:
     # structured-read surface and direct sqlite reads still bypass that
     # contract.
     read_intent = _is_read_intent_bash(text)
+    # Wrapper self-block carve-out: the sanctioned `agent-bridge config
+    # set` wrapper layers its own caller-source + audit gate
+    # (bridge-config.py). Without this carve-out the path-argv check
+    # below denies the wrapper invocation because the protected path
+    # appears as the wrapper's --path argument — leaving operators in a
+    # deadlock where the deny message points back at the same wrapper
+    # they just tried to call. Letting the wrapper through here only
+    # delegates audit responsibility to the wrapper itself; non-operator
+    # callers still get rejected at bridge-config.py.
+    if _is_config_set_wrapper(text):
+        return None
     if _bash_argv_references_path(text, roster_local_path()):
         if read_intent:
             return None
