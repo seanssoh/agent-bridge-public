@@ -3108,14 +3108,19 @@ bridge_note_plugin_liveness_state() {
   local last_key="$2"
   local last_detected_ts="$3"
   local last_restart_ts="$4"
+  # Optional 5th positional: cumulative restart-attempt count for this key.
+  # Older state files (pre-#715-A) omit this field; callers default to 0.
+  local restart_attempts="${5:-0}"
   local state_file=""
 
+  [[ "$restart_attempts" =~ ^[0-9]+$ ]] || restart_attempts=0
   state_file="$(bridge_plugin_liveness_state_file "$agent")"
   mkdir -p "$(dirname "$state_file")"
   cat >"$state_file" <<EOF
 LAST_KEY=$(printf '%q' "$last_key")
 LAST_DETECTED_TS=$(printf '%q' "$last_detected_ts")
 LAST_RESTART_TS=$(printf '%q' "$last_restart_ts")
+RESTART_ATTEMPTS=$(printf '%q' "$restart_attempts")
 EOF
 }
 
@@ -3129,10 +3134,19 @@ bridge_report_plugin_liveness_miss() {
   local key=""
   local now_ts=0
   local cooldown="${BRIDGE_PLUGIN_LIVENESS_RESTART_COOLDOWN_SECONDS:-60}"
+  # Issue #715 A — bound the restart loop. When the missing-channel set is
+  # rooted in operator config (relay token absent, teams unprovisioned, etc.)
+  # the channel CSV never recovers from a daemon-side restart, so the agent
+  # gets killed every cooldown window forever. Cap consecutive restart
+  # attempts per (agent, missing-CSV) key; once the cap is hit, audit a
+  # giveup entry once and stop restarting until the CSV changes (i.e., the
+  # operator changed something).
+  local max_restarts="${BRIDGE_PLUGIN_LIVENESS_MAX_RESTARTS:-5}"
   local state_file=""
   local last_key=""
   local last_detected_ts=0
   local last_restart_ts=0
+  local restart_attempts=0
 
   [[ "${BRIDGE_SKIP_PLUGIN_LIVENESS:-0}" != "1" ]] || return 1
   [[ "$(bridge_agent_source "$agent")" == "static" ]] || return 0
@@ -3167,17 +3181,27 @@ bridge_report_plugin_liveness_miss() {
   key="$(bridge_sha1 "${agent}|${missing}")"
   now_ts="$(date +%s)"
   [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=60
+  [[ "$max_restarts" =~ ^[0-9]+$ ]] || max_restarts=5
   state_file="$(bridge_plugin_liveness_state_file "$agent")"
   if [[ -f "$state_file" ]]; then
     daemon_source_state_file "$state_file" "plugin-liveness/$agent" 1 "LAST_DETECTED_TS" \
-        "LAST_KEY LAST_RESTART_TS" \
+        "LAST_KEY LAST_RESTART_TS RESTART_ATTEMPTS" \
       || true
     last_key="${LAST_KEY:-}"
     last_detected_ts="${LAST_DETECTED_TS:-0}"
     last_restart_ts="${LAST_RESTART_TS:-0}"
+    restart_attempts="${RESTART_ATTEMPTS:-0}"
   fi
   [[ "$last_detected_ts" =~ ^[0-9]+$ ]] || last_detected_ts=0
   [[ "$last_restart_ts" =~ ^[0-9]+$ ]] || last_restart_ts=0
+  [[ "$restart_attempts" =~ ^[0-9]+$ ]] || restart_attempts=0
+
+  # If the operator changed something (different missing-channel CSV), reset
+  # the attempt counter so we get another full restart budget against the new
+  # symptom. Same key on a subsequent miss => stay in the same cycle.
+  if [[ "$key" != "$last_key" ]]; then
+    restart_attempts=0
+  fi
 
   attached="$(bridge_tmux_session_attached_count "$session" 2>/dev/null || printf '0')"
   [[ "$attached" =~ ^[0-9]+$ ]] || attached=0
@@ -3188,14 +3212,38 @@ bridge_report_plugin_liveness_miss() {
         --detail session="$session"
       daemon_info "plugin MCP liveness miss on attached session ${agent} (${missing})"
     fi
-    bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts"
+    bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts" "$restart_attempts"
+    return 0
+  fi
+
+  # Giveup short-circuit. attempts >= max means we already burned our budget
+  # for this missing-CSV key. Emit the giveup audit + daemon_info exactly once
+  # (the "first entry" — attempts == max), then bump to max+1 as a sentinel so
+  # subsequent ticks return silently until the CSV (and thus the key) changes.
+  if (( restart_attempts >= max_restarts )); then
+    if (( restart_attempts == max_restarts )); then
+      bridge_audit_log daemon plugin_mcp_liveness_giveup "$agent" \
+        --detail missing_channels="$missing" \
+        --detail attempts="$restart_attempts" \
+        --detail max_restarts="$max_restarts" \
+        --detail session="$session"
+      daemon_info "plugin MCP liveness restart limit reached for ${agent} (${missing}); skipping until channel CSV changes"
+      restart_attempts=$((max_restarts + 1))
+    fi
+    bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts" "$restart_attempts"
     return 0
   fi
 
   if [[ "$key" == "$last_key" ]] && (( last_restart_ts > 0 )) && (( now_ts - last_restart_ts < cooldown )); then
-    bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts"
+    bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts" "$restart_attempts"
     return 0
   fi
+
+  # Cooldown elapsed (or first miss on this key). Count this as a restart
+  # attempt before invoking, so a failed restart still consumes budget — the
+  # whole point is to bound work against an unrecoverable operator-config
+  # state.
+  restart_attempts=$((restart_attempts + 1))
 
   # Preserve the role's configured continue policy. For static Claude roles,
   # forcing --no-continue here destroys the session continuity that the roster
@@ -3203,8 +3251,10 @@ bridge_report_plugin_liveness_miss() {
   if restart_output="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" agent restart "$agent" 2>&1)"; then
     bridge_audit_log daemon plugin_mcp_liveness_restart "$agent" \
       --detail missing_channels="$missing" \
-      --detail session="$session"
-    daemon_info "restarted ${agent} after plugin MCP liveness miss (${missing})"
+      --detail session="$session" \
+      --detail attempts="$restart_attempts" \
+      --detail max_restarts="$max_restarts"
+    daemon_info "restarted ${agent} after plugin MCP liveness miss (${missing}) [attempt ${restart_attempts}/${max_restarts}]"
     last_restart_ts="$now_ts"
   else
     restart_output="${restart_output//$'\n'/ }"
@@ -3215,11 +3265,13 @@ bridge_report_plugin_liveness_miss() {
     bridge_audit_log daemon plugin_mcp_liveness_restart_failed "$agent" \
       --detail missing_channels="$missing" \
       --detail session="$session" \
+      --detail attempts="$restart_attempts" \
+      --detail max_restarts="$max_restarts" \
       --detail restart_error="$restart_output"
-    daemon_info "plugin MCP liveness restart failed for ${agent} (${missing})${restart_output:+: $restart_output}"
+    daemon_info "plugin MCP liveness restart failed for ${agent} (${missing}) [attempt ${restart_attempts}/${max_restarts}]${restart_output:+: $restart_output}"
   fi
 
-  bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts"
+  bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts" "$restart_attempts"
 }
 
 process_plugin_liveness() {
