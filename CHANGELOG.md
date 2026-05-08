@@ -6,6 +6,39 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-05-09
+
+### Highlight — isolation-v2 migration tooling + canonical state docs
+
+`v0.9.0` 은 v0.7→v0.8 isolated-agent transition 의 ownership/ACL drift 를 자동 회복하는 새 CLI 명령을 추가하고, 그 contract 를 운영 문서로 명문화한다. minor bump 정당화: 새 CLI subcommand surface (`agent-bridge migrate isolation v2`).
+
+핵심 trigger: 이슈 #737 (운영자가 본 isolated agent 의 cascade — `agents/<X>/.claude/` 누락, plugin state files mode 0600 controller-그룹, `/home/agent-bridge-<X>/.claude/` 가 root 소유 + named-user ACL with controller 만 + agent 본인 access 끊김 등). v0.7 시절의 transitional ACL 잔재가 v0.8 hard-cut (PR #641 — KNOWN_ISSUES §16) 후에도 정리 안 된 상태가 진짜 결함이었다. v2 contract 는 운영자 mental model "kill ACLs" 와 정확히 일치 — layout 자체엔 named-user POSIX ACL surface 0개. 새 명령 `migrate isolation v2 --apply` 가 이 잔재를 자동 strip + canonical state 적용.
+
+`agent-bridge upgrade --apply` 후 isolated agent 가 `agents/<X>/...` cascade fail 하면:
+
+```
+agent-bridge migrate isolation v2 --check        # drift report
+agent-bridge migrate isolation v2 --dry-run      # planned actions
+agent-bridge migrate isolation v2 --apply        # apply fix
+agent-bridge agent start <agent>                 # restart
+```
+
+### Added (#742 — refs #737 Q1/Q2/Q3) ★ Highlight
+
+- 새 CLI subcommand `agent-bridge migrate isolation v2 [--check|--dry-run|--apply] [--agent <name>] [--json]` (lib/bridge-isolation-v2-reapply.sh, ~880 LOC). Modes: `--check` 는 drift report only, `--dry-run` 은 planned actions, `--apply` 는 mutation. `agents/<agent>/*` (root:ab-agent-<agent> 2750, subdirs 2770, credentials 2750, agent-env.sh 0640, plugin state files 0640) + `/home/agent-bridge-<agent>/*` (agent 본인 owner 0700, 모든 named-user POSIX ACL strip) 둘 다 cover. `~/.claude/.credentials.json` 미터치 (PR #641 hard-cut 후 v2 contract 외 surface). non-Linux 즉시 silent skip. macOS / non-Linux 호스트는 무영향. idempotent — 두 번째 `--apply` 는 진정한 no-op (path-local stat + named-ACL canary). credentials/launch-secrets.env 도 canonical assertion. `--json` 출력 schema: per-agent `{agent, isolated, actions[], errors[]}` + top-level `total_agents` / `total_repaired`.
+
+### Fixed (#741 — refs #737 Q5)
+
+- `bridge-setup.py` 의 `inspect_discord_dir` / `inspect_telegram_dir` / `inspect_teams_dir` 가 isolated agent 의 owner-only `.env` 를 controller 로 read 시 발생하던 PermissionError 를 PR #718 family sudo-fallback 패턴으로 해소. `_safe_read_env` / `_safe_load_json` / `_safe_path_check` / `_isolated_workdir_owner` / `_sudo_run_as` / `_parse_dotenv_text` helpers (모두 bridge-setup.py 내부 미러). sudo 미설치 시 rc 127 → 명료한 `PermissionError` ("sudo not available; cannot read X as Y. Recovery requires either installing sudo or running this command as the agent user directly.") + cause chain (`from exc`). non-Linux 는 `_isolated_workdir_owner` 가 None 반환으로 fallback 분기 미진입 — 기존 동작 보존. ms365 inspect 는 `bridge-setup.py` 에 없음 (별도 surface). 운영자가 `agent-bridge setup teams <agent>` recovery path 를 정상 사용 가능.
+
+### Fixed (#740 — refs #737 Q6)
+
+- `agent-bridge agent delete --purge-home` 가 isolated agent 의 *actual Linux home* (`/home/agent-bridge-<agent>/`) 도 제거. `getent passwd <user>` 로 정확한 home path 추출 + regex guard `^/home/agent-bridge-[a-zA-Z0-9_-]+$` 으로 운영자 home / system path 보호. `bridge_linux_sudo_root rm -rf` 사용 (root-owned). 실패 시 warn 만 (agent 자체는 이미 delete 됨, fail-loud 금지). Linux user account 자체 (`userdel`) 제거는 scope-out (별도 follow-up). non-Linux short-circuit. retire 분기 보존.
+
+### Documentation (#739 — refs #737)
+
+- `OPERATIONS.md` 에 새 섹션 "Isolation v2 canonical state and migration" — canonical state table ($BRIDGE_DATA_ROOT 환경변수 명시) + migration runbook + POSIX ACL 역할 정리. `KNOWN_ISSUES.md §16` 보강 — "v0.7 → v0.8 migration ACL leftovers" 부분 (manual recovery 명령 + 예외 없는 strip-only 정책). 신규 `docs/agent-runtime/v2-isolation-migration.md` — 깊이 있는 reference (drift signature, --check/--dry-run/--apply 사용법, manual recovery, diagnostic 명령). 모든 docs `ACL preservation count: 0` / `strip-only pass` 언어 통일 — PR #641 hard-cut contract 와 일관 (KNOWN_ISSUES §16 line 269-271, 288-292).
+
 ## [0.8.9] — 2026-05-08
 
 ### Highlight — second post-upgrade hotfix wave (5 PR)
