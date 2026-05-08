@@ -168,27 +168,21 @@ bridge_agent_default_launch_cmd() {
       printf '%s' 'claude --dangerously-skip-permissions'
       ;;
     codex)
-      printf '%s' 'codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen'
+      # v0.8.6 hotfix: every codex agent launches with fast_mode enabled by
+      # default. The codex CLI ships fast_mode as a stable=true feature, but
+      # an operator config.toml that sets `features.fast_mode=false` (or a
+      # downstream policy that flips it) would silently drop every agent off
+      # the fast inference path. Pin it explicitly here so admin-pair
+      # backfill, isolated agent create, and v0.7→v0.8 migration all carry
+      # the same flag and the policy is auditable from the roster's
+      # launch_cmd. codex_hooks stays paired (both features go through the
+      # same injection helper in lib/bridge-state.sh).
+      printf '%s' 'codex -c features.fast_mode=true --dangerously-bypass-approvals-and-sandbox --no-alt-screen'
       ;;
     *)
       bridge_die "지원하지 않는 engine 입니다: $engine"
       ;;
   esac
-}
-
-bridge_expand_user_path() {
-  local raw="$1"
-  if [[ -z "$raw" ]]; then
-    printf '%s' ""
-    return 0
-  fi
-  bridge_agent_manage_python "$raw" <<'PY'
-from pathlib import Path
-import sys
-
-value = sys.argv[1]
-print(str(Path(value).expanduser()))
-PY
 }
 
 bridge_render_template_string() {
