@@ -2829,25 +2829,59 @@ SELF_SIGNAL_PATTERNS = (
 SELF_SIGNAL_FROM_PREFIXES = ("memory-daily", "cron-dispatch", "cron-followup")
 
 
+def _is_system_sender(from_field: str) -> bool:
+    """True only if the sender is a known memory-daily / cron internal source.
+
+    The librarian harvester only wants to suppress events authored by its own
+    cron / dispatch chain. Any non-empty sender that does *not* match a known
+    system prefix is treated as human (or other-agent) work and must never be
+    classified as a self-signal — see issue #728 (codex r2).
+    """
+    if not from_field:
+        return False
+    return any(from_field.startswith(p) for p in SELF_SIGNAL_FROM_PREFIXES)
+
+
 def _is_self_signal_event(event: dict) -> bool:
     """Return True if a queue/transcript event should not count as real activity.
 
-    Accepts a dict with optional ``title``, ``from`` (or ``source``), and
-    ``payload_kind`` keys. Events without those keys (e.g. transcript-session
-    summaries from ``_scan_transcripts``) fall through and return False, so
-    the helper is a safe no-op for shapes that lack metadata.
+    Accepts a dict with optional ``title``, ``from`` (or ``source`` /
+    ``created_by``), and ``payload_kind`` keys. Events without those keys
+    (e.g. transcript-session summaries from ``_scan_transcripts``) fall
+    through and return False, so the helper is a safe no-op for shapes that
+    lack metadata.
+
+    The sender is a hard gate: a human-authored task whose title happens to
+    match a self-signal pattern (e.g. ``"weekly recap — checked ok"``) must
+    not be silently dropped. Only events whose ``from`` / ``source`` /
+    ``created_by`` matches a known internal prefix are even considered for
+    title-regex or payload-kind suppression.
     """
     title = event.get("title") or ""
-    from_field = event.get("from") or event.get("source") or ""
-    payload_kind = event.get("payload_kind") or ""
+    from_field = (
+        event.get("from")
+        or event.get("source")
+        or event.get("created_by")
+        or ""
+    )
+
+    # Sender gate — short-circuit before any title/payload inspection.
+    # A non-system sender (human, other agent, anonymous) is never a
+    # self-signal, regardless of title shape.
+    if not _is_system_sender(from_field):
+        return False
 
     if any(p.search(title) for p in SELF_SIGNAL_PATTERNS):
         return True
-    if any(from_field.startswith(p) for p in SELF_SIGNAL_FROM_PREFIXES):
-        return True
+
+    payload_kind = event.get("payload_kind") or ""
     if payload_kind in {"text", "agentTurn"} and "memory-daily" in title.lower():
         return True
-    return False
+
+    # Sender is a system agent (memory-daily / cron-dispatch / cron-followup)
+    # but title did not match a known pattern. The bare cron-dispatch wake
+    # case from issue #728 lands here — still a self-signal.
+    return True
 
 
 def _scan_transcripts(
