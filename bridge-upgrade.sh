@@ -1444,7 +1444,21 @@ if [[ $DRY_RUN -eq 0 ]]; then
   if ! python3 - "$SHARED_SETTINGS_RERENDER_JSON" <<'PY'
 import json
 import sys
-payload = json.loads(sys.argv[1])
+# Issue #731: empty/non-JSON payload happens when an isolated agent's
+# canonical_dir lookup fails (controller can't traverse mode-2750 workdir)
+# and the rerender helper hands back nothing for that agent. Treat it as
+# a non-fatal skip with a named diagnostic instead of dumping a raw
+# JSONDecodeError traceback into the upgrade log.
+raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+if not raw:
+    print("[bridge-upgrade] WARN: shared-settings rerender returned empty payload (likely isolated agent canonical_dir failure — see #731)", file=sys.stderr)
+    sys.exit(0)
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError as exc:
+    print(f"[bridge-upgrade] WARN: shared-settings rerender returned non-JSON payload: {exc}", file=sys.stderr)
+    print(f"[bridge-upgrade] payload preview: {raw[:200]!r}", file=sys.stderr)
+    sys.exit(0)
 raise SystemExit(0 if int(payload.get("failed_count") or 0) == 0 else 1)
 PY
   then
@@ -2038,7 +2052,19 @@ for item in payload.get("candidates") or []:
 PY
 python3 - "$SHARED_SETTINGS_RERENDER_JSON" <<'PY'
 import json, sys
-payload = json.loads(sys.argv[1])
+# Issue #731: same defensive guard as the verification heredoc above —
+# empty/non-JSON SHARED_SETTINGS_RERENDER_JSON should not raise a raw
+# traceback in the post-upgrade summary, just emit a named WARN.
+raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+if not raw:
+    print("[bridge-upgrade] WARN: shared-settings rerender returned empty payload (likely isolated agent canonical_dir failure — see #731)", file=sys.stderr)
+    sys.exit(0)
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError as exc:
+    print(f"[bridge-upgrade] WARN: shared-settings rerender returned non-JSON payload: {exc}", file=sys.stderr)
+    print(f"[bridge-upgrade] payload preview: {raw[:200]!r}", file=sys.stderr)
+    sys.exit(0)
 count = int(payload.get("count") or 0)
 failed = int(payload.get("failed_count") or 0)
 mode = payload.get("mode") or "skipped"
