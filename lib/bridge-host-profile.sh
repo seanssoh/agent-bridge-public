@@ -60,6 +60,24 @@ except Exception:
 PY
 }
 
+# Read the persisted set_at timestamp (best-effort context for idempotency
+# logging). Empty string if file absent or malformed.
+bridge_host_profile_set_at() {
+  local path
+  path="$(bridge_host_profile_path)"
+  [[ -f "$path" ]] || { printf ''; return 0; }
+  bridge_require_python
+  python3 - "$path" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    print(data.get("set_at", "") or "")
+except Exception:
+    print("")
+PY
+}
+
 # Persist the chosen profile to host-profile.json.
 # Args: profile (server|dev), set_by (init|reconfigure|non-interactive-default)
 bridge_host_profile_save() {
@@ -83,6 +101,10 @@ with open(tmp, "w", encoding="utf-8") as fh:
     fh.write("\n")
 os.replace(tmp, path)
 PY
+  # Codex r2: ensure operators can read this file (umask on shared installs
+  # can produce 0640/0600 by default). Failure is non-fatal — the JSON itself
+  # is already on disk; this only widens read access.
+  chmod 0644 "$path" 2>/dev/null || true
 }
 
 # Resolve cron job ids by name. Echos lines of "<id>\t<name>" for jobs whose
@@ -117,12 +139,25 @@ for job in data.get("jobs", []):
 PY
 }
 
-# Disable a single cron job by id. Returns the CLI's exit code; stderr is
-# captured into the warning channel by the caller.
+# Disable a single cron job by id. Returns the CLI's exit code.
+# Args:
+#   $1 = agent-bridge CLI path
+#   $2 = job id
+#   $3 = quiet (1=fully silence subprocess stdout+stderr, 0=surface stderr)
+# Codex r2: caller QUIET (json_mode / non-interactive) propagates to the
+# subprocess. `agent-bridge cron update` does not currently expose a
+# `--quiet` flag, so we redirect at the shell level. When the operator is
+# interactive we keep stderr visible so cron-update failures surface in
+# the same terminal.
 bridge_host_profile_disable_cron() {
   local agent_bridge_cli="$1"
   local job_id="$2"
-  "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron update "$job_id" --disable >/dev/null 2>&1
+  local quiet="${3:-0}"
+  if [[ "$quiet" == "1" ]]; then
+    "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron update "$job_id" --disable >/dev/null 2>&1
+  else
+    "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron update "$job_id" --disable >/dev/null
+  fi
 }
 
 # Offer to disable the production-style crons (default-yes). Caller has
@@ -165,9 +200,15 @@ bridge_host_profile_offer_dev_cron_disable() {
       ;;
   esac
   local disabled=0 failed=0
+  # Codex r2: forward QUIET (== non-interactive) into subprocess so json_mode
+  # init runs don't pollute the structured handoff with cron-update chatter.
+  local quiet_flag="0"
+  if [[ "$interactive" != "1" ]]; then
+    quiet_flag="1"
+  fi
   while IFS=$'\t' read -r _id _name; do
     [[ -n "$_id" ]] || continue
-    if bridge_host_profile_disable_cron "$agent_bridge_cli" "$_id"; then
+    if bridge_host_profile_disable_cron "$agent_bridge_cli" "$_id" "$quiet_flag"; then
       disabled=$((disabled + 1))
       printf '  disabled %s (%s)\n' "$_name" "$_id" >&2
     else
@@ -198,7 +239,18 @@ bridge_host_profile_run() {
     local existing
     existing="$(bridge_host_profile_load)"
     if [[ -n "$existing" ]]; then
-      printf 'host_profile: %s (already set, skipping prompt)\n' "$existing" >&2
+      # Codex r2: emit `already=<profile>` as a single grep-able sentinel
+      # so downstream tooling / operator runbooks can detect the
+      # already-configured branch without parsing free text. Augment with
+      # set_at for context (best-effort; empty when JSON is malformed).
+      local existing_set_at=""
+      existing_set_at="$(bridge_host_profile_set_at)"
+      if [[ -n "$existing_set_at" ]]; then
+        printf '[host-profile] already=%s (set_at=%s)\n' "$existing" "$existing_set_at" >&2
+      else
+        printf '[host-profile] already=%s\n' "$existing" >&2
+      fi
+      printf '[host-profile] hint: re-run with `--reconfigure` to change.\n' >&2
       printf '%s\n' "$existing"
       return 0
     fi
