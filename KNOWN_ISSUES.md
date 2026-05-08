@@ -488,3 +488,35 @@ This is a debugging escape, not a permanent operating mode.
 Long-term operation without isolation is unsupported in v0.8.0.
 Report the underlying v2 issue upstream. Full operator notes:
 [`OPERATIONS.md` "Rollback hatch — `BRIDGE_DISABLE_ISOLATION=1`"](OPERATIONS.md).
+
+## 23. v1→v2 migration leaves the daemon "half-alive" if started from a stale shell (#712)
+
+After a v1→v2 isolation migration, a long-lived shell that predates
+the upgrade still carries the kernel-cached pre-upgrade supplementary
+group set even though `usermod` has added the operator to
+`ab-controller` (and any `ab-agent-*` groups) in passwd. A daemon
+spawned from such a shell starts successfully but cannot read
+`group=ab-controller mode 0640` state files — `agb status` then
+surfaces `bridge-state.sh:997 source "$file": Permission denied`.
+
+`bridge-daemon.sh start` now refuses with a re-login remediation
+when the current process is missing v2 groups its passwd entry
+includes. Linux-only; installs without `ab-controller` (e.g. macOS,
+or a fresh install that hasn't run v2 group setup) pass through
+unchanged.
+
+Diagnose:
+```
+cat /proc/$DAEMON_PID/status | grep ^Groups
+id -G
+```
+
+Recover (Linux):
+```
+exec sudo -i -u $USER bash
+bash bridge-daemon.sh start
+```
+
+Debug-only override: `BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS=1`
+(the `Permission denied` errors will return — set only when you
+need to inspect a specific failure mode).
