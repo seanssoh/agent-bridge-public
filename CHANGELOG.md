@@ -6,6 +6,52 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.8.8] — 2026-05-08
+
+### Highlight — v0.7→v0.8 post-upgrade cascade 회복 + #720 admin kill-loop root cause
+
+`v0.8.8` 은 v0.7→v0.8.7 업그레이드 직후 호스트에서 발견된 cascade 실패를 한 번에 닫는다. 핵심: PR #721 — `apply-channel-policy.sh` 가 v0.8 isolation-v2 layout 에서 owner re-enable overlay 를 `OWNER_HOME/.claude/settings.local.json` 에 쓰지만 Claude 는 `OWNER_HOME/workdir/.claude/settings.local.json` 을 본다. overlay 가 도달 못 해서 singleton plugins (discord/telegram) 이 disabled 유지 → `bridge-run.sh` plugin pre-flight fail → tmux 죽음 → daemon 재시작 → admin/owner kill-loop. 이게 #715 §A "plugin-MCP-liveness 무한 restart" 의 **진짜 root cause**. PR #716 (MCP-liveness max-restart counter) 는 hardening.
+
+다른 7 PR 은 sudo-handoff trio (#718 — watchdog scan + manual-stop clear + cmd_link_shared_settings), daemon stale supplementary-group preflight (#717 — closes #712), bridge-start post-launch tmux has-session polling + agb admin slow-path conditional (#719 — refs #715 §C #714 §5), dashboard offline static + agb attach remediation hint (#724 — refs #714 §6/7), static-role workdir auto-rebuild on missing (#723 — refs #714 §3), bridge-init host profile onboarding + production cron gating (#725 — closes #713), human-facing plain-language SSOT (#722 — closes #711).
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.8 isolation-v2 layout 변경 없음. 운영 호스트가 kill-loop 중이라면 본 v0.8.8 적용 후 `agent-bridge daemon restart` + admin agent 재기동으로 회복.
+
+### Fixed (#721 — closes #720)
+
+- `scripts/apply-channel-policy.sh` 가 v0.8 isolation-v2 layout split 후 owner re-enable overlay 를 `OWNER_HOME/.claude/settings.local.json` (한 단계 위) 에 쓰던 결함을 종결. 새 helper `_apply_channel_policy_link_workdir_overlay` 가 admin/owner/allow 3 site 모두 `OWNER_HOME/workdir/.claude/settings.local.json` 가 한 단계 위 overlay 를 가리키는 idempotent symlink (`ln -sfn`) 를 생성. 진짜 파일이 자리에 있으면 silent skip + warn (no clobber); mkdir 실패 (isolated user 소유 workdir) 시 silent skip + warn. DRY_RUN / QUIET 기존 패턴 보존. `bridge-run.sh` plugin pre-flight 가 owner workdir 에서 singleton plugins 를 정상 enabled 로 보면 admin kill-loop 종결.
+
+### Fixed (#717 — closes #712)
+
+- `bridge-daemon.sh start` 에 supplementary group preflight 추가. v1→v2 migration 후 stale shell 에서 daemon 재시작 시 `id -G` (passwd 기준) ⊃ 현재 process 의 supplementary GID 를 확인해 누락된 v2 isolation groups (`ab-controller`, `ab-shared`, `ab-agent-*`) 가 있으면 refuse + bilingual remediation. linux-user isolation 미사용 install (예: macOS, controller_group 부재) 은 silent passthrough. `BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS=1` escape hatch. KNOWN_ISSUES.md §23 에 진단 / 회복 절차 등록.
+
+### Fixed (#718 — refs #715 §B + #714 §2/3 + #694)
+
+- Isolated agent multi-site PermissionError sudo-handoff trio. (1) `bridge-watchdog.py:scan_agent` 를 try/except 로 감싸 isolated CLAUDE.md PermissionError 가 전체 walk 를 죽이지 않도록 + warn placeholder. (2) `lib/bridge-state.sh:bridge_agent_clear_manual_stop` 에 `bridge_linux_sudo_root` fallback (PR #692 패턴 재사용) — controller user 가 isolated marker dir (mode 2750) 에 unlink 못 해도 root 로 처리. (3) `bridge-hooks.py:cmd_link_shared_settings` — mutating ops (rm/cp/symlink) 와 metadata probe (`is_symlink`/`exists`/`realpath`) 모두 try/PermissionError → `sudo -n -u <agent-user>` fallback 으로 routed. `_isolated_workdir_owner` 는 `lstat()` 사용 (symlink workdir 자체 owner). `_sudo_run_as` 는 `sudo` 미설치 시 stderr warn.
+
+### Fixed (#719 — refs #715 §C + #714 §5)
+
+- `bridge-start.sh` 세션 시작 후 짧은 `tmux has-session` 폴링 (default `BRIDGE_START_VERIFY_POLL_ATTEMPTS=10` × `BRIDGE_START_VERIFY_POLL_INTERVAL_SECONDS=1` = 10s). 폴링 도중 세션이 죽으면 `BRIDGE_START_VERIFY_LOG_TAIL_LINES=20` (default) 만큼 agent log 를 읽어 surface + 비-0 exit. `agent-bridge` admin slow-path 는 child 호출에 `_admin_rc=0; cmd ... || _admin_rc=$?` 패턴으로 `set -e` 우회 — child nonzero 시 diagnostic heredoc + `exit "$_admin_rc"` 실행. agb admin 60s arming + 죽은 세션 거짓 보고 cliff 종결.
+
+### Fixed (#723 — refs #714 §3)
+
+- `bridge-start.sh` 의 `WORK_DIR` 누락 분기를 정확히 v2 canonical static path 만 auto-rebuild 하도록 한정. 비교는 `[[ -n "$BRIDGE_AGENT_ROOT_V2" && "$WORK_DIR" == "$BRIDGE_AGENT_ROOT_V2/$AGENT/workdir" ]]` 의 prefix string 비교. 외부 임의 `--workdir` / typo 경로는 기존 `bridge_die` 보존. v2 canonical missing 시 plain `mkdir -p` → `bridge_linux_sudo_root mkdir -p` fallback (root-owned parent).
+
+### Changed (#724 — refs #714 §6/7)
+
+- `bridge-status.py` default filter 에 `source=static` OR 분기 추가 — offline static agent 도 dashboard default 에 노출 (이전엔 `--all-agents` 만). `agent-bridge` attach 실패 시 stderr 로 `[hint] bash bridge-start.sh <agent>` / `[hint] agb admin` remediation 한 줄씩 출력 + 에러 텍스트 명료화 (`에이전트 'X'의 tmux 세션이 없습니다`).
+
+### Changed (#716 — refs #715 §A — hardening)
+
+- `bridge-daemon.sh:bridge_report_plugin_liveness_miss` 에 `RESTART_ATTEMPTS` per-(agent,channel-key) 카운터 추가. `BRIDGE_PLUGIN_LIVENESS_MAX_RESTARTS` (default `5`) 초과 시 `plugin_mcp_liveness_giveup` audit 1회 emit + restart 중단 (sentinel) — 같은 key 가 다른 missing-CSV 로 바뀌면 attempts 0 reset. 60s cooldown / attached-session skip / channel-status guard 보존. (#720 가 owner kill-loop 의 진짜 driver 라 본 PR 은 안전망 hardening; backoff 는 미래 transient MCP failure 시나리오에 가치.)
+
+### Added (#725 — closes #713)
+
+- `bridge-init.sh` first-run 에 host profile 질문 (`a` server / `b` dev) + `state/install/host-profile.json` 영속화 (`chmod 0644`). non-interactive (TTY 부재) 입력은 자동 `server` (production install 회귀 차단) + stderr audit-log. `profile=dev` 면 production-style maintenance crons 10개 (`librarian-watchdog`, `wiki-mention-scan`, `wiki-daily-ingest`, `wiki-hub-audit`, `wiki-weekly-summarize`, `wiki-monthly-summarize`, `wiki-copy-full-backfill`, `wiki-dedup-weekly`, `wiki-v2-rebuild`, `wiki-repair-links`) 를 disable 제안 (default-yes). `memory-daily-*` 는 항상 보존. 재실행 시 `[host-profile] already=<dev/server> (set_at=…)` grep-able sentinel 출력 + `--reconfigure` 만 강제 재질문. 신규 helper `lib/bridge-host-profile.sh`.
+
+### Added (#722 — closes #711)
+
+- `docs/agent-runtime/common-instructions.md` 에 "Plain Language Default — 사람한테 답할 때" 섹션 추가. 사람-facing surface (Discord/Telegram 등) 답변에 5초 안에 이해되는 짧은 한국어 default + 영어 단어/축약어 절제 + 글머리표 분리 contract 명문화. agent-to-agent task body / log / diff / 코드 인용은 정확성 우선이라 그대로. install-level deviation 은 `agent SOUL.md` 또는 `docs/agent-runtime/active-preferences.md` 에서 override.
+
 ## [0.8.7] — 2026-05-08
 
 ### Highlight — closes #708 v0.7→v0.8 migration grep-flag-injection abort
