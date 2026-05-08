@@ -226,8 +226,42 @@ CHANNEL_REASON=""
 AGENT_ENV_FILE=""
 
 if [[ ! -d "$WORK_DIR" ]]; then
+  # Two auto-rebuild paths cover the post-migration "workdir vanished"
+  # gap from #714 (item 10 — `patch-dev` static-role with no workdir
+  # tree at all). #4 in the per-symptom table:
+  #   - DEFAULT_WORK_DIR: legacy default home path. Plain mkdir.
+  #   - v2 canonical: $BRIDGE_AGENT_ROOT_V2/<agent>/workdir. Same
+  #     identity as the just-resolved $WORK_DIR for static roles, but
+  #     under v2 the parent (`<root>/agents/<agent>/`) may be
+  #     root-owned, so fall back to bridge_linux_sudo_root.
+  # Anything else (operator-supplied --workdir to a dynamic agent,
+  # roster-explicit non-default path on a v2-disabled install) keeps
+  # the original die behavior: we don't want to silently materialize
+  # directories the operator named by mistake.
+  #
+  # Direct prefix-string comparison against $BRIDGE_AGENT_ROOT_V2 is
+  # used instead of re-invoking bridge_agent_workdir() — that helper
+  # falls through to BRIDGE_AGENT_WORKDIR[<agent>] (an external path)
+  # when v2 is not active, which would cause $WORK_DIR to compare
+  # equal to itself and erroneously skip the die branch on v2-disabled
+  # installs (codex r2 finding).
   if [[ "$WORK_DIR" == "$DEFAULT_WORK_DIR" ]]; then
     mkdir -p "$WORK_DIR"
+  elif [[ -n "$BRIDGE_AGENT_ROOT_V2" && "$WORK_DIR" == "$BRIDGE_AGENT_ROOT_V2/$AGENT/workdir" ]]; then
+    echo "[info] '$AGENT' static workdir 누락, 자동 재생성: $WORK_DIR"
+    if ! mkdir -p "$WORK_DIR" 2>/dev/null; then
+      # v2 isolated layout: the parent agent root may be root-owned
+      # (`<data-root>/agents/<agent>/` mode 0750 root:root) so the
+      # controller user cannot mkdir the workdir leaf directly. Reuse
+      # the existing sudo-handoff helper from lib/bridge-agents.sh
+      # (no new helper introduced — Track B owns sudo-handoff helper
+      # surface).
+      bridge_linux_sudo_root mkdir -p "$WORK_DIR" || \
+        bridge_die "workdir 자동 재생성 실패: $WORK_DIR"
+    fi
+    if [[ ! -d "$WORK_DIR" ]]; then
+      bridge_die "workdir 자동 재생성 후에도 존재하지 않음: $WORK_DIR"
+    fi
   else
     bridge_die "workdir가 없습니다: $WORK_DIR"
   fi
