@@ -7,8 +7,8 @@ from it. Pair with:
 - [`OPERATIONS.md` § "Isolation v2 canonical state and migration"](../../OPERATIONS.md#isolation-v2-canonical-state-and-migration)
   — the short surface-level operator runbook.
 - [`KNOWN_ISSUES.md` §16](../../KNOWN_ISSUES.md#16-layout-v2--claude-first-launch-login-required-pr-641--v080)
-  — the single retained ACL surface (`~/.claude/.credentials.json`)
-  and the v0.7→v0.8 ACL-leftover manual recovery.
+  — the v2 hard-cut (PR #641 deleted every named-user ACL helper from
+  the v2 layout) and the v0.7→v0.8 ACL-leftover manual recovery.
 - [`docs/isolation-migration-guide.md`](../isolation-migration-guide.md)
   — the older v0.6→v0.7 `shared → linux-user` migration walkthrough
   (separate, predates v2).
@@ -29,16 +29,21 @@ The canonical state table for an isolated agent named `<agent>` (its
 backing Linux UID is `agent-bridge-<agent>`, its private group is
 `ab-agent-<agent>`):
 
+> Path prefix `$BRIDGE_DATA_ROOT` is the install environment variable
+> (see `lib/bridge-isolation-v2.sh:36-62`). Default value is
+> `~/.agent-bridge`; if the operator overrides it explicitly, the
+> override path applies.
+
 | Path | Owner | Group | Mode | Notes |
 |---|---|---|---|---|
-| `~/.agent-bridge/shared/` | controller | `ab-shared` | `2750` | read-only public assets |
-| `~/.agent-bridge/state/` | controller | `ab-controller` | `2750` | controller-only |
-| `~/.agent-bridge/agents/<agent>/` | **root** | `ab-agent-<agent>` | `2750` | per-agent private root |
-| `~/.agent-bridge/agents/<agent>/{home,workdir,runtime,logs,requests,responses}/` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `2770` | agent owns; controller via group |
-| `~/.agent-bridge/agents/<agent>/credentials/` | controller | `ab-agent-<agent>` | `2750` | controller writes, agent reads |
-| `~/.agent-bridge/agents/<agent>/credentials/launch-secrets.env` | controller | `ab-agent-<agent>` | `0640` | |
-| `~/.agent-bridge/agents/<agent>/agent-env.sh` | controller | `ab-agent-<agent>` | `0640` | |
-| `~/.agent-bridge/agents/<agent>/workdir/.teams/.env`, `.../.ms365/.env` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `0640` | controller readiness probe via group |
+| `$BRIDGE_DATA_ROOT/shared/` | controller | `ab-shared` | `2750` | read-only public assets |
+| `$BRIDGE_DATA_ROOT/state/` | controller | `ab-controller` | `2750` | controller-only |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/` | **root** | `ab-agent-<agent>` | `2750` | per-agent private root |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/{home,workdir,runtime,logs,requests,responses}/` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `2770` | agent owns; controller via group |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/credentials/` | controller | `ab-agent-<agent>` | `2750` | controller writes, agent reads |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/credentials/launch-secrets.env` | controller | `ab-agent-<agent>` | `0640` | |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/agent-env.sh` | controller | `ab-agent-<agent>` | `0640` | |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/workdir/.teams/.env`, `.../.ms365/.env` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `0640` | controller readiness probe via group |
 | `/home/agent-bridge-<agent>/` | `agent-bridge-<agent>` | `agent-bridge-<agent>` | `0700` | agent's actual Linux home, no ACL |
 | `/home/agent-bridge-<agent>/.claude/`, sub-tree | `agent-bridge-<agent>` | `agent-bridge-<agent>` | `0700` | same — no ACL |
 
@@ -58,12 +63,14 @@ Two access mechanisms only:
    through the v2 tree (via `agents/<agent>/credentials/` for secrets,
    via `agents/<agent>/workdir/...` for plugin state, etc.).
 
-The single transitional ACL exception (`~/.claude/.credentials.json`
-in the operator's home) is documented in
+The v2 layout has **no named-user POSIX ACL surface at all** — PR #641
+(v0.8.0, T2) deleted every ACL-grant helper (including the v0.7
+`bridge_linux_grant_claude_credentials_access` for the operator's
+`~/.claude/.credentials.json`). The migration is strip-only: it
+removes any ACL drift it finds and preserves nothing. See
 [`KNOWN_ISSUES.md` §16](../../KNOWN_ISSUES.md#16-layout-v2--claude-first-launch-login-required-pr-641--v080)
-— that surface is *outside* the v2 layout and uses a named-user `r--`
-ACL plus an `--x` traverse chain because it is the operator's home
-file. It is preserved by the migration command.
+for the credential-seeding flow under v2 (per-agent `claude login` or
+pre-populated `launch-secrets.env`).
 
 ## 2. Drift signatures from v0.7
 
@@ -167,13 +174,12 @@ What `--apply` does:
    of the canonical state table for each isolated agent (idempotent
    when the row is already canonical).
 2. Strips any named-user POSIX ACL it finds inside the v2 tree
-   (`~/.agent-bridge/agents/<agent>/...`) and on the agent's actual
+   (`$BRIDGE_DATA_ROOT/agents/<agent>/...`) and on the agent's actual
    Linux home (`/home/agent-bridge-<agent>/...`). Equivalent to
    `setfacl -bR <path>` on each of those subtrees.
-3. **Preserves** the `~/.claude/.credentials.json` named-user ACL plus
-   the `--x` traverse chain in the operator's home — that is the
-   single transitional exception (see
-   [`KNOWN_ISSUES.md` §16](../../KNOWN_ISSUES.md#16-layout-v2--claude-first-launch-login-required-pr-641--v080)).
+3. ACL preservation count: **0**. PR #641 (v0.8.0, T2) deleted every
+   v2-layer ACL-grant helper, so the migration is a strip-only pass —
+   no named-user ACL is preserved on either subtree.
 4. Re-runs the readiness-probe shape check on the controller-side
    `.claude/` shadow and the workdir plugin state files, fixing any
    drift in §2.2 and §2.3 above.
@@ -185,23 +191,35 @@ What `--apply` does:
 
 For installs where the v0.9.0 migration command is unavailable. Run
 each block as the controller (the user that owns
-`~/.agent-bridge/`), with `sudo` available.
+`$BRIDGE_DATA_ROOT`), with `sudo` available.
 
 ```bash
-# Identify the agent and its UID/GID names.
-A=<agent>
-USER=agent-bridge-$A
-GROUP=ab-agent-$A
+# ⚠️  Input validation FIRST — never run with empty/invalid agent name.
+A="<agent>"
+[[ "$A" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "agent name validation failed"; exit 1; }
+
+USER="agent-bridge-$A"
+GROUP="ab-agent-$A"
 CTRL=$(id -un)
 
+# Sanity check — confirm the user exists and its home matches the
+# expected shape. Refuses to run if either is wrong (protects the
+# operator's home and arbitrary paths from accidental chown/setfacl).
+getent passwd "$USER" >/dev/null || { echo "no Linux user $USER"; exit 1; }
+LINUX_HOME="$(getent passwd "$USER" | cut -d: -f6)"
+[[ "$LINUX_HOME" == "/home/$USER" ]] || {
+  echo "ERROR: $USER home does not match /home/$USER (got: $LINUX_HOME)"
+  exit 1
+}
+
 # 1. Re-own the agent's actual Linux home and strip transitional ACLs.
-sudo chown -R "$USER:$USER" "/home/$USER/"
-sudo chmod -R u+rwX,go-rwx "/home/$USER/"
-sudo setfacl -bR "/home/$USER/"
+sudo chown -R "$USER:$USER" "$LINUX_HOME"
+sudo chmod -R u+rwX,go-rwx "$LINUX_HOME"
+sudo setfacl -bR "$LINUX_HOME"
 
 # 2. Realign plugin state files to v2 group-read contract.
-for f in "$HOME/.agent-bridge/agents/$A/workdir/.teams/.env" \
-         "$HOME/.agent-bridge/agents/$A/workdir/.ms365/.env"; do
+for f in "$BRIDGE_DATA_ROOT/agents/$A/workdir/.teams/.env" \
+         "$BRIDGE_DATA_ROOT/agents/$A/workdir/.ms365/.env"; do
   if [[ -f "$f" ]]; then
     sudo chown "$USER:$GROUP" "$f"
     sudo chmod 0640 "$f"
@@ -210,33 +228,35 @@ done
 
 # 3. Create the controller-side .claude/ shadow if missing.
 sudo install -d -o "$CTRL" -g "$CTRL" -m 0700 \
-  "$HOME/.agent-bridge/agents/$A/.claude"
+  "$BRIDGE_DATA_ROOT/agents/$A/.claude"
 
 # 4. (Optional) Re-assert the canonical group + mode on the v2 agent root.
-sudo chown root:"$GROUP" "$HOME/.agent-bridge/agents/$A"
-sudo chmod 2750 "$HOME/.agent-bridge/agents/$A"
+sudo chown root:"$GROUP" "$BRIDGE_DATA_ROOT/agents/$A"
+sudo chmod 2750 "$BRIDGE_DATA_ROOT/agents/$A"
 
 # 5. Restart the agent.
 agent-bridge agent start "$A"
 ```
 
-**Do not** run `setfacl -b` on `~/.claude/.credentials.json` or its
-ancestor chain. That is the single retained ACL surface; stripping it
-breaks first-launch credential read for every isolated agent on the
-host until you re-run isolation prep.
+The recovery is strip-only across both the v2 tree
+(`$BRIDGE_DATA_ROOT/agents/<agent>/...`) and the agent's actual Linux
+home (`/home/agent-bridge-<agent>/...`). PR #641 (v0.8.0, T2) deleted
+every v2-layer ACL-grant helper, so there is no preserved ACL surface
+to step around — no `setfacl -b` exclusion is needed.
 
 ## 5. POSIX ACL contract — quick summary
 
 | Surface | ACL? | Notes |
 |---|---|---|
-| `~/.agent-bridge/...` (entire v2 layout) | **No** | group ownership + setgid only |
+| `$BRIDGE_DATA_ROOT/...` (entire v2 layout) | **No** | group ownership + setgid only |
 | `/home/agent-bridge-<agent>/...` | **No** | agent-only `0700`, no ACL |
-| `~/.claude/.credentials.json` + ancestor chain | **Yes** | single transitional named-user ACL |
-| Anywhere else outside the v2 layout | **No** | no ACL surface |
+| Operator home (`~/.claude/...`) | **No** | PR #641 deleted the v0.7 `bridge_linux_grant_claude_credentials_access` helper; v2 reaches credentials via per-agent `claude login` instead |
+| Anywhere else | **No** | no ACL surface |
 
-See [`KNOWN_ISSUES.md` §16](../../KNOWN_ISSUES.md#16-layout-v2--claude-first-launch-login-required-pr-641--v080)
-for the long-term plan to replace the transitional surface with
-per-agent `claude login` (operator workflow change).
+The v2 layout has zero named-user ACL surface. See
+[`KNOWN_ISSUES.md` §16](../../KNOWN_ISSUES.md#16-layout-v2--claude-first-launch-login-required-pr-641--v080)
+for the credential-seeding flow under v2 (per-agent `claude login` or
+pre-populated `launch-secrets.env`).
 
 ## 6. Diagnostic commands
 
@@ -248,10 +268,10 @@ USER=agent-bridge-$A
 GROUP=ab-agent-$A
 
 # Per-agent v2 root: should be `root:ab-agent-<agent> 2750`.
-stat -c "%U:%G %a" "$HOME/.agent-bridge/agents/$A"
+stat -c "%U:%G %a" "$BRIDGE_DATA_ROOT/agents/$A"
 
 # Per-agent home (inside v2 layout): should be `<USER>:<GROUP> 2770`.
-stat -c "%U:%G %a" "$HOME/.agent-bridge/agents/$A/home"
+stat -c "%U:%G %a" "$BRIDGE_DATA_ROOT/agents/$A/home"
 
 # Agent's actual Linux home: should be `<USER>:<USER> 700`, no ACL.
 sudo stat -c "%U:%G %a" "/home/$USER"
@@ -259,8 +279,8 @@ sudo getfacl --skip-base "/home/$USER"
 sudo getfacl --skip-base "/home/$USER/.claude" 2>/dev/null
 
 # Plugin state files: should be `<USER>:<GROUP> 640`.
-stat -c "%U:%G %a" "$HOME/.agent-bridge/agents/$A/workdir/.teams/.env" 2>/dev/null
-stat -c "%U:%G %a" "$HOME/.agent-bridge/agents/$A/workdir/.ms365/.env" 2>/dev/null
+stat -c "%U:%G %a" "$BRIDGE_DATA_ROOT/agents/$A/workdir/.teams/.env" 2>/dev/null
+stat -c "%U:%G %a" "$BRIDGE_DATA_ROOT/agents/$A/workdir/.ms365/.env" 2>/dev/null
 
 # Per-agent group membership (controller + agent UID).
 getent group "$GROUP"
@@ -280,7 +300,7 @@ empty inside the agent's home.
   v0.9.0 migration command.
 - **#720** — drift report for the v0.7 → v0.8 home-ownership leftover
   (§2.1 above).
-- **#730** — `bridge_linux_grant_claude_credentials_access` removal +
-  the single retained ACL surface.
+- **#730** — `bridge_linux_grant_claude_credentials_access` removal
+  (PR #641, v0.8.0 T2) + replacement credential-seeding flow.
 - **#731** — readiness probe vs. plugin state file mode mismatch
   (§2.2 above).

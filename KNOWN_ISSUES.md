@@ -298,49 +298,63 @@ auto-migration of the operator's credential file.
 ### v0.7 → v0.8 migration ACL leftovers
 
 Pre-v2 installs may carry transitional named-user POSIX ACLs that the
-v2 contract expects to be absent. The most common leftover is on
-`/home/agent-bridge-<agent>/.claude/` — pre-v2 it was created as
-`root:agent-bridge-<agent>` with a named-user ACL granting the
-controller traversal/read; v2 contract requires the agent itself to
-own its Linux home with no ACL of any kind.
+v2 layout does **not** allow (per the §16 hard-cut above — v2 has no
+named-user ACL surface at all). The most common leftover is on
+`/home/agent-bridge-<agent>/.claude/`, where the v0.7 install left a
+`root:agent-bridge-<agent>` ownership + a controller-only `r-x` ACL
+that prevents the agent UID from reading its own home.
 
 The planned `agent-bridge migrate isolation v2 --apply` command
-(v0.9.0+) detects and strips these leftovers, covering both
-`~/.agent-bridge/agents/<agent>/...` and `/home/agent-bridge-<agent>/...`.
-The single retained ACL surface — the `~/.claude/.credentials.json`
-`r--` grant plus the `--x` traverse chain in the operator's home —
-is preserved (see the entry above).
+(v0.9.0+) detects and strips these leftovers across both
+`$BRIDGE_DATA_ROOT/agents/<agent>/...` and
+`/home/agent-bridge-<agent>/...`. ACL preservation count: **0**.
+The migration is a strip-only pass; no named-user ACL is retained on
+either subtree.
 
 If the migration command is unavailable (older install / scripted
-environment), manual recovery:
+environment), manual recovery (run as the controller, with `sudo`
+available):
 
 ```bash
-A=<agent>
-USER=agent-bridge-$A
-GROUP=ab-agent-$A
+# ⚠️  Input validation FIRST — never run with empty/invalid agent name.
+A="<agent>"
+[[ "$A" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "agent name validation failed"; exit 1; }
+
+USER="agent-bridge-$A"
+GROUP="ab-agent-$A"
 CTRL=$(id -un)
 
-# 1. Restore agent ownership of the agent's actual Linux home and strip
-#    any transitional named-user ACL that pre-v2 installs left behind.
-sudo chown -R "$USER:$USER" "/home/$USER/"
-sudo chmod -R u+rwX,go-rwx "/home/$USER/"
-sudo setfacl -bR "/home/$USER/"
+# Sanity check — confirm the user exists and its home matches the
+# expected shape. Refuses to run if either is wrong.
+getent passwd "$USER" >/dev/null || { echo "no Linux user $USER"; exit 1; }
+LINUX_HOME="$(getent passwd "$USER" | cut -d: -f6)"
+[[ "$LINUX_HOME" == "/home/$USER" ]] || {
+  echo "ERROR: $USER home does not match /home/$USER (got: $LINUX_HOME)"
+  exit 1
+}
+
+# 1. Re-own the agent's actual Linux home and strip transitional ACLs.
+sudo chown -R "$USER:$USER" "$LINUX_HOME"
+sudo chmod -R u+rwX,go-rwx "$LINUX_HOME"
+sudo setfacl -bR "$LINUX_HOME"
 
 # 2. Realign plugin readiness state files to the v2 group-read contract
 #    (controller readiness probe reads via the per-agent group).
-for f in "$HOME/.agent-bridge/agents/$A/workdir/.teams/.env" \
-         "$HOME/.agent-bridge/agents/$A/workdir/.ms365/.env"; do
+for f in "$BRIDGE_DATA_ROOT/agents/$A/workdir/.teams/.env" \
+         "$BRIDGE_DATA_ROOT/agents/$A/workdir/.ms365/.env"; do
   [[ -f "$f" ]] && sudo chgrp "$GROUP" "$f" && sudo chmod 0640 "$f"
 done
 
-# 3. Re-launch and verify.
+# 3. Create the controller-side .claude/ shadow if missing.
+sudo install -d -o "$CTRL" -g "$CTRL" -m 0700 \
+  "$BRIDGE_DATA_ROOT/agents/$A/.claude"
+
+# 4. Re-launch and verify.
 agent-bridge agent start "$A"
 ```
 
-Do **not** strip ACLs from `~/.claude/.credentials.json` or its
-ancestor chain — that is the one transitional surface the v2 contract
-keeps. The full canonical state table and a deeper drift-recovery
-reference live at
+The full canonical state table and a deeper drift-recovery reference
+live at
 [`OPERATIONS.md` § "Isolation v2 canonical state and migration"](./OPERATIONS.md#isolation-v2-canonical-state-and-migration)
 and [`docs/agent-runtime/v2-isolation-migration.md`](./docs/agent-runtime/v2-isolation-migration.md).
 

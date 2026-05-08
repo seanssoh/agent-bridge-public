@@ -698,16 +698,21 @@ The contract itself is documented in source at
 
 ### Canonical state table
 
+> Path prefix `$BRIDGE_DATA_ROOT` is the install environment variable
+> (see `lib/bridge-isolation-v2.sh:36-62`). Default value is
+> `~/.agent-bridge`; if the operator overrides it explicitly, the
+> override path applies.
+
 | Path | Owner | Group | Mode | Notes |
 |---|---|---|---|---|
-| `~/.agent-bridge/shared/` | controller | `ab-shared` | `2750` | read-only public assets (controller writes) |
-| `~/.agent-bridge/state/` | controller | `ab-controller` | `2750` | controller-only state |
-| `~/.agent-bridge/agents/<agent>/` | **root** | `ab-agent-<agent>` | `2750` | per-agent private root, root-owned |
-| `~/.agent-bridge/agents/<agent>/{home,workdir,runtime,logs,requests,responses}/` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `2770` | agent owns; controller reads via group |
-| `~/.agent-bridge/agents/<agent>/credentials/` | controller | `ab-agent-<agent>` | `2750` | controller writes, agent reads via group |
-| `~/.agent-bridge/agents/<agent>/credentials/launch-secrets.env` | controller | `ab-agent-<agent>` | `0640` | |
-| `~/.agent-bridge/agents/<agent>/agent-env.sh` | controller | `ab-agent-<agent>` | `0640` | |
-| `~/.agent-bridge/agents/<agent>/workdir/.teams/.env`, `.../.ms365/.env` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `0640` | controller readiness probe reads via group |
+| `$BRIDGE_DATA_ROOT/shared/` | controller | `ab-shared` | `2750` | read-only public assets (controller writes) |
+| `$BRIDGE_DATA_ROOT/state/` | controller | `ab-controller` | `2750` | controller-only state |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/` | **root** | `ab-agent-<agent>` | `2750` | per-agent private root, root-owned |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/{home,workdir,runtime,logs,requests,responses}/` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `2770` | agent owns; controller reads via group |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/credentials/` | controller | `ab-agent-<agent>` | `2750` | controller writes, agent reads via group |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/credentials/launch-secrets.env` | controller | `ab-agent-<agent>` | `0640` | |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/agent-env.sh` | controller | `ab-agent-<agent>` | `0640` | |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/workdir/.teams/.env`, `.../.ms365/.env` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `0640` | controller readiness probe reads via group |
 | `/home/agent-bridge-<agent>/` (the agent's actual Linux home) | `agent-bridge-<agent>` | `agent-bridge-<agent>` | `0700` | **agent owns. No ACL of any kind.** |
 | `/home/agent-bridge-<agent>/.claude/`, sub-tree | `agent-bridge-<agent>` | `agent-bridge-<agent>` | `0700` | same — agent-only, no ACL |
 
