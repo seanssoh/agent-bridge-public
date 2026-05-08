@@ -2631,8 +2631,38 @@ bridge_agent_clear_manual_stop() {
 
   file="$(bridge_agent_manual_stop_file "$agent")"
   dir="$(bridge_agent_idle_marker_dir "$agent")"
-  rm -f "$file"
-  rmdir "$dir" >/dev/null 2>&1 || true
+
+  # v0.8.8 #714 (item 2): when the host runs linux-user isolation, the
+  # idle-marker directory `state/agents/<agent>/` is owned by
+  # `agent-bridge-<agent>:ab-controller mode 2750` (per
+  # bridge_linux_prepare_agent_isolation). The controller user is in
+  # the group but only has `r-x` at the marker dir, so plain `rm -f`
+  # on the manual-stop file inside it raises EACCES. Same shape PR
+  # #692 solved for `runtime/history.env` via
+  # `bridge_state_v2_isolated_target` + sudo install. Here the file is
+  # under `state/agents/`, not `$BRIDGE_AGENT_ROOT_V2/`, so the
+  # existing predicate doesn't match — we gate on
+  # `bridge_agent_linux_user_isolation_effective` directly. On
+  # non-Linux hosts `bridge_linux_sudo_root` falls through to the
+  # direct invocation, so this branch is a no-op there and on
+  # non-isolated agents the plain `rm -f` already succeeded.
+  if ! rm -f "$file" 2>/dev/null; then
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      if ! bridge_linux_sudo_root rm -f "$file" 2>/dev/null; then
+        bridge_warn "bridge_agent_clear_manual_stop: failed to remove $file (agent=$agent); manual-stop may persist and re-suppress autostart"
+      fi
+    else
+      bridge_warn "bridge_agent_clear_manual_stop: failed to remove $file (agent=$agent); manual-stop may persist and re-suppress autostart"
+    fi
+  fi
+
+  if ! rmdir "$dir" >/dev/null 2>&1; then
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      # rmdir on a non-empty dir is expected and not an error; suppress
+      # only the silent-fail path. The sudo attempt is best-effort.
+      bridge_linux_sudo_root rmdir "$dir" >/dev/null 2>&1 || true
+    fi
+  fi
 }
 
 bridge_reconcile_idle_markers() {
