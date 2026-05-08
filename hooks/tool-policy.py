@@ -1158,6 +1158,45 @@ def _bash_argv_references_system_config(command: str) -> bool:
     return False
 
 
+def _is_config_set_wrapper(text: str) -> bool:
+    """True iff *text* is the sanctioned ``agent-bridge config set`` /
+    ``agb config set`` wrapper invocation.
+
+    The hook normally denies any Bash command whose argv mentions a
+    protected path. That blocks the very wrapper #341 prescribes:
+    ``agent-bridge config set --path <protected> --change ...`` was
+    routed through `_bash_argv_references_path()` and rejected because
+    the protected path appears as the wrapper's argument — wrapper
+    self-block deadlock, even for admin (the deny message itself points
+    operators back at the same wrapper they were trying to call).
+
+    The wrapper layers its own gate (`bridge-config.py:detect_caller_source`
+    + before/after sha256 audit row), so once we let it through the hook
+    the only thing that changes is "audit chain stops being doubled".
+    A non-operator caller still gets denied at the wrapper.
+
+    Match shape: leading word is ``agent-bridge`` or ``agb`` (or a
+    ``/path/to/`` prefix thereof) and the next position after ``config``
+    is exactly ``set``. ``config get`` / ``config list-protected`` keep
+    the existing read-intent carve-out — this helper is only for the
+    write surface that the path-argv gate would otherwise self-block.
+    """
+    try:
+        tokens = shlex.split(text, posix=True, comments=False)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    leaf = tokens[0].rsplit("/", 1)[-1]
+    if leaf not in {"agent-bridge", "agb"}:
+        return False
+    try:
+        idx = tokens.index("config")
+    except ValueError:
+        return False
+    return len(tokens) > idx + 1 and tokens[idx + 1] == "set"
+
+
 def protected_alias_reason(text: str, agent: str) -> str | None:
     admin = is_admin_agent(agent)
     # The two checks below use shlex argv matching rather than substring
@@ -1180,6 +1219,17 @@ def protected_alias_reason(text: str, agent: str) -> str | None:
     # structured-read surface and direct sqlite reads still bypass that
     # contract.
     read_intent = _is_read_intent_bash(text)
+    # Wrapper self-block carve-out: the sanctioned `agent-bridge config
+    # set` wrapper layers its own caller-source + audit gate
+    # (bridge-config.py). Without this carve-out the path-argv check
+    # below denies the wrapper invocation because the protected path
+    # appears as the wrapper's --path argument — leaving operators in a
+    # deadlock where the deny message points back at the same wrapper
+    # they just tried to call. Letting the wrapper through here only
+    # delegates audit responsibility to the wrapper itself; non-operator
+    # callers still get rejected at bridge-config.py.
+    if _is_config_set_wrapper(text):
+        return None
     if _bash_argv_references_path(text, roster_local_path()):
         if read_intent:
             return None
