@@ -5467,6 +5467,116 @@ bridge_stop_silence_watchdog() {
   fi
 }
 
+bridge_daemon_supplementary_group_preflight() {
+  # Issue #712: refuse `bridge-daemon.sh start` when the *current shell*
+  # is missing v2 isolation supplementary groups that the operator's
+  # passwd entry says they belong to. This is the v1→v2 stale-shell
+  # failure mode #668's migration-time warn does not cover (operator
+  # later restarts the daemon from the same pre-upgrade shell, daemon
+  # comes up "half-alive", reads of group=ab-controller mode 0640 env
+  # files trip Permission denied on bridge-state.sh:997).
+  #
+  # Returns 0 (PASS) — start may proceed — when:
+  #   - BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS is truthy (debug hatch), OR
+  #   - BRIDGE_DISABLE_ISOLATION is truthy (isolation off entirely), OR
+  #   - the host is not Linux (this stale-cache class is a Linux usermod
+  #     symptom; macOS has its own dseditgroup membership-refresh story
+  #     handled outside this preflight), OR
+  #   - getent / id are unavailable (cannot reason about groups; do no
+  #     harm), OR
+  #   - the controller group (ab-controller) does not exist on the host
+  #     (linux-user isolation is not deployed here — e.g. fresh install
+  #     that never ran v2 group setup).
+  #
+  # Returns non-zero (REFUSE) when at least one v2 group from the
+  # operator's passwd-driven static group set is absent from the
+  # current process's supplementary GID set.
+  case "${BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS:-}" in
+    1|yes|YES|Yes|on|ON|On|true|TRUE|True)
+      # Silent skip: operator opted in to FORCE-start; do not pollute
+      # daemon stderr with a warn line on every start.
+      return 0
+      ;;
+  esac
+  if declare -F bridge_isolation_disabled_by_env >/dev/null 2>&1 \
+      && bridge_isolation_disabled_by_env; then
+    return 0
+  fi
+  [[ "$(uname -s)" == "Linux" ]] || return 0
+  command -v getent >/dev/null 2>&1 || return 0
+  command -v id >/dev/null 2>&1 || return 0
+
+  local controller_group="${BRIDGE_CONTROLLER_GROUP:-ab-controller}"
+  local agent_group_prefix="${BRIDGE_AGENT_GROUP_PREFIX:-ab-agent-}"
+  local shared_group="${BRIDGE_SHARED_GROUP:-ab-shared}"
+
+  # If the controller group itself is absent, linux-user isolation is
+  # not deployed on this host. Treat as not-applicable (PASS).
+  getent group "$controller_group" >/dev/null 2>&1 || return 0
+
+  # Static (passwd-driven) supplementary group set for the operator —
+  # includes any group memberships added by `usermod -aG` even when the
+  # current shell hasn't picked them up yet.
+  local operator="${USER:-$(id -un 2>/dev/null || true)}"
+  [[ -n "$operator" ]] || return 0
+  local static_groups
+  static_groups="$(id -nG -- "$operator" 2>/dev/null || true)"
+  [[ -n "$static_groups" ]] || return 0
+
+  # Current process supplementary GID set (numeric). On Linux `id -G`
+  # without a user argument reflects the running process's kernel-cached
+  # supp set, which is exactly the set the spawned daemon will inherit.
+  local proc_gids
+  proc_gids="$(id -G 2>/dev/null || true)"
+  [[ -n "$proc_gids" ]] || return 0
+
+  local missing=()
+  local g
+  for g in $static_groups; do
+    case "$g" in
+      "$controller_group"|"$shared_group"|"${agent_group_prefix}"*)
+        local gid
+        gid="$(getent group "$g" 2>/dev/null | awk -F: '{print $3}')"
+        [[ -n "$gid" ]] || continue
+        # Word-boundary match against the space-separated proc_gids.
+        case " $proc_gids " in
+          *" $gid "*) ;;
+          *) missing+=("$g") ;;
+        esac
+        ;;
+    esac
+  done
+
+  if (( ${#missing[@]} == 0 )); then
+    return 0
+  fi
+
+  daemon_warn ""
+  daemon_warn "============================================================"
+  daemon_warn "[오류] 데몬을 시작할 수 없습니다: 현재 셸의 supplementary group set이"
+  daemon_warn "  v2 isolation 그룹들을 포함하지 않습니다."
+  daemon_warn "누락: ${missing[*]}"
+  daemon_warn ""
+  daemon_warn "셸을 재로그인 (예: exec sudo -i -u \$USER bash) 후 다시 시도하세요."
+  daemon_warn ""
+  daemon_warn "[error] daemon refused to start: current shell's supplementary"
+  daemon_warn "  group set is missing v2 isolation groups."
+  daemon_warn "Missing: ${missing[*]}"
+  daemon_warn "Re-login (e.g. \`exec sudo -i -u \$USER bash\`) and retry."
+  daemon_warn ""
+  daemon_warn "자세한 진단 / Diagnostic:"
+  daemon_warn "  cat /proc/\$\$/status | grep ^Groups"
+  daemon_warn "  id -G"
+  daemon_warn ""
+  daemon_warn "디버깅용 우회: BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS=1"
+  daemon_warn "(권한 오류가 isolated agent history env 읽기에서 다시 발생할 수 있음)"
+  daemon_warn "============================================================"
+  bridge_audit_log daemon daemon_start_refused daemon \
+    --detail reason=stale_supplementary_groups \
+    --detail missing="${missing[*]}" >/dev/null 2>&1 || true
+  return 1
+}
+
 cmd_start() {
   local start_deadline
   local recorded_pid=""
@@ -5501,6 +5611,15 @@ cmd_start() {
     daemon_info "bridge daemon already running (pid=$(bridge_daemon_pid))"
     bridge_start_silence_watchdog || true
     return 0
+  fi
+
+  # Issue #712: stale supplementary-group cache after v1→v2 migration
+  # leaves the daemon "half-alive" — it starts, but every read of an
+  # isolated-agent state file (group=ab-controller mode 0640) errors
+  # with Permission denied. Refuse to start when the current shell's
+  # supp set is missing v2 isolation groups it should have per passwd.
+  if ! bridge_daemon_supplementary_group_preflight; then
+    bridge_die "bridge daemon start refused: stale supplementary groups (set BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS=1 to override)"
   fi
 
   mkdir -p "$BRIDGE_STATE_DIR" "$BRIDGE_LOG_DIR"
