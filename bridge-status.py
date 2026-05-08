@@ -631,10 +631,16 @@ def render_dashboard(args: argparse.Namespace) -> str:
             health_critical_count += 1
 
     if not args.all_agents:
+        # Issue #714 (#6): static-source agents must remain visible in the
+        # default dashboard even when they have no tmux session — otherwise a
+        # post-upgrade host where every static restart failed silently looks
+        # like total roster loss. Dynamic agents that have died still get
+        # filtered out, so this only surfaces roster-declared static roles.
         roster = [
             row
             for row in roster
             if str(row.get("active", "0")) == "1"
+            or str(row.get("source", "")) == "static"
             or int(metrics.get(row["agent"], {}).get("queued_count", 0) or 0) > 0
             or int(metrics.get(row["agent"], {}).get("claimed_count", 0) or 0) > 0
             or int(metrics.get(row["agent"], {}).get("blocked_count", 0) or 0) > 0
