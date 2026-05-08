@@ -677,6 +677,96 @@ agent-bridge isolate <agent> --reapply
 then restarting the agent so the next session loads the synced skills
 and reads the rendered settings.
 
+## Isolation v2 canonical state and migration
+
+Agent Bridge v0.8 cut over to layout v2 (per-agent Linux user + private
+group, group-based access, no named-user POSIX ACLs in the v2 layout
+itself). Operators upgrading from v0.7.x or earlier may end up with an
+install whose runtime tree drifted from the v2 contract — the most
+common failure mode is leftover transitional ACLs from the v0.7 helper
+`bridge_linux_grant_claude_credentials_access` (deleted in v0.8.0) that
+were never stripped because the v2 cut-over did not migrate per-agent
+home trees.
+
+This section is the canonical v2 state spec and the recovery runbook.
+The deeper reference (drift signatures, diagnostics, manual recovery
+commands) lives at
+[`docs/agent-runtime/v2-isolation-migration.md`](./docs/agent-runtime/v2-isolation-migration.md).
+
+The contract itself is documented in source at
+`lib/bridge-isolation-v2.sh:38-62`.
+
+### Canonical state table
+
+| Path | Owner | Group | Mode | Notes |
+|---|---|---|---|---|
+| `~/.agent-bridge/shared/` | controller | `ab-shared` | `2750` | read-only public assets (controller writes) |
+| `~/.agent-bridge/state/` | controller | `ab-controller` | `2750` | controller-only state |
+| `~/.agent-bridge/agents/<agent>/` | **root** | `ab-agent-<agent>` | `2750` | per-agent private root, root-owned |
+| `~/.agent-bridge/agents/<agent>/{home,workdir,runtime,logs,requests,responses}/` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `2770` | agent owns; controller reads via group |
+| `~/.agent-bridge/agents/<agent>/credentials/` | controller | `ab-agent-<agent>` | `2750` | controller writes, agent reads via group |
+| `~/.agent-bridge/agents/<agent>/credentials/launch-secrets.env` | controller | `ab-agent-<agent>` | `0640` | |
+| `~/.agent-bridge/agents/<agent>/agent-env.sh` | controller | `ab-agent-<agent>` | `0640` | |
+| `~/.agent-bridge/agents/<agent>/workdir/.teams/.env`, `.../.ms365/.env` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `0640` | controller readiness probe reads via group |
+| `/home/agent-bridge-<agent>/` (the agent's actual Linux home) | `agent-bridge-<agent>` | `agent-bridge-<agent>` | `0700` | **agent owns. No ACL of any kind.** |
+| `/home/agent-bridge-<agent>/.claude/`, sub-tree | `agent-bridge-<agent>` | `agent-bridge-<agent>` | `0700` | same — agent-only, no ACL |
+
+### POSIX ACL role
+
+The v2 layout itself contains **no named-user POSIX ACLs**. PR-E removed
+all named-user ACLs from the v2 layout in favor of group ownership +
+setgid (see "[v2 ACL contract (PR-E)](#v2-acl-contract-pr-e)" below).
+
+The single transitional exception is `~/.claude/.credentials.json` in
+the operator's home — the operator's home is *outside* the v2 layout,
+so the credentials surface uses a named-user `r--` ACL plus `--x`
+traverse on the ancestor chain, granted by
+`bridge_linux_grant_claude_credentials_access`. See
+[`KNOWN_ISSUES.md` §16](./KNOWN_ISSUES.md#16-layout-v2--claude-first-launch-login-required-pr-641--v080)
+for the long-term plan to retire that surface entirely (per-agent
+`claude login`).
+
+If you find any other named-user ACL inside the v2 tree
+(`~/.agent-bridge/agents/<agent>/...`) or on `/home/agent-bridge-<agent>/`,
+it is drift — the migration runbook below strips it.
+
+### v0.7 → v0.8 migration runbook
+
+For an isolated agent that drifted across the v0.7 → v0.8 cut:
+
+1. Upgrade and restart the daemon:
+
+   ```bash
+   agent-bridge upgrade --apply --restart-daemon
+   ```
+
+2. Inspect drift (planned for v0.9.0; until then run the manual
+   recovery in `KNOWN_ISSUES.md` §16):
+
+   ```bash
+   agent-bridge migrate isolation v2 --check        # v0.9.0+
+   ```
+
+3. Apply the fix:
+
+   ```bash
+   agent-bridge migrate isolation v2 --apply        # v0.9.0+
+   ```
+
+   The migration covers `~/.agent-bridge/agents/<agent>/...` *and*
+   `/home/agent-bridge-<agent>/...`, strips transitional named-user
+   ACLs everywhere inside the v2 tree, and preserves the single
+   `~/.claude/.credentials.json` ACL surface.
+
+4. Re-launch the agent and verify the fix:
+
+   ```bash
+   agent-bridge agent start <agent>
+   ```
+
+If `agent-bridge migrate isolation v2` is not available (older install),
+follow the manual recovery in `KNOWN_ISSUES.md` §16.
+
 ## Migrating to layout v2
 
 The v2 layout (PR-A/B/C, shipped in v0.6.19) replaces named-ACL access on

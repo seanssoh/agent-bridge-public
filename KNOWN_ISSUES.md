@@ -295,6 +295,55 @@ Rollback: operators on v0.7.x with the legacy ACL-grant surface can
 stay on v0.7.x; v0.8.0 is the cut-over and there is no per-agent
 auto-migration of the operator's credential file.
 
+### v0.7 → v0.8 migration ACL leftovers
+
+Pre-v2 installs may carry transitional named-user POSIX ACLs that the
+v2 contract expects to be absent. The most common leftover is on
+`/home/agent-bridge-<agent>/.claude/` — pre-v2 it was created as
+`root:agent-bridge-<agent>` with a named-user ACL granting the
+controller traversal/read; v2 contract requires the agent itself to
+own its Linux home with no ACL of any kind.
+
+The planned `agent-bridge migrate isolation v2 --apply` command
+(v0.9.0+) detects and strips these leftovers, covering both
+`~/.agent-bridge/agents/<agent>/...` and `/home/agent-bridge-<agent>/...`.
+The single retained ACL surface — the `~/.claude/.credentials.json`
+`r--` grant plus the `--x` traverse chain in the operator's home —
+is preserved (see the entry above).
+
+If the migration command is unavailable (older install / scripted
+environment), manual recovery:
+
+```bash
+A=<agent>
+USER=agent-bridge-$A
+GROUP=ab-agent-$A
+CTRL=$(id -un)
+
+# 1. Restore agent ownership of the agent's actual Linux home and strip
+#    any transitional named-user ACL that pre-v2 installs left behind.
+sudo chown -R "$USER:$USER" "/home/$USER/"
+sudo chmod -R u+rwX,go-rwx "/home/$USER/"
+sudo setfacl -bR "/home/$USER/"
+
+# 2. Realign plugin readiness state files to the v2 group-read contract
+#    (controller readiness probe reads via the per-agent group).
+for f in "$HOME/.agent-bridge/agents/$A/workdir/.teams/.env" \
+         "$HOME/.agent-bridge/agents/$A/workdir/.ms365/.env"; do
+  [[ -f "$f" ]] && sudo chgrp "$GROUP" "$f" && sudo chmod 0640 "$f"
+done
+
+# 3. Re-launch and verify.
+agent-bridge agent start "$A"
+```
+
+Do **not** strip ACLs from `~/.claude/.credentials.json` or its
+ancestor chain — that is the one transitional surface the v2 contract
+keeps. The full canonical state table and a deeper drift-recovery
+reference live at
+[`OPERATIONS.md` § "Isolation v2 canonical state and migration"](./OPERATIONS.md#isolation-v2-canonical-state-and-migration)
+and [`docs/agent-runtime/v2-isolation-migration.md`](./docs/agent-runtime/v2-isolation-migration.md).
+
 ## 17. Layout v2 requires the engine CLI in a base-readable path (enforcement deferred to runtime)
 
 The v2 group contract has no path INTO the operator's home. If
