@@ -459,12 +459,52 @@ bridge_isolation_v2_reapply_assert() {
       ;;
   esac
 
-  if [[ "$before" == "$target_repr" ]]; then
-    bridge_isolation_v2_reapply_record_action \
-      "$actions_file" "$path" \
-      "$([[ "$kind" == "file" ]] && printf 'chown_chmod_file' || printf 'chown_chmod_dir')" \
-      "$before" "$before" "ok:already-canonical"
-    return 0
+  # Idempotency guard: when the path is already canonical, record
+  # `ok:already-canonical` and skip chown/chmod. Mirrors the agent-home
+  # guard pattern at `bridge_isolation_v2_reapply_assert_agent_home`
+  # (no recursive walk when the canary at the top says everything is
+  # clean).
+  #
+  # Mode comparison must normalize format before compare because:
+  #   - probe output uses `stat -c '%a'` / `stat -f '%Lp'`, both of
+  #     which strip leading zeros (canonical 0640 → "640", 0700 → "700")
+  #   - the layout target table records canonical modes WITH leading
+  #     zeros (0640, 0700, 2750, 2770)
+  # A naive `"$before" == "$target_repr"` compare therefore always
+  # reports drift on `0640`/`0700` paths even when they are clean,
+  # causing every `--apply` (and `--check`) to re-issue chown/chmod and
+  # re-record `ok` instead of `ok:already-canonical`. Normalize via
+  # `$((10#$mode))` so `640` and `0640` both become `416` (decimal of
+  # the same octal) for the compare.
+  #
+  # Path-local ACL is also checked: the canonical layout has zero
+  # named-user/named-group POSIX ACLs inside `agents/<agent>/`. If the
+  # path carries a named ACL we are NOT canonical, even when owner+mode
+  # match — the recursive setfacl strip pass at the agent level will
+  # repair it, but we must not record this row as `ok:already-canonical`.
+  local before_owner_group="${before% *}"
+  local before_mode_raw="${before##* }"
+  local before_mode_norm="$before_mode_raw"
+  local target_mode_norm="$target_mode"
+  if [[ "$before_mode_raw" =~ ^[0-7]+$ ]]; then
+    before_mode_norm=$((10#$before_mode_raw))
+  fi
+  if [[ "$target_mode" =~ ^[0-7]+$ ]]; then
+    target_mode_norm=$((10#$target_mode))
+  fi
+  if [[ "$before_owner_group" == "$owner_group" \
+        && "$before_mode_norm" == "$target_mode_norm" ]]; then
+    local path_has_named_acl=0
+    if bridge_isolation_v2_reapply_has_named_acl "$path"; then
+      path_has_named_acl=1
+    fi
+    if (( path_has_named_acl == 0 )); then
+      bridge_isolation_v2_reapply_record_action \
+        "$actions_file" "$path" \
+        "$([[ "$kind" == "file" ]] && printf 'chown_chmod_file' || printf 'chown_chmod_dir')" \
+        "$before" "$before" "ok:already-canonical"
+      return 0
+    fi
   fi
 
   if [[ "$apply" != "1" ]]; then
