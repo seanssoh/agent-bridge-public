@@ -1160,7 +1160,7 @@ def _bash_argv_references_system_config(command: str) -> bool:
 
 def _is_config_set_wrapper(text: str) -> bool:
     """True iff *text* is the sanctioned ``agent-bridge config set`` /
-    ``agb config set`` wrapper invocation.
+    ``agb config set`` wrapper invocation as a single command.
 
     The hook normally denies any Bash command whose argv mentions a
     protected path. That blocks the very wrapper #341 prescribes:
@@ -1175,26 +1175,41 @@ def _is_config_set_wrapper(text: str) -> bool:
     the only thing that changes is "audit chain stops being doubled".
     A non-operator caller still gets denied at the wrapper.
 
-    Match shape: leading word is ``agent-bridge`` or ``agb`` (or a
-    ``/path/to/`` prefix thereof) and the next position after ``config``
-    is exactly ``set``. ``config get`` / ``config list-protected`` keep
-    the existing read-intent carve-out — this helper is only for the
-    write surface that the path-argv gate would otherwise self-block.
+    Match shape (strict — codex r1 #726):
+
+    - The text contains *no* shell separators (`;` / `&&` / `||` / `|` /
+      `&` / newline). Multi-command pipelines drop straight back to the
+      regular path-argv gate so a trailing `; sqlite3 .../tasks.db
+      .dump` cannot ride through.
+    - shlex tokens[0] leaf is ``agent-bridge`` or ``agb`` (path prefix
+      tolerated).
+    - Subcommand sits at the strict positional ``tokens[1] == "config"``
+      and ``tokens[2] == "set"``. A later embedded ``config set`` inside
+      a different subcommand's argv (e.g. ``agent-bridge wave run config
+      set``) does not fire the carve-out.
+
+    ``config get`` / ``config list-protected`` keep the existing
+    read-intent carve-out — this helper is only for the write surface
+    that the path-argv gate would otherwise self-block.
     """
+    # Reject multi-command pipelines first. shlex does not treat shell
+    # operators as separators — `agent-bridge config set --path X;
+    # sqlite3 .../tasks.db .dump` arrives as one shlex run, and a naive
+    # leaf check would hand the whole text a None reason and let the
+    # second command bypass the queue-DB / system-config gates. The
+    # carve-out only applies when the wrapper invocation stands alone.
+    if _COMMAND_OPERATOR_RE.search(text):
+        return False
     try:
         tokens = shlex.split(text, posix=True, comments=False)
     except ValueError:
         return False
-    if not tokens:
+    if len(tokens) < 3:
         return False
     leaf = tokens[0].rsplit("/", 1)[-1]
     if leaf not in {"agent-bridge", "agb"}:
         return False
-    try:
-        idx = tokens.index("config")
-    except ValueError:
-        return False
-    return len(tokens) > idx + 1 and tokens[idx + 1] == "set"
+    return tokens[1] == "config" and tokens[2] == "set"
 
 
 def protected_alias_reason(text: str, agent: str) -> str | None:
