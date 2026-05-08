@@ -1220,6 +1220,16 @@ def _is_config_set_wrapper(text: str) -> bool:
     # forms must remain allowed for the carve-out to be useful in
     # `2>/dev/null`-suffixed wrapper invocations.
     sanitized = _SAFE_REDIRECT_RE.sub(" ", text)
+    # Reject *any* remaining `<` / `>` after the safe-redirect strip.
+    # bash accepts arbitrary numeric file-descriptor prefixes
+    # (`1>`, `0<`, `3<`, `9>>`, `3<>`, ...) — the codex r3 #726 review
+    # caught that the previous per-token `tok.startswith(">")` check
+    # missed `1>`, `0<`, etc. and let the shell open/truncate/read a
+    # protected path before the wrapper started. Any `<` or `>` outside
+    # the safe-redirect forms means the shell is doing I/O the wrapper
+    # cannot guard.
+    if "<" in sanitized or ">" in sanitized:
+        return False
     # Reject multi-command pipelines. shlex does not treat shell
     # operators as separators — `agent-bridge config set --path X;
     # sqlite3 .../tasks.db .dump` arrives as one shlex run, and a naive
@@ -1234,10 +1244,6 @@ def _is_config_set_wrapper(text: str) -> bool:
         return False
     if len(tokens) < 3:
         return False
-    for tok in tokens:
-        for prefix in ("&>", "2>", ">>", ">", "<"):
-            if tok.startswith(prefix):
-                return False
     leaf = tokens[0].rsplit("/", 1)[-1]
     if leaf not in {"agent-bridge", "agb"}:
         return False
