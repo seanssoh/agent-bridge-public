@@ -267,7 +267,17 @@ bridge_isolation_v2_migrate_capture_all_agents_snapshot() {
         # scratch) get skipped instead of accidentally enrolled into
         # the v2 group/perm pass.
         case "$name" in
-          .*|backups|state|logs|shared|worktrees|agents-archive)
+          # Issue #708 (v0.8.7 hotfix): exclude dirs whose name starts with
+          # `-` so a stray `agents/--help` (e.g. created by a flag-typo'd
+          # v0.7.x `agent create` that bypassed name validation, or by a
+          # manual `mkdir`) never reaches the `grep -qFx "$name"` call
+          # below where grep would parse the leading `--` as its own help
+          # option and dump help text into the snapshot stdout. The grep
+          # call also gets the `--` end-of-options separator below as
+          # defense-in-depth, but skipping the dir up-front keeps the
+          # snapshot clean and matches the existing intent of pruning
+          # non-agent directories.
+          .*|-*|backups|state|logs|shared|worktrees|agents-archive)
             continue
             ;;
         esac
@@ -275,7 +285,12 @@ bridge_isolation_v2_migrate_capture_all_agents_snapshot() {
           # v0.8.3: silent for v1-layout agents in roster (they will
           # migrate via the roster path above and emit_plan rows). Warn
           # only for genuinely orphan dirs that are NOT in BRIDGE_AGENT_IDS.
-          if ! grep -qFx "$name" "$roster_lookup" 2>/dev/null; then
+          # Issue #708 (v0.8.7 hotfix): `--` end-of-options separator so a
+          # `$name` that begins with `-` cannot be parsed by grep as a flag.
+          # This is a safety belt — the case filter above already excludes
+          # `-*` dirs from the walk — but the separator ensures no future
+          # callsite that drops the case filter regresses the same way.
+          if ! grep -qFx -- "$name" "$roster_lookup" 2>/dev/null; then
             bridge_warn "isolation-v2 migration: skipping orphan dir $entry (not in roster, no home/ subdir)"
           fi
           continue

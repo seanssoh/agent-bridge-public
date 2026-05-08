@@ -6,6 +6,10 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **#708 v0.7→v0.8 migration aborted when an orphan agent dir name started with `-`** (`lib/bridge-isolation-v2-migrate.sh::bridge_isolation_v2_migrate_capture_all_agents_snapshot`): an operator running `bridge-upgrade.sh --apply` on a v0.7.8 install whose `$BRIDGE_AGENT_HOME_ROOT` contained a stray dir like `agents/--help` (created by an earlier flag-typo'd `agent create` on a pre-v0.8 install or a manual `mkdir`) hit `isolation-v2 migration failed (rc=1) reason=groups-ensure`. Root cause: the markerless directory walk called `grep -qFx "$name" "$roster_lookup"` without the `--` end-of-options separator. When `$name` started with `-`, GNU grep parsed it as a flag (`-q -F -x --help`), printed its help text to stdout (which `2>/dev/null` does not silence), and the curly-brace block's stdout was piped into `sort -u > "$snapshot"` — so `state/migration/all-agents.snapshot` ended up containing ~70 lines of grep help text mixed with real agent ids. Downstream `ensure_groups_and_memberships` then ran `bridge_isolation_v2_agent_group_name` on the polluted lines, validation failed (e.g. `'                            ACTION is 'read' or 'skip'' has invalid chars`), the migration aborted, and `restart_agents` failed for every agent. v0.8.7 hotfix: (a) add `-*` to the case-filter denylist so `--`-prefixed dirs are skipped from the walk entirely; (b) add `--` to the `grep -qFx` invocation as defense-in-depth so any future callsite that drops the case filter cannot regress the same way. Operators on v0.8.6 with a stray `--`-prefixed orphan dir can move it under `backups/` (which the case filter already excluded) and rerun `bridge-upgrade.sh --apply` without manual intervention. Closes #708.
+
 ## [0.8.6] — 2026-05-08
 
 ### Highlight — closes 4 v0.7→v0.8 admin-pair migration findings + bundles wave-orchestration
