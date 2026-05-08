@@ -766,7 +766,14 @@ PY
       fi
       session="$(bridge_agent_session "$agent")"
       if [[ -z "$session" ]] || ! bridge_tmux_session_exists "$session"; then
-        bridge_die "에이전트 '$agent' 세션이 존재하지 않습니다."
+        # Issue #714 (#7): operators previously had no on-screen remediation
+        # path when an attach target was offline (e.g. after an upgrade where
+        # orchestrate_restart silently failed). Surface the two recovery
+        # commands that almost always close the loop before falling into
+        # bridge_die's red error line.
+        echo "[hint] 세션을 다시 시작하려면: bash bridge-start.sh $agent" >&2
+        echo "[hint] (admin 에이전트인 경우) $CLI_NAME admin" >&2
+        bridge_die "에이전트 '$agent'의 tmux 세션이 없습니다."
       fi
       bridge_attach_tmux_session "$session"
       ;;
