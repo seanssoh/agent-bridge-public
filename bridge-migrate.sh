@@ -8,6 +8,8 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/bridge-lib.sh"
 # shellcheck source=lib/bridge-isolation-v2-migrate.sh
 source "$SCRIPT_DIR/lib/bridge-isolation-v2-migrate.sh"
+# shellcheck source=lib/bridge-isolation-v2-reapply.sh
+source "$SCRIPT_DIR/lib/bridge-isolation-v2-reapply.sh"
 bridge_load_roster
 
 usage() {
@@ -30,6 +32,7 @@ Usage:
   bash $SCRIPT_DIR/bridge-migrate.sh isolation-v2 rollback --yes
   bash $SCRIPT_DIR/bridge-migrate.sh isolation-v2 commit  --yes
   bash $SCRIPT_DIR/bridge-migrate.sh isolation-v2 status
+  bash $SCRIPT_DIR/bridge-migrate.sh isolation v2 [--check|--dry-run|--apply] [--agent <name>] [--json]
   bash $SCRIPT_DIR/bridge-migrate.sh overhead apply [--agent <name>|--all] --yes [--dry-run] [--json]
   bash $SCRIPT_DIR/bridge-migrate.sh overhead rollback --stamp <YYYYMMDD-HHMMSS-<pid>> [--json]
 EOF
@@ -831,6 +834,25 @@ case "$subcommand" in
     ;;
   isolation-v2)
     bridge_isolation_v2_migrate_cli "$@"
+    ;;
+  isolation)
+    # `agent-bridge migrate isolation v2 ...` — repair tool for installs
+    # that drifted from the canonical v2 contract during a v0.7 → v0.8
+    # `agent-bridge upgrade --apply` chain (issue #737). Distinct from the
+    # `isolation-v2` (hyphenated) initial-migration tool above.
+    inner="${1:-}"
+    shift || true
+    case "$inner" in
+      v2)
+        bridge_isolation_v2_reapply_cli "$@"
+        ;;
+      ""|-h|--help|help)
+        usage
+        ;;
+      *)
+        bridge_die "지원하지 않는 migrate isolation 명령입니다: $inner (예: 'migrate isolation v2 --check')"
+        ;;
+    esac
     ;;
   ""|-h|--help|help)
     usage

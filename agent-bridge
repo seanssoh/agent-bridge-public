@@ -154,6 +154,7 @@ Usage:
   $CLI_NAME migrate isolation-v2 rollback --yes
   $CLI_NAME migrate isolation-v2 commit --yes
   $CLI_NAME migrate isolation-v2 status
+  $CLI_NAME migrate isolation v2 [--check|--dry-run|--apply] [--agent <name>] [--json]
   $CLI_NAME wiki bootstrap [--agent <name>] [--shared-root <path>] [--dry-run] [--json]
   $CLI_NAME wiki validate [--full|--frontmatter|--broken-link|--tree-edge] [--json]
   $CLI_NAME wiki dedup-scan [--output <file>] [--json]
