@@ -539,7 +539,25 @@ if [[ $# -gt 0 ]]; then
         exit 0
       fi
 
-      exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "--$ADMIN_ENGINE" --name "$ADMIN_AGENT" --workdir "$ADMIN_WORKDIR" --loop "$@"
+      # Issue #715-C / #714-5: bridge-start.sh now exits non-zero when a
+      # spawned tmux session dies inside the post-launch verify window.
+      # Propagate that signal here (instead of `exec`-ing) so we can append
+      # an admin-targeted remediation hint after the child's own log tail.
+      "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "--$ADMIN_ENGINE" --name "$ADMIN_AGENT" --workdir "$ADMIN_WORKDIR" --loop "$@"
+      _admin_rc=$?
+      if [[ $_admin_rc -ne 0 ]]; then
+        cat >&2 <<EOF
+[오류] '$ADMIN_AGENT' 어드민 세션이 시작 직후 종료되었습니다.
+진단:
+  bash bridge-daemon.sh status
+  grep "plugin MCP liveness miss\\|$ADMIN_AGENT died" "\$BRIDGE_HOME/state/daemon.log" | tail
+  tail -20 "\$BRIDGE_HOME/agents/$ADMIN_AGENT/logs/\$(date +%Y%m%d).log"
+설정 누락 가능성:
+  agb setup discord    # discord relay token 등록
+  agb setup teams      # microsoft teams access.json 등록
+EOF
+      fi
+      exit "$_admin_rc"
       ;;
     bootstrap)
       shift

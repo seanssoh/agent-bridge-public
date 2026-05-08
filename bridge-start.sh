@@ -58,6 +58,58 @@ bridge_start_should_controller_accept_dev_channels() {
   [[ -n "$effective" ]]
 }
 
+bridge_start_post_launch_verify() {
+  # Issue #715-C / #714-5: tmux new-session reports success even if the
+  # session dies a few hundred ms later (plugin MCP liveness restart loop,
+  # missing operator config, isolation permission errors). Poll
+  # bridge_tmux_session_exists for a short window and surface a log tail +
+  # remediation hint when the session disappears, so `agb admin` and
+  # `bash bridge-start.sh <agent>` no longer report success on a dead
+  # tmux pane.
+  local session="$1"
+  local agent="$2"
+  local attempts="${BRIDGE_START_VERIFY_POLL_ATTEMPTS:-10}"
+  local interval="${BRIDGE_START_VERIFY_POLL_INTERVAL_SECONDS:-1}"
+  local tail_lines="${BRIDGE_START_VERIFY_LOG_TAIL_LINES:-20}"
+  local i log_dir log_file=""
+
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=10
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=1
+  [[ "$tail_lines" =~ ^[0-9]+$ ]] || tail_lines=20
+  (( attempts > 0 )) || return 0
+  (( interval > 0 )) || interval=1
+
+  # Defensive: if tmux helper isn't loaded for any reason, preserve prior
+  # behaviour (silent skip) rather than spuriously failing healthy starts.
+  declare -F bridge_tmux_session_exists >/dev/null 2>&1 || return 0
+
+  for ((i = 0; i < attempts; i++)); do
+    sleep "$interval"
+    if ! bridge_tmux_session_exists "$session"; then
+      log_dir="$(bridge_agent_log_dir "$agent" 2>/dev/null || true)"
+      if [[ -n "$log_dir" ]]; then
+        log_file="$log_dir/$(date '+%Y%m%d').log"
+      fi
+      bridge_warn "세션 '$session'이 시작 직후 종료되었습니다 (시작 후 $((i + 1)) 회차 polling)."
+      if [[ -n "$log_file" && -r "$log_file" ]]; then
+        printf '[info] 마지막 로그 (%s):\n' "$log_file" >&2
+        tail -n "$tail_lines" "$log_file" >&2 || true
+      else
+        printf '[info] 에이전트 로그를 찾지 못했습니다 (확인 경로: %s)\n' "${log_file:-<unknown>}" >&2
+      fi
+      cat >&2 <<EOF
+[info] 가능한 원인:
+  - daemon 쪽 plugin MCP liveness restart loop
+    (확인: grep "plugin MCP liveness miss" "\$BRIDGE_HOME/state/daemon.log")
+  - operator-config 누락 (예: discord/teams 토큰; agb setup discord / agb setup teams)
+  - workdir 권한 (linux-user isolation; agent workdir 소유권/모드 확인)
+EOF
+      return 1
+    fi
+  done
+  return 0
+}
+
 bridge_start_schedule_dev_channels_accept() {
   local session="$1"
   local agent="$2"
@@ -446,6 +498,14 @@ if [[ -z "$(bridge_agent_session_id "$AGENT")" ]]; then
   bridge_refresh_agent_session_id "$AGENT" 12 0.25 >/dev/null 2>&1 || true
 fi
 echo "[info] 세션 '$SESSION' 시작 완료"
+
+# Issue #715-C / #714-5: short post-launch has-session polling so a session
+# that dies inside the first few seconds (e.g. daemon restart loop on an
+# unconfigured plugin MCP, isolation permission failure) is surfaced with
+# a log tail and remediation hint instead of a silent success.
+if ! bridge_start_post_launch_verify "$SESSION" "$AGENT"; then
+  exit 1
+fi
 
 if [[ $ATTACH -eq 1 ]]; then
   bridge_attach_tmux_session "$SESSION"
