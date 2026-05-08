@@ -369,6 +369,88 @@ bridge_isolation_v2_migrate_all_per_agent_markers_present() {
 # 3. profile_home override preflight
 # ---------------------------------------------------------------------------
 
+# v0.8.6 hotfix: strip a trailing slash so `/x/` vs `/x` is not flagged
+# as a path mismatch. Used by the override-vs-expected compare below; a
+# bare-bones canonical form is enough here because both sides come from
+# the same controller-side path domain (no symlinks across the v2 root,
+# no `..` segments — those would have failed earlier validators).
+_bridge_isolation_v2_migrate_normalize_path() {
+  local path="$1"
+  case "$path" in
+    '') printf '%s' "" ;;
+    '/') printf '%s' "/" ;;
+    */) printf '%s' "${path%/}" ;;
+    *) printf '%s' "$path" ;;
+  esac
+}
+
+# v0.8.6 hotfix: a `<admin>-dev` agent that explicitly co-locates with
+# its admin's workdir/profile_home is the documented PR #691 admin-pair
+# pattern (`bridge_ensure_admin_codex_pair` + `agent create
+# --allow-shared-workdir`). Migration preflight must NOT reject this —
+# same-workdir is the entire point of the pair (shared SOUL/MEMORY/
+# CLAUDE.md so two models review the same tree from different angles).
+# Returns 0 (whitelisted) when the agent is the sibling `-dev` of an
+# admin in the roster, both sides are shared mode, the admin's workdir
+# is set, and the override expands to the same path. Used by
+# `bridge_isolation_v2_migrate_check_profile_home_overrides`. Whitelist
+# is intentionally tight to the admin-pair pattern, not blanket
+# `isolation_mode=shared` — operators with stale shared-mode overrides
+# unrelated to the pair pattern still get the misalignment warning.
+_bridge_isolation_v2_migrate_is_admin_pair_override() {
+  local agent="$1"
+  local override="$2"
+
+  case "$agent" in
+    *-dev) ;;
+    *) return 1 ;;
+  esac
+
+  local admin="${agent%-dev}"
+  [[ -n "$admin" ]] || return 1
+
+  # v0.8.6 hotfix r2 (codex BLOCKING on PR #704 r1): the previous gate only
+  # checked that `<base>` was a roster member, which whitelisted any
+  # `worker-dev` co-locating with a shared-mode `worker` even though
+  # `worker` is not the configured admin. Tighten the gate to require
+  # the base agent to be the configured admin
+  # (`BRIDGE_ADMIN_AGENT_ID` / `bridge_admin_agent_id`). Combined with
+  # the `<admin>-dev` name pattern this matches exactly the
+  # `bridge_ensure_admin_codex_pair` shape and nothing else.
+  local configured_admin=""
+  if command -v bridge_admin_agent_id >/dev/null 2>&1; then
+    configured_admin="$(bridge_admin_agent_id 2>/dev/null || true)"
+  else
+    configured_admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  fi
+  [[ -n "$configured_admin" && "$admin" == "$configured_admin" ]] || return 1
+
+  declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 || return 1
+  local known found=""
+  for known in "${BRIDGE_AGENT_IDS[@]}"; do
+    if [[ "$known" == "$admin" ]]; then
+      found="$admin"
+      break
+    fi
+  done
+  [[ -n "$found" ]] || return 1
+
+  local admin_isolation pair_isolation
+  admin_isolation="${BRIDGE_AGENT_ISOLATION_MODE[$admin]-}"
+  pair_isolation="${BRIDGE_AGENT_ISOLATION_MODE[$agent]-}"
+  case "$admin_isolation" in ''|shared) ;; *) return 1 ;; esac
+  case "$pair_isolation" in ''|shared) ;; *) return 1 ;; esac
+
+  local admin_workdir
+  admin_workdir="${BRIDGE_AGENT_WORKDIR[$admin]-}"
+  [[ -n "$admin_workdir" ]] || return 1
+  admin_workdir="$(bridge_expand_user_path "$admin_workdir")"
+  admin_workdir="$(_bridge_isolation_v2_migrate_normalize_path "$admin_workdir")"
+
+  [[ "$override" == "$admin_workdir" ]] || return 1
+  return 0
+}
+
 bridge_isolation_v2_migrate_check_profile_home_overrides() {
   # Returns 0 when no agent in the snapshot has a misaligned explicit
   # BRIDGE_AGENT_PROFILE_HOME. Returns 1 otherwise; warns to stderr.
@@ -382,12 +464,34 @@ bridge_isolation_v2_migrate_check_profile_home_overrides() {
     [[ -n "$agent" ]] || continue
     override="${BRIDGE_AGENT_PROFILE_HOME[$agent]-}"
     [[ -n "$override" ]] || continue
+    # v0.8.6 hotfix: bridge_expand_user_path now lives in
+    # lib/bridge-core.sh (sourced by bridge-lib.sh chain) so it's always
+    # defined here. Pre-hotfix it was only in bridge-agent.sh (the
+    # executable), so `bridge-migrate.sh -> lib/bridge-isolation-v2-
+    # migrate.sh` saw `bridge_expand_user_path: command not found`,
+    # the override fell through as the empty string, and an aligned
+    # roster entry was silently flagged as mismatched (operator-side
+    # false-negative). Same call shape — the helper is just actually
+    # loaded now.
     override="$(bridge_expand_user_path "$override")"
+    override="$(_bridge_isolation_v2_migrate_normalize_path "$override")"
     expected="$data_root/agents/$agent/workdir"
-    if [[ "$override" != "$expected" ]]; then
-      bridge_warn "agent '$agent' has explicit BRIDGE_AGENT_PROFILE_HOME=$override which is not the v2 workdir ($expected). agent-bridge profile deploy will land in the wrong location after marker flip. Edit roster (agent-roster.local.sh or agent-roster.sh) to unset or align this entry, then re-run --apply."
-      mismatch=1
+    expected="$(_bridge_isolation_v2_migrate_normalize_path "$expected")"
+    if [[ "$override" == "$expected" ]]; then
+      continue
     fi
+    # v0.8.6 hotfix: whitelist the admin-pair pattern (PR #691). A
+    # `<admin>-dev` sibling whose profile_home points at its admin's
+    # workdir is the documented co-located pair-programming setup
+    # (`bridge_ensure_admin_codex_pair`'s `pair_workdir="$(bridge_agent_workdir
+    # "$admin")"` plus `--allow-shared-workdir`), not a stale roster
+    # entry. Skip the warning + don't flip mismatch so the migration
+    # preserves the operator's intentional pair-programming co-location.
+    if _bridge_isolation_v2_migrate_is_admin_pair_override "$agent" "$override"; then
+      continue
+    fi
+    bridge_warn "agent '$agent' has explicit BRIDGE_AGENT_PROFILE_HOME=$override which is not the v2 workdir ($expected). agent-bridge profile deploy will land in the wrong location after marker flip. Edit roster (agent-roster.local.sh or agent-roster.sh) to unset or align this entry, then re-run --apply."
+    mismatch=1
   done < "$snapshot_path"
   return $(( mismatch ))
 }

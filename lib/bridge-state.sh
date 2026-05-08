@@ -94,9 +94,9 @@ bridge_build_dynamic_launch_cmd() {
   case "$engine" in
     codex)
       if [[ "$continue_mode" == "1" && -n "$session_id" ]]; then
-        bridge_join_quoted codex resume "$session_id" -c "features.codex_hooks=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+        bridge_join_quoted codex resume "$session_id" -c "features.codex_hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
       else
-        bridge_join_quoted codex -c "features.codex_hooks=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+        bridge_join_quoted codex -c "features.codex_hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
       fi
       ;;
     claude)
@@ -144,7 +144,7 @@ bridge_build_resume_launch_cmd() {
 
   case "$engine" in
     codex)
-      bridge_join_quoted codex resume "$session_id" -c "features.codex_hooks=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+      bridge_join_quoted codex resume "$session_id" -c "features.codex_hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
       ;;
     claude)
       original_cmd="${BRIDGE_AGENT_LAUNCH_CMD[$agent]-}"
@@ -265,21 +265,42 @@ if not args or args[0] != "codex":
     print(original)
     raise SystemExit(0)
 
-rest = args[1:]
-has_flag = False
-i = 0
-while i < len(rest):
-    token = rest[i]
-    if token == "--enable" and i + 1 < len(rest) and rest[i + 1] == "codex_hooks":
-        has_flag = True
-        break
-    if token == "-c" and i + 1 < len(rest) and "features.codex_hooks=true" in rest[i + 1]:
-        has_flag = True
-        break
-    i += 2 if token in {"-c", "--enable", "--disable", "--profile", "-p", "--model", "-m", "--cd", "-C"} and i + 1 < len(rest) else 1
+# v0.8.6 hotfix: this helper now ensures BOTH `codex_hooks` and
+# `fast_mode` are pinned on every codex launch — admin-pair backfill,
+# isolated agent create, v0.7→v0.8 migration, and resume paths all
+# converge through here. Pre-hotfix it only injected `codex_hooks`,
+# so an existing roster with the legacy default launch_cmd (no
+# fast_mode) silently fell off the fast inference path on every
+# wake. The injection is idempotent: if a flag is already present
+# (via `--enable <name>`, `-c features.<name>=true`, or any later
+# `-c features.<name>=...` form) the helper leaves it alone.
+REQUIRED_FEATURES = ("codex_hooks", "fast_mode")
+ARG_TAKING_FLAGS = {
+    "-c", "--enable", "--disable", "--profile", "-p",
+    "--model", "-m", "--cd", "-C",
+}
 
-if not has_flag:
-    rest = ["-c", "features.codex_hooks=true", *rest]
+def has_feature(rest: list[str], feature: str) -> bool:
+    pattern = f"features.{feature}=true"
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        next_value = rest[i + 1] if i + 1 < len(rest) else None
+        if token == "--enable" and next_value == feature:
+            return True
+        if token == "-c" and next_value is not None and pattern in next_value:
+            return True
+        i += 2 if token in ARG_TAKING_FLAGS and next_value is not None else 1
+    return False
+
+rest = args[1:]
+prefix_pairs: list[str] = []
+for feature in REQUIRED_FEATURES:
+    if not has_feature(rest, feature):
+        prefix_pairs.extend(["-c", f"features.{feature}=true"])
+
+if prefix_pairs:
+    rest = [*prefix_pairs, *rest]
 
 quoted = " ".join(shlex.quote(token) for token in [args[0], *rest])
 print(f"{env_prefix}{quoted}" if env_prefix else quoted)

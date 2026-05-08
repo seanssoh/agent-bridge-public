@@ -172,7 +172,17 @@ _bridge_layout_resolver_bypass_active() {
   # Reject the empty-suffix form so a stale "upgrade-migrate:" without
   # a nonce body cannot disarm the resolver.
   [[ "${val#upgrade-migrate:}" != "" ]] || return 1
-  _bridge_layout_resolver_handshake_check "bridge-upgrade.sh"
+  # v0.8.6 hotfix: `agent-bridge` accepted as owner in addition to
+  # `bridge-upgrade.sh` / `bridge-migrate.sh` so the public CLI wrapper
+  # can arm the bypass before `bridge-lib.sh` source for `upgrade` /
+  # `migrate` subcommands. Pre-hotfix the wrapper would source
+  # `bridge-lib.sh` (firing the resolver) and die at the v0.8.0
+  # fail-fast on a markerless v0.7.x install before its dispatch
+  # `case` could exec the underlying scripts that arm the bypass
+  # themselves. The descendant-walk in `_bridge_layout_resolver_handshake_check`
+  # still gates on the owner-PID, so a leaked env crossing into a
+  # sibling process tree fails as before.
+  _bridge_layout_resolver_handshake_check "bridge-upgrade.sh" "bridge-migrate.sh" "agent-bridge"
 }
 
 # Fresh-install bypass — same handshake shape as the upgrade bypass but

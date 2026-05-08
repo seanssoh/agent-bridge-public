@@ -24,6 +24,44 @@ case "${1:-}" in
       trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
     fi
     ;;
+  upgrade|migrate)
+    # v0.8.6 hotfix: arm the upgrade-migrate resolver bypass before
+    # `bridge-lib.sh` is sourced below — but ONLY when the live install
+    # is markerless (v0.7.x or earlier, no `state/layout-marker.sh`).
+    # Without the bypass, an operator running `agent-bridge upgrade
+    # --apply` or `agent-bridge migrate isolation-v2 ...` from a v0.8.5
+    # source checkout against a markerless v0.7.x install hits the
+    # v0.8.0 fail-fast at `lib/bridge-layout-resolver.sh:333-345`
+    # before the wrapper's own `case` block can dispatch to
+    # `bridge-upgrade.sh` / `bridge-migrate.sh` (which arm the bypass
+    # themselves but only AFTER they're exec'd, by which time the
+    # wrapper has already died).
+    #
+    # Markered v0.8.x installs MUST NOT take the bypass path — the
+    # resolver's bypass branch (line 297-300) returns
+    # `upgrade-migrate-deferred` before consulting the marker, which
+    # would leave BRIDGE_LAYOUT/BRIDGE_DATA_ROOT unset for the
+    # wrapper's own `bridge_load_roster` call (line 54) and silently
+    # operate against legacy paths. Gate the bypass on marker absence
+    # so already-migrated installs continue to take the normal marker
+    # branch (codex review on PR #704 r3 caught this).
+    #
+    # Mirrors the fresh-install bypass arming for `init|bootstrap`
+    # above. The handshake in `lib/bridge-layout-resolver.sh` accepts
+    # `agent-bridge` alongside `bridge-upgrade.sh` /
+    # `bridge-migrate.sh` as owner so a leaked env crossing into
+    # another tree still fails the descendant check.
+    _BRIDGE_AGENT_BRIDGE_HOME="${BRIDGE_HOME:-$HOME/.agent-bridge}"
+    _BRIDGE_AGENT_BRIDGE_MARKER="${BRIDGE_LAYOUT_MARKER_DIR:-$_BRIDGE_AGENT_BRIDGE_HOME/state}/layout-marker.sh"
+    if [[ ! -f "$_BRIDGE_AGENT_BRIDGE_MARKER" ]] \
+        && [[ -z "${BRIDGE_LAYOUT_RESOLVER_BYPASS:-}" ]]; then
+      _BRIDGE_AGENT_BRIDGE_BYPASS_NONCE="$(date -u '+%Y%m%dT%H%M%SZ')-$$-${RANDOM}${RANDOM}"
+      export BRIDGE_LAYOUT_RESOLVER_BYPASS="upgrade-migrate:${_BRIDGE_AGENT_BRIDGE_BYPASS_NONCE}"
+      export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
+      trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
+    fi
+    unset _BRIDGE_AGENT_BRIDGE_HOME _BRIDGE_AGENT_BRIDGE_MARKER
+    ;;
 esac
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"

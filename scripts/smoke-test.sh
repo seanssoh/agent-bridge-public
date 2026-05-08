@@ -3399,6 +3399,12 @@ assert_contains "$CODEX_HOOK_STATUS_OUTPUT" "status: present"
 assert_contains "$CODEX_HOOK_STATUS_OUTPUT" "prompt_hook: present"
 CODEX_LAUNCH_DRY_RUN="$("$REPO_ROOT/bridge-run.sh" "$CODEX_CLI_AGENT" --dry-run)"
 assert_contains "$CODEX_LAUNCH_DRY_RUN" "launch=codex -c features.codex_hooks=true"
+# v0.8.6 hotfix: every codex launch now also pins features.fast_mode=true so
+# admin-pair backfill, isolated agent create, and v0.7→v0.8 migration all
+# carry the same flag. The injection helper guards against duplicate flags
+# so a roster with only codex_hooks (pre-hotfix default) gets fast_mode
+# auto-injected on next wake; this assertion locks the post-hotfix shape.
+assert_contains "$CODEX_LAUNCH_DRY_RUN" "features.fast_mode=true"
 CODEX_SESSION_START_OUTPUT="$(BRIDGE_AGENT_ID="$SMOKE_AGENT" python3 "$REPO_ROOT/hooks/codex-session-start.py")"
 assert_contains "$CODEX_SESSION_START_OUTPUT" "\"hookEventName\": \"SessionStart\""
 assert_contains "$CODEX_SESSION_START_OUTPUT" "agb inbox $SMOKE_AGENT"
