@@ -6,6 +6,21 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.8.6] — 2026-05-08
+
+### Highlight — closes 4 v0.7→v0.8 admin-pair migration findings + bundles wave-orchestration
+
+`v0.8.5` shipped on 2026-05-08 closing 16 OrbStack VM E2E findings. Within hours an operator running `agent-bridge migrate isolation-v2 dry-run` on a v0.7.8 install with the documented `bridge_ensure_admin_codex_pair` pattern (`patch` + `patch-dev` co-located on admin's workdir for shared SOUL/MEMORY/CLAUDE.md pair-programming) hit a chain of defects that hard-blocked the migration. v0.8.6 closes the chain:
+
+1. **Migration preflight admin-pair whitelist** — recognize the `<admin>-dev` shared-workdir pattern instead of flagging it as misalignment.
+2. **`bridge_expand_user_path` helper sourcing** — moved to `lib/bridge-core.sh` so the migrate dispatch chain doesn't fall through to a `command not found` false-negative.
+3. **Public wrapper bypass arming** — `agent-bridge upgrade` / `agent-bridge migrate` now arm the layout resolver bypass before sourcing `bridge-lib.sh`, gated on marker absence so already-migrated v0.8.x installs keep using normal marker resolution.
+4. **`features.fast_mode=true` policy pinning** — every codex agent launch (admin-pair backfill, isolated create, dynamic spawn, v0.7→v0.8 migration) now pins fast_mode alongside codex_hooks, idempotently injected into already-rostered launch_cmds at runtime.
+
+Plus the `wave-orchestration` skill is now bundled and auto-distributed to every Agent Bridge agent on bootstrap.
+
+**Operators on v0.8.5: upgrade to v0.8.6.** The wrapper marker-gate ensures markered v0.8.x → v0.8.6 upgrades take the normal marker path (no behavior change). Operators on v0.7.x with admin-pair patterns are now able to run `agent-bridge migrate isolation-v2 ...` / `agent-bridge upgrade --apply` directly from a v0.8.6 source checkout without hitting the v0.8.0 fail-fast self-referential remediation loop.
+
 ### Added
 
 - **`wave-orchestration` skill bundled in upstream** (`.claude/skills/wave-orchestration/`, `lib/bridge-skills.sh::bridge_bootstrap_claude_shared_skills` + `bridge_isolated_home_shared_skill_names`): the shared parallel-PR-ship orchestration spine (brief writing → `issue-fixer` dispatch into isolated git worktrees → `codex-rescue` review for >300 LOC specialized work or orchestrator-direct review for mid-size → squash-merge with structured `implement-ok` note → cleanup) is now distributed to every Agent Bridge agent on bootstrap. Pre-Wave the skill lived only in operator-level `~/.claude/skills/` — admin / dynamic / static agents needed manual symlinks. Now the same shared-skill bootstrap that already distributes `agent-bridge-runtime` / `cron-manager` / `memory-wiki` / `patch-permission-approval` also installs `wave-orchestration` so any agent that wakes can dispatch a wave with the same field-tested footgun catalog (8 documented footguns, brief template, codex-rescue setup recipe, 4 worked wave examples). The bundled `issue-fixer` agent (under the skill's `agents/` dir) is project-agnostic — operators copy to `~/.claude/agents/issue-fixer.md` once for `subagent_type: "issue-fixer"` to be available, or fall back to `general-purpose`. Generalized from the operator-private Agent Bridge build: machine-specific paths (operator's plugin cache, `/Users/<u>/...`) replaced with portable `command -v codex` / `PATH=...` resolution; Agent Bridge integration section explains queue-based dispatch (`bridge-task.sh create --to <peer>`) as the alternative to `Agent` tool dispatch for codex peers without that tool.
