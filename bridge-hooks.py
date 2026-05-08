@@ -1123,7 +1123,14 @@ def _isolated_workdir_owner(workdir: Path) -> str | None:
     if sys.platform != "linux":
         return None
     try:
-        stat_result = workdir.stat()
+        # v0.8.8 r2 (codex CHECK 4): use lstat so a workdir that is itself
+        # a symlink (rare but possible when a dynamic agent's worktree is
+        # symlinked into ~/.agent-bridge/agents/<name>) reports the link's
+        # owner rather than the dereferenced target. The fallback below
+        # only escalates to `sudo -n -u agent-bridge-<slug>`, so reading
+        # the link itself is the right signal — escalating to the target's
+        # owner would be a category error.
+        stat_result = workdir.lstat()
     except OSError:
         # Workdir parent likely also unreadable — let the direct path
         # raise the original PermissionError so callers see the same
@@ -1156,6 +1163,15 @@ def _sudo_run_as(os_user: str, *cmd: str) -> int:
         # sudo missing — non-Linux dev hosts don't ship it. Treat as
         # "escalation impossible" so the caller surfaces the original
         # PermissionError instead of a confusing FileNotFoundError.
+        # v0.8.8 r2 (codex CHECK 6): emit a one-line warn so the
+        # operator sees *why* fallback is impossible (this would
+        # otherwise be a silent 127 → caller re-raises the original
+        # PermissionError without context).
+        print(
+            f"[bridge-hooks] sudo not available; cannot escalate to "
+            f"'{os_user}' for {cmd}",
+            file=sys.stderr,
+        )
         return 127
 
 
@@ -1175,6 +1191,64 @@ def _ensure_dir_with_sudo(path: Path, os_user: str | None) -> None:
         rc = _sudo_run_as(os_user, "mkdir", "-p", str(path))
         if rc != 0:
             raise
+
+
+def _safe_path_check(check: str, path: Path, os_user: str | None) -> bool:
+    """PermissionError-safe filesystem predicate for isolated workdirs.
+
+    `check` is one of: "exists", "is_symlink".
+
+    v0.8.8 r2 (codex review needs-more, refs #715-B / #714-2 / #694):
+    `cmd_link_shared_settings` previously called `settings_path.is_symlink()`
+    and `settings_path.exists()` directly. On a linux-user-isolated workdir
+    (`agent-bridge-<slug>:agent-group 0750`), the controller process gets
+    `r-x` on the parent dir but the inode metadata read still succeeds in
+    practice — *until* the agent dir is locked down further (e.g. ACL
+    drift, group-membership timing post-relogin, or 0700 mode), at which
+    point `is_symlink()` / `exists()` raise PermissionError before the
+    rm/cp/ln fallback ever runs. Same isolated-permission shape that
+    drives the rest of this function. Wrap the metadata probes in a
+    sudo-fallback so the controller can interrogate the path via
+    `sudo -n -u agent-bridge-<slug> test -e/-h` when direct stat fails.
+    Falls back to plain raise when `os_user` is None (non-isolated).
+    """
+    try:
+        if check == "exists":
+            return path.exists()
+        if check == "is_symlink":
+            return path.is_symlink()
+    except PermissionError:
+        if os_user is None:
+            raise
+        flag = "-e" if check == "exists" else "-h"
+        rc = _sudo_run_as(os_user, "test", flag, str(path))
+        return rc == 0
+    return False  # unreachable on supported `check` values; satisfies type checkers
+
+
+def _safe_realpath(path: Path, os_user: str | None) -> str:
+    """PermissionError-safe `os.path.realpath` for isolated workdirs.
+
+    Companion to `_safe_path_check`. `os.path.realpath` resolves symlinks
+    by stat-ing each component; on an isolated workdir the controller
+    can hit PermissionError mid-resolution. Fall back to
+    `sudo -n -u <agent-user> readlink -f`. Returns the original path
+    string when the sudo fallback also fails (best-effort — the caller
+    compares two realpaths for equality, so falling back to the raw
+    string just forces the "not equal" branch and re-creates the link).
+    """
+    try:
+        return os.path.realpath(path)
+    except PermissionError:
+        if os_user is None:
+            raise
+        result = subprocess.run(
+            ["sudo", "-n", "-u", os_user, "readlink", "-f", str(path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout.strip() or str(path)
 
 
 def cmd_link_shared_settings(args: argparse.Namespace) -> int:
@@ -1198,9 +1272,13 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
     backup_path = ""
     status = "unchanged"
 
-    if settings_path.is_symlink():
-        current_target = os.path.realpath(settings_path)
-        desired_target = os.path.realpath(shared_path)
+    if _safe_path_check("is_symlink", settings_path, os_user):
+        current_target = _safe_realpath(settings_path, os_user)
+        # `shared_path` is controller-owned (lives under shared/ in the
+        # bridge runtime, never inside an isolated workdir). Pass
+        # os_user=None to keep the realpath straightforward and avoid
+        # an unnecessary sudo escalation surface.
+        desired_target = _safe_realpath(shared_path, None)
         if current_target == desired_target:
             status = "unchanged"
         else:
@@ -1213,7 +1291,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
                 if rc != 0:
                     raise
             status = "updated"
-    elif settings_path.exists():
+    elif _safe_path_check("exists", settings_path, os_user):
         backup = next_backup_path(settings_path)
         try:
             shutil.copy2(settings_path, backup)
@@ -1236,7 +1314,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
     else:
         status = "updated"
 
-    if not settings_path.exists():
+    if not _safe_path_check("exists", settings_path, os_user):
         rel_target = os.path.relpath(shared_path, start=settings_path.parent)
         try:
             settings_path.symlink_to(rel_target)
