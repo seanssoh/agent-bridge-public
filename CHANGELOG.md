@@ -6,6 +6,10 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+### Added
+
+- **`wave-orchestration` skill bundled in upstream** (`.claude/skills/wave-orchestration/`, `lib/bridge-skills.sh::bridge_bootstrap_claude_shared_skills` + `bridge_isolated_home_shared_skill_names`): the shared parallel-PR-ship orchestration spine (brief writing → `issue-fixer` dispatch into isolated git worktrees → `codex-rescue` review for >300 LOC specialized work or orchestrator-direct review for mid-size → squash-merge with structured `implement-ok` note → cleanup) is now distributed to every Agent Bridge agent on bootstrap. Pre-Wave the skill lived only in operator-level `~/.claude/skills/` — admin / dynamic / static agents needed manual symlinks. Now the same shared-skill bootstrap that already distributes `agent-bridge-runtime` / `cron-manager` / `memory-wiki` / `patch-permission-approval` also installs `wave-orchestration` so any agent that wakes can dispatch a wave with the same field-tested footgun catalog (8 documented footguns, brief template, codex-rescue setup recipe, 4 worked wave examples). The bundled `issue-fixer` agent (under the skill's `agents/` dir) is project-agnostic — operators copy to `~/.claude/agents/issue-fixer.md` once for `subagent_type: "issue-fixer"` to be available, or fall back to `general-purpose`. Generalized from the operator-private Agent Bridge build: machine-specific paths (operator's plugin cache, `/Users/<u>/...`) replaced with portable `command -v codex` / `PATH=...` resolution; Agent Bridge integration section explains queue-based dispatch (`bridge-task.sh create --to <peer>`) as the alternative to `Agent` tool dispatch for codex peers without that tool.
+
 ## [0.8.5] — 2026-05-08
 
 ### Highlight — closes 16 release-blocker findings surfaced by the v0.8.4 OrbStack VM E2E retest chain
