@@ -189,16 +189,18 @@ DRIFT=0
 note_drift() { DRIFT=$((DRIFT + 1)); }
 
 # Issue #729: track the largest count of memory-daily-<agent> crons sharing a
-# single wall-clock minute. Populated lazily by step_memory_daily_cron_one as
-# it iterates; surfaced in the JSON report so operators can spot fan-out
-# regressions without having to read raw `cron list` output. The minute is
-# extracted from the existing schedule (post-normalisation) — the canonical
-# value for healthy installs is 1 (every agent's minute is unique).
+# single wall-clock minute. Populated by prepopulate_memory_daily_minute_counts
+# (a pre-pass over the static-agent set) BEFORE the per-agent registration
+# loop runs, so the count reflects the full pre-fix state — both the report
+# field and the re-jitter eligibility gate get a consistent picture rather
+# than a partial mid-loop tally. Healthy install: max == 1 (each agent's
+# minute is unique under the cksum-mod-60 jitter).
 MEMORY_DAILY_SIMULTANEOUS_FIRE_MAX=0
-# Per-minute count of memory-daily-<agent> crons across the whole admin cron
-# board. Built once per run from the initial admin cron listing, before any
-# step_memory_daily_cron_one mutation, so the count reflects the pre-fix
-# state — that is what the operator needs to see in the report.
+# Per-minute count of memory-daily-<agent> crons across all static agents.
+# Codex r2: the re-jitter eligibility gate consults
+# MEMORY_DAILY_MINUTE_COUNTS["$minute"] to require ≥2 colliding agents
+# before overwriting, so an isolated operator override at e.g. minute 0
+# is preserved.
 declare -A MEMORY_DAILY_MINUTE_COUNTS
 
 # -----------------------------------------------------------------------------
@@ -743,6 +745,35 @@ for j in jobs:
 PY
 }
 
+# Issue #729 (codex r2): pre-populate MEMORY_DAILY_MINUTE_COUNTS by walking
+# every static agent's memory-daily cron BEFORE the main registration loop.
+# The eligibility gate in step_memory_daily_cron_one (re-jitter overwrite)
+# needs the FULL pre-fix count of agents-per-minute to distinguish a real
+# collapse (≥2 agents on the same minute) from a single operator override
+# (one agent legitimately parked at e.g. minute 0). The previous incremental
+# tally inside step_memory_daily_cron_one was order-dependent: the first
+# agent at a colliding minute always saw count=1 and would have been
+# wrongly classified as "single override" if the gate consulted it.
+prepopulate_memory_daily_minute_counts() {
+  local agent _home minute found norm_existing
+  while IFS=$'\t' read -r agent _home; do
+    [[ -z "$agent" ]] && continue
+    [[ -z "${STATIC_AGENT_SET[$agent]:-}" ]] && continue
+    found="$(memory_daily_cron_lookup "$agent" "memory-daily-$agent" || true)"
+    [[ -z "$found" ]] && continue
+    norm_existing="$(printf '%s' "$found" | awk -F'\t' '{print $2}')"
+    norm_existing="${norm_existing#cron }"
+    norm_existing="$("$BRIDGE_PYTHON" -c 'import sys; parts = sys.argv[1].split(); print(" ".join(parts[:5]))' "$norm_existing" 2>/dev/null || true)"
+    [[ -z "$norm_existing" ]] && continue
+    minute="$("$BRIDGE_PYTHON" -c 'import sys; parts = sys.argv[1].split(); print(parts[0] if parts else "")' "$norm_existing" 2>/dev/null || true)"
+    [[ -z "$minute" ]] && continue
+    MEMORY_DAILY_MINUTE_COUNTS["$minute"]=$(( ${MEMORY_DAILY_MINUTE_COUNTS["$minute"]:-0} + 1 ))
+    if (( ${MEMORY_DAILY_MINUTE_COUNTS["$minute"]} > MEMORY_DAILY_SIMULTANEOUS_FIRE_MAX )); then
+      MEMORY_DAILY_SIMULTANEOUS_FIRE_MAX="${MEMORY_DAILY_MINUTE_COUNTS["$minute"]}"
+    fi
+  done < "$AGENT_LIST_TMP"
+}
+
 step_memory_daily_cron_one() {
   local agent="$1"
   local title="memory-daily-$agent"
@@ -863,20 +894,16 @@ step_memory_daily_cron_one() {
     effective_existing_tz="${existing_tz:-$trailing_tz}"
     norm_expected="$sched"
 
-    # Issue #729: tally how many memory-daily-<agent> crons share the same
-    # wall-clock minute. The count is a fan-out risk indicator surfaced in
-    # the JSON report so operators don't have to read raw `cron list`.
-    # `norm_existing` is the canonical 5-field cron expression at this
-    # point — split on whitespace, take field 0 (the minute). Skip when
-    # parsing fails (malformed schedule).
+    # Issue #729: extract the existing minute for the re-jitter eligibility
+    # gate. The full per-minute collapse count was already populated by
+    # prepopulate_memory_daily_minute_counts (run before this loop), so the
+    # gate can consult MEMORY_DAILY_MINUTE_COUNTS["$existing_minute"] and
+    # know the count reflects ALL agents, not just the ones the loop has
+    # walked so far. The lazy incremental tally that lived here pre-r2 was
+    # order-dependent and would always show count=1 for the first agent at
+    # a colliding minute — wrong signal for the collapse gate.
     local existing_minute
     existing_minute="$("$BRIDGE_PYTHON" -c 'import sys; parts = sys.argv[1].split(); print(parts[0] if parts else "")' "$norm_existing" 2>/dev/null || true)"
-    if [[ -n "$existing_minute" ]]; then
-      MEMORY_DAILY_MINUTE_COUNTS["$existing_minute"]=$(( ${MEMORY_DAILY_MINUTE_COUNTS["$existing_minute"]:-0} + 1 ))
-      if (( ${MEMORY_DAILY_MINUTE_COUNTS["$existing_minute"]} > MEMORY_DAILY_SIMULTANEOUS_FIRE_MAX )); then
-        MEMORY_DAILY_SIMULTANEOUS_FIRE_MAX="${MEMORY_DAILY_MINUTE_COUNTS["$existing_minute"]}"
-      fi
-    fi
 
     if [[ "$norm_existing" == "$norm_expected" && "$effective_existing_tz" == "$tz" ]]; then
       record "$agent" "cron:$title" "already-registered" "$existing_sched tz=$effective_existing_tz"
@@ -921,17 +948,25 @@ else:
     print("no")
 PY
 )"
-      if [[ "$rejitter_eligible" == "yes" ]]; then
+      # Collapse gate (codex r2): even when the schedule shape matches the
+      # legacy-install signature (M 3 * * *), only overwrite when ≥2
+      # memory-daily crons share the same minute. A single agent parked at
+      # `0 3 * * *` is indistinguishable from a deliberate operator override
+      # — there is no fan-out to remediate, so we preserve the schedule and
+      # fall through to the conflict-refuse path (which surfaces a
+      # collapse-not-detected hint instead of the generic re-jitter hint).
+      local simultaneous_count="${MEMORY_DAILY_MINUTE_COUNTS[$existing_minute]:-0}"
+      if [[ "$rejitter_eligible" == "yes" ]] && (( simultaneous_count >= 2 )); then
         if "$BRIDGE_AGB" cron update "$existing_id" \
               --schedule "$sched" \
               --tz "$tz" \
               >/dev/null 2>&1; then
           record "$agent" "cron:$title" "re-jittered" \
-            "id=$existing_id $existing_sched → $sched tz=$tz reason=#729-jitter-regression"
+            "id=$existing_id $existing_sched → $sched tz=$tz reason=#729-jitter-regression simultaneous=$simultaneous_count"
           return 0
         else
           record "$agent" "cron:$title" "re-jitter-failed" \
-            "id=$existing_id $existing_sched → $sched"
+            "id=$existing_id $existing_sched → $sched simultaneous=$simultaneous_count"
           note_drift
           return 0
         fi
@@ -942,9 +977,16 @@ PY
     # shape is plausibly a jitter regression (daily-3am, wrong minute) so
     # operators learn about the recovery path without reading docs. The
     # hint is purely advisory — emitting it does not mutate anything.
+    #
+    # codex r2: when the shape matches but only ONE agent is on this minute
+    # (no real collapse), surface a different hint so the operator
+    # understands why --re-jitter would have skipped this entry. The
+    # collapse-gate path also lands here when invoked with --re-jitter — in
+    # that case we still emit the hint so the report row carries the
+    # explanation rather than just refusing silently.
     local hint=""
-    if [[ "$RE_JITTER" != "1" \
-          && "$effective_existing_tz" == "$tz" ]]; then
+    local hint_simultaneous="${MEMORY_DAILY_MINUTE_COUNTS[$existing_minute]:-0}"
+    if [[ "$effective_existing_tz" == "$tz" ]]; then
       local rejitter_eligible_hint
       rejitter_eligible_hint="$("$BRIDGE_PYTHON" - "$norm_existing" <<'PY'
 import sys
@@ -962,7 +1004,15 @@ print("yes" if 0 <= m <= 59 else "no")
 PY
 )"
       if [[ "$rejitter_eligible_hint" == "yes" ]]; then
-        hint=" hint=run-with---re-jitter-to-overwrite"
+        if (( hint_simultaneous >= 2 )); then
+          if [[ "$RE_JITTER" != "1" ]]; then
+            hint=" hint=run-with---re-jitter-to-overwrite simultaneous=$hint_simultaneous"
+          fi
+        else
+          # Shape eligible but only one agent on this minute → operator
+          # override, not a collapse. Tell the operator we left it alone.
+          hint=" hint=skipped-single-minute-cron-not-collapsed simultaneous=$hint_simultaneous"
+        fi
       fi
     fi
 
@@ -1251,6 +1301,13 @@ run_backfill_history() {
 bootstrap_install_scripts
 bootstrap_migrate_memory_daily_aggregate
 step_librarian_provision
+
+# Issue #729 (codex r2): build the FULL pre-fix collapse map before any
+# per-agent mutation. The re-jitter eligibility gate inside
+# step_memory_daily_cron_one consults MEMORY_DAILY_MINUTE_COUNTS to gate
+# overwrites on ≥2 same-minute crons (real collapse), so a single
+# operator-overridden agent at e.g. minute 0 is preserved.
+prepopulate_memory_daily_minute_counts
 
 while IFS=$'\t' read -r agent home; do
   [[ -z "$agent" || -z "$home" ]] && continue
