@@ -2814,6 +2814,42 @@ def _probe_legacy(home: Path, date: str) -> tuple[bool, list[dict]]:
     return (present and non_empty), checked
 
 
+# Self-signal filter — see issue #728.
+# The memory-daily harvester must not count its own cron-dispatch events,
+# prior-round backfill placeholders, or no-op "checked ok" markers as
+# "real activity" — otherwise an idle librarian slot perpetually re-queues
+# a backfill that consists only of its own self-signals.
+SELF_SIGNAL_PATTERNS = (
+    re.compile(r"^\[memory-daily\] backfill "),       # prior-round backfill task
+    re.compile(r"^\[memory-daily-skip-admin\] "),     # admin skip aggregate
+    re.compile(r"^\[memory-daily-escalated\] "),      # escalation aggregate
+    re.compile(r" checked ok\s*$"),                   # no-op placeholder
+    re.compile(r"^\[cron-followup\] memory-daily-"),  # cron failure followup
+)
+SELF_SIGNAL_FROM_PREFIXES = ("memory-daily", "cron-dispatch", "cron-followup")
+
+
+def _is_self_signal_event(event: dict) -> bool:
+    """Return True if a queue/transcript event should not count as real activity.
+
+    Accepts a dict with optional ``title``, ``from`` (or ``source``), and
+    ``payload_kind`` keys. Events without those keys (e.g. transcript-session
+    summaries from ``_scan_transcripts``) fall through and return False, so
+    the helper is a safe no-op for shapes that lack metadata.
+    """
+    title = event.get("title") or ""
+    from_field = event.get("from") or event.get("source") or ""
+    payload_kind = event.get("payload_kind") or ""
+
+    if any(p.search(title) for p in SELF_SIGNAL_PATTERNS):
+        return True
+    if any(from_field.startswith(p) for p in SELF_SIGNAL_FROM_PREFIXES):
+        return True
+    if payload_kind in {"text", "agentTurn"} and "memory-daily" in title.lower():
+        return True
+    return False
+
+
 def _scan_transcripts(
     workdir: str,
     start: datetime,
@@ -2904,7 +2940,10 @@ def _scan_transcripts(
                     "last_ts": datetime.fromtimestamp(last_ts).isoformat(timespec="seconds"),
                     "event_counts": counts,
                 })
-    return results
+    # Filter self-signals (issue #728). Transcript dicts have no title/from
+    # fields so this is a no-op for typical session summaries — but the wire-up
+    # keeps both scan helpers symmetric and ready for future event-shape changes.
+    return [r for r in results if not _is_self_signal_event(r)]
 
 
 def _scan_queue_events(db_path: Path, agent: str, start: datetime, end: datetime) -> list[int]:
@@ -2915,21 +2954,35 @@ def _scan_queue_events(db_path: Path, agent: str, start: datetime, end: datetime
     try:
         conn = sqlite3.connect(str(db_path))
         try:
+            # Join into ``tasks`` so we can drop self-signals (issue #728):
+            # cron-dispatch wakes, prior-round [memory-daily] backfill placeholders,
+            # admin aggregate skip/escalation tasks, and cron-followup chains
+            # must not count as "real activity" for the harvester classifier.
             cur = conn.execute(
                 """
-                SELECT DISTINCT task_id FROM task_events
-                WHERE event_type IN ('claimed','done')
-                  AND actor = ?
-                  AND created_ts BETWEEN ? AND ?
-                ORDER BY task_id
+                SELECT DISTINCT te.task_id, t.title, t.created_by
+                FROM task_events te
+                JOIN tasks t ON t.id = te.task_id
+                WHERE te.event_type IN ('claimed','done')
+                  AND te.actor = ?
+                  AND te.created_ts BETWEEN ? AND ?
+                ORDER BY te.task_id
                 """,
                 (agent, start_s, end_s),
             )
-            return [int(row[0]) for row in cur.fetchall()]
+            rows = cur.fetchall()
         finally:
             conn.close()
     except sqlite3.Error:
         return []
+    filtered: list[int] = []
+    for row in rows:
+        task_id = int(row[0])
+        event = {"title": row[1] or "", "from": row[2] or ""}
+        if _is_self_signal_event(event):
+            continue
+        filtered.append(task_id)
+    return filtered
 
 
 def _task_status(db_path: Path, task_id: int) -> tuple[str | None, int | None]:
@@ -3057,6 +3110,27 @@ def _render_backfill_body(agent: str, date: str, activity: dict, daily_note: dic
 
 
 def _queue_backfill(agent: str, date: str, home: Path, workdir: str, activity: dict, daily_note: dict, dry_run: bool) -> int | None:
+    # Defensive guard (issue #728): if every post-filter activity bucket is
+    # empty, do not enqueue another backfill — that is exactly the self-signal
+    # loop the filter is meant to break. The decision logic upstream already
+    # short-circuits on source_confidence == "none", but we re-check here so a
+    # future caller that bypasses the classifier still cannot trigger the loop.
+    strong = (activity.get("strong") or {}).get("transcript_sessions") or []
+    medium = activity.get("medium") or {}
+    weak = activity.get("weak") or {}
+    total_events = (
+        len(strong)
+        + len(medium.get("queue_task_ids") or [])
+        + len(medium.get("ingested_captures_non_precompact") or [])
+        + len(weak.get("precompact_captures") or [])
+        + len(weak.get("git_commits") or [])
+    )
+    if total_events == 0:
+        sys.stderr.write(
+            f"memory-daily: slot={date} agent={agent} "
+            f"reason=no-real-activity-after-self-signal-filter\n"
+        )
+        return None
     bridge_home = os.environ.get("BRIDGE_HOME") or str(Path.home() / ".agent-bridge")
     task_cli = Path(bridge_home).expanduser() / "bridge-task.sh"
     if not task_cli.exists() or dry_run:
