@@ -960,8 +960,26 @@ bridge_agent_session_type_from_home() {
 
 bridge_agent_canonical_dir() {
   local path="$1"
+  local resolved=""
+  # Issue #731: under linux-user isolation the controller user has stat
+  # permission on the parent + lookup on the entry (so `[[ -d ]]` is true)
+  # but not traverse on the directory itself when the workdir is owned by
+  # a separate Linux user with mode 2750. The plain `cd -P` aborts the
+  # subshell silently and the caller hands an empty payload to downstream
+  # JSON parsers (`bridge-upgrade.sh` SHARED_SETTINGS_RERENDER_JSON), which
+  # then surfaces as a raw JSONDecodeError traceback. Mirror the v0.8
+  # sudo-handoff trio (PR #718) by retrying through `bridge_linux_sudo_root`
+  # before falling back to a path passthrough.
   if [[ -d "$path" ]]; then
-    (cd -P "$path" && pwd -P)
+    resolved="$( (cd -P "$path" 2>/dev/null && pwd -P) || true)"
+    if [[ -z "$resolved" ]] && command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+      resolved="$(bridge_linux_sudo_root sh -c 'cd -P "$1" && pwd -P' _ "$path" 2>/dev/null || true)"
+    fi
+    if [[ -n "$resolved" ]]; then
+      printf '%s' "$resolved"
+    else
+      printf '%s' "$path"
+    fi
   else
     printf '%s' "$path"
   fi
