@@ -6,6 +6,36 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.8.9] — 2026-05-08
+
+### Highlight — second post-upgrade hotfix wave (5 PR)
+
+`v0.8.9` 은 v0.8.8 적용 호스트에서 발견된 추가 cascade 4건 + 별도 tool-policy hotfix 1건을 닫는다. 핵심: **PR #734 (closes #731)** 가 isolated agent 의 업그레이드 silent skip + JSONDecodeError 를 종결한다 — `bridge_agent_canonical_dir` 의 `cd -P` 이 isolated workdir 에서 PermissionError 일 때 `bridge_linux_sudo_root` fallback + 최종 path passthrough, 그리고 `bridge-upgrade.sh` 의 `SHARED_SETTINGS_RERENDER_JSON` 두 python heredoc 에 빈/non-JSON 방어 (`sys.exit(0)` + WARN + `raw[:200]` preview). 이 이전엔 isolated agent host 의 업그레이드가 raw traceback + "rerender failed for one or more agents" 로 끝났고 *어느 agent / 어느 step* 인지 알 수 없었다.
+
+다른 4 PR: librarian memory-daily 의 8-day 빈-슬롯 backfill loop 를 sender-gated self-signal filter 로 종결 (#732 closes #728), bootstrap-memory-system 에 `--re-jitter` flag 추가하여 long-running install 에서 모든 memory-daily 크론이 동일 minute 으로 회귀했을 때 collapse 검증 후 분산 (#733 closes #729), v0.8 layout split 후 broken 된 agent profile 의 shared-doc / skill symlink (workdir/COMMON-INSTRUCTIONS.md off-by-2, home/.claude/skills/X off-by-1) 재연결 helper 추가 (#735 closes #730), 그리고 별도 tool-policy hotfix 로 `agent-bridge config set` wrapper 가 path-argv gate 를 정상 통과하도록 (#726).
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.8 isolation-v2 layout 변경 없음. isolated agent 호스트가 v0.8.8 적용 시 raw JSONDecodeError traceback 을 보았다면 본 v0.8.9 적용 후 해당 trace 사라짐.
+
+### Fixed (#734 — closes #731)
+
+- `bridge-agent.sh:bridge_agent_canonical_dir` 가 `cd -P` PermissionError 시 `bridge_linux_sudo_root sh -c 'cd -P "$1" && pwd -P' _ "$path"` fallback 시도. `command -v bridge_linux_sudo_root` guard 로 helper 미설치 install 안전. 최종 fallback 은 입력 path passthrough (caller 의 `[[ -d ]]` 가 이미 valid 임을 증명). non-Linux platform 은 `bridge_linux_sudo_root` 가 즉시 return 으로 sudo 호출 안 됨. `bridge-upgrade.sh:1444` 와 `:2039` 두 python heredoc 에 빈/non-JSON 방어 — empty raw 는 WARN + `sys.exit(0)`, JSONDecodeError catch 후 WARN + `raw[:200]` preview. raw traceback 사라지고 어느 agent/step 가 문제인지 식별 가능.
+
+### Fixed (#732 — closes #728)
+
+- `bridge-memory.py` 의 librarian 활동 분류기에 sender-gated self-signal filter. `_is_system_sender` helper 가 `from_field` 가 `memory-daily` / `cron-dispatch` / `cron-followup` prefix 와 매치할 때만 True; `_is_self_signal_event` 가 sender gate 를 hard short-circuit (title regex / payload_kind 평가 전). human-authored task 가 우연히 `... checked ok` 같은 제목이어도 sender 가 system 이 아니면 보존. system sender 의 self-signal-shaped title (예: `[memory-daily] backfill ...`) 은 필터링; bare cron-dispatch (system + non-matching title) 도 필터링. `_scan_queue_events` 가 task title + created_by 를 JOIN 하고, `_queue_backfill` 가 모든 post-filter activity bucket 이 비어있으면 audit log + return (no backfill task 생성). 8-day 빈-슬롯 backfill loop 종결.
+
+### Fixed (#733 — closes #729)
+
+- `bootstrap-memory-system.sh --apply --re-jitter` flag 추가. long-running install 에서 모든 `memory-daily-<agent>` 크론이 같은 minute 으로 fan-out 된 케이스를 *진짜* collapse (≥2 cron at same minute) 일 때만 강제 jitter overwrite. 단일 cron at minute 0 + hour 3 + dow `*` 는 operator override 로 간주, 보존 + hint `skipped-single-minute-cron-not-collapsed`. `prepopulate_memory_daily_minute_counts` pre-pass 가 모든 static agent 의 minute count 를 사전 집계 (order-dependent 회피). drift report 에 `simultaneous=N` 어노테이션 + `memory_daily_simultaneous_fire_max` / `re_jitter_requested` top-level field 추가. `--re-jitter` 단독 사용 (apply 없이) → exit 2.
+
+### Fixed (#735 — closes #730)
+
+- `bridge-hooks.py` 에 새 subcommand `relink-profile-paths` 추가. v0.8 isolation-v2 layout split 후 broken 된 agent profile symlink 를 재연결: `agents/<agent>/workdir/{COMMON-INSTRUCTIONS,CHANGE-POLICY,TOOLS}.md` → `../../../shared/<DOC>.md` (3 levels up to BRIDGE_HOME), `agents/<agent>/home/.claude/skills/<skill>` → `../../../../../.claude/skills/<skill>` (5 levels up to `$BRIDGE_HOME/.claude/skills/<skill>`, NOT `$HOME` — on-disk skill mirror 가 BRIDGE_HOME 안에 있다). 진짜 파일 / non-symlink 가 자리 점거 시 skipped + warn entry (no clobber). isolated agent 는 PR #718 의 `_sudo_run_as` helper 재사용. `bridge-upgrade.sh` 가 daemon restart 전 `relink-profile-paths --all-agents --json` 호출 + JSON parse guard.
+
+### Fixed (#726)
+
+- `bridge-hooks.py` tool-policy gate 가 `agent-bridge config set <key> <value>` wrapper invocation 을 path-argv 패턴으로 인식해 deny 하던 문제 종결. wrapper-allowlist 분기를 path-argv 검사 *전* 으로 이동. 운영자가 `agent-bridge config set log.level debug` 같은 합법적 wrapper 호출을 다시 사용 가능.
+
 ## [0.8.8] — 2026-05-08
 
 ### Highlight — v0.7→v0.8 post-upgrade cascade 회복 + #720 admin kill-loop root cause
