@@ -225,12 +225,21 @@ def _safe_read_env(path: Path) -> dict[str, str]:
         return {}
     try:
         return load_dotenv(path)
-    except PermissionError:
+    except PermissionError as exc:
         if os_user is None:
             raise
         result = _sudo_run_as(os_user, "cat", str(path))
-        if result.returncode != 0:
-            raise
+        rc = result.returncode
+        if rc == 127:
+            raise PermissionError(
+                f"sudo not available; cannot read {path} as {os_user}. "
+                f"Recovery requires either installing sudo or running this "
+                f"command directly as {os_user}."
+            ) from exc
+        if rc != 0:
+            raise PermissionError(
+                f"sudo cat failed for {path} as {os_user} (rc={rc})"
+            ) from exc
         return _parse_dotenv_text(result.stdout)
 
 
@@ -250,12 +259,21 @@ def _safe_load_json(path: Path, default: Any) -> Any:
         return default
     try:
         return load_json(path, default)
-    except PermissionError:
+    except PermissionError as exc:
         if os_user is None:
             raise
         result = _sudo_run_as(os_user, "cat", str(path))
-        if result.returncode != 0:
-            raise
+        rc = result.returncode
+        if rc == 127:
+            raise PermissionError(
+                f"sudo not available; cannot read {path} as {os_user}. "
+                f"Recovery requires either installing sudo or running this "
+                f"command directly as {os_user}."
+            ) from exc
+        if rc != 0:
+            raise PermissionError(
+                f"sudo cat failed for {path} as {os_user} (rc={rc})"
+            ) from exc
         try:
             return json.loads(result.stdout or "null") or default
         except json.JSONDecodeError:
