@@ -3558,6 +3558,50 @@ PY
         bridge_warn "agent delete: --purge-home refused: resolved home outside expected agent roots: $home_dir"
         ;;
     esac
+
+    # Issue #737 Q6: also cover the isolated agent's actual Linux home
+    # (`/home/agent-bridge-<agent>/`). `bridge_agent_default_home` only
+    # resolves the agents/<agent>/home tree; under linux-user isolation
+    # the agent runs as `agent-bridge-<agent>` whose real OS home is a
+    # separate path on disk and would otherwise leak after delete.
+    #
+    # Discovery rules (defensive):
+    #  - Must be a linux-user-isolated agent (effective, not just
+    #    requested) so we never run sudo+rm on hosts where the agent is
+    #    actually shared-mode.
+    #  - Resolve the OS user from the roster, then read its home from
+    #    `getent passwd` (never hardcode — operator may have customized
+    #    the home root).
+    #  - Refuse anything that doesn't match `^/home/agent-bridge-<slug>$`.
+    #    This blocks operator home, /, /root, /tmp, /var/lib/..., etc.,
+    #    even if a misconfigured passwd entry pointed there.
+    #  - Use bridge_linux_sudo_root because the tree is owned by the
+    #    isolated UID (and dotfiles inside it are often root-owned via
+    #    upgrade-time fixups), so the controller alone cannot rm it.
+    #  - Failures warn-only; the agent is already removed from the
+    #    roster, so an unreachable home is operator-followup, not a
+    #    fail-loud condition.
+    #
+    # Out of scope (separate follow-up): `userdel` of the Linux account.
+    # `--purge-home` cleans home files only; account removal is a
+    # distinct destructive action that deserves its own opt-in flag.
+    if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+       && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      local agent_user linux_home
+      agent_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+      if [[ -n "$agent_user" ]] && getent passwd "$agent_user" >/dev/null 2>&1; then
+        linux_home="$(getent passwd "$agent_user" | cut -d: -f6)"
+        if [[ -n "$linux_home" && "$linux_home" =~ ^/home/agent-bridge-[a-zA-Z0-9_-]+$ ]]; then
+          if [[ -d "$linux_home" ]]; then
+            bridge_warn "agent delete: --purge-home also removing isolated Linux home: $linux_home"
+            bridge_linux_sudo_root rm -rf -- "$linux_home" || \
+              bridge_warn "agent delete: --purge-home best-effort Linux home rm failed: $linux_home (operator manual cleanup may be required)"
+          fi
+        elif [[ -n "$linux_home" ]]; then
+          bridge_warn "agent delete: --purge-home refused isolated Linux home (does not match /home/agent-bridge-* guard): $linux_home"
+        fi
+      fi
+    fi
   fi
 
   local after_sha
