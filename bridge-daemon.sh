@@ -5441,7 +5441,8 @@ bridge_daemon_supplementary_group_preflight() {
   # current process's supplementary GID set.
   case "${BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS:-}" in
     1|yes|YES|Yes|on|ON|On|true|TRUE|True)
-      daemon_warn "preflight: BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS set — skipping supplementary-group check"
+      # Silent skip: operator opted in to FORCE-start; do not pollute
+      # daemon stderr with a warn line on every start.
       return 0
       ;;
   esac
@@ -5505,7 +5506,13 @@ bridge_daemon_supplementary_group_preflight() {
   daemon_warn "누락: ${missing[*]}"
   daemon_warn ""
   daemon_warn "셸을 재로그인 (예: exec sudo -i -u \$USER bash) 후 다시 시도하세요."
-  daemon_warn "자세한 진단:"
+  daemon_warn ""
+  daemon_warn "[error] daemon refused to start: current shell's supplementary"
+  daemon_warn "  group set is missing v2 isolation groups."
+  daemon_warn "Missing: ${missing[*]}"
+  daemon_warn "Re-login (e.g. \`exec sudo -i -u \$USER bash\`) and retry."
+  daemon_warn ""
+  daemon_warn "자세한 진단 / Diagnostic:"
   daemon_warn "  cat /proc/\$\$/status | grep ^Groups"
   daemon_warn "  id -G"
   daemon_warn ""
