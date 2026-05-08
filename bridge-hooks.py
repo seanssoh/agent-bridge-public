@@ -1489,8 +1489,10 @@ def _relink_agent_profile_paths(agent_home: Path, home_dir: Path) -> dict[str, l
     """Resolve every expected profile link under ``agent_home``.
 
     ``agent_home`` is ``<bridge_home>/agents/<agent>``; ``home_dir`` is
-    ``$HOME`` (passed in so tests can redirect via env without touching
-    Path.home()).
+    the operator's ``$HOME`` (passed in so tests can redirect via env
+    without touching ``Path.home()``). Note: the bridge-managed skills
+    mirror that the relink targets point at lives under ``BRIDGE_HOME``,
+    not ``$HOME`` — see the skill-loop comment below.
     """
     result: dict[str, list[str]] = {
         "repaired": [],
@@ -1520,23 +1522,32 @@ def _relink_agent_profile_paths(agent_home: Path, home_dir: Path) -> dict[str, l
             result[state].append(f"workdir/{name}: {detail}")
 
     # Skill links: home/.claude/skills/<skill> → ../../../../../.claude/skills/<skill>.
-    # 5 levels up from <bridge_home>/agents/<agent>/home/.claude/skills/
-    # lands at $HOME; we relink every entry that already exists in the
-    # agent's skills dir (operator's source of truth for which skills the
-    # agent should see). Missing-source skills (operator removed the
-    # ~/.claude/skills/<skill> dir) still get the corrected link target —
-    # if the operator restores the skill later the link will resolve.
+    # 5 levels up from <bridge_home>/agents/<agent>/home/.claude/skills/ resolves to:
+    #   $BRIDGE_HOME/.claude/skills/<skill>
+    # (NOT $HOME/.claude/skills/<skill> — the on-disk skill mirror lives inside
+    # the bridge home, not the operator's home directory.)
+    # We relink every entry that already exists in the agent's skills dir
+    # (operator's source of truth for which skills the agent should see).
+    # Missing-source skills (operator removed the
+    # $BRIDGE_HOME/.claude/skills/<skill> dir) still get the corrected link
+    # target — if the operator restores the skill later the link will resolve.
     skills_dir = home_root / ".claude" / "skills"
     if skills_dir.is_dir():
         for entry in sorted(skills_dir.iterdir()):
             link = skills_dir / entry.name
-            # Only consider symlink entries — directories created locally
-            # by the agent (not bridge-managed) shouldn't be rewritten.
+            # Only consider symlink entries — anything else (directory or
+            # regular file) we surface as skipped without clobbering.
             if not os.path.islink(link):
-                # Real dir — surface as skipped but don't clobber.
                 if entry.is_dir():
                     result["skipped"].append(
                         f"home/.claude/skills/{entry.name}: real directory occupies link site"
+                    )
+                else:
+                    # Regular file (or other non-dir/non-symlink) at a
+                    # skill slot — surface so the operator sees it instead
+                    # of silently skipping. Do not clobber.
+                    result["skipped"].append(
+                        f"home/.claude/skills/{entry.name}: non-symlink/non-dir file occupies link site"
                     )
                 continue
             desired = f"../../../../../.claude/skills/{entry.name}"
