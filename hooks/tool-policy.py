@@ -1160,7 +1160,8 @@ def _bash_argv_references_system_config(command: str) -> bool:
 
 def _is_config_set_wrapper(text: str) -> bool:
     """True iff *text* is the sanctioned ``agent-bridge config set`` /
-    ``agb config set`` wrapper invocation as a single command.
+    ``agb config set`` wrapper invocation as a single, side-effect-free
+    shell command.
 
     The hook normally denies any Bash command whose argv mentions a
     protected path. That blocks the very wrapper #341 prescribes:
@@ -1175,12 +1176,22 @@ def _is_config_set_wrapper(text: str) -> bool:
     the only thing that changes is "audit chain stops being doubled".
     A non-operator caller still gets denied at the wrapper.
 
-    Match shape (strict — codex r1 #726):
+    Match shape (strict — codex r2 #726):
 
     - The text contains *no* shell separators (`;` / `&&` / `||` / `|` /
       `&` / newline). Multi-command pipelines drop straight back to the
       regular path-argv gate so a trailing `; sqlite3 .../tasks.db
       .dump` cannot ride through.
+    - The text contains *no* shell embeddings — command substitution
+      (``$(...)`` / backticks), process substitution (``<(...)`` /
+      ``>(...)``), heredoc / here-string (``<<`` / ``<<<``).
+      ``--change foo=$(sqlite3 .../tasks.db .dump)`` would otherwise
+      let the shell read the queue DB before the wrapper even starts.
+    - The text contains *no* I/O redirection tokens (``>`` / ``>>`` /
+      ``<`` / ``&>``, 2>`` other than the SAFE stderr-discard forms).
+      ``... > ~/.agent-bridge/agent-roster.local.sh`` would otherwise
+      let the shell open/truncate the protected file before any
+      argv-side gate runs.
     - shlex tokens[0] leaf is ``agent-bridge`` or ``agb`` (path prefix
       tolerated).
     - Subcommand sits at the strict positional ``tokens[1] == "config"``
@@ -1192,20 +1203,41 @@ def _is_config_set_wrapper(text: str) -> bool:
     read-intent carve-out — this helper is only for the write surface
     that the path-argv gate would otherwise self-block.
     """
-    # Reject multi-command pipelines first. shlex does not treat shell
+    # Reject shell embeddings on raw text first. `_command_has_shell_embedding`
+    # catches `$(...)`, backticks, `<(...)`, `>(...)`, `<<` / `<<<` — these
+    # are the signals we want, so we deliberately don't pre-sanitize. Same
+    # threat shape as multi-command pipelines: the shell evaluates the
+    # embedded command before the wrapper process even runs, so
+    # bridge-config.py cannot guard the file the subshell opens (codex
+    # r2 #726).
+    if _command_has_shell_embedding(text):
+        return False
+    # Strip the safe stderr-suppression / fd-dup tokens BEFORE the
+    # multi-command and redirection checks. `2>&1` legitimately contains
+    # the `&` token-boundary character that `_COMMAND_OPERATOR_RE` would
+    # otherwise read as a backgrounding signal, and `2>/dev/null` looks
+    # like output redirection but cannot mutate the filesystem. The safe
+    # forms must remain allowed for the carve-out to be useful in
+    # `2>/dev/null`-suffixed wrapper invocations.
+    sanitized = _SAFE_REDIRECT_RE.sub(" ", text)
+    # Reject multi-command pipelines. shlex does not treat shell
     # operators as separators — `agent-bridge config set --path X;
     # sqlite3 .../tasks.db .dump` arrives as one shlex run, and a naive
     # leaf check would hand the whole text a None reason and let the
     # second command bypass the queue-DB / system-config gates. The
     # carve-out only applies when the wrapper invocation stands alone.
-    if _COMMAND_OPERATOR_RE.search(text):
+    if _COMMAND_OPERATOR_RE.search(sanitized):
         return False
     try:
-        tokens = shlex.split(text, posix=True, comments=False)
+        tokens = shlex.split(sanitized, posix=True, comments=False)
     except ValueError:
         return False
     if len(tokens) < 3:
         return False
+    for tok in tokens:
+        for prefix in ("&>", "2>", ">>", ">", "<"):
+            if tok.startswith(prefix):
+                return False
     leaf = tokens[0].rsplit("/", 1)[-1]
     if leaf not in {"agent-bridge", "agb"}:
         return False
