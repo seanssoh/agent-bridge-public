@@ -6,9 +6,16 @@
 #
 # Public entrypoint: bridge_isolation_v2_reapply_cli (dispatched from
 # bridge-migrate.sh as `agent-bridge migrate isolation v2 ...`). Modes:
-#   --check               read-only audit; print drift, no mutation
-#   --dry-run             same as --check but with explicit "would do" rows
-#   --apply               apply the canonical state
+#   --check               drift detection only — record `drift` rows for
+#                         paths whose current state differs from canonical;
+#                         no actions described, no mutation.
+#   --dry-run             plan — record `would` rows describing the
+#                         exact action --apply would take (chown/chmod/
+#                         setfacl). No mutation.
+#   --apply               apply the canonical state. Idempotent — a
+#                         second invocation on a clean tree records
+#                         `ok:already-canonical` rows and skips the
+#                         recursive chown/chmod/setfacl walks.
 #   --agent <name>        scope to a single linux-user-isolated agent
 #                         (default: every linux-user-isolated agent in the roster)
 #   --json                emit per-agent JSON report instead of human text
@@ -61,7 +68,9 @@
 # v0.7 transitional cruft and is stripped via `setfacl -bR`.
 #
 # Platform: macOS / non-Linux hosts have no isolated UID concept and no
-# `setfacl`. The CLI silently no-ops on those hosts.
+# `setfacl`. The CLI is a contract no-op on those hosts: it returns 0
+# with no stdout — neither text nor JSON — so operators do not mistake
+# a non-Linux invocation for a meaningful result.
 #
 # Active-session safety: this tool only mutates filesystem ownership/mode
 # bits on isolation-v2-shaped directories. It does not stop or restart the
@@ -297,6 +306,17 @@ bridge_isolation_v2_reapply_one_agent() {
     "$mode" "$apply" "$actions_file" "$errors_file" \
     "dir" "$agent_root/credentials" "$controller_user:$agent_grp" "2750"
 
+  # credentials/launch-secrets.env: controller-owned 0640 secret env file
+  # sourced by bridge-run.sh. The isolated UID reads it via group r-x on
+  # `credentials/`. Drift here (e.g. agent:ab-agent-<n> 0600 from a v0.7
+  # leftover) blocks `bridge_isolation_v2_load_secret_env` and any
+  # controller-side readiness probe. Canonical contract:
+  # `controller:ab-agent-<agent> 0640` (lib/bridge-isolation-v2.sh:60-61).
+  bridge_isolation_v2_reapply_assert \
+    "$mode" "$apply" "$actions_file" "$errors_file" \
+    "file" "$agent_root/credentials/launch-secrets.env" \
+    "$controller_user:$agent_grp" "0640"
+
   # `.claude/` is the surface that triggered the #737 cascade. If
   # missing on apply, create it controller-owned 0700 so subsequent
   # `bridge-hooks.py:cmd_link_shared_settings` can install settings.
@@ -379,6 +399,15 @@ bridge_isolation_v2_reapply_assert() {
   before="$(bridge_isolation_v2_reapply_probe_owner_group_mode "$path")"
   local target_repr="$owner_group $target_mode"
 
+  # mode → non-apply status mapping. --check records pure drift
+  # ("path differs from canonical, no action proposed"); --dry-run
+  # records the concrete action that --apply WOULD take. Apply paths
+  # ignore this and record `ok`/`error:*` as before.
+  local non_apply_status="would"
+  if [[ "$mode" == "check" ]]; then
+    non_apply_status="drift"
+  fi
+
   case "$kind" in
     dir_install)
       if [[ "$before" == "absent" ]]; then
@@ -400,7 +429,7 @@ bridge_isolation_v2_reapply_assert() {
         else
           bridge_isolation_v2_reapply_record_action \
             "$actions_file" "$path" "create_dir" \
-            "absent" "$target_repr" "would"
+            "absent" "$target_repr" "$non_apply_status"
         fi
         return 0
       fi
@@ -442,7 +471,7 @@ bridge_isolation_v2_reapply_assert() {
     bridge_isolation_v2_reapply_record_action \
       "$actions_file" "$path" \
       "$([[ "$kind" == "file" ]] && printf 'chown_chmod_file' || printf 'chown_chmod_dir')" \
-      "$before" "$target_repr" "would"
+      "$before" "$target_repr" "$non_apply_status"
     return 0
   fi
 
@@ -521,9 +550,11 @@ bridge_isolation_v2_reapply_strip_layout_acls() {
   fi
 
   if [[ "$apply" != "1" ]]; then
+    local non_apply_status="would"
+    [[ "$mode" == "check" ]] && non_apply_status="drift"
     bridge_isolation_v2_reapply_record_action \
       "$actions_file" "$root" "setfacl_strip_recursive" \
-      "named-acl-present" "named-acl-stripped" "would"
+      "named-acl-present" "named-acl-stripped" "$non_apply_status"
     return 0
   fi
 
@@ -563,16 +594,59 @@ bridge_isolation_v2_reapply_assert_agent_home() {
   before="$(bridge_isolation_v2_reapply_probe_owner_group_mode "$linux_home")"
   local target_repr_owner="$os_user:$os_user"
 
+  local home_has_named_acl="no-named-acl"
+  if bridge_isolation_v2_reapply_has_named_acl "$linux_home"; then
+    home_has_named_acl="named-acl-present"
+  fi
+
+  # Idempotency guard: if the *top-level* of the home is already
+  # `os_user:os_user` with go-rwx stripped AND no named ACL is present,
+  # treat the whole tree as canonical and skip the recursive chown/chmod
+  # /setfacl. This makes the second `--apply` invocation a true no-op
+  # (the first one already normalized the tree, and there is no out-of
+  # -band drift source between calls). The recursive walk costs are
+  # measurable on agents with large `~/.claude/projects/` trees, so we
+  # avoid it when the canary at the top says everything below is clean.
+  #
+  # The check is intentionally coarse — we trust the top-level mode bits
+  # as a proxy for the recursive state. An operator who manually chmods
+  # something deep inside the tree and then runs --apply expecting a
+  # full rewalk should pass --check first to confirm drift; a clean
+  # canary means we skip.
+  if [[ "$apply" == "1" && "$before" != "absent" && "$before" != "unknown" ]]; then
+    local before_owner_group="${before% *}"
+    local before_mode="${before##* }"
+    if [[ "$before_owner_group" == "$target_repr_owner" \
+          && "$home_has_named_acl" == "no-named-acl" ]]; then
+      # go-rwx implies the last digit and the middle digit must each
+      # have the read/write bits cleared. Cheap probe: any group/other
+      # bit set in the top-level mode means we still need the recursive
+      # chmod pass; otherwise the tree is canonical.
+      if [[ -n "$before_mode" && "$before_mode" =~ ^[0-7][0-7][0-7]+$ ]]; then
+        local group_digit="${before_mode:1:1}"
+        local other_digit="${before_mode:2:1}"
+        if [[ "$group_digit" == "0" && "$other_digit" == "0" ]]; then
+          bridge_isolation_v2_reapply_record_action \
+            "$actions_file" "$linux_home" "chown_recursive_agent_home" \
+            "$before" "$before" "ok:already-canonical"
+          bridge_isolation_v2_reapply_record_action \
+            "$actions_file" "$linux_home" "setfacl_strip_recursive" \
+            "no-named-acl" "no-named-acl" "ok:already-canonical"
+          return 0
+        fi
+      fi
+    fi
+  fi
+
   if [[ "$apply" != "1" ]]; then
+    local non_apply_status="would"
+    [[ "$mode" == "check" ]] && non_apply_status="drift"
     bridge_isolation_v2_reapply_record_action \
       "$actions_file" "$linux_home" "chown_recursive_agent_home" \
-      "$before" "$target_repr_owner u+rwX,go-rwx" "would"
+      "$before" "$target_repr_owner u+rwX,go-rwx" "$non_apply_status"
     bridge_isolation_v2_reapply_record_action \
       "$actions_file" "$linux_home" "setfacl_strip_recursive" \
-      "$(bridge_isolation_v2_reapply_has_named_acl "$linux_home" \
-          && printf 'named-acl-present' \
-          || printf 'no-named-acl')" \
-      "no-named-acl" "would"
+      "$home_has_named_acl" "no-named-acl" "$non_apply_status"
     return 0
   fi
 
@@ -663,8 +737,14 @@ bridge_isolation_v2_reapply_render_text() {
       [[ -n "$row_path" ]] || continue
       printf '  %-32s %-26s %s -> %s [%s]\n' \
         "$row_action" "$row_status" "$row_before" "$row_after" "$row_path"
+      # An agent counts toward `repaired` whenever any row reflects a
+      # non-canonical state that the tool surfaced (`drift` for --check,
+      # `would` for --dry-run) or actually fixed (`ok`, but NOT
+      # `ok:already-canonical` — that row means we did nothing because
+      # the path was already correct, which is exactly what idempotent
+      # second --apply runs should produce).
       case "$row_status" in
-        ok|would) agent_repaired=1 ;;
+        ok|would|drift) agent_repaired=1 ;;
       esac
     done < "$actions_file"
 
@@ -726,7 +806,12 @@ for agent in agent_ids:
                 "after": after,
                 "status": status,
             })
-            if status in ("ok", "would"):
+            # `ok:already-canonical` is intentionally excluded — it
+            # means the path was already correct and we did nothing,
+            # which is the desired outcome of an idempotent second
+            # --apply run. `drift` (--check) and `would` (--dry-run)
+            # both reflect surfaced non-canonical state.
+            if status in ("ok", "would", "drift"):
                 repaired = True
     errors = []
     if errors_path.exists():
@@ -809,9 +894,18 @@ v0.7 → v0.8 upgrade drift. Covers:
                             agent:agent / u+rwX,go-rwx / setfacl -bR
 
 Modes:
-  --check     audit only (read-only); print drift, no mutation.
-  --dry-run   like --check but with explicit "would do" rows.
-  --apply     apply the canonical state. Requires root or passwordless sudo.
+  --check     drift detection only. Read-only audit that reports paths
+              whose current state differs from canonical. Status field
+              is `drift` for non-canonical rows and `ok:already-canonical`
+              for clean rows. No actions are described.
+  --dry-run   plan mode. Same read-only audit as --check, but each
+              non-canonical row records the concrete action --apply
+              would take (status `would`, with the planned target in
+              the `after` column).
+  --apply     apply the canonical state. Requires root or passwordless
+              sudo. Idempotent — a second --apply on a clean tree
+              records `ok:already-canonical` rows and performs no
+              filesystem mutation.
 
 Notes:
   - macOS / non-Linux hosts silently no-op (no isolated UID concept).
@@ -830,15 +924,12 @@ USAGE
     bridge_die "migrate isolation v2: one of --check, --dry-run, --apply is required"
   fi
 
-  # Non-Linux host → silent skip with informative report.
+  # Non-Linux host → completely silent skip. linux-user isolation is
+  # Linux-only (no setfacl, no foreign UIDs), so this CLI is a contract
+  # no-op on macOS / *BSD / WSL-but-not-Linux. Emitting JSON or text on
+  # those hosts misleads operators into thinking something happened —
+  # the field expectation is "stdout empty + exit 0".
   if ! bridge_isolation_v2_reapply_supported_platform; then
-    if (( emit_json )); then
-      printf '{"mode":"%s","agents":[],"total_agents":0,"total_repaired":0,"platform":"%s","skipped":"non-linux"}\n' \
-        "$mode" "$(uname)"
-    else
-      printf '== isolation-v2 reapply (mode=%s) ==\n' "$mode"
-      printf 'platform=%s — linux-user isolation is Linux-only; skipping.\n' "$(uname)"
-    fi
     return 0
   fi
 
