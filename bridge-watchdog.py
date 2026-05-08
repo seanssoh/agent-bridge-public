@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -109,24 +110,59 @@ def classify_status(
 
 
 def scan_agent(agent_dir: Path) -> AgentWatch:
-    missing_files = [name for name in REQUIRED_FILES if not (agent_dir / name).exists()]
-    claude_text = read_text(agent_dir / "CLAUDE.md") if (agent_dir / "CLAUDE.md").exists() else ""
-    missing_block = MANAGED_START not in claude_text or MANAGED_END not in claude_text
-    session_type, onboarding_state = parse_session_type(agent_dir)
-    heartbeat_present, heartbeat_age = heartbeat_age_seconds(agent_dir)
-    broken_links = collect_broken_links(agent_dir)
-    status = classify_status(missing_files, broken_links, onboarding_state, missing_block, session_type)
-    return AgentWatch(
-        agent=agent_dir.name,
-        session_type=session_type,
-        onboarding_state=onboarding_state,
-        status=status,
-        missing_files=missing_files,
-        broken_links=broken_links,
-        missing_managed_claude_block=missing_block,
-        heartbeat_present=heartbeat_present,
-        heartbeat_age_seconds=heartbeat_age,
-    )
+    # v0.8.8 #715-B / #694: linux-user-isolated agents own
+    # `agents/<name>/CLAUDE.md` as `agent-bridge-<name>:<group> 0640`.
+    # When the controller process credentials don't include the new
+    # group (typical post-migration / post-relogin window), `.exists()`
+    # / `.read_text()` on that path raise `PermissionError` and the
+    # outer list-comprehension in `main()` propagates the exception —
+    # one isolated agent kills the whole watchdog walk and every other
+    # agent's row stays stale. Same shape PR #688 handled in
+    # `bridge-status.py::pending_upgrade_conflict_count` and PR #695's
+    # follow-up `workdir_display`. Wrap the per-agent scan so the row
+    # downgrades to a `warn` placeholder and the outer walk continues
+    # for the rest of the roster. Missing-files / heartbeat / broken-
+    # links fields default to "empty" because we genuinely don't know
+    # — surfacing the `permission denied during scan` note on the
+    # `broken_links` channel keeps the existing markdown render
+    # unchanged (no new `AgentWatch` fields, per spec).
+    try:
+        missing_files = [name for name in REQUIRED_FILES if not (agent_dir / name).exists()]
+        claude_text = read_text(agent_dir / "CLAUDE.md") if (agent_dir / "CLAUDE.md").exists() else ""
+        missing_block = MANAGED_START not in claude_text or MANAGED_END not in claude_text
+        session_type, onboarding_state = parse_session_type(agent_dir)
+        heartbeat_present, heartbeat_age = heartbeat_age_seconds(agent_dir)
+        broken_links = collect_broken_links(agent_dir)
+        status = classify_status(missing_files, broken_links, onboarding_state, missing_block, session_type)
+        return AgentWatch(
+            agent=agent_dir.name,
+            session_type=session_type,
+            onboarding_state=onboarding_state,
+            status=status,
+            missing_files=missing_files,
+            broken_links=broken_links,
+            missing_managed_claude_block=missing_block,
+            heartbeat_present=heartbeat_present,
+            heartbeat_age_seconds=heartbeat_age,
+        )
+    except (PermissionError, FileNotFoundError) as exc:
+        print(
+            f"[bridge-watchdog] skipped {agent_dir.name}: "
+            f"{type(exc).__name__} during scan ({exc.strerror or exc}); "
+            f"likely isolated agent unreadable to controller",
+            file=sys.stderr,
+        )
+        return AgentWatch(
+            agent=agent_dir.name,
+            session_type="unknown",
+            onboarding_state="unknown",
+            status="warn",
+            missing_files=[],
+            broken_links=[f"permission denied during scan: {type(exc).__name__}"],
+            missing_managed_claude_block=False,
+            heartbeat_present=False,
+            heartbeat_age_seconds=None,
+        )
 
 
 def render_markdown(records: list[AgentWatch], bridge_home: Path) -> str:
