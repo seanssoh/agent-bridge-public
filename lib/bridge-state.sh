@@ -555,64 +555,87 @@ if any(item == "plugin:teams" or item.startswith("plugin:teams@") for item in re
 # Pattern allows shell-quoted values (single-quoted, double-quoted,
 # or unquoted whitespace-bounded) so it survives roster-side hand
 # edits and `printf '%q'` outputs from prior writers.
+def _walk_top_level_tokens(s):
+    # Yield (start, end) byte spans of each whitespace-delimited token in
+    # `s`, treating single-quoted, double-quoted, and backslash-escaped
+    # spans as opaque (so whitespace inside a quoted value does NOT
+    # split the enclosing token). Returning byte spans (not the token
+    # string) lets us preserve the original bytes verbatim — critical
+    # for keeping bash expansions like `$HOME` unquoted in unrelated
+    # env-prefix assignments. (See codex r3 review on PR #776.)
+    i, n = 0, len(s)
+    while i < n:
+        while i < n and s[i] in (" ", "\t"):
+            i += 1
+        if i >= n:
+            return
+        start = i
+        while i < n and s[i] not in (" ", "\t"):
+            c = s[i]
+            if c == "'":
+                i += 1
+                while i < n and s[i] != "'":
+                    i += 1
+                if i < n:
+                    i += 1
+            elif c == '"':
+                i += 1
+                while i < n and s[i] != '"':
+                    if s[i] == "\\" and i + 1 < n:
+                        i += 2
+                    else:
+                        i += 1
+                if i < n:
+                    i += 1
+            elif c == "\\" and i + 1 < n:
+                i += 2
+            else:
+                i += 1
+        yield (start, i)
+
+
 for name, value in assignments:
+    # r4 codex review of #776 — preserve original byte form for tokens
+    # we are NOT replacing. The r3 shlex.split + shlex.quote round-trip
+    # destroyed unquoted shell expansions: `OTHER=$HOME` round-tripped
+    # to `OTHER='$HOME'`, which bash then sees as the literal four-char
+    # string `$HOME` instead of expanding. Walk the original env_prefix
+    # in place, identify only the top-level tokens whose raw byte
+    # prefix is `NAME=`, and substitute their span with the canonical
+    # `NAME=<shlex.quote(value)>`. All other bytes (whitespace runs,
+    # other assignments, their original quoting) pass through verbatim.
+    #
+    # r2 Probe 8 retained: ALL matching occurrences are replaced. Shell
+    # eval is last-definition-wins, so a surviving duplicate after the
+    # first replacement would re-overwrite the canonical value. Falling
+    # through to append fires only when ZERO top-level matches found
+    # (true fresh-setup case).
+    #
+    # r3 Probe 9 retained: quote-aware walker treats whitespace inside
+    # `OTHER="x NAME=/fake"` as belonging to the OTHER token, so the
+    # nested `NAME=/fake` substring is never matched at top level.
     quoted_value = shlex.quote(value)
-    # r3 codex Probe 9 — quote-context-aware token replacement.
-    # The earlier regex-only approach (`(?<=\s)NAME=(\S+|"…"|'…')` with
-    # `\S+` arm) treated whitespace inside another env var's *quoted*
-    # value as a valid top-level token boundary. With global subn,
-    # `TEAMS_APP_PASSWORD="x TEAMS_STATE_DIR=/fake"` would also have
-    # the nested-looking `TEAMS_STATE_DIR=/fake` substring rewritten,
-    # corrupting the unrelated env var. Tokenize with shlex.split so
-    # quoted values stay opaque, then only replace tokens whose
-    # prefix-form is exactly `NAME=` at top level. Bash sees the same
-    # semantics on the launch line because we shlex.quote the value
-    # half on re-emit.
-    try:
-        tokens = shlex.split(env_prefix, posix=True)
-        parse_ok = True
-    except ValueError:
-        # Mismatched quotes in roster prefix — bytes are already broken
-        # for shell; fall back to conservative append-if-absent so we
-        # don't mangle further. The shell launch will then surface the
-        # original parse error to the operator instead of us silently
-        # rewriting nested substrings.
-        parse_ok = False
-
-    if not parse_ok:
-        if f"{name}=" not in env_prefix:
-            env_prefix += f"{name}={quoted_value} "
-        continue
-
     prefix_form = f"{name}="
-    replaced = False
-    new_tokens = []
-    for tok in tokens:
-        if tok.startswith(prefix_form):
-            # r2 Probe 8 retained: replace ALL occurrences. Shell eval is
-            # last-definition-wins, so a surviving duplicate after the
-            # first replacement would re-overwrite the canonical value.
-            new_tokens.append(f"{name}={value}")
-            replaced = True
-        else:
-            new_tokens.append(tok)
-    if not replaced:
-        new_tokens.append(f"{name}={value}")
-
-    out_parts = []
-    for tok in new_tokens:
-        eq = tok.find("=")
-        # Top-level `NAME=value` form: only quote the VALUE half so bash
-        # parses it as an env-prefix assignment (the `=` must stay
-        # outside the quoted block). Anything else (positional token,
-        # leading-`=`, name with metachars) gets quoted whole.
-        if eq > 0 and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tok[:eq]):
-            out_parts.append(f"{tok[:eq]}={shlex.quote(tok[eq+1:])}")
-        else:
-            out_parts.append(shlex.quote(tok))
-    env_prefix = " ".join(out_parts)
-    if env_prefix:
-        env_prefix += " "
+    spans = [
+        (s_, e_)
+        for (s_, e_) in _walk_top_level_tokens(env_prefix)
+        if env_prefix[s_:e_].startswith(prefix_form)
+    ]
+    if spans:
+        pieces = []
+        last = 0
+        for s_, e_ in spans:
+            pieces.append(env_prefix[last:s_])
+            pieces.append(f"{name}={quoted_value}")
+            last = e_
+        pieces.append(env_prefix[last:])
+        env_prefix = "".join(pieces)
+        if env_prefix and not env_prefix.endswith((" ", "\t")):
+            env_prefix += " "
+    else:
+        if env_prefix and not env_prefix.endswith((" ", "\t")):
+            env_prefix += " "
+        env_prefix += f"{name}={quoted_value} "
 
 print(f"{env_prefix}{command}" if env_prefix else command)
 PY
