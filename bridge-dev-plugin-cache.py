@@ -405,18 +405,29 @@ def _copy_file_if_changed(src: Path, dst: Path) -> bool:
 
 
 def _overlay_dir(src: Path, dst: Path) -> bool:
-    """Recursively overlay src onto dst. Returns True if anything was written."""
+    """Recursively overlay src onto dst. Returns True if anything was written.
+
+    r4 codex catch — entries that are symlinks-to-directory (created
+    accidentally by the r1/r2 link_source_node_modules path) were
+    matched by the `entry.is_symlink() or entry.is_file()` arm and sent
+    to shutil.copy2, producing a corrupt or absent cache. is_dir()
+    returns True for symlinks-to-directory because pathlib stats the
+    resolved target, so test for is_dir() FIRST and recurse through
+    the symlink — this materializes the dependency tree into the
+    cache as a real directory copy regardless of whether source's
+    node_modules is a symlink (r1/r2 leftover) or a real dir.
+    """
     changed = False
     if dst.exists() and not dst.is_dir():
         remove_tree(dst)
     dst.mkdir(parents=True, exist_ok=True)
     for entry in src.iterdir():
         target = dst / entry.name
-        if entry.is_symlink() or entry.is_file():
-            if _copy_file_if_changed(entry, target):
-                changed = True
-        elif entry.is_dir():
+        if entry.is_dir():  # includes symlinks-to-directory (resolved-stat)
             if _overlay_dir(entry, target):
+                changed = True
+        elif entry.is_file() or entry.is_symlink():
+            if _copy_file_if_changed(entry, target):
                 changed = True
     return changed
 
@@ -437,11 +448,14 @@ def overlay_source_to_cache(source_path: Path, cache_version_path: Path) -> bool
     changed = False
     for entry in source_path.iterdir():
         target = cache_version_path / entry.name
-        if entry.is_symlink() or entry.is_file():
-            if _copy_file_if_changed(entry, target):
-                changed = True
-        elif entry.is_dir():
+        # r4 codex catch — is_dir() FIRST so symlinks-to-directory are
+        # materialized into the cache as a real directory copy. Old
+        # ordering matched is_symlink first → shutil.copy2 → corrupt cache.
+        if entry.is_dir():
             if _overlay_dir(entry, target):
+                changed = True
+        elif entry.is_file() or entry.is_symlink():
+            if _copy_file_if_changed(entry, target):
                 changed = True
     return changed
 
@@ -605,7 +619,13 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
             # into a real directory. Unlink the symlink, then mkdir +
             # overlay source so the cache is genuinely per-agent.
             cache_version_path.unlink(missing_ok=True)
+            # r4 codex Probe 7 — also chmod parent dirs to 0700 so a
+            # default umask (0o022) does not leave the marketplace +
+            # plugin level world-readable above the per-version cache.
             plugin_cache_root.mkdir(parents=True, exist_ok=True)
+            plugin_cache_root.chmod(0o700)
+            if plugin_cache_root.parent != cache_root() and plugin_cache_root.parent.exists():
+                plugin_cache_root.parent.chmod(0o700)
             cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
             cache_version_path.chmod(0o700)  # explicit, defensive against umask
             overlay_source_to_cache(source_path, cache_version_path)
@@ -624,7 +644,13 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
             # Stray non-directory entry (file, special) — remove and
             # rebuild as real directory.
             remove_tree(cache_version_path)
+            # r4 codex Probe 7 — also chmod parent dirs to 0700 so a
+            # default umask (0o022) does not leave the marketplace +
+            # plugin level world-readable above the per-version cache.
             plugin_cache_root.mkdir(parents=True, exist_ok=True)
+            plugin_cache_root.chmod(0o700)
+            if plugin_cache_root.parent != cache_root() and plugin_cache_root.parent.exists():
+                plugin_cache_root.parent.chmod(0o700)
             cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
             cache_version_path.chmod(0o700)  # explicit, defensive against umask
             overlay_source_to_cache(source_path, cache_version_path)
@@ -633,7 +659,13 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
         else:
             # First-time install — create the per-agent directory and
             # overlay source files into it.
+            # r4 codex Probe 7 — also chmod parent dirs to 0700 so a
+            # default umask (0o022) does not leave the marketplace +
+            # plugin level world-readable above the per-version cache.
             plugin_cache_root.mkdir(parents=True, exist_ok=True)
+            plugin_cache_root.chmod(0o700)
+            if plugin_cache_root.parent != cache_root() and plugin_cache_root.parent.exists():
+                plugin_cache_root.parent.chmod(0o700)
             cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
             cache_version_path.chmod(0o700)  # explicit, defensive against umask
             overlay_source_to_cache(source_path, cache_version_path)
