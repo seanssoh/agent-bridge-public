@@ -136,8 +136,13 @@ bridge_migration_isolate() {
       printf '[done] isolation plan (reapply) printed for %s\n' "$agent"
       return 0
     fi
-    bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir" "$(bridge_current_user)" || \
-      bridge_warn "bridge_linux_prepare_agent_isolation returned non-zero for $agent; re-run isolate or check acceptance runbook §2"
+    # Issue #752 H4 — ACL prep is the load-bearing step of --reapply.
+    # If it fails, refuse to print [done] / return 0; otherwise the operator
+    # sees a clean reapply on top of partially-applied isolation perms.
+    if ! bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir" "$(bridge_current_user)"; then
+      bridge_warn "bridge_linux_prepare_agent_isolation failed for $agent during --reapply; refusing to mark reapply complete. Address the underlying cause (sudo policy, missing os_user, perm denied on $workdir) and re-run 'agent-bridge isolate $agent --reapply'. See acceptance runbook §2."
+      return 1
+    fi
     # Issue #544 PR3 — refresh the bridge-native skills under the
     # isolated HOME (.claude/skills/) so existing isolated agents pick
     # up new/changed skills on `--reapply` without unisolate→isolate.
