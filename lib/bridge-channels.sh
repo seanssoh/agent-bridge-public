@@ -195,7 +195,12 @@ bridge_allocate_dynamic_webhook_port() {
   if command -v bridge_isolation_v2_ensure_matrix_path >/dev/null 2>&1 \
       && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
       && bridge_isolation_v2_active 2>/dev/null; then
-    bridge_isolation_v2_ensure_matrix_path "state-agent-dir" "$agent" >/dev/null 2>&1 || true
+    # r14 codex Probe 4 — was `|| true`. r13 caught the symmetric
+    # fallback in the missing-marker retry writer below; this caller
+    # was missed. Same anti-pattern: ensure failure means parent dir
+    # is not matrix-canonical, so the subsequent mkdir would land
+    # mode/group wrong and verify would reject. Hard fail propagates.
+    bridge_isolation_v2_ensure_matrix_path "state-agent-dir" "$agent" >/dev/null 2>&1 || return 1
   fi
   mkdir -p "$(dirname "$port_file")"
   if [[ -f "$port_file" ]]; then

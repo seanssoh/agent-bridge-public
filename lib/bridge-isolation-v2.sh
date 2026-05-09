@@ -1913,8 +1913,15 @@ bridge_isolation_v2_write_agent_state_marker() {
         || _bridge_isolation_v2_run_root_or_sudo rm -f "$tmp" 2>/dev/null || true
       return 1
     }
+  # r14 codex Probe 4 — was `|| true`. chmod 0660 failure means the
+  # marker file's mode doesn't match the matrix contract; verify will
+  # reject. Hard fail propagates so callers see the asymmetry.
   chmod 0660 "$target" 2>/dev/null \
-    || _bridge_isolation_v2_run_root_or_sudo chmod 0660 "$target" 2>/dev/null || true
+    || _bridge_isolation_v2_run_root_or_sudo chmod 0660 "$target" 2>/dev/null \
+    || {
+      bridge_warn "write_agent_state_marker: cannot chmod 0660 $target"
+      return 1
+    }
   return 0
 }
 
