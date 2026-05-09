@@ -761,18 +761,30 @@ _VERIFIED_STATUSES = frozenset(
 _BENIGN_STATUSES = frozenset({"ignored"})
 
 
-def _is_required_channel(channel: str, required: set[str]) -> bool:
+def _is_required_channel(channel: str, required: set[str], optional: set[str]) -> bool:
     """Return True when this channel should block on failure (Q4 split).
 
-    A channel is required when its full `plugin:<name>@<marketplace>`
-    string was passed in `--required-channels`, OR (back-compat) when
-    `--required-channels` is empty (legacy callers that don't yet pass
-    the split treat every channel as required, matching pre-v0.9.7
-    behavior of the bridge-run sync helper).
+    Decision tree:
+      1. channel ∈ required (operator listed in BRIDGE_AGENT_CHANNELS) → required.
+      2. channel ∈ optional (BRIDGE_AGENT_PLUGINS only) → NOT required.
+      3. Both sets EMPTY (legacy caller without splits) → required (back-compat
+         with pre-v0.9.7 bridge-run sync helper).
+      4. Operator declared splits but this channel is in neither (e.g. orphan
+         from --channels but absent from both --required and --optional) →
+         NOT required (conservative; don't block on unlisted plugins).
+
+    r6 codex catch — earlier signature only took `required` and returned
+    True when `not required`, but with the r5 classification reorder
+    that empty-required fallback fired EVEN when --optional-channels
+    was non-empty, demoting genuinely optional plugins to channel-required.
     """
-    if not required:
+    if channel in required:
         return True
-    return channel in required
+    if channel in optional:
+        return False
+    if not required and not optional:
+        return True
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -846,17 +858,13 @@ def main(argv: list[str] | None = None) -> int:
     for item in results:
         channel = item.get("channel", "")
         status = item.get("status", "unknown")
-        # r5 — channel-required check FIRST so a plugin that appears
-        # in both BRIDGE_AGENT_CHANNELS and BRIDGE_AGENT_PLUGINS is
-        # classified as channel-required (the criticality that means
-        # block-on-failure). Subtraction above already removed the
-        # overlap from optional_set, but order the explicit check
-        # defensively so future changes to set semantics don't flip
-        # the contract.
-        if _is_required_channel(channel, required_set):
+        # r5/r6 — pass BOTH sets so the helper can distinguish:
+        #   in required → channel-required (block)
+        #   in optional → optional (warn)
+        #   neither + both empty → channel-required (legacy back-compat)
+        #   neither + at least one set populated → optional (conservative)
+        if _is_required_channel(channel, required_set, optional_set):
             criticality = "channel-required"
-        elif channel in optional_set:
-            criticality = "optional"
         else:
             criticality = "optional"
         item["criticality"] = criticality
