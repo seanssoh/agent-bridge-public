@@ -875,6 +875,35 @@ bridge_isolation_v2_acl_scrub() {
     bridge_warn "acl_scrub: setfacl -bR failed at $root (rc=${_rc}); see ${_scrub_err}"
     return 1
   fi
+  # Self-verify: mirrors the issue #746 / PR #749 fix shape for the
+  # recursive chgrp path. `_bridge_isolation_v2_run_root_or_sudo` tries
+  # direct first and may return rc=0 even when per-entry strip didn't
+  # land (e.g. `acl` package build differences across distros, or the
+  # sudo path silently degraded). Without this, the migrator advances
+  # the v2 marker on a tree with surviving named ACLs and controller
+  # group reads drift the same way #746 reported.
+  #
+  # When getfacl is unavailable on this Linux box we fall through to
+  # the existing rc-only check (mirrors the pre-check fallback above).
+  if command -v getfacl >/dev/null 2>&1; then
+    local _residual_acl
+    _residual_acl="$(getfacl --absolute-names --skip-base -R "$root" 2>/dev/null \
+                      | grep -E '^(user|group|default:user|default:group):[^:]+:' | head -n1 || true)"
+    if [[ -n "$_residual_acl" ]]; then
+      # Retry sudo-only (skip direct-first), in case direct succeeded
+      # on rc but failed on per-entry strip.
+      if [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+        sudo -n setfacl -bR "$root" 2>/dev/null || true
+      fi
+      _residual_acl="$(getfacl --absolute-names --skip-base -R "$root" 2>/dev/null \
+                        | grep -E '^(user|group|default:user|default:group):[^:]+:' | head -n1 || true)"
+      if [[ -n "$_residual_acl" ]]; then
+        bridge_warn "acl_scrub: residual named ACL after setfacl -bR + sudo retry: $_residual_acl"
+        [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
+        return 1
+      fi
+    fi
+  fi
   [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
   return 0
 }
