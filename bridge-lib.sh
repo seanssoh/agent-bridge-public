@@ -338,6 +338,16 @@ bridge_source_module "bridge-hooks.sh"
 bridge_source_module "bridge-channels.sh"
 bridge_source_module "bridge-state.sh"
 bridge_source_module "bridge-isolation-v2.sh"
+# r12 codex catch (#782) — bridge-isolation-v2-reapply.sh defines
+# `bridge_isolation_v2_reapply_eligible_agents`, which the v2 matrix
+# apply/check helpers in bridge-isolation-v2.sh need at runtime to
+# enumerate the isolated-agent roster. Without it, code paths that
+# don't transit bridge-migrate.sh (notably bridge-upgrade.sh's apply
+# subprocess and bridge-start.sh's prepare_agent_isolation) silently
+# fall back to single-agent behavior and strip other roster agents'
+# credential grants during upgrade. Source it here so every entry
+# point sees the helper.
+bridge_source_module "lib/bridge-isolation-v2-reapply.sh"
 # v0.8.0 T5: runtime-only `BRIDGE_DISABLE_ISOLATION=1` escape hatch.
 # Sourced after bridge-isolation-v2.sh so bridge_isolation_v2_active is
 # already defined (the runtime state helper composes the two).

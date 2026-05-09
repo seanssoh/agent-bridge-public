@@ -216,11 +216,14 @@ bridge_allocate_dynamic_webhook_port() {
     if ! bridge_webhook_port_is_available "$port"; then
       continue
     fi
+    # r12 codex Probe 9 — drop direct-write fallback. Matrix writer
+    # failure is signal that the per-agent state-dir is not canonical,
+    # so a fallback write would land mode/group wrong and verify would
+    # reject. Hard fail propagates.
     if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
         && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
         && bridge_isolation_v2_active 2>/dev/null; then
-      bridge_isolation_v2_write_agent_state_marker "$agent" "webhook-port" "$port" \
-        || printf '%s\n' "$port" >"$port_file"
+      bridge_isolation_v2_write_agent_state_marker "$agent" "webhook-port" "$port" || return 1
     else
       printf '%s\n' "$port" >"$port_file"
     fi

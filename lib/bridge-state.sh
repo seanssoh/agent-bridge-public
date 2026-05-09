@@ -2830,11 +2830,17 @@ bridge_agent_mark_idle_now() {
   # as the "rm: cannot remove '.../idle-since': Permission denied" error
   # in the operator's session output. Falls back to the legacy direct
   # write path when the matrix helper isn't loaded (test fixtures).
+  # r12 codex Probe 9 — drop the direct-write fallback when the
+  # matrix-aware writer fails. Falling back to plain mkdir+printf
+  # silently defeated the r10 BUG #4 hard-fail propagation: the
+  # writer would return 1 (signaling matrix not applied), the
+  # fallback would succeed with controller-owned mode, and verify
+  # would then reject. Hard fail here too — matrix needs to be
+  # applied before daemon can write.
   if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
       && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
       && bridge_isolation_v2_active 2>/dev/null; then
-    bridge_isolation_v2_write_agent_state_marker "$agent" "idle-since" "$ts" \
-      || { mkdir -p "$dir"; printf '%s\n' "$ts" >"$file"; }
+    bridge_isolation_v2_write_agent_state_marker "$agent" "idle-since" "$ts" || return 1
   else
     mkdir -p "$dir"
     printf '%s\n' "$ts" >"$file"
@@ -2859,11 +2865,13 @@ bridge_agent_mark_manual_stop() {
   # unnecessary because the isolated UID is now in ab-agent-<X> and the
   # parent dir is 2770. The sudo handoff stays as a fallback for hosts
   # where the matrix has not been applied yet (rolling upgrade window).
+  # r12 codex Probe 9 — same direct-write fallback removal as
+  # bridge_agent_mark_idle_now above. Hard fail when matrix writer
+  # fails so verify and apply stay in sync.
   if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
       && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
       && bridge_isolation_v2_active 2>/dev/null; then
-    bridge_isolation_v2_write_agent_state_marker "$agent" "manual-stop" "$ts" \
-      || { mkdir -p "$dir"; printf '%s\n' "$ts" >"$file"; }
+    bridge_isolation_v2_write_agent_state_marker "$agent" "manual-stop" "$ts" || return 1
   else
     mkdir -p "$dir"
     printf '%s\n' "$ts" >"$file"

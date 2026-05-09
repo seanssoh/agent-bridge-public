@@ -1711,9 +1711,22 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
       done <<<"$existing_named"
     fi
   fi
+  # r12 codex Probe 4 — apply grants ALL roster agents, not just the
+  # called-for one. Without this, applying for agent A while agent B
+  # is also in roster left B without a grant; check would then catch
+  # B as missing (the new (g) condition), but operator would have to
+  # run apply N times. Now one apply call grants everyone in the
+  # roster + repairs the mask + closes other-bits.
+  local _setfacl_cmd=(setfacl)
+  local _ru
+  while IFS= read -r _ru; do
+    [[ -n "$_ru" ]] || continue
+    _setfacl_cmd+=("-m" "u:${_ru}:r--")
+  done <<<"$roster_iso_users"
+  _setfacl_cmd+=("-m" "m::r--" "-m" "o::---" "$cred_file")
   _bridge_isolation_v2_run_root_or_sudo \
-    setfacl -m "u:${iso_user}:r--" -m "m::r--" -m "o::---" "$cred_file" 2>/dev/null || {
-      bridge_warn "apply_controller_credentials_read_grant: setfacl r-- + m::r-- + o::--- on $cred_file failed"
+    "${_setfacl_cmd[@]}" 2>/dev/null || {
+      bridge_warn "apply_controller_credentials_read_grant: setfacl roster grants + m::r-- + o::--- on $cred_file failed"
       return 1
     }
   return 0
@@ -1814,6 +1827,23 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
       printf '%s' "$roster_iso_users" | grep -Fxq "$_e" || return 1
     done <<<"$existing_named"
   fi
+
+  # (g) Every roster agent must HAVE a r-- grant. r11 codex Probe 4
+  # catch — earlier r11 only checked "no extras"; if agent A has a
+  # grant and agent B does not, A's check passed despite B being
+  # un-granted. Multi-agent contract: all roster agents share the
+  # single Anthropic credential, so a missing roster member is a
+  # mismatch that should surface here (verify will tell the operator
+  # to apply for B too).
+  local _roster_user
+  while IFS= read -r _roster_user; do
+    [[ -n "$_roster_user" ]] || continue
+    local _rline
+    _rline="$(printf '%s\n' "$acl_output" \
+      | awk -F: -v u="$_roster_user" '$1=="user" && $2==u {print substr($3,1,3)}' \
+      | head -n1)"
+    [[ "$_rline" == "r--" ]] || return 1
+  done <<<"$roster_iso_users"
 
   # (c) ancestor traversal — every parent back to / must have u:<iso_user>:?-x
   local p
