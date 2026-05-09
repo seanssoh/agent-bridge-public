@@ -1008,7 +1008,17 @@ bridge_isolation_v2_migrate_normalize_layout() {
     # already canonical and skips rows whose paths aren't present
     # (e.g. agents that never ran on this host).
     if command -v bridge_isolation_v2_apply_grant_matrix_for_agent >/dev/null 2>&1; then
-      bridge_isolation_v2_apply_grant_matrix_for_agent "$agent" --apply >/dev/null 2>&1 || true
+      # r10 codex catch — was `|| true` (silently swallow non-zero
+      # matrix apply). That let `bridge-upgrade.sh --apply` (and other
+      # callers of normalize_layout) report success while matrix rows
+      # failed, recreating the v0.9.5/v0.9.6 false-positive cycle at
+      # the upgrade entry point. Now propagate failure: bridge_warn +
+      # return 1 so the operator's `agent-bridge upgrade --apply` exit
+      # code reflects the failure.
+      if ! bridge_isolation_v2_apply_grant_matrix_for_agent "$agent" --apply >/dev/null 2>&1; then
+        bridge_warn "[migrate] grant-matrix apply FAIL agent=$agent — see preceding bridge_warn lines"
+        return 1
+      fi
     fi
   done < "$snapshot_path"
 

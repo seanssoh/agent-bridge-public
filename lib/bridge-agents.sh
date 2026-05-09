@@ -3104,7 +3104,14 @@ bridge_linux_prepare_agent_isolation() {
   # group, then drifted from the v2 contract for the lifetime of the
   # install. Idempotent and silent on a clean tree.
   if command -v bridge_isolation_v2_apply_grant_matrix_for_agent >/dev/null 2>&1; then
-    bridge_isolation_v2_apply_grant_matrix_for_agent "$agent" --apply >/dev/null 2>&1 || true
+    # r10 codex catch — was `|| true`. Propagate matrix-apply failure
+    # so prepare's caller (bridge-agent.sh, bridge-start.sh) returns
+    # non-zero. Operator otherwise sees a green agent create that
+    # immediately fails the first verify.
+    if ! bridge_isolation_v2_apply_grant_matrix_for_agent "$agent" --apply >/dev/null 2>&1; then
+      bridge_warn "bridge_linux_prepare_agent_isolation: grant-matrix apply FAIL agent=$agent"
+      return 1
+    fi
   fi
 }
 bridge_linux_install_isolated_channel_symlink() {
