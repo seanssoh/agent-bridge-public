@@ -6,6 +6,40 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.9.2] — 2026-05-09
+
+### Highlight — post-#746/#747 wave-orchestrated bug-class sweep (13 PR)
+
+`v0.9.2` 는 v0.9.1 (`c3a09a0`, 2026-05-09 13:10 KST) 머지 직후 동일 패턴의 silent-failure / set-e-cascade / redirection-leak 을 codex-rescue + 로컬 grep 으로 코드베이스 전체 audit 한 결과 (umbrella #752) 13 PR 을 4 wave 로 병렬 처리한 hotfix 묶음이다. 모든 PR codex-rescue pair-review 통과 + squash-merge.
+
+핵심 trigger: v0.9.1 의 #746 fix (`bridge_isolation_v2_chgrp_setgid_recursive` self-verify + sudo retry) 와 #747 fix (`scripts/wiki-v2-rebuild.sh` skip-and-continue) 가 land 한 직후, 같은 bug-class 가 다른 위치에도 있는지 audit 진행. 발견: 4 HIGH + 11 MED + 19 LOW. 운영자 결정에 따라 모두 wave-orchestration 으로 fix.
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.9.0 isolation-v2 layout 변경 없음.
+
+⚠ **Known issue (carry-over)**: v0.9.1 운영 호스트에서 #746 fix 가 *defensive* 였음에도 여전히 drift 자동 회복 안 됨. 운영자 진단 결과 새 verify 코드가 실행 경로에 진입조차 못 함 — root cause 미확정 (가설: `bridge-upgrade.sh` 가 lib/bridge-isolation-v2*.sh 를 live runtime 에 복사 안 했을 가능성). v0.9.2 적용 후 다시 검증 필요. 미해결 시 v0.9.3 에서 정밀 fix.
+
+### HIGH (4 PR)
+
+- **#753 H1 — `lib/bridge-migration.sh:644-680`** unisolate 의 default-ACL 제거 path 가 `find -exec setfacl … {} + 2>/dev/null \|\| true` 로 rc 무시 + post-verify 없어서 stale ACL 잔존 가능했던 문제. `find -print0 \| xargs -0 -r setfacl` (xargs rc 전파) + `getfacl --skip-base -R \| grep` post-verify + drift 시 sudo retry. (`443c514`)
+- **#755 H2 — `lib/bridge-isolation-v2.sh:878-908`** Linux setfacl scrub 의 self-verify+sudo-retry — #749 의 H2 카운터파트. `getfacl --absolute-names --skip-base -R \| grep -E '^(user\|group\|default:user\|default:group):[^:]+:'` 로 residual ACL 감지 → sudo retry → re-verify. (`fad0cbf`)
+- **#754 H3 — `lib/bridge-isolation-v2-migrate.sh:1664-1722`** `apply_for_upgrade` 의 marker-present idempotent skip 경로에서 normalize_layout 실패가 warn-only 였던 contract break. rc 캡처 + `status:partial` JSON envelope (last_error / remediation 필드 포함) + 비-0 return. 모든 envelope 에 `status` 필드 추가 — M10 (W3d) 에서 consume. (`ddbe5fa`)
+- **#756 H4 — `lib/bridge-migration.sh:138-148`** `bridge_migration_isolate --reapply` 의 `bridge_linux_prepare_agent_isolation` 실패 시 warn-only 였던 contract break. `if !; then bridge_warn 'refusing to mark reapply complete'; return 1; fi` 로 fatal 화. (`666954c`)
+
+### MED (8 PR — Bug-A cascade + Bug-B/C/D bundles)
+
+- **#757 M1+M2 — `bridge-sync.sh:46-58 + :110-116`** 동적 에이전트 archive/remove 루프 + 세션 상태 persist 루프 둘 다 set -e 하에서 한 에이전트 실패 시 cascade abort. 둘 다 `if !; then bridge_warn; continue; fi`. (`462b78a`)
+- **#758 M3 — `lib/bridge-state.sh:2674-2696`** `bridge_reconcile_idle_markers` 의 inactive-branch 와 non-numeric-branch 둘 다 cascade 보호 추가. (`6f3993a`)
+- **#760 M4 — `bridge-agent.sh:2116-2136`** `run_rerender_settings` 의 per-target 프로브 실패가 후속 모든 타겟 rerender 를 죽이던 cascade. `if !; then bridge_warn; emit error JSON row via env-passed-vars python3 -c; failed_count++; continue; fi`. failed_count 가 함수 rc 결정 → upgrade caller 가 partial-failure 인지 가능. (`e93325b`)
+- **#759 M5 (r2) — `scripts/apply-channel-policy.sh:707-811`** per-agent allowlist overlay 루프의 Python 명령 치환 두 군데 모두 `if !; then warn; overlay_fail++; continue; fi` 가드 + 모든 overlay 실패 시 `(( overlay_fail>0 && overlay_ok==0 ))` → `exit 1` (pipefail 로 outer 전파). 운영자가 모든 agent 의 settings.local.json 이 malformed JSON 인 케이스를 silent rc=0 가 아니라 명료하게 보게 됨. (`2c9a536`)
+- **#761 W3a — `lib/bridge-tmux.sh:1138`** pending-attention lock PID write 의 redirection-order leak. `printf '%d' $$ >"$pid_file" 2>/dev/null` → `printf '%d' $$ 2>/dev/null >"$pid_file"`. (`b13d859`)
+- **#763 W3b — `lib/bridge-isolation-v2.sh:840-873`** Darwin ACL scrub `chmod -R -P -N` 의 self-verify+sudo-retry — H2/#755 의 macOS 카운터파트. `find -print0 \| xargs -0 ls -leOd \| grep -E '^[[:space:]]+[0-9]+:'` 로 residual 감지 (Darwin 은 getfacl 없으므로 ls -le 활용). (`3d79953`)
+- **#764 W3c — `lib/bridge-migration.sh:155-180 + :255-275`** `bridge_install_isolated_home_settings` 호출 두 군데 (reapply / fresh isolate) warn-only → `if !; then bridge_warn 'refusing to mark X complete'; return 1; fi` (H4 패턴 mirror). (`ad42b61`)
+- **#762 W3d — `bridge-upgrade.sh:1441/1622/1638`** upgrade 의 부분-실패 path 세 군데 (shared rerender failed_count, channel-policy `\|\| true`, profile relink failed_count) 모두 `_upgrade_partial_failures` 배열로 캡처. 최종 JSON envelope `status:"partial"\|"ok"` + `partial_failures:[…]` (sorted/dedup). NOT upgrade-fatal — 복구 가능한 부분 실패는 운영자에게 명확히 보이게 surface 만. (`a4af479`)
+
+### LOW sweep (1 PR)
+
+- **#765 W4 — 11 files / 19 sites** bash redirection-order leak 일괄 swap (`> "$f" 2>/dev/null` → `2>/dev/null > "$f"`). 모두 `\|\| true`-protected 였으므로 cosmetic 이지만 누적 stderr noise (degraded fs / cron 출력 / daemon log) 정리. 사이트: bridge-daemon.sh × 5, bin/agb, bridge-cron.sh, bridge-run.sh × 2, bootstrap-memory-system.sh, lib/bridge-isolation-v2.sh, lib/bridge-isolation-v2-migrate.sh × 3, lib/bridge-hooks.sh × 2, lib/bridge-state.sh, scripts/bridge-daemon-liveness.sh, scripts/librarian-idle-exit.sh. (`550710b`)
+
 ## [0.9.1] — 2026-05-09
 
 ### Highlight — v0.9.0 post-upgrade hotfix wave (2 PR)
