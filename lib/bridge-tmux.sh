@@ -1135,7 +1135,7 @@ bridge_tmux_pending_attention_with_lock() {
     sleep 0.05
   done
 
-  printf '%d' $$ >"$pid_file" 2>/dev/null
+  printf '%d' $$ 2>/dev/null >"$pid_file"
   "$action" "$agent" "$@"
   rc=$?
   rm -f "$pid_file" 2>/dev/null
