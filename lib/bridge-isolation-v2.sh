@@ -1682,32 +1682,28 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
 }
 
 bridge_isolation_v2_check_controller_credentials_read_grant() {
-  # RC3 check must verify ALL FIVE of:
-  #   (a) file mask::r-- (or wider)         — was the only check pre-r3
-  #   (b) named-user grant u:<iso_user>:r-- — r3 added (wipe scenario)
-  #   (c) ancestor traversal u:<iso_user>:--x on every parent back to /
-  #   (d) other::---                         — r4 codex catch: world-readable
-  #       credentials false-pass without this. credential must be readable
-  #       only via the named-user ACL exception, never via base other bits.
-  #   (e) file mode matches matrix row (default 0600). r4 codex catch:
-  #       a 0644 credential could carry mask::r-- + named grant + other::---
-  #       and still false-pass (other:: ACL didn't widen, but base mode did).
-  # The signature accepts file_mode as an optional 3rd arg so the caller
-  # (apply_grant_matrix_for_agent) can pass the matrix row's r_fmode.
-  # When omitted, defaults to 0600 (the contractual mode).
-  local agent="$1" path="$2" file_mode="${3:-0600}"
+  # RC3 check verifies the credential's POSIX ACL is exactly the
+  # contracted state. We do NOT compare stat -c '%a' because Linux
+  # exposes the mask:: as the group-class field on ACL'd files: a
+  # correctly-graphed file (chmod 0600 + setfacl -m m::r--) reports
+  # stat 0640, not 0600. (r5 codex catch — earlier r4 attempted to
+  # compare stat mode against matrix r_fmode and false-failed every
+  # apply'd file.) The five conditions are entirely ACL-derived:
+  #   (a) mask::r-- (or wider) — needed so named-user grant is effective
+  #   (b) named-user grant u:<iso_user>:r--
+  #   (c) ancestor traversal u:<iso_user>:?-x on every parent back to /
+  #   (d) other::---            — no world readability (security)
+  #   (e) user::rw- + group::---  — base ACL entries match contract;
+  #       file owner can write, real group cannot read (only the named
+  #       user does, via the (b) entry mediated by the (a) mask)
+  # The file_mode parameter is retained in the signature for caller
+  # symmetry with the apply helper, but check ignores it after r6 —
+  # ACL entries are authoritative.
+  local agent="$1" path="$2"  # file_mode ($3) reserved for symmetry, unused.
   [[ -n "$agent" && -n "$path" ]] || return 1
   [[ -f "$path" ]] || return 1
   command -v getfacl >/dev/null 2>&1 || return 0  # non-Linux host fallback (apply also skips)
   local iso_user="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}"
-
-  # (e) file mode — must match matrix contract before any ACL inspection
-  local actual_mode want_mode got_mode
-  actual_mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null)"
-  [[ -n "$actual_mode" ]] || return 1
-  want_mode="$(printf '%04o' "$((8#$file_mode))" 2>/dev/null || printf '%s' "$file_mode")"
-  got_mode="$(printf '%04o' "$((8#$actual_mode))" 2>/dev/null || printf '%s' "$actual_mode")"
-  [[ "$want_mode" == "$got_mode" ]] || return 1
 
   local acl_output
   acl_output="$(getfacl -p "$path" 2>/dev/null)"
@@ -1720,6 +1716,13 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
     r--|r-x|rw-|rwx) : ;;
     *) return 1 ;;
   esac
+
+  # (e) base ACL entries: user::rw-, group::---
+  local user_line group_line
+  user_line="$(printf '%s\n' "$acl_output" | awk -F: '/^user::/ {print $3}' | head -n1)"
+  [[ "$user_line" == "rw-" ]] || return 1
+  group_line="$(printf '%s\n' "$acl_output" | awk -F: '/^group::/ {print $3}' | head -n1)"
+  [[ "$group_line" == "---" ]] || return 1
 
   # (d) other:: — must be exactly --- (no widening). r4 codex catch.
   local other_line
