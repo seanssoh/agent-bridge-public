@@ -1538,7 +1538,10 @@ bridge_isolation_v2_apply_grant_matrix_for_agent() {
         bridge_isolation_v2_apply_controller_credentials_read_grant "$agent" \
           || row_rc=$?
       else
-        bridge_isolation_v2_check_controller_credentials_read_grant "$agent" "$r_path" \
+        # Pass r_fmode so the helper enforces the matrix-contracted file
+        # mode (r4 codex catch — world-readable credentials false-passed).
+        bridge_isolation_v2_check_controller_credentials_read_grant \
+          "$agent" "$r_path" "$r_fmode" \
           || row_rc=$?
       fi
     else
@@ -1661,26 +1664,50 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
 }
 
 bridge_isolation_v2_check_controller_credentials_read_grant() {
-  # r3 codex catch — RC3 check must verify ALL THREE of:
+  # RC3 check must verify ALL FIVE of:
   #   (a) file mask::r-- (or wider)         — was the only check pre-r3
-  #   (b) named-user grant u:<iso_user>:r-- — wipe scenario from v0.9.5/v0.9.6
+  #   (b) named-user grant u:<iso_user>:r-- — r3 added (wipe scenario)
   #   (c) ancestor traversal u:<iso_user>:--x on every parent back to /
-  # Without (b) and (c), check could false-pass: mask alone says "ok" while
-  # the named entry is absent (no agent grant) or ancestor `--x` was
-  # stripped (agent can't traverse to reach the file).
-  local agent="$1" path="$2"
+  #   (d) other::---                         — r4 codex catch: world-readable
+  #       credentials false-pass without this. credential must be readable
+  #       only via the named-user ACL exception, never via base other bits.
+  #   (e) file mode matches matrix row (default 0600). r4 codex catch:
+  #       a 0644 credential could carry mask::r-- + named grant + other::---
+  #       and still false-pass (other:: ACL didn't widen, but base mode did).
+  # The signature accepts file_mode as an optional 3rd arg so the caller
+  # (apply_grant_matrix_for_agent) can pass the matrix row's r_fmode.
+  # When omitted, defaults to 0600 (the contractual mode).
+  local agent="$1" path="$2" file_mode="${3:-0600}"
   [[ -n "$agent" && -n "$path" ]] || return 1
   [[ -f "$path" ]] || return 1
   command -v getfacl >/dev/null 2>&1 || return 0  # non-Linux host fallback (apply also skips)
   local iso_user="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}"
 
-  # (a) mask
-  local acl_output mask_line
+  # (e) file mode — must match matrix contract before any ACL inspection
+  local actual_mode want_mode got_mode
+  actual_mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null)"
+  [[ -n "$actual_mode" ]] || return 1
+  want_mode="$(printf '%04o' "$((8#$file_mode))" 2>/dev/null || printf '%s' "$file_mode")"
+  got_mode="$(printf '%04o' "$((8#$actual_mode))" 2>/dev/null || printf '%s' "$actual_mode")"
+  [[ "$want_mode" == "$got_mode" ]] || return 1
+
+  local acl_output
   acl_output="$(getfacl -p "$path" 2>/dev/null)"
   [[ -n "$acl_output" ]] || return 1
+
+  # (a) mask
+  local mask_line
   mask_line="$(printf '%s\n' "$acl_output" | awk -F: '/^mask::/ {print $3}' | head -n1)"
   case "$mask_line" in
     r--|r-x|rw-|rwx) : ;;
+    *) return 1 ;;
+  esac
+
+  # (d) other:: — must be exactly --- (no widening). r4 codex catch.
+  local other_line
+  other_line="$(printf '%s\n' "$acl_output" | awk -F: '/^other::/ {print $3}' | head -n1)"
+  case "$other_line" in
+    ---) : ;;
     *) return 1 ;;
   esac
 
