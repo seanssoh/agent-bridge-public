@@ -555,14 +555,110 @@ if any(item == "plugin:teams" or item.startswith("plugin:teams@") for item in re
 # Pattern allows shell-quoted values (single-quoted, double-quoted,
 # or unquoted whitespace-bounded) so it survives roster-side hand
 # edits and `printf '%q'` outputs from prior writers.
+def _skip_dquote(s, i, n):
+    # i points just AFTER opening `"`. Walks to closing `"` while
+    # honoring backslash escapes and nested expansions (`$(…)`, `${…}`,
+    # backticks). Returns index just AFTER the closing `"`.
+    while i < n and s[i] != '"':
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
+        elif c == "$" and i + 1 < n and s[i + 1] == "(":
+            i = _skip_paren_subst(s, i + 2, n)
+        elif c == "$" and i + 1 < n and s[i + 1] == "{":
+            i = _skip_brace_subst(s, i + 2, n)
+        elif c == "`":
+            i = _skip_backtick(s, i + 1, n)
+        else:
+            i += 1
+    if i < n:
+        i += 1
+    return i
+
+
+def _skip_paren_subst(s, i, n):
+    # i points just AFTER opening `$(`. Tracks nested `(` / `)` and
+    # quote-state until depth returns to 0. Returns index just AFTER
+    # the closing `)`. Whitespace and `=` inside a $(…) substitution
+    # MUST NOT split the enclosing token, so the caller treats this
+    # span as opaque. (codex r4 review on PR #776 — Probe 14.)
+    depth = 1
+    while i < n and depth > 0:
+        c = s[i]
+        if c == "(":
+            depth += 1
+            i += 1
+        elif c == ")":
+            depth -= 1
+            i += 1
+        elif c == "'":
+            # Single-quoted span inside $(…) — literal until next `'`.
+            i += 1
+            while i < n and s[i] != "'":
+                i += 1
+            if i < n:
+                i += 1
+        elif c == '"':
+            i = _skip_dquote(s, i + 1, n)
+        elif c == "\\" and i + 1 < n:
+            i += 2
+        else:
+            i += 1
+    return i
+
+
+def _skip_backtick(s, i, n):
+    # i points just AFTER opening backtick. Walks to next backtick;
+    # legacy backticks don't nest natively (POSIX requires `\\\``
+    # escaping for nesting), so honor backslash escapes only.
+    while i < n and s[i] != "`":
+        if s[i] == "\\" and i + 1 < n:
+            i += 2
+        else:
+            i += 1
+    if i < n:
+        i += 1
+    return i
+
+
+def _skip_brace_subst(s, i, n):
+    # i points just AFTER `${`. Walks to matching `}` honoring nested
+    # braces and quote-state. Param-expansion defaults can contain
+    # whitespace (e.g. `${VAR:-some default}`), so we must not let an
+    # inner space split the enclosing token.
+    depth = 1
+    while i < n and depth > 0:
+        c = s[i]
+        if c == "{":
+            depth += 1
+            i += 1
+        elif c == "}":
+            depth -= 1
+            i += 1
+        elif c == "'":
+            i += 1
+            while i < n and s[i] != "'":
+                i += 1
+            if i < n:
+                i += 1
+        elif c == '"':
+            i = _skip_dquote(s, i + 1, n)
+        elif c == "\\" and i + 1 < n:
+            i += 2
+        else:
+            i += 1
+    return i
+
+
 def _walk_top_level_tokens(s):
-    # Yield (start, end) byte spans of each whitespace-delimited token in
-    # `s`, treating single-quoted, double-quoted, and backslash-escaped
-    # spans as opaque (so whitespace inside a quoted value does NOT
-    # split the enclosing token). Returning byte spans (not the token
-    # string) lets us preserve the original bytes verbatim — critical
-    # for keeping bash expansions like `$HOME` unquoted in unrelated
-    # env-prefix assignments. (See codex r3 review on PR #776.)
+    # Yield (start, end) byte spans of each whitespace-delimited token
+    # in `s`, treating single-quoted, double-quoted, backslash-escaped,
+    # `$(…)`, backtick `…`, and `${…}` spans as opaque (so whitespace
+    # inside any of these does NOT split the enclosing token).
+    # Returning byte spans (not the token string) lets us preserve the
+    # original bytes verbatim — critical for keeping bash expansions
+    # like `$HOME`, `$(date)`, `${VAR:-x}` unquoted in unrelated
+    # env-prefix assignments. (See codex r2/r3/r4 review on PR #776.)
     i, n = 0, len(s)
     while i < n:
         while i < n and s[i] in (" ", "\t"):
@@ -579,14 +675,13 @@ def _walk_top_level_tokens(s):
                 if i < n:
                     i += 1
             elif c == '"':
-                i += 1
-                while i < n and s[i] != '"':
-                    if s[i] == "\\" and i + 1 < n:
-                        i += 2
-                    else:
-                        i += 1
-                if i < n:
-                    i += 1
+                i = _skip_dquote(s, i + 1, n)
+            elif c == "$" and i + 1 < n and s[i + 1] == "(":
+                i = _skip_paren_subst(s, i + 2, n)
+            elif c == "$" and i + 1 < n and s[i + 1] == "{":
+                i = _skip_brace_subst(s, i + 2, n)
+            elif c == "`":
+                i = _skip_backtick(s, i + 1, n)
             elif c == "\\" and i + 1 < n:
                 i += 2
             else:
