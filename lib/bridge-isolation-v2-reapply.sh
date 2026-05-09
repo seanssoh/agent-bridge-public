@@ -56,7 +56,7 @@
 #   agents/<agent>/.claude/            controller:controller       0700
 #   agents/<agent>/agent-env.sh        controller:ab-agent-<agent> 0640
 #   agents/<agent>/workdir/.teams/.env,
-#     .ms365/.env                      agent:ab-agent-<agent>     0640
+#     .ms365/.env                      agent:ab-agent-<agent>     0660
 #   /home/agent-bridge-<agent>/        agent:agent                u+rwX,go-rwx
 #                                      (no extended POSIX ACL)
 #
@@ -330,13 +330,71 @@ bridge_isolation_v2_reapply_one_agent() {
 
   # Plugin state .env files: present only after a `setup teams` /
   # `setup ms365` round. When absent, do not invent.
+  #
+  # Issue #771 v0.9.5: mode 0660 (group rw) so the controller — a member
+  # of `ab-agent-<X>` per the v2 design contract (lib/bridge-agents.sh:
+  # 3917-3919 comment "v2: no ACL repair retry. The per-agent group +
+  # setgid contract handles controller access") — can read the .env via
+  # the base group bit. Pre-fix mode 0640 + the strip_layout_acls pass
+  # below could leave the file with `group::---` (base group entry
+  # never set) on certain `acl` package builds, blocking the controller
+  # from reading TEAMS_APP_ID / TEAMS_APP_PASSWORD via the channel
+  # readiness probe and surfacing as `creds_status=unreadable`. 0660
+  # asserts the canonical group-readable+writable state explicitly.
   bridge_isolation_v2_reapply_assert \
     "$mode" "$apply" "$actions_file" "$errors_file" \
-    "file" "$agent_root/workdir/.teams/.env" "$os_user:$agent_grp" "0640"
+    "file" "$agent_root/workdir/.teams/.env" "$os_user:$agent_grp" "0660"
 
   bridge_isolation_v2_reapply_assert \
     "$mode" "$apply" "$actions_file" "$errors_file" \
-    "file" "$agent_root/workdir/.ms365/.env" "$os_user:$agent_grp" "0640"
+    "file" "$agent_root/workdir/.ms365/.env" "$os_user:$agent_grp" "0660"
+
+  # Issue #746 (v0.9.3): per-path asserts above only fix the writable-sub
+  # DIRECTORIES themselves (workdir/, runtime/, logs/, etc.) — they do
+  # NOT recurse into the contents. v0.7→v0.8 migrated installs typically
+  # have files inside workdir/ (CLAUDE.md, MEMORY-SCHEMA.md, memory/*,
+  # SOUL.md) carrying pre-isolation owner-group (e.g. controller-user
+  # primary group) that the controller's `ab-agent-<X>` group cannot
+  # read. Without recursive repair, the centralized
+  # `agent-bridge memory rebuild-index` cron sweep keeps failing
+  # PermissionError on workdir/CLAUDE.md every Saturday — the symptom
+  # the operator filed in #746. v0.9.1 #749 added a verify+sudo-retry
+  # to `bridge_isolation_v2_chgrp_setgid_recursive`, but that helper
+  # is only called from `bridge_isolation_v2_migrate_normalize_layout`
+  # (the FULL migration path under the hyphenated `migrate isolation-v2`
+  # CLI), NOT from this reapply tool (the spaced `migrate isolation v2`
+  # CLI which the operator runs in production). Wire the same helper
+  # in here so the repair tool actually repairs workdir contents.
+  if [[ "$apply" == "1" ]]; then
+    local _writable_sub
+    for _writable_sub in home workdir runtime logs requests responses; do
+      [[ -d "$agent_root/$_writable_sub" ]] || continue
+      if bridge_isolation_v2_chgrp_setgid_recursive \
+            "$agent_grp" 2770 0660 "$agent_root/$_writable_sub" 2>/dev/null; then
+        bridge_isolation_v2_reapply_record_action \
+          "$actions_file" "$agent_root/$_writable_sub" \
+          "chgrp_chmod_recursive" "drift|unknown" "$agent_grp 2770/0660" "ok"
+      else
+        bridge_isolation_v2_reapply_record_action \
+          "$actions_file" "$agent_root/$_writable_sub" \
+          "chgrp_chmod_recursive" "drift|unknown" "$agent_grp 2770/0660" \
+          "error:recursive_chgrp_chmod_failed"
+        printf '%s\n' "chgrp/chmod recursive failed: $agent_root/$_writable_sub (need root or passwordless sudo; rerun after addressing)" \
+          >> "$errors_file"
+      fi
+    done
+  else
+    local _writable_sub
+    local _non_apply_status="would"
+    [[ "$mode" == "check" ]] && _non_apply_status="drift"
+    for _writable_sub in home workdir runtime logs requests responses; do
+      [[ -d "$agent_root/$_writable_sub" ]] || continue
+      bridge_isolation_v2_reapply_record_action \
+        "$actions_file" "$agent_root/$_writable_sub" \
+        "chgrp_chmod_recursive" "drift|unknown" "$agent_grp 2770/0660" \
+        "$_non_apply_status"
+    done
+  fi
 
   # Issue #746 (v0.9.3): per-path asserts above only fix the writable-sub
   # DIRECTORIES themselves (workdir/, runtime/, logs/, etc.) — they do
@@ -391,6 +449,103 @@ bridge_isolation_v2_reapply_one_agent() {
   # exception lives outside this tree and is not visited here.
   bridge_isolation_v2_reapply_strip_layout_acls \
     "$mode" "$apply" "$actions_file" "$errors_file" "$agent_root"
+
+  # Issue #771 v0.9.5: regenerate the cached `runtime/agent-env.sh`
+  # (which carries `BRIDGE_AGENT_LAUNCH_CMD[$agent]` for isolated
+  # agents). This file was written ONCE at agent create / v0.7→v0.8
+  # isolate time with the THEN-current paths embedded in the launch
+  # cmd (e.g. `TEAMS_STATE_DIR=$BRIDGE_HOME/agents/<X>/.teams`). After
+  # v2 layout migration moved channel state dirs under `workdir/`
+  # (e.g. `workdir/.teams/`), the cached launch cmd still pointed at
+  # the pre-v2 path → bun teams server.ts started with stale
+  # TEAMS_STATE_DIR → silent exit before bind → operator's #771
+  # symptom (only one of N agents' Teams server LISTEN-ing).
+  #
+  # bridge_write_linux_agent_env_file recomputes the launch cmd from
+  # the LIVE roster + current `bridge_agent_workdir` (which honors
+  # BRIDGE_AGENT_ROOT_V2 + appends `/workdir`), so calling it here
+  # refreshes the cache to v2-correct paths. Skipped on check / dry-
+  # run modes (they only report; mutation belongs to apply). Symlink
+  # rejection is enforced by the writer itself (lib/bridge-agents.sh
+  # `bridge_write_linux_agent_env_file` v0.9.5 r2 hardening —
+  # `runtime/` is agent-UID-writable so a planted symlink could
+  # otherwise corrupt controller-owned files).
+  if [[ "$apply" == "1" ]]; then
+    local _env_file=""
+    local _writer_loaded=0 _path_loaded=0
+    command -v bridge_write_linux_agent_env_file >/dev/null 2>&1 && _writer_loaded=1
+    command -v bridge_agent_linux_env_file >/dev/null 2>&1 && _path_loaded=1
+    if (( _writer_loaded == 0 )) || (( _path_loaded == 0 )); then
+      # r2 codex finding 2: silent skip on missing helper would mask a
+      # real non-fix (load-order regression, fixture isolation). Treat
+      # missing helper as an explicit error so the operator sees that
+      # regen didn't actually run.
+      bridge_isolation_v2_reapply_record_action \
+        "$actions_file" "$agent_root/runtime/agent-env.sh" \
+        "agent_env_regen" "stale" "live-launch-cmd" \
+        "error:helper_not_loaded"
+      printf '%s\n' "agent_env_regen skipped for $agent: bridge_write_linux_agent_env_file or bridge_agent_linux_env_file not loaded (load-order regression?). Stale BRIDGE_AGENT_LAUNCH_CMD remains — channel servers may bind wrong paths." \
+        >> "$errors_file"
+    else
+      _env_file="$(bridge_agent_linux_env_file "$agent" 2>/dev/null || true)"
+      if [[ -n "$_env_file" ]]; then
+        # r2 codex finding 3: idempotency — if the existing file is
+        # not a symlink AND already byte-identical to what the writer
+        # would produce, skip the rewrite to preserve mtime/ctime
+        # ("ok:already-canonical" matches the rest of the reapply tool's
+        # second-invocation contract). Generate to a temp path, cmp
+        # against existing; if same, drop temp and record canonical;
+        # else move temp into place (which the writer will redo
+        # internally — this short-circuit only affects unchanged
+        # cases). We re-use the writer rather than open-coding the
+        # body so future changes to the launch_cmd format propagate.
+        local _tmp_env=""
+        _tmp_env="$(mktemp -t agent-env.regen.XXXXXX 2>/dev/null || true)"
+        if [[ -n "$_tmp_env" ]] \
+            && bridge_write_linux_agent_env_file "$agent" "$_tmp_env" 2>/dev/null; then
+          if [[ -f "$_env_file" && ! -L "$_env_file" ]] \
+              && cmp -s "$_tmp_env" "$_env_file" 2>/dev/null; then
+            rm -f "$_tmp_env"
+            bridge_isolation_v2_reapply_record_action \
+              "$actions_file" "$_env_file" "agent_env_regen" \
+              "stale|unknown" "live-launch-cmd" "ok:already-canonical"
+          else
+            rm -f "$_tmp_env"
+            if bridge_write_linux_agent_env_file "$agent" "$_env_file" 2>/dev/null; then
+              bridge_isolation_v2_reapply_record_action \
+                "$actions_file" "$_env_file" "agent_env_regen" \
+                "stale" "live-launch-cmd" "ok"
+            else
+              bridge_isolation_v2_reapply_record_action \
+                "$actions_file" "$_env_file" "agent_env_regen" \
+                "stale" "live-launch-cmd" "error:write_failed"
+              printf '%s\n' "agent_env_regen failed for $agent: $_env_file (next agent start will use stale BRIDGE_AGENT_LAUNCH_CMD — channel servers may bind wrong paths)" \
+                >> "$errors_file"
+            fi
+          fi
+        else
+          [[ -n "$_tmp_env" ]] && rm -f "$_tmp_env"
+          bridge_isolation_v2_reapply_record_action \
+            "$actions_file" "$_env_file" "agent_env_regen" \
+            "stale" "live-launch-cmd" "error:write_temp_failed"
+          printf '%s\n' "agent_env_regen failed (temp) for $agent: $_env_file" \
+            >> "$errors_file"
+        fi
+      fi
+    fi
+  else
+    local _env_file_dr=""
+    if command -v bridge_agent_linux_env_file >/dev/null 2>&1; then
+      _env_file_dr="$(bridge_agent_linux_env_file "$agent" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_env_file_dr" ]]; then
+      local _env_dr_status="would"
+      [[ "$mode" == "check" ]] && _env_dr_status="drift"
+      bridge_isolation_v2_reapply_record_action \
+        "$actions_file" "$_env_file_dr" "agent_env_regen" \
+        "stale" "live-launch-cmd" "$_env_dr_status"
+    fi
+  fi
 
   # ------------------------------------------------------------------
   # Agent's actual Linux home (`/home/agent-bridge-<agent>/`)
@@ -975,7 +1130,12 @@ v0.7 → v0.8 upgrade drift. Covers:
   - agents/<agent>/agent-env.sh
                             controller:ab-agent-<agent> 0640
   - agents/<agent>/workdir/.teams/.env, .ms365/.env
-                            agent:ab-agent-<agent>     0640  (if present)
+                            agent:ab-agent-<agent>     0660  (if present)
+                            (group rw — controller is a member of
+                            ab-agent-<agent>, the v2 design treats
+                            this as a write-capability group; the
+                            channel readiness probe needs base group
+                            read after `setfacl -bR` strip)
   - agents/<agent>/         strip every named-user/named-group POSIX ACL
   - /home/agent-bridge-<agent>/
                             agent:agent / u+rwX,go-rwx / setfacl -bR
