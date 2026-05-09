@@ -1670,26 +1670,39 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
     bridge_warn "apply_controller_credentials_read_grant: chmod $file_mode on $cred_file failed"
     return 1
   }
-  # r7 codex W1 — strip stale named-user ACL entries before re-granting.
-  # Operator standing policy: only the current agent's named-user grant
-  # exists on the credential. Stale entries from removed/renamed agents
-  # would otherwise leak the credential to whatever UID still owns the
-  # name (or to a re-used UID). Enumerate every existing user:<name>
-  # entry; drop the ones that aren't the current iso_user.
+  # r11 codex catch — strip is roster-aware, not "this agent only".
+  # All isolated agents in the roster need a named-user r-- grant on
+  # the controller's Anthropic credential (per design v2: single
+  # cross-agent shared secret). Strip ONLY entries whose user is not
+  # in the current isolated-agent roster. Previously (r7) the strip
+  # treated every other named-user as stale, so applying agent B
+  # silently revoked agent A's grant.
   if command -v getfacl >/dev/null 2>&1; then
+    local roster_iso_users
+    roster_iso_users=""
+    if command -v bridge_isolation_v2_reapply_eligible_agents >/dev/null 2>&1; then
+      local _ra
+      while IFS= read -r _ra; do
+        [[ -n "$_ra" ]] || continue
+        roster_iso_users+="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${_ra}"$'\n'
+      done < <(bridge_isolation_v2_reapply_eligible_agents 2>/dev/null || true)
+    fi
+    # Always include the current agent (so we never strip ourselves
+    # if the roster lookup is empty in a fresh-install transient).
+    roster_iso_users+="${iso_user}"$'\n'
+
     local existing_named
     existing_named="$(getfacl -p "$cred_file" 2>/dev/null \
-      | awk -F: -v u="$iso_user" \
-          '$1=="user" && $2!="" && $2!=u {print $2}')"
+      | awk -F: '$1=="user" && $2!="" {print $2}')"
     if [[ -n "$existing_named" ]]; then
       local stale
       while IFS= read -r stale; do
         [[ -n "$stale" ]] || continue
-        # r8 codex catch — strip MUST hard fail. Previously a strip
-        # failure (sudo denied, fs locked) was warn-and-continue, which
-        # let the next setfacl -m succeed and apply return 0 with the
-        # stale entry intact. Verify then rejected via (f). That
-        # apply/check asymmetry was the r4/r5/r7 anti-pattern.
+        # Keep if in roster
+        if printf '%s' "$roster_iso_users" | grep -Fxq "$stale"; then
+          continue
+        fi
+        # r8 codex catch — strip MUST hard fail.
         _bridge_isolation_v2_run_root_or_sudo \
           setfacl -x "u:${stale}" "$cred_file" 2>/dev/null || {
             bridge_warn "apply_controller_credentials_read_grant: setfacl -x u:${stale} on $cred_file failed"
@@ -1772,16 +1785,35 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
     | head -n1)"
   [[ "$named_line" == "r--" ]] || return 1
 
-  # (f) operator standing policy: only the current agent's named-user
-  # grant may exist on the credential. Stale entries from removed
-  # agents leak the credential to whatever UID still owns that name
-  # (or to a re-used UID). r7 codex W1 catch — currently a security
-  # debt, not just cleanliness. Reject any named-user entry whose name
-  # is not the current iso_user.
-  local stale_named
-  stale_named="$(printf '%s\n' "$acl_output" \
-    | awk -F: -v u="$iso_user" '$1=="user" && $2!="" && $2!=u {print $2}')"
-  [[ -z "$stale_named" ]] || return 1
+  # (f) operator standing policy: every named-user grant on the
+  # credential must correspond to a current isolated-agent in the
+  # roster. r11 codex catch — earlier r7 enforced "only this agent"
+  # which is wrong for multi-agent: applying agent B's check after
+  # agent A had been granted would reject the current state. Now
+  # accept any user in the roster; reject only entries whose name is
+  # NOT in the roster (stale / orphaned grants).
+  local roster_iso_users
+  roster_iso_users=""
+  if command -v bridge_isolation_v2_reapply_eligible_agents >/dev/null 2>&1; then
+    local _ra
+    while IFS= read -r _ra; do
+      [[ -n "$_ra" ]] || continue
+      roster_iso_users+="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${_ra}"$'\n'
+    done < <(bridge_isolation_v2_reapply_eligible_agents 2>/dev/null || true)
+  fi
+  # Always include the agent being checked.
+  roster_iso_users+="${iso_user}"$'\n'
+
+  local existing_named
+  existing_named="$(printf '%s\n' "$acl_output" \
+    | awk -F: '$1=="user" && $2!="" {print $2}')"
+  if [[ -n "$existing_named" ]]; then
+    local _e
+    while IFS= read -r _e; do
+      [[ -n "$_e" ]] || continue
+      printf '%s' "$roster_iso_users" | grep -Fxq "$_e" || return 1
+    done <<<"$existing_named"
+  fi
 
   # (c) ancestor traversal — every parent back to / must have u:<iso_user>:?-x
   local p
@@ -1814,7 +1846,17 @@ bridge_isolation_v2_write_agent_state_marker() {
     bridge_warn "write_agent_state_marker: agent and marker_name required"
     return 1
   }
-  bridge_isolation_v2_ensure_matrix_path "state-agent-dir" "$agent" 2>/dev/null || true
+  # r11 codex BUG #4 — was `|| true`. Same anti-pattern as the other
+  # apply/check paths: ensure_matrix_path failure was swallowed, so the
+  # subsequent mkdir/write proceeded against a state-dir that may have
+  # wrong group/mode (RC1 cascade), then the marker file inherited
+  # wrong group, then verify rejected. Hard fail propagates to the
+  # daemon writer's caller. Suppress only the per-call stderr because
+  # bridge_warn from inside ensure_matrix_path already logged.
+  bridge_isolation_v2_ensure_matrix_path "state-agent-dir" "$agent" 2>/dev/null || {
+    bridge_warn "write_agent_state_marker: ensure_matrix_path failed for agent=$agent marker=$marker_name"
+    return 1
+  }
   local dir
   dir="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null)" \
     || dir="${BRIDGE_ACTIVE_AGENT_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state/agents}/$agent"
