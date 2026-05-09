@@ -1378,28 +1378,25 @@ bridge_isolation_v2_apply_row() {
 
   case "$mechanism" in
     controller_credential_acl)
-      # RC3 named-user ACL — handled by the dedicated helper that walks
-      # ancestors and sets the file mask. Apply mode delegates; check mode
-      # probes effective access via setfacl/getfacl.
+      # RC3 named-user ACL — agent context is required to verify the
+      # named-user grant and ancestor traversal entries. The orchestrating
+      # caller (apply_grant_matrix_for_agent) routes apply+check directly
+      # through the dedicated helpers below with $agent in scope, so this
+      # branch should be unreachable in normal operation. If a third-party
+      # caller invokes apply_row with no agent context (12th arg),
+      # downgrade to fail-loud — silent ok was the v0.9.5/v0.9.6 RC3
+      # recurrence anti-pattern.
+      local agent_for_rc3="${12:-}"
+      if [[ -z "$agent_for_rc3" ]]; then
+        bridge_warn "apply_row($row_name): controller_credential_acl requires agent context (\$12); refuse to false-pass"
+        return 1
+      fi
       if [[ "$mode" == "apply" ]]; then
-        bridge_isolation_v2_apply_controller_credentials_read_grant \
-          "${row_name#controller-credentials}" 2>/dev/null
-        # The row_name pattern strips the prefix to recover the agent —
-        # but here we don't have the agent in scope; the caller in
-        # apply_grant_matrix_for_agent invokes the helper directly.
-        return 0
+        bridge_isolation_v2_apply_controller_credentials_read_grant "$agent_for_rc3"
+        return $?
       fi
-      # check mode: just confirm the file exists and the mask is r--.
-      [[ -f "$path" ]] || return 1
-      if command -v getfacl >/dev/null 2>&1; then
-        local mask_line
-        mask_line="$(getfacl -p "$path" 2>/dev/null | awk -F: '/^mask::/ {print $3}' | head -n1)"
-        case "$mask_line" in
-          r--|r-x|rw-|rwx) return 0 ;;
-          *) return 1 ;;
-        esac
-      fi
-      return 0
+      bridge_isolation_v2_check_controller_credentials_read_grant "$agent_for_rc3" "$path"
+      return $?
       ;;
     install_managed)
       # Isolated user's own home — touched only by ensure_user_home /
@@ -1531,11 +1528,19 @@ bridge_isolation_v2_apply_grant_matrix_for_agent() {
     # row format: row_name|path|access_type|owner|group|dir_mode|file_mode|setgid|mechanism|criticality|notes
     IFS='|' read -r r_name r_path r_access r_owner r_group r_dmode r_fmode r_setgid r_mech r_crit r_notes <<<"$row"
     local row_rc=0
-    if [[ "$r_mech" == "controller_credential_acl" && "$mode" == "apply" ]]; then
-      # Apply path: route through the dedicated RC3 helper with the agent
-      # in scope (apply_row alone cannot recover agent from row data).
-      bridge_isolation_v2_apply_controller_credentials_read_grant "$agent" \
-        || row_rc=$?
+    if [[ "$r_mech" == "controller_credential_acl" ]]; then
+      # RC3 — apply AND check both routed through dedicated helpers with
+      # the agent in scope. apply_row alone cannot recover agent from row
+      # data and would either false-pass or refuse the row. (r3 codex
+      # catch: previously only the apply branch routed; check fell through
+      # to apply_row which only verified mask::r--.)
+      if [[ "$mode" == "apply" ]]; then
+        bridge_isolation_v2_apply_controller_credentials_read_grant "$agent" \
+          || row_rc=$?
+      else
+        bridge_isolation_v2_check_controller_credentials_read_grant "$agent" "$r_path" \
+          || row_rc=$?
+      fi
     else
       bridge_isolation_v2_apply_row "$mode" \
         "$r_name" "$r_path" "$r_access" "$r_owner" "$r_group" \
@@ -1652,6 +1657,59 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
       bridge_warn "apply_controller_credentials_read_grant: setfacl r-- + m::r-- on $cred_file failed"
       return 1
     }
+  return 0
+}
+
+bridge_isolation_v2_check_controller_credentials_read_grant() {
+  # r3 codex catch — RC3 check must verify ALL THREE of:
+  #   (a) file mask::r-- (or wider)         — was the only check pre-r3
+  #   (b) named-user grant u:<iso_user>:r-- — wipe scenario from v0.9.5/v0.9.6
+  #   (c) ancestor traversal u:<iso_user>:--x on every parent back to /
+  # Without (b) and (c), check could false-pass: mask alone says "ok" while
+  # the named entry is absent (no agent grant) or ancestor `--x` was
+  # stripped (agent can't traverse to reach the file).
+  local agent="$1" path="$2"
+  [[ -n "$agent" && -n "$path" ]] || return 1
+  [[ -f "$path" ]] || return 1
+  command -v getfacl >/dev/null 2>&1 || return 0  # non-Linux host fallback (apply also skips)
+  local iso_user="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}"
+
+  # (a) mask
+  local acl_output mask_line
+  acl_output="$(getfacl -p "$path" 2>/dev/null)"
+  [[ -n "$acl_output" ]] || return 1
+  mask_line="$(printf '%s\n' "$acl_output" | awk -F: '/^mask::/ {print $3}' | head -n1)"
+  case "$mask_line" in
+    r--|r-x|rw-|rwx) : ;;
+    *) return 1 ;;
+  esac
+
+  # (b) named-user grant for this agent's UID
+  local named_line
+  named_line="$(printf '%s\n' "$acl_output" \
+    | awk -F: -v u="$iso_user" '$1=="user" && $2==u {print $3}' \
+    | head -n1)"
+  case "$named_line" in
+    r--|r-x|rw-|rwx) : ;;
+    *) return 1 ;;
+  esac
+
+  # (c) ancestor traversal — every parent back to / must have u:<iso_user>:?-x
+  local p
+  p="$(dirname "$path")"
+  while [[ -n "$p" && "$p" != "/" && "$p" != "." ]]; do
+    local pacl panchor
+    pacl="$(getfacl -p "$p" 2>/dev/null)" || return 1
+    panchor="$(printf '%s\n' "$pacl" \
+      | awk -F: -v u="$iso_user" '$1=="user" && $2==u {print $3}' \
+      | head -n1)"
+    case "$panchor" in
+      *x) : ;;  # any of --x / r-x / -wx / rwx counts as traverse
+      *) return 1 ;;
+    esac
+    p="$(dirname "$p")"
+  done
+
   return 0
 }
 
