@@ -583,35 +583,50 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
     cache_type = "missing"
 
     try:
+        # r2 codex catch — operator's binding principle is per-agent
+        # isolated cache. r1 implementation used symlink to source which
+        # made each agent's distinct cache *path* resolve to the same
+        # *target*: cross-agent interference on writes, modifications
+        # to the source visible to every agent. Replace symlink with
+        # real per-agent directory (overlay copy of source into the
+        # isolated home). Disk overhead 100-300 MB per agent acknowledged
+        # in design v2 §"Per-Agent Cache Tradeoffs".
         if cache_version_path.is_symlink():
-            current_target = cache_version_path.resolve()
-            if current_target == source_path:
-                status = "unchanged"
-            else:
-                cache_version_path.unlink(missing_ok=True)
-                cache_version_path.symlink_to(source_path, target_is_directory=True)
-                status = "updated"
-            cache_type = "symlink"
+            # Migrate any pre-existing symlink (from r1 or v0.9.6 install)
+            # into a real directory. Unlink the symlink, then mkdir +
+            # overlay source so the cache is genuinely per-agent.
+            cache_version_path.unlink(missing_ok=True)
+            plugin_cache_root.mkdir(parents=True, exist_ok=True)
+            cache_version_path.mkdir(parents=False, exist_ok=False)
+            overlay_source_to_cache(source_path, cache_version_path)
+            status = "updated"
+            cache_type = "directory"
+        elif cache_version_path.is_dir():
+            # Already a real per-agent directory. Overlay source files
+            # (except node_modules) so operator edits to source reach
+            # the cache, while preserving the cache's installed
+            # node_modules dir. The source root's node_modules is then
+            # linked back to the cache below.
+            changed = overlay_source_to_cache(source_path, cache_version_path)
+            status = "updated" if changed else "unchanged"
+            cache_type = "directory"
+        elif cache_version_path.exists():
+            # Stray non-directory entry (file, special) — remove and
+            # rebuild as real directory.
+            remove_tree(cache_version_path)
+            plugin_cache_root.mkdir(parents=True, exist_ok=True)
+            cache_version_path.mkdir(parents=False, exist_ok=False)
+            overlay_source_to_cache(source_path, cache_version_path)
+            status = "updated"
+            cache_type = "directory"
         else:
-            if cache_version_path.is_dir():
-                # Real cache directories carry installed dependencies. Overlay source
-                # files (everything except node_modules) so operator edits reach the
-                # cache, while preserving the cache's installed node_modules dir. The
-                # source root's node_modules is then linked back to the cache below.
-                changed = overlay_source_to_cache(source_path, cache_version_path)
-                status = "updated" if changed else "unchanged"
-                cache_type = "directory"
-            elif cache_version_path.exists():
-                remove_tree(cache_version_path)
-                status = "updated"
-                cache_type = "symlink"
-                plugin_cache_root.mkdir(parents=True, exist_ok=True)
-                cache_version_path.symlink_to(source_path, target_is_directory=True)
-            else:
-                status = "linked"
-                cache_type = "symlink"
-                plugin_cache_root.mkdir(parents=True, exist_ok=True)
-                cache_version_path.symlink_to(source_path, target_is_directory=True)
+            # First-time install — create the per-agent directory and
+            # overlay source files into it.
+            plugin_cache_root.mkdir(parents=True, exist_ok=True)
+            cache_version_path.mkdir(parents=False, exist_ok=False)
+            overlay_source_to_cache(source_path, cache_version_path)
+            status = "linked"
+            cache_type = "directory"
     except OSError as exc:
         # Filesystem refused the install action — fail loud, do not
         # fall through to a verified label. RC6 root cause was the
