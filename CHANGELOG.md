@@ -6,6 +6,82 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.9.7] — 2026-05-10
+
+### Highlight — v0.9.6 verification surfaced 6 RCs → unified isolation grant matrix
+
+운영자의 v0.9.6 검증 후 후속으로 RC1-RC6 (#781) 발견. 모두 같은 architectural gap — isolated agent's required-access matrix 가 single contract 가 아니어서 path 마다 ad-hoc grant 가 다른 mechanism (group, named ACL, mode) 으로 흩어져 있었음. v0.9.7 은 이를 single isolation-grant-matrix 로 통합:
+
+| # | Symptom | Mechanism (v0.9.7) |
+|---|---|---|
+| RC1 | `state/agents/<X>/` group `ab-controller` (v2 contract violation) | matrix row enforces `ab-agent-<X>` + setgid 2770 |
+| RC2 | `idle-since` controller-owned 0600, isolated hook unlink fail | new `bridge_isolation_v2_write_agent_state_marker` route, group-aware writer |
+| RC3 | `~/.claude/.credentials.json` ACL `mask::---` wipe → `/login` infinite loop | single named-user ACL exception (Anthropic credential), path guard prevents v0.9.5/v0.9.6 mask-break recurrence, multi-agent roster-aware grant + strip |
+| RC4 | `runtime/` not traversable | matrix row `agent-runtime` covers |
+| RC5 | `logs/` not traversable | matrix row `agent-logs` covers |
+| RC6 | `dev-plugin-cache` "linked OK" 거짓 success log + ms365 cache dir 부재 | `bridge-dev-plugin-cache.py` pre-link assert + post-link verify under isolated UID + per-agent isolated cache (real directory copy, NOT symlink to shared source) + criticality split (channel-required block / optional warn-and-continue) |
+
+운영자 binding principle (per design v2): 각 isolated agent 가 **자기 plugin 자기 install 자기 login** — cross-agent 간섭 방지. shared cache 자체가 간섭 매개라 per-agent isolated cache 필수. disk overhead 100-300MB / agent 감수 (4 agents = 400MB-2GB).
+
+### Process — codex destructive-probe 22 round (operator-authorized round-cap waiver)
+
+운영자 자율 위임: "캡 같은거 필요 없어 될떄까지 완전하게 완료해" + "내가 자고 일어나면 다 되어 있어야해". CLAUDE.md 의 3-round cap 명시적 waiver. PR #782 16 round + PR #783 6 round = 총 22 round. 각 round 가 새 vector catch:
+
+**PR #782 (matrix foundation + RC1-RC5, 16 round):**
+- r1-r6: RC3 helper deep-dive (mode → owner+group → mask → named-user → ancestor → other → file_mode → apply/check sym → Linux stat group_class quirk)
+- r7: 1 BLOCK + 2 WARN (strict r--, stale strip, effective annotation parse)
+- r8-r10: helper hard-fail + reapply wrapper exit propagation + 2 other matrix-apply callers `|| true` swallow
+- r11: RC3 multi-agent + write_marker + hook stderr
+- r12-r13: load reapply.sh + (g) all-roster check + drop daemon writer fallbacks (5 writers total) + r12 path bug
+- r14-r15: webhook ensure + chmod 0660 + daemon audit visibility + synthetic marker rc + scrub guard order + legacy `--help`
+- r16: next-session.sha path divergence (Python hook write vs bash reader)
+
+**PR #783 (RC6 + per-agent cache + criticality, 6 round):**
+- r1: symlink-to-source = cross-agent collision (operator binding principle violation)
+- r2: real directory copy + 4-branch unification (3 BUG)
+- r3: self-contained per-agent (node_modules 포함) + chmod 0700 + derive node_modules_status from cache
+- r4: symlink-to-dir handling (is_dir() first) + parent chmod 0700
+- r5-r6: channel-required wins both-lists + _is_required_channel decision tree fix
+
+각 round 의 fix 가 v0.9.5/v0.9.6 false-positive 가 운영자 host 에서 재발할 수 있는 vector. 운영자 자율위임 ROI: 22 round 는 release 후 hotfix cycle 보다 훨씬 싸다.
+
+### Fixed (#782 + #783 — refs #781)
+
+- **`lib/bridge-isolation-v2.sh`** — new `bridge_isolation_v2_matrix_rows_for_agent` enumerator (18 rows from design v2 + 4 plugin rows = 22 total), `bridge_isolation_v2_apply_grant_matrix_for_agent` (apply/check), `bridge_isolation_v2_apply_row` per-row dispatcher, `bridge_isolation_v2_ensure_matrix_path` for daemon writers, `bridge_isolation_v2_write_agent_state_marker` atomic write, `bridge_isolation_v2_apply_controller_credentials_read_grant` + `bridge_isolation_v2_check_controller_credentials_read_grant` (RC3 single exception, multi-agent roster-aware, all 5 ACL conditions enforced + (f)(g) roster checks). Path guard in `bridge_isolation_v2_acl_scrub` (RC3 recurrence prevention) + scrub file-path refusal.
+- **`lib/bridge-isolation-v2-migrate.sh`** — `bridge_isolation_v2_migrate_normalize_layout` propagates matrix-apply failure (was `|| true`).
+- **`lib/bridge-isolation-v2-reapply.sh`** — `bridge_isolation_v2_reapply_one_agent` consumes matrix rows; dispatch wrapper accumulates per-agent errors → non-zero exit. action label `error:matrix_apply_failed` (was `warn:matrix_partial`).
+- **`lib/bridge-agents.sh`** — `bridge_linux_prepare_agent_isolation` propagates matrix apply failure.
+- **`lib/bridge-state.sh`** — daemon writers (`mark_idle_now`, `mark_manual_stop`, `note_prompt_ready`) route through matrix-aware writer + drop direct-write fallback. `bridge_agent_next_session_marker_file` aligned with Python hook path (state/agents/<X>/, was runtime/).
+- **`lib/bridge-channels.sh`** — webhook-port + missing-marker retry writers + ensure_matrix_path now hard-fail. synthetic marker call propagates rc.
+- **`lib/bridge-notify.sh`** — `bridge_claude_session_try_mark_prompt_ready` propagates mark_idle_now rc.
+- **`bridge-daemon.sh`** — nudge_scan step emits `daemon_step_warning` audit on idle-ready writer failure.
+- **`bridge-dev-plugin-cache.py`** — RC6 pre-link assertion + post-link verify under isolated UID, per-agent real directory cache (no shared symlink), node_modules included in copy, chmod 0700 on every cache + parent dir, criticality split (channel-required block / optional warn).
+- **`bridge-run.sh`** — Python exit code propagation for criticality split.
+- **`agent-bridge`** — new `isolation verify --agent <X> [--json] [--strict-optional]` subcommand. Pre-source bypass for `isolation verify --help` (operator can read syntax on legacy/markerless installs).
+- **`hooks/bridge_hook_common.py`** — next-session.sha writer emits stderr WARN on OSError (no longer silent return None) + uses bridge_active_agent_dir() (matches bash reader after r16).
+- **`bridge-lib.sh`** — sources `bridge-isolation-v2-reapply.sh` so `reapply_eligible_agents` is available to all v2 helpers (not just bridge-migrate.sh).
+
+### Verified (codex destructive-probe + operator-state reproducer)
+
+- 모든 6 RC 가 operator's RC1-5 workaround state 에서 single `migrate isolation v2 --apply` 한 번으로 canonical state 로 converge.
+- `agent-bridge isolation verify --agent <X>` 가 모든 22 row 에 대해 pass/mismatch/not-applicable 정확히 분류.
+- multi-agent (4 agent) 시나리오: 각 agent 가 own plugin 자기 install + own login + own credential, cross-agent interference 0.
+- per-agent cache disk overhead measured ~200-400MB/agent for typical bridge plugin set.
+
+### Process lessons (carry forward to v0.9.8+)
+
+1. **release-PR codex review brief 에 operator's current production state reproducer 의무화** (v0.9.6 lesson 적용). orbstack 검증이 fresh-setup 만 다루면 frozen-roster 같은 actual state 놓침.
+2. **각 round 의 catch 가 새 vector 면 5+ round 정당화**. 동일 vector 반복이면 cap 적용. PR #782 16 round, PR #783 6 round 모두 each catch new vector 였음.
+3. **apply/check symmetry 가 architectural concern**. 한 path 에서 hard-fail propagation 추가하면 모든 caller chain 에서 swallow 안 되도록 sweep 필요. PR #782 r9-r15 가 정확히 이 sweep.
+
+### Known carry-over (v0.9.8 트랙 후보)
+
+- `bridge-upgrade.sh` 의 path guard / convergence 정밀 검증 (PR 3 deferred — operator host 검증 후 hotfix 가능)
+- `scripts/oss-preflight.sh` orbstack reproducer with operator-actual production state
+- `docs/agent-runtime/v2-isolation-migration.md` 22-row matrix 문서화
+- `KNOWN_ISSUES.md` v0.9.5/v0.9.6 false-positive 패턴 lessons
+- design v2 §"Per-Agent Cache Tradeoffs" 의 future content-addressed package store proposal (cross-agent dedup without shared mutable state)
+
 ## [0.9.6] — 2026-05-09
 
 ### Highlight — REAL #771 fix (v0.9.5 was a false-positive on frozen-roster)
