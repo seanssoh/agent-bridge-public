@@ -412,7 +412,22 @@ def _stamp_next_session_delivered(agent: str, next_session: Path) -> str | None:
         # being applied at start time.
         marker_file.parent.mkdir(parents=True, exist_ok=True)
         marker_file.write_text(digest, encoding="utf-8")
-    except OSError:
+    except OSError as exc:
+        # r11 codex BUG #5 — EACCES (and other OSError variants) was
+        # silently returning None. The hook is a hot-path (runs on every
+        # prompt) so raising would spam, but completely silencing made
+        # it impossible to detect when the matrix's state-agent-dir
+        # grant was missing. Emit a one-line stderr warning so operator
+        # sees the failure mode in the session output AND the daemon
+        # log, then return None to keep the prompt usable.
+        try:
+            sys.stderr.write(
+                "[bridge-hook] WARNING: cannot write next-session.sha at "
+                f"{marker_file}: {exc.__class__.__name__}: {exc}\n"
+            )
+            sys.stderr.flush()
+        except Exception:
+            pass
         return None
     return digest
 
