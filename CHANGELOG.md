@@ -6,6 +6,55 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.9.4] — 2026-05-09
+
+### Highlight — v0.9.3 regression fix (chgrp_setgid_recursive 가 plugin script exec bit 죽임)
+
+`v0.9.4` 는 v0.9.3 PR #768 가 도입한 destructive 회귀를 종결한다. v0.9.3 의 `bridge_isolation_v2_chgrp_setgid_recursive` 의 file_mode=0660 blanket chmod 가 `agents/<X>/home/.claude/plugins/cache/.../scripts/*.sh` (originally 0750) 의 exec bit 를 죽여서 SessionStart hook fail (`crm-mcp-token-sync.sh: Permission denied`) 발화. 운영자가 v0.9.3 적용 직후 발견 후 `chmod g+rx` 워크어라운드로 unblock. v0.9.4 가 helper 자체의 destructive contract 를 수정해서 워크어라운드 불필요화.
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.9.x isolation-v2 layout / contract 변경 없음.
+
+### Process change — release 전 orbstack Linux 검증 의무화
+
+이번 v0.9.4 가 처음으로 **release 머지 전 orbstack Oracle Linux 9 VM 에서 end-to-end 재현 + fix 검증** 을 거쳤다. 이전 v0.9.1/v0.9.2/v0.9.3 가 모두 darwin tempdir 만 보고 release 했고 그 결과 release 후 운영 호스트에서 회귀가 처음 발견되는 패턴이 반복됨. v0.9.4 부터:
+- isolation/migrate/upgrade path 만지는 변경은 orbstack VM 검증 의무
+- codex review brief 에 destructive-change probe (executable / setuid-setgid / symlink / xattr 영향) 항목 추가
+- helper 함수의 implicit destructive contract 는 caller 마다 trace 후 호출 사이트 영향 명시
+
+### Fixed (#770 — refs #746, refs #768)
+
+- `lib/bridge-isolation-v2.sh:bridge_isolation_v2_chgrp_setgid_recursive` 가 file 의 mode 를 numeric `chmod $file_mode` (e.g. literal 0660) 로 blanket 적용하던 destructive contract 를 `X` (uppercase, "x only if dir or already has any exec") 활용한 symbolic chmod 로 교체. translation table:
+
+  | numeric | symbolic |
+  |---|---|
+  | 0660 | `u-s,g-s,g+rwX,o-rwx` |
+  | 0640 | `u-s,g-s,g+rX,g-w,o-rwx` |
+  | 0600 | `u-s,g-s,g-rwx,o-rwx` |
+
+  `u-s,g-s` 는 정규 file 에서 setuid/setgid bit 명시적 제거 (privilege escalation 표면 방어 — codex r2 catch). user perm 미변경 (file owner = agent UID 가 이미 rw 보장). dir 은 literal numeric `dir_mode` 그대로 (e.g. 2770 의 setgid 는 의도적 — 신규 file group 상속).
+
+- `lib/bridge-isolation-v2.sh:bridge_isolation_v2_verify_chgrp_setgid_recursive` 의 file mode sample 검사를 mask `& 0666` 로 변경 — exec-aware. 이전엔 exec-preserved file (e.g. 0770) 이 expected file_mode (0660) 와 mismatch → return 1 → caller 에 false-positive (codex r1 catch). masked 비교는 "did chmod run at all" 의 rw bit 검증을 유지하면서 exec bit 보존을 허용.
+
+### Verified on Linux (orbstack Oracle Linux 9)
+
+| File | Original | After v0.9.3 (regression) | After v0.9.4 (fixed) |
+|---|---|---|---|
+| Plugin script | 0750 | **0660 NOT-EXECUTABLE** | **0770 EXECUTABLE** ✓ |
+| CLAUDE.md | 0640 | 0660 | 0660 |
+| MEMORY-SCHEMA | 0600 | 0660 | 0660 |
+| Setuid file | 4640 | (untested) | **0660 STRIPPED** ✓ |
+| Setgid file | 2640 | (untested) | **0660 STRIPPED** ✓ |
+| verify rc | (always 1 with exec files) | 1 false-positive | **0** ✓ |
+
+### Known carry-over (v0.9.5 트랙 후보)
+
+- **#772** Stop hook → agent-bridge CLI → `mkdir BRIDGE_STATE_DIR` denied (운영자 격리 user uid). non-blocking 이지만 stderr spam (stop 사이클당 3회 이상). 같은 isolation-v2 perm 클래스, 다른 surface (hook layer).
+- **#771** Teams plugin server N-of-1 spawn — 4 에이전트 등록인데 1개만 LISTEN. 운영자의 sales_sean / dev_mun / sales_choi Teams 메시지 silent drop. (channel layer)
+- **#767** daemon inbox-nudge 폭주 (no dedup, no busy-aware gate). transcript 오염, 기능 차단 없음. (daemon scheduler layer)
+- v0.9.3 발견 회귀 #B (creds.json ACL mask `---`) + #C (state/agents/<X>/ mode 2750) — root cause 미확정, v0.9.3 patch scope 외. 운영자 워크어라운드로 unblock 상태.
+
+이상 4건 모두 v0.9.5 사이클에서 동일한 process (orbstack 재현 → 정밀 fix → 검증) 로 처리.
+
 ## [0.9.3] — 2026-05-09
 
 ### Highlight — REAL #746 fix (the v0.9.1 / v0.9.2 attempts hit the wrong code path)
