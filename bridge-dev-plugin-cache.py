@@ -822,12 +822,16 @@ def main(argv: list[str] | None = None) -> int:
     root = Path(args.root).expanduser().resolve()
     required_set = set(normalize_channels(args.required_channels))
     optional_set = set(normalize_channels(args.optional_channels))
-    # Optional always wins over required when an entry appears in both
-    # (operator listed the same plugin in BRIDGE_AGENT_CHANNELS and
-    # BRIDGE_AGENT_PLUGINS — treat the more lenient declaration as the
-    # binding one, since the operator explicitly opted into the
-    # warn-and-continue mode for that plugin).
-    required_set -= optional_set
+    # r5 codex catch (BLOCKING) — channel-required wins over optional
+    # when a plugin appears in BOTH lists. The earlier ordering had
+    # optional winning, which violated the original PR 2 spec
+    # ("channel-required = block, optional = warn+continue; both lists
+    # = channel-required is critical path"). Channel membership
+    # (BRIDGE_AGENT_CHANNELS=plugin:teams) means messages flow through
+    # that plugin — silently launching without it kills inbound
+    # delivery. Subtract required from optional so that any overlap
+    # is treated as channel-required.
+    optional_set -= required_set
     agent_label = args.agent or "-"
 
     results = [
@@ -842,10 +846,17 @@ def main(argv: list[str] | None = None) -> int:
     for item in results:
         channel = item.get("channel", "")
         status = item.get("status", "unknown")
-        if channel in optional_set:
-            criticality = "optional"
-        elif _is_required_channel(channel, required_set):
+        # r5 — channel-required check FIRST so a plugin that appears
+        # in both BRIDGE_AGENT_CHANNELS and BRIDGE_AGENT_PLUGINS is
+        # classified as channel-required (the criticality that means
+        # block-on-failure). Subtraction above already removed the
+        # overlap from optional_set, but order the explicit check
+        # defensively so future changes to set semantics don't flip
+        # the contract.
+        if _is_required_channel(channel, required_set):
             criticality = "channel-required"
+        elif channel in optional_set:
+            criticality = "optional"
         else:
             criticality = "optional"
         item["criticality"] = criticality
