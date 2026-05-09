@@ -6,6 +6,55 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.9.5] — 2026-05-09
+
+### Highlight — #771 Teams server N-of-1 spawn 종결 + writer symlink hardening
+
+`v0.9.5` 는 운영자가 #771 로 보고한 "isolated Teams plugin server 가 4 에이전트 중 1명 (mgt_ahn) 만 LISTEN" 증상의 두 root cause 를 함께 fix. 운영자의 R3+R4 진단으로 확정된 dispatch 경로 분기: `agent-bridge migrate isolation v2 --apply` (공백, repair tool) 가 `bridge_isolation_v2_reapply_one_agent` 로 라우팅되며 이 함수의 두 결함이 결합:
+
+1. **stale `runtime/agent-env.sh`**: isolated agent 의 cached `BRIDGE_AGENT_LAUNCH_CMD[$agent]` 가 v0.7→v0.8 isolate 시점에 한 번 작성되고 이후 regenerate 안 됨. 거기 박힌 `TEAMS_STATE_DIR=…/agents/<X>/.teams` 가 v2 layout 이후 (`/workdir/.teams`) 와 불일치 → 매 restart 마다 stale path 주입 → bun teams server.ts silent-exit before bind → `ss -tln :3980` 에 LISTEN 없음 → router proxy "Unable to connect" 반복 → Sean 메시지 silent drop. 비isolated mgt_ahn 는 daemon 의 live launch_cmd 계산 path 라 영향 없음 = 4 에이전트 중 1명만 살아있던 이유.
+
+2. **channel `.env` mode 0640**: `setfacl -bR` strip 후 `group::---` 잔존 가능 (특정 `acl` 패키지 빌드) → controller 가 base group bit 로 read 불가 → `creds_status=unreadable` → channel readiness probe fail. v2 design contract (lib/bridge-agents.sh:3917-3919 주석: "v2: no ACL repair retry. The per-agent group + setgid contract handles controller access") 가 명시한 group rw 와 불일치.
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.9.x layout/contract 변경 없음. 운영자 호스트에서 #771 본 적 있다면 v0.9.5 적용 후 `migrate isolation v2 --apply` + agent restart 한 번 으로 자동 회복.
+
+### Process — orbstack Linux end-to-end 검증 + codex destructive-probe 3 라운드
+
+이번 release 는 v0.9.4 의 process commitment ("isolation/migrate/upgrade path 만지는 release 는 orbstack Linux 검증 의무") 두 번째 적용. PR #774 의 codex review 가 destructive-probe brief 로 3 라운드:
+- r1: 4 finding 잡음 (HIGH security symlink attack, MED helper-not-loaded silent skip, LOW idempotency, style nit)
+- r2: r2 fix 적용 + Finding 1 의 partial gap (rm-survives) 추가 catch
+- r3: r3 fix 적용 + 6/6 PASS implement-ok
+
+각 라운드의 fix 모두 orbstack Oracle Linux 9 VM 에서 실측 검증. 운영 호스트로 release 가기 전 코드 결함을 사전 차단.
+
+### Fixed (#774 — refs #771)
+
+- `lib/bridge-isolation-v2-reapply.sh:bridge_isolation_v2_reapply_one_agent` 가 recursive perm walk + ACL strip 직후 `bridge_write_linux_agent_env_file "$agent" "$_env_file"` 호출 추가. writer 가 live roster + 현재 `bridge_agent_workdir` (BRIDGE_AGENT_ROOT_V2 honor + `/workdir` append) 로 launch_cmd 재계산해서 cached `BRIDGE_AGENT_LAUNCH_CMD` refresh. mktemp + cmp short-circuit 으로 stable content 시 mtime/ctime 보존 (action row `ok:already-canonical`). helper-not-loaded 시 explicit `error:helper_not_loaded` action row + errors_file append (load-order regression visibility).
+
+- channel `.env` per-path assert mode 0640 → 0660 (`workdir/.teams/.env`, `workdir/.ms365/.env`). v2 design contract 의 group rw 명시. doc table (lib/bridge-isolation-v2-reapply.sh:57-59 + 1085-1090) 동기화.
+
+### Hardening (#774, security — defense in depth)
+
+- `lib/bridge-agents.sh:bridge_write_linux_agent_env_file` 가 `cat >"$file"` redirect 직전 `[[ -L "$file" ]]` 체크 추가. 발견 시 `bridge_linux_sudo_root rm -f` (또는 plain rm) 로 symlink 제거. **post-rm verify 후 symlink 가 살아남았으면** (sudo unavailable / parent dir unwritable) `bridge_warn` + `return 1` — 절대 redirect write 통과 안 함. 이전엔 `[[ -O "$file" ]]` 가 link target (controller-owned) 으로 follow 되어 rm branch skip → cat 이 link 통해 controller 파일 (e.g. `~/.claude/.credentials.json`, 다른 agent env) 덮어쓰는 vector 존재. v0.9.5 의 새 reapply regen call 이 이 vector 노출시켰을 것이라 예방적 fix. 모든 writer caller 가 혜택 (defense in depth).
+
+### Verified on Linux (orbstack Oracle Linux 9)
+
+| Test case | Original | Without fix | With v0.9.5 fix |
+|---|---|---|---|
+| Symlink at runtime/agent-env.sh → target | target=PROTECTED | target overwritten by cat | **target=PROTECTED ✓** |
+| Symlink survives rm (parent dir 0500) | symlink intact | cat through link | **rc=1, bridge_warn, target intact ✓** |
+| stale TEAMS_STATE_DIR (pre-v2 path) | `…/agents/<X>/.teams` | restart inject stale | **regen → `…/workdir/.teams` ✓** |
+| .env post-strip group bit | `group::---` | controller unreadable | **group rw (mode 0660) ✓** |
+
+### Known carry-over (v0.9.6 트랙 후보)
+
+- **#772** Stop hook → agent-bridge CLI → mkdir BRIDGE_STATE_DIR denied (isolated uid). non-blocking 이지만 stderr spam.
+- **#767** daemon inbox-nudge 폭주 (no dedup, no busy-aware gate).
+- **runtime_ready false-positive**: bridge_agent_channel_runtime_ready_for_item 이 file/key presence 만 체크, 실제 server LISTEN 안 봄. Fix 1+2 가 server bind 정상화하면 자연 해소되지만 detect-future-failure 위해 LISTEN check 추가는 별도 enhancement.
+- v0.9.3 residual #B (creds.json ACL mask `---`) + #C (state/agents/<X>/ mode 2750) — root cause 미확정.
+
+이상 4건 모두 v0.9.6 사이클에서 같은 process (orbstack 재현 → 정밀 fix → codex destructive-probe → release).
+
 ## [0.9.4] — 2026-05-09
 
 ### Highlight — v0.9.3 regression fix (chgrp_setgid_recursive 가 plugin script exec bit 죽임)
