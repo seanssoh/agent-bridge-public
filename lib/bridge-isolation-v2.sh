@@ -694,6 +694,43 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
     bridge_warn "chgrp_setgid_recursive: not a directory: $root"
     return 1
   }
+  # Issue #746 v0.9.4 followup: translate the numeric file_mode into a
+  # symbolic chmod that PRESERVES executable bits via `X` (uppercase).
+  # Background: v0.9.3 PR #768 wired this helper into the spaced-CLI
+  # repair tool (reapply_one_agent), which iterates `agents/<X>/home/`
+  # — that tree contains executable plugin scripts (e.g.
+  # `.claude/plugins/cache/<...>/scripts/*.sh` at 0750). The previous
+  # blanket `chmod 0660` on every file killed those exec bits and broke
+  # SessionStart hooks (`crm-mcp-token-sync.sh: Permission denied`) on
+  # the operator's production host. Symbolic mode with `X` adds group
+  # exec only when the file already has any exec bit (or is a dir),
+  # leaving textfiles at g+rw and scripts at g+rwx.
+  #
+  # User permissions are intentionally NOT touched — the file owner
+  # (agent UID) already has rw on its own files; we only assert the
+  # group + other invariants the v2 contract requires.
+  local _file_chmod_symbolic
+  # `u-s,g-s` explicitly strips any pre-existing setuid/setgid bits on
+  # regular files. Files in agents/<X>/{home,workdir,...} should never
+  # carry setuid/setgid (privilege escalation surface); strip them
+  # defensively as part of the canonical-state assertion. Dirs are
+  # handled by the literal `dir_mode` chmod above (e.g. 2770 INCLUDES
+  # the setgid bit, which is intentional — newly-created files inherit
+  # the group). The verify helper masks special bits when comparing
+  # file modes (line ~852), so without explicit strip a stray setuid
+  # bit could survive and verify as clean. r2 codex catch.
+  case "${file_mode#0}" in
+    660) _file_chmod_symbolic='u-s,g-s,g+rwX,o-rwx' ;;
+    640) _file_chmod_symbolic='u-s,g-s,g+rX,g-w,o-rwx' ;;
+    600) _file_chmod_symbolic='u-s,g-s,g-rwx,o-rwx' ;;
+    *)
+      # Unknown literal mode — fall back to the original blanket chmod
+      # so callers using novel modes get the legacy behavior. Future
+      # additions to the cases above should match the v2 contract surface.
+      _file_chmod_symbolic="$file_mode"
+      ;;
+  esac
+
   # `chgrp -R` follows symlinks on BSD/macOS by default while GNU
   # coreutils does not, so a symlink-to-directory inside $root could
   # lead the chown out of the tree on macOS. Restrict the recursion
@@ -703,7 +740,7 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type d -exec chgrp "$group" {} + || return 1
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type f -exec chgrp "$group" {} + || return 1
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type d -exec chmod "$dir_mode" {} + || return 1
-  _bridge_isolation_v2_run_root_or_sudo find "$root" -type f -exec chmod "$file_mode" {} + || return 1
+  _bridge_isolation_v2_run_root_or_sudo find "$root" -type f -exec chmod "$_file_chmod_symbolic" {} + || return 1
 
   # Self-verify: catches the symptom from issue #746 where the
   # direct-first path returns 0 with no actual mutations (e.g. find
@@ -711,6 +748,18 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
   # builds, or the sudo path silently degraded). Without this, the
   # migrator advances the v2 marker on a half-repaired tree and the
   # controller-group read sweep keeps failing every Saturday.
+  #
+  # Note (v0.9.4 followup): the verify helper takes the original numeric
+  # file_mode but only sample-checks ONE file's mode. With the new
+  # exec-preserving symbolic chmod, an executable file's post-chmod
+  # mode will not match `file_mode` exactly (it'll have the +x bit on).
+  # The verify check is best-effort and the verify failure here is
+  # primarily about catching wrong-group (which the symbolic chmod
+  # doesn't affect). On a sample mode mismatch the helper still emits
+  # a bridge_warn but the operator's centralized read access (the
+  # actual #746 contract) is still satisfied because group + base mode
+  # is correct. A future cleanup could make verify aware of symbolic
+  # modes, but it's not required for the #746 contract.
   if ! bridge_isolation_v2_verify_chgrp_setgid_recursive \
         "$group" "$dir_mode" "$file_mode" "$root"; then
     # Drift detected. Retry with sudo-only (skip direct-first), in case
@@ -722,7 +771,7 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
       sudo -n find "$root" -type d -exec chgrp "$group" {} + 2>/dev/null || true
       sudo -n find "$root" -type f -exec chgrp "$group" {} + 2>/dev/null || true
       sudo -n find "$root" -type d -exec chmod "$dir_mode" {} + 2>/dev/null || true
-      sudo -n find "$root" -type f -exec chmod "$file_mode" {} + 2>/dev/null || true
+      sudo -n find "$root" -type f -exec chmod "$_file_chmod_symbolic" {} + 2>/dev/null || true
     fi
     if ! bridge_isolation_v2_verify_chgrp_setgid_recursive \
           "$group" "$dir_mode" "$file_mode" "$root"; then
@@ -796,8 +845,22 @@ bridge_isolation_v2_verify_chgrp_setgid_recursive() {
     actual_mode="$(stat "${stat_fmt[@]}" "$sample_file" 2>/dev/null || true)"
     if [[ -n "$actual_mode" ]]; then
       normalized_actual="$(printf '%04o' "$((8#$actual_mode))" 2>/dev/null || printf '%s' "$actual_mode")"
-      if [[ "$normalized_actual" != "$exp_file_mode" ]]; then
-        bridge_warn "verify_chgrp_setgid_recursive: file mode mismatch at $sample_file (expected=$exp_file_mode actual=$normalized_actual)"
+      # Issue #746 v0.9.4 followup: chgrp_setgid_recursive uses
+      # exec-preserving symbolic chmod on files (g+rwX,o-rwx), so an
+      # originally-executable file (e.g. plugin script 0750) lands at
+      # 0770 post-fix while the caller still passes the canonical
+      # numeric file_mode (0660) as the verify target. Compare only
+      # the rw bits (0666 mask) so the verify is exec-aware: it still
+      # catches "didn't chmod at all" (rw bits would be wrong) but
+      # tolerates the preserved exec bit. Sticky/setgid/setuid not
+      # expected on regular files; if they appear we'd want to flag,
+      # but the existing helper doesn't set them either, so masking
+      # them out here is consistent with the chmod target.
+      local masked_actual masked_expected
+      masked_actual="$(printf '%04o' $(( 8#$normalized_actual & 8#0666 )) 2>/dev/null || printf '%s' "$normalized_actual")"
+      masked_expected="$(printf '%04o' $(( 8#$exp_file_mode & 8#0666 )) 2>/dev/null || printf '%s' "$exp_file_mode")"
+      if [[ "$masked_actual" != "$masked_expected" ]]; then
+        bridge_warn "verify_chgrp_setgid_recursive: file mode (rw bits) mismatch at $sample_file (expected_rw=$masked_expected actual_full=$normalized_actual)"
         return 1
       fi
     fi
