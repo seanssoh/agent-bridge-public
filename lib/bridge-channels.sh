@@ -187,6 +187,16 @@ bridge_allocate_dynamic_webhook_port() {
   trap 'rmdir "$lock_dir" >/dev/null 2>&1 || true' RETURN
 
   port_file="$(bridge_agent_webhook_port_file "$agent")"
+  # v0.9.7 (refs #781 RC2): ensure the per-agent state leaf is canonical
+  # (group ab-agent-<X>, 2770, setgid) before writing webhook-port. The
+  # daemon writes this file on behalf of the isolated UID; without the
+  # matrix grant the file lands as ec2-user:ab-controller 0644 and the
+  # isolated UID may need to re-read it through the leaf.
+  if command -v bridge_isolation_v2_ensure_matrix_path >/dev/null 2>&1 \
+      && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+      && bridge_isolation_v2_active 2>/dev/null; then
+    bridge_isolation_v2_ensure_matrix_path "state-agent-dir" "$agent" >/dev/null 2>&1 || true
+  fi
   mkdir -p "$(dirname "$port_file")"
   if [[ -f "$port_file" ]]; then
     port="$(<"$port_file")"
@@ -206,7 +216,14 @@ bridge_allocate_dynamic_webhook_port() {
     if ! bridge_webhook_port_is_available "$port"; then
       continue
     fi
-    printf '%s\n' "$port" >"$port_file"
+    if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
+        && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+        && bridge_isolation_v2_active 2>/dev/null; then
+      bridge_isolation_v2_write_agent_state_marker "$agent" "webhook-port" "$port" \
+        || printf '%s\n' "$port" >"$port_file"
+    else
+      printf '%s\n' "$port" >"$port_file"
+    fi
     printf '%s' "$port"
     return 0
   done
@@ -412,8 +429,20 @@ bridge_write_idle_ready_agents() {
                 --detail session="$session" 2>/dev/null || true
               bridge_warn "missing idle-since marker for '$agent' after ${retries} probe failures; synthesized current-timestamp marker so nudge dispatch can resume (issue #629)"
             else
-              mkdir -p "$(bridge_agent_idle_marker_dir "$agent")"
-              printf '%s\n' "$retries" >"$retries_file"
+              # v0.9.7 RC2 (refs #781): write retries via the matrix-aware
+              # marker writer so the per-agent state leaf inherits the
+              # canonical ab-agent-<X> 2770 contract. Falls back to plain
+              # mkdir/redirect when the matrix helper isn't loaded.
+              if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
+                  && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+                  && bridge_isolation_v2_active 2>/dev/null; then
+                bridge_isolation_v2_write_agent_state_marker \
+                  "$agent" "missing-marker-retries" "$retries" \
+                  || { mkdir -p "$(bridge_agent_idle_marker_dir "$agent")"; printf '%s\n' "$retries" >"$retries_file"; }
+              else
+                mkdir -p "$(bridge_agent_idle_marker_dir "$agent")"
+                printf '%s\n' "$retries" >"$retries_file"
+              fi
               continue
             fi
           fi

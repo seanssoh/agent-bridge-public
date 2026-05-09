@@ -872,6 +872,35 @@ bridge_isolation_v2_verify_chgrp_setgid_recursive() {
 # 4b. ACL scrub — strip pre-v2 ACL entries before the chmod pass
 # ---------------------------------------------------------------------------
 
+bridge_isolation_v2_acl_scrub_path_allowed() {
+  # Returns 0 when the given root is inside an allow-list:
+  #   - $BRIDGE_DATA_ROOT/ (any subtree of the v2 data root)
+  #   - $BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT/agent-bridge-*  (per-agent home)
+  # Returns 1 for anything else, in particular the controller's home.
+  #
+  # Both target and the allow-list roots are passed through `cd -P`/`pwd -P`
+  # so symlinked prefixes (e.g. macOS `/tmp -> /private/tmp`) compare cleanly.
+  local target="$1"
+  [[ -n "$target" ]] || return 1
+  local target_abs
+  target_abs="$(cd -P "$target" 2>/dev/null && pwd -P)" || target_abs="$target"
+  local dr="${BRIDGE_DATA_ROOT:-}"
+  if [[ -n "$dr" ]]; then
+    local dr_abs
+    dr_abs="$(cd -P "$dr" 2>/dev/null && pwd -P)" || dr_abs="$dr"
+    case "$target_abs" in
+      "$dr_abs"|"$dr_abs"/*) return 0 ;;
+    esac
+  fi
+  local iso_root="${BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT:-/home}"
+  local iso_abs
+  iso_abs="$(cd -P "$iso_root" 2>/dev/null && pwd -P)" || iso_abs="$iso_root"
+  case "$target_abs" in
+    "$iso_abs"/agent-bridge-*) return 0 ;;
+  esac
+  return 1
+}
+
 bridge_isolation_v2_acl_scrub() {
   # Recursively remove every named ACL entry on the tree. Required by the
   # migration tool: pre-v2 (v1) installs left ACLs on agent paths that
@@ -897,6 +926,16 @@ bridge_isolation_v2_acl_scrub() {
     return 1
   }
   [[ -d "$root" ]] || return 0
+  # RC3 recurrence prevention (refs #781): refuse any root that lives
+  # outside the v2 data root or an isolated agent's private home.
+  # Without this guard, a misrouted scrub against the controller's
+  # `~/.claude/` would wipe the named-user ACL mask we deliberately
+  # apply on `.credentials.json` (the only sanctioned named-user
+  # exception), reproducing the v0.9.5/v0.9.6 `/login` infinite loop.
+  if ! bridge_isolation_v2_acl_scrub_path_allowed "$root"; then
+    bridge_warn "acl_scrub: refusing path outside BRIDGE_DATA_ROOT or /home/agent-bridge-* (controller credential ACL guard, refs #781): $root"
+    return 1
+  fi
   local _scrub_err _rc
   _scrub_err="$(mktemp 2>/dev/null || printf '/dev/null')"
   if [[ "$(uname)" == "Darwin" ]]; then
@@ -1174,6 +1213,470 @@ bridge_isolation_v2_launchd_restore_if_needed() {
   [[ -f "$restore_file" ]] || return 0
   bridge_warn "launchd: detected stale unload from prior run - restoring before retry"
   bridge_isolation_v2_launchd_bootstrap
+}
+
+# ---------------------------------------------------------------------------
+# 6c. isolation grant matrix — single contract for migrate/prepare/reapply/verify
+# ---------------------------------------------------------------------------
+#
+# v0.9.7 (refs #781): every required-access path for an isolated agent is now
+# enumerated in one matrix. Migration, prepare, reapply, daemon writers, and
+# the new `agent-bridge isolation verify` CLI all consume the same matrix
+# rows so a fix at one site cannot leave the next required path unverified.
+# See docs/agent-runtime/v2-isolation-grant-matrix.md (PR 3) for the design
+# rationale and the row-by-row breakdown.
+#
+# Row schema (one TSV per matrix entry — pipe-delimited because TSV columns
+# contain spaces in `notes`):
+#   row_name|path|access_type|owner|group|dir_mode|file_mode|setgid|grant_mechanism|criticality|notes
+#
+# Field meaning:
+#   row_name        stable identifier so callers can ensure_matrix_path by name
+#   path            absolute path with `<X>` already substituted for the agent
+#   access_type     dir | file | dir_only_traverse — verifier picks probes
+#   owner           expected owner (`controller` token resolved at apply time)
+#   group           expected group (`ab-agent-<X>`, `ab-shared`, `ab-controller`)
+#   dir_mode        for `access_type=dir`/`dir_only_traverse`, the directory mode
+#   file_mode       for `access_type=file`, the file mode (or '' if not file)
+#   setgid          1 when the dir mode includes the setgid bit, 0 otherwise
+#   grant_mechanism group_setgid | controller_credential_acl | install_managed
+#   criticality     required | optional | not-applicable (PR 1 has only required)
+#   notes           short human reference for the verify CLI's suggested_fix
+#
+# Out-of-scope for PR 1 (RC6 per-agent plugin cache + criticality split lands
+# in PR 2; upgrade reproducer + docs land in PR 3).
+
+bridge_isolation_v2_matrix_rows_for_agent() {
+  # Emit one matrix row per line for the named agent. Caller should pipe
+  # through a dispatcher (`bridge_isolation_v2_apply_grant_matrix_for_agent`)
+  # that resolves `controller` to the live controller user and applies or
+  # checks per row. Returns non-zero only when the agent argument is invalid
+  # (the matrix itself is static contract, not roster-dependent).
+  local agent="$1"
+  [[ -n "$agent" ]] || {
+    bridge_warn "matrix_rows_for_agent: agent name required"
+    return 1
+  }
+  local agent_grp data_root shared_root
+  agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null)" || {
+    bridge_warn "matrix_rows_for_agent: cannot resolve agent group for '$agent'"
+    return 1
+  }
+  data_root="${BRIDGE_DATA_ROOT:-}"
+  shared_root="${BRIDGE_SHARED_ROOT:-${data_root:+$data_root/shared}}"
+  local agent_root="${data_root:+$data_root/agents/$agent}"
+  local state_root="${BRIDGE_HOME:-}/state"
+  local state_agents_root="${state_root}/agents"
+  local state_agent_dir="${state_agents_root}/$agent"
+  local shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
+  local ctrl_grp="${BRIDGE_CONTROLLER_GROUP:-ab-controller}"
+  local iso_user="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}"
+  local iso_home_root="${BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT:-/home}"
+  local iso_home="${iso_home_root}/${iso_user}"
+
+  # ----- shared/ row family (catalog/source only — RC6 per-agent cache
+  # lands in PR 2 as a separate row family) -----
+  if [[ -n "$shared_root" ]]; then
+    printf 'shared-root|%s|dir|controller|%s|2750||1|group_setgid|required|shared catalog/source root\n' \
+      "$shared_root" "$shared_grp"
+    printf 'shared-plugins-cache|%s/plugins-cache|dir|controller|%s|2750|0640|1|group_setgid|required|shared plugin catalog/source (RC6 per-agent cache is PR 2)\n' \
+      "$shared_root" "$shared_grp"
+    printf 'shared-memory-daily-aggregate|%s/memory-daily/aggregate|dir|controller|%s|2750|0640|1|group_setgid|required|memory-daily aggregate read by isolated UIDs\n' \
+      "$shared_root" "$shared_grp"
+  fi
+
+  # ----- per-agent root + writable subdirs + credentials -----
+  if [[ -n "$agent_root" ]]; then
+    printf 'agent-root|%s|dir|root|%s|2750||1|group_setgid|required|root-owned 2750: isolated UID enters via group r-x, no group write\n' \
+      "$agent_root" "$agent_grp"
+    local sub
+    for sub in home workdir runtime logs requests responses; do
+      printf 'agent-%s|%s/%s|dir|%s|%s|2770|0660|1|group_setgid|required|writable subtree (RC4=runtime RC5=logs)\n' \
+        "$sub" "$agent_root" "$sub" "$iso_user" "$agent_grp"
+    done
+    printf 'agent-credentials-dir|%s/credentials|dir|controller|%s|2750|0640|1|group_setgid|required|controller writes launch-secrets.env, group reads\n' \
+      "$agent_root" "$agent_grp"
+    printf 'agent-launch-secrets|%s/credentials/launch-secrets.env|file|controller|%s||0640|0|group_setgid|required|launch secret env file (mode 0640 contract)\n' \
+      "$agent_root" "$agent_grp"
+    printf 'agent-env-sh|%s/runtime/agent-env.sh|file|controller|%s||0640|0|group_setgid|required|cached launch env\n' \
+      "$agent_root" "$agent_grp"
+  fi
+
+  # ----- RC1/RC2: $BRIDGE_HOME/state/{,agents/,agents/<X>} -----
+  if [[ -n "$state_root" ]]; then
+    # RC1 design choice (Q2 in design v2): state/ + state/agents/ get
+    # execute-only traversal via the controller group so isolated hooks
+    # can reach the per-agent leaf without opening daemon-owned siblings.
+    # The leaf directory itself takes the writable per-agent contract so
+    # idle-since etc. can be unlinked by the isolated UID (RC2 fix).
+    printf 'state-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|isolated UID needs --x to reach state/agents/<X>\n' \
+      "$state_root" "$shared_grp"
+    printf 'state-agents-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|isolated UID needs --x to reach its own leaf\n' \
+      "$state_agents_root" "$shared_grp"
+    printf 'state-agent-dir|%s|dir|controller|%s|2770|0660|1|group_setgid|required|RC1: per-agent state leaf, isolated UID + controller rwx\n' \
+      "$state_agent_dir" "$agent_grp"
+    # RC2: file-level rows are not enforced for files that may be absent
+    # at apply time (idle-since, manual-stop, missing-marker-retries,
+    # webhook-port, next-session.sha). The matrix grants the parent +
+    # setgid so the writers inherit ab-agent-<X> automatically; the
+    # writer helper sets mode 0660 explicitly.
+  fi
+
+  # ----- RC3: controller Anthropic credentials read grant (named ACL) -----
+  # Resolve the controller home dynamically so the row stays
+  # machine-agnostic (operator host runs ec2-user; dev hosts run sean).
+  local ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+  if [[ -n "$ctrl_user" ]]; then
+    local ctrl_home
+    ctrl_home="$(getent passwd "$ctrl_user" 2>/dev/null | cut -d: -f6)"
+    if [[ -z "$ctrl_home" ]]; then
+      ctrl_home="${HOME:-}"
+    fi
+    if [[ -n "$ctrl_home" ]]; then
+      printf 'controller-credentials|%s/.claude/.credentials.json|file|%s|%s||0600|0|controller_credential_acl|required|RC3 named-user ACL exception (only cross-agent shared secret)\n' \
+        "$ctrl_home" "$ctrl_user" "$ctrl_user"
+    fi
+  fi
+
+  # ----- isolated user's own private home (catalog symlink target etc.) -----
+  if [[ -n "$iso_home_root" ]]; then
+    printf 'isolated-user-home|%s|dir|%s|%s|0700||0|install_managed|required|isolated UIDs private home\n' \
+      "$iso_home" "$iso_user" "$iso_user"
+  fi
+  return 0
+}
+
+bridge_isolation_v2_apply_row() {
+  # Internal dispatcher — applies (or checks) one matrix row.
+  # Args:
+  #   $1 mode    apply | check
+  #   $2..$11   row fields in matrix order (row_name path access_type owner
+  #             group dir_mode file_mode setgid grant_mechanism criticality)
+  # Returns 0 on apply success / clean check, non-zero otherwise. Caller
+  # is responsible for emitting per-row report rows; this helper only
+  # mutates filesystem state (apply) or compares (check).
+  local mode="$1"
+  local row_name="$2"
+  local path="$3"
+  local access_type="$4"
+  local owner="$5"
+  local group="$6"
+  local dir_mode="$7"
+  local file_mode="$8"
+  local setgid="$9"
+  local mechanism="${10}"
+  local criticality="${11}"
+
+  # Resolve `controller` token at apply time so the matrix stays static.
+  if [[ "$owner" == "controller" ]]; then
+    owner="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+    [[ -n "$owner" ]] || {
+      bridge_warn "apply_row($row_name): cannot resolve controller user"
+      return 1
+    }
+  fi
+
+  case "$mechanism" in
+    controller_credential_acl)
+      # RC3 named-user ACL — handled by the dedicated helper that walks
+      # ancestors and sets the file mask. Apply mode delegates; check mode
+      # probes effective access via setfacl/getfacl.
+      if [[ "$mode" == "apply" ]]; then
+        bridge_isolation_v2_apply_controller_credentials_read_grant \
+          "${row_name#controller-credentials}" 2>/dev/null
+        # The row_name pattern strips the prefix to recover the agent —
+        # but here we don't have the agent in scope; the caller in
+        # apply_grant_matrix_for_agent invokes the helper directly.
+        return 0
+      fi
+      # check mode: just confirm the file exists and the mask is r--.
+      [[ -f "$path" ]] || return 1
+      if command -v getfacl >/dev/null 2>&1; then
+        local mask_line
+        mask_line="$(getfacl -p "$path" 2>/dev/null | awk -F: '/^mask::/ {print $3}' | head -n1)"
+        case "$mask_line" in
+          r--|r-x|rw-|rwx) return 0 ;;
+          *) return 1 ;;
+        esac
+      fi
+      return 0
+      ;;
+    install_managed)
+      # Isolated user's own home — touched only by ensure_user_home /
+      # agent-remove. Apply is a no-op here (creating the user is a
+      # prerequisite of prepare). Check confirms the directory exists.
+      if [[ "$mode" == "apply" ]]; then
+        return 0
+      fi
+      [[ -d "$path" ]]
+      return $?
+      ;;
+    group_setgid)
+      :
+      ;;
+    *)
+      bridge_warn "apply_row($row_name): unknown grant_mechanism '$mechanism'"
+      return 1
+      ;;
+  esac
+
+  # group_setgid path — the common case.
+  case "$access_type" in
+    dir|dir_only_traverse)
+      if [[ "$mode" == "apply" ]]; then
+        # Create the directory if missing — most callers (prepare, daemon
+        # writers) reach apply with the dir already extant; the mkdir is
+        # for daemon ensure_matrix_path callers.
+        if [[ ! -d "$path" ]]; then
+          _bridge_isolation_v2_run_root_or_sudo mkdir -p "$path" || return 1
+        fi
+        _bridge_isolation_v2_run_root_or_sudo chown "$owner:$group" "$path" || return 1
+        _bridge_isolation_v2_run_root_or_sudo chmod "$dir_mode" "$path" || return 1
+        return 0
+      fi
+      # check
+      [[ -d "$path" ]] || return 1
+      local actual_mode
+      actual_mode="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null)"
+      [[ -n "$actual_mode" ]] || return 1
+      local want
+      want="$(printf '%04o' "$((8#$dir_mode))" 2>/dev/null || printf '%s' "$dir_mode")"
+      local got
+      got="$(printf '%04o' "$((8#$actual_mode))" 2>/dev/null || printf '%s' "$actual_mode")"
+      [[ "$want" == "$got" ]]
+      return $?
+      ;;
+    file)
+      if [[ "$mode" == "apply" ]]; then
+        if [[ ! -e "$path" ]]; then
+          # Files are not created by apply — daemon writers create them
+          # via the matrix-aware writer. Treat absent as a no-op success
+          # (verify will report mismatch separately).
+          return 0
+        fi
+        _bridge_isolation_v2_run_root_or_sudo chown "$owner:$group" "$path" || return 1
+        if [[ -n "$file_mode" ]]; then
+          _bridge_isolation_v2_run_root_or_sudo chmod "$file_mode" "$path" || return 1
+        fi
+        return 0
+      fi
+      # check
+      [[ -e "$path" ]] || return 1
+      if [[ -n "$file_mode" ]]; then
+        local actual
+        actual="$(stat -c '%a' "$path" 2>/dev/null || stat -f '%Lp' "$path" 2>/dev/null)"
+        [[ -n "$actual" ]] || return 1
+        local want_f got_f
+        want_f="$(printf '%04o' "$((8#$file_mode))" 2>/dev/null || printf '%s' "$file_mode")"
+        got_f="$(printf '%04o' "$((8#$actual))" 2>/dev/null || printf '%s' "$actual")"
+        [[ "$want_f" == "$got_f" ]] || return 1
+      fi
+      return 0
+      ;;
+    *)
+      bridge_warn "apply_row($row_name): unknown access_type '$access_type'"
+      return 1
+      ;;
+  esac
+}
+
+bridge_isolation_v2_apply_grant_matrix_for_agent() {
+  # Walk every matrix row for the named agent and apply or check it.
+  # Args:
+  #   $1 agent
+  #   $2 --apply | --check (default --check)
+  # Output (--check mode): one line per row to stdout in TSV form
+  #   <row_name>\t<path>\t<status>\t<expected>\t<actual>
+  # Exit: 0 when every required row is satisfied; non-zero on any
+  # required mismatch (--check) or apply failure (--apply).
+  local agent="$1"
+  local mode_flag="${2:---check}"
+  [[ -n "$agent" ]] || {
+    bridge_warn "apply_grant_matrix_for_agent: agent required"
+    return 1
+  }
+  local mode="check"
+  case "$mode_flag" in
+    --apply) mode="apply" ;;
+    --check|--dry-run) mode="check" ;;
+    *)
+      bridge_warn "apply_grant_matrix_for_agent: unknown mode '$mode_flag'"
+      return 1
+      ;;
+  esac
+
+  local rc=0 row line
+  while IFS= read -r row || [[ -n "$row" ]]; do
+    [[ -n "$row" ]] || continue
+    # row format: row_name|path|access_type|owner|group|dir_mode|file_mode|setgid|mechanism|criticality|notes
+    IFS='|' read -r r_name r_path r_access r_owner r_group r_dmode r_fmode r_setgid r_mech r_crit r_notes <<<"$row"
+    local row_rc=0
+    if [[ "$r_mech" == "controller_credential_acl" && "$mode" == "apply" ]]; then
+      # Apply path: route through the dedicated RC3 helper with the agent
+      # in scope (apply_row alone cannot recover agent from row data).
+      bridge_isolation_v2_apply_controller_credentials_read_grant "$agent" \
+        || row_rc=$?
+    else
+      bridge_isolation_v2_apply_row "$mode" \
+        "$r_name" "$r_path" "$r_access" "$r_owner" "$r_group" \
+        "$r_dmode" "$r_fmode" "$r_setgid" "$r_mech" "$r_crit" \
+        || row_rc=$?
+    fi
+    if [[ "$mode" == "check" ]]; then
+      local status="ok" expected actual mode_part=""
+      if (( row_rc != 0 )); then
+        status="mismatch"
+        rc=1
+      fi
+      if [[ -n "$r_dmode" && -n "$r_fmode" ]]; then
+        mode_part="${r_dmode}/${r_fmode}"
+      elif [[ -n "$r_dmode" ]]; then
+        mode_part="$r_dmode"
+      elif [[ -n "$r_fmode" ]]; then
+        mode_part="$r_fmode"
+      fi
+      expected="$r_owner:$r_group${mode_part:+ }$mode_part"
+      actual="$(bridge_isolation_v2_reapply_probe_owner_group_mode "$r_path" 2>/dev/null || printf 'unknown')"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$r_name" "$r_path" "$status" "$expected" "$actual"
+    elif (( row_rc != 0 )); then
+      bridge_warn "apply_grant_matrix_for_agent($agent): row $r_name failed at $r_path"
+      rc=1
+    fi
+  done < <(bridge_isolation_v2_matrix_rows_for_agent "$agent")
+  return $rc
+}
+
+bridge_isolation_v2_ensure_matrix_path() {
+  # Fast path for daemon writers: ensure the named matrix row's path
+  # exists with correct ownership/mode before write. Idempotent — when
+  # the row is already canonical this returns 0 with no mutation.
+  # Args: row_name, agent
+  local row_name="$1"
+  local agent="$2"
+  [[ -n "$row_name" && -n "$agent" ]] || {
+    bridge_warn "ensure_matrix_path: row_name and agent required"
+    return 1
+  }
+  local row
+  row="$(bridge_isolation_v2_matrix_rows_for_agent "$agent" \
+          | awk -F'|' -v n="$row_name" '$1 == n {print; exit}')"
+  if [[ -z "$row" ]]; then
+    bridge_warn "ensure_matrix_path: row '$row_name' not found for agent '$agent'"
+    return 1
+  fi
+  IFS='|' read -r r_name r_path r_access r_owner r_group r_dmode r_fmode r_setgid r_mech r_crit r_notes <<<"$row"
+  bridge_isolation_v2_apply_row "apply" \
+    "$r_name" "$r_path" "$r_access" "$r_owner" "$r_group" \
+    "$r_dmode" "$r_fmode" "$r_setgid" "$r_mech" "$r_crit"
+}
+
+bridge_isolation_v2_apply_controller_credentials_read_grant() {
+  # RC3: the SINGLE named-user-ACL exception. Grants
+  #   u:agent-bridge-<X>:r--   on  ~/.claude/.credentials.json
+  #   u:agent-bridge-<X>:--x   on  every ancestor back to /
+  # then sets `m::r--` on the file so the named entry is effective.
+  #
+  # Path guard: refuse to operate unless the resolved file lives under
+  # the controller home's `.claude/`, never follow symlinks. This is the
+  # v0.9.5/v0.9.6 mask-break recurrence prevention.
+  local agent="$1"
+  [[ -n "$agent" ]] || {
+    bridge_warn "apply_controller_credentials_read_grant: agent required"
+    return 1
+  }
+  command -v setfacl >/dev/null 2>&1 || {
+    bridge_warn "apply_controller_credentials_read_grant: setfacl not available; skipping (non-Linux host)"
+    return 0
+  }
+  local iso_user="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}"
+  local ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+  [[ -n "$ctrl_user" ]] || {
+    bridge_warn "apply_controller_credentials_read_grant: cannot resolve controller user"
+    return 1
+  }
+  local ctrl_home
+  ctrl_home="$(getent passwd "$ctrl_user" 2>/dev/null | cut -d: -f6)"
+  [[ -n "$ctrl_home" ]] || ctrl_home="${HOME:-}"
+  [[ -n "$ctrl_home" ]] || {
+    bridge_warn "apply_controller_credentials_read_grant: cannot resolve controller home"
+    return 1
+  }
+  local cred_file="$ctrl_home/.claude/.credentials.json"
+  # Path guard — refuse symlink targets that escape ~/.claude/
+  if [[ -L "$cred_file" ]]; then
+    bridge_warn "apply_controller_credentials_read_grant: refusing symlink at $cred_file (path guard)"
+    return 1
+  fi
+  if [[ ! -f "$cred_file" ]]; then
+    # No Anthropic credential file present — nothing to grant. Not an
+    # error: an operator who has not run `claude /login` yet is in this
+    # state. Verify will report `not_applicable` for this row.
+    return 0
+  fi
+  # Apply ancestor traverse grants. We deliberately do NOT chmod or
+  # restripe other files in these directories — only setfacl -m to add
+  # the named entry. acl_scrub's path guard ensures it cannot reach
+  # back here and re-strip.
+  local ancestor="$(dirname "$cred_file")"
+  while [[ -n "$ancestor" && "$ancestor" != "/" ]]; do
+    _bridge_isolation_v2_run_root_or_sudo \
+      setfacl -m "u:${iso_user}:--x" "$ancestor" 2>/dev/null || {
+        bridge_warn "apply_controller_credentials_read_grant: setfacl --x on $ancestor failed"
+        return 1
+      }
+    ancestor="$(dirname "$ancestor")"
+  done
+  # File-level read grant + mask repair (the v0.9.5/v0.9.6 wipe).
+  _bridge_isolation_v2_run_root_or_sudo \
+    setfacl -m "u:${iso_user}:r--" -m "m::r--" "$cred_file" 2>/dev/null || {
+      bridge_warn "apply_controller_credentials_read_grant: setfacl r-- + m::r-- on $cred_file failed"
+      return 1
+    }
+  return 0
+}
+
+bridge_isolation_v2_write_agent_state_marker() {
+  # Atomic-ish writer for daemon-side per-agent state markers
+  # (idle-since, manual-stop, missing-marker-retries, etc.). Ensures the
+  # state-agent-dir matrix row is canonical, then writes mode 0660.
+  # Args: agent, marker_name, content
+  local agent="$1"
+  local marker_name="$2"
+  local content="$3"
+  [[ -n "$agent" && -n "$marker_name" ]] || {
+    bridge_warn "write_agent_state_marker: agent and marker_name required"
+    return 1
+  }
+  bridge_isolation_v2_ensure_matrix_path "state-agent-dir" "$agent" 2>/dev/null || true
+  local dir
+  dir="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null)" \
+    || dir="${BRIDGE_ACTIVE_AGENT_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state/agents}/$agent"
+  mkdir -p "$dir" 2>/dev/null \
+    || _bridge_isolation_v2_run_root_or_sudo mkdir -p "$dir" \
+    || {
+      bridge_warn "write_agent_state_marker: cannot create $dir"
+      return 1
+    }
+  local target="$dir/$marker_name"
+  local tmp="${target}.tmp.$$"
+  printf '%s\n' "$content" > "$tmp" 2>/dev/null || {
+    # Direct write failed — fall back to sudo for controller-write paths.
+    if ! _bridge_isolation_v2_run_root_or_sudo bash -c "printf '%s\n' \"\$1\" > \"\$2\"" _ "$content" "$tmp" 2>/dev/null; then
+      bridge_warn "write_agent_state_marker: cannot write $tmp"
+      return 1
+    fi
+  }
+  mv -f "$tmp" "$target" 2>/dev/null \
+    || _bridge_isolation_v2_run_root_or_sudo mv -f "$tmp" "$target" \
+    || {
+      bridge_warn "write_agent_state_marker: cannot rename into $target"
+      rm -f "$tmp" 2>/dev/null \
+        || _bridge_isolation_v2_run_root_or_sudo rm -f "$tmp" 2>/dev/null || true
+      return 1
+    }
+  chmod 0660 "$target" 2>/dev/null \
+    || _bridge_isolation_v2_run_root_or_sudo chmod 0660 "$target" 2>/dev/null || true
+  return 0
 }
 
 # ---------------------------------------------------------------------------

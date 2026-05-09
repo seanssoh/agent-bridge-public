@@ -162,6 +162,7 @@ Usage:
   $CLI_NAME wiki repair-links [--apply] [--limit N] [--json]
   $CLI_NAME isolate <agent> [--dry-run]
   $CLI_NAME unisolate <agent> [--dry-run]
+  $CLI_NAME isolation verify --agent <agent> [--json] [--strict-optional]
   $CLI_NAME inbox [agent] [--all]
   $CLI_NAME show <task-id>
   $CLI_NAME claim <task-id> [--agent <agent>] [--lease <seconds>]
@@ -830,6 +831,143 @@ PY
       shift
       bridge_require_python
       exec python3 "$SCRIPT_DIR/bridge-wiki.py" "$@"
+      ;;
+    isolation)
+      # v0.9.7 (refs #781): read-only verification CLI for the
+      # isolation grant matrix. Walks every required-access matrix row
+      # for an agent and reports per-row status. Does NOT mutate any
+      # ownership/mode/ACL — operators run `migrate isolation v2
+      # --apply --agent <X>` for repair.
+      shift
+      case "${1:-}" in
+        verify)
+          shift
+          _iso_agent=""
+          _iso_json=0
+          _iso_strict_optional=0
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --agent)
+                _iso_agent="$2"
+                shift 2
+                ;;
+              --json)
+                _iso_json=1
+                shift
+                ;;
+              --strict-optional)
+                # Accepted for forward compatibility with PR 2's
+                # criticality split. PR 1 does not enumerate optional
+                # rows yet, so the flag is a no-op here.
+                _iso_strict_optional=1
+                shift
+                ;;
+              -h|--help)
+                cat <<EOF
+Usage: $CLI_NAME isolation verify --agent <agent> [--json] [--strict-optional]
+
+Read-only verification of the v2 isolation grant matrix for one agent.
+Walks every required-access row and reports {path, expected, actual,
+status, suggested_fix}. Exits non-zero on any required mismatch.
+
+  --agent <X>         agent id (required)
+  --json              emit machine-readable JSON (default: human table)
+  --strict-optional   PR 2 forward-compat flag (no-op in PR 1)
+
+Suggested fix when verify reports drift:
+  agent-bridge migrate isolation v2 --apply --agent <X>
+
+This command never mutates filesystem state. Refs #781.
+EOF
+                exit 0
+                ;;
+              *)
+                bridge_die "지원하지 않는 isolation verify 옵션입니다: $1"
+                ;;
+            esac
+          done
+          [[ -n "$_iso_agent" ]] || bridge_die "isolation verify: --agent <name> is required"
+
+          # Source the v2 helpers — bridge-lib.sh already loaded the
+          # module above, so the helpers are in scope. Run check.
+          if ! command -v bridge_isolation_v2_apply_grant_matrix_for_agent >/dev/null 2>&1; then
+            bridge_die "isolation verify: matrix helpers not loaded (BRIDGE_LAYOUT=v2 required)"
+          fi
+
+          _iso_check_out=""
+          _iso_rc=0
+          _iso_check_out="$(bridge_isolation_v2_apply_grant_matrix_for_agent "$_iso_agent" --check 2>&1)" \
+            || _iso_rc=$?
+
+          if (( _iso_json == 1 )); then
+            bridge_require_python
+            # The check output is passed as a third positional arg so the
+            # python heredoc remains the script source while data lands
+            # in argv. This avoids the heredoc-overrides-pipe bash trap
+            # (shellcheck SC2259) without writing temp files.
+            python3 - "$_iso_agent" "$_iso_rc" "$_iso_check_out" <<'PY'
+import json, sys
+agent = sys.argv[1]
+rc = int(sys.argv[2])
+data = sys.argv[3] if len(sys.argv) > 3 else ""
+rows = []
+for line in data.splitlines():
+    parts = line.split("\t")
+    if len(parts) < 5:
+        continue
+    row_name, path, status, expected, actual = parts[:5]
+    rows.append({
+        "row": row_name,
+        "path": path,
+        "status": status,
+        "expected": expected,
+        "actual": actual,
+        "suggested_fix": (
+            f"agent-bridge migrate isolation v2 --apply --agent {agent}"
+            if status != "ok" else ""
+        ),
+    })
+print(json.dumps({
+    "agent": agent,
+    "exit_status": "ok" if rc == 0 else "mismatch",
+    "rows": rows,
+}, ensure_ascii=False, indent=2))
+PY
+          else
+            printf 'Isolation grant matrix verify for agent: %s\n' "$_iso_agent"
+            printf '%s\n' "------------------------------------------------------------------"
+            printf '%-26s %-10s %-30s %s\n' "ROW" "STATUS" "EXPECTED" "PATH"
+            printf '%s\n' "------------------------------------------------------------------"
+            while IFS=$'\t' read -r _name _path _status _expected _actual; do
+              [[ -n "$_name" ]] || continue
+              printf '%-26s %-10s %-30s %s\n' \
+                "$_name" "$_status" "$_expected" "$_path"
+            done <<<"$_iso_check_out"
+            printf '%s\n' "------------------------------------------------------------------"
+            if (( _iso_rc == 0 )); then
+              echo "All required rows: ok"
+            else
+              echo "Drift detected. Repair with:"
+              echo "  agent-bridge migrate isolation v2 --apply --agent $_iso_agent"
+            fi
+          fi
+          exit "$_iso_rc"
+          ;;
+        ""|-h|--help)
+          cat <<EOF
+Usage: $CLI_NAME isolation <verify> [options]
+
+  verify --agent <X> [--json] [--strict-optional]
+       Read-only verification of the v2 grant matrix for one agent.
+
+Refs #781.
+EOF
+          exit 0
+          ;;
+        *)
+          bridge_die "지원하지 않는 isolation 명령입니다: $1"
+          ;;
+      esac
       ;;
     isolate)
       shift

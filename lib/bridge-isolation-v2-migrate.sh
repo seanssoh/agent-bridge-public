@@ -900,10 +900,46 @@ bridge_isolation_v2_migrate_normalize_layout() {
       || { bridge_warn "normalize_layout: shared/ chgrp_setgid_recursive failed"; return 1; }
   fi
 
+  # v0.9.7 (refs #781 RC1/RC2): the broad recursive normalize on
+  # `$data_root/state` previously chgrp'd everything to ab-controller
+  # mode 0640. Two problems with that — (a) it touched the v2 controller
+  # state root indiscriminately, and (b) it cascaded into the per-agent
+  # state leaf at `$BRIDGE_HOME/state/agents/<X>/` (not under
+  # `$data_root/state` directly, but the legacy install ships
+  # BRIDGE_HOME=BRIDGE_DATA_ROOT, so the recursion reached it anyway).
+  # The fix splits state into traversal-only (state/, state/agents/) and
+  # per-agent rwx (state/agents/<X>/) — see the matrix in
+  # lib/bridge-isolation-v2.sh.
   if [[ -d "$data_root/state" ]]; then
-    bridge_isolation_v2_chgrp_setgid_recursive \
-      "$ctrl_grp" 2750 0640 "$data_root/state" \
-      || { bridge_warn "normalize_layout: state/ chgrp_setgid_recursive failed"; return 1; }
+    # Top-level state/: traversal-only via the shared group so isolated
+    # hooks can reach their per-agent leaves without opening daemon
+    # siblings. Direct chmod (no recursion) to avoid clobbering
+    # state/agents/<X>/ — those leaves get their own per-agent matrix
+    # apply below.
+    _bridge_isolation_v2_run_root_or_sudo chgrp "$shared_grp" "$data_root/state" 2>/dev/null || true
+    _bridge_isolation_v2_run_root_or_sudo chmod 0710 "$data_root/state" 2>/dev/null || true
+    if [[ -d "$data_root/state/agents" ]]; then
+      _bridge_isolation_v2_run_root_or_sudo chgrp "$shared_grp" "$data_root/state/agents" 2>/dev/null || true
+      _bridge_isolation_v2_run_root_or_sudo chmod 0710 "$data_root/state/agents" 2>/dev/null || true
+    fi
+    # state/runtime/ stays controller-only (daemon config lives there).
+    if [[ -d "$data_root/state/runtime" ]]; then
+      bridge_isolation_v2_chgrp_setgid_recursive \
+        "$ctrl_grp" 2750 0640 "$data_root/state/runtime" \
+        || { bridge_warn "normalize_layout: state/runtime chgrp_setgid_recursive failed"; return 1; }
+    fi
+    # Other daemon-owned files directly under state/ (daemon.log,
+    # tasks.db, history/, etc.) stay controller-only via direct chgrp
+    # without opening the per-agent leaves.
+    local _state_top _state_basename
+    while IFS= read -r _state_top; do
+      [[ -n "$_state_top" ]] || continue
+      _state_basename="$(basename "$_state_top")"
+      case "$_state_basename" in
+        agents|runtime) continue ;;  # handled separately above
+      esac
+      _bridge_isolation_v2_run_root_or_sudo chgrp -R "$ctrl_grp" "$_state_top" 2>/dev/null || true
+    done < <(find "$data_root/state" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
   fi
 
   # Per-agent root must be 2750 (isolated UID enters via group r-x but
@@ -961,6 +997,18 @@ bridge_isolation_v2_migrate_normalize_layout() {
         bridge_warn "[migrate] workdir-verify FAIL agent=$agent grp=$agent_grp — see preceding warnings"
         return 1
       fi
+    fi
+
+    # v0.9.7 RC1 (refs #781): per-agent state/agents/<X>/ leaf — was
+    # previously left as ec2-user:ab-controller mode 0750 by the broad
+    # state/ recursive normalize, which then blocked the isolated hook
+    # from unlinking idle-since (RC2 cascade). Apply the matrix grant
+    # for this specific agent now so the rest of the matrix (RC4 logs/,
+    # RC5 runtime/) is consistent. The matrix helper is a no-op when
+    # already canonical and skips rows whose paths aren't present
+    # (e.g. agents that never ran on this host).
+    if command -v bridge_isolation_v2_apply_grant_matrix_for_agent >/dev/null 2>&1; then
+      bridge_isolation_v2_apply_grant_matrix_for_agent "$agent" --apply >/dev/null 2>&1 || true
     fi
   done < "$snapshot_path"
 

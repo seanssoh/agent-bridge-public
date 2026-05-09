@@ -397,6 +397,19 @@ def _stamp_next_session_delivered(agent: str, next_session: Path) -> str | None:
     # linux-user isolation) gets the marker where bash will actually look.
     marker_file = bridge_active_agent_dir() / agent / "next-session.sha"
     try:
+        # v0.9.7 RC2 (refs #781): the matrix grants the isolated UID
+        # rwx on state/agents/<X>/ via group ab-agent-<X> + setgid 2770.
+        # Use exist_ok=True so we don't override the parent's setgid bit
+        # with mode 0755 (which Python's mkdir defaults to when
+        # creating). When the parent already exists with the v2
+        # contract the call is a no-op; when it doesn't, a default-mode
+        # mkdir from this hook would land as 0755 owned by the isolated
+        # UID, which is acceptable for the leaf but loses the setgid
+        # inheritance for sibling state files. The matrix-aware writer
+        # in lib/bridge-isolation-v2.sh is the canonical path; this
+        # branch is the hot-path inside an already-running Claude
+        # session so we keep it minimal and rely on the matrix grant
+        # being applied at start time.
         marker_file.parent.mkdir(parents=True, exist_ok=True)
         marker_file.write_text(digest, encoding="utf-8")
     except OSError:

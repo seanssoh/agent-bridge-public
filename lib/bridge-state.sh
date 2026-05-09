@@ -2350,6 +2350,16 @@ bridge_agent_note_prompt_ready() {
   engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
   session="$(bridge_agent_session "$agent" 2>/dev/null || true)"
   ts="$(date +%s)"
+  # v0.9.7 (refs #781 RC4): prompt-ready.env lives under runtime/, which
+  # is granted to the isolated UID + controller via the matrix. Ensure
+  # the matrix row before write so a fresh mkdir (parent absent) lands
+  # with the correct ownership/mode without relying on best-effort
+  # `mkdir -p` inheriting controller-only metadata.
+  if command -v bridge_isolation_v2_ensure_matrix_path >/dev/null 2>&1 \
+      && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+      && bridge_isolation_v2_active 2>/dev/null; then
+    bridge_isolation_v2_ensure_matrix_path "agent-runtime" "$agent" >/dev/null 2>&1 || true
+  fi
   mkdir -p "$dir"
 
   # Idempotency: if a marker already exists for the current session, don't
@@ -2806,22 +2816,58 @@ bridge_agent_mark_idle_now() {
   local agent="$1"
   local dir
   local file
+  local ts
 
   dir="$(bridge_agent_idle_marker_dir "$agent")"
   file="$(bridge_agent_idle_since_file "$agent")"
-  mkdir -p "$dir"
-  printf '%s\n' "$(date +%s)" >"$file"
+  ts="$(date +%s)"
+
+  # v0.9.7 RC2 (refs #781): route through the matrix-aware writer so the
+  # per-agent state/agents/<X>/ leaf is canonicalized (group ab-agent-<X>,
+  # 2770, setgid) before write. Without this the daemon's previous plain
+  # `mkdir -p` + redirection produced ec2-user:ab-controller 0600 files
+  # that the isolated UserPromptSubmit hook could not unlink, surfacing
+  # as the "rm: cannot remove '.../idle-since': Permission denied" error
+  # in the operator's session output. Falls back to the legacy direct
+  # write path when the matrix helper isn't loaded (test fixtures).
+  if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
+      && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+      && bridge_isolation_v2_active 2>/dev/null; then
+    bridge_isolation_v2_write_agent_state_marker "$agent" "idle-since" "$ts" \
+      || { mkdir -p "$dir"; printf '%s\n' "$ts" >"$file"; }
+  else
+    mkdir -p "$dir"
+    printf '%s\n' "$ts" >"$file"
+  fi
 }
 
 bridge_agent_mark_manual_stop() {
   local agent="$1"
   local dir
   local file
+  local ts
 
   dir="$(bridge_agent_idle_marker_dir "$agent")"
   file="$(bridge_agent_manual_stop_file "$agent")"
-  mkdir -p "$dir"
-  printf '%s\n' "$(date +%s)" >"$file"
+  ts="$(date +%s)"
+
+  # v0.9.7 RC2 (refs #781): same matrix-aware route as
+  # bridge_agent_mark_idle_now. manual-stop participates in the same
+  # state/agents/<X>/ leaf contract; without the matrix grant the
+  # isolated `bridge_agent_clear_manual_stop` rm path fell back to a
+  # sudo handoff in PR #714 — the matrix grant makes the sudo handoff
+  # unnecessary because the isolated UID is now in ab-agent-<X> and the
+  # parent dir is 2770. The sudo handoff stays as a fallback for hosts
+  # where the matrix has not been applied yet (rolling upgrade window).
+  if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
+      && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+      && bridge_isolation_v2_active 2>/dev/null; then
+    bridge_isolation_v2_write_agent_state_marker "$agent" "manual-stop" "$ts" \
+      || { mkdir -p "$dir"; printf '%s\n' "$ts" >"$file"; }
+  else
+    mkdir -p "$dir"
+    printf '%s\n' "$ts" >"$file"
+  fi
 }
 
 bridge_agent_clear_idle_marker() {
@@ -2831,7 +2877,16 @@ bridge_agent_clear_idle_marker() {
 
   file="$(bridge_agent_idle_since_file "$agent")"
   dir="$(bridge_agent_idle_marker_dir "$agent")"
-  rm -f "$file"
+  # v0.9.7 RC2 (refs #781): when the matrix grant has been applied, the
+  # isolated UID is in ab-agent-<X> and the parent dir is 2770 setgid,
+  # so this plain `rm -f` succeeds from the isolated hook context.
+  # If it still fails, log a diagnostic so the verify CLI's
+  # `agent-bridge isolation verify` operator-side run can flag that the
+  # matrix is out of sync and `migrate isolation v2 --apply --agent <X>`
+  # is needed.
+  if [[ -f "$file" ]] && ! rm -f "$file" 2>/dev/null; then
+    bridge_warn "bridge_agent_clear_idle_marker: rm $file failed (agent=$agent) — grant matrix may be drifted; run \`agent-bridge isolation verify --agent $agent\`"
+  fi
   # Issue #629: drop the missing-marker retry counter so a future stale
   # marker scenario starts fresh — otherwise the counter could ratchet
   # the synthetic-marker fallback in earlier than warranted.
