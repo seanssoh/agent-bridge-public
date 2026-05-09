@@ -63,6 +63,35 @@ case "${1:-}" in
     unset _BRIDGE_AGENT_BRIDGE_HOME _BRIDGE_AGENT_BRIDGE_MARKER
     ;;
 esac
+# r15 codex Probe 6 (FAIL #7) — `isolation verify --help` must work
+# even on legacy/markerless installs so operator can read the syntax
+# before they upgrade. The layout-required guard inside bridge-lib.sh
+# fires on legacy hosts and dies before the dispatcher would parse
+# `--help`. Pre-empt by handling the help flag here, before sourcing
+# bridge-lib.sh. Only the help case bypasses; an actual `verify`
+# invocation still goes through the full layout check below.
+if [[ "${1:-}" == "isolation" && "${2:-}" == "verify" ]]; then
+  for _arg in "$@"; do
+    if [[ "$_arg" == "-h" || "$_arg" == "--help" ]]; then
+      cat <<'HELP_EOF'
+Usage: agent-bridge isolation verify --agent <agent> [--json] [--strict-optional]
+
+Walk the v0.9.7 grant matrix for <agent> and report mismatches.
+Read-only — no chmod/chgrp/setfacl/mkdir. Exit non-zero on required mismatch.
+
+Options:
+  --agent <name>       Agent id (required).
+  --json               Emit machine-readable output instead of the table.
+  --strict-optional    Treat optional plugin rows as required (PR 2).
+
+Available even on legacy/markerless installs to advise upgrade.
+Run `agent-bridge upgrade --apply` first to populate the v2 layout.
+HELP_EOF
+      exit 0
+    fi
+  done
+  unset _arg
+fi
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 CLI_NAME="$(basename "$0")"

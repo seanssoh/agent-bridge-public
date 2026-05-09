@@ -429,7 +429,13 @@ bridge_write_idle_ready_agents() {
             fi
             retries=$((retries + 1))
             if (( retries >= 10#$max_retries )); then
-              bridge_agent_mark_idle_now "$agent"
+              # r15 codex needs-more — was unconditional. The synthetic
+              # marker writer now propagates the matrix hard-fail (r12-r14
+              # chain), so swallowing here would erase the whole signal.
+              # Hard fail: caller (cmd_sync_cycle nudge_scan step) sees
+              # rc=1 and emits the new daemon_step_warning audit so
+              # operator catches matrix-not-applied via `audit follow`.
+              bridge_agent_mark_idle_now "$agent" || return 1
               rm -f "$retries_file"
               bridge_audit_log daemon nudge_marker_synthesized "$agent" \
                 --detail consecutive_probe_failures="$retries" \

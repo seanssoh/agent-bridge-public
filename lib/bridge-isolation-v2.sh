@@ -925,17 +925,31 @@ bridge_isolation_v2_acl_scrub() {
     bridge_warn "acl_scrub: root required"
     return 1
   }
-  [[ -d "$root" ]] || return 0
-  # RC3 recurrence prevention (refs #781): refuse any root that lives
-  # outside the v2 data root or an isolated agent's private home.
-  # Without this guard, a misrouted scrub against the controller's
-  # `~/.claude/` would wipe the named-user ACL mask we deliberately
-  # apply on `.credentials.json` (the only sanctioned named-user
-  # exception), reproducing the v0.9.5/v0.9.6 `/login` infinite loop.
+  # r15 codex Probe 5 — path guard FIRST, before the directory check.
+  # Earlier the guard ran AFTER `[[ -d "$root" ]] || return 0`, so a
+  # caller passing a controller-credential FILE (not directory) hit
+  # the early return and false-passed without the guard ever running.
+  # That meant a misrouted scrub against the Anthropic credential
+  # would silently no-op instead of refusing — operator could not
+  # tell whether the scrub had stripped the named-user ACL or not.
   if ! bridge_isolation_v2_acl_scrub_path_allowed "$root"; then
     bridge_warn "acl_scrub: refusing path outside BRIDGE_DATA_ROOT or /home/agent-bridge-* (controller credential ACL guard, refs #781): $root"
     return 1
   fi
+  if [[ -f "$root" ]]; then
+    # File path inside the allowlist: refuse loudly. Per-file ACL scrub
+    # is not part of the bulk-strip contract; callers that need to
+    # strip a single file's ACL should use setfacl directly with
+    # explicit named-entry deletion. This refusal prevents a caller
+    # from passing e.g. `agents/<X>/workdir/.teams/.env` and getting
+    # a silent rc=0 while the file's ACL stays intact.
+    bridge_warn "acl_scrub: refusing file path (use setfacl for per-file strip): $root"
+    return 1
+  fi
+  [[ -d "$root" ]] || {
+    bridge_warn "acl_scrub: $root is neither a directory nor regular file"
+    return 1
+  }
   local _scrub_err _rc
   _scrub_err="$(mktemp 2>/dev/null || printf '/dev/null')"
   if [[ "$(uname)" == "Darwin" ]]; then
