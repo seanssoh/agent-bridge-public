@@ -6,6 +6,22 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.9.1] — 2026-05-09
+
+### Highlight — v0.9.0 post-upgrade hotfix wave (2 PR)
+
+`v0.9.1` 은 v0.9.0 적용 호스트에서 같은 날 발견된 두 cascade 를 닫는다. 핵심 trigger: 운영 호스트가 `agent-bridge upgrade --apply` + `agent-bridge migrate isolation v2 --apply` 를 차례로 통과하고 *exit 0 + all dir entries `ok`* 를 보았으나, 정작 `agents/<X>/workdir/` 안의 pre-existing 파일은 v0.7→v0.8 이전 owner-group 을 그대로 유지 → controller user (`ec2-user`, `ab-agent-<X>` 그룹 멤버) 가 `workdir/CLAUDE.md` 를 read 못 함 → 토요일 06:00 KST `wiki-v2-rebuild` cron 이 PermissionError 로 abort, `set -euo pipefail` 가 sweep 전체를 죽임 → 한 에이전트의 perm drift 가 다른 5 에이전트의 weekly index rebuild 까지 silent miss 시키는 cascade.
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.9.0 isolation-v2 layout 변경 없음. v0.9.0 적용 호스트가 같은 cascade 를 보았다면 본 v0.9.1 적용 후 다음 토요일 cron slot (2026-05-16 06:00 KST) 에서 자동 회복.
+
+### Fixed (#749 — refs #746)
+
+- `lib/bridge-isolation-v2.sh` 에 belt-and-braces 가드 두 겹 추가. 새 helper `bridge_isolation_v2_verify_chgrp_setgid_recursive(group, dir_mode, file_mode, root)` 가 tree 를 walk 하면서 모든 dir/file 의 group 이 expected 와 일치하는지 + 하나의 sample dir / file 의 mode 가 expected 와 일치하는지 확인 (mode 비교는 `printf '%04o' "$((8#$mode))"` 정규화로 BSD/macOS `stat -f %A` 와 GNU `stat -c %a` parity). `bridge_isolation_v2_chgrp_setgid_recursive` 가 4 find-exec passes 직후 self-verify 호출 → drift 감지 시 `sudo -n find … -exec chgrp/chmod {} +` (no direct-first) 로 retry 후 재검증 → 여전히 drift 면 명료한 `bridge_warn` 후 return 1. 이전엔 stderr-silenced direct-first 가 find 가 0 반환했음에도 per-file chgrp 실패가 propagate 안 되는 환경 (Amazon Linux GNU findutils 등) 에서 silent no-op 로 끝나고 sudo retry path 가 미진입했다. `lib/bridge-isolation-v2-migrate.sh:bridge_isolation_v2_migrate_normalize_layout` per-agent loop 에 `[migrate] workdir-verify ok|FAIL agent=<X> grp=<grp>` 명시 로깅 — FAIL → return 1 → full apply path 의 `bridge_die` (v2 marker 미진행), upgrade path 는 warn-only (operator 가 grep 으로 식별 가능). rootless smoke regression 무영향 (caller's primary group + 2770/0660 tempdir tree 에서 verify 가 trivial pass).
+
+### Fixed (#748 — refs #747)
+
+- `scripts/wiki-v2-rebuild.sh` 의 `mkdir -p "$(dirname "$live_db")"` + `: 2>/dev/null >> "$lock_file"` 두 lock-init step 을 같은 file 의 기존 `LOCK_BUSY` / `FAIL` / `VALIDATE_FAIL` / `SWAP_FAIL` block 과 동일한 `if !; then log_audit; skipped++; continue; fi` shape 으로 가드. 새 audit tag `MKDIR_FAIL` / `LOCK_INIT_FAIL`. bash redirection 순서 footgun 회피 — `: >> "$lock_file" 2>/dev/null` 은 `>>` open 실패 시 bash 가 `2>/dev/null` 적용 *전에* `Permission denied` diagnostic 을 stderr 로 leak; `: 2>/dev/null >> "$lock_file"` 로 stderr 를 먼저 redirect. `set -euo pipefail` + ERR trap 보존. 단일 에이전트의 perm drift 가 weekly sweep 전체를 죽이던 cascade 종결 — 한 에이전트의 lock-init fail 은 한 에이전트의 skip 이고 그 이상이 아님.
+
 ## [0.9.0] — 2026-05-09
 
 ### Highlight — isolation-v2 migration tooling + canonical state docs
