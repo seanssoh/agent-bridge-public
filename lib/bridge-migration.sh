@@ -155,8 +155,12 @@ bridge_migration_isolate() {
     # Issue #544 PR2 — refresh the per-isolated-home Claude
     # settings.json + settings.effective.json so existing isolated
     # agents pick up the bridge hook entries on `--reapply` without an
-    # unisolate→isolate cycle. Best-effort: warn but don't bail — the
-    # ACL reapply above is the load-bearing step.
+    # unisolate→isolate cycle.
+    # Issue #752 W3c (M8) — settings install is load-bearing on reapply:
+    # without it, hooks/policy entries silently fail to re-render and the
+    # operator's state file says "done" while the agent runs without
+    # bridge hooks. Match H4's contract at line 142-145 — refuse to mark
+    # reapply complete if the install fails.
     if command -v bridge_install_isolated_home_settings >/dev/null 2>&1; then
       # Issue #570: managed autoCompactWindow default is unconditionally
       # 1_000_000; launch_cmd is forwarded for caller-signature parity
@@ -165,8 +169,10 @@ bridge_migration_isolate() {
       # (bridge-agent.sh:1655-1669).
       local _reapply_launch_cmd=""
       _reapply_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || printf '')"
-      bridge_install_isolated_home_settings "$agent" "$_reapply_launch_cmd" \
-        || bridge_warn "isolated-home settings install returned non-zero for $agent; re-run isolate --reapply or check OPERATIONS.md isolated-agent section"
+      if ! bridge_install_isolated_home_settings "$agent" "$_reapply_launch_cmd"; then
+        bridge_warn "bridge_install_isolated_home_settings failed for $agent during --reapply; refusing to mark reapply complete. Address the underlying cause (perm denied on settings.local.json under the isolated HOME, missing renderer deps) and re-run 'agent-bridge isolate $agent --reapply'. See OPERATIONS.md isolated-agent section."
+        return 1
+      fi
     fi
     printf '[done] ACL reapply complete for %s\n' "$agent"
     return 0
@@ -255,13 +261,20 @@ bridge_migration_isolate() {
     # Issue #544 PR2 — install bridge hook entries into the freshly
     # provisioned isolated HOME so SessionStart, UserPromptSubmit, Stop,
     # PermissionDenied, PreToolUse/PostToolUse all fire from first
-    # session. Best-effort; failure here doesn't block migration.
+    # session.
+    # Issue #752 W3c (M9) — settings install is load-bearing on a fresh
+    # isolate: without it, the agent can start under linux-user isolation
+    # without bridge hooks rendered into its .claude/settings.local.json.
+    # Match H4's contract at line 142-145 — refuse to mark isolation
+    # complete if the install fails.
     if command -v bridge_install_isolated_home_settings >/dev/null 2>&1; then
       # Same launch_cmd forward as the --reapply branch above.
       local _isolate_launch_cmd=""
       _isolate_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || printf '')"
-      bridge_install_isolated_home_settings "$agent" "$_isolate_launch_cmd" \
-        || bridge_warn "isolated-home settings install returned non-zero for $agent; re-run isolate --reapply"
+      if ! bridge_install_isolated_home_settings "$agent" "$_isolate_launch_cmd"; then
+        bridge_warn "bridge_install_isolated_home_settings failed for $agent during isolate; refusing to mark isolate complete. Address the underlying cause (perm denied on settings.local.json under the isolated HOME, missing renderer deps) and re-run 'agent-bridge isolate $agent --reapply'. See OPERATIONS.md isolated-agent section."
+        return 1
+      fi
     fi
   fi
 
