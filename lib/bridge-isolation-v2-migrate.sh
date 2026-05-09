@@ -1678,10 +1678,14 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
       BRIDGE_LAYOUT="v2"
       BRIDGE_DATA_ROOT="$data_root"
       export BRIDGE_LAYOUT BRIDGE_DATA_ROOT
+
+      local _norm_rc=0
       if ! bridge_isolation_v2_migrate_normalize_layout \
             "$_norm_snapshot" "$data_root"; then
+        _norm_rc=1
         bridge_warn "apply_for_upgrade: normalize_layout pass on already-migrated install reported failures; layout may carry drifted modes (rerun \`agent-bridge upgrade --apply\` after addressing the warned cause)"
       fi
+
       BRIDGE_LAYOUT="$_saved_layout_norm"
       BRIDGE_DATA_ROOT="$_saved_data_root_norm"
       if [[ -n "$_saved_layout_norm" ]]; then
@@ -1694,8 +1698,26 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
       else
         unset BRIDGE_DATA_ROOT
       fi
+
+      if (( _norm_rc != 0 )); then
+        # H3 (refs #752 / #746): refuse to report clean success when the
+        # normalize_layout pass on an already-migrated install reports
+        # any failure. The upgrade caller can decide whether to abort or
+        # surface this as a partial-success warning, but we MUST NOT
+        # return 0 with `skipped:true` — that's the silent-success path
+        # the v0.9.0 production host hit (#746 / #747 / #749).
+        printf '{"mode":"isolation-v2-migrate","status":"partial","skipped":true,"reason":"normalize-refresh-failed","marker":"%s","data_root":"%s","normalize_refresh":"failed","last_error":"normalize_layout pass on already-migrated install reported failures — see preceding bridge_warn lines","remediation":"rerun agent-bridge upgrade --apply after addressing the warned cause; or run agent-bridge migrate isolation v2 --apply directly for the strict bridge_die contract"}\n' \
+          "$marker_path" "$data_root"
+        return 1
+      fi
+
+      printf '{"mode":"isolation-v2-migrate","status":"ok","skipped":true,"reason":"marker-present","marker":"%s","data_root":"%s","normalize_refresh":"attempted"}\n' \
+        "$marker_path" "$data_root"
+      return 0
     fi
-    printf '{"mode":"isolation-v2-migrate","skipped":true,"reason":"marker-present","marker":"%s","data_root":"%s","normalize_refresh":"attempted"}\n' \
+    # No-privilege / inactive path — keep existing skipped-true success
+    # since we couldn't even attempt normalize_layout.
+    printf '{"mode":"isolation-v2-migrate","status":"ok","skipped":true,"reason":"marker-present","marker":"%s","data_root":"%s","normalize_refresh":"skipped"}\n' \
       "$marker_path" "$data_root"
     return 0
   fi
