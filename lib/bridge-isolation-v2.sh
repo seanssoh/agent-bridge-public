@@ -1356,6 +1356,97 @@ bridge_isolation_v2_matrix_rows_for_agent() {
   if [[ -n "$iso_home_root" ]]; then
     printf 'isolated-user-home|%s|dir|%s|%s|0700||0|install_managed|required|isolated UIDs private home\n' \
       "$iso_home" "$iso_user" "$iso_user"
+
+    # ----- v0.9.7 PR 2 (refs #781) RC6: per-agent plugin subsystem rows -----
+    #
+    # Per design v2 §"Per-agent plugin contract" / §"dev-plugin-cache
+    # linker contract", v0.9.7 abandons the v1 shared dev-plugin-cache
+    # design and replaces it with four per-agent rows under the isolated
+    # home. Operator's binding principle: each isolated agent installs
+    # its own plugins, logs in separately, and never shares cache or
+    # credentials with another agent. Anthropic controller credentials
+    # remain the only cross-agent shared secret (RC3 row above).
+    #
+    # All four rows use grant_mechanism `install_managed`: the matrix
+    # apply path does not create or chmod these — `bridge_linux_share_
+    # plugin_catalog` and `bridge-dev-plugin-cache.py` (running as the
+    # isolated UID under bridge-start.sh's sudo wrap) own creation.
+    # The matrix's job is to enumerate the rows so `agent-bridge
+    # isolation verify` and the upgrader's pre/post checks measure
+    # exactly what the agent will see at runtime.
+    #
+    # Criticality split (Q4 decision): rows tied to plugins are
+    # `optional` for agents that declare no plugins (a Codex agent
+    # with zero plugin: channels and zero BRIDGE_AGENT_PLUGINS does
+    # not need a cache directory at all). Verify reports those as
+    # degraded only and the CLI's `--strict-optional` flag escalates
+    # them to required when the operator wants every row enforced
+    # regardless of declaration.
+    local iso_plugins_root="${iso_home}/.claude/plugins"
+    local _v2_plugin_channels="" _v2_plugin_allowlist=""
+    _v2_plugin_channels="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
+    _v2_plugin_allowlist="$(bridge_agent_plugins_csv "$agent" 2>/dev/null || true)"
+    local _v2_plugin_criticality="optional"
+    if [[ "$_v2_plugin_channels" == *plugin:* ]] \
+        || [[ -n "$_v2_plugin_allowlist" ]]; then
+      _v2_plugin_criticality="required"
+    fi
+
+    # 1. Per-agent plugin runtime data (OAuth tokens, session state).
+    #    Lifecycle: created by bridge_linux_share_plugin_catalog at
+    #    lib/bridge-agents.sh:2007; preserved by unshare; removed only
+    #    by explicit agent removal. Mode 0700 because plugin secrets
+    #    live here and must NEVER be group-readable, including by the
+    #    agent's own ab-agent-<X> group.
+    printf 'isolated-plugin-data|%s/data|dir|%s|%s|0700||0|install_managed|%s|per-agent plugin runtime state and OAuth tokens (private to isolated UID)\n' \
+      "$iso_plugins_root" "$iso_user" "$iso_user" "$_v2_plugin_criticality"
+
+    # 2. Per-agent plugin credentials. This is the generic row covering
+    #    ms365 Microsoft Graph tokens, cosmax-crm OAuth, GitHub PATs,
+    #    Telegram bot tokens, Discord tokens, Teams app passwords, etc.
+    #    Plugin install code controls the exact filename — the matrix
+    #    just verifies the parent dir is private to the isolated UID.
+    #    Files inside take 0600 when the plugin manages mode; dirs take
+    #    0700. `install_managed` means matrix verify probes ownership
+    #    and traversal but does not enforce a specific file mode.
+    #    Same path as data/ today (per design v2 line 44 — credentials
+    #    live under data/<plugin>/ in the current implementation), but
+    #    the row is enumerated separately so a future split (e.g.
+    #    plugins/credentials/) lands in one matrix entry rather than
+    #    requiring all callers to track two paths.
+    printf 'isolated-plugin-credentials|%s/data|dir|%s|%s|0700||0|install_managed|%s|per-agent plugin credential files (ms365/cosmax-crm/GitHub PAT etc; mode 0600 for files when plugin owns mode)\n' \
+      "$iso_plugins_root" "$iso_user" "$iso_user" "$_v2_plugin_criticality"
+
+    # 3. Per-agent plugin manifests (installed_plugins.json,
+    #    known_marketplaces.json, marketplaces/). These are root-owned,
+    #    group-readable so the isolated UID can read but not modify.
+    #    `installPath` entries inside installed_plugins.json must
+    #    resolve to the per-agent cache row below — never to a shared
+    #    dev-plugin-cache (rejected by Q3) and never to another agent's
+    #    home. Verification of `installPath` resolution lives in
+    #    `bridge-dev-plugin-cache.py` post-link checks, not in the
+    #    bash matrix apply.
+    printf 'isolated-plugin-manifests|%s|dir|root|%s|2750||1|install_managed|%s|per-agent plugin manifests (installed_plugins.json + marketplaces/) — installPath must resolve under same isolated home\n' \
+      "$iso_plugins_root" "$agent_grp" "$_v2_plugin_criticality"
+
+    # 4. Per-agent plugin cache root. Per design v2 line 46 / Q3
+    #    decision: NOT a symlink to a shared cache directory. The cache
+    #    is materialized inside the isolated UID's own home by code
+    #    running as that UID (bridge-dev-plugin-cache.py via the
+    #    bridge-start.sh sudo wrap). Cache version dirs land under
+    #    cache/<marketplace>/<plugin>/<version>/ and inherit the
+    #    isolated UID:UID ownership. Mode 0700 because cache content
+    #    is operationally private to one agent.
+    #
+    #    A missing cache directory is NOT itself a launch blocker —
+    #    bridge-run.sh's RC6 sync step attempts to create it. Failure
+    #    of the sync attempt routes through the criticality split in
+    #    bridge-dev-plugin-cache.py: channel-required plugin failures
+    #    block, optional (BRIDGE_AGENT_PLUGINS) plugin failures warn
+    #    and continue. The matrix row enumerates the path so verify
+    #    can probe ownership/mode when the directory exists.
+    printf 'isolated-plugin-cache|%s/cache|dir|%s|%s|0700||0|install_managed|%s|per-agent plugin cache root (Q3 decision: NEVER a symlink to shared cache; created on demand by isolated UID)\n' \
+      "$iso_plugins_root" "$iso_user" "$iso_user" "$_v2_plugin_criticality"
   fi
   return 0
 }
@@ -1571,8 +1662,22 @@ bridge_isolation_v2_apply_grant_matrix_for_agent() {
     if [[ "$mode" == "check" ]]; then
       local status="ok" expected actual mode_part=""
       if (( row_rc != 0 )); then
-        status="mismatch"
-        rc=1
+        # v0.9.7 PR 2 (Q4 split): a row whose criticality is `optional`
+        # demotes mismatch to `degraded` and does NOT flip the overall
+        # exit code by default. The CLI's `--strict-optional` flag
+        # post-processes the rows it cares about (it sees the
+        # criticality column emitted below) and escalates `degraded` to
+        # `mismatch` when the operator wants strict enforcement. Keeping
+        # the demotion here means matrix-direct callers
+        # (apply_grant_matrix_for_agent invoked from migrate apply) get
+        # the same lenient default — they only fail the apply when a
+        # required row is broken.
+        if [[ "$r_crit" == "optional" || "$r_crit" == "not-applicable" ]]; then
+          status="degraded"
+        else
+          status="mismatch"
+          rc=1
+        fi
       fi
       if [[ -n "$r_dmode" && -n "$r_fmode" ]]; then
         mode_part="${r_dmode}/${r_fmode}"
@@ -1583,10 +1688,24 @@ bridge_isolation_v2_apply_grant_matrix_for_agent() {
       fi
       expected="$r_owner:$r_group${mode_part:+ }$mode_part"
       actual="$(bridge_isolation_v2_reapply_probe_owner_group_mode "$r_path" 2>/dev/null || printf 'unknown')"
-      printf '%s\t%s\t%s\t%s\t%s\n' "$r_name" "$r_path" "$status" "$expected" "$actual"
+      # v0.9.7 PR 2 (refs #781): emit the criticality as a 6th column
+      # so `agent-bridge isolation verify --strict-optional` can promote
+      # `degraded` rows to `mismatch` post-hoc without re-walking the
+      # matrix. Existing 5-column consumers (PR 1's verify output)
+      # tolerate the extra column because they read with `IFS=$'\t' read
+      # -r _name _path _status _expected _actual` — trailing fields are
+      # silently absorbed by the last variable in plain `read` only when
+      # there are MORE fields than vars; with `read -r a b c d e` the
+      # 6th field tail-attaches to `e`. Verify CLI is updated to read
+      # the 6th column explicitly so the criticality stays addressable.
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$r_name" "$r_path" "$status" "$expected" "$actual" "$r_crit"
     elif (( row_rc != 0 )); then
-      bridge_warn "apply_grant_matrix_for_agent($agent): row $r_name failed at $r_path"
-      rc=1
+      if [[ "$r_crit" == "optional" || "$r_crit" == "not-applicable" ]]; then
+        bridge_warn "apply_grant_matrix_for_agent($agent): optional row $r_name degraded at $r_path (continuing)"
+      else
+        bridge_warn "apply_grant_matrix_for_agent($agent): row $r_name failed at $r_path"
+        rc=1
+      fi
     fi
   done < <(bridge_isolation_v2_matrix_rows_for_agent "$agent")
   return $rc

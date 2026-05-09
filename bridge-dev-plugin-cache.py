@@ -462,6 +462,60 @@ def link_source_node_modules(source_path: Path, cache_version_path: Path) -> tup
     return "linked", str(cache_node_modules)
 
 
+def _verify_cache_version_path(
+    cache_version_path: Path, source_path: Path
+) -> tuple[bool, str]:
+    """Post-link verification under the running UID.
+
+    The Python process already runs as the isolated UID (bridge-start
+    wraps the whole bridge-run.sh session under `sudo -n -u <os_user> -H`
+    for linux-user-isolated agents — see bridge-start.sh:447). So an
+    `os.access` probe here measures what the isolated agent will actually
+    see when it tries to read the cache version directory.
+
+    Returns (ok, reason). reason is empty when ok=True. v0.9.7 RC6:
+    success labels (`linked-verified`, `updated-verified`,
+    `unchanged-verified`) MUST NOT be emitted unless this returns True.
+    The previous linker logged `linked-OK` based purely on the symlink
+    existing, even when the dest dir was unreadable for the isolated UID
+    or never created — that silent success is exactly the bug RC6 names.
+    """
+    try:
+        if not source_path.exists():
+            return False, f"source-missing:{source_path}"
+    except OSError as exc:
+        return False, f"source-stat-failed:{exc}"
+
+    if not os.access(str(source_path), os.R_OK):
+        return False, f"source-unreadable:{source_path}"
+
+    try:
+        resolved = cache_version_path.resolve()
+    except OSError as exc:
+        return False, f"cache-resolve-failed:{exc}"
+
+    if not resolved.is_dir():
+        return False, f"cache-version-dir-missing:{cache_version_path}"
+
+    if not os.access(str(resolved), os.R_OK):
+        return False, f"cache-version-dir-unreadable:{cache_version_path}"
+
+    # Every parent dir must be traversable for the isolated UID, otherwise
+    # the agent process can resolve the symlink but cannot enter the cache.
+    parent = resolved.parent
+    while True:
+        try:
+            if not os.access(str(parent), os.X_OK):
+                return False, f"parent-not-traversable:{parent}"
+        except OSError as exc:
+            return False, f"parent-access-failed:{parent}:{exc}"
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+
+    return True, ""
+
+
 def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
     marketplace_name, plugins = load_marketplace(root)
 
@@ -485,12 +539,23 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
     source_rel = metadata.get("source") or ""
     version = metadata.get("version") or "0.1.0"
     source_path = (root / source_rel).resolve()
+    # RC6 pre-link assertion: source path must exist AND be readable by
+    # the running UID (which is the isolated agent UID under sudo wrap).
+    # The previous linker only checked existence; an unreadable source
+    # (group/ACL drift) would still log success.
     if not source_path.exists():
         return {
             "channel": channel,
             "plugin": plugin_name,
             "status": "missing",
             "reason": f"source-missing:{source_path}",
+        }
+    if not os.access(str(source_path), os.R_OK):
+        return {
+            "channel": channel,
+            "plugin": plugin_name,
+            "status": "install-failed",
+            "reason": f"source-unreadable:{source_path}",
         }
 
     # Defense-in-depth: every component about to be joined into the
@@ -517,35 +582,52 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
     orphan_removed = 0
     cache_type = "missing"
 
-    if cache_version_path.is_symlink():
-        current_target = cache_version_path.resolve()
-        if current_target == source_path:
-            status = "unchanged"
-        else:
-            cache_version_path.unlink(missing_ok=True)
-            cache_version_path.symlink_to(source_path, target_is_directory=True)
-            status = "updated"
-        cache_type = "symlink"
-    else:
-        if cache_version_path.is_dir():
-            # Real cache directories carry installed dependencies. Overlay source
-            # files (everything except node_modules) so operator edits reach the
-            # cache, while preserving the cache's installed node_modules dir. The
-            # source root's node_modules is then linked back to the cache below.
-            changed = overlay_source_to_cache(source_path, cache_version_path)
-            status = "updated" if changed else "unchanged"
-            cache_type = "directory"
-        elif cache_version_path.exists():
-            remove_tree(cache_version_path)
-            status = "updated"
+    try:
+        if cache_version_path.is_symlink():
+            current_target = cache_version_path.resolve()
+            if current_target == source_path:
+                status = "unchanged"
+            else:
+                cache_version_path.unlink(missing_ok=True)
+                cache_version_path.symlink_to(source_path, target_is_directory=True)
+                status = "updated"
             cache_type = "symlink"
-            plugin_cache_root.mkdir(parents=True, exist_ok=True)
-            cache_version_path.symlink_to(source_path, target_is_directory=True)
         else:
-            status = "linked"
-            cache_type = "symlink"
-            plugin_cache_root.mkdir(parents=True, exist_ok=True)
-            cache_version_path.symlink_to(source_path, target_is_directory=True)
+            if cache_version_path.is_dir():
+                # Real cache directories carry installed dependencies. Overlay source
+                # files (everything except node_modules) so operator edits reach the
+                # cache, while preserving the cache's installed node_modules dir. The
+                # source root's node_modules is then linked back to the cache below.
+                changed = overlay_source_to_cache(source_path, cache_version_path)
+                status = "updated" if changed else "unchanged"
+                cache_type = "directory"
+            elif cache_version_path.exists():
+                remove_tree(cache_version_path)
+                status = "updated"
+                cache_type = "symlink"
+                plugin_cache_root.mkdir(parents=True, exist_ok=True)
+                cache_version_path.symlink_to(source_path, target_is_directory=True)
+            else:
+                status = "linked"
+                cache_type = "symlink"
+                plugin_cache_root.mkdir(parents=True, exist_ok=True)
+                cache_version_path.symlink_to(source_path, target_is_directory=True)
+    except OSError as exc:
+        # Filesystem refused the install action — fail loud, do not
+        # fall through to a verified label. RC6 root cause was the
+        # opposite: actions silently failed and the linker still
+        # printed success.
+        return {
+            "channel": channel,
+            "plugin": plugin_name,
+            "marketplace": marketplace_name,
+            "version": version,
+            "source": str(source_path),
+            "cache": str(cache_version_path),
+            "cache_type": cache_type,
+            "status": "install-failed",
+            "reason": f"install-error:{exc}",
+        }
 
     if plugin_cache_root.exists():
         for marker in plugin_cache_root.rglob(".orphaned_at"):
@@ -553,6 +635,35 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
             orphan_removed += 1
 
     node_modules_status, node_modules_target = link_source_node_modules(source_path, cache_version_path)
+
+    # RC6 post-link verification: a successful install action does not
+    # imply a usable cache for the isolated agent. We must verify under
+    # the running UID before promoting the status to a `*-verified`
+    # label. Failure relabels to `linked-failed` with a structured
+    # reason and the criticality split decides block vs warn.
+    verified, verify_reason = _verify_cache_version_path(cache_version_path, source_path)
+    if not verified:
+        return {
+            "channel": channel,
+            "plugin": plugin_name,
+            "marketplace": marketplace_name,
+            "version": version,
+            "source": str(source_path),
+            "cache": str(cache_version_path),
+            "cache_type": cache_type,
+            "status": "linked-failed",
+            "reason": verify_reason,
+            "node_modules_status": node_modules_status,
+            "node_modules_target": node_modules_target,
+            "orphan_removed": str(orphan_removed),
+        }
+
+    # Success path: relabel `linked` → `linked-verified`,
+    # `updated` → `updated-verified`, `unchanged` → `unchanged-verified`.
+    # Operators (and the bridge-run audit tail) rely on the `-verified`
+    # suffix to distinguish v0.9.7 RC6-fixed output from the older
+    # `linked-OK` lying-success line.
+    verified_status = f"{status}-verified"
 
     return {
         "channel": channel,
@@ -562,11 +673,31 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
         "source": str(source_path),
         "cache": str(cache_version_path),
         "cache_type": cache_type,
-        "status": status,
+        "status": verified_status,
         "node_modules_status": node_modules_status,
         "node_modules_target": node_modules_target,
         "orphan_removed": str(orphan_removed),
     }
+
+
+_VERIFIED_STATUSES = frozenset(
+    {"linked-verified", "updated-verified", "unchanged-verified"}
+)
+_BENIGN_STATUSES = frozenset({"ignored"})
+
+
+def _is_required_channel(channel: str, required: set[str]) -> bool:
+    """Return True when this channel should block on failure (Q4 split).
+
+    A channel is required when its full `plugin:<name>@<marketplace>`
+    string was passed in `--required-channels`, OR (back-compat) when
+    `--required-channels` is empty (legacy callers that don't yet pass
+    the split treat every channel as required, matching pre-v0.9.7
+    behavior of the bridge-run sync helper).
+    """
+    if not required:
+        return True
+    return channel in required
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -575,36 +706,136 @@ def main(argv: list[str] | None = None) -> int:
 
     sync_parser = sub.add_parser("sync")
     sync_parser.add_argument("--channels", required=True)
+    # v0.9.7 RC6 (Q4 decision): channel-required plugin failure must
+    # block bridge-start; optional plugin failure must warn and continue.
+    # The caller (bridge-run.sh) computes the two sets from
+    # `bridge_agent_effective_dev_channels_csv` and `BRIDGE_AGENT_PLUGINS`
+    # respectively and passes them as separate args. Defaulting both to
+    # empty preserves the pre-RC6 caller contract: with no split the
+    # linker treats every channel as required (block-on-fail), which
+    # matches the legacy bridge-run behavior of `bridge_warn` + return.
+    sync_parser.add_argument(
+        "--required-channels",
+        default="",
+        help=(
+            "CSV of channel-required plugin: entries (failure blocks "
+            "bridge-start). Default empty = treat every --channels item "
+            "as required (back-compat)."
+        ),
+    )
+    sync_parser.add_argument(
+        "--optional-channels",
+        default="",
+        help=(
+            "CSV of optional plugin: entries (failure warns and "
+            "continues). Items in this set are demoted to non-fatal "
+            "even if also listed in --channels."
+        ),
+    )
     sync_parser.add_argument("--root", default=str(repo_root()))
     sync_parser.add_argument("--json", action="store_true")
+    sync_parser.add_argument(
+        "--agent",
+        default="",
+        help="Agent name for log lines (operator-visible context).",
+    )
 
     args = parser.parse_args(argv)
     if args.command != "sync":
         return 1
 
     root = Path(args.root).expanduser().resolve()
+    required_set = set(normalize_channels(args.required_channels))
+    optional_set = set(normalize_channels(args.optional_channels))
+    # Optional always wins over required when an entry appears in both
+    # (operator listed the same plugin in BRIDGE_AGENT_CHANNELS and
+    # BRIDGE_AGENT_PLUGINS — treat the more lenient declaration as the
+    # binding one, since the operator explicitly opted into the
+    # warn-and-continue mode for that plugin).
+    required_set -= optional_set
+    agent_label = args.agent or "-"
+
     results = [
         sync_plugin_cache(resolve_marketplace_root(root, item), item)
         for item in normalize_channels(args.channels)
     ]
+
+    # Tag each result with criticality so the downstream reporter and
+    # exit-code logic can apply the Q4 split uniformly.
+    required_failures: list[dict[str, str]] = []
+    optional_failures: list[dict[str, str]] = []
+    for item in results:
+        channel = item.get("channel", "")
+        status = item.get("status", "unknown")
+        if channel in optional_set:
+            criticality = "optional"
+        elif _is_required_channel(channel, required_set):
+            criticality = "channel-required"
+        else:
+            criticality = "optional"
+        item["criticality"] = criticality
+
+        if status in _VERIFIED_STATUSES or status in _BENIGN_STATUSES:
+            continue
+        if criticality == "channel-required":
+            required_failures.append(item)
+        else:
+            optional_failures.append(item)
+
     if args.json:
-        json.dump({"results": results}, sys.stdout, ensure_ascii=False)
+        json.dump(
+            {
+                "results": results,
+                "agent": args.agent,
+                "required_failure_count": len(required_failures),
+                "optional_failure_count": len(optional_failures),
+            },
+            sys.stdout,
+            ensure_ascii=False,
+        )
         sys.stdout.write("\n")
-        return 0
+        # JSON callers still get the criticality-aware exit code so a
+        # programmatic consumer (bridge-run.sh) can branch identically
+        # whether or not it asked for human or JSON output.
+        return 1 if required_failures else 0
 
     for item in results:
         status = item.get("status", "unknown")
         plugin = item.get("plugin") or item.get("channel") or "-"
-        if status in {"linked", "updated", "unchanged"}:
+        criticality = item.get("criticality", "channel-required")
+        if status in _VERIFIED_STATUSES:
             print(
                 f"{plugin}: {status} cache={item.get('cache','-')} source={item.get('source','-')} "
                 f"node_modules={item.get('node_modules_status','-')} "
                 f"node_modules_target={item.get('node_modules_target','-') or '-'} "
-                f"orphan_removed={item.get('orphan_removed','0')}"
+                f"orphan_removed={item.get('orphan_removed','0')} "
+                f"criticality={criticality}"
             )
-        else:
+        elif status in _BENIGN_STATUSES:
             print(f"{plugin}: {status} ({item.get('reason','-')})")
-    return 0
+        else:
+            # Failure line — tag with criticality so the operator (and
+            # bridge-run audit) can tell `WARNING (optional)` apart from
+            # `ERROR (channel-required)` at a glance.
+            tag = "ERROR" if criticality == "channel-required" else "WARNING"
+            print(
+                f"{tag} {plugin}: {status} ({item.get('reason','-')}) "
+                f"criticality={criticality} agent={agent_label}"
+            )
+
+    if optional_failures and not required_failures:
+        # Q4 decision: optional plugin failures warn and continue. Emit
+        # one summary line per failed optional plugin so the operator
+        # sees `launched without it` in the launch log even when no
+        # ERROR line drew their attention to the per-plugin block above.
+        for item in optional_failures:
+            plugin = item.get("plugin") or item.get("channel") or "-"
+            print(
+                f"WARNING: plugin {plugin} missing for agent {agent_label}, "
+                f"launched without it"
+            )
+
+    return 1 if required_failures else 0
 
 
 if __name__ == "__main__":

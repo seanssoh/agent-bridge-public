@@ -82,7 +82,8 @@ Read-only — no chmod/chgrp/setfacl/mkdir. Exit non-zero on required mismatch.
 Options:
   --agent <name>       Agent id (required).
   --json               Emit machine-readable output instead of the table.
-  --strict-optional    Treat optional plugin rows as required (PR 2).
+  --strict-optional    Treat optional plugin rows as required (CLI exit
+                       non-zero on any optional row reporting 'degraded').
 
 Available even on legacy/markerless installs to advise upgrade.
 Run `agent-bridge upgrade --apply` first to populate the v2 layout.
@@ -885,9 +886,10 @@ PY
                 shift
                 ;;
               --strict-optional)
-                # Accepted for forward compatibility with PR 2's
-                # criticality split. PR 1 does not enumerate optional
-                # rows yet, so the flag is a no-op here.
+                # v0.9.7 PR 2 (refs #781): with this flag, `degraded`
+                # rows (criticality=optional, mismatch) escalate to
+                # `mismatch` and the CLI exits non-zero. Without it,
+                # only required-row mismatches flip the exit code.
                 _iso_strict_optional=1
                 shift
                 ;;
@@ -897,11 +899,13 @@ Usage: $CLI_NAME isolation verify --agent <agent> [--json] [--strict-optional]
 
 Read-only verification of the v2 isolation grant matrix for one agent.
 Walks every required-access row and reports {path, expected, actual,
-status, suggested_fix}. Exits non-zero on any required mismatch.
+status, criticality, suggested_fix}. Exits non-zero on any required
+mismatch.
 
   --agent <X>         agent id (required)
   --json              emit machine-readable JSON (default: human table)
-  --strict-optional   PR 2 forward-compat flag (no-op in PR 1)
+  --strict-optional   treat optional row failures as required (CLI exit
+                      non-zero on any optional 'degraded' row)
 
 Suggested fix when verify reports drift:
   agent-bridge migrate isolation v2 --apply --agent <X>
@@ -928,29 +932,50 @@ EOF
           _iso_check_out="$(bridge_isolation_v2_apply_grant_matrix_for_agent "$_iso_agent" --check 2>&1)" \
             || _iso_rc=$?
 
+          # v0.9.7 PR 2 (refs #781): apply_grant_matrix_for_agent now
+          # demotes optional-row failures to status=`degraded` and does
+          # NOT flip rc for them. With `--strict-optional`, the CLI
+          # treats any `degraded` row as a hard mismatch for exit code
+          # purposes (the row data itself stays `degraded` so the
+          # operator can see which rows are optional vs required).
+          if (( _iso_strict_optional == 1 )) \
+              && [[ "$_iso_check_out" == *$'\tdegraded\t'* ]]; then
+            _iso_rc=1
+          fi
+
           if (( _iso_json == 1 )); then
             bridge_require_python
             # The check output is passed as a third positional arg so the
             # python heredoc remains the script source while data lands
             # in argv. This avoids the heredoc-overrides-pipe bash trap
             # (shellcheck SC2259) without writing temp files.
-            python3 - "$_iso_agent" "$_iso_rc" "$_iso_check_out" <<'PY'
+            python3 - "$_iso_agent" "$_iso_rc" "$_iso_check_out" "$_iso_strict_optional" <<'PY'
 import json, sys
 agent = sys.argv[1]
 rc = int(sys.argv[2])
 data = sys.argv[3] if len(sys.argv) > 3 else ""
+strict_optional = sys.argv[4] == "1" if len(sys.argv) > 4 else False
 rows = []
 for line in data.splitlines():
     parts = line.split("\t")
+    # 6-column format added in v0.9.7 PR 2: row, path, status,
+    # expected, actual, criticality. Tolerate older 5-column lines so
+    # consumers reading the upgrader's pre-upgrade snapshot don't break.
     if len(parts) < 5:
         continue
-    row_name, path, status, expected, actual = parts[:5]
+    row_name = parts[0]
+    path = parts[1]
+    status = parts[2]
+    expected = parts[3]
+    actual = parts[4]
+    criticality = parts[5] if len(parts) > 5 else "required"
     rows.append({
         "row": row_name,
         "path": path,
         "status": status,
         "expected": expected,
         "actual": actual,
+        "criticality": criticality,
         "suggested_fix": (
             f"agent-bridge migrate isolation v2 --apply --agent {agent}"
             if status != "ok" else ""
@@ -959,22 +984,34 @@ for line in data.splitlines():
 print(json.dumps({
     "agent": agent,
     "exit_status": "ok" if rc == 0 else "mismatch",
+    "strict_optional": strict_optional,
     "rows": rows,
 }, ensure_ascii=False, indent=2))
 PY
           else
             printf 'Isolation grant matrix verify for agent: %s\n' "$_iso_agent"
+            if (( _iso_strict_optional == 1 )); then
+              printf '%s\n' "(strict-optional: degraded rows escalated to required)"
+            fi
             printf '%s\n' "------------------------------------------------------------------"
-            printf '%-26s %-10s %-30s %s\n' "ROW" "STATUS" "EXPECTED" "PATH"
+            printf '%-26s %-10s %-14s %-30s %s\n' "ROW" "STATUS" "CRITICALITY" "EXPECTED" "PATH"
             printf '%s\n' "------------------------------------------------------------------"
-            while IFS=$'\t' read -r _name _path _status _expected _actual; do
+            while IFS=$'\t' read -r _name _path _status _expected _actual _crit; do
               [[ -n "$_name" ]] || continue
-              printf '%-26s %-10s %-30s %s\n' \
-                "$_name" "$_status" "$_expected" "$_path"
+              # Tolerate 5-column input from older callers — fall back
+              # to `required` so the table still renders sensibly.
+              [[ -n "$_crit" ]] || _crit="required"
+              printf '%-26s %-10s %-14s %-30s %s\n' \
+                "$_name" "$_status" "$_crit" "$_expected" "$_path"
             done <<<"$_iso_check_out"
             printf '%s\n' "------------------------------------------------------------------"
             if (( _iso_rc == 0 )); then
-              echo "All required rows: ok"
+              if [[ "$_iso_check_out" == *$'\tdegraded\t'* ]]; then
+                echo "All required rows: ok (some optional rows degraded)"
+                echo "Run with --strict-optional to fail on optional row degradation."
+              else
+                echo "All required rows: ok"
+              fi
             else
               echo "Drift detected. Repair with:"
               echo "  agent-bridge migrate isolation v2 --apply --agent $_iso_agent"
