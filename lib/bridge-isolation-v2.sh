@@ -1392,10 +1392,10 @@ bridge_isolation_v2_apply_row() {
         return 1
       fi
       if [[ "$mode" == "apply" ]]; then
-        bridge_isolation_v2_apply_controller_credentials_read_grant "$agent_for_rc3"
+        bridge_isolation_v2_apply_controller_credentials_read_grant "$agent_for_rc3" "$file_mode"
         return $?
       fi
-      bridge_isolation_v2_check_controller_credentials_read_grant "$agent_for_rc3" "$path"
+      bridge_isolation_v2_check_controller_credentials_read_grant "$agent_for_rc3" "$path" "$file_mode"
       return $?
       ;;
     install_managed)
@@ -1535,7 +1535,11 @@ bridge_isolation_v2_apply_grant_matrix_for_agent() {
       # catch: previously only the apply branch routed; check fell through
       # to apply_row which only verified mask::r--.)
       if [[ "$mode" == "apply" ]]; then
-        bridge_isolation_v2_apply_controller_credentials_read_grant "$agent" \
+        # Pass r_fmode so apply repairs mode + closes other-bits to match
+        # what check enforces (r5 codex catch — apply/check invariants
+        # were asymmetric: apply set only ACL, check rejected mode/other).
+        bridge_isolation_v2_apply_controller_credentials_read_grant \
+          "$agent" "$r_fmode" \
           || row_rc=$?
       else
         # Pass r_fmode so the helper enforces the matrix-contracted file
@@ -1599,15 +1603,20 @@ bridge_isolation_v2_ensure_matrix_path() {
 }
 
 bridge_isolation_v2_apply_controller_credentials_read_grant() {
-  # RC3: the SINGLE named-user-ACL exception. Grants
-  #   u:agent-bridge-<X>:r--   on  ~/.claude/.credentials.json
-  #   u:agent-bridge-<X>:--x   on  every ancestor back to /
-  # then sets `m::r--` on the file so the named entry is effective.
+  # RC3: the SINGLE named-user-ACL exception. Brings the credential file
+  # into the contracted state — apply must mirror exactly what check
+  # rejects, otherwise apply returns 0 while verify still fails.
+  # Contracted state (matches check's 5 conditions):
+  #   (a) m::r--                        — file ACL mask
+  #   (b) u:agent-bridge-<X>:r--        — named-user grant
+  #   (c) u:agent-bridge-<X>:--x        — on every ancestor back to /
+  #   (d) o::---                        — base other bits closed (no world read)
+  #   (e) mode == file_mode (default 0600)
   #
   # Path guard: refuse to operate unless the resolved file lives under
   # the controller home's `.claude/`, never follow symlinks. This is the
   # v0.9.5/v0.9.6 mask-break recurrence prevention.
-  local agent="$1"
+  local agent="$1" file_mode="${2:-0600}"
   [[ -n "$agent" ]] || {
     bridge_warn "apply_controller_credentials_read_grant: agent required"
     return 1
@@ -1654,10 +1663,19 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
       }
     ancestor="$(dirname "$ancestor")"
   done
-  # File-level read grant + mask repair (the v0.9.5/v0.9.6 wipe).
+  # File-level: mode + ACL all in one call so apply mirrors check exactly.
+  # (r5 codex catch — previously apply set only u:<X>:r-- + m::r-- but
+  # left mode 0644 / other::r-- intact, so verify rejected post-apply.)
+  # `setfacl -m` for o::--- ensures other-bits are closed even if the
+  # underlying chmod doesn't strip them (it does on standard EXT/XFS,
+  # but make it explicit so the ACL stays canonical).
+  _bridge_isolation_v2_run_root_or_sudo chmod "$file_mode" "$cred_file" 2>/dev/null || {
+    bridge_warn "apply_controller_credentials_read_grant: chmod $file_mode on $cred_file failed"
+    return 1
+  }
   _bridge_isolation_v2_run_root_or_sudo \
-    setfacl -m "u:${iso_user}:r--" -m "m::r--" "$cred_file" 2>/dev/null || {
-      bridge_warn "apply_controller_credentials_read_grant: setfacl r-- + m::r-- on $cred_file failed"
+    setfacl -m "u:${iso_user}:r--" -m "m::r--" -m "o::---" "$cred_file" 2>/dev/null || {
+      bridge_warn "apply_controller_credentials_read_grant: setfacl r-- + m::r-- + o::--- on $cred_file failed"
       return 1
     }
   return 0
