@@ -422,11 +422,20 @@ def _overlay_dir(src: Path, dst: Path) -> bool:
 
 
 def overlay_source_to_cache(source_path: Path, cache_version_path: Path) -> bool:
-    """Mirror source files (except node_modules) onto cache. Returns True if changed."""
+    """Mirror EVERYTHING from source onto cache, including node_modules.
+
+    r3 codex catch — earlier overlay skipped node_modules and
+    link_source_node_modules then symlinked source/node_modules → cache,
+    which (a) modified the SOURCE tree (unsafe, source-of-truth must
+    stay clean) and (b) made every agent's sync race over the same
+    source/node_modules pointer (cross-agent collision). The fix is to
+    treat the cache as a fully self-contained per-agent snapshot:
+    copy node_modules into the cache too. Disk overhead is bounded by
+    the plugin's installed dependency tree per agent (operator
+    acknowledged 100-300 MB / agent in design v2).
+    """
     changed = False
     for entry in source_path.iterdir():
-        if entry.name == NODE_MODULES_NAME:
-            continue
         target = cache_version_path / entry.name
         if entry.is_symlink() or entry.is_file():
             if _copy_file_if_changed(entry, target):
@@ -597,7 +606,8 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
             # overlay source so the cache is genuinely per-agent.
             cache_version_path.unlink(missing_ok=True)
             plugin_cache_root.mkdir(parents=True, exist_ok=True)
-            cache_version_path.mkdir(parents=False, exist_ok=False)
+            cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
+            cache_version_path.chmod(0o700)  # explicit, defensive against umask
             overlay_source_to_cache(source_path, cache_version_path)
             status = "updated"
             cache_type = "directory"
@@ -615,7 +625,8 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
             # rebuild as real directory.
             remove_tree(cache_version_path)
             plugin_cache_root.mkdir(parents=True, exist_ok=True)
-            cache_version_path.mkdir(parents=False, exist_ok=False)
+            cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
+            cache_version_path.chmod(0o700)  # explicit, defensive against umask
             overlay_source_to_cache(source_path, cache_version_path)
             status = "updated"
             cache_type = "directory"
@@ -623,7 +634,8 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
             # First-time install — create the per-agent directory and
             # overlay source files into it.
             plugin_cache_root.mkdir(parents=True, exist_ok=True)
-            cache_version_path.mkdir(parents=False, exist_ok=False)
+            cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
+            cache_version_path.chmod(0o700)  # explicit, defensive against umask
             overlay_source_to_cache(source_path, cache_version_path)
             status = "linked"
             cache_type = "directory"
@@ -649,7 +661,23 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
             marker.unlink(missing_ok=True)
             orphan_removed += 1
 
-    node_modules_status, node_modules_target = link_source_node_modules(source_path, cache_version_path)
+    # r3 codex catch — link_source_node_modules MODIFIED the source's
+    # node_modules entry, making every agent's sync race over the same
+    # source pointer (cross-agent collision). The new overlay path
+    # above includes node_modules in the cache itself, so the cache is
+    # genuinely self-contained per-agent. We retain the status report
+    # for backward compat (downstream readers parse the field) but
+    # derive it from the cache's own node_modules now.
+    cache_node_modules = cache_version_path / "node_modules"
+    if cache_node_modules.is_dir():
+        node_modules_status = "present"
+        node_modules_target = str(cache_node_modules)
+    elif cache_node_modules.exists():
+        node_modules_status = "not-directory"
+        node_modules_target = str(cache_node_modules)
+    else:
+        node_modules_status = "missing"
+        node_modules_target = ""
 
     # RC6 post-link verification: a successful install action does not
     # imply a usable cache for the isolated agent. We must verify under
