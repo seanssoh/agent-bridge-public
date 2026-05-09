@@ -582,6 +582,11 @@ def _skip_paren_subst(s, i, n):
     # the closing `)`. Whitespace and `=` inside a $(…) substitution
     # MUST NOT split the enclosing token, so the caller treats this
     # span as opaque. (codex r4 review on PR #776 — Probe 14.)
+    #
+    # r6 codex catch — also honor inner ${…} and `…` so a `)` that
+    # belongs to a nested brace-default like `${UNSET:-) NAME=…}` or
+    # to a backtick-substitution does NOT prematurely close our
+    # paren depth.
     depth = 1
     while i < n and depth > 0:
         c = s[i]
@@ -592,7 +597,6 @@ def _skip_paren_subst(s, i, n):
             depth -= 1
             i += 1
         elif c == "'":
-            # Single-quoted span inside $(…) — literal until next `'`.
             i += 1
             while i < n and s[i] != "'":
                 i += 1
@@ -600,6 +604,12 @@ def _skip_paren_subst(s, i, n):
                 i += 1
         elif c == '"':
             i = _skip_dquote(s, i + 1, n)
+        elif c == "$" and i + 1 < n and s[i + 1] == "(":
+            i = _skip_paren_subst(s, i + 2, n)
+        elif c == "$" and i + 1 < n and s[i + 1] == "{":
+            i = _skip_brace_subst(s, i + 2, n)
+        elif c == "`":
+            i = _skip_backtick(s, i + 1, n)
         elif c == "\\" and i + 1 < n:
             i += 2
         else:
@@ -610,7 +620,12 @@ def _skip_paren_subst(s, i, n):
 def _skip_backtick(s, i, n):
     # i points just AFTER opening backtick. Walks to next backtick;
     # legacy backticks don't nest natively (POSIX requires `\\\``
-    # escaping for nesting), so honor backslash escapes only.
+    # escaping for nesting), so honor backslash escapes only. Inner
+    # ${…} and $(…) are NOT treated as nesting boundaries here — the
+    # next bare backtick (or escaped pair) closes the span — but the
+    # quote-state inside still suppresses any `=` matching at the
+    # outer walker level (we never re-enter the walker until we
+    # return past the closing backtick). (r6 — kept POSIX-conformant.)
     while i < n and s[i] != "`":
         if s[i] == "\\" and i + 1 < n:
             i += 2
@@ -623,9 +638,12 @@ def _skip_backtick(s, i, n):
 
 def _skip_brace_subst(s, i, n):
     # i points just AFTER `${`. Walks to matching `}` honoring nested
-    # braces and quote-state. Param-expansion defaults can contain
-    # whitespace (e.g. `${VAR:-some default}`), so we must not let an
-    # inner space split the enclosing token.
+    # braces, quotes, and inner $(…) / `…` substitutions. Param-
+    # expansion defaults can contain whitespace and arbitrary inner
+    # constructs (e.g. `${VAR:-$(echo NAME=fake)}` or
+    # `${VAR:-some `echo X` default}`), so we must not let an inner
+    # space, `}`, or `)` from a nested context split the enclosing
+    # token. (r6 codex catch — symmetry with _skip_paren_subst.)
     depth = 1
     while i < n and depth > 0:
         c = s[i]
@@ -643,6 +661,12 @@ def _skip_brace_subst(s, i, n):
                 i += 1
         elif c == '"':
             i = _skip_dquote(s, i + 1, n)
+        elif c == "$" and i + 1 < n and s[i + 1] == "(":
+            i = _skip_paren_subst(s, i + 2, n)
+        elif c == "$" and i + 1 < n and s[i + 1] == "{":
+            i = _skip_brace_subst(s, i + 2, n)
+        elif c == "`":
+            i = _skip_backtick(s, i + 1, n)
         elif c == "\\" and i + 1 < n:
             i += 2
         else:
