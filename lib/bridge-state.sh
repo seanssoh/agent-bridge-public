@@ -536,10 +536,48 @@ if any(
 if any(item == "plugin:teams" or item.startswith("plugin:teams@") for item in required):
     assignments.append(("TEAMS_STATE_DIR", teams_dir))
 
+# Issue #771 v0.9.6 — operator's R5 diagnostic confirmed PRIMARY fix
+# (v0.9.5 PR #774 `agent_env_regen`) was a false-positive: the regen
+# correctly re-invokes this helper, but the helper's loop SKIPS any
+# assignment whose name (`<NAME>=`) is already present in env_prefix
+# regardless of the value. So a frozen-roster LAUNCH_CMD with stale
+# `TEAMS_STATE_DIR=…/agents/<X>/.teams` (pre-v2 path) is NEVER
+# replaced — the helper sees the name, skips, and the same stale
+# value rides through every restart. Fresh-setup agents (no existing
+# assignment) work correctly because the append branch fires; legacy
+# v0.7→v0.8 isolated agents stay broken indefinitely. v0.9.5
+# orbstack validation only exercised the fresh-setup case.
+#
+# Fix: regex-match the existing assignment for each name and REPLACE
+# its value with the canonical (live-computed) one. Idempotent in
+# the fresh case (regex doesn't match → falls through to append) and
+# correct in the stale case (regex matches → in-place replace).
+# Pattern allows shell-quoted values (single-quoted, double-quoted,
+# or unquoted whitespace-bounded) so it survives roster-side hand
+# edits and `printf '%q'` outputs from prior writers.
 for name, value in assignments:
-    if f"{name}=" in env_prefix:
-        continue
-    env_prefix += f"{name}={shlex.quote(value)} "
+    quoted = shlex.quote(value)
+    pattern = re.compile(
+        r"(?:(?<=^)|(?<=\s))" + re.escape(name) + r"=("
+        r"'[^']*'"             # single-quoted value
+        r"|\"(?:\\.|[^\"\\])*\""  # double-quoted value
+        r"|\S+"                 # unquoted run of non-whitespace
+        r")"
+    )
+    # r2 codex Probe 8: replace ALL occurrences (not just first) so a
+    # roster with duplicate same-name assignments (e.g. accumulated by
+    # `agent update --launch-cmd-add-env` paths that prepend without
+    # dedup, or by manual edits) doesn't leave a stale second copy.
+    # Shell eval is last-definition-wins, so even one surviving stale
+    # copy after our first occurrence's replacement would re-overwrite
+    # the canonical value at runtime. Use pattern.subn without count
+    # to replace globally; falling through to append only when there
+    # were ZERO matches (true fresh-setup case).
+    new_prefix, count = pattern.subn(f"{name}={quoted}", env_prefix)
+    if count > 0:
+        env_prefix = new_prefix
+    else:
+        env_prefix += f"{name}={quoted} "
 
 print(f"{env_prefix}{command}" if env_prefix else command)
 PY
