@@ -1443,7 +1443,18 @@ bridge_isolation_v2_apply_row() {
       want="$(printf '%04o' "$((8#$dir_mode))" 2>/dev/null || printf '%s' "$dir_mode")"
       local got
       got="$(printf '%04o' "$((8#$actual_mode))" 2>/dev/null || printf '%s' "$actual_mode")"
-      [[ "$want" == "$got" ]]
+      [[ "$want" == "$got" ]] || return 1
+      # r2 codex catch — also compare owner:group. Without this, RC1-style
+      # group drift (e.g. state/agents/<X> owned by ab-controller instead
+      # of ab-agent-<X>) false-passes the check despite mode being correct.
+      # apply path (chown above) doesn't accept token names ("controller"
+      # etc.) — caller must already resolve tokens to actual user/group
+      # names — so check uses the same resolved comparison.
+      local actual_og want_og
+      actual_og="$(stat -c '%U:%G' "$path" 2>/dev/null || stat -f '%Su:%Sg' "$path" 2>/dev/null)"
+      [[ -n "$actual_og" ]] || return 1
+      want_og="$owner:$group"
+      [[ "$actual_og" == "$want_og" ]]
       return $?
       ;;
     file)
@@ -1471,7 +1482,16 @@ bridge_isolation_v2_apply_row() {
         got_f="$(printf '%04o' "$((8#$actual))" 2>/dev/null || printf '%s' "$actual")"
         [[ "$want_f" == "$got_f" ]] || return 1
       fi
-      return 0
+      # r2 codex catch — owner:group drift also fails check, mirroring dir
+      # branch above. Files inherit group from setgid parent in normal
+      # operation, but a mis-grouped pre-existing file (e.g. RC2's
+      # ec2-user:ab-controller idle-since) must surface here.
+      local actual_og_f want_og_f
+      actual_og_f="$(stat -c '%U:%G' "$path" 2>/dev/null || stat -f '%Su:%Sg' "$path" 2>/dev/null)"
+      [[ -n "$actual_og_f" ]] || return 1
+      want_og_f="$owner:$group"
+      [[ "$actual_og_f" == "$want_og_f" ]]
+      return $?
       ;;
     *)
       bridge_warn "apply_row($row_name): unknown access_type '$access_type'"
