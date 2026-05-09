@@ -556,28 +556,63 @@ if any(item == "plugin:teams" or item.startswith("plugin:teams@") for item in re
 # or unquoted whitespace-bounded) so it survives roster-side hand
 # edits and `printf '%q'` outputs from prior writers.
 for name, value in assignments:
-    quoted = shlex.quote(value)
-    pattern = re.compile(
-        r"(?:(?<=^)|(?<=\s))" + re.escape(name) + r"=("
-        r"'[^']*'"             # single-quoted value
-        r"|\"(?:\\.|[^\"\\])*\""  # double-quoted value
-        r"|\S+"                 # unquoted run of non-whitespace
-        r")"
-    )
-    # r2 codex Probe 8: replace ALL occurrences (not just first) so a
-    # roster with duplicate same-name assignments (e.g. accumulated by
-    # `agent update --launch-cmd-add-env` paths that prepend without
-    # dedup, or by manual edits) doesn't leave a stale second copy.
-    # Shell eval is last-definition-wins, so even one surviving stale
-    # copy after our first occurrence's replacement would re-overwrite
-    # the canonical value at runtime. Use pattern.subn without count
-    # to replace globally; falling through to append only when there
-    # were ZERO matches (true fresh-setup case).
-    new_prefix, count = pattern.subn(f"{name}={quoted}", env_prefix)
-    if count > 0:
-        env_prefix = new_prefix
-    else:
-        env_prefix += f"{name}={quoted} "
+    quoted_value = shlex.quote(value)
+    # r3 codex Probe 9 — quote-context-aware token replacement.
+    # The earlier regex-only approach (`(?<=\s)NAME=(\S+|"…"|'…')` with
+    # `\S+` arm) treated whitespace inside another env var's *quoted*
+    # value as a valid top-level token boundary. With global subn,
+    # `TEAMS_APP_PASSWORD="x TEAMS_STATE_DIR=/fake"` would also have
+    # the nested-looking `TEAMS_STATE_DIR=/fake` substring rewritten,
+    # corrupting the unrelated env var. Tokenize with shlex.split so
+    # quoted values stay opaque, then only replace tokens whose
+    # prefix-form is exactly `NAME=` at top level. Bash sees the same
+    # semantics on the launch line because we shlex.quote the value
+    # half on re-emit.
+    try:
+        tokens = shlex.split(env_prefix, posix=True)
+        parse_ok = True
+    except ValueError:
+        # Mismatched quotes in roster prefix — bytes are already broken
+        # for shell; fall back to conservative append-if-absent so we
+        # don't mangle further. The shell launch will then surface the
+        # original parse error to the operator instead of us silently
+        # rewriting nested substrings.
+        parse_ok = False
+
+    if not parse_ok:
+        if f"{name}=" not in env_prefix:
+            env_prefix += f"{name}={quoted_value} "
+        continue
+
+    prefix_form = f"{name}="
+    replaced = False
+    new_tokens = []
+    for tok in tokens:
+        if tok.startswith(prefix_form):
+            # r2 Probe 8 retained: replace ALL occurrences. Shell eval is
+            # last-definition-wins, so a surviving duplicate after the
+            # first replacement would re-overwrite the canonical value.
+            new_tokens.append(f"{name}={value}")
+            replaced = True
+        else:
+            new_tokens.append(tok)
+    if not replaced:
+        new_tokens.append(f"{name}={value}")
+
+    out_parts = []
+    for tok in new_tokens:
+        eq = tok.find("=")
+        # Top-level `NAME=value` form: only quote the VALUE half so bash
+        # parses it as an env-prefix assignment (the `=` must stay
+        # outside the quoted block). Anything else (positional token,
+        # leading-`=`, name with metachars) gets quoted whole.
+        if eq > 0 and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tok[:eq]):
+            out_parts.append(f"{tok[:eq]}={shlex.quote(tok[eq+1:])}")
+        else:
+            out_parts.append(shlex.quote(tok))
+    env_prefix = " ".join(out_parts)
+    if env_prefix:
+        env_prefix += " "
 
 print(f"{env_prefix}{command}" if env_prefix else command)
 PY
