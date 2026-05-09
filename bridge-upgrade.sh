@@ -79,6 +79,17 @@ SOURCE_RECLASSIFY_JSON='{}'
 SHARED_SETTINGS_RERENDER_JSON='{"mode":"skipped","count":0,"failed_count":0,"candidates":[]}'
 ISOLATION_V2_MIGRATION_JSON=""
 
+# Issue #752 W3d (M10/M11/M12): partial-failure surfacing for late
+# upgrade subsystems (shared rerender / channel-policy refresh / profile
+# relink). Each site appends a stable name when its post-step probe
+# reports failures so the final --json envelope can emit
+# `status:"partial"` with `partial_failures:[...]`. These are not
+# upgrade-fatal — operators must see them, but the rest of the upgrade
+# (daemon restart, [upgrade-complete] task, etc.) still runs. Mirrors the
+# post-#754 `apply_for_upgrade` consumer pattern (see
+# lib/bridge-isolation-v2-migrate.sh:1709).
+_upgrade_partial_failures=()
+
 # Issue #682: every exit path from `apply` must emit a single valid JSON
 # document on stdout when --json is set. The success/dry-run paths emit
 # at the bottom of the script (search for `mode": "upgrade"`); the
@@ -1440,6 +1451,7 @@ if [[ $DRY_RUN -eq 0 ]]; then
   set -e
   if [[ $_shared_settings_rerender_rc -ne 0 ]]; then
     echo "[bridge-upgrade] WARN: shared Claude settings rerender reported failures" >&2
+    _upgrade_partial_failures+=("shared_rerender")
   fi
   if ! python3 - "$SHARED_SETTINGS_RERENDER_JSON" <<'PY'
 import json
@@ -1463,6 +1475,7 @@ raise SystemExit(0 if int(payload.get("failed_count") or 0) == 0 else 1)
 PY
   then
     echo "[bridge-upgrade] WARN: shared Claude settings rerender verification failed for one or more agents" >&2
+    _upgrade_partial_failures+=("shared_rerender")
   fi
 fi
 
@@ -1619,9 +1632,15 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   if [[ $DRY_RUN -eq 1 ]]; then
     policy_args+=(--dry-run)
   fi
-  bridge_upgrade_with_target_env "$TARGET_ROOT" \
-    "$BRIDGE_BASH_BIN" "$SOURCE_ROOT/scripts/apply-channel-policy.sh" "${policy_args[@]}" \
-    >/dev/null 2>&1 || true
+  if ! bridge_upgrade_with_target_env "$TARGET_ROOT" \
+      "$BRIDGE_BASH_BIN" "$SOURCE_ROOT/scripts/apply-channel-policy.sh" "${policy_args[@]}" \
+      >/dev/null 2>&1; then
+    # post-#759 (Wave-2 M5) `apply-channel-policy.sh` exits non-zero on
+    # all-fail. Surface the signal so operators see "singleton plugins
+    # may be misrouted" instead of the silent `|| true` swallow.
+    echo "[bridge-upgrade] WARN: channel-policy refresh failed (apply-channel-policy.sh exited non-zero) — singleton plugins may be misrouted" >&2
+    _upgrade_partial_failures+=("channel_policy_refresh")
+  fi
 fi
 
 # Issue #730 — repair v0.8 layout shared-doc/skill profile symlinks. Pre-v0.8
@@ -1636,6 +1655,23 @@ fi
 RELINK_PROFILE_JSON='{"mode":"skipped","count":0}'
 if [[ $DRY_RUN -eq 0 ]]; then
   RELINK_PROFILE_JSON="$(python3 "$TARGET_ROOT/bridge-hooks.py" relink-profile-paths --all-agents --json --bridge-home "$TARGET_ROOT" 2>&1 || true)"
+  # Issue #752 W3d M12: capture relink failed_count separately so a
+  # non-zero count surfaces as `partial_failures.profile_relink` in the
+  # final JSON envelope. The summary heredoc below still runs (with
+  # `|| true`) for the operator-facing log line.
+  _profile_relink_failed_count="$(printf '%s' "$RELINK_PROFILE_JSON" | python3 -c '
+import json, sys
+try:
+    payload = json.loads(sys.stdin.read())
+except (ValueError, TypeError):
+    print(0); sys.exit(0)
+agents = payload.get("agents", []) or []
+print(sum(len(a.get("failed", []) or []) for a in agents))
+' 2>/dev/null || printf 0)"
+  if [[ "${_profile_relink_failed_count:-0}" != "0" ]]; then
+    echo "[bridge-upgrade] WARN: profile relink reported failed_count=${_profile_relink_failed_count} — see embedded JSON for per-agent details" >&2
+    _upgrade_partial_failures+=("profile_relink")
+  fi
   python3 - "$RELINK_PROFILE_JSON" <<'PY' || true
 import json, sys
 raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
@@ -1961,10 +1997,21 @@ if [[ $JSON -eq 1 ]]; then
   # placeholder on dry-run. Always-present so JSON consumers can branch on
   # the field's contents instead of having to handle missing-key vs value.
   printf '%s' "${ISOLATION_V2_MIGRATION_JSON:-}" >"$_json_payload_dir/isolation-v2-migration.json"
+  # Issue #752 W3d: emit dedup'd partial-failure subsystem names as a
+  # JSON array file so the python envelope below can branch
+  # `status:"partial"` + `partial_failures:[...]`. Empty array on the
+  # all-clear path keeps `status:"ok"` semantics intact.
+  if (( ${#_upgrade_partial_failures[@]} > 0 )); then
+    printf '%s\n' "${_upgrade_partial_failures[@]}" \
+      | python3 -c 'import json,sys; print(json.dumps(sorted(set(line.strip() for line in sys.stdin if line.strip()))))' \
+      >"$_json_payload_dir/partial-failures.json"
+  else
+    printf '[]' >"$_json_payload_dir/partial-failures.json"
+  fi
   set +e
-  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" "$_json_payload_dir/isolation-v2-migration.json" <<'PY'
+  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" "$_json_payload_dir/isolation-v2-migration.json" "$_json_payload_dir/partial-failures.json" <<'PY'
 import json, sys
-source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file, isolation_v2_migration_json_file = sys.argv[1:]
+source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file, isolation_v2_migration_json_file, partial_failures_json_file = sys.argv[1:]
 
 def load_json(path):
     with open(path, encoding="utf-8") as fh:
@@ -1998,8 +2045,21 @@ cleanup_payload = load_optional_json(cleanup_json_file)
 # null when the variable was empty (defensive — current code paths always
 # set ISOLATION_V2_MIGRATION_JSON before reaching the JSON envelope).
 isolation_v2_migration_payload = load_optional_json(isolation_v2_migration_json_file)
+# Issue #752 W3d: late-stage subsystems (shared rerender / channel-policy
+# refresh / profile relink) append their stable name to this list when
+# their post-step probe reports failures. `status:"partial"` surfaces the
+# failure to operators / CI without aborting the upgrade — the rest of
+# the upgrade (daemon restart, [upgrade-complete] task) still ran.
+try:
+    with open(partial_failures_json_file, encoding="utf-8") as fh:
+        partial_failures = json.loads(fh.read() or "[]")
+except (FileNotFoundError, ValueError):
+    partial_failures = []
+status = "partial" if partial_failures else "ok"
 payload = {
     "mode": "upgrade",
+    "status": status,
+    "partial_failures": partial_failures,
     "version": source_version,
     "source_root": source_root,
     "source_ref": source_ref,
