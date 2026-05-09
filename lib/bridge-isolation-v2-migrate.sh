@@ -117,7 +117,7 @@ bridge_isolation_v2_migrate_record_force_killed() {
   {
     printf '{"timestamp":"%s","force_killed_sessions":[%s]}\n' \
       "$stamp" "$agents_json"
-  } > "$sidecar" 2>/dev/null || true
+  } 2>/dev/null > "$sidecar" || true
 
   printf '%s' "$agents_json"
 }
@@ -168,7 +168,7 @@ bridge_isolation_v2_migrate_acquire_lock() {
   owner_pid_file="${lock_dir}/owner.pid"
 
   if mkdir "$lock_dir" 2>/dev/null; then
-    printf '%s\n' "$$" >"$owner_pid_file" 2>/dev/null || true
+    printf '%s\n' "$$" 2>/dev/null >"$owner_pid_file" || true
     BRIDGE_ISOLATION_V2_MIGRATE_LOCK_DIR="$lock_dir"
     trap 'bridge_isolation_v2_migrate_release_lock' EXIT
     return 0
@@ -192,7 +192,7 @@ bridge_isolation_v2_migrate_acquire_lock() {
     bridge_die "another isolation-v2 migrate operation is in progress (lock=$lock_dir, stale-cleanup-failed)"
   fi
   if mkdir "$lock_dir" 2>/dev/null; then
-    printf '%s\n' "$$" >"$owner_pid_file" 2>/dev/null || true
+    printf '%s\n' "$$" 2>/dev/null >"$owner_pid_file" || true
     BRIDGE_ISOLATION_V2_MIGRATE_LOCK_DIR="$lock_dir"
     trap 'bridge_isolation_v2_migrate_release_lock' EXIT
     return 0

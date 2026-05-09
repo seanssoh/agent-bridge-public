@@ -338,7 +338,7 @@ bridge_isolation_v2_exec_with_secret_env() {
   local _rc=0
   if (
     bridge_isolation_v2_load_secret_env "$_secret_file" || {
-      : > "$_fail_marker" 2>/dev/null || true
+      : 2>/dev/null > "$_fail_marker" || true
       exit 1
     }
     exec "$_bash_bin" -lc "$_launch_cmd"

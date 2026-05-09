@@ -36,7 +36,7 @@ bridge_run_apply_v2_umask_if_needed() {
   # not need to be set for a peer UID that no longer exists.
   if bridge_isolation_disabled_by_env; then
     if [[ -n "${BRIDGE_RUN_UMASK_PROBE_FILE:-}" ]]; then
-      umask >"$BRIDGE_RUN_UMASK_PROBE_FILE" 2>/dev/null || true
+      umask 2>/dev/null >"$BRIDGE_RUN_UMASK_PROBE_FILE" || true
     fi
     return 0
   fi
@@ -44,7 +44,7 @@ bridge_run_apply_v2_umask_if_needed() {
     umask 007
   fi
   if [[ -n "${BRIDGE_RUN_UMASK_PROBE_FILE:-}" ]]; then
-    umask >"$BRIDGE_RUN_UMASK_PROBE_FILE" 2>/dev/null || true
+    umask 2>/dev/null >"$BRIDGE_RUN_UMASK_PROBE_FILE" || true
   fi
 }
 

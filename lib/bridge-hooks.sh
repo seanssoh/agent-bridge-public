@@ -452,10 +452,10 @@ bridge_install_isolated_home_settings() {
     # symlink branch, then seed the stage effective from the live one.
     ln -s "settings.effective.json" "$stage_settings" 2>/dev/null || true
     if bridge_linux_sudo_root test -f "$target_effective" 2>/dev/null; then
-      bridge_linux_sudo_root cat "$target_effective" >"$stage_effective" 2>/dev/null || true
+      bridge_linux_sudo_root cat "$target_effective" 2>/dev/null >"$stage_effective" || true
     fi
   elif bridge_linux_sudo_root test -f "$target_settings" 2>/dev/null; then
-    bridge_linux_sudo_root cat "$target_settings" >"$stage_settings" 2>/dev/null || true
+    bridge_linux_sudo_root cat "$target_settings" 2>/dev/null >"$stage_settings" || true
   fi
 
   if ! bridge_hooks_python render-isolated-home-settings \

@@ -440,7 +440,7 @@ CRON_SPECS=(
 
 # Fetch existing crons once, parse JSON, cache a title→{schedule,tz,id} map.
 EXISTING_CRONS_JSON="$(mktemp -t bootstrap-crons.XXXXXX.json)"
-"$BRIDGE_AGB" cron list --agent "$BRIDGE_ADMIN_AGENT" --json >"$EXISTING_CRONS_JSON" 2>/dev/null || echo '[]' > "$EXISTING_CRONS_JSON"
+"$BRIDGE_AGB" cron list --agent "$BRIDGE_ADMIN_AGENT" --json 2>/dev/null >"$EXISTING_CRONS_JSON" || echo '[]' > "$EXISTING_CRONS_JSON"
 
 cron_lookup() {
   # cron_lookup <title> — prints "id<TAB>schedule<TAB>tz<TAB>payload_preview"
