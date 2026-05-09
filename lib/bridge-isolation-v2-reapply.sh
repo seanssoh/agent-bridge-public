@@ -338,6 +338,53 @@ bridge_isolation_v2_reapply_one_agent() {
     "$mode" "$apply" "$actions_file" "$errors_file" \
     "file" "$agent_root/workdir/.ms365/.env" "$os_user:$agent_grp" "0640"
 
+  # Issue #746 (v0.9.3): per-path asserts above only fix the writable-sub
+  # DIRECTORIES themselves (workdir/, runtime/, logs/, etc.) — they do
+  # NOT recurse into the contents. v0.7→v0.8 migrated installs typically
+  # have files inside workdir/ (CLAUDE.md, MEMORY-SCHEMA.md, memory/*,
+  # SOUL.md) carrying pre-isolation owner-group (e.g. controller-user
+  # primary group) that the controller's `ab-agent-<X>` group cannot
+  # read. Without recursive repair, the centralized
+  # `agent-bridge memory rebuild-index` cron sweep keeps failing
+  # PermissionError on workdir/CLAUDE.md every Saturday — the symptom
+  # the operator filed in #746. v0.9.1 #749 added a verify+sudo-retry
+  # to `bridge_isolation_v2_chgrp_setgid_recursive`, but that helper
+  # is only called from `bridge_isolation_v2_migrate_normalize_layout`
+  # (the FULL migration path under the hyphenated `migrate isolation-v2`
+  # CLI), NOT from this reapply tool (the spaced `migrate isolation v2`
+  # CLI which the operator runs in production). Wire the same helper
+  # in here so the repair tool actually repairs workdir contents.
+  if [[ "$apply" == "1" ]]; then
+    local _writable_sub
+    for _writable_sub in home workdir runtime logs requests responses; do
+      [[ -d "$agent_root/$_writable_sub" ]] || continue
+      if bridge_isolation_v2_chgrp_setgid_recursive \
+            "$agent_grp" 2770 0660 "$agent_root/$_writable_sub" 2>/dev/null; then
+        bridge_isolation_v2_reapply_record_action \
+          "$actions_file" "$agent_root/$_writable_sub" \
+          "chgrp_chmod_recursive" "drift|unknown" "$agent_grp 2770/0660" "ok"
+      else
+        bridge_isolation_v2_reapply_record_action \
+          "$actions_file" "$agent_root/$_writable_sub" \
+          "chgrp_chmod_recursive" "drift|unknown" "$agent_grp 2770/0660" \
+          "error:recursive_chgrp_chmod_failed"
+        printf '%s\n' "chgrp/chmod recursive failed: $agent_root/$_writable_sub (need root or passwordless sudo; rerun after addressing)" \
+          >> "$errors_file"
+      fi
+    done
+  else
+    local _writable_sub
+    local _non_apply_status="would"
+    [[ "$mode" == "check" ]] && _non_apply_status="drift"
+    for _writable_sub in home workdir runtime logs requests responses; do
+      [[ -d "$agent_root/$_writable_sub" ]] || continue
+      bridge_isolation_v2_reapply_record_action \
+        "$actions_file" "$agent_root/$_writable_sub" \
+        "chgrp_chmod_recursive" "drift|unknown" "$agent_grp 2770/0660" \
+        "$_non_apply_status"
+    done
+  fi
+
   # Layout-internal ACL strip — every named-user/named-group ACL inside
   # `agents/<agent>/` is v0.7 leftover per KNOWN_ISSUES §16 + #737
   # answer table. Strip recursively. The `~/.claude/.credentials.json`
