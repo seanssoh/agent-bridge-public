@@ -644,10 +644,39 @@ bridge_migration_unisolate() {
   for _acl_target in "${acl_strip_paths_recursive[@]}"; do
     [[ -n "$_acl_target" ]] || continue
     bridge_migration_print_step "$dry_run" "setfacl -R -x u:${os_user} ${_acl_target}"
-    bridge_migration_print_step "$dry_run" "find ${_acl_target} -type d -exec setfacl -d -x u:${os_user} {} +"
+    bridge_migration_print_step "$dry_run" "find ${_acl_target} -type d -print0 | xargs -0 -r setfacl -d -x u:${os_user}"
     if [[ "$dry_run" != "1" ]]; then
       bridge_linux_sudo_root setfacl -R -x "u:${os_user}" "$_acl_target" 2>/dev/null || true
-      bridge_linux_sudo_root find "$_acl_target" -type d -exec setfacl -d -x "u:${os_user}" {} + 2>/dev/null || true
+      # Default-ACL strip: `find -exec setfacl ... +` was observed to
+      # return rc=0 even when individual setfacl calls failed (issue
+      # #746 root cause). Pipe through `xargs -0 -r` instead so per-
+      # invocation failures propagate via xargs rc. The whole pipeline
+      # runs under `sh -c` because `bridge_linux_sudo_root find ... |
+      # xargs ...` would only sudo the find half. `xargs -r` is GNU-
+      # only but this is a Linux-only path (bridge_migration_require_linux).
+      bridge_linux_sudo_root sh -c \
+        'find "$1" -type d -print0 | xargs -0 -r setfacl -d -x "u:$2"' \
+        _ "$_acl_target" "$os_user" 2>/dev/null || true
+      # Post-verify: any surviving named ACL for os_user is a regression
+      # (the audit invariant from #752 H1). Retry once sudo-only; if
+      # still drifted, warn loudly with the first surviving path.
+      # Best-effort — unisolate must not abort on residual ACL.
+      if command -v getfacl >/dev/null 2>&1; then
+        local _residual
+        _residual="$(bridge_linux_sudo_root getfacl --absolute-names --skip-base -R "$_acl_target" 2>/dev/null \
+                      | grep -E "^(user|default:user):${os_user}:" | head -n1 || true)"
+        if [[ -n "$_residual" ]]; then
+          bridge_linux_sudo_root setfacl -R -x "u:${os_user}" "$_acl_target" 2>/dev/null || true
+          bridge_linux_sudo_root sh -c \
+            'find "$1" -type d -print0 | xargs -0 -r setfacl -d -x "u:$2"' \
+            _ "$_acl_target" "$os_user" 2>/dev/null || true
+          _residual="$(bridge_linux_sudo_root getfacl --absolute-names --skip-base -R "$_acl_target" 2>/dev/null \
+                        | grep -E "^(user|default:user):${os_user}:" | head -n1 || true)"
+          if [[ -n "$_residual" ]]; then
+            bridge_warn "unisolate: residual ACL after strip on $_acl_target: $_residual (operator: investigate underlying setfacl/sudo failure; rerun unisolate after addressing it)"
+          fi
+        fi
+      fi
     fi
   done
   # history_file is a regular file (not a directory). `-R` is a no-op
