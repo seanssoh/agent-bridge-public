@@ -842,7 +842,31 @@ bridge_isolation_v2_acl_scrub() {
     _rc=$?
     if (( _rc != 0 )); then
       bridge_warn "acl_scrub: chmod -R -P -N failed at $root (rc=${_rc}); see ${_scrub_err}"
+      [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
       return 1
+    fi
+    # Self-verify: counterpart of the Linux setfacl post-verify added by
+    # H2 / PR #755. `_bridge_isolation_v2_run_root_or_sudo` direct-first
+    # may rc=0 even when the per-entry ACL strip didn't land. Darwin has
+    # no getfacl; ACL entries surface as numbered prefix lines (`  0:`,
+    # `  1:`, …) in `ls -le` output. Best-effort — empty trees or BSD ls
+    # without ACL support yield no match, so verify passes.
+    local _residual_acl
+    _residual_acl="$(find "$root" -print0 2>/dev/null \
+                      | xargs -0 ls -leOd 2>/dev/null \
+                      | grep -E '^[[:space:]]+[0-9]+:' | head -n1 || true)"
+    if [[ -n "$_residual_acl" ]]; then
+      if [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+        sudo -n chmod -R -P -N "$root" 2>/dev/null || true
+      fi
+      _residual_acl="$(find "$root" -print0 2>/dev/null \
+                        | xargs -0 ls -leOd 2>/dev/null \
+                        | grep -E '^[[:space:]]+[0-9]+:' | head -n1 || true)"
+      if [[ -n "$_residual_acl" ]]; then
+        bridge_warn "acl_scrub: residual ACL after chmod -R -P -N + sudo retry: $_residual_acl"
+        [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
+        return 1
+      fi
     fi
     [[ "$_scrub_err" != "/dev/null" ]] && rm -f "$_scrub_err"
     return 0
