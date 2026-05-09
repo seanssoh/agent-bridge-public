@@ -1685,9 +1685,15 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
       local stale
       while IFS= read -r stale; do
         [[ -n "$stale" ]] || continue
+        # r8 codex catch — strip MUST hard fail. Previously a strip
+        # failure (sudo denied, fs locked) was warn-and-continue, which
+        # let the next setfacl -m succeed and apply return 0 with the
+        # stale entry intact. Verify then rejected via (f). That
+        # apply/check asymmetry was the r4/r5/r7 anti-pattern.
         _bridge_isolation_v2_run_root_or_sudo \
           setfacl -x "u:${stale}" "$cred_file" 2>/dev/null || {
-            bridge_warn "apply_controller_credentials_read_grant: setfacl -x u:${stale} on $cred_file failed (continuing)"
+            bridge_warn "apply_controller_credentials_read_grant: setfacl -x u:${stale} on $cred_file failed"
+            return 1
           }
       done <<<"$existing_named"
     fi
