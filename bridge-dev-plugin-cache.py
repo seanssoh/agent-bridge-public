@@ -405,34 +405,57 @@ def _copy_file_if_changed(src: Path, dst: Path) -> bool:
 
 
 def _overlay_dir(src: Path, dst: Path) -> bool:
-    """Recursively overlay src onto dst. Returns True if anything was written."""
+    """Recursively overlay src onto dst. Returns True if anything was written.
+
+    r4 codex catch — entries that are symlinks-to-directory (created
+    accidentally by the r1/r2 link_source_node_modules path) were
+    matched by the `entry.is_symlink() or entry.is_file()` arm and sent
+    to shutil.copy2, producing a corrupt or absent cache. is_dir()
+    returns True for symlinks-to-directory because pathlib stats the
+    resolved target, so test for is_dir() FIRST and recurse through
+    the symlink — this materializes the dependency tree into the
+    cache as a real directory copy regardless of whether source's
+    node_modules is a symlink (r1/r2 leftover) or a real dir.
+    """
     changed = False
     if dst.exists() and not dst.is_dir():
         remove_tree(dst)
     dst.mkdir(parents=True, exist_ok=True)
     for entry in src.iterdir():
         target = dst / entry.name
-        if entry.is_symlink() or entry.is_file():
-            if _copy_file_if_changed(entry, target):
-                changed = True
-        elif entry.is_dir():
+        if entry.is_dir():  # includes symlinks-to-directory (resolved-stat)
             if _overlay_dir(entry, target):
+                changed = True
+        elif entry.is_file() or entry.is_symlink():
+            if _copy_file_if_changed(entry, target):
                 changed = True
     return changed
 
 
 def overlay_source_to_cache(source_path: Path, cache_version_path: Path) -> bool:
-    """Mirror source files (except node_modules) onto cache. Returns True if changed."""
+    """Mirror EVERYTHING from source onto cache, including node_modules.
+
+    r3 codex catch — earlier overlay skipped node_modules and
+    link_source_node_modules then symlinked source/node_modules → cache,
+    which (a) modified the SOURCE tree (unsafe, source-of-truth must
+    stay clean) and (b) made every agent's sync race over the same
+    source/node_modules pointer (cross-agent collision). The fix is to
+    treat the cache as a fully self-contained per-agent snapshot:
+    copy node_modules into the cache too. Disk overhead is bounded by
+    the plugin's installed dependency tree per agent (operator
+    acknowledged 100-300 MB / agent in design v2).
+    """
     changed = False
     for entry in source_path.iterdir():
-        if entry.name == NODE_MODULES_NAME:
-            continue
         target = cache_version_path / entry.name
-        if entry.is_symlink() or entry.is_file():
-            if _copy_file_if_changed(entry, target):
-                changed = True
-        elif entry.is_dir():
+        # r4 codex catch — is_dir() FIRST so symlinks-to-directory are
+        # materialized into the cache as a real directory copy. Old
+        # ordering matched is_symlink first → shutil.copy2 → corrupt cache.
+        if entry.is_dir():
             if _overlay_dir(entry, target):
+                changed = True
+        elif entry.is_file() or entry.is_symlink():
+            if _copy_file_if_changed(entry, target):
                 changed = True
     return changed
 
@@ -462,6 +485,60 @@ def link_source_node_modules(source_path: Path, cache_version_path: Path) -> tup
     return "linked", str(cache_node_modules)
 
 
+def _verify_cache_version_path(
+    cache_version_path: Path, source_path: Path
+) -> tuple[bool, str]:
+    """Post-link verification under the running UID.
+
+    The Python process already runs as the isolated UID (bridge-start
+    wraps the whole bridge-run.sh session under `sudo -n -u <os_user> -H`
+    for linux-user-isolated agents — see bridge-start.sh:447). So an
+    `os.access` probe here measures what the isolated agent will actually
+    see when it tries to read the cache version directory.
+
+    Returns (ok, reason). reason is empty when ok=True. v0.9.7 RC6:
+    success labels (`linked-verified`, `updated-verified`,
+    `unchanged-verified`) MUST NOT be emitted unless this returns True.
+    The previous linker logged `linked-OK` based purely on the symlink
+    existing, even when the dest dir was unreadable for the isolated UID
+    or never created — that silent success is exactly the bug RC6 names.
+    """
+    try:
+        if not source_path.exists():
+            return False, f"source-missing:{source_path}"
+    except OSError as exc:
+        return False, f"source-stat-failed:{exc}"
+
+    if not os.access(str(source_path), os.R_OK):
+        return False, f"source-unreadable:{source_path}"
+
+    try:
+        resolved = cache_version_path.resolve()
+    except OSError as exc:
+        return False, f"cache-resolve-failed:{exc}"
+
+    if not resolved.is_dir():
+        return False, f"cache-version-dir-missing:{cache_version_path}"
+
+    if not os.access(str(resolved), os.R_OK):
+        return False, f"cache-version-dir-unreadable:{cache_version_path}"
+
+    # Every parent dir must be traversable for the isolated UID, otherwise
+    # the agent process can resolve the symlink but cannot enter the cache.
+    parent = resolved.parent
+    while True:
+        try:
+            if not os.access(str(parent), os.X_OK):
+                return False, f"parent-not-traversable:{parent}"
+        except OSError as exc:
+            return False, f"parent-access-failed:{parent}:{exc}"
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+
+    return True, ""
+
+
 def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
     marketplace_name, plugins = load_marketplace(root)
 
@@ -485,12 +562,23 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
     source_rel = metadata.get("source") or ""
     version = metadata.get("version") or "0.1.0"
     source_path = (root / source_rel).resolve()
+    # RC6 pre-link assertion: source path must exist AND be readable by
+    # the running UID (which is the isolated agent UID under sudo wrap).
+    # The previous linker only checked existence; an unreadable source
+    # (group/ACL drift) would still log success.
     if not source_path.exists():
         return {
             "channel": channel,
             "plugin": plugin_name,
             "status": "missing",
             "reason": f"source-missing:{source_path}",
+        }
+    if not os.access(str(source_path), os.R_OK):
+        return {
+            "channel": channel,
+            "plugin": plugin_name,
+            "status": "install-failed",
+            "reason": f"source-unreadable:{source_path}",
         }
 
     # Defense-in-depth: every component about to be joined into the
@@ -517,42 +605,140 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
     orphan_removed = 0
     cache_type = "missing"
 
-    if cache_version_path.is_symlink():
-        current_target = cache_version_path.resolve()
-        if current_target == source_path:
-            status = "unchanged"
-        else:
+    try:
+        # r2 codex catch — operator's binding principle is per-agent
+        # isolated cache. r1 implementation used symlink to source which
+        # made each agent's distinct cache *path* resolve to the same
+        # *target*: cross-agent interference on writes, modifications
+        # to the source visible to every agent. Replace symlink with
+        # real per-agent directory (overlay copy of source into the
+        # isolated home). Disk overhead 100-300 MB per agent acknowledged
+        # in design v2 §"Per-Agent Cache Tradeoffs".
+        if cache_version_path.is_symlink():
+            # Migrate any pre-existing symlink (from r1 or v0.9.6 install)
+            # into a real directory. Unlink the symlink, then mkdir +
+            # overlay source so the cache is genuinely per-agent.
             cache_version_path.unlink(missing_ok=True)
-            cache_version_path.symlink_to(source_path, target_is_directory=True)
+            # r4 codex Probe 7 — also chmod parent dirs to 0700 so a
+            # default umask (0o022) does not leave the marketplace +
+            # plugin level world-readable above the per-version cache.
+            plugin_cache_root.mkdir(parents=True, exist_ok=True)
+            plugin_cache_root.chmod(0o700)
+            if plugin_cache_root.parent != cache_root() and plugin_cache_root.parent.exists():
+                plugin_cache_root.parent.chmod(0o700)
+            cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
+            cache_version_path.chmod(0o700)  # explicit, defensive against umask
+            overlay_source_to_cache(source_path, cache_version_path)
             status = "updated"
-        cache_type = "symlink"
-    else:
-        if cache_version_path.is_dir():
-            # Real cache directories carry installed dependencies. Overlay source
-            # files (everything except node_modules) so operator edits reach the
-            # cache, while preserving the cache's installed node_modules dir. The
-            # source root's node_modules is then linked back to the cache below.
+            cache_type = "directory"
+        elif cache_version_path.is_dir():
+            # Already a real per-agent directory. Overlay source files
+            # (except node_modules) so operator edits to source reach
+            # the cache, while preserving the cache's installed
+            # node_modules dir. The source root's node_modules is then
+            # linked back to the cache below.
             changed = overlay_source_to_cache(source_path, cache_version_path)
             status = "updated" if changed else "unchanged"
             cache_type = "directory"
         elif cache_version_path.exists():
+            # Stray non-directory entry (file, special) — remove and
+            # rebuild as real directory.
             remove_tree(cache_version_path)
+            # r4 codex Probe 7 — also chmod parent dirs to 0700 so a
+            # default umask (0o022) does not leave the marketplace +
+            # plugin level world-readable above the per-version cache.
+            plugin_cache_root.mkdir(parents=True, exist_ok=True)
+            plugin_cache_root.chmod(0o700)
+            if plugin_cache_root.parent != cache_root() and plugin_cache_root.parent.exists():
+                plugin_cache_root.parent.chmod(0o700)
+            cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
+            cache_version_path.chmod(0o700)  # explicit, defensive against umask
+            overlay_source_to_cache(source_path, cache_version_path)
             status = "updated"
-            cache_type = "symlink"
-            plugin_cache_root.mkdir(parents=True, exist_ok=True)
-            cache_version_path.symlink_to(source_path, target_is_directory=True)
+            cache_type = "directory"
         else:
-            status = "linked"
-            cache_type = "symlink"
+            # First-time install — create the per-agent directory and
+            # overlay source files into it.
+            # r4 codex Probe 7 — also chmod parent dirs to 0700 so a
+            # default umask (0o022) does not leave the marketplace +
+            # plugin level world-readable above the per-version cache.
             plugin_cache_root.mkdir(parents=True, exist_ok=True)
-            cache_version_path.symlink_to(source_path, target_is_directory=True)
+            plugin_cache_root.chmod(0o700)
+            if plugin_cache_root.parent != cache_root() and plugin_cache_root.parent.exists():
+                plugin_cache_root.parent.chmod(0o700)
+            cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
+            cache_version_path.chmod(0o700)  # explicit, defensive against umask
+            overlay_source_to_cache(source_path, cache_version_path)
+            status = "linked"
+            cache_type = "directory"
+    except OSError as exc:
+        # Filesystem refused the install action — fail loud, do not
+        # fall through to a verified label. RC6 root cause was the
+        # opposite: actions silently failed and the linker still
+        # printed success.
+        return {
+            "channel": channel,
+            "plugin": plugin_name,
+            "marketplace": marketplace_name,
+            "version": version,
+            "source": str(source_path),
+            "cache": str(cache_version_path),
+            "cache_type": cache_type,
+            "status": "install-failed",
+            "reason": f"install-error:{exc}",
+        }
 
     if plugin_cache_root.exists():
         for marker in plugin_cache_root.rglob(".orphaned_at"):
             marker.unlink(missing_ok=True)
             orphan_removed += 1
 
-    node_modules_status, node_modules_target = link_source_node_modules(source_path, cache_version_path)
+    # r3 codex catch — link_source_node_modules MODIFIED the source's
+    # node_modules entry, making every agent's sync race over the same
+    # source pointer (cross-agent collision). The new overlay path
+    # above includes node_modules in the cache itself, so the cache is
+    # genuinely self-contained per-agent. We retain the status report
+    # for backward compat (downstream readers parse the field) but
+    # derive it from the cache's own node_modules now.
+    cache_node_modules = cache_version_path / "node_modules"
+    if cache_node_modules.is_dir():
+        node_modules_status = "present"
+        node_modules_target = str(cache_node_modules)
+    elif cache_node_modules.exists():
+        node_modules_status = "not-directory"
+        node_modules_target = str(cache_node_modules)
+    else:
+        node_modules_status = "missing"
+        node_modules_target = ""
+
+    # RC6 post-link verification: a successful install action does not
+    # imply a usable cache for the isolated agent. We must verify under
+    # the running UID before promoting the status to a `*-verified`
+    # label. Failure relabels to `linked-failed` with a structured
+    # reason and the criticality split decides block vs warn.
+    verified, verify_reason = _verify_cache_version_path(cache_version_path, source_path)
+    if not verified:
+        return {
+            "channel": channel,
+            "plugin": plugin_name,
+            "marketplace": marketplace_name,
+            "version": version,
+            "source": str(source_path),
+            "cache": str(cache_version_path),
+            "cache_type": cache_type,
+            "status": "linked-failed",
+            "reason": verify_reason,
+            "node_modules_status": node_modules_status,
+            "node_modules_target": node_modules_target,
+            "orphan_removed": str(orphan_removed),
+        }
+
+    # Success path: relabel `linked` → `linked-verified`,
+    # `updated` → `updated-verified`, `unchanged` → `unchanged-verified`.
+    # Operators (and the bridge-run audit tail) rely on the `-verified`
+    # suffix to distinguish v0.9.7 RC6-fixed output from the older
+    # `linked-OK` lying-success line.
+    verified_status = f"{status}-verified"
 
     return {
         "channel": channel,
@@ -562,11 +748,43 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
         "source": str(source_path),
         "cache": str(cache_version_path),
         "cache_type": cache_type,
-        "status": status,
+        "status": verified_status,
         "node_modules_status": node_modules_status,
         "node_modules_target": node_modules_target,
         "orphan_removed": str(orphan_removed),
     }
+
+
+_VERIFIED_STATUSES = frozenset(
+    {"linked-verified", "updated-verified", "unchanged-verified"}
+)
+_BENIGN_STATUSES = frozenset({"ignored"})
+
+
+def _is_required_channel(channel: str, required: set[str], optional: set[str]) -> bool:
+    """Return True when this channel should block on failure (Q4 split).
+
+    Decision tree:
+      1. channel ∈ required (operator listed in BRIDGE_AGENT_CHANNELS) → required.
+      2. channel ∈ optional (BRIDGE_AGENT_PLUGINS only) → NOT required.
+      3. Both sets EMPTY (legacy caller without splits) → required (back-compat
+         with pre-v0.9.7 bridge-run sync helper).
+      4. Operator declared splits but this channel is in neither (e.g. orphan
+         from --channels but absent from both --required and --optional) →
+         NOT required (conservative; don't block on unlisted plugins).
+
+    r6 codex catch — earlier signature only took `required` and returned
+    True when `not required`, but with the r5 classification reorder
+    that empty-required fallback fired EVEN when --optional-channels
+    was non-empty, demoting genuinely optional plugins to channel-required.
+    """
+    if channel in required:
+        return True
+    if channel in optional:
+        return False
+    if not required and not optional:
+        return True
+    return False
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -575,36 +793,143 @@ def main(argv: list[str] | None = None) -> int:
 
     sync_parser = sub.add_parser("sync")
     sync_parser.add_argument("--channels", required=True)
+    # v0.9.7 RC6 (Q4 decision): channel-required plugin failure must
+    # block bridge-start; optional plugin failure must warn and continue.
+    # The caller (bridge-run.sh) computes the two sets from
+    # `bridge_agent_effective_dev_channels_csv` and `BRIDGE_AGENT_PLUGINS`
+    # respectively and passes them as separate args. Defaulting both to
+    # empty preserves the pre-RC6 caller contract: with no split the
+    # linker treats every channel as required (block-on-fail), which
+    # matches the legacy bridge-run behavior of `bridge_warn` + return.
+    sync_parser.add_argument(
+        "--required-channels",
+        default="",
+        help=(
+            "CSV of channel-required plugin: entries (failure blocks "
+            "bridge-start). Default empty = treat every --channels item "
+            "as required (back-compat)."
+        ),
+    )
+    sync_parser.add_argument(
+        "--optional-channels",
+        default="",
+        help=(
+            "CSV of optional plugin: entries (failure warns and "
+            "continues). Items in this set are demoted to non-fatal "
+            "even if also listed in --channels."
+        ),
+    )
     sync_parser.add_argument("--root", default=str(repo_root()))
     sync_parser.add_argument("--json", action="store_true")
+    sync_parser.add_argument(
+        "--agent",
+        default="",
+        help="Agent name for log lines (operator-visible context).",
+    )
 
     args = parser.parse_args(argv)
     if args.command != "sync":
         return 1
 
     root = Path(args.root).expanduser().resolve()
+    required_set = set(normalize_channels(args.required_channels))
+    optional_set = set(normalize_channels(args.optional_channels))
+    # r5 codex catch (BLOCKING) — channel-required wins over optional
+    # when a plugin appears in BOTH lists. The earlier ordering had
+    # optional winning, which violated the original PR 2 spec
+    # ("channel-required = block, optional = warn+continue; both lists
+    # = channel-required is critical path"). Channel membership
+    # (BRIDGE_AGENT_CHANNELS=plugin:teams) means messages flow through
+    # that plugin — silently launching without it kills inbound
+    # delivery. Subtract required from optional so that any overlap
+    # is treated as channel-required.
+    optional_set -= required_set
+    agent_label = args.agent or "-"
+
     results = [
         sync_plugin_cache(resolve_marketplace_root(root, item), item)
         for item in normalize_channels(args.channels)
     ]
+
+    # Tag each result with criticality so the downstream reporter and
+    # exit-code logic can apply the Q4 split uniformly.
+    required_failures: list[dict[str, str]] = []
+    optional_failures: list[dict[str, str]] = []
+    for item in results:
+        channel = item.get("channel", "")
+        status = item.get("status", "unknown")
+        # r5/r6 — pass BOTH sets so the helper can distinguish:
+        #   in required → channel-required (block)
+        #   in optional → optional (warn)
+        #   neither + both empty → channel-required (legacy back-compat)
+        #   neither + at least one set populated → optional (conservative)
+        if _is_required_channel(channel, required_set, optional_set):
+            criticality = "channel-required"
+        else:
+            criticality = "optional"
+        item["criticality"] = criticality
+
+        if status in _VERIFIED_STATUSES or status in _BENIGN_STATUSES:
+            continue
+        if criticality == "channel-required":
+            required_failures.append(item)
+        else:
+            optional_failures.append(item)
+
     if args.json:
-        json.dump({"results": results}, sys.stdout, ensure_ascii=False)
+        json.dump(
+            {
+                "results": results,
+                "agent": args.agent,
+                "required_failure_count": len(required_failures),
+                "optional_failure_count": len(optional_failures),
+            },
+            sys.stdout,
+            ensure_ascii=False,
+        )
         sys.stdout.write("\n")
-        return 0
+        # JSON callers still get the criticality-aware exit code so a
+        # programmatic consumer (bridge-run.sh) can branch identically
+        # whether or not it asked for human or JSON output.
+        return 1 if required_failures else 0
 
     for item in results:
         status = item.get("status", "unknown")
         plugin = item.get("plugin") or item.get("channel") or "-"
-        if status in {"linked", "updated", "unchanged"}:
+        criticality = item.get("criticality", "channel-required")
+        if status in _VERIFIED_STATUSES:
             print(
                 f"{plugin}: {status} cache={item.get('cache','-')} source={item.get('source','-')} "
                 f"node_modules={item.get('node_modules_status','-')} "
                 f"node_modules_target={item.get('node_modules_target','-') or '-'} "
-                f"orphan_removed={item.get('orphan_removed','0')}"
+                f"orphan_removed={item.get('orphan_removed','0')} "
+                f"criticality={criticality}"
             )
-        else:
+        elif status in _BENIGN_STATUSES:
             print(f"{plugin}: {status} ({item.get('reason','-')})")
-    return 0
+        else:
+            # Failure line — tag with criticality so the operator (and
+            # bridge-run audit) can tell `WARNING (optional)` apart from
+            # `ERROR (channel-required)` at a glance.
+            tag = "ERROR" if criticality == "channel-required" else "WARNING"
+            print(
+                f"{tag} {plugin}: {status} ({item.get('reason','-')}) "
+                f"criticality={criticality} agent={agent_label}"
+            )
+
+    if optional_failures and not required_failures:
+        # Q4 decision: optional plugin failures warn and continue. Emit
+        # one summary line per failed optional plugin so the operator
+        # sees `launched without it` in the launch log even when no
+        # ERROR line drew their attention to the per-plugin block above.
+        for item in optional_failures:
+            plugin = item.get("plugin") or item.get("channel") or "-"
+            print(
+                f"WARNING: plugin {plugin} missing for agent {agent_label}, "
+                f"launched without it"
+            )
+
+    return 1 if required_failures else 0
 
 
 if __name__ == "__main__":
