@@ -436,12 +436,17 @@ bridge_write_idle_ready_agents() {
               # marker writer so the per-agent state leaf inherits the
               # canonical ab-agent-<X> 2770 contract. Falls back to plain
               # mkdir/redirect when the matrix helper isn't loaded.
+              # r13 codex Probe F+H catch — drop direct-write fallback.
+              # mark_idle_now / mark_manual_stop / webhook-port already
+              # propagate hard fail in r12; this writer was missed in
+              # the r12 sweep. Same anti-pattern: fallback writes
+              # silently defeat the matrix invariant.
               if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
                   && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
                   && bridge_isolation_v2_active 2>/dev/null; then
                 bridge_isolation_v2_write_agent_state_marker \
                   "$agent" "missing-marker-retries" "$retries" \
-                  || { mkdir -p "$(bridge_agent_idle_marker_dir "$agent")"; printf '%s\n' "$retries" >"$retries_file"; }
+                  || return 1
               else
                 mkdir -p "$(bridge_agent_idle_marker_dir "$agent")"
                 printf '%s\n' "$retries" >"$retries_file"

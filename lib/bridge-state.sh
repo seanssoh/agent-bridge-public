@@ -2358,7 +2358,11 @@ bridge_agent_note_prompt_ready() {
   if command -v bridge_isolation_v2_ensure_matrix_path >/dev/null 2>&1 \
       && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
       && bridge_isolation_v2_active 2>/dev/null; then
-    bridge_isolation_v2_ensure_matrix_path "agent-runtime" "$agent" >/dev/null 2>&1 || true
+    # r13 codex Probe F catch — was `|| true` (silent swallow). When
+    # ensure_matrix_path fails we cannot trust the subsequent mkdir to
+    # land the correct ownership/mode for the runtime dir, so the
+    # written marker would later fail verify. Hard fail propagates.
+    bridge_isolation_v2_ensure_matrix_path "agent-runtime" "$agent" >/dev/null 2>&1 || return 1
   fi
   mkdir -p "$dir"
 
