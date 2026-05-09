@@ -2563,6 +2563,36 @@ bridge_write_linux_agent_env_file() {
   bridge_reject_ephemeral_controller_env_for_agent_env
 
   mkdir -p "$(dirname "$file")"
+  # Issue #771 v0.9.5 r2/r3 hardening (codex destructive-probe finding 1):
+  # `runtime/agent-env.sh` lives inside `agents/<X>/runtime/` which is
+  # mode 2770 + agent-UID-writable. An isolated agent could plant a
+  # SYMLINK at this path pointing to a controller-owned file (e.g.
+  # `/home/ec2-user/.claude/.credentials.json` or another agent's
+  # env file). Without a symlink check, `[[ -O "$file" ]]` returns
+  # true on the link's target (which the controller owns), the rm
+  # branch skips, and the subsequent `cat >"$file"` writes through
+  # the symlink — corrupting the controller's file. Refuse symlinks
+  # explicitly: if `runtime/agent-env.sh` is a symlink (regardless
+  # of target), `bridge_linux_sudo_root rm -f` it (or plain rm if
+  # not on Linux) so the redirect creates a fresh regular file.
+  # r3: if rm fails (sudo unavailable + caller doesn't own parent
+  # dir → permission denied) the symlink survives. Without an
+  # explicit fail-loud here, the fall-through `[[ -e && ! -O ]]`
+  # self-heal block + `cat >"$file"` would still write through the
+  # surviving symlink → original corruption vector reopened. Verify
+  # post-rm and return 1 with bridge_warn rather than write through.
+  if [[ -L "$file" ]]; then
+    if [[ "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]] \
+        && command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+      bridge_linux_sudo_root rm -f "$file" 2>/dev/null || rm -f "$file"
+    else
+      rm -f "$file"
+    fi
+    if [[ -L "$file" ]]; then
+      bridge_warn "bridge_write_linux_agent_env_file: refusing to write — symlink at $file survived rm attempt (need root or passwordless sudo to clear). Investigate and remove manually before retry."
+      return 1
+    fi
+  fi
   # Self-heal ownership: when an earlier isolate cycle chowned the file to the
   # isolated os_user, `cat >` preserves ownership and the trailing `chmod 600`
   # fails with EPERM for the operator. Drop the stale inode (via sudo when
