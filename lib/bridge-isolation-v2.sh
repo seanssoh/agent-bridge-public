@@ -1666,13 +1666,32 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
   # File-level: mode + ACL all in one call so apply mirrors check exactly.
   # (r5 codex catch — previously apply set only u:<X>:r-- + m::r-- but
   # left mode 0644 / other::r-- intact, so verify rejected post-apply.)
-  # `setfacl -m` for o::--- ensures other-bits are closed even if the
-  # underlying chmod doesn't strip them (it does on standard EXT/XFS,
-  # but make it explicit so the ACL stays canonical).
   _bridge_isolation_v2_run_root_or_sudo chmod "$file_mode" "$cred_file" 2>/dev/null || {
     bridge_warn "apply_controller_credentials_read_grant: chmod $file_mode on $cred_file failed"
     return 1
   }
+  # r7 codex W1 — strip stale named-user ACL entries before re-granting.
+  # Operator standing policy: only the current agent's named-user grant
+  # exists on the credential. Stale entries from removed/renamed agents
+  # would otherwise leak the credential to whatever UID still owns the
+  # name (or to a re-used UID). Enumerate every existing user:<name>
+  # entry; drop the ones that aren't the current iso_user.
+  if command -v getfacl >/dev/null 2>&1; then
+    local existing_named
+    existing_named="$(getfacl -p "$cred_file" 2>/dev/null \
+      | awk -F: -v u="$iso_user" \
+          '$1=="user" && $2!="" && $2!=u {print $2}')"
+    if [[ -n "$existing_named" ]]; then
+      local stale
+      while IFS= read -r stale; do
+        [[ -n "$stale" ]] || continue
+        _bridge_isolation_v2_run_root_or_sudo \
+          setfacl -x "u:${stale}" "$cred_file" 2>/dev/null || {
+            bridge_warn "apply_controller_credentials_read_grant: setfacl -x u:${stale} on $cred_file failed (continuing)"
+          }
+      done <<<"$existing_named"
+    fi
+  fi
   _bridge_isolation_v2_run_root_or_sudo \
     setfacl -m "u:${iso_user}:r--" -m "m::r--" -m "o::---" "$cred_file" 2>/dev/null || {
       bridge_warn "apply_controller_credentials_read_grant: setfacl r-- + m::r-- + o::--- on $cred_file failed"
@@ -1709,38 +1728,54 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
   acl_output="$(getfacl -p "$path" 2>/dev/null)"
   [[ -n "$acl_output" ]] || return 1
 
-  # (a) mask
+  # All perm extraction uses substr(field,1,3) so the `#effective:???`
+  # annotation that getfacl appends when a named entry is mask-clamped
+  # does not corrupt our exact-match comparisons. (r7 codex W2 catch.)
+
+  # (a) mask — must be exactly r-- (read-only). Wider mask (r-x, rw-,
+  # rwx) would let any named-user entry leak write/exec to the
+  # credential file. (r7 codex BLOCK — named-user grant must be capped
+  # at read-only AND mask must enforce that cap, not merely permit it.)
   local mask_line
-  mask_line="$(printf '%s\n' "$acl_output" | awk -F: '/^mask::/ {print $3}' | head -n1)"
-  case "$mask_line" in
-    r--|r-x|rw-|rwx) : ;;
-    *) return 1 ;;
-  esac
+  mask_line="$(printf '%s\n' "$acl_output" \
+    | awk -F: '/^mask::/ {print substr($3,1,3)}' | head -n1)"
+  [[ "$mask_line" == "r--" ]] || return 1
 
   # (e) base ACL entries: user::rw-, group::---
   local user_line group_line
-  user_line="$(printf '%s\n' "$acl_output" | awk -F: '/^user::/ {print $3}' | head -n1)"
+  user_line="$(printf '%s\n' "$acl_output" \
+    | awk -F: '/^user::/ {print substr($3,1,3)}' | head -n1)"
   [[ "$user_line" == "rw-" ]] || return 1
-  group_line="$(printf '%s\n' "$acl_output" | awk -F: '/^group::/ {print $3}' | head -n1)"
+  group_line="$(printf '%s\n' "$acl_output" \
+    | awk -F: '/^group::/ {print substr($3,1,3)}' | head -n1)"
   [[ "$group_line" == "---" ]] || return 1
 
   # (d) other:: — must be exactly --- (no widening). r4 codex catch.
   local other_line
-  other_line="$(printf '%s\n' "$acl_output" | awk -F: '/^other::/ {print $3}' | head -n1)"
-  case "$other_line" in
-    ---) : ;;
-    *) return 1 ;;
-  esac
+  other_line="$(printf '%s\n' "$acl_output" \
+    | awk -F: '/^other::/ {print substr($3,1,3)}' | head -n1)"
+  [[ "$other_line" == "---" ]] || return 1
 
-  # (b) named-user grant for this agent's UID
+  # (b) named-user grant for this agent's UID — must be exactly r--
+  # (read-only). Credential is a data file; +x is meaningless and +w
+  # would let the isolated UID modify the controller's token.
+  # (r7 codex BLOCK — named user with rw-/rwx false-passed in r6.)
   local named_line
   named_line="$(printf '%s\n' "$acl_output" \
-    | awk -F: -v u="$iso_user" '$1=="user" && $2==u {print $3}' \
+    | awk -F: -v u="$iso_user" '$1=="user" && $2==u {print substr($3,1,3)}' \
     | head -n1)"
-  case "$named_line" in
-    r--|r-x|rw-|rwx) : ;;
-    *) return 1 ;;
-  esac
+  [[ "$named_line" == "r--" ]] || return 1
+
+  # (f) operator standing policy: only the current agent's named-user
+  # grant may exist on the credential. Stale entries from removed
+  # agents leak the credential to whatever UID still owns that name
+  # (or to a re-used UID). r7 codex W1 catch — currently a security
+  # debt, not just cleanliness. Reject any named-user entry whose name
+  # is not the current iso_user.
+  local stale_named
+  stale_named="$(printf '%s\n' "$acl_output" \
+    | awk -F: -v u="$iso_user" '$1=="user" && $2!="" && $2!=u {print $2}')"
+  [[ -z "$stale_named" ]] || return 1
 
   # (c) ancestor traversal — every parent back to / must have u:<iso_user>:?-x
   local p
@@ -1749,7 +1784,7 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
     local pacl panchor
     pacl="$(getfacl -p "$p" 2>/dev/null)" || return 1
     panchor="$(printf '%s\n' "$pacl" \
-      | awk -F: -v u="$iso_user" '$1=="user" && $2==u {print $3}' \
+      | awk -F: -v u="$iso_user" '$1=="user" && $2==u {print substr($3,1,3)}' \
       | head -n1)"
     case "$panchor" in
       *x) : ;;  # any of --x / r-x / -wx / rwx counts as traverse
