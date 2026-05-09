@@ -2110,10 +2110,32 @@ run_rerender_settings() {
   fi
 
   rows_file="$(mktemp "${TMPDIR:-/tmp}/bridge-rerender-settings.XXXXXX")"
+  local _probe_stderr=""
+  local _probe_err=""
+  local _probe_mode=""
   for target in "${targets[@]}"; do
     agent="${target%%$'\t'*}"
     workdir="${target#*$'\t'}"
-    before_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
+    # Issue #752 M4: under `set -e`, a single per-target probe failure
+    # (python crash, sudo denial on isolated read, mktemp ENOSPC) would
+    # abort the whole loop and leave later targets un-rerendered with no
+    # signal which agents were skipped. Capture rc explicitly, emit a
+    # structured error row that satisfies the bridge_agent_print_rerender_*
+    # consumers (status/agent/workdir/mode), warn, and continue.
+    _probe_stderr="$(mktemp "${TMPDIR:-/tmp}/bridge-rerender-probe-err.XXXXXX")"
+    if ! before_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir" 2>"$_probe_stderr")"; then
+      _probe_err="$(<"$_probe_stderr")"
+      rm -f "$_probe_stderr"
+      bridge_warn "rerender-settings: probe 실패로 target='$agent' 건너뜁니다 (workdir=$workdir): ${_probe_err:-no stderr captured}"
+      _probe_mode="$([[ $apply -eq 1 ]] && printf apply || printf dry-run)"
+      row_json="$(BRIDGE_PROBE_AGENT="$agent" BRIDGE_PROBE_WORKDIR="$workdir" \
+        BRIDGE_PROBE_MODE="$_probe_mode" BRIDGE_PROBE_ERROR="${_probe_err:-probe failed}" \
+        python3 -c 'import json,os; print(json.dumps({"agent":os.environ["BRIDGE_PROBE_AGENT"],"workdir":os.environ["BRIDGE_PROBE_WORKDIR"],"mode":os.environ["BRIDGE_PROBE_MODE"],"status":"error","reason":"probe_failed","error":os.environ["BRIDGE_PROBE_ERROR"]}, ensure_ascii=False, sort_keys=True))')"
+      printf '%s\n' "$row_json" >>"$rows_file"
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+    rm -f "$_probe_stderr"
     error=""
     if [[ $apply -eq 1 ]]; then
       # Issue #570: managed autoCompactWindow default is unconditionally
