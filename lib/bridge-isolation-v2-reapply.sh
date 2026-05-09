@@ -401,10 +401,19 @@ bridge_isolation_v2_reapply_one_agent() {
         "$actions_file" "matrix:$agent" \
         "matrix_apply" "drift|unknown" "rc1-rc5 grant matrix" "ok"
     else
+      # r9 codex catch — matrix apply failure must be a hard error,
+      # not warn:matrix_partial. Previously the wrapper recorded a warn
+      # label and dispatch returned 0, so a stale-strip failure (or any
+      # other matrix apply hard-fail from r8) was silently masked. Now
+      # mirror the failure pattern other rows already use: error:* label
+      # + line in errors_file. The dispatch loop below propagates
+      # non-empty errors_file to the wrapper exit code.
       bridge_isolation_v2_reapply_record_action \
         "$actions_file" "matrix:$agent" \
         "matrix_apply" "drift|unknown" "rc1-rc5 grant matrix" \
-        "warn:matrix_partial"
+        "error:matrix_apply_failed"
+      printf '%s\n' "matrix apply failed for agent '$agent' (rc1-rc5 grant matrix). Review prior bridge_warn lines for the specific row; rerun after addressing." \
+        >> "$errors_file"
     fi
   fi
 
@@ -1169,6 +1178,7 @@ USAGE
 
   # Per-agent pass.
   local agent
+  local total_errors=0
   while IFS= read -r agent; do
     [[ -n "$agent" ]] || continue
     local af="$actions_dir/$agent.actions"
@@ -1176,12 +1186,24 @@ USAGE
     : > "$af"
     : > "$ef"
     bridge_isolation_v2_reapply_one_agent "$mode" "$agent" "$af" "$ef" || true
+    # r9 codex catch — accumulate per-agent errors so the dispatch exit
+    # code reflects them. Previously dispatch returned 0 unconditionally,
+    # which meant that a matrix-apply hard-fail (or any other write
+    # failure that produced an errors_file line) was masked. Operator
+    # sees rc=0 from `migrate isolation v2 --apply` while verify still
+    # rejects → false-positive cycle (the v0.9.5/v0.9.6 anti-pattern).
+    if [[ -s "$ef" ]]; then
+      total_errors=$(( total_errors + $(wc -l < "$ef" 2>/dev/null || printf 0) ))
+    fi
   done < "$agents_file"
 
   if (( emit_json )); then
     bridge_isolation_v2_reapply_render_json "$mode" "$agents_file" "$actions_dir"
   else
     bridge_isolation_v2_reapply_render_text "$mode" "$agents_file" "$actions_dir"
+  fi
+  if (( total_errors > 0 )); then
+    return 1
   fi
   return 0
 }
