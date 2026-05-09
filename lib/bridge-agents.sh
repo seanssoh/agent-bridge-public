@@ -3092,6 +3092,27 @@ bridge_linux_prepare_agent_isolation() {
   bridge_write_linux_agent_env_file "$agent" "$env_file"
   # env_file ownership: chgrp/chmod is handled inside bridge_write_linux_agent_env_file's
   # v2 branch (chown controller, chgrp ab-agent-<name>, chmod 0640).
+
+  # v0.9.7 (refs #781): the matrix is the single ownership/mode contract
+  # for the v2 layout. The structural prerequisites above (group/user
+  # creation, mkdir, initial chown/chgrp on the writable subdirs, agent
+  # env file, channel symlinks) remain unchanged — but applying the
+  # matrix at the END of prepare ensures every row the migrate/reapply
+  # tools assert is also asserted at create time. This closes the RC1
+  # window where the per-agent state/agents/<X>/ leaf was created
+  # outside prepare's purview and inherited the daemon's controller
+  # group, then drifted from the v2 contract for the lifetime of the
+  # install. Idempotent and silent on a clean tree.
+  if command -v bridge_isolation_v2_apply_grant_matrix_for_agent >/dev/null 2>&1; then
+    # r10 codex catch — was `|| true`. Propagate matrix-apply failure
+    # so prepare's caller (bridge-agent.sh, bridge-start.sh) returns
+    # non-zero. Operator otherwise sees a green agent create that
+    # immediately fails the first verify.
+    if ! bridge_isolation_v2_apply_grant_matrix_for_agent "$agent" --apply >/dev/null 2>&1; then
+      bridge_warn "bridge_linux_prepare_agent_isolation: grant-matrix apply FAIL agent=$agent"
+      return 1
+    fi
+  fi
 }
 bridge_linux_install_isolated_channel_symlink() {
   # Plant a root-owned symlink at $user_home/.claude/channels/<channel>

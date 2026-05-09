@@ -5251,7 +5251,19 @@ cmd_sync_cycle() {
   snapshot_file="$(mktemp)"
   ready_agents_file="$(mktemp)"
   bridge_write_agent_snapshot "$snapshot_file"
-  bridge_write_idle_ready_agents "$ready_agents_file"
+  # r14 codex Probe 2 — daemon must not hard-fail on a per-cycle write
+  # (design contract: daemon never exits its loop). But the previous
+  # silent swallow erased the matrix hard-fail signal that r12/r13
+  # added. Capture rc + emit a one-line audit so operator can catch
+  # matrix-not-applied via `agent-bridge audit follow` instead of
+  # cycling on a green-looking daemon.
+  if ! bridge_write_idle_ready_agents "$ready_agents_file"; then
+    bridge_audit_log daemon daemon_step_warning daemon \
+      --detail step="nudge_scan_idle_ready" \
+      --detail reason="bridge_write_idle_ready_agents non-zero (matrix not applied or writer error)" \
+      2>/dev/null || true
+    daemon_log_event "nudge_scan: idle_ready writer failed (matrix-aware fix #781); cycle continues"
+  fi
   nudge_output="$(bridge_task_daemon_step "$snapshot_file" "$ready_agents_file" 2>/dev/null || true)"
   rm -f "$snapshot_file"
   rm -f "$ready_agents_file"
