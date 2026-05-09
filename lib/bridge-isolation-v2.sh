@@ -704,6 +704,105 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type f -exec chgrp "$group" {} + || return 1
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type d -exec chmod "$dir_mode" {} + || return 1
   _bridge_isolation_v2_run_root_or_sudo find "$root" -type f -exec chmod "$file_mode" {} + || return 1
+
+  # Self-verify: catches the symptom from issue #746 where the
+  # direct-first path returns 0 with no actual mutations (e.g. find
+  # exit-status not propagating through `-exec ... +` on some findutils
+  # builds, or the sudo path silently degraded). Without this, the
+  # migrator advances the v2 marker on a half-repaired tree and the
+  # controller-group read sweep keeps failing every Saturday.
+  if ! bridge_isolation_v2_verify_chgrp_setgid_recursive \
+        "$group" "$dir_mode" "$file_mode" "$root"; then
+    # Drift detected. Retry with sudo-only (skip direct-first), in case
+    # the direct-first attempt succeeded-on-find-but-failed-on-chgrp.
+    # If still drifted after the sudo retry, surface clearly so the
+    # migrator caller can abort instead of writing the v2 marker on a
+    # half-repaired tree.
+    if [[ "$(id -u)" -ne 0 ]] && command -v sudo >/dev/null 2>&1; then
+      sudo -n find "$root" -type d -exec chgrp "$group" {} + 2>/dev/null || true
+      sudo -n find "$root" -type f -exec chgrp "$group" {} + 2>/dev/null || true
+      sudo -n find "$root" -type d -exec chmod "$dir_mode" {} + 2>/dev/null || true
+      sudo -n find "$root" -type f -exec chmod "$file_mode" {} + 2>/dev/null || true
+    fi
+    if ! bridge_isolation_v2_verify_chgrp_setgid_recursive \
+          "$group" "$dir_mode" "$file_mode" "$root"; then
+      bridge_warn "chgrp_setgid_recursive: tree under $root still has drifted group/mode after sudo retry — see preceding verify warnings"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+bridge_isolation_v2_verify_chgrp_setgid_recursive() {
+  # Confirm the recursive chgrp/chmod actually landed on every entry
+  # under root. Used as a belt-and-braces check after
+  # bridge_isolation_v2_chgrp_setgid_recursive — see issue #746 for the
+  # symptom (helper returns 0 but files keep their pre-migration group/
+  # mode, leaving controller-group reads broken on isolated agent
+  # workdirs).
+  local group="$1"
+  local dir_mode="$2"
+  local file_mode="$3"
+  local root="$4"
+  [[ -n "$group" && -n "$dir_mode" && -n "$file_mode" && -n "$root" ]] || {
+    bridge_warn "verify_chgrp_setgid_recursive: group, dir_mode, file_mode, root required"
+    return 1
+  }
+  [[ -d "$root" ]] || return 0  # nothing to verify
+
+  # Normalize expected modes to %04o so `stat` output ("2770", "660")
+  # compares cleanly across BSD/macOS and GNU coreutils.
+  local exp_dir_mode exp_file_mode
+  exp_dir_mode="$(printf '%04o' "$((8#$dir_mode))" 2>/dev/null || printf '%s' "$dir_mode")"
+  exp_file_mode="$(printf '%04o' "$((8#$file_mode))" 2>/dev/null || printf '%s' "$file_mode")"
+
+  local stat_fmt
+  if [[ "$(uname)" == "Darwin" ]]; then
+    stat_fmt=(-f %A)
+  else
+    stat_fmt=(-c %a)
+  fi
+
+  # First dir whose group != expected. `\! -group` is portable across
+  # BSD/macOS find and GNU findutils; `-not` is GNU-only.
+  local mismatch_path
+  mismatch_path="$(find "$root" -type d \! -group "$group" -print 2>/dev/null | head -n1)"
+  if [[ -n "$mismatch_path" ]]; then
+    bridge_warn "verify_chgrp_setgid_recursive: dir group mismatch under $root (first: $mismatch_path expected=$group)"
+    return 1
+  fi
+  mismatch_path="$(find "$root" -type f \! -group "$group" -print 2>/dev/null | head -n1)"
+  if [[ -n "$mismatch_path" ]]; then
+    bridge_warn "verify_chgrp_setgid_recursive: file group mismatch under $root (first: $mismatch_path expected=$group)"
+    return 1
+  fi
+  # Sample mode check (one entry per type) — a full mode walk is
+  # expensive on large trees; the sample is enough to catch the silent-
+  # no-op failure mode where every entry kept its pre-migration mode.
+  local sample_dir sample_file actual_mode normalized_actual
+  sample_dir="$(find "$root" -type d -print 2>/dev/null | head -n1)"
+  sample_file="$(find "$root" -type f -print 2>/dev/null | head -n1)"
+  if [[ -n "$sample_dir" ]]; then
+    actual_mode="$(stat "${stat_fmt[@]}" "$sample_dir" 2>/dev/null || true)"
+    if [[ -n "$actual_mode" ]]; then
+      normalized_actual="$(printf '%04o' "$((8#$actual_mode))" 2>/dev/null || printf '%s' "$actual_mode")"
+      if [[ "$normalized_actual" != "$exp_dir_mode" ]]; then
+        bridge_warn "verify_chgrp_setgid_recursive: dir mode mismatch at $sample_dir (expected=$exp_dir_mode actual=$normalized_actual)"
+        return 1
+      fi
+    fi
+  fi
+  if [[ -n "$sample_file" ]]; then
+    actual_mode="$(stat "${stat_fmt[@]}" "$sample_file" 2>/dev/null || true)"
+    if [[ -n "$actual_mode" ]]; then
+      normalized_actual="$(printf '%04o' "$((8#$actual_mode))" 2>/dev/null || printf '%s' "$actual_mode")"
+      if [[ "$normalized_actual" != "$exp_file_mode" ]]; then
+        bridge_warn "verify_chgrp_setgid_recursive: file mode mismatch at $sample_file (expected=$exp_file_mode actual=$normalized_actual)"
+        return 1
+      fi
+    fi
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------

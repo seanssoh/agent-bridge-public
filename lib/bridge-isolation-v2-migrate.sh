@@ -947,6 +947,21 @@ bridge_isolation_v2_migrate_normalize_layout() {
         "$agent_grp" 2750 0640 "$agent_root/credentials" \
         || { bridge_warn "normalize_layout: agents/$agent/credentials chgrp_setgid_recursive failed"; return 1; }
     fi
+
+    # v0.9.x #746: explicit re-verify on workdir specifically. Files
+    # mirrored from v0.7→v0.8 layouts retained their pre-isolation
+    # owner-group long after the migrator believed it had repaired
+    # them. The helper now self-verifies, but log a per-agent OK/FAIL
+    # so the operator can grep the migration log for "workdir-verify".
+    if [[ -d "$agent_root/workdir" ]]; then
+      if bridge_isolation_v2_verify_chgrp_setgid_recursive \
+            "$agent_grp" 2770 0660 "$agent_root/workdir" 2>/dev/null; then
+        printf '[migrate] workdir-verify ok agent=%s grp=%s\n' "$agent" "$agent_grp" >&2
+      else
+        bridge_warn "[migrate] workdir-verify FAIL agent=$agent grp=$agent_grp — see preceding warnings"
+        return 1
+      fi
+    fi
   done < "$snapshot_path"
 
   return 0
