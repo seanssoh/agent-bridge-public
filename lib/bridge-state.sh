@@ -2674,8 +2674,12 @@ bridge_reconcile_idle_markers() {
     file="$(bridge_agent_idle_since_file "$agent")"
     [[ -f "$file" ]] || continue
 
+    # #752 M3: per-marker best-effort under bridge-sync's `set -e` — a single
+    # locked dir / perm-denied marker must not cascade-abort subsequent agents.
     if ! bridge_agent_is_active "$agent"; then
-      bridge_agent_clear_idle_marker "$agent"
+      if ! bridge_agent_clear_idle_marker "$agent" 2>/dev/null; then
+        bridge_warn "reconcile_idle_markers: clear (inactive) failed for agent='$agent' — skipping; next reconcile will retry"
+      fi
       continue
     fi
 
@@ -2684,7 +2688,10 @@ bridge_reconcile_idle_markers() {
       continue
     }
     if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-      bridge_agent_clear_idle_marker "$agent"
+      if ! bridge_agent_clear_idle_marker "$agent" 2>/dev/null; then
+        bridge_warn "reconcile_idle_markers: clear (non-numeric) failed for agent='$agent' — skipping; next reconcile will retry"
+        continue
+      fi
     fi
   done
 }
