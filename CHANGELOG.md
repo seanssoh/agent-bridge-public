@@ -6,6 +6,30 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-05-09
+
+### Highlight — REAL #746 fix (the v0.9.1 / v0.9.2 attempts hit the wrong code path)
+
+`v0.9.3` 는 #746 (v0.7→v0.8 migrated 호스트의 workdir 내부 파일 perm drift) 의 **실제 root cause** 를 잡는다. v0.9.1 (#749) 와 v0.9.2 의 13 PR audit wave 가 모두 #746 에 fix 를 시도했지만 운영 호스트에서 동작 안 함이 확인됐고, 운영자 진단 끝에 **dispatch 경로 차이** 가 root cause 로 확정됨.
+
+핵심: `agent-bridge migrate isolation v2 --apply` (공백 form, 운영자가 production 에서 쓰는 repair tool) 는 `bridge_isolation_v2_reapply_one_agent` 로 dispatch 되며, 이 함수의 target path 테이블은 writable-sub 디렉토리들 (`workdir/`, `runtime/`, ...) 자체와 hand-picked 파일 리스트 (`.teams/.env`, `.ms365/.env`, `agent-env.sh`, `launch-secrets.env`, `.claude/`) 만 assert. **workdir 내부 파일들 (CLAUDE.md, MEMORY-SCHEMA.md, memory/*, SOUL.md) 은 절대 안 만짐.** v0.9.1 #749 가 추가한 verify+sudo-retry 는 `bridge_isolation_v2_chgrp_setgid_recursive` 에 들어갔는데, 이 helper 는 `bridge_isolation_v2_migrate_normalize_layout` 에서만 호출 — `agent-bridge migrate isolation-v2 apply` (하이픈 form, 전체 마이그레이션 도구) path 만 커버. 두 CLI 가 완전히 다른 함수로 분기되는 걸 #749 가 인지 못 함.
+
+운영자 진단 데이터 (post-v0.9.2): `grep -c bridge_isolation_v2_verify_chgrp_setgid_recursive lib/bridge-isolation-v2.sh` = 3, `grep -c workdir-verify lib/bridge-isolation-v2-migrate.sh` = 3 (코드는 디스크에 들어왔음), 그러나 `migrate isolation v2 --apply` 출력의 workdir-verify 라인 수 = 0 (호출 안 됨). 시나리오 C 확정 — 코드는 있지만 호출 dispatch 가 다른 분기로 빠짐.
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.9.x isolation-v2 layout 변경 없음. 운영자 호스트가 #746 cascade 를 보았다면 본 v0.9.3 적용 후 `agent-bridge migrate isolation v2 --apply` 한 방에 자동 회복.
+
+### Fixed (#768 — refs #746)
+
+- `lib/bridge-isolation-v2-reapply.sh:bridge_isolation_v2_reapply_one_agent` 에 writable-sub recursive 정규화 추가 (47 LOC, single function). per-path assert 직후 + ACL strip 직전 구간에 삽입. `bridge_isolation_v2_chgrp_setgid_recursive "$agent_grp" 2770 0660 "$agent_root/$sub"` 호출을 `home / workdir / runtime / logs / requests / responses` 각각에 대해 수행. apply 모드에선 실제 chgrp+chmod, check/dry-run 모드에선 `would` / `drift` action row 만 emit. helper 호출은 #749 의 verify+sudo-retry 자동 상속 — drift 감지 시 sudo retry, 그래도 drift 면 명료한 `bridge_warn`. per-sub 실패는 best-effort (errors_file append + record_action error, 다음 sub 로 continue) — repair tool 의 "fix what you can, surface what failed" 철학과 일치.
+
+### Reproduction + verification
+
+darwin tempdir BRIDGE_HOME 에서 운영자 증상 정확히 재현 (workdir DIR 은 canonical 2770/ab-agent-X, 내부 contents 는 0640/0750 + 잘못된 group). pre-fix 의 `migrate isolation v2 --apply` 는 contents 를 안 건드림 → 운영자 production 호스트 결과와 100% 일치. patched source 는 recursive 호출이 contents 를 정상 정규화 (Linux 검증 운영자 호스트에서 post-merge 진행).
+
+### Carry-over from v0.9.2
+
+#767 (daemon inbox-nudge dedup + busy-aware gate) — 별도 트랙. v0.9.4 후속 사이클에서 처리.
+
 ## [0.9.2] — 2026-05-09
 
 ### Highlight — post-#746/#747 wave-orchestrated bug-class sweep (13 PR)
