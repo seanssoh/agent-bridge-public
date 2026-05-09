@@ -139,7 +139,7 @@ if (( _isolated_invocation == 1 )); then
     "$(_json_escape "$_decision")" \
     "$(_json_escape "$_reason")")"
   if mkdir -p "$_audit_dir" 2>/dev/null && [[ -w "$_audit_dir" ]]; then
-    printf '%s\n' "$_audit_row" >>"$_audit_log" 2>/dev/null || true
+    printf '%s\n' "$_audit_row" 2>/dev/null >>"$_audit_log" || true
   fi
 
   if [[ "$_decision" == "deny" ]]; then

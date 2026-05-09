@@ -2384,7 +2384,7 @@ bridge_agent_write_crash_report() {
   tail_file="$(bridge_agent_crash_tail_file "$agent")"
   mkdir -p "$(dirname "$report_file")"
   if [[ -f "$stderr_file" ]]; then
-    tail -n 50 "$stderr_file" >"$tail_file" 2>/dev/null || true
+    tail -n 50 "$stderr_file" 2>/dev/null >"$tail_file" || true
     stderr_tail="$(cat "$tail_file" 2>/dev/null || true)"
   else
     : >"$tail_file"

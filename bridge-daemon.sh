@@ -159,7 +159,7 @@ _bridge_daemon_on_exit() {
   mkdir -p "$BRIDGE_STATE_DIR" 2>/dev/null || true
   printf '[%s] [info] daemon exit pid=%d ec=%d sig=%s last_step=%s err_location=%s\n' \
     "$ts" "$$" "$ec" "$sig" "$step" "${err_location:-none}" \
-    >>"$BRIDGE_LAUNCHAGENT_LOG" 2>/dev/null || true
+    2>/dev/null >>"$BRIDGE_LAUNCHAGENT_LOG" || true
 
   # bridge_audit_log shells out to python; wrap so an audit failure cannot
   # mask the original exit code.
@@ -3678,8 +3678,8 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
   fi
 
   # Persist dedup state and pending-notice JSON for the follow-up handler.
-  printf '%s\n' "$now_ts" >"$last_ts_file" 2>/dev/null || true
-  printf '%s\n' "$event_id" >"$last_event_file" 2>/dev/null || true
+  printf '%s\n' "$now_ts" 2>/dev/null >"$last_ts_file" || true
+  printf '%s\n' "$event_id" 2>/dev/null >"$last_event_file" || true
 
   local pending_path="$agent_state_dir/precompact-notice-pending.json"
   python3 -c '
@@ -4015,7 +4015,7 @@ if isinstance(data, dict):
   #   2. Run record-precompact-completion to mutate precompact-stats.json.
   #   3. Update the pending JSON in place, then archive + move the marker.
   mkdir -p "$recorded_flag_dir" 2>/dev/null || true
-  : >"$recorded_flag" 2>/dev/null || true
+  : 2>/dev/null >"$recorded_flag" || true
 
   bridge_with_timeout 10 precompact_stats_record python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" \
     record-precompact-completion \
@@ -5705,7 +5705,7 @@ cmd_run() {
       # daemon process tree, so a hung daemon cannot interfere with it being
       # observed. See scripts/bridge-daemon-liveness.sh and
       # scripts/install-daemon-liveness-{launchagent,systemd}.sh.
-      printf '%s\n' "$now_ts" >"$BRIDGE_STATE_DIR/daemon.heartbeat" 2>/dev/null || true
+      printf '%s\n' "$now_ts" 2>/dev/null >"$BRIDGE_STATE_DIR/daemon.heartbeat" || true
       last_heartbeat_ts="$now_ts"
     fi
     BRIDGE_DAEMON_LAST_STEP="idle_sleep"

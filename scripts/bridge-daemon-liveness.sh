@@ -121,7 +121,7 @@ cooldown_active() {
 
 record_cooldown() {
   mkdir -p "$(dirname "$BRIDGE_DAEMON_LIVENESS_COOLDOWN_FILE")" 2>/dev/null || true
-  printf '%s\n' "$(now_ts)" >"$BRIDGE_DAEMON_LIVENESS_COOLDOWN_FILE" 2>/dev/null || true
+  printf '%s\n' "$(now_ts)" 2>/dev/null >"$BRIDGE_DAEMON_LIVENESS_COOLDOWN_FILE" || true
 }
 
 restart_daemon() {
