@@ -6,6 +6,74 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.9.6] — 2026-05-09
+
+### Highlight — REAL #771 fix (v0.9.5 was a false-positive on frozen-roster)
+
+`v0.9.5` 의 `bridge_write_linux_agent_env_file` regen call 은 운영자의 R5 진단으로 **false-positive** 확인. Linux 서버에서 `migrate isolation v2 --apply` 후 `cat agents/<X>/runtime/agent-env.sh | grep TEAMS_STATE_DIR` 가 여전히 stale `…/agents/<X>/.teams` (pre-v2 path) 반환. log 는 `agent_env_regen ok` 라고 했지만 실제 파일 내용은 안 바뀜.
+
+진단 결과 root cause 는 `lib/bridge-state.sh` 의 `bridge_claude_launch_with_channel_state_dirs` helper. 이 함수는 launch 시점에 cached `BRIDGE_AGENT_LAUNCH_CMD[$agent]` 의 env-prefix 에 canonical `TEAMS_STATE_DIR` / `MS365_STATE_DIR` / `DISCORD_STATE_DIR` / `TELEGRAM_STATE_DIR` 를 주입하는 것이 책임이지만, 기존 loop 가:
+
+```python
+for name, value in assignments:
+    if f"{name}=" in env_prefix:
+        continue       # ← BUG: name 만 보고 skip → stale value 보존
+    env_prefix += f"{name}={shlex.quote(value)} "
+```
+
+처럼 `<NAME>=` substring 만 검사하고 SKIP. fresh-setup agent (env_prefix 비어 있음) 는 append branch 가 fire 해서 정상이지만, frozen-roster (v0.7→v0.8 migrate 시점에 cached 된 stale `TEAMS_STATE_DIR=…/agents/<X>/.teams`) 는 `name` 이 이미 존재해서 skip → 매 restart 마다 stale path 가 그대로 통과 → bun teams server.ts silent-exit before bind. v0.9.5 의 regen 은 cached file 를 새로 쓰지만 **새로 쓴 내용 자체가 같은 helper 를 통과해서 같은 stale path 를 다시 박아넣는 cycle** 이라 효과 없음. v0.9.5 orbstack 검증은 fresh-setup 만 exercise 했고 frozen-roster scenario miss.
+
+Fix: skip 대신 **byte-preserving in-place replace**. 6 라운드 codex destructive-probe 로 다음을 모두 통과:
+
+- top-level 만 매칭 (quote 안에 nested `NAME=…` substring 무영향)
+- `$VAR` / `${VAR}` / `$(cmd)` / `` `cmd` `` expansion 보존 (관련 없는 token 의 expansion 안 죽임)
+- `$()` / `` ` ` `` / `${}` 안에 `NAME=` 가 있어도 opaque value 로 처리 (literal `)` / `}` 가 나와도 close 안 봄)
+- duplicate dedup (last-wins shell semantic 깨지지 않게 모든 occurrence 교체)
+- 새 canonical value 는 `shlex.quote` 로 hard-quote (literal `$` 등 안전)
+
+`agent-bridge upgrade --apply` + `migrate isolation v2 --apply` + agent restart 한 번 으로 자동 회복.
+
+### Process — codex destructive-probe 6 라운드 (operator-authorized round-cap waiver)
+
+운영자 자율 위임: "캡 같은거 필요 없어 될떄까지 완전하게 완료해". CLAUDE.md 의 3-round cap 명시적 waiver 후 6 라운드 진행. 각 라운드 모두 새 vector catch (마지막 2 라운드는 hardening, 처음 4 라운드는 production-relevant):
+
+| 라운드 | codex catch | 분류 |
+|---|---|---|
+| r1 | skip-if-name-present false-positive | critical (operator hit) |
+| r2 | regex global subn 가 quoted value 안의 nested NAME= 도 덮음 | production-relevant |
+| r3 | shlex.split + shlex.quote round-trip 가 `$VAR` expansion 죽임 | production-relevant |
+| r4 | byte-preserving walker 가 `$()` / `` ` ` `` / `${}` 안 봄 | production-relevant |
+| r5 | `_skip_paren_subst` 가 `${...}` 안 honor → brace-default 의 literal `)` 로 paren 조기 close | hardening |
+| r6 | `_skip_paren_subst` + `_skip_brace_subst` mutual-recurse 추가, `$/${/backtick` 모든 nesting opaque | hardening (closes surface) |
+
+각 라운드의 fix 는 21 destructive probe matrix 로 bash-eval round-trip 검증 (Homebrew bash 5+). `frozen-roster motivating case → fresh setup → empty prefix → idempotent same-value → partial-name overlap → quoted-stale → value-with-space → duplicate dedup → quote-context (probe 9) → $VAR (10) → literal $ in new value (11) → backtick no NAME (12) → mixed quoting (13) → $() (14) → backtick (15) → ${} (16) → nested $() (17) → $() in dquote (18) → codex r5 reproducer (19) → ${} containing $() (20) → backtick in ${} (21)`.
+
+### Process lesson — false-positive 의 의미
+
+v0.9.5 가 false-positive 였던 이유는 orbstack 검증 시나리오가 fresh-setup 만 (= operator 가 리눅스 서버에서 한 번도 본 적 없는 상태) 다뤘기 때문. 운영 호스트의 frozen-roster 상태 (= operator 의 actual state) 를 재현 안 했음. 다음 release process 에는 release-PR codex review brief 에 "operator's current production state 를 reproducer 로 명시" 항목 추가 필요. v0.9.5 CHANGELOG 의 "Verified on Linux" 표는 fresh-setup row 로 한정 → frozen-roster row 추가했다면 release 전 catch 했을 것.
+
+### Fixed (#776 — refs #771)
+
+- `lib/bridge-state.sh:bridge_claude_launch_with_channel_state_dirs` — env-prefix 의 `<NAME>=value` assignment 를 quote-state-aware top-level walker 로 식별 후 byte-preserving in-place replace. 4 helper (`_skip_dquote`, `_skip_paren_subst`, `_skip_backtick`, `_skip_brace_subst`) mutual-recurse 로 nested substitution / quote 모두 opaque 처리. matching 안 된 token 의 raw bytes (포함 `$VAR` / `$()` / backtick 등 expansion) 그대로 통과. matching token 만 `f"{name}={shlex.quote(value)}"` 로 substitute (last-wins shell semantic 위해 모든 occurrence 교체).
+
+### Verified on Linux (orbstack Oracle Linux 9)
+
+| Test case | Original | Without fix | With v0.9.6 fix |
+|---|---|---|---|
+| Frozen-roster `TEAMS_STATE_DIR=/stale/.teams` | `/stale/.teams` | restart 시 stale 통과 | **`/workdir/.teams` 로 교체 ✓** |
+| Fresh-setup (no existing TEAMS) | append OK | (regression-clean) | **append fires ✓** |
+| Quoted-value 안 nested NAME= | (n/a) | global subn 이 nested 도 덮음 (r2 vector) | **opaque ✓** |
+| `OTHER=$HOME` 와 같은 token | (n/a) | shlex round-trip 이 `'$HOME'` 으로 hard-quote (r3 vector) | **expansion 보존 ✓** |
+| `$()` / backtick / `${}` 안 NAME= | (n/a) | walker 가 안 봄 (r4 vector) | **opaque ✓** |
+| `${UNSET:-) NAME=...}` (literal `)`) | (n/a) | paren 조기 close (r5 vector) | **brace-default opaque ✓** |
+
+### Known carry-over (v0.9.7 트랙 후보)
+
+- **#772** Stop hook → agent-bridge CLI → mkdir BRIDGE_STATE_DIR denied (isolated uid). non-blocking 이지만 stderr spam.
+- **#767** daemon inbox-nudge 폭주 (no dedup, no busy-aware gate).
+- **runtime_ready false-positive**: `bridge_agent_channel_runtime_ready_for_item` 이 file/key presence 만 체크, 실제 server LISTEN 안 봄. v0.9.6 fix 가 server bind 정상화하지만 detect-future-failure 위해 LISTEN check 추가는 별도 enhancement.
+- v0.9.3 residual #B (creds.json ACL mask `---`) + #C (state/agents/<X>/ mode 2750) — root cause 미확정.
+
 ## [0.9.5] — 2026-05-09
 
 ### Highlight — #771 Teams server N-of-1 spawn 종결 + writer symlink hardening
