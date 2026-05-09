@@ -2478,7 +2478,19 @@ bridge_agent_context_pressure_state_file() {
 
 bridge_agent_next_session_marker_file() {
   local agent="$1"
-  printf '%s/next-session.sha' "$(bridge_agent_runtime_state_dir "$agent")"
+  # r16 codex catch — was bridge_agent_runtime_state_dir, which on v2
+  # resolves to $BRIDGE_AGENT_ROOT_V2/<X>/runtime/. But the Python
+  # SessionStart hook (hooks/bridge_hook_common.py:398) writes the
+  # marker to bridge_active_agent_dir() / agent / "next-session.sha"
+  # = $BRIDGE_ACTIVE_AGENT_DIR/<X>/. Path divergence: Python wrote
+  # state/agents/<X>/next-session.sha, bash reader looked under
+  # runtime/, so the autoarchive delivery digest never matched and
+  # bridge-run.sh never saw the delivered handoff. Per design v2's
+  # state-agent-marker-files row, all markers (idle-since, manual-stop,
+  # missing-marker-retries, webhook-port, next-session.sha) belong
+  # in state/agents/<X>/. Use idle_marker_dir to match the other
+  # markers + the Python hook.
+  printf '%s/next-session.sha' "$(bridge_agent_idle_marker_dir "$agent")"
 }
 
 bridge_path_age_seconds() {
