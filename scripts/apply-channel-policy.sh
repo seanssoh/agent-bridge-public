@@ -704,6 +704,14 @@ for agent, mapping in plan.items():
     disables = [pid for pid, val in mapping.items() if not val]
     print(agent + "\t" + ",".join(sorted(enables)) + "\t" + ",".join(sorted(disables)))
 ' <<<"$allowlist_json" | \
+  {
+  # #752 M5 r2: track per-agent overlay outcomes so an all-fail run
+  # surfaces non-zero rc instead of silently passing. Counters live in
+  # this subshell (the pipe RHS); the final exit propagates via
+  # pipefail to the outer set -euo pipefail so the bridge-upgrade
+  # caller sees the failure.
+  overlay_ok=0
+  overlay_fail=0
   while IFS=$'\t' read -r allow_agent_id allow_enables_csv allow_disables_csv; do
     [[ -z "$allow_agent_id" ]] && continue
     ALLOW_HOME="$BRIDGE_AGENT_HOME_ROOT/$allow_agent_id"
@@ -713,7 +721,11 @@ for agent, mapping in plan.items():
       continue
     fi
 
-    allow_plan="$("$BRIDGE_PYTHON" - "$ALLOW_LOCAL" "$allow_enables_csv" "$allow_disables_csv" <<'PY'
+    # #752 M5: a malformed per-agent settings.local.json must not abort the
+    # whole upgrade-time apply-channel-policy loop. Guard both Python command
+    # substitutions with `if !; then warn; continue; fi` so we skip the bad
+    # overlay and keep applying policy to remaining agents.
+    if ! allow_plan="$("$BRIDGE_PYTHON" - "$ALLOW_LOCAL" "$allow_enables_csv" "$allow_disables_csv" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -752,9 +764,17 @@ for plugin_id in to_disable:
 payload["enabledPlugins"] = enabled
 print(json.dumps({"changed": changed, "payload": payload}))
 PY
-)"
+)"; then
+      echo "[apply-channel-policy] skip allowlist overlay: '$allow_agent_id' failed to produce overlay plan (likely malformed JSON at $ALLOW_LOCAL); continuing with remaining agents" >&2
+      overlay_fail=$((overlay_fail + 1))
+      continue
+    fi
 
-    allow_changed="$(printf '%s' "$allow_plan" | "$BRIDGE_PYTHON" -c 'import json,sys;print(json.loads(sys.stdin.read())["changed"])')"
+    if ! allow_changed="$(printf '%s' "$allow_plan" | "$BRIDGE_PYTHON" -c 'import json,sys;print(json.loads(sys.stdin.read())["changed"])')"; then
+      echo "[apply-channel-policy] skip allowlist overlay: '$allow_agent_id' produced unparseable plan output; continuing with remaining agents" >&2
+      overlay_fail=$((overlay_fail + 1))
+      continue
+    fi
 
     if [[ "$allow_changed" == "True" ]]; then
       if [[ $DRY_RUN -eq 1 ]]; then
@@ -776,5 +796,17 @@ p.write_text(json.dumps(plan["payload"], indent=2, sort_keys=True) + "\n")
     # #720: ensure workdir/.claude/settings.local.json -> ../../.claude/settings.local.json
     # so Claude (CWD=workdir) actually merges the per-agent allowlist overlay.
     _apply_channel_policy_link_workdir_overlay "$ALLOW_HOME" "$allow_agent_id"
+    overlay_ok=$((overlay_ok + 1))
   done
+
+  # #752 M5 r2: if every per-agent overlay attempt failed, surface non-zero
+  # rc so the bridge-upgrade caller sees the failure rather than silently
+  # advancing on an unwritten policy. Mixed (some-ok / some-fail) is still
+  # treated as best-effort success — operators get per-agent stderr warnings
+  # and can re-run after fixing the bad overlay JSON.
+  if (( overlay_fail > 0 && overlay_ok == 0 )); then
+    echo "[apply-channel-policy] all $overlay_fail allowlist overlay(s) failed; no policy applied" >&2
+    exit 1
+  fi
+  }
 fi
