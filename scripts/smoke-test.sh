@@ -5450,6 +5450,44 @@ TEAMS_DEV_STATE_DIR_LAUNCH="$("$BASH4_BIN" -c '
 ')"
 assert_contains "$TEAMS_DEV_STATE_DIR_LAUNCH" "TEAMS_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams"
 
+# Issue #786 follow-up — bridge_claude_launch_with_channel_state_dirs must
+# also canonicalize MS365_STATE_DIR. Frozen-roster launch_cmd previously kept
+# stale pre-v2 path → ms365 plugin server.ts mkdir EACCES → MCP entry dropped.
+MS365_STALE_LAUNCH="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["'"$CREATED_AGENT"'"]="plugin:ms365@agent-bridge"
+  raw="MS365_STATE_DIR=/stale/.ms365 claude --dangerously-load-development-channels plugin:ms365@agent-bridge --dangerously-skip-permissions --name '"$CREATED_AGENT"'"
+  bridge_claude_launch_with_channel_state_dirs "'"$CREATED_AGENT"'" "$raw"
+')"
+assert_contains "$MS365_STALE_LAUNCH" "MS365_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.ms365"
+assert_not_contains "$MS365_STALE_LAUNCH" "MS365_STATE_DIR=/stale/.ms365"
+python3 - "$MS365_STALE_LAUNCH" <<'PY'
+import sys
+command = sys.argv[1]
+assert command.count("plugin:ms365@agent-bridge") == 1, command
+PY
+MS365_FRESH_LAUNCH="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["'"$CREATED_AGENT"'"]="plugin:ms365@agent-bridge"
+  raw="claude --dangerously-load-development-channels plugin:ms365@agent-bridge --dangerously-skip-permissions --name '"$CREATED_AGENT"'"
+  bridge_claude_launch_with_channel_state_dirs "'"$CREATED_AGENT"'" "$raw"
+')"
+assert_contains "$MS365_FRESH_LAUNCH" "MS365_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.ms365"
+TEAMS_MS365_BOTH_LAUNCH="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["'"$CREATED_AGENT"'"]="plugin:teams@agent-bridge,plugin:ms365@agent-bridge"
+  raw="OTHER_ENV=keep TEAMS_STATE_DIR=/stale/.teams MS365_STATE_DIR=/stale/.ms365 claude --dangerously-load-development-channels plugin:teams@agent-bridge --dangerously-load-development-channels plugin:ms365@agent-bridge --dangerously-skip-permissions --name '"$CREATED_AGENT"'"
+  bridge_claude_launch_with_channel_state_dirs "'"$CREATED_AGENT"'" "$raw"
+')"
+assert_contains "$TEAMS_MS365_BOTH_LAUNCH" "TEAMS_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams"
+assert_contains "$TEAMS_MS365_BOTH_LAUNCH" "MS365_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.ms365"
+assert_contains "$TEAMS_MS365_BOTH_LAUNCH" "OTHER_ENV=keep"
+assert_not_contains "$TEAMS_MS365_BOTH_LAUNCH" "TEAMS_STATE_DIR=/stale/.teams"
+assert_not_contains "$TEAMS_MS365_BOTH_LAUNCH" "MS365_STATE_DIR=/stale/.ms365"
+
 if command -v bun >/dev/null 2>&1; then
   log "exercising Teams channel plugin health"
   TEAMS_SMOKE_PORT="$(python3 - <<'PY'

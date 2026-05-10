@@ -476,6 +476,7 @@ bridge_claude_launch_with_channel_state_dirs() {
   local discord_dir=""
   local telegram_dir=""
   local teams_dir=""
+  local ms365_dir=""
 
   required="$(bridge_agent_effective_launch_plugin_channels_csv "$agent")"
   launch_channels="$(bridge_extract_channels_from_command "$original")"
@@ -491,14 +492,15 @@ bridge_claude_launch_with_channel_state_dirs() {
   discord_dir="$(bridge_agent_discord_state_dir "$agent")"
   telegram_dir="$(bridge_agent_telegram_state_dir "$agent")"
   teams_dir="$(bridge_agent_teams_state_dir "$agent")"
+  ms365_dir="$(bridge_agent_ms365_state_dir "$agent")"
 
   bridge_require_python
-  python3 - "$original" "$required" "$discord_dir" "$telegram_dir" "$teams_dir" <<'PY'
+  python3 - "$original" "$required" "$discord_dir" "$telegram_dir" "$teams_dir" "$ms365_dir" <<'PY'
 import re
 import shlex
 import sys
 
-original, required_csv, discord_dir, telegram_dir, teams_dir = sys.argv[1:]
+original, required_csv, discord_dir, telegram_dir, teams_dir, ms365_dir = sys.argv[1:]
 
 def normalize(raw: str):
     values = []
@@ -535,6 +537,8 @@ if any(
     assignments.append(("TELEGRAM_STATE_DIR", telegram_dir))
 if any(item == "plugin:teams" or item.startswith("plugin:teams@") for item in required):
     assignments.append(("TEAMS_STATE_DIR", teams_dir))
+if any(item == "plugin:ms365" or item.startswith("plugin:ms365@") for item in required):
+    assignments.append(("MS365_STATE_DIR", ms365_dir))
 
 # Issue #771 v0.9.6 — operator's R5 diagnostic confirmed PRIMARY fix
 # (v0.9.5 PR #774 `agent_env_regen`) was a false-positive: the regen
