@@ -483,7 +483,11 @@ def _overlay_dir(src: Path, dst: Path, source_root: Path) -> bool:
     return changed
 
 
-def overlay_source_to_cache(source_path: Path, cache_version_path: Path) -> bool:
+def overlay_source_to_cache(
+    source_path: Path,
+    cache_version_path: Path,
+    source_root: Path | None = None,
+) -> bool:
     """Mirror EVERYTHING from source onto cache, including node_modules.
 
     r3 codex catch — earlier overlay skipped node_modules and
@@ -496,14 +500,27 @@ def overlay_source_to_cache(source_path: Path, cache_version_path: Path) -> bool
     the plugin's installed dependency tree per agent (operator
     acknowledged 100-300 MB / agent in design v2).
 
-    v0.9.8 #786 Finding 1 — ``source_path`` doubles as the plugin's
-    source root for ``_is_symlink_outside_source_root``. Symlinks
-    pointing outside the plugin source tree (e.g. v1-isolation
+    v0.9.8 #786 Finding 1 r1 — used the plugin's own source path as
+    the boundary for symlink-outside-source detection. r2 catch:
+    that boundary was too narrow — a plugin that legitimately uses
+    ``node_modules -> ../dist`` (a sibling dir inside the same
+    marketplace) was wrongly skipped because ``../dist`` is outside
+    the plugin path even though it is inside the marketplace.
+
+    r2 fix: caller passes the MARKETPLACE root via ``source_root``.
+    Symlinks resolving inside the marketplace are recursed (intra-
+    marketplace deps OK); symlinks resolving outside (e.g. v1-isolation
     leftover ``node_modules -> /<controller>/.claude/plugins/cache/...``)
     are skipped with a WARN log instead of triggering a
     ``PermissionError`` on iterdir() under the isolated UID.
+
+    Back-compat: when ``source_root`` is omitted (legacy callers),
+    fall back to ``source_path`` as before.
     """
-    source_root = source_path.resolve()
+    if source_root is None:
+        source_root = source_path.resolve()
+    else:
+        source_root = source_root.resolve()
     changed = False
     for entry in source_path.iterdir():
         target = cache_version_path / entry.name
@@ -694,7 +711,7 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
                 plugin_cache_root.parent.chmod(0o700)
             cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
             cache_version_path.chmod(0o700)  # explicit, defensive against umask
-            overlay_source_to_cache(source_path, cache_version_path)
+            overlay_source_to_cache(source_path, cache_version_path, source_root=root)
             status = "updated"
             cache_type = "directory"
         elif cache_version_path.is_dir():
@@ -703,7 +720,7 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
             # the cache, while preserving the cache's installed
             # node_modules dir. The source root's node_modules is then
             # linked back to the cache below.
-            changed = overlay_source_to_cache(source_path, cache_version_path)
+            changed = overlay_source_to_cache(source_path, cache_version_path, source_root=root)
             status = "updated" if changed else "unchanged"
             cache_type = "directory"
         elif cache_version_path.exists():
@@ -719,7 +736,7 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
                 plugin_cache_root.parent.chmod(0o700)
             cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
             cache_version_path.chmod(0o700)  # explicit, defensive against umask
-            overlay_source_to_cache(source_path, cache_version_path)
+            overlay_source_to_cache(source_path, cache_version_path, source_root=root)
             status = "updated"
             cache_type = "directory"
         else:
@@ -734,7 +751,7 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
                 plugin_cache_root.parent.chmod(0o700)
             cache_version_path.mkdir(parents=False, exist_ok=False, mode=0o700)
             cache_version_path.chmod(0o700)  # explicit, defensive against umask
-            overlay_source_to_cache(source_path, cache_version_path)
+            overlay_source_to_cache(source_path, cache_version_path, source_root=root)
             status = "linked"
             cache_type = "directory"
     except OSError as exc:
