@@ -404,7 +404,46 @@ def _copy_file_if_changed(src: Path, dst: Path) -> bool:
     return True
 
 
-def _overlay_dir(src: Path, dst: Path) -> bool:
+def _is_symlink_outside_source_root(entry: Path, source_root: Path) -> bool:
+    """True when ``entry`` is a symlink whose resolved target is outside ``source_root``.
+
+    v0.9.8 #786 Finding 1 — operator hosts that migrated from v0.7→v0.8
+    isolation often carry leftover ``source/node_modules`` symlinks that
+    point at the controller's plugin cache (e.g.
+    ``/home/<controller>/.claude/plugins/cache/...``). When the linker
+    runs as the isolated UID, the controller path is unreadable and a
+    blind ``iterdir()`` through the symlink raises ``PermissionError``,
+    failing the whole sync. Detect symlinks-to-outside-source up front
+    so the linker can skip them with a WARN instead of crashing.
+
+    ``source_root`` must already be resolved by the caller; ``entry``
+    is resolved here. ``Path.resolve()`` only follows the readlink
+    chain and does not require read access on the final target, so the
+    symlink target being permission-denied to the running UID does not
+    block the check.
+    """
+    if not entry.is_symlink():
+        return False
+    try:
+        resolved = entry.resolve()
+    except OSError:
+        # Loop or other resolution failure — treat as outside so we
+        # skip+warn rather than crash on iterdir().
+        return True
+    try:
+        # Python 3.9+: Path.is_relative_to. Available everywhere this
+        # repo's `python3` runs (CI + macOS Homebrew + Amazon Linux 2023).
+        return not resolved.is_relative_to(source_root)
+    except AttributeError:
+        # Defensive fallback for unexpectedly old interpreters.
+        try:
+            resolved.relative_to(source_root)
+            return False
+        except ValueError:
+            return True
+
+
+def _overlay_dir(src: Path, dst: Path, source_root: Path) -> bool:
     """Recursively overlay src onto dst. Returns True if anything was written.
 
     r4 codex catch — entries that are symlinks-to-directory (created
@@ -416,6 +455,11 @@ def _overlay_dir(src: Path, dst: Path) -> bool:
     the symlink — this materializes the dependency tree into the
     cache as a real directory copy regardless of whether source's
     node_modules is a symlink (r1/r2 leftover) or a real dir.
+
+    v0.9.8 #786 Finding 1 — guard against v1-isolation leftover
+    symlinks-to-outside-source BEFORE the is_dir() recursion, otherwise
+    iterdir() would walk into a controller path the isolated UID
+    cannot read.
     """
     changed = False
     if dst.exists() and not dst.is_dir():
@@ -423,8 +467,15 @@ def _overlay_dir(src: Path, dst: Path) -> bool:
     dst.mkdir(parents=True, exist_ok=True)
     for entry in src.iterdir():
         target = dst / entry.name
+        if _is_symlink_outside_source_root(entry, source_root):
+            sys.stderr.write(
+                f"[bridge-dev-plugin-cache] WARNING: skipping symlink {entry} -> "
+                f"{entry.resolve()} (outside source root {source_root}; "
+                f"likely v1-isolation leftover, run cleanup helper)\n"
+            )
+            continue
         if entry.is_dir():  # includes symlinks-to-directory (resolved-stat)
-            if _overlay_dir(entry, target):
+            if _overlay_dir(entry, target, source_root):
                 changed = True
         elif entry.is_file() or entry.is_symlink():
             if _copy_file_if_changed(entry, target):
@@ -444,15 +495,30 @@ def overlay_source_to_cache(source_path: Path, cache_version_path: Path) -> bool
     copy node_modules into the cache too. Disk overhead is bounded by
     the plugin's installed dependency tree per agent (operator
     acknowledged 100-300 MB / agent in design v2).
+
+    v0.9.8 #786 Finding 1 — ``source_path`` doubles as the plugin's
+    source root for ``_is_symlink_outside_source_root``. Symlinks
+    pointing outside the plugin source tree (e.g. v1-isolation
+    leftover ``node_modules -> /<controller>/.claude/plugins/cache/...``)
+    are skipped with a WARN log instead of triggering a
+    ``PermissionError`` on iterdir() under the isolated UID.
     """
+    source_root = source_path.resolve()
     changed = False
     for entry in source_path.iterdir():
         target = cache_version_path / entry.name
+        if _is_symlink_outside_source_root(entry, source_root):
+            sys.stderr.write(
+                f"[bridge-dev-plugin-cache] WARNING: skipping symlink {entry} -> "
+                f"{entry.resolve()} (outside source root {source_root}; "
+                f"likely v1-isolation leftover, run cleanup helper)\n"
+            )
+            continue
         # r4 codex catch — is_dir() FIRST so symlinks-to-directory are
         # materialized into the cache as a real directory copy. Old
         # ordering matched is_symlink first → shutil.copy2 → corrupt cache.
         if entry.is_dir():
-            if _overlay_dir(entry, target):
+            if _overlay_dir(entry, target, source_root):
                 changed = True
         elif entry.is_file() or entry.is_symlink():
             if _copy_file_if_changed(entry, target):
