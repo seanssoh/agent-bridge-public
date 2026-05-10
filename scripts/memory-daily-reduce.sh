@@ -58,9 +58,33 @@ shopt -s nullglob
 for agent_dir in "$BRIDGE_AGENT_ROOT_V2"/*/; do
   agent_name="$(basename "$agent_dir")"
   fragment_dir="$agent_dir/runtime/memory-daily"
+  # r3 codex catch — refuse symlink agent dir or fragment dir. The
+  # isolated UID writes inside the agent home; if `runtime/memory-daily`
+  # itself is a symlink to a controller-only path, the iterdir walks
+  # through the symlink and exposes controller content as a fragment.
+  if [[ -L "$agent_dir" ]] || [[ -L "$fragment_dir" ]]; then
+    printf '[memory-daily-reduce] WARNING: refusing symlink under agent runtime (security): %s\n' \
+      "$fragment_dir" >&2
+    skipped=$((skipped + 1))
+    continue
+  fi
   [[ -d "$fragment_dir" ]] || { skipped=$((skipped + 1)); continue; }
 
   for fragment in "$fragment_dir"/*.json; do
+    # r3 codex catch (BLOCKING) — refuse symlink fragments. The
+    # isolated UID has write access to runtime/memory-daily/ (matrix
+    # row 2770), so it can plant a symlink to ANY controller-readable
+    # file (e.g. /home/ec2-user/.claude/.credentials.json) and the
+    # reducer's `cp` (without -P) follows the symlink, copying the
+    # target content into shared/aggregate/ where ab-shared group
+    # members read it. Path-traversal exfiltration vector. Reject
+    # symlinks loud; only real files allowed.
+    if [[ -L "$fragment" ]]; then
+      printf '[memory-daily-reduce] WARNING: refusing symlink fragment (security exfiltration vector): %s\n' \
+        "$fragment" >&2
+      errors=$((errors + 1))
+      continue
+    fi
     [[ -f "$fragment" ]] || continue
     fragment_name="$(basename "$fragment")"
     # Skip sidecar / adhoc artifacts — only canonical date-named fragments
@@ -81,8 +105,14 @@ for agent_dir in "$BRIDGE_AGENT_ROOT_V2"/*/; do
     # must DROP the source mode and chmod 0640 on the destination tmp
     # before rename. Otherwise verify reports the aggregate file as
     # mismatch even though the directory mode is canonical.
+    #
+    # r3 codex catch (defense-in-depth) — `cp -P` (no-dereference) so
+    # even if a symlink slips past the [[ -L ]] guard above (TOCTOU
+    # race between the test and cp), cp would copy the symlink itself
+    # (which subsequently fails the `-f` check anyway) instead of
+    # following it. -P is BSD/GNU compatible.
     tmp="${target}.tmp.$$"
-    if cp "$fragment" "$tmp" 2>/dev/null \
+    if cp -P "$fragment" "$tmp" 2>/dev/null \
         && chmod 0640 "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$target" 2>/dev/null; then
       reduced=$((reduced + 1))
