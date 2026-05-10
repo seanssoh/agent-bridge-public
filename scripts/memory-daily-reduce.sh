@@ -108,11 +108,25 @@ for agent_dir in "$BRIDGE_AGENT_ROOT_V2"/*/; do
     #
     # r3 codex catch (defense-in-depth) — `cp -P` (no-dereference) so
     # even if a symlink slips past the [[ -L ]] guard above (TOCTOU
-    # race between the test and cp), cp would copy the symlink itself
-    # (which subsequently fails the `-f` check anyway) instead of
-    # following it. -P is BSD/GNU compatible.
+    # race between the test and cp), cp copies the symlink itself
+    # instead of following it. -P is BSD/GNU compatible.
+    #
+    # r4 codex catches:
+    #   1. TOCTOU swap — attacker swaps real file → symlink between
+    #      Layer 1/2 check and cp -P. cp -P copies symlink into tmp.
+    #      Without the post-copy `[[ -L "$tmp" || ! -f "$tmp" ]]`
+    #      check, mv would publish the symlink and the consumer
+    #      (controller reading aggregate) would dereference into the
+    #      attacker's chosen target. Defense: re-check tmp post-cp;
+    #      if symlink or non-regular, drop without publishing.
+    #   2. Malformed JSON — agent writes `{bad json` to fragment.
+    #      Reducer published as aggregate row. Consumers consuming
+    #      the aggregate JSON-parse downstream and fail noisily.
+    #      Defense: validate JSON parseability before publishing.
     tmp="${target}.tmp.$$"
     if cp -P "$fragment" "$tmp" 2>/dev/null \
+        && [[ -f "$tmp" && ! -L "$tmp" ]] \
+        && python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$tmp" 2>/dev/null \
         && chmod 0640 "$tmp" 2>/dev/null \
         && mv -f "$tmp" "$target" 2>/dev/null; then
       reduced=$((reduced + 1))
