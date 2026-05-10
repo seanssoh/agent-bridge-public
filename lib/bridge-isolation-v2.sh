@@ -358,8 +358,10 @@ bridge_isolation_v2_exec_with_secret_env() {
 
 bridge_isolation_v2_agent_memory_daily_root() {
   # Per-agent memory-daily root. Lives inside the per-agent root so it
-  # inherits the same isolation contract; the daily harvester aggregates
-  # into the shared aggregate dir (controller-owned, group-readable).
+  # inherits the same isolation contract; the daily harvester writes
+  # per-agent fragments here (group ab-shared, mode 2770) and the
+  # controller-side reducer (`scripts/memory-daily-reduce.sh`) combines
+  # fragments into the shared aggregate dir (#786 Finding 2 / Design A).
   local agent="$1"
   local root
   root="$(bridge_isolation_v2_agent_root "$agent")" || return 1
@@ -367,14 +369,17 @@ bridge_isolation_v2_agent_memory_daily_root() {
 }
 
 bridge_isolation_v2_memory_daily_shared_aggregate_dir() {
-  # Canonical shared aggregate directory — the harvester writes
-  # admin-aggregate-*.json files DIRECTLY under this path (not inside an
-  # extra `aggregate/` child). Lives under shared/ so other isolated UIDs
-  # may read the aggregate but never write it (design-r3 decision: shared
-  # writes are controller-only). PR-C r3: contract unified across all
-  # callers so prepare/migration grants the same path the Python writer
-  # uses, eliminating the parent-vs-child mismatch flagged in r2 review
-  # finding P2 #2.
+  # Canonical shared aggregate directory — controller-owned, group-readable.
+  # Lives under shared/ so isolated UIDs may read but never write the
+  # aggregate (design-r3 decision: shared writes are controller-only;
+  # matrix row `shared-memory-daily-aggregate` is mode 2750 / r-x by
+  # ab-shared). Per #786 Finding 2 (Design A), the controller-side reducer
+  # `scripts/memory-daily-reduce.sh` is the sole writer — isolated harvester
+  # invocations skip --shared-aggregate-dir and only emit per-agent
+  # fragments under `<agent_root>/runtime/memory-daily/`. PR-C r3: contract
+  # unified across all callers so prepare/migration grants the same path
+  # the reducer writes, eliminating the parent-vs-child mismatch flagged
+  # in r2 review finding P2 #2.
   [[ -n "$BRIDGE_SHARED_ROOT" ]] || return 1
   printf '%s/memory-daily/aggregate' "$BRIDGE_SHARED_ROOT"
 }
