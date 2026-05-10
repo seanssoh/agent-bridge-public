@@ -74,8 +74,17 @@ for agent_dir in "$BRIDGE_AGENT_ROOT_V2"/*/; do
     # Atomic-ish copy: write to a tmp sibling then rename. Python's
     # _atomic_write_json convention reused so the controller-side reducer
     # composes well with concurrent readers.
+    #
+    # r2 codex catch — was `cp -p` which preserved the per-agent fragment
+    # mode (typically 0660 on the matrix runtime/memory-daily/ row). The
+    # aggregate row contract is `controller:ab-shared 0640`, so the copy
+    # must DROP the source mode and chmod 0640 on the destination tmp
+    # before rename. Otherwise verify reports the aggregate file as
+    # mismatch even though the directory mode is canonical.
     tmp="${target}.tmp.$$"
-    if cp -p "$fragment" "$tmp" 2>/dev/null && mv -f "$tmp" "$target" 2>/dev/null; then
+    if cp "$fragment" "$tmp" 2>/dev/null \
+        && chmod 0640 "$tmp" 2>/dev/null \
+        && mv -f "$tmp" "$target" 2>/dev/null; then
       reduced=$((reduced + 1))
     else
       rm -f "$tmp" 2>/dev/null || true
