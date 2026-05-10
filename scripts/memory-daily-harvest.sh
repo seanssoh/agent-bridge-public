@@ -111,12 +111,23 @@ v2_extra_args=()
 # (b) BRIDGE_DATA_ROOT is set, (c) BRIDGE_DATA_ROOT exists on disk, AND
 # (d) BRIDGE_AGENT_ROOT_V2 is set. Mirrors the wiki harvester gate at
 # scripts/wiki-daily-ingest.sh:174-176.
+#
+# Issue #786 Finding 2 (Design A binding): under linux-user isolation the
+# harvester effectively runs as the isolated UID, which has only r-x on
+# the controller-owned shared aggregate dir (matrix row
+# `shared-memory-daily-aggregate` = mode 2750). Passing --shared-aggregate-dir
+# from this context triggers EACCES on the admin-aggregate-*.json write.
+# Per Design A, the isolated UID writes only the per-agent fragment under
+# runtime/memory-daily/, and the controller-side reducer
+# (scripts/memory-daily-reduce.sh) combines fragments into the shared
+# aggregate. Legacy / non-isolated installs continue to pass both flags so
+# the controller-run harvester still produces aggregates directly.
 if [[ "${BRIDGE_LAYOUT:-legacy}" == "v2" ]] \
     && [[ -n "${BRIDGE_DATA_ROOT:-}" ]] \
     && [[ -d "${BRIDGE_DATA_ROOT}" ]] \
     && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
   v2_extra_args+=(--per-agent-state-dir "$BRIDGE_AGENT_ROOT_V2/$AGENT/runtime/memory-daily")
-  if [[ -n "${BRIDGE_SHARED_ROOT:-}" ]]; then
+  if [[ -n "${BRIDGE_SHARED_ROOT:-}" && "$isolation_mode" != "linux-user" ]]; then
     v2_extra_args+=(--shared-aggregate-dir "$BRIDGE_SHARED_ROOT/memory-daily/aggregate")
   fi
 elif [[ "${BRIDGE_LAYOUT:-legacy}" == "v2" ]]; then
