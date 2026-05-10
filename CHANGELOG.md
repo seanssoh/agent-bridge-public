@@ -6,6 +6,55 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.9.8] — 2026-05-10
+
+### Highlight — v0.9.7 carry-over (#786): RC6 ms365 leak + memory-daily aggregate
+
+운영자가 v0.9.7 ship 후 production 검증에서 발견한 2 finding (#786) 모두 fix. v0.9.5 → v0.9.6 → v0.9.7 → v0.9.8 cycle 의 같은 architectural 패턴 반복 (operator host 의 v1-isolation leftover artifact 가 codex review 의 fresh-install reproducer 로 재현 안 됨) 을 review brief 자체에 lesson 강제 적용 — focus item #1 = "operator's exact production state reproducer".
+
+### Process — review brief 가 operator-host artifact reproducer 의무 명시
+
+운영자 frustration: "왜 계속 같은 문제 반복돼.. 해결되기 전까지 무제한 리뷰 하도록 해". v0.9.5/v0.9.6/v0.9.7 process lesson (release-PR review brief 에 operator's actual production state reproducer 명시) 가 매 release 후 lesson 으로 기록만 되고 다음 release brief 작성 시 누락. v0.9.8 부터 review brief 가 처음부터 operator-host artifact inventory 명시:
+
+- v1-isolation leftover symlinks (`source/<plugin>/node_modules → /controller/cache/...`)
+- pre-v2 `installPath` in `installed_plugins.json`
+- 운영자 ad-hoc workaround state (chmod 2770, named-user ACL grants)
+
+이 강제 효과: PR #787 r1 catch (intra-marketplace symlink) 와 PR #788 r1-r4 catches (chmod, symlink exfiltration, TOCTOU race, JSON validation) 모두 lesson 적용 후 codex 가 catch. 이전 cycle 에서는 catch 못 했을 vector.
+
+### Fixed (#787 — RC6 ms365 leak, refs #786 Finding 1)
+
+- `bridge-dev-plugin-cache.py:overlay_source_to_cache` + `_overlay_dir` — symlink-to-outside-marketplace detect + skip + WARN. operator host 의 v0.7→v0.8 isolation migration leftover (`source/ms365/node_modules → /home/ec2-user/.claude/plugins/cache/...`) 가 isolated UID 권한으로 read 시도 → `PermissionError: [Errno 13]` → ms365 sync `install-failed`. v0.9.7 이 다른 3 plugin (teams, cosmax-crm, cosmax-ep-approval) 는 작동했지만 ms365 만 silent fail.
+- 2-round codex destructive-probe: r1 catch — `source_root = source_path.resolve()` boundary 가 너무 narrow (plugin-specific path), intra-marketplace `node_modules → ../dist` 를 outside-source 로 잘못 분류. r2 fix — caller chain 으로 marketplace root 전달, marketplace boundary 사용.
+
+### Fixed (#788 — memory-daily aggregate matrix vs harvester mismatch, refs #786 Finding 2)
+
+- `scripts/memory-daily-harvest.sh` — isolated UID 시 `--shared-aggregate-dir` 안 넘김 (per-agent fragment 만 쓰도록). 이전엔 isolated UID 가 controller-only `aggregate/` 에 직접 write 시도 → EACCES.
+- `scripts/memory-daily-reduce.sh` (NEW) — controller-side reducer. agents/<X>/runtime/memory-daily/*.json fragment → admin-aggregate-<agent>-<date>.json. operator 가 controller crontab 에 wire (v0.9.9 에서 자동 등록 검토).
+- `lib/bridge-isolation-v2.sh:bridge_isolation_v2_memory_daily_shared_aggregate_dir` — self-contradicting comment fix. 매트릭스 row 가 design A (r-x for isolated UIDs) binding 이라고 명확.
+- 4-round codex destructive-probe (security-heavy):
+  - r1: cp -p preserved fragment mode (0660) vs aggregate contract (0640) → drop -p + explicit chmod 0640
+  - r2 BLOCKING: symlink fragment 가 controller secret 으로의 path-traversal exfiltration vector → 3 defense layer (reject symlink agent_dir, reject symlink fragment, cp -P TOCTOU defense)
+  - r3 BLOCKING: TOCTOU race 후 Layer 2 [[ -L ]] check 사이 swap 가능 → post-cp [[ -f && ! -L ]] re-check + JSON parse gate
+  - r4 implement-ok: 8/8 probes PASS (TOCTOU swap blocked, malformed JSON rejected, valid JSON published, mode 0640, group ab-shared 보존)
+
+### Verified (operator-host artifact + canonical state)
+
+- operator's exact ms365 leftover artifact (`source/ms365/node_modules → /controller/cache/...`) → cache materializes without node_modules + WARN
+- intra-marketplace symlink (e.g. `node_modules → ../dist`) → cache recurses + materializes
+- agent-controlled symlink fragment exfiltration vector → blocked at Layer 2
+- TOCTOU race attack on symlink check → blocked at Layer 4 (post-cp)
+- malformed JSON fragment → rejected at Layer 5 (JSON parse gate)
+- aggregate file mode 0640 + ab-shared group inheritance from setgid parent
+- chmod 2770 운영자 workaround state coexists with new harvester (no regression)
+
+### Known carry-over (v0.9.9 트랙 후보)
+
+- `installed_plugins.json` rewrite ordering (#786 suggested fix item 3 — 이번 PR 는 cache materialization 만 fix; pre-v2 installPath 가 cache fail 시 안 고쳐지는 것은 별도)
+- v1-isolation cleanup helper — `agent-bridge upgrade --apply` 가 `source/<plugin>/node_modules → /controller/...` symlink 을 자동 detect + remove (currently operator manual `rm`)
+- memory-daily reducer 의 cron 자동 등록 (`bridge-cron.sh` 에 controller-side cron job)
+- design v2 §"Per-Agent Cache Tradeoffs" content-addressed package store proposal
+
 ## [0.9.7] — 2026-05-10
 
 ### Highlight — v0.9.6 verification surfaced 6 RCs → unified isolation grant matrix
