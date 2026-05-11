@@ -752,21 +752,39 @@ for name, value in assignments:
         # final assignment. Even though shell eval is last-wins (so the
         # value would still be correct), duplicate exported assignments
         # are a code smell and surface in audit/logs as if multiple
-        # stale values survived. Final re.sub collapses any double
-        # spaces left by drops.
+        # stale values survived.
+        #
+        # r3 codex catch on PR #790: a global `re.sub(r" {2,}", " ", …)`
+        # post-pass would also collapse multi-space runs INSIDE quoted
+        # values elsewhere in env_prefix (e.g. `OTHER="a  b"` would be
+        # mangled to `OTHER="a b"`). Instead, when dropping a duplicate
+        # span, strip ONE leading whitespace character from the gap
+        # between the previous token and the dropped span — this
+        # collapses the dedupe artifact locally without touching any
+        # other whitespace in env_prefix.
         pieces = []
         last = 0
         first = True
         for s_, e_ in spans:
-            pieces.append(env_prefix[last:s_])
             if first:
+                # Keep the full gap before the first matching span,
+                # then emit the canonical assignment.
+                pieces.append(env_prefix[last:s_])
                 pieces.append(f"{name}={quoted_value}")
                 first = False
-            # else: drop this span entirely (no append)
+            else:
+                # Dropping this duplicate span: also drop ONE leading
+                # whitespace separator (space or tab) from the gap so
+                # the surrounding tokens collapse from "…  …" to "… …".
+                # Local to the drop site — does NOT touch spaces inside
+                # quoted values elsewhere in env_prefix.
+                gap = env_prefix[last:s_]
+                if gap and gap[0] in (" ", "\t"):
+                    gap = gap[1:]
+                pieces.append(gap)
             last = e_
         pieces.append(env_prefix[last:])
         env_prefix = "".join(pieces)
-        env_prefix = re.sub(r" {2,}", " ", env_prefix)
         if env_prefix and not env_prefix.endswith((" ", "\t")):
             env_prefix += " "
     else:
