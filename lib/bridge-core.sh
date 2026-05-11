@@ -251,7 +251,7 @@ bridge_expand_user_path() {
   case "$raw" in
     '')   printf '%s' "" ;;
     '~')  printf '%s' "$HOME" ;;
-    '~/'*) printf '%s%s' "$HOME" "${raw#\~}" ;;
+    \~/*) printf '%s%s' "$HOME" "${raw:1}" ;;
     *)    printf '%s' "$raw" ;;
   esac
 }
