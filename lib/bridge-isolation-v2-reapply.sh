@@ -214,6 +214,13 @@ bridge_isolation_v2_reapply_chown_chmod_file() {
   local mode="$2"
   local file="$3"
   bridge_isolation_v2_reapply_run_priv chown "$owner_group" "$file" || return 1
+  # If an extended ACL is present, Linux chmod updates the ACL mask rather
+  # than the owning-group entry. Strip first so target modes like 0660 really
+  # restore group::rw- for v2 channel env files that were rewritten as 0600
+  # with a stale mask::--- ACL.
+  if bridge_isolation_v2_reapply_has_named_acl "$file"; then
+    bridge_isolation_v2_reapply_run_priv setfacl -b "$file" || return 1
+  fi
   bridge_isolation_v2_reapply_run_priv chmod "$mode" "$file" || return 1
   return 0
 }

@@ -854,6 +854,46 @@ If you find any named-user ACL inside the v2 tree
 (`~/.agent-bridge/agents/<agent>/...`) or on `/home/agent-bridge-<agent>/`,
 it is drift — the migration runbook below strips it.
 
+### Claude setup-token registry and rotation
+
+For Claude subscription accounts, the preferred shared-credential path is
+not the controller's `~/.claude/.credentials.json`. Generate one or more
+Claude Code setup tokens and let Agent Bridge write the active token into
+each selected Claude agent's v2 launch-secret file:
+
+```bash
+claude setup-token
+agent-bridge auth claude-token add --id claude-a --stdin --activate --sync
+# Paste the setup token on stdin, then press Enter and Ctrl-D.
+
+claude setup-token
+agent-bridge auth claude-token add --id claude-b --stdin --sync
+```
+
+The registry lives at
+`$BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json` (mode `0600`), and
+`list` output shows only token ids and fingerprints:
+
+```bash
+agent-bridge auth claude-token list
+agent-bridge auth claude-token activate claude-b --sync
+```
+
+To enable automatic rotation, register at least two enabled tokens and set
+the threshold. The daemon reuses the existing Claude usage monitor signal
+from `bridge-usage.py`; when a Claude usage window reaches the rotation
+threshold once per reset cycle, it runs `rotate --if-auto-enabled --sync`.
+
+```bash
+agent-bridge auth claude-token auto-rotate enable --threshold 99
+```
+
+Manual fallback:
+
+```bash
+agent-bridge auth claude-token rotate --reason manual --sync
+```
+
 ### v0.7 → v0.8 migration runbook
 
 For an isolated agent that drifted across the v0.7 → v0.8 cut:

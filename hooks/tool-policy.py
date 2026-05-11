@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import shlex
 import sys
@@ -79,6 +80,58 @@ def roster_local_path() -> Path:
 
 def task_db_path() -> Path:
     return bridge_home_dir() / "state" / "tasks.db"
+
+
+CLAUDE_CREDENTIAL_DENY_REASON = (
+    "Claude OAuth credentials are blocked inside tool calls; use a redacted "
+    "diagnostic such as `claude auth status` instead"
+)
+
+
+def _resolve_existing(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve()
+    except OSError:
+        return path.expanduser()
+
+
+def _controller_home_dir() -> Path | None:
+    try:
+        return Path(pwd.getpwuid(bridge_home_dir().stat().st_uid).pw_dir)
+    except (KeyError, OSError):
+        return None
+
+
+def claude_credential_paths() -> set[Path]:
+    paths = {Path.home() / ".claude" / ".credentials.json"}
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if config_dir:
+        paths.add(Path(config_dir).expanduser() / ".credentials.json")
+    controller_home = _controller_home_dir()
+    if controller_home is not None:
+        paths.add(controller_home / ".claude" / ".credentials.json")
+    return {_resolve_existing(path) for path in paths}
+
+
+def _path_is_claude_credentials(path: Path) -> bool:
+    expanded = _resolve_existing(path)
+    if expanded in claude_credential_paths():
+        return True
+    parts = expanded.parts
+    return len(parts) >= 2 and parts[-2:] == (".claude", ".credentials.json")
+
+
+def _raw_mentions_claude_credentials(raw: str) -> bool:
+    return (
+        "sk-ant-o" in raw
+        or (".credentials.json" in raw and ".claude" in raw)
+    )
+
+
+def claude_credentials_reason_for_path(path: Path) -> str | None:
+    if _path_is_claude_credentials(path):
+        return CLAUDE_CREDENTIAL_DENY_REASON
+    return None
 
 
 def admin_agent_id() -> str:
@@ -1271,6 +1324,12 @@ def protected_alias_reason(text: str, agent: str) -> str | None:
     # gate stays unconditional — `agb` queue commands are the
     # structured-read surface and direct sqlite reads still bypass that
     # contract.
+    if _raw_mentions_claude_credentials(text):
+        return CLAUDE_CREDENTIAL_DENY_REASON
+    for credential_path in claude_credential_paths():
+        if _bash_argv_references_path(text, credential_path):
+            return CLAUDE_CREDENTIAL_DENY_REASON
+
     read_intent = _is_read_intent_bash(text)
     # Wrapper self-block carve-out: the sanctioned `agent-bridge config
     # set` wrapper layers its own caller-source + audit gate
@@ -1505,21 +1564,38 @@ def handle_pretool(payload: dict[str, Any], agent: str) -> int:
     if tool_name == "Bash":
         reason = protected_alias_reason(str(tool_input.get("command") or ""), agent)
     else:
-        # Issue #383: Read / Glob / Grep / NotebookRead tools get the
-        # read-intent allowance on protected paths. Edit / Write /
-        # NotebookEdit and unknown tools stay write-intent.
-        read_intent = _is_read_intent_tool(tool_name, tool_input)
-        for key in ("file_path", "path"):
+        for key in ("file_path", "path", "pattern"):
             raw = str(tool_input.get(key) or "").strip()
             if not raw:
                 continue
-            try:
-                candidate = Path(raw).expanduser()
-            except Exception:
-                continue
-            reason = protected_path_reason(candidate, agent, read_intent=read_intent)
-            if reason:
+            if _raw_mentions_claude_credentials(raw):
+                reason = CLAUDE_CREDENTIAL_DENY_REASON
                 break
+            if key in ("file_path", "path"):
+                try:
+                    candidate = Path(raw).expanduser()
+                except Exception:
+                    continue
+                reason = claude_credentials_reason_for_path(candidate)
+                if reason:
+                    break
+
+        if reason is None:
+            # Issue #383: Read / Glob / Grep / NotebookRead tools get the
+            # read-intent allowance on protected paths. Edit / Write /
+            # NotebookEdit and unknown tools stay write-intent.
+            read_intent = _is_read_intent_tool(tool_name, tool_input)
+            for key in ("file_path", "path"):
+                raw = str(tool_input.get(key) or "").strip()
+                if not raw:
+                    continue
+                try:
+                    candidate = Path(raw).expanduser()
+                except Exception:
+                    continue
+                reason = protected_path_reason(candidate, agent, read_intent=read_intent)
+                if reason:
+                    break
 
     if reason:
         detail["reason"] = reason

@@ -19,6 +19,8 @@
 #   T7  R  malformed activity index → silent exit 1, no traceback
 #   T8  H  pre-compact.py with unwritable state dir → exits 0 (compaction
 #          contract preserved)
+#   T9  W  discord relay sync with no global relay token exits 0 and skips
+#          channel polling noise
 #
 # Tracks B (daemon observer + send primitive + EMA + dedup + follow-up)
 # and Track C (Teams/Mattermost TS plugin writers) are still in flight.
@@ -397,6 +399,44 @@ t8() {
   pass "$case"
 }
 
+# ---------- T9: missing optional relay token is not a hard failure ---------
+t9() {
+  local case="T9 discord relay sync tolerates missing global relay token"
+  local bridge_home="$ROOT/t9-home"
+  local state_file="$ROOT/t9-state.json"
+  local snapshot_file="$ROOT/t9-snapshot.tsv"
+  local runtime_config="$ROOT/t9-runtime.json"
+  local out_file="$ROOT/t9.out"
+  local err_file="$ROOT/t9.err"
+
+  mkdir -p "$bridge_home/agents"
+  cat >"$snapshot_file" <<'EOF'
+agent	channel_id	active	idle_timeout	session
+alpha	100000000000000001	1	0	alpha
+EOF
+  printf '{}\n' >"$runtime_config"
+
+  "$PYTHON" "$DISCORD_RELAY_PY" sync \
+    --agent-snapshot "$snapshot_file" \
+    --bridge-home "$bridge_home" \
+    --state-file "$state_file" \
+    --runtime-config "$runtime_config" >"$out_file" 2>"$err_file"
+  local rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    fail "$case" "expected exit 0; got $rc; stderr=$(cat "$err_file")"
+    return
+  fi
+  if grep -qiE 'token not found|relay sync failed|Traceback' "$err_file"; then
+    fail "$case" "unexpected noisy stderr: $(cat "$err_file")"
+    return
+  fi
+  if [[ ! -f "$state_file" ]]; then
+    fail "$case" "expected relay state file to be written"
+    return
+  fi
+  pass "$case"
+}
+
 t1
 t2
 t3
@@ -405,6 +445,7 @@ t5
 t6
 t7
 t8
+t9
 
 # ---------------------------------------------------------------------------
 # Cases deferred until Track B/C land. Documented here so the next fixer

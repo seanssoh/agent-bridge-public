@@ -137,6 +137,7 @@ Usage:
   $CLI_NAME upgrade rollback [--target <bridge-home>] [--backup-root <dir>] [--json]
   $CLI_NAME upgrade conflicts <list|diff|adopt|discard|archive|reconcile> [--target <bridge-home>] [--json|--yes|--auto-archive] [<conflict-path>]
   $CLI_NAME daemon <ensure|status|start|stop|sync|run> ...
+  $CLI_NAME auth claude-token <add|list|activate|sync|rotate|auto-rotate> ...
   $CLI_NAME escalate question --agent <agent> --question "<text>" [--context "<text>"] [--wait-seconds <seconds>] [--json]
   $CLI_NAME upstream <draft|propose|review> ...
   $CLI_NAME review <policy|request|complete> ...
@@ -270,6 +271,8 @@ Examples:
   $CLI_NAME upgrade conflicts list --json
   $CLI_NAME upgrade conflicts reconcile --auto-archive
   $CLI_NAME upgrade conflicts adopt --yes <conflict-path>
+  $CLI_NAME auth claude-token add --id claude-a --stdin --activate --sync
+  $CLI_NAME auth claude-token auto-rotate enable --threshold 99
   $CLI_NAME escalate question --agent reviewer --question "Should I ship this now?" --context "Second ask without a user reply."
   $CLI_NAME upstream draft --title "setup fails" --symptom "..." --why "..." --output /tmp/issue.md
   $CLI_NAME upstream propose --title "setup fails" --body-file /tmp/issue.md
@@ -693,6 +696,10 @@ PY
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-daemon.sh" "$@"
       ;;
+    auth)
+      shift
+      exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" "$@"
+      ;;
     escalate)
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-escalate.sh" "$@"
@@ -1073,7 +1080,7 @@ EOF
   # sqlite3 fallback path. Reject with an intent-recovery suggestion
   # before the spawn parser sees it.
   if [[ -n "${1:-}" && "${1:0:1}" != "-" ]]; then
-    _top_valid="admin bootstrap init version upgrade escalate upstream review user guard diagnose doctor knowledge config bundle intake list status kill attach urgent task profile setup agent cron memory audit usage watchdog discord migrate wiki isolate unisolate worktree inbox show claim done cancel update handoff summary create"
+    _top_valid="admin bootstrap init version upgrade daemon auth escalate upstream review user guard diagnose doctor knowledge config bundle intake list status kill attach urgent task profile setup agent cron memory audit usage watchdog discord migrate wiki isolate unisolate worktree inbox show claim done cancel update handoff summary create"
     _hint="$(bridge_suggest_subcommand "$1" "$_top_valid")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 명령입니다: $1"

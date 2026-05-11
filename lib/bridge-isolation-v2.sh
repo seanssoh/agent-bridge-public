@@ -1341,19 +1341,23 @@ bridge_isolation_v2_matrix_rows_for_agent() {
     # writer helper sets mode 0660 explicitly.
   fi
 
-  # ----- RC3: controller Anthropic credentials read grant (named ACL) -----
-  # Resolve the controller home dynamically so the row stays
-  # machine-agnostic (operator host runs ec2-user; dev hosts run sean).
-  local ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
-  if [[ -n "$ctrl_user" ]]; then
-    local ctrl_home
-    ctrl_home="$(getent passwd "$ctrl_user" 2>/dev/null | cut -d: -f6)"
-    if [[ -z "$ctrl_home" ]]; then
-      ctrl_home="${HOME:-}"
-    fi
-    if [[ -n "$ctrl_home" ]]; then
-      printf 'controller-credentials|%s/.claude/.credentials.json|file|%s|%s||0600|0|controller_credential_acl|required|RC3 named-user ACL exception (only cross-agent shared secret)\n' \
-        "$ctrl_home" "$ctrl_user" "$ctrl_user"
+  # ----- Legacy opt-in: controller Anthropic credentials read grant -----
+  # Default OFF. Sharing the controller's rotating Claude OAuth file across
+  # agents widens the secret surface and can invalidate every session when the
+  # token is exposed or rotated. Operators that still need the old transition
+  # behavior can opt in explicitly with BRIDGE_ENABLE_CONTROLLER_CREDENTIAL_ACL=1.
+  if [[ "${BRIDGE_ENABLE_CONTROLLER_CREDENTIAL_ACL:-0}" == "1" ]]; then
+    local ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+    if [[ -n "$ctrl_user" ]]; then
+      local ctrl_home
+      ctrl_home="$(getent passwd "$ctrl_user" 2>/dev/null | cut -d: -f6)"
+      if [[ -z "$ctrl_home" ]]; then
+        ctrl_home="${HOME:-}"
+      fi
+      if [[ -n "$ctrl_home" ]]; then
+        printf 'controller-credentials|%s/.claude/.credentials.json|file|%s|%s||0600|0|controller_credential_acl|required|legacy opt-in named-user ACL exception for controller Claude credential\n' \
+          "$ctrl_home" "$ctrl_user" "$ctrl_user"
+      fi
     fi
   fi
 
@@ -1369,8 +1373,8 @@ bridge_isolation_v2_matrix_rows_for_agent() {
     # design and replaces it with four per-agent rows under the isolated
     # home. Operator's binding principle: each isolated agent installs
     # its own plugins, logs in separately, and never shares cache or
-    # credentials with another agent. Anthropic controller credentials
-    # remain the only cross-agent shared secret (RC3 row above).
+    # credentials with another agent. The legacy controller credential
+    # ACL row above is disabled unless explicitly opted in.
     #
     # All four rows use grant_mechanism `install_managed`: the matrix
     # apply path does not create or chmod these — `bridge_linux_share_

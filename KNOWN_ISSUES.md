@@ -281,9 +281,12 @@ Effect on first launch of a v0.8.0 v2-isolated Linux Claude agent:
   - run `claude login` once per isolated UID (the planned end-state),
     which writes `$BRIDGE_AGENT_ROOT_V2/<agent>/home/.claude/.credentials.json`
     owned by the per-agent UID; or
-  - pre-populate `$BRIDGE_AGENT_ROOT_V2/<agent>/home/credentials/launch-secrets.env`
-    with `ANTHROPIC_API_KEY=…` before the first launch, in which case
-    the launcher consumes the env-var path and skips the picker.
+  - pre-populate `$BRIDGE_AGENT_ROOT_V2/<agent>/credentials/launch-secrets.env`
+    with `CLAUDE_CODE_OAUTH_TOKEN=…` (or another supported Claude env
+    credential) before the first launch, in which case the launcher
+    consumes the env-var path and skips the picker. The supported helper is
+    `agent-bridge auth claude-token add --id <id> --stdin --activate --sync`,
+    using a token from `claude setup-token`.
 
 This is the planned end-state described in the PR-E plan — the
 credential file lives entirely inside the v2 layout, no path reaches
