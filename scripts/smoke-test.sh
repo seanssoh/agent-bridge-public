@@ -5450,6 +5450,126 @@ TEAMS_DEV_STATE_DIR_LAUNCH="$("$BASH4_BIN" -c '
 ')"
 assert_contains "$TEAMS_DEV_STATE_DIR_LAUNCH" "TEAMS_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams"
 
+# Issue #786 follow-up — bridge_claude_launch_with_channel_state_dirs must
+# also canonicalize MS365_STATE_DIR. Frozen-roster launch_cmd previously kept
+# stale pre-v2 path → ms365 plugin server.ts mkdir EACCES → MCP entry dropped.
+MS365_STALE_LAUNCH="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["'"$CREATED_AGENT"'"]="plugin:ms365@agent-bridge"
+  raw="MS365_STATE_DIR=/stale/.ms365 claude --dangerously-load-development-channels plugin:ms365@agent-bridge --dangerously-skip-permissions --name '"$CREATED_AGENT"'"
+  bridge_claude_launch_with_channel_state_dirs "'"$CREATED_AGENT"'" "$raw"
+')"
+assert_contains "$MS365_STALE_LAUNCH" "MS365_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.ms365"
+assert_not_contains "$MS365_STALE_LAUNCH" "MS365_STATE_DIR=/stale/.ms365"
+python3 - "$MS365_STALE_LAUNCH" <<'PY'
+import sys
+command = sys.argv[1]
+assert command.count("plugin:ms365@agent-bridge") == 1, command
+PY
+MS365_FRESH_LAUNCH="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["'"$CREATED_AGENT"'"]="plugin:ms365@agent-bridge"
+  raw="claude --dangerously-load-development-channels plugin:ms365@agent-bridge --dangerously-skip-permissions --name '"$CREATED_AGENT"'"
+  bridge_claude_launch_with_channel_state_dirs "'"$CREATED_AGENT"'" "$raw"
+')"
+assert_contains "$MS365_FRESH_LAUNCH" "MS365_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.ms365"
+TEAMS_MS365_BOTH_LAUNCH="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["'"$CREATED_AGENT"'"]="plugin:teams@agent-bridge,plugin:ms365@agent-bridge"
+  raw="OTHER_ENV=keep TEAMS_STATE_DIR=/stale/.teams MS365_STATE_DIR=/stale/.ms365 claude --dangerously-load-development-channels plugin:teams@agent-bridge --dangerously-load-development-channels plugin:ms365@agent-bridge --dangerously-skip-permissions --name '"$CREATED_AGENT"'"
+  bridge_claude_launch_with_channel_state_dirs "'"$CREATED_AGENT"'" "$raw"
+')"
+assert_contains "$TEAMS_MS365_BOTH_LAUNCH" "TEAMS_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams"
+assert_contains "$TEAMS_MS365_BOTH_LAUNCH" "MS365_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.ms365"
+assert_contains "$TEAMS_MS365_BOTH_LAUNCH" "OTHER_ENV=keep"
+assert_not_contains "$TEAMS_MS365_BOTH_LAUNCH" "TEAMS_STATE_DIR=/stale/.teams"
+assert_not_contains "$TEAMS_MS365_BOTH_LAUNCH" "MS365_STATE_DIR=/stale/.ms365"
+
+# PR #790 r2 codex catch — duplicate stale assignments for the SAME VAR
+# must collapse to exactly ONE canonical entry. The replacement loop
+# previously emitted a canonical assignment for EACH matching span,
+# producing `MS365_STATE_DIR=/new MS365_STATE_DIR=/new` instead of a
+# single final assignment. Shell eval is last-wins so the value is
+# still correct, but duplicate exported assignments surface in audit
+# logs / `ps` output as if multiple stale entries survived. The fix
+# is symmetric across all four channel state dirs; verify both an
+# MS365 case and a TEAMS case so the contract is enforced for the
+# whole family.
+MS365_DUP_LAUNCH="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["'"$CREATED_AGENT"'"]="plugin:ms365@agent-bridge"
+  raw="MS365_STATE_DIR=/stale1/.ms365 MS365_STATE_DIR=/stale2/.ms365 claude --dangerously-load-development-channels plugin:ms365@agent-bridge --dangerously-skip-permissions --name '"$CREATED_AGENT"'"
+  bridge_claude_launch_with_channel_state_dirs "'"$CREATED_AGENT"'" "$raw"
+')"
+assert_contains "$MS365_DUP_LAUNCH" "MS365_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.ms365"
+assert_not_contains "$MS365_DUP_LAUNCH" "/stale1/.ms365"
+assert_not_contains "$MS365_DUP_LAUNCH" "/stale2/.ms365"
+python3 - "$MS365_DUP_LAUNCH" <<'PY'
+import re
+import sys
+command = sys.argv[1]
+matches = re.findall(r"\bMS365_STATE_DIR=", command)
+assert len(matches) == 1, f"expected 1 MS365_STATE_DIR=, got {len(matches)}: {command!r}"
+PY
+TEAMS_DUP_LAUNCH="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["'"$CREATED_AGENT"'"]="plugin:teams@agent-bridge"
+  raw="TEAMS_STATE_DIR=/stale1/.teams TEAMS_STATE_DIR=/stale2/.teams claude --dangerously-load-development-channels plugin:teams@agent-bridge --dangerously-skip-permissions --name '"$CREATED_AGENT"'"
+  bridge_claude_launch_with_channel_state_dirs "'"$CREATED_AGENT"'" "$raw"
+')"
+assert_contains "$TEAMS_DUP_LAUNCH" "TEAMS_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams"
+assert_not_contains "$TEAMS_DUP_LAUNCH" "/stale1/.teams"
+assert_not_contains "$TEAMS_DUP_LAUNCH" "/stale2/.teams"
+python3 - "$TEAMS_DUP_LAUNCH" <<'PY'
+import re
+import sys
+command = sys.argv[1]
+matches = re.findall(r"\bTEAMS_STATE_DIR=", command)
+assert len(matches) == 1, f"expected 1 TEAMS_STATE_DIR=, got {len(matches)}: {command!r}"
+PY
+
+# PR #790 r3 codex catch (BLOCKING) — the r2 fix introduced a global
+# `re.sub(r" {2,}", " ", env_prefix)` post-pass to clean up the double
+# space left when a duplicate span was dropped. That cleanup was too
+# coarse: it collapsed multi-space runs ANYWHERE in env_prefix,
+# including INSIDE quoted env values. `OTHER="a  b"` got silently
+# mangled to `OTHER="a b"`, breaking pass-through correctness for any
+# upstream env value that intentionally contained consecutive spaces.
+# r3 fix: strip ONE leading whitespace at each dedupe drop site
+# (local to the span boundary) instead of a global post-pass. Fixture
+# asserts both halves of the contract:
+#   1. Duplicate MS365_STATE_DIR spans still collapse to exactly one.
+#   2. An unrelated OTHER='keep  with  multi  spaces' value with
+#      intentional multi-space runs is preserved BYTE-FOR-BYTE.
+OTHER_QUOTED_PRESERVED_LAUNCH="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["'"$CREATED_AGENT"'"]="plugin:ms365@agent-bridge"
+  raw="OTHER='\''keep  with  multi  spaces'\'' MS365_STATE_DIR=/stale1/.ms365 MS365_STATE_DIR=/stale2/.ms365 claude --dangerously-load-development-channels plugin:ms365@agent-bridge --dangerously-skip-permissions --name '"$CREATED_AGENT"'"
+  bridge_claude_launch_with_channel_state_dirs "'"$CREATED_AGENT"'" "$raw"
+')"
+# OTHER's internal multi-space content must be preserved exactly.
+assert_contains "$OTHER_QUOTED_PRESERVED_LAUNCH" "OTHER='keep  with  multi  spaces'"
+# Dedupe still produces exactly one canonical MS365_STATE_DIR.
+assert_contains "$OTHER_QUOTED_PRESERVED_LAUNCH" "MS365_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.ms365"
+assert_not_contains "$OTHER_QUOTED_PRESERVED_LAUNCH" "/stale1/.ms365"
+assert_not_contains "$OTHER_QUOTED_PRESERVED_LAUNCH" "/stale2/.ms365"
+python3 - "$OTHER_QUOTED_PRESERVED_LAUNCH" <<'PY'
+import re
+import sys
+command = sys.argv[1]
+ms365_matches = re.findall(r"\bMS365_STATE_DIR=", command)
+assert len(ms365_matches) == 1, f"expected 1 MS365_STATE_DIR=, got {len(ms365_matches)}: {command!r}"
+# Belt-and-suspenders: assert the OTHER value passed through byte-for-byte.
+assert "OTHER='keep  with  multi  spaces'" in command, \
+    f"OTHER multi-space content mangled: {command!r}"
+PY
+
 if command -v bun >/dev/null 2>&1; then
   log "exercising Teams channel plugin health"
   TEAMS_SMOKE_PORT="$(python3 - <<'PY'

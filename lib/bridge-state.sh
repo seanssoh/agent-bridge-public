@@ -476,6 +476,7 @@ bridge_claude_launch_with_channel_state_dirs() {
   local discord_dir=""
   local telegram_dir=""
   local teams_dir=""
+  local ms365_dir=""
 
   required="$(bridge_agent_effective_launch_plugin_channels_csv "$agent")"
   launch_channels="$(bridge_extract_channels_from_command "$original")"
@@ -491,14 +492,15 @@ bridge_claude_launch_with_channel_state_dirs() {
   discord_dir="$(bridge_agent_discord_state_dir "$agent")"
   telegram_dir="$(bridge_agent_telegram_state_dir "$agent")"
   teams_dir="$(bridge_agent_teams_state_dir "$agent")"
+  ms365_dir="$(bridge_agent_ms365_state_dir "$agent")"
 
   bridge_require_python
-  python3 - "$original" "$required" "$discord_dir" "$telegram_dir" "$teams_dir" <<'PY'
+  python3 - "$original" "$required" "$discord_dir" "$telegram_dir" "$teams_dir" "$ms365_dir" <<'PY'
 import re
 import shlex
 import sys
 
-original, required_csv, discord_dir, telegram_dir, teams_dir = sys.argv[1:]
+original, required_csv, discord_dir, telegram_dir, teams_dir, ms365_dir = sys.argv[1:]
 
 def normalize(raw: str):
     values = []
@@ -535,6 +537,8 @@ if any(
     assignments.append(("TELEGRAM_STATE_DIR", telegram_dir))
 if any(item == "plugin:teams" or item.startswith("plugin:teams@") for item in required):
     assignments.append(("TEAMS_STATE_DIR", teams_dir))
+if any(item == "plugin:ms365" or item.startswith("plugin:ms365@") for item in required):
+    assignments.append(("MS365_STATE_DIR", ms365_dir))
 
 # Issue #771 v0.9.6 — operator's R5 diagnostic confirmed PRIMARY fix
 # (v0.9.5 PR #774 `agent_env_regen`) was a false-positive: the regen
@@ -741,11 +745,43 @@ for name, value in assignments:
         if env_prefix[s_:e_].startswith(prefix_form)
     ]
     if spans:
+        # r2 codex catch on PR #790: replace the FIRST matching span
+        # with canonical, drop all subsequent spans entirely. Otherwise
+        # `NAME=/old1 NAME=/old2` produces two canonical entries
+        # (`NAME=/new NAME=/new`) instead of collapsing to a single
+        # final assignment. Even though shell eval is last-wins (so the
+        # value would still be correct), duplicate exported assignments
+        # are a code smell and surface in audit/logs as if multiple
+        # stale values survived.
+        #
+        # r3 codex catch on PR #790: a global `re.sub(r" {2,}", " ", …)`
+        # post-pass would also collapse multi-space runs INSIDE quoted
+        # values elsewhere in env_prefix (e.g. `OTHER="a  b"` would be
+        # mangled to `OTHER="a b"`). Instead, when dropping a duplicate
+        # span, strip ONE leading whitespace character from the gap
+        # between the previous token and the dropped span — this
+        # collapses the dedupe artifact locally without touching any
+        # other whitespace in env_prefix.
         pieces = []
         last = 0
+        first = True
         for s_, e_ in spans:
-            pieces.append(env_prefix[last:s_])
-            pieces.append(f"{name}={quoted_value}")
+            if first:
+                # Keep the full gap before the first matching span,
+                # then emit the canonical assignment.
+                pieces.append(env_prefix[last:s_])
+                pieces.append(f"{name}={quoted_value}")
+                first = False
+            else:
+                # Dropping this duplicate span: also drop ONE leading
+                # whitespace separator (space or tab) from the gap so
+                # the surrounding tokens collapse from "…  …" to "… …".
+                # Local to the drop site — does NOT touch spaces inside
+                # quoted values elsewhere in env_prefix.
+                gap = env_prefix[last:s_]
+                if gap and gap[0] in (" ", "\t"):
+                    gap = gap[1:]
+                pieces.append(gap)
             last = e_
         pieces.append(env_prefix[last:])
         env_prefix = "".join(pieces)
