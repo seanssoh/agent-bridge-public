@@ -157,9 +157,11 @@ while IFS= read -r agent; do
     cap="$(_psw_capture_pane "$agent" || true)"
     matched_pattern=""
     if printf '%s\n' "$cap" | grep -qE "$_PICKER_OPTION_LINE_RE"; then
-        matched_pattern="picker option line"
-    elif printf '%s\n' "$cap" | grep -qE "$_PICKER_TAIL_RE"; then
-        matched_pattern="picker tail (Enter/Esc prompt)"
+        if printf '%s\n' "$cap" | grep -qE "$_PICKER_TAIL_RE"; then
+            matched_pattern="picker option line + tail"
+        else
+            matched_pattern="picker option line"
+        fi
     fi
 
     if [[ -n "$matched_pattern" ]]; then

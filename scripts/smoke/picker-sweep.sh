@@ -7,7 +7,9 @@
 #   3. False-positive defence: a session containing picker text in
 #      free-prose context (PR body, doc, log) does NOT trigger send-keys
 #   4. Picker option line match: real picker pane → send Enter, summary task
-#   5. Picker tail match (Enter/Esc prompt) → send Enter
+#   5. Tail-only (no option line) → rejected (defends against generic tool
+#      confirmation prompts that codex r1 flagged as a false-positive vector)
+#   5b. Picker option line + tail combined → send Enter (canonical positive)
 #   6. Notify-empty path: BRIDGE_PICKER_SWEEP_NOTIFY="" → send Enter, no task
 #
 # Test seams: this smoke replaces tmux + agent-bridge calls with mock shell
@@ -206,20 +208,46 @@ smoke_assert_contains "$(cat "$TASK_LOG")" "1 agent(s) auto-unstuck" "4 task tit
 smoke_assert_contains "$(cat "$TASK_LOG")" "stuck-agent:picker option line" "4 task body lists agent"
 
 # ---------------------------------------------------------------------------
-# Test 5 — Picker tail (Enter/Esc prompt) match.
+# Test 5 — Tail-only (no option line) must be REJECTED.
+#
+# Codex r1 review caught that the previous `elif tail` branch matched any
+# pane with the "Enter to confirm · Esc to cancel" tail — including generic
+# tool-confirmation prompts, PR bodies, docs, and logs quoting Claude Code's
+# confirm prompt. The fix requires _PICKER_OPTION_LINE_RE to match; tail
+# alone is no longer sufficient. This test pins that defence.
 # ---------------------------------------------------------------------------
 
-smoke_log "5. picker tail prompt → unstick"
+smoke_log "5. tail-only (no option line) → rejected (false-positive defence)"
 reset_fixture
-printf '%s\n' "tail-agent" > "$FIXTURE_DIR/sessions"
-cat >"$FIXTURE_DIR/pane-tail-agent" <<'PANE'
+printf '%s\n' "tail-only-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-tail-only-agent" <<'PANE'
 A tool ran with this prompt:
 Enter to confirm · Esc to cancel
 PANE
 
 run_sweep
-smoke_assert_eq "1" "$(count_lines "$SEND_LOG")" "5 one send (tail match)"
-smoke_assert_contains "$(cat "$SEND_LOG")" "tail-agent" "5 send target"
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "5 no send (tail-only must not trigger)"
+smoke_assert_eq "0" "$(grep -c "^---$" "$TASK_LOG" || true)" "5 no task (tail-only must not trigger)"
+
+# ---------------------------------------------------------------------------
+# Test 5b — Picker option line + tail combined → unstick (canonical positive).
+#
+# Mirrors Test 4 but asserts the "option line + tail" matched_pattern path
+# explicitly, so future maintainers can see both detection branches exercised.
+# ---------------------------------------------------------------------------
+
+smoke_log "5b. picker option line + tail → unstick (positive)"
+reset_fixture
+printf '%s\n' "full-picker-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-full-picker-agent" <<'PANE'
+❯ 1. Resume from summary (recommended)
+  2. Resume full session as-is
+Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "1" "$(count_lines "$SEND_LOG")" "5b one send (option+tail match)"
+smoke_assert_contains "$(cat "$SEND_LOG")" "full-picker-agent" "5b send target"
 
 # ---------------------------------------------------------------------------
 # Test 6 — Notify-empty path.
