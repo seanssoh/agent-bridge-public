@@ -35,6 +35,26 @@ bridge_start_dev_channels_accept_timeout() {
   printf '%s' "$accept_timeout"
 }
 
+# Time budget for Claude to reach the foreground (i.e. begin presenting its
+# trust/dev-channels prompts) AFTER tmux session creation. The controller
+# watcher arms immediately at tmux-create time, but on a fresh-plugin-cache
+# launch bridge-run.sh first runs bridge_run_sync_dev_plugin_cache for the
+# four configured channels, which can take 3-5 minutes; only then does it
+# exec `claude`. The previous design only had a single 60s prompt-accept
+# budget — so the controller watcher would time out before Claude even
+# started, leaving the trust/dev-channels prompts unanswered and the
+# operator stuck pressing Enter manually. Split budget: this one covers
+# "wait until claude is in the foreground" and is intentionally generous.
+# The existing accept timeout (default 60s) then covers "from foreground
+# to prompt accepted" which is typically <10s.
+bridge_start_dev_channels_claude_foreground_timeout() {
+  local foreground_timeout="${BRIDGE_START_DEV_CHANNELS_CLAUDE_FOREGROUND_TIMEOUT_SECONDS:-600}"
+
+  [[ "$foreground_timeout" =~ ^[0-9]+$ ]] || foreground_timeout=600
+  (( foreground_timeout > 0 )) || foreground_timeout=600
+  printf '%s' "$foreground_timeout"
+}
+
 bridge_start_effective_dev_channels_csv() {
   local agent="$1"
   local suppress_missing="${2:-0}"
@@ -114,18 +134,20 @@ bridge_start_schedule_dev_channels_accept() {
   local session="$1"
   local agent="$2"
   local accept_timeout=""
+  local foreground_timeout=""
   local log_dir=""
   local logfile="/dev/null"
   local errfile="/dev/null"
 
   accept_timeout="$(bridge_start_dev_channels_accept_timeout)"
+  foreground_timeout="$(bridge_start_dev_channels_claude_foreground_timeout)"
   log_dir="$(bridge_agent_log_dir "$agent")"
   if mkdir -p "$log_dir" 2>/dev/null; then
     logfile="$log_dir/$(date '+%Y%m%d').log"
     errfile="$log_dir/$(date '+%Y%m%d').err.log"
   fi
 
-  echo "[info] controller-side Claude development-channels auto-accept armed for '$session' (timeout=${accept_timeout}s)"
+  echo "[info] controller-side Claude development-channels auto-accept armed for '$session' (foreground=${foreground_timeout}s, accept=${accept_timeout}s)"
   (
     "$BRIDGE_BASH_BIN" -lc '
       set -euo pipefail
@@ -133,7 +155,23 @@ bridge_start_schedule_dev_channels_accept() {
       session="$2"
       agent="$3"
       accept_timeout="$4"
+      foreground_timeout="$5"
       source "$script_dir/bridge-lib.sh"
+      if ! bridge_tmux_session_exists "$session"; then
+        printf "[%s] [warn] controller auto-accept dev-channels skipped: tmux session=%s already gone\n" \
+          "$(date "+%Y-%m-%d %H:%M:%S")" "$session" >&2
+        exit 0
+      fi
+      if ! bridge_tmux_wait_for_claude_foreground "$session" "$foreground_timeout" 2 $((foreground_timeout / 2 + 1)); then
+        if ! bridge_tmux_session_exists "$session"; then
+          printf "[%s] [warn] controller auto-accept dev-channels aborted: tmux session=%s ended before claude foreground (likely plugin-cache or launch failure)\n" \
+            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" >&2
+        else
+          printf "[%s] [warn] controller auto-accept dev-channels timeout waiting for claude foreground on session=%s agent=%s after %ss\n" \
+            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" "$foreground_timeout" >&2
+        fi
+        exit 0
+      fi
       if bridge_tmux_wait_for_prompt "$session" claude "$accept_timeout" 1; then
         printf "[%s] [info] controller auto-accept dev-channels completed on session=%s agent=%s\n" \
           "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
@@ -141,7 +179,7 @@ bridge_start_schedule_dev_channels_accept() {
         printf "[%s] [warn] controller auto-accept dev-channels failed/timeout on session=%s agent=%s\n" \
           "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" >&2
       fi
-    ' -- "$SCRIPT_DIR" "$session" "$agent" "$accept_timeout"
+    ' -- "$SCRIPT_DIR" "$session" "$agent" "$accept_timeout" "$foreground_timeout"
   ) </dev/null >>"$logfile" 2>>"$errfile" &
 }
 

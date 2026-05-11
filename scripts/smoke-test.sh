@@ -10430,6 +10430,12 @@ bash "$REPO_ROOT/scripts/smoke/shared-settings-preserve-user-keys.sh"
 log "running precompact-notify suite smoke (issue #597 Track D)"
 bash "$REPO_ROOT/tests/precompact-notify/smoke.sh"
 
+# bridge_tmux_wait_for_claude_foreground must honor session liveness mid-poll
+# so a dead session does not burn the full foreground budget (controller
+# watcher P2 — bridge-start.sh:113 split-budget review r2).
+log "running tmux-wait-foreground-liveness smoke (controller watcher P2)"
+bash "$REPO_ROOT/tests/tmux-wait-foreground-liveness/smoke.sh"
+
 # Issue #639 — codex-task-mode-policy.py write-shape detector redesign
 # (default-deny block-mode allow-list + common-shape parser). Covers all
 # 6 D1 gaps (multi-command, substitution, quoting, exec/bash recursion,

@@ -138,6 +138,9 @@ bridge_tmux_wait_for_claude_foreground() {
 
   start_ts="$(date +%s)"
   while (( checks < max_checks )); do
+    if ! bridge_tmux_session_exists "$session"; then
+      return 1
+    fi
     if bridge_tmux_pane_foreground_is_claude "$session"; then
       return 0
     fi
