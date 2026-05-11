@@ -6,7 +6,39 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
-- `feat(scripts): add opt-in picker-sweep utility for auto-unsticking Claude Code interactive pickers` — new `scripts/picker-sweep.sh` scans every tmux session, detects rate-limit / resume-from-summary pickers, and presses Enter on the default option. Default disabled (`BRIDGE_PICKER_SWEEP_ENABLED=0`); operators opt in via OS crontab or bridge-native cron. Strict line-anchored regex defends against false-positives from PR bodies / docs / logs that quote picker text. Test seams allow `scripts/smoke/picker-sweep.sh` to exercise the script with mock tmux + mock queue without touching live state. See `OPERATIONS.md` "picker-sweep utility" for registration paths.
+## [0.9.9] — 2026-05-11
+
+### Highlight — every-upgrade isolated-UID breakage fixed (#792 CRITICAL hotfix)
+
+`scripts/deploy-live-install.sh` was using `cp -p` which preserved source-tree perms (0700 for shell scripts, 0600 for libs/hooks). Every `agent-bridge upgrade --apply` broke isolated-UID agents on next restart with a cascading 6-symptom failure list (bridge-run.sh EACCES, lib/hook unreadable, marketplace.json PermissionError, plugins/ms365/bun.lock install-failed, .credentials.json ACL mask cancellation, .env mask cancellation). Operators were applying a 6-point manual chmod+setfacl recovery after every upgrade. Fixed in PR #796 via per-file-class mode contract + post-deploy critical-perm verification.
+
+### Fixed
+
+- **`scripts/deploy-live-install.sh` strips perms on every upgrade** (PR #796, refs #792): replaced bare `cp -p` with `cp -p` + per-file-class chmod (`deploy_live_install_set_mode` helper). Added post-deploy `deploy_live_install_verify_critical_perms` sanity sweep with cross-platform stat (GNU `%a` + BSD `%Lp`). Non-fatal warning preserves operator recovery path. Per-class matrix: bridge-*.sh/agent-bridge/agb/hooks 0755, lib/marketplace.json/plugins-*.json 0644. ACL mask restore for `~/.claude/.credentials.json` and per-agent `.env` is documented out-of-scope (those live outside `$TARGET_ROOT`, handled in `lib/bridge-isolation-v2.sh` grant matrix).
+- **`bridge-upgrade.py:create_daily_backup_archive` aborts whole archive on isolated-UID EACCES** (PR #794, refs #785): per-member catch on `os.lstat` and `archive.add` for both `PermissionError` and raw `OSError(errno=EACCES)`. `skipped_isolated` list (bounded 50 + truncation marker + last 10 when len > 60) propagates to `result["skipped_isolated_count"]` AND `cmd_daily_backup_live` CLI JSON payload. Snapshot loop got the same defensive guard. Pattern mirrors existing `agent_migration` precedent.
+- **Orphan `memory-daily-<agent>` cron jobs never garbage-collected** (PR #797, refs #791): new `process_memory_daily_orphan_sweep` helper in `bridge-daemon.sh`. Each sync pass enumerates `family=memory-daily` cron jobs, cross-checks source agent against `BRIDGE_AGENT_IDS`, emits ONE `[health]` task per UTC day per orphan group with body listing `agent-bridge cron delete <job-id>` suggestions. Marker file at `$BRIDGE_STATE_DIR/memory-daily-orphan-sweep/<UTC-day>.surfaced` suppresses re-emit. Idempotent — does NOT auto-disable jobs (operator's explicit Option A preference). Mock unit test at `scripts/test-memory-daily-orphan-sweep.sh` (282 LOC, 16 assertions × 4 scenarios).
+- **MS365 plugin state-dir not canonicalized on launch** (PR #790, refs #786): `bridge_claude_launch_with_channel_state_dirs` (`lib/bridge-state.sh`) now canonicalizes `MS365_STATE_DIR` alongside existing Discord/Telegram/Teams. Frozen-roster `launch_cmd` with stale pre-v2 `MS365_STATE_DIR=…/agents/<X>/.ms365` (under 2750 SetGID parent) gets rewritten to canonical `agents/<X>/workdir/.ms365` (under 2770 ab-agent-X group). Plus 3-round codex catch: duplicate-vector dedupe (multiple stale STATE_DIR spans collapse to one canonical) + surgical separator strip at drop site (preserves quoted multi-space content in non-target env values like `OTHER="a  b"`). Symmetric across all 4 channel state VARs.
+- **Controller watcher times out before Claude foreground** (PR #793): split `bridge_start_schedule_dev_channels_accept` budget into foreground gate (`BRIDGE_START_DEV_CHANNELS_CLAUDE_FOREGROUND_TIMEOUT_SECONDS`, default 600s — waits for tmux pane foreground to become `claude`) and existing 60s accept window. On cold-plugin-cache restarts where `bridge-run.sh` runs `bridge_run_sync_dev_plugin_cache` for 3-5min before `exec claude`, the prior single 60s budget burned down before Claude even started. Plus in-loop `bridge_tmux_session_exists` check inside `bridge_tmux_wait_for_claude_foreground` so a hard plugin-cache failure that exits the tmux session mid-wait returns rc=1 promptly instead of polling the full budget. New runtime smoke `tests/tmux-wait-foreground-liveness/smoke.sh` covers the session-liveness path.
+
+### Added
+
+- **`scripts/picker-sweep.sh` — opt-in auto-unstick utility for stuck Claude Code pickers** (PR #664, SYRS-AI fork contribution): scans every tmux session, detects rate-limit / resume-from-summary pickers via closed-pattern allow-list, sends Enter on default option. Default disabled (`BRIDGE_PICKER_SWEEP_ENABLED=0`); operators opt in via OS crontab or bridge-native cron. Strict line-anchored regex requires both `_PICKER_OPTION_LINE_RE` AND (optionally for log diagnostic) `_PICKER_TAIL_RE` to match — defends against false-positives from PR bodies / docs / logs that quote picker text. Test seams allow `scripts/smoke/picker-sweep.sh` to exercise with mock tmux + mock queue. See `OPERATIONS.md` "picker-sweep utility" for registration paths.
+
+### Hygiene
+
+- **SC2088 false-positive in `bridge_expand_user_path`** (PR #795 Track D): replaced `'~/'*) printf '%s%s' "$HOME" "${raw#\~}"` with `\~/*) printf '%s%s' "$HOME" "${raw:1}"` — byte-equivalent across 8 inputs, shellcheck-clean. The case pattern `'~/'*` (tilde inside quotes) was triggering SC2088 since v0.9.6 push, blocking all gated CI checks (integration smoke, legacy-full-smoke, live/tmux/daemon smoke, unit/static smoke) for 4 consecutive release pushes. v0.9.9 is the first release with green lint since v0.9.5.
+
+### Process — codex-rescue caught 3 BLOCKING vectors this cycle
+
+- **PR #790 r1**: duplicate STATE_DIR spans → 2 canonical entries. Inherited from a latent main-branch bug; PR #790 just exposed it for MS365. r2 dedupe.
+- **PR #790 r2**: global `re.sub(r" {2,}", " ", env_prefix)` cleanup mangled quoted multi-space env values. r3 surgical drop-site strip.
+- **PR #797 r1**: call-site wiring `|| true` silent-swallow instead of `|| daemon_warn`. r2 wiring fix + tracked unit test.
+
+All 3 vectors were quote/substitution semantic issues that fresh-install probes would have missed. Pattern matches the v0.9.5-v0.9.8 "operator-host artifact reproducer required" lesson — now baked into review brief template.
+
+### Internal
+
+- Wave orchestration pattern (per `~/.claude/skills/wave-orchestration/`): 4 fixers + 3 codex reviews dispatched in parallel; 5 squash-merges + 2 codex iteration cycles + 1 fork-side merge conflict resolution + 1 cross-account auth dance (SYRS-AI fork PR), all without operator interaction.
 
 ## [0.9.8] — 2026-05-10
 
