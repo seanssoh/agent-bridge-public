@@ -168,27 +168,21 @@ bridge_agent_default_launch_cmd() {
       printf '%s' 'claude --dangerously-skip-permissions'
       ;;
     codex)
-      printf '%s' 'codex --dangerously-bypass-approvals-and-sandbox --no-alt-screen'
+      # v0.8.6 hotfix: every codex agent launches with fast_mode enabled by
+      # default. The codex CLI ships fast_mode as a stable=true feature, but
+      # an operator config.toml that sets `features.fast_mode=false` (or a
+      # downstream policy that flips it) would silently drop every agent off
+      # the fast inference path. Pin it explicitly here so admin-pair
+      # backfill, isolated agent create, and v0.7→v0.8 migration all carry
+      # the same flag and the policy is auditable from the roster's
+      # launch_cmd. codex_hooks stays paired (both features go through the
+      # same injection helper in lib/bridge-state.sh).
+      printf '%s' 'codex -c features.fast_mode=true --dangerously-bypass-approvals-and-sandbox --no-alt-screen'
       ;;
     *)
       bridge_die "지원하지 않는 engine 입니다: $engine"
       ;;
   esac
-}
-
-bridge_expand_user_path() {
-  local raw="$1"
-  if [[ -z "$raw" ]]; then
-    printf '%s' ""
-    return 0
-  fi
-  bridge_agent_manage_python "$raw" <<'PY'
-from pathlib import Path
-import sys
-
-value = sys.argv[1]
-print(str(Path(value).expanduser()))
-PY
 }
 
 bridge_render_template_string() {
@@ -395,6 +389,22 @@ bridge_scaffold_agent_home() {
   local role_text="$4"
   local engine="$5"
   local session_type="$6"
+  # v0.8.5 #693 (Wave-3): explicit isolation_mode + os_user passed by the
+  # caller (run_create) so the scaffold's sudo-handoff predicate does not
+  # rely on the in-memory roster. At scaffold time the new agent has not
+  # yet been written to agent-roster.local.sh (bridge_write_role_block
+  # runs AFTER scaffold) and `bridge_load_roster` has not been re-invoked,
+  # so `bridge_agent_linux_user_isolation_effective` — which reads
+  # `BRIDGE_AGENT_ISOLATION_MODE[<agent>]` / `BRIDGE_AGENT_OS_USER[<agent>]`
+  # — always returns false for a fresh `agent create --isolate ...` and
+  # the entire PR #688 sudo-handoff block (added for #677) silently
+  # no-ops. Plain `mkdir -p "$home"` then fails with `Permission denied`
+  # because `data/agents/` is `root:root mode 755`. Surface the values
+  # directly from the caller so the predicate works regardless of when
+  # the roster reload happens. Defaults preserve the legacy single-param
+  # signature for any internal callsite that does not (yet) opt in.
+  local explicit_isolation_mode="${7:-}"
+  local explicit_os_user="${8:-}"
   local template_root="$SCRIPT_DIR/agents/_template"
   local session_template="$template_root/session-types/$session_type.md"
   local session_files_root="$template_root/session-type-files/$session_type"
@@ -402,7 +412,142 @@ bridge_scaffold_agent_home() {
   local rel=""
   local target=""
 
+  # v2 layout (issue #686): bridge_agent_workdir resolves to a sibling
+  # `workdir/` next to `home/` when BRIDGE_AGENT_ROOT_V2 is active. The
+  # canonical ASCII art at the top of lib/bridge-isolation-v2.sh lists
+  # both as required per-agent subdirs (`home/` is the isolated process
+  # HOME, `workdir/` is the project tree the agent operates in). Without
+  # this, every fresh `agent create` on v2 leaves `<agent-root>/workdir`
+  # missing, so `bridge-start.sh --dry-run` (and any resolver-relative
+  # tooling like doctor/status) bombs with `workdir가 없습니다`.
+  # Compute the v2 workdir target up-front so the isolated/non-isolated
+  # branches below can both pre-create it alongside `$home`. Legacy
+  # installs (no BRIDGE_AGENT_ROOT_V2) keep `home == workdir` per
+  # bridge_agent_workdir's fallback, so this stays empty and is a no-op.
+  local _scaffold_v2_workdir=""
+  if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
+    _scaffold_v2_workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
+  fi
+
+  # v0.8.5 #677: when the agent will be linux-user isolated under v2,
+  # `$home` lives under `$BRIDGE_AGENT_ROOT_V2/<agent>/...`. The
+  # `agents/` ancestor is root-owned (mode 755) and a stale per-agent
+  # root from a prior failed `agent create` may already exist as
+  # root:ab-agent-<name> mode 2750 — neither gives the controller mkdir
+  # permission, so the plain `mkdir -p "$home"` below would fail with
+  # `Permission denied` and abort the scaffold before
+  # `bridge_linux_prepare_agent_isolation` (which normally lays this
+  # tree down via sudo) ever runs.
+  #
+  # Pre-create the per-agent root and `$home` via sudo with controller
+  # ownership so the rest of the scaffold (template renders, mkdirs,
+  # chmods) executes as plain controller writes. `bridge_linux_prepare_agent_isolation`
+  # runs after scaffold (bridge-agent.sh:2287) and normalizes
+  # ownership/mode to the canonical `root:ab-agent-<name> 2750` per-agent
+  # root + `<isolated>:ab-agent-<name> 2770` subdirs, then `chown -R
+  # $os_user $workdir` transfers the scaffolded contents to the
+  # isolated UID. Mirrors PR #675's `bridge_state_sudo_install_v2_file`
+  # sudo-handoff pattern in lib/bridge-state.sh.
+  # v0.8.5 #693 (Wave-3): replicate `bridge_agent_linux_user_isolation_effective`
+  # using the explicitly-passed args + host-platform check, instead of
+  # querying the in-memory roster which has not yet seen this agent (see
+  # the "explicit_isolation_mode" comment block above). Falls back to the
+  # roster-driven predicate when the caller did not pass explicit args
+  # (any pre-#693 callsite), so the legacy code path keeps functioning
+  # for callers that already had the agent registered before scaffold
+  # (admin-pair backfill via `agent create --allow-shared-workdir`, etc.).
+  local _scaffold_isolation_active=0
+  if [[ -n "$explicit_isolation_mode" || -n "$explicit_os_user" ]]; then
+    if [[ "$explicit_isolation_mode" == "linux-user" ]] \
+        && [[ -n "$explicit_os_user" ]] \
+        && [[ "$(bridge_host_platform 2>/dev/null || uname -s 2>/dev/null || printf '')" == "Linux" ]]; then
+      _scaffold_isolation_active=1
+    fi
+  elif command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    _scaffold_isolation_active=1
+  fi
+  if [[ -n "$home" ]] \
+      && [[ $_scaffold_isolation_active -eq 1 ]] \
+      && command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+    local _scaffold_v2_root=""
+    local _scaffold_controller=""
+    if command -v bridge_isolation_v2_agent_root >/dev/null 2>&1; then
+      _scaffold_v2_root="$(bridge_isolation_v2_agent_root "$agent" 2>/dev/null || printf '')"
+    fi
+    _scaffold_controller="$(bridge_current_user 2>/dev/null || id -un 2>/dev/null || printf '')"
+    if [[ -n "$_scaffold_v2_root" && -n "$_scaffold_controller" ]]; then
+      # Wave-5 #4282 hardening: every sudo-handoff step here is now
+      # strict. Pre-Wave-5 the block silenced stderr and `|| true`-
+      # swallowed every failure (mkdir/chown/chmod) and fell through to
+      # the plain `mkdir -p "$home"` below. On a fresh install where
+      # sudo NOPASSWD does not whitelist `mkdir/chown/chmod` (the
+      # `bridge_migration_install_sudoers` entry only whitelists
+      # `tmux + bash`), the entire block silently no-op'd and the plain
+      # mkdir surfaced raw `Permission denied` instead of an actionable
+      # "sudo configuration is wrong for v2 isolation" error. Surface
+      # each failure via `bridge_die` so the caller can fix the
+      # underlying sudo policy rather than chasing the secondary mkdir
+      # symptom (Scenario A.b root cause analysis, task #4282 retest).
+      #
+      # Scope is intentionally limited to the per-agent root +
+      # `$home` + v2 sibling workdir/ — i.e., paths the predicate has
+      # ALREADY confirmed are isolated-managed. The v2 ancestor parents
+      # (`$BRIDGE_DATA_ROOT`, `$BRIDGE_AGENT_ROOT_V2`) are NOT
+      # normalized here even though the canonical contract in
+      # lib/bridge-isolation-v2.sh:36-47 says `agents/` should be
+      # `root:root 0755`. Locking the parents to root:root would break
+      # the non-isolated v2 path: `bridge_agent_default_home`
+      # (lib/bridge-agents.sh:3226-3232) resolves shared-mode agents'
+      # home to `$BRIDGE_AGENT_ROOT_V2/<agent>/home` too, and the
+      # non-isolated branch reaches plain `mkdir -p "$home"` below
+      # without a sudo handoff — that mkdir would suddenly require
+      # write on a root-owned parent. The pre-Wave-5 `bridge_init_dirs`
+      # umask-derived parent perms (typically `sean:sean 0700` or
+      # `0755`) keep the non-isolated path working. Operators who want
+      # the full canonical layout should use the migration tool, which
+      # owns parent normalization (#4282 codex review, PR #701 r2).
+      #
+      # Per-agent root: idempotent. If a prior failed run left it as
+      # root:ab-agent-<name> 2750, retake it as controller-owned 0755 so
+      # we (and any nested mkdirs) can write into it. Prepare will reset
+      # ownership/mode to the canonical contract.
+      bridge_linux_sudo_root mkdir -p "$_scaffold_v2_root" \
+        || bridge_die "scaffold sudo mkdir failed: $_scaffold_v2_root (verify sudo NOPASSWD whitelist for the controller)"
+      bridge_linux_sudo_root chown "$_scaffold_controller" "$_scaffold_v2_root" \
+        || bridge_die "scaffold sudo chown $_scaffold_controller failed: $_scaffold_v2_root"
+      bridge_linux_sudo_root chmod 0755 "$_scaffold_v2_root" \
+        || bridge_die "scaffold sudo chmod 0755 failed: $_scaffold_v2_root"
+      # Scaffold target ($home is typically $_scaffold_v2_root/home but
+      # may be overridden via BRIDGE_AGENT_WORKDIR). Pre-create via sudo
+      # in case it lives under a path the controller cannot mkdir
+      # directly (same parent-owned-by-root problem as above).
+      bridge_linux_sudo_root mkdir -p "$home" \
+        || bridge_die "scaffold sudo mkdir failed: $home"
+      bridge_linux_sudo_root chown "$_scaffold_controller" "$home" \
+        || bridge_die "scaffold sudo chown $_scaffold_controller failed: $home"
+      bridge_linux_sudo_root chmod 0755 "$home" \
+        || bridge_die "scaffold sudo chmod 0755 failed: $home"
+      # v2 sibling workdir/ (issue #686) — same parent-owned-by-root
+      # problem applies. Pre-create via sudo with controller ownership
+      # so the resolver lookup succeeds; prepare's `chown -R $os_user
+      # $workdir` will retake ownership for the isolated UID after
+      # scaffold completes.
+      if [[ -n "$_scaffold_v2_workdir" ]]; then
+        bridge_linux_sudo_root mkdir -p "$_scaffold_v2_workdir" \
+          || bridge_die "scaffold sudo mkdir failed: $_scaffold_v2_workdir"
+        bridge_linux_sudo_root chown "$_scaffold_controller" "$_scaffold_v2_workdir" \
+          || bridge_die "scaffold sudo chown $_scaffold_controller failed: $_scaffold_v2_workdir"
+        bridge_linux_sudo_root chmod 0755 "$_scaffold_v2_workdir" \
+          || bridge_die "scaffold sudo chmod 0755 failed: $_scaffold_v2_workdir"
+      fi
+    fi
+  fi
+
   mkdir -p "$home"
+  if [[ -n "$_scaffold_v2_workdir" ]]; then
+    mkdir -p "$_scaffold_v2_workdir"
+  fi
   [[ -d "$template_root" ]] || bridge_die "agent template root가 없습니다: $template_root"
   [[ -f "$session_template" ]] || bridge_die "session type template가 없습니다: $session_type"
 
@@ -815,8 +960,26 @@ bridge_agent_session_type_from_home() {
 
 bridge_agent_canonical_dir() {
   local path="$1"
+  local resolved=""
+  # Issue #731: under linux-user isolation the controller user has stat
+  # permission on the parent + lookup on the entry (so `[[ -d ]]` is true)
+  # but not traverse on the directory itself when the workdir is owned by
+  # a separate Linux user with mode 2750. The plain `cd -P` aborts the
+  # subshell silently and the caller hands an empty payload to downstream
+  # JSON parsers (`bridge-upgrade.sh` SHARED_SETTINGS_RERENDER_JSON), which
+  # then surfaces as a raw JSONDecodeError traceback. Mirror the v0.8
+  # sudo-handoff trio (PR #718) by retrying through `bridge_linux_sudo_root`
+  # before falling back to a path passthrough.
   if [[ -d "$path" ]]; then
-    (cd -P "$path" && pwd -P)
+    resolved="$( (cd -P "$path" 2>/dev/null && pwd -P) || true)"
+    if [[ -z "$resolved" ]] && command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+      resolved="$(bridge_linux_sudo_root sh -c 'cd -P "$1" && pwd -P' _ "$path" 2>/dev/null || true)"
+    fi
+    if [[ -n "$resolved" ]]; then
+      printf '%s' "$resolved"
+    else
+      printf '%s' "$path"
+    fi
   else
     printf '%s' "$path"
   fi
@@ -1557,6 +1720,9 @@ bridge_agent_shared_settings_plan_json() {
   local workdir="$2"
   local launch_cmd
   local agent_class=""
+  local effective_file
+  local settings_path_override=""
+  local _isolated_active=0
   launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
   # Issue #593: pass the agent's source class through to the resolver so
   # the plan/diff helper computes the same managed default the renderer
@@ -1569,35 +1735,76 @@ bridge_agent_shared_settings_plan_json() {
     agent_class="$(bridge_agent_source "$agent" 2>/dev/null || true)"
   fi
 
+  effective_file="$(bridge_hook_per_agent_settings_effective_file "$agent")"
+
+  # Wave-5 #4282 Scenario B: for v2 linux-user-isolated agents the
+  # canonical post-apply settings live under `<isolated-home>/.claude/`,
+  # not under `$workdir`. `bridge_install_isolated_home_settings`
+  # writes both `settings.json` (root-owned symlink) and
+  # `settings.effective.json` (root-owned regular file) into the foreign
+  # UID's home, mode 0750 root:os_user — the controller (other) cannot
+  # stat or read it without sudo. Reading the workdir-relative paths
+  # would always return `link.ok=false` and `effective.matches_expected
+  # =false`, so the rerender row reports `needs-rerender` after every
+  # successful apply (task #4280 Scenario B `bob` agent surfaced this:
+  # rerender --apply rc=0 twice, but bob still showed needs-rerender /
+  # link_ok=false / effective_ok=false). Override the python's read
+  # targets to the isolated paths and run under sudo so the plan
+  # reports the actual post-install state.
+  if [[ "$agent" != "_template" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    local _os_user _isolated_home
+    _os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    if [[ -n "$_os_user" ]]; then
+      _isolated_home="$(bridge_agent_linux_user_home "$_os_user" 2>/dev/null || true)"
+      if [[ -n "$_isolated_home" ]] \
+          && command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+        settings_path_override="$_isolated_home/.claude/settings.json"
+        effective_file="$_isolated_home/.claude/settings.effective.json"
+        _isolated_active=1
+      fi
+    fi
+  fi
+
   # Issue #555: the rerender now writes the effective file at the
   # per-agent path ($BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/
-  # settings.effective.json). The plan/diff helper must compare the
-  # workdir symlink against the same per-agent target it will be
-  # relinked to — comparing against the install-wide path would
+  # settings.effective.json) for non-isolated agents. For isolated
+  # agents the path is overridden to <isolated-home>/.claude/
+  # settings.effective.json by the Wave-5 block above. In either case
+  # the plan/diff helper must compare against the path the renderer
+  # writes to — comparing against the install-wide path would
   # forever report `needs-rerender` after a successful apply.
-  bridge_agent_manage_python \
-    "$SCRIPT_DIR/bridge-hooks.py" \
-    "$agent" \
-    "$workdir" \
-    "$(bridge_hook_shared_settings_base_file)" \
-    "$(bridge_hook_shared_settings_overlay_file)" \
-    "$(bridge_hook_per_agent_settings_effective_file "$agent")" \
-    "$launch_cmd" \
-    "$agent_class" <<'PY'
+  #
+  # Wave-5 #4282: stage the python body to a temp file so the
+  # isolated branch (which must traverse the foreign UID's home and
+  # therefore runs the read under sudo) and the non-isolated branch
+  # share a single source of truth. Without this the bash function
+  # would either duplicate the python verbatim across both branches
+  # (which drifts) or only one branch would benefit from future
+  # python-side fixes.
+  local _plan_py
+  _plan_py="$(mktemp "${TMPDIR:-/tmp}/bridge-rerender-plan.XXXXXX.py")" || return 1
+  cat >"$_plan_py" <<'PY'
 import importlib.util
 import json
 import os
 import sys
 from pathlib import Path
 
-hooks_py, agent, workdir, base_file, overlay_file, effective_file, launch_cmd, agent_class = sys.argv[1:]
+argv = sys.argv[1:]
+hooks_py, agent, workdir, base_file, overlay_file, effective_file, launch_cmd, agent_class = argv[:8]
+settings_path_override = argv[8] if len(argv) > 8 else ""
 spec = importlib.util.spec_from_file_location("bridge_hooks", hooks_py)
 if spec is None or spec.loader is None:
     raise SystemExit(f"could not load {hooks_py}")
 hooks = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hooks)
 
-settings_path = Path(workdir).expanduser() / ".claude" / "settings.json"
+if settings_path_override:
+    settings_path = Path(settings_path_override).expanduser()
+else:
+    settings_path = Path(workdir).expanduser() / ".claude" / "settings.json"
 base_path = Path(base_file).expanduser()
 overlay_path = Path(overlay_file).expanduser()
 effective_path = Path(effective_file).expanduser()
@@ -1677,6 +1884,37 @@ payload = {
 }
 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 PY
+
+  local _plan_rc=0
+  if [[ $_isolated_active -eq 1 ]]; then
+    bridge_require_python
+    bridge_linux_sudo_root python3 "$_plan_py" \
+      "$SCRIPT_DIR/bridge-hooks.py" \
+      "$agent" \
+      "$workdir" \
+      "$(bridge_hook_shared_settings_base_file)" \
+      "$(bridge_hook_shared_settings_overlay_file)" \
+      "$effective_file" \
+      "$launch_cmd" \
+      "$agent_class" \
+      "$settings_path_override"
+    _plan_rc=$?
+  else
+    bridge_require_python
+    python3 "$_plan_py" \
+      "$SCRIPT_DIR/bridge-hooks.py" \
+      "$agent" \
+      "$workdir" \
+      "$(bridge_hook_shared_settings_base_file)" \
+      "$(bridge_hook_shared_settings_overlay_file)" \
+      "$effective_file" \
+      "$launch_cmd" \
+      "$agent_class" \
+      "$settings_path_override"
+    _plan_rc=$?
+  fi
+  rm -f "$_plan_py"
+  return $_plan_rc
 }
 
 bridge_agent_rerender_row_json() {
@@ -1872,22 +2110,88 @@ run_rerender_settings() {
   fi
 
   rows_file="$(mktemp "${TMPDIR:-/tmp}/bridge-rerender-settings.XXXXXX")"
+  local _probe_stderr=""
+  local _probe_err=""
+  local _probe_mode=""
   for target in "${targets[@]}"; do
     agent="${target%%$'\t'*}"
     workdir="${target#*$'\t'}"
-    before_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
+    # Issue #752 M4: under `set -e`, a single per-target probe failure
+    # (python crash, sudo denial on isolated read, mktemp ENOSPC) would
+    # abort the whole loop and leave later targets un-rerendered with no
+    # signal which agents were skipped. Capture rc explicitly, emit a
+    # structured error row that satisfies the bridge_agent_print_rerender_*
+    # consumers (status/agent/workdir/mode), warn, and continue.
+    _probe_stderr="$(mktemp "${TMPDIR:-/tmp}/bridge-rerender-probe-err.XXXXXX")"
+    if ! before_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir" 2>"$_probe_stderr")"; then
+      _probe_err="$(<"$_probe_stderr")"
+      rm -f "$_probe_stderr"
+      bridge_warn "rerender-settings: probe 실패로 target='$agent' 건너뜁니다 (workdir=$workdir): ${_probe_err:-no stderr captured}"
+      _probe_mode="$([[ $apply -eq 1 ]] && printf apply || printf dry-run)"
+      row_json="$(BRIDGE_PROBE_AGENT="$agent" BRIDGE_PROBE_WORKDIR="$workdir" \
+        BRIDGE_PROBE_MODE="$_probe_mode" BRIDGE_PROBE_ERROR="${_probe_err:-probe failed}" \
+        python3 -c 'import json,os; print(json.dumps({"agent":os.environ["BRIDGE_PROBE_AGENT"],"workdir":os.environ["BRIDGE_PROBE_WORKDIR"],"mode":os.environ["BRIDGE_PROBE_MODE"],"status":"error","reason":"probe_failed","error":os.environ["BRIDGE_PROBE_ERROR"]}, ensure_ascii=False, sort_keys=True))')"
+      printf '%s\n' "$row_json" >>"$rows_file"
+      failed_count=$((failed_count + 1))
+      continue
+    fi
+    rm -f "$_probe_stderr"
     error=""
     if [[ $apply -eq 1 ]]; then
       # Issue #570: managed autoCompactWindow default is unconditionally
       # 1_000_000; launch_cmd is forwarded only for caller-signature parity
       # with helpers that still accept it (no longer consulted by the renderer).
       target_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || true)"
+      # Issue #669: for v2 linux-user-isolated agents the `<workdir>/.claude/`
+      # tree lives under the foreign UID (mode 0700), so the controller
+      # cannot create or symlink files there. The workdir-side render is
+      # also dead work for these agents — the running Claude session reads
+      # `<isolated-home>/.claude/settings.json` from its own HOME, not the
+      # workdir. Skip the workdir-side render and route directly to the
+      # cross-UID handler (`bridge_install_isolated_home_settings`, which
+      # uses `bridge_linux_sudo_root` to write under the foreign UID).
+      # Net effect: rc=0 on first run for cross-UID isolated agents,
+      # which is what the v0.8.3 release-note "idempotent on rerun" promise
+      # was supposed to deliver but didn't (it stayed rc=1 → rc=1 because
+      # this branch never had a cross-UID path).
+      #
+      # PR #673 r2 (codex BLOCKING, refs #669/#666):
+      # `bridge_install_isolated_home_settings` now returns 1 on real
+      # internal failure (mkdir/render/install/mv). On the rerender
+      # path the install IS the load-bearing step (the workdir-side
+      # render is dead work for cross-UID isolated agents — see the
+      # comment block above), so a nonzero rc must flip this row to
+      # error and increment `failed_count`, mirroring the non-isolated
+      # branch. Capture stderr so the warn line surfaces in the row's
+      # error field. On success, audit the rerender as
+      # `cross_uid_isolated_home` strategy (matches the v0.8.3
+      # CHANGELOG promise that re-runs converge to rc=0).
+      if [[ "$agent" != "_template" ]] \
+          && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+          && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+        if apply_output="$(bridge_install_isolated_home_settings "$agent" "$target_launch_cmd" 2>&1)"; then
+          # Wave-5 #4282 Scenario B: re-probe via the isolation-aware
+          # plan_json so the row reports the actual post-install state
+          # (link.ok / effective.matches_expected / status). Prior to
+          # Wave-5 the success branch reused `before_json` verbatim,
+          # which left the row stuck at `needs-rerender` even after the
+          # install converged — bob agent on task #4280 retest reported
+          # rerender --apply rc=0 twice with link_ok=false /
+          # effective_ok=false on both runs.
+          after_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
+          bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "shared_settings_rerendered" "$agent" \
+            --detail workdir="$workdir" --detail strategy=cross_uid_isolated_home >/dev/null 2>&1 || true
+        else
+          error="$apply_output"
+          after_json="$before_json"
+          failed_count=$((failed_count + 1))
+        fi
       # Issue #555: forward agent id so the rerender writes to the
       # per-agent effective file ($BRIDGE_AGENT_HOME_ROOT/<agent>/.claude/
       # settings.effective.json). Mixed-model installs no longer fight
       # over a single install-wide file; each agent's autoCompactWindow
       # (and any future per-agent managed default) is independent.
-      if apply_output="$(bridge_link_claude_settings_to_shared "$workdir" "$target_launch_cmd" "$agent" 2>&1)"; then
+      elif apply_output="$(bridge_link_claude_settings_to_shared "$workdir" "$target_launch_cmd" "$agent" 2>&1)"; then
         after_json="$(bridge_agent_shared_settings_plan_json "$agent" "$workdir")"
         bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "shared_settings_rerendered" "$agent" \
           --detail workdir="$workdir" >/dev/null 2>&1 || true
@@ -1950,8 +2254,14 @@ run_create() {
   local users_json=""
   local default_home=""
   local start_dry_run=""
+  local start_dry_run_status="ok"
   # Issue #598 Track 4: opt-in for test-artifact-prefix names.
   local test_fixture=0
+  # Issue #691: opt-in for callers that legitimately share a workdir with
+  # another already-managed agent (e.g. the admin-pair backfill spawning
+  # `<admin>-dev` into the admin's workdir, where bootstrap_project_skill has
+  # already populated `.agents/`). Skips the non-empty-workdir guard.
+  local allow_shared_workdir=0
 
   shift || true
 
@@ -2100,6 +2410,14 @@ run_create() {
         test_fixture=1
         shift
         ;;
+      --allow-shared-workdir)
+        # Issue #691: skip the non-empty-workdir guard. Sanctioned for the
+        # admin-pair backfill (admin + admin-dev share the same workdir per
+        # their roles) and any future caller that legitimately layers on top
+        # of an existing managed scaffold.
+        allow_shared_workdir=1
+        shift
+        ;;
       *)
         bridge_die "지원하지 않는 agent create 옵션입니다: $1"
         ;;
@@ -2166,6 +2484,14 @@ report and reap test-fixture agents per their pattern."
       isolation_mode="shared"
       os_user=""
     else
+      # v0.8.4: enforce the group-name char policy upfront so a name
+      # accepted by `agent create` will always compose to a valid Linux
+      # group name (length is hash-truncated separately by
+      # bridge_isolation_v2_agent_group_name; the chars must still be
+      # [a-z_][a-z0-9_-]* per groupadd).
+      if [[ ! "$agent" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        bridge_die "linux-user isolation requires agent name to match [a-z_][a-z0-9_-]* (groupadd policy): '$agent'"
+      fi
       os_user="${os_user:-$(bridge_agent_default_os_user "$agent")}"
     fi
   fi
@@ -2194,11 +2520,20 @@ report and reap test-fixture agents per their pattern."
         :
       elif [[ -d "$workdir" && -f "$workdir/CLAUDE.md" ]]; then
         :
+      elif [[ -d "$workdir" && $allow_shared_workdir -eq 1 ]]; then
+        # Issue #691: caller (admin-pair backfill) explicitly opts into
+        # layering onto an existing managed workdir scaffold.
+        :
       else
         bridge_die "workdir가 이미 존재하고 비어 있지 않습니다: $workdir"
       fi
     fi
-    bridge_scaffold_agent_home "$agent" "$workdir" "$display_name" "$role_text" "$engine" "$session_type"
+    # v0.8.5 #693 (Wave-3): pass isolation_mode + os_user so scaffold's
+    # sudo-handoff predicate (added by PR #688 for #677) actually fires
+    # on `agent create --isolate ...`. Without these explicit args, the
+    # in-roster lookup inside scaffold would short-circuit the sudo path
+    # — see the comment on `bridge_scaffold_agent_home`'s signature.
+    bridge_scaffold_agent_home "$agent" "$workdir" "$display_name" "$role_text" "$engine" "$session_type" "$isolation_mode" "$os_user"
     bridge_scaffold_user_partitions "$workdir" "$users_json"
     if [[ "$engine" == "claude" ]]; then
       bridge_ensure_project_claude_guidance "$workdir" >/dev/null 2>&1 || true
@@ -2242,7 +2577,21 @@ report and reap test-fixture agents per their pattern."
     if [[ "$isolation_mode" == "linux-user" ]]; then
       bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir"
     fi
-    start_dry_run="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --dry-run 2>&1)"
+    # Issue #680: bridge-start.sh --dry-run is purely informational here — its
+    # output is reprinted to the user as `start_dry_run:` for diagnostic
+    # context. Letting its rc propagate via command-substitution + set -e
+    # silently aborts agent-create whenever dry-run reports a non-fatal
+    # warning (e.g. v2 fresh-install where the workdir path resolver expects
+    # `<agent-root>/workdir/` but bridge_scaffold_agent_home materializes
+    # `<agent-root>/home/`). Capture rc separately and surface a clear
+    # status field so a real first-run init no longer exits rc=1 with an
+    # empty log; the underlying scaffold-vs-resolver mismatch remains visible
+    # in the printed start_dry_run output for follow-up.
+    if start_dry_run="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --dry-run 2>&1)"; then
+      start_dry_run_status="ok"
+    else
+      start_dry_run_status="warn (rc=$?)"
+    fi
   fi
 
   if [[ $json_mode -eq 1 ]]; then
@@ -2275,7 +2624,7 @@ report and reap test-fixture agents per their pattern."
     echo "dry_run: yes"
   else
     echo "create: ok"
-    echo "start_dry_run: ok"
+    echo "start_dry_run: $start_dry_run_status"
     echo "$start_dry_run"
     echo "next_steps:"
     echo "  - agent-bridge setup agent $agent"
@@ -3231,6 +3580,50 @@ PY
         bridge_warn "agent delete: --purge-home refused: resolved home outside expected agent roots: $home_dir"
         ;;
     esac
+
+    # Issue #737 Q6: also cover the isolated agent's actual Linux home
+    # (`/home/agent-bridge-<agent>/`). `bridge_agent_default_home` only
+    # resolves the agents/<agent>/home tree; under linux-user isolation
+    # the agent runs as `agent-bridge-<agent>` whose real OS home is a
+    # separate path on disk and would otherwise leak after delete.
+    #
+    # Discovery rules (defensive):
+    #  - Must be a linux-user-isolated agent (effective, not just
+    #    requested) so we never run sudo+rm on hosts where the agent is
+    #    actually shared-mode.
+    #  - Resolve the OS user from the roster, then read its home from
+    #    `getent passwd` (never hardcode — operator may have customized
+    #    the home root).
+    #  - Refuse anything that doesn't match `^/home/agent-bridge-<slug>$`.
+    #    This blocks operator home, /, /root, /tmp, /var/lib/..., etc.,
+    #    even if a misconfigured passwd entry pointed there.
+    #  - Use bridge_linux_sudo_root because the tree is owned by the
+    #    isolated UID (and dotfiles inside it are often root-owned via
+    #    upgrade-time fixups), so the controller alone cannot rm it.
+    #  - Failures warn-only; the agent is already removed from the
+    #    roster, so an unreachable home is operator-followup, not a
+    #    fail-loud condition.
+    #
+    # Out of scope (separate follow-up): `userdel` of the Linux account.
+    # `--purge-home` cleans home files only; account removal is a
+    # distinct destructive action that deserves its own opt-in flag.
+    if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+       && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      local agent_user linux_home
+      agent_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+      if [[ -n "$agent_user" ]] && getent passwd "$agent_user" >/dev/null 2>&1; then
+        linux_home="$(getent passwd "$agent_user" | cut -d: -f6)"
+        if [[ -n "$linux_home" && "$linux_home" =~ ^/home/agent-bridge-[a-zA-Z0-9_-]+$ ]]; then
+          if [[ -d "$linux_home" ]]; then
+            bridge_warn "agent delete: --purge-home also removing isolated Linux home: $linux_home"
+            bridge_linux_sudo_root rm -rf -- "$linux_home" || \
+              bridge_warn "agent delete: --purge-home best-effort Linux home rm failed: $linux_home (operator manual cleanup may be required)"
+          fi
+        elif [[ -n "$linux_home" ]]; then
+          bridge_warn "agent delete: --purge-home refused isolated Linux home (does not match /home/agent-bridge-* guard): $linux_home"
+        fi
+      fi
+    fi
   fi
 
   local after_sha

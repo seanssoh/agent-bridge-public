@@ -109,12 +109,30 @@ def workdir_display(path: str) -> str:
     # Issue #305 Track C: surface a missing workdir at the dashboard layer so a
     # leaked smoke-fixture roster block (or any deleted/renamed/expired
     # registration) is visible without opening agent-roster.local.sh manually.
+    #
+    # v0.8.5 #694 (Wave-3): on Linux v2 partial-isolated-agent state, a
+    # broken `agent create --isolate ...` leaves `data/agents/<agent>/`
+    # as `root:ab-agent-<name> mode 2750`. The controller is in the
+    # group on disk but its process credentials don't include the new
+    # group until re-login, so `Path.is_dir()` raises `PermissionError`
+    # (errno 13) when the kernel checks the cached group set against
+    # the directory's group bits. That uncaught raise crashes the
+    # entire `agent-bridge status --all-agents` render. Treat any
+    # OSError (PermissionError is a subclass) as "unreadable" and tag
+    # the row so operators see the partial state rather than losing
+    # observability of every agent on the host. The same graceful
+    # pattern PR #688 added to `pending_upgrade_conflict_count`'s
+    # walk; this is the second site (`row.get('workdir')` per-agent
+    # row render) that issue #694 surfaced.
     short = short_path(path)
     if not path or short == "-":
         return short
     expanded = str(Path(path).expanduser())
-    if not Path(expanded).is_dir():
-        return f"{short}  [missing]"
+    try:
+        if not Path(expanded).is_dir():
+            return f"{short}  [missing]"
+    except OSError:
+        return f"{short}  [unreadable]"
     return short
 
 
@@ -341,6 +359,15 @@ def pending_upgrade_conflict_count(bridge_home: str) -> int:
 
     Returns 0 if the path does not exist or is not a directory; the
     counter is purely additive on healthy hosts.
+
+    v0.8.5 #681: tolerate `PermissionError`/`OSError` raised mid-walk
+    when a partial isolated agent (e.g. broken `agent create
+    --isolate`) leaves a `data/agents/<agent>/workdir` subtree the
+    controller cannot read. Without this guard `Path.rglob` propagates
+    the first such EACCES out and crashes `agent-bridge status
+    --all-agents` — operators lose dashboard observability of the very
+    state they need to triage. We walk manually so a single denied
+    branch only excludes that subtree, not the whole count.
     """
     if not bridge_home:
         return 0
@@ -348,15 +375,45 @@ def pending_upgrade_conflict_count(bridge_home: str) -> int:
     if not home.is_dir():
         return 0
     count = 0
-    for path in home.rglob("*.upgrade-conflict"):
+    stack: list[Path] = [home]
+    while stack:
+        current = stack.pop()
         try:
-            rel = path.relative_to(home).as_posix()
-        except ValueError:
+            entries = list(os.scandir(current))
+        except (PermissionError, OSError):
+            # Partial isolated-agent state, missing dir, or any other
+            # filesystem drift. Skip this subtree only — keep counting.
             continue
-        if rel.startswith("backups/"):
-            continue
-        if path.is_file():
-            count += 1
+        for entry in entries:
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError:
+                continue
+            if is_dir:
+                # Prune `backups/` at the BRIDGE_HOME root before
+                # descending — same exclusion the rglob/relative_to
+                # branch enforced previously.
+                try:
+                    rel = Path(entry.path).relative_to(home).as_posix()
+                except ValueError:
+                    rel = ""
+                if rel == "backups" or rel.startswith("backups/"):
+                    continue
+                stack.append(Path(entry.path))
+                continue
+            if entry.name.endswith(".upgrade-conflict"):
+                try:
+                    rel = Path(entry.path).relative_to(home).as_posix()
+                except ValueError:
+                    continue
+                if rel.startswith("backups/"):
+                    continue
+                try:
+                    is_file = entry.is_file(follow_symlinks=False)
+                except OSError:
+                    continue
+                if is_file:
+                    count += 1
     return count
 
 
@@ -574,10 +631,16 @@ def render_dashboard(args: argparse.Namespace) -> str:
             health_critical_count += 1
 
     if not args.all_agents:
+        # Issue #714 (#6): static-source agents must remain visible in the
+        # default dashboard even when they have no tmux session — otherwise a
+        # post-upgrade host where every static restart failed silently looks
+        # like total roster loss. Dynamic agents that have died still get
+        # filtered out, so this only surfaces roster-declared static roles.
         roster = [
             row
             for row in roster
             if str(row.get("active", "0")) == "1"
+            or str(row.get("source", "")) == "static"
             or int(metrics.get(row["agent"], {}).get("queued_count", 0) or 0) > 0
             or int(metrics.get(row["agent"], {}).get("claimed_count", 0) or 0) > 0
             or int(metrics.get(row["agent"], {}).get("blocked_count", 0) or 0) > 0

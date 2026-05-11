@@ -3399,6 +3399,12 @@ assert_contains "$CODEX_HOOK_STATUS_OUTPUT" "status: present"
 assert_contains "$CODEX_HOOK_STATUS_OUTPUT" "prompt_hook: present"
 CODEX_LAUNCH_DRY_RUN="$("$REPO_ROOT/bridge-run.sh" "$CODEX_CLI_AGENT" --dry-run)"
 assert_contains "$CODEX_LAUNCH_DRY_RUN" "launch=codex -c features.codex_hooks=true"
+# v0.8.6 hotfix: every codex launch now also pins features.fast_mode=true so
+# admin-pair backfill, isolated agent create, and v0.7→v0.8 migration all
+# carry the same flag. The injection helper guards against duplicate flags
+# so a roster with only codex_hooks (pre-hotfix default) gets fast_mode
+# auto-injected on next wake; this assertion locks the post-hotfix shape.
+assert_contains "$CODEX_LAUNCH_DRY_RUN" "features.fast_mode=true"
 CODEX_SESSION_START_OUTPUT="$(BRIDGE_AGENT_ID="$SMOKE_AGENT" python3 "$REPO_ROOT/hooks/codex-session-start.py")"
 assert_contains "$CODEX_SESSION_START_OUTPUT" "\"hookEventName\": \"SessionStart\""
 assert_contains "$CODEX_SESSION_START_OUTPUT" "agb inbox $SMOKE_AGENT"
@@ -10423,6 +10429,12 @@ bash "$REPO_ROOT/scripts/smoke/shared-settings-preserve-user-keys.sh"
 # which assertions are still pending.
 log "running precompact-notify suite smoke (issue #597 Track D)"
 bash "$REPO_ROOT/tests/precompact-notify/smoke.sh"
+
+# bridge_tmux_wait_for_claude_foreground must honor session liveness mid-poll
+# so a dead session does not burn the full foreground budget (controller
+# watcher P2 — bridge-start.sh:113 split-budget review r2).
+log "running tmux-wait-foreground-liveness smoke (controller watcher P2)"
+bash "$REPO_ROOT/tests/tmux-wait-foreground-liveness/smoke.sh"
 
 # Issue #639 — codex-task-mode-policy.py write-shape detector redesign
 # (default-deny block-mode allow-list + common-shape parser). Covers all

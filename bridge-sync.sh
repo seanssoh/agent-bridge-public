@@ -46,9 +46,15 @@ prune_missing_dynamic_agents() {
       unset "CLAIMED_SESSION_IDS[$sid]"
     fi
 
-    bridge_archive_dynamic_agent "$agent"
-    bridge_remove_dynamic_agent_file "$agent"
-    bridge_agent_clear_idle_marker "$agent"
+    if ! bridge_archive_dynamic_agent "$agent" 2>/dev/null; then
+      bridge_warn "bridge-sync: archive_dynamic_agent failed for agent='$agent' — skipping; next sweep will retry"
+      continue
+    fi
+    if ! bridge_remove_dynamic_agent_file "$agent" 2>/dev/null; then
+      bridge_warn "bridge-sync: remove_dynamic_agent_file failed for agent='$agent' — skipping; next sweep will retry"
+      continue
+    fi
+    bridge_agent_clear_idle_marker "$agent" 2>/dev/null || true
     PRUNED_DYNAMIC["$agent"]=1
   done < <(bridge_dynamic_agent_ids)
 }
@@ -104,7 +110,10 @@ refresh_missing_session_ids() {
     # shellcheck disable=SC2034
     BRIDGE_AGENT_SESSION_ID["$agent"]="$detected"
     CLAIMED_SESSION_IDS["$detected"]="$agent"
-    bridge_persist_agent_state "$agent"
+    if ! bridge_persist_agent_state "$agent" 2>/dev/null; then
+      bridge_warn "bridge-sync: persist_agent_state failed for agent='$agent' — skipping; next sweep will retry"
+      continue
+    fi
   done
 }
 

@@ -30,8 +30,16 @@ while IFS=$'\t' read -r agent home; do
   tmp_db="$live_db.rebuilding"
   lock_file="$live_db.lock"
 
-  mkdir -p "$(dirname "$live_db")"
-  : >> "$lock_file"
+  if ! mkdir -p "$(dirname "$live_db")" 2>/dev/null; then
+    log_audit "$JOB" "MKDIR_FAIL skip agent=$agent path=$(dirname "$live_db")" >/dev/null
+    skipped=$((skipped + 1))
+    continue
+  fi
+  if ! : 2>/dev/null >> "$lock_file"; then
+    log_audit "$JOB" "LOCK_INIT_FAIL skip agent=$agent path=$lock_file" >/dev/null
+    skipped=$((skipped + 1))
+    continue
+  fi
 
   # Acquire an exclusive lock so a manual rebuild can't interleave.
   # shellcheck disable=SC2094

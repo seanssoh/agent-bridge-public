@@ -76,6 +76,52 @@ bridge_isolation_v2_migrate_mkstate() {
     || mkdir -p "$(bridge_isolation_v2_migrate_state_dir)"
 }
 
+# Issue #698: cross-call channel so apply_for_upgrade can surface the
+# force-killed agent list in its success JSON envelope without re-reading
+# the sidecar (sidecar is best-effort + may have been overwritten by a
+# concurrent retry). Reset at the top of every orchestrate_stop call.
+# Read by apply_for_upgrade only on the success path.
+BRIDGE_ISOLATION_V2_MIGRATE_FORCE_KILLED_AGENTS=""
+
+# Issue #698: append the list of agent ids whose tmux sessions had to be
+# force-killed by the per-agent stop loop fallback to a sidecar JSON in
+# the migration state dir, so post-migration audit can see which sessions
+# were stopped non-cooperatively. Best-effort: write failures must not
+# block the migration, since the in-memory abort path in the caller is
+# already the authoritative gate. Returns the agents-as-JSON-array body
+# on stdout so the caller can also embed the same list in its own
+# envelope (success payload + failure err_log).
+bridge_isolation_v2_migrate_record_force_killed() {
+  local -a forced=("$@")
+  (( ${#forced[@]} > 0 )) || { printf ''; return 0; }
+
+  bridge_isolation_v2_migrate_mkstate
+  local sidecar
+  sidecar="$(bridge_isolation_v2_migrate_state_dir)/force-killed-sessions.json"
+
+  local stamp
+  stamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'unknown')"
+
+  local agents_json="" sep="" agent
+  for agent in "${forced[@]}"; do
+    [[ -n "$agent" ]] || continue
+    # Quote the agent id naively — agent ids in this codebase are kebab/
+    # snake-case ASCII (validated upstream), so we don't need a full JSON
+    # encoder. If a stray quote ever appears, drop it rather than emit
+    # malformed JSON.
+    agent="${agent//\"/}"
+    agents_json+="${sep}\"${agent}\""
+    sep=","
+  done
+
+  {
+    printf '{"timestamp":"%s","force_killed_sessions":[%s]}\n' \
+      "$stamp" "$agents_json"
+  } 2>/dev/null > "$sidecar" || true
+
+  printf '%s' "$agents_json"
+}
+
 # ---------------------------------------------------------------------------
 # 1. self-stop guard
 # ---------------------------------------------------------------------------
@@ -122,7 +168,7 @@ bridge_isolation_v2_migrate_acquire_lock() {
   owner_pid_file="${lock_dir}/owner.pid"
 
   if mkdir "$lock_dir" 2>/dev/null; then
-    printf '%s\n' "$$" >"$owner_pid_file" 2>/dev/null || true
+    printf '%s\n' "$$" 2>/dev/null >"$owner_pid_file" || true
     BRIDGE_ISOLATION_V2_MIGRATE_LOCK_DIR="$lock_dir"
     trap 'bridge_isolation_v2_migrate_release_lock' EXIT
     return 0
@@ -146,7 +192,7 @@ bridge_isolation_v2_migrate_acquire_lock() {
     bridge_die "another isolation-v2 migrate operation is in progress (lock=$lock_dir, stale-cleanup-failed)"
   fi
   if mkdir "$lock_dir" 2>/dev/null; then
-    printf '%s\n' "$$" >"$owner_pid_file" 2>/dev/null || true
+    printf '%s\n' "$$" 2>/dev/null >"$owner_pid_file" || true
     BRIDGE_ISOLATION_V2_MIGRATE_LOCK_DIR="$lock_dir"
     trap 'bridge_isolation_v2_migrate_release_lock' EXIT
     return 0
@@ -221,7 +267,17 @@ bridge_isolation_v2_migrate_capture_all_agents_snapshot() {
         # scratch) get skipped instead of accidentally enrolled into
         # the v2 group/perm pass.
         case "$name" in
-          .*|backups|state|logs|shared|worktrees|agents-archive)
+          # Issue #708 (v0.8.7 hotfix): exclude dirs whose name starts with
+          # `-` so a stray `agents/--help` (e.g. created by a flag-typo'd
+          # v0.7.x `agent create` that bypassed name validation, or by a
+          # manual `mkdir`) never reaches the `grep -qFx "$name"` call
+          # below where grep would parse the leading `--` as its own help
+          # option and dump help text into the snapshot stdout. The grep
+          # call also gets the `--` end-of-options separator below as
+          # defense-in-depth, but skipping the dir up-front keeps the
+          # snapshot clean and matches the existing intent of pruning
+          # non-agent directories.
+          .*|-*|backups|state|logs|shared|worktrees|agents-archive)
             continue
             ;;
         esac
@@ -229,7 +285,12 @@ bridge_isolation_v2_migrate_capture_all_agents_snapshot() {
           # v0.8.3: silent for v1-layout agents in roster (they will
           # migrate via the roster path above and emit_plan rows). Warn
           # only for genuinely orphan dirs that are NOT in BRIDGE_AGENT_IDS.
-          if ! grep -qFx "$name" "$roster_lookup" 2>/dev/null; then
+          # Issue #708 (v0.8.7 hotfix): `--` end-of-options separator so a
+          # `$name` that begins with `-` cannot be parsed by grep as a flag.
+          # This is a safety belt — the case filter above already excludes
+          # `-*` dirs from the walk — but the separator ensures no future
+          # callsite that drops the case filter regresses the same way.
+          if ! grep -qFx -- "$name" "$roster_lookup" 2>/dev/null; then
             bridge_warn "isolation-v2 migration: skipping orphan dir $entry (not in roster, no home/ subdir)"
           fi
           continue
@@ -323,6 +384,88 @@ bridge_isolation_v2_migrate_all_per_agent_markers_present() {
 # 3. profile_home override preflight
 # ---------------------------------------------------------------------------
 
+# v0.8.6 hotfix: strip a trailing slash so `/x/` vs `/x` is not flagged
+# as a path mismatch. Used by the override-vs-expected compare below; a
+# bare-bones canonical form is enough here because both sides come from
+# the same controller-side path domain (no symlinks across the v2 root,
+# no `..` segments — those would have failed earlier validators).
+_bridge_isolation_v2_migrate_normalize_path() {
+  local path="$1"
+  case "$path" in
+    '') printf '%s' "" ;;
+    '/') printf '%s' "/" ;;
+    */) printf '%s' "${path%/}" ;;
+    *) printf '%s' "$path" ;;
+  esac
+}
+
+# v0.8.6 hotfix: a `<admin>-dev` agent that explicitly co-locates with
+# its admin's workdir/profile_home is the documented PR #691 admin-pair
+# pattern (`bridge_ensure_admin_codex_pair` + `agent create
+# --allow-shared-workdir`). Migration preflight must NOT reject this —
+# same-workdir is the entire point of the pair (shared SOUL/MEMORY/
+# CLAUDE.md so two models review the same tree from different angles).
+# Returns 0 (whitelisted) when the agent is the sibling `-dev` of an
+# admin in the roster, both sides are shared mode, the admin's workdir
+# is set, and the override expands to the same path. Used by
+# `bridge_isolation_v2_migrate_check_profile_home_overrides`. Whitelist
+# is intentionally tight to the admin-pair pattern, not blanket
+# `isolation_mode=shared` — operators with stale shared-mode overrides
+# unrelated to the pair pattern still get the misalignment warning.
+_bridge_isolation_v2_migrate_is_admin_pair_override() {
+  local agent="$1"
+  local override="$2"
+
+  case "$agent" in
+    *-dev) ;;
+    *) return 1 ;;
+  esac
+
+  local admin="${agent%-dev}"
+  [[ -n "$admin" ]] || return 1
+
+  # v0.8.6 hotfix r2 (codex BLOCKING on PR #704 r1): the previous gate only
+  # checked that `<base>` was a roster member, which whitelisted any
+  # `worker-dev` co-locating with a shared-mode `worker` even though
+  # `worker` is not the configured admin. Tighten the gate to require
+  # the base agent to be the configured admin
+  # (`BRIDGE_ADMIN_AGENT_ID` / `bridge_admin_agent_id`). Combined with
+  # the `<admin>-dev` name pattern this matches exactly the
+  # `bridge_ensure_admin_codex_pair` shape and nothing else.
+  local configured_admin=""
+  if command -v bridge_admin_agent_id >/dev/null 2>&1; then
+    configured_admin="$(bridge_admin_agent_id 2>/dev/null || true)"
+  else
+    configured_admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  fi
+  [[ -n "$configured_admin" && "$admin" == "$configured_admin" ]] || return 1
+
+  declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 || return 1
+  local known found=""
+  for known in "${BRIDGE_AGENT_IDS[@]}"; do
+    if [[ "$known" == "$admin" ]]; then
+      found="$admin"
+      break
+    fi
+  done
+  [[ -n "$found" ]] || return 1
+
+  local admin_isolation pair_isolation
+  admin_isolation="${BRIDGE_AGENT_ISOLATION_MODE[$admin]-}"
+  pair_isolation="${BRIDGE_AGENT_ISOLATION_MODE[$agent]-}"
+  case "$admin_isolation" in ''|shared) ;; *) return 1 ;; esac
+  case "$pair_isolation" in ''|shared) ;; *) return 1 ;; esac
+
+  local admin_workdir
+  admin_workdir="${BRIDGE_AGENT_WORKDIR[$admin]-}"
+  [[ -n "$admin_workdir" ]] || return 1
+  admin_workdir="$(bridge_expand_user_path "$admin_workdir")"
+  admin_workdir="$(_bridge_isolation_v2_migrate_normalize_path "$admin_workdir")"
+
+  [[ "$override" == "$admin_workdir" ]] || return 1
+  return 0
+}
+
 bridge_isolation_v2_migrate_check_profile_home_overrides() {
   # Returns 0 when no agent in the snapshot has a misaligned explicit
   # BRIDGE_AGENT_PROFILE_HOME. Returns 1 otherwise; warns to stderr.
@@ -336,12 +479,34 @@ bridge_isolation_v2_migrate_check_profile_home_overrides() {
     [[ -n "$agent" ]] || continue
     override="${BRIDGE_AGENT_PROFILE_HOME[$agent]-}"
     [[ -n "$override" ]] || continue
+    # v0.8.6 hotfix: bridge_expand_user_path now lives in
+    # lib/bridge-core.sh (sourced by bridge-lib.sh chain) so it's always
+    # defined here. Pre-hotfix it was only in bridge-agent.sh (the
+    # executable), so `bridge-migrate.sh -> lib/bridge-isolation-v2-
+    # migrate.sh` saw `bridge_expand_user_path: command not found`,
+    # the override fell through as the empty string, and an aligned
+    # roster entry was silently flagged as mismatched (operator-side
+    # false-negative). Same call shape — the helper is just actually
+    # loaded now.
     override="$(bridge_expand_user_path "$override")"
+    override="$(_bridge_isolation_v2_migrate_normalize_path "$override")"
     expected="$data_root/agents/$agent/workdir"
-    if [[ "$override" != "$expected" ]]; then
-      bridge_warn "agent '$agent' has explicit BRIDGE_AGENT_PROFILE_HOME=$override which is not the v2 workdir ($expected). agent-bridge profile deploy will land in the wrong location after marker flip. Edit roster (agent-roster.local.sh or agent-roster.sh) to unset or align this entry, then re-run --apply."
-      mismatch=1
+    expected="$(_bridge_isolation_v2_migrate_normalize_path "$expected")"
+    if [[ "$override" == "$expected" ]]; then
+      continue
     fi
+    # v0.8.6 hotfix: whitelist the admin-pair pattern (PR #691). A
+    # `<admin>-dev` sibling whose profile_home points at its admin's
+    # workdir is the documented co-located pair-programming setup
+    # (`bridge_ensure_admin_codex_pair`'s `pair_workdir="$(bridge_agent_workdir
+    # "$admin")"` plus `--allow-shared-workdir`), not a stale roster
+    # entry. Skip the warning + don't flip mismatch so the migration
+    # preserves the operator's intentional pair-programming co-location.
+    if _bridge_isolation_v2_migrate_is_admin_pair_override "$agent" "$override"; then
+      continue
+    fi
+    bridge_warn "agent '$agent' has explicit BRIDGE_AGENT_PROFILE_HOME=$override which is not the v2 workdir ($expected). agent-bridge profile deploy will land in the wrong location after marker flip. Edit roster (agent-roster.local.sh or agent-roster.sh) to unset or align this entry, then re-run --apply."
+    mismatch=1
   done < "$snapshot_path"
   return $(( mismatch ))
 }
@@ -735,18 +900,61 @@ bridge_isolation_v2_migrate_normalize_layout() {
       || { bridge_warn "normalize_layout: shared/ chgrp_setgid_recursive failed"; return 1; }
   fi
 
+  # v0.9.7 (refs #781 RC1/RC2): the broad recursive normalize on
+  # `$data_root/state` previously chgrp'd everything to ab-controller
+  # mode 0640. Two problems with that — (a) it touched the v2 controller
+  # state root indiscriminately, and (b) it cascaded into the per-agent
+  # state leaf at `$BRIDGE_HOME/state/agents/<X>/` (not under
+  # `$data_root/state` directly, but the legacy install ships
+  # BRIDGE_HOME=BRIDGE_DATA_ROOT, so the recursion reached it anyway).
+  # The fix splits state into traversal-only (state/, state/agents/) and
+  # per-agent rwx (state/agents/<X>/) — see the matrix in
+  # lib/bridge-isolation-v2.sh.
   if [[ -d "$data_root/state" ]]; then
-    bridge_isolation_v2_chgrp_setgid_recursive \
-      "$ctrl_grp" 2750 0640 "$data_root/state" \
-      || { bridge_warn "normalize_layout: state/ chgrp_setgid_recursive failed"; return 1; }
+    # Top-level state/: traversal-only via the shared group so isolated
+    # hooks can reach their per-agent leaves without opening daemon
+    # siblings. Direct chmod (no recursion) to avoid clobbering
+    # state/agents/<X>/ — those leaves get their own per-agent matrix
+    # apply below.
+    _bridge_isolation_v2_run_root_or_sudo chgrp "$shared_grp" "$data_root/state" 2>/dev/null || true
+    _bridge_isolation_v2_run_root_or_sudo chmod 0710 "$data_root/state" 2>/dev/null || true
+    if [[ -d "$data_root/state/agents" ]]; then
+      _bridge_isolation_v2_run_root_or_sudo chgrp "$shared_grp" "$data_root/state/agents" 2>/dev/null || true
+      _bridge_isolation_v2_run_root_or_sudo chmod 0710 "$data_root/state/agents" 2>/dev/null || true
+    fi
+    # state/runtime/ stays controller-only (daemon config lives there).
+    if [[ -d "$data_root/state/runtime" ]]; then
+      bridge_isolation_v2_chgrp_setgid_recursive \
+        "$ctrl_grp" 2750 0640 "$data_root/state/runtime" \
+        || { bridge_warn "normalize_layout: state/runtime chgrp_setgid_recursive failed"; return 1; }
+    fi
+    # Other daemon-owned files directly under state/ (daemon.log,
+    # tasks.db, history/, etc.) stay controller-only via direct chgrp
+    # without opening the per-agent leaves.
+    local _state_top _state_basename
+    while IFS= read -r _state_top; do
+      [[ -n "$_state_top" ]] || continue
+      _state_basename="$(basename "$_state_top")"
+      case "$_state_basename" in
+        agents|runtime) continue ;;  # handled separately above
+      esac
+      _bridge_isolation_v2_run_root_or_sudo chgrp -R "$ctrl_grp" "$_state_top" 2>/dev/null || true
+    done < <(find "$data_root/state" -mindepth 1 -maxdepth 1 -print 2>/dev/null)
   fi
 
   # Per-agent root must be 2750 (isolated UID enters via group r-x but
   # MUST NOT have group write at the root, otherwise it could rename or
   # delete credentials/ even though credentials/ itself is 2750). r3
   # review caught the broad recursive 2770 pass making the root
-  # writable. Spec: lib/bridge-isolation-v2.sh:45-59 +
-  # lib/bridge-agents.sh:2116-2152 (`# 2750 — isolated UID r-x at root`).
+  # writable. v0.8.4 r2 reaffirmed 2750 after a brief 2770 detour:
+  # group write at the root broke credentials isolation (POSIX requires
+  # write on the *parent* directory to delete or rename an entry inside
+  # it). Controller writes under per-agent root that must land outside
+  # the prepare codepath (notably `runtime/history.env`) go through a
+  # sudo-handoff helper in lib/bridge-state.sh instead of relying on
+  # group write at the root. Spec: lib/bridge-isolation-v2.sh:45-59 +
+  # lib/bridge-agents.sh `# 2750 — isolated UID r-x at root` comment in
+  # the prepare path.
   local agent agent_grp agent_root sub
   local writable_subs=(home workdir runtime logs requests responses)
   while IFS= read -r agent; do
@@ -774,6 +982,43 @@ bridge_isolation_v2_migrate_normalize_layout() {
       bridge_isolation_v2_chgrp_setgid_recursive \
         "$agent_grp" 2750 0640 "$agent_root/credentials" \
         || { bridge_warn "normalize_layout: agents/$agent/credentials chgrp_setgid_recursive failed"; return 1; }
+    fi
+
+    # v0.9.x #746: explicit re-verify on workdir specifically. Files
+    # mirrored from v0.7→v0.8 layouts retained their pre-isolation
+    # owner-group long after the migrator believed it had repaired
+    # them. The helper now self-verifies, but log a per-agent OK/FAIL
+    # so the operator can grep the migration log for "workdir-verify".
+    if [[ -d "$agent_root/workdir" ]]; then
+      if bridge_isolation_v2_verify_chgrp_setgid_recursive \
+            "$agent_grp" 2770 0660 "$agent_root/workdir" 2>/dev/null; then
+        printf '[migrate] workdir-verify ok agent=%s grp=%s\n' "$agent" "$agent_grp" >&2
+      else
+        bridge_warn "[migrate] workdir-verify FAIL agent=$agent grp=$agent_grp — see preceding warnings"
+        return 1
+      fi
+    fi
+
+    # v0.9.7 RC1 (refs #781): per-agent state/agents/<X>/ leaf — was
+    # previously left as ec2-user:ab-controller mode 0750 by the broad
+    # state/ recursive normalize, which then blocked the isolated hook
+    # from unlinking idle-since (RC2 cascade). Apply the matrix grant
+    # for this specific agent now so the rest of the matrix (RC4 logs/,
+    # RC5 runtime/) is consistent. The matrix helper is a no-op when
+    # already canonical and skips rows whose paths aren't present
+    # (e.g. agents that never ran on this host).
+    if command -v bridge_isolation_v2_apply_grant_matrix_for_agent >/dev/null 2>&1; then
+      # r10 codex catch — was `|| true` (silently swallow non-zero
+      # matrix apply). That let `bridge-upgrade.sh --apply` (and other
+      # callers of normalize_layout) report success while matrix rows
+      # failed, recreating the v0.9.5/v0.9.6 false-positive cycle at
+      # the upgrade entry point. Now propagate failure: bridge_warn +
+      # return 1 so the operator's `agent-bridge upgrade --apply` exit
+      # code reflects the failure.
+      if ! bridge_isolation_v2_apply_grant_matrix_for_agent "$agent" --apply >/dev/null 2>&1; then
+        bridge_warn "[migrate] grant-matrix apply FAIL agent=$agent — see preceding bridge_warn lines"
+        return 1
+      fi
     fi
   done < "$snapshot_path"
 
@@ -870,6 +1115,11 @@ bridge_isolation_v2_migrate_wait_daemon_present() {
 bridge_isolation_v2_migrate_orchestrate_stop() {
   local snapshot_path="$1"
 
+  # Issue #698 (r2): reset the cross-call channel for the success-path
+  # WARN surface in apply_for_upgrade. Stays empty unless force-kill
+  # actually fires + at least one session is killed.
+  BRIDGE_ISOLATION_V2_MIGRATE_FORCE_KILLED_AGENTS=""
+
   # v0.8.3: on macOS, unload the launchd unit BEFORE per-agent stop so
   # the KeepAlive=true daemon doesn't respawn during the 10s
   # wait_daemon_gone window. restore_if_needed handles the case where a
@@ -886,11 +1136,89 @@ bridge_isolation_v2_migrate_orchestrate_stop() {
       || bridge_warn "stop failed for agent '$agent' — continuing; will be skipped at restart"
   done < "$snapshot_path"
 
-  # Verify zero active.
+  # Issue #698: a v0.7.7 daemon-spawned tmux session occasionally outlives
+  # the per-agent stop loop (CLI holding the foreground, tmux server still
+  # tracking attached client). Before this hotfix we aborted right here,
+  # which blocked the v0.7→v0.8 migration on any host where the operator
+  # hadn't pre-stopped every agent. Fall back to `tmux kill-session` for
+  # the still-active set, audit-log the force-killed session list, then
+  # re-verify. Only abort if force-kill ALSO fails to clear the set.
   local remaining
   remaining="$(bridge_active_agent_ids | wc -l | tr -d ' ')"
   if [[ "$remaining" =~ ^[0-9]+$ ]] && (( remaining > 0 )); then
-    bridge_die "agents still active after per-agent stop loop: $remaining"
+    local -a stuck_agents=()
+    mapfile -t stuck_agents < <(bridge_active_agent_ids)
+
+    local -a forced_pairs=()
+    local stuck_session
+    for agent in "${stuck_agents[@]}"; do
+      [[ -n "$agent" ]] || continue
+      stuck_session=""
+      if declare -F bridge_agent_session >/dev/null 2>&1; then
+        stuck_session="$(bridge_agent_session "$agent" 2>/dev/null || printf '')"
+      fi
+      forced_pairs+=("${agent}/${stuck_session:--}")
+    done
+
+    bridge_warn "migration: force-stopping ${#stuck_agents[@]} active tmux session(s) before apply-live (sessions: ${forced_pairs[*]})"
+
+    local -a force_killed=()
+    for agent in "${stuck_agents[@]}"; do
+      [[ -n "$agent" ]] || continue
+      if bridge_kill_agent_session "$agent" >/dev/null 2>&1; then
+        force_killed+=("$agent")
+      fi
+    done
+
+    # record_force_killed echoes the agent list as a JSON-array body
+    # ("a","b") so the failure envelope (below) and apply_for_upgrade's
+    # success envelope can embed the same list without re-encoding.
+    local force_killed_json_body
+    force_killed_json_body="$(bridge_isolation_v2_migrate_record_force_killed \
+      "${force_killed[@]+"${force_killed[@]}"}")"
+
+    # Issue #698 (r2): expose the successfully force-killed list to
+    # apply_for_upgrade via a module-scoped channel so its success
+    # JSON envelope can surface `force_killed_sessions`. Empty when
+    # force-kill never fired.
+    BRIDGE_ISOLATION_V2_MIGRATE_FORCE_KILLED_AGENTS="$force_killed_json_body"
+
+    remaining="$(bridge_active_agent_ids | wc -l | tr -d ' ')"
+    if [[ "$remaining" =~ ^[0-9]+$ ]] && (( remaining > 0 )); then
+      # Issue #698 (r2): emit a structured JSON envelope on stdout AND
+      # write last-error.json BEFORE bridge_die. bridge-upgrade.sh
+      # captures only stdout from the migration child into
+      # ISOLATION_V2_MIGRATION_JSON, and bridge_die exits before any
+      # caller-side err_log write site is reached. Without this block
+      # the upgrade --json failure envelope's `isolation_v2_migration`
+      # / `error.detail` fields receive only the previous (success)
+      # JSON or empty — JSON-mode operators cannot triage which
+      # sessions remained stuck.
+      bridge_isolation_v2_migrate_mkstate
+      local _err_log
+      _err_log="$(bridge_isolation_v2_migrate_state_dir)/last-error.json"
+      # Encode forced_pairs as a JSON string array. Agent ids + tmux
+      # session names in this codebase are ASCII (validated upstream),
+      # so naive quote-strip + literal quoting matches the existing
+      # record_force_killed convention; no full JSON encoder needed.
+      local _pairs_json="" _pair_sep="" _pair _pair_clean
+      for _pair in "${forced_pairs[@]}"; do
+        _pair_clean="${_pair//\"/}"
+        _pairs_json+="${_pair_sep}\"${_pair_clean}\""
+        _pair_sep=","
+      done
+      {
+        printf '{"mode":"isolation-v2-migrate","status":"error","reason":"force-kill-failed",'
+        printf '"last_error":"agents still active after force-kill fallback: %s",' "$remaining"
+        printf '"remaining_count":%s,' "$remaining"
+        printf '"forced_pairs":[%s],' "$_pairs_json"
+        printf '"force_killed_sessions":[%s],' "$force_killed_json_body"
+        printf '"remediation":"manually `tmux kill-session` for each stuck session listed in forced_pairs, then re-run agent-bridge upgrade --apply",'
+        printf '"no_v080_code_installed":"yes"}\n'
+      } >"$_err_log"
+      cat "$_err_log"
+      bridge_die "agents still active after force-kill fallback: $remaining (sessions: ${forced_pairs[*]})"
+    fi
   fi
 
   # Plain daemon stop (active=0 now → no --force needed).
@@ -901,6 +1229,7 @@ bridge_isolation_v2_migrate_orchestrate_stop() {
 
 bridge_isolation_v2_migrate_orchestrate_restart() {
   local snapshot_path="$1"
+  local daemon_up=0
 
   # v0.8.3: on macOS, bring the daemon back under launchd supervision
   # via `launchctl bootstrap` instead of `bridge-daemon.sh start`. The
@@ -912,10 +1241,28 @@ bridge_isolation_v2_migrate_orchestrate_restart() {
     bridge_isolation_v2_launchd_bootstrap \
       || bridge_die "daemon restart failed (launchctl bootstrap)"
     bridge_isolation_v2_migrate_wait_daemon_present 10
+    daemon_up=1
   else
-    "$BRIDGE_BASH_BIN" "$BRIDGE_SCRIPT_DIR/bridge-daemon.sh" start >/dev/null 2>&1 \
-      || bridge_die "daemon restart failed"
-    bridge_isolation_v2_migrate_wait_daemon_present 10
+    # Issue #668: on Linux (and non-launchd Darwin) the migration runs as
+    # a non-root operator with passwordless sudo. usermod just added the
+    # operator to the new ab-controller group, but supplemental group
+    # membership in an already-running shell is cached — until the next
+    # login, this process and its children still see the OLD group set.
+    # Spawning the daemon from this shell therefore inherits stale groups
+    # and the daemon dies the moment it tries to write to a 2770/ab-
+    # controller controller-state path. Treat both `bridge-daemon.sh
+    # start` and the `wait_daemon_present` poll as best-effort: warn,
+    # continue, and surface the relogin requirement in the caller's
+    # JSON. The caller (apply_for_upgrade) advances the marker and
+    # returns success so apply-live can install the v0.8.x code; the
+    # operator finishes the restart by re-logging in (which refreshes
+    # the supplemental-group cache) and running `agb daemon start`.
+    if "$BRIDGE_BASH_BIN" "$BRIDGE_SCRIPT_DIR/bridge-daemon.sh" start >/dev/null 2>&1 \
+        && bridge_isolation_v2_migrate_wait_daemon_present 10 2>/dev/null; then
+      daemon_up=1
+    else
+      bridge_warn "daemon restart deferred — supplemental-group cache requires a fresh login. Re-login and run 'agb daemon start' to finish bringing the daemon up."
+    fi
   fi
 
   # v0.8.3: skip restart for agents whose tmux session has an attached
@@ -923,6 +1270,16 @@ bridge_isolation_v2_migrate_orchestrate_restart() {
   # as `agent_restart_skipped_attached`; mirroring the same predicate
   # here prevents the apply step from yanking the rug out from under a
   # live operator session.
+  #
+  # Issue #668: when the daemon could not be brought up (Linux relogin
+  # path), per-agent restarts would just fail, polluting the upgrade
+  # output with N copies of the same root cause. Defer them to the
+  # operator's post-relogin `agb daemon start` follow-up.
+  if (( daemon_up == 0 )); then
+    bridge_warn "per-agent restart deferred — re-login then run 'agb daemon start' to bring agents back up"
+    return 0
+  fi
+
   local agent session attached
   while IFS= read -r agent; do
     [[ -n "$agent" ]] || continue
@@ -1354,9 +1711,71 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
     printf '%s/state/layout-marker.sh' "$target_root")"
 
   # Idempotent skip: marker already present + valid -> already migrated.
+  # v0.8.4 r2: even on the skip path, run normalize_layout so existing
+  # v0.8.0~v0.8.3 isolated installs (which may carry drifted modes,
+  # including the brief r1 2770 root) get re-pinned to the v0.8.4
+  # canonical 2750 per-agent root + 2770 writable subdirs + 2750
+  # credentials/. The pass is idempotent on already-canonical layouts
+  # (chgrp + chmod to current values is a no-op). Failures here are
+  # warned but not fatal: the operator can rerun `upgrade --apply` once
+  # the underlying problem (e.g. a missing agent group) is corrected,
+  # and a stale-mode install is strictly safer than aborting an
+  # otherwise-successful upgrade — the upgrade has not advanced any
+  # state at this point. The full migrate path below has its own
+  # normalize_layout call with stricter error handling.
   if [[ -f "$marker_path" ]] \
       && bridge_isolation_v2_marker_validate "$marker_path" 2>/dev/null; then
-    printf '{"mode":"isolation-v2-migrate","skipped":true,"reason":"marker-present","marker":"%s","data_root":"%s"}\n' \
+    if bridge_isolation_v2_privilege_preflight 2>/dev/null \
+        && bridge_isolation_v2_active 2>/dev/null; then
+      bridge_isolation_v2_migrate_mkstate
+      bridge_isolation_v2_migrate_capture_all_agents_snapshot
+      local _norm_snapshot
+      _norm_snapshot="$(bridge_isolation_v2_migrate_all_agents_snapshot_path)"
+      local _saved_layout_norm="${BRIDGE_LAYOUT:-}"
+      local _saved_data_root_norm="${BRIDGE_DATA_ROOT:-}"
+      BRIDGE_LAYOUT="v2"
+      BRIDGE_DATA_ROOT="$data_root"
+      export BRIDGE_LAYOUT BRIDGE_DATA_ROOT
+
+      local _norm_rc=0
+      if ! bridge_isolation_v2_migrate_normalize_layout \
+            "$_norm_snapshot" "$data_root"; then
+        _norm_rc=1
+        bridge_warn "apply_for_upgrade: normalize_layout pass on already-migrated install reported failures; layout may carry drifted modes (rerun \`agent-bridge upgrade --apply\` after addressing the warned cause)"
+      fi
+
+      BRIDGE_LAYOUT="$_saved_layout_norm"
+      BRIDGE_DATA_ROOT="$_saved_data_root_norm"
+      if [[ -n "$_saved_layout_norm" ]]; then
+        export BRIDGE_LAYOUT
+      else
+        unset BRIDGE_LAYOUT
+      fi
+      if [[ -n "$_saved_data_root_norm" ]]; then
+        export BRIDGE_DATA_ROOT
+      else
+        unset BRIDGE_DATA_ROOT
+      fi
+
+      if (( _norm_rc != 0 )); then
+        # H3 (refs #752 / #746): refuse to report clean success when the
+        # normalize_layout pass on an already-migrated install reports
+        # any failure. The upgrade caller can decide whether to abort or
+        # surface this as a partial-success warning, but we MUST NOT
+        # return 0 with `skipped:true` — that's the silent-success path
+        # the v0.9.0 production host hit (#746 / #747 / #749).
+        printf '{"mode":"isolation-v2-migrate","status":"partial","skipped":true,"reason":"normalize-refresh-failed","marker":"%s","data_root":"%s","normalize_refresh":"failed","last_error":"normalize_layout pass on already-migrated install reported failures — see preceding bridge_warn lines","remediation":"rerun agent-bridge upgrade --apply after addressing the warned cause; or run agent-bridge migrate isolation v2 --apply directly for the strict bridge_die contract"}\n' \
+          "$marker_path" "$data_root"
+        return 1
+      fi
+
+      printf '{"mode":"isolation-v2-migrate","status":"ok","skipped":true,"reason":"marker-present","marker":"%s","data_root":"%s","normalize_refresh":"attempted"}\n' \
+        "$marker_path" "$data_root"
+      return 0
+    fi
+    # No-privilege / inactive path — keep existing skipped-true success
+    # since we couldn't even attempt normalize_layout.
+    printf '{"mode":"isolation-v2-migrate","status":"ok","skipped":true,"reason":"marker-present","marker":"%s","data_root":"%s","normalize_refresh":"skipped"}\n' \
       "$marker_path" "$data_root"
     return 0
   fi
@@ -1503,10 +1922,17 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
   fi
 
   # Per-agent completion markers — all_snapshot, one marker each.
-  # macOS supplemental group cache: dseditgroup-driven membership only
-  # takes effect after re-login, so flag every Darwin-side agent.
+  # Supplemental-group cache: both macOS dseditgroup membership AND
+  # Linux usermod -aG additions only take effect after re-login, so
+  # flag every agent regardless of platform when the migration ran as
+  # a non-root user (the only path that actually adds groups to the
+  # caller via usermod / dseditgroup). Issue #668: this was previously
+  # macOS-only, leaving the Linux upgrader to omit the relogin caveat
+  # even though the same group cache pitfall applies.
   local relogin_flag=0
-  [[ "$(uname)" == "Darwin" ]] && relogin_flag=1
+  if [[ "$(id -u)" -ne 0 ]]; then
+    relogin_flag=1
+  fi
   local agent agent_grp
   while IFS= read -r agent; do
     [[ -n "$agent" ]] || continue
@@ -1539,9 +1965,24 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
   # Success — JSON. relogin field surfaces the macOS supplemental-group
   # cache caveat to the upgrade output so operators don't get
   # confusing "permission denied" until they re-login.
-  printf '{"mode":"isolation-v2-migrate","status":"applied","data_root":"%s","manifest":"%s","active_agents":%s,"all_agents":%s,"migration_requires_relogin":%s}\n' \
+  #
+  # Issue #698 (r2): when orchestrate_stop's force-kill fallback fired
+  # AND succeeded, surface the killed-session list + sidecar path in
+  # the success envelope so JSON-only operators can tell non-cooperative
+  # tmux kills happened (the cooperative per-agent stop loop is the
+  # default; force-kill is the v0.7.7-daemon-spawned-zombie fallback).
+  # Sidecar path is target-root-relative so the field is portable
+  # across operators reading the JSON from a different host.
+  local _force_killed_body="${BRIDGE_ISOLATION_V2_MIGRATE_FORCE_KILLED_AGENTS:-}"
+  local _force_killed_suffix=""
+  if [[ -n "$_force_killed_body" ]]; then
+    _force_killed_suffix=",\"force_killed_sessions\":[${_force_killed_body}]"
+    _force_killed_suffix+=",\"force_killed_sidecar\":\"state/migration/force-killed-sessions.json\""
+  fi
+  printf '{"mode":"isolation-v2-migrate","status":"applied","data_root":"%s","manifest":"%s","active_agents":%s,"all_agents":%s,"migration_requires_relogin":%s%s}\n' \
     "$data_root" "$manifest" "$active_count" "$all_count" \
-    "$([[ "$relogin_flag" -eq 1 ]] && printf 'true' || printf 'false')"
+    "$([[ "$relogin_flag" -eq 1 ]] && printf 'true' || printf 'false')" \
+    "$_force_killed_suffix"
 
   # Restore caller env (no-op when caller had nothing).
   if [[ -z "$_saved_layout" ]]; then unset BRIDGE_LAYOUT; else BRIDGE_LAYOUT="$_saved_layout"; fi

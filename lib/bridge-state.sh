@@ -94,9 +94,9 @@ bridge_build_dynamic_launch_cmd() {
   case "$engine" in
     codex)
       if [[ "$continue_mode" == "1" && -n "$session_id" ]]; then
-        bridge_join_quoted codex resume "$session_id" -c "features.codex_hooks=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+        bridge_join_quoted codex resume "$session_id" -c "features.codex_hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
       else
-        bridge_join_quoted codex -c "features.codex_hooks=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+        bridge_join_quoted codex -c "features.codex_hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
       fi
       ;;
     claude)
@@ -144,7 +144,7 @@ bridge_build_resume_launch_cmd() {
 
   case "$engine" in
     codex)
-      bridge_join_quoted codex resume "$session_id" -c "features.codex_hooks=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
+      bridge_join_quoted codex resume "$session_id" -c "features.codex_hooks=true" -c "features.fast_mode=true" --dangerously-bypass-approvals-and-sandbox --no-alt-screen
       ;;
     claude)
       original_cmd="${BRIDGE_AGENT_LAUNCH_CMD[$agent]-}"
@@ -265,21 +265,42 @@ if not args or args[0] != "codex":
     print(original)
     raise SystemExit(0)
 
-rest = args[1:]
-has_flag = False
-i = 0
-while i < len(rest):
-    token = rest[i]
-    if token == "--enable" and i + 1 < len(rest) and rest[i + 1] == "codex_hooks":
-        has_flag = True
-        break
-    if token == "-c" and i + 1 < len(rest) and "features.codex_hooks=true" in rest[i + 1]:
-        has_flag = True
-        break
-    i += 2 if token in {"-c", "--enable", "--disable", "--profile", "-p", "--model", "-m", "--cd", "-C"} and i + 1 < len(rest) else 1
+# v0.8.6 hotfix: this helper now ensures BOTH `codex_hooks` and
+# `fast_mode` are pinned on every codex launch — admin-pair backfill,
+# isolated agent create, v0.7→v0.8 migration, and resume paths all
+# converge through here. Pre-hotfix it only injected `codex_hooks`,
+# so an existing roster with the legacy default launch_cmd (no
+# fast_mode) silently fell off the fast inference path on every
+# wake. The injection is idempotent: if a flag is already present
+# (via `--enable <name>`, `-c features.<name>=true`, or any later
+# `-c features.<name>=...` form) the helper leaves it alone.
+REQUIRED_FEATURES = ("codex_hooks", "fast_mode")
+ARG_TAKING_FLAGS = {
+    "-c", "--enable", "--disable", "--profile", "-p",
+    "--model", "-m", "--cd", "-C",
+}
 
-if not has_flag:
-    rest = ["-c", "features.codex_hooks=true", *rest]
+def has_feature(rest: list[str], feature: str) -> bool:
+    pattern = f"features.{feature}=true"
+    i = 0
+    while i < len(rest):
+        token = rest[i]
+        next_value = rest[i + 1] if i + 1 < len(rest) else None
+        if token == "--enable" and next_value == feature:
+            return True
+        if token == "-c" and next_value is not None and pattern in next_value:
+            return True
+        i += 2 if token in ARG_TAKING_FLAGS and next_value is not None else 1
+    return False
+
+rest = args[1:]
+prefix_pairs: list[str] = []
+for feature in REQUIRED_FEATURES:
+    if not has_feature(rest, feature):
+        prefix_pairs.extend(["-c", f"features.{feature}=true"])
+
+if prefix_pairs:
+    rest = [*prefix_pairs, *rest]
 
 quoted = " ".join(shlex.quote(token) for token in [args[0], *rest])
 print(f"{env_prefix}{quoted}" if env_prefix else quoted)
@@ -515,10 +536,225 @@ if any(
 if any(item == "plugin:teams" or item.startswith("plugin:teams@") for item in required):
     assignments.append(("TEAMS_STATE_DIR", teams_dir))
 
+# Issue #771 v0.9.6 — operator's R5 diagnostic confirmed PRIMARY fix
+# (v0.9.5 PR #774 `agent_env_regen`) was a false-positive: the regen
+# correctly re-invokes this helper, but the helper's loop SKIPS any
+# assignment whose name (`<NAME>=`) is already present in env_prefix
+# regardless of the value. So a frozen-roster LAUNCH_CMD with stale
+# `TEAMS_STATE_DIR=…/agents/<X>/.teams` (pre-v2 path) is NEVER
+# replaced — the helper sees the name, skips, and the same stale
+# value rides through every restart. Fresh-setup agents (no existing
+# assignment) work correctly because the append branch fires; legacy
+# v0.7→v0.8 isolated agents stay broken indefinitely. v0.9.5
+# orbstack validation only exercised the fresh-setup case.
+#
+# Fix: regex-match the existing assignment for each name and REPLACE
+# its value with the canonical (live-computed) one. Idempotent in
+# the fresh case (regex doesn't match → falls through to append) and
+# correct in the stale case (regex matches → in-place replace).
+# Pattern allows shell-quoted values (single-quoted, double-quoted,
+# or unquoted whitespace-bounded) so it survives roster-side hand
+# edits and `printf '%q'` outputs from prior writers.
+def _skip_dquote(s, i, n):
+    # i points just AFTER opening `"`. Walks to closing `"` while
+    # honoring backslash escapes and nested expansions (`$(…)`, `${…}`,
+    # backticks). Returns index just AFTER the closing `"`.
+    while i < n and s[i] != '"':
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            i += 2
+        elif c == "$" and i + 1 < n and s[i + 1] == "(":
+            i = _skip_paren_subst(s, i + 2, n)
+        elif c == "$" and i + 1 < n and s[i + 1] == "{":
+            i = _skip_brace_subst(s, i + 2, n)
+        elif c == "`":
+            i = _skip_backtick(s, i + 1, n)
+        else:
+            i += 1
+    if i < n:
+        i += 1
+    return i
+
+
+def _skip_paren_subst(s, i, n):
+    # i points just AFTER opening `$(`. Tracks nested `(` / `)` and
+    # quote-state until depth returns to 0. Returns index just AFTER
+    # the closing `)`. Whitespace and `=` inside a $(…) substitution
+    # MUST NOT split the enclosing token, so the caller treats this
+    # span as opaque. (codex r4 review on PR #776 — Probe 14.)
+    #
+    # r6 codex catch — also honor inner ${…} and `…` so a `)` that
+    # belongs to a nested brace-default like `${UNSET:-) NAME=…}` or
+    # to a backtick-substitution does NOT prematurely close our
+    # paren depth.
+    depth = 1
+    while i < n and depth > 0:
+        c = s[i]
+        if c == "(":
+            depth += 1
+            i += 1
+        elif c == ")":
+            depth -= 1
+            i += 1
+        elif c == "'":
+            i += 1
+            while i < n and s[i] != "'":
+                i += 1
+            if i < n:
+                i += 1
+        elif c == '"':
+            i = _skip_dquote(s, i + 1, n)
+        elif c == "$" and i + 1 < n and s[i + 1] == "(":
+            i = _skip_paren_subst(s, i + 2, n)
+        elif c == "$" and i + 1 < n and s[i + 1] == "{":
+            i = _skip_brace_subst(s, i + 2, n)
+        elif c == "`":
+            i = _skip_backtick(s, i + 1, n)
+        elif c == "\\" and i + 1 < n:
+            i += 2
+        else:
+            i += 1
+    return i
+
+
+def _skip_backtick(s, i, n):
+    # i points just AFTER opening backtick. Walks to next backtick;
+    # legacy backticks don't nest natively (POSIX requires `\\\``
+    # escaping for nesting), so honor backslash escapes only. Inner
+    # ${…} and $(…) are NOT treated as nesting boundaries here — the
+    # next bare backtick (or escaped pair) closes the span — but the
+    # quote-state inside still suppresses any `=` matching at the
+    # outer walker level (we never re-enter the walker until we
+    # return past the closing backtick). (r6 — kept POSIX-conformant.)
+    while i < n and s[i] != "`":
+        if s[i] == "\\" and i + 1 < n:
+            i += 2
+        else:
+            i += 1
+    if i < n:
+        i += 1
+    return i
+
+
+def _skip_brace_subst(s, i, n):
+    # i points just AFTER `${`. Walks to matching `}` honoring nested
+    # braces, quotes, and inner $(…) / `…` substitutions. Param-
+    # expansion defaults can contain whitespace and arbitrary inner
+    # constructs (e.g. `${VAR:-$(echo NAME=fake)}` or
+    # `${VAR:-some `echo X` default}`), so we must not let an inner
+    # space, `}`, or `)` from a nested context split the enclosing
+    # token. (r6 codex catch — symmetry with _skip_paren_subst.)
+    depth = 1
+    while i < n and depth > 0:
+        c = s[i]
+        if c == "{":
+            depth += 1
+            i += 1
+        elif c == "}":
+            depth -= 1
+            i += 1
+        elif c == "'":
+            i += 1
+            while i < n and s[i] != "'":
+                i += 1
+            if i < n:
+                i += 1
+        elif c == '"':
+            i = _skip_dquote(s, i + 1, n)
+        elif c == "$" and i + 1 < n and s[i + 1] == "(":
+            i = _skip_paren_subst(s, i + 2, n)
+        elif c == "$" and i + 1 < n and s[i + 1] == "{":
+            i = _skip_brace_subst(s, i + 2, n)
+        elif c == "`":
+            i = _skip_backtick(s, i + 1, n)
+        elif c == "\\" and i + 1 < n:
+            i += 2
+        else:
+            i += 1
+    return i
+
+
+def _walk_top_level_tokens(s):
+    # Yield (start, end) byte spans of each whitespace-delimited token
+    # in `s`, treating single-quoted, double-quoted, backslash-escaped,
+    # `$(…)`, backtick `…`, and `${…}` spans as opaque (so whitespace
+    # inside any of these does NOT split the enclosing token).
+    # Returning byte spans (not the token string) lets us preserve the
+    # original bytes verbatim — critical for keeping bash expansions
+    # like `$HOME`, `$(date)`, `${VAR:-x}` unquoted in unrelated
+    # env-prefix assignments. (See codex r2/r3/r4 review on PR #776.)
+    i, n = 0, len(s)
+    while i < n:
+        while i < n and s[i] in (" ", "\t"):
+            i += 1
+        if i >= n:
+            return
+        start = i
+        while i < n and s[i] not in (" ", "\t"):
+            c = s[i]
+            if c == "'":
+                i += 1
+                while i < n and s[i] != "'":
+                    i += 1
+                if i < n:
+                    i += 1
+            elif c == '"':
+                i = _skip_dquote(s, i + 1, n)
+            elif c == "$" and i + 1 < n and s[i + 1] == "(":
+                i = _skip_paren_subst(s, i + 2, n)
+            elif c == "$" and i + 1 < n and s[i + 1] == "{":
+                i = _skip_brace_subst(s, i + 2, n)
+            elif c == "`":
+                i = _skip_backtick(s, i + 1, n)
+            elif c == "\\" and i + 1 < n:
+                i += 2
+            else:
+                i += 1
+        yield (start, i)
+
+
 for name, value in assignments:
-    if f"{name}=" in env_prefix:
-        continue
-    env_prefix += f"{name}={shlex.quote(value)} "
+    # r4 codex review of #776 — preserve original byte form for tokens
+    # we are NOT replacing. The r3 shlex.split + shlex.quote round-trip
+    # destroyed unquoted shell expansions: `OTHER=$HOME` round-tripped
+    # to `OTHER='$HOME'`, which bash then sees as the literal four-char
+    # string `$HOME` instead of expanding. Walk the original env_prefix
+    # in place, identify only the top-level tokens whose raw byte
+    # prefix is `NAME=`, and substitute their span with the canonical
+    # `NAME=<shlex.quote(value)>`. All other bytes (whitespace runs,
+    # other assignments, their original quoting) pass through verbatim.
+    #
+    # r2 Probe 8 retained: ALL matching occurrences are replaced. Shell
+    # eval is last-definition-wins, so a surviving duplicate after the
+    # first replacement would re-overwrite the canonical value. Falling
+    # through to append fires only when ZERO top-level matches found
+    # (true fresh-setup case).
+    #
+    # r3 Probe 9 retained: quote-aware walker treats whitespace inside
+    # `OTHER="x NAME=/fake"` as belonging to the OTHER token, so the
+    # nested `NAME=/fake` substring is never matched at top level.
+    quoted_value = shlex.quote(value)
+    prefix_form = f"{name}="
+    spans = [
+        (s_, e_)
+        for (s_, e_) in _walk_top_level_tokens(env_prefix)
+        if env_prefix[s_:e_].startswith(prefix_form)
+    ]
+    if spans:
+        pieces = []
+        last = 0
+        for s_, e_ in spans:
+            pieces.append(env_prefix[last:s_])
+            pieces.append(f"{name}={quoted_value}")
+            last = e_
+        pieces.append(env_prefix[last:])
+        env_prefix = "".join(pieces)
+        if env_prefix and not env_prefix.endswith((" ", "\t")):
+            env_prefix += " "
+    else:
+        if env_prefix and not env_prefix.endswith((" ", "\t")):
+            env_prefix += " "
+        env_prefix += f"{name}={quoted_value} "
 
 print(f"{env_prefix}{command}" if env_prefix else command)
 PY
@@ -1196,6 +1432,26 @@ bridge_load_static_agent_history() {
 
   file="$(bridge_history_file_for_agent "$agent")"
   [[ -f "$file" ]] || return 0
+  # v0.8.5 #694 (Wave-3): partial isolated agent state (failed `agent
+  # create --isolate ...`) leaves `runtime/history.env` owned by the
+  # isolated UID with mode 0640 group=ab-agent-<name>. The controller is
+  # added to that group at `agent create` time, but supplementary group
+  # membership is cached at process credential time — until the operator
+  # re-logs in (or runs a fresh shell), the running `agent show` /
+  # `agent doctor` / roster-load process cannot read the file via group
+  # r--, even though `[[ -f "$file" ]]` succeeds (the parent dir
+  # traversal works because intermediate modes are 2750/2770 with group
+  # r-x and that group bit is checked at stat-time, but the actual file
+  # read uses the cached effective group set). `source "$file"` then
+  # bombs with `Permission denied` and crashes `bridge_load_roster` —
+  # taking out every command that runs at `bridge-agent.sh` load time
+  # (status, show, doctor, list, ...). Skip silently when the file is
+  # not readable to this process; downstream behavior is identical to
+  # the "history file absent" case (the static agent comes up without a
+  # restored AGENT_SESSION_ID, and the next session-id rewrite restores
+  # the entry). Mirrors the graceful-degrade pattern PR #688 added to
+  # `bridge-status.py::pending_upgrade_conflict_count`.
+  [[ -r "$file" ]] || return 0
 
   # shellcheck source=/dev/null
   source "$file"
@@ -1558,6 +1814,85 @@ bridge_dynamic_agent_ids() {
   done
 }
 
+bridge_state_v2_isolated_target() {
+  # v0.8.4 r2: predicate for "this controller-side write must land
+  # under the v2 per-agent root because the agent is linux-user
+  # isolated". Used by bridge_write_agent_state_file to pick between
+  # the direct-write fast path and the sudo-handoff slow path.
+  #
+  # The slow path is only required when:
+  #   - the host is Linux (no-op on macOS / mock hosts)
+  #   - isolation v2 is active for this install
+  #   - the target path lives under $BRIDGE_AGENT_ROOT_V2/<agent>/
+  #   - the agent is configured with linux-user isolation effectively
+  #     (BRIDGE_AGENT_ISOLATION_MODE[<agent>] resolves to linux-user)
+  # Anything else (shared-mode agent in a v2 install, dynamic agent
+  # whose env file lives under controller-owned state/agents/) keeps
+  # the direct-write fast path so non-isolated codepaths are
+  # unaffected.
+  local agent="$1"
+  local target="$2"
+
+  [[ -n "$agent" && -n "$target" ]] || return 1
+  [[ "$(bridge_host_platform 2>/dev/null || uname)" == "Linux" ]] || return 1
+  bridge_isolation_v2_active 2>/dev/null || return 1
+  [[ -n "$BRIDGE_AGENT_ROOT_V2" ]] || return 1
+  case "$target" in
+    "$BRIDGE_AGENT_ROOT_V2"/"$agent"/*) ;;
+    *) return 1 ;;
+  esac
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || return 1
+  return 0
+}
+
+bridge_state_sudo_install_v2_file() {
+  # v0.8.4 r2: stage `$content` into a controller-owned tempfile, then
+  # `bridge_linux_sudo_root install -m <mode> -o <owner> -g <group>`
+  # the staged file into the per-agent root. Mirrors the cross-UID
+  # write pattern PR #673 added in lib/bridge-hooks.sh
+  # (bridge_install_isolated_home_settings).
+  #
+  # This is the controller-side escape hatch for files whose final
+  # location is under $BRIDGE_AGENT_ROOT_V2/<agent>/ but whose author
+  # is the controller, not the isolated UID — runtime/history.env is
+  # the canonical example. The per-agent root mode 2750 (group r-x,
+  # no group write) prevents the controller — a group member but not
+  # the owner — from creating the parent dir or replacing the file
+  # via the direct path; sudo with the right `install` invocation
+  # bypasses that without weakening the root mode.
+  local target="$1"
+  local mode="$2"
+  local owner="$3"
+  local group="$4"
+  local content="$5"
+
+  [[ -n "$target" && -n "$mode" && -n "$owner" && -n "$group" ]] \
+    || return 2
+
+  local tmp=""
+  tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-state-v2.XXXXXX")" || return 1
+  printf '%s' "$content" >"$tmp" || { rm -f "$tmp"; return 1; }
+
+  bridge_linux_sudo_root mkdir -p "$(dirname "$target")" 2>/dev/null || {
+    rm -f "$tmp"
+    return 1
+  }
+  if ! bridge_linux_sudo_root install -m "$mode" -o "$owner" -g "$group" "$tmp" "$target" 2>/dev/null; then
+    # Older `install` builds reject `-o`/`-g` even under sudo; fall back
+    # to plain install + chown.
+    if ! bridge_linux_sudo_root install -m "$mode" "$tmp" "$target" 2>/dev/null; then
+      rm -f "$tmp"
+      return 1
+    fi
+    bridge_linux_sudo_root chown "$owner:$group" "$target" 2>/dev/null || {
+      rm -f "$tmp"
+      return 1
+    }
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
 bridge_write_agent_state_file() {
   local agent="$1"
   local file="$2"
@@ -1576,8 +1911,8 @@ bridge_write_agent_state_file() {
 
   BRIDGE_AGENT_UPDATED_AT["$agent"]="$updated_at"
 
-  mkdir -p "$(dirname "$file")"
-  cat >"$file" <<EOF
+  local content
+  content="$(cat <<EOF
 AGENT_ID=$(printf '%q' "$agent")
 AGENT_DESC=$(printf '%q' "$desc")
 AGENT_ENGINE=$(printf '%q' "$engine")
@@ -1590,6 +1925,31 @@ AGENT_HISTORY_KEY=$(printf '%q' "$history_key")
 AGENT_CREATED_AT=$(printf '%q' "$created_at")
 AGENT_UPDATED_AT=$(printf '%q' "$updated_at")
 EOF
+)"
+
+  # v0.8.4 r2: when the target lives under the v2 per-agent root and
+  # the agent is linux-user isolated, the controller — group member
+  # but not the owner of the 2750 root — cannot mkdir/replace the file
+  # directly. Route through the sudo-handoff helper. The file lands
+  # owned by the isolated UID with mode 0640 + group=ab-agent-<name>,
+  # matching what bridge_linux_prepare_agent_isolation seeds for
+  # history.env (touch + chown $os_user) so the isolated UID can
+  # read/rewrite it from inside its session and the controller can
+  # read it via group r--.
+  if bridge_state_v2_isolated_target "$agent" "$file"; then
+    local _v2_owner _v2_group
+    _v2_owner="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    _v2_group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+    if [[ -n "$_v2_owner" && -n "$_v2_group" ]] \
+        && bridge_state_sudo_install_v2_file \
+            "$file" 0640 "$_v2_owner" "$_v2_group" "$content"; then
+      return 0
+    fi
+    bridge_warn "bridge_write_agent_state_file: sudo-handoff write failed for $file (agent=$agent); falling back to direct write — expect Permission denied if the per-agent root is not writable to the controller"
+  fi
+
+  mkdir -p "$(dirname "$file")"
+  printf '%s' "$content" >"$file"
 }
 
 bridge_write_dynamic_agent_file() {
@@ -1990,6 +2350,20 @@ bridge_agent_note_prompt_ready() {
   engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
   session="$(bridge_agent_session "$agent" 2>/dev/null || true)"
   ts="$(date +%s)"
+  # v0.9.7 (refs #781 RC4): prompt-ready.env lives under runtime/, which
+  # is granted to the isolated UID + controller via the matrix. Ensure
+  # the matrix row before write so a fresh mkdir (parent absent) lands
+  # with the correct ownership/mode without relying on best-effort
+  # `mkdir -p` inheriting controller-only metadata.
+  if command -v bridge_isolation_v2_ensure_matrix_path >/dev/null 2>&1 \
+      && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+      && bridge_isolation_v2_active 2>/dev/null; then
+    # r13 codex Probe F catch — was `|| true` (silent swallow). When
+    # ensure_matrix_path fails we cannot trust the subsequent mkdir to
+    # land the correct ownership/mode for the runtime dir, so the
+    # written marker would later fail verify. Hard fail propagates.
+    bridge_isolation_v2_ensure_matrix_path "agent-runtime" "$agent" >/dev/null 2>&1 || return 1
+  fi
   mkdir -p "$dir"
 
   # Idempotency: if a marker already exists for the current session, don't
@@ -2104,7 +2478,19 @@ bridge_agent_context_pressure_state_file() {
 
 bridge_agent_next_session_marker_file() {
   local agent="$1"
-  printf '%s/next-session.sha' "$(bridge_agent_runtime_state_dir "$agent")"
+  # r16 codex catch — was bridge_agent_runtime_state_dir, which on v2
+  # resolves to $BRIDGE_AGENT_ROOT_V2/<X>/runtime/. But the Python
+  # SessionStart hook (hooks/bridge_hook_common.py:398) writes the
+  # marker to bridge_active_agent_dir() / agent / "next-session.sha"
+  # = $BRIDGE_ACTIVE_AGENT_DIR/<X>/. Path divergence: Python wrote
+  # state/agents/<X>/next-session.sha, bash reader looked under
+  # runtime/, so the autoarchive delivery digest never matched and
+  # bridge-run.sh never saw the delivered handoff. Per design v2's
+  # state-agent-marker-files row, all markers (idle-since, manual-stop,
+  # missing-marker-retries, webhook-port, next-session.sha) belong
+  # in state/agents/<X>/. Use idle_marker_dir to match the other
+  # markers + the Python hook.
+  printf '%s/next-session.sha' "$(bridge_agent_idle_marker_dir "$agent")"
 }
 
 bridge_path_age_seconds() {
@@ -2239,7 +2625,7 @@ bridge_agent_write_crash_report() {
   tail_file="$(bridge_agent_crash_tail_file "$agent")"
   mkdir -p "$(dirname "$report_file")"
   if [[ -f "$stderr_file" ]]; then
-    tail -n 50 "$stderr_file" >"$tail_file" 2>/dev/null || true
+    tail -n 50 "$stderr_file" 2>/dev/null >"$tail_file" || true
     stderr_tail="$(cat "$tail_file" 2>/dev/null || true)"
   else
     : >"$tail_file"
@@ -2446,22 +2832,66 @@ bridge_agent_mark_idle_now() {
   local agent="$1"
   local dir
   local file
+  local ts
 
   dir="$(bridge_agent_idle_marker_dir "$agent")"
   file="$(bridge_agent_idle_since_file "$agent")"
-  mkdir -p "$dir"
-  printf '%s\n' "$(date +%s)" >"$file"
+  ts="$(date +%s)"
+
+  # v0.9.7 RC2 (refs #781): route through the matrix-aware writer so the
+  # per-agent state/agents/<X>/ leaf is canonicalized (group ab-agent-<X>,
+  # 2770, setgid) before write. Without this the daemon's previous plain
+  # `mkdir -p` + redirection produced ec2-user:ab-controller 0600 files
+  # that the isolated UserPromptSubmit hook could not unlink, surfacing
+  # as the "rm: cannot remove '.../idle-since': Permission denied" error
+  # in the operator's session output. Falls back to the legacy direct
+  # write path when the matrix helper isn't loaded (test fixtures).
+  # r12 codex Probe 9 — drop the direct-write fallback when the
+  # matrix-aware writer fails. Falling back to plain mkdir+printf
+  # silently defeated the r10 BUG #4 hard-fail propagation: the
+  # writer would return 1 (signaling matrix not applied), the
+  # fallback would succeed with controller-owned mode, and verify
+  # would then reject. Hard fail here too — matrix needs to be
+  # applied before daemon can write.
+  if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
+      && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+      && bridge_isolation_v2_active 2>/dev/null; then
+    bridge_isolation_v2_write_agent_state_marker "$agent" "idle-since" "$ts" || return 1
+  else
+    mkdir -p "$dir"
+    printf '%s\n' "$ts" >"$file"
+  fi
 }
 
 bridge_agent_mark_manual_stop() {
   local agent="$1"
   local dir
   local file
+  local ts
 
   dir="$(bridge_agent_idle_marker_dir "$agent")"
   file="$(bridge_agent_manual_stop_file "$agent")"
-  mkdir -p "$dir"
-  printf '%s\n' "$(date +%s)" >"$file"
+  ts="$(date +%s)"
+
+  # v0.9.7 RC2 (refs #781): same matrix-aware route as
+  # bridge_agent_mark_idle_now. manual-stop participates in the same
+  # state/agents/<X>/ leaf contract; without the matrix grant the
+  # isolated `bridge_agent_clear_manual_stop` rm path fell back to a
+  # sudo handoff in PR #714 — the matrix grant makes the sudo handoff
+  # unnecessary because the isolated UID is now in ab-agent-<X> and the
+  # parent dir is 2770. The sudo handoff stays as a fallback for hosts
+  # where the matrix has not been applied yet (rolling upgrade window).
+  # r12 codex Probe 9 — same direct-write fallback removal as
+  # bridge_agent_mark_idle_now above. Hard fail when matrix writer
+  # fails so verify and apply stay in sync.
+  if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
+      && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+      && bridge_isolation_v2_active 2>/dev/null; then
+    bridge_isolation_v2_write_agent_state_marker "$agent" "manual-stop" "$ts" || return 1
+  else
+    mkdir -p "$dir"
+    printf '%s\n' "$ts" >"$file"
+  fi
 }
 
 bridge_agent_clear_idle_marker() {
@@ -2471,7 +2901,16 @@ bridge_agent_clear_idle_marker() {
 
   file="$(bridge_agent_idle_since_file "$agent")"
   dir="$(bridge_agent_idle_marker_dir "$agent")"
-  rm -f "$file"
+  # v0.9.7 RC2 (refs #781): when the matrix grant has been applied, the
+  # isolated UID is in ab-agent-<X> and the parent dir is 2770 setgid,
+  # so this plain `rm -f` succeeds from the isolated hook context.
+  # If it still fails, log a diagnostic so the verify CLI's
+  # `agent-bridge isolation verify` operator-side run can flag that the
+  # matrix is out of sync and `migrate isolation v2 --apply --agent <X>`
+  # is needed.
+  if [[ -f "$file" ]] && ! rm -f "$file" 2>/dev/null; then
+    bridge_warn "bridge_agent_clear_idle_marker: rm $file failed (agent=$agent) — grant matrix may be drifted; run \`agent-bridge isolation verify --agent $agent\`"
+  fi
   # Issue #629: drop the missing-marker retry counter so a future stale
   # marker scenario starts fresh — otherwise the counter could ratchet
   # the synthetic-marker fallback in earlier than warranted.
@@ -2486,8 +2925,38 @@ bridge_agent_clear_manual_stop() {
 
   file="$(bridge_agent_manual_stop_file "$agent")"
   dir="$(bridge_agent_idle_marker_dir "$agent")"
-  rm -f "$file"
-  rmdir "$dir" >/dev/null 2>&1 || true
+
+  # v0.8.8 #714 (item 2): when the host runs linux-user isolation, the
+  # idle-marker directory `state/agents/<agent>/` is owned by
+  # `agent-bridge-<agent>:ab-controller mode 2750` (per
+  # bridge_linux_prepare_agent_isolation). The controller user is in
+  # the group but only has `r-x` at the marker dir, so plain `rm -f`
+  # on the manual-stop file inside it raises EACCES. Same shape PR
+  # #692 solved for `runtime/history.env` via
+  # `bridge_state_v2_isolated_target` + sudo install. Here the file is
+  # under `state/agents/`, not `$BRIDGE_AGENT_ROOT_V2/`, so the
+  # existing predicate doesn't match — we gate on
+  # `bridge_agent_linux_user_isolation_effective` directly. On
+  # non-Linux hosts `bridge_linux_sudo_root` falls through to the
+  # direct invocation, so this branch is a no-op there and on
+  # non-isolated agents the plain `rm -f` already succeeded.
+  if ! rm -f "$file" 2>/dev/null; then
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      if ! bridge_linux_sudo_root rm -f "$file" 2>/dev/null; then
+        bridge_warn "bridge_agent_clear_manual_stop: failed to remove $file (agent=$agent); manual-stop may persist and re-suppress autostart"
+      fi
+    else
+      bridge_warn "bridge_agent_clear_manual_stop: failed to remove $file (agent=$agent); manual-stop may persist and re-suppress autostart"
+    fi
+  fi
+
+  if ! rmdir "$dir" >/dev/null 2>&1; then
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      # rmdir on a non-empty dir is expected and not an error; suppress
+      # only the silent-fail path. The sudo attempt is best-effort.
+      bridge_linux_sudo_root rmdir "$dir" >/dev/null 2>&1 || true
+    fi
+  fi
 }
 
 bridge_reconcile_idle_markers() {
@@ -2499,8 +2968,12 @@ bridge_reconcile_idle_markers() {
     file="$(bridge_agent_idle_since_file "$agent")"
     [[ -f "$file" ]] || continue
 
+    # #752 M3: per-marker best-effort under bridge-sync's `set -e` — a single
+    # locked dir / perm-denied marker must not cascade-abort subsequent agents.
     if ! bridge_agent_is_active "$agent"; then
-      bridge_agent_clear_idle_marker "$agent"
+      if ! bridge_agent_clear_idle_marker "$agent" 2>/dev/null; then
+        bridge_warn "reconcile_idle_markers: clear (inactive) failed for agent='$agent' — skipping; next reconcile will retry"
+      fi
       continue
     fi
 
@@ -2509,7 +2982,10 @@ bridge_reconcile_idle_markers() {
       continue
     }
     if ! [[ "$value" =~ ^[0-9]+$ ]]; then
-      bridge_agent_clear_idle_marker "$agent"
+      if ! bridge_agent_clear_idle_marker "$agent" 2>/dev/null; then
+        bridge_warn "reconcile_idle_markers: clear (non-numeric) failed for agent='$agent' — skipping; next reconcile will retry"
+        continue
+      fi
     fi
   done
 }
@@ -2964,11 +3440,20 @@ bridge_daemon_pid() {
   local pid=""
   local candidate=""
   local pattern=""
+  local cmdline=""
 
   pid="$(bridge_daemon_recorded_pid)"
   if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-    printf '%s' "$pid"
-    return 0
+    # Issue #683: pid recycling guard. A stale pid file plus a recycled
+    # OS pid would let `kill -0` succeed for a totally unrelated process,
+    # yielding "running pid=NNNN" from cmd_status that contradicts the
+    # live-listener probes. Verify cmdline before trusting the recorded pid;
+    # fall through to the pgrep-by-pattern path on mismatch.
+    cmdline="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    if [[ -z "$cmdline" || "$cmdline" == *"bridge-daemon.sh run"* ]]; then
+      printf '%s' "$pid"
+      return 0
+    fi
   fi
 
   pattern="$BRIDGE_HOME/bridge-daemon.sh run"

@@ -295,6 +295,69 @@ Rollback: operators on v0.7.x with the legacy ACL-grant surface can
 stay on v0.7.x; v0.8.0 is the cut-over and there is no per-agent
 auto-migration of the operator's credential file.
 
+### v0.7 → v0.8 migration ACL leftovers
+
+Pre-v2 installs may carry transitional named-user POSIX ACLs that the
+v2 layout does **not** allow (per the §16 hard-cut above — v2 has no
+named-user ACL surface at all). The most common leftover is on
+`/home/agent-bridge-<agent>/.claude/`, where the v0.7 install left a
+`root:agent-bridge-<agent>` ownership + a controller-only `r-x` ACL
+that prevents the agent UID from reading its own home.
+
+The planned `agent-bridge migrate isolation v2 --apply` command
+(v0.9.0+) detects and strips these leftovers across both
+`$BRIDGE_DATA_ROOT/agents/<agent>/...` and
+`/home/agent-bridge-<agent>/...`. ACL preservation count: **0**.
+The migration is a strip-only pass; no named-user ACL is retained on
+either subtree.
+
+If the migration command is unavailable (older install / scripted
+environment), manual recovery (run as the controller, with `sudo`
+available):
+
+```bash
+# ⚠️  Input validation FIRST — never run with empty/invalid agent name.
+A="<agent>"
+[[ "$A" =~ ^[a-zA-Z0-9_-]+$ ]] || { echo "agent name validation failed"; exit 1; }
+
+USER="agent-bridge-$A"
+GROUP="ab-agent-$A"
+CTRL=$(id -un)
+
+# Sanity check — confirm the user exists and its home matches the
+# expected shape. Refuses to run if either is wrong.
+getent passwd "$USER" >/dev/null || { echo "no Linux user $USER"; exit 1; }
+LINUX_HOME="$(getent passwd "$USER" | cut -d: -f6)"
+[[ "$LINUX_HOME" == "/home/$USER" ]] || {
+  echo "ERROR: $USER home does not match /home/$USER (got: $LINUX_HOME)"
+  exit 1
+}
+
+# 1. Re-own the agent's actual Linux home and strip transitional ACLs.
+sudo chown -R "$USER:$USER" "$LINUX_HOME"
+sudo chmod -R u+rwX,go-rwx "$LINUX_HOME"
+sudo setfacl -bR "$LINUX_HOME"
+
+# 2. Realign plugin readiness state files to the v2 group-read contract
+#    (controller readiness probe reads via the per-agent group).
+for f in "$BRIDGE_DATA_ROOT/agents/$A/workdir/.teams/.env" \
+         "$BRIDGE_DATA_ROOT/agents/$A/workdir/.ms365/.env"; do
+  [[ -f "$f" ]] && sudo chgrp "$GROUP" "$f" && sudo chmod 0640 "$f"
+done
+
+# 3. Create the controller-side .claude/ shadow if missing.
+sudo install -d -o "$CTRL" -g "$CTRL" -m 0700 \
+  "$BRIDGE_DATA_ROOT/agents/$A/.claude"
+
+# 4. Re-launch and verify.
+agent-bridge agent start "$A"
+```
+
+The full canonical state table and a deeper drift-recovery reference
+live at
+[`OPERATIONS.md` § "Isolation v2 canonical state and migration"](./OPERATIONS.md#isolation-v2-canonical-state-and-migration)
+and [`docs/agent-runtime/v2-isolation-migration.md`](./docs/agent-runtime/v2-isolation-migration.md).
+
 ## 17. Layout v2 requires the engine CLI in a base-readable path (enforcement deferred to runtime)
 
 The v2 group contract has no path INTO the operator's home. If
@@ -488,3 +551,35 @@ This is a debugging escape, not a permanent operating mode.
 Long-term operation without isolation is unsupported in v0.8.0.
 Report the underlying v2 issue upstream. Full operator notes:
 [`OPERATIONS.md` "Rollback hatch — `BRIDGE_DISABLE_ISOLATION=1`"](OPERATIONS.md).
+
+## 23. v1→v2 migration leaves the daemon "half-alive" if started from a stale shell (#712)
+
+After a v1→v2 isolation migration, a long-lived shell that predates
+the upgrade still carries the kernel-cached pre-upgrade supplementary
+group set even though `usermod` has added the operator to
+`ab-controller` (and any `ab-agent-*` groups) in passwd. A daemon
+spawned from such a shell starts successfully but cannot read
+`group=ab-controller mode 0640` state files — `agb status` then
+surfaces `bridge-state.sh:997 source "$file": Permission denied`.
+
+`bridge-daemon.sh start` now refuses with a re-login remediation
+when the current process is missing v2 groups its passwd entry
+includes. Linux-only; installs without `ab-controller` (e.g. macOS,
+or a fresh install that hasn't run v2 group setup) pass through
+unchanged.
+
+Diagnose:
+```
+cat /proc/$DAEMON_PID/status | grep ^Groups
+id -G
+```
+
+Recover (Linux):
+```
+exec sudo -i -u $USER bash
+bash bridge-daemon.sh start
+```
+
+Debug-only override: `BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS=1`
+(the `Permission denied` errors will return — set only when you
+need to inspect a specific failure mode).

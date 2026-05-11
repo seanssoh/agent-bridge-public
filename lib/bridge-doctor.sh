@@ -242,9 +242,31 @@ bridge_doctor_invoke_agent() {
 
   # Subshell isolation — BRIDGE_AGENT_HOME_ROOT is exported only here.
   # shellcheck disable=SC2030 # subshell-scoped export is the design.
+  #
+  # Issue #670 — also pin BRIDGE_CODEX_HOOKS_FILE into the isolated
+  # BRIDGE_HOME for the duration of every child invocation. Without
+  # this, the doctor's `create --engine codex` step downstream-runs
+  # `bridge-start.sh --dry-run`, which calls `bridge_ensure_codex_hooks`.
+  # That helper resolves to `$HOME/.codex/hooks.json` by default and
+  # writes PreToolUse + Stop entries whose `command` strings reference
+  # `$BRIDGE_HOME/hooks/codex-task-mode-policy.py` and
+  # `$BRIDGE_HOME/hooks/codex-review-output-shape.py`. When the
+  # doctor's temp BRIDGE_HOME is cleaned up, those entries become
+  # stale references in the operator's real `~/.codex/hooks.json`,
+  # permanently breaking every codex session on the host (PreToolUse
+  # blocks every command with `python3: can't open file ...`).
+  #
+  # Pinning BRIDGE_CODEX_HOOKS_FILE to a path inside the isolated
+  # BRIDGE_HOME redirects the writes to a hooks.json that dies with
+  # the temp dir on doctor exit. The operator's hooks.json is never
+  # touched. Guarded by [[ -n "${BRIDGE_HOME:-}" ]] (validated up in
+  # bridge_doctor_run) so the export is always safe here.
   local rc=0
   (
     export BRIDGE_AGENT_HOME_ROOT="$fixture_home_root"
+    if [[ -n "${BRIDGE_HOME:-}" ]]; then
+      export BRIDGE_CODEX_HOOKS_FILE="$BRIDGE_HOME/.codex/hooks.json"
+    fi
     exec "${BRIDGE_BASH_BIN:-bash}" "$agent_script" "$verb" "$@"
   ) >"$stdout_log" 2>"$stderr_log" || rc=$?
 

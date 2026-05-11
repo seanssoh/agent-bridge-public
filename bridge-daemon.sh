@@ -159,7 +159,7 @@ _bridge_daemon_on_exit() {
   mkdir -p "$BRIDGE_STATE_DIR" 2>/dev/null || true
   printf '[%s] [info] daemon exit pid=%d ec=%d sig=%s last_step=%s err_location=%s\n' \
     "$ts" "$$" "$ec" "$sig" "$step" "${err_location:-none}" \
-    >>"$BRIDGE_LAUNCHAGENT_LOG" 2>/dev/null || true
+    2>/dev/null >>"$BRIDGE_LAUNCHAGENT_LOG" || true
 
   # bridge_audit_log shells out to python; wrap so an audit failure cannot
   # mask the original exit code.
@@ -3108,14 +3108,19 @@ bridge_note_plugin_liveness_state() {
   local last_key="$2"
   local last_detected_ts="$3"
   local last_restart_ts="$4"
+  # Optional 5th positional: cumulative restart-attempt count for this key.
+  # Older state files (pre-#715-A) omit this field; callers default to 0.
+  local restart_attempts="${5:-0}"
   local state_file=""
 
+  [[ "$restart_attempts" =~ ^[0-9]+$ ]] || restart_attempts=0
   state_file="$(bridge_plugin_liveness_state_file "$agent")"
   mkdir -p "$(dirname "$state_file")"
   cat >"$state_file" <<EOF
 LAST_KEY=$(printf '%q' "$last_key")
 LAST_DETECTED_TS=$(printf '%q' "$last_detected_ts")
 LAST_RESTART_TS=$(printf '%q' "$last_restart_ts")
+RESTART_ATTEMPTS=$(printf '%q' "$restart_attempts")
 EOF
 }
 
@@ -3129,10 +3134,19 @@ bridge_report_plugin_liveness_miss() {
   local key=""
   local now_ts=0
   local cooldown="${BRIDGE_PLUGIN_LIVENESS_RESTART_COOLDOWN_SECONDS:-60}"
+  # Issue #715 A — bound the restart loop. When the missing-channel set is
+  # rooted in operator config (relay token absent, teams unprovisioned, etc.)
+  # the channel CSV never recovers from a daemon-side restart, so the agent
+  # gets killed every cooldown window forever. Cap consecutive restart
+  # attempts per (agent, missing-CSV) key; once the cap is hit, audit a
+  # giveup entry once and stop restarting until the CSV changes (i.e., the
+  # operator changed something).
+  local max_restarts="${BRIDGE_PLUGIN_LIVENESS_MAX_RESTARTS:-5}"
   local state_file=""
   local last_key=""
   local last_detected_ts=0
   local last_restart_ts=0
+  local restart_attempts=0
 
   [[ "${BRIDGE_SKIP_PLUGIN_LIVENESS:-0}" != "1" ]] || return 1
   [[ "$(bridge_agent_source "$agent")" == "static" ]] || return 0
@@ -3167,17 +3181,27 @@ bridge_report_plugin_liveness_miss() {
   key="$(bridge_sha1 "${agent}|${missing}")"
   now_ts="$(date +%s)"
   [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=60
+  [[ "$max_restarts" =~ ^[0-9]+$ ]] || max_restarts=5
   state_file="$(bridge_plugin_liveness_state_file "$agent")"
   if [[ -f "$state_file" ]]; then
     daemon_source_state_file "$state_file" "plugin-liveness/$agent" 1 "LAST_DETECTED_TS" \
-        "LAST_KEY LAST_RESTART_TS" \
+        "LAST_KEY LAST_RESTART_TS RESTART_ATTEMPTS" \
       || true
     last_key="${LAST_KEY:-}"
     last_detected_ts="${LAST_DETECTED_TS:-0}"
     last_restart_ts="${LAST_RESTART_TS:-0}"
+    restart_attempts="${RESTART_ATTEMPTS:-0}"
   fi
   [[ "$last_detected_ts" =~ ^[0-9]+$ ]] || last_detected_ts=0
   [[ "$last_restart_ts" =~ ^[0-9]+$ ]] || last_restart_ts=0
+  [[ "$restart_attempts" =~ ^[0-9]+$ ]] || restart_attempts=0
+
+  # If the operator changed something (different missing-channel CSV), reset
+  # the attempt counter so we get another full restart budget against the new
+  # symptom. Same key on a subsequent miss => stay in the same cycle.
+  if [[ "$key" != "$last_key" ]]; then
+    restart_attempts=0
+  fi
 
   attached="$(bridge_tmux_session_attached_count "$session" 2>/dev/null || printf '0')"
   [[ "$attached" =~ ^[0-9]+$ ]] || attached=0
@@ -3188,14 +3212,38 @@ bridge_report_plugin_liveness_miss() {
         --detail session="$session"
       daemon_info "plugin MCP liveness miss on attached session ${agent} (${missing})"
     fi
-    bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts"
+    bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts" "$restart_attempts"
+    return 0
+  fi
+
+  # Giveup short-circuit. attempts >= max means we already burned our budget
+  # for this missing-CSV key. Emit the giveup audit + daemon_info exactly once
+  # (the "first entry" — attempts == max), then bump to max+1 as a sentinel so
+  # subsequent ticks return silently until the CSV (and thus the key) changes.
+  if (( restart_attempts >= max_restarts )); then
+    if (( restart_attempts == max_restarts )); then
+      bridge_audit_log daemon plugin_mcp_liveness_giveup "$agent" \
+        --detail missing_channels="$missing" \
+        --detail attempts="$restart_attempts" \
+        --detail max_restarts="$max_restarts" \
+        --detail session="$session"
+      daemon_info "plugin MCP liveness restart limit reached for ${agent} (${missing}); skipping until channel CSV changes"
+      restart_attempts=$((max_restarts + 1))
+    fi
+    bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts" "$restart_attempts"
     return 0
   fi
 
   if [[ "$key" == "$last_key" ]] && (( last_restart_ts > 0 )) && (( now_ts - last_restart_ts < cooldown )); then
-    bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts"
+    bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts" "$restart_attempts"
     return 0
   fi
+
+  # Cooldown elapsed (or first miss on this key). Count this as a restart
+  # attempt before invoking, so a failed restart still consumes budget — the
+  # whole point is to bound work against an unrecoverable operator-config
+  # state.
+  restart_attempts=$((restart_attempts + 1))
 
   # Preserve the role's configured continue policy. For static Claude roles,
   # forcing --no-continue here destroys the session continuity that the roster
@@ -3203,8 +3251,10 @@ bridge_report_plugin_liveness_miss() {
   if restart_output="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" agent restart "$agent" 2>&1)"; then
     bridge_audit_log daemon plugin_mcp_liveness_restart "$agent" \
       --detail missing_channels="$missing" \
-      --detail session="$session"
-    daemon_info "restarted ${agent} after plugin MCP liveness miss (${missing})"
+      --detail session="$session" \
+      --detail attempts="$restart_attempts" \
+      --detail max_restarts="$max_restarts"
+    daemon_info "restarted ${agent} after plugin MCP liveness miss (${missing}) [attempt ${restart_attempts}/${max_restarts}]"
     last_restart_ts="$now_ts"
   else
     restart_output="${restart_output//$'\n'/ }"
@@ -3215,11 +3265,13 @@ bridge_report_plugin_liveness_miss() {
     bridge_audit_log daemon plugin_mcp_liveness_restart_failed "$agent" \
       --detail missing_channels="$missing" \
       --detail session="$session" \
+      --detail attempts="$restart_attempts" \
+      --detail max_restarts="$max_restarts" \
       --detail restart_error="$restart_output"
-    daemon_info "plugin MCP liveness restart failed for ${agent} (${missing})${restart_output:+: $restart_output}"
+    daemon_info "plugin MCP liveness restart failed for ${agent} (${missing}) [attempt ${restart_attempts}/${max_restarts}]${restart_output:+: $restart_output}"
   fi
 
-  bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts"
+  bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts" "$restart_attempts"
 }
 
 process_plugin_liveness() {
@@ -3626,8 +3678,8 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
   fi
 
   # Persist dedup state and pending-notice JSON for the follow-up handler.
-  printf '%s\n' "$now_ts" >"$last_ts_file" 2>/dev/null || true
-  printf '%s\n' "$event_id" >"$last_event_file" 2>/dev/null || true
+  printf '%s\n' "$now_ts" 2>/dev/null >"$last_ts_file" || true
+  printf '%s\n' "$event_id" 2>/dev/null >"$last_event_file" || true
 
   local pending_path="$agent_state_dir/precompact-notice-pending.json"
   python3 -c '
@@ -3963,7 +4015,7 @@ if isinstance(data, dict):
   #   2. Run record-precompact-completion to mutate precompact-stats.json.
   #   3. Update the pending JSON in place, then archive + move the marker.
   mkdir -p "$recorded_flag_dir" 2>/dev/null || true
-  : >"$recorded_flag" 2>/dev/null || true
+  : 2>/dev/null >"$recorded_flag" || true
 
   bridge_with_timeout 10 precompact_stats_record python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" \
     record-precompact-completion \
@@ -5199,7 +5251,19 @@ cmd_sync_cycle() {
   snapshot_file="$(mktemp)"
   ready_agents_file="$(mktemp)"
   bridge_write_agent_snapshot "$snapshot_file"
-  bridge_write_idle_ready_agents "$ready_agents_file"
+  # r14 codex Probe 2 — daemon must not hard-fail on a per-cycle write
+  # (design contract: daemon never exits its loop). But the previous
+  # silent swallow erased the matrix hard-fail signal that r12/r13
+  # added. Capture rc + emit a one-line audit so operator can catch
+  # matrix-not-applied via `agent-bridge audit follow` instead of
+  # cycling on a green-looking daemon.
+  if ! bridge_write_idle_ready_agents "$ready_agents_file"; then
+    bridge_audit_log daemon daemon_step_warning daemon \
+      --detail step="nudge_scan_idle_ready" \
+      --detail reason="bridge_write_idle_ready_agents non-zero (matrix not applied or writer error)" \
+      2>/dev/null || true
+    daemon_log_event "nudge_scan: idle_ready writer failed (matrix-aware fix #781); cycle continues"
+  fi
   nudge_output="$(bridge_task_daemon_step "$snapshot_file" "$ready_agents_file" 2>/dev/null || true)"
   rm -f "$snapshot_file"
   rm -f "$ready_agents_file"
@@ -5415,13 +5479,159 @@ bridge_stop_silence_watchdog() {
   fi
 }
 
+bridge_daemon_supplementary_group_preflight() {
+  # Issue #712: refuse `bridge-daemon.sh start` when the *current shell*
+  # is missing v2 isolation supplementary groups that the operator's
+  # passwd entry says they belong to. This is the v1→v2 stale-shell
+  # failure mode #668's migration-time warn does not cover (operator
+  # later restarts the daemon from the same pre-upgrade shell, daemon
+  # comes up "half-alive", reads of group=ab-controller mode 0640 env
+  # files trip Permission denied on bridge-state.sh:997).
+  #
+  # Returns 0 (PASS) — start may proceed — when:
+  #   - BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS is truthy (debug hatch), OR
+  #   - BRIDGE_DISABLE_ISOLATION is truthy (isolation off entirely), OR
+  #   - the host is not Linux (this stale-cache class is a Linux usermod
+  #     symptom; macOS has its own dseditgroup membership-refresh story
+  #     handled outside this preflight), OR
+  #   - getent / id are unavailable (cannot reason about groups; do no
+  #     harm), OR
+  #   - the controller group (ab-controller) does not exist on the host
+  #     (linux-user isolation is not deployed here — e.g. fresh install
+  #     that never ran v2 group setup).
+  #
+  # Returns non-zero (REFUSE) when at least one v2 group from the
+  # operator's passwd-driven static group set is absent from the
+  # current process's supplementary GID set.
+  case "${BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS:-}" in
+    1|yes|YES|Yes|on|ON|On|true|TRUE|True)
+      # Silent skip: operator opted in to FORCE-start; do not pollute
+      # daemon stderr with a warn line on every start.
+      return 0
+      ;;
+  esac
+  if declare -F bridge_isolation_disabled_by_env >/dev/null 2>&1 \
+      && bridge_isolation_disabled_by_env; then
+    return 0
+  fi
+  [[ "$(uname -s)" == "Linux" ]] || return 0
+  command -v getent >/dev/null 2>&1 || return 0
+  command -v id >/dev/null 2>&1 || return 0
+
+  local controller_group="${BRIDGE_CONTROLLER_GROUP:-ab-controller}"
+  local agent_group_prefix="${BRIDGE_AGENT_GROUP_PREFIX:-ab-agent-}"
+  local shared_group="${BRIDGE_SHARED_GROUP:-ab-shared}"
+
+  # If the controller group itself is absent, linux-user isolation is
+  # not deployed on this host. Treat as not-applicable (PASS).
+  getent group "$controller_group" >/dev/null 2>&1 || return 0
+
+  # Static (passwd-driven) supplementary group set for the operator —
+  # includes any group memberships added by `usermod -aG` even when the
+  # current shell hasn't picked them up yet.
+  local operator="${USER:-$(id -un 2>/dev/null || true)}"
+  [[ -n "$operator" ]] || return 0
+  local static_groups
+  static_groups="$(id -nG -- "$operator" 2>/dev/null || true)"
+  [[ -n "$static_groups" ]] || return 0
+
+  # Current process supplementary GID set (numeric). On Linux `id -G`
+  # without a user argument reflects the running process's kernel-cached
+  # supp set, which is exactly the set the spawned daemon will inherit.
+  local proc_gids
+  proc_gids="$(id -G 2>/dev/null || true)"
+  [[ -n "$proc_gids" ]] || return 0
+
+  local missing=()
+  local g
+  for g in $static_groups; do
+    case "$g" in
+      "$controller_group"|"$shared_group"|"${agent_group_prefix}"*)
+        local gid
+        gid="$(getent group "$g" 2>/dev/null | awk -F: '{print $3}')"
+        [[ -n "$gid" ]] || continue
+        # Word-boundary match against the space-separated proc_gids.
+        case " $proc_gids " in
+          *" $gid "*) ;;
+          *) missing+=("$g") ;;
+        esac
+        ;;
+    esac
+  done
+
+  if (( ${#missing[@]} == 0 )); then
+    return 0
+  fi
+
+  daemon_warn ""
+  daemon_warn "============================================================"
+  daemon_warn "[오류] 데몬을 시작할 수 없습니다: 현재 셸의 supplementary group set이"
+  daemon_warn "  v2 isolation 그룹들을 포함하지 않습니다."
+  daemon_warn "누락: ${missing[*]}"
+  daemon_warn ""
+  daemon_warn "셸을 재로그인 (예: exec sudo -i -u \$USER bash) 후 다시 시도하세요."
+  daemon_warn ""
+  daemon_warn "[error] daemon refused to start: current shell's supplementary"
+  daemon_warn "  group set is missing v2 isolation groups."
+  daemon_warn "Missing: ${missing[*]}"
+  daemon_warn "Re-login (e.g. \`exec sudo -i -u \$USER bash\`) and retry."
+  daemon_warn ""
+  daemon_warn "자세한 진단 / Diagnostic:"
+  daemon_warn "  cat /proc/\$\$/status | grep ^Groups"
+  daemon_warn "  id -G"
+  daemon_warn ""
+  daemon_warn "디버깅용 우회: BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS=1"
+  daemon_warn "(권한 오류가 isolated agent history env 읽기에서 다시 발생할 수 있음)"
+  daemon_warn "============================================================"
+  bridge_audit_log daemon daemon_start_refused daemon \
+    --detail reason=stale_supplementary_groups \
+    --detail missing="${missing[*]}" >/dev/null 2>&1 || true
+  return 1
+}
+
 cmd_start() {
   local start_deadline
+  local recorded_pid=""
+  local recorded_cmdline=""
+
+  # Issue #683: post-upgrade verification (start → status) reported
+  # contradictory state — start said "already running pid=NNNN", status said
+  # "stopped socket_listener=off". Two failure modes converge here:
+  #   1. Stale pid file from a prior daemon that exited without cleanup
+  #      (kill -0 returns 1).
+  #   2. Pid recycling: kill -0 succeeds for a recorded pid that the OS has
+  #      reassigned to an unrelated process (different cmdline).
+  # Reap the pid file in both cases before deferring to bridge_daemon_is_running
+  # so start and status agree on daemon-up determination.
+  recorded_pid="$(bridge_daemon_recorded_pid)"
+  if [[ -n "$recorded_pid" ]]; then
+    if ! kill -0 "$recorded_pid" 2>/dev/null; then
+      daemon_info "stale pid file (pid=${recorded_pid} no longer alive), starting fresh"
+      rm -f "$BRIDGE_DAEMON_PID_FILE"
+      recorded_pid=""
+    else
+      recorded_cmdline="$(ps -p "$recorded_pid" -o args= 2>/dev/null || true)"
+      if [[ -n "$recorded_cmdline" && "$recorded_cmdline" != *"bridge-daemon.sh run"* ]]; then
+        daemon_info "stale pid file (pid=${recorded_pid} belongs to non-bridge process), starting fresh"
+        rm -f "$BRIDGE_DAEMON_PID_FILE"
+        recorded_pid=""
+      fi
+    fi
+  fi
 
   if bridge_daemon_is_running; then
     daemon_info "bridge daemon already running (pid=$(bridge_daemon_pid))"
     bridge_start_silence_watchdog || true
     return 0
+  fi
+
+  # Issue #712: stale supplementary-group cache after v1→v2 migration
+  # leaves the daemon "half-alive" — it starts, but every read of an
+  # isolated-agent state file (group=ab-controller mode 0640) errors
+  # with Permission denied. Refuse to start when the current shell's
+  # supp set is missing v2 isolation groups it should have per passwd.
+  if ! bridge_daemon_supplementary_group_preflight; then
+    bridge_die "bridge daemon start refused: stale supplementary groups (set BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS=1 to override)"
   fi
 
   mkdir -p "$BRIDGE_STATE_DIR" "$BRIDGE_LOG_DIR"
@@ -5507,7 +5717,7 @@ cmd_run() {
       # daemon process tree, so a hung daemon cannot interfere with it being
       # observed. See scripts/bridge-daemon-liveness.sh and
       # scripts/install-daemon-liveness-{launchagent,systemd}.sh.
-      printf '%s\n' "$now_ts" >"$BRIDGE_STATE_DIR/daemon.heartbeat" 2>/dev/null || true
+      printf '%s\n' "$now_ts" 2>/dev/null >"$BRIDGE_STATE_DIR/daemon.heartbeat" || true
       last_heartbeat_ts="$now_ts"
     fi
     BRIDGE_DAEMON_LAST_STEP="idle_sleep"

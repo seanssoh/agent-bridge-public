@@ -42,6 +42,12 @@ bridge_ensure_admin_codex_pair() {
   local description="Dedicated codex dev pair for ${admin}: plans, reviews, and proposes code changes via the queue."
   local role_text="Pair programmer for ${admin} (codex)"
 
+  # Issue #691: pair shares the admin's workdir by design (they pair-program
+  # in the same tree). Post-#686 the admin's workdir already contains managed
+  # `.agents/` scaffold, which trips run_create's non-empty-workdir guard.
+  # Opt out of the guard with --allow-shared-workdir so the backfill no
+  # longer surfaces a spurious "admin-pair backfill failed" warning on
+  # otherwise-clean fresh inits.
   set +e
   create_output="$(
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" agent create "$pair_name" \
@@ -53,6 +59,7 @@ bridge_ensure_admin_codex_pair() {
       --role "$role_text" \
       --description "$description" \
       --always-on \
+      --allow-shared-workdir \
       2>&1
   )"
   rc=$?

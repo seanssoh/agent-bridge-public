@@ -4,6 +4,95 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Issue #665 (r2): the public CLI wrapper sources bridge-lib.sh BEFORE it
+# dispatches to bridge-init.sh / bridge-bootstrap.sh, so the resolver
+# fires here in the wrapper process — armed with the wrapper's PID and
+# argv ("agent-bridge"). Without arming the fresh-install bypass before
+# the source below, a markerless fresh home dies inside the resolver
+# (line ~369 of lib/bridge-layout-resolver.sh) before the wrapper ever
+# reaches the dispatch table. Mirror what bridge-init.sh / bridge-
+# bootstrap.sh do for direct invocations: peek at $1 and arm the bypass
+# only for the fresh-install-creating subcommands. The handshake in
+# lib/bridge-layout-resolver.sh accepts "agent-bridge" alongside
+# "bridge-init.sh" / "bridge-bootstrap.sh" for exactly this case.
+case "${1:-}" in
+  init|bootstrap)
+    if [[ -z "${BRIDGE_LAYOUT_RESOLVER_BYPASS:-}" ]]; then
+      _BRIDGE_AGENT_BRIDGE_BYPASS_NONCE="$(date -u '+%Y%m%dT%H%M%SZ')-$$-${RANDOM}${RANDOM}"
+      export BRIDGE_LAYOUT_RESOLVER_BYPASS="fresh-install:${_BRIDGE_AGENT_BRIDGE_BYPASS_NONCE}"
+      export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
+      trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
+    fi
+    ;;
+  upgrade|migrate)
+    # v0.8.6 hotfix: arm the upgrade-migrate resolver bypass before
+    # `bridge-lib.sh` is sourced below — but ONLY when the live install
+    # is markerless (v0.7.x or earlier, no `state/layout-marker.sh`).
+    # Without the bypass, an operator running `agent-bridge upgrade
+    # --apply` or `agent-bridge migrate isolation-v2 ...` from a v0.8.5
+    # source checkout against a markerless v0.7.x install hits the
+    # v0.8.0 fail-fast at `lib/bridge-layout-resolver.sh:333-345`
+    # before the wrapper's own `case` block can dispatch to
+    # `bridge-upgrade.sh` / `bridge-migrate.sh` (which arm the bypass
+    # themselves but only AFTER they're exec'd, by which time the
+    # wrapper has already died).
+    #
+    # Markered v0.8.x installs MUST NOT take the bypass path — the
+    # resolver's bypass branch (line 297-300) returns
+    # `upgrade-migrate-deferred` before consulting the marker, which
+    # would leave BRIDGE_LAYOUT/BRIDGE_DATA_ROOT unset for the
+    # wrapper's own `bridge_load_roster` call (line 54) and silently
+    # operate against legacy paths. Gate the bypass on marker absence
+    # so already-migrated installs continue to take the normal marker
+    # branch (codex review on PR #704 r3 caught this).
+    #
+    # Mirrors the fresh-install bypass arming for `init|bootstrap`
+    # above. The handshake in `lib/bridge-layout-resolver.sh` accepts
+    # `agent-bridge` alongside `bridge-upgrade.sh` /
+    # `bridge-migrate.sh` as owner so a leaked env crossing into
+    # another tree still fails the descendant check.
+    _BRIDGE_AGENT_BRIDGE_HOME="${BRIDGE_HOME:-$HOME/.agent-bridge}"
+    _BRIDGE_AGENT_BRIDGE_MARKER="${BRIDGE_LAYOUT_MARKER_DIR:-$_BRIDGE_AGENT_BRIDGE_HOME/state}/layout-marker.sh"
+    if [[ ! -f "$_BRIDGE_AGENT_BRIDGE_MARKER" ]] \
+        && [[ -z "${BRIDGE_LAYOUT_RESOLVER_BYPASS:-}" ]]; then
+      _BRIDGE_AGENT_BRIDGE_BYPASS_NONCE="$(date -u '+%Y%m%dT%H%M%SZ')-$$-${RANDOM}${RANDOM}"
+      export BRIDGE_LAYOUT_RESOLVER_BYPASS="upgrade-migrate:${_BRIDGE_AGENT_BRIDGE_BYPASS_NONCE}"
+      export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
+      trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
+    fi
+    unset _BRIDGE_AGENT_BRIDGE_HOME _BRIDGE_AGENT_BRIDGE_MARKER
+    ;;
+esac
+# r15 codex Probe 6 (FAIL #7) — `isolation verify --help` must work
+# even on legacy/markerless installs so operator can read the syntax
+# before they upgrade. The layout-required guard inside bridge-lib.sh
+# fires on legacy hosts and dies before the dispatcher would parse
+# `--help`. Pre-empt by handling the help flag here, before sourcing
+# bridge-lib.sh. Only the help case bypasses; an actual `verify`
+# invocation still goes through the full layout check below.
+if [[ "${1:-}" == "isolation" && "${2:-}" == "verify" ]]; then
+  for _arg in "$@"; do
+    if [[ "$_arg" == "-h" || "$_arg" == "--help" ]]; then
+      cat <<'HELP_EOF'
+Usage: agent-bridge isolation verify --agent <agent> [--json] [--strict-optional]
+
+Walk the v0.9.7 grant matrix for <agent> and report mismatches.
+Read-only — no chmod/chgrp/setfacl/mkdir. Exit non-zero on required mismatch.
+
+Options:
+  --agent <name>       Agent id (required).
+  --json               Emit machine-readable output instead of the table.
+  --strict-optional    Treat optional plugin rows as required (CLI exit
+                       non-zero on any optional row reporting 'degraded').
+
+Available even on legacy/markerless installs to advise upgrade.
+Run `agent-bridge upgrade --apply` first to populate the v2 layout.
+HELP_EOF
+      exit 0
+    fi
+  done
+  unset _arg
+fi
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 CLI_NAME="$(basename "$0")"
@@ -95,6 +184,7 @@ Usage:
   $CLI_NAME migrate isolation-v2 rollback --yes
   $CLI_NAME migrate isolation-v2 commit --yes
   $CLI_NAME migrate isolation-v2 status
+  $CLI_NAME migrate isolation v2 [--check|--dry-run|--apply] [--agent <name>] [--json]
   $CLI_NAME wiki bootstrap [--agent <name>] [--shared-root <path>] [--dry-run] [--json]
   $CLI_NAME wiki validate [--full|--frontmatter|--broken-link|--tree-edge] [--json]
   $CLI_NAME wiki dedup-scan [--output <file>] [--json]
@@ -102,6 +192,7 @@ Usage:
   $CLI_NAME wiki repair-links [--apply] [--limit N] [--json]
   $CLI_NAME isolate <agent> [--dry-run]
   $CLI_NAME unisolate <agent> [--dry-run]
+  $CLI_NAME isolation verify --agent <agent> [--json] [--strict-optional]
   $CLI_NAME inbox [agent] [--all]
   $CLI_NAME show <task-id>
   $CLI_NAME claim <task-id> [--agent <agent>] [--lease <seconds>]
@@ -480,7 +571,29 @@ if [[ $# -gt 0 ]]; then
         exit 0
       fi
 
-      exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "--$ADMIN_ENGINE" --name "$ADMIN_AGENT" --workdir "$ADMIN_WORKDIR" --loop "$@"
+      # Issue #715-C / #714-5: bridge-start.sh now exits non-zero when a
+      # spawned tmux session dies inside the post-launch verify window.
+      # Propagate that signal here (instead of `exec`-ing) so we can append
+      # an admin-targeted remediation hint after the child's own log tail.
+      # NOTE: `set -e` at the top of this script would terminate before
+      # `_admin_rc=$?` runs on a nonzero child; the `|| _admin_rc=$?`
+      # tail keeps the heredoc + exit-propagation reachable.
+      _admin_rc=0
+      "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "--$ADMIN_ENGINE" --name "$ADMIN_AGENT" --workdir "$ADMIN_WORKDIR" --loop "$@" \
+        || _admin_rc=$?
+      if [[ $_admin_rc -ne 0 ]]; then
+        cat >&2 <<EOF
+[오류] '$ADMIN_AGENT' 어드민 세션이 시작 직후 종료되었습니다.
+진단:
+  bash bridge-daemon.sh status
+  grep "plugin MCP liveness miss\\|$ADMIN_AGENT died" "\$BRIDGE_HOME/state/daemon.log" | tail
+  tail -20 "\$BRIDGE_HOME/agents/$ADMIN_AGENT/logs/\$(date +%Y%m%d).log"
+설정 누락 가능성:
+  agb setup discord    # discord relay token 등록
+  agb setup teams      # microsoft teams access.json 등록
+EOF
+      fi
+      exit "$_admin_rc"
       ;;
     bootstrap)
       shift
@@ -685,7 +798,14 @@ PY
       fi
       session="$(bridge_agent_session "$agent")"
       if [[ -z "$session" ]] || ! bridge_tmux_session_exists "$session"; then
-        bridge_die "에이전트 '$agent' 세션이 존재하지 않습니다."
+        # Issue #714 (#7): operators previously had no on-screen remediation
+        # path when an attach target was offline (e.g. after an upgrade where
+        # orchestrate_restart silently failed). Surface the two recovery
+        # commands that almost always close the loop before falling into
+        # bridge_die's red error line.
+        echo "[hint] 세션을 다시 시작하려면: bash bridge-start.sh $agent" >&2
+        echo "[hint] (admin 에이전트인 경우) $CLI_NAME admin" >&2
+        bridge_die "에이전트 '$agent'의 tmux 세션이 없습니다."
       fi
       bridge_attach_tmux_session "$session"
       ;;
@@ -741,6 +861,179 @@ PY
       shift
       bridge_require_python
       exec python3 "$SCRIPT_DIR/bridge-wiki.py" "$@"
+      ;;
+    isolation)
+      # v0.9.7 (refs #781): read-only verification CLI for the
+      # isolation grant matrix. Walks every required-access matrix row
+      # for an agent and reports per-row status. Does NOT mutate any
+      # ownership/mode/ACL — operators run `migrate isolation v2
+      # --apply --agent <X>` for repair.
+      shift
+      case "${1:-}" in
+        verify)
+          shift
+          _iso_agent=""
+          _iso_json=0
+          _iso_strict_optional=0
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --agent)
+                _iso_agent="$2"
+                shift 2
+                ;;
+              --json)
+                _iso_json=1
+                shift
+                ;;
+              --strict-optional)
+                # v0.9.7 PR 2 (refs #781): with this flag, `degraded`
+                # rows (criticality=optional, mismatch) escalate to
+                # `mismatch` and the CLI exits non-zero. Without it,
+                # only required-row mismatches flip the exit code.
+                _iso_strict_optional=1
+                shift
+                ;;
+              -h|--help)
+                cat <<EOF
+Usage: $CLI_NAME isolation verify --agent <agent> [--json] [--strict-optional]
+
+Read-only verification of the v2 isolation grant matrix for one agent.
+Walks every required-access row and reports {path, expected, actual,
+status, criticality, suggested_fix}. Exits non-zero on any required
+mismatch.
+
+  --agent <X>         agent id (required)
+  --json              emit machine-readable JSON (default: human table)
+  --strict-optional   treat optional row failures as required (CLI exit
+                      non-zero on any optional 'degraded' row)
+
+Suggested fix when verify reports drift:
+  agent-bridge migrate isolation v2 --apply --agent <X>
+
+This command never mutates filesystem state. Refs #781.
+EOF
+                exit 0
+                ;;
+              *)
+                bridge_die "지원하지 않는 isolation verify 옵션입니다: $1"
+                ;;
+            esac
+          done
+          [[ -n "$_iso_agent" ]] || bridge_die "isolation verify: --agent <name> is required"
+
+          # Source the v2 helpers — bridge-lib.sh already loaded the
+          # module above, so the helpers are in scope. Run check.
+          if ! command -v bridge_isolation_v2_apply_grant_matrix_for_agent >/dev/null 2>&1; then
+            bridge_die "isolation verify: matrix helpers not loaded (BRIDGE_LAYOUT=v2 required)"
+          fi
+
+          _iso_check_out=""
+          _iso_rc=0
+          _iso_check_out="$(bridge_isolation_v2_apply_grant_matrix_for_agent "$_iso_agent" --check 2>&1)" \
+            || _iso_rc=$?
+
+          # v0.9.7 PR 2 (refs #781): apply_grant_matrix_for_agent now
+          # demotes optional-row failures to status=`degraded` and does
+          # NOT flip rc for them. With `--strict-optional`, the CLI
+          # treats any `degraded` row as a hard mismatch for exit code
+          # purposes (the row data itself stays `degraded` so the
+          # operator can see which rows are optional vs required).
+          if (( _iso_strict_optional == 1 )) \
+              && [[ "$_iso_check_out" == *$'\tdegraded\t'* ]]; then
+            _iso_rc=1
+          fi
+
+          if (( _iso_json == 1 )); then
+            bridge_require_python
+            # The check output is passed as a third positional arg so the
+            # python heredoc remains the script source while data lands
+            # in argv. This avoids the heredoc-overrides-pipe bash trap
+            # (shellcheck SC2259) without writing temp files.
+            python3 - "$_iso_agent" "$_iso_rc" "$_iso_check_out" "$_iso_strict_optional" <<'PY'
+import json, sys
+agent = sys.argv[1]
+rc = int(sys.argv[2])
+data = sys.argv[3] if len(sys.argv) > 3 else ""
+strict_optional = sys.argv[4] == "1" if len(sys.argv) > 4 else False
+rows = []
+for line in data.splitlines():
+    parts = line.split("\t")
+    # 6-column format added in v0.9.7 PR 2: row, path, status,
+    # expected, actual, criticality. Tolerate older 5-column lines so
+    # consumers reading the upgrader's pre-upgrade snapshot don't break.
+    if len(parts) < 5:
+        continue
+    row_name = parts[0]
+    path = parts[1]
+    status = parts[2]
+    expected = parts[3]
+    actual = parts[4]
+    criticality = parts[5] if len(parts) > 5 else "required"
+    rows.append({
+        "row": row_name,
+        "path": path,
+        "status": status,
+        "expected": expected,
+        "actual": actual,
+        "criticality": criticality,
+        "suggested_fix": (
+            f"agent-bridge migrate isolation v2 --apply --agent {agent}"
+            if status != "ok" else ""
+        ),
+    })
+print(json.dumps({
+    "agent": agent,
+    "exit_status": "ok" if rc == 0 else "mismatch",
+    "strict_optional": strict_optional,
+    "rows": rows,
+}, ensure_ascii=False, indent=2))
+PY
+          else
+            printf 'Isolation grant matrix verify for agent: %s\n' "$_iso_agent"
+            if (( _iso_strict_optional == 1 )); then
+              printf '%s\n' "(strict-optional: degraded rows escalated to required)"
+            fi
+            printf '%s\n' "------------------------------------------------------------------"
+            printf '%-26s %-10s %-14s %-30s %s\n' "ROW" "STATUS" "CRITICALITY" "EXPECTED" "PATH"
+            printf '%s\n' "------------------------------------------------------------------"
+            while IFS=$'\t' read -r _name _path _status _expected _actual _crit; do
+              [[ -n "$_name" ]] || continue
+              # Tolerate 5-column input from older callers — fall back
+              # to `required` so the table still renders sensibly.
+              [[ -n "$_crit" ]] || _crit="required"
+              printf '%-26s %-10s %-14s %-30s %s\n' \
+                "$_name" "$_status" "$_crit" "$_expected" "$_path"
+            done <<<"$_iso_check_out"
+            printf '%s\n' "------------------------------------------------------------------"
+            if (( _iso_rc == 0 )); then
+              if [[ "$_iso_check_out" == *$'\tdegraded\t'* ]]; then
+                echo "All required rows: ok (some optional rows degraded)"
+                echo "Run with --strict-optional to fail on optional row degradation."
+              else
+                echo "All required rows: ok"
+              fi
+            else
+              echo "Drift detected. Repair with:"
+              echo "  agent-bridge migrate isolation v2 --apply --agent $_iso_agent"
+            fi
+          fi
+          exit "$_iso_rc"
+          ;;
+        ""|-h|--help)
+          cat <<EOF
+Usage: $CLI_NAME isolation <verify> [options]
+
+  verify --agent <X> [--json] [--strict-optional]
+       Read-only verification of the v2 grant matrix for one agent.
+
+Refs #781.
+EOF
+          exit 0
+          ;;
+        *)
+          bridge_die "지원하지 않는 isolation 명령입니다: $1"
+          ;;
+      esac
       ;;
     isolate)
       shift

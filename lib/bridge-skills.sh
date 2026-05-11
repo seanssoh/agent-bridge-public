@@ -178,6 +178,13 @@ bridge_bootstrap_claude_shared_skills() {
   bridge_link_shared_claude_skill "$workdir" "agent-bridge-runtime"
   bridge_link_shared_claude_skill "$workdir" "cron-manager"
   bridge_link_shared_claude_skill "$workdir" "memory-wiki"
+  # v0.8.6: wave-orchestration is the shared parallel-PR-ship pattern
+  # (issue-fixer dispatch into worktrees, codex-rescue review, squash-
+  # merge with structured notes). Distribute to every Agent Bridge agent
+  # so admin / dynamic / static agents all share the same orchestration
+  # spine — operators do not need to copy the skill into per-agent
+  # `.claude/skills/` manually.
+  bridge_link_shared_claude_skill "$workdir" "wave-orchestration"
 
   if [[ -n "$agent" ]]; then
     bridge_sync_claude_runtime_skills "$agent" "$workdir"
@@ -202,7 +209,8 @@ bridge_isolated_home_shared_skill_names() {
     "agent-bridge-runtime" \
     "cron-manager" \
     "memory-wiki" \
-    "patch-permission-approval"
+    "patch-permission-approval" \
+    "wave-orchestration"
 }
 
 # Render one skill text file from the controller-side source into the

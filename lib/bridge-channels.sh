@@ -187,6 +187,21 @@ bridge_allocate_dynamic_webhook_port() {
   trap 'rmdir "$lock_dir" >/dev/null 2>&1 || true' RETURN
 
   port_file="$(bridge_agent_webhook_port_file "$agent")"
+  # v0.9.7 (refs #781 RC2): ensure the per-agent state leaf is canonical
+  # (group ab-agent-<X>, 2770, setgid) before writing webhook-port. The
+  # daemon writes this file on behalf of the isolated UID; without the
+  # matrix grant the file lands as ec2-user:ab-controller 0644 and the
+  # isolated UID may need to re-read it through the leaf.
+  if command -v bridge_isolation_v2_ensure_matrix_path >/dev/null 2>&1 \
+      && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+      && bridge_isolation_v2_active 2>/dev/null; then
+    # r14 codex Probe 4 — was `|| true`. r13 caught the symmetric
+    # fallback in the missing-marker retry writer below; this caller
+    # was missed. Same anti-pattern: ensure failure means parent dir
+    # is not matrix-canonical, so the subsequent mkdir would land
+    # mode/group wrong and verify would reject. Hard fail propagates.
+    bridge_isolation_v2_ensure_matrix_path "state-agent-dir" "$agent" >/dev/null 2>&1 || return 1
+  fi
   mkdir -p "$(dirname "$port_file")"
   if [[ -f "$port_file" ]]; then
     port="$(<"$port_file")"
@@ -206,7 +221,17 @@ bridge_allocate_dynamic_webhook_port() {
     if ! bridge_webhook_port_is_available "$port"; then
       continue
     fi
-    printf '%s\n' "$port" >"$port_file"
+    # r12 codex Probe 9 — drop direct-write fallback. Matrix writer
+    # failure is signal that the per-agent state-dir is not canonical,
+    # so a fallback write would land mode/group wrong and verify would
+    # reject. Hard fail propagates.
+    if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
+        && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+        && bridge_isolation_v2_active 2>/dev/null; then
+      bridge_isolation_v2_write_agent_state_marker "$agent" "webhook-port" "$port" || return 1
+    else
+      printf '%s\n' "$port" >"$port_file"
+    fi
     printf '%s' "$port"
     return 0
   done
@@ -404,7 +429,13 @@ bridge_write_idle_ready_agents() {
             fi
             retries=$((retries + 1))
             if (( retries >= 10#$max_retries )); then
-              bridge_agent_mark_idle_now "$agent"
+              # r15 codex needs-more — was unconditional. The synthetic
+              # marker writer now propagates the matrix hard-fail (r12-r14
+              # chain), so swallowing here would erase the whole signal.
+              # Hard fail: caller (cmd_sync_cycle nudge_scan step) sees
+              # rc=1 and emits the new daemon_step_warning audit so
+              # operator catches matrix-not-applied via `audit follow`.
+              bridge_agent_mark_idle_now "$agent" || return 1
               rm -f "$retries_file"
               bridge_audit_log daemon nudge_marker_synthesized "$agent" \
                 --detail consecutive_probe_failures="$retries" \
@@ -412,8 +443,25 @@ bridge_write_idle_ready_agents() {
                 --detail session="$session" 2>/dev/null || true
               bridge_warn "missing idle-since marker for '$agent' after ${retries} probe failures; synthesized current-timestamp marker so nudge dispatch can resume (issue #629)"
             else
-              mkdir -p "$(bridge_agent_idle_marker_dir "$agent")"
-              printf '%s\n' "$retries" >"$retries_file"
+              # v0.9.7 RC2 (refs #781): write retries via the matrix-aware
+              # marker writer so the per-agent state leaf inherits the
+              # canonical ab-agent-<X> 2770 contract. Falls back to plain
+              # mkdir/redirect when the matrix helper isn't loaded.
+              # r13 codex Probe F+H catch — drop direct-write fallback.
+              # mark_idle_now / mark_manual_stop / webhook-port already
+              # propagate hard fail in r12; this writer was missed in
+              # the r12 sweep. Same anti-pattern: fallback writes
+              # silently defeat the matrix invariant.
+              if command -v bridge_isolation_v2_write_agent_state_marker >/dev/null 2>&1 \
+                  && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+                  && bridge_isolation_v2_active 2>/dev/null; then
+                bridge_isolation_v2_write_agent_state_marker \
+                  "$agent" "missing-marker-retries" "$retries" \
+                  || return 1
+              else
+                mkdir -p "$(bridge_agent_idle_marker_dir "$agent")"
+                printf '%s\n' "$retries" >"$retries_file"
+              fi
               continue
             fi
           fi

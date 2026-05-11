@@ -36,7 +36,7 @@ bridge_run_apply_v2_umask_if_needed() {
   # not need to be set for a peer UID that no longer exists.
   if bridge_isolation_disabled_by_env; then
     if [[ -n "${BRIDGE_RUN_UMASK_PROBE_FILE:-}" ]]; then
-      umask >"$BRIDGE_RUN_UMASK_PROBE_FILE" 2>/dev/null || true
+      umask 2>/dev/null >"$BRIDGE_RUN_UMASK_PROBE_FILE" || true
     fi
     return 0
   fi
@@ -44,7 +44,7 @@ bridge_run_apply_v2_umask_if_needed() {
     umask 007
   fi
   if [[ -n "${BRIDGE_RUN_UMASK_PROBE_FILE:-}" ]]; then
-    umask >"$BRIDGE_RUN_UMASK_PROBE_FILE" 2>/dev/null || true
+    umask 2>/dev/null >"$BRIDGE_RUN_UMASK_PROBE_FILE" || true
   fi
 }
 
@@ -449,27 +449,89 @@ bridge_run_schedule_dev_channels_accept() {
 }
 
 bridge_run_sync_dev_plugin_cache() {
-  local channels=""
+  # v0.9.7 RC6 (refs #781): the Python linker is now criticality-aware.
+  # Channel-required plugin failures (declared via BRIDGE_AGENT_CHANNELS=
+  # plugin:<id>) must block bridge-start; BRIDGE_AGENT_PLUGINS optional
+  # plugin failures warn and continue. The split is computed here and
+  # passed to Python via --required-channels / --optional-channels.
+  #
+  # Channels passed as --channels remain the union (effective dev
+  # channels), so the linker can sync everything in one pass; the
+  # criticality split only affects logging label (ERROR vs WARNING)
+  # and the Python exit code.
+  #
+  # Returns:
+  #   0 — all channel-required plugins verified (optional warnings OK)
+  #   non-zero — at least one channel-required plugin failed (block)
+  local channels="" required_channels="" optional_csv=""
   local output=""
   local line=""
+  local rc=0
 
   [[ "$ENGINE" == "claude" ]] || return 0
   [[ $SAFE_MODE -eq 0 ]] || return 0
   channels="$(bridge_agent_effective_dev_channels_csv "$AGENT")"
   [[ -n "$channels" ]] || return 0
 
-  if output="$(python3 "$SCRIPT_DIR/bridge-dev-plugin-cache.py" sync --channels "$channels" 2>&1)"; then
-    while IFS= read -r line; do
-      [[ -n "$line" ]] || continue
-      log_line "[dev-plugin-cache] $line"
-    done <<<"$output"
-  else
-    while IFS= read -r line; do
-      [[ -n "$line" ]] || continue
-      log_line "[dev-plugin-cache] $line"
-    done <<<"$output"
-    bridge_warn "development plugin cache sync failed for ${AGENT}"
+  # Required: every plugin: channel from the effective channel set.
+  # These come from BRIDGE_AGENT_CHANNELS — primary-channel config.
+  required_channels="$channels"
+
+  # Optional: BRIDGE_AGENT_PLUGINS allowlist entries (#272). These are
+  # bare plugin ids; qualify them with the agent-bridge marketplace so
+  # the Python comparator (which sees full plugin:<id>@<mkt> strings)
+  # can match. Items already in the channels CSV are also marked
+  # optional here — the Python side takes the lenient declaration as
+  # binding when both lists overlap.
+  optional_csv="$(bridge_agent_plugins_csv "$AGENT" 2>/dev/null || true)"
+  if [[ -n "$optional_csv" ]]; then
+    local _opt_qualified="" _opt_token="" _opt_item=""
+    local IFS_orig="$IFS"
+    IFS=','
+    # shellcheck disable=SC2206 # intentional split on `,`.
+    local -a _opt_arr=( $optional_csv )
+    IFS="$IFS_orig"
+    for _opt_token in "${_opt_arr[@]}"; do
+      _opt_token="${_opt_token## }"
+      _opt_token="${_opt_token%% }"
+      [[ -n "$_opt_token" ]] || continue
+      if [[ "$_opt_token" == *"@"* ]]; then
+        _opt_item="plugin:${_opt_token}"
+      else
+        _opt_item="plugin:${_opt_token}@agent-bridge"
+      fi
+      if [[ -n "$_opt_qualified" ]]; then
+        _opt_qualified+=",$_opt_item"
+      else
+        _opt_qualified="$_opt_item"
+      fi
+    done
+    optional_csv="$_opt_qualified"
   fi
+
+  output="$(python3 "$SCRIPT_DIR/bridge-dev-plugin-cache.py" sync \
+    --channels "$channels" \
+    --required-channels "$required_channels" \
+    --optional-channels "${optional_csv:-}" \
+    --agent "$AGENT" \
+    2>&1)" || rc=$?
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    log_line "[dev-plugin-cache] $line"
+  done <<<"$output"
+
+  if (( rc != 0 )); then
+    # Required-plugin failure — surface with bridge_warn AND propagate
+    # the non-zero exit upstream. bridge-run.sh's caller (bridge-start.sh
+    # via the sudo wrap) needs the non-zero status to block launch per
+    # the Q4 channel-required criticality decision. The legacy code
+    # path swallowed this with `bridge_warn` only and let the launch
+    # continue — which is exactly the silent-failure shape RC6 names.
+    bridge_warn "development plugin cache sync failed for ${AGENT} (channel-required plugin missing/unverified)"
+    return "$rc"
+  fi
+  return 0
 }
 
 bridge_run_safe_mode_resume_hint() {
@@ -551,7 +613,25 @@ while true; do
   local_launch_cmd_display="$(bridge_redact_inline_env_secrets "$LAUNCH_CMD")"
 
   if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
-    bridge_run_sync_dev_plugin_cache
+    # v0.9.7 RC6 (refs #781): channel-required plugin sync failure must
+    # block the launch — the agent is being started for that channel
+    # and an isolated-UID-unreadable cache directory means MCP servers
+    # never surface (which is exactly the silent-failure shape the RC6
+    # bug report names). Optional plugin failures are non-fatal and do
+    # not flip the helper's exit code, so the launch proceeds normally
+    # for them.
+    if ! bridge_run_sync_dev_plugin_cache; then
+      bridge_audit_log state dev_plugin_cache_blocked_launch "$AGENT" \
+        --field reason="channel-required plugin missing or unverified" \
+        >/dev/null 2>&1 || true
+      log_line "[error] aborting launch: channel-required plugin cache failed for ${AGENT}"
+      log_line "[error] repair with: agent-bridge isolation verify --agent ${AGENT}"
+      # Exit non-zero so the sudo wrap (bridge-start.sh:447) propagates
+      # the failure to the operator. Without this, the loop would
+      # continue and the agent would launch missing the very channel it
+      # was started for.
+      exit 65
+    fi
     bridge_ensure_claude_launch_channel_plugins "$AGENT"
     bridge_run_schedule_dev_channels_accept "$LAUNCH_CMD"
     bridge_run_schedule_idle_marker_and_inbox_bootstrap "$previous_session_id"

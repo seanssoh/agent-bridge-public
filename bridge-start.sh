@@ -35,6 +35,26 @@ bridge_start_dev_channels_accept_timeout() {
   printf '%s' "$accept_timeout"
 }
 
+# Time budget for Claude to reach the foreground (i.e. begin presenting its
+# trust/dev-channels prompts) AFTER tmux session creation. The controller
+# watcher arms immediately at tmux-create time, but on a fresh-plugin-cache
+# launch bridge-run.sh first runs bridge_run_sync_dev_plugin_cache for the
+# four configured channels, which can take 3-5 minutes; only then does it
+# exec `claude`. The previous design only had a single 60s prompt-accept
+# budget — so the controller watcher would time out before Claude even
+# started, leaving the trust/dev-channels prompts unanswered and the
+# operator stuck pressing Enter manually. Split budget: this one covers
+# "wait until claude is in the foreground" and is intentionally generous.
+# The existing accept timeout (default 60s) then covers "from foreground
+# to prompt accepted" which is typically <10s.
+bridge_start_dev_channels_claude_foreground_timeout() {
+  local foreground_timeout="${BRIDGE_START_DEV_CHANNELS_CLAUDE_FOREGROUND_TIMEOUT_SECONDS:-600}"
+
+  [[ "$foreground_timeout" =~ ^[0-9]+$ ]] || foreground_timeout=600
+  (( foreground_timeout > 0 )) || foreground_timeout=600
+  printf '%s' "$foreground_timeout"
+}
+
 bridge_start_effective_dev_channels_csv() {
   local agent="$1"
   local suppress_missing="${2:-0}"
@@ -58,22 +78,76 @@ bridge_start_should_controller_accept_dev_channels() {
   [[ -n "$effective" ]]
 }
 
+bridge_start_post_launch_verify() {
+  # Issue #715-C / #714-5: tmux new-session reports success even if the
+  # session dies a few hundred ms later (plugin MCP liveness restart loop,
+  # missing operator config, isolation permission errors). Poll
+  # bridge_tmux_session_exists for a short window and surface a log tail +
+  # remediation hint when the session disappears, so `agb admin` and
+  # `bash bridge-start.sh <agent>` no longer report success on a dead
+  # tmux pane.
+  local session="$1"
+  local agent="$2"
+  local attempts="${BRIDGE_START_VERIFY_POLL_ATTEMPTS:-10}"
+  local interval="${BRIDGE_START_VERIFY_POLL_INTERVAL_SECONDS:-1}"
+  local tail_lines="${BRIDGE_START_VERIFY_LOG_TAIL_LINES:-20}"
+  local i log_dir log_file=""
+
+  [[ "$attempts" =~ ^[0-9]+$ ]] || attempts=10
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=1
+  [[ "$tail_lines" =~ ^[0-9]+$ ]] || tail_lines=20
+  (( attempts > 0 )) || return 0
+  (( interval > 0 )) || interval=1
+
+  # Defensive: if tmux helper isn't loaded for any reason, preserve prior
+  # behaviour (silent skip) rather than spuriously failing healthy starts.
+  declare -F bridge_tmux_session_exists >/dev/null 2>&1 || return 0
+
+  for ((i = 0; i < attempts; i++)); do
+    sleep "$interval"
+    if ! bridge_tmux_session_exists "$session"; then
+      log_dir="$(bridge_agent_log_dir "$agent" 2>/dev/null || true)"
+      if [[ -n "$log_dir" ]]; then
+        log_file="$log_dir/$(date '+%Y%m%d').log"
+      fi
+      bridge_warn "세션 '$session'이 시작 직후 종료되었습니다 (시작 후 $((i + 1)) 회차 polling)."
+      if [[ -n "$log_file" && -r "$log_file" ]]; then
+        printf '[info] 마지막 로그 (%s):\n' "$log_file" >&2
+        tail -n "$tail_lines" "$log_file" >&2 || true
+      else
+        printf '[info] 에이전트 로그를 찾지 못했습니다 (확인 경로: %s)\n' "${log_file:-<unknown>}" >&2
+      fi
+      cat >&2 <<EOF
+[info] 가능한 원인:
+  - daemon 쪽 plugin MCP liveness restart loop
+    (확인: grep "plugin MCP liveness miss" "\$BRIDGE_HOME/state/daemon.log")
+  - operator-config 누락 (예: discord/teams 토큰; agb setup discord / agb setup teams)
+  - workdir 권한 (linux-user isolation; agent workdir 소유권/모드 확인)
+EOF
+      return 1
+    fi
+  done
+  return 0
+}
+
 bridge_start_schedule_dev_channels_accept() {
   local session="$1"
   local agent="$2"
   local accept_timeout=""
+  local foreground_timeout=""
   local log_dir=""
   local logfile="/dev/null"
   local errfile="/dev/null"
 
   accept_timeout="$(bridge_start_dev_channels_accept_timeout)"
+  foreground_timeout="$(bridge_start_dev_channels_claude_foreground_timeout)"
   log_dir="$(bridge_agent_log_dir "$agent")"
   if mkdir -p "$log_dir" 2>/dev/null; then
     logfile="$log_dir/$(date '+%Y%m%d').log"
     errfile="$log_dir/$(date '+%Y%m%d').err.log"
   fi
 
-  echo "[info] controller-side Claude development-channels auto-accept armed for '$session' (timeout=${accept_timeout}s)"
+  echo "[info] controller-side Claude development-channels auto-accept armed for '$session' (foreground=${foreground_timeout}s, accept=${accept_timeout}s)"
   (
     "$BRIDGE_BASH_BIN" -lc '
       set -euo pipefail
@@ -81,7 +155,23 @@ bridge_start_schedule_dev_channels_accept() {
       session="$2"
       agent="$3"
       accept_timeout="$4"
+      foreground_timeout="$5"
       source "$script_dir/bridge-lib.sh"
+      if ! bridge_tmux_session_exists "$session"; then
+        printf "[%s] [warn] controller auto-accept dev-channels skipped: tmux session=%s already gone\n" \
+          "$(date "+%Y-%m-%d %H:%M:%S")" "$session" >&2
+        exit 0
+      fi
+      if ! bridge_tmux_wait_for_claude_foreground "$session" "$foreground_timeout" 2 $((foreground_timeout / 2 + 1)); then
+        if ! bridge_tmux_session_exists "$session"; then
+          printf "[%s] [warn] controller auto-accept dev-channels aborted: tmux session=%s ended before claude foreground (likely plugin-cache or launch failure)\n" \
+            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" >&2
+        else
+          printf "[%s] [warn] controller auto-accept dev-channels timeout waiting for claude foreground on session=%s agent=%s after %ss\n" \
+            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" "$foreground_timeout" >&2
+        fi
+        exit 0
+      fi
       if bridge_tmux_wait_for_prompt "$session" claude "$accept_timeout" 1; then
         printf "[%s] [info] controller auto-accept dev-channels completed on session=%s agent=%s\n" \
           "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
@@ -89,7 +179,7 @@ bridge_start_schedule_dev_channels_accept() {
         printf "[%s] [warn] controller auto-accept dev-channels failed/timeout on session=%s agent=%s\n" \
           "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" >&2
       fi
-    ' -- "$SCRIPT_DIR" "$session" "$agent" "$accept_timeout"
+    ' -- "$SCRIPT_DIR" "$session" "$agent" "$accept_timeout" "$foreground_timeout"
   ) </dev/null >>"$logfile" 2>>"$errfile" &
 }
 
@@ -174,8 +264,42 @@ CHANNEL_REASON=""
 AGENT_ENV_FILE=""
 
 if [[ ! -d "$WORK_DIR" ]]; then
+  # Two auto-rebuild paths cover the post-migration "workdir vanished"
+  # gap from #714 (item 10 — `patch-dev` static-role with no workdir
+  # tree at all). #4 in the per-symptom table:
+  #   - DEFAULT_WORK_DIR: legacy default home path. Plain mkdir.
+  #   - v2 canonical: $BRIDGE_AGENT_ROOT_V2/<agent>/workdir. Same
+  #     identity as the just-resolved $WORK_DIR for static roles, but
+  #     under v2 the parent (`<root>/agents/<agent>/`) may be
+  #     root-owned, so fall back to bridge_linux_sudo_root.
+  # Anything else (operator-supplied --workdir to a dynamic agent,
+  # roster-explicit non-default path on a v2-disabled install) keeps
+  # the original die behavior: we don't want to silently materialize
+  # directories the operator named by mistake.
+  #
+  # Direct prefix-string comparison against $BRIDGE_AGENT_ROOT_V2 is
+  # used instead of re-invoking bridge_agent_workdir() — that helper
+  # falls through to BRIDGE_AGENT_WORKDIR[<agent>] (an external path)
+  # when v2 is not active, which would cause $WORK_DIR to compare
+  # equal to itself and erroneously skip the die branch on v2-disabled
+  # installs (codex r2 finding).
   if [[ "$WORK_DIR" == "$DEFAULT_WORK_DIR" ]]; then
     mkdir -p "$WORK_DIR"
+  elif [[ -n "$BRIDGE_AGENT_ROOT_V2" && "$WORK_DIR" == "$BRIDGE_AGENT_ROOT_V2/$AGENT/workdir" ]]; then
+    echo "[info] '$AGENT' static workdir 누락, 자동 재생성: $WORK_DIR"
+    if ! mkdir -p "$WORK_DIR" 2>/dev/null; then
+      # v2 isolated layout: the parent agent root may be root-owned
+      # (`<data-root>/agents/<agent>/` mode 0750 root:root) so the
+      # controller user cannot mkdir the workdir leaf directly. Reuse
+      # the existing sudo-handoff helper from lib/bridge-agents.sh
+      # (no new helper introduced — Track B owns sudo-handoff helper
+      # surface).
+      bridge_linux_sudo_root mkdir -p "$WORK_DIR" || \
+        bridge_die "workdir 자동 재생성 실패: $WORK_DIR"
+    fi
+    if [[ ! -d "$WORK_DIR" ]]; then
+      bridge_die "workdir 자동 재생성 후에도 존재하지 않음: $WORK_DIR"
+    fi
   else
     bridge_die "workdir가 없습니다: $WORK_DIR"
   fi
@@ -446,6 +570,14 @@ if [[ -z "$(bridge_agent_session_id "$AGENT")" ]]; then
   bridge_refresh_agent_session_id "$AGENT" 12 0.25 >/dev/null 2>&1 || true
 fi
 echo "[info] 세션 '$SESSION' 시작 완료"
+
+# Issue #715-C / #714-5: short post-launch has-session polling so a session
+# that dies inside the first few seconds (e.g. daemon restart loop on an
+# unconfigured plugin MCP, isolation permission failure) is surfaced with
+# a log tail and remediation hint instead of a silent success.
+if ! bridge_start_post_launch_verify "$SESSION" "$AGENT"; then
+  exit 1
+fi
 
 if [[ $ATTACH -eq 1 ]]; then
   bridge_attach_tmux_session "$SESSION"

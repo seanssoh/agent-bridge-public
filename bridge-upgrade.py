@@ -155,6 +155,24 @@ def read_source_version(source_root: Path) -> str:
     return version or "0.0.0-dev"
 
 
+def read_target_version(target_root: Path) -> str:
+    """Read the live install's `VERSION` file, mirror of `read_source_version`.
+
+    Returns "" when the file is missing or empty so callers can distinguish
+    "no live VERSION recorded" (fresh / corrupt install) from a real
+    semver string. Issue #666: used by `analyze_live` to recover from a
+    missing/unreachable `base_ref` on a real cross-version upgrade by
+    treating content-drifted files as `upstream_only` instead of
+    `unknown_base_live_diff` (which silently keeps live and never copies).
+    """
+    version_path = target_root / "VERSION"
+    try:
+        version = version_path.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (FileNotFoundError, IndexError, OSError):
+        return ""
+    return version
+
+
 def load_json_arg(value: str = "", file_path: str = "") -> dict[str, Any]:
     if file_path:
         return json.loads(Path(file_path).read_text(encoding="utf-8"))
@@ -1185,6 +1203,14 @@ def create_daily_backup_archive(
         with contextlib.suppress(FileNotFoundError):
             tmp_path.unlink()
 
+        # Issue #785: under v0.9.7 unified isolation, files inside
+        # `agents/<X>/` are owned by `agent-bridge-<X>:ab-agent-<X>` with
+        # `0640/0700`. The controller (`ec2-user`) can `readdir` the parent
+        # (2750 SetGID) but cannot `open` the inner files. Without a
+        # per-member catch the first EACCES aborts the whole archive after
+        # writing 0 bytes. Mirrors the `agent_migration` PermissionError
+        # pattern (above) — accumulate skip records, surface in JSON.
+        skipped_isolated: list[dict[str, str]] = []
         try:
             with tarfile.open(
                 tmp_path, "w:gz", format=tarfile.PAX_FORMAT, dereference=False
@@ -1196,22 +1222,49 @@ def create_daily_backup_archive(
                         stat_result = os.lstat(src_path)
                     except FileNotFoundError:
                         continue
+                    except PermissionError:
+                        skipped_isolated.append({"path": str(src_path), "stage": "lstat"})
+                        continue
                     if S_ISSOCK(stat_result.st_mode) or S_ISFIFO(stat_result.st_mode):
                         continue
-                    archive.add(src_path, arcname=arcname, recursive=False)
+                    try:
+                        archive.add(src_path, arcname=arcname, recursive=False)
+                    except PermissionError:
+                        skipped_isolated.append({"path": str(src_path), "stage": "add"})
+                        continue
+                    except OSError as exc:
+                        # CPython usually raises PermissionError, but
+                        # tarfile.add may surface raw OSError(EACCES) for
+                        # certain paths; treat both as the same isolation
+                        # boundary.
+                        if exc.errno == errno.EACCES:
+                            skipped_isolated.append({"path": str(src_path), "stage": "add"})
+                            continue
+                        raise
 
                 # Explicitly add today's snapshot dumps. The walk excluded
                 # state/backup-snapshots/ so prior days' dumps don't bloat
-                # this archive.
+                # this archive. Snapshots are written by the controller so
+                # EACCES is unlikely, but defend symmetrically with the main
+                # loop in case a future snapshot path becomes isolated.
                 for entry in snapshots:
                     snap_path = Path(entry["snapshot_path"])
                     if not snap_path.exists():
                         continue
-                    archive.add(
-                        snap_path,
-                        arcname=entry["snapshot_relpath"],
-                        recursive=False,
-                    )
+                    try:
+                        archive.add(
+                            snap_path,
+                            arcname=entry["snapshot_relpath"],
+                            recursive=False,
+                        )
+                    except PermissionError:
+                        skipped_isolated.append({"path": str(snap_path), "stage": "add_snapshot"})
+                        continue
+                    except OSError as exc:
+                        if exc.errno == errno.EACCES:
+                            skipped_isolated.append({"path": str(snap_path), "stage": "add_snapshot"})
+                            continue
+                        raise
         except OSError as exc:
             with contextlib.suppress(FileNotFoundError):
                 tmp_path.unlink()
@@ -1245,6 +1298,18 @@ def create_daily_backup_archive(
             result["archive_bytes"] = archive_path.stat().st_size
         except FileNotFoundError:
             result["archive_bytes"] = 0
+        if skipped_isolated:
+            # Bound the path list so operator JSON stays grep-able even when
+            # an isolated agent home has thousands of files (e.g. venv).
+            result["skipped_isolated_count"] = len(skipped_isolated)
+            if len(skipped_isolated) <= 60:
+                result["skipped_isolated"] = skipped_isolated
+            else:
+                result["skipped_isolated"] = (
+                    skipped_isolated[:50]
+                    + [{"path": "...", "stage": "truncated"}]
+                    + skipped_isolated[-10:]
+                )
         return result
 
 
@@ -1373,6 +1438,35 @@ def analyze_live(source_root: Path, target_root: Path, base_ref: str) -> dict[st
         "mode_drift": 0,
     }
 
+    # Issue #666: when the source release ref differs from the live VERSION
+    # (a real cross-version upgrade) but `base_ref` could not be resolved
+    # / its commit is unreachable in this source clone, the previous
+    # classifier sent every content-drifted file to `unknown_base_live_diff`
+    # → `keep_live` and copied 0 files. Result: rc=0 + installed metadata
+    # bumped + live runtime stayed on the prior version (silent failed
+    # upgrade). Compute the version-mismatch flag once up-front so per-file
+    # classification can fall back to `upstream_only` (deploy_upstream)
+    # when there is no usable `base` *and* we know upstream is a different
+    # release — preserving the "rerun same version → keep operator edits"
+    # contract by gating on the version mismatch, not just on `base is None`.
+    source_version = read_source_version(source_root)
+    target_version = read_target_version(target_root)
+    # `read_source_version` falls back to the dev sentinel "0.0.0-dev" when
+    # the source checkout has no `VERSION` file (a dev clone, not a real
+    # release). Treating that as a real version would flip every
+    # content-drifted file to `upstream_only` on a same-version rerun from
+    # a dev clone, force-deploying over operator edits. Treat the sentinel
+    # as "unknown" for `versions_differ` only; do NOT change the function's
+    # return value because other callers (payload["version"], the
+    # `--version` default in cmd_perform_replace) still need a non-empty
+    # string.
+    versions_differ = (
+        bool(source_version)
+        and bool(target_version)
+        and source_version != target_version
+        and source_version != "0.0.0-dev"
+    )
+
     for relpath in tracked_files(source_root):
         if should_skip_relpath(relpath):
             continue
@@ -1410,8 +1504,20 @@ def analyze_live(source_root: Path, target_root: Path, base_ref: str) -> dict[st
                 classification = "unchanged"
                 strategy = "noop"
         elif not base_ref or base is None:
-            classification = "unknown_base_live_diff"
-            strategy = "keep_live"
+            # Issue #666: no usable base for this file. If the source
+            # release ref is a different version from the live install,
+            # treat as a forward-rolling upgrade and deploy upstream
+            # (release-shipped files like VERSION, bridge-upgrade.py,
+            # lib/bridge-isolation-v2*.sh must actually land). On a
+            # same-version rerun (e.g. re-applying v0.8.3 over v0.8.3
+            # without recorded base_ref), keep_live still wins —
+            # operator-edited content is preserved.
+            if versions_differ:
+                classification = "upstream_only"
+                strategy = "deploy_upstream"
+            else:
+                classification = "unknown_base_live_diff"
+                strategy = "keep_live"
         elif base == live:
             classification = "upstream_only"
             strategy = "deploy_upstream"
@@ -2017,6 +2123,13 @@ def cmd_daily_backup_live(args: argparse.Namespace) -> int:
         payload["archive_bytes"] = result["archive_bytes"]
     if "error_detail" in result:
         payload["error_detail"] = result["error_detail"]
+    # Issue #785: surface per-member EACCES skips so operators can see what
+    # was excluded from the archive instead of treating a partial-but-created
+    # outcome as a silent success.
+    if "skipped_isolated_count" in result:
+        payload["skipped_isolated_count"] = result["skipped_isolated_count"]
+    if "skipped_isolated" in result:
+        payload["skipped_isolated"] = result["skipped_isolated"]
 
     if result["outcome"] == "created":
         payload["created"] = True

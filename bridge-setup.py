@@ -10,6 +10,7 @@ import json
 import os
 import re
 import socket
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -109,6 +110,176 @@ def load_dotenv(path: Path) -> dict[str, str]:
     return payload
 
 
+def _parse_dotenv_text(text: str) -> dict[str, str]:
+    payload: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        payload[key.strip()] = value.strip()
+    return payload
+
+
+def _isolated_workdir_owner(path: Path) -> str | None:
+    # Mirror of bridge-hooks.py `_isolated_workdir_owner` (#714 / #694
+    # family). bridge-setup.py runs as the controller user during
+    # `agent-bridge setup teams|telegram|discord <agent>` recovery; when
+    # the plugin state files (`.teams/.env`, `.telegram/.env`,
+    # `.discord/.env`) are owned by an isolated `agent-bridge-<slug>` UID
+    # in 0600 mode, the controller's `.env` read raises PermissionError
+    # before the recovery flow can reach `save_text` (#737 Q5). We fall
+    # back to `sudo -n -u <agent-user> cat` for the read; this helper
+    # picks the target user from the path's filesystem owner. Returns
+    # None on non-Linux hosts and for non-isolated paths so the
+    # fallback-only callers stay no-ops on dev machines.
+    if sys.platform != "linux":
+        return None
+    try:
+        stat_result = path.lstat()
+    except OSError:
+        return None
+    try:
+        import pwd
+
+        owner = pwd.getpwuid(stat_result.st_uid).pw_name
+    except (KeyError, ImportError):
+        return None
+    if stat_result.st_uid == os.getuid():
+        return None
+    if not owner.startswith("agent-bridge-"):
+        return None
+    return owner
+
+
+def _sudo_run_as(os_user: str, *cmd: str) -> subprocess.CompletedProcess[str]:
+    # Mirror of bridge-hooks.py `_sudo_run_as` (#714 / #694 family);
+    # captures stdout/stderr so callers (`_safe_read_env`) can parse
+    # the output instead of just inspecting the rc.
+    full = ["sudo", "-n", "-u", os_user, *cmd]
+    try:
+        return subprocess.run(full, check=False, capture_output=True, text=True)
+    except FileNotFoundError:
+        # sudo missing — non-Linux dev hosts don't ship it. Mirror
+        # bridge-hooks.py: emit a one-line warn and synthesize a
+        # non-zero CompletedProcess so the caller surfaces the original
+        # PermissionError shape rather than a confusing FileNotFoundError.
+        print(
+            f"[bridge-setup] sudo not available; cannot escalate to "
+            f"'{os_user}' for {cmd}",
+            file=sys.stderr,
+        )
+        return subprocess.CompletedProcess(args=full, returncode=127, stdout="", stderr="")
+
+
+def _safe_path_check(check: str, path: Path, os_user: str | None) -> bool:
+    """PermissionError-safe filesystem predicate for isolated plugin state.
+
+    Mirror of bridge-hooks.py `_safe_path_check` (PR #718 r2). On
+    isolated installs, `path.exists()` may raise PermissionError before
+    `load_dotenv`/`load_json` ever run (e.g. when the plugin dir's
+    parent is mode 0700 owned by the agent user, leaving the controller
+    without `+x` traversal). Falls back to `sudo -n -u <agent-user>
+    test -e/-h <path>` so the controller can still detect "exists" and
+    take the recovery path. `os_user=None` (non-Linux / non-isolated)
+    re-raises so callers preserve the original error shape.
+    """
+    try:
+        if check == "exists":
+            return path.exists()
+        if check == "is_symlink":
+            return path.is_symlink()
+    except PermissionError:
+        if os_user is None:
+            raise
+        flag = "-e" if check == "exists" else "-h"
+        result = _sudo_run_as(os_user, "test", flag, str(path))
+        return result.returncode == 0
+    return False
+
+
+def _safe_read_env(path: Path) -> dict[str, str]:
+    """PermissionError-safe `load_dotenv` for isolated plugin `.env` files.
+
+    On a linux-user-isolated install, `agents/<agent>/workdir/.teams/.env`
+    (and equivalents for telegram/discord) is `agent-bridge-<slug>:agent-group
+    0600`. `agent-bridge setup teams <agent>` runs as the controller and
+    its inspect_*_dir → load_dotenv → path.read_text() raises
+    PermissionError before the recovery flow can rewrite the file —
+    the documented recovery primitive cannot run on a file that exists
+    but is owner-only (#737 Q5).
+
+    Strategy mirrors PR #718 family: try direct read first (covers
+    non-isolated installs and macOS dev hosts), then fall back to
+    `sudo -n -u <agent-user> cat <path>` and parse the captured stdout
+    with the same dotenv schema as `load_dotenv`. The metadata probe
+    (`exists`) is also wrapped because the parent dir may itself be
+    0700 owned by the agent user. Returns `{}` when the path doesn't
+    exist (matches `load_dotenv`); re-raises the original PermissionError
+    when no isolated owner can be identified (non-Linux, non-isolated,
+    or sudo unavailable) so the caller surfaces the same error shape it
+    had before.
+    """
+    os_user = _isolated_workdir_owner(path) or _isolated_workdir_owner(path.parent)
+    if not _safe_path_check("exists", path, os_user):
+        return {}
+    try:
+        return load_dotenv(path)
+    except PermissionError as exc:
+        if os_user is None:
+            raise
+        result = _sudo_run_as(os_user, "cat", str(path))
+        rc = result.returncode
+        if rc == 127:
+            raise PermissionError(
+                f"sudo not available; cannot read {path} as {os_user}. "
+                f"Recovery requires either installing sudo or running this "
+                f"command directly as {os_user}."
+            ) from exc
+        if rc != 0:
+            raise PermissionError(
+                f"sudo cat failed for {path} as {os_user} (rc={rc})"
+            ) from exc
+        return _parse_dotenv_text(result.stdout)
+
+
+def _safe_load_json(path: Path, default: Any) -> Any:
+    """PermissionError-safe `load_json` for isolated plugin state files.
+
+    Companion to `_safe_read_env` for `access.json` / `state.json` that
+    live alongside the `.env` in the same isolated plugin dir. Falls
+    back to `sudo -n -u <agent-user> cat` and `json.loads` when the
+    direct read fails. Returns `default` for missing files (matches
+    `load_json`) or when the sudo fallback succeeds but the body is
+    not valid JSON (best-effort — recovery flow rebuilds the doc from
+    operator input).
+    """
+    os_user = _isolated_workdir_owner(path) or _isolated_workdir_owner(path.parent)
+    if not _safe_path_check("exists", path, os_user):
+        return default
+    try:
+        return load_json(path, default)
+    except PermissionError as exc:
+        if os_user is None:
+            raise
+        result = _sudo_run_as(os_user, "cat", str(path))
+        rc = result.returncode
+        if rc == 127:
+            raise PermissionError(
+                f"sudo not available; cannot read {path} as {os_user}. "
+                f"Recovery requires either installing sudo or running this "
+                f"command directly as {os_user}."
+            ) from exc
+        if rc != 0:
+            raise PermissionError(
+                f"sudo cat failed for {path} as {os_user} (rc={rc})"
+            ) from exc
+        try:
+            return json.loads(result.stdout or "null") or default
+        except json.JSONDecodeError:
+            return default
+
+
 def normalize_id_list(values: list[str] | tuple[str, ...] | None, label: str) -> list[str]:
     results: list[str] = []
     seen: set[str] = set()
@@ -183,8 +354,13 @@ def prompt_yes_no(prompt: str, default: bool) -> bool:
 def inspect_discord_dir(discord_dir: Path) -> dict[str, Any]:
     env_path = discord_dir / ".env"
     access_path = discord_dir / "access.json"
-    env = load_dotenv(env_path)
-    access_payload = load_json(access_path, {})
+    # #737 Q5: isolated agent's `.env` is `agent-bridge-<slug>:agent-group
+    # 0600`; controller-side `load_dotenv` raises PermissionError before
+    # `agent-bridge setup discord <agent>` can recover. `_safe_read_env`
+    # / `_safe_load_json` fall back to `sudo -n -u <agent-user> cat` on
+    # Linux isolated installs; no-op on non-Linux dev hosts.
+    env = _safe_read_env(env_path)
+    access_payload = _safe_load_json(access_path, {})
     groups = access_payload.get("groups") or {}
     channels = [str(channel_id) for channel_id in groups.keys() if str(channel_id).strip()]
     allow_from = normalize_id_list(access_payload.get("allowFrom") or [], "allow_from")
@@ -288,8 +464,9 @@ def candidate_channel_accounts(agent: str, accounts: dict[str, dict[str, Any]]) 
 def inspect_telegram_dir(telegram_dir: Path) -> dict[str, Any]:
     env_path = telegram_dir / ".env"
     access_path = telegram_dir / "access.json"
-    env = load_dotenv(env_path)
-    access_payload = load_json(access_path, {})
+    # #737 Q5: see inspect_discord_dir.
+    env = _safe_read_env(env_path)
+    access_payload = _safe_load_json(access_path, {})
     allow_from = normalize_id_list(access_payload.get("allowFrom") or [], "allow_from")
     default_chat = str(access_payload.get("defaultChatId") or "").strip()
     return {
@@ -306,9 +483,13 @@ def inspect_teams_dir(teams_dir: Path) -> dict[str, Any]:
     env_path = teams_dir / ".env"
     access_path = teams_dir / "access.json"
     state_path = teams_dir / "state.json"
-    env = load_dotenv(env_path)
-    access_payload = load_json(access_path, {})
-    state_payload = load_json(state_path, {})
+    # #737 Q5: see inspect_discord_dir. This is the path called out in
+    # the issue body — `bridge-setup.py:inspect_teams_dir → load_dotenv`
+    # was the first observed PermissionError on the documented recovery
+    # primitive (`agent-bridge setup teams <agent>`).
+    env = _safe_read_env(env_path)
+    access_payload = _safe_load_json(access_path, {})
+    state_payload = _safe_load_json(state_path, {})
     groups = access_payload.get("groups") or {}
     conversations = [str(key) for key in groups.keys() if str(key).strip()]
     allow_from = normalize_teams_id_list(access_payload.get("allowFrom") or [], "allow_from")

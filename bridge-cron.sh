@@ -1009,7 +1009,7 @@ run_sync() {
         if [[ -n "${BRIDGE_CRON_RUN_ARTIFACTS_OLDER_THAN_DAYS:-}" ]]; then
           rga_args+=(--older-than-days "$BRIDGE_CRON_RUN_ARTIFACTS_OLDER_THAN_DAYS")
         fi
-        bridge_cron_python "${rga_args[@]}" >"$tmp_dir/native-run-artifacts-cleanup.json" 2>/dev/null || true
+        bridge_cron_python "${rga_args[@]}" 2>/dev/null >"$tmp_dir/native-run-artifacts-cleanup.json" || true
       fi
     fi
   fi

@@ -22,7 +22,24 @@ export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
 # Always clear the bypass at exit so a crashed / interrupted upgrade
 # can never leave the env in a state that disarms the resolver for
 # subsequent shells in the same process tree.
-trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
+# Issue #682: emit a JSON failure envelope on stdout when --json is set
+# and the script is exiting non-zero without having already emitted JSON
+# (bridge_die, set -e abort, external helper rc!=0). The emit body is
+# defined later (`bridge_upgrade_emit_failure_json`); the trap is
+# installed up here so very-early bridge_die calls (option parsing, dirty
+# source check) still produce a JSON envelope when --json was passed.
+_bridge_upgrade_exit_handler() {
+  local rc=$?
+  unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID
+  if [[ $rc -ne 0 \
+        && "${JSON:-0}" == "1" \
+        && "${_BRIDGE_UPGRADE_JSON_EMITTED:-0}" != "1" ]] \
+      && declare -F bridge_upgrade_emit_failure_json >/dev/null 2>&1; then
+    bridge_upgrade_emit_failure_json "$rc" || true
+  fi
+  return "$rc"
+}
+trap _bridge_upgrade_exit_handler EXIT
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 # shellcheck source=lib/bridge-cleanup.sh
@@ -60,6 +77,37 @@ SOURCE_REF=""
 SOURCE_HEAD=""
 SOURCE_RECLASSIFY_JSON='{}'
 SHARED_SETTINGS_RERENDER_JSON='{"mode":"skipped","count":0,"failed_count":0,"candidates":[]}'
+ISOLATION_V2_MIGRATION_JSON=""
+
+# Issue #752 W3d (M10/M11/M12): partial-failure surfacing for late
+# upgrade subsystems (shared rerender / channel-policy refresh / profile
+# relink). Each site appends a stable name when its post-step probe
+# reports failures so the final --json envelope can emit
+# `status:"partial"` with `partial_failures:[...]`. These are not
+# upgrade-fatal — operators must see them, but the rest of the upgrade
+# (daemon restart, [upgrade-complete] task, etc.) still runs. Mirrors the
+# post-#754 `apply_for_upgrade` consumer pattern (see
+# lib/bridge-isolation-v2-migrate.sh:1709).
+_upgrade_partial_failures=()
+
+# Issue #682: every exit path from `apply` must emit a single valid JSON
+# document on stdout when --json is set. The success/dry-run paths emit
+# at the bottom of the script (search for `mode": "upgrade"`); the
+# bridge_die / set -e / external-helper-rc!=0 paths previously dropped
+# straight to text on stderr and an empty stdout, breaking the contract
+# for programmatic operators (issue #682 Finding 1, surfaced by the
+# v0.7.7 → v0.8.4 OrbStack VM E2E retest, task #4195 Scenario C).
+#
+# `_BRIDGE_UPGRADE_JSON_EMITTED` flips to 1 once the success-path
+# envelope prints; the EXIT trap emits a `rc != 0 + error{...}` envelope
+# only when the flag is still 0. `_BRIDGE_UPGRADE_DIE_REASON` /
+# `_BRIDGE_UPGRADE_DIE_DETAIL` / `_BRIDGE_UPGRADE_DIE_REMEDIATION` are
+# populated by the migration block so the emitted envelope carries
+# actionable detail rather than just "rc=1".
+_BRIDGE_UPGRADE_JSON_EMITTED=0
+_BRIDGE_UPGRADE_DIE_REASON=""
+_BRIDGE_UPGRADE_DIE_DETAIL=""
+_BRIDGE_UPGRADE_DIE_REMEDIATION=""
 
 usage() {
   cat <<EOF
@@ -80,6 +128,97 @@ The repo checkout remains source of truth for core code. Live-only operator chan
 When run from an installed live copy without --source, the last recorded source checkout is reused and pulled automatically.
 Default channel is stable: the latest vX.Y.Z tag is used when one exists. Use --channel dev to track main, or --channel current/--source to deploy the current checkout.
 EOF
+}
+
+# Issue #682: emit a single valid JSON envelope on stdout when --json is
+# set and the script is exiting non-zero before the success/dry-run JSON
+# emission point. Idempotent: the EXIT trap calls this only when
+# `_BRIDGE_UPGRADE_JSON_EMITTED` is still 0. Best-effort: any internal
+# failure falls back to a hardcoded minimal envelope so the caller
+# always gets parseable JSON.
+#
+# Args:
+#   $1  exit code (rc)
+bridge_upgrade_emit_failure_json() {
+  local rc="${1:-1}"
+  local reason="${_BRIDGE_UPGRADE_DIE_REASON:-}"
+  local detail="${_BRIDGE_UPGRADE_DIE_DETAIL:-}"
+  local remediation="${_BRIDGE_UPGRADE_DIE_REMEDIATION:-}"
+  if [[ -z "$reason" ]]; then
+    reason="upgrade aborted (rc=${rc})"
+  fi
+  if [[ -z "$detail" ]]; then
+    detail="agent-bridge upgrade exited with rc=${rc} before reaching the success/dry-run JSON emission point. See stderr for the textual error."
+  fi
+  if [[ -z "$remediation" ]]; then
+    remediation="re-run with --json --dry-run to inspect the planned changes; consult agent-bridge logs / stderr for the underlying failure."
+  fi
+  # Pass values via argv (escapes safely for any input — newlines, quotes,
+  # unicode). Empty strings are forwarded as-is and rendered as null in the
+  # envelope when the corresponding bash var was empty.
+  if ! python3 - \
+        "$rc" \
+        "$reason" \
+        "$detail" \
+        "$remediation" \
+        "${SOURCE_VERSION:-}" \
+        "${SOURCE_ROOT:-}" \
+        "${SOURCE_REF:-}" \
+        "${SOURCE_HEAD:-}" \
+        "${TARGET_ROOT:-}" \
+        "${CHANNEL:-}" \
+        "${TARGET_REF:-}" \
+        "${TARGET_VERSION:-}" \
+        "${TARGET_HEAD:-}" \
+        "${DRY_RUN:-0}" \
+        "${ISOLATION_V2_MIGRATION_JSON:-}" \
+        <<'PY' 2>/dev/null
+import json, sys
+
+(rc, reason, detail, remediation,
+ source_version, source_root, source_ref, source_head,
+ target_root, channel, target_ref, target_version, target_head,
+ dry_run, iso_v2_json) = sys.argv[1:16]
+
+def _or_none(s):
+    return s if s else None
+
+def _load_json_str(s):
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except (ValueError, TypeError):
+        return {"_raw": s, "_parse_error": True}
+
+payload = {
+    "mode": "upgrade",
+    "rc": int(rc),
+    "error": {
+        "reason": reason,
+        "detail": detail,
+        "remediation": remediation,
+    },
+    "version": _or_none(source_version),
+    "source_root": _or_none(source_root),
+    "source_ref": _or_none(source_ref),
+    "source_head": _or_none(source_head),
+    "target_root": _or_none(target_root),
+    "channel": _or_none(channel),
+    "target_ref": _or_none(target_ref),
+    "target_version": _or_none(target_version),
+    "target_head": _or_none(target_head),
+    "dry_run": dry_run == "1",
+    "isolation_v2_migration": _load_json_str(iso_v2_json),
+}
+print(json.dumps(payload, ensure_ascii=False, indent=2))
+PY
+  then
+    # Fallback: minimal hand-rolled JSON if python invocation fails
+    # entirely. Operators still get a parseable envelope.
+    printf '{"mode":"upgrade","rc":%d,"error":{"reason":"emit-helper-failed","detail":"python3 emission of bridge_upgrade_emit_failure_json failed","remediation":"inspect bridge-upgrade stderr"}}\n' "$rc"
+  fi
+  _BRIDGE_UPGRADE_JSON_EMITTED=1
 }
 
 bridge_upgrade_version_from_file() {
@@ -1228,6 +1367,13 @@ EOF
   _migrate_rc=$?
   set -e
   if [[ $_migrate_rc -ne 0 ]]; then
+    # Issue #682: populate structured failure fields so the EXIT trap's
+    # --json emit carries actionable detail (apply-live did NOT run at
+    # this point; live VERSION + installed_version both still match the
+    # pre-upgrade state).
+    _BRIDGE_UPGRADE_DIE_REASON="isolation-v2 migration failed (rc=${_migrate_rc})"
+    _BRIDGE_UPGRADE_DIE_DETAIL="${ISOLATION_V2_MIGRATION_JSON}"
+    _BRIDGE_UPGRADE_DIE_REMEDIATION="see ${TARGET_ROOT}/state/migration/isolation-v2/last-error.json; apply-live did NOT run, safe to retry after fix"
     bridge_die "isolation-v2 migration failed during upgrade
   rc=${_migrate_rc}
   detail: ${ISOLATION_V2_MIGRATION_JSON}
@@ -1268,6 +1414,34 @@ if [[ $STRICT_MERGE -eq 1 ]]; then
   apply_args+=(--strict-merge)
 fi
 APPLY_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${apply_args[@]}")"
+
+# Issue #682 Finding 2: advance the `installed_version` / `installed_ref`
+# / `installed_head` metadata atomically with the live VERSION write.
+# apply-live above writes the live VERSION file (plus every other tracked
+# release file) by treating it as a normal text merge target; subsequent
+# steps (shared-settings rerender, migrate-agents, daemon restart) can
+# fail under `set -e` after VERSION has already advanced. write-state
+# previously sat at the very end of the apply path, which produced the
+# observed "live VERSION=0.8.4 + installed_version=0.7.7" mismatch when a
+# downstream helper exited non-zero. Running it here pins the invariant:
+# if the live VERSION file moved, last-upgrade.json moved with it. The
+# call is itself a single small JSON write (state/upgrade/last-upgrade.json)
+# and is safe to re-run — re-invoking the upgrader idempotently re-writes
+# the same payload.
+if [[ $DRY_RUN -eq 0 ]]; then
+  _write_state_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-state-json.XXXXXX")"
+  printf '%s' "$ANALYSIS_JSON" >"$_write_state_payload_dir/analysis.json"
+  python3 "$SOURCE_ROOT/bridge-upgrade.py" write-state \
+    --source-root "$SOURCE_ROOT" \
+    --target-root "$TARGET_ROOT" \
+    --backup-root "$BACKUP_ROOT" \
+    --analysis-json-file "$_write_state_payload_dir/analysis.json" \
+    --version "$SOURCE_VERSION" \
+    --source-ref "$SOURCE_REF" \
+    --channel "$CHANNEL" >/dev/null
+  rm -rf "$_write_state_payload_dir"
+fi
+
 AGENT_RESTART_JSON="$(bridge_upgrade_agent_restart_json "" 0 "$DRY_RUN")"
 
 if [[ $DRY_RUN -eq 0 ]]; then
@@ -1277,15 +1451,31 @@ if [[ $DRY_RUN -eq 0 ]]; then
   set -e
   if [[ $_shared_settings_rerender_rc -ne 0 ]]; then
     echo "[bridge-upgrade] WARN: shared Claude settings rerender reported failures" >&2
+    _upgrade_partial_failures+=("shared_rerender")
   fi
   if ! python3 - "$SHARED_SETTINGS_RERENDER_JSON" <<'PY'
 import json
 import sys
-payload = json.loads(sys.argv[1])
+# Issue #731: empty/non-JSON payload happens when an isolated agent's
+# canonical_dir lookup fails (controller can't traverse mode-2750 workdir)
+# and the rerender helper hands back nothing for that agent. Treat it as
+# a non-fatal skip with a named diagnostic instead of dumping a raw
+# JSONDecodeError traceback into the upgrade log.
+raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+if not raw:
+    print("[bridge-upgrade] WARN: shared-settings rerender returned empty payload (likely isolated agent canonical_dir failure — see #731)", file=sys.stderr)
+    sys.exit(0)
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError as exc:
+    print(f"[bridge-upgrade] WARN: shared-settings rerender returned non-JSON payload: {exc}", file=sys.stderr)
+    print(f"[bridge-upgrade] payload preview: {raw[:200]!r}", file=sys.stderr)
+    sys.exit(0)
 raise SystemExit(0 if int(payload.get("failed_count") or 0) == 0 else 1)
 PY
   then
     echo "[bridge-upgrade] WARN: shared Claude settings rerender verification failed for one or more agents" >&2
+    _upgrade_partial_failures+=("shared_rerender")
   fi
 fi
 
@@ -1442,9 +1632,74 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   if [[ $DRY_RUN -eq 1 ]]; then
     policy_args+=(--dry-run)
   fi
-  bridge_upgrade_with_target_env "$TARGET_ROOT" \
-    "$BRIDGE_BASH_BIN" "$SOURCE_ROOT/scripts/apply-channel-policy.sh" "${policy_args[@]}" \
-    >/dev/null 2>&1 || true
+  if ! bridge_upgrade_with_target_env "$TARGET_ROOT" \
+      "$BRIDGE_BASH_BIN" "$SOURCE_ROOT/scripts/apply-channel-policy.sh" "${policy_args[@]}" \
+      >/dev/null 2>&1; then
+    # post-#759 (Wave-2 M5) `apply-channel-policy.sh` exits non-zero on
+    # all-fail. Surface the signal so operators see "singleton plugins
+    # may be misrouted" instead of the silent `|| true` swallow.
+    echo "[bridge-upgrade] WARN: channel-policy refresh failed (apply-channel-policy.sh exited non-zero) — singleton plugins may be misrouted" >&2
+    _upgrade_partial_failures+=("channel_policy_refresh")
+  fi
+fi
+
+# Issue #730 — repair v0.8 layout shared-doc/skill profile symlinks. Pre-v0.8
+# installs created links like `agents/<agent>/workdir/COMMON-INSTRUCTIONS.md ->
+# ../shared/COMMON-INSTRUCTIONS.md` that resolve to a non-existent path after
+# the home/workdir split. `bridge-hooks.py relink-profile-paths` re-resolves
+# each known link site to the correct relative target and replaces only the
+# broken ones (real files are skipped, no clobber). Runs before daemon
+# restart so the next session sees the corrected profile view immediately.
+# Skipped on --dry-run; failures are non-fatal (warn only) so an unexpected
+# error in the relinker never blocks the upgrade.
+RELINK_PROFILE_JSON='{"mode":"skipped","count":0}'
+if [[ $DRY_RUN -eq 0 ]]; then
+  RELINK_PROFILE_JSON="$(python3 "$TARGET_ROOT/bridge-hooks.py" relink-profile-paths --all-agents --json --bridge-home "$TARGET_ROOT" 2>&1 || true)"
+  # Issue #752 W3d M12: capture relink failed_count separately so a
+  # non-zero count surfaces as `partial_failures.profile_relink` in the
+  # final JSON envelope. The summary heredoc below still runs (with
+  # `|| true`) for the operator-facing log line.
+  _profile_relink_failed_count="$(printf '%s' "$RELINK_PROFILE_JSON" | python3 -c '
+import json, sys
+try:
+    payload = json.loads(sys.stdin.read())
+except (ValueError, TypeError):
+    print(0); sys.exit(0)
+agents = payload.get("agents", []) or []
+print(sum(len(a.get("failed", []) or []) for a in agents))
+' 2>/dev/null || printf 0)"
+  if [[ "${_profile_relink_failed_count:-0}" != "0" ]]; then
+    echo "[bridge-upgrade] WARN: profile relink reported failed_count=${_profile_relink_failed_count} — see embedded JSON for per-agent details" >&2
+    _upgrade_partial_failures+=("profile_relink")
+  fi
+  python3 - "$RELINK_PROFILE_JSON" <<'PY' || true
+import json, sys
+raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+if not raw or not raw.startswith("{"):
+    print(
+        "[bridge-upgrade] WARN: relink-profile-paths returned non-JSON; "
+        f"raw preview: {raw[:200]}",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError as exc:
+    print(
+        f"[bridge-upgrade] WARN: relink-profile-paths JSON decode error: {exc}",
+        file=sys.stderr,
+    )
+    sys.exit(0)
+agents = payload.get("agents", []) or []
+total_repaired = sum(len(a.get("repaired", []) or []) for a in agents)
+total_skipped = sum(len(a.get("skipped", []) or []) for a in agents)
+total_failed = sum(len(a.get("failed", []) or []) for a in agents)
+print(
+    f"[bridge-upgrade] profile symlinks repaired: {total_repaired} "
+    f"(skipped={total_skipped}, failed={total_failed}, "
+    f"agents={len(agents)})"
+)
+PY
 fi
 
 if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
@@ -1454,19 +1709,6 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
 fi
 
-if [[ $DRY_RUN -eq 0 ]]; then
-  _write_state_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-state-json.XXXXXX")"
-  printf '%s' "$ANALYSIS_JSON" >"$_write_state_payload_dir/analysis.json"
-  python3 "$SOURCE_ROOT/bridge-upgrade.py" write-state \
-    --source-root "$SOURCE_ROOT" \
-    --target-root "$TARGET_ROOT" \
-    --backup-root "$BACKUP_ROOT" \
-    --analysis-json-file "$_write_state_payload_dir/analysis.json" \
-    --version "$SOURCE_VERSION" \
-    --source-ref "$SOURCE_REF" \
-    --channel "$CHANNEL" >/dev/null
-  rm -rf "$_write_state_payload_dir"
-fi
 
 # Bug #507 — auto-cleanup of daily-backup residue on every successful
 # `agb upgrade --apply`. Idempotent; reports failures via cleanup_failures
@@ -1747,10 +1989,29 @@ if [[ $JSON -eq 1 ]]; then
   # (matches the OPERATIONS.md contract). Empty file when cleanup didn't
   # run (e.g. dry-run paths that bypass the cleanup block above).
   printf '%s' "${CLEANUP_JSON:-}" >"$_json_payload_dir/cleanup.json"
+  # Issue #668 (r2): surface the isolation-v2 migration payload in --json
+  # output so operators reading the JSON envelope can detect the macOS
+  # supplemental-group cache caveat (`migration_requires_relogin`) and the
+  # Linux daemon-restart deferred path. The payload is emitted by
+  # lib/bridge-isolation-v2-migrate.sh:1578 on apply, and a dry-run-shaped
+  # placeholder on dry-run. Always-present so JSON consumers can branch on
+  # the field's contents instead of having to handle missing-key vs value.
+  printf '%s' "${ISOLATION_V2_MIGRATION_JSON:-}" >"$_json_payload_dir/isolation-v2-migration.json"
+  # Issue #752 W3d: emit dedup'd partial-failure subsystem names as a
+  # JSON array file so the python envelope below can branch
+  # `status:"partial"` + `partial_failures:[...]`. Empty array on the
+  # all-clear path keeps `status:"ok"` semantics intact.
+  if (( ${#_upgrade_partial_failures[@]} > 0 )); then
+    printf '%s\n' "${_upgrade_partial_failures[@]}" \
+      | python3 -c 'import json,sys; print(json.dumps(sorted(set(line.strip() for line in sys.stdin if line.strip()))))' \
+      >"$_json_payload_dir/partial-failures.json"
+  else
+    printf '[]' >"$_json_payload_dir/partial-failures.json"
+  fi
   set +e
-  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" <<'PY'
+  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" "$_json_payload_dir/isolation-v2-migration.json" "$_json_payload_dir/partial-failures.json" <<'PY'
 import json, sys
-source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file = sys.argv[1:]
+source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file, isolation_v2_migration_json_file, partial_failures_json_file = sys.argv[1:]
 
 def load_json(path):
     with open(path, encoding="utf-8") as fh:
@@ -1778,8 +2039,27 @@ channel_guard_payload = load_json(channel_guard_json_file)
 source_reclassify_payload = load_json(source_reclassify_json_file)
 shared_settings_rerender_payload = load_json(shared_settings_rerender_json_file)
 cleanup_payload = load_optional_json(cleanup_json_file)
+# Always include the isolation-v2 migration field so JSON consumers can
+# branch on the contents (status="applied" + migration_requires_relogin,
+# skipped="dry-run", etc.) without missing-key handling. Falls back to
+# null when the variable was empty (defensive — current code paths always
+# set ISOLATION_V2_MIGRATION_JSON before reaching the JSON envelope).
+isolation_v2_migration_payload = load_optional_json(isolation_v2_migration_json_file)
+# Issue #752 W3d: late-stage subsystems (shared rerender / channel-policy
+# refresh / profile relink) append their stable name to this list when
+# their post-step probe reports failures. `status:"partial"` surfaces the
+# failure to operators / CI without aborting the upgrade — the rest of
+# the upgrade (daemon restart, [upgrade-complete] task) still ran.
+try:
+    with open(partial_failures_json_file, encoding="utf-8") as fh:
+        partial_failures = json.loads(fh.read() or "[]")
+except (FileNotFoundError, ValueError):
+    partial_failures = []
+status = "partial" if partial_failures else "ok"
 payload = {
     "mode": "upgrade",
+    "status": status,
+    "partial_failures": partial_failures,
     "version": source_version,
     "source_root": source_root,
     "source_ref": source_ref,
@@ -1812,6 +2092,7 @@ payload = {
     "channel_guard": channel_guard_payload,
     "agent_restart": agent_restart_payload,
     "agent_migration": migration_payload,
+    "isolation_v2_migration": isolation_v2_migration_payload,
     "source_reclassify": source_reclassify_payload,
     "shared_settings_rerender": shared_settings_rerender_payload,
     "cleanup": cleanup_payload,
@@ -1821,6 +2102,13 @@ PY
   _json_rc=$?
   set -e
   rm -rf "$_json_payload_dir"
+  # Issue #682: mark the success-path JSON envelope as emitted so the
+  # EXIT trap does not double-print a failure envelope when `exit
+  # "$_json_rc"` itself is non-zero (rare — the python heredoc above
+  # already produced output; a second envelope would corrupt the
+  # contract). On _json_rc != 0, the trap fires, sees the flag=1, and
+  # skips emit; operator still gets the raw python stderr.
+  _BRIDGE_UPGRADE_JSON_EMITTED=1
   exit "$_json_rc"
 fi
 
@@ -1866,7 +2154,19 @@ for item in payload.get("candidates") or []:
 PY
 python3 - "$SHARED_SETTINGS_RERENDER_JSON" <<'PY'
 import json, sys
-payload = json.loads(sys.argv[1])
+# Issue #731: same defensive guard as the verification heredoc above —
+# empty/non-JSON SHARED_SETTINGS_RERENDER_JSON should not raise a raw
+# traceback in the post-upgrade summary, just emit a named WARN.
+raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+if not raw:
+    print("[bridge-upgrade] WARN: shared-settings rerender returned empty payload (likely isolated agent canonical_dir failure — see #731)", file=sys.stderr)
+    sys.exit(0)
+try:
+    payload = json.loads(raw)
+except json.JSONDecodeError as exc:
+    print(f"[bridge-upgrade] WARN: shared-settings rerender returned non-JSON payload: {exc}", file=sys.stderr)
+    print(f"[bridge-upgrade] payload preview: {raw[:200]!r}", file=sys.stderr)
+    sys.exit(0)
 count = int(payload.get("count") or 0)
 failed = int(payload.get("failed_count") or 0)
 mode = payload.get("mode") or "skipped"

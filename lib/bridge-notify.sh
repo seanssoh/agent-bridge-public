@@ -80,7 +80,11 @@ bridge_claude_session_try_mark_prompt_ready() {
   [[ -n "$session" ]] || return 1
   bridge_tmux_session_exists "$session" || return 1
   bridge_tmux_session_has_prompt "$session" claude || return 1
-  bridge_agent_mark_idle_now "$agent"
+  # r13 codex Probe E catch — was unconditional `return 0` after the
+  # mark_idle call, swallowing the new hard-fail propagation from r12.
+  # Now propagate so callers (channels prompt-detector, notify path)
+  # see the failure when the matrix writer rejects.
+  bridge_agent_mark_idle_now "$agent" || return 1
   return 0
 }
 

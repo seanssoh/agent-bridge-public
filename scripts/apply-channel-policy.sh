@@ -68,6 +68,56 @@ SINGLETON_PLUGINS=(
 
 DRY_RUN=0
 QUIET=0
+
+# v0.8 layout fix (#720): the per-owner re-enable / allowlist overlays above
+# are written to `$OWNER_HOME/.claude/settings.local.json`, but Claude Code is
+# launched with `CWD = $OWNER_HOME/workdir` so its project-scope merge reads
+# `$OWNER_HOME/workdir/.claude/settings.local.json`. In v0.7 these were the
+# same directory; under the v0.8 isolation-v2 layout they are not, and the
+# overlay silently never reaches Claude — which kept the singleton plugins
+# disabled for the very owners that should hold them and produced the admin
+# kill-loop traced in the #720 repro.
+#
+# Mirror the symlink that `bridge-hooks.py:cmd_link_shared_settings` already
+# creates for `settings.json` so `workdir/.claude/settings.local.json` -> the
+# real overlay one directory up. `ln -sfn` is idempotent when the target is
+# already correct; we refuse to clobber a real file (operator-managed) and
+# treat `mkdir`/`ln` failures as soft skips so an isolated-user workdir owned
+# by a different uid does not abort the whole policy pass — the controller
+# side still gets the overlay it needs and `cmd_link_shared_settings` will
+# top up the isolated-side path at agent launch.
+_apply_channel_policy_link_workdir_overlay() {
+  local owner_home="$1" agent_id="$2"
+  local overlay_label="${3:-settings.local.json}"
+  local workdir_claude="$owner_home/workdir/.claude"
+  local link_path="$workdir_claude/$overlay_label"
+  local link_target="../../.claude/$overlay_label"
+
+  [[ -d "$owner_home/workdir" ]] || return 0
+
+  if [[ -e "$link_path" && ! -L "$link_path" ]]; then
+    [[ $QUIET -eq 1 ]] || echo "[apply-channel-policy] WARNING: $link_path is a regular file (not a symlink); leaving it in place — operator must remove it for the v0.8 overlay merge to take effect ($agent_id)" >&2
+    return 0
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    [[ $QUIET -eq 1 ]] || echo "[apply-channel-policy] would symlink $link_path -> $link_target ($agent_id)"
+    return 0
+  fi
+
+  if ! mkdir -p "$workdir_claude" 2>/dev/null; then
+    [[ $QUIET -eq 1 ]] || echo "[apply-channel-policy] WARNING: cannot mkdir $workdir_claude (likely isolated-user owned); skipping workdir overlay symlink for $agent_id — bridge-hooks.py:cmd_link_shared_settings will fix it at launch" >&2
+    return 0
+  fi
+
+  if ! ln -sfn "$link_target" "$link_path" 2>/dev/null; then
+    [[ $QUIET -eq 1 ]] || echo "[apply-channel-policy] WARNING: cannot symlink $link_path -> $link_target ($agent_id); skipping" >&2
+    return 0
+  fi
+
+  [[ $QUIET -eq 1 ]] || echo "[apply-channel-policy] symlinked $link_path -> $link_target ($agent_id)"
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
@@ -282,6 +332,10 @@ p.write_text(json.dumps(plan["payload"], indent=2, sort_keys=True) + "\n")
     else
       [[ $QUIET -eq 1 ]] || echo "[apply-channel-policy] admin overlay for '$admin_agent_id' already re-enables singleton policy (no change)"
     fi
+
+    # #720: ensure workdir/.claude/settings.local.json -> ../../.claude/settings.local.json
+    # so Claude (CWD=workdir) actually merges the admin re-enable overlay.
+    _apply_channel_policy_link_workdir_overlay "$ADMIN_HOME" "$admin_agent_id"
   fi
 fi
 
@@ -471,6 +525,10 @@ p.write_text(json.dumps(plan["payload"], indent=2, sort_keys=True) + "\n")
     else
       [[ $QUIET -eq 1 ]] || echo "[apply-channel-policy] owner overlay for '$owner_id' already re-enables singleton policy (no change)"
     fi
+
+    # #720: ensure workdir/.claude/settings.local.json -> ../../.claude/settings.local.json
+    # so Claude (CWD=workdir) actually merges the per-owner re-enable.
+    _apply_channel_policy_link_workdir_overlay "$OWNER_HOME" "$owner_id"
   done
 fi
 
@@ -646,6 +704,14 @@ for agent, mapping in plan.items():
     disables = [pid for pid, val in mapping.items() if not val]
     print(agent + "\t" + ",".join(sorted(enables)) + "\t" + ",".join(sorted(disables)))
 ' <<<"$allowlist_json" | \
+  {
+  # #752 M5 r2: track per-agent overlay outcomes so an all-fail run
+  # surfaces non-zero rc instead of silently passing. Counters live in
+  # this subshell (the pipe RHS); the final exit propagates via
+  # pipefail to the outer set -euo pipefail so the bridge-upgrade
+  # caller sees the failure.
+  overlay_ok=0
+  overlay_fail=0
   while IFS=$'\t' read -r allow_agent_id allow_enables_csv allow_disables_csv; do
     [[ -z "$allow_agent_id" ]] && continue
     ALLOW_HOME="$BRIDGE_AGENT_HOME_ROOT/$allow_agent_id"
@@ -655,7 +721,11 @@ for agent, mapping in plan.items():
       continue
     fi
 
-    allow_plan="$("$BRIDGE_PYTHON" - "$ALLOW_LOCAL" "$allow_enables_csv" "$allow_disables_csv" <<'PY'
+    # #752 M5: a malformed per-agent settings.local.json must not abort the
+    # whole upgrade-time apply-channel-policy loop. Guard both Python command
+    # substitutions with `if !; then warn; continue; fi` so we skip the bad
+    # overlay and keep applying policy to remaining agents.
+    if ! allow_plan="$("$BRIDGE_PYTHON" - "$ALLOW_LOCAL" "$allow_enables_csv" "$allow_disables_csv" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -694,9 +764,17 @@ for plugin_id in to_disable:
 payload["enabledPlugins"] = enabled
 print(json.dumps({"changed": changed, "payload": payload}))
 PY
-)"
+)"; then
+      echo "[apply-channel-policy] skip allowlist overlay: '$allow_agent_id' failed to produce overlay plan (likely malformed JSON at $ALLOW_LOCAL); continuing with remaining agents" >&2
+      overlay_fail=$((overlay_fail + 1))
+      continue
+    fi
 
-    allow_changed="$(printf '%s' "$allow_plan" | "$BRIDGE_PYTHON" -c 'import json,sys;print(json.loads(sys.stdin.read())["changed"])')"
+    if ! allow_changed="$(printf '%s' "$allow_plan" | "$BRIDGE_PYTHON" -c 'import json,sys;print(json.loads(sys.stdin.read())["changed"])')"; then
+      echo "[apply-channel-policy] skip allowlist overlay: '$allow_agent_id' produced unparseable plan output; continuing with remaining agents" >&2
+      overlay_fail=$((overlay_fail + 1))
+      continue
+    fi
 
     if [[ "$allow_changed" == "True" ]]; then
       if [[ $DRY_RUN -eq 1 ]]; then
@@ -714,5 +792,21 @@ p.write_text(json.dumps(plan["payload"], indent=2, sort_keys=True) + "\n")
     else
       [[ $QUIET -eq 1 ]] || echo "[apply-channel-policy] allowlist overlay for '$allow_agent_id' already matches policy (no change)"
     fi
+
+    # #720: ensure workdir/.claude/settings.local.json -> ../../.claude/settings.local.json
+    # so Claude (CWD=workdir) actually merges the per-agent allowlist overlay.
+    _apply_channel_policy_link_workdir_overlay "$ALLOW_HOME" "$allow_agent_id"
+    overlay_ok=$((overlay_ok + 1))
   done
+
+  # #752 M5 r2: if every per-agent overlay attempt failed, surface non-zero
+  # rc so the bridge-upgrade caller sees the failure rather than silently
+  # advancing on an unwritten policy. Mixed (some-ok / some-fail) is still
+  # treated as best-effort success — operators get per-agent stderr warnings
+  # and can re-run after fixing the bad overlay JSON.
+  if (( overlay_fail > 0 && overlay_ok == 0 )); then
+    echo "[apply-channel-policy] all $overlay_fail allowlist overlay(s) failed; no policy applied" >&2
+    exit 1
+  fi
+  }
 fi

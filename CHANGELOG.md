@@ -8,6 +8,568 @@ version bumps via the `VERSION` file.
 
 - `feat(scripts): add opt-in picker-sweep utility for auto-unsticking Claude Code interactive pickers` — new `scripts/picker-sweep.sh` scans every tmux session, detects rate-limit / resume-from-summary pickers, and presses Enter on the default option. Default disabled (`BRIDGE_PICKER_SWEEP_ENABLED=0`); operators opt in via OS crontab or bridge-native cron. Strict line-anchored regex defends against false-positives from PR bodies / docs / logs that quote picker text. Test seams allow `scripts/smoke/picker-sweep.sh` to exercise the script with mock tmux + mock queue without touching live state. See `OPERATIONS.md` "picker-sweep utility" for registration paths.
 
+## [0.9.8] — 2026-05-10
+
+### Highlight — v0.9.7 carry-over (#786): RC6 ms365 leak + memory-daily aggregate
+
+운영자가 v0.9.7 ship 후 production 검증에서 발견한 2 finding (#786) 모두 fix. v0.9.5 → v0.9.6 → v0.9.7 → v0.9.8 cycle 의 같은 architectural 패턴 반복 (operator host 의 v1-isolation leftover artifact 가 codex review 의 fresh-install reproducer 로 재현 안 됨) 을 review brief 자체에 lesson 강제 적용 — focus item #1 = "operator's exact production state reproducer".
+
+### Process — review brief 가 operator-host artifact reproducer 의무 명시
+
+운영자 frustration: "왜 계속 같은 문제 반복돼.. 해결되기 전까지 무제한 리뷰 하도록 해". v0.9.5/v0.9.6/v0.9.7 process lesson (release-PR review brief 에 operator's actual production state reproducer 명시) 가 매 release 후 lesson 으로 기록만 되고 다음 release brief 작성 시 누락. v0.9.8 부터 review brief 가 처음부터 operator-host artifact inventory 명시:
+
+- v1-isolation leftover symlinks (`source/<plugin>/node_modules → /controller/cache/...`)
+- pre-v2 `installPath` in `installed_plugins.json`
+- 운영자 ad-hoc workaround state (chmod 2770, named-user ACL grants)
+
+이 강제 효과: PR #787 r1 catch (intra-marketplace symlink) 와 PR #788 r1-r4 catches (chmod, symlink exfiltration, TOCTOU race, JSON validation) 모두 lesson 적용 후 codex 가 catch. 이전 cycle 에서는 catch 못 했을 vector.
+
+### Fixed (#787 — RC6 ms365 leak, refs #786 Finding 1)
+
+- `bridge-dev-plugin-cache.py:overlay_source_to_cache` + `_overlay_dir` — symlink-to-outside-marketplace detect + skip + WARN. operator host 의 v0.7→v0.8 isolation migration leftover (`source/ms365/node_modules → /home/ec2-user/.claude/plugins/cache/...`) 가 isolated UID 권한으로 read 시도 → `PermissionError: [Errno 13]` → ms365 sync `install-failed`. v0.9.7 이 다른 3 plugin (teams, cosmax-crm, cosmax-ep-approval) 는 작동했지만 ms365 만 silent fail.
+- 2-round codex destructive-probe: r1 catch — `source_root = source_path.resolve()` boundary 가 너무 narrow (plugin-specific path), intra-marketplace `node_modules → ../dist` 를 outside-source 로 잘못 분류. r2 fix — caller chain 으로 marketplace root 전달, marketplace boundary 사용.
+
+### Fixed (#788 — memory-daily aggregate matrix vs harvester mismatch, refs #786 Finding 2)
+
+- `scripts/memory-daily-harvest.sh` — isolated UID 시 `--shared-aggregate-dir` 안 넘김 (per-agent fragment 만 쓰도록). 이전엔 isolated UID 가 controller-only `aggregate/` 에 직접 write 시도 → EACCES.
+- `scripts/memory-daily-reduce.sh` (NEW) — controller-side reducer. agents/<X>/runtime/memory-daily/*.json fragment → admin-aggregate-<agent>-<date>.json. operator 가 controller crontab 에 wire (v0.9.9 에서 자동 등록 검토).
+- `lib/bridge-isolation-v2.sh:bridge_isolation_v2_memory_daily_shared_aggregate_dir` — self-contradicting comment fix. 매트릭스 row 가 design A (r-x for isolated UIDs) binding 이라고 명확.
+- 4-round codex destructive-probe (security-heavy):
+  - r1: cp -p preserved fragment mode (0660) vs aggregate contract (0640) → drop -p + explicit chmod 0640
+  - r2 BLOCKING: symlink fragment 가 controller secret 으로의 path-traversal exfiltration vector → 3 defense layer (reject symlink agent_dir, reject symlink fragment, cp -P TOCTOU defense)
+  - r3 BLOCKING: TOCTOU race 후 Layer 2 [[ -L ]] check 사이 swap 가능 → post-cp [[ -f && ! -L ]] re-check + JSON parse gate
+  - r4 implement-ok: 8/8 probes PASS (TOCTOU swap blocked, malformed JSON rejected, valid JSON published, mode 0640, group ab-shared 보존)
+
+### Verified (operator-host artifact + canonical state)
+
+- operator's exact ms365 leftover artifact (`source/ms365/node_modules → /controller/cache/...`) → cache materializes without node_modules + WARN
+- intra-marketplace symlink (e.g. `node_modules → ../dist`) → cache recurses + materializes
+- agent-controlled symlink fragment exfiltration vector → blocked at Layer 2
+- TOCTOU race attack on symlink check → blocked at Layer 4 (post-cp)
+- malformed JSON fragment → rejected at Layer 5 (JSON parse gate)
+- aggregate file mode 0640 + ab-shared group inheritance from setgid parent
+- chmod 2770 운영자 workaround state coexists with new harvester (no regression)
+
+### Known carry-over (v0.9.9 트랙 후보)
+
+- `installed_plugins.json` rewrite ordering (#786 suggested fix item 3 — 이번 PR 는 cache materialization 만 fix; pre-v2 installPath 가 cache fail 시 안 고쳐지는 것은 별도)
+- v1-isolation cleanup helper — `agent-bridge upgrade --apply` 가 `source/<plugin>/node_modules → /controller/...` symlink 을 자동 detect + remove (currently operator manual `rm`)
+- memory-daily reducer 의 cron 자동 등록 (`bridge-cron.sh` 에 controller-side cron job)
+- design v2 §"Per-Agent Cache Tradeoffs" content-addressed package store proposal
+
+## [0.9.7] — 2026-05-10
+
+### Highlight — v0.9.6 verification surfaced 6 RCs → unified isolation grant matrix
+
+운영자의 v0.9.6 검증 후 후속으로 RC1-RC6 (#781) 발견. 모두 같은 architectural gap — isolated agent's required-access matrix 가 single contract 가 아니어서 path 마다 ad-hoc grant 가 다른 mechanism (group, named ACL, mode) 으로 흩어져 있었음. v0.9.7 은 이를 single isolation-grant-matrix 로 통합:
+
+| # | Symptom | Mechanism (v0.9.7) |
+|---|---|---|
+| RC1 | `state/agents/<X>/` group `ab-controller` (v2 contract violation) | matrix row enforces `ab-agent-<X>` + setgid 2770 |
+| RC2 | `idle-since` controller-owned 0600, isolated hook unlink fail | new `bridge_isolation_v2_write_agent_state_marker` route, group-aware writer |
+| RC3 | `~/.claude/.credentials.json` ACL `mask::---` wipe → `/login` infinite loop | single named-user ACL exception (Anthropic credential), path guard prevents v0.9.5/v0.9.6 mask-break recurrence, multi-agent roster-aware grant + strip |
+| RC4 | `runtime/` not traversable | matrix row `agent-runtime` covers |
+| RC5 | `logs/` not traversable | matrix row `agent-logs` covers |
+| RC6 | `dev-plugin-cache` "linked OK" 거짓 success log + ms365 cache dir 부재 | `bridge-dev-plugin-cache.py` pre-link assert + post-link verify under isolated UID + per-agent isolated cache (real directory copy, NOT symlink to shared source) + criticality split (channel-required block / optional warn-and-continue) |
+
+운영자 binding principle (per design v2): 각 isolated agent 가 **자기 plugin 자기 install 자기 login** — cross-agent 간섭 방지. shared cache 자체가 간섭 매개라 per-agent isolated cache 필수. disk overhead 100-300MB / agent 감수 (4 agents = 400MB-2GB).
+
+### Process — codex destructive-probe 22 round (operator-authorized round-cap waiver)
+
+운영자 자율 위임: "캡 같은거 필요 없어 될떄까지 완전하게 완료해" + "내가 자고 일어나면 다 되어 있어야해". CLAUDE.md 의 3-round cap 명시적 waiver. PR #782 16 round + PR #783 6 round = 총 22 round. 각 round 가 새 vector catch:
+
+**PR #782 (matrix foundation + RC1-RC5, 16 round):**
+- r1-r6: RC3 helper deep-dive (mode → owner+group → mask → named-user → ancestor → other → file_mode → apply/check sym → Linux stat group_class quirk)
+- r7: 1 BLOCK + 2 WARN (strict r--, stale strip, effective annotation parse)
+- r8-r10: helper hard-fail + reapply wrapper exit propagation + 2 other matrix-apply callers `|| true` swallow
+- r11: RC3 multi-agent + write_marker + hook stderr
+- r12-r13: load reapply.sh + (g) all-roster check + drop daemon writer fallbacks (5 writers total) + r12 path bug
+- r14-r15: webhook ensure + chmod 0660 + daemon audit visibility + synthetic marker rc + scrub guard order + legacy `--help`
+- r16: next-session.sha path divergence (Python hook write vs bash reader)
+
+**PR #783 (RC6 + per-agent cache + criticality, 6 round):**
+- r1: symlink-to-source = cross-agent collision (operator binding principle violation)
+- r2: real directory copy + 4-branch unification (3 BUG)
+- r3: self-contained per-agent (node_modules 포함) + chmod 0700 + derive node_modules_status from cache
+- r4: symlink-to-dir handling (is_dir() first) + parent chmod 0700
+- r5-r6: channel-required wins both-lists + _is_required_channel decision tree fix
+
+각 round 의 fix 가 v0.9.5/v0.9.6 false-positive 가 운영자 host 에서 재발할 수 있는 vector. 운영자 자율위임 ROI: 22 round 는 release 후 hotfix cycle 보다 훨씬 싸다.
+
+### Fixed (#782 + #783 — refs #781)
+
+- **`lib/bridge-isolation-v2.sh`** — new `bridge_isolation_v2_matrix_rows_for_agent` enumerator (18 rows from design v2 + 4 plugin rows = 22 total), `bridge_isolation_v2_apply_grant_matrix_for_agent` (apply/check), `bridge_isolation_v2_apply_row` per-row dispatcher, `bridge_isolation_v2_ensure_matrix_path` for daemon writers, `bridge_isolation_v2_write_agent_state_marker` atomic write, `bridge_isolation_v2_apply_controller_credentials_read_grant` + `bridge_isolation_v2_check_controller_credentials_read_grant` (RC3 single exception, multi-agent roster-aware, all 5 ACL conditions enforced + (f)(g) roster checks). Path guard in `bridge_isolation_v2_acl_scrub` (RC3 recurrence prevention) + scrub file-path refusal.
+- **`lib/bridge-isolation-v2-migrate.sh`** — `bridge_isolation_v2_migrate_normalize_layout` propagates matrix-apply failure (was `|| true`).
+- **`lib/bridge-isolation-v2-reapply.sh`** — `bridge_isolation_v2_reapply_one_agent` consumes matrix rows; dispatch wrapper accumulates per-agent errors → non-zero exit. action label `error:matrix_apply_failed` (was `warn:matrix_partial`).
+- **`lib/bridge-agents.sh`** — `bridge_linux_prepare_agent_isolation` propagates matrix apply failure.
+- **`lib/bridge-state.sh`** — daemon writers (`mark_idle_now`, `mark_manual_stop`, `note_prompt_ready`) route through matrix-aware writer + drop direct-write fallback. `bridge_agent_next_session_marker_file` aligned with Python hook path (state/agents/<X>/, was runtime/).
+- **`lib/bridge-channels.sh`** — webhook-port + missing-marker retry writers + ensure_matrix_path now hard-fail. synthetic marker call propagates rc.
+- **`lib/bridge-notify.sh`** — `bridge_claude_session_try_mark_prompt_ready` propagates mark_idle_now rc.
+- **`bridge-daemon.sh`** — nudge_scan step emits `daemon_step_warning` audit on idle-ready writer failure.
+- **`bridge-dev-plugin-cache.py`** — RC6 pre-link assertion + post-link verify under isolated UID, per-agent real directory cache (no shared symlink), node_modules included in copy, chmod 0700 on every cache + parent dir, criticality split (channel-required block / optional warn).
+- **`bridge-run.sh`** — Python exit code propagation for criticality split.
+- **`agent-bridge`** — new `isolation verify --agent <X> [--json] [--strict-optional]` subcommand. Pre-source bypass for `isolation verify --help` (operator can read syntax on legacy/markerless installs).
+- **`hooks/bridge_hook_common.py`** — next-session.sha writer emits stderr WARN on OSError (no longer silent return None) + uses bridge_active_agent_dir() (matches bash reader after r16).
+- **`bridge-lib.sh`** — sources `bridge-isolation-v2-reapply.sh` so `reapply_eligible_agents` is available to all v2 helpers (not just bridge-migrate.sh).
+
+### Verified (codex destructive-probe + operator-state reproducer)
+
+- 모든 6 RC 가 operator's RC1-5 workaround state 에서 single `migrate isolation v2 --apply` 한 번으로 canonical state 로 converge.
+- `agent-bridge isolation verify --agent <X>` 가 모든 22 row 에 대해 pass/mismatch/not-applicable 정확히 분류.
+- multi-agent (4 agent) 시나리오: 각 agent 가 own plugin 자기 install + own login + own credential, cross-agent interference 0.
+- per-agent cache disk overhead measured ~200-400MB/agent for typical bridge plugin set.
+
+### Process lessons (carry forward to v0.9.8+)
+
+1. **release-PR codex review brief 에 operator's current production state reproducer 의무화** (v0.9.6 lesson 적용). orbstack 검증이 fresh-setup 만 다루면 frozen-roster 같은 actual state 놓침.
+2. **각 round 의 catch 가 새 vector 면 5+ round 정당화**. 동일 vector 반복이면 cap 적용. PR #782 16 round, PR #783 6 round 모두 each catch new vector 였음.
+3. **apply/check symmetry 가 architectural concern**. 한 path 에서 hard-fail propagation 추가하면 모든 caller chain 에서 swallow 안 되도록 sweep 필요. PR #782 r9-r15 가 정확히 이 sweep.
+
+### Known carry-over (v0.9.8 트랙 후보)
+
+- `bridge-upgrade.sh` 의 path guard / convergence 정밀 검증 (PR 3 deferred — operator host 검증 후 hotfix 가능)
+- `scripts/oss-preflight.sh` orbstack reproducer with operator-actual production state
+- `docs/agent-runtime/v2-isolation-migration.md` 22-row matrix 문서화
+- `KNOWN_ISSUES.md` v0.9.5/v0.9.6 false-positive 패턴 lessons
+- design v2 §"Per-Agent Cache Tradeoffs" 의 future content-addressed package store proposal (cross-agent dedup without shared mutable state)
+
+## [0.9.6] — 2026-05-09
+
+### Highlight — REAL #771 fix (v0.9.5 was a false-positive on frozen-roster)
+
+`v0.9.5` 의 `bridge_write_linux_agent_env_file` regen call 은 운영자의 R5 진단으로 **false-positive** 확인. Linux 서버에서 `migrate isolation v2 --apply` 후 `cat agents/<X>/runtime/agent-env.sh | grep TEAMS_STATE_DIR` 가 여전히 stale `…/agents/<X>/.teams` (pre-v2 path) 반환. log 는 `agent_env_regen ok` 라고 했지만 실제 파일 내용은 안 바뀜.
+
+진단 결과 root cause 는 `lib/bridge-state.sh` 의 `bridge_claude_launch_with_channel_state_dirs` helper. 이 함수는 launch 시점에 cached `BRIDGE_AGENT_LAUNCH_CMD[$agent]` 의 env-prefix 에 canonical `TEAMS_STATE_DIR` / `MS365_STATE_DIR` / `DISCORD_STATE_DIR` / `TELEGRAM_STATE_DIR` 를 주입하는 것이 책임이지만, 기존 loop 가:
+
+```python
+for name, value in assignments:
+    if f"{name}=" in env_prefix:
+        continue       # ← BUG: name 만 보고 skip → stale value 보존
+    env_prefix += f"{name}={shlex.quote(value)} "
+```
+
+처럼 `<NAME>=` substring 만 검사하고 SKIP. fresh-setup agent (env_prefix 비어 있음) 는 append branch 가 fire 해서 정상이지만, frozen-roster (v0.7→v0.8 migrate 시점에 cached 된 stale `TEAMS_STATE_DIR=…/agents/<X>/.teams`) 는 `name` 이 이미 존재해서 skip → 매 restart 마다 stale path 가 그대로 통과 → bun teams server.ts silent-exit before bind. v0.9.5 의 regen 은 cached file 를 새로 쓰지만 **새로 쓴 내용 자체가 같은 helper 를 통과해서 같은 stale path 를 다시 박아넣는 cycle** 이라 효과 없음. v0.9.5 orbstack 검증은 fresh-setup 만 exercise 했고 frozen-roster scenario miss.
+
+Fix: skip 대신 **byte-preserving in-place replace**. 6 라운드 codex destructive-probe 로 다음을 모두 통과:
+
+- top-level 만 매칭 (quote 안에 nested `NAME=…` substring 무영향)
+- `$VAR` / `${VAR}` / `$(cmd)` / `` `cmd` `` expansion 보존 (관련 없는 token 의 expansion 안 죽임)
+- `$()` / `` ` ` `` / `${}` 안에 `NAME=` 가 있어도 opaque value 로 처리 (literal `)` / `}` 가 나와도 close 안 봄)
+- duplicate dedup (last-wins shell semantic 깨지지 않게 모든 occurrence 교체)
+- 새 canonical value 는 `shlex.quote` 로 hard-quote (literal `$` 등 안전)
+
+`agent-bridge upgrade --apply` + `migrate isolation v2 --apply` + agent restart 한 번 으로 자동 회복.
+
+### Process — codex destructive-probe 6 라운드 (operator-authorized round-cap waiver)
+
+운영자 자율 위임: "캡 같은거 필요 없어 될떄까지 완전하게 완료해". CLAUDE.md 의 3-round cap 명시적 waiver 후 6 라운드 진행. 각 라운드 모두 새 vector catch (마지막 2 라운드는 hardening, 처음 4 라운드는 production-relevant):
+
+| 라운드 | codex catch | 분류 |
+|---|---|---|
+| r1 | skip-if-name-present false-positive | critical (operator hit) |
+| r2 | regex global subn 가 quoted value 안의 nested NAME= 도 덮음 | production-relevant |
+| r3 | shlex.split + shlex.quote round-trip 가 `$VAR` expansion 죽임 | production-relevant |
+| r4 | byte-preserving walker 가 `$()` / `` ` ` `` / `${}` 안 봄 | production-relevant |
+| r5 | `_skip_paren_subst` 가 `${...}` 안 honor → brace-default 의 literal `)` 로 paren 조기 close | hardening |
+| r6 | `_skip_paren_subst` + `_skip_brace_subst` mutual-recurse 추가, `$/${/backtick` 모든 nesting opaque | hardening (closes surface) |
+
+각 라운드의 fix 는 21 destructive probe matrix 로 bash-eval round-trip 검증 (Homebrew bash 5+). `frozen-roster motivating case → fresh setup → empty prefix → idempotent same-value → partial-name overlap → quoted-stale → value-with-space → duplicate dedup → quote-context (probe 9) → $VAR (10) → literal $ in new value (11) → backtick no NAME (12) → mixed quoting (13) → $() (14) → backtick (15) → ${} (16) → nested $() (17) → $() in dquote (18) → codex r5 reproducer (19) → ${} containing $() (20) → backtick in ${} (21)`.
+
+### Process lesson — false-positive 의 의미
+
+v0.9.5 가 false-positive 였던 이유는 orbstack 검증 시나리오가 fresh-setup 만 (= operator 가 리눅스 서버에서 한 번도 본 적 없는 상태) 다뤘기 때문. 운영 호스트의 frozen-roster 상태 (= operator 의 actual state) 를 재현 안 했음. 다음 release process 에는 release-PR codex review brief 에 "operator's current production state 를 reproducer 로 명시" 항목 추가 필요. v0.9.5 CHANGELOG 의 "Verified on Linux" 표는 fresh-setup row 로 한정 → frozen-roster row 추가했다면 release 전 catch 했을 것.
+
+### Fixed (#776 — refs #771)
+
+- `lib/bridge-state.sh:bridge_claude_launch_with_channel_state_dirs` — env-prefix 의 `<NAME>=value` assignment 를 quote-state-aware top-level walker 로 식별 후 byte-preserving in-place replace. 4 helper (`_skip_dquote`, `_skip_paren_subst`, `_skip_backtick`, `_skip_brace_subst`) mutual-recurse 로 nested substitution / quote 모두 opaque 처리. matching 안 된 token 의 raw bytes (포함 `$VAR` / `$()` / backtick 등 expansion) 그대로 통과. matching token 만 `f"{name}={shlex.quote(value)}"` 로 substitute (last-wins shell semantic 위해 모든 occurrence 교체).
+
+### Verified on Linux (orbstack Oracle Linux 9)
+
+| Test case | Original | Without fix | With v0.9.6 fix |
+|---|---|---|---|
+| Frozen-roster `TEAMS_STATE_DIR=/stale/.teams` | `/stale/.teams` | restart 시 stale 통과 | **`/workdir/.teams` 로 교체 ✓** |
+| Fresh-setup (no existing TEAMS) | append OK | (regression-clean) | **append fires ✓** |
+| Quoted-value 안 nested NAME= | (n/a) | global subn 이 nested 도 덮음 (r2 vector) | **opaque ✓** |
+| `OTHER=$HOME` 와 같은 token | (n/a) | shlex round-trip 이 `'$HOME'` 으로 hard-quote (r3 vector) | **expansion 보존 ✓** |
+| `$()` / backtick / `${}` 안 NAME= | (n/a) | walker 가 안 봄 (r4 vector) | **opaque ✓** |
+| `${UNSET:-) NAME=...}` (literal `)`) | (n/a) | paren 조기 close (r5 vector) | **brace-default opaque ✓** |
+
+### Known carry-over (v0.9.7 트랙 후보)
+
+- **#772** Stop hook → agent-bridge CLI → mkdir BRIDGE_STATE_DIR denied (isolated uid). non-blocking 이지만 stderr spam.
+- **#767** daemon inbox-nudge 폭주 (no dedup, no busy-aware gate).
+- **runtime_ready false-positive**: `bridge_agent_channel_runtime_ready_for_item` 이 file/key presence 만 체크, 실제 server LISTEN 안 봄. v0.9.6 fix 가 server bind 정상화하지만 detect-future-failure 위해 LISTEN check 추가는 별도 enhancement.
+- v0.9.3 residual #B (creds.json ACL mask `---`) + #C (state/agents/<X>/ mode 2750) — root cause 미확정.
+
+## [0.9.5] — 2026-05-09
+
+### Highlight — #771 Teams server N-of-1 spawn 종결 + writer symlink hardening
+
+`v0.9.5` 는 운영자가 #771 로 보고한 "isolated Teams plugin server 가 4 에이전트 중 1명 (mgt_ahn) 만 LISTEN" 증상의 두 root cause 를 함께 fix. 운영자의 R3+R4 진단으로 확정된 dispatch 경로 분기: `agent-bridge migrate isolation v2 --apply` (공백, repair tool) 가 `bridge_isolation_v2_reapply_one_agent` 로 라우팅되며 이 함수의 두 결함이 결합:
+
+1. **stale `runtime/agent-env.sh`**: isolated agent 의 cached `BRIDGE_AGENT_LAUNCH_CMD[$agent]` 가 v0.7→v0.8 isolate 시점에 한 번 작성되고 이후 regenerate 안 됨. 거기 박힌 `TEAMS_STATE_DIR=…/agents/<X>/.teams` 가 v2 layout 이후 (`/workdir/.teams`) 와 불일치 → 매 restart 마다 stale path 주입 → bun teams server.ts silent-exit before bind → `ss -tln :3980` 에 LISTEN 없음 → router proxy "Unable to connect" 반복 → Sean 메시지 silent drop. 비isolated mgt_ahn 는 daemon 의 live launch_cmd 계산 path 라 영향 없음 = 4 에이전트 중 1명만 살아있던 이유.
+
+2. **channel `.env` mode 0640**: `setfacl -bR` strip 후 `group::---` 잔존 가능 (특정 `acl` 패키지 빌드) → controller 가 base group bit 로 read 불가 → `creds_status=unreadable` → channel readiness probe fail. v2 design contract (lib/bridge-agents.sh:3917-3919 주석: "v2: no ACL repair retry. The per-agent group + setgid contract handles controller access") 가 명시한 group rw 와 불일치.
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.9.x layout/contract 변경 없음. 운영자 호스트에서 #771 본 적 있다면 v0.9.5 적용 후 `migrate isolation v2 --apply` + agent restart 한 번 으로 자동 회복.
+
+### Process — orbstack Linux end-to-end 검증 + codex destructive-probe 3 라운드
+
+이번 release 는 v0.9.4 의 process commitment ("isolation/migrate/upgrade path 만지는 release 는 orbstack Linux 검증 의무") 두 번째 적용. PR #774 의 codex review 가 destructive-probe brief 로 3 라운드:
+- r1: 4 finding 잡음 (HIGH security symlink attack, MED helper-not-loaded silent skip, LOW idempotency, style nit)
+- r2: r2 fix 적용 + Finding 1 의 partial gap (rm-survives) 추가 catch
+- r3: r3 fix 적용 + 6/6 PASS implement-ok
+
+각 라운드의 fix 모두 orbstack Oracle Linux 9 VM 에서 실측 검증. 운영 호스트로 release 가기 전 코드 결함을 사전 차단.
+
+### Fixed (#774 — refs #771)
+
+- `lib/bridge-isolation-v2-reapply.sh:bridge_isolation_v2_reapply_one_agent` 가 recursive perm walk + ACL strip 직후 `bridge_write_linux_agent_env_file "$agent" "$_env_file"` 호출 추가. writer 가 live roster + 현재 `bridge_agent_workdir` (BRIDGE_AGENT_ROOT_V2 honor + `/workdir` append) 로 launch_cmd 재계산해서 cached `BRIDGE_AGENT_LAUNCH_CMD` refresh. mktemp + cmp short-circuit 으로 stable content 시 mtime/ctime 보존 (action row `ok:already-canonical`). helper-not-loaded 시 explicit `error:helper_not_loaded` action row + errors_file append (load-order regression visibility).
+
+- channel `.env` per-path assert mode 0640 → 0660 (`workdir/.teams/.env`, `workdir/.ms365/.env`). v2 design contract 의 group rw 명시. doc table (lib/bridge-isolation-v2-reapply.sh:57-59 + 1085-1090) 동기화.
+
+### Hardening (#774, security — defense in depth)
+
+- `lib/bridge-agents.sh:bridge_write_linux_agent_env_file` 가 `cat >"$file"` redirect 직전 `[[ -L "$file" ]]` 체크 추가. 발견 시 `bridge_linux_sudo_root rm -f` (또는 plain rm) 로 symlink 제거. **post-rm verify 후 symlink 가 살아남았으면** (sudo unavailable / parent dir unwritable) `bridge_warn` + `return 1` — 절대 redirect write 통과 안 함. 이전엔 `[[ -O "$file" ]]` 가 link target (controller-owned) 으로 follow 되어 rm branch skip → cat 이 link 통해 controller 파일 (e.g. `~/.claude/.credentials.json`, 다른 agent env) 덮어쓰는 vector 존재. v0.9.5 의 새 reapply regen call 이 이 vector 노출시켰을 것이라 예방적 fix. 모든 writer caller 가 혜택 (defense in depth).
+
+### Verified on Linux (orbstack Oracle Linux 9)
+
+| Test case | Original | Without fix | With v0.9.5 fix |
+|---|---|---|---|
+| Symlink at runtime/agent-env.sh → target | target=PROTECTED | target overwritten by cat | **target=PROTECTED ✓** |
+| Symlink survives rm (parent dir 0500) | symlink intact | cat through link | **rc=1, bridge_warn, target intact ✓** |
+| stale TEAMS_STATE_DIR (pre-v2 path) | `…/agents/<X>/.teams` | restart inject stale | **regen → `…/workdir/.teams` ✓** |
+| .env post-strip group bit | `group::---` | controller unreadable | **group rw (mode 0660) ✓** |
+
+### Known carry-over (v0.9.6 트랙 후보)
+
+- **#772** Stop hook → agent-bridge CLI → mkdir BRIDGE_STATE_DIR denied (isolated uid). non-blocking 이지만 stderr spam.
+- **#767** daemon inbox-nudge 폭주 (no dedup, no busy-aware gate).
+- **runtime_ready false-positive**: bridge_agent_channel_runtime_ready_for_item 이 file/key presence 만 체크, 실제 server LISTEN 안 봄. Fix 1+2 가 server bind 정상화하면 자연 해소되지만 detect-future-failure 위해 LISTEN check 추가는 별도 enhancement.
+- v0.9.3 residual #B (creds.json ACL mask `---`) + #C (state/agents/<X>/ mode 2750) — root cause 미확정.
+
+이상 4건 모두 v0.9.6 사이클에서 같은 process (orbstack 재현 → 정밀 fix → codex destructive-probe → release).
+
+## [0.9.4] — 2026-05-09
+
+### Highlight — v0.9.3 regression fix (chgrp_setgid_recursive 가 plugin script exec bit 죽임)
+
+`v0.9.4` 는 v0.9.3 PR #768 가 도입한 destructive 회귀를 종결한다. v0.9.3 의 `bridge_isolation_v2_chgrp_setgid_recursive` 의 file_mode=0660 blanket chmod 가 `agents/<X>/home/.claude/plugins/cache/.../scripts/*.sh` (originally 0750) 의 exec bit 를 죽여서 SessionStart hook fail (`crm-mcp-token-sync.sh: Permission denied`) 발화. 운영자가 v0.9.3 적용 직후 발견 후 `chmod g+rx` 워크어라운드로 unblock. v0.9.4 가 helper 자체의 destructive contract 를 수정해서 워크어라운드 불필요화.
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.9.x isolation-v2 layout / contract 변경 없음.
+
+### Process change — release 전 orbstack Linux 검증 의무화
+
+이번 v0.9.4 가 처음으로 **release 머지 전 orbstack Oracle Linux 9 VM 에서 end-to-end 재현 + fix 검증** 을 거쳤다. 이전 v0.9.1/v0.9.2/v0.9.3 가 모두 darwin tempdir 만 보고 release 했고 그 결과 release 후 운영 호스트에서 회귀가 처음 발견되는 패턴이 반복됨. v0.9.4 부터:
+- isolation/migrate/upgrade path 만지는 변경은 orbstack VM 검증 의무
+- codex review brief 에 destructive-change probe (executable / setuid-setgid / symlink / xattr 영향) 항목 추가
+- helper 함수의 implicit destructive contract 는 caller 마다 trace 후 호출 사이트 영향 명시
+
+### Fixed (#770 — refs #746, refs #768)
+
+- `lib/bridge-isolation-v2.sh:bridge_isolation_v2_chgrp_setgid_recursive` 가 file 의 mode 를 numeric `chmod $file_mode` (e.g. literal 0660) 로 blanket 적용하던 destructive contract 를 `X` (uppercase, "x only if dir or already has any exec") 활용한 symbolic chmod 로 교체. translation table:
+
+  | numeric | symbolic |
+  |---|---|
+  | 0660 | `u-s,g-s,g+rwX,o-rwx` |
+  | 0640 | `u-s,g-s,g+rX,g-w,o-rwx` |
+  | 0600 | `u-s,g-s,g-rwx,o-rwx` |
+
+  `u-s,g-s` 는 정규 file 에서 setuid/setgid bit 명시적 제거 (privilege escalation 표면 방어 — codex r2 catch). user perm 미변경 (file owner = agent UID 가 이미 rw 보장). dir 은 literal numeric `dir_mode` 그대로 (e.g. 2770 의 setgid 는 의도적 — 신규 file group 상속).
+
+- `lib/bridge-isolation-v2.sh:bridge_isolation_v2_verify_chgrp_setgid_recursive` 의 file mode sample 검사를 mask `& 0666` 로 변경 — exec-aware. 이전엔 exec-preserved file (e.g. 0770) 이 expected file_mode (0660) 와 mismatch → return 1 → caller 에 false-positive (codex r1 catch). masked 비교는 "did chmod run at all" 의 rw bit 검증을 유지하면서 exec bit 보존을 허용.
+
+### Verified on Linux (orbstack Oracle Linux 9)
+
+| File | Original | After v0.9.3 (regression) | After v0.9.4 (fixed) |
+|---|---|---|---|
+| Plugin script | 0750 | **0660 NOT-EXECUTABLE** | **0770 EXECUTABLE** ✓ |
+| CLAUDE.md | 0640 | 0660 | 0660 |
+| MEMORY-SCHEMA | 0600 | 0660 | 0660 |
+| Setuid file | 4640 | (untested) | **0660 STRIPPED** ✓ |
+| Setgid file | 2640 | (untested) | **0660 STRIPPED** ✓ |
+| verify rc | (always 1 with exec files) | 1 false-positive | **0** ✓ |
+
+### Known carry-over (v0.9.5 트랙 후보)
+
+- **#772** Stop hook → agent-bridge CLI → `mkdir BRIDGE_STATE_DIR` denied (운영자 격리 user uid). non-blocking 이지만 stderr spam (stop 사이클당 3회 이상). 같은 isolation-v2 perm 클래스, 다른 surface (hook layer).
+- **#771** Teams plugin server N-of-1 spawn — 4 에이전트 등록인데 1개만 LISTEN. 운영자의 sales_sean / dev_mun / sales_choi Teams 메시지 silent drop. (channel layer)
+- **#767** daemon inbox-nudge 폭주 (no dedup, no busy-aware gate). transcript 오염, 기능 차단 없음. (daemon scheduler layer)
+- v0.9.3 발견 회귀 #B (creds.json ACL mask `---`) + #C (state/agents/<X>/ mode 2750) — root cause 미확정, v0.9.3 patch scope 외. 운영자 워크어라운드로 unblock 상태.
+
+이상 4건 모두 v0.9.5 사이클에서 동일한 process (orbstack 재현 → 정밀 fix → 검증) 로 처리.
+
+## [0.9.3] — 2026-05-09
+
+### Highlight — REAL #746 fix (the v0.9.1 / v0.9.2 attempts hit the wrong code path)
+
+`v0.9.3` 는 #746 (v0.7→v0.8 migrated 호스트의 workdir 내부 파일 perm drift) 의 **실제 root cause** 를 잡는다. v0.9.1 (#749) 와 v0.9.2 의 13 PR audit wave 가 모두 #746 에 fix 를 시도했지만 운영 호스트에서 동작 안 함이 확인됐고, 운영자 진단 끝에 **dispatch 경로 차이** 가 root cause 로 확정됨.
+
+핵심: `agent-bridge migrate isolation v2 --apply` (공백 form, 운영자가 production 에서 쓰는 repair tool) 는 `bridge_isolation_v2_reapply_one_agent` 로 dispatch 되며, 이 함수의 target path 테이블은 writable-sub 디렉토리들 (`workdir/`, `runtime/`, ...) 자체와 hand-picked 파일 리스트 (`.teams/.env`, `.ms365/.env`, `agent-env.sh`, `launch-secrets.env`, `.claude/`) 만 assert. **workdir 내부 파일들 (CLAUDE.md, MEMORY-SCHEMA.md, memory/*, SOUL.md) 은 절대 안 만짐.** v0.9.1 #749 가 추가한 verify+sudo-retry 는 `bridge_isolation_v2_chgrp_setgid_recursive` 에 들어갔는데, 이 helper 는 `bridge_isolation_v2_migrate_normalize_layout` 에서만 호출 — `agent-bridge migrate isolation-v2 apply` (하이픈 form, 전체 마이그레이션 도구) path 만 커버. 두 CLI 가 완전히 다른 함수로 분기되는 걸 #749 가 인지 못 함.
+
+운영자 진단 데이터 (post-v0.9.2): `grep -c bridge_isolation_v2_verify_chgrp_setgid_recursive lib/bridge-isolation-v2.sh` = 3, `grep -c workdir-verify lib/bridge-isolation-v2-migrate.sh` = 3 (코드는 디스크에 들어왔음), 그러나 `migrate isolation v2 --apply` 출력의 workdir-verify 라인 수 = 0 (호출 안 됨). 시나리오 C 확정 — 코드는 있지만 호출 dispatch 가 다른 분기로 빠짐.
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.9.x isolation-v2 layout 변경 없음. 운영자 호스트가 #746 cascade 를 보았다면 본 v0.9.3 적용 후 `agent-bridge migrate isolation v2 --apply` 한 방에 자동 회복.
+
+### Fixed (#768 — refs #746)
+
+- `lib/bridge-isolation-v2-reapply.sh:bridge_isolation_v2_reapply_one_agent` 에 writable-sub recursive 정규화 추가 (47 LOC, single function). per-path assert 직후 + ACL strip 직전 구간에 삽입. `bridge_isolation_v2_chgrp_setgid_recursive "$agent_grp" 2770 0660 "$agent_root/$sub"` 호출을 `home / workdir / runtime / logs / requests / responses` 각각에 대해 수행. apply 모드에선 실제 chgrp+chmod, check/dry-run 모드에선 `would` / `drift` action row 만 emit. helper 호출은 #749 의 verify+sudo-retry 자동 상속 — drift 감지 시 sudo retry, 그래도 drift 면 명료한 `bridge_warn`. per-sub 실패는 best-effort (errors_file append + record_action error, 다음 sub 로 continue) — repair tool 의 "fix what you can, surface what failed" 철학과 일치.
+
+### Reproduction + verification
+
+darwin tempdir BRIDGE_HOME 에서 운영자 증상 정확히 재현 (workdir DIR 은 canonical 2770/ab-agent-X, 내부 contents 는 0640/0750 + 잘못된 group). pre-fix 의 `migrate isolation v2 --apply` 는 contents 를 안 건드림 → 운영자 production 호스트 결과와 100% 일치. patched source 는 recursive 호출이 contents 를 정상 정규화 (Linux 검증 운영자 호스트에서 post-merge 진행).
+
+### Carry-over from v0.9.2
+
+#767 (daemon inbox-nudge dedup + busy-aware gate) — 별도 트랙. v0.9.4 후속 사이클에서 처리.
+
+## [0.9.2] — 2026-05-09
+
+### Highlight — post-#746/#747 wave-orchestrated bug-class sweep (13 PR)
+
+`v0.9.2` 는 v0.9.1 (`c3a09a0`, 2026-05-09 13:10 KST) 머지 직후 동일 패턴의 silent-failure / set-e-cascade / redirection-leak 을 codex-rescue + 로컬 grep 으로 코드베이스 전체 audit 한 결과 (umbrella #752) 13 PR 을 4 wave 로 병렬 처리한 hotfix 묶음이다. 모든 PR codex-rescue pair-review 통과 + squash-merge.
+
+핵심 trigger: v0.9.1 의 #746 fix (`bridge_isolation_v2_chgrp_setgid_recursive` self-verify + sudo retry) 와 #747 fix (`scripts/wiki-v2-rebuild.sh` skip-and-continue) 가 land 한 직후, 같은 bug-class 가 다른 위치에도 있는지 audit 진행. 발견: 4 HIGH + 11 MED + 19 LOW. 운영자 결정에 따라 모두 wave-orchestration 으로 fix.
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.9.0 isolation-v2 layout 변경 없음.
+
+⚠ **Known issue (carry-over)**: v0.9.1 운영 호스트에서 #746 fix 가 *defensive* 였음에도 여전히 drift 자동 회복 안 됨. 운영자 진단 결과 새 verify 코드가 실행 경로에 진입조차 못 함 — root cause 미확정 (가설: `bridge-upgrade.sh` 가 lib/bridge-isolation-v2*.sh 를 live runtime 에 복사 안 했을 가능성). v0.9.2 적용 후 다시 검증 필요. 미해결 시 v0.9.3 에서 정밀 fix.
+
+### HIGH (4 PR)
+
+- **#753 H1 — `lib/bridge-migration.sh:644-680`** unisolate 의 default-ACL 제거 path 가 `find -exec setfacl … {} + 2>/dev/null \|\| true` 로 rc 무시 + post-verify 없어서 stale ACL 잔존 가능했던 문제. `find -print0 \| xargs -0 -r setfacl` (xargs rc 전파) + `getfacl --skip-base -R \| grep` post-verify + drift 시 sudo retry. (`443c514`)
+- **#755 H2 — `lib/bridge-isolation-v2.sh:878-908`** Linux setfacl scrub 의 self-verify+sudo-retry — #749 의 H2 카운터파트. `getfacl --absolute-names --skip-base -R \| grep -E '^(user\|group\|default:user\|default:group):[^:]+:'` 로 residual ACL 감지 → sudo retry → re-verify. (`fad0cbf`)
+- **#754 H3 — `lib/bridge-isolation-v2-migrate.sh:1664-1722`** `apply_for_upgrade` 의 marker-present idempotent skip 경로에서 normalize_layout 실패가 warn-only 였던 contract break. rc 캡처 + `status:partial` JSON envelope (last_error / remediation 필드 포함) + 비-0 return. 모든 envelope 에 `status` 필드 추가 — M10 (W3d) 에서 consume. (`ddbe5fa`)
+- **#756 H4 — `lib/bridge-migration.sh:138-148`** `bridge_migration_isolate --reapply` 의 `bridge_linux_prepare_agent_isolation` 실패 시 warn-only 였던 contract break. `if !; then bridge_warn 'refusing to mark reapply complete'; return 1; fi` 로 fatal 화. (`666954c`)
+
+### MED (8 PR — Bug-A cascade + Bug-B/C/D bundles)
+
+- **#757 M1+M2 — `bridge-sync.sh:46-58 + :110-116`** 동적 에이전트 archive/remove 루프 + 세션 상태 persist 루프 둘 다 set -e 하에서 한 에이전트 실패 시 cascade abort. 둘 다 `if !; then bridge_warn; continue; fi`. (`462b78a`)
+- **#758 M3 — `lib/bridge-state.sh:2674-2696`** `bridge_reconcile_idle_markers` 의 inactive-branch 와 non-numeric-branch 둘 다 cascade 보호 추가. (`6f3993a`)
+- **#760 M4 — `bridge-agent.sh:2116-2136`** `run_rerender_settings` 의 per-target 프로브 실패가 후속 모든 타겟 rerender 를 죽이던 cascade. `if !; then bridge_warn; emit error JSON row via env-passed-vars python3 -c; failed_count++; continue; fi`. failed_count 가 함수 rc 결정 → upgrade caller 가 partial-failure 인지 가능. (`e93325b`)
+- **#759 M5 (r2) — `scripts/apply-channel-policy.sh:707-811`** per-agent allowlist overlay 루프의 Python 명령 치환 두 군데 모두 `if !; then warn; overlay_fail++; continue; fi` 가드 + 모든 overlay 실패 시 `(( overlay_fail>0 && overlay_ok==0 ))` → `exit 1` (pipefail 로 outer 전파). 운영자가 모든 agent 의 settings.local.json 이 malformed JSON 인 케이스를 silent rc=0 가 아니라 명료하게 보게 됨. (`2c9a536`)
+- **#761 W3a — `lib/bridge-tmux.sh:1138`** pending-attention lock PID write 의 redirection-order leak. `printf '%d' $$ >"$pid_file" 2>/dev/null` → `printf '%d' $$ 2>/dev/null >"$pid_file"`. (`b13d859`)
+- **#763 W3b — `lib/bridge-isolation-v2.sh:840-873`** Darwin ACL scrub `chmod -R -P -N` 의 self-verify+sudo-retry — H2/#755 의 macOS 카운터파트. `find -print0 \| xargs -0 ls -leOd \| grep -E '^[[:space:]]+[0-9]+:'` 로 residual 감지 (Darwin 은 getfacl 없으므로 ls -le 활용). (`3d79953`)
+- **#764 W3c — `lib/bridge-migration.sh:155-180 + :255-275`** `bridge_install_isolated_home_settings` 호출 두 군데 (reapply / fresh isolate) warn-only → `if !; then bridge_warn 'refusing to mark X complete'; return 1; fi` (H4 패턴 mirror). (`ad42b61`)
+- **#762 W3d — `bridge-upgrade.sh:1441/1622/1638`** upgrade 의 부분-실패 path 세 군데 (shared rerender failed_count, channel-policy `\|\| true`, profile relink failed_count) 모두 `_upgrade_partial_failures` 배열로 캡처. 최종 JSON envelope `status:"partial"\|"ok"` + `partial_failures:[…]` (sorted/dedup). NOT upgrade-fatal — 복구 가능한 부분 실패는 운영자에게 명확히 보이게 surface 만. (`a4af479`)
+
+### LOW sweep (1 PR)
+
+- **#765 W4 — 11 files / 19 sites** bash redirection-order leak 일괄 swap (`> "$f" 2>/dev/null` → `2>/dev/null > "$f"`). 모두 `\|\| true`-protected 였으므로 cosmetic 이지만 누적 stderr noise (degraded fs / cron 출력 / daemon log) 정리. 사이트: bridge-daemon.sh × 5, bin/agb, bridge-cron.sh, bridge-run.sh × 2, bootstrap-memory-system.sh, lib/bridge-isolation-v2.sh, lib/bridge-isolation-v2-migrate.sh × 3, lib/bridge-hooks.sh × 2, lib/bridge-state.sh, scripts/bridge-daemon-liveness.sh, scripts/librarian-idle-exit.sh. (`550710b`)
+
+## [0.9.1] — 2026-05-09
+
+### Highlight — v0.9.0 post-upgrade hotfix wave (2 PR)
+
+`v0.9.1` 은 v0.9.0 적용 호스트에서 같은 날 발견된 두 cascade 를 닫는다. 핵심 trigger: 운영 호스트가 `agent-bridge upgrade --apply` + `agent-bridge migrate isolation v2 --apply` 를 차례로 통과하고 *exit 0 + all dir entries `ok`* 를 보았으나, 정작 `agents/<X>/workdir/` 안의 pre-existing 파일은 v0.7→v0.8 이전 owner-group 을 그대로 유지 → controller user (`ec2-user`, `ab-agent-<X>` 그룹 멤버) 가 `workdir/CLAUDE.md` 를 read 못 함 → 토요일 06:00 KST `wiki-v2-rebuild` cron 이 PermissionError 로 abort, `set -euo pipefail` 가 sweep 전체를 죽임 → 한 에이전트의 perm drift 가 다른 5 에이전트의 weekly index rebuild 까지 silent miss 시키는 cascade.
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.9.0 isolation-v2 layout 변경 없음. v0.9.0 적용 호스트가 같은 cascade 를 보았다면 본 v0.9.1 적용 후 다음 토요일 cron slot (2026-05-16 06:00 KST) 에서 자동 회복.
+
+### Fixed (#749 — refs #746)
+
+- `lib/bridge-isolation-v2.sh` 에 belt-and-braces 가드 두 겹 추가. 새 helper `bridge_isolation_v2_verify_chgrp_setgid_recursive(group, dir_mode, file_mode, root)` 가 tree 를 walk 하면서 모든 dir/file 의 group 이 expected 와 일치하는지 + 하나의 sample dir / file 의 mode 가 expected 와 일치하는지 확인 (mode 비교는 `printf '%04o' "$((8#$mode))"` 정규화로 BSD/macOS `stat -f %A` 와 GNU `stat -c %a` parity). `bridge_isolation_v2_chgrp_setgid_recursive` 가 4 find-exec passes 직후 self-verify 호출 → drift 감지 시 `sudo -n find … -exec chgrp/chmod {} +` (no direct-first) 로 retry 후 재검증 → 여전히 drift 면 명료한 `bridge_warn` 후 return 1. 이전엔 stderr-silenced direct-first 가 find 가 0 반환했음에도 per-file chgrp 실패가 propagate 안 되는 환경 (Amazon Linux GNU findutils 등) 에서 silent no-op 로 끝나고 sudo retry path 가 미진입했다. `lib/bridge-isolation-v2-migrate.sh:bridge_isolation_v2_migrate_normalize_layout` per-agent loop 에 `[migrate] workdir-verify ok|FAIL agent=<X> grp=<grp>` 명시 로깅 — FAIL → return 1 → full apply path 의 `bridge_die` (v2 marker 미진행), upgrade path 는 warn-only (operator 가 grep 으로 식별 가능). rootless smoke regression 무영향 (caller's primary group + 2770/0660 tempdir tree 에서 verify 가 trivial pass).
+
+### Fixed (#748 — refs #747)
+
+- `scripts/wiki-v2-rebuild.sh` 의 `mkdir -p "$(dirname "$live_db")"` + `: 2>/dev/null >> "$lock_file"` 두 lock-init step 을 같은 file 의 기존 `LOCK_BUSY` / `FAIL` / `VALIDATE_FAIL` / `SWAP_FAIL` block 과 동일한 `if !; then log_audit; skipped++; continue; fi` shape 으로 가드. 새 audit tag `MKDIR_FAIL` / `LOCK_INIT_FAIL`. bash redirection 순서 footgun 회피 — `: >> "$lock_file" 2>/dev/null` 은 `>>` open 실패 시 bash 가 `2>/dev/null` 적용 *전에* `Permission denied` diagnostic 을 stderr 로 leak; `: 2>/dev/null >> "$lock_file"` 로 stderr 를 먼저 redirect. `set -euo pipefail` + ERR trap 보존. 단일 에이전트의 perm drift 가 weekly sweep 전체를 죽이던 cascade 종결 — 한 에이전트의 lock-init fail 은 한 에이전트의 skip 이고 그 이상이 아님.
+
+## [0.9.0] — 2026-05-09
+
+### Highlight — isolation-v2 migration tooling + canonical state docs
+
+`v0.9.0` 은 v0.7→v0.8 isolated-agent transition 의 ownership/ACL drift 를 자동 회복하는 새 CLI 명령을 추가하고, 그 contract 를 운영 문서로 명문화한다. minor bump 정당화: 새 CLI subcommand surface (`agent-bridge migrate isolation v2`).
+
+핵심 trigger: 이슈 #737 (운영자가 본 isolated agent 의 cascade — `agents/<X>/.claude/` 누락, plugin state files mode 0600 controller-그룹, `/home/agent-bridge-<X>/.claude/` 가 root 소유 + named-user ACL with controller 만 + agent 본인 access 끊김 등). v0.7 시절의 transitional ACL 잔재가 v0.8 hard-cut (PR #641 — KNOWN_ISSUES §16) 후에도 정리 안 된 상태가 진짜 결함이었다. v2 contract 는 운영자 mental model "kill ACLs" 와 정확히 일치 — layout 자체엔 named-user POSIX ACL surface 0개. 새 명령 `migrate isolation v2 --apply` 가 이 잔재를 자동 strip + canonical state 적용.
+
+`agent-bridge upgrade --apply` 후 isolated agent 가 `agents/<X>/...` cascade fail 하면:
+
+```
+agent-bridge migrate isolation v2 --check        # drift report
+agent-bridge migrate isolation v2 --dry-run      # planned actions
+agent-bridge migrate isolation v2 --apply        # apply fix
+agent-bridge agent start <agent>                 # restart
+```
+
+### Added (#742 — refs #737 Q1/Q2/Q3) ★ Highlight
+
+- 새 CLI subcommand `agent-bridge migrate isolation v2 [--check|--dry-run|--apply] [--agent <name>] [--json]` (lib/bridge-isolation-v2-reapply.sh, ~880 LOC). Modes: `--check` 는 drift report only, `--dry-run` 은 planned actions, `--apply` 는 mutation. `agents/<agent>/*` (root:ab-agent-<agent> 2750, subdirs 2770, credentials 2750, agent-env.sh 0640, plugin state files 0640) + `/home/agent-bridge-<agent>/*` (agent 본인 owner 0700, 모든 named-user POSIX ACL strip) 둘 다 cover. `~/.claude/.credentials.json` 미터치 (PR #641 hard-cut 후 v2 contract 외 surface). non-Linux 즉시 silent skip. macOS / non-Linux 호스트는 무영향. idempotent — 두 번째 `--apply` 는 진정한 no-op (path-local stat + named-ACL canary). credentials/launch-secrets.env 도 canonical assertion. `--json` 출력 schema: per-agent `{agent, isolated, actions[], errors[]}` + top-level `total_agents` / `total_repaired`.
+
+### Fixed (#741 — refs #737 Q5)
+
+- `bridge-setup.py` 의 `inspect_discord_dir` / `inspect_telegram_dir` / `inspect_teams_dir` 가 isolated agent 의 owner-only `.env` 를 controller 로 read 시 발생하던 PermissionError 를 PR #718 family sudo-fallback 패턴으로 해소. `_safe_read_env` / `_safe_load_json` / `_safe_path_check` / `_isolated_workdir_owner` / `_sudo_run_as` / `_parse_dotenv_text` helpers (모두 bridge-setup.py 내부 미러). sudo 미설치 시 rc 127 → 명료한 `PermissionError` ("sudo not available; cannot read X as Y. Recovery requires either installing sudo or running this command as the agent user directly.") + cause chain (`from exc`). non-Linux 는 `_isolated_workdir_owner` 가 None 반환으로 fallback 분기 미진입 — 기존 동작 보존. ms365 inspect 는 `bridge-setup.py` 에 없음 (별도 surface). 운영자가 `agent-bridge setup teams <agent>` recovery path 를 정상 사용 가능.
+
+### Fixed (#740 — refs #737 Q6)
+
+- `agent-bridge agent delete --purge-home` 가 isolated agent 의 *actual Linux home* (`/home/agent-bridge-<agent>/`) 도 제거. `getent passwd <user>` 로 정확한 home path 추출 + regex guard `^/home/agent-bridge-[a-zA-Z0-9_-]+$` 으로 운영자 home / system path 보호. `bridge_linux_sudo_root rm -rf` 사용 (root-owned). 실패 시 warn 만 (agent 자체는 이미 delete 됨, fail-loud 금지). Linux user account 자체 (`userdel`) 제거는 scope-out (별도 follow-up). non-Linux short-circuit. retire 분기 보존.
+
+### Documentation (#739 — refs #737)
+
+- `OPERATIONS.md` 에 새 섹션 "Isolation v2 canonical state and migration" — canonical state table ($BRIDGE_DATA_ROOT 환경변수 명시) + migration runbook + POSIX ACL 역할 정리. `KNOWN_ISSUES.md §16` 보강 — "v0.7 → v0.8 migration ACL leftovers" 부분 (manual recovery 명령 + 예외 없는 strip-only 정책). 신규 `docs/agent-runtime/v2-isolation-migration.md` — 깊이 있는 reference (drift signature, --check/--dry-run/--apply 사용법, manual recovery, diagnostic 명령). 모든 docs `ACL preservation count: 0` / `strip-only pass` 언어 통일 — PR #641 hard-cut contract 와 일관 (KNOWN_ISSUES §16 line 269-271, 288-292).
+
+## [0.8.9] — 2026-05-08
+
+### Highlight — second post-upgrade hotfix wave (5 PR)
+
+`v0.8.9` 은 v0.8.8 적용 호스트에서 발견된 추가 cascade 4건 + 별도 tool-policy hotfix 1건을 닫는다. 핵심: **PR #734 (closes #731)** 가 isolated agent 의 업그레이드 silent skip + JSONDecodeError 를 종결한다 — `bridge_agent_canonical_dir` 의 `cd -P` 이 isolated workdir 에서 PermissionError 일 때 `bridge_linux_sudo_root` fallback + 최종 path passthrough, 그리고 `bridge-upgrade.sh` 의 `SHARED_SETTINGS_RERENDER_JSON` 두 python heredoc 에 빈/non-JSON 방어 (`sys.exit(0)` + WARN + `raw[:200]` preview). 이 이전엔 isolated agent host 의 업그레이드가 raw traceback + "rerender failed for one or more agents" 로 끝났고 *어느 agent / 어느 step* 인지 알 수 없었다.
+
+다른 4 PR: librarian memory-daily 의 8-day 빈-슬롯 backfill loop 를 sender-gated self-signal filter 로 종결 (#732 closes #728), bootstrap-memory-system 에 `--re-jitter` flag 추가하여 long-running install 에서 모든 memory-daily 크론이 동일 minute 으로 회귀했을 때 collapse 검증 후 분산 (#733 closes #729), v0.8 layout split 후 broken 된 agent profile 의 shared-doc / skill symlink (workdir/COMMON-INSTRUCTIONS.md off-by-2, home/.claude/skills/X off-by-1) 재연결 helper 추가 (#735 closes #730), 그리고 별도 tool-policy hotfix 로 `agent-bridge config set` wrapper 가 path-argv gate 를 정상 통과하도록 (#726).
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.8 isolation-v2 layout 변경 없음. isolated agent 호스트가 v0.8.8 적용 시 raw JSONDecodeError traceback 을 보았다면 본 v0.8.9 적용 후 해당 trace 사라짐.
+
+### Fixed (#734 — closes #731)
+
+- `bridge-agent.sh:bridge_agent_canonical_dir` 가 `cd -P` PermissionError 시 `bridge_linux_sudo_root sh -c 'cd -P "$1" && pwd -P' _ "$path"` fallback 시도. `command -v bridge_linux_sudo_root` guard 로 helper 미설치 install 안전. 최종 fallback 은 입력 path passthrough (caller 의 `[[ -d ]]` 가 이미 valid 임을 증명). non-Linux platform 은 `bridge_linux_sudo_root` 가 즉시 return 으로 sudo 호출 안 됨. `bridge-upgrade.sh:1444` 와 `:2039` 두 python heredoc 에 빈/non-JSON 방어 — empty raw 는 WARN + `sys.exit(0)`, JSONDecodeError catch 후 WARN + `raw[:200]` preview. raw traceback 사라지고 어느 agent/step 가 문제인지 식별 가능.
+
+### Fixed (#732 — closes #728)
+
+- `bridge-memory.py` 의 librarian 활동 분류기에 sender-gated self-signal filter. `_is_system_sender` helper 가 `from_field` 가 `memory-daily` / `cron-dispatch` / `cron-followup` prefix 와 매치할 때만 True; `_is_self_signal_event` 가 sender gate 를 hard short-circuit (title regex / payload_kind 평가 전). human-authored task 가 우연히 `... checked ok` 같은 제목이어도 sender 가 system 이 아니면 보존. system sender 의 self-signal-shaped title (예: `[memory-daily] backfill ...`) 은 필터링; bare cron-dispatch (system + non-matching title) 도 필터링. `_scan_queue_events` 가 task title + created_by 를 JOIN 하고, `_queue_backfill` 가 모든 post-filter activity bucket 이 비어있으면 audit log + return (no backfill task 생성). 8-day 빈-슬롯 backfill loop 종결.
+
+### Fixed (#733 — closes #729)
+
+- `bootstrap-memory-system.sh --apply --re-jitter` flag 추가. long-running install 에서 모든 `memory-daily-<agent>` 크론이 같은 minute 으로 fan-out 된 케이스를 *진짜* collapse (≥2 cron at same minute) 일 때만 강제 jitter overwrite. 단일 cron at minute 0 + hour 3 + dow `*` 는 operator override 로 간주, 보존 + hint `skipped-single-minute-cron-not-collapsed`. `prepopulate_memory_daily_minute_counts` pre-pass 가 모든 static agent 의 minute count 를 사전 집계 (order-dependent 회피). drift report 에 `simultaneous=N` 어노테이션 + `memory_daily_simultaneous_fire_max` / `re_jitter_requested` top-level field 추가. `--re-jitter` 단독 사용 (apply 없이) → exit 2.
+
+### Fixed (#735 — closes #730)
+
+- `bridge-hooks.py` 에 새 subcommand `relink-profile-paths` 추가. v0.8 isolation-v2 layout split 후 broken 된 agent profile symlink 를 재연결: `agents/<agent>/workdir/{COMMON-INSTRUCTIONS,CHANGE-POLICY,TOOLS}.md` → `../../../shared/<DOC>.md` (3 levels up to BRIDGE_HOME), `agents/<agent>/home/.claude/skills/<skill>` → `../../../../../.claude/skills/<skill>` (5 levels up to `$BRIDGE_HOME/.claude/skills/<skill>`, NOT `$HOME` — on-disk skill mirror 가 BRIDGE_HOME 안에 있다). 진짜 파일 / non-symlink 가 자리 점거 시 skipped + warn entry (no clobber). isolated agent 는 PR #718 의 `_sudo_run_as` helper 재사용. `bridge-upgrade.sh` 가 daemon restart 전 `relink-profile-paths --all-agents --json` 호출 + JSON parse guard.
+
+### Fixed (#726)
+
+- `bridge-hooks.py` tool-policy gate 가 `agent-bridge config set <key> <value>` wrapper invocation 을 path-argv 패턴으로 인식해 deny 하던 문제 종결. wrapper-allowlist 분기를 path-argv 검사 *전* 으로 이동. 운영자가 `agent-bridge config set log.level debug` 같은 합법적 wrapper 호출을 다시 사용 가능.
+
+## [0.8.8] — 2026-05-08
+
+### Highlight — v0.7→v0.8 post-upgrade cascade 회복 + #720 admin kill-loop root cause
+
+`v0.8.8` 은 v0.7→v0.8.7 업그레이드 직후 호스트에서 발견된 cascade 실패를 한 번에 닫는다. 핵심: PR #721 — `apply-channel-policy.sh` 가 v0.8 isolation-v2 layout 에서 owner re-enable overlay 를 `OWNER_HOME/.claude/settings.local.json` 에 쓰지만 Claude 는 `OWNER_HOME/workdir/.claude/settings.local.json` 을 본다. overlay 가 도달 못 해서 singleton plugins (discord/telegram) 이 disabled 유지 → `bridge-run.sh` plugin pre-flight fail → tmux 죽음 → daemon 재시작 → admin/owner kill-loop. 이게 #715 §A "plugin-MCP-liveness 무한 restart" 의 **진짜 root cause**. PR #716 (MCP-liveness max-restart counter) 는 hardening.
+
+다른 7 PR 은 sudo-handoff trio (#718 — watchdog scan + manual-stop clear + cmd_link_shared_settings), daemon stale supplementary-group preflight (#717 — closes #712), bridge-start post-launch tmux has-session polling + agb admin slow-path conditional (#719 — refs #715 §C #714 §5), dashboard offline static + agb attach remediation hint (#724 — refs #714 §6/7), static-role workdir auto-rebuild on missing (#723 — refs #714 §3), bridge-init host profile onboarding + production cron gating (#725 — closes #713), human-facing plain-language SSOT (#722 — closes #711).
+
+`agent-bridge upgrade --apply` 로 자동 반영. v0.8 isolation-v2 layout 변경 없음. 운영 호스트가 kill-loop 중이라면 본 v0.8.8 적용 후 `agent-bridge daemon restart` + admin agent 재기동으로 회복.
+
+### Fixed (#721 — closes #720)
+
+- `scripts/apply-channel-policy.sh` 가 v0.8 isolation-v2 layout split 후 owner re-enable overlay 를 `OWNER_HOME/.claude/settings.local.json` (한 단계 위) 에 쓰던 결함을 종결. 새 helper `_apply_channel_policy_link_workdir_overlay` 가 admin/owner/allow 3 site 모두 `OWNER_HOME/workdir/.claude/settings.local.json` 가 한 단계 위 overlay 를 가리키는 idempotent symlink (`ln -sfn`) 를 생성. 진짜 파일이 자리에 있으면 silent skip + warn (no clobber); mkdir 실패 (isolated user 소유 workdir) 시 silent skip + warn. DRY_RUN / QUIET 기존 패턴 보존. `bridge-run.sh` plugin pre-flight 가 owner workdir 에서 singleton plugins 를 정상 enabled 로 보면 admin kill-loop 종결.
+
+### Fixed (#717 — closes #712)
+
+- `bridge-daemon.sh start` 에 supplementary group preflight 추가. v1→v2 migration 후 stale shell 에서 daemon 재시작 시 `id -G` (passwd 기준) ⊃ 현재 process 의 supplementary GID 를 확인해 누락된 v2 isolation groups (`ab-controller`, `ab-shared`, `ab-agent-*`) 가 있으면 refuse + bilingual remediation. linux-user isolation 미사용 install (예: macOS, controller_group 부재) 은 silent passthrough. `BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS=1` escape hatch. KNOWN_ISSUES.md §23 에 진단 / 회복 절차 등록.
+
+### Fixed (#718 — refs #715 §B + #714 §2/3 + #694)
+
+- Isolated agent multi-site PermissionError sudo-handoff trio. (1) `bridge-watchdog.py:scan_agent` 를 try/except 로 감싸 isolated CLAUDE.md PermissionError 가 전체 walk 를 죽이지 않도록 + warn placeholder. (2) `lib/bridge-state.sh:bridge_agent_clear_manual_stop` 에 `bridge_linux_sudo_root` fallback (PR #692 패턴 재사용) — controller user 가 isolated marker dir (mode 2750) 에 unlink 못 해도 root 로 처리. (3) `bridge-hooks.py:cmd_link_shared_settings` — mutating ops (rm/cp/symlink) 와 metadata probe (`is_symlink`/`exists`/`realpath`) 모두 try/PermissionError → `sudo -n -u <agent-user>` fallback 으로 routed. `_isolated_workdir_owner` 는 `lstat()` 사용 (symlink workdir 자체 owner). `_sudo_run_as` 는 `sudo` 미설치 시 stderr warn.
+
+### Fixed (#719 — refs #715 §C + #714 §5)
+
+- `bridge-start.sh` 세션 시작 후 짧은 `tmux has-session` 폴링 (default `BRIDGE_START_VERIFY_POLL_ATTEMPTS=10` × `BRIDGE_START_VERIFY_POLL_INTERVAL_SECONDS=1` = 10s). 폴링 도중 세션이 죽으면 `BRIDGE_START_VERIFY_LOG_TAIL_LINES=20` (default) 만큼 agent log 를 읽어 surface + 비-0 exit. `agent-bridge` admin slow-path 는 child 호출에 `_admin_rc=0; cmd ... || _admin_rc=$?` 패턴으로 `set -e` 우회 — child nonzero 시 diagnostic heredoc + `exit "$_admin_rc"` 실행. agb admin 60s arming + 죽은 세션 거짓 보고 cliff 종결.
+
+### Fixed (#723 — refs #714 §3)
+
+- `bridge-start.sh` 의 `WORK_DIR` 누락 분기를 정확히 v2 canonical static path 만 auto-rebuild 하도록 한정. 비교는 `[[ -n "$BRIDGE_AGENT_ROOT_V2" && "$WORK_DIR" == "$BRIDGE_AGENT_ROOT_V2/$AGENT/workdir" ]]` 의 prefix string 비교. 외부 임의 `--workdir` / typo 경로는 기존 `bridge_die` 보존. v2 canonical missing 시 plain `mkdir -p` → `bridge_linux_sudo_root mkdir -p` fallback (root-owned parent).
+
+### Changed (#724 — refs #714 §6/7)
+
+- `bridge-status.py` default filter 에 `source=static` OR 분기 추가 — offline static agent 도 dashboard default 에 노출 (이전엔 `--all-agents` 만). `agent-bridge` attach 실패 시 stderr 로 `[hint] bash bridge-start.sh <agent>` / `[hint] agb admin` remediation 한 줄씩 출력 + 에러 텍스트 명료화 (`에이전트 'X'의 tmux 세션이 없습니다`).
+
+### Changed (#716 — refs #715 §A — hardening)
+
+- `bridge-daemon.sh:bridge_report_plugin_liveness_miss` 에 `RESTART_ATTEMPTS` per-(agent,channel-key) 카운터 추가. `BRIDGE_PLUGIN_LIVENESS_MAX_RESTARTS` (default `5`) 초과 시 `plugin_mcp_liveness_giveup` audit 1회 emit + restart 중단 (sentinel) — 같은 key 가 다른 missing-CSV 로 바뀌면 attempts 0 reset. 60s cooldown / attached-session skip / channel-status guard 보존. (#720 가 owner kill-loop 의 진짜 driver 라 본 PR 은 안전망 hardening; backoff 는 미래 transient MCP failure 시나리오에 가치.)
+
+### Added (#725 — closes #713)
+
+- `bridge-init.sh` first-run 에 host profile 질문 (`a` server / `b` dev) + `state/install/host-profile.json` 영속화 (`chmod 0644`). non-interactive (TTY 부재) 입력은 자동 `server` (production install 회귀 차단) + stderr audit-log. `profile=dev` 면 production-style maintenance crons 10개 (`librarian-watchdog`, `wiki-mention-scan`, `wiki-daily-ingest`, `wiki-hub-audit`, `wiki-weekly-summarize`, `wiki-monthly-summarize`, `wiki-copy-full-backfill`, `wiki-dedup-weekly`, `wiki-v2-rebuild`, `wiki-repair-links`) 를 disable 제안 (default-yes). `memory-daily-*` 는 항상 보존. 재실행 시 `[host-profile] already=<dev/server> (set_at=…)` grep-able sentinel 출력 + `--reconfigure` 만 강제 재질문. 신규 helper `lib/bridge-host-profile.sh`.
+
+### Added (#722 — closes #711)
+
+- `docs/agent-runtime/common-instructions.md` 에 "Plain Language Default — 사람한테 답할 때" 섹션 추가. 사람-facing surface (Discord/Telegram 등) 답변에 5초 안에 이해되는 짧은 한국어 default + 영어 단어/축약어 절제 + 글머리표 분리 contract 명문화. agent-to-agent task body / log / diff / 코드 인용은 정확성 우선이라 그대로. install-level deviation 은 `agent SOUL.md` 또는 `docs/agent-runtime/active-preferences.md` 에서 override.
+
+## [0.8.7] — 2026-05-08
+
+### Highlight — closes #708 v0.7→v0.8 migration grep-flag-injection abort
+
+`v0.8.6` shipped earlier today closing the v0.7→v0.8 admin-pair migration chain. An operator running `bridge-upgrade.sh --apply` on a v0.7.8 install whose `agents/` directory contained a stray dir starting with `-` (e.g. `agents/--help` from a flag-typo'd pre-v0.8 `agent create` or a manual `mkdir`) hit `isolation-v2 migration failed (rc=1) reason=groups-ensure`. v0.8.7 closes that single finding with a 2-line defensive fix.
+
+**Operators on v0.8.6: upgrade to v0.8.7.** No separate v0.8.6 stop required. If your v0.8.6 install already aborted with `reason=groups-ensure` and you have a `--`-prefixed orphan dir under `agents/`, move it under `backups/` (any name) and rerun `bridge-upgrade.sh --apply` from the v0.8.7 source.
+
+### Fixed
+
+- **#708 v0.7→v0.8 migration aborted when an orphan agent dir name started with `-`** (`lib/bridge-isolation-v2-migrate.sh::bridge_isolation_v2_migrate_capture_all_agents_snapshot`): an operator running `bridge-upgrade.sh --apply` on a v0.7.8 install whose `$BRIDGE_AGENT_HOME_ROOT` contained a stray dir like `agents/--help` (created by an earlier flag-typo'd `agent create` on a pre-v0.8 install or a manual `mkdir`) hit `isolation-v2 migration failed (rc=1) reason=groups-ensure`. Root cause: the markerless directory walk called `grep -qFx "$name" "$roster_lookup"` without the `--` end-of-options separator. When `$name` started with `-`, GNU grep parsed it as a flag (`-q -F -x --help`), printed its help text to stdout (which `2>/dev/null` does not silence), and the curly-brace block's stdout was piped into `sort -u > "$snapshot"` — so `state/migration/all-agents.snapshot` ended up containing ~70 lines of grep help text mixed with real agent ids. Downstream `ensure_groups_and_memberships` then ran `bridge_isolation_v2_agent_group_name` on the polluted lines, validation failed (e.g. `'                            ACTION is 'read' or 'skip'' has invalid chars`), the migration aborted, and `restart_agents` failed for every agent. v0.8.7 hotfix: (a) add `-*` to the case-filter denylist so `--`-prefixed dirs are skipped from the walk entirely; (b) add `--` to the `grep -qFx` invocation as defense-in-depth so any future callsite that drops the case filter cannot regress the same way. Operators on v0.8.6 with a stray `--`-prefixed orphan dir can move it under `backups/` (which the case filter already excluded) and rerun `bridge-upgrade.sh --apply` without manual intervention. Closes #708.
+
+## [0.8.6] — 2026-05-08
+
+### Highlight — closes 4 v0.7→v0.8 admin-pair migration findings + bundles wave-orchestration
+
+`v0.8.5` shipped on 2026-05-08 closing 16 OrbStack VM E2E findings. Within hours an operator running `agent-bridge migrate isolation-v2 dry-run` on a v0.7.8 install with the documented `bridge_ensure_admin_codex_pair` pattern (`patch` + `patch-dev` co-located on admin's workdir for shared SOUL/MEMORY/CLAUDE.md pair-programming) hit a chain of defects that hard-blocked the migration. v0.8.6 closes the chain:
+
+1. **Migration preflight admin-pair whitelist** — recognize the `<admin>-dev` shared-workdir pattern instead of flagging it as misalignment.
+2. **`bridge_expand_user_path` helper sourcing** — moved to `lib/bridge-core.sh` so the migrate dispatch chain doesn't fall through to a `command not found` false-negative.
+3. **Public wrapper bypass arming** — `agent-bridge upgrade` / `agent-bridge migrate` now arm the layout resolver bypass before sourcing `bridge-lib.sh`, gated on marker absence so already-migrated v0.8.x installs keep using normal marker resolution.
+4. **`features.fast_mode=true` policy pinning** — every codex agent launch (admin-pair backfill, isolated create, dynamic spawn, v0.7→v0.8 migration) now pins fast_mode alongside codex_hooks, idempotently injected into already-rostered launch_cmds at runtime.
+
+Plus the `wave-orchestration` skill is now bundled and auto-distributed to every Agent Bridge agent on bootstrap.
+
+**Operators on v0.8.5: upgrade to v0.8.6.** The wrapper marker-gate ensures markered v0.8.x → v0.8.6 upgrades take the normal marker path (no behavior change). Operators on v0.7.x with admin-pair patterns are now able to run `agent-bridge migrate isolation-v2 ...` / `agent-bridge upgrade --apply` directly from a v0.8.6 source checkout without hitting the v0.8.0 fail-fast self-referential remediation loop.
+
+### Added
+
+- **`wave-orchestration` skill bundled in upstream** (`.claude/skills/wave-orchestration/`, `lib/bridge-skills.sh::bridge_bootstrap_claude_shared_skills` + `bridge_isolated_home_shared_skill_names`): the shared parallel-PR-ship orchestration spine (brief writing → `issue-fixer` dispatch into isolated git worktrees → `codex-rescue` review for >300 LOC specialized work or orchestrator-direct review for mid-size → squash-merge with structured `implement-ok` note → cleanup) is now distributed to every Agent Bridge agent on bootstrap. Pre-Wave the skill lived only in operator-level `~/.claude/skills/` — admin / dynamic / static agents needed manual symlinks. Now the same shared-skill bootstrap that already distributes `agent-bridge-runtime` / `cron-manager` / `memory-wiki` / `patch-permission-approval` also installs `wave-orchestration` so any agent that wakes can dispatch a wave with the same field-tested footgun catalog (8 documented footguns, brief template, codex-rescue setup recipe, 4 worked wave examples). The bundled `issue-fixer` agent (under the skill's `agents/` dir) is project-agnostic — operators copy to `~/.claude/agents/issue-fixer.md` once for `subagent_type: "issue-fixer"` to be available, or fall back to `general-purpose`. Generalized from the operator-private Agent Bridge build: machine-specific paths (operator's plugin cache, `/Users/<u>/...`) replaced with portable `command -v codex` / `PATH=...` resolution; Agent Bridge integration section explains queue-based dispatch (`bridge-task.sh create --to <peer>`) as the alternative to `Agent` tool dispatch for codex peers without that tool.
+
+### Fixed
+
+- **v0.7→v0.8 migration preflight rejected admin-pair shared-workdir installs** (`lib/bridge-isolation-v2-migrate.sh::bridge_isolation_v2_migrate_check_profile_home_overrides`, `lib/bridge-core.sh::bridge_expand_user_path`): two layered defects surfaced by an operator running `agent-bridge migrate isolation-v2 dry-run` on a v0.7.8 install with the documented PR #691 admin-pair pattern (`patch` + `patch-dev` co-located on the admin's workdir for shared SOUL/MEMORY/CLAUDE.md pair-programming). (a) The preflight rejected `<admin>-dev`'s explicit `BRIDGE_AGENT_PROFILE_HOME` pointing at the admin's workdir as a "misalignment", even though `bridge_ensure_admin_codex_pair` documents same-workdir as the entire point of the pair (`pair_workdir="$(bridge_agent_workdir "$admin")"` + `agent create --allow-shared-workdir`). The preflight wording was `[경고]` but the same code path called `bridge_die` on `--apply`, hard-blocking the migration. Whitelist the admin-pair pattern: a `<admin>-dev` agent whose admin exists in the roster, whose admin and pair both run in shared mode, and whose override expands to the admin's workdir is now accepted as the documented co-located pattern. Whitelist is intentionally tight — operators with stale shared-mode overrides unrelated to the pair pattern still see the misalignment warning. (b) `bridge_expand_user_path` lived in `bridge-agent.sh` (the executable) but was called from `lib/bridge-isolation-v2-migrate.sh` whose dispatch goes through `bridge-migrate.sh -> bridge-lib.sh` — `bridge-agent.sh` was never sourced, so the helper was undefined at the call site. The override fell through as the empty string, and an operator who *aligned* their `BRIDGE_AGENT_PROFILE_HOME` to exactly the v2 path was still silently flagged as mismatched (false-negative whose only stderr signal was a `bridge_expand_user_path: command not found` line that operators reasonably read as cosmetic). Move the helper to `lib/bridge-core.sh` (sourced by every consumer through `bridge-lib.sh`) as a bash-native implementation — byte-equivalent for the controller-relative paths the roster uses, no python startup, no sourcing dependency on the executable. The migration preflight also normalizes paths (trailing-slash strip) before the compare so `/x/` vs `/x` no longer flags. Operator-side workaround (manually `unset BRIDGE_AGENT_PROFILE_HOME[<admin>-dev]` before migration) is no longer required.
+- **public `agent-bridge upgrade` / `agent-bridge migrate` failed at v0.8.0 layout fail-fast on markerless v0.7.x installs** (`agent-bridge` wrapper, `lib/bridge-layout-resolver.sh::_bridge_layout_resolver_bypass_active`): an operator running `agent-bridge upgrade --apply` (or `agent-bridge migrate isolation-v2 dry-run/apply`) from a v0.8.5 source checkout against a still-markerless v0.7.x live install hit `Agent Bridge v0.8.0 requires isolation-v2` and a self-referential `remediation: run agent-bridge upgrade --apply to migrate` — i.e. the documented remediation was the very command that just died. The wrapper sourced `bridge-lib.sh` (firing the resolver) BEFORE its dispatch `case` could exec `bridge-upgrade.sh` / `bridge-migrate.sh`; those underlying scripts arm `BRIDGE_LAYOUT_RESOLVER_BYPASS=upgrade-migrate:<nonce>` themselves but only after they're exec'd, by which time the wrapper has already fail-fasted. Workarounds (path-shadowing the v0.7.x live CLI, or invoking `bridge-upgrade.sh` / `bridge-migrate.sh` directly) were undocumented. Wave-5+1 hotfix arms the same bypass in the wrapper for `upgrade` / `migrate` subcommands BEFORE the bridge-lib.sh source (mirroring the existing `init` / `bootstrap` arming for `fresh-install:<nonce>`), and extends `_bridge_layout_resolver_bypass_active`'s handshake to accept `agent-bridge` alongside `bridge-upgrade.sh` / `bridge-migrate.sh` as the owner script. Process-tree descendant gate via owner-PID is preserved, so a leaked env crossing into a sibling tree still fails the check. Closes the OrbStack VM verify finding from PR #704 r1.
+- **codex agents launched without `features.fast_mode=true`** (`bridge-agent.sh::bridge_agent_default_launch_cmd`, `lib/bridge-state.sh::bridge_codex_launch_with_hooks`, `lib/bridge-state.sh::bridge_build_dynamic_launch_cmd` + `bridge_build_resume_launch_cmd`): every codex agent launch now pins `features.fast_mode=true` alongside `features.codex_hooks=true`. Pre-hotfix the codex CLI ships fast_mode as a stable=true default, but an operator `~/.codex/config.toml` that flips it to false (or a downstream policy override) silently dropped every agent off the fast inference path — admin-pair backfill, isolated agent create, dynamic agent spawn, and v0.7→v0.8 migration all carried only `codex_hooks`. Pin `fast_mode` in the same injection point so the policy is auditable from the roster's stored launch_cmd, and idempotently inject it into already-rostered launch_cmds at runtime via `bridge_codex_launch_with_hooks` (the helper now ensures BOTH features are present, recognizing `--enable <feature>` and `-c features.<feature>=true` forms). Closes the Wave-5+1 operator request to make fast-mode the policy default for every codex call (skill, plugin, pair backfill, migration).
+
+## [0.8.5] — 2026-05-08
+
+### Highlight — closes 16 release-blocker findings surfaced by the v0.8.4 OrbStack VM E2E retest chain
+
+`v0.8.4` shipped on 2026-05-07. Follow-up OrbStack Linux VM end-to-end verification (Debian 12 + Oracle 9.7) found a 4-wave chain of release-blocker regressions: silent failed-upgrade JSON, daemon stop/start/status disagreement, scaffold predicate misfire on `agent create --isolate`, partial-state status/show/doctor crashes, v2 layout `home/`-vs-`workdir/` divergence, admin-pair backfill spurious warning, and v0.7→v0.8 migration aborts on long-running agent sessions. Wave-5 closes the 3 follow-up findings the Wave-4 retest surfaced: fresh-init missing live CLI, scaffold sudo silent-failure masking, and isolated-agent rerender state-surface mismatch. v0.8.5 is the first v0.8.x release where the OrbStack VM E2E acceptance gate (3 scenarios: fresh Debian install, Oracle 9.7 v0.8.x→v0.8.x upgrade, v0.7.7 → v0.8.x migration) passes deterministically.
+
+**Operators on v0.8.4: upgrade to v0.8.5.** No separate v0.8.4 stop is required; `agent-bridge upgrade --apply` from a v0.8.4 install converges to v0.8.5 in one pass.
+
+### Fixed
+
+- **fresh `agent-bridge init` left no live CLI under `$BRIDGE_HOME`** (`bridge-init.sh::bridge_init_ensure_live_cli`): on a non-dry-run init from a source checkout, `~/.agent-bridge/agent-bridge` was never materialized — `bridge-init.sh` only scaffolded `state/`, `runtime/`, `shared/`, the v2 marker, and the admin/admin-pair role blocks; the only code that copies tracked source into `$BRIDGE_HOME` was the standalone `scripts/deploy-live-install.sh` (documented in `OPERATIONS.md` as the upgrade path, never wired into fresh init). Operators and the OrbStack VM E2E retest harness (task #4280 Scenario A) followed the documented post-clone flow `git clone … && bash bridge-init.sh && ~/.agent-bridge/agent-bridge agent create …` and got `~/.agent-bridge/agent-bridge: No such file or directory`. The new `bridge_init_ensure_live_cli` step runs after preflight on the non-dry-run path, short-circuits when the live CLI already exists or when `$SCRIPT_DIR == $BRIDGE_HOME` (re-init / self-deploy), and otherwise dispatches `scripts/deploy-live-install.sh --target $BRIDGE_HOME` through `bridge_init_run_step` so a deploy failure fail-fasts the whole init rather than swallowing into a silent partial state. `agent-bridge init` is now a single self-contained post-clone entry point. Closes the front-line CLI-path failure surfaced repeatedly across Wave-3 / Wave-4 retests (#4226 noted as known limitation, #4280 escalated).
+- **`agent rerender-settings --apply` reported `needs-rerender` indefinitely for v2 linux-user-isolated agents** (`bridge-agent.sh::bridge_agent_shared_settings_plan_json`, `bridge-agent.sh::run_rerender_settings`): for isolated agents the apply-success branch reused the pre-apply plan as the post-apply state (`after_json="$before_json"`), and the plan helper itself read settings from `$workdir/.claude/settings.json` plus the per-agent shared `settings.effective.json` — neither of which is the path `bridge_install_isolated_home_settings` actually writes. The renderer for isolated agents installs both `settings.json` (root-owned symlink) and `settings.effective.json` (root-owned regular file) under `<isolated-home>/.claude/`, mode `0750 root:os_user`, which the controller (other) cannot stat without sudo. Result: every rerun of `agent rerender-settings --apply` for an isolated agent landed rc=0 but the row still reported `link.ok=false` / `effective.matches_expected=false` / `status=needs-rerender`. Task #4280 Wave-4 retest Scenario B surfaced this on `bob`: two consecutive applies, both rc=0, both still flagged `bob` as needs-rerender. The plan helper now detects `bridge_agent_linux_user_isolation_effective`, points the python at `<isolated-home>/.claude/{settings.json,settings.effective.json}`, and runs the read under `bridge_linux_sudo_root` so root traversal succeeds. The apply-success branch re-probes via the helper instead of cloning `before_json`. Non-isolated agents continue to read the workdir/.claude paths via plain `python3`. Refactored the inline python script body to a single staged-temp file shared by both branches so future plan-helper changes apply uniformly. Investigated against task #4280 OrbStack VM E2E retest, scope-controlled to `bridge_agent_shared_settings_plan_json` + the apply-success branch in `run_rerender_settings`.
+- **scaffold sudo-handoff silenced every failure on `agent create --isolate`** (`bridge-agent.sh::bridge_scaffold_agent_home`): every `bridge_linux_sudo_root mkdir/chown/chmod` in the v2 sudo-handoff block was wrapped in `2>/dev/null || true`, so when the controller's sudo NOPASSWD whitelist did not cover those operations (the canonical `bridge_migration_install_sudoers` entry only whitelists `tmux + bash`) the entire block silently no-op'd and the plain `mkdir -p "$home"` further down the function reported raw `mkdir: cannot create directory …: Permission denied`. Operators chasing this on the OrbStack VM E2E retest (task #4280 Scenario A.b, ~2026-05-07) had no signal that sudo was the actual cause — the scaffold appeared to skip sudo entirely and crash on a parent-perms problem. Each `mkdir/chown/chmod` step now `bridge_die`s with the failed path and a remediation hint pointing at the sudo NOPASSWD whitelist when the operation fails. Same-state idempotent reruns continue to be a bytewise no-op. Scope-controlled to the per-agent root + `$home` + v2 sibling workdir/ — paths the predicate has already confirmed are isolated-managed. The v2 ancestor parents (`$BRIDGE_DATA_ROOT`, `$BRIDGE_AGENT_ROOT_V2`) are intentionally NOT normalized here even though the canonical contract in `lib/bridge-isolation-v2.sh:36-47` says `agents/` should be `root:root 0755`: `bridge_agent_default_home` resolves shared-mode agents' home to the same v2 root, so locking the parents to root-owned would break the non-isolated v2 `agent create` path which reaches plain `mkdir -p "$home"` without a sudo handoff (caught by codex review on PR #701 r1). Operators who want the full canonical layout should use the migration tool, which owns parent normalization. Fresh `agent-bridge agent create <name> --engine codex --isolate --os-user <u>` on Debian/Oracle Linux now either completes rc=0 (sudo + isolation correctly configured) or fails with an actionable `bridge_die` naming the exact path and operation that needs operator attention. Investigated against task #4280 OrbStack VM E2E retest.
+- **#698 v0.7→v0.8 migration aborted when v0.7.7 agents stayed active in tmux** (`lib/bridge-isolation-v2-migrate.sh::bridge_isolation_v2_migrate_orchestrate_stop`): the per-agent stop loop bounded-retried `bridge-agent.sh stop <agent>` and aborted the entire upgrade with `agents still active after per-agent stop loop: <N>` whenever a v0.7.7 daemon-spawned tmux session refused to die in the loop window (CLI holding the foreground, tmux server still tracking attached client). Wave-3 OrbStack VM E2E retest #4226 Scenario C surfaced this on Oracle Linux 9.7: live `VERSION` + `installed_version` stayed at `0.7.7`, `apply-live` never ran, operator had to manually `tmux kill-session` for every alive session before retrying. Added a force-kill fallback after the existing retry loop: still-active agents are looked up via `bridge_agent_session`, escalated through `bridge_kill_agent_session` (`tmux kill-session -t <session>` + 1s bounded re-poll), and the force-killed list is written to `state/migration/force-killed-sessions.json` (timestamped) so post-migration audit can see which sessions were stopped non-cooperatively. The migration only aborts now if force-kill ALSO fails to clear the active set, with a more actionable `agents still active after force-kill fallback: <N> (sessions: <list>)` reason. First-run upgrade now succeeds even when daemon-spawned agent sessions are alive. The force-kill outcome is also visible to programmatic operators reading `agent-bridge upgrade --apply --json`: on success the `isolation_v2_migration` payload carries `force_killed_sessions` (list of agent ids) and `force_killed_sidecar` (target-root-relative path) when non-empty; on the force-kill-failure abort path the upgrade failure envelope's `error.detail` (and `state/migration/last-error.json`) now carry a structured `reason: "force-kill-failed"` body with `remaining_count`, `forced_pairs` (the stuck `agent/session` names), and `force_killed_sessions` instead of the previous generic `isolation-v2 migration failed` detail. (refs #698)
+- **#683 daemon stop/start/status post-upgrade inconsistency** (`bridge-daemon.sh::cmd_start`, `lib/bridge-state.sh::bridge_daemon_pid`): `bridge-daemon.sh start` now detects stale pid files via `kill -0` (and via cmdline mismatch on the recorded pid, to handle pid recycling), reports `stale pid file (pid=NNNN no longer alive), starting fresh`, removes the stale pid file, and proceeds. `bridge_daemon_pid` rejects a recorded pid whose cmdline no longer ends in `bridge-daemon.sh run`, so `cmd_status` and `cmd_start` agree on daemon-up determination on the post-upgrade verification path that surfaced the contradictory `start: already running pid=NNNN` / `status: stopped socket_listener=off` output (Scenario B / Oracle 0.8.2 → 0.8.4 OrbStack VM E2E retest, task #4195).
+- **#691 admin-pair backfill emitted spurious warning post-#686 fix** (`bridge-agent.sh::run_create`, `lib/bridge-admin-pair.sh::bridge_ensure_admin_codex_pair`): added `agent create --allow-shared-workdir` opt-out so the admin-pair backfill (which legitimately layers `<admin>-dev` onto the admin's already-scaffolded workdir) bypasses the non-empty-workdir guard. Post-#686, `bridge_scaffold_agent_home` materializes both `home/` and `workdir/`, and `bridge_bootstrap_project_skill` populates `<workdir>/.agents/skills/agent-bridge/` for codex admins — `run_create`'s existence check tripped on that managed content and `bridge_die`d, which `bridge-init.sh` swallowed into a non-fatal "admin-pair backfill failed" warning + a missing `<admin>-dev` registration + missing CLAUDE.md SOP block. Fresh `bridge-init.sh --admin admin --engine codex --skip-channel-setup` now finishes rc=0 with no admin-pair warning and the pair + SOP block both materialize.
+- **#677 isolated agent scaffold Permission denied on `agent create`** (`bridge-agent.sh::bridge_scaffold_agent_home`): scaffold now uses sudo-handoff (`bridge_linux_sudo_root mkdir/chown/chmod`) to pre-create the per-agent v2 root and `$home` with controller ownership when `bridge_agent_linux_user_isolation_effective` returns true, so the rest of the scaffold (template renders, mkdirs, chmods) runs as plain controller writes. `bridge_linux_prepare_agent_isolation` (which runs after scaffold) then normalizes ownership/mode to the canonical `root:ab-agent-<name> 2750` per-agent root + `<isolated>:ab-agent-<name> 2770` subdirs and `chown -R $os_user $workdir` transfers scaffolded contents to the isolated UID. Closes the front-line failure that PR #675 had scope-controlled out — fresh `agent create <name> --engine codex --isolate --os-user <u>` on Debian / Oracle Linux now completes rc=0 with no Permission denied. Mirrors PR #675's `bridge_state_sudo_install_v2_file` sudo-handoff pattern in `lib/bridge-state.sh`.
+- **#693 isolated agent scaffold permission still failed post-PR #688/#690** (`bridge-agent.sh::bridge_scaffold_agent_home`, `bridge-agent.sh::run_create`): PR #688's sudo-handoff block was correct in principle but its predicate (`bridge_agent_linux_user_isolation_effective "$agent"`) read `BRIDGE_AGENT_ISOLATION_MODE[<agent>]` / `BRIDGE_AGENT_OS_USER[<agent>]` from the in-memory roster — and at scaffold time those maps have not yet seen the new agent (the role block is written and the roster is reloaded by `run_create` AFTER `bridge_scaffold_agent_home` returns). The predicate therefore always returned false on `agent create --isolate`, the entire sudo block silently no-op'd, and plain `mkdir -p "$home"` failed because `data/agents/` is `root:root mode 755`. Pass `isolation_mode` + `os_user` as explicit parameters to `bridge_scaffold_agent_home` from `run_create` and use them directly inside the predicate (legacy roster-driven branch retained for any pre-#693 callsite that omits the new args). Fresh Debian / Oracle Linux `agent create <name> --engine codex --isolate --os-user <u>` now actually exercises the PR #688 sudo path and completes rc=0. Investigated against task #4211 OrbStack VM E2E retest Scenario A.
+- **#694 status/show/doctor still crashed on partial isolated agent state post-PR #688** (`lib/bridge-state.sh::bridge_load_static_agent_history`, `bridge-status.py::workdir_display`): two more failure sites the PR #688 fix to `pending_upgrade_conflict_count` did not cover. (a) `bridge_load_static_agent_history` did `source "$file"` after `[[ -f "$file" ]]` succeeded, but the existence test stats parent dirs (group r-x is enough) while reading the file requires the controller's process credential set to include the per-agent group — and supplementary group membership is cached at process start, so a fresh shell after `agent create --isolate` cannot read `runtime/history.env` until re-login. The unhandled `Permission denied` propagated out of `bridge_load_roster`, taking down every `bridge-agent.sh`-loaded entry point (status, show, doctor, list, ...). Added a `[[ -r "$file" ]]` guard before `source` so the load gracefully degrades to the "history file absent" fallback (no restored `AGENT_SESSION_ID`; next session-id rewrite restores it). (b) `bridge-status.py::workdir_display` called `Path(expanded).is_dir()` which can raise `PermissionError` on the same partial-state agent's `data/agents/<agent>/workdir/` subtree, crashing `agent-bridge status --all-agents`. Wrapped in `try/except OSError` and surface a `[unreadable]` tag in the dashboard row so operators retain observability instead of losing the entire render. Mirrors the graceful-walk pattern PR #688 added one site upstream.
+- **#680 `bridge-init.sh` first-run on fresh install exited rc=1 with empty log** (`bridge-agent.sh::run_create`): on a fresh v2 install, `agent create` invoked `bridge-start.sh <agent> --dry-run` purely as informational diagnostic capture, but `bridge_agent_workdir` resolves to `<agent-root>/workdir/` while `bridge_scaffold_agent_home` materializes `<agent-root>/home/` — the dry-run failed `workdir가 없습니다`, command-substitution propagated rc=1 to `set -e`, and `agent create` aborted silently before printing anything. `bridge-init.sh` redirected create's stdout to `/dev/null`, leaving operators with rc=1 + empty log on first-run init while the rerun (which short-circuits via `bridge_agent_exists`) succeeded. The dry-run capture now tolerates non-zero rc and surfaces the actual rc through the printed `start_dry_run:` field; first-run `bridge-init.sh` exits rc=0 on a clean home, idempotent rerun preserved, the underlying scaffold-vs-resolver mismatch remains visible in the create output for follow-up. (refs #680)
+- **#681 `agent-bridge status --all-agents` PermissionError crash on partial isolated agent state** (`bridge-status.py::pending_upgrade_conflict_count`): the `home.rglob("*.upgrade-conflict")` walk used by the dashboard's `pending upgrade-conflicts` warning line propagated the first `PermissionError` raised by an unreadable `data/agents/<broken-agent>/workdir/` subtree out of the function, crashing the entire status render. Replaced with an explicit `os.scandir` stack walk that catches `PermissionError`/`OSError` per directory: a single denied subtree is skipped, iteration continues, and operators retain dashboard observability of the partial-create state they need to triage. `backups/...` exclusion behavior preserved.
+- **#682 v0.7→v0.8 migration emits invalid `--json` on failure + leaves `installed_version` stale at 0.7.7** (`bridge-upgrade.sh`): two related findings from v0.8.4 OrbStack VM E2E retest task #4195 Scenario C. (a) `agent-bridge upgrade --apply --json` rc=1 path now emits a single valid JSON envelope on stdout with `error: { reason, detail, remediation }`, the `isolation_v2_migration` payload, and the version fields — instead of dropping out of the JSON contract entirely on `bridge_die` / `set -e` aborts. Wired through an EXIT trap that fires when `JSON=1` and `_BRIDGE_UPGRADE_JSON_EMITTED=0`; the migration block populates `_BRIDGE_UPGRADE_DIE_{REASON,DETAIL,REMEDIATION}` so the envelope carries actionable detail rather than just `rc=1`. (b) `installed_version` / `installed_ref` / `installed_head` (the metadata under `state/upgrade/last-upgrade.json`) now advances atomically with the live `VERSION` write — the `write-state` call moved from the very end of the apply path to immediately after `apply-live`, so any subsequent helper failure (shared-settings rerender, migrate-agents, daemon-restart-blocked-by-supplemental-group-cache) cannot leave the two states desynchronized. The previous tail position produced the observed `live VERSION=0.8.4 + installed_version=0.7.7` mismatch on rc=1 paths.
+- **#686 v2 layout: `bridge_scaffold_agent_home` only created `home/` while resolver expected `workdir/`** (`bridge-agent.sh::bridge_scaffold_agent_home`): scaffold now also materializes the v2 sibling `workdir/` (`<BRIDGE_AGENT_ROOT_V2>/<agent>/workdir`) per the canonical ASCII layout in `lib/bridge-isolation-v2.sh` (both subdirs are required, distinct purposes — `home/` is the isolated process HOME, `workdir/` is the project tree the agent operates in). On v2 fresh installs, `bridge-start.sh --dry-run` previously failed `workdir가 없습니다` because `bridge_agent_workdir` returns `<agent-root>/workdir/` while the scaffold materialized only `<agent-root>/home/`. This closes the silent-fail mode that PR #685 made visible (`start_dry_run: warn (rc=1)`). Legacy installs (no `BRIDGE_AGENT_ROOT_V2`) keep `home == workdir` and are unaffected. (refs #686)
+
+## [0.8.4] — 2026-05-07
+
+### Highlight — closes 5 release-blocker regressions surfaced by v0.8.3 OrbStack VM E2E
+
+`v0.8.3` shipped on 2026-05-07 with the silent-data-loss fix for v0.7.x → v0.8.x upgrades, but follow-up OrbStack Linux VM end-to-end verification (Debian 12 + Oracle 9.7) found 5 release-blocker regressions: fresh install rejection, silent failed upgrade, broken Linux isolation, broken v0.7.x → v0.8.3 migration, and non-idempotent rerender. v0.8.4 closes all five plus a host regression in `agent-bridge agent doctor`.
+
+**Operators on v0.8.3: upgrade to v0.8.4.** Operators on v0.7.x → v0.8.3 migrations that aborted on Linux: re-run `agent-bridge upgrade --apply` after upgrading to v0.8.4 source.
+
+### Fixed
+
+- **#665 fresh install rejected on markerless install** (`bridge-init.sh`, `bridge-bootstrap.sh`, `agent-bridge`, `lib/bridge-layout-resolver.sh`): both the underlying scripts and the public `agent-bridge init` / `agent-bridge bootstrap` CLI wrappers now arm a one-shot `BRIDGE_LAYOUT_RESOLVER_BYPASS=fresh-install:<nonce>` env so the v0.8.0 fail-fast guard accepts a clean home as a fresh install while still rejecting `markerless(existing-install)`. Trap on EXIT prevents env leakage to sibling shells. Resolver argv handshake updated to accept the wrapper argv pattern. (#674)
+- **#666 silent failed upgrade — `rc=0 + files_copied=0 + version mismatch`** (`bridge-upgrade.py::analyze_live`): the per-file classifier now force-deploys (`upstream_only`) on cross-version upgrade when `base_ref` is not resolvable, instead of falling back to `keep_live`. Same-version reruns (operator drift) and missing-VERSION corner stay on `keep_live`. Dev clones with `0.0.0-dev` source sentinel correctly classify as unknown-skip. (#671)
+- **#667 Linux isolation v2 broken** (`lib/bridge-isolation-v2.sh`, `lib/bridge-agents.sh`, `lib/bridge-isolation-v2-migrate.sh`, `lib/bridge-state.sh`): two layered fixes. (a) `bridge_isolation_v2_agent_group_name` on Linux now hash-truncates long agent names instead of hard-rejecting (`<first-N-chars>-<7-char-sha256>`). Darwin keeps full 255-char names. (b) Per-agent root mode stays at `2750` (was 2750→2770 attempt in r1, reverted) — `2770` would break the credentials/ isolation guarantee because group rwx on parent lets group members `rmdir credentials/`. Controller-write sites under `BRIDGE_AGENT_ROOT_V2/<agent>/` (e.g., `runtime/history.env`) now route through the sudo-handoff helper `bridge_state_sudo_install_v2_file` (mirrors PR #673's cross-UID install pattern). `apply_for_upgrade` runs `normalize_layout` before the marker-present skip so existing v0.8.0~v0.8.3 installs get re-pinned to canonical modes. (#675)
+- **#668 v0.7.7 → v0.8.3 migration aborted on Linux daemon restart** (`lib/bridge-isolation-v2-migrate.sh::orchestrate_restart`, `bridge-upgrade.sh`): root cause was supplemental-group-cache — `usermod` adds the operator to the new `ab-controller` group but the running shell's group set is cached until next login, so spawning the daemon from this shell inherits stale groups and dies. The non-launchd branch now treats `bridge-daemon.sh start` + `wait_daemon_present` as best-effort: warns + advances the marker + lets `apply-live` install v0.8.x code. Operator finishes by re-login + `agb daemon start`. The `upgrade --json` payload now surfaces `migration_requires_relogin: true` via the `isolation_v2_migration` field for JSON-mode operators. (#674)
+- **#669 rerender cross-UID Permission denied not idempotent** (`bridge-agent.sh::run_rerender_settings`, `lib/bridge-hooks.sh`): for v2 linux-user-isolated agents, the rerender helper now detects `bridge_agent_linux_user_isolation_effective` up-front and routes through `bridge_install_isolated_home_settings` (sudo-handoff, foreign-UID atomic install), instead of the original `bridge_link_claude_settings_to_shared` path that hit `PermissionError` on `<workdir>/.claude/`. The previous `|| true` swallow at the rerender call site is dropped — internal helper failures (mkdir/render/install/atomic-mv/symlink) now propagate `rc=1` + increment `failed_count` + surface in audit JSON instead of silently reporting success. Migration callsites still use `|| bridge_warn` for best-effort. (#673)
+- **#670 agent-doctor leaked stale temporary BRIDGE_HOME hook paths into `~/.codex/hooks.json`** (`lib/bridge-doctor.sh::bridge_doctor_invoke_agent`): every doctor child invocation (CRUD steps + cleanup-trap delete) now exports `BRIDGE_CODEX_HOOKS_FILE=$BRIDGE_HOME/.codex/hooks.json` inside the wrapper subshell only. Codex CLI then reads/writes the doctor's isolated hooks.json instead of the operator's real `~/.codex/hooks.json`. The redirected hooks.json dies with the temp BRIDGE_HOME on exit. Operator's global config sha256 byte-identical before/after doctor run. (#672)
+
+### Known issues / v0.8.5 follow-up
+
+- **`bridge_scaffold_agent_home` Permission denied for short-name isolated agents on `agent create`**: a separate failure point from #667. The scaffold path runs before `bridge_linux_prepare_agent_isolation` and may still hit `mkdir: cannot create directory data/agents/<agent>: Permission denied` on Linux. Fix scope-controlled out of v0.8.4 r2 to keep PR size bounded; tracked for v0.8.5.
+- **non-blocking migration warnings** (deferred from #668): non-launchd daemon-start errors are uniformly labeled supplemental-group-cache (unrelated daemon failures get swallowed); systemd path is not distinguished from no-init fallback; `tests/isolation-v2-pr-f/smoke.sh` is stale relative to current v0.8.0 rejection behavior; concurrent init invocations on different `--data-root` race without an init-level lock.
+
+### Operator notes
+
+- **v0.8.3 was not OrbStack-VM-verified** despite the release notes claiming end-to-end coverage. v0.8.4 should be the first v0.8.x release where the OrbStack VM E2E (3 scenarios: fresh Debian install, Oracle 9.7 v0.8.x→v0.8.x upgrade, v0.7.7 → v0.8.x migration) passes end-to-end. Wave-end VM retest pending.
+- The wave that produced v0.8.4 used 1 ephemeral `upstream-issue-fixer` per track + `codex:codex-rescue` review per PR, with `orchestrator-direct` review fallback when the codex broker hit the `'mode,'` model config error mid-wave (memory `feedback_codex_review_parallel_subagent.md`).
+
 ## [0.8.3] — 2026-05-07
 
 ### Highlight — fixes silent data loss on v0.7.x → v0.8.x upgrade

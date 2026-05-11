@@ -232,6 +232,30 @@ bridge_source_head() {
   git -C "$BRIDGE_SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || printf '-'
 }
 
+# Expand a leading `~` or `~/...` to $HOME. Bash-native equivalent of
+# `pathlib.Path(p).expanduser()` for the agent-bridge path patterns the
+# roster actually uses (`~`, `~/foo`, `/abs/...`, or a relative path).
+# Issue v0.8.6 hotfix: previously this lived in bridge-agent.sh and called
+# `bridge_agent_manage_python`, so any caller that didn't transitively
+# source bridge-agent.sh saw `bridge_expand_user_path: command not found`
+# (e.g. `lib/bridge-isolation-v2-migrate.sh:136` running under
+# `bridge-migrate.sh`'s sourcing chain). Move the helper here so every
+# bridge-lib.sh consumer has it without sourcing the executable script.
+# Bash-native by design: drops the python startup cost on every call site
+# (rerender preflight, scaffold path resolution, migration preflight) and
+# is byte-equivalent for the inputs the codebase actually uses. The python
+# `~user` expansion is intentionally not supported — agent roster paths
+# are always controller-relative.
+bridge_expand_user_path() {
+  local raw="$1"
+  case "$raw" in
+    '')   printf '%s' "" ;;
+    '~')  printf '%s' "$HOME" ;;
+    \~/*) printf '%s%s' "$HOME" "${raw:1}" ;;
+    *)    printf '%s' "$raw" ;;
+  esac
+}
+
 bridge_source_ref() {
   git -C "$BRIDGE_SCRIPT_DIR" describe --tags --exact-match HEAD 2>/dev/null \
     || git -C "$BRIDGE_SCRIPT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null \

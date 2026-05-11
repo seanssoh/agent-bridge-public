@@ -136,8 +136,13 @@ bridge_migration_isolate() {
       printf '[done] isolation plan (reapply) printed for %s\n' "$agent"
       return 0
     fi
-    bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir" "$(bridge_current_user)" || \
-      bridge_warn "bridge_linux_prepare_agent_isolation returned non-zero for $agent; re-run isolate or check acceptance runbook §2"
+    # Issue #752 H4 — ACL prep is the load-bearing step of --reapply.
+    # If it fails, refuse to print [done] / return 0; otherwise the operator
+    # sees a clean reapply on top of partially-applied isolation perms.
+    if ! bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir" "$(bridge_current_user)"; then
+      bridge_warn "bridge_linux_prepare_agent_isolation failed for $agent during --reapply; refusing to mark reapply complete. Address the underlying cause (sudo policy, missing os_user, perm denied on $workdir) and re-run 'agent-bridge isolate $agent --reapply'. See acceptance runbook §2."
+      return 1
+    fi
     # Issue #544 PR3 — refresh the bridge-native skills under the
     # isolated HOME (.claude/skills/) so existing isolated agents pick
     # up new/changed skills on `--reapply` without unisolate→isolate.
@@ -150,8 +155,12 @@ bridge_migration_isolate() {
     # Issue #544 PR2 — refresh the per-isolated-home Claude
     # settings.json + settings.effective.json so existing isolated
     # agents pick up the bridge hook entries on `--reapply` without an
-    # unisolate→isolate cycle. Best-effort: warn but don't bail — the
-    # ACL reapply above is the load-bearing step.
+    # unisolate→isolate cycle.
+    # Issue #752 W3c (M8) — settings install is load-bearing on reapply:
+    # without it, hooks/policy entries silently fail to re-render and the
+    # operator's state file says "done" while the agent runs without
+    # bridge hooks. Match H4's contract at line 142-145 — refuse to mark
+    # reapply complete if the install fails.
     if command -v bridge_install_isolated_home_settings >/dev/null 2>&1; then
       # Issue #570: managed autoCompactWindow default is unconditionally
       # 1_000_000; launch_cmd is forwarded for caller-signature parity
@@ -160,8 +169,10 @@ bridge_migration_isolate() {
       # (bridge-agent.sh:1655-1669).
       local _reapply_launch_cmd=""
       _reapply_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || printf '')"
-      bridge_install_isolated_home_settings "$agent" "$_reapply_launch_cmd" \
-        || bridge_warn "isolated-home settings install returned non-zero for $agent; re-run isolate --reapply or check OPERATIONS.md isolated-agent section"
+      if ! bridge_install_isolated_home_settings "$agent" "$_reapply_launch_cmd"; then
+        bridge_warn "bridge_install_isolated_home_settings failed for $agent during --reapply; refusing to mark reapply complete. Address the underlying cause (perm denied on settings.local.json under the isolated HOME, missing renderer deps) and re-run 'agent-bridge isolate $agent --reapply'. See OPERATIONS.md isolated-agent section."
+        return 1
+      fi
     fi
     printf '[done] ACL reapply complete for %s\n' "$agent"
     return 0
@@ -250,13 +261,20 @@ bridge_migration_isolate() {
     # Issue #544 PR2 — install bridge hook entries into the freshly
     # provisioned isolated HOME so SessionStart, UserPromptSubmit, Stop,
     # PermissionDenied, PreToolUse/PostToolUse all fire from first
-    # session. Best-effort; failure here doesn't block migration.
+    # session.
+    # Issue #752 W3c (M9) — settings install is load-bearing on a fresh
+    # isolate: without it, the agent can start under linux-user isolation
+    # without bridge hooks rendered into its .claude/settings.local.json.
+    # Match H4's contract at line 142-145 — refuse to mark isolation
+    # complete if the install fails.
     if command -v bridge_install_isolated_home_settings >/dev/null 2>&1; then
       # Same launch_cmd forward as the --reapply branch above.
       local _isolate_launch_cmd=""
       _isolate_launch_cmd="$(bridge_agent_launch_cmd_raw "$agent" 2>/dev/null || printf '')"
-      bridge_install_isolated_home_settings "$agent" "$_isolate_launch_cmd" \
-        || bridge_warn "isolated-home settings install returned non-zero for $agent; re-run isolate --reapply"
+      if ! bridge_install_isolated_home_settings "$agent" "$_isolate_launch_cmd"; then
+        bridge_warn "bridge_install_isolated_home_settings failed for $agent during isolate; refusing to mark isolate complete. Address the underlying cause (perm denied on settings.local.json under the isolated HOME, missing renderer deps) and re-run 'agent-bridge isolate $agent --reapply'. See OPERATIONS.md isolated-agent section."
+        return 1
+      fi
     fi
   fi
 
@@ -644,10 +662,39 @@ bridge_migration_unisolate() {
   for _acl_target in "${acl_strip_paths_recursive[@]}"; do
     [[ -n "$_acl_target" ]] || continue
     bridge_migration_print_step "$dry_run" "setfacl -R -x u:${os_user} ${_acl_target}"
-    bridge_migration_print_step "$dry_run" "find ${_acl_target} -type d -exec setfacl -d -x u:${os_user} {} +"
+    bridge_migration_print_step "$dry_run" "find ${_acl_target} -type d -print0 | xargs -0 -r setfacl -d -x u:${os_user}"
     if [[ "$dry_run" != "1" ]]; then
       bridge_linux_sudo_root setfacl -R -x "u:${os_user}" "$_acl_target" 2>/dev/null || true
-      bridge_linux_sudo_root find "$_acl_target" -type d -exec setfacl -d -x "u:${os_user}" {} + 2>/dev/null || true
+      # Default-ACL strip: `find -exec setfacl ... +` was observed to
+      # return rc=0 even when individual setfacl calls failed (issue
+      # #746 root cause). Pipe through `xargs -0 -r` instead so per-
+      # invocation failures propagate via xargs rc. The whole pipeline
+      # runs under `sh -c` because `bridge_linux_sudo_root find ... |
+      # xargs ...` would only sudo the find half. `xargs -r` is GNU-
+      # only but this is a Linux-only path (bridge_migration_require_linux).
+      bridge_linux_sudo_root sh -c \
+        'find "$1" -type d -print0 | xargs -0 -r setfacl -d -x "u:$2"' \
+        _ "$_acl_target" "$os_user" 2>/dev/null || true
+      # Post-verify: any surviving named ACL for os_user is a regression
+      # (the audit invariant from #752 H1). Retry once sudo-only; if
+      # still drifted, warn loudly with the first surviving path.
+      # Best-effort — unisolate must not abort on residual ACL.
+      if command -v getfacl >/dev/null 2>&1; then
+        local _residual
+        _residual="$(bridge_linux_sudo_root getfacl --absolute-names --skip-base -R "$_acl_target" 2>/dev/null \
+                      | grep -E "^(user|default:user):${os_user}:" | head -n1 || true)"
+        if [[ -n "$_residual" ]]; then
+          bridge_linux_sudo_root setfacl -R -x "u:${os_user}" "$_acl_target" 2>/dev/null || true
+          bridge_linux_sudo_root sh -c \
+            'find "$1" -type d -print0 | xargs -0 -r setfacl -d -x "u:$2"' \
+            _ "$_acl_target" "$os_user" 2>/dev/null || true
+          _residual="$(bridge_linux_sudo_root getfacl --absolute-names --skip-base -R "$_acl_target" 2>/dev/null \
+                        | grep -E "^(user|default:user):${os_user}:" | head -n1 || true)"
+          if [[ -n "$_residual" ]]; then
+            bridge_warn "unisolate: residual ACL after strip on $_acl_target: $_residual (operator: investigate underlying setfacl/sudo failure; rerun unisolate after addressing it)"
+          fi
+        fi
+      fi
     fi
   done
   # history_file is a regular file (not a directory). `-R` is a no-op

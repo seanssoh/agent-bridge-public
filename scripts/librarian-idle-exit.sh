@@ -24,7 +24,7 @@ AGENT="librarian"
 LOG="$BRIDGE_HOME/state/librarian-watchdog.log"
 GRACE_SECONDS="${LIBRARIAN_IDLE_GRACE_SECONDS:-60}"
 
-log() { printf '%s [idle-exit] %s\n' "$(date +%FT%T%z)" "$*" >>"$LOG" 2>/dev/null || true; }
+log() { printf '%s [idle-exit] %s\n' "$(date +%FT%T%z)" "$*" 2>/dev/null >>"$LOG" || true; }
 
 if ! "$BRIDGE_CLI" agent list 2>/dev/null | awk '{print $1}' | grep -qx "$AGENT"; then
   log "librarian not registered — nothing to stop"

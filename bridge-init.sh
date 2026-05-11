@@ -4,10 +4,25 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# Issue #665: the layout resolver fails fast on markerless installs. On a
+# fresh install the marker does not yet exist, so we MUST arm the
+# fresh-install bypass before sourcing bridge-lib.sh. The resolver only
+# honors the bypass when classification is fresh-install-candidate
+# (no existing-install evidence) — an existing markerless install still
+# trips the v0.8.0 fail-fast and is sent to `agent-bridge upgrade --apply`.
+# The bypass value carries a unique nonce, and the resolver only honors
+# it when the calling process is a descendant of the init owner PID, so
+# a leaked or copied env var alone cannot disarm the fail-fast guard.
+_BRIDGE_INIT_BYPASS_NONCE="$(date -u '+%Y%m%dT%H%M%SZ')-$$-${RANDOM}${RANDOM}"
+export BRIDGE_LAYOUT_RESOLVER_BYPASS="fresh-install:${_BRIDGE_INIT_BYPASS_NONCE}"
+export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
+trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 # shellcheck source=lib/bridge-admin-pair.sh
 source "$SCRIPT_DIR/lib/bridge-admin-pair.sh"
+# shellcheck source=lib/bridge-host-profile.sh
+source "$SCRIPT_DIR/lib/bridge-host-profile.sh"
 # bridge_load_roster is deferred until after argument parsing so that
 # `init --dry-run` is mutation-free (bridge_load_roster -> bridge_init_dirs
 # would otherwise create $BRIDGE_HOME/state on a fresh-install-candidate and
@@ -17,7 +32,7 @@ source "$SCRIPT_DIR/lib/bridge-admin-pair.sh"
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") [--admin <agent>] [--engine claude|codex] [--session <name>] [--workdir <path>] [--user <id[:display-name]>]... [--channels <csv>] [--discord-channel <id>]... [--allow-from <id>]... [--default-chat <id>] [--teams-app-id <id>] [--teams-app-password <secret>] [--teams-tenant-id <id>] [--teams-allow-from <id>]... [--teams-conversation <id>]... [--channel-account <account>] [--runtime-config <path>] [--api-base-url <url>] [--skip-validate] [--skip-send-test] [--skip-channel-setup] [--test-start] [--dry-run] [--json]
+  $(basename "$0") [--admin <agent>] [--engine claude|codex] [--session <name>] [--workdir <path>] [--user <id[:display-name]>]... [--channels <csv>] [--discord-channel <id>]... [--allow-from <id>]... [--default-chat <id>] [--teams-app-id <id>] [--teams-app-password <secret>] [--teams-tenant-id <id>] [--teams-allow-from <id>]... [--teams-conversation <id>]... [--channel-account <account>] [--runtime-config <path>] [--api-base-url <url>] [--profile server|dev] [--reconfigure] [--skip-validate] [--skip-send-test] [--skip-channel-setup] [--test-start] [--dry-run] [--json]
 
 Examples:
   $(basename "$0") --admin patch --engine claude --channels plugin:telegram@claude-plugins-official --allow-from 123456789 --default-chat 123456789 --channel-account default
@@ -109,6 +124,37 @@ bridge_init_run_step() {
   fi
 }
 
+bridge_init_ensure_live_cli() {
+  # Issue #4282 Wave-5: on a non-dry-run init, deploy the live CLI under
+  # $BRIDGE_HOME so the operator's next command (`~/.agent-bridge/agent-bridge
+  # agent create ...`, the canonical post-init flow documented in the
+  # OrbStack VM E2E retest brief) finds the binary it expects. Without
+  # this, `bridge-init.sh` from a fresh source checkout returned rc=0 with
+  # only state/runtime/shared/ scaffolded — the `agent-bridge` script
+  # itself stayed under $SCRIPT_DIR (which is $HOME/.agent-bridge-source,
+  # not $BRIDGE_HOME), and operators / VM retest harnesses fell off the
+  # documented path with `~/.agent-bridge/agent-bridge: No such file or
+  # directory`. The only existing code that materializes the CLI under
+  # $BRIDGE_HOME was the standalone `scripts/deploy-live-install.sh` —
+  # tracked in OPERATIONS.md as the upgrade path, never wired into the
+  # fresh-init dispatch. Wire it here so `agent-bridge init` is the single
+  # post-clone entry point operators need.
+  #
+  # Idempotent: short-circuits when the CLI already exists at the live
+  # path (re-init / partial-state recovery) and when init was invoked
+  # from $BRIDGE_HOME directly (self-deploy would overwrite live state
+  # we are still initializing). Errors fail-fast through
+  # `bridge_init_run_step` rather than warn-and-continue, since a
+  # missing live CLI breaks the whole operator workflow.
+  [[ $dry_run -eq 0 ]] || return 0
+  [[ -x "$BRIDGE_HOME/agent-bridge" ]] && return 0
+  local script_dir_canonical bridge_home_canonical
+  script_dir_canonical="$(cd -P "$SCRIPT_DIR" 2>/dev/null && pwd -P || printf '%s' "$SCRIPT_DIR")"
+  bridge_home_canonical="$(cd -P "$BRIDGE_HOME" 2>/dev/null && pwd -P || printf '%s' "$BRIDGE_HOME")"
+  [[ "$script_dir_canonical" != "$bridge_home_canonical" ]] || return 0
+  bridge_init_run_step "live install deploy" "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/deploy-live-install.sh" --target "$BRIDGE_HOME"
+}
+
 bridge_init_warnings_json() {
   bridge_require_python
   python3 - "${WARNINGS[@]}" <<'PY'
@@ -156,6 +202,9 @@ notify_target=""
 notify_account=""
 api_base_url=""
 user_specs=()
+host_profile_reconfigure=0
+host_profile_override=""
+host_profile_chosen=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -308,6 +357,18 @@ while [[ $# -gt 0 ]]; do
     --always-on)
       always_on=1
       shift
+      ;;
+    --reconfigure)
+      host_profile_reconfigure=1
+      shift
+      ;;
+    --profile)
+      [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+      case "$2" in
+        server|dev) host_profile_override="$2" ;;
+        *) bridge_die "--profile 은 server 또는 dev 여야 합니다 (got: $2)" ;;
+      esac
+      shift 2
       ;;
     --dry-run)
       dry_run=1
@@ -562,6 +623,32 @@ else
   final_session="${BRIDGE_AGENT_SESSION[$admin_agent]-$session}"
   final_workdir="${BRIDGE_AGENT_WORKDIR[$admin_agent]-${workdir:-$(bridge_agent_default_home "$admin_agent")}}"
 fi
+
+bridge_init_ensure_live_cli
+
+# Issue #713: ask the operator whether this is a server (always-on production
+# host) or a developer PC, and on `dev` offer to disable the production-style
+# librarian/wiki maintenance crons that drown a laptop in `[cron-followup]`
+# tasks every transient API blip. Skipped on --dry-run (mutation-free
+# contract). Non-interactive contexts (`--json`, no TTY) default to `server`
+# to preserve today's behavior on hosted installs. Re-running init on an
+# already-answered host is a no-op unless `--reconfigure` is passed.
+if [[ $dry_run -eq 0 ]]; then
+  # Prefer the live CLI deployed under $BRIDGE_HOME (canonical post-init
+  # surface — bridge_init_ensure_live_cli just materialized it). Fall back
+  # to the source checkout's CLI when init is invoked from $BRIDGE_HOME
+  # itself (the self-deploy short-circuit branch).
+  host_profile_cli="$BRIDGE_HOME/agent-bridge"
+  if [[ ! -x "$host_profile_cli" ]]; then
+    host_profile_cli="$SCRIPT_DIR/agent-bridge"
+  fi
+  host_profile_chosen="$(bridge_host_profile_run \
+    "$host_profile_cli" \
+    "$host_profile_reconfigure" \
+    "$host_profile_override" \
+    "$json_mode")" || host_profile_chosen=""
+fi
+
 warnings_json="$(bridge_init_warnings_json)"
 
 if [[ $json_mode -eq 1 ]]; then
@@ -598,6 +685,9 @@ printf 'created: %s\n' "$([[ $created -eq 1 ]] && echo yes || echo no)"
 printf 'channel_setup: %s\n' "$channel_setup_status"
 printf 'preflight: %s\n' "$preflight_status"
 printf 'admin_saved: %s\n' "$([[ $admin_saved -eq 1 ]] && echo yes || echo no)"
+if [[ -n "$host_profile_chosen" ]]; then
+  printf 'host_profile: %s\n' "$host_profile_chosen"
+fi
 for warning in "${WARNINGS[@]}"; do
   printf 'warning: %s\n' "$warning"
 done
