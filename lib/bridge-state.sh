@@ -745,14 +745,28 @@ for name, value in assignments:
         if env_prefix[s_:e_].startswith(prefix_form)
     ]
     if spans:
+        # r2 codex catch on PR #790: replace the FIRST matching span
+        # with canonical, drop all subsequent spans entirely. Otherwise
+        # `NAME=/old1 NAME=/old2` produces two canonical entries
+        # (`NAME=/new NAME=/new`) instead of collapsing to a single
+        # final assignment. Even though shell eval is last-wins (so the
+        # value would still be correct), duplicate exported assignments
+        # are a code smell and surface in audit/logs as if multiple
+        # stale values survived. Final re.sub collapses any double
+        # spaces left by drops.
         pieces = []
         last = 0
+        first = True
         for s_, e_ in spans:
             pieces.append(env_prefix[last:s_])
-            pieces.append(f"{name}={quoted_value}")
+            if first:
+                pieces.append(f"{name}={quoted_value}")
+                first = False
+            # else: drop this span entirely (no append)
             last = e_
         pieces.append(env_prefix[last:])
         env_prefix = "".join(pieces)
+        env_prefix = re.sub(r" {2,}", " ", env_prefix)
         if env_prefix and not env_prefix.endswith((" ", "\t")):
             env_prefix += " "
     else:

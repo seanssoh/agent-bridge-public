@@ -5488,6 +5488,51 @@ assert_contains "$TEAMS_MS365_BOTH_LAUNCH" "OTHER_ENV=keep"
 assert_not_contains "$TEAMS_MS365_BOTH_LAUNCH" "TEAMS_STATE_DIR=/stale/.teams"
 assert_not_contains "$TEAMS_MS365_BOTH_LAUNCH" "MS365_STATE_DIR=/stale/.ms365"
 
+# PR #790 r2 codex catch — duplicate stale assignments for the SAME VAR
+# must collapse to exactly ONE canonical entry. The replacement loop
+# previously emitted a canonical assignment for EACH matching span,
+# producing `MS365_STATE_DIR=/new MS365_STATE_DIR=/new` instead of a
+# single final assignment. Shell eval is last-wins so the value is
+# still correct, but duplicate exported assignments surface in audit
+# logs / `ps` output as if multiple stale entries survived. The fix
+# is symmetric across all four channel state dirs; verify both an
+# MS365 case and a TEAMS case so the contract is enforced for the
+# whole family.
+MS365_DUP_LAUNCH="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["'"$CREATED_AGENT"'"]="plugin:ms365@agent-bridge"
+  raw="MS365_STATE_DIR=/stale1/.ms365 MS365_STATE_DIR=/stale2/.ms365 claude --dangerously-load-development-channels plugin:ms365@agent-bridge --dangerously-skip-permissions --name '"$CREATED_AGENT"'"
+  bridge_claude_launch_with_channel_state_dirs "'"$CREATED_AGENT"'" "$raw"
+')"
+assert_contains "$MS365_DUP_LAUNCH" "MS365_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.ms365"
+assert_not_contains "$MS365_DUP_LAUNCH" "/stale1/.ms365"
+assert_not_contains "$MS365_DUP_LAUNCH" "/stale2/.ms365"
+python3 - "$MS365_DUP_LAUNCH" <<'PY'
+import re
+import sys
+command = sys.argv[1]
+matches = re.findall(r"\bMS365_STATE_DIR=", command)
+assert len(matches) == 1, f"expected 1 MS365_STATE_DIR=, got {len(matches)}: {command!r}"
+PY
+TEAMS_DUP_LAUNCH="$("$BASH4_BIN" -c '
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_load_roster
+  BRIDGE_AGENT_CHANNELS["'"$CREATED_AGENT"'"]="plugin:teams@agent-bridge"
+  raw="TEAMS_STATE_DIR=/stale1/.teams TEAMS_STATE_DIR=/stale2/.teams claude --dangerously-load-development-channels plugin:teams@agent-bridge --dangerously-skip-permissions --name '"$CREATED_AGENT"'"
+  bridge_claude_launch_with_channel_state_dirs "'"$CREATED_AGENT"'" "$raw"
+')"
+assert_contains "$TEAMS_DUP_LAUNCH" "TEAMS_STATE_DIR=$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams"
+assert_not_contains "$TEAMS_DUP_LAUNCH" "/stale1/.teams"
+assert_not_contains "$TEAMS_DUP_LAUNCH" "/stale2/.teams"
+python3 - "$TEAMS_DUP_LAUNCH" <<'PY'
+import re
+import sys
+command = sys.argv[1]
+matches = re.findall(r"\bTEAMS_STATE_DIR=", command)
+assert len(matches) == 1, f"expected 1 TEAMS_STATE_DIR=, got {len(matches)}: {command!r}"
+PY
+
 if command -v bun >/dev/null 2>&1; then
   log "exercising Teams channel plugin health"
   TEAMS_SMOKE_PORT="$(python3 - <<'PY'
