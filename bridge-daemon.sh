@@ -4790,6 +4790,160 @@ reap_idle_orphan_sessions() {
   return "$changed"
 }
 
+# Issue #791 — surface orphan memory-daily-<agent> cron jobs whose source
+# agent is no longer in the live roster. The harvester for such a job fails
+# at `agb agent show <agent> --json` and emits a [cron-followup] task every
+# day until the operator deletes the cron manually. This sweep enumerates
+# memory-daily jobs from the native cron jobs file, cross-checks each one's
+# source agent (parsed from the `name` field `memory-daily-<agent>`) against
+# the loaded roster (BRIDGE_AGENT_IDS), and surfaces a single [health] task
+# to the admin agent with the orphan list + suggested `cron delete` commands.
+#
+# Surfacing-only by design: we do NOT auto-disable jobs (operator preference
+# — idempotent surfacing beats silent mutation). De-duped to one task per
+# UTC day via a marker file under BRIDGE_STATE_DIR/memory-daily-orphan-sweep/
+# so a daemon that ticks many times per minute does not spam the queue.
+process_memory_daily_orphan_sweep() {
+  [[ "${BRIDGE_MEMORY_DAILY_ORPHAN_SWEEP_ENABLED:-1}" == "1" ]] || return 1
+
+  local admin_agent
+  admin_agent="$(bridge_admin_agent_id)"
+  [[ -n "$admin_agent" ]] || return 1
+  bridge_agent_exists "$admin_agent" || return 1
+
+  # The roster is loaded once per daemon-loop iteration before sync_state
+  # runs (see the top of the run loop); BRIDGE_AGENT_IDS is therefore the
+  # authoritative list for this sweep. Re-load defensively in case a future
+  # caller invokes this helper outside the normal loop ordering.
+  bridge_load_roster
+
+  local jobs_json
+  jobs_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-cron.sh" list --json 2>/dev/null || true)"
+  [[ -n "$jobs_json" ]] || return 1
+
+  # Parse memory-daily orphans out of the cron list JSON.
+  # Output: tab-separated job_id<TAB>source_agent, one orphan per line.
+  # Pass the roster on stdin (newline-delimited) so we do not need to
+  # serialize an arbitrarily large array onto argv.
+  local roster_stream=""
+  local agent_id
+  for agent_id in "${BRIDGE_AGENT_IDS[@]:-}"; do
+    [[ -n "$agent_id" ]] || continue
+    roster_stream+="${agent_id}"$'\n'
+  done
+
+  # Embed the roster on argv (newline-joined) rather than piping it on
+  # stdin so we do not have to juggle a heredoc + herestring pair on the
+  # same `python3` invocation. The script body still parses jobs JSON from
+  # argv[1] and the newline-delimited roster from argv[2].
+  local orphans_tsv
+  orphans_tsv="$(python3 - "$jobs_json" "$roster_stream" <<'PY' 2>/dev/null || true
+import json, sys
+
+raw_jobs = sys.argv[1] if len(sys.argv) > 1 else ""
+raw_roster = sys.argv[2] if len(sys.argv) > 2 else ""
+roster = {line.strip() for line in raw_roster.splitlines() if line.strip()}
+try:
+    payload = json.loads(raw_jobs)
+except Exception:
+    sys.exit(0)
+
+jobs = payload.get("jobs") if isinstance(payload, dict) else payload
+if not isinstance(jobs, list):
+    sys.exit(0)
+
+PREFIX = "memory-daily-"
+for job in jobs:
+    if not isinstance(job, dict):
+        continue
+    if (job.get("family") or "") != "memory-daily":
+        continue
+    name = job.get("name") or ""
+    if not name.startswith(PREFIX):
+        continue
+    source_agent = name[len(PREFIX):].strip()
+    if not source_agent:
+        continue
+    if source_agent in roster:
+        continue
+    job_id = job.get("id") or job.get("name") or ""
+    if not job_id:
+        continue
+    print(f"{job_id}\t{source_agent}")
+PY
+  )"
+
+  [[ -n "$orphans_tsv" ]] || return 1
+
+  # Dedupe — emit at most one [health] task per UTC day. The marker is
+  # written before the queue create call so a partial failure (queue
+  # unavailable mid-write) still wins the suppression on the next tick;
+  # this is the conservative choice for queue-spam protection.
+  local marker_dir="$BRIDGE_STATE_DIR/memory-daily-orphan-sweep"
+  mkdir -p "$marker_dir" 2>/dev/null || true
+  local today marker
+  today="$(date -u '+%Y-%m-%d')"
+  marker="$marker_dir/$today.surfaced"
+  if [[ -f "$marker" ]]; then
+    return 1
+  fi
+
+  # Build the body. List one bullet per orphan with the exact `cron delete`
+  # command the operator can paste.
+  local orphan_count=0
+  local body
+  body="Orphan memory-daily cron jobs detected — the named source agent is no longer in the loaded roster, so the daily harvester will fail at \`agb agent show <agent> --json\` and emit a [cron-followup] task every day until the cron entry is removed."$'\n\n'
+  body+="Run the suggested \`agent-bridge cron delete\` commands to clear:"$'\n\n'
+
+  local job_id source_agent
+  while IFS=$'\t' read -r job_id source_agent; do
+    [[ -n "$job_id" && -n "$source_agent" ]] || continue
+    body+="- \`memory-daily-${source_agent}\` (id=${job_id}, source_agent=${source_agent}) — \`agent-bridge cron delete ${job_id}\`"$'\n'
+    orphan_count=$(( orphan_count + 1 ))
+  done <<<"$orphans_tsv"
+
+  (( orphan_count > 0 )) || return 1
+
+  body+=$'\n'"This [health] task is emitted once per UTC day (marker: ${marker}). Re-runs are suppressed until the marker is rotated. Filed by daemon process_memory_daily_orphan_sweep — refs issue #791."
+
+  : > "$marker" 2>/dev/null || true
+
+  local title
+  title="[health] orphan memory-daily cron jobs (n=${orphan_count})"
+
+  # Idempotent surface: if today's [health] task is already queued (e.g.,
+  # marker file was lost across a state-dir rotation), update in place
+  # rather than creating a duplicate.
+  local title_prefix="[health] orphan memory-daily cron jobs"
+  local existing_id
+  existing_id="$(bridge_queue_cli find-open --agent "$admin_agent" --title-prefix "$title_prefix" 2>/dev/null || true)"
+
+  local reported=0
+  if [[ "$existing_id" =~ ^[0-9]+$ ]]; then
+    if bridge_queue_cli update "$existing_id" --actor daemon --title "$title" --priority normal --note "$body" >/dev/null 2>&1; then
+      reported=1
+    fi
+  else
+    if bridge_queue_cli create --to "$admin_agent" --from daemon --priority normal --title "$title" --body "$body" >/dev/null 2>&1; then
+      reported=1
+    fi
+  fi
+
+  if (( reported == 1 )); then
+    bridge_audit_log daemon memory_daily_orphan_sweep "$admin_agent" \
+      --detail orphan_count="$orphan_count" \
+      --detail marker="$marker"
+    daemon_info "memory-daily orphan-sweep: surfaced ${orphan_count} orphan job(s) to ${admin_agent}"
+    return 0
+  fi
+
+  # Roll back the marker so the next tick re-tries — we never want a
+  # silent failure to permanently suppress the surface.
+  rm -f "$marker" 2>/dev/null || true
+  daemon_warn "memory-daily orphan-sweep: failed to emit [health] task (orphan_count=${orphan_count})"
+  return 1
+}
+
 process_mcp_orphan_cleanup() {
   local enabled="${BRIDGE_MCP_ORPHAN_CLEANUP_ENABLED:-1}"
   local interval="${BRIDGE_MCP_ORPHAN_CLEANUP_INTERVAL_SECONDS:-300}"
@@ -5395,6 +5549,14 @@ cmd_sync_cycle() {
         --detail pid="${prev_pid:-}"
     fi
   fi
+
+  # Issue #791 — surface orphan memory-daily-<agent> cron jobs whose source
+  # agent is no longer in the loaded roster. Runs after cron_sync (which
+  # only normalizes runtime state, never deletes job entries) so the orphan
+  # list reflects the post-sync truth. Best-effort: any failure is logged
+  # and must not abort the rest of the sync pass.
+  BRIDGE_DAEMON_LAST_STEP="memory_daily_orphan_sweep"
+  process_memory_daily_orphan_sweep >/dev/null 2>&1 || true
 
   BRIDGE_DAEMON_LAST_STEP="dashboard_post"
   bridge_dashboard_post_if_changed "$summary_output" || true
