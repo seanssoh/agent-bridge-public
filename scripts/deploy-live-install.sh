@@ -32,6 +32,92 @@ run_cmd() {
   "$@"
 }
 
+# Explicit per-file-class mode contract for the live install.
+#
+# Background: `cp -p` preserves whatever the maintainer's source-tree perms
+# happen to be (often 0600 / 0700 on a single-user dev box). On the live
+# install, isolated-UID agents need group/other read on libs, hooks, marketplace
+# manifests, and plugin lockfiles, plus group/other exec on entry scripts and
+# hook handlers. Issue #792 captured the cascading restart failures that occur
+# when source-tree perms leak through.
+#
+# Scope boundary: this helper sets POSIX mode bits only. POSIX ACL mask restore
+# for `~/.claude/.credentials.json` and per-agent `workdir/.{teams,ms365}/.env`
+# is intentionally NOT handled here — those paths live outside `$TARGET_ROOT`
+# (operator-config, not deploy artifacts), and `should_skip_relpath` already
+# excludes `agents/*`. ACL repair belongs in the isolation grant-matrix layer
+# (`lib/bridge-isolation-v2.sh`), tracked separately.
+deploy_live_install_set_mode() {
+  local relpath="$1" dst="$2"
+  local mode="0644"
+  case "$relpath" in
+    bridge-*.sh|bridge-*.py|agent-bridge|agb)
+      mode="0755" ;;
+    lib/*.sh|lib/*.py)
+      mode="0644" ;;
+    hooks/*.py|hooks/*.sh)
+      mode="0755" ;;
+    .claude-plugin/marketplace.json)
+      mode="0644" ;;
+    plugins/*/bun.lock|plugins/*/package.json|plugins/*/*.md|plugins/*/*.json)
+      mode="0644" ;;
+    plugins/*/*.ts|plugins/*/*.js|plugins/*/*.mjs|plugins/*/*.sh|plugins/*/*.py)
+      mode="0755" ;;
+    scripts/*.sh|scripts/smoke/*.sh)
+      mode="0755" ;;
+    scripts/*.py|scripts/*.md)
+      mode="0644" ;;
+    *.sh|*.py)
+      mode="0644" ;;
+    *)
+      mode="0644" ;;
+  esac
+  run_cmd chmod "$mode" "$dst"
+}
+
+# Post-deploy sanity check: confirm a known-critical set of files ended up with
+# permissions that the isolated-UID restart path can actually traverse.
+# Non-fatal — failure emits a warning but does not abort the deploy, since
+# aborting blocks operator recovery. Issue #792.
+deploy_live_install_verify_critical_perms() {
+  local errors=0
+  local critical_files=(
+    "$TARGET_ROOT/agent-bridge"
+    "$TARGET_ROOT/agb"
+    "$TARGET_ROOT/bridge-task.sh"
+    "$TARGET_ROOT/lib/bridge-core.sh"
+    "$TARGET_ROOT/hooks/prompt-guard.py"
+    "$TARGET_ROOT/.claude-plugin/marketplace.json"
+  )
+  local f mode last_digit
+  for f in "${critical_files[@]}"; do
+    [[ -e "$f" ]] || continue
+    if [[ ! -r "$f" ]]; then
+      printf '[error] critical-perm: %s not readable by deployer\n' "$f" >&2
+      errors=$((errors + 1))
+    fi
+    # `o+r` minimum: isolated UIDs (non-group members for marketplace etc.)
+    # must be able to stat/read.
+    mode="$(stat -c '%a' "$f" 2>/dev/null || stat -f '%Lp' "$f" 2>/dev/null || echo '')"
+    case "$f" in
+      *.sh|*/agent-bridge|*/agb|*.py)
+        if [[ -n "$mode" ]]; then
+          last_digit="${mode: -1}"
+          if [[ "$last_digit" =~ ^[0-9]+$ ]] && (( last_digit < 4 )); then
+            printf '[error] critical-perm: %s mode=%s lacks o+r (isolated UIDs cannot read)\n' "$f" "$mode" >&2
+            errors=$((errors + 1))
+          fi
+        fi ;;
+    esac
+  done
+  if (( errors > 0 )); then
+    printf '[error] deploy-live-install: %d critical-perm checks failed\n' "$errors" >&2
+    return 1
+  fi
+  printf '[info] deploy-live-install: critical-perm verification passed\n'
+  return 0
+}
+
 should_skip_relpath() {
   local relpath="$1"
 
@@ -76,6 +162,8 @@ copy_tracked_file() {
 
   run_cmd mkdir -p "$(dirname "$dst")"
   run_cmd cp -p "$src" "$dst"
+  # #792: source-tree perms can be 0600/0700; force the live-install contract.
+  deploy_live_install_set_mode "$relpath" "$dst"
   COPIED_COUNT=$((COPIED_COUNT + 1))
 }
 
@@ -175,6 +263,12 @@ if [[ "$DRY_RUN" == "0" ]]; then
   while IFS= read -r -d '' relpath; do
     verify_tracked_file "$relpath"
   done < <(git -C "$SOURCE_ROOT" ls-files -z)
+
+  # #792: non-fatal sanity sweep so the operator notices a perms regression
+  # the moment it ships, instead of after six isolated-UID restart failures.
+  if ! deploy_live_install_verify_critical_perms; then
+    printf '[warn] deploy-live-install: critical-perm verification flagged issues (see above)\n' >&2
+  fi
 
   python3 "$SOURCE_ROOT/bridge-upgrade.py" write-state \
     --source-root "$SOURCE_ROOT" \
