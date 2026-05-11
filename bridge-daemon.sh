@@ -5556,7 +5556,7 @@ cmd_sync_cycle() {
   # list reflects the post-sync truth. Best-effort: any failure is logged
   # and must not abort the rest of the sync pass.
   BRIDGE_DAEMON_LAST_STEP="memory_daily_orphan_sweep"
-  process_memory_daily_orphan_sweep >/dev/null 2>&1 || true
+  process_memory_daily_orphan_sweep 2>/dev/null || daemon_warn "memory-daily orphan sweep failed"
 
   BRIDGE_DAEMON_LAST_STEP="dashboard_post"
   bridge_dashboard_post_if_changed "$summary_output" || true
