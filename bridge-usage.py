@@ -358,9 +358,11 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     state = load_monitor_state(state_path)
     entries = state.setdefault("entries", {})
     alerts: list[dict[str, Any]] = []
+    rotation_candidates: list[dict[str, Any]] = []
     warn = float(args.warn_threshold)
     critical = float(args.critical_threshold)
     elevated = _parse_elevated(args, warn, critical)
+    rotation_threshold = float(args.rotation_threshold)
 
     for snapshot in snapshots:
         key = "::".join(
@@ -376,6 +378,8 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         previous = entries.get(key, {}) if isinstance(entries.get(key), dict) else {}
         previous_reset = previous.get("reset_at")
         previous_latch = previous.get("last_alert_bucket")
+        rotation_triggered_at = previous.get("rotation_triggered_at")
+        rotation_triggered_reset_at = previous.get("rotation_triggered_reset_at")
 
         # Cycle rollover: if reset_at has moved forward by more than the grace
         # window, this is a new cycle — clear the latch so alerts can fire again.
@@ -383,6 +387,9 @@ def cmd_monitor(args: argparse.Namespace) -> int:
         # (see RESET_FORWARD_GRACE_SECONDS). This was the #215 noise source.
         if reset_cycle_advanced(previous_reset, reset_at):
             previous_latch = None
+        if reset_cycle_advanced(rotation_triggered_reset_at, reset_at):
+            rotation_triggered_at = None
+            rotation_triggered_reset_at = None
 
         next_latch = previous_latch
         alerted_at = previous.get("alerted_at")
@@ -407,16 +414,46 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             next_latch = bucket
             alerted_at = now_iso()
 
+        if (
+            snapshot.get("provider") == "claude"
+            and isinstance(used_percent, (int, float))
+            and used_percent >= rotation_threshold
+        ):
+            if not rotation_triggered_at:
+                rotation_candidates.append(
+                    {
+                        **snapshot,
+                        "rotation_threshold": rotation_threshold,
+                        "message": (
+                            f"Claude usage rotation candidate: {snapshot.get('window') or 'unknown'} "
+                            f"window at {used_percent:.0f}% (threshold {rotation_threshold:.0f}%)."
+                        ),
+                    }
+                )
+                rotation_triggered_at = now_iso()
+                rotation_triggered_reset_at = reset_at
+        elif snapshot.get("provider") == "claude":
+            rotation_triggered_at = None
+            rotation_triggered_reset_at = None
+
         entries[key] = {
             "last_alert_bucket": next_latch,
             "reset_at": reset_at,
             "used_percent": used_percent,
             "alerted_at": alerted_at,
+            "rotation_triggered_at": rotation_triggered_at,
+            "rotation_triggered_reset_at": rotation_triggered_reset_at,
         }
 
     state["updated_at"] = now_iso()
     save_monitor_state(state_path, state)
-    result = {"generated_at": now_iso(), "snapshots": snapshots, "alerts": alerts, "state_file": str(state_path)}
+    result = {
+        "generated_at": now_iso(),
+        "snapshots": snapshots,
+        "alerts": alerts,
+        "rotation_candidates": rotation_candidates,
+        "state_file": str(state_path),
+    }
     if args.json:
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
@@ -476,6 +513,7 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_parser = sub.add_parser("monitor")
     add_source_args(monitor_parser)
     monitor_parser.add_argument("--state-file", required=True)
+    monitor_parser.add_argument("--rotation-threshold", type=float, default=99.0)
     monitor_parser.add_argument("--json", action="store_true")
     monitor_parser.set_defaults(handler=cmd_monitor)
 

@@ -352,6 +352,10 @@ bridge_usage_poll_state_file() {
   printf '%s/usage/poll.env' "$BRIDGE_STATE_DIR"
 }
 
+bridge_claude_token_recovery_state_file() {
+  printf '%s/claude-token-recovery.env' "$BRIDGE_STATE_DIR"
+}
+
 bridge_usage_due() {
   local interval="${BRIDGE_USAGE_MONITOR_INTERVAL_SECONDS:-300}"
   local file=""
@@ -384,6 +388,41 @@ bridge_note_usage_poll() {
   cat >"$file" <<EOF
 USAGE_UPDATED_TS=$now
 USAGE_NEXT_TS=$next_ts
+EOF
+}
+
+bridge_claude_token_recovery_due() {
+  local interval="${BRIDGE_CLAUDE_TOKEN_RECOVERY_INTERVAL_SECONDS:-300}"
+  local file=""
+  local now=0
+  local next_ts=0
+
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=300
+  (( interval > 0 )) || return 0
+  file="$(bridge_claude_token_recovery_state_file)"
+  [[ -f "$file" ]] || return 0
+  daemon_source_state_file "$file" "claude-token-recovery" 1 "CLAUDE_TOKEN_RECOVERY_NEXT_TS" || return 0
+  [[ "${CLAUDE_TOKEN_RECOVERY_NEXT_TS:-0}" =~ ^[0-9]+$ ]] || return 0
+  now="$(date +%s)"
+  next_ts="${CLAUDE_TOKEN_RECOVERY_NEXT_TS:-0}"
+  (( now >= next_ts ))
+}
+
+bridge_note_claude_token_recovery_poll() {
+  local interval="${BRIDGE_CLAUDE_TOKEN_RECOVERY_INTERVAL_SECONDS:-300}"
+  local file=""
+  local now=0
+  local next_ts=0
+
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=300
+  (( interval > 0 )) || interval=300
+  file="$(bridge_claude_token_recovery_state_file)"
+  mkdir -p "$(dirname "$file")"
+  now="$(date +%s)"
+  next_ts=$(( now + interval ))
+  cat >"$file" <<EOF
+CLAUDE_TOKEN_RECOVERY_UPDATED_TS=$now
+CLAUDE_TOKEN_RECOVERY_NEXT_TS=$next_ts
 EOF
 }
 
@@ -983,7 +1022,9 @@ process_usage_monitor() {
   local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
   local monitor_json=""
   local alert_rows=""
+  local rotation_rows=""
   local alert_count=0
+  local rotation_count=0
   local priority=""
   local title=""
   local body=""
@@ -995,6 +1036,14 @@ process_usage_monitor() {
   local reset_at=""
   local source=""
   local body_file=""
+  local rotation_agent_scope="${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}"
+  local rotate_json=""
+  local rotation_status_row=""
+  local rotation_status=""
+  local rotation_reason=""
+  local rotation_from=""
+  local rotation_to=""
+  local rotation_sync_status=""
 
   [[ "${BRIDGE_USAGE_MONITOR_ENABLED:-1}" == "1" ]] || return 1
   [[ -n "$admin_agent" ]] || return 1
@@ -1016,6 +1065,31 @@ process_usage_monitor() {
     bridge_note_usage_poll
     return 1
   }
+
+  rotation_rows="$(python3 - "$monitor_json" <<'PY'
+import json, sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+
+for item in payload.get("rotation_candidates", []):
+    print(
+        "\t".join(
+            [
+                str(item.get("provider", "")),
+                str(item.get("account", "")),
+                str(item.get("window", "")),
+                str(item.get("used_percent", "")),
+                str(item.get("reset_at", "")),
+                str(item.get("source", "")),
+                str(item.get("message", "")),
+            ]
+        )
+    )
+PY
+)" || rotation_rows=""
 
   while IFS=$'\t' read -r provider account window bucket used_percent reset_at source body; do
     [[ -z "$provider" || -z "$window" || -z "$bucket" ]] && continue
@@ -1040,8 +1114,175 @@ process_usage_monitor() {
     alert_count=$((alert_count + 1))
   done <<<"$alert_rows"
 
+  while IFS=$'\t' read -r provider account window used_percent reset_at source body; do
+    [[ -z "$provider" || "$provider" != "claude" || -z "$window" ]] && continue
+    # Rotate only once per monitor pass; bridge-usage.py already latches each
+    # provider/account/window candidate once per usage reset cycle.
+    (( rotation_count > 0 )) && continue
+    rotate_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
+      --if-auto-enabled \
+      --sync \
+      --agents "$rotation_agent_scope" \
+      --reason "usage:${window}:${used_percent}" \
+      --json 2>/dev/null || true)"
+    rotation_status_row="$(python3 - "$rotate_json" <<'PY'
+import json, sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    payload = {"status": "error", "reason": "invalid_rotation_output"}
+sync = payload.get("sync") if isinstance(payload.get("sync"), dict) else {}
+print(
+    "\t".join(
+        [
+            str(payload.get("status", "")),
+            str(payload.get("reason", "")),
+            str(payload.get("old_active_token_id", "")),
+            str(payload.get("active_token_id", "")),
+            str(sync.get("status", "")),
+        ]
+    )
+)
+PY
+)"
+    IFS=$'\t' read -r rotation_status rotation_reason rotation_from rotation_to rotation_sync_status <<<"$rotation_status_row"
+    bridge_audit_log daemon claude_token_rotation "$admin_agent" \
+      --detail status="$rotation_status" \
+      --detail reason="$rotation_reason" \
+      --detail provider="$provider" \
+      --detail account="$account" \
+      --detail window="$window" \
+      --detail used_percent="$used_percent" \
+      --detail reset_at="$reset_at" \
+      --detail source="$source" \
+      --detail from="$rotation_from" \
+      --detail to="$rotation_to" \
+      --detail sync_status="$rotation_sync_status" \
+      --detail agent_scope="$rotation_agent_scope"
+    case "$rotation_status:$rotation_reason" in
+      rotated:*)
+        title="claude token rotated"
+        body="Claude token rotated after ${window} usage reached ${used_percent}%. active_token=${rotation_to}; sync=${rotation_sync_status:-unknown}."
+        priority="high"
+        ;;
+      skipped:no_alternate_token|error:*)
+        title="claude token rotation needs attention"
+        body="Claude usage reached ${used_percent}% for ${window}, but token rotation did not complete (${rotation_status:-unknown}${rotation_reason:+: $rotation_reason})."
+        priority="high"
+        ;;
+      *)
+        title=""
+        ;;
+    esac
+    if [[ -n "$title" ]] && bridge_agent_has_notify_transport "$admin_agent"; then
+      bridge_notify_send "$admin_agent" "$title" "$body" "" "$priority" "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" >/dev/null 2>&1 || true
+    fi
+    rotation_count=$((rotation_count + 1))
+  done <<<"$rotation_rows"
+
   bridge_note_usage_poll
-  (( alert_count > 0 ))
+  (( alert_count > 0 || rotation_count > 0 ))
+}
+
+process_claude_token_recovery() {
+  local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
+  local recovery_json=""
+  local recovery_row=""
+  local status=""
+  local reason=""
+  local checked_count="0"
+  local recovered_count="0"
+  local still_disabled_count="0"
+  local recovered_csv=""
+  local sync_recommended="0"
+  local sync_json=""
+  local sync_status=""
+  local timeout_seconds="${BRIDGE_CLAUDE_TOKEN_RECOVERY_TIMEOUT_SECONDS:-60}"
+  local check_timeout="${BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS:-45}"
+  local retry_seconds="${BRIDGE_CLAUDE_TOKEN_CHECK_RETRY_SECONDS:-1800}"
+  local agent_scope="${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}"
+
+  [[ "${BRIDGE_CLAUDE_TOKEN_RECOVERY_ENABLED:-1}" == "1" ]] || return 1
+  bridge_claude_token_recovery_due || return 1
+
+  [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds=60
+  [[ "$check_timeout" =~ ^[0-9]+$ ]] || check_timeout=45
+  [[ "$retry_seconds" =~ ^[0-9]+$ ]] || retry_seconds=1800
+
+  if ! recovery_json="$(bridge_with_timeout "$timeout_seconds" claude_token_recovery \
+      "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token recover-due \
+      --timeout "$check_timeout" \
+      --retry-seconds "$retry_seconds" \
+      --json 2>/dev/null)"; then
+    bridge_note_claude_token_recovery_poll
+    bridge_audit_log daemon claude_token_recovery "$target" \
+      --detail status=error \
+      --detail reason=recover_due_failed \
+      --detail timeout_seconds="$timeout_seconds" \
+      2>/dev/null || true
+    return 1
+  fi
+
+  recovery_row="$(python3 - "$recovery_json" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    payload = {"status": "error", "reason": "invalid_recovery_output"}
+recovered = payload.get("recovered") if isinstance(payload.get("recovered"), list) else []
+print(
+    "\t".join(
+        [
+            str(payload.get("status", "")),
+            str(payload.get("reason", "")),
+            str(payload.get("checked_count", 0)),
+            str(payload.get("recovered_count", 0)),
+            str(payload.get("still_disabled_count", 0)),
+            ",".join(str(item) for item in recovered),
+            "1" if payload.get("sync_recommended") else "0",
+        ]
+    )
+)
+PY
+)"
+  IFS=$'\t' read -r status reason checked_count recovered_count still_disabled_count recovered_csv sync_recommended <<<"$recovery_row"
+
+  bridge_note_claude_token_recovery_poll
+
+  if [[ "$sync_recommended" == "1" ]]; then
+    sync_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync --agents "$agent_scope" --json 2>/dev/null || true)"
+    sync_status="$(python3 - "$sync_json" <<'PY'
+import json
+import sys
+try:
+    print(json.loads(sys.argv[1]).get("status", ""))
+except Exception:
+    print("error")
+PY
+)"
+  fi
+
+  if [[ "$status" != "skipped" || "${checked_count:-0}" != "0" ]]; then
+    bridge_audit_log daemon claude_token_recovery "$target" \
+      --detail status="$status" \
+      --detail reason="$reason" \
+      --detail checked_count="$checked_count" \
+      --detail recovered_count="$recovered_count" \
+      --detail still_disabled_count="$still_disabled_count" \
+      --detail recovered="$recovered_csv" \
+      --detail sync_recommended="$sync_recommended" \
+      --detail sync_status="$sync_status" \
+      2>/dev/null || true
+  fi
+
+  if [[ "${recovered_count:-0}" != "0" ]]; then
+    daemon_info "claude token recovery: recovered=${recovered_csv:-?} sync=${sync_status:-not-needed}"
+  fi
+
+  [[ "$status" != "skipped" && "${checked_count:-0}" != "0" ]]
 }
 
 process_release_monitor() {
@@ -4717,7 +4958,7 @@ reap_idle_orphan_sessions() {
 # UTC day via a marker file under BRIDGE_STATE_DIR/memory-daily-orphan-sweep/
 # so a daemon that ticks many times per minute does not spam the queue.
 process_memory_daily_orphan_sweep() {
-  [[ "${BRIDGE_MEMORY_DAILY_ORPHAN_SWEEP_ENABLED:-1}" == "1" ]] || return 1
+  [[ "${BRIDGE_MEMORY_DAILY_ORPHAN_SWEEP_ENABLED:-1}" == "1" ]] || return 0
 
   local admin_agent
   admin_agent="$(bridge_admin_agent_id)"
@@ -4755,7 +4996,7 @@ process_memory_daily_orphan_sweep() {
   local orphans_tsv
   orphans_tsv="$(bridge_with_timeout 5 memory_daily_orphan_scan python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" memory-daily-orphan-scan "$jobs_json" "$roster_stream" 2>/dev/null || true)"
 
-  [[ -n "$orphans_tsv" ]] || return 1
+  [[ -n "$orphans_tsv" ]] || return 0
 
   # Dedupe — emit at most one [health] task per UTC day. The marker is
   # written before the queue create call so a partial failure (queue
@@ -4767,7 +5008,7 @@ process_memory_daily_orphan_sweep() {
   today="$(date -u '+%Y-%m-%d')"
   marker="$marker_dir/$today.surfaced"
   if [[ -f "$marker" ]]; then
-    return 1
+    return 0
   fi
 
   # Build the body. List one bullet per orphan with the exact `cron delete`
@@ -4784,7 +5025,7 @@ process_memory_daily_orphan_sweep() {
     orphan_count=$(( orphan_count + 1 ))
   done <<<"$orphans_tsv"
 
-  (( orphan_count > 0 )) || return 1
+  (( orphan_count > 0 )) || return 0
 
   body+=$'\n'"This [health] task is emitted once per UTC day (marker: ${marker}). Re-runs are suppressed until the marker is rotated. Filed by daemon process_memory_daily_orphan_sweep — refs issue #791."
 
@@ -5337,6 +5578,10 @@ cmd_sync_cycle() {
   fi
   BRIDGE_DAEMON_LAST_STEP="crash_reports"
   if process_crash_reports; then
+    changed=0
+  fi
+  BRIDGE_DAEMON_LAST_STEP="claude_token_recovery"
+  if process_claude_token_recovery; then
     changed=0
   fi
   BRIDGE_DAEMON_LAST_STEP="usage_monitor"

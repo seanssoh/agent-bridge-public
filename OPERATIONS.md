@@ -854,6 +854,91 @@ If you find any named-user ACL inside the v2 tree
 (`~/.agent-bridge/agents/<agent>/...`) or on `/home/agent-bridge-<agent>/`,
 it is drift — the migration runbook below strips it.
 
+### Claude setup-token registry and rotation
+
+For Claude subscription accounts, the preferred shared-credential path is
+not the controller's `~/.claude/.credentials.json`. Generate one or more
+Claude Code setup tokens and let Agent Bridge render the active token into
+each selected Claude agent's own `.claude/.credentials.json` file. Sync also
+seeds the sibling `.claude/.claude.json` bootstrap file when missing, because
+interactive Claude Code sessions require both files to skip first-run login
+prompts. It also preserves `settings.json` while adding Claude's
+`skipDangerousModePermissionPrompt` user setting for bridge-managed agents
+that are launched with `--dangerously-skip-permissions`.
+
+```bash
+claude setup-token
+agent-bridge auth claude-token add --id claude-a --stdin --activate --sync
+# Paste the setup token on stdin, then press Enter and Ctrl-D.
+
+claude setup-token
+agent-bridge auth claude-token add --id claude-b --stdin --sync
+```
+
+The registry lives at
+`$BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json` (mode `0600`), and
+`list` output shows only token ids and fingerprints:
+
+```bash
+agent-bridge auth claude-token list
+agent-bridge auth claude-token activate claude-b --sync
+```
+
+To enable automatic rotation, register at least two enabled tokens and set
+the threshold. The daemon reuses the existing Claude usage monitor signal
+from `bridge-usage.py`; when a Claude usage window reaches the rotation
+threshold once per reset cycle, it runs `rotate --if-auto-enabled --sync`.
+Sync keeps only a non-secret `CLAUDE_CONFIG_DIR=` pointer in the legacy
+`credentials/launch-secrets.env` file and removes any stale
+`CLAUDE_CODE_OAUTH_TOKEN=` entry, so the active OAuth token is not inherited
+by Bash/tool subprocesses.
+
+The credential write path is hardened against two specific failure
+modes (see PR #799 r2-of-Path-A):
+
+- **Symlink attack on `.claude/`.** The agent owns its own home, so a
+  pre-planted `.claude` symlink could redirect a privileged write
+  outside the isolated home. The sync path rejects any non-real
+  `.claude` directory and verifies the resolved real path stays
+  inside the isolated user home before any `mkdir` / `chown` / write.
+- **Atomic chown.** The credential / config / settings tempfiles are
+  chowned to the isolated UID before `os.replace`, so the file is
+  never root-owned at its final path. There is no window where Claude
+  cannot read its own credential because the post-sync repair has not
+  run yet.
+
+Same-UID FS readability of the credential file is documented as a
+defense-in-depth residual in [`KNOWN_ISSUES.md` §25](./KNOWN_ISSUES.md#25-claude-oauth-credential--same-uid-fs-readability-residual-799-r2-of-path-a).
+A credential-helper enhancement is planned to close that gap in a
+follow-up PR.
+
+```bash
+agent-bridge auth claude-token auto-rotate enable --threshold 99
+```
+
+If a stored token hits a Claude quota limit during a health check, Agent
+Bridge records the reset estimate returned by Claude (for example
+`resets May 13, 3am (UTC)`) as `disabled_until` / `next_check_at` and
+keeps that token out of rotation while it is unavailable. The main daemon
+then runs `claude-token recover-due` on its normal loop; once the reset
+time has passed, it probes the token directly through the Claude CLI and
+re-enables it when the probe succeeds. This recovery path is pure
+script/daemon code and does not create agent tasks or expose token values
+to queue payloads.
+
+Manual health check:
+
+```bash
+agent-bridge auth claude-token check claude-b --disable-on-quota --enable-on-ok
+agent-bridge auth claude-token recover-due
+```
+
+Manual fallback:
+
+```bash
+agent-bridge auth claude-token rotate --reason manual --sync
+```
+
 ### v0.7 → v0.8 migration runbook
 
 For an isolated agent that drifted across the v0.7 → v0.8 cut:

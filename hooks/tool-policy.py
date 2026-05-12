@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import shlex
 import sys
@@ -79,6 +80,127 @@ def roster_local_path() -> Path:
 
 def task_db_path() -> Path:
     return bridge_home_dir() / "state" / "tasks.db"
+
+
+CLAUDE_CREDENTIAL_DENY_REASON = (
+    "Claude OAuth credentials are blocked inside tool calls; use a redacted "
+    "diagnostic such as `claude auth status` instead"
+)
+
+
+def _resolve_existing(path: Path) -> Path:
+    try:
+        return path.expanduser().resolve()
+    except OSError:
+        return path.expanduser()
+
+
+def _controller_home_dir() -> Path | None:
+    try:
+        return Path(pwd.getpwuid(bridge_home_dir().stat().st_uid).pw_dir)
+    except (KeyError, OSError):
+        return None
+
+
+def claude_credential_paths() -> set[Path]:
+    paths = {Path.home() / ".claude" / ".credentials.json"}
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if config_dir:
+        paths.add(Path(config_dir).expanduser() / ".credentials.json")
+    controller_home = _controller_home_dir()
+    if controller_home is not None:
+        paths.add(controller_home / ".claude" / ".credentials.json")
+    # PR #799 r2 codex finding 2 — the Claude OAuth token registry honors
+    # $BRIDGE_CLAUDE_TOKEN_REGISTRY (override) before falling back to
+    # $BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json (see
+    # bridge-auth.sh:27 bridge_auth_registry_path). Both surfaces must be
+    # denied so Read/Glob/Grep/Bash-by-path access mirrors the raw-text
+    # deny in `_raw_mentions_claude_credentials`.
+    registry_override = os.environ.get("BRIDGE_CLAUDE_TOKEN_REGISTRY", "").strip()
+    if registry_override:
+        paths.add(Path(registry_override).expanduser())
+    runtime_secrets = os.environ.get("BRIDGE_RUNTIME_SECRETS_DIR", "").strip()
+    if runtime_secrets:
+        paths.add(Path(runtime_secrets).expanduser() / "claude-oauth-tokens.json")
+    return {_resolve_existing(path) for path in paths}
+
+
+def _path_is_claude_credentials(path: Path) -> bool:
+    expanded = _resolve_existing(path)
+    if expanded in claude_credential_paths():
+        return True
+    parts = expanded.parts
+    return len(parts) >= 2 and parts[-2:] == (".claude", ".credentials.json")
+
+
+def _raw_mentions_claude_credentials(raw: str) -> bool:
+    return (
+        "sk-ant-o" in raw
+        or (".credentials.json" in raw and ".claude" in raw)
+        # PR #799 r2/r3 defense-in-depth — Path A no longer delivers the
+        # active OAuth token through the tool-inherited environment, but
+        # block the variable name so stale launch env files or manual
+        # operator exports cannot be read through tool output.
+        or "CLAUDE_CODE_OAUTH_TOKEN" in raw
+        # PR #799 r2 codex finding 1 — block `launch-secrets.env`
+        # mentions (defense-in-depth for any future env vars added to
+        # the same file).
+        or "launch-secrets.env" in raw
+        # PR #799 r2 codex finding 2 — block reads of the token
+        # registry JSON. The `claude_credential_paths()` set covers the
+        # canonical and override paths for path-typed inputs; this
+        # substring rule covers raw Bash text that names the file by
+        # basename or a relative path.
+        or "claude-oauth-tokens.json" in raw
+    )
+
+
+# PR #799 r3 codex finding 1 — match process-environment dump verbs
+# that revealed the exported CLAUDE_CODE_OAUTH_TOKEN under the abandoned
+# env-token delivery path. Path A now syncs Claude OAuth through
+# .credentials.json instead, but keep this as a stale-env/manual-export
+# guard; the r2 substring deny above only matches raw text containing the
+# literal token-variable name.
+#
+# Coverage:
+#   env [/options]            POSIX env, dumps everything when called with no
+#                             positional COMMAND or piped
+#   printenv [VAR...]         no-arg dump and `printenv CLAUDE_CODE_OAUTH_TOKEN`
+#   set                       bash builtin with no args dumps all vars
+#   compgen -e                completion list of exported vars
+#   declare -p / declare -x   prints all / all exported vars
+#   typeset -p / typeset -x   ksh-style alias for declare
+#   export -p                 prints all exported vars
+#   /proc/<pid>/environ       Linux env dump via procfs (also /proc/self/environ)
+#
+# Word-boundary patterns avoid matching legitimate token substrings
+# such as `environment`, `setfacl`, `kubectl set image`, or `set -e`.
+# Routed to the same CLAUDE_CREDENTIAL_DENY_REASON as the substring
+# deny — no second reason constant.
+_ENV_DUMP_PATTERNS = (
+    re.compile(r"(?<![A-Za-z0-9_/])env(?![A-Za-z0-9_])"),
+    re.compile(r"(?<![A-Za-z0-9_/])printenv(?![A-Za-z0-9_])"),
+    # bare `set` with no args (dumps all vars). Require a separator
+    # before and a terminator/pipe/EOL after so `set -e`, `set -o
+    # pipefail`, `kubectl set image`, `git remote set-url`, and
+    # `setfacl` do NOT match.
+    re.compile(r"(?:^|[;\s|&])set\s*(?:$|[|;&])"),
+    re.compile(r"(?<![A-Za-z0-9_])compgen\s+-[A-Za-z]*e"),
+    re.compile(r"(?<![A-Za-z0-9_])declare\s+-[A-Za-z]*[xp]"),
+    re.compile(r"(?<![A-Za-z0-9_])typeset\s+-[A-Za-z]*[xp]"),
+    re.compile(r"(?<![A-Za-z0-9_])export\s+-p(?![A-Za-z0-9_])"),
+    re.compile(r"/proc/[^/\s]+/environ\b"),
+)
+
+
+def _raw_dumps_process_environment(raw: str) -> bool:
+    return any(p.search(raw) for p in _ENV_DUMP_PATTERNS)
+
+
+def claude_credentials_reason_for_path(path: Path) -> str | None:
+    if _path_is_claude_credentials(path):
+        return CLAUDE_CREDENTIAL_DENY_REASON
+    return None
 
 
 def admin_agent_id() -> str:
@@ -1271,6 +1393,17 @@ def protected_alias_reason(text: str, agent: str) -> str | None:
     # gate stays unconditional — `agb` queue commands are the
     # structured-read surface and direct sqlite reads still bypass that
     # contract.
+    if _raw_mentions_claude_credentials(text):
+        return CLAUDE_CREDENTIAL_DENY_REASON
+    # PR #799 r3 codex finding 1 — env-dump verbs revealed exported
+    # OAuth tokens under the abandoned env-token path, bypassing the
+    # substring deny above. Kept as a stale-env/manual-export guard.
+    if _raw_dumps_process_environment(text):
+        return CLAUDE_CREDENTIAL_DENY_REASON
+    for credential_path in claude_credential_paths():
+        if _bash_argv_references_path(text, credential_path):
+            return CLAUDE_CREDENTIAL_DENY_REASON
+
     read_intent = _is_read_intent_bash(text)
     # Wrapper self-block carve-out: the sanctioned `agent-bridge config
     # set` wrapper layers its own caller-source + audit gate
@@ -1505,21 +1638,38 @@ def handle_pretool(payload: dict[str, Any], agent: str) -> int:
     if tool_name == "Bash":
         reason = protected_alias_reason(str(tool_input.get("command") or ""), agent)
     else:
-        # Issue #383: Read / Glob / Grep / NotebookRead tools get the
-        # read-intent allowance on protected paths. Edit / Write /
-        # NotebookEdit and unknown tools stay write-intent.
-        read_intent = _is_read_intent_tool(tool_name, tool_input)
-        for key in ("file_path", "path"):
+        for key in ("file_path", "path", "pattern"):
             raw = str(tool_input.get(key) or "").strip()
             if not raw:
                 continue
-            try:
-                candidate = Path(raw).expanduser()
-            except Exception:
-                continue
-            reason = protected_path_reason(candidate, agent, read_intent=read_intent)
-            if reason:
+            if _raw_mentions_claude_credentials(raw):
+                reason = CLAUDE_CREDENTIAL_DENY_REASON
                 break
+            if key in ("file_path", "path"):
+                try:
+                    candidate = Path(raw).expanduser()
+                except Exception:
+                    continue
+                reason = claude_credentials_reason_for_path(candidate)
+                if reason:
+                    break
+
+        if reason is None:
+            # Issue #383: Read / Glob / Grep / NotebookRead tools get the
+            # read-intent allowance on protected paths. Edit / Write /
+            # NotebookEdit and unknown tools stay write-intent.
+            read_intent = _is_read_intent_tool(tool_name, tool_input)
+            for key in ("file_path", "path"):
+                raw = str(tool_input.get(key) or "").strip()
+                if not raw:
+                    continue
+                try:
+                    candidate = Path(raw).expanduser()
+                except Exception:
+                    continue
+                reason = protected_path_reason(candidate, agent, read_intent=read_intent)
+                if reason:
+                    break
 
     if reason:
         detail["reason"] = reason

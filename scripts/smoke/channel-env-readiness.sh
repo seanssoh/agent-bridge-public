@@ -7,12 +7,11 @@
 # 2. Return "missing" when the file exists but no requested key is present
 #    with a non-empty value.
 # 3. Return "missing" when the file is absent.
-# 4. Return "present" after a successful linux-user ACL repair retry.
-# 5. Return "unreadable" after bounded ACL repair attempts fail.
-# 6. Suppress raw grep stderr in all cases (issue body's primary symptom).
-# 7. Have status_reason emit a distinct "unreadable: ..." line with an
+# 4. Return "unreadable" without attempting legacy ACL repair under v2.
+# 5. Suppress raw grep stderr in all cases (issue body's primary symptom).
+# 6. Have status_reason emit a distinct "unreadable: ..." line with an
 #    ACL diagnostic blob (instead of the false-negative "missing token").
-# 8. Cover the ms365 channel branch in status_reason (was previously absent).
+# 7. Cover the ms365 channel branch in status_reason (was previously absent).
 #
 # The smoke is Linux-only by design — POSIX named-user ACLs and getfacl
 # behave differently on Darwin, so the unreadable-with-repair scenarios
@@ -61,7 +60,7 @@ MOCK_REPAIR_BEHAVIOR="none"   # none | restore | nop
 MOCK_REPAIR_COUNT_FILE=""
 
 register_worker() {
-  WORKDIR="$BRIDGE_AGENT_HOME_ROOT/$WORKER"
+  WORKDIR="$BRIDGE_AGENT_ROOT_V2/$WORKER/workdir"
   TEAMS_DIR="$WORKDIR/.teams"
   TEAMS_ENV="$TEAMS_DIR/.env"
   MS365_DIR="$WORKDIR/.ms365"
@@ -107,10 +106,9 @@ EOF
 # Install our mock AFTER bridge-lib.sh has been sourced, otherwise the
 # real definition from lib/bridge-agents.sh would clobber the override.
 # The fixture uses chmod 000 to simulate "controller cannot read" without
-# requiring sudo / setfacl; mock behaviors:
-#   - none:    do nothing (file stays unreadable).
-#   - restore: chmod 600 the file so a subsequent [[ -r ]] succeeds.
-#   - nop:     count attempts but do nothing.
+# requiring sudo / setfacl. The v2 readiness path must not call this legacy
+# repair hook; the counter asserts that unreadable files remain a direct
+# drift signal.
 install_repair_mock() {
   bridge_linux_acl_repair_channel_env_files() {
     local agent="$1"
@@ -171,16 +169,16 @@ assert_missing_when_file_absent() {
   smoke_assert_eq "missing" "$out" "absent .env returns missing"
 }
 
-assert_unreadable_then_repaired() {
+assert_unreadable_without_repair_retry() {
   write_present_teams_env
   chmod 000 "$TEAMS_ENV"
   reset_repair_mock restore
   local out calls
   out="$(bridge_channel_env_file_readiness "$WORKER" "plugin:teams" "$TEAMS_ENV" TEAMS_APP_ID MicrosoftAppId)"
-  smoke_assert_eq "present" "$out" "unreadable .env recovers to present after ACL repair restores readability"
+  smoke_assert_eq "unreadable" "$out" "v2 unreadable .env stays unreadable without legacy ACL repair"
   calls="$(repair_calls)"
-  if (( calls < 1 )); then
-    smoke_fail "expected ACL repair to be invoked at least once; got $calls"
+  if (( calls != 0 )); then
+    smoke_fail "expected no legacy ACL repair attempts under v2; got $calls"
   fi
   chmod 600 "$TEAMS_ENV" 2>/dev/null || true
 }
@@ -191,10 +189,10 @@ assert_unreadable_when_repair_fails() {
   reset_repair_mock nop
   local out calls
   out="$(bridge_channel_env_file_readiness "$WORKER" "plugin:teams" "$TEAMS_ENV" TEAMS_APP_ID MicrosoftAppId)"
-  smoke_assert_eq "unreadable" "$out" "unreadable .env stays unreadable after bounded repair attempts fail"
+  smoke_assert_eq "unreadable" "$out" "unreadable .env stays unreadable under v2"
   calls="$(repair_calls)"
-  if (( calls < 2 )); then
-    smoke_fail "expected at least 2 repair attempts (BRIDGE_ENV_READINESS_REPAIR_ATTEMPTS default); got $calls"
+  if (( calls != 0 )); then
+    smoke_fail "expected no legacy ACL repair attempts under v2; got $calls"
   fi
   chmod 600 "$TEAMS_ENV" 2>/dev/null || true
 }
@@ -225,22 +223,22 @@ assert_no_grep_stderr_leakage() {
     smoke_fail "no-stderr scenario 3 (absent) leaked: $(cat "$stderr_path")"
   fi
 
-  # Scenario 4: unreadable then repaired
+  # Scenario 4: unreadable under v2
   write_present_teams_env
   chmod 000 "$TEAMS_ENV"
   reset_repair_mock restore
   capture_stderr_file "$stderr_path" bridge_channel_env_file_readiness "$WORKER" "plugin:teams" "$TEAMS_ENV" TEAMS_APP_ID >/dev/null
   if [[ -s "$stderr_path" ]]; then
-    smoke_fail "no-stderr scenario 4 (unreadable->repaired) leaked: $(cat "$stderr_path")"
+    smoke_fail "no-stderr scenario 4 (unreadable) leaked: $(cat "$stderr_path")"
   fi
   chmod 600 "$TEAMS_ENV" 2>/dev/null || true
 
-  # Scenario 5: unreadable repair fails
+  # Scenario 5: unreadable remains a direct drift signal
   chmod 000 "$TEAMS_ENV"
   reset_repair_mock nop
   capture_stderr_file "$stderr_path" bridge_channel_env_file_readiness "$WORKER" "plugin:teams" "$TEAMS_ENV" TEAMS_APP_ID >/dev/null
   if [[ -s "$stderr_path" ]]; then
-    smoke_fail "no-stderr scenario 5 (unreadable->fail) leaked: $(cat "$stderr_path")"
+    smoke_fail "no-stderr scenario 5 (unreadable) leaked: $(cat "$stderr_path")"
   fi
   chmod 600 "$TEAMS_ENV" 2>/dev/null || true
 }
@@ -326,8 +324,8 @@ main() {
   smoke_run "readable .env with non-empty key returns present"           assert_present_with_value
   smoke_run "readable .env with empty values returns missing"            assert_missing_with_empty_value
   smoke_run "absent .env returns missing"                                assert_missing_when_file_absent
-  smoke_run "unreadable .env recovers via ACL repair retry"              assert_unreadable_then_repaired
-  smoke_run "unreadable .env stays unreadable when repair fails"         assert_unreadable_when_repair_fails
+  smoke_run "unreadable .env skips legacy ACL repair under v2"           assert_unreadable_without_repair_retry
+  smoke_run "unreadable .env stays unreadable under v2"                  assert_unreadable_when_repair_fails
   smoke_run "no raw grep stderr leakage in any readiness scenario"       assert_no_grep_stderr_leakage
   smoke_run "status_reason emits unreadable + ACL diagnostic"            assert_status_reason_unreadable_with_diagnostic
   smoke_run "ms365 status_reason branch covers all three states"         assert_ms365_branch_covered

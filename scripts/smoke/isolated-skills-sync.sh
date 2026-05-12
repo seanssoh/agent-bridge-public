@@ -41,14 +41,22 @@ build_fixture() {
   smoke_make_temp_root "$SMOKE_NAME"
 
   FIXTURE_BRIDGE_HOME="$SMOKE_TMP_ROOT/bridge-home"
+  FIXTURE_DATA_ROOT="$SMOKE_TMP_ROOT/data"
   FIXTURE_ISOLATED_HOME_ROOT="$SMOKE_TMP_ROOT/home"
   FIXTURE_OS_USER="agent-bridge-smoke"
   FIXTURE_ISOLATED_HOME="$FIXTURE_ISOLATED_HOME_ROOT/$FIXTURE_OS_USER"
   FIXTURE_AGENT="smoke"
 
   mkdir -p \
+    "$FIXTURE_BRIDGE_HOME/state" \
     "$FIXTURE_BRIDGE_HOME/.claude/skills" \
+    "$FIXTURE_DATA_ROOT" \
     "$FIXTURE_ISOLATED_HOME"
+  cat >"$FIXTURE_BRIDGE_HOME/state/layout-marker.sh" <<EOF
+BRIDGE_LAYOUT=v2
+BRIDGE_DATA_ROOT=$FIXTURE_DATA_ROOT
+EOF
+  chmod 0644 "$FIXTURE_BRIDGE_HOME/state/layout-marker.sh"
 
   # Seed each shared skill with a minimal SKILL.md whose body contains
   # the `~/.agent-bridge/` literal that the renderer must rewrite. The

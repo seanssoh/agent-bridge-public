@@ -249,9 +249,9 @@ sudo -n install -d -m 2770 -o "$isolated_user" -g "$SMOKE_GROUP_NAME" "$agent_ho
 
 # Verify mode/owner/group landed exactly as expected. `stat -c` is
 # GNU coreutils; we already gated on Linux.
-agent_home_mode="$(stat -c '%a' "$agent_home")"
-agent_home_owner="$(stat -c '%U' "$agent_home")"
-agent_home_group="$(stat -c '%G' "$agent_home")"
+agent_home_mode="$(sudo -n stat -c '%a' "$agent_home")"
+agent_home_owner="$(sudo -n stat -c '%U' "$agent_home")"
+agent_home_group="$(sudo -n stat -c '%G' "$agent_home")"
 smoke_assert_eq "2770" "$agent_home_mode" "agent home mode"
 smoke_assert_eq "$isolated_user" "$agent_home_owner" "agent home owner"
 smoke_assert_eq "$SMOKE_GROUP_NAME" "$agent_home_group" "agent home group"
@@ -285,7 +285,7 @@ done
 # inheritance. If this fails, the v2 model itself is broken on this
 # host and the rest of the smoke is meaningless.
 for path in "${fixture_paths[@]}"; do
-  fixture_group="$(stat -c '%G' "$path")"
+  fixture_group="$(sudo -n stat -c '%G' "$path")"
   smoke_assert_eq "$SMOKE_GROUP_NAME" "$fixture_group" \
     "fixture group inheritance via setgid bit ($path)"
 done
@@ -294,15 +294,15 @@ done
 # Phase 4 — POSITIVE: controller (member of ab-agent-<n>) can read
 # ---------------------------------------------------------------------------
 
-# Spawn the read via `sg "$SMOKE_GROUP_NAME" -c '<cmd>'`: this loads a
-# fresh shell as the current user with the named group's privileges
-# active, picking up the `usermod -aG` row we wrote. The current shell
-# would not see the new group otherwise (the kernel caches
-# supplementary groups at exec time).
+# Spawn the read as the controller UID with the transient agent group active.
+# The current shell does not see the `usermod -aG` row because the kernel
+# caches supplementary groups at exec time, and `sg` is blocked on some CI
+# hosts by setgroups restrictions. `sudo -u controller -g group` gives the
+# subprocess the exact UID/GID boundary this smoke needs to assert.
 for path in "${fixture_paths[@]}"; do
   out=""
-  out="$(sg "$SMOKE_GROUP_NAME" -c "cat '$path' 2>&1")" || \
-    smoke_fail "phase 4 (positive): controller=$controller_user via sg $SMOKE_GROUP_NAME could not read $path: $out"
+  out="$(sudo -n -u "$controller_user" -g "$SMOKE_GROUP_NAME" /bin/sh -c "cat '$path' 2>&1")" || \
+    smoke_fail "phase 4 (positive): controller=$controller_user group=$SMOKE_GROUP_NAME could not read $path: $out"
   smoke_assert_contains "$out" "$sentinel" \
     "phase 4 (positive): controller read of $path returns sentinel"
 done
@@ -331,7 +331,7 @@ smoke_log "phase 5: unrelated UID denied at all 3 fixture paths"
 # here, the smoke is silently passing via the v1 ACL fallback and the
 # v2 group model has not actually been validated.
 for path in "$agent_home" "${fixture_paths[@]}"; do
-  acl_out="$(getfacl --skip-base --absolute-names "$path" 2>/dev/null || true)"
+  acl_out="$(sudo -n getfacl --skip-base --absolute-names "$path" 2>/dev/null || true)"
   # `--skip-base` suppresses the base owner/group/other rows. What
   # remains is comments (lines starting with #) and blank lines; any
   # `user:` or `group:<name>:` row is an extended entry.

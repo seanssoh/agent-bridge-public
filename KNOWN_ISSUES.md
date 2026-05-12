@@ -281,9 +281,12 @@ Effect on first launch of a v0.8.0 v2-isolated Linux Claude agent:
   - run `claude login` once per isolated UID (the planned end-state),
     which writes `$BRIDGE_AGENT_ROOT_V2/<agent>/home/.claude/.credentials.json`
     owned by the per-agent UID; or
-  - pre-populate `$BRIDGE_AGENT_ROOT_V2/<agent>/home/credentials/launch-secrets.env`
-    with `ANTHROPIC_API_KEY=…` before the first launch, in which case
-    the launcher consumes the env-var path and skips the picker.
+  - pre-populate `$BRIDGE_AGENT_ROOT_V2/<agent>/credentials/launch-secrets.env`
+    with `CLAUDE_CODE_OAUTH_TOKEN=…` (or another supported Claude env
+    credential) before the first launch, in which case the launcher
+    consumes the env-var path and skips the picker. The supported helper is
+    `agent-bridge auth claude-token add --id <id> --stdin --activate --sync`,
+    using a token from `claude setup-token`.
 
 This is the planned end-state described in the PR-E plan — the
 credential file lives entirely inside the v2 layout, no path reaches
@@ -583,3 +586,89 @@ bash bridge-daemon.sh start
 Debug-only override: `BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS=1`
 (the `Permission denied` errors will return — set only when you
 need to inspect a specific failure mode).
+
+## 24. Tool-policy denies `env` / `printenv` env-as-prefix invocations (#799 r3)
+
+The tool-policy pretool gate denies env-dump verbs — `env`,
+`printenv`, bare `set`, `compgen -e`, `declare -p` / `declare -x`,
+`typeset -p` / `typeset -x`, `export -p`, and any read of
+`/proc/<pid>/environ` — as defense-in-depth for stale/manual secret
+environment variables. #799's final design no longer delivers Claude
+OAuth tokens through `CLAUDE_CODE_OAUTH_TOKEN`; it writes the active
+setup token into the selected Claude agent's `.claude/.credentials.json`
+file instead. The env-dump deny remains because older deploys or manual
+operator exports may still put token material in the process
+environment, and literal substring checks only fire when the raw command
+names the variable.
+
+Side effect: `env VAR=val cmd` (env-as-prefix) is also denied because
+distinguishing it from a bare `env` dump from the raw command string
+is unreliable. Use one of the following when you need env-as-prefix
+invocations from Bash:
+
+- `/usr/bin/env LANG=C foo` — allowed (the absolute path bypasses
+  the bare-word `env` pattern, which uses a `/`-rejecting lookbehind).
+- `VAR=val cmd` — allowed (shell-native env-prefix, no `env` verb).
+- A wrapper shell script that sets the env and execs the binary —
+  allowed (the verb is the wrapper name, not `env`).
+
+`set -e` / `set -o pipefail` / `kubectl set image` / `git remote
+set-url` / `setfacl` and other commands that happen to contain `set`,
+`env`, or `environment` substrings remain allowed; the patterns are
+word-boundary based and require terminator/pipe context after bare
+`set`.
+
+## 25. Claude OAuth credential — same-UID FS readability residual (#799 r2-of-Path-A)
+
+The per-agent `.claude/.credentials.json` file is owned by the
+isolated agent UID so the Claude CLI can read it. Because the same UID
+also runs Bash, Read, and other tool subprocesses, a deliberately
+constructed tool call that dynamically enumerates `~/.claude` (e.g.
+`python -c 'import pathlib;
+print((pathlib.Path.home()/".claude"/".credentials.json").read_text())'`)
+can read the credential without matching the hook's literal-substring
+deny rules.
+
+Defense-in-depth measures applied in #799 r1-of-Path-A through r2:
+
+- File mode `0o600` owned by the isolated agent UID. No cross-UID
+  access from other isolated agents or from the controller's tool UID.
+- Atomic chown: the credential / config / settings tempfiles are
+  chowned to the isolated UID **before** `os.replace`, so there is no
+  transient root-owned window at the final path. See PR #799 r2 codex
+  finding 3.
+- Symlink hardening: `bridge-auth.sh` rejects a pre-existing
+  `.claude` symlink in the agent-owned home and verifies the resolved
+  real path stays inside the isolated user home. `bridge-auth.py`
+  re-applies the check before any privileged write. See PR #799 r2
+  codex finding 2.
+- Pretool hook deny list catches literal mentions of `.claude` +
+  `.credentials.json`, the registry JSON path, the legacy
+  `launch-secrets.env`, the `CLAUDE_CODE_OAUTH_TOKEN` env name, and
+  env-dump verbs (`env`, `printenv`, `set`, `compgen -e`,
+  `declare/typeset -[xp]`, `export -p`, `/proc/<pid>/environ`). See §24.
+- Token rotation limits blast radius — a leaked token is invalidated
+  on next rotation via `agent-bridge auth claude-token rotate --sync`.
+
+Residual limit: deliberate exfiltration via dynamic `Path.home()`
+enumeration in any interpreter that can read `os.environ`/`%ENV`/`ENV[]`
+or open files cannot be caught by literal-substring deny rules without
+banning all interpreter use. Path B (the prior env-injection design)
+leaked through any interpreter's environment view; the Path A
+file-based design contains the leak surface to deliberate
+`Path.home()`-relative reads, which is hook-deny-able in the literal
+case and rotation-recoverable in the deliberate case.
+
+Planned future enhancement (separate PR, not in scope for this round):
+a credential-helper pattern — a setuid/setgid helper, or a separate
+Claude launcher identity that owns the credential file and hands the
+token only to the Claude binary, with the agent's tool UID having no
+filesystem access to the credential. This would close the same-UID
+readability gap without re-introducing env injection.
+
+Operator guidance: this is a defense-in-depth limit, not a fundamental
+break. For high-trust deployments where the same-UID readability is
+not acceptable (e.g. agents executing arbitrary third-party code under
+the tool UID), keep token rotation enabled with a short interval and
+treat the per-agent credential as a rotation-controlled secret rather
+than a long-lived one.

@@ -640,6 +640,47 @@ for compound_cmd in \
   fi
 done
 
+# --- Scenario 9: Claude OAuth credential file is never tool-readable ----
+# Reads of ~/.claude/.credentials.json are blocked even when the generic
+# system-config gate would otherwise allow read-intent commands. A leaked
+# OAuth access/refresh token in tool output can invalidate every Claude
+# session sharing that credential.
+cred_cmd="strings /home/ec2-user/.claude/.credentials.json | head"
+payload="$(emit_bash_payload "test-9a" "$cred_cmd")"
+out="$(run_hook_pretool_payload "$payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$out" == *'"deny"'* ]] && [[ "$out" == *"Claude OAuth credentials are blocked"* ]]; then
+  pass "scenario 9a: Bash read of Claude OAuth credential denied"
+else
+  fail "scenario 9a: Bash read of Claude OAuth credential not denied — output: $out"
+fi
+
+read_payload=$(cat <<'JSON'
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Read",
+  "tool_use_id": "test-9b",
+  "session_id": "test-session-9b",
+  "tool_input": {
+    "file_path": "/home/ec2-user/.claude/.credentials.json"
+  }
+}
+JSON
+)
+out="$(run_hook_pretool_payload "$read_payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$out" == *'"deny"'* ]] && [[ "$out" == *"Claude OAuth credentials are blocked"* ]]; then
+  pass "scenario 9b: Read tool access to Claude OAuth credential denied"
+else
+  fail "scenario 9b: Read tool access to Claude OAuth credential not denied — output: $out"
+fi
+
+payload="$(emit_bash_payload "test-9c" "claude auth status")"
+out="$(run_hook_pretool_payload "$payload" "$NON_ADMIN_AGENT" 2>/dev/null || true)"
+if [[ "$out" == *'"deny"'* ]]; then
+  fail "scenario 9c: redacted auth-status diagnostic falsely denied — output: $out"
+else
+  pass "scenario 9c: redacted auth-status diagnostic allowed"
+fi
+
 # --- Summary -------------------------------------------------------------
 printf '\n[smoke] system-config-gating: %d pass, %d fail\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

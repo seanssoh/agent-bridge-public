@@ -1569,7 +1569,7 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   # owns the agent registration. Tolerant on failure: warn and continue.
   if [[ -n "$ADMIN_AGENT_ID" ]]; then
     if [[ $DRY_RUN -eq 1 ]]; then
-      echo "[bridge-upgrade] plan: ensure admin codex pair ${ADMIN_AGENT_ID}-dev (idempotent)"
+      echo "[bridge-upgrade] plan: ensure admin codex pair ${ADMIN_AGENT_ID}-dev (idempotent)" >&2
     else
       _admin_pair_output=""
       if ! _admin_pair_output="$(
@@ -1697,7 +1697,8 @@ total_failed = sum(len(a.get("failed", []) or []) for a in agents)
 print(
     f"[bridge-upgrade] profile symlinks repaired: {total_repaired} "
     f"(skipped={total_skipped}, failed={total_failed}, "
-    f"agents={len(agents)})"
+    f"agents={len(agents)})",
+    file=sys.stderr,
 )
 PY
 fi

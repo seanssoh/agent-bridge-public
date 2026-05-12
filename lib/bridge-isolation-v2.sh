@@ -187,9 +187,10 @@ bridge_isolation_v2_agent_credentials_dir() {
 bridge_isolation_v2_agent_secret_env_file() {
   # Path to the per-agent launch-secrets.env file, the controller-owned
   # KEY=VALUE shell-env file that bridge-run.sh sources before child
-  # execution (bridge_isolation_v2_load_secret_env). Keeping secrets in
-  # this file (not in BRIDGE_AGENT_LAUNCH_CMD) prevents leaks via
-  # process listings, dry-run output, log lines, and crash reports.
+  # execution (bridge_isolation_v2_load_secret_env). Claude OAuth tokens
+  # no longer use this tool-inherited env channel; bridge-auth.sh renders
+  # them into the agent's Claude .credentials.json file and keeps only a
+  # non-secret CLAUDE_CONFIG_DIR pointer here.
   local agent="$1"
   local credentials_dir
   credentials_dir="$(bridge_isolation_v2_agent_credentials_dir "$agent")" || return 1
@@ -1341,19 +1342,23 @@ bridge_isolation_v2_matrix_rows_for_agent() {
     # writer helper sets mode 0660 explicitly.
   fi
 
-  # ----- RC3: controller Anthropic credentials read grant (named ACL) -----
-  # Resolve the controller home dynamically so the row stays
-  # machine-agnostic (operator host runs ec2-user; dev hosts run sean).
-  local ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
-  if [[ -n "$ctrl_user" ]]; then
-    local ctrl_home
-    ctrl_home="$(getent passwd "$ctrl_user" 2>/dev/null | cut -d: -f6)"
-    if [[ -z "$ctrl_home" ]]; then
-      ctrl_home="${HOME:-}"
-    fi
-    if [[ -n "$ctrl_home" ]]; then
-      printf 'controller-credentials|%s/.claude/.credentials.json|file|%s|%s||0600|0|controller_credential_acl|required|RC3 named-user ACL exception (only cross-agent shared secret)\n' \
-        "$ctrl_home" "$ctrl_user" "$ctrl_user"
+  # ----- Legacy opt-in: controller Anthropic credentials read grant -----
+  # Default OFF. Sharing the controller's rotating Claude OAuth file across
+  # agents widens the secret surface and can invalidate every session when the
+  # token is exposed or rotated. Operators that still need the old transition
+  # behavior can opt in explicitly with BRIDGE_ENABLE_CONTROLLER_CREDENTIAL_ACL=1.
+  if [[ "${BRIDGE_ENABLE_CONTROLLER_CREDENTIAL_ACL:-0}" == "1" ]]; then
+    local ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+    if [[ -n "$ctrl_user" ]]; then
+      local ctrl_home
+      ctrl_home="$(getent passwd "$ctrl_user" 2>/dev/null | cut -d: -f6)"
+      if [[ -z "$ctrl_home" ]]; then
+        ctrl_home="${HOME:-}"
+      fi
+      if [[ -n "$ctrl_home" ]]; then
+        printf 'controller-credentials|%s/.claude/.credentials.json|file|%s|%s||0600|0|controller_credential_acl|required|legacy opt-in named-user ACL exception for controller Claude credential\n' \
+          "$ctrl_home" "$ctrl_user" "$ctrl_user"
+      fi
     fi
   fi
 
@@ -1369,8 +1374,8 @@ bridge_isolation_v2_matrix_rows_for_agent() {
     # design and replaces it with four per-agent rows under the isolated
     # home. Operator's binding principle: each isolated agent installs
     # its own plugins, logs in separately, and never shares cache or
-    # credentials with another agent. Anthropic controller credentials
-    # remain the only cross-agent shared secret (RC3 row above).
+    # credentials with another agent. The legacy controller credential
+    # ACL row above is disabled unless explicitly opted in.
     #
     # All four rows use grant_mechanism `install_managed`: the matrix
     # apply path does not create or chmod these — `bridge_linux_share_
@@ -1456,6 +1461,25 @@ bridge_isolation_v2_matrix_rows_for_agent() {
   return 0
 }
 
+bridge_isolation_v2_controller_user() {
+  # Isolated agent hooks run with USER=agent-bridge-<agent>, but generated
+  # agent envs carry the controller UID that authored the v2 layout.
+  local controller_uid="${BRIDGE_CONTROLLER_UID:-}"
+  local controller_user=""
+
+  if [[ "$controller_uid" =~ ^[0-9]+$ ]] && command -v getent >/dev/null 2>&1; then
+    controller_user="$(getent passwd "$controller_uid" 2>/dev/null | cut -d: -f1 || true)"
+    if [[ -n "$controller_user" ]]; then
+      printf '%s' "$controller_user"
+      return 0
+    fi
+  fi
+
+  controller_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+  [[ -n "$controller_user" ]] || return 1
+  printf '%s' "$controller_user"
+}
+
 bridge_isolation_v2_apply_row() {
   # Internal dispatcher — applies (or checks) one matrix row.
   # Args:
@@ -1477,9 +1501,9 @@ bridge_isolation_v2_apply_row() {
   local mechanism="${10}"
   local criticality="${11}"
 
-  # Resolve `controller` token at apply time so the matrix stays static.
+  # Resolve `controller` token at apply/check time so the matrix stays static.
   if [[ "$owner" == "controller" ]]; then
-    owner="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+    owner="$(bridge_isolation_v2_controller_user 2>/dev/null || true)"
     [[ -n "$owner" ]] || {
       bridge_warn "apply_row($row_name): cannot resolve controller user"
       return 1
@@ -1735,6 +1759,11 @@ bridge_isolation_v2_ensure_matrix_path() {
     return 1
   fi
   IFS='|' read -r r_name r_path r_access r_owner r_group r_dmode r_fmode r_setgid r_mech r_crit r_notes <<<"$row"
+  if bridge_isolation_v2_apply_row "check" \
+    "$r_name" "$r_path" "$r_access" "$r_owner" "$r_group" \
+    "$r_dmode" "$r_fmode" "$r_setgid" "$r_mech" "$r_crit" 2>/dev/null; then
+    return 0
+  fi
   bridge_isolation_v2_apply_row "apply" \
     "$r_name" "$r_path" "$r_access" "$r_owner" "$r_group" \
     "$r_dmode" "$r_fmode" "$r_setgid" "$r_mech" "$r_crit"
