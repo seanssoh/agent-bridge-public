@@ -319,6 +319,121 @@ def cmd_mcp_orphan_cleanup_parse(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# #800 regression follow-up — PR #799 introduced four NEW heredoc-stdin
+# callsites on the cron auth / token rotation / quota recovery paths roughly
+# 30 minutes after PR #801 (#800 Track A) closed nine sibling sites. The
+# subcommands below are the Pattern-A wrapping for those four regressions,
+# wired in by ``fix/daemon-heredoc-regression-rotation-recovery``.
+# ---------------------------------------------------------------------------
+
+
+def cmd_usage_rotation_candidates_parse(args: argparse.Namespace) -> int:
+    """Original site: bridge-daemon.sh:1069 (process_usage_monitor).
+
+    Extracts ``rotation_candidates`` tuples from the usage-monitor JSON.
+    Output: one tab-separated row per candidate:
+      provider \\t account \\t window \\t used_percent \\t reset_at \\t source \\t message
+    JSON-parse error exits 1 so the bash callsite's ``|| rotation_rows=""``
+    fallback fires and the loop continues with no candidates.
+    """
+    try:
+        payload = json.loads(args.monitor_json)
+    except Exception:
+        return 1
+
+    for item in payload.get("rotation_candidates", []) or []:
+        print(
+            "\t".join(
+                [
+                    str(item.get("provider", "")),
+                    str(item.get("account", "")),
+                    str(item.get("window", "")),
+                    str(item.get("used_percent", "")),
+                    str(item.get("reset_at", "")),
+                    str(item.get("source", "")),
+                    str(item.get("message", "")),
+                ]
+            )
+        )
+    return 0
+
+
+def cmd_rotation_status_parse(args: argparse.Namespace) -> int:
+    """Original site: bridge-daemon.sh:1128 (process_usage_monitor rotate branch).
+
+    Parses the bridge-auth.sh claude-token rotate --json envelope. Output (a
+    single row):
+      status \\t reason \\t old_active_token_id \\t active_token_id \\t sync_status
+    JSON-parse error degrades to ``error\\tinvalid_rotation_output\\t...`` so
+    the downstream ``case "$rotation_status:$rotation_reason"`` branch can
+    classify it under ``error:*``.
+    """
+    try:
+        payload = json.loads(args.rotate_json)
+    except Exception:
+        payload = {"status": "error", "reason": "invalid_rotation_output"}
+    sync = payload.get("sync") if isinstance(payload.get("sync"), dict) else {}
+    print(
+        "\t".join(
+            [
+                str(payload.get("status", "")),
+                str(payload.get("reason", "")),
+                str(payload.get("old_active_token_id", "")),
+                str(payload.get("active_token_id", "")),
+                str(sync.get("status", "")),
+            ]
+        )
+    )
+    return 0
+
+
+def cmd_recovery_status_parse(args: argparse.Namespace) -> int:
+    """Original site: bridge-daemon.sh:1227 (process_claude_token_recovery).
+
+    Parses the bridge-auth.sh claude-token recover-due --json envelope.
+    Output (a single row):
+      status \\t reason \\t checked_count \\t recovered_count \\t still_disabled_count \\t recovered_csv \\t sync_recommended
+    JSON-parse error degrades to ``error\\tinvalid_recovery_output\\t...``;
+    the bash callsite then audit-logs the failure reason.
+    """
+    try:
+        payload = json.loads(args.recovery_json)
+    except Exception:
+        payload = {"status": "error", "reason": "invalid_recovery_output"}
+    recovered = payload.get("recovered") if isinstance(payload.get("recovered"), list) else []
+    print(
+        "\t".join(
+            [
+                str(payload.get("status", "")),
+                str(payload.get("reason", "")),
+                str(payload.get("checked_count", 0)),
+                str(payload.get("recovered_count", 0)),
+                str(payload.get("still_disabled_count", 0)),
+                ",".join(str(item) for item in recovered),
+                "1" if payload.get("sync_recommended") else "0",
+            ]
+        )
+    )
+    return 0
+
+
+def cmd_sync_status_parse(args: argparse.Namespace) -> int:
+    """Original site: bridge-daemon.sh:1257 (process_claude_token_recovery sync branch).
+
+    Extracts the ``status`` field from a bridge-auth.sh claude-token sync
+    --json envelope. Empty argv / parse failure prints ``error`` so the
+    bash side surfaces a sync failure rather than silently treating it as
+    success.
+    """
+    try:
+        payload = json.loads(args.sync_json)
+        print(str(payload.get("status", "")))
+    except Exception:
+        print("error")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI plumbing.
 # ---------------------------------------------------------------------------
 
@@ -378,6 +493,27 @@ SUBCOMMANDS = {
         cmd_mcp_orphan_cleanup_parse,
         [("report_file", "path to mcp-orphan-cleanup report JSON file")],
         "Single tab-separated row of summary counts (4 cols).",
+    ),
+    # #800 regression follow-up — PR #799 callsites.
+    "usage-rotation-candidates-parse": (
+        cmd_usage_rotation_candidates_parse,
+        [("monitor_json", "JSON payload produced by bridge-usage.sh monitor --json")],
+        "Tabular extract of usage-monitor rotation candidates (7 cols / row).",
+    ),
+    "rotation-status-parse": (
+        cmd_rotation_status_parse,
+        [("rotate_json", "JSON envelope from bridge-auth.sh claude-token rotate --json")],
+        "Single-row rotation outcome: status / reason / from / to / sync_status (5 cols).",
+    ),
+    "recovery-status-parse": (
+        cmd_recovery_status_parse,
+        [("recovery_json", "JSON envelope from bridge-auth.sh claude-token recover-due --json")],
+        "Single-row recovery outcome (7 cols).",
+    ),
+    "sync-status-parse": (
+        cmd_sync_status_parse,
+        [("sync_json", "JSON envelope from bridge-auth.sh claude-token sync --json")],
+        "Single line — sync status string ('error' on parse failure).",
     ),
 }
 

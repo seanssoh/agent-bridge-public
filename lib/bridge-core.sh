@@ -6,6 +6,59 @@ bridge_die() {
   exit 1
 }
 
+# Issue #800 regression follow-up: the Levenshtein nearest-match fallback used
+# by ``bridge_suggest_subcommand`` previously embedded its Python body via
+# ``python3 - "$arg" <<'PY' ... PY``. That is the same heredoc-stdin pattern
+# PR #801 closed across nine daemon callsites — bash can wedge in
+# ``heredoc_write`` BEFORE the python child launches. The body is short and
+# only fires on unknown-subcommand error paths, so we use Pattern B
+# (``python3 -c "$SCRIPT"`` here-string) rather than promoting it into
+# ``bridge-daemon-helpers.py``. ``bridge_with_timeout`` (lib/bridge-state.sh)
+# enforces a 5s ceiling — pure compute, no IO — and audit-logs
+# ``daemon_subprocess_timeout`` on 124/137 so the operator can spot a stuck
+# call site even on the help/error path. The variable is module-level so we
+# don't pay parser cost on every invocation.
+_BRIDGE_CORE_LEVENSHTEIN_PY='
+import sys
+
+def levenshtein(a, b):
+    if a == b:
+        return 0
+    if not a or not b:
+        return max(len(a), len(b))
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        curr = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cost = 0 if ca == cb else 1
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
+        prev = curr
+    return prev[-1]
+
+unknown = sys.argv[1].strip()
+candidates = [c for c in sys.argv[2].split() if c]
+
+if not candidates:
+    sys.exit(0)
+
+scored = sorted(((levenshtein(unknown.lower(), c.lower()), c) for c in candidates))
+best = scored[0]
+second = scored[1] if len(scored) > 1 else None
+
+# Require: (a) distance <= 2, (b) distance < len(unknown) (reject wild
+# matches where the "closest" valid word shares almost nothing), and
+# (c) a strict margin over second-best to avoid ambiguous ties.
+if best[0] > 2:
+    sys.exit(0)
+if best[0] >= len(unknown):
+    sys.exit(0)
+if second and second[0] <= best[0]:
+    # Tie — suggesting one of several equally-near is noisier than silence.
+    sys.exit(0)
+
+print(best[1])
+'
+
 # bridge_suggest_subcommand — intent-recovery for unknown CLI subcommands.
 #
 # Issue #163: agents repeatedly guessed CLI subcommand names that don't exist
@@ -82,47 +135,13 @@ bridge_suggest_subcommand() {
 
   bridge_require_python
   local match
-  match="$(python3 - "$unknown" "$valid_list" <<'PY'
-import sys
-
-def levenshtein(a, b):
-    if a == b:
-        return 0
-    if not a or not b:
-        return max(len(a), len(b))
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        curr = [i] + [0] * len(b)
-        for j, cb in enumerate(b, 1):
-            cost = 0 if ca == cb else 1
-            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost)
-        prev = curr
-    return prev[-1]
-
-unknown = sys.argv[1].strip()
-candidates = [c for c in sys.argv[2].split() if c]
-
-if not candidates:
-    sys.exit(0)
-
-scored = sorted(((levenshtein(unknown.lower(), c.lower()), c) for c in candidates))
-best = scored[0]
-second = scored[1] if len(scored) > 1 else None
-
-# Require: (a) distance <= 2, (b) distance < len(unknown) (reject wild
-# matches where the "closest" valid word shares almost nothing), and
-# (c) a strict margin over second-best to avoid ambiguous ties.
-if best[0] > 2:
-    sys.exit(0)
-if best[0] >= len(unknown):
-    sys.exit(0)
-if second and second[0] <= best[0]:
-    # Tie — suggesting one of several equally-near is noisier than silence.
-    sys.exit(0)
-
-print(best[1])
-PY
-  )"
+  # Pattern B per PR #801 / #800 follow-up: ``python3 -c "$SCRIPT"`` here-
+  # string + ``bridge_with_timeout`` wrapper. The previous form was
+  # ``python3 - "$arg" <<'PY' ... PY`` which is the heredoc-stdin deadlock
+  # class. ``bridge_with_timeout`` is defined in lib/bridge-state.sh which
+  # is sourced AFTER this module in bridge-lib.sh — safe because bash
+  # resolves the function name at call time, not at source time.
+  match="$(bridge_with_timeout 5 core_match python3 -c "$_BRIDGE_CORE_LEVENSHTEIN_PY" "$unknown" "$valid_list" 2>/dev/null || true)"
 
   if [[ -n "$match" ]]; then
     printf '혹시 %q 이었나요?' "$match"
