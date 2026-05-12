@@ -859,7 +859,12 @@ it is drift — the migration runbook below strips it.
 For Claude subscription accounts, the preferred shared-credential path is
 not the controller's `~/.claude/.credentials.json`. Generate one or more
 Claude Code setup tokens and let Agent Bridge render the active token into
-each selected Claude agent's own `.claude/.credentials.json` file:
+each selected Claude agent's own `.claude/.credentials.json` file. Sync also
+seeds the sibling `.claude/.claude.json` bootstrap file when missing, because
+interactive Claude Code sessions require both files to skip first-run login
+prompts. It also preserves `settings.json` while adding Claude's
+`skipDangerousModePermissionPrompt` user setting for bridge-managed agents
+that are launched with `--dangerously-skip-permissions`.
 
 ```bash
 claude setup-token

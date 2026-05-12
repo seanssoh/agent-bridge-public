@@ -31,6 +31,9 @@ TOKEN_B="fake-claude-oauth-token-b"
 TOKEN_C="fake-claude-oauth-token-c"
 AGENT="patch"
 CREDENTIAL_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/home/.claude/.credentials.json"
+CLAUDE_CONFIG_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/home/.claude/.claude.json"
+CLAUDE_SETTINGS_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/home/.claude/settings.json"
+CLAUDE_SETTINGS_EFFECTIVE_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/home/.claude/settings.effective.json"
 LEGACY_SECRET_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/credentials/launch-secrets.env"
 
 mkdir -p "$BRIDGE_HOME" "$BRIDGE_DATA_ROOT" "$ROOT/runtime/secrets" "$ROOT/workdir" "$ROOT/bin"
@@ -111,15 +114,50 @@ if actual != expected:
 if "refreshToken" in payload.get("claudeAiOauth", {}):
     raise SystemExit("setup-token credential should not invent refreshToken")
 PY
+"$PYTHON" - "$CLAUDE_CONFIG_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+for key in ("firstStartTime", "migrationVersion", "seenNotifications", "userID"):
+    if key not in payload:
+        raise SystemExit(f"Claude config bootstrap missing {key}")
+if payload.get("hasCompletedOnboarding") is not True:
+    raise SystemExit("Claude config bootstrap did not complete onboarding")
+projects = payload.get("projects", {})
+trusted = [
+    key for key, project in projects.items()
+    if isinstance(project, dict) and project.get("hasTrustDialogAccepted") is True
+]
+if not trusted:
+    raise SystemExit("Claude config bootstrap did not trust the agent workdir")
+if not payload.get("opusProMigrationComplete") or not payload.get("sonnet1m45MigrationComplete"):
+    raise SystemExit("Claude config bootstrap did not mark migrations complete")
+PY
+[[ $? -eq 0 ]] || fail "Claude config bootstrap missing onboarding/trust state"
+"$PYTHON" - "$CLAUDE_SETTINGS_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if payload.get("skipDangerousModePermissionPrompt") is not True:
+    raise SystemExit("Claude settings bootstrap did not accept agent bypass-permission launch mode")
+PY
+[[ $? -eq 0 ]] || fail "Claude settings bootstrap missing bypass-permission state"
 [[ -f "$LEGACY_SECRET_FILE" ]] || fail "legacy launch env file with CLAUDE_CONFIG_DIR was not created"
 ! grep -Fq "CLAUDE_CODE_OAUTH_TOKEN" "$LEGACY_SECRET_FILE" || fail "legacy launch secret still contains token env"
 grep -Fq "CLAUDE_CONFIG_DIR='$(dirname "$CREDENTIAL_FILE")'" "$LEGACY_SECRET_FILE" || fail "legacy launch env did not point Claude at per-agent config dir"
-pass "add --sync writes Claude credential file without leaking token env"
+pass "add --sync writes Claude credential/config files without leaking token env"
 
 ADD_SECOND_JSON="$(printf '%s' "$TOKEN_B" | "$REPO_ROOT/agent-bridge" auth claude-token add --id second --stdin --json)"
 [[ "$ADD_SECOND_JSON" != *"$TOKEN_B"* ]] || fail "add output leaked token B"
 json_assert "add second" "$ADD_SECOND_JSON" "payload['status'] == 'added' and payload['active_token_id'] == 'first'"
 pass "second token registered without activation"
+
+mv "$CLAUDE_SETTINGS_FILE" "$CLAUDE_SETTINGS_EFFECTIVE_FILE"
+ln -s "settings.effective.json" "$CLAUDE_SETTINGS_FILE"
 
 ROTATE_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token rotate --reason smoke --sync --json)"
 [[ "$ROTATE_JSON" != *"$TOKEN_A"* && "$ROTATE_JSON" != *"$TOKEN_B"* ]] || fail "rotate output leaked token"
@@ -135,6 +173,8 @@ if actual != sys.argv[2]:
 PY
 ! grep -Fq "CLAUDE_CODE_OAUTH_TOKEN" "$LEGACY_SECRET_FILE" || fail "legacy launch secret reintroduced token env"
 grep -Fq "CLAUDE_CONFIG_DIR='$(dirname "$CREDENTIAL_FILE")'" "$LEGACY_SECRET_FILE" || fail "legacy launch env lost CLAUDE_CONFIG_DIR"
+[[ -L "$CLAUDE_SETTINGS_FILE" ]] || fail "Claude settings symlink was replaced during sync"
+[[ "$(readlink "$CLAUDE_SETTINGS_FILE")" == "settings.effective.json" ]] || fail "Claude settings symlink target changed during sync"
 pass "rotate --sync advances Claude credential file"
 
 DISABLED_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token auto-rotate disable --json)"

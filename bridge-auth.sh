@@ -102,9 +102,13 @@ bridge_auth_prepare_credential_file() {
 bridge_auth_fix_credential_file_mode() {
   local agent="$1"
   local file="$2"
+  local config_file=""
+  local settings_file=""
   local os_user=""
   local os_group=""
 
+  config_file="$(dirname "$file")/.claude.json"
+  settings_file="$(dirname "$file")/settings.json"
   if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
     os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
     [[ -n "$os_user" ]] || {
@@ -114,9 +118,19 @@ bridge_auth_fix_credential_file_mode() {
     os_group="$(id -gn "$os_user" 2>/dev/null || printf '%s' "$os_user")"
     bridge_auth_run_privileged chown "$os_user:$os_group" "$file" || return 1
     bridge_auth_run_privileged chmod 0600 "$file" || return 1
+    if bridge_auth_run_privileged test -f "$config_file"; then
+      bridge_auth_run_privileged chown "$os_user:$os_group" "$config_file" || return 1
+      bridge_auth_run_privileged chmod 0600 "$config_file" || return 1
+    fi
+    if bridge_auth_run_privileged test -e "$settings_file"; then
+      bridge_auth_run_privileged chown "$os_user:$os_group" "$settings_file" || return 1
+    fi
     return 0
   fi
   chmod 0600 "$file" 2>/dev/null || bridge_auth_run_privileged chmod 0600 "$file"
+  if [[ -f "$config_file" ]]; then
+    chmod 0600 "$config_file" 2>/dev/null || bridge_auth_run_privileged chmod 0600 "$config_file"
+  fi
 }
 
 bridge_auth_update_legacy_claude_config_env() {
@@ -200,14 +214,19 @@ bridge_auth_sync_agent_python() {
   local agent="$1"
   local registry="$2"
   local file="$3"
+  local workdir=""
+  local -a workdir_args=()
+
+  workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  [[ -n "$workdir" ]] && workdir_args=(--workdir "$workdir")
 
   if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
     bridge_linux_sudo_root python3 "$SCRIPT_DIR/bridge-auth.py" \
-      --registry "$registry" sync-agent --agent "$agent" --file "$file" --json
+      --registry "$registry" sync-agent --agent "$agent" --file "$file" "${workdir_args[@]}" --json
     return $?
   fi
   python3 "$SCRIPT_DIR/bridge-auth.py" \
-    --registry "$registry" sync-agent --agent "$agent" --file "$file" --json
+    --registry "$registry" sync-agent --agent "$agent" --file "$file" "${workdir_args[@]}" --json
 }
 
 bridge_auth_selected_agents() {

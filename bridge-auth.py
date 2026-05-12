@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -25,6 +26,7 @@ TOKEN_ENV_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
 TOKEN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 CLAUDE_OAUTH_EXPIRES_AT_MS = 4102444800000
 CLAUDE_OAUTH_SCOPES = ["user:inference", "user:profile"]
+CLAUDE_CONFIG_MIGRATION_VERSION = 13
 MONTHS = {
     "january": 1,
     "february": 2,
@@ -121,6 +123,42 @@ def claude_oauth_credentials_payload(token: str) -> dict[str, Any]:
             "scopes": CLAUDE_OAUTH_SCOPES,
         }
     }
+
+
+def claude_config_bootstrap_payload(
+    existing: dict[str, Any] | None = None,
+    trusted_workdirs: list[str] | None = None,
+) -> dict[str, Any]:
+    payload = dict(existing or {})
+    now = now_utc()
+    payload.setdefault("firstStartTime", now.isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+    payload.setdefault("hasCompletedOnboarding", True)
+    payload.setdefault("opusProMigrationComplete", True)
+    payload.setdefault("sonnet1m45MigrationComplete", True)
+    payload.setdefault("seenNotifications", {})
+    payload.setdefault("migrationVersion", CLAUDE_CONFIG_MIGRATION_VERSION)
+    payload.setdefault("changelogLastFetched", int(now.timestamp() * 1000))
+    payload.setdefault("userID", str(uuid.uuid4()))
+    if trusted_workdirs:
+        projects = payload.get("projects")
+        if projects is None:
+            projects = {}
+            payload["projects"] = projects
+        if not isinstance(projects, dict):
+            raise ValueError("Claude config projects must contain a JSON object")
+        for workdir in trusted_workdirs:
+            project = projects.get(workdir)
+            if not isinstance(project, dict):
+                project = {}
+                projects[workdir] = project
+            project["hasTrustDialogAccepted"] = True
+            project["hasCompletedProjectOnboarding"] = True
+            project.setdefault("allowedTools", [])
+            project.setdefault("mcpContextUris", [])
+            project.setdefault("mcpServers", {})
+            project.setdefault("enabledMcpjsonServers", [])
+            project.setdefault("disabledMcpjsonServers", [])
+    return payload
 
 
 def read_token(args: argparse.Namespace) -> str:
@@ -425,6 +463,7 @@ def probe_claude_token(token: str, timeout_seconds: int) -> dict[str, Any]:
             config_path = Path(config_dir)
             os.chmod(config_path, 0o700)
             write_claude_credentials_file(config_path / ".credentials.json", token)
+            ensure_claude_config_file(config_path)
             env = os.environ.copy()
             env.pop(TOKEN_ENV_KEY, None)
             env.pop("ANTHROPIC_API_KEY", None)
@@ -959,18 +998,23 @@ def cmd_auto_rotate(args: argparse.Namespace) -> int:
 def write_claude_credentials_file(path: Path, token: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(claude_oauth_credentials_payload(token), ensure_ascii=True, indent=2) + "\n"
+    write_private_file_atomic(path, text, mode=0o600, prefix=".credentials.")
+
+
+def write_private_file_atomic(path: Path, text: str, *, mode: int = 0o600, prefix: str = ".tmp.") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     fd = -1
     tmp_name = ""
     try:
-        fd, tmp_name = tempfile.mkstemp(prefix=".credentials.", suffix=".tmp", dir=str(path.parent))
+        fd, tmp_name = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=str(path.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fd = -1
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        os.chmod(tmp_name, 0o600)
+        os.chmod(tmp_name, mode)
         os.replace(tmp_name, path)
-        os.chmod(path, 0o600)
+        os.chmod(path, mode)
     finally:
         if fd >= 0:
             os.close(fd)
@@ -979,6 +1023,63 @@ def write_claude_credentials_file(path: Path, token: str) -> None:
                 os.unlink(tmp_name)
             except FileNotFoundError:
                 pass
+
+
+def ensure_claude_config_file(config_dir: Path, trusted_workdirs: list[str] | None = None) -> Path:
+    path = config_dir / ".claude.json"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    existing: dict[str, Any] | None = None
+    if path.exists():
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Claude config file is not valid JSON: {path}: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"Claude config file must contain a JSON object: {path}")
+        existing = parsed
+    payload = claude_config_bootstrap_payload(existing, trusted_workdirs)
+    if existing == payload:
+        os.chmod(path, 0o600)
+        return path
+    text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
+    write_private_file_atomic(path, text, mode=0o600, prefix=".claude.")
+    return path
+
+
+def claude_settings_write_path(config_dir: Path) -> Path:
+    path = config_dir / "settings.json"
+    if not path.is_symlink():
+        return path
+    target = path.resolve(strict=False)
+    config_root = config_dir.resolve(strict=False)
+    try:
+        target.relative_to(config_root)
+    except ValueError as exc:
+        raise ValueError(f"Claude settings symlink must stay inside config dir: {path} -> {target}") from exc
+    return target
+
+
+def ensure_claude_settings_file(config_dir: Path) -> Path:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = claude_settings_write_path(config_dir)
+    payload: dict[str, Any] = {}
+    mode = 0o600
+    if path.exists():
+        mode = path.stat().st_mode & 0o777
+        try:
+            parsed = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"Claude settings file is not valid JSON: {path}: {exc}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"Claude settings file must contain a JSON object: {path}")
+        payload = parsed
+    before = dict(payload)
+    payload.setdefault("skipDangerousModePermissionPrompt", True)
+    if payload == before:
+        return path
+    text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
+    write_private_file_atomic(path, text, mode=mode, prefix=".settings.")
+    return path
 
 
 def cmd_sync_agent(args: argparse.Namespace) -> int:
@@ -995,14 +1096,21 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
             raise ValueError(f"active token id is disabled: {active_id}")
         token = str(row.get("token") or "")
         validate_token(token)
-        write_claude_credentials_file(Path(args.file).expanduser(), token)
+        credential_file = Path(args.file).expanduser()
+        trusted_workdirs = [str(Path(item).expanduser()) for item in (args.workdir or []) if item]
+        write_claude_credentials_file(credential_file, token)
+        config_file = ensure_claude_config_file(credential_file.parent, trusted_workdirs)
+        settings_file = ensure_claude_settings_file(credential_file.parent)
     except Exception as exc:
         return fail(str(exc), json_mode)
     payload = {
         "status": "synced",
         "agent": args.agent,
-        "file": str(Path(args.file).expanduser()),
+        "file": str(credential_file),
+        "config_file": str(config_file),
+        "settings_file": str(settings_file),
         "delivery": "claude_credentials_file",
+        "trusted_workdirs": trusted_workdirs,
         "active_token_id": active_id,
         "fingerprint": token_fingerprint(token),
     }
@@ -1075,6 +1183,7 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser = sub.add_parser("sync-agent")
     sync_parser.add_argument("--agent", required=True)
     sync_parser.add_argument("--file", required=True)
+    sync_parser.add_argument("--workdir", action="append", default=[])
     sync_parser.add_argument("--json", action="store_true")
     sync_parser.set_defaults(handler=cmd_sync_agent)
 
