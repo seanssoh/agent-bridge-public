@@ -1710,7 +1710,7 @@ bridge_audit_log() {
   python3 "$BRIDGE_SCRIPT_DIR/bridge-audit.py" write --file "$BRIDGE_AUDIT_LOG" --actor "$actor" --action "$action" --target "$target" "$@" >/dev/null
 }
 
-# bridge_with_timeout — issue #265 proposal A.
+# bridge_with_timeout — issue #265 proposal A; #802 carry-over python fallback.
 #
 # Wraps an external command with `timeout(1)` so a single hung subprocess in
 # the daemon main loop cannot block the scheduler indefinitely (the canonical
@@ -1728,17 +1728,60 @@ bridge_audit_log() {
 #   when passed as empty string.
 # - <call_site_label> is the symbolic name used in the audit detail
 #   (e.g. "release_monitor", "stall_analyze").
-# - When neither `timeout` nor `gtimeout` is on PATH, the helper falls
-#   through to a plain exec so behavior on bare hosts matches today; a
-#   one-time `daemon_subprocess_timeout_unavailable` audit row is written
-#   the first time so the gap is visible without spamming the log.
+#
+# Three-tier fallback chain (#802 carry-over):
+#   1. `timeout(1)` / `gtimeout(1)` — preferred; POSIX exit codes (124/137).
+#   2. `python3 subprocess.run(timeout=)` — when neither binary is on PATH.
+#      python3 is a hard dependency of agent-bridge, so this branch is reached
+#      on bare macOS hosts without GNU coreutils installed. The python wrapper
+#      maps `TimeoutExpired` to exit code 124 to match GNU `timeout(1)` and
+#      `FileNotFoundError` to 127 (POSIX "command not found"). The audit row
+#      shape is identical to tier 1's so downstream log readers do not need
+#      to special-case it.
+#   3. Plain exec — last resort when even python3 is missing (a severely
+#      degraded host). A one-time `daemon_subprocess_timeout_unavailable`
+#      audit row is written so the gap is visible without spamming the log.
 #
 # Caveat: only wrappable around *external* commands. Bash functions cannot be
 # wrapped with `timeout(1)` directly — those must be exposed through a
 # subshell + `bash -c` first, which is out of scope for this helper.
 _BRIDGE_WITH_TIMEOUT_BIN_CACHED=0
 _BRIDGE_WITH_TIMEOUT_BIN=""
+_BRIDGE_WITH_TIMEOUT_PYTHON_CACHED=0
+_BRIDGE_WITH_TIMEOUT_PYTHON=""
 _BRIDGE_WITH_TIMEOUT_UNAVAILABLE_LOGGED=0
+
+# Inline python3 wrapper used by the tier-2 fallback. Authored here as a
+# module-level constant so we pass it via `python3 -c "$SCRIPT"` (here-string
+# variable + `-c`) instead of `python3 - <<'PY' ... PY` heredoc-stdin. The
+# heredoc-stdin form is the bash `heredoc_write` deadlock class documented in
+# issue #800 / PR #801; this wrapper is short and only invoked once per call
+# so the deadlock risk is low, but staying consistent with the post-#801
+# pattern across the codebase keeps the reasoning uniform.
+_BRIDGE_WITH_TIMEOUT_PY_WRAPPER='
+import subprocess
+import sys
+
+try:
+    deadline = float(sys.argv[1])
+except (IndexError, ValueError):
+    sys.stderr.write("bridge_with_timeout: invalid timeout seconds argv[1]\n")
+    sys.exit(2)
+cmd = sys.argv[2:]
+if not cmd:
+    sys.stderr.write("bridge_with_timeout: no command argv provided\n")
+    sys.exit(2)
+try:
+    proc = subprocess.run(cmd, timeout=deadline)
+    sys.exit(proc.returncode)
+except subprocess.TimeoutExpired:
+    # Match GNU timeout(1) exit code so downstream audit + caller branches
+    # treat python-fallback timeouts identically to the binary path.
+    sys.exit(124)
+except FileNotFoundError as exc:
+    sys.stderr.write("bridge_with_timeout: command not found: %s\n" % exc)
+    sys.exit(127)
+'
 
 bridge_with_timeout() {
   local secs="${1:-}"
@@ -1759,31 +1802,55 @@ bridge_with_timeout() {
 
   started_ts="$(date +%s 2>/dev/null || echo 0)"
 
-  if [[ -z "$_BRIDGE_WITH_TIMEOUT_BIN" ]]; then
-    if (( _BRIDGE_WITH_TIMEOUT_UNAVAILABLE_LOGGED == 0 )); then
-      bridge_audit_log daemon daemon_subprocess_timeout_unavailable daemon \
+  # Tier 1: GNU timeout(1) / gtimeout(1) — preferred.
+  if [[ -n "$_BRIDGE_WITH_TIMEOUT_BIN" ]]; then
+    "$_BRIDGE_WITH_TIMEOUT_BIN" "$secs" "$@"
+    rc=$?
+    if [[ "$rc" == "124" || "$rc" == "137" ]]; then
+      elapsed=$(( $(date +%s 2>/dev/null || echo "$started_ts") - started_ts ))
+      bridge_audit_log daemon daemon_subprocess_timeout daemon \
         --detail call_site="$label" \
-        --detail requested_seconds="$secs" \
-        --detail note="neither timeout nor gtimeout on PATH; running unwrapped" \
+        --detail timeout_seconds="$secs" \
+        --detail elapsed_seconds="$elapsed" \
+        --detail exit_code="$rc" \
+        --detail tier="binary" \
         2>/dev/null || true
-      _BRIDGE_WITH_TIMEOUT_UNAVAILABLE_LOGGED=1
     fi
-    "$@"
-    return $?
+    return "$rc"
   fi
 
-  "$_BRIDGE_WITH_TIMEOUT_BIN" "$secs" "$@"
-  rc=$?
-  if [[ "$rc" == "124" || "$rc" == "137" ]]; then
-    elapsed=$(( $(date +%s 2>/dev/null || echo "$started_ts") - started_ts ))
-    bridge_audit_log daemon daemon_subprocess_timeout daemon \
-      --detail call_site="$label" \
-      --detail timeout_seconds="$secs" \
-      --detail elapsed_seconds="$elapsed" \
-      --detail exit_code="$rc" \
-      2>/dev/null || true
+  # Tier 2: python3 subprocess.run(timeout=…) — bare-host fallback.
+  if (( _BRIDGE_WITH_TIMEOUT_PYTHON_CACHED == 0 )); then
+    _BRIDGE_WITH_TIMEOUT_PYTHON="$(command -v python3 2>/dev/null || true)"
+    _BRIDGE_WITH_TIMEOUT_PYTHON_CACHED=1
   fi
-  return "$rc"
+  if [[ -n "$_BRIDGE_WITH_TIMEOUT_PYTHON" ]]; then
+    "$_BRIDGE_WITH_TIMEOUT_PYTHON" -c "$_BRIDGE_WITH_TIMEOUT_PY_WRAPPER" "$secs" "$@"
+    rc=$?
+    if [[ "$rc" == "124" || "$rc" == "137" ]]; then
+      elapsed=$(( $(date +%s 2>/dev/null || echo "$started_ts") - started_ts ))
+      bridge_audit_log daemon daemon_subprocess_timeout daemon \
+        --detail call_site="$label" \
+        --detail timeout_seconds="$secs" \
+        --detail elapsed_seconds="$elapsed" \
+        --detail exit_code="$rc" \
+        --detail tier="python" \
+        2>/dev/null || true
+    fi
+    return "$rc"
+  fi
+
+  # Tier 3: no wrap available — log once and run unwrapped (status quo).
+  if (( _BRIDGE_WITH_TIMEOUT_UNAVAILABLE_LOGGED == 0 )); then
+    bridge_audit_log daemon daemon_subprocess_timeout_unavailable daemon \
+      --detail call_site="$label" \
+      --detail requested_seconds="$secs" \
+      --detail note="neither timeout/gtimeout nor python3 on PATH; running unwrapped" \
+      2>/dev/null || true
+    _BRIDGE_WITH_TIMEOUT_UNAVAILABLE_LOGGED=1
+  fi
+  "$@"
+  return $?
 }
 
 bridge_mcp_orphan_cleanup_state_dir() {
