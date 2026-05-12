@@ -1066,30 +1066,13 @@ process_usage_monitor() {
     return 1
   }
 
-  rotation_rows="$(python3 - "$monitor_json" <<'PY'
-import json, sys
-
-try:
-    payload = json.loads(sys.argv[1])
-except Exception:
-    raise SystemExit(1)
-
-for item in payload.get("rotation_candidates", []):
-    print(
-        "\t".join(
-            [
-                str(item.get("provider", "")),
-                str(item.get("account", "")),
-                str(item.get("window", "")),
-                str(item.get("used_percent", "")),
-                str(item.get("reset_at", "")),
-                str(item.get("source", "")),
-                str(item.get("message", "")),
-            ]
-        )
-    )
-PY
-)" || rotation_rows=""
+  # Issue #800 regression follow-up (PR #799 introduced this site 30 min
+  # after PR #801 closed nine sibling heredoc-stdin sites). Routed through
+  # the checked-in helper subcommand wrapped by bridge_with_timeout — same
+  # rationale as the usage-alert-parse call above. 5s ceiling (pure JSON
+  # filter, no IO); rc=124|137 falls through ``|| rotation_rows=""`` so the
+  # loop continues without rotation candidates this tick.
+  rotation_rows="$(bridge_with_timeout 5 usage_rotation_candidates_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" usage-rotation-candidates-parse "$monitor_json")" || rotation_rows=""
 
   while IFS=$'\t' read -r provider account window bucket used_percent reset_at source body; do
     [[ -z "$provider" || -z "$window" || -z "$bucket" ]] && continue
@@ -1125,27 +1108,12 @@ PY
       --agents "$rotation_agent_scope" \
       --reason "usage:${window}:${used_percent}" \
       --json 2>/dev/null || true)"
-    rotation_status_row="$(python3 - "$rotate_json" <<'PY'
-import json, sys
-
-try:
-    payload = json.loads(sys.argv[1])
-except Exception:
-    payload = {"status": "error", "reason": "invalid_rotation_output"}
-sync = payload.get("sync") if isinstance(payload.get("sync"), dict) else {}
-print(
-    "\t".join(
-        [
-            str(payload.get("status", "")),
-            str(payload.get("reason", "")),
-            str(payload.get("old_active_token_id", "")),
-            str(payload.get("active_token_id", "")),
-            str(sync.get("status", "")),
-        ]
-    )
-)
-PY
-)"
+    # Issue #800 regression follow-up: rotation outcome parser moved out of
+    # heredoc-stdin into the helper subcommand. 5s ceiling — pure JSON
+    # parse + tabular print; rc=124|137 leaves the row empty and the
+    # subsequent ``IFS=$'\t' read`` decodes to empty fields, which the
+    # downstream ``case`` statement routes through the ``error:*`` branch.
+    rotation_status_row="$(bridge_with_timeout 5 rotation_status_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" rotation-status-parse "$rotate_json" || true)"
     IFS=$'\t' read -r rotation_status rotation_reason rotation_from rotation_to rotation_sync_status <<<"$rotation_status_row"
     bridge_audit_log daemon claude_token_rotation "$admin_agent" \
       --detail status="$rotation_status" \
@@ -1224,45 +1192,24 @@ process_claude_token_recovery() {
     return 1
   fi
 
-  recovery_row="$(python3 - "$recovery_json" <<'PY'
-import json
-import sys
-
-try:
-    payload = json.loads(sys.argv[1])
-except Exception:
-    payload = {"status": "error", "reason": "invalid_recovery_output"}
-recovered = payload.get("recovered") if isinstance(payload.get("recovered"), list) else []
-print(
-    "\t".join(
-        [
-            str(payload.get("status", "")),
-            str(payload.get("reason", "")),
-            str(payload.get("checked_count", 0)),
-            str(payload.get("recovered_count", 0)),
-            str(payload.get("still_disabled_count", 0)),
-            ",".join(str(item) for item in recovered),
-            "1" if payload.get("sync_recommended") else "0",
-        ]
-    )
-)
-PY
-)"
+  # Issue #800 regression follow-up: recovery-outcome parser moved into the
+  # helper subcommand. 5s ceiling — pure JSON parse + tabular print; on
+  # rc=124|137 the bash callsite sees an empty row and the downstream
+  # audit_log captures status="" reason="" which the operator can spot via
+  # the daemon_subprocess_timeout row written by bridge_with_timeout.
+  recovery_row="$(bridge_with_timeout 5 recovery_status_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" recovery-status-parse "$recovery_json" || true)"
   IFS=$'\t' read -r status reason checked_count recovered_count still_disabled_count recovered_csv sync_recommended <<<"$recovery_row"
 
   bridge_note_claude_token_recovery_poll
 
   if [[ "$sync_recommended" == "1" ]]; then
     sync_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync --agents "$agent_scope" --json 2>/dev/null || true)"
-    sync_status="$(python3 - "$sync_json" <<'PY'
-import json
-import sys
-try:
-    print(json.loads(sys.argv[1]).get("status", ""))
-except Exception:
-    print("error")
-PY
-)"
+    # Issue #800 regression follow-up: sync-status extractor moved into the
+    # helper subcommand. 5s ceiling — single dict lookup; rc=124|137 leaves
+    # sync_status empty and the surrounding audit_log captures sync_status=""
+    # so the operator sees the gap alongside the daemon_subprocess_timeout
+    # row.
+    sync_status="$(bridge_with_timeout 5 sync_status_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" sync-status-parse "$sync_json" || true)"
   fi
 
   if [[ "$status" != "skipped" || "${checked_count:-0}" != "0" ]]; then

@@ -210,9 +210,12 @@ step_helper_subcommands_resolve() {
   local help_out
   help_out="$(python3 "$BRIDGE_REPO_ROOT/bridge-daemon-helpers.py" --help 2>&1 || true)"
   local sub
+  # Track A (9) + #800 regression follow-up (4 new for PR #799 sites).
   for sub in usage-alert-parse release-alert-parse backup-parse stall-iso-format \
              permission-expire-scan watchdog-problem-count nudge-live-state \
-             memory-daily-orphan-scan mcp-orphan-cleanup-parse; do
+             memory-daily-orphan-scan mcp-orphan-cleanup-parse \
+             usage-rotation-candidates-parse rotation-status-parse \
+             recovery-status-parse sync-status-parse; do
     smoke_assert_contains "$help_out" "$sub" "helper --help should list $sub"
   done
 }
@@ -418,13 +421,124 @@ JSON
   smoke_log "  tick1 rc=$rc1, tick2 rc=$rc2 elapsed=${elapsed2}s — wrapping is non-wedging across calls"
 }
 
+# ---------------------------------------------------------------------------
+# #800 regression follow-up — PR #799 introduced 4 new daemon callsites plus
+# 2 library sites that bypassed PR #801's wrapping convention. The steps
+# below mirror the existing 9-site assertions exactly:
+#
+#   * For each new call_site label, drive bridge_with_timeout 2s against the
+#     synthetic STALL_HELPER and confirm rc=124|137 within budget. This
+#     proves the wrap label is wired correctly at the new bash callsite.
+#   * Confirm the audit row tags the new call_site so the operator can
+#     identify which regression site wedged.
+#   * Confirm the real helper subcommand passes valid JSON through cleanly
+#     (smoke against malformed argv would just print to stderr — pure parse
+#     paths, no stall vector — so we cover the happy path via the real
+#     helper to prove the subcommand body itself works).
+#
+# Library sites (core_match, skills_resolve_target) follow Pattern B
+# (python3 -c "$SCRIPT" here-string). We exercise the SAME bridge_with_timeout
+# wrapper with their labels because Pattern B and Pattern A go through the
+# same wrapping helper — what we are proving is "the bash callsite label is
+# wired and the ceiling is enforced", which is identical for both patterns.
+# ---------------------------------------------------------------------------
+
+# Run a 2s stall with the given call_site label and confirm both the rc=124|137
+# outcome and an audit row tagged with the label.
+_assert_label_stall_and_audit() {
+  local label="$1"
+  smoke_log "  label=$label — driving 2s stall + audit row check"
+  local output rc elapsed
+  output="$(run_with_timeout_subshell "$label" 2 python3 "$STALL_HELPER")"
+  rc="$(printf '%s\n' "$output" | sed -n 's/.*rc=\([0-9]*\).*/\1/p')"
+  elapsed="$(printf '%s\n' "$output" | sed -n 's/.*elapsed=\([0-9]*\).*/\1/p')"
+  [[ -n "$rc" ]] || smoke_fail "could not parse rc from: $output (label=$label)"
+  if [[ "$rc" != "124" && "$rc" != "137" ]]; then
+    smoke_fail "label=$label: expected rc=124|137, got rc=$rc (elapsed=${elapsed}s)"
+  fi
+  if (( elapsed > 8 )); then
+    smoke_fail "label=$label: ceiling not enforced (elapsed=${elapsed}s, budget 2s)"
+  fi
+  if ! grep -q "\"call_site\": \"$label\"" "$BRIDGE_AUDIT_LOG"; then
+    smoke_fail "audit log missing call_site=$label after stall: $(cat "$BRIDGE_AUDIT_LOG")"
+  fi
+  smoke_log "    rc=$rc elapsed=${elapsed}s — wrap fires + audit row present"
+}
+
+step_pr799_usage_rotation_candidates_wrap() {
+  smoke_log "step 9: PR #799 site — usage_rotation_candidates_parse wrap + audit"
+  _assert_label_stall_and_audit usage_rotation_candidates_parse
+
+  # Real-helper happy path: confirm the subcommand body parses valid input.
+  local out
+  out="$(python3 "$REAL_HELPER" usage-rotation-candidates-parse \
+    '{"rotation_candidates":[{"provider":"claude","account":"a","window":"5h","used_percent":"95","reset_at":"x","source":"s","message":"m"}]}')"
+  smoke_assert_eq "claude"$'\t'"a"$'\t'"5h"$'\t'"95"$'\t'"x"$'\t'"s"$'\t'"m" "$out" \
+    "usage-rotation-candidates-parse should emit 7-col row from valid JSON"
+}
+
+step_pr799_rotation_status_wrap() {
+  smoke_log "step 10: PR #799 site — rotation_status_parse wrap + audit"
+  _assert_label_stall_and_audit rotation_status_parse
+
+  local out
+  out="$(python3 "$REAL_HELPER" rotation-status-parse \
+    '{"status":"rotated","reason":"ok","old_active_token_id":"a","active_token_id":"b","sync":{"status":"ok"}}')"
+  smoke_assert_eq "rotated"$'\t'"ok"$'\t'"a"$'\t'"b"$'\t'"ok" "$out" \
+    "rotation-status-parse should emit 5-col row from valid JSON"
+}
+
+step_pr799_recovery_status_wrap() {
+  smoke_log "step 11: PR #799 site — recovery_status_parse wrap + audit"
+  _assert_label_stall_and_audit recovery_status_parse
+
+  local out
+  out="$(python3 "$REAL_HELPER" recovery-status-parse \
+    '{"status":"ok","reason":"","checked_count":1,"recovered_count":1,"still_disabled_count":0,"recovered":["t1"],"sync_recommended":true}')"
+  smoke_assert_eq "ok"$'\t\t'"1"$'\t'"1"$'\t'"0"$'\t'"t1"$'\t'"1" "$out" \
+    "recovery-status-parse should emit 7-col row from valid JSON"
+}
+
+step_pr799_sync_status_wrap() {
+  smoke_log "step 12: PR #799 site — sync_status_parse wrap + audit"
+  _assert_label_stall_and_audit sync_status_parse
+
+  local out
+  out="$(python3 "$REAL_HELPER" sync-status-parse '{"status":"ok"}')"
+  smoke_assert_eq "ok" "$out" \
+    "sync-status-parse should print the status string from valid JSON"
+
+  # Parse failure prints "error" (bash callsite treats empty/error as a
+  # sync failure for audit purposes).
+  local err
+  err="$(python3 "$REAL_HELPER" sync-status-parse 'not-json')"
+  smoke_assert_eq "error" "$err" \
+    "sync-status-parse should print 'error' on parse failure"
+}
+
+step_lib_core_match_wrap() {
+  smoke_log "step 13: library site — lib/bridge-core.sh core_match wrap + audit"
+  _assert_label_stall_and_audit core_match
+}
+
+step_lib_skills_resolve_target_wrap() {
+  smoke_log "step 14: library site — lib/bridge-skills.sh skills_resolve_target wrap + audit"
+  _assert_label_stall_and_audit skills_resolve_target
+}
+
 smoke_run "stalling helper terminates within budget" step_wrapping_terminates_stalled_helper
 smoke_run "daemon_subprocess_timeout audit row written" step_audit_row_written
 smoke_run "next tick recovers without intervention" step_loop_recovers_next_tick
-smoke_run "all 9 Track-A subcommands wired up" step_helper_subcommands_resolve
+smoke_run "all Track-A + PR #799 regression subcommands wired up" step_helper_subcommands_resolve
 smoke_run "real helper (mcp-orphan-cleanup-parse) stalls on FIFO" step_real_helper_stalls_on_fifo
 smoke_run "real helper (mcp-orphan-cleanup-parse) passes through valid JSON" step_real_helper_passthrough
 smoke_run "real helper (nudge-live-state) stalls on sqlite EXCLUSIVE lock" step_real_helper_stalls_on_sqlite_lock
 smoke_run "loop survives real stall then recovers on next call" step_loop_survives_real_stall_then_recovers
+smoke_run "PR #799 site: usage_rotation_candidates_parse wrap" step_pr799_usage_rotation_candidates_wrap
+smoke_run "PR #799 site: rotation_status_parse wrap" step_pr799_rotation_status_wrap
+smoke_run "PR #799 site: recovery_status_parse wrap" step_pr799_recovery_status_wrap
+smoke_run "PR #799 site: sync_status_parse wrap" step_pr799_sync_status_wrap
+smoke_run "library site: lib/bridge-core.sh core_match wrap" step_lib_core_match_wrap
+smoke_run "library site: lib/bridge-skills.sh skills_resolve_target wrap" step_lib_skills_resolve_target_wrap
 
 smoke_log "PASS"

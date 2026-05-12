@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash disable=SC2153
 
+# Issue #800 regression follow-up: ``bridge_sync_claude_runtime_skills``
+# resolved each skill symlink target via ``python3 - "$link" "$runtime" <<'PY'``
+# heredoc-stdin — the bash heredoc_write deadlock class PR #801 closed for
+# the daemon main loop. The body is two ``os.path.realpath`` calls plus an
+# equality check, so we use Pattern B (``python3 -c "$SCRIPT"`` here-string)
+# rather than promoting it to ``bridge-daemon-helpers.py``. ``bridge_with_timeout``
+# (lib/bridge-state.sh) enforces a 5s ceiling — path resolution should be
+# microseconds, the ceiling exists so a wedged filesystem (stuck NFS mount,
+# stalled FUSE userspace) cannot freeze every skill sync pass.
+_BRIDGE_SKILLS_REALPATH_MATCH_PY='
+import os
+import sys
+
+link_path = os.path.realpath(sys.argv[1])
+runtime_path = os.path.realpath(sys.argv[2])
+print("1" if link_path == runtime_path else "0")
+'
+
 bridge_project_skill_dir_for() {
   local engine="$1"
   local workdir="$2"
@@ -125,15 +143,13 @@ bridge_sync_claude_runtime_skills() {
     bridge_is_shared_claude_skill_name "$skill" && continue
     runtime_target="$(bridge_runtime_claude_skill_source_dir "$skill" || true)"
     [[ -n "$runtime_target" ]] || continue
-    target="$(python3 - "$existing" "$runtime_target" <<'PY'
-import os
-import sys
-
-link_path = os.path.realpath(sys.argv[1])
-runtime_path = os.path.realpath(sys.argv[2])
-print("1" if link_path == runtime_path else "0")
-PY
-)"
+    # Pattern B per PR #801 / #800 follow-up: ``python3 -c "$SCRIPT"`` here-
+    # string + ``bridge_with_timeout``. The previous heredoc-stdin form was
+    # the deadlock class documented in #800. ``bridge_with_timeout`` is
+    # defined in lib/bridge-state.sh (sourced AFTER this module in
+    # bridge-lib.sh); bash resolves the function name at call time so the
+    # ordering is safe — same convention as ``bridge_tmux_send_keys_with_timeout``.
+    target="$(bridge_with_timeout 5 skills_resolve_target python3 -c "$_BRIDGE_SKILLS_REALPATH_MATCH_PY" "$existing" "$runtime_target" 2>/dev/null || true)"
     [[ "$target" == "1" ]] || continue
     found=0
     for configured_skill in $configured; do
