@@ -55,11 +55,18 @@ if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
   printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500,"result":"token env should not be inherited"}'
   exit 1
 fi
+if [[ "${FAKE_CLAUDE_REQUIRE_CONFIG:-0}" == "1" && -z "${CLAUDE_CONFIG_DIR:-}" ]]; then
+  printf '%s\n' '{"type":"result","is_error":true,"api_error_status":401,"result":"missing CLAUDE_CONFIG_DIR"}'
+  exit 1
+fi
 if [[ -n "${CLAUDE_CONFIG_DIR:-}" && ! -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]]; then
   printf '%s\n' '{"type":"result","is_error":true,"api_error_status":401,"result":"missing credential file"}'
   exit 1
 fi
 case "${FAKE_CLAUDE_MODE:-ok}" in
+  structured)
+    printf '%s\n' '{"type":"result","is_error":false,"structured_output":{"status":"completed","summary":"OK","findings":[],"actions_taken":[],"needs_human_followup":false,"recommended_next_steps":[],"artifacts":[],"confidence":"high","delivery_intent":"silent"}}'
+    ;;
   quota)
     printf '%s\n' '{"type":"result","is_error":true,"api_error_status":429,"result":"You'\''ve hit your limit - resets May 13, 3am (UTC)"}'
     exit 1
@@ -150,6 +157,54 @@ PY
 ! grep -Fq "CLAUDE_CODE_OAUTH_TOKEN" "$LEGACY_SECRET_FILE" || fail "legacy launch secret still contains token env"
 grep -Fq "CLAUDE_CONFIG_DIR='$(dirname "$CREDENTIAL_FILE")'" "$LEGACY_SECRET_FILE" || fail "legacy launch env did not point Claude at per-agent config dir"
 pass "add --sync writes Claude credential/config files without leaking token env"
+
+CRON_RUN_DIR="$ROOT/cron-runner-claude-config"
+mkdir -p "$CRON_RUN_DIR"
+cat >"$CRON_RUN_DIR/payload.txt" <<'PAYLOAD'
+Smoke-test cron runner Claude config injection.
+PAYLOAD
+"$PYTHON" - "$CRON_RUN_DIR" "$ROOT/workdir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+run_dir = Path(sys.argv[1])
+workdir = Path(sys.argv[2])
+payload = {
+    "run_id": "cron-runner-claude-config-smoke",
+    "job_name": "cron-runner-claude-config-smoke",
+    "family": "smoke",
+    "target_agent": "patch",
+    "target_engine": "claude",
+    "target_workdir": str(workdir),
+    "payload_file": str(run_dir / "payload.txt"),
+    "result_file": str(run_dir / "result.json"),
+    "status_file": str(run_dir / "status.json"),
+    "stdout_log": str(run_dir / "stdout.log"),
+    "stderr_log": str(run_dir / "stderr.log"),
+}
+(run_dir / "request.json").write_text(json.dumps(payload), encoding="utf-8")
+PY
+PATH="$ROOT/bin:$PATH" \
+  FAKE_CLAUDE_MODE=structured \
+  FAKE_CLAUDE_REQUIRE_CONFIG=1 \
+  "$PYTHON" "$REPO_ROOT/bridge-cron-runner.py" run --request-file "$CRON_RUN_DIR/request.json" >/dev/null
+"$PYTHON" - "$CRON_RUN_DIR/status.json" "$CRON_RUN_DIR/stdout.log" "$CREDENTIAL_FILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+status = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+if status.get("state") != "success":
+    raise SystemExit(f"cron runner did not succeed: {status!r}")
+stdout = Path(sys.argv[2]).read_text(encoding="utf-8")
+if "missing CLAUDE_CONFIG_DIR" in stdout or "missing credential file" in stdout:
+    raise SystemExit(f"cron runner did not inject Claude config: {stdout!r}")
+credential_file = Path(sys.argv[3])
+if not credential_file.is_file():
+    raise SystemExit("credential file missing after cron runner smoke")
+PY
+pass "cron runner injects per-agent CLAUDE_CONFIG_DIR for claude -p"
 
 ADD_SECOND_JSON="$(printf '%s' "$TOKEN_B" | "$REPO_ROOT/agent-bridge" auth claude-token add --id second --stdin --json)"
 [[ "$ADD_SECOND_JSON" != *"$TOKEN_B"* ]] || fail "add output leaked token B"

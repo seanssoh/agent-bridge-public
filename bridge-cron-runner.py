@@ -1497,6 +1497,223 @@ def runner_env() -> dict[str, str]:
     return env
 
 
+def _safe_agent_id(value: str) -> bool:
+    return bool(value) and all(ch.isalnum() or ch in "._-" for ch in value)
+
+
+def bridge_data_root() -> Path | None:
+    value = os.environ.get("BRIDGE_DATA_ROOT", "").strip()
+    if value:
+        return Path(value).expanduser()
+    return bridge_home()
+
+
+def _env_assignment(path: Path, key: str) -> str | None:
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return None
+    prefix = f"{key}="
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if not line.startswith(prefix):
+            continue
+        try:
+            parts = shlex.split(line, comments=False, posix=True)
+        except ValueError:
+            return None
+        if len(parts) != 1 or not parts[0].startswith(prefix):
+            continue
+        return parts[0].split("=", 1)[1]
+    return None
+
+
+def _agent_secret_env_candidates(agent: str) -> list[Path]:
+    roots: list[Path] = []
+    for env_name in ("BRIDGE_AGENT_ROOT_V2", "BRIDGE_AGENT_HOME_ROOT"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            roots.append(Path(value).expanduser())
+    data_root = bridge_data_root()
+    if data_root is not None:
+        roots.append(data_root / "agents")
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        candidate = root / agent / "credentials" / "launch-secrets.env"
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(candidate)
+    return candidates
+
+
+def claude_config_dir_from_launch_env(agent: str) -> Path | None:
+    for candidate in _agent_secret_env_candidates(agent):
+        value = _env_assignment(candidate, "CLAUDE_CONFIG_DIR")
+        if not value:
+            continue
+        path = Path(value).expanduser()
+        if path.is_absolute():
+            return path
+    return None
+
+
+def _shared_agent_claude_config_candidates(agent: str) -> list[Path]:
+    roots: list[Path] = []
+    data_root = bridge_data_root()
+    if data_root is not None:
+        roots.append(data_root)
+    home = bridge_home()
+    if home is not None:
+        roots.append(home)
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        for candidate in (
+            root / "agents" / agent / "home" / ".claude",
+            root / "agents" / agent / ".claude",
+        ):
+            key = str(candidate)
+            if key not in seen:
+                seen.add(key)
+                candidates.append(candidate)
+    return candidates
+
+
+def _isolated_user_for_agent(agent: str) -> pwd.struct_passwd | None:
+    try:
+        return pwd.getpwnam(f"agent-bridge-{agent}")
+    except KeyError:
+        return None
+
+
+def claude_config_dir_for_request(request: dict[str, Any]) -> Path | None:
+    agent = str(request.get("target_agent") or "").strip()
+    if not _safe_agent_id(agent):
+        return None
+
+    from_launch_env = claude_config_dir_from_launch_env(agent)
+    if from_launch_env is not None:
+        return from_launch_env
+
+    for candidate in _shared_agent_claude_config_candidates(agent):
+        if (candidate / ".credentials.json").is_file():
+            return candidate
+
+    isolated_user = _isolated_user_for_agent(agent)
+    if isolated_user is not None:
+        return Path(isolated_user.pw_dir) / ".claude"
+    return None
+
+
+def _path_is_under(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def claude_run_as_user_for_request(request: dict[str, Any], config_dir: Path | None) -> str | None:
+    agent = str(request.get("target_agent") or "").strip()
+    if not _safe_agent_id(agent):
+        return None
+    isolated_user = _isolated_user_for_agent(agent)
+    if isolated_user is None or os.getuid() == isolated_user.pw_uid:
+        return None
+
+    user_home = Path(isolated_user.pw_dir)
+    if config_dir is not None and _path_is_under(config_dir, user_home):
+        return isolated_user.pw_name
+
+    workdir = str(request.get("target_workdir") or "")
+    if workdir:
+        try:
+            if Path(workdir).expanduser().stat().st_uid == isolated_user.pw_uid:
+                return isolated_user.pw_name
+        except OSError:
+            pass
+    return None
+
+
+def agent_env_file_for_request(request: dict[str, Any]) -> Path | None:
+    agent = str(request.get("target_agent") or "").strip()
+    if not _safe_agent_id(agent):
+        return None
+    home = bridge_home()
+    if home is None:
+        return None
+    for candidate in (
+        home / "state" / "agents" / agent / "agent-env.sh",
+        home / "agents" / agent / "runtime" / "agent-env.sh",
+        home / "agents" / agent / ".bridge" / "agent-env.sh",
+    ):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def apply_claude_agent_env(env: dict[str, str], request: dict[str, Any], request_file: Path | None) -> str | None:
+    agent = str(request.get("target_agent") or "").strip()
+    if not _safe_agent_id(agent):
+        return None
+
+    config_dir = claude_config_dir_for_request(request)
+    if config_dir is None:
+        raise RuntimeError(f"Claude config dir not found for target agent: {agent}")
+
+    env["BRIDGE_AGENT_ID"] = agent
+    home = bridge_home()
+    if home is not None:
+        env.setdefault("BRIDGE_HOME", str(home))
+        env.setdefault("BRIDGE_ACTIVE_AGENT_DIR", str(home / "state" / "agents"))
+    agent_env_file = agent_env_file_for_request(request)
+    if agent_env_file is not None:
+        env["BRIDGE_AGENT_ENV_FILE"] = str(agent_env_file)
+    env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    if request_file is not None:
+        env["CRON_REQUEST_DIR"] = str(request_file.parent)
+
+    sudo_user = claude_run_as_user_for_request(request, config_dir)
+    if sudo_user is None and not os.access(config_dir / ".credentials.json", os.R_OK):
+        raise RuntimeError(
+            f"Claude credentials for target agent {agent} are not readable by the cron runner: "
+            f"{config_dir / '.credentials.json'}"
+        )
+    return sudo_user
+
+
+def command_for_run_as_user(command: list[str], sudo_user: str | None, env: dict[str, str]) -> list[str]:
+    if not sudo_user:
+        return command
+
+    explicit_keys = (
+        "PATH",
+        "CLAUDE_CONFIG_DIR",
+        "CRON_REQUEST_DIR",
+        "BRIDGE_HOME",
+        "BRIDGE_AGENT_ID",
+        "BRIDGE_AGENT_ENV_FILE",
+        "BRIDGE_ACTIVE_AGENT_DIR",
+        "BRIDGE_DATA_ROOT",
+        "BRIDGE_LAYOUT",
+        "BRIDGE_SHARED_ROOT",
+        "BRIDGE_AGENT_ROOT_V2",
+        "BRIDGE_CONTROLLER_STATE_ROOT",
+        "BRIDGE_LAYOUT_MARKER_DIR",
+    )
+    explicit_env = [f"{key}={env[key]}" for key in explicit_keys if env.get(key)]
+    return ["sudo", "-n", "-u", sudo_user, "-H", "env", *explicit_env, *command]
+
+
 # PR1.3 — `apply_channel_runtime_env` and `validate_channel_delivery_request`
 # are removed: the cron child no longer ever loads channel plugins, so
 # wiring DISCORD_STATE_DIR / TELEGRAM_STATE_DIR into its env, or validating
@@ -1572,8 +1789,8 @@ def run_claude(request: dict[str, Any], prompt: str, timeout: int, request_file:
         prompt,
     ]
     env = runner_env()
-    if request_file is not None:
-        env["CRON_REQUEST_DIR"] = str(request_file.parent)
+    sudo_user = apply_claude_agent_env(env, request, request_file)
+    command = command_for_run_as_user(command, sudo_user, env)
     completed = subprocess.run(
         command,
         cwd=workdir,
