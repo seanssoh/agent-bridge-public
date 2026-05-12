@@ -32,35 +32,27 @@ def body(name: str) -> str:
     raise SystemExit(f"unterminated function: {name}")
 
 
-helper = body("bridge_linux_repair_isolated_claude_read_lens")
-required_helper_fragments = [
-    'm::r-x',
-    'd -m "m::r-X"',
-    'find "$isolated_projects_dir" -type d',
-    'find "$isolated_projects_dir" -type f',
-    'm::r--',
-]
-missing = [fragment for fragment in required_helper_fragments if fragment not in helper]
-if missing:
-    raise SystemExit(f"read-lens helper missing fragments: {missing}")
-
-cred = body("bridge_linux_grant_claude_credentials_access")
-repair_call = (
-    'bridge_linux_repair_isolated_claude_read_lens '
-    '"$os_user" "$user_home" "$controller_user"'
-)
-repair_pos = cred.find(repair_call)
-early_return_pos = cred.find('if [[ "$current_target" == "$controller_cred_file" ]]; then')
-if repair_pos < 0:
-    raise SystemExit("credential repair path does not restore isolated Claude read lens")
-if early_return_pos < 0:
-    raise SystemExit("credential symlink early-return guard not found")
-if repair_pos > early_return_pos:
-    raise SystemExit("read lens repair must run before credential symlink early return")
-
 prepare = body("bridge_linux_prepare_agent_isolation")
-if repair_call not in prepare:
-    raise SystemExit("isolation prepare path does not use read-lens helper")
+required_prepare_fragments = [
+    'local isolated_claude_dir="$user_home/.claude"',
+    'bridge_linux_sudo_root mkdir -p "$isolated_claude_dir"',
+    'bridge_linux_sudo_root chown "$os_user" "$isolated_claude_dir"',
+    'bridge_linux_sudo_root chgrp "$_claude_v2_grp" "$isolated_claude_dir"',
+    'bridge_linux_sudo_root chmod 2750 "$isolated_claude_dir"',
+    'controller (group member of',
+    'without any named-user ACL',
+]
+missing = [fragment for fragment in required_prepare_fragments if fragment not in prepare]
+if missing:
+    raise SystemExit(f"v2 read-lens prepare path missing fragments: {missing}")
+
+for stale in [
+    "bridge_linux_repair_isolated_claude_read_lens",
+    "bridge_linux_grant_claude_credentials_access",
+    "bridge_linux_sudo_root setfacl",
+]:
+    if stale in prepare:
+        raise SystemExit(f"v2 read-lens prepare path still references stale ACL/credential helper: {stale}")
 
 print("isolation Claude read-lens smoke passed")
 PY
