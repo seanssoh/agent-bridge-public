@@ -232,6 +232,45 @@ grep -Fq "CLAUDE_CONFIG_DIR='$(dirname "$CREDENTIAL_FILE")'" "$LEGACY_SECRET_FIL
 [[ "$(readlink "$CLAUDE_SETTINGS_FILE")" == "settings.effective.json" ]] || fail "Claude settings symlink target changed during sync"
 pass "rotate --sync advances Claude credential file"
 
+# PR #799 r4 codex finding 1 — the bridge-auth.py unchanged-content fast paths
+# at ensure_claude_config_file (.claude.json) and ensure_claude_settings_file
+# (settings.json) returned without atomic rewrite when the payload matched the
+# on-disk content, doing final-path os.chmod/os.chown on a path the agent UID
+# can swap to a symlink between check and op. Same TOCTOU symlink-follow class
+# as the bash helper r3 removed. r4 drops both fast paths — every sync now
+# routes through write_private_file_atomic, which carries the parent-symlink
+# check and the chown-before-replace ordering.
+#
+# Proof: capture the .claude.json and settings.effective.json inodes before and
+# after a re-sync. ``os.replace`` always allocates a new inode for the tempfile
+# and renames it into place, so the inode MUST rotate even when the JSON
+# content is identical. If the dropped fast path were still active, the in-place
+# os.chmod/os.chown would leave the inode constant.
+#
+# The settings.json path on this fixture is a symlink to settings.effective.json
+# (set up before the rotate above). The atomic rewrite replaces the symlink's
+# TARGET, not the symlink itself, so we stat the resolved target via ``-L``
+# (BSD stat on macOS and GNU stat on Linux both honour ``-L`` to dereference).
+stat_inode() {
+  stat -L -f %i "$1" 2>/dev/null || stat -L -c %i "$1"
+}
+BEFORE_CLAUDE_INODE="$(stat_inode "$CLAUDE_CONFIG_FILE")"
+BEFORE_SETTINGS_INODE="$(stat_inode "$CLAUDE_SETTINGS_FILE")"
+"$REPO_ROOT/agent-bridge" auth claude-token sync --agents "$AGENT" --json >/dev/null
+AFTER_CLAUDE_INODE="$(stat_inode "$CLAUDE_CONFIG_FILE")"
+AFTER_SETTINGS_INODE="$(stat_inode "$CLAUDE_SETTINGS_FILE")"
+if [[ "$BEFORE_CLAUDE_INODE" == "$AFTER_CLAUDE_INODE" ]]; then
+  fail "r4 unchanged-content fast path: .claude.json inode unchanged after re-sync (before=$BEFORE_CLAUDE_INODE after=$AFTER_CLAUDE_INODE)"
+fi
+if [[ "$BEFORE_SETTINGS_INODE" == "$AFTER_SETTINGS_INODE" ]]; then
+  fail "r4 unchanged-content fast path: settings.json inode unchanged after re-sync (before=$BEFORE_SETTINGS_INODE after=$AFTER_SETTINGS_INODE)"
+fi
+# The settings.json symlink must still exist and point to the same target —
+# atomic rewrite of the resolved target does NOT replace the symlink itself.
+[[ -L "$CLAUDE_SETTINGS_FILE" ]] || fail "r4 unchanged-content rewrite replaced settings.json symlink"
+[[ "$(readlink "$CLAUDE_SETTINGS_FILE")" == "settings.effective.json" ]] || fail "r4 unchanged-content rewrite changed settings.json symlink target"
+pass "unchanged-content sync routes through atomic rewrite (inode rotated for .claude.json + settings.json target)"
+
 DISABLED_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token auto-rotate disable --json)"
 json_assert "auto disable" "$DISABLED_JSON" "payload['status'] == 'ok' and payload['auto_rotate_enabled'] is False"
 SKIP_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token rotate --if-auto-enabled --sync --json)"

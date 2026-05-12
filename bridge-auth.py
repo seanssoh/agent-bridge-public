@@ -1129,12 +1129,14 @@ def ensure_claude_config_file(
             raise ValueError(f"Claude config file must contain a JSON object: {path}")
         existing = parsed
     payload = claude_config_bootstrap_payload(existing, trusted_workdirs)
-    if existing == payload:
-        os.chmod(path, 0o600)
-        if owner_uid is not None:
-            gid = owner_gid if owner_gid is not None else -1
-            os.chown(path, owner_uid, gid)
-        return path
+    # PR #799 r4 codex finding 1 — always route through write_private_file_atomic.
+    # The previous "existing == payload" fast path returned without atomic rewrite,
+    # doing final-path os.chmod/os.chown on a path the agent UID can swap to a
+    # symlink between check and op. That is the same TOCTOU symlink-follow class
+    # as the bash helper r3 removed. Atomic rewrite carries the
+    # _ensure_claude_dir_safe parent-symlink check and the chown-before-replace
+    # ordering, so there is no privileged-op-on-final-path window. Perf hit is
+    # negligible — .claude.json is small and sync is infrequent.
     text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
     write_private_file_atomic(
         path,
@@ -1181,13 +1183,15 @@ def ensure_claude_settings_file(
         if not isinstance(parsed, dict):
             raise ValueError(f"Claude settings file must contain a JSON object: {path}")
         payload = parsed
-    before = dict(payload)
     payload.setdefault("skipDangerousModePermissionPrompt", True)
-    if payload == before:
-        if owner_uid is not None and path.exists():
-            gid = owner_gid if owner_gid is not None else -1
-            os.chown(path, owner_uid, gid)
-        return path
+    # PR #799 r4 codex finding 1 — always route through write_private_file_atomic.
+    # The previous "payload == before" fast path returned without atomic rewrite,
+    # doing final-path os.chown on a path the agent UID can swap to a symlink
+    # between check and op. Same TOCTOU symlink-follow class as the bash helper
+    # r3 removed. Atomic rewrite carries the _ensure_claude_dir_safe parent-symlink
+    # check and the chown-before-replace ordering, so there is no privileged-op-
+    # on-final-path window. Perf hit is negligible — settings.json is small and
+    # sync is infrequent.
     text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
     write_private_file_atomic(
         path,
