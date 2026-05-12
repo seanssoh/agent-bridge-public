@@ -1006,31 +1006,13 @@ process_usage_monitor() {
     return 1
   fi
 
-  alert_rows="$(python3 - "$monitor_json" <<'PY'
-import json, sys
-
-try:
-    payload = json.loads(sys.argv[1])
-except Exception:
-    raise SystemExit(1)
-
-for alert in payload.get("alerts", []):
-    print(
-        "\t".join(
-            [
-                str(alert.get("provider", "")),
-                str(alert.get("account", "")),
-                str(alert.get("window", "")),
-                str(alert.get("bucket", "")),
-                str(alert.get("used_percent", "")),
-                str(alert.get("reset_at", "")),
-                str(alert.get("source", "")),
-                str(alert.get("message", "")),
-            ]
-        )
-    )
-PY
-)" || {
+  # Issue #800 Track A: moved out of `python3 - <<'PY'` heredoc-stdin into a
+  # checked-in helper subcommand wrapped by bridge_with_timeout. The original
+  # heredoc-stdin pattern allowed bash to wedge in `heredoc_write` BEFORE the
+  # python child ever launched (the deadlock class documented in #800);
+  # `python3 helpers.py …` has no heredoc on the pipe and the external
+  # timeout(1) covers the full call.
+  alert_rows="$(bridge_with_timeout 5 usage_alert_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" usage-alert-parse "$monitor_json")" || {
     bridge_note_usage_poll
     return 1
   }
@@ -1093,28 +1075,9 @@ process_release_monitor() {
     return 1
   fi
 
-  alert_row="$(python3 - "$monitor_json" <<'PY'
-import json
-import sys
-
-payload = json.loads(sys.argv[1])
-alerts = payload.get("alerts") or []
-if not alerts:
-    raise SystemExit(0)
-alert = alerts[0]
-print(
-    "\t".join(
-        [
-            str(alert.get("latest_tag") or ""),
-            str(alert.get("latest_version") or ""),
-            str(alert.get("release_name") or ""),
-            str(alert.get("published_at") or ""),
-            str(alert.get("html_url") or ""),
-        ]
-    )
-)
-PY
-)"
+  # Issue #800 Track A: heredoc-stdin → helper subcommand wrapped by
+  # bridge_with_timeout (see bridge-daemon-helpers.py docstring for context).
+  alert_row="$(bridge_with_timeout 5 release_alert_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" release-alert-parse "$monitor_json")"
 
   bridge_note_release_poll
   [[ -n "$alert_row" ]] || return 1
@@ -1207,26 +1170,11 @@ process_daily_backup() {
   # Bug #507: parse outcome from the structured JSON instead of relying on
   # `created`. Outcomes other than `created` carry their own follow-up.
   local parse_payload=""
-  if ! parse_payload="$(python3 - "$backup_json" <<'PY' 2>/dev/null
-import json
-import sys
-
-try:
-    payload = json.loads(sys.argv[1])
-except Exception as exc:
-    print(f"PARSE_ERROR\t{type(exc).__name__}: {exc}\t\t\t\t")
-    raise SystemExit(0)
-outcome = str(payload.get("outcome") or "")
-archive_path = str(payload.get("archive_path") or "")
-pruned = payload.get("pruned") or []
-free_bytes = payload.get("free_bytes") or 0
-needed_bytes = payload.get("needed_bytes") or 0
-error_detail = str(payload.get("error_detail") or "")
-print("\t".join([
-    outcome, error_detail, archive_path, str(len(pruned)), str(free_bytes), str(needed_bytes)
-]))
-PY
-)"; then
+  # Issue #800 Track A: heredoc-stdin → helper subcommand wrapped by
+  # bridge_with_timeout. 60s ceiling (well above the helper's pure-JSON parse
+  # cost) mirrors the daily-backup-live budget per the issue's per-site
+  # recommendations.
+  if ! parse_payload="$(bridge_with_timeout 60 backup_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" backup-parse "$backup_json" 2>/dev/null)"; then
     bridge_note_daily_backup_failure "parse" "python3 invocation failed"
     return 1
   fi
@@ -1452,17 +1400,9 @@ bridge_write_stall_report_body() {
 
   title_label="$(bridge_stall_reason_label "$classification")"
   audits="$(bridge_stall_recent_audits_markdown "$agent")"
-  first_detected_iso="$(python3 - "$first_detected_ts" <<'PY'
-from datetime import datetime, timezone
-import sys
-try:
-    ts = int(sys.argv[1])
-except Exception:
-    ts = 0
-if ts > 0:
-    print(datetime.fromtimestamp(ts, timezone.utc).astimezone().isoformat())
-PY
-)"
+  # Issue #800 Track A: heredoc-stdin → helper subcommand wrapped by
+  # bridge_with_timeout (5s — pure datetime formatting, no IO).
+  first_detected_iso="$(bridge_with_timeout 5 stall_iso_format python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" stall-iso-format "$first_detected_ts")"
   mkdir -p "$(dirname "$body_file")"
   {
     echo "# Stall Report"
@@ -1945,29 +1885,9 @@ process_permission_task_timeout_fanout() {
   local changed=1
 
   local expired_rows
-  expired_rows="$(python3 - "$tasks_json" "$now_ts" "$timeout_seconds" <<'PY' 2>/dev/null || true
-import json, sys
-payload = sys.argv[1]
-now_ts = int(sys.argv[2])
-timeout = int(sys.argv[3])
-try:
-    tasks = json.loads(payload)
-except Exception:
-    sys.exit(0)
-for t in tasks:
-    created_ts = int(t.get("created_ts", 0) or 0)
-    if created_ts <= 0:
-        continue
-    age = now_ts - created_ts
-    if age < timeout:
-        continue
-    tid = int(t.get("id", 0) or 0)
-    title = str(t.get("title", "")).replace("\t", " ")
-    status = str(t.get("status", ""))
-    created_by = str(t.get("created_by", ""))
-    print(f"{tid}\t{age}\t{created_by}\t{status}\t{title}")
-PY
-  )"
+  # Issue #800 Track A: heredoc-stdin → helper subcommand wrapped by
+  # bridge_with_timeout (5s — pure JSON filter, no IO).
+  expired_rows="$(bridge_with_timeout 5 permission_expire_scan python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" permission-expire-scan "$tasks_json" "$now_ts" "$timeout_seconds" 2>/dev/null || true)"
   [[ -n "$expired_rows" ]] || return 1
 
   local task_id age_seconds created_by status title marker age_minutes body_text
@@ -2315,15 +2235,9 @@ process_watchdog_report() {
   if ! report_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-watchdog.sh" scan --json 2>/dev/null)"; then
     return 1
   fi
-  problem_count="$(python3 - "$report_json" <<'PY'
-import json, sys
-try:
-    payload = json.loads(sys.argv[1])
-    print(int(payload.get("problem_count", 0)))
-except Exception:
-    print(0)
-PY
-)"
+  # Issue #800 Track A: heredoc-stdin → helper subcommand wrapped by
+  # bridge_with_timeout (5s — single int extraction, no IO).
+  problem_count="$(bridge_with_timeout 5 watchdog_problem_count python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" watchdog-problem-count "$report_json")"
   [[ "$problem_count" =~ ^[0-9]+$ ]] || problem_count=0
   current_key="$(bridge_watchdog_problem_key "$report_json")"
   cooldown="${BRIDGE_WATCHDOG_COOLDOWN_SECONDS:-86400}"
@@ -2725,33 +2639,32 @@ nudge_agent_session() {
   local task_priority=""
   local task_status=""
 
-  live_state="$(python3 - "$BRIDGE_TASK_DB" "$agent" <<'PY' 2>/dev/null || true
-import sqlite3
-import sys
-
-db_path, agent = sys.argv[1:]
-with sqlite3.connect(db_path) as conn:
-    queued_ids = [
-        str(row[0])
-        for row in conn.execute(
-            """
-            SELECT id
-            FROM tasks
-            WHERE assigned_to = ?
-              AND status = 'queued'
-              AND title NOT LIKE '[cron-dispatch]%'
-            ORDER BY id
-            """,
-            (agent,),
-        ).fetchall()
-    ]
-    claimed_count = conn.execute(
-        "SELECT COUNT(*) FROM tasks WHERE claimed_by = ? AND status = 'claimed'",
-        (agent,),
-    ).fetchone()[0]
-print(f"{len(queued_ids)}\t{claimed_count}\t{','.join(queued_ids)}")
-PY
-)"
+  # Issue #800 Track A (highest-impact site): heredoc-stdin → helper subcommand
+  # wrapped by bridge_with_timeout. 15s ceiling — the live-state query is on
+  # the per-agent nudge hot path, so a long wait here stalls every subsequent
+  # agent in the loop. On timeout (rc=124) we emit an explicit per-agent
+  # daemon_subprocess_timeout audit row (the wrapper already writes a
+  # generic one without target=$agent context) and skip nudging THIS agent
+  # on THIS tick. The next tick retries naturally; if the timeout pattern
+  # persists the per-agent audit rows accumulate so the operator can see
+  # which agent's DB row keeps wedging the query. We do NOT propagate
+  # failure to siblings — the wedge documented in #800 is per-query, not
+  # per-loop, so other agents in the scan should still get nudged.
+  local live_state_rc=0
+  set +e
+  live_state="$(bridge_with_timeout 15 nudge_live_state python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" nudge-live-state "$BRIDGE_TASK_DB" "$agent" 2>/dev/null)"
+  live_state_rc=$?
+  set -e
+  if (( live_state_rc == 124 || live_state_rc == 137 )); then
+    bridge_audit_log daemon daemon_subprocess_timeout "$agent" \
+      --detail call_site=nudge_live_state \
+      --detail target_agent="$agent" \
+      --detail timeout_seconds=15 \
+      --detail exit_code="$live_state_rc" \
+      --detail action=skip_this_tick
+    daemon_warn "nudge live-state query for ${agent} timed out (rc=${live_state_rc}); skipping nudge this tick"
+    return 0
+  fi
   if [[ -n "$live_state" ]]; then
     IFS=$'\t' read -r live_queued live_claimed live_nudge_key <<<"$live_state"
   else
@@ -4834,44 +4747,13 @@ process_memory_daily_orphan_sweep() {
 
   # Embed the roster on argv (newline-joined) rather than piping it on
   # stdin so we do not have to juggle a heredoc + herestring pair on the
-  # same `python3` invocation. The script body still parses jobs JSON from
-  # argv[1] and the newline-delimited roster from argv[2].
+  # same `python3` invocation.
+  #
+  # Issue #800 Track A: heredoc-stdin → helper subcommand wrapped by
+  # bridge_with_timeout (5s — pure JSON diff against the in-memory roster,
+  # no IO).
   local orphans_tsv
-  orphans_tsv="$(python3 - "$jobs_json" "$roster_stream" <<'PY' 2>/dev/null || true
-import json, sys
-
-raw_jobs = sys.argv[1] if len(sys.argv) > 1 else ""
-raw_roster = sys.argv[2] if len(sys.argv) > 2 else ""
-roster = {line.strip() for line in raw_roster.splitlines() if line.strip()}
-try:
-    payload = json.loads(raw_jobs)
-except Exception:
-    sys.exit(0)
-
-jobs = payload.get("jobs") if isinstance(payload, dict) else payload
-if not isinstance(jobs, list):
-    sys.exit(0)
-
-PREFIX = "memory-daily-"
-for job in jobs:
-    if not isinstance(job, dict):
-        continue
-    if (job.get("family") or "") != "memory-daily":
-        continue
-    name = job.get("name") or ""
-    if not name.startswith(PREFIX):
-        continue
-    source_agent = name[len(PREFIX):].strip()
-    if not source_agent:
-        continue
-    if source_agent in roster:
-        continue
-    job_id = job.get("id") or job.get("name") or ""
-    if not job_id:
-        continue
-    print(f"{job_id}\t{source_agent}")
-PY
-  )"
+  orphans_tsv="$(bridge_with_timeout 5 memory_daily_orphan_scan python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" memory-daily-orphan-scan "$jobs_json" "$roster_stream" 2>/dev/null || true)"
 
   [[ -n "$orphans_tsv" ]] || return 1
 
@@ -4991,24 +4873,9 @@ process_mcp_orphan_cleanup() {
   fi
   printf '%s\n' "$cleanup_json" >"$report_file"
 
-  parsed="$(python3 - "$report_file" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(
-    "\t".join(
-        [
-            str(payload.get("killed_count", 0)),
-            str(payload.get("orphan_count", 0)),
-            str(payload.get("freed_mb_estimate", 0)),
-            str(len(payload.get("errors", []))),
-        ]
-    )
-)
-PY
-)" || return 1
+  # Issue #800 Track A: heredoc-stdin → helper subcommand wrapped by
+  # bridge_with_timeout (5s — single small JSON file read + count extract).
+  parsed="$(bridge_with_timeout 5 mcp_orphan_cleanup_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" mcp-orphan-cleanup-parse "$report_file")" || return 1
   IFS=$'\t' read -r killed_count orphan_count freed_mb error_count <<<"$parsed"
   [[ "$killed_count" =~ ^[0-9]+$ ]] || killed_count=0
   [[ "$orphan_count" =~ ^[0-9]+$ ]] || orphan_count=0
