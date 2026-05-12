@@ -990,6 +990,7 @@ bridge_agent_has_static_admin_shape() {
   local workdir=""
   local default_home=""
   local legacy_home=""
+  local v2_workdir=""
   local session_type=""
 
   [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 1
@@ -999,7 +1000,10 @@ bridge_agent_has_static_admin_shape() {
   workdir="$(bridge_agent_canonical_dir "$(bridge_expand_user_path "$(bridge_agent_workdir "$agent")")")"
   default_home="$(bridge_agent_canonical_dir "$(bridge_expand_user_path "$(bridge_agent_default_home "$agent")")")"
   legacy_home="$(bridge_agent_canonical_dir "$(bridge_expand_user_path "$BRIDGE_AGENT_HOME_ROOT/$agent")")"
-  [[ -n "$workdir" && ( "$workdir" == "$default_home" || "$workdir" == "$legacy_home" ) ]] || return 1
+  if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
+    v2_workdir="$(bridge_agent_canonical_dir "$(bridge_expand_user_path "$BRIDGE_AGENT_ROOT_V2/$agent/workdir")")"
+  fi
+  [[ -n "$workdir" && ( "$workdir" == "$default_home" || "$workdir" == "$legacy_home" || "$workdir" == "$v2_workdir" ) ]] || return 1
 
   [[ -f "$workdir/SOUL.md" || -f "$default_home/SOUL.md" || -f "$legacy_home/SOUL.md" ]] || return 1
   return 0
