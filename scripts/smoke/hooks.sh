@@ -159,14 +159,16 @@ claude_shared_settings_context_defaults() {
   assert_claude_auto_compact_window "$isolated_root/.claude/settings.effective.json" "425000" "isolated overlay preserves operator override"
 }
 
-managed_custom_workdir_shared_settings() {
-  local custom_workdir output target bash4_bin
+managed_v2_workdir_shared_settings() {
+  local custom_workdir actual_workdir output target bash4_bin
 
   custom_workdir="$SMOKE_TMP_ROOT/custom-managed-workdir"
-  mkdir -p "$custom_workdir"
+  actual_workdir="$BRIDGE_AGENT_ROOT_V2/custom-agent/workdir"
+  mkdir -p "$custom_workdir" "$actual_workdir"
   cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
 bridge_add_agent_id_if_missing "custom-agent"
 BRIDGE_AGENT_ENGINE["custom-agent"]="claude"
+BRIDGE_AGENT_SOURCE["custom-agent"]="static"
 BRIDGE_AGENT_SESSION["custom-agent"]="custom-agent"
 BRIDGE_AGENT_WORKDIR["custom-agent"]="$custom_workdir"
 EOF
@@ -182,14 +184,15 @@ EOF
 
   output="$(
     "$bash4_bin" -c 'repo="$1"; workdir="$2"; source "$repo/bridge-lib.sh"; bridge_load_roster; bridge_ensure_claude_stop_hook "$workdir"' \
-      _ "$SMOKE_REPO_ROOT" "$custom_workdir"
+      _ "$SMOKE_REPO_ROOT" "$actual_workdir"
   )"
-  smoke_assert_contains "$output" "settings_file: $custom_workdir/.claude/settings.json" "custom managed settings link output"
-  [[ -L "$custom_workdir/.claude/settings.json" ]] || smoke_fail "custom managed workdir should use shared settings symlink"
-  target="$(readlink "$custom_workdir/.claude/settings.json")"
-  smoke_assert_contains "$target" "../bridge-home/agents/.claude/settings.effective.json" "custom managed settings symlink target"
+  smoke_assert_contains "$output" "settings_file: $actual_workdir/.claude/settings.json" "v2 managed settings link output"
+  [[ -L "$actual_workdir/.claude/settings.json" ]] || smoke_fail "v2 managed workdir should use shared settings symlink"
+  [[ ! -e "$custom_workdir/.claude/settings.json" ]] || smoke_fail "v2 should not write hooks into ignored explicit custom workdir"
+  target="$(readlink "$actual_workdir/.claude/settings.json")"
+  smoke_assert_contains "$target" "bridge-home/agents/.claude/settings.effective.json" "v2 managed settings symlink target"
   # Issue #570: managed autoCompactWindow default is unconditionally 1_000_000.
-  assert_claude_auto_compact_window "$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json" "1000000" "custom managed shared settings"
+  assert_claude_auto_compact_window "$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json" "1000000" "v2 managed shared settings"
 }
 
 claude_settings_mode_source_gate() {
@@ -200,31 +203,34 @@ claude_settings_mode_source_gate() {
   # "shared" — handing dynamic agents the static-only managed
   # autoCompactWindow default (1_000_000 as of issue #570) instead of
   # leaving them on Claude Code's own native auto-compact handling.
-  local case_root static_workdir dynamic_workdir within_root_workdir bash4_bin
-  local dynamic_under_root_workdir
-  local mode_dynamic mode_static mode_within_root mode_dynamic_under_root
+  local case_root static_configured_workdir dynamic_configured_workdir within_root_workdir bash4_bin
+  local static_workdir dynamic_workdir dynamic_under_root_configured_workdir
+  local mode_dynamic mode_static mode_within_root mode_dynamic_under_root_configured
 
   case_root="$SMOKE_TMP_ROOT/settings-mode-gate"
   mkdir -p "$case_root"
-  static_workdir="$case_root/static-agent-workdir"
-  dynamic_workdir="$case_root/dynamic-agent-workdir"
+  static_configured_workdir="$case_root/static-agent-workdir"
+  dynamic_configured_workdir="$case_root/dynamic-agent-workdir"
+  static_workdir="$BRIDGE_AGENT_ROOT_V2/static-agent/workdir"
+  dynamic_workdir="$BRIDGE_AGENT_ROOT_V2/dynamic-agent/workdir"
   within_root_workdir="$BRIDGE_AGENT_HOME_ROOT/within-root-agent"
-  dynamic_under_root_workdir="$BRIDGE_AGENT_HOME_ROOT/dynamic-agent"
-  mkdir -p "$static_workdir" "$dynamic_workdir" "$within_root_workdir" \
-    "$dynamic_under_root_workdir"
+  dynamic_under_root_configured_workdir="$BRIDGE_AGENT_HOME_ROOT/dynamic-agent"
+  mkdir -p "$static_configured_workdir" "$dynamic_configured_workdir" \
+    "$static_workdir" "$dynamic_workdir" "$within_root_workdir" \
+    "$dynamic_under_root_configured_workdir"
 
   cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
 bridge_add_agent_id_if_missing "static-agent"
 BRIDGE_AGENT_ENGINE["static-agent"]="claude"
 BRIDGE_AGENT_SOURCE["static-agent"]="static"
 BRIDGE_AGENT_SESSION["static-agent"]="static-agent"
-BRIDGE_AGENT_WORKDIR["static-agent"]="$static_workdir"
+BRIDGE_AGENT_WORKDIR["static-agent"]="$static_configured_workdir"
 
 bridge_add_agent_id_if_missing "dynamic-agent"
 BRIDGE_AGENT_ENGINE["dynamic-agent"]="claude"
 BRIDGE_AGENT_SOURCE["dynamic-agent"]="dynamic"
 BRIDGE_AGENT_SESSION["dynamic-agent"]="dynamic-agent"
-BRIDGE_AGENT_WORKDIR["dynamic-agent"]="$dynamic_under_root_workdir"
+BRIDGE_AGENT_WORKDIR["dynamic-agent"]="$dynamic_under_root_configured_workdir"
 EOF
 
   bash4_bin="$BASH"
@@ -236,34 +242,35 @@ EOF
     fi
   fi
 
-  # E1 — dynamic claude agent's registered workdir (outside HOME_ROOT) must
+  # E1 — dynamic claude agent's v2 canonical workdir (outside HOME_ROOT) must
   # NOT classify as `shared`. Re-register the dynamic agent with the
-  # outside-HOME_ROOT workdir for this case.
+  # outside-HOME_ROOT configured workdir for this case; v2 still resolves the
+  # actual workdir to BRIDGE_AGENT_ROOT_V2/<agent>/workdir.
   cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
 bridge_add_agent_id_if_missing "static-agent"
 BRIDGE_AGENT_ENGINE["static-agent"]="claude"
 BRIDGE_AGENT_SOURCE["static-agent"]="static"
 BRIDGE_AGENT_SESSION["static-agent"]="static-agent"
-BRIDGE_AGENT_WORKDIR["static-agent"]="$static_workdir"
+BRIDGE_AGENT_WORKDIR["static-agent"]="$static_configured_workdir"
 
 bridge_add_agent_id_if_missing "dynamic-agent"
 BRIDGE_AGENT_ENGINE["dynamic-agent"]="claude"
 BRIDGE_AGENT_SOURCE["dynamic-agent"]="dynamic"
 BRIDGE_AGENT_SESSION["dynamic-agent"]="dynamic-agent"
-BRIDGE_AGENT_WORKDIR["dynamic-agent"]="$dynamic_workdir"
+BRIDGE_AGENT_WORKDIR["dynamic-agent"]="$dynamic_configured_workdir"
 EOF
   mode_dynamic="$(
     "$bash4_bin" -c 'repo="$1"; workdir="$2"; source "$repo/bridge-lib.sh"; bridge_load_roster; bridge_claude_settings_mode "$workdir"' \
       _ "$SMOKE_REPO_ROOT" "$dynamic_workdir"
   )"
-  smoke_assert_eq "local" "$mode_dynamic" "E1: dynamic claude agent workdir resolves as local (not shared)"
+  smoke_assert_eq "local" "$mode_dynamic" "E1: dynamic claude agent v2 workdir resolves as local (not shared)"
 
-  # E2 — static claude agent's registered workdir continues to classify as `shared`.
+  # E2 — static claude agent's v2 canonical workdir classifies as `shared`.
   mode_static="$(
     "$bash4_bin" -c 'repo="$1"; workdir="$2"; source "$repo/bridge-lib.sh"; bridge_load_roster; bridge_claude_settings_mode "$workdir"' \
       _ "$SMOKE_REPO_ROOT" "$static_workdir"
   )"
-  smoke_assert_eq "shared" "$mode_static" "E2: static claude agent workdir resolves as shared"
+  smoke_assert_eq "shared" "$mode_static" "E2: static claude agent v2 workdir resolves as shared"
 
   # E3 — workdir within BRIDGE_AGENT_HOME_ROOT and NOT registered as a
   # dynamic agent still resolves as `shared`. The dynamic short-circuit
@@ -275,31 +282,28 @@ EOF
   )"
   smoke_assert_eq "shared" "$mode_within_root" "E3: workdir inside BRIDGE_AGENT_HOME_ROOT (unregistered) remains shared"
 
-  # E4 — Issue #516 r2 (codex needs-more on PR #518): a dynamic claude
-  # agent registered with a workdir that LIVES UNDER
-  # BRIDGE_AGENT_HOME_ROOT must short-circuit to `local` BEFORE the
-  # HOME_ROOT fast-path fires. Operator passes --workdir under the home
-  # root via the dynamic spawn path; without the registered-dynamic
-  # short-circuit, the HOME_ROOT fast-path would silently inflate that
-  # agent's autoCompactWindow against operator intent.
+  # E4 — v2 ignores explicit per-agent workdir overrides, including a
+  # configured path under BRIDGE_AGENT_HOME_ROOT. The configured path is not
+  # the dynamic agent's actual workdir, so it remains an ordinary
+  # home-root-managed path and resolves as shared.
   cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
 bridge_add_agent_id_if_missing "static-agent"
 BRIDGE_AGENT_ENGINE["static-agent"]="claude"
 BRIDGE_AGENT_SOURCE["static-agent"]="static"
 BRIDGE_AGENT_SESSION["static-agent"]="static-agent"
-BRIDGE_AGENT_WORKDIR["static-agent"]="$static_workdir"
+BRIDGE_AGENT_WORKDIR["static-agent"]="$static_configured_workdir"
 
 bridge_add_agent_id_if_missing "dynamic-agent"
 BRIDGE_AGENT_ENGINE["dynamic-agent"]="claude"
 BRIDGE_AGENT_SOURCE["dynamic-agent"]="dynamic"
 BRIDGE_AGENT_SESSION["dynamic-agent"]="dynamic-agent"
-BRIDGE_AGENT_WORKDIR["dynamic-agent"]="$dynamic_under_root_workdir"
+BRIDGE_AGENT_WORKDIR["dynamic-agent"]="$dynamic_under_root_configured_workdir"
 EOF
-  mode_dynamic_under_root="$(
+  mode_dynamic_under_root_configured="$(
     "$bash4_bin" -c 'repo="$1"; workdir="$2"; source "$repo/bridge-lib.sh"; bridge_load_roster; bridge_claude_settings_mode "$workdir"' \
-      _ "$SMOKE_REPO_ROOT" "$dynamic_under_root_workdir"
+      _ "$SMOKE_REPO_ROOT" "$dynamic_under_root_configured_workdir"
   )"
-  smoke_assert_eq "local" "$mode_dynamic_under_root" "E4: dynamic claude agent registered with workdir under HOME_ROOT resolves as local (not shared)"
+  smoke_assert_eq "shared" "$mode_dynamic_under_root_configured" "E4: ignored dynamic workdir override under HOME_ROOT remains shared"
 }
 
 hook_runtime_helpers() {
@@ -326,7 +330,7 @@ main() {
   smoke_run "Codex hooks ensure/status" codex_hooks_contract
   smoke_run "Claude hooks ensure/status" claude_hooks_contract
   smoke_run "Claude shared settings context defaults" claude_shared_settings_context_defaults
-  smoke_run "managed custom workdir shared settings" managed_custom_workdir_shared_settings
+  smoke_run "v2 managed static workdir shared settings" managed_v2_workdir_shared_settings
   smoke_run "claude settings mode source=static gate (#516)" claude_settings_mode_source_gate
   smoke_run "hook runtime helper output" hook_runtime_helpers
   smoke_log "passed"
