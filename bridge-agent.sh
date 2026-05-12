@@ -1546,12 +1546,12 @@ PY
 #              here by adding more sources of truth without changing the
 #              public field shape.
 #   3. channel — at least one channel plugin port from
-#                `bridge_agent_plugin_ports` is in LISTEN state. Uses
-#                `bridge_port_is_listening` if a sibling helper exists
-#                (Track D / #779), otherwise an inline socket-connect
-#                probe. We treat *any* port that this agent is supposed
-#                to bind as a positive channel signal — channel plugins
-#                only listen while the agent runtime is alive.
+#                `bridge_agent_plugin_ports` is in LISTEN state. Delegates
+#                to `bridge_port_is_listening` (Track D / #779, lives in
+#                lib/bridge-agents.sh) so the LISTEN probe stays a single
+#                source of truth. We treat *any* port that this agent is
+#                supposed to bind as a positive channel signal — channel
+#                plugins only listen while the agent runtime is alive.
 #
 # Zombie tmux protection: when the tmux session exists but agent
 # processes are dead, we still report alive=true based on the tmux
@@ -1573,34 +1573,15 @@ bridge_agent_alive_pid_signal() {
 }
 
 bridge_agent_alive_port_is_listening() {
-  # Track D (#779) is expected to expose `bridge_port_is_listening`.
-  # If that lands first, prefer it (single source of truth). Otherwise
-  # use an inline socket-connect probe so this fix stands alone.
+  # Delegate to the canonical LISTEN probe shipped by Track D (#779) in
+  # lib/bridge-agents.sh. bridge-agent.sh loads bridge-lib.sh →
+  # bridge-agents.sh at startup, so the helper is always defined here.
+  # No defensive fallback: keeping a forbidden heredoc-stdin Python
+  # callsite around as "just in case" violates the #800 deadlock-class
+  # convention (PR #801) and the branch can never reach it in practice.
   local port="$1"
   [[ -n "$port" ]] || return 1
-  if [[ "$(type -t bridge_port_is_listening 2>/dev/null)" == "function" ]]; then
-    bridge_port_is_listening "$port"
-    return $?
-  fi
-  python3 - "$port" <<'PY' >/dev/null 2>&1
-import socket
-import sys
-
-try:
-    port = int(sys.argv[1])
-except (TypeError, ValueError):
-    sys.exit(1)
-# Connect-to-localhost is a portable LISTEN probe: a listening socket
-# accepts the connection; nothing bound → ECONNREFUSED. Avoids needing
-# ss/lsof/netstat which differ across macOS/Linux/Alpine.
-for host in ("127.0.0.1", "::1"):
-    try:
-        with socket.create_connection((host, port), timeout=0.25):
-            sys.exit(0)
-    except OSError:
-        continue
-sys.exit(1)
-PY
+  bridge_port_is_listening "$port"
 }
 
 bridge_agent_alive_channel_signal() {
