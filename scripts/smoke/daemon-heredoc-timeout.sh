@@ -19,6 +19,37 @@
 #      helper for a no-op to simulate "next tick, helper recovered".
 #   4. bridge-daemon-helpers.py exposes all 9 subcommands Track A relies on.
 #
+# r2 (codex finding — synthetic-helper coverage gap)
+# --------------------------------------------------
+# Steps 1-3 above use synthetic sleeps-forever.py / noop.py. r2 codex review
+# called that out: the smoke never exercised a REAL `bridge-daemon-helpers.py`
+# subcommand body, only the bridge_with_timeout shell wrapper. To close that
+# gap without modifying production code (no env-var override or PATH hook in
+# the daemon — it resolves the helper via $SCRIPT_DIR/bridge-daemon-helpers.py
+# directly), r2 adds:
+#
+#   5. mcp-orphan-cleanup-parse stalled on a FIFO `report_file`. The real
+#      subcommand body calls `Path(...).read_text()`, which blocks forever
+#      on an empty FIFO. bridge_with_timeout 2s must kill it. Asserts the
+#      audit row tags `call_site=mcp_orphan_cleanup_parse`.
+#   6. mcp-orphan-cleanup-parse with a valid JSON file passes through cleanly
+#      (proves the shim wraps but does not break the real subcommand body).
+#   7. nudge-live-state against a sqlite DB whose write lock is held by a
+#      sidecar python process. The helper's `sqlite3.connect(...).execute(...)`
+#      blocks on the lock; bridge_with_timeout 2s must kill it. This is the
+#      most realistic I/O-wait stall — exactly the class of hang #800
+#      documented.
+#   8. Loop-survival across two consecutive bridge_with_timeout calls: the
+#      FIFO-stall fires (rc=124|137), then immediately the same subcommand
+#      against a valid file succeeds (rc=0). Proves the wrapping is
+#      non-wedging across calls. (Driving a full `bridge-daemon.sh sync`
+#      tick is impractical here — cmd_sync_cycle requires substantial
+#      runtime bootstrap (roster, tmux sessions, queue DB schema, hooks,
+#      cron state) that the smoke environment does not provide. The
+#      consecutive-call pattern is the cleanest realistic equivalent to
+#      a "next tick" assertion without modifying production code to add
+#      a dry-run mode.)
+#
 # We do NOT need real claude/codex binaries — we test only the daemon's
 # subprocess wrapping correctness via the bridge_with_timeout helper that
 # bridge-daemon.sh uses for every callsite touched by Track A.
@@ -186,9 +217,214 @@ step_helper_subcommands_resolve() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# r2 codex finding — exercise REAL bridge-daemon-helpers.py subcommands
+# under realistic stalls, not synthetic sleeps-forever.py.
+# ---------------------------------------------------------------------------
+
+# Path to the real, checked-in helper. This is the same path bridge-daemon.sh
+# invokes via "$SCRIPT_DIR/bridge-daemon-helpers.py".
+REAL_HELPER="$BRIDGE_REPO_ROOT/bridge-daemon-helpers.py"
+
+step_real_helper_stalls_on_fifo() {
+  smoke_log "step 5: real mcp-orphan-cleanup-parse must stall on an empty FIFO"
+  # mcp-orphan-cleanup-parse calls Path(report_file).read_text() — a FIFO
+  # with no writer blocks indefinitely, exercising the real subcommand body.
+  local fifo="$SMOKE_TMP_ROOT/cleanup-report.fifo"
+  rm -f "$fifo"
+  if ! mkfifo "$fifo" 2>/dev/null; then
+    smoke_fail "mkfifo not available; cannot construct realistic helper stall"
+  fi
+
+  local output rc elapsed
+  output="$(run_with_timeout_subshell mcp_orphan_cleanup_parse 2 \
+              python3 "$REAL_HELPER" mcp-orphan-cleanup-parse "$fifo")"
+  rc="$(printf '%s\n' "$output" | sed -n 's/.*rc=\([0-9]*\).*/\1/p')"
+  elapsed="$(printf '%s\n' "$output" | sed -n 's/.*elapsed=\([0-9]*\).*/\1/p')"
+  [[ -n "$rc" ]] || smoke_fail "could not parse rc from: $output"
+  [[ -n "$elapsed" ]] || smoke_fail "could not parse elapsed from: $output"
+  if [[ "$rc" != "124" && "$rc" != "137" ]]; then
+    smoke_fail "real-helper FIFO stall: expected rc=124|137, got rc=$rc (elapsed=${elapsed}s)"
+  fi
+  if (( elapsed > 8 )); then
+    smoke_fail "real-helper FIFO stall: ceiling not enforced (elapsed=${elapsed}s, budget 2s)"
+  fi
+
+  # Audit row must tag the new call_site label so an operator can identify
+  # which real subcommand wedged. bridge_with_timeout writes the row on
+  # 124/137 with `call_site=$label` (label was the second argv to the driver).
+  if ! grep -q '"call_site": "mcp_orphan_cleanup_parse"' "$BRIDGE_AUDIT_LOG"; then
+    smoke_fail "audit log missing call_site=mcp_orphan_cleanup_parse after FIFO stall: $(cat "$BRIDGE_AUDIT_LOG")"
+  fi
+  smoke_log "  rc=$rc elapsed=${elapsed}s — real helper stalled and got killed"
+
+  # Drain the FIFO so cleanup doesn't hang on EXIT. The helper child was
+  # SIGKILLed by timeout(1), so the FIFO has no pending reader; just unlink.
+  rm -f "$fifo"
+}
+
+step_real_helper_passthrough() {
+  smoke_log "step 6: real mcp-orphan-cleanup-parse with valid JSON must pass through"
+  local report="$SMOKE_TMP_ROOT/cleanup-report.json"
+  cat >"$report" <<'JSON'
+{"killed_count": 3, "orphan_count": 7, "freed_mb_estimate": 42, "errors": ["a", "b"]}
+JSON
+
+  # Use the driver so the call is wrapped in bridge_with_timeout (5s budget —
+  # the real subcommand is a single JSON parse + print).
+  local rc=0
+  local stdout_file="$SMOKE_TMP_ROOT/passthrough.out"
+  set +e
+  "$DRIVER" 5 mcp_orphan_cleanup_parse python3 "$REAL_HELPER" \
+      mcp-orphan-cleanup-parse "$report" >"$stdout_file" 2>&1
+  rc=$?
+  set -e
+  if (( rc != 0 )); then
+    smoke_fail "real-helper passthrough should succeed but rc=$rc (out: $(cat "$stdout_file"))"
+  fi
+  local row
+  row="$(cat "$stdout_file")"
+  # Expected shape: killed_count \t orphan_count \t freed_mb_estimate \t error_count
+  smoke_assert_eq "3"$'\t'"7"$'\t'"42"$'\t'"2" "$row" "passthrough row should match JSON input"
+  smoke_log "  row='$row' — real helper produced expected output"
+}
+
+step_real_helper_stalls_on_sqlite_lock() {
+  smoke_log "step 7: real nudge-live-state must stall on a held sqlite write lock"
+  local db_path="$SMOKE_TMP_ROOT/tasks-locked.db"
+  rm -f "$db_path"
+  # Build a minimal schema covering the columns nudge-live-state reads.
+  python3 - "$db_path" <<'PYINIT'
+import sqlite3, sys
+db = sys.argv[1]
+c = sqlite3.connect(db)
+c.execute("""
+    CREATE TABLE tasks (
+        id            INTEGER PRIMARY KEY,
+        assigned_to   TEXT,
+        status        TEXT,
+        claimed_by    TEXT,
+        title         TEXT
+    )
+""")
+c.commit()
+c.close()
+PYINIT
+  [[ -f "$db_path" ]] || smoke_fail "could not initialize sqlite DB at $db_path"
+
+  # Sidecar holds BEGIN EXCLUSIVE for up to 30s so the helper's
+  # sqlite3.connect(...).execute(SELECT ...) blocks on the writer lock.
+  # 30s is well above the helper's 2s budget; the locker is reaped on EXIT
+  # via $LOCKER_PID below.
+  local locker_pid_file="$SMOKE_TMP_ROOT/sqlite-locker.pid"
+  rm -f "$locker_pid_file"
+  python3 - "$db_path" "$locker_pid_file" <<'PYLOCK' &
+import os, sqlite3, sys, time
+db, pidfile = sys.argv[1], sys.argv[2]
+conn = sqlite3.connect(db, isolation_level=None, timeout=60)
+conn.execute("BEGIN EXCLUSIVE")
+with open(pidfile, "w") as fh:
+    fh.write(str(os.getpid()))
+time.sleep(30)
+PYLOCK
+  local locker_pid=$!
+  # Wait for the locker to actually grab the lock (pidfile appears).
+  local waits=0
+  while [[ ! -s "$locker_pid_file" ]] && (( waits < 30 )); do
+    sleep 0.1
+    waits=$(( waits + 1 ))
+  done
+  if [[ ! -s "$locker_pid_file" ]]; then
+    kill "$locker_pid" 2>/dev/null || true
+    wait "$locker_pid" 2>/dev/null || true
+    smoke_fail "sqlite locker sidecar never acquired the EXCLUSIVE lock"
+  fi
+
+  local output rc elapsed
+  output="$(run_with_timeout_subshell nudge_live_state 2 \
+              python3 "$REAL_HELPER" nudge-live-state "$db_path" some-agent)"
+  rc="$(printf '%s\n' "$output" | sed -n 's/.*rc=\([0-9]*\).*/\1/p')"
+  elapsed="$(printf '%s\n' "$output" | sed -n 's/.*elapsed=\([0-9]*\).*/\1/p')"
+
+  kill "$locker_pid" 2>/dev/null || true
+  wait "$locker_pid" 2>/dev/null || true
+
+  [[ -n "$rc" ]] || smoke_fail "could not parse rc from: $output"
+  [[ -n "$elapsed" ]] || smoke_fail "could not parse elapsed from: $output"
+  if [[ "$rc" != "124" && "$rc" != "137" ]]; then
+    smoke_fail "real-helper sqlite-lock stall: expected rc=124|137, got rc=$rc (elapsed=${elapsed}s, output=$output)"
+  fi
+  if (( elapsed > 8 )); then
+    smoke_fail "real-helper sqlite-lock stall: ceiling not enforced (elapsed=${elapsed}s)"
+  fi
+  # The previous step_audit_row_written already verified the
+  # daemon_subprocess_timeout row gets written with call_site=nudge_live_state
+  # for the synthetic stall; here we just confirm a second row was appended
+  # so the operator can distinguish multiple stalls within a single tick.
+  local count
+  count="$(grep -c '"call_site": "nudge_live_state"' "$BRIDGE_AUDIT_LOG" || true)"
+  if (( count < 2 )); then
+    smoke_fail "audit log should now have >=2 nudge_live_state timeout rows, got $count"
+  fi
+  smoke_log "  rc=$rc elapsed=${elapsed}s — real helper stalled on real sqlite I/O wait"
+}
+
+step_loop_survives_real_stall_then_recovers() {
+  smoke_log "step 8: two consecutive bridge_with_timeout calls — real stall then real success"
+  # Re-use the FIFO + passthrough vectors back-to-back via the same driver,
+  # mirroring what a daemon tick does when the same callsite is invoked
+  # again on the next cycle after a timeout.
+  local fifo="$SMOKE_TMP_ROOT/cleanup-report-r2.fifo"
+  rm -f "$fifo"
+  mkfifo "$fifo" || smoke_fail "mkfifo failed for recovery test"
+
+  # Call 1: stall.
+  local rc1=0
+  local out1="$SMOKE_TMP_ROOT/recover-tick1.out"
+  set +e
+  "$DRIVER" 2 mcp_orphan_cleanup_parse python3 "$REAL_HELPER" \
+      mcp-orphan-cleanup-parse "$fifo" >"$out1" 2>&1
+  rc1=$?
+  set -e
+  if [[ "$rc1" != "124" && "$rc1" != "137" ]]; then
+    rm -f "$fifo"
+    smoke_fail "recovery tick1 should time out, got rc=$rc1 (out: $(cat "$out1"))"
+  fi
+  rm -f "$fifo"
+
+  # Call 2: same callsite, valid input — must succeed immediately.
+  local report="$SMOKE_TMP_ROOT/cleanup-report-r2.json"
+  cat >"$report" <<'JSON'
+{"killed_count": 0, "orphan_count": 0, "freed_mb_estimate": 0, "errors": []}
+JSON
+  local rc2=0
+  local out2="$SMOKE_TMP_ROOT/recover-tick2.out"
+  local start_ts end_ts elapsed2
+  start_ts="$(date +%s)"
+  set +e
+  "$DRIVER" 5 mcp_orphan_cleanup_parse python3 "$REAL_HELPER" \
+      mcp-orphan-cleanup-parse "$report" >"$out2" 2>&1
+  rc2=$?
+  set -e
+  end_ts="$(date +%s)"
+  elapsed2=$(( end_ts - start_ts ))
+  if (( rc2 != 0 )); then
+    smoke_fail "recovery tick2 should succeed but rc=$rc2 (out: $(cat "$out2"))"
+  fi
+  if (( elapsed2 > 5 )); then
+    smoke_fail "recovery tick2 should be fast but elapsed=${elapsed2}s"
+  fi
+  smoke_assert_eq "0"$'\t'"0"$'\t'"0"$'\t'"0" "$(cat "$out2")" "recovery tick2 output"
+  smoke_log "  tick1 rc=$rc1, tick2 rc=$rc2 elapsed=${elapsed2}s — wrapping is non-wedging across calls"
+}
+
 smoke_run "stalling helper terminates within budget" step_wrapping_terminates_stalled_helper
 smoke_run "daemon_subprocess_timeout audit row written" step_audit_row_written
 smoke_run "next tick recovers without intervention" step_loop_recovers_next_tick
 smoke_run "all 9 Track-A subcommands wired up" step_helper_subcommands_resolve
+smoke_run "real helper (mcp-orphan-cleanup-parse) stalls on FIFO" step_real_helper_stalls_on_fifo
+smoke_run "real helper (mcp-orphan-cleanup-parse) passes through valid JSON" step_real_helper_passthrough
+smoke_run "real helper (nudge-live-state) stalls on sqlite EXCLUSIVE lock" step_real_helper_stalls_on_sqlite_lock
+smoke_run "loop survives real stall then recovers on next call" step_loop_survives_real_stall_then_recovers
 
 smoke_log "PASS"
