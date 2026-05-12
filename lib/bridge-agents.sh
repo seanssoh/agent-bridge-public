@@ -4022,6 +4022,7 @@ bridge_agent_channel_runtime_ready_for_item() {
   local agent="$1"
   local item="$2"
   local dir=""
+  local port=""
 
   item="$(bridge_trim_whitespace "$item")"
   [[ -n "$item" ]] || return 1
@@ -4031,6 +4032,13 @@ bridge_agent_channel_runtime_ready_for_item() {
   # keys. Both unreadable and missing return 1 here (downstream readiness is
   # boolean), but the structured reason path uses the same helper to emit a
   # distinct status_reason.
+  #
+  # Issue #779: for inbound listener channels (teams), also probe the TCP
+  # LISTEN port so file-present-but-server-silent-exited does NOT report
+  # runtime_ready=true, and so a stale state report does not survive a
+  # rebind. discord/telegram are outbound bot connections — no LISTEN
+  # socket — and ms365 shares the teams HTTP listener for the OAuth
+  # callback, so neither gets a separate LISTEN probe here.
   case "$item" in
     plugin:discord|plugin:discord@*)
       dir="$(bridge_agent_discord_state_dir "$agent")"
@@ -4046,7 +4054,16 @@ bridge_agent_channel_runtime_ready_for_item() {
       dir="$(bridge_agent_teams_state_dir "$agent")"
       [[ -f "$dir/access.json" ]] || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_ID MicrosoftAppId)" == "present" ]] || return 1
-      [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_PASSWORD MicrosoftAppPassword)" == "present" ]]
+      [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_PASSWORD MicrosoftAppPassword)" == "present" ]] || return 1
+      # Issue #779: confirm the webhook listener is actually bound.
+      # bridge_read_port_from_env_file returns 0 with empty stdout when
+      # the key is missing — treat that as "no probe available, accept
+      # file-check result" rather than a hard failure.
+      port="$(bridge_read_port_from_env_file "$dir/.env" TEAMS_WEBHOOK_PORT 2>/dev/null || true)"
+      if [[ -n "$port" ]] && declare -F bridge_port_is_listening >/dev/null 2>&1; then
+        bridge_port_is_listening "$port" || return 1
+      fi
+      return 0
       ;;
     plugin:ms365|plugin:ms365@*)
       dir="$(bridge_agent_ms365_state_dir "$agent")"
@@ -4063,6 +4080,36 @@ bridge_agent_channel_runtime_ready_for_item() {
       return 0
       ;;
   esac
+}
+
+# bridge_port_is_listening — portable Linux + macOS TCP LISTEN probe.
+# Issue #779. Used by bridge_agent_channel_runtime_ready_for_item (teams)
+# and reusable for other channel readiness paths (e.g. Track E).
+#
+# Returns 0 if a process is bound and LISTEN-ing on the local TCP port,
+# 1 if not, and fail-open (0) if neither `ss` nor `lsof` is available so
+# we never make pre-existing file-check behavior strictly worse on a
+# stripped-down host. Sub-100ms typical (well under the <500ms
+# `agent-bridge show` latency budget).
+bridge_port_is_listening() {
+  local port="$1"
+
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+
+  # Linux: ss is fast, batch-friendly, and ships with iproute2.
+  if command -v ss >/dev/null 2>&1; then
+    ss -tln "sport = :$port" 2>/dev/null | grep -q "LISTEN" && return 0
+    return 1
+  fi
+  # macOS / BSD: lsof is the portable fallback.
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | grep -q "LISTEN" && return 0
+    return 1
+  fi
+  # No probe tool available — fail-open so we preserve prior file-check
+  # behavior on minimal hosts. Callers treat 0 as "ready"; this means
+  # status reports remain accurate to within what we can actually test.
+  return 0
 }
 
 bridge_channel_provider_for_item() {
