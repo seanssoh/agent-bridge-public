@@ -109,7 +109,23 @@ def _default_daemon_script() -> Path:
     default_home_candidate = Path.home() / ".agent-bridge" / "bridge-daemon.sh"
     if default_home_candidate.is_file():
         return default_home_candidate
-    return SCRIPT_DIR / "bridge-daemon.sh"
+    # Last-resort dev fallback. Production installs should NEVER reach this
+    # branch — it indicates the watchdog is running from a non-canonical
+    # location (temp dir, worktree, etc.) and is the exact failure class
+    # issue #800 / #265 documented. Log a clear warning so operators see
+    # the problem rather than silently inheriting the broken default. The
+    # module-level `log` is not yet bound at import time when this resolver
+    # runs, so use `logging.getLogger` directly — it's the same handler the
+    # rest of the module will attach to once `logging.basicConfig` runs.
+    fallback = SCRIPT_DIR / "bridge-daemon.sh"
+    logging.getLogger("watchdog-silence").warning(
+        "DAEMON_SCRIPT resolved via SCRIPT_DIR fallback (%s) — "
+        "no BRIDGE_HOME or ~/.agent-bridge install found. "
+        "This is the failure mode #800 Track C documented; "
+        "set BRIDGE_HOME or install canonically via 'agent-bridge upgrade'.",
+        fallback,
+    )
+    return fallback
 
 
 DAEMON_SCRIPT = Path(

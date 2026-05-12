@@ -6042,12 +6042,12 @@ cmd_status() {
     # supervises) cannot block `daemon status` itself. The watchdog status
     # path opens the audit JSONL and seeks into it; on a healthy host this
     # returns in <100ms, on a sick host we'd rather show stale-or-missing
-    # rows than hang the daemon status caller.
-    if command -v timeout >/dev/null 2>&1; then
-      watchdog_out="$(timeout 5 python3 "$watchdog_py" status 2>/dev/null || true)"
-    else
-      watchdog_out="$(python3 "$watchdog_py" status 2>/dev/null || true)"
-    fi
+    # rows than hang the daemon status caller. Use the project-wide
+    # bridge_with_timeout wrapper (lib/bridge-state.sh) so the timeout
+    # works on hosts that don't ship GNU `timeout(1)` — notably macOS
+    # without coreutils, where the previous bare `command -v timeout` test
+    # failed and the call ran unbounded.
+    watchdog_out="$(bridge_with_timeout 5 cmd_status_watchdog python3 "$watchdog_py" status 2>/dev/null || true)"
     if [[ -n "$watchdog_out" ]]; then
       local line
       while IFS= read -r line; do
