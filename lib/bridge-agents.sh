@@ -175,9 +175,13 @@ bridge_list_worktrees() {
 # --apply actually runs `git worktree remove -f <path>`. --prune-branches also
 # deletes the local branch ref via `git branch -D` once the worktree is gone.
 #
-# Stash safety is checked from the WORKTREE'S directory (`git -C <wt> stash list`).
-# Because all worktrees in a repo share refs/stash, the count seen there is the
-# global count; we treat any non-zero as "skip" rather than guessing ownership.
+# Stash safety is checked ONCE at the repo level (`git -C <repo_root> stash list`)
+# BEFORE the per-worktree classification loop. Because all worktrees in a repo
+# share refs/stash, any stash entry anywhere blocks all removal — the doctor
+# refuses to touch any worktree until the operator handles the stashes first.
+# Doing the check at repo-level (rather than per-worktree) is load-bearing: a
+# porcelain-listed worktree whose directory is missing on disk would otherwise
+# read stash_count=0 and fall through to REMOVE, silently bypassing the policy.
 #
 # Args: doctor [--dry-run] [--apply] [--max-age-days N] [--target-branch ref]
 #              [--include-stale] [--prune-branches] [--repo PATH]
@@ -267,6 +271,16 @@ USAGE
     bridge_die "git worktree list 실행 실패: $repo_root"
   fi
 
+  # Repo-level stash check. refs/stash is shared across every worktree in the
+  # repo, so a single `git stash list` at the repo root captures the global
+  # count. ANY non-zero count blocks removal for every worktree — even ones
+  # whose on-disk directory has gone missing (the prior per-worktree check
+  # silently returned 0 in that case and let REMOVE fire, which violated the
+  # "any stash anywhere blocks all" policy).
+  local repo_stash_count=0
+  repo_stash_count="$(git -C "$repo_root" stash list 2>/dev/null | wc -l | tr -d ' ')"
+  [[ -z "$repo_stash_count" ]] && repo_stash_count=0
+
   local now_epoch
   now_epoch="$(date +%s)"
   local age_threshold_secs=$(( max_age_days * 86400 ))
@@ -313,7 +327,8 @@ USAGE
           _bridge_worktree_doctor_classify_one \
             "$repo_root" "$wt_path" "$wt_branch" \
             "$target_branch" "$now_epoch" "$age_threshold_secs" \
-            "$mode" "$include_stale" "$prune_branches"
+            "$mode" "$include_stale" "$prune_branches" \
+            "$repo_stash_count"
         fi
         wt_path=""
         wt_branch=""
@@ -326,7 +341,8 @@ USAGE
     _bridge_worktree_doctor_classify_one \
       "$repo_root" "$wt_path" "$wt_branch" \
       "$target_branch" "$now_epoch" "$age_threshold_secs" \
-      "$mode" "$include_stale" "$prune_branches"
+      "$mode" "$include_stale" "$prune_branches" \
+      "$repo_stash_count"
   fi
 
   echo ""
@@ -360,6 +376,7 @@ _bridge_worktree_doctor_classify_one() {
   local mode="$7"
   local include_stale="$8"
   local prune_branches="$9"
+  local repo_stash_count="${10:-0}"
 
   # Match only fixer-style worktree paths: */.claude/worktrees/agent-*
   # or */.claude/worktrees/ab-*. Operator's primary checkout and ad-hoc
@@ -379,14 +396,13 @@ _bridge_worktree_doctor_classify_one() {
     short_branch="$wt_branch"
   fi
 
-  # Stash safety check — count stash entries from inside the worktree.
-  # Best-effort: if `git -C <wt>` errors (worktree dir gone, locked refs),
-  # treat as 0 stash entries since there's nothing to lose.
-  local stash_count=0
-  if [[ -d "$wt_path" ]]; then
-    stash_count="$(git -C "$wt_path" stash list 2>/dev/null | wc -l | tr -d ' ')"
-    [[ -z "$stash_count" ]] && stash_count=0
-  fi
+  # Stash count is the GLOBAL repo-level count captured once by
+  # bridge_worktree_doctor before the porcelain loop. Using the global value
+  # (rather than a per-worktree `git -C <wt> stash list`) is what makes
+  # "any stash anywhere blocks all removal" actually hold: a porcelain-listed
+  # worktree whose on-disk directory is missing would previously read 0 here
+  # and fall through to REMOVE under --apply, silently bypassing the policy.
+  local stash_count="$repo_stash_count"
 
   # Last commit age on the branch (epoch seconds). Fall back to 0 if the
   # ref is gone — that itself is a signal the worktree is stale.

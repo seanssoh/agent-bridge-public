@@ -196,6 +196,66 @@ case_apply_reaps_merged_only() {
     "git still tracks unmerged worktree"
 }
 
+# Build a repo where one fixer worktree has been MERGED into main (and would
+# normally classify REMOVE), but its on-disk directory has been removed — the
+# `git worktree list --porcelain` output still lists it because the metadata
+# under .git/worktrees/<name> is still present. A second, unrelated worktree
+# holds a stash entry. Because refs/stash is shared, the global stash count is
+# non-zero. The doctor must SKIP the orphan-dir worktree (NOT REMOVE it),
+# because "any stash anywhere blocks all removal" must hold even when the
+# per-worktree dir is gone (regression catch for codex r1 BLOCKING on PR #807:
+# the prior check `if [[ -d "$wt_path" ]]; then ... stash_count=...` left
+# stash_count=0 for missing dirs and let REMOVE fire under --apply).
+build_repo_orphan_dir_with_global_stash() {
+  local repo="$1"
+  rm -rf "$repo"
+  mkdir -p "$repo/.claude/worktrees"
+  git -C "$repo" init -q -b main
+  git -C "$repo" -c user.name=smoke -c user.email=smoke@example.com commit -q --allow-empty -m "init"
+
+  # Worktree #1: merged into main, then its on-disk dir is rm -rf'd. The
+  # porcelain entry survives because we never `git worktree remove` it.
+  git -C "$repo" branch fix/merged-orphan
+  git -C "$repo" worktree add -q "$repo/.claude/worktrees/agent-orphan" fix/merged-orphan
+  printf 'm\n' >"$repo/.claude/worktrees/agent-orphan/m.txt"
+  git -C "$repo/.claude/worktrees/agent-orphan" \
+    -c user.name=smoke -c user.email=smoke@example.com add m.txt
+  git -C "$repo/.claude/worktrees/agent-orphan" \
+    -c user.name=smoke -c user.email=smoke@example.com commit -q -m "merged orphan"
+  git -C "$repo" -c user.name=smoke -c user.email=smoke@example.com \
+    merge -q --no-ff fix/merged-orphan -m "merge orphan"
+  rm -rf "$repo/.claude/worktrees/agent-orphan"
+
+  # Worktree #2: holds the stash entry. Some other lane's WIP. We do NOT want
+  # the orphan worktree above to be reaped while this stash exists, because
+  # the stash ref is shared across all worktrees in the repo.
+  git -C "$repo" branch fix/stash-holder
+  git -C "$repo" worktree add -q "$repo/.claude/worktrees/agent-stash-holder" fix/stash-holder
+  printf 'baseline\n' >"$repo/.claude/worktrees/agent-stash-holder/keep.txt"
+  git -C "$repo/.claude/worktrees/agent-stash-holder" \
+    -c user.name=smoke -c user.email=smoke@example.com add keep.txt
+  git -C "$repo/.claude/worktrees/agent-stash-holder" \
+    -c user.name=smoke -c user.email=smoke@example.com commit -q -m "baseline"
+  printf 'unsaved WIP\n' >"$repo/.claude/worktrees/agent-stash-holder/wip.txt"
+  git -C "$repo/.claude/worktrees/agent-stash-holder" \
+    -c user.name=smoke -c user.email=smoke@example.com add wip.txt
+  git -C "$repo/.claude/worktrees/agent-stash-holder" \
+    -c user.name=smoke -c user.email=smoke@example.com \
+    stash push -q -m "orphan-smoke-stash" -- wip.txt
+
+  # Sanity — porcelain still lists the orphan, and the global stash count is 1.
+  local porcelain
+  porcelain="$(git -C "$repo" worktree list --porcelain)"
+  smoke_assert_contains "$porcelain" "agent-orphan" \
+    "porcelain still references orphan worktree after rm -rf"
+  if [[ -d "$repo/.claude/worktrees/agent-orphan" ]]; then
+    smoke_fail "orphan worktree dir should not exist after setup rm -rf"
+  fi
+  local repo_stash_count
+  repo_stash_count="$(git -C "$repo" stash list | wc -l | tr -d ' ')"
+  smoke_assert_eq "1" "$repo_stash_count" "global repo stash count is 1"
+}
+
 case_stash_skip_all() {
   smoke_setup_bridge_home "$SMOKE_NAME-stash"
   load_doctor_fns
@@ -242,8 +302,58 @@ case_stash_skip_all() {
     "stash worktree retained when stash present"
 }
 
+case_global_stash_refuse_blocks_orphan_worktrees() {
+  smoke_setup_bridge_home "$SMOKE_NAME-orphan"
+  load_doctor_fns
+  local repo="$SMOKE_TMP_ROOT/repo-orphan"
+  build_repo_orphan_dir_with_global_stash "$repo"
+
+  # Dry-run: the orphan-dir worktree (merged + missing on disk) must classify
+  # SKIP, not REMOVE, because the global stash count is non-zero. The
+  # stash-holder worktree must also classify SKIP.
+  local dry_out
+  dry_out="$(bridge_worktree_doctor --dry-run --repo "$repo" 2>&1)"
+
+  local orphan_row stash_row
+  orphan_row="$(printf '%s\n' "$dry_out" | grep agent-orphan || true)"
+  stash_row="$(printf '%s\n' "$dry_out" | grep agent-stash-holder || true)"
+  smoke_assert_contains "$orphan_row" "SKIP" \
+    "orphan worktree (dir missing) SKIP'd because global stash is non-zero"
+  smoke_assert_contains "$stash_row" "SKIP" \
+    "stash-holder worktree SKIP'd"
+
+  # And explicitly: the orphan row must NOT be REMOVE. The prior per-worktree
+  # check would have read stash_count=0 here (the dir is gone), let merged →
+  # REMOVE win, and reaped it under --apply.
+  smoke_assert_not_contains "$orphan_row" "REMOVE" \
+    "orphan worktree must NOT classify REMOVE while stash exists anywhere"
+
+  # The orphan row's STASH column should reflect the GLOBAL count (1), not 0.
+  # This is the load-bearing assertion of the fix: a row whose on-disk dir
+  # is gone still shows the repo-level stash count.
+  if [[ ! "$orphan_row" =~ \|[[:space:]]+[1-9] ]]; then
+    smoke_fail "orphan worktree row should show non-zero stash count (global): $orphan_row"
+  fi
+
+  # Apply: nothing should be removed; the orphan must NOT be reaped.
+  local apply_out
+  apply_out="$(bridge_worktree_doctor --apply --repo "$repo" 2>&1)"
+  smoke_assert_not_contains "$apply_out" "removed: " \
+    "apply does not remove anything when global stash is non-zero"
+  smoke_assert_not_contains "$apply_out" "removed: $repo/.claude/worktrees/agent-orphan" \
+    "apply must NOT reap orphan worktree while stash present"
+
+  # Porcelain should still list the orphan after --apply.
+  local porcelain_after
+  porcelain_after="$(git -C "$repo" worktree list --porcelain)"
+  smoke_assert_contains "$porcelain_after" "agent-orphan" \
+    "orphan worktree porcelain entry survived --apply (stash blocked removal)"
+}
+
 smoke_log "starting smoke: $SMOKE_NAME"
 smoke_run "dry-run classification (merged → REMOVE, unmerged → KEEP)" case_dry_run_classification
 smoke_run "apply removes only merged, leaves unmerged"               case_apply_reaps_merged_only
 smoke_run "stash anywhere → all worktrees SKIP (apply is a no-op)"   case_stash_skip_all
+smoke_run "global stash refuse blocks orphan (missing-dir) worktrees" \
+                                                                     case_global_stash_refuse_blocks_orphan_worktrees
 smoke_log "all worktree-doctor cases passed"
