@@ -28,10 +28,11 @@ export BRIDGE_LAYOUT=v2
 
 TOKEN_A="fake-claude-oauth-token-a"
 TOKEN_B="fake-claude-oauth-token-b"
+TOKEN_C="fake-claude-oauth-token-c"
 AGENT="patch"
 SECRET_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/credentials/launch-secrets.env"
 
-mkdir -p "$BRIDGE_HOME" "$BRIDGE_DATA_ROOT" "$ROOT/runtime/secrets" "$ROOT/workdir"
+mkdir -p "$BRIDGE_HOME" "$BRIDGE_DATA_ROOT" "$ROOT/runtime/secrets" "$ROOT/workdir" "$ROOT/bin"
 : >"$BRIDGE_ROSTER_FILE"
 cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<ROSTER
 BRIDGE_ADMIN_AGENT_ID="$AGENT"
@@ -43,6 +44,24 @@ BRIDGE_AGENT_WORKDIR["$AGENT"]="$ROOT/workdir"
 BRIDGE_AGENT_LAUNCH_CMD["$AGENT"]="claude"
 BRIDGE_AGENT_SOURCE["$AGENT"]="static"
 ROSTER
+
+cat >"$ROOT/bin/claude" <<'FAKE_CLAUDE'
+#!/usr/bin/env bash
+case "${FAKE_CLAUDE_MODE:-ok}" in
+  quota)
+    printf '%s\n' '{"type":"result","is_error":true,"api_error_status":429,"result":"You'\''ve hit your limit - resets May 13, 3am (UTC)"}'
+    exit 1
+    ;;
+  auth)
+    printf '%s\n' '{"type":"result","is_error":true,"api_error_status":401,"result":"unauthorized"}'
+    exit 1
+    ;;
+  *)
+    printf '%s\n' '{"type":"result","is_error":false,"result":"OK"}'
+    ;;
+esac
+FAKE_CLAUDE
+chmod +x "$ROOT/bin/claude"
 
 pass() {
   printf '[smoke][pass] %s\n' "$1"
@@ -90,6 +109,33 @@ json_assert "auto disabled skip" "$SKIP_JSON" "payload['status'] == 'skipped' an
 ENABLED_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token auto-rotate enable --threshold 99 --json)"
 json_assert "auto enable" "$ENABLED_JSON" "payload['status'] == 'ok' and payload['auto_rotate_enabled'] is True and payload['rotation_threshold'] == 99.0"
 pass "auto-rotate gate is registry controlled"
+
+ADD_QUOTA_JSON="$(printf '%s' "$TOKEN_C" | "$REPO_ROOT/agent-bridge" auth claude-token add --id quota --stdin --json)"
+[[ "$ADD_QUOTA_JSON" != *"$TOKEN_C"* ]] || fail "quota add output leaked token"
+CHECK_QUOTA_JSON="$(
+  PATH="$ROOT/bin:$PATH" \
+  FAKE_CLAUDE_MODE=quota \
+  BRIDGE_AUTH_NOW_UTC="2026-05-12T02:00:00+00:00" \
+  "$REPO_ROOT/agent-bridge" auth claude-token check quota --disable-on-quota --json
+)"
+[[ "$CHECK_QUOTA_JSON" != *"$TOKEN_C"* ]] || fail "quota check output leaked token"
+json_assert "quota check" "$CHECK_QUOTA_JSON" "payload['status'] == 'quota_limited' and payload['reset_at'] == '2026-05-13T03:00:00+00:00' and payload['token']['enabled'] is False"
+RECOVER_NOT_DUE_JSON="$(
+  PATH="$ROOT/bin:$PATH" \
+  BRIDGE_AUTH_NOW_UTC="2026-05-13T02:59:00+00:00" \
+  "$REPO_ROOT/agent-bridge" auth claude-token recover-due --json
+)"
+json_assert "quota recover not due" "$RECOVER_NOT_DUE_JSON" "payload['status'] == 'skipped' and payload['reason'] == 'no_due_tokens'"
+RECOVER_DUE_JSON="$(
+  PATH="$ROOT/bin:$PATH" \
+  FAKE_CLAUDE_MODE=ok \
+  BRIDGE_AUTH_NOW_UTC="2026-05-13T03:00:00+00:00" \
+  "$REPO_ROOT/agent-bridge" auth claude-token recover-due --json
+)"
+json_assert "quota recover due" "$RECOVER_DUE_JSON" "payload['status'] == 'ok' and payload['checked_count'] == 1 and payload['recovered_count'] == 1 and payload['recovered'] == ['quota']"
+LIST_AFTER_RECOVER="$("$REPO_ROOT/agent-bridge" auth claude-token list --json)"
+json_assert "quota list recovered" "$LIST_AFTER_RECOVER" "next(row for row in payload['tokens'] if row['id'] == 'quota')['enabled'] is True"
+pass "quota-limited tokens store reset time and recover automatically when due"
 
 USAGE_ROOT="$ROOT/usage"
 USAGE_CACHE="$USAGE_ROOT/claude-usage.json"

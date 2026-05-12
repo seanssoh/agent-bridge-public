@@ -352,6 +352,10 @@ bridge_usage_poll_state_file() {
   printf '%s/usage/poll.env' "$BRIDGE_STATE_DIR"
 }
 
+bridge_claude_token_recovery_state_file() {
+  printf '%s/claude-token-recovery.env' "$BRIDGE_STATE_DIR"
+}
+
 bridge_usage_due() {
   local interval="${BRIDGE_USAGE_MONITOR_INTERVAL_SECONDS:-300}"
   local file=""
@@ -384,6 +388,41 @@ bridge_note_usage_poll() {
   cat >"$file" <<EOF
 USAGE_UPDATED_TS=$now
 USAGE_NEXT_TS=$next_ts
+EOF
+}
+
+bridge_claude_token_recovery_due() {
+  local interval="${BRIDGE_CLAUDE_TOKEN_RECOVERY_INTERVAL_SECONDS:-300}"
+  local file=""
+  local now=0
+  local next_ts=0
+
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=300
+  (( interval > 0 )) || return 0
+  file="$(bridge_claude_token_recovery_state_file)"
+  [[ -f "$file" ]] || return 0
+  daemon_source_state_file "$file" "claude-token-recovery" 1 "CLAUDE_TOKEN_RECOVERY_NEXT_TS" || return 0
+  [[ "${CLAUDE_TOKEN_RECOVERY_NEXT_TS:-0}" =~ ^[0-9]+$ ]] || return 0
+  now="$(date +%s)"
+  next_ts="${CLAUDE_TOKEN_RECOVERY_NEXT_TS:-0}"
+  (( now >= next_ts ))
+}
+
+bridge_note_claude_token_recovery_poll() {
+  local interval="${BRIDGE_CLAUDE_TOKEN_RECOVERY_INTERVAL_SECONDS:-300}"
+  local file=""
+  local now=0
+  local next_ts=0
+
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=300
+  (( interval > 0 )) || interval=300
+  file="$(bridge_claude_token_recovery_state_file)"
+  mkdir -p "$(dirname "$file")"
+  now="$(date +%s)"
+  next_ts=$(( now + interval ))
+  cat >"$file" <<EOF
+CLAUDE_TOKEN_RECOVERY_UPDATED_TS=$now
+CLAUDE_TOKEN_RECOVERY_NEXT_TS=$next_ts
 EOF
 }
 
@@ -1162,6 +1201,106 @@ PY
 
   bridge_note_usage_poll
   (( alert_count > 0 || rotation_count > 0 ))
+}
+
+process_claude_token_recovery() {
+  local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
+  local recovery_json=""
+  local recovery_row=""
+  local status=""
+  local reason=""
+  local checked_count="0"
+  local recovered_count="0"
+  local still_disabled_count="0"
+  local recovered_csv=""
+  local sync_recommended="0"
+  local sync_json=""
+  local sync_status=""
+  local timeout_seconds="${BRIDGE_CLAUDE_TOKEN_RECOVERY_TIMEOUT_SECONDS:-60}"
+  local check_timeout="${BRIDGE_CLAUDE_TOKEN_CHECK_TIMEOUT_SECONDS:-45}"
+  local retry_seconds="${BRIDGE_CLAUDE_TOKEN_CHECK_RETRY_SECONDS:-1800}"
+  local agent_scope="${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}"
+
+  [[ "${BRIDGE_CLAUDE_TOKEN_RECOVERY_ENABLED:-1}" == "1" ]] || return 1
+  bridge_claude_token_recovery_due || return 1
+
+  [[ "$timeout_seconds" =~ ^[0-9]+$ ]] || timeout_seconds=60
+  [[ "$check_timeout" =~ ^[0-9]+$ ]] || check_timeout=45
+  [[ "$retry_seconds" =~ ^[0-9]+$ ]] || retry_seconds=1800
+
+  if ! recovery_json="$(bridge_with_timeout "$timeout_seconds" claude_token_recovery \
+      "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token recover-due \
+      --timeout "$check_timeout" \
+      --retry-seconds "$retry_seconds" \
+      --json 2>/dev/null)"; then
+    bridge_note_claude_token_recovery_poll
+    bridge_audit_log daemon claude_token_recovery "$target" \
+      --detail status=error \
+      --detail reason=recover_due_failed \
+      --detail timeout_seconds="$timeout_seconds" \
+      2>/dev/null || true
+    return 1
+  fi
+
+  recovery_row="$(python3 - "$recovery_json" <<'PY'
+import json
+import sys
+
+try:
+    payload = json.loads(sys.argv[1])
+except Exception:
+    payload = {"status": "error", "reason": "invalid_recovery_output"}
+recovered = payload.get("recovered") if isinstance(payload.get("recovered"), list) else []
+print(
+    "\t".join(
+        [
+            str(payload.get("status", "")),
+            str(payload.get("reason", "")),
+            str(payload.get("checked_count", 0)),
+            str(payload.get("recovered_count", 0)),
+            str(payload.get("still_disabled_count", 0)),
+            ",".join(str(item) for item in recovered),
+            "1" if payload.get("sync_recommended") else "0",
+        ]
+    )
+)
+PY
+)"
+  IFS=$'\t' read -r status reason checked_count recovered_count still_disabled_count recovered_csv sync_recommended <<<"$recovery_row"
+
+  bridge_note_claude_token_recovery_poll
+
+  if [[ "$sync_recommended" == "1" ]]; then
+    sync_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync --agents "$agent_scope" --json 2>/dev/null || true)"
+    sync_status="$(python3 - "$sync_json" <<'PY'
+import json
+import sys
+try:
+    print(json.loads(sys.argv[1]).get("status", ""))
+except Exception:
+    print("error")
+PY
+)"
+  fi
+
+  if [[ "$status" != "skipped" || "${checked_count:-0}" != "0" ]]; then
+    bridge_audit_log daemon claude_token_recovery "$target" \
+      --detail status="$status" \
+      --detail reason="$reason" \
+      --detail checked_count="$checked_count" \
+      --detail recovered_count="$recovered_count" \
+      --detail still_disabled_count="$still_disabled_count" \
+      --detail recovered="$recovered_csv" \
+      --detail sync_recommended="$sync_recommended" \
+      --detail sync_status="$sync_status" \
+      2>/dev/null || true
+  fi
+
+  if [[ "${recovered_count:-0}" != "0" ]]; then
+    daemon_info "claude token recovery: recovered=${recovered_csv:-?} sync=${sync_status:-not-needed}"
+  fi
+
+  [[ "$status" != "skipped" && "${checked_count:-0}" != "0" ]]
 }
 
 process_release_monitor() {
@@ -5572,6 +5711,10 @@ cmd_sync_cycle() {
   fi
   BRIDGE_DAEMON_LAST_STEP="crash_reports"
   if process_crash_reports; then
+    changed=0
+  fi
+  BRIDGE_DAEMON_LAST_STEP="claude_token_recovery"
+  if process_claude_token_recovery; then
     changed=0
   fi
   BRIDGE_DAEMON_LAST_STEP="usage_monitor"

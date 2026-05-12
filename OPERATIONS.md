@@ -888,6 +888,23 @@ threshold once per reset cycle, it runs `rotate --if-auto-enabled --sync`.
 agent-bridge auth claude-token auto-rotate enable --threshold 99
 ```
 
+If a stored token hits a Claude quota limit during a health check, Agent
+Bridge records the reset estimate returned by Claude (for example
+`resets May 13, 3am (UTC)`) as `disabled_until` / `next_check_at` and
+keeps that token out of rotation while it is unavailable. The main daemon
+then runs `claude-token recover-due` on its normal loop; once the reset
+time has passed, it probes the token directly through the Claude CLI and
+re-enables it when the probe succeeds. This recovery path is pure
+script/daemon code and does not create agent tasks or expose token values
+to queue payloads.
+
+Manual health check:
+
+```bash
+agent-bridge auth claude-token check claude-b --disable-on-quota --enable-on-ok
+agent-bridge auth claude-token recover-due
+```
+
 Manual fallback:
 
 ```bash

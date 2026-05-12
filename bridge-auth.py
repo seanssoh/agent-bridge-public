@@ -8,9 +8,10 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +19,47 @@ from typing import Any
 REGISTRY_VERSION = 1
 TOKEN_ENV_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
 TOKEN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+MONTHS = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+
+def now_utc() -> datetime:
+    fixed = os.environ.get("BRIDGE_AUTH_NOW_UTC")
+    if fixed:
+        value = fixed.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    return datetime.now(timezone.utc)
 
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    return now_utc().isoformat(timespec="seconds")
+
+
+def iso_to_utc(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def json_dump(payload: dict[str, Any]) -> None:
@@ -168,6 +206,11 @@ def public_token_row(row: dict[str, Any], active_id: str) -> dict[str, Any]:
         "created_at": row.get("created_at") or "",
         "updated_at": row.get("updated_at") or "",
         "last_activated_at": row.get("last_activated_at") or "",
+        "last_checked_at": row.get("last_checked_at") or "",
+        "last_check_status": row.get("last_check_status") or "",
+        "disabled_reason": row.get("disabled_reason") or "",
+        "disabled_until": row.get("disabled_until") or "",
+        "next_check_at": row.get("next_check_at") or "",
         "note": row.get("note") or "",
     }
 
@@ -190,6 +233,183 @@ def enabled_token_ids(registry: dict[str, Any]) -> list[str]:
         if bool(row.get("enabled", True)) and row.get("token"):
             ids.append(str(row.get("id") or ""))
     return [token_id for token_id in ids if token_id]
+
+
+def redact_token(text: str, token: str) -> str:
+    if not text or not token:
+        return text
+    return text.replace(token, "<redacted-token>")
+
+
+def collect_json_value(payload: Any, key: str) -> Any:
+    if isinstance(payload, dict):
+        if key in payload:
+            return payload[key]
+        for value in payload.values():
+            found = collect_json_value(value, key)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for value in payload:
+            found = collect_json_value(value, key)
+            if found is not None:
+                return found
+    return None
+
+
+def parse_reset_at(text: str, reference: datetime | None = None) -> str:
+    if not text:
+        return ""
+    reference = reference or now_utc()
+    absolute = re.search(
+        r"\bresets?\s+([A-Za-z]+)\s+(\d{1,2}),\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*\(UTC\)",
+        text,
+        re.IGNORECASE,
+    )
+    if absolute:
+        month = MONTHS.get(absolute.group(1).lower())
+        if month:
+            day = int(absolute.group(2))
+            hour = int(absolute.group(3))
+            minute = int(absolute.group(4) or "0")
+            meridiem = absolute.group(5).lower()
+            if meridiem == "pm" and hour != 12:
+                hour += 12
+            if meridiem == "am" and hour == 12:
+                hour = 0
+            candidate = datetime(reference.year, month, day, hour, minute, tzinfo=timezone.utc)
+            if candidate < reference - timedelta(days=1):
+                candidate = candidate.replace(year=reference.year + 1)
+            return candidate.isoformat(timespec="seconds")
+
+    relative = re.search(r"\bresets?\s+in\s+(\d+)h(?:\s+(\d+)m)?", text, re.IGNORECASE)
+    if relative:
+        hours = int(relative.group(1))
+        minutes = int(relative.group(2) or "0")
+        return (reference + timedelta(hours=hours, minutes=minutes)).isoformat(timespec="seconds")
+
+    return ""
+
+
+def classify_probe(stdout: str, stderr: str, returncode: int) -> tuple[str, dict[str, Any]]:
+    raw = "\n".join(part for part in (stdout, stderr) if part)
+    payload: Any = None
+    if stdout.strip():
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            payload = None
+
+    api_status = collect_json_value(payload, "api_error_status") if payload is not None else None
+    result = collect_json_value(payload, "result") if payload is not None else ""
+    if isinstance(result, (dict, list)):
+        result_text = json.dumps(result, ensure_ascii=True)
+    else:
+        result_text = str(result or "")
+    combined = "\n".join(part for part in (result_text, raw) if part)
+    reset_at = parse_reset_at(combined)
+
+    api_status_text = str(api_status or "")
+    lower = combined.lower()
+    detail: dict[str, Any] = {
+        "api_error_status": api_status_text,
+        "reset_at": reset_at,
+        "returncode": returncode,
+    }
+
+    if api_status_text == "429" or "hit your limit" in lower or "usage limit" in lower:
+        return "quota_limited", detail
+    if api_status_text in {"401", "403"} or "invalid api key" in lower or "unauthorized" in lower:
+        return "auth_failed", detail
+
+    if payload is not None:
+        is_error = bool(collect_json_value(payload, "is_error"))
+        if returncode == 0 and not is_error:
+            return "available", detail
+    elif returncode == 0:
+        return "available", detail
+
+    return "failed", detail
+
+
+def probe_claude_token(token: str, timeout_seconds: int) -> dict[str, Any]:
+    claude_bin = os.environ.get("BRIDGE_CLAUDE_TOKEN_CHECK_BIN", "claude")
+    prompt = os.environ.get("BRIDGE_CLAUDE_TOKEN_CHECK_PROMPT", "Return exactly OK.")
+    env = os.environ.copy()
+    env[TOKEN_ENV_KEY] = token
+    command = [claude_bin, "-p", prompt, "--output-format", "json"]
+    try:
+        proc = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=timeout_seconds,
+            env=env,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout", "returncode": 124, "api_error_status": "", "reset_at": ""}
+    except FileNotFoundError:
+        return {"status": "failed", "returncode": 127, "api_error_status": "", "reset_at": "", "error": "claude_not_found"}
+
+    stdout = redact_token(proc.stdout or "", token)
+    stderr = redact_token(proc.stderr or "", token)
+    status, detail = classify_probe(stdout, stderr, proc.returncode)
+    detail["status"] = status
+    return detail
+
+
+def clear_quota_disable_fields(row: dict[str, Any]) -> None:
+    for key in ("disabled_reason", "disabled_until", "next_check_at"):
+        row.pop(key, None)
+
+
+def update_row_from_probe(
+    row: dict[str, Any],
+    probe: dict[str, Any],
+    *,
+    enable_on_ok: bool,
+    disable_on_quota: bool,
+    retry_seconds: int,
+) -> dict[str, Any]:
+    timestamp = now_iso()
+    status = str(probe.get("status") or "failed")
+    reset_at = str(probe.get("reset_at") or "")
+    row["last_checked_at"] = timestamp
+    row["last_check_status"] = status
+    row["last_check_api_error_status"] = str(probe.get("api_error_status") or "")
+    row["last_check_returncode"] = int(probe.get("returncode") or 0)
+
+    if status == "available" and enable_on_ok:
+        row["enabled"] = True
+        clear_quota_disable_fields(row)
+    elif status == "quota_limited" and disable_on_quota:
+        row["enabled"] = False
+        row["disabled_reason"] = "quota_limited"
+        if reset_at:
+            row["disabled_until"] = reset_at
+            row["next_check_at"] = reset_at
+        else:
+            row["next_check_at"] = (now_utc() + timedelta(seconds=retry_seconds)).isoformat(timespec="seconds")
+    elif status not in {"available", "quota_limited"}:
+        row["next_check_at"] = (now_utc() + timedelta(seconds=retry_seconds)).isoformat(timespec="seconds")
+
+    row["updated_at"] = timestamp
+    return public_token_row(row, "")
+
+
+def quota_recheck_due(row: dict[str, Any], reference: datetime) -> bool:
+    if bool(row.get("enabled", True)):
+        return False
+    if str(row.get("disabled_reason") or "") != "quota_limited":
+        return False
+    due_values = [str(row.get("next_check_at") or ""), str(row.get("disabled_until") or "")]
+    for value in due_values:
+        due_at = iso_to_utc(value)
+        if due_at is not None and due_at <= reference:
+            return True
+    return not any(due_values)
 
 
 def cmd_add(args: argparse.Namespace) -> int:
@@ -351,6 +571,120 @@ def cmd_rotate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_check(args: argparse.Namespace) -> int:
+    json_mode = bool(args.json)
+    registry_path = Path(args.registry).expanduser()
+    retry_seconds = int(args.retry_seconds or 1800)
+    timeout_seconds = int(args.timeout or 45)
+    try:
+        registry = load_registry(registry_path)
+        row = find_token(registry, args.id)
+        if row is None:
+            raise ValueError(f"unknown token id: {args.id}")
+        token = str(row.get("token") or "")
+        validate_token(token)
+        probe = probe_claude_token(token, timeout_seconds)
+        update_row_from_probe(
+            row,
+            probe,
+            enable_on_ok=bool(args.enable_on_ok),
+            disable_on_quota=bool(args.disable_on_quota),
+            retry_seconds=retry_seconds,
+        )
+        save_registry(registry_path, registry)
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+
+    active_id = str(registry.get("active_token_id") or "")
+    payload = {
+        "status": str(probe.get("status") or "failed"),
+        "id": args.id,
+        "active_token_id": active_id,
+        "api_error_status": str(probe.get("api_error_status") or ""),
+        "reset_at": str(probe.get("reset_at") or ""),
+        "token": public_token_row(row, active_id),
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        reset = f" reset_at={payload['reset_at']}" if payload["reset_at"] else ""
+        print(f"{payload['status']}: {args.id}{reset}")
+    return 0
+
+
+def cmd_recover_due(args: argparse.Namespace) -> int:
+    json_mode = bool(args.json)
+    registry_path = Path(args.registry).expanduser()
+    retry_seconds = int(args.retry_seconds or 1800)
+    timeout_seconds = int(args.timeout or 45)
+    reference = now_utc()
+    checked: list[dict[str, Any]] = []
+    recovered: list[str] = []
+    still_disabled: list[str] = []
+    try:
+        registry = load_registry(registry_path)
+        active_id = str(registry.get("active_token_id") or "")
+        candidates = [row for row in token_rows(registry) if quota_recheck_due(row, reference)]
+        for row in candidates:
+            token_id = str(row.get("id") or "")
+            token = str(row.get("token") or "")
+            if not token_id or not token:
+                continue
+            validate_token(token)
+            probe = probe_claude_token(token, timeout_seconds)
+            update_row_from_probe(
+                row,
+                probe,
+                enable_on_ok=True,
+                disable_on_quota=True,
+                retry_seconds=retry_seconds,
+            )
+            status = str(probe.get("status") or "failed")
+            reset_at = str(probe.get("reset_at") or "")
+            checked.append(
+                {
+                    "id": token_id,
+                    "status": status,
+                    "api_error_status": str(probe.get("api_error_status") or ""),
+                    "reset_at": reset_at,
+                    "enabled": bool(row.get("enabled", True)),
+                }
+            )
+            if status == "available" and bool(row.get("enabled", True)):
+                recovered.append(token_id)
+            elif not bool(row.get("enabled", True)):
+                still_disabled.append(token_id)
+        if checked:
+            registry["last_recovery_check"] = {
+                "checked_at": now_iso(),
+                "checked_count": len(checked),
+                "recovered_count": len(recovered),
+            }
+            save_registry(registry_path, registry)
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+
+    payload = {
+        "status": "ok" if checked else "skipped",
+        "reason": "" if checked else "no_due_tokens",
+        "active_token_id": registry.get("active_token_id") or "",
+        "checked_count": len(checked),
+        "recovered_count": len(recovered),
+        "still_disabled_count": len(still_disabled),
+        "recovered": recovered,
+        "checked": checked,
+        "sync_recommended": active_id in recovered,
+    }
+    if json_mode:
+        json_dump(payload)
+    else:
+        if checked:
+            print(f"checked={len(checked)} recovered={len(recovered)} still_disabled={len(still_disabled)}")
+        else:
+            print("skipped: no_due_tokens")
+    return 0
+
+
 def cmd_auto_rotate(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
@@ -492,6 +826,21 @@ def build_parser() -> argparse.ArgumentParser:
     rotate_parser.add_argument("--agents", help=argparse.SUPPRESS)
     rotate_parser.add_argument("--json", action="store_true")
     rotate_parser.set_defaults(handler=cmd_rotate)
+
+    check_parser = sub.add_parser("check")
+    check_parser.add_argument("id")
+    check_parser.add_argument("--enable-on-ok", action="store_true")
+    check_parser.add_argument("--disable-on-quota", action="store_true")
+    check_parser.add_argument("--timeout", type=int, default=45)
+    check_parser.add_argument("--retry-seconds", type=int, default=1800)
+    check_parser.add_argument("--json", action="store_true")
+    check_parser.set_defaults(handler=cmd_check)
+
+    recover_parser = sub.add_parser("recover-due")
+    recover_parser.add_argument("--timeout", type=int, default=45)
+    recover_parser.add_argument("--retry-seconds", type=int, default=1800)
+    recover_parser.add_argument("--json", action="store_true")
+    recover_parser.set_defaults(handler=cmd_recover_due)
 
     auto_parser = sub.add_parser("auto-rotate")
     auto_parser.add_argument("action", choices=("enable", "disable", "status"))
