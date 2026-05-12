@@ -203,6 +203,7 @@ Usage:
   $CLI_NAME handoff <task-id> --to <agent> [--from <agent>] [--note <text> | --note-file <path>]
   $CLI_NAME summary [agent...]
   $CLI_NAME worktree list
+  $CLI_NAME worktree doctor [--dry-run|--apply] [--max-age-days N] [--target-branch ref] [--include-stale] [--prune-branches]
   $CLI_NAME profile status [agent|--all]
   $CLI_NAME profile diff <agent>
   $CLI_NAME profile deploy <agent> [--dry-run] [--force]
@@ -1060,6 +1061,11 @@ EOF
             bridge_die "Usage: $CLI_NAME worktree list"
           fi
           bridge_list_worktrees
+          exit 0
+          ;;
+        doctor)
+          shift
+          bridge_worktree_doctor "$@"
           exit 0
           ;;
         *)

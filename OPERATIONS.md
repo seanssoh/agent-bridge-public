@@ -387,6 +387,15 @@ Managed worktrees live under:
 ~/.agent-bridge/worktrees/<repo-slug>/<agent>
 ```
 
+Stale fixer worktrees accumulated under `<repo>/.claude/worktrees/agent-*` (or
+`ab-*`) can be reaped safely with `agb worktree doctor`. The doctor classifies
+each fixer-style worktree as REMOVE (branch merged into `main`), STALE
+(unmerged but >14 days old), SKIP (stash entries present — refs/stash is shared
+across worktrees, so we never remove when a stash is in flight), or KEEP.
+Default is `--dry-run`; pass `--apply` to actually run `git worktree remove
+-f`. See `agb worktree doctor --help` for `--target-branch`, `--max-age-days`,
+`--include-stale`, and `--prune-branches`.
+
 ## Status And Debugging
 
 Use these first:

@@ -155,6 +155,305 @@ bridge_list_worktrees() {
   fi
 }
 
+# bridge_worktree_doctor — reap stale .claude/worktrees/<agent-*|ab-*> worktrees.
+#
+# Scans `git worktree list --porcelain` from the current repo and classifies each
+# fixer-style worktree (matching the `.claude/worktrees/agent-*` or
+# `.claude/worktrees/ab-*` pattern) into one of:
+#
+#   REMOVE  — branch is merged into the target branch (default `main`) AND the
+#             worktree has no stash entries.
+#   STALE   — branch is NOT merged but its last commit is older than
+#             --max-age-days (default 14). Reported but only removed under
+#             --apply --include-stale (operator opts in twice).
+#   SKIP    — worktree has 1+ stash entries. Refuse to touch (shared
+#             .git/refs/stash means popping in the wrong worktree can pull
+#             another lane's WIP — see feedback_worktree_stash_shared_git_dir).
+#   KEEP    — branch unmerged AND last commit is recent. Untouched.
+#
+# Default is --dry-run: prints the classification table and would-be actions.
+# --apply actually runs `git worktree remove -f <path>`. --prune-branches also
+# deletes the local branch ref via `git branch -D` once the worktree is gone.
+#
+# Stash safety is checked from the WORKTREE'S directory (`git -C <wt> stash list`).
+# Because all worktrees in a repo share refs/stash, the count seen there is the
+# global count; we treat any non-zero as "skip" rather than guessing ownership.
+#
+# Args: doctor [--dry-run] [--apply] [--max-age-days N] [--target-branch ref]
+#              [--include-stale] [--prune-branches] [--repo PATH]
+bridge_worktree_doctor() {
+  local mode="dry-run"
+  local max_age_days=14
+  local target_branch="main"
+  local include_stale=0
+  local prune_branches=0
+  local repo_root=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run)
+        mode="dry-run"
+        shift
+        ;;
+      --apply)
+        mode="apply"
+        shift
+        ;;
+      --max-age-days)
+        [[ $# -lt 2 ]] && bridge_die "--max-age-days 뒤에 숫자를 지정하세요."
+        if [[ ! "$2" =~ ^[0-9]+$ ]]; then
+          bridge_die "--max-age-days 값은 정수여야 합니다: $2"
+        fi
+        max_age_days="$2"
+        shift 2
+        ;;
+      --target-branch)
+        [[ $# -lt 2 ]] && bridge_die "--target-branch 뒤에 ref 이름을 지정하세요."
+        target_branch="$2"
+        shift 2
+        ;;
+      --include-stale)
+        include_stale=1
+        shift
+        ;;
+      --prune-branches)
+        prune_branches=1
+        shift
+        ;;
+      --repo)
+        [[ $# -lt 2 ]] && bridge_die "--repo 뒤에 경로를 지정하세요."
+        repo_root="$2"
+        shift 2
+        ;;
+      -h|--help)
+        cat <<'USAGE'
+Usage:
+  agent-bridge worktree doctor [--dry-run|--apply]
+                               [--max-age-days N] [--target-branch ref]
+                               [--include-stale] [--prune-branches]
+                               [--repo PATH]
+
+Reap stale .claude/worktrees/(agent-*|ab-*) worktrees safely.
+
+  --dry-run         (default) print classification + intended actions only
+  --apply           actually run `git worktree remove -f` on REMOVE rows
+  --max-age-days N  STALE threshold for unmerged branches (default: 14)
+  --target-branch R branch to test "merged into" against (default: main)
+  --include-stale   also remove STALE rows under --apply (operator opts in)
+  --prune-branches  also delete the local branch ref via `git branch -D`
+  --repo PATH       repo root to inspect (default: current working directory)
+
+Stash safety: any worktree with `git stash list` non-empty is SKIPped — the
+shared refs/stash store across worktrees means removing one can orphan stash
+refs that another lane might pop and inadvertently mix in WIP.
+USAGE
+        return 0
+        ;;
+      *)
+        bridge_die "지원하지 않는 doctor 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  if [[ -z "$repo_root" ]]; then
+    repo_root="$(pwd -P)"
+  fi
+  if ! repo_root="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)"; then
+    bridge_die "현재 경로는 git 저장소가 아닙니다: ${repo_root:-$(pwd -P)}"
+  fi
+
+  local porcelain
+  if ! porcelain="$(git -C "$repo_root" worktree list --porcelain 2>/dev/null)"; then
+    bridge_die "git worktree list 실행 실패: $repo_root"
+  fi
+
+  local now_epoch
+  now_epoch="$(date +%s)"
+  local age_threshold_secs=$(( max_age_days * 86400 ))
+
+  # Counters for summary — read/written by _bridge_worktree_doctor_classify_one
+  # via Bash dynamic scope (intentional: keeps the porcelain parse loop simple).
+  local total_scanned=0
+  local n_remove=0
+  local n_stale=0
+  local n_skip=0
+  local n_keep=0
+  local n_removed=0
+  local n_remove_failed=0
+
+  # Iterate porcelain blocks. Each block starts with `worktree <path>` and
+  # ends at a blank line. Fields we care about: worktree, branch.
+  #
+  # NOTE: we deliberately use a temp-file fd redirection rather than a
+  # `<<<"$porcelain"` here-string or `done < <(printf ...)` process
+  # substitution. macOS Homebrew Bash 5.3.9 has a heredoc_write bug where
+  # write(2) into the parent's heredoc anon-pipe deadlocks when the body
+  # contains multiple `worktree`/`branch`/empty-line records — observed
+  # on this repo's own checkout (~152 fixer worktrees) and reproduced in
+  # the smoke fixture with 3 fixture worktrees plus merge commits. A
+  # temp file decouples the producer from the read loop entirely.
+  local porcelain_tmp
+  porcelain_tmp="$(mktemp -t bridge-worktree-doctor.XXXXXX)"
+  printf '%s\n' "$porcelain" >"$porcelain_tmp"
+
+  local wt_path="" wt_branch="" line
+  printf '%-7s | %-7s | %-7s | %s\n' "STATUS" "STASH" "AGE" "WORKTREE"
+  printf -- '--------+---------+---------+----------------------------------------\n'
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      "worktree "*)
+        wt_path="${line#worktree }"
+        wt_branch=""
+        ;;
+      "branch "*)
+        wt_branch="${line#branch }"
+        ;;
+      "")
+        if [[ -n "$wt_path" ]]; then
+          _bridge_worktree_doctor_classify_one \
+            "$repo_root" "$wt_path" "$wt_branch" \
+            "$target_branch" "$now_epoch" "$age_threshold_secs" \
+            "$mode" "$include_stale" "$prune_branches"
+        fi
+        wt_path=""
+        wt_branch=""
+        ;;
+    esac
+  done <"$porcelain_tmp"
+  rm -f "$porcelain_tmp"
+  # Trailing entry without blank line terminator.
+  if [[ -n "$wt_path" ]]; then
+    _bridge_worktree_doctor_classify_one \
+      "$repo_root" "$wt_path" "$wt_branch" \
+      "$target_branch" "$now_epoch" "$age_threshold_secs" \
+      "$mode" "$include_stale" "$prune_branches"
+  fi
+
+  echo ""
+  echo "Summary (mode=$mode, target-branch=$target_branch, max-age-days=$max_age_days):"
+  printf '  scanned    : %d\n' "$total_scanned"
+  printf '  REMOVE     : %d (merged into %s, no stash)\n' "$n_remove" "$target_branch"
+  printf '  STALE      : %d (unmerged, >%d days old)\n' "$n_stale" "$max_age_days"
+  printf '  SKIP       : %d (stash entries present)\n' "$n_skip"
+  printf '  KEEP       : %d (recent/unmerged)\n' "$n_keep"
+  if [[ "$mode" == "apply" ]]; then
+    printf '  removed    : %d\n' "$n_removed"
+    if (( n_remove_failed > 0 )); then
+      printf '  failed     : %d\n' "$n_remove_failed"
+    fi
+  else
+    echo "  (dry-run; rerun with --apply to actually remove REMOVE rows)"
+  fi
+}
+
+# Helper used only by bridge_worktree_doctor. Lives outside the main function
+# so the counter mutations stay in one place. Reads/writes the n_* and
+# total_scanned counters from the calling function's scope via Bash dynamic
+# scope.
+_bridge_worktree_doctor_classify_one() {
+  local repo_root="$1"
+  local wt_path="$2"
+  local wt_branch="$3"
+  local target_branch="$4"
+  local now_epoch="$5"
+  local age_threshold_secs="$6"
+  local mode="$7"
+  local include_stale="$8"
+  local prune_branches="$9"
+
+  # Match only fixer-style worktree paths: */.claude/worktrees/agent-*
+  # or */.claude/worktrees/ab-*. Operator's primary checkout and ad-hoc
+  # locations are NOT in scope — this is intentional, doctor is a focused
+  # reaper, not a general worktree cleaner.
+  if [[ "$wt_path" != *"/.claude/worktrees/agent-"* ]] \
+     && [[ "$wt_path" != *"/.claude/worktrees/ab-"* ]]; then
+    return 0
+  fi
+
+  total_scanned=$(( total_scanned + 1 ))
+
+  local short_branch=""
+  if [[ "$wt_branch" == refs/heads/* ]]; then
+    short_branch="${wt_branch#refs/heads/}"
+  else
+    short_branch="$wt_branch"
+  fi
+
+  # Stash safety check — count stash entries from inside the worktree.
+  # Best-effort: if `git -C <wt>` errors (worktree dir gone, locked refs),
+  # treat as 0 stash entries since there's nothing to lose.
+  local stash_count=0
+  if [[ -d "$wt_path" ]]; then
+    stash_count="$(git -C "$wt_path" stash list 2>/dev/null | wc -l | tr -d ' ')"
+    [[ -z "$stash_count" ]] && stash_count=0
+  fi
+
+  # Last commit age on the branch (epoch seconds). Fall back to 0 if the
+  # ref is gone — that itself is a signal the worktree is stale.
+  local last_commit_epoch=0
+  if [[ -n "$short_branch" ]]; then
+    last_commit_epoch="$(git -C "$repo_root" log -1 --format=%ct "$short_branch" 2>/dev/null || printf '0')"
+  fi
+  local age_secs=0
+  if [[ "$last_commit_epoch" =~ ^[0-9]+$ ]] && (( last_commit_epoch > 0 )); then
+    age_secs=$(( now_epoch - last_commit_epoch ))
+  fi
+  local age_days=$(( age_secs / 86400 ))
+
+  # Merged check: branch reachable from target_branch tip.
+  local is_merged=0
+  if [[ -n "$short_branch" ]]; then
+    if git -C "$repo_root" merge-base --is-ancestor "$short_branch" "$target_branch" 2>/dev/null; then
+      is_merged=1
+    fi
+  fi
+
+  local status="KEEP"
+  if (( stash_count > 0 )); then
+    status="SKIP"
+    n_skip=$(( n_skip + 1 ))
+  elif (( is_merged == 1 )); then
+    status="REMOVE"
+    n_remove=$(( n_remove + 1 ))
+  elif (( age_secs > age_threshold_secs )); then
+    status="STALE"
+    n_stale=$(( n_stale + 1 ))
+  else
+    status="KEEP"
+    n_keep=$(( n_keep + 1 ))
+  fi
+
+  printf '%-7s | %-7s | %3dd    | %s\n' \
+    "$status" "${stash_count}" "$age_days" "$wt_path"
+
+  if [[ "$mode" != "apply" ]]; then
+    return 0
+  fi
+
+  # Apply mode — REMOVE always, STALE only with --include-stale.
+  local should_remove=0
+  if [[ "$status" == "REMOVE" ]]; then
+    should_remove=1
+  elif [[ "$status" == "STALE" && "$include_stale" == "1" ]]; then
+    should_remove=1
+  fi
+
+  if (( should_remove == 1 )); then
+    if git -C "$repo_root" worktree remove -f "$wt_path" >/dev/null 2>&1; then
+      n_removed=$(( n_removed + 1 ))
+      printf '         [apply] removed: %s\n' "$wt_path"
+      if [[ "$prune_branches" == "1" && -n "$short_branch" ]]; then
+        if git -C "$repo_root" branch -D "$short_branch" >/dev/null 2>&1; then
+          printf '         [apply] deleted branch: %s\n' "$short_branch"
+        fi
+      fi
+    else
+      n_remove_failed=$(( n_remove_failed + 1 ))
+      printf '         [apply] FAILED to remove: %s\n' "$wt_path" >&2
+    fi
+  fi
+}
+
 bridge_static_agents_for_project_engine() {
   local project_root="$1"
   local engine="$2"
