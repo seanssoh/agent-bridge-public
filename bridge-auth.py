@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -11,9 +13,11 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 REGISTRY_VERSION = 1
@@ -183,6 +187,80 @@ def save_registry(path: Path, payload: dict[str, Any]) -> None:
                 os.unlink(tmp_name)
             except FileNotFoundError:
                 pass
+
+
+REGISTRY_LOCK_SUFFIX = ".lock"
+REGISTRY_LOCK_DEFAULT_TIMEOUT_SECONDS = 30
+
+
+@contextmanager
+def registry_lock(
+    registry_path: Path,
+    *,
+    timeout_seconds: int = REGISTRY_LOCK_DEFAULT_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Inter-process exclusive lock for the token registry.
+
+    PR #799 r2 codex finding 3 — every mutating cmd_* path performs a
+    read-modify-write (``load_registry`` -> mutate -> ``save_registry``).
+    Concurrent invocations (e.g. the daemon's rotate loop racing an
+    operator ``activate`` or the recovery probe re-persisting state)
+    can drop one writer's changes because ``save_registry`` uses
+    ``os.replace`` for atomicity but not concurrency.
+
+    Implementation notes:
+    - Uses ``fcntl.flock`` on a sibling ``.lock`` file (Linux + macOS
+      both honor it; the registry tree is POSIX-only).
+    - ``flock`` has no native timeout, so we poll non-blockingly until
+      ``timeout_seconds`` elapses to avoid an unbounded blocker.
+    - The lock guards the load->mutate->save critical section ONLY.
+      Slow operations (``probe_claude_token``, a 45 s network call)
+      MUST be lifted OUT of the lock by reading state under the lock,
+      releasing, probing, then re-acquiring to persist results — see
+      ``cmd_recover_due`` for the canonical pattern.
+    """
+    registry_path = Path(registry_path).expanduser()
+    lock_path = registry_path.with_suffix(
+        registry_path.suffix + REGISTRY_LOCK_SUFFIX
+    )
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # Open the lock file with O_RDWR | O_CREAT so flock owns a real fd
+    # even on a fresh registry tree. 0o600 keeps the sibling restricted
+    # to the operator UID, matching the registry file itself.
+    fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    acquired = False
+    try:
+        deadline = time.monotonic() + max(1, int(timeout_seconds))
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                pass
+            except OSError as exc:
+                # EWOULDBLOCK comes through as BlockingIOError on
+                # Python 3.3+, but some old kernels surface EACCES on
+                # the very first non-blocking attempt. Treat both as
+                # transient, anything else fails fast.
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                    raise
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"registry_lock timeout after {timeout_seconds}s on {lock_path}"
+                )
+            time.sleep(0.1)
+        yield
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def token_rows(registry: dict[str, Any]) -> list[dict[str, Any]]:
@@ -415,44 +493,49 @@ def quota_recheck_due(row: dict[str, Any], reference: datetime) -> bool:
 def cmd_add(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
+    # PR #799 r2 codex finding 3 — ``read_token`` reads --stdin /
+    # --token-file and does no IO on the registry. Validate it OUTSIDE
+    # the lock so the critical section stays narrow.
     try:
         validate_token_id(args.id)
         token = read_token(args)
-        registry = load_registry(registry_path)
     except Exception as exc:
         return fail(str(exc), json_mode)
 
-    rows = token_rows(registry)
-    existing = find_token(registry, args.id)
-    timestamp = now_iso()
-    row = {
-        "id": args.id,
-        "token": token,
-        "enabled": True,
-        "created_at": timestamp,
-        "updated_at": timestamp,
-        "last_activated_at": "",
-        "note": args.note or "",
-    }
-    if existing is not None:
-        if not args.replace:
-            return fail(f"token id already exists: {args.id}", json_mode)
-        row["created_at"] = existing.get("created_at") or timestamp
-        row["last_activated_at"] = existing.get("last_activated_at") or ""
-        rows[rows.index(existing)] = row
-    else:
-        rows.append(row)
-
-    if args.activate or not registry.get("active_token_id"):
-        registry["active_token_id"] = args.id
-        row["last_activated_at"] = timestamp
-    if args.enable_auto_rotate:
-        registry["auto_rotate_enabled"] = True
-    if args.threshold is not None:
-        registry["rotation_threshold"] = validate_threshold(args.threshold)
-
     try:
-        save_registry(registry_path, registry)
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+
+            rows = token_rows(registry)
+            existing = find_token(registry, args.id)
+            timestamp = now_iso()
+            row = {
+                "id": args.id,
+                "token": token,
+                "enabled": True,
+                "created_at": timestamp,
+                "updated_at": timestamp,
+                "last_activated_at": "",
+                "note": args.note or "",
+            }
+            if existing is not None:
+                if not args.replace:
+                    return fail(f"token id already exists: {args.id}", json_mode)
+                row["created_at"] = existing.get("created_at") or timestamp
+                row["last_activated_at"] = existing.get("last_activated_at") or ""
+                rows[rows.index(existing)] = row
+            else:
+                rows.append(row)
+
+            if args.activate or not registry.get("active_token_id"):
+                registry["active_token_id"] = args.id
+                row["last_activated_at"] = timestamp
+            if args.enable_auto_rotate:
+                registry["auto_rotate_enabled"] = True
+            if args.threshold is not None:
+                registry["rotation_threshold"] = validate_threshold(args.threshold)
+
+            save_registry(registry_path, registry)
     except Exception as exc:
         return fail(str(exc), json_mode)
 
@@ -493,16 +576,18 @@ def cmd_list(args: argparse.Namespace) -> int:
 def cmd_activate(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
+    # PR #799 r2 codex finding 3 — registry lock around the load->mutate->save.
     try:
-        registry = load_registry(registry_path)
-        row = find_token(registry, args.id)
-        if row is None:
-            raise ValueError(f"unknown token id: {args.id}")
-        if not bool(row.get("enabled", True)):
-            raise ValueError(f"token id is disabled: {args.id}")
-        registry["active_token_id"] = args.id
-        row["last_activated_at"] = now_iso()
-        save_registry(registry_path, registry)
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            row = find_token(registry, args.id)
+            if row is None:
+                raise ValueError(f"unknown token id: {args.id}")
+            if not bool(row.get("enabled", True)):
+                raise ValueError(f"token id is disabled: {args.id}")
+            registry["active_token_id"] = args.id
+            row["last_activated_at"] = now_iso()
+            save_registry(registry_path, registry)
     except Exception as exc:
         return fail(str(exc), json_mode)
     payload = {
@@ -520,43 +605,52 @@ def cmd_activate(args: argparse.Namespace) -> int:
 def cmd_rotate(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
+    # PR #799 r2 codex finding 3 — registry lock around the load->mutate->save.
+    old_id = ""
+    new_id = ""
+    row: dict[str, Any] | None = None
+    skipped_payload: dict[str, Any] | None = None
     try:
-        registry = load_registry(registry_path)
-        if args.if_auto_enabled and not bool(registry.get("auto_rotate_enabled", False)):
-            payload = {"status": "skipped", "reason": "auto_rotate_disabled"}
-            if json_mode:
-                json_dump(payload)
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            if args.if_auto_enabled and not bool(registry.get("auto_rotate_enabled", False)):
+                skipped_payload = {"status": "skipped", "reason": "auto_rotate_disabled"}
             else:
-                print("skipped: auto_rotate_disabled")
-            return 0
-        ids = enabled_token_ids(registry)
-        if len(ids) < 2:
-            payload = {"status": "skipped", "reason": "no_alternate_token", "active_token_id": registry.get("active_token_id") or ""}
-            if json_mode:
-                json_dump(payload)
-            else:
-                print("skipped: no_alternate_token")
-            return 0
-        old_id = str(registry.get("active_token_id") or "")
-        if old_id not in ids:
-            new_id = ids[0]
-        else:
-            new_id = ids[(ids.index(old_id) + 1) % len(ids)]
-        row = find_token(registry, new_id)
-        if row is None:
-            raise ValueError(f"rotation selected missing token id: {new_id}")
-        timestamp = now_iso()
-        registry["active_token_id"] = new_id
-        row["last_activated_at"] = timestamp
-        registry["last_rotation"] = {
-            "rotated_at": timestamp,
-            "from": old_id,
-            "to": new_id,
-            "reason": args.reason or "",
-        }
-        save_registry(registry_path, registry)
+                ids = enabled_token_ids(registry)
+                if len(ids) < 2:
+                    skipped_payload = {
+                        "status": "skipped",
+                        "reason": "no_alternate_token",
+                        "active_token_id": registry.get("active_token_id") or "",
+                    }
+                else:
+                    old_id = str(registry.get("active_token_id") or "")
+                    if old_id not in ids:
+                        new_id = ids[0]
+                    else:
+                        new_id = ids[(ids.index(old_id) + 1) % len(ids)]
+                    row = find_token(registry, new_id)
+                    if row is None:
+                        raise ValueError(f"rotation selected missing token id: {new_id}")
+                    timestamp = now_iso()
+                    registry["active_token_id"] = new_id
+                    row["last_activated_at"] = timestamp
+                    registry["last_rotation"] = {
+                        "rotated_at": timestamp,
+                        "from": old_id,
+                        "to": new_id,
+                        "reason": args.reason or "",
+                    }
+                    save_registry(registry_path, registry)
     except Exception as exc:
         return fail(str(exc), json_mode)
+
+    if skipped_payload is not None:
+        if json_mode:
+            json_dump(skipped_payload)
+        else:
+            print(f"skipped: {skipped_payload['reason']}")
+        return 0
     payload = {
         "status": "rotated",
         "old_active_token_id": old_id,
@@ -576,22 +670,39 @@ def cmd_check(args: argparse.Namespace) -> int:
     registry_path = Path(args.registry).expanduser()
     retry_seconds = int(args.retry_seconds or 1800)
     timeout_seconds = int(args.timeout or 45)
+    # PR #799 r2 codex finding 3 — split into a locked read, an
+    # unlocked probe (45 s network op), and a locked persist. Holding
+    # the lock across ``probe_claude_token`` would block every other
+    # registry mutation (the daemon's rotate loop, operator activate,
+    # recovery sweep) for the duration of the network call.
     try:
-        registry = load_registry(registry_path)
-        row = find_token(registry, args.id)
-        if row is None:
-            raise ValueError(f"unknown token id: {args.id}")
-        token = str(row.get("token") or "")
-        validate_token(token)
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            row = find_token(registry, args.id)
+            if row is None:
+                raise ValueError(f"unknown token id: {args.id}")
+            token = str(row.get("token") or "")
+            validate_token(token)
+
         probe = probe_claude_token(token, timeout_seconds)
-        update_row_from_probe(
-            row,
-            probe,
-            enable_on_ok=bool(args.enable_on_ok),
-            disable_on_quota=bool(args.disable_on_quota),
-            retry_seconds=retry_seconds,
-        )
-        save_registry(registry_path, registry)
+
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            row = find_token(registry, args.id)
+            if row is None:
+                # Token was deleted between the probe and the persist.
+                # Surface the probe result without persisting; the
+                # caller will see the result but no row update.
+                pass
+            else:
+                update_row_from_probe(
+                    row,
+                    probe,
+                    enable_on_ok=bool(args.enable_on_ok),
+                    disable_on_quota=bool(args.disable_on_quota),
+                    retry_seconds=retry_seconds,
+                )
+                save_registry(registry_path, registry)
     except Exception as exc:
         return fail(str(exc), json_mode)
 
@@ -602,7 +713,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         "active_token_id": active_id,
         "api_error_status": str(probe.get("api_error_status") or ""),
         "reset_at": str(probe.get("reset_at") or ""),
-        "token": public_token_row(row, active_id),
+        "token": public_token_row(row, active_id) if row is not None else {},
     }
     if json_mode:
         json_dump(payload)
@@ -621,53 +732,85 @@ def cmd_recover_due(args: argparse.Namespace) -> int:
     checked: list[dict[str, Any]] = []
     recovered: list[str] = []
     still_disabled: list[str] = []
+    active_id = ""
+    # PR #799 r2 codex finding 3 — split into THREE phases:
+    #   1. Locked read: snapshot candidates and the active_token_id.
+    #   2. Unlocked probes: ``probe_claude_token`` is a 45 s network
+    #      op per token; holding the lock across the entire recovery
+    #      sweep would freeze every other registry mutation for
+    #      minutes when several tokens are due at once.
+    #   3. Locked persist: re-read the registry (another mutator may
+    #      have run in between), re-match by token id, apply the
+    #      probe result, save.
+    # If a token has been deleted mid-probe the re-match returns
+    # ``None`` and we skip cleanly — no row update, no error.
     try:
-        registry = load_registry(registry_path)
-        active_id = str(registry.get("active_token_id") or "")
-        candidates = [row for row in token_rows(registry) if quota_recheck_due(row, reference)]
-        for row in candidates:
-            token_id = str(row.get("id") or "")
-            token = str(row.get("token") or "")
-            if not token_id or not token:
-                continue
+        with registry_lock(registry_path):
+            registry = load_registry(registry_path)
+            active_id = str(registry.get("active_token_id") or "")
+            snapshots: list[dict[str, Any]] = []
+            for row in token_rows(registry):
+                if not quota_recheck_due(row, reference):
+                    continue
+                token_id = str(row.get("id") or "")
+                token = str(row.get("token") or "")
+                if not token_id or not token:
+                    continue
+                snapshots.append({"id": token_id, "token": token})
+
+        probes: list[tuple[str, dict[str, Any]]] = []
+        for snap in snapshots:
+            token = snap["token"]
             validate_token(token)
             probe = probe_claude_token(token, timeout_seconds)
-            update_row_from_probe(
-                row,
-                probe,
-                enable_on_ok=True,
-                disable_on_quota=True,
-                retry_seconds=retry_seconds,
-            )
-            status = str(probe.get("status") or "failed")
-            reset_at = str(probe.get("reset_at") or "")
-            checked.append(
-                {
-                    "id": token_id,
-                    "status": status,
-                    "api_error_status": str(probe.get("api_error_status") or ""),
-                    "reset_at": reset_at,
-                    "enabled": bool(row.get("enabled", True)),
-                }
-            )
-            if status == "available" and bool(row.get("enabled", True)):
-                recovered.append(token_id)
-            elif not bool(row.get("enabled", True)):
-                still_disabled.append(token_id)
-        if checked:
-            registry["last_recovery_check"] = {
-                "checked_at": now_iso(),
-                "checked_count": len(checked),
-                "recovered_count": len(recovered),
-            }
-            save_registry(registry_path, registry)
+            probes.append((snap["id"], probe))
+
+        if probes:
+            with registry_lock(registry_path):
+                registry = load_registry(registry_path)
+                active_id = str(registry.get("active_token_id") or "")
+                for token_id, probe in probes:
+                    row = find_token(registry, token_id)
+                    if row is None:
+                        # Token was deleted between the probe and the
+                        # persist phase — drop it from the report.
+                        continue
+                    update_row_from_probe(
+                        row,
+                        probe,
+                        enable_on_ok=True,
+                        disable_on_quota=True,
+                        retry_seconds=retry_seconds,
+                    )
+                    status = str(probe.get("status") or "failed")
+                    reset_at = str(probe.get("reset_at") or "")
+                    checked.append(
+                        {
+                            "id": token_id,
+                            "status": status,
+                            "api_error_status": str(probe.get("api_error_status") or ""),
+                            "reset_at": reset_at,
+                            "enabled": bool(row.get("enabled", True)),
+                        }
+                    )
+                    if status == "available" and bool(row.get("enabled", True)):
+                        recovered.append(token_id)
+                    elif not bool(row.get("enabled", True)):
+                        still_disabled.append(token_id)
+                if checked:
+                    registry["last_recovery_check"] = {
+                        "checked_at": now_iso(),
+                        "checked_count": len(checked),
+                        "recovered_count": len(recovered),
+                    }
+                    save_registry(registry_path, registry)
     except Exception as exc:
         return fail(str(exc), json_mode)
 
     payload = {
         "status": "ok" if checked else "skipped",
         "reason": "" if checked else "no_due_tokens",
-        "active_token_id": registry.get("active_token_id") or "",
+        "active_token_id": active_id,
         "checked_count": len(checked),
         "recovered_count": len(recovered),
         "still_disabled_count": len(still_disabled),
@@ -688,17 +831,23 @@ def cmd_recover_due(args: argparse.Namespace) -> int:
 def cmd_auto_rotate(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     registry_path = Path(args.registry).expanduser()
+    # PR #799 r2 codex finding 3 — ``status`` is a pure read and stays
+    # outside the lock. ``enable`` and ``disable`` mutate the registry
+    # and need the lock around their load->mutate->save.
     try:
-        registry = load_registry(registry_path)
-        if args.action == "enable":
-            registry["auto_rotate_enabled"] = True
-            if args.threshold is not None:
-                registry["rotation_threshold"] = validate_threshold(args.threshold)
-            save_registry(registry_path, registry)
-        elif args.action == "disable":
-            registry["auto_rotate_enabled"] = False
-            save_registry(registry_path, registry)
-        elif args.action != "status":
+        if args.action in ("enable", "disable"):
+            with registry_lock(registry_path):
+                registry = load_registry(registry_path)
+                if args.action == "enable":
+                    registry["auto_rotate_enabled"] = True
+                    if args.threshold is not None:
+                        registry["rotation_threshold"] = validate_threshold(args.threshold)
+                else:
+                    registry["auto_rotate_enabled"] = False
+                save_registry(registry_path, registry)
+        elif args.action == "status":
+            registry = load_registry(registry_path)
+        else:
             raise ValueError(f"unsupported auto-rotate action: {args.action}")
     except Exception as exc:
         return fail(str(exc), json_mode)

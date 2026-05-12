@@ -194,3 +194,77 @@ SHELL_MONITOR="$(
 )"
 json_assert "usage shell registry threshold" "$SHELL_MONITOR" "len(payload['rotation_candidates']) == 1 and payload['rotation_candidates'][0]['rotation_threshold'] == 98.0"
 pass "bridge-usage.sh reads registry rotation threshold"
+
+# PR #799 r2 codex finding 1 — tool-policy.py pretool gate must deny:
+#   A. raw Bash text that dereferences $CLAUDE_CODE_OAUTH_TOKEN,
+#   B. raw Bash text that mentions the launch-secrets.env filename, and
+#   C. raw Bash text or Read input that targets the token registry JSON.
+# The credential deny reason is `CLAUDE_CREDENTIAL_DENY_REASON`, which
+# contains the literal "Claude OAuth credentials".
+
+run_pretool_bash() {
+  # run_pretool_bash <bash command>
+  local cmd="$1"
+  local payload
+  payload=$("$PYTHON" - "$cmd" <<'PY'
+import json
+import sys
+print(json.dumps({
+    "hook_event_name": "PreToolUse",
+    "tool_name": "Bash",
+    "tool_use_id": "pr799-r2-smoke",
+    "session_id": "pr799-r2-smoke-session",
+    "tool_input": {"command": sys.argv[1]},
+}))
+PY
+)
+  BRIDGE_AGENT_ID="$AGENT" \
+    BRIDGE_HOME="$BRIDGE_HOME" \
+    BRIDGE_ADMIN_AGENT_ID="$AGENT" \
+    "$PYTHON" "$REPO_ROOT/hooks/tool-policy.py" <<<"$payload"
+}
+
+DENY_OUT="$(run_pretool_bash 'printf %s "$CLAUDE_CODE_OAUTH_TOKEN"')"
+[[ "$DENY_OUT" == *'"permissionDecision":"deny"'* || "$DENY_OUT" == *'"permissionDecision": "deny"'* ]] || fail "env-deref pretool did not deny: $DENY_OUT"
+[[ "$DENY_OUT" == *'Claude OAuth credentials'* ]] || fail "env-deref deny reason missing credential phrase: $DENY_OUT"
+pass "pretool denies \$CLAUDE_CODE_OAUTH_TOKEN deref"
+
+DENY_OUT="$(run_pretool_bash "cat $BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json")"
+[[ "$DENY_OUT" == *'"permissionDecision":"deny"'* || "$DENY_OUT" == *'"permissionDecision": "deny"'* ]] || fail "registry-path pretool did not deny: $DENY_OUT"
+[[ "$DENY_OUT" == *'Claude OAuth credentials'* ]] || fail "registry-path deny reason missing credential phrase: $DENY_OUT"
+pass "pretool denies registry JSON read"
+
+DENY_OUT="$(run_pretool_bash 'grep CLAUDE launch-secrets.env')"
+[[ "$DENY_OUT" == *'"permissionDecision":"deny"'* || "$DENY_OUT" == *'"permissionDecision": "deny"'* ]] || fail "launch-secrets.env pretool did not deny: $DENY_OUT"
+[[ "$DENY_OUT" == *'Claude OAuth credentials'* ]] || fail "launch-secrets.env deny reason missing credential phrase: $DENY_OUT"
+pass "pretool denies launch-secrets.env mention"
+
+# PR #799 r2 codex finding 3 — concurrent activate operations must not
+# corrupt the registry. With the fcntl-based registry_lock context
+# manager, one writer wins fully and the other waits, but neither
+# leaves a torn JSON or an undefined active_token_id.
+
+LOCK_REGISTRY="$BRIDGE_CLAUDE_TOKEN_REGISTRY"
+LOCK_A_OUT="$ROOT/lock-a.out"
+LOCK_B_OUT="$ROOT/lock-b.out"
+( "$REPO_ROOT/agent-bridge" auth claude-token activate first --json >"$LOCK_A_OUT" 2>&1 ) &
+PID_A=$!
+( "$REPO_ROOT/agent-bridge" auth claude-token activate second --json >"$LOCK_B_OUT" 2>&1 ) &
+PID_B=$!
+wait "$PID_A"
+wait "$PID_B"
+"$PYTHON" - "$LOCK_REGISTRY" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+data = json.loads(path.read_text(encoding="utf-8"))
+active = data.get("active_token_id")
+if active not in ("first", "second"):
+    raise SystemExit(f"lock-race: unexpected active_token_id={active!r}; registry={data!r}")
+ids = {row.get("id") for row in data.get("tokens", []) if isinstance(row, dict)}
+if "first" not in ids or "second" not in ids:
+    raise SystemExit(f"lock-race: missing tokens; ids={ids!r}")
+PY
+pass "concurrent activate is lock-serialized (no torn registry)"

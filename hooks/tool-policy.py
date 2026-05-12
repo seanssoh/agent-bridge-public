@@ -110,6 +110,18 @@ def claude_credential_paths() -> set[Path]:
     controller_home = _controller_home_dir()
     if controller_home is not None:
         paths.add(controller_home / ".claude" / ".credentials.json")
+    # PR #799 r2 codex finding 2 — the Claude OAuth token registry honors
+    # $BRIDGE_CLAUDE_TOKEN_REGISTRY (override) before falling back to
+    # $BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json (see
+    # bridge-auth.sh:27 bridge_auth_registry_path). Both surfaces must be
+    # denied so Read/Glob/Grep/Bash-by-path access mirrors the raw-text
+    # deny in `_raw_mentions_claude_credentials`.
+    registry_override = os.environ.get("BRIDGE_CLAUDE_TOKEN_REGISTRY", "").strip()
+    if registry_override:
+        paths.add(Path(registry_override).expanduser())
+    runtime_secrets = os.environ.get("BRIDGE_RUNTIME_SECRETS_DIR", "").strip()
+    if runtime_secrets:
+        paths.add(Path(runtime_secrets).expanduser() / "claude-oauth-tokens.json")
     return {_resolve_existing(path) for path in paths}
 
 
@@ -125,6 +137,23 @@ def _raw_mentions_claude_credentials(raw: str) -> bool:
     return (
         "sk-ant-o" in raw
         or (".credentials.json" in raw and ".claude" in raw)
+        # PR #799 r2 codex finding 1 — block env-var dereference of the
+        # active OAuth token. The token is exported into the launch
+        # subshell via launch-secrets.env and inherited by the agent;
+        # without this rule any agent can run
+        # `printf %s "$CLAUDE_CODE_OAUTH_TOKEN"` and leak it through
+        # tool output.
+        or "CLAUDE_CODE_OAUTH_TOKEN" in raw
+        # PR #799 r2 codex finding 1 — block `launch-secrets.env`
+        # mentions (defense-in-depth for any future env vars added to
+        # the same file).
+        or "launch-secrets.env" in raw
+        # PR #799 r2 codex finding 2 — block reads of the token
+        # registry JSON. The `claude_credential_paths()` set covers the
+        # canonical and override paths for path-typed inputs; this
+        # substring rule covers raw Bash text that names the file by
+        # basename or a relative path.
+        or "claude-oauth-tokens.json" in raw
     )
 
 
