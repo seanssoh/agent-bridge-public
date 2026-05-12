@@ -728,3 +728,83 @@ if grep -q 'bridge_auth_fix_credential_file_mode' "$REPO_ROOT/bridge-auth.sh"; t
   fail "no_post_write_chown_in_sync: bridge_auth_fix_credential_file_mode still referenced in bridge-auth.sh"
 fi
 pass "post-sync chown TOCTOU helper removed from sync hot path (no bridge_auth_fix_credential_file_mode)"
+
+# PR #799 r5 codex r4 — final-path chmod removed from write_private_file_atomic.
+# Codex r4 BLOCKING called out the post-replace ``os.chmod(path, mode)`` as the
+# last remaining final-path TOCTOU surface in ``write_private_file_atomic``. The
+# fix deletes that line — ``os.replace`` is ``rename(2)`` so the pre-replace
+# chmod on the tempfile is preserved through the rename, and no final-path op
+# is needed. The AST static check below regresses anyone re-introducing a
+# final-path chmod/chown outside the explicit allow-list:
+#   - tempfile pre-replace ops inside write_private_file_atomic (tmp_name)
+#   - save_registry (controller-owned home, agent-uncontrollable)
+#   - probe_claude_token (sandboxed tempfile.TemporaryDirectory)
+# Plain shell grep cannot determine the enclosing function for a line, so we
+# walk the bridge-auth.py AST and check (call-arg, enclosing-function) pairs.
+test_no_post_replace_chmod() {
+  local out
+  out=$("$PYTHON" - "$REPO_ROOT" <<'PY'
+import ast
+import sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+src = (repo / "bridge-auth.py").read_text(encoding="utf-8")
+tree = ast.parse(src)
+
+# Functions whose entire body is allowed to operate on final paths because
+# the caller surface is controller-owned (save_registry) or sandboxed
+# (probe_claude_token). write_private_file_atomic is allowed ONLY for
+# tempfile ops (tmp_name); a final-path chmod/chown inside it is the very
+# r5 regression this assertion guards.
+allowed_funcs = {"save_registry", "probe_claude_token"}
+wpfa_func = "write_private_file_atomic"
+
+func_spans = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.FunctionDef):
+        func_spans.append((node.lineno, node.end_lineno or node.lineno, node.name))
+
+def enclosing(lineno):
+    matches = [(lo, hi, name) for (lo, hi, name) in func_spans if lo <= lineno <= hi]
+    if not matches:
+        return None
+    # Innermost span = largest lo.
+    matches.sort(key=lambda t: t[0])
+    return matches[-1][2]
+
+violations = []
+for node in ast.walk(tree):
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+        continue
+    if node.func.attr not in ("chmod", "chown"):
+        continue
+    try:
+        arg = ast.unparse(node.args[0])
+    except Exception:
+        arg = "<complex>"
+    # Tempfile-style args are inherently safe.
+    if any(tok in arg for tok in ("tmp_name", "tmp_path", "tempfile", "config_path", "path.parent")):
+        continue
+    fn = enclosing(node.lineno)
+    if fn == wpfa_func:
+        violations.append(
+            f"line {node.lineno}: os.{node.func.attr}({arg}) - final-path op inside write_private_file_atomic (r5 regression)"
+        )
+    elif fn not in allowed_funcs:
+        violations.append(
+            f"line {node.lineno}: os.{node.func.attr}({arg}) - outside allow-list (save_registry/probe_claude_token/write_private_file_atomic tempfile); enclosing={fn}"
+        )
+
+for v in violations:
+    print(v)
+PY
+)
+  if [[ -n "$out" ]]; then
+    printf '[smoke][fail] no_post_replace_chmod: bridge-auth.py has unexpected final-path os.chmod/os.chown calls:\n%s\n' "$out" >&2
+    exit 1
+  fi
+  pass "no unguarded final-path os.chmod/os.chown in bridge-auth.py (write_private_file_atomic post-replace removed)"
+}
+
+test_no_post_replace_chmod

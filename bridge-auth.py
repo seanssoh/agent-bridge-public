@@ -1097,7 +1097,12 @@ def write_private_file_atomic(
             gid = owner_gid if owner_gid is not None else -1
             os.chown(tmp_name, owner_uid, gid)
         os.replace(tmp_name, path)
-        os.chmod(path, mode)
+        # r5 codex r4: removed redundant post-replace `os.chmod(path, mode)`.
+        # The tempfile was chmodded to `mode` at the line above before replace,
+        # and `os.replace` is `rename(2)` which preserves mode bits via
+        # inode rename. The post-replace chmod was defensive redundancy
+        # and the only remaining final-path TOCTOU surface in
+        # write_private_file_atomic.
     finally:
         if fd >= 0:
             os.close(fd)
