@@ -31,6 +31,7 @@ Bootstrap options:
   --skip-launchagent      Do not install/load the macOS LaunchAgent
   --skip-systemd          Do not install/enable the Linux systemd user unit
   --skip-liveness         Do not install the daemon liveness watcher (issue #265 D)
+  --skip-watchdog-silence Do not install the silence watchdog OS unit (issue #800 C)
   --dry-run
   --json
 
@@ -50,6 +51,7 @@ skip_daemon=0
 skip_launchagent=0
 skip_systemd=0
 skip_liveness=0
+skip_watchdog_silence=0
 dry_run=0
 json_mode=0
 init_args=()
@@ -84,6 +86,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-liveness)
       skip_liveness=1
+      shift
+      ;;
+    --skip-watchdog-silence)
+      skip_watchdog_silence=1
       shift
       ;;
     --dry-run)
@@ -131,6 +137,7 @@ daemon_status="skipped"
 launchagent_status="skipped"
 systemd_status="skipped"
 liveness_status="skipped"
+watchdog_silence_status="skipped"
 next_command="agb admin"
 reload_command="source \"$bootstrap_rcfile\" || export PATH=\"\$HOME/.agent-bridge:\$PATH\""
 bootstrap_os="${BRIDGE_BOOTSTRAP_OS:-$(uname -s)}"
@@ -213,8 +220,52 @@ if [[ $skip_liveness -eq 0 ]]; then
   esac
 fi
 
+# Issue #800 Track C: install the silence-watchdog OS unit alongside the
+# liveness watcher. The two are sibling recovery layers — liveness checks
+# the heartbeat-file mtime on a timer, silence-watchdog reads audit `ts`
+# columns from the log and stop+starts the daemon when no tick has been
+# written in the threshold window. Both must be canonical OS-managed
+# processes; ad-hoc launches from test sessions / worktrees were what
+# the issue documented as the recurring failure mode.
+if [[ $skip_watchdog_silence -eq 0 ]]; then
+  case "$bootstrap_os" in
+    Darwin)
+      if [[ $skip_launchagent -eq 1 ]]; then
+        watchdog_silence_status="skipped"
+      else
+        watchdog_silence_status="planned"
+        if [[ $dry_run -eq 0 ]]; then
+          "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/install-watchdog-silence-launchagent.sh" --apply --load >/dev/null
+          watchdog_silence_status="loaded"
+        fi
+      fi
+      ;;
+    Linux)
+      if [[ $skip_systemd -eq 1 ]]; then
+        watchdog_silence_status="skipped"
+      else
+        watchdog_silence_status="planned"
+        if [[ $dry_run -eq 0 ]]; then
+          "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/install-watchdog-silence-systemd.sh" --apply --enable >/dev/null
+          watchdog_silence_status="enabled"
+        fi
+      fi
+      ;;
+    *)
+      watchdog_silence_status="unsupported"
+      ;;
+  esac
+
+  # Cleanup orphan watchdog instances left behind by prior test sessions
+  # before launchd/systemd kickstart claims the canonical slot. This is
+  # idempotent — a fresh install with nothing to clean is a no-op.
+  if [[ $dry_run -eq 0 && -f "$SCRIPT_DIR/bridge-watchdog-silence.py" ]]; then
+    python3 "$SCRIPT_DIR/bridge-watchdog-silence.py" cleanup-orphans >/dev/null 2>&1 || true
+  fi
+fi
+
 if [[ $json_mode -eq 1 ]]; then
-  python3 - "$init_json" "$shell_status" "$bootstrap_shell" "$bootstrap_rcfile" "$daemon_status" "$launchagent_status" "$systemd_status" "$next_command" "$reload_command" "$liveness_status" <<'PY'
+  python3 - "$init_json" "$shell_status" "$bootstrap_shell" "$bootstrap_rcfile" "$daemon_status" "$launchagent_status" "$systemd_status" "$next_command" "$reload_command" "$liveness_status" "$watchdog_silence_status" <<'PY'
 import json
 import sys
 
@@ -231,6 +282,7 @@ payload = {
     "launchagent": {"status": sys.argv[6]},
     "systemd": {"status": sys.argv[7]},
     "liveness": {"status": sys.argv[10]},
+    "watchdog_silence": {"status": sys.argv[11]},
     "next_command": sys.argv[8],
     "reload_command": sys.argv[9],
     "handoff_steps": [
@@ -258,6 +310,7 @@ printf 'daemon: %s\n' "$daemon_status"
 printf 'launchagent: %s\n' "$launchagent_status"
 printf 'systemd: %s\n' "$systemd_status"
 printf 'liveness: %s\n' "$liveness_status"
+printf 'watchdog_silence: %s\n' "$watchdog_silence_status"
 printf 'rc_reload_command: %s\n' "$reload_command"
 echo
 echo "handoff:"

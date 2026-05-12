@@ -29,6 +29,7 @@ Trust model (issue #591):
 Usage:
     python3 bridge-watchdog-silence.py run [--once]
     python3 bridge-watchdog-silence.py status
+    python3 bridge-watchdog-silence.py cleanup-orphans [--dry-run]
 
 Environment:
     BRIDGE_HOME                                       runtime root
@@ -41,11 +42,14 @@ Environment:
     BRIDGE_DAEMON_SILENCE_RESTART_COOLDOWN_SECONDS    default 300
     BRIDGE_DAEMON_SILENCE_TAIL_BYTES                  audit tail window (default 4 MiB)
     BRIDGE_DAEMON_SILENCE_RESTART_TIMEOUT_SECONDS     stop+start timeout (default 30)
+    BRIDGE_DAEMON_SCRIPT                              override DAEMON_SCRIPT resolution
+    BRIDGE_DAEMON_SILENCE_PIDLOCK                     override pidlock path (default state/silence-watchdog.pidlock)
 """
 
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -70,8 +74,62 @@ BRIDGE_DAEMON_PID_FILE = Path(
 COOLDOWN_FILE = Path(
     os.environ.get("BRIDGE_DAEMON_SILENCE_COOLDOWN_FILE", BRIDGE_STATE_DIR / "silence-watchdog.json")
 )
+PIDLOCK_FILE = Path(
+    os.environ.get("BRIDGE_DAEMON_SILENCE_PIDLOCK", BRIDGE_STATE_DIR / "silence-watchdog.pidlock")
+)
+
+
+def _default_daemon_script() -> Path:
+    """Resolve the canonical daemon script path.
+
+    Issue #800 Track C: the previous default of ``SCRIPT_DIR / "bridge-daemon.sh"``
+    permanently bound watchdog instances launched from temp / worktree paths to
+    those (often-deleted) paths. Every recovery attempt then exited 127 on
+    "No such file or directory" and the live daemon was never restarted.
+
+    Resolution precedence (each step must point at an existing file):
+
+    1. ``BRIDGE_HOME/bridge-daemon.sh`` — the canonical install location.
+       This is the path the launchd plist / systemd unit shipped via
+       ``scripts/install-watchdog-silence-launchagent.sh`` resolves to.
+    2. ``~/.agent-bridge/bridge-daemon.sh`` — documented canonical install
+       fallback used when ``BRIDGE_HOME`` is unset.
+    3. ``SCRIPT_DIR / "bridge-daemon.sh"`` — last-resort in-tree development
+       fallback so ``python3 bridge-watchdog-silence.py …`` still works when
+       run directly out of a source checkout.
+
+    The explicit ``BRIDGE_DAEMON_SCRIPT`` env-var override (handled by the
+    caller) wins above all of these and is kept for tests.
+    """
+    home = os.environ.get("BRIDGE_HOME", "").strip()
+    if home:
+        candidate = Path(home).expanduser() / "bridge-daemon.sh"
+        if candidate.is_file():
+            return candidate
+    default_home_candidate = Path.home() / ".agent-bridge" / "bridge-daemon.sh"
+    if default_home_candidate.is_file():
+        return default_home_candidate
+    # Last-resort dev fallback. Production installs should NEVER reach this
+    # branch — it indicates the watchdog is running from a non-canonical
+    # location (temp dir, worktree, etc.) and is the exact failure class
+    # issue #800 / #265 documented. Log a clear warning so operators see
+    # the problem rather than silently inheriting the broken default. The
+    # module-level `log` is not yet bound at import time when this resolver
+    # runs, so use `logging.getLogger` directly — it's the same handler the
+    # rest of the module will attach to once `logging.basicConfig` runs.
+    fallback = SCRIPT_DIR / "bridge-daemon.sh"
+    logging.getLogger("watchdog-silence").warning(
+        "DAEMON_SCRIPT resolved via SCRIPT_DIR fallback (%s) — "
+        "no BRIDGE_HOME or ~/.agent-bridge install found. "
+        "This is the failure mode #800 Track C documented; "
+        "set BRIDGE_HOME or install canonically via 'agent-bridge upgrade'.",
+        fallback,
+    )
+    return fallback
+
+
 DAEMON_SCRIPT = Path(
-    os.environ.get("BRIDGE_DAEMON_SCRIPT", SCRIPT_DIR / "bridge-daemon.sh")
+    os.environ.get("BRIDGE_DAEMON_SCRIPT") or _default_daemon_script()
 )
 
 
@@ -257,6 +315,91 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def acquire_pidlock() -> "tuple[object, Path] | None":
+    """Acquire an exclusive non-blocking flock on the watchdog pidlock.
+
+    Issue #800 Track C compounding factor: multiple watchdog instances
+    accumulated on the same host (10 concurrent on the affected install),
+    each looping detection without ever advancing ``last_restart_epoch``.
+    A pidlock at ``state/silence-watchdog.pidlock`` makes ``run`` self-
+    deduplicate so the second-and-later invocations exit cleanly with a
+    log line pointing at the holder.
+
+    Returns ``(lock_fd, lock_path)`` on success, ``None`` if another
+    instance already holds the lock (caller should exit 0).
+
+    The lock file path is resolved from ``$BRIDGE_HOME/state/`` (or the
+    explicit ``BRIDGE_DAEMON_SILENCE_PIDLOCK`` override) — never
+    ``SCRIPT_DIR``, so concurrent watchdogs launched from different temp
+    paths still contend on the same lockfile.
+    """
+    lock_path = PIDLOCK_FILE
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.error("pidlock parent mkdir failed: %s", exc)
+        return None
+
+    # Open for read+write (create if missing) so we can both flock and
+    # write the holder pid for diagnostics.
+    try:
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        log.error("pidlock open failed for %s: %s", lock_path, exc)
+        return None
+
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # Someone else holds it. Read the pid for the log message and exit
+        # cleanly — concurrent watchdogs are an expected condition on hosts
+        # with stale launches, not an error.
+        try:
+            with open(str(lock_path), "r", encoding="utf-8") as handle:
+                other = handle.read().strip() or "unknown"
+        except OSError:
+            other = "unknown"
+        finally:
+            os.close(fd)
+        log.info(
+            "another bridge-watchdog-silence instance already running "
+            "(holder_pid=%s lock=%s) — exiting cleanly",
+            other, lock_path,
+        )
+        return None
+
+    # We hold the lock. Stamp our pid so a future contender can see who
+    # owns it. truncate-then-write keeps the file size in sync with the
+    # current holder rather than appending across handoffs.
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+        os.fsync(fd)
+    except OSError as exc:
+        log.warning("pidlock write failed (lock still held): %s", exc)
+
+    return (fd, lock_path)
+
+
+def release_pidlock(handle: "tuple[object, Path] | None") -> None:
+    """Release the watchdog pidlock acquired by :func:`acquire_pidlock`."""
+    if handle is None:
+        return
+    fd, lock_path = handle
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    # We deliberately leave the lock file on disk so the next instance can
+    # contend on the same inode without a recreate race. Stale pid bytes
+    # are harmless (re-stamped on next acquire).
+    _ = lock_path  # keep the path available for callers that want to log it
+
+
 def emit_audit(action: str, detail: dict) -> None:
     """Write an audit row via bridge-audit.py so we share the hash chain
     and rotation logic with every other bridge writer."""
@@ -410,26 +553,38 @@ def tick(now: float | None = None) -> str:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    if args.once:
-        outcome = tick()
-        log.info("once outcome: %s", outcome)
+    # Issue #800 Track C: pidlock before any work so a second concurrent
+    # `run` (the common orphan-accumulation shape) exits cleanly instead
+    # of looping detections that fight for the same recovery cooldown.
+    lock_handle = acquire_pidlock()
+    if lock_handle is None:
         return 0
+    try:
+        if args.once:
+            outcome = tick()
+            log.info("once outcome: %s", outcome)
+            return 0
 
-    log.info(
-        "silence watchdog started (threshold=%ds poll=%ds cooldown=%ds heartbeat=%ds)",
-        SILENCE_THRESHOLD, POLL_INTERVAL, RESTART_COOLDOWN, HEARTBEAT_INTERVAL,
-    )
-    while True:
-        try:
-            tick()
-        except Exception as exc:  # noqa: BLE001 — supervisor must not die on any cycle error
-            log.error("watchdog cycle error: %s", exc)
-        time.sleep(POLL_INTERVAL)
+        log.info(
+            "silence watchdog started (threshold=%ds poll=%ds cooldown=%ds heartbeat=%ds daemon_script=%s)",
+            SILENCE_THRESHOLD, POLL_INTERVAL, RESTART_COOLDOWN, HEARTBEAT_INTERVAL,
+            DAEMON_SCRIPT,
+        )
+        while True:
+            try:
+                tick()
+            except Exception as exc:  # noqa: BLE001 — supervisor must not die on any cycle error
+                log.error("watchdog cycle error: %s", exc)
+            time.sleep(POLL_INTERVAL)
+    finally:
+        release_pidlock(lock_handle)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
     print(f"audit_log: {BRIDGE_AUDIT_LOG}")
     print(f"daemon_pid_file: {BRIDGE_DAEMON_PID_FILE}")
+    print(f"daemon_script: {DAEMON_SCRIPT} (exists={DAEMON_SCRIPT.is_file()})")
+    print(f"pidlock: {PIDLOCK_FILE}")
     print(f"heartbeat_interval_seconds: {HEARTBEAT_INTERVAL}")
     print(f"silence_threshold_seconds: {SILENCE_THRESHOLD}")
     print(f"poll_interval_seconds: {POLL_INTERVAL}")
@@ -437,8 +592,13 @@ def cmd_status(args: argparse.Namespace) -> int:
     last = find_last_daemon_tick(BRIDGE_AUDIT_LOG, TAIL_BYTES)
     if last is None:
         print("last_daemon_tick: (none in tail window)")
+        print("last_detection_epoch: (none)")
     else:
         print(f"last_daemon_tick: {last.raw_ts} (age={int(last.age_seconds)}s)")
+        if last.age_seconds > SILENCE_THRESHOLD:
+            print(f"last_detection_epoch: {last.epoch:.0f} (silence age={int(last.age_seconds)}s)")
+        else:
+            print("last_detection_epoch: (none — within threshold)")
     cooldown_epoch = read_cooldown()
     if cooldown_epoch:
         age = int(time.time() - cooldown_epoch)
@@ -450,6 +610,241 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("daemon: (no pid file)")
     else:
         print(f"daemon: pid={pid} alive={pid_alive(pid)}")
+    # Surface the watchdog's own running instance so daemon-status callers
+    # can answer "is the watchdog itself up?" without an extra pgrep.
+    watchdog_pid = _read_pidlock_holder()
+    if watchdog_pid:
+        alive = pid_alive(watchdog_pid)
+        print(f"watchdog: pid={watchdog_pid} alive={alive}")
+    else:
+        print("watchdog: (not running — no pidlock holder)")
+    return 0
+
+
+def _read_pidlock_holder() -> int | None:
+    """Read the pid recorded inside the watchdog pidlock, if any.
+
+    Returns ``None`` if the lockfile is absent, empty, or unparseable.
+    Note this does NOT prove the holder is still alive — callers should
+    cross-check with :func:`pid_alive`.
+    """
+    try:
+        text = PIDLOCK_FILE.read_text(encoding="utf-8").strip()
+    except (FileNotFoundError, OSError):
+        return None
+    if not text:
+        return None
+    try:
+        return int(text.splitlines()[0].strip())
+    except (ValueError, IndexError):
+        return None
+
+
+def _watchdog_cmdline(pid: int) -> str:
+    """Return the command line of pid <pid>, empty string on any failure.
+
+    Uses ``ps -p <pid> -o command=`` which is portable across macOS and
+    Linux; ``/proc/<pid>/cmdline`` would be Linux-only.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return ""
+    return (result.stdout or "").strip()
+
+
+def _process_ppid(pid: int) -> int | None:
+    """Return the parent pid of <pid>, ``None`` on failure.
+
+    Uses ``ps -p <pid> -o ppid=`` for cross-platform portability. A ppid
+    of 1 indicates the process was reparented to init/launchd, the usual
+    fingerprint of an orphan watchdog whose owning session is gone.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "ppid="],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    text = (result.stdout or "").strip()
+    if not text:
+        return None
+    try:
+        return int(text.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _canonical_watchdog_script_paths() -> "list[Path]":
+    """Return the set of paths a *non-orphan* watchdog should be running from.
+
+    Anything outside this set, with ppid=1, is an orphan candidate. The
+    BRIDGE_DAEMON_SCRIPT env-var override is intentionally read here
+    because operators with test rigs that legitimately run the watchdog
+    out of a custom path can extend the allow-list.
+    """
+    canonical: list[Path] = []
+    seen: set[str] = set()
+    home = os.environ.get("BRIDGE_HOME", "").strip()
+    if home:
+        candidate = Path(home).expanduser() / "bridge-watchdog-silence.py"
+        seen.add(str(candidate.resolve()) if candidate.exists() else str(candidate))
+        canonical.append(candidate)
+    default_home = Path.home() / ".agent-bridge" / "bridge-watchdog-silence.py"
+    key = str(default_home.resolve()) if default_home.exists() else str(default_home)
+    if key not in seen:
+        canonical.append(default_home)
+        seen.add(key)
+    override = os.environ.get("BRIDGE_DAEMON_SCRIPT", "").strip()
+    if override:
+        # When operators pin DAEMON_SCRIPT, treat the sibling watchdog
+        # script next to it as canonical too.
+        sibling = Path(override).expanduser().parent / "bridge-watchdog-silence.py"
+        skey = str(sibling.resolve()) if sibling.exists() else str(sibling)
+        if skey not in seen:
+            canonical.append(sibling)
+            seen.add(skey)
+    return canonical
+
+
+def cmd_cleanup_orphans(args: argparse.Namespace) -> int:
+    """Find + reap orphan watchdog instances launched from non-canonical paths.
+
+    Issue #800 Track C compounding factor: the affected install had 10
+    concurrent watchdog instances, all from worktree / temp paths, none
+    of which could recover the live daemon. None had a parent in their
+    original session — they were all reparented to launchd (ppid=1).
+
+    Reaping policy:
+
+    1. ``pgrep -fl bridge-watchdog-silence.py`` to discover candidates.
+    2. For each, read the command line. If the script path is in the
+       canonical allow-list (``$BRIDGE_HOME`` or ``~/.agent-bridge`` or
+       the ``BRIDGE_DAEMON_SCRIPT`` sibling) we skip — that's our own
+       canonical instance, not an orphan.
+    3. If ppid=1 (reparented to init/launchd), SIGTERM, sleep 2s, then
+       SIGKILL if still alive. Skip non-orphans (ppid != 1) to avoid
+       killing a fixer's own live test invocation.
+
+    With ``--dry-run``, prints what it would kill without sending signals.
+    Idempotent — running again after a clean sweep is a no-op.
+    """
+    dry_run = bool(getattr(args, "dry_run", False))
+    self_pid = os.getpid()
+    try:
+        result = subprocess.run(
+            ["pgrep", "-fl", "bridge-watchdog-silence.py"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        log.error("pgrep failed: %s", exc)
+        return 1
+
+    candidates: list[tuple[int, str]] = []
+    for line in (result.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        head, _, rest = line.partition(" ")
+        try:
+            pid = int(head)
+        except ValueError:
+            continue
+        if pid == self_pid:
+            continue
+        candidates.append((pid, rest))
+
+    if not candidates:
+        log.info("cleanup-orphans: no watchdog instances found")
+        return 0
+
+    canonical_paths = _canonical_watchdog_script_paths()
+    canonical_resolved = set()
+    for p in canonical_paths:
+        try:
+            canonical_resolved.add(str(p.resolve()))
+        except OSError:
+            canonical_resolved.add(str(p))
+
+    killed = 0
+    skipped = 0
+    for pid, cmdline in candidates:
+        cmdline_full = _watchdog_cmdline(pid) or cmdline
+        # Extract the script path from the cmdline. The shape is normally
+        # `python3 /some/path/bridge-watchdog-silence.py run` — find the
+        # first token ending in bridge-watchdog-silence.py.
+        script_path: Path | None = None
+        for token in cmdline_full.split():
+            if token.endswith("bridge-watchdog-silence.py"):
+                script_path = Path(token)
+                break
+        if script_path is None:
+            log.info(
+                "cleanup-orphans: skip pid=%s (cannot parse script path from cmdline=%r)",
+                pid, cmdline_full,
+            )
+            skipped += 1
+            continue
+
+        try:
+            resolved = str(script_path.resolve())
+        except OSError:
+            resolved = str(script_path)
+
+        if resolved in canonical_resolved:
+            log.info(
+                "cleanup-orphans: skip pid=%s (canonical path=%s)",
+                pid, resolved,
+            )
+            skipped += 1
+            continue
+
+        ppid = _process_ppid(pid)
+        if ppid != 1:
+            log.info(
+                "cleanup-orphans: skip pid=%s (non-orphan ppid=%s path=%s)",
+                pid, ppid, resolved,
+            )
+            skipped += 1
+            continue
+
+        if dry_run:
+            log.info(
+                "cleanup-orphans: would TERM pid=%s (orphan path=%s ppid=%s)",
+                pid, resolved, ppid,
+            )
+            killed += 1
+            continue
+
+        log.info(
+            "cleanup-orphans: SIGTERM pid=%s (orphan path=%s ppid=%s)",
+            pid, resolved, ppid,
+        )
+        try:
+            os.kill(pid, 15)
+        except ProcessLookupError:
+            continue
+        except OSError as exc:
+            log.warning("cleanup-orphans: SIGTERM pid=%s failed: %s", pid, exc)
+            continue
+        # Grace period, then SIGKILL if still alive.
+        time.sleep(2)
+        if pid_alive(pid):
+            log.warning("cleanup-orphans: SIGKILL pid=%s (TERM grace expired)", pid)
+            try:
+                os.kill(pid, 9)
+            except (ProcessLookupError, OSError):
+                pass
+        killed += 1
+
+    log.info(
+        "cleanup-orphans: %s %d orphan(s), skipped %d canonical/non-orphan instance(s)",
+        "would kill" if dry_run else "killed", killed, skipped,
+    )
     return 0
 
 
@@ -464,11 +859,26 @@ def main() -> int:
     status_p = sub.add_parser("status")
     status_p.set_defaults(handler=cmd_status)
 
+    cleanup_p = sub.add_parser(
+        "cleanup-orphans",
+        help="Find + reap orphan watchdog instances (#800 Track C).",
+    )
+    cleanup_p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would be killed without sending signals.",
+    )
+    cleanup_p.set_defaults(handler=cmd_cleanup_orphans)
+
     args = parser.parse_args()
     # Issue #591: refuse to run with a cross-home pid file before any state
     # read or audit peek so a leaked-env orphan terminates itself instead of
-    # cross-home killing the live daemon.
-    _validate_cross_home()
+    # cross-home killing the live daemon. cleanup-orphans does not read the
+    # daemon pid file (it operates on its own pgrep results) so it is exempt
+    # — and the exemption matters because cleanup is most useful precisely
+    # when the operator is recovering from a cross-home env leak.
+    if args.command != "cleanup-orphans":
+        _validate_cross_home()
     return int(args.handler(args))
 
 
