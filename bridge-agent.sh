@@ -1531,6 +1531,101 @@ print(json.dumps(records, ensure_ascii=False, indent=2))
 PY
 }
 
+# Issue #780 — multi-signal alive determination for `agent show --json`.
+#
+# Controller-side health probe historically only checked tmux session
+# existence. That yields `alive=null` (or implicit-false) when the agent
+# itself is running outside a tmux session (systemd-direct, dynamic
+# detach, custom launcher) but its channel servers / claude session are
+# alive. The new `alive` field is the OR of three signals so any one
+# being live is enough to report `alive=true`:
+#
+#   1. tmux  — `bridge_agent_is_active` (existing single signal)
+#   2. pid   — `<agent_home>/runtime/agent.pid` exists + the PID is alive
+#              (kill -0). Future systemd-unit signal can be folded in
+#              here by adding more sources of truth without changing the
+#              public field shape.
+#   3. channel — at least one channel plugin port from
+#                `bridge_agent_plugin_ports` is in LISTEN state. Delegates
+#                to `bridge_port_is_listening` (Track D / #779, lives in
+#                lib/bridge-agents.sh) so the LISTEN probe stays a single
+#                source of truth. We treat *any* port that this agent is
+#                supposed to bind as a positive channel signal — channel
+#                plugins only listen while the agent runtime is alive.
+#
+# Zombie tmux protection: when the tmux session exists but agent
+# processes are dead, we still report alive=true based on the tmux
+# signal. That's an accepted residue — `agent-bridge doctor` is the
+# path to detect zombies.
+bridge_agent_alive_pid_signal() {
+  local agent="$1"
+  local home=""
+  local pid_file=""
+  local pid_raw=""
+
+  home="$(bridge_agent_default_home "$agent" 2>/dev/null || true)"
+  [[ -n "$home" ]] || return 1
+  pid_file="$home/runtime/agent.pid"
+  [[ -f "$pid_file" ]] || return 1
+  pid_raw="$(head -n 1 "$pid_file" 2>/dev/null | tr -d '[:space:]')"
+  [[ -n "$pid_raw" && "$pid_raw" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid_raw" 2>/dev/null
+}
+
+bridge_agent_alive_port_is_listening() {
+  # Delegate to the canonical LISTEN probe shipped by Track D (#779) in
+  # lib/bridge-agents.sh. bridge-agent.sh loads bridge-lib.sh →
+  # bridge-agents.sh at startup, so the helper is always defined here.
+  # No defensive fallback: keeping a forbidden heredoc-stdin Python
+  # callsite around as "just in case" violates the #800 deadlock-class
+  # convention (PR #801) and the branch can never reach it in practice.
+  local port="$1"
+  [[ -n "$port" ]] || return 1
+  bridge_port_is_listening "$port"
+}
+
+bridge_agent_alive_channel_signal() {
+  local agent="$1"
+  local line=""
+  local port=""
+
+  if ! type bridge_agent_plugin_ports >/dev/null 2>&1; then
+    return 1
+  fi
+  # bridge_agent_plugin_ports emits one "<port>\t<binary>\t<plugin>" per
+  # known long-lived listener for the agent. Any one in LISTEN is enough.
+  while IFS=$'\t' read -r port _ _; do
+    [[ -n "$port" ]] || continue
+    if bridge_agent_alive_port_is_listening "$port"; then
+      return 0
+    fi
+  done < <(bridge_agent_plugin_ports "$agent" 2>/dev/null || true)
+  return 1
+}
+
+bridge_agent_alive_signals_json() {
+  local agent="$1"
+  local tmux_signal="false"
+  local pid_signal="false"
+  local channel_signal="false"
+  local alive="false"
+
+  if bridge_agent_is_active "$agent" 2>/dev/null; then
+    tmux_signal="true"
+  fi
+  if bridge_agent_alive_pid_signal "$agent" 2>/dev/null; then
+    pid_signal="true"
+  fi
+  if bridge_agent_alive_channel_signal "$agent" 2>/dev/null; then
+    channel_signal="true"
+  fi
+  if [[ "$tmux_signal" == "true" || "$pid_signal" == "true" || "$channel_signal" == "true" ]]; then
+    alive="true"
+  fi
+  printf '{"alive":%s,"signals":{"tmux":%s,"pid":%s,"channel":%s}}' \
+    "$alive" "$tmux_signal" "$pid_signal" "$channel_signal"
+}
+
 run_show() {
   local agent="${1:-}"
   local json_mode=0
@@ -1559,11 +1654,17 @@ run_show() {
     # output is intentionally unchanged; only --json exposes the path so
     # operators can pipe it into recovery scripts (e.g. forget-session
     # follow-ups) without parsing the human format.
+    #
+    # alive (issue #780): multi-signal OR (tmux | pid | channel LISTEN)
+    # written alongside the existing `active` field. `active` stays as
+    # the tmux-only signal so callers that depend on the old meaning
+    # are unchanged; `alive` is the new operator-facing health value.
     bridge_agent_manage_python \
       "$(emit_agent_records_json show "$output")" \
       "$(bridge_agent_channel_diagnostics_json "$agent")" \
       "$(bridge_agent_session_health_json "$agent")" \
-      "$(bridge_agent_session_source_path "$agent")" <<'PY'
+      "$(bridge_agent_session_source_path "$agent")" \
+      "$(bridge_agent_alive_signals_json "$agent")" <<'PY'
 import json
 import sys
 
@@ -1571,6 +1672,9 @@ payload = json.loads(sys.argv[1])
 payload.setdefault("channels", {})["diagnostics"] = json.loads(sys.argv[2])
 payload["session_health"] = json.loads(sys.argv[3])
 payload["session_source"] = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
+alive_blob = json.loads(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else {}
+payload["alive"] = bool(alive_blob.get("alive", False))
+payload["alive_signals"] = alive_blob.get("signals", {})
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY
     return 0
