@@ -58,39 +58,30 @@ launch_dry_run_contract() {
 }
 
 launch_umask_probe_contract() {
-  local shared_probe isolated_probe v2_probe
-  local shared_recorded isolated_recorded v2_recorded
+  local shared_probe isolated_probe
+  local shared_recorded isolated_recorded
   local v2_data_root
 
-  shared_probe="$SMOKE_TMP_ROOT/launch-shared-umask.probe"
-  isolated_probe="$SMOKE_TMP_ROOT/launch-isolated-legacy-umask.probe"
-  v2_probe="$SMOKE_TMP_ROOT/launch-isolated-v2-umask.probe"
+  shared_probe="$SMOKE_TMP_ROOT/launch-v2-shared-umask.probe"
+  isolated_probe="$SMOKE_TMP_ROOT/launch-v2-isolated-umask.probe"
   v2_data_root="$SMOKE_TMP_ROOT/v2-data"
   mkdir -p "$v2_data_root/agents" "$v2_data_root/shared" "$v2_data_root/state"
-
-  BRIDGE_LAYOUT=legacy \
-  BRIDGE_DATA_ROOT= \
-  BRIDGE_HOST_PLATFORM_OVERRIDE=Linux \
-  BRIDGE_RUN_UMASK_PROBE_FILE="$shared_probe" \
-    bash "$SMOKE_REPO_ROOT/bridge-run.sh" launch-agent --dry-run >/dev/null
-  shared_recorded="$(cat "$shared_probe" 2>/dev/null || true)"
-  smoke_assert_eq "0077" "$shared_recorded" "legacy shared bridge-run umask remains private"
-
-  BRIDGE_LAYOUT=legacy \
-  BRIDGE_DATA_ROOT= \
-  BRIDGE_HOST_PLATFORM_OVERRIDE=Linux \
-  BRIDGE_RUN_UMASK_PROBE_FILE="$isolated_probe" \
-    bash "$SMOKE_REPO_ROOT/bridge-run.sh" launch-isolated-agent --dry-run >/dev/null
-  isolated_recorded="$(cat "$isolated_probe" 2>/dev/null || true)"
-  smoke_assert_eq "0007" "$isolated_recorded" "legacy linux-user bridge-run umask preserves ACL mask"
 
   BRIDGE_LAYOUT=v2 \
   BRIDGE_DATA_ROOT="$v2_data_root" \
   BRIDGE_HOST_PLATFORM_OVERRIDE=Linux \
-  BRIDGE_RUN_UMASK_PROBE_FILE="$v2_probe" \
+  BRIDGE_RUN_UMASK_PROBE_FILE="$shared_probe" \
+    bash "$SMOKE_REPO_ROOT/bridge-run.sh" launch-agent --dry-run >/dev/null
+  shared_recorded="$(cat "$shared_probe" 2>/dev/null || true)"
+  smoke_assert_eq "0077" "$shared_recorded" "v2 shared bridge-run umask remains private"
+
+  BRIDGE_LAYOUT=v2 \
+  BRIDGE_DATA_ROOT="$v2_data_root" \
+  BRIDGE_HOST_PLATFORM_OVERRIDE=Linux \
+  BRIDGE_RUN_UMASK_PROBE_FILE="$isolated_probe" \
     bash "$SMOKE_REPO_ROOT/bridge-run.sh" launch-isolated-agent --dry-run >/dev/null
-  v2_recorded="$(cat "$v2_probe" 2>/dev/null || true)"
-  smoke_assert_eq "0007" "$v2_recorded" "v2 linux-user bridge-run umask remains 0007"
+  isolated_recorded="$(cat "$isolated_probe" 2>/dev/null || true)"
+  smoke_assert_eq "0007" "$isolated_recorded" "v2 linux-user bridge-run umask remains 0007"
 }
 
 main() {

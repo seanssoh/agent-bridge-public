@@ -41,6 +41,11 @@ smoke_setup_bridge_home() {
   export BRIDGE_ROSTER_LOCAL_FILE="$BRIDGE_HOME/agent-roster.local.sh"
   export BRIDGE_TASK_DB="$BRIDGE_STATE_DIR/tasks.db"
   export BRIDGE_AGENT_HOME_ROOT="$BRIDGE_HOME/agents"
+  export BRIDGE_LAYOUT="v2"
+  export BRIDGE_DATA_ROOT="$SMOKE_TMP_ROOT/data"
+  export BRIDGE_SHARED_ROOT="$BRIDGE_DATA_ROOT/shared"
+  export BRIDGE_AGENT_ROOT_V2="$BRIDGE_DATA_ROOT/agents"
+  export BRIDGE_CONTROLLER_STATE_ROOT="$BRIDGE_DATA_ROOT/state"
   export BRIDGE_RUNTIME_ROOT="$BRIDGE_HOME/runtime"
   export BRIDGE_RUNTIME_CONFIG_FILE="$BRIDGE_RUNTIME_ROOT/bridge-config.json"
   export BRIDGE_HOOKS_DIR="$BRIDGE_HOME/hooks"
@@ -54,10 +59,18 @@ smoke_setup_bridge_home() {
     "$BRIDGE_ACTIVE_AGENT_DIR" \
     "$BRIDGE_HISTORY_DIR" \
     "$BRIDGE_AGENT_HOME_ROOT" \
+    "$BRIDGE_SHARED_ROOT" \
+    "$BRIDGE_AGENT_ROOT_V2" \
+    "$BRIDGE_CONTROLLER_STATE_ROOT" \
     "$BRIDGE_RUNTIME_ROOT" \
     "$BRIDGE_HOOKS_DIR"
   : >"$BRIDGE_ROSTER_FILE"
   : >"$BRIDGE_ROSTER_LOCAL_FILE"
+  cat >"$BRIDGE_STATE_DIR/layout-marker.sh" <<EOF
+BRIDGE_LAYOUT=v2
+BRIDGE_DATA_ROOT=$BRIDGE_DATA_ROOT
+EOF
+  chmod 0644 "$BRIDGE_STATE_DIR/layout-marker.sh"
 }
 
 smoke_cleanup_temp_root() {
