@@ -6029,6 +6029,41 @@ cmd_status() {
   if [[ "$BRIDGE_LAUNCHAGENT_LOG" != "$BRIDGE_DAEMON_LOG" ]]; then
     echo "launchagent_log=${BRIDGE_LAUNCHAGENT_LOG}"
   fi
+
+  # Issue #800 Track C: surface the silence-watchdog state so operators
+  # can answer "is anything recovering me if I hang again?" without an
+  # extra pgrep / journalctl roundtrip. We call into the watchdog's own
+  # `status` subcommand and translate its key lines into `watchdog_*=...`
+  # rows so the daemon status grep-grammar stays single-line key=value.
+  local watchdog_py="$SCRIPT_DIR/bridge-watchdog-silence.py"
+  if [[ -f "$watchdog_py" ]]; then
+    local watchdog_out
+    # Hard timeout so a wedged audit log (the very condition the watchdog
+    # supervises) cannot block `daemon status` itself. The watchdog status
+    # path opens the audit JSONL and seeks into it; on a healthy host this
+    # returns in <100ms, on a sick host we'd rather show stale-or-missing
+    # rows than hang the daemon status caller.
+    if command -v timeout >/dev/null 2>&1; then
+      watchdog_out="$(timeout 5 python3 "$watchdog_py" status 2>/dev/null || true)"
+    else
+      watchdog_out="$(python3 "$watchdog_py" status 2>/dev/null || true)"
+    fi
+    if [[ -n "$watchdog_out" ]]; then
+      local line
+      while IFS= read -r line; do
+        case "$line" in
+          "daemon_script: "*)         echo "watchdog_daemon_script=${line#daemon_script: }" ;;
+          "last_daemon_tick: "*)      echo "watchdog_${line//: /=}" ;;
+          "last_detection_epoch: "*)  echo "watchdog_${line//: /=}" ;;
+          "last_restart_epoch: "*)    echo "watchdog_${line//: /=}" ;;
+          "watchdog: "*)              echo "watchdog_process=${line#watchdog: }" ;;
+          *) ;;
+        esac
+      done <<EOF
+$watchdog_out
+EOF
+    fi
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
