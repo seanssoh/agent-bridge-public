@@ -171,40 +171,6 @@ bridge_auth_prepare_credential_file() {
   chmod 0700 "$dir" 2>/dev/null || true
 }
 
-bridge_auth_fix_credential_file_mode() {
-  local agent="$1"
-  local file="$2"
-  local config_file=""
-  local settings_file=""
-  local os_user=""
-  local os_group=""
-
-  config_file="$(dirname "$file")/.claude.json"
-  settings_file="$(dirname "$file")/settings.json"
-  if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
-    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
-    [[ -n "$os_user" ]] || {
-      printf '[error] cannot resolve isolated os_user for agent: %s\n' "$agent" >&2
-      return 1
-    }
-    os_group="$(id -gn "$os_user" 2>/dev/null || printf '%s' "$os_user")"
-    bridge_auth_run_privileged chown "$os_user:$os_group" "$file" || return 1
-    bridge_auth_run_privileged chmod 0600 "$file" || return 1
-    if bridge_auth_run_privileged test -f "$config_file"; then
-      bridge_auth_run_privileged chown "$os_user:$os_group" "$config_file" || return 1
-      bridge_auth_run_privileged chmod 0600 "$config_file" || return 1
-    fi
-    if bridge_auth_run_privileged test -e "$settings_file"; then
-      bridge_auth_run_privileged chown "$os_user:$os_group" "$settings_file" || return 1
-    fi
-    return 0
-  fi
-  chmod 0600 "$file" 2>/dev/null || bridge_auth_run_privileged chmod 0600 "$file"
-  if [[ -f "$config_file" ]]; then
-    chmod 0600 "$config_file" 2>/dev/null || bridge_auth_run_privileged chmod 0600 "$config_file"
-  fi
-}
-
 bridge_auth_update_legacy_claude_config_env() {
   local agent="$1"
   local file="$2"
@@ -441,17 +407,19 @@ PY
       rc=1
       continue
     fi
-    # PR #799 r2 codex finding 3 — Python wrote the tempfile, chowned it to
-    # the isolated UID, then ``os.replace``-d into final path. The file is
-    # never root-owned at its final path so the post-sync chown repair
-    # below is now a defense-in-depth assertion: it re-applies mode/owner
-    # on legacy installs where stale root-owned files may pre-exist. It is
-    # no longer load-bearing for fresh rotations.
-    if ! bridge_auth_fix_credential_file_mode "$agent" "$file"; then
-      failed+=("$agent:mode_failed")
-      rc=1
-      continue
-    fi
+    # PR #799 r3 codex finding 1 — Python's ``write_private_file_atomic``
+    # writes the tempfile, chmod/chown's it (when --owner-uid/--owner-gid
+    # are passed) BEFORE ``os.replace``, so .credentials.json / .claude.json
+    # / settings.json land at their final paths already owner-correct and
+    # mode 0600. The previous post-sync chown/chmod "defense-in-depth"
+    # repair walked the final pathnames without re-lstat after replace,
+    # which is a TOCTOU: the agent UID could swap the final path to a
+    # symlink between ``os.replace`` and the privileged chown, letting the
+    # privileged op follow out of the agent's home. The repair has been
+    # removed from the sync hot path. Legacy installs with pre-existing
+    # root-owned credential files are fixed by simply re-running
+    # ``sync`` — the atomic rewrite replaces the stale file with a
+    # correctly-owned one.
     if ! bridge_auth_update_legacy_claude_config_env "$agent" "$legacy_file" "$(dirname "$file")"; then
       failed+=("$agent:legacy_env_update_failed")
       rc=1

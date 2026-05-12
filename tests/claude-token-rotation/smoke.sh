@@ -671,3 +671,21 @@ case "$CRED_MODE" in
     ;;
 esac
 pass "credential file is owner-correct + mode 0600 at its final path (no transient root-owned window)"
+
+# PR #799 r3 codex finding 1 — the legacy post-sync chown/chmod repair
+# helper ``bridge_auth_fix_credential_file_mode`` is a TOCTOU window: it
+# walks the final pathnames after Python's ``os.replace`` without
+# re-lstat, so the agent UID can swap the final path to a symlink between
+# replace and chown, letting the privileged op follow out of the agent
+# home. The fix removes the helper entirely (the Python atomic-write
+# already produces correct ownership/mode for fresh rotations, and
+# legacy stale-state installs are repaired by re-running ``sync``).
+# Assert: (a) the function definition is gone from bridge-auth.sh, and
+# (b) the sync hot path no longer references it.
+if grep -q '^bridge_auth_fix_credential_file_mode\b' "$REPO_ROOT/bridge-auth.sh"; then
+  fail "no_post_write_chown_in_sync: bridge_auth_fix_credential_file_mode definition still present"
+fi
+if grep -q 'bridge_auth_fix_credential_file_mode' "$REPO_ROOT/bridge-auth.sh"; then
+  fail "no_post_write_chown_in_sync: bridge_auth_fix_credential_file_mode still referenced in bridge-auth.sh"
+fi
+pass "post-sync chown TOCTOU helper removed from sync hot path (no bridge_auth_fix_credential_file_mode)"
