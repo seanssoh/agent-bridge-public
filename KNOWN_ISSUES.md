@@ -586,3 +586,32 @@ bash bridge-daemon.sh start
 Debug-only override: `BRIDGE_DAEMON_FORCE_START_WITH_STALE_GROUPS=1`
 (the `Permission denied` errors will return — set only when you
 need to inspect a specific failure mode).
+
+## 24. Tool-policy denies `env` / `printenv` env-as-prefix invocations (#799 r3)
+
+The tool-policy pretool gate denies env-dump verbs — `env`,
+`printenv`, bare `set`, `compgen -e`, `declare -p` / `declare -x`,
+`typeset -p` / `typeset -x`, `export -p`, and any read of
+`/proc/<pid>/environ` — to prevent exfiltration of the exported
+`CLAUDE_CODE_OAUTH_TOKEN` (the active OAuth token injected into the
+agent's launch subshell via `launch-secrets.env`). The literal
+substring deny added in #799 r2 only matched when the raw text named
+the token variable; env-dump verbs enumerate every exported variable
+without naming any of them, so they bypassed that check entirely.
+
+Side effect: `env VAR=val cmd` (env-as-prefix) is also denied because
+distinguishing it from a bare `env` dump from the raw command string
+is unreliable. Use one of the following when you need env-as-prefix
+invocations from Bash:
+
+- `/usr/bin/env LANG=C foo` — allowed (the absolute path bypasses
+  the bare-word `env` pattern, which uses a `/`-rejecting lookbehind).
+- `VAR=val cmd` — allowed (shell-native env-prefix, no `env` verb).
+- A wrapper shell script that sets the env and execs the binary —
+  allowed (the verb is the wrapper name, not `env`).
+
+`set -e` / `set -o pipefail` / `kubectl set image` / `git remote
+set-url` / `setfacl` and other commands that happen to contain `set`,
+`env`, or `environment` substrings remain allowed; the patterns are
+word-boundary based and require terminator/pipe context after bare
+`set`.

@@ -157,6 +157,48 @@ def _raw_mentions_claude_credentials(raw: str) -> bool:
     )
 
 
+# PR #799 r3 codex finding 1 — match process-environment dump verbs
+# that would reveal the exported CLAUDE_CODE_OAUTH_TOKEN without naming
+# it directly. The r2 substring deny (above) only matches when the raw
+# text contains the literal token-variable name; env-dump verbs
+# enumerate every exported variable without naming any of them, so the
+# substring check never fires.
+#
+# Coverage:
+#   env [/options]            POSIX env, dumps everything when called with no
+#                             positional COMMAND or piped
+#   printenv [VAR...]         no-arg dump and `printenv CLAUDE_CODE_OAUTH_TOKEN`
+#   set                       bash builtin with no args dumps all vars
+#   compgen -e                completion list of exported vars
+#   declare -p / declare -x   prints all / all exported vars
+#   typeset -p / typeset -x   ksh-style alias for declare
+#   export -p                 prints all exported vars
+#   /proc/<pid>/environ       Linux env dump via procfs (also /proc/self/environ)
+#
+# Word-boundary patterns avoid matching legitimate token substrings
+# such as `environment`, `setfacl`, `kubectl set image`, or `set -e`.
+# Routed to the same CLAUDE_CREDENTIAL_DENY_REASON as the substring
+# deny — no second reason constant.
+_ENV_DUMP_PATTERNS = (
+    re.compile(r"(?<![A-Za-z0-9_/])env(?![A-Za-z0-9_])"),
+    re.compile(r"(?<![A-Za-z0-9_/])printenv(?![A-Za-z0-9_])"),
+    # bare `set` with no args (dumps all vars). Require a separator
+    # before and a terminator/pipe/EOL after so `set -e`, `set -o
+    # pipefail`, `kubectl set image`, `git remote set-url`, and
+    # `setfacl` do NOT match.
+    re.compile(r"(?:^|[;\s|&])set\s*(?:$|[|;&])"),
+    re.compile(r"(?<![A-Za-z0-9_])compgen\s+-[A-Za-z]*e"),
+    re.compile(r"(?<![A-Za-z0-9_])declare\s+-[A-Za-z]*[xp]"),
+    re.compile(r"(?<![A-Za-z0-9_])typeset\s+-[A-Za-z]*[xp]"),
+    re.compile(r"(?<![A-Za-z0-9_])export\s+-p(?![A-Za-z0-9_])"),
+    re.compile(r"/proc/[^/\s]+/environ\b"),
+)
+
+
+def _raw_dumps_process_environment(raw: str) -> bool:
+    return any(p.search(raw) for p in _ENV_DUMP_PATTERNS)
+
+
 def claude_credentials_reason_for_path(path: Path) -> str | None:
     if _path_is_claude_credentials(path):
         return CLAUDE_CREDENTIAL_DENY_REASON
@@ -1354,6 +1396,10 @@ def protected_alias_reason(text: str, agent: str) -> str | None:
     # structured-read surface and direct sqlite reads still bypass that
     # contract.
     if _raw_mentions_claude_credentials(text):
+        return CLAUDE_CREDENTIAL_DENY_REASON
+    # PR #799 r3 codex finding 1 — env-dump verbs reveal the exported
+    # OAuth token without naming it, bypassing the substring deny above.
+    if _raw_dumps_process_environment(text):
         return CLAUDE_CREDENTIAL_DENY_REASON
     for credential_path in claude_credential_paths():
         if _bash_argv_references_path(text, credential_path):

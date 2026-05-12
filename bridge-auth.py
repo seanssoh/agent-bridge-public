@@ -675,6 +675,15 @@ def cmd_check(args: argparse.Namespace) -> int:
     # the lock across ``probe_claude_token`` would block every other
     # registry mutation (the daemon's rotate loop, operator activate,
     # recovery sweep) for the duration of the network call.
+    #
+    # PR #799 r3 codex finding 2 — also snapshot the token fingerprint
+    # during the locked read and re-verify it during the locked
+    # persist. Without that check a concurrent ``cmd_add --replace``
+    # (or any other mutator that swaps the row's token value while
+    # keeping the row id) would have the stale probe persisted onto
+    # the new token. Fingerprint comparison keeps the raw token off
+    # the diff and audit log.
+    skipped_stale_reason = ""
     try:
         with registry_lock(registry_path):
             registry = load_registry(registry_path)
@@ -683,6 +692,7 @@ def cmd_check(args: argparse.Namespace) -> int:
                 raise ValueError(f"unknown token id: {args.id}")
             token = str(row.get("token") or "")
             validate_token(token)
+            snapshot_fingerprint = token_fingerprint(token)
 
         probe = probe_claude_token(token, timeout_seconds)
 
@@ -693,16 +703,28 @@ def cmd_check(args: argparse.Namespace) -> int:
                 # Token was deleted between the probe and the persist.
                 # Surface the probe result without persisting; the
                 # caller will see the result but no row update.
-                pass
+                skipped_stale_reason = "row_deleted"
             else:
-                update_row_from_probe(
-                    row,
-                    probe,
-                    enable_on_ok=bool(args.enable_on_ok),
-                    disable_on_quota=bool(args.disable_on_quota),
-                    retry_seconds=retry_seconds,
+                current_token = str(row.get("token") or "")
+                current_fingerprint = (
+                    token_fingerprint(current_token) if current_token else ""
                 )
-                save_registry(registry_path, registry)
+                if current_fingerprint != snapshot_fingerprint:
+                    # Token VALUE was replaced (cmd_add --replace,
+                    # cmd_rotate, etc.) during the unlocked probe
+                    # window. Discard the stale probe rather than
+                    # persisting it onto the new token.
+                    skipped_stale_reason = "token_replaced"
+                    row = None
+                else:
+                    update_row_from_probe(
+                        row,
+                        probe,
+                        enable_on_ok=bool(args.enable_on_ok),
+                        disable_on_quota=bool(args.disable_on_quota),
+                        retry_seconds=retry_seconds,
+                    )
+                    save_registry(registry_path, registry)
     except Exception as exc:
         return fail(str(exc), json_mode)
 
@@ -715,11 +737,20 @@ def cmd_check(args: argparse.Namespace) -> int:
         "reset_at": str(probe.get("reset_at") or ""),
         "token": public_token_row(row, active_id) if row is not None else {},
     }
+    if skipped_stale_reason:
+        # Surface the skip so machine-readable callers can distinguish
+        # "probe persisted" from "probe discarded due to mid-probe row
+        # mutation." Backwards-compatible additions only.
+        payload["status"] = "skipped"
+        payload["reason"] = skipped_stale_reason
     if json_mode:
         json_dump(payload)
     else:
-        reset = f" reset_at={payload['reset_at']}" if payload["reset_at"] else ""
-        print(f"{payload['status']}: {args.id}{reset}")
+        if skipped_stale_reason:
+            print(f"skipped: {args.id} reason={skipped_stale_reason}")
+        else:
+            reset = f" reset_at={payload['reset_at']}" if payload["reset_at"] else ""
+            print(f"{payload['status']}: {args.id}{reset}")
     return 0
 
 
@@ -732,6 +763,7 @@ def cmd_recover_due(args: argparse.Namespace) -> int:
     checked: list[dict[str, Any]] = []
     recovered: list[str] = []
     still_disabled: list[str] = []
+    skipped_stale: list[dict[str, str]] = []
     active_id = ""
     # PR #799 r2 codex finding 3 — split into THREE phases:
     #   1. Locked read: snapshot candidates and the active_token_id.
@@ -744,6 +776,14 @@ def cmd_recover_due(args: argparse.Namespace) -> int:
     #      probe result, save.
     # If a token has been deleted mid-probe the re-match returns
     # ``None`` and we skip cleanly — no row update, no error.
+    #
+    # PR #799 r3 codex finding 3 — also snapshot the token fingerprint
+    # AND the due-state markers (``disabled_until``, ``next_check_at``).
+    # During the locked persist, skip any row whose token value was
+    # swapped or whose due-state was updated by a concurrent
+    # ``cmd_check`` / ``cmd_add --replace`` / ``cmd_rotate`` while the
+    # probe was running. Surface the skip via ``skipped_stale`` so
+    # operators reading ``--json`` see what was dropped and why.
     try:
         with registry_lock(registry_path):
             registry = load_registry(registry_path)
@@ -756,24 +796,48 @@ def cmd_recover_due(args: argparse.Namespace) -> int:
                 token = str(row.get("token") or "")
                 if not token_id or not token:
                     continue
-                snapshots.append({"id": token_id, "token": token})
+                snapshots.append({
+                    "id": token_id,
+                    "token": token,
+                    "fingerprint": token_fingerprint(token),
+                    "disabled_until": str(row.get("disabled_until") or ""),
+                    "next_check_at": str(row.get("next_check_at") or ""),
+                })
 
-        probes: list[tuple[str, dict[str, Any]]] = []
+        probes: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for snap in snapshots:
             token = snap["token"]
             validate_token(token)
             probe = probe_claude_token(token, timeout_seconds)
-            probes.append((snap["id"], probe))
+            probes.append((snap, probe))
 
         if probes:
             with registry_lock(registry_path):
                 registry = load_registry(registry_path)
                 active_id = str(registry.get("active_token_id") or "")
-                for token_id, probe in probes:
+                for snap, probe in probes:
+                    token_id = snap["id"]
                     row = find_token(registry, token_id)
                     if row is None:
                         # Token was deleted between the probe and the
                         # persist phase — drop it from the report.
+                        skipped_stale.append({"id": token_id, "reason": "row_deleted"})
+                        continue
+                    current_token = str(row.get("token") or "")
+                    current_fingerprint = (
+                        token_fingerprint(current_token) if current_token else ""
+                    )
+                    if current_fingerprint != snap["fingerprint"]:
+                        # Token VALUE was replaced — stale probe.
+                        skipped_stale.append({"id": token_id, "reason": "token_replaced"})
+                        continue
+                    if str(row.get("disabled_until") or "") != snap["disabled_until"]:
+                        # Due-state changed (another check/recovery
+                        # already updated this row) — stale probe.
+                        skipped_stale.append({"id": token_id, "reason": "disabled_until_changed"})
+                        continue
+                    if str(row.get("next_check_at") or "") != snap["next_check_at"]:
+                        skipped_stale.append({"id": token_id, "reason": "next_check_at_changed"})
                         continue
                     update_row_from_probe(
                         row,
@@ -817,6 +881,12 @@ def cmd_recover_due(args: argparse.Namespace) -> int:
         "recovered": recovered,
         "checked": checked,
         "sync_recommended": active_id in recovered,
+        # PR #799 r3 codex finding 3 — backwards-compatible addition.
+        # Empty list when nothing was discarded; populated entries
+        # carry {"id": ..., "reason": ...}. The daemon caller in
+        # bridge-daemon.sh ignores this field; operators reading
+        # ``--json`` get the diagnostic.
+        "skipped_stale": skipped_stale,
     }
     if json_mode:
         json_dump(payload)

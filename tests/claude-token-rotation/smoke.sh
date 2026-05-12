@@ -239,6 +239,67 @@ DENY_OUT="$(run_pretool_bash 'grep CLAUDE launch-secrets.env')"
 [[ "$DENY_OUT" == *'Claude OAuth credentials'* ]] || fail "launch-secrets.env deny reason missing credential phrase: $DENY_OUT"
 pass "pretool denies launch-secrets.env mention"
 
+# PR #799 r3 codex finding 1 — env-dump verbs reveal the exported
+# CLAUDE_CODE_OAUTH_TOKEN without naming the variable. The r2 literal
+# substring deny does not fire on these, so route them through
+# `_raw_dumps_process_environment` to the same credential reason.
+for cmd in \
+    'env' \
+    'env | grep CLAUDE' \
+    'printenv' \
+    'printenv CLAUDE_CODE_OAUTH_TOKEN' \
+    'set' \
+    'set | grep ^CLAUDE_' \
+    'compgen -e' \
+    'declare -p' \
+    'declare -x' \
+    'typeset -p' \
+    'typeset -x' \
+    'export -p' \
+    'cat /proc/self/environ' \
+; do
+    DENY_OUT="$(run_pretool_bash "$cmd")"
+    [[ "$DENY_OUT" == *'"permissionDecision":"deny"'* || "$DENY_OUT" == *'"permissionDecision": "deny"'* ]] \
+        || fail "env-dump pretool did not deny: cmd=$cmd out=$DENY_OUT"
+    [[ "$DENY_OUT" == *'Claude OAuth credentials'* ]] \
+        || fail "env-dump deny reason missing credential phrase: cmd=$cmd out=$DENY_OUT"
+done
+# /proc/$$/environ uses a runtime PID — assert via a static-PID variant
+DENY_OUT="$(run_pretool_bash 'tr "\0" "\n" < /proc/1234/environ')"
+[[ "$DENY_OUT" == *'"permissionDecision":"deny"'* || "$DENY_OUT" == *'"permissionDecision": "deny"'* ]] \
+    || fail "procfs-environ pretool did not deny: $DENY_OUT"
+[[ "$DENY_OUT" == *'Claude OAuth credentials'* ]] \
+    || fail "procfs-environ deny reason missing credential phrase: $DENY_OUT"
+pass "pretool denies env-dump verbs (env / printenv / set / compgen -e / declare -p|-x / typeset -p|-x / export -p / /proc/<pid>/environ)"
+
+# PR #799 r3 codex finding 1 — false-positive sanity: legitimate
+# commands containing tokens like `set`, `env`, `environment`,
+# `setfacl`, `kubectl set image`, etc. must NOT trip the env-dump
+# patterns. None of these contains the substrings already covered by
+# `_raw_mentions_claude_credentials`, so a deny here would be the new
+# `_raw_dumps_process_environment` over-matching.
+for cmd in \
+    'setfacl -m g:foo:rx /tmp/x' \
+    'set -e' \
+    'set -o pipefail' \
+    'set -x' \
+    'kubectl set image deploy/foo bar=baz:1' \
+    'git remote set-url origin foo' \
+    'environment_var_unrelated=1 ./script.sh' \
+    'echo $environment' \
+    'declare foo=1' \
+    'typeset foo=1' \
+    'export FOO=bar' \
+; do
+    ALLOW_OUT="$(run_pretool_bash "$cmd")"
+    if [[ "$ALLOW_OUT" == *'"permissionDecision":"deny"'* || "$ALLOW_OUT" == *'"permissionDecision": "deny"'* ]]; then
+        if [[ "$ALLOW_OUT" == *'Claude OAuth credentials'* ]]; then
+            fail "false-positive env-dump deny: cmd=$cmd out=$ALLOW_OUT"
+        fi
+    fi
+done
+pass "env-dump deny does not over-match setfacl / set -e / kubectl set image / git remote set-url / etc."
+
 # PR #799 r2 codex finding 3 — concurrent activate operations must not
 # corrupt the registry. With the fcntl-based registry_lock context
 # manager, one writer wins fully and the other waits, but neither
@@ -268,3 +329,126 @@ if "first" not in ids or "second" not in ids:
     raise SystemExit(f"lock-race: missing tokens; ids={ids!r}")
 PY
 pass "concurrent activate is lock-serialized (no torn registry)"
+
+# PR #799 r3 codex findings 2 + 3 — stale-probe race assertions for
+# cmd_check and cmd_recover_due. Both commands run an unlocked
+# ``probe_claude_token`` between a locked snapshot and a locked
+# persist. If another mutator swaps the row's token value (cmd_add
+# --replace, cmd_rotate) or updates the due-state markers during the
+# probe window, the persist must DISCARD the stale probe rather than
+# overwriting the new state.
+#
+# Inherent timing: the race needs a sleeping fake `claude` so the
+# probe window is observable. Slow CI hosts can skip via
+# BRIDGE_SMOKE_FAST=1; the unit-static / integration smoke runs do not
+# set that flag, so the assertion stays exercised on CI.
+if [[ "${BRIDGE_SMOKE_FAST:-0}" != "1" ]]; then
+  SLOW_CLAUDE_DIR="$ROOT/slow-claude"
+  mkdir -p "$SLOW_CLAUDE_DIR"
+  cat >"$SLOW_CLAUDE_DIR/claude" <<'SLOW_CLAUDE'
+#!/usr/bin/env bash
+# r3 race-test fake claude — sleeps so a concurrent mutator can swap
+# the row's token value or due-state markers before the probe persist
+# phase reacquires the lock.
+sleep "${SLOW_CLAUDE_SLEEP:-3}"
+printf '%s\n' '{"type":"result","is_error":false,"result":"OK"}'
+SLOW_CLAUDE
+  chmod +x "$SLOW_CLAUDE_DIR/claude"
+
+  # The race tests invoke ``bridge-auth.py`` directly (not via the
+  # ``agent-bridge auth`` wrapper). The wrapper's per-call init
+  # (sourcing isolation libs, validating layout, etc.) adds variable
+  # startup latency that makes the 1-second pre-mutate sleep unreliable
+  # — the locked-read snapshot phase had already observed the mutation
+  # on slower hosts, defeating the race entirely. Calling the python
+  # entry point directly is the contract being tested (the wrapper just
+  # exec's ``python3 bridge-auth.py ... recover-due``) and removes the
+  # wrapper variance.
+
+  # --- Setup for cmd_check stale-probe skip ---
+  RACE_REGISTRY="$ROOT/runtime/secrets/race-check-tokens.json"
+  "$PYTHON" "$REPO_ROOT/bridge-auth.py" --registry "$RACE_REGISTRY" \
+    add --id race --stdin --json \
+    <<<"fake-claude-oauth-token-race-orig" >/dev/null
+
+  CHECK_RACE_OUT="$ROOT/check-race.out"
+  (
+    PATH="$SLOW_CLAUDE_DIR:$PATH" \
+    SLOW_CLAUDE_SLEEP=3 \
+    "$PYTHON" "$REPO_ROOT/bridge-auth.py" --registry "$RACE_REGISTRY" \
+      check race --enable-on-ok --json \
+      >"$CHECK_RACE_OUT" 2>&1
+  ) &
+  CHECK_PID=$!
+  # Give the locked-read phase time to complete, then mutate.
+  sleep 1
+  "$PYTHON" "$REPO_ROOT/bridge-auth.py" --registry "$RACE_REGISTRY" \
+    add --id race --stdin --replace --json \
+    <<<"fake-claude-oauth-token-race-NEW" >/dev/null
+  wait "$CHECK_PID"
+  CHECK_RACE_JSON="$(cat "$CHECK_RACE_OUT")"
+  json_assert "cmd_check stale skip" "$CHECK_RACE_JSON" \
+    "payload.get('status') == 'skipped' and payload.get('reason') == 'token_replaced'"
+  pass "cmd_check discards stale probe when token value was swapped mid-probe"
+
+  # --- Setup for cmd_recover_due stale-probe skip ---
+  RECOVER_REGISTRY="$ROOT/runtime/secrets/race-recover-tokens.json"
+  "$PYTHON" - "$RECOVER_REGISTRY" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps({
+    "version": 1,
+    "active_token_id": "",
+    "auto_rotate_enabled": False,
+    "rotation_threshold": 99.0,
+    "tokens": [
+        {
+            "id": "stalecheck",
+            "token": "fake-claude-oauth-token-stalecheck",
+            "enabled": False,
+            "disabled_reason": "quota_limited",
+            "disabled_until": "2026-05-12T00:00:00+00:00",
+            "next_check_at": "2026-05-12T00:00:00+00:00",
+            "created_at": "2026-05-11T00:00:00+00:00",
+            "updated_at": "2026-05-11T00:00:00+00:00",
+            "last_activated_at": "",
+            "note": ""
+        }
+    ],
+    "last_rotation": {}
+}, indent=2))
+PY
+  chmod 600 "$RECOVER_REGISTRY"
+
+  RECOVER_RACE_OUT="$ROOT/recover-race.out"
+  (
+    PATH="$SLOW_CLAUDE_DIR:$PATH" \
+    SLOW_CLAUDE_SLEEP=3 \
+    BRIDGE_AUTH_NOW_UTC="2026-05-13T00:00:00+00:00" \
+    "$PYTHON" "$REPO_ROOT/bridge-auth.py" --registry "$RECOVER_REGISTRY" \
+      recover-due --json \
+      >"$RECOVER_RACE_OUT" 2>&1
+  ) &
+  RECOVER_PID=$!
+  # During the probe window, mutate disabled_until on the row.
+  sleep 1
+  "$PYTHON" - "$RECOVER_REGISTRY" <<'PY'
+import json, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+data = json.loads(path.read_text())
+for row in data["tokens"]:
+    if row["id"] == "stalecheck":
+        row["disabled_until"] = "2026-05-14T00:00:00+00:00"
+path.write_text(json.dumps(data, indent=2))
+PY
+  wait "$RECOVER_PID"
+  RECOVER_RACE_JSON="$(cat "$RECOVER_RACE_OUT")"
+  json_assert "cmd_recover_due stale skip" "$RECOVER_RACE_JSON" \
+    "any(s.get('id') == 'stalecheck' and s.get('reason') == 'disabled_until_changed' for s in payload.get('skipped_stale', []))"
+  pass "cmd_recover_due discards stale probe when disabled_until changed mid-probe"
+else
+  printf '[smoke][skip] r3 stale-probe race assertions skipped (BRIDGE_SMOKE_FAST=1)\n'
+fi
