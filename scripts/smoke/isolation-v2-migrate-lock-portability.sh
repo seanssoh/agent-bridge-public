@@ -16,7 +16,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-BRIDGE_BASH="${BRIDGE_BASH_BIN:-bash}"
+ORIGINAL_PATH="${PATH:-/usr/bin:/bin}"
+BRIDGE_BASH="${BRIDGE_BASH_BIN:-$(command -v bash)}"
 
 # Use brew bash on macOS (system bash is 3.2 and lacks `declare -g`).
 if [[ "$(uname)" == "Darwin" ]]; then
@@ -30,21 +31,20 @@ fi
 TMPHOME="$(mktemp -d "${TMPDIR:-/tmp}/agb-isolation-v2-lock.XXXXXX")"
 trap 'rm -rf "$TMPHOME"' EXIT
 
-# Build a sanitized PATH that has NO `flock` binary anywhere.
-# Walk the existing PATH, filter out any directory containing flock.
-STRIPPED_PATH=""
-IFS=':' read -ra path_parts <<<"${PATH:-/usr/bin:/bin}"
-for d in "${path_parts[@]}"; do
-  [[ -n "$d" ]] || continue
-  [[ -d "$d" ]] || continue
-  if [[ ! -x "$d/flock" ]]; then
-    STRIPPED_PATH="${STRIPPED_PATH}${STRIPPED_PATH:+:}$d"
-  fi
+# Build a sanitized PATH that has the core commands this smoke needs but no
+# `flock` entry. Filtering out every directory that contains flock also removes
+# mkdir/rm on typical Linux hosts, so use a small symlink farm instead.
+STRIPPED_BIN="$TMPHOME/no-flock-bin"
+mkdir -p "$STRIPPED_BIN"
+for cmd in bash mkdir rm cat tr grep; do
+  target="$(PATH="$ORIGINAL_PATH" command -v "$cmd" 2>/dev/null || true)"
+  [[ -n "$target" ]] || { echo "[smoke] missing required command for stripped PATH: $cmd" >&2; exit 1; }
+  ln -s "$target" "$STRIPPED_BIN/$cmd"
 done
-export PATH="$STRIPPED_PATH"
+STRIPPED_PATH="$STRIPPED_BIN"
 
 # Sanity: confirm `flock` is genuinely unreachable.
-if command -v flock >/dev/null 2>&1; then
+if PATH="$STRIPPED_PATH" command -v flock >/dev/null 2>&1; then
   echo "[smoke:isolation-v2-migrate-lock-portability] FAIL: flock still reachable on stripped PATH" >&2
   exit 1
 fi
