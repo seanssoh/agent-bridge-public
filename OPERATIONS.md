@@ -893,6 +893,25 @@ Sync keeps only a non-secret `CLAUDE_CONFIG_DIR=` pointer in the legacy
 `CLAUDE_CODE_OAUTH_TOKEN=` entry, so the active OAuth token is not inherited
 by Bash/tool subprocesses.
 
+The credential write path is hardened against two specific failure
+modes (see PR #799 r2-of-Path-A):
+
+- **Symlink attack on `.claude/`.** The agent owns its own home, so a
+  pre-planted `.claude` symlink could redirect a privileged write
+  outside the isolated home. The sync path rejects any non-real
+  `.claude` directory and verifies the resolved real path stays
+  inside the isolated user home before any `mkdir` / `chown` / write.
+- **Atomic chown.** The credential / config / settings tempfiles are
+  chowned to the isolated UID before `os.replace`, so the file is
+  never root-owned at its final path. There is no window where Claude
+  cannot read its own credential because the post-sync repair has not
+  run yet.
+
+Same-UID FS readability of the credential file is documented as a
+defense-in-depth residual in [`KNOWN_ISSUES.md` §25](./KNOWN_ISSUES.md#25-claude-oauth-credential--same-uid-fs-readability-residual-799-r2-of-path-a).
+A credential-helper enhancement is planned to close that gap in a
+follow-up PR.
+
 ```bash
 agent-bridge auth claude-token auto-rotate enable --threshold 99
 ```

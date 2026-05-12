@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -995,13 +996,88 @@ def cmd_auto_rotate(args: argparse.Namespace) -> int:
     return 0
 
 
-def write_claude_credentials_file(path: Path, token: str) -> None:
+def _ensure_claude_dir_safe(path: Path, allowed_root: Path | None) -> None:
+    """Verify ``path``'s parent is a real directory inside ``allowed_root``.
+
+    The credential parent directory (``~/.claude/`` in the isolated home) is
+    owned by the agent UID, so an attacker that controls the agent can plant
+    a symlink to anywhere on disk and trick a root-run ``os.replace`` into
+    clobbering the symlink target. This helper rejects any non-real directory
+    before any privileged write happens.
+
+    Raises ``PermissionError`` if:
+      - the parent exists and is a symlink, or
+      - the parent exists and is not a directory, or
+      - the parent's resolved real path is not inside ``allowed_root``.
+
+    Does NOT create the directory — callers decide whether to ``mkdir`` it,
+    and creating directly via ``os.mkdir`` (not ``mkdir -p`` shell expansion)
+    avoids walking through agent-controlled symlink chains.
+
+    Passing ``allowed_root=None`` disables the root-prefix check entirely; the
+    helper still rejects symlinks and non-directories at the parent. That mode
+    is intended for non-isolated dev installs where the credential dir lives
+    inside the controller's own home and is not agent-controlled.
+    """
+    parent = path.parent
+    try:
+        st = os.lstat(str(parent))
+    except FileNotFoundError:
+        # Parent does not exist yet; safe — the caller will mkdir it.
+        return
+    if stat.S_ISLNK(st.st_mode):
+        raise PermissionError(
+            f"refusing to write through symlinked credential dir: {parent}"
+        )
+    if not stat.S_ISDIR(st.st_mode):
+        raise PermissionError(f"credential dir is not a directory: {parent}")
+    if allowed_root is None:
+        return
+    try:
+        resolved = parent.resolve(strict=True)
+        allowed = allowed_root.resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise PermissionError(
+            f"cannot resolve credential dir or allowed root: {exc}"
+        ) from exc
+    resolved_str = str(resolved)
+    allowed_str = str(allowed)
+    if resolved != allowed and not resolved_str.startswith(allowed_str + os.sep):
+        raise PermissionError(
+            f"credential dir resolves outside isolated home: {resolved} not under {allowed}"
+        )
+
+
+def write_claude_credentials_file(
+    path: Path,
+    token: str,
+    *,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+    allowed_root: Path | None = None,
+) -> None:
+    _ensure_claude_dir_safe(path, allowed_root)
     path.parent.mkdir(parents=True, exist_ok=True)
     text = json.dumps(claude_oauth_credentials_payload(token), ensure_ascii=True, indent=2) + "\n"
-    write_private_file_atomic(path, text, mode=0o600, prefix=".credentials.")
+    write_private_file_atomic(
+        path,
+        text,
+        mode=0o600,
+        prefix=".credentials.",
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
 
 
-def write_private_file_atomic(path: Path, text: str, *, mode: int = 0o600, prefix: str = ".tmp.") -> None:
+def write_private_file_atomic(
+    path: Path,
+    text: str,
+    *,
+    mode: int = 0o600,
+    prefix: str = ".tmp.",
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = -1
     tmp_name = ""
@@ -1013,6 +1089,13 @@ def write_private_file_atomic(path: Path, text: str, *, mode: int = 0o600, prefi
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp_name, mode)
+        # PR #799 r2 codex finding 3 — chown the tempfile to the target UID
+        # BEFORE ``os.replace`` so the credential file is never root-owned at
+        # its final path. Avoids the window where Claude can't read its own
+        # credential because the post-sync ``chown`` repair has not run yet.
+        if owner_uid is not None:
+            gid = owner_gid if owner_gid is not None else -1
+            os.chown(tmp_name, owner_uid, gid)
         os.replace(tmp_name, path)
         os.chmod(path, mode)
     finally:
@@ -1025,8 +1108,16 @@ def write_private_file_atomic(path: Path, text: str, *, mode: int = 0o600, prefi
                 pass
 
 
-def ensure_claude_config_file(config_dir: Path, trusted_workdirs: list[str] | None = None) -> Path:
+def ensure_claude_config_file(
+    config_dir: Path,
+    trusted_workdirs: list[str] | None = None,
+    *,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+    allowed_root: Path | None = None,
+) -> Path:
     path = config_dir / ".claude.json"
+    _ensure_claude_dir_safe(path, allowed_root)
     config_dir.mkdir(parents=True, exist_ok=True)
     existing: dict[str, Any] | None = None
     if path.exists():
@@ -1040,9 +1131,19 @@ def ensure_claude_config_file(config_dir: Path, trusted_workdirs: list[str] | No
     payload = claude_config_bootstrap_payload(existing, trusted_workdirs)
     if existing == payload:
         os.chmod(path, 0o600)
+        if owner_uid is not None:
+            gid = owner_gid if owner_gid is not None else -1
+            os.chown(path, owner_uid, gid)
         return path
     text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
-    write_private_file_atomic(path, text, mode=0o600, prefix=".claude.")
+    write_private_file_atomic(
+        path,
+        text,
+        mode=0o600,
+        prefix=".claude.",
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
     return path
 
 
@@ -1059,7 +1160,14 @@ def claude_settings_write_path(config_dir: Path) -> Path:
     return target
 
 
-def ensure_claude_settings_file(config_dir: Path) -> Path:
+def ensure_claude_settings_file(
+    config_dir: Path,
+    *,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+    allowed_root: Path | None = None,
+) -> Path:
+    _ensure_claude_dir_safe(config_dir / "settings.json", allowed_root)
     config_dir.mkdir(parents=True, exist_ok=True)
     path = claude_settings_write_path(config_dir)
     payload: dict[str, Any] = {}
@@ -1076,9 +1184,19 @@ def ensure_claude_settings_file(config_dir: Path) -> Path:
     before = dict(payload)
     payload.setdefault("skipDangerousModePermissionPrompt", True)
     if payload == before:
+        if owner_uid is not None and path.exists():
+            gid = owner_gid if owner_gid is not None else -1
+            os.chown(path, owner_uid, gid)
         return path
     text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
-    write_private_file_atomic(path, text, mode=mode, prefix=".settings.")
+    write_private_file_atomic(
+        path,
+        text,
+        mode=mode,
+        prefix=".settings.",
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
     return path
 
 
@@ -1098,9 +1216,31 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
         validate_token(token)
         credential_file = Path(args.file).expanduser()
         trusted_workdirs = [str(Path(item).expanduser()) for item in (args.workdir or []) if item]
-        write_claude_credentials_file(credential_file, token)
-        config_file = ensure_claude_config_file(credential_file.parent, trusted_workdirs)
-        settings_file = ensure_claude_settings_file(credential_file.parent)
+        owner_uid = args.owner_uid if args.owner_uid is not None and args.owner_uid >= 0 else None
+        owner_gid = args.owner_gid if args.owner_gid is not None and args.owner_gid >= 0 else None
+        allowed_root = (
+            Path(args.allowed_root).expanduser() if args.allowed_root else None
+        )
+        write_claude_credentials_file(
+            credential_file,
+            token,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            allowed_root=allowed_root,
+        )
+        config_file = ensure_claude_config_file(
+            credential_file.parent,
+            trusted_workdirs,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            allowed_root=allowed_root,
+        )
+        settings_file = ensure_claude_settings_file(
+            credential_file.parent,
+            owner_uid=owner_uid,
+            owner_gid=owner_gid,
+            allowed_root=allowed_root,
+        )
     except Exception as exc:
         return fail(str(exc), json_mode)
     payload = {
@@ -1184,6 +1324,23 @@ def build_parser() -> argparse.ArgumentParser:
     sync_parser.add_argument("--agent", required=True)
     sync_parser.add_argument("--file", required=True)
     sync_parser.add_argument("--workdir", action="append", default=[])
+    sync_parser.add_argument(
+        "--owner-uid",
+        type=int,
+        default=None,
+        help="chown credential/config/settings files to this UID before os.replace (PR #799 r2 atomic chown)",
+    )
+    sync_parser.add_argument(
+        "--owner-gid",
+        type=int,
+        default=None,
+        help="chown credential/config/settings files to this GID before os.replace",
+    )
+    sync_parser.add_argument(
+        "--allowed-root",
+        default=None,
+        help="require resolved credential dir to stay under this real path (PR #799 r2 symlink hardening)",
+    )
     sync_parser.add_argument("--json", action="store_true")
     sync_parser.set_defaults(handler=cmd_sync_agent)
 

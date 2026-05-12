@@ -584,3 +584,90 @@ PY
 else
   printf '[smoke][skip] r3 stale-probe race assertions skipped (BRIDGE_SMOKE_FAST=1)\n'
 fi
+
+# PR #799 r2 codex finding 2 — symlink in the agent's `.claude` directory
+# must be rejected before any write. The agent owns its own home, so a
+# pre-planted symlink to anywhere on disk could trick a privileged write
+# into clobbering the symlink target. We register a fresh agent for the
+# rejection test so the assertion runs against a clean home (the main
+# patch/AGENT flow above has already populated $CREDENTIAL_FILE).
+
+SYM_AGENT="patch-symlink-test"
+SYM_AGENT_HOME="$BRIDGE_DATA_ROOT/agents/$SYM_AGENT/home"
+cat >>"$BRIDGE_ROSTER_LOCAL_FILE" <<ROSTER_APPEND
+bridge_add_agent_id_if_missing "$SYM_AGENT"
+BRIDGE_AGENT_DESC["$SYM_AGENT"]="Symlink test"
+BRIDGE_AGENT_ENGINE["$SYM_AGENT"]="claude"
+BRIDGE_AGENT_SESSION["$SYM_AGENT"]="$SYM_AGENT"
+BRIDGE_AGENT_WORKDIR["$SYM_AGENT"]="$ROOT/workdir"
+BRIDGE_AGENT_LAUNCH_CMD["$SYM_AGENT"]="claude"
+BRIDGE_AGENT_SOURCE["$SYM_AGENT"]="static"
+ROSTER_APPEND
+mkdir -p "$SYM_AGENT_HOME"
+SYM_ATTACK_TARGET="$ROOT/attacker-target"
+mkdir -p "$SYM_ATTACK_TARGET"
+ln -s "$SYM_ATTACK_TARGET" "$SYM_AGENT_HOME/.claude"
+
+SYM_SYNC_OUT="$ROOT/sym-sync.out"
+set +e
+"$REPO_ROOT/agent-bridge" auth claude-token sync --agents "$SYM_AGENT" --json \
+  >"$SYM_SYNC_OUT" 2>&1
+SYM_SYNC_RC=$?
+set -e
+SYM_SYNC_TEXT="$(cat "$SYM_SYNC_OUT")"
+# Either rc != 0 OR a payload with status != ok and an explicit symlink
+# failure is acceptable; the contract is that the credential write does
+# NOT happen.
+if [[ "$SYM_SYNC_TEXT" != *"symlink"* ]]; then
+  fail "symlink-reject did not surface symlink error: rc=$SYM_SYNC_RC out=$SYM_SYNC_TEXT"
+fi
+# The symlink target must remain empty — no credential file written
+# inside it. (The walk through symlink would have created
+# $SYM_ATTACK_TARGET/.credentials.json or similar.)
+if [[ -e "$SYM_ATTACK_TARGET/.credentials.json" ]]; then
+  fail "symlink target was written through: $SYM_ATTACK_TARGET/.credentials.json exists"
+fi
+pass "symlink in agent .claude/ is rejected before any privileged write"
+
+# PR #799 r2 codex finding 3 — atomic chown: the credential file at its
+# final path must be owned by the target UID (never transiently
+# root-owned). In the non-isolated smoke harness there is no separate
+# isolated UID to chown to, so the assertion is:
+#   - the credential file exists at its expected path,
+#   - it is owned by the calling UID immediately after sync (i.e. the
+#     uid that ran the sync command can read it without a repair step),
+#   - mode is 0600.
+# When BRIDGE_SMOKE_ATOMIC_CHOWN_REQUIRE_ROOT=1 the harness is being run
+# in a privileged isolated-mode driver; assert that the file is NOT
+# root-owned (= it was chowned to the agent UID before os.replace).
+
+if [[ ! -f "$CREDENTIAL_FILE" ]]; then
+  fail "atomic-chown: credential file missing at $CREDENTIAL_FILE"
+fi
+CRED_UID="$("$PYTHON" - "$CREDENTIAL_FILE" <<'PY'
+import os, sys
+print(os.stat(sys.argv[1]).st_uid)
+PY
+)"
+CRED_MODE="$("$PYTHON" - "$CREDENTIAL_FILE" <<'PY'
+import os, stat as st, sys
+print(oct(st.S_IMODE(os.stat(sys.argv[1]).st_mode)))
+PY
+)"
+SELF_UID="$(id -u)"
+if [[ "${BRIDGE_SMOKE_ATOMIC_CHOWN_REQUIRE_ROOT:-0}" == "1" ]]; then
+  if [[ "$CRED_UID" == "0" ]]; then
+    fail "atomic-chown: isolated-mode credential is still root-owned ($CRED_UID); pre-replace chown did not apply"
+  fi
+else
+  if [[ "$CRED_UID" != "$SELF_UID" ]]; then
+    fail "atomic-chown: credential UID=$CRED_UID expected $SELF_UID; rotation is not atomic w.r.t. ownership"
+  fi
+fi
+case "$CRED_MODE" in
+  0o600|0o0600) : ;;
+  *)
+    fail "atomic-chown: credential mode=$CRED_MODE expected 0o600"
+    ;;
+esac
+pass "credential file is owner-correct + mode 0600 at its final path (no transient root-owned window)"

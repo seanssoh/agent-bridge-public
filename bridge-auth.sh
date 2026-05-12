@@ -48,7 +48,12 @@ bridge_auth_legacy_secret_env_file_for_agent() {
   printf '%s' "$file"
 }
 
-bridge_auth_claude_credentials_file_for_agent() {
+bridge_auth_resolved_user_home_for_agent() {
+  # Resolve the user home that the credential file should live under,
+  # following the same rule as bridge_auth_claude_credentials_file_for_agent
+  # but without appending the `.claude/.credentials.json` tail. Used as the
+  # ``allowed_root`` argument for symlink hardening so the resolved
+  # ``.claude`` directory must stay inside the agent's own home.
   local agent="$1"
   local os_user=""
   local user_home=""
@@ -57,22 +62,85 @@ bridge_auth_claude_credentials_file_for_agent() {
     if [[ -n "$os_user" ]]; then
       user_home="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || true)"
       if [[ -n "$user_home" ]]; then
-        printf '%s/.claude/.credentials.json' "$user_home"
+        printf '%s' "$user_home"
         return 0
       fi
     fi
   fi
-  printf '%s/.claude/.credentials.json' "$(bridge_agent_default_home "$agent")"
+  bridge_agent_default_home "$agent"
+}
+
+bridge_auth_verify_safe_claude_dir() {
+  # PR #799 r2 codex finding 2 — reject any non-real ``.claude/`` (symlink,
+  # file, or path that resolves outside the isolated home). The agent owns
+  # its own home, so it can pre-place ``.claude`` as a symlink to anywhere
+  # on disk; a privileged write would then clobber the symlink target. This
+  # helper rejects those cases before any mkdir / chown / write happens.
+  #
+  # Both the user-home and the resolved claude dir are passed through
+  # ``cd -P`` so per-platform symlink prefixes (e.g. macOS
+  # ``/var`` -> ``/private/var``) do not produce false rejections on the
+  # prefix match.
+  local agent="$1"
+  local user_home="$2"
+  local claude_dir="$user_home/.claude"
+  local resolved_home=""
+  local resolved=""
+  if [[ ! -e "$claude_dir" && ! -L "$claude_dir" ]]; then
+    return 0
+  fi
+  if [[ -L "$claude_dir" ]]; then
+    printf '[error] %s is a symlink — refusing to write through it (agent=%s)\n' \
+      "$claude_dir" "$agent" >&2
+    return 1
+  fi
+  if [[ ! -d "$claude_dir" ]]; then
+    printf '[error] %s exists but is not a directory (agent=%s)\n' \
+      "$claude_dir" "$agent" >&2
+    return 1
+  fi
+  resolved_home="$(cd -P "$user_home" 2>/dev/null && pwd -P)" || {
+    printf '[error] cannot resolve agent home: %s (agent=%s)\n' "$user_home" "$agent" >&2
+    return 1
+  }
+  resolved="$(cd -P "$claude_dir" 2>/dev/null && pwd -P)" || {
+    printf '[error] cannot resolve %s (agent=%s)\n' "$claude_dir" "$agent" >&2
+    return 1
+  }
+  case "$resolved/" in
+    "$resolved_home/"*) : ;;
+    *)
+      printf '[error] %s resolves outside isolated home: %s (home=%s, agent=%s)\n' \
+        "$claude_dir" "$resolved" "$resolved_home" "$agent" >&2
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+bridge_auth_claude_credentials_file_for_agent() {
+  local agent="$1"
+  local user_home=""
+  user_home="$(bridge_auth_resolved_user_home_for_agent "$agent")" || return 1
+  [[ -n "$user_home" ]] || {
+    printf '[error] cannot resolve user home for agent: %s\n' "$agent" >&2
+    return 1
+  }
+  bridge_auth_verify_safe_claude_dir "$agent" "$user_home" || return 1
+  printf '%s/.claude/.credentials.json' "$user_home"
 }
 
 bridge_auth_prepare_credential_file() {
   local agent="$1"
   local file="$2"
   local dir=""
+  local user_home=""
   local os_user=""
   local os_group=""
 
   dir="$(dirname "$file")"
+  user_home="$(bridge_auth_resolved_user_home_for_agent "$agent")" || return 1
+  bridge_auth_verify_safe_claude_dir "$agent" "$user_home" || return 1
   if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
     os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
     [[ -n "$os_user" ]] || {
@@ -81,6 +149,10 @@ bridge_auth_prepare_credential_file() {
     }
     os_group="$(id -gn "$os_user" 2>/dev/null || printf '%s' "$os_user")"
     if ! bridge_auth_run_privileged test -d "$dir"; then
+      # PR #799 r2 codex finding 2 — verify_safe_claude_dir above already
+      # rejected pre-existing symlinks / non-dirs. The ``mkdir -p`` here is
+      # safe because the parent ``$user_home`` is the privileged-owned
+      # isolated root and ``.claude`` does not yet exist.
       bridge_auth_run_privileged mkdir -p "$dir" || {
         printf '[error] cannot create Claude credentials dir: %s\n' "$dir" >&2
         return 1
@@ -215,18 +287,53 @@ bridge_auth_sync_agent_python() {
   local registry="$2"
   local file="$3"
   local workdir=""
+  local user_home=""
+  local os_user=""
+  local owner_uid=""
+  local owner_gid=""
   local -a workdir_args=()
+  local -a owner_args=()
 
   workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
   [[ -n "$workdir" ]] && workdir_args=(--workdir "$workdir")
 
+  # PR #799 r2 codex findings 2 + 3 — pass the isolated UID/GID + allowed
+  # filesystem root to Python so:
+  #   - the credential / config / settings tempfiles are chowned to the
+  #     target UID BEFORE ``os.replace`` (no transient root-owned window);
+  #   - the symlink rejection + realpath-stays-inside-home check runs on
+  #     the Python side too, not only in the bash wrapper.
   if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    if [[ -n "$os_user" ]]; then
+      owner_uid="$(id -u "$os_user" 2>/dev/null || true)"
+      owner_gid="$(id -g "$os_user" 2>/dev/null || true)"
+      user_home="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || true)"
+      if [[ -n "$owner_uid" ]]; then
+        owner_args+=(--owner-uid "$owner_uid")
+      fi
+      if [[ -n "$owner_gid" ]]; then
+        owner_args+=(--owner-gid "$owner_gid")
+      fi
+      if [[ -n "$user_home" ]]; then
+        owner_args+=(--allowed-root "$user_home")
+      fi
+    fi
     bridge_linux_sudo_root python3 "$SCRIPT_DIR/bridge-auth.py" \
-      --registry "$registry" sync-agent --agent "$agent" --file "$file" "${workdir_args[@]}" --json
+      --registry "$registry" sync-agent --agent "$agent" --file "$file" \
+      "${workdir_args[@]}" "${owner_args[@]}" --json
     return $?
   fi
+  # Non-isolated dev install — Python still gets the agent's resolved home as
+  # ``--allowed-root`` so the symlink-reject defense applies there too, but
+  # no chown args (caller UID already owns the file).
+  user_home="$(bridge_auth_resolved_user_home_for_agent "$agent" 2>/dev/null || true)"
+  if [[ -n "$user_home" ]]; then
+    owner_args+=(--allowed-root "$user_home")
+  fi
   python3 "$SCRIPT_DIR/bridge-auth.py" \
-    --registry "$registry" sync-agent --agent "$agent" --file "$file" "${workdir_args[@]}" --json
+    --registry "$registry" sync-agent --agent "$agent" --file "$file" \
+    "${workdir_args[@]}" "${owner_args[@]}" --json
 }
 
 bridge_auth_selected_agents() {
@@ -318,7 +425,11 @@ PY
   fi
 
   for agent in "${agents[@]}"; do
-    file="$(bridge_auth_claude_credentials_file_for_agent "$agent")"
+    file="$(bridge_auth_claude_credentials_file_for_agent "$agent")" || {
+      failed+=("$agent:credential_path_rejected")
+      rc=1
+      continue
+    }
     legacy_file="$(bridge_auth_legacy_secret_env_file_for_agent "$agent")"
     if ! bridge_auth_prepare_credential_file "$agent" "$file"; then
       failed+=("$agent:prepare_failed")
@@ -330,6 +441,12 @@ PY
       rc=1
       continue
     fi
+    # PR #799 r2 codex finding 3 — Python wrote the tempfile, chowned it to
+    # the isolated UID, then ``os.replace``-d into final path. The file is
+    # never root-owned at its final path so the post-sync chown repair
+    # below is now a defense-in-depth assertion: it re-applies mode/owner
+    # on legacy installs where stale root-owned files may pre-exist. It is
+    # no longer load-bearing for fresh rotations.
     if ! bridge_auth_fix_credential_file_mode "$agent" "$file"; then
       failed+=("$agent:mode_failed")
       rc=1
