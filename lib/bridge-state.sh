@@ -1841,12 +1841,16 @@ bridge_with_timeout() {
   fi
 
   # Tier 3: no wrap available — log once and run unwrapped (status quo).
+  # NOTE: bridge_audit_log itself calls bridge_require_python, which `exit`s
+  # via bridge_die when python3 is absent — the very condition that put us in
+  # tier 3. Wrap the audit call in a subshell so any such `exit` is contained
+  # to the subshell and the unwrapped exec below still runs.
   if (( _BRIDGE_WITH_TIMEOUT_UNAVAILABLE_LOGGED == 0 )); then
-    bridge_audit_log daemon daemon_subprocess_timeout_unavailable daemon \
-      --detail call_site="$label" \
-      --detail requested_seconds="$secs" \
-      --detail note="neither timeout/gtimeout nor python3 on PATH; running unwrapped" \
-      2>/dev/null || true
+    ( bridge_audit_log daemon daemon_subprocess_timeout_unavailable daemon \
+        --detail call_site="$label" \
+        --detail requested_seconds="$secs" \
+        --detail note="neither timeout/gtimeout nor python3 on PATH; running unwrapped" \
+        2>/dev/null ) || true
     _BRIDGE_WITH_TIMEOUT_UNAVAILABLE_LOGGED=1
   fi
   "$@"

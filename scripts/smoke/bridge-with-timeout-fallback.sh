@@ -52,6 +52,13 @@ smoke_setup_bridge_home "$SMOKE_NAME"
 
 export BRIDGE_REPO_ROOT="$SMOKE_REPO_ROOT"
 export BRIDGE_SCRIPT_DIR="$BRIDGE_REPO_ROOT"
+# bridge-lib.sh (sourced by the driver) routes through bridge-layout-resolver,
+# which hard-aborts on a markerless install unless BRIDGE_LAYOUT=v2 +
+# BRIDGE_DATA_ROOT=<absolute> are exported. Seed an isolated v2 data root in
+# the temp BRIDGE_HOME so the driver can load the full lib chain.
+export BRIDGE_LAYOUT=v2
+export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
+mkdir -p "$BRIDGE_DATA_ROOT/agents"
 : >"$BRIDGE_AUDIT_LOG"
 
 # Resolve the absolute paths to the binaries we may want to hide per tier.
@@ -70,14 +77,32 @@ BASH_BIN="$(command -v bash)"
 DRIVER="$SMOKE_TMP_ROOT/with-timeout-driver.sh"
 cat >"$DRIVER" <<'EOF'
 #!/usr/bin/env bash
-# args: <secs> <label> <cmd> [cmd_args...]
+# args: <tier_path> <secs> <label> <cmd> [cmd_args...]
+#
+# The driver sources bridge-lib.sh under the *load PATH* (BRIDGE_LOAD_PATH —
+# inherited from the smoke harness) so cd/dirname/basename are resolvable
+# while the lib chain initializes. Only after the source completes do we
+# narrow PATH to the per-tier shim — that is the PATH bridge_with_timeout's
+# own `command -v timeout/gtimeout/python3` resolution sees, so the tier
+# isolation still holds. Sourcing the full lib chain ensures
+# bridge_require_python is defined, so the tier-3 audit-before-exec bug
+# (codex r1 Finding 1) is reproducible from this harness.
 set -uo pipefail
 SCRIPT_DIR="${BRIDGE_REPO_ROOT:?}"
 # shellcheck source=/dev/null
-source "$BRIDGE_REPO_ROOT/lib/bridge-state.sh"
-secs="$1"
-label="$2"
-shift 2
+source "$BRIDGE_REPO_ROOT/bridge-lib.sh"
+tier_path="$1"
+secs="$2"
+label="$3"
+shift 3
+# Reset bridge_with_timeout's per-shell binary caches so the new PATH is
+# actually probed instead of returning a stale resolution from a prior call.
+_BRIDGE_WITH_TIMEOUT_BIN_CACHED=0
+_BRIDGE_WITH_TIMEOUT_BIN=""
+_BRIDGE_WITH_TIMEOUT_PYTHON_CACHED=0
+_BRIDGE_WITH_TIMEOUT_PYTHON=""
+_BRIDGE_WITH_TIMEOUT_UNAVAILABLE_LOGGED=0
+PATH="$tier_path"
 bridge_with_timeout "$secs" "$label" "$@"
 EOF
 chmod +x "$DRIVER"
@@ -115,9 +140,14 @@ run_in_tier() {
   local started ended elapsed
   started="$("$DATE_BIN" +%s)"
   set +e
+  # PATH passed to env -i is the *load PATH* — bridge-lib.sh's source-time
+  # initialization (cd, dirname, basename, etc.) needs the system PATH to
+  # resolve coreutils. The driver narrows PATH to "$tier_path" right before
+  # invoking bridge_with_timeout, so tier-1/2/3 isolation still applies to
+  # bridge_with_timeout's own binary probing.
   env -i \
     HOME="$HOME" \
-    PATH="$tier_path" \
+    PATH="$PATH" \
     BRIDGE_HOME="$BRIDGE_HOME" \
     BRIDGE_STATE_DIR="$BRIDGE_STATE_DIR" \
     BRIDGE_LOG_DIR="$BRIDGE_LOG_DIR" \
@@ -125,7 +155,9 @@ run_in_tier() {
     BRIDGE_AUDIT_LOG="$BRIDGE_AUDIT_LOG" \
     BRIDGE_REPO_ROOT="$BRIDGE_REPO_ROOT" \
     BRIDGE_SCRIPT_DIR="$BRIDGE_SCRIPT_DIR" \
-    "$BASH_BIN" "$DRIVER" "$secs" "$label" "$@" >/dev/null 2>&1
+    BRIDGE_LAYOUT="$BRIDGE_LAYOUT" \
+    BRIDGE_DATA_ROOT="$BRIDGE_DATA_ROOT" \
+    "$BASH_BIN" "$DRIVER" "$tier_path" "$secs" "$label" "$@" >/dev/null 2>&1
   rc=$?
   set -e
   ended="$("$DATE_BIN" +%s)"
@@ -168,6 +200,33 @@ step_tier1_binary_path() {
     smoke_fail "tier 1: audit log missing tier=binary detail: $(cat "$BRIDGE_AUDIT_LOG")"
   fi
   smoke_log "  rc=$rc elapsed=${elapsed}s (binary tier killed at budget)"
+}
+
+step_tier1_binary_passthrough() {
+  smoke_log "tier 1: binary wrap must pass through exit codes for fast-completing cmds"
+
+  if [[ -z "$SYS_TIMEOUT" && -z "$SYS_GTIMEOUT" ]]; then
+    smoke_skip "tier 1 passthrough" "neither timeout(1) nor gtimeout(1) on host — cannot exercise the binary tier"
+    return 0
+  fi
+
+  local tier_dir
+  tier_dir="$(build_tier_path_dir "$SMOKE_TMP_ROOT/path-tier1-pass" \
+    "$SYS_TIMEOUT" "$SYS_GTIMEOUT" "$SYS_PYTHON3" "$DATE_BIN" "$SLEEP_BIN")"
+
+  # `sleep 0` exits 0 immediately; budget 5s is well above that.
+  local output rc
+  output="$(run_in_tier "$tier_dir" 5 tier1_pass "$SLEEP_BIN" 0)"
+  rc="$(printf '%s\n' "$output" | sed -n 's/.*rc=\([0-9]*\).*/\1/p')"
+  if [[ "$rc" != "0" ]]; then
+    smoke_fail "tier 1 passthrough: expected rc=0, got rc=$rc (output=$output)"
+  fi
+
+  # The fast-success path must NOT write a timeout audit row.
+  if grep -q '"call_site": "tier1_pass"' "$BRIDGE_AUDIT_LOG"; then
+    smoke_fail "tier 1 passthrough: unexpected audit row for successful run"
+  fi
+  smoke_log "  rc=$rc (binary tier transparently passes success)"
 }
 
 # --- tier 2: python3 only ---------------------------------------------------
@@ -302,6 +361,7 @@ step_tier3_unwrapped_with_audit() {
 }
 
 smoke_run "tier 1 (timeout/gtimeout binary) kills at budget"        step_tier1_binary_path
+smoke_run "tier 1 (binary) passes through fast-success commands"   step_tier1_binary_passthrough
 smoke_run "tier 2 (python3) kills at budget when binary hidden"    step_tier2_python_kill
 smoke_run "tier 2 (python3) passes through fast-success commands"  step_tier2_python_passthrough
 smoke_run "tier 3 (no wrap) runs unwrapped when python3 hidden"    step_tier3_unwrapped_with_audit
