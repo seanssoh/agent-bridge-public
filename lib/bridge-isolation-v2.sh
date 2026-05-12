@@ -1461,6 +1461,25 @@ bridge_isolation_v2_matrix_rows_for_agent() {
   return 0
 }
 
+bridge_isolation_v2_controller_user() {
+  # Isolated agent hooks run with USER=agent-bridge-<agent>, but generated
+  # agent envs carry the controller UID that authored the v2 layout.
+  local controller_uid="${BRIDGE_CONTROLLER_UID:-}"
+  local controller_user=""
+
+  if [[ "$controller_uid" =~ ^[0-9]+$ ]] && command -v getent >/dev/null 2>&1; then
+    controller_user="$(getent passwd "$controller_uid" 2>/dev/null | cut -d: -f1 || true)"
+    if [[ -n "$controller_user" ]]; then
+      printf '%s' "$controller_user"
+      return 0
+    fi
+  fi
+
+  controller_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+  [[ -n "$controller_user" ]] || return 1
+  printf '%s' "$controller_user"
+}
+
 bridge_isolation_v2_apply_row() {
   # Internal dispatcher — applies (or checks) one matrix row.
   # Args:
@@ -1482,9 +1501,9 @@ bridge_isolation_v2_apply_row() {
   local mechanism="${10}"
   local criticality="${11}"
 
-  # Resolve `controller` token at apply time so the matrix stays static.
+  # Resolve `controller` token at apply/check time so the matrix stays static.
   if [[ "$owner" == "controller" ]]; then
-    owner="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+    owner="$(bridge_isolation_v2_controller_user 2>/dev/null || true)"
     [[ -n "$owner" ]] || {
       bridge_warn "apply_row($row_name): cannot resolve controller user"
       return 1
@@ -1740,6 +1759,11 @@ bridge_isolation_v2_ensure_matrix_path() {
     return 1
   fi
   IFS='|' read -r r_name r_path r_access r_owner r_group r_dmode r_fmode r_setgid r_mech r_crit r_notes <<<"$row"
+  if bridge_isolation_v2_apply_row "check" \
+    "$r_name" "$r_path" "$r_access" "$r_owner" "$r_group" \
+    "$r_dmode" "$r_fmode" "$r_setgid" "$r_mech" "$r_crit" 2>/dev/null; then
+    return 0
+  fi
   bridge_isolation_v2_apply_row "apply" \
     "$r_name" "$r_path" "$r_access" "$r_owner" "$r_group" \
     "$r_dmode" "$r_fmode" "$r_setgid" "$r_mech" "$r_crit"
