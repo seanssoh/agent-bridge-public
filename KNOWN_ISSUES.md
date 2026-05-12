@@ -592,12 +592,14 @@ need to inspect a specific failure mode).
 The tool-policy pretool gate denies env-dump verbs — `env`,
 `printenv`, bare `set`, `compgen -e`, `declare -p` / `declare -x`,
 `typeset -p` / `typeset -x`, `export -p`, and any read of
-`/proc/<pid>/environ` — to prevent exfiltration of the exported
-`CLAUDE_CODE_OAUTH_TOKEN` (the active OAuth token injected into the
-agent's launch subshell via `launch-secrets.env`). The literal
-substring deny added in #799 r2 only matched when the raw text named
-the token variable; env-dump verbs enumerate every exported variable
-without naming any of them, so they bypassed that check entirely.
+`/proc/<pid>/environ` — as defense-in-depth for stale/manual secret
+environment variables. #799's final design no longer delivers Claude
+OAuth tokens through `CLAUDE_CODE_OAUTH_TOKEN`; it writes the active
+setup token into the selected Claude agent's `.claude/.credentials.json`
+file instead. The env-dump deny remains because older deploys or manual
+operator exports may still put token material in the process
+environment, and literal substring checks only fire when the raw command
+names the variable.
 
 Side effect: `env VAR=val cmd` (env-as-prefix) is also denied because
 distinguishing it from a bare `env` dump from the raw command string

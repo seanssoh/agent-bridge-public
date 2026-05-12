@@ -641,13 +641,13 @@ while true; do
   if [[ -f "$ERRFILE" ]]; then
     local_err_size_before="$(wc -c <"$ERRFILE" 2>/dev/null || echo 0)"
   fi
-  # v2 isolation: load per-agent launch secrets from credentials/launch-secrets.env
-  # into the child shell so the child inherits them via export, NEVER via
-  # composing into LAUNCH_CMD. Composing tokens into LAUNCH_CMD leaks via
-  # process listings, raw display output, crash-report paths, and
-  # any tee'd stderr. Loading inside the launch subshell (not the parent)
-  # also prevents stale secrets from persisting across restart-loop
-  # iterations after the credentials file is rotated, emptied, or removed.
+  # v2 isolation: load generic per-agent launch secrets from
+  # credentials/launch-secrets.env into the child shell so the child inherits
+  # them via export, NEVER via composing into LAUNCH_CMD. Claude OAuth token
+  # values deliberately do not use this path; agent-bridge auth claude-token
+  # sync writes Claude's .credentials.json file, keeps only a non-secret
+  # CLAUDE_CONFIG_DIR pointer here, and scrubs stale CLAUDE_CODE_OAUTH_TOKEN
+  # entries from this env file.
   #
   # v0.8.0 T5: BRIDGE_DISABLE_ISOLATION=1 short-circuits the secret-env
   # wrap. Skipping this means the child does NOT see launch secrets

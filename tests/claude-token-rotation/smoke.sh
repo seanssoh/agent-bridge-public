@@ -30,7 +30,8 @@ TOKEN_A="fake-claude-oauth-token-a"
 TOKEN_B="fake-claude-oauth-token-b"
 TOKEN_C="fake-claude-oauth-token-c"
 AGENT="patch"
-SECRET_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/credentials/launch-secrets.env"
+CREDENTIAL_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/home/.claude/.credentials.json"
+LEGACY_SECRET_FILE="$BRIDGE_DATA_ROOT/agents/$AGENT/credentials/launch-secrets.env"
 
 mkdir -p "$BRIDGE_HOME" "$BRIDGE_DATA_ROOT" "$ROOT/runtime/secrets" "$ROOT/workdir" "$ROOT/bin"
 : >"$BRIDGE_ROSTER_FILE"
@@ -47,6 +48,14 @@ ROSTER
 
 cat >"$ROOT/bin/claude" <<'FAKE_CLAUDE'
 #!/usr/bin/env bash
+if [[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]]; then
+  printf '%s\n' '{"type":"result","is_error":true,"api_error_status":500,"result":"token env should not be inherited"}'
+  exit 1
+fi
+if [[ -n "${CLAUDE_CONFIG_DIR:-}" && ! -f "$CLAUDE_CONFIG_DIR/.credentials.json" ]]; then
+  printf '%s\n' '{"type":"result","is_error":true,"api_error_status":401,"result":"missing credential file"}'
+  exit 1
+fi
 case "${FAKE_CLAUDE_MODE:-ok}" in
   quota)
     printf '%s\n' '{"type":"result","is_error":true,"api_error_status":429,"result":"You'\''ve hit your limit - resets May 13, 3am (UTC)"}'
@@ -88,8 +97,24 @@ PY
 ADD_JSON="$(printf '%s' "$TOKEN_A" | "$REPO_ROOT/agent-bridge" auth claude-token add --id first --stdin --activate --sync --json)"
 [[ "$ADD_JSON" != *"$TOKEN_A"* ]] || fail "add output leaked token A"
 json_assert "add first" "$ADD_JSON" "payload['status'] == 'added' and payload['active_token_id'] == 'first' and payload['sync']['status'] == 'ok'"
-grep -Fq "CLAUDE_CODE_OAUTH_TOKEN='$TOKEN_A'" "$SECRET_FILE" || fail "secret file did not receive token A"
-pass "add --sync writes active token without leaking it"
+"$PYTHON" - "$CREDENTIAL_FILE" "$TOKEN_A" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected = sys.argv[2]
+payload = json.loads(path.read_text(encoding="utf-8"))
+actual = payload.get("claudeAiOauth", {}).get("accessToken")
+if actual != expected:
+    raise SystemExit("credential file did not receive token A")
+if "refreshToken" in payload.get("claudeAiOauth", {}):
+    raise SystemExit("setup-token credential should not invent refreshToken")
+PY
+[[ -f "$LEGACY_SECRET_FILE" ]] || fail "legacy launch env file with CLAUDE_CONFIG_DIR was not created"
+! grep -Fq "CLAUDE_CODE_OAUTH_TOKEN" "$LEGACY_SECRET_FILE" || fail "legacy launch secret still contains token env"
+grep -Fq "CLAUDE_CONFIG_DIR='$(dirname "$CREDENTIAL_FILE")'" "$LEGACY_SECRET_FILE" || fail "legacy launch env did not point Claude at per-agent config dir"
+pass "add --sync writes Claude credential file without leaking token env"
 
 ADD_SECOND_JSON="$(printf '%s' "$TOKEN_B" | "$REPO_ROOT/agent-bridge" auth claude-token add --id second --stdin --json)"
 [[ "$ADD_SECOND_JSON" != *"$TOKEN_B"* ]] || fail "add output leaked token B"
@@ -99,8 +124,18 @@ pass "second token registered without activation"
 ROTATE_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token rotate --reason smoke --sync --json)"
 [[ "$ROTATE_JSON" != *"$TOKEN_A"* && "$ROTATE_JSON" != *"$TOKEN_B"* ]] || fail "rotate output leaked token"
 json_assert "rotate" "$ROTATE_JSON" "payload['status'] == 'rotated' and payload['old_active_token_id'] == 'first' and payload['active_token_id'] == 'second' and payload['sync']['status'] == 'ok'"
-grep -Fq "CLAUDE_CODE_OAUTH_TOKEN='$TOKEN_B'" "$SECRET_FILE" || fail "secret file did not rotate to token B"
-pass "rotate --sync advances launch secret"
+"$PYTHON" - "$CREDENTIAL_FILE" "$TOKEN_B" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+actual = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("claudeAiOauth", {}).get("accessToken")
+if actual != sys.argv[2]:
+    raise SystemExit("credential file did not rotate to token B")
+PY
+! grep -Fq "CLAUDE_CODE_OAUTH_TOKEN" "$LEGACY_SECRET_FILE" || fail "legacy launch secret reintroduced token env"
+grep -Fq "CLAUDE_CONFIG_DIR='$(dirname "$CREDENTIAL_FILE")'" "$LEGACY_SECRET_FILE" || fail "legacy launch env lost CLAUDE_CONFIG_DIR"
+pass "rotate --sync advances Claude credential file"
 
 DISABLED_JSON="$("$REPO_ROOT/agent-bridge" auth claude-token auto-rotate disable --json)"
 json_assert "auto disable" "$DISABLED_JSON" "payload['status'] == 'ok' and payload['auto_rotate_enabled'] is False"
@@ -195,9 +230,11 @@ SHELL_MONITOR="$(
 json_assert "usage shell registry threshold" "$SHELL_MONITOR" "len(payload['rotation_candidates']) == 1 and payload['rotation_candidates'][0]['rotation_threshold'] == 98.0"
 pass "bridge-usage.sh reads registry rotation threshold"
 
-# PR #799 r2 codex finding 1 — tool-policy.py pretool gate must deny:
+# PR #799 r2/r3 defense-in-depth — the Path A sync path no longer puts
+# Claude OAuth tokens in the tool-inherited environment, but the pretool
+# gate must still deny legacy/stale env-token references and the registry:
 #   A. raw Bash text that dereferences $CLAUDE_CODE_OAUTH_TOKEN,
-#   B. raw Bash text that mentions the launch-secrets.env filename, and
+#   B. raw Bash text that mentions the legacy launch-secrets.env filename, and
 #   C. raw Bash text or Read input that targets the token registry JSON.
 # The credential deny reason is `CLAUDE_CREDENTIAL_DENY_REASON`, which
 # contains the literal "Claude OAuth credentials".
@@ -239,10 +276,10 @@ DENY_OUT="$(run_pretool_bash 'grep CLAUDE launch-secrets.env')"
 [[ "$DENY_OUT" == *'Claude OAuth credentials'* ]] || fail "launch-secrets.env deny reason missing credential phrase: $DENY_OUT"
 pass "pretool denies launch-secrets.env mention"
 
-# PR #799 r3 codex finding 1 — env-dump verbs reveal the exported
-# CLAUDE_CODE_OAUTH_TOKEN without naming the variable. The r2 literal
-# substring deny does not fire on these, so route them through
-# `_raw_dumps_process_environment` to the same credential reason.
+# PR #799 r3 codex finding 1 — env-dump verbs revealed the exported
+# CLAUDE_CODE_OAUTH_TOKEN without naming the variable under the abandoned
+# env-token delivery path. Keep the deny as a legacy/stale-secret guard;
+# Path A no longer relies on it for normal Claude OAuth delivery.
 for cmd in \
     'env' \
     'env | grep CLAUDE' \

@@ -23,6 +23,8 @@ from typing import Any, Iterator
 REGISTRY_VERSION = 1
 TOKEN_ENV_KEY = "CLAUDE_CODE_OAUTH_TOKEN"
 TOKEN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+CLAUDE_OAUTH_EXPIRES_AT_MS = 4102444800000
+CLAUDE_OAUTH_SCOPES = ["user:inference", "user:profile"]
 MONTHS = {
     "january": 1,
     "february": 2,
@@ -111,10 +113,14 @@ def validate_threshold(value: float) -> float:
     return value
 
 
-def shell_single_quote(value: str) -> str:
-    if "'" in value:
-        raise ValueError("single quotes are not supported in launch secret values")
-    return "'" + value + "'"
+def claude_oauth_credentials_payload(token: str) -> dict[str, Any]:
+    return {
+        "claudeAiOauth": {
+            "accessToken": token,
+            "expiresAt": CLAUDE_OAUTH_EXPIRES_AT_MS,
+            "scopes": CLAUDE_OAUTH_SCOPES,
+        }
+    }
 
 
 def read_token(args: argparse.Namespace) -> str:
@@ -413,19 +419,26 @@ def classify_probe(stdout: str, stderr: str, returncode: int) -> tuple[str, dict
 def probe_claude_token(token: str, timeout_seconds: int) -> dict[str, Any]:
     claude_bin = os.environ.get("BRIDGE_CLAUDE_TOKEN_CHECK_BIN", "claude")
     prompt = os.environ.get("BRIDGE_CLAUDE_TOKEN_CHECK_PROMPT", "Return exactly OK.")
-    env = os.environ.copy()
-    env[TOKEN_ENV_KEY] = token
     command = [claude_bin, "-p", prompt, "--output-format", "json"]
     try:
-        proc = subprocess.run(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout_seconds,
-            env=env,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory(prefix="agb-claude-token-check.") as config_dir:
+            config_path = Path(config_dir)
+            os.chmod(config_path, 0o700)
+            write_claude_credentials_file(config_path / ".credentials.json", token)
+            env = os.environ.copy()
+            env.pop(TOKEN_ENV_KEY, None)
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            env["CLAUDE_CONFIG_DIR"] = str(config_path)
+            proc = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=timeout_seconds,
+                env=env,
+                check=False,
+            )
     except subprocess.TimeoutExpired:
         return {"status": "timeout", "returncode": 124, "api_error_status": "", "reset_at": ""}
     except FileNotFoundError:
@@ -871,9 +884,15 @@ def cmd_recover_due(args: argparse.Namespace) -> int:
     except Exception as exc:
         return fail(str(exc), json_mode)
 
+    reason = ""
+    if checked:
+        status = "ok"
+    else:
+        status = "skipped"
+        reason = "all_skipped_stale" if skipped_stale else "no_due_tokens"
     payload = {
-        "status": "ok" if checked else "skipped",
-        "reason": "" if checked else "no_due_tokens",
+        "status": status,
+        "reason": reason,
         "active_token_id": active_id,
         "checked_count": len(checked),
         "recovered_count": len(recovered),
@@ -894,7 +913,7 @@ def cmd_recover_due(args: argparse.Namespace) -> int:
         if checked:
             print(f"checked={len(checked)} recovered={len(recovered)} still_disabled={len(still_disabled)}")
         else:
-            print("skipped: no_due_tokens")
+            print(f"skipped: {reason}")
     return 0
 
 
@@ -937,28 +956,13 @@ def cmd_auto_rotate(args: argparse.Namespace) -> int:
     return 0
 
 
-def update_launch_secret_file(path: Path, token: str) -> None:
+def write_claude_credentials_file(path: Path, token: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
-    rendered = f"{TOKEN_ENV_KEY}={shell_single_quote(token)}"
-    output: list[str] = []
-    replaced = False
-    key_prefix = TOKEN_ENV_KEY + "="
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith(key_prefix) or line.startswith(key_prefix):
-            if not replaced:
-                output.append(rendered)
-                replaced = True
-            continue
-        output.append(line)
-    if not replaced:
-        output.append(rendered)
-    text = "\n".join(output) + "\n"
+    text = json.dumps(claude_oauth_credentials_payload(token), ensure_ascii=True, indent=2) + "\n"
     fd = -1
     tmp_name = ""
     try:
-        fd, tmp_name = tempfile.mkstemp(prefix=".launch-secrets.", suffix=".tmp", dir=str(path.parent))
+        fd, tmp_name = tempfile.mkstemp(prefix=".credentials.", suffix=".tmp", dir=str(path.parent))
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fd = -1
             fh.write(text)
@@ -991,13 +995,14 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
             raise ValueError(f"active token id is disabled: {active_id}")
         token = str(row.get("token") or "")
         validate_token(token)
-        update_launch_secret_file(Path(args.file).expanduser(), token)
+        write_claude_credentials_file(Path(args.file).expanduser(), token)
     except Exception as exc:
         return fail(str(exc), json_mode)
     payload = {
         "status": "synced",
         "agent": args.agent,
         "file": str(Path(args.file).expanduser()),
+        "delivery": "claude_credentials_file",
         "active_token_id": active_id,
         "fingerprint": token_fingerprint(token),
     }

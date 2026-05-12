@@ -36,7 +36,7 @@ bridge_auth_run_privileged() {
   bridge_linux_sudo_root "$@"
 }
 
-bridge_auth_secret_file_for_agent() {
+bridge_auth_legacy_secret_env_file_for_agent() {
   local agent="$1"
   local file=""
   if bridge_isolation_v2_active 2>/dev/null; then
@@ -48,54 +48,136 @@ bridge_auth_secret_file_for_agent() {
   printf '%s' "$file"
 }
 
-bridge_auth_prepare_secret_file() {
+bridge_auth_claude_credentials_file_for_agent() {
+  local agent="$1"
+  local os_user=""
+  local user_home=""
+  if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    if [[ -n "$os_user" ]]; then
+      user_home="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || true)"
+      if [[ -n "$user_home" ]]; then
+        printf '%s/.claude/.credentials.json' "$user_home"
+        return 0
+      fi
+    fi
+  fi
+  printf '%s/.claude/.credentials.json' "$(bridge_agent_default_home "$agent")"
+}
+
+bridge_auth_prepare_credential_file() {
   local agent="$1"
   local file="$2"
   local dir=""
-  local group=""
-  local dir_mode="0700"
+  local os_user=""
+  local os_group=""
 
   dir="$(dirname "$file")"
-  if bridge_isolation_v2_active 2>/dev/null; then
-    group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
-    [[ -n "$group" ]] || {
-      printf '[error] cannot resolve v2 group for agent: %s\n' "$agent" >&2
+  if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    [[ -n "$os_user" ]] || {
+      printf '[error] cannot resolve isolated os_user for agent: %s\n' "$agent" >&2
       return 1
     }
-    if [[ "${BRIDGE_CLAUDE_TOKEN_SYNC_ALLOW_CURRENT_GROUP_FALLBACK:-0}" == "1" ]] \
-        && ! bridge_isolation_v2_group_exists "$group"; then
-      group="$(id -gn)"
-      dir_mode="0700"
-    elif ! bridge_isolation_v2_ensure_group "$group"; then
-      if [[ "${BRIDGE_CLAUDE_TOKEN_SYNC_ALLOW_CURRENT_GROUP_FALLBACK:-0}" == "1" ]]; then
-        group="$(id -gn)"
-        dir_mode="0700"
-      else
-        printf '[error] cannot ensure v2 group for %s: %s\n' "$agent" "$group" >&2
+    os_group="$(id -gn "$os_user" 2>/dev/null || printf '%s' "$os_user")"
+    if ! bridge_auth_run_privileged test -d "$dir"; then
+      bridge_auth_run_privileged mkdir -p "$dir" || {
+        printf '[error] cannot create Claude credentials dir: %s\n' "$dir" >&2
         return 1
-      fi
-    else
-      dir_mode="2750"
+      }
+      bridge_auth_run_privileged chown "$os_user:$os_group" "$dir" || return 1
+      bridge_auth_run_privileged chmod 0700 "$dir" || return 1
     fi
-  else
-    group="$(id -gn)"
+    return 0
   fi
-
   if [[ ! -d "$dir" ]]; then
-    bridge_auth_run_privileged mkdir -p "$dir" || {
-      printf '[error] cannot create credentials dir: %s\n' "$dir" >&2
+    mkdir -p "$dir" || {
+      printf '[error] cannot create Claude credentials dir: %s\n' "$dir" >&2
       return 1
     }
   fi
-  if [[ "$dir_mode" == "2750" ]]; then
-    bridge_auth_run_privileged chown "$(id -un):$group" "$dir" || return 1
-    bridge_auth_run_privileged chmod 2750 "$dir" || return 1
-  else
-    chmod 0700 "$dir" 2>/dev/null || true
-  fi
+  chmod 0700 "$dir" 2>/dev/null || true
 }
 
-bridge_auth_fix_secret_file_mode() {
+bridge_auth_fix_credential_file_mode() {
+  local agent="$1"
+  local file="$2"
+  local os_user=""
+  local os_group=""
+
+  if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    [[ -n "$os_user" ]] || {
+      printf '[error] cannot resolve isolated os_user for agent: %s\n' "$agent" >&2
+      return 1
+    }
+    os_group="$(id -gn "$os_user" 2>/dev/null || printf '%s' "$os_user")"
+    bridge_auth_run_privileged chown "$os_user:$os_group" "$file" || return 1
+    bridge_auth_run_privileged chmod 0600 "$file" || return 1
+    return 0
+  fi
+  chmod 0600 "$file" 2>/dev/null || bridge_auth_run_privileged chmod 0600 "$file"
+}
+
+bridge_auth_update_legacy_claude_config_env() {
+  local agent="$1"
+  local file="$2"
+  local config_dir="$3"
+  local dir=""
+
+  dir="$(dirname "$file")"
+  if [[ ! -d "$dir" ]]; then
+    bridge_auth_run_privileged mkdir -p "$dir" || {
+      printf '[error] cannot create legacy launch env dir: %s\n' "$dir" >&2
+      return 1
+    }
+  fi
+  python3 - "$file" "$config_dir" <<'PY'
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+path = Path(sys.argv[1])
+config_dir = sys.argv[2]
+key = "CLAUDE_CODE_OAUTH_TOKEN="
+config_key = "CLAUDE_CONFIG_DIR="
+lines = path.read_text(encoding="utf-8", errors="ignore").splitlines() if path.exists() else []
+filtered = [
+    line
+    for line in lines
+    if not line.strip().startswith(key)
+    and not line.strip().startswith(config_key)
+]
+if "'" in config_dir:
+    raise SystemExit("CLAUDE_CONFIG_DIR path cannot contain single quote")
+filtered.append(f"CLAUDE_CONFIG_DIR='{config_dir}'")
+text = "\n".join(filtered)
+if text:
+    text += "\n"
+fd = -1
+tmp_name = ""
+try:
+    fd, tmp_name = tempfile.mkstemp(prefix=".launch-secrets.", suffix=".tmp", dir=str(path.parent))
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fd = -1
+        fh.write(text)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp_name, path)
+finally:
+    if fd >= 0:
+        os.close(fd)
+    if tmp_name:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+PY
+  bridge_auth_fix_legacy_secret_file_mode "$agent" "$file"
+}
+
+bridge_auth_fix_legacy_secret_file_mode() {
   local agent="$1"
   local file="$2"
   local group=""
@@ -107,11 +189,25 @@ bridge_auth_fix_secret_file_mode() {
       file_mode="0640"
       bridge_auth_run_privileged chown "$(id -un):$group" "$file" || return 1
     elif [[ "${BRIDGE_CLAUDE_TOKEN_SYNC_ALLOW_CURRENT_GROUP_FALLBACK:-0}" != "1" ]]; then
-      printf '[error] v2 group missing after sync for %s: %s\n' "$agent" "$group" >&2
+      printf '[error] v2 group missing after legacy secret scrub for %s: %s\n' "$agent" "$group" >&2
       return 1
     fi
   fi
   chmod "$file_mode" "$file" 2>/dev/null || bridge_auth_run_privileged chmod "$file_mode" "$file"
+}
+
+bridge_auth_sync_agent_python() {
+  local agent="$1"
+  local registry="$2"
+  local file="$3"
+
+  if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    bridge_linux_sudo_root python3 "$SCRIPT_DIR/bridge-auth.py" \
+      --registry "$registry" sync-agent --agent "$agent" --file "$file" --json
+    return $?
+  fi
+  python3 "$SCRIPT_DIR/bridge-auth.py" \
+    --registry "$registry" sync-agent --agent "$agent" --file "$file" --json
 }
 
 bridge_auth_selected_agents() {
@@ -160,6 +256,7 @@ bridge_auth_sync_agents() {
   local json_mode="$3"
   local agent=""
   local file=""
+  local legacy_file=""
   local output=""
   local selection_output=""
   local selection_error=""
@@ -202,19 +299,25 @@ PY
   fi
 
   for agent in "${agents[@]}"; do
-    file="$(bridge_auth_secret_file_for_agent "$agent")"
-    if ! bridge_auth_prepare_secret_file "$agent" "$file"; then
+    file="$(bridge_auth_claude_credentials_file_for_agent "$agent")"
+    legacy_file="$(bridge_auth_legacy_secret_env_file_for_agent "$agent")"
+    if ! bridge_auth_prepare_credential_file "$agent" "$file"; then
       failed+=("$agent:prepare_failed")
       rc=1
       continue
     fi
-    if ! output="$(python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" sync-agent --agent "$agent" --file "$file" --json 2>&1)"; then
+    if ! output="$(bridge_auth_sync_agent_python "$agent" "$registry" "$file" 2>&1)"; then
       failed+=("$agent:$output")
       rc=1
       continue
     fi
-    if ! bridge_auth_fix_secret_file_mode "$agent" "$file"; then
+    if ! bridge_auth_fix_credential_file_mode "$agent" "$file"; then
       failed+=("$agent:mode_failed")
+      rc=1
+      continue
+    fi
+    if ! bridge_auth_update_legacy_claude_config_env "$agent" "$legacy_file" "$(dirname "$file")"; then
+      failed+=("$agent:legacy_env_update_failed")
       rc=1
       continue
     fi

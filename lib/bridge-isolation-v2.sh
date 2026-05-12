@@ -187,9 +187,10 @@ bridge_isolation_v2_agent_credentials_dir() {
 bridge_isolation_v2_agent_secret_env_file() {
   # Path to the per-agent launch-secrets.env file, the controller-owned
   # KEY=VALUE shell-env file that bridge-run.sh sources before child
-  # execution (bridge_isolation_v2_load_secret_env). Keeping secrets in
-  # this file (not in BRIDGE_AGENT_LAUNCH_CMD) prevents leaks via
-  # process listings, dry-run output, log lines, and crash reports.
+  # execution (bridge_isolation_v2_load_secret_env). Claude OAuth tokens
+  # no longer use this tool-inherited env channel; bridge-auth.sh renders
+  # them into the agent's Claude .credentials.json file and keeps only a
+  # non-secret CLAUDE_CONFIG_DIR pointer here.
   local agent="$1"
   local credentials_dir
   credentials_dir="$(bridge_isolation_v2_agent_credentials_dir "$agent")" || return 1

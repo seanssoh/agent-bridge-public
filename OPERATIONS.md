@@ -858,8 +858,8 @@ it is drift — the migration runbook below strips it.
 
 For Claude subscription accounts, the preferred shared-credential path is
 not the controller's `~/.claude/.credentials.json`. Generate one or more
-Claude Code setup tokens and let Agent Bridge write the active token into
-each selected Claude agent's v2 launch-secret file:
+Claude Code setup tokens and let Agent Bridge render the active token into
+each selected Claude agent's own `.claude/.credentials.json` file:
 
 ```bash
 claude setup-token
@@ -883,6 +883,10 @@ To enable automatic rotation, register at least two enabled tokens and set
 the threshold. The daemon reuses the existing Claude usage monitor signal
 from `bridge-usage.py`; when a Claude usage window reaches the rotation
 threshold once per reset cycle, it runs `rotate --if-auto-enabled --sync`.
+Sync keeps only a non-secret `CLAUDE_CONFIG_DIR=` pointer in the legacy
+`credentials/launch-secrets.env` file and removes any stale
+`CLAUDE_CODE_OAUTH_TOKEN=` entry, so the active OAuth token is not inherited
+by Bash/tool subprocesses.
 
 ```bash
 agent-bridge auth claude-token auto-rotate enable --threshold 99

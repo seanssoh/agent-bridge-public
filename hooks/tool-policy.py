@@ -137,12 +137,10 @@ def _raw_mentions_claude_credentials(raw: str) -> bool:
     return (
         "sk-ant-o" in raw
         or (".credentials.json" in raw and ".claude" in raw)
-        # PR #799 r2 codex finding 1 — block env-var dereference of the
-        # active OAuth token. The token is exported into the launch
-        # subshell via launch-secrets.env and inherited by the agent;
-        # without this rule any agent can run
-        # `printf %s "$CLAUDE_CODE_OAUTH_TOKEN"` and leak it through
-        # tool output.
+        # PR #799 r2/r3 defense-in-depth — Path A no longer delivers the
+        # active OAuth token through the tool-inherited environment, but
+        # block the variable name so stale launch env files or manual
+        # operator exports cannot be read through tool output.
         or "CLAUDE_CODE_OAUTH_TOKEN" in raw
         # PR #799 r2 codex finding 1 — block `launch-secrets.env`
         # mentions (defense-in-depth for any future env vars added to
@@ -158,11 +156,11 @@ def _raw_mentions_claude_credentials(raw: str) -> bool:
 
 
 # PR #799 r3 codex finding 1 — match process-environment dump verbs
-# that would reveal the exported CLAUDE_CODE_OAUTH_TOKEN without naming
-# it directly. The r2 substring deny (above) only matches when the raw
-# text contains the literal token-variable name; env-dump verbs
-# enumerate every exported variable without naming any of them, so the
-# substring check never fires.
+# that revealed the exported CLAUDE_CODE_OAUTH_TOKEN under the abandoned
+# env-token delivery path. Path A now syncs Claude OAuth through
+# .credentials.json instead, but keep this as a stale-env/manual-export
+# guard; the r2 substring deny above only matches raw text containing the
+# literal token-variable name.
 #
 # Coverage:
 #   env [/options]            POSIX env, dumps everything when called with no
@@ -1397,8 +1395,9 @@ def protected_alias_reason(text: str, agent: str) -> str | None:
     # contract.
     if _raw_mentions_claude_credentials(text):
         return CLAUDE_CREDENTIAL_DENY_REASON
-    # PR #799 r3 codex finding 1 — env-dump verbs reveal the exported
-    # OAuth token without naming it, bypassing the substring deny above.
+    # PR #799 r3 codex finding 1 — env-dump verbs revealed exported
+    # OAuth tokens under the abandoned env-token path, bypassing the
+    # substring deny above. Kept as a stale-env/manual-export guard.
     if _raw_dumps_process_environment(text):
         return CLAUDE_CREDENTIAL_DENY_REASON
     for credential_path in claude_credential_paths():
