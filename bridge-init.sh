@@ -23,6 +23,8 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 source "$SCRIPT_DIR/lib/bridge-admin-pair.sh"
 # shellcheck source=lib/bridge-host-profile.sh
 source "$SCRIPT_DIR/lib/bridge-host-profile.sh"
+# shellcheck source=lib/bridge-init-default-crons.sh
+source "$SCRIPT_DIR/lib/bridge-init-default-crons.sh"
 # bridge_load_roster is deferred until after argument parsing so that
 # `init --dry-run` is mutation-free (bridge_load_roster -> bridge_init_dirs
 # would otherwise create $BRIDGE_HOME/state on a fresh-install-candidate and
@@ -565,6 +567,13 @@ if [[ $dry_run -eq 0 ]]; then
     if [[ -n "$channels" ]]; then
       bridge_init_append_warning "host_profile=dev: requested channels (${channels}) — channel bootstrap skipped this init. Re-run \`agb setup <channel> ${admin_agent}\` later or pass \`--profile server\` to enable on this install."
     fi
+  fi
+  # Track D follow-up to #713 / #809: auto-register the picker-sweep
+  # bridge-native cron on host_profile=server installs. Idempotent (the
+  # helper short-circuits if a `picker-sweep` job already exists).
+  # Non-fatal: helper logs and returns 0 on any failure so init keeps going.
+  if [[ -n "$host_profile_chosen" && "$host_profile_chosen" != "dev" ]]; then
+    bridge_init_register_default_picker_sweep "$host_profile_cli" "$admin_agent" || true
   fi
 fi
 

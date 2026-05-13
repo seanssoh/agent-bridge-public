@@ -130,8 +130,40 @@ def bridge_home_dir() -> Path:
     return Path.home() / ".agent-bridge"
 
 
+def _host_profile_is_dev() -> bool:
+    """Best-effort host_profile=dev detection for the prompt-guard default.
+
+    Order:
+      1. BRIDGE_HOST_PROFILE env (cheapest; explicit override).
+      2. $BRIDGE_HOME/state/install/host-profile.json.
+
+    All read errors collapse to "not dev" (fail-open to the server default of
+    enabled) — a corrupt/unreadable host-profile file should not silently
+    disable prompt-guard on a hosted install.
+    """
+    env_profile = (os.environ.get("BRIDGE_HOST_PROFILE") or "").strip().lower()
+    if env_profile == "dev":
+        return True
+    if env_profile == "server":
+        return False
+    try:
+        path = bridge_home_dir() / "state" / "install" / "host-profile.json"
+        if not path.is_file():
+            return False
+        import json as _json
+        with path.open("r", encoding="utf-8") as fh:
+            data = _json.load(fh)
+        return str(data.get("profile", "")).strip().lower() == "dev"
+    except Exception:
+        return False
+
+
 def prompt_guard_enabled() -> bool:
-    return truthy(os.environ.get("BRIDGE_PROMPT_GUARD_ENABLED"), default=False)
+    # Track D follow-up to #713 / #809: server hosts default-enable prompt
+    # guard; dev hosts stay opted out. Explicit BRIDGE_PROMPT_GUARD_ENABLED
+    # (0 or 1) wins over host_profile via `truthy`'s default fallback.
+    default_enabled = not _host_profile_is_dev()
+    return truthy(os.environ.get("BRIDGE_PROMPT_GUARD_ENABLED"), default=default_enabled)
 
 
 def split_csv(value: str | None) -> list[str]:

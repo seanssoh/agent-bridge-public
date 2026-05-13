@@ -60,6 +60,56 @@ except Exception:
 PY
 }
 
+# Lightweight host_profile check usable from scripts that haven't sourced the
+# full bridge lib chain (e.g. scripts/picker-sweep.sh invoked from a bare
+# cron line). Reads the persisted host-profile.json directly via inline
+# python3 — does NOT call bridge_require_python (no roster, no logging
+# setup required).
+#
+# Resolution order for the JSON path:
+#   1. BRIDGE_HOST_PROFILE env (cheapest, explicit override; wins outright).
+#   2. $BRIDGE_HOME/state/install/host-profile.json — checked first because
+#      most invocations come from a cron line that sets BRIDGE_HOME and
+#      expects state under it. When BRIDGE_HOME is set but the file under
+#      it doesn't exist, we still fall through to (3) so a relocated
+#      BRIDGE_STATE_DIR remains honored.
+#   3. $BRIDGE_STATE_DIR/install/host-profile.json — honored when set
+#      explicitly (e.g. an operator who relocated state with
+#      BRIDGE_STATE_DIR=/var/lib/agent-bridge/state).
+#
+# Returns 0 (truthy in shell sense) when the resolved profile is "dev",
+# 1 otherwise (including unknown / unset / file missing / read error).
+bridge_host_profile_is_dev() {
+  local env_profile="${BRIDGE_HOST_PROFILE:-}"
+  case "$env_profile" in
+    dev) return 0 ;;
+    server) return 1 ;;
+  esac
+  local path=""
+  if [[ -n "${BRIDGE_HOME:-}" && -f "$BRIDGE_HOME/state/install/host-profile.json" ]]; then
+    path="$BRIDGE_HOME/state/install/host-profile.json"
+  elif [[ -n "${BRIDGE_STATE_DIR:-}" && -f "$BRIDGE_STATE_DIR/install/host-profile.json" ]]; then
+    path="$BRIDGE_STATE_DIR/install/host-profile.json"
+  else
+    return 1
+  fi
+  command -v python3 >/dev/null 2>&1 || return 1
+  local profile
+  profile="$(python3 - "$path" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    p = data.get("profile", "")
+    if p in ("server", "dev"):
+        print(p)
+except Exception:
+    pass
+PY
+)"
+  [[ "$profile" == "dev" ]]
+}
+
 # Read the persisted set_at timestamp (best-effort context for idempotency
 # logging). Empty string if file absent or malformed.
 bridge_host_profile_set_at() {
@@ -349,6 +399,8 @@ bridge_host_profile_emit_dev_advisories() {
   printf '    Linux 운영 호스트에서 다중 사용자 분리가 필요해지면\n'
   printf '    `agent-bridge migrate isolation-v2 --apply` 로 전환할 수 있습니다.\n'
   printf '  - librarian / wiki-* 정기 크론: 위 단계에서 disable 처리됨\n'
+  printf '  - picker-sweep 자동 unstick: skip (BRIDGE_PICKER_SWEEP_ENABLED=1 로 override 가능)\n'
+  printf '  - prompt-guard (채널/MCP/intake 검사): skip (BRIDGE_PROMPT_GUARD_ENABLED=1 로 override 가능)\n'
   printf '\n'
   printf '정적 에이전트는 admin(`%s`) + admin-dev(`%s` codex pair) 2개로\n' "$admin_agent" "$admin_pair"
   printf '시작합니다. 추가 정적 역할은 운영 모드에서만 필요한 경우가 일반적입니다.\n'

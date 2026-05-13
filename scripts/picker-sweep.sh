@@ -54,12 +54,36 @@ _psw_log() {
 }
 
 # ---------------------------------------------------------------------------
-# Opt-in gate. Default disabled so a stray cron registration with no env vars
-# is a silent no-op rather than spamming send-keys.
+# Opt-in gate. Default is now enabled on server hosts (Track D follow-up to
+# #713 / #809) — picker-sweep is one of the essentials that ought to run by
+# default on hosted installs. Two opt-out paths remain:
+#
+#   1. `BRIDGE_PICKER_SWEEP_ENABLED=0` — explicit operator opt-out, wins
+#      against any host_profile signal.
+#   2. `host_profile=dev` — when the env value is unset, a dev install
+#      default-skips. The operator can still set `BRIDGE_PICKER_SWEEP_ENABLED=1`
+#      on a dev host to override.
+#
+# Order matters: explicit env wins over host_profile.
 # ---------------------------------------------------------------------------
 
-if [[ "${BRIDGE_PICKER_SWEEP_ENABLED:-0}" != "1" ]]; then
-    _psw_log "BRIDGE_PICKER_SWEEP_ENABLED!=1 — picker-sweep skipped"
+# host_profile=dev opt-out — only consulted when BRIDGE_PICKER_SWEEP_ENABLED is
+# unset. Sourcing lib/bridge-host-profile.sh gives us `bridge_host_profile_is_dev`,
+# which reads $BRIDGE_HOME/state/install/host-profile.json directly without
+# pulling in the full bridge lib chain.
+if [[ -z "${BRIDGE_PICKER_SWEEP_ENABLED:-}" ]]; then
+    if [[ -r "$BRIDGE_HOME/lib/bridge-host-profile.sh" ]]; then
+        # shellcheck source=/dev/null
+        source "$BRIDGE_HOME/lib/bridge-host-profile.sh"
+        if bridge_host_profile_is_dev; then
+            _psw_log "host_profile=dev — picker-sweep default-skipped (set BRIDGE_PICKER_SWEEP_ENABLED=1 to override)"
+            exit 0
+        fi
+    fi
+fi
+
+if [[ "${BRIDGE_PICKER_SWEEP_ENABLED:-1}" != "1" ]]; then
+    _psw_log "BRIDGE_PICKER_SWEEP_ENABLED=0 (explicit opt-out) — picker-sweep skipped"
     exit 0
 fi
 

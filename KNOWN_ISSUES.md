@@ -659,11 +659,10 @@ file-based design contains the leak surface to deliberate
 `Path.home()`-relative reads, which is hook-deny-able in the literal
 case and rotation-recoverable in the deliberate case.
 
-Planned future enhancement (separate PR, not in scope for this round):
-a credential-helper pattern — a setuid/setgid helper, or a separate
-Claude launcher identity that owns the credential file and hands the
-token only to the Claude binary, with the agent's tool UID having no
-filesystem access to the credential. This would close the same-UID
+Planned future enhancement: tracked in issue #810 — a credential-helper
+pattern (setuid/setgid helper, separate launcher identity, or per-launch
+ephemeral delivery). The design discussion is open in the issue body;
+no implementation PR is queued. This would close the same-UID
 readability gap without re-introducing env injection.
 
 Operator guidance: this is a defense-in-depth limit, not a fundamental
