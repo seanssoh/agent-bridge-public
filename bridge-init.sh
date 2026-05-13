@@ -558,7 +558,8 @@ if [[ $dry_run -eq 0 ]]; then
     "$host_profile_cli" \
     "$host_profile_reconfigure" \
     "$host_profile_override" \
-    "$json_mode")" || host_profile_chosen=""
+    "$json_mode" \
+    "$admin_agent")" || host_profile_chosen=""
   if [[ "$host_profile_chosen" == "dev" ]] && [[ $skip_channel_setup -eq 0 ]]; then
     skip_channel_setup=1
     if [[ -n "$channels" ]]; then

@@ -225,6 +225,10 @@ bridge_host_profile_offer_dev_cron_disable() {
 #   $2 = reconfigure (1=force re-prompt even if file exists)
 #   $3 = profile_override ("server"|"dev"|"" = ask)
 #   $4 = json_mode (1=non-interactive contract: default server, no prompt)
+#   $5 = admin agent id (used by the dev advisory to render the real static
+#        pair names; falls back to "admin" inside the advisory helper when
+#        empty so older callers without this arg still get a sensible
+#        message)
 # Echoes the chosen/loaded profile; non-zero exit only on fatal write
 # failures.
 bridge_host_profile_run() {
@@ -232,6 +236,7 @@ bridge_host_profile_run() {
   local reconfigure="${2:-0}"
   local profile_override="${3:-}"
   local json_mode="${4:-0}"
+  local admin_agent="${5:-}"
 
   # Idempotent fast-path: existing profile + no --reconfigure and no
   # explicit override.
@@ -315,7 +320,7 @@ bridge_host_profile_run() {
 
   if [[ "$profile" == "dev" ]]; then
     bridge_host_profile_offer_dev_cron_disable "$agent_bridge_cli" "$interactive" >/dev/null || true
-    bridge_host_profile_emit_dev_advisories >&2 || true
+    bridge_host_profile_emit_dev_advisories "$admin_agent" >&2 || true
   fi
 
   printf '%s\n' "$profile"
@@ -328,17 +333,24 @@ bridge_host_profile_run() {
 # No mutations — channel-skip is enforced at the bridge-init.sh call site,
 # isolation is operator-opt-in. The block is informational so the dev
 # operator sees in one place why the rest of the init flow looks lighter.
+#
+# Args:
+#   $1 = admin agent id (e.g. "patch"). Used to render the static-pair line
+#        accurately when --admin is non-default. Falls back to "admin" when
+#        empty so legacy callers still get a sensible message.
 bridge_host_profile_emit_dev_advisories() {
+  local admin_agent="${1:-admin}"
+  local admin_pair="${admin_agent}-dev"
   printf '\n'
   printf '[host-profile=dev] 다음 운영용 기능은 이번 init 에서 건너뛰거나 비활성 상태로 둡니다:\n'
   printf '  - 외부 채널 (Discord / Telegram / Teams / Mattermost) 부트스트랩: skip\n'
-  printf '    필요해지면 `agb setup discord <admin>` 등으로 나중에 켤 수 있습니다.\n'
+  printf '    필요해지면 `agb setup discord %s` 등으로 나중에 켤 수 있습니다.\n' "$admin_agent"
   printf '  - 멀티테넌트 v2 isolation 레이아웃: legacy 유지 (마이그레이션 비강제)\n'
   printf '    Linux 운영 호스트에서 다중 사용자 분리가 필요해지면\n'
   printf '    `agent-bridge migrate isolation-v2 --apply` 로 전환할 수 있습니다.\n'
   printf '  - librarian / wiki-* 정기 크론: 위 단계에서 disable 처리됨\n'
   printf '\n'
-  printf '정적 에이전트는 admin(`patch` 기본) + admin-dev(`patch-dev` codex pair) 2개로\n'
+  printf '정적 에이전트는 admin(`%s`) + admin-dev(`%s` codex pair) 2개로\n' "$admin_agent" "$admin_pair"
   printf '시작합니다. 추가 정적 역할은 운영 모드에서만 필요한 경우가 일반적입니다.\n'
   printf '\n'
 }
