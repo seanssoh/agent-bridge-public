@@ -348,6 +348,14 @@ bridge_tmux_session_has_prompt_from_text() {
   bridge_tmux_engine_requires_prompt "$engine" || return 0
   [[ -n "$recent" ]] || return 1
 
+  # Issue #815 Wave A: feeding a large tmux capture into the iterator via
+  # here-string blocked Bash in `heredoc_write` on the operator's stale
+  # runtime. Stage the text through a tempfile and read via `< file` instead.
+  local _tmp
+  _tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$recent" > "$_tmp"
   while IFS= read -r line; do
     line="${line//$'\r'/}"
     line="${line//$'\u00A0'/ }"
@@ -372,7 +380,7 @@ bridge_tmux_session_has_prompt_from_text() {
         fi
         ;;
     esac
-  done <<<"$recent"
+  done < "$_tmp"
 
   return 1
 }
@@ -429,6 +437,13 @@ bridge_tmux_session_has_pending_input_from_text() {
   # branch to return 0 on the first match and mark an idle session as
   # busy. Track last_prompt_line for codex too and evaluate pending-input
   # after the loop on that final line only.
+  # Issue #815 Wave A: route the multi-record capture through a tempfile
+  # instead of `done <<<` to avoid `heredoc_write` hangs on stale runtimes.
+  local _tmp
+  _tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$recent" > "$_tmp"
   while IFS= read -r line; do
     line="${line//$'\r'/}"
     line="${line//$'\u00A0'/ }"
@@ -451,7 +466,7 @@ bridge_tmux_session_has_pending_input_from_text() {
         fi
         ;;
     esac
-  done <<<"$recent"
+  done < "$_tmp"
 
   if [[ -n "$last_prompt_line" ]]; then
     bridge_tmux_prompt_line_has_pending_input "$engine" "$last_prompt_line"
@@ -738,11 +753,18 @@ bridge_tmux_codex_post_paste_is_clean() {
   [[ -n "$signature" ]] || return 1
   local last_line=""
   local line=""
+  # Issue #815 Wave A: stage capture through tempfile (see header note
+  # at the top of bridge_tmux_session_has_prompt_from_text).
+  local _tmp
+  _tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$ansi_text" > "$_tmp"
   while IFS= read -r line; do
     if [[ "$line" == *›* ]]; then
       last_line="$line"
     fi
-  done <<<"$ansi_text"
+  done < "$_tmp"
   [[ -n "$last_line" ]] || return 1
   case "$last_line" in
     *$'\x1b[2m'*|*$'\x1b[0;2m'*|*$'\x1b[22;2m'*|*$'\x1b[2;'*)
@@ -799,11 +821,17 @@ bridge_tmux_codex_submit_landed() {
 
   local last_prompt_line=""
   local line=""
+  # Issue #815 Wave A: stage capture through tempfile.
+  local _tmp
+  _tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$ansi_text" > "$_tmp"
   while IFS= read -r line; do
     if [[ "$line" == *›* ]]; then
       last_prompt_line="$line"
     fi
-  done <<<"$ansi_text"
+  done < "$_tmp"
 
   if [[ -n "$last_prompt_line" && "$last_prompt_line" == *"$signature"* ]]; then
     # Signature still on the composer line — submit did not fire.
@@ -948,6 +976,13 @@ bridge_tmux_type_and_submit() {
   local pane_target
   pane_target="$(bridge_tmux_pane_target "$session")"
 
+  # Issue #815 Wave A: $text can be a multi-line operator nudge; stage
+  # through a tempfile to avoid `heredoc_write` hangs on stale runtimes.
+  local _tmp
+  _tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$text" > "$_tmp"
   while IFS= read -r line || [[ -n "$line" ]]; do
     if [[ $first_line -eq 0 ]]; then
       bridge_tmux_send_keys_with_timeout tmux_send_type_newline \
@@ -958,7 +993,7 @@ bridge_tmux_type_and_submit() {
         -t "$pane_target" -l -- "$line"
     fi
     first_line=0
-  done <<<"$text"
+  done < "$_tmp"
 
   # Issue #146: the previous implementation used a fixed 50ms grace
   # before C-m. Under load, Claude's TUI occasionally took longer to
@@ -1257,6 +1292,16 @@ bridge_tmux_pending_attention_flush() {
   now="$(date +%s)"
   [[ "$now" =~ ^[0-9]+$ ]] || now=0
 
+  # Issue #815 Wave A: $drained is the entire pending-attention spool
+  # for the agent — can be many lines. Stage through a tempfile to
+  # avoid `heredoc_write` hangs on stale runtimes. The nested inner
+  # `while read` consumes the rest of stdin from the same fd, so it
+  # keeps its original heredoc-less shape.
+  local _tmp
+  _tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$drained" > "$_tmp"
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     ts="${line%%$'\t'*}"
@@ -1285,7 +1330,7 @@ bridge_tmux_pending_attention_flush() {
       unflushed+="$line"$'\n'
     done
     break
-  done <<<"$drained"
+  done < "$_tmp"
 
   if [[ -n "$unflushed" ]]; then
     bridge_tmux_pending_attention_prepend "$agent" "$unflushed"
@@ -1341,11 +1386,17 @@ bridge_tmux_claude_last_prompt_is_ghost_text() {
   [[ -n "$ansi_text" ]] || return 1
   local last_line=""
   local line=""
+  # Issue #815 Wave A: stage capture through tempfile.
+  local _tmp
+  _tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$ansi_text" > "$_tmp"
   while IFS= read -r line; do
     if [[ "$line" == *❯* || "$line" == *'>'* ]]; then
       last_line="$line"
     fi
-  done <<<"$ansi_text"
+  done < "$_tmp"
   [[ -n "$last_line" ]] || return 1
   bridge_tmux_line_has_sgr_dim "$last_line"
 }
@@ -1363,11 +1414,17 @@ bridge_tmux_codex_last_prompt_is_placeholder() {
   [[ -n "$ansi_text" ]] || return 1
   local last_line=""
   local line=""
+  # Issue #815 Wave A: stage capture through tempfile.
+  local _tmp
+  _tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$ansi_text" > "$_tmp"
   while IFS= read -r line; do
     if [[ "$line" == *›* ]]; then
       last_line="$line"
     fi
-  done <<<"$ansi_text"
+  done < "$_tmp"
   [[ -n "$last_line" ]] || return 1
   # Match the SGR 2 (dim) forms codex is known to emit. Narrow patterns
   # avoid false positives against 24-bit color sequences like `38;2;r;g;b`

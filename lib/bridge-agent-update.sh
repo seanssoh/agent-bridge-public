@@ -181,190 +181,14 @@ PY
 bridge_agent_update_apply_launch_cmd() {
   local current="$1"
   bridge_require_python
-  # Pass the python source via -c (env var carries the script body) so
-  # the heredoc approach does not collide with the caller's TSV stream
-  # piped into python's stdin. See sister channels-applier below.
-  BRIDGE_AGENT_UPDATE_LC_CURRENT="$current" python3 -c "$_BRIDGE_AGENT_UPDATE_APPLY_LC_PY"
+  # Issue #815 Wave A: the body of this applier used to live in a
+  # `$(cat <<'PY' ... PY)` source-time capture. On a stale runtime that
+  # hung Bash in `heredoc_write` while sourcing this module, which in
+  # turn hung the CLI hot path. The body now lives in a regular file
+  # under scripts/python-helpers/, so no source-time read occurs.
+  BRIDGE_AGENT_UPDATE_LC_CURRENT="$current" \
+    python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/agent-update-apply-launch-cmd.py"
 }
-
-# Source for bridge_agent_update_apply_launch_cmd. Stored in a string so
-# python3 -c "$..." receives the body cleanly while the heredoc-form
-# stdin remains free for the caller-provided TSV stream.
-_BRIDGE_AGENT_UPDATE_APPLY_LC_PY=$(cat <<'PY'
-import json
-import os
-import re
-import sys
-
-current = os.environ.get("BRIDGE_AGENT_UPDATE_LC_CURRENT", "")
-
-
-def split_env_prefix(value: str) -> tuple[list[str], list[str]]:
-    """Return (env_prefix_tokens, argv_tokens).
-
-    env_prefix is the leading run of ``KEY=VALUE`` tokens (no leading
-    dash, must contain ``=``, key matches ``[A-Za-z_][A-Za-z0-9_]*``).
-    Everything from the first non-env token onwards is argv. We
-    tokenize whitespace-naively: the launch_cmd is operator-authored
-    in roster.local.sh and is shell-quoted on emission, so a single
-    space split is sufficient for the env/argv boundary.
-    """
-    tokens = value.split()
-    env_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-    env: list[str] = []
-    argv: list[str] = []
-    boundary_seen = False
-    for tok in tokens:
-        if not boundary_seen and not tok.startswith("-") and env_re.match(tok):
-            env.append(tok)
-        else:
-            boundary_seen = True
-            argv.append(tok)
-    return env, argv
-
-
-def reassemble(env: list[str], argv: list[str]) -> str:
-    pieces: list[str] = []
-    pieces.extend(env)
-    pieces.extend(argv)
-    return " ".join(pieces).strip()
-
-
-def env_key(token: str) -> str:
-    return token.split("=", 1)[0]
-
-
-def add_env(env: list[str], pair: str) -> bool:
-    """Idempotent prepend of KEY=VALUE.
-
-    No-op if the same KEY=VALUE token is already in the env prefix
-    (in any position). If a different value for KEY is present, the
-    contract is "prepend" — we add the new pair at the front; the
-    operator removed-then-added if they wanted to change a value.
-    """
-    if pair in env:
-        return False
-    env.insert(0, pair)
-    return True
-
-
-def remove_env(env: list[str], key: str) -> bool:
-    """Remove every ``KEY=...`` token from the env prefix."""
-    keep: list[str] = []
-    removed = False
-    for tok in env:
-        if env_key(tok) == key:
-            removed = True
-            continue
-        keep.append(tok)
-    env[:] = keep
-    return removed
-
-
-def add_dev_channel(argv: list[str], spec: str) -> bool:
-    """Append ``--dangerously-load-development-channels <spec>`` to argv.
-
-    Idempotent: skip if the option-paired form (whitespace OR ``=``)
-    is already present anywhere in argv.
-    """
-    pair_ws = ["--dangerously-load-development-channels", spec]
-    pair_eq = f"--dangerously-load-development-channels={spec}"
-    # Whitespace form: option followed immediately by spec.
-    for i in range(len(argv) - 1):
-        if argv[i] == pair_ws[0] and argv[i + 1] == pair_ws[1]:
-            return False
-    # = form: option=spec as a single token.
-    if pair_eq in argv:
-        return False
-    argv.append(pair_ws[0])
-    argv.append(pair_ws[1])
-    return True
-
-
-def remove_dev_channel(argv: list[str], spec: str) -> bool:
-    """Strip the option/spec pair (whitespace + ``=`` forms) and any
-    dangling bare ``spec`` token left behind by an operator partial
-    edit. Mirrors the cleanup logic in bridge-relay-cleanup.py
-    (RELAY_DEV_CHANNEL_RE / RELAY_BARE_TOKEN_RE) but parameterised on
-    the user-supplied spec rather than hard-coded telegram-relay.
-    """
-    pair_eq = f"--dangerously-load-development-channels={spec}"
-    new: list[str] = []
-    removed = False
-    i = 0
-    while i < len(argv):
-        tok = argv[i]
-        nxt = argv[i + 1] if i + 1 < len(argv) else None
-        if tok == "--dangerously-load-development-channels" and nxt == spec:
-            removed = True
-            i += 2
-            continue
-        if tok == pair_eq:
-            removed = True
-            i += 1
-            continue
-        if tok == spec:
-            # Dangling bare token (operator hand-edited only the
-            # option half away). Cleaning this matches the
-            # bridge-relay-cleanup contract for parity.
-            removed = True
-            i += 1
-            continue
-        new.append(tok)
-        i += 1
-    argv[:] = new
-    return removed
-
-
-value = current
-env, argv = split_env_prefix(value)
-actions: list[str] = []
-
-for line in sys.stdin:
-    line = line.rstrip("\n")
-    if not line:
-        continue
-    parts = line.split("\t", 1)
-    if len(parts) != 2:
-        continue
-    op, payload = parts[0], parts[1]
-    if op == "set-launch-cmd":
-        new_value = payload
-        if new_value != value:
-            value = new_value
-            env, argv = split_env_prefix(value)
-            actions.append(f"set-launch-cmd")
-        continue
-    if op == "add-env":
-        if "=" not in payload:
-            print(f"--launch-cmd-add-env requires KEY=VALUE, got: {payload}", file=sys.stderr)
-            sys.exit(2)
-        if add_env(env, payload):
-            actions.append(f"add-env {payload}")
-        value = reassemble(env, argv)
-        continue
-    if op == "remove-env":
-        if remove_env(env, payload):
-            actions.append(f"remove-env {payload}")
-        value = reassemble(env, argv)
-        continue
-    if op == "add-dev-channel":
-        if add_dev_channel(argv, payload):
-            actions.append(f"add-dev-channel {payload}")
-        value = reassemble(env, argv)
-        continue
-    if op == "remove-dev-channel":
-        if remove_dev_channel(argv, payload):
-            actions.append(f"remove-dev-channel {payload}")
-        value = reassemble(env, argv)
-        continue
-    print(f"unknown launch-cmd op: {op}", file=sys.stderr)
-    sys.exit(2)
-
-print(value)
-print(json.dumps(actions, ensure_ascii=False))
-PY
-)
 
 # bridge_agent_update_apply_channels — compute the new channels CSV
 # from a starting value plus typed mutations on stdin (TSV):
@@ -374,63 +198,16 @@ PY
 #   channels-remove\t<token>
 #
 # Stdout: two lines (new csv, json action array).
+#
+# Issue #815 Wave A: like the launch-cmd applier above, the body now
+# lives in scripts/python-helpers/ rather than a source-time heredoc
+# capture. See agent-update-apply-launch-cmd rationale.
 bridge_agent_update_apply_channels() {
   local current="$1"
   bridge_require_python
-  BRIDGE_AGENT_UPDATE_CH_CURRENT="$current" python3 -c "$_BRIDGE_AGENT_UPDATE_APPLY_CH_PY"
+  BRIDGE_AGENT_UPDATE_CH_CURRENT="$current" \
+    python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/agent-update-apply-channels.py"
 }
-
-_BRIDGE_AGENT_UPDATE_APPLY_CH_PY=$(cat <<'PY'
-import json
-import os
-import sys
-
-
-def split_csv(raw: str) -> list[str]:
-    if not raw:
-        return []
-    return [item.strip() for item in raw.split(",") if item.strip()]
-
-
-def join_csv(items: list[str]) -> str:
-    return ",".join(items)
-
-
-value = os.environ.get("BRIDGE_AGENT_UPDATE_CH_CURRENT", "")
-items = split_csv(value)
-actions: list[str] = []
-
-for line in sys.stdin:
-    line = line.rstrip("\n")
-    if not line:
-        continue
-    parts = line.split("\t", 1)
-    if len(parts) != 2:
-        continue
-    op, payload = parts[0], parts[1]
-    if op == "channels-set":
-        new_items = split_csv(payload)
-        if new_items != items:
-            items = new_items
-            actions.append("channels-set")
-        continue
-    if op == "channels-add":
-        if payload and payload not in items:
-            items.append(payload)
-            actions.append(f"channels-add {payload}")
-        continue
-    if op == "channels-remove":
-        if payload and payload in items:
-            items.remove(payload)
-            actions.append(f"channels-remove {payload}")
-        continue
-    print(f"unknown channels op: {op}", file=sys.stderr)
-    sys.exit(2)
-
-print(join_csv(items))
-print(json.dumps(actions, ensure_ascii=False))
-PY
-)
 
 # bridge_agent_update_emit_audit — write a system_config_mutation row
 # matching bridge-config.py:cmd_set's shape for the agent-update

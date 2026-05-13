@@ -102,8 +102,18 @@ CLI_NAME="$(basename "$0")"
 # parsing + the layout resolver decision (PR-F): calling it here would
 # materialize $BRIDGE_HOME/state via bridge_init_dirs before --dry-run is
 # even checked, breaking the dry-run mutation-free invariant.
+#
+# Issue #815 Wave A: also skip the top-level pre-dispatch load for the
+# hot-path subcommands that own their own roster load timing
+# (`status`, `daemon`, `agent`, `task`, `inbox`). On a stale runtime
+# the eager top-level load runs `bridge_render_active_roster` (which
+# fanned out into multi-record `done <<<` loops, the second-class
+# heredoc_write hang vector). The subcommand dispatch paths still load
+# the roster lazily when they actually need it; skipping here keeps
+# `agb status` / `agb agent list` / `agb inbox <agent>` / `agb daemon
+# start` startup well under 5s on the operator's live host.
 case "${1:-}" in
-  version) ;;
+  version|status|daemon|agent|task|inbox) ;;
   init)
     # bridge-isolation-v2.sh's `BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"`
     # default fires during our bridge-lib.sh source above and exports the

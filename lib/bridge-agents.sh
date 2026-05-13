@@ -4771,6 +4771,13 @@ bridge_agent_channel_diagnostics_text() {
   local row_count=0
 
   tsv="$(bridge_agent_channel_diagnostics_tsv "$agent")"
+  # Issue #815 Wave A: stage multi-record TSV through a tempfile instead
+  # of `done <<<` to avoid `heredoc_write` hangs on stale runtimes.
+  local _tmp
+  _tmp="$(mktemp)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_tmp'" RETURN
+  printf '%s\n' "$tsv" > "$_tmp"
   while IFS=$'\t' read -r channel provider plugin_spec plugin_status plugin_installed plugin_enabled launch_allowlisted access_status credentials_status runtime_ready state_dir; do
     [[ "$channel" == "channel" ]] && continue
     [[ -n "$channel" ]] || continue
@@ -4780,7 +4787,7 @@ bridge_agent_channel_diagnostics_text() {
     printf '  plugin: installed=%s enabled=%s status=%s spec=%s\n' "$plugin_installed" "$plugin_enabled" "$plugin_status" "$plugin_spec"
     printf '  launch_allowlisted: %s\n' "$launch_allowlisted"
     printf '  runtime: state_dir=%s access=%s credentials=%s ready=%s\n' "$state_dir" "$access_status" "$credentials_status" "$runtime_ready"
-  done <<<"$tsv"
+  done < "$_tmp"
 
   if [[ "$row_count" == "0" ]]; then
     printf '%s\n' "- channels: (none)"
@@ -6210,11 +6217,21 @@ bridge_list_active_agents_numbered() {
   local -A claimed_counts=()
 
   if summary_output="$(bridge_queue_cli summary --format tsv 2>/dev/null)"; then
-    while IFS=$'\t' read -r agent_name queued claimed _blocked _active _idle _last_seen _last_nudge _session _engine _workdir; do
-      [[ -z "$agent_name" ]] && continue
-      queue_counts["$agent_name"]="$queued"
-      claimed_counts["$agent_name"]="$claimed"
-    done <<<"$summary_output"
+    # Issue #815 Wave A: $summary_output is the entire queue summary
+    # (one row per agent) — multi-record text that triggered
+    # `heredoc_write` hangs on stale runtimes. Stage through tempfile.
+    local _tmp_summary
+    _tmp_summary="$(mktemp)" || _tmp_summary=""
+    if [[ -n "$_tmp_summary" ]]; then
+      # shellcheck disable=SC2064
+      trap "rm -f -- '$_tmp_summary'" RETURN
+      printf '%s\n' "$summary_output" > "$_tmp_summary"
+      while IFS=$'\t' read -r agent_name queued claimed _blocked _active _idle _last_seen _last_nudge _session _engine _workdir; do
+        [[ -z "$agent_name" ]] && continue
+        queue_counts["$agent_name"]="$queued"
+        claimed_counts["$agent_name"]="$claimed"
+      done < "$_tmp_summary"
+    fi
   fi
 
   while IFS= read -r agent; do
