@@ -7,10 +7,18 @@
 # indefinitely. This script scans every tmux session, detects a picker that
 # matches a closed pattern allow-list, and presses Enter on the default option.
 #
-# Usage (opt-in cron, default disabled):
+# Usage (essential cron; default-enabled on host_profile=server, default-skipped
+# on host_profile=dev; explicit BRIDGE_PICKER_SWEEP_ENABLED=0 always wins):
 #
-#   *) Set BRIDGE_PICKER_SWEEP_ENABLED=1 in the environment that invokes the
-#      script (cron line, agent-bridge cron payload, etc).
+#   *) On host_profile=server installs (the post-bridge-init default), this
+#      script is wired up automatically — `bridge-init.sh` auto-registers a
+#      `*/10 * * * *` bridge-native cron via
+#      `lib/bridge-init-default-crons.sh::bridge_init_register_default_picker_sweep`.
+#      Operators do not need to register it manually on fresh server inits.
+#   *) Explicit override: `BRIDGE_PICKER_SWEEP_ENABLED=0` in the environment
+#      that invokes the script (or in the cron payload) forces the
+#      explicit-opt-out path. `BRIDGE_PICKER_SWEEP_ENABLED=1` forces the
+#      enabled path even on host_profile=dev.
 #   *) Set BRIDGE_PICKER_SWEEP_SELF to the agent name running this cron, so
 #      its own tmux pane is skipped (false-positives from talking ABOUT a
 #      picker in a doc/PR/log are the dominant failure mode).

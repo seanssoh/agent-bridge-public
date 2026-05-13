@@ -47,15 +47,22 @@ bridge_init_register_default_picker_sweep() {
   # job, proceed to register".
   #
   # Footgun #11 mitigation: route both the CLI's JSON output AND the python
-  # interpreter input via tempfiles rather than piping into a `python3 -
-  # <<'PY'` block. Multi-record JSON over stdin into a heredoc'd python3 has
-  # hit heredoc/here-string deadlocks on the orchestrator host (see #800,
-  # HANDOFF_2026-05-08).
-  local list_tmp=""
+  # script itself via tempfiles rather than piping into a `python3 - <<'PY'`
+  # block. Multi-record JSON heredoc-fed to python3 has hit heredoc/here-string
+  # deadlocks on the orchestrator host (see #800, HANDOFF_2026-05-08).
+  # r1 codex review caught that the initial fix only tempfile'd the JSON output
+  # while still using `python3 - <<'PY'` for the script — same deadlock class.
+  # r2 fix: write the python script to its own tempfile and exec it.
+  local list_tmp="" script_tmp=""
   list_tmp="$(mktemp 2>/dev/null)" || list_tmp=""
-  if [[ -n "$list_tmp" ]]; then
-    if "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron list --json >"$list_tmp" 2>/dev/null; then
-      if python3 - "$list_tmp" <<'PY' 2>/dev/null
+  script_tmp="$(mktemp 2>/dev/null)" || script_tmp=""
+  # Cleanup both tempfiles on every return path via a RETURN trap. The
+  # `rm -f --` form (and quoted paths) is safe even if either tempfile is
+  # empty / unset.
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$list_tmp' '$script_tmp'" RETURN
+  if [[ -n "$list_tmp" && -n "$script_tmp" ]]; then
+    cat >"$script_tmp" <<'PY'
 import json, sys
 try:
     with open(sys.argv[1], "r", encoding="utf-8") as fh:
@@ -69,13 +76,12 @@ for j in (jobs or []):
         sys.exit(0)
 sys.exit(1)
 PY
-      then
-        rm -f "$list_tmp"
+    if "$BRIDGE_BASH_BIN" "$agent_bridge_cli" cron list --json >"$list_tmp" 2>/dev/null; then
+      if python3 "$script_tmp" "$list_tmp" >/dev/null 2>&1; then
         printf '[init] picker-sweep cron already registered — skip\n' >&2
         return 0
       fi
     fi
-    rm -f "$list_tmp"
   fi
 
   # Register: */10 * * * *, payload runs scripts/picker-sweep.sh with the env
