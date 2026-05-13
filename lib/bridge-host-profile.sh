@@ -315,7 +315,30 @@ bridge_host_profile_run() {
 
   if [[ "$profile" == "dev" ]]; then
     bridge_host_profile_offer_dev_cron_disable "$agent_bridge_cli" "$interactive" >/dev/null || true
+    bridge_host_profile_emit_dev_advisories >&2 || true
   fi
 
   printf '%s\n' "$profile"
+}
+
+# Emit one-shot advisory text for the operator on profile=dev. Currently
+# covers: (a) external-channel setup will be skipped during this init run,
+# (b) the v2 multi-tenant isolation layout is not required for dev hosts
+# and stays opt-in via BRIDGE_LAYOUT=v2 / `agent-bridge migrate isolation-v2`.
+# No mutations — channel-skip is enforced at the bridge-init.sh call site,
+# isolation is operator-opt-in. The block is informational so the dev
+# operator sees in one place why the rest of the init flow looks lighter.
+bridge_host_profile_emit_dev_advisories() {
+  printf '\n'
+  printf '[host-profile=dev] 다음 운영용 기능은 이번 init 에서 건너뛰거나 비활성 상태로 둡니다:\n'
+  printf '  - 외부 채널 (Discord / Telegram / Teams / Mattermost) 부트스트랩: skip\n'
+  printf '    필요해지면 `agb setup discord <admin>` 등으로 나중에 켤 수 있습니다.\n'
+  printf '  - 멀티테넌트 v2 isolation 레이아웃: legacy 유지 (마이그레이션 비강제)\n'
+  printf '    Linux 운영 호스트에서 다중 사용자 분리가 필요해지면\n'
+  printf '    `agent-bridge migrate isolation-v2 --apply` 로 전환할 수 있습니다.\n'
+  printf '  - librarian / wiki-* 정기 크론: 위 단계에서 disable 처리됨\n'
+  printf '\n'
+  printf '정적 에이전트는 admin(`patch` 기본) + admin-dev(`patch-dev` codex pair) 2개로\n'
+  printf '시작합니다. 추가 정적 역할은 운영 모드에서만 필요한 경우가 일반적입니다.\n'
+  printf '\n'
 }
