@@ -59,8 +59,39 @@ bridge_guard_bool_value() {
   esac
 }
 
+# Default value for BRIDGE_PROMPT_GUARD_ENABLED when the env is unset.
+# Track D follow-up to #713 / #809: server hosts default to "1" so prompt
+# guard runs on fresh hosted installs without an extra opt-in. dev hosts
+# default to "0" so a laptop install stays quiet. Explicit env override
+# (set to "0" or "1") wins over host_profile via the call site in
+# bridge_prompt_guard_enabled_default.
+bridge_prompt_guard_default() {
+  # Lazy-source bridge-host-profile.sh: lib/bridge-guard.sh is loaded by
+  # contexts that may or may not have already sourced the host-profile
+  # helper. `type` check avoids re-source on every call.
+  if ! declare -F bridge_host_profile_is_dev >/dev/null 2>&1; then
+    if [[ -r "${BRIDGE_SCRIPT_DIR:-}/lib/bridge-host-profile.sh" ]]; then
+      # shellcheck source=/dev/null
+      source "${BRIDGE_SCRIPT_DIR}/lib/bridge-host-profile.sh"
+    elif [[ -r "${BRIDGE_HOME:-}/lib/bridge-host-profile.sh" ]]; then
+      # shellcheck source=/dev/null
+      source "${BRIDGE_HOME}/lib/bridge-host-profile.sh"
+    fi
+  fi
+  if declare -F bridge_host_profile_is_dev >/dev/null 2>&1 \
+      && bridge_host_profile_is_dev; then
+    printf '0'
+  else
+    printf '1'
+  fi
+}
+
 bridge_prompt_guard_enabled_default() {
-  bridge_guard_bool_value "${BRIDGE_PROMPT_GUARD_ENABLED:-0}" "0"
+  local raw="${BRIDGE_PROMPT_GUARD_ENABLED:-}"
+  if [[ -z "$raw" ]]; then
+    raw="$(bridge_prompt_guard_default)"
+  fi
+  bridge_guard_bool_value "$raw" "0"
 }
 
 bridge_agent_prompt_guard_enabled() {

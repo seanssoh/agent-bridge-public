@@ -2,7 +2,11 @@
 # scripts/smoke/picker-sweep.sh — fixture smoke for the picker-sweep utility.
 #
 # Validates picker-sweep.sh in isolation:
-#   1. Default-disabled gate: BRIDGE_PICKER_SWEEP_ENABLED!=1 → no-op exit 0
+#   1. Explicit-opt-out gate: BRIDGE_PICKER_SWEEP_ENABLED=0 → no-op exit 0
+#      (Default has flipped to enabled on host_profile=server since PR #813;
+#      this smoke runs picker-sweep.sh outside a real BRIDGE_HOME, so the
+#      host_profile-aware default helper short-circuits — the smoke continues
+#      to drive the env-override path explicitly.)
 #   2. Self-skip: agent matching BRIDGE_PICKER_SWEEP_SELF is skipped
 #   3. False-positive defence: a session containing picker text in
 #      free-prose context (PR body, doc, log) does NOT trigger send-keys
@@ -119,10 +123,16 @@ count_lines() {
 }
 
 # ---------------------------------------------------------------------------
-# Test 1 — Default-disabled gate.
+# Test 1 — Explicit-opt-out gate.
+#
+# Default flipped to enabled on host_profile=server in PR #813. The smoke
+# fixture has no BRIDGE_HOME (no state/install/host-profile.json), so
+# `bridge_host_profile_is_dev` returns false (fail-closed) and the host_profile
+# branch in picker-sweep.sh does not fire. The remaining gate is the
+# explicit operator opt-out: BRIDGE_PICKER_SWEEP_ENABLED=0.
 # ---------------------------------------------------------------------------
 
-smoke_log "1. default-disabled gate"
+smoke_log "1. explicit-opt-out gate"
 reset_fixture
 printf '%s\n' "agent-a" > "$FIXTURE_DIR/sessions"
 cat >"$FIXTURE_DIR/pane-agent-a" <<'PANE'
@@ -132,11 +142,11 @@ cat >"$FIXTURE_DIR/pane-agent-a" <<'PANE'
 Enter to confirm · Esc to cancel
 PANE
 
-unset BRIDGE_PICKER_SWEEP_ENABLED
+export BRIDGE_PICKER_SWEEP_ENABLED=0
 run_sweep
 smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "1 no send (gate closed)"
 smoke_assert_eq "0" "$(count_lines "$TASK_LOG")" "1 no task (gate closed)"
-smoke_assert_contains "$(cat "$BRIDGE_PICKER_SWEEP_LOG")" "BRIDGE_PICKER_SWEEP_ENABLED!=1" "1 gate logged"
+smoke_assert_contains "$(cat "$BRIDGE_PICKER_SWEEP_LOG")" "explicit opt-out" "1 gate logged"
 
 # Enable for the remaining tests.
 export BRIDGE_PICKER_SWEEP_ENABLED=1
