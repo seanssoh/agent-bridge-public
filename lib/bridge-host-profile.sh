@@ -189,8 +189,17 @@ bridge_host_profile_list_production_crons() {
   [[ -n "$list_json" ]] || return 0
   bridge_require_python
   # Pass exact-name list first, then a `--prefixes` separator, then prefix list.
-  # The separator is a sentinel that cannot appear as a cron name (cron names
-  # are slug-cased per `classify_family` in bridge-cron.py).
+  # The separator is an argv-static sentinel — the two source lists at the top
+  # of this file (BRIDGE_HOST_PROFILE_PRODUCTION_CRONS,
+  # BRIDGE_HOST_PROFILE_PRODUCTION_CRON_PREFIXES) are controller-owned constants
+  # that never contain `--prefixes` literally, and adding new entries is
+  # reviewed alongside this helper. Codex r1 reviewer caught that cron `name`
+  # is the raw operator-supplied title (not slugified — only `job_id` runs
+  # through `slugify_title`), so the contract relies on caller discipline,
+  # not on cron-name format invariants. Structural encoding (single JSON
+  # payload via stdin) would be safer but adds bash-side JSON escaping risk
+  # for no current benefit; revisit if a future addition needs `--`-prefixed
+  # tokens.
   python3 - "$list_json" "${BRIDGE_HOST_PROFILE_PRODUCTION_CRONS[@]}" "--prefixes" "${BRIDGE_HOST_PROFILE_PRODUCTION_CRON_PREFIXES[@]}" <<'PY'
 import json, sys
 list_json = sys.argv[1]
@@ -399,8 +408,13 @@ bridge_host_profile_run() {
   printf 'host_profile: %s (saved to %s, set_by=%s)\n' "$profile" "$(bridge_host_profile_path)" "$set_by" >&2
 
   if [[ "$profile" == "dev" ]]; then
-    bridge_host_profile_offer_dev_cron_disable "$agent_bridge_cli" "$interactive" >/dev/null || true
-    bridge_host_profile_emit_dev_advisories "$admin_agent" >&2 || true
+    # Codex r1 finding 5: capture the cron-disable summary so the advisory
+    # below reflects what actually happened (user-declined / no-matching /
+    # success / partial-failure) instead of unconditionally claiming
+    # "disable 처리됨".
+    local cron_disable_summary=""
+    cron_disable_summary="$(bridge_host_profile_offer_dev_cron_disable "$agent_bridge_cli" "$interactive" || true)"
+    bridge_host_profile_emit_dev_advisories "$admin_agent" "$cron_disable_summary" >&2 || true
   fi
 
   printf '%s\n' "$profile"
@@ -409,7 +423,9 @@ bridge_host_profile_run() {
 # Emit one-shot advisory text for the operator on profile=dev. Currently
 # covers: (a) external-channel setup will be skipped during this init run,
 # (b) the v2 multi-tenant isolation layout is not required for dev hosts
-# and stays opt-in via BRIDGE_LAYOUT=v2 / `agent-bridge migrate isolation-v2`.
+# and stays opt-in via BRIDGE_LAYOUT=v2 / `agent-bridge migrate isolation-v2`,
+# (c) the actual outcome of the production-cron disable offer (reflects
+# user-declined, no-matching-crons, success, or partial-failure cases).
 # No mutations — channel-skip is enforced at the bridge-init.sh call site,
 # isolation is operator-opt-in. The block is informational so the dev
 # operator sees in one place why the rest of the init flow looks lighter.
@@ -418,9 +434,36 @@ bridge_host_profile_run() {
 #   $1 = admin agent id (e.g. "patch"). Used to render the static-pair line
 #        accurately when --admin is non-default. Falls back to "admin" when
 #        empty so legacy callers still get a sensible message.
+#   $2 = cron-disable summary (the single-line output of
+#        bridge_host_profile_offer_dev_cron_disable; e.g.
+#        "disabled=10 failed=0", "disabled=0 skipped=12 reason=user-declined",
+#        "disabled=0 skipped=0 reason=no-matching-crons"). Drives the
+#        wording of the cron lines below. Empty string falls back to the
+#        "offered" wording so a future caller that hasn't wired this up
+#        still produces sensible output.
 bridge_host_profile_emit_dev_advisories() {
   local admin_agent="${1:-admin}"
+  local cron_summary="${2:-}"
   local admin_pair="${admin_agent}-dev"
+  # Parse summary into a short user-facing verb. The summary is one of:
+  #   disabled=N failed=M                          (success-or-mixed path)
+  #   disabled=0 skipped=N reason=user-declined    (operator said no)
+  #   disabled=0 skipped=N reason=no-matching-crons (nothing to disable yet)
+  # We treat "disabled > 0" as truly disabled, anything else as offered-only.
+  local cron_verb="disable 처리됨"
+  local cron_extra=""
+  if [[ -n "$cron_summary" ]]; then
+    if [[ "$cron_summary" == *"reason=user-declined"* ]]; then
+      cron_verb="유지됨 (운영자가 disable 거절)"
+      cron_extra='    필요하면 나중에 `agb cron update <id> --disable` 으로 끌 수 있습니다.\n'
+    elif [[ "$cron_summary" == *"reason=no-matching-crons"* ]]; then
+      cron_verb="해당 없음 (현재 호스트에 등록된 매칭 크론 없음)"
+      cron_extra=""
+    elif [[ "$cron_summary" =~ disabled=0([[:space:]]|$) ]]; then
+      cron_verb="disable 시도 결과 0건 (요약: ${cron_summary})"
+      cron_extra=""
+    fi
+  fi
   printf '\n'
   printf '[host-profile=dev] 다음 운영용 기능은 이번 init 에서 건너뛰거나 비활성 상태로 둡니다:\n'
   printf '  - 외부 채널 (Discord / Telegram / Teams / Mattermost) 부트스트랩: skip\n'
@@ -428,9 +471,13 @@ bridge_host_profile_emit_dev_advisories() {
   printf '  - 멀티테넌트 v2 isolation 레이아웃: legacy 유지 (마이그레이션 비강제)\n'
   printf '    Linux 운영 호스트에서 다중 사용자 분리가 필요해지면\n'
   printf '    `agent-bridge migrate isolation-v2 --apply` 로 전환할 수 있습니다.\n'
-  printf '  - librarian / wiki-* 정기 크론: 위 단계에서 disable 처리됨\n'
-  printf '  - memory-daily-<agent> 크론: 위 단계에서 disable 처리됨\n'
+  printf '  - librarian / wiki-* 정기 크론: %s\n' "$cron_verb"
+  printf '  - memory-daily-<agent> 크론: %s\n' "$cron_verb"
   printf '    (Claude Code 자체 세션 메모리와 기능이 중복되므로 dev 에서는 불필요)\n'
+  if [[ -n "$cron_extra" ]]; then
+    # shellcheck disable=SC2059
+    printf "$cron_extra"
+  fi
   printf '  - picker-sweep 자동 unstick: skip (BRIDGE_PICKER_SWEEP_ENABLED=1 로 override 가능)\n'
   printf '  - prompt-guard (채널/MCP/intake 검사): skip (BRIDGE_PROMPT_GUARD_ENABLED=1 로 override 가능)\n'
   printf '\n'
@@ -439,6 +486,6 @@ bridge_host_profile_emit_dev_advisories() {
   printf '\n'
   printf 'admin 에이전트의 CLAUDE.md 에는 `wave-orchestration` 스킬을 default workflow\n'
   printf '로 사용하라는 SOP 블록이 자동 주입됩니다 — 사용자가 "X 만들어줘" 라고 하면\n'
-  printf 'patch + patch-dev 페어가 wave (병렬 issue-fixer + codex review) 로 진행합니다.\n'
+  printf '%s + %s 페어가 wave (병렬 issue-fixer + codex review) 로 진행합니다.\n' "$admin_agent" "$admin_pair"
   printf '\n'
 }
