@@ -209,3 +209,65 @@ Otherwise: parallel.
 ## Composite footgun — VERSION + close-keyword + worktree path
 
 If a fixer trips footguns 1, 2, and 4 in the same PR, the PR (a) mutates the operator's primary checkout, (b) auto-closes the parent issue, and (c) bumps VERSION concurrent with an open release PR. Recovery is a manual revert + amend + reopen + comment + roster reset. Don't let this happen — every brief should explicitly call out all three. The cost of a 3-line footgun callout in the brief is much smaller than the cost of recovery.
+
+## Footgun 11 — Bash heredoc / here-string deadlock against a slow consumer
+
+**Symptom**: A bash hot path that feeds bash-side data into a `while read` loop or `python3 - <<'PY'` subprocess via heredoc / here-string silently wedges with no output and no progress. `pstack` / `lldb` on the bash frame shows it stuck inside `heredoc_write → __wait4`. Sometimes never times out (the canonical #800 case was a 34h daemon hang). Sometimes only reproduces past a threshold input size (multi-record git porcelain, a few KB+).
+
+**Root cause**: Bash heredoc / here-string plumbing puts the **producer** (bash writing the heredoc body) and the **consumer** (subprocess stdin or `while read` reader) on the same pipe pair. If the consumer blocks even briefly during processing (slow `python3` startup, slow line-by-line work) AND the producer's data exceeds the pipe buffer, both ends wedge. The producer waits for the consumer to drain; the consumer waits for the producer to finish; nothing breaks the deadlock.
+
+The bug class covers at least three syntactic variants — all share the same root:
+
+```bash
+# Variant A — heredoc into subprocess stdin (the #800 / PR #801 / PR #806 case):
+result="$(python3 - <<'PY'
+... multi-line python body ...
+PY
+)"
+
+# Variant B — here-string into `while read` loop (the 2026-05-13 worktree-doctor case):
+while IFS= read -r line; do
+    process "$line"        # if slow, deadlocks on multi-record input
+done <<<"$porcelain"
+
+# Variant C — `<<EOF ... EOF` heredoc to any pipe-pair consumer:
+some_cmd <<EOF
+... multi-line body ...
+EOF
+```
+
+**Fix** — route the producer through a tempfile so the bash heredoc-write step finishes before the consumer ever runs:
+
+```bash
+# Producer/consumer decoupled via tempfile:
+local tmp
+tmp="$(mktemp)"
+trap "rm -f '$tmp'" RETURN
+printf '%s\n' "$porcelain" > "$tmp"
+
+# Now the consumer reads from a real file; no back-pressure interaction.
+while IFS= read -r line; do
+    process "$line"
+done < "$tmp"
+```
+
+For the `python3 - <<'PY'` variant, write the script to a tempfile and exec it:
+
+```bash
+local tmp
+tmp="$(mktemp --suffix=.py)"
+trap "rm -f '$tmp'" RETURN
+cat > "$tmp" <<'PY'
+... multi-line python body ...
+PY
+result="$(python3 "$tmp")"
+```
+
+**Apply rule for brief writers**: when the task involves bash that pipes bash-side data into ANY pipe-pair consumer (subprocess stdin, `while read`, an embedded interpreter), default to **`mktemp + < file`** instead of heredoc / here-string. Threshold heuristic: anything over a single short value (a SHA, a single path, a flag) should go via tempfile. Cheap to write, prevents the deadlock class entirely.
+
+**Real instances**:
+- #800 (closed 2026-05-12) — 34h daemon hang traced to nested `$(python3 - <<'PY')` in `bridge-daemon.sh` rotation / recovery paths. Fixed in PR #801 + #806 by wrapping production callsites.
+- 2026-05-13 — worktree-doctor fixer's smoke setup deadlocked in `<<<"$porcelain"` against multi-record `git worktree list --porcelain` output on Bash 5.3.9. Same `heredoc_write` frame as #800.
+- PR #809 body (this wave) — operator notes `./scripts/smoke-test.sh` hangs on a `cat` heredoc on the orchestrator's host. Same class; pre-existing on `main`, not introduced by #809.
+
+**Escalation trigger**: if a third *new* surface trips this class (i.e., outside the already-wrapped daemon hot paths), open a repo-wide audit issue and grep every `<<<` and `<<'`/`<<\"` site in `lib/`, `scripts/`, and root `bridge-*.sh` for producer-consumer pairs above the threshold. Until then, fix at the encounter site and call this footgun out in the next bash-heavy brief.
