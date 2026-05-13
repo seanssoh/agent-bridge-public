@@ -1083,8 +1083,8 @@ process_usage_monitor() {
   # loop continues without rotation candidates this tick.
   rotation_rows="$(bridge_with_timeout 5 usage_rotation_candidates_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" usage-rotation-candidates-parse "$monitor_json")" || rotation_rows=""
 
-  printf '%s' "$alert_rows" > "$_alert_tmp"
-  printf '%s' "$rotation_rows" > "$_rotation_tmp"
+  printf '%s\n' "$alert_rows" > "$_alert_tmp"
+  printf '%s\n' "$rotation_rows" > "$_rotation_tmp"
 
   while IFS=$'\t' read -r provider account window bucket used_percent reset_at source body; do
     [[ -z "$provider" || -z "$window" || -z "$bucket" ]] && continue
@@ -1768,7 +1768,7 @@ process_stall_reports() {
   [[ "$max_nudges" =~ ^[0-9]+$ ]] || max_nudges=2
   now_ts="$(date +%s)"
 
-  printf '%s' "$summary_output" > "$_summary_tmp"
+  printf '%s\n' "$summary_output" > "$_summary_tmp"
 
   while IFS=$'\t' read -r agent queued claimed blocked active idle last_seen last_nudge session engine workdir; do
     [[ -n "$agent" ]] || continue
@@ -1857,7 +1857,7 @@ process_stall_reports() {
             # Issue #265 proposal A: stall analyzer runs once per active agent
             # per cycle; a single hang would multiply across the roster on
             # every tick. Wrap so a stuck child cannot freeze the whole loop.
-            printf '%s' "$capture" > "$_capture_tmp"
+            printf '%s\n' "$capture" > "$_capture_tmp"
             analysis_shell="$(bridge_with_timeout "" stall_analyze python3 "$SCRIPT_DIR/bridge-stall.py" analyze --format shell < "$_capture_tmp" 2>/dev/null || true)"
             if [[ -n "$analysis_shell" ]]; then
               STALL_CLASSIFICATION=""
@@ -1865,7 +1865,7 @@ process_stall_reports() {
               STALL_MATCHED_LINE_HASH=""
               STALL_EXCERPT_HASH=""
               STALL_EXCERPT_B64=""
-              printf '%s' "$analysis_shell" > "$_shell_tmp"
+              printf '%s\n' "$analysis_shell" > "$_shell_tmp"
               # shellcheck disable=SC1090
               source "$_shell_tmp"
               classification="${STALL_CLASSIFICATION:-}"
@@ -2110,7 +2110,7 @@ process_permission_task_timeout_fanout() {
   _expired_tmp="$(mktemp)"
   # shellcheck disable=SC2064
   trap "rm -f -- '$_expired_tmp'" RETURN
-  printf '%s' "$expired_rows" > "$_expired_tmp"
+  printf '%s\n' "$expired_rows" > "$_expired_tmp"
 
   local task_id age_seconds created_by status title marker age_minutes body_text
   local primary="" notify_target_agent="" requester_has_notify
@@ -2239,7 +2239,7 @@ process_context_pressure_reports() {
   [[ "$scan_interval" =~ ^[0-9]+$ ]] || scan_interval=60
   now_ts="$(date +%s)"
 
-  printf '%s' "$summary_output" > "$_summary_tmp"
+  printf '%s\n' "$summary_output" > "$_summary_tmp"
 
   while IFS=$'\t' read -r agent queued claimed blocked active idle last_seen last_nudge session engine workdir; do
     [[ -n "$agent" ]] || continue
@@ -2305,13 +2305,13 @@ process_context_pressure_reports() {
     if [[ -n "$capture" ]]; then
       # Issue #265 proposal A: same risk profile as the stall analyzer above
       # (per-agent per-cycle); cap subprocess time to keep the loop moving.
-      printf '%s' "$capture" > "$_capture_tmp"
+      printf '%s\n' "$capture" > "$_capture_tmp"
       analysis_shell="$(bridge_with_timeout "" context_pressure_analyze python3 "$SCRIPT_DIR/bridge-context-pressure.py" analyze --format shell --engine "$engine" < "$_capture_tmp" 2>/dev/null || true)"
       if [[ -n "$analysis_shell" ]]; then
         CONTEXT_PRESSURE_SEVERITY=""
         CONTEXT_PRESSURE_MATCHED_PATTERN=""
         CONTEXT_PRESSURE_EXCERPT_HASH=""
-        printf '%s' "$analysis_shell" > "$_shell_tmp"
+        printf '%s\n' "$analysis_shell" > "$_shell_tmp"
         # shellcheck disable=SC1090
         source "$_shell_tmp"
         severity="${CONTEXT_PRESSURE_SEVERITY:-}"
@@ -2928,7 +2928,7 @@ nudge_agent_session() {
     _open_task_tmp="$(mktemp)"
     # shellcheck disable=SC2064
     trap "rm -f -- '$_open_task_tmp'" RETURN
-    printf '%s' "$open_task_shell" > "$_open_task_tmp"
+    printf '%s\n' "$open_task_shell" > "$_open_task_tmp"
     # shellcheck disable=SC1090
     source "$_open_task_tmp"
   fi
@@ -3654,7 +3654,7 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
 
   local event_id="" trigger="" started_ts="" raw_trigger=""
   local key="" val=""
-  printf '%s' "$parsed" > "$_parsed_tmp"
+  printf '%s\n' "$parsed" > "$_parsed_tmp"
   while IFS=$'\t' read -r key val; do
     case "$key" in
       event_id) event_id="$val" ;;
@@ -3738,7 +3738,7 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
   local CHANNEL_ROUTE_PLUGIN="" CHANNEL_ROUTE_CHANNEL_ID=""
   local CHANNEL_ROUTE_REPLY_TO_MESSAGE_ID="" CHANNEL_ROUTE_LAST_USER_INBOUND_TS=""
   local CHANNEL_ROUTE_THREAD_ID=""
-  printf '%s' "$route_output" > "$_route_tmp"
+  printf '%s\n' "$route_output" > "$_route_tmp"
   # shellcheck disable=SC1090
   source "$_route_tmp"
 
@@ -3774,7 +3774,7 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
 
   local PRECOMPACT_BODY_B64="" PRECOMPACT_EXPECTED_SECONDS=""
   local PRECOMPACT_LANG="" PRECOMPACT_KIND="" PRECOMPACT_DURATION_SECONDS=""
-  printf '%s' "$render_output" > "$_render_tmp"
+  printf '%s\n' "$render_output" > "$_render_tmp"
   # shellcheck disable=SC1090
   source "$_render_tmp"
   local body=""
@@ -3824,7 +3824,7 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
   local CHANNEL_SEND_REPLY_TO_MESSAGE_ID="" CHANNEL_SEND_MESSAGE_ID=""
   local CHANNEL_SEND_THREAD_ID="" CHANNEL_SEND_DRY_RUN=""
   if [[ -n "$send_output" ]]; then
-    printf '%s' "$send_output" > "$_send_tmp"
+    printf '%s\n' "$send_output" > "$_send_tmp"
     # shellcheck disable=SC1090
     source "$_send_tmp"
   fi
@@ -3998,7 +3998,7 @@ for k in keys:
   local pending_started_ts="0" pending_lang="" pending_dry_run="0"
   local pending_followup_sent_ts=""
   local pkey="" pval=""
-  printf '%s' "$pending_parsed" > "$_pending_tmp"
+  printf '%s\n' "$pending_parsed" > "$_pending_tmp"
   while IFS=$'\t' read -r pkey pval; do
     case "$pkey" in
       event_id) pending_event_id="$pval" ;;
@@ -4067,7 +4067,7 @@ for k in keys:
   local PRECOMPACT_BODY_B64="" PRECOMPACT_EXPECTED_SECONDS=""
   local PRECOMPACT_LANG="" PRECOMPACT_KIND="" PRECOMPACT_DURATION_SECONDS=""
   if [[ -n "$render_output" ]]; then
-    printf '%s' "$render_output" > "$_render_tmp"
+    printf '%s\n' "$render_output" > "$_render_tmp"
     # shellcheck disable=SC1090
     source "$_render_tmp"
   fi
@@ -4126,7 +4126,7 @@ for k in keys:
 
   local CHANNEL_SEND_STATUS="" CHANNEL_SEND_MESSAGE_ID="" CHANNEL_SEND_DRY_RUN=""
   if [[ -n "$send_output" ]]; then
-    printf '%s' "$send_output" > "$_send_tmp"
+    printf '%s\n' "$send_output" > "$_send_tmp"
     # shellcheck disable=SC1090
     source "$_send_tmp"
   fi
@@ -4372,7 +4372,7 @@ start_cron_dispatch_workers() {
   rm -f "$status_snapshot_file"
   [[ -n "$ready_rows" ]] || return 0
 
-  printf '%s' "$ready_rows" > "$_ready_tmp"
+  printf '%s\n' "$ready_rows" > "$_ready_tmp"
 
   while IFS=$'\t' read -r task_id agent _priority _title _body_path; do
     [[ -n "$task_id" && -n "$agent" ]] || continue
@@ -4755,7 +4755,7 @@ process_on_demand_agents() {
   _summary_tmp="$(mktemp)"
   # shellcheck disable=SC2064
   trap "rm -f -- '$_summary_tmp'" RETURN
-  printf '%s' "$summary_output" > "$_summary_tmp"
+  printf '%s\n' "$summary_output" > "$_summary_tmp"
 
   while IFS=$'\t' read -r agent queued claimed blocked active idle _last_seen _last_nudge session _engine _workdir; do
     [[ -z "$agent" ]] && continue
@@ -5065,7 +5065,7 @@ process_memory_daily_orphan_sweep() {
   body+="Run the suggested \`agent-bridge cron delete\` commands to clear:"$'\n\n'
 
   local job_id source_agent
-  printf '%s' "$orphans_tsv" > "$_orphans_tmp"
+  printf '%s\n' "$orphans_tsv" > "$_orphans_tmp"
   while IFS=$'\t' read -r job_id source_agent; do
     [[ -n "$job_id" && -n "$source_agent" ]] || continue
     body+="- \`memory-daily-${source_agent}\` (id=${job_id}, source_agent=${source_agent}) — \`agent-bridge cron delete ${job_id}\`"$'\n'
@@ -5589,7 +5589,7 @@ cmd_sync_cycle() {
   start_cron_dispatch_workers || true
 
   BRIDGE_DAEMON_LAST_STEP="nudge_agents"
-  printf '%s' "$nudge_output" > "$_nudge_tmp"
+  printf '%s\n' "$nudge_output" > "$_nudge_tmp"
   while IFS=$'\t' read -r agent session queued claimed idle nudge_key; do
     [[ -z "$agent" || -z "$session" ]] && continue
     if ! bridge_tmux_session_exists "$session"; then
