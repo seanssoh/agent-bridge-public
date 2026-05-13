@@ -534,6 +534,40 @@ if [[ $dry_run -eq 0 ]] && [[ "$(bridge_agent_engine "$admin_agent" 2>/dev/null 
   fi
 fi
 
+# Issue #713 follow-up: ask the operator whether this is a server (always-on
+# production host) or a developer PC, then let the dev branch short-circuit the
+# heavy server-only setup that follows. Must run AFTER the admin agent and its
+# codex pair exist (the dev advisory references them by id) but BEFORE channel
+# bootstrap so a `dev` answer skips Discord/Telegram/Teams/Mattermost setup
+# entirely instead of forcing the operator to confirm or `--skip-channel-setup`
+# every flag. Re-running init on an already-answered host is idempotent unless
+# `--reconfigure` is passed; non-interactive (`--json`, no TTY) defaults to
+# `server` to preserve today's behavior on hosted installs. Skipped on
+# `--dry-run` (mutation-free contract).
+if [[ $dry_run -eq 0 ]]; then
+  bridge_init_ensure_live_cli
+  # Prefer the live CLI deployed under $BRIDGE_HOME (canonical post-init
+  # surface — bridge_init_ensure_live_cli just materialized it). Fall back
+  # to the source checkout's CLI when init is invoked from $BRIDGE_HOME
+  # itself (the self-deploy short-circuit branch).
+  host_profile_cli="$BRIDGE_HOME/agent-bridge"
+  if [[ ! -x "$host_profile_cli" ]]; then
+    host_profile_cli="$SCRIPT_DIR/agent-bridge"
+  fi
+  host_profile_chosen="$(bridge_host_profile_run \
+    "$host_profile_cli" \
+    "$host_profile_reconfigure" \
+    "$host_profile_override" \
+    "$json_mode" \
+    "$admin_agent")" || host_profile_chosen=""
+  if [[ "$host_profile_chosen" == "dev" ]] && [[ $skip_channel_setup -eq 0 ]]; then
+    skip_channel_setup=1
+    if [[ -n "$channels" ]]; then
+      bridge_init_append_warning "host_profile=dev: requested channels (${channels}) — channel bootstrap skipped this init. Re-run \`agb setup <channel> ${admin_agent}\` later or pass \`--profile server\` to enable on this install."
+    fi
+  fi
+fi
+
 if [[ $skip_channel_setup -eq 0 ]] && [[ $dry_run -eq 0 ]]; then
   channel_setup_status="ok"
   if bridge_channel_csv_contains "$channels" "plugin:discord"; then
@@ -626,28 +660,10 @@ fi
 
 bridge_init_ensure_live_cli
 
-# Issue #713: ask the operator whether this is a server (always-on production
-# host) or a developer PC, and on `dev` offer to disable the production-style
-# librarian/wiki maintenance crons that drown a laptop in `[cron-followup]`
-# tasks every transient API blip. Skipped on --dry-run (mutation-free
-# contract). Non-interactive contexts (`--json`, no TTY) default to `server`
-# to preserve today's behavior on hosted installs. Re-running init on an
-# already-answered host is a no-op unless `--reconfigure` is passed.
-if [[ $dry_run -eq 0 ]]; then
-  # Prefer the live CLI deployed under $BRIDGE_HOME (canonical post-init
-  # surface — bridge_init_ensure_live_cli just materialized it). Fall back
-  # to the source checkout's CLI when init is invoked from $BRIDGE_HOME
-  # itself (the self-deploy short-circuit branch).
-  host_profile_cli="$BRIDGE_HOME/agent-bridge"
-  if [[ ! -x "$host_profile_cli" ]]; then
-    host_profile_cli="$SCRIPT_DIR/agent-bridge"
-  fi
-  host_profile_chosen="$(bridge_host_profile_run \
-    "$host_profile_cli" \
-    "$host_profile_reconfigure" \
-    "$host_profile_override" \
-    "$json_mode")" || host_profile_chosen=""
-fi
+# Note: host_profile_run (Issue #713) was called earlier — before channel
+# bootstrap — so a `dev` answer can short-circuit the Discord/Telegram/Teams/
+# Mattermost setup steps. host_profile_chosen is already populated by that
+# call (or empty on --dry-run).
 
 warnings_json="$(bridge_init_warnings_json)"
 

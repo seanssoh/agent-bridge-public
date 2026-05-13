@@ -6,6 +6,10 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+### Changed
+
+- **`bridge-init.sh` host_profile question moved before channel bootstrap; `dev` answer now also short-circuits channel setup and emits the heavy-feature advisory in one block** (refs Issue #713 follow-up). Previously `bridge_host_profile_run` fired after `Discord/Telegram/Teams/Mattermost` setup, so a developer-laptop install was forced to walk through (or `--skip-channel-setup` past) the channel branches before being told it could skip them. The question now runs immediately after admin-agent + `<admin>-dev` codex-pair materialization and immediately before the channel setup blocks; on `host_profile=dev` the call site flips `skip_channel_setup=1` and appends an init warning when the operator-passed `--channels` is non-empty (so the explicit channel csv is acknowledged rather than silently dropped). `bridge_host_profile_emit_dev_advisories` (new helper in `lib/bridge-host-profile.sh`) prints a unified "this is what dev profile skips" block: external-channel bootstrap, multi-tenant v2 isolation migration (stays opt-in via `agent-bridge migrate isolation-v2`), librarian / wiki-* maintenance crons (already disabled by the existing offer), and the operator's `--admin <name>` + `<name>-dev` static-pair-only floor (codex r2 round threaded `admin_agent` through the helper so the advisory renders the real pair names rather than the literal `patch`/`patch-dev` defaults; no extra static roles get auto-created — operators add them in `agent-roster.local.sh` when they upgrade to server). Server / CI / `--json` paths are unchanged: non-interactive still defaults to `server`, and `--reconfigure` still re-prompts. Idempotent against re-runs (the existing `[host-profile] already=…` sentinel still wins).
+
 ## [0.10.0] — 2026-05-13
 
 ### Highlight — credential file delivery + daemon hang fixes + worktree doctor
