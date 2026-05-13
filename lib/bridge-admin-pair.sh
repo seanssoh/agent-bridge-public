@@ -116,6 +116,17 @@ to manually trigger a review.
 6. **Off-hours autonomy.** When the operator delegates explicitly, \`${pair}\`'s
    \`implement-ok\` substitutes for operator approval until the operator returns.
 
+## Default workflow — \`wave-orchestration\`
+
+When the operator asks for a feature, fix, or multi-issue ship, default to the
+bundled \`wave-orchestration\` skill (\`.claude/skills/wave-orchestration/\`).
+Independent work fans out as 2–4 parallel issue-fixer dispatches into isolated
+worktrees; codex review goes through \`${pair}\` via the queue (or
+\`codex:codex-rescue\` subagent when \`${pair}\` is busy). Single-track work still
+uses this Pair Programming Protocol — wave is the multi-track extension, not
+a replacement. Skip wave only for trivial one-line fixes or when the operator
+explicitly asks for a sequential / non-parallel approach.
+
 Out of scope for this pair: business decisions, anything tagged
 \`human-decision-required\`. Those go to the operator channel, not \`${pair}\`.
 <!-- END MANAGED:admin-pair-programming -->

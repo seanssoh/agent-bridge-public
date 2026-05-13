@@ -3,15 +3,18 @@
 # bridge-host-profile.sh — first-run host profile (server vs dev) + production
 # cron gating.
 #
-# Background: Issue #713. On a fresh install, the admin agent inherits the
-# same managed cron set on every host — including production-style wiki/
-# librarian maintenance jobs that only make sense on a hosted/server install.
-# On a developer laptop they generate `[cron-followup]` storms from transient
-# network blips and assume infra (wiki content, ingestion sources) the laptop
-# never set up. This helper adds a one-time onboarding question and, on a
-# `dev` answer, offers to disable the production-style jobs (default-yes).
-# `memory-daily-*` is intentionally NOT in the gated list — it's useful on
-# every host.
+# Background: Issue #713 + 2026-05-13 follow-up. On a fresh install, the admin
+# agent inherits the same managed cron set on every host — including
+# production-style wiki/librarian maintenance jobs that only make sense on a
+# hosted/server install. On a developer laptop they generate `[cron-followup]`
+# storms from transient network blips and assume infra (wiki content,
+# ingestion sources) the laptop never set up. This helper adds a one-time
+# onboarding question and, on a `dev` answer, offers to disable the
+# production-style jobs (default-yes). `memory-daily-<agent>` is also in the
+# gated set on dev hosts as of 2026-05-13: Claude Code's own session-memory
+# system already covers the long-term-context use case on a developer laptop,
+# so running the harvester is duplicative there. Re-enable any time with
+# `agb cron update memory-daily-<agent> --enable`.
 #
 # Schema-extension follow-up (cron job definitions declaring
 # `profiles: [server, dev]` directly) is out of scope here — see #713's
@@ -33,6 +36,17 @@ BRIDGE_HOST_PROFILE_PRODUCTION_CRONS=(
   "wiki-dedup-weekly"
   "wiki-v2-rebuild"
   "wiki-repair-links"
+)
+
+# Cron name prefixes that are gated off on profile=dev. `memory-daily-<agent>`
+# is per-agent (one cron per static agent), so the exact-name list above can't
+# enumerate it. Operator decision (2026-05-13): dev hosts already get
+# Claude Code's own session-memory system (`~/.claude/projects/<repo>/memory/`)
+# which covers the long-term context use case memory-daily harvests serve, so
+# the daily harvester is duplicative on a developer laptop. Re-enable any time
+# with `agb cron update memory-daily-<agent> --enable`.
+BRIDGE_HOST_PROFILE_PRODUCTION_CRON_PREFIXES=(
+  "memory-daily-"
 )
 
 bridge_host_profile_path() {
@@ -174,17 +188,31 @@ bridge_host_profile_list_production_crons() {
   fi
   [[ -n "$list_json" ]] || return 0
   bridge_require_python
-  python3 - "$list_json" "${BRIDGE_HOST_PROFILE_PRODUCTION_CRONS[@]}" <<'PY'
+  # Pass exact-name list first, then a `--prefixes` separator, then prefix list.
+  # The separator is a sentinel that cannot appear as a cron name (cron names
+  # are slug-cased per `classify_family` in bridge-cron.py).
+  python3 - "$list_json" "${BRIDGE_HOST_PROFILE_PRODUCTION_CRONS[@]}" "--prefixes" "${BRIDGE_HOST_PROFILE_PRODUCTION_CRON_PREFIXES[@]}" <<'PY'
 import json, sys
 list_json = sys.argv[1]
-gated_names = set(sys.argv[2:])
+args = sys.argv[2:]
+gated_names = set()
+gated_prefixes = []
+mode = "names"
+for arg in args:
+    if arg == "--prefixes":
+        mode = "prefixes"
+        continue
+    if mode == "names":
+        gated_names.add(arg)
+    else:
+        gated_prefixes.append(arg)
 try:
     data = json.loads(list_json)
 except Exception:
     sys.exit(0)
 for job in data.get("jobs", []):
     name = job.get("name", "")
-    if name in gated_names:
+    if name in gated_names or any(name.startswith(p) for p in gated_prefixes):
         print(f"{job.get('id', '')}\t{name}")
 PY
 }
@@ -225,8 +253,10 @@ bridge_host_profile_offer_dev_cron_disable() {
     return 0
   fi
   printf '\n' >&2
-  printf '이 호스트(profile=dev)에는 librarian-watchdog / wiki-* 유지보수 크론이\n' >&2
-  printf '일반적으로 필요하지 않습니다. 다음 크론을 disable 하시겠습니까?\n' >&2
+  printf '이 호스트(profile=dev)에는 librarian / wiki-* 유지보수 크론과\n' >&2
+  printf 'memory-daily-<agent> 크론이 일반적으로 필요하지 않습니다\n' >&2
+  printf '(memory-daily 는 Claude Code 자체 세션 메모리와 기능이 중복됩니다).\n' >&2
+  printf '다음 크론을 disable 하시겠습니까?\n' >&2
   printf '(나중에 `agb cron update <id> --enable` 으로 다시 켤 수 있습니다.)\n' >&2
   printf '\n' >&2
   while IFS=$'\t' read -r _id _name; do
@@ -399,10 +429,16 @@ bridge_host_profile_emit_dev_advisories() {
   printf '    Linux 운영 호스트에서 다중 사용자 분리가 필요해지면\n'
   printf '    `agent-bridge migrate isolation-v2 --apply` 로 전환할 수 있습니다.\n'
   printf '  - librarian / wiki-* 정기 크론: 위 단계에서 disable 처리됨\n'
+  printf '  - memory-daily-<agent> 크론: 위 단계에서 disable 처리됨\n'
+  printf '    (Claude Code 자체 세션 메모리와 기능이 중복되므로 dev 에서는 불필요)\n'
   printf '  - picker-sweep 자동 unstick: skip (BRIDGE_PICKER_SWEEP_ENABLED=1 로 override 가능)\n'
   printf '  - prompt-guard (채널/MCP/intake 검사): skip (BRIDGE_PROMPT_GUARD_ENABLED=1 로 override 가능)\n'
   printf '\n'
   printf '정적 에이전트는 admin(`%s`) + admin-dev(`%s` codex pair) 2개로\n' "$admin_agent" "$admin_pair"
   printf '시작합니다. 추가 정적 역할은 운영 모드에서만 필요한 경우가 일반적입니다.\n'
+  printf '\n'
+  printf 'admin 에이전트의 CLAUDE.md 에는 `wave-orchestration` 스킬을 default workflow\n'
+  printf '로 사용하라는 SOP 블록이 자동 주입됩니다 — 사용자가 "X 만들어줘" 라고 하면\n'
+  printf 'patch + patch-dev 페어가 wave (병렬 issue-fixer + codex review) 로 진행합니다.\n'
   printf '\n'
 }
