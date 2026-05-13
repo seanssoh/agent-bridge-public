@@ -10,7 +10,7 @@ version bumps via the `VERSION` file.
 
 ### Highlight — credential file delivery + daemon hang fixes + worktree doctor
 
-Two wave cycles (PR #799/#801/#802 + #803/#804/#805/#806/#807) landed 8 PRs across credential isolation, daemon timeout hardening, and operational surface. Headline: PR #799 closed the env-injection credential leak class (Path A architecture, 5-round codex review chain ending at AST-audited exhaustive enumeration of remaining final-path operations). PR #801 + #806 structurally eliminated the `$(python3 - <<'PY')` heredoc-write deadlock class across the daemon main loop (#800 root cause + parallel-PR regression). PR #807 ships `agent-bridge worktree doctor` for safe stale-worktree cleanup with repo-level stash-safety guard.
+This release cycle (PR #799/#801/#802 + #803/#804/#805/#806/#807) landed 8 PRs across credential isolation, daemon timeout hardening, and operational surface. Headline: PR #799 closed the env-injection credential leak class (Path A architecture, 5-round codex review chain ending at AST-audited exhaustive enumeration of remaining final-path operations). PR #801 + #806 structurally eliminated the `$(python3 - <<'PY')` heredoc-write deadlock class across the daemon main loop (#800 root cause + parallel-PR regression). PR #807 ships `agent-bridge worktree doctor` for safe stale-worktree cleanup with repo-level stash-safety guard.
 
 ### Added — new user-facing surface
 
@@ -22,8 +22,8 @@ Two wave cycles (PR #799/#801/#802 + #803/#804/#805/#806/#807) landed 8 PRs acro
 
 ### Fixed — daemon hang / heredoc deadlock class
 
-- **34-hour silent daemon hang root cause** (PR #801, refs #800 Track A, refs #265 Proposal A): 9 unwrapped `$(python3 - <<'PY')` callsites in `bridge-daemon.sh` moved out of heredoc-stdin into `bridge-daemon-helpers.py` subcommands. Each wrapped in `bridge_with_timeout <secs> <label>` with per-site budget (5s JSON-only / 15s nudge_live_state hot path / 60s daily-backup). Highest-impact site (`nudge_live_state`, line 2728) has explicit per-agent `skip_this_tick` audit-only fallback — sibling agents continue. Smoke fixture (`scripts/smoke/daemon-heredoc-timeout.sh`) exercises real subcommand bodies via FIFO + sqlite EXCLUSIVE lock stall vectors (the actual #800 hang class).
-- **PR #799 introduced 4 NEW heredoc regression sites** (PR #806): PR #799's cron auth + token rotation/recovery paths were developed in parallel with PR #801 and missed the #800 wrapping convention. PR #806 wrapped lines 1069 (usage_rotation_candidates_parse), 1128 (rotation_status_parse), 1227 (recovery_status_parse), 1257 (sync_status_parse) using same Pattern A helper subcommand. Plus 2 library sites at `lib/bridge-core.sh:85` (`core_match`) and `lib/bridge-skills.sh:128` (`skills_resolve_target`) wrapped with Pattern B (`python3 -c "$SCRIPT"` here-string variable). Registry now 13 entries.
+- **34-hour silent daemon hang root cause** (PR #801, refs #800 Track A, refs #265 Proposal A): 9 unwrapped `$(python3 - <<'PY')` callsites in `bridge-daemon.sh` moved out of heredoc-stdin into `bridge-daemon-helpers.py` subcommands. Each wrapped in `bridge_with_timeout <secs> <label>` with per-site budget (5s JSON-only / 15s nudge_live_state hot path / 60s daily-backup). Highest-impact site (`nudge_live_state`) has explicit per-agent `skip_this_tick` audit-only fallback — sibling agents continue. Smoke fixture (`scripts/smoke/daemon-heredoc-timeout.sh`) exercises real subcommand bodies via FIFO + sqlite EXCLUSIVE lock stall vectors (the actual #800 hang class).
+- **PR #799 introduced 4 NEW heredoc regression sites** (PR #806): PR #799's cron auth + token rotation/recovery paths were developed in parallel with PR #801 and missed the #800 wrapping convention. PR #806 wrapped the four new sites (`usage_rotation_candidates_parse`, `rotation_status_parse`, `recovery_status_parse`, `sync_status_parse`) using same Pattern A helper subcommand. Plus 2 library sites in `lib/bridge-core.sh` (`core_match`) and `lib/bridge-skills.sh` (`skills_resolve_target`) wrapped with Pattern B (`python3 -c "$SCRIPT"` here-string variable). Registry now 13 entries.
 
 ### Fixed — Claude OAuth credential isolation (Path A)
 
@@ -48,7 +48,7 @@ Two wave cycles (PR #799/#801/#802 + #803/#804/#805/#806/#807) landed 8 PRs acro
 
 ### Internal — wave orchestration metadata
 
-- 8 PRs landed across 3 wave cycles in <5 hours of operator-clock-time, all squash-merged with structured `implement-ok` notes and codex-rescue pair-review.
+- 8 PRs landed across this release cycle in <5 hours of operator-clock-time, all squash-merged with structured `implement-ok` notes and codex-rescue pair-review.
 - New fixer footgun discovered: **Edit/Write tool CWD pollution**. Track F fixer's first round of edits landed in operator's primary checkout instead of own fixer worktree (Edit tool with parent-process CWD on operator path). Worktree-relative absolute paths now mandatory in fixer briefs.
 - New runtime footgun discovered: **Bash 5.3.9 here-string heredoc-write deadlock**. `<<<"$porcelain"` into multi-record read loop deadlocks in `heredoc_write` — same #800 class. Workaround: `mktemp + < file`.
 
