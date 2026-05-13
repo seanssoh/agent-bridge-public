@@ -647,16 +647,18 @@ bridge_daily_backup_compose_state() {
     esac
   done
 
-  cat <<EOF
-DAILY_BACKUP_LAST_SUCCESS_TS=${success_ts}
-DAILY_BACKUP_LAST_SUCCESS_DATE=${success_date}
-DAILY_BACKUP_LAST_ARCHIVE=$(printf '%q' "$archive")
-DAILY_BACKUP_LAST_PRUNED_COUNT=${pruned}
-DAILY_BACKUP_LAST_FAILURE_TS=${failure_ts}
-DAILY_BACKUP_LAST_FAILURE_REASON=${failure_reason}
-DAILY_BACKUP_LAST_FAILURE_DETAIL=$(printf '%q' "$failure_detail")
-DAILY_BACKUP_LAST_WARN_TS=${warn_ts}
-EOF
+  # Footgun #11 (refs #815 Wave B): emit via grouped printf to avoid
+  # heredoc on a hot path. Caller captures stdout via $(...).
+  {
+    printf 'DAILY_BACKUP_LAST_SUCCESS_TS=%s\n' "$success_ts"
+    printf 'DAILY_BACKUP_LAST_SUCCESS_DATE=%s\n' "$success_date"
+    printf 'DAILY_BACKUP_LAST_ARCHIVE=%s\n' "$(printf '%q' "$archive")"
+    printf 'DAILY_BACKUP_LAST_PRUNED_COUNT=%s\n' "$pruned"
+    printf 'DAILY_BACKUP_LAST_FAILURE_TS=%s\n' "$failure_ts"
+    printf 'DAILY_BACKUP_LAST_FAILURE_REASON=%s\n' "$failure_reason"
+    printf 'DAILY_BACKUP_LAST_FAILURE_DETAIL=%s\n' "$(printf '%q' "$failure_detail")"
+    printf 'DAILY_BACKUP_LAST_WARN_TS=%s\n' "$warn_ts"
+  }
 }
 
 bridge_note_daily_backup_success() {
@@ -1044,6 +1046,13 @@ process_usage_monitor() {
   local rotation_from=""
   local rotation_to=""
   local rotation_sync_status=""
+  # Footgun #11 (refs #815 Wave B): route the alert_rows / rotation_rows
+  # loops through tempfiles to avoid `done <<<` heredoc_write wedges.
+  local _alert_tmp="" _rotation_tmp=""
+  _alert_tmp="$(mktemp)"
+  _rotation_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_alert_tmp' '$_rotation_tmp'" RETURN
 
   [[ "${BRIDGE_USAGE_MONITOR_ENABLED:-1}" == "1" ]] || return 1
   [[ -n "$admin_agent" ]] || return 1
@@ -1074,6 +1083,9 @@ process_usage_monitor() {
   # loop continues without rotation candidates this tick.
   rotation_rows="$(bridge_with_timeout 5 usage_rotation_candidates_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" usage-rotation-candidates-parse "$monitor_json")" || rotation_rows=""
 
+  printf '%s' "$alert_rows" > "$_alert_tmp"
+  printf '%s' "$rotation_rows" > "$_rotation_tmp"
+
   while IFS=$'\t' read -r provider account window bucket used_percent reset_at source body; do
     [[ -z "$provider" || -z "$window" || -z "$bucket" ]] && continue
     if [[ "$bucket" == "crit" ]]; then
@@ -1095,7 +1107,7 @@ process_usage_monitor() {
       --detail reset_at="$reset_at" \
       --detail source="$source"
     alert_count=$((alert_count + 1))
-  done <<<"$alert_rows"
+  done < "$_alert_tmp"
 
   while IFS=$'\t' read -r provider account window used_percent reset_at source body; do
     [[ -z "$provider" || "$provider" != "claude" || -z "$window" ]] && continue
@@ -1147,7 +1159,7 @@ process_usage_monitor() {
       bridge_notify_send "$admin_agent" "$title" "$body" "" "$priority" "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" >/dev/null 2>&1 || true
     fi
     rotation_count=$((rotation_count + 1))
-  done <<<"$rotation_rows"
+  done < "$_rotation_tmp"
 
   bridge_note_usage_poll
   (( alert_count > 0 || rotation_count > 0 ))
@@ -1272,7 +1284,10 @@ process_release_monitor() {
   IFS=$'\t' read -r tag version release_name published_at release_url <<<"$alert_row"
   [[ -n "$tag" ]] || return 1
 
-  if ! upgrade_check_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" upgrade --check --json --no-restart-daemon --target "$BRIDGE_HOME" 2>/dev/null)"; then
+  # Refs #815 Wave B: wrap the upgrade --check call with bridge_with_timeout
+  # (30s ceiling — local readiness probe, normally <1s; protects the release
+  # monitor hot path from a wedged upgrader child).
+  if ! upgrade_check_json="$(bridge_with_timeout 30 release_upgrade_check "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" upgrade --check --json --no-restart-daemon --target "$BRIDGE_HOME" 2>/dev/null)"; then
     upgrade_check_json="{}"
   fi
 
@@ -1734,6 +1749,14 @@ process_stall_reports() {
   # Issue #329 Track D: composite dedup keys, recomputed each iteration.
   local current_dedup_key=""
   local prior_dedup_key=""
+  # Footgun #11 (refs #815 Wave B): tempfile-route the summary loop, the
+  # capture analyzer input, and the analyzer shell-output `source` call.
+  local _summary_tmp="" _capture_tmp="" _shell_tmp=""
+  _summary_tmp="$(mktemp)"
+  _capture_tmp="$(mktemp)"
+  _shell_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_summary_tmp' '$_capture_tmp' '$_shell_tmp'" RETURN
 
   [[ "${BRIDGE_STALL_SCAN_ENABLED:-1}" == "1" ]] || return 1
   if [[ -n "$admin_agent" ]] && bridge_agent_exists "$admin_agent"; then
@@ -1744,6 +1767,8 @@ process_stall_reports() {
   [[ "$unknown_idle" =~ ^[0-9]+$ ]] || unknown_idle=900
   [[ "$max_nudges" =~ ^[0-9]+$ ]] || max_nudges=2
   now_ts="$(date +%s)"
+
+  printf '%s' "$summary_output" > "$_summary_tmp"
 
   while IFS=$'\t' read -r agent queued claimed blocked active idle last_seen last_nudge session engine workdir; do
     [[ -n "$agent" ]] || continue
@@ -1832,15 +1857,17 @@ process_stall_reports() {
             # Issue #265 proposal A: stall analyzer runs once per active agent
             # per cycle; a single hang would multiply across the roster on
             # every tick. Wrap so a stuck child cannot freeze the whole loop.
-            analysis_shell="$(bridge_with_timeout "" stall_analyze python3 "$SCRIPT_DIR/bridge-stall.py" analyze --format shell <<<"$capture" 2>/dev/null || true)"
+            printf '%s' "$capture" > "$_capture_tmp"
+            analysis_shell="$(bridge_with_timeout "" stall_analyze python3 "$SCRIPT_DIR/bridge-stall.py" analyze --format shell < "$_capture_tmp" 2>/dev/null || true)"
             if [[ -n "$analysis_shell" ]]; then
               STALL_CLASSIFICATION=""
               STALL_MATCHED_PATTERN=""
               STALL_MATCHED_LINE_HASH=""
               STALL_EXCERPT_HASH=""
               STALL_EXCERPT_B64=""
-              # shellcheck disable=SC1091
-              source /dev/stdin <<<"$analysis_shell"
+              printf '%s' "$analysis_shell" > "$_shell_tmp"
+              # shellcheck disable=SC1090
+              source "$_shell_tmp"
               classification="${STALL_CLASSIFICATION:-}"
               matched_pattern="${STALL_MATCHED_PATTERN:-}"
               matched_line_hash="${STALL_MATCHED_LINE_HASH:-}"
@@ -2021,7 +2048,7 @@ process_stall_reports() {
     fi
 
     bridge_note_stall_state "$agent" "$classification" "$excerpt_hash" "$first_detected_ts" "$last_detected_ts" "$now_ts" "$idle" "$claimed" "$nudge_count" "$last_nudge_ts" "$escalated_ts" "$task_id" "$matched_pattern" "$matched_line_hash"
-  done <<<"$summary_output"
+  done < "$_summary_tmp"
 
   return "$changed"
 }
@@ -2078,6 +2105,13 @@ process_permission_task_timeout_fanout() {
   expired_rows="$(bridge_with_timeout 5 permission_expire_scan python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" permission-expire-scan "$tasks_json" "$now_ts" "$timeout_seconds" 2>/dev/null || true)"
   [[ -n "$expired_rows" ]] || return 1
 
+  # Footgun #11 (refs #815 Wave B): route the expired_rows loop via tempfile.
+  local _expired_tmp=""
+  _expired_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_expired_tmp'" RETURN
+  printf '%s' "$expired_rows" > "$_expired_tmp"
+
   local task_id age_seconds created_by status title marker age_minutes body_text
   local primary="" notify_target_agent="" requester_has_notify
   while IFS=$'\t' read -r task_id age_seconds created_by status title; do
@@ -2128,7 +2162,7 @@ process_permission_task_timeout_fanout() {
 
     printf '%s\n' "$now_ts" >"$marker"
     changed=0
-  done <<<"$expired_rows"
+  done < "$_expired_tmp"
 
   return "$changed"
 }
@@ -2192,10 +2226,20 @@ process_context_pressure_reports() {
   local severity=""
   local excerpt_hash=""
   local inactive=0
+  # Footgun #11 (refs #815 Wave B): tempfile-route the summary loop, the
+  # context-pressure analyzer capture input, and the analyzer shell-output.
+  local _summary_tmp="" _capture_tmp="" _shell_tmp=""
+  _summary_tmp="$(mktemp)"
+  _capture_tmp="$(mktemp)"
+  _shell_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_summary_tmp' '$_capture_tmp' '$_shell_tmp'" RETURN
 
   [[ "${BRIDGE_CONTEXT_PRESSURE_SCAN_ENABLED:-1}" == "1" ]] || return 1
   [[ "$scan_interval" =~ ^[0-9]+$ ]] || scan_interval=60
   now_ts="$(date +%s)"
+
+  printf '%s' "$summary_output" > "$_summary_tmp"
 
   while IFS=$'\t' read -r agent queued claimed blocked active idle last_seen last_nudge session engine workdir; do
     [[ -n "$agent" ]] || continue
@@ -2261,13 +2305,15 @@ process_context_pressure_reports() {
     if [[ -n "$capture" ]]; then
       # Issue #265 proposal A: same risk profile as the stall analyzer above
       # (per-agent per-cycle); cap subprocess time to keep the loop moving.
-      analysis_shell="$(bridge_with_timeout "" context_pressure_analyze python3 "$SCRIPT_DIR/bridge-context-pressure.py" analyze --format shell --engine "$engine" <<<"$capture" 2>/dev/null || true)"
+      printf '%s' "$capture" > "$_capture_tmp"
+      analysis_shell="$(bridge_with_timeout "" context_pressure_analyze python3 "$SCRIPT_DIR/bridge-context-pressure.py" analyze --format shell --engine "$engine" < "$_capture_tmp" 2>/dev/null || true)"
       if [[ -n "$analysis_shell" ]]; then
         CONTEXT_PRESSURE_SEVERITY=""
         CONTEXT_PRESSURE_MATCHED_PATTERN=""
         CONTEXT_PRESSURE_EXCERPT_HASH=""
-        # shellcheck disable=SC1091
-        source /dev/stdin <<<"$analysis_shell"
+        printf '%s' "$analysis_shell" > "$_shell_tmp"
+        # shellcheck disable=SC1090
+        source "$_shell_tmp"
         severity="${CONTEXT_PRESSURE_SEVERITY:-}"
         matched_pattern="${CONTEXT_PRESSURE_MATCHED_PATTERN:-}"
         excerpt_hash="${CONTEXT_PRESSURE_EXCERPT_HASH:-}"
@@ -2322,7 +2368,7 @@ process_context_pressure_reports() {
 
     last_detected_ts="$now_ts"
     bridge_note_context_pressure_state "$agent" "$severity" "$excerpt_hash" "$first_detected_ts" "$last_detected_ts" "$now_ts" "$last_report_ts" "$matched_pattern"
-  done <<<"$summary_output"
+  done < "$_summary_tmp"
 
   return "$changed"
 }
@@ -2876,8 +2922,15 @@ nudge_agent_session() {
   title="$(bridge_queue_attention_title "$live_queued")"
   open_task_shell="$(bridge_queue_cli find-open --agent "$agent" --format shell 2>/dev/null || true)"
   if [[ -n "$open_task_shell" ]]; then
-    # shellcheck disable=SC1091
-    source /dev/stdin <<<"$open_task_shell"
+    # Footgun #11 (refs #815 Wave B): tempfile-route the `source` of the
+    # find-open shell output to avoid sourcing /dev/stdin heredoc_write.
+    local _open_task_tmp=""
+    _open_task_tmp="$(mktemp)"
+    # shellcheck disable=SC2064
+    trap "rm -f -- '$_open_task_tmp'" RETURN
+    printf '%s' "$open_task_shell" > "$_open_task_tmp"
+    # shellcheck disable=SC1090
+    source "$_open_task_tmp"
   fi
   task_status="${TASK_STATUS:-}"
   if [[ "$task_status" == "queued" && -n "$TASK_ID" && -n "$TASK_TITLE" ]]; then
@@ -3568,6 +3621,17 @@ _bridge_precompact_handle_started() {
   local marker_basename
   marker_basename="$(basename "$marker")"
 
+  # Footgun #11 (refs #815 Wave B): tempfile-route the parsed-tsv loop
+  # and the three sites that sourced /dev/stdin from shell output
+  # (route/render/send).
+  local _parsed_tmp="" _route_tmp="" _render_tmp="" _send_tmp=""
+  _parsed_tmp="$(mktemp)"
+  _route_tmp="$(mktemp)"
+  _render_tmp="$(mktemp)"
+  _send_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_parsed_tmp' '$_route_tmp' '$_render_tmp' '$_send_tmp'" RETURN
+
   # Parse the marker JSON via python so we never have to grep raw JSON.
   local parsed
   parsed="$(python3 -c '
@@ -3590,6 +3654,7 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
 
   local event_id="" trigger="" started_ts="" raw_trigger=""
   local key="" val=""
+  printf '%s' "$parsed" > "$_parsed_tmp"
   while IFS=$'\t' read -r key val; do
     case "$key" in
       event_id) event_id="$val" ;;
@@ -3597,7 +3662,7 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
       started_ts) started_ts="$val" ;;
       raw_trigger) raw_trigger="$val" ;;
     esac
-  done <<<"$parsed"
+  done < "$_parsed_tmp"
 
   if [[ -z "$event_id" ]]; then
     mv -f "$marker" "$invalid_dir/$marker_basename" 2>/dev/null || true
@@ -3673,8 +3738,9 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
   local CHANNEL_ROUTE_PLUGIN="" CHANNEL_ROUTE_CHANNEL_ID=""
   local CHANNEL_ROUTE_REPLY_TO_MESSAGE_ID="" CHANNEL_ROUTE_LAST_USER_INBOUND_TS=""
   local CHANNEL_ROUTE_THREAD_ID=""
+  printf '%s' "$route_output" > "$_route_tmp"
   # shellcheck disable=SC1090
-  source /dev/stdin <<<"$route_output"
+  source "$_route_tmp"
 
   if [[ -z "$CHANNEL_ROUTE_PLUGIN" || -z "$CHANNEL_ROUTE_CHANNEL_ID" ]]; then
     mv -f "$marker" "$processed_dir/$event_id.json" 2>/dev/null || true
@@ -3708,8 +3774,9 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
 
   local PRECOMPACT_BODY_B64="" PRECOMPACT_EXPECTED_SECONDS=""
   local PRECOMPACT_LANG="" PRECOMPACT_KIND="" PRECOMPACT_DURATION_SECONDS=""
+  printf '%s' "$render_output" > "$_render_tmp"
   # shellcheck disable=SC1090
-  source /dev/stdin <<<"$render_output"
+  source "$_render_tmp"
   local body=""
   if [[ -n "$PRECOMPACT_BODY_B64" ]]; then
     body="$(printf '%s' "$PRECOMPACT_BODY_B64" | base64 -d 2>/dev/null || true)"
@@ -3757,8 +3824,9 @@ print("raw_trigger\t" + str(data.get("raw_trigger") or ""))
   local CHANNEL_SEND_REPLY_TO_MESSAGE_ID="" CHANNEL_SEND_MESSAGE_ID=""
   local CHANNEL_SEND_THREAD_ID="" CHANNEL_SEND_DRY_RUN=""
   if [[ -n "$send_output" ]]; then
+    printf '%s' "$send_output" > "$_send_tmp"
     # shellcheck disable=SC1090
-    source /dev/stdin <<<"$send_output"
+    source "$_send_tmp"
   fi
 
   if (( send_rc != 0 )) || [[ "$CHANNEL_SEND_STATUS" != "ok" ]]; then
@@ -3870,6 +3938,15 @@ _bridge_precompact_handle_completed() {
   local marker_basename
   marker_basename="$(basename "$marker")"
 
+  # Footgun #11 (refs #815 Wave B): tempfile-route the pending-parsed
+  # loop plus render/send sites that sourced /dev/stdin from shell output.
+  local _pending_tmp="" _render_tmp="" _send_tmp=""
+  _pending_tmp="$(mktemp)"
+  _render_tmp="$(mktemp)"
+  _send_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_pending_tmp' '$_render_tmp' '$_send_tmp'" RETURN
+
   local completed_ts=""
   completed_ts="$(python3 -c '
 import json, sys
@@ -3921,6 +3998,7 @@ for k in keys:
   local pending_started_ts="0" pending_lang="" pending_dry_run="0"
   local pending_followup_sent_ts=""
   local pkey="" pval=""
+  printf '%s' "$pending_parsed" > "$_pending_tmp"
   while IFS=$'\t' read -r pkey pval; do
     case "$pkey" in
       event_id) pending_event_id="$pval" ;;
@@ -3934,7 +4012,7 @@ for k in keys:
       dry_run) pending_dry_run="$pval" ;;
       followup_sent_ts) pending_followup_sent_ts="$pval" ;;
     esac
-  done <<<"$pending_parsed"
+  done < "$_pending_tmp"
 
   if [[ -n "$pending_followup_sent_ts" && "$pending_followup_sent_ts" != "0" ]]; then
     # Already sent followup for this pending notice — completion marker is
@@ -3989,8 +4067,9 @@ for k in keys:
   local PRECOMPACT_BODY_B64="" PRECOMPACT_EXPECTED_SECONDS=""
   local PRECOMPACT_LANG="" PRECOMPACT_KIND="" PRECOMPACT_DURATION_SECONDS=""
   if [[ -n "$render_output" ]]; then
+    printf '%s' "$render_output" > "$_render_tmp"
     # shellcheck disable=SC1090
-    source /dev/stdin <<<"$render_output"
+    source "$_render_tmp"
   fi
   local body=""
   if [[ -n "$PRECOMPACT_BODY_B64" ]]; then
@@ -4047,8 +4126,9 @@ for k in keys:
 
   local CHANNEL_SEND_STATUS="" CHANNEL_SEND_MESSAGE_ID="" CHANNEL_SEND_DRY_RUN=""
   if [[ -n "$send_output" ]]; then
+    printf '%s' "$send_output" > "$_send_tmp"
     # shellcheck disable=SC1090
-    source /dev/stdin <<<"$send_output"
+    source "$_send_tmp"
   fi
 
   local now_ts
@@ -4274,6 +4354,11 @@ start_cron_dispatch_workers() {
   local _title
   local _body_path
   local started=0
+  # Footgun #11 (refs #815 Wave B): tempfile-route ready_rows.
+  local _ready_tmp=""
+  _ready_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_ready_tmp'" RETURN
 
   [[ "$max_parallel" =~ ^[0-9]+$ ]] || max_parallel=0
   (( max_parallel > 0 )) || return 0
@@ -4286,6 +4371,8 @@ start_cron_dispatch_workers() {
   ready_rows="$(cron_ready_rows_with_retry "$max_parallel" "$status_snapshot_file" || true)"
   rm -f "$status_snapshot_file"
   [[ -n "$ready_rows" ]] || return 0
+
+  printf '%s' "$ready_rows" > "$_ready_tmp"
 
   while IFS=$'\t' read -r task_id agent _priority _title _body_path; do
     [[ -n "$task_id" && -n "$agent" ]] || continue
@@ -4304,7 +4391,7 @@ start_cron_dispatch_workers() {
 
     bridge_warn "failed to start cron worker for task #${task_id}"
     bridge_queue_cli handoff "$task_id" --to "$agent" --from daemon --note "failed to start cron worker" >/dev/null 2>&1 || true
-  done <<<"$ready_rows"
+  done < "$_ready_tmp"
 
   return "$started"
 }
@@ -4663,6 +4750,12 @@ process_on_demand_agents() {
   local live_blocked=0
   local configured_session=""
   local attached_count=0
+  # Footgun #11 (refs #815 Wave B): tempfile-route summary_output.
+  local _summary_tmp=""
+  _summary_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_summary_tmp'" RETURN
+  printf '%s' "$summary_output" > "$_summary_tmp"
 
   while IFS=$'\t' read -r agent queued claimed blocked active idle _last_seen _last_nudge session _engine _workdir; do
     [[ -z "$agent" ]] && continue
@@ -4768,7 +4861,7 @@ process_on_demand_agents() {
     else
       bridge_warn "on-demand auto-stop failed: ${agent}"
     fi
-  done <<<"$summary_output"
+  done < "$_summary_tmp"
 
   return "$changed"
 }
@@ -4912,6 +5005,12 @@ process_memory_daily_orphan_sweep() {
   [[ -n "$admin_agent" ]] || return 1
   bridge_agent_exists "$admin_agent" || return 1
 
+  # Footgun #11 (refs #815 Wave B): tempfile-route orphans_tsv loop.
+  local _orphans_tmp=""
+  _orphans_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_orphans_tmp'" RETURN
+
   # The roster is loaded once per daemon-loop iteration before sync_state
   # runs (see the top of the run loop); BRIDGE_AGENT_IDS is therefore the
   # authoritative list for this sweep. Re-load defensively in case a future
@@ -4966,11 +5065,12 @@ process_memory_daily_orphan_sweep() {
   body+="Run the suggested \`agent-bridge cron delete\` commands to clear:"$'\n\n'
 
   local job_id source_agent
+  printf '%s' "$orphans_tsv" > "$_orphans_tmp"
   while IFS=$'\t' read -r job_id source_agent; do
     [[ -n "$job_id" && -n "$source_agent" ]] || continue
     body+="- \`memory-daily-${source_agent}\` (id=${job_id}, source_agent=${source_agent}) — \`agent-bridge cron delete ${job_id}\`"$'\n'
     orphan_count=$(( orphan_count + 1 ))
-  done <<<"$orphans_tsv"
+  done < "$_orphans_tmp"
 
   (( orphan_count > 0 )) || return 0
 
@@ -5416,6 +5516,11 @@ cmd_sync_cycle() {
   local changed=1
   local cron_sync_timeout="${BRIDGE_CRON_SYNC_TIMEOUT:-30}"
   local timeout_bin=""
+  # Footgun #11 (refs #815 Wave B): tempfile-route nudge_output loop.
+  local _nudge_tmp=""
+  _nudge_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$_nudge_tmp'" RETURN
 
   # The daemon is long-lived, so dynamic agents created after startup will not
   # exist in memory unless we reload the roster each cycle.
@@ -5434,7 +5539,10 @@ cmd_sync_cycle() {
   process_precompact_events || true
 
   BRIDGE_DAEMON_LAST_STEP="bridge_sync"
-  "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true
+  # Refs #815 Wave B: wrap with bridge_with_timeout so a stuck child cannot
+  # wedge the daemon main loop. 30s ceiling — bridge-sync.sh reconciles roster
+  # + state under normal conditions in <1s; timeouts here are pathological.
+  bridge_with_timeout 30 bridge_sync "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true
   bridge_load_roster
   BRIDGE_DAEMON_LAST_STEP="queue_gateway"
   if process_queue_gateway_requests; then
@@ -5481,6 +5589,7 @@ cmd_sync_cycle() {
   start_cron_dispatch_workers || true
 
   BRIDGE_DAEMON_LAST_STEP="nudge_agents"
+  printf '%s' "$nudge_output" > "$_nudge_tmp"
   while IFS=$'\t' read -r agent session queued claimed idle nudge_key; do
     [[ -z "$agent" || -z "$session" ]] && continue
     if ! bridge_tmux_session_exists "$session"; then
@@ -5495,7 +5604,7 @@ cmd_sync_cycle() {
         continue
         ;;
     esac
-  done <<<"$nudge_output"
+  done < "$_nudge_tmp"
 
   BRIDGE_DAEMON_LAST_STEP="queue_summary"
   summary_output="$(bridge_queue_cli summary --format tsv 2>/dev/null || true)"
