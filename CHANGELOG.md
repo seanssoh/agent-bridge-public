@@ -6,6 +6,58 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-05-13
+
+### Highlight — credential file delivery + daemon hang fixes + worktree doctor
+
+This release cycle (PR #799/#801/#802 + #803/#804/#805/#806/#807) landed 8 PRs across credential isolation, daemon timeout hardening, and operational surface. Headline: PR #799 closed the env-injection credential leak class (Path A architecture, 5-round codex review chain ending at AST-audited exhaustive enumeration of remaining final-path operations). PR #801 + #806 structurally eliminated the `$(python3 - <<'PY')` heredoc-write deadlock class across the daemon main loop (#800 root cause + parallel-PR regression). PR #807 ships `agent-bridge worktree doctor` for safe stale-worktree cleanup with repo-level stash-safety guard.
+
+### Added — new user-facing surface
+
+- **`agent-bridge auth claude-token` subcommand** (PR #799): per-agent Claude OAuth token registry with rotation, quota recovery, and file-based credential delivery. Token written to per-agent `~/.claude/.credentials.json` (NOT env-injected); rotation atomic via `write_private_file_atomic` with chown-before-replace + `_ensure_claude_dir_safe` parent symlink check. `fcntl.flock` `registry_lock` makes concurrent rotate/recover/check safe across daemon + manual CLI. New fcntl-locked `claude-oauth-tokens.json` registry under `$BRIDGE_RUNTIME_SECRETS_DIR`.
+- **Watchdog canonical install** (PR #802): `scripts/install-watchdog-silence-launchagent.sh` (macOS, KeepAlive=true + RunAtLoad=true) + `scripts/install-watchdog-silence-systemd.sh` (Linux, Type=simple Restart=always). Both wired into `bridge-bootstrap.sh` alongside daemon-liveness install. `DAEMON_SCRIPT` default now resolves via env override → `$BRIDGE_HOME/bridge-daemon.sh` → `~/.agent-bridge/bridge-daemon.sh` → `SCRIPT_DIR` (last-resort dev fallback with explicit warning). `state/silence-watchdog.pidlock` (fcntl) blocks concurrent run.
+- **`agent-bridge watchdog cleanup-orphans`** (PR #802): reaps watchdog instances with ppid=1 + script path outside canonical allow-list. Validated against 10 orphan instances on operator host.
+- **`agent-bridge worktree doctor [--dry-run|--apply|--max-age-days|--target-branch|--include-stale|--prune-branches|--repo]`** (PR #807): stale worktree cleanup with repo-level stash-safety guard. Default `--dry-run`. Stash present anywhere in repo blocks all removals (load-bearing — `feedback_worktree_stash_shared_git_dir.md`).
+- **`bridge-daemon-helpers.py`** (PR #801, expanded PR #806): 13 subcommands corresponding to the daemon's parsing/lookup callsites. Replaces `$(python3 - <<'PY')` heredoc-stdin pattern that was the root cause of the 34h silent daemon hang in #800.
+
+### Fixed — daemon hang / heredoc deadlock class
+
+- **34-hour silent daemon hang root cause** (PR #801, refs #800 Track A, refs #265 Proposal A): 9 unwrapped `$(python3 - <<'PY')` callsites in `bridge-daemon.sh` moved out of heredoc-stdin into `bridge-daemon-helpers.py` subcommands. Each wrapped in `bridge_with_timeout <secs> <label>` with per-site budget (5s JSON-only / 15s nudge_live_state hot path / 60s daily-backup). Highest-impact site (`nudge_live_state`) has explicit per-agent `skip_this_tick` audit-only fallback — sibling agents continue. Smoke fixture (`scripts/smoke/daemon-heredoc-timeout.sh`) exercises real subcommand bodies via FIFO + sqlite EXCLUSIVE lock stall vectors (the actual #800 hang class).
+- **PR #799 introduced 4 NEW heredoc regression sites** (PR #806): PR #799's cron auth + token rotation/recovery paths were developed in parallel with PR #801 and missed the #800 wrapping convention. PR #806 wrapped the four new sites (`usage_rotation_candidates_parse`, `rotation_status_parse`, `recovery_status_parse`, `sync_status_parse`) using same Pattern A helper subcommand. Plus 2 library sites in `lib/bridge-core.sh` (`core_match`) and `lib/bridge-skills.sh` (`skills_resolve_target`) wrapped with Pattern B (`python3 -c "$SCRIPT"` here-string variable). Registry now 13 entries.
+
+### Fixed — Claude OAuth credential isolation (Path A)
+
+- **`CLAUDE_CODE_OAUTH_TOKEN` env-injection leak class** (PR #799 r1-r5 chain, refs `feedback_credential_env_injection_anti_pattern.md`): credential delivery moved from `launch-secrets.env` env injection to per-agent `~/.claude/.credentials.json` file. Path B (hook-deny defense-in-depth) ESCALATE recommendation from codex r3 led to architecture pivot. Now: tool execution UID can still read its own credential file (Finding 1 same-UID FS readability residual — documented in `KNOWN_ISSUES.md §25` with credential-helper pattern noted as planned future enhancement), but no interpreter `os.environ` / `%ENV` / `ENV[]` leak. Hook deny rules from r2-r3 retained as belt-and-suspenders.
+- **Symlink-attack hardening** (PR #799 r2): bash `bridge_auth_claude_credentials_file_for_agent` + Python `_ensure_claude_dir_safe` reject symlinked `.claude/` dirs. `cd -P` real-path verification requires resolved path to stay under isolated user home. macOS `/var` ↔ `/private/var` prefix mismatch handled.
+- **Rotation atomicity** (PR #799 r2): `write_private_file_atomic` chowns tempfile to isolated UID BEFORE `os.replace` (NOT after — that was the r1 race). Removed post-replace chmod (r5 redundancy elimination — `rename(2)` preserves mode bits via inode rename).
+- **`bridge-cron-runner.py` 401 on claude -p** (PR #799): runner now resolves per-agent `CLAUDE_CONFIG_DIR` from `launch-secrets.env`. Previously fell back to controller default `~/.claude` and hit 401 even while interactive sessions worked.
+
+### Fixed — operational hardening
+
+- **`bridge_with_timeout` self-defeat on bare macOS** (PR #804, refs PR #802 r2 caveat): wrapper relied on `timeout(1)`/`gtimeout(1)`; bare macOS without GNU coreutils ran wrapped command unwrapped. Added tier-2 Python `subprocess.run(timeout=)` fallback using `python3 -c "$SCRIPT"` here-string pattern (NOT heredoc-stdin). 3-tier chain: timeout(1) → python3 → unwrapped exec (last resort). Tier-3 audit wrapped in subshell `(...) || true` to contain `bridge_require_python` exit when python3 is also missing.
+- **Channel runtime readiness false-negative** (PR #803, refs #779): `bridge_agent_channel_runtime_ready_for_item` now does LISTEN port probe after file/env-key checks. `bridge_port_is_listening` helper (Linux `ss` + macOS `lsof` portable, fail-open on minimal hosts). Teams branch only — discord/telegram outbound, ms365 shares teams listener. Legacy roster (no `TEAMS_WEBHOOK_PORT`) preserved via empty-port short-circuit.
+- **`agent-bridge show --json alive=null`** when tmux session absent (PR #805, refs #780): multi-signal OR — tmux session OR `agents/<X>/runtime/agent.pid` alive OR channel LISTEN. Existing `active` field preserved unchanged for backwards compat; new `alive` + `alive_signals` fields surface in `--json`.
+- **CI smoke v0.8.0 isolation-v2 marker noise** (PR #799 Wave 1, indirect): `scripts/smoke/lib.sh:smoke_setup_bridge_home` writes `$BRIDGE_STATE_DIR/layout-marker.sh` with `BRIDGE_LAYOUT=v2 + BRIDGE_DATA_ROOT`. Resolved the markerless(existing-install) abort that was masking real regressions across PR #799 r1-era CI runs.
+
+### Process — codex pair-review chains this cycle
+
+- **PR #799 — 5-round Path A cycle** (after 3-round Path B abandonment): r1 same-UID accepted residual + symlink + chown race → r2 symlink/atomic fix → r3 drop bash legacy helper → r4 drop Python unchanged-content fast paths → r5 drop redundant post-replace chmod. r5 codex AST-walker independent audit matched fixer's enumeration exactly (6 final-path chmod/chown calls all in allow-listed context: 3 in save_registry controller-owned, 1 in probe_claude_token sandboxed tempdir, 2 in write_private_file_atomic tempfile pre-replace). Convergent-pattern technical-override of 4-round cap policy — documented in `project_pr799_path_a_shipped.md`.
+- **PR #801 — r1 smoke-fixture-realism finding**: codex r1 audit confirmed production code correctness (path resolution, no-stdin contract, arg order, per-agent nudge skip) but flagged smoke harness used synthetic helpers. r2 extended smoke with real subcommand stall vectors (FIFO no-writer for `mcp_orphan_cleanup_parse` blocking `Path.read_text()`, sqlite `BEGIN EXCLUSIVE` for `nudge_live_state` blocking `sqlite3.connect.execute`). Smoke now legitimately catches the production hang class.
+- **PR #802 — r2 SCRIPT_DIR silent-fallback BLOCKING**: codex r1 caught that fallback chain's SCRIPT_DIR last-resort returned without warning — exactly the failure mode #800 Track C was fixing. r2 added explicit warning before SCRIPT_DIR fallback return. Documented caveat about `bridge_with_timeout` PATH dependency carried over to PR #804.
+- **PR #806 catches regression class**: PR #799 + PR #801 developed in parallel against same base; PR #799 added 4 NEW heredoc-stdin sites that PR #801's audit had no visibility into. PR #806 was the audit follow-up. Pattern worth flagging: **parallel PR development on same surface needs cross-PR audit before merge or immediate follow-up after merge**.
+
+### Internal — wave orchestration metadata
+
+- 8 PRs landed across this release cycle in <5 hours of operator-clock-time, all squash-merged with structured `implement-ok` notes and codex-rescue pair-review.
+- New fixer footgun discovered: **Edit/Write tool CWD pollution**. Track F fixer's first round of edits landed in operator's primary checkout instead of own fixer worktree (Edit tool with parent-process CWD on operator path). Worktree-relative absolute paths now mandatory in fixer briefs.
+- New runtime footgun discovered: **Bash 5.3.9 here-string heredoc-write deadlock**. `<<<"$porcelain"` into multi-record read loop deadlocks in `heredoc_write` — same #800 class. Workaround: `mktemp + < file`.
+
+### Carry-over to next cycle
+
+- Finding 1 (same-UID FS readability) — `KNOWN_ISSUES.md §25` notes credential-helper / separate Claude launcher identity as planned future enhancement.
+- One-shot script heredoc sites (`bridge-intake.sh`, `bridge-bootstrap.sh`, `bridge-bundle.sh`, `scripts/wiki-daily-ingest.sh`, `scripts/repair-task-db.sh`, `scripts/export-public-snapshot.sh`) still use heredoc-stdin pattern. Lower priority than daemon main-loop sites; tracked for future audit pass.
+- Worktree doctor stash-safety policy refuses all removal when ANY stash present — operator's current checkout has 5 in-flight stashes blocking cleanup of 156 stale fixer worktrees. Resolve stashes (or use git stash drop for known-stale ones) to enable cleanup.
+
 ## [0.9.9] — 2026-05-11
 
 ### Highlight — every-upgrade isolated-UID breakage fixed (#792 CRITICAL hotfix)
