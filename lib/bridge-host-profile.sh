@@ -439,8 +439,13 @@ bridge_host_profile_run() {
 #        "disabled=10 failed=0", "disabled=0 skipped=12 reason=user-declined",
 #        "disabled=0 skipped=0 reason=no-matching-crons"). Drives the
 #        wording of the cron lines below. Empty string falls back to the
-#        "offered" wording so a future caller that hasn't wired this up
-#        still produces sensible output.
+#        success wording ("disable 처리됨") — assumes a future caller that
+#        forgot to wire the summary through has nevertheless run the
+#        offer first (matches the actual call site in
+#        bridge_host_profile_run, which always invokes offer + emit in
+#        sequence). Codex r2 finding: keep this fallback honest by stating
+#        the actual init value rather than promising "offered" wording the
+#        code does not emit.
 bridge_host_profile_emit_dev_advisories() {
   local admin_agent="${1:-admin}"
   local cron_summary="${2:-}"
