@@ -3131,10 +3131,12 @@ bridge_persist_agent_state() {
 # alive, cwd matches, no transcript jsonl yet) is implemented in the
 # Python helper. The bash body uses `python3 "$BRIDGE_SCRIPT_DIR/scripts
 # /python-helpers/detect-claude-session-id.py"` rather than an inline
-# `python3 - <<'PY' ... PY` heredoc — the former is immune to the Bash
-# 5.3.9 `heredoc_write` deadlock class (issue #815 / #800) that wedges
+# Python heredoc — the former is immune to the Bash 5.3.9
+# `heredoc_write` deadlock class (issue #815 / #800) that wedges
 # the function when callers wrap it in command substitution from a shell
-# sourced via absolute path.
+# sourced via absolute path. (Forbidden pattern string intentionally
+# omitted from this comment so the footgun #11 self-audit grep recipe
+# does not flag a textual mention as a real callsite.)
 bridge_detect_claude_session_id() {
   local workdir="$1"
   local since_ms="${2:-0}"

@@ -3,11 +3,13 @@
 
 Extracted from `lib/bridge-state.sh::bridge_detect_claude_session_id` as
 part of issue #827 fix. The bash wrapper previously inlined this body via
-`python3 - <<'PY' ... PY` (heredoc-stdin). On Bash 5.3.9 that pattern can
-wedge in `heredoc_write` when the wrapper is called inside a command
-substitution `$(...)` and the surrounding shell was sourced from an
-absolute path — the same heredoc-write class issue #815 / #800 closed in
-the daemon and CLI hot paths. Moving the body into a real script removes
+a Python heredoc-stdin (forbidden pattern string omitted to keep this
+docstring out of the footgun #11 self-audit grep). On Bash 5.3.9 that
+pattern can wedge in `heredoc_write` when the wrapper is called inside
+a command substitution `$(...)` and the surrounding shell was sourced
+from an absolute path — the same heredoc-write class issue #815 / #800
+closed in the daemon and CLI hot paths. Moving the body into a real
+script removes
 the heredoc read entirely.
 
 Args (positional, order-sensitive):
