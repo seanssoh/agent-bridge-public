@@ -78,10 +78,10 @@ unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID
 TEST_BRIDGE_HOME="$TMP_ROOT/bridge-home"
 mkdir -p "$TEST_BRIDGE_HOME/state" "$TEST_BRIDGE_HOME/data"
 MARKER_PATH="$TEST_BRIDGE_HOME/state/layout-marker.sh"
-cat >"$MARKER_PATH" <<MARKER
-BRIDGE_LAYOUT=v2
-BRIDGE_DATA_ROOT=$TEST_BRIDGE_HOME/data
-MARKER
+{
+  printf '%s\n' 'BRIDGE_LAYOUT=v2'
+  printf 'BRIDGE_DATA_ROOT=%s/data\n' "$TEST_BRIDGE_HOME"
+} >"$MARKER_PATH"
 chmod 0644 "$MARKER_PATH"
 export BRIDGE_HOME="$TEST_BRIDGE_HOME"
 export BRIDGE_STATE_DIR="$TEST_BRIDGE_HOME/state"
@@ -195,24 +195,24 @@ R1_DRIVER="$TMP_ROOT/r1-driver.sh"
 # A "claude" symlink to bash so `ps -o comm=` on the pane PID reports
 # basename `claude` (matches bridge_tmux_command_name_is_claude).
 ln -sf "$(command -v bash)" "$R1_BIN_DIR/claude"
-cat >"$R1_PAYLOAD" <<R1PAY
-IFS= read -r line
-printf '%s\n' "\${line:-<enter>}" >"$R1_ACK"
-# Print a Claude-style ready prompt so bridge_tmux_session_has_prompt
-# succeeds and bridge_tmux_wait_for_prompt returns 0 after the picker
-# Enter is sent. The picker text up the buffer no longer matters; only
-# the most recent 20 lines are scanned.
-printf '\n❯ \n'
-sleep 2
-R1PAY
+{
+  printf '%s\n' 'IFS= read -r line'
+  printf '%s\n' 'printf '\''%s\n'\'' "${line:-<enter>}" >"'"$R1_ACK"'"'
+  printf '%s\n' '# Print a Claude-style ready prompt so bridge_tmux_session_has_prompt'
+  printf '%s\n' '# succeeds and bridge_tmux_wait_for_prompt returns 0 after the picker'
+  printf '%s\n' '# Enter is sent. The picker text up the buffer no longer matters; only'
+  printf '%s\n' '# the most recent 20 lines are scanned.'
+  printf '%s\n' 'printf '\''\n❯ \n'\'''
+  printf '%s\n' 'sleep 2'
+} >"$R1_PAYLOAD"
 chmod +x "$R1_PAYLOAD"
-cat >"$R1_DRIVER" <<R1DRV
-#!/usr/bin/env bash
-printf 'WARNING: Loading development channels\n'
-printf 'I am using this for local development\n'
-printf 'Enter to confirm · Esc to cancel\n'
-exec "$R1_BIN_DIR/claude" "$R1_PAYLOAD"
-R1DRV
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'printf '\''WARNING: Loading development channels\n'\'''
+  printf '%s\n' 'printf '\''I am using this for local development\n'\'''
+  printf '%s\n' 'printf '\''Enter to confirm · Esc to cancel\n'\'''
+  printf 'exec "%s/claude" "%s"\n' "$R1_BIN_DIR" "$R1_PAYLOAD"
+} >"$R1_DRIVER"
 chmod +x "$R1_DRIVER"
 tmux new-session -d -s "$R1_SESSION" "$R1_DRIVER"
 SMOKE_SESSIONS+=("$R1_SESSION")
@@ -253,22 +253,22 @@ R2_DRIVER="$TMP_ROOT/r2-driver.sh"
 # exact pre-fix wedge shape: foreground != claude, no claude under it,
 # but picker text on screen.
 ln -sf "$(command -v bash)" "$R2_BIN_DIR/node"
-cat >"$R2_PAYLOAD" <<R2PAY
-IFS= read -r line
-printf '%s\n' "\${line:-<enter>}" >"$R2_ACK"
-# Same prompt-render trick as R1 so wait_for_prompt returns 0 after the
-# picker Enter is sent.
-printf '\n❯ \n'
-sleep 2
-R2PAY
+{
+  printf '%s\n' 'IFS= read -r line'
+  printf '%s\n' 'printf '\''%s\n'\'' "${line:-<enter>}" >"'"$R2_ACK"'"'
+  printf '%s\n' '# Same prompt-render trick as R1 so wait_for_prompt returns 0 after the'
+  printf '%s\n' '# picker Enter is sent.'
+  printf '%s\n' 'printf '\''\n❯ \n'\'''
+  printf '%s\n' 'sleep 2'
+} >"$R2_PAYLOAD"
 chmod +x "$R2_PAYLOAD"
-cat >"$R2_DRIVER" <<R2DRV
-#!/usr/bin/env bash
-printf 'WARNING: Loading development channels\n'
-printf 'I am using this for local development\n'
-printf 'Enter to confirm · Esc to cancel\n'
-exec "$R2_BIN_DIR/node" "$R2_PAYLOAD"
-R2DRV
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'printf '\''WARNING: Loading development channels\n'\'''
+  printf '%s\n' 'printf '\''I am using this for local development\n'\'''
+  printf '%s\n' 'printf '\''Enter to confirm · Esc to cancel\n'\'''
+  printf 'exec "%s/node" "%s"\n' "$R2_BIN_DIR" "$R2_PAYLOAD"
+} >"$R2_DRIVER"
 chmod +x "$R2_DRIVER"
 tmux new-session -d -s "$R2_SESSION" "$R2_DRIVER"
 SMOKE_SESSIONS+=("$R2_SESSION")
@@ -371,11 +371,11 @@ fi
 step "R4: watcher times out cleanly when neither picker nor foreground appears"
 R4_SESSION="agb-825-r4-$$"
 R4_DRIVER="$TMP_ROOT/r4-driver.sh"
-cat >"$R4_DRIVER" <<R4DRV
-#!/usr/bin/env bash
-printf 'unrelated pane output — neither picker nor claude foreground here\n'
-exec "$(command -v sleep)" 10
-R4DRV
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'printf '\''unrelated pane output — neither picker nor claude foreground here\n'\'''
+  printf 'exec "%s" 10\n' "$(command -v sleep)"
+} >"$R4_DRIVER"
 chmod +x "$R4_DRIVER"
 tmux new-session -d -s "$R4_SESSION" "$R4_DRIVER"
 SMOKE_SESSIONS+=("$R4_SESSION")
