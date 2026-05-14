@@ -70,8 +70,15 @@ def cmd_usage_alert_parse(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:1009 (process_usage_monitor).
 
     Extracts alert tuples from the usage-monitor JSON for shell consumption.
-    Output: one tab-separated row per alert:
-      provider \\t account \\t window \\t bucket \\t used_percent \\t reset_at \\t source \\t message
+    Output: one tab-separated row per alert (9 cols):
+      provider \\t account \\t window \\t bucket \\t used_percent \\t reset_at \\t source \\t agent \\t message
+
+    Issue #831: `agent` is the new 8th column, inserted BEFORE message so the
+    daemon callsite's existing `IFS=$'\\t' read ... source body` continues to
+    work when treating message as the trailing free-form field — but the
+    callsite must list `agent` between `source` and `body` to surface it.
+    Placing `message` last keeps its existing role as the absorbed
+    trailing-content slot in shell readers that mismatch the column count.
     """
     try:
         payload = json.loads(args.monitor_json)
@@ -89,6 +96,7 @@ def cmd_usage_alert_parse(args: argparse.Namespace) -> int:
                     str(alert.get("used_percent", "")),
                     str(alert.get("reset_at", "")),
                     str(alert.get("source", "")),
+                    str(alert.get("agent", "")),
                     str(alert.get("message", "")),
                 ]
             )
@@ -331,8 +339,12 @@ def cmd_usage_rotation_candidates_parse(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:1069 (process_usage_monitor).
 
     Extracts ``rotation_candidates`` tuples from the usage-monitor JSON.
-    Output: one tab-separated row per candidate:
-      provider \\t account \\t window \\t used_percent \\t reset_at \\t source \\t message
+    Output: one tab-separated row per candidate (8 cols):
+      provider \\t account \\t window \\t used_percent \\t reset_at \\t source \\t agent \\t message
+
+    Issue #831: `agent` is inserted as the 7th column (before message) so the
+    daemon shell loop can surface the triggering agent in its audit row. The
+    bash callsite is updated in lockstep.
     JSON-parse error exits 1 so the bash callsite's ``|| rotation_rows=""``
     fallback fires and the loop continues with no candidates.
     """
@@ -342,6 +354,10 @@ def cmd_usage_rotation_candidates_parse(args: argparse.Namespace) -> int:
         return 1
 
     for item in payload.get("rotation_candidates", []) or []:
+        # `agent` field on the candidate falls back to `worst_case_agent` for
+        # consistency with the envelope-level field. Either may be empty for
+        # legacy-single-cache rows.
+        agent = item.get("agent") or item.get("worst_case_agent") or ""
         print(
             "\t".join(
                 [
@@ -351,6 +367,7 @@ def cmd_usage_rotation_candidates_parse(args: argparse.Namespace) -> int:
                     str(item.get("used_percent", "")),
                     str(item.get("reset_at", "")),
                     str(item.get("source", "")),
+                    str(agent),
                     str(item.get("message", "")),
                 ]
             )
