@@ -10516,6 +10516,36 @@ bash "$REPO_ROOT/scripts/test-usage-monitor-isolated.sh"
 log "running picker-sweep-registration regression suite (issue #833)"
 bash "$REPO_ROOT/scripts/test-picker-sweep-registration.sh"
 
+# Resume-quarantine regression (Issue #820, v0.11.0): verifies
+# bridge_run_quarantine_rejected_resume only fires on real Claude
+# `--resume <stale-id>` rejections (not on unrelated short-duration
+# failures), and that forget-session clears the quarantine on the
+# changed=no path too.
+log "running resume-quarantine regression suite (issue #820)"
+bash "$REPO_ROOT/scripts/test-resume-quarantine.sh"
+
+# Prompt-guard regression (Issue #823, v0.11.0): verifies
+# `bridge_runtime_secret_access` requires a sensitive-action verb
+# within an 80-char window of a credential-bearing path. Locks down
+# both the positive (verb + protected path) and negative (pure-prose
+# mentions, verb + non-credential .env file) shapes.
+log "running prompt-guard rules regression suite (issue #823)"
+bash "$REPO_ROOT/scripts/test-prompt-guard-rules.sh"
+
+# Issues #821 + #822 (v0.11.0) — upgrade-time restart hardening: verifies the
+# per-agent `bridge_with_timeout` wrap (124/137 -> restart-timeout) and
+# the `recovered_by_daemon` reconciliation pass that reclassifies failed
+# rows whose agent ends up active after a bounded settle window.
+log "running upgrade-restart-hardening regression suite (issues #821 #822)"
+bash "$REPO_ROOT/scripts/test-upgrade-restart-hardening.sh"
+
+# Issue #824 (v0.11.0) — `agent show <X>` text formatter regression. Pins
+# the tab-to-sentinel translation that preserves empty middle fields
+# (notably session_id) and the field-count guard that refuses to render
+# a row whose column count drifts from the producer's 30-column schema.
+log "running agent-show-formatter regression suite (issue #824)"
+bash "$REPO_ROOT/scripts/test-agent-show-formatter.sh"
+
 # Issue #541 PR-A — memory-daily payload jsonl-aware migration regression.
 log "running cron-migrate-payloads smoke (issue #541 PR-A)"
 bash "$REPO_ROOT/scripts/smoke/cron-migrate-payloads.sh"

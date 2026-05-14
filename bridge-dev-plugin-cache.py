@@ -870,6 +870,206 @@ def _is_required_channel(channel: str, required: set[str], optional: set[str]) -
     return False
 
 
+def _now_iso_utc() -> str:
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{datetime.now(timezone.utc).microsecond // 1000:03d}Z"
+
+
+def _manifest_entry_already_correct(payload: dict, entry: dict[str, str]) -> bool:
+    """Return True if the manifest already has a correct entry for this plugin.
+
+    Used by the read-only pre-check so an isolated agent whose plugins dir is
+    root-owned but already-correct does not have to acquire a writable lock.
+    "Correct" means: an entry exists for `<plugin>@<marketplace>`, its first
+    element is a dict, and both `installPath` and `version` already match the
+    verified-cache values we would otherwise write. `installedAt` and
+    `lastUpdated` are deliberately ignored — they drift across launches and
+    are not a correctness signal.
+    """
+    plugin_name = entry.get("plugin", "")
+    marketplace = entry.get("marketplace", "")
+    version = entry.get("version", "")
+    install_path = entry.get("cache", "")
+    if not plugin_name or not marketplace or not install_path:
+        return False
+    key = f"{plugin_name}@{marketplace}"
+    existing_list = (payload.get("plugins") or {}).get(key)
+    if not isinstance(existing_list, list) or not existing_list:
+        return False
+    first = existing_list[0]
+    if not isinstance(first, dict):
+        return False
+    if first.get("installPath") != install_path:
+        return False
+    if first.get("version") != version:
+        return False
+    return True
+
+
+def _read_manifest_payload(target: Path) -> tuple[dict, str | None]:
+    """Read the manifest as JSON. Returns (payload, error_reason).
+
+    Empty / missing → default `{"version": 2, "plugins": {}}` with no error.
+    Read or parse failure → `({}, reason)`.
+    """
+    if not target.is_file():
+        return {"version": 2, "plugins": {}}, None
+    try:
+        return json.loads(target.read_text(encoding="utf-8")), None
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, f"read-failed: {exc}"
+
+
+def _update_installed_plugins_manifest(
+    plugins_root: Path,
+    verified_entries: list[dict[str, str]],
+) -> tuple[bool, str]:
+    """Merge verified plugin entries into <plugins_root>/installed_plugins.json.
+
+    Returns (ok, reason). The contract is now stricter than the first draft:
+
+      - If every verified entry is already correctly represented in the
+        manifest (matching `installPath` + `version`), return
+        `(True, "already-correct")` WITHOUT taking the writable lock. This is
+        the path isolated-UID agents fall through when their root-owned
+        manifest was populated by a separate share-catalog process.
+      - If a write is required and the lock cannot be acquired, return
+        `(False, "lock-open-failed: ...")` etc. The caller must treat this as
+        a required-failure for channel-required plugins (silent-success
+        elimination per r1 review feedback).
+      - Atomic write via tempfile + os.replace under a sidecar
+        `installed_plugins.json.lock` flock — we replace the target inode, so
+        locking the target file itself races with the swap.
+
+    Per-entry policy when writing: preserve `installedAt` if the same plugin
+    entry exists; always refresh `installPath`, `version`, `lastUpdated`.
+    Other plugin entries are preserved verbatim.
+    """
+    import errno
+    import fcntl
+    import tempfile
+
+    if not verified_entries:
+        return True, "no-op"
+
+    target = plugins_root / "installed_plugins.json"
+    lock_path = plugins_root / "installed_plugins.json.lock"
+
+    # Read-only pre-check: when the manifest already has correct entries for
+    # every verified plugin, no write is needed. This is what lets isolated
+    # agents (root-owned plugins dir) skip the writable lock when the
+    # share-catalog path already populated their manifest correctly.
+    pre_payload, pre_err = _read_manifest_payload(target)
+    if pre_err is None:
+        all_correct = all(
+            _manifest_entry_already_correct(pre_payload, entry)
+            for entry in verified_entries
+        )
+        if all_correct:
+            return True, "already-correct"
+
+    try:
+        plugins_root.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"mkdir-failed: {exc}"
+
+    try:
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        return False, f"lock-open-failed: {exc}"
+
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            return False, f"flock-failed: {exc}"
+
+        existing_mode = 0o600
+        if target.is_file():
+            try:
+                existing_mode = target.stat().st_mode & 0o777
+            except OSError:
+                pass
+            try:
+                payload = json.loads(target.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                return False, f"read-failed: {exc}"
+        else:
+            payload = {"version": 2, "plugins": {}}
+
+        plugins = payload.setdefault("plugins", {})
+        now = _now_iso_utc()
+        changed = False
+
+        for entry in verified_entries:
+            plugin_name = entry.get("plugin", "")
+            marketplace = entry.get("marketplace", "")
+            version = entry.get("version", "")
+            install_path = entry.get("cache", "")
+            if not plugin_name or not marketplace or not install_path:
+                continue
+            key = f"{plugin_name}@{marketplace}"
+            existing_list = plugins.get(key) or []
+            installed_at = now
+            if isinstance(existing_list, list) and existing_list:
+                first = existing_list[0]
+                if isinstance(first, dict) and "installedAt" in first:
+                    installed_at = first["installedAt"]
+            new_entry = {
+                "scope": "user",
+                "installPath": install_path,
+                "version": version,
+                "installedAt": installed_at,
+                "lastUpdated": now,
+            }
+            if isinstance(existing_list, list) and existing_list:
+                existing_first = existing_list[0] if isinstance(existing_list[0], dict) else {}
+                merged = dict(existing_first)
+                merged.update(new_entry)
+                if merged == existing_first:
+                    continue
+                existing_list[0] = merged
+                plugins[key] = existing_list
+            else:
+                plugins[key] = [new_entry]
+            changed = True
+
+        if not changed:
+            return True, "no-change"
+
+        try:
+            tmp_fd, tmp_name = tempfile.mkstemp(
+                prefix="installed_plugins.", suffix=".json.tmp", dir=str(plugins_root)
+            )
+        except OSError as exc:
+            return False, f"tempfile-failed: {exc}"
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as fp:
+                json.dump(payload, fp, ensure_ascii=False, indent=2)
+                fp.write("\n")
+            os.chmod(tmp_name, existing_mode)
+            os.replace(tmp_name, str(target))
+        except OSError as exc:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            if exc.errno == errno.EACCES:
+                return False, f"eacces (root-owned manifest, fail-soft): {exc}"
+            return False, f"write-failed: {exc}"
+
+        return True, "updated"
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -959,6 +1159,44 @@ def main(argv: list[str] | None = None) -> int:
         else:
             optional_failures.append(item)
 
+    # After per-plugin verification, register the verified entries in the
+    # agent's installed_plugins.json so Claude's plugin loader treats them as
+    # installed (not just cached). Without this, non-isolated agents that
+    # use --dangerously-load-development-channels still report
+    # `plugin: <X>@<marketplace> · plugin not installed` in the Claude pane.
+    # Sales_sean (isolated) avoids this because its catalog share path
+    # already populates the manifest; the helper's read-only pre-check
+    # returns `already-correct` and skips the writable lock there.
+    verified_for_manifest = [
+        item for item in results if item.get("status") in _VERIFIED_STATUSES
+    ]
+    manifest_status, manifest_reason = _update_installed_plugins_manifest(
+        claude_plugins_root(),
+        verified_for_manifest,
+    )
+    manifest_summary = {
+        "ok": manifest_status,
+        "reason": manifest_reason,
+        "verified_count": len(verified_for_manifest),
+        "plugins_root": str(claude_plugins_root()),
+    }
+
+    # Manifest write failure is fatal for channel-required plugins UNLESS the
+    # read-only pre-check already certified the entries as `already-correct`
+    # (which counts as ok=True, never reaches this branch). Per r1 review:
+    # silent success when cache verifies but manifest is missing/stale is the
+    # bug class the dev-cache linker was already trying to eliminate; the
+    # manifest write completes that contract for non-isolated agents.
+    if not manifest_status:
+        for item in verified_for_manifest:
+            channel = item.get("channel", "")
+            if not _is_required_channel(channel, required_set, optional_set):
+                continue
+            item_copy = dict(item)
+            item_copy["status"] = "manifest-write-failed"
+            item_copy["reason"] = manifest_reason
+            required_failures.append(item_copy)
+
     if args.json:
         json.dump(
             {
@@ -966,6 +1204,7 @@ def main(argv: list[str] | None = None) -> int:
                 "agent": args.agent,
                 "required_failure_count": len(required_failures),
                 "optional_failure_count": len(optional_failures),
+                "manifest": manifest_summary,
             },
             sys.stdout,
             ensure_ascii=False,
@@ -999,6 +1238,17 @@ def main(argv: list[str] | None = None) -> int:
                 f"{tag} {plugin}: {status} ({item.get('reason','-')}) "
                 f"criticality={criticality} agent={agent_label}"
             )
+
+    if not manifest_status:
+        # Fail-soft: log the reason but don't block launch. Isolated UID
+        # agents typically have a root-owned manifest that the share-catalog
+        # path maintains; the dev-cache sync running as the isolated UID
+        # cannot rewrite it, but that is benign as long as the entry is
+        # already present (which the catalog path ensures separately).
+        print(
+            f"WARNING: installed_plugins.json merge skipped — {manifest_reason} "
+            f"(plugins_root={claude_plugins_root()}, agent={agent_label})"
+        )
 
     if optional_failures and not required_failures:
         # Q4 decision: optional plugin failures warn and continue. Emit

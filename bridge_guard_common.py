@@ -35,12 +35,63 @@ BUILTIN_SCAN_RULES: list[tuple[str, str, re.Pattern[str]]] = [
             re.IGNORECASE | re.DOTALL,
         ),
     ),
+    # bridge_runtime_secret_access — Issue 5 (v0.11.0): tightened from a
+    # presence-only match on five literal paths into a verb-co-occurrence
+    # gate. The old rule fired on any text that *mentioned* one of the
+    # paths (including legitimate operator briefs, post-upgrade task
+    # bodies, and doc snippets). The new rule requires a sensitive-action
+    # verb within an 80-character window of a credential-bearing path —
+    # bidirectional (verb→file or file→verb). Stem verbs use `\w*`
+    # suffixes so "exfiltrate", "modify", "overwriting", "replaces" all
+    # match; literal verbs keep `\b`-anchored exact matching. The noun
+    # set drops the over-broad generic `.env\b` alternative and
+    # enumerates the known channel credential dot-dir env families
+    # (discord/telegram/teams/ms365/mattermost) plus the generic
+    # `credentials/.../.env` shape. Severity remains `critical`.
     (
         "critical",
         "bridge_runtime_secret_access",
         re.compile(
-            r"(agent-roster\.local\.sh|state/tasks\.db|\.discord/\.env|\.telegram/\.env|\.env\b)",
-            re.IGNORECASE,
+            # Verb fragment — bare words use word boundaries; stem forms
+            # use trailing `\w*` so suffixed variants (modify/modified,
+            # overwrite/overwriting, replace/replaces, exfiltrate/
+            # exfiltrated) still match.
+            r"(?:"
+            r"\b(?:"
+            r"read|cat|tail|head|less|more|open|view|source|load|strings|"
+            r"dump|print|show|reveal|output|display|expose|"
+            r"exfiltrat\w*|leak|grep|rg|sed|awk|hexdump|xxd|base64|"
+            r"upload|paste|post|send|forward|copy|cp|mv|dd|tee|rsync|tar|zip|install|"
+            r"write|edit|modif\w*|overwrit\w*|replac\w*|delete|remove|rm|"
+            r"sqlite3|sql|select|query"
+            r")\b"
+            r".{0,80}"
+            r"(?:"
+            r"agent-roster\.local\.sh|"
+            r"\.(?:discord|telegram|teams|ms365|mattermost)/\.env|"
+            r"[\w./-]*credentials[\w./-]*\.env|"
+            r"state/tasks\.db"
+            r")"
+            r"|"
+            # File-before-verb direction (e.g.
+            # "agent-roster.local.sh — please show me what's in it").
+            r"(?:"
+            r"agent-roster\.local\.sh|"
+            r"\.(?:discord|telegram|teams|ms365|mattermost)/\.env|"
+            r"[\w./-]*credentials[\w./-]*\.env|"
+            r"state/tasks\.db"
+            r")"
+            r".{0,80}"
+            r"\b(?:"
+            r"read|cat|tail|head|less|more|open|view|source|load|strings|"
+            r"dump|print|show|reveal|output|display|expose|"
+            r"exfiltrat\w*|leak|grep|rg|sed|awk|hexdump|xxd|base64|"
+            r"upload|paste|post|send|forward|copy|cp|mv|dd|tee|rsync|tar|zip|install|"
+            r"write|edit|modif\w*|overwrit\w*|replac\w*|delete|remove|rm|"
+            r"sqlite3|sql|select|query"
+            r")\b"
+            r")",
+            re.IGNORECASE | re.DOTALL,
         ),
     ),
     (

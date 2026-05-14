@@ -407,11 +407,21 @@ bridge_upgrade_collect_agent_restart_report() {
   #   is empty (the silent-exit common case). Base64 keeps newlines from
   #   breaking the tab framing. Empty when status != "failed" or the
   #   agent has no log directory yet. See `bridge_agent_log_dir`.
+  #
+  # Issue 3 (v0.11.0): each `bridge-agent.sh restart` is now wrapped by
+  # `bridge_with_timeout` so a hung per-agent restart cannot block the
+  # whole upgrade. Default timeout 60s, overridable via
+  # BRIDGE_UPGRADE_RESTART_TIMEOUT_SECONDS. A 124/137 exit-code from the
+  # timeout helper is mapped to reason="restart-timeout" so the operator
+  # summary distinguishes timeout from ordinary failure without
+  # inspecting the audit log.
+  local restart_timeout="${BRIDGE_UPGRADE_RESTART_TIMEOUT_SECONDS:-60}"
   bridge_upgrade_with_target_env "$target_root" "$BRIDGE_BASH_BIN" -lc '
     set -euo pipefail
     target_root="$1"
     dry_run="$2"
     source_root="$3"
+    restart_timeout="$4"
     source "$source_root/bridge-lib.sh"
     bridge_load_roster
 
@@ -449,14 +459,20 @@ bridge_upgrade_collect_agent_restart_report() {
         elif [[ "$dry_run" == "1" ]]; then
           status="would-restart"
           reason="eligible"
-        elif "$BRIDGE_BASH_BIN" "$target_root/bridge-agent.sh" restart "$agent" >/dev/null 2>&1; then
+        elif bridge_with_timeout "$restart_timeout" "upgrade_agent_restart:$agent" \
+             "$BRIDGE_BASH_BIN" "$target_root/bridge-agent.sh" restart "$agent" \
+             >/dev/null 2>&1; then
           status="restarted"
           reason="eligible"
           exit_code=0
         else
           exit_code=$?
           status="failed"
-          reason="restart-failed"
+          if [[ "$exit_code" == "124" || "$exit_code" == "137" ]]; then
+            reason="restart-timeout"
+          else
+            reason="restart-failed"
+          fi
           # Capture last ~5 log lines for the summary. Prefer .err.log;
           # fall back to .log when .err.log is empty (silent-exit case).
           # All subshell errors are tolerated so a missing log dir does
@@ -484,7 +500,118 @@ bridge_upgrade_collect_agent_restart_report() {
         "$agent" "$status" "$reason" "$attached" "$session" \
         "${exit_code:-}" "${log_tail_b64:-}"
     done
-  ' -- "$target_root" "$dry_run" "$source_root"
+  ' -- "$target_root" "$dry_run" "$source_root" "$restart_timeout"
+}
+
+# Issue 4 (v0.11.0): reconcile the initial restart report with the
+# daemon's subsequent launch cycle. A `failed`/`restart-timeout` row
+# whose agent ends up active+session-running after a bounded settle
+# window is reclassified to `recovered_by_daemon`, with the original
+# reason preserved as `daemon-recovered:was=<reason>` so the operator
+# can still triage the underlying issue from the JSON detail.
+#
+# The settle is poll-based (1s interval, capped at
+# BRIDGE_UPGRADE_RECOVERY_SETTLE_SECONDS, default 20s) and skipped
+# entirely when the report contains no `failed` rows or when dry_run=1.
+bridge_upgrade_reconcile_agent_restart_recovery() {
+  local target_root="$1"
+  local report="$2"
+  local dry_run="${3:-0}"
+  local source_root="${4:-$SOURCE_ROOT}"
+  local settle_seconds="${5:-${BRIDGE_UPGRADE_RECOVERY_SETTLE_SECONDS:-20}}"
+  # Defensive normalization, matches the style of bridge_with_timeout.
+  # An invalid override (e.g. BRIDGE_UPGRADE_RECOVERY_SETTLE_SECONDS=abc)
+  # would otherwise reach the inner `set -u` arithmetic and crash the
+  # reconcile pass — task #2067 review hardening.
+  [[ "$settle_seconds" =~ ^[0-9]+$ ]] || settle_seconds=20
+
+  if [[ -z "$report" ]]; then
+    printf '%s' "$report"
+    return 0
+  fi
+  if [[ "$dry_run" == "1" ]]; then
+    printf '%s' "$report"
+    return 0
+  fi
+  # Skip the wait entirely when there is nothing to reconcile.
+  if ! grep -qE $'\t''failed'$'\t' <<<"$report"; then
+    printf '%s' "$report"
+    return 0
+  fi
+
+  bridge_upgrade_with_target_env "$target_root" "$BRIDGE_BASH_BIN" -lc '
+    set -euo pipefail
+    target_root="$1"
+    source_root="$2"
+    settle_seconds="$3"
+    report="$4"
+    source "$source_root/bridge-lib.sh"
+    bridge_load_roster
+
+    # Tab-separated read inside this -lc body: ANSI-C $'tab' is awkward to
+    # embed in a single-quoted -lc heredoc, so materialise the tab into a
+    # variable. printf is portable across the bash versions we support.
+    TAB="$(printf "\t")"
+
+    # Collect the agents that need a recovery probe up front so the
+    # poll loop can short-circuit as soon as all of them are active.
+    failed_agents=()
+    while IFS="$TAB" read -r agent status _reason _attached _session _exit_code _log_tail; do
+      [[ -n "$agent" ]] || continue
+      if [[ "$status" == "failed" ]]; then
+        failed_agents+=("$agent")
+      fi
+    done <<<"$report"
+
+    declare -A recovered=()
+    if (( ${#failed_agents[@]} > 0 )); then
+      elapsed=0
+      interval=1
+      while (( elapsed < settle_seconds )); do
+        all_recovered=1
+        for agent in "${failed_agents[@]}"; do
+          if [[ -n "${recovered[$agent]:-}" ]]; then
+            continue
+          fi
+          if bridge_agent_is_active "$agent"; then
+            recovered[$agent]=1
+          else
+            all_recovered=0
+          fi
+        done
+        if (( all_recovered == 1 )); then
+          break
+        fi
+        sleep "$interval"
+        elapsed=$(( elapsed + interval ))
+      done
+      # Final probe in case the last sleep elapsed without re-checking.
+      for agent in "${failed_agents[@]}"; do
+        if [[ -n "${recovered[$agent]:-}" ]]; then
+          continue
+        fi
+        if bridge_agent_is_active "$agent"; then
+          recovered[$agent]=1
+        fi
+      done
+    fi
+
+    # Rewrite the report, reclassifying recovered rows. The 7-column
+    # tab-separated shape is preserved exactly; log_tail_b64 is NOT
+    # decoded/re-encoded.
+    while IFS="$TAB" read -r agent status reason attached session exit_code log_tail_b64; do
+      [[ -n "$agent" ]] || continue
+      if [[ "$status" == "failed" && -n "${recovered[$agent]:-}" ]]; then
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+          "$agent" "recovered_by_daemon" "daemon-recovered:was=$reason" \
+          "$attached" "$session" "$exit_code" "$log_tail_b64"
+      else
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+          "$agent" "$status" "$reason" "$attached" "$session" \
+          "$exit_code" "$log_tail_b64"
+      fi
+    done <<<"$report"
+  ' -- "$target_root" "$source_root" "$settle_seconds" "$report"
 }
 
 bridge_upgrade_agent_restart_json() {
@@ -519,12 +646,15 @@ payload = {
     "eligible": 0,
     "restart_eligible": 0,
     "restart_attempted_ok": 0,
+    "recovered_by_daemon": 0,
     "failed": 0,
     "skipped": 0,
     "restart_attempted_ok_agents": [],
     "restart_eligible_agents": [],
+    "recovered_by_daemon_agents": [],
     "failed_agents": [],
     "failed_details": [],
+    "recovered_by_daemon_details": [],
     "skipped_reasons": {},
 }
 
@@ -567,13 +697,30 @@ for raw in report.splitlines():
     elif status == "failed":
         payload["failed"] += 1
         payload["failed_agents"].append(agent)
-        detail = {"agent": agent}
+        detail = {"agent": agent, "reason": reason}
         try:
             detail["exit_code"] = int(exit_code) if exit_code else None
         except ValueError:
             detail["exit_code"] = None
         detail["last_log_tail"] = _decode_log_tail(log_tail_b64)
         payload["failed_details"].append(detail)
+    elif status == "recovered_by_daemon":
+        # Issue 4 (v0.11.0): daemon launched the agent after our initial
+        # restart attempt failed/timed-out. Counted separately so the
+        # operator-facing summary stops over-reporting "failed" when the
+        # daemon cycle absorbed the transient. Preserves the original
+        # reason (encoded as `daemon-recovered:was=<original>`) plus the
+        # exit_code + log_tail so the underlying issue is still
+        # diagnosable from the JSON.
+        payload["recovered_by_daemon"] += 1
+        payload["recovered_by_daemon_agents"].append(agent)
+        detail = {"agent": agent, "was_reason": reason.split("was=", 1)[-1] if "was=" in reason else reason}
+        try:
+            detail["exit_code"] = int(exit_code) if exit_code else None
+        except ValueError:
+            detail["exit_code"] = None
+        detail["last_log_tail"] = _decode_log_tail(log_tail_b64)
+        payload["recovered_by_daemon_details"].append(detail)
     else:
         payload["skipped"] += 1
         payload["skipped_reasons"][reason] = payload["skipped_reasons"].get(reason, 0) + 1
@@ -600,6 +747,7 @@ print(f"agent_restart_enabled: {'yes' if payload.get('enabled') else 'no'}")
 print(f"agent_restart_considered: {payload.get('considered', 0)}")
 print(f"agent_restart_eligible: {payload.get('eligible', 0)}")
 print(f"agent_restart_attempted_ok: {payload.get('restart_attempted_ok', 0)}")
+print(f"agent_restart_recovered_by_daemon: {payload.get('recovered_by_daemon', 0)}")
 print(f"agent_restart_failed: {payload.get('failed', 0)}")
 print(f"agent_restart_skipped: {payload.get('skipped', 0)}")
 if payload.get("restart_eligible"):
@@ -610,6 +758,8 @@ if payload.get("restart_eligible_agents"):
     print(f"agent_restart_eligible_agents: {','.join(payload['restart_eligible_agents'])}")
 if payload.get("failed_agents"):
     print(f"agent_restart_failed_agents: {','.join(payload['failed_agents'])}")
+if payload.get("recovered_by_daemon_agents"):
+    print(f"agent_restart_recovered_by_daemon_agents: {','.join(payload['recovered_by_daemon_agents'])}")
 # #256 Gap 1: surface per-agent exit code + last log tail when a restart
 # failed, so the operator can triage without hand-grepping log dirs.
 for detail in payload.get("failed_details", []) or []:
@@ -626,6 +776,29 @@ for detail in payload.get("failed_details", []) or []:
         print(f"agent_restart_failed_detail_{agent_id}: exit={exit_label} tail={tail_flat}")
     else:
         print(f"agent_restart_failed_detail_{agent_id}: exit={exit_label} tail=<no log tail captured>")
+# Issue 4 (v0.11.0): surface the same shape for recovered_by_daemon rows
+# so the operator can still triage the original failure even though the
+# daemon absorbed the transient.
+for detail in payload.get("recovered_by_daemon_details", []) or []:
+    agent_id = detail.get("agent") or "unknown"
+    exit_code = detail.get("exit_code")
+    exit_label = str(exit_code) if isinstance(exit_code, int) else "n/a"
+    was_reason = detail.get("was_reason") or "unknown"
+    tail = detail.get("last_log_tail") or ""
+    tail_flat = " ".join(tail.split())
+    if len(tail_flat) > 240:
+        tail_flat = tail_flat[:237] + "..."
+    if tail_flat:
+        print(f"agent_restart_recovered_detail_{agent_id}: was={was_reason} exit={exit_label} tail={tail_flat}")
+    else:
+        print(f"agent_restart_recovered_detail_{agent_id}: was={was_reason} exit={exit_label} tail=<no log tail captured>")
+if payload.get("recovered_by_daemon", 0) > 0 and not payload.get("dry_run"):
+    print(
+        "agent_restart_note: agent(s) above failed the in-upgrade "
+        "restart but the daemon subsequently launched them. They are "
+        "not failures from the operator's perspective; verify with "
+        "`agent-bridge status`."
+    )
 for reason in sorted(payload.get("skipped_reasons", {})):
     print(f"agent_restart_skipped_{reason}: {payload['skipped_reasons'][reason]}")
 if payload.get("dry_run") and payload.get("restart_eligible"):
@@ -1237,6 +1410,11 @@ if [[ "$SUBCOMMAND" == "rollback" ]]; then
   fi
   if [[ $RESTART_AGENTS -eq 1 ]]; then
     ROLLBACK_AGENT_RESTART_REPORT="$(bridge_upgrade_collect_agent_restart_report "$TARGET_ROOT" "$DRY_RUN")"
+    # Issue 4 (v0.11.0): reconcile failed rows against the daemon's
+    # subsequent launch cycle so the rollback summary does not over-
+    # report failures the daemon already absorbed. No-op when dry-run
+    # or when no `failed` rows are present.
+    ROLLBACK_AGENT_RESTART_REPORT="$(bridge_upgrade_reconcile_agent_restart_recovery "$TARGET_ROOT" "$ROLLBACK_AGENT_RESTART_REPORT" "$DRY_RUN")"
     ROLLBACK_AGENT_RESTART_JSON="$(bridge_upgrade_agent_restart_json "$ROLLBACK_AGENT_RESTART_REPORT" 1 "$DRY_RUN")"
   fi
   if [[ $JSON -eq 1 ]]; then
@@ -2017,6 +2195,11 @@ fi
 
 if [[ $RESTART_AGENTS -eq 1 ]]; then
   AGENT_RESTART_REPORT="$(bridge_upgrade_collect_agent_restart_report "$TARGET_ROOT" "$DRY_RUN")"
+  # Issue 4 (v0.11.0): reconcile failed rows against the daemon's
+  # subsequent launch cycle so the upgrade summary does not over-report
+  # failures the daemon already absorbed. No-op when dry-run or when no
+  # `failed` rows are present.
+  AGENT_RESTART_REPORT="$(bridge_upgrade_reconcile_agent_restart_recovery "$TARGET_ROOT" "$AGENT_RESTART_REPORT" "$DRY_RUN")"
   AGENT_RESTART_JSON="$(bridge_upgrade_agent_restart_json "$AGENT_RESTART_REPORT" 1 "$DRY_RUN")"
 fi
 

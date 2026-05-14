@@ -1692,7 +1692,59 @@ PY
     return 0
   fi
 
-  while IFS=$'\t' read -r row_agent description engine source session session_id workdir profile_home profile_source active activity_state loop_mode continue_mode always_on idle_timeout wake_status notify_status channel_status channels notify_kind notify_target notify_account discord_channel_id isolation_mode os_user queue_queued queue_claimed queue_blocked actions admin; do
+  # Issue 6 (v0.11.0): tab-separated rows with potentially-empty middle
+  # fields (notably session_id) cannot be parsed with `IFS=$'\t' read`
+  # — tab is whitespace, so Bash collapses adjacent tabs and every
+  # field after the empty one shifts by a slot. Symptom: `session_id:`
+  # showed the workdir path. Fix: translate tab to a non-whitespace
+  # sentinel (US, 0x1F), then split on the sentinel so empty fields
+  # round-trip correctly. Pure Bash 4 (no `readarray -d`).
+  local _tsv_line=""
+  local _tsv_sep
+  _tsv_sep=$'\x1f'
+  local -a _fields=()
+  while IFS= read -r _tsv_line; do
+    [[ -n "$_tsv_line" ]] || continue
+    _fields=()
+    IFS="$_tsv_sep" read -r -a _fields <<<"${_tsv_line//$'\t'/$_tsv_sep}"
+    # Guard against producer/consumer drift. The header in
+    # bridge_agent_records_tsv emits exactly 30 columns; any other
+    # count means a schema change landed in the producer without an
+    # update here — bail loudly rather than print shifted garbage
+    # (the very class of bug this fix repairs).
+    if (( ${#_fields[@]} != 30 )); then
+      bridge_die "agent show: unexpected TSV column count (${#_fields[@]} != 30); refusing to render"
+    fi
+    row_agent="${_fields[0]}"
+    description="${_fields[1]}"
+    engine="${_fields[2]}"
+    source="${_fields[3]}"
+    session="${_fields[4]}"
+    session_id="${_fields[5]}"
+    workdir="${_fields[6]}"
+    profile_home="${_fields[7]}"
+    profile_source="${_fields[8]}"
+    active="${_fields[9]}"
+    activity_state="${_fields[10]}"
+    loop_mode="${_fields[11]}"
+    continue_mode="${_fields[12]}"
+    always_on="${_fields[13]}"
+    idle_timeout="${_fields[14]}"
+    wake_status="${_fields[15]}"
+    notify_status="${_fields[16]}"
+    channel_status="${_fields[17]}"
+    channels="${_fields[18]}"
+    notify_kind="${_fields[19]}"
+    notify_target="${_fields[20]}"
+    notify_account="${_fields[21]}"
+    discord_channel_id="${_fields[22]}"
+    isolation_mode="${_fields[23]}"
+    os_user="${_fields[24]}"
+    queue_queued="${_fields[25]}"
+    queue_claimed="${_fields[26]}"
+    queue_blocked="${_fields[27]}"
+    actions="${_fields[28]}"
+    admin="${_fields[29]}"
     [[ "$row_agent" == "agent" ]] && continue
     printf 'agent: %s\n' "$row_agent"
     printf 'description: %s\n' "$description"
@@ -4316,6 +4368,26 @@ run_forget_session() {
     active="yes"
   fi
 
+  # Issue 2 (v0.11.0): evaluate the resume-quarantine clear up front, BEFORE
+  # the persisted-session early-return. Review #2040 finding 2: the operator
+  # may legitimately have an empty persisted id (post-recovery) but a
+  # non-empty `resume-quarantine.json` on disk; the prior implementation
+  # gated the clear on `changed=yes` and silently left the quarantine in
+  # place in that case.
+  #
+  # Safety rules unchanged: clear only when `active != yes` so a rapid-fail
+  # loop in bridge-run.sh cannot reintroduce the quarantined id between the
+  # operator's clear and the loop's next quarantine pass. The cleared flag
+  # is reported on both the `changed=yes` and `changed=no` output paths so
+  # the operator-facing semantics are honest about what was reset.
+  local _quarantine_cleared="no"
+  local _quarantine_file=""
+  _quarantine_file="$(bridge_agent_resume_quarantine_file "$agent" 2>/dev/null || true)"
+  if [[ "$active" != "yes" && -n "$_quarantine_file" && -f "$_quarantine_file" ]]; then
+    bridge_agent_resume_quarantine_clear "$agent" 2>/dev/null || true
+    _quarantine_cleared="yes"
+  fi
+
   # The lock + read-modify-write happens inside bridge_clear_persisted_session_id.
   # When two callers race, only the holder that observes a non-empty prior id
   # comes back with `changed=yes`; the others see `changed=no` and we record
@@ -4336,11 +4408,16 @@ run_forget_session() {
       --detail prior_id_hash= \
       --detail active="$active" \
       --detail changed=no \
+      --detail resume_quarantine_cleared="$_quarantine_cleared" \
       --detail reason=already_forgotten >/dev/null 2>&1 || true
     printf 'agent: %s\n' "$agent"
     printf 'changed: no\n'
     printf 'reason: already_forgotten\n'
     printf 'active: %s\n' "$active"
+    printf 'resume_quarantine_cleared: %s\n' "$_quarantine_cleared"
+    if [[ "$active" == "yes" && -n "$_quarantine_file" && -f "$_quarantine_file" ]]; then
+      bridge_warn "active=yes — resume-quarantine left intact; run forget-session again after 'agent stop $agent' for a clean slate"
+    fi
     return 0
   fi
 
@@ -4348,6 +4425,7 @@ run_forget_session() {
     --detail cleared_files="$cleared_csv" \
     --detail prior_id_hash="$prior_id_hash" \
     --detail active="$active" \
+    --detail resume_quarantine_cleared="$_quarantine_cleared" \
     --detail changed=yes >/dev/null 2>&1 || true
 
   printf 'agent: %s\n' "$agent"
@@ -4355,8 +4433,12 @@ run_forget_session() {
   printf 'cleared_files: %s\n' "${cleared_csv:--}"
   printf 'prior_id_hash: %s\n' "${prior_id_hash:--}"
   printf 'active: %s\n' "$active"
+  printf 'resume_quarantine_cleared: %s\n' "$_quarantine_cleared"
   if [[ "$active" == "yes" ]]; then
     bridge_warn "active=yes — running tmux session must be restarted fresh to pick up cleared id; suggested next: bridge-agent.sh restart $agent --no-continue"
+    if [[ -n "$_quarantine_file" && -f "$_quarantine_file" ]]; then
+      bridge_warn "active=yes — resume-quarantine left intact; run forget-session again after 'agent stop $agent' for a clean slate"
+    fi
   fi
 }
 

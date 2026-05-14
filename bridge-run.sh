@@ -509,7 +509,27 @@ bridge_run_sync_dev_plugin_cache() {
     optional_csv="$_opt_qualified"
   fi
 
-  output="$(python3 "$SCRIPT_DIR/bridge-dev-plugin-cache.py" sync \
+  # Resolve per-agent Claude plugin roots so the cache materializes under the
+  # same Claude config home the agent actually launches into. Without this,
+  # non-isolated agents fall back to Path.home()/.claude in the Python helper,
+  # which is the controller's global Claude dir — the agent's Claude never
+  # sees the marketplace and reports `plugin not installed` (#TBD).
+  #
+  # BRIDGE_DISABLE_ISOLATION=1 rollback path: bridge-run runs the agent as the
+  # controller even when the roster declares an isolated os_user. Honour the
+  # disabled-boundary by using the controller-side default home in that case.
+  local agent_claude_root=""
+  local _agent_os_user_local=""
+  if ! bridge_isolation_disabled_by_env && bridge_agent_linux_user_isolation_effective "$AGENT"; then
+    _agent_os_user_local="$(bridge_agent_os_user "$AGENT")"
+    agent_claude_root="$(bridge_agent_linux_user_home "$_agent_os_user_local")/.claude"
+  else
+    agent_claude_root="$(bridge_agent_default_home "$AGENT")/.claude"
+  fi
+
+  output="$(BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT="$agent_claude_root/plugins/cache" \
+    BRIDGE_CLAUDE_PLUGINS_ROOT="$agent_claude_root/plugins" \
+    python3 "$SCRIPT_DIR/bridge-dev-plugin-cache.py" sync \
     --channels "$channels" \
     --required-channels "$required_channels" \
     --optional-channels "${optional_csv:-}" \
@@ -555,6 +575,111 @@ bridge_run_safe_mode_resume_hint() {
   else
     log_line "[safe-mode] return to normal mode with: agent-bridge agent start ${AGENT}"
   fi
+}
+
+# Issue 2 (v0.11.0): record a Claude `--resume <stale-id>` rejection.
+# Called right after each launch returns, before the ONCE early-exit so
+# one-shot runs also record. Heuristic:
+#   1. ENGINE == claude, EXIT_CODE != 0, EXIT_CODE != 130|143 (signal exits),
+#      AND --resume <token> appears in LAUNCH_CMD.
+#   2. Try to extract the rejected session id from the new stderr bytes
+#      (slice between $local_err_size_before and $local_err_size_after).
+#   3. If stderr did not include a session id (Claude often writes the
+#      "No conversation found" hint to the alt-screen TUI, leaving ERRFILE
+#      empty), fall back to the --resume token from LAUNCH_CMD when the
+#      run was suspiciously short (<= 10s).
+#   4. Validate the extracted id, then call quarantine_add +
+#      archive_transcript so the next resolver pass excludes it.
+#
+# All output goes through log_line so the operator sees one line per
+# quarantine event; failures here are best-effort and never propagate.
+bridge_run_quarantine_rejected_resume() {
+  local exit_code="${1:-0}"
+  local duration="${2:-0}"
+  local launch_cmd="${3:-}"
+  local errfile="${4:-}"
+  local err_before="${5:-0}"
+  local err_after="${6:-0}"
+  local rejected_id=""
+  local cmd_resume_id=""
+  local stderr_slice=""
+  local archived_csv=""
+  local source=""
+
+  [[ "$ENGINE" == "claude" ]] || return 0
+  (( exit_code != 0 )) || return 0
+  # Skip clean signal exits (SIGINT/SIGTERM) — those are not resume rejections.
+  case "$exit_code" in
+    130|143) return 0 ;;
+  esac
+  [[ -n "$launch_cmd" ]] || return 0
+
+  # Extract --resume <token> from LAUNCH_CMD. Falls back to a regex-based
+  # match; UUID-shaped ids are accepted along with any token that survives
+  # bridge_resume_session_id_valid downstream.
+  cmd_resume_id="$(printf '%s' "$launch_cmd" \
+    | grep -oE -- '--resume[[:space:]]+[A-Za-z0-9._-]+' \
+    | head -n1 \
+    | awk '{print $2}' || true)"
+  [[ -n "$cmd_resume_id" ]] || return 0
+
+  # Slice stderr to the bytes the just-finished launch produced. tail -c +N
+  # is 1-indexed, so we want N = err_before + 1.
+  if [[ -f "$errfile" && "$err_after" =~ ^[0-9]+$ && "$err_before" =~ ^[0-9]+$ ]] \
+     && (( err_after > err_before )); then
+    stderr_slice="$(tail -c +"$((err_before + 1))" "$errfile" 2>/dev/null \
+      | head -c 8192 2>/dev/null || true)"
+    if [[ -n "$stderr_slice" ]] \
+       && printf '%s' "$stderr_slice" | grep -qE 'No conversation found|session ID'; then
+      rejected_id="$(printf '%s' "$stderr_slice" \
+        | grep -oE '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}' \
+        | head -n1 || true)"
+      source="stderr"
+    fi
+  fi
+
+  if [[ -z "$rejected_id" ]]; then
+    # Fallback gate (review #2040): only fire when there's NO new stderr
+    # content for this launch. Non-empty stderr that does not match the
+    # rejection pattern means the failure is something else (auth, plugin
+    # cache, stdin contract, etc.) and the resume id should NOT be
+    # quarantined — that would mask the real error and skip a valid
+    # session on the next attempt. Whitespace-only stderr is treated as
+    # empty for this gate.
+    local _stderr_has_content=0
+    if [[ -n "$stderr_slice" ]] && [[ -n "${stderr_slice//[[:space:]]/}" ]]; then
+      _stderr_has_content=1
+    fi
+    if (( _stderr_has_content == 0 )) \
+       && [[ "$duration" =~ ^[0-9]+$ ]] \
+       && (( duration <= 10 )); then
+      # Empty/whitespace-only stderr is the live-symptom shape (Claude's
+      # TUI alt-screen swallows the rejection message before exit). Treat
+      # short-duration EXIT 1 with `--resume <uuid>` as a high-confidence
+      # rejection in that case.
+      rejected_id="$cmd_resume_id"
+      source="launch-cmd"
+    fi
+  fi
+
+  [[ -n "$rejected_id" ]] || return 0
+  bridge_resume_session_id_valid "$rejected_id" || return 0
+
+  if ! bridge_agent_resume_quarantine_add "$AGENT" "$rejected_id" "no-conversation-found" 2>/dev/null; then
+    return 0
+  fi
+  log_line "[quarantine] resume id rejected (exit=${exit_code}, source=${source}, duration=${duration}s) → ${rejected_id}; subsequent launches will skip this transcript"
+  archived_csv="$(bridge_agent_resume_quarantine_archive_transcript "$AGENT" "$rejected_id" 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+  if [[ -n "$archived_csv" ]]; then
+    log_line "[quarantine] archived transcript(s): ${archived_csv}"
+  fi
+  bridge_audit_log state claude_resume_quarantined "$AGENT" \
+    --field session_id="$rejected_id" \
+    --field exit_code="$exit_code" \
+    --field duration_seconds="$duration" \
+    --field source="$source" \
+    --field archived="${archived_csv:-}" \
+    >/dev/null 2>&1 || true
 }
 
 bridge_run_fail_backoff_seconds() {
@@ -689,6 +814,13 @@ while true; do
   if [[ -f "$ERRFILE" ]]; then
     local_err_size_after="$(wc -c <"$ERRFILE" 2>/dev/null || echo 0)"
   fi
+
+  # Issue 2 (v0.11.0): detect a `claude --resume <stale-id>` rejection and
+  # quarantine the id so the next resolver pass skips it. Runs BEFORE the
+  # ONCE early-exit so one-shot launches also persist the rejection.
+  bridge_run_quarantine_rejected_resume \
+    "$EXIT_CODE" "$run_duration" "$LAUNCH_CMD" "$ERRFILE" \
+    "$local_err_size_before" "$local_err_size_after" || true
 
   bridge_run_cleanup_mcp_orphans
 

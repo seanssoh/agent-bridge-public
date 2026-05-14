@@ -17,6 +17,11 @@ Args (positional, order-sensitive):
     sys.argv[2] — candidate session id (may be empty)
     sys.argv[3] — max_age_hours (float string; default 48)
     sys.argv[4] — agent name (debug-only)
+    sys.argv[5] — exclude_csv: comma-separated session ids that the caller
+        wants filtered out (issue #820 / v0.11.0 Issue 2 quarantine). Stems
+        in this set are skipped during fs-scan; a candidate that matches an
+        entry is treated as quarantined and resolves to the freshest other
+        eligible transcript (rc=2) instead of being accepted as-is.
 
 Stdout: accepted session id, or empty when there is nothing to resume.
 Exit code:
@@ -91,6 +96,11 @@ def main() -> int:
     except ValueError:
         max_age_hours = 48.0
     agent = sys.argv[4] or ""
+    exclude = {
+        x
+        for x in (sys.argv[5] if len(sys.argv) > 5 else "").split(",")
+        if x
+    }
 
     cutoff = time.time() - max_age_hours * 3600
 
@@ -143,7 +153,7 @@ def main() -> int:
             if not entry.endswith(".jsonl"):
                 continue
             stem = entry[: -len(".jsonl")]
-            if not stem or stem in seen_stems:
+            if not stem or stem in seen_stems or stem in exclude:
                 continue
             full = os.path.join(base, entry)
             try:
@@ -166,6 +176,17 @@ def main() -> int:
 
     eligible.sort(key=lambda t: t[0], reverse=True)
     freshest_stem = eligible[0][1]
+
+    # Issue #820: a candidate explicitly in the quarantine set must not be
+    # accepted even if it would otherwise be the freshest. Resolve to the
+    # freshest non-quarantined stem (rc=2) so the caller knows to swap.
+    if candidate and candidate in exclude:
+        sys.stderr.write(
+            f"[debug] resume id quarantined: candidate={candidate} "
+            f"freshest={freshest_stem} workdir={workdir} agent={agent}\n"
+        )
+        print(freshest_stem, end="")
+        return 2
 
     if candidate and candidate == freshest_stem:
         print(candidate, end="")
