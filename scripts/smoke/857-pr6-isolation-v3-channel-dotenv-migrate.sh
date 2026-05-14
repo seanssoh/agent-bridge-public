@@ -234,8 +234,13 @@ case_a2_already_canonical() {
     out="$(bridge_isolation_v3_channel_dotenv_cli --check 2>&1)" || rc=$?
     smoke_assert_eq 0 "$rc" "A2: --check on canonical tree rc=0"
     smoke_assert_contains "$out" "ok:already-canonical" "A2: at least one already-canonical row"
-    [[ "$out" != *"drift"* ]] || smoke_fail "A2: canonical tree must not record drift, got: $out"
-    [[ "$out" != *"would"* ]] || smoke_fail "A2: --check must not emit would rows, got: $out"
+    # The summary line contains `drift=0 would=0` literal tokens, so a naive
+    # substring check on $out always matches "drift"/"would" even when zero
+    # rows of that status exist. Strip the summary line first and check only
+    # the per-row body.
+    out_rows="$(printf '%s\n' "$out" | sed '/^summary:/d' | sed '/^==/d')"
+    [[ "$out_rows" != *"drift"* ]] || smoke_fail "A2: canonical tree must not record drift, got: $out"
+    [[ "$out_rows" != *"would"* ]] || smoke_fail "A2: --check must not emit would rows, got: $out"
   ) || smoke_fail "A2 sub-shell failed"
   smoke_log "ok: A2 (canonical tree -> all ok:already-canonical, no drift)"
 }
@@ -298,7 +303,9 @@ case_a3_legacy_state_full_cycle() {
     out="$(bridge_isolation_v3_channel_dotenv_cli --check 2>&1)" || rc=$?
     smoke_assert_eq 0 "$rc" "A3.4: re-check post-apply rc=0"
     smoke_assert_contains "$out" "ok:already-canonical" "A3.4: post-apply tree is canonical"
-    [[ "$out" != *"drift"* ]] || smoke_fail "A3.4: re-check must show no drift"
+    # Strip summary line before substring check (it contains literal "drift=0").
+    out_rows="$(printf '%s\n' "$out" | sed '/^summary:/d' | sed '/^==/d')"
+    [[ "$out_rows" != *"drift"* ]] || smoke_fail "A3.4: re-check must show no drift, got: $out"
   ) || smoke_fail "A3 sub-shell failed"
   smoke_log "ok: A3 (drift -> --check -> --dry-run -> --apply -> idempotent re-check)"
 }
