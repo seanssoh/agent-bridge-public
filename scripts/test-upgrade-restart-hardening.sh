@@ -167,7 +167,7 @@ export SOURCE_ROOT
 # That subshell does not inherit unexported test-shell vars, so export
 # both the bash bin and the per-case knob the stub reads.
 export BRIDGE_BASH_BIN="${BRIDGE_BASH_BIN:-bash}"
-export export RECOVERED_AGENTS=""
+export RECOVERED_AGENTS=""
 
 # shellcheck source=/dev/null
 source "$RECON_TMP"

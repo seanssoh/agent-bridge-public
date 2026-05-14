@@ -548,8 +548,8 @@ bridge_upgrade_reconcile_agent_restart_recovery() {
     source "$source_root/bridge-lib.sh"
     bridge_load_roster
 
-    # Tab-separated read inside this -lc body: $'\t' is awkward to embed
-    # in a single-quoted -lc heredoc, so materialise the tab into a
+    # Tab-separated read inside this -lc body: ANSI-C $'tab' is awkward to
+    # embed in a single-quoted -lc heredoc, so materialise the tab into a
     # variable. printf is portable across the bash versions we support.
     TAB="$(printf "\t")"
 
