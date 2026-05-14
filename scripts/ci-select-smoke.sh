@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 864-upgrade-perm-regressions
 }
 
 add_all_integration() {
@@ -243,7 +243,7 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
-    lib/bridge-isolation*.sh|lib/bridge-migration.sh|bridge-migrate.sh|tests/isolation*)
+    lib/bridge-isolation*.sh|lib/bridge-migration.sh|bridge-migrate.sh|lib/bridge-marker-bootstrap.sh|tests/isolation*)
       # Issue #583 closure smoke (v0.8.0 T4): the cross-class read
       # boundary depends directly on lib/bridge-isolation-v2.sh
       # primitives (group + setgid model), so cover it whenever any
@@ -254,7 +254,14 @@ select_for_path() {
       # lives in lib/bridge-isolation-helpers.sh; pull its regression
       # smoke in on every isolation-lib move so the write helper's
       # pre-check + atomic write rc map stays covered.
-      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability 857-pr1-isolation-write-helper launch
+      # Issue #864: bridge_isolation_v2_migrate_marker_write owner fix
+      # (R1) + normalize_layout per-agent .claude/plugins/ chmod 2770
+      # (R3) live in lib/bridge-isolation-v2-migrate.sh; the matrix
+      # row for the manifests dir (R3) lives in lib/bridge-isolation-v2.sh;
+      # the marker validator the R1 fix targets lives in
+      # lib/bridge-marker-bootstrap.sh. Pull the smoke in for every
+      # isolation-lib + marker-bootstrap move.
+      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability 857-pr1-isolation-write-helper 864-upgrade-perm-regressions launch
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -324,7 +331,11 @@ select_for_path() {
       # gained a try/except for PermissionError + a `memory/` template
       # skip; cover its smoke directly when the upgrade Python or shell
       # entry moves.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate
+      # Issue #864 (v0.13.0 hotfix): bridge-upgrade.sh gained the post-
+      # apply-live `find scripts/ -type d -exec chmod a+rX {} +` step
+      # (R2). Pull the per-regression smoke whenever the upgrade entry
+      # moves so the umask=077 dir normalization stays pinned.
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions
       add_integration integration-minimal
       ;;
 

@@ -10556,6 +10556,13 @@ bash "$REPO_ROOT/scripts/test-prompt-guard-rules.sh"
 log "running upgrade-restart-hardening regression suite (issues #821 #822)"
 bash "$REPO_ROOT/scripts/test-upgrade-restart-hardening.sh"
 
+# Issue #864 (v0.13.0 hotfix) — three migration-side permission regressions
+# that block isolated agent start: marker owner left as controller (R1),
+# new scripts/* dirs at mode 0700 from umask=077 (R2), per-isolated-agent
+# ~/.claude/plugins/ left at 2750 blocking flock (R3). Pin all three.
+log "running 864-upgrade-perm-regressions suite (issue #864 R1/R2/R3)"
+bash "$REPO_ROOT/scripts/smoke/864-upgrade-perm-regressions.sh"
+
 # Issue #824 (v0.11.0) — `agent show <X>` text formatter regression. Pins
 # the tab-to-sentinel translation that preserves empty middle fields
 # (notably session_id) and the field-count guard that refuses to render

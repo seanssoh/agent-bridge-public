@@ -1020,6 +1020,32 @@ bridge_isolation_v2_migrate_normalize_layout() {
         return 1
       fi
     fi
+
+    # Issue #864 R3: re-pin `/home/agent-bridge-<name>/.claude/plugins/`
+    # to mode 2770 if it currently sits at 2750. v0.11.0 → v0.13.0
+    # upgrades on already-isolated installs leave the dir at 2750 (the
+    # prior contract); `bridge-dev-plugin-cache.py` running under the
+    # isolated UID then EACCES on flock and aborts launch with
+    # `channel-required plugin cache failed`. The fresh-creation path
+    # in `bridge_linux_share_plugin_catalog` lands the dir at 2770
+    # directly; this pass closes the gap for installs migrated in
+    # place. install_managed rows in the matrix are no-ops on apply
+    # (the matrix is verify-only for plugin-managed paths), so the
+    # chmod has to happen here. Best-effort: a missing plugins/ dir
+    # (agent never started, or non-plugin agent) is silently skipped.
+    local _r3_os_user _r3_iso_home _r3_plugins_dir
+    _r3_os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    if [[ -n "$_r3_os_user" ]] \
+        && command -v bridge_agent_linux_user_home >/dev/null 2>&1; then
+      _r3_iso_home="$(bridge_agent_linux_user_home "$_r3_os_user" 2>/dev/null || true)"
+      if [[ -n "$_r3_iso_home" ]]; then
+        _r3_plugins_dir="$_r3_iso_home/.claude/plugins"
+        if [[ -d "$_r3_plugins_dir" ]]; then
+          _bridge_isolation_v2_run_root_or_sudo chmod 2770 "$_r3_plugins_dir" \
+            >/dev/null 2>&1 || true
+        fi
+      fi
+    fi
   done < "$snapshot_path"
 
   return 0
@@ -1321,10 +1347,24 @@ bridge_isolation_v2_migrate_marker_write() {
   } > "$tmp"
 
   chmod 0640 "$tmp" || { rm -f "$tmp"; bridge_die "marker chmod failed"; }
-  # Owner: leave as caller (controller). Group bit 0 prevents group write
-  # already; ownership is inherited from caller process which is the
-  # controller running the migration.
   mv -f "$tmp" "$marker_path" || bridge_die "marker mv failed"
+
+  # Issue #864 R1: chown marker to `root:<shared-group>` mode 0640 so the
+  # validator (lib/bridge-marker-bootstrap.sh:69-75) accepts it under any
+  # caller UID. The validator short-circuits owner_uid==0 unconditionally;
+  # without root ownership, `bridge-run.sh` running under `sudo -u
+  # agent-bridge-<name>` sees the marker as owned by the controller UID
+  # (e.g. 1000) which is neither root nor the running isolated UID, falls
+  # back to `markerless(existing-install)`, and dies. `ab-shared` is the
+  # broader group every isolated agent + the controller already join via
+  # `bridge_isolation_v2_groups_apply`. Best-effort: a rootless dev tree
+  # where the caller can't sudo just leaves marker as caller-owned, which
+  # is also a valid validator state (owner_uid == current controller UID
+  # is the second short-circuit branch). The migrator never runs as a
+  # third party.
+  local _r1_shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
+  _bridge_isolation_v2_run_root_or_sudo chown "root:${_r1_shared_grp}" "$marker_path" >/dev/null 2>&1 || true
+  _bridge_isolation_v2_run_root_or_sudo chmod 0640 "$marker_path" >/dev/null 2>&1 || true
 
   if ! bridge_isolation_v2_marker_validate "$marker_path"; then
     rm -f "$marker_path"

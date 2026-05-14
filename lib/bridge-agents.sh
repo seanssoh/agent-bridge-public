@@ -2307,14 +2307,21 @@ bridge_linux_share_plugin_catalog() {
     || _v2_grp=""
   [[ -n "$_v2_grp" ]] || bridge_die "isolation v2: cannot resolve agent group for plugin catalog of '$agent'"
 
-  # 1. plugins/ root: root-owned, group-traversable.
-  #    chown root:ab-agent-<name>, chmod 2750. setgid bit means new children
-  #    inherit ab-agent-<name>; the isolated UID reaches the dir via group r-x.
+  # 1. plugins/ root: root-owned, group-traversable + group-writable.
+  #    chown root:ab-agent-<name>, chmod 2770. Issue #864 R3: the dev-
+  #    plugin-cache sync (`bridge-dev-plugin-cache.py` invoked under the
+  #    isolated UID via the bridge-start.sh sudo wrap) needs to take a
+  #    flock on `installed_plugins.json.lock` here. Mode 2750 (group
+  #    r-x only, no write) caused flock() to EACCES and aborted launch
+  #    with `channel-required plugin cache failed`. 2770 gives the
+  #    agent's own group write access so flock + manifest merge work;
+  #    the setgid bit is preserved so new children inherit
+  #    ab-agent-<name>.
   bridge_linux_sudo_root mkdir -p "$isolated_plugins"
   bridge_linux_sudo_root chown "root:${_v2_grp}" "$isolated_plugins" \
     || bridge_die "isolation v2: chown root:${_v2_grp} on '$isolated_plugins' failed"
-  bridge_linux_sudo_root chmod 2750 "$isolated_plugins" \
-    || bridge_die "isolation v2: chmod 2750 on '$isolated_plugins' failed"
+  bridge_linux_sudo_root chmod 2770 "$isolated_plugins" \
+    || bridge_die "isolation v2: chmod 2770 on '$isolated_plugins' failed"
 
   # 2. plugins/data/: isolated UID owns this so plugin runtime state writes work.
   local os_group=""

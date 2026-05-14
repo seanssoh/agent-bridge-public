@@ -1593,6 +1593,23 @@ if [[ $STRICT_MERGE -eq 1 ]]; then
 fi
 APPLY_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${apply_args[@]}")"
 
+# Issue #864 R2: `apply-live` above creates new live `scripts/` subdirs
+# via `Path.parent.mkdir(parents=True, exist_ok=True)`, which inherits
+# the controller shell's `umask=077` and produces directories at mode
+# 0700. Files inside land at mode 0644 (the explicit `target_mode`
+# argument). The isolated agent UID (sudo -u agent-bridge-<name>) then
+# cannot traverse the new dirs, and step-3 of bridge-run.sh fails with
+# `python3: can't open file '.../scripts/python-helpers/sha1-batch.py':
+# [Errno 13] Permission denied`. Normalize directory perms to a+rX
+# (typical 0755) after the overlay completes. `-type d` keeps file modes
+# untouched (the 0644 from apply-live is correct for the script bodies);
+# `a+rX` is the idempotent form — uppercase X applies +x only to dirs
+# or already-executable files, so the chmod is safe to run repeatedly
+# on a clean tree. Skip when --dry-run because no files moved.
+if [[ $DRY_RUN -eq 0 && -d "$TARGET_ROOT/scripts" ]]; then
+  find "$TARGET_ROOT/scripts" -type d -exec chmod a+rX {} + 2>/dev/null || true
+fi
+
 # Issue #682 Finding 2: advance the `installed_version` / `installed_ref`
 # / `installed_head` metadata atomically with the live VERSION write.
 # apply-live above writes the live VERSION file (plus every other tracked
