@@ -1429,14 +1429,17 @@ bridge_isolation_v2_matrix_rows_for_agent() {
 
     # 3. Per-agent plugin manifests (installed_plugins.json,
     #    known_marketplaces.json, marketplaces/). These are root-owned,
-    #    group-readable so the isolated UID can read but not modify.
+    #    group-writable so the isolated UID can take an flock and merge
+    #    its per-UID installed_plugins.json (Issue #864 R3 — was 2750,
+    #    which blocked flock on installed_plugins.json.lock and aborted
+    #    launch with `channel-required plugin cache failed`).
     #    `installPath` entries inside installed_plugins.json must
     #    resolve to the per-agent cache row below — never to a shared
     #    dev-plugin-cache (rejected by Q3) and never to another agent's
     #    home. Verification of `installPath` resolution lives in
     #    `bridge-dev-plugin-cache.py` post-link checks, not in the
     #    bash matrix apply.
-    printf 'isolated-plugin-manifests|%s|dir|root|%s|2750||1|install_managed|%s|per-agent plugin manifests (installed_plugins.json + marketplaces/) — installPath must resolve under same isolated home\n' \
+    printf 'isolated-plugin-manifests|%s|dir|root|%s|2770||1|install_managed|%s|per-agent plugin manifests (installed_plugins.json + marketplaces/) — installPath must resolve under same isolated home; group write required for flock\n' \
       "$iso_plugins_root" "$agent_grp" "$_v2_plugin_criticality"
 
     # 4. Per-agent plugin cache root. Per design v2 line 46 / Q3
