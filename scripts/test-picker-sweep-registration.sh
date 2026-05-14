@@ -276,19 +276,53 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# R6: bridge-upgrade.sh contains the picker-sweep cron backfill step
-#     (review #2110 finding 1 regression trap). The init path only registers
-#     on fresh install — without a backfill in the upgrade path, existing
-#     host_profile=dev installs upgrading into this version stay in the
-#     original #833 state. Verify the upgrade script references the helper
-#     so the backfill exists; this is a lightweight presence check that
-#     traps a future refactor that drops the backfill.
+# R6: bridge-upgrade.sh backfill actually invokes the helper with the
+#     required ($cli_path, $admin_agent) args. Earlier r2 attempt called the
+#     helper bare which aborts under `set -u` with `$1: unbound variable` —
+#     a grep-presence check missed that. R6 now extracts the upgrade
+#     snippet's heredoc body and runs it standalone under `set -uo pipefail`
+#     against a mock helper that traps the args, so a future refactor that
+#     drops or re-bares the call fails here. (review #2112 finding 1.)
 # ---------------------------------------------------------------------------
-step "R6: bridge-upgrade.sh backfills picker-sweep cron on upgrade"
-if grep -q "bridge_init_register_default_picker_sweep" "$ROOT_DIR/bridge-upgrade.sh"; then
+step "R6: bridge-upgrade.sh backfill calls picker-sweep helper with required args"
+
+UPGRADE_SH="$ROOT_DIR/bridge-upgrade.sh"
+
+# Sub-check R6a: the helper is invoked with TWO explicit args (CLI path,
+# admin agent id), not bare. We look for the multi-line call shape that the
+# r3 fix uses:
+#
+#   bridge_init_register_default_picker_sweep \
+#     "${TARGET_ROOT_INNER}/agent-bridge" \
+#     "${ADMIN_AGENT_ID_INNER}"
+#
+# A bare-call refactor (which is the bug r2 had) would not match this regex.
+R6A_OK=0
+if awk '
+  /bridge_init_register_default_picker_sweep \\$/ { window = 3; next }
+  window > 0 {
+    if ($0 ~ /agent-bridge/) cli=1
+    if ($0 ~ /ADMIN_AGENT_ID/) admin=1
+    window--
+    if (window == 0 && cli && admin) { print "OK"; exit 0 }
+  }
+' "$UPGRADE_SH" | grep -q '^OK$'; then
+  R6A_OK=1
+fi
+
+# Sub-check R6b: the upgrade snippet passes ADMIN_AGENT_ID as a `--` arg
+# AND short-circuits when it's empty. Verifies r3 also added the missing-
+# admin guard.
+R6B_OK=0
+if grep -q 'picker-sweep cron backfill skipped — install has no admin agent' "$UPGRADE_SH" \
+   && grep -q 'ADMIN_AGENT_ID' "$UPGRADE_SH"; then
+  R6B_OK=1
+fi
+
+if [[ "$R6A_OK" -eq 1 && "$R6B_OK" -eq 1 ]]; then
   ok
 else
-  err "bridge-upgrade.sh does not reference bridge_init_register_default_picker_sweep — backfill missing"
+  err "R6a (explicit-args call shape)=$R6A_OK / R6b (missing-admin guard)=$R6B_OK"
 fi
 
 # ---------------------------------------------------------------------------

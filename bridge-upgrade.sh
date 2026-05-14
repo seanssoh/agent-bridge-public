@@ -1605,17 +1605,33 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
   # unexpected error never blocks the upgrade.
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "[bridge-upgrade] plan: backfill picker-sweep cron (idempotent; closes #833 for upgraded installs)" >&2
+  elif [[ -z "${ADMIN_AGENT_ID:-}" ]]; then
+    # picker-sweep cron requires an admin agent (the helper targets
+    # `<admin>-dev` for the codex-pair cron — see
+    # bridge_init_register_default_picker_sweep's docstring). If the install
+    # has no admin agent, the helper's own no-op skip is correct, but doing
+    # it inline avoids invoking a sub-shell that would fail with the missing
+    # arg under `set -u`.
+    echo "[bridge-upgrade] picker-sweep cron backfill skipped — install has no admin agent" >&2
   else
     _picker_sweep_output=""
     if ! _picker_sweep_output="$(
       bridge_upgrade_with_target_env "$TARGET_ROOT" "$BRIDGE_BASH_BIN" -lc '
         set -euo pipefail
         SCRIPT_DIR="$1"
+        TARGET_ROOT_INNER="$2"
+        ADMIN_AGENT_ID_INNER="$3"
         source "$SCRIPT_DIR/bridge-lib.sh"
         source "$SCRIPT_DIR/lib/bridge-init-default-crons.sh"
         bridge_load_roster
-        bridge_init_register_default_picker_sweep
-      ' -- "$SOURCE_ROOT" 2>&1
+        # bridge_init_register_default_picker_sweep requires
+        # ($cli_path, $admin_agent_id) at $1/$2 and runs under set -u, so
+        # bare invocation aborts before idempotency can short-circuit.
+        # The CLI path is the live target tree (TARGET_ROOT/agent-bridge).
+        bridge_init_register_default_picker_sweep \
+          "${TARGET_ROOT_INNER}/agent-bridge" \
+          "${ADMIN_AGENT_ID_INNER}"
+      ' -- "$SOURCE_ROOT" "$TARGET_ROOT" "$ADMIN_AGENT_ID" 2>&1
     )"; then
       echo "[bridge-upgrade] WARN: picker-sweep cron backfill failed: $_picker_sweep_output" >&2
       _upgrade_partial_failures+=("picker_sweep_cron_backfill")
