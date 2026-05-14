@@ -338,6 +338,12 @@ else
     [[ -n "$path" ]] || continue
     select_for_path "$path"
   done < <(detect_changed_files)
+  # Issue #815 Wave D: destructive regression smoke is repo-wide coverage
+  # for the heredoc / here-string deadlock surface Wave A/B/C fixed. It
+  # runs on every required-suite invocation regardless of diff so a
+  # future commit that touches an unrelated file cannot accidentally
+  # regress the deadlock or detection-gap class without CI catching it.
+  add_required heredoc-regression
 fi
 
 selected_list="$(printf '%s\n' "$selected" | sed '/^$/d')"
