@@ -6409,6 +6409,15 @@ done
 assert_contains "$(cat "$DEV_CHANNELS_DISPATCH_ACK")" "<enter>"
 tmux kill-session -t "=$DEV_CHANNELS_DISPATCH_SESSION" >/dev/null 2>&1 || true
 
+# Issue #825 regression suite: controller-side dev-channels auto-accept
+# watcher must fire on pane-content-text trigger (not solely on the
+# foreground basename gate). Pre-fix the watcher would wedge indefinitely
+# on live v0.11.0+ installs when the picker text was visible but the
+# foreground process name did not match claude|claude-*|claude.*.
+log "running issue #825 controller dev-channels auto-accept regression"
+bash "$REPO_ROOT/scripts/test-controller-dev-channels-accept.sh" \
+  || die "issue #825 controller dev-channels auto-accept suite failed"
+
 log "classifying admin foreground exit by onboarding state"
 ONBOARDING_ADMIN_WORKDIR="$TMP_ROOT/onboarding-admin"
 mkdir -p "$ONBOARDING_ADMIN_WORKDIR"
