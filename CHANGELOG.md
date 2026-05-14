@@ -6,6 +6,12 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.12.0] — 2026-05-14
+
+### Highlight — live recovery follow-ups + heredoc resilience reinforcement
+
+Post-v0.11.0 follow-up wave triggered by the 2026-05-14 `crm-test` live recovery on the operator's host (running into #815 heredoc stalls). Nine PRs landed across two task chains: the v0.11.0 hotfix queue (#830 prompt-guard default-off revert, #831 usage monitor per-agent state, #832 channel-health probe controller-blind degradation) and the dynamic-startup recovery wave (#837 #826 grace, #840 #827 live session id pre-transcript, #839 #828 skill auto-help opt-in, #842 #4494 Wave D integrated smoke). Plus follow-up #838 filed for a surviving #815-class site in `lib/bridge-state.sh::bridge_resolve_resume_session_id` that Wave A/B/C/D didn't cover.
+
 ### Changed
 
 - **Integrated dynamic-recovery regression smoke `scripts/smoke/4494-integrated-dynamic-recovery.sh` — Wave D of #4494**. Single fixture that exercises the 3 fixes from #826 (PR #837, bridge-sync grace), #827 (PR #840, live Claude session id pre-transcript), and #828 (PR #839, skill auto-help opt-in) in one end-to-end flow simulating the operator's 2026-05-14 `crm-test` recovery: dynamic agent .env preserved through a slow start, live `sessions/<pid>.json` accepted before transcript, agent-bridge --help recursion suppressed on default render path, total wall time under 10s. Wired into `scripts/ci-select-smoke.sh` required suite. Driver bodies tracked under `scripts/smoke/4494-integrated-helpers/` (heredoc-to-file with multi-line bash bodies deadlocks on Bash 5.3.9 — see `feedback_bash_heredoc_write_class_recurrence.md`).
