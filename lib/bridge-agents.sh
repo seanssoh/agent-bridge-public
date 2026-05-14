@@ -4297,8 +4297,8 @@ bridge_channel_env_file_readiness() {
   # Without this branch the daemon would emit a false channel_health_miss
   # for a healthy isolated agent.
   if declare -F bridge_isolation_can_sudo_to_agent >/dev/null 2>&1; then
-    bridge_isolation_can_sudo_to_agent "$agent" 2>/dev/null
-    sudo_rc=$?
+    sudo_rc=0
+    bridge_isolation_can_sudo_to_agent "$agent" 2>/dev/null || sudo_rc=$?
     case "$sudo_rc" in
       0)
         # Agent isolated AND we can sudo to its UID — probe via that UID.
@@ -4322,8 +4322,8 @@ for k in "${keys[@]}"; do
 done
 exit 1
 '
-        bridge_isolation_run_as_agent_user_via_bash "$agent" "$probe_script" "$file" "$@" >/dev/null
-        probe_rc=$?
+        probe_rc=0
+        bridge_isolation_run_as_agent_user_via_bash "$agent" "$probe_script" "$file" "$@" >/dev/null 2>&1 || probe_rc=$?
         # The helper preserves script's exit code shifted into the 3+ band
         # when nonzero (rc=0 stays 0; script-rc 1 -> 3; script-rc 2 -> 4).
         # See lib/bridge-isolation-helpers.sh docstring.
