@@ -2069,14 +2069,20 @@ bridge_isolation_v2_apply_channel_state_dotenv_acl() {
   }
 
   local iso_user="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}"
-  # Sanity-resolve the controller user — the helper only needs to confirm
-  # one is available (mirrors the credentials helper preflight); the chown
-  # target on channel dotenvs is the isolated UID owning the agent workdir,
-  # not the controller, so we do not consume the resolved value here.
-  if ! bridge_isolation_v2_controller_user >/dev/null 2>&1; then
+  # r2 codex finding 1 — KEEP the resolved controller user. Channel dotenvs
+  # are owned by the isolated UID (the agent owns its own workdir), so the
+  # controller needs a named-user `u:<ctrl>:r--` ACL grant to read the file.
+  # r1 resolved the controller for a preflight sanity check and then dropped
+  # it, which meant the stale-strip below removed any pre-existing controller
+  # grant and the final setfacl re-asserted only roster agents. Net effect:
+  # after one repair call the controller could no longer read the dotenv —
+  # a regression strictly worse than the original mask::--- it was repairing.
+  # Mirrors the credentials helper at :1796-1799.
+  local ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+  [[ -n "$ctrl_user" ]] || {
     bridge_warn "apply_channel_state_dotenv_acl: cannot resolve controller user"
     return 1
-  fi
+  }
 
   # Build the roster-aware set of UIDs that legitimately hold a r-- grant
   # on channel dotenv files. Mirrors the credentials helper's roster
@@ -2092,6 +2098,11 @@ bridge_isolation_v2_apply_channel_state_dotenv_acl() {
   fi
   # Always include the agent being applied for (fresh-install transient).
   roster_iso_users+="${iso_user}"$'\n'
+  # r2 finding 1 — include the controller user in the keep-and-grant set
+  # so the stale-strip never removes it AND the final setfacl re-grants
+  # it. Single source of truth: both the strip-skip-list (via grep -Fxq)
+  # and the apply-grant-list iterate this string.
+  roster_iso_users+="${ctrl_user}"$'\n'
 
   # Resolve the agent's workdir once so the path guard can refuse any
   # provider state dir that does not live under it.

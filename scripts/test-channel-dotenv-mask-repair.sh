@@ -316,6 +316,126 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Case 5 (r2 finding 1): controller grant is preserved across a repair call.
+# Pre-state: u:ctrl_user:r-- + u:agent-bridge-A:r-- (roster).
+# Post-state must include BOTH grants (and add agent-bridge-B from roster).
+# Without the r2 fix, the stale-strip removed u:ctrl_user and the final
+# setfacl only re-granted roster members, breaking controller reads.
+# ---------------------------------------------------------------------------
+step "Case 5 (r2 finding 1): controller grant is preserved + roster expansion"
+
+if (( HAVE_SETFACL == 1 && HAVE_GETFACL == 1 )); then
+  AGENT_NAME="case5-agent"
+  STUB_AGENT_WORKDIR="$TMP_HOME/$AGENT_NAME/workdir"
+  TEAMS_DIR="$STUB_AGENT_WORKDIR/.teams"
+  mkdir -p "$TEAMS_DIR"
+  TEAMS_ENV="$TEAMS_DIR/.env"
+  printf 'TEAMS_APP_ID=ctrl\n' >"$TEAMS_ENV"
+  chmod 0640 "$TEAMS_ENV"
+
+  CTRL_UID_NAME="${USER:-${LOGNAME:-}}"
+  # Roster member proxy: use a second real system uid distinct from CTRL.
+  ROSTER_A_USER="daemon"
+  if ! id -u "$ROSTER_A_USER" >/dev/null 2>&1; then
+    ROSTER_A_USER="nobody"
+  fi
+  # Second roster member we will assert is GRANTED post-call (was missing pre).
+  ROSTER_B_USER="bin"
+  if ! id -u "$ROSTER_B_USER" >/dev/null 2>&1; then
+    ROSTER_B_USER="sys"
+  fi
+  if [[ -z "$CTRL_UID_NAME" ]] \
+      || ! id -u "$ROSTER_A_USER" >/dev/null 2>&1 \
+      || ! id -u "$ROSTER_B_USER" >/dev/null 2>&1; then
+    skip "could not resolve three distinct system uids (ctrl/$ROSTER_A_USER/$ROSTER_B_USER)"
+  elif ! setfacl -m "u:${CTRL_UID_NAME}:r--" "$TEAMS_ENV" 2>/dev/null \
+       || ! setfacl -m "u:${ROSTER_A_USER}:r--" "$TEAMS_ENV" 2>/dev/null; then
+    skip "setfacl multi-user pre-state unsupported on this filesystem"
+  else
+    STUB_STATE_DIR_TEAMS="$TEAMS_DIR"
+    STUB_STATE_DIR_MS365=""
+    STUB_STATE_DIR_DISCORD=""
+    STUB_STATE_DIR_TELEGRAM=""
+    STUB_STATE_DIR_MATTERMOST=""
+    # Roster reports A and B as eligible agents — the helper will compose
+    # u:A:r-- and u:B:r-- grants. Empty prefix so STUB_ROSTER values map
+    # directly to existing uids without an `agent-bridge-` prefix.
+    STUB_ROSTER="$(printf '%s\n%s\n' "$ROSTER_A_USER" "$ROSTER_B_USER")"
+    BRIDGE_AGENT_OS_USER_PREFIX=""
+    # Stub controller to a STABLE name. The helper reads
+    # ${SUDO_USER:-${USER:-${LOGNAME:-}}}; force USER for determinism.
+    export USER="$CTRL_UID_NAME"
+
+    # The helper's agent argument becomes iso_user; pass an agent name
+    # that does NOT collide with ROSTER_A_USER / ROSTER_B_USER / CTRL.
+    # The roster set already covers the two real uids; this agent name
+    # gets appended too but won't resolve to a real uid (and the final
+    # setfacl will fail for that bogus name, so we use one of the roster
+    # uids as the called-for agent to keep the final grant set valid).
+    if ! bridge_isolation_v2_apply_channel_state_dotenv_acl "$ROSTER_A_USER" 0640; then
+      err "helper returned non-zero on controller-grant test"
+    else
+      post_ctrl="$(getfacl -p "$TEAMS_ENV" 2>/dev/null \
+        | awk -F: -v u="$CTRL_UID_NAME" '$1=="user" && $2==u {print substr($3,1,3); exit}')"
+      post_a="$(getfacl -p "$TEAMS_ENV" 2>/dev/null \
+        | awk -F: -v u="$ROSTER_A_USER" '$1=="user" && $2==u {print substr($3,1,3); exit}')"
+      post_b="$(getfacl -p "$TEAMS_ENV" 2>/dev/null \
+        | awk -F: -v u="$ROSTER_B_USER" '$1=="user" && $2==u {print substr($3,1,3); exit}')"
+      post_mask="$(getfacl -p "$TEAMS_ENV" 2>/dev/null \
+        | awk -F: '/^mask::/ {print substr($3,1,3); exit}')"
+      if [[ "$post_ctrl" == "r--" ]] \
+          && [[ "$post_a" == "r--" ]] \
+          && [[ "$post_b" == "r--" ]] \
+          && [[ "$post_mask" == "r--" ]]; then
+        ok
+      else
+        err "post-state ctrl='$post_ctrl' A='$post_a' B='$post_b' mask='$post_mask' (want all r--)"
+      fi
+    fi
+    unset BRIDGE_AGENT_OS_USER_PREFIX
+    unset STUB_ROSTER
+  fi
+else
+  skip "setfacl/getfacl not available on this host"
+fi
+
+# ---------------------------------------------------------------------------
+# Case 6 (r2 finding 3): bridge-start.sh pre-launch ordering.
+# Static lexical assertion: the ACL repair call site must precede the
+# channel-status `bridge_die unreadable` guard. Without this ordering,
+# `agent start` dies on auth=unreadable before the helper ever runs.
+# Mocking the full bridge-start launch path is out of scope (operator
+# UIDs, sudo, isolation matrix); the file ordering invariant is the
+# accurate proxy and is what r2 actually changes.
+# ---------------------------------------------------------------------------
+step "Case 6 (r2 finding 3): bridge-start ACL repair runs before channel-status guard"
+
+START_SH="$ROOT_DIR/bridge-start.sh"
+if [[ ! -f "$START_SH" ]]; then
+  err "bridge-start.sh missing from \$ROOT_DIR=$ROOT_DIR"
+else
+  helper_line="$(grep -n 'bridge_isolation_v2_apply_channel_state_dotenv_acl "\$AGENT"' "$START_SH" \
+    | awk -F: 'NR==1 {print $1; exit}')"
+  status_line="$(grep -n 'bridge_agent_channel_status_reason "\$AGENT"' "$START_SH" \
+    | awk -F: 'NR==1 {print $1; exit}')"
+  if [[ -z "$helper_line" ]] || [[ -z "$status_line" ]]; then
+    err "could not locate helper or status callsite (helper='$helper_line' status='$status_line')"
+  elif (( helper_line < status_line )); then
+    ok
+  else
+    err "helper at line $helper_line is NOT before channel-status check at line $status_line"
+  fi
+fi
+
+# NOTE: r2 codex finding 5 (race between operator-driven and daemon-driven
+# re-assert) is INTENTIONALLY UNFIXED in this stop-gap PR. The operator
+# elected to (a) limit the daemon path by flipping the self-heal default
+# OFF (`BRIDGE_CHANNEL_HEALTH_DOTENV_SELFHEAL:-0` at bridge-daemon.sh:3563)
+# and (b) defer the structural fix to the controller-blind redesign that
+# removes the controller-side ACL surface entirely. A regression test for
+# the race would assert behavior we are not promising and is omitted.
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 TOTAL=$((PASS + FAIL + SKIP))
