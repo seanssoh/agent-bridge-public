@@ -196,7 +196,13 @@ select_for_path() {
       # bridge_write_roster_status_snapshot 'starting/stalled before
       # engine' branch (Wave B). Cover the regression smoke + the
       # engine-alive unit smoke when this file moves.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch
+      #
+      # Issue #848 r2: bridge-sync-roster-memo guards the bridge-sync.sh
+      # roster-cache invalidation contract added on top of the r1
+      # per-process memoization. Triggered on bridge-sync.sh and on
+      # lib/bridge-state.sh (which hosts bridge_roster_cache_invalidate
+      # / bridge_load_roster).
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
