@@ -215,7 +215,12 @@ select_for_path() {
       # bridge-cron.py; pull its smoke in for the same trigger set.
       # Issue #628 — cron mutation audit emission ditto.
       # Native cron shell payload runner regression.
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner queue
+      # v0.13.5 hotfix — RESULT_SCHEMA must satisfy OpenAI Structured
+      # Outputs strict mode (every key in properties must appear in
+      # required at every nested object level). Cover the invariant
+      # smoke whenever bridge-cron-runner.py moves so a future PR can't
+      # silently regress the strict-mode contract.
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict queue
       add_integration integration-minimal
       ;;
 

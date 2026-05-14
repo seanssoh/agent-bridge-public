@@ -66,28 +66,49 @@ RESULT_SCHEMA = {
             "type": "string",
             "enum": list(DELIVERY_INTENT_VALUES),
         },
+        # Conditional fields — must be present in every codex emission per
+        # OpenAI Structured Outputs strict mode. Use `anyOf [object, null]`
+        # so codex emits `null` when the conditional is not applicable;
+        # `normalize_forward_target` / `normalize_channel_relay` already
+        # handle None → return None and the validator branches at
+        # validate_result preserve the existing conditional semantics.
         "forward_target": {
-            "type": "object",
-            "properties": {
-                "channel": {"type": "string", "enum": list(FORWARD_CHANNEL_VALUES)},
-                "target_ref": {"type": "string"},
-                "format": {"type": "string", "enum": list(FORWARD_FORMAT_VALUES)},
-            },
-            "required": ["channel", "target_ref", "format"],
-            "additionalProperties": False,
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "channel": {"type": "string", "enum": list(FORWARD_CHANNEL_VALUES)},
+                        "target_ref": {"type": "string"},
+                        "format": {"type": "string", "enum": list(FORWARD_FORMAT_VALUES)},
+                    },
+                    "required": ["channel", "target_ref", "format"],
+                    "additionalProperties": False,
+                },
+                {"type": "null"},
+            ],
         },
-        "summary_short": {"type": "string", "maxLength": SUMMARY_SHORT_MAX},
+        "summary_short": {
+            "anyOf": [
+                {"type": "string", "maxLength": SUMMARY_SHORT_MAX},
+                {"type": "null"},
+            ],
+        },
         "channel_relay": {
-            "type": "object",
-            "properties": {
-                "body": {"type": "string"},
-                "urgency": {"type": "string"},
-                "transport": {"type": "string"},
-                "target": {"type": "string"},
-                "subject": {"type": "string"},
-            },
-            "required": ["body"],
-            "additionalProperties": False,
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "body": {"type": "string"},
+                        "urgency": {"type": "string"},
+                        "transport": {"type": "string"},
+                        "target": {"type": "string"},
+                        "subject": {"type": "string"},
+                    },
+                    "required": ["body", "urgency", "transport", "target", "subject"],
+                    "additionalProperties": False,
+                },
+                {"type": "null"},
+            ],
         },
     },
     "required": [
@@ -100,6 +121,9 @@ RESULT_SCHEMA = {
         "artifacts",
         "confidence",
         "delivery_intent",
+        "forward_target",
+        "summary_short",
+        "channel_relay",
     ],
     "additionalProperties": False,
 }
@@ -1415,12 +1439,13 @@ def build_prompt(request: dict[str, Any], payload_text: str) -> str:
         "## Required JSON fields (in addition to the schema's existing keys)",
         "",
         "- `delivery_intent`: one of `silent | main_session_only | forward_to_user`. Required.",
-        "- `summary_short`: ≤ 200 chars, operator-facing summary. Required when `delivery_intent != silent`.",
-        "- `forward_target`: required when `delivery_intent = forward_to_user`. Object with:",
+        "- `summary_short`: ≤ 200 chars, operator-facing summary. Required (non-null) when `delivery_intent != silent`; set to `null` for `silent`.",
+        "- `forward_target`: required (non-null) when `delivery_intent = forward_to_user`; set to `null` otherwise. Object with:",
         "    - `channel`: one of `telegram | discord | mattermost`.",
         "    - `target_ref`: a logical target name (NOT a chat id, NOT a webhook URL). The parent resolves it against its own routing config.",
         "    - `format`: `markdown` or `text`.",
-        "- For `silent`, leave `summary_short` empty/unset and do not set `forward_target`.",
+        "- `channel_relay`: set to `null` unless this job opted into the legacy structured relay (deprecated; see below).",
+        "- For `silent`, set `summary_short` and `forward_target` to `null`.",
     ]
 
     if policy == "always_silent":
