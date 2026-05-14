@@ -213,15 +213,15 @@ case_a7_no_sudo() {
 case_b1_real_two_uid() {
   local test_uid_user="${BRIDGE_ISOLATION_HELPERS_TEST_UID:-}"
   if [[ -z "$test_uid_user" ]]; then
-    smoke_log "skip B1: BRIDGE_ISOLATION_HELPERS_TEST_UID unset"
+    smoke_log "SKIP: B1 real two-UID — BRIDGE_ISOLATION_HELPERS_TEST_UID unset"
     return 0
   fi
   if ! command -v sudo >/dev/null 2>&1; then
-    smoke_log "skip B1: sudo not on PATH"
+    smoke_log "SKIP: B1 real two-UID — sudo not on PATH"
     return 0
   fi
   if ! sudo -n -u "$test_uid_user" bash -c 'exit 0' 2>/dev/null; then
-    smoke_log "skip B1: passwordless sudo to $test_uid_user unavailable"
+    smoke_log "SKIP: B1 real two-UID — passwordless sudo to $test_uid_user unavailable"
     return 0
   fi
 
