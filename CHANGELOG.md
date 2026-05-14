@@ -6,6 +6,23 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.13.2] — 2026-05-14
+
+### Highlight — v0.11.0 → v0.13.0 upgrade migration perm regressions fixed
+
+Hotfix release closing **#864** — three permission-class regressions discovered by the operator during v0.11.0 → v0.13.0 live install verification. Each blocked `agent start` for isolated agents and required a manual `chown`/`chmod` workaround to unstick. Without this hotfix, every fresh upgrade host has every isolated agent silently failing to start under the auto-restart backoff loop.
+
+### Fixed
+
+- **v0.13.0 upgrade migration permission regressions — R1+R2+R3 bundled (PR #866, closes #864)**.
+  - **R1 — `state/layout-marker.sh` ownership**: post-upgrade the marker retained `ec2-user:ab-controller mode 0640`. `bridge_isolation_v2_marker_validate` (`lib/bridge-marker-bootstrap.sh:64-75`) rejects markers whose owner UID is neither root nor the current controller UID — so under `sudo -u agent-bridge-<name>` the marker is rejected, layout falls back to `markerless(existing-install)`, `bridge_die`. Fix: `bridge_isolation_v2_migrate_marker_write` (`lib/bridge-isolation-v2-migrate.sh:1343-1367`) now chowns the marker to `root:${BRIDGE_SHARED_GROUP:-ab-shared}` via the existing `_bridge_isolation_v2_run_root_or_sudo` direct-first/sudo-fallback helper after the atomic tmp+chmod+mv-f write. Root ownership satisfies the validator's `owner_uid == 0` short-circuit regardless of which UID is running.
+  - **R2 — new `scripts/*` subdirs created mode 0700**: the v0.13.0 upgrade installed `scripts/python-helpers/`, `scripts/cli-help/`, `scripts/smoke/4494-integrated-helpers/`, `scripts/smoke/835-static-admin-launch-helpers/`, `scripts/smoke/heredoc-regression-helpers/` as `drwx------ ec2-user:ec2-user` (umask=077 inheritance during the apply-live overlay). Isolated agent UID couldn't traverse them → `python3` failed to open `scripts/python-helpers/sha1-batch.py` (PR #856's batched-sha1 hot path on agent start). Fix: `bridge-upgrade.sh:1606-1611` runs `find "$TARGET_ROOT/scripts" -type d -exec chmod a+rX {} +` immediately after apply-live (gated on `DRY_RUN==0`). Uppercase `X` ensures files don't get unwanted +x. apply-live's `bridge-upgrade.py:1746-1766` already writes file modes explicitly via `write_bytes(..., target_mode)`; this fixes the parallel dir-mode gap.
+  - **R3 — isolated `~/.claude/plugins/` mode 2750**: per-agent isolation grant left `/home/agent-bridge-<name>/.claude/plugins/` as `drwxr-s--- root:ab-agent-<name> 2750`. Group r-x+setgid but NO write. Dev-plugin-cache (`bridge-dev-plugin-cache.py:955-983`) needs to flock `installed_plugins.json.lock` during agent-start step 4, fails with EACCES, channel-required plugin cache aborts, launch fails. Fix: three coordinated changes set mode 2770 with setgid preserved — `bridge_linux_share_plugin_catalog` fresh-create path (`lib/bridge-agents.sh:2310-2324`), `bridge_isolation_v2_migrate_normalize_layout` upgrade path (`lib/bridge-isolation-v2-migrate.sh:1024-1045`), grant matrix row (`lib/bridge-isolation-v2.sh:1430-1443`). Scope is `~/.claude/plugins/` ONLY; `~/.claude/` itself stays 2750 (read-only catalog), other 2750 matrix rows (shared root/cache/aggregate, agent root, credentials) unchanged.
+
+  Regression smoke `scripts/smoke/864-upgrade-perm-regressions.sh` (6 assertions: R1=1, R2=3, R3=2) exercises all three on synthesized v0.11.0 → v0.13.0 fixtures. Uses python3 for portable mode reads (`stat -f '%Lp'` on macOS BSD strips the setgid bit, which would break R3's 2750↔2770 distinction). Wired into `scripts/ci-select-smoke.sh` as required when `bridge-upgrade.sh`, `lib/bridge-isolation-v2*.sh`, `lib/bridge-marker-bootstrap.sh`, or `lib/bridge-agents.sh` change.
+
+  Operator-host context: the regressions are discovered as a sequence (marker → scripts → plugins) — fixing one unblocks the next failure stack frame, no overlap. Without this hotfix, an operator running `agent-bridge upgrade --apply` from v0.11.0 to v0.13.0 sees all isolated agents enter auto-restart backoff with no dashboard signal beyond `auto-start backoff <agent> (failures=N, retry_in=Ns, reason=start-command-failed)`. The upgrade JSON output still shows generic `partial_failures` rather than structured `agent_perm_regression_<N>` rows; surfacing this in the upgrade JSON is tracked as a follow-up polish.
+
 ## [0.13.1] — 2026-05-14
 
 ### Highlight — Wave 3 #825 fix + #857 PR-1 foundation for ACL deprecation
