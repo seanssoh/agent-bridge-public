@@ -30,8 +30,11 @@
 #      still works end-to-end.
 #
 # Footgun 11 self-audit: this smoke writes its fixture files via
-# `mktemp + printf '%s\n' … > file + chmod +x`. No `cat <<EOF > $file` for
-# multi-line bodies, no `<<<` here-strings against subprocesses.
+# `mktemp + printf …%s…\n … > file + chmod +x`. No heredoc-to-file for
+# multi-line bodies, no here-string against subprocesses. (Forbidden
+# pattern strings intentionally omitted from this comment so the
+# self-audit grep recipe does not flag a textual mention as a real
+# callsite.)
 
 # Bash 4+ re-exec (mirrors scripts/smoke/daemon.sh).
 _SMOKE_REEXEC_TARGET="${BASH_SOURCE[0]}"
