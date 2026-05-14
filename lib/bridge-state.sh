@@ -76,7 +76,7 @@ bridge_build_dynamic_launch_cmd() {
       session_id=""
     fi
     if [[ "$effective_continue" == "1" && -z "$session_id" ]]; then
-      if bridge_claude_has_resumable_session_state "$(bridge_agent_workdir "$agent")"; then
+      if bridge_claude_has_resumable_session_state "$(bridge_agent_workdir "$agent")" "$agent"; then
         continue_fallback=1
       else
         bridge_warn "Claude agent '$agent' has continue=1 but no resumable session yet (first wake); launching fresh."
@@ -181,6 +181,7 @@ bridge_claude_resume_session_id_for_agent() {
   local session_id=""
   local detected=""
   local workdir=""
+  local _quarantine_csv=""
 
   [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 1
 
@@ -193,6 +194,11 @@ bridge_claude_resume_session_id_for_agent() {
     return 0
   fi
 
+  # Issue 2 (v0.11.0): exclude ids the runner has previously quarantined so
+  # the transcript-fallback scan cannot re-select a `claude --resume`-rejected
+  # session id. Empty list when no quarantine state exists.
+  _quarantine_csv="$(bridge_agent_resume_quarantine_ids "$agent" 2>/dev/null || true)"
+
   # Fallback: detect a transcript by workdir, age-bounded by the resume
   # window. Without this gate the same stale transcript that bridge_normalize
   # just rejected would be re-discovered (the original `agb admin` incident).
@@ -200,10 +206,12 @@ bridge_claude_resume_session_id_for_agent() {
   _max_hours_int="${_max_hours_int%.*}"
   [[ "$_max_hours_int" =~ ^[0-9]+$ ]] || _max_hours_int=48
   local _since_ms=$(( ($(date +%s) - _max_hours_int * 3600) * 1000 ))
-  detected="$(bridge_detect_claude_session_id "$workdir" "$_since_ms" "" 2>/dev/null || true)"
+  detected="$(bridge_detect_claude_session_id "$workdir" "$_since_ms" "$_quarantine_csv" 2>/dev/null || true)"
   [[ -n "$detected" ]] || return 1
   # Belt-and-suspenders: round-trip through the resolver so a missed slug or
   # detection-side regression cannot reintroduce a stale id past this point.
+  # The resolver auto-fetches the quarantine list when given a non-empty
+  # agent and no explicit exclude_csv, so the same guard applies here.
   local _accepted="" _rc=0
   _accepted="$(bridge_resolve_resume_session_id claude "$agent" "$workdir" "$detected" 2>/dev/null)" || _rc=$?
   [[ "$_rc" != 1 && -n "$_accepted" ]] || return 1
@@ -349,7 +357,7 @@ bridge_build_static_claude_launch_cmd() {
     effective_continue=1
     session_id="$(bridge_claude_resume_session_id_for_agent "$agent" || true)"
     if [[ "$effective_continue" == "1" && -z "$session_id" ]]; then
-      if bridge_claude_has_resumable_session_state "$(bridge_agent_workdir "$agent")"; then
+      if bridge_claude_has_resumable_session_state "$(bridge_agent_workdir "$agent")" "$agent"; then
         continue_fallback=1
       else
         bridge_warn "Claude agent '$agent' has continue=1 but no resumable session yet (first wake); launching fresh."
@@ -1783,6 +1791,180 @@ bridge_agent_runtime_state_dir() {
   bridge_agent_idle_marker_dir "$agent"
 }
 
+# Issue 2 (v0.11.0): per-agent resume-quarantine for rejected Claude session
+# ids. When `claude --resume <stale-id>` exits 1 ("No conversation found"),
+# bridge-run.sh records the rejected id here and archives the matching
+# transcript so the detector's fs scan does not re-select it on the next
+# launch. Resolver/detector wrappers thread the CSV through exclude_csv so
+# both the live-sessions and transcript-fallback paths skip quarantined ids.
+bridge_agent_resume_quarantine_file() {
+  local agent="$1"
+  printf '%s/resume-quarantine.json' "$(bridge_agent_runtime_state_dir "$agent")"
+}
+
+bridge_resume_session_id_valid() {
+  local id="$1"
+  [[ -n "$id" ]] || return 1
+  # Restrict to characters that appear in Claude session ids (UUIDs today;
+  # underscores/dots are kept so future session-id formats still pass without
+  # widening to anything that could break CSV/filesystem semantics).
+  [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  return 0
+}
+
+bridge_agent_resume_quarantine_ids() {
+  local agent="$1"
+  local file=""
+  [[ -n "$agent" ]] || { printf ''; return 0; }
+  file="$(bridge_agent_resume_quarantine_file "$agent")"
+  [[ -f "$file" ]] || { printf ''; return 0; }
+  python3 - "$file" 2>/dev/null <<'PY' || printf ''
+import json, sys
+try:
+    with open(sys.argv[1]) as fh:
+        data = json.load(fh)
+except Exception:
+    print("", end="")
+    raise SystemExit(0)
+ids = []
+if isinstance(data, dict):
+    for entry in (data.get("quarantined") or []):
+        if not isinstance(entry, dict):
+            continue
+        sid = entry.get("session_id")
+        if isinstance(sid, str) and sid:
+            ids.append(sid)
+print(",".join(ids), end="")
+PY
+}
+
+# bridge_agent_resume_quarantine_add — append <session_id> with <reason> to the
+# per-agent quarantine list. flock + atomic rewrite. Cap enforced (oldest
+# evicted) at $BRIDGE_RESUME_QUARANTINE_CAP (default 50). No-op when the id is
+# already present. Silently no-ops when the session id fails validation.
+bridge_agent_resume_quarantine_add() {
+  local agent="$1"
+  local session_id="$2"
+  local reason="${3:-no-conversation-found}"
+  local workdir=""
+  local file=""
+  local cap="${BRIDGE_RESUME_QUARANTINE_CAP:-50}"
+
+  [[ -n "$agent" ]] || return 1
+  bridge_resume_session_id_valid "$session_id" || return 1
+  workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  file="$(bridge_agent_resume_quarantine_file "$agent")"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+
+  python3 - "$file" "$session_id" "$reason" "$workdir" "$cap" <<'PY'
+import fcntl, json, os, sys, tempfile, time
+file_path, sid, reason, workdir, cap_s = sys.argv[1:6]
+try:
+    cap = max(1, int(cap_s))
+except Exception:
+    cap = 50
+
+lock_path = file_path + ".lock"
+lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    data = {"version": 1, "quarantined": []}
+    if os.path.isfile(file_path):
+        try:
+            with open(file_path) as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict) and isinstance(loaded.get("quarantined"), list):
+                data = loaded
+                data["version"] = 1
+        except Exception:
+            pass
+    entries = data.get("quarantined") or []
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("session_id") == sid:
+            raise SystemExit(0)
+    entries.append({
+        "session_id": sid,
+        "rejected_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "reason": reason,
+        "workdir": workdir,
+    })
+    if len(entries) > cap:
+        entries = entries[-cap:]
+    data["quarantined"] = entries
+    data["version"] = 1
+    target_dir = os.path.dirname(file_path) or "."
+    fd, tmppath = tempfile.mkstemp(prefix=".resume-quarantine.", dir=target_dir)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(data, fh, indent=2)
+        os.replace(tmppath, file_path)
+    except Exception:
+        try:
+            os.unlink(tmppath)
+        except Exception:
+            pass
+        raise
+finally:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+PY
+}
+
+bridge_agent_resume_quarantine_clear() {
+  local agent="$1"
+  local file=""
+  [[ -n "$agent" ]] || return 0
+  file="$(bridge_agent_resume_quarantine_file "$agent")"
+  rm -f "$file" "${file}.lock" 2>/dev/null || true
+}
+
+# Move the rejected transcript into a `.quarantined/` subdir under the same
+# project slug dir so the detector's `*.jsonl` glob no longer matches it.
+# Returns 0 even when no transcript was found — the resolver-side exclude_csv
+# is the primary guard; this just prevents fs-scan from re-discovering the id.
+bridge_agent_resume_quarantine_archive_transcript() {
+  local agent="$1"
+  local session_id="$2"
+  local workdir=""
+
+  [[ -n "$agent" ]] || return 1
+  bridge_resume_session_id_valid "$session_id" || return 1
+  workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  [[ -n "$workdir" ]] || return 0
+
+  python3 - "$workdir" "$session_id" 2>/dev/null <<'PY' || true
+import os, re, shutil, sys, time
+workdir = sys.argv[1]
+sid = sys.argv[2]
+def slugs(path):
+    a = path.replace("/", "-")
+    b = re.sub(r"[/.]", "-", path)
+    out = [a]
+    if b != a:
+        out.append(b)
+    return out
+for slug in slugs(workdir):
+    base = os.path.expanduser(f"~/.claude/projects/{slug}")
+    src = os.path.join(base, f"{sid}.jsonl")
+    if not os.path.isfile(src):
+        continue
+    qdir = os.path.join(base, ".quarantined")
+    try:
+        os.makedirs(qdir, exist_ok=True)
+    except Exception:
+        continue
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    dst = os.path.join(qdir, f"{sid}.{ts}.jsonl")
+    try:
+        shutil.move(src, dst)
+        sys.stdout.write(dst + "\n")
+    except Exception:
+        pass
+PY
+}
+
 bridge_agent_log_dir() {
   local agent="$1"
   if bridge_isolation_v2_active && [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
@@ -2568,6 +2750,7 @@ bridge_resolve_resume_session_id() {
   local workdir="$3"
   local candidate="${4:-}"
   local max_age_hours="${5:-${BRIDGE_RESUME_MAX_AGE_HOURS:-48}}"
+  local exclude_csv="${6:-}"
 
   if [[ "$engine" != "claude" ]]; then
     if [[ -n "$candidate" ]]; then printf '%s' "$candidate"; fi
@@ -2577,10 +2760,20 @@ bridge_resolve_resume_session_id() {
 
   # The python body lives in a file rather than an inline heredoc-stdin
   # for the same reason bridge_detect_claude_session_id does — see issue
-  # #827 / #815 / #800. The live-session shortcut (issue #827) is
-  # implemented inside the helper.
+  # #827 / #815 / #800. The live-session shortcut (issue #827) and the
+  # per-agent resume-quarantine filter (issue #820 / Issue 2 v0.11.0) are
+  # both implemented inside the helper.
+  #
+  # Issue #820: when the caller did not pass an explicit exclude list but
+  # supplied an agent, auto-fetch the per-agent resume-quarantine CSV so
+  # every existing call site inherits the rejection guard without signature
+  # churn. Empty result is harmless.
+  if [[ -z "$exclude_csv" && -n "$agent" ]]; then
+    exclude_csv="$(bridge_agent_resume_quarantine_ids "$agent" 2>/dev/null || true)"
+  fi
+
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-claude-resume-session-id.py" \
-    "$workdir" "$candidate" "$max_age_hours" "$agent"
+    "$workdir" "$candidate" "$max_age_hours" "$agent" "$exclude_csv"
 }
 
 # Returns 0 (true) if the given workdir has any in-window
@@ -2590,9 +2783,10 @@ bridge_resolve_resume_session_id() {
 # resolver's debug stderr is suppressed because this is a probe.
 bridge_claude_has_resumable_session_state() {
   local workdir="$1"
+  local agent="${2:-}"
   [[ -n "$workdir" ]] || return 1
   local rc=0
-  bridge_resolve_resume_session_id claude "" "$workdir" "" >/dev/null 2>/dev/null || rc=$?
+  bridge_resolve_resume_session_id claude "$agent" "$workdir" "" >/dev/null 2>/dev/null || rc=$?
   [[ "$rc" != 1 ]]
 }
 
@@ -2605,9 +2799,10 @@ bridge_claude_has_resumable_session_state() {
 bridge_claude_session_id_exists() {
   local session_id="$1"
   local workdir="$2"
+  local agent="${3:-}"
   [[ -n "$session_id" && -n "$workdir" ]] || return 1
   local accepted="" rc=0
-  accepted="$(bridge_resolve_resume_session_id claude "" "$workdir" "$session_id" 2>/dev/null)" || rc=$?
+  accepted="$(bridge_resolve_resume_session_id claude "$agent" "$workdir" "$session_id" 2>/dev/null)" || rc=$?
   [[ "$rc" == 0 && "$accepted" == "$session_id" ]]
 }
 
@@ -2713,12 +2908,23 @@ bridge_refresh_agent_session_id() {
   fi
 
   since_hint="${BRIDGE_AGENT_CREATED_AT[$agent]-$(date +%s)}"
+  local _quarantine_csv=""
+  local quarantine_id
+  local -a quarantine_ids=()
+  _quarantine_csv="$(bridge_agent_resume_quarantine_ids "$agent" 2>/dev/null || true)"
+  if [[ -n "$_quarantine_csv" ]]; then
+    IFS=',' read -r -a quarantine_ids <<<"$_quarantine_csv"
+  fi
   for ((try_index = 0; try_index < attempts; try_index += 1)); do
     excluded=()
     for extra in "${extra_excluded[@]}"; do
       extra="$(bridge_trim_whitespace "$extra")"
       [[ -n "$extra" ]] || continue
       excluded+=("$extra")
+    done
+    for quarantine_id in "${quarantine_ids[@]}"; do
+      [[ -n "$quarantine_id" ]] || continue
+      excluded+=("$quarantine_id")
     done
     for other in "${BRIDGE_AGENT_IDS[@]}"; do
       [[ "$other" == "$agent" ]] && continue
