@@ -97,6 +97,116 @@ def save_text(path: Path, text: str) -> None:
     os.chmod(path, 0o600)
 
 
+# Inline mirror of bridge_isolation_write_file_as_agent_user_via_bash
+# (lib/bridge-isolation-helpers.sh:181). Used when the destination's
+# parent dir is owned by an isolated agent-bridge-<slug> UID and the
+# controller cannot write directly.
+#
+# Contract — MUST match the Bash helper exit-code band:
+#   rc=0    success
+#   rc=2    sudo missing / not allowed
+#   rc=5    destination dir missing
+#   rc=6    mktemp failed
+#   rc=7    stdin write failed
+#   rc=8    chmod failed
+#   rc=9    rename failed
+#
+# DO NOT introduce heredoc / here-string at the call site (footgun #11 —
+# see CLAUDE.md, [[feedback_bash_heredoc_write_class_recurrence]]).
+# Content is streamed via subprocess stdin pipe.
+_ISOLATED_WRITE_SCRIPT = (
+    'dest_path="$1"\n'
+    'mode="$2"\n'
+    'dest_dir="$(dirname "$dest_path")"\n'
+    'if [[ ! -d "$dest_dir" ]]; then exit 5; fi\n'
+    'umask 0077\n'
+    'tmp="$(mktemp "$dest_dir/.$(basename "$dest_path").bridge-write-tmp.XXXXXX")" || exit 6\n'
+    'trap \'rm -f "$tmp" 2>/dev/null\' EXIT INT TERM\n'
+    'if ! cat - >"$tmp"; then exit 7; fi\n'
+    'if ! chmod "$mode" "$tmp"; then exit 8; fi\n'
+    'if ! mv -f "$tmp" "$dest_path"; then exit 9; fi\n'
+    'trap - EXIT INT TERM\n'
+    'exit 0\n'
+)
+
+
+def _sudo_write_as(
+    os_user: str,
+    dest_path: Path,
+    content: str,
+    mode: int = 0o600,
+) -> subprocess.CompletedProcess[str]:
+    """Symmetric write counterpart to `_sudo_run_as`. Streams `content` via
+    stdin to `bash -c <inline-script>` running as `os_user` under
+    `sudo -n`. The inline script atomically writes to `dest_path` at
+    `mode` using mktemp-in-target-dir + chmod-before-rename — same
+    contract as `bridge_isolation_write_file_as_agent_user_via_bash`.
+
+    Does NOT raise on non-zero rc — caller inspects `proc.returncode`
+    against the contract above. Matches `_sudo_run_as` ergonomics.
+    """
+    full = [
+        "sudo", "-n", "-u", os_user, "bash", "-c", _ISOLATED_WRITE_SCRIPT,
+        "bridge-isolation", str(dest_path), f"{mode:o}",
+    ]
+    try:
+        return subprocess.run(
+            full, input=content, check=False, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        print(
+            f"[bridge-setup] sudo not available; cannot escalate to "
+            f"'{os_user}' for write to {dest_path}",
+            file=sys.stderr,
+        )
+        return subprocess.CompletedProcess(
+            args=full, returncode=127, stdout="", stderr=""
+        )
+
+
+def _isolation_aware_save_text(path: Path, text: str, mode: int = 0o600) -> None:
+    """save_text variant that delegates to sudo-as-isolated-UID when the
+    destination's parent dir is owned by an isolated agent-bridge-<slug>
+    UID. On non-isolated installs / non-Linux dev hosts, falls back to
+    the standard `save_text` path unchanged.
+
+    Probes ownership via `_resolve_isolated_owner_for_path` so the
+    nearest existing ancestor is used; `path.parent` alone is not
+    reliable because a caller (e.g. `cmd_<channel>`) may have already
+    `mkdir`'d the parent as the controller, hiding the isolated lineage
+    from a single-level lstat. The destination file itself may not
+    exist yet on first setup.
+    """
+    owner = _resolve_isolated_owner_for_path(path)
+    if owner is None:
+        save_text(path, text)
+        return
+    proc = _sudo_write_as(owner, path, text, mode)
+    if proc.returncode != 0:
+        raise SetupError(
+            f"isolation-aware save_text to {path} as {owner} failed "
+            f"(rc={proc.returncode}): {proc.stderr.strip() or '(no stderr)'}"
+        )
+
+
+def _isolation_aware_save_json(path: Path, payload: Any, mode: int = 0o600) -> None:
+    """save_json variant — same isolation-aware dispatch as
+    `_isolation_aware_save_text`. Serializes the payload first, then
+    streams via the same write contract.
+    """
+    owner = _resolve_isolated_owner_for_path(path)
+    if owner is None:
+        save_json(path, payload)
+        return
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    proc = _sudo_write_as(owner, path, text, mode)
+    if proc.returncode != 0:
+        raise SetupError(
+            f"isolation-aware save_json to {path} as {owner} failed "
+            f"(rc={proc.returncode}): {proc.stderr.strip() or '(no stderr)'}"
+        )
+
+
 def load_dotenv(path: Path) -> dict[str, str]:
     payload: dict[str, str] = {}
     if not path.exists():
@@ -150,6 +260,75 @@ def _isolated_workdir_owner(path: Path) -> str | None:
     if not owner.startswith("agent-bridge-"):
         return None
     return owner
+
+
+def _resolve_isolated_owner_for_path(path: Path) -> str | None:
+    """Walk up from `path` to find the nearest existing ancestor and
+    return its isolated `agent-bridge-<slug>` owner via
+    `_isolated_workdir_owner`. Returns None when the nearest existing
+    ancestor is controller-owned, on non-Linux dev hosts, or when no
+    ancestor exists.
+
+    Use this in setup paths where the destination (channel dir or
+    channel dotenv) may not exist yet — `path.parent` alone is not
+    reliable because `mkdir` running as the controller would create a
+    controller-owned dir, hiding the isolated lineage from a single-
+    level lstat.
+    """
+    cur = path
+    # Avoid an infinite loop on filesystem root.
+    while True:
+        try:
+            if cur.exists():
+                return _isolated_workdir_owner(cur)
+        except OSError:
+            pass
+        parent = cur.parent
+        if parent == cur:
+            return None
+        cur = parent
+
+
+def _isolation_aware_mkdir(path: Path) -> None:
+    """`mkdir -p` with isolation awareness. If `path` does not exist and
+    its nearest existing ancestor is owned by an isolated
+    `agent-bridge-<slug>` UID, create the missing components as that
+    UID via `sudo -n -u <owner> bash -c 'umask 0077; mkdir -p "$1"'`.
+    Otherwise falls back to `Path.mkdir(parents=True, exist_ok=True)`.
+
+    The umask=0077 ensures the new dir lands at mode 0700 owned by the
+    isolated UID, mirroring the v0700/0750 mode the isolation-prepare
+    flow uses for precreated channel state dirs.
+    """
+    if path.exists():
+        return
+    owner = _resolve_isolated_owner_for_path(path)
+    if owner is None:
+        path.mkdir(parents=True, exist_ok=True)
+        return
+    script = (
+        'set -e\n'
+        'umask 0077\n'
+        'mkdir -p "$1"\n'
+        'exit 0\n'
+    )
+    full = [
+        "sudo", "-n", "-u", owner, "bash", "-c", script,
+        "bridge-isolation", str(path),
+    ]
+    try:
+        proc = subprocess.run(
+            full, check=False, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        raise SetupError(
+            f"sudo not available; cannot mkdir {path} as isolated user {owner}"
+        )
+    if proc.returncode != 0:
+        raise SetupError(
+            f"isolation-aware mkdir {path} as {owner} failed "
+            f"(rc={proc.returncode}): {proc.stderr.strip() or '(no stderr)'}"
+        )
 
 
 def _sudo_run_as(os_user: str, *cmd: str) -> subprocess.CompletedProcess[str]:
@@ -1007,9 +1186,9 @@ def cmd_discord(args: argparse.Namespace) -> int:
             print_result(result)
             return 0
 
-        discord_dir.mkdir(parents=True, exist_ok=True)
-        save_text(inspected["env_path"], f"DISCORD_BOT_TOKEN={token}\n")
-        save_json(inspected["access_path"], access_doc)
+        _isolation_aware_mkdir(discord_dir)
+        _isolation_aware_save_text(inspected["env_path"], f"DISCORD_BOT_TOKEN={token}\n")
+        _isolation_aware_save_json(inspected["access_path"], access_doc)
         result["write_status"] = "ok"
 
         if args.skip_validate:
@@ -1135,9 +1314,9 @@ def cmd_telegram(args: argparse.Namespace) -> int:
             print_telegram_result(result)
             return 0
 
-        telegram_dir.mkdir(parents=True, exist_ok=True)
-        save_text(inspected["env_path"], f"TELEGRAM_BOT_TOKEN={token}\n")
-        save_json(inspected["access_path"], access_doc)
+        _isolation_aware_mkdir(telegram_dir)
+        _isolation_aware_save_text(inspected["env_path"], f"TELEGRAM_BOT_TOKEN={token}\n")
+        _isolation_aware_save_json(inspected["access_path"], access_doc)
         result["write_status"] = "ok"
 
         if args.skip_validate:
@@ -1328,7 +1507,7 @@ def cmd_teams(args: argparse.Namespace) -> int:
             print_teams_result(result)
             return 0
 
-        teams_dir.mkdir(parents=True, exist_ok=True)
+        _isolation_aware_mkdir(teams_dir)
         env_lines = [
             f"TEAMS_APP_ID={app_id}",
             f"TEAMS_APP_PASSWORD={app_password}",
@@ -1339,8 +1518,8 @@ def cmd_teams(args: argparse.Namespace) -> int:
             env_lines.append(f"TEAMS_TENANT_ID={tenant_id}")
         if service_url:
             env_lines.append(f"TEAMS_SERVICE_URL={service_url}")
-        save_text(inspected["env_path"], "\n".join(env_lines) + "\n")
-        save_json(inspected["access_path"], access_doc)
+        _isolation_aware_save_text(inspected["env_path"], "\n".join(env_lines) + "\n")
+        _isolation_aware_save_json(inspected["access_path"], access_doc)
         credential_validation = {"status": "skipped"}
         if not args.skip_validate:
             credential_validation = validate_teams_credentials(app_id, app_password, tenant_id)
@@ -1380,7 +1559,7 @@ def cmd_teams(args: argparse.Namespace) -> int:
         validation_state["status"] = summarize_teams_validation(credential_validation, endpoint_probe)
         validation_state["messaging_endpoint"] = messaging_endpoint
         state_doc["validation"] = validation_state
-        save_json(inspected["state_path"], state_doc)
+        _isolation_aware_save_json(inspected["state_path"], state_doc)
         result["write_status"] = "ok"
         result["validation"] = {
             "status": validation_state["status"],
@@ -1582,10 +1761,10 @@ def cmd_mattermost(args: argparse.Namespace) -> int:
             print_mattermost_result(result)
             return 0
 
-        mattermost_dir.mkdir(parents=True, exist_ok=True)
-        save_text(env_path, env_text)
-        save_json(access_path, access_doc)
-        save_json(mcp_path, mcp_doc)
+        _isolation_aware_mkdir(mattermost_dir)
+        _isolation_aware_save_text(env_path, env_text)
+        _isolation_aware_save_json(access_path, access_doc)
+        _isolation_aware_save_json(mcp_path, mcp_doc)
         result["write_status"] = "ok"
 
         if args.skip_validate:
