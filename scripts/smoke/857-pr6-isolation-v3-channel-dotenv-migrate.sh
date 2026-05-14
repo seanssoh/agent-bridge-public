@@ -116,14 +116,18 @@ install_agent_mocks() {
       printf '%s\n' '$agent_name'
     }
   "
-  # Mock bridge_die to be non-fatal in the smoke (so a `bridge_die`
-  # call from invalid args returns a controllable rc instead of `exit
-  # 1` torpedoing the whole script). The under-test paths don't rely
-  # on side effects of the message; smoke asserts on rc instead.
+  # Mock bridge_die to mirror production semantics — bridge_die in
+  # `lib/bridge-core.sh` exits the shell, so the CLI under test assumes
+  # it never returns. Using `return 1` here would let the CLI fall
+  # through past the eligibility gate; A7.2 specifically depends on
+  # the subshell exiting non-zero when --agent rejects an unknown
+  # name. We run inside `out="$(...)"` subshells, so `exit 1` here
+  # only terminates the captured subshell — outer `|| rc=$?` collects
+  # the rc cleanly.
   # shellcheck disable=SC2329
   bridge_die() {
     printf '[v3-smoke] bridge_die: %s\n' "$*" >&2
-    return 1
+    exit 1
   }
 }
 
@@ -132,8 +136,9 @@ install_empty_roster_mocks() {
   bridge_isolation_v2_reapply_eligible_agents() { :; }
   # shellcheck disable=SC2329
   bridge_agent_isolation_mode() { printf ''; }
+  # Mirror production bridge_die semantics; see install_agent_mocks above.
   # shellcheck disable=SC2329
-  bridge_die() { printf '[v3-smoke] bridge_die: %s\n' "$*" >&2; return 1; }
+  bridge_die() { printf '[v3-smoke] bridge_die: %s\n' "$*" >&2; exit 1; }
 }
 
 # Write a fixture file with a single line of content. `printf` (NOT
