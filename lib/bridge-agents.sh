@@ -4738,7 +4738,10 @@ bridge_agent_channel_diagnostics_tsv() {
     plugin_enabled="n/a"
     if [[ "$item" == plugin:* ]]; then
       plugin_spec="${item#plugin:}"
-      plugin_status="$(bridge_claude_plugin_status "$plugin_spec")"
+      # #852: thread the agent through so the status probe can trust the
+      # isolation-aware short-circuit instead of false-failing on os.access
+      # across the isolation boundary.
+      plugin_status="$(bridge_claude_plugin_status "$plugin_spec" "$agent")"
       case "$plugin_status" in
         enabled)
           plugin_installed="yes"
@@ -5771,9 +5774,16 @@ bridge_agent_channel_status() {
 
 bridge_claude_plugin_status() {
   local plugin_spec="$1"
+  # #852 controller-blind plugin trust: optional agent id lets isolation-
+  # aware callers gate the controller-side filesystem probe. Existing
+  # single-arg callers (and the BRIDGE_CLAUDE_INSTALLED_PLUGINS_FILE test
+  # path) keep their previous behavior — only the isolation-trust early
+  # return below changes when this arg is non-empty.
+  local agent="${2-}"
   local registry="${BRIDGE_CLAUDE_INSTALLED_PLUGINS_FILE:-}"
   local default_manifest=""
   local manifest_owner=""
+  local manifest_has_spec=""
   local output=""
 
   if [[ -n "$registry" && -f "$registry" ]]; then
@@ -5797,6 +5807,33 @@ PY
     return 0
   fi
 
+  # #852 controller-blind plugin trust: when an isolated agent declares
+  # a third-party marketplace plugin, the controller's HOME's
+  # installed_plugins.json holds the spec but the entry's installPath
+  # points into the isolated UID's mode-700 home. The os.access probe
+  # below runs as the controller UID, fails to traverse the isolated
+  # home, and false-reports "missing" — triggering a redundant
+  # `claude plugin install` that fails on the controller's own
+  # marketplace drift (#853). Skip the filesystem probe entirely when
+  # the agent is linux-user-isolated: the manifest's key set is the
+  # source of truth (written by bridge_write_isolated_installed_plugins_
+  # manifest at isolation-prepare time). The legacy single-arg callers
+  # (no agent in scope) and the existing root-owned isolated-side
+  # short-circuit below remain in effect.
+  default_manifest="${HOME:-}/.claude/plugins/installed_plugins.json"
+  if [[ -n "$agent" && -n "${HOME:-}" && -f "$default_manifest" ]]; then
+    if bridge_agent_linux_user_isolation_requested "$agent"; then
+      bridge_require_python
+      manifest_has_spec="$(python3 \
+        "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/claude-plugin-manifest-has-spec.py" \
+        "$default_manifest" "$plugin_spec" 2>/dev/null || printf 'absent')"
+      if [[ "$manifest_has_spec" == "present" ]]; then
+        printf '%s' "enabled"
+        return 0
+      fi
+    fi
+  fi
+
   # #346 isolate: when bridge-run.sh executes under an isolated linux-user
   # UID and the per-UID installed_plugins.json is root-owned, that file
   # was written by bridge_write_isolated_installed_plugins_manifest as the
@@ -5807,7 +5844,6 @@ PY
   # respawn loop. Controller (non-root) UIDs do not match the
   # owner==root guard, so the existing claude-plugin-list fallback
   # remains in effect for the controller side.
-  default_manifest="${HOME:-}/.claude/plugins/installed_plugins.json"
   if [[ -n "${HOME:-}" && "$(id -u 2>/dev/null || echo 0)" != "0" && -f "$default_manifest" ]]; then
     manifest_owner="$(stat -c '%u' "$default_manifest" 2>/dev/null || echo -1)"
     if [[ "$manifest_owner" == "0" ]]; then
@@ -5918,13 +5954,82 @@ bridge_force_refresh_claude_marketplace() {
   claude plugin marketplace add "$source" >/dev/null
 }
 
+# #853 controller-side marketplace silent-drift self-heal. Before
+# `claude plugin install <plugin>@<marketplace>` runs for an isolated
+# agent, verify the controller's live `claude plugin marketplace list`
+# still enumerates the marketplace. If it does not but the controller's
+# known_marketplaces.json declares a github source for it, run
+# `claude plugin marketplace add <repo>` inline so the subsequent
+# install resolves the spec instead of failing with `Plugin "<name>"
+# not found in marketplace "<mkt>"`.
+#
+# Returns 0 when the marketplace is present (already, or after a
+# successful re-add). Returns non-zero when the self-heal could not
+# proceed (no claude binary, marketplace not in known_marketplaces.json,
+# no github repo to add from, or the add command failed). Callers
+# treat non-zero as "degrade to the existing legacy install attempt and
+# warn loudly" — never `bridge_die` here, the install path retains its
+# own error handling.
+#
+# Gated on `bridge_agent_linux_user_isolation_requested` because non-
+# isolated installs already work without this step: the controller is
+# both the marketplace enumerator and the install consumer, so the
+# `claude plugin install` retry-after-refresh path that already exists
+# in bridge_ensure_claude_plugin_enabled is sufficient. The gap this
+# helper closes is the isolated-agent case where the controller does
+# the install but its marketplace state has silently drifted away from
+# the row it once added.
+bridge_claude_marketplace_ensure_present_for_isolated() {
+  local marketplace="$1"
+  local agent="${2-}"
+  local catalog=""
+  local repo=""
+  local list_output=""
+
+  [[ -n "$marketplace" ]] || return 1
+  [[ -n "$agent" ]] || return 1
+  bridge_agent_linux_user_isolation_requested "$agent" || return 1
+  command -v claude >/dev/null 2>&1 || return 1
+
+  list_output="$(claude plugin marketplace list 2>/dev/null || true)"
+  # `claude plugin marketplace list` formats each row as a header line
+  # followed by a `Source:` / `Path:` block. Use a word-boundary grep so
+  # a substring match (e.g. "foo-bar" matching "foo-bar-baz") cannot
+  # false-positive — the marketplace id is ASCII-safe per upstream
+  # validation rules.
+  if printf '%s\n' "$list_output" | grep -Eq "(^|[[:space:]])${marketplace}([[:space:]]|\$)"; then
+    return 0
+  fi
+
+  catalog="${HOME:-}/.claude/plugins/known_marketplaces.json"
+  [[ -f "$catalog" ]] || return 1
+
+  bridge_require_python
+  repo="$(python3 \
+    "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/claude-known-marketplaces-extract-repo.py" \
+    "$catalog" "$marketplace" 2>/dev/null || printf '')"
+  [[ -n "$repo" ]] || return 1
+
+  bridge_info "[info] Re-adding drifted Claude plugin marketplace: $marketplace ($repo)"
+  if ! claude plugin marketplace add "$repo" >/dev/null 2>&1; then
+    bridge_warn "Failed to re-add Claude plugin marketplace '$marketplace' (repo=$repo); install will proceed and may fail loudly."
+    return 1
+  fi
+  return 0
+}
+
 bridge_ensure_claude_plugin_enabled() {
   local plugin_spec="$1"
+  # #852: optional agent id lets the controller-side status probe trust
+  # the isolated UID's per-agent installed_plugins.json instead of
+  # crossing the isolation boundary with os.access. Existing
+  # single-arg callers continue to work.
+  local agent="${2-}"
   local status=""
   local output=""
   local marketplace=""
 
-  status="$(bridge_claude_plugin_status "$plugin_spec")"
+  status="$(bridge_claude_plugin_status "$plugin_spec" "$agent")"
   case "$status" in
     enabled)
       bridge_info "[info] Claude plugin ready: $plugin_spec"
@@ -5941,9 +6046,24 @@ bridge_ensure_claude_plugin_enabled() {
       if [[ -n "${BRIDGE_CLAUDE_INSTALLED_PLUGINS_FILE:-}" ]]; then
         bridge_die "Claude plugin registry is missing '$plugin_spec' in test mode."
       fi
+      # #853: self-heal a silently-drifted controller marketplace before
+      # the install shell-out. Non-zero return = "could not self-heal,
+      # proceed with install as before"; the existing
+      # bridge_force_refresh_claude_marketplace retry path below still
+      # catches the directory-source agent-bridge marketplace case.
+      marketplace="$(bridge_claude_plugin_marketplace "$plugin_spec")"
+      if [[ -n "$marketplace" && -n "$agent" ]]; then
+        # codex r1 (#858): drop the stdout/stderr suppression so the
+        # helper's own bridge_warn on `claude plugin marketplace add`
+        # failure surfaces to the operator. `|| true` is retained
+        # because the caller intentionally continues into the legacy
+        # install path on any non-zero rc — the helper documents that
+        # contract in its banner comment.
+        bridge_claude_marketplace_ensure_present_for_isolated "$marketplace" "$agent" \
+          || true
+      fi
       bridge_info "[info] Installing Claude plugin: $plugin_spec"
       if ! output="$(claude plugin install --scope user "$plugin_spec" 2>&1)"; then
-        marketplace="$(bridge_claude_plugin_marketplace "$plugin_spec")"
         if bridge_claude_plugin_install_missing_from_marketplace "$output" && bridge_force_refresh_claude_marketplace "$marketplace"; then
           bridge_info "[info] Retrying Claude plugin install after marketplace refresh: $plugin_spec"
           claude plugin install --scope user "$plugin_spec" >/dev/null
@@ -5958,12 +6078,17 @@ bridge_ensure_claude_plugin_enabled() {
       ;;
   esac
 
-  status="$(bridge_claude_plugin_status "$plugin_spec")"
+  status="$(bridge_claude_plugin_status "$plugin_spec" "$agent")"
   [[ "$status" == "enabled" ]] || bridge_die "Claude plugin '$plugin_spec' is not enabled after install/setup (status=$status). Run: claude plugin install --scope user $plugin_spec"
 }
 
 bridge_claude_channel_plugins_ready_for_csv() {
   local channels="$1"
+  # #852: optional agent id threads through to the status probe so the
+  # readiness check trusts the isolation-aware short-circuit instead of
+  # false-failing on cross-boundary os.access. Single-arg callers keep
+  # the legacy behavior.
+  local agent="${2-}"
   local item=""
   local plugin_spec=""
   local status=""
@@ -5976,7 +6101,7 @@ bridge_claude_channel_plugins_ready_for_csv() {
     item="$(bridge_trim_whitespace "$item")"
     [[ "$item" == plugin:* ]] || continue
     plugin_spec="${item#plugin:}"
-    status="$(bridge_claude_plugin_status "$plugin_spec")"
+    status="$(bridge_claude_plugin_status "$plugin_spec" "$agent")"
     [[ "$status" == "enabled" ]] || return 1
   done
 
@@ -5990,7 +6115,7 @@ bridge_agent_channel_setup_complete() {
   [[ "$(bridge_agent_channel_status "$agent")" == "ok" || "$(bridge_agent_channel_status "$agent")" == "-" ]] || return 1
   [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 0
   plugins="$(bridge_merge_channels_csv "$(bridge_agent_required_launch_channels_csv "$agent")" "$(bridge_agent_required_dev_channels_csv "$agent")")"
-  bridge_claude_channel_plugins_ready_for_csv "$plugins"
+  bridge_claude_channel_plugins_ready_for_csv "$plugins" "$agent"
 }
 
 bridge_ensure_agent_bridge_claude_marketplace() {
@@ -6010,6 +6135,14 @@ bridge_ensure_agent_bridge_claude_marketplace() {
 
 bridge_ensure_claude_channel_plugins_for_csv() {
   local channels="$1"
+  # #852/#853: optional agent id threads through to
+  # bridge_ensure_claude_plugin_enabled so the controller-side status
+  # probe can trust the isolated manifest and the marketplace self-heal
+  # can gate on isolation. Existing single-arg callers (none in the
+  # tree at time of fix, but the signature stays back-compatible)
+  # continue to work — when agent is empty, the downstream calls take
+  # the pre-fix code path.
+  local agent="${2-}"
   local item=""
   local plugin_spec=""
   local -a items=()
@@ -6024,7 +6157,7 @@ bridge_ensure_claude_channel_plugins_for_csv() {
     if [[ "$plugin_spec" == *@agent-bridge ]]; then
       bridge_ensure_agent_bridge_claude_marketplace
     fi
-    bridge_ensure_claude_plugin_enabled "$plugin_spec"
+    bridge_ensure_claude_plugin_enabled "$plugin_spec" "$agent"
   done
 }
 
@@ -6032,14 +6165,14 @@ bridge_ensure_claude_channel_plugins() {
   local agent="$1"
 
   [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 0
-  bridge_ensure_claude_channel_plugins_for_csv "$(bridge_agent_channels_csv "$agent")"
+  bridge_ensure_claude_channel_plugins_for_csv "$(bridge_agent_channels_csv "$agent")" "$agent"
 }
 
 bridge_ensure_claude_launch_channel_plugins() {
   local agent="$1"
 
   [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 0
-  bridge_ensure_claude_channel_plugins_for_csv "$(bridge_agent_effective_launch_plugin_channels_csv "$agent")"
+  bridge_ensure_claude_channel_plugins_for_csv "$(bridge_agent_effective_launch_plugin_channels_csv "$agent")" "$agent"
 }
 
 bridge_agent_notify_kind() {
