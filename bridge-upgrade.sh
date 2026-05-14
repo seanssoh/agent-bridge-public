@@ -548,9 +548,11 @@ bridge_upgrade_reconcile_agent_restart_recovery() {
     source "$source_root/bridge-lib.sh"
     bridge_load_roster
 
-    # Tab-separated read inside this -lc body: ANSI-C $'tab' is awkward to
-    # embed in a single-quoted -lc heredoc, so materialise the tab into a
-    # variable. printf is portable across the bash versions we support.
+    # Tab-separated read inside this -lc body: the ANSI-C tab escape
+    # sequence is awkward to embed in a single-quoted -lc heredoc
+    # because the apostrophes terminate the outer quote, so we
+    # materialise the tab into a variable. printf is portable across
+    # the bash versions we support.
     TAB="$(printf "\t")"
 
     # Collect the agents that need a recovery probe up front so the
