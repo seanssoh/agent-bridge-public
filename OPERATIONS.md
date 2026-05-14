@@ -566,7 +566,7 @@ to override that path. To disable the cron on a given install, run
 
 | Variable | Purpose |
 | --- | --- |
-| `BRIDGE_PICKER_SWEEP_ENABLED` | Set to `1` to enable the sweep. Default `0` (no-op). |
+| `BRIDGE_PICKER_SWEEP_ENABLED` | Tri-state runtime gate. Unset on `host_profile=dev`: manual runs default-skip (hint emitted on stderr). Unset on any other profile (or no host-profile file): runs by default. Set to `1`: always runs regardless of profile. Set to `0`: always skips. The cron payload registered by `bridge-init.sh` and by the upgrade backfill always sets `=1`, so cron-fired runs are not subject to this default-skip — only ad-hoc manual invocations are. |
 | `BRIDGE_PICKER_SWEEP_SELF` | Agent name to skip when scanning. Set this to the agent that *runs* the sweep so its own pane (which often contains picker text in PR bodies, docs, or logs) is not auto-Entered. Empty = no self-skip. |
 | `BRIDGE_PICKER_SWEEP_NOTIFY` | Admin agent ID. When non-empty, picker-sweep enqueues a queue task summarising auto-unstick events. Empty = log-only. |
 

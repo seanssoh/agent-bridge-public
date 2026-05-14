@@ -276,6 +276,22 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# R6: bridge-upgrade.sh contains the picker-sweep cron backfill step
+#     (review #2110 finding 1 regression trap). The init path only registers
+#     on fresh install — without a backfill in the upgrade path, existing
+#     host_profile=dev installs upgrading into this version stay in the
+#     original #833 state. Verify the upgrade script references the helper
+#     so the backfill exists; this is a lightweight presence check that
+#     traps a future refactor that drops the backfill.
+# ---------------------------------------------------------------------------
+step "R6: bridge-upgrade.sh backfills picker-sweep cron on upgrade"
+if grep -q "bridge_init_register_default_picker_sweep" "$ROOT_DIR/bridge-upgrade.sh"; then
+  ok
+else
+  err "bridge-upgrade.sh does not reference bridge_init_register_default_picker_sweep — backfill missing"
+fi
+
+# ---------------------------------------------------------------------------
 TOTAL=$((PASS + FAIL))
 printf '\n# Issue #833 picker-sweep registration suite: %s/%s passed\n' "$PASS" "$TOTAL"
 if [[ "$FAIL" -gt 0 ]]; then

@@ -1595,6 +1595,35 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
     fi
   fi
 
+  # Issue #833 r2: backfill the picker-sweep cron on every upgrade.
+  # bridge-init.sh registers it on fresh install, but existing installs that
+  # upgraded into this version (especially host_profile=dev, the v0.11.0
+  # prompt-guard workaround path) never get the cron and stay in the
+  # original #833 state. bridge_init_register_default_picker_sweep is itself
+  # idempotent (skips when the cron entry already exists), so re-running on
+  # every upgrade is safe. Tolerant on failure: warn and continue so an
+  # unexpected error never blocks the upgrade.
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[bridge-upgrade] plan: backfill picker-sweep cron (idempotent; closes #833 for upgraded installs)" >&2
+  else
+    _picker_sweep_output=""
+    if ! _picker_sweep_output="$(
+      bridge_upgrade_with_target_env "$TARGET_ROOT" "$BRIDGE_BASH_BIN" -lc '
+        set -euo pipefail
+        SCRIPT_DIR="$1"
+        source "$SCRIPT_DIR/bridge-lib.sh"
+        source "$SCRIPT_DIR/lib/bridge-init-default-crons.sh"
+        bridge_load_roster
+        bridge_init_register_default_picker_sweep
+      ' -- "$SOURCE_ROOT" 2>&1
+    )"; then
+      echo "[bridge-upgrade] WARN: picker-sweep cron backfill failed: $_picker_sweep_output" >&2
+      _upgrade_partial_failures+=("picker_sweep_cron_backfill")
+    else
+      [[ -n "$_picker_sweep_output" ]] && printf '%s\n' "$_picker_sweep_output" >&2
+    fi
+  fi
+
   # Also propagate per-agent doc sync (bridge-docs.py apply) so
   # MEMORY-SCHEMA.md / SKILLS.md / CLAUDE.md managed blocks track the
   # canonical runtime on every upgrade. Before 2026-04-19 this hook was
