@@ -3588,6 +3588,95 @@ bridge_daemon_is_running() {
   [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
 }
 
+# Issue #815 Wave C: tick-freshness as a first-class health signal.
+#
+# Read state/daemon.heartbeat and return its age in whole seconds on
+# stdout. Returns 0 (success) when the heartbeat exists and parses as a
+# non-negative epoch integer; prints nothing and returns 1 when the file
+# is missing, empty, or unparseable. The heartbeat is written as a bare
+# epoch integer (date +%s) by cmd_run; for compatibility with hosts that
+# might have an older ISO-formatted heartbeat, an ISO-string fallback is
+# attempted via `date -d` / `date -j -f`.
+bridge_daemon_heartbeat_age_seconds() {
+  local heartbeat_file="$BRIDGE_STATE_DIR/daemon.heartbeat"
+  local raw=""
+  local epoch=""
+  local now_epoch
+
+  [[ -f "$heartbeat_file" ]] || return 1
+  raw="$(<"$heartbeat_file")" || return 1
+  # Trim surrounding whitespace and newlines.
+  raw="${raw//[$'\t\r\n ']/}"
+  [[ -n "$raw" ]] || return 1
+
+  if [[ "$raw" =~ ^[0-9]+$ ]]; then
+    epoch="$raw"
+  else
+    # ISO fallback. GNU date (Linux) accepts -d; BSD date (macOS) needs
+    # -j -f. Both are silenced; on parse failure epoch stays empty.
+    epoch="$(date -d "$raw" +%s 2>/dev/null || true)"
+    if [[ -z "$epoch" ]]; then
+      epoch="$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$raw" +%s 2>/dev/null || true)"
+    fi
+    [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
+  fi
+
+  now_epoch="$(date +%s)"
+  local age=$(( now_epoch - epoch ))
+  (( age < 0 )) && age=0
+  printf '%s' "$age"
+  return 0
+}
+
+# Issue #815 Wave C: derived health signal from pid liveness + heartbeat
+# freshness. Writes three lines to stdout in `key=value` form:
+#
+#   tick_age_seconds=<int or empty>
+#   tick_fresh=<true|false>
+#   health=<ok|silent|down>
+#
+# Threshold: BRIDGE_DAEMON_TICK_FRESH_SECONDS (default 120; the daemon
+# emits daemon_tick every 60s, so 2× margin = stale after 2 missed ticks).
+#
+# Health derivation:
+#   - ok      : pid alive AND tick_fresh
+#   - silent  : pid alive AND tick stale (or missing)  — repair condition
+#   - down    : pid missing or not alive
+#
+# Tests can capture this directly to validate the signal independently
+# of the cmd_status text shape.
+bridge_daemon_health_signal() {
+  local pid=""
+  local pid_alive="false"
+  local age=""
+  local fresh="false"
+  local health="down"
+  local threshold="${BRIDGE_DAEMON_TICK_FRESH_SECONDS:-120}"
+  [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=120
+
+  pid="$(bridge_daemon_pid 2>/dev/null || true)"
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    pid_alive="true"
+  fi
+
+  age="$(bridge_daemon_heartbeat_age_seconds 2>/dev/null || true)"
+  if [[ "$age" =~ ^[0-9]+$ ]] && (( age <= threshold )); then
+    fresh="true"
+  fi
+
+  if [[ "$pid_alive" == "true" ]]; then
+    if [[ "$fresh" == "true" ]]; then
+      health="ok"
+    else
+      health="silent"
+    fi
+  fi
+
+  printf 'tick_age_seconds=%s\n' "$age"
+  printf 'tick_fresh=%s\n' "$fresh"
+  printf 'health=%s\n' "$health"
+}
+
 bridge_daemon_all_pids() {
   # Issue #269: cmd_stop only killed the pid-file PID, so any earlier daemon
   # that lost its pid-file (e.g. install moved paths, orphan re-parented to
