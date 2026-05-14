@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# bridge-init-default-crons.sh — host_profile=server default cron registrations.
+# bridge-init-default-crons.sh — fresh-install default cron registrations.
 #
-# Track D follow-up to #713 / #809: a fresh server install should not need an
-# extra step to enable the essentials. picker-sweep is the first essential we
-# auto-register here. The helper is invoked from bridge-init.sh AFTER
-# bridge_host_profile_run returns "server" (or non-interactive default-server).
-# It is intentionally idempotent: re-running init must not double-register.
+# Track D follow-up to #713 / #809, follow-on to #833: a fresh install (server
+# OR dev) should not need an extra step to enable the essentials. picker-sweep
+# is the first essential we auto-register here. The helper is invoked from
+# bridge-init.sh AFTER bridge_host_profile_run returns. Registration is
+# unconditional with respect to host_profile — the registered cron payload
+# sets BRIDGE_PICKER_SWEEP_ENABLED=1, which overrides the runtime
+# host_profile=dev default-skip in scripts/picker-sweep.sh. Operators who
+# want the sweep disabled can `agb cron update picker-sweep --disable` after
+# init. The helper is intentionally idempotent: re-running init must not
+# double-register.
 #
 # Future essentials (e.g. additional unstick / hygiene crons) belong here too;
 # keep each registration in its own function so re-runs can be reasoned about

@@ -10509,6 +10509,13 @@ bash "$REPO_ROOT/scripts/test-channel-probe-isolated.sh"
 log "running usage-monitor-isolated regression suite (issue #831)"
 bash "$REPO_ROOT/scripts/test-usage-monitor-isolated.sh"
 
+# Issue #833 — picker-sweep cron registration must fire on every fresh
+# install regardless of host_profile (dev or server). Runtime gating moved
+# into the cron payload's BRIDGE_PICKER_SWEEP_ENABLED=1; the host_profile=dev
+# default-skip now applies to manual runs only.
+log "running picker-sweep-registration regression suite (issue #833)"
+bash "$REPO_ROOT/scripts/test-picker-sweep-registration.sh"
+
 # Issue #541 PR-A — memory-daily payload jsonl-aware migration regression.
 log "running cron-migrate-payloads smoke (issue #541 PR-A)"
 bash "$REPO_ROOT/scripts/smoke/cron-migrate-payloads.sh"

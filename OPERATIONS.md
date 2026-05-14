@@ -553,9 +553,14 @@ tmux-managed agents nobody is watching, this freezes the session indefinitely.
 `scripts/picker-sweep.sh` scans every tmux session, detects a picker that
 matches a closed pattern allow-list, and presses Enter on the default option.
 
-The utility is **opt-in**: it is shipped in the repo but does nothing unless
-both the cron registration *and* the `BRIDGE_PICKER_SWEEP_ENABLED=1` flag are
-present.
+The utility is **auto-registered on every fresh install** (server and dev,
+as of #833): `bridge-init.sh` registers a `*/10 * * * *` bridge-native cron
+whose payload sets `BRIDGE_PICKER_SWEEP_ENABLED=1`, so the sweep runs out of
+the box. Manual invocations (operator running `scripts/picker-sweep.sh` by
+hand, outside the cron payload) still respect the host_profile=dev
+default-skip — set `BRIDGE_PICKER_SWEEP_ENABLED=1` in the calling environment
+to override that path. To disable the cron on a given install, run
+`agb cron update picker-sweep --disable` after init.
 
 ### Required environment
 
