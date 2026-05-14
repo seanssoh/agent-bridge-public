@@ -245,68 +245,25 @@ bridge_normalize_agent_session_id() {
   esac
 }
 
+# Issue #835 Wave A — the previous in-line Python body was read through
+# bash stdin redirection. On Homebrew Bash 5.3.9 that read can wedge in
+# `heredoc_write` when this wrapper is invoked inside a command
+# substitution from an absolute-path-sourced shell — same class that
+# closed #800 / #815 / #827 / #840 for daemon, CLI, status, and
+# session-id hot paths. Moving the body into a real script bypasses the
+# bash read entirely. (Forbidden pattern strings intentionally omitted
+# from this comment so the footgun #11 self-audit grep recipe does not
+# flag a textual mention as a real callsite.)
 bridge_codex_launch_with_hooks() {
   local original="$1"
 
-  python3 - "$original" <<'PY'
-import re
-import shlex
-import sys
-
-original = sys.argv[1]
-match = re.match(r"^(?P<prefix>.*?)(?P<command>codex(?:\s|$).*)$", original)
-if not match:
-    print(original)
-    raise SystemExit(0)
-
-env_prefix = match.group("prefix")
-args = shlex.split(match.group("command"))
-if not args or args[0] != "codex":
-    print(original)
-    raise SystemExit(0)
-
-# v0.8.6 hotfix: this helper now ensures BOTH `codex_hooks` and
-# `fast_mode` are pinned on every codex launch — admin-pair backfill,
-# isolated agent create, v0.7→v0.8 migration, and resume paths all
-# converge through here. Pre-hotfix it only injected `codex_hooks`,
-# so an existing roster with the legacy default launch_cmd (no
-# fast_mode) silently fell off the fast inference path on every
-# wake. The injection is idempotent: if a flag is already present
-# (via `--enable <name>`, `-c features.<name>=true`, or any later
-# `-c features.<name>=...` form) the helper leaves it alone.
-REQUIRED_FEATURES = ("codex_hooks", "fast_mode")
-ARG_TAKING_FLAGS = {
-    "-c", "--enable", "--disable", "--profile", "-p",
-    "--model", "-m", "--cd", "-C",
+  bridge_require_python
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-codex-hooks.py" \
+    "$original"
 }
 
-def has_feature(rest: list[str], feature: str) -> bool:
-    pattern = f"features.{feature}=true"
-    i = 0
-    while i < len(rest):
-        token = rest[i]
-        next_value = rest[i + 1] if i + 1 < len(rest) else None
-        if token == "--enable" and next_value == feature:
-            return True
-        if token == "-c" and next_value is not None and pattern in next_value:
-            return True
-        i += 2 if token in ARG_TAKING_FLAGS and next_value is not None else 1
-    return False
-
-rest = args[1:]
-prefix_pairs: list[str] = []
-for feature in REQUIRED_FEATURES:
-    if not has_feature(rest, feature):
-        prefix_pairs.extend(["-c", f"features.{feature}=true"])
-
-if prefix_pairs:
-    rest = [*prefix_pairs, *rest]
-
-quoted = " ".join(shlex.quote(token) for token in [args[0], *rest])
-print(f"{env_prefix}{quoted}" if env_prefix else quoted)
-PY
-}
-
+# Issue #835 Wave A — body lives in scripts/python-helpers/. See
+# bridge_codex_launch_with_hooks above for the heredoc_write rationale.
 bridge_claude_launch_with_channels() {
   local agent="$1"
   local original="$2"
@@ -319,74 +276,12 @@ bridge_claude_launch_with_channels() {
   fi
 
   bridge_require_python
-  python3 - "$original" "$required" <<'PY'
-import re
-import shlex
-import sys
-
-original, required_csv = sys.argv[1:]
-
-def normalize(raw: str):
-    values = []
-    seen = set()
-    for chunk in raw.split(","):
-        item = chunk.strip()
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        values.append(item)
-    return values
-
-required = normalize(required_csv)
-if not required:
-    print(original)
-    raise SystemExit(0)
-
-match = re.match(r"^(?P<prefix>.*?)(?P<command>claude(?:\s|$).*)$", original)
-if not match:
-    print(original)
-    raise SystemExit(0)
-
-env_prefix = match.group("prefix")
-args = shlex.split(match.group("command"))
-if not args or args[0] != "claude":
-    print(original)
-    raise SystemExit(0)
-
-rest = args[1:]
-existing = []
-filtered = []
-i = 0
-while i < len(rest):
-    token = rest[i]
-    if token == "--channels" and i + 1 < len(rest):
-        existing.extend(normalize(rest[i + 1]))
-        i += 2
-        continue
-    if token.startswith("--channels="):
-        existing.extend(normalize(token.split("=", 1)[1]))
-        i += 1
-        continue
-    filtered.append(token)
-    i += 1
-
-merged = []
-seen = set()
-for item in [*existing, *required]:
-    if item in seen:
-        continue
-    seen.add(item)
-    merged.append(item)
-
-rebuilt = ["claude", *filtered]
-for item in merged:
-    rebuilt.extend(["--channels", item])
-
-quoted = " ".join(shlex.quote(token) for token in rebuilt)
-print(f"{env_prefix}{quoted}" if env_prefix else quoted)
-PY
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-claude-channels.py" \
+    "$original" "$required"
 }
 
+# Issue #835 Wave A — body lives in scripts/python-helpers/. See
+# bridge_codex_launch_with_hooks above for the heredoc_write rationale.
 bridge_claude_launch_with_development_channels() {
   local original="$1"
   local required_csv="${2:-}"
@@ -397,76 +292,15 @@ bridge_claude_launch_with_development_channels() {
   fi
 
   bridge_require_python
-  python3 - "$original" "$required_csv" <<'PY'
-import re
-import shlex
-import sys
-
-original, required_csv = sys.argv[1:]
-
-def normalize(raw: str):
-    values = []
-    seen = set()
-    for chunk in raw.split(","):
-        item = chunk.strip()
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        values.append(item)
-    return values
-
-required = normalize(required_csv)
-if not required:
-    print(original)
-    raise SystemExit(0)
-
-match = re.match(r"^(?P<prefix>.*?)(?P<command>claude(?:\s|$).*)$", original)
-if not match:
-    print(original)
-    raise SystemExit(0)
-
-env_prefix = match.group("prefix")
-args = shlex.split(match.group("command"))
-if not args or args[0] != "claude":
-    print(original)
-    raise SystemExit(0)
-
-rest = args[1:]
-existing = []
-filtered = []
-i = 0
-while i < len(rest):
-    token = rest[i]
-    if token == "--dangerously-load-development-channels":
-        i += 1
-        while i < len(rest) and not rest[i].startswith("-"):
-            existing.extend(normalize(rest[i]))
-            i += 1
-        continue
-    if token.startswith("--dangerously-load-development-channels="):
-        existing.extend(normalize(token.split("=", 1)[1]))
-        i += 1
-        continue
-    filtered.append(token)
-    i += 1
-
-merged = []
-seen = set()
-for item in [*existing, *required]:
-    if item in seen:
-        continue
-    seen.add(item)
-    merged.append(item)
-
-rebuilt = ["claude", *filtered]
-for item in merged:
-    rebuilt.extend(["--dangerously-load-development-channels", item])
-
-quoted = " ".join(shlex.quote(token) for token in rebuilt)
-print(f"{env_prefix}{quoted}" if env_prefix else quoted)
-PY
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-claude-dev-channels.py" \
+    "$original" "$required_csv"
 }
 
+# Issue #835 Wave A — body lives in scripts/python-helpers/. See
+# bridge_codex_launch_with_hooks above for the heredoc_write rationale.
+# (The byte-preserving env_prefix walker and the duplicate-collapse
+# behavior from PR #776 / PR #790 are preserved unchanged inside the
+# helper.)
 bridge_claude_launch_with_channel_state_dirs() {
   local agent="$1"
   local original="$2"
@@ -495,305 +329,8 @@ bridge_claude_launch_with_channel_state_dirs() {
   ms365_dir="$(bridge_agent_ms365_state_dir "$agent")"
 
   bridge_require_python
-  python3 - "$original" "$required" "$discord_dir" "$telegram_dir" "$teams_dir" "$ms365_dir" <<'PY'
-import re
-import shlex
-import sys
-
-original, required_csv, discord_dir, telegram_dir, teams_dir, ms365_dir = sys.argv[1:]
-
-def normalize(raw: str):
-    values = []
-    seen = set()
-    for chunk in raw.split(","):
-        item = chunk.strip()
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        values.append(item)
-    return values
-
-required = normalize(required_csv)
-if not required:
-    print(original)
-    raise SystemExit(0)
-
-match = re.match(r"^(?P<prefix>.*?)(?P<command>claude(?:\s|$).*)$", original)
-if not match:
-    print(original)
-    raise SystemExit(0)
-
-env_prefix = match.group("prefix")
-command = match.group("command")
-assignments = []
-
-if any(item == "plugin:discord" or item.startswith("plugin:discord@") for item in required):
-    assignments.append(("DISCORD_STATE_DIR", discord_dir))
-if any(
-    item == "plugin:telegram"
-    or item.startswith("plugin:telegram@")
-    for item in required
-):
-    assignments.append(("TELEGRAM_STATE_DIR", telegram_dir))
-if any(item == "plugin:teams" or item.startswith("plugin:teams@") for item in required):
-    assignments.append(("TEAMS_STATE_DIR", teams_dir))
-if any(item == "plugin:ms365" or item.startswith("plugin:ms365@") for item in required):
-    assignments.append(("MS365_STATE_DIR", ms365_dir))
-
-# Issue #771 v0.9.6 — operator's R5 diagnostic confirmed PRIMARY fix
-# (v0.9.5 PR #774 `agent_env_regen`) was a false-positive: the regen
-# correctly re-invokes this helper, but the helper's loop SKIPS any
-# assignment whose name (`<NAME>=`) is already present in env_prefix
-# regardless of the value. So a frozen-roster LAUNCH_CMD with stale
-# `TEAMS_STATE_DIR=…/agents/<X>/.teams` (pre-v2 path) is NEVER
-# replaced — the helper sees the name, skips, and the same stale
-# value rides through every restart. Fresh-setup agents (no existing
-# assignment) work correctly because the append branch fires; legacy
-# v0.7→v0.8 isolated agents stay broken indefinitely. v0.9.5
-# orbstack validation only exercised the fresh-setup case.
-#
-# Fix: regex-match the existing assignment for each name and REPLACE
-# its value with the canonical (live-computed) one. Idempotent in
-# the fresh case (regex doesn't match → falls through to append) and
-# correct in the stale case (regex matches → in-place replace).
-# Pattern allows shell-quoted values (single-quoted, double-quoted,
-# or unquoted whitespace-bounded) so it survives roster-side hand
-# edits and `printf '%q'` outputs from prior writers.
-def _skip_dquote(s, i, n):
-    # i points just AFTER opening `"`. Walks to closing `"` while
-    # honoring backslash escapes and nested expansions (`$(…)`, `${…}`,
-    # backticks). Returns index just AFTER the closing `"`.
-    while i < n and s[i] != '"':
-        c = s[i]
-        if c == "\\" and i + 1 < n:
-            i += 2
-        elif c == "$" and i + 1 < n and s[i + 1] == "(":
-            i = _skip_paren_subst(s, i + 2, n)
-        elif c == "$" and i + 1 < n and s[i + 1] == "{":
-            i = _skip_brace_subst(s, i + 2, n)
-        elif c == "`":
-            i = _skip_backtick(s, i + 1, n)
-        else:
-            i += 1
-    if i < n:
-        i += 1
-    return i
-
-
-def _skip_paren_subst(s, i, n):
-    # i points just AFTER opening `$(`. Tracks nested `(` / `)` and
-    # quote-state until depth returns to 0. Returns index just AFTER
-    # the closing `)`. Whitespace and `=` inside a $(…) substitution
-    # MUST NOT split the enclosing token, so the caller treats this
-    # span as opaque. (codex r4 review on PR #776 — Probe 14.)
-    #
-    # r6 codex catch — also honor inner ${…} and `…` so a `)` that
-    # belongs to a nested brace-default like `${UNSET:-) NAME=…}` or
-    # to a backtick-substitution does NOT prematurely close our
-    # paren depth.
-    depth = 1
-    while i < n and depth > 0:
-        c = s[i]
-        if c == "(":
-            depth += 1
-            i += 1
-        elif c == ")":
-            depth -= 1
-            i += 1
-        elif c == "'":
-            i += 1
-            while i < n and s[i] != "'":
-                i += 1
-            if i < n:
-                i += 1
-        elif c == '"':
-            i = _skip_dquote(s, i + 1, n)
-        elif c == "$" and i + 1 < n and s[i + 1] == "(":
-            i = _skip_paren_subst(s, i + 2, n)
-        elif c == "$" and i + 1 < n and s[i + 1] == "{":
-            i = _skip_brace_subst(s, i + 2, n)
-        elif c == "`":
-            i = _skip_backtick(s, i + 1, n)
-        elif c == "\\" and i + 1 < n:
-            i += 2
-        else:
-            i += 1
-    return i
-
-
-def _skip_backtick(s, i, n):
-    # i points just AFTER opening backtick. Walks to next backtick;
-    # legacy backticks don't nest natively (POSIX requires `\\\``
-    # escaping for nesting), so honor backslash escapes only. Inner
-    # ${…} and $(…) are NOT treated as nesting boundaries here — the
-    # next bare backtick (or escaped pair) closes the span — but the
-    # quote-state inside still suppresses any `=` matching at the
-    # outer walker level (we never re-enter the walker until we
-    # return past the closing backtick). (r6 — kept POSIX-conformant.)
-    while i < n and s[i] != "`":
-        if s[i] == "\\" and i + 1 < n:
-            i += 2
-        else:
-            i += 1
-    if i < n:
-        i += 1
-    return i
-
-
-def _skip_brace_subst(s, i, n):
-    # i points just AFTER `${`. Walks to matching `}` honoring nested
-    # braces, quotes, and inner $(…) / `…` substitutions. Param-
-    # expansion defaults can contain whitespace and arbitrary inner
-    # constructs (e.g. `${VAR:-$(echo NAME=fake)}` or
-    # `${VAR:-some `echo X` default}`), so we must not let an inner
-    # space, `}`, or `)` from a nested context split the enclosing
-    # token. (r6 codex catch — symmetry with _skip_paren_subst.)
-    depth = 1
-    while i < n and depth > 0:
-        c = s[i]
-        if c == "{":
-            depth += 1
-            i += 1
-        elif c == "}":
-            depth -= 1
-            i += 1
-        elif c == "'":
-            i += 1
-            while i < n and s[i] != "'":
-                i += 1
-            if i < n:
-                i += 1
-        elif c == '"':
-            i = _skip_dquote(s, i + 1, n)
-        elif c == "$" and i + 1 < n and s[i + 1] == "(":
-            i = _skip_paren_subst(s, i + 2, n)
-        elif c == "$" and i + 1 < n and s[i + 1] == "{":
-            i = _skip_brace_subst(s, i + 2, n)
-        elif c == "`":
-            i = _skip_backtick(s, i + 1, n)
-        elif c == "\\" and i + 1 < n:
-            i += 2
-        else:
-            i += 1
-    return i
-
-
-def _walk_top_level_tokens(s):
-    # Yield (start, end) byte spans of each whitespace-delimited token
-    # in `s`, treating single-quoted, double-quoted, backslash-escaped,
-    # `$(…)`, backtick `…`, and `${…}` spans as opaque (so whitespace
-    # inside any of these does NOT split the enclosing token).
-    # Returning byte spans (not the token string) lets us preserve the
-    # original bytes verbatim — critical for keeping bash expansions
-    # like `$HOME`, `$(date)`, `${VAR:-x}` unquoted in unrelated
-    # env-prefix assignments. (See codex r2/r3/r4 review on PR #776.)
-    i, n = 0, len(s)
-    while i < n:
-        while i < n and s[i] in (" ", "\t"):
-            i += 1
-        if i >= n:
-            return
-        start = i
-        while i < n and s[i] not in (" ", "\t"):
-            c = s[i]
-            if c == "'":
-                i += 1
-                while i < n and s[i] != "'":
-                    i += 1
-                if i < n:
-                    i += 1
-            elif c == '"':
-                i = _skip_dquote(s, i + 1, n)
-            elif c == "$" and i + 1 < n and s[i + 1] == "(":
-                i = _skip_paren_subst(s, i + 2, n)
-            elif c == "$" and i + 1 < n and s[i + 1] == "{":
-                i = _skip_brace_subst(s, i + 2, n)
-            elif c == "`":
-                i = _skip_backtick(s, i + 1, n)
-            elif c == "\\" and i + 1 < n:
-                i += 2
-            else:
-                i += 1
-        yield (start, i)
-
-
-for name, value in assignments:
-    # r4 codex review of #776 — preserve original byte form for tokens
-    # we are NOT replacing. The r3 shlex.split + shlex.quote round-trip
-    # destroyed unquoted shell expansions: `OTHER=$HOME` round-tripped
-    # to `OTHER='$HOME'`, which bash then sees as the literal four-char
-    # string `$HOME` instead of expanding. Walk the original env_prefix
-    # in place, identify only the top-level tokens whose raw byte
-    # prefix is `NAME=`, and substitute their span with the canonical
-    # `NAME=<shlex.quote(value)>`. All other bytes (whitespace runs,
-    # other assignments, their original quoting) pass through verbatim.
-    #
-    # r2 Probe 8 retained: ALL matching occurrences are replaced. Shell
-    # eval is last-definition-wins, so a surviving duplicate after the
-    # first replacement would re-overwrite the canonical value. Falling
-    # through to append fires only when ZERO top-level matches found
-    # (true fresh-setup case).
-    #
-    # r3 Probe 9 retained: quote-aware walker treats whitespace inside
-    # `OTHER="x NAME=/fake"` as belonging to the OTHER token, so the
-    # nested `NAME=/fake` substring is never matched at top level.
-    quoted_value = shlex.quote(value)
-    prefix_form = f"{name}="
-    spans = [
-        (s_, e_)
-        for (s_, e_) in _walk_top_level_tokens(env_prefix)
-        if env_prefix[s_:e_].startswith(prefix_form)
-    ]
-    if spans:
-        # r2 codex catch on PR #790: replace the FIRST matching span
-        # with canonical, drop all subsequent spans entirely. Otherwise
-        # `NAME=/old1 NAME=/old2` produces two canonical entries
-        # (`NAME=/new NAME=/new`) instead of collapsing to a single
-        # final assignment. Even though shell eval is last-wins (so the
-        # value would still be correct), duplicate exported assignments
-        # are a code smell and surface in audit/logs as if multiple
-        # stale values survived.
-        #
-        # r3 codex catch on PR #790: a global `re.sub(r" {2,}", " ", …)`
-        # post-pass would also collapse multi-space runs INSIDE quoted
-        # values elsewhere in env_prefix (e.g. `OTHER="a  b"` would be
-        # mangled to `OTHER="a b"`). Instead, when dropping a duplicate
-        # span, strip ONE leading whitespace character from the gap
-        # between the previous token and the dropped span — this
-        # collapses the dedupe artifact locally without touching any
-        # other whitespace in env_prefix.
-        pieces = []
-        last = 0
-        first = True
-        for s_, e_ in spans:
-            if first:
-                # Keep the full gap before the first matching span,
-                # then emit the canonical assignment.
-                pieces.append(env_prefix[last:s_])
-                pieces.append(f"{name}={quoted_value}")
-                first = False
-            else:
-                # Dropping this duplicate span: also drop ONE leading
-                # whitespace separator (space or tab) from the gap so
-                # the surrounding tokens collapse from "…  …" to "… …".
-                # Local to the drop site — does NOT touch spaces inside
-                # quoted values elsewhere in env_prefix.
-                gap = env_prefix[last:s_]
-                if gap and gap[0] in (" ", "\t"):
-                    gap = gap[1:]
-                pieces.append(gap)
-            last = e_
-        pieces.append(env_prefix[last:])
-        env_prefix = "".join(pieces)
-        if env_prefix and not env_prefix.endswith((" ", "\t")):
-            env_prefix += " "
-    else:
-        if env_prefix and not env_prefix.endswith((" ", "\t")):
-            env_prefix += " "
-        env_prefix += f"{name}={quoted_value} "
-
-print(f"{env_prefix}{command}" if env_prefix else command)
-PY
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-claude-channel-state-dirs.py" \
+    "$original" "$required" "$discord_dir" "$telegram_dir" "$teams_dir" "$ms365_dir"
 }
 
 bridge_build_static_claude_launch_cmd() {
@@ -824,78 +361,17 @@ bridge_build_static_claude_launch_cmd() {
     fi
   fi
 
+  # Issue #835 Wave A — body lives in scripts/python-helpers/. This is
+  # the function the operator's static admin `patch` wedged in on
+  # 2026-05-14 (macOS Bash 5.3.9, `heredoc_write` deadlock during
+  # command-substitution evaluation from an absolute-path-sourced
+  # shell). The helper file is read by Python directly, so the bash
+  # heredoc read is gone. (Forbidden pattern strings intentionally
+  # omitted from this comment so the footgun #11 self-audit grep
+  # recipe does not flag a textual mention as a real callsite.)
   bridge_require_python
-  python3 - "$agent" "$continue_mode" "$session_id" "$continue_fallback" "$fallback" <<'PY'
-import re
-import shlex
-import sys
-
-agent, continue_mode, session_id, continue_fallback, original = sys.argv[1:]
-
-
-def repair_false_command(value: str) -> str:
-    try:
-        tokens = shlex.split(value)
-    except ValueError:
-        return value
-    if not tokens:
-        return value
-    idx = 0
-    while idx < len(tokens):
-        key = tokens[idx].split("=", 1)[0]
-        if "=" not in tokens[idx] or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key) or tokens[idx].startswith("-"):
-            break
-        idx += 1
-    if idx < len(tokens) and tokens[idx] == "false":
-        tokens[idx] = "claude"
-        return " ".join(shlex.quote(token) for token in tokens)
-    return value
-
-
-original = repair_false_command(original)
-match = re.match(r"^(?P<prefix>.*?)(?P<command>claude(?:\s|$).*)$", original)
-if not match:
-    print(original)
-    raise SystemExit(0)
-
-env_prefix = match.group("prefix")
-args = shlex.split(match.group("command"))
-if not args or args[0] != "claude":
-    print(original)
-    raise SystemExit(0)
-
-rest = args[1:]
-extras = []
-j = 0
-while j < len(rest):
-    token = rest[j]
-    if token in {"-c", "--continue", "--dangerously-skip-permissions"}:
-        j += 1
-        continue
-    if token in {"--resume", "--name"}:
-        j += 2 if j + 1 < len(rest) else 1
-        continue
-    extras.append(token)
-    if token.startswith("--") and j + 1 < len(rest) and not rest[j + 1].startswith("-"):
-        extras.append(rest[j + 1])
-        j += 2
-        continue
-    j += 1
-
-base = ["claude"]
-if continue_mode == "1" and session_id:
-    base.extend(["--resume", session_id])
-elif continue_mode == "1" and continue_fallback == "1":
-    base.append("--continue")
-base.extend(["--dangerously-skip-permissions", "--name", agent])
-base.extend(extras)
-
-quoted = " ".join(shlex.quote(token) for token in base)
-if env_prefix:
-    print(f"{env_prefix}{quoted}")
-else:
-    print(quoted)
-PY
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-static-claude-build.py" \
+    "$agent" "$continue_mode" "$session_id" "$continue_fallback" "$fallback"
 }
 
 bridge_build_safe_claude_launch_cmd() {
@@ -914,89 +390,12 @@ bridge_build_safe_claude_launch_cmd() {
     session_id="$(bridge_claude_resume_session_id_for_agent "$agent" 2>/dev/null || true)"
   fi
 
+  # Issue #835 Wave A — body lives in scripts/python-helpers/. See
+  # bridge_build_static_claude_launch_cmd above for the heredoc_write
+  # rationale.
   bridge_require_python
-  python3 - "$agent" "$continue_mode" "$session_id" "$fallback" <<'PY'
-import re
-import shlex
-import sys
-
-agent, continue_mode, session_id, original = sys.argv[1:]
-
-
-def repair_false_command(value: str) -> str:
-    try:
-        tokens = shlex.split(value)
-    except ValueError:
-        return value
-    if not tokens:
-        return value
-    idx = 0
-    while idx < len(tokens):
-        key = tokens[idx].split("=", 1)[0]
-        if "=" not in tokens[idx] or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key) or tokens[idx].startswith("-"):
-            break
-        idx += 1
-    if idx < len(tokens) and tokens[idx] == "false":
-        tokens[idx] = "claude"
-        return " ".join(shlex.quote(token) for token in tokens)
-    return value
-
-
-original = repair_false_command(original)
-match = re.match(r"^(?P<prefix>.*?)(?P<command>claude(?:\s|$).*)$", original)
-if not match:
-    print(original)
-    raise SystemExit(0)
-
-env_prefix = match.group("prefix")
-args = shlex.split(match.group("command"))
-if not args or args[0] != "claude":
-    print(original)
-    raise SystemExit(0)
-
-rest = args[1:]
-extras = []
-i = 0
-while i < len(rest):
-    token = rest[i]
-    if token in {"-c", "--continue", "--dangerously-skip-permissions"}:
-        i += 1
-        continue
-    if token in {"--resume", "--name", "--channels"}:
-        i += 2 if i + 1 < len(rest) else 1
-        continue
-    if token.startswith("--channels="):
-        i += 1
-        continue
-    if token == "--dangerously-load-development-channels":
-        i += 1
-        while i < len(rest) and not rest[i].startswith("-"):
-            i += 1
-        continue
-    if token.startswith("--dangerously-load-development-channels="):
-        i += 1
-        continue
-    extras.append(token)
-    if token.startswith("--") and i + 1 < len(rest) and not rest[i + 1].startswith("-"):
-        extras.append(rest[i + 1])
-        i += 2
-        continue
-    i += 1
-
-base = ["claude"]
-if continue_mode == "1" and session_id:
-    base.extend(["--resume", session_id])
-elif continue_mode == "1":
-    base.append("--continue")
-base.extend(["--dangerously-skip-permissions", "--name", agent])
-base.extend(extras)
-
-quoted = " ".join(shlex.quote(token) for token in base)
-if env_prefix:
-    print(f"{env_prefix}{quoted}")
-else:
-    print(quoted)
-PY
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-safe-claude-build.py" \
+    "$agent" "$continue_mode" "$session_id" "$fallback"
 }
 
 bridge_safe_mode_resume_mode() {
