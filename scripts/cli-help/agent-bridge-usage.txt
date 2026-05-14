@@ -59,6 +59,7 @@ Usage:
   __CLI_NAME__ migrate isolation-v2 commit --yes
   __CLI_NAME__ migrate isolation-v2 status
   __CLI_NAME__ migrate isolation v2 [--check|--dry-run|--apply] [--agent <name>] [--json]
+  __CLI_NAME__ migrate isolation v3 [--check|--dry-run|--apply] [--agent <name>] [--json]
   __CLI_NAME__ wiki bootstrap [--agent <name>] [--shared-root <path>] [--dry-run] [--json]
   __CLI_NAME__ wiki validate [--full|--frontmatter|--broken-link|--tree-edge] [--json]
   __CLI_NAME__ wiki dedup-scan [--output <file>] [--json]
