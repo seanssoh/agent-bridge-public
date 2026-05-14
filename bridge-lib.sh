@@ -331,6 +331,11 @@ bridge_source_module "bridge-marker-bootstrap.sh"
 # child env defaults. Read-only — never writes the marker.
 bridge_source_module "bridge-layout-resolver.sh"
 bridge_source_module "bridge-agents.sh"
+# Issue #832: small probes for running a snippet as the isolated UID of a
+# linux-user-isolated agent. Sourced after bridge-agents.sh because the
+# helpers depend on bridge_agent_os_user /
+# bridge_agent_linux_user_isolation_effective.
+bridge_source_module "bridge-isolation-helpers.sh"
 bridge_source_module "bridge-guard.sh"
 bridge_source_module "bridge-tmux.sh"
 bridge_source_module "bridge-skills.sh"

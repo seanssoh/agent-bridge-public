@@ -4249,16 +4249,26 @@ bridge_env_file_has_any_nonempty_key() {
 #
 # Usage:
 #   case "$(bridge_channel_env_file_readiness <agent> <item> <file> <key>...)" in
-#     present)    ... ;;
-#     missing)    ... ;;
-#     unreadable) ... ;;   # caller may then call bridge_channel_env_file_acl_diagnostic
+#     present)          ... ;;
+#     missing)          ... ;;
+#     unreadable)       ... ;;   # caller may then call bridge_channel_env_file_acl_diagnostic
+#     controller-blind) ... ;;   # issue #832: isolated dotenv, controller cannot sudo to verify
 #   esac
+#
+# Issue #832: when the controller cannot `[[ -r ]]` the file AND the agent
+# is linux-user isolated AND passwordless sudo to the agent's os_user is
+# unavailable, returns `"controller-blind"` instead of `"unreadable"`.
+# That distinct state lets the caller emit a controller-blind reason and
+# the status mapping degrade to `"unknown"` (fail-open) rather than
+# firing a false channel_health_miss audit row.
 bridge_channel_env_file_readiness() {
   local agent="$1"
   local item="$2"
   local file="$3"
   shift 3 || true
   local rc=0
+  local sudo_rc=0
+  local probe_rc=0
 
   if [[ ! -e "$file" ]]; then
     printf 'missing'
@@ -4278,6 +4288,81 @@ bridge_channel_env_file_readiness() {
     # File readable; helper just didn't find a non-empty matching key.
     printf 'missing'
     return 0
+  fi
+
+  # Issue #832: controller cannot read the file. Before declaring unreadable,
+  # see if we can probe via the agent's isolated UID (linux-user mode only).
+  # The agent's own UID can read its own dotenv when ACL drift left the
+  # controller unable to, and operators have correctly configured tokens.
+  # Without this branch the daemon would emit a false channel_health_miss
+  # for a healthy isolated agent.
+  if declare -F bridge_isolation_can_sudo_to_agent >/dev/null 2>&1; then
+    sudo_rc=0
+    bridge_isolation_can_sudo_to_agent "$agent" 2>/dev/null || sudo_rc=$?
+    case "$sudo_rc" in
+      0)
+        # Agent isolated AND we can sudo to its UID — probe via that UID.
+        # Self-contained inline script: tests readability and key presence
+        # without sourcing bridge-lib.sh inside the isolated UID.
+        # Exit codes from the inline script:
+        #   0 — readable and at least one nonempty matching KEY=value line
+        #   1 — readable but no matching nonempty key
+        #   2 — not readable even to the isolated UID
+        local probe_script
+        probe_script='
+file="$1"
+shift
+keys=("$@")
+[[ -r "$file" ]] || exit 2
+if [[ ${#keys[@]} -eq 0 ]]; then
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=[^[:space:]#]" "$file" && exit 0 || exit 1
+fi
+for k in "${keys[@]}"; do
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?${k}=[^[:space:]#].*" "$file" && exit 0
+done
+exit 1
+'
+        probe_rc=0
+        bridge_isolation_run_as_agent_user_via_bash "$agent" "$probe_script" "$file" "$@" >/dev/null 2>&1 || probe_rc=$?
+        # The helper preserves script's exit code shifted into the 3+ band
+        # when nonzero (rc=0 stays 0; script-rc 1 -> 3; script-rc 2 -> 4).
+        # See lib/bridge-isolation-helpers.sh docstring.
+        case "$probe_rc" in
+          0)
+            : "${item}"
+            printf 'present'
+            return 0
+            ;;
+          3)
+            : "${item}"
+            printf 'missing'
+            return 0
+            ;;
+          4)
+            : "${item}"
+            printf 'unreadable'
+            return 0
+            ;;
+          *)
+            # Probe itself failed unexpectedly (e.g. sudoers raced) —
+            # fall through to the standard unreadable path.
+            ;;
+        esac
+        ;;
+      2)
+        # Agent IS isolated but passwordless sudo is unavailable. Controller
+        # cannot determine readiness either way — degrade to controller-blind
+        # rather than firing a false miss. Caller maps this to status=unknown.
+        : "${item}"
+        printf 'controller-blind'
+        return 0
+        ;;
+      *)
+        # rc=1 — agent not in linux-user isolation. Fall through to the
+        # standard unreadable path (true ACL drift on a controller-managed
+        # file).
+        ;;
+    esac
   fi
 
   # v2: no ACL repair retry. The per-agent group + setgid contract
@@ -4495,6 +4580,12 @@ bridge_channel_credentials_status_for_item() {
   # required key probe reports unreadable, the overall status is unreadable
   # (operators need to know the controller cannot read the file at all,
   # which is actionable via ACL repair, vs. truly missing keys).
+  #
+  # Issue #832: also propagate "controller-blind" — emitted by the readiness
+  # function when the controller cannot read the file AND the agent is
+  # linux-user isolated AND we cannot sudo to its UID to verify. unreadable
+  # takes precedence (a real ACL drift somewhere is more actionable than
+  # any single controller-blind path).
   case "$item" in
     plugin:discord|plugin:discord@*)
       r1="$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN)"
@@ -4509,6 +4600,8 @@ bridge_channel_credentials_status_for_item() {
       r2="$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_PASSWORD MicrosoftAppPassword)"
       if [[ "$r1" == "unreadable" || "$r2" == "unreadable" ]]; then
         printf '%s' "unreadable"
+      elif [[ "$r1" == "controller-blind" || "$r2" == "controller-blind" ]]; then
+        printf '%s' "controller-blind"
       elif [[ "$r1" == "present" && "$r2" == "present" ]]; then
         printf '%s' "present"
       else
@@ -4521,6 +4614,8 @@ bridge_channel_credentials_status_for_item() {
       r3="$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MS365_TENANT_ID)"
       if [[ "$r1" == "unreadable" || "$r2" == "unreadable" || "$r3" == "unreadable" ]]; then
         printf '%s' "unreadable"
+      elif [[ "$r1" == "controller-blind" || "$r2" == "controller-blind" || "$r3" == "controller-blind" ]]; then
+        printf '%s' "controller-blind"
       elif [[ "$r1" == "present" && "$r2" == "present" && "$r3" == "present" ]]; then
         printf '%s' "present"
       else
@@ -4695,7 +4790,13 @@ bridge_agent_channel_diagnostics_tsv() {
     launch_allowlisted="$(bridge_agent_channel_launch_allowlisted_for_item "$agent" "$item")"
     access_status="$(bridge_channel_access_status_for_item "$agent" "$item")"
     credentials_status="$(bridge_channel_credentials_status_for_item "$agent" "$item")"
-    if bridge_agent_channel_runtime_ready_for_item "$agent" "$item"; then
+    # Issue #832: when credentials probe is controller-blind the runtime
+    # readiness is indeterminate, not yes/no. Render a distinct
+    # `indeterminate` so `agent show` can tell the operator
+    # "we cannot verify" apart from "we verified and it's missing".
+    if [[ "$credentials_status" == "controller-blind" ]]; then
+      runtime_ready="indeterminate"
+    elif bridge_agent_channel_runtime_ready_for_item "$agent" "$item"; then
       runtime_ready="yes"
     else
       runtime_ready="no"
@@ -4932,12 +5033,51 @@ bridge_agent_ready_channels_csv() {
   for item in "${items[@]}"; do
     item="$(bridge_trim_whitespace "$item")"
     [[ -n "$item" ]] || continue
+    # Issue #832: controller-blind channels are indeterminate, not ready.
+    # Skip them here — they surface via
+    # bridge_agent_controller_blind_channels_csv.
+    if [[ "$(bridge_channel_credentials_status_for_item "$agent" "$item")" == "controller-blind" ]]; then
+      continue
+    fi
     if bridge_agent_channel_runtime_ready_for_item "$agent" "$item"; then
       ready="$(bridge_append_csv_unique "$ready" "$item")"
     fi
   done
 
   printf '%s' "$ready"
+}
+
+# Issue #832: enumerate channels whose credentials probe returned
+# `controller-blind` — the controller cannot determine readiness because
+# the dotenv is unreadable AND we cannot sudo to the agent's UID to verify.
+# These channels MUST NOT appear in missing_channels_csv (no false miss)
+# and MUST NOT appear in ready_channels_csv (we have not verified them).
+# `bridge_agent_launch_channels_csv` re-includes them under
+# `BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS=1` so dev-mode launches do not
+# drop the channel just because the controller could not introspect it.
+bridge_agent_controller_blind_channels_csv() {
+  local agent="$1"
+  local required=""
+  local item=""
+  local blind=""
+  local -a items=()
+
+  required="$(bridge_agent_channels_csv "$agent")"
+  [[ -n "$required" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  IFS=',' read -r -a items <<<"$required"
+  for item in "${items[@]}"; do
+    item="$(bridge_trim_whitespace "$item")"
+    [[ -n "$item" ]] || continue
+    if [[ "$(bridge_channel_credentials_status_for_item "$agent" "$item")" == "controller-blind" ]]; then
+      blind="$(bridge_append_csv_unique "$blind" "$item")"
+    fi
+  done
+
+  printf '%s' "$blind"
 }
 
 bridge_agent_missing_channels_csv() {
@@ -4957,6 +5097,12 @@ bridge_agent_missing_channels_csv() {
   for item in "${items[@]}"; do
     item="$(bridge_trim_whitespace "$item")"
     [[ -n "$item" ]] || continue
+    # Issue #832: controller-blind channels are indeterminate, not missing.
+    # Excluding them here is what makes the suppress-missing-channels
+    # launch path keep them in the launch flags instead of dropping them.
+    if [[ "$(bridge_channel_credentials_status_for_item "$agent" "$item")" == "controller-blind" ]]; then
+      continue
+    fi
     if ! bridge_agent_channel_runtime_ready_for_item "$agent" "$item"; then
       missing="$(bridge_append_csv_unique "$missing" "$item")"
     fi
@@ -4995,7 +5141,13 @@ bridge_agent_launch_channels_csv() {
   local channels=""
 
   if [[ "${BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS:-0}" == "1" ]]; then
-    channels="$(bridge_filter_approved_channels_csv "$(bridge_agent_ready_channels_csv "$agent")")"
+    # Issue #832: under suppress-missing-channels, fold controller-blind
+    # channels back in alongside ready ones. We cannot verify their
+    # credentials from the controller, but we also cannot prove they are
+    # broken — dropping them would silently strip a working channel from
+    # an isolated agent's launch flags.
+    channels="$(bridge_merge_channels_csv "$(bridge_agent_ready_channels_csv "$agent")" "$(bridge_agent_controller_blind_channels_csv "$agent")")"
+    channels="$(bridge_filter_approved_channels_csv "$channels")"
   else
     channels="$(bridge_filter_approved_channels_csv "$(bridge_agent_channels_csv "$agent")")"
   fi
@@ -5004,9 +5156,14 @@ bridge_agent_launch_channels_csv() {
 
 bridge_agent_effective_dev_channels_csv() {
   local agent="$1"
+  local channels=""
 
   if [[ "${BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS:-0}" == "1" ]]; then
-    bridge_filter_development_channels_csv "$(bridge_agent_ready_channels_csv "$agent")"
+    # Issue #832: same controller-blind merge as launch_channels_csv —
+    # keep the dev channel set inclusive of indeterminate channels under
+    # suppression so the merged plugin set still loads.
+    channels="$(bridge_merge_channels_csv "$(bridge_agent_ready_channels_csv "$agent")" "$(bridge_agent_controller_blind_channels_csv "$agent")")"
+    bridge_filter_development_channels_csv "$channels"
     return 0
   fi
 
@@ -5369,6 +5526,11 @@ bridge_agent_runtime_channel_status_reason() {
         "$discord_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$discord_dir/.env" "$repair_attempts")"
       return 0
     fi
+    if [[ "$readiness" == "controller-blind" ]]; then
+      printf 'controller-blind:plugin:discord:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+        "$discord_dir" "$(bridge_channel_env_file_acl_diagnostic "$discord_dir/.env" "$repair_attempts")"
+      return 0
+    fi
     if [[ "$readiness" != "present" ]]; then
       printf 'missing Discord bot token under %s (.env with DISCORD_BOT_TOKEN required)' "$discord_dir"
       return 0
@@ -5385,6 +5547,11 @@ bridge_agent_runtime_channel_status_reason() {
     if [[ "$readiness" == "unreadable" ]]; then
       printf 'unreadable: Telegram .env under %s (ACL repair failed %s times; %s)' \
         "$telegram_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$telegram_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" == "controller-blind" ]]; then
+      printf 'controller-blind:plugin:telegram:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+        "$telegram_dir" "$(bridge_channel_env_file_acl_diagnostic "$telegram_dir/.env" "$repair_attempts")"
       return 0
     fi
     if [[ "$readiness" != "present" ]]; then
@@ -5405,6 +5572,11 @@ bridge_agent_runtime_channel_status_reason() {
         "$teams_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
       return 0
     fi
+    if [[ "$readiness" == "controller-blind" ]]; then
+      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+        "$teams_dir" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
+      return 0
+    fi
     if [[ "$readiness" != "present" ]]; then
       printf 'missing Teams app id under %s (.env with TEAMS_APP_ID required)' "$teams_dir"
       return 0
@@ -5413,6 +5585,11 @@ bridge_agent_runtime_channel_status_reason() {
     if [[ "$readiness" == "unreadable" ]]; then
       printf 'unreadable: Teams .env under %s (ACL repair failed %s times; %s)' \
         "$teams_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" == "controller-blind" ]]; then
+      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+        "$teams_dir" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
       return 0
     fi
     if [[ "$readiness" != "present" ]]; then
@@ -5433,6 +5610,11 @@ bridge_agent_runtime_channel_status_reason() {
         "$ms365_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
+    if [[ "$readiness" == "controller-blind" ]]; then
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+        "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
+      return 0
+    fi
     if [[ "$readiness" != "present" ]]; then
       printf 'missing MS365 client id under %s (.env with MS365_CLIENT_ID required)' "$ms365_dir"
       return 0
@@ -5443,6 +5625,11 @@ bridge_agent_runtime_channel_status_reason() {
         "$ms365_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
+    if [[ "$readiness" == "controller-blind" ]]; then
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+        "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
+      return 0
+    fi
     if [[ "$readiness" != "present" ]]; then
       printf 'missing MS365 client secret under %s (.env with MS365_CLIENT_SECRET required)' "$ms365_dir"
       return 0
@@ -5451,6 +5638,11 @@ bridge_agent_runtime_channel_status_reason() {
     if [[ "$readiness" == "unreadable" ]]; then
       printf 'unreadable: MS365 .env under %s (ACL repair failed %s times; %s)' \
         "$ms365_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" == "controller-blind" ]]; then
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+        "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
     if [[ "$readiness" != "present" ]]; then
@@ -5470,6 +5662,11 @@ bridge_agent_runtime_channel_status_reason() {
     if [[ "$readiness" == "unreadable" ]]; then
       printf 'unreadable: Mattermost .env under %s (ACL repair failed %s times; %s)' \
         "$mattermost_dir" "$repair_attempts" "$(bridge_channel_env_file_acl_diagnostic "$mattermost_dir/.env" "$repair_attempts")"
+      return 0
+    fi
+    if [[ "$readiness" == "controller-blind" ]]; then
+      printf 'controller-blind:plugin:mattermost:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+        "$mattermost_dir" "$(bridge_channel_env_file_acl_diagnostic "$mattermost_dir/.env" "$repair_attempts")"
       return 0
     fi
     if [[ "$readiness" != "present" ]]; then
@@ -5587,6 +5784,16 @@ bridge_agent_channel_status() {
 
   reason="$(bridge_agent_channel_status_reason "$agent")"
   if [[ -n "$reason" ]]; then
+    # Issue #832: a controller-blind dotenv is an indeterminate state, not
+    # a confirmed mismatch. Degrade to `unknown` so the daemon does not
+    # fire a false channel_health_miss audit row and so operators can
+    # tell "we cannot verify" apart from "we verified and it's broken".
+    case "$reason" in
+      controller-blind:*)
+        printf '%s' "unknown"
+        return 0
+        ;;
+    esac
     printf '%s' "miss"
     return 0
   fi

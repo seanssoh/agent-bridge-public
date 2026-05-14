@@ -10479,6 +10479,13 @@ assert_contains "$FP_STATUS_OUTPUT" "context-pressure FP rate (7d): 1/1 (100%)"
 log "running stale-resume regression suite"
 bash "$REPO_ROOT/scripts/test-stale-resume.sh"
 
+# Issue #832 — channel-health probe must degrade to controller-blind /
+# status=unknown when the controller cannot read an isolated agent's
+# dotenv AND we cannot sudo to that agent's UID. Without this, the daemon
+# fires a false channel_health_miss audit row on every health cycle.
+log "running channel-probe-isolated regression suite (issue #832)"
+bash "$REPO_ROOT/scripts/test-channel-probe-isolated.sh"
+
 # Issue #541 PR-A — memory-daily payload jsonl-aware migration regression.
 log "running cron-migrate-payloads smoke (issue #541 PR-A)"
 bash "$REPO_ROOT/scripts/smoke/cron-migrate-payloads.sh"
