@@ -353,6 +353,10 @@ bridge_source_module "bridge-isolation-v2.sh"
 # credential grants during upgrade. Source it here so every entry
 # point sees the helper.
 bridge_source_module "bridge-isolation-v2-reapply.sh"
+# #857 PR-6 (v0.13.4): channel-dotenv migrator. Depends on v2-reapply
+# primitives (record_action / run_priv / has_named_acl /
+# probe_owner_group_mode / chown_chmod_file) — source after v2-reapply.
+bridge_source_module "bridge-isolation-v3-channel-dotenv.sh"
 # v0.8.0 T5: runtime-only `BRIDGE_DISABLE_ISOLATION=1` escape hatch.
 # Sourced after bridge-isolation-v2.sh so bridge_isolation_v2_active is
 # already defined (the runtime state helper composes the two).

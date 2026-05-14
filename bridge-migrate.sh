@@ -10,6 +10,8 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 source "$SCRIPT_DIR/lib/bridge-isolation-v2-migrate.sh"
 # shellcheck source=lib/bridge-isolation-v2-reapply.sh
 source "$SCRIPT_DIR/lib/bridge-isolation-v2-reapply.sh"
+# shellcheck source=lib/bridge-isolation-v3-channel-dotenv.sh
+source "$SCRIPT_DIR/lib/bridge-isolation-v3-channel-dotenv.sh"
 bridge_load_roster
 
 usage() {
@@ -33,6 +35,7 @@ Usage:
   bash $SCRIPT_DIR/bridge-migrate.sh isolation-v2 commit  --yes
   bash $SCRIPT_DIR/bridge-migrate.sh isolation-v2 status
   bash $SCRIPT_DIR/bridge-migrate.sh isolation v2 [--check|--dry-run|--apply] [--agent <name>] [--json]
+  bash $SCRIPT_DIR/bridge-migrate.sh isolation v3 [--check|--dry-run|--apply] [--agent <name>] [--json]
   bash $SCRIPT_DIR/bridge-migrate.sh overhead apply [--agent <name>|--all] --yes [--dry-run] [--json]
   bash $SCRIPT_DIR/bridge-migrate.sh overhead rollback --stamp <YYYYMMDD-HHMMSS-<pid>> [--json]
 EOF
@@ -840,17 +843,23 @@ case "$subcommand" in
     # that drifted from the canonical v2 contract during a v0.7 → v0.8
     # `agent-bridge upgrade --apply` chain (issue #737). Distinct from the
     # `isolation-v2` (hyphenated) initial-migration tool above.
+    # `agent-bridge migrate isolation v3 ...` (new in v0.13.4, #857 PR-6)
+    # — channel-dotenv migrator from the legacy ACL-grant contract to the
+    # 0600 + isolated-UID-owned shape established by v0.13.3 PR-2/PR-3.
     inner="${1:-}"
     shift || true
     case "$inner" in
       v2)
         bridge_isolation_v2_reapply_cli "$@"
         ;;
+      v3)
+        bridge_isolation_v3_channel_dotenv_cli "$@"
+        ;;
       ""|-h|--help|help)
         usage
         ;;
       *)
-        bridge_die "지원하지 않는 migrate isolation 명령입니다: $inner (예: 'migrate isolation v2 --check')"
+        bridge_die "지원하지 않는 migrate isolation 명령입니다: $inner (예: 'migrate isolation v2 --check', 'migrate isolation v3 --dry-run')"
         ;;
     esac
     ;;
