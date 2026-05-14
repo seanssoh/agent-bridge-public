@@ -832,21 +832,37 @@ TRACK_A_EMPTY="$("$BASH4_BIN" -c '
   || die "expected empty summary for nonexistent subcommand, got: $TRACK_A_EMPTY"
 log "  [ok] bridge_cli_subcommand_help_summary returns empty for unknown subcommand"
 
+# Issue #828: the auto-generated "Full Subcommand Reference" block is now
+# opt-in via BRIDGE_RENDER_SKILL_AUTO_HELP=1 so dynamic agent start does not
+# recurse into `agent-bridge --help`. The default render path emits only the
+# curated intent-grouped sections; the opt-in path adds the auto-discovered
+# subcommand list. Both shapes are asserted below.
+TRACK_A_RENDER_DEFAULT="$("$BASH4_BIN" -c '
+  unset BRIDGE_RENDER_SKILL_AUTO_HELP
+  source "'"$REPO_ROOT"'/bridge-lib.sh"
+  bridge_render_project_bridge_reference /tmp/test-bridge-home
+')"
+[[ "$TRACK_A_RENDER_DEFAULT" != *"## Full Subcommand Reference"* ]] \
+  || die "default render must skip auto-help block (#828); got it"
+log "  [ok] default render skips auto-generated Full Subcommand Reference (#828)"
+
 TRACK_A_RENDER="$("$BASH4_BIN" -c '
+  export BRIDGE_RENDER_SKILL_AUTO_HELP=1
   source "'"$REPO_ROOT"'/bridge-lib.sh"
   bridge_render_project_bridge_reference /tmp/test-bridge-home
 ')"
 assert_contains "$TRACK_A_RENDER" "## Full Subcommand Reference"
 assert_contains "$TRACK_A_RENDER" "### cron"
 assert_contains "$TRACK_A_RENDER" "### task"
-log "  [ok] bridge-commands.md renders auto-discovered Full Subcommand Reference"
+log "  [ok] opt-in render emits auto-discovered Full Subcommand Reference"
 
 for _track_a_hdr in "## Roster" "## Start Or Resume Agents" "## Task Queue" \
                     "## Cron" "## Urgent Interrupts" "## Stop Sessions" \
                     "## Share Larger Files"; do
+  assert_contains "$TRACK_A_RENDER_DEFAULT" "$_track_a_hdr"
   assert_contains "$TRACK_A_RENDER" "$_track_a_hdr"
 done
-log "  [ok] intent-grouped sections preserved (Roster/Start/Task Queue/Cron/Urgent/Stop/Share)"
+log "  [ok] intent-grouped sections preserved (Roster/Start/Task Queue/Cron/Urgent/Stop/Share) in both render modes"
 
 # Issue #283 Track D: bare agent-bridge / agb prints help instead of erroring.
 log "agent-bridge bare invocation prints help summary (#283 Track D)"
