@@ -30,6 +30,16 @@ trap cleanup EXIT
 
 # --- harness helpers ---------------------------------------------------------
 
+# Portable `stat` shims. On Linux (GNU coreutils), `stat -c '%a' <file>` returns
+# the mode digits; `stat -f` instead prints filesystem status (verbose), which
+# is the CI failure mode this helper exists to avoid. On macOS (BSD), `stat -c`
+# is invalid and exits non-zero, so the GNU form must be tried FIRST and we
+# fall back to the BSD `-f '%Lp'` / `-f '%Su'` form when it fails. Same shape
+# for owner lookup. Kept as single-line conditionals to stay off the heredoc
+# footgun surface (Bash 5.3.9 heredoc_write deadlock class).
+file_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+file_owner() { stat -c '%U' "$1" 2>/dev/null || stat -f '%Su' "$1" 2>/dev/null; }
+
 # Build a PATH directory containing a `sudo` shim. The shim strips `-n -u
 # <user>` and execs the remaining command as the current user, so the helper's
 # `sudo -n -u <user> bash -c "$script" bridge-isolation <dest> <mode>`
@@ -105,7 +115,7 @@ case_a1_happy_path_default_mode() {
   smoke_assert_file_exists "$dest" "A1: destination file created"
   actual_content="$(cat "$dest")"
   smoke_assert_eq "$content" "$actual_content" "A1: content roundtrips through stdin pipe"
-  actual_mode="$(stat -f '%Lp' "$dest" 2>/dev/null || stat -c '%a' "$dest")"
+  actual_mode="$(file_mode "$dest")"
   smoke_assert_eq "600" "$actual_mode" "A1: default mode 0600 applied"
   # No temp leak in the dest dir (only `payload.env` should remain).
   local leak
@@ -124,7 +134,7 @@ case_a2_custom_mode() {
   printf 'k=v\n' | bridge_isolation_write_file_as_agent_user_via_bash \
     agent-test "$dest" 0640 || rc=$?
   smoke_assert_eq 0 "$rc" "A2: helper returns 0 with custom mode"
-  actual_mode="$(stat -f '%Lp' "$dest" 2>/dev/null || stat -c '%a' "$dest")"
+  actual_mode="$(file_mode "$dest")"
   smoke_assert_eq "640" "$actual_mode" "A2: custom mode 0640 propagated"
 }
 
@@ -250,7 +260,7 @@ case_b1_real_two_uid() {
     agent-test "$dest" || rc=$?
   smoke_assert_eq 0 "$rc" "B1: real two-UID write returns 0"
   smoke_assert_file_exists "$dest" "B1: dest file created"
-  actual_owner="$(stat -f '%Su' "$dest" 2>/dev/null || stat -c '%U' "$dest")"
+  actual_owner="$(file_owner "$dest")"
   smoke_assert_eq "$test_uid_user" "$actual_owner" "B1: dest owned by isolated UID"
 }
 
