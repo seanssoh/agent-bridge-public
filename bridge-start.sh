@@ -162,19 +162,66 @@ bridge_start_schedule_dev_channels_accept() {
           "$(date "+%Y-%m-%d %H:%M:%S")" "$session" >&2
         exit 0
       fi
-      if ! bridge_tmux_wait_for_claude_foreground "$session" "$foreground_timeout" 2 $((foreground_timeout / 2 + 1)); then
+      # Issue #825: primary trigger is pane-content-text match for the
+      # dev-channels picker. The foreground-basename gate has been observed
+      # to false-negative on v0.11.0+ live installs (Claude apparently
+      # presents the picker from a wrapper whose `comm` does not match
+      # claude|claude-*|claude.*) which wedged the watcher indefinitely.
+      # We poll BOTH the picker text AND the legacy foreground gate;
+      # whichever fires first wins. The picker text (specifically the
+      # "WARNING: Loading development channels" + "I am using this for
+      # local development" pair detected by
+      # bridge_tmux_pane_has_dev_channels_picker) is unique to the Claude
+      # dev-channels load path, so its presence alone is sufficient
+      # evidence the picker has been drawn — we do not require an
+      # additional process-name match on top. The picker-sweep allow-list
+      # (scripts/picker-sweep.sh:137-138) does NOT include the dev-channels
+      # picker text, so the two watcher surfaces stay disjoint.
+      picker_seen=0
+      foreground_ready=0
+      poll_seconds="${BRIDGE_START_DEV_CHANNELS_PICKER_POLL_SECONDS:-2}"
+      [[ "$poll_seconds" =~ ^[0-9]+([.][0-9]+)?$ ]] || poll_seconds=2
+      start_ts="$(date +%s)"
+      while :; do
         if ! bridge_tmux_session_exists "$session"; then
-          printf "[%s] [warn] controller auto-accept dev-channels aborted: tmux session=%s ended before claude foreground (likely plugin-cache or launch failure)\n" \
+          printf "[%s] [warn] controller auto-accept dev-channels aborted: tmux session=%s ended before picker/foreground (likely plugin-cache or launch failure)\n" \
             "$(date "+%Y-%m-%d %H:%M:%S")" "$session" >&2
-        else
-          printf "[%s] [warn] controller auto-accept dev-channels timeout waiting for claude foreground on session=%s agent=%s after %ss\n" \
-            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" "$foreground_timeout" >&2
+          exit 0
         fi
-        exit 0
+        if bridge_tmux_pane_has_dev_channels_picker "$session"; then
+          picker_seen=1
+          break
+        fi
+        if bridge_tmux_pane_foreground_is_claude "$session"; then
+          foreground_ready=1
+          break
+        fi
+        elapsed=$(( $(date +%s) - start_ts ))
+        if (( elapsed >= foreground_timeout )); then
+          printf "[%s] [warn] controller auto-accept dev-channels timeout waiting for picker/claude foreground on session=%s agent=%s after %ss\n" \
+            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" "$foreground_timeout" >&2
+          exit 0
+        fi
+        sleep "$poll_seconds"
+      done
+      # Picker-text-trigger short-circuits the secondary foreground gate
+      # inside bridge_tmux_claude_advance_blocker (lib/bridge-tmux.sh:677).
+      # The picker text IS the direct signal — Claude has drawn the
+      # dev-channels prompt, so requiring an additional foreground match
+      # on top would just resurrect the bug this commit closes. The
+      # legacy gate is preserved for the non-picker trigger path so other
+      # callers (and non-dev-channels callers) are unaffected.
+      if (( picker_seen == 1 )); then
+        export BRIDGE_TMUX_DEV_CHANNELS_REQUIRE_CLAUDE_FOREGROUND=0
       fi
       if bridge_tmux_wait_for_prompt "$session" claude "$accept_timeout" 1; then
-        printf "[%s] [info] controller auto-accept dev-channels completed on session=%s agent=%s\n" \
-          "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
+        if (( picker_seen == 1 )); then
+          printf "[%s] [info] controller auto-accept dev-channels completed (picker-text trigger) on session=%s agent=%s\n" \
+            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
+        else
+          printf "[%s] [info] controller auto-accept dev-channels completed (foreground trigger) on session=%s agent=%s\n" \
+            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
+        fi
       else
         printf "[%s] [warn] controller auto-accept dev-channels failed/timeout on session=%s agent=%s\n" \
           "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" >&2

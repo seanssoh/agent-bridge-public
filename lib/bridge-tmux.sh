@@ -363,6 +363,29 @@ bridge_tmux_claude_blocker_state() {
   bridge_tmux_claude_blocker_state_from_text "$recent"
 }
 
+# Issue #825: pane-content-only check for the dev-channels picker. Returns
+# 0 iff the pane has the picker text in view, regardless of foreground
+# process basename. This is the primary trigger condition for the
+# controller-side auto-accept watcher (bridge-start.sh::
+# bridge_start_schedule_dev_channels_accept): on v0.11.0+ live installs the
+# foreground basename gate has been observed to false-negative (Claude
+# launches under a wrapper whose `comm` does not match the
+# claude|claude-*|claude.* regex even after the picker is drawn), wedging
+# the watcher indefinitely. The picker text pair detected here
+# ("WARNING: Loading development channels" + "I am using this for local
+# development") is unique to the Claude dev-channels load path, so its
+# presence alone is sufficient evidence the picker has been drawn; no
+# additional process-name match is required.
+bridge_tmux_pane_has_dev_channels_picker() {
+  local session="$1"
+  local recent=""
+
+  recent="$(bridge_capture_recent "$session" 80 2>/dev/null || true)"
+  [[ -n "$recent" ]] || return 1
+
+  [[ "$(bridge_tmux_claude_blocker_state_from_text "$recent")" == "devchannels" ]]
+}
+
 bridge_tmux_claude_prompt_line_ready() {
   local trimmed="$1"
   local remainder=""
