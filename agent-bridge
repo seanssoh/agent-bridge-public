@@ -112,8 +112,17 @@ CLI_NAME="$(basename "$0")"
 # the roster lazily when they actually need it; skipping here keeps
 # `agb status` / `agb agent list` / `agb inbox <agent>` / `agb daemon
 # start` startup well under 5s on the operator's live host.
+#
+# Issue #848: also skip for `--help` / `-h` / `help` / `--version` / `-V`
+# (and the `version` subcommand token already covered above). `agb
+# --help` previously paid the full roster-hydration cost just to render
+# the static usage block (~0.8-1.1s of python3 cold-starts on macOS);
+# the help text only uses `$CLI_NAME`, so the roster isn't needed. The
+# matching short-circuit DISPATCH for the flag spellings lives below
+# (after `usage()` is defined) — this entry only keeps the *roster*
+# off the hot path.
 case "${1:-}" in
-  version|status|daemon|agent|task|inbox) ;;
+  version|status|daemon|agent|task|inbox|help|--help|-h|--version|-V) ;;
   init)
     # bridge-isolation-v2.sh's `BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"`
     # default fires during our bridge-lib.sh source above and exports the
@@ -376,6 +385,25 @@ Primary command: \`agent-bridge\`
 Short alias: \`agb\`
 EOF
 }
+
+# Issue #848: actual short-circuit dispatch for the help / version flag
+# spellings. Placed AFTER `usage()` is defined (the function references
+# `$CLI_NAME`, set at line 98) and AFTER the skip-roster case above so
+# bridge_load_roster has not run for these tokens. The matching skip-
+# list entries above keep the *roster* off the hot path; this block
+# keeps the *dispatch* off it too. `--version` / `-V` are rewritten to
+# the existing `version` subcommand handler downstream to avoid
+# duplicating its `--json` + source-ref + upgrade-state formatting
+# logic.
+case "${1:-}" in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  --version|-V)
+    set -- version "${@:2}"
+    ;;
+esac
 
 is_tty() {
   [[ -t 0 && -t 1 ]]

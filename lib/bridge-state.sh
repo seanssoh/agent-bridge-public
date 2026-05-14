@@ -941,6 +941,19 @@ bridge_load_static_histories() {
 }
 
 bridge_load_roster() {
+  # Issue #848: per-process memoization. `agent-bridge`,
+  # `bridge-run.sh`, `bridge-daemon.sh`, and `bridge-start.sh` are
+  # independent processes that each `source bridge-lib.sh`, so the cache
+  # only ever short-circuits inside ONE shell. Within that shell, the
+  # roster files cannot change unless the caller explicitly invalidates
+  # via `bridge_roster_cache_invalidate`, so a single "loaded" flag is
+  # sufficient. Set `BRIDGE_ROSTER_CACHE_DISABLE=1` in env to bypass the
+  # cache entirely (tests).
+  if [[ "${BRIDGE_ROSTER_CACHE_DISABLE:-0}" != "1" \
+        && "${BRIDGE_ROSTER_CACHE_LOADED:-0}" == "1" ]]; then
+    return 0
+  fi
+
   local agent
   local fast_load="${BRIDGE_FAST_ROSTER_LOAD:-0}"
   local isolated_env_file="${BRIDGE_AGENT_ENV_FILE:-}"
@@ -1073,6 +1086,46 @@ bridge_load_roster() {
 
   bridge_init_dirs
 
+  # Issue #848: precompute history keys for all roster entries that still
+  # need one in a single batched python3 invocation. The previous loop
+  # called `bridge_history_key_for → bridge_sha1` per agent, which paid
+  # one python3 cold-start (~50-80ms on macOS) per agent. With ~7 roster
+  # entries that's ~0.5s just on hash spawns; batching collapses that to
+  # one spawn. The agents that already carry an explicit
+  # BRIDGE_AGENT_HISTORY_KEY (set by the roster file) are skipped so we
+  # don't waste a hash slot on them.
+  local -a _bridge_history_key_pending=()
+  local _agent_engine _agent_workdir _hash_input
+  for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+    if [[ -z "${BRIDGE_AGENT_HISTORY_KEY[$agent]:-}" ]]; then
+      _bridge_history_key_pending+=("$agent")
+    fi
+  done
+  if ((${#_bridge_history_key_pending[@]} > 0)) \
+      && command -v python3 >/dev/null 2>&1; then
+    local _hash_inputs=""
+    for agent in "${_bridge_history_key_pending[@]}"; do
+      _agent_engine="$(bridge_agent_engine "$agent")"
+      _agent_workdir="$(bridge_agent_workdir "$agent")"
+      _hash_input="${_agent_engine}|${agent}|${_agent_workdir}"
+      _hash_inputs+="${_hash_input}"$'\n'
+    done
+    # Footgun #11 / here-string deadlock — split the batch output into
+    # an array without `<<<` and without heredoc-stdin. `mapfile` reads
+    # from the pipe directly inside a process substitution, which avoids
+    # the bash 5.3.9 `<<<` write-end stall observed in the v0.10/v0.11
+    # heredoc_write class.
+    local -a _hash_lines=()
+    mapfile -t _hash_lines < <(printf '%s' "$_hash_inputs" | bridge_sha1_batch)
+    local _hash_idx=0
+    for agent in "${_bridge_history_key_pending[@]}"; do
+      BRIDGE_AGENT_HISTORY_KEY["$agent"]="${_hash_lines[$_hash_idx]:-}"
+      _hash_idx=$((_hash_idx + 1))
+    done
+    unset _hash_inputs _hash_lines _hash_idx
+  fi
+  unset _bridge_history_key_pending _agent_engine _agent_workdir _hash_input
+
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
     BRIDGE_AGENT_SOURCE["$agent"]="${BRIDGE_AGENT_SOURCE[$agent]-static}"
     # Issue #598 Track 1: any id surfaced by the roster files (without an
@@ -1084,6 +1137,9 @@ bridge_load_roster() {
     fi
     BRIDGE_AGENT_LOOP["$agent"]="${BRIDGE_AGENT_LOOP[$agent]-1}"
     BRIDGE_AGENT_CONTINUE["$agent"]="${BRIDGE_AGENT_CONTINUE[$agent]-1}"
+    # Issue #848: per-agent sha1 fallback kept for the edge case where
+    # python3 was unavailable above (batched path skipped). All happy-
+    # path roster entries already have BRIDGE_AGENT_HISTORY_KEY set.
     BRIDGE_AGENT_HISTORY_KEY["$agent"]="${BRIDGE_AGENT_HISTORY_KEY[$agent]-$(bridge_history_key_for "$(bridge_agent_engine "$agent")" "$agent" "$(bridge_agent_workdir "$agent")")}"
     BRIDGE_AGENT_IDLE_TIMEOUT["$agent"]="${BRIDGE_AGENT_IDLE_TIMEOUT[$agent]-$BRIDGE_ON_DEMAND_IDLE_SECONDS}"
     # Issue #597 Track B: default OFF for PreCompact auto-notify. Per-agent
@@ -1108,6 +1164,21 @@ bridge_load_roster() {
     fi
     bridge_reconcile_dynamic_agents_from_tmux
   fi
+
+  # Issue #848: mark the per-process cache populated. Skipped when the
+  # escape hatch is engaged so tests that simulate multiple invocations
+  # in one shell still re-parse the roster files.
+  if [[ "${BRIDGE_ROSTER_CACHE_DISABLE:-0}" != "1" ]]; then
+    BRIDGE_ROSTER_CACHE_LOADED=1
+  fi
+}
+
+# Drop the per-process roster cache. Callers that mutate the roster
+# files mid-shell (e.g., `agb roster edit`, dynamic-agent registration
+# helpers that write directly to disk) MUST invoke this before they
+# expect the next `bridge_load_roster` to re-read disk. Refs #848.
+bridge_roster_cache_invalidate() {
+  BRIDGE_ROSTER_CACHE_LOADED=0
 }
 
 bridge_audit_log() {

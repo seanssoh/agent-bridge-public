@@ -5556,7 +5556,11 @@ cmd_sync_cycle() {
 
   # The daemon is long-lived, so dynamic agents created after startup will not
   # exist in memory unless we reload the roster each cycle.
+  # Issue #848: per-process roster memoization means the bare
+  # bridge_load_roster call would no-op after the first cycle —
+  # invalidate the cache here so each cycle observes fresh disk state.
   BRIDGE_DAEMON_LAST_STEP="load_roster"
+  bridge_roster_cache_invalidate
   bridge_load_roster
 
   # Discord relay runs FIRST — lowest-latency path for DM wake
@@ -5575,6 +5579,10 @@ cmd_sync_cycle() {
   # wedge the daemon main loop. 30s ceiling — bridge-sync.sh reconciles roster
   # + state under normal conditions in <1s; timeouts here are pathological.
   bridge_with_timeout 30 bridge_sync "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-sync.sh" >/dev/null 2>&1 || true
+  # Issue #848: bridge-sync.sh ran as a child process and may have
+  # touched the roster files; invalidate so this in-loop reload picks
+  # up any newly-registered dynamic agents.
+  bridge_roster_cache_invalidate
   bridge_load_roster
   BRIDGE_DAEMON_LAST_STEP="queue_gateway"
   if process_queue_gateway_requests; then

@@ -500,6 +500,10 @@ else
   fi
   "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "${create_args[@]}" >/dev/null
   created=1
+  # Issue #848: the child `agent create` invocation mutated the roster
+  # files on disk, so the next `bridge_load_roster` MUST re-parse them
+  # rather than serve cached state from the earlier load above.
+  bridge_roster_cache_invalidate
   bridge_load_roster
 fi
 
@@ -516,6 +520,10 @@ if [[ $dry_run -eq 0 ]]; then
     bridge_init_append_warning "admin-pair backfill failed: ${pair_output}"
   else
     [[ -n "$pair_output" ]] && printf '%s\n' "$pair_output" >&2
+    # Issue #848: bridge_ensure_admin_codex_pair may have appended a new
+    # static agent to the roster file — invalidate before the re-load
+    # so the next call observes the new entry.
+    bridge_roster_cache_invalidate
     bridge_load_roster
     inject_output=""
     if ! inject_output="$(python3 "$SCRIPT_DIR/bridge-upgrade.py" inject-admin-pair-block --target-root "$BRIDGE_HOME" --admin-agent "$admin_agent" 2>&1)"; then

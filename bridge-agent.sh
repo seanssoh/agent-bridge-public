@@ -2736,6 +2736,10 @@ report and reap test-fixture agents per their pattern."
       "$always_on" \
       "$isolation_mode" \
       "$os_user" >/dev/null
+    # Issue #848: bridge_write_role_block just appended a new entry to
+    # the local roster file; invalidate the per-process cache so the
+    # next load re-reads disk instead of replaying the pre-create map.
+    bridge_roster_cache_invalidate
     bridge_load_roster
     if [[ "$engine" == "claude" ]]; then
       # Issue #570: managed autoCompactWindow default is unconditionally

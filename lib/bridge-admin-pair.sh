@@ -71,6 +71,9 @@ bridge_ensure_admin_codex_pair() {
     # made it. This keeps the install convergent on transient failures
     # rather than leaving an admin with a registered pair but no SOP block.
     # (Issue #517 r1 review finding 3.)
+    # Issue #848: the child process touched the roster files on disk,
+    # so the in-process cache must be discarded before re-reading.
+    bridge_roster_cache_invalidate
     bridge_load_roster
     if bridge_agent_exists "$pair_name"; then
       printf '[admin-pair] create-partial-but-registered: %s\n%s\n' "$pair_name" "$create_output" >&2
