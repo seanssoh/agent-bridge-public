@@ -484,7 +484,6 @@ bridge_host_profile_emit_dev_advisories() {
     printf "$cron_extra"
   fi
   printf '  - picker-sweep 자동 unstick: skip (BRIDGE_PICKER_SWEEP_ENABLED=1 로 override 가능)\n'
-  printf '  - prompt-guard (채널/MCP/intake 검사): skip (BRIDGE_PROMPT_GUARD_ENABLED=1 로 override 가능)\n'
   printf '\n'
   printf '정적 에이전트는 admin(`%s`) + admin-dev(`%s` codex pair) 2개로\n' "$admin_agent" "$admin_pair"
   printf '시작합니다. 추가 정적 역할은 운영 모드에서만 필요한 경우가 일반적입니다.\n'

@@ -159,11 +159,13 @@ def _host_profile_is_dev() -> bool:
 
 
 def prompt_guard_enabled() -> bool:
-    # Track D follow-up to #713 / #809: server hosts default-enable prompt
-    # guard; dev hosts stay opted out. Explicit BRIDGE_PROMPT_GUARD_ENABLED
-    # (0 or 1) wins over host_profile via `truthy`'s default fallback.
-    default_enabled = not _host_profile_is_dev()
-    return truthy(os.environ.get("BRIDGE_PROMPT_GUARD_ENABLED"), default=default_enabled)
+    # Track D's host_profile-aware default (server → enabled, dev → off,
+    # shipped in v0.11.0 / PR #813) was reverted 2026-05-14 because operators
+    # reported the auto-enable produced too many spurious blocks on real
+    # channel / MCP / intake traffic on server installs. Prompt guard is
+    # back to default-OFF on every host; explicit BRIDGE_PROMPT_GUARD_ENABLED=1
+    # still opts in.
+    return truthy(os.environ.get("BRIDGE_PROMPT_GUARD_ENABLED"), default=False)
 
 
 def split_csv(value: str | None) -> list[str]:
