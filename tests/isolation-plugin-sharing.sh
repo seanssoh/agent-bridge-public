@@ -761,6 +761,217 @@ if [[ ! -s "$STUB_LOG" ]]; then
   die "negative case: claude stub was NOT invoked; short-circuit gate is too loose"
 fi
 
+# ---------------------------------------------------------------------
+# third-party-plugin-trust sub-case (#852 + #853)
+# ---------------------------------------------------------------------
+# The block above covers the isolated-UID side (#346 regression):
+# `bridge_claude_plugin_status` running as the isolated UID against a
+# root-owned per-UID manifest. The block below covers the
+# controller-side path (#852): the controller's HOME's
+# installed_plugins.json holds the third-party plugin spec, but the
+# entry's installPath points into the isolated UID's mode-700 home that
+# the controller cannot traverse. The os.access probe would false-fail
+# and trigger a redundant `claude plugin install`, which on a
+# silently-drifted controller marketplace (#853) fails with
+# `Plugin "<name>" not found in marketplace "<mkt>"` and aborts the
+# launch. The fix trusts the manifest's key set when the agent is
+# linux-user-isolated.
+
+log "controller-blind plugin trust + marketplace self-heal (#852 #853)"
+
+# Snapshot of the existing claude stub log for later restoration. The
+# self-heal assertions need a fresh log; the broader test below will
+# re-arm the stub from scratch when it needs to.
+: > "$STUB_LOG"
+
+# Fake controller plugin tree under TMP_ROOT for the controller-side
+# tests so the operator's real ~/.claude is never touched. Mirrors the
+# CONTROLLER_HOME_FAKE pattern at the top of this script.
+CTRL_BLIND_HOME="$TMP_ROOT/controller-blind-home"
+CTRL_BLIND_PLUGINS="$CTRL_BLIND_HOME/.claude/plugins"
+mkdir -p "$CTRL_BLIND_PLUGINS"
+chmod 0755 "$CTRL_BLIND_HOME" "$CTRL_BLIND_HOME/.claude" "$CTRL_BLIND_PLUGINS"
+
+# Sentinel installPath under a mode-700 directory the operator UID
+# cannot traverse — mirrors the production shape where the isolated
+# UID's home (/home/agent-bridge-<agent>) is mode 700 owned by the
+# isolated UID and the controller has no traverse permission. Use the
+# real isolated UID's home created earlier so we know controller
+# os.access against this path returns False without further setup.
+CTRL_BLIND_INSTALL_PATH="$TEST_OS_HOME/.claude/plugins/cache/cosmax-marketplace/cosmax-ep-approval/0.1.14"
+
+# Write the controller's installed_plugins.json with the third-party
+# entry. Use python rather than a shell heredoc so the new code added
+# in this PR matches the footgun #11 ban on inline heredocs.
+python3 -c '
+import json, sys
+manifest_path = sys.argv[1]
+install_path = sys.argv[2]
+payload = {
+    "version": 2,
+    "plugins": {
+        "cosmax-ep-approval@cosmax-marketplace": [
+            {"scope": "user", "version": "0.1.14", "installPath": install_path}
+        ]
+    },
+}
+with open(manifest_path, "w") as f:
+    json.dump(payload, f, indent=2)
+' "$CTRL_BLIND_PLUGINS/installed_plugins.json" "$CTRL_BLIND_INSTALL_PATH"
+
+# Write a known_marketplaces.json that has the marketplace row with a
+# github source — the self-heal helper extracts the repo slug from this
+# row when `claude plugin marketplace list` no longer enumerates the
+# marketplace.
+python3 -c '
+import json, sys
+path = sys.argv[1]
+payload = {
+    "cosmax-marketplace": {
+        "source": {
+            "source": "github",
+            "repo": "COSMAX-PI-Dev-Team/claude-plugin-registry",
+        },
+    },
+    "agent-bridge": {
+        "source": {"source": "directory", "path": "/opt/agent-bridge"},
+    },
+}
+with open(path, "w") as f:
+    json.dump(payload, f, indent=2)
+' "$CTRL_BLIND_PLUGINS/known_marketplaces.json"
+
+# Confirm the os.access probe genuinely fails for the operator UID
+# against the synthetic installPath. Without this baseline an
+# "enabled" result below would not actually prove the trust path —
+# os.access could succeed for unrelated reasons.
+if python3 -c 'import os, sys; sys.exit(0 if os.access(sys.argv[1], os.R_OK | os.X_OK) else 1)' "$CTRL_BLIND_INSTALL_PATH"; then
+  die "test setup invariant broken: operator UID can traverse $CTRL_BLIND_INSTALL_PATH; expected mode-700 home block"
+fi
+
+# Re-arm the claude stub log; any `claude` shell-out during the
+# isolation-trust short-circuit invalidates the test.
+: > "$STUB_LOG"
+
+THIRD_SPEC="cosmax-ep-approval@cosmax-marketplace"
+
+log "Assertion A: bridge_claude_plugin_status trusts manifest without os.access when agent is isolated"
+trust_status="$(env HOME="$CTRL_BLIND_HOME" PATH="$STUB_DIR:$PATH" \
+  bash -c 'source "'"$REPO_ROOT"'/bridge-lib.sh"; bridge_load_roster; bridge_claude_plugin_status "'"$THIRD_SPEC"'" "'"$TEST_AGENT"'"')"
+if [[ "$trust_status" != "enabled" ]]; then
+  die "Assertion A failed: expected 'enabled' from controller-side trust path, got '$trust_status'"
+fi
+if [[ -s "$STUB_LOG" ]]; then
+  die "Assertion A failed: claude stub was invoked during controller-side trust path; log: $(cat "$STUB_LOG")"
+fi
+
+log "Assertion A negative: omitting the agent arg falls through to the legacy os.access path"
+neg_trust_status="$(env HOME="$CTRL_BLIND_HOME" PATH="$STUB_DIR:$PATH" \
+  bash -c 'source "'"$REPO_ROOT"'/bridge-lib.sh"; bridge_load_roster; bridge_claude_plugin_status "'"$THIRD_SPEC"'"')"
+# Without the agent arg the legacy code path either falls through to
+# `claude plugin list` (returning "missing" because the stub prints
+# nothing matching) or short-circuits via the root-owned manifest gate.
+# Either way the new controller-side trust short-circuit MUST NOT fire,
+# so an "enabled" result here is a regression.
+if [[ "$neg_trust_status" == "enabled" ]]; then
+  die "Assertion A negative failed: trust short-circuit fired without an agent arg in scope (legacy callers would have wrong semantics)"
+fi
+
+log "Assertion B: bridge_claude_marketplace_ensure_present_for_isolated re-adds drifted marketplace"
+# Stub `claude plugin marketplace list` so the first row enumerates
+# only `agent-bridge` — that simulates the controller-side drift in
+# #853 where cosmax-marketplace silently disappeared from the live
+# list even though known_marketplaces.json still names it. Re-arm the
+# stub to honor `marketplace list` separately from the catch-all log
+# behavior used above.
+SELFHEAL_STUB_DIR="$TMP_ROOT/selfheal-stubs"
+SELFHEAL_STUB_LOG="$TMP_ROOT/selfheal-claude-calls.log"
+mkdir -p "$SELFHEAL_STUB_DIR"
+: > "$SELFHEAL_STUB_LOG"
+chmod 0755 "$SELFHEAL_STUB_DIR"
+chmod 0666 "$SELFHEAL_STUB_LOG"
+# Build the stub script via printf so the new test code stays free of
+# the heredoc patterns the codex review checklist treats as a footgun.
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf 'echo "%s" "$@" >> "%s"\n' 'stub-claude:' "$SELFHEAL_STUB_LOG"
+  printf '%s\n' 'if [[ "$1" == "plugin" && "$2" == "marketplace" && "$3" == "list" ]]; then'
+  printf '%s\n' '  printf "Configured marketplaces:\n  > agent-bridge\n"'
+  printf '%s\n' '  exit 0'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'exit 0'
+} > "$SELFHEAL_STUB_DIR/claude"
+chmod 0755 "$SELFHEAL_STUB_DIR/claude"
+
+env HOME="$CTRL_BLIND_HOME" PATH="$SELFHEAL_STUB_DIR:$PATH" \
+  bash -c 'source "'"$REPO_ROOT"'/bridge-lib.sh"; bridge_load_roster; bridge_claude_marketplace_ensure_present_for_isolated "cosmax-marketplace" "'"$TEST_AGENT"'"' \
+  || die "Assertion B: self-heal helper returned non-zero on a marketplace that should be re-addable"
+
+if ! grep -Fq 'plugin marketplace add COSMAX-PI-Dev-Team/claude-plugin-registry' "$SELFHEAL_STUB_LOG"; then
+  die "Assertion B failed: expected 'plugin marketplace add COSMAX-PI-Dev-Team/claude-plugin-registry' invocation; got: $(cat "$SELFHEAL_STUB_LOG")"
+fi
+
+log "Assertion B negative: helper returns non-zero when known_marketplaces.json has no github source for the marketplace"
+# Replace the catalog with a directory-source-only entry so the repo
+# extractor returns empty. The self-heal helper must NOT shell out
+# `marketplace add` in this case — it should degrade gracefully so the
+# caller (bridge_ensure_claude_plugin_enabled) proceeds with the
+# legacy install attempt and warns loudly.
+python3 -c '
+import json, sys
+path = sys.argv[1]
+payload = {
+    "cosmax-marketplace": {"source": {"source": "directory", "path": "/x"}},
+}
+with open(path, "w") as f:
+    json.dump(payload, f, indent=2)
+' "$CTRL_BLIND_PLUGINS/known_marketplaces.json"
+: > "$SELFHEAL_STUB_LOG"
+
+set +e
+env HOME="$CTRL_BLIND_HOME" PATH="$SELFHEAL_STUB_DIR:$PATH" \
+  bash -c 'source "'"$REPO_ROOT"'/bridge-lib.sh"; bridge_load_roster; bridge_claude_marketplace_ensure_present_for_isolated "cosmax-marketplace" "'"$TEST_AGENT"'"' \
+  >/dev/null 2>&1
+neg_rc=$?
+set -e
+if [[ "$neg_rc" -eq 0 ]]; then
+  die "Assertion B negative failed: helper returned 0 when no github source was extractable"
+fi
+if grep -Fq 'plugin marketplace add' "$SELFHEAL_STUB_LOG"; then
+  die "Assertion B negative failed: helper invoked 'plugin marketplace add' despite no extractable repo: $(cat "$SELFHEAL_STUB_LOG")"
+fi
+
+log "Assertion B isolation gate: helper is a no-op for non-isolated agents"
+# Flip the agent's isolation mode to none transiently and confirm the
+# helper short-circuits without consulting known_marketplaces.json or
+# the marketplace list. Restore after the assertion so downstream tests
+# still see the linux-user isolation expected by the rest of this file.
+_orig_iso_mode="${BRIDGE_AGENT_ISOLATION_MODE["$TEST_AGENT"]}"
+BRIDGE_AGENT_ISOLATION_MODE["$TEST_AGENT"]=""
+: > "$SELFHEAL_STUB_LOG"
+set +e
+env HOME="$CTRL_BLIND_HOME" PATH="$SELFHEAL_STUB_DIR:$PATH" \
+  BRIDGE_AGENT_ISOLATION_MODE_OVERRIDE="" \
+  bash -c '
+    source "'"$REPO_ROOT"'/bridge-lib.sh"
+    bridge_load_roster
+    BRIDGE_AGENT_ISOLATION_MODE["'"$TEST_AGENT"'"]=""
+    bridge_claude_marketplace_ensure_present_for_isolated "cosmax-marketplace" "'"$TEST_AGENT"'"
+  ' >/dev/null 2>&1
+gate_rc=$?
+set -e
+BRIDGE_AGENT_ISOLATION_MODE["$TEST_AGENT"]="$_orig_iso_mode"
+if [[ "$gate_rc" -eq 0 ]]; then
+  die "Assertion B isolation gate failed: helper returned 0 for a non-isolated agent"
+fi
+if [[ -s "$SELFHEAL_STUB_LOG" ]]; then
+  die "Assertion B isolation gate failed: helper shelled out claude for a non-isolated agent: $(cat "$SELFHEAL_STUB_LOG")"
+fi
+
+# Reset the trust-path stub log for the existing post-block assertions
+# below so they observe a clean slate.
+: > "$STUB_LOG"
+
 # Drop the third-party plugin from the channel set so the existing
 # stale-ACL-revoke assertion below operates on the original baseline
 # (declared-plugin only -> replacement-plugin only).
