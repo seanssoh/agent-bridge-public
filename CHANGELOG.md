@@ -6,6 +6,56 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.13.5] — 2026-05-15
+
+### Highlight — hotfix: bridge-cron-runner RESULT_SCHEMA violates OpenAI Structured Outputs strict mode
+
+Live cron failure on the operator's Linux server surfaced an upstream API behavior shift: OpenAI Responses API's Structured Outputs strict mode now rejects schemas where the `required` array does not include every key in `properties` at every nested object level. The previous `RESULT_SCHEMA` in `bridge-cron-runner.py` violated this in two places, breaking every codex-driven cron with `payload_kind=text` (picker-sweep being the canary). Hotfix release.
+
+Operator-observed error verbatim:
+```
+'required' is required to be supplied and to be an array including every key in properties. Missing 'urgency'.
+```
+
+### Fixed
+
+- **bridge-cron-runner RESULT_SCHEMA strict-mode compliance (PR #877)**. Top-level `required` listed 9 of 12 properties (missed `forward_target`, `summary_short`, `channel_relay`). `channel_relay.required` listed 1 of 5 properties (only `body`; missed `urgency`, `transport`, `target`, `subject`). Fix uses the `anyOf [{actual_type}, {"type": "null"}]` pattern for conditional top-level fields so codex emits `null` when the field is not applicable. Strict mode is now satisfied:
+  - All 12 top-level properties listed in top-level `required`.
+  - All 5 `channel_relay.properties` keys listed in `channel_relay.required` (codex emits either the full object or `null`).
+  - `forward_target.required` was already correct (had all 3 of 3).
+
+  The runtime validator (`validate_result` + `normalize_forward_target` + `normalize_channel_relay`) is null-safe — `result.get(key)` returns `None` for null values, normalizers return `None` on `None` input, and existing intent-conditional branches preserve the same semantics. **No validator code changes.**
+
+  Prompt text at `bridge-cron-runner.py:1415-1423` updated to explicitly instruct codex to emit `null` for conditional fields when not applicable (the schema enforces this through Structured Outputs, but explicit prompt instruction reduces model confusion).
+
+  New regression smoke `scripts/smoke/cron-runner-schema-openai-strict.sh` walks `RESULT_SCHEMA` and asserts the invariant: every `properties` block has a `required` array containing all its keys. `scripts/ci-select-smoke.sh` wires the smoke as required when `bridge-cron-runner.py` changes.
+
+  Codex pair-review r1 → `implement-ok` (no findings). CI all green. PR #877 merged at `40f08f9`.
+
+### Operator-host run procedure for v0.13.5
+
+After upgrading a Linux install (the failure surface) to v0.13.5:
+
+```
+agent-bridge upgrade --apply
+agent-bridge cron enable picker-sweep-<id>  # re-activate any cron disabled during diagnosis
+# Watch next cron cycle:
+tail -f ~/.agent-bridge/logs/cron-runner.log
+```
+
+The cron should successfully complete codex round-trips. If the failure recurs, capture the codex CLI stderr — the upstream API may have shifted further and additional schema updates would be needed.
+
+### Why this is a release-grade hotfix
+
+- Production cron blocked since the upstream API change. Every 10-minute cycle was a failure spam.
+- The fix is contained: schema + prompt only; validator and downstream code unchanged.
+- Smoke regression prevents re-introduction.
+
+### Unaffected installs
+
+- **macOS shared-agent installs**: not directly affected (cron-runner uses the same code path on all OSes, but the failure mode only surfaces when codex CLI is actually invoked against a live OpenAI Responses API in strict mode — local mocks / dry-runs would not have triggered it). If macOS install runs codex-driven crons, this hotfix still applies.
+- **agent-bridge installs that don't use codex engine for cron**: not affected at all (the schema is only used when dispatching via codex).
+
 ## [0.13.4] — 2026-05-15
 
 ### Highlight — #857 PR-6: operator-facing channel dotenv migration tool
