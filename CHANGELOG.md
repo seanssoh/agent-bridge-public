@@ -6,6 +6,47 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.13.3] — 2026-05-14
+
+### Highlight — #857 PR-2 + PR-3 combined: channel setup dotenv writes via sudo-as-isolated-UID + local smoke gate unblock
+
+Follow-up to v0.13.1 (#857 PR-1, the sudo-as-isolated-UID **write** helper). PR-2 and PR-3 of the umbrella plan #857 are combined into one PR (`bridge-setup.py` is a shared file; splitting was rejected as churn). After this release, every channel setup command (`agb setup discord|telegram|teams|mattermost`) writes its dotenv (`.env` / `access.json` / `state.json` / `mcp.json`) as the isolated UID at mode 0600 on linux-user-isolated installs, removing the controller's direct write on channel dotenvs entirely.
+
+The runtime ACL stop-gap (`bridge_isolation_v2_apply_channel_state_dotenv_acl` from #851 / PR #855) remains in place as a safety net for one cycle while live installs validate PR-2's behavior; #857 PR-5 will retire the stop-gap in a future release.
+
+### Added
+
+- **Isolation-aware channel setup writes (PR #868, refs #857 PR-2 + PR-3 combined)**. `bridge-setup.py` gains four new helpers symmetric to the existing read-side `_sudo_run_as` / `_isolated_workdir_owner` family:
+  - `_ISOLATED_WRITE_SCRIPT` — inline mirror of `bridge_isolation_write_file_as_agent_user_via_bash` (`lib/bridge-isolation-helpers.sh:181`). Single-quoted Python literal so `$variables` resolve inside the sudo'd bash only. Same rc band (0 = success, 2 = sudo missing, 5-9 = script-rc shifted; rc=127 added in Python on `FileNotFoundError`). No heredoc / here-string anywhere — footgun #11 (memory note `feedback_bash_heredoc_write_class_recurrence`, originating from #815 Wave D, Bash 5.3.9 heredoc_write deadlock class).
+  - `_sudo_write_as(os_user, dest_path, content, mode=0o600)` — symmetric to the existing `_sudo_run_as`. Streams content via `subprocess.run(..., input=content)` (NOT heredoc). Returns `CompletedProcess`; callers inspect rc.
+  - `_resolve_isolated_owner_for_path(path)` — walks up from `path` to the nearest existing ancestor and returns its isolated `agent-bridge-<slug>` owner via `_isolated_workdir_owner`. Necessary because `mkdir` running as the controller would create a controller-owned dir, hiding the isolated lineage from a single-level `path.parent` lstat (codex r1 catch on PR #868).
+  - `_isolation_aware_mkdir(path)` — `mkdir -p` with isolation awareness. If the nearest existing ancestor is isolated-owned, escalates to `sudo -n -u <owner> bash -c 'set -e; umask 0077; mkdir -p "$1"; exit 0'` so missing components land at mode 0700 owned by the isolated UID. Otherwise falls back to `Path.mkdir(parents=True, exist_ok=True)`. Same `SetupError`-on-failure ergonomics as `_sudo_write_as`.
+  - `_isolation_aware_save_text` / `_isolation_aware_save_json` — call the walker, then either delegate to `_sudo_write_as` (isolated lineage) or fall back to the existing `save_text` / `save_json` (controller-owned). `save_text` / `save_json` themselves are untouched and continue to serve non-channel callers (runtime config caches, claude-plugin caches, etc.).
+
+  Ten `save_text` / `save_json` call sites across `cmd_discord` / `cmd_telegram` / `cmd_teams` / `cmd_mattermost` are rewired to the new `_isolation_aware_save_*` variants; four `<channel>_dir.mkdir(parents=True, exist_ok=True)` calls become `_isolation_aware_mkdir(<channel>_dir)`. This covers the mattermost case the umbrella plan implicitly excluded — `lib/bridge-agents.sh:3380-3438` only precreates `discord/telegram/teams/ms365` from `BRIDGE_AGENT_CHANNELS` at agent-create time and omits mattermost, so first-time `agb setup mattermost <agent>` previously had no precreated dir and would have landed on a controller-owned path even with PR-1 in place. The new `_isolation_aware_mkdir` covers this and any other channel added post-create.
+
+  After PR-2: channel dotenv files born at mode 0600 owned by the isolated UID. Controller never opens these files for writing. Read path was already isolated via PR #836 (v0.12.0) — `bridge_channel_env_file_readiness` at `lib/bridge-agents.sh:4239-4302` delegates to `bridge_isolation_run_as_agent_user_via_bash` when the controller can't `[[ -r ]]` the file.
+
+  Codex pair-review: r1 → `needs-more` (controller-side `mkdir` before isolated save) → r2 (walker + `_isolation_aware_mkdir`) → `implement-ok`. Cumulative diff +193 / -14 in a single file. No VERSION/CHANGELOG churn in the feature PR itself; no `setfacl` removal (that's #857 PR-5, deferred).
+
+### Fixed
+
+- **Local smoke gate unblock — shellcheck SC2026 on apostrophe-bearing comment (PR #869)**. `bridge-upgrade.sh:551` previously contained the literal `$'tab'` apostrophe pair inside a `bash -lc '...'` body. Shellcheck's static analyzer (SC2026 info severity) flagged the inner apostrophes as terminating the outer single-quoted string, which exited rc=1 under `set -euo pipefail` in `scripts/smoke-test.sh:210`. Pre-existing since PR #834 (v0.13.0 cycle, 2026-05-12) — broke local `./scripts/smoke-test.sh` while GitHub CI stayed green (different shellcheck invocation). Pure comment rewrite, no runtime behavior change. Restores the CLAUDE.md preflight contract (`./scripts/smoke-test.sh` required-green) for any subsequent local-validated PR.
+
+### Operator-host verification notes for v0.13.3
+
+After upgrading a linux-user-isolated install to v0.13.3, the next `agb setup <channel> <agent>` for a channel not declared in `BRIDGE_AGENT_CHANNELS` at agent-create time should produce:
+
+```
+stat -c '%U:%G %a' "$BRIDGE_AGENT_HOME_ROOT/<agent>/.<channel>/"          # → agent-bridge-<slug>:<group> 700
+stat -c '%U:%G %a' "$BRIDGE_AGENT_HOME_ROOT/<agent>/.<channel>/.env"      # → agent-bridge-<slug>:<group> 600
+getfacl "$BRIDGE_AGENT_HOME_ROOT/<agent>/.<channel>/.env"                 # owner+group+other only; NO `user:<controller>:r--`
+```
+
+The runtime ACL self-heal helper `bridge_isolation_v2_apply_channel_state_dotenv_acl` (called from `bridge-start.sh:479` and `bridge-daemon.sh:3573`) remains in place this cycle as a safety net — verify the new flow works in production for one cycle before #857 PR-5 retires the helper.
+
+Note a slight mode divergence: dirs precreated at agent-create time by `bridge_linux_install_isolated_channel_symlink` (`lib/bridge-agents.sh:3570`) get mode `2770` (group r-w-x + setgid). Dirs created lazily by `_isolation_aware_mkdir` at setup time get mode `0700` (stricter, no group, no setgid). The 0700 case still works correctly because the subsequent save delegates ownership probing to the directory itself; the divergence is cosmetic and aligning it (either tightening precreate to 0700 or loosening the lazy path to 2770) is a future polish, not a correctness issue.
+
 ## [0.13.2] — 2026-05-14
 
 ### Highlight — v0.11.0 → v0.13.0 upgrade migration perm regressions fixed
