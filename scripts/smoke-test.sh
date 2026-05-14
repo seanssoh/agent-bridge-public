@@ -10669,4 +10669,12 @@ bash "$REPO_ROOT/scripts/smoke/isolation-v2-migrate-lock-portability.sh"
 log "running upgrade-isolated-agent-migrate smoke (v0.8.2 hotfix, issue #652)"
 bash "$REPO_ROOT/scripts/smoke/upgrade-isolated-agent-migrate.sh"
 
+# Issue #857 PR-1 — bridge_isolation_write_file_as_agent_user_via_bash
+# is the WRITE counterpart to PR #836's read helper, used by later PRs in
+# the #857 ACL deprecation umbrella to migrate channel-dotenv ownership
+# to the isolated UID. Cover the helper's pre-check rc bands and atomic
+# write sequence whenever lib/bridge-isolation-helpers.sh moves.
+log "running 857-pr1-isolation-write-helper smoke (#857 PR-1)"
+bash "$REPO_ROOT/scripts/smoke/857-pr1-isolation-write-helper.sh"
+
 log "smoke test passed"
