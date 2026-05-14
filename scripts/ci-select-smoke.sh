@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch
 }
 
 add_all_integration() {
@@ -177,7 +177,11 @@ select_for_path() {
       ;;
 
     bridge-setup.py|bridge-setup.sh|bridge-status.py|bridge-status.sh)
-      add_required queue upgrade-conflicts-lifecycle
+      # Issue #835 Wave B: bridge-status.py gained the
+      # `starting/stalled before engine` rendering branch — cover the
+      # regression smoke + engine-alive unit smoke when status entry
+      # points move.
+      add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch
       add_integration integration-minimal
       ;;
 
@@ -187,7 +191,12 @@ select_for_path() {
       ;;
 
     bridge-daemon.sh|bridge-sync.sh|bridge-watchdog.sh|bridge-cron.sh|lib/bridge-cron.sh|lib/bridge-state.sh|lib/bridge-notify.sh)
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner
+      # Issue #835 Wave A / B / C: lib/bridge-state.sh hosts
+      # bridge_agent_launch_cmd (Wave A heredoc extraction) and the
+      # bridge_write_roster_status_snapshot 'starting/stalled before
+      # engine' branch (Wave B). Cover the regression smoke + the
+      # engine-alive unit smoke when this file moves.
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -205,7 +214,13 @@ select_for_path() {
       ;;
 
     bridge-start.sh|bridge-run.sh|bridge-send.sh|bridge-action.sh|bridge-agent.sh|agent-bridge|agb|lib/bridge-tmux.sh|lib/bridge-session-patterns.sh|lib/bridge-wave.sh|lib/bridge-agent-update.sh|lib/bridge-doctor.sh)
-      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering
+      # Issue #835 Wave B: lib/bridge-tmux.sh hosts the new
+      # bridge_agent_engine_process_alive predicate and
+      # bridge_tmux_command_name_matches_engine basename helper.
+      # bridge-agent.sh::bridge_agent_activity_state consumes them.
+      # Cover both Wave C's integration smoke + Wave B's unit smoke
+      # whenever either file moves.
+      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -310,6 +325,17 @@ select_for_path() {
 
     bridge-init.sh|lib/bridge-admin-pair.sh)
       add_required admin-codex-pair upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering
+      add_integration integration-minimal
+      ;;
+
+    scripts/python-helpers/launch-cmd-*.py)
+      # Issue #835 Wave A: launch-cmd Python heredoc bodies were extracted
+      # from lib/bridge-state.sh into standalone .py files to dodge the
+      # Bash 5.3.9 heredoc_write deadlock on the static admin
+      # `bridge_agent_launch_cmd` path. Any modification to these helpers
+      # must re-run the Wave C regression smoke that asserts the call
+      # returns in <2s.
+      add_required 835-static-admin-launch launch launch-dev-channels-injection channel-env-readiness
       add_integration integration-minimal
       ;;
 
