@@ -115,6 +115,15 @@ bash ./scripts/oss-preflight.sh
 - If you change documented behavior, update the corresponding doc (`README.md`, `ARCHITECTURE.md`, `OPERATIONS.md`, `KNOWN_ISSUES.md`, or `docs/developer-handover.md`) in the same change.
 - Do not put private team names, channel tokens, or machine paths into tracked files — this repo is a public snapshot.
 
+## Multi-Issue Work — Evaluate Wave Orchestration First
+
+Before processing 2+ open issues / PRs / tracks (or any work with back-references to multiple GitHub items), evaluate whether the `wave-orchestration` skill applies. The full decision matrix and dispatch contract live in [`docs/agent-runtime/common-instructions.md`](./docs/agent-runtime/common-instructions.md) under *Multi-Item Work — Wave Orchestration 평가*. Headlines:
+
+- 2+ disjoint issues, Track A/B/C splits, or large changes that benefit from per-track PRs → invoke the skill, write per-track briefs, dispatch fixers in parallel via `Agent` with `isolation: "worktree"` + `run_in_background: true`.
+- Single small bug / typo / <50 LOC / interactive review → direct edit, do not invoke the skill.
+- Same-file/same-function conflicts → serialize, never dispatch overlapping fixers in parallel.
+- The directive applies to admin, static, dynamic, and cron sessions. Dynamic agents on ad-hoc work should re-evaluate when hidden back-references appear in the task body.
+
 ## Working With Codex Reviewers
 
 This repo is normally operated by Claude + one or more Codex agents running side by side. The full collaboration contract lives in [`AGENTS.md` §"Multi-Agent Collaboration"](./AGENTS.md). The pieces you need to remember as a Claude author:

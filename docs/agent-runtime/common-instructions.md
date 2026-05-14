@@ -50,6 +50,35 @@ task를 수신하면 아래 순서를 반드시 따른다:
 - 사용자 답이 필요한 질문을 두 번째로 반복하려고 하면, 다시 묻기 전에 `~/.agent-bridge/agent-bridge escalate question --agent <self> --question "<question>" --context "<why the answer is needed>"`로 관리자 외부 채널에 먼저 에스컬레이션한다.
 - 15분 이상 blocked → `agb update <task_id> --status blocked --note "사유"`.
 
+## Multi-Item Work — Wave Orchestration 평가
+
+작업이 단일 task / 단일 surface로 끝나지 않을 가능성이 있으면, **본격 처리 전에 wave-orchestration이 더 맞는 상황인지 먼저 검토한다.** admin/static/dynamic/cron 모든 세션 타입에 적용된다. 평가 자체는 가볍게 — 1분 안에 끝낸다.
+
+### Wave-orchestration이 더 맞는 신호 (1개라도 해당하면 평가 진행)
+
+- 처리할 GitHub issue / PR이 **2개 이상**이고 서로 surface가 겹치지 않는다.
+- 한 이슈가 명시적으로 **Track A/B/C/...** 또는 **Wave 1/2/...** 로 쪼개진다.
+- 큰 변경을 단일 PR로 묶기보다 작은 PR로 쪼개는 게 review/revert 비용이 낮다.
+- 코드 변경이 **>300 LOC + 도메인 전문성** (ACL, daemon, security primitive 등)을 요구해 codex pair-review가 필수다.
+- 사용자가 "백로그 처리해", "이슈 여러 개 닫아", "병렬로 가자", "wave", "track" 등을 언급한다.
+
+### Wave-orchestration이 **맞지 않는** 상황 (skill 호출 금지)
+
+- 단일 1-line 버그 수정 / typo / 명확히 50 LOC 미만 변경 → 직접 edit + PR.
+- 아키텍처 결정이 필요해 사용자와 brainstorm이 먼저 필요한 경우 → wave 아닌 design 모드.
+- 같은 file/function을 만지는 N개 이슈 → 직렬화 필수, 병렬 dispatch 금지.
+- 사용자가 인터랙티브 검토를 원하는 작은 변경.
+
+### 평가 결과 처리
+
+- **Wave-orchestration 적합** 판단 → `wave-orchestration` skill을 invoke해 brief 작성 → fixer dispatch 절차로 진행. 평가 결과(왜 wave가 맞는지)를 한 줄로 사용자/요청자에게 표면화한 뒤 진행.
+- **단일 처리가 맞다** 판단 → wave skill 호출 없이 정상 처리. 단, 처리 중 추가 surface가 드러나면 그 시점에 재평가한다 (mid-task 전환 가능).
+- **판단 불명확** → 안전한 기본은 단일 처리. wave는 명확한 이득이 보일 때만 invoke한다.
+
+### Dynamic agent 특이사항
+
+dynamic agent는 ad-hoc 작업을 받는 경우가 많다. 받은 작업이 단일 surface로 보이더라도 **back-reference (관련 이슈/PR 참조)가 본문에 보이면** wave 평가를 한 번 한다. 이슈가 묶음으로 들어왔는데 brief에 보이지 않을 수 있다.
+
 ## Cron Followup Handling
 
 이 섹션은 cron child가 자기 부모 에이전트(`target_agent`, 보통 admin / operator-attached main session)에게 보내는 `[cron-followup]` task를 어떻게 처리하는지 정의한다. cron child 자체는 외부 채널로 직접 보내지 않는다 — 부모 세션이 단일 user-facing 출구다 ([`ARCHITECTURE.md`](../../ARCHITECTURE.md) "Cron reporting contract" 참조).
