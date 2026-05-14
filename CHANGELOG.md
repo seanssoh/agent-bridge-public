@@ -6,6 +6,23 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-05-14
+
+### Highlight — Wave 3 #825 fix + #857 PR-1 foundation for ACL deprecation
+
+Post-v0.13.0 follow-up wave. Two PRs landed within the same operator-clock as v0.13.0:
+
+1. **#825 closed (PR #862)** — controller-side dev-channels auto-accept watcher silent failure since v0.11.0. Fix is intentionally robust to the underlying root cause (foreground-detector basename regex `claude|claude-*|claude.*` may or may not be the proximate cause depending on the operator's specific Claude invocation — hypothesis was inconclusive on macOS).
+2. **#857 PR-1 (PR #861)** — first step of the 6-PR ACL deprecation umbrella. Adds `bridge_isolation_write_file_as_agent_user_via_bash` symmetric to PR #836's read helper. Subsequent PRs (PR-2/-3/-4) will use this to rewire channel dotenv setup flows; PR-5 will remove the channel-dotenv ACL stop-gap from #851 (PR #855).
+
+### Fixed
+
+- **Pane-content trigger for controller dev-channels auto-accept watcher (PR #862, closes #825)**. `bridge_start_schedule_dev_channels_accept` now polls `bridge_tmux_pane_has_dev_channels_picker` (a new helper that grep'es the tmux pane for the development-channels picker text — "I am using this for local development") BEFORE the foreground process-name gate. When the picker text appears, the watcher exports `BRIDGE_TMUX_DEV_CHANNELS_REQUIRE_CLAUDE_FOREGROUND=0` and sends `C-m` regardless of the foreground basename. Where the foreground gate is still load-bearing, `lib/bridge-tmux.sh` now consults `bridge_tmux_process_tree_has_claude` (the existing process-tree descendant walker from PR #836's family) as a permissive variant — the basename regex `claude|claude-*|claude.*` is left narrow to avoid accidentally matching unrelated `node`/`bun` processes. New regression `scripts/test-controller-dev-channels-accept.sh` with 4 cases (R1 positive control, R2 negative control — the bug, R3 picker-sweep neighbor guard ensuring `scripts/picker-sweep.sh`'s allow-list does NOT overlap with dev-channels picker text, R4 timeout-still-works for the no-picker/no-foreground edge). Generated fixture files are written with `{ printf '%s\n' ... } > file` blocks (footgun #11 — heredoc-stdin and `<<<` here-strings are forbidden anywhere in the smoke). Cross-platform stat extraction uses GNU `-c '%a'` first with BSD `-f '%Lp'` fallback for portability across macOS dev and Linux CI.
+
+### Added
+
+- **Sudo-as-agent-UID write helper `bridge_isolation_write_file_as_agent_user_via_bash` (PR #861, refs #857 PR-1)**. Symmetric to PR #836's read helper at `lib/bridge-isolation-helpers.sh:80`. Signature: `<agent> <dest_path> [mode]` with default mode `0600`. Reads content from stdin pipe (NOT staging file, NOT env, NOT heredoc/here-string at call sites). Inside the isolated UID, an inline `bash -c` script does temp-file-in-destination-dir (same-fs atomic rename), `umask 0077`, `chmod $mode` BEFORE `mv -f` so the published file lands with the correct mode without a readable-by-others window. RC contract mirrors the read helper exactly: 0 = isolated+sudo+success, 1 = not isolated (caller falls back to direct write), 2 = isolated+no passwordless sudo, 3+ = script returned non-zero with rc preserved (rcs<3 shifted into 3+ band). Pre-check via the existing `bridge_isolation_can_sudo_to_agent` for DRY with the read helper. New smoke `scripts/smoke/857-pr1-isolation-write-helper.sh` with 7 mocked-sudo cases (A1-A7: default mode, custom mode, dest-dir missing, mktemp fail, stdin pipe fail, chmod fail, mv fail) plus 1 env-gated real two-UID case (B1, requires `BRIDGE_ISOLATION_HELPERS_TEST_UID` + passwordless sudo to that user — explicit `SKIP:` log when env is unset). Wired into `scripts/ci-select-smoke.sh` as required when `lib/bridge-isolation-helpers.sh` changes. **PR-1 only.** Caller rewires land in subsequent umbrella PRs.
+
 ## [0.13.0] — 2026-05-14
 
 ### Highlight — v0.11.0 fallout cleared + agb perf 94.5% faster + ACL stop-gap + controller-blind plugin trust
