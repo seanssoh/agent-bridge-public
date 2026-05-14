@@ -344,6 +344,15 @@ else
   # future commit that touches an unrelated file cannot accidentally
   # regress the deadlock or detection-gap class without CI catching it.
   add_required heredoc-regression
+  # Task #4494 Wave D: integrated dynamic-recovery smoke exercises the
+  # 3 already-shipped surface fixes from #826 (PR #837 bridge-sync
+  # grace) / #827 (PR #840 live Claude session id pre-transcript) /
+  # #828 (PR #839 skill auto-help opt-in) in a single end-to-end flow
+  # simulating the operator's 2026-05-14 `crm-test` recovery scenario.
+  # Pinned to every required-suite run regardless of diff so a future
+  # commit that touches an unrelated file cannot regress any of the
+  # three vectors in combination.
+  add_required 4494-integrated-dynamic-recovery
 fi
 
 selected_list="$(printf '%s\n' "$selected" | sed '/^$/d')"
