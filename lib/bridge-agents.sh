@@ -3877,56 +3877,24 @@ bridge_extract_channels_from_command() {
   printf '%s' "$csv"
 }
 
+# Issue #835 Wave A' — body lives in scripts/python-helpers/. The
+# previous in-line Python body was read through bash stdin redirection;
+# on Homebrew Bash 5.3.9 that read can wedge in `heredoc_write` when
+# this wrapper is invoked inside a command substitution from an
+# absolute-path-sourced shell — same class that closed #800 / #815 /
+# #827 / #840 for daemon, CLI, status, and session-id hot paths, and
+# that Wave A flagged as upstream of the `bridge_agent_launch_cmd
+# patch` wedge on the launch-cmd hot path. Moving the body into a real
+# script bypasses the bash read entirely. (Forbidden pattern strings
+# intentionally omitted from this comment so the footgun #11
+# self-audit grep recipe does not flag a textual mention as a real
+# callsite.)
 bridge_extract_development_channels_from_command() {
   local command="${1:-}"
 
   bridge_require_python
-  python3 - "$command" <<'PY'
-import shlex
-import sys
-
-command = sys.argv[1]
-
-def normalize(raw: str):
-    values = []
-    seen = set()
-    for chunk in raw.split(","):
-        item = chunk.strip()
-        if not item or item in seen:
-            continue
-        seen.add(item)
-        values.append(item)
-    return values
-
-try:
-    tokens = shlex.split(command)
-except ValueError:
-    print("")
-    raise SystemExit(0)
-
-items = []
-seen = set()
-i = 0
-while i < len(tokens):
-    token = tokens[i]
-    if token == "--dangerously-load-development-channels":
-        i += 1
-        while i < len(tokens) and not tokens[i].startswith("-"):
-            for item in normalize(tokens[i]):
-                if item not in seen:
-                    seen.add(item)
-                    items.append(item)
-            i += 1
-        continue
-    if token.startswith("--dangerously-load-development-channels="):
-        for item in normalize(token.split("=", 1)[1]):
-            if item not in seen:
-                seen.add(item)
-                items.append(item)
-    i += 1
-
-print(",".join(items))
-PY
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/extract-dev-channels-from-command.py" \
+    "$command"
 }
 
 bridge_channel_csv_contains() {
