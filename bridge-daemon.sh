@@ -214,6 +214,19 @@ bridge_agent_heartbeat_activity_state() {
     return 0
   fi
 
+  # Issue #835 Wave B: distinguish "tmux up, engine never spawned"
+  # (starting) from "engine present mid-turn" (working). The heartbeat
+  # path persists activity_state into agent_state, which downstream
+  # consumers (bridge-queue priority computation, bridge-doctor
+  # diagnostics, dashboard renderers) read directly — so making the
+  # snapshot, agent-show, and heartbeat paths agree avoids transient
+  # disagreement during the operator's wedge window.
+  if bridge_tmux_engine_requires_prompt "$engine" \
+      && ! bridge_agent_engine_process_alive "$agent" "$engine"; then
+    printf '%s' "starting"
+    return 0
+  fi
+
   printf '%s' "working"
 }
 
