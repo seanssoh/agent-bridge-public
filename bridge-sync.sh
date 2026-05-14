@@ -69,12 +69,24 @@ prune_missing_dynamic_agents() {
       bridge_warn "bridge-sync: archive_dynamic_agent failed for agent='$agent' — skipping; next sweep will retry"
       continue
     fi
+    # Issue #848 (codex r2 Vector 2): bridge_archive_dynamic_agent has just
+    # written the agent's history env to disk via
+    # bridge_write_agent_state_file (lib/bridge-state.sh:2755-2761). That
+    # write alone is sufficient to make the in-process roster cache stale,
+    # so flag the agent for invalidation BEFORE the cleanup half runs.
+    # Without this early flag, an archive-succeeds-but-remove-fails path
+    # falls through the bridge_remove_dynamic_agent_file `continue` below
+    # with the on-disk roster already mutated and the cache flag never set
+    # — bridge_render_active_roster downstream then mis-reports the
+    # pruned-and-archived agent as active.
+    # Rule: track mutation immediately after each successful writer call,
+    # not only after full prune success.
+    PRUNED_DYNAMIC["$agent"]=1
     if ! bridge_remove_dynamic_agent_file "$agent" 2>/dev/null; then
       bridge_warn "bridge-sync: remove_dynamic_agent_file failed for agent='$agent' — skipping; next sweep will retry"
       continue
     fi
     bridge_agent_clear_idle_marker "$agent" 2>/dev/null || true
-    PRUNED_DYNAMIC["$agent"]=1
   done < <(bridge_dynamic_agent_ids)
 
   # Issue #848 (codex r1 Vector 2): bridge_archive_dynamic_agent and

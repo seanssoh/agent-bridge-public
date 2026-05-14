@@ -341,10 +341,51 @@ test_sync_main_render_excludes_pruned() {
   fi
 }
 
+# T6 — Issue #848 codex r2 Vector 2: archive succeeds + remove fails
+# must STILL invalidate the cache, because the archive write has already
+# mutated the on-disk history env. Pre-r3 the flag was only flipped AFTER
+# remove succeeded, so this path fell through `continue` with the cache
+# left stale. Override `bridge_remove_dynamic_agent_file` to return 1 so
+# we exercise the half-success branch deterministically.
+test_prune_archive_ok_remove_fail_still_invalidates() {
+  reset_stubs
+  local now
+  now="$(date +%s)"
+  register_dynamic_agent "stale-half-fail" "$((now - 21600))"  # 6h ago
+  BRIDGE_AGENT_IDS=(stale-half-fail)
+  BRIDGE_ROSTER_CACHE_LOADED=1
+
+  # Override the remove stub for this test only — archive still succeeds
+  # via the existing stub at line 110.
+  # shellcheck disable=SC2329  # invoked indirectly via prune_missing_dynamic_agents
+  bridge_remove_dynamic_agent_file() {
+    STUB_REMOVED[$1]=0
+    return 1
+  }
+
+  unset BRIDGE_DYNAMIC_START_GRACE_SECONDS
+  prune_missing_dynamic_agents
+
+  # Restore the default stub so subsequent tests see the success path.
+  # shellcheck disable=SC2329  # invoked indirectly via prune_missing_dynamic_agents
+  bridge_remove_dynamic_agent_file() {
+    STUB_REMOVED[$1]=1
+    return 0
+  }
+
+  smoke_assert_eq "1" "${STUB_ARCHIVED[stale-half-fail]-0}" \
+    "T6 archive ran (history env mutated on disk)"
+  smoke_assert_eq "0" "${STUB_REMOVED[stale-half-fail]-1}" \
+    "T6 remove failed (simulated)"
+  smoke_assert_eq "0" "${BRIDGE_ROSTER_CACHE_LOADED}" \
+    "T6 cache flag invalidated even though remove failed (archive write alone is sufficient)"
+}
+
 smoke_run "T1 prune invalidates cache on churn"            test_prune_invalidates_on_churn
 smoke_run "T2 prune leaves cache intact without churn"     test_prune_skips_invalidate_without_churn
 smoke_run "T3 refresh invalidates cache on persist"        test_refresh_invalidates_on_persist
 smoke_run "T4 refresh leaves cache intact without churn"   test_refresh_skips_invalidate_without_churn
 smoke_run "T5 sync render excludes pruned dynamic"         test_sync_main_render_excludes_pruned
+smoke_run "T6 prune archive-ok+remove-fail still invalidates" test_prune_archive_ok_remove_fail_still_invalidates
 
 smoke_log "all checks passed"
