@@ -255,6 +255,59 @@ else
   err "agent_field='$U7_AGENT_FIELD' rot_col7='$ROT_COL7' (expected agent-a / agent-a)"
 fi
 
+# --- U8: explicit per-agent mode + all entries present=false MUST NOT fall ---
+# back to controller cache (review #2104 finding 1 regression trap). Without
+# this guardrail, "monitor THESE isolated agents" silently degrades to "read
+# controller cache instead", which is exactly the original #831 blind spot:
+# an isolated agent's hidden rate-limit goes un-rotated because the daemon
+# saw a healthy controller-cache signal from a different account.
+step "U8: explicit per-agent mode + all present=false ignores legacy cache (no false rotate)"
+# Build a per-agent payload with TWO entries, both present=false (cache
+# unreadable). Provide a legacy cache pinned at 99% — would normally trigger
+# a rotation if the loader fell back. Expect zero claude snapshots + zero
+# rotation candidates.
+U8_PAYLOAD="$TMP_HOME/u8-payload.json"
+cat >"$U8_PAYLOAD" <<'EOF'
+[
+  {"agent":"agent-a","path":"/nonexistent/a.json","present":false,"payload":null},
+  {"agent":"agent-b","path":"/nonexistent/b.json","present":false,"payload":null}
+]
+EOF
+U8_LEGACY_CACHE="$TMP_HOME/u8-legacy.json"
+make_cache "$U8_LEGACY_CACHE" "subscription" 99.5 "2099-01-01T00:00:00+00:00"
+STATE_U8="$TMP_HOME/u8-state.json"
+OUT_U8="$(python3 "$ROOT_DIR/bridge-usage.py" monitor \
+  --per-agent-cache-json "$U8_PAYLOAD" \
+  --legacy-single-path "$U8_LEGACY_CACHE" \
+  --claude-usage-cache "$U8_LEGACY_CACHE" \
+  --codex-sessions-dir "$TMP_HOME/nonexistent-codex" \
+  --state-file "$STATE_U8" \
+  --rotation-threshold 99 \
+  --json)"
+U8_CLAUDE_COUNT="$(printf '%s' "$OUT_U8" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(sum(1 for s in d.get("snapshots",[]) if s.get("provider")=="claude"))')"
+U8_ROT_COUNT="$(printf '%s' "$OUT_U8" | python3 -c 'import sys,json; d=json.loads(sys.stdin.read()); print(len(d.get("rotation_candidates") or []))')"
+if [[ "$U8_CLAUDE_COUNT" == "0" && "$U8_ROT_COUNT" == "0" ]]; then
+  ok
+else
+  err "claude_count='$U8_CLAUDE_COUNT' rot_count='$U8_ROT_COUNT' (expected 0/0; legacy cache must NOT leak when per-agent mode is explicit)"
+fi
+
+# --- U9: cache payload never appears on python3 argv (review finding 2) ------
+# The shell helper bridge_usage_build_per_agent_payload must route cache
+# contents via a 0600 intermediate file, NOT via argv. We assert this by
+# checking that the function's body does not call `python3 - "$tmp"
+# "${python_args[@]+...}"` and instead passes only two file paths.
+step "U9: payload builder routes cache content via intermediate file, not argv"
+U9_BODY="$(awk '/^bridge_usage_build_per_agent_payload\(\) \{/{c=1} c{print} c && /^\}$/{c=0}' "$ROOT_DIR/bridge-usage.sh")"
+# Must NOT pass python_args (the old argv leak idiom).
+if printf '%s' "$U9_BODY" | grep -qE 'python_args'; then
+  err "bridge_usage_build_per_agent_payload still references python_args — argv leak regression"
+elif ! printf '%s' "$U9_BODY" | grep -qE 'python3 - "\$tmp" "\$rows_tmp"'; then
+  err "bridge_usage_build_per_agent_payload should invoke python3 with exactly two file-path argv (tmp + rows_tmp)"
+else
+  ok
+fi
+
 # --- Summary ----------------------------------------------------------------
 TOTAL=$((PASS + FAIL))
 printf '\n# Issue #831 usage-monitor per-agent suite: %s/%s passed\n' "$PASS" "$TOTAL"

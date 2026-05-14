@@ -191,6 +191,23 @@ def claude_snapshots(
     )
 
 
+def _per_agent_payload_is_present(per_agent_path: Path) -> bool:
+    """Issue #831 r2 (review #2104 finding 1): treat per-agent mode as active
+    as soon as the caller supplied a parseable list payload, even if every
+    entry is `present=false` / unreadable. The earlier "fall through to
+    controller cache when zero per-agent snapshots" path silently re-enabled
+    the original #831 blind spot — caller's intent ("monitor THESE agents")
+    must be honored even when none of them have data.
+    """
+    if not per_agent_path.is_file():
+        return False
+    try:
+        entries = load_json(per_agent_path)
+    except Exception:
+        return False
+    return isinstance(entries, list)
+
+
 def claude_snapshots_per_agent(
     per_agent_path: Path,
     warn: float,
@@ -309,22 +326,29 @@ def collect_snapshots(args: argparse.Namespace) -> list[dict[str, Any]]:
     elevated = _parse_elevated(args, warn, critical)
     snapshots: list[dict[str, Any]] = []
 
-    # Issue #831: when --per-agent-cache-json is supplied, prefer the per-agent
-    # array so each Claude snapshot is tagged with its agent. Otherwise fall
-    # back to the legacy single-controller path for back-compat (U5).
+    # Issue #831: when --per-agent-cache-json is supplied, the caller is in
+    # explicit per-agent mode. Per-agent mode latches on flag presence + a
+    # parseable/list-shaped payload, NOT on snapshot count. If selected agents
+    # all have present=false or unreadable caches, the correct answer is "no
+    # signal from those agents" — NOT "fall back to controller cache" (which
+    # would silently reintroduce the original #831 blind spot, where one
+    # isolated agent's hidden rate-limit went un-rotated).
+    #
+    # The legacy single-controller path is only used when --per-agent-cache-json
+    # is absent (true legacy invocation, e.g. an older operator script).
     per_agent_path_raw = getattr(args, "per_agent_cache_json", None)
-    used_per_agent = False
+    per_agent_mode_active = False
     if per_agent_path_raw:
         per_agent_path = Path(per_agent_path_raw).expanduser()
-        per_agent_snaps = claude_snapshots_per_agent(
-            per_agent_path, warn, critical, elevated=elevated
-        )
-        if per_agent_snaps:
+        per_agent_mode_active = _per_agent_payload_is_present(per_agent_path)
+        if per_agent_mode_active:
+            per_agent_snaps = claude_snapshots_per_agent(
+                per_agent_path, warn, critical, elevated=elevated
+            )
             snapshots.extend(per_agent_snaps)
-            used_per_agent = True
 
-    if not used_per_agent:
-        # Legacy single-controller cache (back-compat). `--legacy-single-path`
+    if not per_agent_mode_active:
+        # True legacy single-controller cache (back-compat). `--legacy-single-path`
         # is accepted as a synonym for `--claude-usage-cache` so the wrapper
         # can always pass both without disturbing existing semantics.
         legacy_raw = getattr(args, "legacy_single_path", None) or args.claude_usage_cache

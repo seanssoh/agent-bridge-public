@@ -199,57 +199,77 @@ cat "$file"
 #   JSON array of {agent, path, present, payload} entries. Returns the
 #   tempfile path on stdout. The tempfile is mode 0600.
 bridge_usage_build_per_agent_payload() {
-  local tmp="" agent="" path="" content="" python_args=()
+  # Issue #831 r2 (review #2104 finding 2): per-agent cache contents must NOT
+  # transit through the python3 argv. Argv is process-table-visible, has
+  # ARG_MAX limits that the prior triplet encoding could hit on a large agent
+  # roster, and crosses the isolation boundary that the 0600 tempfile was
+  # supposed to enforce. Instead, write rows to a separate 0600 intermediate
+  # file (`rows_tmp`) using a TAB-delimited <agent><TAB><path><TAB><b64-content>
+  # framing, then pass ONLY the two file paths via argv. Python streams the
+  # rows file and emits the final JSON array into the output tempfile.
+  local tmp="" rows_tmp="" agent="" path="" content=""
   tmp="$(mktemp)"
-  chmod 600 "$tmp"
+  rows_tmp="$(mktemp)"
+  chmod 600 "$tmp" "$rows_tmp"
 
   while IFS= read -r agent; do
     [[ -n "$agent" ]] || continue
     path="$(bridge_usage_resolve_claude_cache_path "$agent")"
     content="$(bridge_usage_read_claude_cache_for_agent "$agent" "$path")"
-    # Encode each row as agent <TAB> path <TAB> base64(content) so python can
-    # decode without worrying about embedded newlines / quotes / NULs.
-    python_args+=("$agent" "$path" "$(printf '%s' "$content" | base64 | tr -d '\n')")
+    # Line per agent: <agent><TAB><path><TAB><base64-content>. base64 keeps
+    # the encoded value newline-free (tr -d '\n'), so a literal newline
+    # terminates the row safely.
+    printf '%s\t%s\t%s\n' "$agent" "$path" "$(printf '%s' "$content" | base64 | tr -d '\n')" >>"$rows_tmp"
   done
 
-  python3 - "$tmp" "${python_args[@]+"${python_args[@]}"}" <<'PY'
+  python3 - "$tmp" "$rows_tmp" <<'PY'
 import base64
 import json
 import sys
 from pathlib import Path
 
 out_path = Path(sys.argv[1])
-items = sys.argv[2:]
+rows_path = Path(sys.argv[2])
 entries = []
-# items come in (agent, path, b64) triplets.
-for i in range(0, len(items), 3):
-    agent = items[i]
-    path = items[i + 1] if i + 1 < len(items) else ""
-    b64 = items[i + 2] if i + 2 < len(items) else ""
-    raw = ""
-    if b64:
-        try:
-            raw = base64.b64decode(b64).decode("utf-8", errors="replace")
-        except Exception:
-            raw = ""
-    parsed = None
-    present = False
-    if raw.strip():
-        try:
-            parsed = json.loads(raw)
-            present = True
-        except Exception:
-            parsed = None
-            present = False
-    entries.append({
-        "agent": agent,
-        "path": path,
-        "present": present,
-        "payload": parsed,
-    })
+
+with rows_path.open("r", encoding="utf-8") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        parts = line.split("\t", 2)
+        agent = parts[0] if len(parts) > 0 else ""
+        path = parts[1] if len(parts) > 1 else ""
+        b64 = parts[2] if len(parts) > 2 else ""
+        raw = ""
+        if b64:
+            try:
+                raw = base64.b64decode(b64).decode("utf-8", errors="replace")
+            except Exception:
+                raw = ""
+        parsed = None
+        present = False
+        if raw.strip():
+            try:
+                parsed = json.loads(raw)
+                present = True
+            except Exception:
+                parsed = None
+                present = False
+        entries.append({
+            "agent": agent,
+            "path": path,
+            "present": present,
+            "payload": parsed,
+        })
 
 out_path.write_text(json.dumps(entries, ensure_ascii=True), encoding="utf-8")
 PY
+
+  # Clean up the intermediate rows file regardless of python3 exit; the final
+  # payload file (`tmp`) is the caller's responsibility (returned via stdout).
+  rm -f "$rows_tmp" 2>/dev/null || true
+
   printf '%s' "$tmp"
 }
 
