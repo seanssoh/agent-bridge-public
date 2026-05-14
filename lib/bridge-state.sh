@@ -3613,10 +3613,22 @@ bridge_daemon_heartbeat_age_seconds() {
     epoch="$raw"
   else
     # ISO fallback. GNU date (Linux) accepts -d; BSD date (macOS) needs
-    # -j -f. Both are silenced; on parse failure epoch stays empty.
-    epoch="$(date -d "$raw" +%s 2>/dev/null || true)"
+    # -j -f and does NOT accept colonized offsets (`+09:00`) — only
+    # `+0900` form. Codex r1 caught this: the legacy heartbeat documented
+    # in CHANGELOG (`2026-05-13T07:30:05+09:00`) failed the BSD parse
+    # silently and `bridge_daemon_health_signal` reported `health=down`
+    # instead of `health=silent`, masking the wedge condition.
+    #
+    # Normalize the offset before the BSD branch: `+HH:MM` / `-HH:MM`
+    # → `+HHMM` / `-HHMM`. Linux GNU date already accepts both forms
+    # so the normalization is BSD-only but harmless on Linux.
+    local raw_normalized="$raw"
+    if [[ "$raw_normalized" =~ ^(.+)([+-])([0-9]{2}):([0-9]{2})$ ]]; then
+      raw_normalized="${BASH_REMATCH[1]}${BASH_REMATCH[2]}${BASH_REMATCH[3]}${BASH_REMATCH[4]}"
+    fi
+    epoch="$(date -d "$raw_normalized" +%s 2>/dev/null || true)"
     if [[ -z "$epoch" ]]; then
-      epoch="$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$raw" +%s 2>/dev/null || true)"
+      epoch="$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$raw_normalized" +%s 2>/dev/null || true)"
     fi
     [[ "$epoch" =~ ^[0-9]+$ ]] || return 1
   fi

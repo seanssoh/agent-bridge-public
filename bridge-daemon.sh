@@ -5967,42 +5967,48 @@ cmd_start() {
 
     local is_silent="false"
     if [[ -z "$tick_age" ]]; then
-      # No parseable heartbeat. Be conservative: only treat this as
-      # silent when there is also no `state/daemon.heartbeat` file at
-      # all AFTER the daemon process has had time to write its initial
-      # tick. A freshly-started daemon writes the heartbeat within ~1s
-      # (Wave C also emits an initial tick before the main loop), so a
-      # 5s grace covers the start race without masking a real wedge.
-      if [[ ! -f "$BRIDGE_STATE_DIR/daemon.heartbeat" ]]; then
-        # Determine process age via /proc on Linux or `ps -o etime` on
-        # macOS. Treat as silent only if the process has been alive for
-        # longer than the start grace window.
-        local proc_age_seconds=""
-        if [[ -r "/proc/$running_pid/stat" ]]; then
-          local now_epoch boot_epoch start_jiffies clk_tck
-          now_epoch="$(date +%s)"
-          # Field 22 is starttime in clock ticks since boot.
-          start_jiffies="$(awk '{print $22}' "/proc/$running_pid/stat" 2>/dev/null || true)"
-          clk_tck="$(getconf CLK_TCK 2>/dev/null || printf '%s' 100)"
-          if [[ "$start_jiffies" =~ ^[0-9]+$ ]] && [[ "$clk_tck" =~ ^[0-9]+$ ]] && (( clk_tck > 0 )); then
-            boot_epoch="$(awk '/btime/ {print $2}' /proc/stat 2>/dev/null || true)"
-            if [[ "$boot_epoch" =~ ^[0-9]+$ ]]; then
-              proc_age_seconds=$(( now_epoch - (boot_epoch + start_jiffies / clk_tck) ))
-            fi
-          fi
-        else
-          local etime_seconds
-          etime_seconds="$(ps -o etime= -p "$running_pid" 2>/dev/null | awk '{print $1}')"
-          # etime format: [[DD-]HH:]MM:SS
-          if [[ "$etime_seconds" =~ ^([0-9]+-)?(([0-9]+):)?([0-9]+):([0-9]+)$ ]]; then
-            local d=${BASH_REMATCH[1]%-} h=${BASH_REMATCH[3]} m=${BASH_REMATCH[4]} s=${BASH_REMATCH[5]}
-            d=${d:-0}; h=${h:-0}
-            proc_age_seconds=$(( d * 86400 + h * 3600 + m * 60 + s ))
+      # No parseable heartbeat. Either:
+      #   (a) `state/daemon.heartbeat` is missing entirely (real wedge or
+      #       fresh start before the initial-tick write), or
+      #   (b) the file exists but holds an unparseable value (legacy
+      #       ISO format the heartbeat parser couldn't normalize; the
+      #       BSD `date -j -f` does not accept colonized offsets on
+      #       macOS before the r2 fix landed, so a real wedged daemon
+      #       could surface here).
+      # Either way, use process-age as the tie-breaker: treat as silent
+      # only if the daemon process has been alive longer than the
+      # start-race grace window (5s). A freshly-started daemon writes
+      # the heartbeat within ~1s (cmd_run emits an initial tick before
+      # the main loop), so 5s covers the race without masking a real
+      # wedge. Codex r1 catch: do NOT gate the process-age fallback on
+      # heartbeat-file absence — that mapped (file exists + unparseable)
+      # to `is_silent=false` and let `cmd_start` return 0 on a wedged
+      # daemon. The fallback fires whenever tick_age is empty.
+      local proc_age_seconds=""
+      if [[ -r "/proc/$running_pid/stat" ]]; then
+        local now_epoch boot_epoch start_jiffies clk_tck
+        now_epoch="$(date +%s)"
+        # Field 22 is starttime in clock ticks since boot.
+        start_jiffies="$(awk '{print $22}' "/proc/$running_pid/stat" 2>/dev/null || true)"
+        clk_tck="$(getconf CLK_TCK 2>/dev/null || printf '%s' 100)"
+        if [[ "$start_jiffies" =~ ^[0-9]+$ ]] && [[ "$clk_tck" =~ ^[0-9]+$ ]] && (( clk_tck > 0 )); then
+          boot_epoch="$(awk '/btime/ {print $2}' /proc/stat 2>/dev/null || true)"
+          if [[ "$boot_epoch" =~ ^[0-9]+$ ]]; then
+            proc_age_seconds=$(( now_epoch - (boot_epoch + start_jiffies / clk_tck) ))
           fi
         fi
-        if [[ "$proc_age_seconds" =~ ^[0-9]+$ ]] && (( proc_age_seconds > 5 )); then
-          is_silent="true"
+      else
+        local etime_seconds
+        etime_seconds="$(ps -o etime= -p "$running_pid" 2>/dev/null | awk '{print $1}')"
+        # etime format: [[DD-]HH:]MM:SS
+        if [[ "$etime_seconds" =~ ^([0-9]+-)?(([0-9]+):)?([0-9]+):([0-9]+)$ ]]; then
+          local d=${BASH_REMATCH[1]%-} h=${BASH_REMATCH[3]} m=${BASH_REMATCH[4]} s=${BASH_REMATCH[5]}
+          d=${d:-0}; h=${h:-0}
+          proc_age_seconds=$(( d * 86400 + h * 3600 + m * 60 + s ))
         fi
+      fi
+      if [[ "$proc_age_seconds" =~ ^[0-9]+$ ]] && (( proc_age_seconds > 5 )); then
+        is_silent="true"
       fi
     elif (( tick_age > fresh_threshold )); then
       is_silent="true"
