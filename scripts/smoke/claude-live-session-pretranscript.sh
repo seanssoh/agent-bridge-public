@@ -57,10 +57,12 @@ smoke_require_cmd "$PY_BIN"
 # shell is wired up the same way the production daemon and CLI are. The
 # function bodies of bridge_detect_claude_session_id and
 # bridge_resolve_resume_session_id now call out to
-# scripts/python-helpers/*.py rather than running an inline
-# `python3 - <<'PY' ... PY` heredoc — that earlier inline form wedged on
-# Bash 5.3.9 in the heredoc-write deadlock class (#815 / #800). The
-# helper-file form is immune.
+# scripts/python-helpers/*.py rather than running an inline Python
+# heredoc — that earlier inline form wedged on Bash 5.3.9 in the
+# heredoc-write deadlock class (#815 / #800). The helper-file form is
+# immune. (Forbidden pattern strings intentionally omitted from this
+# comment so the footgun #11 grep recipe does not flag a textual
+# mention as a real callsite.)
 # shellcheck source=bridge-lib.sh disable=SC1091
 source "$SMOKE_REPO_ROOT/bridge-lib.sh"
 
@@ -74,9 +76,10 @@ DEAD_PID="999999"
 # session id on stdout.
 #
 # Footgun 11 self-audit: writes the JSON body via mktemp + redirect from
-# python3 stdin → file → cp into fixture, not `cat <<EOF > $session_file`,
-# so the smoke itself never reintroduces the heredoc-to-file pattern that
-# the repo is guarding against.
+# python3 stdout to a tempfile then cp into the fixture, NOT a
+# heredoc-to-file pattern. (Forbidden pattern strings intentionally
+# omitted from this comment so the footgun #11 grep recipe does not flag
+# a textual mention as a real callsite.)
 make_fixture_home() {
   local fixture_home="$1"
   local pid="$2"
