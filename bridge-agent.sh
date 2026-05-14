@@ -1187,6 +1187,7 @@ bridge_agent_queue_maps() {
 bridge_agent_activity_state() {
   local agent="$1"
   local session=""
+  local engine=""
 
   if ! bridge_agent_is_active "$agent"; then
     printf '%s' "stopped"
@@ -1194,8 +1195,19 @@ bridge_agent_activity_state() {
   fi
 
   session="$(bridge_agent_session "$agent")"
-  if bridge_tmux_session_has_prompt "$session" "$(bridge_agent_engine "$agent")"; then
+  engine="$(bridge_agent_engine "$agent")"
+  if bridge_tmux_session_has_prompt "$session" "$engine"; then
     printf '%s' "idle"
+    return 0
+  fi
+
+  # Issue #835 Wave B: tmux exists but no claude/codex descendant in the
+  # pane process tree → starting/stalled before engine. Without this,
+  # `agb agent show` showed `working` for a wedged static admin (operator
+  # 2026-05-14 incident, #835).
+  if bridge_tmux_engine_requires_prompt "$engine" \
+      && ! bridge_agent_engine_process_alive "$agent" "$engine"; then
+    printf '%s' "starting"
     return 0
   fi
 

@@ -66,8 +66,65 @@ bridge_tmux_command_name_is_claude() {
   esac
 }
 
+# Issue #835 Wave B: generalized engine-name predicate used by the
+# tmux-without-engine detection helper. Mirrors bridge_tmux_command_name_is_claude
+# but covers both claude and codex by argument. Kept as a separate function
+# (rather than absorbing into _is_claude with an extra arg) so existing
+# claude-only call sites keep their narrow contract and a future engine
+# kind (e.g., a wrapper "claude-code") is added by extending the case here.
+bridge_tmux_command_name_matches_engine() {
+  local command_name="${1:-}"
+  local engine="${2:-}"
+  local base=""
+
+  [[ -n "$command_name" ]] || return 1
+  [[ -n "$engine" ]] || return 1
+  base="${command_name##*/}"
+  case "$engine" in
+    claude)
+      case "$base" in
+        claude|claude-*|claude.*) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    codex)
+      case "$base" in
+        codex|codex-*|codex.*) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 bridge_tmux_process_tree_has_claude() {
   local root_pid="$1"
+  bridge_tmux_process_tree_has_engine "$root_pid" claude
+}
+
+# Issue #835 Wave B: engine-agnostic process-tree walker. Walks descendants
+# of $root_pid (BFS) and returns 0 if any process's `comm` matches the
+# requested engine kind (claude or codex). The pre-existing
+# bridge_tmux_process_tree_has_claude is preserved as a thin alias so its
+# (claude-only) callers keep their narrow contract; new callers needing
+# codex detection or a parameterized engine should use this helper directly.
+#
+# Implementation mirrors the original claude walker:
+#   - BFS bounded by BRIDGE_TMUX_PROCESS_TREE_MAX_PROCS (default 128) to
+#     defend against pgrep loops on a process namespace under churn.
+#   - `seen` string tracks visited pids without an associative array so the
+#     helper still works under Bash 3.x re-exec paths (we re-exec to Bash 4+
+#     in entry points, but lib/ helpers are sourced from a variety of
+#     contexts including tests that may not re-exec).
+#   - pgrep -P expands to ${child_pid}\n list; we filter to numeric only.
+#   - Footgun #11 (issue #815): NO heredoc-stdin / here-string. The
+#     `done < <(pgrep ...)` process substitution is a /dev/fd pipe, not a
+#     here-string, so it's safe.
+bridge_tmux_process_tree_has_engine() {
+  local root_pid="$1"
+  local engine="$2"
   local max_procs="${BRIDGE_TMUX_PROCESS_TREE_MAX_PROCS:-128}"
   local -a queue=()
   local seen=" "
@@ -77,6 +134,7 @@ bridge_tmux_process_tree_has_claude() {
   local count=0
 
   [[ "$root_pid" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "$engine" ]] || return 1
   [[ "$max_procs" =~ ^[0-9]+$ ]] || max_procs=128
   (( max_procs > 0 )) || max_procs=128
 
@@ -91,7 +149,7 @@ bridge_tmux_process_tree_has_claude() {
     count=$((count + 1))
 
     comm="$(ps -o comm= -p "$pid" 2>/dev/null | awk '{$1=$1; print}' || true)"
-    if bridge_tmux_command_name_is_claude "$comm"; then
+    if bridge_tmux_command_name_matches_engine "$comm" "$engine"; then
       return 0
     fi
 
@@ -119,6 +177,60 @@ bridge_tmux_pane_foreground_is_claude() {
 
   pane_cmd="$(tmux display-message -p -t "$(bridge_tmux_pane_target "$session")" '#{pane_current_command}' 2>/dev/null || true)"
   bridge_tmux_command_name_is_claude "$pane_cmd"
+}
+
+# Issue #835 Wave B: tmux-without-engine detection helper.
+#
+# Returns 0 iff the agent's tmux pane process tree (rooted at the pane_pid
+# from `tmux display-message #{pane_pid}`) contains a process whose comm
+# matches the agent's declared engine kind (claude or codex). Returns 1 if
+# the agent has no live tmux session, the engine kind is not claude/codex
+# (the helper is undefined for other shapes), or no engine descendant is
+# found within BRIDGE_TMUX_PROCESS_TREE_MAX_PROCS.
+#
+# Motivation: the operator's 2026-05-14 #835 incident showed that
+# `bridge_agent_is_active` only checks `tmux has-session`. When
+# bridge-run.sh wedged in the launch-cmd builder (issue #815 follow-up
+# wave) the pane existed with only `bridge-run.sh <agent> --continue`
+# shells underneath — no `claude` child — yet `agb status` rendered the
+# row as `working` because the prompt heuristic in
+# bridge_write_roster_status_snapshot couldn't find the engine prompt and
+# defaulted to "working". This helper is the missing predicate that
+# distinguishes "engine running" from "tmux present but engine never
+# spawned (starting/stalled before engine)".
+#
+# Callers (Wave B integration point): lib/bridge-state.sh::
+# bridge_write_roster_status_snapshot, bridge-agent.sh::
+# bridge_agent_activity_state, and bridge-daemon.sh::
+# bridge_agent_heartbeat_activity_state. All three currently default to
+# `working` when prompt is not detected; with this helper they can
+# distinguish `starting` (no engine yet) from `working` (engine present
+# but mid-turn, no prompt drawn).
+bridge_agent_engine_process_alive() {
+  local agent="$1"
+  local engine="${2:-}"
+  local session=""
+  local pane_pid=""
+
+  [[ -n "$agent" ]] || return 1
+  if [[ -z "$engine" ]]; then
+    engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+  fi
+  # Defined only for prompt-driven engines. Anything else returns 1
+  # (caller must treat the helper as "unknown" / fall through to the
+  # legacy active-by-tmux check).
+  case "$engine" in
+    claude|codex) ;;
+    *) return 1 ;;
+  esac
+
+  session="$(bridge_agent_session "$agent" 2>/dev/null || true)"
+  [[ -n "$session" ]] || return 1
+  bridge_tmux_session_exists "$session" || return 1
+
+  pane_pid="$(bridge_tmux_session_pane_pid "$session")"
+  [[ "$pane_pid" =~ ^[0-9]+$ ]] || return 1
+  bridge_tmux_process_tree_has_engine "$pane_pid" "$engine"
 }
 
 bridge_tmux_wait_for_claude_foreground() {

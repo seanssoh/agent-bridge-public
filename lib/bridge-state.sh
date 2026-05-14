@@ -3032,7 +3032,20 @@ bridge_write_roster_status_snapshot() {
         if bridge_tmux_session_has_prompt_from_text "$engine" "$recent"; then
           activity_state="idle"
         else
-          activity_state="working"
+          # Issue #835 Wave B: distinguish "engine running, no prompt yet"
+          # (working) from "tmux exists but engine never spawned"
+          # (starting). Before this gate, the operator's 2026-05-14 wedge
+          # (bridge-run.sh patch --continue stuck in launch-cmd heredoc
+          # expansion, no `claude` child) rendered as `working`, hiding
+          # the failure mode from `agb status`. The helper is defined only
+          # for claude/codex (other engine shapes fall through to
+          # "working", preserving legacy behavior).
+          if bridge_tmux_engine_requires_prompt "$engine" \
+              && ! bridge_agent_engine_process_alive "$agent" "$engine"; then
+            activity_state="starting"
+          else
+            activity_state="working"
+          fi
         fi
       fi
 

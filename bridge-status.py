@@ -709,7 +709,7 @@ def render_dashboard(args: argparse.Namespace) -> str:
         )
     lines.append("")
     lines.append("Agents")
-    lines.append("  #  agent           eng     src     loop on  state    q   c   b   garden  idle  stale wake chan  nudge  load        session        workdir")
+    lines.append("  #  agent           eng     src     loop on  state     q   c   b   garden  idle  stale wake chan  nudge  load        session        workdir")
 
     active_index = 0
     for row in roster:
@@ -742,12 +742,16 @@ def render_dashboard(args: argparse.Namespace) -> str:
         )
         load_bar = f"q:{render_bar(queued, width=4, char='=')} c:{render_bar(claimed, width=4, char='*')}"
         wake_state = "zmb" if zombie else (row.get("wake") or "-")
+        # Issue #835 Wave B: column width bumped from 7 to 8 chars so the
+        # new "starting" state (tmux present, engine descendant not yet
+        # spawned in pane process tree) renders without truncation
+        # alongside the legacy "stopped"/"idle"/"working" values.
         lines.append(
             f"{idx_label}  {agent:<15} {row['engine']:<7} "
             f"{(row.get('source') or '-')[:7]:<7} "
             f"{str(row.get('loop') or '-')[:4]:<4} "
             f"{'yes' if active else 'no ':<3} "
-            f"{activity_state:<7} "
+            f"{activity_state:<8} "
             f"{queued:>2}  {claimed:>2}  {blocked:>2}  "
             f"{garden_str:>6}  "
             f"{fmt_idle(int(activity_ts) if activity_ts else None):>4}  "
