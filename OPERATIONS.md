@@ -553,15 +553,20 @@ tmux-managed agents nobody is watching, this freezes the session indefinitely.
 `scripts/picker-sweep.sh` scans every tmux session, detects a picker that
 matches a closed pattern allow-list, and presses Enter on the default option.
 
-The utility is **opt-in**: it is shipped in the repo but does nothing unless
-both the cron registration *and* the `BRIDGE_PICKER_SWEEP_ENABLED=1` flag are
-present.
+The utility is **auto-registered on every fresh install** (server and dev,
+as of #833): `bridge-init.sh` registers a `*/10 * * * *` bridge-native cron
+whose payload sets `BRIDGE_PICKER_SWEEP_ENABLED=1`, so the sweep runs out of
+the box. Manual invocations (operator running `scripts/picker-sweep.sh` by
+hand, outside the cron payload) still respect the host_profile=dev
+default-skip — set `BRIDGE_PICKER_SWEEP_ENABLED=1` in the calling environment
+to override that path. To disable the cron on a given install, run
+`agb cron update picker-sweep --disable` after init.
 
 ### Required environment
 
 | Variable | Purpose |
 | --- | --- |
-| `BRIDGE_PICKER_SWEEP_ENABLED` | Set to `1` to enable the sweep. Default `0` (no-op). |
+| `BRIDGE_PICKER_SWEEP_ENABLED` | Tri-state runtime gate. Unset on `host_profile=dev`: manual runs default-skip (hint emitted on stderr). Unset on any other profile (or no host-profile file): runs by default. Set to `1`: always runs regardless of profile. Set to `0`: always skips. The cron payload registered by `bridge-init.sh` and by the upgrade backfill always sets `=1`, so cron-fired runs are not subject to this default-skip — only ad-hoc manual invocations are. |
 | `BRIDGE_PICKER_SWEEP_SELF` | Agent name to skip when scanning. Set this to the agent that *runs* the sweep so its own pane (which often contains picker text in PR bodies, docs, or logs) is not auto-Entered. Empty = no self-skip. |
 | `BRIDGE_PICKER_SWEEP_NOTIFY` | Admin agent ID. When non-empty, picker-sweep enqueues a queue task summarising auto-unstick events. Empty = log-only. |
 

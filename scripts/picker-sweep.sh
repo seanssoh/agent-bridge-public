@@ -7,18 +7,23 @@
 # indefinitely. This script scans every tmux session, detects a picker that
 # matches a closed pattern allow-list, and presses Enter on the default option.
 #
-# Usage (essential cron; default-enabled on host_profile=server, default-skipped
-# on host_profile=dev; explicit BRIDGE_PICKER_SWEEP_ENABLED=0 always wins):
+# Usage (essential cron; cron registration is unconditional as of #833, so a
+# fresh `bridge-init` produces a working sweep on both server and dev installs.
+# The runtime default-skip on host_profile=dev applies only to manual runs that
+# do not set BRIDGE_PICKER_SWEEP_ENABLED — the auto-registered cron payload
+# always sets it, so cron-fired runs execute regardless of profile.
+# Explicit BRIDGE_PICKER_SWEEP_ENABLED=0 always wins):
 #
-#   *) On host_profile=server installs (the post-bridge-init default), this
-#      script is wired up automatically — `bridge-init.sh` auto-registers a
+#   *) On every fresh install, `bridge-init.sh` auto-registers a
 #      `*/10 * * * *` bridge-native cron via
 #      `lib/bridge-init-default-crons.sh::bridge_init_register_default_picker_sweep`.
-#      Operators do not need to register it manually on fresh server inits.
+#      Operators do not need to register it manually. To disable on a given
+#      install, run `agb cron update picker-sweep --disable` after init.
 #   *) Explicit override: `BRIDGE_PICKER_SWEEP_ENABLED=0` in the environment
 #      that invokes the script (or in the cron payload) forces the
 #      explicit-opt-out path. `BRIDGE_PICKER_SWEEP_ENABLED=1` forces the
-#      enabled path even on host_profile=dev.
+#      enabled path even on host_profile=dev (the auto-registered cron
+#      payload sets this).
 #   *) Set BRIDGE_PICKER_SWEEP_SELF to the agent name running this cron, so
 #      its own tmux pane is skipped (false-positives from talking ABOUT a
 #      picker in a doc/PR/log are the dominant failure mode).
@@ -62,15 +67,18 @@ _psw_log() {
 }
 
 # ---------------------------------------------------------------------------
-# Opt-in gate. Default is now enabled on server hosts (Track D follow-up to
-# #713 / #809) — picker-sweep is one of the essentials that ought to run by
-# default on hosted installs. Two opt-out paths remain:
+# Opt-in gate. Cron registration is unconditional as of #833, and the auto-
+# registered cron payload always sets `BRIDGE_PICKER_SWEEP_ENABLED=1` — so
+# cron-fired runs execute on both server and dev installs. The runtime gates
+# below apply only to MANUAL invocations (operator running this script by
+# hand outside the cron payload):
 #
 #   1. `BRIDGE_PICKER_SWEEP_ENABLED=0` — explicit operator opt-out, wins
 #      against any host_profile signal.
 #   2. `host_profile=dev` — when the env value is unset, a dev install
-#      default-skips. The operator can still set `BRIDGE_PICKER_SWEEP_ENABLED=1`
-#      on a dev host to override.
+#      default-skips a manual run. The operator can set
+#      `BRIDGE_PICKER_SWEEP_ENABLED=1` on a dev host to override; the
+#      auto-registered cron payload already does this.
 #
 # Order matters: explicit env wins over host_profile.
 # ---------------------------------------------------------------------------
@@ -85,6 +93,7 @@ if [[ -z "${BRIDGE_PICKER_SWEEP_ENABLED:-}" ]]; then
         source "$BRIDGE_HOME/lib/bridge-host-profile.sh"
         if bridge_host_profile_is_dev; then
             _psw_log "host_profile=dev — picker-sweep default-skipped (set BRIDGE_PICKER_SWEEP_ENABLED=1 to override)"
+            printf '[picker-sweep] host_profile=dev — set BRIDGE_PICKER_SWEEP_ENABLED=1 to enable per-feature (see OPERATIONS.md). The cron payload already sets this; this skip only applies to manual runs.\n' >&2
             exit 0
         fi
     fi

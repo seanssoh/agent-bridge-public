@@ -568,11 +568,16 @@ if [[ $dry_run -eq 0 ]]; then
       bridge_init_append_warning "host_profile=dev: requested channels (${channels}) — channel bootstrap skipped this init. Re-run \`agb setup <channel> ${admin_agent}\` later or pass \`--profile server\` to enable on this install."
     fi
   fi
-  # Track D follow-up to #713 / #809: auto-register the picker-sweep
-  # bridge-native cron on host_profile=server installs. Idempotent (the
-  # helper short-circuits if a `picker-sweep` job already exists).
+  # Track D follow-up to #713 / #809, follow-on to #833: auto-register the
+  # picker-sweep bridge-native cron on every fresh install, regardless of
+  # host_profile. The helper is idempotent (short-circuits when a job titled
+  # `picker-sweep` already exists), and the registered cron payload sets
+  # `BRIDGE_PICKER_SWEEP_ENABLED=1` — that env var wins against the runtime
+  # host_profile=dev default-skip in scripts/picker-sweep.sh, so a dev install
+  # gets a working sweep without an extra opt-in step. Operators who want the
+  # sweep disabled can `agb cron update picker-sweep --disable` after init.
   # Non-fatal: helper logs and returns 0 on any failure so init keeps going.
-  if [[ -n "$host_profile_chosen" && "$host_profile_chosen" != "dev" ]]; then
+  if [[ -n "$host_profile_chosen" ]]; then
     bridge_init_register_default_picker_sweep "$host_profile_cli" "$admin_agent" || true
   fi
 fi
