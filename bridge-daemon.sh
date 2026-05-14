@@ -1059,7 +1059,11 @@ process_usage_monitor() {
   bridge_agent_exists "$admin_agent" || return 1
   bridge_usage_due || return 1
 
-  if ! monitor_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-usage.sh" monitor --json 2>/dev/null)"; then
+  # Issue #831: read each Claude agent's own usage cache, not just the
+  # controller's $HOME. Default scope mirrors bridge-auth.sh sync (static
+  # Claude roster). Operators can broaden via BRIDGE_USAGE_MONITOR_AGENTS.
+  local usage_monitor_agents_scope="${BRIDGE_USAGE_MONITOR_AGENTS:-static}"
+  if ! monitor_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-usage.sh" monitor --json --agents "$usage_monitor_agents_scope" 2>/dev/null)"; then
     bridge_note_usage_poll
     return 1
   fi
@@ -1086,7 +1090,8 @@ process_usage_monitor() {
   printf '%s\n' "$alert_rows" > "$_alert_tmp"
   printf '%s\n' "$rotation_rows" > "$_rotation_tmp"
 
-  while IFS=$'\t' read -r provider account window bucket used_percent reset_at source body; do
+  local triggering_agent=""
+  while IFS=$'\t' read -r provider account window bucket used_percent reset_at source triggering_agent body; do
     [[ -z "$provider" || -z "$window" || -z "$bucket" ]] && continue
     if [[ "$bucket" == "crit" ]]; then
       priority="urgent"
@@ -1098,6 +1103,10 @@ process_usage_monitor() {
     if bridge_agent_has_notify_transport "$admin_agent"; then
       bridge_notify_send "$admin_agent" "$title" "$body" "" "$priority" "${BRIDGE_DAEMON_NOTIFY_DRY_RUN:-0}" >/dev/null 2>&1 || true
     fi
+    # Issue #831: record the triggering agent in the audit row so operators
+    # can attribute a per-agent usage spike to its source agent rather than
+    # the controller. Empty string preserves the previous row shape for
+    # legacy-single-cache invocations.
     bridge_audit_log daemon usage_alert "$admin_agent" \
       --detail provider="$provider" \
       --detail account="$account" \
@@ -1105,11 +1114,13 @@ process_usage_monitor() {
       --detail bucket="$bucket" \
       --detail used_percent="$used_percent" \
       --detail reset_at="$reset_at" \
-      --detail source="$source"
+      --detail source="$source" \
+      --detail agent="$triggering_agent"
     alert_count=$((alert_count + 1))
   done < "$_alert_tmp"
 
-  while IFS=$'\t' read -r provider account window used_percent reset_at source body; do
+  local worst_case_agent=""
+  while IFS=$'\t' read -r provider account window used_percent reset_at source worst_case_agent body; do
     [[ -z "$provider" || "$provider" != "claude" || -z "$window" ]] && continue
     # Rotate only once per monitor pass; bridge-usage.py already latches each
     # provider/account/window candidate once per usage reset cycle.
@@ -1127,6 +1138,9 @@ process_usage_monitor() {
     # downstream ``case`` statement routes through the ``error:*`` branch.
     rotation_status_row="$(bridge_with_timeout 5 rotation_status_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" rotation-status-parse "$rotate_json" || true)"
     IFS=$'\t' read -r rotation_status rotation_reason rotation_from rotation_to rotation_sync_status <<<"$rotation_status_row"
+    # Issue #831: record `worst_case_agent` — the agent whose usage actually
+    # crossed the rotation threshold this pass. Empty for legacy single-cache
+    # rows. Distinct from `agent_scope` (the rotation fanout target).
     bridge_audit_log daemon claude_token_rotation "$admin_agent" \
       --detail status="$rotation_status" \
       --detail reason="$rotation_reason" \
@@ -1139,7 +1153,8 @@ process_usage_monitor() {
       --detail from="$rotation_from" \
       --detail to="$rotation_to" \
       --detail sync_status="$rotation_sync_status" \
-      --detail agent_scope="$rotation_agent_scope"
+      --detail agent_scope="$rotation_agent_scope" \
+      --detail worst_case_agent="$worst_case_agent"
     case "$rotation_status:$rotation_reason" in
       rotated:*)
         title="claude token rotated"

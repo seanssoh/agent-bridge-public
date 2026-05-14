@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""bridge-usage.py - collect and monitor Claude/Codex usage windows."""
+"""bridge-usage.py - collect and monitor Claude/Codex usage windows.
+
+Issue #831 — Claude usage caches live under each agent's own home in any
+linux-user-isolated install. The monitor used to read the controller's
+$HOME cache only, which on an isolated rig is empty. This module now
+accepts ``--per-agent-cache-json <path>`` (an array built by
+bridge-usage.sh from each agent's resolved cache path) and tags every
+snapshot with ``agent_id``. The monitor's per-key latch is extended with
+``agent`` so two agents sharing the same plan/account/window cannot mask
+each other's rotation triggers.
+"""
 
 from __future__ import annotations
 
@@ -123,18 +133,15 @@ def normalize_window(name: str, minutes: Any) -> str:
     return f"{value}m"
 
 
-def claude_snapshots(
-    path: Path,
+def _claude_snapshots_from_payload(
+    payload: Any,
+    source: str,
     warn: float,
     critical: float,
-    elevated: float | None = None,
+    elevated: float | None,
+    agent: str | None,
 ) -> list[dict[str, Any]]:
-    if not path.is_file():
-        return []
-    try:
-        payload = load_json(path)
-    except Exception:
-        return []
+    """Shared body for claude_snapshots() and the per-agent collector."""
     if not isinstance(payload, dict):
         return []
     data = payload.get("data") or payload.get("lastGoodData") or {}
@@ -152,16 +159,89 @@ def claude_snapshots(
             percent = float(used_percent)
         except (TypeError, ValueError):
             percent = None  # type: ignore[assignment]
-        snapshots.append(
-            {
-                "provider": "claude",
-                "account": plan,
-                "window": window,
-                "used_percent": percent,
-                "reset_at": reset_at,
-                "health": classify_health(percent, warn, critical, elevated=elevated),
-                "source": str(path),
-            }
+        entry: dict[str, Any] = {
+            "provider": "claude",
+            "account": plan,
+            "window": window,
+            "used_percent": percent,
+            "reset_at": reset_at,
+            "health": classify_health(percent, warn, critical, elevated=elevated),
+            "source": source,
+        }
+        if agent is not None:
+            entry["agent"] = agent
+        snapshots.append(entry)
+    return snapshots
+
+
+def claude_snapshots(
+    path: Path,
+    warn: float,
+    critical: float,
+    elevated: float | None = None,
+) -> list[dict[str, Any]]:
+    if not path.is_file():
+        return []
+    try:
+        payload = load_json(path)
+    except Exception:
+        return []
+    return _claude_snapshots_from_payload(
+        payload, str(path), warn, critical, elevated, agent=None
+    )
+
+
+def _per_agent_payload_is_present(per_agent_path: Path) -> bool:
+    """Issue #831 r2 (review #2104 finding 1): treat per-agent mode as active
+    as soon as the caller supplied a parseable list payload, even if every
+    entry is `present=false` / unreadable. The earlier "fall through to
+    controller cache when zero per-agent snapshots" path silently re-enabled
+    the original #831 blind spot — caller's intent ("monitor THESE agents")
+    must be honored even when none of them have data.
+    """
+    if not per_agent_path.is_file():
+        return False
+    try:
+        entries = load_json(per_agent_path)
+    except Exception:
+        return False
+    return isinstance(entries, list)
+
+
+def claude_snapshots_per_agent(
+    per_agent_path: Path,
+    warn: float,
+    critical: float,
+    elevated: float | None = None,
+) -> list[dict[str, Any]]:
+    """Issue #831: read the per-agent cache payload array (built by
+    bridge-usage.sh) and emit one snapshot set per agent. Each snapshot is
+    tagged with `agent` so the monitor latch key can include agent identity.
+    """
+    if not per_agent_path.is_file():
+        return []
+    try:
+        entries = load_json(per_agent_path)
+    except Exception:
+        return []
+    if not isinstance(entries, list):
+        return []
+
+    snapshots: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        agent = str(entry.get("agent") or "").strip()
+        if not agent:
+            continue
+        if not entry.get("present"):
+            continue  # U3: agent's cache missing entirely → skip silently.
+        payload = entry.get("payload")
+        source = str(entry.get("path") or "")
+        snapshots.extend(
+            _claude_snapshots_from_payload(
+                payload, source, warn, critical, elevated, agent=agent
+            )
         )
     return snapshots
 
@@ -244,10 +324,38 @@ def collect_snapshots(args: argparse.Namespace) -> list[dict[str, Any]]:
     warn = float(args.warn_threshold)
     critical = float(args.critical_threshold)
     elevated = _parse_elevated(args, warn, critical)
-    snapshots = []
-    snapshots.extend(
-        claude_snapshots(Path(args.claude_usage_cache).expanduser(), warn, critical, elevated=elevated)
-    )
+    snapshots: list[dict[str, Any]] = []
+
+    # Issue #831: when --per-agent-cache-json is supplied, the caller is in
+    # explicit per-agent mode. Per-agent mode latches on flag presence + a
+    # parseable/list-shaped payload, NOT on snapshot count. If selected agents
+    # all have present=false or unreadable caches, the correct answer is "no
+    # signal from those agents" — NOT "fall back to controller cache" (which
+    # would silently reintroduce the original #831 blind spot, where one
+    # isolated agent's hidden rate-limit went un-rotated).
+    #
+    # The legacy single-controller path is only used when --per-agent-cache-json
+    # is absent (true legacy invocation, e.g. an older operator script).
+    per_agent_path_raw = getattr(args, "per_agent_cache_json", None)
+    per_agent_mode_active = False
+    if per_agent_path_raw:
+        per_agent_path = Path(per_agent_path_raw).expanduser()
+        per_agent_mode_active = _per_agent_payload_is_present(per_agent_path)
+        if per_agent_mode_active:
+            per_agent_snaps = claude_snapshots_per_agent(
+                per_agent_path, warn, critical, elevated=elevated
+            )
+            snapshots.extend(per_agent_snaps)
+
+    if not per_agent_mode_active:
+        # True legacy single-controller cache (back-compat). `--legacy-single-path`
+        # is accepted as a synonym for `--claude-usage-cache` so the wrapper
+        # can always pass both without disturbing existing semantics.
+        legacy_raw = getattr(args, "legacy_single_path", None) or args.claude_usage_cache
+        snapshots.extend(
+            claude_snapshots(Path(legacy_raw).expanduser(), warn, critical, elevated=elevated)
+        )
+
     snapshots.extend(
         codex_snapshots(Path(args.codex_sessions_dir).expanduser(), warn, critical, elevated=elevated)
     )
@@ -336,6 +444,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 0
     for snapshot in snapshots:
+        # Issue #831: include agent column so isolated-per-agent runs are
+        # legible in tab output. Empty for legacy controller-cache rows.
         print(
             "\t".join(
                 [
@@ -346,6 +456,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                     str(snapshot.get("reset_at", "")),
                     str(snapshot.get("health", "")),
                     str(snapshot.get("source", "")),
+                    str(snapshot.get("agent", "")),
                 ]
             )
         )
@@ -363,13 +474,25 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     critical = float(args.critical_threshold)
     elevated = _parse_elevated(args, warn, critical)
     rotation_threshold = float(args.rotation_threshold)
+    # Track the worst-case agent so the aggregate rotation row tells the
+    # operator which agent triggered. Per #831 patch-dev r2 §4: a 99% on
+    # agent-A must NOT be masked by a 60% on agent-B sharing the same plan.
+    worst_case_agent: str | None = None
+    worst_case_percent: float = -1.0
 
     for snapshot in snapshots:
+        # Issue #831 patch-dev r2 §4: include agent identity in the latching
+        # key. Two isolated agents on the same Claude plan/account/window must
+        # have independent rotation_triggered_at state so one cannot mask the
+        # other. Non-agent snapshots (codex, legacy controller cache) latch
+        # with an empty agent field — order-independent and back-compat.
+        snapshot_agent = str(snapshot.get("agent") or "")
         key = "::".join(
             [
                 str(snapshot.get("provider", "")),
                 str(snapshot.get("account", "")),
                 str(snapshot.get("window", "")),
+                snapshot_agent,
             ]
         )
         bucket = bucket_for_snapshot(snapshot, warn, critical, elevated=elevated)
@@ -419,17 +542,24 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             and isinstance(used_percent, (int, float))
             and used_percent >= rotation_threshold
         ):
+            # Track worst-case across this monitor pass — used for aggregate
+            # attribution in the output envelope.
+            if used_percent > worst_case_percent:
+                worst_case_percent = float(used_percent)
+                worst_case_agent = snapshot_agent or None
             if not rotation_triggered_at:
-                rotation_candidates.append(
-                    {
-                        **snapshot,
-                        "rotation_threshold": rotation_threshold,
-                        "message": (
-                            f"Claude usage rotation candidate: {snapshot.get('window') or 'unknown'} "
-                            f"window at {used_percent:.0f}% (threshold {rotation_threshold:.0f}%)."
-                        ),
-                    }
-                )
+                candidate = {
+                    **snapshot,
+                    "rotation_threshold": rotation_threshold,
+                    "worst_case_agent": snapshot_agent or None,
+                    "message": (
+                        f"Claude usage rotation candidate: {snapshot.get('window') or 'unknown'} "
+                        f"window at {used_percent:.0f}% (threshold {rotation_threshold:.0f}%)"
+                        + (f" on agent {snapshot_agent}" if snapshot_agent else "")
+                        + "."
+                    ),
+                }
+                rotation_candidates.append(candidate)
                 rotation_triggered_at = now_iso()
                 rotation_triggered_reset_at = reset_at
         elif snapshot.get("provider") == "claude":
@@ -447,12 +577,33 @@ def cmd_monitor(args: argparse.Namespace) -> int:
 
     state["updated_at"] = now_iso()
     save_monitor_state(state_path, state)
+    # Per-agent breakdown: one entry per (agent, provider, window) with the
+    # latest used_percent so operator-facing output can show "agent-A 99%,
+    # agent-B 60%". Sorted by used_percent desc so the worst-case row is
+    # first.
+    per_agent_breakdown = sorted(
+        (
+            {
+                "agent": str(s.get("agent") or ""),
+                "provider": s.get("provider"),
+                "account": s.get("account"),
+                "window": s.get("window"),
+                "used_percent": s.get("used_percent"),
+                "health": s.get("health"),
+            }
+            for s in snapshots
+            if s.get("agent")
+        ),
+        key=lambda r: (-(r["used_percent"] if isinstance(r["used_percent"], (int, float)) else -1)),
+    )
     result = {
         "generated_at": now_iso(),
         "snapshots": snapshots,
         "alerts": alerts,
         "rotation_candidates": rotation_candidates,
         "state_file": str(state_path),
+        "worst_case_agent": worst_case_agent,
+        "per_agent_breakdown": per_agent_breakdown,
     }
     if args.json:
         print(json.dumps(result, ensure_ascii=True, indent=2))
@@ -504,6 +655,11 @@ def build_parser() -> argparse.ArgumentParser:
         cmd.add_argument("--warn-threshold", type=float, default=90.0, **common_kwargs)
         cmd.add_argument("--elevated-threshold", type=float, default=95.0, **common_kwargs)
         cmd.add_argument("--critical-threshold", type=float, default=100.0, **common_kwargs)
+        # Issue #831 per-agent collection. Both optional; back-compat is
+        # preserved (U5) when neither is supplied or per-agent payload is
+        # empty.
+        cmd.add_argument("--per-agent-cache-json", default=None, **common_kwargs)
+        cmd.add_argument("--legacy-single-path", default=None, **common_kwargs)
 
     status_parser = sub.add_parser("status")
     add_source_args(status_parser)

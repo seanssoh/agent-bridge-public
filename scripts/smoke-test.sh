@@ -10502,6 +10502,13 @@ bash "$REPO_ROOT/scripts/test-stale-resume.sh"
 log "running channel-probe-isolated regression suite (issue #832)"
 bash "$REPO_ROOT/scripts/test-channel-probe-isolated.sh"
 
+# Issue #831 — usage monitor must read each Claude agent's own usage cache
+# (per-agent latching), not just the controller's $HOME. Without this, two
+# isolated agents sharing the same plan can mask each other's rotation
+# triggers.
+log "running usage-monitor-isolated regression suite (issue #831)"
+bash "$REPO_ROOT/scripts/test-usage-monitor-isolated.sh"
+
 # Issue #541 PR-A — memory-daily payload jsonl-aware migration regression.
 log "running cron-migrate-payloads smoke (issue #541 PR-A)"
 bash "$REPO_ROOT/scripts/smoke/cron-migrate-payloads.sh"
