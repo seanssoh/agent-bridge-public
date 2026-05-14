@@ -3127,128 +3127,21 @@ bridge_persist_agent_state() {
   bridge_write_agent_state_file "$agent" "$(bridge_history_file_for_agent "$agent")"
 }
 
+# Issue #827: live-session acceptance (sessions/<pid>.json present, pid
+# alive, cwd matches, no transcript jsonl yet) is implemented in the
+# Python helper. The bash body uses `python3 "$BRIDGE_SCRIPT_DIR/scripts
+# /python-helpers/detect-claude-session-id.py"` rather than an inline
+# `python3 - <<'PY' ... PY` heredoc — the former is immune to the Bash
+# 5.3.9 `heredoc_write` deadlock class (issue #815 / #800) that wedges
+# the function when callers wrap it in command substitution from a shell
+# sourced via absolute path.
 bridge_detect_claude_session_id() {
   local workdir="$1"
   local since_ms="${2:-0}"
   local exclude_csv="${3:-}"
 
-  python3 - "$workdir" "$since_ms" "$exclude_csv" <<'PY'
-import glob
-import json
-import os
-import re
-import sys
-
-workdir = os.path.realpath(sys.argv[1])
-since_ms = int(sys.argv[2] or "0")
-if 0 < since_ms < 10**11:
-    since_ms *= 1000
-exclude = {x for x in sys.argv[3].split(",") if x}
-best = None
-
-
-def read_transcript_session_id(path):
-    try:
-        if os.path.getsize(path) <= 0:
-            return None
-        with open(path, "r", encoding="utf-8") as fh:
-            seen = 0
-            for raw in fh:
-                line = raw.strip()
-                if not line:
-                    continue
-                seen += 1
-                try:
-                    obj = json.loads(line)
-                except Exception:
-                    if seen >= 10:
-                        break
-                    continue
-                if isinstance(obj, dict):
-                    found = obj.get("sessionId")
-                    if found:
-                        return found
-                if seen >= 10:
-                    break
-    except Exception:
-        return None
-    return None
-
-
-def workdir_slug_candidates(path):
-    # Claude encodes the project dir by replacing "/" (always) and "." (most
-    # versions) with "-". Accept both variants so older transcripts still
-    # match.
-    slash_only = path.replace("/", "-")
-    slash_and_dot = re.sub(r"[/.]", "-", path)
-    candidates = [slash_only]
-    if slash_and_dot != slash_only:
-        candidates.append(slash_and_dot)
-    return candidates
-
-
-# Primary: live sessions/<pid>.json records.
-for path in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        continue
-    sid = data.get("sessionId")
-    cwd = os.path.realpath(str(data.get("cwd") or ""))
-    started = int(data.get("startedAt") or 0)
-    if cwd != workdir or not sid or sid in exclude:
-        continue
-    if since_ms and started < max(0, since_ms - 300000):
-        continue
-    transcript = None
-    for slug in workdir_slug_candidates(workdir):
-        candidate = os.path.expanduser(
-            f"~/.claude/projects/{slug}/{sid}.jsonl"
-        )
-        if os.path.isfile(candidate):
-            transcript = candidate
-            break
-    if transcript is None:
-        for candidate in glob.glob(
-            os.path.expanduser(f"~/.claude/projects/**/{sid}.jsonl"),
-            recursive=True,
-        ):
-            if os.path.isfile(candidate):
-                transcript = candidate
-                break
-    if transcript is None:
-        continue
-    if best is None or started > best[0]:
-        best = (started, sid)
-
-# Fallback: dead processes left behind a transcript but sessions/<pid>.json
-# has already been cleaned up. Pick the most recent transcript in the
-# agent's project dir so `continue=1` agents can resume after a restart.
-if best is None:
-    transcripts = []
-    for slug in workdir_slug_candidates(workdir):
-        transcripts.extend(
-            glob.glob(os.path.expanduser(f"~/.claude/projects/{slug}/*.jsonl"))
-        )
-    for transcript in transcripts:
-        stem = os.path.splitext(os.path.basename(transcript))[0]
-        if not stem or stem in exclude:
-            continue
-        try:
-            mtime_ms = int(os.path.getmtime(transcript) * 1000)
-        except Exception:
-            continue
-        if since_ms and mtime_ms < max(0, since_ms - 300000):
-            continue
-        # Filename is what `claude --resume` takes; trust it even if the
-        # first-line sessionId disagrees (legacy transcripts may lack it).
-        read_transcript_session_id(transcript)
-        if best is None or mtime_ms > best[0]:
-            best = (mtime_ms, stem)
-
-print(best[1] if best else "")
-PY
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/detect-claude-session-id.py" \
+    "$workdir" "$since_ms" "$exclude_csv"
 }
 
 # bridge_resolve_resume_session_id is the single source of truth for whether
@@ -3281,98 +3174,12 @@ bridge_resolve_resume_session_id() {
   fi
   [[ -n "$workdir" ]] || return 1
 
-  python3 - "$workdir" "$candidate" "$max_age_hours" "$agent" <<'PY'
-import os
-import re
-import sys
-import time
-
-input_workdir = sys.argv[1]
-workdir = os.path.realpath(input_workdir)
-candidate = sys.argv[2] or ""
-try:
-    max_age_hours = float(sys.argv[3])
-except ValueError:
-    max_age_hours = 48.0
-agent = sys.argv[4] or ""
-
-cutoff = time.time() - max_age_hours * 3600
-
-
-def workdir_slug_candidates(path):
-    slash_only = path.replace("/", "-")
-    slash_and_dot = re.sub(r"[/.]", "-", path)
-    candidates = [slash_only]
-    if slash_and_dot != slash_only:
-        candidates.append(slash_and_dot)
-    return candidates
-
-
-def ordered_slug_candidates(paths):
-    candidates = []
-    seen = set()
-    for path in paths:
-        for slug in workdir_slug_candidates(path):
-            if slug not in seen:
-                seen.add(slug)
-                candidates.append(slug)
-    return candidates
-
-
-eligible = []
-seen_stems = set()
-for slug in ordered_slug_candidates([input_workdir, workdir]):
-    base = os.path.expanduser(f"~/.claude/projects/{slug}")
-    if not os.path.isdir(base):
-        continue
-    try:
-        entries = os.listdir(base)
-    except OSError:
-        continue
-    for entry in entries:
-        if not entry.endswith(".jsonl"):
-            continue
-        stem = entry[: -len(".jsonl")]
-        if not stem or stem in seen_stems:
-            continue
-        full = os.path.join(base, entry)
-        try:
-            st = os.stat(full)
-        except OSError:
-            continue
-        if not os.path.isfile(full) or st.st_size <= 0:
-            continue
-        if st.st_mtime < cutoff:
-            continue
-        seen_stems.add(stem)
-        eligible.append((st.st_mtime, stem))
-
-if not eligible:
-    sys.stderr.write(
-        f"[debug] resume id rejected: no eligible transcript within {max_age_hours}h "
-        f"for workdir={workdir} agent={agent}\n"
-    )
-    sys.exit(1)
-
-eligible.sort(key=lambda t: t[0], reverse=True)
-freshest_stem = eligible[0][1]
-
-if candidate and candidate == freshest_stem:
-    print(candidate, end="")
-    sys.exit(0)
-
-if candidate:
-    sys.stderr.write(
-        f"[debug] resume id replaced: candidate={candidate} "
-        f"freshest={freshest_stem} workdir={workdir} agent={agent}\n"
-    )
-    print(freshest_stem, end="")
-    sys.exit(2)
-
-# Empty candidate: freshest eligible is just an acceptance, not a replacement.
-print(freshest_stem, end="")
-sys.exit(0)
-PY
+  # The python body lives in a file rather than an inline heredoc-stdin
+  # for the same reason bridge_detect_claude_session_id does — see issue
+  # #827 / #815 / #800. The live-session shortcut (issue #827) is
+  # implemented inside the helper.
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-claude-resume-session-id.py" \
+    "$workdir" "$candidate" "$max_age_hours" "$agent"
 }
 
 # Returns 0 (true) if the given workdir has any in-window
