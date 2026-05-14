@@ -432,6 +432,17 @@ if bridge_isolation_disabled_by_env; then
 elif bridge_agent_linux_user_isolation_effective "$AGENT"; then
   AGENT_ENV_FILE="$(bridge_agent_linux_env_file "$AGENT")"
   bridge_write_linux_agent_env_file "$AGENT" "$AGENT_ENV_FILE"
+  # Issue #851: pre-launch re-assert of the channel dotenv ACL. The
+  # daemon's health loop also self-heals on observed drift, but an
+  # operator running `agent start` should not have to wait a daemon
+  # cycle when the dotenv mask has reverted to `---` since the last
+  # session shutdown. Idempotent on a healthy file; warns and continues
+  # on a non-Linux host. Suppress operator-visible noise — the helper
+  # logs via bridge_warn when something actually fails, and the post
+  # launch verify still surfaces a hard channel-auth failure separately.
+  if command -v bridge_isolation_v2_apply_channel_state_dotenv_acl >/dev/null 2>&1; then
+    bridge_isolation_v2_apply_channel_state_dotenv_acl "$AGENT" >/dev/null 2>&1 || true
+  fi
 fi
 
 SESSION_CMD="$(bridge_join_quoted "$BRIDGE_BASH_BIN" "$RUNNER" "$AGENT")"

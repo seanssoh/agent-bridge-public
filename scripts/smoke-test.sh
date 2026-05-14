@@ -10502,6 +10502,14 @@ bash "$REPO_ROOT/scripts/test-stale-resume.sh"
 log "running channel-probe-isolated regression suite (issue #832)"
 bash "$REPO_ROOT/scripts/test-channel-probe-isolated.sh"
 
+# Issue #851 — runtime channel dotenv ACL mask reverts to --- after plugin
+# writes inherit the controller umask. Pins the new self-heal helper
+# bridge_isolation_v2_apply_channel_state_dotenv_acl that the daemon health
+# loop + pre-launch path call when an isolated agent's dotenv flips to
+# auth=unreadable.
+log "running channel-dotenv-mask-repair regression suite (issue #851)"
+bash "$REPO_ROOT/scripts/test-channel-dotenv-mask-repair.sh"
+
 # Issue #831 — usage monitor must read each Claude agent's own usage cache
 # (per-agent latching), not just the controller's $HOME. Without this, two
 # isolated agents sharing the same plan can mask each other's rotation
