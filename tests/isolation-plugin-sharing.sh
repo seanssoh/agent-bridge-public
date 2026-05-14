@@ -877,6 +877,33 @@ if [[ "$neg_trust_status" == "enabled" ]]; then
   die "Assertion A negative failed: trust short-circuit fired without an agent arg in scope (legacy callers would have wrong semantics)"
 fi
 
+log "Assertion A missing-manifest negative: isolated agent + spec absent from manifest -> 'missing', not 'enabled'"
+# codex r1 (#858 checkpoint 6): assert the controller-blind short-circuit
+# is strictly key-set-driven. The manifest at $CTRL_BLIND_PLUGINS holds
+# only THIRD_SPEC; query with a different spec and confirm the trust
+# path does NOT false-positive the result to "enabled". The expected
+# fall-through is `claude plugin list` (via $STUB_DIR/claude), which
+# logs the call and prints nothing matching — yielding "missing".
+: > "$STUB_LOG"
+MISSING_SPEC="nonexistent-spec@cosmax-marketplace"
+missing_trust_status="$(env HOME="$CTRL_BLIND_HOME" PATH="$STUB_DIR:$PATH" \
+  bash -c 'source "'"$REPO_ROOT"'/bridge-lib.sh"; bridge_load_roster; bridge_claude_plugin_status "'"$MISSING_SPEC"'" "'"$TEST_AGENT"'"')"
+if [[ "$missing_trust_status" == "enabled" ]]; then
+  die "Assertion A missing-manifest negative failed: trust short-circuit fired for a spec the manifest does NOT list; got '$missing_trust_status' (expected 'missing')"
+fi
+if [[ "$missing_trust_status" != "missing" ]]; then
+  die "Assertion A missing-manifest negative failed: expected 'missing' for absent spec, got '$missing_trust_status'"
+fi
+# The stub MUST have been invoked — that proves the short-circuit did
+# not silently return early. If empty, the controller-blind path
+# fabricated a result without consulting either the manifest's key
+# set (correctly absent) or the legacy `claude plugin list` fallback.
+if [[ ! -s "$STUB_LOG" ]]; then
+  die "Assertion A missing-manifest negative failed: claude stub was never invoked; the short-circuit returned a fabricated result for an absent spec"
+fi
+# Reset the stub log so downstream assertions observe a clean slate.
+: > "$STUB_LOG"
+
 log "Assertion B: bridge_claude_marketplace_ensure_present_for_isolated re-adds drifted marketplace"
 # Stub `claude plugin marketplace list` so the first row enumerates
 # only `agent-bridge` — that simulates the controller-side drift in

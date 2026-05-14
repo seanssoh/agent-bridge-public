@@ -6053,8 +6053,14 @@ bridge_ensure_claude_plugin_enabled() {
       # catches the directory-source agent-bridge marketplace case.
       marketplace="$(bridge_claude_plugin_marketplace "$plugin_spec")"
       if [[ -n "$marketplace" && -n "$agent" ]]; then
+        # codex r1 (#858): drop the stdout/stderr suppression so the
+        # helper's own bridge_warn on `claude plugin marketplace add`
+        # failure surfaces to the operator. `|| true` is retained
+        # because the caller intentionally continues into the legacy
+        # install path on any non-zero rc — the helper documents that
+        # contract in its banner comment.
         bridge_claude_marketplace_ensure_present_for_isolated "$marketplace" "$agent" \
-          >/dev/null 2>&1 || true
+          || true
       fi
       bridge_info "[info] Installing Claude plugin: $plugin_spec"
       if ! output="$(claude plugin install --scope user "$plugin_spec" 2>&1)"; then
