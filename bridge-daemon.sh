@@ -3186,6 +3186,10 @@ bridge_report_channel_health_miss() {
   [[ "$admin_agent" != "$agent" ]] || return 0
 
   status="$(bridge_agent_channel_status "$agent")"
+  # Issue #832: `unknown` (controller-blind) is an indeterminate readiness,
+  # not a confirmed mismatch. Treat it like `ok`/`-` for audit purposes —
+  # do NOT fire a channel_health_miss row, and clear any stale state so we
+  # do not leak a "still firing" signal once the operator fixes ACLs.
   if [[ "$status" != "miss" ]]; then
     bridge_clear_channel_health_state "$agent"
     return 0
