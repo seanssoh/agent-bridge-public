@@ -456,7 +456,11 @@ case_a7_single_agent_filter() {
     rc=0
     out="$(bridge_isolation_v3_channel_dotenv_cli --check --agent agent-test 2>&1)" || rc=$?
     smoke_assert_eq 0 "$rc" "A7.1: --agent agent-test --check rc=0"
-    smoke_assert_contains "$out" "agent-test" "A7.1: row mentions the scoped agent path"
+    # The row path is the agent's mocked workdir (fixture-rooted at .../a7/
+    # by `case_fixture_root a7`, not by the agent name). Verify the
+    # workdir path appears in stdout — that's the actual proof that
+    # scoping picked the correct agent's workdir.
+    smoke_assert_contains "$out" "$workdir" "A7.1: row mentions the scoped agent workdir"
 
     # Unknown agent: bridge_die path → rc=1 (our mock returns 1).
     rc=0
