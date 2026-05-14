@@ -5950,9 +5950,114 @@ cmd_start() {
   fi
 
   if bridge_daemon_is_running; then
-    daemon_info "bridge daemon already running (pid=$(bridge_daemon_pid))"
-    bridge_start_silence_watchdog || true
-    return 0
+    # Issue #815 Wave C: detect pid-alive-but-tick-stale and auto-repair.
+    # Before Wave C, `agb daemon start` only checked pid liveness and
+    # returned "already running" even when the daemon's main loop had
+    # been wedged for hours (issue #815 evidence: heartbeat stuck 18h
+    # while pid still alive). Now we also check tick freshness; if the
+    # pid is alive but the heartbeat is stale by more than the configured
+    # threshold, treat as a silent-but-alive condition and run the repair
+    # sequence: kill the silent daemon, clean state, restart fresh.
+    local running_pid
+    running_pid="$(bridge_daemon_pid)"
+    local tick_age=""
+    tick_age="$(bridge_daemon_heartbeat_age_seconds 2>/dev/null || true)"
+    local fresh_threshold="${BRIDGE_DAEMON_TICK_FRESH_SECONDS:-120}"
+    [[ "$fresh_threshold" =~ ^[0-9]+$ ]] || fresh_threshold=120
+
+    local is_silent="false"
+    if [[ -z "$tick_age" ]]; then
+      # No parseable heartbeat. Either:
+      #   (a) `state/daemon.heartbeat` is missing entirely (real wedge or
+      #       fresh start before the initial-tick write), or
+      #   (b) the file exists but holds an unparseable value (legacy
+      #       ISO format the heartbeat parser couldn't normalize; the
+      #       BSD `date -j -f` does not accept colonized offsets on
+      #       macOS before the r2 fix landed, so a real wedged daemon
+      #       could surface here).
+      # Either way, use process-age as the tie-breaker: treat as silent
+      # only if the daemon process has been alive longer than the
+      # start-race grace window (5s). A freshly-started daemon writes
+      # the heartbeat within ~1s (cmd_run emits an initial tick before
+      # the main loop), so 5s covers the race without masking a real
+      # wedge. Codex r1 catch: do NOT gate the process-age fallback on
+      # heartbeat-file absence — that mapped (file exists + unparseable)
+      # to `is_silent=false` and let `cmd_start` return 0 on a wedged
+      # daemon. The fallback fires whenever tick_age is empty.
+      local proc_age_seconds=""
+      if [[ -r "/proc/$running_pid/stat" ]]; then
+        local now_epoch boot_epoch start_jiffies clk_tck
+        now_epoch="$(date +%s)"
+        # Field 22 is starttime in clock ticks since boot.
+        start_jiffies="$(awk '{print $22}' "/proc/$running_pid/stat" 2>/dev/null || true)"
+        clk_tck="$(getconf CLK_TCK 2>/dev/null || printf '%s' 100)"
+        if [[ "$start_jiffies" =~ ^[0-9]+$ ]] && [[ "$clk_tck" =~ ^[0-9]+$ ]] && (( clk_tck > 0 )); then
+          boot_epoch="$(awk '/btime/ {print $2}' /proc/stat 2>/dev/null || true)"
+          if [[ "$boot_epoch" =~ ^[0-9]+$ ]]; then
+            proc_age_seconds=$(( now_epoch - (boot_epoch + start_jiffies / clk_tck) ))
+          fi
+        fi
+      else
+        local etime_seconds
+        etime_seconds="$(ps -o etime= -p "$running_pid" 2>/dev/null | awk '{print $1}')"
+        # etime format: [[DD-]HH:]MM:SS
+        if [[ "$etime_seconds" =~ ^([0-9]+-)?(([0-9]+):)?([0-9]+):([0-9]+)$ ]]; then
+          local d=${BASH_REMATCH[1]%-} h=${BASH_REMATCH[3]} m=${BASH_REMATCH[4]} s=${BASH_REMATCH[5]}
+          d=${d:-0}; h=${h:-0}
+          proc_age_seconds=$(( d * 86400 + h * 3600 + m * 60 + s ))
+        fi
+      fi
+      if [[ "$proc_age_seconds" =~ ^[0-9]+$ ]] && (( proc_age_seconds > 5 )); then
+        is_silent="true"
+      fi
+    elif (( tick_age > fresh_threshold )); then
+      is_silent="true"
+    fi
+
+    if [[ "$is_silent" == "true" ]]; then
+      printf '[daemon] silent daemon detected (pid=%s, tick stale by %ss) — repair sequence: kill + restart\n' \
+        "$running_pid" "${tick_age:-unknown}" >&2
+      bridge_audit_log daemon daemon_start_repair_silent daemon \
+        --detail pid="$running_pid" \
+        --detail tick_age_seconds="${tick_age:-unknown}" \
+        --detail threshold_seconds="$fresh_threshold" 2>/dev/null || true
+
+      # Stop the silent daemon. We bypass cmd_stop here because cmd_stop
+      # has a guard against stopping with active agents (issues
+      # #314/#315) that we explicitly want to override on a wedged
+      # daemon — the silence watchdog uses `stop --force` for the same
+      # reason. We mirror that intent inline so the repair path is
+      # legible and doesn't require cmd_stop to learn a new flag.
+      if kill -TERM "$running_pid" 2>/dev/null; then
+        local deadline=$(( $(date +%s) + 5 ))
+        while (( $(date +%s) <= deadline )); do
+          kill -0 "$running_pid" 2>/dev/null || break
+          sleep 0.2
+        done
+        if kill -0 "$running_pid" 2>/dev/null; then
+          kill -KILL "$running_pid" 2>/dev/null || true
+          sleep 0.2
+        fi
+      fi
+
+      # Stop the silence watchdog cleanly so the restart sequence
+      # starts a fresh supervisor with the new daemon pid in view.
+      bridge_stop_silence_watchdog 2>/dev/null || true
+
+      # Clean stale state so the restarted daemon does not inherit a
+      # confusing heartbeat / pid that would skew the next health check.
+      rm -f "$BRIDGE_DAEMON_PID_FILE" 2>/dev/null || true
+      rm -f "$BRIDGE_STATE_DIR/daemon.heartbeat" 2>/dev/null || true
+
+      bridge_audit_log daemon daemon_start_repair_silent_killed daemon \
+        --detail prior_pid="$running_pid" 2>/dev/null || true
+      daemon_info "silent daemon repaired (killed pid=$running_pid); proceeding to fresh start"
+      # Fall through to the start path below.
+    else
+      daemon_info "bridge daemon already running (pid=$running_pid)"
+      bridge_start_silence_watchdog || true
+      return 0
+    fi
   fi
 
   # Issue #712: stale supplementary-group cache after v1→v2 migration
@@ -6024,6 +6129,21 @@ cmd_run() {
   [[ "$heartbeat_interval" =~ ^[0-9]+$ ]] || heartbeat_interval=60
   local last_heartbeat_ts=0
   local now_ts
+
+  # Issue #815 Wave C: emit one initial daemon_tick + heartbeat write BEFORE
+  # the first sync cycle so the post-restart healthy state is observable
+  # within ~1s, not after the first periodic boundary. Without this, a
+  # caller that runs `daemon stop && daemon start && daemon status` in
+  # quick succession sees `health: silent` for up to 60s after a successful
+  # restart, defeating the auto-repair signal.
+  now_ts="$(date +%s)"
+  bridge_audit_log daemon daemon_tick daemon \
+    --detail loop_step="startup_initial_tick" \
+    --detail interval_seconds="$BRIDGE_DAEMON_INTERVAL" \
+    --detail heartbeat_interval_seconds="$heartbeat_interval" \
+    2>/dev/null || true
+  printf '%s\n' "$now_ts" 2>/dev/null >"$BRIDGE_STATE_DIR/daemon.heartbeat" || true
+  last_heartbeat_ts="$now_ts"
 
   while true; do
     BRIDGE_DAEMON_LAST_STEP="sync_cycle"
@@ -6184,6 +6304,38 @@ cmd_status() {
   else
     echo "stopped socket_listener=${socket_status}"
   fi
+
+  # Issue #815 Wave C: surface tick freshness + derived health so
+  # operators can answer "is the daemon actually doing work?" not just
+  # "is the pid alive?". The fields are additive — existing parsers that
+  # key off `running pid=` / `stopped` are unaffected. The single-line
+  # `health: <ok|silent|down> ...` summary is the human-facing answer;
+  # the three key=value lines preserve the grep-grammar for tooling.
+  local health_age="" health_fresh="" health_state=""
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      tick_age_seconds=*) health_age="${line#tick_age_seconds=}" ;;
+      tick_fresh=*)       health_fresh="${line#tick_fresh=}" ;;
+      health=*)           health_state="${line#health=}" ;;
+    esac
+    printf '%s\n' "$line"
+  done < <(bridge_daemon_health_signal)
+  case "$health_state" in
+    ok)
+      echo "health: ok (pid alive, last tick ${health_age:-?}s ago)"
+      ;;
+    silent)
+      if [[ -n "$health_age" ]]; then
+        echo "health: silent (pid alive but tick is ${health_age}s stale — likely wedged; \`agb daemon start\` will auto-repair)"
+      else
+        echo "health: silent (pid alive but no parseable heartbeat — likely wedged; \`agb daemon start\` will auto-repair)"
+      fi
+      ;;
+    *)
+      echo "health: down (no live pid)"
+      ;;
+  esac
   # Issue #590 / PR #599 r2: surface every log path the operator may need
   # so `agent-bridge daemon status` answers "where is the daemon writing?"
   # directly. r3: BRIDGE_LAUNCHAGENT_LOG is now resolved from the same
