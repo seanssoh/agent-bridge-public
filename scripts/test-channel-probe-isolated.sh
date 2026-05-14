@@ -295,6 +295,76 @@ case "$(printf 'present\nmissing\nunreadable\ncontroller-blind\n' | grep -Fx "$C
     ;;
 esac
 
+# --- C11: inline probe script regex parity with controller-side helper -------
+# The other isolated cases stub out bridge_isolation_run_as_agent_user_via_bash
+# entirely so they don't exercise the inline grep. This case extracts the
+# probe script literally from lib/bridge-agents.sh and runs it against fixture
+# files to verify regex parity with bridge_env_file_has_any_nonempty_key — in
+# particular that `export KEY=value` is accepted on the isolated path (the
+# controller helper at lib/bridge-agents.sh:4220 accepts that form).
+step "C11: inline probe accepts 'export KEY=value' (parity with controller helper)"
+
+INLINE_PROBE="$TMP_HOME/inline-probe.sh"
+{
+  printf '#!/usr/bin/env bash\n'
+  # Extract the probe_script body verbatim — between the single-quoted opener
+  # and the standalone closing quote line. This keeps the test trapping a
+  # future drift in the inline regex.
+  awk "
+    /^[[:space:]]*probe_script='\$/ { capture=1; next }
+    capture && /^'\$/ { capture=0; next }
+    capture { print }
+  " "$ROOT_DIR/lib/bridge-agents.sh"
+} >"$INLINE_PROBE"
+chmod +x "$INLINE_PROBE"
+# Sanity: the extraction produced a nonempty file
+if [[ ! -s "$INLINE_PROBE" ]]; then
+  err "could not extract probe_script from bridge-agents.sh"
+fi
+
+run_probe() {
+  bash "$INLINE_PROBE" "$@"
+}
+
+C11_FAIL=0
+# C11a: bare KEY=value, with key filter, present.
+F11a="$TMP_HOME/c11a.env"
+printf 'DISCORD_BOT_TOKEN=abc123\n' >"$F11a"
+run_probe "$F11a" DISCORD_BOT_TOKEN || { C11_FAIL=1; err "C11a bare key: expected 0 got $?"; }
+
+# C11b: export KEY=value, with key filter — must match.
+F11b="$TMP_HOME/c11b.env"
+printf 'export DISCORD_BOT_TOKEN=abc123\n' >"$F11b"
+run_probe "$F11b" DISCORD_BOT_TOKEN || { C11_FAIL=1; err "C11b export form: expected 0 got $?"; }
+
+# C11c: export with multiple spaces between export and key.
+F11c="$TMP_HOME/c11c.env"
+printf 'export   DISCORD_BOT_TOKEN=abc123\n' >"$F11c"
+run_probe "$F11c" DISCORD_BOT_TOKEN || { C11_FAIL=1; err "C11c multi-space export: expected 0 got $?"; }
+
+# C11d: keyless mode (no positional args after file) accepts export form too.
+F11d="$TMP_HOME/c11d.env"
+printf 'export FOO=bar\n' >"$F11d"
+run_probe "$F11d" || { C11_FAIL=1; err "C11d keyless export: expected 0 got $?"; }
+
+# C11e: empty value still rejected (existing controller helper rejects it too).
+F11e="$TMP_HOME/c11e.env"
+printf 'export DISCORD_BOT_TOKEN=\n' >"$F11e"
+if run_probe "$F11e" DISCORD_BOT_TOKEN 2>/dev/null; then
+  C11_FAIL=1
+  err "C11e empty value: expected 1, got 0 (regex too loose)"
+fi
+
+# C11f: comment line not treated as a value.
+F11f="$TMP_HOME/c11f.env"
+printf '# export DISCORD_BOT_TOKEN=abc\n' >"$F11f"
+if run_probe "$F11f" DISCORD_BOT_TOKEN 2>/dev/null; then
+  C11_FAIL=1
+  err "C11f commented line: expected 1, got 0"
+fi
+
+if [[ "$C11_FAIL" -eq 0 ]]; then ok; fi
+
 # --- Summary -----------------------------------------------------------------
 TOTAL=$((PASS + FAIL))
 printf '\n# Issue #832 channel-probe isolation suite: %s/%s passed\n' "$PASS" "$TOTAL"

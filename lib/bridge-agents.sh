@@ -4315,10 +4315,10 @@ shift
 keys=("$@")
 [[ -r "$file" ]] || exit 2
 if [[ ${#keys[@]} -eq 0 ]]; then
-  grep -Eq "^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*[[:space:]]*=[[:space:]]*[^[:space:]]" "$file" && exit 0 || exit 1
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=[^[:space:]#]" "$file" && exit 0 || exit 1
 fi
 for k in "${keys[@]}"; do
-  grep -Eq "^[[:space:]]*${k}[[:space:]]*=[[:space:]]*[^[:space:]]" "$file" && exit 0
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?${k}=[^[:space:]#].*" "$file" && exit 0
 done
 exit 1
 '
