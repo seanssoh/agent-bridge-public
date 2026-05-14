@@ -6,6 +6,61 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.13.4] — 2026-05-15
+
+### Highlight — #857 PR-6: operator-facing channel dotenv migration tool
+
+Adds `agent-bridge migrate isolation v3` — the in-place migration helper that converges every existing linux-user-isolated agent's channel state files (`.env`, `access.json`, `state.json`, `mcp.json` per provider) toward the v0.13.4 canonical contract: owner=isolated-UID, group=ab-agent-<slug>, mode=0600, no extended ACL. The new write path landed in v0.13.3 (PR-2); PR-6 migrates the existing files that were created under the legacy controller-owned + named-user ACL grant shape.
+
+Default mode is `--dry-run` — operators see the planned mutations before they happen. `--apply` is required for the actual migration. After one production cycle of v3 migrate validation, #857 PR-5 retires the runtime ACL stop-gap (`bridge_isolation_v2_apply_channel_state_dotenv_acl`) and the umbrella issue #857 closes.
+
+### Added
+
+- **`agent-bridge migrate isolation v3` tool (PR #871, refs #857 PR-6)**. New module `lib/bridge-isolation-v3-channel-dotenv.sh` (~530 LOC) + `bridge-migrate.sh` `v3)` dispatcher arm + smoke 9 cases. Modes:
+  - `--check` — drift detection only
+  - `--dry-run` (default — never mutates without explicit opt-in) — emits `would` rows describing the planned mutations
+  - `--apply` — perform the mutations
+  - `--agent <name>` — scope to one agent (default: every linux-user-isolated agent in roster)
+  - `--json` — JSON output (schema matches v2 reapply for piping compatibility)
+
+  The tool walks each agent's 5 channel state dirs (`.discord`, `.telegram`, `.teams`, `.ms365`, `.mattermost`) and asserts the canonical state per file. Reuses v2 reapply's mutation primitives (`bridge_isolation_v2_reapply_chown_chmod_file`, `bridge_isolation_v2_reapply_run_priv`, `bridge_isolation_v2_reapply_record_action`, `bridge_isolation_v2_reapply_has_named_acl`, `bridge_isolation_v2_reapply_probe_owner_group_mode`) — no duplication of the direct-then-sudo, ACL-strip-before-chmod ladder. Path guards mirror the stop-gap helper at `lib/bridge-isolation-v2.sh:2127-2160` (refuse symlinks, non-regular files; require parent-dir basename `.<provider>`; require workdir-scope under `<agent_workdir>/.<provider>/`). macOS / non-Linux hosts no-op (returns 0 silently — no stdout, no temp-file leak), mirroring v2 reapply's contract.
+
+  Active-session safe: mutates only ownership/mode/ACL on existing channel dotenv files. Does NOT stop/start the daemon, does NOT touch the queue, does NOT chgrp recursively. Operators may run `--apply` on a live install; worst case is a transient probe miss during the chown window, which the stop-gap self-heals on the next start cycle.
+
+  Smoke `scripts/smoke/857-pr6-isolation-v3-channel-dotenv-migrate.sh` covers 9 cases (A1-A9): no isolated agents, canonical tree, legacy ACL drift, mattermost mcp.json migration, symlink refused, non-regular file refused, `--agent` scoping (valid + unknown), `--json` output, idempotent re-run after `--apply`. Wired into `scripts/ci-select-smoke.sh` as required when `lib/bridge-isolation-v3-channel-dotenv.sh`, `bridge-migrate.sh`, or `lib/bridge-isolation-v2-reapply.sh` changes.
+
+  CLI help at `scripts/cli-help/agent-bridge-usage.txt` documents the new verb. `bridge-lib.sh` sources the new module after `bridge-isolation-v2-reapply.sh` so callers outside `bridge-migrate.sh` can also reach the public entry.
+
+  Codex pair-review: r1 → `implement-ok` (no findings on the v3 module / dispatcher / wire-up). Three smoke false-positives discovered by CI Linux were fixed in follow-up commits before merge (substring match on `drift=0` summary token, assertion of agent name in fixture-rooted path, `bridge_die` mock semantics) — pure smoke assertion fixes, zero behavioral change to the v3 migrator. Codex r2 sanity on the smoke fix → `implement-ok`.
+
+### Operator-host run procedure for v0.13.4
+
+After upgrading a linux-user-isolated install to v0.13.4:
+
+```
+agent-bridge migrate isolation v3              # default --dry-run; emits `would` rows
+agent-bridge migrate isolation v3 --apply       # perform mutations after reviewing dry-run output
+```
+
+Verify post-apply:
+
+```
+for a in <isolated-agent-names>; do
+  for ch in discord telegram teams ms365 mattermost; do
+    f="$BRIDGE_AGENT_HOME_ROOT/$a/.$ch/.env"
+    [[ -f "$f" ]] || continue
+    stat -c '%U:%G %a' "$f"                                  # → agent-bridge-<slug>:<grp> 600
+    getfacl "$f" 2>&1 | grep -E '^user:[^:]+:' || echo "(no named-user ACL — expected)"
+  done
+done
+```
+
+After successful migration, channel dotenvs match what v0.13.3's PR-2 (#868) produces for fresh `agb setup <channel>` runs. The runtime ACL stop-gap (`bridge_isolation_v2_apply_channel_state_dotenv_acl`) becomes a no-op on migrated agents — PR-5 retires it next cycle after one cycle of production validation.
+
+### Macros for non-Linux installs
+
+`agent-bridge migrate isolation v3` is a contract no-op on macOS / non-Linux hosts (returns 0 silently). Shared-agent installs (no linux-user isolation) don't need to run it; new setup paths produce mode-0600 files directly via PR-2's `_isolation_aware_save_*` helpers when applicable. macOS installs see no behavior change from v0.13.4.
+
 ## [0.13.3] — 2026-05-14
 
 ### Highlight — #857 PR-2 + PR-3 combined: channel setup dotenv writes via sudo-as-isolated-UID + local smoke gate unblock
