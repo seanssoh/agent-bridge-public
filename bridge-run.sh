@@ -272,6 +272,10 @@ bridge_run_refresh_roster_if_changed() {
     return 0
   fi
 
+  # Issue #848: signature changed on disk — discard the per-process
+  # cache so the next bridge_load_roster actually re-reads the files
+  # instead of returning the cached pre-change state.
+  bridge_roster_cache_invalidate
   bridge_load_roster
   bridge_require_agent "$AGENT"
   # PR-E: re-apply isolation umask after roster reload — bridge-lib.sh's

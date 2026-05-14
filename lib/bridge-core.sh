@@ -494,6 +494,16 @@ print(hashlib.sha1(sys.argv[1].encode("utf-8")).hexdigest())
 PY
 }
 
+# Batch variant of bridge_sha1 — one python3 spawn hashes N inputs. Reads
+# one input per line from stdin, emits hex digests one per line in the
+# same order. Use when a caller knows the full set of inputs upfront
+# (canonical case: roster hydration's per-agent history-key hashing,
+# which used to pay one python3 cold-start per agent). Refs #848.
+bridge_sha1_batch() {
+  bridge_require_python
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/sha1-batch.py"
+}
+
 bridge_redact_inline_env_secrets() {
   local text="${1-}"
   local redacted=""

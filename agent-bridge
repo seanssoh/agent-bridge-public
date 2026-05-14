@@ -93,9 +93,68 @@ HELP_EOF
   done
   unset _arg
 fi
+# Issue #848 (codex r1 Vector 3): handle --help / -h / --version / -V
+# BEFORE sourcing bridge-lib.sh. The previous short-circuit at the
+# bottom of this file skipped bridge_load_roster but still paid the
+# cost of `source bridge-lib.sh`, which transitively sources every
+# `lib/bridge-*.sh` module — ~25 sources for ~50-80ms of cold-start
+# residual on macOS. With the template-backed renderer below, neither
+# the `--help` nor the `--version` short-circuit needs anything from
+# bridge-lib.sh, so we exit before paying the source cost.
+#
+# The positional `version` subcommand continues to flow through the
+# downstream handler (sourced bridge-lib, full --json / source-ref /
+# upgrade-state formatting) since callers typing `agb version` are
+# asking for the full version snapshot; only the `--version` / `-V`
+# flag spellings get the fast print here.
+#
+# `usage()` downstream also reads from the same template via
+# `bridge_print_usage_from_template`, so the slow (invalid-arg)
+# fallback path stays in sync with this fast path automatically.
+CLI_NAME="$(basename "$0")"
+
+# Print the usage template with `__CLI_NAME__` substituted for the
+# resolved CLI invocation name. Pure shell + sed — no bridge-lib
+# dependency. Used by both the top-level --help short-circuit and
+# the downstream usage() function so both paths stay byte-identical.
+bridge_print_usage_from_template() {
+  local template="$SCRIPT_DIR/scripts/cli-help/agent-bridge-usage.txt"
+  if [[ ! -f "$template" ]]; then
+    # Defensive fallback: template missing from a partial install.
+    # Print a minimal hand-rolled hint so --help still exits 0 with
+    # something actionable rather than dying silently.
+    printf 'Usage: %s <subcommand> [options...]\n' "$CLI_NAME"
+    printf '       %s --help     show full subcommand list\n' "$CLI_NAME"
+    printf '       %s --version  show installed version\n' "$CLI_NAME"
+    printf '(usage template missing: %s)\n' "$template" >&2
+    return 0
+  fi
+  # Use a sed delimiter that cannot appear in CLI_NAME (`/`, `_`, `:`).
+  # CLI_NAME is the result of `basename "$0"` so it is a filename
+  # component without slashes — `|` is safe.
+  sed "s|__CLI_NAME__|$CLI_NAME|g" "$template"
+}
+
+case "${1:-}" in
+  --help|-h)
+    bridge_print_usage_from_template
+    exit 0
+    ;;
+  --version|-V)
+    # Read VERSION directly — no bridge-lib (bridge_version lives in
+    # lib/bridge-core.sh which we are explicitly avoiding sourcing on
+    # this hot path).
+    if [[ -f "$SCRIPT_DIR/VERSION" ]]; then
+      printf 'Agent Bridge %s\n' "$(head -n 1 "$SCRIPT_DIR/VERSION" | tr -d '[:space:]')"
+    else
+      printf 'Agent Bridge 0.0.0-dev\n'
+    fi
+    exit 0
+    ;;
+esac
+
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
-CLI_NAME="$(basename "$0")"
 
 # Skip roster load for commands that must remain mutation-free or own their
 # own load timing. `init` defers bridge_load_roster until after argument
@@ -112,8 +171,19 @@ CLI_NAME="$(basename "$0")"
 # the roster lazily when they actually need it; skipping here keeps
 # `agb status` / `agb agent list` / `agb inbox <agent>` / `agb daemon
 # start` startup well under 5s on the operator's live host.
+#
+# Issue #848: `--help` / `-h` / `--version` / `-V` are now handled at
+# the TOP of this file (before `source bridge-lib.sh` above) — those
+# tokens exit before they ever reach this case statement. The flag
+# spellings are kept in the skip-list below as a belt-and-suspenders
+# guard so that any future move of the top short-circuit cannot
+# accidentally re-introduce the full roster-hydration cost (~0.8-1.1s
+# of python3 cold-starts on macOS) on the help path. The `help`
+# subcommand token is also kept so that an `agb help` style invocation
+# (if a future patch adds the subcommand handler) does not eat the
+# roster cost either.
 case "${1:-}" in
-  version|status|daemon|agent|task|inbox) ;;
+  version|status|daemon|agent|task|inbox|help|--help|-h|--version|-V) ;;
   init)
     # bridge-isolation-v2.sh's `BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"`
     # default fires during our bridge-lib.sh source above and exports the
@@ -134,248 +204,20 @@ case "${1:-}" in
 esac
 
 usage() {
-  cat <<EOF
-Usage:
-  $CLI_NAME status [--watch] [--refresh <seconds>] [--open-limit <count>] [--all-agents]
-  $CLI_NAME version [--json]
-  $CLI_NAME list
-  $CLI_NAME admin [--safe-mode] [--replace] [--continue|--no-continue] [--no-attach] [--no-project-skill]
-  $CLI_NAME bootstrap [bootstrap options...] [init options...]
-  $CLI_NAME init [--admin <agent>] [--engine claude|codex] [--session <name>] [--channels <csv>] [--dry-run] [--json]
-  $CLI_NAME upgrade [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--pull|--no-pull] [--restart-daemon] [--dry-run] [--json] [--strict-merge]
-  $CLI_NAME upgrade analyze [--target <bridge-home>] [--json]
-  $CLI_NAME upgrade rollback [--target <bridge-home>] [--backup-root <dir>] [--json]
-  $CLI_NAME upgrade conflicts <list|diff|adopt|discard|archive|reconcile> [--target <bridge-home>] [--json|--yes|--auto-archive] [<conflict-path>]
-  $CLI_NAME daemon <ensure|status|start|stop|sync|run> ...
-  $CLI_NAME auth claude-token <add|list|activate|sync|rotate|auto-rotate> ...
-  $CLI_NAME escalate question --agent <agent> --question "<text>" [--context "<text>"] [--wait-seconds <seconds>] [--json]
-  $CLI_NAME upstream <draft|propose|review> ...
-  $CLI_NAME review <policy|request|complete> ...
-  $CLI_NAME user <set|show> ...
-  $CLI_NAME guard <status|scan|sanitize> ...
-  $CLI_NAME diagnose <acl> [--json]
-  $CLI_NAME doctor [--json] [--detectors <kind[,kind...]>] [--state-dir <path>] [--task-db <path>]
-  $CLI_NAME knowledge <init|operator|capture|promote|search|lint> ...
-  $CLI_NAME skills <list> [--agent <name>] [--json]
-  $CLI_NAME config <set|get|list-protected> ...
-  $CLI_NAME bundle <create|show> ...
-  $CLI_NAME intake <triage|show> ...
-  $CLI_NAME wave <dispatch|list|show|templates|close-issue> ...
-  $CLI_NAME agent <create|update|delete|retire|list|registry|show|reclassify|start|safe-mode|stop|restart|attach|compact|handoff> ...
-  $CLI_NAME kill <number|all>
-  $CLI_NAME attach [number|name]
-  $CLI_NAME urgent <agent> "<message>" [--wait <seconds>]
-  $CLI_NAME task <create|inbox|show|claim|done|update|handoff|summary> ...
-  $CLI_NAME profile <status|diff|deploy> ...
-  $CLI_NAME setup <discord|telegram|teams|agent|admin> ...
-  $CLI_NAME cron <inventory|show|import|list|create|update|delete|rebalance-memory-daily|enqueue|sync|run-subagent|errors|cleanup> ...
-  $CLI_NAME memory <init|capture|ingest|promote|remember|lint|search|rebuild-index|query> ...
-  $CLI_NAME audit [list] [--agent <name>] [--action <type>] [--since <datetime>] [--limit N] [--json]
-  $CLI_NAME audit follow --agent <name> [--action <type>] [--contains <text>] [--follow]
-  $CLI_NAME audit verify
-  $CLI_NAME usage <status|monitor|alerts> ...
-  $CLI_NAME watchdog scan [agent...] [--json]
-  $CLI_NAME discord <status|sync>
-  $CLI_NAME migrate runtime inventory [--json] [--report <path>]
-  $CLI_NAME migrate runtime sync [--dry-run]
-  $CLI_NAME migrate runtime rewrite-cron [--dry-run] [--json]
-  $CLI_NAME migrate runtime rewrite-files [--dry-run] [--json]
-  $CLI_NAME migrate docs audit [--all] [agent...]
-  $CLI_NAME migrate docs apply [--all] [agent...] [--dry-run]
-  $CLI_NAME watchdog scan
-  $CLI_NAME migrate workspace plan <agent>
-  $CLI_NAME migrate workspace copy <agent> [--dry-run]
-  $CLI_NAME migrate workspace cutover <agent> --dry-run
-  $CLI_NAME migrate overhead pre-migrate [--output <file>] [--json]
-  $CLI_NAME migrate overhead dry-run [--agent <name>|--all] [--json]
-  $CLI_NAME migrate overhead apply [--agent <name>|--all] --yes [--dry-run] [--json]
-  $CLI_NAME migrate overhead rollback --stamp <YYYYMMDD-HHMMSS-<pid>> [--json]
-  $CLI_NAME migrate isolation-v2 dry-run --data-root <path>
-  $CLI_NAME migrate isolation-v2 apply --data-root <path> --yes
-  $CLI_NAME migrate isolation-v2 rollback --yes
-  $CLI_NAME migrate isolation-v2 commit --yes
-  $CLI_NAME migrate isolation-v2 status
-  $CLI_NAME migrate isolation v2 [--check|--dry-run|--apply] [--agent <name>] [--json]
-  $CLI_NAME wiki bootstrap [--agent <name>] [--shared-root <path>] [--dry-run] [--json]
-  $CLI_NAME wiki validate [--full|--frontmatter|--broken-link|--tree-edge] [--json]
-  $CLI_NAME wiki dedup-scan [--output <file>] [--json]
-  $CLI_NAME wiki dedup-apply --plan <file> [--dry-run] [--json]
-  $CLI_NAME wiki repair-links [--apply] [--limit N] [--json]
-  $CLI_NAME isolate <agent> [--dry-run]
-  $CLI_NAME unisolate <agent> [--dry-run]
-  $CLI_NAME isolation verify --agent <agent> [--json] [--strict-optional]
-  $CLI_NAME inbox [agent] [--all]
-  $CLI_NAME show <task-id>
-  $CLI_NAME claim <task-id> [--agent <agent>] [--lease <seconds>]
-  $CLI_NAME done <task-id> [--agent <agent>] [--note <text> | --note-file <path>]
-  $CLI_NAME cancel <task-id> [--actor <name>] [--note <text> | --note-file <path>]
-  $CLI_NAME update <task-id> [--status queued|claimed|blocked|in_progress] [--priority ...] [--note ...]
-  $CLI_NAME handoff <task-id> --to <agent> [--from <agent>] [--note <text> | --note-file <path>]
-  $CLI_NAME summary [agent...]
-  $CLI_NAME worktree list
-  $CLI_NAME worktree doctor [--dry-run|--apply] [--max-age-days N] [--target-branch ref] [--include-stale] [--prune-branches]
-  $CLI_NAME profile status [agent|--all]
-  $CLI_NAME profile diff <agent>
-  $CLI_NAME profile deploy <agent> [--dry-run] [--force]
-  $CLI_NAME agent create <agent> [--engine claude|codex] [--session <name>] [--workdir <path>] [--always-on] [--dry-run] [--json]
-  $CLI_NAME agent list [--json]
-  $CLI_NAME agent registry [--json]
-  $CLI_NAME agent show <agent> [--json]
-  $CLI_NAME agent reclassify [--agent <agent>] [--apply] [--json]
-  $CLI_NAME agent start <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
-  $CLI_NAME agent safe-mode <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
-  $CLI_NAME agent stop <agent>
-  $CLI_NAME agent restart <agent> [--attach|--no-attach] [--continue|--no-continue] [--dry-run]
-  $CLI_NAME agent attach <agent>
-  $CLI_NAME agent compact <agent> [--note <text>]
-  $CLI_NAME agent handoff <agent> [--note <text>]
-  $CLI_NAME setup discord <agent> [--channel <id>]... [--channel-account <account>]
-  $CLI_NAME setup telegram <agent> [--allow-from <id>]... [--channel-account <account>]
-  $CLI_NAME setup teams <agent> [--app-id <id>] [--tenant-id <id>] [--allow-from <id>]... [--conversation <id>]...
-  $CLI_NAME setup agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start]
-  $CLI_NAME discord status
-  $CLI_NAME discord sync
-  $CLI_NAME cron inventory [--mode recurring|one-shot|all] [--family <family>] [--limit <count>]
-  $CLI_NAME cron show <job-name-or-id>
-  $CLI_NAME cron import [--source-jobs-file <path>] [--dry-run]
-  $CLI_NAME cron list [--agent <bridge-agent>] [--enabled yes|no|all] [--limit <count>] [--json]
-  $CLI_NAME cron create --agent <bridge-agent> (--schedule "<cron-expr>" | --at "<iso-datetime>") --title "<title>" [--payload "<text>" | --payload-file <path>] [--tz <iana-tz>] [--delete-after-run]
-  $CLI_NAME cron update <job-id> [--agent <bridge-agent>] [--schedule "<cron-expr>" | --at "<iso-datetime>"] [--title "<title>"] [--payload "<text>" | --payload-file <path>] [--tz <iana-tz>] [--enable|--disable] [--delete-after-run|--keep-after-run]
-  $CLI_NAME cron delete <job-id>
-  $CLI_NAME cron enqueue <job-name-or-id> [--slot <slot-key>] [--dry-run]
-  $CLI_NAME cron sync [--dry-run] [--json] [--since <iso-datetime>] [--now <iso-datetime>]
-  $CLI_NAME cron run-subagent <run-id> [--dry-run]
-  $CLI_NAME cron errors report [--agent <agent>] [--family <family>] [--limit <count>] [--json]
-  $CLI_NAME cron cleanup report [--mode expired-one-shot] [--json]
-  $CLI_NAME cron cleanup prune [--mode expired-one-shot] [--dry-run]
-  $CLI_NAME memory init --agent <agent> [--user <id[:display-name]>] [--json]
-  $CLI_NAME knowledge init [--team-name <name>] [--json]
-  $CLI_NAME knowledge operator set --user owner --name "<name>"
-  $CLI_NAME knowledge operator show [--json]
-  $CLI_NAME bundle create --to reviewer --title "QA handoff" --summary "Review attached draft" --action "Return blockers" --artifact ~/agent-bridge/shared/report.md::draft
-  $CLI_NAME intake triage --capture <capture-id> --owner patch --summary "Customer needs ETA update" --category support --route
-  $CLI_NAME knowledge capture --source chat --text "..."
-  $CLI_NAME knowledge promote --kind people --summary "..."
-  $CLI_NAME knowledge search --query "..."
-  $CLI_NAME memory capture --agent <agent> --source discord --user owner --text "..."
-  $CLI_NAME memory ingest --agent <agent> --latest
-  $CLI_NAME memory promote --agent <agent> --kind shared --page personal-preferences --capture <id>
-  $CLI_NAME memory remember --agent <agent> --source chat --user owner --text "..." [--kind user|shared|project|decision]
-  $CLI_NAME memory lint --agent <agent>
-  $CLI_NAME migrate workspace plan <agent>
-  $CLI_NAME migrate workspace copy <agent> [--dry-run]
-  $CLI_NAME migrate workspace cutover <agent> --dry-run
-  $CLI_NAME --codex|--claude --name <agent> [--loop] [--no-continue] [--workdir <dir>] [--replace] [--no-attach] [--no-project-skill] [--prefer wake|new|shared] [--test-fixture]
-
-Examples:
-  $CLI_NAME status
-  $CLI_NAME status --watch
-  $CLI_NAME version
-  $CLI_NAME admin
-  $CLI_NAME admin --safe-mode
-  $CLI_NAME bootstrap --admin manager --engine claude --channels plugin:telegram@claude-plugins-official
-  $CLI_NAME init --admin manager --engine claude --channels plugin:telegram@claude-plugins-official
-  $CLI_NAME upgrade
-  $CLI_NAME upgrade --strict-merge --json
-  $CLI_NAME upgrade analyze --json
-  $CLI_NAME upgrade rollback --json
-  $CLI_NAME upgrade conflicts list --json
-  $CLI_NAME upgrade conflicts reconcile --auto-archive
-  $CLI_NAME upgrade conflicts adopt --yes <conflict-path>
-  $CLI_NAME auth claude-token add --id claude-a --stdin --activate --sync
-  $CLI_NAME auth claude-token auto-rotate enable --threshold 99
-  $CLI_NAME escalate question --agent reviewer --question "Should I ship this now?" --context "Second ask without a user reply."
-  $CLI_NAME upstream draft --title "setup fails" --symptom "..." --why "..." --output /tmp/issue.md
-  $CLI_NAME upstream propose --title "setup fails" --body-file /tmp/issue.md
-  $CLI_NAME review request --subject "release check" --reviewer reviewer --body-file /tmp/plan.md
-  $CLI_NAME user set --name "Sean" --timezone Asia/Seoul
-  $CLI_NAME user show --json
-  $CLI_NAME knowledge init --team-name "Acme"
-  $CLI_NAME knowledge operator set --user owner --name "Sean"
-  $CLI_NAME bundle show 20260411T130000+0900-qa-handoff --json
-  $CLI_NAME intake show 20260411T130000+0900-mail --json
-  $CLI_NAME knowledge search --query "primary operator"
-  $CLI_NAME config list-protected
-  $CLI_NAME config get --path \$BRIDGE_HOME/agents/foo/.discord/access.json
-  $CLI_NAME config set --path \$BRIDGE_HOME/agents/foo/.discord/access.json --change groups.append=12345
-  $CLI_NAME list
-  $CLI_NAME kill 1
-  $CLI_NAME kill all
-  $CLI_NAME agent create reviewer --engine claude
-  $CLI_NAME agent list --json
-  $CLI_NAME agent registry --json
-  $CLI_NAME agent show reviewer --json
-  $CLI_NAME agent reclassify --apply
-  $CLI_NAME agent start reviewer --dry-run
-  $CLI_NAME agent restart reviewer --attach
-  $CLI_NAME agent compact static-discord-bot
-  $CLI_NAME agent handoff static-discord-bot --note "context critical"
-  $CLI_NAME attach
-  $CLI_NAME attach 1
-  $CLI_NAME attach reviewer
-  $CLI_NAME worktree list
-  $CLI_NAME cron inventory --family memory-daily --limit 10
-  $CLI_NAME cron import --dry-run
-  $CLI_NAME cron list --agent <agent>
-  $CLI_NAME cron create --agent <agent> --schedule "0 9 * * *" --title "일일 모니터링"
-  $CLI_NAME cron rebalance-memory-daily --dry-run
-  $CLI_NAME cron enqueue <memory-daily-job-id> --slot 2026-04-05 --dry-run
-  $CLI_NAME cron sync --dry-run
-  $CLI_NAME cron run-subagent <run-id> --dry-run
-  $CLI_NAME cron errors report --limit 20
-  $CLI_NAME cron cleanup report
-  $CLI_NAME memory init --agent assistant --user owner:Owner
-  $CLI_NAME memory capture --agent assistant --source telegram --user owner --author "Alice" --text "I prefer morning updates."
-  $CLI_NAME memory ingest --agent assistant --latest
-  $CLI_NAME memory promote --agent assistant --kind user --user owner --summary "User prefers concise morning updates."
-  $CLI_NAME memory promote --agent assistant --kind user-profile --user owner --summary "답변 없으면 Discord로 에스컬레이션."   # appends to shared users/<uid>/USER.md Stable Preferences
-  $CLI_NAME memory remember --agent assistant --source chat --user owner --text "User prefers concise morning updates." --kind user
-  $CLI_NAME memory lint --agent assistant
-  $CLI_NAME memory search --agent assistant --user owner --query "concise morning updates"
-  $CLI_NAME memory rebuild-index --agent assistant
-  $CLI_NAME memory query --agent assistant --user owner --query "morning updates"
-  $CLI_NAME audit --agent patch --limit 20
-  $CLI_NAME audit follow --agent patch --follow
-  $CLI_NAME audit verify
-  $CLI_NAME usage status --json
-  $CLI_NAME usage alerts --json
-  $CLI_NAME setup discord tester
-  $CLI_NAME setup telegram tester --allow-from 123456789
-  $CLI_NAME setup teams tester --allow-from 00000000-0000-0000-0000-000000000000
-  $CLI_NAME setup agent tester
-  $CLI_NAME migrate runtime inventory
-  $CLI_NAME migrate runtime sync --dry-run
-  $CLI_NAME migrate runtime rewrite-cron --dry-run
-  $CLI_NAME migrate runtime rewrite-files --dry-run
-  $CLI_NAME migrate docs audit --all
-  $CLI_NAME migrate docs apply --all --dry-run
-  $CLI_NAME migrate workspace plan <agent>
-  $CLI_NAME migrate workspace copy <agent> --dry-run
-  $CLI_NAME migrate workspace cutover <agent> --dry-run
-  $CLI_NAME inbox developer
-  $CLI_NAME task create --to tester --title "재테스트" --body-file ~/agent-bridge/shared/report.md
-  $CLI_NAME claim 12 --agent tester
-  $CLI_NAME urgent developer "[TESTER] 프로덕션 장애 확인 필요"
-  $CLI_NAME --codex --name dev
-  $CLI_NAME --codex --name qa --loop
-  $CLI_NAME --claude --name reviewer --workdir /path/to/repo
-  $CLI_NAME --codex --name worker-a --prefer new
-
-By default, $CLI_NAME installs a project-local agent-bridge skill in the target workdir:
-  Codex  -> .agents/skills/agent-bridge/SKILL.md
-  Claude -> .claude/skills/agent-bridge/SKILL.md
-
-Bridge-owned Claude homes also receive shared runtime skills:
-  .claude/skills/agent-bridge-runtime/SKILL.md
-  .claude/skills/cron-manager/SKILL.md
-
-If a same-name session is already active with different engine/workdir/loop settings,
-$CLI_NAME will refuse to attach. Use \`$CLI_NAME kill <number>\` or rerun with \`--replace\`.
-
-Primary command: \`agent-bridge\`
-Short alias: \`agb\`
-EOF
+  # Issue #848 (codex r1 Vector 3): delegate to the shared template
+  # renderer defined near the top of this file. Keeps the slow-path
+  # invalid-arg fallback (which lands here after bridge-lib has been
+  # sourced) byte-identical to the fast-path `--help` short-circuit.
+  bridge_print_usage_from_template
 }
+
+
+# Issue #848 r2 (codex Vector 3): `--help` / `-h` / `--version` / `-V`
+# are handled at the TOP of this file before `source bridge-lib.sh`.
+# No dispatch needed here anymore — those flags exit before this point.
+# The positional `version` subcommand still flows through the dispatch
+# table below (sourced bridge-lib path) to keep the full `--json` /
+# `source-ref` / upgrade-state output for callers typing `agb version`.
 
 is_tty() {
   [[ -t 0 && -t 1 ]]

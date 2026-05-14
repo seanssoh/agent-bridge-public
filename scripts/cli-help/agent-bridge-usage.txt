@@ -1,0 +1,239 @@
+Usage:
+  __CLI_NAME__ status [--watch] [--refresh <seconds>] [--open-limit <count>] [--all-agents]
+  __CLI_NAME__ version [--json]
+  __CLI_NAME__ list
+  __CLI_NAME__ admin [--safe-mode] [--replace] [--continue|--no-continue] [--no-attach] [--no-project-skill]
+  __CLI_NAME__ bootstrap [bootstrap options...] [init options...]
+  __CLI_NAME__ init [--admin <agent>] [--engine claude|codex] [--session <name>] [--channels <csv>] [--dry-run] [--json]
+  __CLI_NAME__ upgrade [--apply] [--check] [--channel stable|dev|current] [--version <semver>] [--ref <git-ref>] [--pull|--no-pull] [--restart-daemon] [--dry-run] [--json] [--strict-merge]
+  __CLI_NAME__ upgrade analyze [--target <bridge-home>] [--json]
+  __CLI_NAME__ upgrade rollback [--target <bridge-home>] [--backup-root <dir>] [--json]
+  __CLI_NAME__ upgrade conflicts <list|diff|adopt|discard|archive|reconcile> [--target <bridge-home>] [--json|--yes|--auto-archive] [<conflict-path>]
+  __CLI_NAME__ daemon <ensure|status|start|stop|sync|run> ...
+  __CLI_NAME__ auth claude-token <add|list|activate|sync|rotate|auto-rotate> ...
+  __CLI_NAME__ escalate question --agent <agent> --question "<text>" [--context "<text>"] [--wait-seconds <seconds>] [--json]
+  __CLI_NAME__ upstream <draft|propose|review> ...
+  __CLI_NAME__ review <policy|request|complete> ...
+  __CLI_NAME__ user <set|show> ...
+  __CLI_NAME__ guard <status|scan|sanitize> ...
+  __CLI_NAME__ diagnose <acl> [--json]
+  __CLI_NAME__ doctor [--json] [--detectors <kind[,kind...]>] [--state-dir <path>] [--task-db <path>]
+  __CLI_NAME__ knowledge <init|operator|capture|promote|search|lint> ...
+  __CLI_NAME__ skills <list> [--agent <name>] [--json]
+  __CLI_NAME__ config <set|get|list-protected> ...
+  __CLI_NAME__ bundle <create|show> ...
+  __CLI_NAME__ intake <triage|show> ...
+  __CLI_NAME__ wave <dispatch|list|show|templates|close-issue> ...
+  __CLI_NAME__ agent <create|update|delete|retire|list|registry|show|reclassify|start|safe-mode|stop|restart|attach|compact|handoff> ...
+  __CLI_NAME__ kill <number|all>
+  __CLI_NAME__ attach [number|name]
+  __CLI_NAME__ urgent <agent> "<message>" [--wait <seconds>]
+  __CLI_NAME__ task <create|inbox|show|claim|done|update|handoff|summary> ...
+  __CLI_NAME__ profile <status|diff|deploy> ...
+  __CLI_NAME__ setup <discord|telegram|teams|agent|admin> ...
+  __CLI_NAME__ cron <inventory|show|import|list|create|update|delete|rebalance-memory-daily|enqueue|sync|run-subagent|errors|cleanup> ...
+  __CLI_NAME__ memory <init|capture|ingest|promote|remember|lint|search|rebuild-index|query> ...
+  __CLI_NAME__ audit [list] [--agent <name>] [--action <type>] [--since <datetime>] [--limit N] [--json]
+  __CLI_NAME__ audit follow --agent <name> [--action <type>] [--contains <text>] [--follow]
+  __CLI_NAME__ audit verify
+  __CLI_NAME__ usage <status|monitor|alerts> ...
+  __CLI_NAME__ watchdog scan [agent...] [--json]
+  __CLI_NAME__ discord <status|sync>
+  __CLI_NAME__ migrate runtime inventory [--json] [--report <path>]
+  __CLI_NAME__ migrate runtime sync [--dry-run]
+  __CLI_NAME__ migrate runtime rewrite-cron [--dry-run] [--json]
+  __CLI_NAME__ migrate runtime rewrite-files [--dry-run] [--json]
+  __CLI_NAME__ migrate docs audit [--all] [agent...]
+  __CLI_NAME__ migrate docs apply [--all] [agent...] [--dry-run]
+  __CLI_NAME__ watchdog scan
+  __CLI_NAME__ migrate workspace plan <agent>
+  __CLI_NAME__ migrate workspace copy <agent> [--dry-run]
+  __CLI_NAME__ migrate workspace cutover <agent> --dry-run
+  __CLI_NAME__ migrate overhead pre-migrate [--output <file>] [--json]
+  __CLI_NAME__ migrate overhead dry-run [--agent <name>|--all] [--json]
+  __CLI_NAME__ migrate overhead apply [--agent <name>|--all] --yes [--dry-run] [--json]
+  __CLI_NAME__ migrate overhead rollback --stamp <YYYYMMDD-HHMMSS-<pid>> [--json]
+  __CLI_NAME__ migrate isolation-v2 dry-run --data-root <path>
+  __CLI_NAME__ migrate isolation-v2 apply --data-root <path> --yes
+  __CLI_NAME__ migrate isolation-v2 rollback --yes
+  __CLI_NAME__ migrate isolation-v2 commit --yes
+  __CLI_NAME__ migrate isolation-v2 status
+  __CLI_NAME__ migrate isolation v2 [--check|--dry-run|--apply] [--agent <name>] [--json]
+  __CLI_NAME__ wiki bootstrap [--agent <name>] [--shared-root <path>] [--dry-run] [--json]
+  __CLI_NAME__ wiki validate [--full|--frontmatter|--broken-link|--tree-edge] [--json]
+  __CLI_NAME__ wiki dedup-scan [--output <file>] [--json]
+  __CLI_NAME__ wiki dedup-apply --plan <file> [--dry-run] [--json]
+  __CLI_NAME__ wiki repair-links [--apply] [--limit N] [--json]
+  __CLI_NAME__ isolate <agent> [--dry-run]
+  __CLI_NAME__ unisolate <agent> [--dry-run]
+  __CLI_NAME__ isolation verify --agent <agent> [--json] [--strict-optional]
+  __CLI_NAME__ inbox [agent] [--all]
+  __CLI_NAME__ show <task-id>
+  __CLI_NAME__ claim <task-id> [--agent <agent>] [--lease <seconds>]
+  __CLI_NAME__ done <task-id> [--agent <agent>] [--note <text> | --note-file <path>]
+  __CLI_NAME__ cancel <task-id> [--actor <name>] [--note <text> | --note-file <path>]
+  __CLI_NAME__ update <task-id> [--status queued|claimed|blocked|in_progress] [--priority ...] [--note ...]
+  __CLI_NAME__ handoff <task-id> --to <agent> [--from <agent>] [--note <text> | --note-file <path>]
+  __CLI_NAME__ summary [agent...]
+  __CLI_NAME__ worktree list
+  __CLI_NAME__ worktree doctor [--dry-run|--apply] [--max-age-days N] [--target-branch ref] [--include-stale] [--prune-branches]
+  __CLI_NAME__ profile status [agent|--all]
+  __CLI_NAME__ profile diff <agent>
+  __CLI_NAME__ profile deploy <agent> [--dry-run] [--force]
+  __CLI_NAME__ agent create <agent> [--engine claude|codex] [--session <name>] [--workdir <path>] [--always-on] [--dry-run] [--json]
+  __CLI_NAME__ agent list [--json]
+  __CLI_NAME__ agent registry [--json]
+  __CLI_NAME__ agent show <agent> [--json]
+  __CLI_NAME__ agent reclassify [--agent <agent>] [--apply] [--json]
+  __CLI_NAME__ agent start <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
+  __CLI_NAME__ agent safe-mode <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
+  __CLI_NAME__ agent stop <agent>
+  __CLI_NAME__ agent restart <agent> [--attach|--no-attach] [--continue|--no-continue] [--dry-run]
+  __CLI_NAME__ agent attach <agent>
+  __CLI_NAME__ agent compact <agent> [--note <text>]
+  __CLI_NAME__ agent handoff <agent> [--note <text>]
+  __CLI_NAME__ setup discord <agent> [--channel <id>]... [--channel-account <account>]
+  __CLI_NAME__ setup telegram <agent> [--allow-from <id>]... [--channel-account <account>]
+  __CLI_NAME__ setup teams <agent> [--app-id <id>] [--tenant-id <id>] [--allow-from <id>]... [--conversation <id>]...
+  __CLI_NAME__ setup agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start]
+  __CLI_NAME__ discord status
+  __CLI_NAME__ discord sync
+  __CLI_NAME__ cron inventory [--mode recurring|one-shot|all] [--family <family>] [--limit <count>]
+  __CLI_NAME__ cron show <job-name-or-id>
+  __CLI_NAME__ cron import [--source-jobs-file <path>] [--dry-run]
+  __CLI_NAME__ cron list [--agent <bridge-agent>] [--enabled yes|no|all] [--limit <count>] [--json]
+  __CLI_NAME__ cron create --agent <bridge-agent> (--schedule "<cron-expr>" | --at "<iso-datetime>") --title "<title>" [--payload "<text>" | --payload-file <path>] [--tz <iana-tz>] [--delete-after-run]
+  __CLI_NAME__ cron update <job-id> [--agent <bridge-agent>] [--schedule "<cron-expr>" | --at "<iso-datetime>"] [--title "<title>"] [--payload "<text>" | --payload-file <path>] [--tz <iana-tz>] [--enable|--disable] [--delete-after-run|--keep-after-run]
+  __CLI_NAME__ cron delete <job-id>
+  __CLI_NAME__ cron enqueue <job-name-or-id> [--slot <slot-key>] [--dry-run]
+  __CLI_NAME__ cron sync [--dry-run] [--json] [--since <iso-datetime>] [--now <iso-datetime>]
+  __CLI_NAME__ cron run-subagent <run-id> [--dry-run]
+  __CLI_NAME__ cron errors report [--agent <agent>] [--family <family>] [--limit <count>] [--json]
+  __CLI_NAME__ cron cleanup report [--mode expired-one-shot] [--json]
+  __CLI_NAME__ cron cleanup prune [--mode expired-one-shot] [--dry-run]
+  __CLI_NAME__ memory init --agent <agent> [--user <id[:display-name]>] [--json]
+  __CLI_NAME__ knowledge init [--team-name <name>] [--json]
+  __CLI_NAME__ knowledge operator set --user owner --name "<name>"
+  __CLI_NAME__ knowledge operator show [--json]
+  __CLI_NAME__ bundle create --to reviewer --title "QA handoff" --summary "Review attached draft" --action "Return blockers" --artifact ~/agent-bridge/shared/report.md::draft
+  __CLI_NAME__ intake triage --capture <capture-id> --owner patch --summary "Customer needs ETA update" --category support --route
+  __CLI_NAME__ knowledge capture --source chat --text "..."
+  __CLI_NAME__ knowledge promote --kind people --summary "..."
+  __CLI_NAME__ knowledge search --query "..."
+  __CLI_NAME__ memory capture --agent <agent> --source discord --user owner --text "..."
+  __CLI_NAME__ memory ingest --agent <agent> --latest
+  __CLI_NAME__ memory promote --agent <agent> --kind shared --page personal-preferences --capture <id>
+  __CLI_NAME__ memory remember --agent <agent> --source chat --user owner --text "..." [--kind user|shared|project|decision]
+  __CLI_NAME__ memory lint --agent <agent>
+  __CLI_NAME__ migrate workspace plan <agent>
+  __CLI_NAME__ migrate workspace copy <agent> [--dry-run]
+  __CLI_NAME__ migrate workspace cutover <agent> --dry-run
+  __CLI_NAME__ --codex|--claude --name <agent> [--loop] [--no-continue] [--workdir <dir>] [--replace] [--no-attach] [--no-project-skill] [--prefer wake|new|shared] [--test-fixture]
+
+Examples:
+  __CLI_NAME__ status
+  __CLI_NAME__ status --watch
+  __CLI_NAME__ version
+  __CLI_NAME__ admin
+  __CLI_NAME__ admin --safe-mode
+  __CLI_NAME__ bootstrap --admin manager --engine claude --channels plugin:telegram@claude-plugins-official
+  __CLI_NAME__ init --admin manager --engine claude --channels plugin:telegram@claude-plugins-official
+  __CLI_NAME__ upgrade
+  __CLI_NAME__ upgrade --strict-merge --json
+  __CLI_NAME__ upgrade analyze --json
+  __CLI_NAME__ upgrade rollback --json
+  __CLI_NAME__ upgrade conflicts list --json
+  __CLI_NAME__ upgrade conflicts reconcile --auto-archive
+  __CLI_NAME__ upgrade conflicts adopt --yes <conflict-path>
+  __CLI_NAME__ auth claude-token add --id claude-a --stdin --activate --sync
+  __CLI_NAME__ auth claude-token auto-rotate enable --threshold 99
+  __CLI_NAME__ escalate question --agent reviewer --question "Should I ship this now?" --context "Second ask without a user reply."
+  __CLI_NAME__ upstream draft --title "setup fails" --symptom "..." --why "..." --output /tmp/issue.md
+  __CLI_NAME__ upstream propose --title "setup fails" --body-file /tmp/issue.md
+  __CLI_NAME__ review request --subject "release check" --reviewer reviewer --body-file /tmp/plan.md
+  __CLI_NAME__ user set --name "Sean" --timezone Asia/Seoul
+  __CLI_NAME__ user show --json
+  __CLI_NAME__ knowledge init --team-name "Acme"
+  __CLI_NAME__ knowledge operator set --user owner --name "Sean"
+  __CLI_NAME__ bundle show 20260411T130000+0900-qa-handoff --json
+  __CLI_NAME__ intake show 20260411T130000+0900-mail --json
+  __CLI_NAME__ knowledge search --query "primary operator"
+  __CLI_NAME__ config list-protected
+  __CLI_NAME__ config get --path $BRIDGE_HOME/agents/foo/.discord/access.json
+  __CLI_NAME__ config set --path $BRIDGE_HOME/agents/foo/.discord/access.json --change groups.append=12345
+  __CLI_NAME__ list
+  __CLI_NAME__ kill 1
+  __CLI_NAME__ kill all
+  __CLI_NAME__ agent create reviewer --engine claude
+  __CLI_NAME__ agent list --json
+  __CLI_NAME__ agent registry --json
+  __CLI_NAME__ agent show reviewer --json
+  __CLI_NAME__ agent reclassify --apply
+  __CLI_NAME__ agent start reviewer --dry-run
+  __CLI_NAME__ agent restart reviewer --attach
+  __CLI_NAME__ agent compact static-discord-bot
+  __CLI_NAME__ agent handoff static-discord-bot --note "context critical"
+  __CLI_NAME__ attach
+  __CLI_NAME__ attach 1
+  __CLI_NAME__ attach reviewer
+  __CLI_NAME__ worktree list
+  __CLI_NAME__ cron inventory --family memory-daily --limit 10
+  __CLI_NAME__ cron import --dry-run
+  __CLI_NAME__ cron list --agent <agent>
+  __CLI_NAME__ cron create --agent <agent> --schedule "0 9 * * *" --title "일일 모니터링"
+  __CLI_NAME__ cron rebalance-memory-daily --dry-run
+  __CLI_NAME__ cron enqueue <memory-daily-job-id> --slot 2026-04-05 --dry-run
+  __CLI_NAME__ cron sync --dry-run
+  __CLI_NAME__ cron run-subagent <run-id> --dry-run
+  __CLI_NAME__ cron errors report --limit 20
+  __CLI_NAME__ cron cleanup report
+  __CLI_NAME__ memory init --agent assistant --user owner:Owner
+  __CLI_NAME__ memory capture --agent assistant --source telegram --user owner --author "Alice" --text "I prefer morning updates."
+  __CLI_NAME__ memory ingest --agent assistant --latest
+  __CLI_NAME__ memory promote --agent assistant --kind user --user owner --summary "User prefers concise morning updates."
+  __CLI_NAME__ memory promote --agent assistant --kind user-profile --user owner --summary "답변 없으면 Discord로 에스컬레이션."   # appends to shared users/<uid>/USER.md Stable Preferences
+  __CLI_NAME__ memory remember --agent assistant --source chat --user owner --text "User prefers concise morning updates." --kind user
+  __CLI_NAME__ memory lint --agent assistant
+  __CLI_NAME__ memory search --agent assistant --user owner --query "concise morning updates"
+  __CLI_NAME__ memory rebuild-index --agent assistant
+  __CLI_NAME__ memory query --agent assistant --user owner --query "morning updates"
+  __CLI_NAME__ audit --agent patch --limit 20
+  __CLI_NAME__ audit follow --agent patch --follow
+  __CLI_NAME__ audit verify
+  __CLI_NAME__ usage status --json
+  __CLI_NAME__ usage alerts --json
+  __CLI_NAME__ setup discord tester
+  __CLI_NAME__ setup telegram tester --allow-from 123456789
+  __CLI_NAME__ setup teams tester --allow-from 00000000-0000-0000-0000-000000000000
+  __CLI_NAME__ setup agent tester
+  __CLI_NAME__ migrate runtime inventory
+  __CLI_NAME__ migrate runtime sync --dry-run
+  __CLI_NAME__ migrate runtime rewrite-cron --dry-run
+  __CLI_NAME__ migrate runtime rewrite-files --dry-run
+  __CLI_NAME__ migrate docs audit --all
+  __CLI_NAME__ migrate docs apply --all --dry-run
+  __CLI_NAME__ migrate workspace plan <agent>
+  __CLI_NAME__ migrate workspace copy <agent> --dry-run
+  __CLI_NAME__ migrate workspace cutover <agent> --dry-run
+  __CLI_NAME__ inbox developer
+  __CLI_NAME__ task create --to tester --title "재테스트" --body-file ~/agent-bridge/shared/report.md
+  __CLI_NAME__ claim 12 --agent tester
+  __CLI_NAME__ urgent developer "[TESTER] 프로덕션 장애 확인 필요"
+  __CLI_NAME__ --codex --name dev
+  __CLI_NAME__ --codex --name qa --loop
+  __CLI_NAME__ --claude --name reviewer --workdir /path/to/repo
+  __CLI_NAME__ --codex --name worker-a --prefer new
+
+By default, __CLI_NAME__ installs a project-local agent-bridge skill in the target workdir:
+  Codex  -> .agents/skills/agent-bridge/SKILL.md
+  Claude -> .claude/skills/agent-bridge/SKILL.md
+
+Bridge-owned Claude homes also receive shared runtime skills:
+  .claude/skills/agent-bridge-runtime/SKILL.md
+  .claude/skills/cron-manager/SKILL.md
+
+If a same-name session is already active with different engine/workdir/loop settings,
+__CLI_NAME__ will refuse to attach. Use `__CLI_NAME__ kill <number>` or rerun with `--replace`.
+
+Primary command: `agent-bridge`
+Short alias: `agb`

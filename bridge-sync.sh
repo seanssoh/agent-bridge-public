@@ -69,18 +69,43 @@ prune_missing_dynamic_agents() {
       bridge_warn "bridge-sync: archive_dynamic_agent failed for agent='$agent' — skipping; next sweep will retry"
       continue
     fi
+    # Issue #848 (codex r2 Vector 2): bridge_archive_dynamic_agent has just
+    # written the agent's history env to disk via
+    # bridge_write_agent_state_file (lib/bridge-state.sh:2755-2761). That
+    # write alone is sufficient to make the in-process roster cache stale,
+    # so flag the agent for invalidation BEFORE the cleanup half runs.
+    # Without this early flag, an archive-succeeds-but-remove-fails path
+    # falls through the bridge_remove_dynamic_agent_file `continue` below
+    # with the on-disk roster already mutated and the cache flag never set
+    # — bridge_render_active_roster downstream then mis-reports the
+    # pruned-and-archived agent as active.
+    # Rule: track mutation immediately after each successful writer call,
+    # not only after full prune success.
+    PRUNED_DYNAMIC["$agent"]=1
     if ! bridge_remove_dynamic_agent_file "$agent" 2>/dev/null; then
       bridge_warn "bridge-sync: remove_dynamic_agent_file failed for agent='$agent' — skipping; next sweep will retry"
       continue
     fi
     bridge_agent_clear_idle_marker "$agent" 2>/dev/null || true
-    PRUNED_DYNAMIC["$agent"]=1
   done < <(bridge_dynamic_agent_ids)
+
+  # Issue #848 (codex r1 Vector 2): bridge_archive_dynamic_agent and
+  # bridge_remove_dynamic_agent_file above mutate the roster files on
+  # disk (history env + dynamic .env removal). The Issue #848 per-process
+  # roster memoization in lib/bridge-state.sh means the next
+  # bridge_load_roster call no-ops unless we drop the cache flag here.
+  # Without this invalidate, pruned agents linger in BRIDGE_AGENT_IDS /
+  # BRIDGE_AGENT_* maps for the rest of the sync pass and the downstream
+  # bridge_render_active_roster reports them as active.
+  if [[ ${#PRUNED_DYNAMIC[@]} -gt 0 ]]; then
+    bridge_roster_cache_invalidate
+  fi
 }
 
 refresh_missing_session_ids() {
   local agent sid exclude_csv created_at detected key _resolved _rc
   local -a excluded
+  local persisted_any=0
 
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
     [[ -z "$agent" ]] && continue
@@ -133,7 +158,19 @@ refresh_missing_session_ids() {
       bridge_warn "bridge-sync: persist_agent_state failed for agent='$agent' — skipping; next sweep will retry"
       continue
     fi
+    persisted_any=1
   done
+
+  # Issue #848 (codex r1 Vector 2): bridge_persist_agent_state writes the
+  # AGENT_SESSION_ID / AGENT_UPDATED_AT fields to the history env (and
+  # the dynamic .env for dynamic agents). With the Issue #848 per-process
+  # roster memoization in place, the caller's next bridge_load_roster
+  # would otherwise no-op and leave BRIDGE_AGENT_SESSION_ID stale for the
+  # downstream bridge_reconcile_idle_markers / bridge_render_active_roster
+  # pass.
+  if [[ "$persisted_any" -eq 1 ]]; then
+    bridge_roster_cache_invalidate
+  fi
 }
 
 bridge_sync_main() {
@@ -145,6 +182,17 @@ bridge_sync_main() {
   refresh_missing_session_ids
   bridge_load_roster
   bridge_reconcile_idle_markers
+  # Issue #848 (codex r1 Vector 6): defensive invalidate immediately
+  # before the active-roster render. The prune/refresh helpers above
+  # invalidate after their own mutations, so the bridge_load_roster
+  # right above this comment already reloaded fresh maps in the normal
+  # path. The defensive invalidate here guarantees that ANY future
+  # mutation slipped into bridge_reconcile_idle_markers (or a helper it
+  # transitively calls) cannot strand bridge_render_active_roster on
+  # stale BRIDGE_AGENT_* maps, which would mis-report pruned dynamic
+  # agents as still-active in the rendered TSV/MD snapshot.
+  bridge_roster_cache_invalidate
+  bridge_load_roster
   bridge_render_active_roster
 }
 
