@@ -3551,6 +3551,37 @@ process_channel_health() {
   [[ "${BRIDGE_CHANNEL_HEALTH_ENABLED:-1}" == "1" ]] || return 1
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
     [[ -z "$agent" ]] && continue
+
+    # Issue #851 (r2 stop-gap classification): when an isolated agent's
+    # channel dotenv shows `auth=unreadable` (the v0.11.0+ runtime
+    # regression where plugin writes silently revert the ACL mask to
+    # `---`), re-assert the contracted dotenv ACL before reporting. The
+    # helper is idempotent on a healthy file. Only the named-user + mask
+    # drift is fixed here — true "missing token" / "missing access.json"
+    # reasons fall through to bridge_report_channel_health_miss
+    # unchanged.
+    #
+    # r2 codex review (PR #855): the operator + daemon concurrent
+    # re-assert path is a known race that can produce a silent
+    # half-broken ACL. Operator decision: ship the pre-launch repair
+    # (bridge-start.sh) as the primary remediation and leave the daemon
+    # path OFF BY DEFAULT until the long-term controller-blind redesign
+    # (umbrella issue, see PR #855 description) removes the surface.
+    # Operators who want the daemon hook may opt in with
+    # BRIDGE_CHANNEL_HEALTH_DOTENV_SELFHEAL=1.
+    if [[ "${BRIDGE_CHANNEL_HEALTH_DOTENV_SELFHEAL:-0}" == "1" ]] \
+        && command -v bridge_isolation_v2_apply_channel_state_dotenv_acl >/dev/null 2>&1 \
+        && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+        && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      local _ch_reason=""
+      _ch_reason="$(bridge_agent_channel_status_reason "$agent" 2>/dev/null || true)"
+      case "$_ch_reason" in
+        *unreadable:*)
+          bridge_isolation_v2_apply_channel_state_dotenv_acl "$agent" >/dev/null 2>&1 || true
+          ;;
+      esac
+    fi
+
     bridge_report_channel_health_miss "$agent" || true
   done
 }

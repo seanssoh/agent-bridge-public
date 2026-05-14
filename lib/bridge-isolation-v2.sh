@@ -2031,6 +2031,191 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
   return 0
 }
 
+bridge_isolation_v2_apply_channel_state_dotenv_acl() {
+  # Issue #851 (v0.11.0+ regression): runtime channel-state writes from
+  # Teams/MS365/etc. plugins inherit the controller's umask=077 and
+  # silently revert the dotenv's POSIX ACL `mask::---`, which then renders
+  # the named-user `r--` grant as `#effective:---`. Controller-side reads
+  # then fail and the next `agent start` blocks with
+  # `auth=unreadable ready=no`.
+  #
+  # #778 fixed the migration path. This helper covers the runtime path:
+  # it re-asserts (a) file mode, (b) one named-user r-- grant per roster
+  # isolated agent + controller, (c) mask::r--, (d) other::--- across
+  # every channel dotenv under <agent_home>/.{teams,ms365,discord,
+  # telegram,mattermost}/.env that already exists.
+  #
+  # Failure semantics:
+  #   - non-Linux host (no setfacl): warn-skip, return 0
+  #   - no dotenv exists for any provider: return 0 (no-op)
+  #   - one provider's repair fails but at least one other succeeded: warn,
+  #     return 0 (best-effort self-heal)
+  #   - every existing dotenv's repair failed: return 1
+  #
+  # Path guard: refuse symlinks and refuse paths that do not resolve
+  # under the agent's workdir + the known provider subdir.
+  local agent="$1" file_mode="${2:-0640}"
+  [[ -n "$agent" ]] || {
+    bridge_warn "apply_channel_state_dotenv_acl: agent required"
+    return 1
+  }
+  command -v setfacl >/dev/null 2>&1 || {
+    bridge_warn "apply_channel_state_dotenv_acl: setfacl not available; skipping (non-Linux host)"
+    return 0
+  }
+  command -v bridge_channel_state_dir_for_item >/dev/null 2>&1 || {
+    bridge_warn "apply_channel_state_dotenv_acl: bridge_channel_state_dir_for_item not loaded (lib/bridge-agents.sh not sourced)"
+    return 1
+  }
+
+  local iso_user="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}"
+  # r2 codex finding 1 — KEEP the resolved controller user. Channel dotenvs
+  # are owned by the isolated UID (the agent owns its own workdir), so the
+  # controller needs a named-user `u:<ctrl>:r--` ACL grant to read the file.
+  # r1 resolved the controller for a preflight sanity check and then dropped
+  # it, which meant the stale-strip below removed any pre-existing controller
+  # grant and the final setfacl re-asserted only roster agents. Net effect:
+  # after one repair call the controller could no longer read the dotenv —
+  # a regression strictly worse than the original mask::--- it was repairing.
+  # Mirrors the credentials helper at :1796-1799.
+  local ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+  [[ -n "$ctrl_user" ]] || {
+    bridge_warn "apply_channel_state_dotenv_acl: cannot resolve controller user"
+    return 1
+  }
+
+  # Build the roster-aware set of UIDs that legitimately hold a r-- grant
+  # on channel dotenv files. Mirrors the credentials helper's roster
+  # logic — the strip step uses this set to keep only current isolated
+  # agents' grants and the apply step grants every roster member.
+  local roster_iso_users=""
+  if command -v bridge_isolation_v2_reapply_eligible_agents >/dev/null 2>&1; then
+    local _ra
+    while IFS= read -r _ra; do
+      [[ -n "$_ra" ]] || continue
+      roster_iso_users+="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${_ra}"$'\n'
+    done < <(bridge_isolation_v2_reapply_eligible_agents 2>/dev/null || true)
+  fi
+  # Always include the agent being applied for (fresh-install transient).
+  roster_iso_users+="${iso_user}"$'\n'
+  # r2 finding 1 — include the controller user in the keep-and-grant set
+  # so the stale-strip never removes it AND the final setfacl re-grants
+  # it. Single source of truth: both the strip-skip-list (via grep -Fxq)
+  # and the apply-grant-list iterate this string.
+  roster_iso_users+="${ctrl_user}"$'\n'
+
+  # Resolve the agent's workdir once so the path guard can refuse any
+  # provider state dir that does not live under it.
+  local agent_workdir=""
+  if command -v bridge_agent_workdir >/dev/null 2>&1; then
+    agent_workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  fi
+
+  local providers=(plugin:teams plugin:ms365 plugin:discord plugin:telegram plugin:mattermost)
+  local existed=0 repaired=0
+  local provider state_dir dotenv
+
+  for provider in "${providers[@]}"; do
+    state_dir="$(bridge_channel_state_dir_for_item "$agent" "$provider" 2>/dev/null || true)"
+    [[ -n "$state_dir" ]] || continue
+    dotenv="$state_dir/.env"
+    [[ -e "$dotenv" ]] || continue
+    existed=$((existed + 1))
+
+    # Refuse symlinks (the credentials helper does the same — a symlink at
+    # the dotenv path is either a misconfigured deploy or a tampering
+    # attempt; we will not chmod/setfacl through it).
+    if [[ -L "$dotenv" ]]; then
+      bridge_warn "apply_channel_state_dotenv_acl: refusing symlink at $dotenv (path guard)"
+      continue
+    fi
+    # Refuse anything that is not a regular file.
+    [[ -f "$dotenv" ]] || {
+      bridge_warn "apply_channel_state_dotenv_acl: $dotenv is not a regular file; skipping"
+      continue
+    }
+    # Path guard: the dotenv must resolve to <agent_workdir>/.<provider>/.env
+    # (or, when agent_workdir is unavailable, at least live in a `.<provider>/`
+    # leaf so we never operate on an arbitrary path returned by a stub).
+    local provider_short="${provider#plugin:}"
+    local parent_basename
+    parent_basename="$(basename "$(dirname "$dotenv")")"
+    if [[ "$parent_basename" != ".${provider_short}" ]]; then
+      bridge_warn "apply_channel_state_dotenv_acl: $dotenv parent is not .${provider_short} (path guard); skipping"
+      continue
+    fi
+    if [[ -n "$agent_workdir" ]]; then
+      case "$dotenv" in
+        "$agent_workdir/.${provider_short}/.env")
+          : # ok
+          ;;
+        *)
+          bridge_warn "apply_channel_state_dotenv_acl: $dotenv outside $agent_workdir/.${provider_short}/ (path guard); skipping"
+          continue
+          ;;
+      esac
+    fi
+
+    # Step 1: chmod to the contracted file mode (0640 historically — controller
+    # writes, agent group reads via the named-user ACL mediated by mask::r--).
+    if ! _bridge_isolation_v2_run_root_or_sudo chmod "$file_mode" "$dotenv" 2>/dev/null; then
+      bridge_warn "apply_channel_state_dotenv_acl: chmod $file_mode on $dotenv failed"
+      continue
+    fi
+
+    # Step 2: roster-aware strip of stale named-user grants. Same pattern
+    # as bridge_isolation_v2_apply_controller_credentials_read_grant.
+    if command -v getfacl >/dev/null 2>&1; then
+      local existing_named
+      existing_named="$(getfacl -p "$dotenv" 2>/dev/null \
+        | awk -F: '$1=="user" && $2!="" {print $2}')"
+      if [[ -n "$existing_named" ]]; then
+        local strip_failed=0 stale
+        while IFS= read -r stale; do
+          [[ -n "$stale" ]] || continue
+          if printf '%s' "$roster_iso_users" | grep -Fxq "$stale"; then
+            continue
+          fi
+          if ! _bridge_isolation_v2_run_root_or_sudo \
+              setfacl -x "u:${stale}" "$dotenv" 2>/dev/null; then
+            bridge_warn "apply_channel_state_dotenv_acl: setfacl -x u:${stale} on $dotenv failed"
+            strip_failed=1
+            break
+          fi
+        done < <(printf '%s\n' "$existing_named")
+        if (( strip_failed == 1 )); then
+          continue
+        fi
+      fi
+    fi
+
+    # Step 3: re-grant every roster isolated UID r-- and re-assert the mask
+    # so the named entries are effective. o::--- closes world reads.
+    local _setfacl_cmd=(setfacl)
+    local _ru
+    while IFS= read -r _ru; do
+      [[ -n "$_ru" ]] || continue
+      _setfacl_cmd+=("-m" "u:${_ru}:r--")
+    done < <(printf '%s\n' "$roster_iso_users")
+    _setfacl_cmd+=("-m" "m::r--" "-m" "o::---" "$dotenv")
+    if ! _bridge_isolation_v2_run_root_or_sudo "${_setfacl_cmd[@]}" 2>/dev/null; then
+      bridge_warn "apply_channel_state_dotenv_acl: setfacl roster grants + m::r-- + o::--- on $dotenv failed"
+      continue
+    fi
+    repaired=$((repaired + 1))
+  done
+
+  # No dotenv existed → idempotent no-op success.
+  if (( existed == 0 )); then
+    return 0
+  fi
+  # At least one existed AND every repair failed → total failure.
+  if (( repaired == 0 )); then
+    return 1
+  fi
+  return 0
+}
+
 bridge_isolation_v2_write_agent_state_marker() {
   # Atomic-ish writer for daemon-side per-agent state markers
   # (idle-since, manual-stop, missing-marker-retries, etc.). Ensures the

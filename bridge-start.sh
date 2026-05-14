@@ -415,7 +415,23 @@ if [[ $CONTINUE_EXPLICIT -eq 1 && "$CONTINUE_MODE" == "0" ]]; then
   unset _persisted_session_id
 fi
 
+# Issue #851 r2 codex finding 3 — the pre-launch ACL re-assert MUST run
+# BEFORE the channel-status check below. Otherwise, when the dotenv mask
+# has reverted to `---` (the v0.11.0+ runtime regression this PR addresses)
+# the status check returns `unreadable:` and bridge_die fires before the
+# repair ever runs. The status helper recomputes off live filesystem state
+# (no cache — see bridge_agent_channel_status_reason in lib/bridge-agents.sh)
+# so re-asserting the ACL then re-running the check picks up the healed
+# state. Idempotent on a healthy file; warns and continues on a non-Linux
+# host. Suppress operator-visible noise — the helper logs via bridge_warn
+# when something actually fails, and the post-launch verify still surfaces
+# a hard channel-auth failure separately.
 if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
+  if ! bridge_isolation_disabled_by_env \
+      && bridge_agent_linux_user_isolation_effective "$AGENT" \
+      && command -v bridge_isolation_v2_apply_channel_state_dotenv_acl >/dev/null 2>&1; then
+    bridge_isolation_v2_apply_channel_state_dotenv_acl "$AGENT" >/dev/null 2>&1 || true
+  fi
   CHANNEL_REASON="$(bridge_agent_channel_status_reason "$AGENT")"
   if [[ -n "$CHANNEL_REASON" ]]; then
     if bridge_agent_should_stop_on_attached_clean_exit "$AGENT"; then
