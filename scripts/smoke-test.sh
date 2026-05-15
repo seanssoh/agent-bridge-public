@@ -10691,4 +10691,16 @@ bash "$REPO_ROOT/scripts/smoke/upgrade-isolated-agent-migrate.sh"
 log "running 857-pr1-isolation-write-helper smoke (#857 PR-1)"
 bash "$REPO_ROOT/scripts/smoke/857-pr1-isolation-write-helper.sh"
 
+# Issue #895 — `bridge_agent_workdir`'s v2-anchor branch was firing for
+# every isolation mode, silently re-rooting shared-mode dynamic agents
+# spawned via `agb --claude --name <agent>` into an empty stub. The fix
+# (Track C v0.13.10) gates the v2 anchor override on `linux-user`
+# isolation (the privacy invariant the override exists for) and falls
+# through to the explicit `BRIDGE_AGENT_WORKDIR[<agent>]` for any other
+# mode. The smoke asserts all three branches: shared, linux-user, and
+# the unset/default-fallback case — one-sided coverage would let any
+# direction regress.
+log "running dynamic-agent-shared-mode-workdir smoke (issue #895)"
+bash "$REPO_ROOT/scripts/smoke/dynamic-agent-shared-mode-workdir.sh"
+
 log "smoke test passed"

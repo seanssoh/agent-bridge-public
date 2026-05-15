@@ -3703,17 +3703,34 @@ bridge_agent_workdir() {
   local agent="$1"
   local explicit="${BRIDGE_AGENT_WORKDIR[$agent]-}"
 
-  # v2 takes precedence over explicit roster workdirs: the per-agent private
-  # root (root-owned, group r-x, mode 2750) IS the isolation contract. An
-  # explicit workdir outside that root would launch the agent into a
-  # directory the per-agent group cannot reach — or worse, a directory that
-  # other isolated UIDs can reach — silently breaking PR-C's per-agent
-  # privacy. Static rosters that need a non-default location should set
-  # BRIDGE_DATA_ROOT (which moves the v2 anchor for every agent), not
-  # BRIDGE_AGENT_WORKDIR per-agent.
+  # v2 anchor precedence is conditional on isolation mode (issue #895,
+  # ymprince WSL2 report, v0.13.8):
+  #
+  #   * linux-user isolation — the per-agent private root (root-owned,
+  #     group r-x, mode 2750) IS the isolation contract. An explicit
+  #     workdir outside that root would launch the agent into a
+  #     directory the per-agent group cannot reach, or worse, a
+  #     directory that other isolated UIDs can reach, silently breaking
+  #     per-agent privacy. Static rosters that need a non-default
+  #     location should set BRIDGE_DATA_ROOT (which moves the v2 anchor
+  #     for every agent), not BRIDGE_AGENT_WORKDIR per-agent.
+  #
+  #   * shared isolation (default for `agb --claude --name <agent>`
+  #     dynamic spawn) — no per-UID privacy invariant to enforce. The
+  #     launcher captures the operator's cwd into
+  #     BRIDGE_AGENT_WORKDIR[<agent>] (agent-bridge:1199), and
+  #     unconditionally rewriting that to the v2 anchor leaves the
+  #     agent in an empty stub with the operator's project invisible.
+  #     Fall through to the explicit-then-default resolution so the
+  #     operator's cwd is honored for shared dynamic agents.
+  local _isolation_mode=""
   if [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
-    printf '%s/%s/workdir' "$BRIDGE_AGENT_ROOT_V2" "$agent"
-    return 0
+    _isolation_mode="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || printf '')"
+    if [[ "$_isolation_mode" == "linux-user" ]]; then
+      printf '%s/%s/workdir' "$BRIDGE_AGENT_ROOT_V2" "$agent"
+      return 0
+    fi
+    # Any non-linux-user mode (shared, unknown, "") falls through.
   fi
 
   if [[ -n "$explicit" ]]; then

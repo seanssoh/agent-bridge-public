@@ -165,12 +165,25 @@ managed_v2_workdir_shared_settings() {
   custom_workdir="$SMOKE_TMP_ROOT/custom-managed-workdir"
   actual_workdir="$BRIDGE_AGENT_ROOT_V2/custom-agent/workdir"
   mkdir -p "$custom_workdir" "$actual_workdir"
+  # Issue #895: post-fix `bridge_agent_workdir` only returns the v2 anchor
+  # (BRIDGE_AGENT_ROOT_V2/<agent>/workdir) when the agent's isolation
+  # mode is `linux-user` (the privacy-invariant contract the anchor
+  # exists for). For any other mode, including the default-shared
+  # fallback, it now correctly honors the explicit BRIDGE_AGENT_WORKDIR.
+  # This test exercises the v2-managed-linux-user path where the anchor
+  # MUST win over the explicit workdir, so set isolation_mode=linux-user
+  # explicitly. Without this opt-in, the resolver would (correctly)
+  # honor `$custom_workdir`, and the test's "settings symlink lives at
+  # the anchor" + "custom workdir receives no symlink" assertions would
+  # fail — that would be exercising the shared-mode contract, not the
+  # managed-v2 contract this test is named for.
   cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
 bridge_add_agent_id_if_missing "custom-agent"
 BRIDGE_AGENT_ENGINE["custom-agent"]="claude"
 BRIDGE_AGENT_SOURCE["custom-agent"]="static"
 BRIDGE_AGENT_SESSION["custom-agent"]="custom-agent"
 BRIDGE_AGENT_WORKDIR["custom-agent"]="$custom_workdir"
+BRIDGE_AGENT_ISOLATION_MODE["custom-agent"]="linux-user"
 EOF
 
   bash4_bin="$BASH"
@@ -225,12 +238,14 @@ BRIDGE_AGENT_ENGINE["static-agent"]="claude"
 BRIDGE_AGENT_SOURCE["static-agent"]="static"
 BRIDGE_AGENT_SESSION["static-agent"]="static-agent"
 BRIDGE_AGENT_WORKDIR["static-agent"]="$static_configured_workdir"
+BRIDGE_AGENT_ISOLATION_MODE["static-agent"]="linux-user"
 
 bridge_add_agent_id_if_missing "dynamic-agent"
 BRIDGE_AGENT_ENGINE["dynamic-agent"]="claude"
 BRIDGE_AGENT_SOURCE["dynamic-agent"]="dynamic"
 BRIDGE_AGENT_SESSION["dynamic-agent"]="dynamic-agent"
 BRIDGE_AGENT_WORKDIR["dynamic-agent"]="$dynamic_under_root_configured_workdir"
+BRIDGE_AGENT_ISOLATION_MODE["dynamic-agent"]="linux-user"
 EOF
 
   bash4_bin="$BASH"
@@ -252,12 +267,14 @@ BRIDGE_AGENT_ENGINE["static-agent"]="claude"
 BRIDGE_AGENT_SOURCE["static-agent"]="static"
 BRIDGE_AGENT_SESSION["static-agent"]="static-agent"
 BRIDGE_AGENT_WORKDIR["static-agent"]="$static_configured_workdir"
+BRIDGE_AGENT_ISOLATION_MODE["static-agent"]="linux-user"
 
 bridge_add_agent_id_if_missing "dynamic-agent"
 BRIDGE_AGENT_ENGINE["dynamic-agent"]="claude"
 BRIDGE_AGENT_SOURCE["dynamic-agent"]="dynamic"
 BRIDGE_AGENT_SESSION["dynamic-agent"]="dynamic-agent"
 BRIDGE_AGENT_WORKDIR["dynamic-agent"]="$dynamic_configured_workdir"
+BRIDGE_AGENT_ISOLATION_MODE["dynamic-agent"]="linux-user"
 EOF
   mode_dynamic="$(
     "$bash4_bin" -c 'repo="$1"; workdir="$2"; source "$repo/bridge-lib.sh"; bridge_load_roster; bridge_claude_settings_mode "$workdir"' \
@@ -292,12 +309,14 @@ BRIDGE_AGENT_ENGINE["static-agent"]="claude"
 BRIDGE_AGENT_SOURCE["static-agent"]="static"
 BRIDGE_AGENT_SESSION["static-agent"]="static-agent"
 BRIDGE_AGENT_WORKDIR["static-agent"]="$static_configured_workdir"
+BRIDGE_AGENT_ISOLATION_MODE["static-agent"]="linux-user"
 
 bridge_add_agent_id_if_missing "dynamic-agent"
 BRIDGE_AGENT_ENGINE["dynamic-agent"]="claude"
 BRIDGE_AGENT_SOURCE["dynamic-agent"]="dynamic"
 BRIDGE_AGENT_SESSION["dynamic-agent"]="dynamic-agent"
 BRIDGE_AGENT_WORKDIR["dynamic-agent"]="$dynamic_under_root_configured_workdir"
+BRIDGE_AGENT_ISOLATION_MODE["dynamic-agent"]="linux-user"
 EOF
   mode_dynamic_under_root_configured="$(
     "$bash4_bin" -c 'repo="$1"; workdir="$2"; source "$repo/bridge-lib.sh"; bridge_load_roster; bridge_claude_settings_mode "$workdir"' \
