@@ -299,6 +299,7 @@ bridge_upgrade_with_target_env() {
     BRIDGE_DISCORD_RELAY_STATE_FILE="$target_root/state/discord-relay.json" \
     BRIDGE_LAYOUT_RESOLVER_BYPASS="${BRIDGE_LAYOUT_RESOLVER_BYPASS:-}" \
     BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID="${BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID:-}" \
+    BRIDGE_UPGRADE_CONTEXT="${BRIDGE_UPGRADE_CONTEXT:-}" \
     "$@"
 }
 
@@ -1415,6 +1416,13 @@ if [[ $DRY_RUN -eq 0 ]]; then
   # `_migrate_rc=$?` captures the bash exit code, not mktemp/rm.
   set +e
   _iso_v2_migrate_tmp="$(mktemp -t agb-upg-isov2.XXXXXX)"
+  # v0.13.10: BRIDGE_UPGRADE_CONTEXT=1 signals
+  # `bridge_isolation_v2_migrate_apply_for_upgrade` that the caller is the
+  # upgrader (vs. a direct `agent-bridge migrate isolation v2 --apply` run)
+  # so it can take the markerless-existing-install + no-isolated-roster
+  # marker-only fast-path. The env var must be propagated through
+  # `bridge_upgrade_with_target_env`'s `env -i` filter.
+  BRIDGE_UPGRADE_CONTEXT=1 \
   bridge_upgrade_with_target_env "$TARGET_ROOT" \
     "$BRIDGE_BASH_BIN" \
     "$SOURCE_ROOT/lib/upgrade-helpers/isolation-v2-migrate.sh" \
