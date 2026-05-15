@@ -238,6 +238,7 @@ def _emit_admin_credential_read_allowed(
     tool: str,
     surface: str,
     sample: str = "",
+    tool_input: dict[str, Any] | None = None,
 ) -> None:
     """Audit an admin agent's read-intent bypass of a credential-deny path.
 
@@ -255,6 +256,13 @@ def _emit_admin_credential_read_allowed(
     (``raw_credentials_mention`` / ``raw_env_dump`` / ``argv_path`` /
     ``input_path``) and ``sample`` is a truncated copy of the offending
     text or path for post-hoc inspection.
+
+    The audit row mirrors the deny-row shape (``agent_tool_denied``):
+    when the caller supplies ``tool_input`` we emit the same
+    ``summary`` block ``tool_input_summary`` would produce, so a single
+    audit consumer can read allow + deny rows uniformly (codex PR #881
+    r1 finding 3). Bash callers without ``tool_input`` can pass
+    ``sample=text`` and it will be lifted into ``summary.command``.
     """
     detail: dict[str, Any] = {
         "tool": tool,
@@ -262,6 +270,18 @@ def _emit_admin_credential_read_allowed(
     }
     if sample:
         detail["sample"] = truncate_text(sample, 200)
+    # Mirror the deny-row `summary` field. Prefer the structured
+    # `tool_input_summary` shape when caller has the full tool_input;
+    # otherwise synthesize a minimal Bash summary from `sample` so the
+    # audit row still carries the structured field deny consumers
+    # expect.
+    if tool_input is not None:
+        detail["summary"] = tool_input_summary(tool, tool_input)
+    elif sample and tool == "Bash":
+        detail["summary"] = {
+            "command": truncate_text(sample, 240),
+            "description": "",
+        }
     write_audit("agent_admin_credential_read_allowed", agent or "unknown", detail)
 
 
@@ -473,6 +493,20 @@ _SAFE_REDIRECT_RE = re.compile(
     r"(?:2>/dev/null|2>&1|&>/dev/null)(?=$|[\s;&|()<>])"
 )
 
+# Output-redirection token detector for `_is_read_intent_bash`.
+#
+# The prior `tok.startswith(("&>", "2>", ">>", ">"))` check missed numeric
+# fd forms other than `2>`: e.g. `1>/tmp/leak`, `3>file`, `99>>log`. That
+# let `cat ~/.claude/.credentials.json 1>/tmp/leak` slip through as
+# read-intent and bypass the admin credential carve-out's deny mirror
+# (codex PR #881 r1 finding 1).
+#
+# Match shape: optional digit run, then `>` or `>>`. Anchored to the
+# start of the token because `_is_read_intent_bash` operates on the
+# whitespace-split tokens of a stage; an embedded `2>` inside a quoted
+# string never reaches this check.
+_NUMERIC_FD_WRITE_RE = re.compile(r"^[0-9]+>>?")
+
 
 def _is_read_intent_bash(command: str) -> bool:
     """Return True iff *command* is purely read-intent.
@@ -520,6 +554,14 @@ def _is_read_intent_bash(command: str) -> bool:
             for prefix in ("&>", "2>", ">>", ">"):
                 if tok.startswith(prefix):
                     return False
+            # Numeric fd output redirections (`1>file`, `3>file`,
+            # `99>>log`, …). The prefix tuple above only catches the
+            # bare `>` / `>>` / `&>` / `2>` forms; other digit fds slip
+            # through and would otherwise let
+            # `cat ~/.claude/.credentials.json 1>/tmp/leak` classify as
+            # read-intent (codex PR #881 r1 finding 1).
+            if _NUMERIC_FD_WRITE_RE.match(tok):
+                return False
         first = _stage_first_token(stage_stripped)
         if not first:
             continue
@@ -1405,7 +1447,11 @@ def _is_config_set_wrapper(text: str) -> bool:
     return tokens[1] == "config" and tokens[2] == "set"
 
 
-def protected_alias_reason(text: str, agent: str) -> str | None:
+def protected_alias_reason(
+    text: str,
+    agent: str,
+    tool_input: dict[str, Any] | None = None,
+) -> str | None:
     admin = is_admin_agent(agent)
     # The two checks below use shlex argv matching rather than substring
     # matching (closes #252). A Bash invocation that actually opens the
@@ -1448,6 +1494,7 @@ def protected_alias_reason(text: str, agent: str) -> str | None:
                 tool="Bash",
                 surface="raw_credentials_mention",
                 sample=text,
+                tool_input=tool_input,
             )
         else:
             return CLAUDE_CREDENTIAL_DENY_REASON
@@ -1466,6 +1513,7 @@ def protected_alias_reason(text: str, agent: str) -> str | None:
                 tool="Bash",
                 surface="raw_env_dump",
                 sample=text,
+                tool_input=tool_input,
             )
         else:
             return CLAUDE_CREDENTIAL_DENY_REASON
@@ -1480,6 +1528,7 @@ def protected_alias_reason(text: str, agent: str) -> str | None:
                     tool="Bash",
                     surface="argv_path",
                     sample=str(credential_path),
+                    tool_input=tool_input,
                 )
                 break
             return CLAUDE_CREDENTIAL_DENY_REASON
@@ -1714,7 +1763,11 @@ def handle_pretool(payload: dict[str, Any], agent: str) -> int:
         detail["target_agent"] = target_agent
 
     if tool_name == "Bash":
-        reason = protected_alias_reason(str(tool_input.get("command") or ""), agent)
+        reason = protected_alias_reason(
+            str(tool_input.get("command") or ""),
+            agent,
+            tool_input=tool_input,
+        )
     else:
         # Classify read-intent once for the whole non-Bash branch — both
         # the credential carve-out below and the protected-path gate
@@ -1738,6 +1791,7 @@ def handle_pretool(payload: dict[str, Any], agent: str) -> int:
                         tool=tool_name,
                         surface="input_path",
                         sample=raw,
+                        tool_input=tool_input,
                     )
                     continue
                 reason = CLAUDE_CREDENTIAL_DENY_REASON
@@ -1759,6 +1813,7 @@ def handle_pretool(payload: dict[str, Any], agent: str) -> int:
                             tool=tool_name,
                             surface="input_path",
                             sample=str(candidate),
+                            tool_input=tool_input,
                         )
                         continue
                     reason = credential_reason

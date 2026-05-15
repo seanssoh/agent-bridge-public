@@ -18,6 +18,7 @@ if str(_HOOKS_DIR) not in sys.path:
 from bridge_hook_common import (  # noqa: E402
     current_agent,
     load_guard_module,
+    truncate_text,
     write_audit,
 )
 
@@ -93,6 +94,11 @@ def main() -> int:
                     "threshold": result.threshold,
                     "reasons": result.reasons[:5],
                     "categories": result.categories[:5],
+                    # Mirror the deny-row `summary` shape (codex PR #881
+                    # r1 finding 3). The deny path here is `prompt`, so
+                    # the natural summary field is a truncated copy of
+                    # the prompt text the guard fired on.
+                    "summary": {"prompt": truncate_text(prompt, 240)},
                 },
             )
             json.dump(
@@ -121,6 +127,10 @@ def main() -> int:
                 "threshold": result.threshold,
                 "reasons": result.reasons[:5],
                 "categories": result.categories[:5],
+                # Mirror the same `summary` shape used in the warn-only
+                # branch so both audit rows share a single consumer
+                # contract (codex PR #881 r1 finding 3).
+                "summary": {"prompt": truncate_text(prompt, 240)},
             },
         )
         json.dump(
