@@ -10632,6 +10632,13 @@ bash "$REPO_ROOT/scripts/smoke/per-agent-settings-rendering.sh"
 log "running shared-settings-preserve-user-keys smoke (issue #613)"
 bash "$REPO_ROOT/scripts/smoke/shared-settings-preserve-user-keys.sh"
 
+# v0.13.6 hotfix track 1 — ADMIN-PROTOCOL.md wire-up. The agent CLAUDE.md
+# managed block points admin sessions at ADMIN-PROTOCOL.md but until
+# this smoke landed the file was never propagated into <bridge_home>/
+# shared/ and the matching symlink was missing from every agent home.
+log "running admin-protocol-shared-link smoke (v0.13.6 hotfix track 1)"
+bash "$REPO_ROOT/scripts/smoke/admin-protocol-shared-link.sh"
+
 # Issue #597 Track D — precompact-notify suite. Exercises the Discord
 # relay activity-index writer, the Track A route-primitive end-to-end
 # with the writer-populated index, and the pre-compact.py hook

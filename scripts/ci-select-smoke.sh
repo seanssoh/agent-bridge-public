@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions admin-protocol-shared-link
 }
 
 add_all_integration() {
@@ -373,6 +373,17 @@ select_for_path() {
       add_all_required_static
       add_all_integration
       add_live live-tmux-daemon
+      ;;
+
+    bridge-docs.py)
+      # v0.13.6 hotfix track 1: bridge-docs.py owns AGENT_SHARED_LINKS and
+      # the shared-doc render dispatch. The admin-protocol-shared-link
+      # smoke pins the wire-up that propagates docs/agent-runtime/
+      # admin-protocol.md into <bridge_home>/shared/ADMIN-PROTOCOL.md and
+      # symlinks it from every agent home. Cover it on every bridge-docs.py
+      # move so the dispatch table and link tuple stay in lockstep.
+      add_required admin-protocol-shared-link
+      add_integration integration-minimal
       ;;
 
     *.sh|lib/*.sh|scripts/*.sh|*.py|scripts/*.py)
