@@ -106,7 +106,11 @@ add_live() {
 }
 
 add_all_required_static() {
+<<<<<<< HEAD
   add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions admin-protocol-shared-link
+=======
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions admin-protocol-shared-link bridge-notify-no-default-discord-875
+>>>>>>> 3e2f7eb (fix(notify): skip discord notify silently when default account absent (closes #875))
 }
 
 add_all_integration() {
@@ -319,8 +323,15 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
-    scripts/apply-channel-policy.sh|lib/bridge-channels.sh|lib/bridge-discord.sh|bridge-discord-relay.sh|bridge-notify.sh|runtime-templates/*)
-      add_required channel-plugins
+    scripts/apply-channel-policy.sh|lib/bridge-channels.sh|lib/bridge-discord.sh|bridge-discord-relay.sh|bridge-notify.sh|bridge-notify.py|runtime-templates/*)
+      # Issue #875: bridge-notify.py owns the implicit-default account silent-
+      # skip contract — when an agent has no Discord channel and the runner
+      # reaches the default-account lookup, the runner must return 0 with a
+      # structured skip row instead of surfacing "discord account not found:
+      # default" as a hard failure in cron-followup bodies. Cover the
+      # regression smoke whenever bridge-notify.py moves so the strict-miss
+      # vs default-miss split stays intact.
+      add_required channel-plugins bridge-notify-no-default-discord-875
       add_integration integration-minimal
       ;;
 
