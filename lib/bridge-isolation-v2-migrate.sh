@@ -1378,6 +1378,51 @@ bridge_isolation_v2_migrate_marker_remove() {
   rm -f "$marker_path"
 }
 
+# v0.13.10: marker-only write for the markerless-existing-install +
+# no-isolated-roster upgrade fast-path. Same on-disk bytes as the full
+# `bridge_isolation_v2_migrate_marker_write` (BRIDGE_LAYOUT=v2 +
+# BRIDGE_DATA_ROOT=<path>), validator-compatible, but skips the
+# `_bridge_isolation_v2_run_root_or_sudo chown root:<group>` step that
+# requires passwordless sudo on Linux and `dseditgroup` on macOS. Used
+# only from `bridge_isolation_v2_migrate_apply_for_upgrade` when:
+#   - the caller is the upgrade flow (BRIDGE_UPGRADE_CONTEXT=1), AND
+#   - the roster has zero linux-user-isolated agents (rc=1 from
+#     bridge_isolation_v2_roster_has_isolated_agents).
+# The marker bytes are wire-compatible with markers written by the full
+# migrate path; the validator's owner check passes via the
+# `owner_uid == current controller UID` second branch in
+# bridge_isolation_v2_marker_validate.
+bridge_isolation_v2_migrate_marker_write_minimal() {
+  local data_root="$1"
+  [[ -n "$data_root" && "${data_root:0:1}" == "/" ]] || {
+    bridge_warn "marker_write_minimal: --data-root <abs-path> required"
+    return 1
+  }
+
+  local marker_path
+  marker_path="$(bridge_isolation_v2_marker_path)"
+
+  bridge_isolation_v2_migrate_mkstate
+  install -d -m 0750 "$(dirname "$marker_path")" 2>/dev/null \
+    || mkdir -p "$(dirname "$marker_path")"
+
+  local tmp="${marker_path}.tmp.$$"
+  {
+    printf 'BRIDGE_LAYOUT=%s\n' "$(printf %q "v2")"
+    printf 'BRIDGE_DATA_ROOT=%s\n' "$(printf %q "$data_root")"
+  } > "$tmp" || { rm -f "$tmp"; bridge_warn "marker_write_minimal: write to $tmp failed"; return 1; }
+
+  chmod 0640 "$tmp" || { rm -f "$tmp"; bridge_warn "marker_write_minimal: chmod failed"; return 1; }
+  mv -f "$tmp" "$marker_path" || { bridge_warn "marker_write_minimal: mv to $marker_path failed"; return 1; }
+
+  if ! bridge_isolation_v2_marker_validate "$marker_path"; then
+    rm -f "$marker_path"
+    bridge_warn "marker_write_minimal: marker validation failed after write — removed"
+    return 1
+  fi
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # 10. legacy data path enumeration (commit candidate filter)
 # ---------------------------------------------------------------------------
@@ -1770,17 +1815,89 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
   # take the skip branch silently — bypassing the preflight check.
   local _iso_check_rc=0
   bridge_isolation_v2_roster_has_isolated_agents 2>/dev/null || _iso_check_rc=$?
+
+  local data_root="${BRIDGE_DATA_ROOT:-$target_root}"
+  local marker_path
+  marker_path="$(bridge_isolation_v2_marker_path 2>/dev/null || \
+    printf '%s/state/layout-marker.sh' "$target_root")"
+
+  # v0.13.10: markerless-existing-install + no-isolated-roster fast-path.
+  #
+  # The v0.8.0+ layout resolver rejects `markerless(existing-install)` and
+  # tells the operator to run `agent-bridge upgrade --apply`. The upgrader
+  # is supposed to write the marker as part of this migrate step, but
+  # before v0.13.10 the marker-write path was gated behind
+  # `bridge_isolation_v2_privilege_preflight` (needs root or passwordless
+  # sudo) and behind group ops that require `dseditgroup` (macOS) or
+  # `groupadd`/`usermod` (Linux). A v0.7.x → v0.13.x leap on a single-OS-
+  # user host with no isolated agents would therefore either:
+  #   - hit the macos-shared-agent skip below (status=ok, but marker NOT
+  #     written), so the next boot still hits the layout-resolver reject; OR
+  #   - fail privilege preflight on Linux without sudo (same outcome).
+  #
+  # The minimum semantic change needed to unblock the leap is to write the
+  # v2 marker — the marker is metadata. Without isolated agents, no
+  # group/setgid/ownership operations are required for correctness:
+  #   - `shared`-mode agents do not depend on `ab-agent-<slug>` groups.
+  #   - the marker bytes are wire-compatible with the full-migrate marker.
+  #   - the operator's later `agent-bridge agent add --isolated <name>`
+  #     flow handles group setup at THAT point (with its own sudo check).
+  #
+  # Guard:
+  #   - BRIDGE_UPGRADE_CONTEXT=1 — only fire when invoked by the upgrader
+  #     (preserves existing semantics for direct
+  #     `agent-bridge migrate isolation v2 --apply` calls, which keep the
+  #     macos-shared-agent skip below).
+  #   - _iso_check_rc == 1 — confirmed-no-isolated (rc=2 unknown falls
+  #     through to the existing preflight so the operator gets actionable
+  #     remediation rather than a silent metadata-only success).
+  #   - marker NOT already valid — if a valid marker exists, the next
+  #     branch (marker-present skip) handles idempotency + normalize_layout
+  #     refresh. We must not pre-empt that path.
+  if [[ "${BRIDGE_UPGRADE_CONTEXT:-0}" == "1" \
+        && "$_iso_check_rc" -eq 1 ]] \
+      && { [[ ! -f "$marker_path" ]] \
+           || ! bridge_isolation_v2_marker_validate "$marker_path" 2>/dev/null; }; then
+    if bridge_isolation_v2_migrate_marker_write_minimal "$data_root"; then
+      printf '{"mode":"isolation-v2-migrate","status":"ok","skipped":false,"reason":"marker-only-no-isolated-roster","marker":"%s","data_root":"%s","group_ops":"skipped","platform":"%s"}\n' \
+        "$marker_path" "$data_root" "$(uname -s 2>/dev/null || printf 'unknown')"
+      return 0
+    fi
+    # Fall through on write failure — `bridge_warn` already fired inside
+    # the helper. The existing preflight/migration body below will emit
+    # its own structured error so the operator sees one canonical
+    # last_error rather than a duplicate marker-write warning.
+  fi
+
+  # v0.13.6 hotfix track 4: silent no-op on macOS shared-agent installs.
+  # The isolation-v2 layout (group + setgid + named-UID ownership) only
+  # has operational effect on Linux hosts where agents run under their
+  # own `agent-bridge-<slug>` UIDs. On a single-OS-user host with no
+  # isolated agents (the macOS dev pattern), the migration's chgrp/chmod
+  # work has no effect and `bridge_isolation_v2_privilege_preflight`
+  # demands passwordless sudo just to perform that no-op — which aborts
+  # the upgrade when the operator (correctly) declines the prompt.
+  # Skip the entire migration body in that case and emit a benign no-op
+  # JSON. The branch is idempotent: every subsequent upgrade hits the
+  # same gate.
+  #
+  # `bridge_isolation_v2_roster_has_isolated_agents` returns:
+  #   0 — has isolated agent (do NOT skip, fall through to migration)
+  #   1 — confirmed no isolated agent (safe to skip on non-Linux)
+  #   2 — unknown / predicate or roster array unavailable (do NOT skip,
+  #       fall through so the existing preflight path emits its own
+  #       error and the operator gets actionable remediation)
+  #
+  # codex r1 needs-more catch (PR #882 r2): treat rc=1 (confirmed) and
+  # rc=2 (unknown) differently. Original logic merged both via `!cmd`
+  # which would have let a Darwin host with a broken roster predicate
+  # take the skip branch silently — bypassing the preflight check.
   if [[ "$(uname -s 2>/dev/null || printf 'unknown')" != "Linux" \
         && "$_iso_check_rc" -eq 1 ]]; then
     printf '{"mode":"isolation-v2-migrate","status":"ok","skipped":true,"reason":"macos-shared-agent","platform":"%s","no_v080_code_installed":"yes"}\n' \
       "$(uname -s 2>/dev/null || printf 'unknown')"
     return 0
   fi
-
-  local data_root="${BRIDGE_DATA_ROOT:-$target_root}"
-  local marker_path
-  marker_path="$(bridge_isolation_v2_marker_path 2>/dev/null || \
-    printf '%s/state/layout-marker.sh' "$target_root")"
 
   # Idempotent skip: marker already present + valid -> already migrated.
   # v0.8.4 r2: even on the skip path, run normalize_layout so existing

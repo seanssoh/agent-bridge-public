@@ -10674,6 +10674,15 @@ bash "$REPO_ROOT/scripts/smoke/agent-doctor.sh"
 log "running isolation-v2-migrate-lock-portability smoke (v0.8.1 hotfix)"
 bash "$REPO_ROOT/scripts/smoke/isolation-v2-migrate-lock-portability.sh"
 
+# v0.13.10 Track A regression smoke — verifies the marker-only fast-path
+# in bridge_isolation_v2_migrate_apply_for_upgrade: a markerless install
+# with no isolated agents that runs under BRIDGE_UPGRADE_CONTEXT=1 must
+# write the v2 marker without invoking sudo / group ops, and the gating
+# must hold for the non-upgrade context, has-isolated rosters, and
+# rc=2 (unknown) roster predicates.
+log "running isolation-v2-marker-only-migrate smoke (v0.13.10 Track A)"
+bash "$REPO_ROOT/scripts/smoke/isolation-v2-marker-only-migrate.sh"
+
 # v0.8.2 hotfix regression smoke (issue #652) — verifies cmd_migrate_agents
 # does NOT abort the multi-agent loop when one agent home is owned by a
 # different UID (controller cannot stat into 0700 memory tree). Two
