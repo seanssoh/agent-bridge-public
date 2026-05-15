@@ -132,11 +132,25 @@ bridge_layout_resolver_validate_env() {
       return 0
       ;;
     legacy|v1)
-      # v0.8.0 hard-cut: ACL-based isolation (v1) was removed. The only
-      # accepted BRIDGE_LAYOUT value is now `v2`. Fail-fast so operators
-      # who scripted `BRIDGE_LAYOUT=legacy` (or `=v1`) discover the
-      # required migration immediately instead of silently running on a
-      # half-removed code path.
+      # S2 stale-env unblock: if a valid v2 marker exists, the env value
+      # is a leftover from pre-v0.8.0 (e.g., an old shell rc, a stale
+      # tmux session, an operator script). Demote the hard-die to a
+      # warning and let the marker step run — the marker is authoritative
+      # for installs already migrated to v2. This is the codex-flagged
+      # operator-visible blocker (audit doc B17) where even the resolver
+      # consensus check trips on its own.
+      local _stale_marker_path
+      _stale_marker_path="$(bridge_isolation_v2_marker_path 2>/dev/null || true)"
+      if [[ -n "$_stale_marker_path" && -f "$_stale_marker_path" ]] \
+         && bridge_isolation_v2_marker_validate "$_stale_marker_path" >/dev/null 2>&1; then
+        bridge_warn "BRIDGE_LAYOUT=${layout} is a stale pre-v0.8.0 env override; marker ${_stale_marker_path} pins this install to v2. Preferring marker. To silence: \`unset BRIDGE_LAYOUT\` in your shell rc."
+        BRIDGE_LAYOUT_IGNORED_PARTIAL_ENV="BRIDGE_LAYOUT (stale ${layout} override; marker=v2)"
+        unset BRIDGE_LAYOUT
+        unset BRIDGE_DATA_ROOT
+        return 1
+      fi
+      # No valid v2 marker on disk — operator hasn't migrated. Keep the
+      # original hard-die so the migration prompt surfaces.
       bridge_die "Agent Bridge v0.8.0 requires isolation-v2 (POSIX group + setgid).
   current_layout=${layout}
   remediation: run \`agent-bridge upgrade --apply\` to migrate, or roll back to v0.7.x.

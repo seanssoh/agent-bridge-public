@@ -1572,7 +1572,12 @@ bridge_isolation_v2_apply_row() {
       return $?
       ;;
     group_setgid)
-      :
+      # macOS no-op: POSIX setgid groups are not the security primitive
+      # on Darwin. Skip silently so callers (apply_grant_matrix_for_agent,
+      # ensure_matrix_path) don't see false-negative chown/chmod failures
+      # against an `agent-bridge-*` user/group that does not exist on
+      # this host. S2 operator-visible blocker (audit doc C-S1).
+      [[ "$(uname)" == "Darwin" ]] && return 0
       ;;
     *)
       bridge_warn "apply_row($row_name): unknown grant_mechanism '$mechanism'"
@@ -1780,6 +1785,13 @@ bridge_isolation_v2_ensure_matrix_path() {
     bridge_warn "ensure_matrix_path: row_name and agent required"
     return 1
   }
+  # macOS no-op: POSIX setgid groups are not the security primitive on
+  # Darwin (the upgrade flow does not create `agent-bridge-*` OS users
+  # or `ab-*` groups there). Daemon writers should proceed with the
+  # caller's normal FS perms; returning 1 here would spam the warning
+  # log for every per-agent state-marker write (S2 operator-visible
+  # blocker, audit doc C-S1 / B17).
+  [[ "$(uname)" == "Darwin" ]] && return 0
   local row
   row="$(bridge_isolation_v2_matrix_rows_for_agent "$agent" \
           | awk -F'|' -v n="$row_name" '$1 == n {print; exit}')"
