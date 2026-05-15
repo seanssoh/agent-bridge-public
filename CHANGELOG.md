@@ -6,6 +6,51 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.13.10] — 2026-05-15
+
+### Highlight — v2 isolation bundle (3-track wave): unblock v0.7.x → v0.13.x leap end-to-end + close #686 / #895
+
+v0.13.7/v0.13.8/v0.13.9 fixed the Bash 5.3.9 heredoc deadlock CHAIN (3 surface variants). After v0.13.9 unblocked the leap's hang, the next gate was the v2-isolation layer: markerless-existing-install reject + shared-mode agent resolver semantics + scaffold/workdir mismatch coverage. v0.13.10 ships three tracks bundled in one release:
+
+**Track A — markerless-existing-install marker-only migrate (PR #897, closes blocker on patch host)**
+
+`bridge_isolation_v2_migrate_apply_for_upgrade` gained a marker-only fast-path that fires under `BRIDGE_UPGRADE_CONTEXT=1` + `bridge_isolation_v2_roster_has_isolated_agents` rc=1 (confirmed no isolated agents). Writes a wire-compatible v2 marker (mode 0640, `BRIDGE_LAYOUT=v2` + `BRIDGE_DATA_ROOT=...`) without group operations. Works on any host (macOS, Linux, BSD) without sudo. New `BRIDGE_UPGRADE_CONTEXT=1` env propagation through `bridge_upgrade_with_target_env`'s `env -i` allowlist. New regression smoke `scripts/smoke/isolation-v2-marker-only-migrate.sh` with 6 cases including T6 post-marker boot assertion (validates shared-mode agents still resolve to legacy explicit workdir + reach CLAUDE.md via `env -i` fresh subprocess).
+
+Operator-host context: this fixes patch task #4526/#4538 (Linux retry blocked at preflight) + Sean's mac install 2026-05-15 17:01 broken state (apply-live partially ran during isolation-v2 dseditgroup sudo failure, recovered via backup rollback).
+
+**Track B — close #686 with regression smoke for v2 home/+workdir/ scaffold (PR #898)**
+
+Issue #686 (v0.8.5 cycle, 2026-05-07) reported `bridge_scaffold_agent_home` materializing `home/` but `bridge_agent_workdir` resolving to `workdir/`. Verified functionally fixed at current main (v0.13.9): `_scaffold_v2_workdir` materialized in both isolated (sudo-handoff at `bridge-agent.sh:536-542`) and non-isolated (plain mkdir at `bridge-agent.sh:547-550`) branches. New regression smoke `scripts/smoke/v2-scaffold-home-and-workdir.sh` pins the fix with T1 (non-isolated) and T2 (Linux-only isolated/sudo-handoff). T2 uses `bridge_linux_sudo_root mkdir/chown/chmod` semantics matching PR #677/#688's fresh-install pre-state.
+
+Closes #686.
+
+**Track C — fix #895 `bridge_agent_workdir` honors explicit cwd for shared mode under v2 (PR #899)**
+
+Issue #895 (2026-05-15, @ymprince WSL2 OSS user, Linux 6.6.87.2-microsoft-standard-WSL2). `bridge_agent_workdir` unconditionally returned `$BRIDGE_AGENT_ROOT_V2/<agent>/workdir` whenever `BRIDGE_AGENT_ROOT_V2` was set, regardless of isolation mode. The v2-anchor override existed for the `linux-user` privacy invariant (per-agent group, mode 2750) but was firing for `shared` mode agents too, silently re-rooting `agb --claude --name <agent>` dynamic ad-hoc spawns into an empty `.claude/`+`.omc/` stub. The whole "open project, run `agb --claude --name worker`" UX was broken for fresh projects without a matching static role (`--prefer new` gated on `STATIC_CANDIDATES > 0`).
+
+Fix: gate the v2-anchor override on `bridge_agent_isolation_mode`. `linux-user` keeps current behavior (anchor wins, privacy invariant enforced); `shared` (and any other mode, including default-fallback) falls through to existing explicit-then-default resolution. New regression smoke `scripts/smoke/dynamic-agent-shared-mode-workdir.sh` with 3 cases (shared explicit cwd / linux-user anchor / no isolation_mode default-fallback).
+
+Closes #895.
+
+### Wave-orchestration patterns realized
+
+- **Bundle dependency ordering**: Track A's marker-only fast-path was r1-BLOCKING by codex until Track C's resolver fix landed (marker activation without resolver branching would have silently broken shared-mode legacy paths). Resolved by merging C first → rebasing A → adding T6 post-marker regression assertion → merging A → rebasing B.
+- **Latent test bug surfaced by changed-files coverage**: Track A's `lib/bridge-isolation*.sh` edit was the first PR since #882 to pull `isolation-v2-migrate-macos-skip.sh` into ci-select required, exposing a latent T5 expectation bug (helper returns rc=2 when `BRIDGE_AGENT_IDS` undeclared but smoke expected rc=1). T5 expectation corrected.
+- **`set -u` + undeclared assoc array footgun**: Track B's T2 smoke driver was post-#895 broken (Linux-only) because the driver declared `BRIDGE_AGENT_WORKDIR` but not `BRIDGE_AGENT_OS_USER` or `BRIDGE_AGENT_ISOLATION_MODE`. `bridge_agent_isolation_mode` reads `${BRIDGE_AGENT_OS_USER[$agent]-}` under `set -u`, which errors on undeclared arrays (bash treats the key as a separate variable lookup). The `2>/dev/null` in `bridge_agent_workdir` swallowed the error silently and the resolver fell through. Production never trips this because `bridge_load_roster` declares both arrays before any resolver call; the fix makes the test driver match the production invariant.
+- **ci-select required-static registration is necessary, not optional**: each new smoke must be registered in `scripts/ci-select-smoke.sh::add_all_required_static` for the changed-files-aware required selector to actually execute it in PR CI. All three tracks landed initial-r1 commits that forgot this registration; codex caught it each time.
+
+### Operator-host follow-up
+
+For installs blocked at the v0.7.x → v0.13.x leap by the markerless-existing-install reject:
+
+1. Confirm install unchanged: `cat ~/.agent-bridge/VERSION` should show the pre-upgrade version.
+2. Re-pull source: `cd <source-checkout> && git fetch origin && git checkout v0.13.10`.
+3. Re-run upgrader: `./agent-bridge upgrade --apply`.
+
+The marker-only fast-path fires automatically when the install has no isolated agents in its roster, which is the canonical v0.7.x → v0.13.x upgrade shape. Operators who later add isolated agents via `agent-bridge agent add --isolated` will handle group setup at that opt-in moment (separate from upgrade).
+
+If the upgrader still aborts on a host with isolated agents already in the roster, file a follow-up referencing this changelog entry — the marker-only fast-path is intentionally scoped to the no-isolated-roster case and the group-setup path is deferred to a v0.14.x cleanup.
+
 ## [0.13.9] — 2026-05-15
 
 ### Highlight — hotfix: heredoc-stdin **producer-side** wedge (3rd variant, v0.7.x → v0.13.x leap still blocked on v0.13.8)
