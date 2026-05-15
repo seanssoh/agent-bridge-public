@@ -139,15 +139,30 @@ bridge_layout_resolver_validate_env() {
       # for installs already migrated to v2. This is the codex-flagged
       # operator-visible blocker (audit doc B17) where even the resolver
       # consensus check trips on its own.
+      #
+      # Codex r1 catch (#904): only demote when the marker actually
+      # pins BRIDGE_LAYOUT=v2. A marker still pinned to v1 (un-migrated
+      # install) must fall through to the hard-die without the false
+      # "preferring marker" warning — that warning is part of the
+      # operator-visible contract and only correct when the marker
+      # is v2.
       local _stale_marker_path
       _stale_marker_path="$(bridge_isolation_v2_marker_path 2>/dev/null || true)"
       if [[ -n "$_stale_marker_path" && -f "$_stale_marker_path" ]] \
          && bridge_isolation_v2_marker_validate "$_stale_marker_path" >/dev/null 2>&1; then
-        bridge_warn "BRIDGE_LAYOUT=${layout} is a stale pre-v0.8.0 env override; marker ${_stale_marker_path} pins this install to v2. Preferring marker. To silence: \`unset BRIDGE_LAYOUT\` in your shell rc."
-        BRIDGE_LAYOUT_IGNORED_PARTIAL_ENV="BRIDGE_LAYOUT (stale ${layout} override; marker=v2)"
-        unset BRIDGE_LAYOUT
-        unset BRIDGE_DATA_ROOT
-        return 1
+        local _marker_layout
+        _marker_layout="$(
+          grep -E '^[[:space:]]*BRIDGE_LAYOUT[[:space:]]*=' "$_stale_marker_path" 2>/dev/null \
+            | tail -1 \
+            | sed -E "s/^[[:space:]]*BRIDGE_LAYOUT[[:space:]]*=//; s/^[\"']//; s/[\"']$//"
+        )"
+        if [[ "$_marker_layout" == "v2" ]]; then
+          bridge_warn "BRIDGE_LAYOUT=${layout} is a stale pre-v0.8.0 env override; marker ${_stale_marker_path} pins this install to v2. Preferring marker. To silence: \`unset BRIDGE_LAYOUT\` in your shell rc."
+          BRIDGE_LAYOUT_IGNORED_PARTIAL_ENV="BRIDGE_LAYOUT (stale ${layout} override; marker=v2)"
+          unset BRIDGE_LAYOUT
+          unset BRIDGE_DATA_ROOT
+          return 1
+        fi
       fi
       # No valid v2 marker on disk — operator hasn't migrated. Keep the
       # original hard-die so the migration prompt surfaces.

@@ -91,7 +91,7 @@ if ! grep -q '^RC=0$' "$T1_OUT"; then
   smoke_log "T1 output:"; cat "$T1_OUT"
   smoke_fail "T1: ensure_matrix_path did not return 0 on Darwin"
 fi
-if grep -q 'ensure_matrix_path' "$T1_OUT" | grep -qE 'failed|not found|required'; then
+if grep -qE 'ensure_matrix_path.*(failed|not found|required)' "$T1_OUT"; then
   smoke_log "T1 output:"; cat "$T1_OUT"
   smoke_fail "T1: ensure_matrix_path emitted a warning on Darwin (must be silent no-op)"
 fi

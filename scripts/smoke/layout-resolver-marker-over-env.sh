@@ -21,6 +21,11 @@
 #        overrides).
 #   C3 — env=legacy + NO marker → resolver DIES with the original
 #        migration prompt (regression guard for unmigrated installs).
+#   C4 — env=legacy + marker pinned to v1 → resolver DIES WITHOUT the
+#        false "preferring marker" warning. Codex r1 catch on PR #904:
+#        the demotion contract is "env=legacy + marker=v2 → demote";
+#        a v1 marker is itself un-migrated and must surface the hard-die
+#        without the misleading warning.
 
 set -uo pipefail
 
@@ -65,20 +70,39 @@ write_v2_marker() {
   chmod 0644 "$marker_file"
 }
 
+# Build a v1 (un-migrated) marker for the false-positive guard. The
+# validator returns 0 for this shape (only the v2 branch checks
+# data_root) — codex r1 caught that we were demoting based on validator
+# rc alone.
+write_v1_marker() {
+  local home_dir="$1"
+  local marker_dir="$home_dir/state"
+  local marker_file="$marker_dir/layout-marker.sh"
+  mkdir -p "$marker_dir"
+  {
+    printf '%s\n' '# bridge layout marker (v1) — un-migrated, smoke fixture'
+    printf 'BRIDGE_LAYOUT=v1\n'
+  } > "$marker_file"
+  chmod 0644 "$marker_file"
+}
+
 run_resolver() {
-  # Args: $1 = env_layout, $2 = env_data_root, $3 = home_dir, $4 = write_marker (1|0), $5 = out_file
+  # Args: $1 = env_layout, $2 = env_data_root, $3 = home_dir,
+  #       $4 = marker_kind (v2|v1|none), $5 = out_file
   local env_layout="$1"
   local env_data_root="$2"
   local home_dir="$3"
-  local write_marker="$4"
+  local marker_kind="$4"
   local out_file="$5"
 
   mkdir -p "$home_dir/state" "$env_data_root"
-  if [[ "$write_marker" == "1" ]]; then
-    write_v2_marker "$home_dir" "$env_data_root"
-  else
-    rm -f "$home_dir/state/layout-marker.sh"
-  fi
+  case "$marker_kind" in
+    v2) write_v2_marker "$home_dir" "$env_data_root" ;;
+    v1) write_v1_marker "$home_dir" ;;
+    none|0) rm -f "$home_dir/state/layout-marker.sh" ;;
+    1) write_v2_marker "$home_dir" "$env_data_root" ;;
+    *) smoke_fail "internal: unknown marker_kind=$marker_kind" ;;
+  esac
 
   local driver="$SMOKE_TMP_ROOT/driver-$$.sh"
   {
@@ -157,5 +181,22 @@ if grep -q 'stale pre-v0.8.0 env override' "$C3_OUT"; then
 fi
 smoke_log "C3 PASS"
 
-smoke_log "PASS — stale-env demotion behaves correctly across 3 cases"
+# C4 — env=legacy + marker pinned to v1 (un-migrated) → no false demote
+smoke_log "C4: env=legacy + marker pinned to v1 → hard-die WITHOUT demotion warning"
+C4_HOME="$SMOKE_TMP_ROOT/c4-home"
+C4_DATA="$SMOKE_TMP_ROOT/c4-data"
+C4_OUT="$SMOKE_TMP_ROOT/c4.out"
+run_resolver "legacy" "$C4_DATA" "$C4_HOME" "v1" "$C4_OUT" || true
+
+if ! grep -q 'requires isolation-v2' "$C4_OUT"; then
+  smoke_log "C4 output:"; cat "$C4_OUT"
+  smoke_fail "C4: expected hard-die ('requires isolation-v2') when marker pins layout to v1"
+fi
+if grep -q 'stale pre-v0.8.0 env override' "$C4_OUT"; then
+  smoke_log "C4 output:"; cat "$C4_OUT"
+  smoke_fail "C4: must NOT emit the 'preferring marker' demotion warning when marker pins layout to v1"
+fi
+smoke_log "C4 PASS"
+
+smoke_log "PASS — stale-env demotion behaves correctly across 4 cases"
 exit 0
