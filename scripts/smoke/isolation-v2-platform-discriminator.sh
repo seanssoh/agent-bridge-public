@@ -173,5 +173,62 @@ grep -q '^BEFORE_CLEAR=no$' "$D6_OUT" || { cat "$D6_OUT"; smoke_fail "D6: cached
 grep -q '^AFTER_CLEAR=yes$' "$D6_OUT" || { cat "$D6_OUT"; smoke_fail "D6: after clear, new env value should take effect"; }
 smoke_log "D6 PASS"
 
-smoke_log "PASS — discriminator predicates correct across 6 cases"
+# D7 — cache contract through bridge_isolation_v2_enforce wrapper.
+# Codex r1 catch: _enforce previously used $() which spawned a subshell,
+# so the cache var was never written back to the parent shell. This
+# verifies the documented cache contract holds across the gate the 140
+# S5 sites will actually use.
+smoke_log "D7: _enforce wrapper cache contract"
+D7_OUT="$SMOKE_TMP_ROOT/d7.out"
+run_predicate_probe "no" "Linux" '
+bridge_isolation_v2_enforce; FIRST_RC=$?
+echo "CACHE_AFTER_FIRST=$_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED"
+echo "FIRST_RC=$FIRST_RC"
+# Mutate env without clear_cache; the cache must override.
+export BRIDGE_ISOLATION_REQUIRED=yes
+bridge_isolation_v2_enforce; SECOND_RC=$?
+echo "CACHE_AFTER_SECOND=$_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED"
+echo "SECOND_RC=$SECOND_RC"
+# Now clear cache and verify the new env wins.
+bridge_isolation_discriminator_clear_cache
+bridge_isolation_v2_enforce; THIRD_RC=$?
+echo "CACHE_AFTER_THIRD=$_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED"
+echo "THIRD_RC=$THIRD_RC"
+' "$D7_OUT" || true
+
+grep -q '^CACHE_AFTER_FIRST=no$' "$D7_OUT" || { cat "$D7_OUT"; smoke_fail "D7: _enforce did not populate parent-shell cache after first call"; }
+grep -q '^FIRST_RC=1$' "$D7_OUT" || { cat "$D7_OUT"; smoke_fail "D7: _enforce rc mismatch after first call"; }
+grep -q '^CACHE_AFTER_SECOND=no$' "$D7_OUT" || { cat "$D7_OUT"; smoke_fail "D7: cache should persist across env mutation without clear_cache"; }
+grep -q '^SECOND_RC=1$' "$D7_OUT" || { cat "$D7_OUT"; smoke_fail "D7: _enforce should honor cached value, not new env"; }
+grep -q '^CACHE_AFTER_THIRD=yes$' "$D7_OUT" || { cat "$D7_OUT"; smoke_fail "D7: cache should reflect new env after clear_cache"; }
+grep -q '^THIRD_RC=0$' "$D7_OUT" || { cat "$D7_OUT"; smoke_fail "D7: _enforce should honor new env after clear_cache"; }
+smoke_log "D7 PASS"
+
+# D8 — standalone v2 module sources discriminator (CI red regression guard).
+# Codex r1 catch: tests/isolation-v2-primitives/smoke.sh sources
+# lib/bridge-isolation-v2.sh directly. After r2, v2 module self-sources
+# the discriminator so _enforce is defined in that flow too.
+smoke_log "D8: standalone v2 source brings in discriminator"
+D8_OUT="$SMOKE_TMP_ROOT/d8.out"
+D8_DRIVER="$SMOKE_TMP_ROOT/d8-driver.sh"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf 'cd %q\n' "$REPO_ROOT"
+  # Stub bridge_warn / bridge_die like the real standalone smoke does.
+  printf '%s\n' 'bridge_warn() { printf "[stub_warn] %s\n" "$*" >&2; }'
+  printf '%s\n' 'bridge_die() { printf "[stub_die] %s\n" "$*" >&2; exit 1; }'
+  printf '%s\n' 'source "$0_REPO_ROOT/lib/bridge-isolation-v2.sh" 2>&1'
+  printf '%s\n' 'if declare -f bridge_isolation_v2_enforce >/dev/null 2>&1; then echo "ENFORCE_DEFINED=yes"; else echo "ENFORCE_DEFINED=no"; fi'
+  printf '%s\n' 'if declare -f bridge_isolation_discriminator_auto_resolve >/dev/null 2>&1; then echo "RESOLVE_DEFINED=yes"; else echo "RESOLVE_DEFINED=no"; fi'
+} | sed "s#\$0_REPO_ROOT#$REPO_ROOT#g" >"$D8_DRIVER"
+chmod +x "$D8_DRIVER"
+"$BRIDGE_BASH" "$D8_DRIVER" >"$D8_OUT" 2>&1 || true
+rm -f "$D8_DRIVER"
+
+grep -q '^ENFORCE_DEFINED=yes$' "$D8_OUT" || { cat "$D8_OUT"; smoke_fail "D8: standalone v2 source did not bring in bridge_isolation_v2_enforce"; }
+grep -q '^RESOLVE_DEFINED=yes$' "$D8_OUT" || { cat "$D8_OUT"; smoke_fail "D8: standalone v2 source did not bring in bridge_isolation_discriminator_auto_resolve"; }
+smoke_log "D8 PASS"
+
+smoke_log "PASS — discriminator predicates correct across 8 cases"
 exit 0

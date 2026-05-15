@@ -42,10 +42,28 @@
 # string ("yes" or "no"). An empty string means "not yet resolved".
 _BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED=""
 
+_bridge_isolation_discriminator_platform() {
+  # Standalone-safe platform helper. Prefers BRIDGE_HOST_PLATFORM_OVERRIDE
+  # (for testability), then bridge_host_platform when available
+  # (full bridge-lib flow), then falls back to direct `uname -s`
+  # so the discriminator works when only this module is sourced
+  # (e.g., tests/isolation-v2-primitives/smoke.sh).
+  if [[ -n "${BRIDGE_HOST_PLATFORM_OVERRIDE:-}" ]]; then
+    printf '%s' "$BRIDGE_HOST_PLATFORM_OVERRIDE"
+    return 0
+  fi
+  if command -v bridge_host_platform >/dev/null 2>&1; then
+    bridge_host_platform 2>/dev/null
+    return $?
+  fi
+  uname -s 2>/dev/null || printf 'unknown'
+}
+
 bridge_isolation_discriminator_auto_resolve() {
   # Returns 0 always; prints the resolved value ("yes" or "no") on stdout.
   # Reads $BRIDGE_ISOLATION_REQUIRED and $BRIDGE_HOST_PLATFORM_OVERRIDE
-  # from the calling environment.
+  # from the calling environment. Result cached in
+  # $_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED (parent-shell var).
   if [[ -n "$_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED" ]]; then
     printf '%s' "$_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED"
     return 0
@@ -57,15 +75,19 @@ bridge_isolation_discriminator_auto_resolve() {
       resolved="$req"
       ;;
     auto|"")
-      if [[ "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]]; then
+      if [[ "$(_bridge_isolation_discriminator_platform)" == "Linux" ]]; then
         resolved="yes"
       else
         resolved="no"
       fi
       ;;
     *)
-      bridge_warn "BRIDGE_ISOLATION_REQUIRED='$req' is invalid (expected yes|no|auto); treating as auto"
-      if [[ "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]]; then
+      if command -v bridge_warn >/dev/null 2>&1; then
+        bridge_warn "BRIDGE_ISOLATION_REQUIRED='$req' is invalid (expected yes|no|auto); treating as auto"
+      else
+        printf '[discriminator] BRIDGE_ISOLATION_REQUIRED=%q invalid; treating as auto\n' "$req" >&2
+      fi
+      if [[ "$(_bridge_isolation_discriminator_platform)" == "Linux" ]]; then
         resolved="yes"
       else
         resolved="no"
@@ -83,9 +105,16 @@ bridge_isolation_v2_enforce() {
   #   - operator explicitly set BRIDGE_ISOLATION_REQUIRED=yes
   # Returns 1 (skip v2 enforcement, silent no-op) otherwise.
   #
+  # Codex r1 catch (PR #908): MUST NOT wrap auto_resolve in `$()` —
+  # the subshell would prevent the cache var from persisting to the
+  # parent shell, so every call would re-resolve (and re-warn on
+  # invalid BRIDGE_ISOLATION_REQUIRED). Call in-place with output
+  # redirected, then read the cache var directly.
+  #
   # Usage at call site:
   #   bridge_isolation_v2_enforce || return 0
-  [[ "$(bridge_isolation_discriminator_auto_resolve)" == "yes" ]]
+  bridge_isolation_discriminator_auto_resolve >/dev/null
+  [[ "$_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED" == "yes" ]]
 }
 
 bridge_isolation_v2_require_linux() {
@@ -98,9 +127,14 @@ bridge_isolation_v2_require_linux() {
   # _require_linux is an assertion that terminates if the host can't
   # satisfy the contract.
   local platform
-  platform="$(bridge_host_platform 2>/dev/null || printf 'unknown')"
+  platform="$(_bridge_isolation_discriminator_platform)"
   if [[ "$platform" != "Linux" ]]; then
-    bridge_die "operation requires Linux (host platform=$platform)"
+    if command -v bridge_die >/dev/null 2>&1; then
+      bridge_die "operation requires Linux (host platform=$platform)"
+    else
+      printf '[discriminator][error] operation requires Linux (host platform=%s)\n' "$platform" >&2
+      exit 1
+    fi
   fi
   return 0
 }

@@ -110,6 +110,24 @@ BRIDGE_AGENT_GROUP_PREFIX="${BRIDGE_AGENT_GROUP_PREFIX:-ab-agent-}"
 # 2. helpers — environment / dispatch
 # ---------------------------------------------------------------------------
 
+# Source the platform discriminator (S3). Two-path source:
+# - bridge-lib.sh flow sources `bridge-isolation-discriminator.sh` before
+#   us, so the function already exists and the guard below is a no-op.
+# - Standalone module callers (e.g. tests/isolation-v2-primitives/smoke.sh
+#   sourcing this file directly without going through bridge-lib.sh)
+#   need the discriminator brought in here so `bridge_isolation_v2_enforce`
+#   call sites further down resolve. The discriminator is self-contained:
+#   its `_platform` helper falls back to direct `uname -s` when
+#   `bridge_host_platform` is not available.
+if ! declare -f bridge_isolation_v2_enforce >/dev/null 2>&1; then
+  _BRIDGE_V2_MODULE_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  if [[ -f "$_BRIDGE_V2_MODULE_DIR/bridge-isolation-discriminator.sh" ]]; then
+    # shellcheck source=bridge-isolation-discriminator.sh
+    source "$_BRIDGE_V2_MODULE_DIR/bridge-isolation-discriminator.sh"
+  fi
+  unset _BRIDGE_V2_MODULE_DIR
+fi
+
 bridge_isolation_v2_active() {
   # Returns 0 (active) when BRIDGE_LAYOUT=v2 and BRIDGE_DATA_ROOT is set.
   #
