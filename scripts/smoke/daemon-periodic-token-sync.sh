@@ -39,10 +39,12 @@
 #       rc=1. The status-failed branch is the operator's visibility into
 #       persistent sync breakage.
 #
-# Footgun #11 mitigation: every helper body in this smoke is written to a
-# tempfile (`cat > "$path" <<'EOF' ... EOF`) and invoked via `bash <path>`
-# rather than passed through `bash -s <<<` here-strings or `python3 - <<'PY'`
-# heredoc-stdin. This mirrors the post-#800 / post-PR #801 convention.
+# Footgun #11 mitigation: every helper body in this smoke lives in a
+# committed fixture file under scripts/smoke/fixtures/<smoke-name>/ and is
+# copied into the temp root via `cp` rather than written through
+# `cat > "$path" <<'EOF' ... EOF` heredocs or `bash -s <<<` here-strings.
+# This mirrors the post-#800 / post-PR #801 / post-PR #883 r1 convention
+# (codex review caught new heredocs at lines 111, 124, 144).
 
 # Bash 4+ re-exec (mirrors scripts/smoke/daemon.sh).
 _SMOKE_REEXEC_TARGET="${BASH_SOURCE[0]}"
@@ -105,29 +107,20 @@ done
 SHIM_DIR="$SMOKE_TMP_ROOT/shim"
 mkdir -p "$SHIM_DIR"
 
+# Fixture root: each helper body lives in its own committed file. We copy
+# rather than heredoc-write to comply with footgun #11.
+FIXTURE_DIR="$SMOKE_REPO_ROOT/scripts/smoke/fixtures/daemon-periodic-token-sync"
+[[ -d "$FIXTURE_DIR" ]] || smoke_fail "fixture dir not found: $FIXTURE_DIR"
+
 # bridge-auth.sh shim: by default prints a valid `claude-token sync --json`
 # envelope and exits 0. The A4 case rewrites this to exit non-zero.
 make_auth_shim_success() {
-  cat >"$SHIM_DIR/bridge-auth.sh" <<'EOF'
-#!/usr/bin/env bash
-# Test shim for bridge-auth.sh — emits a minimal `claude-token sync --json`
-# envelope so the daemon helper's sync-status-parse subcommand returns "ok".
-set -euo pipefail
-# Drain argv; we only honor `claude-token sync --json` shape but do not
-# enforce it here — the daemon callsite passes a fixed shape.
-printf '{"status": "ok", "synced_agents": ["test-agent"]}\n'
-EOF
+  cp "$FIXTURE_DIR/bridge-auth-shim-success.sh" "$SHIM_DIR/bridge-auth.sh"
   chmod +x "$SHIM_DIR/bridge-auth.sh"
 }
 
 make_auth_shim_failure() {
-  cat >"$SHIM_DIR/bridge-auth.sh" <<'EOF'
-#!/usr/bin/env bash
-# Test shim for bridge-auth.sh — simulates the bridge-auth.sh sync command
-# failing (e.g. controller token missing). Exit non-zero so the tick takes
-# the status=failed branch.
-exit 7
-EOF
+  cp "$FIXTURE_DIR/bridge-auth-shim-failure.sh" "$SHIM_DIR/bridge-auth.sh"
   chmod +x "$SHIM_DIR/bridge-auth.sh"
 }
 
@@ -140,81 +133,10 @@ ln -sf "$SMOKE_REPO_ROOT/bridge-daemon-helpers.py" "$SHIM_DIR/bridge-daemon-help
 # Driver runs in a subshell with stubs for daemon_info / daemon_warn /
 # bridge_audit_log / bridge_with_timeout, points SCRIPT_DIR at the shim,
 # sources the extracted function bodies, and invokes the requested action.
+# Body lives in scripts/smoke/fixtures/daemon-periodic-token-sync/driver.sh
+# (committed) and is copied in to comply with footgun #11.
 DRIVER="$SMOKE_TMP_ROOT/driver.sh"
-cat >"$DRIVER" <<'EOF'
-#!/usr/bin/env bash
-# args: <action: due|tick> [extra args ignored]
-set -uo pipefail
-
-# Required env (caller sets all):
-#   SHIM_DIR, BRIDGE_STATE_DIR, FUNCS_SH, AUDIT_FILE
-: "${SHIM_DIR:?}"
-: "${BRIDGE_STATE_DIR:?}"
-: "${FUNCS_SH:?}"
-: "${AUDIT_FILE:?}"
-
-# Daemon function bodies reference "$SCRIPT_DIR/bridge-auth.sh" and
-# "$SCRIPT_DIR/bridge-daemon-helpers.py" — point that at our shim dir.
-SCRIPT_DIR="$SHIM_DIR"
-BRIDGE_BASH_BIN="${BASH:-bash}"
-export BRIDGE_STATE_DIR
-
-# Stubs for daemon-side helpers the function body calls. We capture every
-# bridge_audit_log call as one line per row in $AUDIT_FILE so the smoke
-# can grep the action + status fields after the call.
-daemon_info()  { printf '[info] %s\n' "$*" >&2; }
-daemon_warn()  { printf '[warn] %s\n' "$*" >&2; }
-bridge_audit_log() {
-  # signature: <actor> <action> <target> [--detail k=v ...]
-  local actor="$1" action="$2" target="$3"; shift 3 || true
-  local row="action=$action actor=$actor target=$target"
-  while (( $# )); do
-    if [[ "$1" == "--detail" ]]; then
-      shift
-      row+=" $1"
-    fi
-    shift || true
-  done
-  printf '%s\n' "$row" >>"$AUDIT_FILE"
-}
-# bridge_with_timeout — pass-through (no real timeout binary needed; the
-# shim helper returns instantly). Mirrors the test-double in
-# tests/codex-composer/smoke.sh.
-bridge_with_timeout() {
-  # <secs> <label> <cmd> [args...]
-  shift 2 || true
-  "$@"
-}
-
-# Source the extracted function bodies.
-# shellcheck source=/dev/null
-source "$FUNCS_SH"
-
-action="${1:-}"
-case "$action" in
-  due)
-    if bridge_daemon_periodic_token_sync_due; then
-      echo "DUE"
-    else
-      echo "NOT-DUE"
-    fi
-    ;;
-  tick)
-    if bridge_daemon_periodic_token_sync_tick; then
-      echo "TICK-OK"
-    else
-      echo "TICK-FAIL"
-    fi
-    ;;
-  state-file)
-    echo "$(bridge_daemon_periodic_token_sync_state_file)"
-    ;;
-  *)
-    echo "unknown action: $action" >&2
-    exit 2
-    ;;
-esac
-EOF
+cp "$FIXTURE_DIR/driver.sh" "$DRIVER"
 chmod +x "$DRIVER"
 
 AUDIT_FILE="$SMOKE_TMP_ROOT/audit.log"
