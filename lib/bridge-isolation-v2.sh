@@ -1080,6 +1080,32 @@ bridge_isolation_v2_privilege_preflight() {
   return 1
 }
 
+bridge_isolation_v2_roster_has_isolated_agents() {
+  # Returns:
+  #   0  — at least one roster agent has effective linux-user isolation
+  #   1  — roster fully iterated, NO agent is effectively isolated (confirmed
+  #        shared-only / safe to skip)
+  #   2  — predicate function or BRIDGE_AGENT_IDS array unavailable
+  #        (unknown — callers MUST fall through to the existing path
+  #        rather than treat as "no isolated")
+  #
+  # codex r1 needs-more catch (PR #882): merging rc=1 (confirmed-no-iso) and
+  # rc=2 (unknown) in a single non-zero would let a Darwin host with a
+  # broken roster predicate take the macOS skip branch, bypassing the
+  # legitimate preflight. Splitting the unknown state into rc=2 lets the
+  # caller gate "skip" on the confirmed rc=1 only.
+  declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 || return 2
+  declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 || return 2
+  local _roster_agent
+  for _roster_agent in "${BRIDGE_AGENT_IDS[@]}"; do
+    [[ -n "$_roster_agent" ]] || continue
+    if bridge_agent_linux_user_isolation_effective "$_roster_agent" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # 5. umask helpers — restore on every path
 # ---------------------------------------------------------------------------
