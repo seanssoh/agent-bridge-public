@@ -333,6 +333,42 @@ bridge_upgrade_with_target_env() {
     "$@"
 }
 
+# Footgun #11 (refs #265 / #800 / #815 / #890): Bash 5.3.9 deadlocks in
+# `read_comsub` when a parent `$()` command substitution captures the stdout
+# of a child whose own stdin is fed by a heredoc (the `python3 - <<'PY' …`
+# and `bash -s -- … <<'EOF' …` shapes used by several helpers in this file).
+# v0.13.7 fixed the `<<<` here-string variants of the same class; v0.13.8
+# closes the heredoc-stdin variant by staging stdout through a tempfile and
+# reading it back with the `$(< file)` bash builtin form, which does NOT
+# fork a subshell and therefore cannot wedge `read_comsub`.
+#
+# Usage: bridge_upgrade_capture_to_var <varname> <cmd> [args...]
+#
+# Exit status reflects <cmd>'s exit status. The tempfile is removed on both
+# success and failure paths; nothing persists on disk after the call returns.
+bridge_upgrade_capture_to_var() {
+  local _bucv_var="$1"
+  shift
+  local _bucv_tmp _bucv_rc=0
+  _bucv_tmp="$(mktemp -t agb-upg-capture.XXXXXX)" || return 1
+  # The `|| _bucv_rc=$?` idiom disarms `set -e` AND captures the real exit
+  # status. A bare `if ! "$@"; then ... $? ... fi` would lose the original
+  # rc because the `!` resets `$?` inside the then-branch to 0 (the inverted
+  # pipeline status), so the caller would see success even when "$@" failed.
+  "$@" >"$_bucv_tmp" || _bucv_rc=$?
+  if (( _bucv_rc != 0 )); then
+    rm -f -- "$_bucv_tmp"
+    return "$_bucv_rc"
+  fi
+  # `$(< file)` is the bash builtin shortcut for reading a file's contents
+  # without forking a subshell — safe under Bash 5.3.9. Trailing-newline
+  # stripping matches the semantics of the original `$()` capture it
+  # replaces, so callers that compared the value to a non-newline-terminated
+  # constant behave identically.
+  printf -v "$_bucv_var" '%s' "$(<"$_bucv_tmp")"
+  rm -f -- "$_bucv_tmp"
+}
+
 bridge_upgrade_propagate_claude_hooks() {
   local target_root="$1"
 
@@ -1136,8 +1172,10 @@ TARGET_ROOT="$(cd -P "$(dirname "$TARGET_ROOT")" && pwd -P)/$(basename "$TARGET_
 SOURCE_ROOT="$(cd -P "$SOURCE_ROOT" && pwd -P)"
 
 if [[ $SOURCE_EXPLICIT -eq 0 && "$SOURCE_ROOT" == "$TARGET_ROOT" ]]; then
-  RECORDED_SOURCE_ROOT="$(
-    python3 - "$TARGET_ROOT/state/upgrade/last-upgrade.json" <<'PY'
+  # Footgun #11: stage the `python3 - <<'PY' …` heredoc output via tempfile
+  # to avoid the parent-`$()`-over-heredoc-stdin Bash 5.3.9 deadlock.
+  _recorded_source_root_tmp="$(mktemp -t agb-upg-recsrc.XXXXXX)"
+  python3 - "$TARGET_ROOT/state/upgrade/last-upgrade.json" >"$_recorded_source_root_tmp" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1152,7 +1190,8 @@ except (FileNotFoundError, json.JSONDecodeError):
 source = str(payload.get("source_root") or "").strip()
 print(source)
 PY
-  )"
+  RECORDED_SOURCE_ROOT="$(<"$_recorded_source_root_tmp")"
+  rm -f -- "$_recorded_source_root_tmp"
   if [[ -n "$RECORDED_SOURCE_ROOT" && -d "$RECORDED_SOURCE_ROOT/.git" ]]; then
     SOURCE_ROOT="$(cd -P "$RECORDED_SOURCE_ROOT" && pwd -P)"
     if [[ "$SUBCOMMAND" == "apply" && $PULL_EXPLICIT -eq 0 ]]; then
@@ -1380,8 +1419,15 @@ if [[ $CHECK_ONLY -eq 1 ]]; then
 fi
 
 ANALYSIS_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" analyze-live --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT")"
-CHANNEL_GUARD_REPORT="$(bridge_upgrade_channel_guard_report "$SOURCE_ROOT" "$TARGET_ROOT")"
-CHANNEL_GUARD_JSON="$(bridge_upgrade_channel_guard_json "$CHANNEL_GUARD_REPORT")"
+# Footgun #11 (refs #890 / task #4532): both helpers below feed their inner
+# command stdin from a heredoc (`bash -s … <<'EOF'`, `python3 - … <<'PY'`).
+# Capturing them with a bare `$()` wedges Bash 5.3.9 in `read_comsub` during
+# a v0.7.x → v0.13.x leap. Stage stdout through a tempfile via the
+# `bridge_upgrade_capture_to_var` helper instead — same value, no deadlock.
+bridge_upgrade_capture_to_var CHANNEL_GUARD_REPORT \
+  bridge_upgrade_channel_guard_report "$SOURCE_ROOT" "$TARGET_ROOT"
+bridge_upgrade_capture_to_var CHANNEL_GUARD_JSON \
+  bridge_upgrade_channel_guard_json "$CHANNEL_GUARD_REPORT"
 
 if [[ "$SUBCOMMAND" == "analyze" ]]; then
   if [[ $JSON -eq 1 ]]; then
@@ -1411,7 +1457,9 @@ PY
 fi
 
 if [[ "$SUBCOMMAND" == "rollback" ]]; then
-  ROLLBACK_AGENT_RESTART_JSON="$(bridge_upgrade_agent_restart_json "" 0 "$DRY_RUN")"
+  # Footgun #11: same heredoc-stdin pattern as the --apply path above.
+  bridge_upgrade_capture_to_var ROLLBACK_AGENT_RESTART_JSON \
+    bridge_upgrade_agent_restart_json "" 0 "$DRY_RUN"
   rollback_args=(rollback-live --target-root "$TARGET_ROOT")
   if [[ -n "$BACKUP_ROOT" ]]; then
     rollback_args+=(--backup-root "$BACKUP_ROOT")
@@ -1433,7 +1481,8 @@ if [[ "$SUBCOMMAND" == "rollback" ]]; then
     # report failures the daemon already absorbed. No-op when dry-run
     # or when no `failed` rows are present.
     ROLLBACK_AGENT_RESTART_REPORT="$(bridge_upgrade_reconcile_agent_restart_recovery "$TARGET_ROOT" "$ROLLBACK_AGENT_RESTART_REPORT" "$DRY_RUN")"
-    ROLLBACK_AGENT_RESTART_JSON="$(bridge_upgrade_agent_restart_json "$ROLLBACK_AGENT_RESTART_REPORT" 1 "$DRY_RUN")"
+    bridge_upgrade_capture_to_var ROLLBACK_AGENT_RESTART_JSON \
+      bridge_upgrade_agent_restart_json "$ROLLBACK_AGENT_RESTART_REPORT" 1 "$DRY_RUN"
   fi
   if [[ $JSON -eq 1 ]]; then
     python3 - "$ROLLBACK_JSON" "$ROLLBACK_AGENT_RESTART_JSON" "$RESTART_DAEMON" "$RESTART_AGENTS" <<'PY'
@@ -1545,10 +1594,17 @@ if [[ $DRY_RUN -eq 0 ]]; then
   # forwards BRIDGE_LAYOUT_RESOLVER_BYPASS{,_OWNER_PID} explicitly so
   # the resolver inside the child still validates the handshake — the
   # process-tree walk traverses env → bash → upgrade.sh and matches.
+  # Footgun #11 (refs #890 / task #4532): the outer `$()` capture combined
+  # with `bash -s -- … <<'EOF' …` heredoc-fed stdin is the same shape that
+  # wedges Bash 5.3.9 in `read_comsub`. Stage stdout through a tempfile and
+  # read it back via `$(< file)` (bash builtin shortcut — no subshell
+  # fork, cannot wedge). The structural `set +e ; … ; rc=$? ; set -e`
+  # frame stays intact so the existing failure-handling block below still
+  # captures rc correctly.
   set +e
-  ISOLATION_V2_MIGRATION_JSON="$(
-    bridge_upgrade_with_target_env "$TARGET_ROOT" \
-      "$BRIDGE_BASH_BIN" -s -- "$SOURCE_ROOT" "$TARGET_ROOT" <<'EOF'
+  _iso_v2_migrate_tmp="$(mktemp -t agb-upg-isov2.XXXXXX)"
+  bridge_upgrade_with_target_env "$TARGET_ROOT" \
+    "$BRIDGE_BASH_BIN" -s -- "$SOURCE_ROOT" "$TARGET_ROOT" >"$_iso_v2_migrate_tmp" <<'EOF'
 set -euo pipefail
 source_root="$1"
 target_root="$2"
@@ -1559,8 +1615,9 @@ bridge_load_roster
 source "$source_root/lib/bridge-isolation-v2-migrate.sh"
 bridge_isolation_v2_migrate_apply_for_upgrade --target-root "$target_root" --json
 EOF
-  )"
   _migrate_rc=$?
+  ISOLATION_V2_MIGRATION_JSON="$(<"$_iso_v2_migrate_tmp")"
+  rm -f -- "$_iso_v2_migrate_tmp"
   set -e
   if [[ $_migrate_rc -ne 0 ]]; then
     # Issue #682: populate structured failure fields so the EXIT trap's
@@ -1655,7 +1712,11 @@ if [[ $DRY_RUN -eq 0 ]]; then
   rm -rf "$_write_state_payload_dir"
 fi
 
-AGENT_RESTART_JSON="$(bridge_upgrade_agent_restart_json "" 0 "$DRY_RUN")"
+# Footgun #11: `bridge_upgrade_agent_restart_json` feeds python via heredoc;
+# `$()` capture would deadlock under Bash 5.3.9 once a real report ships
+# enough output to fill the pipe (the leap path traverses this twice).
+bridge_upgrade_capture_to_var AGENT_RESTART_JSON \
+  bridge_upgrade_agent_restart_json "" 0 "$DRY_RUN"
 
 if [[ $DRY_RUN -eq 0 ]]; then
   set +e
@@ -2235,7 +2296,10 @@ if [[ $RESTART_AGENTS -eq 1 ]]; then
   # failures the daemon already absorbed. No-op when dry-run or when no
   # `failed` rows are present.
   AGENT_RESTART_REPORT="$(bridge_upgrade_reconcile_agent_restart_recovery "$TARGET_ROOT" "$AGENT_RESTART_REPORT" "$DRY_RUN")"
-  AGENT_RESTART_JSON="$(bridge_upgrade_agent_restart_json "$AGENT_RESTART_REPORT" 1 "$DRY_RUN")"
+  # Footgun #11: `agent_restart_json` heredoc + populated report = wedge
+  # candidate under Bash 5.3.9. Stage via tempfile.
+  bridge_upgrade_capture_to_var AGENT_RESTART_JSON \
+    bridge_upgrade_agent_restart_json "$AGENT_RESTART_REPORT" 1 "$DRY_RUN"
 fi
 
 if [[ $JSON -eq 1 ]]; then
