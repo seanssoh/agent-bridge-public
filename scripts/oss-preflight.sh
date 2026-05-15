@@ -119,4 +119,13 @@ if (( fail != 0 )); then
   exit 1
 fi
 
+# Heredoc-ban ratchet for bridge-upgrade.sh (footgun #11 carry-over).
+# See scripts/lint-heredoc-ban.sh for policy.
+if [[ -x "$repo_root/scripts/lint-heredoc-ban.sh" ]]; then
+  if ! "$repo_root/scripts/lint-heredoc-ban.sh"; then
+    echo "[oss] heredoc-ban ratchet failed — see scripts/lint-heredoc-ban.sh policy"
+    exit 1
+  fi
+fi
+
 echo "[oss] preflight passed"
