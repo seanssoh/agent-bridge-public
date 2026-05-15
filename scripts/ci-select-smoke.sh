@@ -239,7 +239,13 @@ select_for_path() {
       # required at every nested object level). Cover the invariant
       # smoke whenever bridge-cron-runner.py moves so a future PR can't
       # silently regress the strict-mode contract.
-      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict queue
+      # #874 (v0.13.6 hotfix): bridge-cron-runner.py's COMMON_BIN_DIRS +
+      # BRIDGE_CRON_EXTRA_PATH ext point control whether cron-driven
+      # codex/claude invocations can locate both the CLI binary AND the
+      # node interpreter under fnm/nvm/asdf/volta. Pin the registration
+      # contract smoke whenever the runner moves so a future PR cannot
+      # silently regress the fallback list.
+      add_required cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner cron-runner-schema-openai-strict cron-path-augmentation-874 queue
       add_integration integration-minimal
       ;;
 
