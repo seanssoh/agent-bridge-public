@@ -671,3 +671,74 @@ not acceptable (e.g. agents executing arbitrary third-party code under
 the tool UID), keep token rotation enabled with a short interval and
 treat the per-agent credential as a rotation-controlled secret rather
 than a long-lived one.
+
+## 26. Fixed in v0.13.x hotfix wave (2026-05-15)
+
+The following classes of issue are resolved as of v0.13.10. See `CHANGELOG.md` for per-release detail.
+
+### Bash 5.3.9 read_comsub / heredoc_write deadlock chain (footgun #11)
+
+Three variants of the same Bash 5.3.9 wedge blocked `agent-bridge upgrade --apply` on hosts running recent bash. Each variant was discovered only after the previous was fixed:
+
+- **v0.13.7 (PR #890)** — `<<<` here-string variant. Four sites converted to pipe / tempfile reads.
+- **v0.13.8 (PR #892)** — parent-`$()`-capture-of-heredoc-stdin variant. New helper `bridge_upgrade_capture_to_var`.
+- **v0.13.9 (PR #894)** — producer-side heredoc-write variant. Six leap-path bodies moved to standalone files under `lib/upgrade-helpers/` and invoked with file-as-argv.
+
+Operator impact: post-v0.13.10, v0.7.x → v0.13.x leap completes cleanly on Bash 5.3.9 hosts.
+
+**Outstanding**: 18 python heredoc sites in `bridge-upgrade.sh` (post-apply / alternate-subcommand) deferred to v0.14.x cleanup. Off the apply leap path. See §27 below.
+
+### Markerless-existing-install layout reject (upgrade gate)
+
+v0.7.x installs lack the isolation-v2 marker. Post-v0.8.0 the layout resolver hard-rejected markerless installs, blocking the leap.
+
+- **v0.13.10 Track A (PR #897)** — marker-only fast-path in `bridge_isolation_v2_migrate_apply_for_upgrade`. When invoked under `BRIDGE_UPGRADE_CONTEXT=1` and the roster has no isolated agents in the linux-user sense, the migration writes a wire-compatible v2 marker (mode 0640) without group operations. Works on macOS, Linux, BSD without sudo.
+
+### bridge_agent_workdir shared-mode workdir override (#895, ymprince WSL2)
+
+Pre-v0.13.10: `bridge_agent_workdir` unconditionally returned the v2 anchor regardless of isolation mode, breaking `agb --claude --name <agent>` dynamic spawn UX.
+
+- **v0.13.10 Track C (PR #899)** — branch the v2-anchor override on `bridge_agent_isolation_mode`. linux-user keeps current behavior; shared and default-fallback honor explicit `BRIDGE_AGENT_WORKDIR`. Closes #895.
+
+### v2 scaffold home/ vs workdir/ sibling mismatch (#686)
+
+Originally reported v0.8.5. `bridge_scaffold_agent_home` materialized `home/` but `bridge_agent_workdir` resolved to `workdir/`. Fix landed in PR #685 (v0.8.5). PR #898 (v0.13.10 Track B) added regression smoke. Closes #686.
+
+## 27. Outstanding (carry-over to v0.14.x / stabilization plan)
+
+Tracked but not blocking. See `docs/stabilization-plan-2026-05-15.md` for stage assignments and `docs/audit-2026-05-15.md` for individual file:line evidence.
+
+### 18 deferred python heredoc sites in bridge-upgrade.sh
+
+Per v0.13.10 codex r4 (PR #897), 18 `python3 - <<'PY' …` sites remain:
+- Lines 662, 761, 784, 1130, 1243, 1252, 1297, 1308, 1534, 1581, 1798, 2144, 2260, 2266, 2278, 2287, 2313, 2345.
+
+Classification (codex r4 verified):
+- **7 sites** alternate-subcommand paths (`--check`, `--analyze`, `--rollback`) — never reached via `--apply`.
+- **11 sites** post-apply — install is upgraded before any of these execute.
+
+Cleanup: stabilization plan S10-late + bash-5.3.9 VM verification.
+
+### BRIDGE_LAYOUT=legacy env-leak from old sessions
+
+Long-running shell / tmux sessions started before v0.13.10 may carry stale `BRIDGE_LAYOUT=legacy` env. Resolver hard-dies even when on-disk marker is valid v2.
+
+- **Workaround**: `unset BRIDGE_LAYOUT BRIDGE_DATA_ROOT` or restart parent process.
+- **Planned fix**: stabilization plan S2.
+
+### macOS isolation-v2 noise
+
+Stop hooks on macOS emit `[경고] write_agent_state_marker: ensure_matrix_path failed` because the v2 matrix encodes Linux POSIX setgid invariants that don't apply on macOS. Cosmetic; marker write succeeds via fallback.
+
+- **Planned fix**: stabilization plan S2 + S3 (platform-aware discriminator).
+
+### Isolated-agent group setup on macOS
+
+`agent-bridge agent add --isolated` on macOS attempts `dseditgroup` which requires sudo. Without sudo, mid-migration failure leaves install in a broken state.
+
+- **Workaround**: do NOT use `--isolated` on macOS. Use shared-mode.
+- **Planned fix**: stabilization plan S6 — explicit error gate.
+
+### Audit findings
+
+See `docs/audit-2026-05-15.md` for the full P0/P1/P2 catalog (31 bug-surface + 17 stability + 20 isolation-v2 top sites + 5 isolation-v2 buried-assumption + 10 refactor + 17 test/doc-drift findings). Each has an owner-stage in the stabilization plan.

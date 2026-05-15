@@ -46,12 +46,46 @@ Tracked long-lived agent profiles live under `agents/`. That tree is the portabl
 
 Shared Bash implementation is split under [`lib/`](./lib):
 
+**Core modules**
+
 - `bridge-core.sh`: generic helpers, hashing, queue wrapper, and path utilities
-- `bridge-agents.sh`: roster accessors, active-agent queries, worktree preparation, and session kill helpers
+- `bridge-agents.sh`: roster accessors, active-agent queries, worktree preparation, session kill helpers, `bridge_agent_workdir` resolver (post-#895 honors isolation_mode), `bridge_agent_isolation_mode` lookup
 - `bridge-tmux.sh`: tmux session I/O and submit helpers
 - `bridge-skills.sh`: project-local skill generation and migration of older managed skill directories
 - `bridge-state.sh`: roster loading, dynamic/static agent persistence, session-id detection, and daemon snapshots
 - `bridge-cron.sh`: legacy cron path helpers, family-aware default slots, target resolution, and enqueue manifests
+- `bridge-hooks.sh`: Claude / Codex hook ensure + status, shared-settings symlink, `bridge_claude_settings_mode` source-aware classifier
+- `bridge-channels.sh`: channel discovery, per-channel webhook port allocation, dynamic + static channel state writes
+- `bridge-cleanup.sh`: cleanup payload renderer (v0.13.6 PR #886 — heredoc-free fixture path)
+
+**Isolation-v2 stack** (added v0.8.0+, expanded through v0.13.x)
+
+- `bridge-marker-bootstrap.sh`: layout marker validator + reader; runs before `bridge-layout-resolver.sh` so the resolver sees a parsed marker (or env fallback)
+- `bridge-layout-resolver.sh`: decides BRIDGE_LAYOUT (v2 only as of v0.8.0); fail-fast on `legacy` env; markerless-existing-install detection; fresh-install bypass handshake
+- `bridge-isolation-v2.sh`: matrix-driven path enforcement (groups, modes, setgid); platform-aware (POSIX setgid on Linux; Darwin no-op stubs in many ensure paths)
+- `bridge-isolation-v2-migrate.sh`: layout migration entry; v0.13.10 added the marker-only fast-path for markerless-existing-install + no-isolated-roster (Track A PR #897)
+- `bridge-isolation-v2-reapply.sh`: standalone reapply / verify CLI for matrix rows; Linux-only platform-gated at entry
+- `bridge-isolation-runtime.sh`: per-launch runtime helpers (secret-env exec wrapper with umask 0007)
+- `bridge-isolation-v3-channel-dotenv.sh`: channel `.env` secret-store ACL helpers (POSIX named-user ACL on Linux; macOS no-op)
+- `bridge-isolation-helpers.sh`: shared primitives reused across the v2/v3 stack (write-as-agent, sudo-handoff predicates)
+- `bridge-migration.sh`: per-agent migration entry for the `migrate-agents` subcommand; Linux-only via `bridge_migration_require_linux`
+- `bridge-host-profile.sh`: per-host capability snapshot (uname, sudo availability, group tooling) consulted by isolation gates
+
+**Upgrade helpers** (added v0.13.9, expanded through v0.13.10)
+
+`lib/upgrade-helpers/` holds standalone scripts invoked by `bridge-upgrade.sh` with file-as-argv (no heredoc-stdin → no footgun #11 Bash 5.3.9 deadlock). Each file replaces a former `<<EOF`/`<<'PY'` heredoc body that wedged the leap path:
+
+- `channel-guard-report.sh` (bash heredoc → standalone)
+- `channel-guard-json.py` (python heredoc → standalone)
+- `agent-restart-json.py` (python heredoc → standalone)
+- `recorded-source-root.py` (inline python heredoc → standalone)
+- `isolation-v2-migrate.sh` (inline bash heredoc → standalone)
+- `emit-failure-json.py` (python heredoc → standalone, EXIT-trap path)
+
+**Wave orchestration**
+
+- `bridge-wave.sh`: wave-orchestration runtime support (used by skill `wave-orchestration`)
+- `bridge-admin-pair.sh`: admin-pair backfill + state (for paired Claude+Codex sessions)
 
 ## State Layout
 

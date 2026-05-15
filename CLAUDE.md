@@ -35,10 +35,22 @@ Tracked source must stay machine-agnostic. Machine-specific roster overrides, ch
 ## Layout at a Glance
 
 - Root `bridge-*.sh` and `bridge-*.py`: primary CLI entry points. New logic should generally go into a `lib/bridge-*.sh` helper rather than growing root scripts.
-- [`lib/`](./lib): shared Bash implementation (`bridge-core.sh`, `bridge-agents.sh`, `bridge-tmux.sh`, `bridge-state.sh`, `bridge-cron.sh`, `bridge-skills.sh`, `bridge-hooks.sh`).
+- [`lib/`](./lib): shared Bash implementation. Core modules: `bridge-core.sh`, `bridge-agents.sh`, `bridge-tmux.sh`, `bridge-state.sh`, `bridge-cron.sh`, `bridge-skills.sh`, `bridge-hooks.sh`, `bridge-channels.sh`, `bridge-cleanup.sh`. Isolation-v2 stack (v0.8.0+): `bridge-marker-bootstrap.sh`, `bridge-layout-resolver.sh`, `bridge-isolation-v2.sh`, `bridge-isolation-v2-migrate.sh`, `bridge-isolation-v2-reapply.sh`, `bridge-isolation-runtime.sh`, `bridge-isolation-v3-channel-dotenv.sh`, `bridge-isolation-helpers.sh`, `bridge-migration.sh`, `bridge-host-profile.sh`. See `ARCHITECTURE.md` §"Shell Module Layout" for the full annotated list.
+- [`lib/upgrade-helpers/`](./lib/upgrade-helpers) (v0.13.9+): standalone scripts invoked by `bridge-upgrade.sh` with file-as-argv to bypass the Bash 5.3.9 heredoc-stdin deadlock (footgun #11). Six files: `channel-guard-report.sh`, `channel-guard-json.py`, `agent-restart-json.py`, `recorded-source-root.py`, `isolation-v2-migrate.sh`, `emit-failure-json.py`. **Anti-pattern**: do NOT add new `<<EOF` / `<<'PY'` heredoc-stdin to subprocess in `bridge-upgrade.sh` — extract to a standalone helper instead. See `KNOWN_ISSUES.md` §26.
 - Python is used for structured work: queue backend (`bridge-queue.py`), cron inventory (`bridge-cron.py`), docs/audit/intake/dashboard helpers.
 - [`agents/`](./agents): tracked portable agent profile templates (not runtime homes).
 - [`scripts/`](./scripts): install + smoke + deploy helpers.
+
+## Recent critical patches (v0.13.7-v0.13.10, 2026-05-15)
+
+A 4-cycle hotfix wave + bundled v2-isolation cleanup landed on 2026-05-15. Read these if touching upgrade / isolation / scaffold code:
+
+- **v0.13.7-v0.13.9**: three variants of the same Bash 5.3.9 `read_comsub`/`heredoc_write` deadlock (footgun #11). Each release unblocked the next leap step; v0.13.9 closed the chain by extracting heredoc bodies to `lib/upgrade-helpers/`.
+- **v0.13.10**: 3-track bundle — Track A (PR #897) markerless-existing-install marker-only migrate; Track B (PR #898) v2 scaffold regression smoke; Track C (PR #899) `bridge_agent_workdir` isolation-mode branch (#895 ymprince WSL2 OSS user).
+
+Current stabilization roadmap: `docs/stabilization-plan-2026-05-15.md` (mandatory read for any post-v0.13.10 session). Audit ground truth: `docs/audit-2026-05-15.md`.
+
+**Version policy** (operator directive 2026-05-15): stabilization PRs do NOT bump VERSION/CHANGELOG. The next release PR is operator-cued and batches accumulated user-visible items. See plan §"Version policy".
 
 ## Common Commands
 
