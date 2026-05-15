@@ -6,6 +6,86 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.13.6] — 2026-05-15
+
+### Highlight — operator-host audit wave (8 PRs, single session)
+
+8 PRs landed on top of v0.13.5 in a single session driven by patch-host diagnostics on a Linux production install. Three high-priority operational regressions plus four targeted improvements plus one emergency hotfix:
+
+- **ADMIN-PROTOCOL.md propagation** (#880) — was referenced but never installed.
+- **admin agent hook exemption** (#881) — admin diagnostic reads were being silently blocked.
+- **macOS upgrade path unblocked** (#882) — isolation-v2 migration was demanding sudo on hosts where the v2 layout has no operational effect.
+- **daemon periodic Claude token sync** (#883) — token sync only fired on rotation events; cron-only agents went stale and hit 429 (mgt_ahn on 2026-05-15 03:49 KST).
+- **cron PATH for node-manager binaries** (#885) — fnm/nvm/asdf/volta stable alias paths now augmented automatically.
+- **cleanup payload renderer** (#886) — empty stdin no longer leaks raw `json.JSONDecodeError`, and the heredoc-stdin pattern that swallowed the caller's piped JSON is gone.
+- **bridge-notify default discord** (#887) — agents without a discord channel no longer emit `discord account not found: default` noise.
+- **ci-select conflict marker hotfix** (#888) — emergency: PR #887's squash-merge left raw git conflict markers in `scripts/ci-select-smoke.sh`, breaking every subsequent CI invocation. Hotfix removed the markers and collapsed the merged dispatch row.
+
+PR #884 (isolated UID credential sync via sudo helper) was opened, then closed without merging after on-host diagnosis confirmed the original gap was a false reading — sales_sean's credential file lives at the isolated UID's real home (`/home/agent-bridge-sales_sean/.claude/.credentials.json`), not the controller-side mirror; PR #883's periodic sync covers the actual stale-token symptom this PR had been chasing.
+
+### Fixed
+
+- **ADMIN-PROTOCOL.md wire-up (PR #880, refs operator report 2026-05-15)**. `bridge-docs.py:23` `AGENT_SHARED_LINKS` tuple was missing `ADMIN-PROTOCOL.md`, so admin agent homes never received the symlink even though the managed CLAUDE.md block referenced it. Added the tuple entry plus a `render_shared_admin_protocol_md` renderer that reads `docs/agent-runtime/admin-protocol.md` as the SSOT, prepends a managed-by header, and emits the body verbatim. Wired symlink loop at `bridge-docs.py:1333` then auto-creates `ADMIN-PROTOCOL.md -> ../shared/ADMIN-PROTOCOL.md` in every agent home. New smoke `scripts/smoke/admin-protocol-shared-link.sh` (9 cases) pins the propagation contract.
+
+- **Admin agent hook exemption pass (PR #881)**. Hooks were treating admin agents (the operator's own delegated principal) the same as any peer, so diagnostic reads like `ls ~/.claude/.credentials.json` were silently blocked with `Claude OAuth credentials are blocked inside tool calls`. Added read-intent exemption for admin agents:
+  - `hooks/tool-policy.py`: Bash credential surface (raw text, env-dump, argv path) and Read/Glob/Grep/NotebookRead credential-path checks now allow admin + read-intent and audit via `agent_admin_credential_read_allowed`. `_is_read_intent_bash` extended to catch numeric-fd write redirections (`1>file`, `99>>file`) so a compromised admin cannot exfiltrate by piping a read through an output redirect.
+  - `hooks/prompt-guard.py`: low / medium severity prompt-guard hits become `prompt_guard_admin_warn_only` audit rows for admin agents (high / critical still hard-block — compromised admin defense).
+  - Roster / system-config / task DB mutation deny paths remain in force for admin too (wrapper-required, per the existing #341 contract).
+  - New smoke `scripts/smoke/admin-hook-exemption.sh` (11 cases) pins read vs write classification, audit shape, and the high-severity hard-block.
+
+- **isolation-v2 migration macOS no-op (PR #882, refs operator report 2026-05-15 via task #4522)**. `bridge_isolation_v2_migrate_apply_for_upgrade` was platform-agnostic — markerless installs unconditionally tried to apply the v2 layout, and `bridge_isolation_v2_privilege_preflight` then demanded root / passwordless sudo. macOS shared-agent installs have no isolated UIDs and the v2 layout (group + setgid + named-user) has no operational effect there, but the operator was still being prompted for sudo and the upgrade aborted on refusal. Fix:
+  - New helper `bridge_isolation_v2_roster_has_isolated_agents` (`lib/bridge-isolation-v2.sh:1083`) returns 0 (has isolated), 1 (confirmed no isolated), or 2 (unknown — predicate or `BRIDGE_AGENT_IDS` unavailable). The rc=1 vs rc=2 split (codex r1 catch) lets the caller skip ONLY when explicitly confirmed safe.
+  - `bridge_isolation_v2_migrate_apply_for_upgrade` gates the skip on `uname -s != Linux && rc == 1`. Unknown roster state falls through to the existing preflight so the operator sees the real cause instead of a silent skip.
+  - New smoke `scripts/smoke/isolation-v2-migrate-macos-skip.sh` (5 cases) pins both branches (Darwin+confirmed-shared skip; Darwin+isolated, Linux+isolated, predicate-missing all fall through).
+
+- **Daemon periodic Claude token sync (PR #883, refs operator report 2026-05-15)**. Three static Claude agents on a production Linux host went 62 hours without a token refresh — patch refreshed via its live Claude session, but dev_mun / sales_choi / mgt_ahn were cron-only and never had a live session to self-refresh. The daemon's sync branch only fires on `sync_recommended=1` from token-recovery, which never triggers for cron-only agents. mgt_ahn hit a 429 on 2026-05-15 03:49 KST. Fix:
+  - New `bridge_daemon_periodic_token_sync_due` + `_tick` in `bridge-daemon.sh`'s main poll loop. Every `BRIDGE_CLAUDE_TOKEN_SYNC_INTERVAL_SECONDS` (default 3600, set to `0` to disable) the tick calls `bridge-auth.sh claude-token sync --agents <scope>` and writes a `claude_token_periodic_sync` audit row regardless of any rotation / recovery event.
+  - Hot-loop guard: state file timestamp is refreshed on both success and failure (so a persistently-failing sync emits one `status=failed` audit row per interval, not every tick).
+  - `BRIDGE_CLAUDE_TOKEN_PERIODIC_SYNC_ENABLED=0` kill switch; `BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS` (default `static`) selects the scope.
+  - New smoke `scripts/smoke/daemon-periodic-token-sync.sh` (5 cases) pins first-call due / not-due skip / overdue refire / failure-without-hot-loop / interval=0 disable. Fixture files split off the original heredoc bodies to satisfy footgun #11.
+
+- **cron PATH augmentation for node-manager binaries + interpreters (PR #885, closes #874)**. fnm / nvm / asdf / volta-managed `codex` / `claude` binaries were invisible to cron because the runner's `COMMON_BIN_DIRS` only listed plain stable paths. Operators had to manually `npm install -g` and symlink `node` on every fresh host. Fix:
+  - `bridge-cron-runner.py:COMMON_BIN_DIRS` now includes `~/.local/share/fnm/aliases/default/bin`, `~/.nvm/versions/node/default/bin`, `~/.asdf/shims`, `~/.volta/bin` (stable alias paths only — per-version paths are intentionally excluded because `fnm use <other>` breaks them).
+  - `BRIDGE_CRON_EXTRA_PATH` env override for operator-specific augmentation. Iteration order ensures extras win over built-in fallbacks at PATH position 0 (codex r1 catch on the `insert(0, …)` semantics).
+  - New smoke `scripts/smoke/cron-path-augmentation-874.sh` pins the registration contract.
+
+- **cleanup payload renderer empty-stdin handling (PR #886, closes #872)**. `lib/bridge-cleanup.sh` rendered the "Backup residue cleanup" section of the `[upgrade-complete]` task body by piping JSON into a `python3 - <<'PY' ... PY` heredoc-stdin invocation. The heredoc body itself became `python3`'s stdin, so the caller's piped `CLEANUP_JSON` never reached the renderer; an empty payload leaked raw `json.JSONDecodeError: Expecting value: line 1 column 1 (char 0)` into every operator's task body. Fix:
+  - Extracted the renderer body to `scripts/python-helpers/cleanup-payload-renderer.py` and invoked it as `python3 <fixture-path>` (post-#800 footgun #11 mitigation pattern). The caller's piped JSON now reaches the renderer as designed.
+  - Renderer handles `empty stdin → friendly no-actions message`, `invalid JSON → operator-readable parse error (no traceback leak)`, `valid JSON → structured summary`.
+  - New smoke `scripts/smoke/cleanup-payload-empty-stdin-872.sh` (3 cases).
+
+- **bridge-notify default-discord silent-skip (PR #887, closes #875)**. `bridge-notify` was emitting `discord account not found: default` into `[cron-followup]` task bodies for codex agents that had no discord channel configured. Now `bridge_notify_send --account default` with a missing default account silently skips with a `bridge_notify_skipped` (reason=no_default_account) audit row, exiting 0. `--account <named>` with a missing named account remains a hard failure (intentional configuration error).
+
+- **ci-select conflict-marker emergency hotfix (PR #888)**. PR #887's squash-merge inherited an unresolved `scripts/ci-select-smoke.sh` conflict against PR #883's `daemon-periodic-token-sync` dispatch row, and the merge committed the file with raw `<<<<<<<` / `=======` / `>>>>>>>` markers intact. This was a hard bash syntax error that broke every subsequent CI invocation. Hotfix removed the markers and collapsed the merged dispatch row into a single line including all PR #880/#881/#882/#883/#885/#887 dispatch tokens. **Operator-side mitigation if a v0.13.6 release artifact was already pulled between `791b75b` and `ee36c5b`**: re-pull main; `bash -n scripts/ci-select-smoke.sh` should report no errors. The release tag below is cut from `ee36c5b` or later, so consumers of the tag are not affected.
+
+### Closed (issue tracker)
+
+- #872 — cleanup payload empty-stdin renders raw `json.JSONDecodeError`
+- #874 — bridge-cron-runner PATH augmentation for fnm/nvm/asdf
+- #875 — bridge-notify spurious `discord account not found: default`
+
+### Operator-host follow-up procedure for v0.13.6
+
+After upgrading a linux-user-isolated install to v0.13.6:
+
+1. `agent-bridge upgrade --apply` (or the operator's preferred path).
+2. Monitor `~/.agent-bridge/logs/daemon.log` for `claude_token_periodic_sync` audit rows over the next 1-2 hours. Expected cadence: every `BRIDGE_CLAUDE_TOKEN_SYNC_INTERVAL_SECONDS` (default 3600).
+3. Verify cron-only agents now have fresh credential mtimes:
+   ```
+   for a in <cron-only-agents>; do
+     sudo -u "agent-bridge-$a" stat -c '%Y' ~agent-bridge-$a/.claude/.credentials.json 2>/dev/null
+   done
+   ```
+   Each should be within the last interval.
+4. For macOS shared-agent installs: no operational action required — the v2 isolation migration silently skipped (audit JSON shows `"skipped":true, "reason":"macos-shared-agent"`).
+
+### Carry-over
+
+- **PR-5 stop-gap retirement (#857)** — pending one cycle of v3 migrate validation in Linux production. Track for v0.14.0.
+- **#859 (plugin install isolated-UID)** — separate design pass.
+- **#879 (dev-channels watcher race)** — multi-isolated-agent restart race condition. Surface is large; deferred to next cycle for root-cause investigation.
+- **OpenAI strict-mode schema audit on other JSON schemas** — bridge-cron-runner's `RESULT_SCHEMA` was caught in v0.13.5; other schemas should be similarly audited to prevent the next strict-mode tightening from breaking them.
+
 ## [0.13.5] — 2026-05-15
 
 ### Highlight — hotfix: bridge-cron-runner RESULT_SCHEMA violates OpenAI Structured Outputs strict mode
