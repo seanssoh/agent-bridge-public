@@ -140,6 +140,20 @@ write_driver_script() {
     'ls -1 "$(dirname "$HOME_DIR")" 2>&1 | sed "s/^/  /"' \
     'echo "RESOLVER_OUTPUT:"' \
     'declare -A BRIDGE_AGENT_WORKDIR 2>/dev/null || true' \
+    '# Post-#895 (Track C v0.13.10), bridge_agent_workdir gates the v2-anchor' \
+    '# override on the agent`s registered isolation_mode (`linux-user` only).' \
+    '# Production reads that from `BRIDGE_AGENT_ISOLATION_MODE[<agent>]`,' \
+    '# populated by bridge_load_roster from `agent-roster.local.sh`. The' \
+    '# driver bypasses roster load (it`s testing scaffold + resolver in' \
+    '# isolation), so we mirror the roster state directly: register the' \
+    '# agent`s isolation mode here so the resolver`s mode-gate sees the' \
+    '# same value the caller passed to scaffold. T1 (no SCAFFOLD_ISOLATION_MODE)' \
+    '# leaves the entry unset → resolver falls through to default; T2' \
+    '# (linux-user) writes the entry → resolver returns the v2 anchor.' \
+    'declare -A BRIDGE_AGENT_ISOLATION_MODE 2>/dev/null || true' \
+    'if [[ -n "${SCAFFOLD_ISOLATION_MODE:-}" ]]; then' \
+    '  BRIDGE_AGENT_ISOLATION_MODE["$AGENT_ID"]="$SCAFFOLD_ISOLATION_MODE"' \
+    'fi' \
     'resolved="$(bridge_agent_workdir "$AGENT_ID" 2>&1)"' \
     'echo "  $resolved"' \
     'if [[ -d "$HOME_DIR" ]]; then echo "HOME_DIR_STATUS: dir"; else echo "HOME_DIR_STATUS: missing"; fi' \
