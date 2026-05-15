@@ -26,8 +26,15 @@
 #      (the bug-fix path).
 #   2. linux-user mode + explicit cwd → resolver returns the v2 anchor
 #      (the privacy-preserving path, must NOT regress).
+#   3. NO isolation mode entry at all + explicit cwd → resolver returns
+#      the explicit cwd. `bridge_agent_isolation_mode` normalizes the
+#      missing/empty roster value to `shared` (lib/bridge-agents.sh:799-
+#      802), so the default-fallback contract must behave identically
+#      to case 1. Without this case, a future edit that special-cases
+#      "explicit shared" but forgets the unset path could silently
+#      regress dynamic spawn for fresh-install agents.
 #
-# Both branches are asserted because a one-sided test would let either
+# All three cases are asserted because one-sided coverage would let any
 # direction silently break the other.
 
 set -uo pipefail
@@ -58,21 +65,36 @@ if (( BASH_VERSINFO[0] < 4 )); then
   fi
 fi
 
-# Synthetic cwds the launcher would normally capture from $PWD. Both
-# live under the smoke's TMP root so cleanup reaps them.
+# Synthetic cwds the launcher would normally capture from $PWD. Each
+# lives under the smoke's TMP root so cleanup reaps them.
 SHARED_CWD="$SMOKE_TMP_ROOT/fake-project-shared"
 LU_CWD="$SMOKE_TMP_ROOT/fake-project-lu"
-mkdir -p "$SHARED_CWD" "$LU_CWD"
+UNSET_CWD="$SMOKE_TMP_ROOT/fake-project-unset"
+mkdir -p "$SHARED_CWD" "$LU_CWD" "$UNSET_CWD"
 
 # Drive the resolver inside a fresh Bash 4+ shell that sources the full
 # library tree. We deliberately keep the controller-shell scope free of
 # the BRIDGE_AGENT_* assoc arrays so the source step owns the type
 # declarations (`declare -g -A`) — re-declaring them in the outer scope
 # would risk type drift across smoke runs.
+#
+# isolation_mode argument semantics:
+#   * "shared" / "linux-user"  — set BRIDGE_AGENT_ISOLATION_MODE[<agent>]
+#     to that literal value.
+#   * ""  (empty)              — do NOT set BRIDGE_AGENT_ISOLATION_MODE
+#     at all. Exercises the no-mode roster default which
+#     `bridge_agent_isolation_mode` normalizes to "shared" per
+#     lib/bridge-agents.sh:799-802. This is the case a roster row that
+#     omits `isolation_mode=` would hit at runtime.
 run_resolver() {
   local agent="$1"
   local isolation_mode="$2"
   local explicit_workdir="$3"
+
+  local isolation_line=""
+  if [[ -n "$isolation_mode" ]]; then
+    isolation_line="BRIDGE_AGENT_ISOLATION_MODE[$agent]=$isolation_mode"
+  fi
 
   "$BASH4_BIN" -c "
     set -uo pipefail
@@ -89,7 +111,7 @@ run_resolver() {
     BRIDGE_AGENT_ENGINE[$agent]=claude
     BRIDGE_AGENT_SESSION[$agent]=$agent
     BRIDGE_AGENT_WORKDIR[$agent]='$explicit_workdir'
-    BRIDGE_AGENT_ISOLATION_MODE[$agent]=$isolation_mode
+    $isolation_line
 
     bridge_agent_workdir '$agent'
   "
@@ -130,6 +152,32 @@ smoke_assert_not_contains "$lu_resolved" "$LU_CWD" \
   "linux-user resolver must not return the operator's cwd ($LU_CWD); v2 anchor wins"
 
 smoke_log "case 2: linux-user mode → v2 anchor preserved (resolved=$lu_resolved)"
+
+# ----------------------------------------------------------------------
+# Case 3 — no isolation_mode entry → default-fallback honors explicit cwd.
+#
+# `bridge_agent_isolation_mode` (lib/bridge-agents.sh:799-802) normalizes
+# empty / missing roster values to `shared`, so the resolver must behave
+# identically to Case 1 even when `BRIDGE_AGENT_ISOLATION_MODE[<agent>]`
+# is never set. This pins the default-fallback contract so a future
+# special-case for an explicitly-set `shared` literal cannot silently
+# regress dynamic spawn for fresh-install agents whose roster row omits
+# `isolation_mode=`.
+# ----------------------------------------------------------------------
+
+unset_agent="unset_test"
+unset_resolved="$(run_resolver "$unset_agent" "" "$UNSET_CWD")" \
+  || smoke_fail "no-mode resolver invocation failed (resolved='$unset_resolved')"
+
+smoke_assert_eq "$UNSET_CWD" "$unset_resolved" \
+  "no isolation_mode entry + explicit cwd: resolver returns the operator's cwd (normalized to shared per bridge_agent_isolation_mode)"
+
+# Defense-in-depth: explicit must NOT have been rewritten to the v2 anchor.
+unset_anchor="$BRIDGE_AGENT_ROOT_V2/$unset_agent/workdir"
+smoke_assert_not_contains "$unset_resolved" "$BRIDGE_AGENT_ROOT_V2" \
+  "no-mode resolver must not return any path under \$BRIDGE_AGENT_ROOT_V2 ($unset_anchor)"
+
+smoke_log "case 3: no isolation_mode entry → explicit cwd honored (resolved=$unset_resolved)"
 
 # ----------------------------------------------------------------------
 # Done
