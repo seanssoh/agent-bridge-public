@@ -155,8 +155,17 @@ bridge_upgrade_emit_failure_json() {
   fi
   # Pass values via argv (escapes safely for any input — newlines, quotes,
   # unicode). Empty strings are forwarded as-is and rendered as null in the
-  # envelope when the corresponding bash var was empty.
-  if ! python3 - \
+  # envelope when the corresponding bash var was empty. Footgun #11 third
+  # variant (task #4538 codex r1 catch): body moved to
+  # lib/upgrade-helpers/emit-failure-json.py so the EXIT trap path no longer
+  # has a heredoc-stdin-to-python wedge candidate when the leap aborts
+  # pre-apply (e.g. isolation-v2 failure at lines ~1457-1469). The fallback
+  # printf below still fires if the helper script is missing or python is
+  # broken on the host. SOURCE_ROOT may be unset when this runs very early
+  # (before the source-root resolution block); fall back to SCRIPT_DIR which
+  # is set at script entry so the helper path always resolves.
+  local _emit_helper="${SOURCE_ROOT:-${SCRIPT_DIR:-}}/lib/upgrade-helpers/emit-failure-json.py"
+  if ! python3 "$_emit_helper" \
         "$rc" \
         "$reason" \
         "$detail" \
@@ -172,47 +181,7 @@ bridge_upgrade_emit_failure_json() {
         "${TARGET_HEAD:-}" \
         "${DRY_RUN:-0}" \
         "${ISOLATION_V2_MIGRATION_JSON:-}" \
-        <<'PY' 2>/dev/null
-import json, sys
-
-(rc, reason, detail, remediation,
- source_version, source_root, source_ref, source_head,
- target_root, channel, target_ref, target_version, target_head,
- dry_run, iso_v2_json) = sys.argv[1:16]
-
-def _or_none(s):
-    return s if s else None
-
-def _load_json_str(s):
-    if not s:
-        return None
-    try:
-        return json.loads(s)
-    except (ValueError, TypeError):
-        return {"_raw": s, "_parse_error": True}
-
-payload = {
-    "mode": "upgrade",
-    "rc": int(rc),
-    "error": {
-        "reason": reason,
-        "detail": detail,
-        "remediation": remediation,
-    },
-    "version": _or_none(source_version),
-    "source_root": _or_none(source_root),
-    "source_ref": _or_none(source_ref),
-    "source_head": _or_none(source_head),
-    "target_root": _or_none(target_root),
-    "channel": _or_none(channel),
-    "target_ref": _or_none(target_ref),
-    "target_version": _or_none(target_version),
-    "target_head": _or_none(target_head),
-    "dry_run": dry_run == "1",
-    "isolation_v2_migration": _load_json_str(iso_v2_json),
-}
-print(json.dumps(payload, ensure_ascii=False, indent=2))
-PY
+        2>/dev/null
   then
     # Fallback: minimal hand-rolled JSON if python invocation fails
     # entirely. Operators still get a parseable envelope.
