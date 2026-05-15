@@ -239,16 +239,18 @@ bridge_upgrade_current_ref() {
 
 bridge_upgrade_latest_stable_tag() {
   local root="$1"
-  local tags
-  tags="$(git -C "$root" tag --list 'v[0-9]*.[0-9]*.[0-9]*')"
-  python3 -c '
+  # Footgun #11 (heredoc/here-string deadlock — refs #265 / #800 / #815):
+  # piping `git tag` output directly into python3 avoids the
+  # `python3 ... <<<"$tags"` here-string that wedges Bash 5.3.9 in
+  # `read_comsub` during a v0.7.x → v0.13.x upgrade --apply leap.
+  git -C "$root" tag --list 'v[0-9]*.[0-9]*.[0-9]*' | python3 -c '
 import re
 import sys
 
 tags = [line.strip() for line in sys.stdin if re.fullmatch(r"v\d+\.\d+\.\d+", line.strip())]
 tags.sort(key=lambda tag: tuple(int(part) for part in tag[1:].split(".")))
 print(tags[-1] if tags else "")
-' <<<"$tags"
+'
 }
 
 bridge_upgrade_normalize_version_tag() {
@@ -534,7 +536,9 @@ bridge_upgrade_reconcile_agent_restart_recovery() {
     return 0
   fi
   # Skip the wait entirely when there is nothing to reconcile.
-  if ! grep -qE $'\t''failed'$'\t' <<<"$report"; then
+  # Footgun #11 (refs #265 / #800 / #815): pipe instead of here-string
+  # to keep Bash 5.3.9 from wedging in `read_comsub` during apply leaps.
+  if ! printf '%s\n' "$report" | grep -qE $'\t''failed'$'\t'; then
     printf '%s' "$report"
     return 0
   fi
@@ -555,6 +559,18 @@ bridge_upgrade_reconcile_agent_restart_recovery() {
     # the bash versions we support.
     TAB="$(printf "\t")"
 
+    # Footgun #11 (refs #265 / #800 / #815): stage the report through a
+    # tempfile and stream `< $tempfile` instead of `done <<<"$report"`.
+    # The here-string form wedges Bash 5.3.9 in `read_comsub` /
+    # `heredoc_write` during a v0.7.x → v0.13.x upgrade --apply leap.
+    _rep_tmp="$(mktemp -t agb-upg-rep.XXXXXX)"
+    # shellcheck disable=SC2064
+    trap "rm -f -- \"$_rep_tmp\"" EXIT
+    # Trailing newline matches the original `<<<` semantics so the last
+    # row is delivered to read. Command substitution strips trailing
+    # newlines from the caller report, so we re-add one here.
+    printf "%s\n" "$report" > "$_rep_tmp"
+
     # Collect the agents that need a recovery probe up front so the
     # poll loop can short-circuit as soon as all of them are active.
     failed_agents=()
@@ -563,7 +579,7 @@ bridge_upgrade_reconcile_agent_restart_recovery() {
       if [[ "$status" == "failed" ]]; then
         failed_agents+=("$agent")
       fi
-    done <<<"$report"
+    done < "$_rep_tmp"
 
     declare -A recovered=()
     if (( ${#failed_agents[@]} > 0 )); then
@@ -612,7 +628,7 @@ bridge_upgrade_reconcile_agent_restart_recovery() {
           "$agent" "$status" "$reason" "$attached" "$session" \
           "$exit_code" "$log_tail_b64"
       fi
-    done <<<"$report"
+    done < "$_rep_tmp"
   ' -- "$target_root" "$source_root" "$settle_seconds" "$report"
 }
 
