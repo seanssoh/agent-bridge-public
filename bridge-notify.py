@@ -32,6 +32,18 @@ def load_text_file(path: str | None) -> str:
     return Path(path).read_text(encoding="utf-8").strip()
 
 
+class MissingDefaultAccount(LookupError):
+    """Raised when the implicit ``default`` account for a channel kind is absent.
+
+    Distinct from an explicit non-default account miss because the ``default``
+    name is a runner-internal lookup key — operators never name it. Issue #875:
+    cron-followup paths for agents without a Discord channel were surfacing
+    ``discord account not found: default`` as a hard failure in operator-facing
+    bodies. The caller turns this into a silent skip + audit row; non-default
+    misses still raise SystemExit so real operator misconfig still trips.
+    """
+
+
 def load_account_config(config_path: Path, kind: str, account: str) -> dict[str, Any]:
     payload = load_json(config_path)
     channels = payload.get("channels") or {}
@@ -39,6 +51,8 @@ def load_account_config(config_path: Path, kind: str, account: str) -> dict[str,
     accounts = channel_cfg.get("accounts") or {}
     account_cfg = accounts.get(account)
     if not isinstance(account_cfg, dict):
+        if account == "default":
+            raise MissingDefaultAccount(f"{kind} account not found: {account}")
         raise SystemExit(f"{kind} account not found: {account}")
     return account_cfg
 
@@ -228,6 +242,28 @@ def cmd_send(args: argparse.Namespace) -> int:
             send_mattermost(token, target, text, api_base_url)
         else:
             raise SystemExit(f"unsupported notify kind: {kind}")
+    except MissingDefaultAccount:
+        # Issue #875: the implicit ``default`` account name is not configurable
+        # by the operator, so its absence means "this host never wired a default
+        # for this channel kind" rather than "a named account got typoed". Skip
+        # silently with a structured audit row so cron-followup bodies stop
+        # surfacing the noisy lookup error. The queue-side fallback (the
+        # cron-followup task itself) still delivers the alert.
+        skip_payload = dict(payload)
+        skip_payload["status"] = "skipped"
+        skip_payload["skip_reason"] = "no_default_account"
+        write_audit(
+            "bridge_notify_skipped",
+            str(args.agent or "bridge"),
+            {
+                "kind": kind,
+                "target": target,
+                "account": account,
+                "reason": "no_default_account",
+            },
+        )
+        print(json.dumps(skip_payload, ensure_ascii=False, indent=2))
+        return 0
     except HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
         raise SystemExit(f"{kind} notify failed: HTTP {exc.code}: {details}") from exc
