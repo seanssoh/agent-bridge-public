@@ -18,7 +18,7 @@
 # rotation / recovery event, writes a `claude_token_periodic_sync` audit
 # row, and updates the last-sync timestamp.
 #
-# This smoke exercises four cases (A1-A4) directly against the two
+# This smoke exercises five cases (A1-A5) directly against the two
 # extracted functions, using a shim `bridge-auth.sh` so we never touch the
 # real sync path. We intentionally do not boot the daemon — those cases
 # are covered by the live-tmux-daemon smoke. The unit-level coverage
