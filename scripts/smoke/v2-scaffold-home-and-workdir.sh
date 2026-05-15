@@ -151,6 +151,15 @@ write_driver_script() {
     '# leaves the entry unset → resolver falls through to default; T2' \
     '# (linux-user) writes the entry → resolver returns the v2 anchor.' \
     'declare -A BRIDGE_AGENT_ISOLATION_MODE 2>/dev/null || true' \
+    '# bridge_agent_isolation_mode also reads `BRIDGE_AGENT_OS_USER[$agent]-`' \
+    '# (lib/bridge-agents.sh:794). Under `set -u`, that read fails on an' \
+    '# undeclared assoc array and silently aborts the function via the' \
+    '# 2>/dev/null in the resolver — falling back to the non-v2 path. Declare' \
+    '# the OS_USER map up-front so the predicate sees an empty entry instead' \
+    '# of an unset-variable error. The smoke does not exercise os_user-driven' \
+    '# linux-user detection (T2 hits the explicit isolation_mode path), so' \
+    '# leaving the entry unset is correct — only the declaration is needed.' \
+    'declare -A BRIDGE_AGENT_OS_USER 2>/dev/null || true' \
     'if [[ -n "${SCAFFOLD_ISOLATION_MODE:-}" ]]; then' \
     '  BRIDGE_AGENT_ISOLATION_MODE["$AGENT_ID"]="$SCAFFOLD_ISOLATION_MODE"' \
     'fi' \
@@ -341,10 +350,13 @@ $T2_OUT"
   T2_HOME_STATUS="$(extract_line "$T2_OUT" "HOME_DIR_STATUS")"
   T2_SIBLING_STATUS="$(extract_line "$T2_OUT" "SIBLING_WORKDIR_STATUS")"
   T2_RESOLVER_MATCH="$(extract_line "$T2_OUT" "RESOLVER_MATCH")"
+  T2_RESOLVED="$(printf '%s\n' "$T2_OUT" | awk '/^RESOLVER_OUTPUT:/{getline; sub(/^  /,""); print; exit}')"
 
   smoke_assert_eq "dir" "$T2_HOME_STATUS" "T2: isolated branch created home/ directory (sudo-handoff path)"
   smoke_assert_eq "dir" "$T2_SIBLING_STATUS" "T2: isolated branch created workdir/ sibling (issue #686 fix, sudo-handoff branch)"
-  smoke_assert_eq "yes" "$T2_RESOLVER_MATCH" "T2: bridge_agent_workdir returns the sudo-materialized workdir/ (linux-user → v2 anchor branch)"
+  if [[ "$T2_RESOLVER_MATCH" != "yes" ]]; then
+    smoke_fail "T2: bridge_agent_workdir returns the sudo-materialized workdir/ (linux-user → v2 anchor branch): expected RESOLVER_MATCH=yes, got '$T2_RESOLVER_MATCH'. resolved='$T2_RESOLVED' expected_sibling='$T2_V2_ROOT/$T2_AGENT_ID/workdir'"
+  fi
 
   smoke_log "T2 PASS — isolated branch + resolver agreement verified"
 fi
