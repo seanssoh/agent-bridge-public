@@ -124,7 +124,7 @@ Codex r2 correction: S10-early (lint-only guard against NEW heredoc-stdin sites)
 - OPERATIONS.md: consolidated v0.13.7-v0.13.10 hotfix wave operator follow-up
 - README.md: version context + leap path warning
 - **NEW MANDATORY DELIVERABLE**: `docs/audit-2026-05-15.md` archiving raw findings with structured rows: `id | severity (P0/P1/P2) | category | file:line | one-line | risk | owner-stage | status`. Covers the 14 P1 bug-surface + 6 P1 stability + 18 deferred python heredoc sites + isolation-v2 top-20 list. Without this, subsequent sessions cannot pick up from this plan alone (codex correction: the previous draft left audit details in conversation-only state which is not durable).
-- No VERSION bump
+- Release: stabilization PR; not bumped (per §"Version policy")
 - Linux VM: not strictly required (no code change), but smoke runs still pass
 - Single PR: `docs/v0.13.x-catchup-and-audit-archive`
 
@@ -191,21 +191,21 @@ Move S4 to AFTER S5. New numbering: original S4 becomes S5.5 (post-discriminator
 - 35 Bucket 3 sites get `bridge_isolation_v2_require_linux()` early-error
 - 55 Bucket 4 mixed sites get function-split refactor
 - Track E: docs (OPERATIONS.md upgrade-on-macOS section; KNOWN_ISSUES.md updates)
-- VERSION: NO pre-allocation. The next release PR after S5 v0.14.0 will batch any user-visible items from S6+. Codex correction: do NOT pre-declare v0.14.1 for cleanup; that contradicts the "batch at deploy time" policy.
+- Release: no per-stage bump; the next operator-cued release PR after S5 v0.14.0 batches user-visible S6 items. Codex correction: do NOT pre-declare v0.14.1 for cleanup; that contradicts §"Version policy".
 
 **S7 — Audit A P1 cleanup wave**
 - Silent error swallowing fixes (daemon state, marker writes)
 - Tempfile cleanup discipline (mktemp + EXIT trap)
 - Retry shapes (exponential backoff on SQLite busy, mkdir lock, flock)
 - `set -u`/`set -e` trap-capture corrections
-- VERSION: stabilization patches; do not bump
+- Release: no per-stage bump; batch any user-visible S7 items into the next operator-cued release PR per §"Version policy"
 
 **S8 — Audit B P1 cleanup wave**
 - SQLite `busy_timeout` PRAGMA + Python retry context
 - Daemon shutdown completeness (post-stop validation + tmux pane reap)
 - Backup integrity check (`tar -tzf` after creation)
 - Marker version field add
-- VERSION: still no bumps unless user-visible
+- Release: no per-stage bump; batch any user-visible S8 items into the next operator-cued release PR per §"Version policy"
 
 **S9 — Audit D refactor wave (long-tail)**
 - Env var registry (`lib/bridge-config-vars.sh` canonical doc)
