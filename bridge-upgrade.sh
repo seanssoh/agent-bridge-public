@@ -673,114 +673,12 @@ bridge_upgrade_agent_restart_json() {
   local enabled="$2"
   local dry_run="${3:-0}"
 
-  # JSON key contract (post-#257): dry-run reports *eligibility*, not success;
-  # apply reports the `bridge-agent.sh restart` exit-0 count, not agent health.
-  #   - restart_eligible / restart_eligible_agents: dry-run candidates. This
-  #     is what we would attempt; it does NOT predict whether the agent will
-  #     stay stably up after launch (plugin resolution, settings corruption,
-  #     dependency outages can still surface at apply).
-  #   - restart_attempted_ok / restart_attempted_ok_agents: apply tally of
-  #     `bridge-agent.sh restart` commands that returned exit 0. Does NOT
-  #     prove the agent survived the first few seconds after launch; that
-  #     requires post-restart health reconciliation (tracked in #256).
-  # The prior keys `would_restart`/`restarted` over-promised at both layers
-  # and caused the #253→#254 misdiagnosis. Renamed here per issue #257.
-  python3 - "$enabled" "$dry_run" "$report" <<'PY'
-import base64
-import json
-import sys
-
-enabled = sys.argv[1] == "1"
-dry_run = sys.argv[2] == "1"
-report = sys.argv[3]
-payload = {
-    "enabled": enabled,
-    "dry_run": dry_run,
-    "considered": 0,
-    "eligible": 0,
-    "restart_eligible": 0,
-    "restart_attempted_ok": 0,
-    "recovered_by_daemon": 0,
-    "failed": 0,
-    "skipped": 0,
-    "restart_attempted_ok_agents": [],
-    "restart_eligible_agents": [],
-    "recovered_by_daemon_agents": [],
-    "failed_agents": [],
-    "failed_details": [],
-    "recovered_by_daemon_details": [],
-    "skipped_reasons": {},
-}
-
-
-def _decode_log_tail(raw_b64):
-    """Return the decoded log-tail string or None when absent/corrupt.
-
-    Deliberately plain-Python (no PEP 604 annotation) because the
-    reference install's system python is 3.9.6 — `str | None` would
-    raise `TypeError` at function-definition time before the summary
-    ever ran. See PR #261 round-1 review.
-    """
-    if not raw_b64:
-        return None
-    try:
-        decoded = base64.b64decode(raw_b64, validate=False)
-    except Exception:  # noqa: BLE001 — b64 is operator-captured log; failing open with None is fine
-        return None
-    return decoded.decode("utf-8", errors="replace")
-
-
-for raw in report.splitlines():
-    raw = raw.rstrip("\n")
-    if not raw:
-        continue
-    # Tuple format (see bridge_upgrade_collect_agent_restart_report): 7 cols.
-    # Older builds may emit 5 cols (pre-#256); tolerate that shape so a
-    # half-upgraded host doesn't crash the aggregator.
-    parts = (raw.split("\t", 6) + ["", "", "", "", "", "", ""])[:7]
-    agent, status, reason, _attached, _session, exit_code, log_tail_b64 = parts
-    payload["considered"] += 1
-    if reason == "eligible":
-        payload["eligible"] += 1
-    if status == "would-restart":
-        payload["restart_eligible"] += 1
-        payload["restart_eligible_agents"].append(agent)
-    elif status == "restarted":
-        payload["restart_attempted_ok"] += 1
-        payload["restart_attempted_ok_agents"].append(agent)
-    elif status == "failed":
-        payload["failed"] += 1
-        payload["failed_agents"].append(agent)
-        detail = {"agent": agent, "reason": reason}
-        try:
-            detail["exit_code"] = int(exit_code) if exit_code else None
-        except ValueError:
-            detail["exit_code"] = None
-        detail["last_log_tail"] = _decode_log_tail(log_tail_b64)
-        payload["failed_details"].append(detail)
-    elif status == "recovered_by_daemon":
-        # Issue 4 (v0.11.0): daemon launched the agent after our initial
-        # restart attempt failed/timed-out. Counted separately so the
-        # operator-facing summary stops over-reporting "failed" when the
-        # daemon cycle absorbed the transient. Preserves the original
-        # reason (encoded as `daemon-recovered:was=<original>`) plus the
-        # exit_code + log_tail so the underlying issue is still
-        # diagnosable from the JSON.
-        payload["recovered_by_daemon"] += 1
-        payload["recovered_by_daemon_agents"].append(agent)
-        detail = {"agent": agent, "was_reason": reason.split("was=", 1)[-1] if "was=" in reason else reason}
-        try:
-            detail["exit_code"] = int(exit_code) if exit_code else None
-        except ValueError:
-            detail["exit_code"] = None
-        detail["last_log_tail"] = _decode_log_tail(log_tail_b64)
-        payload["recovered_by_daemon_details"].append(detail)
-    else:
-        payload["skipped"] += 1
-        payload["skipped_reasons"][reason] = payload["skipped_reasons"].get(reason, 0) + 1
-
-print(json.dumps(payload, ensure_ascii=False))
-PY
+  # JSON key contract documented at the top of
+  # lib/upgrade-helpers/agent-restart-json.py (#253/#254/#257). Footgun #11
+  # (task #4538): the python heredoc body was moved into that file because
+  # `python3 - <<'PY' … PY` heredoc-stdin wedges Bash 5.3.9 (producer-side).
+  python3 "$SOURCE_ROOT/lib/upgrade-helpers/agent-restart-json.py" \
+    "$enabled" "$dry_run" "$report"
 }
 
 bridge_upgrade_print_agent_restart_summary() {
@@ -868,68 +766,24 @@ bridge_upgrade_channel_guard_report() {
   local source_root="$1"
   local target_root="$2"
 
-  bridge_upgrade_with_target_env "$target_root" "$BRIDGE_BASH_BIN" -s -- "$source_root" "$target_root" <<'EOF'
-set -euo pipefail
-source_root="$1"
-target_root="$2"
-source "$source_root/bridge-lib.sh"
-bridge_load_roster
-
-agent=""
-session=""
-active="no"
-reason=""
-required=""
-
-for agent in "${BRIDGE_AGENT_IDS[@]}"; do
-  if [[ "$(bridge_agent_channel_status "$agent")" != "miss" ]]; then
-    continue
-  fi
-  session="$(bridge_agent_session "$agent")"
-  active="no"
-  if [[ -n "$session" ]] && bridge_tmux_session_exists "$session"; then
-    active="yes"
-  fi
-  reason="$(bridge_agent_channel_runtime_drift_reason "$agent")"
-  if [[ -z "$reason" ]]; then
-    reason="$(bridge_agent_channel_status_reason "$agent")"
-  fi
-  reason="${reason//$'\t'/ }"
-  reason="${reason//$'\n'/ }"
-  required="$(bridge_agent_channels_csv "$agent")"
-  printf "%s\t%s\t%s\t%s\n" "$agent" "$active" "$required" "$reason"
-done
-EOF
+  # Footgun #11 third variant (task #4538): the heredoc body that used to
+  # live here wedges Bash 5.3.9 in `heredoc_write -> write()` (producer-side
+  # mirror of the read_comsub bug fixed in v0.13.7 and v0.13.8). The
+  # script body now lives in lib/upgrade-helpers/channel-guard-report.sh and
+  # is invoked as a regular file argument — no heredoc-stdin anywhere on
+  # this path.
+  bridge_upgrade_with_target_env "$target_root" "$BRIDGE_BASH_BIN" \
+    "$source_root/lib/upgrade-helpers/channel-guard-report.sh" \
+    "$source_root" "$target_root"
 }
 
 bridge_upgrade_channel_guard_json() {
   local report="$1"
 
-  python3 - "$report" <<'PY'
-import json
-import sys
-
-items = []
-active_count = 0
-for raw in sys.argv[1].splitlines():
-    raw = raw.rstrip("\n")
-    if not raw:
-        continue
-    agent, active, required, reason = (raw.split("\t", 3) + ["", "", "", ""])[:4]
-    is_active = active == "yes"
-    if is_active:
-        active_count += 1
-    items.append(
-        {
-            "agent": agent,
-            "active": is_active,
-            "required_channels": required,
-            "reason": reason,
-        }
-    )
-
-print(json.dumps({"count": len(items), "active_count": active_count, "agents": items}, ensure_ascii=False))
-PY
+  # Footgun #11 (task #4538): the python heredoc body that used to live here
+  # is now lib/upgrade-helpers/channel-guard-json.py — invoked with file-as-
+  # argv so no heredoc-stdin path remains.
+  python3 "$SOURCE_ROOT/lib/upgrade-helpers/channel-guard-json.py" "$report"
 }
 
 bridge_upgrade_print_channel_guard_summary() {
@@ -1172,26 +1026,12 @@ TARGET_ROOT="$(cd -P "$(dirname "$TARGET_ROOT")" && pwd -P)/$(basename "$TARGET_
 SOURCE_ROOT="$(cd -P "$SOURCE_ROOT" && pwd -P)"
 
 if [[ $SOURCE_EXPLICIT -eq 0 && "$SOURCE_ROOT" == "$TARGET_ROOT" ]]; then
-  # Footgun #11: stage the `python3 - <<'PY' …` heredoc output via tempfile
-  # to avoid the parent-`$()`-over-heredoc-stdin Bash 5.3.9 deadlock.
-  _recorded_source_root_tmp="$(mktemp -t agb-upg-recsrc.XXXXXX)"
-  python3 - "$TARGET_ROOT/state/upgrade/last-upgrade.json" >"$_recorded_source_root_tmp" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-try:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-except (FileNotFoundError, json.JSONDecodeError):
-    print("")
-    raise SystemExit(0)
-
-source = str(payload.get("source_root") or "").strip()
-print(source)
-PY
-  RECORDED_SOURCE_ROOT="$(<"$_recorded_source_root_tmp")"
-  rm -f -- "$_recorded_source_root_tmp"
+  # Footgun #11 third variant (task #4538): replace the inline `python3 -
+  # <<'PY' …` heredoc-stdin with an invocation of the standalone helper at
+  # lib/upgrade-helpers/recorded-source-root.py. The v0.13.8 tempfile-capture
+  # only fixed the consumer-side `$()` deadlock; the inner heredoc-stdin to
+  # python still wedges Bash 5.3.9 in `heredoc_write -> write()`.
+  RECORDED_SOURCE_ROOT="$(python3 "$SOURCE_ROOT/lib/upgrade-helpers/recorded-source-root.py" "$TARGET_ROOT/state/upgrade/last-upgrade.json")"
   if [[ -n "$RECORDED_SOURCE_ROOT" && -d "$RECORDED_SOURCE_ROOT/.git" ]]; then
     SOURCE_ROOT="$(cd -P "$RECORDED_SOURCE_ROOT" && pwd -P)"
     if [[ "$SUBCOMMAND" == "apply" && $PULL_EXPLICIT -eq 0 ]]; then
@@ -1594,27 +1434,22 @@ if [[ $DRY_RUN -eq 0 ]]; then
   # forwards BRIDGE_LAYOUT_RESOLVER_BYPASS{,_OWNER_PID} explicitly so
   # the resolver inside the child still validates the handshake — the
   # process-tree walk traverses env → bash → upgrade.sh and matches.
-  # Footgun #11 (refs #890 / task #4532): the outer `$()` capture combined
-  # with `bash -s -- … <<'EOF' …` heredoc-fed stdin is the same shape that
-  # wedges Bash 5.3.9 in `read_comsub`. Stage stdout through a tempfile and
-  # read it back via `$(< file)` (bash builtin shortcut — no subshell
-  # fork, cannot wedge). The structural `set +e ; … ; rc=$? ; set -e`
-  # frame stays intact so the existing failure-handling block below still
-  # captures rc correctly.
+  # Footgun #11 third variant (task #4538): the v0.13.8 hotfix moved the
+  # `$()` capture to a tempfile but left the inner `bash -s -- … <<'EOF' …`
+  # heredoc-stdin in place. Bash 5.3.9 still wedges the parent in
+  # `heredoc_write -> write()` when the bash -s subprocess is slow to drain
+  # (sourcing bridge-lib.sh + lib/bridge-isolation-v2-migrate.sh before the
+  # heredoc write completes). The migration body now lives at
+  # lib/upgrade-helpers/isolation-v2-migrate.sh and is invoked with the file
+  # as argv — no heredoc-stdin anywhere on this path. The tempfile + `$(<)`
+  # capture is kept for symmetry with the failure-handling frame and so
+  # `_migrate_rc=$?` captures the bash exit code, not mktemp/rm.
   set +e
   _iso_v2_migrate_tmp="$(mktemp -t agb-upg-isov2.XXXXXX)"
   bridge_upgrade_with_target_env "$TARGET_ROOT" \
-    "$BRIDGE_BASH_BIN" -s -- "$SOURCE_ROOT" "$TARGET_ROOT" >"$_iso_v2_migrate_tmp" <<'EOF'
-set -euo pipefail
-source_root="$1"
-target_root="$2"
-# shellcheck source=/dev/null
-source "$source_root/bridge-lib.sh"
-bridge_load_roster
-# shellcheck source=lib/bridge-isolation-v2-migrate.sh
-source "$source_root/lib/bridge-isolation-v2-migrate.sh"
-bridge_isolation_v2_migrate_apply_for_upgrade --target-root "$target_root" --json
-EOF
+    "$BRIDGE_BASH_BIN" \
+    "$SOURCE_ROOT/lib/upgrade-helpers/isolation-v2-migrate.sh" \
+    "$SOURCE_ROOT" "$TARGET_ROOT" >"$_iso_v2_migrate_tmp"
   _migrate_rc=$?
   ISOLATION_V2_MIGRATION_JSON="$(<"$_iso_v2_migrate_tmp")"
   rm -f -- "$_iso_v2_migrate_tmp"
