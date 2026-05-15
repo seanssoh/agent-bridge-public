@@ -66,64 +66,44 @@ bridge_cleanup_daily_backup_residue() {
 # Stdin: JSON cleanup payload from bridge_cleanup_daily_backup_residue.
 # Stdout: markdown block.
 bridge_cleanup_render_summary() {
-  python3 - <<'PY'
-import json
-import sys
-
-try:
-    data = json.load(sys.stdin)
-except Exception as exc:
-    print(f"## Backup residue cleanup\n\nCould not parse cleanup payload: {exc}")
-    raise SystemExit(0)
-
-stale = data.get("stale_tmp_removed") or []
-daily = data.get("daily_pruned") or []
-snaps = data.get("snapshots_pruned") or []
-upg = data.get("upgrade_backups") or {}
-upg_pruned = upg.get("pruned") or []
-upg_preserved = upg.get("preserved") or []
-cfg = data.get("claude_config") or {}
-fails = data.get("cleanup_failures") or []
-
-freed_human = data.get("bytes_freed_human") or "0 B"
-before_human = data.get("free_bytes_before_human") or "?"
-after_human = data.get("free_bytes_after_human") or "?"
-
-lines = ["## Backup residue cleanup", ""]
-lines.append(f"- Disk free before → after: **{before_human} → {after_human}** "
-             f"(freed: **{freed_human}**)")
-lines.append(f"- Stale `*.tgz.tmp.*` reaped: **{len(stale)}**")
-lines.append(f"- Daily archives pruned (retain=7d default): **{len(daily)}**")
-lines.append(f"- SQL snapshots pruned: **{len(snaps)}**")
-if upg.get("skipped_no_backup_mode"):
-    lines.append("- Upgrade-* backups: **skipped** (--no-backup mode)")
-else:
-    lines.append(f"- Upgrade-* backups pruned: **{len(upg_pruned)}** "
-                 f"(preserved {len(upg_preserved)} including current)")
-
-cfg_status = cfg.get("status", "unknown")
-status_blurb = {
-    "ok": "valid JSON",
-    "missing": "not present (no Claude Code installed for this user?)",
-    "corrupted": "**CORRUPTED — recover from ~/.claude/backups/**",
-    "unreadable": "unreadable (permissions?)",
-}.get(cfg_status, cfg_status)
-lines.append(f"- `~/.claude.json`: {status_blurb}")
-if cfg_status == "corrupted" and cfg.get("recovery_candidate"):
-    lines.append(f"  - Suggested recovery source: `{cfg['recovery_candidate']}`")
-
-if fails:
-    lines.append("")
-    lines.append("### Cleanup failures (manual follow-up required)")
-    for failure in fails:
-        step = failure.get("step", "?")
-        err = failure.get("error", "?")
-        path = failure.get("path", "")
-        suffix = f" (path={path})" if path else ""
-        lines.append(f"- `{step}`: {err}{suffix}")
-
-print("\n".join(lines))
-PY
+  # Issue #872 / PR #886:
+  #
+  # Round 1 history: the original surface used `python3 - <<'PY' ... PY`,
+  # which makes the heredoc body itself python3's stdin (because `-` reads
+  # the script from stdin). The caller's `printf '%s' "$CLEANUP_JSON" |
+  # bridge_cleanup_render_summary` pipe was therefore inaccessible to the
+  # renderer — sys.stdin always returned empty and json.load surfaced
+  # JSONDecodeError verbatim into the [upgrade-complete] task body.
+  #
+  # Round 1 fix (PR #886 r1) replaced the heredoc-stdin form with a
+  # `cat >"$script_tmp" <<'PY' ... PY` tempfile-script form. r1 codex
+  # review correctly flagged this as self-contradictory: the original
+  # bug class is "heredoc-as-content-delivery is fragile under the
+  # post-#800 heredoc/here-string toolchain" (see HANDOFF_2026-05-08).
+  # Mitigating a footgun #11 trip with another heredoc still leaves the
+  # heredoc-content boundary in the source — every new heredoc is a
+  # fresh failure surface and a regression magnet (#840 docstring-literal
+  # trip is the most recent recurrence).
+  #
+  # Round 2 fix (this commit): the renderer body lives as a tracked
+  # python file under scripts/python-helpers/cleanup-payload-renderer.py
+  # and we invoke it as `python3 <path>`. fd 0 still points at the
+  # caller's pipe so sys.stdin.read() sees the JSON payload as intended.
+  # No heredoc, no tempfile script write — the script is content the
+  # repo ships, not content this function emits.
+  #
+  # We self-resolve the script path from BASH_SOURCE so the helper works
+  # both inside the full upgrader (BRIDGE_SCRIPT_DIR set by bridge-lib.sh)
+  # and under the smoke runner (only lib/bridge-cleanup.sh sourced).
+  local _self_dir
+  _self_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+  local renderer="$_self_dir/scripts/python-helpers/cleanup-payload-renderer.py"
+  if [[ ! -f "$renderer" ]]; then
+    printf '## Backup residue cleanup\n\n_Renderer payload missing at %s._\n' \
+      "$renderer"
+    return 0
+  fi
+  python3 "$renderer"
 }
 
 # Render the agent-safe verification block embedded in the [upgrade-complete]
