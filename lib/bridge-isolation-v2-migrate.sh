@@ -1755,12 +1755,23 @@ bridge_isolation_v2_migrate_apply_for_upgrade() {
   # the upgrade when the operator (correctly) declines the prompt.
   # Skip the entire migration body in that case and emit a benign no-op
   # JSON. The branch is idempotent: every subsequent upgrade hits the
-  # same gate. `bridge_isolation_v2_roster_has_isolated_agents` is
-  # fail-safe — if it can't evaluate (predicate not declared, roster
-  # array missing) it returns non-zero, but we still gate on `uname -s
-  # != Linux` so the Linux migration path is strictly unchanged.
-  if [[ "$(uname -s 2>/dev/null || printf 'unknown')" != "Linux" ]] \
-      && ! bridge_isolation_v2_roster_has_isolated_agents 2>/dev/null; then
+  # same gate.
+  #
+  # `bridge_isolation_v2_roster_has_isolated_agents` returns:
+  #   0 — has isolated agent (do NOT skip, fall through to migration)
+  #   1 — confirmed no isolated agent (safe to skip on non-Linux)
+  #   2 — unknown / predicate or roster array unavailable (do NOT skip,
+  #       fall through so the existing preflight path emits its own
+  #       error and the operator gets actionable remediation)
+  #
+  # codex r1 needs-more catch (PR #882 r2): treat rc=1 (confirmed) and
+  # rc=2 (unknown) differently. Original logic merged both via `!cmd`
+  # which would have let a Darwin host with a broken roster predicate
+  # take the skip branch silently — bypassing the preflight check.
+  local _iso_check_rc=0
+  bridge_isolation_v2_roster_has_isolated_agents 2>/dev/null || _iso_check_rc=$?
+  if [[ "$(uname -s 2>/dev/null || printf 'unknown')" != "Linux" \
+        && "$_iso_check_rc" -eq 1 ]]; then
     printf '{"mode":"isolation-v2-migrate","status":"ok","skipped":true,"reason":"macos-shared-agent","platform":"%s","no_v080_code_installed":"yes"}\n' \
       "$(uname -s 2>/dev/null || printf 'unknown')"
     return 0

@@ -1081,21 +1081,21 @@ bridge_isolation_v2_privilege_preflight() {
 }
 
 bridge_isolation_v2_roster_has_isolated_agents() {
-  # Returns 0 when at least one agent in the loaded roster has effective
-  # linux-user isolation; non-zero when no agent is effectively isolated
-  # (roster empty, not loaded, or every agent resolves to shared).
+  # Returns:
+  #   0  — at least one roster agent has effective linux-user isolation
+  #   1  — roster fully iterated, NO agent is effectively isolated (confirmed
+  #        shared-only / safe to skip)
+  #   2  — predicate function or BRIDGE_AGENT_IDS array unavailable
+  #        (unknown — callers MUST fall through to the existing path
+  #        rather than treat as "no isolated")
   #
-  # Used by `bridge_isolation_v2_migrate_apply_for_upgrade` to short-circuit
-  # the migration on hosts where the v2 layout (group + setgid + per-agent
-  # named-UID) has no operational effect — notably macOS shared-agent
-  # installs where every agent runs as the controller's own OS user.
-  #
-  # Fail-safe: if the predicate or roster array is unavailable (e.g. lib
-  # source order edge case), returns 1 so callers that gate on "no isolated
-  # agents" do NOT take the skip branch — i.e. behavior falls back to the
-  # pre-fix migration path.
-  declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 || return 1
-  declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 || return 1
+  # codex r1 needs-more catch (PR #882): merging rc=1 (confirmed-no-iso) and
+  # rc=2 (unknown) in a single non-zero would let a Darwin host with a
+  # broken roster predicate take the macOS skip branch, bypassing the
+  # legitimate preflight. Splitting the unknown state into rc=2 lets the
+  # caller gate "skip" on the confirmed rc=1 only.
+  declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 || return 2
+  declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1 || return 2
   local _roster_agent
   for _roster_agent in "${BRIDGE_AGENT_IDS[@]}"; do
     [[ -n "$_roster_agent" ]] || continue
