@@ -10712,4 +10712,12 @@ bash "$REPO_ROOT/scripts/smoke/857-pr1-isolation-write-helper.sh"
 log "running dynamic-agent-shared-mode-workdir smoke (issue #895)"
 bash "$REPO_ROOT/scripts/smoke/dynamic-agent-shared-mode-workdir.sh"
 
+# Issue #686 — `bridge_scaffold_agent_home` must materialize BOTH
+# `<agent-root>/home/` and the sibling `<agent-root>/workdir/` so the
+# resolver (`bridge_agent_workdir`) lands on an existing directory.
+# Without this sibling mkdir every fresh v2 install surfaced
+# `workdir가 없습니다` from `bridge-start.sh --dry-run`.
+log "running v2-scaffold-home-and-workdir smoke (issue #686)"
+bash "$REPO_ROOT/scripts/smoke/v2-scaffold-home-and-workdir.sh"
+
 log "smoke test passed"
