@@ -6,6 +6,47 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.13.9] — 2026-05-15
+
+### Highlight — hotfix: heredoc-stdin **producer-side** wedge (3rd variant, v0.7.x → v0.13.x leap still blocked on v0.13.8)
+
+Third release cycle of the same Bash 5.3.9 deadlock bug class. Operator-host (patch, Linux ec2-user, task #4538) retry on v0.13.8 STILL HANGS. The v0.13.7/v0.13.8 fixes closed the consumer-side variants (`<<<` here-string and parent-`$()`-over-heredoc-stdin); v0.13.9 closes the **producer-side** variant.
+
+Sample evidence on patch host: main bash thread parked in `heredoc_write -> write(libsystem_kernel)` at `bridge-upgrade.sh:871` — the inner `bridge_upgrade_with_target_env $BASH -s -- … <<'EOF' … EOF` pattern inside `bridge_upgrade_channel_guard_report`. The parent bash writes the heredoc body to the child's pipe stdin and blocks because the child (slow start: `source bridge-lib.sh` + `bridge_load_roster`) hasn't drained the pipe yet.
+
+The only robust fix is to **remove the heredoc-stdin path entirely** for every leap-path body. v0.13.9 moves each leap-path body to a standalone file under `lib/upgrade-helpers/` and invokes it via `bash $file args` / `python3 $file args` (file-as-argv, no heredoc anywhere).
+
+### Fixed
+
+- **bridge-upgrade.sh heredoc-stdin producer-side wedge (PR #894)**. Six call-sites + six new helper files:
+
+    | bridge-upgrade.sh function/inline site | New helper file |
+    |---|---|
+    | `bridge_upgrade_channel_guard_report` body (bash `<<'EOF'`) | `lib/upgrade-helpers/channel-guard-report.sh` |
+    | `bridge_upgrade_channel_guard_json` body (python `<<'PY'`) | `lib/upgrade-helpers/channel-guard-json.py` |
+    | `bridge_upgrade_agent_restart_json` body (python `<<'PY'`) | `lib/upgrade-helpers/agent-restart-json.py` |
+    | Inline `RECORDED_SOURCE_ROOT` (python `<<'PY'`) | `lib/upgrade-helpers/recorded-source-root.py` |
+    | Inline `ISOLATION_V2_MIGRATION_JSON` (bash `<<'EOF'`) | `lib/upgrade-helpers/isolation-v2-migrate.sh` |
+    | `bridge_upgrade_emit_failure_json` body (python `<<'PY'`, codex r1 BLOCKING catch) | `lib/upgrade-helpers/emit-failure-json.py` |
+
+  The `bridge_upgrade_capture_to_var` helper from v0.13.8 stays in place. It's no longer load-bearing (inner heredoc is gone), but it's still used at the migrated callsites for defensive style and consistency with what shipped in v0.13.8.
+
+  Codex review chain: r1 caught `emit_failure_json` (EXIT-trap path) as BLOCKING — fixed. r2 caught helper body byte-formatting drift — fixed. r3 flagged 18 additional non-leap-path python heredoc sites as BLOCKING. r4 verified the orchestrator's CLAUDE.md 3-round-cap triage: those 18 sites are all alternate-subcommand (--check/--analyze/--rollback) or post-apply (after apply-live succeeds), so they are deferred to v0.13.10 as a defensive cleanup pass.
+
+### Operator-host follow-up
+
+If your v0.13.8 upgrade is still blocked:
+
+1. Confirm install unchanged: `cat ~/.agent-bridge/VERSION` should still show the pre-upgrade version. apply-live did not run.
+2. Re-pull source: `cd <source-checkout> && git fetch origin && git checkout v0.13.9`.
+3. Re-run upgrader: `./agent-bridge upgrade --apply`.
+4. If the apply succeeds but the script HANGS post-apply (script doesn't exit, VERSION has already advanced), it's a v0.13.10 carry-over python heredoc. `pkill -f bridge-upgrade.sh` is safe (install is upgraded). File a follow-up referencing task #4538.
+
+### Carry-over to v0.13.10
+
+- Migrate 18 remaining python heredoc-stdin sites at bridge-upgrade.sh lines 662, 761, 784, 1130, 1243, 1252, 1297, 1308, 1534, 1581, 1798, 2144, 2260, 2266, 2278, 2287, 2313, 2345 to standalone `lib/upgrade-helpers/*.py` files following the v0.13.9 pattern.
+- Add a `<<EOF` / `<<'PY'` ban lint rule for `bridge-upgrade.sh` to prevent regression of the bug class.
+
 ## [0.13.8] — 2026-05-15
 
 ### Highlight — hotfix: heredoc-stdin `$()` capture deadlocks (v0.7.x → v0.13.x leap still blocked on v0.13.7)
