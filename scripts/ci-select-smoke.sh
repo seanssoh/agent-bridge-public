@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions
+  add_required queue daemon launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy isolated-credential-sync v2-cross-class-read isolation-v2-migrate-lock-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions
 }
 
 add_all_integration() {
@@ -273,6 +273,19 @@ select_for_path() {
       add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions launch
       add_integration integration-minimal
       add_live live-tmux-daemon
+      ;;
+
+    bridge-auth.sh|bridge-auth.py)
+      # PR #883 (v0.13.6 hotfix track 5) — bridge-auth.sh gained an
+      # isolation-aware credential-sync branch that pipes the token
+      # payload (emitted by bridge-auth.py's new
+      # ``emit-credential-payload`` subcommand) through
+      # ``bridge_isolation_write_file_as_agent_user_via_bash`` (PR #861).
+      # Pull the regression smoke for every move on either entry point.
+      # Also re-run the PR #861 write-helper smoke since this row's fix
+      # consumes that helper's exit-code contract.
+      add_required isolated-credential-sync 857-pr1-isolation-write-helper
+      add_integration integration-minimal
       ;;
 
     bin/agb|bin/*)

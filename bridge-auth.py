@@ -1209,6 +1209,50 @@ def ensure_claude_settings_file(
     return path
 
 
+def cmd_emit_credential_payload(args: argparse.Namespace) -> int:
+    """Emit the Claude credentials JSON payload for the registry's active
+    token to stdout — no file write, no chown, no parent-dir creation.
+
+    PR #883 (v0.13.6 hotfix track 5): the standard ``sync-agent`` path
+    chowns the credential file to the isolated UID *before* ``os.replace``
+    (PR #799 r2), but that still requires the controller-run sync process
+    to write the tempfile into the agent's home — a directory mode 0700
+    owned by the isolated UID where the controller is ``EACCES`` and the
+    write silently no-ops. ``emit-credential-payload`` lets the
+    isolation-aware shell sync path read the token via the registry
+    (which the controller does own), pipe the resulting JSON body
+    through ``bridge_isolation_write_file_as_agent_user_via_bash``, and
+    have the isolated UID itself perform the atomic write inside its
+    own home.
+
+    The payload shape MUST match what ``write_claude_credentials_file``
+    would have produced: ``claudeAiOauth.{accessToken,expiresAt,scopes}``.
+    The ``--agent`` arg is accepted for audit-log symmetry with
+    ``sync-agent`` but is not consulted to look up state — the registry's
+    ``active_token_id`` is the sole input.
+    """
+    json_mode = bool(args.json)
+    try:
+        registry = load_registry(Path(args.registry).expanduser())
+        active_id = str(registry.get("active_token_id") or "")
+        if not active_id:
+            raise ValueError("no active token id")
+        row = find_token(registry, active_id)
+        if row is None:
+            raise ValueError(f"active token id is missing from registry: {active_id}")
+        if not bool(row.get("enabled", True)):
+            raise ValueError(f"active token id is disabled: {active_id}")
+        token = str(row.get("token") or "")
+        validate_token(token)
+        payload = claude_oauth_credentials_payload(token)
+    except Exception as exc:
+        return fail(str(exc), json_mode)
+    # Emit raw JSON body — same shape ``write_claude_credentials_file``
+    # writes to disk. Caller pipes this into the isolation write helper.
+    sys.stdout.write(json.dumps(payload, ensure_ascii=True, indent=2) + "\n")
+    return 0
+
+
 def cmd_sync_agent(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
     try:
@@ -1328,6 +1372,18 @@ def build_parser() -> argparse.ArgumentParser:
     auto_parser.add_argument("--threshold", type=float)
     auto_parser.add_argument("--json", action="store_true")
     auto_parser.set_defaults(handler=cmd_auto_rotate)
+
+    emit_parser = sub.add_parser("emit-credential-payload")
+    # ``--agent`` is accepted for audit-log symmetry with ``sync-agent``;
+    # the registry's ``active_token_id`` is the sole state input. The
+    # shell caller passes it through so debug logs show which agent the
+    # payload was emitted for. ``--json`` is accepted but does NOT change
+    # output shape (the body is always raw JSON, never wrapped) — the
+    # flag exists so the shell-side combined-JSON emitter does not have
+    # to special-case the argv.
+    emit_parser.add_argument("--agent", required=True)
+    emit_parser.add_argument("--json", action="store_true", help=argparse.SUPPRESS)
+    emit_parser.set_defaults(handler=cmd_emit_credential_payload)
 
     sync_parser = sub.add_parser("sync-agent")
     sync_parser.add_argument("--agent", required=True)

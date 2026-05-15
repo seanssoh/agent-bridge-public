@@ -248,6 +248,96 @@ bridge_auth_fix_legacy_secret_file_mode() {
   chmod "$file_mode" "$file" 2>/dev/null || bridge_auth_run_privileged chmod "$file_mode" "$file"
 }
 
+bridge_auth_sync_agent_isolated_via_sudo() {
+  # PR #883 (v0.13.6 hotfix track 5) — isolated-UID credential sync via the
+  # PR #861 helper. The standard ``bridge_auth_sync_agent_python`` path
+  # writes the credentials tempfile from the controller process and then
+  # ``os.replace``s it into the final path. The controller already
+  # ``chown``s the tempfile to the isolated UID before the replace
+  # (PR #799 r2), but the tempfile is created INSIDE the agent's
+  # ``~/.claude/`` directory — which is mode 0700 owned by the isolated
+  # UID. The controller's ``tempfile.mkstemp`` therefore fails with
+  # ``EACCES`` and the sync silently no-ops, leaving the agent without a
+  # ``.credentials.json``.
+  #
+  # This helper reuses ``bridge_isolation_write_file_as_agent_user_via_bash``
+  # (PR #861, lib/bridge-isolation-helpers.sh:181) — a controller-driven
+  # ``sudo -n -u <os_user> bash -c <inline-write>`` that streams stdin
+  # into ``$dest_dir/.<basename>.bridge-write-tmp.XXXXXX``, chmods to
+  # ``0600`` before the atomic rename, and leaves no temp residue on
+  # failure. Token material flows controller -> Python (which loads the
+  # registry and emits the payload to stdout) -> shell pipe -> isolated
+  # UID via sudo. The token never lands on disk in a controller-owned
+  # tempfile.
+  #
+  # Returns:
+  #   0       — write succeeded; caller proceeds to legacy-env update.
+  #   non-0   — failure; caller appends ``<agent>:<reason>`` to ``failed``
+  #             and continues to the next agent. ``reason`` distinguishes
+  #             which sub-step failed for the operator's audit-log
+  #             readback.
+  local agent="$1"
+  local registry="$2"
+  local file="$3"
+  local payload=""
+
+  if ! command -v bridge_isolation_write_file_as_agent_user_via_bash >/dev/null 2>&1 \
+        && ! declare -F bridge_isolation_write_file_as_agent_user_via_bash >/dev/null 2>&1; then
+    printf 'isolation_helper_unavailable\n'
+    return 1
+  fi
+
+  # Emit the credential payload — Python reads the registry, validates the
+  # active token, and prints the JSON body to stdout. No file write, no
+  # parent-dir creation. ``2>/dev/null`` swallows stderr so a registry
+  # error surfaces as a return-code failure rather than leaking the raw
+  # ``[error] ...`` line into the failure-reason string the caller picks
+  # up (the bash caller's audit only consumes our stdout reason).
+  if ! payload="$(python3 "$SCRIPT_DIR/bridge-auth.py" --registry "$registry" \
+        emit-credential-payload --agent "$agent" 2>/dev/null)"; then
+    printf 'emit_payload_failed\n'
+    return 1
+  fi
+
+  if [[ -z "$payload" ]]; then
+    printf 'emit_payload_empty\n'
+    return 1
+  fi
+
+  # Pipe the payload to the isolation write helper. Content is streamed
+  # via stdin (`cat -` inside the inline sudo'd script), NEVER a heredoc
+  # / here-string — that surface re-opens the Bash 5.3.9 heredoc_write
+  # deadlock class (footgun #11, PR #815 Wave D + PR #840 docstring-
+  # literal recurrence).
+  local helper_rc=0
+  printf '%s' "$payload" \
+    | bridge_isolation_write_file_as_agent_user_via_bash "$agent" "$file" 0600 \
+    >/dev/null 2>&1 || helper_rc=$?
+  case "$helper_rc" in
+    0)
+      return 0
+      ;;
+    1)
+      # Helper says "not isolated" — should be impossible because the
+      # caller only takes this branch when ``bridge_agent_linux_user_isolation_effective``
+      # returned true. Treat as a contract violation, not a sudo issue.
+      printf 'isolated_write_not_isolated\n'
+      return 1
+      ;;
+    2)
+      printf 'isolated_write_no_sudo\n'
+      return 1
+      ;;
+    *)
+      # script-band rc 3+ — preserve in the failure reason so operators
+      # can disambiguate the helper's documented exit codes (5=dest
+      # missing, 6=mktemp, 7=stdin, 8=chmod, 9=mv).
+      printf 'isolated_write_failed_rc=%s\n' "$helper_rc"
+      return 1
+      ;;
+  esac
+}
+
 bridge_auth_sync_agent_python() {
   local agent="$1"
   local registry="$2"
@@ -402,10 +492,27 @@ PY
       rc=1
       continue
     fi
-    if ! output="$(bridge_auth_sync_agent_python "$agent" "$registry" "$file" 2>&1)"; then
-      failed+=("$agent:$output")
-      rc=1
-      continue
+    # PR #883 (v0.13.6 hotfix track 5) — isolated agents get a sudo-as-
+    # isolated-UID write path. The standard Python sync from the
+    # controller cannot create a tempfile inside the agent's
+    # ``~/.claude/`` (mode 0700 owned by the isolated UID), so the
+    # ``mkstemp`` fails with EACCES and the sync silently no-ops. The
+    # isolation-aware branch lets the isolated UID itself perform the
+    # atomic write via PR #861's helper, then falls through to the
+    # legacy-env update which is privileged on the controller side and
+    # already isolation-aware (chown to v2 group).
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      if ! output="$(bridge_auth_sync_agent_isolated_via_sudo "$agent" "$registry" "$file" 2>&1)"; then
+        failed+=("$agent:$output")
+        rc=1
+        continue
+      fi
+    else
+      if ! output="$(bridge_auth_sync_agent_python "$agent" "$registry" "$file" 2>&1)"; then
+        failed+=("$agent:$output")
+        rc=1
+        continue
+      fi
     fi
     # PR #799 r3 codex finding 1 — Python's ``write_private_file_atomic``
     # writes the tempfile, chmod/chown's it (when --owner-uid/--owner-gid
