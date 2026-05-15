@@ -100,14 +100,16 @@ This is a behavior change from the v0.13.x cycle where 4 patches in one day each
 Each stage:
 1. Implement on macOS (local dev)
 2. Run macOS-side smokes
-3. Push to PR (`fix/<slug>` or `chore/<slug>`)
+3. Push to PR (`fix/<slug>` or `chore/<slug>`) — PR header MUST include `release-impact: <none|user-visible|migration>`
 4. Verify CI green (covers macOS smoke + lint)
-5. Test on OrbStack Linux VM (agb-test first; linux-systemd-test for systemd-touching stages)
+5. Test on OrbStack Linux VM (per §"Linux VM policy" per-stage matrix)
 6. Codex review via agb-dev-codex queue
 7. Merge after Linux green + codex implement-ok
-8. NO VERSION bump unless stage produces user-facing change
+8. **Stabilization PRs NEVER bump VERSION/CHANGELOG.** Release PR is separate and batched at operator's deploy cue. See §"Version policy".
 
 ### Stage order (smallest → largest impact)
+
+Codex r2 correction: S10-early (lint-only guard against NEW heredoc-stdin sites) MUST land before S2/S3/S5 touch upgrade-adjacent code. Hoisted as **S1.5** in the order below to make this explicit, ahead of S2.
 
 **S0 — Bookkeeping (no code change)**
 - Write this document (in progress)
@@ -125,6 +127,18 @@ Each stage:
 - No VERSION bump
 - Linux VM: not strictly required (no code change), but smoke runs still pass
 - Single PR: `docs/v0.13.x-catchup-and-audit-archive`
+
+**S1.5 — Heredoc-stdin ban lint guard (BEFORE S2) [release-impact: none]**
+
+Codex r2 promoted this from S10-early into the explicit stage order. Purpose: prevent S2-S5 stabilization stages from accidentally creating new footgun #11 sites in upgrade-adjacent code.
+
+- Add grep-based pre-commit / CI check rejecting NEW `<<EOF`/`<<'PY'` heredoc-stdin patterns in bridge-upgrade.sh
+- Existing 18 deferred sites grandfathered with inline `# heredoc-grandfathered` annotations
+- No code migration in this stage — just regression prevention
+- Linux VM verification: not required (lint-only change; CI runs the new check)
+- PR: `chore/heredoc-ban-lint-guard-s1_5`
+
+The full migration of the 18 grandfathered sites lives in S10-late (post-S6, with `bash-539-test` VM mandatory).
 
 **S2 — Operator-visible blockers: macOS noise + stale BRIDGE_LAYOUT=legacy env unblock [release-impact: user-visible]**
 
@@ -165,14 +179,13 @@ Per codex correction: removing the Bash 3.2 re-exec is NOT pure cleanup. The re-
 
 Move S4 to AFTER S5. New numbering: original S4 becomes S5.5 (post-discriminator, pre-Bucket-2-finalize cleanup).
 
-**S5 — Bucket 2 enforcement gates (multi-track wave)**
+**S5 — Bucket 2 enforcement gates (multi-track wave) [release-impact: migration]**
 - 140 Linux-only enforcement sites gate-wrap with `bridge_isolation_v2_enforce()`
 - Track A: lib/bridge-isolation-v2*.sh (~80 sites)
 - Track B: bridge-daemon.sh + lib/bridge-channels.sh + lib/bridge-state.sh (~30 sites)
 - Track C: bridge-agent.sh scaffold + bridge-init.sh (~15 sites)
 - Track D: cross-platform smoke expansion (macOS no-op + Linux full)
-- VERSION bump: v0.14.0 (this is the platform-discriminator semantic milestone)
-- PR: per-track + bundle release
+- After all S5 tracks merge: **a separate release PR cuts v0.14.0** as the platform-discriminator semantic milestone. The S5 tracks themselves do NOT bump VERSION; the release PR aggregates them at operator's deploy cue per §"Version policy".
 
 **S6 — Bucket 3 contract errors + Bucket 4 splits (multi-track) [release-impact: migration]**
 - 35 Bucket 3 sites get `bridge_isolation_v2_require_linux()` early-error
@@ -238,23 +251,29 @@ Append below as stages complete.
 
 ### Stage 0 — Plan write-up
 - **Started**: 2026-05-15 22:30 KST
-- **Status**: in-progress
-- **Next**: commit this doc + S1 dispatch
+- **Status**: codex r1 needs-more (5 items) → r2 needs-more (3 doc consistency items) → r3 dispatched
+- **PR**: #901, branch `chore/stabilization-plan-2026-05-15`
+- **Next**: r3 implement-ok → merge → S1 dispatch
 
-### Stage 1 — Doc catch-up
-- **Status**: pending S0
+### Stage 1 — Doc catch-up + audit ground truth archive
+- **Status**: pending S0 merge
 
-### Stage 2 — macOS noise fix
-- **Status**: pending S1
+### Stage 1.5 — Heredoc-ban lint guard
+- **Status**: pending S1 (per codex r2 ordering)
 
-### Stage 3 — Platform discriminator
+### Stage 2 — Operator-visible blockers (macOS noise + env-leak)
+- **Status**: pending S1.5
+
+### Stage 3 — Platform discriminator foundation
 - **Status**: pending S2
 
 (remaining stages pending)
 
-## Audit raw output
+## Audit raw output — archived in S1
 
-The 5 audit subagents produced detailed enumeration. Key files cited inline above. For each finding's file:line, see the in-memory audit transcripts (this session's task notifications); summarize-and-archive into a separate `docs/audit-2026-05-15.md` if it grows beyond conversation scope.
+S1 must create `docs/audit-2026-05-15.md` with the structured row format (`id | severity | category | file:line | one-line | risk | owner-stage | status`). Until S1 lands, this section is intentionally incomplete and **S1 is blocked on archiving the evidence** (the audit subagent outputs only exist in this session's task notifications).
+
+Next session: do NOT proceed past S1 without verifying `docs/audit-2026-05-15.md` exists and is non-empty.
 
 ## Recovery from misuse
 
