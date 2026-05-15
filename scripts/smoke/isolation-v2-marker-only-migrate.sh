@@ -336,4 +336,163 @@ if [[ -f "$T5_MARKER" ]]; then
 fi
 smoke_log "T5 PASS: rc=2 unknown roster keeps the operator-visible preflight path"
 
-smoke_log "all 5 tests PASS"
+# --- T6: post-marker boot resolves shared-mode agent workdir + CLAUDE.md ----
+#
+# Codex r1 BLOCKING on PR #897: the original T1-T5 only validated the
+# marker bytes and the absence of sudo. They never started a clean
+# post-marker process and exercised `bridge_agent_workdir <agent>` to
+# confirm the marker-only fast-path does not strand a shared-mode agent
+# whose CLAUDE.md (and project tree) live at an operator-explicit
+# workdir.
+#
+# Why this matters with Track A's marker-only path: after the fast-path
+# writes the marker, the next process to source `bridge-lib.sh` will see
+# `BRIDGE_LAYOUT=v2` via the marker, `bridge-isolation-v2.sh` will
+# compute `BRIDGE_AGENT_ROOT_V2=$BRIDGE_DATA_ROOT/agents`, and
+# `bridge_agent_workdir` (lib/bridge-agents.sh:3702) enters its v2-anchor
+# gate. Pre-#895 the gate fired unconditionally; post-#895 (Track C,
+# merged 2026-05-15 main HEAD 9e909be) it fires only for `linux-user`
+# mode. Shared-mode agents — the entire v0.7.x → v0.13.x upgrade target
+# population — must fall through to the explicit
+# `BRIDGE_AGENT_WORKDIR[<agent>]` so the operator's project (and its
+# CLAUDE.md) stay reachable.
+#
+# T6 stages a markerless install with one shared-mode agent whose
+# explicit workdir contains a CLAUDE.md, applies the marker-only path,
+# then spawns a FRESH bash subprocess that exports only `BRIDGE_HOME`
+# (the marker on disk is what makes BRIDGE_LAYOUT=v2 take effect; no
+# pre-set BRIDGE_LAYOUT / BRIDGE_DATA_ROOT in env). The subprocess
+# sources bridge-lib.sh, calls `bridge_load_roster` to populate
+# BRIDGE_AGENT_WORKDIR[], then invokes `bridge_agent_workdir <agent>`
+# and we assert the returned path equals the explicit workdir and
+# contains the staged CLAUDE.md.
+
+smoke_log "T6: post-marker boot resolves shared-mode agent workdir + CLAUDE.md (codex r1)"
+
+T6_HOME="$SMOKE_TMP_ROOT/t6"
+mkdir -p "$T6_HOME"
+stage_markerless_install "$T6_HOME"
+
+# Stage a shared-mode agent with CLAUDE.md at an operator-explicit workdir.
+# The workdir lives OUTSIDE $T6_HOME/data/agents/ (the v2 anchor that
+# pre-#895 would have re-rooted to) so the assertion can distinguish
+# explicit-cwd-honored from v2-anchor-stomp.
+T6_AGENT="t6_legacy_shared"
+T6_EXPLICIT_WORKDIR="$T6_HOME/operator-project"
+mkdir -p "$T6_EXPLICIT_WORKDIR"
+printf '# %s CLAUDE.md (post-marker reachability fixture)\n' "$T6_AGENT" \
+  >"$T6_EXPLICIT_WORKDIR/CLAUDE.md"
+
+# Roster file: shared-mode agent, isolation_mode UNSET so it exercises
+# the default-fallback contract (bridge_agent_isolation_mode normalizes
+# unset to "shared" per lib/bridge-agents.sh:799-802 — same path
+# operator's v0.7.x roster rows hit on upgrade).
+{
+  printf '#!/usr/bin/env bash\n'
+  printf '# shellcheck shell=bash disable=SC2034\n'
+  printf 'bridge_add_agent_id_if_missing %q\n' "$T6_AGENT"
+  printf 'BRIDGE_AGENT_ENGINE[%s]=claude\n' "$T6_AGENT"
+  printf 'BRIDGE_AGENT_SESSION[%s]=%s\n' "$T6_AGENT" "$T6_AGENT"
+  printf 'BRIDGE_AGENT_WORKDIR[%s]=%q\n' "$T6_AGENT" "$T6_EXPLICIT_WORKDIR"
+} >"$T6_HOME/agent-roster.local.sh"
+
+# Step 1: apply the marker-only fast-path (same harness as T1).
+T6_APPLY_OUT="$T6_HOME/apply-out.txt"
+run_apply_for_upgrade "$T6_HOME" shared 1 "$T6_APPLY_OUT"
+T6_APPLY_PAYLOAD="$(cat "$T6_APPLY_OUT")"
+assert_marker_only_path "T6.apply" "$T6_APPLY_PAYLOAD"
+
+# Confirm marker landed (same invariant as T1's post-condition).
+T6_MARKER="$T6_HOME/state/layout-marker.sh"
+if [[ ! -f "$T6_MARKER" ]]; then
+  smoke_fail "T6: marker $T6_MARKER missing after marker-only fast-path"
+fi
+
+# Step 2: clean post-marker boot. Spawn a fresh bash with a SCRUBBED env
+# (`env -i`) so leaked controller-shell `BRIDGE_*` exports from the
+# operator's live agent session cannot mask the marker pickup. Only
+# BRIDGE_HOME + the four standard inherited vars (HOME / PATH / TMPDIR /
+# USER) are passed through; everything else — including
+# BRIDGE_LAYOUT_MARKER_DIR, BRIDGE_LAYOUT, BRIDGE_DATA_ROOT — is
+# deliberately absent so the marker on disk is the only signal that can
+# set BRIDGE_LAYOUT=v2. This pins the contract that a fresh shell
+# launched on the upgraded install picks up v2 layout from the marker
+# alone, which is exactly what the next `agent-bridge ...` process does
+# after `agent-bridge upgrade --apply` exits.
+T6_POSTMARKER_DRIVER="$T6_HOME/postmarker-driver.sh"
+write_driver_script "$T6_POSTMARKER_DRIVER" \
+  '#!/usr/bin/env bash' \
+  'set -uo pipefail' \
+  'cd "$REPO_ROOT"' \
+  'export BRIDGE_HOME="$HOME_DIR"' \
+  '# Roster cache lives per-process. Forcing a re-read keeps the' \
+  '# driver immune to any future change that might pre-cache the' \
+  '# roster before bridge_load_roster runs.' \
+  'export BRIDGE_ROSTER_CACHE_DISABLE=1' \
+  'source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1' \
+  'bridge_load_roster' \
+  'printf "BRIDGE_LAYOUT=%s\n" "${BRIDGE_LAYOUT:-unset}"' \
+  'printf "BRIDGE_DATA_ROOT=%s\n" "${BRIDGE_DATA_ROOT:-unset}"' \
+  'printf "BRIDGE_AGENT_ROOT_V2=%s\n" "${BRIDGE_AGENT_ROOT_V2:-unset}"' \
+  'printf "BRIDGE_LAYOUT_SOURCE=%s\n" "${BRIDGE_LAYOUT_SOURCE:-unset}"' \
+  'printf "resolved=%s\n" "$(bridge_agent_workdir "$AGENT_ID")"'
+
+T6_POSTMARKER_OUT="$(env -i \
+  HOME="${HOME:-}" \
+  PATH="${PATH:-/usr/bin:/bin}" \
+  TMPDIR="${TMPDIR:-/tmp}" \
+  USER="${USER:-}" \
+  REPO_ROOT="$REPO_ROOT" \
+  HOME_DIR="$T6_HOME" \
+  AGENT_ID="$T6_AGENT" \
+  "$BRIDGE_BASH" "$T6_POSTMARKER_DRIVER" 2>&1)" || true
+
+# Assert: marker activated v2 layout in the clean boot.
+case "$T6_POSTMARKER_OUT" in
+  *"BRIDGE_LAYOUT=v2"*) ;;
+  *)
+    smoke_fail "T6: post-marker boot did not pick up BRIDGE_LAYOUT=v2 from marker. output:
+$T6_POSTMARKER_OUT" ;;
+esac
+
+# Assert: BRIDGE_AGENT_ROOT_V2 is set (proves isolation-v2.sh derived
+# it from the marker's BRIDGE_DATA_ROOT). Without this, the
+# `bridge_agent_workdir` v2-anchor gate (lib/bridge-agents.sh:3727)
+# would have been a no-op for trivial reasons and the assertion below
+# would not actually exercise the shared-mode fall-through.
+case "$T6_POSTMARKER_OUT" in
+  *"BRIDGE_AGENT_ROOT_V2=$T6_HOME/data/agents"*) ;;
+  *)
+    smoke_fail "T6: post-marker boot did not derive BRIDGE_AGENT_ROOT_V2=$T6_HOME/data/agents from marker. output:
+$T6_POSTMARKER_OUT" ;;
+esac
+
+# Assert: bridge_agent_workdir <agent> returned the explicit workdir,
+# NOT the v2 anchor. This is the post-#895 shared-mode contract Track A's
+# marker activation must not violate.
+T6_RESOLVED="$(printf '%s\n' "$T6_POSTMARKER_OUT" | sed -n 's/^resolved=//p' | tail -n 1)"
+if [[ -z "$T6_RESOLVED" ]]; then
+  smoke_fail "T6: post-marker boot did not emit a resolved= line. output:
+$T6_POSTMARKER_OUT"
+fi
+if [[ "$T6_RESOLVED" != "$T6_EXPLICIT_WORKDIR" ]]; then
+  smoke_fail "T6: bridge_agent_workdir returned '$T6_RESOLVED', expected '$T6_EXPLICIT_WORKDIR'. Marker-only fast-path must NOT strand shared-mode agents at the v2 anchor (codex r1 catch on PR #897; see #895 / Track C / lib/bridge-agents.sh:3702-3742). output:
+$T6_POSTMARKER_OUT"
+fi
+
+# Defense-in-depth: returned path must NOT be under the v2 agent root.
+case "$T6_RESOLVED" in
+  "$T6_HOME/data/agents"*|"$T6_HOME/data/agents/"*)
+    smoke_fail "T6: resolved workdir '$T6_RESOLVED' is under \$BRIDGE_AGENT_ROOT_V2 — shared-mode agent must not be re-rooted to v2 anchor. output:
+$T6_POSTMARKER_OUT" ;;
+esac
+
+# Assert: CLAUDE.md is reachable at the resolved workdir.
+if [[ ! -f "$T6_RESOLVED/CLAUDE.md" ]]; then
+  smoke_fail "T6: CLAUDE.md not reachable at resolved workdir '$T6_RESOLVED' — marker activation broke shared-mode agent path. output:
+$T6_POSTMARKER_OUT"
+fi
+
+smoke_log "T6 PASS: marker-only + shared-mode agent preserves legacy workdir + CLAUDE.md (resolved=$T6_RESOLVED)"
+
+smoke_log "all 6 tests PASS"
