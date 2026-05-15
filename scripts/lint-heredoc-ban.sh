@@ -17,17 +17,28 @@
 # - PRs that add new heredoc-stdin without removing one push count over
 #   the ceiling and fail this lint.
 #
-# Pattern detected (4 wrapper shapes — all reproduce the v0.13.7-v0.13.9
-# deadlock chain when the subprocess is slow to drain):
-#   1. command-start:    bash -s … <<EOF                / python3 - … <<PY
-#   2. if-wrapped:       if [!] bash -s … <<EOF         / if [!] python3 - … <<PY
-#   3. `$()`-wrapped:    var=$(bash -s … <<EOF)         / var=$(python3 - … <<PY)
-#                        var="$(bash -s … <<EOF)"       / var="$(python3 - … <<PY)"
-#   4. piped + `$()`:    var="$(printf … | bash -s … <<EOF)"  etc.
+# Contract — broad-match:
+#   A "site" is any non-comment line in bridge-upgrade.sh that contains
+#   a heredoc-fed `bash -s ...` or `python3 - ...` subprocess on the
+#   same line — i.e., the sub-pattern
+#       <bash -s | python3 -> ... <<EOF | <<'EOF' | <<"EOF" | <<PY | <<'PY' | <<"PY" | <<-...
+#   appears anywhere on the line.
 #
-# Comment-only lines (first non-whitespace char is `#`) do NOT match —
-# doc strings and audit-trail references to heredoc shapes do not trip
-# the lint.
+#   Wrapper shape does NOT matter: command-start, `if [!] ` wrapped,
+#   `var=$(...)` / `var="$(...)"` command-substitution, piped + `$()`,
+#   nested `$(...)` deeper than one level, backtick command-sub, or even
+#   the pattern embedded inside a double-quoted string — all count.
+#
+#   The only false-positive surface is a literal mention of the
+#   sub-pattern inside a string on a NON-comment line. In practice
+#   bridge-upgrade.sh has zero such strings, and the right place to
+#   document the danger pattern in code is a comment line (those are
+#   excluded — see below).
+#
+# Comment-line skip:
+#   Lines whose first non-whitespace char is `#` are excluded from the
+#   count. Audit-trail references, doc strings inside comments, and
+#   intent-explaining notes do not trip the lint.
 #
 # This script is NOT a substitute for the migration work in S10-late;
 # it's the regression guard during S2-S9 so the bridge-upgrade.sh heredoc
@@ -46,17 +57,32 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 target_file="$repo_root/bridge-upgrade.sh"
 ceiling="${BRIDGE_UPGRADE_HEREDOC_CEILING:-18}"
 
-# Pattern: heredoc-stdin invocation of bash -s / python3 - in any of the 4
-# wrapper shapes (see header comment). The optional leading-context
-# alternation captures:
-#   - `if [!] ` prefix (alternative #1)
-#   - any non-comment text containing `$(` optionally followed by
-#     non-paren text (alternative #2 — handles assignment with `$()`,
-#     piped command-substitution, etc.)
-# Comment lines fail the leading-context alternation because `[^#]*` cannot
-# consume `#`, and the bare command-start anchor `[[:space:]]*` requires
-# the next char to be `b` or `p` (start of `bash`/`python3`).
-pattern='^[[:space:]]*((if[[:space:]]+!?[[:space:]]*)|([^#]*\$\([^()]*))?(bash[[:space:]]+-s|python3[[:space:]]+-)[[:space:]].*<<-?["'"'"']?(EOF|PY)["'"'"']?'
+# Core danger pattern. Anchored to "command name + space + heredoc op + tag",
+# but NOT anchored to start-of-line — so wrapper shape is irrelevant.
+danger_pattern='(bash[[:space:]]+-s|python3[[:space:]]+-)[[:space:]].*<<-?["'"'"']?(EOF|PY)["'"'"']?'
+
+# Comment-prefix on `grep -nE` output (format: LINENO:CONTENT). Lines whose
+# CONTENT (after optional whitespace) begins with `#` are comment-only.
+comment_prefix='^[0-9]+:[[:space:]]*#'
+
+count_sites() {
+  local file="$1"
+  local n
+  # 1st pass: every line containing the danger pattern (with line numbers).
+  # 2nd pass: drop comment-only lines.
+  # `grep -vc` outputs "0" with exit 1 when the input stream is empty —
+  # accept that via `|| true` so set -o pipefail doesn't trip.
+  n="$(grep -nE "$danger_pattern" "$file" 2>/dev/null \
+        | grep -vcE "$comment_prefix" 2>/dev/null || true)"
+  [[ -z "$n" ]] && n=0
+  printf '%s\n' "$n"
+}
+
+list_sites() {
+  local file="$1"
+  grep -nE "$danger_pattern" "$file" 2>/dev/null \
+    | grep -vE "$comment_prefix" || true
+}
 
 run_self_test() {
   local fixture
@@ -66,7 +92,7 @@ run_self_test() {
   cat >"$fixture" <<'FIXTURE'
 # Comment line that mentions python3 - <<'PY' should NOT match.
   # Indented comment with bash -s -- <<'EOF' should NOT match.
-echo "doc string with python3 - <<PY embedded" >/dev/null
+# Comment with nested $(python3 - <<PY) should NOT match either.
 bash -s -- "$arg" <<'EOF'
 python3 - "$payload" <<'PY'
   bash -s -- "$arg" <<EOF
@@ -82,33 +108,37 @@ out=$(bash -s -- "$arg" <<EOF)
 local out="$(python3 - "$payload" <<'PY')"
 result="$(printf '%s' "$json" | python3 - "$arg" <<'PY')"
 result="$(printf '%s' "$json" | bash -s -- "$arg" <<'EOF')"
+nested="$(other "$(bar)" | python3 - "$payload" <<'PY')"
+backtick=`python3 - "$payload" <<'PY'`
+echo "doc string with python3 - <<PY embedded" >/dev/null
 echo done
 true
 FIXTURE
 
-  # Expected: 15 positive matches (every line that starts a real invocation).
-  # Negative cases: 5 (two comments + echo doc-string + 2 trailing no-op lines).
-  local expected=15
+  # 18 positives: every non-comment line containing the danger pattern.
+  # Includes broad-match positives — nested $(), backtick wrapper, and the
+  # doc-string literal — to make the broad-match contract explicit.
+  # 5 negatives: 3 comment lines + 2 trailing no-ops.
+  local expected=18
   local got
-  got="$(grep -cE "$pattern" "$fixture" || true)"
+  got="$(count_sites "$fixture")"
 
   if [[ "$got" != "$expected" ]]; then
     echo "[lint-heredoc-ban] SELF-TEST FAIL: expected $expected matches, got $got" >&2
     echo "[lint-heredoc-ban] matches:" >&2
-    grep -nE "$pattern" "$fixture" | sed 's/^/[lint-heredoc-ban]   /' >&2 || true
+    list_sites "$fixture" | sed 's/^/[lint-heredoc-ban]   /' >&2
     return 1
   fi
 
-  # Negative checks: comment-only lines and doc strings must NOT match.
-  local negatives
-  negatives="$(grep -nE "$pattern" "$fixture" | grep -E '^[0-9]+:[[:space:]]*#|echo "doc string' || true)"
-  if [[ -n "$negatives" ]]; then
-    echo "[lint-heredoc-ban] SELF-TEST FAIL: comment/doc-string lines matched:" >&2
-    printf '%s\n' "$negatives" | sed 's/^/[lint-heredoc-ban]   /' >&2
+  local comment_hits
+  comment_hits="$(list_sites "$fixture" | grep -cE "$comment_prefix" || true)"
+  if [[ "${comment_hits:-0}" != "0" ]]; then
+    echo "[lint-heredoc-ban] SELF-TEST FAIL: $comment_hits comment-prefixed line(s) matched (must be 0):" >&2
+    list_sites "$fixture" | grep -E "$comment_prefix" | sed 's/^/[lint-heredoc-ban]   /' >&2
     return 1
   fi
 
-  echo "[lint-heredoc-ban] SELF-TEST PASS: pattern catches $got synthetic invocations across all 4 shapes."
+  echo "[lint-heredoc-ban] SELF-TEST PASS: $got positives caught (broad-match across all wrapper shapes), 0 comment-line false positives."
   return 0
 }
 
@@ -123,13 +153,13 @@ if [[ ! -f "$target_file" ]]; then
 fi
 
 if [[ "${1:-}" == "--list" ]]; then
-  grep -nE "$pattern" "$target_file" || true
+  list_sites "$target_file"
   echo
   echo "(ceiling: $ceiling)"
   exit 0
 fi
 
-count="$(grep -cE "$pattern" "$target_file" || true)"
+count="$(count_sites "$target_file")"
 
 if [[ "$count" -gt "$ceiling" ]]; then
   echo "[lint-heredoc-ban] FAIL: bridge-upgrade.sh has $count heredoc-stdin subprocess sites, exceeding the ceiling ($ceiling)." >&2
@@ -137,7 +167,7 @@ if [[ "$count" -gt "$ceiling" ]]; then
   echo "[lint-heredoc-ban] extracted to lib/upgrade-helpers/ (see existing examples)." >&2
   echo "[lint-heredoc-ban]" >&2
   echo "[lint-heredoc-ban] Detected sites:" >&2
-  grep -nE "$pattern" "$target_file" | sed 's/^/[lint-heredoc-ban]   /' >&2 || true
+  list_sites "$target_file" | sed 's/^/[lint-heredoc-ban]   /' >&2
   exit 1
 fi
 
