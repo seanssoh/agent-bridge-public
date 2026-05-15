@@ -425,6 +425,16 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
+    scripts/python-helpers/cleanup-payload-renderer.py)
+      # PR #886 r2: bridge_cleanup_render_summary delegates the JSON →
+      # markdown render to this fixture file so the renderer body lives
+      # outside any heredoc (post-#800 footgun #11 mitigation). Any
+      # change to the fixture must re-run the empty-stdin regression
+      # smoke that asserts the renderer never leaks JSONDecodeError.
+      add_required cleanup-payload-empty-stdin-872 upgrade telegram-relay-residue-cleanup
+      add_integration integration-minimal
+      ;;
+
     bridge-lib.sh|lib/bridge-core.sh|lib/bridge-agents.sh|agent-roster.sh|agent-roster.local.example.sh|bridge-config.sh)
       add_all_required_static
       add_all_integration
