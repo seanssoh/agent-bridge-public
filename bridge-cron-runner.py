@@ -128,13 +128,47 @@ RESULT_SCHEMA = {
     "additionalProperties": False,
 }
 
+# #874 (v0.13.6 hotfix): cron runner PATH augmentation must cover BOTH the
+# CLI binary (codex / claude) AND the interpreter its shebang re-exec's
+# (`#!/usr/bin/env node`). Under fnm / nvm / asdf / volta the per-version
+# `node` binary lives outside the previous fallback list, so the runner
+# would find ~/.local/bin/codex, then exec `env node` and fail with
+# `env: node: No such file or directory` once the binary had already been
+# located. Each manager exposes a stable alias path that the manager keeps
+# pointed at the user's default version — the dynamic multishell paths
+# (e.g. /run/user/<uid>/fnm_multishells/<session-id>/bin/) are deliberately
+# excluded because they are tied to an interactive shell session and stale
+# under cron. Operators who run unusual managers can extend the list at
+# runtime via BRIDGE_CRON_EXTRA_PATH (see `cron_extra_path_dirs()`).
 COMMON_BIN_DIRS = [
     Path.home() / ".local" / "bin",
     Path.home() / ".nix-profile" / "bin",
     Path.home() / "bin",
+    # Node version managers — stable alias / shim paths that host both the
+    # globally-installed CLI binary AND its `node` interpreter.
+    Path.home() / ".local" / "share" / "fnm" / "aliases" / "default" / "bin",
+    Path.home() / ".nvm" / "versions" / "node" / "default" / "bin",
+    Path.home() / ".asdf" / "shims",
+    Path.home() / ".volta" / "bin",
+    # System paths
     Path("/opt/homebrew/bin"),
     Path("/usr/local/bin"),
 ]
+
+
+def cron_extra_path_dirs() -> list[Path]:
+    """Operator-side PATH extension for the cron runner.
+
+    Reads BRIDGE_CRON_EXTRA_PATH as a colon-separated list (PATH-style),
+    expands `~` per entry, and returns the resulting Path objects in order.
+    Empty / unset env yields an empty list. This is the escape hatch for
+    hosts that use a node/python/ruby version manager whose stable alias
+    path is not in `COMMON_BIN_DIRS`.
+    """
+    extra = os.environ.get("BRIDGE_CRON_EXTRA_PATH", "").strip()
+    if not extra:
+        return []
+    return [Path(entry).expanduser() for entry in extra.split(os.pathsep) if entry.strip()]
 SHELL_RESULT_STATUS_VALUES = {"success", "error"}
 SHELL_PAYLOAD_ENV_PREFIXES = ("POLL_", "SCRIPT_")
 SHELL_PROTECTED_ENV_EXACT = {"HOME", "PATH"}
@@ -1508,7 +1542,15 @@ def augmented_path() -> str:
             continue
         seen.add(entry)
         entries.append(entry)
-    for candidate in COMMON_BIN_DIRS:
+    # #874: operator-provided extras win over built-in fallbacks so a host
+    # with an unusual manager can short-circuit the lookup; both are still
+    # filtered by is_dir() so a missing directory is silently skipped.
+    #
+    # codex r1 catch: `insert(0, entry)` prepends each iterated candidate to
+    # the front of the list, so the LAST iterated candidate ends up at PATH
+    # position 0 (highest precedence). To make extras win over COMMON_BIN_DIRS,
+    # iterate built-in fallbacks FIRST and extras LAST.
+    for candidate in (*COMMON_BIN_DIRS, *cron_extra_path_dirs()):
         entry = str(candidate)
         if candidate.is_dir() and entry not in seen:
             seen.add(entry)
@@ -1759,7 +1801,10 @@ def resolve_binary(name: str, override_env: str) -> str:
     if resolved:
         return resolved
 
-    searched = [str(path) for path in COMMON_BIN_DIRS]
+    # #874: include BRIDGE_CRON_EXTRA_PATH dirs in the error so the operator
+    # can see exactly which directories were searched (matching what the
+    # augmented PATH actually contained), not just the built-in fallbacks.
+    searched = [str(path) for path in (*cron_extra_path_dirs(), *COMMON_BIN_DIRS)]
     raise FileNotFoundError(f"{name} binary not found; searched PATH and common dirs: {', '.join(searched)}")
 
 
