@@ -6,6 +6,28 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.13.7] — 2026-05-15
+
+### Highlight — hotfix: bridge-upgrade.sh here-string deadlocks blocking v0.7.x → v0.13.x leap
+
+Operator-host (Linux ec2-user, task #4526) reported `agent-bridge upgrade --apply` silently hanging on every retry (6 attempts) of a v0.7.6 → v0.13.6 leap path. Bash stuck in `read_comsub` — waiting for a pipe `<<<` here-string never closed. footgun #11 / #265 / #800 / #815 class on Bash 5.3.9.
+
+Wedge point at `bridge-upgrade.sh:251` (the `python3 -c '<script>' <<<"$tags"` invocation inside `bridge_upgrade_latest_stable_tag`), plus three sites at lines 537, 566, 615 inside the agent-restart recovery `-lc` body.
+
+### Fixed
+
+- **bridge-upgrade.sh here-string deadlocks (PR #890)**. Four `<<<` here-string sites replaced with safe forms — pipe (`git tag … | python3 -c …`) for the tag enumeration, and `printf '%s\n' "$var" > tempfile; … < tempfile` (with `trap … EXIT` cleanup) for the report consumers. Trailing newline preserved via `printf '%s\n'` because command substitution strips the `\n` that `<<<` would have added; without the explicit `\n` the last row of the report would be dropped. Inner `bash -lc` body's new tempfile is scoped to the subshell and does not conflict with the outer `_bridge_upgrade_exit_handler` trap.
+
+  Verification: `bash -n` + `shellcheck` clean; isolated `bridge_upgrade_latest_stable_tag` smoke (3-tag fixture, 10s timeout) returns `v0.13.6` instantly with no hang. Codex r1 implement-ok across the 8-item checklist. Single file (+23/-7 LOC).
+
+### Operator-host follow-up
+
+If your v0.13.6 upgrade is blocked by this deadlock:
+
+1. Confirm install is unaffected: `cat ~/.agent-bridge/VERSION` should still show the pre-upgrade version. `apply-live` did not run.
+2. Re-pull source: `cd <source-checkout> && git fetch origin && git checkout v0.13.7`.
+3. Re-run upgrader: `./agent-bridge upgrade --apply`.
+
 ## [0.13.6] — 2026-05-15
 
 ### Highlight — operator-host audit wave (8 PRs, single session)
