@@ -106,6 +106,35 @@ without guessing.
 
 표준 upgrade 절차는 [`UPGRADING.md`](UPGRADING.md) 에 정리되어 있다. 모든 install 에서 동일한 명령으로 진행한다:
 
+### v0.13.x hotfix wave (2026-05-15) — operator follow-up
+
+If you're upgrading from any v0.7.x install, target v0.13.10 or later. The v0.13.7-v0.13.10 cycle fixed a four-stage `agent-bridge upgrade --apply` blocker that affected the v0.7.x → v0.13.x leap on Bash 5.3.9 hosts (matched by recent Linux distros). Operators on macOS were similarly affected by a markerless-existing-install layout reject.
+
+**Recommended upgrade path**:
+
+```bash
+cd <source-checkout>
+git fetch origin
+git checkout v0.13.10
+./agent-bridge upgrade --apply
+```
+
+Expected behavior (post-v0.13.10):
+- No hang on any of the four heredoc-class wedge points (read_comsub / heredoc_write variants resolved)
+- Markerless-existing-install case: marker-only fast-path fires automatically when the roster has no isolated agents in the linux-user sense. No sudo required. Works on macOS, Linux, BSD.
+- `isolation-v2 migrate result`: should show `"reason":"marker-only-no-isolated-roster"` for typical v0.7.x → v0.13.10 paths.
+- `apply-live` completes within ~10 minutes; daemon, queue, agents accessible after restart.
+
+**If your shell session predates v0.13.10**: the parent process may carry `BRIDGE_LAYOUT=legacy` env from the old install. Symptom: `agb` commands fail with `current_layout=legacy`. Workaround: `unset BRIDGE_LAYOUT BRIDGE_DATA_ROOT` in the affected shell, or restart Claude Code / tmux server. Marker on disk is correct; only the inherited env is stale. Planned fix in stabilization plan S2.
+
+**If your install has isolated agents in the roster** (linux-user mode, Linux only): the fast-path does NOT fire; the full migration runs and needs sudo for `groupadd` / `usermod`. Run with sudo available or follow the documented migration recipe.
+
+**On macOS**: the marker-only fast-path covers the typical case (shared-mode agents). Avoid `agent-bridge agent add --isolated` on macOS — `dseditgroup` requires sudo and the isolation contract does not apply on macOS (POSIX setgid is Linux-only). Stay on shared mode. Planned fix in stabilization plan S6 — explicit error gate.
+
+For per-release detail, see `CHANGELOG.md` v0.13.7 through v0.13.10. For stabilization roadmap, see `docs/stabilization-plan-2026-05-15.md` + `docs/audit-2026-05-15.md`.
+
+
+
 ```bash
 agb upgrade --dry-run
 agb upgrade --apply
