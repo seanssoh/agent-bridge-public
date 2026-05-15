@@ -1172,8 +1172,10 @@ TARGET_ROOT="$(cd -P "$(dirname "$TARGET_ROOT")" && pwd -P)/$(basename "$TARGET_
 SOURCE_ROOT="$(cd -P "$SOURCE_ROOT" && pwd -P)"
 
 if [[ $SOURCE_EXPLICIT -eq 0 && "$SOURCE_ROOT" == "$TARGET_ROOT" ]]; then
-  RECORDED_SOURCE_ROOT="$(
-    python3 - "$TARGET_ROOT/state/upgrade/last-upgrade.json" <<'PY'
+  # Footgun #11: stage the `python3 - <<'PY' …` heredoc output via tempfile
+  # to avoid the parent-`$()`-over-heredoc-stdin Bash 5.3.9 deadlock.
+  _recorded_source_root_tmp="$(mktemp -t agb-upg-recsrc.XXXXXX)"
+  python3 - "$TARGET_ROOT/state/upgrade/last-upgrade.json" >"$_recorded_source_root_tmp" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -1188,7 +1190,8 @@ except (FileNotFoundError, json.JSONDecodeError):
 source = str(payload.get("source_root") or "").strip()
 print(source)
 PY
-  )"
+  RECORDED_SOURCE_ROOT="$(<"$_recorded_source_root_tmp")"
+  rm -f -- "$_recorded_source_root_tmp"
   if [[ -n "$RECORDED_SOURCE_ROOT" && -d "$RECORDED_SOURCE_ROOT/.git" ]]; then
     SOURCE_ROOT="$(cd -P "$RECORDED_SOURCE_ROOT" && pwd -P)"
     if [[ "$SUBCOMMAND" == "apply" && $PULL_EXPLICIT -eq 0 ]]; then
@@ -1591,10 +1594,17 @@ if [[ $DRY_RUN -eq 0 ]]; then
   # forwards BRIDGE_LAYOUT_RESOLVER_BYPASS{,_OWNER_PID} explicitly so
   # the resolver inside the child still validates the handshake — the
   # process-tree walk traverses env → bash → upgrade.sh and matches.
+  # Footgun #11 (refs #890 / task #4532): the outer `$()` capture combined
+  # with `bash -s -- … <<'EOF' …` heredoc-fed stdin is the same shape that
+  # wedges Bash 5.3.9 in `read_comsub`. Stage stdout through a tempfile and
+  # read it back via `$(< file)` (bash builtin shortcut — no subshell
+  # fork, cannot wedge). The structural `set +e ; … ; rc=$? ; set -e`
+  # frame stays intact so the existing failure-handling block below still
+  # captures rc correctly.
   set +e
-  ISOLATION_V2_MIGRATION_JSON="$(
-    bridge_upgrade_with_target_env "$TARGET_ROOT" \
-      "$BRIDGE_BASH_BIN" -s -- "$SOURCE_ROOT" "$TARGET_ROOT" <<'EOF'
+  _iso_v2_migrate_tmp="$(mktemp -t agb-upg-isov2.XXXXXX)"
+  bridge_upgrade_with_target_env "$TARGET_ROOT" \
+    "$BRIDGE_BASH_BIN" -s -- "$SOURCE_ROOT" "$TARGET_ROOT" >"$_iso_v2_migrate_tmp" <<'EOF'
 set -euo pipefail
 source_root="$1"
 target_root="$2"
@@ -1605,8 +1615,9 @@ bridge_load_roster
 source "$source_root/lib/bridge-isolation-v2-migrate.sh"
 bridge_isolation_v2_migrate_apply_for_upgrade --target-root "$target_root" --json
 EOF
-  )"
   _migrate_rc=$?
+  ISOLATION_V2_MIGRATION_JSON="$(<"$_iso_v2_migrate_tmp")"
+  rm -f -- "$_iso_v2_migrate_tmp"
   set -e
   if [[ $_migrate_rc -ne 0 ]]; then
     # Issue #682: populate structured failure fields so the EXIT trap's
