@@ -165,6 +165,19 @@ select_for_path() {
     return 0
   fi
 
+  # v0.13.6 hotfix track 1 r2 (codex catch): docs/agent-runtime/admin-protocol.md
+  # is the SSOT body that bridge-docs.py renders into <bridge_home>/shared/
+  # ADMIN-PROTOCOL.md. A change to the SSOT must trigger the propagation smoke
+  # so the rendered body stays in lockstep with the wire-up. This case must
+  # precede the is_docs_only_path early-return below, which would otherwise
+  # short-circuit on the .md extension and select only the global required
+  # smokes.
+  case "$path" in
+    docs/agent-runtime/admin-protocol.md)
+      add_required admin-protocol-shared-link
+      ;;
+  esac
+
   if is_docs_only_path "$path"; then
     return 0
   fi
