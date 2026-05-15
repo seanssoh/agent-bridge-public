@@ -24,6 +24,7 @@ AGENT_SHARED_LINKS = (
     "COMMON-INSTRUCTIONS.md",
     "CHANGE-POLICY.md",
     "TOOLS.md",
+    "ADMIN-PROTOCOL.md",
 )
 DEPRECATED_SHARED_FILES = (
     "ROSTER.md",
@@ -589,6 +590,48 @@ def render_shared_change_policy_md(bridge_home: Path) -> str:
 """
 
 
+ADMIN_PROTOCOL_FALLBACK = """# ADMIN-PROTOCOL.md — Agent Bridge Admin Protocol
+
+<!-- Managed by agent-bridge. Source: docs/agent-runtime/admin-protocol.md missing at render time. -->
+
+Source document `docs/agent-runtime/admin-protocol.md` was not present in this
+install at render time. Re-run `agent-bridge upgrade` from a complete source
+checkout to repopulate this file. See repository docs for the canonical admin
+protocol body.
+"""
+
+
+def render_shared_admin_protocol_md(bridge_home: Path) -> str:
+    """Propagate docs/agent-runtime/admin-protocol.md into the shared dir.
+
+    Rationale: the agent CLAUDE.md managed block points admin sessions at
+    `ADMIN-PROTOCOL.md` (see `_admin_block_lines`), but until this renderer
+    existed the file was never written to `<bridge_home>/shared/` and the
+    matching symlink was therefore missing from every admin agent home
+    (`COMMON-INSTRUCTIONS.md`, `CHANGE-POLICY.md`, `TOOLS.md` had the wiring
+    via `AGENT_SHARED_LINKS`, `ADMIN-PROTOCOL.md` did not). Reading the
+    source-of-truth body keeps the shared copy in lockstep with the doc the
+    repo already maintains, rather than duplicating 30KB of protocol text
+    inline here.
+
+    `bridge_home` is accepted for parity with the other shared renderers
+    (dispatch table calls every renderer with the same signature) even
+    though this renderer derives content from REPO_ROOT alone.
+    """
+    del bridge_home  # signature parity with other renderers
+    source = REPO_ROOT / "docs" / "agent-runtime" / "admin-protocol.md"
+    if not source.exists():
+        return ADMIN_PROTOCOL_FALLBACK
+    body = read_text(source)
+    header = (
+        "<!-- Managed by agent-bridge. "
+        "Source: docs/agent-runtime/admin-protocol.md. "
+        "Edits to this file will be overwritten on the next "
+        "`agent-bridge upgrade`. -->\n\n"
+    )
+    return header + body
+
+
 SKILLS_DOC_MODES = ("legacy-catalog", "plugin-routing", "disabled")
 
 
@@ -990,6 +1033,7 @@ def sync_shared_docs(bridge_home: Path, source_shared: Path, dry_run: bool, stam
         "TOOLS.md": render_shared_tools_md,
         "COMMON-INSTRUCTIONS.md": render_shared_common_instructions_md,
         "CHANGE-POLICY.md": render_shared_change_policy_md,
+        "ADMIN-PROTOCOL.md": render_shared_admin_protocol_md,
     }
     # BRIDGE_SKILLS_DOC_MODE chooses the catalog rendering strategy.
     # Whichever file is *not* selected gets cleaned up so a mode flip
