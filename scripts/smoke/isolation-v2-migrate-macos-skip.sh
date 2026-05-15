@@ -169,9 +169,22 @@ write_driver_script "$T5_DRIVER" \
 
 T5_OUT="$(REPO_ROOT="$REPO_ROOT" T5_HOME="$T5_HOME" "$BRIDGE_BASH" "$T5_DRIVER" 2>&1)" || true
 
+# T5 expectation corrected v0.13.10 — `bridge_isolation_v2_roster_has_isolated_agents`
+# returns rc=2 (NOT rc=1) when `BRIDGE_AGENT_IDS` is undeclared, per the
+# helper's documented contract at lib/bridge-isolation-v2.sh:1083-1107:
+#   0 — has isolated agent
+#   1 — roster fully iterated, NO agent is effectively isolated (confirmed)
+#   2 — predicate function or BRIDGE_AGENT_IDS array unavailable (unknown)
+# The first sub-case here invokes the helper before `BRIDGE_AGENT_IDS=...`
+# is set in the driver, so the helper hits the `declare -p BRIDGE_AGENT_IDS
+# || return 2` guard — rc=2 is the correct expectation. Latent bug from
+# PR #882: the original assertion mistakenly expected rc=1 ("empty array")
+# but the smoke driver leaves the array undeclared, not empty. Never
+# surfaced until Track A's lib/bridge-isolation-v2-migrate.sh edit pulled
+# this smoke into the ci-select required set.
 case "$T5_OUT" in
-  *"empty=1"*) ;;
-  *) smoke_fail "T5 expected empty=1 (no roster → non-zero), got: $T5_OUT" ;;
+  *"empty=2"*) ;;
+  *) smoke_fail "T5 expected empty=2 (BRIDGE_AGENT_IDS undeclared → rc=2 unknown), got: $T5_OUT" ;;
 esac
 case "$T5_OUT" in
   *"shared_only=1"*) ;;
@@ -181,7 +194,7 @@ case "$T5_OUT" in
   *"mixed=0"*) ;;
   *) smoke_fail "T5 expected mixed=0 (at least one isolated → zero), got: $T5_OUT" ;;
 esac
-smoke_log "T5 PASS: helper distinguishes empty / shared-only / mixed rosters"
+smoke_log "T5 PASS: helper distinguishes undeclared / shared-only / mixed rosters"
 
 # --- shared fixture for T1..T4 -----------------------------------------------
 
