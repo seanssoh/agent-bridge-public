@@ -1193,6 +1193,114 @@ process_usage_monitor() {
   (( alert_count > 0 || rotation_count > 0 ))
 }
 
+# --- Periodic claude-token sync (v0.13.6 hotfix) -----------------------------
+# Issue context: process_claude_token_recovery above only calls
+# `bridge-auth.sh claude-token sync` when `sync_recommended=1` — i.e. when the
+# recover-due pass actually rotated or re-enabled a token. Cron-only static
+# agents (no live Claude Code session, no rotation event) consequently inherit
+# whatever token the controller had on the day they were created and never see
+# a refresh. Operator-observed symptom (2026-05-15 patch host on Linux): three
+# static cron agents (dev_mun / sales_choi / mgt_ahn) carrying a 5/12 token
+# while patch's own Claude Code refreshed to 5/15; mgt_ahn hit 429 because the
+# stale token was still pinned to the original credential.
+#
+# Fix: a low-frequency, idempotent sync tick that pushes the controller's
+# active claude token to every in-scope static agent every N seconds
+# (default 3600s = 1 hour) regardless of rotation/recovery events. The sync
+# itself is the same `bridge-auth.sh claude-token sync` that today's recovery
+# branch already invokes — we are not introducing a new sync mechanism, just
+# guaranteeing the existing one runs on a wall-clock cadence.
+#
+# Env contract:
+#   - BRIDGE_CLAUDE_TOKEN_SYNC_INTERVAL_SECONDS — sync cadence (default 3600).
+#     Set to 0 to disable the periodic tick entirely.
+#   - BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS — agent scope (default "static"); same
+#     semantic as the recovery branch.
+#
+# Audit row: `claude_token_periodic_sync` with status / agent_scope /
+# interval_seconds / trigger=periodic so the operator can see the cadence
+# alongside the existing rotation / recovery rows when reading audit.jsonl.
+bridge_daemon_periodic_token_sync_state_file() {
+  printf '%s/daemon/last-token-sync' "$BRIDGE_STATE_DIR"
+}
+
+bridge_daemon_periodic_token_sync_due() {
+  local interval="${BRIDGE_CLAUDE_TOKEN_SYNC_INTERVAL_SECONDS:-3600}"
+  local file=""
+  local last_ts=0
+  local now=0
+  local elapsed=0
+
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=3600
+  # Interval 0 == disabled. Treat as never-due so the tick is a no-op.
+  (( interval > 0 )) || return 1
+  file="$(bridge_daemon_periodic_token_sync_state_file)"
+  # First-call case: no state file yet — fire immediately so a freshly-started
+  # daemon does not wait a full interval before first sync.
+  [[ -f "$file" ]] || return 0
+  last_ts="$(cat "$file" 2>/dev/null | tr -dc '0-9' || printf '0')"
+  [[ -n "$last_ts" ]] || last_ts=0
+  now="$(date +%s)"
+  elapsed=$(( now - last_ts ))
+  (( elapsed >= interval ))
+}
+
+bridge_daemon_periodic_token_sync_tick() {
+  local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
+  local interval="${BRIDGE_CLAUDE_TOKEN_SYNC_INTERVAL_SECONDS:-3600}"
+  local agent_scope="${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}"
+  local file=""
+  local now=0
+  local sync_json=""
+  local sync_status=""
+
+  [[ "${BRIDGE_CLAUDE_TOKEN_PERIODIC_SYNC_ENABLED:-1}" == "1" ]] || return 1
+  [[ "$interval" =~ ^[0-9]+$ ]] || interval=3600
+  (( interval > 0 )) || return 1
+  bridge_daemon_periodic_token_sync_due || return 1
+
+  file="$(bridge_daemon_periodic_token_sync_state_file)"
+  now="$(date +%s)"
+
+  if sync_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync \
+      --agents "$agent_scope" --json 2>/dev/null)"; then
+    # 5s ceiling — pure JSON parse + dict lookup; rc=124|137 leaves
+    # sync_status empty and the surrounding audit_log captures sync_status=""
+    # so the operator sees the gap alongside the daemon_subprocess_timeout
+    # row. Mirrors the parse pattern in process_claude_token_recovery.
+    sync_status="$(bridge_with_timeout 5 sync_status_parse python3 \
+      "$SCRIPT_DIR/bridge-daemon-helpers.py" sync-status-parse "$sync_json" \
+      2>/dev/null || printf '')"
+    mkdir -p "$(dirname "$file")" 2>/dev/null || true
+    # Always record the attempt timestamp so a persistent sync failure does
+    # not retrigger every poll tick. The audit row below carries the failure
+    # signal; operator inspects audit.jsonl for the actual status.
+    printf '%s\n' "$now" >"$file" 2>/dev/null || true
+    bridge_audit_log daemon claude_token_periodic_sync "$target" \
+      --detail status="${sync_status:-unknown}" \
+      --detail trigger=periodic \
+      --detail agent_scope="$agent_scope" \
+      --detail interval_seconds="$interval" \
+      2>/dev/null || true
+    daemon_info "claude token periodic sync: status=${sync_status:-unknown} agents=$agent_scope interval=${interval}s"
+    return 0
+  fi
+
+  # bridge-auth.sh sync failed outright (non-zero rc, no JSON). Still record
+  # the attempt to avoid hot-looping the failure, but tag it so the operator
+  # can correlate with the launchagent log.
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  printf '%s\n' "$now" >"$file" 2>/dev/null || true
+  bridge_audit_log daemon claude_token_periodic_sync "$target" \
+    --detail status=failed \
+    --detail trigger=periodic \
+    --detail agent_scope="$agent_scope" \
+    --detail interval_seconds="$interval" \
+    2>/dev/null || true
+  daemon_warn "claude token periodic sync failed (bridge-auth.sh exited non-zero; see audit log)"
+  return 1
+}
+
 process_claude_token_recovery() {
   local target="${BRIDGE_ADMIN_AGENT_ID:-daemon}"
   local recovery_json=""
@@ -5709,6 +5817,14 @@ cmd_sync_cycle() {
   fi
   BRIDGE_DAEMON_LAST_STEP="claude_token_recovery"
   if process_claude_token_recovery; then
+    changed=0
+  fi
+  # v0.13.6 hotfix — refs operator report 2026-05-15 patch host.
+  # Cron-only static agents never trigger the rotation/recovery branch above
+  # and so go stale (mgt_ahn hit 429 after 3 days on a 5/12 token). The
+  # periodic tick guarantees a wall-clock sync regardless of rotation events.
+  BRIDGE_DAEMON_LAST_STEP="claude_token_periodic_sync"
+  if bridge_daemon_periodic_token_sync_tick; then
     changed=0
   fi
   BRIDGE_DAEMON_LAST_STEP="usage_monitor"
