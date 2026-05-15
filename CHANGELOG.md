@@ -6,6 +6,48 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.13.8] — 2026-05-15
+
+### Highlight — hotfix: heredoc-stdin `$()` capture deadlocks (v0.7.x → v0.13.x leap still blocked on v0.13.7)
+
+Operator-host retry on v0.13.7 (Linux ec2-user, Bash 5.3.9, patch task #4526 / #4532) still wedged. The `<<<` here-string sites PR #890 fixed were the right class but the wrong instances — the wedge moved one variant over to parent `$()` command substitution capturing a child whose stdin is fed by a **heredoc** (`bash -s -- … <<'EOF' …` or `python3 - … <<'PY' …`). Same Bash 5.3.9 `read_comsub` bug, different surface.
+
+Confirmed wedge at `bridge-upgrade.sh:1383` (`CHANNEL_GUARD_REPORT="$(bridge_upgrade_channel_guard_report …)"` — function body at line 831 invokes `bridge_upgrade_with_target_env … bash -s -- … <<'EOF' … EOF`). Defensive migrations follow for every other heredoc-stdin site the apply path would have hit next plus the rollback path.
+
+### Fixed
+
+- **bridge-upgrade.sh heredoc-stdin `$()` capture deadlocks (PR #892)**. Adds a `bridge_upgrade_capture_to_var <var> <cmd …>` helper that stages `<cmd>`'s stdout to a tempfile (`mktemp` — single-line stdout, empirically safe under Bash 5.3.9) and reads it back via the `$(< file)` bash builtin form (no subshell fork → cannot wedge `read_comsub`). Six `$()` capture sites for four heredoc-stdin helpers are migrated:
+
+    - `CHANNEL_GUARD_REPORT` (line 1420) — primary wedge from task #4532
+    - `CHANNEL_GUARD_JSON` (line 1422) — defensive, same shape, next on path
+    - `ROLLBACK_AGENT_RESTART_JSON` × 2 (lines 1454, 1477) — rollback path
+    - `AGENT_RESTART_JSON` × 2 (lines 1703, 2286) — apply path, both placeholder and real-report variants
+
+  Plus two inline `$( cmd … <<EOF … EOF )` sites that don't go through a helper function:
+
+    - `RECORDED_SOURCE_ROOT` (line 1175) — `python3 - … <<'PY'` capture, single-tree install branch (`SOURCE_ROOT == TARGET_ROOT`). Migrated defensively.
+    - `ISOLATION_V2_MIGRATION_JSON` (line ~1595) — `bash -s -- … <<'EOF'` capture on the **apply path**, surfaced by codex r1 review as BLOCKING. Existing `set +e ; … ; rc=$? ; set -e` failure-handling frame preserved intact.
+
+  The helper itself uses `"$@" >tmp || _rc=$?` rather than `if ! "$@" >tmp; then …` because the latter would reset `$?` to 0 inside the then-branch (the inverted pipeline status), masking real failures from the caller under `set -e`. The chosen idiom disarms `set -e` for the wrapped call AND preserves the original rc. Verified by a 5-case functional smoke (heredoc bash-s, heredoc python3, 5000-row output, failure rc=5 round-trip, empty output, no `/tmp/agb-upg-capture.*` residue).
+
+  Functions intentionally left unchanged because they are not on the wedge surface:
+
+    - `bridge_upgrade_collect_agent_restart_report` / `bridge_upgrade_reconcile_agent_restart_recovery`: use `bash -lc 'script'` (script passed as argv, stdin inherited — not heredoc-fed).
+    - `bridge_upgrade_propagate_claude_shared_settings`: delegates to `bridge-agent.sh rerender-settings` — no inline heredoc.
+    - `bridge_upgrade_installed_field`: heredoc python, but only called during `--check-only` (off the leap path) and produces single-field tiny output.
+
+  Verification: `bash -n` + `shellcheck` clean across the whole `*.sh` / `agent-bridge` / `agb` / `lib/*.sh` / `scripts/*.sh` set. Codex r1 surfaced one BLOCKING missed site (ISOLATION_V2_MIGRATION_JSON) → fixed → codex r2 implement-ok.
+
+### Operator-host follow-up
+
+If your v0.13.7 upgrade is still blocked by this deadlock:
+
+1. Confirm install is unaffected: `cat ~/.agent-bridge/VERSION` should still show the pre-upgrade version. `apply-live` did not run.
+2. Re-pull source: `cd <source-checkout> && git fetch origin && git checkout v0.13.8`.
+3. Re-run upgrader: `./agent-bridge upgrade --apply`.
+
+If a leap retry on v0.13.8 still hangs, capture the trace (`BASH_XTRACEFD` to a file) and file an upstream issue — there may be a third variant of this bug class still hiding in the script.
+
 ## [0.13.7] — 2026-05-15
 
 ### Highlight — hotfix: bridge-upgrade.sh here-string deadlocks blocking v0.7.x → v0.13.x leap
