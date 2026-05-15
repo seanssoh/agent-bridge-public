@@ -232,6 +232,39 @@ def is_admin_agent(agent: str) -> bool:
     return False
 
 
+def _emit_admin_credential_read_allowed(
+    agent: str,
+    *,
+    tool: str,
+    surface: str,
+    sample: str = "",
+) -> None:
+    """Audit an admin agent's read-intent bypass of a credential-deny path.
+
+    Admin agents (system agents acting as the operator's deputy) are
+    allowed to perform diagnostic reads (``cat`` / ``ls`` / ``stat`` /
+    ``grep`` / ``head`` / ``tail`` / Read / Glob / Grep / NotebookRead)
+    against the Claude OAuth credential path and to inspect their own
+    process environment. Mutation deny paths (roster local, system
+    config, queue DB) stay enforced — admin still flows mutations
+    through ``agent-bridge config set``.
+
+    Every bypass writes an ``agent_admin_credential_read_allowed`` audit
+    row so the operator retains a full ledger of admin credential
+    reads. ``surface`` is the deny path that was bypassed
+    (``raw_credentials_mention`` / ``raw_env_dump`` / ``argv_path`` /
+    ``input_path``) and ``sample`` is a truncated copy of the offending
+    text or path for post-hoc inspection.
+    """
+    detail: dict[str, Any] = {
+        "tool": tool,
+        "surface": surface,
+    }
+    if sample:
+        detail["sample"] = truncate_text(sample, 200)
+    write_audit("agent_admin_credential_read_allowed", agent or "unknown", detail)
+
+
 _NON_AGENT_ENTRIES: frozenset[str] = frozenset({
     # `shared` is the canonical symlink to BRIDGE_SHARED_DIR. Treating it
     # as a peer agent home used to collapse every shared-dir write into
@@ -1393,18 +1426,63 @@ def protected_alias_reason(text: str, agent: str) -> str | None:
     # gate stays unconditional — `agb` queue commands are the
     # structured-read surface and direct sqlite reads still bypass that
     # contract.
+    # Classify read-intent once, up front: the admin-credential-read
+    # carve-out below needs the same classification the protected-path
+    # gate uses, and there's no benefit to recomputing it after each
+    # deny. Read-intent means every pipeline stage's leading command is
+    # in `_READ_INTENT_BASH_COMMANDS` (cat / ls / stat / grep / head /
+    # tail / etc.) — `sed -i` / `awk -i inplace` / any output
+    # redirection disqualifies the whole invocation. See
+    # `_is_read_intent_bash` for the full contract.
+    read_intent = _is_read_intent_bash(text)
     if _raw_mentions_claude_credentials(text):
-        return CLAUDE_CREDENTIAL_DENY_REASON
+        # Admin agents are the operator's deputy: their read-intent
+        # diagnostic commands (e.g. `ls ~/.claude/.credentials.json`,
+        # `stat $BRIDGE_RUNTIME_SECRETS_DIR/claude-oauth-tokens.json`)
+        # need to succeed for credential-state triage. The deny stays
+        # in force for write-intent commands and for non-admin agents.
+        # Every bypass writes an audit row.
+        if admin and read_intent:
+            _emit_admin_credential_read_allowed(
+                agent,
+                tool="Bash",
+                surface="raw_credentials_mention",
+                sample=text,
+            )
+        else:
+            return CLAUDE_CREDENTIAL_DENY_REASON
     # PR #799 r3 codex finding 1 — env-dump verbs revealed exported
     # OAuth tokens under the abandoned env-token path, bypassing the
     # substring deny above. Kept as a stale-env/manual-export guard.
     if _raw_dumps_process_environment(text):
-        return CLAUDE_CREDENTIAL_DENY_REASON
+        # Admin diagnostics may legitimately `env | grep BRIDGE_` or
+        # `printenv` to inspect runtime state. Allowed only when the
+        # pipeline is purely read-intent — the same gate keeps a
+        # compromised admin from `env > /tmp/leak.txt`-style writes
+        # because output redirection drops the read-intent flag.
+        if admin and read_intent:
+            _emit_admin_credential_read_allowed(
+                agent,
+                tool="Bash",
+                surface="raw_env_dump",
+                sample=text,
+            )
+        else:
+            return CLAUDE_CREDENTIAL_DENY_REASON
     for credential_path in claude_credential_paths():
         if _bash_argv_references_path(text, credential_path):
+            # Admin read-intent argv reference to a credential file
+            # (e.g. `cat ~/.claude/.credentials.json | jq .`) — allow
+            # with an audit row. Non-admin / write-intent stay denied.
+            if admin and read_intent:
+                _emit_admin_credential_read_allowed(
+                    agent,
+                    tool="Bash",
+                    surface="argv_path",
+                    sample=str(credential_path),
+                )
+                break
             return CLAUDE_CREDENTIAL_DENY_REASON
-
-    read_intent = _is_read_intent_bash(text)
     # Wrapper self-block carve-out: the sanctioned `agent-bridge config
     # set` wrapper layers its own caller-source + audit gate
     # (bridge-config.py). Without this carve-out the path-argv check
@@ -1638,11 +1716,30 @@ def handle_pretool(payload: dict[str, Any], agent: str) -> int:
     if tool_name == "Bash":
         reason = protected_alias_reason(str(tool_input.get("command") or ""), agent)
     else:
+        # Classify read-intent once for the whole non-Bash branch — both
+        # the credential carve-out below and the protected-path gate
+        # that follows need the same classification. Read / Glob / Grep
+        # / NotebookRead are read-intent; Edit / Write / MultiEdit /
+        # NotebookEdit and unknown tools are write-intent.
+        read_intent = _is_read_intent_tool(tool_name, tool_input)
+        admin = is_admin_agent(agent)
         for key in ("file_path", "path", "pattern"):
             raw = str(tool_input.get(key) or "").strip()
             if not raw:
                 continue
             if _raw_mentions_claude_credentials(raw):
+                # Admin + read-intent (Read / Glob / Grep /
+                # NotebookRead) diagnostic on a credential surface —
+                # allow with an audit row. Mutating tools (Edit / Write
+                # / NotebookEdit) and non-admin agents stay denied.
+                if admin and read_intent:
+                    _emit_admin_credential_read_allowed(
+                        agent,
+                        tool=tool_name,
+                        surface="input_path",
+                        sample=raw,
+                    )
+                    continue
                 reason = CLAUDE_CREDENTIAL_DENY_REASON
                 break
             if key in ("file_path", "path"):
@@ -1650,15 +1747,29 @@ def handle_pretool(payload: dict[str, Any], agent: str) -> int:
                     candidate = Path(raw).expanduser()
                 except Exception:
                     continue
-                reason = claude_credentials_reason_for_path(candidate)
-                if reason:
+                credential_reason = claude_credentials_reason_for_path(candidate)
+                if credential_reason:
+                    # Same carve-out logic for the path-typed credential
+                    # check: admin diagnostic Read of `.credentials.json`
+                    # (or any path resolved by `claude_credential_paths`)
+                    # is allowed and audited; mutations stay denied.
+                    if admin and read_intent:
+                        _emit_admin_credential_read_allowed(
+                            agent,
+                            tool=tool_name,
+                            surface="input_path",
+                            sample=str(candidate),
+                        )
+                        continue
+                    reason = credential_reason
                     break
 
         if reason is None:
             # Issue #383: Read / Glob / Grep / NotebookRead tools get the
             # read-intent allowance on protected paths. Edit / Write /
             # NotebookEdit and unknown tools stay write-intent.
-            read_intent = _is_read_intent_tool(tool_name, tool_input)
+            # `read_intent` was already classified above for the
+            # credential carve-out — reuse it.
             for key in ("file_path", "path"):
                 raw = str(tool_input.get(key) or "").strip()
                 if not raw:

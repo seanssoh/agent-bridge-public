@@ -244,7 +244,11 @@ select_for_path() {
       # for cross-agent reads is the v1 partial fix that v2's group
       # permission model supersedes; cover the v2 closure smoke so
       # changes to the allowlist don't silently regress the v2 path.
-      add_required hooks agent-update v2-cross-class-read
+      # v0.13.6 track 2: admin agent read-intent exemption pass on
+      # credential deny surfaces (raw mention, env dump, argv path,
+      # input path). Cover the regression smoke whenever tool-policy.py
+      # moves so the exemption + mutation deny contract stays pinned.
+      add_required hooks agent-update v2-cross-class-read admin-hook-exemption
       add_integration integration-minimal
       ;;
 
@@ -331,7 +335,12 @@ select_for_path() {
       # arg that switches to per-agent rendering; cover the regression.
       # Issue #613 — shared renderer now preserves operator-edited user
       # keys symmetrically with the isolated renderer.
-      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys
+      # v0.13.6 track 2: hooks/prompt-guard.py grew an admin
+      # warn-only carve-out for low/medium severity hits and reuses
+      # tool-policy's `is_admin_agent`. The admin-hook-exemption smoke
+      # covers both the prompt-guard branch and the tool-policy
+      # credential-deny exemption.
+      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption
       add_integration integration-minimal
       ;;
 
