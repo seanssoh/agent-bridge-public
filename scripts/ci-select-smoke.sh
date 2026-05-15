@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions admin-protocol-shared-link bridge-notify-no-default-discord-875
+  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872
 }
 
 add_all_integration() {
@@ -385,7 +385,22 @@ select_for_path() {
       # apply-live `find scripts/ -type d -exec chmod a+rX {} +` step
       # (R2). Pull the per-regression smoke whenever the upgrade entry
       # moves so the umask=077 dir normalization stays pinned.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions
+      # Issue #872 (v0.13.6 track 7): bridge_cleanup_render_summary's
+      # empty-stdin / invalid-payload degradation is invoked from
+      # bridge-upgrade.sh's [upgrade-complete] task body composer; pull
+      # its regression smoke in whenever the upgrade entry moves so the
+      # task body cannot regress to leaking raw JSONDecodeError text.
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-codex-pair telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872
+      add_integration integration-minimal
+      ;;
+
+    lib/bridge-cleanup.sh)
+      # Issue #872 (v0.13.6 track 7): the cleanup payload renderer must
+      # degrade gracefully on empty / invalid stdin so the
+      # [upgrade-complete] task body never contains a raw Python
+      # JSONDecodeError. Cover the regression whenever the cleanup lib
+      # moves.
+      add_required cleanup-payload-empty-stdin-872 upgrade telegram-relay-residue-cleanup
       add_integration integration-minimal
       ;;
 

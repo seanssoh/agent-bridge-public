@@ -66,14 +66,41 @@ bridge_cleanup_daily_backup_residue() {
 # Stdin: JSON cleanup payload from bridge_cleanup_daily_backup_residue.
 # Stdout: markdown block.
 bridge_cleanup_render_summary() {
-  python3 - <<'PY'
+  # Issue #872: previously this used `python3 - <<'PY' ... PY`, which makes
+  # the heredoc body itself python3's stdin (because `-` reads the script
+  # from stdin). That meant the caller's `printf '%s' "$CLEANUP_JSON" |
+  # bridge_cleanup_render_summary` pipe was inaccessible to the renderer
+  # — sys.stdin always returned empty and json.load surfaced
+  # JSONDecodeError verbatim into the [upgrade-complete] task body.
+  #
+  # Fix follows the post-#800 pattern in lib/bridge-init-default-crons.sh
+  # (see footgun #11 mitigation note there): write the python script to a
+  # tempfile and exec it with `python3 <tempfile>`, which leaves fd 0
+  # pointing at the caller's pipe so sys.stdin.read() actually sees the
+  # JSON payload. The renderer also degrades to friendly placeholders on
+  # empty or unparseable input instead of leaking the raw exception text.
+  local script_tmp
+  script_tmp="$(mktemp 2>/dev/null)" || {
+    printf '## Backup residue cleanup\n\n_Renderer could not allocate a temp file._\n'
+    return 0
+  }
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$script_tmp'" RETURN
+  cat >"$script_tmp" <<'PY'
 import json
 import sys
 
+raw = sys.stdin.read()
+if not raw.strip():
+    print("## Backup residue cleanup\n\n"
+          "_Cleanup helper returned empty payload (no work performed)._")
+    raise SystemExit(0)
+
 try:
-    data = json.load(sys.stdin)
-except Exception as exc:
-    print(f"## Backup residue cleanup\n\nCould not parse cleanup payload: {exc}")
+    data = json.loads(raw)
+except Exception:
+    print("## Backup residue cleanup\n\n"
+          "_Cleanup payload could not be parsed; see daemon logs for details._")
     raise SystemExit(0)
 
 stale = data.get("stale_tmp_removed") or []
@@ -124,6 +151,7 @@ if fails:
 
 print("\n".join(lines))
 PY
+  python3 "$script_tmp"
 }
 
 # Render the agent-safe verification block embedded in the [upgrade-complete]
