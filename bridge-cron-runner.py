@@ -1545,7 +1545,12 @@ def augmented_path() -> str:
     # #874: operator-provided extras win over built-in fallbacks so a host
     # with an unusual manager can short-circuit the lookup; both are still
     # filtered by is_dir() so a missing directory is silently skipped.
-    for candidate in (*cron_extra_path_dirs(), *COMMON_BIN_DIRS):
+    #
+    # codex r1 catch: `insert(0, entry)` prepends each iterated candidate to
+    # the front of the list, so the LAST iterated candidate ends up at PATH
+    # position 0 (highest precedence). To make extras win over COMMON_BIN_DIRS,
+    # iterate built-in fallbacks FIRST and extras LAST.
+    for candidate in (*COMMON_BIN_DIRS, *cron_extra_path_dirs()):
         entry = str(candidate)
         if candidate.is_dir() and entry not in seen:
             seen.add(entry)
