@@ -17,33 +17,20 @@ The function is invoked by the EXIT trap on non-zero exits — including
 pre-apply isolation-v2 aborts at bridge-upgrade.sh:1457-1469 — so a heredoc
 wedge there would mask the actual failure with a hang. Moved to a standalone
 file to remove the heredoc-stdin path.
+
+Body kept byte-for-byte (modulo this header docstring) with the prior heredoc
+at bridge-upgrade.sh:175-215 (v0.13.8) per codex r2 review on PR #894.
 """
 
-import json
-import sys
+import json, sys
 
-(
-    rc,
-    reason,
-    detail,
-    remediation,
-    source_version,
-    source_root,
-    source_ref,
-    source_head,
-    target_root,
-    channel,
-    target_ref,
-    target_version,
-    target_head,
-    dry_run,
-    iso_v2_json,
-) = sys.argv[1:16]
-
+(rc, reason, detail, remediation,
+ source_version, source_root, source_ref, source_head,
+ target_root, channel, target_ref, target_version, target_head,
+ dry_run, iso_v2_json) = sys.argv[1:16]
 
 def _or_none(s):
     return s if s else None
-
 
 def _load_json_str(s):
     if not s:
@@ -52,7 +39,6 @@ def _load_json_str(s):
         return json.loads(s)
     except (ValueError, TypeError):
         return {"_raw": s, "_parse_error": True}
-
 
 payload = {
     "mode": "upgrade",
