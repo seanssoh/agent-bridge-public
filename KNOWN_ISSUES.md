@@ -741,4 +741,4 @@ Stop hooks on macOS emit `[경고] write_agent_state_marker: ensure_matrix_path 
 
 ### Audit findings
 
-See `docs/audit-2026-05-15.md` for the full P0/P1/P2 catalog (31 bug-surface + 17 stability + 5 isolation-v2 buried-assumption + 10 refactor + 17 test/doc-drift findings). Each has an owner-stage in the stabilization plan.
+See `docs/audit-2026-05-15.md` for the full P0/P1/P2 catalog (31 bug-surface + 17 stability + 20 isolation-v2 top sites + 5 isolation-v2 buried-assumption + 10 refactor + 17 test/doc-drift findings). Each has an owner-stage in the stabilization plan.
