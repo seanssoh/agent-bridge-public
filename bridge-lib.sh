@@ -342,6 +342,11 @@ bridge_source_module "bridge-skills.sh"
 bridge_source_module "bridge-hooks.sh"
 bridge_source_module "bridge-channels.sh"
 bridge_source_module "bridge-state.sh"
+# S3 (v0.14.x stabilization): platform discriminator. Sourced BEFORE
+# bridge-isolation-v2.sh so the v2 module's Bucket 2 enforcement
+# gates can call `bridge_isolation_v2_enforce`. Depends on
+# bridge_host_platform from bridge-agents.sh (sourced above).
+bridge_source_module "bridge-isolation-discriminator.sh"
 bridge_source_module "bridge-isolation-v2.sh"
 # r12 codex catch (#782) — bridge-isolation-v2-reapply.sh defines
 # `bridge_isolation_v2_reapply_eligible_agents`, which the v2 matrix
