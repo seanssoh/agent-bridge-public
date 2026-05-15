@@ -9,19 +9,39 @@
 4. Use OrbStack VMs to verify each stage on Linux before next stage
 5. Discuss with `agb-dev-codex` when ambiguous; proceed only on complete agreement
 
-## Available Linux test infrastructure
+## Linux VM policy (codex-tightened)
+
+### Available now
 
 | VM | Distro | Bash | agb VERSION | Purpose |
 |---|---|---|---|---|
-| `agb-test` | Oracle Linux 9 (RedHat) | 5.1.8 | 0.8.4 | RedHat ecosystem + RHEL semantics; v0.8.4 → v0.14 leap testing |
-| `linux-systemd-test` | Debian bookworm | 5.2.15 | 0.8.5 | Debian ecosystem; systemd unit interaction |
+| `agb-test` | Oracle Linux 9 (RedHat) | 5.1.8 | 0.8.4 | **Leap fixture** — kept on v0.8.4 to verify v0.7.x → v0.13.x → v0.14 upgrade paths end-to-end |
+| `linux-systemd-test` | Debian bookworm | 5.2.15 | 0.8.5 | **Will be upgraded to v0.13.10 baseline** (S1 deliverable) — current-state Linux regression checks for each stage |
 
-Both VMs are useful for:
-- Per-stage Linux behavior verification (the macOS dev path can't catch Linux-only regressions)
-- Cross-distro coverage (RedHat vs Debian path differences)
-- v0.7.x → v0.13.x leap testing (predates the 4 hotfix cycles)
+### Required additions
 
-A future Bash 5.3.9 VM may be added to reproduce the exact bash version where patch host (operator's prod) hit footgun #11.
+| VM | Purpose | When required |
+|---|---|---|
+| New: `bash-539-test` (any distro, Bash 5.3.9) | Reproduce footgun #11 wedge env where patch host originally failed; mandatory before claiming any heredoc-class closure | Before S10-late (heredoc cleanup wave). Optional but recommended before S5 (platform discriminator) to confirm no regression. |
+
+### Per-stage VM verification matrix
+
+| Stage class | VM(s) required |
+|---|---|
+| Doc-only PR | None (CI runs lint/syntax) |
+| Code change touching macOS-specific paths only | macOS local + agb-test sanity check |
+| Code change touching Linux-specific paths | linux-systemd-test (current baseline) + agb-test (leap fixture) |
+| Heredoc / bash-stdin / upgrade-path code | linux-systemd-test + agb-test + bash-539-test |
+| Platform discriminator (S3, S5, S6) | linux-systemd-test + agb-test (both) |
+
+### Codex correction rationale
+
+The previous draft listed VMs as "useful for testing" with no policy. Codex flagged that:
+1. Outdated installs alone (v0.8.4, v0.8.5) can't represent current-state regression checks
+2. Bash 5.3.9 reproduction is mandatory before claiming footgun #11 closure
+3. Leap testing and current-state testing are distinct concerns
+
+This split keeps `agb-test` as the leap fixture and upgrades `linux-systemd-test` to v0.13.10 as the current baseline.
 
 ## Audit summary (2026-05-15)
 
@@ -59,20 +79,21 @@ A future Bash 5.3.9 VM may be added to reproduce the exact bash version where pa
 - **Hardening discipline**: `ci-select-smoke.sh` registration must be coupled to new-smoke PRs; Track A/B/C v0.13.10 r1 codex all caught it
 - **Doc drift**: ARCHITECTURE.md missing 9 lib/ modules added since v0.8.0; CLAUDE.md, OPERATIONS.md, KNOWN_ISSUES.md missing v0.13.7-v0.13.10 patch wave summary; README.md lacks version context
 
-## Version policy (operator directive)
+## Version policy (operator directive, codex-clarified)
 
-**Default**: stabilization changes do NOT bump VERSION or add CHANGELOG entries.
+**Stabilization PRs never bump VERSION or add CHANGELOG entries.** Even when a stabilization PR changes operator-visible behavior (e.g., clearer error on Bash 3.2, suppressed stop-hook noise), the individual PR does NOT cut a release. Instead:
 
-**Patch bumps** (v0.13.11, v0.13.12, ...): ONLY when operator-visible change ships
-- New CLI behavior
-- Bug fix that resolves a user-reported issue
-- Migration step required
+- **Release PR** (separate, batched): when the operator decides to ship a deploy-able tag, a release PR collects ALL operator-visible changes accumulated since the last release into ONE VERSION+CHANGELOG entry. The release PR is opened explicitly by the operator (or on operator's "ship" cue), not automatically per fix.
+- **Per-stage labels**: each stabilization PR header MUST state `release-impact: <none|user-visible|migration>`. Examples:
+  - S1 doc catch-up → `release-impact: none`
+  - S2 stale-env unblock → `release-impact: user-visible` (operators with leaked `BRIDGE_LAYOUT=legacy` see different behavior)
+  - S4 Bash 3.2 cleanup → `release-impact: user-visible` (clearer error)
+  - S5 platform discriminator → `release-impact: migration` (new env semantic)
+- **Release PR aggregation**: at release time, the release PR body lists all merged-since-last-release PRs with their `release-impact` labels. Only `user-visible` and `migration` items get a CHANGELOG bullet; `none` items are silently included for git-log completeness.
+- **Major-minor reservation**: v0.14.0 is reserved for the platform-discriminator semantic milestone (S5 completion). v0.14.1+ are reserved for post-v0.14.0 cleanup releases, NOT pre-allocated to specific stages (codex correction: previous draft pre-declared v0.14.1 for S6, which contradicts the "batch at deploy time" principle).
+- **What never bumps**: doc updates, test-only PRs, internal refactors with no behavior change, smoke coverage additions, lint fixes, ci-select-smoke registration follow-ups.
 
-**Minor bumps** (v0.14.0): ONLY when the platform-discriminator refactor completes (Bucket 2 + 3 gates fully landed). The minor bump signals a real semantic milestone, not accumulated patches.
-
-**No bumps for**: doc updates, test-only PRs, internal refactors with no behavior change, smoke coverage additions, lint fixes.
-
-This is a behavior change from the v0.13.x cycle where 4 patches in one day each got VERSION+CHANGELOG entries.
+This is a behavior change from the v0.13.x cycle where 4 patches in one day each got VERSION+CHANGELOG entries despite each cycle having only one operator-visible change (the leap unblock progression).
 
 ## Stage plan
 
@@ -94,42 +115,55 @@ Each stage:
 - Verify OrbStack VMs reachable
 - **Stage 0 completion criteria**: this doc on `main`
 
-**S1 — Doc catch-up (no code)**
+**S1 — Doc catch-up + audit ground truth (no code) [release-impact: none]**
 - ARCHITECTURE.md: add 9 missing lib/ modules
 - KNOWN_ISSUES.md: add "Fixed in v0.13.x wave" + "Outstanding v0.14.x" sections
 - CLAUDE.md: brief recent-patches note + `lib/upgrade-helpers/` pattern reference
 - OPERATIONS.md: consolidated v0.13.7-v0.13.10 hotfix wave operator follow-up
 - README.md: version context + leap path warning
+- **NEW MANDATORY DELIVERABLE**: `docs/audit-2026-05-15.md` archiving raw findings with structured rows: `id | severity (P0/P1/P2) | category | file:line | one-line | risk | owner-stage | status`. Covers the 14 P1 bug-surface + 6 P1 stability + 18 deferred python heredoc sites + isolation-v2 top-20 list. Without this, subsequent sessions cannot pick up from this plan alone (codex correction: the previous draft left audit details in conversation-only state which is not durable).
 - No VERSION bump
 - Linux VM: not strictly required (no code change), but smoke runs still pass
-- Single PR: `docs/v0.13.x-catchup-and-stabilization-plan`
+- Single PR: `docs/v0.13.x-catchup-and-audit-archive`
 
-**S2 — macOS isolation noise fix (small code change)**
-- Sean's stop-hook warning: `[경고] write_agent_state_marker: ensure_matrix_path failed for agent=... marker=idle-since`
-- Add macOS early-return to `bridge_isolation_v2_ensure_matrix_path` (lib/bridge-isolation-v2.sh:1772)
-- Add the same gate to `bridge_isolation_v2_apply_row` for setgid-related operations
-- Smoke: new `scripts/smoke/isolation-v2-macos-noise-suppression.sh` (1 test on Darwin)
-- Linux VM verification: agb-test smoke run (verify no regression to Linux enforcement)
-- No VERSION bump (operator-internal noise; not a CLI behavior change)
-- PR: `fix/isolation-v2-macos-quiet`
+**S2 — Operator-visible blockers: macOS noise + stale BRIDGE_LAYOUT=legacy env unblock [release-impact: user-visible]**
 
-**S3 — Platform discriminator foundation (medium)**
+Two narrowly-scoped operator-visible fixes (codex flagged the second as a current CLI blocker — codex itself hit it running the consensus check via `agb inbox`):
+
+1. **macOS isolation-v2 matrix-path noise**:
+   - Sean's stop-hook warning: `[경고] write_agent_state_marker: ensure_matrix_path failed for agent=... marker=idle-since`
+   - Add macOS early-return to `bridge_isolation_v2_ensure_matrix_path` (lib/bridge-isolation-v2.sh:1772)
+   - Add the same gate to `bridge_isolation_v2_apply_row` for setgid-related operations
+   - Smoke: new `scripts/smoke/isolation-v2-macos-noise-suppression.sh` (1 test on Darwin)
+
+2. **`BRIDGE_LAYOUT=legacy` env leak demoted from hard-die to warning**:
+   - Currently `lib/bridge-layout-resolver.sh:140` hard-dies when env says `legacy` even if marker says `v2`
+   - This is the leak that bit Sean's session AND codex's consensus check
+   - Fix: when marker exists and is valid v2 but env says `legacy`, log warning and prefer marker
+   - Smoke: new `scripts/smoke/layout-resolver-marker-over-env.sh` (3 cases: env=legacy + marker=v2 → use marker; env=v2 + no marker → use env; env+marker both set + agree → use marker)
+
+S2 is hard-coded to these two narrow operator-visible blockers, NOT a general discriminator (that's S3's scope per codex correction).
+
+- Linux VM verification: agb-test (sanity check that Linux enforcement still works) + linux-systemd-test (verify env-leak fix doesn't break v2-marker installs)
+- PR: `fix/operator-visible-isolation-v2-blockers-s2`
+
+**S3 — Platform discriminator foundation (medium) [release-impact: migration]**
 - New `lib/bridge-isolation-discriminator.sh` with the 3 predicates from Audit C
-- Wire S2's hardcoded gate into the discriminator
+- Re-wire S2's hardcoded gates into the discriminator
 - 1-2 additional Bucket 2 sites converted as proof
 - New smoke `scripts/smoke/isolation-v2-platform-discriminator.sh`
 - ci-select-smoke registration
 - Linux VM: agb-test + linux-systemd-test (both)
-- No VERSION bump (still no user-facing change)
 - PR: `feat/isolation-v2-platform-discriminator`
 
-**S4 — Bash 3.2 re-exec removal (small refactor)**
-- Remove the 30-line Bash 4 candidate re-exec from bridge-lib.sh + bootstrap-memory-system.sh + 8 test scripts
-- Replace with `[[ ${BASH_VERSINFO[0]} -lt 4 ]] && bridge_die "Bash 4+ required"`
-- Verify on Linux VM (Bash 5.x default, should be no-op)
-- Verify on macOS (`/opt/homebrew/bin/bash`, Bash 4+, should be no-op)
-- No VERSION bump (operator behavior unchanged unless they were stuck on Bash 3.2, in which case the new error is clearer)
-- PR: `chore/remove-bash-3.2-re-exec`
+**S4 — Bash 3.2 re-exec removal — DEFERRED to post-S5 [release-impact: user-visible]**
+
+Per codex correction: removing the Bash 3.2 re-exec is NOT pure cleanup. The re-exec is currently a load-bearing entry shim — operators on macOS who invoke `bridge-lib.sh` via system `/bin/bash` (Bash 3.2) reach a Bash 4+ candidate via the shim. Removing the shim changes the failure mode for those operators (clear error instead of working-via-detection). This is operator-visible and must wait until:
+1. S5 platform-discriminator is stable on main
+2. Operator docs (README, OPERATIONS) explicitly require Bash 4+ at install time
+3. Codex checkpoint before dispatch (compatibility proof: any prod path still reaching via Bash 3.2 should be enumerated)
+
+Move S4 to AFTER S5. New numbering: original S4 becomes S5.5 (post-discriminator, pre-Bucket-2-finalize cleanup).
 
 **S5 — Bucket 2 enforcement gates (multi-track wave)**
 - 140 Linux-only enforcement sites gate-wrap with `bridge_isolation_v2_enforce()`
@@ -140,11 +174,11 @@ Each stage:
 - VERSION bump: v0.14.0 (this is the platform-discriminator semantic milestone)
 - PR: per-track + bundle release
 
-**S6 — Bucket 3 contract errors + Bucket 4 splits (multi-track)**
+**S6 — Bucket 3 contract errors + Bucket 4 splits (multi-track) [release-impact: migration]**
 - 35 Bucket 3 sites get `bridge_isolation_v2_require_linux()` early-error
 - 55 Bucket 4 mixed sites get function-split refactor
 - Track E: docs (OPERATIONS.md upgrade-on-macOS section; KNOWN_ISSUES.md updates)
-- VERSION: v0.14.1 (post-v0.14.0 cleanup)
+- VERSION: NO pre-allocation. The next release PR after S5 v0.14.0 will batch any user-visible items from S6+. Codex correction: do NOT pre-declare v0.14.1 for cleanup; that contradicts the "batch at deploy time" policy.
 
 **S7 — Audit A P1 cleanup wave**
 - Silent error swallowing fixes (daemon state, marker writes)
@@ -169,10 +203,24 @@ Each stage:
 - Naming consolidation (`bridge_isolation_v2_*` → `bridge_marker_isolation_*`)
 - Multi-cycle effort; pick 1-2 per cycle to avoid disruption
 
-**S10 — Bash heredoc-stdin ban lint + remaining 18 sites**
-- Add a custom lint rule or shellcheck wrapper rejecting `<<EOF`/`<<'PY'` to subprocess in bridge-upgrade.sh
-- Migrate the remaining 18 deferred python heredoc sites (post-apply / alternate subcommand paths)
-- VERSION: no bump (defensive cleanup)
+**S10 — Bash heredoc-stdin ban lint + remaining 18 sites [release-impact: none]**
+
+Per codex correction: S10 was too late if broad stabilization touches upgrade-adjacent code first.
+
+**Split into two phases**:
+
+- **S10-early (BEFORE S4 / before any upgrade-adjacent stabilization touches bridge-upgrade.sh)**:
+  - Lint-only guard: add a grep-based pre-commit / CI check rejecting NEW `<<EOF`/`<<'PY'` heredoc-stdin patterns in bridge-upgrade.sh
+  - Existing 18 deferred sites grandfathered with an inline `# heredoc-grandfathered` annotation
+  - No code migration yet — just regression prevention
+  - Goal: prevent stabilization stages from accidentally creating new footgun #11 sites
+
+- **S10-late (after S6, defensive cleanup wave)**:
+  - Migrate the 18 grandfathered sites to standalone helpers under `lib/upgrade-helpers/` (extends v0.13.9 pattern)
+  - Per-site verification on Bash 5.3.9 VM (see VM policy)
+  - Drop grandfather annotations as sites move
+
+- Requires Bash 5.3.9 VM (see §"Linux VM policy") before S10-late dispatch — codex flagged this as the only way to claim footgun #11 closure rigorously.
 
 ## Codex consensus checkpoints
 
