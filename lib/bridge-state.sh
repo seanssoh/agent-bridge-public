@@ -1049,10 +1049,15 @@ bridge_load_roster() {
   # this window so a chronically-full disk doesn't burn one tarball
   # attempt per daemon cycle. One warn + one audit per window.
   : "${BRIDGE_DAILY_BACKUP_FAILURE_COOLDOWN_SECONDS:=3600}"
+  # Issue #745: daily-backup walk+tar+gzip timeout. Default 300s (was
+  # hardcoded 120s in bridge-daemon.sh) so installs with ~1.4GB+ tarballs
+  # don't trip the timeout. Raise further for very large installs.
+  : "${BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS:=300}"
   # Bug #507 (concurrency): grace window for stale tmp reaping. Should
-  # exceed the daemon-side bridge_with_timeout ceiling (120s) plus
-  # buffer; default 180s = 120 + 60.
-  : "${BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS:=180}"
+  # exceed the daemon-side BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS ceiling
+  # plus buffer; default 360s = 300 + 60 (was 180s = 120 + 60 before
+  # #745 timeout bump).
+  : "${BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS:=360}"
   # Daily-backup exclude roots additive to the hardcoded list in
   # bridge-upgrade.py (logs/, worktrees/, runtime/{assets,media,extensions},
   # .claude/worktrees/, state/backup-snapshots/). Colon- or comma-separated.
