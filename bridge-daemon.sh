@@ -1089,7 +1089,7 @@ process_usage_monitor() {
   # controller's $HOME. Default scope mirrors bridge-auth.sh sync (static
   # Claude roster). Operators can broaden via BRIDGE_USAGE_MONITOR_AGENTS.
   local usage_monitor_agents_scope="${BRIDGE_USAGE_MONITOR_AGENTS:-static}"
-  if ! monitor_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-usage.sh" monitor --json --agents "$usage_monitor_agents_scope" 2>/dev/null)"; then
+  if ! monitor_json="$(bridge_with_timeout 30 daemon_usage_monitor "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-usage.sh" monitor --json --agents "$usage_monitor_agents_scope" 2>/dev/null)"; then
     bridge_note_usage_poll
     return 1
   fi
@@ -1151,7 +1151,7 @@ process_usage_monitor() {
     # Rotate only once per monitor pass; bridge-usage.py already latches each
     # provider/account/window candidate once per usage reset cycle.
     (( rotation_count > 0 )) && continue
-    rotate_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
+    rotate_json="$(bridge_with_timeout 20 daemon_auth_token_rotate "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token rotate \
       --if-auto-enabled \
       --sync \
       --agents "$rotation_agent_scope" \
@@ -1275,7 +1275,7 @@ bridge_daemon_periodic_token_sync_tick() {
   file="$(bridge_daemon_periodic_token_sync_state_file)"
   now="$(date +%s)"
 
-  if sync_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync \
+  if sync_json="$(bridge_with_timeout 15 daemon_auth_token_sync "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync \
       --agents "$agent_scope" --json 2>/dev/null)"; then
     # 5s ceiling — pure JSON parse + dict lookup; rc=124|137 leaves
     # sync_status empty and the surrounding audit_log captures sync_status=""
@@ -1364,7 +1364,7 @@ process_claude_token_recovery() {
   bridge_note_claude_token_recovery_poll
 
   if [[ "$sync_recommended" == "1" ]]; then
-    sync_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync --agents "$agent_scope" --json 2>/dev/null || true)"
+    sync_json="$(bridge_with_timeout 15 daemon_auth_token_sync_recovery "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-auth.sh" claude-token sync --agents "$agent_scope" --json 2>/dev/null || true)"
     # Issue #800 regression follow-up: sync-status extractor moved into the
     # helper subcommand. 5s ceiling — single dict lookup; rc=124|137 leaves
     # sync_status empty and the surrounding audit_log captures sync_status=""
@@ -2615,7 +2615,7 @@ process_watchdog_report() {
   if ! "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-watchdog.sh" scan >"$report_file"; then
     return 1
   fi
-  if ! report_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-watchdog.sh" scan --json 2>/dev/null)"; then
+  if ! report_json="$(bridge_with_timeout 30 daemon_watchdog_scan "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-watchdog.sh" scan --json 2>/dev/null)"; then
     return 1
   fi
   # Issue #800 Track A: heredoc-stdin → helper subcommand wrapped by
@@ -3555,7 +3555,7 @@ bridge_report_plugin_liveness_miss() {
   # Preserve the role's configured continue policy. For static Claude roles,
   # forcing --no-continue here destroys the session continuity that the roster
   # or persisted history would otherwise restore.
-  if restart_output="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" agent restart "$agent" 2>&1)"; then
+  if restart_output="$(bridge_with_timeout 10 daemon_agent_restart_mcp "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" agent restart "$agent" 2>&1)"; then
     bridge_audit_log daemon plugin_mcp_liveness_restart "$agent" \
       --detail missing_channels="$missing" \
       --detail session="$session" \
@@ -5219,7 +5219,7 @@ process_memory_daily_orphan_sweep() {
   bridge_load_roster
 
   local jobs_json
-  jobs_json="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-cron.sh" list --json 2>/dev/null || true)"
+  jobs_json="$(bridge_with_timeout 5 daemon_cron_list "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-cron.sh" list --json 2>/dev/null || true)"
   [[ -n "$jobs_json" ]] || return 1
 
   # Parse memory-daily orphans out of the cron list JSON.
