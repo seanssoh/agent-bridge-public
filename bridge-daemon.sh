@@ -4981,6 +4981,23 @@ process_on_demand_agents() {
         fi
       fi
       if ((( always_on == 1 ))) && ! bridge_agent_is_active "$agent"; then
+        # Engine-binary preflight: if the agent's engine CLI is absent
+        # from PATH, every restart attempt will exit 127 within
+        # milliseconds and the daemon would spam
+        # `[경고] always-on auto-start failed: <agent>` until backoff
+        # caps at 300s. Skip the attempt entirely and record the
+        # failure once per backoff window. Operator log: `daemon_info`
+        # (not bridge_warn) since this is an install-state issue,
+        # not a daemon bug.
+        local _agent_engine
+        _agent_engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+        if [[ -n "$_agent_engine" ]] && ! command -v "$_agent_engine" >/dev/null 2>&1; then
+          bridge_daemon_note_autostart_failure "$agent" "engine-cli-missing:$_agent_engine"
+          daemon_info "auto-start skipped ${agent} — engine CLI '$_agent_engine' not on PATH"
+          unset _agent_engine
+          continue
+        fi
+        unset _agent_engine
         if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
           session="$(bridge_agent_session "$agent")"
           sleep 1
