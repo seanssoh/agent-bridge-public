@@ -280,6 +280,16 @@ if [[ "$RESTART_DAEMON" == "1" ]]; then
   if [[ "$DRY_RUN" == "1" ]]; then
     printf '[dry-run] bash %s/bridge-daemon.sh stop --force\n' "$TARGET_ROOT"
     printf '[dry-run] bash %s/bridge-daemon.sh ensure\n' "$TARGET_ROOT"
+  elif [[ ! -f "$TARGET_ROOT/state/layout-marker.sh" ]]; then
+    # Clean install path: layout-marker.sh hasn't been written yet
+    # (bridge-bootstrap.sh writes it on first run). Skipping daemon
+    # restart here — the bootstrap step that follows is the canonical
+    # marker-writer + first daemon-start. Without this skip,
+    # bridge-daemon.sh ensure would source bridge-lib.sh, which would
+    # hard-die in bridge_layout_resolver_init at
+    # `markerless(fresh-install-candidate)` because the bypass nonce
+    # is not armed for this subprocess.
+    DAEMON_RESTART_SKIPPED=1
   else
     # --force: deploy-live-install is a sanctioned daemon stop+restart path
     # and must not be blocked by the #314/#315 active-agent guard.
@@ -297,4 +307,8 @@ if [[ "$DRY_RUN" == "0" ]]; then
   printf 'verified_files: %s\n' "$VERIFIED_COUNT"
   printf 'upgrade_state_written: %s\n' "$([[ "$UPGRADE_STATE_WRITTEN" == "1" ]] && printf yes || printf no)"
 fi
-printf 'daemon_restarted: %s\n' "$([[ "$RESTART_DAEMON" == "1" ]] && printf yes || printf no)"
+if [[ "${DAEMON_RESTART_SKIPPED:-0}" == "1" ]]; then
+  printf 'daemon_restarted: skipped-fresh-install\n'
+else
+  printf 'daemon_restarted: %s\n' "$([[ "$RESTART_DAEMON" == "1" ]] && printf yes || printf no)"
+fi

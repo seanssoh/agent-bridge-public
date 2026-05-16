@@ -82,9 +82,19 @@ bridge_layout_resolver_has_existing_evidence() {
   fi
 
   if [[ -d "$home/agents" ]]; then
-    local entry
+    local entry name
     for entry in "$home/agents"/*/; do
       [[ -d "$entry" ]] || continue
+      # Skip non-agent reserved entries — names starting with `_` or `.`
+      # are documentation / template dirs (e.g. `_template/` for fresh
+      # agent scaffolding, `_shared/` for cross-agent assets) that ship
+      # with every fresh source checkout. Clean install would otherwise
+      # be misclassified as `markerless(existing-install)` and hard-die
+      # on first bootstrap.
+      name="$(basename "${entry%/}")"
+      case "$name" in
+        _*|.*) continue ;;
+      esac
       # Non-empty agent home directory (CLAUDE.md, settings.json, etc.).
       if compgen -G "$entry"'*' >/dev/null 2>&1; then
         return 0
