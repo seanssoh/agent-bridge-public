@@ -134,11 +134,13 @@ git checkout v0.14.0
 
 For per-stage detail, see `CHANGELOG.md` `[0.14.0]`. For the stabilization roadmap, see `docs/stabilization-plan-2026-05-15.md` + `docs/audit-2026-05-15.md`.
 
-### v0.13.x hotfix wave (2026-05-15) — operator follow-up
+### v0.13.x hotfix wave (2026-05-15) — historical context
 
-If you're upgrading from any v0.7.x install, target v0.13.10 or later. The v0.13.7-v0.13.10 cycle fixed a four-stage `agent-bridge upgrade --apply` blocker that affected the v0.7.x → v0.13.x leap on Bash 5.3.9 hosts (matched by recent Linux distros). Operators on macOS were similarly affected by a markerless-existing-install layout reject.
+**Current recommendation**: upgrade directly to v0.14.0 (see the v0.14.0 section above). This section is preserved for operators pinned below v0.14.0 (e.g., post-v0.13.10 staging environments waiting for v0.14.0 acceptance) and as historical context for the leap-path blockers that v0.13.7-v0.13.10 resolved.
 
-**Recommended upgrade path**:
+The v0.13.7-v0.13.10 cycle fixed a four-stage `agent-bridge upgrade --apply` blocker that affected the v0.7.x → v0.13.x leap on Bash 5.3.9 hosts (matched by recent Linux distros). Operators on macOS were similarly affected by a markerless-existing-install layout reject. v0.14.0 carries those fixes forward — operators can leap directly from v0.7.x/v0.8.x/v0.9.x/v0.10.x/v0.11.x/v0.12.x to v0.14.0 in a single `agent-bridge upgrade --apply` step.
+
+**Minimum-safe fallback upgrade path** (only if pinning below v0.14.0):
 
 ```bash
 cd <source-checkout>
@@ -147,7 +149,7 @@ git checkout v0.13.10
 ./agent-bridge upgrade --apply
 ```
 
-Expected behavior (post-v0.13.10):
+Expected behavior (post-v0.13.10, also covered by v0.14.0):
 - No hang on any of the four heredoc-class wedge points (read_comsub / heredoc_write variants resolved)
 - Markerless-existing-install case: marker-only fast-path fires automatically when the roster has no isolated agents in the linux-user sense. No sudo required. Works on macOS, Linux, BSD.
 - `isolation-v2 migrate result`: should show `"reason":"marker-only-no-isolated-roster"` for typical v0.7.x → v0.13.10 paths.
