@@ -222,6 +222,87 @@ notify_task_requester() {
   bridge_dispatch_notification "$creator" "$TASK_TITLE" "$notice_message" "$TASK_ID" "$TASK_PRIORITY" || true
 }
 
+# notify_task_blocker
+#
+# Issue #697 — mirror of notify_task_requester for the claimed→blocked
+# transition. Inserts a `[task-blocked] task #<id>: <title>` task addressed
+# to the original requester so a dispatcher-style agent (e.g. `patch`) sees
+# the block in its inbox instead of having to poll the worker's tmux pane.
+#
+# Idempotency: the title format `[task-blocked] task #<id>:` is unique per
+# original task; we query find-open with that prefix and bail if a
+# notification already exists, so re-blocking the same task (or repeated
+# blocked refresh updates) does not duplicate.
+notify_task_blocker() {
+  local task_id="$1"
+  local actor="$2"
+  local note="$3"
+  local note_file="$4"
+  local TASK_ID=""
+  local TASK_TITLE=""
+  local TASK_CREATED_BY=""
+  local TASK_PRIORITY=""
+  local creator
+  local creator_engine=""
+  local blocked_title=""
+  local blocked_body=""
+  local notice_message=""
+  local existing_id=""
+  local ORIG_TASK_ID=""
+  local ORIG_TASK_TITLE=""
+  local ORIG_TASK_PRIORITY=""
+
+  ensure_roster_loaded
+  bridge_queue_source_shell show "$task_id" --format shell
+
+  creator="$TASK_CREATED_BY"
+  [[ -n "$creator" ]] || return 0
+  [[ "$creator" != "$actor" ]] || return 0
+  bridge_agent_exists "$creator" || return 0
+  # Never auto-notify on a notification task — guards against loops if a
+  # requester ever ends up claiming + blocking the [task-blocked] task we
+  # just inserted for them.
+  [[ "$TASK_TITLE" == \[task-blocked\]* ]] && return 0
+  [[ "$TASK_TITLE" == \[task-complete\]* ]] && return 0
+  creator_engine="$(bridge_agent_engine "$creator")"
+
+  ORIG_TASK_ID="$TASK_ID"
+  ORIG_TASK_TITLE="$TASK_TITLE"
+  ORIG_TASK_PRIORITY="$TASK_PRIORITY"
+
+  blocked_title="[task-blocked] task #${ORIG_TASK_ID}: ${ORIG_TASK_TITLE}"
+
+  # Idempotency check — re-blocking the same task (or any subsequent
+  # blocked refresh) must not create a duplicate notification. Use the
+  # title prefix `[task-blocked] task #<id>:` which is unique per
+  # original task.
+  existing_id="$(bridge_queue_cli find-open --agent "$creator" --title-prefix "[task-blocked] task #${ORIG_TASK_ID}:" --format id 2>/dev/null || true)"
+  if [[ -n "$existing_id" ]]; then
+    return 0
+  fi
+
+  blocked_body="blocked_by: ${actor}"
+  blocked_body+=$'\n'"original_task: #${ORIG_TASK_ID}"
+  blocked_body+=$'\n'"inspect: agb show ${ORIG_TASK_ID}"
+  if [[ -n "$note" ]]; then
+    blocked_body+=$'\n\n'"block_reason:"$'\n'"${note}"
+  elif [[ -n "$note_file" ]]; then
+    blocked_body+=$'\n'"block_reason_file: ${note_file}"
+  fi
+
+  TASK_ID=""
+  TASK_TITLE=""
+  TASK_PRIORITY=""
+  bridge_queue_source_shell create --to "$creator" --title "$blocked_title" --from bridge --priority "$ORIG_TASK_PRIORITY" --body "$blocked_body" --format shell
+
+  if [[ "$creator_engine" != "claude" ]] && ! bridge_agent_is_active "$creator"; then
+    return 0
+  fi
+
+  notice_message="agb inbox ${creator}"
+  bridge_dispatch_notification "$creator" "$TASK_TITLE" "$notice_message" "$TASK_ID" "$TASK_PRIORITY" || true
+}
+
 cmd_create() {
   local target=""
   local title=""
@@ -542,6 +623,12 @@ cmd_done() {
 cmd_update() {
   local task_id=""
   local actor=""
+  local new_status=""
+  local note_arg=""
+  local note_file_arg=""
+  local prior_status=""
+  local TASK_STATUS=""
+  local i
 
   task_id="${1:-}"
   shift || true
@@ -549,7 +636,57 @@ cmd_update() {
 
   actor="$(infer_actor_if_possible "")"
 
+  # Issue #697 — peek at --status / --note / --note-file / --actor so we
+  # can auto-notify the requester on a claimed→blocked transition. We do
+  # not consume the args; the queue CLI still receives them unchanged
+  # (argparse uses the last --actor when both are present, matching this
+  # peek).
+  local -a update_args=("$@")
+  local total="${#update_args[@]}"
+  i=0
+  while (( i < total )); do
+    case "${update_args[$i]}" in
+      --status)
+        (( i + 1 < total )) && new_status="${update_args[$((i + 1))]}"
+        ;;
+      --status=*)
+        new_status="${update_args[$i]#--status=}"
+        ;;
+      --note)
+        (( i + 1 < total )) && note_arg="${update_args[$((i + 1))]}"
+        ;;
+      --note=*)
+        note_arg="${update_args[$i]#--note=}"
+        ;;
+      --note-file)
+        (( i + 1 < total )) && note_file_arg="${update_args[$((i + 1))]}"
+        ;;
+      --note-file=*)
+        note_file_arg="${update_args[$i]#--note-file=}"
+        ;;
+      --actor)
+        (( i + 1 < total )) && actor="${update_args[$((i + 1))]}"
+        ;;
+      --actor=*)
+        actor="${update_args[$i]#--actor=}"
+        ;;
+    esac
+    i=$((i + 1))
+  done
+
+  # Snapshot prior status only when a blocked-notify is plausible, so the
+  # extra `show` round-trip is paid only on the relevant code path.
+  if [[ "$new_status" == "blocked" ]] && { [[ -n "$note_arg" ]] || [[ -n "$note_file_arg" ]]; }; then
+    if bridge_queue_source_shell show "$task_id" --format shell 2>/dev/null; then
+      prior_status="$TASK_STATUS"
+    fi
+  fi
+
   bridge_queue_cli update "$task_id" --actor "$actor" "$@"
+
+  if [[ "$new_status" == "blocked" ]] && [[ "$prior_status" == "claimed" ]] && { [[ -n "$note_arg" ]] || [[ -n "$note_file_arg" ]]; }; then
+    notify_task_blocker "$task_id" "$actor" "$note_arg" "$note_file_arg"
+  fi
 }
 
 cmd_cancel() {
