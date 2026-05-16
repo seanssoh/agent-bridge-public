@@ -132,10 +132,36 @@ fi
 # Add new options carefully — false-positive on Claude's own output is the
 # main failure mode. Prefer expanding the option enumeration to a whole new
 # regex only if Anthropic ships a new picker shape.
+#
+# 2026-05-16 additions (post-v0.14.1 ship E2E):
+#   - "I am using this for local development" — Claude Code's development-
+#     channels warning that blocks agent launch when channels env carries
+#     a development plugin. Default cursor `❯ 1` is on this option, so a
+#     bare Enter accepts and continues. Discovered when patch was stuck
+#     post-v0.14.1 upgrade with development-channels warning visible.
+#   - "Press enter to continue" — codex CLI's cwd-confirm prompt. Different
+#     shape from Claude's numbered picker (single confirmation line, no
+#     options). Has its own regex below (_PICKER_CODEX_CONFIRM_RE).
+#
+# NOT added (intentionally):
+#   - "Yes, I accept" / "No, exit" (Bypass Permissions warning) — Claude's
+#     default cursor is on "No, exit" (option 1). A bare Enter would EXIT
+#     Claude on first launch. Needs explicit "send 2 + Enter" support
+#     before adding. Operator must accept this warning interactively
+#     once per host; the result is persisted in Claude Code's local
+#     settings so subsequent launches skip the warning.
 # ---------------------------------------------------------------------------
 
-_PICKER_OPTION_LINE_RE='^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.[[:space:]]+(Stop and wait for limit to reset|Switch to extra usage|Switch to Team plan|Resume from summary \(recommended\)|Resume full session as-is)[[:space:]]*$'
+_PICKER_OPTION_LINE_RE='^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.[[:space:]]+(Stop and wait for limit to reset|Switch to extra usage|Switch to Team plan|Resume from summary \(recommended\)|Resume full session as-is|I am using this for local development)[[:space:]]*$'
 _PICKER_TAIL_RE='^[[:space:]]*Enter to confirm · Esc to cancel[[:space:]]*$'
+
+# Codex picker shape — fundamentally different from Claude's. Codex emits
+# a single "Press enter to continue" line (no numbered options) when
+# confirming the working directory at launch. Auto-Enter is safe because
+# there's only one action path. Added 2026-05-16 after codex patch-dev
+# was blocked at the cwd-confirm prompt during the v0.13.x → v0.14.1
+# upgrade supervise flow.
+_PICKER_CODEX_CONFIRM_RE='^[[:space:]]*Press enter to continue[[:space:]]*$'
 
 # ---------------------------------------------------------------------------
 # Test seams. The smoke replaces these with fixture-driven wrappers.
@@ -203,6 +229,10 @@ while IFS= read -r agent; do
         else
             matched_pattern="picker option line"
         fi
+    elif printf '%s\n' "$cap" | grep -qE "$_PICKER_CODEX_CONFIRM_RE"; then
+        # Codex cwd-confirm picker (single "Press enter to continue" line,
+        # no numbered options). Safe to auto-Enter — only one action path.
+        matched_pattern="codex cwd-confirm"
     fi
 
     if [[ -n "$matched_pattern" ]]; then
