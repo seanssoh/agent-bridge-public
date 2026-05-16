@@ -17,7 +17,7 @@ log_audit "$JOB" "starting $JOB" >/dev/null
 
 trap 'file_failure_task "$JOB" "$LOG"' ERR
 
-REPORT_JSON="$(mktemp -t wiki-repair-links.XXXXXX.json)"
+REPORT_JSON="$(mktemp "${TMPDIR:-/tmp}/wiki-repair-links.json.XXXXXX")"
 # shellcheck disable=SC2064
 trap "rm -f '$REPORT_JSON'; file_failure_task '$JOB' '$LOG'" ERR
 

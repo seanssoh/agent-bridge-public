@@ -97,7 +97,7 @@ write_watermark_atomic() {
 # Lane A — daily-note byte-replica copy (no librarian involvement)
 # -------------------------------------------------------------------------
 
-COPY_JSON="$(mktemp -t wiki-daily-copy.XXXXXX.json)"
+COPY_JSON="$(mktemp "${TMPDIR:-/tmp}/wiki-daily-copy.json.XXXXXX")"
 # shellcheck disable=SC2064
 trap "rm -f '$COPY_JSON'" EXIT
 
@@ -200,7 +200,7 @@ if [[ "${BRIDGE_LAYOUT:-legacy}" == "v2" \
     exit 2
   fi
 
-  _lane_b_stderr="$(mktemp -t wiki-daily-ingest.agb-stderr.XXXXXX)"
+  _lane_b_stderr="$(mktemp "${TMPDIR:-/tmp}/wiki-daily-ingest.agb-stderr.XXXXXX")"
 
   agent_list_json="$("$BRIDGE_AGB" agent list --json 2>"$_lane_b_stderr")"
   agb_exit=$?

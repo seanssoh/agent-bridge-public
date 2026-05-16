@@ -51,7 +51,7 @@ echo "[smoke:${SMOKE_NAME}] starting"
 # itself is not polluted by sourcing bridge-core. We use a here-doc
 # bash invocation (NOT heredoc-stdin to a captured subprocess, so the
 # footgun #11 chain is avoided) and write the result to a tmpfile.
-TMP_OUT="$(mktemp -t agb-prefix.XXXXXX)"
+TMP_OUT="$(mktemp "${TMPDIR:-/tmp}/agb-prefix.XXXXXX")"
 trap 'rm -f "$TMP_OUT"' EXIT
 
 PREFIX_DRIVER="$SCRIPT_DIR/bridge-export-prefix-no-stale-layout-driver.sh"

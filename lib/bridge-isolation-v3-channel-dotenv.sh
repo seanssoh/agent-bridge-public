@@ -486,9 +486,9 @@ bridge_isolation_v3_channel_dotenv_cli() {
   fi
 
   local actions_file errors_file
-  actions_file="$(mktemp -t agb-isolation-v3-actions.XXXXXX)" \
+  actions_file="$(mktemp "${TMPDIR:-/tmp}/agb-isolation-v3-actions.XXXXXX")" \
     || bridge_die "migrate isolation v3: cannot create temp actions file"
-  errors_file="$(mktemp -t agb-isolation-v3-errors.XXXXXX)" \
+  errors_file="$(mktemp "${TMPDIR:-/tmp}/agb-isolation-v3-errors.XXXXXX")" \
     || bridge_die "migrate isolation v3: cannot create temp errors file"
   # shellcheck disable=SC2064
   trap "rm -f '$actions_file' '$errors_file'" RETURN

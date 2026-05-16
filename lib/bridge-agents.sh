@@ -307,7 +307,7 @@ USAGE
   # the smoke fixture with 3 fixture worktrees plus merge commits. A
   # temp file decouples the producer from the read loop entirely.
   local porcelain_tmp
-  porcelain_tmp="$(mktemp -t bridge-worktree-doctor.XXXXXX)"
+  porcelain_tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-worktree-doctor.XXXXXX")"
   printf '%s\n' "$porcelain" >"$porcelain_tmp"
 
   local wt_path="" wt_branch="" line

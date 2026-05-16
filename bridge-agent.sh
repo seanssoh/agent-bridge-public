@@ -3607,7 +3607,7 @@ PY
   if [[ $orphan_tasks -eq 1 && "$open_count" -gt 0 && -f "$BRIDGE_TASK_DB" ]]; then
     bridge_require_python
     local _orphan_err
-    _orphan_err="$(mktemp -t agb-orphan-err.XXXXXX)"
+    _orphan_err="$(mktemp "${TMPDIR:-/tmp}/agb-orphan-err.XXXXXX")"
     if ! python3 - "$BRIDGE_TASK_DB" "$agent" "agent retired via 'agent delete'" <<'PY' 2>"$_orphan_err"
 import sqlite3
 import sys

@@ -269,7 +269,7 @@ _bridge_wave_dispatch_member() {
   fi
 
   local spawn_log
-  spawn_log="$(mktemp -t "wave-spawn-${member_id}.XXXXXX")"
+  spawn_log="$(mktemp "${TMPDIR:-/tmp}/wave-spawn-${member_id}.XXXXXX")"
 
   local ab_bin="$BRIDGE_SCRIPT_DIR/agent-bridge"
   if [[ ! -x "$ab_bin" ]]; then

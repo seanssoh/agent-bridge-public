@@ -320,7 +320,7 @@ bridge_upgrade_capture_to_var() {
   local _bucv_var="$1"
   shift
   local _bucv_tmp _bucv_rc=0
-  _bucv_tmp="$(mktemp -t agb-upg-capture.XXXXXX)" || return 1
+  _bucv_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-capture.XXXXXX")" || return 1
   # The `|| _bucv_rc=$?` idiom disarms `set -e` AND captures the real exit
   # status. A bare `if ! "$@"; then ... $? ... fi` would lose the original
   # rc because the `!` resets `$?` inside the then-branch to 0 (the inverted
@@ -569,7 +569,7 @@ bridge_upgrade_reconcile_agent_restart_recovery() {
     # tempfile and stream `< $tempfile` instead of `done <<<"$report"`.
     # The here-string form wedges Bash 5.3.9 in `read_comsub` /
     # `heredoc_write` during a v0.7.x → v0.13.x upgrade --apply leap.
-    _rep_tmp="$(mktemp -t agb-upg-rep.XXXXXX)"
+    _rep_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-rep.XXXXXX")"
     # shellcheck disable=SC2064
     trap "rm -f -- \"$_rep_tmp\"" EXIT
     # Trailing newline matches the original `<<<` semantics so the last
@@ -1415,7 +1415,7 @@ if [[ $DRY_RUN -eq 0 ]]; then
   # capture is kept for symmetry with the failure-handling frame and so
   # `_migrate_rc=$?` captures the bash exit code, not mktemp/rm.
   set +e
-  _iso_v2_migrate_tmp="$(mktemp -t agb-upg-isov2.XXXXXX)"
+  _iso_v2_migrate_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-isov2.XXXXXX")"
   # v0.13.10: BRIDGE_UPGRADE_CONTEXT=1 signals
   # `bridge_isolation_v2_migrate_apply_for_upgrade` that the caller is the
   # upgrader (vs. a direct `agent-bridge migrate isolation v2 --apply` run)
@@ -1910,7 +1910,7 @@ if [[ $DRY_RUN -eq 0 ]]; then
     done
   fi
   if [[ -n "$_post_admin" && -x "$TARGET_ROOT/agent-bridge" ]]; then
-    _post_body="$(mktemp -t bridge-upgrade-post.XXXXXX)"
+    _post_body="$(mktemp "${TMPDIR:-/tmp}/bridge-upgrade-post.XXXXXX")"
     cat >"$_post_body" <<POST_EOF
 # Agent Bridge upgrade completed
 
@@ -2069,7 +2069,7 @@ POST_EOF
     mkdir -p "$_post_body_persist_dir"
     _post_body_persist="$_post_body_persist_dir/upgrade-complete-$(date -u +%Y%m%dT%H%M%SZ).md"
     cp "$_post_body" "$_post_body_persist"
-    _post_task_log="$(mktemp -t bridge-upgrade-post-task.XXXXXX.log)"
+    _post_task_log="$(mktemp "${TMPDIR:-/tmp}/bridge-upgrade-post-task.log.XXXXXX")"
     if bridge_upgrade_with_target_env "$TARGET_ROOT" "$TARGET_ROOT/agent-bridge" task create \
         --to "$_post_admin" --priority normal --from "$_post_admin" \
         --title "[upgrade-complete] Agent Bridge $SOURCE_VERSION — run bootstrap" \
