@@ -141,7 +141,7 @@ python3 -c "import json,os; json.load(open(os.path.expanduser('~/.claude.json'))
 # 6. Latest SQL snapshot restore self-test (writes to a temp DB, not live)
 LATEST=\$(ls -1t "\$TARGET_ROOT/state/backup-snapshots"/tasks-*.sql.gz 2>/dev/null | head -1)
 if [[ -n "\$LATEST" ]]; then
-  TMPDB=\$(mktemp -t agb-restore-check.XXXXXX.sqlite)
+  TMPDB=\$(mktemp "\${TMPDIR:-/tmp}/agb-restore-check.sqlite.XXXXXX")
   if gunzip -c "\$LATEST" | sqlite3 "\$TMPDB" >/dev/null 2>&1; then
     echo "snapshot restorable: \$LATEST"
   else

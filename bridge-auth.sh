@@ -357,7 +357,7 @@ bridge_auth_sync_agents() {
   local -a synced=()
   local -a failed=()
 
-  selection_error="$(mktemp -t agb-auth-select.XXXXXX 2>/dev/null || printf '%s' "/tmp/agb-auth-select.$$.$RANDOM")"
+  selection_error="$(mktemp "${TMPDIR:-/tmp}/agb-auth-select.XXXXXX" 2>/dev/null || printf '%s' "/tmp/agb-auth-select.$$.$RANDOM")"
   if ! selection_output="$(bridge_auth_selected_agents "$spec" 2>"$selection_error")"; then
     if [[ "$json_mode" == "1" ]]; then
       python3 - "$selection_error" <<'PY'

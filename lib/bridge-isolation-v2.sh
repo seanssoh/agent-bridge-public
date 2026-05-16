@@ -352,7 +352,7 @@ bridge_isolation_v2_exec_with_secret_env() {
   # only the loader-failure branch creates; the parent then checks the
   # marker independently of the exit code.
   local _fail_marker
-  _fail_marker="$(mktemp -t agb-secret-fail.XXXXXX 2>/dev/null || printf '%s' "/tmp/agb-secret-fail.$$.$RANDOM")"
+  _fail_marker="$(mktemp "${TMPDIR:-/tmp}/agb-secret-fail.XXXXXX" 2>/dev/null || printf '%s' "/tmp/agb-secret-fail.$$.$RANDOM")"
   rm -f "$_fail_marker"
   local _rc=0
   if (

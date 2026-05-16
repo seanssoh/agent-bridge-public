@@ -495,7 +495,7 @@ bridge_isolation_v2_reapply_one_agent() {
         # cases). We re-use the writer rather than open-coding the
         # body so future changes to the launch_cmd format propagate.
         local _tmp_env=""
-        _tmp_env="$(mktemp -t agent-env.regen.XXXXXX 2>/dev/null || true)"
+        _tmp_env="$(mktemp "${TMPDIR:-/tmp}/agent-env.regen.XXXXXX" 2>/dev/null || true)"
         if [[ -n "$_tmp_env" ]] \
             && bridge_write_linux_agent_env_file "$agent" "$_tmp_env" 2>/dev/null; then
           if [[ -f "$_env_file" && ! -L "$_env_file" ]] \

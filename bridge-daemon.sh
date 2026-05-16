@@ -787,7 +787,7 @@ bridge_emit_daily_backup_failure_admin_task() {
   (( cooldown > 0 )) || cooldown=3600
   resume_at="$(bridge_daily_backup_format_epoch "$(( $(date +%s) + cooldown ))")"
 
-  body_file="$(mktemp -t bridge-daily-backup-fail.XXXXXX.md)"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-daily-backup-fail.md.XXXXXX")"
   case "$reason" in
     disk_full)
       _bridge_render_disk_full_task_body "$detail" "$resume_at" "$cooldown" >"$body_file"
@@ -1502,7 +1502,7 @@ process_daily_backup() {
   # the subprocess. Capture the rc directly via `set +e` / `set -e` toggle
   # so timeouts (124) and non-zero rc map to real failure reasons.
   local stderr_capture=""
-  stderr_capture="$(mktemp -t bridge-daily-backup.XXXXXX.err)"
+  stderr_capture="$(mktemp "${TMPDIR:-/tmp}/bridge-daily-backup.err.XXXXXX")"
   set +e
   backup_json="$(bridge_with_timeout 120 daily_backup python3 "$SCRIPT_DIR/bridge-upgrade.py" daily-backup-live --target-root "$BRIDGE_HOME" --backup-dir "$BRIDGE_DAILY_BACKUP_DIR" --retain-days "$retain_days" 2>"$stderr_capture")"
   subprocess_rc=$?

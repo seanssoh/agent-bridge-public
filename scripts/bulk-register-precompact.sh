@@ -260,7 +260,7 @@ main() {
         : > "$LOG_FILE"
     else
         # Dry-run: route log to a tmp path so the real state dir stays clean.
-        LOG_FILE="$(mktemp -t precompact-dryrun.XXXXXX).jsonl"
+        LOG_FILE="$(mktemp "${TMPDIR:-/tmp}/precompact-dryrun.XXXXXX").jsonl"
     fi
 
     local targets

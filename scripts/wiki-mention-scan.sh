@@ -22,7 +22,7 @@ log_audit "$JOB" "starting $JOB" >/dev/null
 
 trap 'file_failure_task "$JOB" "$LOG"' ERR
 
-SCAN_JSON="$(mktemp -t wiki-mention-scan.XXXXXX.json)"
+SCAN_JSON="$(mktemp "${TMPDIR:-/tmp}/wiki-mention-scan.json.XXXXXX")"
 # shellcheck disable=SC2064
 trap "rm -f '$SCAN_JSON'; file_failure_task '$JOB' '$LOG'" ERR
 

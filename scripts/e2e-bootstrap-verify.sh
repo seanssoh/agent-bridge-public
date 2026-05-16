@@ -108,7 +108,7 @@ required_crons=(
   wiki-dedup-weekly
 )
 
-cron_list_json="$(mktemp -t e2e-crons.XXXXXX.json)"
+cron_list_json="$(mktemp "${TMPDIR:-/tmp}/e2e-crons.json.XXXXXX")"
 trap 'rm -f "$cron_list_json"' EXIT
 "$BRIDGE_AGB" cron list --agent patch --json >"$cron_list_json" 2>/dev/null || echo '[]' > "$cron_list_json"
 
