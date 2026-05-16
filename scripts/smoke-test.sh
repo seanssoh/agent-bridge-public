@@ -3302,6 +3302,68 @@ assert_contains "$REQUESTER_SHOW_OUTPUT" "assigned_to: $REQUESTER_AGENT"
 assert_contains "$REQUESTER_SHOW_OUTPUT" "original_task: #$NOTICE_TASK_ID"
 assert_contains "$REQUESTER_SHOW_OUTPUT" "completed_by: $SMOKE_AGENT"
 
+# Issue #697 — claimed→blocked transition with a non-empty note must
+# auto-notify the requester with a `[task-blocked]` task, and a second
+# blocked update on the same task must not create a duplicate.
+log "auto-notifying requester on claimed→blocked transition (#697)"
+BLOCKED_NOTIFY_CREATE_OUTPUT="$(bash "$REPO_ROOT/bridge-task.sh" create --to "$SMOKE_AGENT" --title "smoke blocked-notify" --body "needs human input" --from "$REQUESTER_AGENT")"
+assert_contains "$BLOCKED_NOTIFY_CREATE_OUTPUT" "created task #"
+BLOCKED_NOTIFY_TASK_ID="$(printf '%s\n' "$BLOCKED_NOTIFY_CREATE_OUTPUT" | sed -n 's/^created task #\([0-9][0-9]*\).*/\1/p' | head -n1)"
+[[ "$BLOCKED_NOTIFY_TASK_ID" =~ ^[0-9]+$ ]] || die "could not parse blocked-notify task id"
+bash "$REPO_ROOT/bridge-task.sh" claim "$BLOCKED_NOTIFY_TASK_ID" --agent "$SMOKE_AGENT" >/dev/null
+bash "$REPO_ROOT/bridge-task.sh" update "$BLOCKED_NOTIFY_TASK_ID" --actor "$SMOKE_AGENT" --status blocked --note "operator decision needed: scope A or B" >/dev/null
+REQUESTER_BLOCKED_INBOX="$(bash "$REPO_ROOT/bridge-task.sh" inbox "$REQUESTER_AGENT")"
+assert_contains "$REQUESTER_BLOCKED_INBOX" "[task-blocked] task #${BLOCKED_NOTIFY_TASK_ID}: smoke blocked-notify"
+BLOCKED_NOTIFY_NOTICE_ID="$(python3 "$REPO_ROOT/bridge-queue.py" find-open --agent "$REQUESTER_AGENT" --title-prefix "[task-blocked] task #${BLOCKED_NOTIFY_TASK_ID}:")"
+[[ "$BLOCKED_NOTIFY_NOTICE_ID" =~ ^[0-9]+$ ]] || die "blocked-notify notice id was not numeric: $BLOCKED_NOTIFY_NOTICE_ID"
+BLOCKED_NOTIFY_SHOW="$(bash "$REPO_ROOT/bridge-task.sh" show "$BLOCKED_NOTIFY_NOTICE_ID")"
+assert_contains "$BLOCKED_NOTIFY_SHOW" "assigned_to: $REQUESTER_AGENT"
+assert_contains "$BLOCKED_NOTIFY_SHOW" "original_task: #${BLOCKED_NOTIFY_TASK_ID}"
+assert_contains "$BLOCKED_NOTIFY_SHOW" "blocked_by: $SMOKE_AGENT"
+assert_contains "$BLOCKED_NOTIFY_SHOW" "operator decision needed: scope A or B"
+
+# Idempotency — re-blocking the same task must not duplicate the notice.
+bash "$REPO_ROOT/bridge-task.sh" update "$BLOCKED_NOTIFY_TASK_ID" --actor "$SMOKE_AGENT" --status blocked --note "still waiting" >/dev/null
+BLOCKED_NOTIFY_COUNT="$(BRIDGE_TASK_DB="$BRIDGE_TASK_DB" REQUESTER_AGENT="$REQUESTER_AGENT" BLOCKED_NOTIFY_TASK_ID="$BLOCKED_NOTIFY_TASK_ID" python3 - <<'PY'
+import os
+import sqlite3
+
+db = os.environ["BRIDGE_TASK_DB"]
+agent = os.environ["REQUESTER_AGENT"]
+prefix = f"[task-blocked] task #{os.environ['BLOCKED_NOTIFY_TASK_ID']}:"
+with sqlite3.connect(db) as conn:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE assigned_to = ? AND title LIKE ?",
+        (agent, prefix + "%"),
+    ).fetchone()
+print(int(row[0]))
+PY
+)"
+[[ "$BLOCKED_NOTIFY_COUNT" == "1" ]] || die "expected exactly one [task-blocked] notice, got $BLOCKED_NOTIFY_COUNT"
+
+# Negative — a blocked update WITHOUT a note must not create a notice.
+BLOCKED_NONOTE_CREATE_OUTPUT="$(bash "$REPO_ROOT/bridge-task.sh" create --to "$SMOKE_AGENT" --title "smoke blocked-no-note" --body "x" --from "$REQUESTER_AGENT")"
+BLOCKED_NONOTE_TASK_ID="$(printf '%s\n' "$BLOCKED_NONOTE_CREATE_OUTPUT" | sed -n 's/^created task #\([0-9][0-9]*\).*/\1/p' | head -n1)"
+[[ "$BLOCKED_NONOTE_TASK_ID" =~ ^[0-9]+$ ]] || die "could not parse blocked-no-note task id"
+bash "$REPO_ROOT/bridge-task.sh" claim "$BLOCKED_NONOTE_TASK_ID" --agent "$SMOKE_AGENT" >/dev/null
+bash "$REPO_ROOT/bridge-task.sh" update "$BLOCKED_NONOTE_TASK_ID" --actor "$SMOKE_AGENT" --status blocked >/dev/null
+BLOCKED_NONOTE_COUNT="$(BRIDGE_TASK_DB="$BRIDGE_TASK_DB" REQUESTER_AGENT="$REQUESTER_AGENT" BLOCKED_NONOTE_TASK_ID="$BLOCKED_NONOTE_TASK_ID" python3 - <<'PY'
+import os
+import sqlite3
+
+db = os.environ["BRIDGE_TASK_DB"]
+agent = os.environ["REQUESTER_AGENT"]
+prefix = f"[task-blocked] task #{os.environ['BLOCKED_NONOTE_TASK_ID']}:"
+with sqlite3.connect(db) as conn:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE assigned_to = ? AND title LIKE ?",
+        (agent, prefix + "%"),
+    ).fetchone()
+print(int(row[0]))
+PY
+)"
+[[ "$BLOCKED_NONOTE_COUNT" == "0" ]] || die "expected no [task-blocked] notice when no note, got $BLOCKED_NONOTE_COUNT"
+
 log "cancelling an orphan task without a roster entry"
 ORPHAN_TASK_ID=""
 ORPHAN_CREATE_OUTPUT="$(BRIDGE_TASK_DB="$BRIDGE_TASK_DB" python3 "$REPO_ROOT/bridge-queue.py" create --to tester --title "orphan cleanup" --from smoke --priority high --body "cleanup me" --format shell)"
