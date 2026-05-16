@@ -10737,4 +10737,12 @@ bash "$REPO_ROOT/scripts/smoke/classify-stale-dynamic-exemption.sh"
 log "running bridge-export-prefix-no-stale-layout smoke (patch #4725)"
 bash "$REPO_ROOT/scripts/smoke/bridge-export-prefix-no-stale-layout.sh"
 
+# `_ENV_DUMP_PATTERNS` in hooks/tool-policy.py used to false-positive on
+# natural-language `env` and `printenv` (e.g. task titles like
+# "stale env override" denied as if they were process-env dumps). Guard
+# the regex tightening with both true-positive and false-positive
+# truth-table cases (operator-flagged 2026-05-16).
+log "running tool-policy-process-dump-regex smoke"
+bash "$REPO_ROOT/scripts/smoke/tool-policy-process-dump-regex.sh"
+
 log "smoke test passed"
