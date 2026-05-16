@@ -110,6 +110,24 @@ BRIDGE_AGENT_GROUP_PREFIX="${BRIDGE_AGENT_GROUP_PREFIX:-ab-agent-}"
 # 2. helpers — environment / dispatch
 # ---------------------------------------------------------------------------
 
+# Source the platform discriminator (S3). Two-path source:
+# - bridge-lib.sh flow sources `bridge-isolation-discriminator.sh` before
+#   us, so the function already exists and the guard below is a no-op.
+# - Standalone module callers (e.g. tests/isolation-v2-primitives/smoke.sh
+#   sourcing this file directly without going through bridge-lib.sh)
+#   need the discriminator brought in here so `bridge_isolation_v2_enforce`
+#   call sites further down resolve. The discriminator is self-contained:
+#   its `_platform` helper falls back to direct `uname -s` when
+#   `bridge_host_platform` is not available.
+if ! declare -f bridge_isolation_v2_enforce >/dev/null 2>&1; then
+  _BRIDGE_V2_MODULE_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  if [[ -f "$_BRIDGE_V2_MODULE_DIR/bridge-isolation-discriminator.sh" ]]; then
+    # shellcheck source=bridge-isolation-discriminator.sh
+    source "$_BRIDGE_V2_MODULE_DIR/bridge-isolation-discriminator.sh"
+  fi
+  unset _BRIDGE_V2_MODULE_DIR
+fi
+
 bridge_isolation_v2_active() {
   # Returns 0 (active) when BRIDGE_LAYOUT=v2 and BRIDGE_DATA_ROOT is set.
   #
@@ -676,6 +694,11 @@ bridge_isolation_v2_chgrp_setgid_dir() {
     bridge_warn "chgrp_setgid_dir: not a directory: $dir"
     return 1
   }
+  # Platform discriminator gate (S3): chgrp + setgid bit are POSIX
+  # primitives that only have a security model on Linux. On non-Linux
+  # hosts (default: macOS) this is a silent no-op so callers see
+  # success rather than chgrp-failure noise. Audit C07 (Bucket 2).
+  bridge_isolation_v2_enforce || return 0
   _bridge_isolation_v2_run_root_or_sudo chgrp "$group" "$dir" || return 1
   _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$dir" || return 1
 }
@@ -1572,12 +1595,13 @@ bridge_isolation_v2_apply_row() {
       return $?
       ;;
     group_setgid)
-      # macOS no-op: POSIX setgid groups are not the security primitive
-      # on Darwin. Skip silently so callers (apply_grant_matrix_for_agent,
-      # ensure_matrix_path) don't see false-negative chown/chmod failures
-      # against an `agent-bridge-*` user/group that does not exist on
-      # this host. S2 operator-visible blocker (audit doc C-S1).
-      [[ "$(uname)" == "Darwin" ]] && return 0
+      # Platform discriminator gate (S3): the group_setgid mechanism
+      # is a silent no-op when v2 is not the security primitive on
+      # this host (default: non-Linux). Callers don't see false-negative
+      # chown/chmod failures against an `agent-bridge-*` user/group
+      # that does not exist outside Linux. Operators can force via
+      # BRIDGE_ISOLATION_REQUIRED=yes.
+      bridge_isolation_v2_enforce || return 0
       ;;
     *)
       bridge_warn "apply_row($row_name): unknown grant_mechanism '$mechanism'"
@@ -1785,13 +1809,13 @@ bridge_isolation_v2_ensure_matrix_path() {
     bridge_warn "ensure_matrix_path: row_name and agent required"
     return 1
   }
-  # macOS no-op: POSIX setgid groups are not the security primitive on
-  # Darwin (the upgrade flow does not create `agent-bridge-*` OS users
-  # or `ab-*` groups there). Daemon writers should proceed with the
-  # caller's normal FS perms; returning 1 here would spam the warning
-  # log for every per-agent state-marker write (S2 operator-visible
-  # blocker, audit doc C-S1 / B17).
-  [[ "$(uname)" == "Darwin" ]] && return 0
+  # Platform discriminator gate (S3): isolation-v2 enforcement is a
+  # silent no-op on hosts where v2 is not the security model (default:
+  # non-Linux). Daemon writers proceed with the caller's normal FS
+  # perms instead of seeing the chown/chmod path fail loudly.
+  # Operators can force enforcement via BRIDGE_ISOLATION_REQUIRED=yes
+  # (e.g., for self-test on a Linux container running rootless).
+  bridge_isolation_v2_enforce || return 0
   local row
   row="$(bridge_isolation_v2_matrix_rows_for_agent "$agent" \
           | awk -F'|' -v n="$row_name" '$1 == n {print; exit}')"
