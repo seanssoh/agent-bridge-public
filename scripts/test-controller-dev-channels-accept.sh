@@ -21,9 +21,12 @@
 #      `claude` and the process tree has no claude descendant, but the
 #      pane contains the picker text. Pre-fix would time out without
 #      sending Enter; post-fix the picker-text trigger fires.
-#   R3 Neighbor guard: the picker-sweep allow-list
-#      (scripts/picker-sweep.sh:137-138) does NOT include the dev-channels
-#      picker text, so picker-sweep does not grab a dev-channels pane.
+#   R3 Sweep coverage: the picker-sweep allow-list
+#      (scripts/picker-sweep.sh:155) NOW includes the dev-channels
+#      picker text 'I am using this for local development' (added in
+#      PR #923 on 2026-05-16 after operator's host got blocked on this
+#      picker post-v0.14.1 upgrade). The test asserts picker-sweep
+#      auto-accepts the dev-channels pane.
 #   R4 Timeout-still-works: pane has neither picker text nor claude
 #      foreground; bridge_tmux_pane_has_dev_channels_picker returns 1
 #      forever, the legacy foreground gate also returns 1, and the
@@ -304,11 +307,14 @@ if [[ "$FAIL" -eq 0 || ("$LAST_DESC" == "R2"* && "$R2_ACK" != "" ) ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# R3: neighbor guard — the picker-sweep allow-list does NOT include the
-# dev-channels picker text. We exercise picker-sweep against a dev-channels
-# pane and assert the sweep does not send Enter into it.
+# R3: sweep coverage — the picker-sweep allow-list NOW includes the
+# dev-channels picker text 'I am using this for local development'
+# (added in PR #923, 2026-05-16, after operator's host got blocked on
+# this picker post-v0.14.1 upgrade). Exercise picker-sweep against a
+# dev-channels pane and assert the sweep auto-accepts (default cursor
+# is on option 1 so a bare Enter accepts).
 # ---------------------------------------------------------------------------
-step "R3: picker-sweep does NOT match dev-channels picker text"
+step "R3: picker-sweep auto-accepts dev-channels picker text"
 R3_DIR="$TMP_ROOT/r3"
 mkdir -p "$R3_DIR/lib" "$R3_DIR/state/install" "$R3_DIR/scripts"
 cp "$ROOT_DIR/lib/bridge-host-profile.sh" "$R3_DIR/lib/"
@@ -318,10 +324,11 @@ printf '{"profile":"server"}\n' > "$R3_DIR/state/install/host-profile.json"
 R3_SEND_RECORD="$R3_DIR/picker-sweep-sends.log"
 R3_TASKS_RECORD="$R3_DIR/picker-sweep-tasks.log"
 : > "$R3_SEND_RECORD" "$R3_TASKS_RECORD"
+export R3_SEND_RECORD R3_TASKS_RECORD
 
 # Test seam shims: list a single fake session that capture-pane will
-# return the dev-channels picker text for. If picker-sweep wrongly grabs
-# this pane it will call _send_enter, which records to the log.
+# return the dev-channels picker text for. PR #923 makes picker-sweep
+# auto-accept this pane — verify _send_enter was called.
 # shellcheck disable=SC2329 # invoked via BRIDGE_PICKER_SWEEP_*_FN env seam
 r3_list_sessions() {
   printf '%s\n' "r3-fake-devchannels"
@@ -354,13 +361,14 @@ BRIDGE_PICKER_SWEEP_ENABLED=1 \
   BRIDGE_PICKER_SWEEP_CREATE_TASK_FN=r3_create_task \
   "$BASH_BIN" "$R3_DIR/scripts/picker-sweep.sh" 2>"$R3_STDERR" >/dev/null || R3_RC=$?
 
-# Picker-sweep must exit 0 (no matching picker) AND must not have called
-# _send_enter. If it had grabbed the dev-channels pane, R3_SEND_RECORD
-# would contain "=r3-fake-devchannels:".
-if [[ "$R3_RC" == "0" && ! -s "$R3_SEND_RECORD" ]]; then
+# Picker-sweep must exit 0 AND must have called _send_enter exactly once
+# with the fake session name. Pre-PR-#923 this test asserted the
+# opposite (NO send); post-PR-#923 a send IS expected.
+if [[ "$R3_RC" == "0" && -s "$R3_SEND_RECORD" ]] \
+   && grep -q '^r3-fake-devchannels$' "$R3_SEND_RECORD"; then
   ok
 else
-  err "R3 picker-sweep grabbed dev-channels pane (rc=$R3_RC, sends=$(cat "$R3_SEND_RECORD" 2>/dev/null || true), stderr=$(cat "$R3_STDERR" 2>/dev/null || true))"
+  err "R3 picker-sweep did NOT auto-accept dev-channels pane (rc=$R3_RC, sends=$(cat "$R3_SEND_RECORD" 2>/dev/null || true), stderr=$(cat "$R3_STDERR" 2>/dev/null || true))"
 fi
 
 # ---------------------------------------------------------------------------
