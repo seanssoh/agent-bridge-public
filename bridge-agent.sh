@@ -1956,7 +1956,15 @@ bridge_agent_shared_settings_plan_json() {
   # (which drifts) or only one branch would benefit from future
   # python-side fixes.
   local _plan_py
-  _plan_py="$(mktemp "${TMPDIR:-/tmp}/bridge-rerender-plan.XXXXXX.py")" || return 1
+  # BSD-portable template: macOS BSD `mktemp` only expands trailing `X`
+  # sequences. A `.XXXXXX.py` template returns the literal `XXXXXX.py`
+  # path, which creates a static file the first time and `File exists`
+  # every call after. Patch task #4648 surfaced this after the v0.14.0
+  # upgrade on operator's mac — all 8 shared-settings rerender targets
+  # failed and required manual cleanup. Drop the `.py` extension; the
+  # python heredoc body is executed via `python3 "$_plan_py"` which does
+  # not require a `.py` suffix.
+  _plan_py="$(mktemp "${TMPDIR:-/tmp}/bridge-rerender-plan.XXXXXX")" || return 1
   cat >"$_plan_py" <<'PY'
 import importlib.util
 import json

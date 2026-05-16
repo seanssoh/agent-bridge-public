@@ -297,7 +297,14 @@ cmd_request() {
   esac
 
   mkdir -p "$BRIDGE_SHARED_DIR/reviews"
-  task_body_file="$(mktemp "$BRIDGE_SHARED_DIR/reviews/review-request.XXXXXX.md")"
+  # BSD-portable: macOS `mktemp` only expands trailing `X` sequences;
+  # a `.XXXXXX.md` template returns the literal `XXXXXX.md` path. Use
+  # suffix-less mktemp + rename so the `.md` cosmetic extension (for
+  # operator editor highlighting in shared/reviews/) is preserved.
+  # Task #4648 surfaced the parallel bug at bridge-agent.sh:1959.
+  task_body_file_base="$(mktemp "$BRIDGE_SHARED_DIR/reviews/review-request.XXXXXX")"
+  task_body_file="${task_body_file_base}.md"
+  mv "$task_body_file_base" "$task_body_file" || { rm -f "$task_body_file_base"; bridge_die "review-request body rename failed"; }
   {
     echo "# Review Request"
     echo
@@ -392,7 +399,10 @@ cmd_complete() {
   esac
 
   mkdir -p "$BRIDGE_SHARED_DIR/reviews"
-  completion_file="$(mktemp "$BRIDGE_SHARED_DIR/reviews/review-complete.XXXXXX.md")"
+  # BSD-portable (task #4648 carry): see review-request mktemp comment above.
+  completion_file_base="$(mktemp "$BRIDGE_SHARED_DIR/reviews/review-complete.XXXXXX")"
+  completion_file="${completion_file_base}.md"
+  mv "$completion_file_base" "$completion_file" || { rm -f "$completion_file_base"; bridge_die "review-complete body rename failed"; }
   {
     echo "review_decision: $decision"
     echo "reviewed_by: $reviewer"
