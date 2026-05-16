@@ -794,8 +794,20 @@ bridge_export_env_prefix() {
     BRIDGE_ROSTER_FILE
     BRIDGE_ROSTER_LOCAL_FILE
     BRIDGE_STATE_DIR
-    BRIDGE_LAYOUT
-    BRIDGE_DATA_ROOT
+    # NOTE 2026-05-16 (patch ticket #4725): BRIDGE_LAYOUT and
+    # BRIDGE_DATA_ROOT were intentionally REMOVED from this prefix.
+    # On a v2-migrated install, the marker at state/layout-marker.sh
+    # is the source of truth — children re-resolve via the resolver
+    # at startup. When this prefix was re-exporting the parent's
+    # potentially-stale BRIDGE_LAYOUT, every spawned child inherited
+    # the legacy value and triggered the
+    # `BRIDGE_LAYOUT=legacy is a stale pre-v0.8.0 env override; …
+    # Preferring marker.` warning on every CLI invocation — visible
+    # to the operator dozens of times per command output. The
+    # underlying resolver behavior is correct (marker wins); the
+    # noise was self-inflicted by re-propagating the demoted value
+    # into the child shell. Dropping these two names lets the child
+    # resolver compute the layout cleanly.
     BRIDGE_LAYOUT_MARKER_DIR
     BRIDGE_ACTIVE_AGENT_DIR
     BRIDGE_HISTORY_DIR

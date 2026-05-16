@@ -10728,4 +10728,13 @@ bash "$REPO_ROOT/scripts/smoke/v2-scaffold-home-and-workdir.sh"
 log "running classify-stale-dynamic-exemption smoke"
 bash "$REPO_ROOT/scripts/smoke/classify-stale-dynamic-exemption.sh"
 
+# bridge_export_env_prefix was re-exporting BRIDGE_LAYOUT and
+# BRIDGE_DATA_ROOT from the parent process into every spawned child
+# (patch ticket #4725, 2026-05-16). On a v2-migrated install, parents
+# can carry a legacy value and every child then triggers the
+# resolver-demote warning on every CLI command. Guard the trimmed
+# prefix list.
+log "running bridge-export-prefix-no-stale-layout smoke (patch #4725)"
+bash "$REPO_ROOT/scripts/smoke/bridge-export-prefix-no-stale-layout.sh"
+
 log "smoke test passed"
