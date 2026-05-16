@@ -442,6 +442,16 @@ _bridge_worktree_doctor_classify_one() {
   printf '%-7s | %-7s | %3dd    | %s\n' \
     "$status" "${stash_count}" "$age_days" "$wt_path"
 
+  # Dry-run surfaces which orphaned children WOULD be reaped on REMOVE
+  # rows so the operator sees the full picture before opting into --apply.
+  # MUST run BEFORE the early `mode != apply` return below — the r1 of
+  # PR #927 put this call inside the apply branch and codex caught it as
+  # unreachable. Smoke `worktree-doctor-reap-zombies-dry-run.sh` is the
+  # integration regression guard.
+  if [[ "$mode" == "dry-run" && "$status" == "REMOVE" ]]; then
+    _bridge_worktree_doctor_reap_children "$wt_path" "dry-run"
+  fi
+
   if [[ "$mode" != "apply" ]]; then
     return 0
   fi
@@ -455,6 +465,14 @@ _bridge_worktree_doctor_classify_one() {
   fi
 
   if (( should_remove == 1 )); then
+    # Before removing the worktree directory itself, reap any leftover
+    # daemonized child processes whose argv references the worktree path.
+    # Operator-observed (Sean, 2026-05-16): 7 bridge-watchdog-silence.py
+    # processes parented to init(1), alive 8-12 days, scripts pointing at
+    # worktree dirs that had been pruned long ago. `git worktree remove -f`
+    # does NOT cascade to such children — it only touches metadata and the
+    # filesystem. We must do it ourselves.
+    _bridge_worktree_doctor_reap_children "$wt_path" "$mode"
     if git -C "$repo_root" worktree remove -f "$wt_path" >/dev/null 2>&1; then
       n_removed=$(( n_removed + 1 ))
       printf '         [apply] removed: %s\n' "$wt_path"
@@ -467,6 +485,151 @@ _bridge_worktree_doctor_classify_one() {
       n_remove_failed=$(( n_remove_failed + 1 ))
       printf '         [apply] FAILED to remove: %s\n' "$wt_path" >&2
     fi
+  fi
+}
+
+# _bridge_worktree_doctor_reap_children — terminate any process whose argv
+# references the given worktree path. Used by the doctor BEFORE removing a
+# worktree directory so daemonized children (e.g. python helpers) that were
+# reparented to init(1) don't outlive their worktree.
+#
+# Args: wt_path mode
+#   wt_path  absolute path of the worktree about to be removed
+#   mode     "apply" → actually send SIGTERM then SIGKILL after a short wait
+#            anything else (including "dry-run") → report PIDs only, no signals
+#
+# Anchor policy (the critical correctness call):
+#   Match a process if any whitespace-delimited token in its `ps` `command`
+#   field starts with "<wt_path>/". This is anchored (NOT a naive substring
+#   "contains"), so:
+#     - It catches direct-exec children where argv[0] is the worktree
+#       binary path (e.g. `/path/to/.claude/worktrees/agent-X/foo.sh ...`).
+#     - It catches interpreter-exec children where argv[0] is the
+#       interpreter and argv[1+] is a script path under the worktree
+#       (e.g. `Python /path/to/.claude/worktrees/agent-X/bridge-watchdog-silence.py run`
+#       — the exact shape of the 7 zombie processes Sean observed on
+#       2026-05-16).
+#     - It does NOT catch a `git` process running against the worktree
+#       (git's argv doesn't include the worktree path as a path token —
+#       paths are passed via `-C` separately).
+#     - It does NOT catch the doctor itself (this function's argv is the
+#       caller's argv, which doesn't include "<wt_path>/" as a token).
+#   We also defensively skip our own PID and any `git` basename.
+#
+# Cross-platform `ps` contract:
+#   We invoke `ps -eo pid=,command=` (= suppresses headers). This flag set
+#   works identically on macOS BSD `ps` and Linux procps `ps`. We avoid
+#   `pgrep -f` because the `-f` flag's argv-matching semantics drift between
+#   BSD pgrep (matches against process name only by default) and Linux
+#   pgrep (matches full command line); using `ps` + a pure-bash token scan
+#   keeps the behavior identical on both.
+#
+# Signal ordering: TERM → wait up to ~2s (polling at 100ms) → KILL.
+_bridge_worktree_doctor_reap_children() {
+  local wt_path="$1"
+  local mode="$2"
+
+  # Refuse to operate on an empty path or "/" (defense in depth — a bug
+  # upstream that passed wt_path="" would otherwise match every process
+  # whose command line contains "/").
+  if [[ -z "$wt_path" || "$wt_path" == "/" ]]; then
+    return 0
+  fi
+
+  local self_pid=$$
+  # Path prefix we anchor against. We anchor on "<wt_path>/" specifically
+  # (trailing slash mandatory) so we never match a sibling worktree whose
+  # name happens to start with the same prefix (e.g. agent-foo vs
+  # agent-foo-bar).
+  local anchor="${wt_path%/}/"
+
+  # Snapshot the process table once. Output format: "<pid> <command...>".
+  # ps -eo pid=,command= works on both macOS BSD ps and Linux procps ps;
+  # the trailing = suppresses the header.
+  local ps_out
+  if ! ps_out="$(ps -eo pid=,command= 2>/dev/null)"; then
+    return 0
+  fi
+
+  local -a matched_pids=()
+  local line pid cmd token
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Split into pid + command. Leading whitespace from BSD ps is stripped
+    # by the read.
+    line="${line#"${line%%[![:space:]]*}"}"
+    pid="${line%%[[:space:]]*}"
+    cmd="${line#"$pid"}"
+    cmd="${cmd#"${cmd%%[![:space:]]*}"}"
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    # Skip self and our parent (the caller). Safer than only skipping $$.
+    if [[ "$pid" == "$self_pid" || "$pid" == "$PPID" ]]; then
+      continue
+    fi
+    # Skip git plumbing. The doctor itself runs git subprocesses that
+    # happen during/after this scan; we don't want to ever target them.
+    local first_token="${cmd%%[[:space:]]*}"
+    local first_basename="${first_token##*/}"
+    if [[ "$first_basename" == "git" ]]; then
+      continue
+    fi
+
+    # Token-level anchor: does any whitespace-separated token in the
+    # command line start with the worktree path + "/"?
+    local matched=0
+    # shellcheck disable=SC2086  # intentional word-splitting on the cmd line
+    for token in $cmd; do
+      if [[ "$token" == "$anchor"* ]]; then
+        matched=1
+        break
+      fi
+    done
+    if (( matched == 1 )); then
+      matched_pids+=("$pid")
+    fi
+  done <<<"$ps_out"
+
+  if (( ${#matched_pids[@]} == 0 )); then
+    return 0
+  fi
+
+  if [[ "$mode" != "apply" ]]; then
+    printf '         [dry-run] would reap %d orphaned child PID(s) under %s: %s\n' \
+      "${#matched_pids[@]}" "$wt_path" "${matched_pids[*]}"
+    return 0
+  fi
+
+  # Apply mode: SIGTERM, poll up to ~2s, then SIGKILL stragglers.
+  local p
+  for p in "${matched_pids[@]}"; do
+    kill -TERM "$p" 2>/dev/null || true
+  done
+  printf '         [apply] sent SIGTERM to %d orphan(s) under %s: %s\n' \
+    "${#matched_pids[@]}" "$wt_path" "${matched_pids[*]}"
+
+  # Poll for exit. 20 iterations × 0.1s = ~2s budget.
+  local iter
+  local -a still_alive=()
+  for (( iter = 0; iter < 20; iter++ )); do
+    still_alive=()
+    for p in "${matched_pids[@]}"; do
+      if kill -0 "$p" 2>/dev/null; then
+        still_alive+=("$p")
+      fi
+    done
+    if (( ${#still_alive[@]} == 0 )); then
+      break
+    fi
+    sleep 0.1
+  done
+
+  if (( ${#still_alive[@]} > 0 )); then
+    for p in "${still_alive[@]}"; do
+      kill -KILL "$p" 2>/dev/null || true
+    done
+    printf '         [apply] SIGKILL escalation for %d straggler(s): %s\n' \
+      "${#still_alive[@]}" "${still_alive[*]}" >&2
   fi
 }
 
