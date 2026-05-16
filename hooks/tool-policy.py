@@ -219,7 +219,7 @@ _ENV_DUMP_PATTERNS = (
         r"""
         (?<![A-Za-z0-9_/.\-]) env \b
         (?:
-            \s+ -- [A-Za-z0-9_-]*               # long option (incl. bare `--`)
+            \s+ -- [A-Za-z0-9_-]* (?: = \S* )?   # long option, incl. GNU --name=value
           | \s+ -[uSPC] \s+ \S+                 # short opt that takes a separated arg
           | \s+ -[A-Za-z0-9][A-Za-z0-9]*        # short opt or packed -uVAR
           | \s+ [A-Za-z_][A-Za-z0-9_]* = \S*    # VAR=value assignment
@@ -242,11 +242,16 @@ _ENV_DUMP_PATTERNS = (
     # Natural-language "use printenv to check" (preceded by a space
     # which is not in the separator set) no longer matches.
     re.compile(r"(?:^|[\n;&|`()<>])\s*printenv\b"),
-    # bare `set` with no args (dumps all vars). Require a separator
-    # before and a terminator/pipe/EOL after so `set -e`, `set -o
-    # pipefail`, `kubectl set image`, `git remote set-url`, and
-    # `setfacl` do NOT match.
-    re.compile(r"(?:^|[;\s|&])set\s*(?:$|[|;&])"),
+    # bare `set` with no args (dumps all vars). Same noise-reduction as
+    # the env/printenv tightenings — natural language "the var was set"
+    # used to match because the prior class `[;\s|&]` allowed a plain
+    # whitespace prefix, which is indistinguishable from "verb at end of
+    # an English sentence". The new prefix `[\n;|&` + subshell/backtick
+    # delimiters` excludes pure whitespace, so `the var was set` falls
+    # through. Dangerous shapes (`set`, `set | head`, `;set`, `$(set)`,
+    # `set > file`) still match because the prefix is consumed and the
+    # trailing terminator class is unchanged.
+    re.compile(r"(?:^|[\n;|&`()<>])\s*set\s*(?=$|[\n;|&<>`)])"),
     re.compile(r"(?<![A-Za-z0-9_])compgen\s+-[A-Za-z]*e"),
     re.compile(r"(?<![A-Za-z0-9_])declare\s+-[A-Za-z]*[xp]"),
     re.compile(r"(?<![A-Za-z0-9_])typeset\s+-[A-Za-z]*[xp]"),

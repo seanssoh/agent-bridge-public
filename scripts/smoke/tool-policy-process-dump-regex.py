@@ -59,6 +59,13 @@ def main() -> int:
         ("env # comment", True),                               # inline comment
         ("env -u VAR1 -u VAR2", True),                         # multiple -u, no utility
         ("env -u VAR VAR2=val", True),                         # mixed opt + assign, no utility
+        # r3 additions (codex PR #925 r2 catch): GNU long-option
+        # `--name=value` forms also dump when no utility follows.
+        ("env --ignore-signal=PIPE", True),
+        ("env --default-signal=PIPE", True),
+        ("env --block-signal=PIPE", True),
+        ("env --unset=CLAUDE_CODE_OAUTH_TOKEN", True),
+        ("env --split-string=FOO=bar", True),                  # =value containing another =
         ("printenv", True),                                    # bare printenv
         ("printenv CLAUDE_CODE_OAUTH_TOKEN", True),            # specific var
         ("printenv | head", True),                             # piped
@@ -96,6 +103,14 @@ def main() -> int:
         ("set -o pipefail", False),                            # set -o
         ("setfacl -m u:foo:rwx /tmp", False),                  # setfacl
         ("git remote set-url origin git@x", False),            # set-url
+        # r3 additions (codex PR #925 r2 side note): natural-language
+        # `set` at end of an English sentence used to match because the
+        # set regex allowed a whitespace prefix. The r3 tightening
+        # mirrors the env/printenv approach and excludes pure
+        # whitespace from the precondition.
+        ("the env was set", False),
+        ("permission was set", False),
+        ("after the var was set", False),
         ("env -i bash -c 'echo hi'", False),                   # env -i CLEARS env (not dump)
         ("env VAR=value cmd", False),                          # env VAR= (not dump)
         ("env -u CLAUDE_VAR cmd", False),                      # env -u (unset, not dump)
