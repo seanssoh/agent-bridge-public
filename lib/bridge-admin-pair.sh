@@ -34,6 +34,19 @@ bridge_ensure_admin_codex_pair() {
     return 0
   fi
 
+  # E2E test on Ubuntu 24.04 (2026-05-16) caught a fresh-install
+  # regression: bridge-bootstrap.sh always creates the codex pair, even
+  # when codex CLI is absent. The pair then crash-loops indefinitely,
+  # the watchdog files [crash-loop] tasks, and the admin agent's first
+  # autonomous action becomes "diagnose patch-dev failure" instead of
+  # onboarding. Skip pair creation when codex isn't on PATH — operator
+  # can run `agent-bridge agent create <admin>-dev --engine codex …`
+  # after installing the codex CLI.
+  if ! command -v codex >/dev/null 2>&1; then
+    printf '[admin-pair] skipped (codex CLI not on PATH): %s — install codex first, then re-run `bridge-bootstrap.sh --admin %s --engine claude` to backfill the pair and its picker-sweep cron.\n' "$pair_name" "$admin" >&2
+    return 0
+  fi
+
   pair_workdir="$(bridge_agent_workdir "$admin" 2>/dev/null || true)"
   if [[ -z "$pair_workdir" ]]; then
     pair_workdir="$(bridge_agent_default_home "$admin")"
