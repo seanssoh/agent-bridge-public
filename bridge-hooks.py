@@ -1076,11 +1076,36 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # under the normal start path, root under sudo-backed reapply).
     effective_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = effective_path.with_suffix(effective_path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(merged, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
-    os.chmod(tmp, 0o644)
-    os.replace(tmp, effective_path)
+    # E2E test on Ubuntu 24.04 VM (2026-05-16) caught a race: under
+    # concurrent bootstrap (bridge-bootstrap.sh) + patch first-start +
+    # watchdog firing, the parent dir occasionally gets recreated by
+    # a sibling process between mkdir and os.replace, and the tmp
+    # file disappears with the dir. Retry once with a fresh write
+    # cycle before propagating; if it still fails after the retry,
+    # treat as a soft warning and continue (the effective_path may
+    # have been written by another writer in the meantime, or the
+    # next agent-start tick will re-render).
+    def _atomic_write_effective() -> None:
+        with tmp.open("w", encoding="utf-8") as handle:
+            json.dump(merged, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, effective_path)
+
+    try:
+        _atomic_write_effective()
+    except FileNotFoundError:
+        # Race window — parent dir got nuked between mkdir and replace,
+        # or tmp got removed by a sibling cleanup. Retry once.
+        effective_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            _atomic_write_effective()
+        except FileNotFoundError as exc:
+            sys.stderr.write(
+                "[bridge-hooks] effective-settings atomic write raced "
+                f"twice; continuing — next agent-start tick will re-render. "
+                f"detail={exc}\n"
+            )
 
     # 4. Atomic symlink: settings.json -> settings.effective.json. Replace
     # any prior regular file (we already preserved its user keys above) or

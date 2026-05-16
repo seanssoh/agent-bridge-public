@@ -656,7 +656,26 @@ bridge_agent_clear_broken_launch "$AGENT"
 BRIDGE_AGENT_CREATED_AT["$AGENT"]="$(date +%s)"
 bridge_persist_agent_state "$AGENT"
 
-tmux new-session -d -s "$SESSION" -c "$WORK_DIR" "$SESSION_CMD"
+_bridge_start_new_session_err="$(mktemp 2>/dev/null || printf '/tmp/agb-newsession-err.%s' "$$")"
+if ! tmux new-session -d -s "$SESSION" -c "$WORK_DIR" "$SESSION_CMD" 2>"$_bridge_start_new_session_err"; then
+  # Race: the early `bridge_tmux_session_exists` check at the top of the
+  # script may not have caught a daemon-spawned session that landed in
+  # the gap. tmux emits `duplicate session: <name>` on stderr — that's
+  # cosmetic noise, not a real failure. Treat existing-session as OK,
+  # everything else as a real failure surface the captured stderr.
+  if bridge_tmux_session_exists "$SESSION" 2>/dev/null; then
+    if grep -q 'duplicate session' "$_bridge_start_new_session_err" 2>/dev/null; then
+      printf '[info] tmux session %s already exists (race with daemon spawn) — proceeding with attached attach\n' "$SESSION"
+    fi
+  else
+    printf '[error] tmux new-session failed for %s:\n' "$SESSION" >&2
+    cat "$_bridge_start_new_session_err" >&2 2>/dev/null || true
+    rm -f "$_bridge_start_new_session_err"
+    exit 1
+  fi
+fi
+rm -f "$_bridge_start_new_session_err"
+unset _bridge_start_new_session_err
 bridge_tmux_bootstrap_session_options "$SESSION"
 if [[ "$ENGINE" == "claude" ]]; then
   bridge_tmux_prepare_claude_session "$SESSION" 8 >/dev/null 2>&1 || true

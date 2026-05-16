@@ -53,10 +53,12 @@ run_predicate_probe() {
   #       $2 = host_override ("Linux"|"Darwin"),
   #       $3 = snippet (the test body),
   #       $4 = out_file
+  #       $5 = primitives_ready_override ("yes"|"no" or empty for auto/getent)
   local env_required="$1"
   local host_override="$2"
   local snippet="$3"
   local out_file="$4"
+  local primitives_ready="${5:-}"
   local driver="$SMOKE_TMP_ROOT/driver-$$.sh"
 
   {
@@ -75,6 +77,15 @@ run_predicate_probe() {
     fi
     printf '%s\n' 'mkdir -p "$BRIDGE_HOME/state" "$BRIDGE_DATA_ROOT"'
     printf '%s\n' 'source "$0_REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1'
+    # Discriminator readiness override — set the cache var BEFORE the
+    # snippet runs so the gate's primitives-readiness probe (getent
+    # ab-shared) is bypassed in favor of the deterministic value.
+    # Without this the smoke would depend on whether the test host
+    # happens to have an ab-shared group, which is not the case on
+    # macOS dev and is not the case on freshly-provisioned Linux CI.
+    if [[ -n "$primitives_ready" ]]; then
+      printf 'export _BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED=%q\n' "$primitives_ready"
+    fi
     printf '%s\n' "$snippet"
   } | sed "s#\$0_REPO_ROOT#$REPO_ROOT#g" >"$driver"
   chmod +x "$driver"
@@ -85,19 +96,33 @@ run_predicate_probe() {
   return $rc
 }
 
-# D1 — default + Linux → resolve=yes, enforce 0, require_linux 0
-smoke_log "D1: env=unset + host=Linux"
+# D1 — default + Linux + primitives ready → resolve=yes, enforce 0, require_linux 0
+smoke_log "D1: env=unset + host=Linux + primitives ready"
 D1_OUT="$SMOKE_TMP_ROOT/d1.out"
 run_predicate_probe "" "Linux" '
 echo "RESOLVE=$(bridge_isolation_discriminator_auto_resolve)"
 bridge_isolation_v2_enforce; echo "ENFORCE_RC=$?"
 bridge_isolation_v2_require_linux; echo "REQUIRE_RC=$?"
-' "$D1_OUT" || true
+' "$D1_OUT" "yes" || true
 
 grep -q '^RESOLVE=yes$' "$D1_OUT" || { cat "$D1_OUT"; smoke_fail "D1: expected RESOLVE=yes"; }
-grep -q '^ENFORCE_RC=0$' "$D1_OUT" || { cat "$D1_OUT"; smoke_fail "D1: expected ENFORCE_RC=0"; }
+grep -q '^ENFORCE_RC=0$' "$D1_OUT" || { cat "$D1_OUT"; smoke_fail "D1: expected ENFORCE_RC=0 (primitives ready)"; }
 grep -q '^REQUIRE_RC=0$' "$D1_OUT" || { cat "$D1_OUT"; smoke_fail "D1: expected REQUIRE_RC=0"; }
 smoke_log "D1 PASS"
+
+# D1b — default + Linux + primitives NOT ready → resolve=yes BUT enforce 1
+# Covers PR #919 readiness gate: clean install w/o ab-shared group should
+# skip enforcement instead of emitting ensure_matrix_path noise.
+smoke_log "D1b: env=unset + host=Linux + primitives NOT ready"
+D1B_OUT="$SMOKE_TMP_ROOT/d1b.out"
+run_predicate_probe "" "Linux" '
+echo "RESOLVE=$(bridge_isolation_discriminator_auto_resolve)"
+bridge_isolation_v2_enforce; echo "ENFORCE_RC=$?"
+' "$D1B_OUT" "no" || true
+
+grep -q '^RESOLVE=yes$' "$D1B_OUT" || { cat "$D1B_OUT"; smoke_fail "D1b: resolve should still be yes (Linux+auto)"; }
+grep -q '^ENFORCE_RC=1$' "$D1B_OUT" || { cat "$D1B_OUT"; smoke_fail "D1b: enforce should be 1 when primitives not ready"; }
+smoke_log "D1b PASS"
 
 # D2 — default + Darwin → resolve=no, enforce 1, require_linux DIES
 smoke_log "D2: env=unset + host=Darwin → require_linux must die"
@@ -118,16 +143,19 @@ fi
 grep -q 'operation requires Linux' "$D2_OUT" || { cat "$D2_OUT"; smoke_fail "D2: expected 'requires Linux' die message"; }
 smoke_log "D2 PASS"
 
-# D3 — explicit yes + Darwin → resolve=yes, enforce 0 (override)
-smoke_log "D3: env=yes + host=Darwin (explicit opt-in)"
+# D3 — explicit yes + Darwin → resolve=yes, enforce 0 (override AND bypass readiness)
+# PR #919 readiness gate: explicit yes bypasses the primitives-ready
+# probe — operator wants to see loud chgrp/setfacl failures during
+# self-test. Use primitives=no to verify the bypass.
+smoke_log "D3: env=yes + host=Darwin + primitives NOT ready (explicit opt-in bypasses readiness)"
 D3_OUT="$SMOKE_TMP_ROOT/d3.out"
 run_predicate_probe "yes" "Darwin" '
 echo "RESOLVE=$(bridge_isolation_discriminator_auto_resolve)"
 bridge_isolation_v2_enforce; echo "ENFORCE_RC=$?"
-' "$D3_OUT" || true
+' "$D3_OUT" "no" || true
 
 grep -q '^RESOLVE=yes$' "$D3_OUT" || { cat "$D3_OUT"; smoke_fail "D3: expected RESOLVE=yes (explicit)"; }
-grep -q '^ENFORCE_RC=0$' "$D3_OUT" || { cat "$D3_OUT"; smoke_fail "D3: expected ENFORCE_RC=0"; }
+grep -q '^ENFORCE_RC=0$' "$D3_OUT" || { cat "$D3_OUT"; smoke_fail "D3: expected ENFORCE_RC=0 (explicit yes bypasses readiness)"; }
 smoke_log "D3 PASS"
 
 # D4 — explicit no + Linux → resolve=no, enforce 1 (override)
