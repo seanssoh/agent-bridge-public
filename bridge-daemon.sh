@@ -299,7 +299,16 @@ write_agent_heartbeat() {
   fi
 
   temp_file="$(mktemp)"
-  cat >"$temp_file" <<EOF
+  # Audit A17 (P1 leak): the cat/mv/rm cleanup at the function tail
+  # only runs on the happy path. If `cat` (or any subshell inside the
+  # heredoc body — bridge_now_iso, bridge_agent_desc, etc.) fails,
+  # set -e can return early and the tempfile leaks. The daemon
+  # writes a heartbeat every loop tick — even rare failures
+  # accumulate in $TMPDIR.
+  #
+  # A RETURN trap does NOT fire on set-e abort (codex r1 repro on
+  # PR #915), so explicit error check + rm is required.
+  if ! cat >"$temp_file" <<EOF
 # Heartbeat
 
 - generated_at: $(bridge_now_iso)
@@ -328,6 +337,10 @@ write_agent_heartbeat() {
 - last_seen: ${last_seen}
 - last_nudge: ${last_nudge}
 EOF
+  then
+    rm -f -- "$temp_file"
+    return 1
+  fi
 
   if [[ -f "$heartbeat_file" ]] && cmp -s "$temp_file" "$heartbeat_file"; then
     rm -f "$temp_file"
