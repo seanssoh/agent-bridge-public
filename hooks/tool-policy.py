@@ -177,9 +177,33 @@ def _raw_mentions_claude_credentials(raw: str) -> bool:
 # such as `environment`, `setfacl`, `kubectl set image`, or `set -e`.
 # Routed to the same CLAUDE_CREDENTIAL_DENY_REASON as the substring
 # deny — no second reason constant.
+# `env` precondition tightened on 2026-05-16 (operator-flagged false
+# positive). The earlier `(?<![A-Za-z0-9_/])env(?![A-Za-z0-9_])` matched
+# every standalone occurrence of the word `env` regardless of context,
+# so a task title or commit subject containing natural English like
+# "stale env override" tripped the credential-deny path and the operator
+# could not queue tasks that legitimately mention the word. Two
+# tightenings:
+#   1. Lookbehind also excludes `-` and `.` so identifiers like
+#      `show-env`, `tmux show-env`, and `.env` no longer match.
+#   2. Lookahead now requires that `env` is followed (after optional
+#      whitespace) by a command terminator / pipe / redirect / end of
+#      string. That keeps the truly dangerous shapes — bare `env`,
+#      `env | grep …`, `env > /tmp/x`, `;env`, `$(env)` — while letting
+#      `env -i bash` (which CLEARS the environment, not dumps it),
+#      `env VAR=val cmd`, and natural-language `env` fall through.
+# Same fix applied to `printenv` so prose like "use printenv to check"
+# no longer false-positives. `printenv` invoked at command position
+# (alone, with VAR args, piped, or redirected) is still caught.
 _ENV_DUMP_PATTERNS = (
-    re.compile(r"(?<![A-Za-z0-9_/])env(?![A-Za-z0-9_])"),
-    re.compile(r"(?<![A-Za-z0-9_/])printenv(?![A-Za-z0-9_])"),
+    re.compile(r"(?<![A-Za-z0-9_/.\-])env(?=\s*(?:$|[\n;|&<>`)]))"),
+    # `printenv` is always dangerous when invoked (with or without VAR
+    # args), so only the command-position precondition is enforced — no
+    # trailing terminator requirement. The prefix `(?:^|[\n;&|`()<>])`
+    # consumes the separator, but re.search only cares about existence.
+    # Natural-language "use printenv to check" (preceded by a space
+    # which is not in the separator set) no longer matches.
+    re.compile(r"(?:^|[\n;&|`()<>])\s*printenv\b"),
     # bare `set` with no args (dumps all vars). Require a separator
     # before and a terminator/pipe/EOL after so `set -e`, `set -o
     # pipefail`, `kubectl set image`, `git remote set-url`, and
