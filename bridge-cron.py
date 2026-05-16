@@ -810,9 +810,17 @@ def _iter_processes_psutil():
 def _iter_processes_ps():
     try:
         out = subprocess.check_output(
-            ["ps", "-eo", "pid=,args="], text=True, stderr=subprocess.DEVNULL
+            ["ps", "-eo", "pid=,args="],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError, OSError):
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        OSError,
+    ):
         return []
     items = []
     for raw_line in out.splitlines():
