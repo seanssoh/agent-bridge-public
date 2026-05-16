@@ -742,6 +742,21 @@ bridge_isolation_v2_reapply_strip_layout_acls() {
     return 0
   fi
 
+  # Platform discriminator gate (S5 Track A2, audit C-S2 Bucket 2):
+  # POSIX `setfacl` is Linux-only. The tool-presence check below would
+  # false-pass on a Darwin host with Homebrew-installed Linux setfacl
+  # (BSD ACL semantics differ — silent no-op or attribute-error). The
+  # discriminator gate is platform-aware and pre-empts the tool-presence
+  # check on non-Linux hosts. Operator can force via
+  # BRIDGE_ISOLATION_REQUIRED=yes (the tool-presence check still
+  # protects against missing setfacl on Linux).
+  if ! bridge_isolation_v2_enforce; then
+    bridge_isolation_v2_reapply_record_action \
+      "$actions_file" "$root" "setfacl_strip_recursive" \
+      "non-linux-host" "non-linux-host" "skipped:platform-discriminator"
+    return 0
+  fi
+
   if ! command -v setfacl >/dev/null 2>&1; then
     # ACL toolchain absent → nothing was set, nothing to strip.
     bridge_isolation_v2_reapply_record_action \

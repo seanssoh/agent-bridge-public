@@ -230,5 +230,83 @@ if grep -q '^RC=0$' "$G6_OUT"; then
 fi
 smoke_log "G6 PASS (explicit opt-in engaged enforcement on Darwin)"
 
-smoke_log "PASS — Bucket 2 gates wired correctly across 6 cases (C08: G1/G2/G3, C13: G4/G5/G6)"
+# --- C-S2 direct coverage (reapply_strip_layout_acls) ---------------------
+# Audit C-S2 (S5 Track A2): the setfacl tool-presence check would false-pass
+# on Darwin with Homebrew-installed Linux setfacl. The discriminator gate
+# pre-empts that. Verifies the new action-record code path.
+
+run_strip_probe() {
+  # Args: $1 = env_required, $2 = host_override, $3 = out_file
+  local env_required="$1"
+  local host_override="$2"
+  local out_file="$3"
+  local driver="$SMOKE_TMP_ROOT/strip-driver-$$.sh"
+  local actions_file="$SMOKE_TMP_ROOT/strip-actions-$$.tsv"
+  local errors_file="$SMOKE_TMP_ROOT/strip-errors-$$.tsv"
+  local target_dir="$SMOKE_TMP_ROOT/strip-target-$$"
+  mkdir -p "$target_dir"
+  : >"$actions_file"
+  : >"$errors_file"
+
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'set -uo pipefail'
+    printf 'cd %q\n' "$REPO_ROOT"
+    printf 'export BRIDGE_HOME=%q\n' "$SMOKE_TMP_ROOT/strip-bh-$$"
+    printf 'export BRIDGE_STATE_DIR=%q\n' "$SMOKE_TMP_ROOT/strip-bh-$$/state"
+    printf 'export BRIDGE_LAYOUT=v2\n'
+    printf 'export BRIDGE_DATA_ROOT=%q\n' "$SMOKE_TMP_ROOT/strip-bh-$$/data"
+    printf 'export BRIDGE_HOST_PLATFORM_OVERRIDE=%q\n' "$host_override"
+    if [[ -n "$env_required" ]]; then
+      printf 'export BRIDGE_ISOLATION_REQUIRED=%q\n' "$env_required"
+    fi
+    printf '%s\n' 'mkdir -p "$BRIDGE_HOME/state" "$BRIDGE_DATA_ROOT"'
+    printf '%s\n' 'source "$0_REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1'
+    printf 'bridge_isolation_v2_reapply_strip_layout_acls apply 1 %q %q %q; echo "RC=$?"\n' \
+      "$actions_file" "$errors_file" "$target_dir"
+    printf 'echo "ACTIONS:"; cat %q\n' "$actions_file"
+  } | sed "s#\$0_REPO_ROOT#$REPO_ROOT#g" >"$driver"
+  chmod +x "$driver"
+
+  "$BRIDGE_BASH" "$driver" >"$out_file" 2>&1
+  rm -f "$driver"
+}
+
+# G7 — strip_layout_acls Darwin default → skipped:platform-discriminator
+smoke_log "G7: strip_layout_acls Darwin default → discriminator skip"
+G7_OUT="$SMOKE_TMP_ROOT/g7.out"
+run_strip_probe "" "Darwin" "$G7_OUT"
+
+if ! grep -q '^RC=0$' "$G7_OUT"; then
+  cat "$G7_OUT"; smoke_fail "G7: expected RC=0 (silent no-op on Darwin)"
+fi
+if ! grep -q 'skipped:platform-discriminator' "$G7_OUT"; then
+  cat "$G7_OUT"; smoke_fail "G7: expected the new platform-discriminator action record on Darwin"
+fi
+smoke_log "G7 PASS"
+
+# G8 — strip_layout_acls Linux default → engages, hits the
+# tool-presence check or proceeds to setfacl. RC=0 either way (since
+# the function always records and returns 0 on missing tooling or
+# completed strip).
+smoke_log "G8: strip_layout_acls Linux default → gate engaged (not skipped:platform-discriminator)"
+G8_OUT="$SMOKE_TMP_ROOT/g8.out"
+run_strip_probe "" "Linux" "$G8_OUT"
+
+if grep -q 'skipped:platform-discriminator' "$G8_OUT"; then
+  cat "$G8_OUT"; smoke_fail "G8: gate short-circuited on host=Linux (should engage)"
+fi
+smoke_log "G8 PASS (gate engaged on host=Linux)"
+
+# G9 — strip_layout_acls Darwin + opt-in → engages
+smoke_log "G9: strip_layout_acls Darwin + opt-in → gate engaged"
+G9_OUT="$SMOKE_TMP_ROOT/g9.out"
+run_strip_probe "yes" "Darwin" "$G9_OUT"
+
+if grep -q 'skipped:platform-discriminator' "$G9_OUT"; then
+  cat "$G9_OUT"; smoke_fail "G9: gate short-circuited on Darwin+opt-in (should engage)"
+fi
+smoke_log "G9 PASS (explicit opt-in overrode Darwin default)"
+
+smoke_log "PASS — Bucket 2 gates wired correctly across 9 cases (C08: G1/G2/G3, C13: G4/G5/G6, C-S2: G7/G8/G9)"
 exit 0
