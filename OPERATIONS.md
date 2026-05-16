@@ -106,6 +106,34 @@ without guessing.
 
 표준 upgrade 절차는 [`UPGRADING.md`](UPGRADING.md) 에 정리되어 있다. 모든 install 에서 동일한 명령으로 진행한다:
 
+### v0.14.0 stabilization milestone (2026-05-16) — operator follow-up
+
+v0.14.0 batches S0-S3 + S5 Track A1/A2 of the v0.14.x stabilization plan. Recommended target for fresh upgrades and for v0.13.10 installs that hit operator-visible noise.
+
+**Recommended upgrade path**:
+
+```bash
+cd <source-checkout>
+git fetch origin
+git checkout v0.14.0
+./agent-bridge upgrade --apply
+```
+
+`upgrade --apply` is a source-to-runtime copy. The new `lib/bridge-isolation-discriminator.sh` module + updated `lib/bridge-isolation-v2.sh` / `bridge-isolation-v2-migrate.sh` / `bridge-isolation-v2-reapply.sh` / `bridge-layout-resolver.sh` lands in `~/.agent-bridge/lib/` automatically. No special migration script is required for v0.13.10 → v0.14.0.
+
+**Operator-visible changes**:
+- `ensure_matrix_path failed` stop-hook spam on macOS is silenced (S2 + S3 fix).
+- `BRIDGE_LAYOUT=legacy` env-leak no longer hard-dies when a valid v2 marker exists; emits a one-line warning and prefers the marker (S2 fix).
+- New env knob `BRIDGE_ISOLATION_REQUIRED=auto|yes|no` (default `auto`: Linux→enforce, else→no-op). Explicit `yes`/`no` override is for self-test scenarios.
+
+**If your install has a runtime stop-gap patch** (manual edit to `~/.agent-bridge/lib/bridge-isolation-v2.sh` to silence the stop-hook noise before v0.14.0): the upgrade overwrites it with the proper discriminator-based fix. No manual cleanup needed.
+
+**Linux operators**: default behavior unchanged. `BRIDGE_ISOLATION_REQUIRED=auto` resolves to `yes` on Linux — every Bucket 2 gate keeps the existing chgrp/setgid/setfacl enforcement path.
+
+**macOS operators**: the platform-discriminator gates make isolation-v2 enforcement an explicit no-op. The stop-hook noise that prompted the S2 fix is gone after upgrade.
+
+For per-stage detail, see `CHANGELOG.md` `[0.14.0]`. For the stabilization roadmap, see `docs/stabilization-plan-2026-05-15.md` + `docs/audit-2026-05-15.md`.
+
 ### v0.13.x hotfix wave (2026-05-15) — operator follow-up
 
 If you're upgrading from any v0.7.x install, target v0.13.10 or later. The v0.13.7-v0.13.10 cycle fixed a four-stage `agent-bridge upgrade --apply` blocker that affected the v0.7.x → v0.13.x leap on Bash 5.3.9 hosts (matched by recent Linux distros). Operators on macOS were similarly affected by a markerless-existing-install layout reject.
@@ -125,11 +153,11 @@ Expected behavior (post-v0.13.10):
 - `isolation-v2 migrate result`: should show `"reason":"marker-only-no-isolated-roster"` for typical v0.7.x → v0.13.10 paths.
 - `apply-live` completes within ~10 minutes; daemon, queue, agents accessible after restart.
 
-**If your shell session predates v0.13.10**: the parent process may carry `BRIDGE_LAYOUT=legacy` env from the old install. Symptom: `agb` commands fail with `current_layout=legacy`. Workaround: `unset BRIDGE_LAYOUT BRIDGE_DATA_ROOT` in the affected shell, or restart Claude Code / tmux server. Marker on disk is correct; only the inherited env is stale. Planned fix in stabilization plan S2.
+**If your shell session predates v0.13.10**: the parent process may carry `BRIDGE_LAYOUT=legacy` env from the old install. Symptom on v0.13.10 and earlier: `agb` commands fail with `current_layout=legacy`. Workaround for v0.13.10: `unset BRIDGE_LAYOUT BRIDGE_DATA_ROOT` in the affected shell, or restart Claude Code / tmux server. Marker on disk is correct; only the inherited env is stale. **Fixed in v0.14.0**: the resolver now demotes the hard-die to a warning when a valid v2 marker exists and prefers the marker.
 
 **If your install has isolated agents in the roster** (linux-user mode, Linux only): the fast-path does NOT fire; the full migration runs and needs sudo for `groupadd` / `usermod`. Run with sudo available or follow the documented migration recipe.
 
-**On macOS**: the marker-only fast-path covers the typical case (shared-mode agents). Avoid `agent-bridge agent add --isolated` on macOS — `dseditgroup` requires sudo and the isolation contract does not apply on macOS (POSIX setgid is Linux-only). Stay on shared mode. Planned fix in stabilization plan S6 — explicit error gate.
+**On macOS**: the marker-only fast-path covers the typical case (shared-mode agents). Avoid `agent-bridge agent add --isolated` on macOS — `dseditgroup` requires sudo and the isolation contract does not apply on macOS (POSIX setgid is Linux-only). Stay on shared mode. **v0.14.0 update**: the platform discriminator (`BRIDGE_ISOLATION_REQUIRED=auto` default) makes the no-op explicit — Bucket 2 enforcement primitives silently skip on macOS instead of emitting `ensure_matrix_path failed` warnings. Operators who need to self-test enforcement on macOS can set `BRIDGE_ISOLATION_REQUIRED=yes` to force engagement.
 
 For per-release detail, see `CHANGELOG.md` v0.13.7 through v0.13.10. For stabilization roadmap, see `docs/stabilization-plan-2026-05-15.md` + `docs/audit-2026-05-15.md`.
 
