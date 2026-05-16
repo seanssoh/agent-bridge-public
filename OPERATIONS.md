@@ -68,6 +68,16 @@ to opt out, or invoke the installer directly:
 ./scripts/install-daemon-liveness-systemd.sh --apply --enable      # Linux
 ```
 
+`BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS` (default 60s, issue #767) is the
+minimum interval between identical-fingerprint inbox nudges to the same
+agent. The daemon hashes the agent's queued task IDs each sync cycle; if the
+fingerprint has not changed and the previous nudge fired within this window,
+the redundant nudge is suppressed and an `session_nudge_deduped` audit row
+is emitted instead. This prevents `[Agent Bridge]: ACTION REQUIRED` payloads
+from piling up in an agent's transcript while it is mid-tool-call. Per-agent
+state lives in `state/daemon-nudge-state/<agent>.env`. Raise the value on
+chronically-slow hosts; set to `0` to disable dedup entirely.
+
 Check overall status:
 
 ```bash

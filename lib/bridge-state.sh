@@ -1015,6 +1015,12 @@ bridge_load_roster() {
   : "${BRIDGE_TASK_LEASE_SECONDS:=900}"
   : "${BRIDGE_TASK_IDLE_NUDGE_SECONDS:=120}"
   : "${BRIDGE_TASK_NUDGE_COOLDOWN_SECONDS:=300}"
+  # Issue #767: minimum seconds between identical-fingerprint inbox nudges to
+  # the same agent. Suppresses redundant nudges when the queue's pending-task
+  # set hasn't changed (e.g., target agent is mid-tool-call and hasn't drained
+  # the inbox yet). Default 60s; raise on chronically-slow hosts. Set to 0 to
+  # disable dedup entirely.
+  : "${BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS:=60}"
   : "${BRIDGE_TASK_HEARTBEAT_WINDOW_SECONDS:=300}"
   : "${BRIDGE_HEALTH_WARN_SECONDS:=3600}"
   : "${BRIDGE_HEALTH_CRITICAL_SECONDS:=14400}"
