@@ -19,8 +19,6 @@ export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
 trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
-# shellcheck source=lib/bridge-admin-pair.sh
-source "$SCRIPT_DIR/lib/bridge-admin-pair.sh"
 # shellcheck source=lib/bridge-host-profile.sh
 source "$SCRIPT_DIR/lib/bridge-host-profile.sh"
 # shellcheck source=lib/bridge-init-default-crons.sh
@@ -166,7 +164,7 @@ print(json.dumps(sys.argv[1:], ensure_ascii=False))
 PY
 }
 
-admin_agent="${BRIDGE_ADMIN_AGENT_ID:-admin}"
+admin_agent="${BRIDGE_ADMIN_AGENT_ID:-patch}"
 engine="claude"
 session=""
 workdir=""
@@ -507,30 +505,12 @@ else
   bridge_load_roster
 fi
 
-# Issue #517: ensure the admin's sibling codex dev pair (`<admin>-dev`) and
-# inject the pair-programming SOP managed block into the admin's CLAUDE.md.
-# Applies regardless of admin engine — the pair is always engine=codex; the
-# SOP block is engine-neutral (it talks about plan/review/implement loops,
-# which apply to any orchestrator). Tolerant on failure — pair backfill must
-# never fail an otherwise-successful admin install. Skipped on --dry-run to
-# honor the mutation-free contract.
-if [[ $dry_run -eq 0 ]]; then
-  pair_output=""
-  if ! pair_output="$(bridge_ensure_admin_codex_pair "$admin_agent" 2>&1)"; then
-    bridge_init_append_warning "admin-pair backfill failed: ${pair_output}"
-  else
-    [[ -n "$pair_output" ]] && printf '%s\n' "$pair_output" >&2
-    # Issue #848: bridge_ensure_admin_codex_pair may have appended a new
-    # static agent to the roster file — invalidate before the re-load
-    # so the next call observes the new entry.
-    bridge_roster_cache_invalidate
-    bridge_load_roster
-    inject_output=""
-    if ! inject_output="$(python3 "$SCRIPT_DIR/bridge-upgrade.py" inject-admin-pair-block --target-root "$BRIDGE_HOME" --admin-agent "$admin_agent" 2>&1)"; then
-      bridge_init_append_warning "admin-pair CLAUDE.md inject failed: ${inject_output}"
-    fi
-  fi
-fi
+# Issue #4769 (reverts #517): no auto-backfill of `<admin>-dev` codex pair.
+# Operator runs `agent-bridge setup admin <agent>` explicitly to set the
+# admin identifier, and creates any sibling dev agent (e.g. `patch-dev`)
+# with `agent-bridge agent create <name> --engine codex …` when desired.
+# Auto-creating a sibling defeated the model-diversity intent of the
+# `patch (claude) + patch-dev (codex)` standard pair.
 
 if [[ $dry_run -eq 0 ]] && [[ "$(bridge_agent_engine "$admin_agent" 2>/dev/null || printf '%s' "$engine")" == "claude" ]]; then
   admin_workdir="$(bridge_agent_workdir "$admin_agent" 2>/dev/null || true)"

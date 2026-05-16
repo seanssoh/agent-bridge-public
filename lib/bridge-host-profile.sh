@@ -485,11 +485,14 @@ bridge_host_profile_emit_dev_advisories() {
   fi
   printf '  - picker-sweep 자동 unstick: skip (BRIDGE_PICKER_SWEEP_ENABLED=1 로 override 가능)\n'
   printf '\n'
-  printf '정적 에이전트는 admin(`%s`) + admin-dev(`%s` codex pair) 2개로\n' "$admin_agent" "$admin_pair"
-  printf '시작합니다. 추가 정적 역할은 운영 모드에서만 필요한 경우가 일반적입니다.\n'
+  printf '정적 에이전트는 우선 admin(`%s`) 1 개만 등록합니다 (issue #4769).\n' "$admin_agent"
+  printf '모델 다양성용 codex 페어(`%s`)는 다음 명령으로 명시 등록할 수 있습니다:\n' "$admin_pair"
+  printf '  agent-bridge agent create %s --engine codex \\\n' "$admin_pair"
+  printf '    --workdir "$(agent-bridge agent show %s --field workdir)" \\\n' "$admin_agent"
+  printf '    --allow-shared-workdir --always-on\n'
   printf '\n'
-  printf 'admin 에이전트의 CLAUDE.md 에는 `wave-orchestration` 스킬을 default workflow\n'
+  printf '%s 에이전트의 CLAUDE.md 에는 `wave-orchestration` 스킬을 default workflow\n' "$admin_agent"
   printf '로 사용하라는 SOP 블록이 자동 주입됩니다 — 사용자가 "X 만들어줘" 라고 하면\n'
-  printf '%s + %s 페어가 wave (병렬 issue-fixer + codex review) 로 진행합니다.\n' "$admin_agent" "$admin_pair"
+  printf '%s 가 wave (병렬 issue-fixer + codex review) 로 진행합니다.\n' "$admin_agent"
   printf '\n'
 }

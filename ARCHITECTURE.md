@@ -85,7 +85,6 @@ Shared Bash implementation is split under [`lib/`](./lib):
 **Wave orchestration**
 
 - `bridge-wave.sh`: wave-orchestration runtime support (used by skill `wave-orchestration`)
-- `bridge-admin-pair.sh`: admin-pair backfill + state (for paired Claude+Codex sessions)
 
 ## State Layout
 

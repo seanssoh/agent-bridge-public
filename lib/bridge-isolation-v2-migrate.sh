@@ -401,10 +401,13 @@ _bridge_isolation_v2_migrate_normalize_path() {
 
 # v0.8.6 hotfix: a `<admin>-dev` agent that explicitly co-locates with
 # its admin's workdir/profile_home is the documented PR #691 admin-pair
-# pattern (`bridge_ensure_admin_codex_pair` + `agent create
-# --allow-shared-workdir`). Migration preflight must NOT reject this —
-# same-workdir is the entire point of the pair (shared SOUL/MEMORY/
-# CLAUDE.md so two models review the same tree from different angles).
+# shape (operator-registered codex sibling created with `agent create
+# --allow-shared-workdir`; the auto-backfill helper that originally
+# served this shape was removed in #4769, the whitelist itself stays so
+# operators who register the pair manually keep their preflight pass).
+# Migration preflight must NOT reject this — same-workdir is the entire
+# point of the pair (shared SOUL/MEMORY/ CLAUDE.md so two models
+# review the same tree from different angles).
 # Returns 0 (whitelisted) when the agent is the sibling `-dev` of an
 # admin in the roster, both sides are shared mode, the admin's workdir
 # is set, and the override expands to the same path. Used by
@@ -430,8 +433,9 @@ _bridge_isolation_v2_migrate_is_admin_pair_override() {
   # `worker` is not the configured admin. Tighten the gate to require
   # the base agent to be the configured admin
   # (`BRIDGE_ADMIN_AGENT_ID` / `bridge_admin_agent_id`). Combined with
-  # the `<admin>-dev` name pattern this matches exactly the
-  # `bridge_ensure_admin_codex_pair` shape and nothing else.
+  # the `<admin>-dev` name pattern this matches exactly the documented
+  # admin-pair shape (`<admin>` + sibling `<admin>-dev` codex agent
+  # co-located via `--allow-shared-workdir`) and nothing else.
   local configured_admin=""
   if command -v bridge_admin_agent_id >/dev/null 2>&1; then
     configured_admin="$(bridge_admin_agent_id 2>/dev/null || true)"
@@ -498,10 +502,11 @@ bridge_isolation_v2_migrate_check_profile_home_overrides() {
     # v0.8.6 hotfix: whitelist the admin-pair pattern (PR #691). A
     # `<admin>-dev` sibling whose profile_home points at its admin's
     # workdir is the documented co-located pair-programming setup
-    # (`bridge_ensure_admin_codex_pair`'s `pair_workdir="$(bridge_agent_workdir
-    # "$admin")"` plus `--allow-shared-workdir`), not a stale roster
-    # entry. Skip the warning + don't flip mismatch so the migration
-    # preserves the operator's intentional pair-programming co-location.
+    # (operator runs `agent create <admin>-dev --workdir "$(agent show
+    # <admin> --field workdir)" --allow-shared-workdir`), not a stale
+    # roster entry. Skip the warning + don't flip mismatch so the
+    # migration preserves the operator's intentional pair-programming
+    # co-location.
     if _bridge_isolation_v2_migrate_is_admin_pair_override "$agent" "$override"; then
       continue
     fi

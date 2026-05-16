@@ -799,6 +799,70 @@ print("" if value is None else str(value))
 PY
 }
 
+# Issue #4769 (reverts #517): when a host carries the auto-created
+# `admin` + `admin-dev` pair from a previous v0.14.x upgrade, emit a
+# non-destructive advisory describing the explicit-setup contract and
+# the retire/setup recipe to restore the operator's intended admin id
+# (typically `patch`). Strictly read-only: no roster mutation, no agent
+# removal. Dry-run prints a plan line instead of probing the live
+# install.
+#
+# Idempotency: the advisory is one-shot. After printing, drop a marker
+# at $TARGET_ROOT/state/admin-pair-advisory-acknowledged.ts so the next
+# upgrade short-circuits. Operators who keep admin/admin-dev never see
+# the advisory after the first upgrade. Operators who want to re-read
+# the recipe can `rm $BRIDGE_HOME/state/admin-pair-advisory-acknowledged.ts`
+# or set BRIDGE_ADMIN_PAIR_ADVISORY=force. Hard-suppress with
+# BRIDGE_ADMIN_PAIR_ADVISORY=0.
+bridge_upgrade_emit_admin_pair_advisory() {
+  local target_root="$1"
+  local admin_id="$2"
+  local dry_run="${3:-0}"
+  local advisory_mode="${BRIDGE_ADMIN_PAIR_ADVISORY:-1}"
+
+  if [[ "$advisory_mode" == "0" ]]; then
+    return 0
+  fi
+
+  if [[ "$dry_run" == "1" ]]; then
+    echo "[bridge-upgrade] plan: advise on auto-created admin/admin-dev (one-shot; no-op when absent or acknowledged)" >&2
+    return 0
+  fi
+
+  # Heuristic for "auto-created by removed admin-pair feature":
+  #   - $BRIDGE_ADMIN_AGENT_ID resolves to literal "admin"
+  #   - both `admin/` and `admin-dev/` agent homes exist
+  # An operator who explicitly chose admin/admin-dev as their pair gets
+  # the advisory ONCE — the recipe is non-destructive and they can
+  # ignore it. The marker prevents repeat noise on subsequent upgrades.
+  [[ "$admin_id" == "admin" ]] || return 0
+  local agent_root="$target_root/agents"
+  [[ -d "$agent_root/admin" ]] || return 0
+  [[ -d "$agent_root/admin-dev" ]] || return 0
+
+  local marker="$target_root/state/admin-pair-advisory-acknowledged.ts"
+  if [[ -f "$marker" && "$advisory_mode" != "force" ]]; then
+    return 0
+  fi
+
+  cat >&2 <<'ADVISORY'
+[bridge-upgrade] ADVISORY: admin/admin-dev appear to be auto-created by the removed admin-pair feature.
+[bridge-upgrade] To restore the recommended patch-only contract:
+[bridge-upgrade]   agent-bridge agent retire admin-dev
+[bridge-upgrade]   agent-bridge agent retire admin
+[bridge-upgrade]   agent-bridge setup admin patch
+[bridge-upgrade] (Skip if you intentionally created admin/admin-dev.)
+[bridge-upgrade] This advisory will not repeat. Re-show with BRIDGE_ADMIN_PAIR_ADVISORY=force, suppress with =0.
+ADVISORY
+
+  # Best-effort marker write. state/ should already exist on a live
+  # install; mkdir -p is a safety net for malformed targets. Failure
+  # to write the marker is non-fatal — the next upgrade re-emits the
+  # advisory, which is harmless.
+  mkdir -p "$target_root/state" 2>/dev/null || true
+  date -u '+%Y-%m-%dT%H:%M:%SZ' >"$marker" 2>/dev/null || true
+}
+
 bridge_upgrade_conflicts_dispatch() {
   # Issue #394: thin shell dispatcher for the `conflicts` lifecycle
   # subcommands. Delegates to bridge-upgrade.py so list/diff/adopt/
@@ -1648,38 +1712,12 @@ if [[ $MIGRATE_AGENTS -eq 1 ]]; then
     done
   ' -- "$SOURCE_ROOT" "$DRY_RUN"
 
-  # Issue #517: backfill the admin's sibling codex dev pair (`<admin>-dev`).
-  # Idempotent — skipped when the pair already exists. The admin CLAUDE.md
-  # managed pair-programming block is refreshed by `migrate-agents` above
-  # (admin session_type branch in migrate_agent_home), so this step only
-  # owns the agent registration. Tolerant on failure: warn and continue.
-  if [[ -n "$ADMIN_AGENT_ID" ]]; then
-    if [[ $DRY_RUN -eq 1 ]]; then
-      echo "[bridge-upgrade] plan: ensure admin codex pair ${ADMIN_AGENT_ID}-dev (idempotent)" >&2
-    else
-      _admin_pair_output=""
-      if ! _admin_pair_output="$(
-        bridge_upgrade_with_target_env "$TARGET_ROOT" "$BRIDGE_BASH_BIN" -lc '
-          set -euo pipefail
-          # bridge-admin-pair.sh:bridge_ensure_admin_codex_pair invokes
-          # "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" agent create ...,
-          # so SCRIPT_DIR must be bound before sourcing the helper. Without
-          # this the heredocs subshells set -u aborts as
-          # "SCRIPT_DIR: unbound variable" and admin-pair backfill fails on
-          # every upgrade. (Issue #517 r1 review finding 1.)
-          SCRIPT_DIR="$1"
-          source "$SCRIPT_DIR/bridge-lib.sh"
-          source "$SCRIPT_DIR/lib/bridge-admin-pair.sh"
-          bridge_load_roster
-          bridge_ensure_admin_codex_pair "$2"
-        ' -- "$SOURCE_ROOT" "$ADMIN_AGENT_ID" 2>&1
-      )"; then
-        echo "[bridge-upgrade] WARN: admin-pair backfill failed: $_admin_pair_output" >&2
-      else
-        [[ -n "$_admin_pair_output" ]] && printf '%s\n' "$_admin_pair_output" >&2
-      fi
-    fi
-  fi
+  # Issue #4769 (reverts #517): no auto-backfill of `<admin>-dev` codex pair
+  # on upgrade. The post-upgrade advisory below points operators of hosts
+  # where the removed feature already auto-created admin/admin-dev to the
+  # explicit setup/retire recipe — but no destructive action runs here.
+
+  bridge_upgrade_emit_admin_pair_advisory "$TARGET_ROOT" "$ADMIN_AGENT_ID" "$DRY_RUN"
 
   # Issue #833 r2: backfill the picker-sweep cron on every upgrade.
   # bridge-init.sh registers it on fresh install, but existing installs that

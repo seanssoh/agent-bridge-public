@@ -27,10 +27,13 @@
 #
 # Per OPERATIONS.md "picker-sweep utility" §B (Bridge-native cron with a
 # Codex target): the cron runner wraps payloads in `claude -p` (or `codex
-# exec`), so we target `<admin>-dev` (the codex pair always present after
-# bridge-init runs `bridge_ensure_admin_codex_pair`). Targeting the Claude
-# admin would route picker-sweep through the very picker it is meant to
-# clear — see OPERATIONS.md.
+# exec`), so we target `<admin>-dev` (the codex pair that the operator
+# explicitly registers alongside the admin, e.g. `patch-dev` for the
+# default `patch` admin). Targeting the Claude admin would route
+# picker-sweep through the very picker it is meant to clear — see
+# OPERATIONS.md. Issue #4769 (reverts #517): the `<admin>-dev` pair is
+# no longer auto-created on init; the existence guard below already
+# short-circuits when the operator hasn't registered it yet.
 bridge_init_register_default_picker_sweep() {
   local agent_bridge_cli="$1"
   local admin_agent="$2"
@@ -47,11 +50,13 @@ bridge_init_register_default_picker_sweep() {
 
   # Skip when the cron target <admin>-dev (the codex pair) is not in the
   # roster. Without this guard the cron persists a job referencing an
-  # agent that does not exist — every dispatch then fails. Happens on
-  # hosts where bridge_ensure_admin_codex_pair was skipped because
-  # codex CLI was absent (see lib/bridge-admin-pair.sh). Operator can
-  # install codex + re-run bridge-bootstrap.sh to backfill both the
-  # pair AND this cron.
+  # agent that does not exist — every dispatch then fails. After issue
+  # #4769 the `<admin>-dev` pair is no longer auto-created on init: the
+  # operator registers it explicitly with `agent-bridge agent create
+  # <admin>-dev --engine codex …`. Operators who skip the dev pair (or
+  # haven't installed the codex CLI yet) keep the skip message below;
+  # re-running `bridge-bootstrap.sh` after registering the pair will
+  # backfill the cron on its next invocation.
   if ! bridge_agent_exists "$cron_agent" 2>/dev/null; then
     printf '[init] picker-sweep cron skipped — target agent %s not in roster (codex pair absent). Install codex CLI and re-run bridge-bootstrap.sh to backfill.\n' "$cron_agent" >&2
     return 0
