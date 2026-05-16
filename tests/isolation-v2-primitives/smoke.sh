@@ -164,7 +164,14 @@ if [[ -n "$caller_group" ]]; then
   # operation directly. Run this WITHOUT relying on sudo by stubbing
   # out `sudo` to fail; a passing run proves the helper goes through
   # the direct path first and does not silently require sudo.
+  #
+  # PR #919 readiness gate: this test exercises the rootless chgrp
+  # primitive directly. The discriminator's readiness probe would
+  # short-circuit on a fresh CI host without an ab-shared group,
+  # so force the cache to "yes" — we're not testing readiness here,
+  # we're testing the chgrp/chmod behavior on a tree the caller owns.
   (
+    export _BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED=yes
     sudo() { return 127; }
     export -f sudo
     bridge_isolation_v2_chgrp_setgid_recursive \
@@ -269,8 +276,13 @@ ok "legacy default does not leak v2 group exports to child env"
 if [[ -n "$caller_group" ]]; then
   single_dir="$TMP_ROOT/setgid-single"
   mkdir -p "$single_dir"
-  bridge_isolation_v2_chgrp_setgid_dir "$caller_group" 2750 "$single_dir" \
-    || die "chgrp_setgid_dir: failed on rootless primary-group path"
+  # PR #919 readiness gate: same rationale as the recursive variant
+  # above — testing chgrp/chmod behavior on caller-owned tree, not
+  # fresh-host readiness skip. Force the cache "yes" for this call.
+  (
+    export _BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED=yes
+    bridge_isolation_v2_chgrp_setgid_dir "$caller_group" 2750 "$single_dir"
+  ) || die "chgrp_setgid_dir: failed on rootless primary-group path"
   single_mode="$(stat -c '%a' "$single_dir" 2>/dev/null || stat -f '%Lp' "$single_dir" 2>/dev/null)"
   case "$single_mode" in
     2750|02750|750) ok "chgrp_setgid_dir: applied mode (got $single_mode)" ;;

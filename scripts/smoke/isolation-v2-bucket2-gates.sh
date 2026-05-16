@@ -48,10 +48,12 @@ fi
 
 run_gate_probe() {
   # Args: $1 = env_required, $2 = host_override, $3 = snippet, $4 = out_file
+  #       $5 = primitives_ready_override ("yes"|"no" or empty)
   local env_required="$1"
   local host_override="$2"
   local snippet="$3"
   local out_file="$4"
+  local primitives_ready="${5:-}"
   local driver="$SMOKE_TMP_ROOT/driver-$$.sh"
 
   {
@@ -68,6 +70,13 @@ run_gate_probe() {
     fi
     printf '%s\n' 'mkdir -p "$BRIDGE_HOME/state" "$BRIDGE_DATA_ROOT"'
     printf '%s\n' 'source "$0_REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1'
+    # PR #919 readiness gate: bypass the getent probe so the smoke is
+    # deterministic regardless of whether the test host has an
+    # ab-shared group. "yes" → primitives ready, gate may engage;
+    # "no" → primitives missing, gate skips on auto policy.
+    if [[ -n "$primitives_ready" ]]; then
+      printf 'export _BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED=%q\n' "$primitives_ready"
+    fi
     printf '%s\n' "$snippet"
   } | sed "s#\$0_REPO_ROOT#$REPO_ROOT#g" >"$driver"
   chmod +x "$driver"
@@ -109,7 +118,7 @@ mkdir -p "$G2_TREE"
 touch "$G2_TREE/file"
 run_gate_probe "" "Linux" \
   "bridge_isolation_v2_chgrp_setgid_recursive definitely_missing_group_910 2750 0640 '$G2_TREE'; echo \"RC=\$?\"" \
-  "$G2_OUT" || true
+  "$G2_OUT" "yes" || true
 
 if grep -q '^RC=0$' "$G2_OUT"; then
   cat "$G2_OUT"; smoke_fail "G2: gate short-circuited (RC=0); enforcement did NOT engage on host=Linux"
@@ -129,7 +138,7 @@ mkdir -p "$G3_TREE"
 touch "$G3_TREE/file"
 run_gate_probe "yes" "Darwin" \
   "bridge_isolation_v2_chgrp_setgid_recursive definitely_missing_group_910 2750 0640 '$G3_TREE'; echo \"RC=\$?\"" \
-  "$G3_OUT" || true
+  "$G3_OUT" "no" || true
 
 if grep -q '^RC=0$' "$G3_OUT"; then
   cat "$G3_OUT"; smoke_fail "G3: gate short-circuited (RC=0); BRIDGE_ISOLATION_REQUIRED=yes did NOT override Darwin default"
@@ -158,10 +167,12 @@ stage_normalize_fixture() {
 
 run_normalize_probe() {
   # Args: $1 = env_required, $2 = host_override, $3 = data_root, $4 = out_file
+  #       $5 = primitives_ready_override ("yes"|"no" or empty)
   local env_required="$1"
   local host_override="$2"
   local data_root="$3"
   local out_file="$4"
+  local primitives_ready="${5:-}"
   local driver="$SMOKE_TMP_ROOT/normalize-driver-$$.sh"
   local snapshot="$SMOKE_TMP_ROOT/normalize-snapshot.json"
   printf '{}\n' >"$snapshot"
@@ -179,6 +190,9 @@ run_normalize_probe() {
     printf 'export BRIDGE_CONTROLLER_GROUP=definitely_missing_ctrl_grp_910\n'
     if [[ -n "$env_required" ]]; then
       printf 'export BRIDGE_ISOLATION_REQUIRED=%q\n' "$env_required"
+    fi
+    if [[ -n "$primitives_ready" ]]; then
+      printf 'export _BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED=%q\n' "$primitives_ready"
     fi
     printf '%s\n' 'mkdir -p "$BRIDGE_HOME/state"'
     printf '%s\n' 'source "$0_REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1'
@@ -212,7 +226,7 @@ smoke_log "G4 PASS"
 smoke_log "G5: migrate_normalize_layout Linux engages (asserts non-zero RC on missing groups)"
 G5_DATA="$(stage_normalize_fixture "$SMOKE_TMP_ROOT/g5-data")"
 G5_OUT="$SMOKE_TMP_ROOT/g5.out"
-run_normalize_probe "" "Linux" "$G5_DATA" "$G5_OUT"
+run_normalize_probe "" "Linux" "$G5_DATA" "$G5_OUT" "yes"
 
 if grep -q '^RC=0$' "$G5_OUT"; then
   cat "$G5_OUT"; smoke_fail "G5: gate short-circuited on host=Linux (RC=0); enforcement did NOT engage"
@@ -223,7 +237,7 @@ smoke_log "G5 PASS (gate engaged on host=Linux; normalize_layout failed on missi
 smoke_log "G6: migrate_normalize_layout Darwin + opt-in engages"
 G6_DATA="$(stage_normalize_fixture "$SMOKE_TMP_ROOT/g6-data")"
 G6_OUT="$SMOKE_TMP_ROOT/g6.out"
-run_normalize_probe "yes" "Darwin" "$G6_DATA" "$G6_OUT"
+run_normalize_probe "yes" "Darwin" "$G6_DATA" "$G6_OUT" "no"
 
 if grep -q '^RC=0$' "$G6_OUT"; then
   cat "$G6_OUT"; smoke_fail "G6: gate short-circuited on Darwin+opt-in (RC=0); enforcement did NOT engage"
@@ -237,9 +251,11 @@ smoke_log "G6 PASS (explicit opt-in engaged enforcement on Darwin)"
 
 run_strip_probe() {
   # Args: $1 = env_required, $2 = host_override, $3 = out_file
+  #       $4 = primitives_ready_override ("yes"|"no" or empty)
   local env_required="$1"
   local host_override="$2"
   local out_file="$3"
+  local primitives_ready="${4:-}"
   local driver="$SMOKE_TMP_ROOT/strip-driver-$$.sh"
   local actions_file="$SMOKE_TMP_ROOT/strip-actions-$$.tsv"
   local errors_file="$SMOKE_TMP_ROOT/strip-errors-$$.tsv"
@@ -259,6 +275,9 @@ run_strip_probe() {
     printf 'export BRIDGE_HOST_PLATFORM_OVERRIDE=%q\n' "$host_override"
     if [[ -n "$env_required" ]]; then
       printf 'export BRIDGE_ISOLATION_REQUIRED=%q\n' "$env_required"
+    fi
+    if [[ -n "$primitives_ready" ]]; then
+      printf 'export _BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED=%q\n' "$primitives_ready"
     fi
     printf '%s\n' 'mkdir -p "$BRIDGE_HOME/state" "$BRIDGE_DATA_ROOT"'
     printf '%s\n' 'source "$0_REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1'
@@ -291,7 +310,7 @@ smoke_log "G7 PASS"
 # completed strip).
 smoke_log "G8: strip_layout_acls Linux default → gate engaged (not skipped:platform-discriminator)"
 G8_OUT="$SMOKE_TMP_ROOT/g8.out"
-run_strip_probe "" "Linux" "$G8_OUT"
+run_strip_probe "" "Linux" "$G8_OUT" "yes"
 
 if grep -q 'skipped:platform-discriminator' "$G8_OUT"; then
   cat "$G8_OUT"; smoke_fail "G8: gate short-circuited on host=Linux (should engage)"
@@ -301,7 +320,7 @@ smoke_log "G8 PASS (gate engaged on host=Linux)"
 # G9 — strip_layout_acls Darwin + opt-in → engages
 smoke_log "G9: strip_layout_acls Darwin + opt-in → gate engaged"
 G9_OUT="$SMOKE_TMP_ROOT/g9.out"
-run_strip_probe "yes" "Darwin" "$G9_OUT"
+run_strip_probe "yes" "Darwin" "$G9_OUT" "no"
 
 if grep -q 'skipped:platform-discriminator' "$G9_OUT"; then
   cat "$G9_OUT"; smoke_fail "G9: gate short-circuited on Darwin+opt-in (should engage)"
@@ -327,8 +346,12 @@ G10_DRIVER="$SMOKE_TMP_ROOT/g10-driver.sh"
   # Source ONLY the reapply module (no bridge-lib.sh).
   printf '%s\n' 'source "$0_REPO_ROOT/lib/bridge-isolation-v2-reapply.sh" 2>&1'
   printf '%s\n' 'if declare -f bridge_isolation_v2_enforce >/dev/null 2>&1; then echo "ENFORCE_DEFINED=yes"; else echo "ENFORCE_DEFINED=no"; fi'
-  # Sanity probe: with host=Linux, the gate must engage (not the discriminator-skip path).
+  # Sanity probe: with host=Linux + primitives ready, the gate must
+  # engage (not the discriminator-skip path). PR #919 readiness gate:
+  # set the cache var to make this deterministic regardless of whether
+  # the test host has an ab-shared group.
   printf '%s\n' 'export BRIDGE_HOST_PLATFORM_OVERRIDE=Linux'
+  printf '%s\n' 'export _BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED=yes'
   printf '%s\n' 'bridge_isolation_v2_enforce; echo "ENFORCE_RC=$?"'
 } | sed "s#\$0_REPO_ROOT#$REPO_ROOT#g" >"$G10_DRIVER"
 chmod +x "$G10_DRIVER"

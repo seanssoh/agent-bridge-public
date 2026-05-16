@@ -101,9 +101,25 @@ bridge_isolation_discriminator_auto_resolve() {
 
 bridge_isolation_v2_enforce() {
   # Bucket 2 enforcement gate. Returns 0 (enforce v2) when:
-  #   - host is Linux and BRIDGE_ISOLATION_REQUIRED is auto/yes, OR
+  #   - host is Linux and BRIDGE_ISOLATION_REQUIRED is auto/yes, AND
+  #   - v2 primitives are initialized (POSIX groups exist), OR
   #   - operator explicitly set BRIDGE_ISOLATION_REQUIRED=yes
   # Returns 1 (skip v2 enforcement, silent no-op) otherwise.
+  #
+  # E2E test on Ubuntu 24.04 VM (2026-05-16) caught a Linux-side
+  # regression: discriminator returns "yes" on Linux + auto policy,
+  # but on a fresh install where isolation-v2 groups (ab-shared,
+  # ab-controller) haven't been created yet, the downstream
+  # chgrp/setgid primitives fail and emit
+  # `[경고] ensure_matrix_path failed for agent=<X> marker=idle-since`
+  # on every daemon write — same operator-visible noise class as
+  # macOS pre-S2. Add a primitives-readiness check: skip enforcement
+  # if the canonical v2 groups don't exist yet. Operator can complete
+  # v2 init via `agent-bridge migrate isolation v2 --apply` (which
+  # creates the groups), and subsequent calls then engage.
+  #
+  # Explicit `BRIDGE_ISOLATION_REQUIRED=yes` bypasses the readiness
+  # check (operator wants to see the loud failures during self-test).
   #
   # Codex r1 catch (PR #908): MUST NOT wrap auto_resolve in `$()` —
   # the subshell would prevent the cache var from persisting to the
@@ -114,7 +130,41 @@ bridge_isolation_v2_enforce() {
   # Usage at call site:
   #   bridge_isolation_v2_enforce || return 0
   bridge_isolation_discriminator_auto_resolve >/dev/null
-  [[ "$_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED" == "yes" ]]
+  [[ "$_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED" == "yes" ]] || return 1
+  # Auto-resolve said yes. If operator forced via env=yes, skip the
+  # readiness probe — they want to see chgrp/setfacl failures during
+  # self-test. Otherwise (auto on Linux), require primitives ready.
+  if [[ "${BRIDGE_ISOLATION_REQUIRED:-auto}" == "yes" ]]; then
+    return 0
+  fi
+  _bridge_isolation_discriminator_primitives_ready
+}
+
+_bridge_isolation_discriminator_primitives_ready() {
+  # Cached check: do the canonical v2 POSIX groups exist? On fresh
+  # installs the groups are absent until `agent-bridge migrate
+  # isolation v2 --apply` runs. While absent, every v2 enforcement
+  # primitive would fail and emit noise — treat as "not ready" and
+  # skip enforcement (gate returns 1).
+  #
+  # Cache result for the shell's lifetime to avoid the getent fork
+  # cost on every daemon-loop matrix-touch.
+  if [[ -n "${_BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED:-}" ]]; then
+    [[ "$_BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED" == "yes" ]]
+    return $?
+  fi
+  local shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
+  if getent group "$shared_grp" >/dev/null 2>&1; then
+    _BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED=yes
+    return 0
+  fi
+  _BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED=no
+  return 1
+}
+
+bridge_isolation_discriminator_clear_primitives_cache() {
+  # Test hook — used by smokes that create groups mid-shell.
+  unset _BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED
 }
 
 bridge_isolation_v2_require_linux() {
@@ -140,9 +190,10 @@ bridge_isolation_v2_require_linux() {
 }
 
 bridge_isolation_discriminator_clear_cache() {
-  # Test/tool hook: invalidate the resolved cache so a follow-up call
-  # to `_auto_resolve` re-reads BRIDGE_ISOLATION_REQUIRED. Not used in
-  # production code paths; smoke harnesses that mutate the env var
-  # mid-run need this.
+  # Test/tool hook: invalidate BOTH the resolved-policy cache AND the
+  # primitives-readiness cache. Smoke harnesses that mutate env or
+  # group state mid-run need to call this so subsequent _enforce
+  # calls re-evaluate.
   _BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED=""
+  unset _BRIDGE_ISOLATION_PRIMITIVES_READY_CACHED
 }
