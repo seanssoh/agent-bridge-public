@@ -80,8 +80,26 @@ def fmt_garden(blocked_count: int, oldest_blocked_ts: int | None) -> str:
     return f"{int(blocked_count)}d"
 
 
-def classify_stale(active: bool, activity_ts: int | None, warn_seconds: int, critical_seconds: int) -> str:
+def classify_stale(
+    active: bool,
+    activity_ts: int | None,
+    warn_seconds: int,
+    critical_seconds: int,
+    source: str | None = None,
+) -> str:
+    # Stale-health classification is only meaningful for agents that are
+    # expected to be doing autonomous work — i.e. static-source roles
+    # (librarian, patch, admin, …) whose long idle is a real "broken"
+    # signal. Dynamic-source agents (crm-dev, agb-dev-claude, …) are
+    # operator-driven containers that the human keeps running between
+    # interactive sessions; classifying their idle time as warn/crit
+    # produces a constant false-positive on every healthy host. Treat
+    # active dynamic agents as not-applicable ("-") so the dashboard
+    # `health warn/crit` counter and the per-row column stay focused on
+    # static roles that actually need attention.
     if not active:
+        return "-"
+    if source == "dynamic":
         return "-"
     if not activity_ts:
         return "crit"
@@ -624,6 +642,7 @@ def render_dashboard(args: argparse.Namespace) -> str:
             int(activity_ts) if activity_ts else None,
             args.stale_warn_seconds,
             args.stale_critical_seconds,
+            source=str(row.get("source", "")) or None,
         )
         if stale == "warn":
             health_warn_count += 1
@@ -739,6 +758,7 @@ def render_dashboard(args: argparse.Namespace) -> str:
             int(activity_ts) if activity_ts else None,
             args.stale_warn_seconds,
             args.stale_critical_seconds,
+            source=str(row.get("source", "")) or None,
         )
         load_bar = f"q:{render_bar(queued, width=4, char='=')} c:{render_bar(claimed, width=4, char='*')}"
         wake_state = "zmb" if zombie else (row.get("wake") or "-")
@@ -866,6 +886,7 @@ def render_dashboard_json(args: argparse.Namespace) -> str:
                     int(activity_ts) if activity_ts else None,
                     args.stale_warn_seconds,
                     args.stale_critical_seconds,
+                    source=str(row.get("source", "")) or None,
                 ),
             },
             "plugins": plugins_for_agent(row),
