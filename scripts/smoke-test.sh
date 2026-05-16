@@ -10745,4 +10745,19 @@ bash "$REPO_ROOT/scripts/smoke/bridge-export-prefix-no-stale-layout.sh"
 log "running tool-policy-process-dump-regex smoke"
 bash "$REPO_ROOT/scripts/smoke/tool-policy-process-dump-regex.sh"
 
+# bridge_worktree_doctor previously left daemonized children alive after
+# pruning their worktree dir — Sean observed 7 orphaned bridge-watchdog
+# processes parented to init(1) on 2026-05-16. The doctor now reaps argv-
+# anchored children before removing the worktree; this smoke is the
+# regression catch for both shapes (direct-exec + interpreter-exec).
+log "running worktree-doctor-reap-zombies smoke"
+bash "$REPO_ROOT/scripts/smoke/worktree-doctor-reap-zombies.sh"
+
+# Integration test for the dry-run path through bridge_worktree_doctor:
+# proves --dry-run actually invokes the reap helper for REMOVE rows
+# (catches the r1 regression where the helper call lived after the early
+# `mode != apply` return and was therefore unreachable).
+log "running worktree-doctor-reap-zombies-dry-run integration smoke"
+bash "$REPO_ROOT/scripts/smoke/worktree-doctor-reap-zombies-dry-run.sh"
+
 log "smoke test passed"
