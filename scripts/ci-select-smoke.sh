@@ -490,6 +490,14 @@ else
   # future commit that touches an unrelated file cannot accidentally
   # regress the deadlock or detection-gap class without CI catching it.
   add_required heredoc-regression
+  # Task #4648 carry: BSD mktemp portability is repo-wide regression
+  # class coverage (positional `mktemp "...XXXXXX.<ext>"` returns the
+  # literal path on macOS BSD). The smoke's M4 grep-lint catches any
+  # NEW occurrence across tracked shell files, so any PR — even one
+  # that touches a file unrelated to the original sites — fails CI
+  # if it reintroduces the bug class. Cheap (single grep + ~4 string
+  # checks); always required.
+  add_required bsd-mktemp-portability
   # Task #4494 Wave D: integrated dynamic-recovery smoke exercises the
   # 3 already-shipped surface fixes from #826 (PR #837 bridge-sync
   # grace) / #827 (PR #840 live Claude session id pre-transcript) /
