@@ -48,6 +48,17 @@ def main() -> int:
         ("&& env", True),                                      # after &&
         ("$(env)", True),                                      # comsub
         ("`env`", True),                                       # backtick
+        # r2 additions (codex PR #925 needs-more): env with options or
+        # assignments but NO utility command still dumps env.
+        ("env VAR=value", True),                               # assign, no utility
+        ("env -u CLAUDE_CODE_OAUTH_TOKEN", True),              # -u VAR, no utility
+        ("env -0", True),                                      # -0 format flag, no utility
+        ("env --null", True),                                  # long-opt null format
+        ("env 1>/tmp/dump", True),                             # FD-prefixed redirect
+        ("env 1>&2", True),                                    # FD-to-FD redirect
+        ("env # comment", True),                               # inline comment
+        ("env -u VAR1 -u VAR2", True),                         # multiple -u, no utility
+        ("env -u VAR VAR2=val", True),                         # mixed opt + assign, no utility
         ("printenv", True),                                    # bare printenv
         ("printenv CLAUDE_CODE_OAUTH_TOKEN", True),            # specific var
         ("printenv | head", True),                             # piped

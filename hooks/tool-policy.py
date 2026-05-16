@@ -177,26 +177,64 @@ def _raw_mentions_claude_credentials(raw: str) -> bool:
 # such as `environment`, `setfacl`, `kubectl set image`, or `set -e`.
 # Routed to the same CLAUDE_CREDENTIAL_DENY_REASON as the substring
 # deny — no second reason constant.
-# `env` precondition tightened on 2026-05-16 (operator-flagged false
-# positive). The earlier `(?<![A-Za-z0-9_/])env(?![A-Za-z0-9_])` matched
-# every standalone occurrence of the word `env` regardless of context,
-# so a task title or commit subject containing natural English like
-# "stale env override" tripped the credential-deny path and the operator
-# could not queue tasks that legitimately mention the word. Two
-# tightenings:
-#   1. Lookbehind also excludes `-` and `.` so identifiers like
-#      `show-env`, `tmux show-env`, and `.env` no longer match.
-#   2. Lookahead now requires that `env` is followed (after optional
-#      whitespace) by a command terminator / pipe / redirect / end of
-#      string. That keeps the truly dangerous shapes — bare `env`,
-#      `env | grep …`, `env > /tmp/x`, `;env`, `$(env)` — while letting
-#      `env -i bash` (which CLEARS the environment, not dumps it),
-#      `env VAR=val cmd`, and natural-language `env` fall through.
-# Same fix applied to `printenv` so prose like "use printenv to check"
-# no longer false-positives. `printenv` invoked at command position
-# (alone, with VAR args, piped, or redirected) is still caught.
+# `env` and `printenv` regexes re-derived on 2026-05-16. Two rounds:
+#
+#   r1 (initial fix for operator-flagged false positive): the original
+#       `(?<![A-Za-z0-9_/])env(?![A-Za-z0-9_])` matched every standalone
+#       occurrence of the word `env` regardless of context, so task
+#       titles or commit subjects containing natural language like
+#       "stale env override" tripped the credential-deny path. r1
+#       added `-` and `.` to the lookbehind and required a terminator
+#       immediately after `env`.
+#
+#   r2 (codex PR #925 needs-more): r1 newly missed real dump shapes
+#       where `env` carries options/assignments but no utility command:
+#       `env VAR=value`, `env -u CLAUDE_CODE_OAUTH_TOKEN`, `env -0`,
+#       `env --null`, `env 1>/tmp/dump`, `env 1>&2`, `env # comment`.
+#       POSIX env prints the environment when no utility is given, so
+#       each of those leaks the parent process env.
+#
+# Final semantics for `env`:
+#   - Lookbehind excludes `[A-Za-z0-9_/.\-]` so `show-env`, `printenv`,
+#     `.env` do NOT match (preserves the natural-language fix).
+#   - After `env\b`, the regex consumes zero-or-more option/assignment
+#     tokens — short opt `-X` (with optional packed value), separated
+#     arg form `-u VAR` for short opts that take a follow-on arg (the
+#     POSIX `-u/-S/-P/-C` set), long opt `--name`, or `VAR=value`
+#     assignment.
+#   - The match completes when after those tokens the next non-space
+#     thing is a statement terminator, redirect (incl. FD-prefixed `1>`
+#     / `2>&1` / `>>`), an inline comment `#`, a subshell-close `)`,
+#     a backtick, or end-of-string.
+#   - Crucially, if the next thing is a bare word (utility command),
+#     the match fails — so `env -i bash`, `env VAR=val cmd`,
+#     `env -u FOO cmd` still pass through.
+#
+# `printenv` is always a dump on invocation (with or without VAR
+# args), so only the command-position precondition is enforced.
+# Natural prose ("use printenv to check") passes; real invocations
+# still trip.
 _ENV_DUMP_PATTERNS = (
-    re.compile(r"(?<![A-Za-z0-9_/.\-])env(?=\s*(?:$|[\n;|&<>`)]))"),
+    re.compile(
+        r"""
+        (?<![A-Za-z0-9_/.\-]) env \b
+        (?:
+            \s+ -- [A-Za-z0-9_-]*               # long option (incl. bare `--`)
+          | \s+ -[uSPC] \s+ \S+                 # short opt that takes a separated arg
+          | \s+ -[A-Za-z0-9][A-Za-z0-9]*        # short opt or packed -uVAR
+          | \s+ [A-Za-z_][A-Za-z0-9_]* = \S*    # VAR=value assignment
+        )*
+        \s*
+        (?:
+            $                                    # end of string
+          | \#                                   # inline comment
+          | [\n;|&)]                            # statement terminator / subshell close
+          | [0-9]* [<>]                         # redirect (FD-prefixed or bare)
+          | `                                    # backtick close
+        )
+        """,
+        re.VERBOSE,
+    ),
     # `printenv` is always dangerous when invoked (with or without VAR
     # args), so only the command-position precondition is enforced — no
     # trailing terminator requirement. The prefix `(?:^|[\n;&|`()<>])`
