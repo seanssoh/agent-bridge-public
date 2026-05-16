@@ -6,6 +6,88 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-05-16
+
+### Highlight — v0.14.x stabilization milestone (S0-S3 + S5 Track A1/A2)
+
+First operator-cued release after v0.13.10's hotfix wave. Batches the v0.14.x stabilization plan's foundational stages per operator's "버전 좀 크게 올리지마" directive: stabilization PRs do NOT bump VERSION/CHANGELOG individually; the next release PR is operator-cued and aggregates accumulated user-visible items.
+
+**Operator-visible changes**:
+- macOS isolation-v2 noise (`ensure_matrix_path failed` stop-hook spam) silenced via platform-discriminator gate. `BRIDGE_LAYOUT=legacy` env-leak hard-die demoted to warning when a valid v2 marker pins the install to v2.
+- New `BRIDGE_ISOLATION_REQUIRED=auto|yes|no` env knob (default `auto`: Linux→enforce, else→silent no-op). Explicit override lets operators force enforcement on macOS or disable on Linux for self-test.
+
+### Stabilization stages landed
+
+**S0 — `docs/stabilization-plan-2026-05-15.md` (PR #901)**
+
+Master roadmap after 4-round codex consensus. Stage S0→S10 plan with OrbStack VM matrix per stage, §"Version policy" (stabilization PRs never bump VERSION; release PRs batched), and §"Linux VM policy" (linux-systemd-test + agb-test fixtures, bash-539-test required before S10-late).
+
+**S1 — `docs/audit-2026-05-15.md` + 5-doc catch-up (PR #902)**
+
+254-line structured audit archive — 5 audit subagents' output cross-referenced under a universal `id | severity | file:line | owner-stage | status` schema:
+- Audit A: 31 bug-surface findings (A01-A31)
+- Audit B: 17 stability findings (B01-B17) + 9-row hardcoded-timeout catalog
+- Audit C: 20 top-impact isolation-v2 sites (C01-C20) + 5 buried-assumption surprises (C-S1..C-S5)
+- Audit D: 10 refactor categories (D01-D10)
+- Audit E: 17 test/docs findings (E01-E17), E03 flipped to closed (stale-checkout false alarm), E06-E10 closed by this PR
+
+Doc catch-up: `ARCHITECTURE.md` (+14 lib/ modules), `KNOWN_ISSUES.md` (§26 fixed-in-v0.13.x + §27 outstanding), `CLAUDE.md` (Recent critical patches section), `OPERATIONS.md` (v0.13.x hotfix wave operator follow-up), `README.md` intro.
+
+**S1.5 — Heredoc-ban ratchet lint (PR #903)**
+
+Count-based ratchet lint preventing NEW heredoc-stdin subprocess sites in `bridge-upgrade.sh` (footgun #11 carry-over). 18-site ceiling (current count); `BRIDGE_UPGRADE_HEREDOC_CEILING` env override; `--list` + `--self-test` modes. Broad-match contract: any non-comment line containing `(bash -s|python3 -) ... <<EOF|PY` counts. 18-positive / 5-negative inline self-test fixture. Wired into `scripts/oss-preflight.sh` (existing CI job). 3 codex rounds (BLOCKING `$()` wrapper → BLOCKING nested `$()` + SHOULD-FIX doc-string → implement-ok via broad-match path).
+
+**S2 — Operator-visible blockers (PR #904)**
+
+Track 2A: `bridge_isolation_v2_ensure_matrix_path` + `bridge_isolation_v2_apply_row` group_setgid path early-return on Darwin. Silences `[경고] write_agent_state_marker: ensure_matrix_path failed` stop-hook spam per Sean's mac stop-hook output.
+
+Track 2B: `bridge_layout_resolver_validate_env` legacy|v1 branch demotes `BRIDGE_LAYOUT=legacy` env hard-die to a warning when a valid v2 marker exists on disk. Codex itself hit this surface running the consensus check via `agb inbox`.
+
+2 new smoke tests (`isolation-v2-macos-noise-suppression.sh` + `layout-resolver-marker-over-env.sh` with 4 cases including C4 v1-marker false-positive guard).
+
+**S3 — Platform discriminator foundation (PR #908)**
+
+New `lib/bridge-isolation-discriminator.sh` with 3 predicates (audit C design):
+- `bridge_isolation_discriminator_auto_resolve` (cached) — resolves `BRIDGE_ISOLATION_REQUIRED=auto|yes|no` (default `auto`: Linux→yes, else→no)
+- `bridge_isolation_v2_enforce` — Bucket 2 enforcement gate (return 0 if v2 should enforce)
+- `bridge_isolation_v2_require_linux` — Bucket 3 contract gate (die if not Linux)
+
+S2's ad-hoc `uname == Darwin` gates rewired through the discriminator (3 sites). Discriminator standalone-safe: `_platform` helper falls through `BRIDGE_HOST_PLATFORM_OVERRIDE` → `bridge_host_platform` → direct `uname -s`. `_enforce` calls `auto_resolve` in-place (no `$()`) so the cache var persists in the parent shell across multiple calls. v2 module self-sources the discriminator when sourced standalone.
+
+8-case smoke (`isolation-v2-platform-discriminator.sh`) covering all 3 predicates + cache contract + standalone source.
+
+**S5 Track A1 — Bucket 2 gates for v2 module remaining primitives (PR #910)**
+
+audit C08 (`bridge_isolation_v2_chgrp_setgid_recursive` in `lib/bridge-isolation-v2.sh`) + audit C13 (`bridge_isolation_v2_migrate_normalize_layout` in `lib/bridge-isolation-v2-migrate.sh`) gated via `bridge_isolation_v2_enforce`. 6 new smoke cases (G1-G6, missing-group assertion shape to prove gate engagement vs. silent short-circuit).
+
+**S5 Track A2 — Bucket 2 gate for v2-reapply strip_layout_acls (PR #911)**
+
+audit C-S2 — `bridge_isolation_v2_reapply_strip_layout_acls` gated to pre-empt the tool-presence (`command -v setfacl`) check on non-Linux hosts. Prevents Homebrew-installed Linux setfacl on Darwin from false-passing the check and reaching BSD-incompatible setfacl semantics. Records distinct `skipped:platform-discriminator` action row. 4 new smoke cases (G7-G10 including standalone-source regression guard).
+
+### Verification
+
+Each PR verified on:
+- macOS (host dev environment)
+- OrbStack VM `linux-systemd-test` (Debian Bash 5.2.15)
+
+Smoke regression matrix:
+- S1.5 heredoc-ban: count=18 ceiling unchanged
+- S2 noise-suppression: T1/T2 PASS
+- S2 layout-resolver: C1-C4 PASS
+- S3 discriminator: D1-D8 PASS
+- S5 bucket2-gates: G1-G10 PASS
+
+### Stages NOT in this release (deferred per plan)
+
+- **S4 → S5.5** (Bash 3.2 re-exec removal): operator-visible behavior change; requires S5 platform-discriminator to be stable on main + docs require Bash 4+ at install time + codex compatibility checkpoint.
+- **S5 Tracks B/C/D**: scope investigation showed daemon/channels/state/agent files have very few clear discriminator-gate sites beyond what's covered by transitive gating through Track A. Plan's 140-site estimate was speculative; actual high-value Bucket 2 gating is captured in A1/A2.
+- **S6 (Bucket 3 contract errors + Bucket 4 splits)**: next operator-cued cycle.
+- **S7-S10**: long-tail cleanup waves.
+
+### Operator follow-up
+
+After upgrading, the `BRIDGE_LAYOUT=legacy` warning + new env knob behavior are operator-visible. Sean's mac runtime had stop-hook noise pre-upgrade; the discriminator gate + S2 fixes silence it. If you still see `ensure_matrix_path failed` after `agent-bridge upgrade --apply`, file an issue with the host-profile context.
+
 ## [0.13.10] — 2026-05-15
 
 ### Highlight — v2 isolation bundle (3-track wave): unblock v0.7.x → v0.13.x leap end-to-end + close #686 / #895
