@@ -354,7 +354,12 @@ bridge_cron_write_completion_note() {
   local followup_task_id="${3:-}"
 
   bridge_require_python
-  python3 - "$run_id" "$note_file" "$followup_task_id" "$(bridge_cron_request_file_by_id "$run_id")" "$(bridge_cron_result_file_by_id "$run_id")" "$(bridge_cron_status_file_by_id "$run_id")" <<'PY'
+  # Pre-capture nested $() into locals to avoid footgun #11 (Bash 5.3.9 read_comsub/heredoc_write deadlock under I/O pressure).
+  local request_file result_file status_file
+  request_file="$(bridge_cron_request_file_by_id "$run_id")"
+  result_file="$(bridge_cron_result_file_by_id "$run_id")"
+  status_file="$(bridge_cron_status_file_by_id "$run_id")"
+  python3 - "$run_id" "$note_file" "$followup_task_id" "$request_file" "$result_file" "$status_file" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -429,7 +434,12 @@ bridge_cron_write_followup_body() {
   local body_file="$2"
 
   bridge_require_python
-  python3 - "$run_id" "$body_file" "$(bridge_cron_request_file_by_id "$run_id")" "$(bridge_cron_result_file_by_id "$run_id")" "$(bridge_cron_status_file_by_id "$run_id")" <<'PY'
+  # Pre-capture nested $() into locals to avoid footgun #11 (Bash 5.3.9 read_comsub/heredoc_write deadlock under I/O pressure).
+  local request_file result_file status_file
+  request_file="$(bridge_cron_request_file_by_id "$run_id")"
+  result_file="$(bridge_cron_result_file_by_id "$run_id")"
+  status_file="$(bridge_cron_status_file_by_id "$run_id")"
+  python3 - "$run_id" "$body_file" "$request_file" "$result_file" "$status_file" <<'PY'
 import json
 import sys
 from pathlib import Path
