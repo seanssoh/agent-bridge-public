@@ -82,6 +82,20 @@
 # 1. helpers — platform / agent enumeration
 # ---------------------------------------------------------------------------
 
+# Source the platform discriminator if not already loaded. Same two-path
+# pattern as lib/bridge-isolation-v2.sh:122-129 — bridge-lib.sh / bridge-
+# migrate.sh sources it before us in the normal flow, but a direct caller
+# (e.g., a tool that sources only this module) needs the helper brought
+# in here so `bridge_isolation_v2_enforce` resolves at line 753 below.
+if ! declare -f bridge_isolation_v2_enforce >/dev/null 2>&1; then
+  _BRIDGE_V2_REAPPLY_MODULE_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+  if [[ -f "$_BRIDGE_V2_REAPPLY_MODULE_DIR/bridge-isolation-discriminator.sh" ]]; then
+    # shellcheck source=bridge-isolation-discriminator.sh
+    source "$_BRIDGE_V2_REAPPLY_MODULE_DIR/bridge-isolation-discriminator.sh"
+  fi
+  unset _BRIDGE_V2_REAPPLY_MODULE_DIR
+fi
+
 bridge_isolation_v2_reapply_supported_platform() {
   # Reapply touches Linux-only primitives (sudo chown to a foreign UID,
   # setfacl). On non-Linux hosts the linux-user isolation mode itself is

@@ -308,5 +308,40 @@ if grep -q 'skipped:platform-discriminator' "$G9_OUT"; then
 fi
 smoke_log "G9 PASS (explicit opt-in overrode Darwin default)"
 
-smoke_log "PASS — Bucket 2 gates wired correctly across 9 cases (C08: G1/G2/G3, C13: G4/G5/G6, C-S2: G7/G8/G9)"
+# G10 — standalone reapply module source brings in discriminator.
+# Codex r1 catch on PR #911: a direct caller sourcing only
+# lib/bridge-isolation-v2-reapply.sh (without bridge-lib.sh) hit
+# `bridge_isolation_v2_enforce: command not found`. r2 added the
+# guarded self-source pattern. This case verifies the regression
+# guard for the standalone source path.
+smoke_log "G10: standalone reapply module source brings in discriminator"
+G10_OUT="$SMOKE_TMP_ROOT/g10.out"
+G10_DRIVER="$SMOKE_TMP_ROOT/g10-driver.sh"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf 'cd %q\n' "$REPO_ROOT"
+  # Stub bridge_warn / bridge_die as the standalone harness pattern does.
+  printf '%s\n' 'bridge_warn() { printf "[stub_warn] %s\n" "$*" >&2; }'
+  printf '%s\n' 'bridge_die() { printf "[stub_die] %s\n" "$*" >&2; exit 1; }'
+  # Source ONLY the reapply module (no bridge-lib.sh).
+  printf '%s\n' 'source "$0_REPO_ROOT/lib/bridge-isolation-v2-reapply.sh" 2>&1'
+  printf '%s\n' 'if declare -f bridge_isolation_v2_enforce >/dev/null 2>&1; then echo "ENFORCE_DEFINED=yes"; else echo "ENFORCE_DEFINED=no"; fi'
+  # Sanity probe: with host=Linux, the gate must engage (not the discriminator-skip path).
+  printf '%s\n' 'export BRIDGE_HOST_PLATFORM_OVERRIDE=Linux'
+  printf '%s\n' 'bridge_isolation_v2_enforce; echo "ENFORCE_RC=$?"'
+} | sed "s#\$0_REPO_ROOT#$REPO_ROOT#g" >"$G10_DRIVER"
+chmod +x "$G10_DRIVER"
+"$BRIDGE_BASH" "$G10_DRIVER" >"$G10_OUT" 2>&1 || true
+rm -f "$G10_DRIVER"
+
+if ! grep -q '^ENFORCE_DEFINED=yes$' "$G10_OUT"; then
+  cat "$G10_OUT"; smoke_fail "G10: standalone reapply source did not bring in bridge_isolation_v2_enforce"
+fi
+if ! grep -q '^ENFORCE_RC=0$' "$G10_OUT"; then
+  cat "$G10_OUT"; smoke_fail "G10: bridge_isolation_v2_enforce did not return 0 with host=Linux override"
+fi
+smoke_log "G10 PASS"
+
+smoke_log "PASS — Bucket 2 gates wired correctly across 10 cases (C08: G1/G2/G3, C13: G4/G5/G6, C-S2: G7/G8/G9, standalone: G10)"
 exit 0
