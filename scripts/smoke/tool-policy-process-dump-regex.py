@@ -66,6 +66,15 @@ def main() -> int:
         ("env --block-signal=PIPE", True),
         ("env --unset=CLAUDE_CODE_OAUTH_TOKEN", True),
         ("env --split-string=FOO=bar", True),                  # =value containing another =
+        # r4 additions (codex PR #925 r3 catch): GNU separated-arg long
+        # options that print env when no utility supplied. The
+        # `--argv0` and `--chdir` separated forms are NOT in this list
+        # because GNU env requires a command for those.
+        ("env --unset CLAUDE_CODE_OAUTH_TOKEN", True),
+        ("env --ignore-signal PIPE", True),
+        ("env --default-signal PIPE", True),
+        ("env --block-signal PIPE", True),
+        ("env --split-string FOO=bar", True),
         ("printenv", True),                                    # bare printenv
         ("printenv CLAUDE_CODE_OAUTH_TOKEN", True),            # specific var
         ("printenv | head", True),                             # piped
@@ -114,6 +123,15 @@ def main() -> int:
         ("env -i bash -c 'echo hi'", False),                   # env -i CLEARS env (not dump)
         ("env VAR=value cmd", False),                          # env VAR= (not dump)
         ("env -u CLAUDE_VAR cmd", False),                      # env -u (unset, not dump)
+        # r4 false-positive guards: GNU long opts whose separated form
+        # REQUIRES a utility (--argv0, --chdir) — codex r3 explicitly
+        # asked we NOT match these.
+        ("env --argv0 NAME cmd", False),
+        ("env --chdir /tmp cmd", False),
+        ("env --argv0=NAME cmd", False),                       # = form with utility
+        ("env --chdir=/tmp cmd", False),                       # = form with utility
+        ("env --unset NAME cmd", False),                       # separated dump-shape + utility = safe
+        ("env --ignore-signal PIPE cmd", False),               # separated + utility = safe
     ]
 
     failures: list[str] = []

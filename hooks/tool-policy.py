@@ -219,7 +219,17 @@ _ENV_DUMP_PATTERNS = (
         r"""
         (?<![A-Za-z0-9_/.\-]) env \b
         (?:
-            \s+ -- [A-Za-z0-9_-]* (?: = \S* )?   # long option, incl. GNU --name=value
+            # Long option with separated arg (GNU forms that print env
+            # with no utility -- codex PR #925 r3): --unset NAME,
+            # --ignore-signal SIG, --default-signal SIG,
+            # --block-signal SIG, --split-string ARG. Listed explicitly
+            # to avoid over-matching `--argv0 NAME cmd` and
+            # `--chdir /tmp cmd` which require a utility.
+            \s+ --(?: unset
+                    | ignore-signal | default-signal | block-signal
+                    | split-string )
+              \s+ \S+
+          | \s+ -- [A-Za-z0-9_-]* (?: = \S* )?   # long option, incl. GNU --name=value
           | \s+ -[uSPC] \s+ \S+                 # short opt that takes a separated arg
           | \s+ -[A-Za-z0-9][A-Za-z0-9]*        # short opt or packed -uVAR
           | \s+ [A-Za-z_][A-Za-z0-9_]* = \S*    # VAR=value assignment
