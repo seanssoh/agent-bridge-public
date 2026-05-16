@@ -723,6 +723,12 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
     bridge_warn "chgrp_setgid_recursive: not a directory: $root"
     return 1
   }
+  # Platform discriminator gate (S5 Track A1, extending S3 pattern):
+  # recursive chgrp + setgid bit only has a security model on hosts
+  # where POSIX setgid groups are the primitive (default: Linux).
+  # Audit C08 — Bucket 2. Operators can force enforcement via
+  # BRIDGE_ISOLATION_REQUIRED=yes.
+  bridge_isolation_v2_enforce || return 0
   # Issue #746 v0.9.4 followup: translate the numeric file_mode into a
   # symbolic chmod that PRESERVES executable bits via `X` (uppercase).
   # Background: v0.9.3 PR #768 wired this helper into the spaced-CLI
