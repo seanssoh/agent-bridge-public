@@ -45,6 +45,18 @@ bridge_init_register_default_picker_sweep() {
     return 0
   fi
 
+  # Skip when the cron target <admin>-dev (the codex pair) is not in the
+  # roster. Without this guard the cron persists a job referencing an
+  # agent that does not exist — every dispatch then fails. Happens on
+  # hosts where bridge_ensure_admin_codex_pair was skipped because
+  # codex CLI was absent (see lib/bridge-admin-pair.sh). Operator can
+  # install codex + re-run bridge-bootstrap.sh to backfill both the
+  # pair AND this cron.
+  if ! bridge_agent_exists "$cron_agent" 2>/dev/null; then
+    printf '[init] picker-sweep cron skipped — target agent %s not in roster (codex pair absent). Install codex CLI and re-run bridge-bootstrap.sh to backfill.\n' "$cron_agent" >&2
+    return 0
+  fi
+
   # Idempotency check: list bridge-native crons (text-kind only is fine;
   # picker-sweep is registered as text-kind below) and look for an existing
   # job titled `picker-sweep`. `cron list --json` exits non-zero on a fresh
