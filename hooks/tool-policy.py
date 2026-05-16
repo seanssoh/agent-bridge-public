@@ -220,14 +220,16 @@ _ENV_DUMP_PATTERNS = (
         (?<![A-Za-z0-9_/.\-]) env \b
         (?:
             # Long option with separated arg (GNU forms that print env
-            # with no utility -- codex PR #925 r3): --unset NAME,
-            # --ignore-signal SIG, --default-signal SIG,
-            # --block-signal SIG, --split-string ARG. Listed explicitly
-            # to avoid over-matching `--argv0 NAME cmd` and
-            # `--chdir /tmp cmd` which require a utility.
-            \s+ --(?: unset
-                    | ignore-signal | default-signal | block-signal
-                    | split-string )
+            # with no utility -- codex PR #925 r3+r4): --unset NAME,
+            # --split-string ARG. The signal-control opts
+            # (--ignore-signal / --default-signal / --block-signal) are
+            # NOT in this list because GNU env treats the next token as
+            # the COMMAND, not as the signal arg, in the separated form
+            # (verified by codex r4 against /opt/homebrew/bin/genv,
+            # exit 127 "No such file or directory"). Their =value form
+            # is still a dump and is matched by the long-opt branch
+            # below.
+            \s+ --(?: unset | split-string )
               \s+ \S+
           | \s+ -- [A-Za-z0-9_-]* (?: = \S* )?   # long option, incl. GNU --name=value
           | \s+ -[uSPC] \s+ \S+                 # short opt that takes a separated arg

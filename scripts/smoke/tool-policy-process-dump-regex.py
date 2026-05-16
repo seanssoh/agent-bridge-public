@@ -71,9 +71,6 @@ def main() -> int:
         # `--argv0` and `--chdir` separated forms are NOT in this list
         # because GNU env requires a command for those.
         ("env --unset CLAUDE_CODE_OAUTH_TOKEN", True),
-        ("env --ignore-signal PIPE", True),
-        ("env --default-signal PIPE", True),
-        ("env --block-signal PIPE", True),
         ("env --split-string FOO=bar", True),
         ("printenv", True),                                    # bare printenv
         ("printenv CLAUDE_CODE_OAUTH_TOKEN", True),            # specific var
@@ -131,7 +128,15 @@ def main() -> int:
         ("env --argv0=NAME cmd", False),                       # = form with utility
         ("env --chdir=/tmp cmd", False),                       # = form with utility
         ("env --unset NAME cmd", False),                       # separated dump-shape + utility = safe
-        ("env --ignore-signal PIPE cmd", False),               # separated + utility = safe
+        # r5 corrections (codex PR #925 r4): GNU env treats the next
+        # token after these long opts as the COMMAND in separated form,
+        # not as the signal arg -- so they are NOT dump shapes.
+        # Verified by codex against /opt/homebrew/bin/genv: exit 127
+        # "No such file or directory". Their =value form IS a dump and
+        # is still caught by the `--name=value` branch (rows 14-16).
+        ("env --ignore-signal PIPE", False),
+        ("env --default-signal PIPE", False),
+        ("env --block-signal PIPE", False),
     ]
 
     failures: list[str] = []
