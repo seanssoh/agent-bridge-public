@@ -67,6 +67,42 @@ bridge_start_effective_dev_channels_csv() {
   bridge_agent_effective_dev_channels_csv "$agent"
 }
 
+bridge_start_should_send_onboarding_nudge() {
+  # Fresh-install nudge gate (see usage in main flow). Returns 0 only
+  # when the agent's SESSION-TYPE.md declares `Session Type: admin` AND
+  # `Onboarding State: pending`. Static-claude and dynamic agents are
+  # NOT nudged — they have no onboarding flow tied to first user msg.
+  local agent="$1"
+  local home_dir
+  home_dir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  [[ -d "$home_dir" ]] || return 1
+  [[ -f "$home_dir/SESSION-TYPE.md" ]] || return 1
+  grep -qE '^- Session Type:[[:space:]]*admin\b' "$home_dir/SESSION-TYPE.md" 2>/dev/null || return 1
+  [[ "$(bridge_agent_onboarding_state "$agent" 2>/dev/null || printf '')" == "pending" ]]
+}
+
+bridge_start_send_onboarding_nudge_async() {
+  # Send a short onboarding-start nudge to the agent's tmux session in
+  # the background so the foreground bridge-start.sh flow continues to
+  # the post-launch verify + attach step. The nudge fires ~8 seconds
+  # after the agent process becomes interactive (Claude Code welcome
+  # screen + initial prompt rendering settles around that mark).
+  local session="$1"
+  local agent="$2"
+  (
+    sleep 8
+    if bridge_tmux_session_exists "$session" 2>/dev/null; then
+      # Type the message then send Enter as a separate key event.
+      # Single-line nudge — the agent's SESSION-TYPE.md owns the
+      # specific question script.
+      tmux send-keys -t "$session" '안녕하세요. 처음 시작하는 install이라 onboarding을 진행해주세요.' 2>/dev/null || true
+      sleep 0.5
+      tmux send-keys -t "$session" Enter 2>/dev/null || true
+    fi
+  ) >/dev/null 2>&1 &
+  disown $! 2>/dev/null || true
+}
+
 bridge_start_should_controller_accept_dev_channels() {
   local agent="$1"
   local suppress_missing="${2:-0}"
@@ -627,7 +663,23 @@ if [[ "$ENGINE" == "claude" ]]; then
   if [[ $CONTROLLER_DEV_CHANNELS_ACCEPT -eq 1 ]]; then
     bridge_start_schedule_dev_channels_accept "$SESSION" "$AGENT"
   fi
-  bridge_agent_mark_idle_now "$AGENT"
+  # Fresh-install onboarding nudge: SESSION-TYPE.md's first-session
+  # checklist for admin agents triggers "when the first user message
+  # arrives" — but on a brand-new install no user message has been
+  # typed yet, so the agent sits idle at the prompt waiting. Auto-send
+  # a one-line nudge so onboarding doesn't require the operator to
+  # type something first. Discovered during E2E test on Ubuntu 24.04
+  # VM (2026-05-16).
+  #
+  # Run BEFORE bridge_agent_mark_idle_now: the idle-marker writer can
+  # fail under set -e (e.g., ensure_matrix_path warns on a non-isolated
+  # state-agent-dir row), causing bridge-start.sh to exit before
+  # reaching the nudge. The nudge spawn is itself async + heavily
+  # guarded against errors.
+  if bridge_start_should_send_onboarding_nudge "$AGENT"; then
+    bridge_start_send_onboarding_nudge_async "$SESSION" "$AGENT" || true
+  fi
+  bridge_agent_mark_idle_now "$AGENT" || true
 fi
 if [[ -z "$(bridge_agent_session_id "$AGENT")" ]]; then
   bridge_refresh_agent_session_id "$AGENT" 12 0.25 >/dev/null 2>&1 || true
