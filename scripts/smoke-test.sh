@@ -10720,4 +10720,12 @@ bash "$REPO_ROOT/scripts/smoke/dynamic-agent-shared-mode-workdir.sh"
 log "running v2-scaffold-home-and-workdir smoke (issue #686)"
 bash "$REPO_ROOT/scripts/smoke/v2-scaffold-home-and-workdir.sh"
 
+# Dynamic agents are operator-driven containers; long idle is normal
+# state, not a health signal. The dashboard previously flagged them
+# as warn/crit purely on idle threshold (Sean, 2026-05-16). Guard the
+# classify_stale dynamic-source exemption so a future regression
+# brings the false-positive back into the health counter.
+log "running classify-stale-dynamic-exemption smoke"
+bash "$REPO_ROOT/scripts/smoke/classify-stale-dynamic-exemption.sh"
+
 log "smoke test passed"
