@@ -3002,6 +3002,75 @@ bridge_dashboard_post_if_changed() {
   rm -f "$summary_file"
 }
 
+# --- Inbox-nudge dedup (issue #767) -----------------------------------------
+# Suppress repeat inbox nudges when the agent's pending-task fingerprint has
+# not changed AND a recent nudge was already delivered. Without this, an
+# agent that's mid-tool-call (e.g., a long bash invocation) accumulates
+# identical "ACTION REQUIRED" payloads in its transcript every daemon tick
+# until the bash returns. Per-agent state lives in
+# $BRIDGE_STATE_DIR/daemon-nudge-state/<agent>.env. The companion
+# busy-aware gate (defer while pane is IN_TOOL_USE) is a follow-up.
+bridge_daemon_nudge_state_file() {
+  local agent="$1"
+  local dir="$BRIDGE_STATE_DIR/daemon-nudge-state"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s' "$dir/${agent}.env"
+}
+
+# Compute a deterministic fingerprint from the comma-separated queued task
+# IDs the daemon already gathered via the live-state query. Sorting the IDs
+# numerically guarantees insertion order is irrelevant — only the set of
+# pending tasks affects the fingerprint, so reordering or partial drains
+# both produce a fresh value. Empty input yields a stable empty marker.
+bridge_daemon_compute_nudge_fingerprint() {
+  local id_csv="${1:-}"
+  if [[ -z "$id_csv" ]]; then
+    printf '%s' "empty"
+    return 0
+  fi
+  printf '%s\n' "${id_csv//,/$'\n'}" | sort -n | sha1sum | cut -d' ' -f1
+}
+
+# Return 0 (skip) when the recorded fingerprint matches the incoming one AND
+# the recorded timestamp is within the redelivery window. Any other condition
+# (missing file, mismatched fingerprint, expired window, unreadable state)
+# returns non-zero so the caller proceeds to fire the nudge. Setting
+# BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS=0 disables dedup entirely.
+bridge_daemon_should_skip_nudge() {
+  local agent="$1"
+  local fingerprint="$2"
+  local redelivery="${BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS:-60}"
+  [[ "$redelivery" =~ ^[0-9]+$ ]] || redelivery=60
+  (( redelivery > 0 )) || return 1
+  local file
+  file="$(bridge_daemon_nudge_state_file "$agent")"
+  [[ -f "$file" ]] || return 1
+  local LAST_NUDGE_FINGERPRINT="" LAST_NUDGE_TS="0"
+  daemon_source_state_file "$file" "nudge-dedup" 0 || return 1
+  [[ "$LAST_NUDGE_FINGERPRINT" == "$fingerprint" ]] || return 1
+  [[ "$LAST_NUDGE_TS" =~ ^[0-9]+$ ]] || return 1
+  local now
+  now="$(date +%s)"
+  (( LAST_NUDGE_TS <= now )) || return 1  # clock-skew guard: future TS makes signed Bash arithmetic falsely skip
+  (( now - LAST_NUDGE_TS < redelivery )) || return 1
+  return 0
+}
+
+# Atomic write so a concurrent reader never sees a half-flushed file.
+bridge_daemon_record_nudge() {
+  local agent="$1"
+  local fingerprint="$2"
+  local file tmp now
+  file="$(bridge_daemon_nudge_state_file "$agent")"
+  now="$(date +%s)"
+  tmp="$(mktemp "${file}.XXXXXX")" || return 1
+  {
+    printf 'LAST_NUDGE_FINGERPRINT=%q\n' "$fingerprint"
+    printf 'LAST_NUDGE_TS=%q\n' "$now"
+  } > "$tmp"
+  mv "$tmp" "$file"
+}
+
 nudge_agent_session() {
   local agent="$1"
   local _session="$2"
@@ -3068,6 +3137,25 @@ nudge_agent_session() {
     return 0
   fi
 
+  # Issue #767: fingerprint-based dedup. The live-state query already returned
+  # the comma-separated queued IDs; reuse that as the canonical pending-task
+  # set. If the same set was nudged within the redelivery window, suppress —
+  # otherwise the agent (typically mid-tool-call) accumulates identical
+  # ACTION REQUIRED payloads in its transcript every daemon tick. Skip-only;
+  # record happens after the verified send below so a dropped/lost submit
+  # still re-fires on the next tick.
+  local nudge_fingerprint
+  nudge_fingerprint="$(bridge_daemon_compute_nudge_fingerprint "${live_nudge_key:-$nudge_key}")"
+  if bridge_daemon_should_skip_nudge "$agent" "$nudge_fingerprint"; then
+    bridge_audit_log daemon session_nudge_deduped "$agent" \
+      --detail fingerprint="$nudge_fingerprint" \
+      --detail queued="$live_queued" \
+      --detail claimed="$live_claimed" \
+      --detail redelivery_seconds="${BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS:-60}"
+    daemon_info "skipped duplicate nudge for ${agent} (fingerprint=${nudge_fingerprint:0:8}, queued=${live_queued})"
+    return 0
+  fi
+
   title="$(bridge_queue_attention_title "$live_queued")"
   open_task_shell="$(bridge_queue_cli find-open --agent "$agent" --format shell 2>/dev/null || true)"
   if [[ -n "$open_task_shell" ]]; then
@@ -3131,13 +3219,19 @@ nudge_agent_session() {
     fi
   fi
 
+  # Issue #767: record AFTER the verified send so a submit that was lost
+  # post-grace (returned non-zero above) leaves the prior fingerprint in
+  # place and the next idle-nudge tick re-fires unconditionally.
+  bridge_daemon_record_nudge "$agent" "$nudge_fingerprint" || true
+
   bridge_audit_log daemon session_nudge_sent "$agent" \
     --detail queued="$live_queued" \
     --detail claimed="$live_claimed" \
     --detail idle_seconds="$idle" \
     --detail task_id="${task_id:-0}" \
     --detail post_status="${post_status:-unknown}" \
-    --detail title="$title"
+    --detail title="$title" \
+    --detail fingerprint="$nudge_fingerprint"
   daemon_info "nudged ${agent} (queued=${live_queued}, claimed=${live_claimed}, idle=${idle}s)"
 }
 
