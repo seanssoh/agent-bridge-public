@@ -893,6 +893,13 @@ bridge_isolation_v2_migrate_normalize_layout() {
   local data_root="$2"
   local shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
   local ctrl_grp="${BRIDGE_CONTROLLER_GROUP:-ab-controller}"
+  # Platform discriminator gate (S5 Track A1, audit C13 Bucket 2):
+  # POSIX group + setgid normalization is the security primitive on
+  # Linux only. On non-Linux hosts the chgrp + chmod calls would target
+  # ab-shared/ab-controller groups that the upgrade flow doesn't
+  # create. Silent no-op under the default policy; operator can force
+  # via BRIDGE_ISOLATION_REQUIRED=yes.
+  bridge_isolation_v2_enforce || return 0
 
   if [[ -d "$data_root/shared" ]]; then
     bridge_isolation_v2_chgrp_setgid_recursive \
