@@ -6,6 +6,62 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.1] — 2026-05-16
+
+### Highlight — completeness pass after v0.14.0 E2E (8 fixes)
+
+Operator-cued patch release. E2E install + onboarding + comm test on a fresh Ubuntu 24.04 VM uncovered 6 regressions in the v0.14.0 clean-install / fresh-host flow, plus 2 audit-A backlog items. All ship together.
+
+### Operator-visible
+
+- macOS `ensure_matrix_path failed` stop-hook spam silenced on **Linux** too — the platform discriminator now checks v2 primitives readiness (`getent ab-shared`) before engaging. Hosts without `agent-bridge migrate isolation v2 --apply` no longer emit the warning on every daemon write tick.
+- Fresh-install admin onboarding now auto-triggers — `bridge-start.sh` sends a single Korean nudge ~8s after the claude tmux session settles, so the agent's `SESSION-TYPE.md` first-session checklist fires without the operator typing first.
+- macOS rerender failure caused by BSD `mktemp ".XXXXXX.py"` template returning the literal path → silenced. `bridge-agent.sh:1959` + `bridge-review.sh:300,402` use BSD-portable templates. Repo-wide grep-lint catches future regressions.
+
+### Stages landed
+
+**Discovered during E2E test (2026-05-16, agb-clean-test Ubuntu 24.04)**:
+
+- PR #916 — clean install regressions:
+  - `bridge_layout_resolver_has_existing_evidence` skips `agents/_*/` (e.g. `_template/`) reserved dirs so a fresh deploy doesn't get misclassified as `markerless(existing-install)`.
+  - `deploy-live-install.sh --restart-daemon` skips daemon-restart when `state/layout-marker.sh` is absent (defer to `bridge-bootstrap.sh`).
+
+- PR #917 — codex-absent host:
+  - `bridge_ensure_admin_codex_pair` early-returns when `command -v codex` is absent. No crash-loop `<admin>-dev` on hosts without codex CLI.
+  - `bridge_init_register_default_picker_sweep` skips registration when target `<admin>-dev` agent is not in roster. Operator skip message points to `bridge-bootstrap.sh` re-run for backfill.
+
+- PR #918 — fresh-install onboarding nudge:
+  - `bridge-start.sh` adds `bridge_start_should_send_onboarding_nudge` gate + `_send_onboarding_nudge_async` helper. Admin/`Onboarding State: pending` agents get an automatic nudge ~8s after spawn.
+
+- PR #919 — completeness backlog (4 fixes):
+  - **Discriminator primitives-readiness check** (highest impact): `bridge_isolation_v2_enforce` on auto policy now requires `getent ab-shared` before returning yes. Fresh installs no longer spam `ensure_matrix_path failed`.
+  - `bridge-hooks.py` settings.effective.json.tmp `os.replace` retries once on `FileNotFoundError` then falls back to soft warning.
+  - `bridge-start.sh` tmux new-session captures stderr; `duplicate session` race-with-daemon surfaces a clear `[info]` line.
+  - Audit smoke contracts updated for the new readiness-aware gate (`scripts/smoke/isolation-v2-platform-discriminator.sh`, `isolation-v2-bucket2-gates.sh`, `tests/isolation-v2-primitives/smoke.sh`).
+
+**Discovered during v0.13.x → v0.14.1 upgrade test (this PR)**:
+
+- Engine-CLI preflight in daemon auto-start loop — when an agent's engine binary (`claude`, `codex`) is not on PATH, the daemon now skips the spawn attempt and records a backoff failure as `engine-cli-missing:<engine>` (`daemon_info`, not `bridge_warn`). Avoids the 10-retry burst of `[경고] always-on auto-start failed: <agent>` when the host doesn't have the engine installed.
+
+**Backlog from audit-A (audit-2026-05-15)**:
+
+- PR #914 — BSD-portable `mktemp` template (3 sites). Always-required regression-class smoke `bsd-mktemp-portability` ratchets the bug class.
+- PR #915 — `write_agent_heartbeat` cat-failure tempfile leak (audit A17). Explicit `if ! cat ... ; then rm; return; fi` replaces the ineffective RETURN trap.
+
+### Verification
+
+Each PR independently verified with codex review (`implement-ok`):
+- agb-clean-test (Ubuntu 24.04, Bash 5.2.21): full E2E install → bootstrap → onboarding → dynamic agent → cross-agent comm
+- linux-systemd-test (Debian Bash 5.2.15): v0.8.5 → v0.14.1 single-step `agent-bridge upgrade --apply` confirms graceful leap
+
+### Upgrade path
+
+`agent-bridge upgrade --apply` on any v0.7.x / v0.8.x / v0.9.x / v0.10.x / v0.11.x / v0.12.x / v0.13.x install lands cleanly at v0.14.1 in one atomic step. No intermediate hop needed — the v0.13.7-v0.13.9 heredoc-chain fixes are already in main.
+
+Hosts that hit the v0.14.0 fresh-install regressions can re-run `agent-bridge upgrade --apply` to land the v0.14.1 fixes. No special migration script required.
+
+See `OPERATIONS.md §"Upgrade"` for the recipe + operator follow-up notes per release.
+
 ## [0.14.0] — 2026-05-16
 
 ### Highlight — v0.14.x stabilization milestone (S0-S3 + S5 Track A1/A2)
