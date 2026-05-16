@@ -106,6 +106,40 @@ without guessing.
 
 표준 upgrade 절차는 [`UPGRADING.md`](UPGRADING.md) 에 정리되어 있다. 모든 install 에서 동일한 명령으로 진행한다:
 
+### v0.14.1 completeness pass (2026-05-16) — operator follow-up
+
+Patch release after the v0.14.0 E2E test on a fresh Ubuntu 24.04 VM. 8 fixes batched (6 clean-install regressions + 2 audit-A backlog).
+
+**Recommended upgrade path** (any v0.7.x+ install):
+
+```bash
+cd <source-checkout>
+git fetch origin
+git checkout v0.14.1
+./agent-bridge upgrade --apply
+```
+
+Single atomic step works from any v0.7.x / v0.8.x / v0.9.x / v0.10.x / v0.11.x / v0.12.x / v0.13.x source. The v0.13.7-v0.13.9 heredoc-chain fixes (extracted to `lib/upgrade-helpers/`) make the leap-path safe on Bash 5.3.9 hosts.
+
+**Operator-visible changes since v0.14.0**:
+
+- Linux `ensure_matrix_path failed` warning silenced on fresh installs (no `ab-shared` group yet). The platform discriminator now checks v2 primitives readiness via `getent ab-shared` before engaging.
+- Hosts without `claude` / `codex` CLI: daemon no longer spams `[경고] always-on auto-start failed` — engine-CLI preflight skips the spawn with a single `daemon_info` line.
+- Fresh-install admin onboarding auto-triggers — `agb admin` greets and asks 2 questions without the operator typing first.
+- macOS `bridge-rerender-plan.XXXXXX.py` BSD `mktemp` literal-path bug fixed — settings rerender no longer blocks on stale file.
+- `bridge-bootstrap.sh` on hosts without codex CLI: skips `<admin>-dev` pair creation + picker-sweep cron registration (was crash-looping). Operator can install codex + re-run bootstrap to backfill.
+
+**Linux operators on v0.13.x or earlier with errors**: this release is the recommended target. Symptoms like:
+- Hard-die at `current_layout=markerless(existing-install)` on clean install,
+- Stop-hook spam `ensure_matrix_path failed`,
+- Always-on auto-start retry loop on missing engine CLI,
+
+...are all closed in v0.14.1. Single `agent-bridge upgrade --apply` from your current version lands at v0.14.1 cleanly.
+
+**Runtime stop-gap removal**: operators who hand-patched `~/.agent-bridge/lib/bridge-isolation-v2.sh` (Darwin gate workaround for pre-v0.14.0) — the upgrade overwrites the stop-gap with the proper discriminator-based fix. No manual cleanup needed.
+
+For per-stage detail, see `CHANGELOG.md` `[0.14.1]`.
+
 ### v0.14.0 stabilization milestone (2026-05-16) — operator follow-up
 
 v0.14.0 batches S0-S3 + S5 Track A1/A2 of the v0.14.x stabilization plan. Recommended target for fresh upgrades and for v0.13.10 installs that hit operator-visible noise.

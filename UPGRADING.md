@@ -2,6 +2,12 @@
 
 이 문서는 모든 install 에서 동일하게 따라야 하는 표준 upgrade 절차를 정의한다. 각 host 의 설치 방식이 약간씩 달라도 (canonical `~/.agent-bridge` 만 있는 host vs source-checkout `~/.agent-bridge-source` 가 추가로 있는 admin host), upgrade 자체는 같은 명령으로 끝난다.
 
+## Recommended target
+
+**v0.14.1 이상**. v0.14.1 은 v0.14.0 의 clean-install 문제 6 개 + audit-A 백로그 2 개를 모두 닫은 completeness release 다. 모든 v0.7.x / v0.8.x / v0.9.x / v0.10.x / v0.11.x / v0.12.x / v0.13.x 설치에서 단일 `agent-bridge upgrade --apply` 한 번으로 v0.14.1 까지 올라간다 (v0.13.7-v0.13.9 가 Bash 5.3.9 heredoc-chain 을 풀어놨기 때문에 중간 hop 불필요).
+
+v0.13.x 환경에서 에러가 발생하는 호스트 (예: `current_layout=markerless(existing-install)` hard-die, stop-hook `ensure_matrix_path failed` spam, always-on auto-start retry loop) 는 v0.14.1 로 올라오면 모두 닫힌다. 자세한 background 는 `OPERATIONS.md §"v0.14.1 completeness pass"` 참고.
+
 ## TL;DR
 
 ```bash
