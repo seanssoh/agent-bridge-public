@@ -6,6 +6,20 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+### Removed
+
+- **Auto-backfill of the `<admin>-dev` codex pair** (reverts #517; closes #4769; refs queue task #4769). `lib/bridge-admin-pair.sh` and the `bridge_ensure_admin_codex_pair` helper, the `bridge-upgrade.py inject-admin-pair-block` subcommand, the SOP-block injection on every `migrate-agents` upgrade pass, and the `bridge-init.sh` / `bridge-upgrade.sh` admin-pair backfill sites are all removed. v0.14.0 silently registered a sibling `<admin>-dev` codex agent on every upgrade and (combined with the `:-admin` init fallback) shifted `BRIDGE_ADMIN_AGENT_ID` away from the operator's chosen value (typically `patch`) to literal `admin`, which defeated the model-diversity intent of the documented `patch (claude) + patch-dev (codex)` standard pair. The admin pair is now an explicit one-time setup: `agent-bridge setup admin <agent>` writes the identifier, and `agent-bridge agent create <admin>-dev --engine codex …` registers the sibling if the operator wants one.
+- **Silent admin-scalar writes from `agent reclassify` (operator-invoked AND upgrade-invoked)**. `bridge_agent_reclassify_static_admin` no longer upserts `BRIDGE_ADMIN_AGENT_ID` when reclassifying a dynamic-but-static-shaped agent. The previous behavior fired from both `agent reclassify --apply` and the automatic reclassify pass that `bridge-upgrade.sh` runs on every non-dry-run upgrade — the upgrade-invoked path was the exact silent-backfill regression #4769 removes. `BRIDGE_ADMIN_AGENT_ID` is now written by exactly one code path: `agent-bridge setup admin <agent>` (`bridge-setup.sh::run_admin`). Operators recovering an admin agent that is mis-recorded as `dynamic` run `agent-bridge agent reclassify --apply` THEN `agent-bridge setup admin <agent>` — see `docs/agent-runtime/admin-protocol.md` §"스태틱 admin 이 dynamic 으로 잘못 기록된 호스트 복구".
+
+### Changed
+
+- `bridge-init.sh` admin-agent default fallback flipped from `:-admin` to `:-patch` so `BRIDGE_ADMIN_AGENT_ID`-unset fresh installs land on the documented standard identifier.
+- Post-upgrade advisory in `bridge-upgrade.sh` (`bridge_upgrade_emit_admin_pair_advisory`): hosts where `BRIDGE_ADMIN_AGENT_ID=admin` AND both `admin/` and `admin-dev/` agent homes exist see a non-destructive recipe pointing at `agent-bridge agent retire admin-dev` → `retire admin` → `setup admin patch` to restore the patch-only contract. No auto-retire.
+
+### Tests
+
+- New regression smoke `scripts/smoke/admin-pair-no-auto-backfill.sh` (4 cases): patch-named admin install records `BRIDGE_ADMIN_AGENT_ID=patch`; admin-id unset install falls back to `patch`; fresh install with operator-named admin does NOT auto-register a sibling; grep-lint asserts `bridge_ensure_admin_codex_pair` and `bridge-admin-pair.sh` no longer appear in any tracked code path. Wired into `scripts/ci-select-smoke.sh` in place of the retired `admin-codex-pair` smoke (which validated the now-removed inject helper).
+
 ## [0.14.1] — 2026-05-16
 
 ### Highlight — completeness pass after v0.14.0 E2E (8 fixes)

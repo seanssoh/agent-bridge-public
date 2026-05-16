@@ -1106,10 +1106,19 @@ bridge_agent_reclassify_static_admin() {
     1 >/dev/null
 
   BRIDGE_AGENT_SOURCE["$agent"]="static"
-  if [[ -z "${BRIDGE_ADMIN_AGENT_ID:-}" ]]; then
-    bridge_roster_local_upsert_scalar "BRIDGE_ADMIN_AGENT_ID" "$agent"
-    BRIDGE_ADMIN_AGENT_ID="$agent"
-  fi
+  # Issue #4769 (reverts #517): reclassify no longer writes
+  # BRIDGE_ADMIN_AGENT_ID. The previous behavior fired both from the
+  # operator-invoked `agent reclassify --apply` path AND from
+  # `bridge-upgrade.sh`'s automatic reclassify pass on every non-dry-run
+  # upgrade (bridge-upgrade.sh:1396-1400) — which is the exact
+  # silent-backfill regression #4769 removes. Reclassify is now strictly
+  # source-classification repair: it flips the in-memory + roster
+  # `BRIDGE_AGENT_SOURCE[$agent]` to `static` and emits the audit row.
+  # The admin scalar is written exclusively by `agent-bridge setup admin
+  # <agent>` (bridge-setup.sh:run_admin). Operators recovering from a
+  # stale dynamic-vs-static misclassification on an admin agent run
+  # `agent reclassify --apply` THEN `setup admin <agent>` — see
+  # docs/agent-runtime/admin-protocol.md §"Admin pair contract".
   bridge_audit_log "$(bridge_admin_agent_id 2>/dev/null || printf bridge-upgrade)" "agent_source_reclassified" "$agent" \
     --detail old_source="$old_source" \
     --detail new_source=static \
