@@ -278,4 +278,61 @@ smoke_assert_eq "1" "$(count_lines "$SEND_LOG")" "6 one send"
 smoke_assert_eq "0" "$(count_lines "$TASK_LOG")" "6 no task (notify empty)"
 smoke_assert_contains "$(cat "$BRIDGE_PICKER_SWEEP_LOG")" "BRIDGE_PICKER_SWEEP_NOTIFY unset" "6 notify-skip logged"
 
+
+# ---------------------------------------------------------------------------
+# Test 7 — Claude Code development-channels warning (post-v0.14.1 addition).
+# ---------------------------------------------------------------------------
+
+smoke_log "7. dev-channels warning → unstick"
+reset_fixture
+printf '%s\n' "dev-channels-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-dev-channels-agent" <<'PANE'
+  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development only.
+
+  Channels: plugin:teams@agent-bridge, plugin:ms365@agent-bridge
+
+  ❯ 1. I am using this for local development
+    2. Exit
+
+  Enter to confirm · Esc to cancel
+PANE
+
+export BRIDGE_PICKER_SWEEP_NOTIFY="admin"
+run_sweep
+smoke_assert_eq "1" "$(count_lines "$SEND_LOG")" "7 one send (dev-channels warning auto-accepted)"
+smoke_assert_eq "1" "$(grep -c "^---$" "$TASK_LOG" || true)" "7 one task (notify admin)"
+
+# ---------------------------------------------------------------------------
+# Test 8 — Codex CLI "Press enter to continue" cwd-confirm prompt.
+# ---------------------------------------------------------------------------
+
+smoke_log "8. codex cwd-confirm → unstick"
+reset_fixture
+printf '%s\n' "codex-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-codex-agent" <<'PANE'
+  Working directory: /home/sean/agent-bridge-public
+  Press enter to continue
+PANE
+
+run_sweep
+smoke_assert_eq "1" "$(count_lines "$SEND_LOG")" "8 one send (codex cwd-confirm auto-accepted)"
+smoke_assert_eq "1" "$(grep -c "^---$" "$TASK_LOG" || true)" "8 one task (notify admin)"
+
+# ---------------------------------------------------------------------------
+# Test 9 — codex confirm regex must NOT trip on free-prose mention.
+# ---------------------------------------------------------------------------
+
+smoke_log "9. codex confirm — false-positive defence (free-prose)"
+reset_fixture
+printf '%s\n' "doc-agent2" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-doc-agent2" <<'PANE'
+> When codex shows "Press enter to continue" the operator types Enter.
+> See codex docs for the cwd-confirm flow.
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "9 no send (codex confirm in '>' quote)"
+
 smoke_log "all checks passed"
