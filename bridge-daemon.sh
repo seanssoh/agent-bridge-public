@@ -533,6 +533,20 @@ bridge_daily_backup_int() {
   fi
 }
 
+# Issue #745: resolve the daily-backup timeout from
+# BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS. Default 300s (was hardcoded 120s)
+# so installs with ~1.4GB+ tarballs don't trip the timeout. Rejects 0,
+# negatives, and non-numeric input back to the default — never returns
+# an unsafe value that would make `bridge_with_timeout` complain.
+bridge_daily_backup_resolve_timeout() {
+  local raw="${BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS:-300}"
+  if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw > 0 )); then
+    printf '%s' "$raw"
+  else
+    printf '%s' "300"
+  fi
+}
+
 # Format a Unix epoch into a portable ISO-8601 string. macOS /bin/date
 # does not support `-d @TS`, so we route through Python (already a hard
 # dep). Falls back to printing the raw epoch if Python is missing.
@@ -882,6 +896,8 @@ _bridge_render_generic_failure_task_body() {
   local detail="${2:-}"
   local resume_at="${3:-}"
   local cooldown="${4:-3600}"
+  local backup_timeout=""
+  backup_timeout="$(bridge_daily_backup_resolve_timeout)"
 
   cat <<EOF
 # Daily backup paused — failure reason: ${reason}
@@ -901,7 +917,7 @@ detail: ${detail:-(no detail)}
 
 ## What this could mean
 
-- \`timeout\`: the backup walk exceeded the 120s daemon timeout. Check whether \`$BRIDGE_HOME\` has unexpectedly large directories (e.g. an unbacked \`shared/\` or accidentally-included \`worktrees/\`). Tune \`BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS\` if needed.
+- \`timeout\`: the backup walk exceeded the ${backup_timeout}s daemon timeout. Check whether \`$BRIDGE_HOME\` has unexpectedly large directories (e.g. an unbacked \`shared/\` or accidentally-included \`worktrees/\`). Tune \`BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS\` to skip transient subtrees, or raise \`BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS\` (default 300) for larger installs.
 - \`parse\` / \`subprocess_rc_*\`: the python3 helper exited unexpectedly. Stderr should be in the daemon log; \`tail -n 200 $BRIDGE_HOME/state/daemon.log\`.
 - \`error_sqlite_snapshot\`: \`state/tasks.db\` exists but its hot snapshot failed (corruption, locked). Run \`python3 $BRIDGE_HOME/bridge-upgrade.py verify-tasks-db --target-root $BRIDGE_HOME\` to diagnose.
 - \`error_oserror_*\`: filesystem error from tar write or rename. Check disk health.
@@ -1493,7 +1509,10 @@ process_daily_backup() {
   # Issue #265 proposal A: daily-backup walks BRIDGE_HOME (large file tree on
   # long-lived installs) and writes a tarball; a hung filesystem (NFS,
   # external mount, full disk waiting on flush) would otherwise stall the
-  # daemon main loop. 120s ceiling is well above the observed normal runtime.
+  # daemon main loop. Issue #745: the ceiling is now resolved from
+  # BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS (default 300s, raised from the
+  # original 120s) so operators with larger installs can tune without
+  # patching source.
   # Bug #507: capture stderr too (separate file) so an error_detail can be
   # surfaced to state.env / audit instead of silently swallowed.
   #
@@ -1502,16 +1521,18 @@ process_daily_backup() {
   # the subprocess. Capture the rc directly via `set +e` / `set -e` toggle
   # so timeouts (124) and non-zero rc map to real failure reasons.
   local stderr_capture=""
+  local backup_timeout=""
+  backup_timeout="$(bridge_daily_backup_resolve_timeout)"
   stderr_capture="$(mktemp "${TMPDIR:-/tmp}/bridge-daily-backup.err.XXXXXX")"
   set +e
-  backup_json="$(bridge_with_timeout 120 daily_backup python3 "$SCRIPT_DIR/bridge-upgrade.py" daily-backup-live --target-root "$BRIDGE_HOME" --backup-dir "$BRIDGE_DAILY_BACKUP_DIR" --retain-days "$retain_days" 2>"$stderr_capture")"
+  backup_json="$(bridge_with_timeout "$backup_timeout" daily_backup python3 "$SCRIPT_DIR/bridge-upgrade.py" daily-backup-live --target-root "$BRIDGE_HOME" --backup-dir "$BRIDGE_DAILY_BACKUP_DIR" --retain-days "$retain_days" 2>"$stderr_capture")"
   subprocess_rc=$?
   set -e
   if (( subprocess_rc != 0 )); then
     error_detail="$(head -c 400 "$stderr_capture" 2>/dev/null | tr '\n' ' ')"
     rm -f "$stderr_capture"
     if (( subprocess_rc == 124 )); then
-      bridge_note_daily_backup_failure "timeout" "bridge_with_timeout 120s exceeded"
+      bridge_note_daily_backup_failure "timeout" "bridge_with_timeout ${backup_timeout}s exceeded (raise BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS)"
     else
       bridge_note_daily_backup_failure "subprocess_rc_${subprocess_rc}" "$error_detail"
     fi

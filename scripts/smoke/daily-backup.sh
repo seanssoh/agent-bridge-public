@@ -242,6 +242,68 @@ step_cleanup_residue_happy_path() {
   smoke_log "cleanup_residue_happy_path OK"
 }
 
+step_timeout_resolution() {
+  # Issue #745: bridge_daily_backup_resolve_timeout honours
+  # BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS, defaults to 300, and clamps
+  # invalid input (0, negative, non-numeric) back to 300. Also asserts
+  # the env var name appears in the daemon's rc=124 failure detail wiring
+  # so operators see actionable guidance.
+  local daemon_src="$SMOKE_REPO_ROOT/bridge-daemon.sh"
+  [[ -f "$daemon_src" ]] \
+    || smoke_fail "timeout_resolution: bridge-daemon.sh missing at $daemon_src"
+
+  # Extract just the helper function (skip sourcing the whole daemon —
+  # that would run its top-level dispatch). Boundaries: from the function
+  # header through the next blank line after the closing brace.
+  local fn_body
+  fn_body="$(awk '
+    /^bridge_daily_backup_resolve_timeout\(\)/ { capture=1 }
+    capture { print }
+    capture && /^}$/ { exit }
+  ' "$daemon_src")"
+  [[ -n "$fn_body" ]] \
+    || smoke_fail "timeout_resolution: failed to extract bridge_daily_backup_resolve_timeout from $daemon_src"
+
+  # Helper that evals the extracted function in a clean subshell with a
+  # given env value, then prints the resolved timeout.
+  local case_input case_want got
+  for case_pair in \
+      "::300" \
+      "600:600" \
+      "0:300" \
+      "-1:300" \
+      "abc:300"; do
+    case_input="${case_pair%%:*}"
+    case_want="${case_pair##*:}"
+    if [[ -z "$case_input" ]]; then
+      got="$(env -u BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS \
+        bash -c "$fn_body"$'\n''bridge_daily_backup_resolve_timeout')"
+    else
+      got="$(BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS="$case_input" \
+        bash -c "$fn_body"$'\n''bridge_daily_backup_resolve_timeout')"
+    fi
+    [[ "$got" == "$case_want" ]] \
+      || smoke_fail "timeout_resolution: input='${case_input}' want=${case_want} got=${got}"
+  done
+
+  # rc=124 failure path must mention the env var by name so operators
+  # know what to tune. Restrict the window to the daily-backup failure
+  # handler to avoid matching the helper's own docstring. Use a bash
+  # regex on a captured string instead of piping into grep -q so
+  # `set -o pipefail` cannot be tripped by SIGPIPE on early exit.
+  local fn_window
+  fn_window="$(awk '
+    /process_daily_backup\(\)/ { in_fn=1 }
+    in_fn { print }
+    in_fn && /^}$/ { exit }
+  ' "$daemon_src")"
+  if [[ ! "$fn_window" =~ bridge_with_timeout.*exceeded.*BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS ]]; then
+    smoke_fail "timeout_resolution: rc=124 failure detail does not name BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS"
+  fi
+
+  smoke_log "timeout_resolution OK (5/5 cases + rc=124 detail wiring)"
+}
+
 main() {
   smoke_log "starting issue #507 regression smoke"
   step_snapshot_content
@@ -250,6 +312,7 @@ main() {
   step_missing_tasks_db
   step_corrupted_tasks_db_blocks_archive
   step_cleanup_residue_happy_path
+  step_timeout_resolution
   smoke_log "all daily-backup checks passed"
 }
 

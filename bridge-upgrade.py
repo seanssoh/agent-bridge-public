@@ -847,13 +847,15 @@ def iter_daily_backup_members(
 def _resolve_grace_seconds(override: int | None = None) -> int:
     # bug #507: stale-tmp reaper must not unlink an in-flight peer's tmp
     # file, so only files older than (daemon_timeout + grace) are removed.
-    # 180s default = 120s daemon timeout + 60s grace.
+    # Issue #745: default raised 180 -> 360 to track the daemon-side
+    # BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS default bump (120 -> 300) plus
+    # the original 60s slack.
     if override is not None:
         return max(0, int(override))
     raw = os.environ.get("BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS", "")
     if raw.isdigit():
         return max(0, int(raw))
-    return 180
+    return 360
 
 
 def reap_stale_daily_backup_tmp(
