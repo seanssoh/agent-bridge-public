@@ -94,6 +94,27 @@ bridge_cron_scheduler_python() {
   python3 "$BRIDGE_SCRIPT_DIR/bridge-cron-scheduler.py" "$@"
 }
 
+# PR #953 r3 (refs #4807, codex r2 P2 #1): centralized dispatcher for the
+# lib/cron-helpers/*.py extraction helpers. The thirteen helper invocations
+# below previously expanded `python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/
+# <name>.py" "$@"` inline without first re-validating BRIDGE_SCRIPT_DIR. If
+# the source checkout moved or BRIDGE_SCRIPT_DIR was inherited stale, the
+# helper path expanded to a `[Errno 2]` while consuming `source <(...)` /
+# `... | grep` patterns silently swallowed the failure — the daemon then
+# continued with blank CRON_* env, which is the 13h cron-worker hang shape.
+# Routing every helper through this wrapper guarantees the same per-call
+# stale-source guard the `bridge_cron_python` family already enforces.
+bridge_cron_helper_python() {
+  local helper="${1:-}"
+  [[ -n "$helper" ]] || return 1
+  shift || true
+  bridge_require_python
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/$helper.py" "$@"
+}
+
 bridge_cron_default_slot() {
   local family="${1:-memory-daily}"
 
@@ -105,10 +126,11 @@ bridge_cron_default_slot() {
       TZ=Asia/Seoul date +%F
       ;;
     *)
-      bridge_require_python
       # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
       # lib/cron-helpers/default-slot-now.py — see helper docstring.
-      python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/default-slot-now.py"
+      # PR #953 r3: routed through bridge_cron_helper_python for per-call
+      # BRIDGE_SCRIPT_DIR guard.
+      bridge_cron_helper_python default-slot-now
       ;;
   esac
 }
@@ -117,10 +139,11 @@ bridge_cron_slot_from_datetime() {
   local value="${1:-}"
 
   [[ -n "$value" ]] || return 1
-  bridge_require_python
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/slot-from-datetime.py — see helper docstring.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/slot-from-datetime.py" "$value"
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_cron_helper_python slot-from-datetime "$value"
 }
 
 bridge_cron_slot_for_job() {
@@ -143,10 +166,11 @@ bridge_cron_scheduler_state_file() {
 bridge_cron_safe_component() {
   local value="$1"
 
-  bridge_require_python
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/safe-component.py — see helper docstring.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/safe-component.py" "$value"
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_cron_helper_python safe-component "$value"
 }
 
 bridge_cron_job_slug() {
@@ -311,10 +335,13 @@ bridge_cron_load_run_shell() {
   result_file="$(bridge_cron_result_file_by_id "$run_id")"
   status_file="$(bridge_cron_status_file_by_id "$run_id")"
 
-  bridge_require_python
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/load-run-shell.py — see helper docstring.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/load-run-shell.py" \
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard (the daemon consumes this via
+  # `source <(bridge_cron_load_run_shell)`, which would swallow a
+  # python3 [Errno 2] silently and leave CRON_* env blank).
+  bridge_cron_helper_python load-run-shell \
     "$request_file" "$result_file" "$status_file"
 }
 
@@ -323,7 +350,6 @@ bridge_cron_write_completion_note() {
   local note_file="$2"
   local followup_task_id="${3:-}"
 
-  bridge_require_python
   # Pre-capture nested $() into locals to avoid footgun #11 (Bash 5.3.9 read_comsub/heredoc_write deadlock under I/O pressure).
   local request_file result_file status_file
   request_file="$(bridge_cron_request_file_by_id "$run_id")"
@@ -331,7 +357,9 @@ bridge_cron_write_completion_note() {
   status_file="$(bridge_cron_status_file_by_id "$run_id")"
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/write-completion-note.py — see helper docstring.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/write-completion-note.py" \
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_cron_helper_python write-completion-note \
     "$run_id" "$note_file" "$followup_task_id" \
     "$request_file" "$result_file" "$status_file"
 }
@@ -340,7 +368,6 @@ bridge_cron_write_followup_body() {
   local run_id="$1"
   local body_file="$2"
 
-  bridge_require_python
   # Pre-capture nested $() into locals to avoid footgun #11 (Bash 5.3.9 read_comsub/heredoc_write deadlock under I/O pressure).
   local request_file result_file status_file
   request_file="$(bridge_cron_request_file_by_id "$run_id")"
@@ -348,7 +375,9 @@ bridge_cron_write_followup_body() {
   status_file="$(bridge_cron_status_file_by_id "$run_id")"
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/write-followup-body.py — see helper docstring.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/write-followup-body.py" \
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_cron_helper_python write-followup-body \
     "$run_id" "$body_file" \
     "$request_file" "$result_file" "$status_file"
 }
@@ -445,10 +474,11 @@ bridge_cron_write_manifest() {
 
   mkdir -p "$(dirname "$manifest_file")"
 
-  bridge_require_python
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/write-manifest.py — see helper docstring.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/write-manifest.py" \
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_cron_helper_python write-manifest \
     "$manifest_file" "$job_id" "$job_name" "$family" "$source_agent" \
     "$target" "$slot" "$task_id" "$created_at" "$body_file" \
     "$source_file" "$run_id" "$request_file" "$payload_file" \
@@ -509,13 +539,14 @@ bridge_cron_write_request() {
 
   mkdir -p "$(dirname "$request_file")"
 
-  bridge_require_python
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/write-request.py — see helper docstring. This was
   # the most argv-dense site in lib/bridge-cron.sh (44 positional
   # arguments) and the surface most directly tied to the 13h cron-worker
   # hang on the operator host.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/write-request.py" \
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_cron_helper_python write-request \
     "$request_file" "$run_id" "$job_id" "$job_name" "$family" \
     "$source_agent" "$target" "$slot" "$task_id" "$created_at" \
     "$body_file" "$payload_file" "$result_file" "$status_file" \
@@ -544,10 +575,11 @@ bridge_cron_write_status() {
 
   mkdir -p "$(dirname "$status_file")"
 
-  bridge_require_python
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/write-status.py — see helper docstring.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/write-status.py" \
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_cron_helper_python write-status \
     "$status_file" "$run_id" "$state" "$engine" \
     "$request_file" "$result_file" "$updated_at" "$error_message"
 }
@@ -592,10 +624,11 @@ bridge_cron_update_request_task_id() {
   [[ -n "$request_file" && -f "$request_file" ]] || return 0
   [[ -n "$task_id" ]] || return 0
 
-  bridge_require_python
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/update-request-task-id.py — see helper docstring.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/update-request-task-id.py" \
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_cron_helper_python update-request-task-id \
     "$request_file" "$task_id"
 }
 
@@ -607,10 +640,11 @@ bridge_cron_update_manifest_task_id() {
   [[ -n "$manifest_file" && -f "$manifest_file" ]] || return 0
   [[ -n "$task_id" ]] || return 0
 
-  bridge_require_python
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/update-manifest-task-id.py — see helper docstring.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/update-manifest-task-id.py" \
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_cron_helper_python update-manifest-task-id \
     "$manifest_file" "$task_id"
 }
 
@@ -621,20 +655,22 @@ bridge_cron_actions_taken_contains() {
   [[ -n "$result_file" && -f "$result_file" ]] || return 1
   [[ -n "$action" ]] || return 1
 
-  bridge_require_python
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/actions-taken-contains.py — see helper docstring.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/actions-taken-contains.py" \
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_cron_helper_python actions-taken-contains \
     "$result_file" "$action"
 }
 
 bridge_cron_job_always_followup() {
   local job_id="$1"
 
-  bridge_require_python
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/cron-helpers/job-always-followup.py — see helper docstring.
-  python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/job-always-followup.py" \
+  # PR #953 r3: routed through bridge_cron_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_cron_helper_python job-always-followup \
     "$job_id" "$BRIDGE_NATIVE_CRON_JOBS_FILE"
 }
 

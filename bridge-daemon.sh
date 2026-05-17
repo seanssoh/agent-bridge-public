@@ -31,6 +31,27 @@ daemon_warn() {
   printf '[%s] [warn] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$message" >&2
 }
 
+# PR #953 r3 (refs #4807, codex r2 P2 #1): centralized dispatcher for the
+# lib/daemon-helpers/*.py extraction helpers. Seven helper invocations
+# downstream previously expanded `python3 "$SCRIPT_DIR/lib/daemon-helpers/
+# <name>.py" "$@"` inline without first re-validating BRIDGE_SCRIPT_DIR /
+# SCRIPT_DIR. If the source checkout moved or BRIDGE_SCRIPT_DIR was
+# inherited stale, the helper path expanded to `[Errno 2]`. Routing every
+# helper through this wrapper guarantees the same per-call stale-source
+# guard `bridge_resolve_script_dir_check` already enforces elsewhere.
+# The wrapper uses $BRIDGE_SCRIPT_DIR (set by bridge-lib.sh) rather than
+# the daemon's local $SCRIPT_DIR so the guard's recovery branch (which
+# rewrites BRIDGE_SCRIPT_DIR) actually changes the path we dispatch to.
+bridge_daemon_helper_python() {
+  local helper="${1:-}"
+  [[ -n "$helper" ]] || return 1
+  shift || true
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  python3 "$BRIDGE_SCRIPT_DIR/lib/daemon-helpers/$helper.py" "$@"
+}
+
 daemon_source_state_file() {
   local file="$1"
   local label="${2:-state}"
@@ -554,8 +575,10 @@ bridge_daily_backup_format_epoch() {
   local epoch="${1:-0}"
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/daemon-helpers/format-epoch-iso.py — see helper docstring.
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
   if command -v python3 >/dev/null 2>&1; then
-    python3 "$SCRIPT_DIR/lib/daemon-helpers/format-epoch-iso.py" "$epoch" 2>/dev/null \
+    bridge_daemon_helper_python format-epoch-iso "$epoch" 2>/dev/null \
       || printf '%s' "$epoch"
   else
     printf '%s' "$epoch"
@@ -983,7 +1006,9 @@ bridge_write_release_alert_body() {
   # lib/daemon-helpers/write-release-alert-body.py — see helper docstring.
   # The helper exits 1 when the monitor payload carries no alerts; preserve
   # that contract (process_usage_monitor branches on the rc).
-  python3 "$SCRIPT_DIR/lib/daemon-helpers/write-release-alert-body.py" \
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python write-release-alert-body \
     "$body_file" "$monitor_json" "$upgrade_check_json"
 }
 
@@ -1639,14 +1664,18 @@ bridge_stall_decode_excerpt() {
   local encoded="${1:-}"
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/daemon-helpers/stall-decode-excerpt.py — see helper docstring.
-  python3 "$SCRIPT_DIR/lib/daemon-helpers/stall-decode-excerpt.py" "$encoded"
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python stall-decode-excerpt "$encoded"
 }
 
 bridge_stall_recent_audits_markdown() {
   local agent="$1"
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/daemon-helpers/stall-recent-audits-markdown.py — see helper docstring.
-  python3 "$SCRIPT_DIR/lib/daemon-helpers/stall-recent-audits-markdown.py" \
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python stall-recent-audits-markdown \
     "$BRIDGE_AUDIT_LOG" "$agent"
 }
 
@@ -2442,7 +2471,9 @@ bridge_watchdog_problem_key() {
   local report_json="$1"
   # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
   # lib/daemon-helpers/watchdog-problem-key.py — see helper docstring.
-  python3 "$SCRIPT_DIR/lib/daemon-helpers/watchdog-problem-key.py" "$report_json"
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python watchdog-problem-key "$report_json"
 }
 
 bridge_watchdog_due() {
@@ -4556,7 +4587,9 @@ start_cron_worker() {
   # lib/daemon-helpers/start-cron-worker-spawn.py — see helper docstring.
   # The cron-dispatch start path runs concurrently with daemon polling so
   # the deadlock surface was hot.
-  python3 "$SCRIPT_DIR/lib/daemon-helpers/start-cron-worker-spawn.py" \
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python start-cron-worker-spawn \
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-daemon.sh" "$task_id" "$log_file" >/dev/null
 }
 
@@ -5522,7 +5555,9 @@ bridge_queue_gateway_socket_connect_probe() {
   # lib/daemon-helpers/gateway-socket-connect-probe.py — see helper docstring.
   # Status path runs on every `daemon status` invocation; the deadlock
   # surface was hot under concurrent dispatch pressure.
-  python3 "$SCRIPT_DIR/lib/daemon-helpers/gateway-socket-connect-probe.py" \
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python gateway-socket-connect-probe \
     "$socket_path" >/dev/null 2>&1
 }
 

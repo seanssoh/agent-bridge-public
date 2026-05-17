@@ -209,14 +209,20 @@ smoke_assert_contains "$load_out" "CRON_FAILURE_CLASS=admin-resolvable" "C3 load
 smoke_log "C3 PASS — hot helpers round-trip cleanly"
 
 # C4 — call-site discipline. Every helper invocation in bridge-daemon.sh
-# must route through `$SCRIPT_DIR/lib/daemon-helpers/`; every helper
-# invocation in lib/bridge-cron.sh must route through
-# `$BRIDGE_SCRIPT_DIR/lib/cron-helpers/`. A relative path or hard-coded
-# absolute path would re-introduce the operator-host runtime drift that
-# the upgrade-helpers / agent-cli-helpers waves taught us to avoid.
-smoke_log "C4: helper call sites use \$SCRIPT_DIR / \$BRIDGE_SCRIPT_DIR interpolation"
+# must route through `$BRIDGE_SCRIPT_DIR/lib/daemon-helpers/` (PR #953 r3
+# centralized the seven inline `$SCRIPT_DIR` call sites behind the
+# `bridge_daemon_helper_python` wrapper, which uses `$BRIDGE_SCRIPT_DIR`
+# so the per-call `bridge_resolve_script_dir_check` guard's recovery
+# branch — which only rewrites BRIDGE_SCRIPT_DIR — actually changes the
+# dispatch target). Every helper invocation in lib/bridge-cron.sh must
+# route through `$BRIDGE_SCRIPT_DIR/lib/cron-helpers/` (centralized
+# behind `bridge_cron_helper_python` in the same PR). A relative path
+# or hard-coded absolute path would re-introduce the operator-host
+# runtime drift that the upgrade-helpers / agent-cli-helpers waves
+# taught us to avoid.
+smoke_log "C4: helper call sites use \$BRIDGE_SCRIPT_DIR interpolation"
 
-daemon_call_pattern='python3 "\$SCRIPT_DIR/lib/daemon-helpers/'
+daemon_call_pattern='python3 "\$BRIDGE_SCRIPT_DIR/lib/daemon-helpers/'
 daemon_call_count="$(grep -c "$daemon_call_pattern" "$DAEMON_SCRIPT" || true)"
 if (( daemon_call_count == 0 )); then
   smoke_fail "C4: no helper invocations found in bridge-daemon.sh"
@@ -224,13 +230,13 @@ fi
 
 # bridge-daemon.sh must not import a daemon helper via a non-anchored path
 if grep -nE 'python3 [^"]*lib/daemon-helpers/' "$DAEMON_SCRIPT" \
-    | grep -vE 'python3 "\$SCRIPT_DIR/lib/daemon-helpers/' \
+    | grep -vE 'python3 "\$BRIDGE_SCRIPT_DIR/lib/daemon-helpers/' \
     | grep -vE '^[0-9]+:[[:space:]]*#' >/dev/null 2>&1; then
   smoke_log "C4 bridge-daemon.sh has a non-anchored helper invocation:"
   grep -nE 'python3 [^"]*lib/daemon-helpers/' "$DAEMON_SCRIPT" \
-    | grep -vE 'python3 "\$SCRIPT_DIR/lib/daemon-helpers/' \
+    | grep -vE 'python3 "\$BRIDGE_SCRIPT_DIR/lib/daemon-helpers/' \
     | grep -vE '^[0-9]+:[[:space:]]*#'
-  smoke_fail "C4: daemon helper invocation missing \$SCRIPT_DIR anchor"
+  smoke_fail "C4: daemon helper invocation missing \$BRIDGE_SCRIPT_DIR anchor"
 fi
 
 cron_call_pattern='python3 "\$BRIDGE_SCRIPT_DIR/lib/cron-helpers/'
