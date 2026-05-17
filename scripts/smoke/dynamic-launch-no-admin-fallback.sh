@@ -62,6 +62,73 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# r4 (codex PR #955 r3, P1 BLOCKING): smoke_setup_bridge_home re-exports
+# the BRIDGE_HOME-derived paths it sets, but does not pre-unset other
+# BRIDGE_* env vars that the caller's shell may already have exported
+# from the live Agent Bridge install (e.g. when this smoke is run from
+# an `agb`-managed agent session). Inherited values like
+# BRIDGE_DAEMON_PID_FILE, BRIDGE_WORKTREE_ROOT, BRIDGE_DAEMON_LOG, etc.
+# would still point at the operator's live `~/.agent-bridge` paths even
+# though BRIDGE_HOME itself is now the temp root. agent-bridge →
+# bridge-daemon.sh ensure consults BRIDGE_DAEMON_PID_FILE and would
+# touch the live daemon.pid (cleanup, repair, or even kill of the
+# operator's running daemon). Pin every derived path to the temp tree
+# by unsetting first — the smoke library's subsequent `export` calls
+# then take effect from a clean slate, and any path the library does
+# not explicitly set falls back to its bridge-lib.sh default rooted at
+# BRIDGE_HOME (which we have now pointed at the temp root).
+#
+# Keep this list in sync with `bridge_reject_ephemeral_controller_env_for_agent_env`
+# in lib/bridge-agents.sh — that function enumerates every BRIDGE_*
+# path the runtime materially depends on, so any new entry there is
+# also a potential live-state leak vector here.
+unset \
+  BRIDGE_HOME \
+  BRIDGE_ROSTER_FILE \
+  BRIDGE_ROSTER_LOCAL_FILE \
+  BRIDGE_STATE_DIR \
+  BRIDGE_LAYOUT_MARKER_DIR \
+  BRIDGE_ACTIVE_AGENT_DIR \
+  BRIDGE_HISTORY_DIR \
+  BRIDGE_WORKTREE_META_DIR \
+  BRIDGE_ACTIVE_ROSTER_TSV \
+  BRIDGE_ACTIVE_ROSTER_MD \
+  BRIDGE_DAEMON_PID_FILE \
+  BRIDGE_DAEMON_LOG \
+  BRIDGE_DAEMON_CRASH_LOG \
+  BRIDGE_TASK_DB \
+  BRIDGE_PROFILE_STATE_DIR \
+  BRIDGE_CRON_STATE_DIR \
+  BRIDGE_CRON_HOME_DIR \
+  BRIDGE_WORKTREE_ROOT \
+  BRIDGE_AGENT_HOME_ROOT \
+  BRIDGE_RUNTIME_ROOT \
+  BRIDGE_RUNTIME_SCRIPTS_DIR \
+  BRIDGE_RUNTIME_SKILLS_DIR \
+  BRIDGE_RUNTIME_SHARED_DIR \
+  BRIDGE_RUNTIME_SHARED_TOOLS_DIR \
+  BRIDGE_RUNTIME_SHARED_REFERENCES_DIR \
+  BRIDGE_RUNTIME_MEMORY_DIR \
+  BRIDGE_RUNTIME_CREDENTIALS_DIR \
+  BRIDGE_RUNTIME_SECRETS_DIR \
+  BRIDGE_RUNTIME_CONFIG_FILE \
+  BRIDGE_HOOKS_DIR \
+  BRIDGE_SHARED_DIR \
+  BRIDGE_TASK_NOTE_DIR \
+  BRIDGE_LOG_DIR \
+  BRIDGE_DATA_ROOT \
+  BRIDGE_SHARED_ROOT \
+  BRIDGE_AGENT_ROOT_V2 \
+  BRIDGE_CONTROLLER_STATE_ROOT \
+  BRIDGE_LAUNCHAGENT_LOG \
+  BRIDGE_AUDIT_LOG \
+  BRIDGE_LAYOUT
+# Intentionally NOT unsetting BRIDGE_ADMIN_AGENT_ID here: that is an
+# identifier (not a derived path) and C2 below specifically exercises
+# the "explicitly unset in a subshell" shape. Pre-unsetting it would
+# collapse C1 and C2 into the same case and weaken C1's
+# inherited-from-controller-session coverage.
+
 smoke_setup_bridge_home "$SMOKE_NAME"
 
 REPO_ROOT="$SMOKE_REPO_ROOT"
@@ -170,28 +237,44 @@ EOF
 # fd-0 redirect plus pipeline-captured fd-1 guarantees both are denied
 # even when the smoke runs from an interactive terminal).
 #
-# Returns the wrapper's combined stdout+stderr. Exit code is discarded:
-# downstream daemon/start hangs are expected in the smoke environment
-# and would otherwise mask the assertion.
+# Captures combined stdout+stderr to LAST_SPAWN_OUT and the wrapper's
+# exit code (or `timeout`'s 124 on bound expiry) to LAST_SPAWN_RC.
+# Both are populated as globals; the function itself always returns 0
+# so the caller can sequence assertions without an interleaved `|| true`.
+LAST_SPAWN_OUT=""
+LAST_SPAWN_RC=0
 run_spawn() {
   local agent_name="$1"
   shift
-  if [[ -n "$TIMEOUT_BIN" ]]; then
-    "$TIMEOUT_BIN" "$INVOKE_TIMEOUT_SECONDS" \
-      "$BASH4_BIN" "$REPO_ROOT/agent-bridge" \
-      --claude \
-      --name "$agent_name" \
-      --workdir "$FAKE_PROJECT_CANON" \
-      --no-attach \
-      "$@" </dev/null 2>&1 || true
-  else
+  local tmpfile
+  tmpfile="$(mktemp "${SMOKE_TMP_ROOT}/run-spawn-out.XXXXXX")"
+  local rc=0
+  # r4 (codex PR #955 r3, P2): route through a tmpfile + explicit rc
+  # capture so we can assert on BOTH the captured output and the wrapper
+  # exit code. `$(...) || true` would discard rc, which is exactly the
+  # gap codex flagged: a future regression that aborts the wrapper
+  # before the dispatch decision would leave LAST_SPAWN_OUT empty and
+  # silently pass the negative `assert_not_contains` checks. With rc
+  # captured we can distinguish "timed out past the dispatch decision"
+  # (rc=124, expected) from "wrapper bailed pre-dispatch" (rc != 124 +
+  # rc != 0, regression).
+  #
+  # NOTE: `set -e` is OFF for this file (`set -uo pipefail` only, no
+  # `-e`), but we still must not chain `|| rc=$?` directly onto the
+  # multi-line `\` continuation — that breaks the line continuation
+  # parse. Use a bare invocation followed by `rc=$?` captured on the
+  # very next line; nothing must run between them.
+  "$TIMEOUT_BIN" "$INVOKE_TIMEOUT_SECONDS" \
     "$BASH4_BIN" "$REPO_ROOT/agent-bridge" \
-      --claude \
-      --name "$agent_name" \
-      --workdir "$FAKE_PROJECT_CANON" \
-      --no-attach \
-      "$@" </dev/null 2>&1 || true
-  fi
+    --claude \
+    --name "$agent_name" \
+    --workdir "$FAKE_PROJECT_CANON" \
+    --no-attach \
+    "$@" </dev/null >"$tmpfile" 2>&1 || rc=$?
+  LAST_SPAWN_OUT="$(cat "$tmpfile")"
+  LAST_SPAWN_RC="$rc"
+  rm -f "$tmpfile" >/dev/null 2>&1 || true
+  return 0
 }
 
 # The exact hijack marker the wrapper prints at agent-bridge:1141 right
@@ -199,13 +282,55 @@ run_spawn() {
 # wrapper, the smoke must be updated in lockstep.
 HIJACK_MARKER="대신 정적 역할 'patch'를 깨웁니다"
 
+# r4 (codex PR #955 r3, P2): positive control for each should-spawn
+# case. The negative `assert_not_contains` checks pass on ANY output
+# that lacks the marker — including timeouts, env init failures, and
+# regressions that abort the wrapper before the dispatch decision is
+# reached. To distinguish "shared-dispatch correctly chose not to
+# hijack" from "wrapper crashed pre-dispatch", assert the wrapper
+# proceeded at least as far as the post-dispatch downstream stage.
+#
+# The wrapper's `bridge-daemon.sh ensure` invocation at
+# agent-bridge:1218 hangs in the smoke environment (no live daemon, no
+# real tmux), so a healthy non-hijack run hits the 15s `$TIMEOUT_BIN`
+# bound and rc=124. The hijack branch routes into `start_static_agent`
+# which in turn invokes `bridge-start.sh patch`, which also hangs →
+# also rc=124. So rc=124 is the cross-branch signal for "wrapper got
+# past the dispatch decision". Any other non-zero rc indicates the
+# wrapper died early (e.g. roster load failure, missing helper, the
+# new sanitize_stale_ephemeral_controller_env code path swallowing
+# our env), which the smoke MUST flag.
+#
+# Why not assert on the per-agent active env file written at
+# agent-bridge:1216 (`bridge_write_dynamic_agent_file`)? That side
+# effect is materially later — on Bash 5.3.9 macOS the wrapper hits
+# the footgun #11 heredoc-stdin deadlock inside
+# `bridge_write_agent_state_file` (lib/bridge-state.sh, `content=$(cat
+# <<EOF…)` pattern) BEFORE the file is created, so the file-existence
+# assertion is brittle on the dev host even when dispatch behavior is
+# correct. rc=124 is reliably observable on every Bash version because
+# it comes from the `timeout` wrapper, not from the wrapper script.
+assert_spawn_reached_post_dispatch() {
+  local context="$1"
+  # rc=0 (wrapper somehow finished cleanly) is acceptable too — it
+  # would mean the smoke environment has enough plumbing to run the
+  # whole wrapper to completion, which a regression-tightening test
+  # would never want to reject. rc=124 is the expected case in the
+  # current smoke environment.
+  if [[ "$LAST_SPAWN_RC" != "124" && "$LAST_SPAWN_RC" != "0" ]]; then
+    smoke_fail "$context: wrapper exited rc=$LAST_SPAWN_RC before reaching the post-dispatch downstream stage (expected rc=124 from \`$TIMEOUT_BIN $INVOKE_TIMEOUT_SECONDS\` or rc=0 from a complete run; non-124 non-zero indicates an early pre-dispatch failure that would let the negative HIJACK_MARKER check pass on empty output). Captured output: $LAST_SPAWN_OUT"
+  fi
+}
+
 # ----------------------------------------------------------------------
 # C1 — explicit `--name new-dynamic-xyz` must not hijack to `patch`.
 # ----------------------------------------------------------------------
 
-C1_OUT="$(run_spawn "new-dynamic-xyz")"
-smoke_assert_not_contains "$C1_OUT" "$HIJACK_MARKER" \
+run_spawn "new-dynamic-xyz"
+smoke_assert_not_contains "$LAST_SPAWN_OUT" "$HIJACK_MARKER" \
   "C1 (admin static present, non-TTY): wrapper must not redirect to static role 'patch'"
+assert_spawn_reached_post_dispatch \
+  "C1 (admin static present, non-TTY)"
 smoke_log "C1 PASS"
 
 # ----------------------------------------------------------------------
@@ -219,9 +344,12 @@ smoke_log "C1 PASS"
 # accidentally couple them.
 # ----------------------------------------------------------------------
 
-C2_OUT="$(unset BRIDGE_ADMIN_AGENT_ID && run_spawn "new-dynamic-c2")"
-smoke_assert_not_contains "$C2_OUT" "$HIJACK_MARKER" \
+unset BRIDGE_ADMIN_AGENT_ID
+run_spawn "new-dynamic-c2"
+smoke_assert_not_contains "$LAST_SPAWN_OUT" "$HIJACK_MARKER" \
   "C2 (BRIDGE_ADMIN_AGENT_ID unset, non-TTY): wrapper must not redirect to static role"
+assert_spawn_reached_post_dispatch \
+  "C2 (BRIDGE_ADMIN_AGENT_ID unset, non-TTY)"
 smoke_log "C2 PASS"
 
 # ----------------------------------------------------------------------
@@ -256,9 +384,11 @@ else
   smoke_log "C3: sqlite3 unavailable — running without seeded ghost row (the dispatch path doesn't consult tasks.db; the invariant still holds)"
 fi
 
-C3_OUT="$(run_spawn "ghost-agent")"
-smoke_assert_not_contains "$C3_OUT" "$HIJACK_MARKER" \
+run_spawn "ghost-agent"
+smoke_assert_not_contains "$LAST_SPAWN_OUT" "$HIJACK_MARKER" \
   "C3 (tasks.db ghost row, non-TTY): wrapper must not redirect to static role (dispatch ignores tasks.db)"
+assert_spawn_reached_post_dispatch \
+  "C3 (tasks.db ghost row, non-TTY)"
 smoke_log "C3 PASS"
 
 # ----------------------------------------------------------------------
@@ -270,8 +400,8 @@ smoke_log "C3 PASS"
 # UX.
 # ----------------------------------------------------------------------
 
-WAKE_OUT="$(run_spawn "wake-target" --prefer wake)"
-smoke_assert_contains "$WAKE_OUT" "$HIJACK_MARKER" \
+run_spawn "wake-target" --prefer wake
+smoke_assert_contains "$LAST_SPAWN_OUT" "$HIJACK_MARKER" \
   "positive control: --prefer wake still redirects to the project static role (operator opted in)"
 smoke_log "positive control PASS (--prefer wake)"
 
