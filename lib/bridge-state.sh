@@ -1,6 +1,20 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash disable=SC2034
 
+# PR #951 r7 (#946 L1): direct-source callers (scripts/smoke/daemon-heredoc-
+# timeout.sh, scripts/smoke/heredoc-regression-helpers/*, scripts/smoke/
+# idle-counter-latch.sh, scripts/smoke/nudge-marker-recovery.sh) source this
+# file without first sourcing bridge-lib.sh, so the bridge_resolve_script_dir_*
+# helpers defined in bridge-core.sh would be undefined and every guard call
+# below would return command-not-found instead of 0/1 — silently breaking the
+# audit + early-return contract codex r6 fixed. Source bridge-core.sh
+# idempotently here; the full-loader path (bridge-lib.sh sources bridge-core
+# before bridge-state) becomes a no-op via the declare -F gate.
+if ! declare -F bridge_resolve_script_dir_check >/dev/null 2>&1; then
+  # shellcheck source=lib/bridge-core.sh
+  source "$(cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/bridge-core.sh"
+fi
+
 bridge_agent_next_session_file() {
   local agent="$1"
   printf '%s/NEXT-SESSION.md' "$(bridge_agent_workdir "$agent")"

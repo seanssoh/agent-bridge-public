@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash disable=SC2034
 
+# PR #951 r7: color constants are normally defined by bridge-lib.sh BEFORE
+# it sources bridge-core.sh. Direct-source paths (lib/bridge-state.sh
+# sourcing this file from the top to make bridge_resolve_script_dir_check
+# available to scripts/smoke/* direct-source consumers) reach the helpers
+# below without bridge-lib.sh ever running, so RED/YELLOW/CYAN/NC would
+# be unbound and `set -u` callers (e.g. scripts/smoke/nudge-marker-
+# recovery.sh) would crash inside bridge_warn / bridge_die. Define empty
+# defaults idempotently — the full-loader path's earlier assignments win
+# via the := default-if-unset pattern.
+: "${RED:=}"
+: "${GREEN:=}"
+: "${YELLOW:=}"
+: "${CYAN:=}"
+: "${NC:=}"
+
 bridge_die() {
   echo -e "${RED}[오류] $*${NC}" >&2
   exit 1
