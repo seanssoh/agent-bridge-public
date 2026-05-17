@@ -189,7 +189,17 @@ json_escape() {
 # ---------------------------------------------------------------------------
 
 # Patterns. POSIX ERE; tested in scripts/smoke/lint-heredoc-scanner-self.sh.
-RE_HEREDOC_OP='<<-?["'"'"']?[A-Za-z_][A-Za-z0-9_]*["'"'"']?'
+#
+# RE_HEREDOC_OP tolerates whitespace between `<<` / `<<-` and the delimiter
+# ONLY when the delimiter is quoted (`<<  'PY'`, `<<  "PY"`). Bash accepts
+# both quoted and unquoted-with-whitespace, but unquoted `<<  TOKEN` is
+# indistinguishable from a comparison expression `"x << y"` inside a string
+# (e.g. `"elapsed << interval"`) and produces a false positive that
+# trips the lint on prose. Quoted-only is sufficient to catch the actual
+# r3 P2 #2 case (the only whitespace-tolerant shape that has shown up in
+# the tree). r3 fix for codex PR #954 r2 finding P2 #2 — combined with the
+# tightening above to avoid prose-text false positives.
+RE_HEREDOC_OP='<<-?([[:space:]]*["'"'"'][A-Za-z_][A-Za-z0-9_]*["'"'"']|["'"'"']?[A-Za-z_][A-Za-z0-9_]*["'"'"']?)'
 RE_HERESTRING='<<<'
 RE_PROCSUB_IN='<[[:space:]]+<\('
 RE_PROCSUB_OUT='>[[:space:]]+>\('
@@ -251,8 +261,18 @@ line_has_heredoc_like() {
 
 # Classify one line. Echoes `CATEGORY|REASON`.
 # CATEGORY ∈ {C1, C2, C3, C4, H3, SAFE, NONE}.
+#
+# $1: raw line.
+# $2: entry capture state — non-zero if a `$(...)` or backtick from a
+#     PRIOR line is still open at the moment this line is read. Set by
+#     scan_file() via the cross-line capture tracker (r3 fix for codex
+#     PR #954 r2 finding P1). When non-zero, any heredoc-op on this line
+#     is inside a capture wrapper regardless of single-line shape, so we
+#     classify as C1 (cat-in-capture stays C2 because the sub-class is
+#     meaningful for the deadlock profile).
 classify_line() {
   local line="$1"
+  local entry_capture="${2:-0}"
   local trimmed="${line#"${line%%[![:space:]]*}"}"
 
   if [[ "$trimmed" == \#* ]]; then
@@ -287,13 +307,19 @@ classify_line() {
   fi
 
   # Heredoc-op branch.
-  if is_output_file_heredoc "$line"; then
+  # Cross-line check first: a write-to-file heredoc inside a capture isn't
+  # safe (the redirect feeds a tempfile, but the OUTER capture still waits
+  # on stdout); fold that into C1. Single-line is_output_file_heredoc already
+  # disqualifies same-line capture via in_capture_line.
+  if (( entry_capture == 0 )) && is_output_file_heredoc "$line"; then
     printf 'SAFE|write-to-file heredoc (cmd > path <<EOF)\n'
     return
   fi
 
   local in_cap=0
-  if in_capture_line "$line"; then
+  if (( entry_capture > 0 )); then
+    in_cap=1
+  elif in_capture_line "$line"; then
     in_cap=1
   fi
 
@@ -302,10 +328,14 @@ classify_line() {
     return
   fi
   if (( in_cap == 1 )); then
+    local cross_line_note=""
+    if (( entry_capture > 0 )); then
+      cross_line_note=" (cross-line capture)"
+    fi
     if [[ "$line" =~ $RE_INTERP ]]; then
-      printf 'C1|interpreter heredoc in capture (deadlock class)\n'
+      printf 'C1|interpreter heredoc in capture (deadlock class)%s\n' "$cross_line_note"
     else
-      printf 'C1|heredoc in capture\n'
+      printf 'C1|heredoc in capture%s\n' "$cross_line_note"
     fi
     return
   fi
@@ -321,6 +351,180 @@ classify_line() {
   fi
 
   printf 'SAFE|non-interpreter heredoc, no capture\n'
+}
+
+# ---------------------------------------------------------------------------
+# Cross-line capture state tracking.
+#
+# `in_capture_line` only sees a single line, so a heredoc whose surrounding
+# `$(...)` opened on a PRIOR line is mis-classified as C3 instead of C1.
+# That made it possible to bypass the baseline ratchet by wrapping a
+# baselined C3 site in multi-line capture (r3 fix for codex PR #954 r2
+# finding P1). To close that gap, scan_file() walks every line of the file
+# in order, maintaining `capture_depth` (the running count of unclosed
+# `$(`) and `backtick_open` (parity of unescaped backticks). When a heredoc
+# is opened, the body lines are skipped for paren counting until we see the
+# delimiter line; otherwise we'd misread heredoc body content as code.
+#
+# The line stripper is deliberately conservative: it removes single-quoted
+# strings (their contents are literal so `$(` inside them is not a capture)
+# and inline comments. Double-quoted strings are KEPT because `"$(cmd)"` is
+# a real capture wrapper and bash treats it as such. Edge cases like
+# `\$(` (escaped) or `$(...)` split across lines via `\\` continuation are
+# accepted as "best effort"; the false-positive cost of treating them as
+# captures (C1 instead of C3) is strictly safer than the false-negative
+# cost of letting a real capture-wrapped heredoc through as C3.
+# ---------------------------------------------------------------------------
+
+# Strip quoted segments and trailing comments from a line so we can
+# safely count `$(` / `)` / backticks for cross-line capture tracking.
+# Reads / writes the global vars `STRIP_IN_SINGLE` and `STRIP_IN_DOUBLE`
+# so quote state PERSISTS across lines (a `'...'` argument can span many
+# lines, e.g. `bash -c '\n  source ...\n  '`; without cross-line quote
+# state the in-quote body lines would be mis-counted as code and pump
+# capture_depth into the next chunk of file).
+#
+# Tracks BOTH single and double quote modes — important for the common
+# bash escape `'"'"'` (close-quote, double-quote-literal-single, re-open
+# quote). A single-mode-only stripper would mis-toggle on the middle `'`
+# inside the double-quoted segment and emit phantom code, which would
+# corrupt cross-line capture_depth. Inside double-quotes we KEEP `$(`,
+# `)`, and backtick — they are real bash code (`"$(cmd)"` is a valid
+# capture wrapper) — but we strip `'` literals so they don't enter
+# single-mode.
+#
+# Writes its output to the global `STRIP_RESULT` instead of stdout so the
+# caller doesn't have to `$()`-capture it — that would run this function
+# in a subshell and lose the STRIP_IN_* updates the function makes.
+STRIP_IN_SINGLE=0
+STRIP_IN_DOUBLE=0
+STRIP_RESULT=""
+strip_quotes_and_comments() {
+  local s="$1"
+  local out=""
+  local n=${#s}
+  local i=0
+  local ch
+  while (( i < n )); do
+    ch="${s:i:1}"
+    if (( STRIP_IN_SINGLE == 1 )); then
+      if [[ "$ch" == "'" ]]; then
+        STRIP_IN_SINGLE=0
+      fi
+      i=$((i + 1))
+      continue
+    fi
+    if (( STRIP_IN_DOUBLE == 1 )); then
+      # Backslash escapes the next char inside double-quotes too.
+      if [[ "$ch" == "\\" && $((i + 1)) -lt $n ]]; then
+        i=$((i + 2))
+        continue
+      fi
+      if [[ "$ch" == '"' ]]; then
+        STRIP_IN_DOUBLE=0
+        i=$((i + 1))
+        continue
+      fi
+      # Inside double-quote, `$(`, `)`, and `` ` `` are still code.
+      # Pass them through so capture counters see them.
+      out="${out}${ch}"
+      i=$((i + 1))
+      continue
+    fi
+    # Trailing comment: `#` preceded by whitespace or start of line.
+    # Conservative rule: only strip `# ` (space-comment) or comment at
+    # start of line so we don't trip on `${#var}`.
+    if [[ "$ch" == "#" ]]; then
+      if (( i == 0 )); then
+        break
+      fi
+      local prev="${s:i-1:1}"
+      if [[ "$prev" == " " || "$prev" == $'\t' ]]; then
+        break
+      fi
+    fi
+    if [[ "$ch" == "\\" && $((i + 1)) -lt $n ]]; then
+      # Skip escaped char wholesale (e.g. \$, \`, \(, \) ).
+      i=$((i + 2))
+      continue
+    fi
+    if [[ "$ch" == "'" ]]; then
+      STRIP_IN_SINGLE=1
+      i=$((i + 1))
+      continue
+    fi
+    if [[ "$ch" == '"' ]]; then
+      STRIP_IN_DOUBLE=1
+      i=$((i + 1))
+      continue
+    fi
+    out="${out}${ch}"
+    i=$((i + 1))
+  done
+  STRIP_RESULT="$out"
+}
+
+# Count occurrences of a literal substring in $1. Writes the count to
+# the global `COUNT_RESULT`.
+COUNT_RESULT=0
+count_substr() {
+  local hay="$1" needle="$2"
+  local rest="$hay" hits=0
+  while [[ "$rest" == *"$needle"* ]]; do
+    hits=$((hits + 1))
+    rest="${rest#*"$needle"}"
+  done
+  COUNT_RESULT=$hits
+}
+
+# Count unescaped backticks (each toggles backtick capture state). Writes
+# the count to `COUNT_RESULT`.
+count_backticks() {
+  local s="$1"
+  local n=${#s}
+  local i=0 hits=0
+  local ch
+  while (( i < n )); do
+    ch="${s:i:1}"
+    if [[ "$ch" == "\\" && $((i + 1)) -lt $n ]]; then
+      i=$((i + 2))
+      continue
+    fi
+    if [[ "$ch" == '`' ]]; then
+      hits=$((hits + 1))
+    fi
+    i=$((i + 1))
+  done
+  COUNT_RESULT=$hits
+}
+
+# Pull the heredoc delimiter token from a line. Echoes empty if no heredoc
+# operator is present. Recognizes `<<DELIM`, `<<'DELIM'`, `<<"DELIM"`,
+# `<<-DELIM`, and (per r3 P2 #2) optional whitespace after the operator.
+#
+# Bash regex backreferences inside `[[ =~ ]]` are unreliable, so we try
+# the three quote variants explicitly instead of `(["'])(...)\1`. Always
+# returns 0 — callers gate further work on the echoed token being
+# non-empty (matters under `set -e`).
+extract_heredoc_delim() {
+  local line="$1"
+  local re_sq='<<-?[[:space:]]*'"'"'([A-Za-z_][A-Za-z0-9_]*)'"'"
+  local re_dq='<<-?[[:space:]]*"([A-Za-z_][A-Za-z0-9_]*)"'
+  local re_nq='<<-?[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)'
+  if [[ "$line" =~ $re_sq ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$line" =~ $re_dq ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  if [[ "$line" =~ $re_nq ]]; then
+    printf '%s' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  printf ''
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -359,36 +563,139 @@ scan_file() {
 
   local lineno=0
   local raw norm_snippet hash class category reason
+  # Cross-line capture state (r3 P1):
+  #   capture_depth   — number of unclosed `$(` from prior lines.
+  #   backtick_open   — 1 if an odd number of unescaped backticks have been
+  #                     seen so far (we're inside a `…` capture).
+  #   in_heredoc_body — 1 while we're between a heredoc opener and its
+  #                     terminating delimiter line. Paren counting is
+  #                     suspended in heredoc bodies (they're literal text,
+  #                     not code).
+  #   heredoc_delim   — the delimiter token we're waiting to see at the
+  #                     start of a line to close the heredoc body.
+  local capture_depth=0
+  local backtick_open=0
+  local in_heredoc_body=0
+  local heredoc_delim=""
+  local stripped opens closes ticks entry_capture trimmed delim
+  # Quote state lives on STRIP_IN_SINGLE / STRIP_IN_DOUBLE and persists
+  # across strip_quotes_and_comments() calls so multi-line `'...'`
+  # arguments (e.g. `bash -c '\n  source ...\n  '`) don't bleed code into
+  # the in-quote body. Reset at file boundaries.
+  STRIP_IN_SINGLE=0
+  STRIP_IN_DOUBLE=0
   while IFS= read -r raw || [[ -n "$raw" ]]; do
     lineno=$((lineno + 1))
-    if ! line_has_heredoc_like "$raw"; then
+
+    # Heredoc-body handling: skip paren / classification logic until we
+    # see the line that closes the heredoc. The body terminator is the
+    # delimiter token at the start of a line (leading whitespace tolerated
+    # for the tab-strip `<<-` variant; we accept both shapes here because
+    # the audit only needs to know where the body ENDS, not the exact
+    # form of the opener).
+    #
+    # Backtick-wrapped heredoc (`var=\`cmd <<PY ... PY\``) puts the
+    # closing backtick on the SAME line as the heredoc terminator, so we
+    # also accept `<delim>` followed immediately by `` ` ``. (Other shapes
+    # like `<delim>)` aren't legal — `$(...)` requires the `)` on its own
+    # line after the terminator.)
+    if (( in_heredoc_body == 1 )); then
+      trimmed="${raw#"${raw%%[![:space:]]*}"}"
+      local first_tok="${trimmed%%[[:space:]]*}"
+      if [[ "$first_tok" == "$heredoc_delim" ]]; then
+        in_heredoc_body=0
+        heredoc_delim=""
+      elif [[ "$first_tok" == "${heredoc_delim}\`" ]]; then
+        in_heredoc_body=0
+        heredoc_delim=""
+        # Backtick terminator closes the surrounding backtick capture too.
+        if (( backtick_open == 1 )); then
+          backtick_open=0
+        fi
+      fi
       continue
     fi
-    class="$(classify_line "$raw")"
-    category="${class%%|*}"
-    reason="${class#*|}"
-    case "$category" in
-      NONE) continue ;;
-      C1|C2|C3|C4|H3|SAFE) ;;
-      *) continue ;;
-    esac
 
-    norm_snippet="$(normalize_snippet "$raw")"
-    hash="$(printf '%s' "$norm_snippet" | _sha256)"
+    # Comment-only or empty lines: do NOT touch any cross-line state.
+    # Comments can mention `<<'EOF'` or `$(...)` literally; treating them
+    # as code would corrupt capture_depth and falsely enter heredoc body.
+    trimmed="${raw#"${raw%%[![:space:]]*}"}"
+    if [[ -z "$trimmed" || "$trimmed" == \#* ]]; then
+      continue
+    fi
 
-    SUMMARY_COUNTS[$category]=$(( ${SUMMARY_COUNTS[$category]:-0} + 1 ))
+    # Capture-state snapshot taken BEFORE the line's own deltas — that's
+    # what classify_line cares about (was a `$(` from an EARLIER line still
+    # open at the moment this heredoc opener was read?).
+    if (( capture_depth > 0 )) || (( backtick_open == 1 )); then
+      entry_capture=1
+    else
+      entry_capture=0
+    fi
 
-    case "$mode" in
-      tsv)
-        emit_row_tsv "$rel" "$lineno" "$category" "$hash" "$reason" "$norm_snippet"
-        ;;
-      json)
-        emit_row_json "$rel" "$lineno" "$category" "$hash" "$reason" "$norm_snippet"
-        ;;
-      summary)
-        : # counting only
-        ;;
-    esac
+    if line_has_heredoc_like "$raw"; then
+      class="$(classify_line "$raw" "$entry_capture")"
+      category="${class%%|*}"
+      reason="${class#*|}"
+      case "$category" in
+        NONE) ;;
+        C1|C2|C3|C4|H3|SAFE)
+          norm_snippet="$(normalize_snippet "$raw")"
+          hash="$(printf '%s' "$norm_snippet" | _sha256)"
+
+          SUMMARY_COUNTS[$category]=$(( ${SUMMARY_COUNTS[$category]:-0} + 1 ))
+
+          case "$mode" in
+            tsv)
+              emit_row_tsv "$rel" "$lineno" "$category" "$hash" "$reason" "$norm_snippet"
+              ;;
+            json)
+              emit_row_json "$rel" "$lineno" "$category" "$hash" "$reason" "$norm_snippet"
+              ;;
+            summary)
+              : # counting only
+              ;;
+          esac
+          ;;
+        *) ;;
+      esac
+    fi
+
+    # Update cross-line state from this line's own deltas. The stripped
+    # form removes quoted strings and trailing comments so a `$(` inside
+    # `'...'` / `"..."` or after `# ` doesn't bump capture_depth. We use
+    # globals (STRIP_RESULT, COUNT_RESULT) instead of $()-capture so the
+    # in_single / in_double updates survive — $() spawns a subshell that
+    # discards the var writes.
+    strip_quotes_and_comments "$raw"
+    stripped="$STRIP_RESULT"
+    count_substr "$stripped" '$('
+    opens="$COUNT_RESULT"
+    count_substr "$stripped" ')'
+    closes="$COUNT_RESULT"
+    count_backticks "$stripped"
+    ticks="$COUNT_RESULT"
+    capture_depth=$(( capture_depth + opens - closes ))
+    if (( capture_depth < 0 )); then
+      # A closer with no opener (e.g. `)` ending a function body or
+      # case branch). Clamp to 0 so a stray paren doesn't permanently
+      # disable cross-line tracking.
+      capture_depth=0
+    fi
+    if (( ticks > 0 )); then
+      backtick_open=$(( (backtick_open + ticks) % 2 ))
+    fi
+
+    # Enter heredoc-body mode if this line opened a heredoc. We probe the
+    # ORIGINAL raw line for the operator+delimiter (the stripped form may
+    # have lost the delim if it was single-quoted, e.g. `<<'PY'`).
+    if [[ "$raw" =~ $RE_HEREDOC_OP ]]; then
+      delim="$(extract_heredoc_delim "$raw")"
+      if [[ -n "$delim" ]]; then
+        in_heredoc_body=1
+        heredoc_delim="$delim"
+      fi
+    fi
   done < "$abs"
 }
 

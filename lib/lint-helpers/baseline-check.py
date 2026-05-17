@@ -60,10 +60,29 @@ def main(argv: list[str]) -> int:
     # already has that hash. Per-(path, hash) lookup means a new occurrence
     # at a new path/line MUST appear as a new baseline row before merge
     # (r2 fix for codex PR #954 r1 finding P1 #1).
-    baseline_cat_by_path_hash: dict[tuple[str, str], str] = {}
+    #
+    # We track OCCURRENCE COUNTS per (path, hash, category) tuple, not
+    # just presence. If a file already has one baselined `python3 - <<'PY'`
+    # site and a developer copy-pastes a SECOND identical opener into the
+    # same file, the second site is a new heredoc-stdin subprocess that
+    # needs review — the (path, hash) existence test alone would treat the
+    # copy as already accepted (r3 fix for codex PR #954 r2 finding P2 #1).
+    # Keying by (path, hash, category) also means the SAME hash appearing
+    # with two different categories at different lines (one wrapped in a
+    # cross-line capture, one not) is correctly recognized as TWO distinct
+    # baselined sites and avoids a false "promoted" report.
+    baseline_count_by_pkc: dict[tuple[str, str, str], int] = defaultdict(int)
+    baseline_cats_by_ph: dict[tuple[str, str], set[str]] = defaultdict(set)
     for row in baseline_rows:
         # path, line, category, snippet_hash[, reason, owner, expires_or_phase]
-        baseline_cat_by_path_hash[(row[0], row[3])] = row[2]
+        pkc = (row[0], row[3], row[2])
+        baseline_count_by_pkc[pkc] += 1
+        baseline_cats_by_ph[(row[0], row[3])].add(row[2])
+
+    current_count_by_pkc: dict[tuple[str, str, str], int] = defaultdict(int)
+    current_rows_by_pkc: dict[
+        tuple[str, str, str], list[tuple[str, str, str, str, str, str]]
+    ] = defaultdict(list)
 
     new_sites: list[tuple[str, str, str, str, str, str]] = []
     promoted: list[tuple[str, str, str, str, str, str]] = []
@@ -76,13 +95,45 @@ def main(argv: list[str]) -> int:
         counts[cat] += 1
         if cat == "SAFE":
             continue
-        key = (path, snippet_hash)
-        if key not in baseline_cat_by_path_hash:
-            new_sites.append((path, line, cat, snippet_hash, reason, snippet))
-        else:
-            old_cat = baseline_cat_by_path_hash[key]
-            if old_cat != cat:
-                promoted.append((path, line, cat, old_cat, snippet_hash, snippet))
+        pkc = (path, snippet_hash, cat)
+        ph = (path, snippet_hash)
+        current_count_by_pkc[pkc] += 1
+        current_rows_by_pkc[pkc].append(
+            (path, line, cat, snippet_hash, reason, snippet)
+        )
+        if pkc not in baseline_count_by_pkc:
+            if ph in baseline_cats_by_ph:
+                # Hash is known at this path, but with a DIFFERENT category
+                # — the surrounding context (capture wrapper) changed and
+                # the site needs re-review. We report all old categories so
+                # the reviewer can see what changed.
+                old_cats = ",".join(sorted(baseline_cats_by_ph[ph]))
+                promoted.append(
+                    (path, line, cat, old_cats, snippet_hash, snippet)
+                )
+            else:
+                # Brand new (path, hash) pair — every occurrence is a new
+                # site.
+                new_sites.append((path, line, cat, snippet_hash, reason, snippet))
+
+    # Detect copy-paste overflow: a (path, hash, category) tuple already
+    # present in the baseline but with MORE occurrences in the current
+    # scan than baseline accounts for. Each surplus occurrence is itself
+    # a new site that must be reviewed before it can ratchet in.
+    for pkc, current_count in current_count_by_pkc.items():
+        baseline_count = baseline_count_by_pkc.get(pkc, 0)
+        if baseline_count == 0:
+            # Already accounted for above (either new or promoted).
+            continue
+        if current_count <= baseline_count:
+            continue
+        surplus = current_count - baseline_count
+        # Report the LAST `surplus` occurrences as overflow (the earliest
+        # ones plausibly correspond to the original baselined rows; the
+        # tail is the copy-paste). Line numbers in current rows are sorted
+        # by scan order, so the tail is the right thing to flag.
+        for entry in current_rows_by_pkc[pkc][-surplus:]:
+            new_sites.append(entry)
 
     fail = False
     if new_sites:

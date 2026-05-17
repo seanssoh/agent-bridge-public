@@ -155,6 +155,18 @@ expect_at 73  H3   "H3 here-string into interpreter"
 # H3 — process substitution.
 expect_at 76  H3   "H3 process substitution"
 
+# C3 — heredoc operator with whitespace before delimiter (`<<  'PY'`).
+# r3 P2 #2: bash accepts whitespace; the audit must match it.
+expect_at 81  C3   "C3 whitespace before delimiter"
+
+# C1 — cross-line capture (`\$(` opens, continuation lines, heredoc inside).
+# r3 P1: classifier must carry capture state across lines so the heredoc
+# on a continuation line is recognized as in-capture.
+expect_at 92  C1   "C1 cross-line \$() capture"
+
+# C1 — cross-line backtick wrapper variant.
+expect_at 99  C1   "C1 cross-line backtick capture"
+
 # ---------------------------------------------------------------------------
 # Snippet-hash stability under reformatting. Reformatted_pair() generates
 # two snippets that should be semantically equal (only whitespace differs)
@@ -192,5 +204,50 @@ summary_out="$("$fixture_dir/scripts/audit-footgun-11.sh" --summary)"
 for cat in C1 C2 C3 C4 H3 SAFE TOTAL; do
   smoke_assert_contains "$summary_out" "$cat" "summary contains $cat row"
 done
+
+# ---------------------------------------------------------------------------
+# baseline-check.py occurrence-count ratchet (r3 P2 #1).
+#
+# If a file has ONE baselined `python3 - <<'PY'` site and someone copies
+# the same opener to add a SECOND identical line, the (path, hash) presence
+# check alone would treat the copy as already accepted. The fix tracks
+# OCCURRENCE COUNTS per (path, hash, category) and reports overflow as a
+# new site that needs review.
+#
+# Test fixtures are written via printf — NOT heredoc — to keep this smoke
+# immune to Bash 5.3.9 footgun #11 (the very class the lint guards).
+# ---------------------------------------------------------------------------
+
+baseline_helper="$REPO_ROOT/lib/lint-helpers/baseline-check.py"
+overflow_tsv_baseline="$SMOKE_TMP_ROOT/overflow-baseline.tsv"
+overflow_tsv_current_ok="$SMOKE_TMP_ROOT/overflow-current-ok.tsv"
+overflow_tsv_current_dup="$SMOKE_TMP_ROOT/overflow-current-dup.tsv"
+
+printf 'path\tline\tcategory\tsnippet_hash\treason\towner\texpires_or_phase\n' \
+  >"$overflow_tsv_baseline"
+printf 'fake.sh\t10\tC3\tabc123\tsmoke\ttest\ttest\n' \
+  >>"$overflow_tsv_baseline"
+
+printf 'path\tline\tcategory\tsnippet_hash\treason\tsnippet\n' \
+  >"$overflow_tsv_current_ok"
+printf "fake.sh\t10\tC3\tabc123\tsmoke\tpython3 - <<'PY'\n" \
+  >>"$overflow_tsv_current_ok"
+
+printf 'path\tline\tcategory\tsnippet_hash\treason\tsnippet\n' \
+  >"$overflow_tsv_current_dup"
+printf "fake.sh\t10\tC3\tabc123\tsmoke\tpython3 - <<'PY'\n" \
+  >>"$overflow_tsv_current_dup"
+printf "fake.sh\t20\tC3\tabc123\tsmoke\tpython3 - <<'PY'\n" \
+  >>"$overflow_tsv_current_dup"
+
+set +e
+python3 "$baseline_helper" "$overflow_tsv_current_ok" "$overflow_tsv_baseline" >/dev/null 2>&1
+overflow_ok_rc=$?
+python3 "$baseline_helper" "$overflow_tsv_current_dup" "$overflow_tsv_baseline" >/dev/null 2>&1
+overflow_dup_rc=$?
+set -e
+
+smoke_assert_eq 0 "$overflow_ok_rc" "baseline-check: 1 baseline + 1 current = PASS"
+smoke_assert_eq 1 "$overflow_dup_rc" "baseline-check: 1 baseline + 2 copies = FAIL (copy-paste overflow caught)"
 
 smoke_log "ALL TESTS PASSED"

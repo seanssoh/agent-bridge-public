@@ -74,3 +74,28 @@ result="$(python3 -c 'import sys;print(sys.stdin.read())' <<<"$payload")"
 
 # H3: stdin redirected from process substitution (`< <(...)`).
 while IFS= read -r line; do :; done < <(echo a)
+
+# C3: heredoc operator with whitespace before delimiter (Bash-legal).
+# r3 fixture for codex PR #954 r2 finding P2 #2 — the original regex
+# required `<<DELIM` with no gap and silently dropped `<<  'PY'`.
+python3 - "$payload" <<  'PY'
+print("space-before-delim")
+PY
+
+# C1: cross-line capture — `$(` opens on line 85, heredoc opens on line 87
+# inside the still-open capture. Before r3 the classifier only looked at
+# the single line of the heredoc and tagged this as C3, letting a copy of
+# a baselined C3 site wrapped in multi-line capture slip past
+# --baseline-check (codex PR #954 r2 finding P1).
+out=$(
+  bridge_require_python
+  python3 - "$payload" <<'PY'
+print("cross-line capture")
+PY
+)
+
+# C1: cross-line capture with backtick wrapper variant.
+out=`
+  python3 - "$payload" <<'PY'
+print("cross-line backtick")
+PY`
