@@ -40,6 +40,14 @@ if [[ -z "${BRIDGE_HOME:-}" ]]; then
   # behavior of v0.14.1 fresh installs. Only applied for the auto-
   # isolated path — when the caller exports BRIDGE_HOME (CI runner,
   # custom rig) they remain responsible for layout state.
+  # r4 (codex PR #947 r3) — unset derived v2 roots that bridge-isolation-v2.sh
+  # preserves via the ${VAR:-default} idiom. Without unsetting, an operator
+  # shell that already exported these (e.g. an Agent Bridge-managed admin
+  # session running smoke against this checkout) would let later helpers
+  # write runtime/shared/state under the LIVE install despite the auto-
+  # isolated BRIDGE_HOME. Unsetting forces bridge-isolation-v2.sh to
+  # recompute from the freshly set BRIDGE_DATA_ROOT.
+  unset BRIDGE_AGENT_ROOT_V2 BRIDGE_SHARED_ROOT BRIDGE_CONTROLLER_STATE_ROOT
   export BRIDGE_LAYOUT="v2"
   export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
 fi
@@ -1156,6 +1164,8 @@ export BRIDGE_SHARED_DIR="$BRIDGE_HOME/shared"
 # line 44. Only refresh under the auto-isolation contract — operator-
 # supplied BRIDGE_HOME keeps full control of layout state.
 if [[ "${_SMOKE_AUTO_ISOLATED:-0}" == "1" ]]; then
+  # r4 (PR #947 r3) — same derived-root reset as the auto-isolation block.
+  unset BRIDGE_AGENT_ROOT_V2 BRIDGE_SHARED_ROOT BRIDGE_CONTROLLER_STATE_ROOT
   export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
 fi
 agent="spool-test"
@@ -1346,6 +1356,8 @@ export BRIDGE_HOME="$TMP_ROOT/bridge-home"
 # that operator-supplied BRIDGE_HOME (CI runner / custom rig) keeps full
 # control of layout state.
 if [[ "${_SMOKE_AUTO_ISOLATED:-0}" == "1" ]]; then
+  # r4 (PR #947 r3) — same derived-root reset as the auto-isolation block.
+  unset BRIDGE_AGENT_ROOT_V2 BRIDGE_SHARED_ROOT BRIDGE_CONTROLLER_STATE_ROOT
   export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
 fi
 export BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1
