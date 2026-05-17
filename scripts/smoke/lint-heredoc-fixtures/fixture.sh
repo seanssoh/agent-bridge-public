@@ -99,3 +99,22 @@ out=`
   python3 - "$payload" <<'PY'
 print("cross-line backtick")
 PY`
+
+# r4 P1 fixture: case-arm `pattern)` between an `$(` opener and a heredoc.
+# The leading case-arm `)` has no matching `(`. Before r4 the depth counter
+# decremented on the case-arm `)` and the clamp-to-0 guard dragged a real
+# prior `$(...)` capture down to 0, so the heredoc below mis-classified as
+# C3 (codex PR #954 r3 P1 BLOCKING — bypassed the CI ratchet). After r4
+# maybe_strip_case_arm drops the leading `pattern)` BEFORE paren counting,
+# keeping the close count balanced and preserving real cross-line capture
+# state across case branches.
+case "$mode" in
+  active)
+    out=$(
+      python3 - "$payload" <<'PY'
+print("after case arm")
+PY
+    )
+    ;;
+esac
+

@@ -125,15 +125,32 @@ def main(argv: list[str]) -> int:
         if baseline_count == 0:
             # Already accounted for above (either new or promoted).
             continue
-        if current_count <= baseline_count:
+        if current_count == baseline_count:
             continue
-        surplus = current_count - baseline_count
-        # Report the LAST `surplus` occurrences as overflow (the earliest
-        # ones plausibly correspond to the original baselined rows; the
-        # tail is the copy-paste). Line numbers in current rows are sorted
-        # by scan order, so the tail is the right thing to flag.
-        for entry in current_rows_by_pkc[pkc][-surplus:]:
-            new_sites.append(entry)
+        if current_count > baseline_count:
+            surplus = current_count - baseline_count
+            # Report the LAST `surplus` occurrences as overflow (the earliest
+            # ones plausibly correspond to the original baselined rows; the
+            # tail is the copy-paste). Line numbers in current rows are sorted
+            # by scan order, so the tail is the right thing to flag.
+            for entry in current_rows_by_pkc[pkc][-surplus:]:
+                new_sites.append(entry)
+
+    # Detect deletion drift: baseline accounts for MORE occurrences of a
+    # (path, hash, category) tuple than the current scan contains. This is
+    # progress (a site was extracted or removed) but leaves stale baseline
+    # capacity that could mask a newly added copy of the same opener in a
+    # later PR — the surplus would be silently absorbed by the unused
+    # baseline rows. Force the contributor to run --baseline-update so the
+    # TSV always matches reality (r4 fix for codex PR #954 r3 finding P2 #2).
+    stale_baseline: list[tuple[str, str, str, int, int]] = []
+    for pkc, baseline_count in baseline_count_by_pkc.items():
+        current_count = current_count_by_pkc.get(pkc, 0)
+        if current_count < baseline_count:
+            path, snippet_hash, cat = pkc
+            stale_baseline.append(
+                (path, snippet_hash, cat, baseline_count, current_count)
+            )
 
     fail = False
     if new_sites:
@@ -194,6 +211,34 @@ def main(argv: list[str]) -> int:
                 f"[lint-heredoc-ban]        hash:    {snippet_hash}",
                 file=sys.stderr,
             )
+
+    if stale_baseline:
+        fail = True
+        print(
+            "[lint-heredoc-ban] FAIL: baseline accounts for sites that no "
+            "longer exist (run --baseline-update to tighten):",
+            file=sys.stderr,
+        )
+        for path, snippet_hash, cat, baseline_count, current_count in stale_baseline:
+            print(
+                f"[lint-heredoc-ban]   {cat:4s} {path}  hash={snippet_hash[:12]}  "
+                f"baseline={baseline_count} current={current_count} "
+                f"(stale capacity={baseline_count - current_count})",
+                file=sys.stderr,
+            )
+        print(
+            "[lint-heredoc-ban] Stale capacity masks newly added copies "
+            "of the same opener — silent deletion is prohibited. Run:",
+            file=sys.stderr,
+        )
+        print(
+            "[lint-heredoc-ban]   scripts/lint-heredoc-ban.sh --baseline-update",
+            file=sys.stderr,
+        )
+        print(
+            "[lint-heredoc-ban] then commit the resulting baseline diff.",
+            file=sys.stderr,
+        )
 
     if not fail:
         print(

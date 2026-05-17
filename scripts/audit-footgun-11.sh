@@ -498,6 +498,48 @@ count_backticks() {
   COUNT_RESULT=$hits
 }
 
+# Detect case-arm `pattern)` at line start and strip it before paren
+# counting. Bash case-arm patterns start at logical line beginning and
+# end with `)` that has no matching `(`. Without stripping, the unmatched
+# `)` would decrement capture_depth — clamped to 0 but a real prior `$(`
+# capture could be dragged down (codex PR #954 r3 P1 BLOCKING). We
+# tolerate the common pattern shapes: alphanumeric, `*`, `?`, `[...]`,
+# `+`, `|`, `.`, with an optional alternation pipe. Patterns starting
+# with `-` are deliberately NOT matched because that shape is far more
+# often a continuation argument like `--json)` (multi-line `$(cmd
+# --flag)"` close) than a case arm, and stripping the trailing `)` of
+# a `--flag)` argument would leave the outer `$()` close count
+# unbalanced. Anything more exotic (e.g. patterns containing `(` or
+# embedded `$()`) is rare and the counter degrades gracefully.
+maybe_strip_case_arm() {
+  local s="$1"
+  local trimmed leading
+  trimmed="${s#"${s%%[![:space:]]*}"}"
+  if [[ -z "$trimmed" ]]; then
+    printf '%s' "$s"
+    return 0
+  fi
+  # Match: optional pattern alternation pipe(s), pattern chars, terminating
+  # `)` followed by whitespace or end-of-line. Per `man bash` case-arm
+  # pattern chars include `*`, `?`, `[...]`, `|`, and identifier chars.
+  #
+  # We disallow a LEADING `-` because that pattern shape is far more often
+  # a continuation argument like `--json)` (command-line flag closer in a
+  # multi-line `$(cmd --flag)"` expression) than a case-arm pattern.
+  # Case-arm patterns don't conventionally start with `-` — bash supports
+  # it syntactically but the convention is identifiers, globs, or literals.
+  # Treating `--json)` as a case-arm would strip the `)` we need to keep
+  # so the outer `$(...)` close count stays balanced.
+  if [[ "$trimmed" =~ ^[A-Za-z0-9_*?\.+]([A-Za-z0-9_*?\.\|+\-]|\[[^\]]*\])*\)([[:space:]]|$) ]]; then
+    leading="${BASH_REMATCH[0]}"
+    # Strip everything up to and including the matched `pattern)`.
+    s="${s/${leading}/}"
+    printf '%s' "$s"
+    return 0
+  fi
+  printf '%s' "$s"
+}
+
 # Pull the heredoc delimiter token from a line. Echoes empty if no heredoc
 # operator is present. Recognizes `<<DELIM`, `<<'DELIM'`, `<<"DELIM"`,
 # `<<-DELIM`, and (per r3 P2 #2) optional whitespace after the operator.
@@ -563,8 +605,13 @@ scan_file() {
 
   local lineno=0
   local raw norm_snippet hash class category reason
-  # Cross-line capture state (r3 P1):
-  #   capture_depth   — number of unclosed `$(` from prior lines.
+  # Cross-line capture state:
+  #   capture_depth   — count of unclosed `$(` from prior lines. Decremented
+  #                     by `)` and clamped to 0 on underflow. r4 adds a
+  #                     case-arm stripper (maybe_strip_case_arm) BEFORE the
+  #                     decrement so the leading `)` of `pattern)` doesn't
+  #                     drag a real prior capture down to 0 (PR #954 r3 P1
+  #                     BLOCKING fix).
   #   backtick_open   — 1 if an odd number of unescaped backticks have been
   #                     seen so far (we're inside a `…` capture).
   #   in_heredoc_body — 1 while we're between a heredoc opener and its
@@ -669,6 +716,17 @@ scan_file() {
     # discards the var writes.
     strip_quotes_and_comments "$raw"
     stripped="$STRIP_RESULT"
+    # Case-arm `pattern)` at line start has no matching `(`. Without
+    # stripping, its trailing `)` decrements capture_depth even though
+    # there was no matching `$(` open — the clamp-to-0 guard catches the
+    # underflow case but a real `$(`-opened capture from a prior line is
+    # silently dragged down to 0, dropping entry_capture and making a
+    # heredoc inside the real capture mis-classify as C3 (codex PR #954
+    # r3 finding P1 BLOCKING — bypassed the CI ratchet). Stripping the
+    # leading `pattern)` shape BEFORE paren counting keeps the close
+    # count balanced and leaves the real capture state intact across
+    # case arms.
+    stripped="$(maybe_strip_case_arm "$stripped")"
     count_substr "$stripped" '$('
     opens="$COUNT_RESULT"
     count_substr "$stripped" ')'
@@ -678,8 +736,8 @@ scan_file() {
     capture_depth=$(( capture_depth + opens - closes ))
     if (( capture_depth < 0 )); then
       # A closer with no opener (e.g. `)` ending a function body or
-      # case branch). Clamp to 0 so a stray paren doesn't permanently
-      # disable cross-line tracking.
+      # subshell-group `(...)`). Clamp to 0 so a stray paren doesn't
+      # permanently disable cross-line tracking.
       capture_depth=0
     fi
     if (( ticks > 0 )); then

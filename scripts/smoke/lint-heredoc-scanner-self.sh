@@ -167,6 +167,15 @@ expect_at 92  C1   "C1 cross-line \$() capture"
 # C1 — cross-line backtick wrapper variant.
 expect_at 99  C1   "C1 cross-line backtick capture"
 
+# r4 P1 — case-arm `pattern)` preceding `$()` capture wrapping a heredoc.
+# Without case-arm stripping, the leading `)` (no matching `(`) would
+# decrement the prior `$()` capture_depth via the simple counter, which
+# clamps to 0 and silently drops entry_capture — the heredoc inside the
+# real capture then mis-classifies as C3, bypassing the CI ratchet. The
+# case-arm stripper drops the leading `pattern)` before paren counting
+# so the close count stays balanced and entry_capture survives.
+expect_at 114 C1   "C1 case-arm then \$() capture (r4 P1)"
+
 # ---------------------------------------------------------------------------
 # Snippet-hash stability under reformatting. Reformatted_pair() generates
 # two snippets that should be semantically equal (only whitespace differs)
@@ -249,5 +258,37 @@ set -e
 
 smoke_assert_eq 0 "$overflow_ok_rc" "baseline-check: 1 baseline + 1 current = PASS"
 smoke_assert_eq 1 "$overflow_dup_rc" "baseline-check: 1 baseline + 2 copies = FAIL (copy-paste overflow caught)"
+
+# ---------------------------------------------------------------------------
+# r4 P2 #2: deletion drift detection. If baseline accounts for MORE
+# occurrences than current scan finds, the stale capacity could silently
+# absorb a newly added copy of the same opener in a later PR. Force the
+# contributor to run --baseline-update so the TSV always matches reality.
+# ---------------------------------------------------------------------------
+
+deletion_tsv_baseline="$SMOKE_TMP_ROOT/deletion-baseline.tsv"
+deletion_tsv_current="$SMOKE_TMP_ROOT/deletion-current.tsv"
+
+# Baseline records 2 occurrences of (fake.sh, hash=abc123, C3).
+printf 'path\tline\tcategory\tsnippet_hash\treason\towner\texpires_or_phase\n' \
+  >"$deletion_tsv_baseline"
+printf 'fake.sh\t10\tC3\tabc123\tsmoke\ttest\ttest\n' \
+  >>"$deletion_tsv_baseline"
+printf 'fake.sh\t20\tC3\tabc123\tsmoke\ttest\ttest\n' \
+  >>"$deletion_tsv_baseline"
+
+# Current scan only finds 1 occurrence — site was deleted but baseline
+# still has capacity for 2.
+printf 'path\tline\tcategory\tsnippet_hash\treason\tsnippet\n' \
+  >"$deletion_tsv_current"
+printf "fake.sh\t10\tC3\tabc123\tsmoke\tpython3 - <<'PY'\n" \
+  >>"$deletion_tsv_current"
+
+set +e
+python3 "$baseline_helper" "$deletion_tsv_current" "$deletion_tsv_baseline" >/dev/null 2>&1
+deletion_rc=$?
+set -e
+
+smoke_assert_eq 1 "$deletion_rc" "baseline-check: 2 baseline + 1 current = FAIL (stale capacity caught — r4 P2 #2)"
 
 smoke_log "ALL TESTS PASSED"
