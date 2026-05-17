@@ -25,7 +25,37 @@ if [[ -z "${BRIDGE_HOME:-}" ]]; then
   BRIDGE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/agb-smoke-isolated.XXXXXX")/.agent-bridge"
   export BRIDGE_HOME
   _SMOKE_AUTO_ISOLATED=1
+  # r5 (codex PR #947 r4) — export so child bash -s blocks see it.
+  # Without export, the conditional refresh blocks at line ~1148 and ~1330
+  # in child shells see _SMOKE_AUTO_ISOLATED as empty and never re-derive
+  # BRIDGE_DATA_ROOT, so pending-attention state ends up under the initial
+  # auto-isolated home outside $scratch / $TMP_ROOT.
+  export _SMOKE_AUTO_ISOLATED
   printf '[smoke] BRIDGE_HOME auto-isolated to %s (was unset)\n' "$BRIDGE_HOME"
+  # #946: when the smoke matrix runs against an auto-isolated fresh
+  # temp BRIDGE_HOME, every child shell that sources bridge-lib.sh
+  # would otherwise be classified as `fresh-install-candidate` and
+  # die at the v0.8.0 isolation hard-cut (the fresh-install bypass
+  # handshake requires the owner to be bridge-init.sh / bridge-
+  # bootstrap.sh / agent-bridge — smoke is none of those). Export
+  # an explicit v2 layout override so resolver step 1 (env) wins
+  # and the matrix can actually run. macOS platform discriminator
+  # skips the v2 isolation enforcement (no `ab-shared` group), so
+  # the override is safe; on Linux without v2 primitives the same
+  # discriminator silently skips enforcement, matching the auto
+  # behavior of v0.14.1 fresh installs. Only applied for the auto-
+  # isolated path — when the caller exports BRIDGE_HOME (CI runner,
+  # custom rig) they remain responsible for layout state.
+  # r4 (codex PR #947 r3) — unset derived v2 roots that bridge-isolation-v2.sh
+  # preserves via the ${VAR:-default} idiom. Without unsetting, an operator
+  # shell that already exported these (e.g. an Agent Bridge-managed admin
+  # session running smoke against this checkout) would let later helpers
+  # write runtime/shared/state under the LIVE install despite the auto-
+  # isolated BRIDGE_HOME. Unsetting forces bridge-isolation-v2.sh to
+  # recompute from the freshly set BRIDGE_DATA_ROOT.
+  unset BRIDGE_AGENT_ROOT_V2 BRIDGE_SHARED_ROOT BRIDGE_CONTROLLER_STATE_ROOT
+  export BRIDGE_LAYOUT="v2"
+  export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
 fi
 if [[ -n "${BRIDGE_HOME:-}" ]]; then
   _smoke_allowed_tmp_prefix=""
@@ -282,11 +312,23 @@ EOF
 # operator-shell defaults would silently steer bridge-run.sh at the live
 # roster and the test would be a no-op (or worse, an env-pollution false
 # pass against unrelated agents).
+#
+# Explicit BRIDGE_LAYOUT=v2 + BRIDGE_DATA_ROOT take resolver step 1 (env
+# override) so the dummy agent-roster.local.sh written above does not trip
+# bridge_layout_resolver_has_existing_evidence — that would classify the
+# fresh temp dir as `markerless(existing-install)` and silently kill the
+# entire smoke matrix here via the v0.8.0 isolation hard-cut (#946). The
+# evidence-based fail-fast still protects real installs; this is the
+# correct shape for an isolated dry-run probe whose only on-disk artifact
+# is the roster definition the test itself wrote.
 LAUNCH_DRYRUN_OUTPUT="$(env -u BRIDGE_ROSTER_FILE -u BRIDGE_ROSTER_LOCAL_FILE \
   -u BRIDGE_STATE_DIR -u BRIDGE_ACTIVE_AGENT_DIR -u BRIDGE_LOG_DIR \
   -u BRIDGE_SHARED_DIR -u BRIDGE_TASK_DB \
   BRIDGE_HOME="$LAUNCH_DRYRUN_HOME" \
-  "$BASH4_BIN" "$REPO_ROOT/bridge-run.sh" "dryrun-redact-smoke" --dry-run 2>&1)"
+  BRIDGE_LAYOUT="v2" \
+  BRIDGE_DATA_ROOT="$LAUNCH_DRYRUN_HOME/data" \
+  "$BASH4_BIN" "$REPO_ROOT/bridge-run.sh" "dryrun-redact-smoke" --dry-run 2>&1)" \
+  || die "bridge-run.sh --dry-run probe failed (rc=$?); output: $LAUNCH_DRYRUN_OUTPUT"
 assert_contains "$LAUNCH_DRYRUN_OUTPUT" "launch=MS365_CLIENT_SECRET=***redacted***"
 assert_contains "$LAUNCH_DRYRUN_OUTPUT" "MY_API_TOKEN=***redacted***"
 # Non-secret BRIDGE_LAYOUT_MARKER_KEY must round-trip with its real value
@@ -1122,6 +1164,16 @@ export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
 export BRIDGE_ACTIVE_AGENT_DIR="$BRIDGE_STATE_DIR/agents"
 export BRIDGE_LOG_DIR="$BRIDGE_HOME/logs"
 export BRIDGE_SHARED_DIR="$BRIDGE_HOME/shared"
+# #946 r3 — match BRIDGE_DATA_ROOT to the new scratch home so v2-derived
+# paths (BRIDGE_AGENT_ROOT_V2 etc.) inside any bridge-lib.sh source that
+# follows write under $scratch instead of the auto-isolated home from
+# line 44. Only refresh under the auto-isolation contract — operator-
+# supplied BRIDGE_HOME keeps full control of layout state.
+if [[ "${_SMOKE_AUTO_ISOLATED:-0}" == "1" ]]; then
+  # r4 (PR #947 r3) — same derived-root reset as the auto-isolation block.
+  unset BRIDGE_AGENT_ROOT_V2 BRIDGE_SHARED_ROOT BRIDGE_CONTROLLER_STATE_ROOT
+  export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
+fi
 agent="spool-test"
 
 # Round-trip escape/unescape over the four escape classes.
@@ -1301,6 +1353,19 @@ SPOOL_UT
 
 TMP_ROOT="$(cd "$(mktemp -d)" && pwd -P)"
 export BRIDGE_HOME="$TMP_ROOT/bridge-home"
+# #946 r2 — refresh BRIDGE_DATA_ROOT when BRIDGE_HOME is reassigned mid-script.
+# Without this re-export, the auto-isolation block's BRIDGE_DATA_ROOT (line 44)
+# still pointed at the obsolete `agb-smoke-isolated.../data` tree, so v2 paths
+# such as BRIDGE_AGENT_ROOT_V2 derived under bridge-lib.sh would escape
+# $TMP_ROOT and cleanup would miss the state files. Only refresh when the
+# auto-isolation path armed v2 in the first place — preserves the contract
+# that operator-supplied BRIDGE_HOME (CI runner / custom rig) keeps full
+# control of layout state.
+if [[ "${_SMOKE_AUTO_ISOLATED:-0}" == "1" ]]; then
+  # r4 (PR #947 r3) — same derived-root reset as the auto-isolation block.
+  unset BRIDGE_AGENT_ROOT_V2 BRIDGE_SHARED_ROOT BRIDGE_CONTROLLER_STATE_ROOT
+  export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
+fi
 export BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1
 # Issue #403 fix #4: pin the isolated-user home root under TMP_ROOT so any
 # inner test path that builds `<root>/<os_user>/.agent-bridge` cannot
