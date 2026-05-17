@@ -114,6 +114,7 @@ run_driver() {
     BRIDGE_LAYOUT="$BRIDGE_LAYOUT" \
     BRIDGE_DATA_ROOT="$BRIDGE_DATA_ROOT" \
     TEST_PGREP_BROKEN_PATH="${TEST_PGREP_BROKEN_PATH:-}" \
+    TEST_BROKEN_PROCTABLE_PATH="${TEST_BROKEN_PROCTABLE_PATH:-}" \
     bash "$DRIVER" "$@"
 }
 
@@ -133,6 +134,35 @@ echo "pgrep: Cannot get process list" >&2
 exit 3
 STUB
   chmod +x "$dir/pgrep"
+  printf '%s' "$dir"
+}
+
+# PR #952 r4 P1: build a directory with stubs for BOTH pgrep AND ps that
+# fail with "Operation not permitted" — this models the macOS sandbox /
+# restricted-container environment codex r3 caught. Under r3 both stubs
+# return empty / non-zero and descendant enumeration produces the empty
+# list; the wrapper subshell got reaped but the python3 grandchild
+# outlived the timeout. r4's pgrp-kill primary mechanism must still
+# reap the grandchild despite both stubs failing.
+make_broken_proctable_dir() {
+  local dir
+  dir="$(mktemp -d -t agb-broken-proctable-XXXXXX)"
+  cat >"$dir/pgrep" <<'STUB'
+#!/usr/bin/env bash
+# Stub: real macOS sandbox failure surface.
+echo "pgrep: Operation not permitted" >&2
+exit 3
+STUB
+  cat >"$dir/ps" <<'STUB'
+#!/usr/bin/env bash
+# Stub: real macOS sandbox failure surface. POSIX ps exits non-zero on
+# permission denial; some environments emit nothing on stdout, others
+# emit a partial header. We model both by emitting nothing and returning
+# 1, which is what restricted SIP environments do.
+echo "ps: Operation not permitted" >&2
+exit 1
+STUB
+  chmod +x "$dir/pgrep" "$dir/ps"
   printf '%s' "$dir"
 }
 
@@ -431,6 +461,69 @@ step_r3_pgrep_failure_reaps_grandchild() {
   rm -f -- "$sentinel"
 }
 
+# --- PR #952 r4 P1: process-group kill works under denied pgrep+ps ---------
+
+step_r4_pgrp_kill_under_denied_proctable() {
+  # PR #952 r4 P1 regression: codex r3 caught that in macOS sandbox /
+  # restricted-container environments BOTH pgrep AND `ps -A` return
+  # "Operation not permitted". r3's ps fallback was just as denied as
+  # the pgrep primary, so _bridge_enumerate_children silently returned
+  # the empty list and the kill walk only reaped the immediate wrapper
+  # subshell — the python3 grandchild outlived the timeout exactly as
+  # it did pre-r2.
+  #
+  # r4 makes the timeout reap independent of process-table access by
+  # putting the wrapper subshell in its own process group via `set -m`.
+  # On timeout, the helper sends the signal to the negative pid; the
+  # kernel delivers it to every member of the group regardless of
+  # /proc / sandbox visibility.
+  #
+  # Probe: prepend a directory with BROKEN pgrep AND ps stubs to PATH,
+  # then drive a python3-grandchild helper through the 2s timeout. The
+  # sentinel file MUST NOT exist after the timeout + settle window —
+  # proving the pgrp kill reached the grandchild without enumeration.
+  smoke_log "r4 step: pgrp kill must reap grandchild when BOTH pgrep AND ps are denied"
+
+  local broken_dir
+  broken_dir="$(make_broken_proctable_dir)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$broken_dir' 2>/dev/null || true" RETURN
+
+  local crash_log="$BRIDGE_LOG_DIR/daemon-crash.log"
+  : >"$crash_log"
+  : >"$BRIDGE_AUDIT_LOG"
+
+  local sentinel
+  sentinel="$(mktemp -t r4-pgrp-kill-XXXXXX)"
+  rm -f -- "$sentinel"
+
+  local output started ended elapsed
+  started="$(date +%s)"
+  output="$(TEST_BROKEN_PROCTABLE_PATH="$broken_dir" TEST_SENTINEL_FILE="$sentinel" \
+    run_driver l2_value_with_timeout_pgrep_and_ps_broken 2 pgrp_kill_test agent-r4 SENTINEL_FALLBACK)"
+  ended="$(date +%s)"
+  elapsed=$(( ended - started ))
+
+  smoke_assert_eq "SENTINEL_FALLBACK" "$output" "r4 timeout should still substitute sentinel when both pgrep and ps are denied"
+  # Budget is generous because `sleep 0.1` polling on macOS bash 5.x
+  # is ~0.2s per tick (a 2s budget actually takes 4-5s wall clock).
+  # The smoke is just checking the ceiling DID fire, not the exact
+  # latency. The real failure surface is the sentinel-survives case
+  # below — that fails categorically, not by timing.
+  if (( elapsed > 10 )); then
+    smoke_fail "r4 ceiling did not fire with broken pgrep+ps — elapsed=${elapsed}s (budget 10s, ~5x the 2s deadline to absorb sleep 0.1 quantization)"
+  fi
+
+  # python3 child sleeps 5s; deadline fires at 2s. Wait 4s past return
+  # so a surviving child would have written by now.
+  sleep 4
+  if [[ -f "$sentinel" ]]; then
+    smoke_fail "r4 P1 regression: python3 grandchild survived timeout when BOTH pgrep AND ps were denied — sentinel exists: $(ls -l "$sentinel" 2>/dev/null; cat "$sentinel" 2>/dev/null || true). The pgrp kill mechanism did not reach the grandchild. Process-table-independent reap is broken."
+  fi
+  smoke_log "  python3 grandchild reaped via pgrp kill after both pgrep AND ps stubs failed"
+  rm -f -- "$sentinel"
+}
+
 # --- PR #952 r3 P2 #2: skip-nudges does not consume ready-agents file ------
 
 step_r3_skip_nudges_does_not_read_ready_file() {
@@ -587,6 +680,36 @@ step_in_source_wiring_present() {
     smoke_fail "bridge-daemon.sh _bridge_kill_proc_tree reintroduced direct pgrep call (must go through _bridge_enumerate_children) — r3 P2 #1 regression"
   fi
 
+  # PR #952 r4 P1 wiring: the heartbeat helper must enable bash monitor
+  # mode around the background fork so the wrapper subshell gets its own
+  # process group, and _bridge_kill_proc_tree must use a negative-pid
+  # kill as the PRIMARY mechanism. Without these the timeout reap depends
+  # on process-table access (pgrep / ps) which is denied in macOS sandbox
+  # and some restricted Linux containers.
+  #
+  # Slurp each function body into a tempfile (NOT a `<<<` here-string) —
+  # bash 5.3.9 deadlocks on here-strings larger than PIPE_BUF when used
+  # inside an `if !` under `set -e`. Same class as CLAUDE.md footgun #11
+  # / lib/upgrade-helpers/ rationale. The heartbeat function body is
+  # ~5KB; the kill helper body is ~2KB. Both exceed PIPE_BUF on macOS.
+  local hb_body_file kill_body_file
+  hb_body_file="$(mktemp -t agb-r4-hb-XXXXXX)"
+  kill_body_file="$(mktemp -t agb-r4-kill-XXXXXX)"
+  # shellcheck disable=SC2064
+  trap "rm -f -- '$hb_body_file' '$kill_body_file' 2>/dev/null || true" RETURN
+  awk '/^_bridge_heartbeat_value_with_timeout\(\)/,/^}/' "$daemon_sh" >"$hb_body_file"
+  awk '/^_bridge_kill_proc_tree\(\)/,/^}/' "$daemon_sh" >"$kill_body_file"
+
+  if ! grep -qE '^[[:space:]]*set -m[[:space:]]*$' "$hb_body_file"; then
+    smoke_fail "bridge-daemon.sh _bridge_heartbeat_value_with_timeout missing 'set -m' before background fork — r4 P1 regression (pgrp kill needs wrapper as pgrp leader)"
+  fi
+  if ! grep -q 'set +m;' "$hb_body_file"; then
+    smoke_fail "bridge-daemon.sh _bridge_heartbeat_value_with_timeout missing 'set +m;' inside wrapper subshell — r4 P1 regression (without it nested forks each get their own pgrp)"
+  fi
+  if ! grep -q 'kill "-\$sig" -- "-\$root_pid"' "$kill_body_file"; then
+    smoke_fail "bridge-daemon.sh _bridge_kill_proc_tree missing negative-pid kill ('kill -SIG -- -PID') — r4 P1 regression (process-table-independent reap path)"
+  fi
+
   # PR #952 r3 P2 #2 wiring: cmd_daemon_step must defer load_ready_agents
   # until AFTER the skip_nudges short-circuit. The legacy form loaded the
   # file at function entry and would block on a broken/blocking path
@@ -630,6 +753,7 @@ smoke_run "L4 nudge_scan: writer failure runs maintenance-only step + skips nudg
 smoke_run "L4 nudge_scan: writer success invokes full step + silent" step_l4_writer_success_runs_step
 smoke_run "r3: _bridge_enumerate_children falls back to ps when pgrep fails (P2 #1 regression)" step_r3_pgrep_failure_enumerates_via_ps
 smoke_run "r3: timeout reaps python3 grandchild via ps fallback when pgrep is broken (P2 #1 regression)" step_r3_pgrep_failure_reaps_grandchild
+smoke_run "r4: pgrp kill reaps grandchild when BOTH pgrep AND ps are denied (P1 regression)" step_r4_pgrp_kill_under_denied_proctable
 smoke_run "r3: daemon-step --skip-nudges does NOT consume blocking ready-agents fifo (P2 #2 regression)" step_r3_skip_nudges_does_not_read_ready_file
 smoke_run "in-source: bridge-daemon.sh L2/L4 wiring is present and not regressed" step_in_source_wiring_present
 

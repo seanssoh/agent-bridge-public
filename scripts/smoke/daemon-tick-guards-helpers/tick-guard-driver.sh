@@ -89,13 +89,21 @@ _bridge_enumerate_children() {
 }
 
 _bridge_kill_proc_tree() {
+  # PR #952 r4 P1: process-group kill is the primary mechanism. The
+  # wrapper subshell is its own pgrp leader (the helper enables `set -m`
+  # before forking), so a negative-pid kill reaches every descendant
+  # without depending on pgrep / ps process-table access. Defensive
+  # enumeration runs second and is a no-op when the pgrp kill succeeded.
   local root_pid="$1"
   local sig="${2:-TERM}"
+  kill "-$sig" -- "-$root_pid" 2>/dev/null || true
   local children child
   children="$(_bridge_enumerate_children "$root_pid")"
-  for child in $children; do
-    _bridge_kill_proc_tree "$child" "$sig"
-  done
+  if [[ -n "$children" ]]; then
+    for child in $children; do
+      _bridge_kill_proc_tree "$child" "$sig"
+    done
+  fi
   kill "-$sig" "$root_pid" 2>/dev/null || true
 }
 
@@ -115,8 +123,13 @@ _bridge_heartbeat_value_with_timeout() {
     printf '%s' "$default"
     return 0
   fi
-  ( "$@" >"$stdout_file" 2>/dev/null ) &
+  # PR #952 r4 P1: enable bash monitor mode just around the fork so the
+  # wrapper subshell becomes its own process-group leader. Mirrors the
+  # production helper.
+  set -m
+  ( set +m; "$@" >"$stdout_file" 2>/dev/null ) &
   local pid=$!
+  set +m
   local i=0
   local poll_max=$(( secs * 10 ))
   while (( i < poll_max )); do
@@ -149,7 +162,9 @@ _bridge_heartbeat_value_with_timeout() {
     return 0
   fi
   local rc=0
-  wait "$pid" && rc=0 || rc=$?
+  # Silence monitor-mode "Done" / "Terminated" job-completion notices
+  # that bash prints to stderr (PR #952 r4 P1).
+  wait "$pid" 2>/dev/null && rc=0 || rc=$?
   if (( rc != 0 )); then
     daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}' exited rc=${rc}; substituting sentinel '${default}' (refs #946)"
     rm -f -- "$stdout_file"
@@ -283,6 +298,25 @@ case "${1:-}" in
     shift
     if [[ -n "${TEST_PGREP_BROKEN_PATH:-}" ]]; then
       export PATH="${TEST_PGREP_BROKEN_PATH}:${PATH}"
+    fi
+    _bridge_heartbeat_value_with_timeout "$1" "$2" "$3" "$4" _test_spawn_python3_sentinel_writer
+    ;;
+  l2_value_with_timeout_pgrep_and_ps_broken)
+    # PR #952 r4 P1 probe: TEST_BROKEN_PROCTABLE_PATH points at a
+    # directory containing stubs for BOTH pgrep AND ps that exit non-zero
+    # with "Operation not permitted" — this is the macOS sandbox /
+    # restricted-container scenario codex r3 caught. With both
+    # process-table primitives denied, descendant enumeration returns
+    # the empty list. The r3 form would only reap the immediate wrapper
+    # subshell and leak the python3 grandchild.
+    #
+    # r4 puts the wrapper in its own process group via `set -m` and
+    # kills via negative-pid, which does NOT require process-table
+    # access. The smoke asserts the python3 child sentinel never
+    # appears, proving the pgrp kill reached the grandchild.
+    shift
+    if [[ -n "${TEST_BROKEN_PROCTABLE_PATH:-}" ]]; then
+      export PATH="${TEST_BROKEN_PROCTABLE_PATH}:${PATH}"
     fi
     _bridge_heartbeat_value_with_timeout "$1" "$2" "$3" "$4" _test_spawn_python3_sentinel_writer
     ;;

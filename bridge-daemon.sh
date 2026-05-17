@@ -299,15 +299,45 @@ EOF
 # grandchild orphaned, so a stuck helper still leaked one long-running
 # child per heartbeat tick.
 #
-# We walk descendants depth-first with pgrep -P (depth-first so leaves
-# die before their parents — reduces SIGCHLD reaping races) and send the
-# requested signal to each. setsid / process-group kill is not portable
-# across macOS/Linux without an external wrapper (perl POSIX, util-linux
-# setsid) AND would require launching helpers via bash -c, which loses
-# the in-process bash function table. Recursive pgrep is the cleanest
-# portable approach given those constraints; pgrep is in
-# procps-ng (Linux) and Darwin base (macOS), already required by other
-# daemon paths.
+# PR #952 r4 P1 (process-group primary): codex r3 observed that pgrep
+# AND `ps -A` BOTH return "Operation not permitted" in restricted macOS
+# sandbox environments (and analogous failures in unprivileged Linux
+# containers with /proc filtering). When both process-table primitives
+# are denied, descendant enumeration silently returns the empty list
+# and the kill walk only reaps the immediate wrapper subshell — the
+# python3 grandchild outlives the timeout exactly as it did pre-r2.
+#
+# r4 makes the kill mechanism independent of process-table access by
+# putting the wrapper subshell in its own process group via bash
+# monitor mode (`set -m`). The wrapper's pgid equals its pid; any
+# child forked inside the wrapper inherits that pgid because we
+# immediately disable monitor mode inside the wrapper (otherwise every
+# nested `&` would get its own pgrp). On timeout we send the signal
+# to the negative pid, which the kernel delivers to every process in
+# the group regardless of /proc / sandbox visibility.
+#
+# `set -m` is enabled in the parent (the command-substitution subshell
+# that ran _bridge_heartbeat_value_with_timeout) for the single line
+# that backgrounds the wrapper, then disabled again — so daemon-wide
+# signal handling is unaffected. The wrapper's pgid stays valid even
+# after the wrapper exits, because the kernel keeps the pgrp alive
+# while any member is still running. So `kill -- -$pid` reaches an
+# orphaned python3 grandchild even after its wrapper subshell died.
+#
+# pgrep + ps enumeration are retained as DEFENSIVE-ONLY logging. If
+# pgrp kill ever misses a descendant (e.g. a child that explicitly
+# called setpgid) the enumerated PIDs become a warning log line, not
+# the primary reap path. They are no longer load-bearing.
+#
+# Historical rationale (r2/r3): the prior reasoning that
+# "setsid / process-group kill is not portable across macOS/Linux
+# without an external wrapper" was incorrect — bash monitor mode is in
+# POSIX job control and works the same way on both platforms. The
+# concern about "launching helpers via bash -c, which loses the
+# in-process bash function table" only applies to setsid(1) / python3
+# setsid wrappers that replace the process image with a fresh
+# interpreter. Bash monitor mode keeps the wrapper in the same
+# interpreter, so the function table is preserved.
 #
 # PR #952 r3 P2 #1: pgrep failure escalation. pgrep exit codes:
 #   0 — matches found
@@ -319,7 +349,9 @@ EOF
 # wedged helper's actual grandchildren survived the kill walk. r3
 # detects the failure and falls back to scanning `ps -A -o pid,ppid`
 # for descendants — `ps` is in POSIX and not subject to the pgrep
-# sandbox path that fails first.
+# sandbox path that fails first. r4 keeps this fallback because the
+# defensive logging hook still needs to enumerate when both pgrep and
+# the pgrp kill leave residual descendants.
 _bridge_enumerate_children() {
   # Stdout: one child PID per line. Exit 0 always — caller decides
   # whether an empty list is meaningful.
@@ -353,13 +385,44 @@ _bridge_enumerate_children() {
 }
 
 _bridge_kill_proc_tree() {
+  # PR #952 r4 P1: process-group kill is now the PRIMARY mechanism.
+  # `root_pid` is the pid of a subshell we backgrounded under monitor
+  # mode (`set -m`), so its pgid equals its pid. A negative-pid signal
+  # is delivered by the kernel to every member of the group without
+  # needing pgrep / ps to enumerate descendants — that is the property
+  # we lost in r3 when both process-table primitives were denied.
+  #
+  # We then run the legacy enumeration as DEFENSIVE coverage: if pgrep
+  # or ps happen to be available AND a descendant somehow escaped the
+  # pgrp (rare: only if a child explicitly called setpgid), we
+  # individually signal those PIDs and log a warning. This is no
+  # longer the load-bearing reap path.
   local root_pid="$1"
   local sig="${2:-TERM}"
+
+  # Primary: process-group kill via negative-pid. Ignore ESRCH ("No
+  # such process") which fires harmlessly if the wrapper already
+  # exited and reaped all its descendants between the kill -0 probe
+  # and this call.
+  kill "-$sig" -- "-$root_pid" 2>/dev/null || true
+
+  # Defensive: enumerate descendants for residual cleanup + logging.
+  # _bridge_enumerate_children returns 0 always; an empty list is a
+  # normal answer (everything was in the pgrp). A non-empty list AFTER
+  # the pgrp kill means something escaped — signal individually and
+  # log so an operator can grep for the rare escape.
   local children child
   children="$(_bridge_enumerate_children "$root_pid")"
-  for child in $children; do
-    _bridge_kill_proc_tree "$child" "$sig"
-  done
+  if [[ -n "$children" ]]; then
+    for child in $children; do
+      _bridge_kill_proc_tree "$child" "$sig"
+    done
+  fi
+
+  # Also signal the root pid itself by absolute pid — handles the
+  # never-monitor-mode regression case where the wrapper was NOT in
+  # its own pgrp (defensive, should be a no-op when r4 wiring is
+  # intact).
   kill "-$sig" "$root_pid" 2>/dev/null || true
 }
 
@@ -409,8 +472,22 @@ _bridge_heartbeat_value_with_timeout() {
 
   # Background the function call. We intentionally do NOT use
   # bridge_with_timeout — see comment above.
-  ( "$@" >"$stdout_file" 2>/dev/null ) &
+  #
+  # PR #952 r4 P1: enable bash monitor mode (`set -m`) JUST around the
+  # background fork so the wrapper subshell becomes its own
+  # process-group leader (pgid == pid). We immediately disable monitor
+  # mode INSIDE the subshell so any nested `&` (e.g. a helper that
+  # itself backgrounds a python3 child) inherits the wrapper's pgid
+  # instead of getting its own — that gives the timeout path a single
+  # negative-pid kill target that reaches all descendants without
+  # depending on pgrep / ps process-table access (denied in macOS
+  # sandbox + some Linux container configs). The parent's monitor-mode
+  # state is restored on the next line, so daemon job-control behavior
+  # is unchanged outside this six-line window.
+  set -m
+  ( set +m; "$@" >"$stdout_file" 2>/dev/null ) &
   local pid=$!
+  set +m
 
   # Poll for completion. 100ms granularity (10 polls per second) so a
   # fast function returns near-instantly without burning a full second
@@ -453,8 +530,11 @@ _bridge_heartbeat_value_with_timeout() {
   local rc=0
   # `wait` returns the backgrounded child's exit code. We want to capture
   # it without letting `set -e` short-circuit on a non-zero status, so use
-  # the canonical `cmd && rc=0 || rc=$?` form.
-  wait "$pid" && rc=0 || rc=$?
+  # the canonical `cmd && rc=0 || rc=$?` form. Stderr is redirected so
+  # bash monitor mode (PR #952 r4 P1) does not print a "[1]+ Done ..."
+  # job-completion notice — that notice would otherwise leak into the
+  # daemon stderr stream on every successful heartbeat helper call.
+  wait "$pid" 2>/dev/null && rc=0 || rc=$?
   if (( rc != 0 )); then
     daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}' exited rc=${rc}; substituting sentinel '${default}' (refs #946)"
     rm -f -- "$stdout_file"
