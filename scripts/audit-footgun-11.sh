@@ -53,6 +53,37 @@
 
 set -euo pipefail
 
+# This script uses associative arrays (`declare -A`), which require Bash 4+.
+# On macOS, /usr/bin/env bash typically resolves to /bin/bash 3.2 (Apple's
+# stock build), which aborts the declare-A line with "unbound variable" and
+# leaves the lint shipping in `lint-heredoc-ban.sh --baseline-check` with a
+# non-actionable failure (r2 fix for codex PR #954 r1 finding P2 #1). Re-exec
+# via the first Bash 4+ interpreter we can find so the script works on
+# developer macOS machines, not just Linux CI.
+if (( BASH_VERSINFO[0] < 4 )); then
+  _audit_bash4=""
+  if [[ -n "${BASH4_BIN:-}" && -x "${BASH4_BIN}" ]]; then
+    _audit_bash4="$BASH4_BIN"
+  else
+    for _cand in \
+      "$(command -v bash4 2>/dev/null || true)" \
+      /opt/homebrew/bin/bash \
+      /usr/local/bin/bash \
+    ; do
+      if [[ -n "$_cand" && -x "$_cand" ]]; then
+        _audit_bash4="$_cand"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$_audit_bash4" ]]; then
+    echo "audit-footgun-11: requires Bash 4+ (declare -A); found Bash ${BASH_VERSION}." >&2
+    echo "audit-footgun-11: install Homebrew bash (\`brew install bash\`) or set BASH4_BIN to a Bash 4+ interpreter." >&2
+    exit 2
+  fi
+  exec "$_audit_bash4" "${BASH_SOURCE[0]}" "$@"
+fi
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 mode="tsv"
@@ -375,6 +406,10 @@ main() {
       scripts/audit-footgun-11.sh) continue ;;
       scripts/lint-heredoc-ban.sh) continue ;;
       scripts/smoke/lint-heredoc-scanner-self.sh) continue ;;
+      # Static fixtures used by the scanner self-test (r2 fix for codex
+      # PR #954 finding P1 #2 — the prior fixture was inlined via
+      # `cat <<'FIXTURE'`, which wedges on Bash 5.3.9 footgun #11).
+      scripts/smoke/lint-heredoc-fixtures/*) continue ;;
     esac
     scan_file "$rel"
   done < <(collect_sources)

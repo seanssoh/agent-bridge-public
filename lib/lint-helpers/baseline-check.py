@@ -53,10 +53,17 @@ def main(argv: list[str]) -> int:
     current_rows = read_tsv(current_path, 6)
     baseline_rows = read_tsv(baseline_path, 4)
 
-    baseline_cat_by_hash: dict[str, str] = {}
+    # Key by (path, snippet_hash) — NOT snippet_hash alone. Common snippets
+    # like `python3 - <<'PY'` share a normalized hash across many files; if
+    # we keyed only by hash, a copy-pasted C1/C3 site at a brand new path
+    # would silently bypass the ratchet because some existing baseline row
+    # already has that hash. Per-(path, hash) lookup means a new occurrence
+    # at a new path/line MUST appear as a new baseline row before merge
+    # (r2 fix for codex PR #954 r1 finding P1 #1).
+    baseline_cat_by_path_hash: dict[tuple[str, str], str] = {}
     for row in baseline_rows:
         # path, line, category, snippet_hash[, reason, owner, expires_or_phase]
-        baseline_cat_by_hash[row[3]] = row[2]
+        baseline_cat_by_path_hash[(row[0], row[3])] = row[2]
 
     new_sites: list[tuple[str, str, str, str, str, str]] = []
     promoted: list[tuple[str, str, str, str, str, str]] = []
@@ -69,10 +76,11 @@ def main(argv: list[str]) -> int:
         counts[cat] += 1
         if cat == "SAFE":
             continue
-        if snippet_hash not in baseline_cat_by_hash:
+        key = (path, snippet_hash)
+        if key not in baseline_cat_by_path_hash:
             new_sites.append((path, line, cat, snippet_hash, reason, snippet))
         else:
-            old_cat = baseline_cat_by_hash[snippet_hash]
+            old_cat = baseline_cat_by_path_hash[key]
             if old_cat != cat:
                 promoted.append((path, line, cat, old_cat, snippet_hash, snippet))
 

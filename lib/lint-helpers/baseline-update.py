@@ -53,10 +53,14 @@ def main(argv: list[str]) -> int:
     current_path, baseline_path = argv[1], argv[2]
 
     # Baseline schema: path, line, category, snippet_hash, reason, owner, expires_or_phase
+    # Metadata is keyed by (path, snippet_hash) so a snippet copy-pasted to
+    # a new file does NOT inherit metadata from an existing site at a
+    # different path. Matches the (path, hash) ratchet key in
+    # baseline-check.py (r2 fix for codex PR #954 r1 finding P1 #1).
     baseline_rows = read_tsv(baseline_path, 7)
-    meta_by_hash: dict[str, tuple[str, str, str]] = {}
+    meta_by_path_hash: dict[tuple[str, str], tuple[str, str, str]] = {}
     for row in baseline_rows:
-        meta_by_hash[row[3]] = (row[4], row[5], row[6])
+        meta_by_path_hash[(row[0], row[3])] = (row[4], row[5], row[6])
 
     # Audit schema: path, line, category, snippet_hash, reason, snippet
     current_rows = read_tsv(current_path, 6)
@@ -93,8 +97,9 @@ def main(argv: list[str]) -> int:
             if cat == "SAFE":
                 continue
             audit_reason = row[4] if len(row) > 4 else ""
-            if snippet_hash in meta_by_hash:
-                reason, owner, phase = meta_by_hash[snippet_hash]
+            key = (path, snippet_hash)
+            if key in meta_by_path_hash:
+                reason, owner, phase = meta_by_path_hash[key]
                 if not reason:
                     reason = audit_reason
             else:

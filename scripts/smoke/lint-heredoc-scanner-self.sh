@@ -41,10 +41,24 @@ smoke_make_temp_root "$SMOKE_NAME"
 [[ -x "$LINT"  ]] || smoke_fail "lint script missing or non-executable: $LINT"
 
 # ---------------------------------------------------------------------------
-# Fixture file. Each non-comment line is labelled in a trailing comment for
+# Fixture files. Each non-comment line is labelled in a trailing comment for
 # the human reader; the assertions below compare against expected category
-# at each line number. The fixture is committed inside the temp tree only.
+# at each line number.
+#
+# The fixtures are CHECKED IN under scripts/smoke/lint-heredoc-fixtures/ and
+# copied into the temp tree here (NOT generated via heredoc). Generating
+# them via `cat <<'FIXTURE'` would wedge on Bash 5.3.9 — the exact footgun
+# this test is guarding against — because the fixture body contains every
+# C1/C2/C3/C4/H3 shape we want to classify (r2 fix for codex PR #954 r1
+# finding P1 #2). The audit script skips scripts/smoke/lint-heredoc-fixtures/
+# explicitly so the checked-in fixtures do not pollute the real baseline.
 # ---------------------------------------------------------------------------
+
+FIXTURES_SRC="$REPO_ROOT/scripts/smoke/lint-heredoc-fixtures"
+[[ -d "$FIXTURES_SRC" ]] || smoke_fail "fixture source dir missing: $FIXTURES_SRC"
+[[ -f "$FIXTURES_SRC/fixture.sh" ]] || smoke_fail "fixture.sh missing"
+[[ -f "$FIXTURES_SRC/fixture-reformat-a.sh" ]] || smoke_fail "fixture-reformat-a.sh missing"
+[[ -f "$FIXTURES_SRC/fixture-reformat-b.sh" ]] || smoke_fail "fixture-reformat-b.sh missing"
 
 fixture_dir="$SMOKE_TMP_ROOT/fixture-repo"
 mkdir -p "$fixture_dir/scripts"
@@ -53,84 +67,7 @@ git init -q .
 git config user.email "smoke@example.test"
 git config user.name "smoke"
 
-cat > scripts/fixture.sh <<'FIXTURE'
-#!/usr/bin/env bash
-# Comment line: bash -s -- <<'EOF' (NEG: comment should never match).
-# Comment line: $(python3 - <<'PY')  (NEG: comment should never match).
-
-# C3: interpreter heredoc outside capture, single quoted delimiter.
-python3 - "$payload" <<'PY'
-print("hello")
-PY
-
-# C3: interpreter heredoc outside capture, unquoted delimiter, tab-strip.
-python3 - <<-PY
-print("indent ok")
-PY
-
-# C3: arbitrary delimiter MARKER must be matched (regex must not hard-code EOF/PY).
-python3 - <<MARKER
-print("marker delim")
-MARKER
-
-# C4: bash -s heredoc, no capture.
-bash -s -- "$arg" <<'EOF'
-echo hi
-EOF
-
-# C1: nested $() with python3 - heredoc.
-out=$(python3 - "$payload" <<'PY'
-print("captured")
-PY
-)
-
-# C1: env-prefixed python3 inside $().
-result="$(NOTE='x' python3 - <<'PY'
-print(1)
-PY
-)"
-
-# C1: pipe-then-capture (printf | python3 - <<PY inside $()).
-result="$(printf '%s' "$json" | python3 - "$arg" <<'PY'
-print(2)
-PY
-)"
-
-# C1: backtick wrapper, single-quoted delimiter.
-backtick=`python3 - "$payload" <<'PY'
-print(3)
-PY`
-
-# C2: cat heredoc inside $() capture.
-content="$(cat <<EOF
-template
-EOF
-)"
-
-# SAFE: write-to-file heredoc with cat > path syntax.
-cat > "$tmp_path" <<EOF
-template
-EOF
-
-# SAFE: cat <<EOF top-level (usage/help text).
-cat <<EOF
-usage: smoke
-EOF
-
-# SAFE: redirected to stderr (still a write-target, not a capture).
-cat > /dev/stderr <<EOF
-msg
-EOF
-
-# H3: here-string feeding read.
-IFS=$'\t' read -r a b c <<<"$row"
-
-# H3: here-string feeding python3 (interpreter consumer flag).
-result="$(python3 -c 'import sys;print(sys.stdin.read())' <<<"$payload")"
-
-# H3: process substitution input.
-diff <(echo a) <(echo b)
-FIXTURE
+cp "$FIXTURES_SRC/fixture.sh" scripts/fixture.sh
 git add -A
 git commit -qm "fixture"
 
@@ -224,21 +161,8 @@ expect_at 76  H3   "H3 process substitution"
 # and asserts identical SHA-256 in the audit output.
 # ---------------------------------------------------------------------------
 
-cat > scripts/fixture-reformat-a.sh <<'A'
-#!/usr/bin/env bash
-out=$(python3 - "$payload" <<'PY'
-print(1)
-PY
-)
-A
-
-cat > scripts/fixture-reformat-b.sh <<'B'
-#!/usr/bin/env bash
-out=$(python3   -   "$payload"   <<'PY'
-print(1)
-PY
-)
-B
+cp "$FIXTURES_SRC/fixture-reformat-a.sh" scripts/fixture-reformat-a.sh
+cp "$FIXTURES_SRC/fixture-reformat-b.sh" scripts/fixture-reformat-b.sh
 
 ( cd "$fixture_dir" && git add -A && git commit -qm "reformat fixtures" )
 
