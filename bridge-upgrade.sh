@@ -1924,6 +1924,21 @@ if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
   bash "$TARGET_ROOT/bridge-daemon.sh" ensure >/dev/null
 fi
 
+# Patch #4798 — tmux server-env cleanup. Pre-PR-#926 installs leaked
+# BRIDGE_LAYOUT / BRIDGE_DATA_ROOT into the tmux server's global env
+# via inheritance from the original `agent-bridge` invocation that
+# started the server. Once leaked, every new pane inherits the stale
+# value and the layout resolver fires its "stale pre-v0.8.0 env
+# override" warning on every CLI command. PR #926 stopped the export
+# prefix from re-forwarding the vars but did NOT clean the existing
+# tmux server-level entries.  `tmux setenv -u -g` is idempotent — when
+# the server has no entry the call is a no-op. Suppress all output so
+# operators without a running tmux server don't see error noise.
+if [[ $DRY_RUN -eq 0 ]] && command -v tmux >/dev/null 2>&1; then
+  tmux setenv -u -g BRIDGE_LAYOUT 2>/dev/null || true
+  tmux setenv -u -g BRIDGE_DATA_ROOT 2>/dev/null || true
+fi
+
 
 # Bug #507 — auto-cleanup of daily-backup residue on every successful
 # `agb upgrade --apply`. Idempotent; reports failures via cleanup_failures

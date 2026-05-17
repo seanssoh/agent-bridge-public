@@ -168,7 +168,21 @@ bridge_layout_resolver_validate_env() {
             | sed -E "s/^[[:space:]]*BRIDGE_LAYOUT[[:space:]]*=//; s/^[\"']//; s/[\"']$//"
         )"
         if [[ "$_marker_layout" == "v2" ]]; then
-          bridge_warn "BRIDGE_LAYOUT=${layout} is a stale pre-v0.8.0 env override; marker ${_stale_marker_path} pins this install to v2. Preferring marker. To silence: \`unset BRIDGE_LAYOUT\` in your shell rc."
+          # Patch #4798: gate the warning behind a once-per-process
+          # sentinel. When the stale BRIDGE_LAYOUT lives at the tmux
+          # server-env level (operator hit by a pre-PR-#926 install
+          # that leaked it via setenv -g), every spawned child inherits
+          # the value and the resolver re-fires the warning for every
+          # `agent-bridge` / `agb` call — drowning the operator in
+          # noise. Export the sentinel so any child shell that
+          # re-sources bridge-lib.sh inside the same process tree
+          # stays quiet too; the parent upgrade flow has a one-shot
+          # `tmux setenv -u -g` cleanup that actually removes the
+          # server-level leak (bridge-upgrade.sh).
+          if [[ -z "${_BRIDGE_LAYOUT_STALE_ENV_WARNED:-}" ]]; then
+            bridge_warn "BRIDGE_LAYOUT=${layout} is a stale pre-v0.8.0 env override; marker ${_stale_marker_path} pins this install to v2. Preferring marker. To silence: \`unset BRIDGE_LAYOUT\` in your shell rc (and run \`agent-bridge upgrade --apply\` once to clear any tmux server-level leak)."
+            export _BRIDGE_LAYOUT_STALE_ENV_WARNED=1
+          fi
           BRIDGE_LAYOUT_IGNORED_PARTIAL_ENV="BRIDGE_LAYOUT (stale ${layout} override; marker=v2)"
           unset BRIDGE_LAYOUT
           unset BRIDGE_DATA_ROOT
