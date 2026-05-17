@@ -4080,7 +4080,15 @@ bridge_extract_development_channels_from_command() {
   local command="${1:-}"
 
   bridge_require_python
-  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/extract-dev-channels-from-command.py" \
+  # #946 L1: re-validate BRIDGE_SCRIPT_DIR before forking python3. The
+  # daemon's nudge_scan and channel-state writers fork this helper every
+  # tick — if the source checkout was removed mid-flight, an unguarded
+  # python3 call emits an opaque [Errno 2] line and the cycle re-tries
+  # indefinitely. bridge_with_timeout caps the subprocess at 15s so a
+  # hung child (FS deadlock, slow disk) cannot wedge the parent tick.
+  bridge_resolve_script_dir_or_die
+  bridge_with_timeout 15 extract_dev_channels_from_command \
+    python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/extract-dev-channels-from-command.py" \
     "$command"
 }
 

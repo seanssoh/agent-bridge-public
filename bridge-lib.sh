@@ -32,6 +32,31 @@ umask 077
 
 BRIDGE_SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 
+# Startup validation: if the source checkout that BRIDGE_SCRIPT_DIR resolved
+# to has been removed or is incomplete, fail loud and fast rather than fan
+# out [Errno 2] failures from every helper invocation. This is the L1 cure
+# for the daemon-hang cascade documented in #946 — when a wave-orchestration
+# fixer worktree (or upgrade source dir) is cleaned up while a long-lived
+# daemon still holds a path captured from BASH_SOURCE[0], every subsequent
+# `python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/…"` call fails
+# silently. A loud die here lets launchd restart the daemon cleanly and
+# surfaces the misconfiguration to the operator.
+#
+# bridge_die is sourced later (bridge-core.sh) so we cannot call it yet;
+# inline a minimal early-die that writes to stderr and exits 1.
+if [[ -z "${BRIDGE_SCRIPT_DIR:-}" ]]; then
+  echo "[bridge-lib] [error] BRIDGE_SCRIPT_DIR unresolved at startup (BASH_SOURCE[0] returned an empty dirname?)" >&2
+  exit 1
+fi
+if [[ ! -d "$BRIDGE_SCRIPT_DIR" ]]; then
+  echo "[bridge-lib] [error] BRIDGE_SCRIPT_DIR=$BRIDGE_SCRIPT_DIR does not exist (source checkout moved or deleted?)" >&2
+  exit 1
+fi
+if [[ ! -d "$BRIDGE_SCRIPT_DIR/scripts/python-helpers" ]]; then
+  echo "[bridge-lib] [error] BRIDGE_SCRIPT_DIR=$BRIDGE_SCRIPT_DIR missing scripts/python-helpers/ (incomplete source checkout?)" >&2
+  exit 1
+fi
+
 bridge_early_ephemeral_tmp_root() {
   local path="${1:-}"
   local tmpdir="${TMPDIR:-}"
@@ -377,3 +402,34 @@ bridge_source_module "bridge-wave.sh"
 # Sourced last because it consumes helpers from bridge-agents.sh and
 # bridge-core.sh (`bridge_admin_agent_id`, `bridge_require_python`).
 bridge_source_module "bridge-agent-update.sh"
+
+# Per-call re-validation of BRIDGE_SCRIPT_DIR (#946 L1). Long-lived daemons
+# can survive a mid-flight removal of the source checkout (worktree cleanup
+# after a wave dispatch, `agb upgrade --apply` moving the source root,
+# `brew prune` on a Homebrew-installed source dir). The startup validation
+# above only fires when bridge-lib.sh is first sourced; callers that fork
+# repeatedly into python-helpers from a running daemon need to re-check
+# before each invocation. The helper attempts a cheap re-resolution via
+# BASH_SOURCE before giving up so a temporary symlink swap or a
+# mount-point flip can recover, then dies with a clear message if the
+# directory is truly gone — daemon dies fast, launchd restarts, operator
+# sees the root cause instead of a 6-hour silent hang on [Errno 2].
+bridge_resolve_script_dir_or_die() {
+  if [[ -n "${BRIDGE_SCRIPT_DIR:-}" && -d "$BRIDGE_SCRIPT_DIR/scripts/python-helpers" ]]; then
+    return 0
+  fi
+
+  # Re-resolution attempt: BASH_SOURCE may now point somewhere new if the
+  # file is still discoverable through a sibling path. Cheap to try.
+  local resolved=""
+  if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
+    resolved="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P 2>/dev/null)" || resolved=""
+  fi
+  if [[ -n "$resolved" && -d "$resolved/scripts/python-helpers" ]]; then
+    BRIDGE_SCRIPT_DIR="$resolved"
+    export BRIDGE_SCRIPT_DIR
+    return 0
+  fi
+
+  bridge_die "BRIDGE_SCRIPT_DIR=${BRIDGE_SCRIPT_DIR:-<unset>} does not exist or is missing scripts/python-helpers/ (source checkout moved or deleted mid-flight?)"
+}

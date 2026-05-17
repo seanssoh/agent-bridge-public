@@ -296,6 +296,53 @@ assert_not_contains "$LAUNCH_DRYRUN_OUTPUT" "fake-secret-XYZ"
 assert_not_contains "$LAUNCH_DRYRUN_OUTPUT" "fake-token-ABC"
 rm -rf "$LAUNCH_DRYRUN_HOME"
 
+log "BRIDGE_SCRIPT_DIR startup validation + re-resolution helper (issue #946 L1)"
+# Regression coverage for the daemon-hang root cause documented in #946.
+# When the source checkout that BRIDGE_SCRIPT_DIR was captured from is
+# removed mid-flight (wave-orchestration fixer worktree cleanup, brew
+# prune of an upgrade source dir, `agb upgrade --apply` moving the
+# source root), every subsequent
+# `python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/…"` call from the
+# daemon used to fail silently with [Errno 2] and the cycle would
+# accumulate hung child bash processes until the tick loop wedged.
+# Lock the new contract:
+#   1. Startup-time: bridge-lib.sh dies loudly when its script dir is
+#      missing scripts/python-helpers/.
+#   2. Run-time: bridge_resolve_script_dir_or_die dies with the same
+#      class of message when the dir vanishes after sourcing.
+SCRIPTDIR_FAKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agb-smoke-scriptdir.XXXXXX")"
+# Negative startup case: stage a fake source tree WITHOUT
+# scripts/python-helpers/ and source bridge-lib.sh from it. Validation
+# must die with the documented message.
+mkdir -p "$SCRIPTDIR_FAKE_ROOT/bad/lib"
+cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/bad/bridge-lib.sh"
+SCRIPTDIR_BAD_OUT="$("$BASH4_BIN" -c "source '$SCRIPTDIR_FAKE_ROOT/bad/bridge-lib.sh'" 2>&1 || true)"
+assert_contains "$SCRIPTDIR_BAD_OUT" "missing scripts/python-helpers/"
+# Positive startup case: a tree WITH scripts/python-helpers/ passes
+# startup validation (control). Use a symlinked lib/ so we don't have to
+# stage every module file just to exercise the validation path.
+mkdir -p "$SCRIPTDIR_FAKE_ROOT/good/scripts/python-helpers"
+cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/good/bridge-lib.sh"
+ln -sf "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/good/lib"
+ln -sf "$REPO_ROOT/VERSION" "$SCRIPTDIR_FAKE_ROOT/good/VERSION" 2>/dev/null || true
+SCRIPTDIR_GOOD_OUT="$("$BASH4_BIN" -c "source '$SCRIPTDIR_FAKE_ROOT/good/bridge-lib.sh' >/dev/null 2>&1 && echo SCRIPTDIR_STARTUP_OK" 2>&1 || true)"
+assert_contains "$SCRIPTDIR_GOOD_OUT" "SCRIPTDIR_STARTUP_OK"
+# Run-time re-validation: source the staged copy (passes startup), then
+# remove the staged scripts/python-helpers/ to simulate a worktree
+# cleanup mid-flight. bridge_resolve_script_dir_or_die must die with the
+# documented message. We delete only the python-helpers subdir, leaving
+# the bridge-lib.sh on disk so the re-resolution branch via BASH_SOURCE
+# also fails (its dirname still lacks the subdir) — without that we
+# would silently recover and the test would be a no-op.
+SCRIPTDIR_LIVE_OUT="$("$BASH4_BIN" -c "
+  source '$SCRIPTDIR_FAKE_ROOT/good/bridge-lib.sh' >/dev/null 2>&1
+  rm -rf '$SCRIPTDIR_FAKE_ROOT/good/scripts'
+  bridge_resolve_script_dir_or_die
+" 2>&1 || true)"
+assert_contains "$SCRIPTDIR_LIVE_OUT" "does not exist or is missing scripts/python-helpers/"
+rm -rf "$SCRIPTDIR_FAKE_ROOT"
+log "  [ok] script-dir startup validation + re-resolution helper"
+
 log "bridge_cron_sync_enabled reducer: any-0-disables semantics (issue #192)"
 # Regression matrix for the `BRIDGE_CRON_SYNC_ENABLED` reducer introduced
 # in #213 after the original precedence chain silently let an outer =1

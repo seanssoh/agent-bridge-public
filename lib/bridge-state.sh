@@ -284,7 +284,13 @@ bridge_claude_launch_with_channels() {
   fi
 
   bridge_require_python
-  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-claude-channels.py" \
+  # #946 L1: re-validate BRIDGE_SCRIPT_DIR + cap the python3 subprocess at
+  # 15s. The daemon forks this on every launch-cmd rebuild path; an
+  # unguarded call fans out [Errno 2] on stale-source-checkout and a hung
+  # child can wedge the tick loop.
+  bridge_resolve_script_dir_or_die
+  bridge_with_timeout 15 launch_cmd_claude_channels \
+    python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-claude-channels.py" \
     "$original" "$required"
 }
 
