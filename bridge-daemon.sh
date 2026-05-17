@@ -31,6 +31,27 @@ daemon_warn() {
   printf '[%s] [warn] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$message" >&2
 }
 
+# PR #953 r3 (refs #4807, codex r2 P2 #1): centralized dispatcher for the
+# lib/daemon-helpers/*.py extraction helpers. Seven helper invocations
+# downstream previously expanded `python3 "$SCRIPT_DIR/lib/daemon-helpers/
+# <name>.py" "$@"` inline without first re-validating BRIDGE_SCRIPT_DIR /
+# SCRIPT_DIR. If the source checkout moved or BRIDGE_SCRIPT_DIR was
+# inherited stale, the helper path expanded to `[Errno 2]`. Routing every
+# helper through this wrapper guarantees the same per-call stale-source
+# guard `bridge_resolve_script_dir_check` already enforces elsewhere.
+# The wrapper uses $BRIDGE_SCRIPT_DIR (set by bridge-lib.sh) rather than
+# the daemon's local $SCRIPT_DIR so the guard's recovery branch (which
+# rewrites BRIDGE_SCRIPT_DIR) actually changes the path we dispatch to.
+bridge_daemon_helper_python() {
+  local helper="${1:-}"
+  [[ -n "$helper" ]] || return 1
+  shift || true
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  python3 "$BRIDGE_SCRIPT_DIR/lib/daemon-helpers/$helper.py" "$@"
+}
+
 daemon_source_state_file() {
   local file="$1"
   local label="${2:-state}"
@@ -120,6 +141,15 @@ BRIDGE_DAEMON_LAST_STEP="${BRIDGE_DAEMON_LAST_STEP:-init}"
 BRIDGE_DAEMON_ERR_LOCATION="${BRIDGE_DAEMON_ERR_LOCATION:-}"
 _BRIDGE_DAEMON_EXIT_LOGGED=0
 _BRIDGE_DAEMON_IN_ERR_TRAP=0
+# Issue #946 L4 / PR #952 r2: consecutive-failure counter for
+# bridge_write_idle_ready_agents. Reset to 0 on each successful write;
+# incremented on each failure. The nudge_scan step uses this both to (a)
+# trigger the maintenance-only fallback path on the failing tick (avoiding
+# broken-state nudge consumption while preserving queue maintenance) and
+# (b) surface a `daemon_step_warning` audit row so an operator can spot a
+# wedged writer after N consecutive ticks instead of having to grep raw
+# logs.
+_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=0
 
 _bridge_daemon_on_signal() {
   BRIDGE_LAST_SIGNAL="$1"
@@ -267,6 +297,283 @@ HEARTBEAT_NEXT_TS=$next_ts
 EOF
 }
 
+# Issue #946 L2: bound each command-substitution inside write_agent_heartbeat
+# so a stuck helper (missing python3 helper file, hung tmux probe, locked
+# state file) cannot wedge the daemon tick. Each value is pre-computed via
+# bridge_with_timeout with a per-call ceiling; on timeout/failure we
+# substitute a grep-able sentinel and emit a one-line [L2] event so an
+# operator can identify which helper site is misbehaving from the daemon
+# crash log.
+#
+# Why pre-compute instead of wrapping inline? `cat <<EOF $(slow_helper) EOF`
+# evaluates command substitutions inside the heredoc body — there is no
+# way to bound them from inside the heredoc itself. The deadlock surfaced
+# on operator-host 2026-05-17 was that channel_status's python3 helpers
+# hung on a stale worktree path, the parent heredoc waited forever on the
+# child fork, and `set -e` did not abort because `cat` had not yet
+# observed a failure. Pre-resolving the values gives us a clean failure
+# boundary on each call.
+# PR #952 r2 P2 #2: recursive descendant kill. The wedged-helper case
+# documented for L2 is a bash function that forks a python3/tmux child
+# (e.g. bridge_agent_channel_status → python3 bridge-channels.py).
+# Killing just the immediate background subshell PID leaves the python3
+# grandchild orphaned, so a stuck helper still leaked one long-running
+# child per heartbeat tick.
+#
+# PR #952 r4 P1 (process-group primary): codex r3 observed that pgrep
+# AND `ps -A` BOTH return "Operation not permitted" in restricted macOS
+# sandbox environments (and analogous failures in unprivileged Linux
+# containers with /proc filtering). When both process-table primitives
+# are denied, descendant enumeration silently returns the empty list
+# and the kill walk only reaps the immediate wrapper subshell — the
+# python3 grandchild outlives the timeout exactly as it did pre-r2.
+#
+# r4 makes the kill mechanism independent of process-table access by
+# putting the wrapper subshell in its own process group via bash
+# monitor mode (`set -m`). The wrapper's pgid equals its pid; any
+# child forked inside the wrapper inherits that pgid because we
+# immediately disable monitor mode inside the wrapper (otherwise every
+# nested `&` would get its own pgrp). On timeout we send the signal
+# to the negative pid, which the kernel delivers to every process in
+# the group regardless of /proc / sandbox visibility.
+#
+# `set -m` is enabled in the parent (the command-substitution subshell
+# that ran _bridge_heartbeat_value_with_timeout) for the single line
+# that backgrounds the wrapper, then disabled again — so daemon-wide
+# signal handling is unaffected. The wrapper's pgid stays valid even
+# after the wrapper exits, because the kernel keeps the pgrp alive
+# while any member is still running. So `kill -- -$pid` reaches an
+# orphaned python3 grandchild even after its wrapper subshell died.
+#
+# pgrep + ps enumeration are retained as DEFENSIVE-ONLY logging. If
+# pgrp kill ever misses a descendant (e.g. a child that explicitly
+# called setpgid) the enumerated PIDs become a warning log line, not
+# the primary reap path. They are no longer load-bearing.
+#
+# Historical rationale (r2/r3): the prior reasoning that
+# "setsid / process-group kill is not portable across macOS/Linux
+# without an external wrapper" was incorrect — bash monitor mode is in
+# POSIX job control and works the same way on both platforms. The
+# concern about "launching helpers via bash -c, which loses the
+# in-process bash function table" only applies to setsid(1) / python3
+# setsid wrappers that replace the process image with a fresh
+# interpreter. Bash monitor mode keeps the wrapper in the same
+# interpreter, so the function table is preserved.
+#
+# PR #952 r3 P2 #1: pgrep failure escalation. pgrep exit codes:
+#   0 — matches found
+#   1 — no matches (a leaf process; normal termination of the recursion)
+#   2 — invalid options
+#   3 — fatal error (e.g. macOS sandbox "Cannot get process list",
+#       /proc unreadable, etc.)
+# The r2 form swallowed exit ≥2 as "no children", which meant the
+# wedged helper's actual grandchildren survived the kill walk. r3
+# detects the failure and falls back to scanning `ps -A -o pid,ppid`
+# for descendants — `ps` is in POSIX and not subject to the pgrep
+# sandbox path that fails first. r4 keeps this fallback because the
+# defensive logging hook still needs to enumerate when both pgrep and
+# the pgrp kill leave residual descendants.
+_bridge_enumerate_children() {
+  # Stdout: one child PID per line. Exit 0 always — caller decides
+  # whether an empty list is meaningful.
+  local parent_pid="$1"
+  local pgrep_out pgrep_rc=0
+  pgrep_out="$(pgrep -P "$parent_pid" 2>/dev/null)" || pgrep_rc=$?
+  if (( pgrep_rc == 0 )) || (( pgrep_rc == 1 )); then
+    # 0 = matches; 1 = no matches (leaf process). Either is the
+    # authoritative answer; no fallback needed.
+    [[ -n "$pgrep_out" ]] && printf '%s\n' "$pgrep_out"
+    return 0
+  fi
+  # pgrep failed (sandbox / /proc gone / invalid options). Fall back
+  # to `ps` — it does not share pgrep's enumeration path on macOS.
+  # `ps -A -o pid=,ppid=` is portable across macOS + Linux + BSD.
+  local line child_pid child_ppid
+  while IFS= read -r line; do
+    # Trim leading whitespace, then split on whitespace.
+    line="${line#"${line%%[![:space:]]*}"}"
+    child_pid="${line%% *}"
+    child_ppid="${line#* }"
+    child_ppid="${child_ppid#"${child_ppid%%[![:space:]]*}"}"
+    child_ppid="${child_ppid%% *}"
+    [[ -z "$child_pid" || -z "$child_ppid" ]] && continue
+    [[ "$child_pid" =~ ^[0-9]+$ && "$child_ppid" =~ ^[0-9]+$ ]] || continue
+    if [[ "$child_ppid" == "$parent_pid" ]]; then
+      printf '%s\n' "$child_pid"
+    fi
+  done < <(ps -A -o pid=,ppid= 2>/dev/null)
+  return 0
+}
+
+_bridge_kill_proc_tree() {
+  # PR #952 r4 P1: process-group kill is now the PRIMARY mechanism.
+  # `root_pid` is the pid of a subshell we backgrounded under monitor
+  # mode (`set -m`), so its pgid equals its pid. A negative-pid signal
+  # is delivered by the kernel to every member of the group without
+  # needing pgrep / ps to enumerate descendants — that is the property
+  # we lost in r3 when both process-table primitives were denied.
+  #
+  # We then run the legacy enumeration as DEFENSIVE coverage: if pgrep
+  # or ps happen to be available AND a descendant somehow escaped the
+  # pgrp (rare: only if a child explicitly called setpgid), we
+  # individually signal those PIDs and log a warning. This is no
+  # longer the load-bearing reap path.
+  local root_pid="$1"
+  local sig="${2:-TERM}"
+
+  # Primary: process-group kill via negative-pid. Ignore ESRCH ("No
+  # such process") which fires harmlessly if the wrapper already
+  # exited and reaped all its descendants between the kill -0 probe
+  # and this call.
+  kill "-$sig" -- "-$root_pid" 2>/dev/null || true
+
+  # Defensive: enumerate descendants for residual cleanup + logging.
+  # _bridge_enumerate_children returns 0 always; an empty list is a
+  # normal answer (everything was in the pgrp). A non-empty list AFTER
+  # the pgrp kill means something escaped — signal individually and
+  # log so an operator can grep for the rare escape.
+  local children child
+  children="$(_bridge_enumerate_children "$root_pid")"
+  if [[ -n "$children" ]]; then
+    for child in $children; do
+      _bridge_kill_proc_tree "$child" "$sig"
+    done
+  fi
+
+  # Also signal the root pid itself by absolute pid — handles the
+  # never-monitor-mode regression case where the wrapper was NOT in
+  # its own pgrp (defensive, should be a no-op when r4 wiring is
+  # intact).
+  kill "-$sig" "$root_pid" 2>/dev/null || true
+}
+
+_bridge_heartbeat_value_with_timeout() {
+  # Args: <timeout_seconds> <call_site_label> <agent> <default> <fn> [fn-args...]
+  #
+  # Prints the function's stdout on success, or <default> on timeout/error.
+  # On failure also emits a [L2] daemon_log_event so operators can grep
+  # the crash log for which heartbeat helper site degraded.
+  #
+  # bridge_with_timeout (lib/bridge-state.sh) cannot bound bash functions
+  # because timeout(1) / gtimeout(1) only run executables, not shell
+  # functions. So this helper builds a manual deadline using the
+  # background-subshell + sleep-poll + kill-TERM/KILL pattern already
+  # established in bridge_stop_queue_gateway_socket_listener
+  # (bridge-daemon.sh:5928-5939). The pattern is:
+  #
+  #   1. fork the function call into a background subshell, redirect
+  #      stdout to a tempfile so we can recover the value if it
+  #      completes.
+  #   2. poll kill -0 up to `secs` ticks (~1s resolution; aligned with
+  #      the daemon's existing audit cadence).
+  #   3. on deadline expiry: kill the entire descendant tree (PR #952 r2
+  #      P2 #2 — recursive pgrep so python3/tmux grandchildren do not
+  #      leak as orphans), brief grace, escalate to SIGKILL, drop
+  #      tempfile, return sentinel + L2 event.
+  #   4. on natural completion: wait + read tempfile contents.
+  local secs="$1"
+  local label="$2"
+  local agent="$3"
+  local default="$4"
+  shift 4
+
+  if [[ ! "$secs" =~ ^[0-9]+$ ]] || (( secs == 0 )); then
+    secs=5
+  fi
+
+  local stdout_file
+  stdout_file="$(mktemp 2>/dev/null)" || stdout_file=""
+  if [[ -z "$stdout_file" ]]; then
+    # mktemp failed (e.g. $TMPDIR full). Skip the bound — substitute
+    # the sentinel rather than running unbounded.
+    daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}': mktemp failed; substituting sentinel '${default}' (refs #946)"
+    printf '%s' "$default"
+    return 0
+  fi
+
+  # Background the function call. We intentionally do NOT use
+  # bridge_with_timeout — see comment above.
+  #
+  # PR #952 r4 P1: enable bash monitor mode (`set -m`) JUST around the
+  # background fork so the wrapper subshell becomes its own
+  # process-group leader (pgid == pid). We immediately disable monitor
+  # mode INSIDE the subshell so any nested `&` (e.g. a helper that
+  # itself backgrounds a python3 child) inherits the wrapper's pgid
+  # instead of getting its own — that gives the timeout path a single
+  # negative-pid kill target that reaches all descendants without
+  # depending on pgrep / ps process-table access (denied in macOS
+  # sandbox + some Linux container configs). The parent's monitor-mode
+  # state is restored on the next line, so daemon job-control behavior
+  # is unchanged outside this six-line window.
+  set -m
+  ( set +m; "$@" >"$stdout_file" 2>/dev/null ) &
+  local pid=$!
+  set +m
+
+  # Poll for completion. 100ms granularity (10 polls per second) so a
+  # fast function returns near-instantly without burning a full second
+  # of latency per heartbeat write.
+  local i=0
+  local poll_max=$(( secs * 10 ))
+  while (( i < poll_max )); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    # Deadline hit — recursive descendant kill so any python3/tmux child
+    # of the wrapper subshell dies too (PR #952 r2 P2 #2). Without this
+    # the python3 grandchild survived as an orphan per tick — codex's
+    # 4891ms probe caught the leak. Escalate TERM → KILL like the queue
+    # gateway stop helper. A 0.5s grace covers most python3 helpers; the
+    # KILL is the hard cap so the parent can never wait indefinitely.
+    #
+    # PR #952 r5 P2 #1: the KILL stage is UNCONDITIONAL — do not gate it
+    # behind `kill -0 pid`. If the wrapper subshell honored SIGTERM and
+    # died, `kill -0 $pid` returns false, but a SIGTERM-ignoring
+    # grandchild (e.g. python3 with a handler, or a child that ran
+    # `trap '' TERM`) may still be alive in the same process group.
+    # Sending negative-pid SIGKILL is uncatchable and reaches every
+    # surviving member of the group; sending it after the wrapper is
+    # already dead is harmless (the kernel just reports ESRCH per pid).
+    _bridge_kill_proc_tree "$pid" "TERM"
+    sleep 0.5
+    _bridge_kill_proc_tree "$pid" "KILL"
+    wait "$pid" 2>/dev/null || true
+    daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}' timed out at ${secs}s; substituting sentinel '${default}' (refs #946)"
+    bridge_audit_log daemon daemon_heartbeat_helper_timeout daemon \
+      --detail call_site="heartbeat_${label}" \
+      --detail agent="$agent" \
+      --detail timeout_seconds="$secs" \
+      --detail sentinel="$default" \
+      2>/dev/null || true
+    rm -f -- "$stdout_file"
+    printf '%s' "$default"
+    return 0
+  fi
+
+  local rc=0
+  # `wait` returns the backgrounded child's exit code. We want to capture
+  # it without letting `set -e` short-circuit on a non-zero status, so use
+  # the canonical `cmd && rc=0 || rc=$?` form. Stderr is redirected so
+  # bash monitor mode (PR #952 r4 P1) does not print a "[1]+ Done ..."
+  # job-completion notice — that notice would otherwise leak into the
+  # daemon stderr stream on every successful heartbeat helper call.
+  wait "$pid" 2>/dev/null && rc=0 || rc=$?
+  if (( rc != 0 )); then
+    daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}' exited rc=${rc}; substituting sentinel '${default}' (refs #946)"
+    rm -f -- "$stdout_file"
+    printf '%s' "$default"
+    return 0
+  fi
+  cat -- "$stdout_file" 2>/dev/null || printf '%s' "$default"
+  rm -f -- "$stdout_file"
+  return 0
+}
+
 write_agent_heartbeat() {
   local agent="$1"
   local heartbeat_file=""
@@ -282,6 +589,19 @@ write_agent_heartbeat() {
   local session=""
   local workdir=""
   local temp_file=""
+  # Issue #946 L2: pre-resolved heredoc values. Each is bounded by
+  # _bridge_heartbeat_value_with_timeout (defined above) so a wedged
+  # helper logs-and-skips rather than hanging the tick. Defaults are the
+  # same "-" / "?" tokens existing dashboards already render for missing
+  # data so no downstream consumer sees a novel shape.
+  local hb_now="?"
+  local hb_desc="-"
+  local hb_engine="-"
+  local hb_source="-"
+  local hb_always_on="no"
+  local hb_wake_status="-"
+  local hb_notify_status="-"
+  local hb_channel_status="-"
 
   heartbeat_file="$(bridge_agent_heartbeat_file "$agent")" || return 0
   workdir="$(bridge_agent_workdir "$agent")"
@@ -292,11 +612,54 @@ write_agent_heartbeat() {
   if bridge_agent_is_active "$agent"; then
     active="yes"
   fi
-  state="$(bridge_agent_heartbeat_activity_state "$agent")"
-  summary="$(bridge_queue_cli summary --agent "$agent" --format tsv 2>/dev/null | head -n 1 || true)"
+  # bridge_agent_heartbeat_activity_state can shell to tmux probes; bound it.
+  state="$(_bridge_heartbeat_value_with_timeout 5 activity_state "$agent" "unknown" bridge_agent_heartbeat_activity_state "$agent")"
+  # bridge_queue_cli internally forks python3 to bridge-queue-gateway.py
+  # (lib/bridge-core.sh:583) — bound via the same helper. We strip the
+  # leading newlines that head(1) might preserve when the helper returns
+  # the sentinel value.
+  local _hb_summary_raw=""
+  _hb_summary_raw="$(_bridge_heartbeat_value_with_timeout 10 queue_summary "$agent" "" \
+      bridge_queue_cli summary --agent "$agent" --format tsv)"
+  summary="$(printf '%s' "$_hb_summary_raw" | head -n 1 || true)"
   if [[ -n "$summary" ]]; then
     IFS=$'\t' read -r _agent queued claimed blocked _active idle last_seen last_nudge _session _engine _workdir <<<"$summary"
   fi
+
+  # Pre-resolve heredoc command-substitutions. PR #952 r7 perf scope:
+  # only the wedge-prone sites (those that fork python3 / tmux / external
+  # subprocesses) go through _bridge_heartbeat_value_with_timeout. The
+  # cheap pure-bash helpers (assoc-array getters, numeric compares) are
+  # called directly — wrapping them costs at minimum one `sleep 0.1` poll
+  # tick per call (the helper backgrounds the fn into a subshell and polls
+  # `kill -0` at 100 ms cadence before reaping). Codex r6 P2: a healthy
+  # tick paid ~0.5 s of mandatory latency for the four cheap callers on
+  # every static agent. Direct invocation restores the pre-r1 fast path.
+  #
+  # Wrap retained on: now_iso (forks python3 in bridge_now_iso),
+  # wake_status (calls bridge_tmux_* probes), channel_status (transitively
+  # forks python3 to extract-dev-channels-from-command for the operator
+  # wedge surface from #946).
+  #
+  # Wrap removed on: desc / engine / source / always_on_check /
+  # notify_status. All five are pure bash — assoc-array lookups, numeric
+  # compares, and string tests with no fork. They cannot wedge on a stale
+  # BRIDGE_SCRIPT_DIR (no helper file to read) and cannot hang on a tmux
+  # probe (no tmux call), so the timeout wrapper provides no protection.
+  hb_now="$(_bridge_heartbeat_value_with_timeout 2 now_iso "$agent" "?" bridge_now_iso)"
+  hb_desc="$(bridge_agent_desc "$agent")"
+  hb_engine="$(bridge_agent_engine "$agent")"
+  hb_source="$(bridge_agent_source "$agent")"
+  # bridge_agent_is_always_on returns 0/1 (no stdout). Convert inline so
+  # the heredoc can interpolate a token; pure-bash so no wrap needed.
+  if bridge_agent_is_always_on "$agent"; then
+    hb_always_on="yes"
+  else
+    hb_always_on="no"
+  fi
+  hb_wake_status="$(_bridge_heartbeat_value_with_timeout 5 wake_status "$agent" "?" bridge_agent_wake_status "$agent")"
+  hb_notify_status="$(bridge_agent_notify_status "$agent")"
+  hb_channel_status="$(_bridge_heartbeat_value_with_timeout 10 channel_status "$agent" "?" bridge_agent_channel_status "$agent")"
 
   temp_file="$(mktemp)"
   # Audit A17 (P1 leak): the cat/mv/rm cleanup at the function tail
@@ -308,22 +671,27 @@ write_agent_heartbeat() {
   #
   # A RETURN trap does NOT fire on set-e abort (codex r1 repro on
   # PR #915), so explicit error check + rm is required.
+  #
+  # Issue #946 L2: the heredoc body now only references pre-resolved
+  # local variables — no command substitutions remain inside. A stuck
+  # helper degrades a single value to its sentinel rather than wedging
+  # the whole `cat`.
   if ! cat >"$temp_file" <<EOF
 # Heartbeat
 
-- generated_at: $(bridge_now_iso)
+- generated_at: ${hb_now}
 - agent: ${agent}
-- description: $(bridge_agent_desc "$agent")
-- engine: $(bridge_agent_engine "$agent")
-- source: $(bridge_agent_source "$agent")
+- description: ${hb_desc}
+- engine: ${hb_engine}
+- source: ${hb_source}
 - session: ${session:--}
 - workdir: ${workdir:--}
 - active: ${active}
 - activity_state: ${state}
-- always_on: $(bridge_agent_is_always_on "$agent" && printf 'yes' || printf 'no')
-- wake_status: $(bridge_agent_wake_status "$agent")
-- notify_status: $(bridge_agent_notify_status "$agent")
-- channel_status: $(bridge_agent_channel_status "$agent")
+- always_on: ${hb_always_on}
+- wake_status: ${hb_wake_status}
+- notify_status: ${hb_notify_status}
+- channel_status: ${hb_channel_status}
 
 ## Queue
 
@@ -552,18 +920,13 @@ bridge_daily_backup_resolve_timeout() {
 # dep). Falls back to printing the raw epoch if Python is missing.
 bridge_daily_backup_format_epoch() {
   local epoch="${1:-0}"
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/format-epoch-iso.py — see helper docstring.
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$epoch" <<'PY' 2>/dev/null || printf '%s' "$epoch"
-import datetime
-import sys
-
-try:
-    ts = int(sys.argv[1])
-except (IndexError, ValueError):
-    print("")
-    raise SystemExit(0)
-print(datetime.datetime.fromtimestamp(ts).isoformat(timespec="seconds"))
-PY
+    bridge_daemon_helper_python format-epoch-iso "$epoch" 2>/dev/null \
+      || printf '%s' "$epoch"
   else
     printf '%s' "$epoch"
   fi
@@ -986,80 +1349,14 @@ bridge_write_release_alert_body() {
   local monitor_json="$2"
   local upgrade_check_json="${3:-{}}"
 
-  python3 - "$body_file" "$monitor_json" "$upgrade_check_json" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-body_file = Path(sys.argv[1])
-monitor_payload = json.loads(sys.argv[2])
-try:
-    upgrade_payload = json.loads(sys.argv[3])
-except Exception:
-    upgrade_payload = {}
-
-alerts = monitor_payload.get("alerts") or []
-if not alerts:
-    raise SystemExit(1)
-alert = alerts[0]
-release = monitor_payload.get("release") or {}
-tag = str(alert.get("latest_tag") or release.get("latest_tag") or "")
-version = str(alert.get("latest_version") or release.get("latest_version") or "")
-installed_version = str(alert.get("installed_version") or release.get("installed_version") or "")
-release_name = str(alert.get("release_name") or release.get("release_name") or tag or version)
-repo = str(alert.get("repo") or release.get("repo") or "")
-release_url = str(alert.get("html_url") or release.get("html_url") or "")
-published_at = str(alert.get("published_at") or release.get("published_at") or "")
-notes = str(alert.get("body") or release.get("body") or "").strip()
-
-upgrade_target_ref = str(upgrade_payload.get("target_ref") or "")
-upgrade_target_version = str(upgrade_payload.get("target_version") or "")
-upgrade_available = bool(upgrade_payload.get("update_available"))
-local_upgrade_ready = bool(
-    upgrade_available
-    and (
-        (tag and upgrade_target_ref == tag)
-        or (version and upgrade_target_version == version)
-    )
-)
-
-if local_upgrade_ready:
-    readiness_note = "Direct `agb upgrade` on this server should target the same stable release."
-else:
-    readiness_note = (
-        "This server's local source checkout is not yet pointing at the same stable release. "
-        "Downstream/source sync may be required before `agb upgrade` can apply it."
-    )
-
-body_file.parent.mkdir(parents=True, exist_ok=True)
-with body_file.open("w", encoding="utf-8") as fh:
-    fh.write("# Stable Release Available\n\n")
-    fh.write(f"- release: {release_name}\n")
-    fh.write(f"- tag: {tag or '-'}\n")
-    fh.write(f"- version: {version or '-'}\n")
-    fh.write(f"- installed_version: {installed_version or '-'}\n")
-    fh.write(f"- repo: {repo or '-'}\n")
-    fh.write(f"- published_at: {published_at or '-'}\n")
-    fh.write(f"- release_url: {release_url or '-'}\n")
-    fh.write(f"- detected_at: {monitor_payload.get('generated_at') or '-'}\n")
-    fh.write("\n## Patch Action\n\n")
-    fh.write("1. Read the release notes below.\n")
-    fh.write("2. Summarize the user-facing changes to the admin user in Korean.\n")
-    fh.write("3. Ask whether to apply the upgrade now.\n")
-    fh.write("4. If the local upgrade path is not ready, explain that source/downstream sync is required first.\n")
-    fh.write("\n## Local Upgrade Readiness\n\n")
-    fh.write(f"- local_upgrade_ready: {'yes' if local_upgrade_ready else 'no'}\n")
-    fh.write(f"- local_upgrade_target_ref: {upgrade_target_ref or '-'}\n")
-    fh.write(f"- local_upgrade_target_version: {upgrade_target_version or '-'}\n")
-    fh.write(f"- local_upgrade_update_available: {'yes' if upgrade_available else 'no'}\n")
-    fh.write(f"- note: {readiness_note}\n")
-    fh.write("\n## Release Notes\n\n")
-    if notes:
-        fh.write(notes)
-        fh.write("\n")
-    else:
-        fh.write("_No release notes were published in the GitHub release body._\n")
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/write-release-alert-body.py — see helper docstring.
+  # The helper exits 1 when the monitor payload carries no alerts; preserve
+  # that contract (process_usage_monitor branches on the rc).
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python write-release-alert-body \
+    "$body_file" "$monitor_json" "$upgrade_check_json"
 }
 
 process_usage_monitor() {
@@ -1712,47 +2009,21 @@ bridge_stall_reason_label() {
 
 bridge_stall_decode_excerpt() {
   local encoded="${1:-}"
-  python3 - "$encoded" <<'PY'
-import base64, sys
-payload = sys.argv[1]
-if not payload:
-    raise SystemExit(0)
-print(base64.b64decode(payload.encode("ascii")).decode("utf-8", errors="ignore"), end="")
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/stall-decode-excerpt.py — see helper docstring.
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python stall-decode-excerpt "$encoded"
 }
 
 bridge_stall_recent_audits_markdown() {
   local agent="$1"
-  python3 - "$BRIDGE_AUDIT_LOG" "$agent" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-agent = sys.argv[2]
-rows = []
-if path.is_file():
-    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            item = json.loads(raw)
-        except Exception:
-            continue
-        detail = item.get("detail") or {}
-        target = str(item.get("target") or "")
-        if target == agent or str(detail.get("agent") or "") == agent:
-            rows.append(item)
-rows = rows[-2:]
-if not rows:
-    print("- none")
-else:
-    for item in rows:
-        ts = str(item.get("ts") or "")
-        action = str(item.get("action") or "unknown")
-        print(f"- {action} @ {ts}")
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/stall-recent-audits-markdown.py — see helper docstring.
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python stall-recent-audits-markdown \
+    "$BRIDGE_AUDIT_LOG" "$agent"
 }
 
 bridge_write_stall_report_body() {
@@ -2545,31 +2816,11 @@ process_context_pressure_reports() {
 
 bridge_watchdog_problem_key() {
   local report_json="$1"
-  python3 - "$report_json" <<'PY'
-import hashlib
-import json
-import sys
-
-raw = sys.argv[1]
-try:
-    payload = json.loads(raw)
-except Exception:
-    print(hashlib.sha256(raw.encode("utf-8")).hexdigest() if raw else "")
-    raise SystemExit(0)
-
-agents = []
-for item in payload.get("agents", []):
-    if isinstance(item, dict):
-        stable = dict(item)
-        # Age advances every scan; keep heartbeat_present, but exclude the
-        # volatile age value so unchanged drift dedupes correctly.
-        stable.pop("heartbeat_age_seconds", None)
-        agents.append(stable)
-    else:
-        agents.append(item)
-canonical = json.dumps(agents, sort_keys=True, separators=(",", ":"))
-print(hashlib.sha256(canonical.encode("utf-8")).hexdigest() if canonical else "")
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/watchdog-problem-key.py — see helper docstring.
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python watchdog-problem-key "$report_json"
 }
 
 bridge_watchdog_due() {
@@ -4679,23 +4930,14 @@ start_cron_worker() {
   log_file="$(bridge_cron_worker_log_file "$task_id")"
   mkdir -p "$(dirname "$log_file")"
   bridge_require_python
-  python3 - "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-daemon.sh" "$task_id" "$log_file" <<'PY' >/dev/null
-import os
-import subprocess
-import sys
-
-bash_bin, daemon_script, task_id, log_file = sys.argv[1:]
-
-with open(os.devnull, "rb") as stdin_handle, open(log_file, "ab", buffering=0) as log_handle:
-    subprocess.Popen(
-        [bash_bin, daemon_script, "run-cron-worker", task_id],
-        stdin=stdin_handle,
-        stdout=log_handle,
-        stderr=log_handle,
-        start_new_session=True,
-        close_fds=True,
-    )
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/start-cron-worker-spawn.py — see helper docstring.
+  # The cron-dispatch start path runs concurrently with daemon polling so
+  # the deadlock surface was hot.
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python start-cron-worker-spawn \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-daemon.sh" "$task_id" "$log_file" >/dev/null
 }
 
 start_cron_dispatch_workers() {
@@ -5656,24 +5898,14 @@ bridge_queue_gateway_socket_connect_probe() {
   local socket_path
   socket_path="$1"
   [[ -n "$socket_path" ]] || return 1
-  python3 - "$socket_path" <<'PY' >/dev/null 2>&1
-import socket
-import sys
-
-path = sys.argv[1]
-sock_type = getattr(socket, "SOCK_SEQPACKET", None)
-if sock_type is None:
-    raise SystemExit(1)
-sock = socket.socket(socket.AF_UNIX, sock_type)
-try:
-    sock.settimeout(1.0)
-    sock.connect(path)
-except OSError:
-    raise SystemExit(1)
-finally:
-    sock.close()
-raise SystemExit(0)
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/gateway-socket-connect-probe.py — see helper docstring.
+  # Status path runs on every `daemon status` invocation; the deadlock
+  # surface was hot under concurrent dispatch pressure.
+  # PR #953 r3: routed through bridge_daemon_helper_python for per-call
+  # BRIDGE_SCRIPT_DIR guard.
+  bridge_daemon_helper_python gateway-socket-connect-probe \
+    "$socket_path" >/dev/null 2>&1
 }
 
 bridge_queue_gateway_socket_is_running() {
@@ -5973,14 +6205,45 @@ cmd_sync_cycle() {
   # added. Capture rc + emit a one-line audit so operator can catch
   # matrix-not-applied via `agent-bridge audit follow` instead of
   # cycling on a green-looking daemon.
-  if ! bridge_write_idle_ready_agents "$ready_agents_file"; then
+  #
+  # Issue #946 L4 / PR #952 r2: when the writer fails, the original code
+  # fell through to bridge_task_daemon_step with a broken/empty ready-agent
+  # file. The downstream consumer then computed nudge candidates from
+  # invalid input, silently suppressing `[task-queued]` interrupts on the
+  # operator host for hours (operator-host evidence 2026-05-17: hundreds of
+  # `idle_ready writer failed` lines while queued tasks never reached their
+  # target). r1 skipped bridge_task_daemon_step entirely on writer failure,
+  # which fixed the bad-nudge problem but starved the same step's
+  # maintenance side-effects (lease extend/expire, cron de-dupe, stale-
+  # claim requeue, blocked-task aging) for the whole tick — a writer wedge
+  # would now freeze queue maintenance for as long as it lasted.
+  #
+  # r2 splits the two concerns: on writer failure we still call
+  # bridge_task_daemon_step but with --maintenance-only so the python
+  # backend runs all the maintenance work and then exits without consuming
+  # the (broken) ready-agents file or printing nudge candidates. The
+  # consecutive-failure counter and audit row are preserved so an operator
+  # still gets the writer-wedge signal.
+  nudge_output=""
+  if bridge_write_idle_ready_agents "$ready_agents_file"; then
+    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=0
+    nudge_output="$(bridge_task_daemon_step "$snapshot_file" "$ready_agents_file" 2>/dev/null || true)"
+  else
+    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=$(( _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL + 1 ))
     bridge_audit_log daemon daemon_step_warning daemon \
       --detail step="nudge_scan_idle_ready" \
       --detail reason="bridge_write_idle_ready_agents non-zero (matrix not applied or writer error)" \
+      --detail consecutive_failures="$_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL" \
+      --detail action="maintenance_only_skip_nudges" \
       2>/dev/null || true
-    daemon_log_event "nudge_scan: idle_ready writer failed (matrix-aware fix #781); cycle continues"
+    daemon_log_event "[L4] nudge_scan: idle_ready writer failed (consec=${_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL}); running daemon_step maintenance-only and skipping nudges this tick (refs #946 L4, PR #952 r2, matrix-aware #781)"
+    # Run the maintenance side-effects without nudge dispatch. Failures
+    # here are non-fatal — the step's external state (sqlite txns) is
+    # already protected by its own transaction boundary, and an exception
+    # path leaves the next tick to retry. nudge_output stays empty so the
+    # downstream nudge-fanout loop is a no-op for this tick.
+    bridge_task_daemon_step --maintenance-only "$snapshot_file" >/dev/null 2>&1 || true
   fi
-  nudge_output="$(bridge_task_daemon_step "$snapshot_file" "$ready_agents_file" 2>/dev/null || true)"
   rm -f "$snapshot_file"
   rm -f "$ready_agents_file"
 

@@ -1114,11 +1114,19 @@ if [[ ${#STATIC_CANDIDATES[@]} -gt 0 ]]; then
     SPAWN_PREFERENCE="$(prompt_spawn_mode "$IS_GIT_PROJECT" "$PROJECT_ROOT" "${STATIC_CANDIDATES[@]}")"
     echo
   elif [[ -z "$SPAWN_PREFERENCE" ]]; then
-    if [[ ${#STATIC_CANDIDATES[@]} -eq 1 ]]; then
-      SPAWN_PREFERENCE="wake"
-    else
-      SPAWN_PREFERENCE="shared"
-    fi
+    # Task #4813: never silently hijack an explicit `--name <X>` in
+    # non-TTY mode. Prior to this guard, a single-static-candidate
+    # project would default to `wake` and redirect the operator's
+    # named dynamic spawn (e.g. `--name shopicode`) to the existing
+    # static role (e.g. `patch`), dropping the explicit name on the
+    # floor. The matching-static path was already handled at line
+    # ~1084 above (`bridge_agent_exists && static` → start_static_agent),
+    # so by the time we reach here NAME is definitively NOT one of
+    # these static roles — the operator's named-dynamic intent is
+    # unambiguous. Default to `shared` (current checkout, new dynamic
+    # worker alongside the static role). Operator can still pass
+    # `--prefer wake` or `--prefer new` to override.
+    SPAWN_PREFERENCE="shared"
   fi
 
   case "$SPAWN_PREFERENCE" in

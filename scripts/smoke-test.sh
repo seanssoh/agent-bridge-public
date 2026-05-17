@@ -11160,6 +11160,18 @@ bash "$REPO_ROOT/scripts/smoke/dynamic-agent-shared-mode-workdir.sh"
 log "running v2-scaffold-home-and-workdir smoke (issue #686)"
 bash "$REPO_ROOT/scripts/smoke/v2-scaffold-home-and-workdir.sh"
 
+# Task #4813 — `agent-bridge --claude --name <new-dynamic> --no-attach`
+# from a project that already hosts a static role (e.g. `patch`) was
+# silently redirecting to that static role in non-TTY mode. The
+# `STATIC_CANDIDATES > 0` branch in agent-bridge defaulted to
+# `SPAWN_PREFERENCE=wake` whenever there was exactly one candidate,
+# dropping the operator's explicit `--name` on the floor. The fix
+# changes the non-TTY default to `shared` so explicit names always
+# spawn a new dynamic worker. Operator-opt-in `--prefer wake|new` is
+# still honored, and the TTY interactive picker is unchanged.
+log "running dynamic-launch-no-admin-fallback smoke (task #4813)"
+bash "$REPO_ROOT/scripts/smoke/dynamic-launch-no-admin-fallback.sh"
+
 # Dynamic agents are operator-driven containers; long idle is normal
 # state, not a health signal. The dashboard previously flagged them
 # as warn/crit purely on idle threshold (Sean, 2026-05-16). Guard the
@@ -11226,15 +11238,36 @@ bash "$REPO_ROOT/scripts/smoke/smoke-isolation-no-live-leak.sh"
 log "running bridge-agent-cli-no-deadlock smoke (refs queue task #4773)"
 bash "$REPO_ROOT/scripts/smoke/bridge-agent-cli-no-deadlock.sh"
 
+# bridge-daemon.sh + lib/bridge-cron.sh footgun #11 migration regression
+# guard (refs queue task #4807). Operator host (2026-05-17 → 2026-05-18)
+# accumulated 7 zombie daemon processes plus two cron-workers hung 13h
+# on the same task_id. Five bridge-daemon.sh sites and thirteen
+# lib/bridge-cron.sh sites carried the same Bash 5.3.9 read_comsub /
+# heredoc_write trip surface; all were migrated to standalone helpers
+# under lib/daemon-helpers/ and lib/cron-helpers/. Smoke verifies the
+# heredoc-stdin count stays at zero, every helper parses, and every
+# call site routes through the $SCRIPT_DIR / $BRIDGE_SCRIPT_DIR anchor.
+log "running bridge-daemon-cron-no-deadlock smoke (refs queue task #4807)"
+bash "$REPO_ROOT/scripts/smoke/bridge-daemon-cron-no-deadlock.sh"
+
+# Issue #946 L2 + L4 — daemon tick-loop wedge defenses + PR #952 r2+r5+r6+r7
+# regressions. L2 pre-resolves heartbeat heredoc command substitutions with
+# a per-call deadline so a stuck helper (e.g. stale-worktree python3 path)
+# cannot hang the tick; r2 adds recursive descendant kill so a python3/tmux
+# grandchild does not survive the timeout; r4 uses bash monitor mode (set -m)
+# + negative-pid kill for sandbox resilience; r5 unconditional KILL after
+# grace; r7 scoped wrapper to wedge-prone helpers only. L4 runs the daemon
+# step's maintenance side-effects via --maintenance-only on
+# bridge_write_idle_ready_agents failure (root cause of operator-host
+# nudge-suppression 2026-05-17).
+log "running daemon-tick-guards-l2-l4 smoke (refs #946 L2+L4, PR #952)"
+bash "$REPO_ROOT/scripts/smoke/daemon-tick-guards-l2-l4.sh"
+
 # bridge-watchdog-silence.py previously truncated captured daemon
 # stop/start output to the last line, so every wedge from 2026-05-15
 # onward surfaced the same v0.8.0 ACL background sentence in the
 # silence-watchdog audit row. Issue #946 L3 preserves the full stderr
 # block and classifies the resolver die path (line 384 / 406 / 439).
-# This smoke step pins the classifier token map, the state-file
-# `resolver_die` + `stderr_preview` persistence, and the multi-line
-# survival contract so the next wedge is diagnosable in seconds rather
-# than hours.
 log "running watchdog-silence-stderr-capture smoke (#946 L3)"
 bash "$REPO_ROOT/scripts/smoke/watchdog-silence-stderr-capture.sh"
 

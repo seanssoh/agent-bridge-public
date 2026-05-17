@@ -270,6 +270,17 @@ if [[ "$DRY_RUN" == "0" ]]; then
     printf '[warn] deploy-live-install: critical-perm verification flagged issues (see above)\n' >&2
   fi
 
+  # PR #953 r4 (codex review): normalize traverse perms on lib helper dirs
+  # created under controller umask=077. Files inside are chmod'd by
+  # copy_tracked_file, but parent dirs created via mkdir -p stay 0700,
+  # blocking isolated-UID agents from invoking the helpers. Mirrors the
+  # post-apply chmod block in bridge-upgrade.sh.
+  for helper_dir in scripts/python-helpers lib/cron-helpers lib/daemon-helpers lib/upgrade-helpers lib/lint-helpers lib/agent-cli-helpers; do
+    if [[ -d "$TARGET_ROOT/$helper_dir" ]]; then
+      find "$TARGET_ROOT/$helper_dir" -type d -exec chmod a+rX {} + 2>/dev/null || true
+    fi
+  done
+
   python3 "$SOURCE_ROOT/bridge-upgrade.py" write-state \
     --source-root "$SOURCE_ROOT" \
     --target-root "$TARGET_ROOT" >/dev/null

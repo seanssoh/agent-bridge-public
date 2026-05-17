@@ -1584,9 +1584,24 @@ APPLY_JSON="$(python3 "$SOURCE_ROOT/bridge-upgrade.py" "${apply_args[@]}")"
 # `a+rX` is the idempotent form — uppercase X applies +x only to dirs
 # or already-executable files, so the chmod is safe to run repeatedly
 # on a clean tree. Skip when --dry-run because no files moved.
-if [[ $DRY_RUN -eq 0 && -d "$TARGET_ROOT/scripts" ]]; then
-  find "$TARGET_ROOT/scripts" -type d -exec chmod a+rX {} + 2>/dev/null || true
-fi
+#
+# PR #953 r3 (refs #4807, codex r2 P2 #2): queue task #4807 introduced
+# `lib/cron-helpers/` (13 helpers) and `lib/daemon-helpers/` (7
+# helpers). On a fresh upgrade `apply-live` creates these new directory
+# subtrees under the same controller umask=077, so the isolated agent
+# UID hits `[Errno 13] Permission denied` opening
+# `lib/cron-helpers/write-request.py` (cron dispatch) or
+# `lib/daemon-helpers/format-epoch-iso.py` (daemon backup). Extend the
+# normalize pass to walk every helper subtree under `lib/`. The
+# `lib/upgrade-helpers/` carry from v0.13.9 needs the same treatment
+# during a controller-umask upgrade, so include it too. Idempotent
+# (`a+rX` on already-0755 dirs is a no-op).
+for _helper_dir in scripts lib/cron-helpers lib/daemon-helpers lib/upgrade-helpers; do
+  if [[ $DRY_RUN -eq 0 && -d "$TARGET_ROOT/$_helper_dir" ]]; then
+    find "$TARGET_ROOT/$_helper_dir" -type d -exec chmod a+rX {} + 2>/dev/null || true
+  fi
+done
+unset _helper_dir
 
 # Issue #682 Finding 2: advance the `installed_version` / `installed_ref`
 # / `installed_head` metadata atomically with the live VERSION write.
