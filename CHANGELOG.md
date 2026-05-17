@@ -34,7 +34,7 @@ Operator-cued patch release rolling up the 2026-05-17/05-18 daemon-hang diagnosi
   - deletion drift (current_count < baseline_count fails with `--baseline-update` guidance, preventing stale capacity from masking later regressions)
   - whitespace tolerance for `<<  'PY'` (Bash-legal but easily-missed shape)
 - New CI step runs `scripts/smoke/lint-heredoc-scanner-self.sh` (Ubuntu, Bash 4+) which exercises the audit + baseline-check + a real-tree assertion that `STRIP_CASE_ARM_FIRES > 0` (proving the strip runs in production code, not just fixtures).
-- Initial baseline: C1=104, C2=54, C3=314, C4=0, H3=366, SAFE=593 (TOTAL=1441 sites). All existing sites accepted; future additions must justify entry into the baseline TSV via the metadata columns (owner + Phase tag).
+- Initial baseline: C1=104, C2=54, C3=314, C4=0, H3=366, SAFE=593 (TOTAL=1431 sites). All existing sites accepted; future additions must justify entry into the baseline TSV via the metadata columns (owner + Phase tag).
 - Phase 2-6 PR pipeline scope is annotated per-row in the baseline so the next migration waves can scope by `Phase N PR X`.
 - Zero runtime behavior change. Bash 3.2 fixture parse caveat documented inline (CI runs on Ubuntu under Bash 4+).
 
