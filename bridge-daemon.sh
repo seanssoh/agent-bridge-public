@@ -509,11 +509,18 @@ _bridge_heartbeat_value_with_timeout() {
     # 4891ms probe caught the leak. Escalate TERM → KILL like the queue
     # gateway stop helper. A 0.5s grace covers most python3 helpers; the
     # KILL is the hard cap so the parent can never wait indefinitely.
+    #
+    # PR #952 r5 P2 #1: the KILL stage is UNCONDITIONAL — do not gate it
+    # behind `kill -0 pid`. If the wrapper subshell honored SIGTERM and
+    # died, `kill -0 $pid` returns false, but a SIGTERM-ignoring
+    # grandchild (e.g. python3 with a handler, or a child that ran
+    # `trap '' TERM`) may still be alive in the same process group.
+    # Sending negative-pid SIGKILL is uncatchable and reaches every
+    # surviving member of the group; sending it after the wrapper is
+    # already dead is harmless (the kernel just reports ESRCH per pid).
     _bridge_kill_proc_tree "$pid" "TERM"
     sleep 0.5
-    if kill -0 "$pid" 2>/dev/null; then
-      _bridge_kill_proc_tree "$pid" "KILL"
-    fi
+    _bridge_kill_proc_tree "$pid" "KILL"
     wait "$pid" 2>/dev/null || true
     daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}' timed out at ${secs}s; substituting sentinel '${default}' (refs #946)"
     bridge_audit_log daemon daemon_heartbeat_helper_timeout daemon \

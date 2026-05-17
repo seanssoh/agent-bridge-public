@@ -397,7 +397,19 @@ step_r3_pgrep_failure_enumerates_via_ps() {
   # then call _bridge_enumerate_children with a stub pgrep on PATH that
   # exits 3. The child PID MUST appear in the enumeration output —
   # proving the ps fallback discovered it.
+  #
+  # PR #952 r5 P2 #2: this probe is meaningless when the real `ps -A`
+  # is ALSO denied (restricted macOS sandbox, some Codex sandbox envs,
+  # SELinux-locked containers). In that environment the r4 pgrp-kill
+  # path — exercised by step_r4_pgrp_kill_under_denied_proctable — is
+  # the load-bearing reap mechanism, and it does not depend on ps.
+  # Skip the ps-specific assertion rather than fail-by-environment.
   smoke_log "r3 step 1: _bridge_enumerate_children must use ps fallback when pgrep fails (exit ≥2)"
+
+  if ! ps -A -o pid=,ppid= >/dev/null 2>&1; then
+    smoke_log "  SKIP: real \`ps -A\` is denied in this environment; r4 pgrp-kill is the load-bearing path"
+    return 0
+  fi
 
   local broken_dir
   broken_dir="$(make_broken_pgrep_dir)"
