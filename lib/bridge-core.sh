@@ -137,9 +137,13 @@ bridge_resolve_script_dir_check() {
 
   # Re-resolution attempt: BASH_SOURCE may now point somewhere new if the
   # file is still discoverable through a sibling path. Cheap to try.
+  # NOTE: this file lives at lib/bridge-core.sh, so dirname BASH_SOURCE[0]
+  # points at <repo>/lib. The repo root (where scripts/python-helpers/ lives)
+  # is one level up — hence the "/.." suffix. Do NOT drop it without also
+  # moving this helper back to the repo root. (PR #951 r4 — codex P2)
   local resolved=""
   if [[ -n "${BASH_SOURCE[0]:-}" ]]; then
-    resolved="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P 2>/dev/null)" || resolved=""
+    resolved="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P 2>/dev/null)" || resolved=""
   fi
   if [[ -n "$resolved" && -d "$resolved/scripts/python-helpers" ]]; then
     BRIDGE_SCRIPT_DIR="$resolved"
