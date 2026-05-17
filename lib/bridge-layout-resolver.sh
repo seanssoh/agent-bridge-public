@@ -70,13 +70,14 @@ bridge_layout_resolver_has_existing_evidence() {
     fi
   fi
 
+  # File-only probe: empty auto-created subdirs (e.g. state/cron/workers/) must NOT trip evidence — same class as PR #897.
   if [[ -d "$state/runtime" ]]; then
-    if compgen -G "$state/runtime/*" >/dev/null 2>&1; then
+    if find "$state/runtime" -mindepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
       return 0
     fi
   fi
   if [[ -d "$state/cron" ]]; then
-    if compgen -G "$state/cron/*" >/dev/null 2>&1; then
+    if find "$state/cron" -mindepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
       return 0
     fi
   fi

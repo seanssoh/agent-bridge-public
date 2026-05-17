@@ -10822,4 +10822,7 @@ bash "$REPO_ROOT/scripts/smoke/worktree-doctor-reap-zombies.sh"
 log "running worktree-doctor-reap-zombies-dry-run integration smoke"
 bash "$REPO_ROOT/scripts/smoke/worktree-doctor-reap-zombies-dry-run.sh"
 
+log "running layout-evidence-empty-subdir smoke"
+bash "$REPO_ROOT/scripts/smoke/layout-evidence-empty-subdir.sh"
+
 log "smoke test passed"
