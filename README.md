@@ -454,7 +454,7 @@ agb --claude --name pr-fix --prefer shared   # primary checkout 강제 (reducer 
 - `--loop` 있음: 백그라운드에서 에이전트가 crash하거나 종료되면 **5초 내 자동 재시작**. 스태틱 에이전트와 동일한 영속 운영 모드. 장시간 작업하면서 세션이 끊겨도 자동 복구되어야 할 때.
 - `--loop` 없음: 주어진 작업만 하고 세션 종료. 일회성 작업에 적합.
 
-**--prefer 의 차이** (기본값은 매칭되는 정적 role 유무에 따라 reducer 가 자동 선택. TTY 면 prompt, non-TTY + 단일 후보면 `wake`, non-TTY + 다중/0 후보면 `shared`):
+**--prefer 의 차이** (기본값은 매칭되는 정적 role 유무에 따라 reducer 가 자동 선택. TTY 면 prompt, non-TTY 면 `shared` — `--name <new>` 가 동명 정적 role 을 silent 하게 깨우지 않도록 wake 는 명시적 `--prefer wake` opt-in 만 허용. 자세한 배경은 issue #4813):
 - `--prefer shared`: 현재 셸 cwd 그대로 사용. 가장 단순. primary checkout 을 강제하려면 명시.
 - `--prefer wake`: 같은 이름의 idle 세션이 있으면 깨워서 재사용. 새 세션 spawn 비용 절약.
 - `--prefer new`: 매 호출마다 새 git worktree 생성. shared repo 에서 병렬 fixer 운영 시 conflict 방지 (예: 멀티-PR review 동시 진행).

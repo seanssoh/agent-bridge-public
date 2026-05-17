@@ -11160,6 +11160,18 @@ bash "$REPO_ROOT/scripts/smoke/dynamic-agent-shared-mode-workdir.sh"
 log "running v2-scaffold-home-and-workdir smoke (issue #686)"
 bash "$REPO_ROOT/scripts/smoke/v2-scaffold-home-and-workdir.sh"
 
+# Task #4813 — `agent-bridge --claude --name <new-dynamic> --no-attach`
+# from a project that already hosts a static role (e.g. `patch`) was
+# silently redirecting to that static role in non-TTY mode. The
+# `STATIC_CANDIDATES > 0` branch in agent-bridge defaulted to
+# `SPAWN_PREFERENCE=wake` whenever there was exactly one candidate,
+# dropping the operator's explicit `--name` on the floor. The fix
+# changes the non-TTY default to `shared` so explicit names always
+# spawn a new dynamic worker. Operator-opt-in `--prefer wake|new` is
+# still honored, and the TTY interactive picker is unchanged.
+log "running dynamic-launch-no-admin-fallback smoke (task #4813)"
+bash "$REPO_ROOT/scripts/smoke/dynamic-launch-no-admin-fallback.sh"
+
 # Dynamic agents are operator-driven containers; long idle is normal
 # state, not a health signal. The dashboard previously flagged them
 # as warn/crit purely on idle threshold (Sean, 2026-05-16). Guard the
