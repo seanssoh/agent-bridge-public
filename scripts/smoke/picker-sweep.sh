@@ -556,4 +556,29 @@ smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "17 no bare-Enter send"
 smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "17 one option send"
 smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "alt-title-agent:option=1" "17 send option=1 (alternate title)"
 
+# ---------------------------------------------------------------------------
+# Test 18 — r8 hardening (codex PR #949 r7): an UNRELATED WARNING picker
+# that happens to include "2. Yes, I accept" as one of its options must
+# NOT fire the bypass branch. r7 captured the warning block but the
+# branch keyed on the generic accept line alone. r8 requires the
+# bypass-specific "Bypass Permissions mode" discriminator text.
+# ---------------------------------------------------------------------------
+
+smoke_log "18. unrelated WARNING with 'Yes, I accept' option → must NOT fire bypass (r8)"
+reset_fixture
+printf '%s\n' "unrelated-accept-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-unrelated-accept-agent" <<'PANE'
+  WARNING: Some other Claude policy notice requires acknowledgement.
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+    3. Defer the choice
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "18 no bare-Enter send"
+smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "18 no option send (unrelated WARNING ≠ bypass-permissions discriminator)"
+
 smoke_log "all checks passed"

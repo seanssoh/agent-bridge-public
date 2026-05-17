@@ -311,17 +311,27 @@ while IFS= read -r agent; do
       }
     ')"
 
+    # r8 (codex PR #949 r7) — require the active picker to contain the
+    # bypass-specific or auto-mode-specific discriminator text in addition
+    # to the accept-option line. Without this, a different WARNING: picker
+    # that happens to include "2. Yes, I accept" in its options would fire
+    # the bypass branch and send a safety-sensitive 2 into an unrelated
+    # menu. Discriminators:
+    #   bypass: "Bypass Permissions mode"
+    #   auto:   "Auto mode" | "auto mode" | "Enable auto mode"
     if [[ -n "$active_picker" ]] \
+        && printf '%s\n' "$active_picker" | grep -q "Bypass Permissions mode" \
         && printf '%s\n' "$active_picker" | grep -qE "$_PICKER_BYPASS_PERMISSIONS_ACCEPT_RE"; then
         # Bypass Permissions warning (#948). Default cursor is "No, exit",
-        # so we must EXPLICITLY send "2" to accept. Both the distinctive
-        # accept line ("2. Yes, I accept") AND the canonical tail are
-        # required — r3 hardening (codex PR #949 r2) ensures we don't
-        # false-positive on any other Claude warning that happens to
-        # include "No, exit".
+        # so we must EXPLICITLY send "2" to accept. r8 requires BOTH the
+        # canonical "Bypass Permissions mode" discriminator text AND the
+        # accept-option line. r3 hardening (codex PR #949 r2) ensures we
+        # don't false-positive on warnings that share "No, exit". r5/r6
+        # active_picker extraction excludes stale text.
         matched_pattern="bypass-permissions warning"
         explicit_option="2"
     elif [[ -n "$active_picker" ]] \
+        && printf '%s\n' "$active_picker" | grep -qE "(Auto mode|auto mode|Enable auto mode)" \
         && printf '%s\n' "$active_picker" | grep -qE "$_PICKER_AUTO_MODE_ACCEPT_RE"; then
         # Auto mode warning (#948). Send "1" so the mode becomes the user
         # default — next claude restart won't re-prompt. Same r3 hardening
