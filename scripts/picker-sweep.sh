@@ -290,14 +290,18 @@ while IFS= read -r agent; do
                 _psw_log "  send-option failed for $agent"
                 continue
             fi
+            # #948 r2 — record the actual action so the admin task body below
+            # reports the safety-sensitive explicit option, not the default
+            # "Enter". Codex PR #949 review caught the misreport.
+            unstuck_agents+=("$agent:$matched_pattern (sent option $explicit_option)")
         else
             _psw_log "PICKER detected on '$agent' ($matched_pattern) — sending Enter for default"
             if ! _psw_send_enter "$agent"; then
                 _psw_log "  send-enter failed for $agent"
                 continue
             fi
+            unstuck_agents+=("$agent:$matched_pattern (sent Enter)")
         fi
-        unstuck_agents+=("$agent:$matched_pattern")
     fi
 done < <(_psw_list_sessions)
 
@@ -314,22 +318,35 @@ if [[ -z "$NOTIFY_AGENT" ]]; then
     exit 0
 fi
 
-task_body=$(cat <<EOF
-Claude Code interactive picker auto-unstick result:
+# #948 r2 — admin task body. Rewritten to use a plain multi-line string
+# assignment (no heredoc-inside-command-substitution) so the parse path
+# stays robust across the Bash 5.3.9 + macOS shell harness contexts where
+# `$(cat <<EOF ... EOF)` with longer bodies tripped a parser edge case
+# (unexpected EOF while looking for matching backtick-paren). Backslash-
+# escaped quotes keep the body readable while staying within standard
+# double-quoted string rules.
+task_body="Claude Code interactive picker auto-unstick result:
 
 $joined
 
-Each session was advanced via the default option (Enter). The default for
-rate-limit pickers is "Stop and wait for limit to reset" (safest); the default
-for resume-from-summary is "Resume from summary (recommended)".
+Each entry shows the agent, picker pattern, and the actual action taken
+(\"sent Enter\" for default-option pickers, \"sent option N\" for explicit
+picks). The explicit-option path is used for safety-sensitive prompts
+(e.g., Bypass Permissions warning, Auto mode warning - refs #948) where the
+default cursor would EXIT Claude rather than accept; sweeper sends the
+documented \"accept\" option (option 2 for Bypass Permissions, option 1 for
+Auto mode \"make default\").
+
+For default-Enter pickers: rate-limit pickers default to \"Stop and wait
+for limit to reset\" (safest); resume-from-summary defaults to
+\"Resume from summary (recommended)\".
 
 This cron is best-effort. If the same agent shows up across multiple sweeps,
-investigate manually — repeated picker hits usually indicate a deeper
-plan-level issue (rate limit window saturated, broken summary, etc).
+investigate manually - repeated picker hits usually indicate a deeper
+plan-level issue (rate limit window saturated, broken summary, etc.) or
+that the explicit-option ack did not persist across claude restarts.
 
-log: $LOG
-EOF
-)
+log: $LOG"
 
 if ! _psw_create_task \
         "[picker-sweep] ${#unstuck_agents[@]} agent(s) auto-unstuck from interactive picker" \
