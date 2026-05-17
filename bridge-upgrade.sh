@@ -1375,21 +1375,30 @@ if [[ "$SUBCOMMAND" == "rollback" ]]; then
     bridge_upgrade_capture_to_var ROLLBACK_AGENT_RESTART_JSON \
       bridge_upgrade_agent_restart_json "$ROLLBACK_AGENT_RESTART_REPORT" 1 "$DRY_RUN"
   fi
+  # Linux ARG_MAX: ROLLBACK_JSON / ROLLBACK_AGENT_RESTART_JSON may grow with
+  # restart reports; spool to tempfiles instead of passing via argv.
+  _rollback_payload_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-rollback-json.XXXXXX")"
+  printf '%s' "$ROLLBACK_JSON" >"$_rollback_payload_dir/rollback.json"
+  printf '%s' "$ROLLBACK_AGENT_RESTART_JSON" >"$_rollback_payload_dir/agent-restart.json"
   if [[ $JSON -eq 1 ]]; then
-    python3 - "$ROLLBACK_JSON" "$ROLLBACK_AGENT_RESTART_JSON" "$RESTART_DAEMON" "$RESTART_AGENTS" <<'PY'
+    python3 - "$_rollback_payload_dir/rollback.json" "$_rollback_payload_dir/agent-restart.json" "$RESTART_DAEMON" "$RESTART_AGENTS" <<'PY'
 import json
 import sys
 
-payload = json.loads(sys.argv[1])
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
+with open(sys.argv[2], encoding="utf-8") as fh:
+    agent_restart = json.load(fh)
 payload["restart_daemon"] = sys.argv[3] == "1"
 payload["restart_agents"] = sys.argv[4] == "1"
-payload["agent_restart"] = json.loads(sys.argv[2])
+payload["agent_restart"] = agent_restart
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY
   else
-    python3 - "$ROLLBACK_JSON" <<'PY'
+    python3 - "$_rollback_payload_dir/rollback.json" <<'PY'
 import json, sys
-payload = json.loads(sys.argv[1])
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
 print("== Agent Bridge rollback ==")
 print(f"target_root: {payload.get('target_root')}")
 print(f"backup_root: {payload.get('backup_root')}")
@@ -1398,6 +1407,7 @@ print(f"removed_entries: {payload.get('removed_entries', 0)}")
 PY
     bridge_upgrade_print_agent_restart_summary "$ROLLBACK_AGENT_RESTART_JSON"
   fi
+  rm -rf "$_rollback_payload_dir"
   exit 0
 fi
 
@@ -1620,7 +1630,11 @@ if [[ $DRY_RUN -eq 0 ]]; then
     echo "[bridge-upgrade] WARN: shared Claude settings rerender reported failures" >&2
     _upgrade_partial_failures+=("shared_rerender")
   fi
-  if ! python3 - "$SHARED_SETTINGS_RERENDER_JSON" <<'PY'
+  # Linux ARG_MAX: SHARED_SETTINGS_RERENDER_JSON grows with agent count;
+  # spool to tempfile instead of argv.
+  _shared_rerender_verify_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-shared-rerender-verify-json.XXXXXX")"
+  printf '%s' "$SHARED_SETTINGS_RERENDER_JSON" >"$_shared_rerender_verify_dir/payload.json"
+  if ! python3 - "$_shared_rerender_verify_dir/payload.json" <<'PY'
 import json
 import sys
 # Issue #731: empty/non-JSON payload happens when an isolated agent's
@@ -1628,7 +1642,8 @@ import sys
 # and the rerender helper hands back nothing for that agent. Treat it as
 # a non-fatal skip with a named diagnostic instead of dumping a raw
 # JSONDecodeError traceback into the upgrade log.
-raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+with open(sys.argv[1], encoding="utf-8") as fh:
+    raw = fh.read().strip()
 if not raw:
     print("[bridge-upgrade] WARN: shared-settings rerender returned empty payload (likely isolated agent canonical_dir failure — see #731)", file=sys.stderr)
     sys.exit(0)
@@ -1644,6 +1659,7 @@ PY
     echo "[bridge-upgrade] WARN: shared Claude settings rerender verification failed for one or more agents" >&2
     _upgrade_partial_failures+=("shared_rerender")
   fi
+  rm -rf "$_shared_rerender_verify_dir"
 fi
 
 # v0.7.0 → v0.7.1 transition cleanup. Idempotent best-effort removal of
@@ -1667,9 +1683,14 @@ if [[ $DRY_RUN -eq 0 ]]; then
   _relay_cleanup_preview_rc=$?
   set -e
   if [[ $_relay_cleanup_preview_rc -eq 0 && -n "$RELAY_CLEANUP_PREVIEW_JSON" ]]; then
-    if python3 - "$RELAY_CLEANUP_PREVIEW_JSON" <<'PY' >/dev/null 2>&1
+    # Linux ARG_MAX: spool preview payload to tempfile.
+    _relay_cleanup_preview_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-relay-cleanup-preview-json.XXXXXX")"
+    printf '%s' "$RELAY_CLEANUP_PREVIEW_JSON" >"$_relay_cleanup_preview_dir/payload.json"
+    if python3 - "$_relay_cleanup_preview_dir/payload.json" <<'PY' >/dev/null 2>&1
 import json, sys
-raise SystemExit(0 if json.loads(sys.argv[1]).get("any_changes") else 1)
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
+raise SystemExit(0 if payload.get("any_changes") else 1)
 PY
     then
       if [[ -n "$BACKUP_ROOT" ]]; then
@@ -1700,6 +1721,7 @@ PY
           --detail summary="$RELAY_CLEANUP_JSON" >/dev/null 2>&1 || true
       fi
     fi
+    rm -rf "$_relay_cleanup_preview_dir"
   elif [[ $_relay_cleanup_preview_rc -ne 0 ]]; then
     echo "[bridge-upgrade] WARN: telegram-relay residue cleanup preview exited non-zero ($_relay_cleanup_preview_rc); skipping cleanup, manual procedure may be required (see docs/proposals/v0.7.0-install-cleanup-verification-prompt.md)" >&2
   fi
@@ -1858,9 +1880,14 @@ print(sum(len(a.get("failed", []) or []) for a in agents))
     echo "[bridge-upgrade] WARN: profile relink reported failed_count=${_profile_relink_failed_count} — see embedded JSON for per-agent details" >&2
     _upgrade_partial_failures+=("profile_relink")
   fi
-  python3 - "$RELINK_PROFILE_JSON" <<'PY' || true
+  # Linux ARG_MAX: RELINK_PROFILE_JSON grows with per-agent symlink lists;
+  # spool to tempfile instead of argv.
+  _relink_profile_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-relink-profile-json.XXXXXX")"
+  printf '%s' "$RELINK_PROFILE_JSON" >"$_relink_profile_dir/payload.json"
+  python3 - "$_relink_profile_dir/payload.json" <<'PY' || true
 import json, sys
-raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+with open(sys.argv[1], encoding="utf-8") as fh:
+    raw = fh.read().strip()
 if not raw or not raw.startswith("{"):
     print(
         "[bridge-upgrade] WARN: relink-profile-paths returned non-JSON; "
@@ -1887,6 +1914,7 @@ print(
     file=sys.stderr,
 )
 PY
+  rm -rf "$_relink_profile_dir"
 fi
 
 if [[ $RESTART_DAEMON -eq 1 && $DRY_RUN -eq 0 ]]; then
@@ -2330,6 +2358,9 @@ echo "restart_agents: $([[ $RESTART_AGENTS -eq 1 ]] && printf yes || printf no)"
 _status_print_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-status-json.XXXXXX")"
 printf '%s' "$ANALYSIS_JSON" >"$_status_print_dir/analysis.json"
 printf '%s' "$SOURCE_RECLASSIFY_JSON" >"$_status_print_dir/source-reclassify.json"
+printf '%s' "$SHARED_SETTINGS_RERENDER_JSON" >"$_status_print_dir/shared-settings-rerender.json"
+printf '%s' "$APPLY_JSON" >"$_status_print_dir/apply.json"
+printf '%s' "$RECONCILE_JSON" >"$_status_print_dir/reconcile.json"
 if [[ $BACKUP -eq 1 ]]; then
   echo "backup_root: $BACKUP_ROOT"
   printf '%s' "$BACKUP_JSON" >"$_status_print_dir/backup.json"
@@ -2363,13 +2394,13 @@ print(f"source_reclassify: {count} candidate(s) ({mode})")
 for item in payload.get("candidates") or []:
     print(f"  - {item.get('action')}: {item.get('agent')} old_source={item.get('old_source')} new_source={item.get('new_source')} reason={item.get('reason')}")
 PY
-rm -rf "$_status_print_dir"
-python3 - "$SHARED_SETTINGS_RERENDER_JSON" <<'PY'
+python3 - "$_status_print_dir/shared-settings-rerender.json" <<'PY'
 import json, sys
 # Issue #731: same defensive guard as the verification heredoc above —
 # empty/non-JSON SHARED_SETTINGS_RERENDER_JSON should not raise a raw
 # traceback in the post-upgrade summary, just emit a named WARN.
-raw = (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+with open(sys.argv[1], encoding="utf-8") as fh:
+    raw = fh.read().strip()
 if not raw:
     print("[bridge-upgrade] WARN: shared-settings rerender returned empty payload (likely isolated agent canonical_dir failure — see #731)", file=sys.stderr)
     sys.exit(0)
@@ -2390,10 +2421,12 @@ for item in payload.get("candidates") or []:
     change_keys = ",".join(str(change.get("key")) for change in changes) or "-"
     print(f"  - {status}: {agent} changes={change_keys}")
 PY
-python3 - "$APPLY_JSON" "$RECONCILE_JSON" "$UPGRADE_RUN_ID" <<'PY'
+python3 - "$_status_print_dir/apply.json" "$_status_print_dir/reconcile.json" "$UPGRADE_RUN_ID" <<'PY'
 import json, sys
-payload = json.loads(sys.argv[1])
-reconcile = json.loads(sys.argv[2])
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
+with open(sys.argv[2], encoding="utf-8") as fh:
+    reconcile = json.load(fh)
 run_id = sys.argv[3]
 counts = payload.get("counts", {})
 print(f"files_copied: {counts.get('files_copied', 0)}")
@@ -2422,11 +2455,14 @@ print(
 )
 PY
 if [[ $MIGRATE_AGENTS -eq 1 ]]; then
-  python3 - "$MIGRATION_JSON" <<'PY'
+  printf '%s' "$MIGRATION_JSON" >"$_status_print_dir/migration.json"
+  python3 - "$_status_print_dir/migration.json" <<'PY'
 import json, sys
-payload = json.loads(sys.argv[1])
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
 print(f"agents_migrated: {payload.get('agents_with_additions', 0)}")
 print(f"migrated_files: {payload.get('added_files', 0)}")
 PY
 fi
+rm -rf "$_status_print_dir"
 bridge_upgrade_print_agent_restart_summary "$AGENT_RESTART_JSON"
