@@ -100,6 +100,12 @@ bash bridge-task.sh create --to tester --title "t" --body "b"
 bash ./scripts/oss-preflight.sh
 ```
 
+## Releases require explicit operator permission
+
+**Never cut a version release (VERSION bump + CHANGELOG entry + release/vX.Y.Z PR + tag) without the operator's explicit go**, even if you have broad autonomy on the work that would go into it. "Handle items 1-N autonomously" or "you decide" or similar standing autonomy does NOT include the release ship itself. Operator's standing directive (2026-05-17): batch fixes accumulate freely; the operator cues the release.
+
+Acceptable: prep VERSION + CHANGELOG drafts, run codex-rescue review on a release branch, leave the PR open for operator to merge. NOT acceptable: squash-merge the release PR or push the `vX.Y.Z` tag without an explicit "go release" or equivalent from the operator.
+
 ## Environment Variables Worth Knowing
 
 - `BRIDGE_HOME` — override live runtime root; essential for isolated tests.
