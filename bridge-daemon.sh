@@ -553,18 +553,6 @@ _bridge_heartbeat_value_with_timeout() {
   return 0
 }
 
-# Tiny shim that converts bridge_agent_is_always_on's exit code into the
-# yes/no token the heartbeat report expects. Exists so the bounded helper
-# above can capture the answer via stdout (its only channel) rather than
-# the function's return code (which is lost across the subshell boundary).
-_bridge_heartbeat_always_on_yesno() {
-  if bridge_agent_is_always_on "$1"; then
-    printf '%s' "yes"
-  else
-    printf '%s' "no"
-  fi
-}
-
 write_agent_heartbeat() {
   local agent="$1"
   local heartbeat_file=""
@@ -617,26 +605,39 @@ write_agent_heartbeat() {
     IFS=$'\t' read -r _agent queued claimed blocked _active idle last_seen last_nudge _session _engine _workdir <<<"$summary"
   fi
 
-  # Pre-resolve every heredoc command-substitution with a per-call ceiling.
-  # bridge_now_iso is local-only (date(1)) — 2s ceiling is generous.
+  # Pre-resolve heredoc command-substitutions. PR #952 r7 perf scope:
+  # only the wedge-prone sites (those that fork python3 / tmux / external
+  # subprocesses) go through _bridge_heartbeat_value_with_timeout. The
+  # cheap pure-bash helpers (assoc-array getters, numeric compares) are
+  # called directly — wrapping them costs at minimum one `sleep 0.1` poll
+  # tick per call (the helper backgrounds the fn into a subshell and polls
+  # `kill -0` at 100 ms cadence before reaping). Codex r6 P2: a healthy
+  # tick paid ~0.5 s of mandatory latency for the four cheap callers on
+  # every static agent. Direct invocation restores the pre-r1 fast path.
+  #
+  # Wrap retained on: now_iso (forks python3 in bridge_now_iso),
+  # wake_status (calls bridge_tmux_* probes), channel_status (transitively
+  # forks python3 to extract-dev-channels-from-command for the operator
+  # wedge surface from #946).
+  #
+  # Wrap removed on: desc / engine / source / always_on_check /
+  # notify_status. All five are pure bash — assoc-array lookups, numeric
+  # compares, and string tests with no fork. They cannot wedge on a stale
+  # BRIDGE_SCRIPT_DIR (no helper file to read) and cannot hang on a tmux
+  # probe (no tmux call), so the timeout wrapper provides no protection.
   hb_now="$(_bridge_heartbeat_value_with_timeout 2 now_iso "$agent" "?" bridge_now_iso)"
-  hb_desc="$(_bridge_heartbeat_value_with_timeout 2 desc "$agent" "-" bridge_agent_desc "$agent")"
-  hb_engine="$(_bridge_heartbeat_value_with_timeout 2 engine "$agent" "-" bridge_agent_engine "$agent")"
-  hb_source="$(_bridge_heartbeat_value_with_timeout 2 source "$agent" "-" bridge_agent_source "$agent")"
-  # bridge_agent_is_always_on returns 0/1 (no stdout); the original heredoc
-  # used `&& printf yes || printf no`. Use the small inline shim
-  # _bridge_heartbeat_always_on_yesno (defined above) to convert the
-  # return code into stdout we can capture through the bounded helper.
-  # The helper already forks the call into a subshell (`( "$@" )`) which
-  # inherits all daemon functions so the shim resolves naturally.
-  hb_always_on="$(_bridge_heartbeat_value_with_timeout 2 always_on_check "$agent" "no" \
-      _bridge_heartbeat_always_on_yesno "$agent")"
-  # bridge_agent_wake_status / notify_status / channel_status are the
-  # operator-visible heavy hitters from #946 — channel_status transitively
-  # forks python3 to lib/bridge-agents.sh extract-dev-channels-from-command.py
-  # which is exactly what wedged on stale worktree paths. 10s ceiling.
+  hb_desc="$(bridge_agent_desc "$agent")"
+  hb_engine="$(bridge_agent_engine "$agent")"
+  hb_source="$(bridge_agent_source "$agent")"
+  # bridge_agent_is_always_on returns 0/1 (no stdout). Convert inline so
+  # the heredoc can interpolate a token; pure-bash so no wrap needed.
+  if bridge_agent_is_always_on "$agent"; then
+    hb_always_on="yes"
+  else
+    hb_always_on="no"
+  fi
   hb_wake_status="$(_bridge_heartbeat_value_with_timeout 5 wake_status "$agent" "?" bridge_agent_wake_status "$agent")"
-  hb_notify_status="$(_bridge_heartbeat_value_with_timeout 5 notify_status "$agent" "?" bridge_agent_notify_status "$agent")"
+  hb_notify_status="$(bridge_agent_notify_status "$agent")"
   hb_channel_status="$(_bridge_heartbeat_value_with_timeout 10 channel_status "$agent" "?" bridge_agent_channel_status "$agent")"
 
   temp_file="$(mktemp)"
