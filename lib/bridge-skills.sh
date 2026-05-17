@@ -465,6 +465,12 @@ bridge_sync_skill_docs() {
 
   [[ -f "$BRIDGE_SCRIPT_DIR/bridge-docs.py" ]] || return 0
   bridge_require_python
+  # #946 L1 (r2): stale-source guard. The `-f` check above already
+  # catches the file-missing case, but the centralized helper emits
+  # the audit log entry the operator needs to diagnose the cascade.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   skills_json="$(bridge_agent_skills_registry_json)"
   workdir_json="$(bridge_agent_workdir_registry_json)"
   BRIDGE_AGENT_SKILLS_JSON="$skills_json" \

@@ -362,11 +362,19 @@ bridge_queue_gateway_transport() {
 
 bridge_queue_gateway_runtime_verify() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-queue-gateway.py" verify-runtime --bridge-home "$BRIDGE_HOME"
 }
 
 bridge_queue_gateway_runtime_ensure() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-queue-gateway.py" ensure-runtime --bridge-home "$BRIDGE_HOME" "$@"
 }
 
@@ -479,6 +487,11 @@ bridge_queue_gateway_proxy_agent() {
 
 bridge_queue_cli_direct() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard. Called from many `$(...)`
+  # substitutions across the queue path.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-queue.py" "$@"
 }
 
@@ -501,6 +514,14 @@ PY
 # which used to pay one python3 cold-start per agent). Refs #848.
 bridge_sha1_batch() {
   bridge_require_python
+  # #946 L1 (r2 codex P1 #1 — explicitly cited): `bridge_load_roster` uses
+  # this after every cache invalidation. r1 left this path unguarded, so
+  # the stale-source #946 cascade reproduced on every roster reload. The
+  # `_check` form is required (not `_or_die`) because callers typically
+  # wrap this in `$( ... | bridge_sha1_batch )` for batched hashing.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/sha1-batch.py"
 }
 
@@ -586,6 +607,11 @@ bridge_queue_cli() {
 
   if agent="$(bridge_queue_gateway_proxy_agent 2>/dev/null)"; then
     bridge_require_python
+    # #946 L1 (r2): stale-source guard. bridge_queue_cli is the
+    # universal queue path — frequently called from `$(...)`.
+    if ! bridge_resolve_script_dir_check; then
+      return 1
+    fi
     transport="$(bridge_queue_gateway_transport)"
     if [[ "$transport" == "socket" ]]; then
       python3 "$BRIDGE_SCRIPT_DIR/bridge-queue-gateway.py" socket-client \

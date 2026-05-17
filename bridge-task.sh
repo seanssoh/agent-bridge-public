@@ -417,6 +417,15 @@ cmd_create() {
       fi
       local companion_result=""
       local companion_rc=0
+      # #946 L1 (r2): stale-source guard before the substitution. If the
+      # source checkout vanished mid-shell, fail-empty here rather than
+      # forking python3 against a bogus path inside `$(...)` (the
+      # substitution would swallow the error and companion_rc would stay
+      # 0). The check helper writes one audit line to BRIDGE_DAEMON_LOG
+      # so the failure remains visible.
+      if ! bridge_resolve_script_dir_check; then
+        bridge_die "BRIDGE_SCRIPT_DIR validation failed; see daemon log"
+      fi
       companion_result="$(python3 "$BRIDGE_SCRIPT_DIR/bridge-queue.py" \
         validate-companion-body "${companion_args[@]}" </dev/null 2>/dev/null)" || companion_rc=$?
       if [[ "$companion_rc" -eq 2 ]]; then

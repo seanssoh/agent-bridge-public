@@ -37,16 +37,28 @@ bridge_require_cron_source_jobs() {
 
 bridge_cron_python() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-cron.py" "$@"
 }
 
 bridge_cron_runner_python() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-cron-runner.py" "$@"
 }
 
 bridge_cron_scheduler_python() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-cron-scheduler.py" "$@"
 }
 

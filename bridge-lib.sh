@@ -409,13 +409,114 @@ bridge_source_module "bridge-agent-update.sh"
 # `brew prune` on a Homebrew-installed source dir). The startup validation
 # above only fires when bridge-lib.sh is first sourced; callers that fork
 # repeatedly into python-helpers from a running daemon need to re-check
-# before each invocation. The helper attempts a cheap re-resolution via
+# before each invocation. The helpers attempt a cheap re-resolution via
 # BASH_SOURCE before giving up so a temporary symlink swap or a
-# mount-point flip can recover, then dies with a clear message if the
-# directory is truly gone — daemon dies fast, launchd restarts, operator
-# sees the root cause instead of a 6-hour silent hang on [Errno 2].
-bridge_resolve_script_dir_or_die() {
+# mount-point flip can recover.
+#
+# r2 (codex P1 #2): the original `_or_die` form was unsafe inside command
+# substitutions. When a caller wraps `bridge_extract_development_channels_
+# from_command` (and similar) in `$(...)`, `bridge_die` exits only the
+# substitution subshell — the parent receives an empty value and a
+# non-zero substitution exit status. Under `set -e` the parent dies; under
+# `... || true` the parent silently continues with the empty value and the
+# daemon-hang cascade #946 reproduces unchanged. The fix splits the helper:
+#
+#   bridge_resolve_script_dir_check  — returns 0/1 + writes one
+#       de-duplicated audit line to BRIDGE_DAEMON_LOG (or stderr fallback).
+#       Safe inside `$()`: the audit goes to a FILE, not the captured
+#       stdout, so substitution swallow cannot hide the signal.
+#   bridge_resolve_script_dir_or_die — thin wrapper for callers OUTSIDE
+#       substitution context (startup paths, daemon tick health check).
+#
+# Wrapper helpers in lib/bridge-*.sh that invoke `python3
+# "$BRIDGE_SCRIPT_DIR/..."` use `bridge_resolve_script_dir_check || return 1`
+# so a stale source checkout fails-empty + audit-logs whether or not the
+# caller's context suppresses errexit.
+
+# Suppress repeat audit logs. We CANNOT use a shell variable for dedup —
+# the check helper is invoked from inside `$(...)` substitutions, and any
+# assignment in a subshell does not survive to the parent. Use a sentinel
+# file under BRIDGE_STATE_DIR keyed on the failed path so even subshell
+# calls coordinate; the dedup window is per-process (PID + dir-hash) so a
+# daemon restart logs again. Also export an in-process flag so the same
+# shell only pays the stat/write cost once per dedup window.
+_BRIDGE_SCRIPT_DIR_AUDIT_LOGGED=0
+export _BRIDGE_SCRIPT_DIR_AUDIT_LOGGED
+
+bridge_resolve_script_dir_sentinel_path() {
+  local target="${1:-${BRIDGE_SCRIPT_DIR:-unset}}"
+  local hash=""
+  # Avoid forking python3 for the hash — we may be here BECAUSE python3
+  # cannot run. Bash-native: a short tag derived from PID + path length +
+  # first/last bytes is enough to differentiate "same failed dir" from
+  # "different failed dir within the same process".
+  hash="${$}-${#target}-${target:0:8}-${target: -8}"
+  hash="${hash//\//_}"
+  printf '%s/script-dir-audit-%s' "${BRIDGE_STATE_DIR:-/tmp}" "$hash"
+}
+
+bridge_resolve_script_dir_audit() {
+  local reason="$1"
+  local log_line=""
+  local timestamp
+  timestamp="$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || printf 'unknown-ts')"
+  log_line="[$timestamp] [error] [L1] BRIDGE_SCRIPT_DIR=${BRIDGE_SCRIPT_DIR:-<unset>} $reason (source checkout moved or deleted mid-flight?)"
+
+  # In-process fast path: this shell already logged.
+  if (( _BRIDGE_SCRIPT_DIR_AUDIT_LOGGED == 1 )); then
+    return 0
+  fi
+
+  # Cross-subshell dedup: a sentinel file exists if the parent (or a
+  # sibling subshell) already logged for this PID + failed path. The
+  # sentinel includes PID so a daemon restart starts clean.
+  local sentinel
+  sentinel="$(bridge_resolve_script_dir_sentinel_path)"
+  if [[ -f "$sentinel" ]]; then
+    _BRIDGE_SCRIPT_DIR_AUDIT_LOGGED=1
+    return 0
+  fi
+
+  # Prefer the daemon log (visible to operator via `agb status` /
+  # `tail BRIDGE_DAEMON_LOG`). Fall back to stderr if the log path is
+  # unset (early-startup contexts before bridge-lib.sh finishes init)
+  # or unwritable. Either sink is OUTSIDE any `$(...)` substitution
+  # the caller may be running in, so the substitution swallow does
+  # not hide the signal.
+  local logged=0
+  if [[ -n "${BRIDGE_DAEMON_LOG:-}" ]]; then
+    local log_dir
+    log_dir="$(dirname -- "$BRIDGE_DAEMON_LOG" 2>/dev/null || printf '')"
+    if [[ -n "$log_dir" ]] && mkdir -p "$log_dir" 2>/dev/null; then
+      if printf '%s\n' "$log_line" >>"$BRIDGE_DAEMON_LOG" 2>/dev/null; then
+        logged=1
+      fi
+    fi
+  fi
+  if (( logged == 0 )); then
+    printf '%s\n' "$log_line" >&2
+  fi
+
+  # Touch the cross-subshell sentinel. Best-effort: if BRIDGE_STATE_DIR
+  # itself is unwritable we accept a small amount of log spam over
+  # losing the signal entirely.
+  local sentinel_dir
+  sentinel_dir="$(dirname -- "$sentinel" 2>/dev/null || printf '')"
+  if [[ -n "$sentinel_dir" ]]; then
+    mkdir -p "$sentinel_dir" 2>/dev/null || true
+    : >"$sentinel" 2>/dev/null || true
+  fi
+  _BRIDGE_SCRIPT_DIR_AUDIT_LOGGED=1
+}
+
+bridge_resolve_script_dir_check() {
   if [[ -n "${BRIDGE_SCRIPT_DIR:-}" && -d "$BRIDGE_SCRIPT_DIR/scripts/python-helpers" ]]; then
+    # Recovered (or never broken). Clear the cross-subshell sentinel so
+    # a later failure logs once again, and reset the in-process flag.
+    local sentinel
+    sentinel="$(bridge_resolve_script_dir_sentinel_path)"
+    rm -f "$sentinel" 2>/dev/null || true
+    _BRIDGE_SCRIPT_DIR_AUDIT_LOGGED=0
     return 0
   fi
 
@@ -428,8 +529,22 @@ bridge_resolve_script_dir_or_die() {
   if [[ -n "$resolved" && -d "$resolved/scripts/python-helpers" ]]; then
     BRIDGE_SCRIPT_DIR="$resolved"
     export BRIDGE_SCRIPT_DIR
+    local sentinel
+    sentinel="$(bridge_resolve_script_dir_sentinel_path)"
+    rm -f "$sentinel" 2>/dev/null || true
+    _BRIDGE_SCRIPT_DIR_AUDIT_LOGGED=0
     return 0
   fi
 
+  local reason="does not exist or is missing scripts/python-helpers/"
+  if [[ -z "${BRIDGE_SCRIPT_DIR:-}" ]]; then
+    reason="unresolved"
+  fi
+  bridge_resolve_script_dir_audit "$reason"
+  return 1
+}
+
+bridge_resolve_script_dir_or_die() {
+  bridge_resolve_script_dir_check && return 0
   bridge_die "BRIDGE_SCRIPT_DIR=${BRIDGE_SCRIPT_DIR:-<unset>} does not exist or is missing scripts/python-helpers/ (source checkout moved or deleted mid-flight?)"
 }

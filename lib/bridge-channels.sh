@@ -3,6 +3,14 @@
 
 bridge_channels_python() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard. Channels helper is reached from
+  # many `$(...)` substitutions (precompact route resolution, render,
+  # send, webhook status). Without the guard a stale checkout fans out
+  # the same [Errno 2] cascade as the daemon-hang on every channel
+  # op tick.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" "$@"
 }
 

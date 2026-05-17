@@ -266,6 +266,12 @@ bridge_codex_launch_with_hooks() {
   local original="$1"
 
   bridge_require_python
+  # #946 L1 (r2): substitution-safe stale-source guard. This wrapper is
+  # reached from inside `$(bridge_build_*_launch_cmd ...)` substitutions
+  # in the daemon nudge/precompact paths.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-codex-hooks.py" \
     "$original"
 }
@@ -284,11 +290,16 @@ bridge_claude_launch_with_channels() {
   fi
 
   bridge_require_python
-  # #946 L1: re-validate BRIDGE_SCRIPT_DIR + cap the python3 subprocess at
-  # 15s. The daemon forks this on every launch-cmd rebuild path; an
-  # unguarded call fans out [Errno 2] on stale-source-checkout and a hung
-  # child can wedge the tick loop.
-  bridge_resolve_script_dir_or_die
+  # #946 L1 (r2 codex P1 #2): substitution-safe check (see
+  # bridge_extract_development_channels_from_command in lib/bridge-agents.sh
+  # for the full rationale). Daemon forks this on every launch-cmd
+  # rebuild path; unguarded fans out [Errno 2] when the source checkout
+  # vanishes mid-flight, and a hung child can wedge the tick. We use
+  # `_check` (not `_or_die`) because `bridge_build_safe_claude_launch_cmd`
+  # and other indirect callers may invoke this from inside `$(...)`.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   bridge_with_timeout 15 launch_cmd_claude_channels \
     python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-claude-channels.py" \
     "$original" "$required"
@@ -306,6 +317,12 @@ bridge_claude_launch_with_development_channels() {
   fi
 
   bridge_require_python
+  # #946 L1 (r2 codex P1 #1): missing in r1. Substitution-safe guard so a
+  # stale source checkout fails-empty + audit-logs instead of fanning out
+  # [Errno 2] from the launch-cmd rebuild path.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-claude-dev-channels.py" \
     "$original" "$required_csv"
 }
@@ -343,6 +360,14 @@ bridge_claude_launch_with_channel_state_dirs() {
   ms365_dir="$(bridge_agent_ms365_state_dir "$agent")"
 
   bridge_require_python
+  # #946 L1 (r2 codex P1 #1): missing in r1. Substitution-safe guard. This
+  # wrapper is the channel-state-dirs chain that the operator's static
+  # admin `patch` ran into on 2026-05-14 and is reached from inside
+  # `$(bridge_agent_launch_cmd ...)` substitutions on every launch-cmd
+  # rebuild — the swallow surface r1 missed.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-claude-channel-state-dirs.py" \
     "$original" "$required" "$discord_dir" "$telegram_dir" "$teams_dir" "$ms365_dir"
 }
@@ -384,6 +409,11 @@ bridge_build_static_claude_launch_cmd() {
   # omitted from this comment so the footgun #11 self-audit grep
   # recipe does not flag a textual mention as a real callsite.)
   bridge_require_python
+  # #946 L1 (r2): substitution-safe guard. Static-admin launch-cmd rebuild
+  # is reached from inside `$(bridge_agent_launch_cmd ...)` substitutions.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-static-claude-build.py" \
     "$agent" "$continue_mode" "$session_id" "$continue_fallback" "$fallback"
 }
@@ -408,6 +438,12 @@ bridge_build_safe_claude_launch_cmd() {
   # bridge_build_static_claude_launch_cmd above for the heredoc_write
   # rationale.
   bridge_require_python
+  # #946 L1 (r2): substitution-safe guard. Safe-mode launch-cmd rebuild
+  # is reached from `$(bridge_safe_mode_command ...)` substitutions in
+  # bridge-tmux.sh fallback paths.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-safe-claude-build.py" \
     "$agent" "$continue_mode" "$session_id" "$fallback"
 }
@@ -1205,6 +1241,16 @@ bridge_audit_log() {
   shift 3 || true
 
   bridge_require_python
+  # #946 L1 (r2): stale-source guard. Audit-log is called ubiquitously
+  # via `bridge_audit_log ... 2>/dev/null || true`, which is the
+  # substitution-swallow class codex P1 #2 flagged — a `bridge_die` here
+  # would be silently absorbed and the daemon would keep ticking with no
+  # audit trail at all. The check helper logs the stale-source event
+  # once to BRIDGE_DAEMON_LOG (not the audit log, which itself is what
+  # we cannot reach), preserving the visibility contract.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-audit.py" write --file "$BRIDGE_AUDIT_LOG" --actor "$actor" --action "$action" --target "$target" "$@" >/dev/null
 }
 
@@ -2811,6 +2857,11 @@ bridge_detect_claude_session_id() {
   local since_ms="${2:-0}"
   local exclude_csv="${3:-}"
 
+  # #946 L1 (r2): substitution-safe guard. This helper is called
+  # exclusively from `$(...)` substitutions (callers parse stdout).
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/detect-claude-session-id.py" \
     "$workdir" "$since_ms" "$exclude_csv"
 }
@@ -2860,6 +2911,11 @@ bridge_resolve_resume_session_id() {
     exclude_csv="$(bridge_agent_resume_quarantine_ids "$agent" 2>/dev/null || true)"
   fi
 
+  # #946 L1 (r2): substitution-safe guard. Called from `$(...)` by
+  # bridge_claude_resume_session_id_for_agent and friends.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-claude-resume-session-id.py" \
     "$workdir" "$candidate" "$max_age_hours" "$agent" "$exclude_csv"
 }

@@ -340,8 +340,75 @@ SCRIPTDIR_LIVE_OUT="$("$BASH4_BIN" -c "
   bridge_resolve_script_dir_or_die
 " 2>&1 || true)"
 assert_contains "$SCRIPTDIR_LIVE_OUT" "does not exist or is missing scripts/python-helpers/"
+
+# r2 (codex P1 #2 regression — substitution-context propagation):
+# bridge_resolve_script_dir_check must return non-zero AND write an
+# audit line to BRIDGE_DAEMON_LOG even when called from inside `$(...)`
+# with errexit suppressed via `|| true`. Without this contract the
+# daemon-hang #946 reproduces unchanged because the substitution
+# swallows `bridge_die`'s subshell exit, the parent receives an empty
+# string, and the next tick repeats the same failing helper invocation.
+#
+# Layout: source the staged bridge-lib.sh, remove the source dir mid-
+# flight, then run bridge_resolve_script_dir_check inside `$(...) || true`
+# and assert:
+#   (a) the substitution result is empty
+#   (b) BRIDGE_DAEMON_LOG (BRIDGE_STATE_DIR/daemon.log by default)
+#       carries one `[L1] BRIDGE_SCRIPT_DIR=...` audit line
+#   (c) repeated check calls within the same shell do NOT duplicate
+#       the audit (dedup contract via per-PID sentinel file)
+SCRIPTDIR_SUB_STATE="$(mktemp -d "${TMPDIR:-/tmp}/agb-smoke-scriptdir-sub.XXXXXX")"
+# Re-stage a fresh "good" tree because the previous block destroyed
+# its scripts/python-helpers/ subtree.
+mkdir -p "$SCRIPTDIR_FAKE_ROOT/sub/scripts/python-helpers"
+cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/sub/bridge-lib.sh"
+ln -sf "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/sub/lib"
+ln -sf "$REPO_ROOT/VERSION" "$SCRIPTDIR_FAKE_ROOT/sub/VERSION" 2>/dev/null || true
+SCRIPTDIR_SUB_OUT="$(BRIDGE_HOME="$SCRIPTDIR_SUB_STATE" \
+  BRIDGE_STATE_DIR="$SCRIPTDIR_SUB_STATE/state" \
+  BRIDGE_DAEMON_LOG="$SCRIPTDIR_SUB_STATE/state/daemon.log" \
+  "$BASH4_BIN" -c "
+  source '$SCRIPTDIR_FAKE_ROOT/sub/bridge-lib.sh' >/dev/null 2>&1
+  rm -rf '$SCRIPTDIR_FAKE_ROOT/sub/scripts'
+  # Substitution-context call with errexit suppressed — the daemon's
+  # \`bridge_agent_channels_csv \"\$agent\" 2>/dev/null || true\` shape.
+  SUB_RESULT=\"\$(bridge_resolve_script_dir_check && echo NEVER_REACHED || true)\"
+  printf 'SUB_RESULT=[%s]\\n' \"\$SUB_RESULT\"
+  # A second call from the same shell should NOT re-log.
+  bridge_resolve_script_dir_check >/dev/null 2>&1 || true
+  bridge_resolve_script_dir_check >/dev/null 2>&1 || true
+" 2>&1 || true)"
+# (a) substitution result empty — the check helper returned 1 without
+# emitting NEVER_REACHED.
+assert_contains "$SCRIPTDIR_SUB_OUT" "SUB_RESULT=[]"
+assert_not_contains "$SCRIPTDIR_SUB_OUT" "NEVER_REACHED"
+# (b) one audit line landed in BRIDGE_DAEMON_LOG. The log file proves
+# the substitution did not swallow the signal — codex P1 #2 contract.
+SCRIPTDIR_LOG_FILE="$SCRIPTDIR_SUB_STATE/state/daemon.log"
+if [[ -f "$SCRIPTDIR_LOG_FILE" ]]; then
+  SCRIPTDIR_LOG_LINES="$(grep -c '\[L1\] BRIDGE_SCRIPT_DIR=' "$SCRIPTDIR_LOG_FILE" 2>/dev/null || printf '0')"
+else
+  SCRIPTDIR_LOG_LINES=0
+fi
+if (( SCRIPTDIR_LOG_LINES < 1 )); then
+  echo "FAIL: expected >=1 [L1] BRIDGE_SCRIPT_DIR= line in $SCRIPTDIR_LOG_FILE, got $SCRIPTDIR_LOG_LINES" >&2
+  echo "--- log file ---" >&2
+  cat "$SCRIPTDIR_LOG_FILE" 2>&1 >&2 || echo "(no log)" >&2
+  echo "--- subprocess output ---" >&2
+  printf '%s\n' "$SCRIPTDIR_SUB_OUT" >&2
+  exit 1
+fi
+# (c) the per-PID sentinel deduped: even with three check calls the
+# audit log carries exactly one entry. Without the cross-subshell
+# sentinel a substitution-context caller would re-log on every call.
+if (( SCRIPTDIR_LOG_LINES > 1 )); then
+  echo "FAIL: expected exactly 1 deduped [L1] BRIDGE_SCRIPT_DIR= line, got $SCRIPTDIR_LOG_LINES" >&2
+  cat "$SCRIPTDIR_LOG_FILE" >&2
+  exit 1
+fi
+rm -rf "$SCRIPTDIR_SUB_STATE"
 rm -rf "$SCRIPTDIR_FAKE_ROOT"
-log "  [ok] script-dir startup validation + re-resolution helper"
+log "  [ok] script-dir startup validation + re-resolution helper + substitution propagation"
 
 log "bridge_cron_sync_enabled reducer: any-0-disables semantics (issue #192)"
 # Regression matrix for the `BRIDGE_CRON_SYNC_ENABLED` reducer introduced
