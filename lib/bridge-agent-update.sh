@@ -231,8 +231,15 @@ bridge_agent_update_emit_audit() {
 
   bridge_require_python
   local detail_json
+  # Footgun #11 (KNOWN_ISSUES.md §26): this used to be `python3 - …
+  # <<'PY' … PY` inside a `$()` capture. Bash 5.3.9 `heredoc_write`
+  # deadlocks the moment any CRUD path emits an audit row, so the
+  # unregistered agent-update / agent-delete smokes never finished on
+  # the operator host. Standalone helper invoked file-as-argv removes
+  # the heredoc-stdin path; same shape PR #940 used for registry/list
+  # /show.
   detail_json="$(
-    python3 - \
+    python3 "$BRIDGE_SCRIPT_DIR/lib/agent-cli-helpers/audit-detail-json.py" \
       "$trigger_label" \
       "$actor" \
       "$actor_source" \
@@ -246,55 +253,7 @@ bridge_agent_update_emit_audit() {
       "$after_launch_cmd" \
       "$before_channels" \
       "$after_channels" \
-      "$actions_json" <<'PY'
-import json
-import sys
-
-(
-    trigger,
-    actor,
-    actor_source,
-    target_agent,
-    path,
-    before_sha,
-    after_sha,
-    operation,
-    reason,
-    before_launch_cmd,
-    after_launch_cmd,
-    before_channels,
-    after_channels,
-    actions_json,
-) = sys.argv[1:]
-
-# Mirror bridge-config.py:cmd_set's wrapper-apply / wrapper-deny detail
-# shape so end-to-end audit verification (`agent-bridge audit verify`)
-# treats agent-update rows the same way it treats config-set rows.
-detail = {
-    "kind": "system_config_mutation",
-    "actor": actor,
-    "actor_source": actor_source,
-    "trigger": trigger,
-    "path": path,
-    "before_sha256": before_sha,
-    "operation": operation,
-    "matched_pattern": "agent-roster.local.sh",
-    "target_agent": target_agent,
-    "before_launch_cmd": before_launch_cmd,
-    "after_launch_cmd": after_launch_cmd,
-    "before_channels": before_channels,
-    "after_channels": after_channels,
-}
-if after_sha:
-    detail["after_sha256"] = after_sha
-if reason:
-    detail["reason"] = reason
-try:
-    detail["actions"] = json.loads(actions_json) if actions_json else []
-except (TypeError, ValueError):
-    detail["actions"] = []
-print(json.dumps(detail, ensure_ascii=True, sort_keys=True))
-PY
+      "$actions_json"
   )"
 
   python3 "$BRIDGE_SCRIPT_DIR/bridge-audit.py" write \

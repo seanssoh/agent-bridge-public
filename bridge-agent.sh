@@ -3363,8 +3363,11 @@ PY
 # managed-role block from agent-roster.local.sh. Trust model mirrors
 # run_update (admin agent identity + operator-trusted source). Safety
 # gates: refuse if agent missing, refuse self-delete of admin, refuse
-# active session without --force, refuse open inbox tasks without
-# --orphan-tasks. Optional --purge-home / --purge-crons cleanup.
+# active session without --force, refuse open inbox tasks (queued /
+# claimed / blocked) without --orphan-tasks. With --orphan-tasks every
+# open row assigned to the agent is closed to status `cancelled` with
+# closed_ts set (refs #4797) so the row stops counting in `agb task
+# summary`. Optional --purge-home / --purge-crons cleanup.
 run_delete() {
   local agent=""
   local from_agent=""
@@ -3523,7 +3526,7 @@ PY
     fi
     [[ "$open_count" =~ ^[0-9]+$ ]] || open_count=0
     if [[ "$open_count" -gt 0 && $orphan_tasks -eq 0 ]]; then
-      deny_reason="agent '$agent' has $open_count open inbox task(s) — pass --orphan-tasks to mark them blocked"
+      deny_reason="agent '$agent' has $open_count open inbox task(s) — pass --orphan-tasks to close them"
     fi
   fi
 
@@ -3570,24 +3573,12 @@ PY
 
     if [[ $json_output -eq 1 ]]; then
       bridge_require_python
+      # Footgun #11: invoke the JSON formatter via file-as-argv (not
+      # heredoc-stdin) so the dry-run path does not wedge Bash 5.3.9.
       AGENT="$agent" CALLER_SOURCE="$caller_source" OPEN_COUNT="$open_count" \
       ORPHAN_TASKS="$orphan_tasks" PURGE_HOME="$purge_home" PURGE_CRONS="$purge_crons" \
-      python3 - <<'PY'
-import json
-import os
-
-payload = {
-    "agent": os.environ["AGENT"],
-    "deleted": False,
-    "dry_run": True,
-    "purge_home": os.environ["PURGE_HOME"] == "1",
-    "purge_crons": os.environ["PURGE_CRONS"] == "1",
-    "orphan_tasks": os.environ["ORPHAN_TASKS"] == "1",
-    "open_inbox_tasks": int(os.environ["OPEN_COUNT"] or 0),
-    "caller_source": os.environ["CALLER_SOURCE"],
-}
-print(json.dumps(payload, ensure_ascii=False, indent=2))
-PY
+      DELETED=0 DRY_RUN=1 BEFORE_SHA="" AFTER_SHA="" \
+        python3 "$SCRIPT_DIR/lib/agent-cli-helpers/delete-result-json.py"
     else
       printf 'agent: %s\n' "$agent"
       printf 'deleted: no\n'
@@ -3606,96 +3597,40 @@ PY
 
   if [[ $orphan_tasks -eq 1 && "$open_count" -gt 0 && -f "$BRIDGE_TASK_DB" ]]; then
     bridge_require_python
-    local _orphan_err
+    local _orphan_err _orphan_note _orphan_helper
     _orphan_err="$(mktemp "${TMPDIR:-/tmp}/agb-orphan-err.XXXXXX")"
-    if ! python3 - "$BRIDGE_TASK_DB" "$agent" "agent retired via 'agent delete'" <<'PY' 2>"$_orphan_err"
-import sqlite3
-import sys
-import time
-
-db_path, agent, note = sys.argv[1], sys.argv[2], sys.argv[3]
-now_ts = int(time.time())
-conn = sqlite3.connect(db_path)
-try:
-    with conn:
-        rows = conn.execute(
-            """
-            SELECT id FROM tasks
-            WHERE assigned_to = ?
-              AND status IN ('queued', 'claimed')
-              AND title NOT LIKE '[cron-dispatch]%'
-            """,
-            (agent,),
-        ).fetchall()
-        for (task_id,) in rows:
-            # `blocked` is an open status (bridge-queue.py:22), so leave
-            # closed_ts untouched — only cancelled/done set it. Restrict
-            # the UPDATE WHERE to the same queued/claimed set so already
-            # blocked rows are not redundantly bumped (idempotent).
-            conn.execute(
-                """
-                UPDATE tasks
-                SET status = 'blocked', updated_ts = ?
-                WHERE id = ?
-                  AND status IN ('queued', 'claimed')
-                  AND title NOT LIKE '[cron-dispatch]%'
-                """,
-                (now_ts, task_id),
-            )
-            conn.execute(
-                """
-                INSERT INTO task_events (
-                  task_id, event_type, actor, created_ts, note_text,
-                  note_path, from_agent, to_agent
-                ) VALUES (?, 'blocked', 'agent-delete', ?, ?, NULL, NULL, ?)
-                """,
-                (task_id, now_ts, note, agent),
-            )
-finally:
-    conn.close()
-PY
-    then
+    # Completion note format (refs #4797): include agent name and the
+    # operator-facing trigger so `agb task show <id>` after a ghost GC
+    # surfaces *why* the row was closed without reading the audit log.
+    _orphan_note="agent ${agent} deleted, task orphaned by --orphan-tasks"
+    _orphan_helper="$SCRIPT_DIR/lib/agent-cli-helpers/orphan-tasks-gc.py"
+    # Footgun #11: do NOT feed this body via `python3 - <<'PY' … PY`.
+    # The previous implementation used a heredoc-stdin and deadlocked
+    # Bash 5.3.9 `heredoc_write` the moment any caller exercised the
+    # orphan-tasks branch, leaving every --orphan-tasks invocation hung
+    # before the SQL ran. Standalone helper invoked file-as-argv keeps
+    # the path off the broken surface (same precedent as
+    # lib/upgrade-helpers/recorded-source-root.py and
+    # lib/agent-cli-helpers/registry-format-json.py).
+    if ! python3 "$_orphan_helper" "$BRIDGE_TASK_DB" "$agent" "$_orphan_note" 2>"$_orphan_err"; then
       local _orphan_err_text
       _orphan_err_text="$(cat "$_orphan_err" 2>/dev/null || true)"
       rm -f "$_orphan_err"
-      bridge_die "agent delete: failed to mark inbox tasks blocked for '$agent'${_orphan_err_text:+ ($_orphan_err_text)}"
+      bridge_die "agent delete: failed to cancel orphaned inbox tasks for '$agent'${_orphan_err_text:+ ($_orphan_err_text)}"
     fi
     rm -f "$_orphan_err"
   fi
 
   # Remove the managed-role block from the roster file. Same regex the
   # block writer in bridge_write_role_block uses, with re.sub("") to
-  # excise instead of replace.
-  bridge_agent_manage_python "$roster_path" "$agent" >/dev/null <<'PY'
-from pathlib import Path
-import re
-import sys
-
-path = Path(sys.argv[1])
-agent = sys.argv[2]
-text = path.read_text(encoding="utf-8")
-begin = f"# BEGIN AGENT BRIDGE MANAGED ROLE: {agent}"
-end = f"# END AGENT BRIDGE MANAGED ROLE: {agent}"
-if begin not in text or end not in text:
-    raise SystemExit(f"managed block not found for {agent}: {path}")
-pattern = re.compile(
-    rf"^# BEGIN AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n.*?^# END AGENT BRIDGE MANAGED ROLE: {re.escape(agent)}\n?",
-    flags=re.MULTILINE | re.DOTALL,
-)
-# Mirror bridge-agent.sh:717 — verify the regex matches before writing.
-# subn returns (new_text, count); refuse to write unless exactly one
-# managed block was excised.
-new_text, count = pattern.subn("", text, count=1)
-if count != 1:
-    raise SystemExit(
-        f"managed block not found or matched {count} times for {agent}: {path}"
-    )
-text = new_text
-# Collapse the triple-newline left behind by block removal (cosmetic).
-text = re.sub(r"\n{3,}", "\n\n", text)
-path.write_text(text, encoding="utf-8")
-print(path)
-PY
+  # excise instead of replace. Helper is invoked file-as-argv (not
+  # heredoc-stdin) to dodge the Bash 5.3.9 `heredoc_write` deadlock
+  # documented in KNOWN_ISSUES.md §26 (footgun #11). Same shape as
+  # PR #940's registry/list/show extraction.
+  bridge_require_python
+  python3 "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" \
+    "$roster_path" "$agent" >/dev/null \
+    || bridge_die "agent delete: failed to excise managed-role block for '$agent' from $roster_path"
 
   # Issue #4795: drop the daemon's auto-start backoff state file for this
   # agent so the daemon's next sync tick does not log a spurious
@@ -3841,27 +3776,12 @@ PY
 
   if [[ $json_output -eq 1 ]]; then
     bridge_require_python
+    # Footgun #11: invoke the JSON formatter via file-as-argv (not
+    # heredoc-stdin) so the apply path does not wedge Bash 5.3.9.
     AGENT="$agent" CALLER_SOURCE="$caller_source" OPEN_COUNT="$open_count" \
     ORPHAN_TASKS="$orphan_tasks" PURGE_HOME="$purge_home" PURGE_CRONS="$purge_crons" \
-    BEFORE_SHA="$before_sha" AFTER_SHA="$after_sha" \
-    python3 - <<'PY'
-import json
-import os
-
-payload = {
-    "agent": os.environ["AGENT"],
-    "deleted": True,
-    "dry_run": False,
-    "purge_home": os.environ["PURGE_HOME"] == "1",
-    "purge_crons": os.environ["PURGE_CRONS"] == "1",
-    "orphan_tasks": os.environ["ORPHAN_TASKS"] == "1",
-    "open_inbox_tasks": int(os.environ["OPEN_COUNT"] or 0),
-    "caller_source": os.environ["CALLER_SOURCE"],
-    "before_sha": os.environ["BEFORE_SHA"],
-    "after_sha": os.environ["AFTER_SHA"],
-}
-print(json.dumps(payload, ensure_ascii=False, indent=2))
-PY
+    DELETED=1 DRY_RUN=0 BEFORE_SHA="$before_sha" AFTER_SHA="$after_sha" \
+      python3 "$SCRIPT_DIR/lib/agent-cli-helpers/delete-result-json.py"
   else
     printf 'agent: %s\n' "$agent"
     printf 'deleted: yes\n'
