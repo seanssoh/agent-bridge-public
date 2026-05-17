@@ -414,8 +414,77 @@ if (( SCRIPTDIR_LOG_LINES > 1 )); then
   exit 1
 fi
 rm -rf "$SCRIPTDIR_SUB_STATE"
+
+# r6 (codex P2 — guard ordering): `bridge_sync_skill_docs` used to early-
+# return 0 via `[[ -f $BRIDGE_SCRIPT_DIR/bridge-docs.py ]]` BEFORE the
+# stale-source guard. When the source dir vanished, the file-existence
+# test saw `bridge-docs.py` missing, took the graceful skip, and reported
+# success — masking the cascade and skipping the [L1] audit entirely.
+# r6 reorders so the guard runs first. Lock the contract:
+#   (a) stale dir → rc=1 + [L1] audit landed.
+#   (b) valid dir + bridge-docs.py legitimately absent → rc=0, no audit.
+SCRIPTDIR_GUARD_STATE="$(mktemp -d "${TMPDIR:-/tmp}/agb-smoke-scriptdir-guard.XXXXXX")"
+mkdir -p "$SCRIPTDIR_FAKE_ROOT/guard/scripts/python-helpers"
+cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/guard/bridge-lib.sh"
+cp -R "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/guard/lib"
+ln -sf "$REPO_ROOT/VERSION" "$SCRIPTDIR_FAKE_ROOT/guard/VERSION" 2>/dev/null || true
+# Intentionally do NOT copy bridge-docs.py — the original anti-pattern
+# would happily return 0 in that state. After r6 the missing-file skip
+# only applies when the script dir is valid.
+SCRIPTDIR_GUARD_STALE_OUT="$(BRIDGE_HOME="$SCRIPTDIR_GUARD_STATE/stale" \
+  BRIDGE_STATE_DIR="$SCRIPTDIR_GUARD_STATE/stale/state" \
+  BRIDGE_DAEMON_LOG="$SCRIPTDIR_GUARD_STATE/stale/state/daemon.log" \
+  "$BASH4_BIN" -c "
+  mkdir -p \"\$BRIDGE_STATE_DIR\"
+  source '$SCRIPTDIR_FAKE_ROOT/guard/bridge-lib.sh' >/dev/null 2>&1
+  rm -rf '$SCRIPTDIR_FAKE_ROOT/guard/scripts'
+  bridge_sync_skill_docs smoke >/dev/null 2>&1
+  printf 'GUARD_STALE_RC=%s\n' \"\$?\"
+" 2>&1 || true)"
+assert_contains "$SCRIPTDIR_GUARD_STALE_OUT" "GUARD_STALE_RC=1"
+SCRIPTDIR_GUARD_STALE_LOG="$SCRIPTDIR_GUARD_STATE/stale/state/daemon.log"
+if [[ -f "$SCRIPTDIR_GUARD_STALE_LOG" ]]; then
+  SCRIPTDIR_GUARD_STALE_LINES="$(grep -c '\[L1\] BRIDGE_SCRIPT_DIR=' "$SCRIPTDIR_GUARD_STALE_LOG" 2>/dev/null || printf '0')"
+else
+  SCRIPTDIR_GUARD_STALE_LINES=0
+fi
+if (( SCRIPTDIR_GUARD_STALE_LINES < 1 )); then
+  echo "FAIL: r6 stale guard — expected >=1 [L1] line, got $SCRIPTDIR_GUARD_STALE_LINES" >&2
+  cat "$SCRIPTDIR_GUARD_STALE_LOG" 2>&1 >&2 || echo "(no log)" >&2
+  echo "--- subprocess output ---" >&2
+  printf '%s\n' "$SCRIPTDIR_GUARD_STALE_OUT" >&2
+  exit 1
+fi
+# (b) Positive: valid script dir but bridge-docs.py absent. Re-stage
+# (the previous block destroyed the guard fixture's scripts/).
+mkdir -p "$SCRIPTDIR_FAKE_ROOT/guard2/scripts/python-helpers"
+cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/guard2/bridge-lib.sh"
+cp -R "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/guard2/lib"
+ln -sf "$REPO_ROOT/VERSION" "$SCRIPTDIR_FAKE_ROOT/guard2/VERSION" 2>/dev/null || true
+SCRIPTDIR_GUARD_OK_OUT="$(BRIDGE_HOME="$SCRIPTDIR_GUARD_STATE/ok" \
+  BRIDGE_STATE_DIR="$SCRIPTDIR_GUARD_STATE/ok/state" \
+  BRIDGE_DAEMON_LOG="$SCRIPTDIR_GUARD_STATE/ok/state/daemon.log" \
+  "$BASH4_BIN" -c "
+  mkdir -p \"\$BRIDGE_STATE_DIR\"
+  source '$SCRIPTDIR_FAKE_ROOT/guard2/bridge-lib.sh' >/dev/null 2>&1
+  bridge_sync_skill_docs smoke >/dev/null 2>&1
+  printf 'GUARD_OK_RC=%s\n' \"\$?\"
+" 2>&1 || true)"
+assert_contains "$SCRIPTDIR_GUARD_OK_OUT" "GUARD_OK_RC=0"
+SCRIPTDIR_GUARD_OK_LOG="$SCRIPTDIR_GUARD_STATE/ok/state/daemon.log"
+if [[ -f "$SCRIPTDIR_GUARD_OK_LOG" ]]; then
+  SCRIPTDIR_GUARD_OK_LINES="$(grep -c '\[L1\] BRIDGE_SCRIPT_DIR=' "$SCRIPTDIR_GUARD_OK_LOG" 2>/dev/null || printf '0')"
+else
+  SCRIPTDIR_GUARD_OK_LINES=0
+fi
+if (( SCRIPTDIR_GUARD_OK_LINES != 0 )); then
+  echo "FAIL: r6 minimal-install path — expected 0 [L1] lines, got $SCRIPTDIR_GUARD_OK_LINES" >&2
+  cat "$SCRIPTDIR_GUARD_OK_LOG" 2>&1 >&2 || true
+  exit 1
+fi
+rm -rf "$SCRIPTDIR_GUARD_STATE"
 rm -rf "$SCRIPTDIR_FAKE_ROOT"
-log "  [ok] script-dir startup validation + re-resolution helper + substitution propagation"
+log "  [ok] script-dir startup validation + re-resolution helper + substitution propagation + sync-skill-docs guard ordering"
 
 log "bridge_cron_sync_enabled reducer: any-0-disables semantics (issue #192)"
 # Regression matrix for the `BRIDGE_CRON_SYNC_ENABLED` reducer introduced
