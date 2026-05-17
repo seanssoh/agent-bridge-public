@@ -120,6 +120,13 @@ BRIDGE_DAEMON_LAST_STEP="${BRIDGE_DAEMON_LAST_STEP:-init}"
 BRIDGE_DAEMON_ERR_LOCATION="${BRIDGE_DAEMON_ERR_LOCATION:-}"
 _BRIDGE_DAEMON_EXIT_LOGGED=0
 _BRIDGE_DAEMON_IN_ERR_TRAP=0
+# Issue #946 L4: consecutive-failure counter for bridge_write_idle_ready_agents.
+# Reset to 0 on each successful write; incremented on each failure. The
+# nudge_scan step uses this both to skip bridge_task_daemon_step on the
+# failing tick (avoiding broken-state consumption) and to surface a
+# `daemon_nudge_skip_streak` audit row so an operator can spot a wedged
+# writer after N consecutive ticks instead of having to grep raw logs.
+_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=0
 
 _bridge_daemon_on_signal() {
   BRIDGE_LAST_SIGNAL="$1"
@@ -267,6 +274,132 @@ HEARTBEAT_NEXT_TS=$next_ts
 EOF
 }
 
+# Issue #946 L2: bound each command-substitution inside write_agent_heartbeat
+# so a stuck helper (missing python3 helper file, hung tmux probe, locked
+# state file) cannot wedge the daemon tick. Each value is pre-computed via
+# bridge_with_timeout with a per-call ceiling; on timeout/failure we
+# substitute a grep-able sentinel and emit a one-line [L2] event so an
+# operator can identify which helper site is misbehaving from the daemon
+# crash log.
+#
+# Why pre-compute instead of wrapping inline? `cat <<EOF $(slow_helper) EOF`
+# evaluates command substitutions inside the heredoc body — there is no
+# way to bound them from inside the heredoc itself. The deadlock surfaced
+# on operator-host 2026-05-17 was that channel_status's python3 helpers
+# hung on a stale worktree path, the parent heredoc waited forever on the
+# child fork, and `set -e` did not abort because `cat` had not yet
+# observed a failure. Pre-resolving the values gives us a clean failure
+# boundary on each call.
+_bridge_heartbeat_value_with_timeout() {
+  # Args: <timeout_seconds> <call_site_label> <agent> <default> <fn> [fn-args...]
+  #
+  # Prints the function's stdout on success, or <default> on timeout/error.
+  # On failure also emits a [L2] daemon_log_event so operators can grep
+  # the crash log for which heartbeat helper site degraded.
+  #
+  # bridge_with_timeout (lib/bridge-state.sh) cannot bound bash functions
+  # because timeout(1) / gtimeout(1) only run executables, not shell
+  # functions. So this helper builds a manual deadline using the
+  # background-subshell + sleep-poll + kill-TERM/KILL pattern already
+  # established in bridge_stop_queue_gateway_socket_listener
+  # (bridge-daemon.sh:5928-5939). The pattern is:
+  #
+  #   1. fork the function call into a background subshell, redirect
+  #      stdout to a tempfile so we can recover the value if it
+  #      completes.
+  #   2. poll kill -0 up to `secs` ticks (~1s resolution; aligned with
+  #      the daemon's existing audit cadence).
+  #   3. on deadline expiry: kill -TERM, brief grace, kill -KILL, drop
+  #      tempfile, return sentinel + L2 event.
+  #   4. on natural completion: wait + read tempfile contents.
+  local secs="$1"
+  local label="$2"
+  local agent="$3"
+  local default="$4"
+  shift 4
+
+  if [[ ! "$secs" =~ ^[0-9]+$ ]] || (( secs == 0 )); then
+    secs=5
+  fi
+
+  local stdout_file
+  stdout_file="$(mktemp 2>/dev/null)" || stdout_file=""
+  if [[ -z "$stdout_file" ]]; then
+    # mktemp failed (e.g. $TMPDIR full). Skip the bound — substitute
+    # the sentinel rather than running unbounded.
+    daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}': mktemp failed; substituting sentinel '${default}' (refs #946)"
+    printf '%s' "$default"
+    return 0
+  fi
+
+  # Background the function call. We intentionally do NOT use
+  # bridge_with_timeout — see comment above.
+  ( "$@" >"$stdout_file" 2>/dev/null ) &
+  local pid=$!
+
+  # Poll for completion. 100ms granularity (10 polls per second) so a
+  # fast function returns near-instantly without burning a full second
+  # of latency per heartbeat write.
+  local i=0
+  local poll_max=$(( secs * 10 ))
+  while (( i < poll_max )); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+    i=$(( i + 1 ))
+  done
+
+  if kill -0 "$pid" 2>/dev/null; then
+    # Deadline hit — escalate from TERM to KILL like the queue gateway
+    # stop helper does. A 0.5s grace covers most python3 helpers; the
+    # KILL is the hard cap so the parent can never wait indefinitely.
+    kill -TERM "$pid" 2>/dev/null || true
+    sleep 0.5
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "$pid" 2>/dev/null || true
+    fi
+    wait "$pid" 2>/dev/null || true
+    daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}' timed out at ${secs}s; substituting sentinel '${default}' (refs #946)"
+    bridge_audit_log daemon daemon_heartbeat_helper_timeout daemon \
+      --detail call_site="heartbeat_${label}" \
+      --detail agent="$agent" \
+      --detail timeout_seconds="$secs" \
+      --detail sentinel="$default" \
+      2>/dev/null || true
+    rm -f -- "$stdout_file"
+    printf '%s' "$default"
+    return 0
+  fi
+
+  local rc=0
+  # `wait` returns the backgrounded child's exit code. We want to capture
+  # it without letting `set -e` short-circuit on a non-zero status, so use
+  # the canonical `cmd && rc=0 || rc=$?` form.
+  wait "$pid" && rc=0 || rc=$?
+  if (( rc != 0 )); then
+    daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}' exited rc=${rc}; substituting sentinel '${default}' (refs #946)"
+    rm -f -- "$stdout_file"
+    printf '%s' "$default"
+    return 0
+  fi
+  cat -- "$stdout_file" 2>/dev/null || printf '%s' "$default"
+  rm -f -- "$stdout_file"
+  return 0
+}
+
+# Tiny shim that converts bridge_agent_is_always_on's exit code into the
+# yes/no token the heartbeat report expects. Exists so the bounded helper
+# above can capture the answer via stdout (its only channel) rather than
+# the function's return code (which is lost across the subshell boundary).
+_bridge_heartbeat_always_on_yesno() {
+  if bridge_agent_is_always_on "$1"; then
+    printf '%s' "yes"
+  else
+    printf '%s' "no"
+  fi
+}
+
 write_agent_heartbeat() {
   local agent="$1"
   local heartbeat_file=""
@@ -282,6 +415,19 @@ write_agent_heartbeat() {
   local session=""
   local workdir=""
   local temp_file=""
+  # Issue #946 L2: pre-resolved heredoc values. Each is bounded by
+  # _bridge_heartbeat_value_with_timeout (defined above) so a wedged
+  # helper logs-and-skips rather than hanging the tick. Defaults are the
+  # same "-" / "?" tokens existing dashboards already render for missing
+  # data so no downstream consumer sees a novel shape.
+  local hb_now="?"
+  local hb_desc="-"
+  local hb_engine="-"
+  local hb_source="-"
+  local hb_always_on="no"
+  local hb_wake_status="-"
+  local hb_notify_status="-"
+  local hb_channel_status="-"
 
   heartbeat_file="$(bridge_agent_heartbeat_file "$agent")" || return 0
   workdir="$(bridge_agent_workdir "$agent")"
@@ -292,11 +438,41 @@ write_agent_heartbeat() {
   if bridge_agent_is_active "$agent"; then
     active="yes"
   fi
-  state="$(bridge_agent_heartbeat_activity_state "$agent")"
-  summary="$(bridge_queue_cli summary --agent "$agent" --format tsv 2>/dev/null | head -n 1 || true)"
+  # bridge_agent_heartbeat_activity_state can shell to tmux probes; bound it.
+  state="$(_bridge_heartbeat_value_with_timeout 5 activity_state "$agent" "unknown" bridge_agent_heartbeat_activity_state "$agent")"
+  # bridge_queue_cli internally forks python3 to bridge-queue-gateway.py
+  # (lib/bridge-core.sh:583) — bound via the same helper. We strip the
+  # leading newlines that head(1) might preserve when the helper returns
+  # the sentinel value.
+  local _hb_summary_raw=""
+  _hb_summary_raw="$(_bridge_heartbeat_value_with_timeout 10 queue_summary "$agent" "" \
+      bridge_queue_cli summary --agent "$agent" --format tsv)"
+  summary="$(printf '%s' "$_hb_summary_raw" | head -n 1 || true)"
   if [[ -n "$summary" ]]; then
     IFS=$'\t' read -r _agent queued claimed blocked _active idle last_seen last_nudge _session _engine _workdir <<<"$summary"
   fi
+
+  # Pre-resolve every heredoc command-substitution with a per-call ceiling.
+  # bridge_now_iso is local-only (date(1)) — 2s ceiling is generous.
+  hb_now="$(_bridge_heartbeat_value_with_timeout 2 now_iso "$agent" "?" bridge_now_iso)"
+  hb_desc="$(_bridge_heartbeat_value_with_timeout 2 desc "$agent" "-" bridge_agent_desc "$agent")"
+  hb_engine="$(_bridge_heartbeat_value_with_timeout 2 engine "$agent" "-" bridge_agent_engine "$agent")"
+  hb_source="$(_bridge_heartbeat_value_with_timeout 2 source "$agent" "-" bridge_agent_source "$agent")"
+  # bridge_agent_is_always_on returns 0/1 (no stdout); the original heredoc
+  # used `&& printf yes || printf no`. Use the small inline shim
+  # _bridge_heartbeat_always_on_yesno (defined above) to convert the
+  # return code into stdout we can capture through the bounded helper.
+  # The helper already forks the call into a subshell (`( "$@" )`) which
+  # inherits all daemon functions so the shim resolves naturally.
+  hb_always_on="$(_bridge_heartbeat_value_with_timeout 2 always_on_check "$agent" "no" \
+      _bridge_heartbeat_always_on_yesno "$agent")"
+  # bridge_agent_wake_status / notify_status / channel_status are the
+  # operator-visible heavy hitters from #946 — channel_status transitively
+  # forks python3 to lib/bridge-agents.sh extract-dev-channels-from-command.py
+  # which is exactly what wedged on stale worktree paths. 10s ceiling.
+  hb_wake_status="$(_bridge_heartbeat_value_with_timeout 5 wake_status "$agent" "?" bridge_agent_wake_status "$agent")"
+  hb_notify_status="$(_bridge_heartbeat_value_with_timeout 5 notify_status "$agent" "?" bridge_agent_notify_status "$agent")"
+  hb_channel_status="$(_bridge_heartbeat_value_with_timeout 10 channel_status "$agent" "?" bridge_agent_channel_status "$agent")"
 
   temp_file="$(mktemp)"
   # Audit A17 (P1 leak): the cat/mv/rm cleanup at the function tail
@@ -308,22 +484,27 @@ write_agent_heartbeat() {
   #
   # A RETURN trap does NOT fire on set-e abort (codex r1 repro on
   # PR #915), so explicit error check + rm is required.
+  #
+  # Issue #946 L2: the heredoc body now only references pre-resolved
+  # local variables — no command substitutions remain inside. A stuck
+  # helper degrades a single value to its sentinel rather than wedging
+  # the whole `cat`.
   if ! cat >"$temp_file" <<EOF
 # Heartbeat
 
-- generated_at: $(bridge_now_iso)
+- generated_at: ${hb_now}
 - agent: ${agent}
-- description: $(bridge_agent_desc "$agent")
-- engine: $(bridge_agent_engine "$agent")
-- source: $(bridge_agent_source "$agent")
+- description: ${hb_desc}
+- engine: ${hb_engine}
+- source: ${hb_source}
 - session: ${session:--}
 - workdir: ${workdir:--}
 - active: ${active}
 - activity_state: ${state}
-- always_on: $(bridge_agent_is_always_on "$agent" && printf 'yes' || printf 'no')
-- wake_status: $(bridge_agent_wake_status "$agent")
-- notify_status: $(bridge_agent_notify_status "$agent")
-- channel_status: $(bridge_agent_channel_status "$agent")
+- always_on: ${hb_always_on}
+- wake_status: ${hb_wake_status}
+- notify_status: ${hb_notify_status}
+- channel_status: ${hb_channel_status}
 
 ## Queue
 
@@ -5933,14 +6114,30 @@ cmd_sync_cycle() {
   # added. Capture rc + emit a one-line audit so operator can catch
   # matrix-not-applied via `agent-bridge audit follow` instead of
   # cycling on a green-looking daemon.
-  if ! bridge_write_idle_ready_agents "$ready_agents_file"; then
+  #
+  # Issue #946 L4: when the writer fails, the previous code fell through
+  # to bridge_task_daemon_step with a broken/empty ready-agent file. The
+  # downstream consumer then computed nudge candidates from invalid input,
+  # silently suppressing `[task-queued]` interrupts on the operator host
+  # for hours (operator-host evidence 2026-05-17: hundreds of `idle_ready
+  # writer failed` lines while queued tasks never reached their target).
+  # Skip bridge_task_daemon_step explicitly on writer failure so the next
+  # tick re-attempts with fresh state, and track consecutive failures so
+  # a wedged writer surfaces as an audit row instead of log noise.
+  nudge_output=""
+  if bridge_write_idle_ready_agents "$ready_agents_file"; then
+    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=0
+    nudge_output="$(bridge_task_daemon_step "$snapshot_file" "$ready_agents_file" 2>/dev/null || true)"
+  else
+    _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=$(( _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL + 1 ))
     bridge_audit_log daemon daemon_step_warning daemon \
       --detail step="nudge_scan_idle_ready" \
       --detail reason="bridge_write_idle_ready_agents non-zero (matrix not applied or writer error)" \
+      --detail consecutive_failures="$_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL" \
+      --detail action="skip_bridge_task_daemon_step" \
       2>/dev/null || true
-    daemon_log_event "nudge_scan: idle_ready writer failed (matrix-aware fix #781); cycle continues"
+    daemon_log_event "[L4] nudge_scan: idle_ready writer failed (consec=${_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL}); skipping bridge_task_daemon_step this tick (refs #946, matrix-aware #781)"
   fi
-  nudge_output="$(bridge_task_daemon_step "$snapshot_file" "$ready_agents_file" 2>/dev/null || true)"
   rm -f "$snapshot_file"
   rm -f "$ready_agents_file"
 
