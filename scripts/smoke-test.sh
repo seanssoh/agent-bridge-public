@@ -26,6 +26,22 @@ if [[ -z "${BRIDGE_HOME:-}" ]]; then
   export BRIDGE_HOME
   _SMOKE_AUTO_ISOLATED=1
   printf '[smoke] BRIDGE_HOME auto-isolated to %s (was unset)\n' "$BRIDGE_HOME"
+  # #946: when the smoke matrix runs against an auto-isolated fresh
+  # temp BRIDGE_HOME, every child shell that sources bridge-lib.sh
+  # would otherwise be classified as `fresh-install-candidate` and
+  # die at the v0.8.0 isolation hard-cut (the fresh-install bypass
+  # handshake requires the owner to be bridge-init.sh / bridge-
+  # bootstrap.sh / agent-bridge — smoke is none of those). Export
+  # an explicit v2 layout override so resolver step 1 (env) wins
+  # and the matrix can actually run. macOS platform discriminator
+  # skips the v2 isolation enforcement (no `ab-shared` group), so
+  # the override is safe; on Linux without v2 primitives the same
+  # discriminator silently skips enforcement, matching the auto
+  # behavior of v0.14.1 fresh installs. Only applied for the auto-
+  # isolated path — when the caller exports BRIDGE_HOME (CI runner,
+  # custom rig) they remain responsible for layout state.
+  export BRIDGE_LAYOUT="v2"
+  export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
 fi
 if [[ -n "${BRIDGE_HOME:-}" ]]; then
   _smoke_allowed_tmp_prefix=""
@@ -282,11 +298,23 @@ EOF
 # operator-shell defaults would silently steer bridge-run.sh at the live
 # roster and the test would be a no-op (or worse, an env-pollution false
 # pass against unrelated agents).
+#
+# Explicit BRIDGE_LAYOUT=v2 + BRIDGE_DATA_ROOT take resolver step 1 (env
+# override) so the dummy agent-roster.local.sh written above does not trip
+# bridge_layout_resolver_has_existing_evidence — that would classify the
+# fresh temp dir as `markerless(existing-install)` and silently kill the
+# entire smoke matrix here via the v0.8.0 isolation hard-cut (#946). The
+# evidence-based fail-fast still protects real installs; this is the
+# correct shape for an isolated dry-run probe whose only on-disk artifact
+# is the roster definition the test itself wrote.
 LAUNCH_DRYRUN_OUTPUT="$(env -u BRIDGE_ROSTER_FILE -u BRIDGE_ROSTER_LOCAL_FILE \
   -u BRIDGE_STATE_DIR -u BRIDGE_ACTIVE_AGENT_DIR -u BRIDGE_LOG_DIR \
   -u BRIDGE_SHARED_DIR -u BRIDGE_TASK_DB \
   BRIDGE_HOME="$LAUNCH_DRYRUN_HOME" \
-  "$BASH4_BIN" "$REPO_ROOT/bridge-run.sh" "dryrun-redact-smoke" --dry-run 2>&1)"
+  BRIDGE_LAYOUT="v2" \
+  BRIDGE_DATA_ROOT="$LAUNCH_DRYRUN_HOME/data" \
+  "$BASH4_BIN" "$REPO_ROOT/bridge-run.sh" "dryrun-redact-smoke" --dry-run 2>&1)" \
+  || die "bridge-run.sh --dry-run probe failed (rc=$?); output: $LAUNCH_DRYRUN_OUTPUT"
 assert_contains "$LAUNCH_DRYRUN_OUTPUT" "launch=MS365_CLIENT_SECRET=***redacted***"
 assert_contains "$LAUNCH_DRYRUN_OUTPUT" "MY_API_TOKEN=***redacted***"
 # Non-secret BRIDGE_LAYOUT_MARKER_KEY must round-trip with its real value
