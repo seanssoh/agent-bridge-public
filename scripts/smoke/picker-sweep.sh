@@ -225,7 +225,7 @@ smoke_assert_contains "$(cat "$SEND_LOG")" "stuck-agent" "4 send target"
 smoke_assert_eq "1" "$(grep -c "^---$" "$TASK_LOG" || true)" "4 one task"
 smoke_assert_contains "$(cat "$TASK_LOG")" "recipient=admin" "4 task recipient"
 smoke_assert_contains "$(cat "$TASK_LOG")" "1 agent(s) auto-unstuck" "4 task title"
-smoke_assert_contains "$(cat "$TASK_LOG")" "stuck-agent:picker option line" "4 task body lists agent"
+smoke_assert_contains "$(cat "$TASK_LOG")" "stuck-agent:picker option line + tail (sent Enter)" "4 task body lists agent + action"
 
 # ---------------------------------------------------------------------------
 # Test 5 — Tail-only (no option line) must be REJECTED.
@@ -370,7 +370,7 @@ run_sweep
 smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "10 no bare-Enter send (would EXIT Claude)"
 smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "10 one option send"
 smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "bypass-agent:option=2" "10 send option=2 (Yes I accept)"
-smoke_assert_contains "$(cat "$TASK_LOG")" "bypass-agent:bypass-permissions warning" "10 task body identifies pattern"
+smoke_assert_contains "$(cat "$TASK_LOG")" "bypass-agent:bypass-permissions warning (sent option 2)" "10 task body records explicit option send"
 
 # ---------------------------------------------------------------------------
 # Test 11 — Auto mode warning (#948). 3-option picker; send option 1 so the
@@ -394,7 +394,7 @@ run_sweep
 smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "11 no bare-Enter send"
 smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "11 one option send"
 smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "auto-agent:option=1" "11 send option=1 (make default)"
-smoke_assert_contains "$(cat "$TASK_LOG")" "auto-agent:auto-mode warning" "11 task body identifies pattern"
+smoke_assert_contains "$(cat "$TASK_LOG")" "auto-agent:auto-mode warning (sent option 1)" "11 task body records explicit option send"
 
 # ---------------------------------------------------------------------------
 # Test 12 — Bypass/auto patterns must NOT fire on free-prose mention.
