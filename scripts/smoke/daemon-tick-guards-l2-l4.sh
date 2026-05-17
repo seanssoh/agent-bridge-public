@@ -113,7 +113,27 @@ run_driver() {
     BRIDGE_SCRIPT_DIR="$BRIDGE_SCRIPT_DIR" \
     BRIDGE_LAYOUT="$BRIDGE_LAYOUT" \
     BRIDGE_DATA_ROOT="$BRIDGE_DATA_ROOT" \
+    TEST_PGREP_BROKEN_PATH="${TEST_PGREP_BROKEN_PATH:-}" \
     bash "$DRIVER" "$@"
+}
+
+# PR #952 r3 P2 #1: build a directory with a stub pgrep that always exits
+# 3 (mimics macOS sandbox "Cannot get process list"). The driver prepends
+# this dir to PATH so the recursive child enumeration must fall back to
+# `ps -A -o pid,ppid` parsing.
+make_broken_pgrep_dir() {
+  local dir
+  dir="$(mktemp -d -t agb-broken-pgrep-XXXXXX)"
+  cat >"$dir/pgrep" <<'STUB'
+#!/usr/bin/env bash
+# Stub: mimic pgrep that cannot enumerate processes.
+# Exit code 3 = fatal error (real pgrep returns this on macOS sandbox
+# "Cannot get process list" and on /proc unreadable).
+echo "pgrep: Cannot get process list" >&2
+exit 3
+STUB
+  chmod +x "$dir/pgrep"
+  printf '%s' "$dir"
 }
 
 # --- L2: deadline kills a wedged helper -------------------------------------
@@ -335,6 +355,159 @@ step_l4_writer_success_runs_step() {
   rm -f -- "$spy_file"
 }
 
+# --- PR #952 r3 P2 #1: pgrep failure → ps fallback regression --------------
+
+step_r3_pgrep_failure_enumerates_via_ps() {
+  # PR #952 r3 P2 #1: when pgrep returns exit ≥2 (real failure, not
+  # "no matches"), the r2 form silently treated the result as an empty
+  # child list — the wedged helper's grandchild survived the kill walk.
+  # r3 detects the failure and falls back to `ps -A -o pid,ppid`.
+  #
+  # Probe: spawn a known child (sleep 30) under the driver process,
+  # then call _bridge_enumerate_children with a stub pgrep on PATH that
+  # exits 3. The child PID MUST appear in the enumeration output —
+  # proving the ps fallback discovered it.
+  smoke_log "r3 step 1: _bridge_enumerate_children must use ps fallback when pgrep fails (exit ≥2)"
+
+  local broken_dir
+  broken_dir="$(make_broken_pgrep_dir)"
+  # shellcheck disable=SC2064  # we want the value expanded now.
+  trap "rm -rf '$broken_dir' 2>/dev/null || true" RETURN
+
+  local out
+  out="$(TEST_PGREP_BROKEN_PATH="$broken_dir" run_driver enumerate_children_pgrep_broken)"
+  local child_pid enum_block
+  child_pid="$(printf '%s\n' "$out" | sed -n 's/^CHILD=//p')"
+  if [[ -z "$child_pid" ]]; then
+    smoke_fail "r3 enumerate probe did not print CHILD= line; got: $out"
+  fi
+  enum_block="$(printf '%s\n' "$out" | awk '/^ENUM_OUTPUT_BEGIN/{f=1;next} /^ENUM_OUTPUT_END/{f=0} f')"
+  if ! grep -qx -- "$child_pid" <<<"$enum_block"; then
+    smoke_fail "r3 P2 #1 regression: ps fallback did not list child PID $child_pid. enum block: $enum_block. full output: $out"
+  fi
+  smoke_log "  ps fallback found child PID $child_pid after pgrep stub exited 3"
+}
+
+step_r3_pgrep_failure_reaps_grandchild() {
+  # PR #952 r3 P2 #1 end-to-end: a wedged helper with a python3
+  # grandchild must still get reaped when pgrep is broken. Without
+  # the ps fallback the python3 child would survive the timeout and
+  # write the sentinel file — the leak we already caught in r2 for
+  # the non-broken-pgrep case.
+  smoke_log "r3 step 2: timeout kill walks descendants via ps fallback when pgrep is broken"
+
+  local broken_dir
+  broken_dir="$(make_broken_pgrep_dir)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$broken_dir' 2>/dev/null || true" RETURN
+
+  local crash_log="$BRIDGE_LOG_DIR/daemon-crash.log"
+  : >"$crash_log"
+  : >"$BRIDGE_AUDIT_LOG"
+
+  local sentinel
+  sentinel="$(mktemp -t r3-pgrep-broken-XXXXXX)"
+  rm -f -- "$sentinel"
+
+  local output started ended elapsed
+  started="$(date +%s)"
+  output="$(TEST_PGREP_BROKEN_PATH="$broken_dir" TEST_SENTINEL_FILE="$sentinel" \
+    run_driver l2_value_with_timeout_pgrep_broken 2 pgrep_broken agent-w SENTINEL_FALLBACK)"
+  ended="$(date +%s)"
+  elapsed=$(( ended - started ))
+
+  smoke_assert_eq "SENTINEL_FALLBACK" "$output" "r3 timeout should still substitute sentinel when pgrep is broken"
+  if (( elapsed > 6 )); then
+    smoke_fail "r3 ceiling did not fire promptly with broken pgrep — elapsed=${elapsed}s"
+  fi
+
+  # python3 child sleeps 5s; deadline fires at 2s. Wait 4s past return
+  # so a surviving child would have written by now.
+  sleep 4
+  if [[ -f "$sentinel" ]]; then
+    smoke_fail "r3 P2 #1 regression: python3 grandchild survived timeout when pgrep was broken — sentinel exists: $(ls -l "$sentinel" 2>/dev/null; cat "$sentinel" 2>/dev/null || true). ps fallback did not enumerate descendants."
+  fi
+  smoke_log "  python3 grandchild reaped via ps fallback after pgrep stub exited 3"
+  rm -f -- "$sentinel"
+}
+
+# --- PR #952 r3 P2 #2: skip-nudges does not consume ready-agents file ------
+
+step_r3_skip_nudges_does_not_read_ready_file() {
+  # PR #952 r3 P2 #2: in r2 cmd_daemon_step called load_ready_agents
+  # at function entry, before the --skip-nudges short-circuit. A
+  # broken/blocking ready-agents file (fifo with no writer, an
+  # unreadable path) would block / raise before maintenance ran.
+  #
+  # r3 defers the load to the non-skip branch. Probe: run daemon-step
+  # with --skip-nudges + --ready-agents-file pointing at a fifo with
+  # no writer. The call MUST return within the budget and emit the
+  # "(maintenance-only; nudges skipped)" marker; the fifo MUST NOT
+  # have been opened (we can't test the latter directly, but if the
+  # call hangs we fail on the timeout).
+  smoke_log "r3 step 3: --skip-nudges must NOT consume ready-agents file (P2 #2 regression)"
+
+  # Stand up a minimal snapshot file — daemon-step requires --snapshot.
+  local snapshot fifo_path
+  snapshot="$SMOKE_TMP_ROOT/r3-skip-snapshot.tsv"
+  cat >"$snapshot" <<'EOF'
+agent	queued	claimed	blocked	active	idle	last_seen	last_nudge	session	engine	workdir	session_activity_ts
+EOF
+
+  # Create a fifo with NO writer attached. The r2 form would block on
+  # open() (or first read()); r3 must skip the load entirely.
+  fifo_path="$SMOKE_TMP_ROOT/r3-blocking-ready-agents.fifo"
+  rm -f -- "$fifo_path"
+  mkfifo "$fifo_path"
+
+  local out rc=0 started ended elapsed
+  started="$(date +%s)"
+  # Cap with a wall-clock budget — if the deferred load fix is missing,
+  # the open() blocks indefinitely. 8s is well above any reasonable
+  # maintenance pass. Use a background timer + kill to enforce the cap
+  # since `timeout` is not universally available on macOS without coreutils.
+  (
+    out="$(python3 "$BRIDGE_REPO_ROOT/bridge-queue.py" daemon-step \
+      --snapshot "$snapshot" \
+      --skip-nudges \
+      --ready-agents-file "$fifo_path" \
+      --idle-threshold 120 \
+      --nudge-cooldown 900 \
+      --format text 2>&1)" || rc=$?
+    printf '%s\n=== rc=%s ===\n' "$out" "$rc"
+  ) >"$SMOKE_TMP_ROOT/r3-skip-out.txt" 2>&1 &
+  local probe_pid=$!
+
+  local waited=0
+  while (( waited < 8 )); do
+    if ! kill -0 "$probe_pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.5
+    waited=$(( waited + 1 ))
+  done
+  if kill -0 "$probe_pid" 2>/dev/null; then
+    kill -KILL "$probe_pid" 2>/dev/null || true
+    wait "$probe_pid" 2>/dev/null || true
+    rm -f -- "$fifo_path"
+    smoke_fail "r3 P2 #2 regression: daemon-step --skip-nudges hung on blocking ready-agents fifo (>4s wall clock). The r2 form consumed the file at entry; r3 must defer the load."
+  fi
+  wait "$probe_pid" 2>/dev/null || true
+  ended="$(date +%s)"
+  elapsed=$(( ended - started ))
+
+  out="$(cat "$SMOKE_TMP_ROOT/r3-skip-out.txt")"
+  # Maintenance-only marker must appear in text format output.
+  if ! grep -q '(maintenance-only; nudges skipped)' <<<"$out"; then
+    smoke_fail "r3 P2 #2: expected '(maintenance-only; nudges skipped)' marker in daemon-step output; got: $out"
+  fi
+  if ! grep -q '=== rc=0 ===' <<<"$out"; then
+    smoke_fail "r3 P2 #2: daemon-step exited non-zero with --skip-nudges + blocking fifo: $out"
+  fi
+  smoke_log "  daemon-step --skip-nudges returned in ${elapsed}s without reading the blocking fifo"
+  rm -f -- "$fifo_path"
+}
+
 # --- proof of in-source wiring ----------------------------------------------
 #
 # The driver above is a carbon-copy of the production helpers. Guard
@@ -395,6 +568,44 @@ step_in_source_wiring_present() {
     smoke_fail "bridge-daemon.sh missing KILL-recursive kill on timeout — P2 #2 regression"
   fi
 
+  # PR #952 r3 P2 #1 wiring: pgrep failure must escalate to ps fallback.
+  # The kill helper now delegates child enumeration to
+  # _bridge_enumerate_children which detects pgrep exit ≥2 and falls back
+  # to `ps -A -o pid,ppid` parsing.
+  if ! grep -q '^_bridge_enumerate_children()' "$daemon_sh"; then
+    smoke_fail "bridge-daemon.sh missing _bridge_enumerate_children helper — r3 P2 #1 regression"
+  fi
+  if ! grep -q 'ps -A -o pid=,ppid=' "$daemon_sh"; then
+    smoke_fail "bridge-daemon.sh missing ps fallback in _bridge_enumerate_children — r3 P2 #1 regression"
+  fi
+  if ! grep -q '_bridge_enumerate_children "$root_pid"' "$daemon_sh"; then
+    smoke_fail "bridge-daemon.sh _bridge_kill_proc_tree no longer delegates to _bridge_enumerate_children — r3 P2 #1 regression"
+  fi
+  # The legacy form (direct `pgrep -P ... || true` swallow) must NOT
+  # appear inside _bridge_kill_proc_tree any more.
+  if awk '/^_bridge_kill_proc_tree\(\)/,/^}/' "$daemon_sh" | grep -q 'pgrep -P'; then
+    smoke_fail "bridge-daemon.sh _bridge_kill_proc_tree reintroduced direct pgrep call (must go through _bridge_enumerate_children) — r3 P2 #1 regression"
+  fi
+
+  # PR #952 r3 P2 #2 wiring: cmd_daemon_step must defer load_ready_agents
+  # until AFTER the skip_nudges short-circuit. The legacy form loaded the
+  # file at function entry and would block on a broken/blocking path
+  # before maintenance ran.
+  if ! grep -q 'r3 P2 #2: defer ready_agents load until the non-skip branch' "$queue_py"; then
+    smoke_fail "bridge-queue.py missing the r3 P2 #2 deferred-load comment marker — regression marker drifted"
+  fi
+  # The first load_ready_agents call must live AFTER the skip_nudges
+  # return statement, not before it. Delegated to a standalone helper
+  # because embedding the python check as a `<<'PY'` heredoc in this
+  # smoke trips Bash 5.3.9 footgun #11 (heredoc-write deadlock once
+  # body exceeds PIPE_BUF). Same pattern as the tick-guard-driver and
+  # lib/upgrade-helpers/ — see CLAUDE.md.
+  local order_check="$SCRIPT_DIR/daemon-tick-guards-helpers/check-load-ready-after-skip.py"
+  smoke_assert_file_exists "$order_check" "check-load-ready-after-skip.py helper"
+  if ! python3 "$order_check" "$queue_py"; then
+    smoke_fail "bridge-queue.py r3 P2 #2 source-order check failed (load_ready_agents called before skip_nudges short-circuit)"
+  fi
+
   # write_agent_heartbeat heredoc body must no longer contain inline
   # command substitutions for the helpers we pre-resolved. The grep below
   # asserts the heredoc references the local vars (hb_channel_status) and
@@ -417,6 +628,9 @@ smoke_run "L2 helper: fast path passes through silently" step_l2_fast_path_passe
 smoke_run "L2 helper: python3 grandchild reaped on timeout (P2 #2 regression)" step_l2_python3_grandchild_reaped
 smoke_run "L4 nudge_scan: writer failure runs maintenance-only step + skips nudges (P2 #1 regression)" step_l4_writer_failure_runs_maintenance_only
 smoke_run "L4 nudge_scan: writer success invokes full step + silent" step_l4_writer_success_runs_step
+smoke_run "r3: _bridge_enumerate_children falls back to ps when pgrep fails (P2 #1 regression)" step_r3_pgrep_failure_enumerates_via_ps
+smoke_run "r3: timeout reaps python3 grandchild via ps fallback when pgrep is broken (P2 #1 regression)" step_r3_pgrep_failure_reaps_grandchild
+smoke_run "r3: daemon-step --skip-nudges does NOT consume blocking ready-agents fifo (P2 #2 regression)" step_r3_skip_nudges_does_not_read_ready_file
 smoke_run "in-source: bridge-daemon.sh L2/L4 wiring is present and not regressed" step_in_source_wiring_present
 
 smoke_log "PASS"

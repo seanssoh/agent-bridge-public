@@ -308,11 +308,55 @@ EOF
 # portable approach given those constraints; pgrep is in
 # procps-ng (Linux) and Darwin base (macOS), already required by other
 # daemon paths.
+#
+# PR #952 r3 P2 #1: pgrep failure escalation. pgrep exit codes:
+#   0 — matches found
+#   1 — no matches (a leaf process; normal termination of the recursion)
+#   2 — invalid options
+#   3 — fatal error (e.g. macOS sandbox "Cannot get process list",
+#       /proc unreadable, etc.)
+# The r2 form swallowed exit ≥2 as "no children", which meant the
+# wedged helper's actual grandchildren survived the kill walk. r3
+# detects the failure and falls back to scanning `ps -A -o pid,ppid`
+# for descendants — `ps` is in POSIX and not subject to the pgrep
+# sandbox path that fails first.
+_bridge_enumerate_children() {
+  # Stdout: one child PID per line. Exit 0 always — caller decides
+  # whether an empty list is meaningful.
+  local parent_pid="$1"
+  local pgrep_out pgrep_rc=0
+  pgrep_out="$(pgrep -P "$parent_pid" 2>/dev/null)" || pgrep_rc=$?
+  if (( pgrep_rc == 0 )) || (( pgrep_rc == 1 )); then
+    # 0 = matches; 1 = no matches (leaf process). Either is the
+    # authoritative answer; no fallback needed.
+    [[ -n "$pgrep_out" ]] && printf '%s\n' "$pgrep_out"
+    return 0
+  fi
+  # pgrep failed (sandbox / /proc gone / invalid options). Fall back
+  # to `ps` — it does not share pgrep's enumeration path on macOS.
+  # `ps -A -o pid=,ppid=` is portable across macOS + Linux + BSD.
+  local line child_pid child_ppid
+  while IFS= read -r line; do
+    # Trim leading whitespace, then split on whitespace.
+    line="${line#"${line%%[![:space:]]*}"}"
+    child_pid="${line%% *}"
+    child_ppid="${line#* }"
+    child_ppid="${child_ppid#"${child_ppid%%[![:space:]]*}"}"
+    child_ppid="${child_ppid%% *}"
+    [[ -z "$child_pid" || -z "$child_ppid" ]] && continue
+    [[ "$child_pid" =~ ^[0-9]+$ && "$child_ppid" =~ ^[0-9]+$ ]] || continue
+    if [[ "$child_ppid" == "$parent_pid" ]]; then
+      printf '%s\n' "$child_pid"
+    fi
+  done < <(ps -A -o pid=,ppid= 2>/dev/null)
+  return 0
+}
+
 _bridge_kill_proc_tree() {
   local root_pid="$1"
   local sig="${2:-TERM}"
   local children child
-  children="$(pgrep -P "$root_pid" 2>/dev/null || true)"
+  children="$(_bridge_enumerate_children "$root_pid")"
   for child in $children; do
     _bridge_kill_proc_tree "$child" "$sig"
   done

@@ -58,11 +58,41 @@ daemon_log_event() {
 # PR #952 r2 P2 #2: recursive descendant kill. Mirrors
 # _bridge_kill_proc_tree in bridge-daemon.sh — kills the entire descendant
 # tree so a python3/tmux grandchild does not leak as an orphan.
+#
+# PR #952 r3 P2 #1: pgrep failure escalation. Mirrors the production
+# _bridge_enumerate_children — when pgrep returns exit ≥2 (macOS sandbox
+# "Cannot get process list", /proc unreadable, etc.), fall back to
+# parsing `ps -A -o pid,ppid` so the wedged helper's grandchildren are
+# still discovered and killed.
+_bridge_enumerate_children() {
+  local parent_pid="$1"
+  local pgrep_out pgrep_rc=0
+  pgrep_out="$(pgrep -P "$parent_pid" 2>/dev/null)" || pgrep_rc=$?
+  if (( pgrep_rc == 0 )) || (( pgrep_rc == 1 )); then
+    [[ -n "$pgrep_out" ]] && printf '%s\n' "$pgrep_out"
+    return 0
+  fi
+  local line child_pid child_ppid
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    child_pid="${line%% *}"
+    child_ppid="${line#* }"
+    child_ppid="${child_ppid#"${child_ppid%%[![:space:]]*}"}"
+    child_ppid="${child_ppid%% *}"
+    [[ -z "$child_pid" || -z "$child_ppid" ]] && continue
+    [[ "$child_pid" =~ ^[0-9]+$ && "$child_ppid" =~ ^[0-9]+$ ]] || continue
+    if [[ "$child_ppid" == "$parent_pid" ]]; then
+      printf '%s\n' "$child_pid"
+    fi
+  done < <(ps -A -o pid=,ppid= 2>/dev/null)
+  return 0
+}
+
 _bridge_kill_proc_tree() {
   local root_pid="$1"
   local sig="${2:-TERM}"
   local children child
-  children="$(pgrep -P "$root_pid" 2>/dev/null || true)"
+  children="$(_bridge_enumerate_children "$root_pid")"
   for child in $children; do
     _bridge_kill_proc_tree "$child" "$sig"
   done
@@ -242,6 +272,42 @@ case "${1:-}" in
     # the timeout + settle window, proving the grandchild was reaped.
     shift
     _bridge_heartbeat_value_with_timeout "$1" "$2" "$3" "$4" _test_spawn_python3_sentinel_writer
+    ;;
+  l2_value_with_timeout_pgrep_broken)
+    # PR #952 r3 P2 #1 probe: TEST_PGREP_BROKEN_PATH points at a directory
+    # containing a stub pgrep that exits 3 (macOS sandbox failure). We
+    # prepend it to PATH only AFTER the helper has been entered, so the
+    # subshell child path lookup hits the stub. The smoke asserts that
+    # the descendant python3 child still gets reaped — proving the ps
+    # fallback discovered it after pgrep failed.
+    shift
+    if [[ -n "${TEST_PGREP_BROKEN_PATH:-}" ]]; then
+      export PATH="${TEST_PGREP_BROKEN_PATH}:${PATH}"
+    fi
+    _bridge_heartbeat_value_with_timeout "$1" "$2" "$3" "$4" _test_spawn_python3_sentinel_writer
+    ;;
+  enumerate_children_pgrep_broken)
+    # PR #952 r3 P2 #1 unit probe: exercise _bridge_enumerate_children
+    # with a broken pgrep stub on PATH. Spawn a known child process
+    # (sleep 30), then call the function and assert the child PID
+    # appears in stdout — proving ps fallback works.
+    shift
+    if [[ -n "${TEST_PGREP_BROKEN_PATH:-}" ]]; then
+      export PATH="${TEST_PGREP_BROKEN_PATH}:${PATH}"
+    fi
+    # Spawn child, capture PID, give kernel a moment to register it.
+    sleep 30 &
+    child_pid=$!
+    sleep 0.2
+    # Print "<my_pid> <child_pid> <enumeration_output>" so the smoke
+    # can assert child_pid appears in enumeration output.
+    echo "PARENT=$$"
+    echo "CHILD=$child_pid"
+    echo "ENUM_OUTPUT_BEGIN"
+    _bridge_enumerate_children "$$"
+    echo "ENUM_OUTPUT_END"
+    kill "$child_pid" 2>/dev/null || true
+    wait "$child_pid" 2>/dev/null || true
     ;;
   l4_nudge_scan)
     shift

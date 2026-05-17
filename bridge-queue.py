@@ -1824,7 +1824,15 @@ def load_ready_agents(path: str | None) -> set[str]:
 
 def cmd_daemon_step(args: argparse.Namespace) -> int:
     snapshot_rows = load_snapshot(args.snapshot)
-    ready_agents = load_ready_agents(getattr(args, "ready_agents_file", None))
+    # PR #952 r3 P2 #2: defer ready_agents load until the non-skip branch.
+    # When the L4 fail-path calls us with --skip-nudges + a broken/blocking
+    # ready-agents file (e.g. /dev/full, a fifo with no writer, an unreadable
+    # path from a wedged write), the r2 form consumed the file at function
+    # entry and would block/raise before maintenance ran. Maintenance ops
+    # (lease extend/expire, cron de-dupe, stale-claim requeue, blocked-task
+    # aging) do not need ready_agents — load only when nudge dispatch will
+    # actually consume it.
+    ready_agents: set[str] = set()
     current_ts = now_ts()
     lease_seconds = int(args.lease_seconds)
     heartbeat_window = int(args.heartbeat_window)
@@ -2081,6 +2089,13 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
             if args.format == "text":
                 print("(maintenance-only; nudges skipped)")
             return 0
+
+        # PR #952 r3 P2 #2: load ready-agents only here, after the skip
+        # check — a broken or blocking ready-agents file must NOT be
+        # consumed on the maintenance-only path.
+        ready_agents = load_ready_agents(
+            getattr(args, "ready_agents_file", None)
+        )
 
         rows = conn.execute(
             """
