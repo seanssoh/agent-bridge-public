@@ -96,6 +96,24 @@ export BRIDGE_DAEMON_LOG="$BRIDGE_STATE_DIR/daemon.log"
 # catching).
 INVOKE_TIMEOUT_SECONDS=15
 
+# Resolve `timeout` portably. Homebrew's coreutils on macOS exposes
+# the binary as `gtimeout`; existing smokes (e.g.
+# skill-render-no-help-recursion.sh, 835-static-admin-launch.sh) walk
+# this same fallback. Without it, an unconditional `timeout` call
+# returns "command not found" rc before the wrapper runs, which
+# causes the negative cases to pass on a shell error (smoke_assert_not_contains
+# trivially succeeds against empty output) and the positive control
+# to fail — silent green smoke on macOS dev hosts. Falls back to a
+# bare invocation if neither binary is on PATH; a downstream hang
+# would manifest as a smoke timeout from the test runner, which is
+# strictly better than the silent-pass failure mode.
+TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  TIMEOUT_BIN="gtimeout"
+fi
+
 # ----------------------------------------------------------------------
 # Fixture project + static `patch` roster entry.
 # ----------------------------------------------------------------------
@@ -146,13 +164,22 @@ EOF
 run_spawn() {
   local agent_name="$1"
   shift
-  timeout "$INVOKE_TIMEOUT_SECONDS" \
+  if [[ -n "$TIMEOUT_BIN" ]]; then
+    "$TIMEOUT_BIN" "$INVOKE_TIMEOUT_SECONDS" \
+      "$BASH4_BIN" "$REPO_ROOT/agent-bridge" \
+      --claude \
+      --name "$agent_name" \
+      --workdir "$FAKE_PROJECT_CANON" \
+      --no-attach \
+      "$@" </dev/null 2>&1 || true
+  else
     "$BASH4_BIN" "$REPO_ROOT/agent-bridge" \
-    --claude \
-    --name "$agent_name" \
-    --workdir "$FAKE_PROJECT_CANON" \
-    --no-attach \
-    "$@" </dev/null 2>&1 || true
+      --claude \
+      --name "$agent_name" \
+      --workdir "$FAKE_PROJECT_CANON" \
+      --no-attach \
+      "$@" </dev/null 2>&1 || true
+  fi
 }
 
 # The exact hijack marker the wrapper prints at agent-bridge:1141 right
