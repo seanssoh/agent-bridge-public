@@ -444,7 +444,11 @@ _BRIDGE_SCRIPT_DIR_AUDIT_LOGGED=0
 export _BRIDGE_SCRIPT_DIR_AUDIT_LOGGED
 
 bridge_resolve_script_dir_sentinel_path() {
-  local target="${1:-${BRIDGE_SCRIPT_DIR:-unset}}"
+  # Reads BRIDGE_SCRIPT_DIR from env. Callers never pass an explicit
+  # target — the global is the only resolution surface — but the
+  # function is wrapped for readability and to keep the path derivation
+  # local. shellcheck disable=SC2120 (no args ever passed; deliberate).
+  local target="${BRIDGE_SCRIPT_DIR:-unset}"
   local hash=""
   # Avoid forking python3 for the hash — we may be here BECAUSE python3
   # cannot run. Bash-native: a short tag derived from PID + path length +
