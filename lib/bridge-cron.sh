@@ -10,6 +10,29 @@ if ! declare -F bridge_resolve_script_dir_check >/dev/null 2>&1; then
   source "$(cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/bridge-core.sh"
 fi
 
+# PR #953 r2 (refs #4807, codex r1 P2): the cron-helpers wrappers added in
+# r1 (bridge_cron_default_slot, bridge_cron_slot_from_datetime, bridge_cron_
+# safe_component, bridge_cron_actions_taken_contains, etc.) call
+# `python3 "$BRIDGE_SCRIPT_DIR/lib/cron-helpers/<name>.py"` directly without
+# going through bridge_cron_python's `bridge_resolve_script_dir_check` guard.
+# Direct-source consumers (tests/memory-daily-harvest/smoke.sh scenario 10
+# does `bash -c "source lib/bridge-cron.sh && bridge_cron_actions_taken_
+# contains ..."` without bridge-lib.sh) leave BRIDGE_SCRIPT_DIR unset, so the
+# helper paths expand to `/lib/cron-helpers/<name>.py` and python3 fails with
+# [Errno 2]. Derive BRIDGE_SCRIPT_DIR from BASH_SOURCE here (same shape as
+# bridge_resolve_script_dir_check's BASH_SOURCE recovery branch) so the
+# wrappers can dispatch without each adding their own guard. The full-loader
+# path (bridge-lib.sh sets BRIDGE_SCRIPT_DIR before sourcing this file) is a
+# no-op via the := default-if-unset pattern.
+if [[ -z "${BRIDGE_SCRIPT_DIR:-}" ]]; then
+  _bridge_cron_resolved_script_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P 2>/dev/null)" || _bridge_cron_resolved_script_dir=""
+  if [[ -n "$_bridge_cron_resolved_script_dir" && -d "$_bridge_cron_resolved_script_dir/scripts/python-helpers" ]]; then
+    BRIDGE_SCRIPT_DIR="$_bridge_cron_resolved_script_dir"
+    export BRIDGE_SCRIPT_DIR
+  fi
+  unset _bridge_cron_resolved_script_dir
+fi
+
 bridge_require_legacy_cron_jobs() {
   if [[ -f "$BRIDGE_SOURCE_CRON_JOBS_FILE" ]]; then
     return 0
