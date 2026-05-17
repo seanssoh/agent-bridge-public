@@ -143,13 +143,16 @@ fi
 #     shape from Claude's numbered picker (single confirmation line, no
 #     options). Has its own regex below (_PICKER_CODEX_CONFIRM_RE).
 #
-# NOT added (intentionally):
+# 2026-05-17 additions (#948 — fresh-install spawn crash-loop):
 #   - "Yes, I accept" / "No, exit" (Bypass Permissions warning) — Claude's
-#     default cursor is on "No, exit" (option 1). A bare Enter would EXIT
-#     Claude on first launch. Needs explicit "send 2 + Enter" support
-#     before adding. Operator must accept this warning interactively
-#     once per host; the result is persisted in Claude Code's local
-#     settings so subsequent launches skip the warning.
+#     default cursor is on "No, exit" (option 1). Bare Enter would EXIT
+#     Claude. Now handled via _PICKER_BYPASS_PERMISSIONS_RE +
+#     explicit "send 2 + Enter" through the new option-N send mechanism
+#     (BRIDGE_PICKER_SWEEP_SEND_OPTION_FN seam below).
+#   - Auto mode warning ("Yes, and make it my default mode" /
+#     "Yes, enable auto mode" / "No, exit") — same pattern. Sweeper sends
+#     option 1 (make-default) so subsequent claude restarts don't re-prompt
+#     and crash-loop the agent.
 # ---------------------------------------------------------------------------
 
 _PICKER_OPTION_LINE_RE='^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.[[:space:]]+(Stop and wait for limit to reset|Switch to extra usage|Switch to Team plan|Resume from summary \(recommended\)|Resume full session as-is|I am using this for local development)[[:space:]]*$'
@@ -162,6 +165,23 @@ _PICKER_TAIL_RE='^[[:space:]]*Enter to confirm · Esc to cancel[[:space:]]*$'
 # was blocked at the cwd-confirm prompt during the v0.13.x → v0.14.1
 # upgrade supervise flow.
 _PICKER_CODEX_CONFIRM_RE='^[[:space:]]*Press enter to continue[[:space:]]*$'
+
+# #948 — Bypass Permissions warning. Claude CLI default cursor is on
+# "No, exit" (option 1), so bare Enter would EXIT Claude on first launch
+# in a fresh install / fresh user account. Must explicitly send "2" + Enter
+# to accept. The warning is emitted whenever launch_cmd uses
+# `--dangerously-skip-permissions` (agent-bridge's static admin contract)
+# and the user/machine hasn't acked it yet.
+_PICKER_BYPASS_PERMISSIONS_RE='^[[:space:]]*(❯[[:space:]]*)?[12]\.[[:space:]]+(No, exit|Yes, I accept)[[:space:]]*$'
+
+# #948 — Auto mode warning. 3-option picker:
+#   1. Yes, and make it my default mode
+#   2. Yes, enable auto mode (just this once)
+#   3. No, exit
+# Default cursor is on option 1. Send "1" + Enter so subsequent claude
+# restarts don't re-prompt and crash-loop the agent. This is the variant
+# the operator preference suggested in #948 ("auto mode 사용할 수 있는지").
+_PICKER_AUTO_MODE_RE='^[[:space:]]*(❯[[:space:]]*)?[123]\.[[:space:]]+(Yes, and make it my default mode|Yes, enable auto mode|No, exit)[[:space:]]*$'
 
 # ---------------------------------------------------------------------------
 # Test seams. The smoke replaces these with fixture-driven wrappers.
@@ -187,6 +207,18 @@ _psw_default_send_enter() {
     tmux send-keys -t "$target" Enter 2>/dev/null
 }
 
+# #948 — send an explicit option number followed by Enter. Used for pickers
+# whose default cursor lands on a destructive option (e.g., Bypass Permissions
+# warning defaults to "No, exit"). The send is split into two calls so the
+# digit input is committed before Enter fires it — tmux send-keys collapses
+# adjacent string args, and a stray "2Enter" literal can confuse the TUI.
+# shellcheck disable=SC2329 # invoked indirectly via $_PSW_*_FN below
+_psw_default_send_option() {
+    local target="$1" option_num="$2"
+    tmux send-keys -t "$target" "$option_num" 2>/dev/null && \
+        tmux send-keys -t "$target" Enter 2>/dev/null
+}
+
 # shellcheck disable=SC2329 # invoked indirectly via $_PSW_*_FN below
 _psw_default_create_task() {
     local title="$1" body="$2" recipient="$3"
@@ -202,11 +234,13 @@ _psw_default_create_task() {
 _PSW_LIST_SESSIONS_FN="${BRIDGE_PICKER_SWEEP_LIST_SESSIONS_FN:-_psw_default_list_sessions}"
 _PSW_CAPTURE_PANE_FN="${BRIDGE_PICKER_SWEEP_CAPTURE_PANE_FN:-_psw_default_capture_pane}"
 _PSW_SEND_ENTER_FN="${BRIDGE_PICKER_SWEEP_SEND_ENTER_FN:-_psw_default_send_enter}"
+_PSW_SEND_OPTION_FN="${BRIDGE_PICKER_SWEEP_SEND_OPTION_FN:-_psw_default_send_option}"
 _PSW_CREATE_TASK_FN="${BRIDGE_PICKER_SWEEP_CREATE_TASK_FN:-_psw_default_create_task}"
 
 _psw_list_sessions() { "$_PSW_LIST_SESSIONS_FN"; }
 _psw_capture_pane()  { "$_PSW_CAPTURE_PANE_FN"  "$@"; }
 _psw_send_enter()    { "$_PSW_SEND_ENTER_FN"    "$@"; }
+_psw_send_option()   { "$_PSW_SEND_OPTION_FN"   "$@"; }
 _psw_create_task()   { "$_PSW_CREATE_TASK_FN"   "$@"; }
 
 # ---------------------------------------------------------------------------
@@ -223,7 +257,21 @@ while IFS= read -r agent; do
 
     cap="$(_psw_capture_pane "$agent" || true)"
     matched_pattern=""
-    if printf '%s\n' "$cap" | grep -qE "$_PICKER_OPTION_LINE_RE"; then
+    explicit_option=""   # #948 — when set, send "N + Enter" instead of bare Enter
+    if printf '%s\n' "$cap" | grep -qE "$_PICKER_BYPASS_PERMISSIONS_RE" \
+        && printf '%s\n' "$cap" | grep -qE "$_PICKER_TAIL_RE"; then
+        # Bypass Permissions warning (#948). Default cursor is "No, exit",
+        # so we must EXPLICITLY send "2" to accept. Tail-required to avoid
+        # false-positive on free-prose contexts (docs / logs / PR bodies).
+        matched_pattern="bypass-permissions warning"
+        explicit_option="2"
+    elif printf '%s\n' "$cap" | grep -qE "$_PICKER_AUTO_MODE_RE" \
+        && printf '%s\n' "$cap" | grep -qE "$_PICKER_TAIL_RE"; then
+        # Auto mode warning (#948). Send "1" so the mode becomes the user
+        # default — next claude restart won't re-prompt.
+        matched_pattern="auto-mode warning"
+        explicit_option="1"
+    elif printf '%s\n' "$cap" | grep -qE "$_PICKER_OPTION_LINE_RE"; then
         if printf '%s\n' "$cap" | grep -qE "$_PICKER_TAIL_RE"; then
             matched_pattern="picker option line + tail"
         else
@@ -236,10 +284,18 @@ while IFS= read -r agent; do
     fi
 
     if [[ -n "$matched_pattern" ]]; then
-        _psw_log "PICKER detected on '$agent' ($matched_pattern) — sending Enter for default"
-        if ! _psw_send_enter "$agent"; then
-            _psw_log "  send-enter failed for $agent"
-            continue
+        if [[ -n "$explicit_option" ]]; then
+            _psw_log "PICKER detected on '$agent' ($matched_pattern) — sending option $explicit_option + Enter"
+            if ! _psw_send_option "$agent" "$explicit_option"; then
+                _psw_log "  send-option failed for $agent"
+                continue
+            fi
+        else
+            _psw_log "PICKER detected on '$agent' ($matched_pattern) — sending Enter for default"
+            if ! _psw_send_enter "$agent"; then
+                _psw_log "  send-enter failed for $agent"
+                continue
+            fi
         fi
         unstuck_agents+=("$agent:$matched_pattern")
     fi

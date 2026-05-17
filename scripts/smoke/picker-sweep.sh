@@ -81,13 +81,20 @@ mock_send_enter() {
     printf '%s\n' "$target" >> "$SEND_LOG"
 }
 
+# #948 — mock for the explicit "send N + Enter" path. Records the agent and
+# option number so smoke assertions can verify the correct option was sent.
+mock_send_option() {
+    local target="$1" option_num="$2"
+    printf '%s:option=%s\n' "$target" "$option_num" >> "$SEND_OPTION_LOG"
+}
+
 mock_create_task() {
     local title="$1" body="$2" recipient="$3"
     printf 'recipient=%s\ntitle=%s\nbody=%s\n---\n' \
         "$recipient" "$title" "$body" >> "$TASK_LOG"
 }
 
-export -f mock_list_sessions mock_capture_pane mock_send_enter mock_create_task
+export -f mock_list_sessions mock_capture_pane mock_send_enter mock_send_option mock_create_task
 MOCK_EOF
 # shellcheck source=/dev/null
 source "$MOCK_LIB"
@@ -96,16 +103,19 @@ source "$MOCK_LIB"
 export BRIDGE_PICKER_SWEEP_LIST_SESSIONS_FN=mock_list_sessions
 export BRIDGE_PICKER_SWEEP_CAPTURE_PANE_FN=mock_capture_pane
 export BRIDGE_PICKER_SWEEP_SEND_ENTER_FN=mock_send_enter
+export BRIDGE_PICKER_SWEEP_SEND_OPTION_FN=mock_send_option
 export BRIDGE_PICKER_SWEEP_CREATE_TASK_FN=mock_create_task
 
 # Pin the log file so the smoke can inspect it.
 export BRIDGE_PICKER_SWEEP_LOG="$FIXTURE_DIR/picker-sweep.log"
-export FIXTURE_DIR SEND_LOG TASK_LOG
+SEND_OPTION_LOG="$FIXTURE_DIR/sent-options.log"
+export FIXTURE_DIR SEND_LOG SEND_OPTION_LOG TASK_LOG
 
 reset_fixture() {
-    rm -f "$FIXTURE_DIR/sessions" "$FIXTURE_DIR"/pane-* "$SEND_LOG" "$TASK_LOG" "$BRIDGE_PICKER_SWEEP_LOG"
+    rm -f "$FIXTURE_DIR/sessions" "$FIXTURE_DIR"/pane-* "$SEND_LOG" "$SEND_OPTION_LOG" "$TASK_LOG" "$BRIDGE_PICKER_SWEEP_LOG"
     : >"$FIXTURE_DIR/sessions"
     : >"$SEND_LOG"
+    : >"$SEND_OPTION_LOG"
     : >"$TASK_LOG"
 }
 
@@ -334,5 +344,76 @@ PANE
 
 run_sweep
 smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "9 no send (codex confirm in '>' quote)"
+
+# ---------------------------------------------------------------------------
+# Test 10 — Bypass Permissions warning (#948). Default cursor is on
+# "No, exit" so bare Enter would EXIT Claude. Must send option 2 explicitly.
+# ---------------------------------------------------------------------------
+
+smoke_log "10. bypass-permissions warning → send option 2"
+reset_fixture
+printf '%s\n' "bypass-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-bypass-agent" <<'PANE'
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  In Bypass Permissions mode, Claude Code will not ask for your approval
+  before running potentially dangerous commands.
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+
+  Enter to confirm · Esc to cancel
+PANE
+
+export BRIDGE_PICKER_SWEEP_NOTIFY="admin"
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "10 no bare-Enter send (would EXIT Claude)"
+smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "10 one option send"
+smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "bypass-agent:option=2" "10 send option=2 (Yes I accept)"
+smoke_assert_contains "$(cat "$TASK_LOG")" "bypass-agent:bypass-permissions warning" "10 task body identifies pattern"
+
+# ---------------------------------------------------------------------------
+# Test 11 — Auto mode warning (#948). 3-option picker; send option 1 so the
+# mode becomes the user default and subsequent claude restarts skip the prompt.
+# ---------------------------------------------------------------------------
+
+smoke_log "11. auto-mode warning → send option 1"
+reset_fixture
+printf '%s\n' "auto-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-auto-agent" <<'PANE'
+  WARNING: Auto mode allows Claude to run commands automatically.
+
+  ❯ 1. Yes, and make it my default mode
+    2. Yes, enable auto mode
+    3. No, exit
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "11 no bare-Enter send"
+smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "11 one option send"
+smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "auto-agent:option=1" "11 send option=1 (make default)"
+smoke_assert_contains "$(cat "$TASK_LOG")" "auto-agent:auto-mode warning" "11 task body identifies pattern"
+
+# ---------------------------------------------------------------------------
+# Test 12 — Bypass/auto patterns must NOT fire on free-prose mention.
+# Same false-positive defence as Test 3/9 but for the new regexes.
+# ---------------------------------------------------------------------------
+
+smoke_log "12. bypass/auto patterns — false-positive defence (free-prose)"
+reset_fixture
+printf '%s\n' "doc-agent3" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-doc-agent3" <<'PANE'
+> The picker reads:
+>   ❯ 1. No, exit
+>     2. Yes, I accept
+> When the operator selects "2. Yes, I accept" the warning is acked.
+> Auto mode picker similar: 1. Yes, and make it my default mode / 2. Yes, enable auto mode / 3. No, exit
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "12 no bare-Enter send (free-prose)"
+smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "12 no option send (free-prose)"
 
 smoke_log "all checks passed"
