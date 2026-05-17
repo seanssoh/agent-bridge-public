@@ -1391,44 +1391,30 @@ run_list() {
     emit_agent_records_json list "$output"
     return 0
   fi
-  bridge_agent_manage_python "$(emit_agent_records_json list "$output")" <<'PY'
-import json
-import sys
-
-items = json.loads(sys.argv[1])
-print("agent | eng | src | active | state | iso | q/c/b | wake | notify | chan | session | workdir")
-for item in items:
-    suffix = " [admin]" if item.get("admin") else ""
-    isolation = item.get("isolation", {}) or {}
-    mode = isolation.get("mode") or "shared"
-    os_user = isolation.get("os_user") or ""
-    iso_text = f"{mode}:{os_user}" if os_user else mode
-    # v0.8.0 T5: when the runtime hatch is on, override the iso column
-    # so a glance at `agent-bridge agent list` makes it obvious the
-    # boundary is off across the whole controller. The configured
-    # isolation_mode stays available in the JSON form and in `agent
-    # show` for operators who want both fields.
-    runtime_state = isolation.get("runtime_state") or ""
-    if runtime_state == "disabled-by-env":
-        iso_text = "disabled-by-env"
-    queue = item.get("queue", {}) or {}
-    notify = item.get("notify", {}) or {}
-    channels = item.get("channels", {}) or {}
-    print(
-        f"{item.get('agent','')}{suffix} | "
-        f"{item.get('engine','')} | "
-        f"{item.get('source','')} | "
-        f"{'yes' if item.get('active') else 'no'} | "
-        f"{item.get('activity_state','')} | "
-        f"{iso_text} | "
-        f"{queue.get('queued',0)}/{queue.get('claimed',0)}/{queue.get('blocked',0)} | "
-        f"{item.get('wake_status','')} | "
-        f"{notify.get('status','')} | "
-        f"{channels.get('status','')} | "
-        f"{item.get('session','')} | "
-        f"{item.get('workdir','')}"
-    )
-PY
+  # Bash 5.3.9 deadlock (footgun #11, KNOWN_ISSUES.md §26 — refs queue
+  # task #4773): the original form
+  # `bridge_agent_manage_python "$(emit_agent_records_json list "$output")" <<'PY'`
+  # nested two heredoc-stdin python3 subprocesses (emit_agent_records_json
+  # itself is a `python3 - "$tsv" <<'PY'` consumer), and the
+  # function-wrapper + heredoc-stdin combination wedged `read_comsub` on
+  # operator hosts (7-17 hour hangs on `agent list`). Spool the JSON to a
+  # tempfile and dispatch to a standalone helper script — no
+  # heredoc-stdin anywhere on the call path. Same precedent as
+  # lib/upgrade-helpers/agent-restart-json.py.
+  bridge_require_python
+  local _list_dir _list_rc
+  _list_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-agent-list-json.XXXXXX")"
+  emit_agent_records_json list "$output" >"$_list_dir/records.json"
+  # codex PR #940 r2 BLOCKING: RETURN trap does NOT fire on `set -e`
+  # errexit abort (Bash 5.3.9 forced-failure probe confirmed). Use the
+  # explicit set +e / capture-rc / set -e pattern so cleanup ALWAYS runs
+  # regardless of helper rc, and propagate the helper's exit status.
+  set +e
+  python3 "$SCRIPT_DIR/lib/agent-cli-helpers/list-format-text.py" "$_list_dir/records.json"
+  _list_rc=$?
+  set -e
+  rm -rf "$_list_dir"
+  return "$_list_rc"
 }
 
 # run_registry — issue #598 Track 1. Read-only enumeration of every
@@ -1520,36 +1506,28 @@ run_registry() {
     done
   fi
 
-  bridge_agent_manage_python "$rows" <<'PY'
-import json
-import sys
-
-raw = sys.argv[1] if len(sys.argv) > 1 else ""
-records = []
-for line in raw.splitlines():
-    if not line.strip():
-        continue
-    parts = line.split("\t")
-    if len(parts) < 10:
-        continue
-    (id_, cls, agent_source, privilege_class, home, workdir,
-     engine, session, is_alive, source) = parts[:10]
-    records.append({
-        "id": id_,
-        "class": cls,
-        "agent_source": agent_source,
-        "privilege_class": privilege_class,
-        "home": home,
-        "workdir": workdir,
-        "engine": engine,
-        "session": session,
-        "is_alive": is_alive == "1",
-        "source": source,
-    })
-
-records.sort(key=lambda r: r["id"])
-print(json.dumps(records, ensure_ascii=False, indent=2))
-PY
+  # Bash 5.3.9 deadlock (footgun #11 — refs queue task #4773): the
+  # original form `bridge_agent_manage_python "$rows" <<'PY'` wedged
+  # `read_comsub` on the operator host even though no `$()` capture
+  # surrounded the call. The function-wrapper indirection through
+  # `bridge_agent_manage_python` (which expands to `python3 - "$@"`)
+  # combined with heredoc-stdin reliably hung 7-17 hours during
+  # `bridge-agent.sh registry` on bash 5.3.9. Spool rows to a tempfile
+  # and dispatch to a standalone helper — same precedent as
+  # lib/upgrade-helpers/agent-restart-json.py.
+  bridge_require_python
+  local _registry_dir _registry_rc
+  _registry_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-agent-registry.XXXXXX")"
+  printf '%s' "$rows" >"$_registry_dir/rows.tsv"
+  # codex PR #940 r2 BLOCKING: see run_list above for the RETURN-trap-
+  # bypass rationale. Same explicit set +e / capture-rc / set -e pattern
+  # ensures the tempdir is removed regardless of helper rc.
+  set +e
+  python3 "$SCRIPT_DIR/lib/agent-cli-helpers/registry-format-json.py" "$_registry_dir/rows.tsv"
+  _registry_rc=$?
+  set -e
+  rm -rf "$_registry_dir"
+  return "$_registry_rc"
 }
 
 # Issue #780 — multi-signal alive determination for `agent show --json`.
@@ -1680,25 +1658,38 @@ run_show() {
     # written alongside the existing `active` field. `active` stays as
     # the tmux-only signal so callers that depend on the old meaning
     # are unchanged; `alive` is the new operator-facing health value.
-    bridge_agent_manage_python \
-      "$(emit_agent_records_json show "$output")" \
-      "$(bridge_agent_channel_diagnostics_json "$agent")" \
-      "$(bridge_agent_session_health_json "$agent")" \
-      "$(bridge_agent_session_source_path "$agent")" \
-      "$(bridge_agent_alive_signals_json "$agent")" <<'PY'
-import json
-import sys
-
-payload = json.loads(sys.argv[1])
-payload.setdefault("channels", {})["diagnostics"] = json.loads(sys.argv[2])
-payload["session_health"] = json.loads(sys.argv[3])
-payload["session_source"] = sys.argv[4] if len(sys.argv) > 4 and sys.argv[4] else None
-alive_blob = json.loads(sys.argv[5]) if len(sys.argv) > 5 and sys.argv[5] else {}
-payload["alive"] = bool(alive_blob.get("alive", False))
-payload["alive_signals"] = alive_blob.get("signals", {})
-print(json.dumps(payload, ensure_ascii=False, indent=2))
-PY
-    return 0
+    #
+    # Bash 5.3.9 deadlock (footgun #11 — refs queue task #4773): the
+    # original form chained four nested `$()` captures (three of which
+    # were themselves `python3 - <<'PY'` heredoc-stdin consumers) into a
+    # `bridge_agent_manage_python ... <<'PY'` parent heredoc reader. The
+    # combination wedged `read_comsub` on the operator host. Spool each
+    # input to a tempfile and dispatch to a standalone helper —
+    # same precedent as lib/upgrade-helpers/agent-restart-json.py.
+    bridge_require_python
+    local _show_dir _show_rc
+    _show_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-agent-show.XXXXXX")"
+    emit_agent_records_json show "$output" >"$_show_dir/records.json"
+    bridge_agent_channel_diagnostics_json "$agent" >"$_show_dir/diagnostics.json"
+    bridge_agent_session_health_json "$agent" >"$_show_dir/session-health.json"
+    bridge_agent_alive_signals_json "$agent" >"$_show_dir/alive.json"
+    bridge_agent_session_source_path "$agent" >"$_show_dir/session-source.txt"
+    # codex PR #940 r2 BLOCKING: see run_list above for the RETURN-trap-
+    # bypass rationale. Same explicit set +e / capture-rc / set -e pattern
+    # ensures the tempdir is removed regardless of helper rc. Cleanup
+    # lives INSIDE this json_mode branch so the text-mode path (which
+    # never created _show_dir) does not try to rm a non-existent dir.
+    set +e
+    python3 "$SCRIPT_DIR/lib/agent-cli-helpers/show-format-json.py" \
+      "$_show_dir/records.json" \
+      "$_show_dir/diagnostics.json" \
+      "$_show_dir/session-health.json" \
+      "$_show_dir/session-source.txt" \
+      "$_show_dir/alive.json"
+    _show_rc=$?
+    set -e
+    rm -rf "$_show_dir"
+    return "$_show_rc"
   fi
 
   # Issue 6 (v0.11.0): tab-separated rows with potentially-empty middle

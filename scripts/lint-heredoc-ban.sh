@@ -1,26 +1,32 @@
 #!/usr/bin/env bash
 # scripts/lint-heredoc-ban.sh — ratchet lint preventing NEW heredoc-stdin
-# subprocess sites in bridge-upgrade.sh.
+# subprocess sites in footgun-#11-prone files (currently bridge-upgrade.sh
+# and bridge-agent.sh).
 #
 # Context: footgun #11 (Bash 5.3.9 `read_comsub` / `heredoc_write` deadlock
-# chain — fixed in v0.13.7 through v0.13.9). Six leap-path sites were
-# extracted to standalone helpers under lib/upgrade-helpers/; 18 off-leap
-# sites remain in bridge-upgrade.sh deferred to the S10-late stabilization
-# wave. This lint ratchets the count downward — it fails CI if anyone
-# introduces a NEW heredoc-stdin subprocess line in bridge-upgrade.sh
-# without first migrating an existing one out.
+# chain — fixed in v0.13.7 through v0.13.9 for the upgrader and refs #4773
+# for the agent CLI). Six leap-path upgrader sites were extracted to
+# standalone helpers under lib/upgrade-helpers/; 18 off-leap sites remain
+# in bridge-upgrade.sh deferred to the S10-late stabilization wave. For
+# bridge-agent.sh, the three nested-$() heredoc-stdin sites in
+# run_list/run_registry/run_show were migrated to file-as-argv (operator
+# host hangs of 7-17 hours triaged in queue task #4773); 9 single-level
+# heredoc-stdin sites remain. This lint ratchets each count downward —
+# it fails CI if anyone introduces a NEW heredoc-stdin subprocess line
+# in either file without first migrating an existing one out.
 #
 # Ratchet semantics:
-# - BRIDGE_UPGRADE_HEREDOC_CEILING (default 18) is the current allowed count.
-# - When S10-late migrates sites, the ceiling drops to the new count via
-#   PR that updates this script's default.
+# - BRIDGE_UPGRADE_HEREDOC_CEILING (default 18) — bridge-upgrade.sh.
+# - BRIDGE_AGENT_HEREDOC_CEILING   (default  9) — bridge-agent.sh.
+# - When stabilization migrates more sites, the ceilings drop to the new
+#   counts via PR that updates this script's defaults.
 # - PRs that add new heredoc-stdin without removing one push count over
 #   the ceiling and fail this lint.
 #
 # Contract — broad-match:
-#   A "site" is any non-comment line in bridge-upgrade.sh that contains
-#   a heredoc-fed `bash -s ...` or `python3 - ...` subprocess on the
-#   same line — i.e., the sub-pattern
+#   A "site" is any non-comment line in a target file (bridge-upgrade.sh
+#   or bridge-agent.sh) that contains a heredoc-fed `bash -s ...` or
+#   `python3 - ...` subprocess on the same line — i.e., the sub-pattern
 #       <bash -s | python3 -> ... <<EOF | <<'EOF' | <<"EOF" | <<PY | <<'PY' | <<"PY" | <<-...
 #   appears anywhere on the line.
 #
@@ -46,16 +52,22 @@
 # progress.
 #
 # Usage:
-#   scripts/lint-heredoc-ban.sh              # check, exit 1 if over ceiling
-#   scripts/lint-heredoc-ban.sh --list       # list all detected sites
+#   scripts/lint-heredoc-ban.sh              # check every target, exit 1 over ceiling
+#   scripts/lint-heredoc-ban.sh --list       # list all detected sites in every target
 #   scripts/lint-heredoc-ban.sh --self-test  # verify pattern against fixtures
-#   BRIDGE_UPGRADE_HEREDOC_CEILING=10 ...    # override ceiling for testing
+#   BRIDGE_UPGRADE_HEREDOC_CEILING=10 ...    # override bridge-upgrade.sh ceiling
+#   BRIDGE_AGENT_HEREDOC_CEILING=8 ...       # override bridge-agent.sh ceiling
 
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-target_file="$repo_root/bridge-upgrade.sh"
-ceiling="${BRIDGE_UPGRADE_HEREDOC_CEILING:-18}"
+
+# Target files + their per-file ceiling env var name + default. Adding a
+# new target is a 1-line append. Each target is checked independently.
+declare -a TARGETS=(
+  "bridge-upgrade.sh:BRIDGE_UPGRADE_HEREDOC_CEILING:18"
+  "bridge-agent.sh:BRIDGE_AGENT_HEREDOC_CEILING:9"
+)
 
 # Core danger pattern. Anchored to "command name + space + heredoc op + tag",
 # but NOT anchored to start-of-line — so wrapper shape is irrelevant.
@@ -147,33 +159,55 @@ if [[ "${1:-}" == "--self-test" ]]; then
   exit $?
 fi
 
-if [[ ! -f "$target_file" ]]; then
-  echo "[lint-heredoc-ban] target file missing: $target_file" >&2
-  exit 2
-fi
-
+mode="check"
 if [[ "${1:-}" == "--list" ]]; then
-  list_sites "$target_file"
-  echo
-  echo "(ceiling: $ceiling)"
-  exit 0
+  mode="list"
 fi
 
-count="$(count_sites "$target_file")"
+overall_rc=0
+for spec in "${TARGETS[@]}"; do
+  rel_path="${spec%%:*}"
+  rest="${spec#*:}"
+  env_var="${rest%%:*}"
+  default_ceiling="${rest#*:}"
+  target_file="$repo_root/$rel_path"
 
-if [[ "$count" -gt "$ceiling" ]]; then
-  echo "[lint-heredoc-ban] FAIL: bridge-upgrade.sh has $count heredoc-stdin subprocess sites, exceeding the ceiling ($ceiling)." >&2
-  echo "[lint-heredoc-ban] This lint ratchets footgun #11 carry-over. New heredoc-stdin sites must be" >&2
-  echo "[lint-heredoc-ban] extracted to lib/upgrade-helpers/ (see existing examples)." >&2
-  echo "[lint-heredoc-ban]" >&2
-  echo "[lint-heredoc-ban] Detected sites:" >&2
-  list_sites "$target_file" | sed 's/^/[lint-heredoc-ban]   /' >&2
-  exit 1
-fi
+  # Resolve the ceiling via indirect expansion so we honor per-file env
+  # overrides without listing every var name here.
+  ceiling="${!env_var:-$default_ceiling}"
 
-if [[ "$count" -lt "$ceiling" ]]; then
-  echo "[lint-heredoc-ban] note: count=$count is below ceiling=$ceiling. Consider lowering the ceiling in scripts/lint-heredoc-ban.sh to ratchet."
-fi
+  if [[ ! -f "$target_file" ]]; then
+    echo "[lint-heredoc-ban] target file missing: $target_file" >&2
+    overall_rc=2
+    continue
+  fi
 
-echo "[lint-heredoc-ban] PASS: count=$count, ceiling=$ceiling"
-exit 0
+  if [[ "$mode" == "list" ]]; then
+    echo "== $rel_path (ceiling: $ceiling, env: $env_var) =="
+    list_sites "$target_file"
+    echo
+    continue
+  fi
+
+  count="$(count_sites "$target_file")"
+
+  if [[ "$count" -gt "$ceiling" ]]; then
+    echo "[lint-heredoc-ban] FAIL: $rel_path has $count heredoc-stdin subprocess sites, exceeding the ceiling ($ceiling)." >&2
+    echo "[lint-heredoc-ban] This lint ratchets footgun #11 carry-over. New heredoc-stdin sites must be" >&2
+    echo "[lint-heredoc-ban] extracted to lib/upgrade-helpers/ (see existing examples) or spooled to a tempfile" >&2
+    echo "[lint-heredoc-ban] (file-as-argv, see PR #937 status-print pattern)." >&2
+    echo "[lint-heredoc-ban]" >&2
+    echo "[lint-heredoc-ban] Detected sites in $rel_path:" >&2
+    list_sites "$target_file" | sed 's/^/[lint-heredoc-ban]   /' >&2
+    overall_rc=1
+    continue
+  fi
+
+  if [[ "$count" -lt "$ceiling" ]]; then
+    echo "[lint-heredoc-ban] note: $rel_path count=$count is below ceiling=$ceiling. Consider lowering the $env_var default in scripts/lint-heredoc-ban.sh to ratchet."
+  fi
+
+  echo "[lint-heredoc-ban] PASS: $rel_path count=$count, ceiling=$ceiling"
+done
+
+exit "$overall_rc"
