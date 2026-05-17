@@ -4295,6 +4295,19 @@ _bridge_precompact_handle_started() {
   local agent_dir="$2"
   local marker="$3"
 
+  # #946 L1 (r2 codex P1 #2): stale-source guard. The three `python3
+  # "$BRIDGE_SCRIPT_DIR/bridge-channels.py"` invocations below
+  # (route-precompact-target, render-precompact-message, send-managed
+  # -message) all run inside `$(...)` substitutions, which is the
+  # swallow surface r1 missed — codex cited the precompact_route path
+  # specifically. Re-check once at function entry so we fail-fast
+  # before any of the three forks and leave the marker untouched for
+  # the next daemon cycle to retry after recovery (e.g. an upgrade
+  # finishes and BRIDGE_SCRIPT_DIR is restored).
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+
   local processed_dir="$agent_dir/processed"
   local invalid_dir="$agent_dir/invalid"
   mkdir -p "$processed_dir" "$invalid_dir"
@@ -4611,6 +4624,14 @@ _bridge_precompact_handle_completed() {
   local agent="$1"
   local agent_dir="$2"
   local marker="$3"
+
+  # #946 L1 (r2 codex P1 #2): stale-source guard. The render/send
+  # invocations below run inside `$(...)` substitutions — same swallow
+  # surface as _bridge_precompact_handle_started. Fail-fast and leave
+  # the marker for the next cycle to retry.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
 
   local processed_dir="$agent_dir/processed"
   local invalid_dir="$agent_dir/invalid"
@@ -6219,6 +6240,25 @@ cmd_sync_cycle() {
   _nudge_tmp="$(mktemp)"
   # shellcheck disable=SC2064
   trap "rm -f -- '$_nudge_tmp'" RETURN
+
+  # #946 L1 (r2): per-tick stale-source-checkout drift detector. Runs
+  # FIRST so the cycle never silently fans out [Errno 2] from helper
+  # invocations downstream when the source root was moved/removed
+  # mid-flight (wave-orchestration worktree cleanup, `agb upgrade
+  # --apply`, `brew prune`). The check helper logs once to
+  # BRIDGE_DAEMON_LOG (de-duped per process) and returns non-zero; we
+  # surface it as a daemon_info line every tick so `agb status` /
+  # `tail daemon.log` makes the regression visible instead of letting
+  # the operator chase a silent 6-hour hang (the symptom that closed
+  # #946 in the first place). Continue the tick — most wrapper helpers
+  # also re-check and fail-empty, so the cycle drains quickly rather
+  # than wedging on per-call retries. The next launchd-restart of the
+  # daemon (from inside the source dir at boot time, or via the silence
+  # watchdog) re-arms BRIDGE_SCRIPT_DIR.
+  BRIDGE_DAEMON_LAST_STEP="l1_script_dir_health"
+  if ! bridge_resolve_script_dir_check; then
+    daemon_info "[L1] BRIDGE_SCRIPT_DIR=${BRIDGE_SCRIPT_DIR:-<unset>} is missing or invalid; helper invocations will fail-empty this tick. Re-source from a valid checkout (or run \`agb upgrade --apply\`) and the daemon will recover."
+  fi
 
   # The daemon is long-lived, so dynamic agents created after startup will not
   # exist in memory unless we reload the roster each cycle.

@@ -1,8 +1,25 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 
+# PR #951 r7 (#946 L1): scripts/smoke/nudge-marker-recovery.sh sources this
+# file directly without bridge-lib.sh, so bridge_resolve_script_dir_check
+# (defined in bridge-core.sh) would be undefined. Source bridge-core.sh
+# idempotently; full-loader path is a no-op via the declare -F gate.
+if ! declare -F bridge_resolve_script_dir_check >/dev/null 2>&1; then
+  # shellcheck source=lib/bridge-core.sh
+  source "$(cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/bridge-core.sh"
+fi
+
 bridge_channels_python() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard. Channels helper is reached from
+  # many `$(...)` substitutions (precompact route resolution, render,
+  # send, webhook status). Without the guard a stale checkout fans out
+  # the same [Errno 2] cascade as the daemon-hang on every channel
+  # op tick.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-channels.py" "$@"
 }
 

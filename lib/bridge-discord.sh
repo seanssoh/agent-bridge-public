@@ -56,6 +56,13 @@ bridge_discord_relay_step() {
     return 1
   fi
 
+  # #946 L1 (r2): stale-source guard. Discord relay runs every daemon
+  # tick; an unguarded call fans out [Errno 2] across the relay cycle
+  # when the source checkout vanishes mid-flight.
+  if ! bridge_resolve_script_dir_check; then
+    rm -f "$snapshot_file"
+    return 1
+  fi
   if ! python3 "$BRIDGE_SCRIPT_DIR/bridge-discord-relay.py" \
     sync \
     --agent-snapshot "$snapshot_file" \

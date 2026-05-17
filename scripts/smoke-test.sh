@@ -25,7 +25,37 @@ if [[ -z "${BRIDGE_HOME:-}" ]]; then
   BRIDGE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/agb-smoke-isolated.XXXXXX")/.agent-bridge"
   export BRIDGE_HOME
   _SMOKE_AUTO_ISOLATED=1
+  # r5 (codex PR #947 r4) — export so child bash -s blocks see it.
+  # Without export, the conditional refresh blocks at line ~1148 and ~1330
+  # in child shells see _SMOKE_AUTO_ISOLATED as empty and never re-derive
+  # BRIDGE_DATA_ROOT, so pending-attention state ends up under the initial
+  # auto-isolated home outside $scratch / $TMP_ROOT.
+  export _SMOKE_AUTO_ISOLATED
   printf '[smoke] BRIDGE_HOME auto-isolated to %s (was unset)\n' "$BRIDGE_HOME"
+  # #946: when the smoke matrix runs against an auto-isolated fresh
+  # temp BRIDGE_HOME, every child shell that sources bridge-lib.sh
+  # would otherwise be classified as `fresh-install-candidate` and
+  # die at the v0.8.0 isolation hard-cut (the fresh-install bypass
+  # handshake requires the owner to be bridge-init.sh / bridge-
+  # bootstrap.sh / agent-bridge — smoke is none of those). Export
+  # an explicit v2 layout override so resolver step 1 (env) wins
+  # and the matrix can actually run. macOS platform discriminator
+  # skips the v2 isolation enforcement (no `ab-shared` group), so
+  # the override is safe; on Linux without v2 primitives the same
+  # discriminator silently skips enforcement, matching the auto
+  # behavior of v0.14.1 fresh installs. Only applied for the auto-
+  # isolated path — when the caller exports BRIDGE_HOME (CI runner,
+  # custom rig) they remain responsible for layout state.
+  # r4 (codex PR #947 r3) — unset derived v2 roots that bridge-isolation-v2.sh
+  # preserves via the ${VAR:-default} idiom. Without unsetting, an operator
+  # shell that already exported these (e.g. an Agent Bridge-managed admin
+  # session running smoke against this checkout) would let later helpers
+  # write runtime/shared/state under the LIVE install despite the auto-
+  # isolated BRIDGE_HOME. Unsetting forces bridge-isolation-v2.sh to
+  # recompute from the freshly set BRIDGE_DATA_ROOT.
+  unset BRIDGE_AGENT_ROOT_V2 BRIDGE_SHARED_ROOT BRIDGE_CONTROLLER_STATE_ROOT
+  export BRIDGE_LAYOUT="v2"
+  export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
 fi
 if [[ -n "${BRIDGE_HOME:-}" ]]; then
   _smoke_allowed_tmp_prefix=""
@@ -282,11 +312,23 @@ EOF
 # operator-shell defaults would silently steer bridge-run.sh at the live
 # roster and the test would be a no-op (or worse, an env-pollution false
 # pass against unrelated agents).
+#
+# Explicit BRIDGE_LAYOUT=v2 + BRIDGE_DATA_ROOT take resolver step 1 (env
+# override) so the dummy agent-roster.local.sh written above does not trip
+# bridge_layout_resolver_has_existing_evidence — that would classify the
+# fresh temp dir as `markerless(existing-install)` and silently kill the
+# entire smoke matrix here via the v0.8.0 isolation hard-cut (#946). The
+# evidence-based fail-fast still protects real installs; this is the
+# correct shape for an isolated dry-run probe whose only on-disk artifact
+# is the roster definition the test itself wrote.
 LAUNCH_DRYRUN_OUTPUT="$(env -u BRIDGE_ROSTER_FILE -u BRIDGE_ROSTER_LOCAL_FILE \
   -u BRIDGE_STATE_DIR -u BRIDGE_ACTIVE_AGENT_DIR -u BRIDGE_LOG_DIR \
   -u BRIDGE_SHARED_DIR -u BRIDGE_TASK_DB \
   BRIDGE_HOME="$LAUNCH_DRYRUN_HOME" \
-  "$BASH4_BIN" "$REPO_ROOT/bridge-run.sh" "dryrun-redact-smoke" --dry-run 2>&1)"
+  BRIDGE_LAYOUT="v2" \
+  BRIDGE_DATA_ROOT="$LAUNCH_DRYRUN_HOME/data" \
+  "$BASH4_BIN" "$REPO_ROOT/bridge-run.sh" "dryrun-redact-smoke" --dry-run 2>&1)" \
+  || die "bridge-run.sh --dry-run probe failed (rc=$?); output: $LAUNCH_DRYRUN_OUTPUT"
 assert_contains "$LAUNCH_DRYRUN_OUTPUT" "launch=MS365_CLIENT_SECRET=***redacted***"
 assert_contains "$LAUNCH_DRYRUN_OUTPUT" "MY_API_TOKEN=***redacted***"
 # Non-secret BRIDGE_LAYOUT_MARKER_KEY must round-trip with its real value
@@ -295,6 +337,196 @@ assert_contains "$LAUNCH_DRYRUN_OUTPUT" "BRIDGE_LAYOUT_MARKER_KEY=preserve-me"
 assert_not_contains "$LAUNCH_DRYRUN_OUTPUT" "fake-secret-XYZ"
 assert_not_contains "$LAUNCH_DRYRUN_OUTPUT" "fake-token-ABC"
 rm -rf "$LAUNCH_DRYRUN_HOME"
+
+log "BRIDGE_SCRIPT_DIR startup validation + re-resolution helper (issue #946 L1)"
+# Regression coverage for the daemon-hang root cause documented in #946.
+# When the source checkout that BRIDGE_SCRIPT_DIR was captured from is
+# removed mid-flight (wave-orchestration fixer worktree cleanup, brew
+# prune of an upgrade source dir, `agb upgrade --apply` moving the
+# source root), every subsequent
+# `python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/…"` call from the
+# daemon used to fail silently with [Errno 2] and the cycle would
+# accumulate hung child bash processes until the tick loop wedged.
+# Lock the new contract:
+#   1. Startup-time: bridge-lib.sh dies loudly when its script dir is
+#      missing scripts/python-helpers/.
+#   2. Run-time: bridge_resolve_script_dir_or_die dies with the same
+#      class of message when the dir vanishes after sourcing.
+SCRIPTDIR_FAKE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/agb-smoke-scriptdir.XXXXXX")"
+# Negative startup case: stage a fake source tree WITHOUT
+# scripts/python-helpers/ and source bridge-lib.sh from it. Validation
+# must die with the documented message.
+mkdir -p "$SCRIPTDIR_FAKE_ROOT/bad/lib"
+cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/bad/bridge-lib.sh"
+SCRIPTDIR_BAD_OUT="$("$BASH4_BIN" -c "source '$SCRIPTDIR_FAKE_ROOT/bad/bridge-lib.sh'" 2>&1 || true)"
+assert_contains "$SCRIPTDIR_BAD_OUT" "missing scripts/python-helpers/"
+# Positive startup case: a tree WITH scripts/python-helpers/ passes
+# startup validation (control). Copy lib/ (don't symlink) so the fixture
+# stays self-contained: r4's bridge_resolve_script_dir_check uses
+# `cd -P "$(dirname "${BASH_SOURCE[0]}")/.."` which resolves symlinks,
+# so a symlinked lib/ would let the resolver follow back to the real
+# checkout and find scripts/python-helpers there after we delete the
+# fake scripts/ below — breaking the failure-path assertion.
+mkdir -p "$SCRIPTDIR_FAKE_ROOT/good/scripts/python-helpers"
+cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/good/bridge-lib.sh"
+cp -R "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/good/lib"
+ln -sf "$REPO_ROOT/VERSION" "$SCRIPTDIR_FAKE_ROOT/good/VERSION" 2>/dev/null || true
+SCRIPTDIR_GOOD_OUT="$("$BASH4_BIN" -c "source '$SCRIPTDIR_FAKE_ROOT/good/bridge-lib.sh' >/dev/null 2>&1 && echo SCRIPTDIR_STARTUP_OK" 2>&1 || true)"
+assert_contains "$SCRIPTDIR_GOOD_OUT" "SCRIPTDIR_STARTUP_OK"
+# Run-time re-validation: source the staged copy (passes startup), then
+# remove the staged scripts/python-helpers/ to simulate a worktree
+# cleanup mid-flight. bridge_resolve_script_dir_or_die must die with the
+# documented message. We delete only the python-helpers subdir, leaving
+# the bridge-lib.sh on disk so the re-resolution branch via BASH_SOURCE
+# also fails (its dirname still lacks the subdir) — without that we
+# would silently recover and the test would be a no-op.
+SCRIPTDIR_LIVE_OUT="$("$BASH4_BIN" -c "
+  source '$SCRIPTDIR_FAKE_ROOT/good/bridge-lib.sh' >/dev/null 2>&1
+  rm -rf '$SCRIPTDIR_FAKE_ROOT/good/scripts'
+  bridge_resolve_script_dir_or_die
+" 2>&1 || true)"
+assert_contains "$SCRIPTDIR_LIVE_OUT" "does not exist or is missing scripts/python-helpers/"
+
+# r2 (codex P1 #2 regression — substitution-context propagation):
+# bridge_resolve_script_dir_check must return non-zero AND write an
+# audit line to BRIDGE_DAEMON_LOG even when called from inside `$(...)`
+# with errexit suppressed via `|| true`. Without this contract the
+# daemon-hang #946 reproduces unchanged because the substitution
+# swallows `bridge_die`'s subshell exit, the parent receives an empty
+# string, and the next tick repeats the same failing helper invocation.
+#
+# Layout: source the staged bridge-lib.sh, remove the source dir mid-
+# flight, then run bridge_resolve_script_dir_check inside `$(...) || true`
+# and assert:
+#   (a) the substitution result is empty
+#   (b) BRIDGE_DAEMON_LOG (BRIDGE_STATE_DIR/daemon.log by default)
+#       carries one `[L1] BRIDGE_SCRIPT_DIR=...` audit line
+#   (c) repeated check calls within the same shell do NOT duplicate
+#       the audit (dedup contract via per-PID sentinel file)
+SCRIPTDIR_SUB_STATE="$(mktemp -d "${TMPDIR:-/tmp}/agb-smoke-scriptdir-sub.XXXXXX")"
+# Re-stage a fresh "good" tree because the previous block destroyed
+# its scripts/python-helpers/ subtree.
+mkdir -p "$SCRIPTDIR_FAKE_ROOT/sub/scripts/python-helpers"
+cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/sub/bridge-lib.sh"
+# Copy lib/ (don't symlink) — see comment on the `good` fixture above.
+# r4's resolver uses `cd -P` so a symlinked lib/ would let the failure
+# path silently recover via the real checkout.
+cp -R "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/sub/lib"
+ln -sf "$REPO_ROOT/VERSION" "$SCRIPTDIR_FAKE_ROOT/sub/VERSION" 2>/dev/null || true
+SCRIPTDIR_SUB_OUT="$(BRIDGE_HOME="$SCRIPTDIR_SUB_STATE" \
+  BRIDGE_STATE_DIR="$SCRIPTDIR_SUB_STATE/state" \
+  BRIDGE_DAEMON_LOG="$SCRIPTDIR_SUB_STATE/state/daemon.log" \
+  "$BASH4_BIN" -c "
+  source '$SCRIPTDIR_FAKE_ROOT/sub/bridge-lib.sh' >/dev/null 2>&1
+  rm -rf '$SCRIPTDIR_FAKE_ROOT/sub/scripts'
+  # Substitution-context call with errexit suppressed — the daemon's
+  # \`bridge_agent_channels_csv \"\$agent\" 2>/dev/null || true\` shape.
+  SUB_RESULT=\"\$(bridge_resolve_script_dir_check && echo NEVER_REACHED || true)\"
+  printf 'SUB_RESULT=[%s]\\n' \"\$SUB_RESULT\"
+  # A second call from the same shell should NOT re-log.
+  bridge_resolve_script_dir_check >/dev/null 2>&1 || true
+  bridge_resolve_script_dir_check >/dev/null 2>&1 || true
+" 2>&1 || true)"
+# (a) substitution result empty — the check helper returned 1 without
+# emitting NEVER_REACHED.
+assert_contains "$SCRIPTDIR_SUB_OUT" "SUB_RESULT=[]"
+assert_not_contains "$SCRIPTDIR_SUB_OUT" "NEVER_REACHED"
+# (b) one audit line landed in BRIDGE_DAEMON_LOG. The log file proves
+# the substitution did not swallow the signal — codex P1 #2 contract.
+SCRIPTDIR_LOG_FILE="$SCRIPTDIR_SUB_STATE/state/daemon.log"
+if [[ -f "$SCRIPTDIR_LOG_FILE" ]]; then
+  SCRIPTDIR_LOG_LINES="$(grep -c '\[L1\] BRIDGE_SCRIPT_DIR=' "$SCRIPTDIR_LOG_FILE" 2>/dev/null || printf '0')"
+else
+  SCRIPTDIR_LOG_LINES=0
+fi
+if (( SCRIPTDIR_LOG_LINES < 1 )); then
+  echo "FAIL: expected >=1 [L1] BRIDGE_SCRIPT_DIR= line in $SCRIPTDIR_LOG_FILE, got $SCRIPTDIR_LOG_LINES" >&2
+  echo "--- log file ---" >&2
+  cat "$SCRIPTDIR_LOG_FILE" 2>&1 >&2 || echo "(no log)" >&2
+  echo "--- subprocess output ---" >&2
+  printf '%s\n' "$SCRIPTDIR_SUB_OUT" >&2
+  exit 1
+fi
+# (c) the per-PID sentinel deduped: even with three check calls the
+# audit log carries exactly one entry. Without the cross-subshell
+# sentinel a substitution-context caller would re-log on every call.
+if (( SCRIPTDIR_LOG_LINES > 1 )); then
+  echo "FAIL: expected exactly 1 deduped [L1] BRIDGE_SCRIPT_DIR= line, got $SCRIPTDIR_LOG_LINES" >&2
+  cat "$SCRIPTDIR_LOG_FILE" >&2
+  exit 1
+fi
+rm -rf "$SCRIPTDIR_SUB_STATE"
+
+# r6 (codex P2 — guard ordering): `bridge_sync_skill_docs` used to early-
+# return 0 via `[[ -f $BRIDGE_SCRIPT_DIR/bridge-docs.py ]]` BEFORE the
+# stale-source guard. When the source dir vanished, the file-existence
+# test saw `bridge-docs.py` missing, took the graceful skip, and reported
+# success — masking the cascade and skipping the [L1] audit entirely.
+# r6 reorders so the guard runs first. Lock the contract:
+#   (a) stale dir → rc=1 + [L1] audit landed.
+#   (b) valid dir + bridge-docs.py legitimately absent → rc=0, no audit.
+SCRIPTDIR_GUARD_STATE="$(mktemp -d "${TMPDIR:-/tmp}/agb-smoke-scriptdir-guard.XXXXXX")"
+mkdir -p "$SCRIPTDIR_FAKE_ROOT/guard/scripts/python-helpers"
+cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/guard/bridge-lib.sh"
+cp -R "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/guard/lib"
+ln -sf "$REPO_ROOT/VERSION" "$SCRIPTDIR_FAKE_ROOT/guard/VERSION" 2>/dev/null || true
+# Intentionally do NOT copy bridge-docs.py — the original anti-pattern
+# would happily return 0 in that state. After r6 the missing-file skip
+# only applies when the script dir is valid.
+SCRIPTDIR_GUARD_STALE_OUT="$(BRIDGE_HOME="$SCRIPTDIR_GUARD_STATE/stale" \
+  BRIDGE_STATE_DIR="$SCRIPTDIR_GUARD_STATE/stale/state" \
+  BRIDGE_DAEMON_LOG="$SCRIPTDIR_GUARD_STATE/stale/state/daemon.log" \
+  "$BASH4_BIN" -c "
+  mkdir -p \"\$BRIDGE_STATE_DIR\"
+  source '$SCRIPTDIR_FAKE_ROOT/guard/bridge-lib.sh' >/dev/null 2>&1
+  rm -rf '$SCRIPTDIR_FAKE_ROOT/guard/scripts'
+  bridge_sync_skill_docs smoke >/dev/null 2>&1
+  printf 'GUARD_STALE_RC=%s\n' \"\$?\"
+" 2>&1 || true)"
+assert_contains "$SCRIPTDIR_GUARD_STALE_OUT" "GUARD_STALE_RC=1"
+SCRIPTDIR_GUARD_STALE_LOG="$SCRIPTDIR_GUARD_STATE/stale/state/daemon.log"
+if [[ -f "$SCRIPTDIR_GUARD_STALE_LOG" ]]; then
+  SCRIPTDIR_GUARD_STALE_LINES="$(grep -c '\[L1\] BRIDGE_SCRIPT_DIR=' "$SCRIPTDIR_GUARD_STALE_LOG" 2>/dev/null || printf '0')"
+else
+  SCRIPTDIR_GUARD_STALE_LINES=0
+fi
+if (( SCRIPTDIR_GUARD_STALE_LINES < 1 )); then
+  echo "FAIL: r6 stale guard — expected >=1 [L1] line, got $SCRIPTDIR_GUARD_STALE_LINES" >&2
+  cat "$SCRIPTDIR_GUARD_STALE_LOG" 2>&1 >&2 || echo "(no log)" >&2
+  echo "--- subprocess output ---" >&2
+  printf '%s\n' "$SCRIPTDIR_GUARD_STALE_OUT" >&2
+  exit 1
+fi
+# (b) Positive: valid script dir but bridge-docs.py absent. Re-stage
+# (the previous block destroyed the guard fixture's scripts/).
+mkdir -p "$SCRIPTDIR_FAKE_ROOT/guard2/scripts/python-helpers"
+cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/guard2/bridge-lib.sh"
+cp -R "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/guard2/lib"
+ln -sf "$REPO_ROOT/VERSION" "$SCRIPTDIR_FAKE_ROOT/guard2/VERSION" 2>/dev/null || true
+SCRIPTDIR_GUARD_OK_OUT="$(BRIDGE_HOME="$SCRIPTDIR_GUARD_STATE/ok" \
+  BRIDGE_STATE_DIR="$SCRIPTDIR_GUARD_STATE/ok/state" \
+  BRIDGE_DAEMON_LOG="$SCRIPTDIR_GUARD_STATE/ok/state/daemon.log" \
+  "$BASH4_BIN" -c "
+  mkdir -p \"\$BRIDGE_STATE_DIR\"
+  source '$SCRIPTDIR_FAKE_ROOT/guard2/bridge-lib.sh' >/dev/null 2>&1
+  bridge_sync_skill_docs smoke >/dev/null 2>&1
+  printf 'GUARD_OK_RC=%s\n' \"\$?\"
+" 2>&1 || true)"
+assert_contains "$SCRIPTDIR_GUARD_OK_OUT" "GUARD_OK_RC=0"
+SCRIPTDIR_GUARD_OK_LOG="$SCRIPTDIR_GUARD_STATE/ok/state/daemon.log"
+if [[ -f "$SCRIPTDIR_GUARD_OK_LOG" ]]; then
+  SCRIPTDIR_GUARD_OK_LINES="$(grep -c '\[L1\] BRIDGE_SCRIPT_DIR=' "$SCRIPTDIR_GUARD_OK_LOG" 2>/dev/null || printf '0')"
+else
+  SCRIPTDIR_GUARD_OK_LINES=0
+fi
+if (( SCRIPTDIR_GUARD_OK_LINES != 0 )); then
+  echo "FAIL: r6 minimal-install path — expected 0 [L1] lines, got $SCRIPTDIR_GUARD_OK_LINES" >&2
+  cat "$SCRIPTDIR_GUARD_OK_LOG" 2>&1 >&2 || true
+  exit 1
+fi
+rm -rf "$SCRIPTDIR_GUARD_STATE"
+rm -rf "$SCRIPTDIR_FAKE_ROOT"
+log "  [ok] script-dir startup validation + re-resolution helper + substitution propagation + sync-skill-docs guard ordering"
 
 log "bridge_cron_sync_enabled reducer: any-0-disables semantics (issue #192)"
 # Regression matrix for the `BRIDGE_CRON_SYNC_ENABLED` reducer introduced
@@ -1122,6 +1354,16 @@ export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
 export BRIDGE_ACTIVE_AGENT_DIR="$BRIDGE_STATE_DIR/agents"
 export BRIDGE_LOG_DIR="$BRIDGE_HOME/logs"
 export BRIDGE_SHARED_DIR="$BRIDGE_HOME/shared"
+# #946 r3 — match BRIDGE_DATA_ROOT to the new scratch home so v2-derived
+# paths (BRIDGE_AGENT_ROOT_V2 etc.) inside any bridge-lib.sh source that
+# follows write under $scratch instead of the auto-isolated home from
+# line 44. Only refresh under the auto-isolation contract — operator-
+# supplied BRIDGE_HOME keeps full control of layout state.
+if [[ "${_SMOKE_AUTO_ISOLATED:-0}" == "1" ]]; then
+  # r4 (PR #947 r3) — same derived-root reset as the auto-isolation block.
+  unset BRIDGE_AGENT_ROOT_V2 BRIDGE_SHARED_ROOT BRIDGE_CONTROLLER_STATE_ROOT
+  export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
+fi
 agent="spool-test"
 
 # Round-trip escape/unescape over the four escape classes.
@@ -1301,6 +1543,19 @@ SPOOL_UT
 
 TMP_ROOT="$(cd "$(mktemp -d)" && pwd -P)"
 export BRIDGE_HOME="$TMP_ROOT/bridge-home"
+# #946 r2 — refresh BRIDGE_DATA_ROOT when BRIDGE_HOME is reassigned mid-script.
+# Without this re-export, the auto-isolation block's BRIDGE_DATA_ROOT (line 44)
+# still pointed at the obsolete `agb-smoke-isolated.../data` tree, so v2 paths
+# such as BRIDGE_AGENT_ROOT_V2 derived under bridge-lib.sh would escape
+# $TMP_ROOT and cleanup would miss the state files. Only refresh when the
+# auto-isolation path armed v2 in the first place — preserves the contract
+# that operator-supplied BRIDGE_HOME (CI runner / custom rig) keeps full
+# control of layout state.
+if [[ "${_SMOKE_AUTO_ISOLATED:-0}" == "1" ]]; then
+  # r4 (PR #947 r3) — same derived-root reset as the auto-isolation block.
+  unset BRIDGE_AGENT_ROOT_V2 BRIDGE_SHARED_ROOT BRIDGE_CONTROLLER_STATE_ROOT
+  export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
+fi
 export BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1
 # Issue #403 fix #4: pin the isolated-user home root under TMP_ROOT so any
 # inner test path that builds `<root>/<os_user>/.agent-bridge` cannot
@@ -10971,6 +11226,7 @@ bash "$REPO_ROOT/scripts/smoke/smoke-isolation-no-live-leak.sh"
 log "running bridge-agent-cli-no-deadlock smoke (refs queue task #4773)"
 bash "$REPO_ROOT/scripts/smoke/bridge-agent-cli-no-deadlock.sh"
 
+<<<<<<< HEAD
 # Issue #946 L2 + L4 — daemon tick-loop wedge defenses + PR #952 r2
 # regressions. L2 pre-resolves heartbeat heredoc command substitutions
 # with a per-call deadline so a stuck helper (e.g. stale-worktree python3
@@ -10982,5 +11238,18 @@ bash "$REPO_ROOT/scripts/smoke/bridge-agent-cli-no-deadlock.sh"
 # task aging — root cause of operator-host nudge-suppression 2026-05-17).
 log "running daemon-tick-guards-l2-l4 smoke (refs #946 L2+L4, PR #952 r2)"
 bash "$REPO_ROOT/scripts/smoke/daemon-tick-guards-l2-l4.sh"
+=======
+# bridge-watchdog-silence.py previously truncated captured daemon
+# stop/start output to the last line, so every wedge from 2026-05-15
+# onward surfaced the same v0.8.0 ACL background sentence in the
+# silence-watchdog audit row. Issue #946 L3 preserves the full stderr
+# block and classifies the resolver die path (line 384 / 406 / 439).
+# This smoke step pins the classifier token map, the state-file
+# `resolver_die` + `stderr_preview` persistence, and the multi-line
+# survival contract so the next wedge is diagnosable in seconds rather
+# than hours.
+log "running watchdog-silence-stderr-capture smoke (#946 L3)"
+bash "$REPO_ROOT/scripts/smoke/watchdog-silence-stderr-capture.sh"
+>>>>>>> origin/main
 
 log "smoke test passed"

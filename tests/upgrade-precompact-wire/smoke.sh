@@ -187,6 +187,17 @@ fi
 banner 5 "bridge_ensure_claude_pre_compact_hook (shell wrapper) registers via shell entry point"
 C5_HOME="$SMOKE_ROOT/c5"
 mkdir -p "$C5_HOME/hooks" "$C5_HOME/agents" "$C5_HOME/lib"
+# #946 L1 r2 (PR #951) added a per-call `bridge_resolve_script_dir_check`
+# guard at every `python3 "$BRIDGE_SCRIPT_DIR/..."` wrapper site so the
+# daemon fails-empty instead of hanging when the source checkout is
+# moved/deleted mid-flight. The guard requires
+# `$BRIDGE_SCRIPT_DIR/scripts/python-helpers/` to exist; in this smoke
+# we set BRIDGE_SCRIPT_DIR=BRIDGE_HOME=$C5_HOME (mocked source root) so
+# we have to seed the sentinel directory or the guard reports the home
+# as stale and the wrapper returns 1 before reaching bridge-hooks.py.
+# Empty is fine — the precompact path doesn't actually invoke any
+# helper under that directory.
+mkdir -p "$C5_HOME/scripts/python-helpers"
 cp "$REPO_ROOT/bridge-hooks.py" "$C5_HOME/bridge-hooks.py"
 cp "$REPO_ROOT/hooks/pre-compact.py" "$C5_HOME/hooks/pre-compact.py"
 cp "$REPO_ROOT/hooks/bridge_hook_common.py" "$C5_HOME/hooks/bridge_hook_common.py"

@@ -83,5 +83,9 @@ bridge_profile_active_flag() {
 
 bridge_profile_python() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-profile.py" "$@"
 }
