@@ -600,7 +600,7 @@ scripts/smoke/queue.sh	57	C1	9312c346bf44c1593cb43e20042a6e5dd516a1ef1ad8a9f40e6
 scripts/smoke/queue.sh	262	C1	33a4c2ede24bfd27c26122c45faecda13962db315a1bcf9264db9df1690dbcda	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
 scripts/smoke/queue.sh	516	C3	f3f3b3f0296c1c5ff36fe573ff63f33d4a5103028d8002ca3de38d9182fe033f	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/queue.sh	575	C3	2003a271cd72790bc792cd4accbe01da311c5c6b61a16c61dc4347a75732d14c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke/queue.sh	618	C3	63864df49225fc3e243408d9d37c6ac421e901e2964f5e577baf3e6854db6ee6	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	process-boundary-safe
+scripts/smoke/queue.sh	618	C3	63864df49225fc3e243408d9d37c6ac421e901e2964f5e577baf3e6854db6ee6	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/queue.sh	706	C3	a63b059a9e1b33221d04d760916f2bcc3902930dcee88d817544a226bbbed547	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/queue.sh	923	C1	63864df49225fc3e243408d9d37c6ac421e901e2964f5e577baf3e6854db6ee6	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	process-boundary-safe
 scripts/smoke/queue.sh	956	C1	63864df49225fc3e243408d9d37c6ac421e901e2964f5e577baf3e6854db6ee6	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	process-boundary-safe
