@@ -52,6 +52,13 @@ smoke_make_temp_root "$SMOKE_NAME"
 # C1/C2/C3/C4/H3 shape we want to classify (r2 fix for codex PR #954 r1
 # finding P1 #2). The audit script skips scripts/smoke/lint-heredoc-fixtures/
 # explicitly so the checked-in fixtures do not pollute the real baseline.
+#
+# fixture.sh is STATIC TEXT — never executed. The r5 P2 shape near the
+# bottom (heredoc inside `$(case ... in arm) ... ;; esac)`) is not
+# parseable by Bash 3.2 (`bash -n` errors on macOS stock bash) but
+# parses cleanly under Bash 4+, which the audit requires. Do not "fix"
+# this for Bash 3.2 — the parser shape IS the regression the fixture
+# exercises.
 # ---------------------------------------------------------------------------
 
 FIXTURES_SRC="$REPO_ROOT/scripts/smoke/lint-heredoc-fixtures"
@@ -167,14 +174,34 @@ expect_at 92  C1   "C1 cross-line \$() capture"
 # C1 — cross-line backtick wrapper variant.
 expect_at 99  C1   "C1 cross-line backtick capture"
 
-# r4 P1 — case-arm `pattern)` preceding `$()` capture wrapping a heredoc.
-# Without case-arm stripping, the leading `)` (no matching `(`) would
-# decrement the prior `$()` capture_depth via the simple counter, which
-# clamps to 0 and silently drops entry_capture — the heredoc inside the
-# real capture then mis-classifies as C3, bypassing the CI ratchet. The
-# case-arm stripper drops the leading `pattern)` before paren counting
-# so the close count stays balanced and entry_capture survives.
-expect_at 114 C1   "C1 case-arm then \$() capture (r4 P1)"
+# r5 P2 — case-arm `pattern)` INSIDE an already-open `$()` capture.
+# This is the configuration that actually requires maybe_strip_case_arm
+# to run: without the strip, the case-arm `)` pops the 'C' frame the
+# outer `$(` pushed, the heredoc's entry_capture becomes 0, and the
+# heredoc mis-classifies as C3 — bypassing the CI ratchet (codex PR
+# #954 r3 P1 BLOCKING). r4's earlier shape put the case-arm BEFORE
+# `out=$(` opened, so the heredoc's entry_capture was set by the
+# inner `$(` regardless and the regression wasn't actually exercised
+# (codex PR #954 r4 P2 finding #5). r5 restructures: outer `$(` opens
+# first, then `case`, then `active)`, then the heredoc inside.
+expect_at 120 C1   "C1 case-arm inside open \$() (r5 P2)"
+
+# r5 P2 verification hook: rerun the audit with the debug counter env
+# var set, and assert the case-arm stripper actually fired on the
+# fixture. The expect_at above is the live classification witness; this
+# is the orthogonal "the strip ran in real code" assertion the brief
+# called out, so a future regression that silently no-ops the stripper
+# (e.g. a future commit gates it more aggressively) would fail this
+# even before the classification regression surfaces.
+fires_stderr="$SMOKE_TMP_ROOT/audit-fires.stderr"
+BRIDGE_AUDIT_DEBUG_CASE_ARM=1 "$fixture_dir/scripts/audit-footgun-11.sh" --summary \
+  >/dev/null 2>"$fires_stderr"
+fires_count="$(grep -oE 'STRIP_CASE_ARM_FIRES=[0-9]+' "$fires_stderr" | cut -d= -f2 | head -1)"
+[[ -n "$fires_count" ]] \
+  || smoke_fail "STRIP_CASE_ARM_FIRES not emitted by audit --summary under BRIDGE_AUDIT_DEBUG_CASE_ARM=1"
+(( fires_count > 0 )) \
+  || smoke_fail "STRIP_CASE_ARM_FIRES=0 — maybe_strip_case_arm did NOT fire on the fixture scan, the strip is silently no-op'd"
+smoke_log "STRIP_CASE_ARM_FIRES=$fires_count on fixture scan (case-arm strip ran)"
 
 # ---------------------------------------------------------------------------
 # Snippet-hash stability under reformatting. Reformatted_pair() generates

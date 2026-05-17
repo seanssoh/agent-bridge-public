@@ -100,21 +100,27 @@ out=`
 print("cross-line backtick")
 PY`
 
-# r4 P1 fixture: case-arm `pattern)` between an `$(` opener and a heredoc.
-# The leading case-arm `)` has no matching `(`. Before r4 the depth counter
-# decremented on the case-arm `)` and the clamp-to-0 guard dragged a real
-# prior `$(...)` capture down to 0, so the heredoc below mis-classified as
-# C3 (codex PR #954 r3 P1 BLOCKING — bypassed the CI ratchet). After r4
-# maybe_strip_case_arm drops the leading `pattern)` BEFORE paren counting,
-# keeping the close count balanced and preserving real cross-line capture
-# state across case branches.
-case "$mode" in
-  active)
-    out=$(
-      python3 - "$payload" <<'PY'
-print("after case arm")
+# r5 P2 fixture: case-arm `pattern)` INSIDE an already-open `$(` capture.
+# This is the configuration that actually requires maybe_strip_case_arm
+# to run — without the strip, the case-arm `)` would pop the 'C' frame
+# the outer `$(` pushed (paren-type stack tolerance silently eats the
+# unmatched close), the heredoc below would mis-classify as C3, and the
+# CI ratchet would be bypassed (codex PR #954 r3 P1 BLOCKING).
+#
+# r4's earlier shape put `case "$mode" in / active)` BEFORE `out=$(`
+# opened, so the regression was never actually exercised — the
+# `entry_capture` state at the heredoc line happened to be the value
+# the outer-most `$(` set, not the post-case-arm value (codex PR #954
+# r4 P2 finding #5). r5 restructures so the outer `$(` opens BEFORE
+# the case statement.
+result=$(
+  echo "outer-open"
+  case "$mode" in
+    active)
+      python3 - <<'PY'
+print("captured")
 PY
-    )
-    ;;
-esac
+      ;;
+  esac
+)
 

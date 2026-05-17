@@ -405,6 +405,13 @@ strip_quotes_and_comments() {
   local n=${#s}
   local i=0
   local ch
+  # Running per-line `(` / `)` counts in `out`. Used by the `#` comment-
+  # break check to detect "comment-marker appears inside an unclosed
+  # `$(...)` open" — that's bash-illegal as a real comment, so the `#`
+  # is actually inside a string the naive `"` toggle mis-tracked. Both
+  # counts treat `$(` and bare `(` the same (any open keeps the line
+  # tail).
+  local strip_line_open_count=0 strip_line_close_count=0
   while (( i < n )); do
     ch="${s:i:1}"
     if (( STRIP_IN_SINGLE == 1 )); then
@@ -415,9 +422,17 @@ strip_quotes_and_comments() {
       continue
     fi
     if (( STRIP_IN_DOUBLE == 1 )); then
-      # Backslash escapes the next char inside double-quotes too.
+      # Backslash escapes the next char inside double-quotes too. Apply
+      # the same `\$(` → swallow-paren rule as the outside-quote path
+      # so a `printf "...\$(\n"` shape doesn't push a phantom `(` onto
+      # the paren stack (r5 self-test).
       if [[ "$ch" == "\\" && $((i + 1)) -lt $n ]]; then
-        i=$((i + 2))
+        local _esc_next="${s:i+1:1}"
+        if [[ "$_esc_next" == '$' && $((i + 2)) -lt $n && "${s:i+2:1}" == '(' ]]; then
+          i=$((i + 3))
+        else
+          i=$((i + 2))
+        fi
         continue
       fi
       if [[ "$ch" == '"' ]]; then
@@ -427,25 +442,59 @@ strip_quotes_and_comments() {
       fi
       # Inside double-quote, `$(`, `)`, and `` ` `` are still code.
       # Pass them through so capture counters see them.
+      if [[ "$ch" == '(' ]]; then
+        strip_line_open_count=$((strip_line_open_count + 1))
+      elif [[ "$ch" == ')' ]]; then
+        strip_line_close_count=$((strip_line_close_count + 1))
+      fi
       out="${out}${ch}"
       i=$((i + 1))
       continue
     fi
     # Trailing comment: `#` preceded by whitespace or start of line.
     # Conservative rule: only strip `# ` (space-comment) or comment at
-    # start of line so we don't trip on `${#var}`.
+    # start of line so we don't trip on `${#var}`. Comment-only LINES
+    # are already skipped by scan_file's `trimmed == #*` check before
+    # this stripper is invoked.
+    #
+    # r5: also require that the stripper has emitted no unbalanced `(`
+    # so far on this line. The naive `"` toggle can mis-read the entry
+    # quote state when nested quotes appear inside
+    # `"$(... "X" ... "Y" ...)"` (each inner `"..."` toggles dbl=1→0→1,
+    # leaving us "outside" mid-string from the stripper's view even
+    # though bash semantics keeps us inside the outer string). When a
+    # `#` shows up inside such a string, breaking the loop would drop
+    # the closing `)` of an open `$(`, leaking a phantom 'C' onto
+    # CAPTURE_STACK and turning every downstream heredoc into a
+    # cross-line C1/C2 false positive. The "any unbalanced `(` in
+    # current `out`" check catches the common case where the `#` is
+    # inside a string opened mid-line via `$( ... "..." # ... )"`.
+    # Counts maintained inline so the comment-check is O(1) per line.
     if [[ "$ch" == "#" ]]; then
       if (( i == 0 )); then
         break
       fi
       local prev="${s:i-1:1}"
       if [[ "$prev" == " " || "$prev" == $'\t' ]]; then
-        break
+        if (( strip_line_open_count <= strip_line_close_count )); then
+          break
+        fi
+        # Unbalanced opens — keep going so the closing `)` is captured.
       fi
     fi
     if [[ "$ch" == "\\" && $((i + 1)) -lt $n ]]; then
-      # Skip escaped char wholesale (e.g. \$, \`, \(, \) ).
-      i=$((i + 2))
+      # Skip escaped char wholesale (e.g. \$, \`, \(, \) ). For `\$(`,
+      # also swallow the trailing `(` — the escape turned `$(` into a
+      # literal `$(` from bash's view (no command substitution opens),
+      # so the `(` is structural NOPS and pushing it onto the paren
+      # stack would unbalance everything downstream (r5 self-test
+      # caught this on `printf "STATE_NEXT_TS=\$(\n"` shapes).
+      local _esc_next="${s:i+1:1}"
+      if [[ "$_esc_next" == '$' && $((i + 2)) -lt $n && "${s:i+2:1}" == '(' ]]; then
+        i=$((i + 3))
+      else
+        i=$((i + 2))
+      fi
       continue
     fi
     if [[ "$ch" == "'" ]]; then
@@ -457,6 +506,11 @@ strip_quotes_and_comments() {
       STRIP_IN_DOUBLE=1
       i=$((i + 1))
       continue
+    fi
+    if [[ "$ch" == '(' ]]; then
+      strip_line_open_count=$((strip_line_open_count + 1))
+    elif [[ "$ch" == ')' ]]; then
+      strip_line_close_count=$((strip_line_close_count + 1))
     fi
     out="${out}${ch}"
     i=$((i + 1))
@@ -499,24 +553,36 @@ count_backticks() {
 }
 
 # Detect case-arm `pattern)` at line start and strip it before paren
-# counting. Bash case-arm patterns start at logical line beginning and
+# tracking. Bash case-arm patterns start at logical line beginning and
 # end with `)` that has no matching `(`. Without stripping, the unmatched
-# `)` would decrement capture_depth — clamped to 0 but a real prior `$(`
-# capture could be dragged down (codex PR #954 r3 P1 BLOCKING). We
-# tolerate the common pattern shapes: alphanumeric, `*`, `?`, `[...]`,
+# `)` would attempt to pop the top of the capture stack (a real prior
+# `$(` capture) — codex PR #954 r3 P1 BLOCKING. The r5 paren-type-stack
+# `)` handler treats empty-stack pops as silent (case-arm / parser-error
+# tolerance), but stripping case arms BEFORE the stack walk preserves
+# REAL captures across case branches instead of letting their tops get
+# eaten.
+#
+# We tolerate the common pattern shapes: alphanumeric, `*`, `?`, `[...]`,
 # `+`, `|`, `.`, with an optional alternation pipe. Patterns starting
 # with `-` are deliberately NOT matched because that shape is far more
 # often a continuation argument like `--json)` (multi-line `$(cmd
 # --flag)"` close) than a case arm, and stripping the trailing `)` of
-# a `--flag)` argument would leave the outer `$()` close count
-# unbalanced. Anything more exotic (e.g. patterns containing `(` or
-# embedded `$()`) is rare and the counter degrades gracefully.
+# a `--flag)` argument would unbalance the outer `$()` close count.
+# Anything more exotic (e.g. patterns containing `(` or embedded `$()`)
+# is rare and the counter degrades gracefully.
+#
+# Result goes to global `MAYBE_STRIP_RESULT` (not stdout) so callers can
+# avoid `$()` subshell capture — that would lose the STRIP_CASE_ARM_FIRES
+# debug counter increment and the side-effect would not survive (r5 P2
+# verification hook).
+MAYBE_STRIP_RESULT=""
+STRIP_CASE_ARM_FIRES=0
 maybe_strip_case_arm() {
   local s="$1"
   local trimmed leading
   trimmed="${s#"${s%%[![:space:]]*}"}"
   if [[ -z "$trimmed" ]]; then
-    printf '%s' "$s"
+    MAYBE_STRIP_RESULT="$s"
     return 0
   fi
   # Match: optional pattern alternation pipe(s), pattern chars, terminating
@@ -534,10 +600,75 @@ maybe_strip_case_arm() {
     leading="${BASH_REMATCH[0]}"
     # Strip everything up to and including the matched `pattern)`.
     s="${s/${leading}/}"
-    printf '%s' "$s"
+    STRIP_CASE_ARM_FIRES=$(( STRIP_CASE_ARM_FIRES + 1 ))
+    MAYBE_STRIP_RESULT="$s"
     return 0
   fi
-  printf '%s' "$s"
+  MAYBE_STRIP_RESULT="$s"
+  return 0
+}
+
+# Paren-type stack walker (r5 P1 BLOCKING fix). Walks the stripped line
+# character-by-character and maintains the global `CAPTURE_STACK` — a
+# string of single-char tokens:
+#   'C'  capture wrapper (`$(`) — entry_capture turns ON while one is
+#        anywhere in the stack.
+#   'G'  bare group (`(`, including the inner `(` of arithmetic `((` and
+#        `$((`) — does NOT count as capture, but takes up a slot so a
+#        later `)` pops THIS group, not the enclosing capture.
+#
+# `)` pops the top (last char). Empty-stack pops are silent — that's the
+# case-arm `)` (already stripped above), or a parser error in the source,
+# neither of which should drag a REAL capture down to 0 the way the
+# r3/r4 simple counter did (codex PR #954 r4 P1 BLOCKING).
+#
+# Why a stack instead of `capture_depth - close_count`: a bare `( cmd )`
+# group emits an unmatched `)` from the simple counter's perspective —
+# the `(` was not a `$(` open so it didn't increment, but the `)`
+# decrements. r3/r4's clamp-to-0 masks the underflow but lets a `( cmd )`
+# group line silently zero out a prior `$(` capture, dropping
+# entry_capture on the next line's heredoc and bypassing the C1 guard.
+# A stack tracks "what kind of paren most recently opened" so `)` pops
+# the right one. Arithmetic `$((`/`((`/`))` balance naturally: each `(`
+# pushes (C or G), each `)` pops; equal counts on the same line cancel.
+#
+# Reads STRIP_RESULT (post strip_quotes_and_comments + maybe_strip_case_arm)
+# and mutates CAPTURE_STACK in place.
+CAPTURE_STACK=""
+update_capture_stack() {
+  local s="$1"
+  local n=${#s}
+  local i=0
+  local ch next
+  while (( i < n )); do
+    ch="${s:i:1}"
+    # `$(` opens a CAPTURE — consume both chars and push C.
+    if [[ "$ch" == '$' && $((i + 1)) -lt $n ]]; then
+      next="${s:i+1:1}"
+      if [[ "$next" == '(' ]]; then
+        CAPTURE_STACK="${CAPTURE_STACK}C"
+        i=$((i + 2))
+        continue
+      fi
+    fi
+    # Bare `(` (not preceded by `$`) opens a GROUP. Also covers the
+    # inner `(` of arithmetic `$((` (first `(` already consumed as part
+    # of `$(` push) and `((` (both pushes are GROUP).
+    if [[ "$ch" == '(' ]]; then
+      CAPTURE_STACK="${CAPTURE_STACK}G"
+      i=$((i + 1))
+      continue
+    fi
+    # `)` pops top of stack — empty-stack pop is silent.
+    if [[ "$ch" == ')' ]]; then
+      if [[ -n "$CAPTURE_STACK" ]]; then
+        CAPTURE_STACK="${CAPTURE_STACK%?}"
+      fi
+      i=$((i + 1))
+      continue
+    fi
+    i=$((i + 1))
+  done
 }
 
 # Pull the heredoc delimiter token from a line. Echoes empty if no heredoc
@@ -606,25 +737,33 @@ scan_file() {
   local lineno=0
   local raw norm_snippet hash class category reason
   # Cross-line capture state:
-  #   capture_depth   — count of unclosed `$(` from prior lines. Decremented
-  #                     by `)` and clamped to 0 on underflow. r4 adds a
-  #                     case-arm stripper (maybe_strip_case_arm) BEFORE the
-  #                     decrement so the leading `)` of `pattern)` doesn't
-  #                     drag a real prior capture down to 0 (PR #954 r3 P1
-  #                     BLOCKING fix).
+  #   CAPTURE_STACK   — global string of 'C' (capture) / 'G' (group) tokens
+  #                     pushed/popped by update_capture_stack on each
+  #                     line's stripped content. Reset per-file. r5
+  #                     replaced the prior `capture_depth` integer counter
+  #                     because the counter clamp-to-0 silently dragged a
+  #                     real `$(` capture down whenever a bare `( cmd )`
+  #                     group, `(( ))` arithmetic, or case-arm `)` shape
+  #                     decremented past zero (codex PR #954 r4 P1
+  #                     BLOCKING). The stack pops the RIGHT kind of paren
+  #                     so each `)` cancels its matching `(` rather than
+  #                     blindly eating the deepest `$(`.
+  #                     entry_capture := CAPTURE_STACK contains 'C'.
   #   backtick_open   — 1 if an odd number of unescaped backticks have been
-  #                     seen so far (we're inside a `…` capture).
+  #                     seen so far (we're inside a `…` capture). Tracked
+  #                     separately from the paren stack because backticks
+  #                     don't compose with `(` / `)`.
   #   in_heredoc_body — 1 while we're between a heredoc opener and its
-  #                     terminating delimiter line. Paren counting is
+  #                     terminating delimiter line. Paren tracking is
   #                     suspended in heredoc bodies (they're literal text,
   #                     not code).
   #   heredoc_delim   — the delimiter token we're waiting to see at the
   #                     start of a line to close the heredoc body.
-  local capture_depth=0
+  CAPTURE_STACK=""
   local backtick_open=0
   local in_heredoc_body=0
   local heredoc_delim=""
-  local stripped opens closes ticks entry_capture trimmed delim
+  local stripped ticks entry_capture trimmed delim
   # Quote state lives on STRIP_IN_SINGLE / STRIP_IN_DOUBLE and persists
   # across strip_quotes_and_comments() calls so multi-line `'...'`
   # arguments (e.g. `bash -c '\n  source ...\n  '`) don't bleed code into
@@ -673,8 +812,10 @@ scan_file() {
 
     # Capture-state snapshot taken BEFORE the line's own deltas — that's
     # what classify_line cares about (was a `$(` from an EARLIER line still
-    # open at the moment this heredoc opener was read?).
-    if (( capture_depth > 0 )) || (( backtick_open == 1 )); then
+    # open at the moment this heredoc opener was read?). entry_capture is
+    # set when the CAPTURE_STACK contains any 'C' (capture) frame — bare
+    # 'G' (group) frames don't count.
+    if [[ "$CAPTURE_STACK" == *C* ]] || (( backtick_open == 1 )); then
       entry_capture=1
     else
       entry_capture=0
@@ -710,36 +851,53 @@ scan_file() {
 
     # Update cross-line state from this line's own deltas. The stripped
     # form removes quoted strings and trailing comments so a `$(` inside
-    # `'...'` / `"..."` or after `# ` doesn't bump capture_depth. We use
-    # globals (STRIP_RESULT, COUNT_RESULT) instead of $()-capture so the
-    # in_single / in_double updates survive — $() spawns a subshell that
-    # discards the var writes.
+    # `'...'` / `"..."` or after `# ` doesn't push onto CAPTURE_STACK. We
+    # use globals (STRIP_RESULT, MAYBE_STRIP_RESULT, COUNT_RESULT)
+    # instead of $()-capture so the in_single / in_double / fires-counter
+    # updates survive — $() spawns a subshell that discards the var writes.
+    #
+    # Snapshot the ENTRY quote state before strip mutates it. The
+    # case-arm stripper needs entry-state, not post-strip-state, because
+    # `pattern)` only legitimately appears at the start of a fresh shell
+    # command (entry sgl=dbl=0). A continuation line inside a `$(python3
+    # -c '...')` body sits at entry_dbl=1, and a Python tuple close like
+    # `followup_sent_ts)` would otherwise match the case-arm regex and
+    # get incorrectly stripped — eating the `)` that should pop the C
+    # frame for the outer `$(`.
+    local entry_in_single=$STRIP_IN_SINGLE
+    local entry_in_double=$STRIP_IN_DOUBLE
     strip_quotes_and_comments "$raw"
     stripped="$STRIP_RESULT"
     # Case-arm `pattern)` at line start has no matching `(`. Without
-    # stripping, its trailing `)` decrements capture_depth even though
-    # there was no matching `$(` open — the clamp-to-0 guard catches the
-    # underflow case but a real `$(`-opened capture from a prior line is
-    # silently dragged down to 0, dropping entry_capture and making a
-    # heredoc inside the real capture mis-classify as C3 (codex PR #954
-    # r3 finding P1 BLOCKING — bypassed the CI ratchet). Stripping the
-    # leading `pattern)` shape BEFORE paren counting keeps the close
-    # count balanced and leaves the real capture state intact across
-    # case arms.
-    stripped="$(maybe_strip_case_arm "$stripped")"
-    count_substr "$stripped" '$('
-    opens="$COUNT_RESULT"
-    count_substr "$stripped" ')'
-    closes="$COUNT_RESULT"
+    # stripping, its trailing `)` would pop the top of CAPTURE_STACK
+    # (the r5 paren-type stack's empty-stack tolerance means an isolated
+    # case-arm `)` is silent, but a REAL prior `$(`-pushed 'C' frame
+    # would be eaten — codex PR #954 r3 finding P1 BLOCKING, which
+    # bypassed the CI ratchet). Stripping the leading `pattern)` shape
+    # BEFORE the stack walk preserves the capture frame intact across
+    # case branches. maybe_strip_case_arm writes its result to
+    # MAYBE_STRIP_RESULT (not stdout) so the STRIP_CASE_ARM_FIRES debug
+    # counter increment survives — calling it via `$()` would discard
+    # the counter update (r5 P2 verification hook).
+    #
+    # Guard: only invoke the case-arm stripper when the ENTRY quote state
+    # is clean (sgl=dbl=0). Inside a multi-line `'...'` or `"..."` body
+    # — most commonly a `python3 -c '...'` continuation under `$()` —
+    # a regex match against the stripped output can falsely trigger on
+    # interpreter syntax like `tuple_member)` and erase the `)` that
+    # should pop the C frame for the outer capture (r5 self-test
+    # regression discovered while validating the paren-type stack).
+    if (( entry_in_single == 0 && entry_in_double == 0 )); then
+      maybe_strip_case_arm "$stripped"
+      stripped="$MAYBE_STRIP_RESULT"
+    fi
+    # Paren-type stack walk: pushes 'C' on `$(`, 'G' on bare `(`, pops
+    # top on `)`. Empty-stack pops are silent (case-arm fallthrough or
+    # source parser error). See update_capture_stack header for why a
+    # stack is required instead of the r3/r4 simple counter.
+    update_capture_stack "$stripped"
     count_backticks "$stripped"
     ticks="$COUNT_RESULT"
-    capture_depth=$(( capture_depth + opens - closes ))
-    if (( capture_depth < 0 )); then
-      # A closer with no opener (e.g. `)` ending a function body or
-      # subshell-group `(...)`). Clamp to 0 so a stray paren doesn't
-      # permanently disable cross-line tracking.
-      capture_depth=0
-    fi
     if (( ticks > 0 )); then
       backtick_open=$(( (backtick_open + ticks) % 2 ))
     fi
@@ -789,6 +947,17 @@ main() {
       total=$(( total + ${SUMMARY_COUNTS[$c]:-0} ))
     done
     printf 'TOTAL\t%s\n' "$total"
+  fi
+
+  # r5 P2: optional debug counter. When BRIDGE_AUDIT_DEBUG_CASE_ARM=1 is
+  # set, emit the number of maybe_strip_case_arm invocations that
+  # actually stripped something. The smoke self-test asserts this is
+  # non-zero on the fixture to prove the strip ran in real code (not
+  # just that the classification result is correct, which could happen
+  # even if the strip silently no-op'd). Printed to stderr so it doesn't
+  # pollute --tsv / --json / --summary stdout.
+  if [[ "${BRIDGE_AUDIT_DEBUG_CASE_ARM:-0}" == "1" ]]; then
+    printf 'STRIP_CASE_ARM_FIRES=%d\n' "$STRIP_CASE_ARM_FIRES" >&2
   fi
 }
 

@@ -198,8 +198,8 @@ lib/bridge-core.sh	507	C3	c5a19ca66d0088387de551f481ce08c0218765bdc1221891c961bb
 lib/bridge-core.sh	560	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-core.sh	679	C3	aef38fbc7564d9de6b2815ae358b26d9825bfb3f22fc31a8dab46b9c8d49d9f0	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-core.sh	818	H3	7f7d4271f82d264c46d0c2422682d01605a432c0cb26abe55cab67d0259b5683	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-core.sh	1118	C3	70a49191ce1893945509406b7a5958498a35d5a13f7ea313cc6fcb8e22361100	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-core.sh	1139	C3	70a49191ce1893945509406b7a5958498a35d5a13f7ea313cc6fcb8e22361100	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-core.sh	1118	C1	70a49191ce1893945509406b7a5958498a35d5a13f7ea313cc6fcb8e22361100	interpreter heredoc (stripper false-positive: phantom capture from nested-quote bash-c-python at L714)	patch	process-boundary-safe
+lib/bridge-core.sh	1139	C1	70a49191ce1893945509406b7a5958498a35d5a13f7ea313cc6fcb8e22361100	interpreter heredoc (stripper false-positive: phantom capture from nested-quote bash-c-python at L714)	patch	process-boundary-safe
 lib/bridge-cron.sh	86	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-cron.sh	100	C3	61be7f11413c4788744477b9d1233d24940fe6b70653f980cc432d8b699452a7	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-cron.sh	133	C3	61be7f11413c4788744477b9d1233d24940fe6b70653f980cc432d8b699452a7	interpreter heredoc, no capture	patch	Phase 3 PR C
@@ -347,7 +347,7 @@ scripts/smoke-test.sh	3438	C1	5ccb2685ca25f47db71a8831c9d2cbd26a2ee5226e3e61f9ed
 scripts/smoke-test.sh	3452	C1	a392c08171778c980329006b11a67e7081f71154a4ce20feff977adb7ed68360	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	3467	C1	bcdeda4950380174d5b3cb1d20875e56b0090162fae2f73208235601c92b571c	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	3481	C1	a3f0ed1cc100a7ee238b550a4da36155cb6baf0ada56b1d16daa28e8d715039f	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3512	C1	11d7dcda5a5abecccb687c1f2dff26948409a6670d6ed859a4d209f9f951db41	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	process-boundary-safe
+scripts/smoke-test.sh	3512	C3	11d7dcda5a5abecccb687c1f2dff26948409a6670d6ed859a4d209f9f951db41	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	3529	C2	eaf3c7f97ab716d53cef83c228b1a5b06f47c9d292e4db19cc75029626a62228	cat heredoc in capture	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	3563	C3	11d7dcda5a5abecccb687c1f2dff26948409a6670d6ed859a4d209f9f951db41	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	3584	C3	395a2b470a17f5ab4140ed8cf8b3d1247b4aaccc385a9c607c8e272637adf889	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
@@ -600,7 +600,7 @@ scripts/smoke/queue.sh	57	C1	9312c346bf44c1593cb43e20042a6e5dd516a1ef1ad8a9f40e6
 scripts/smoke/queue.sh	262	C1	33a4c2ede24bfd27c26122c45faecda13962db315a1bcf9264db9df1690dbcda	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
 scripts/smoke/queue.sh	516	C3	f3f3b3f0296c1c5ff36fe573ff63f33d4a5103028d8002ca3de38d9182fe033f	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/queue.sh	575	C3	2003a271cd72790bc792cd4accbe01da311c5c6b61a16c61dc4347a75732d14c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke/queue.sh	618	C3	63864df49225fc3e243408d9d37c6ac421e901e2964f5e577baf3e6854db6ee6	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke/queue.sh	618	C3	63864df49225fc3e243408d9d37c6ac421e901e2964f5e577baf3e6854db6ee6	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	process-boundary-safe
 scripts/smoke/queue.sh	706	C3	a63b059a9e1b33221d04d760916f2bcc3902930dcee88d817544a226bbbed547	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/queue.sh	923	C1	63864df49225fc3e243408d9d37c6ac421e901e2964f5e577baf3e6854db6ee6	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	process-boundary-safe
 scripts/smoke/queue.sh	956	C1	63864df49225fc3e243408d9d37c6ac421e901e2964f5e577baf3e6854db6ee6	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	process-boundary-safe
