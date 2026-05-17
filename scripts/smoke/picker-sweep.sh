@@ -530,4 +530,30 @@ run_sweep
 smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "16 no bare-Enter send"
 smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "16 no option send (stale WARNING block must not replay)"
 
+# ---------------------------------------------------------------------------
+# Test 17 — r7 hardening (codex PR #949 r6): hypothetical auto-mode prompt
+# without "WARNING:" header (e.g. claude CLI rendering it as
+# "Enable auto mode?!"). r6 anchored on "WARNING:" only and would have
+# missed this shape. r7 accepts "Enable auto mode" and "Bypass Permissions
+# mode" as alternate headers.
+# ---------------------------------------------------------------------------
+
+smoke_log "17. auto-mode prompt with 'Enable auto mode' title → send option 1 (r7)"
+reset_fixture
+printf '%s\n' "alt-title-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-alt-title-agent" <<'PANE'
+  Enable auto mode?!
+
+  ❯ 1. Yes, and make it my default mode
+    2. Yes, enable auto mode
+    3. No, exit
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "17 no bare-Enter send"
+smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "17 one option send"
+smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "alt-title-agent:option=1" "17 send option=1 (alternate title)"
+
 smoke_log "all checks passed"

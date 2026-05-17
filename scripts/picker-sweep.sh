@@ -285,12 +285,23 @@ while IFS= read -r agent; do
     # line that follows it. Stale text outside that window (free-prose,
     # previous picker rounds, unrelated warnings) is excluded.
     active_picker="$(printf '%s\n' "$cap" | awk -v tail_re="$_PICKER_TAIL_RE" '
-      /^[[:space:]]*WARNING:/ { start = NR; have_start = 1; have_end = 0; bail = 0 }
+      # r7 (codex PR #949 r6) — accept multiple header forms because Claude
+      # CLI may render the auto-mode confirmation with a title other than
+      # the literal "WARNING:" token (e.g. "Enable auto mode?!"). Headers
+      # we anchor on:
+      #   - "WARNING:" — canonical bypass + current auto (claude 2.1.143)
+      #   - "Enable auto mode" — hypothetical alternate auto title
+      #   - "Bypass Permissions mode" — hypothetical alternate bypass title
+      # Each header opens a new picker block. The previous r4-r6 contract is
+      # preserved: emit only when a tail line follows the header AND no
+      # non-blank content appears below the tail.
+      /^[[:space:]]*(WARNING:|Enable auto mode|Bypass Permissions mode)/ {
+        start = NR; have_start = 1; have_end = 0; bail = 0
+      }
       have_start && $0 ~ tail_re { end = NR; have_end = 1 }
-      # r6 (codex PR #949 r5) — if any non-blank line appears AFTER the
-      # tail, the picker has already been answered and the bottom of the
-      # pane is now showing later output. Bail; the warning+tail block in
-      # scrollback is stale and must not fire.
+      # r6 (codex PR #949 r5) — bail when the picker has been answered:
+      # any non-blank line after the tail means the bottom of the pane is
+      # now showing later output, not the prompt.
       have_end && NR > end && /[^[:space:]]/ { bail = 1 }
       { lines[NR] = $0 }
       END {
