@@ -186,6 +186,10 @@ bridge_agent_update_apply_launch_cmd() {
   # hung Bash in `heredoc_write` while sourcing this module, which in
   # turn hung the CLI hot path. The body now lives in a regular file
   # under scripts/python-helpers/, so no source-time read occurs.
+  # #946 L1 (r2): stale-source guard.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   BRIDGE_AGENT_UPDATE_LC_CURRENT="$current" \
     python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/agent-update-apply-launch-cmd.py"
 }
@@ -205,6 +209,10 @@ bridge_agent_update_apply_launch_cmd() {
 bridge_agent_update_apply_channels() {
   local current="$1"
   bridge_require_python
+  # #946 L1 (r2): stale-source guard.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   BRIDGE_AGENT_UPDATE_CH_CURRENT="$current" \
     python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/agent-update-apply-channels.py"
 }
@@ -230,6 +238,16 @@ bridge_agent_update_emit_audit() {
   local actions_json="${14:-[]}"
 
   bridge_require_python
+  # #946 L1 (r2): stale-source guard before either of the two python3
+  # forks below. The audit-detail-json invocation happens INSIDE `$()`,
+  # which is exactly the substitution-swallow site codex P1 #2 flagged
+  # — without the guard a stale checkout silently emits an empty
+  # detail_json and the subsequent audit.py call lands with garbage
+  # input. The check helper writes one audit line to BRIDGE_DAEMON_LOG
+  # (not the audit log we cannot reach) so the failure is visible.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   local detail_json
   # Footgun #11 (KNOWN_ISSUES.md §26): this used to be `python3 - …
   # <<'PY' … PY` inside a `$()` capture. Bash 5.3.9 `heredoc_write`

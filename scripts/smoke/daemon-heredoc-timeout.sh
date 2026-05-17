@@ -126,9 +126,18 @@ chmod +x "$NOOP_HELPER"
 
 # Driver script that sources bridge_with_timeout and invokes it on argv.
 # Written to disk so we avoid layered quoting around `bash -c`.
+#
+# PR #951 r7: pin the shebang to the bash 4+ binary the parent re-execed
+# into. The smoke entry point re-execs into /opt/homebrew/bin/bash when
+# system bash is 3.2, but `#!/usr/bin/env bash` in the DRIVER would
+# resolve via PATH and might pick /bin/bash 3.2 again. lib/bridge-state.sh
+# (r7) transitively sources lib/bridge-core.sh, which uses `declare -ga`
+# (bash 4.2+). Pinning the shebang ensures the DRIVER inherits the same
+# bash the smoke driver is running under.
 DRIVER="$SMOKE_TMP_ROOT/with-timeout-driver.sh"
-cat >"$DRIVER" <<'EOF'
-#!/usr/bin/env bash
+{
+  printf '#!%s\n' "${BASH:-/usr/bin/env bash}"
+  cat <<'EOF'
 # args: <secs> <label> <cmd> [cmd_args...]
 set -uo pipefail
 SCRIPT_DIR="${BRIDGE_REPO_ROOT:?}"
@@ -139,6 +148,7 @@ label="$2"
 shift 2
 bridge_with_timeout "$secs" "$label" "$@"
 EOF
+} >"$DRIVER"
 chmod +x "$DRIVER"
 
 run_with_timeout_subshell() {

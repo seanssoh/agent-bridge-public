@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 
+# PR #951 r7 (#946 L1): tests/memory-daily-harvest/smoke.sh sources this
+# file via `bash -c` without bridge-lib.sh, so bridge_resolve_script_dir_check
+# (defined in bridge-core.sh) would be undefined. Source bridge-core.sh
+# idempotently; full-loader path is a no-op via the declare -F gate.
+if ! declare -F bridge_resolve_script_dir_check >/dev/null 2>&1; then
+  # shellcheck source=lib/bridge-core.sh
+  source "$(cd -P "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)/bridge-core.sh"
+fi
+
 bridge_require_legacy_cron_jobs() {
   if [[ -f "$BRIDGE_SOURCE_CRON_JOBS_FILE" ]]; then
     return 0
@@ -37,16 +46,28 @@ bridge_require_cron_source_jobs() {
 
 bridge_cron_python() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-cron.py" "$@"
 }
 
 bridge_cron_runner_python() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-cron-runner.py" "$@"
 }
 
 bridge_cron_scheduler_python() {
   bridge_require_python
+  # #946 L1 (r2): stale-source guard.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-cron-scheduler.py" "$@"
 }
 

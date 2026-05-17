@@ -4080,7 +4080,25 @@ bridge_extract_development_channels_from_command() {
   local command="${1:-}"
 
   bridge_require_python
-  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/extract-dev-channels-from-command.py" \
+  # #946 L1 (r2 codex P1 #2): use the substitution-safe check helper
+  # instead of `bridge_resolve_script_dir_or_die`. This wrapper is called
+  # from inside `$(...)` substitutions (e.g.
+  # bridge_claude_launch_with_channel_state_dirs at lib/bridge-state.sh,
+  # and the channel-health path in bridge-daemon.sh). If we called
+  # `_or_die` here the parent's `bridge_die` would exit only the
+  # substitution subshell — the caller would see an empty value and
+  # continue, leaving the daemon-hang cascade #946 reproducible. The
+  # `_check` form returns non-zero + writes one de-duplicated audit
+  # line to BRIDGE_DAEMON_LOG so the failure is visible whether or not
+  # the caller's context suppresses errexit, and the substitution
+  # collapses to empty without ever forking python3 against a stale
+  # path. bridge_with_timeout caps the subprocess at 15s so a hung
+  # child (FS deadlock, slow disk) cannot wedge the parent tick.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  bridge_with_timeout 15 extract_dev_channels_from_command \
+    python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/extract-dev-channels-from-command.py" \
     "$command"
 }
 

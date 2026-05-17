@@ -463,6 +463,16 @@ PY
 bridge_sync_skill_docs() {
   local skills_json="" workdir_json=""
 
+  # #946 L1 (r6 — codex P2): stale-source guard MUST run BEFORE any
+  # `[[ -f "$BRIDGE_SCRIPT_DIR/..." ]]` early-return. When the source
+  # checkout is gone, that file-existence check returns 0 (file is
+  # absent) and we'd silently `return 0` as if everything were fine —
+  # masking the cascade and skipping the [L1] audit. The guard:
+  #   * stale dir → audit fires + return 1.
+  #   * dir valid + bridge-docs.py absent (minimal install) → return 0.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
   [[ -f "$BRIDGE_SCRIPT_DIR/bridge-docs.py" ]] || return 0
   bridge_require_python
   skills_json="$(bridge_agent_skills_registry_json)"
