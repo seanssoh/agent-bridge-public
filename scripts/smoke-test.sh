@@ -319,11 +319,15 @@ cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/bad/bridge-lib.sh"
 SCRIPTDIR_BAD_OUT="$("$BASH4_BIN" -c "source '$SCRIPTDIR_FAKE_ROOT/bad/bridge-lib.sh'" 2>&1 || true)"
 assert_contains "$SCRIPTDIR_BAD_OUT" "missing scripts/python-helpers/"
 # Positive startup case: a tree WITH scripts/python-helpers/ passes
-# startup validation (control). Use a symlinked lib/ so we don't have to
-# stage every module file just to exercise the validation path.
+# startup validation (control). Copy lib/ (don't symlink) so the fixture
+# stays self-contained: r4's bridge_resolve_script_dir_check uses
+# `cd -P "$(dirname "${BASH_SOURCE[0]}")/.."` which resolves symlinks,
+# so a symlinked lib/ would let the resolver follow back to the real
+# checkout and find scripts/python-helpers there after we delete the
+# fake scripts/ below — breaking the failure-path assertion.
 mkdir -p "$SCRIPTDIR_FAKE_ROOT/good/scripts/python-helpers"
 cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/good/bridge-lib.sh"
-ln -sf "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/good/lib"
+cp -R "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/good/lib"
 ln -sf "$REPO_ROOT/VERSION" "$SCRIPTDIR_FAKE_ROOT/good/VERSION" 2>/dev/null || true
 SCRIPTDIR_GOOD_OUT="$("$BASH4_BIN" -c "source '$SCRIPTDIR_FAKE_ROOT/good/bridge-lib.sh' >/dev/null 2>&1 && echo SCRIPTDIR_STARTUP_OK" 2>&1 || true)"
 assert_contains "$SCRIPTDIR_GOOD_OUT" "SCRIPTDIR_STARTUP_OK"
@@ -362,7 +366,10 @@ SCRIPTDIR_SUB_STATE="$(mktemp -d "${TMPDIR:-/tmp}/agb-smoke-scriptdir-sub.XXXXXX
 # its scripts/python-helpers/ subtree.
 mkdir -p "$SCRIPTDIR_FAKE_ROOT/sub/scripts/python-helpers"
 cp "$REPO_ROOT/bridge-lib.sh" "$SCRIPTDIR_FAKE_ROOT/sub/bridge-lib.sh"
-ln -sf "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/sub/lib"
+# Copy lib/ (don't symlink) — see comment on the `good` fixture above.
+# r4's resolver uses `cd -P` so a symlinked lib/ would let the failure
+# path silently recover via the real checkout.
+cp -R "$REPO_ROOT/lib" "$SCRIPTDIR_FAKE_ROOT/sub/lib"
 ln -sf "$REPO_ROOT/VERSION" "$SCRIPTDIR_FAKE_ROOT/sub/VERSION" 2>/dev/null || true
 SCRIPTDIR_SUB_OUT="$(BRIDGE_HOME="$SCRIPTDIR_SUB_STATE" \
   BRIDGE_STATE_DIR="$SCRIPTDIR_SUB_STATE/state" \
