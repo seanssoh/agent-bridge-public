@@ -222,34 +222,45 @@ smoke_log "C3 PASS — hot helpers round-trip cleanly"
 # taught us to avoid.
 smoke_log "C4: helper call sites use \$BRIDGE_SCRIPT_DIR interpolation"
 
+# r5 (codex PR #953 r4): positive count must FILTER COMMENTS so explanatory
+# comment lines (e.g. "# python3 \"$BRIDGE_SCRIPT_DIR/lib/daemon-helpers/...\"")
+# do not inflate the call-site count and let the assertion silently pass
+# even after a regression removes all real invocations.
 daemon_call_pattern='python3 "\$BRIDGE_SCRIPT_DIR/lib/daemon-helpers/'
-daemon_call_count="$(grep -c "$daemon_call_pattern" "$DAEMON_SCRIPT" || true)"
+daemon_call_count="$(grep -nE "$daemon_call_pattern" "$DAEMON_SCRIPT" \
+  | grep -vE '^[0-9]+:[[:space:]]*#' \
+  | wc -l | tr -d '[:space:]')"
 if (( daemon_call_count == 0 )); then
   smoke_fail "C4: no helper invocations found in bridge-daemon.sh"
 fi
 
-# bridge-daemon.sh must not import a daemon helper via a non-anchored path
-if grep -nE 'python3 [^"]*lib/daemon-helpers/' "$DAEMON_SCRIPT" \
+# bridge-daemon.sh must not import a daemon helper via a non-anchored path.
+# r5 (codex PR #953 r4): also catch the QUOTED non-anchored form
+# python3 "$SOMEVAR/lib/daemon-helpers/..." (e.g. reintroducing $SCRIPT_DIR
+# in place of $BRIDGE_SCRIPT_DIR breaks the script-dir guard recovery branch).
+if grep -nE 'python3 ("?[^"]*|"\$[^"]*")lib/daemon-helpers/' "$DAEMON_SCRIPT" \
     | grep -vE 'python3 "\$BRIDGE_SCRIPT_DIR/lib/daemon-helpers/' \
     | grep -vE '^[0-9]+:[[:space:]]*#' >/dev/null 2>&1; then
   smoke_log "C4 bridge-daemon.sh has a non-anchored helper invocation:"
-  grep -nE 'python3 [^"]*lib/daemon-helpers/' "$DAEMON_SCRIPT" \
+  grep -nE 'python3 ("?[^"]*|"\$[^"]*")lib/daemon-helpers/' "$DAEMON_SCRIPT" \
     | grep -vE 'python3 "\$BRIDGE_SCRIPT_DIR/lib/daemon-helpers/' \
     | grep -vE '^[0-9]+:[[:space:]]*#'
   smoke_fail "C4: daemon helper invocation missing \$BRIDGE_SCRIPT_DIR anchor"
 fi
 
 cron_call_pattern='python3 "\$BRIDGE_SCRIPT_DIR/lib/cron-helpers/'
-cron_call_count="$(grep -c "$cron_call_pattern" "$CRON_SCRIPT" || true)"
+cron_call_count="$(grep -nE "$cron_call_pattern" "$CRON_SCRIPT" \
+  | grep -vE '^[0-9]+:[[:space:]]*#' \
+  | wc -l | tr -d '[:space:]')"
 if (( cron_call_count == 0 )); then
   smoke_fail "C4: no helper invocations found in lib/bridge-cron.sh"
 fi
 
-if grep -nE 'python3 [^"]*lib/cron-helpers/' "$CRON_SCRIPT" \
+if grep -nE 'python3 ("?[^"]*|"\$[^"]*")lib/cron-helpers/' "$CRON_SCRIPT" \
     | grep -vE 'python3 "\$BRIDGE_SCRIPT_DIR/lib/cron-helpers/' \
     | grep -vE '^[0-9]+:[[:space:]]*#' >/dev/null 2>&1; then
   smoke_log "C4 lib/bridge-cron.sh has a non-anchored helper invocation:"
-  grep -nE 'python3 [^"]*lib/cron-helpers/' "$CRON_SCRIPT" \
+  grep -nE 'python3 ("?[^"]*|"\$[^"]*")lib/cron-helpers/' "$CRON_SCRIPT" \
     | grep -vE 'python3 "\$BRIDGE_SCRIPT_DIR/lib/cron-helpers/' \
     | grep -vE '^[0-9]+:[[:space:]]*#'
   smoke_fail "C4: cron helper invocation missing \$BRIDGE_SCRIPT_DIR anchor"
