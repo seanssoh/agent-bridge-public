@@ -10951,4 +10951,14 @@ bash "$REPO_ROOT/scripts/smoke/layout-evidence-empty-subdir.sh"
 log "running smoke-isolation-no-live-leak smoke (refs queue #4793)"
 bash "$REPO_ROOT/scripts/smoke/smoke-isolation-no-live-leak.sh"
 
+# Refs queue task #4773 — bridge-agent.sh registry/list/show JSON paths
+# wedged Bash 5.3.9 read_comsub via nested $() captures feeding
+# heredoc-stdin python3 subprocesses through the bridge_agent_manage_python
+# wrapper. Three sites migrated to standalone helpers under
+# lib/agent-cli-helpers/. Smoke verifies the registry path completes
+# within the timeout, produces valid JSON, and that no nested-$()-into-
+# heredoc combos remain in bridge-agent.sh.
+log "running bridge-agent-cli-no-deadlock smoke (refs queue task #4773)"
+bash "$REPO_ROOT/scripts/smoke/bridge-agent-cli-no-deadlock.sh"
+
 log "smoke test passed"
