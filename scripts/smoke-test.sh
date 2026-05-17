@@ -13,6 +13,20 @@ source "$REPO_ROOT/lib/bridge-session-patterns.sh"
 # $TMP_ROOT. If BRIDGE_HOME is inherited from the parent shell and points at a
 # real install (e.g. $HOME/.agent-bridge), we would terminate the running
 # daemon, drop dynamic agent sessions, and trash live state. See issue #207.
+#
+# Auto-isolate when BRIDGE_HOME is UNSET: prior versions silently fell through
+# this guard and the subsequent early test blocks (run before $TMP_ROOT is
+# computed at line ~1289) inherited the agent-bridge CLI default
+# `$HOME/.agent-bridge`, leaking ~10 empty agent dirs into the live install
+# (`claude-static`, `cap-test`, `spool-test`, `lock-test`, `always-on-agent-$$`,
+# etc.) and tripping the watchdog drift alarm every cycle. Refs queue #4793,
+# operator-host evidence 2026-05-17.
+if [[ -z "${BRIDGE_HOME:-}" ]]; then
+  BRIDGE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/agb-smoke-isolated.XXXXXX")/.agent-bridge"
+  export BRIDGE_HOME
+  _SMOKE_AUTO_ISOLATED=1
+  printf '[smoke] BRIDGE_HOME auto-isolated to %s (was unset)\n' "$BRIDGE_HOME"
+fi
 if [[ -n "${BRIDGE_HOME:-}" ]]; then
   _smoke_allowed_tmp_prefix=""
   for _smoke_tmp_candidate in "${TMPDIR:-}" "/tmp" "/private/tmp" "/var/folders"; do
@@ -1546,6 +1560,115 @@ cleanup() {
   if [[ -e "$TMP_ROOT" ]]; then
     printf '[smoke][error] failed to remove temporary smoke root after retries: %s\n' "$TMP_ROOT" >&2
     status=1
+  fi
+  # Defensive sweep (queue task #4793): wipe smoke-created agent dirs from
+  # $BRIDGE_HOME/agents/ AND report+wipe any that managed to land in the
+  # live install ($HOME/.agent-bridge/agents/) before the top-of-file
+  # BRIDGE_HOME guard catches a future regression. Live-path guard: if
+  # BRIDGE_HOME IS the live install, refuse the wipe entirely — that
+  # combination means the top-of-file guard already failed and the safest
+  # move is to leave everything in place for the operator to inspect.
+  if [[ "${BRIDGE_HOME:-}" == "$HOME/.agent-bridge" ]]; then
+    printf '[smoke][error] cleanup refused: BRIDGE_HOME is live install (%s)\n' \
+      "$BRIDGE_HOME" >&2
+    printf '[smoke][error] top-of-file BRIDGE_HOME guard should have caught this; refusing to rm-rf live agents/\n' >&2
+    status=1
+  else
+    local _smoke_known_pat
+    # Wipe smoke-created agent dirs from the isolated BRIDGE_HOME first.
+    # This is normally a no-op (rm -rf "$TMP_ROOT" already removed them)
+    # but covers the case where BRIDGE_HOME points outside TMP_ROOT.
+    if [[ -n "${BRIDGE_HOME:-}" ]] && [[ -d "$BRIDGE_HOME/agents" ]]; then
+      for _smoke_known_pat in \
+        "always-on-agent-$$" \
+        "auto-start-agent-$$" \
+        "broken-channel-$$" \
+        "claude-static" \
+        "cap-test" \
+        "spool-test" \
+        "lock-test"; do
+        [[ -d "$BRIDGE_HOME/agents/$_smoke_known_pat" ]] || continue
+        rm -rf "$BRIDGE_HOME/agents/$_smoke_known_pat" 2>/dev/null || true
+      done
+    fi
+    # Report + (conditionally) wipe any smoke residue that landed in the
+    # live install. This is the queue #4793 leak path. Reporting first
+    # (so the operator sees that the guard regressed), wiping second
+    # (so the watchdog drift alarm stops firing). Two fingerprint
+    # classes:
+    #   - PID-seeded names (`<role>-$$`): safe to rm by basename — $$
+    #     is unique to this smoke run, so a real live agent cannot
+    #     share the name.
+    #   - HARDCODED names (claude-static / cap-test / spool-test /
+    #     lock-test): MUST pass an emptiness fingerprint check before
+    #     wipe. A real operator may legitimately have a `claude-static`
+    #     agent; we refuse to delete it by basename alone. The smoke
+    #     fixture only writes layout-marker files / empty dirs for
+    #     these, so the find probe below catches real content.
+    if [[ -d "$HOME/.agent-bridge/agents" ]]; then
+      local _smoke_leaked_list=()
+      local _smoke_named_kept=()
+      local _smoke_pid_pat="-$$"
+      local _smoke_live_entry=""
+      # PID-seeded names: $$ is unique to this smoke run, so any match
+      # is definitely smoke residue — wipe by basename, no fingerprint
+      # check needed.
+      for _smoke_live_entry in "$HOME/.agent-bridge/agents/"*"$_smoke_pid_pat"; do
+        [[ -d "$_smoke_live_entry" ]] || continue
+        _smoke_leaked_list+=("$(basename "$_smoke_live_entry")")
+      done
+      # Hardcoded names: a real operator could legitimately have an
+      # agent named `claude-static`/`cap-test`/`spool-test`/`lock-test`.
+      # Refuse to wipe by basename alone — the smoke fixture only
+      # writes state/runtime scaffolding under these (no operator
+      # notes / memory / session-type markers). The find probe below
+      # treats anything outside state/ runtime/ .cache/ as evidence
+      # of a real agent and keeps the dir.
+      for _smoke_known_pat in claude-static cap-test spool-test lock-test; do
+        local _smoke_named_target="$HOME/.agent-bridge/agents/$_smoke_known_pat"
+        [[ -d "$_smoke_named_target" ]] || continue
+        local _smoke_real_file=""
+        _smoke_real_file="$(find "$_smoke_named_target" -mindepth 1 -maxdepth 3 -type f \
+          ! -path '*/state/*' ! -path '*/runtime/*' ! -path '*/.cache/*' \
+          -print -quit 2>/dev/null || true)"
+        if [[ -n "$_smoke_real_file" ]]; then
+          _smoke_named_kept+=("$_smoke_known_pat (has real file: ${_smoke_real_file#"$HOME"/.agent-bridge/agents/})")
+        else
+          _smoke_leaked_list+=("$_smoke_known_pat")
+        fi
+        unset _smoke_real_file _smoke_named_target
+      done
+      if (( ${#_smoke_named_kept[@]} > 0 )); then
+        printf '[smoke][warn] live install has dirs matching smoke names but with real content — leaving alone: %s\n' \
+          "${_smoke_named_kept[*]}" >&2
+      fi
+      if (( ${#_smoke_leaked_list[@]} > 0 )); then
+        printf '[smoke][error] smoke leaked agent dirs into the live install (refs #4793): %s\n' \
+          "${_smoke_leaked_list[*]}" >&2
+        printf '[smoke][error] live install path: %s/.agent-bridge/agents/\n' "$HOME" >&2
+        printf '[smoke][error] wiping leaked dirs (top-of-file guard should have prevented this)\n' >&2
+        local _smoke_leaked_name=""
+        for _smoke_leaked_name in "${_smoke_leaked_list[@]}"; do
+          rm -rf "$HOME/.agent-bridge/agents/$_smoke_leaked_name" 2>/dev/null || true
+        done
+        status=1
+        unset _smoke_leaked_name
+      fi
+      unset _smoke_leaked_list _smoke_named_kept _smoke_pid_pat _smoke_live_entry
+    fi
+    unset _smoke_known_pat
+  fi
+  # Auto-isolated BRIDGE_HOME cleanup. We only touch the tempdir we created
+  # ourselves at startup — never a caller-supplied path.
+  if [[ "${_SMOKE_AUTO_ISOLATED:-0}" == "1" ]] && [[ -n "${BRIDGE_HOME:-}" ]]; then
+    local _smoke_iso_parent
+    _smoke_iso_parent="$(dirname "$BRIDGE_HOME")"
+    case "$_smoke_iso_parent" in
+      "${TMPDIR%/}"/agb-smoke-isolated.*|/tmp/agb-smoke-isolated.*|/private/tmp/agb-smoke-isolated.*|/var/folders/*/agb-smoke-isolated.*|/private/var/folders/*/agb-smoke-isolated.*)
+        rm -rf "$_smoke_iso_parent" 2>/dev/null || true
+        ;;
+    esac
+    unset _smoke_iso_parent
   fi
   exit "$status"
 }
@@ -10824,5 +10947,8 @@ bash "$REPO_ROOT/scripts/smoke/worktree-doctor-reap-zombies-dry-run.sh"
 
 log "running layout-evidence-empty-subdir smoke"
 bash "$REPO_ROOT/scripts/smoke/layout-evidence-empty-subdir.sh"
+
+log "running smoke-isolation-no-live-leak smoke (refs queue #4793)"
+bash "$REPO_ROOT/scripts/smoke/smoke-isolation-no-live-leak.sh"
 
 log "smoke test passed"
