@@ -11238,15 +11238,24 @@ bash "$REPO_ROOT/scripts/smoke/bridge-agent-cli-no-deadlock.sh"
 log "running bridge-daemon-cron-no-deadlock smoke (refs queue task #4807)"
 bash "$REPO_ROOT/scripts/smoke/bridge-daemon-cron-no-deadlock.sh"
 
+# Issue #946 L2 + L4 — daemon tick-loop wedge defenses + PR #952 r2+r5+r6+r7
+# regressions. L2 pre-resolves heartbeat heredoc command substitutions with
+# a per-call deadline so a stuck helper (e.g. stale-worktree python3 path)
+# cannot hang the tick; r2 adds recursive descendant kill so a python3/tmux
+# grandchild does not survive the timeout; r4 uses bash monitor mode (set -m)
+# + negative-pid kill for sandbox resilience; r5 unconditional KILL after
+# grace; r7 scoped wrapper to wedge-prone helpers only. L4 runs the daemon
+# step's maintenance side-effects via --maintenance-only on
+# bridge_write_idle_ready_agents failure (root cause of operator-host
+# nudge-suppression 2026-05-17).
+log "running daemon-tick-guards-l2-l4 smoke (refs #946 L2+L4, PR #952)"
+bash "$REPO_ROOT/scripts/smoke/daemon-tick-guards-l2-l4.sh"
+
 # bridge-watchdog-silence.py previously truncated captured daemon
 # stop/start output to the last line, so every wedge from 2026-05-15
 # onward surfaced the same v0.8.0 ACL background sentence in the
 # silence-watchdog audit row. Issue #946 L3 preserves the full stderr
 # block and classifies the resolver die path (line 384 / 406 / 439).
-# This smoke step pins the classifier token map, the state-file
-# `resolver_die` + `stderr_preview` persistence, and the multi-line
-# survival contract so the next wedge is diagnosable in seconds rather
-# than hours.
 log "running watchdog-silence-stderr-capture smoke (#946 L3)"
 bash "$REPO_ROOT/scripts/smoke/watchdog-silence-stderr-capture.sh"
 
