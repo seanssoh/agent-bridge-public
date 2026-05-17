@@ -146,9 +146,14 @@ _bridge_heartbeat_value_with_timeout() {
     # returned the fallback — codex r1's leak.
     _bridge_kill_proc_tree "$pid" "TERM"
     sleep 0.5
-    if kill -0 "$pid" 2>/dev/null; then
-      _bridge_kill_proc_tree "$pid" "KILL"
-    fi
+    # r6 (codex PR #952 r5) — unconditional KILL escalation. A SIGTERM-
+    # ignoring grandchild in the same process group survives the first
+    # _bridge_kill_proc_tree TERM and the wrapper dying makes kill -0 false,
+    # but the grandchild is still alive. SIGKILL is uncatchable so this
+    # negative-PID KILL reaches it via the pgrp. Mirror production
+    # bridge-daemon.sh exactly so the smoke catches the same class of
+    # regression.
+    _bridge_kill_proc_tree "$pid" "KILL"
     wait "$pid" 2>/dev/null || true
     daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}' timed out at ${secs}s; substituting sentinel '${default}' (refs #946)"
     bridge_audit_log daemon daemon_heartbeat_helper_timeout daemon \
