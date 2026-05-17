@@ -2070,6 +2070,18 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
             admin_agent=admin_agent,
         )
 
+        # Issue #946 L4 / PR #952 r2: maintenance is complete (lease extend
+        # / expire, cron de-dupe, stale-claim requeue, blocked-task aging).
+        # If the caller passed --skip-nudges (the bash daemon's L4 fail-path
+        # uses this when bridge_write_idle_ready_agents failed) return now
+        # without consuming the ready-agents file or emitting nudge rows.
+        # Production-side proof: tests/smoke gating reads the audit log for
+        # the maintenance side-effects regardless of the skip flag.
+        if getattr(args, "skip_nudges", False):
+            if args.format == "text":
+                print("(maintenance-only; nudges skipped)")
+            return 0
+
         rows = conn.execute(
             """
             SELECT assigned_to, id
@@ -2432,6 +2444,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("BRIDGE_ADMIN_AGENT_ID", "patch"),
     )
     daemon_parser.add_argument("--ready-agents-file")
+    # Issue #946 L4 / PR #952 r2: when the idle_ready writer fails the bash
+    # caller still needs maintenance (lease extend/expire, cron de-dupe,
+    # stale-claim requeue, blocked-task aging) to run; only the nudge
+    # candidate enumeration depends on the ready-agents file. --skip-nudges
+    # keeps the maintenance path intact and short-circuits before the
+    # per-agent nudge selection loop, so the daemon never freezes queue
+    # maintenance on a transient writer failure.
+    daemon_parser.add_argument("--skip-nudges", action="store_true")
     daemon_parser.add_argument("--format", choices=("text", "tsv"), default="tsv")
     daemon_parser.set_defaults(handler=cmd_daemon_step)
 

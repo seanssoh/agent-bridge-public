@@ -120,12 +120,14 @@ BRIDGE_DAEMON_LAST_STEP="${BRIDGE_DAEMON_LAST_STEP:-init}"
 BRIDGE_DAEMON_ERR_LOCATION="${BRIDGE_DAEMON_ERR_LOCATION:-}"
 _BRIDGE_DAEMON_EXIT_LOGGED=0
 _BRIDGE_DAEMON_IN_ERR_TRAP=0
-# Issue #946 L4: consecutive-failure counter for bridge_write_idle_ready_agents.
-# Reset to 0 on each successful write; incremented on each failure. The
-# nudge_scan step uses this both to skip bridge_task_daemon_step on the
-# failing tick (avoiding broken-state consumption) and to surface a
-# `daemon_nudge_skip_streak` audit row so an operator can spot a wedged
-# writer after N consecutive ticks instead of having to grep raw logs.
+# Issue #946 L4 / PR #952 r2: consecutive-failure counter for
+# bridge_write_idle_ready_agents. Reset to 0 on each successful write;
+# incremented on each failure. The nudge_scan step uses this both to (a)
+# trigger the maintenance-only fallback path on the failing tick (avoiding
+# broken-state nudge consumption while preserving queue maintenance) and
+# (b) surface a `daemon_step_warning` audit row so an operator can spot a
+# wedged writer after N consecutive ticks instead of having to grep raw
+# logs.
 _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=0
 
 _bridge_daemon_on_signal() {
@@ -290,6 +292,33 @@ EOF
 # child fork, and `set -e` did not abort because `cat` had not yet
 # observed a failure. Pre-resolving the values gives us a clean failure
 # boundary on each call.
+# PR #952 r2 P2 #2: recursive descendant kill. The wedged-helper case
+# documented for L2 is a bash function that forks a python3/tmux child
+# (e.g. bridge_agent_channel_status → python3 bridge-channels.py).
+# Killing just the immediate background subshell PID leaves the python3
+# grandchild orphaned, so a stuck helper still leaked one long-running
+# child per heartbeat tick.
+#
+# We walk descendants depth-first with pgrep -P (depth-first so leaves
+# die before their parents — reduces SIGCHLD reaping races) and send the
+# requested signal to each. setsid / process-group kill is not portable
+# across macOS/Linux without an external wrapper (perl POSIX, util-linux
+# setsid) AND would require launching helpers via bash -c, which loses
+# the in-process bash function table. Recursive pgrep is the cleanest
+# portable approach given those constraints; pgrep is in
+# procps-ng (Linux) and Darwin base (macOS), already required by other
+# daemon paths.
+_bridge_kill_proc_tree() {
+  local root_pid="$1"
+  local sig="${2:-TERM}"
+  local children child
+  children="$(pgrep -P "$root_pid" 2>/dev/null || true)"
+  for child in $children; do
+    _bridge_kill_proc_tree "$child" "$sig"
+  done
+  kill "-$sig" "$root_pid" 2>/dev/null || true
+}
+
 _bridge_heartbeat_value_with_timeout() {
   # Args: <timeout_seconds> <call_site_label> <agent> <default> <fn> [fn-args...]
   #
@@ -309,7 +338,9 @@ _bridge_heartbeat_value_with_timeout() {
   #      completes.
   #   2. poll kill -0 up to `secs` ticks (~1s resolution; aligned with
   #      the daemon's existing audit cadence).
-  #   3. on deadline expiry: kill -TERM, brief grace, kill -KILL, drop
+  #   3. on deadline expiry: kill the entire descendant tree (PR #952 r2
+  #      P2 #2 — recursive pgrep so python3/tmux grandchildren do not
+  #      leak as orphans), brief grace, escalate to SIGKILL, drop
   #      tempfile, return sentinel + L2 event.
   #   4. on natural completion: wait + read tempfile contents.
   local secs="$1"
@@ -351,13 +382,16 @@ _bridge_heartbeat_value_with_timeout() {
   done
 
   if kill -0 "$pid" 2>/dev/null; then
-    # Deadline hit — escalate from TERM to KILL like the queue gateway
-    # stop helper does. A 0.5s grace covers most python3 helpers; the
+    # Deadline hit — recursive descendant kill so any python3/tmux child
+    # of the wrapper subshell dies too (PR #952 r2 P2 #2). Without this
+    # the python3 grandchild survived as an orphan per tick — codex's
+    # 4891ms probe caught the leak. Escalate TERM → KILL like the queue
+    # gateway stop helper. A 0.5s grace covers most python3 helpers; the
     # KILL is the hard cap so the parent can never wait indefinitely.
-    kill -TERM "$pid" 2>/dev/null || true
+    _bridge_kill_proc_tree "$pid" "TERM"
     sleep 0.5
     if kill -0 "$pid" 2>/dev/null; then
-      kill -KILL "$pid" 2>/dev/null || true
+      _bridge_kill_proc_tree "$pid" "KILL"
     fi
     wait "$pid" 2>/dev/null || true
     daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}' timed out at ${secs}s; substituting sentinel '${default}' (refs #946)"
@@ -6115,15 +6149,24 @@ cmd_sync_cycle() {
   # matrix-not-applied via `agent-bridge audit follow` instead of
   # cycling on a green-looking daemon.
   #
-  # Issue #946 L4: when the writer fails, the previous code fell through
-  # to bridge_task_daemon_step with a broken/empty ready-agent file. The
-  # downstream consumer then computed nudge candidates from invalid input,
-  # silently suppressing `[task-queued]` interrupts on the operator host
-  # for hours (operator-host evidence 2026-05-17: hundreds of `idle_ready
-  # writer failed` lines while queued tasks never reached their target).
-  # Skip bridge_task_daemon_step explicitly on writer failure so the next
-  # tick re-attempts with fresh state, and track consecutive failures so
-  # a wedged writer surfaces as an audit row instead of log noise.
+  # Issue #946 L4 / PR #952 r2: when the writer fails, the original code
+  # fell through to bridge_task_daemon_step with a broken/empty ready-agent
+  # file. The downstream consumer then computed nudge candidates from
+  # invalid input, silently suppressing `[task-queued]` interrupts on the
+  # operator host for hours (operator-host evidence 2026-05-17: hundreds of
+  # `idle_ready writer failed` lines while queued tasks never reached their
+  # target). r1 skipped bridge_task_daemon_step entirely on writer failure,
+  # which fixed the bad-nudge problem but starved the same step's
+  # maintenance side-effects (lease extend/expire, cron de-dupe, stale-
+  # claim requeue, blocked-task aging) for the whole tick — a writer wedge
+  # would now freeze queue maintenance for as long as it lasted.
+  #
+  # r2 splits the two concerns: on writer failure we still call
+  # bridge_task_daemon_step but with --maintenance-only so the python
+  # backend runs all the maintenance work and then exits without consuming
+  # the (broken) ready-agents file or printing nudge candidates. The
+  # consecutive-failure counter and audit row are preserved so an operator
+  # still gets the writer-wedge signal.
   nudge_output=""
   if bridge_write_idle_ready_agents "$ready_agents_file"; then
     _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=0
@@ -6134,9 +6177,15 @@ cmd_sync_cycle() {
       --detail step="nudge_scan_idle_ready" \
       --detail reason="bridge_write_idle_ready_agents non-zero (matrix not applied or writer error)" \
       --detail consecutive_failures="$_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL" \
-      --detail action="skip_bridge_task_daemon_step" \
+      --detail action="maintenance_only_skip_nudges" \
       2>/dev/null || true
-    daemon_log_event "[L4] nudge_scan: idle_ready writer failed (consec=${_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL}); skipping bridge_task_daemon_step this tick (refs #946, matrix-aware #781)"
+    daemon_log_event "[L4] nudge_scan: idle_ready writer failed (consec=${_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL}); running daemon_step maintenance-only and skipping nudges this tick (refs #946 L4, PR #952 r2, matrix-aware #781)"
+    # Run the maintenance side-effects without nudge dispatch. Failures
+    # here are non-fatal — the step's external state (sqlite txns) is
+    # already protected by its own transaction boundary, and an exception
+    # path leaves the next tick to retry. nudge_output stays empty so the
+    # downstream nudge-fanout loop is a no-op for this tick.
+    bridge_task_daemon_step --maintenance-only "$snapshot_file" >/dev/null 2>&1 || true
   fi
   rm -f "$snapshot_file"
   rm -f "$ready_agents_file"

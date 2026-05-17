@@ -54,6 +54,21 @@ daemon_log_event() {
 # (the smoke's step_in_source_wiring_present check asserts the production
 # helper exists; this driver mirrors its behavior so the smoke can drive
 # it without bringing up the full sync_cycle dependency stack).
+#
+# PR #952 r2 P2 #2: recursive descendant kill. Mirrors
+# _bridge_kill_proc_tree in bridge-daemon.sh — kills the entire descendant
+# tree so a python3/tmux grandchild does not leak as an orphan.
+_bridge_kill_proc_tree() {
+  local root_pid="$1"
+  local sig="${2:-TERM}"
+  local children child
+  children="$(pgrep -P "$root_pid" 2>/dev/null || true)"
+  for child in $children; do
+    _bridge_kill_proc_tree "$child" "$sig"
+  done
+  kill "-$sig" "$root_pid" 2>/dev/null || true
+}
+
 _bridge_heartbeat_value_with_timeout() {
   local secs="$1"
   local label="$2"
@@ -82,10 +97,14 @@ _bridge_heartbeat_value_with_timeout() {
     i=$(( i + 1 ))
   done
   if kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid" 2>/dev/null || true
+    # PR #952 r2 P2 #2: recursive descendant kill (the production helper
+    # does the same). Without this, a python3/tmux grandchild outlives
+    # the timeout and writes its sentinel file after the parent already
+    # returned the fallback — codex r1's leak.
+    _bridge_kill_proc_tree "$pid" "TERM"
     sleep 0.5
     if kill -0 "$pid" 2>/dev/null; then
-      kill -KILL "$pid" 2>/dev/null || true
+      _bridge_kill_proc_tree "$pid" "KILL"
     fi
     wait "$pid" 2>/dev/null || true
     daemon_log_event "[L2] heartbeat helper '${label}' for agent '${agent}' timed out at ${secs}s; substituting sentinel '${default}' (refs #946)"
@@ -120,6 +139,38 @@ _test_sleep_forever() {
   sleep 60
 }
 
+# PR #952 r2 P2 #2 regression probe — a bash function that forks a python3
+# child writing a sentinel file after 5s. The L2 helper must kill the
+# python3 grandchild on timeout; if it survives, the sentinel file will
+# appear in TEST_SENTINEL_FILE after the timeout fires and we return.
+_test_spawn_python3_sentinel_writer() {
+  local sentinel="${TEST_SENTINEL_FILE:?TEST_SENTINEL_FILE not set}"
+  # Run the python3 child in the same process group as us (no setsid /
+  # nohup). The parent function (this bash function) sleeps forever so the
+  # L2 helper deadline must fire while the python3 child is still alive.
+  # If the helper only kills the immediate subshell wrapper, the python3
+  # child orphans into pid 1 and proceeds to write the sentinel — that is
+  # exactly the leak codex flagged.
+  python3 -c "
+import time, sys
+time.sleep(5)
+with open(sys.argv[1], 'w') as f:
+    f.write('survived')
+" "$sentinel" &
+  local child=$!
+  # Parent blocks too so the L2 helper has both PIDs to clean up.
+  wait "$child"
+}
+
+# --- L4 maintenance-mode probe ---------------------------------------------
+# PR #952 r2 P2 #1: spy that records which mode the production-side
+# fall-through invoked bridge_task_daemon_step with. The smoke asserts
+# that on writer failure the maintenance-only mode was invoked (so the
+# downstream cron-dedupe / lease-extend / blocked-task-aging work was NOT
+# starved by the wedged writer).
+_TEST_BRIDGE_TASK_DAEMON_STEP_MAINTENANCE_CALLS=0
+_TEST_BRIDGE_TASK_DAEMON_STEP_FULL_CALLS=0
+
 # --- L4 nudge-scan harness --------------------------------------------------
 # Carbon-copy of the L4 branch in bridge-daemon.sh:6022. Stubs
 # bridge_write_idle_ready_agents (rc controlled by TEST_WRITER_RC) and
@@ -129,9 +180,25 @@ _BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL=0
 _TEST_BRIDGE_TASK_DAEMON_STEP_CALLS=0
 
 bridge_write_agent_snapshot() { : ; }
+# PR #952 r2 P2 #1: stub records whether the caller passed
+# --maintenance-only (the writer-failure path) or invoked the full step
+# (writer-success path). Writes the breadcrumb to TEST_STEP_SPY_FILE so
+# the smoke can assert across separate driver invocations.
 bridge_task_daemon_step() {
   _TEST_BRIDGE_TASK_DAEMON_STEP_CALLS=$(( _TEST_BRIDGE_TASK_DAEMON_STEP_CALLS + 1 ))
-  printf 'agent\tsession\t0\t0\t0\tkey\n'
+  local mode="full"
+  if [[ "${1:-}" == "--maintenance-only" ]]; then
+    mode="maintenance"
+    _TEST_BRIDGE_TASK_DAEMON_STEP_MAINTENANCE_CALLS=$(( _TEST_BRIDGE_TASK_DAEMON_STEP_MAINTENANCE_CALLS + 1 ))
+  else
+    _TEST_BRIDGE_TASK_DAEMON_STEP_FULL_CALLS=$(( _TEST_BRIDGE_TASK_DAEMON_STEP_FULL_CALLS + 1 ))
+  fi
+  if [[ -n "${TEST_STEP_SPY_FILE:-}" ]]; then
+    printf '%s\n' "$mode" >>"$TEST_STEP_SPY_FILE"
+  fi
+  if [[ "$mode" == "full" ]]; then
+    printf 'agent\tsession\t0\t0\t0\tkey\n'
+  fi
 }
 bridge_write_idle_ready_agents() {
   return "${TEST_WRITER_RC:-0}"
@@ -152,9 +219,13 @@ _test_nudge_scan_branch() {
       --detail step="nudge_scan_idle_ready" \
       --detail reason="bridge_write_idle_ready_agents non-zero (matrix not applied or writer error)" \
       --detail consecutive_failures="$_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL" \
-      --detail action="skip_bridge_task_daemon_step" \
+      --detail action="maintenance_only_skip_nudges" \
       2>/dev/null || true
-    daemon_log_event "[L4] nudge_scan: idle_ready writer failed (consec=${_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL}); skipping bridge_task_daemon_step this tick (refs #946, matrix-aware #781)"
+    daemon_log_event "[L4] nudge_scan: idle_ready writer failed (consec=${_BRIDGE_NUDGE_IDLE_READY_CONSEC_FAIL}); running daemon_step maintenance-only and skipping nudges this tick (refs #946 L4, PR #952 r2, matrix-aware #781)"
+    # PR #952 r2 P2 #1: still invoke the step in maintenance-only mode so
+    # the queue maintenance side-effects (lease, cron-dedup, blocked-task
+    # aging) are not starved by a transient writer failure.
+    bridge_task_daemon_step --maintenance-only "$snapshot_file" >/dev/null 2>&1 || true
   fi
   rm -f "$snapshot_file" "$ready_agents_file"
   printf '%s' "$nudge_output"
@@ -164,6 +235,13 @@ case "${1:-}" in
   l2_value_with_timeout)
     shift
     _bridge_heartbeat_value_with_timeout "$@"
+    ;;
+  l2_value_with_timeout_pythonchild)
+    # PR #952 r2 P2 #2 probe: drive the helper with the python3-grandchild
+    # spawner. The smoke asserts TEST_SENTINEL_FILE does NOT exist after
+    # the timeout + settle window, proving the grandchild was reaped.
+    shift
+    _bridge_heartbeat_value_with_timeout "$1" "$2" "$3" "$4" _test_spawn_python3_sentinel_writer
     ;;
   l4_nudge_scan)
     shift

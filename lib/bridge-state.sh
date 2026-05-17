@@ -3343,6 +3343,18 @@ bridge_write_roster_status_snapshot() {
 }
 
 bridge_task_daemon_step() {
+  # Issue #946 L4 / PR #952 r2: --maintenance-only (when passed as the very
+  # first positional arg) makes the underlying python step run all the
+  # queue-maintenance work (lease extend/expire, cron de-dupe, stale-claim
+  # requeue, blocked-task aging) but skip the nudge candidate enumeration
+  # and ready-agents file consumption. The bash L4 fail-path calls this
+  # form when bridge_write_idle_ready_agents fails so a transient writer
+  # error no longer freezes queue maintenance for the whole tick.
+  local skip_nudges=0
+  if [[ "${1:-}" == "--maintenance-only" ]]; then
+    skip_nudges=1
+    shift
+  fi
   local snapshot_file="$1"
   local ready_agents_file="${2:-}"
   local zombie_threshold="${BRIDGE_ZOMBIE_NUDGE_THRESHOLD:-10}"
@@ -3359,7 +3371,9 @@ bridge_task_daemon_step() {
     --admin-agent "${BRIDGE_ADMIN_AGENT_ID:-patch}"
   )
 
-  if [[ -n "$ready_agents_file" && -f "$ready_agents_file" ]]; then
+  if (( skip_nudges )); then
+    args+=(--skip-nudges)
+  elif [[ -n "$ready_agents_file" && -f "$ready_agents_file" ]]; then
     args+=(--ready-agents-file "$ready_agents_file")
   fi
 

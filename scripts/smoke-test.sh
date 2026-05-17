@@ -10971,13 +10971,16 @@ bash "$REPO_ROOT/scripts/smoke/smoke-isolation-no-live-leak.sh"
 log "running bridge-agent-cli-no-deadlock smoke (refs queue task #4773)"
 bash "$REPO_ROOT/scripts/smoke/bridge-agent-cli-no-deadlock.sh"
 
-# Issue #946 L2 + L4 — daemon tick-loop wedge defenses. L2 pre-resolves
-# heartbeat heredoc command substitutions with a per-call deadline so a
-# stuck helper (e.g. stale-worktree python3 path) cannot hang the tick.
-# L4 gates bridge_task_daemon_step on bridge_write_idle_ready_agents
-# succeeding so a broken ready-agent file is never consumed (root cause
-# of operator-host nudge-suppression 2026-05-17).
-log "running daemon-tick-guards-l2-l4 smoke (refs #946 L2+L4)"
+# Issue #946 L2 + L4 — daemon tick-loop wedge defenses + PR #952 r2
+# regressions. L2 pre-resolves heartbeat heredoc command substitutions
+# with a per-call deadline so a stuck helper (e.g. stale-worktree python3
+# path) cannot hang the tick; r2 adds recursive descendant kill so a
+# python3/tmux grandchild does not survive the timeout. L4 runs the
+# daemon step's maintenance side-effects via --maintenance-only on
+# bridge_write_idle_ready_agents failure (r2: previous version skipped
+# the step entirely, starving lease extension / cron de-dupe / blocked-
+# task aging — root cause of operator-host nudge-suppression 2026-05-17).
+log "running daemon-tick-guards-l2-l4 smoke (refs #946 L2+L4, PR #952 r2)"
 bash "$REPO_ROOT/scripts/smoke/daemon-tick-guards-l2-l4.sh"
 
 log "smoke test passed"
