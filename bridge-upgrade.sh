@@ -759,11 +759,16 @@ bridge_upgrade_channel_guard_json() {
 bridge_upgrade_print_channel_guard_summary() {
   local payload="$1"
 
-  python3 - "$payload" <<'PY'
+  # Spool payload to tempfile and pass filename — see r1/r2 rationale at line 2313.
+  local _guard_dir
+  _guard_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-guard-json.XXXXXX")"
+  printf '%s' "$payload" >"$_guard_dir/payload.json"
+  python3 - "$_guard_dir/payload.json" <<'PY'
 import json
 import sys
 
-payload = json.loads(sys.argv[1])
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
 items = payload.get("agents", [])
 if not items:
     raise SystemExit(0)
@@ -777,6 +782,7 @@ for item in items[:10]:
 if len(items) > 10:
     print(f"  ... +{len(items) - 10} more")
 PY
+  rm -rf "$_guard_dir"
 }
 
 bridge_upgrade_installed_field() {
@@ -1304,19 +1310,29 @@ bridge_upgrade_capture_to_var CHANNEL_GUARD_JSON \
   bridge_upgrade_channel_guard_json "$CHANNEL_GUARD_REPORT"
 
 if [[ "$SUBCOMMAND" == "analyze" ]]; then
+  # Linux ARG_MAX overflow: same hazard as the post-upgrade status block below
+  # (see comment at line ~2304). ANALYSIS_JSON / CHANNEL_GUARD_JSON can grow
+  # past argv limits on large installs, so spool to a tempfile and pass the
+  # filename rather than embedding the payload in argv.
+  _analyze_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-analyze-json.XXXXXX")"
+  printf '%s' "$ANALYSIS_JSON" >"$_analyze_dir/analysis.json"
+  printf '%s' "$CHANNEL_GUARD_JSON" >"$_analyze_dir/channel-guard.json"
   if [[ $JSON -eq 1 ]]; then
-    python3 - "$ANALYSIS_JSON" "$CHANNEL_GUARD_JSON" <<'PY'
+    python3 - "$_analyze_dir/analysis.json" "$_analyze_dir/channel-guard.json" <<'PY'
 import json
 import sys
 
-payload = json.loads(sys.argv[1])
-payload["channel_guard"] = json.loads(sys.argv[2])
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
+with open(sys.argv[2], encoding="utf-8") as fh:
+    payload["channel_guard"] = json.load(fh)
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY
   else
-    python3 - "$ANALYSIS_JSON" <<'PY'
+    python3 - "$_analyze_dir/analysis.json" <<'PY'
 import json, sys
-payload = json.loads(sys.argv[1])
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
 counts = payload.get("counts", {})
 print("== Agent Bridge upgrade analyze ==")
 print(f"source_root: {payload.get('source_root')}")
@@ -1327,6 +1343,7 @@ for key in ("missing_live", "upstream_only", "live_only", "merge_required", "unk
 PY
     bridge_upgrade_print_channel_guard_summary "$CHANNEL_GUARD_JSON"
   fi
+  rm -rf "$_analyze_dir"
   exit 0
 fi
 
@@ -2301,17 +2318,32 @@ echo "target_root: $TARGET_ROOT"
 echo "preserved_customizations: agent-roster.local.sh, state/, logs/, shared/, backups/, worktrees/, agents/<agent>/"
 echo "strict_merge: $([[ $STRICT_MERGE -eq 1 ]] && printf yes || printf no)"
 echo "restart_agents: $([[ $RESTART_AGENTS -eq 1 ]] && printf yes || printf no)"
+# Linux ARG_MAX overflow: large JSON payloads (BACKUP/ANALYSIS/SOURCE_RECLASSIFY)
+# must not be passed as argv — Oracle 9 / Ubuntu hit `python3: Argument list too
+# long` (E2BIG) on big upgrade manifests, silently dropping status visibility
+# even when the upgrade itself succeeds. Spool each payload to a tempfile and
+# pass the filename instead, mirroring the --json envelope pattern at line
+# ~2156. Filename-via-argv is the only option that works here: heredoc-stdin
+# (`python3 <<PY ... PY`) is forbidden (footgun #11, Bash 5.3.9 deadlock) and
+# `printf '%s' "$JSON" | python3 - <<'PY'` trips SC2259 because the heredoc
+# overrides the piped stdin.
+_status_print_dir="$(mktemp -d "${TMPDIR:-/tmp}/bridge-upgrade-status-json.XXXXXX")"
+printf '%s' "$ANALYSIS_JSON" >"$_status_print_dir/analysis.json"
+printf '%s' "$SOURCE_RECLASSIFY_JSON" >"$_status_print_dir/source-reclassify.json"
 if [[ $BACKUP -eq 1 ]]; then
   echo "backup_root: $BACKUP_ROOT"
-  python3 - "$BACKUP_JSON" <<'PY'
+  printf '%s' "$BACKUP_JSON" >"$_status_print_dir/backup.json"
+  python3 - "$_status_print_dir/backup.json" <<'PY'
 import json, sys
-payload = json.loads(sys.argv[1])
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
 print(f"backup_created: {'yes' if payload.get('created') else 'no'}")
 PY
 fi
-python3 - "$ANALYSIS_JSON" <<'PY'
+python3 - "$_status_print_dir/analysis.json" <<'PY'
 import json, sys
-payload = json.loads(sys.argv[1])
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
 counts = payload.get("counts", {})
 print(f"analysis_base_ref: {payload.get('base_ref') or '-'}")
 print(f"analysis_missing_live: {counts.get('missing_live', 0)}")
@@ -2321,15 +2353,17 @@ print(f"analysis_merge_required: {counts.get('merge_required', 0)}")
 print(f"analysis_unknown_base_live_diff: {counts.get('unknown_base_live_diff', 0)}")
 PY
 bridge_upgrade_print_channel_guard_summary "$CHANNEL_GUARD_JSON"
-python3 - "$SOURCE_RECLASSIFY_JSON" <<'PY'
+python3 - "$_status_print_dir/source-reclassify.json" <<'PY'
 import json, sys
-payload = json.loads(sys.argv[1])
+with open(sys.argv[1], encoding="utf-8") as fh:
+    payload = json.load(fh)
 count = int(payload.get("count") or 0)
 mode = payload.get("mode") or "dry-run"
 print(f"source_reclassify: {count} candidate(s) ({mode})")
 for item in payload.get("candidates") or []:
     print(f"  - {item.get('action')}: {item.get('agent')} old_source={item.get('old_source')} new_source={item.get('new_source')} reason={item.get('reason')}")
 PY
+rm -rf "$_status_print_dir"
 python3 - "$SHARED_SETTINGS_RERENDER_JSON" <<'PY'
 import json, sys
 # Issue #731: same defensive guard as the verification heredoc above —
