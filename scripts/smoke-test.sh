@@ -11226,6 +11226,18 @@ bash "$REPO_ROOT/scripts/smoke/smoke-isolation-no-live-leak.sh"
 log "running bridge-agent-cli-no-deadlock smoke (refs queue task #4773)"
 bash "$REPO_ROOT/scripts/smoke/bridge-agent-cli-no-deadlock.sh"
 
+# bridge-daemon.sh + lib/bridge-cron.sh footgun #11 migration regression
+# guard (refs queue task #4807). Operator host (2026-05-17 → 2026-05-18)
+# accumulated 7 zombie daemon processes plus two cron-workers hung 13h
+# on the same task_id. Five bridge-daemon.sh sites and thirteen
+# lib/bridge-cron.sh sites carried the same Bash 5.3.9 read_comsub /
+# heredoc_write trip surface; all were migrated to standalone helpers
+# under lib/daemon-helpers/ and lib/cron-helpers/. Smoke verifies the
+# heredoc-stdin count stays at zero, every helper parses, and every
+# call site routes through the $SCRIPT_DIR / $BRIDGE_SCRIPT_DIR anchor.
+log "running bridge-daemon-cron-no-deadlock smoke (refs queue task #4807)"
+bash "$REPO_ROOT/scripts/smoke/bridge-daemon-cron-no-deadlock.sh"
+
 # bridge-watchdog-silence.py previously truncated captured daemon
 # stop/start output to the last line, so every wedge from 2026-05-15
 # onward surfaced the same v0.8.0 ACL background sentence in the

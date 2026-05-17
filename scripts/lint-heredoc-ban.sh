@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/lint-heredoc-ban.sh — ratchet lint preventing NEW heredoc-stdin
-# subprocess sites in footgun-#11-prone files (currently bridge-upgrade.sh
-# and bridge-agent.sh).
+# subprocess sites in footgun-#11-prone files (currently bridge-upgrade.sh,
+# bridge-agent.sh, bridge-daemon.sh, and lib/bridge-cron.sh).
 #
 # Context: footgun #11 (Bash 5.3.9 `read_comsub` / `heredoc_write` deadlock
 # chain — fixed in v0.13.7 through v0.13.9 for the upgrader and refs #4773
@@ -11,22 +11,29 @@
 # bridge-agent.sh, the three nested-$() heredoc-stdin sites in
 # run_list/run_registry/run_show were migrated to file-as-argv (operator
 # host hangs of 7-17 hours triaged in queue task #4773); 9 single-level
-# heredoc-stdin sites remain. This lint ratchets each count downward —
-# it fails CI if anyone introduces a NEW heredoc-stdin subprocess line
-# in either file without first migrating an existing one out.
+# heredoc-stdin sites remain. Queue task #4807 then extracted every
+# heredoc-stdin site in bridge-daemon.sh (7 sites → lib/daemon-helpers/)
+# and lib/bridge-cron.sh (13 sites → lib/cron-helpers/) after the
+# operator host accumulated 7 zombie daemon processes plus two
+# cron-workers hung 13h on the same task id. This lint ratchets each
+# count downward — it fails CI if anyone introduces a NEW heredoc-stdin
+# subprocess line in any tracked file without first migrating an
+# existing one out.
 #
 # Ratchet semantics:
 # - BRIDGE_UPGRADE_HEREDOC_CEILING (default 18) — bridge-upgrade.sh.
 # - BRIDGE_AGENT_HEREDOC_CEILING   (default  9) — bridge-agent.sh.
+# - BRIDGE_DAEMON_HEREDOC_CEILING  (default  0) — bridge-daemon.sh.
+# - BRIDGE_CRON_HEREDOC_CEILING    (default  0) — lib/bridge-cron.sh.
 # - When stabilization migrates more sites, the ceilings drop to the new
 #   counts via PR that updates this script's defaults.
 # - PRs that add new heredoc-stdin without removing one push count over
 #   the ceiling and fail this lint.
 #
 # Contract — broad-match:
-#   A "site" is any non-comment line in a target file (bridge-upgrade.sh
-#   or bridge-agent.sh) that contains a heredoc-fed `bash -s ...` or
-#   `python3 - ...` subprocess on the same line — i.e., the sub-pattern
+#   A "site" is any non-comment line in a target file that contains a
+#   heredoc-fed `bash -s ...` or `python3 - ...` subprocess on the same
+#   line — i.e., the sub-pattern
 #       <bash -s | python3 -> ... <<EOF | <<'EOF' | <<"EOF" | <<PY | <<'PY' | <<"PY" | <<-...
 #   appears anywhere on the line.
 #
@@ -57,6 +64,8 @@
 #   scripts/lint-heredoc-ban.sh --self-test  # verify pattern against fixtures
 #   BRIDGE_UPGRADE_HEREDOC_CEILING=10 ...    # override bridge-upgrade.sh ceiling
 #   BRIDGE_AGENT_HEREDOC_CEILING=8 ...       # override bridge-agent.sh ceiling
+#   BRIDGE_DAEMON_HEREDOC_CEILING=1 ...      # override bridge-daemon.sh ceiling
+#   BRIDGE_CRON_HEREDOC_CEILING=1 ...        # override lib/bridge-cron.sh ceiling
 
 set -euo pipefail
 
@@ -67,6 +76,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 declare -a TARGETS=(
   "bridge-upgrade.sh:BRIDGE_UPGRADE_HEREDOC_CEILING:18"
   "bridge-agent.sh:BRIDGE_AGENT_HEREDOC_CEILING:9"
+  "bridge-daemon.sh:BRIDGE_DAEMON_HEREDOC_CEILING:0"
+  "lib/bridge-cron.sh:BRIDGE_CRON_HEREDOC_CEILING:0"
 )
 
 # Core danger pattern. Anchored to "command name + space + heredoc op + tag",

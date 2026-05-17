@@ -552,18 +552,11 @@ bridge_daily_backup_resolve_timeout() {
 # dep). Falls back to printing the raw epoch if Python is missing.
 bridge_daily_backup_format_epoch() {
   local epoch="${1:-0}"
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/format-epoch-iso.py — see helper docstring.
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$epoch" <<'PY' 2>/dev/null || printf '%s' "$epoch"
-import datetime
-import sys
-
-try:
-    ts = int(sys.argv[1])
-except (IndexError, ValueError):
-    print("")
-    raise SystemExit(0)
-print(datetime.datetime.fromtimestamp(ts).isoformat(timespec="seconds"))
-PY
+    python3 "$SCRIPT_DIR/lib/daemon-helpers/format-epoch-iso.py" "$epoch" 2>/dev/null \
+      || printf '%s' "$epoch"
   else
     printf '%s' "$epoch"
   fi
@@ -986,80 +979,12 @@ bridge_write_release_alert_body() {
   local monitor_json="$2"
   local upgrade_check_json="${3:-{}}"
 
-  python3 - "$body_file" "$monitor_json" "$upgrade_check_json" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-body_file = Path(sys.argv[1])
-monitor_payload = json.loads(sys.argv[2])
-try:
-    upgrade_payload = json.loads(sys.argv[3])
-except Exception:
-    upgrade_payload = {}
-
-alerts = monitor_payload.get("alerts") or []
-if not alerts:
-    raise SystemExit(1)
-alert = alerts[0]
-release = monitor_payload.get("release") or {}
-tag = str(alert.get("latest_tag") or release.get("latest_tag") or "")
-version = str(alert.get("latest_version") or release.get("latest_version") or "")
-installed_version = str(alert.get("installed_version") or release.get("installed_version") or "")
-release_name = str(alert.get("release_name") or release.get("release_name") or tag or version)
-repo = str(alert.get("repo") or release.get("repo") or "")
-release_url = str(alert.get("html_url") or release.get("html_url") or "")
-published_at = str(alert.get("published_at") or release.get("published_at") or "")
-notes = str(alert.get("body") or release.get("body") or "").strip()
-
-upgrade_target_ref = str(upgrade_payload.get("target_ref") or "")
-upgrade_target_version = str(upgrade_payload.get("target_version") or "")
-upgrade_available = bool(upgrade_payload.get("update_available"))
-local_upgrade_ready = bool(
-    upgrade_available
-    and (
-        (tag and upgrade_target_ref == tag)
-        or (version and upgrade_target_version == version)
-    )
-)
-
-if local_upgrade_ready:
-    readiness_note = "Direct `agb upgrade` on this server should target the same stable release."
-else:
-    readiness_note = (
-        "This server's local source checkout is not yet pointing at the same stable release. "
-        "Downstream/source sync may be required before `agb upgrade` can apply it."
-    )
-
-body_file.parent.mkdir(parents=True, exist_ok=True)
-with body_file.open("w", encoding="utf-8") as fh:
-    fh.write("# Stable Release Available\n\n")
-    fh.write(f"- release: {release_name}\n")
-    fh.write(f"- tag: {tag or '-'}\n")
-    fh.write(f"- version: {version or '-'}\n")
-    fh.write(f"- installed_version: {installed_version or '-'}\n")
-    fh.write(f"- repo: {repo or '-'}\n")
-    fh.write(f"- published_at: {published_at or '-'}\n")
-    fh.write(f"- release_url: {release_url or '-'}\n")
-    fh.write(f"- detected_at: {monitor_payload.get('generated_at') or '-'}\n")
-    fh.write("\n## Patch Action\n\n")
-    fh.write("1. Read the release notes below.\n")
-    fh.write("2. Summarize the user-facing changes to the admin user in Korean.\n")
-    fh.write("3. Ask whether to apply the upgrade now.\n")
-    fh.write("4. If the local upgrade path is not ready, explain that source/downstream sync is required first.\n")
-    fh.write("\n## Local Upgrade Readiness\n\n")
-    fh.write(f"- local_upgrade_ready: {'yes' if local_upgrade_ready else 'no'}\n")
-    fh.write(f"- local_upgrade_target_ref: {upgrade_target_ref or '-'}\n")
-    fh.write(f"- local_upgrade_target_version: {upgrade_target_version or '-'}\n")
-    fh.write(f"- local_upgrade_update_available: {'yes' if upgrade_available else 'no'}\n")
-    fh.write(f"- note: {readiness_note}\n")
-    fh.write("\n## Release Notes\n\n")
-    if notes:
-        fh.write(notes)
-        fh.write("\n")
-    else:
-        fh.write("_No release notes were published in the GitHub release body._\n")
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/write-release-alert-body.py — see helper docstring.
+  # The helper exits 1 when the monitor payload carries no alerts; preserve
+  # that contract (process_usage_monitor branches on the rc).
+  python3 "$SCRIPT_DIR/lib/daemon-helpers/write-release-alert-body.py" \
+    "$body_file" "$monitor_json" "$upgrade_check_json"
 }
 
 process_usage_monitor() {
@@ -1712,47 +1637,17 @@ bridge_stall_reason_label() {
 
 bridge_stall_decode_excerpt() {
   local encoded="${1:-}"
-  python3 - "$encoded" <<'PY'
-import base64, sys
-payload = sys.argv[1]
-if not payload:
-    raise SystemExit(0)
-print(base64.b64decode(payload.encode("ascii")).decode("utf-8", errors="ignore"), end="")
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/stall-decode-excerpt.py — see helper docstring.
+  python3 "$SCRIPT_DIR/lib/daemon-helpers/stall-decode-excerpt.py" "$encoded"
 }
 
 bridge_stall_recent_audits_markdown() {
   local agent="$1"
-  python3 - "$BRIDGE_AUDIT_LOG" "$agent" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-agent = sys.argv[2]
-rows = []
-if path.is_file():
-    for raw in path.read_text(encoding="utf-8", errors="ignore").splitlines():
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            item = json.loads(raw)
-        except Exception:
-            continue
-        detail = item.get("detail") or {}
-        target = str(item.get("target") or "")
-        if target == agent or str(detail.get("agent") or "") == agent:
-            rows.append(item)
-rows = rows[-2:]
-if not rows:
-    print("- none")
-else:
-    for item in rows:
-        ts = str(item.get("ts") or "")
-        action = str(item.get("action") or "unknown")
-        print(f"- {action} @ {ts}")
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/stall-recent-audits-markdown.py — see helper docstring.
+  python3 "$SCRIPT_DIR/lib/daemon-helpers/stall-recent-audits-markdown.py" \
+    "$BRIDGE_AUDIT_LOG" "$agent"
 }
 
 bridge_write_stall_report_body() {
@@ -2545,31 +2440,9 @@ process_context_pressure_reports() {
 
 bridge_watchdog_problem_key() {
   local report_json="$1"
-  python3 - "$report_json" <<'PY'
-import hashlib
-import json
-import sys
-
-raw = sys.argv[1]
-try:
-    payload = json.loads(raw)
-except Exception:
-    print(hashlib.sha256(raw.encode("utf-8")).hexdigest() if raw else "")
-    raise SystemExit(0)
-
-agents = []
-for item in payload.get("agents", []):
-    if isinstance(item, dict):
-        stable = dict(item)
-        # Age advances every scan; keep heartbeat_present, but exclude the
-        # volatile age value so unchanged drift dedupes correctly.
-        stable.pop("heartbeat_age_seconds", None)
-        agents.append(stable)
-    else:
-        agents.append(item)
-canonical = json.dumps(agents, sort_keys=True, separators=(",", ":"))
-print(hashlib.sha256(canonical.encode("utf-8")).hexdigest() if canonical else "")
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/watchdog-problem-key.py — see helper docstring.
+  python3 "$SCRIPT_DIR/lib/daemon-helpers/watchdog-problem-key.py" "$report_json"
 }
 
 bridge_watchdog_due() {
@@ -4679,23 +4552,12 @@ start_cron_worker() {
   log_file="$(bridge_cron_worker_log_file "$task_id")"
   mkdir -p "$(dirname "$log_file")"
   bridge_require_python
-  python3 - "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-daemon.sh" "$task_id" "$log_file" <<'PY' >/dev/null
-import os
-import subprocess
-import sys
-
-bash_bin, daemon_script, task_id, log_file = sys.argv[1:]
-
-with open(os.devnull, "rb") as stdin_handle, open(log_file, "ab", buffering=0) as log_handle:
-    subprocess.Popen(
-        [bash_bin, daemon_script, "run-cron-worker", task_id],
-        stdin=stdin_handle,
-        stdout=log_handle,
-        stderr=log_handle,
-        start_new_session=True,
-        close_fds=True,
-    )
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/start-cron-worker-spawn.py — see helper docstring.
+  # The cron-dispatch start path runs concurrently with daemon polling so
+  # the deadlock surface was hot.
+  python3 "$SCRIPT_DIR/lib/daemon-helpers/start-cron-worker-spawn.py" \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-daemon.sh" "$task_id" "$log_file" >/dev/null
 }
 
 start_cron_dispatch_workers() {
@@ -5656,24 +5518,12 @@ bridge_queue_gateway_socket_connect_probe() {
   local socket_path
   socket_path="$1"
   [[ -n "$socket_path" ]] || return 1
-  python3 - "$socket_path" <<'PY' >/dev/null 2>&1
-import socket
-import sys
-
-path = sys.argv[1]
-sock_type = getattr(socket, "SOCK_SEQPACKET", None)
-if sock_type is None:
-    raise SystemExit(1)
-sock = socket.socket(socket.AF_UNIX, sock_type)
-try:
-    sock.settimeout(1.0)
-    sock.connect(path)
-except OSError:
-    raise SystemExit(1)
-finally:
-    sock.close()
-raise SystemExit(0)
-PY
+  # Footgun #11 (refs queue task #4807): heredoc-stdin extracted to
+  # lib/daemon-helpers/gateway-socket-connect-probe.py — see helper docstring.
+  # Status path runs on every `daemon status` invocation; the deadlock
+  # surface was hot under concurrent dispatch pressure.
+  python3 "$SCRIPT_DIR/lib/daemon-helpers/gateway-socket-connect-probe.py" \
+    "$socket_path" >/dev/null 2>&1
 }
 
 bridge_queue_gateway_socket_is_running() {
