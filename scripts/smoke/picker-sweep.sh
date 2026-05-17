@@ -474,4 +474,34 @@ smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "14 no bare-Enter send"
 smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "14 one option send (active picker only)"
 smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "combo-agent:option=1" "14 send option=1 (auto-mode active, NOT stale bypass option 2)"
 
+# ---------------------------------------------------------------------------
+# Test 15 — r5 hardening (codex PR #949 r4): stale "2. Yes, I accept" in
+# free-text scrollback above an UNRELATED active picker (with the canonical
+# tail). The r4 active_picker extraction (last block ending with tail)
+# would still include the stale accept line and fire the bypass branch,
+# sending option 2 into the unrelated menu. The r5 fix anchors active_picker
+# extraction to lines between the MOST RECENT "WARNING:" header and the
+# MOST RECENT tail after it — stale text outside that window is excluded.
+# ---------------------------------------------------------------------------
+
+smoke_log "15. stale accept above unrelated active picker → must NOT trigger bypass send (r5)"
+reset_fixture
+printf '%s\n' "stale-accept-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-stale-accept-agent" <<'PANE'
+notes from a previous answer:
+  2. Yes, I accept
+
+  WARNING: An unrelated Claude warning that happens to share menu shape.
+
+  ❯ 1. No, exit
+    2. Do something completely unrelated to permissions
+    3. Try another path
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "15 no bare-Enter send"
+smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "15 no option send (stale accept must not fire bypass on unrelated menu)"
+
 smoke_log "all checks passed"

@@ -269,19 +269,30 @@ while IFS= read -r agent; do
     matched_pattern=""
     explicit_option=""   # #948 — when set, send "N + Enter" instead of bare Enter
 
-    # r4 (codex PR #949 r3) — scope explicit-option detection to the ACTIVE
-    # picker only. capture-pane returns ~25 lines of scrollback, so a
-    # fresh-install sequence (bypass accepted -> auto mode picker now showing)
-    # can have BOTH "2. Yes, I accept" (stale) and "1. Yes, and make it my
-    # default mode" (active) in the same capture. The bypass regex would win
-    # first and send option 2 into the auto-mode menu instead of option 1,
-    # and the ack would not persist across restarts. active_picker extracts
-    # only the lines of the LAST picker block (ending with the most recent
-    # tail), which is the menu actively waiting for input.
+    # r4 (codex PR #949 r3) + r5 (codex PR #949 r4) — scope explicit-option
+    # detection to the ACTIVE picker block ONLY. capture-pane returns ~25
+    # lines of scrollback, so two false-positive shapes need defending:
+    #   r4 case — stale bypass accept line + active auto picker in same
+    #             capture: bypass regex would win and send option 2 into
+    #             the auto menu (= "just this once" instead of "make
+    #             default"), ack would not persist.
+    #   r5 case — stale "2. Yes, I accept" in free-text (above an unrelated
+    #             active picker that ends with the canonical tail): would
+    #             fire bypass branch and send option 2 into the unrelated
+    #             menu (safety-sensitive false-positive).
+    # active_picker now extracts only lines between the MOST RECENT
+    # WARNING header (the canonical menu opener) and the MOST RECENT tail
+    # line that follows it. Stale text outside that window (free-prose,
+    # previous picker rounds, unrelated warnings) is excluded.
     active_picker="$(printf '%s\n' "$cap" | awk -v tail_re="$_PICKER_TAIL_RE" '
-      $0 ~ tail_re { last = buf $0; buf = ""; next }
-      { buf = buf $0 "\n" }
-      END { if (last != "") print last }
+      /^[[:space:]]*WARNING:/ { start = NR; have_start = 1; have_end = 0 }
+      have_start && $0 ~ tail_re { end = NR; have_end = 1 }
+      { lines[NR] = $0 }
+      END {
+        if (have_start && have_end) {
+          for (i = start; i <= end; i++) print lines[i]
+        }
+      }
     ')"
 
     if [[ -n "$active_picker" ]] \
