@@ -6,19 +6,98 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.2] — 2026-05-17
+
+### Highlight — stability + completeness pass (22 fixes from 2 sessions + OrbStack VM E2E discoveries)
+
+Operator-cued patch release rolling up the 2026-05-16 noise-reduction wave + the 2026-05-17 stability + lifecycle-cleanup waves. 22 PRs total; nothing is feature-additive except #933 (blocked-notify queue contract). The OrbStack VM lifecycle E2E test on 2026-05-17 surfaced 2 Linux-specific regressions (#936 layout-resolver false-evidence + #937 ARG_MAX overflow) that are also in this release. Post-merge wave from patch (queue tasks #4793-#4798) addressed 6 agent-lifecycle cleanup gaps.
+
+### Operator-visible
+
+- `agent-bridge` / `agb` CLI on macOS Bash 5.3.9 no longer hangs on `registry` / `list` / `show` (queue task #4773 / PR #940). Same class as the v0.13.7-v0.13.10 footgun #11 wave; bridge-agent.sh sites that used `bridge_agent_manage_python "$(...)" <<'PY'` now spool JSON to tempfiles and invoke standalone helpers in `lib/agent-cli-helpers/`. Lint-heredoc-ban ratchet expanded to cover `bridge-agent.sh` (ceiling=9).
+- `agent delete --orphan-tasks` now actually closes orphaned tasks (queue task #4797 / PR #943). Previously the agent registry entry was removed but `assigned_to=<deleted-agent>` task rows remained `blocked`, leading to ghost inboxes (operator saw 27-day-old crm-cli + 22-day admin-smoke entries). New cancel path sets `status=cancelled` + clears lease + emits `cancelled` task_event.
+- Watchdog no longer reports false "profile drift" alerts for orphan directories that were never registered (queue task #4796 / PR #941). Enumeration is registry-anchored by default; orphan dirs surface as a separate `orphan_directory` category.
+- Daemon no longer retries `auto-start backoff` for deleted agents (queue task #4795 / PR #942). `agent delete` + `agent retire` clear daemon-autostart state; daemon sync pass also sweeps stale entries every tick.
+- `BRIDGE_LAYOUT=legacy` warning no longer fires on every CLI invocation (queue task #4798 / PR #944). `bridge-upgrade.sh` self-cleans stale tmux server env vars on every non-dry-run upgrade; the warning is gated to once-per-process.
+- `bridge-init.sh` clean install on Linux no longer false-trips `markerless(existing-install)` on empty `state/cron/workers/` subdirs (PR #936). Layout-resolver evidence probe matches its documented intent ("have content") — switched from `compgen -G` to `find -type f`.
+- `scripts/smoke-test.sh` no longer leaks empty agent directories to live `$HOME/.agent-bridge/agents/` when `BRIDGE_HOME` is unset (queue task #4793 / PR #939). Smoke now auto-isolates to a `mktemp -d` parent, and cleanup defensively wipes (with fingerprint guard) any smoke-shaped dirs that escaped to the live install.
+- `bridge-upgrade.sh` status-print + analyze subcommand no longer hits Linux ARG_MAX (E2BIG) on big upgrade manifests (PRs #937 + #938). 14 sites total converted to file-as-argv pattern. macOS unaffected.
+- `bridge-cron.sh` `bridge_cron_write_completion_note` + `bridge_cron_write_followup_body` no longer wedge on Bash 5.3.9 (PR #928). Same footgun #11 class as the v0.13.7-9 hotfix wave (bridge-upgrade.sh covered there; cron module covered here).
+- Daily backup timeout now configurable via `BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS` env (default 300s, up from hardcoded 120s) (refs #745 / PR #935). Larger installs (operator's 1.4GB tarball) no longer always-fail at the 120s ceiling.
+- Daemon now wraps 6 previously-unprotected `$(...)` captures with `bridge_with_timeout` (PR #931, the Track B-1 fix from the 2026-05-16 daemon wedge incident). Each call site has a distinct label so `daemon_subprocess_timeout` audit rows distinguish them.
+- Inbox-nudge sweep no longer fires identical payloads multiple times into mid-tool-call agents (refs #767 / PR #932). Per-agent fingerprint dedup via `BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS` (default 60s) + clock-skew guard for NTP step-back resilience.
+- Worker agents that block mid-plan now auto-notify the requester (refs #697 / PR #933). `claimed → blocked` transition with a non-empty note emits a `[task-blocked]` notification task to the original requester (mirrors the existing `[task-complete]` pattern). Idempotent per transition.
+
 ### Removed
 
-- **Auto-backfill of the `<admin>-dev` codex pair** (reverts #517; closes #4769; refs queue task #4769). `lib/bridge-admin-pair.sh` and the `bridge_ensure_admin_codex_pair` helper, the `bridge-upgrade.py inject-admin-pair-block` subcommand, the SOP-block injection on every `migrate-agents` upgrade pass, and the `bridge-init.sh` / `bridge-upgrade.sh` admin-pair backfill sites are all removed. v0.14.0 silently registered a sibling `<admin>-dev` codex agent on every upgrade and (combined with the `:-admin` init fallback) shifted `BRIDGE_ADMIN_AGENT_ID` away from the operator's chosen value (typically `patch`) to literal `admin`, which defeated the model-diversity intent of the documented `patch (claude) + patch-dev (codex)` standard pair. The admin pair is now an explicit one-time setup: `agent-bridge setup admin <agent>` writes the identifier, and `agent-bridge agent create <admin>-dev --engine codex …` registers the sibling if the operator wants one.
-- **Silent admin-scalar writes from `agent reclassify` (operator-invoked AND upgrade-invoked)**. `bridge_agent_reclassify_static_admin` no longer upserts `BRIDGE_ADMIN_AGENT_ID` when reclassifying a dynamic-but-static-shaped agent. The previous behavior fired from both `agent reclassify --apply` and the automatic reclassify pass that `bridge-upgrade.sh` runs on every non-dry-run upgrade — the upgrade-invoked path was the exact silent-backfill regression #4769 removes. `BRIDGE_ADMIN_AGENT_ID` is now written by exactly one code path: `agent-bridge setup admin <agent>` (`bridge-setup.sh::run_admin`). Operators recovering an admin agent that is mis-recorded as `dynamic` run `agent-bridge agent reclassify --apply` THEN `agent-bridge setup admin <agent>` — see `docs/agent-runtime/admin-protocol.md` §"스태틱 admin 이 dynamic 으로 잘못 기록된 호스트 복구".
+- **Auto-backfill of the `<admin>-dev` codex pair** (reverts #517; queue task #4769 / PR #934). `lib/bridge-admin-pair.sh` and the `bridge_ensure_admin_codex_pair` helper, the `bridge-upgrade.py inject-admin-pair-block` subcommand, the SOP-block injection on every `migrate-agents` upgrade pass, and the `bridge-init.sh` / `bridge-upgrade.sh` admin-pair backfill sites are all removed. v0.14.0 silently registered a sibling `<admin>-dev` codex agent on every upgrade and (combined with the `:-admin` init fallback) shifted `BRIDGE_ADMIN_AGENT_ID` away from the operator's chosen value (typically `patch`) to literal `admin`, which defeated the model-diversity intent of the documented `patch (claude) + patch-dev (codex)` standard pair. The admin pair is now an explicit one-time setup: `agent-bridge setup admin <agent>` writes the identifier, and `agent-bridge agent create <admin>-dev --engine codex …` registers the sibling if the operator wants one.
+- **Silent admin-scalar writes from `agent reclassify` (operator-invoked AND upgrade-invoked)** (PR #934). `bridge_agent_reclassify_static_admin` no longer upserts `BRIDGE_ADMIN_AGENT_ID` when reclassifying a dynamic-but-static-shaped agent. The previous behavior fired from both `agent reclassify --apply` and the automatic reclassify pass that `bridge-upgrade.sh` runs on every non-dry-run upgrade. The identifier is now written by exactly one code path: `agent-bridge setup admin <agent>` (`bridge-setup.sh::run_admin`). Operators recovering an admin agent that is mis-recorded as `dynamic` run `agent-bridge agent reclassify --apply` THEN `agent-bridge setup admin <agent>`.
 
 ### Changed
 
-- `bridge-init.sh` admin-agent default fallback flipped from `:-admin` to `:-patch` so `BRIDGE_ADMIN_AGENT_ID`-unset fresh installs land on the documented standard identifier.
-- Post-upgrade advisory in `bridge-upgrade.sh` (`bridge_upgrade_emit_admin_pair_advisory`): hosts where `BRIDGE_ADMIN_AGENT_ID=admin` AND both `admin/` and `admin-dev/` agent homes exist see a non-destructive recipe pointing at `agent-bridge agent retire admin-dev` → `retire admin` → `setup admin patch` to restore the patch-only contract. No auto-retire.
+- `bridge-init.sh` admin-agent default fallback flipped from `:-admin` to `:-patch` so admin-id-unset fresh installs land on the documented standard identifier (PR #934).
+- Post-upgrade advisory in `bridge-upgrade.sh` for hosts with auto-created admin/admin-dev directories (PR #934): non-destructive recipe pointing at `agent-bridge agent retire admin-dev` → `retire admin` → `setup admin patch` to restore the patch-only contract. No auto-retire.
+- `bridge-cron.py` `subprocess.run` / `check_output` calls now have explicit `timeout=` kwargs (PR #930). Defensive fix against `/proc` over NFS or downstream-tool hangs.
+- BSD/GNU portability for `mktemp -t TEMPLATE` (PR #929): 17 sites converted to portable positional form `mktemp ${TMPDIR:-/tmp}/TEMPLATE.XXXXXX`. r1 had an extension-suffix bug (`name.XXXXXX.md` is literal on BSD); r2 fixed by moving extension before the X-block (`name.md.XXXXXX`). Production sites only; test fixture in `tests/isolation-v2-pr-c/` intentionally left untouched.
+
+### Stability hardening — footgun #11 / read_comsub deadlock class
+
+- `lib/bridge-cron.sh` `bridge_cron_write_completion_note` + `bridge_cron_write_followup_body` (PR #928). Two unmigrated sites in cron module. Pre-capture nested `$()` into locals before the `python3 - <<'PY'` heredoc invocation.
+- `bridge-upgrade.sh` ARG_MAX overflow: 6 sites in status-print + analyze subcommand + `bridge_upgrade_print_channel_guard_summary` function (PR #937 + r2 + r3). Discovered during OrbStack VM Scenario 2 (Oracle 9): `python3 - "$ANALYSIS_JSON"` etc. hit `Argument list too long` on large manifests. Switched to tempfile-as-argv pattern (mirrors `lib/upgrade-helpers/`).
+- `bridge-upgrade.sh` audit sweep: 8 additional ARG_MAX-risky sites at lines 1362/1373/1606/1653/1844/2350/2376/2408 (PR #938).
+- `bridge-agent.sh` registry/list/show: 3 critical sites with double-nested `$()` + heredoc-stdin (queue #4773 / PR #940). Extracted to standalone helpers in `lib/agent-cli-helpers/` (mirrors `lib/upgrade-helpers/`). `set +e` / `_rc=$?` / `set -e` / `rm -rf` cleanup at each call site (RETURN trap is bypassed by errexit on Bash 5.3.9 — empirically verified).
+- `bridge-agent.sh` delete path: 4 additional latent footgun #11 sites surfaced + fixed during queue #4797 work (PR #943). Mirrors PR #940 pattern with 4 new `lib/agent-cli-helpers/` files.
+- Daemon spawn-site timeout coverage (Track B-1 from 2026-05-16 daemon wedge, PR #931): 6 sites in `bridge-daemon.sh` at lines 1092/1154/1278/1367/2618/3558/5222 wrapped with `bridge_with_timeout`. Each label distinct so audit-row attribution is unambiguous. Root cause of the 2026-05-16 operator wedge: `wait_for → waitchld → __wait4` blocked indefinitely on disk-pressure heredoc child.
+
+### Fixes from 2026-05-16 noise-reduction wave (carried forward)
+
+- `picker-sweep` allow-list missed "I am using this for local development" + codex cwd-confirm pane (PR #923).
+- `classify_stale` exempts dynamic-source agents from uniform thresholds (PR #924) — idle is normal for operator-driven container agents.
+- `_ENV_DUMP_PATTERNS` tool-policy regex tightened to stop false-positive on natural-language `env`/`printenv` (5 rounds of codex iteration, PR #925). Catches GNU `--name=value` long-opts, separated-arg long-opts (`--unset NAME`), utility-less verbs (`env VAR=val`, `-u VAR`, `-0`, `--null`, FD redirects), while preserving legitimate `genv` invocations.
+- `bridge_export_env_prefix` no longer re-exports stale `BRIDGE_LAYOUT` / `BRIDGE_DATA_ROOT` from possibly-stale parent (PR #926). Every CLI command no longer warns about stale-marker conflict.
+- `bridge_worktree_doctor` reaps orphaned children when pruning worktree directories (PR #927). Per-token anchor catches interpreter-exec zombies (`python /worktree/script` shape).
+
+### Stabilization / completeness
+
+- Layout-resolver evidence probe fixed: empty `state/cron/` subdirectories no longer false-trip `markerless(existing-install)` classification (PR #936). Discovered during OrbStack VM Scenario 1 (Ubuntu noble) — blocked every clean Linux install path. macOS unaffected (already on v2 marker).
+- Watchdog enumeration: registry-anchored default instead of `agents/` directory listing (queue #4796 / PR #941). Orphan dirs reported in separate `orphan_directory` category (additive JSON keys; existing daemon consumers unaffected).
+- Daemon stale-always-on sweep: drops auto-start backoff state for agents removed from registry (queue #4795 / PR #942). `agent delete` + `agent retire` explicitly clean state. Daemon sync pass also sweeps every tick.
+- Tmux server stale layout-var cleanup: `bridge-upgrade.sh` calls `tmux setenv -u -g` on every non-dry-run upgrade (queue #4798 / PR #944). Warning gated by per-process sentinel `_BRIDGE_LAYOUT_STALE_ENV_WARNED`.
+- Smoke-test BRIDGE_HOME isolation: auto-isolate to `mktemp -d` when unset + cleanup defensive sweep with fingerprint guard (queue #4793 / PR #939). Stops smoke runs from leaking ~10 empty agent dirs into live install per run.
+- Backup timeout config var (refs #745 / PR #935): `BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS` env (default 300s) replaces hardcoded 120s. `BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS` default bumped 180s → 360s.
+
+### Features
+
+- `feat(queue)`: auto-notify requester on `claimed → blocked` transition (refs #697 / PR #933). Worker silent stalls now surface in dispatcher inbox. The only feature-additive entry in this release; rest are fixes/hardening.
+
+### Daemon resilience (continued from operator-visible section)
+
+- Fingerprint-based dedup for inbox-nudge sweep (refs #767 / PR #932). Companion busy-aware gate still pending as a follow-up.
 
 ### Tests
 
-- New regression smoke `scripts/smoke/admin-pair-no-auto-backfill.sh` (4 cases): patch-named admin install records `BRIDGE_ADMIN_AGENT_ID=patch`; admin-id unset install falls back to `patch`; fresh install with operator-named admin does NOT auto-register a sibling; grep-lint asserts `bridge_ensure_admin_codex_pair` and `bridge-admin-pair.sh` no longer appear in any tracked code path. Wired into `scripts/ci-select-smoke.sh` in place of the retired `admin-codex-pair` smoke (which validated the now-removed inject helper).
+- Multiple new regression smokes in `scripts/smoke/`:
+  - `admin-pair-no-auto-backfill.sh` (PR #934)
+  - `layout-evidence-empty-subdir.sh` (PR #936)
+  - `smoke-isolation-no-live-leak.sh` (PR #939)
+  - `bridge-agent-cli-no-deadlock.sh` (PR #940)
+  - `watchdog-registry-anchored.sh` (PR #941, 7 cases)
+  - `daemon-stale-always-on.sh` (PR #942)
+  - `agent-delete-task-gc.sh` (PR #943)
+  - `tmux-server-bridge-layout-cleanup.sh` (PR #944)
+  - `tmux-server-bridge-layout-cleanup-driver.sh` (PR #944, standalone driver to avoid footgun #11)
+  - Enhanced `daily-backup.sh` with `step_timeout_resolution` (PR #935, 5 stub cases + rc=124 detail wiring grep)
+
+### Lint
+
+- `scripts/lint-heredoc-ban.sh` ratchet expanded: `bridge-agent.sh` now covered with ceiling=9 (current count post-fix). `bridge-upgrade.sh` ceiling unchanged at 18. Prevents footgun #11 regression in the two highest-risk modules.
+
+### Migration
+
+- Operators with `BRIDGE_ADMIN_AGENT_ID=admin` (auto-set by v0.14.0): see post-upgrade advisory for retire recipe (PR #934).
+- Operators with `BRIDGE_LAYOUT=legacy` in tmux server env: `agent-bridge upgrade --apply` v0.14.2 auto-cleans (PR #944).
+- Operators with deleted-agent backoff log spam: `agent-bridge upgrade --apply` v0.14.2 starts the next daemon sweep tick which clears stale state (PR #942).
+- Operators with orphan agent dirs in `~/.agent-bridge/agents/`: PR #941 watchdog stops alerting on them; manual `rm -rf` still needed to fully clean.
 
 ## [0.14.1] — 2026-05-16
 
