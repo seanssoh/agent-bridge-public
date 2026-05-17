@@ -80,6 +80,26 @@ jobs:
       - name: Run OSS preflight
         run: bash ./scripts/oss-preflight.sh
 
+  lint-heredoc-ban:
+    name: lint-heredoc-ban
+    # Phase 1 baseline ratchet for footgun #11
+    # (Bash 5.3.9 read_comsub/heredoc_write deadlock).
+    # See docs/developer-handover.md §5.7 and
+    # scripts/lint-heredoc-ban.sh --baseline-check for the policy.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run scanner self-test
+        run: bash ./scripts/lint-heredoc-ban.sh --self-test
+
+      - name: Verify baseline ratchet (fails on new heredoc-stdin sites)
+        run: bash ./scripts/lint-heredoc-ban.sh --baseline-check
+
   unit-static-smoke:
     name: unit/static smoke
     runs-on: ubuntu-latest

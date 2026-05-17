@@ -52,11 +52,29 @@
 # progress.
 #
 # Usage:
-#   scripts/lint-heredoc-ban.sh              # check every target, exit 1 over ceiling
-#   scripts/lint-heredoc-ban.sh --list       # list all detected sites in every target
-#   scripts/lint-heredoc-ban.sh --self-test  # verify pattern against fixtures
-#   BRIDGE_UPGRADE_HEREDOC_CEILING=10 ...    # override bridge-upgrade.sh ceiling
-#   BRIDGE_AGENT_HEREDOC_CEILING=8 ...       # override bridge-agent.sh ceiling
+#   scripts/lint-heredoc-ban.sh                  # legacy per-file ceiling check (default)
+#   scripts/lint-heredoc-ban.sh --list           # list all detected sites in every target
+#   scripts/lint-heredoc-ban.sh --self-test      # verify pattern against fixtures
+#   BRIDGE_UPGRADE_HEREDOC_CEILING=10 ...        # override bridge-upgrade.sh ceiling
+#   BRIDGE_AGENT_HEREDOC_CEILING=8 ...           # override bridge-agent.sh ceiling
+#
+# Phase 1 baseline ratchet (footgun #11):
+#   scripts/lint-heredoc-ban.sh --baseline-check  # category-aware ratchet against
+#                                                   .lint-heredoc-baseline.tsv. Fails
+#                                                   on any C1/C2/C3/C4/H3 site whose
+#                                                   snippet hash is not in the
+#                                                   baseline, or on a site whose
+#                                                   category changed since the
+#                                                   baseline (e.g. a previously C3
+#                                                   site that got wrapped in $()).
+#   scripts/lint-heredoc-ban.sh --baseline-update # regenerate baseline TSV from
+#                                                   current tree (drops removed
+#                                                   sites, keeps reason/owner/phase
+#                                                   columns for matched hashes).
+#                                                   Hand-review the diff and fill
+#                                                   metadata for new rows before
+#                                                   committing — silent acceptance
+#                                                   is prohibited.
 
 set -euo pipefail
 
@@ -158,6 +176,97 @@ if [[ "${1:-}" == "--self-test" ]]; then
   run_self_test
   exit $?
 fi
+
+# ---------------------------------------------------------------------------
+# Phase 1 baseline ratchet (footgun #11). Category-aware, snippet-hash
+# anchored. Identity column is snippet_hash (normalized SHA-256), so the
+# baseline survives line-number drift and indentation reformatting.
+#
+# Baseline file: .lint-heredoc-baseline.tsv
+# Schema:
+#   path<TAB>line<TAB>category<TAB>snippet_hash<TAB>reason<TAB>owner<TAB>expires_or_phase
+#
+# The Python helpers are invoked file-as-argv (lib/lint-helpers/*.py) — never
+# via heredoc-stdin — so this lint can never trip the very bug it is
+# guarding against.
+# ---------------------------------------------------------------------------
+
+baseline_file_default="$repo_root/.lint-heredoc-baseline.tsv"
+audit_script="$repo_root/scripts/audit-footgun-11.sh"
+baseline_check_py="$repo_root/lib/lint-helpers/baseline-check.py"
+baseline_update_py="$repo_root/lib/lint-helpers/baseline-update.py"
+
+run_baseline_check() {
+  local baseline_file="${BRIDGE_LINT_BASELINE_FILE:-$baseline_file_default}"
+
+  if [[ ! -x "$audit_script" ]]; then
+    echo "[lint-heredoc-ban] FAIL: audit script missing or non-executable: $audit_script" >&2
+    return 2
+  fi
+  if [[ ! -f "$baseline_check_py" ]]; then
+    echo "[lint-heredoc-ban] FAIL: helper missing: $baseline_check_py" >&2
+    return 2
+  fi
+  if [[ ! -f "$baseline_file" ]]; then
+    echo "[lint-heredoc-ban] FAIL: baseline file missing: $baseline_file" >&2
+    echo "[lint-heredoc-ban] Run: scripts/lint-heredoc-ban.sh --baseline-update" >&2
+    return 2
+  fi
+
+  local current_tsv
+  current_tsv="$(mktemp)"
+  # shellcheck disable=SC2064  # path captured at trap-set time on purpose
+  trap "rm -f '$current_tsv'" RETURN
+
+  if ! "$audit_script" --tsv > "$current_tsv"; then
+    echo "[lint-heredoc-ban] FAIL: audit script returned non-zero" >&2
+    return 2
+  fi
+
+  python3 "$baseline_check_py" "$current_tsv" "$baseline_file"
+}
+
+run_baseline_update() {
+  local baseline_file="${BRIDGE_LINT_BASELINE_FILE:-$baseline_file_default}"
+
+  if [[ ! -x "$audit_script" ]]; then
+    echo "[lint-heredoc-ban] FAIL: audit script missing or non-executable: $audit_script" >&2
+    return 2
+  fi
+  if [[ ! -f "$baseline_update_py" ]]; then
+    echo "[lint-heredoc-ban] FAIL: helper missing: $baseline_update_py" >&2
+    return 2
+  fi
+
+  local current_tsv
+  current_tsv="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$current_tsv'" RETURN
+
+  if ! "$audit_script" --tsv > "$current_tsv"; then
+    echo "[lint-heredoc-ban] FAIL: audit script returned non-zero" >&2
+    return 2
+  fi
+
+  if ! python3 "$baseline_update_py" "$current_tsv" "$baseline_file"; then
+    echo "[lint-heredoc-ban] FAIL: baseline-update helper returned non-zero" >&2
+    return 2
+  fi
+
+  echo "[lint-heredoc-ban] baseline updated: $baseline_file"
+  echo "[lint-heredoc-ban] Review the diff and fill owner / expires_or_phase columns for new rows."
+}
+
+case "${1:-}" in
+  --baseline-check)
+    run_baseline_check
+    exit $?
+    ;;
+  --baseline-update)
+    run_baseline_update
+    exit $?
+    ;;
+esac
 
 mode="check"
 if [[ "${1:-}" == "--list" ]]; then
