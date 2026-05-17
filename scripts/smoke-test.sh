@@ -1329,6 +1329,17 @@ SPOOL_UT
 
 TMP_ROOT="$(cd "$(mktemp -d)" && pwd -P)"
 export BRIDGE_HOME="$TMP_ROOT/bridge-home"
+# #946 r2 — refresh BRIDGE_DATA_ROOT when BRIDGE_HOME is reassigned mid-script.
+# Without this re-export, the auto-isolation block's BRIDGE_DATA_ROOT (line 44)
+# still pointed at the obsolete `agb-smoke-isolated.../data` tree, so v2 paths
+# such as BRIDGE_AGENT_ROOT_V2 derived under bridge-lib.sh would escape
+# $TMP_ROOT and cleanup would miss the state files. Only refresh when the
+# auto-isolation path armed v2 in the first place — preserves the contract
+# that operator-supplied BRIDGE_HOME (CI runner / custom rig) keeps full
+# control of layout state.
+if [[ "${_SMOKE_AUTO_ISOLATED:-0}" == "1" ]]; then
+  export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
+fi
 export BRIDGE_ALLOW_EPHEMERAL_CONTROLLER_ENV=1
 # Issue #403 fix #4: pin the isolated-user home root under TMP_ROOT so any
 # inner test path that builds `<root>/<os_user>/.agent-bridge` cannot
