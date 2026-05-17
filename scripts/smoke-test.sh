@@ -25,6 +25,12 @@ if [[ -z "${BRIDGE_HOME:-}" ]]; then
   BRIDGE_HOME="$(mktemp -d "${TMPDIR:-/tmp}/agb-smoke-isolated.XXXXXX")/.agent-bridge"
   export BRIDGE_HOME
   _SMOKE_AUTO_ISOLATED=1
+  # r5 (codex PR #947 r4) — export so child bash -s blocks see it.
+  # Without export, the conditional refresh blocks at line ~1148 and ~1330
+  # in child shells see _SMOKE_AUTO_ISOLATED as empty and never re-derive
+  # BRIDGE_DATA_ROOT, so pending-attention state ends up under the initial
+  # auto-isolated home outside $scratch / $TMP_ROOT.
+  export _SMOKE_AUTO_ISOLATED
   printf '[smoke] BRIDGE_HOME auto-isolated to %s (was unset)\n' "$BRIDGE_HOME"
   # #946: when the smoke matrix runs against an auto-isolated fresh
   # temp BRIDGE_HOME, every child shell that sources bridge-lib.sh
