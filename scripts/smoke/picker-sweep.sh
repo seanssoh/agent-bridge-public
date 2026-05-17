@@ -504,4 +504,30 @@ run_sweep
 smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "15 no bare-Enter send"
 smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "15 no option send (stale accept must not fire bypass on unrelated menu)"
 
+# ---------------------------------------------------------------------------
+# Test 16 — r6 hardening (codex PR #949 r5): stale bypass WARNING+tail in
+# scrollback with NEWER output below (picker already answered, pane is
+# back to a normal prompt or unrelated content). r5's WARNING-anchored
+# extraction would replay the stale block; r6 bails when non-blank
+# content appears AFTER the tail.
+# ---------------------------------------------------------------------------
+
+smoke_log "16. stale WARNING+tail with output below → must NOT replay (r6)"
+reset_fixture
+printf '%s\n' "stale-warning-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-stale-warning-agent" <<'PANE'
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+
+  Enter to confirm · Esc to cancel
+assistant: continuing after accepted warning
+> ready for next input
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "16 no bare-Enter send"
+smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "16 no option send (stale WARNING block must not replay)"
+
 smoke_log "all checks passed"

@@ -285,11 +285,16 @@ while IFS= read -r agent; do
     # line that follows it. Stale text outside that window (free-prose,
     # previous picker rounds, unrelated warnings) is excluded.
     active_picker="$(printf '%s\n' "$cap" | awk -v tail_re="$_PICKER_TAIL_RE" '
-      /^[[:space:]]*WARNING:/ { start = NR; have_start = 1; have_end = 0 }
+      /^[[:space:]]*WARNING:/ { start = NR; have_start = 1; have_end = 0; bail = 0 }
       have_start && $0 ~ tail_re { end = NR; have_end = 1 }
+      # r6 (codex PR #949 r5) — if any non-blank line appears AFTER the
+      # tail, the picker has already been answered and the bottom of the
+      # pane is now showing later output. Bail; the warning+tail block in
+      # scrollback is stale and must not fire.
+      have_end && NR > end && /[^[:space:]]/ { bail = 1 }
       { lines[NR] = $0 }
       END {
-        if (have_start && have_end) {
+        if (have_start && have_end && !bail) {
           for (i = start; i <= end; i++) print lines[i]
         }
       }
