@@ -6,6 +6,42 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.3] — 2026-05-18
+
+### Highlight — daemon-hang root-cause wave (#946 5-layer fix) + dynamic launch UX fix + Phase 1 footgun #11 ratchet infrastructure
+
+Operator-cued patch release rolling up the 2026-05-17/05-18 daemon-hang diagnosis + fix wave (#946 5-layer root-cause cascade), one operator-reported dynamic-launch UX regression (#955 / queue task #4813), one footgun #11 follow-up (#953 / queue task #4807), and the first phase of the footgun #11 CI ratchet infrastructure (#954 / queue task #4812). 8 PRs total. The #946 cascade is operator-visible (daemon no longer wedges silently on macOS Bash 5.3.9); #955 fixes the silent admin-role hijack reported during VM validation; #954 adds dev/CI infrastructure with zero runtime behavior change.
+
+### Operator-visible
+
+- **Daemon no longer wedges silently** when `tick_subshell` operations stall (#946 / PRs #947 + #949 + #950 + #951 + #952). 5-layer root-cause fix from codex pair-review on the OrbStack VM hang reproducer:
+  - **L1** (PR #951): `bridge-core.sh` now validates `BRIDGE_SCRIPT_DIR` exists at startup and at every helper invocation. Previous behavior: stale `BRIDGE_SCRIPT_DIR` (e.g. after source-checkout move) silently broke every helper subprocess without any error path. New behavior: explicit `_or_die` with re-resolution from `BASH_SOURCE`.
+  - **L2 + L4** (PR #952): daemon tick subshell calls wrapped in `bridge_with_timeout` (5s ceiling); `idle_ready` writer failures now explicitly fall through to maintenance pass instead of nudge skip (prior behavior starved maintenance and left the daemon visible-running but functionally idle).
+  - **L3** (PR #950): silence-watchdog now captures full stderr from resolver die paths, classified as `resolver_die` with stderr preview, surfacing in `state/silence-watchdog.json` `detail.resolver_die` field. Operators can grep `detail.resolver_die` to identify the L1 vector.
+  - **Entry fix** (PR #947): `scripts/smoke-test.sh` correctly exports `BRIDGE_LAYOUT=v2` + `BRIDGE_DATA_ROOT` at auto-isolation site so the matrix runs past step 266 without false-failing on the v2 root.
+  - **Picker auto-unstick** (PR #949): `scripts/picker-sweep.sh` now explicitly handles Claude's "Bypass Permissions" and "Enable auto mode" interactive picker shapes (WARNING-header anchored + dual-header detection + dual-check for warning text + accept line). Operators no longer have to manually attach to a wedged static session to advance the picker.
+- **`agent-bridge --claude --name <new-dynamic-name> --no-attach` no longer silently hijacks to a same-engine static role** (#955 / queue task #4813). Previous behavior: when cwd's project_root hosted exactly one static role for the requested engine, `SPAWN_PREFERENCE=wake` defaulted in non-TTY mode and woke that static role instead of the operator's named dynamic worker. The explicit `--name` was dropped on the floor and a marker line printed: `[info] 새 dynamic worker 'X' 대신 정적 역할 'Y'를 깨웁니다`. New behavior: non-TTY default is `shared` (operator gets a new dynamic worker on the current checkout). `--prefer wake` / `--prefer new` still honored for operators who explicitly opt in. TTY interactive picker unchanged. Added regression smoke (`scripts/smoke/dynamic-launch-no-admin-fallback.sh`) with C1/C2/C3 + positive-control + temp-daemon-leak-prevention coverage.
+
+### Stability hardening — footgun #11 / read_comsub deadlock class (follow-up to v0.14.2's PR #940)
+
+- `bridge-daemon.sh` + `lib/bridge-cron.sh` extracted 20 latent footgun #11 sites to standalone helpers (#953 / queue task #4807). Same pattern as `lib/upgrade-helpers/` (v0.13.9) and `lib/agent-cli-helpers/` (v0.14.2 / PR #940): nested `$()` + heredoc-stdin sites now invoke `bash <helper-script> <argv...>` with the parent process spooling argv to tempfiles where needed, never via stdin-heredoc-to-subprocess pipeline. 7 daemon sites → `lib/daemon-helpers/` (6 fn-based + 1 inline). 13 cron sites → `lib/cron-helpers/`. `bridge-core.sh` source made idempotent so helpers can source it without double-init. CI lint-heredoc-ban ratchet now covers `bridge-daemon.sh` (ceiling=0) and `lib/bridge-cron.sh` (ceiling=0).
+
+### Dev / CI infrastructure — footgun #11 Phase 1 ratchet
+
+- **`scripts/audit-footgun-11.sh` + `.lint-heredoc-baseline.tsv` + `scripts/lint-heredoc-ban.sh --baseline-check`** (#954 / queue task #4812). Category-aware (C1/C2/C3/C4/H3) snippet-hash ratchet against an opt-in baseline TSV. Detects:
+  - cross-line capture state (paren-type stack tracking C captures vs G groups across multi-line `$( ... )` constructs, with case-arm strip + escape-swallow + `#`-comment-break paren-gating)
+  - per-(path, hash, category) occurrence counts (silent copy-paste of an already-baselined footgun in the same file fails the ratchet)
+  - deletion drift (current_count < baseline_count fails with `--baseline-update` guidance, preventing stale capacity from masking later regressions)
+  - whitespace tolerance for `<<  'PY'` (Bash-legal but easily-missed shape)
+- New CI step runs `scripts/smoke/lint-heredoc-scanner-self.sh` (Ubuntu, Bash 4+) which exercises the audit + baseline-check + a real-tree assertion that `STRIP_CASE_ARM_FIRES > 0` (proving the strip runs in production code, not just fixtures).
+- Initial baseline: C1=104, C2=54, C3=314, C4=0, H3=366, SAFE=593 (TOTAL=1441 sites). All existing sites accepted; future additions must justify entry into the baseline TSV via the metadata columns (owner + Phase tag).
+- Phase 2-6 PR pipeline scope is annotated per-row in the baseline so the next migration waves can scope by `Phase N PR X`.
+- Zero runtime behavior change. Bash 3.2 fixture parse caveat documented inline (CI runs on Ubuntu under Bash 4+).
+
+### Docs
+
+- `CLAUDE.md`: explicit operator-permission requirement for version releases. Standing autonomy on stabilization work does NOT include the release ship itself. Operator cues the release.
+
 ## [0.14.2] — 2026-05-17
 
 ### Highlight — stability + completeness pass (22 fixes from 2 sessions + OrbStack VM E2E discoveries)
