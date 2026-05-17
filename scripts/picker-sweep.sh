@@ -172,16 +172,26 @@ _PICKER_CODEX_CONFIRM_RE='^[[:space:]]*Press enter to continue[[:space:]]*$'
 # to accept. The warning is emitted whenever launch_cmd uses
 # `--dangerously-skip-permissions` (agent-bridge's static admin contract)
 # and the user/machine hasn't acked it yet.
-_PICKER_BYPASS_PERMISSIONS_RE='^[[:space:]]*(❯[[:space:]]*)?[12]\.[[:space:]]+(No, exit|Yes, I accept)[[:space:]]*$'
+#
+# r3 — key the matcher off the DISTINCTIVE "Yes, I accept" line, not the
+# generic "No, exit" / "1. No, exit". Codex PR #949 r2 review caught that
+# matching on the generic option could false-positive on any other Claude
+# warning whose menu also offered "No, exit", causing the sweeper to send
+# a safety-sensitive "2" against an unrelated prompt. Requiring the
+# accept-option line ensures we only fire on the actual Bypass warning.
+_PICKER_BYPASS_PERMISSIONS_ACCEPT_RE='^[[:space:]]*(❯[[:space:]]*)?2\.[[:space:]]+Yes, I accept[[:space:]]*$'
 
 # #948 — Auto mode warning. 3-option picker:
 #   1. Yes, and make it my default mode
 #   2. Yes, enable auto mode (just this once)
 #   3. No, exit
 # Default cursor is on option 1. Send "1" + Enter so subsequent claude
-# restarts don't re-prompt and crash-loop the agent. This is the variant
-# the operator preference suggested in #948 ("auto mode 사용할 수 있는지").
-_PICKER_AUTO_MODE_RE='^[[:space:]]*(❯[[:space:]]*)?[123]\.[[:space:]]+(Yes, and make it my default mode|Yes, enable auto mode|No, exit)[[:space:]]*$'
+# restarts don't re-prompt and crash-loop the agent.
+#
+# r3 — key the matcher off the DISTINCTIVE "Yes, and make it my default
+# mode" line, not the generic "No, exit". Same false-positive guard as the
+# bypass regex above.
+_PICKER_AUTO_MODE_ACCEPT_RE='^[[:space:]]*(❯[[:space:]]*)?1\.[[:space:]]+Yes, and make it my default mode[[:space:]]*$'
 
 # ---------------------------------------------------------------------------
 # Test seams. The smoke replaces these with fixture-driven wrappers.
@@ -258,17 +268,22 @@ while IFS= read -r agent; do
     cap="$(_psw_capture_pane "$agent" || true)"
     matched_pattern=""
     explicit_option=""   # #948 — when set, send "N + Enter" instead of bare Enter
-    if printf '%s\n' "$cap" | grep -qE "$_PICKER_BYPASS_PERMISSIONS_RE" \
+    if printf '%s\n' "$cap" | grep -qE "$_PICKER_BYPASS_PERMISSIONS_ACCEPT_RE" \
         && printf '%s\n' "$cap" | grep -qE "$_PICKER_TAIL_RE"; then
         # Bypass Permissions warning (#948). Default cursor is "No, exit",
-        # so we must EXPLICITLY send "2" to accept. Tail-required to avoid
-        # false-positive on free-prose contexts (docs / logs / PR bodies).
+        # so we must EXPLICITLY send "2" to accept. Both the distinctive
+        # accept line ("2. Yes, I accept") AND the canonical tail are
+        # required — r3 hardening (codex PR #949 r2) ensures we don't
+        # false-positive on any other Claude warning that happens to
+        # include "No, exit".
         matched_pattern="bypass-permissions warning"
         explicit_option="2"
-    elif printf '%s\n' "$cap" | grep -qE "$_PICKER_AUTO_MODE_RE" \
+    elif printf '%s\n' "$cap" | grep -qE "$_PICKER_AUTO_MODE_ACCEPT_RE" \
         && printf '%s\n' "$cap" | grep -qE "$_PICKER_TAIL_RE"; then
         # Auto mode warning (#948). Send "1" so the mode becomes the user
-        # default — next claude restart won't re-prompt.
+        # default — next claude restart won't re-prompt. Same r3 hardening
+        # as bypass — match the distinctive "Yes, and make it my default
+        # mode" line, not the generic "No, exit".
         matched_pattern="auto-mode warning"
         explicit_option="1"
     elif printf '%s\n' "$cap" | grep -qE "$_PICKER_OPTION_LINE_RE"; then

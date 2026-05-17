@@ -416,4 +416,28 @@ run_sweep
 smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "12 no bare-Enter send (free-prose)"
 smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "12 no option send (free-prose)"
 
+# ---------------------------------------------------------------------------
+# Test 13 — Generic exit-option menu (#948 r3 hardening from codex PR #949
+# r2 review). A different Claude warning whose menu also lists "No, exit"
+# must NOT trigger the bypass-permissions / auto-mode send paths — those
+# now key off the distinctive accept-option line, not the generic exit.
+# ---------------------------------------------------------------------------
+
+smoke_log "13. generic exit-option menu — must NOT trigger bypass/auto send (r3 hardening)"
+reset_fixture
+printf '%s\n' "generic-exit-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-generic-exit-agent" <<'PANE'
+  WARNING: An unrelated Claude warning that happens to share menu shape.
+
+  ❯ 1. No, exit
+    2. Do something completely unrelated to permissions
+    3. Try another path
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "13 no bare-Enter send"
+smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "13 no option send (generic exit ≠ bypass/auto accept)"
+
 smoke_log "all checks passed"
