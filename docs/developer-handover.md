@@ -286,6 +286,69 @@ PR1+PR2 분리에서 자주 헷갈리는 지점:
 - 부모는 frontmatter parser가 `None`을 돌려도 죽지 않고 legacy prose handling으로 fallback한다 — PR1 이전 cron이나 손으로 만든 task를 위함이다.
 - daemon은 `reporting_decision`이 `silent` 또는 `reported`면 자기 followup 경로를 **suppress**하고, `invalid` 또는 빈 값이면 기존 failure-followup 경로를 그대로 돌린다. 즉 schema-required-fail은 반드시 사람에게 surface된다.
 
+### 7. footgun #11 — heredoc-stdin in a capture wedges bash 5.3.9
+
+Bash 5.3.9 contains a `read_comsub` / `heredoc_write` deadlock chain: any
+heredoc-fed subprocess whose stdout is being captured by a parent (via
+`$()`, backticks, or a pipe feeding `$()`) can wedge for hours. The same
+syntactic shape caused outages in v0.13.7, v0.13.8, v0.13.9, PR #940,
+PR #943, and queue task #4807.
+
+The anti-pattern, in any of these surfaces, is dangerous:
+
+```bash
+# C1 — heredoc-fed interpreter inside a capture wrapper:
+out="$(python3 - "$arg" <<'PY'
+... body ...
+PY
+)"
+
+# C2 — cat <<EOF inside a capture wrapper:
+content="$(cat <<EOF
+... body ...
+EOF
+)"
+
+# C4 — bash -s heredoc, no capture but same deadlock class:
+bash -s -- "$arg" <<'EOF'
+... body ...
+EOF
+```
+
+The recommended replacement is **file-as-argv**: spool the body to a tempfile
+or extract it to a standalone helper script invoked with `sys.argv`.
+
+```bash
+# Helper extracted to lib/upgrade-helpers/foo.py — called with argv only:
+out="$(python3 "$REPO_ROOT/lib/upgrade-helpers/foo.py" "$arg")"
+
+# Or in-line: spool the body to a tempfile, then exec the interpreter:
+tmpscript="$(mktemp)"
+cat >"$tmpscript" <<'PY'
+... body ...
+PY
+out="$(python3 "$tmpscript" "$arg")"
+rm -f "$tmpscript"
+```
+
+Two artifacts guard against regression:
+
+- `scripts/audit-footgun-11.sh` enumerates every heredoc-stdin site in
+  tracked shell sources, categorizes it (C1/C2/C3/C4/H3/SAFE), and emits
+  TSV or JSON for grep-friendly review.
+- `scripts/lint-heredoc-ban.sh --baseline-check` ratchets against
+  `.lint-heredoc-baseline.tsv` and fails CI on any new site whose snippet
+  hash is not in the baseline. Adding an intentional exception requires
+  running `--baseline-update` and hand-filling the `reason / owner /
+  expires_or_phase` columns in the same PR — silent acceptance is
+  prohibited.
+
+The `lint-heredoc-ban` GitHub Actions job is required on `pull_request`.
+The existing per-file ceiling lint (`scripts/lint-heredoc-ban.sh` legacy
+mode, invoked from `scripts/oss-preflight.sh`) is preserved for
+back-compat and remains the floor for `bridge-upgrade.sh` and
+`bridge-agent.sh` specifically.
+
 ## 6. 개발할 때의 기본 작업 흐름
 
 ### 상태 파악

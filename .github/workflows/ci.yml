@@ -80,6 +80,36 @@ jobs:
       - name: Run OSS preflight
         run: bash ./scripts/oss-preflight.sh
 
+  lint-heredoc-ban:
+    name: lint-heredoc-ban
+    # Phase 1 baseline ratchet for footgun #11
+    # (Bash 5.3.9 read_comsub/heredoc_write deadlock).
+    # See docs/developer-handover.md §5.7 and
+    # scripts/lint-heredoc-ban.sh --baseline-check for the policy.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run scanner self-test (legacy per-file ceiling fixtures)
+        run: bash ./scripts/lint-heredoc-ban.sh --self-test
+
+      - name: Run scanner self-test (taxonomic — audit classifier)
+        # Exercises scripts/audit-footgun-11.sh against a checked-in
+        # fixture covering the full C1/C2/C3/C4/H3/SAFE matrix +
+        # snippet_hash reformatting invariance + JSON validity. Without
+        # this, a regression in the classifier would silently disappear
+        # rows from --baseline-check (which only flags NEW sites; vanished
+        # rows are not failures) and the ratchet would pass while the
+        # tooling rotted (r2 fix for codex PR #954 r1 finding P2 #2).
+        run: bash ./scripts/smoke/lint-heredoc-scanner-self.sh
+
+      - name: Verify baseline ratchet (fails on new heredoc-stdin sites)
+        run: bash ./scripts/lint-heredoc-ban.sh --baseline-check
+
   unit-static-smoke:
     name: unit/static smoke
     runs-on: ubuntu-latest
