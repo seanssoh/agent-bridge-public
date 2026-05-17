@@ -1150,6 +1150,14 @@ export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
 export BRIDGE_ACTIVE_AGENT_DIR="$BRIDGE_STATE_DIR/agents"
 export BRIDGE_LOG_DIR="$BRIDGE_HOME/logs"
 export BRIDGE_SHARED_DIR="$BRIDGE_HOME/shared"
+# #946 r3 — match BRIDGE_DATA_ROOT to the new scratch home so v2-derived
+# paths (BRIDGE_AGENT_ROOT_V2 etc.) inside any bridge-lib.sh source that
+# follows write under $scratch instead of the auto-isolated home from
+# line 44. Only refresh under the auto-isolation contract — operator-
+# supplied BRIDGE_HOME keeps full control of layout state.
+if [[ "${_SMOKE_AUTO_ISOLATED:-0}" == "1" ]]; then
+  export BRIDGE_DATA_ROOT="$BRIDGE_HOME/data"
+fi
 agent="spool-test"
 
 # Round-trip escape/unescape over the four escape classes.
