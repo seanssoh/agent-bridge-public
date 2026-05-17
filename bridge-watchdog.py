@@ -7,6 +7,8 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -34,20 +36,149 @@ def read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="ignore")
 
 
-def list_agent_dirs(root: Path, selected: list[str]) -> list[Path]:
+# Directory basenames under $BRIDGE_AGENT_HOME_ROOT that are bridge-managed
+# infrastructure rather than per-agent homes; the watchdog skips them.
+# Mirrors bridge-doctor.py:ORPHAN_SKIP_NAMES — keep the two lists in lockstep.
+WATCHDOG_SKIP_NAMES = frozenset({"_template", "shared"})
+
+
+def list_agent_dirs(
+    root: Path,
+    selected: list[str],
+    registry_ids: set[str] | None = None,
+) -> tuple[list[Path], list[str]]:
+    """Enumerate per-agent home directories to scan.
+
+    Returns (scan_paths, orphan_names).
+
+    When ``registry_ids`` is provided (registry-anchored mode, default), only
+    directories whose basename appears in the registry are scanned. Directories
+    on disk that are not in the registry are returned in ``orphan_names`` so
+    the caller can surface them under a separate ``orphan_directories`` alert
+    bucket — they no longer drive ``profile_drift`` warns (refs queue #4796).
+
+    When ``registry_ids`` is ``None``, every directory is scanned (legacy
+    behavior, used only when the caller passes ``--no-registry-anchored``).
+
+    When ``selected`` is non-empty, both filters defer to the explicit
+    selection so ``agent-bridge watchdog scan <agent>`` keeps working even
+    if the registry lookup failed.
+    """
     if not root.exists():
-        return []
-    paths = []
+        return [], []
+    paths: list[Path] = []
+    orphans: list[str] = []
     selected_set = set(selected)
     for path in sorted(root.iterdir()):
         if not path.is_dir():
             continue
-        if path.name.startswith(".") or path.name in {"_template", "shared"}:
+        if path.name.startswith(".") or path.name in WATCHDOG_SKIP_NAMES:
             continue
-        if selected and path.name not in selected_set:
+        if selected:
+            if path.name in selected_set:
+                paths.append(path)
+            continue
+        if registry_ids is not None and path.name not in registry_ids:
+            orphans.append(path.name)
             continue
         paths.append(path)
-    return paths
+    return paths, orphans
+
+
+def load_registry_agent_ids(
+    args: argparse.Namespace,
+    bridge_home: Path,
+) -> set[str] | None:
+    """Return the set of agent ids known to ``agent registry --json``.
+
+    Returns ``None`` when registry-anchoring is disabled or the lookup fails;
+    the caller falls back to the legacy listing-only mode in that case so the
+    watchdog never goes silent because of a broken registry endpoint.
+
+    Tests inject ``--agent-registry-json <file>`` to skip the subprocess; the
+    file shape mirrors ``bridge-doctor.py`` (JSON array of objects with an
+    ``id`` field) so the same fixtures work for both detectors.
+    """
+    if args.agent_registry_json:
+        path = Path(args.agent_registry_json).expanduser()
+        if not path.is_file():
+            print(
+                f"[bridge-watchdog] --agent-registry-json file not found: {path}",
+                file=sys.stderr,
+            )
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                f"[bridge-watchdog] --agent-registry-json unreadable ({exc}); "
+                "falling back to listing-only enumeration",
+                file=sys.stderr,
+            )
+            return None
+        return _registry_ids_from_payload(data)
+
+    binary = args.agent_bridge or os.environ.get("BRIDGE_AGENT_BRIDGE_BIN", "").strip()
+    if not binary:
+        sibling = Path(__file__).resolve().parent / "agent-bridge"
+        if sibling.is_file():
+            binary = str(sibling)
+        else:
+            located = shutil.which("agent-bridge")
+            if not located:
+                print(
+                    "[bridge-watchdog] agent-bridge binary not found; "
+                    "falling back to listing-only enumeration",
+                    file=sys.stderr,
+                )
+                return None
+            binary = located
+    env = os.environ.copy()
+    env["BRIDGE_HOME"] = str(bridge_home)
+    try:
+        proc = subprocess.run(
+            [binary, "agent", "registry", "--json"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as exc:
+        stderr = getattr(exc, "stderr", "") or ""
+        print(
+            f"[bridge-watchdog] agent registry --json failed ({type(exc).__name__}: "
+            f"{stderr.strip() or exc}); falling back to listing-only enumeration",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        print(
+            f"[bridge-watchdog] agent registry --json returned invalid JSON ({exc}); "
+            "falling back to listing-only enumeration",
+            file=sys.stderr,
+        )
+        return None
+    return _registry_ids_from_payload(data)
+
+
+def _registry_ids_from_payload(data: object) -> set[str] | None:
+    if not isinstance(data, list):
+        print(
+            "[bridge-watchdog] agent registry payload is not a JSON array; "
+            "falling back to listing-only enumeration",
+            file=sys.stderr,
+        )
+        return None
+    ids: set[str] = set()
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        agent_id = str(row.get("id") or "").strip()
+        if agent_id:
+            ids.add(agent_id)
+    return ids
 
 
 def collect_broken_links(agent_dir: Path) -> list[str]:
@@ -165,9 +296,14 @@ def scan_agent(agent_dir: Path) -> AgentWatch:
         )
 
 
-def render_markdown(records: list[AgentWatch], bridge_home: Path) -> str:
+def render_markdown(
+    records: list[AgentWatch],
+    bridge_home: Path,
+    orphan_directories: list[str] | None = None,
+) -> str:
     now_iso = datetime.now().astimezone().isoformat()
     problems = [item for item in records if item.status != "ok"]
+    orphan_directories = orphan_directories or []
     lines = [
         "# Watchdog Report",
         "",
@@ -175,8 +311,18 @@ def render_markdown(records: list[AgentWatch], bridge_home: Path) -> str:
         f"- bridge_home: {bridge_home}",
         f"- agents: {len(records)}",
         f"- problems: {len(problems)}",
+        f"- orphan_directories: {len(orphan_directories)}",
         "",
     ]
+    if orphan_directories:
+        # Refs queue #4796: orphan dirs (smoke leaks, manual mkdir) used to
+        # surface as profile_drift warns when the watchdog enumerated
+        # `agents/` directly. Surface them under a separate bucket so
+        # operators can triage with `agent-bridge doctor --detectors
+        # orphan-agent-dir` instead of treating them as live-agent drift.
+        lines.append("## orphan_directories")
+        lines.extend(f"- {name}" for name in orphan_directories)
+        lines.append("")
     if not records:
         lines.append("- no agents scanned")
         return "\n".join(lines) + "\n"
@@ -208,23 +354,60 @@ def main() -> int:
     parser.add_argument("--bridge-home", default=os.environ.get("BRIDGE_HOME", str(Path.home() / ".agent-bridge")))
     parser.add_argument("--agent-home-root", default=None)
     parser.add_argument("--json", action="store_true")
+    # Refs queue #4796: registry-anchored enumeration is the default. Orphan
+    # directories under $BRIDGE_AGENT_HOME_ROOT no longer drive profile_drift
+    # warns; they surface in the separate `orphan_directories` bucket. Pass
+    # --no-registry-anchored to restore the legacy listing-only behavior
+    # (every dir is scanned as if it were a registered agent).
+    parser.add_argument(
+        "--registry-anchored",
+        dest="registry_anchored",
+        action="store_true",
+        default=True,
+        help="enumerate agents from `agent registry --json` (default)",
+    )
+    parser.add_argument(
+        "--no-registry-anchored",
+        dest="registry_anchored",
+        action="store_false",
+        help="legacy listing-only enumeration (scan every dir under agents/)",
+    )
+    parser.add_argument(
+        "--agent-bridge",
+        default=None,
+        help="path to the agent-bridge binary used for the registry query",
+    )
+    parser.add_argument(
+        "--agent-registry-json",
+        default=None,
+        help="path to a JSON file with the registry payload (test injection)",
+    )
     args = parser.parse_args()
 
     bridge_home = Path(args.bridge_home).expanduser()
     agent_root = Path(args.agent_home_root).expanduser() if args.agent_home_root else bridge_home / "agents"
-    records = [scan_agent(path) for path in list_agent_dirs(agent_root, args.agents)]
+    registry_ids: set[str] | None = None
+    if args.registry_anchored and not args.agents:
+        # Explicit agent args bypass the registry filter so the operator can
+        # still scope-scan a single agent even when the registry endpoint is
+        # broken. When no args are given the registry filter applies.
+        registry_ids = load_registry_agent_ids(args, bridge_home)
+    scan_paths, orphan_directories = list_agent_dirs(agent_root, args.agents, registry_ids)
+    records = [scan_agent(path) for path in scan_paths]
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
         "bridge_home": str(bridge_home),
         "agent_home_root": str(agent_root),
         "agent_count": len(records),
         "problem_count": sum(1 for item in records if item.status != "ok"),
+        "orphan_directory_count": len(orphan_directories),
+        "orphan_directories": orphan_directories,
         "agents": [asdict(item) for item in records],
     }
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print(render_markdown(records, bridge_home), end="")
+        print(render_markdown(records, bridge_home, orphan_directories), end="")
     return 0
 
 
