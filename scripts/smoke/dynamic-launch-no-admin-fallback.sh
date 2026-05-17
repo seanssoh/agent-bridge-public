@@ -114,6 +114,18 @@ elif command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT_BIN="gtimeout"
 fi
 
+# r3 (codex PR #955 r2): when neither timeout nor gtimeout is available
+# (e.g. default macOS without coreutils), skip the smoke entirely instead
+# of running agent-bridge unbounded. The negative cases drive paths that
+# can hang after the dispatch decision, so an unbounded fallback would
+# stall scripts/smoke-test.sh forever. Skipping is strictly safer than
+# silent-pass — operators see the explicit message and install coreutils
+# (brew install coreutils) to enable the smoke.
+if [[ -z "$TIMEOUT_BIN" ]]; then
+  smoke_log "SKIP: neither \`timeout\` nor \`gtimeout\` available (install via \`brew install coreutils\` on macOS) — smoke requires a portable timeout to bound runaway agent-bridge invocations safely"
+  exit 0
+fi
+
 # ----------------------------------------------------------------------
 # Fixture project + static `patch` roster entry.
 # ----------------------------------------------------------------------
