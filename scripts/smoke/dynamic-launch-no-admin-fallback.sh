@@ -58,6 +58,22 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib.sh"
 
 cleanup() {
+  # r5 (codex PR #955 r4, P2): on Linux, each `run_spawn` reaches
+  # `bridge-daemon.sh ensure` whose start path launches the daemon under
+  # `setsid` (detached from the controlling terminal). The 15s `timeout`
+  # wrapper kills the `bridge-start` child but NOT the setsid-detached
+  # daemon — it survives the wrapper exit. Without an explicit stop here,
+  # cleanup would `rm -rf` the SMOKE_TMP_ROOT and orphan a bridge daemon
+  # against a vanished BRIDGE_HOME. STOP first, then delete; reversing
+  # the order leaks the daemon.
+  #
+  # Guard on both BRIDGE_HOME and REPO_ROOT in case cleanup fires before
+  # smoke_setup_bridge_home / `REPO_ROOT=...` ran (early-exit path); the
+  # script runs with `set -u`, so any unset reference here would itself
+  # crash cleanup.
+  if [[ -n "${BRIDGE_HOME:-}" && -d "${BRIDGE_HOME:-}" && -n "${REPO_ROOT:-}" ]]; then
+    bash "$REPO_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
+  fi
   smoke_cleanup_temp_root
 }
 trap cleanup EXIT
