@@ -3697,6 +3697,16 @@ path.write_text(text, encoding="utf-8")
 print(path)
 PY
 
+  # Issue #4795: drop the daemon's auto-start backoff state file for this
+  # agent so the daemon's next sync tick does not log a spurious
+  # `auto-start backoff <agent>` warning for a roster-removed agent. The
+  # daemon also sweeps orphan state defensively, but clearing it here
+  # closes the race window between `agent delete` returning and the next
+  # daemon tick. Best-effort: missing file or directory is silently ignored.
+  if [[ -n "${BRIDGE_STATE_DIR:-}" ]]; then
+    rm -f "$BRIDGE_STATE_DIR/daemon-autostart/$agent.env" 2>/dev/null || true
+  fi
+
   if [[ $purge_crons -eq 1 ]]; then
     # Best-effort: list native crons for this agent and delete each.
     # Failures are non-fatal — the roster block is already gone and
@@ -4067,6 +4077,14 @@ PY
       bridge_warn "agent retire: failed to remove dynamic active-env file for '$agent' (best-effort)"
     bridge_agent_clear_idle_marker "$agent" >/dev/null 2>&1 || true
     bridge_agent_clear_prompt_ready "$agent" >/dev/null 2>&1 || true
+  fi
+
+  # Issue #4795: clear daemon auto-start backoff state file so the daemon
+  # does not emit `auto-start backoff <agent>` after retire. Mirrors the
+  # cleanup in run_delete; covers the case where a retired static-class
+  # entry left a backoff state row behind.
+  if [[ -n "${BRIDGE_STATE_DIR:-}" ]]; then
+    rm -f "$BRIDGE_STATE_DIR/daemon-autostart/$agent.env" 2>/dev/null || true
   fi
 
   # Step 8: quarantine OR purge the home dir.

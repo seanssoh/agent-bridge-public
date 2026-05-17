@@ -2995,6 +2995,41 @@ bridge_daemon_clear_autostart_failure() {
   rm -f "$(bridge_daemon_autostart_state_file "$agent")"
 }
 
+# Issue #4795: sweep orphan auto-start backoff state files. When an agent
+# is removed from the roster (`agent delete` / `agent retire`) the daemon's
+# per-agent `daemon-autostart/<agent>.env` file is left behind. The
+# autostart loop in process_on_demand_agents skips orphans via
+# bridge_agent_exists, but the backoff state file accumulates and (more
+# importantly) re-loaded roster paths in the future may re-attempt start
+# against agents whose state survived. Drop the state file once we are
+# sure the agent is no longer in the registry. Idempotent — does nothing
+# when the directory or files are absent.
+bridge_daemon_sweep_orphan_autostart_state() {
+  local dir="$BRIDGE_STATE_DIR/daemon-autostart"
+  local changed=1
+  local file
+  local agent
+
+  [[ -d "$dir" ]] || return "$changed"
+
+  shopt -s nullglob
+  for file in "$dir"/*.env; do
+    agent="$(basename "$file" .env)"
+    [[ -n "$agent" ]] || continue
+    if bridge_agent_exists "$agent"; then
+      continue
+    fi
+    rm -f "$file" 2>/dev/null || continue
+    bridge_audit_log daemon autostart_state_orphan_swept "$agent" \
+      --detail file="$file" 2>/dev/null || true
+    daemon_info "auto-start state cleared for orphan agent ${agent} (removed from roster)"
+    changed=0
+  done
+  shopt -u nullglob
+
+  return "$changed"
+}
+
 bridge_dashboard_post_if_changed() {
   local summary_output="$1"
   local summary_file
@@ -5982,6 +6017,16 @@ cmd_sync_cycle() {
   fi
   BRIDGE_DAEMON_LAST_STEP="release_monitor"
   if process_release_monitor; then
+    changed=0
+  fi
+  # Issue #4795: prune backoff state for agents that no longer exist in
+  # the roster (e.g. after `agent delete --purge-home`). Must run AFTER
+  # bridge_load_roster (already done at the top of cmd_sync_cycle) so
+  # bridge_agent_exists reflects fresh disk state, and BEFORE
+  # process_on_demand_agents so a freshly-deleted agent does not record
+  # a new backoff row on the same tick.
+  BRIDGE_DAEMON_LAST_STEP="autostart_state_sweep"
+  if bridge_daemon_sweep_orphan_autostart_state; then
     changed=0
   fi
   BRIDGE_DAEMON_LAST_STEP="on_demand_agents"
