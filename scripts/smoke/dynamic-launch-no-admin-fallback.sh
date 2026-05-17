@@ -58,21 +58,52 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/lib.sh"
 
 cleanup() {
-  # r5 (codex PR #955 r4, P2): on Linux, each `run_spawn` reaches
-  # `bridge-daemon.sh ensure` whose start path launches the daemon under
-  # `setsid` (detached from the controlling terminal). The 15s `timeout`
-  # wrapper kills the `bridge-start` child but NOT the setsid-detached
-  # daemon — it survives the wrapper exit. Without an explicit stop here,
-  # cleanup would `rm -rf` the SMOKE_TMP_ROOT and orphan a bridge daemon
-  # against a vanished BRIDGE_HOME. STOP first, then delete; reversing
-  # the order leaks the daemon.
+  # r6 (codex PR #955 r5, P1 BLOCKING): r5 invoked
+  # `bridge-daemon.sh stop --force` here, but cmd_stop calls
+  # `bridge_daemon_all_pids` (lib/bridge-state.sh:3264-3292) which
+  # pgrep-sweeps every same-user `bridge-daemon.sh run$` process
+  # regardless of BRIDGE_HOME. The operator's live daemon (against
+  # `~/.agent-bridge`) and this smoke's temp daemon (against
+  # `SMOKE_TMP_ROOT/bridge-home`) BOTH match — calling `stop --force`
+  # from the smoke would kill the operator's live daemon. That is
+  # strictly worse than the r4 leak it was meant to fix (a stale temp
+  # daemon is harmless; killing the live daemon mid-session is not).
   #
-  # Guard on both BRIDGE_HOME and REPO_ROOT in case cleanup fires before
-  # smoke_setup_bridge_home / `REPO_ROOT=...` ran (early-exit path); the
-  # script runs with `set -u`, so any unset reference here would itself
-  # crash cleanup.
-  if [[ -n "${BRIDGE_HOME:-}" && -d "${BRIDGE_HOME:-}" && -n "${REPO_ROOT:-}" ]]; then
-    bash "$REPO_ROOT/bridge-daemon.sh" stop --force >/dev/null 2>&1 || true
+  # r6: bypass `bridge-daemon.sh stop` entirely. Kill ONLY the temp
+  # tree's pids by reading them directly from their pid files. The pid
+  # paths are derived from BRIDGE_STATE_DIR (smoke_setup_bridge_home
+  # pins that to the temp root), so this is guaranteed scoped to the
+  # temp tree — the operator's live daemon is provably untouched.
+  #
+  # Cover daemon.pid (which `cmd_stop` would have killed) and
+  # silence-watchdog.pid (which `cmd_stop` killed via
+  # `bridge_stop_silence_watchdog`). The Linux setsid-detached daemon
+  # survives the 15s `timeout` wrapper exit, so we must STOP both
+  # before smoke_cleanup_temp_root deletes BRIDGE_HOME.
+  #
+  # Guard on BRIDGE_STATE_DIR in case cleanup fires before
+  # smoke_setup_bridge_home ran (early-exit path); the script runs
+  # with `set -u`, so any unset reference here would itself crash
+  # cleanup.
+  if [[ -n "${BRIDGE_STATE_DIR:-}" && -d "${BRIDGE_STATE_DIR:-}" ]]; then
+    local _pid_file _pid _i
+    for _pid_file in \
+      "${BRIDGE_DAEMON_PID_FILE:-$BRIDGE_STATE_DIR/daemon.pid}" \
+      "$BRIDGE_STATE_DIR/silence-watchdog.pid"; do
+      [[ -f "$_pid_file" ]] || continue
+      _pid="$(cat "$_pid_file" 2>/dev/null || true)"
+      if [[ -n "$_pid" && "$_pid" =~ ^[0-9]+$ ]] && kill -0 "$_pid" 2>/dev/null; then
+        kill "$_pid" 2>/dev/null || true
+        # TERM-then-KILL with a 1s grace window (5 × 200ms polls). The
+        # daemon's signal handler should exit promptly; the KILL is the
+        # safety net for the silence-watchdog if it has wedged.
+        for _i in 1 2 3 4 5; do
+          kill -0 "$_pid" 2>/dev/null || break
+          sleep 0.2
+        done
+        kill -KILL "$_pid" 2>/dev/null || true
+      fi
+    done
   fi
   smoke_cleanup_temp_root
 }
