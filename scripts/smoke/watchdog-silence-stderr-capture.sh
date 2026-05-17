@@ -49,6 +49,14 @@ trap cleanup EXIT
 smoke_setup_bridge_home "$SMOKE_NAME"
 smoke_require_cmd python3
 
+# Strip operator-shell overrides that would steer the watchdog module's
+# import-time defaults outside this smoke's temp bridge home. The module
+# resolves COOLDOWN_FILE / PIDLOCK from these env vars at import; an
+# inherited override would mismatch our state-file assertions AND
+# (worse) write into the operator's live state. Defence-in-depth alongside
+# the module-resolved path checks below. Refs PR #950 codex review P2.
+unset BRIDGE_DAEMON_SILENCE_COOLDOWN_FILE BRIDGE_DAEMON_SILENCE_PIDLOCK
+
 WATCHDOG_SCRIPT="$REPO_ROOT/bridge-watchdog-silence.py"
 smoke_assert_file_exists "$WATCHDOG_SCRIPT" "watchdog source"
 
@@ -198,7 +206,13 @@ mod.attempt_restart({"age_seconds": 9999, "threshold_seconds": 600,
                      "last_tick_ts": "2026-05-17T00:00:00+00:00",
                      "daemon_pid": 1})
 
-state_path = Path(os.environ["BRIDGE_STATE_DIR"]) / "silence-watchdog.json"
+# Use the module's resolved COOLDOWN_FILE rather than re-deriving from
+# BRIDGE_STATE_DIR. The watchdog honors BRIDGE_DAEMON_SILENCE_COOLDOWN_FILE
+# at import time, so a shell that inherits that override would mismatch a
+# hard-coded path here and (worse) the write could land outside the
+# smoke's temp bridge home. Asserting on mod.COOLDOWN_FILE pins the
+# isolation invariant. Refs PR #950 codex review P2.
+state_path = Path(mod.COOLDOWN_FILE)
 if not state_path.exists():
     print(f"FAIL: state file not written at {state_path}")
     sys.exit(1)
