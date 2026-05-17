@@ -81,13 +81,20 @@ mock_send_enter() {
     printf '%s\n' "$target" >> "$SEND_LOG"
 }
 
+# #948 — mock for the explicit "send N + Enter" path. Records the agent and
+# option number so smoke assertions can verify the correct option was sent.
+mock_send_option() {
+    local target="$1" option_num="$2"
+    printf '%s:option=%s\n' "$target" "$option_num" >> "$SEND_OPTION_LOG"
+}
+
 mock_create_task() {
     local title="$1" body="$2" recipient="$3"
     printf 'recipient=%s\ntitle=%s\nbody=%s\n---\n' \
         "$recipient" "$title" "$body" >> "$TASK_LOG"
 }
 
-export -f mock_list_sessions mock_capture_pane mock_send_enter mock_create_task
+export -f mock_list_sessions mock_capture_pane mock_send_enter mock_send_option mock_create_task
 MOCK_EOF
 # shellcheck source=/dev/null
 source "$MOCK_LIB"
@@ -96,16 +103,19 @@ source "$MOCK_LIB"
 export BRIDGE_PICKER_SWEEP_LIST_SESSIONS_FN=mock_list_sessions
 export BRIDGE_PICKER_SWEEP_CAPTURE_PANE_FN=mock_capture_pane
 export BRIDGE_PICKER_SWEEP_SEND_ENTER_FN=mock_send_enter
+export BRIDGE_PICKER_SWEEP_SEND_OPTION_FN=mock_send_option
 export BRIDGE_PICKER_SWEEP_CREATE_TASK_FN=mock_create_task
 
 # Pin the log file so the smoke can inspect it.
 export BRIDGE_PICKER_SWEEP_LOG="$FIXTURE_DIR/picker-sweep.log"
-export FIXTURE_DIR SEND_LOG TASK_LOG
+SEND_OPTION_LOG="$FIXTURE_DIR/sent-options.log"
+export FIXTURE_DIR SEND_LOG SEND_OPTION_LOG TASK_LOG
 
 reset_fixture() {
-    rm -f "$FIXTURE_DIR/sessions" "$FIXTURE_DIR"/pane-* "$SEND_LOG" "$TASK_LOG" "$BRIDGE_PICKER_SWEEP_LOG"
+    rm -f "$FIXTURE_DIR/sessions" "$FIXTURE_DIR"/pane-* "$SEND_LOG" "$SEND_OPTION_LOG" "$TASK_LOG" "$BRIDGE_PICKER_SWEEP_LOG"
     : >"$FIXTURE_DIR/sessions"
     : >"$SEND_LOG"
+    : >"$SEND_OPTION_LOG"
     : >"$TASK_LOG"
 }
 
@@ -215,7 +225,7 @@ smoke_assert_contains "$(cat "$SEND_LOG")" "stuck-agent" "4 send target"
 smoke_assert_eq "1" "$(grep -c "^---$" "$TASK_LOG" || true)" "4 one task"
 smoke_assert_contains "$(cat "$TASK_LOG")" "recipient=admin" "4 task recipient"
 smoke_assert_contains "$(cat "$TASK_LOG")" "1 agent(s) auto-unstuck" "4 task title"
-smoke_assert_contains "$(cat "$TASK_LOG")" "stuck-agent:picker option line" "4 task body lists agent"
+smoke_assert_contains "$(cat "$TASK_LOG")" "stuck-agent:picker option line + tail (sent Enter)" "4 task body lists agent + action"
 
 # ---------------------------------------------------------------------------
 # Test 5 — Tail-only (no option line) must be REJECTED.
@@ -334,5 +344,241 @@ PANE
 
 run_sweep
 smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "9 no send (codex confirm in '>' quote)"
+
+# ---------------------------------------------------------------------------
+# Test 10 — Bypass Permissions warning (#948). Default cursor is on
+# "No, exit" so bare Enter would EXIT Claude. Must send option 2 explicitly.
+# ---------------------------------------------------------------------------
+
+smoke_log "10. bypass-permissions warning → send option 2"
+reset_fixture
+printf '%s\n' "bypass-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-bypass-agent" <<'PANE'
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  In Bypass Permissions mode, Claude Code will not ask for your approval
+  before running potentially dangerous commands.
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+
+  Enter to confirm · Esc to cancel
+PANE
+
+export BRIDGE_PICKER_SWEEP_NOTIFY="admin"
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "10 no bare-Enter send (would EXIT Claude)"
+smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "10 one option send"
+smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "bypass-agent:option=2" "10 send option=2 (Yes I accept)"
+smoke_assert_contains "$(cat "$TASK_LOG")" "bypass-agent:bypass-permissions warning (sent option 2)" "10 task body records explicit option send"
+
+# ---------------------------------------------------------------------------
+# Test 11 — Auto mode warning (#948). 3-option picker; send option 1 so the
+# mode becomes the user default and subsequent claude restarts skip the prompt.
+# ---------------------------------------------------------------------------
+
+smoke_log "11. auto-mode warning → send option 1"
+reset_fixture
+printf '%s\n' "auto-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-auto-agent" <<'PANE'
+  WARNING: Auto mode allows Claude to run commands automatically.
+
+  ❯ 1. Yes, and make it my default mode
+    2. Yes, enable auto mode
+    3. No, exit
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "11 no bare-Enter send"
+smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "11 one option send"
+smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "auto-agent:option=1" "11 send option=1 (make default)"
+smoke_assert_contains "$(cat "$TASK_LOG")" "auto-agent:auto-mode warning (sent option 1)" "11 task body records explicit option send"
+
+# ---------------------------------------------------------------------------
+# Test 12 — Bypass/auto patterns must NOT fire on free-prose mention.
+# Same false-positive defence as Test 3/9 but for the new regexes.
+# ---------------------------------------------------------------------------
+
+smoke_log "12. bypass/auto patterns — false-positive defence (free-prose)"
+reset_fixture
+printf '%s\n' "doc-agent3" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-doc-agent3" <<'PANE'
+> The picker reads:
+>   ❯ 1. No, exit
+>     2. Yes, I accept
+> When the operator selects "2. Yes, I accept" the warning is acked.
+> Auto mode picker similar: 1. Yes, and make it my default mode / 2. Yes, enable auto mode / 3. No, exit
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "12 no bare-Enter send (free-prose)"
+smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "12 no option send (free-prose)"
+
+# ---------------------------------------------------------------------------
+# Test 13 — Generic exit-option menu (#948 r3 hardening from codex PR #949
+# r2 review). A different Claude warning whose menu also lists "No, exit"
+# must NOT trigger the bypass-permissions / auto-mode send paths — those
+# now key off the distinctive accept-option line, not the generic exit.
+# ---------------------------------------------------------------------------
+
+smoke_log "13. generic exit-option menu — must NOT trigger bypass/auto send (r3 hardening)"
+reset_fixture
+printf '%s\n' "generic-exit-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-generic-exit-agent" <<'PANE'
+  WARNING: An unrelated Claude warning that happens to share menu shape.
+
+  ❯ 1. No, exit
+    2. Do something completely unrelated to permissions
+    3. Try another path
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "13 no bare-Enter send"
+smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "13 no option send (generic exit ≠ bypass/auto accept)"
+
+# ---------------------------------------------------------------------------
+# Test 14 — r4 hardening (codex PR #949 r3): capture contains a STALE
+# bypass-warning accept line above an ACTIVE auto-mode picker. The bypass
+# branch would otherwise win and send option 2 into the auto-mode menu
+# (= "Yes, enable auto mode just this once"), and the ack would not
+# persist across restarts. The fix scopes detection to the last picker
+# block (after the most recent tail), so only the active picker's accept
+# line matters.
+# ---------------------------------------------------------------------------
+
+smoke_log "14. stale bypass + active auto-mode in same capture → send auto's option 1 (r4)"
+reset_fixture
+printf '%s\n' "combo-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-combo-agent" <<'PANE'
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+
+  Enter to confirm · Esc to cancel
+  WARNING: Auto mode allows Claude to run commands automatically.
+
+  ❯ 1. Yes, and make it my default mode
+    2. Yes, enable auto mode
+    3. No, exit
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "14 no bare-Enter send"
+smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "14 one option send (active picker only)"
+smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "combo-agent:option=1" "14 send option=1 (auto-mode active, NOT stale bypass option 2)"
+
+# ---------------------------------------------------------------------------
+# Test 15 — r5 hardening (codex PR #949 r4): stale "2. Yes, I accept" in
+# free-text scrollback above an UNRELATED active picker (with the canonical
+# tail). The r4 active_picker extraction (last block ending with tail)
+# would still include the stale accept line and fire the bypass branch,
+# sending option 2 into the unrelated menu. The r5 fix anchors active_picker
+# extraction to lines between the MOST RECENT "WARNING:" header and the
+# MOST RECENT tail after it — stale text outside that window is excluded.
+# ---------------------------------------------------------------------------
+
+smoke_log "15. stale accept above unrelated active picker → must NOT trigger bypass send (r5)"
+reset_fixture
+printf '%s\n' "stale-accept-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-stale-accept-agent" <<'PANE'
+notes from a previous answer:
+  2. Yes, I accept
+
+  WARNING: An unrelated Claude warning that happens to share menu shape.
+
+  ❯ 1. No, exit
+    2. Do something completely unrelated to permissions
+    3. Try another path
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "15 no bare-Enter send"
+smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "15 no option send (stale accept must not fire bypass on unrelated menu)"
+
+# ---------------------------------------------------------------------------
+# Test 16 — r6 hardening (codex PR #949 r5): stale bypass WARNING+tail in
+# scrollback with NEWER output below (picker already answered, pane is
+# back to a normal prompt or unrelated content). r5's WARNING-anchored
+# extraction would replay the stale block; r6 bails when non-blank
+# content appears AFTER the tail.
+# ---------------------------------------------------------------------------
+
+smoke_log "16. stale WARNING+tail with output below → must NOT replay (r6)"
+reset_fixture
+printf '%s\n' "stale-warning-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-stale-warning-agent" <<'PANE'
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+
+  Enter to confirm · Esc to cancel
+assistant: continuing after accepted warning
+> ready for next input
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "16 no bare-Enter send"
+smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "16 no option send (stale WARNING block must not replay)"
+
+# ---------------------------------------------------------------------------
+# Test 17 — r7 hardening (codex PR #949 r6): hypothetical auto-mode prompt
+# without "WARNING:" header (e.g. claude CLI rendering it as
+# "Enable auto mode?!"). r6 anchored on "WARNING:" only and would have
+# missed this shape. r7 accepts "Enable auto mode" and "Bypass Permissions
+# mode" as alternate headers.
+# ---------------------------------------------------------------------------
+
+smoke_log "17. auto-mode prompt with 'Enable auto mode' title → send option 1 (r7)"
+reset_fixture
+printf '%s\n' "alt-title-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-alt-title-agent" <<'PANE'
+  Enable auto mode?!
+
+  ❯ 1. Yes, and make it my default mode
+    2. Yes, enable auto mode
+    3. No, exit
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "17 no bare-Enter send"
+smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "17 one option send"
+smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "alt-title-agent:option=1" "17 send option=1 (alternate title)"
+
+# ---------------------------------------------------------------------------
+# Test 18 — r8 hardening (codex PR #949 r7): an UNRELATED WARNING picker
+# that happens to include "2. Yes, I accept" as one of its options must
+# NOT fire the bypass branch. r7 captured the warning block but the
+# branch keyed on the generic accept line alone. r8 requires the
+# bypass-specific "Bypass Permissions mode" discriminator text.
+# ---------------------------------------------------------------------------
+
+smoke_log "18. unrelated WARNING with 'Yes, I accept' option → must NOT fire bypass (r8)"
+reset_fixture
+printf '%s\n' "unrelated-accept-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-unrelated-accept-agent" <<'PANE'
+  WARNING: Some other Claude policy notice requires acknowledgement.
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+    3. Defer the choice
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "18 no bare-Enter send"
+smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "18 no option send (unrelated WARNING ≠ bypass-permissions discriminator)"
 
 smoke_log "all checks passed"

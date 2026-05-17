@@ -143,13 +143,16 @@ fi
 #     shape from Claude's numbered picker (single confirmation line, no
 #     options). Has its own regex below (_PICKER_CODEX_CONFIRM_RE).
 #
-# NOT added (intentionally):
+# 2026-05-17 additions (#948 — fresh-install spawn crash-loop):
 #   - "Yes, I accept" / "No, exit" (Bypass Permissions warning) — Claude's
-#     default cursor is on "No, exit" (option 1). A bare Enter would EXIT
-#     Claude on first launch. Needs explicit "send 2 + Enter" support
-#     before adding. Operator must accept this warning interactively
-#     once per host; the result is persisted in Claude Code's local
-#     settings so subsequent launches skip the warning.
+#     default cursor is on "No, exit" (option 1). Bare Enter would EXIT
+#     Claude. Now handled via _PICKER_BYPASS_PERMISSIONS_RE +
+#     explicit "send 2 + Enter" through the new option-N send mechanism
+#     (BRIDGE_PICKER_SWEEP_SEND_OPTION_FN seam below).
+#   - Auto mode warning ("Yes, and make it my default mode" /
+#     "Yes, enable auto mode" / "No, exit") — same pattern. Sweeper sends
+#     option 1 (make-default) so subsequent claude restarts don't re-prompt
+#     and crash-loop the agent.
 # ---------------------------------------------------------------------------
 
 _PICKER_OPTION_LINE_RE='^[[:space:]]*(❯[[:space:]]*)?[0-9]+\.[[:space:]]+(Stop and wait for limit to reset|Switch to extra usage|Switch to Team plan|Resume from summary \(recommended\)|Resume full session as-is|I am using this for local development)[[:space:]]*$'
@@ -162,6 +165,33 @@ _PICKER_TAIL_RE='^[[:space:]]*Enter to confirm · Esc to cancel[[:space:]]*$'
 # was blocked at the cwd-confirm prompt during the v0.13.x → v0.14.1
 # upgrade supervise flow.
 _PICKER_CODEX_CONFIRM_RE='^[[:space:]]*Press enter to continue[[:space:]]*$'
+
+# #948 — Bypass Permissions warning. Claude CLI default cursor is on
+# "No, exit" (option 1), so bare Enter would EXIT Claude on first launch
+# in a fresh install / fresh user account. Must explicitly send "2" + Enter
+# to accept. The warning is emitted whenever launch_cmd uses
+# `--dangerously-skip-permissions` (agent-bridge's static admin contract)
+# and the user/machine hasn't acked it yet.
+#
+# r3 — key the matcher off the DISTINCTIVE "Yes, I accept" line, not the
+# generic "No, exit" / "1. No, exit". Codex PR #949 r2 review caught that
+# matching on the generic option could false-positive on any other Claude
+# warning whose menu also offered "No, exit", causing the sweeper to send
+# a safety-sensitive "2" against an unrelated prompt. Requiring the
+# accept-option line ensures we only fire on the actual Bypass warning.
+_PICKER_BYPASS_PERMISSIONS_ACCEPT_RE='^[[:space:]]*(❯[[:space:]]*)?2\.[[:space:]]+Yes, I accept[[:space:]]*$'
+
+# #948 — Auto mode warning. 3-option picker:
+#   1. Yes, and make it my default mode
+#   2. Yes, enable auto mode (just this once)
+#   3. No, exit
+# Default cursor is on option 1. Send "1" + Enter so subsequent claude
+# restarts don't re-prompt and crash-loop the agent.
+#
+# r3 — key the matcher off the DISTINCTIVE "Yes, and make it my default
+# mode" line, not the generic "No, exit". Same false-positive guard as the
+# bypass regex above.
+_PICKER_AUTO_MODE_ACCEPT_RE='^[[:space:]]*(❯[[:space:]]*)?1\.[[:space:]]+Yes, and make it my default mode[[:space:]]*$'
 
 # ---------------------------------------------------------------------------
 # Test seams. The smoke replaces these with fixture-driven wrappers.
@@ -187,6 +217,18 @@ _psw_default_send_enter() {
     tmux send-keys -t "$target" Enter 2>/dev/null
 }
 
+# #948 — send an explicit option number followed by Enter. Used for pickers
+# whose default cursor lands on a destructive option (e.g., Bypass Permissions
+# warning defaults to "No, exit"). The send is split into two calls so the
+# digit input is committed before Enter fires it — tmux send-keys collapses
+# adjacent string args, and a stray "2Enter" literal can confuse the TUI.
+# shellcheck disable=SC2329 # invoked indirectly via $_PSW_*_FN below
+_psw_default_send_option() {
+    local target="$1" option_num="$2"
+    tmux send-keys -t "$target" "$option_num" 2>/dev/null && \
+        tmux send-keys -t "$target" Enter 2>/dev/null
+}
+
 # shellcheck disable=SC2329 # invoked indirectly via $_PSW_*_FN below
 _psw_default_create_task() {
     local title="$1" body="$2" recipient="$3"
@@ -202,11 +244,13 @@ _psw_default_create_task() {
 _PSW_LIST_SESSIONS_FN="${BRIDGE_PICKER_SWEEP_LIST_SESSIONS_FN:-_psw_default_list_sessions}"
 _PSW_CAPTURE_PANE_FN="${BRIDGE_PICKER_SWEEP_CAPTURE_PANE_FN:-_psw_default_capture_pane}"
 _PSW_SEND_ENTER_FN="${BRIDGE_PICKER_SWEEP_SEND_ENTER_FN:-_psw_default_send_enter}"
+_PSW_SEND_OPTION_FN="${BRIDGE_PICKER_SWEEP_SEND_OPTION_FN:-_psw_default_send_option}"
 _PSW_CREATE_TASK_FN="${BRIDGE_PICKER_SWEEP_CREATE_TASK_FN:-_psw_default_create_task}"
 
 _psw_list_sessions() { "$_PSW_LIST_SESSIONS_FN"; }
 _psw_capture_pane()  { "$_PSW_CAPTURE_PANE_FN"  "$@"; }
 _psw_send_enter()    { "$_PSW_SEND_ENTER_FN"    "$@"; }
+_psw_send_option()   { "$_PSW_SEND_OPTION_FN"   "$@"; }
 _psw_create_task()   { "$_PSW_CREATE_TASK_FN"   "$@"; }
 
 # ---------------------------------------------------------------------------
@@ -223,7 +267,79 @@ while IFS= read -r agent; do
 
     cap="$(_psw_capture_pane "$agent" || true)"
     matched_pattern=""
-    if printf '%s\n' "$cap" | grep -qE "$_PICKER_OPTION_LINE_RE"; then
+    explicit_option=""   # #948 — when set, send "N + Enter" instead of bare Enter
+
+    # r4 (codex PR #949 r3) + r5 (codex PR #949 r4) — scope explicit-option
+    # detection to the ACTIVE picker block ONLY. capture-pane returns ~25
+    # lines of scrollback, so two false-positive shapes need defending:
+    #   r4 case — stale bypass accept line + active auto picker in same
+    #             capture: bypass regex would win and send option 2 into
+    #             the auto menu (= "just this once" instead of "make
+    #             default"), ack would not persist.
+    #   r5 case — stale "2. Yes, I accept" in free-text (above an unrelated
+    #             active picker that ends with the canonical tail): would
+    #             fire bypass branch and send option 2 into the unrelated
+    #             menu (safety-sensitive false-positive).
+    # active_picker now extracts only lines between the MOST RECENT
+    # WARNING header (the canonical menu opener) and the MOST RECENT tail
+    # line that follows it. Stale text outside that window (free-prose,
+    # previous picker rounds, unrelated warnings) is excluded.
+    active_picker="$(printf '%s\n' "$cap" | awk -v tail_re="$_PICKER_TAIL_RE" '
+      # r7 (codex PR #949 r6) — accept multiple header forms because Claude
+      # CLI may render the auto-mode confirmation with a title other than
+      # the literal "WARNING:" token (e.g. "Enable auto mode?!"). Headers
+      # we anchor on:
+      #   - "WARNING:" — canonical bypass + current auto (claude 2.1.143)
+      #   - "Enable auto mode" — hypothetical alternate auto title
+      #   - "Bypass Permissions mode" — hypothetical alternate bypass title
+      # Each header opens a new picker block. The previous r4-r6 contract is
+      # preserved: emit only when a tail line follows the header AND no
+      # non-blank content appears below the tail.
+      /^[[:space:]]*(WARNING:|Enable auto mode|Bypass Permissions mode)/ {
+        start = NR; have_start = 1; have_end = 0; bail = 0
+      }
+      have_start && $0 ~ tail_re { end = NR; have_end = 1 }
+      # r6 (codex PR #949 r5) — bail when the picker has been answered:
+      # any non-blank line after the tail means the bottom of the pane is
+      # now showing later output, not the prompt.
+      have_end && NR > end && /[^[:space:]]/ { bail = 1 }
+      { lines[NR] = $0 }
+      END {
+        if (have_start && have_end && !bail) {
+          for (i = start; i <= end; i++) print lines[i]
+        }
+      }
+    ')"
+
+    # r8 (codex PR #949 r7) — require the active picker to contain the
+    # bypass-specific or auto-mode-specific discriminator text in addition
+    # to the accept-option line. Without this, a different WARNING: picker
+    # that happens to include "2. Yes, I accept" in its options would fire
+    # the bypass branch and send a safety-sensitive 2 into an unrelated
+    # menu. Discriminators:
+    #   bypass: "Bypass Permissions mode"
+    #   auto:   "Auto mode" | "auto mode" | "Enable auto mode"
+    if [[ -n "$active_picker" ]] \
+        && printf '%s\n' "$active_picker" | grep -q "Bypass Permissions mode" \
+        && printf '%s\n' "$active_picker" | grep -qE "$_PICKER_BYPASS_PERMISSIONS_ACCEPT_RE"; then
+        # Bypass Permissions warning (#948). Default cursor is "No, exit",
+        # so we must EXPLICITLY send "2" to accept. r8 requires BOTH the
+        # canonical "Bypass Permissions mode" discriminator text AND the
+        # accept-option line. r3 hardening (codex PR #949 r2) ensures we
+        # don't false-positive on warnings that share "No, exit". r5/r6
+        # active_picker extraction excludes stale text.
+        matched_pattern="bypass-permissions warning"
+        explicit_option="2"
+    elif [[ -n "$active_picker" ]] \
+        && printf '%s\n' "$active_picker" | grep -qE "(Auto mode|auto mode|Enable auto mode)" \
+        && printf '%s\n' "$active_picker" | grep -qE "$_PICKER_AUTO_MODE_ACCEPT_RE"; then
+        # Auto mode warning (#948). Send "1" so the mode becomes the user
+        # default — next claude restart won't re-prompt. Same r3 hardening
+        # as bypass — match the distinctive "Yes, and make it my default
+        # mode" line, not the generic "No, exit".
+        matched_pattern="auto-mode warning"
+        explicit_option="1"
+    elif printf '%s\n' "$cap" | grep -qE "$_PICKER_OPTION_LINE_RE"; then
         if printf '%s\n' "$cap" | grep -qE "$_PICKER_TAIL_RE"; then
             matched_pattern="picker option line + tail"
         else
@@ -236,12 +352,24 @@ while IFS= read -r agent; do
     fi
 
     if [[ -n "$matched_pattern" ]]; then
-        _psw_log "PICKER detected on '$agent' ($matched_pattern) — sending Enter for default"
-        if ! _psw_send_enter "$agent"; then
-            _psw_log "  send-enter failed for $agent"
-            continue
+        if [[ -n "$explicit_option" ]]; then
+            _psw_log "PICKER detected on '$agent' ($matched_pattern) — sending option $explicit_option + Enter"
+            if ! _psw_send_option "$agent" "$explicit_option"; then
+                _psw_log "  send-option failed for $agent"
+                continue
+            fi
+            # #948 r2 — record the actual action so the admin task body below
+            # reports the safety-sensitive explicit option, not the default
+            # "Enter". Codex PR #949 review caught the misreport.
+            unstuck_agents+=("$agent:$matched_pattern (sent option $explicit_option)")
+        else
+            _psw_log "PICKER detected on '$agent' ($matched_pattern) — sending Enter for default"
+            if ! _psw_send_enter "$agent"; then
+                _psw_log "  send-enter failed for $agent"
+                continue
+            fi
+            unstuck_agents+=("$agent:$matched_pattern (sent Enter)")
         fi
-        unstuck_agents+=("$agent:$matched_pattern")
     fi
 done < <(_psw_list_sessions)
 
@@ -258,22 +386,35 @@ if [[ -z "$NOTIFY_AGENT" ]]; then
     exit 0
 fi
 
-task_body=$(cat <<EOF
-Claude Code interactive picker auto-unstick result:
+# #948 r2 — admin task body. Rewritten to use a plain multi-line string
+# assignment (no heredoc-inside-command-substitution) so the parse path
+# stays robust across the Bash 5.3.9 + macOS shell harness contexts where
+# `$(cat <<EOF ... EOF)` with longer bodies tripped a parser edge case
+# (unexpected EOF while looking for matching backtick-paren). Backslash-
+# escaped quotes keep the body readable while staying within standard
+# double-quoted string rules.
+task_body="Claude Code interactive picker auto-unstick result:
 
 $joined
 
-Each session was advanced via the default option (Enter). The default for
-rate-limit pickers is "Stop and wait for limit to reset" (safest); the default
-for resume-from-summary is "Resume from summary (recommended)".
+Each entry shows the agent, picker pattern, and the actual action taken
+(\"sent Enter\" for default-option pickers, \"sent option N\" for explicit
+picks). The explicit-option path is used for safety-sensitive prompts
+(e.g., Bypass Permissions warning, Auto mode warning - refs #948) where the
+default cursor would EXIT Claude rather than accept; sweeper sends the
+documented \"accept\" option (option 2 for Bypass Permissions, option 1 for
+Auto mode \"make default\").
+
+For default-Enter pickers: rate-limit pickers default to \"Stop and wait
+for limit to reset\" (safest); resume-from-summary defaults to
+\"Resume from summary (recommended)\".
 
 This cron is best-effort. If the same agent shows up across multiple sweeps,
-investigate manually — repeated picker hits usually indicate a deeper
-plan-level issue (rate limit window saturated, broken summary, etc).
+investigate manually - repeated picker hits usually indicate a deeper
+plan-level issue (rate limit window saturated, broken summary, etc.) or
+that the explicit-option ack did not persist across claude restarts.
 
-log: $LOG
-EOF
-)
+log: $LOG"
 
 if ! _psw_create_task \
         "[picker-sweep] ${#unstuck_agents[@]} agent(s) auto-unstuck from interactive picker" \
