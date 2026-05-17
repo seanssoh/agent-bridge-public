@@ -10922,6 +10922,16 @@ bash "$REPO_ROOT/scripts/smoke/classify-stale-dynamic-exemption.sh"
 log "running bridge-export-prefix-no-stale-layout smoke (patch #4725)"
 bash "$REPO_ROOT/scripts/smoke/bridge-export-prefix-no-stale-layout.sh"
 
+# Companion regression to patch #4725: PR #926 stopped the bridge-core
+# export prefix from forwarding stale BRIDGE_LAYOUT/BRIDGE_DATA_ROOT,
+# but did not clean values that already lived in the tmux server's
+# GLOBAL env from pre-PR-#926 installs. Patch #4798 adds a one-shot
+# `tmux setenv -u -g` cleanup to bridge-upgrade.sh and gates the
+# resolver warning to once-per-process so transitional installs are
+# not drowned in noise. Smoke pins both halves.
+log "running tmux-server-bridge-layout-cleanup smoke (patch #4798)"
+bash "$REPO_ROOT/scripts/smoke/tmux-server-bridge-layout-cleanup.sh"
+
 # `_ENV_DUMP_PATTERNS` in hooks/tool-policy.py used to false-positive on
 # natural-language `env` and `printenv` (e.g. task titles like
 # "stale env override" denied as if they were process-env dumps). Guard
