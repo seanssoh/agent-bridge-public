@@ -268,8 +268,24 @@ while IFS= read -r agent; do
     cap="$(_psw_capture_pane "$agent" || true)"
     matched_pattern=""
     explicit_option=""   # #948 — when set, send "N + Enter" instead of bare Enter
-    if printf '%s\n' "$cap" | grep -qE "$_PICKER_BYPASS_PERMISSIONS_ACCEPT_RE" \
-        && printf '%s\n' "$cap" | grep -qE "$_PICKER_TAIL_RE"; then
+
+    # r4 (codex PR #949 r3) — scope explicit-option detection to the ACTIVE
+    # picker only. capture-pane returns ~25 lines of scrollback, so a
+    # fresh-install sequence (bypass accepted -> auto mode picker now showing)
+    # can have BOTH "2. Yes, I accept" (stale) and "1. Yes, and make it my
+    # default mode" (active) in the same capture. The bypass regex would win
+    # first and send option 2 into the auto-mode menu instead of option 1,
+    # and the ack would not persist across restarts. active_picker extracts
+    # only the lines of the LAST picker block (ending with the most recent
+    # tail), which is the menu actively waiting for input.
+    active_picker="$(printf '%s\n' "$cap" | awk -v tail_re="$_PICKER_TAIL_RE" '
+      $0 ~ tail_re { last = buf $0; buf = ""; next }
+      { buf = buf $0 "\n" }
+      END { if (last != "") print last }
+    ')"
+
+    if [[ -n "$active_picker" ]] \
+        && printf '%s\n' "$active_picker" | grep -qE "$_PICKER_BYPASS_PERMISSIONS_ACCEPT_RE"; then
         # Bypass Permissions warning (#948). Default cursor is "No, exit",
         # so we must EXPLICITLY send "2" to accept. Both the distinctive
         # accept line ("2. Yes, I accept") AND the canonical tail are
@@ -278,8 +294,8 @@ while IFS= read -r agent; do
         # include "No, exit".
         matched_pattern="bypass-permissions warning"
         explicit_option="2"
-    elif printf '%s\n' "$cap" | grep -qE "$_PICKER_AUTO_MODE_ACCEPT_RE" \
-        && printf '%s\n' "$cap" | grep -qE "$_PICKER_TAIL_RE"; then
+    elif [[ -n "$active_picker" ]] \
+        && printf '%s\n' "$active_picker" | grep -qE "$_PICKER_AUTO_MODE_ACCEPT_RE"; then
         # Auto mode warning (#948). Send "1" so the mode becomes the user
         # default — next claude restart won't re-prompt. Same r3 hardening
         # as bypass — match the distinctive "Yes, and make it my default

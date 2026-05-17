@@ -440,4 +440,38 @@ run_sweep
 smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "13 no bare-Enter send"
 smoke_assert_eq "0" "$(count_lines "$SEND_OPTION_LOG")" "13 no option send (generic exit ≠ bypass/auto accept)"
 
+# ---------------------------------------------------------------------------
+# Test 14 — r4 hardening (codex PR #949 r3): capture contains a STALE
+# bypass-warning accept line above an ACTIVE auto-mode picker. The bypass
+# branch would otherwise win and send option 2 into the auto-mode menu
+# (= "Yes, enable auto mode just this once"), and the ack would not
+# persist across restarts. The fix scopes detection to the last picker
+# block (after the most recent tail), so only the active picker's accept
+# line matters.
+# ---------------------------------------------------------------------------
+
+smoke_log "14. stale bypass + active auto-mode in same capture → send auto's option 1 (r4)"
+reset_fixture
+printf '%s\n' "combo-agent" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-combo-agent" <<'PANE'
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  ❯ 1. No, exit
+    2. Yes, I accept
+
+  Enter to confirm · Esc to cancel
+  WARNING: Auto mode allows Claude to run commands automatically.
+
+  ❯ 1. Yes, and make it my default mode
+    2. Yes, enable auto mode
+    3. No, exit
+
+  Enter to confirm · Esc to cancel
+PANE
+
+run_sweep
+smoke_assert_eq "0" "$(count_lines "$SEND_LOG")" "14 no bare-Enter send"
+smoke_assert_eq "1" "$(count_lines "$SEND_OPTION_LOG")" "14 one option send (active picker only)"
+smoke_assert_contains "$(cat "$SEND_OPTION_LOG")" "combo-agent:option=1" "14 send option=1 (auto-mode active, NOT stale bypass option 2)"
+
 smoke_log "all checks passed"
