@@ -422,10 +422,93 @@ def emit_audit(action: str, detail: dict) -> None:
         log.error("audit write failed for %s: %s", action, exc)
 
 
+# Stderr preview cap (bytes) for the persisted state file. The full stderr
+# block goes to the watchdog log unconditionally; the JSON state field is
+# capped so a runaway resolver message can't bloat silence-watchdog.json.
+STDERR_PREVIEW_MAX = 500
+
+
+def _stderr_preview(output: str) -> str:
+    """Trim and single-line-escape a captured stderr block for audit/state.
+
+    Multi-line resolver die messages are valuable in the watchdog log, but
+    the audit `--detail key=value` channel and the JSON state file are
+    easier to grep / round-trip when each preview is a single line. We
+    replace newlines with the literal `\\n` two-char sequence and cap to
+    `STDERR_PREVIEW_MAX` bytes so the persisted size stays bounded.
+    """
+    return output.strip().replace("\n", "\\n")[:STDERR_PREVIEW_MAX]
+
+
+def _indent_block(text: str, prefix: str = "    ") -> str:
+    """Indent every line of `text` with `prefix` for readable log output."""
+    if not text:
+        return ""
+    return "\n".join(prefix + line for line in text.rstrip("\n").splitlines())
+
+
+def _classify_resolver_die(stderr_text: str) -> str:
+    """Map a `bridge-layout-resolver.sh` `bridge_die` stderr block to a
+    short identifier of which die path fired.
+
+    Issue #946 L3: every silence-watchdog `daemon stop` failure from
+    2026-05-15 onward surfaced the same truncated v0.8.0 ACL-removal
+    sentence (the last line of the multi-line die message), making
+    post-mortem triage impossible without re-running the wedged invocation.
+    The full stderr already carries a `current_layout=` discriminator;
+    this helper substring-matches that discriminator against the three
+    known die paths in `lib/bridge-layout-resolver.sh` so the audit row
+    records which path fired without a parse pass.
+
+    Path map (verified against `lib/bridge-layout-resolver.sh` 2026-05-17):
+      - `current_layout=legacy` / `current_layout=v1` -> marker says
+        marker-pinned-legacy (line 384).
+      - `current_layout=markerless(existing-install)` -> evidence-based
+        markerless existing install (line 406).
+      - `current_layout=markerless(...)` (anything else, typically
+        `fresh-install-candidate` or `invalid-marker(fallback)`) ->
+        evidence-based markerless fresh-candidate (line 439).
+      - `ACL-based isolation` present without any of the above -> some
+        other v0.8.0 hard-cut surface we have not catalogued yet; caller
+        should look at the full stderr block.
+      - none of the above -> `other` (not a resolver die — could be a
+        permission error, missing pid file, timeout, etc.).
+
+    Returns a short token suitable for use as an audit detail value.
+    """
+    if not stderr_text:
+        return "other"
+    # Match the `current_layout=` discriminator first — it's emitted by all
+    # three resolver die paths and is the only field that disambiguates.
+    if "current_layout=markerless(existing-install)" in stderr_text:
+        return "markerless-existing (line 406)"
+    if "current_layout=markerless(" in stderr_text:
+        # Catches `fresh-install-candidate`, `invalid-marker(fallback)`,
+        # `missing-marker(existing)`, and any future markerless source.
+        return "markerless-fresh-candidate (line 439)"
+    if "current_layout=legacy" in stderr_text or "current_layout=v1" in stderr_text:
+        return "marker-legacy (line 384)"
+    # No `current_layout=` line, but the ACL-removal sentence is present —
+    # this is a v0.8.0 hard-cut surface we don't recognize. Surface that
+    # ambiguity clearly so post-mortem readers know to read the full
+    # stderr block (preserved in the log) rather than trust the label.
+    if "ACL-based isolation" in stderr_text:
+        return "v0.8.0-isolation-hard-cut (line unknown — see full stderr)"
+    return "other"
+
+
 def run_daemon_command(*verb_args: str) -> tuple[int, str]:
     """Run `bash bridge-daemon.sh <verb_args>` with a hard timeout. Returns
-    (exit_code, last-line-of-output) so the audit row can record why a
-    restart attempt failed."""
+    (exit_code, full-combined-output) so callers can both log the entire
+    block (grep-able) and classify the failure mode.
+
+    Issue #946 L3: the previous implementation truncated the captured
+    output to `splitlines()[-1]`, which discarded the multi-line resolver
+    die message and left every wedge surfacing the same generic ACL line.
+    Full capture is cheap (the daemon stop/start output is bounded by the
+    `RESTART_TIMEOUT` window) and is the only way to identify which die
+    path fired in a post-mortem.
+    """
     bash = os.environ.get("BRIDGE_BASH_BIN", "bash")
     cmd = [bash, str(DAEMON_SCRIPT), *verb_args]
     label = " ".join(verb_args)
@@ -439,8 +522,7 @@ def run_daemon_command(*verb_args: str) -> tuple[int, str]:
     except OSError as exc:
         return 127, f"bridge-daemon.sh {label} spawn failed: {exc}"
     output = (result.stdout or "") + (result.stderr or "")
-    last = output.strip().splitlines()[-1] if output.strip() else ""
-    return result.returncode, last
+    return result.returncode, output
 
 
 def attempt_restart(reason_detail: dict) -> None:
@@ -451,36 +533,66 @@ def attempt_restart(reason_detail: dict) -> None:
     # --force: the silence watchdog only fires on a wedged/silent daemon.
     # Bypass the issue #314/#315 active-agent guard so a stuck daemon can
     # still be restarted on a host with running agents.
-    stop_code, stop_msg = run_daemon_command("stop", "--force")
+    stop_code, stop_output = run_daemon_command("stop", "--force")
     if stop_code != 0:
+        # Issue #946 L3: classify which resolver die path fired (when the
+        # failure was a v0.8.0 isolation hard-cut) and quote the full
+        # stderr block in the watchdog log so post-mortem readers can
+        # disambiguate `marker-legacy` / `markerless-existing` /
+        # `markerless-fresh-candidate` without re-running the wedge.
+        stop_resolver_die = _classify_resolver_die(stop_output)
+        stop_preview = _stderr_preview(stop_output)
         emit_audit(
             "daemon_silence_restart_attempted",
             {
                 "outcome": "stop_failed",
                 "stop_exit": stop_code,
-                "stop_msg": stop_msg[:200],
+                "stop_resolver_die": stop_resolver_die,
+                "stop_msg": stop_preview,
                 **reason_detail,
             },
         )
-        log.error("daemon stop failed (exit=%s): %s", stop_code, stop_msg)
+        log.error(
+            "daemon stop failed (exit=%s, resolver_die=%s):\n%s",
+            stop_code, stop_resolver_die, _indent_block(stop_output),
+        )
         # Cooldown is set even on failure so we don't loop on a permanently
-        # broken daemon.
-        write_cooldown(time.time(), {"outcome": "stop_failed", "stop_exit": stop_code})
+        # broken daemon. Persist the resolver_die classification and the
+        # stderr preview in the JSON state so an operator (or future
+        # diagnosis pass) can grep `silence-watchdog.json` and immediately
+        # learn which die path fired without re-running anything.
+        write_cooldown(time.time(), {
+            "outcome": "stop_failed",
+            "stop_exit": stop_code,
+            "resolver_die": stop_resolver_die,
+            "stderr_preview": stop_preview,
+        })
         return
 
-    start_code, start_msg = run_daemon_command("start")
+    start_code, start_output = run_daemon_command("start")
     if start_code != 0:
+        start_resolver_die = _classify_resolver_die(start_output)
+        start_preview = _stderr_preview(start_output)
         emit_audit(
             "daemon_silence_restart_attempted",
             {
                 "outcome": "start_failed",
                 "start_exit": start_code,
-                "start_msg": start_msg[:200],
+                "start_resolver_die": start_resolver_die,
+                "start_msg": start_preview,
                 **reason_detail,
             },
         )
-        log.error("daemon start failed (exit=%s): %s", start_code, start_msg)
-        write_cooldown(time.time(), {"outcome": "start_failed", "start_exit": start_code})
+        log.error(
+            "daemon start failed (exit=%s, resolver_die=%s):\n%s",
+            start_code, start_resolver_die, _indent_block(start_output),
+        )
+        write_cooldown(time.time(), {
+            "outcome": "start_failed",
+            "start_exit": start_code,
+            "resolver_die": start_resolver_die,
+            "stderr_preview": start_preview,
+        })
         return
 
     new_pid = daemon_recorded_pid() or 0
