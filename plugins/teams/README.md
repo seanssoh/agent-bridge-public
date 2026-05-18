@@ -33,7 +33,7 @@ For the full operator guide, including ALB / nginx / iptables paths and setup va
 
 ## Tools
 
-- `reply`: send a message back to a Teams conversation that has already passed access control.
+- `reply`: send a message back to a Teams conversation that has already passed access control. Accepts `chat_id` (required), `text` (optional if `attachments` is non-empty), and `attachments` (optional array; personal chats only — see §Outbound Attachments).
 - `fetch_messages`: read the local rolling message log captured by the plugin.
 
 ## Access
@@ -69,7 +69,16 @@ When a Teams user attaches a file or image, the plugin downloads each attachment
 <TEAMS_STATE_DIR>/attachments/<message_id>/<filename>
 ```
 
-(directory mode 0700, file mode 0600). The Claude channel notification meta gains an `attachments` array with `name`, `content_type`, `download_status` (`ok` / `skipped_non_file` / `failed`), and — on success — `local_path` and `size_bytes`. Cards and other non-file attachment kinds are recorded with `skipped_non_file` so the agent still sees the metadata.
+(directory mode 0700, file mode 0600). The Claude channel notification meta gains an `attachments` array with `name`, `content_type`, `download_status` (`ok` / `skipped_non_file` / `failed`), and — on success — `local_path` and `size_bytes`. Cards (`application/vnd.microsoft.card.*` and `application/vnd.microsoft.teams.card.*`) are recorded with `skipped_non_file` so the agent still sees the metadata.
+
+Downloaded content types:
+
+- `application/vnd.microsoft.teams.file.download.info` — Teams native file picker (downloadUrl from `content.downloadUrl`)
+- `image/*` — picture attachments
+- `application/*` (other than card types above) — PDFs, DOCX, ZIP, octet-stream, etc.
+- `audio/*`, `video/*`, `text/*` — media and plain text
+
+Cards stay skipped on purpose; the agent should not auto-fetch adaptive / hero / signin card payloads.
 
 Override the location and size cap via:
 
@@ -80,7 +89,42 @@ TEAMS_ATTACHMENT_MAX_BYTES=52428800       # default: 50 MB; clamped to 1 GB; non
 
 Filenames and message ids are sanitized (strict allowlist) before they're joined into the on-disk path; downloads stream to disk with an in-flight byte counter so a server lying about `Content-Length` cannot bypass the cap.
 
-Outbound attachments (sending files from the bot to Teams) are not yet implemented; track that work separately.
+## Outbound Attachments
+
+The `reply` MCP tool accepts an optional `attachments` array so the agent can send general files (PDF/DOCX/ZIP/images/etc.) back to a Teams user. Phase 1 supports **personal chats only** — group chats and channels return a structured error `attachments_not_supported_in_groupchat` (SharePoint-backed group delivery is Phase 2).
+
+```jsonc
+{
+  "chat_id": "...",
+  "text": "Here's the report you asked for",
+  "attachments": [
+    { "path": "/abs/path/to/report.pdf", "name": "report.pdf" }
+  ]
+}
+```
+
+Delivery uses the Teams file consent card flow:
+
+1. The plugin sends one `application/vnd.microsoft.teams.card.file.consent` activity per file, with the agent's text on the first card. The pending consent is persisted to `<TEAMS_STATE_DIR>/outbound-consents.json` (mode 0600) keyed by a server-generated token so a plugin restart between send and user-accept can still complete the upload.
+2. When the user clicks **Accept**, Teams posts a `fileConsent/invoke` activity to `/api/messages`. The plugin PUTs the file bytes to the upload URL and replies with a `fileInfo` card pointing at the uploaded blob. **Decline** drops the pending record and posts a short text reply.
+3. Pending consents older than 24 hours are swept on plugin start.
+
+Per-file validation:
+
+- `path` must be absolute and live under `TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT` (defaults to `<TEAMS_STATE_DIR>/outbound`). Paths outside the root are rejected so the agent cannot ship arbitrary host files.
+- Must be a regular file (no directories, symlinks, or special files).
+- Per-file size cap via `TEAMS_OUTBOUND_ATTACHMENT_MAX_BYTES` (default 50 MB; clamped to 1 GB).
+- Display name (defaults to `basename(path)`) runs through the same sanitizer as inbound — strict allowlist.
+- Content type is inferred from the filename extension. Card types (`application/vnd.microsoft.card.*` and `application/vnd.microsoft.teams.card.*`) are rejected; the agent cannot inject adaptive cards through the attach path.
+
+Per-message cap: 10 attachments.
+
+Override the allowlist root and size cap via:
+
+```dotenv
+TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT=<absolute path>   # default: <TEAMS_STATE_DIR>/outbound
+TEAMS_OUTBOUND_ATTACHMENT_MAX_BYTES=52428800            # default: 50 MB; clamped to 1 GB
+```
 
 ## Delivery Mode
 
