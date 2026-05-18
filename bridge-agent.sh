@@ -2792,7 +2792,7 @@ report and reap test-fixture agents per their pattern."
           if [[ -n "$_v2_apply_err" ]]; then
             printf '%s\n' "$_v2_apply_err" >&2
           fi
-          bridge_die "agent create: v2 shared-mode grant-matrix apply failed for '$agent' — first daemon pass would wedge on missing rows. Inspect output above, then 'agb agent delete $agent --force' to roll back."
+          bridge_die "agent create: v2 shared-mode grant-matrix apply failed for '$agent' — first daemon pass would wedge on missing rows. Inspect output above, then 'agb agent delete $agent --force --purge-home' to roll back (the scaffolded home directory must be removed too)."
         }
     fi
     # Issue #680: bridge-start.sh --dry-run is purely informational here — its
