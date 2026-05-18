@@ -128,9 +128,21 @@ TEAMS_OUTBOUND_ATTACHMENT_MAX_BYTES=52428800            # default: 50 MB; clampe
 
 ## Delivery Mode
 
-By default, inbound Teams messages are delivered to Claude Code with `notifications/claude/channel`, and the server waits for the MCP stdio write before acknowledging the Teams webhook. If the MCP write fails, the webhook returns an error so Teams can retry.
+Inbound Teams messages can be delivered to Claude Code through the MCP channel notification, the Agent Bridge queue, or both. Select with `TEAMS_DELIVERY_MODE`:
 
-Legacy `TEAMS_BRIDGE_MODE` / `TEAMS_BRIDGE_AGENT` settings are ignored. Teams inbound delivery must not create Agent Bridge queue tasks; it should enter the active Claude Code session as a channel message. Accepted messages are written to the local log only after Claude Code accepts the channel notification, so Teams webhook retries can still recover from delivery failures without duplicating already delivered messages.
+| Mode | Behavior | Trade-offs |
+| --- | --- | --- |
+| `channel` *(default)* | Send `notifications/claude/channel` only. Webhook waits for the MCP stdio write before acknowledging Teams. | Lowest latency, single write. Risk: if Claude Code's MCP notification handler does not wake the session (see issue #959), the message persists in `messages.jsonl` but the agent stays idle. |
+| `bridge` | Skip the channel notification; enqueue an Agent Bridge queue task via `bridge-task.sh create` with the full message body. The daemon then wakes the agent through the standard inbox path. | Higher latency (daemon tick) but the wake is the same code path inbox messages use, so it cannot be silently dropped by a stalled MCP handler. Queue tasks accumulate if the agent is offline. Requires `BRIDGE_AGENT_ID` and `BRIDGE_HOME` to be set in the plugin's environment. |
+| `both` | Fire the channel notification AND enqueue the queue task. | Belt-and-braces: covers the issue #959 silent-drop window without removing the low-latency channel path. Risk: the agent can see the same message twice (once via channel, once via queue) if both succeed. |
+
+Default is `channel`, so existing installs see no behavior change. An invalid value logs a warning and falls back to `channel`.
+
+In `bridge` and `both` modes, queue enqueue failures (missing `BRIDGE_AGENT_ID`, missing `bridge-task.sh`, queue subprocess non-zero exit) are logged to stderr but do not cause the Teams webhook to retry. In `channel` and `both` modes, a channel-notification failure still throws so Teams retries — even in `both` mode where bridge delivery may have succeeded, to keep the at-least-once channel contract.
+
+Legacy `TEAMS_BRIDGE_MODE` / `TEAMS_BRIDGE_AGENT` env vars remain ignored; use `TEAMS_DELIVERY_MODE=bridge` instead. Accepted messages are written to the local log only after the chosen delivery path completes, so Teams webhook retries can still recover from delivery failures without duplicating already delivered messages.
+
+End-to-end verification of bridge-mode delivery requires a real Teams + Azure setup; CI smoke covers boot only.
 
 ## Current Scope
 
