@@ -102,7 +102,7 @@ smoke_log "T2: apply_row group_setgid Darwin no-op"
 T2_OUT="$SMOKE_TMP_ROOT/t2.out"
 T2_PATH="$SMOKE_TMP_ROOT/t2-target-dir"
 run_isolation_call \
-  "mkdir -p \"$T2_PATH\"; bridge_isolation_v2_apply_row apply test-row \"$T2_PATH\" dir root ab-shared 2750 0640 1 group_setgid required; echo \"RC=\$?\"" \
+  "mkdir -p \"$T2_PATH\"; bridge_isolation_v2_apply_row apply test-row \"$T2_PATH\" dir root ab-shared 2750 0640 1 group_setgid required testagent; echo \"RC=\$?\"" \
   "$T2_OUT" || true
 
 if ! grep -q '^RC=0$' "$T2_OUT"; then
