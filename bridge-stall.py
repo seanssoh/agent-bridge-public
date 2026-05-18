@@ -113,10 +113,18 @@ IGNORED_LINES = {
     "The current task appears stalled. Check the current state, summarize what is blocking progress, and continue if work can proceed.",
 }
 
-# Claude Code UI glyphs used to mark agent-authored output lines (prompt
-# carets, tool-call markers, status pips, etc.). Any line beginning with
-# one of these is the agent narrating — never raw provider error output.
-AGENT_GLYPH_PREFIXES = ("❯", ">", "›", "⏺", "⎿", "✢", "✻", "✱", "ℹ", "✓", "✗")
+# Agent-authored output glyphs. Any line beginning with one of these is the
+# agent narrating — never raw provider error output.
+#   Claude Code: ❯ > › ⏺ ⎿ ✢ ✻ ✱ ℹ ✓ ✗  (prompt caret, tool-call markers,
+#       status pips).
+#   Codex CLI: • │ └  (tool/action bullet, continuation body, continuation
+#       tail). Without codex glyphs here, lines like `└ HTTP/1.1 401
+#       Unauthorized` produced by an intentional smoke test re-fire as
+#       false-positive auth stalls every daemon tick.
+AGENT_GLYPH_PREFIXES = (
+    "❯", ">", "›", "⏺", "⎿", "✢", "✻", "✱", "ℹ", "✓", "✗",
+    "•", "│", "└",
+)
 
 
 def looks_like_agent_output(stripped: str) -> bool:
@@ -191,25 +199,35 @@ def classify(normalized: str) -> tuple[str, str, str]:
     # the agent narrating a previous error (e.g. "⏺ inbox empty, no 429
     # reoccurrence"). Without this, agent replies referencing past errors
     # become a self-sustaining stall loop.
-    candidate_lines: list[str] = []
+    #
+    # Block-aware extension: codex renders tool/diff output as a glyph-prefixed
+    # head line followed by indented continuation lines that carry no glyph
+    # (wrapped diff bodies, multi-line tool stdout). Glyph-only filtering let
+    # those wrapped lines reach classify and match e.g. "401 Unauthorized"
+    # quoted from a smoke test. Once we enter an agent block on a glyph line,
+    # skip subsequent non-empty lines whose RAW text starts with whitespace;
+    # exit the block on a blank line or the next non-indented, non-glyph line
+    # (which is itself eligible for matching). Issue #329 Track D's
+    # walk-line-by-line semantics are preserved so matched_line_hash keeps its
+    # dedup behavior.
+    in_agent_block = False
     for raw in normalized.splitlines():
         stripped = raw.strip()
-        if not stripped or stripped.startswith(AGENT_GLYPH_PREFIXES):
+        if not stripped:
+            in_agent_block = False
             continue
-        candidate_lines.append(stripped)
-    if not candidate_lines:
-        return "", "", ""
-    # Issue #329 Track D: walk lines individually so the classifier can return
-    # the actual matched line. Previously classify() searched the joined
-    # haystack and only knew which (group, pattern) fired; the daemon dedup
-    # therefore had to fall back on excerpt_hash, which churned every loop
-    # whenever any other text moved through the pane.
-    for line in candidate_lines:
-        haystack = line.lower()
+        if stripped.startswith(AGENT_GLYPH_PREFIXES):
+            in_agent_block = True
+            continue
+        if in_agent_block:
+            if raw[:1].isspace():
+                continue
+            in_agent_block = False
+        haystack = stripped.lower()
         for classification, patterns in PATTERN_GROUPS:
             for pattern in patterns:
                 if re.search(pattern, haystack, flags=re.IGNORECASE):
-                    return classification, pattern, _normalize_matched_line(line)
+                    return classification, pattern, _normalize_matched_line(stripped)
     return "", "", ""
 
 
