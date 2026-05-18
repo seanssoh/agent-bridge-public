@@ -2760,6 +2760,23 @@ report and reap test-fixture agents per their pattern."
     bridge_sync_skill_docs "$agent" >/dev/null 2>&1 || true
     if [[ "$isolation_mode" == "linux-user" ]]; then
       bridge_linux_prepare_agent_isolation "$agent" "$os_user" "$workdir"
+    elif command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+        && bridge_isolation_v2_active 2>/dev/null \
+        && command -v bridge_isolation_v2_apply_grant_matrix_for_agent >/dev/null 2>&1; then
+      # #909: shared-mode agents on a v2-active install must also leave
+      # the matrix in a check-passing state. Without this, the first
+      # daemon write through write_agent_state_marker hits ensure_matrix_
+      # path → apply_row → chown, and on a tree the controller already
+      # owns this is a no-op success. The call is here so a fresh
+      # `agent create <X>` on a shared-only v2 install mirrors the
+      # bootstrap/upgrade-provisioned shape (patch / librarian survive
+      # only because their matrix paths were materialized earlier; a
+      # fresh agent has no such head start). `bridge_linux_prepare_
+      # agent_isolation` already covers linux-user above so this branch
+      # is the shared-mode counterpart.
+      if ! bridge_isolation_v2_apply_grant_matrix_for_agent "$agent" --apply >/dev/null 2>&1; then
+        bridge_warn "agent create: v2 shared-mode grant-matrix apply degraded for '$agent' (non-fatal)"
+      fi
     fi
     # Issue #680: bridge-start.sh --dry-run is purely informational here — its
     # output is reprinted to the user as `start_dry_run:` for diagnostic

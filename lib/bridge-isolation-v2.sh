@@ -1349,6 +1349,29 @@ bridge_isolation_v2_matrix_rows_for_agent() {
   local iso_home_root="${BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT:-/home}"
   local iso_home="${iso_home_root}/${iso_user}"
 
+  # #909: branch the per-agent matrix rows on the agent's isolation_mode.
+  # Same family as #895 (workdir resolver) — v2 layout can be active while
+  # individual agents run in shared mode (default for `agb --claude --name
+  # <X>` dynamic spawn and for installs that never opted any agent into
+  # linux-user isolation). Linux-user rows reference the per-agent UID
+  # `agent-bridge-<X>` and group `ab-agent-<X>`, neither of which exists
+  # on a shared-only install. Without this branch a freshly created
+  # shared agent fails ensure_matrix_path on every state-marker write
+  # (chown to nonexistent user/group), so write_agent_state_marker returns
+  # 1, the idle-since marker never lands, and the always-on daemon
+  # restart-loops the tmux session indefinitely.
+  local _v2_isolation_mode="linux-user"
+  if command -v bridge_agent_isolation_mode >/dev/null 2>&1; then
+    _v2_isolation_mode="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || printf 'linux-user')"
+  fi
+  # Anything outside the {shared, linux-user} pair (unknown / "") preserves
+  # the legacy linux-user matrix — defensive default for any roster entry
+  # that pre-dates the isolation_mode field.
+  case "$_v2_isolation_mode" in
+    shared) ;;
+    *) _v2_isolation_mode="linux-user" ;;
+  esac
+
   # ----- shared/ row family (catalog/source only — RC6 per-agent cache
   # lands in PR 2 as a separate row family) -----
   if [[ -n "$shared_root" ]]; then
@@ -1362,19 +1385,44 @@ bridge_isolation_v2_matrix_rows_for_agent() {
 
   # ----- per-agent root + writable subdirs + credentials -----
   if [[ -n "$agent_root" ]]; then
-    printf 'agent-root|%s|dir|root|%s|2750||1|group_setgid|required|root-owned 2750: isolated UID enters via group r-x, no group write\n' \
-      "$agent_root" "$agent_grp"
-    local sub
-    for sub in home workdir runtime logs requests responses; do
-      printf 'agent-%s|%s/%s|dir|%s|%s|2770|0660|1|group_setgid|required|writable subtree (RC4=runtime RC5=logs)\n' \
-        "$sub" "$agent_root" "$sub" "$iso_user" "$agent_grp"
-    done
-    printf 'agent-credentials-dir|%s/credentials|dir|controller|%s|2750|0640|1|group_setgid|required|controller writes launch-secrets.env, group reads\n' \
-      "$agent_root" "$agent_grp"
-    printf 'agent-launch-secrets|%s/credentials/launch-secrets.env|file|controller|%s||0640|0|group_setgid|required|launch secret env file (mode 0640 contract)\n' \
-      "$agent_root" "$agent_grp"
-    printf 'agent-env-sh|%s/runtime/agent-env.sh|file|controller|%s||0640|0|group_setgid|required|cached launch env\n' \
-      "$agent_root" "$agent_grp"
+    if [[ "$_v2_isolation_mode" == "shared" ]]; then
+      # #909 shared-mode row family: operator-owned, controller primary
+      # group. Mode 2750 for the root mirrors linux-user (root-owned
+      # 2750: only the controller can write at the root), but the
+      # writable subdirs widen to mode 2770 with `controller`+
+      # `controller_group` so the controller (which IS the agent process
+      # in shared mode) can write. No `ab-agent-<X>` group required, no
+      # `agent-bridge-<X>` user required. The credentials/runtime files
+      # keep mode 0640 (controller-only write, group-read) so a future
+      # mode migration to per-agent isolation does not regress secrets.
+      printf 'agent-root|%s|dir|controller|controller_group|2750||1|group_setgid|required|#909 shared-mode: controller-owned per-agent root\n' \
+        "$agent_root"
+      local sub
+      for sub in home workdir runtime logs requests responses; do
+        printf 'agent-%s|%s/%s|dir|controller|controller_group|2770|0660|1|group_setgid|required|#909 shared-mode writable subtree\n' \
+          "$sub" "$agent_root" "$sub"
+      done
+      printf 'agent-credentials-dir|%s/credentials|dir|controller|controller_group|2750|0640|1|group_setgid|required|#909 shared-mode credentials dir\n' \
+        "$agent_root"
+      printf 'agent-launch-secrets|%s/credentials/launch-secrets.env|file|controller|controller_group||0640|0|group_setgid|required|#909 shared-mode launch secret env file\n' \
+        "$agent_root"
+      printf 'agent-env-sh|%s/runtime/agent-env.sh|file|controller|controller_group||0640|0|group_setgid|required|#909 shared-mode cached launch env\n' \
+        "$agent_root"
+    else
+      printf 'agent-root|%s|dir|root|%s|2750||1|group_setgid|required|root-owned 2750: isolated UID enters via group r-x, no group write\n' \
+        "$agent_root" "$agent_grp"
+      local sub
+      for sub in home workdir runtime logs requests responses; do
+        printf 'agent-%s|%s/%s|dir|%s|%s|2770|0660|1|group_setgid|required|writable subtree (RC4=runtime RC5=logs)\n' \
+          "$sub" "$agent_root" "$sub" "$iso_user" "$agent_grp"
+      done
+      printf 'agent-credentials-dir|%s/credentials|dir|controller|%s|2750|0640|1|group_setgid|required|controller writes launch-secrets.env, group reads\n' \
+        "$agent_root" "$agent_grp"
+      printf 'agent-launch-secrets|%s/credentials/launch-secrets.env|file|controller|%s||0640|0|group_setgid|required|launch secret env file (mode 0640 contract)\n' \
+        "$agent_root" "$agent_grp"
+      printf 'agent-env-sh|%s/runtime/agent-env.sh|file|controller|%s||0640|0|group_setgid|required|cached launch env\n' \
+        "$agent_root" "$agent_grp"
+    fi
   fi
 
   # ----- RC1/RC2: $BRIDGE_HOME/state/{,agents/,agents/<X>} -----
@@ -1388,8 +1436,18 @@ bridge_isolation_v2_matrix_rows_for_agent() {
       "$state_root" "$shared_grp"
     printf 'state-agents-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|isolated UID needs --x to reach its own leaf\n' \
       "$state_agents_root" "$shared_grp"
-    printf 'state-agent-dir|%s|dir|controller|%s|2770|0660|1|group_setgid|required|RC1: per-agent state leaf, isolated UID + controller rwx\n' \
-      "$state_agent_dir" "$agent_grp"
+    if [[ "$_v2_isolation_mode" == "shared" ]]; then
+      # #909: state-agent-dir under shared mode is operator-owned; the
+      # `ab-agent-<X>` group does not exist. write_agent_state_marker
+      # calls ensure_matrix_path "state-agent-dir" before every idle-since
+      # write, so this row is the hottest fail surface on a shared-only
+      # install.
+      printf 'state-agent-dir|%s|dir|controller|controller_group|2770|0660|1|group_setgid|required|#909 shared-mode per-agent state leaf\n' \
+        "$state_agent_dir"
+    else
+      printf 'state-agent-dir|%s|dir|controller|%s|2770|0660|1|group_setgid|required|RC1: per-agent state leaf, isolated UID + controller rwx\n' \
+        "$state_agent_dir" "$agent_grp"
+    fi
     # RC2: file-level rows are not enforced for files that may be absent
     # at apply time (idle-since, manual-stop, missing-marker-retries,
     # webhook-port, next-session.sha). The matrix grants the parent +
@@ -1418,7 +1476,14 @@ bridge_isolation_v2_matrix_rows_for_agent() {
   fi
 
   # ----- isolated user's own private home (catalog symlink target etc.) -----
-  if [[ -n "$iso_home_root" ]]; then
+  # #909: skip the entire isolated-user-home + per-agent plugin row family
+  # for shared-mode agents. These rows reference `agent-bridge-<X>` (a
+  # Linux account that is never created for shared agents) — emitting them
+  # would re-introduce the chown-to-nonexistent-user failure this fix
+  # exists to close. Plugin install in shared mode lands under the
+  # controller's own ~/.claude (the legacy path) instead of the per-agent
+  # isolated home.
+  if [[ -n "$iso_home_root" ]] && [[ "$_v2_isolation_mode" != "shared" ]]; then
     printf 'isolated-user-home|%s|dir|%s|%s|0700||0|install_managed|required|isolated UIDs private home\n' \
       "$iso_home" "$iso_user" "$iso_user"
 
@@ -1538,6 +1603,72 @@ bridge_isolation_v2_controller_user() {
   printf '%s' "$controller_user"
 }
 
+bridge_isolation_v2_controller_primary_group() {
+  # Resolve the controller user's primary group name. Used by the shared-
+  # mode matrix branch (#909) — shared-mode per-agent rows are owned by the
+  # operator (controller) and grouped by the operator's primary group rather
+  # than the per-agent `ab-agent-<X>` group (which exists only for
+  # linux-user isolation). This keeps `chown`/`chgrp` against real local
+  # identifiers so apply_row does not fail with "user/group does not exist"
+  # on a shared-only install.
+  local controller_user=""
+  controller_user="$(bridge_isolation_v2_controller_user 2>/dev/null || true)"
+  [[ -n "$controller_user" ]] || return 1
+  local group=""
+  group="$(id -gn "$controller_user" 2>/dev/null || true)"
+  [[ -n "$group" ]] || return 1
+  printf '%s' "$group"
+}
+
+bridge_isolation_v2_identity_exists() {
+  # Probe whether a POSIX user or group name resolves on the local host.
+  # Used by apply_row's #909 belt-and-braces guard so a row referencing a
+  # non-existent identity (e.g., `agent-bridge-mgmt` on a shared-only
+  # install) is skipped rather than wedging the daemon.
+  # Args: name, kind ("user" | "group")
+  local name="$1"
+  local kind="$2"
+  [[ -n "$name" && -n "$kind" ]] || return 1
+  case "$kind" in
+    user)
+      # Propagate getent's rc on Linux (authoritative). Fall through to
+      # `id -u` on hosts without getent (macOS) — `id -u <missing>` is
+      # also authoritative (rc=1).
+      if command -v getent >/dev/null 2>&1; then
+        getent passwd "$name" >/dev/null 2>&1
+        return $?
+      fi
+      id -u "$name" >/dev/null 2>&1
+      return $?
+      ;;
+    group)
+      # Try getent first (Linux NSS). If getent is present, propagate its
+      # rc — a successful lookup is rc=0, NSS-absent is non-zero, and
+      # either result is authoritative.
+      if command -v getent >/dev/null 2>&1; then
+        getent group "$name" >/dev/null 2>&1
+        return $?
+      fi
+      # macOS fallback: dscl returns rc=56 for eDSRecordNotFound. When
+      # dscl is available, propagate its rc directly so the probe is
+      # authoritative on macOS too (early-`return 0`-only made the probe
+      # non-authoritative, defeating the purpose of the belt-and-braces
+      # guard on macOS smokes).
+      if command -v dscl >/dev/null 2>&1; then
+        dscl . -read "/Groups/$name" >/dev/null 2>&1
+        return $?
+      fi
+      # No probe primitive available — return success so the downstream
+      # chown proceeds and surfaces its own error path. This is the
+      # non-Linux, non-macOS fallback (rare in practice).
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 bridge_isolation_v2_apply_row() {
   # Internal dispatcher — applies (or checks) one matrix row.
   # Args:
@@ -1564,6 +1695,16 @@ bridge_isolation_v2_apply_row() {
     owner="$(bridge_isolation_v2_controller_user 2>/dev/null || true)"
     [[ -n "$owner" ]] || {
       bridge_warn "apply_row($row_name): cannot resolve controller user"
+      return 1
+    }
+  fi
+  # #909: same indirection for the group field so shared-mode rows can
+  # emit `controller_group` without baking the operator's primary group
+  # name into the static matrix.
+  if [[ "$group" == "controller_group" ]]; then
+    group="$(bridge_isolation_v2_controller_primary_group 2>/dev/null || true)"
+    [[ -n "$group" ]] || {
+      bridge_warn "apply_row($row_name): cannot resolve controller primary group"
       return 1
     }
   fi
@@ -1614,6 +1755,28 @@ bridge_isolation_v2_apply_row() {
       return 1
       ;;
   esac
+
+  # #909 belt-and-braces: if the resolved owner/group does not exist on
+  # this host, treat the apply branch as a non-fatal degraded skip. The
+  # primary fix is the shared-mode row branch in matrix_rows_for_agent,
+  # which emits operator-owned rows that ALWAYS resolve. This guard is
+  # the second line of defense: if any matrix row still slips through
+  # referencing a non-existent identity (e.g., a future row family or a
+  # mis-routed caller passing an `ab-agent-<X>` group on a shared-only
+  # install), the agent should NOT wedge into a daemon restart-loop the
+  # operator cannot mitigate from an agent session — same failure shape
+  # the original #909 report documents.
+  if [[ "$mode" == "apply" ]] \
+      && [[ "$mechanism" == "group_setgid" ]]; then
+    if ! bridge_isolation_v2_identity_exists "$owner" "user" 2>/dev/null; then
+      bridge_warn "apply_row($row_name): owner '$owner' does not exist on host — skipping apply (#909 non-fatal in non-isolated mode)"
+      return 0
+    fi
+    if ! bridge_isolation_v2_identity_exists "$group" "group" 2>/dev/null; then
+      bridge_warn "apply_row($row_name): group '$group' does not exist on host — skipping apply (#909 non-fatal in non-isolated mode)"
+      return 0
+    fi
+  fi
 
   # group_setgid path — the common case.
   case "$access_type" in
