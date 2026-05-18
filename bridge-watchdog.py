@@ -16,7 +16,10 @@ from pathlib import Path
 
 MANAGED_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
-REQUIRED_FILES = ("CLAUDE.md", "SOUL.md", "MEMORY-SCHEMA.md", "MEMORY.md", "SESSION-TYPE.md")
+# Claude-runtime profile files. Codex agents don't read these — see #905.
+CLAUDE_REQUIRED_FILES = ("CLAUDE.md", "SOUL.md", "MEMORY-SCHEMA.md", "MEMORY.md", "SESSION-TYPE.md")
+# Backward-compat alias: legacy callers / tests reference REQUIRED_FILES.
+REQUIRED_FILES = CLAUDE_REQUIRED_FILES
 
 
 @dataclass
@@ -30,6 +33,14 @@ class AgentWatch:
     missing_managed_claude_block: bool
     heartbeat_present: bool
     heartbeat_age_seconds: int | None
+    # Provenance from the registry payload. `engine` defaults to "claude"
+    # when the registry lookup is unavailable so legacy listing-only mode
+    # continues to assert the Claude-profile set (no regression for
+    # pre-#905 installs). `agent_source` defaults to "" (unknown) so the
+    # #907 fresh-provision suppression only activates when the registry
+    # explicitly tags the agent as dynamic.
+    engine: str = "claude"
+    agent_source: str = ""
 
 
 def read_text(path: Path) -> str:
@@ -40,6 +51,16 @@ def read_text(path: Path) -> str:
 # infrastructure rather than per-agent homes; the watchdog skips them.
 # Mirrors bridge-doctor.py:ORPHAN_SKIP_NAMES — keep the two lists in lockstep.
 WATCHDOG_SKIP_NAMES = frozenset({"_template", "shared"})
+
+
+# Registry-provenance map shared between the loader and the scan loop.
+# Keys are agent ids (basename of `agents/<name>`); values are dicts with
+# the subset of registry fields the watchdog needs:
+#   - "engine":       "claude" | "codex" | ""
+#   - "agent_source": "static" | "dynamic" | ""
+# A dedicated type alias keeps the signatures readable without dragging
+# the whole registry schema into the watchdog.
+RegistryMeta = dict[str, dict[str, str]]
 
 
 def list_agent_dirs(
@@ -88,16 +109,26 @@ def list_agent_dirs(
 def load_registry_agent_ids(
     args: argparse.Namespace,
     bridge_home: Path,
-) -> set[str] | None:
-    """Return the set of agent ids known to ``agent registry --json``.
+) -> tuple[set[str] | None, RegistryMeta]:
+    """Return ``(ids, meta)`` from ``agent registry --json``.
 
-    Returns ``None`` when registry-anchoring is disabled or the lookup fails;
-    the caller falls back to the legacy listing-only mode in that case so the
-    watchdog never goes silent because of a broken registry endpoint.
+    ``ids`` is the set of registered agent ids used to anchor the directory
+    enumeration. ``meta`` is a per-id provenance map (``engine`` +
+    ``agent_source``) consumed by the scan loop to apply the engine-aware
+    profile check (#905) and the dynamic-agent fresh-state suppression (#907).
+
+    Returns ``(None, {})`` when registry-anchoring is disabled or the lookup
+    fails; the caller falls back to the legacy listing-only mode in that case
+    so the watchdog never goes silent because of a broken registry endpoint.
+    The empty meta map then makes every agent default to ``engine=claude``
+    (preserving pre-#905 behavior) and ``agent_source=""`` (so #907's
+    dynamic-only suppression is never accidentally triggered for unknown
+    provenance).
 
     Tests inject ``--agent-registry-json <file>`` to skip the subprocess; the
     file shape mirrors ``bridge-doctor.py`` (JSON array of objects with an
-    ``id`` field) so the same fixtures work for both detectors.
+    ``id`` field, optionally ``engine`` + ``agent_source``) so the same
+    fixtures work for both detectors.
     """
     if args.agent_registry_json:
         path = Path(args.agent_registry_json).expanduser()
@@ -106,7 +137,7 @@ def load_registry_agent_ids(
                 f"[bridge-watchdog] --agent-registry-json file not found: {path}",
                 file=sys.stderr,
             )
-            return None
+            return None, {}
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -115,7 +146,7 @@ def load_registry_agent_ids(
                 "falling back to listing-only enumeration",
                 file=sys.stderr,
             )
-            return None
+            return None, {}
         return _registry_ids_from_payload(data)
 
     binary = args.agent_bridge or os.environ.get("BRIDGE_AGENT_BRIDGE_BIN", "").strip()
@@ -131,7 +162,7 @@ def load_registry_agent_ids(
                     "falling back to listing-only enumeration",
                     file=sys.stderr,
                 )
-                return None
+                return None, {}
             binary = located
     env = os.environ.copy()
     env["BRIDGE_HOME"] = str(bridge_home)
@@ -150,7 +181,7 @@ def load_registry_agent_ids(
             f"{stderr.strip() or exc}); falling back to listing-only enumeration",
             file=sys.stderr,
         )
-        return None
+        return None, {}
     try:
         data = json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
@@ -159,26 +190,39 @@ def load_registry_agent_ids(
             "falling back to listing-only enumeration",
             file=sys.stderr,
         )
-        return None
+        return None, {}
     return _registry_ids_from_payload(data)
 
 
-def _registry_ids_from_payload(data: object) -> set[str] | None:
+def _registry_ids_from_payload(
+    data: object,
+) -> tuple[set[str] | None, RegistryMeta]:
     if not isinstance(data, list):
         print(
             "[bridge-watchdog] agent registry payload is not a JSON array; "
             "falling back to listing-only enumeration",
             file=sys.stderr,
         )
-        return None
+        return None, {}
     ids: set[str] = set()
+    meta: RegistryMeta = {}
     for row in data:
         if not isinstance(row, dict):
             continue
         agent_id = str(row.get("id") or "").strip()
-        if agent_id:
-            ids.add(agent_id)
-    return ids
+        if not agent_id:
+            continue
+        ids.add(agent_id)
+        # Surface engine + agent_source so the scan loop can apply the
+        # engine-aware profile check (#905) and the dynamic-agent
+        # fresh-state suppression (#907). Missing fields → empty string;
+        # the scan loop maps empty engine → "claude" (legacy behavior)
+        # and empty source → no #907 suppression (conservative).
+        meta[agent_id] = {
+            "engine": str(row.get("engine") or "").strip(),
+            "agent_source": str(row.get("agent_source") or "").strip(),
+        }
+    return ids, meta
 
 
 def collect_broken_links(agent_dir: Path) -> list[str]:
@@ -222,25 +266,71 @@ def heartbeat_age_seconds(agent_dir: Path) -> tuple[bool, int | None]:
 NON_ONBOARDING_SESSION_TYPES = frozenset({"dynamic", "cron"})
 
 
+def required_profile_files(engine: str) -> tuple[str, ...]:
+    """Per-engine required profile-file set.
+
+    Issue #905: the watchdog used to assert ``CLAUDE_REQUIRED_FILES`` on
+    every agent regardless of engine, so codex agents (which don't read
+    any of those Claude-runtime files) surfaced as ``status=error`` with
+    every required file marked missing. Codex CLI has no equivalent
+    required-file contract at the agent home root, so the codex path
+    returns an empty tuple — the missing-files check effectively becomes
+    a no-op for codex and the watchdog stops manufacturing drift for an
+    engine it doesn't actually monitor.
+    """
+    if engine == "codex":
+        return ()
+    # Claude (and any future / unknown engine — conservative default
+    # preserves the pre-#905 behavior so missing roster metadata never
+    # silently turns off the drift check for a real Claude agent).
+    return CLAUDE_REQUIRED_FILES
+
+
 def classify_status(
     missing_files: list[str],
     broken_links: list[str],
     onboarding_state: str,
     missing_block: bool,
     session_type: str = "",
+    agent_source: str = "",
+    engine: str = "claude",
 ) -> str:
     if missing_files:
         return "error"
+    # Issue #905: codex agents have no SESSION-TYPE.md / onboarding-state
+    # contract — they're operated entirely through the Codex CLI, which
+    # never reads either file. The watchdog's onboarding-staleness check
+    # was firing on every codex agent (`session_type=unknown`,
+    # `onboarding_state=missing`) and contributing to problem_count even
+    # after the missing-files check was made engine-aware. Skip the
+    # onboarding-stale signal entirely for codex.
     onboarding_stale = (
-        onboarding_state in {"pending", "missing"}
+        engine != "codex"
+        and onboarding_state in {"pending", "missing"}
         and session_type not in NON_ONBOARDING_SESSION_TYPES
     )
-    if broken_links or missing_block or onboarding_stale:
+    # Issue #907: dynamic agents (system-provisioned, e.g. `librarian`)
+    # land with `missing_managed_claude_block=yes` until their first run
+    # fills the block in. The watchdog was emitting a high-priority
+    # admin-inbox profile-drift task on every cycle for that
+    # fresh-provision default — a condition admin has no authority to
+    # resolve per ADMIN-PROTOCOL's static/dynamic boundary (#303/#304/
+    # #343 anti-pattern). Suppress the `missing_block` warn signal for
+    # dynamic agents so a fresh-provisioned dynamic with no other drift
+    # classifies as `ok` and never reaches `problem_count`.
+    effective_missing_block = missing_block
+    if agent_source == "dynamic":
+        effective_missing_block = False
+    if broken_links or effective_missing_block or onboarding_stale:
         return "warn"
     return "ok"
 
 
-def scan_agent(agent_dir: Path) -> AgentWatch:
+def scan_agent(
+    agent_dir: Path,
+    engine: str = "claude",
+    agent_source: str = "",
+) -> AgentWatch:
     # v0.8.8 #715-B / #694: linux-user-isolated agents own
     # `agents/<name>/CLAUDE.md` as `agent-bridge-<name>:<group> 0640`.
     # When the controller process credentials don't include the new
@@ -258,13 +348,28 @@ def scan_agent(agent_dir: Path) -> AgentWatch:
     # `broken_links` channel keeps the existing markdown render
     # unchanged (no new `AgentWatch` fields, per spec).
     try:
-        missing_files = [name for name in REQUIRED_FILES if not (agent_dir / name).exists()]
-        claude_text = read_text(agent_dir / "CLAUDE.md") if (agent_dir / "CLAUDE.md").exists() else ""
-        missing_block = MANAGED_START not in claude_text or MANAGED_END not in claude_text
+        required = required_profile_files(engine)
+        missing_files = [name for name in required if not (agent_dir / name).exists()]
+        # The managed-block check only applies to Claude — codex agents
+        # don't own a CLAUDE.md and shouldn't be flagged for a block they
+        # have no contract to maintain (#905).
+        if engine == "codex":
+            missing_block = False
+        else:
+            claude_text = read_text(agent_dir / "CLAUDE.md") if (agent_dir / "CLAUDE.md").exists() else ""
+            missing_block = MANAGED_START not in claude_text or MANAGED_END not in claude_text
         session_type, onboarding_state = parse_session_type(agent_dir)
         heartbeat_present, heartbeat_age = heartbeat_age_seconds(agent_dir)
         broken_links = collect_broken_links(agent_dir)
-        status = classify_status(missing_files, broken_links, onboarding_state, missing_block, session_type)
+        status = classify_status(
+            missing_files,
+            broken_links,
+            onboarding_state,
+            missing_block,
+            session_type,
+            agent_source,
+            engine,
+        )
         return AgentWatch(
             agent=agent_dir.name,
             session_type=session_type,
@@ -275,6 +380,8 @@ def scan_agent(agent_dir: Path) -> AgentWatch:
             missing_managed_claude_block=missing_block,
             heartbeat_present=heartbeat_present,
             heartbeat_age_seconds=heartbeat_age,
+            engine=engine or "claude",
+            agent_source=agent_source,
         )
     except (PermissionError, FileNotFoundError) as exc:
         print(
@@ -293,6 +400,8 @@ def scan_agent(agent_dir: Path) -> AgentWatch:
             missing_managed_claude_block=False,
             heartbeat_present=False,
             heartbeat_age_seconds=None,
+            engine=engine or "claude",
+            agent_source=agent_source,
         )
 
 
@@ -329,6 +438,9 @@ def render_markdown(
     for item in records:
         lines.append(f"## {item.agent}")
         lines.append(f"- status: {item.status}")
+        lines.append(f"- engine: {item.engine}")
+        if item.agent_source:
+            lines.append(f"- agent_source: {item.agent_source}")
         lines.append(f"- session_type: {item.session_type}")
         lines.append(f"- onboarding_state: {item.onboarding_state}")
         lines.append(f"- heartbeat_present: {'yes' if item.heartbeat_present else 'no'}")
@@ -387,13 +499,26 @@ def main() -> int:
     bridge_home = Path(args.bridge_home).expanduser()
     agent_root = Path(args.agent_home_root).expanduser() if args.agent_home_root else bridge_home / "agents"
     registry_ids: set[str] | None = None
-    if args.registry_anchored and not args.agents:
-        # Explicit agent args bypass the registry filter so the operator can
-        # still scope-scan a single agent even when the registry endpoint is
-        # broken. When no args are given the registry filter applies.
-        registry_ids = load_registry_agent_ids(args, bridge_home)
+    registry_meta: RegistryMeta = {}
+    if args.registry_anchored:
+        # Explicit agent args bypass the registry id filter (so the
+        # operator can still scope-scan a single agent even when the
+        # registry endpoint is broken), but we still consult the registry
+        # for engine + agent_source metadata so #905 / #907 fixes apply
+        # to scoped scans too.
+        registry_ids, registry_meta = load_registry_agent_ids(args, bridge_home)
+        if args.agents:
+            # Disable the id filter; keep the meta map.
+            registry_ids = None
     scan_paths, orphan_directories = list_agent_dirs(agent_root, args.agents, registry_ids)
-    records = [scan_agent(path) for path in scan_paths]
+    records = [
+        scan_agent(
+            path,
+            engine=(registry_meta.get(path.name, {}).get("engine") or "claude"),
+            agent_source=registry_meta.get(path.name, {}).get("agent_source", ""),
+        )
+        for path in scan_paths
+    ]
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
         "bridge_home": str(bridge_home),
