@@ -201,15 +201,25 @@ def classify(normalized: str) -> tuple[str, str, str]:
     # become a self-sustaining stall loop.
     #
     # Block-aware extension: codex renders tool/diff output as a glyph-prefixed
-    # head line followed by indented continuation lines that carry no glyph
-    # (wrapped diff bodies, multi-line tool stdout). Glyph-only filtering let
-    # those wrapped lines reach classify and match e.g. "401 Unauthorized"
-    # quoted from a smoke test. Once we enter an agent block on a glyph line,
-    # skip subsequent non-empty lines whose RAW text starts with whitespace;
-    # exit the block on a blank line or the next non-indented, non-glyph line
-    # (which is itself eligible for matching). Issue #329 Track D's
-    # walk-line-by-line semantics are preserved so matched_line_hash keeps its
-    # dedup behavior.
+    # head line followed by continuation lines that carry no glyph (wrapped
+    # diff bodies, multi-line tool stdout). Glyph-only filtering let those
+    # continuation lines reach classify and match e.g. "401 Unauthorized"
+    # quoted from a smoke test or from a tracked review report.
+    #
+    # An earlier version of this rule treated the block as "indented lines
+    # only" — but codex wraps long head lines too, e.g.
+    #     • Added /very/long/path/to/file.md (+34
+    #     -0)
+    #     1 +...
+    # where `-0)` lands flush-left and looks like a block exit. Once exited,
+    # the indented diff body that followed was eligible to match. The rule
+    # below treats *any* non-empty line inside an agent block as part of the
+    # block, regardless of indentation; the block ends on the next blank line.
+    # A subsequent glyph line restarts the block. This is broader than the
+    # original indented-only rule but matches how codex actually structures
+    # output: top-level pane items are separated by blank lines, and any
+    # rendering inside one item is the agent narrating. Issue #329 Track D's
+    # walk-line-by-line semantics and matched_line_hash dedup are preserved.
     in_agent_block = False
     for raw in normalized.splitlines():
         stripped = raw.strip()
@@ -220,9 +230,7 @@ def classify(normalized: str) -> tuple[str, str, str]:
             in_agent_block = True
             continue
         if in_agent_block:
-            if raw[:1].isspace():
-                continue
-            in_agent_block = False
+            continue
         haystack = stripped.lower()
         for classification, patterns in PATTERN_GROUPS:
             for pattern in patterns:
