@@ -26,9 +26,11 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
+  rmdirSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -899,6 +901,47 @@ function runPromptGuard(command: 'scan' | 'sanitize', text: string): Record<stri
 }
 
 /**
+ * Build the channel meta object used by BOTH the `notifications/claude/channel`
+ * notification AND the bridge-mode queue task body. Centralizing here keeps
+ * the two delivery paths from drifting (PR #961 r1 found bridge body was
+ * missing conversation_id / tenant_id / service_url / attachment_count that
+ * the channel notification carries).
+ */
+function buildChannelMeta(
+  activity: Activity,
+  stored: StoredMessage,
+  attachments: StoredAttachment[],
+): Record<string, unknown> {
+  return {
+    source: 'teams',
+    chat_id: stored.chat_id,
+    conversation_id: stored.chat_id,
+    message_id: stored.message_id,
+    user: stored.user,
+    user_id: stored.user_id,
+    aad_object_id: stored.aad_object_id,
+    tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
+    service_url: String(activity.serviceUrl ?? ''),
+    text: stored.text,
+    ts: stored.ts,
+    ...(stored.revision ? { revision: stored.revision } : {}),
+    ...(attachments.length > 0
+      ? {
+          attachment_count: String(attachments.length),
+          attachments: attachments.map(att => ({
+            name: att.name,
+            content_type: att.content_type,
+            download_status: att.download_status,
+            ...(att.local_path ? { local_path: att.local_path } : {}),
+            ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
+            ...(att.download_error ? { download_error: att.download_error } : {}),
+          })),
+        }
+      : {}),
+  }
+}
+
+/**
  * Bridge-mode delivery (issue #959): enqueue the inbound Teams message as an
  * Agent Bridge queue task via `bridge-task.sh create`. Used when
  * TEAMS_DELIVERY_MODE is `bridge` or `both`. The daemon then wakes the agent
@@ -912,44 +955,52 @@ function runPromptGuard(command: 'scan' | 'sanitize', text: string): Record<stri
  * operator has opted into queue-only delivery and silent loss is preferable
  * to retry storms when the queue itself is unhealthy.
  */
-function deliverViaBridgeQueue(stored: StoredMessage): void {
+function deliverViaBridgeQueue(
+  activity: Activity,
+  stored: StoredMessage,
+  attachments: StoredAttachment[],
+): void {
   const agent = String(process.env.BRIDGE_AGENT_ID ?? '').trim()
   if (!agent) {
-    process.stderr.write(`teams channel: bridge-mode delivery skipped — BRIDGE_AGENT_ID unset\n`)
+    process.stderr.write(`teams channel: bridge-mode delivery skipped — BRIDGE_AGENT_ID unset, message_id=${stored.message_id}\n`)
     return
   }
   const taskScript = join(BRIDGE_HOME, 'bridge-task.sh')
   if (!existsSync(taskScript)) {
-    process.stderr.write(`teams channel: bridge-mode delivery skipped — bridge-task.sh not found at ${taskScript}\n`)
+    process.stderr.write(`teams channel: bridge-mode delivery skipped — bridge-task.sh not found at ${taskScript}, message_id=${stored.message_id}\n`)
     return
   }
 
-  const body = JSON.stringify({
-    source: 'teams',
-    chat_id: stored.chat_id,
-    message_id: stored.message_id,
-    user: stored.user,
-    user_id: stored.user_id,
-    aad_object_id: stored.aad_object_id,
-    text: stored.text,
-    ts: stored.ts,
-    ...(stored.revision ? { revision: stored.revision } : {}),
-    ...(stored.attachments ? { attachments: stored.attachments } : {}),
-  }, null, 2)
+  const body = JSON.stringify(buildChannelMeta(activity, stored, attachments), null, 2)
 
   // Tempfile delivery dodges argv length limits and shell-escaping of the
-  // arbitrary user-supplied body. 0o600 keeps the JSON payload (which may
+  // arbitrary user-supplied body. mkdtemp guarantees a fresh unique directory
+  // even on same-ms collisions; opening the file with 'wx' fails fast if an
+  // attacker pre-created the path. 0o600 keeps the JSON payload (which may
   // contain user PII / message text) off any group-readable tmp.
   const safeMid = stored.message_id.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 80) || 'msg'
-  const bodyFile = join(tmpdir(), `teams-bridge-${safeMid}-${Date.now()}.json`)
+  let bodyDir: string
   try {
-    writeFileSync(bodyFile, body, { mode: 0o600 })
+    bodyDir = mkdtempSync(join(tmpdir(), 'teams-bridge-'))
   } catch (err) {
-    process.stderr.write(`teams channel: bridge-mode delivery skipped — could not write body file: ${err}\n`)
+    process.stderr.write(`teams channel: bridge-mode delivery skipped — could not create body dir: ${err}, message_id=${stored.message_id}\n`)
+    return
+  }
+  const bodyFile = join(bodyDir, `${safeMid}.json`)
+  try {
+    writeFileSync(bodyFile, body, { mode: 0o600, flag: 'wx' })
+  } catch (err) {
+    process.stderr.write(`teams channel: bridge-mode delivery skipped — could not write body file: ${err}, message_id=${stored.message_id}\n`)
+    try { rmdirSync(bodyDir) } catch {}
     return
   }
 
-  const title = `[teams] ${stored.user || 'user'}: ${(stored.text || '(attachment)').slice(0, 60)}`
+  // Title budget: cap WHOLE title (prefix + user + text) to TITLE_MAX so a
+  // long Teams display name can't push the user-visible text off the inbox
+  // row. Single ellipsis at the end keeps the truncation obvious.
+  const TITLE_MAX = 120
+  const rawTitle = `[teams] ${stored.user || 'user'}: ${stored.text || '(attachment)'}`
+  const title = rawTitle.length > TITLE_MAX ? rawTitle.slice(0, TITLE_MAX - 1) + '…' : rawTitle
   try {
     const r = spawnSync(
       'bash',
@@ -965,10 +1016,11 @@ function deliverViaBridgeQueue(stored: StoredMessage): void {
     )
     if (r.status !== 0) {
       const stderrTail = r.stderr ? r.stderr.toString().slice(0, 200) : ''
-      process.stderr.write(`teams channel: bridge-mode enqueue failed rc=${r.status}: ${stderrTail}\n`)
+      process.stderr.write(`teams channel: bridge-mode enqueue failed rc=${r.status}, message_id=${stored.message_id}: ${stderrTail}\n`)
     }
   } finally {
     try { unlinkSync(bodyFile) } catch {}
+    try { rmdirSync(bodyDir) } catch {}
   }
 }
 
@@ -1718,32 +1770,7 @@ async function handleActivity(context: TurnContext): Promise<void> {
         method: 'notifications/claude/channel',
         params: {
           content: text || (attachments.length > 0 ? '(attachment)' : ''),
-          meta: {
-            source: 'teams',
-            chat_id: chatId,
-            conversation_id: chatId,
-            message_id: messageId,
-            user: userName,
-            user_id: stored.user_id,
-            aad_object_id: aad,
-            tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
-            service_url: String(activity.serviceUrl ?? ''),
-            ts,
-            ...(revision ? { revision } : {}),
-            ...(attachments.length > 0
-              ? {
-                  attachment_count: String(attachments.length),
-                  attachments: attachments.map(att => ({
-                    name: att.name,
-                    content_type: att.content_type,
-                    download_status: att.download_status,
-                    ...(att.local_path ? { local_path: att.local_path } : {}),
-                    ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
-                    ...(att.download_error ? { download_error: att.download_error } : {}),
-                  })),
-                }
-              : {}),
-          },
+          meta: buildChannelMeta(activity, stored, attachments),
         },
       })
       channelDelivered = true
@@ -1756,7 +1783,7 @@ async function handleActivity(context: TurnContext): Promise<void> {
   if (mode === 'bridge' || mode === 'both') {
     // Bridge-mode failures log but do not throw — operators choosing bridge
     // or both have accepted best-effort enqueue. See deliverViaBridgeQueue.
-    deliverViaBridgeQueue(stored)
+    deliverViaBridgeQueue(activity, stored, attachments)
   }
 
   // Channel-mode (and both-mode) failure surfaces to Teams so it retries; in
