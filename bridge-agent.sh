@@ -2774,9 +2774,26 @@ report and reap test-fixture agents per their pattern."
       # fresh agent has no such head start). `bridge_linux_prepare_
       # agent_isolation` already covers linux-user above so this branch
       # is the shared-mode counterpart.
-      if ! bridge_isolation_v2_apply_grant_matrix_for_agent "$agent" --apply >/dev/null 2>&1; then
-        bridge_warn "agent create: v2 shared-mode grant-matrix apply degraded for '$agent' (non-fatal)"
-      fi
+      #
+      # r2 P1 #3: hard-fail on apply error. apply_grant_matrix_for_agent
+      # returns rc=1 only when a `required` row is broken (`optional`
+      # rows demote to `degraded` and keep rc=0 — see the criticality
+      # split in lib/bridge-isolation-v2.sh's apply_grant_matrix_for_
+      # agent walker). Required apply failure here means marker writes
+      # through ensure_matrix_path will reject on the first daemon pass;
+      # swallowing the failure as "degraded continue" was exactly the
+      # #909 wedge shape (non-bootable agent with no operator signal).
+      # Surface the apply stderr and die so the operator sees the cause
+      # and can either remove the agent (`agb agent delete <name>
+      # --force`) or fix the underlying identity/permission issue.
+      local _v2_apply_err=""
+      _v2_apply_err="$(bridge_isolation_v2_apply_grant_matrix_for_agent "$agent" --apply 2>&1 >/dev/null)" \
+        || {
+          if [[ -n "$_v2_apply_err" ]]; then
+            printf '%s\n' "$_v2_apply_err" >&2
+          fi
+          bridge_die "agent create: v2 shared-mode grant-matrix apply failed for '$agent' — first daemon pass would wedge on missing rows. Inspect output above, then 'agb agent delete $agent --force' to roll back."
+        }
     fi
     # Issue #680: bridge-start.sh --dry-run is purely informational here — its
     # output is reprinted to the user as `start_dry_run:` for diagnostic

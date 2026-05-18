@@ -1332,11 +1332,7 @@ bridge_isolation_v2_matrix_rows_for_agent() {
     bridge_warn "matrix_rows_for_agent: agent name required"
     return 1
   }
-  local agent_grp data_root shared_root
-  agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null)" || {
-    bridge_warn "matrix_rows_for_agent: cannot resolve agent group for '$agent'"
-    return 1
-  }
+  local data_root shared_root
   data_root="${BRIDGE_DATA_ROOT:-}"
   shared_root="${BRIDGE_SHARED_ROOT:-${data_root:+$data_root/shared}}"
   local agent_root="${data_root:+$data_root/agents/$agent}"
@@ -1371,6 +1367,22 @@ bridge_isolation_v2_matrix_rows_for_agent() {
     shared) ;;
     *) _v2_isolation_mode="linux-user" ;;
   esac
+
+  # r2 P1 #1: defer agent_grp resolution until we know we're in linux-user
+  # mode. bridge_isolation_v2_agent_group_name rejects names outside
+  # `[a-z_][a-z0-9_-]*` (POSIX group-name shape), but bridge-core.sh accepts
+  # broader names in shared mode (digits/dots/hyphens/uppercase). Resolving
+  # here in shared mode would fail the whole matrix emit for a legitimate
+  # shared agent like `foo.bar`, which is the exact wedge the #909 fix
+  # exists to close. Shared rows use `controller_group` (resolved at
+  # apply_row time) instead of the per-agent group.
+  local agent_grp=""
+  if [[ "$_v2_isolation_mode" != "shared" ]]; then
+    agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null)" || {
+      bridge_warn "matrix_rows_for_agent: cannot resolve agent group for '$agent'"
+      return 1
+    }
+  fi
 
   # ----- shared/ row family (catalog/source only — RC6 per-agent cache
   # lands in PR 2 as a separate row family) -----
@@ -1675,6 +1687,9 @@ bridge_isolation_v2_apply_row() {
   #   $1 mode    apply | check
   #   $2..$11   row fields in matrix order (row_name path access_type owner
   #             group dir_mode file_mode setgid grant_mechanism criticality)
+  #   $12       agent (optional) — required for controller_credential_acl
+  #             and consulted by the #909 belt-and-braces fallback to gate
+  #             "missing identity = warn" on shared-mode agents only.
   # Returns 0 on apply success / clean check, non-zero otherwise. Caller
   # is responsible for emitting per-row report rows; this helper only
   # mutates filesystem state (apply) or compares (check).
@@ -1689,6 +1704,7 @@ bridge_isolation_v2_apply_row() {
   local setgid="$9"
   local mechanism="${10}"
   local criticality="${11}"
+  local agent="${12:-}"
 
   # Resolve `controller` token at apply/check time so the matrix stays static.
   if [[ "$owner" == "controller" ]]; then
@@ -1719,16 +1735,15 @@ bridge_isolation_v2_apply_row() {
       # caller invokes apply_row with no agent context (12th arg),
       # downgrade to fail-loud — silent ok was the v0.9.5/v0.9.6 RC3
       # recurrence anti-pattern.
-      local agent_for_rc3="${12:-}"
-      if [[ -z "$agent_for_rc3" ]]; then
+      if [[ -z "$agent" ]]; then
         bridge_warn "apply_row($row_name): controller_credential_acl requires agent context (\$12); refuse to false-pass"
         return 1
       fi
       if [[ "$mode" == "apply" ]]; then
-        bridge_isolation_v2_apply_controller_credentials_read_grant "$agent_for_rc3" "$file_mode"
+        bridge_isolation_v2_apply_controller_credentials_read_grant "$agent" "$file_mode"
         return $?
       fi
-      bridge_isolation_v2_check_controller_credentials_read_grant "$agent_for_rc3" "$path" "$file_mode"
+      bridge_isolation_v2_check_controller_credentials_read_grant "$agent" "$path" "$file_mode"
       return $?
       ;;
     install_managed)
@@ -1757,24 +1772,47 @@ bridge_isolation_v2_apply_row() {
   esac
 
   # #909 belt-and-braces: if the resolved owner/group does not exist on
-  # this host, treat the apply branch as a non-fatal degraded skip. The
-  # primary fix is the shared-mode row branch in matrix_rows_for_agent,
-  # which emits operator-owned rows that ALWAYS resolve. This guard is
-  # the second line of defense: if any matrix row still slips through
-  # referencing a non-existent identity (e.g., a future row family or a
-  # mis-routed caller passing an `ab-agent-<X>` group on a shared-only
-  # install), the agent should NOT wedge into a daemon restart-loop the
-  # operator cannot mitigate from an agent session — same failure shape
-  # the original #909 report documents.
+  # this host, treat the apply branch as a non-fatal degraded skip ONLY
+  # for shared-mode agents. The primary fix is the shared-mode row branch
+  # in matrix_rows_for_agent, which emits operator-owned rows that ALWAYS
+  # resolve. This guard is the second line of defense: if any matrix row
+  # still slips through referencing a non-existent identity (e.g., a
+  # future row family or a mis-routed caller passing an `ab-agent-<X>`
+  # group on a shared-only install), a shared agent should NOT wedge into
+  # a daemon restart-loop the operator cannot mitigate from an agent
+  # session — same failure shape the original #909 report documents.
+  #
+  # r2 P1 #2: gate the downgrade on shared-mode. Linux-user rows in
+  # matrix_rows_for_agent (`else` branches around the
+  # `_v2_isolation_mode == "shared"` checks) reference `agent-bridge-<X>`
+  # / `ab-agent-<X>`. A missing identity there is a real linux-user setup
+  # bug (e.g., bridge_linux_prepare_agent_isolation never ran, useradd
+  # failed silently); masking it with a warn would hide the bug and
+  # leave the agent half-prepared. Without an agent in scope ($12 unset
+  # — third-party caller), preserve the pre-r1 hard-fail behavior because
+  # we cannot prove shared-mode.
   if [[ "$mode" == "apply" ]] \
       && [[ "$mechanism" == "group_setgid" ]]; then
+    local _missing_kind="" _missing_name=""
     if ! bridge_isolation_v2_identity_exists "$owner" "user" 2>/dev/null; then
-      bridge_warn "apply_row($row_name): owner '$owner' does not exist on host — skipping apply (#909 non-fatal in non-isolated mode)"
-      return 0
+      _missing_kind="user"
+      _missing_name="$owner"
+    elif ! bridge_isolation_v2_identity_exists "$group" "group" 2>/dev/null; then
+      _missing_kind="group"
+      _missing_name="$group"
     fi
-    if ! bridge_isolation_v2_identity_exists "$group" "group" 2>/dev/null; then
-      bridge_warn "apply_row($row_name): group '$group' does not exist on host — skipping apply (#909 non-fatal in non-isolated mode)"
-      return 0
+    if [[ -n "$_missing_kind" ]]; then
+      local _agent_iso_mode=""
+      if [[ -n "$agent" ]] \
+          && command -v bridge_agent_isolation_mode >/dev/null 2>&1; then
+        _agent_iso_mode="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || true)"
+      fi
+      if [[ "$_agent_iso_mode" == "shared" ]]; then
+        bridge_warn "apply_row($row_name): $_missing_kind '$_missing_name' does not exist on host — skipping apply (#909 shared-mode non-fatal)"
+        return 0
+      fi
+      bridge_warn "apply_row($row_name): $_missing_kind '$_missing_name' does not exist on host (agent='${agent:-<unknown>}', mode='${_agent_iso_mode:-<unknown>}') — refusing to false-pass linux-user setup"
+      return 1
     fi
   fi
 
@@ -1910,9 +1948,12 @@ bridge_isolation_v2_apply_grant_matrix_for_agent() {
           || row_rc=$?
       fi
     else
+      # r2 P1 #2: pass agent ($12) so apply_row's belt-and-braces fallback
+      # can gate "missing identity = warn" on shared-mode agents only.
       bridge_isolation_v2_apply_row "$mode" \
         "$r_name" "$r_path" "$r_access" "$r_owner" "$r_group" \
         "$r_dmode" "$r_fmode" "$r_setgid" "$r_mech" "$r_crit" \
+        "$agent" \
         || row_rc=$?
     fi
     if [[ "$mode" == "check" ]]; then
@@ -1993,14 +2034,18 @@ bridge_isolation_v2_ensure_matrix_path() {
     return 1
   fi
   IFS='|' read -r r_name r_path r_access r_owner r_group r_dmode r_fmode r_setgid r_mech r_crit r_notes <<<"$row"
+  # r2 P1 #2: pass agent ($12) so apply_row's belt-and-braces fallback
+  # can gate "missing identity = warn" on shared-mode agents only.
   if bridge_isolation_v2_apply_row "check" \
     "$r_name" "$r_path" "$r_access" "$r_owner" "$r_group" \
-    "$r_dmode" "$r_fmode" "$r_setgid" "$r_mech" "$r_crit" 2>/dev/null; then
+    "$r_dmode" "$r_fmode" "$r_setgid" "$r_mech" "$r_crit" \
+    "$agent" 2>/dev/null; then
     return 0
   fi
   bridge_isolation_v2_apply_row "apply" \
     "$r_name" "$r_path" "$r_access" "$r_owner" "$r_group" \
-    "$r_dmode" "$r_fmode" "$r_setgid" "$r_mech" "$r_crit"
+    "$r_dmode" "$r_fmode" "$r_setgid" "$r_mech" "$r_crit" \
+    "$agent"
 }
 
 bridge_isolation_v2_apply_controller_credentials_read_grant() {
