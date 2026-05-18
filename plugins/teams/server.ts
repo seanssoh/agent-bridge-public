@@ -24,8 +24,10 @@ import {
   chmodSync,
   constants as fsConstants,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -696,19 +698,65 @@ type OutboundConsentRecord = {
   created_at: string
   conversation_id: string
   chat_id: string
+  // Defense-in-depth: bind the consent token to the user the card was sent to
+  // (the ConversationReference's user.aadObjectId, when Teams populates it).
+  // The invoke handler rejects mismatches so a leaked token can't be replayed
+  // by another user even if Teams' threading model changes in the future.
+  // Empty string means we never had the field (older record or non-Teams ref).
+  aad_object_id?: string
 }
 
 type OutboundConsentStore = Record<string, OutboundConsentRecord>
 
+// Per-process serialization for consent-store mutations. Two concurrent
+// fileConsent/invoke handlers (or an invoke racing the startup TTL sweep) used
+// to read → mutate → save in parallel, so the second writer could resurrect
+// the token the first writer had just deleted. JS is single-threaded but the
+// awaited Teams upload PUT in handleFileConsentInvoke yields the event loop
+// long enough for a sibling invoke to interleave. The mutex is per-process:
+// the on-disk atomic rename in saveOutboundConsents protects against
+// cross-process tearing (which shouldn't happen — STATE_DIR is per-agent —
+// but is cheap defense-in-depth).
+let consentMutex: Promise<void> = Promise.resolve()
+async function withConsentLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = consentMutex
+  let release: () => void = () => {}
+  consentMutex = new Promise<void>(resolve => {
+    release = resolve
+  })
+  await previous
+  try {
+    return await fn()
+  } finally {
+    release()
+  }
+}
+
 function loadOutboundConsents(): OutboundConsentStore {
-  return loadJson<OutboundConsentStore>(OUTBOUND_CONSENTS_FILE, {})
+  if (!existsSync(OUTBOUND_CONSENTS_FILE)) return {}
+  try {
+    return JSON.parse(readFileSync(OUTBOUND_CONSENTS_FILE, 'utf8')) as OutboundConsentStore
+  } catch (err) {
+    // Noisy log + rename-aside rather than silent fresh-start: a malformed
+    // consent file means an in-flight upload's pending record is gone, and
+    // operators need to know the file was quarantined for postmortem.
+    process.stderr.write(
+      `teams channel: outbound-consents.json malformed, starting fresh: ${(err as Error)?.message ?? err}\n`,
+    )
+    try {
+      renameSync(OUTBOUND_CONSENTS_FILE, `${OUTBOUND_CONSENTS_FILE}.corrupt-${Date.now()}`)
+    } catch {}
+    return {}
+  }
 }
 
 function saveOutboundConsents(store: OutboundConsentStore): void {
+  // saveJson already does atomic tempfile + rename with mode 0600, so this
+  // delegates to the shared helper.
   saveJson(OUTBOUND_CONSENTS_FILE, store)
 }
 
-function sweepOutboundConsents(): void {
+function sweepOutboundConsentsLocked(): void {
   const store = loadOutboundConsents()
   const now = Date.now()
   let mutated = false
@@ -720,6 +768,12 @@ function sweepOutboundConsents(): void {
     }
   }
   if (mutated) saveOutboundConsents(store)
+}
+
+async function sweepOutboundConsents(): Promise<void> {
+  await withConsentLock(async () => {
+    sweepOutboundConsentsLocked()
+  })
 }
 
 async function downloadAttachments(
@@ -848,6 +902,7 @@ async function sendFileConsentCard(
   agentMessage: string,
 ): Promise<string> {
   const token = randomUUID()
+  const refUserAad = String((ref as any).user?.aadObjectId ?? '').trim()
   const record: OutboundConsentRecord = {
     abs_path: absPath,
     display_name: displayName,
@@ -857,10 +912,13 @@ async function sendFileConsentCard(
     created_at: new Date().toISOString(),
     conversation_id: String((ref as any).conversation?.id ?? ''),
     chat_id: chatId,
+    ...(refUserAad ? { aad_object_id: refUserAad } : {}),
   }
-  const store = loadOutboundConsents()
-  store[token] = record
-  saveOutboundConsents(store)
+  await withConsentLock(async () => {
+    const store = loadOutboundConsents()
+    store[token] = record
+    saveOutboundConsents(store)
+  })
 
   await adapter.continueConversation(ref, async context => {
     const consentAttachment = {
@@ -914,8 +972,8 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
   }
   const action = String(value.action ?? '').trim()
   const token = String(value.context?.token ?? '').trim()
-  const store = loadOutboundConsents()
-  const record = token ? store[token] : undefined
+  const invokeConvId = String(activity.conversation?.id ?? '').trim()
+  const invokeAad = String((activity.from as any)?.aadObjectId ?? '').trim()
 
   // Tell BotFrameworkAdapter the invoke status to write back. Status 200 +
   // empty body is the Bot Framework convention for "consent handled".
@@ -926,6 +984,37 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
     } as any)
   }
 
+  // Look up the record under the lock. If the conversation id (or aadObjectId,
+  // when present on both sides) doesn't match what we recorded when the consent
+  // card was sent, treat the token as compromised: drop it and decline. The
+  // token is an unguessable uuid, but binding it to the conversation prevents
+  // a leaked token from being replayed in a different chat.
+  const record = await withConsentLock(async () => {
+    const store = loadOutboundConsents()
+    const rec = token ? store[token] : undefined
+    if (!rec) return undefined
+    if (rec.conversation_id && invokeConvId && invokeConvId !== rec.conversation_id) {
+      process.stderr.write(
+        `teams channel: fileConsent conversation mismatch token=${token} ` +
+          `invoke=${invokeConvId} stored=${rec.conversation_id}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return undefined
+    }
+    const storedAad = String((rec as any).aad_object_id ?? '').trim()
+    if (storedAad && invokeAad && storedAad !== invokeAad) {
+      process.stderr.write(
+        `teams channel: fileConsent aad mismatch token=${token} ` +
+          `invoke=${invokeAad} stored=${storedAad}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return undefined
+    }
+    return rec
+  })
+
   if (!record) {
     process.stderr.write(`teams channel: fileConsent invoke for unknown token=${token}\n`)
     await sendInvokeStatus(404)
@@ -933,8 +1022,11 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
   }
 
   if (action === 'decline') {
-    delete store[token]
-    saveOutboundConsents(store)
+    await withConsentLock(async () => {
+      const store = loadOutboundConsents()
+      delete store[token]
+      saveOutboundConsents(store)
+    })
     try {
       await context.sendActivity(`File delivery declined: ${record.display_name}`)
     } catch (err) {
@@ -970,8 +1062,11 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
     bytes = readFileSync(record.abs_path)
   } catch (err) {
     process.stderr.write(`teams channel: fileConsent read failed token=${token}: ${err}\n`)
-    delete store[token]
-    saveOutboundConsents(store)
+    await withConsentLock(async () => {
+      const store = loadOutboundConsents()
+      delete store[token]
+      saveOutboundConsents(store)
+    })
     try {
       await context.sendActivity(`File delivery failed: ${record.display_name}`)
     } catch {}
@@ -980,7 +1075,9 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
   }
 
   // Teams upload protocol: PUT with Content-Range covering the whole file.
-  // For a single-chunk upload the range is `bytes 0-(size-1)/size`.
+  // For a single-chunk upload the range is `bytes 0-(size-1)/size`. The PUT
+  // intentionally runs OUTSIDE the consent lock so a slow upload doesn't
+  // serialize sibling invokes in the same process.
   const last = Math.max(0, bytes.byteLength - 1)
   const contentRange = `bytes 0-${last}/${bytes.byteLength}`
   let uploadOk = false
@@ -1004,8 +1101,11 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
 
   if (!uploadOk) {
     process.stderr.write(`teams channel: fileConsent upload failed token=${token}: ${uploadErr}\n`)
-    delete store[token]
-    saveOutboundConsents(store)
+    await withConsentLock(async () => {
+      const store = loadOutboundConsents()
+      delete store[token]
+      saveOutboundConsents(store)
+    })
     try {
       await context.sendActivity(`File upload failed: ${record.display_name}`)
     } catch {}
@@ -1034,8 +1134,11 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
     process.stderr.write(`teams channel: fileInfo post failed (upload succeeded): ${err}\n`)
   }
 
-  delete store[token]
-  saveOutboundConsents(store)
+  await withConsentLock(async () => {
+    const store = loadOutboundConsents()
+    delete store[token]
+    saveOutboundConsents(store)
+  })
   await sendInvokeStatus(200)
 }
 
@@ -1184,6 +1287,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       // Validate each attachment up front before sending any consent cards so a
       // single bad path doesn't leave half the files in pending consent state.
       const allowRoot = resolveOutboundAllowRoot()
+      // realpath the allow root once: if the root itself is a symlink chain we
+      // need to compare resolved-to-resolved. resolveOutboundAllowRoot mkdirs
+      // the root, so this should always succeed; on failure fall back to the
+      // raw root and let the per-path check below reject anything outside it.
+      let allowRootReal: string
+      try {
+        allowRootReal = realpathSync(allowRoot)
+      } catch {
+        allowRootReal = allowRoot
+      }
       const maxBytes = resolveOutboundMaxBytes()
       const validated: {
         absPath: string
@@ -1198,17 +1311,43 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           throw new Error(`attachment.path must be absolute: ${rawPath}`)
         }
         const absPath = pathResolve(rawPath)
-        // Containment check: absPath must be inside allowRoot. The trailing
-        // separator guards against a prefix-collision attack
-        // (`/a/b-evil` vs `/a/b`).
-        if (absPath !== allowRoot && !absPath.startsWith(allowRoot + '/')) {
+        // Reject symlinks outright before realpath: the supplied path must
+        // point directly at a regular file. A symlink whose TARGET is inside
+        // the allow root would pass realpath containment but is a more
+        // surprising input vector than necessary — and a symlink whose target
+        // moves between lstat and read is a TOCTOU primitive we don't need to
+        // accept. lstat (NOT stat) so we see the link itself, not its target.
+        let lstat
+        try {
+          lstat = lstatSync(absPath)
+        } catch (err) {
+          throw new Error(`attachment.path not found: ${absPath} (${(err as Error).message})`)
+        }
+        if (lstat.isSymbolicLink()) {
+          throw new Error(`attachment.path must not be a symlink: ${absPath}`)
+        }
+        // Containment via realpath: resolve the full chain (including any
+        // symlinks in PARENT directories) and compare against the realpath of
+        // the allow root. This closes the symlink-escape hole left by the
+        // pre-realpath pathResolve.startsWith check, where a malicious entry
+        // inside the allow root could point at /etc/shadow and be uploaded.
+        let absPathReal: string
+        try {
+          absPathReal = realpathSync(absPath)
+        } catch (err) {
+          throw new Error(`attachment.path not found: ${absPath} (${(err as Error).message})`)
+        }
+        if (absPathReal !== allowRootReal && !absPathReal.startsWith(allowRootReal + '/')) {
           throw new Error(
-            `attachment.path outside TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT (${allowRoot}): ${absPath}`,
+            `attachment.path resolves outside TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT ` +
+              `(${allowRootReal}): ${absPath} -> ${absPathReal}`,
           )
         }
+        // statSync on the realpath is now safe (containment proven, lstat
+        // already confirmed the supplied entry isn't a link).
         let stat
         try {
-          stat = statSync(absPath)
+          stat = statSync(absPathReal)
         } catch (err) {
           throw new Error(`attachment.path not found: ${absPath} (${(err as Error).message})`)
         }
@@ -1227,7 +1366,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         if (isCardContentType(ct)) {
           throw new Error(`attachment content_type is a card type (not allowed): ${ct}`)
         }
-        validated.push({ absPath, displayName: safeName, size: stat.size, contentType: ct })
+        validated.push({ absPath: absPathReal, displayName: safeName, size: stat.size, contentType: ct })
       }
 
       // Send one consent card per file. The agent's text rides on the first
@@ -1593,12 +1732,12 @@ if (CLI_SUBCOMMAND === '_smoke-record-activity' || CLI_SUBCOMMAND === '_smoke-sh
 
 // Sweep stale outbound file consents (older than 24h) on plugin start so a
 // long-lived state file doesn't accumulate unbounded pending records. Best
-// effort: a sweep failure logs but never blocks listener startup.
-try {
-  sweepOutboundConsents()
-} catch (err) {
+// effort: a sweep failure logs but never blocks listener startup. The sweep
+// runs through the per-process consent mutex so a concurrent invoke during
+// startup can't trample it.
+sweepOutboundConsents().catch(err => {
   process.stderr.write(`teams channel: outbound consent sweep failed: ${err}\n`)
-}
+})
 
 httpServer.listen(PORT, HOST, () => {
   process.stderr.write(`teams channel: listening on http://${HOST}:${PORT} (/api/messages, /auth/callback)\n`)

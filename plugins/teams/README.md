@@ -111,8 +111,8 @@ Delivery uses the Teams file consent card flow:
 
 Per-file validation:
 
-- `path` must be absolute and live under `TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT` (defaults to `<TEAMS_STATE_DIR>/outbound`). Paths outside the root are rejected so the agent cannot ship arbitrary host files.
-- Must be a regular file (no directories, symlinks, or special files).
+- `path` must be absolute and live under `TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT` (defaults to `<TEAMS_STATE_DIR>/outbound`). The supplied path is `realpath`-resolved (following parent-directory symlinks) and the resolved path must remain inside the realpath of the allow root, so a symlink chain inside the root cannot escape to arbitrary host files.
+- Must be a regular file. Symbolic links are rejected outright at the supplied path (an `lstat` check runs before `realpath`); the agent must pass the real on-disk location, not a link to it. Directories and special files are also rejected.
 - Per-file size cap via `TEAMS_OUTBOUND_ATTACHMENT_MAX_BYTES` (default 50 MB; clamped to 1 GB).
 - Display name (defaults to `basename(path)`) runs through the same sanitizer as inbound — strict allowlist.
 - Content type is inferred from the filename extension. Card types (`application/vnd.microsoft.card.*` and `application/vnd.microsoft.teams.card.*`) are rejected; the agent cannot inject adaptive cards through the attach path.
