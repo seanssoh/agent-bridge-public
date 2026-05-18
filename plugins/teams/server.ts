@@ -662,7 +662,26 @@ function resolveOutboundAllowRoot(): string {
   try {
     mkdirSync(root, { recursive: true, mode: 0o700 })
   } catch {}
-  return root
+  // r3 fix (NOTE #1): assert the resolved root is actually a directory.
+  // mkdir is a no-op if the path already exists as a regular file, and a
+  // file-valued env var would otherwise authorize that exact file as the
+  // allow root via the `=== allowRootReal` equality branch in the per-path
+  // containment check. realpath + isDirectory closes that hole.
+  let real: string
+  try {
+    real = realpathSync(root)
+  } catch (err) {
+    throw new Error(
+      `TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT does not resolve: ${root} (${(err as Error)?.message ?? err})`,
+    )
+  }
+  const s = statSync(real)
+  if (!s.isDirectory()) {
+    throw new Error(
+      `TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT must be a directory: ${root} -> ${real}`,
+    )
+  }
+  return real
 }
 
 function resolveOutboundMaxBytes(): number {
@@ -744,7 +763,11 @@ function loadOutboundConsents(): OutboundConsentStore {
       `teams channel: outbound-consents.json malformed, starting fresh: ${(err as Error)?.message ?? err}\n`,
     )
     try {
-      renameSync(OUTBOUND_CONSENTS_FILE, `${OUTBOUND_CONSENTS_FILE}.corrupt-${Date.now()}`)
+      // r3 fix: Date.now() (ms) can collide on simultaneous corruption
+      // detections (multi-process or rapid retries within the same tick).
+      // Append pid + uuid slice so each quarantine file is unique.
+      const suffix = `${Date.now()}-${process.pid}-${randomUUID().slice(0, 8)}`
+      renameSync(OUTBOUND_CONSENTS_FILE, `${OUTBOUND_CONSENTS_FILE}.corrupt-${suffix}`)
     } catch {}
     return {}
   }
@@ -903,6 +926,12 @@ async function sendFileConsentCard(
 ): Promise<string> {
   const token = randomUUID()
   const refUserAad = String((ref as any).user?.aadObjectId ?? '').trim()
+  // INVARIANT: callers pass the realpath-resolved absPath so the record pins
+  // the consent to a specific inode chain (the validation site in
+  // call_tool/reply replaces the raw user-supplied path with realpathSync's
+  // result before invoking us). handleFileConsentInvoke re-validates the
+  // stored path at upload time to catch any swap during the send→accept
+  // window — see r3 (P1 BLOCKING) fix.
   const record: OutboundConsentRecord = {
     abs_path: absPath,
     display_name: displayName,
@@ -989,7 +1018,17 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
   // card was sent, treat the token as compromised: drop it and decline. The
   // token is an unguessable uuid, but binding it to the conversation prevents
   // a leaked token from being replayed in a different chat.
-  const record = await withConsentLock(async () => {
+  //
+  // r3 (P1 BLOCKING + P2): under the same lock we ALSO re-validate the stored
+  // path (lstat + realpath + containment + size equality) and reserve the
+  // token by deleting it BEFORE releasing the lock for the PUT. Reservation
+  // closes the second-accept race against the single-use Teams upload URL;
+  // re-validation closes the consent-send→accept TOCTOU symlink-swap window.
+  // Bytes are read inside the lock too so a path swap can't race the read.
+  type LockedAccept = { kind: 'ok'; record: OutboundConsentRecord; bytes: Buffer }
+  type LockedReject = { kind: 'reject'; status: number; reason: string }
+  type LockedNone = undefined
+  const handled = await withConsentLock(async (): Promise<LockedAccept | LockedReject | LockedNone> => {
     const store = loadOutboundConsents()
     const rec = token ? store[token] : undefined
     if (!rec) return undefined
@@ -1003,23 +1042,150 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
       return undefined
     }
     const storedAad = String((rec as any).aad_object_id ?? '').trim()
-    if (storedAad && invokeAad && storedAad !== invokeAad) {
+    if (storedAad && invokeAad) {
+      if (storedAad !== invokeAad) {
+        process.stderr.write(
+          `teams channel: fileConsent aad mismatch token=${token} ` +
+            `invoke=${invokeAad} stored=${storedAad}\n`,
+        )
+        delete store[token]
+        saveOutboundConsents(store)
+        return undefined
+      }
+    } else if (storedAad || invokeAad) {
+      // r3 fix (NOTE #2): don't silently degrade — record the asymmetry so an
+      // operator notices if Teams stops sending aadObjectId on invokes (which
+      // would otherwise downgrade every check to conversation-only binding).
       process.stderr.write(
-        `teams channel: fileConsent aad mismatch token=${token} ` +
-          `invoke=${invokeAad} stored=${storedAad}\n`,
+        `teams channel: fileConsent aadObjectId bind asymmetric token=${token} ` +
+          `stored=${storedAad ? 'present' : 'absent'} invoke=${invokeAad ? 'present' : 'absent'}; ` +
+          `proceeding with conversation-only bind\n`,
+      )
+    }
+
+    // Accept-action specific work (re-validate + reserve). Decline and other
+    // actions take the existing fast path outside the lock so we don't block
+    // the mutex on path I/O for non-upload flows.
+    if (action !== 'accept') {
+      return { kind: 'ok', record: rec, bytes: Buffer.alloc(0) }
+    }
+
+    // r3 (P1 BLOCKING): re-run lstat + realpath + containment + size equality
+    // against the STORED abs_path. The stored path was already realpath-pinned
+    // at consent-send time (see sendFileConsentCard caller), but the inode
+    // chain can still be swapped under us during the send→accept window. We
+    // refuse on any of: lstat-is-symlink, realpath change, containment break,
+    // size drift, not-a-file.
+    let allowRootReal: string
+    try {
+      allowRootReal = resolveOutboundAllowRoot()
+    } catch (err) {
+      process.stderr.write(
+        `teams channel: fileConsent allow-root resolve failed token=${token}: ${(err as Error)?.message ?? err}\n`,
       )
       delete store[token]
       saveOutboundConsents(store)
-      return undefined
+      return { kind: 'reject', status: 500, reason: 'allow-root unresolved' }
     }
-    return rec
+
+    let nowReal: string
+    try {
+      const linkStat = lstatSync(rec.abs_path)
+      if (linkStat.isSymbolicLink()) {
+        process.stderr.write(
+          `teams channel: fileConsent upload-time symlink detected token=${token} path=${rec.abs_path}\n`,
+        )
+        delete store[token]
+        saveOutboundConsents(store)
+        return { kind: 'reject', status: 404, reason: 'symlink swap' }
+      }
+      nowReal = realpathSync(rec.abs_path)
+    } catch (err) {
+      process.stderr.write(
+        `teams channel: fileConsent upload-time path resolve failed token=${token}: ${(err as Error)?.message ?? err}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 404, reason: 'path unresolved' }
+    }
+
+    if (nowReal !== allowRootReal && !nowReal.startsWith(allowRootReal + '/')) {
+      process.stderr.write(
+        `teams channel: fileConsent upload-time path escaped allow root token=${token} ` +
+          `path=${nowReal} root=${allowRootReal}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 404, reason: 'escaped allow root' }
+    }
+
+    let stat
+    try {
+      stat = statSync(nowReal)
+    } catch (err) {
+      process.stderr.write(
+        `teams channel: fileConsent upload-time stat failed token=${token}: ${(err as Error)?.message ?? err}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 404, reason: 'stat failed' }
+    }
+    if (!stat.isFile()) {
+      process.stderr.write(
+        `teams channel: fileConsent upload-time path is not a regular file token=${token} path=${nowReal}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 404, reason: 'not a regular file' }
+    }
+    if (stat.size !== rec.size) {
+      // r3: size drift now refuses (was a warning). A change in size between
+      // consent and accept is also a swap signal — fail closed.
+      process.stderr.write(
+        `teams channel: fileConsent size drift token=${token} stored=${rec.size} actual=${stat.size}; refusing\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 404, reason: 'size drift' }
+    }
+
+    let bytes: Buffer
+    try {
+      bytes = readFileSync(nowReal)
+    } catch (err) {
+      process.stderr.write(
+        `teams channel: fileConsent upload-time read failed token=${token}: ${(err as Error)?.message ?? err}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 500, reason: 'read failed' }
+    }
+
+    // r3 (P2): reserve the token by deleting it INSIDE the lock before the
+    // PUT runs. A concurrent accept replay will now 404 on the lookup above
+    // rather than racing the consumed Teams upload URL with a second PUT.
+    // Failure of the PUT does NOT restore the record (the upload URL is
+    // single-use, so a retry would 4xx at Teams anyway).
+    delete store[token]
+    saveOutboundConsents(store)
+    return { kind: 'ok', record: rec, bytes }
   })
 
-  if (!record) {
+  if (!handled) {
     process.stderr.write(`teams channel: fileConsent invoke for unknown token=${token}\n`)
     await sendInvokeStatus(404)
     return
   }
+  if (handled.kind === 'reject') {
+    try {
+      await context.sendActivity(`File delivery failed: ${handled.reason}`)
+    } catch {}
+    await sendInvokeStatus(handled.status)
+    return
+  }
+
+  const record = handled.record
+  const bytes = handled.bytes
 
   if (action === 'decline') {
     await withConsentLock(async () => {
@@ -1045,32 +1211,8 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
   const uploadUrl = String(value.uploadInfo?.uploadUrl ?? '').trim()
   if (!uploadUrl) {
     process.stderr.write(`teams channel: fileConsent accept missing uploadUrl token=${token}\n`)
+    // Record is already consumed; nothing to clean up.
     await sendInvokeStatus(400)
-    return
-  }
-
-  // Re-stat the file in case it disappeared since the consent card was sent.
-  let bytes: Buffer
-  try {
-    const stat = statSync(record.abs_path)
-    if (!stat.isFile()) throw new Error('not a regular file')
-    if (stat.size !== record.size) {
-      process.stderr.write(
-        `teams channel: fileConsent size drift token=${token} stored=${record.size} actual=${stat.size}\n`,
-      )
-    }
-    bytes = readFileSync(record.abs_path)
-  } catch (err) {
-    process.stderr.write(`teams channel: fileConsent read failed token=${token}: ${err}\n`)
-    await withConsentLock(async () => {
-      const store = loadOutboundConsents()
-      delete store[token]
-      saveOutboundConsents(store)
-    })
-    try {
-      await context.sendActivity(`File delivery failed: ${record.display_name}`)
-    } catch {}
-    await sendInvokeStatus(500)
     return
   }
 
@@ -1100,12 +1242,10 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
   }
 
   if (!uploadOk) {
+    // Token was already reserved (deleted) inside the consent lock — a retry
+    // 404s rather than re-PUTting against the now-consumed upload URL. See
+    // r3 (P2) note on handleFileConsentInvoke.
     process.stderr.write(`teams channel: fileConsent upload failed token=${token}: ${uploadErr}\n`)
-    await withConsentLock(async () => {
-      const store = loadOutboundConsents()
-      delete store[token]
-      saveOutboundConsents(store)
-    })
     try {
       await context.sendActivity(`File upload failed: ${record.display_name}`)
     } catch {}
@@ -1134,11 +1274,7 @@ async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
     process.stderr.write(`teams channel: fileInfo post failed (upload succeeded): ${err}\n`)
   }
 
-  await withConsentLock(async () => {
-    const store = loadOutboundConsents()
-    delete store[token]
-    saveOutboundConsents(store)
-  })
+  // Token already reserved (deleted) inside the consent lock — no cleanup needed.
   await sendInvokeStatus(200)
 }
 
