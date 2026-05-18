@@ -955,6 +955,16 @@ function buildChannelMeta(
  * operator has opted into queue-only delivery and silent loss is preferable
  * to retry storms when the queue itself is unhealthy.
  */
+function truncateForTitle(s: string, maxCodepoints: number): string {
+  // String.slice operates on UTF-16 code units, which splits surrogate pairs
+  // (any non-BMP character — most emoji, CJK extensions, etc.) and leaves a
+  // lone surrogate. Spread iterates by Unicode codepoint, so the slice
+  // boundary always falls on a complete character.
+  const codepoints = [...s]
+  if (codepoints.length <= maxCodepoints) return s
+  return codepoints.slice(0, maxCodepoints - 1).join('') + '…'
+}
+
 function deliverViaBridgeQueue(
   activity: Activity,
   stored: StoredMessage,
@@ -991,6 +1001,9 @@ function deliverViaBridgeQueue(
     writeFileSync(bodyFile, body, { mode: 0o600, flag: 'wx' })
   } catch (err) {
     process.stderr.write(`teams channel: bridge-mode delivery skipped — could not write body file: ${err}, message_id=${stored.message_id}\n`)
+    // Mirror the success-path finally: drop the file (may exist as a partial
+    // write) before rmdir so a non-empty dir doesn't leak both artifacts.
+    try { unlinkSync(bodyFile) } catch {}
     try { rmdirSync(bodyDir) } catch {}
     return
   }
@@ -1000,7 +1013,7 @@ function deliverViaBridgeQueue(
   // row. Single ellipsis at the end keeps the truncation obvious.
   const TITLE_MAX = 120
   const rawTitle = `[teams] ${stored.user || 'user'}: ${stored.text || '(attachment)'}`
-  const title = rawTitle.length > TITLE_MAX ? rawTitle.slice(0, TITLE_MAX - 1) + '…' : rawTitle
+  const title = truncateForTitle(rawTitle, TITLE_MAX)
   try {
     const r = spawnSync(
       'bash',
