@@ -6,6 +6,32 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.4] — 2026-05-18
+
+### Highlight — Teams plugin: bidirectional file attachments (Phase 1)
+
+Operator-cued single-PR patch release. Adds bidirectional file attachment support to the Microsoft Teams channel plugin (`plugins/teams/`), closing issue #957. 1 PR (#958), 3-round codex pair-review chain.
+
+### Operator-visible
+
+- **Inbound attachments** — Teams attachments with general-file content types (PDF, DOCX, ZIP, octet-stream, images, audio, video, plain text, etc.) now download to `<TEAMS_STATE_DIR>/attachments/<message_id>/<filename>` and surface in the channel notification meta `attachments` array, the same way `image/*` and Teams-native file picker uploads already did. Adaptive cards and other Teams card content types (`application/vnd.microsoft.card.*`, `application/vnd.microsoft.teams.card.*`) remain `skipped_non_file` by design — operator scope is "general files only".
+- **Outbound attachments** — the `reply` MCP tool now accepts an optional `attachments` array of `{path, name?}` objects. Personal-chat only (Phase 1). Files are delivered via the Teams file consent card flow: the bot sends a consent card, the user clicks Accept, the bot uploads to the URL Teams provides, and Teams attaches the file in the conversation. Group / channel outbound is deferred to Phase 2 (requires SharePoint upload via Microsoft Graph); group-chat invocations return a structured `attachments_not_supported_in_groupchat` error so the agent can fall back to text-only.
+- Defaults: 50 MB per file (clamped to 1 GB via `TEAMS_OUTBOUND_ATTACHMENT_MAX_BYTES` env), 10 attachments per message. Outbound allow root defaults to `${TEAMS_STATE_DIR}/outbound` and can be overridden via `TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT`.
+
+### Security hardening (caught during codex pair-review)
+
+The 3-round chain surfaced and fixed several classes of attack surface before merge:
+
+- **Symlink escape at consent time and at upload time** — both the allow-root containment check and the upload-time read now `realpath`-resolve the supplied path and `lstat`-reject symbolic links outright. Stored record holds the realpath-pinned inode chain; upload-time re-validates inside the consent lock against the live filesystem state. Size drift since consent now refuses the upload (was a warning in an earlier round).
+- **Consent-store race condition** — per-process promise-chain mutex serializes every load-mutate-save sequence on `outbound-consents.json`. Token is reserved (deleted from store + persisted) INSIDE the lock BEFORE the PUT begins, so a concurrent accept-replay during a slow upload hits the 404 path instead of attempting a second PUT to the single-use upload URL.
+- **Token-to-conversation binding** — invoke handler now verifies `activity.conversation.id` matches the stored `conversation_id` and (when both sides populate it) `activity.from.aadObjectId` matches the stored `aad_object_id`. Asymmetric aad state (one side present, the other absent) logs a stderr warning before proceeding with conversation-only bind. Mismatch drops the consent record as compromised.
+- **Allow-root sanity** — `resolveOutboundAllowRoot` asserts the resolved path is a directory (`statSync.isDirectory()` after realpath); a file-valued env override is rejected at first use with both the original and resolved paths in the error.
+- **Corrupt state file recovery** — malformed `outbound-consents.json` is renamed to `outbound-consents.json.corrupt-<epoch_ms>-<pid>-<uuid8>` (collision-resistant) and logged to stderr; the plugin starts with a fresh store rather than crashing or silently overwriting evidence.
+
+### Docs
+
+- `plugins/teams/README.md`: updated `Tools` section to document the optional `attachments` parameter; added a new `Outbound Attachments` section paralleling the existing `Inbound Attachments` documentation; removed the "outbound not implemented" disclaimer.
+
 ## [0.14.3] — 2026-05-18
 
 ### Highlight — daemon-hang root-cause wave (#946 5-layer fix) + dynamic launch UX fix + Phase 1 footgun #11 ratchet infrastructure
