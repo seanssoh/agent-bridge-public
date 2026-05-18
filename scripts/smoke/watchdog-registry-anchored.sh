@@ -276,4 +276,100 @@ assert rows["baz"]["status"] == "error", rows["baz"]
 assert payload["problem_count"] == 1, f"expected 1 problem (baz drift), got {payload['problem_count']}"
 PY
 
+# --- C8: engine-aware profile check for codex agents (#905) -------------
+# Refs issue #905: the watchdog used to assert CLAUDE.md / SOUL.md / etc.
+# on every agent regardless of engine, so codex agents (which don't read
+# any of those files) surfaced as `status=error` with every Claude
+# profile file marked missing. With the engine-aware required-file
+# selector, codex agents with no Claude profile files classify as `ok`
+# and do NOT contribute to problem_count — so the daemon no longer emits
+# admin-inbox profile-drift tasks for codex agents.
+smoke_log "C8: codex agent without Claude-profile files classifies ok (#905)"
+C8_ROOT="$SMOKE_TMP_ROOT/c8-agents"
+mkdir -p "$C8_ROOT/codex-only"
+# Intentionally bare — no CLAUDE.md / SOUL.md / SESSION-TYPE.md / etc.
+C8_REGISTRY="$SMOKE_TMP_ROOT/c8-registry.json"
+cat >"$C8_REGISTRY" <<'EOF'
+[
+  {"id": "codex-only", "class": "static", "agent_source": "static", "engine": "codex"}
+]
+EOF
+C8_JSON="$(run_watchdog scan --json --agent-home-root "$C8_ROOT" --agent-registry-json "$C8_REGISTRY")"
+"$PY_BIN" - "$C8_JSON" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+rows = {row["agent"]: row for row in payload["agents"]}
+assert "codex-only" in rows, rows
+row = rows["codex-only"]
+assert row["engine"] == "codex", row
+assert row["missing_files"] == [], f"codex must not assert Claude profile files: {row['missing_files']}"
+assert row["missing_managed_claude_block"] is False, row
+assert row["status"] == "ok", f"codex agent should classify ok, got {row['status']}"
+assert payload["problem_count"] == 0, payload["problem_count"]
+PY
+
+# --- C9: dynamic-agent fresh-state suppression (#907) -------------------
+# Refs issue #907: a freshly-provisioned dynamic agent (e.g. `librarian`)
+# lands with `onboarding_state: pending` + `missing_managed_claude_block:
+# yes`. The watchdog used to emit a high-priority admin-inbox
+# profile-drift task on every cycle for that fresh-provision default
+# even though admin has no authority to resolve dynamic-agent state
+# (ADMIN-PROTOCOL static/dynamic boundary; #303/#304/#343 anti-pattern).
+# After the fix, the same agent shape classifies as `ok` and never
+# contributes to problem_count. Broken-link drift on the same dynamic
+# agent still surfaces as `warn` so real issues are not silenced.
+smoke_log "C9: dynamic agent with fresh-provision defaults classifies ok (#907)"
+C9_ROOT="$SMOKE_TMP_ROOT/c9-agents"
+LIB_DIR="$C9_ROOT/librarian"
+mkdir -p "$LIB_DIR"
+# Fresh-provision shape: required files present, but CLAUDE.md lacks the
+# managed block (first run will install it).
+cat >"$LIB_DIR/CLAUDE.md" <<'EOF'
+# librarian
+(empty profile — to be filled in on first run)
+EOF
+: >"$LIB_DIR/SOUL.md"
+: >"$LIB_DIR/MEMORY-SCHEMA.md"
+: >"$LIB_DIR/MEMORY.md"
+cat >"$LIB_DIR/SESSION-TYPE.md" <<'EOF'
+# Session Type
+
+- Session Type: dynamic
+- Onboarding State: pending
+EOF
+C9_REGISTRY="$SMOKE_TMP_ROOT/c9-registry.json"
+cat >"$C9_REGISTRY" <<'EOF'
+[
+  {"id": "librarian", "class": "dynamic", "agent_source": "dynamic", "engine": "claude"}
+]
+EOF
+C9_JSON="$(run_watchdog scan --json --agent-home-root "$C9_ROOT" --agent-registry-json "$C9_REGISTRY")"
+"$PY_BIN" - "$C9_JSON" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+rows = {row["agent"]: row for row in payload["agents"]}
+row = rows["librarian"]
+assert row["agent_source"] == "dynamic", row
+assert row["missing_managed_claude_block"] is True, row  # field is preserved
+assert row["status"] == "ok", f"fresh-provision dynamic should be ok, got {row['status']}"
+assert payload["problem_count"] == 0, payload["problem_count"]
+PY
+
+# Sanity: actual drift on the dynamic agent (broken symlink) still warns
+# even though missing_block alone is suppressed — the #907 fix targets
+# the fresh-provision default only.
+smoke_log "C9b: dynamic agent with broken symlink still warns (no silent-drop)"
+ln -s /nonexistent/target "$LIB_DIR/dangler"
+C9B_JSON="$(run_watchdog scan --json --agent-home-root "$C9_ROOT" --agent-registry-json "$C9_REGISTRY")"
+"$PY_BIN" - "$C9B_JSON" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+rows = {row["agent"]: row for row in payload["agents"]}
+row = rows["librarian"]
+assert row["broken_links"], f"broken_links must surface: {row}"
+assert row["status"] == "warn", f"actual drift on dynamic must warn, got {row['status']}"
+assert payload["problem_count"] == 1, payload["problem_count"]
+PY
+rm -f "$LIB_DIR/dangler"
+
 smoke_log "PASS"
