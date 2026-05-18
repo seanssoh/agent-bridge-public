@@ -24,14 +24,17 @@ import {
   chmodSync,
   constants as fsConstants,
   existsSync,
+  lstatSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from 'fs'
 import { homedir } from 'os'
-import { isAbsolute as pathIsAbsolute, join, resolve as pathResolve } from 'path'
+import { basename, isAbsolute as pathIsAbsolute, join, resolve as pathResolve } from 'path'
 import { createRecentMessageDeduper, storedRowMatchesIncoming } from './dedupe.ts'
 
 type GroupPolicy = {
@@ -135,6 +138,11 @@ function resolveAttachmentMaxBytes(): number {
 const ATTACHMENTS_DIR = resolveAttachmentsDir()
 const ATTACHMENT_MAX_BYTES = resolveAttachmentMaxBytes()
 const TEAMS_FILE_DOWNLOAD_TYPE = 'application/vnd.microsoft.teams.file.download.info'
+const TEAMS_FILE_CONSENT_CARD_TYPE = 'application/vnd.microsoft.teams.card.file.consent'
+const TEAMS_FILE_INFO_CARD_TYPE = 'application/vnd.microsoft.teams.card.file.info'
+const OUTBOUND_CONSENT_TTL_MS = 24 * 60 * 60 * 1000 // 24h
+const OUTBOUND_MAX_ATTACHMENTS_PER_MESSAGE = 10
+const OUTBOUND_CONSENTS_FILE = join(STATE_DIR, 'outbound-consents.json')
 const MS365_CALLBACK_DIR =
   process.env.MS365_CALLBACK_SHARED_DIR ?? join(BRIDGE_HOME, 'shared', 'ms365-callbacks')
 
@@ -564,6 +572,233 @@ async function streamDownload(
   }
 }
 
+// Cards (adaptive, hero, signin, file consent, …) are explicitly NOT general
+// files. They live under application/vnd.microsoft.card.* and
+// application/vnd.microsoft.teams.card.*. Inbound download skips them and
+// outbound delivery rejects them (operator scope: "general files only").
+function isCardContentType(ct: string): boolean {
+  return (
+    ct.startsWith('application/vnd.microsoft.card.') ||
+    ct.startsWith('application/vnd.microsoft.teams.card.')
+  )
+}
+
+// Inbound allowlist: image/*, audio/*, video/*, text/*, and any
+// application/* that is NOT a card. Covers PDF, DOCX, ZIP, octet-stream,
+// plain text, etc. Matches the "general files only" scope from #957.
+function isGeneralFileContentType(ct: string): boolean {
+  if (!ct) return false
+  if (isCardContentType(ct)) return false
+  if (ct.startsWith('image/')) return true
+  if (ct.startsWith('audio/')) return true
+  if (ct.startsWith('video/')) return true
+  if (ct.startsWith('text/')) return true
+  if (ct.startsWith('application/')) return true
+  return false
+}
+
+// Minimal mime map for outbound attachments. We infer from the sanitized
+// filename because Teams' file consent card flow expects a content type in
+// the FileInfoCard payload, and agents are not asked to specify one. Anything
+// not matched falls through to application/octet-stream (Teams accepts that
+// for arbitrary binary downloads).
+const OUTBOUND_MIME_BY_EXT: Record<string, string> = {
+  '.pdf': 'application/pdf',
+  '.txt': 'text/plain',
+  '.md': 'text/markdown',
+  '.csv': 'text/csv',
+  '.json': 'application/json',
+  '.xml': 'application/xml',
+  '.html': 'text/html',
+  '.htm': 'text/html',
+  '.zip': 'application/zip',
+  '.gz': 'application/gzip',
+  '.tar': 'application/x-tar',
+  '.doc': 'application/msword',
+  '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  '.xls': 'application/vnd.ms-excel',
+  '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  '.ppt': 'application/vnd.ms-powerpoint',
+  '.pptx': 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.svg': 'image/svg+xml',
+  '.mp3': 'audio/mpeg',
+  '.wav': 'audio/wav',
+  '.mp4': 'video/mp4',
+  '.mov': 'video/quicktime',
+}
+
+function inferContentType(filename: string): string {
+  const lower = filename.toLowerCase()
+  const dot = lower.lastIndexOf('.')
+  if (dot < 0) return 'application/octet-stream'
+  const ext = lower.slice(dot)
+  return OUTBOUND_MIME_BY_EXT[ext] ?? 'application/octet-stream'
+}
+
+// Outbound attachments must live under an allowlist root so a compromised or
+// confused agent cannot leak arbitrary host files (e.g. ~/.ssh/id_rsa) by
+// passing an absolute path to `reply`. Default root is per-plugin under
+// STATE_DIR; operator can override with TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT.
+function resolveOutboundAllowRoot(): string {
+  const override = process.env.TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT
+  let root: string
+  if (override) {
+    if (!pathIsAbsolute(override)) {
+      process.stderr.write(
+        `teams channel: TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT not absolute, using default\n`,
+      )
+      root = pathResolve(STATE_DIR, 'outbound')
+    } else {
+      root = pathResolve(override)
+    }
+  } else {
+    root = pathResolve(STATE_DIR, 'outbound')
+  }
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 })
+  } catch {}
+  // r3 fix (NOTE #1): assert the resolved root is actually a directory.
+  // mkdir is a no-op if the path already exists as a regular file, and a
+  // file-valued env var would otherwise authorize that exact file as the
+  // allow root via the `=== allowRootReal` equality branch in the per-path
+  // containment check. realpath + isDirectory closes that hole.
+  let real: string
+  try {
+    real = realpathSync(root)
+  } catch (err) {
+    throw new Error(
+      `TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT does not resolve: ${root} (${(err as Error)?.message ?? err})`,
+    )
+  }
+  const s = statSync(real)
+  if (!s.isDirectory()) {
+    throw new Error(
+      `TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT must be a directory: ${root} -> ${real}`,
+    )
+  }
+  return real
+}
+
+function resolveOutboundMaxBytes(): number {
+  const DEFAULT_MAX = 50 * 1024 * 1024 // 50 MB
+  const CEILING = 1024 * 1024 * 1024 // 1 GB sanity ceiling
+  const raw = process.env.TEAMS_OUTBOUND_ATTACHMENT_MAX_BYTES
+  if (!raw) return DEFAULT_MAX
+  const n = Number(raw)
+  if (!Number.isFinite(n) || n <= 0) {
+    process.stderr.write(
+      `teams channel: TEAMS_OUTBOUND_ATTACHMENT_MAX_BYTES invalid, using default ${DEFAULT_MAX}\n`,
+    )
+    return DEFAULT_MAX
+  }
+  if (n > CEILING) {
+    process.stderr.write(
+      `teams channel: TEAMS_OUTBOUND_ATTACHMENT_MAX_BYTES exceeds ceiling ${CEILING}, using ceiling\n`,
+    )
+    return CEILING
+  }
+  return Math.floor(n)
+}
+
+// Pending outbound file consent state. Persisted under STATE_DIR so a plugin
+// restart between "agent calls reply with attachments" and "user accepts
+// consent card" can still complete the upload.
+type OutboundConsentRecord = {
+  abs_path: string
+  display_name: string
+  size: number
+  content_type: string
+  agent_message: string
+  created_at: string
+  conversation_id: string
+  chat_id: string
+  // Defense-in-depth: bind the consent token to the user the card was sent to
+  // (the ConversationReference's user.aadObjectId, when Teams populates it).
+  // The invoke handler rejects mismatches so a leaked token can't be replayed
+  // by another user even if Teams' threading model changes in the future.
+  // Empty string means we never had the field (older record or non-Teams ref).
+  aad_object_id?: string
+}
+
+type OutboundConsentStore = Record<string, OutboundConsentRecord>
+
+// Per-process serialization for consent-store mutations. Two concurrent
+// fileConsent/invoke handlers (or an invoke racing the startup TTL sweep) used
+// to read → mutate → save in parallel, so the second writer could resurrect
+// the token the first writer had just deleted. JS is single-threaded but the
+// awaited Teams upload PUT in handleFileConsentInvoke yields the event loop
+// long enough for a sibling invoke to interleave. The mutex is per-process:
+// the on-disk atomic rename in saveOutboundConsents protects against
+// cross-process tearing (which shouldn't happen — STATE_DIR is per-agent —
+// but is cheap defense-in-depth).
+let consentMutex: Promise<void> = Promise.resolve()
+async function withConsentLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = consentMutex
+  let release: () => void = () => {}
+  consentMutex = new Promise<void>(resolve => {
+    release = resolve
+  })
+  await previous
+  try {
+    return await fn()
+  } finally {
+    release()
+  }
+}
+
+function loadOutboundConsents(): OutboundConsentStore {
+  if (!existsSync(OUTBOUND_CONSENTS_FILE)) return {}
+  try {
+    return JSON.parse(readFileSync(OUTBOUND_CONSENTS_FILE, 'utf8')) as OutboundConsentStore
+  } catch (err) {
+    // Noisy log + rename-aside rather than silent fresh-start: a malformed
+    // consent file means an in-flight upload's pending record is gone, and
+    // operators need to know the file was quarantined for postmortem.
+    process.stderr.write(
+      `teams channel: outbound-consents.json malformed, starting fresh: ${(err as Error)?.message ?? err}\n`,
+    )
+    try {
+      // r3 fix: Date.now() (ms) can collide on simultaneous corruption
+      // detections (multi-process or rapid retries within the same tick).
+      // Append pid + uuid slice so each quarantine file is unique.
+      const suffix = `${Date.now()}-${process.pid}-${randomUUID().slice(0, 8)}`
+      renameSync(OUTBOUND_CONSENTS_FILE, `${OUTBOUND_CONSENTS_FILE}.corrupt-${suffix}`)
+    } catch {}
+    return {}
+  }
+}
+
+function saveOutboundConsents(store: OutboundConsentStore): void {
+  // saveJson already does atomic tempfile + rename with mode 0600, so this
+  // delegates to the shared helper.
+  saveJson(OUTBOUND_CONSENTS_FILE, store)
+}
+
+function sweepOutboundConsentsLocked(): void {
+  const store = loadOutboundConsents()
+  const now = Date.now()
+  let mutated = false
+  for (const [token, rec] of Object.entries(store)) {
+    const ts = Date.parse(rec.created_at)
+    if (!Number.isFinite(ts) || now - ts > OUTBOUND_CONSENT_TTL_MS) {
+      delete store[token]
+      mutated = true
+    }
+  }
+  if (mutated) saveOutboundConsents(store)
+}
+
+async function sweepOutboundConsents(): Promise<void> {
+  await withConsentLock(async () => {
+    sweepOutboundConsentsLocked()
+  })
+}
+
 async function downloadAttachments(
   activity: Activity,
   messageId: string,
@@ -586,10 +821,17 @@ async function downloadAttachments(
     }
     let downloadUrl = ''
     if (contentType === TEAMS_FILE_DOWNLOAD_TYPE) {
+      // Teams native file picker — downloadUrl lives inside content.
       const content = ((att as any).content ?? {}) as { downloadUrl?: string }
       downloadUrl = String(content.downloadUrl ?? '').trim() || String((att as any).contentUrl ?? '').trim()
-    } else if (contentType.startsWith('image/')) {
-      downloadUrl = String((att as any).contentUrl ?? '').trim()
+    } else if (isGeneralFileContentType(contentType)) {
+      // Generic file (PDF/DOCX/octet-stream/image/etc) from drag-drop, paste,
+      // or external integrations. contentUrl is the common case; fall back to
+      // content.downloadUrl which some Teams clients use for drag-drop. Cards
+      // and unknown types fall through to skipped_non_file (existing
+      // behavior).
+      const content = ((att as any).content ?? {}) as { downloadUrl?: string }
+      downloadUrl = String((att as any).contentUrl ?? '').trim() || String(content.downloadUrl ?? '').trim()
     }
     if (!downloadUrl) {
       results.push(stored)
@@ -658,6 +900,384 @@ function recentMessages(chatId: string, limit: number): StoredMessage[] {
   return rows.slice(-Math.max(1, Math.min(limit, 100)))
 }
 
+/**
+ * Send a Teams file consent card for one outbound file. Teams renders a card
+ * in the conversation; when the user clicks Accept, the bot receives a
+ * `fileConsent/invoke` activity with an upload URL. The bot PUTs file bytes
+ * to that URL, then posts a fileInfo card so the user can open the upload.
+ *
+ * We store a record keyed by a server-generated token in the acceptContext;
+ * the invoke handler looks the token up to find the abs_path on disk.
+ * Persisting through STATE_DIR means a plugin restart between the consent
+ * card send and the user accept doesn't strand the upload.
+ *
+ * `text` is only sent on the first card (per-message) so the user sees the
+ * agent's message once, not repeated per attachment. The caller is
+ * responsible for passing '' on subsequent attachments in the same message.
+ */
+async function sendFileConsentCard(
+  ref: ConversationReference,
+  chatId: string,
+  absPath: string,
+  displayName: string,
+  size: number,
+  contentType: string,
+  agentMessage: string,
+): Promise<string> {
+  const token = randomUUID()
+  const refUserAad = String((ref as any).user?.aadObjectId ?? '').trim()
+  // INVARIANT: callers pass the realpath-resolved absPath so the record pins
+  // the consent to a specific inode chain (the validation site in
+  // call_tool/reply replaces the raw user-supplied path with realpathSync's
+  // result before invoking us). handleFileConsentInvoke re-validates the
+  // stored path at upload time to catch any swap during the send→accept
+  // window — see r3 (P1 BLOCKING) fix.
+  const record: OutboundConsentRecord = {
+    abs_path: absPath,
+    display_name: displayName,
+    size,
+    content_type: contentType,
+    agent_message: agentMessage,
+    created_at: new Date().toISOString(),
+    conversation_id: String((ref as any).conversation?.id ?? ''),
+    chat_id: chatId,
+    ...(refUserAad ? { aad_object_id: refUserAad } : {}),
+  }
+  await withConsentLock(async () => {
+    const store = loadOutboundConsents()
+    store[token] = record
+    saveOutboundConsents(store)
+  })
+
+  await adapter.continueConversation(ref, async context => {
+    const consentAttachment = {
+      contentType: TEAMS_FILE_CONSENT_CARD_TYPE,
+      name: displayName,
+      content: {
+        description: agentMessage || `File from Agent Bridge: ${displayName}`,
+        sizeInBytes: size,
+        acceptContext: { token },
+        declineContext: { token },
+      },
+    }
+    const activity: Partial<Activity> = {
+      type: ActivityTypes.Message,
+      attachments: [consentAttachment as any],
+    }
+    if (agentMessage) {
+      activity.text = agentMessage
+    }
+    await context.sendActivity(activity)
+  })
+
+  return token
+}
+
+/**
+ * Handle a `fileConsent/invoke` activity from Teams. The activity.value is a
+ * FileConsentCardResponse: action (accept/decline), context (our token), and
+ * — on accept — uploadInfo with uploadUrl. On accept we PUT the file bytes
+ * to the upload URL, then post a follow-up message with a fileInfo card
+ * pointing at the uploaded blob. On decline we drop the pending record and
+ * post a small text reply.
+ *
+ * Returns an InvokeResponse status to be cached on context.turnState so
+ * BotFrameworkAdapter.processActivity can write it back to Teams. Any error
+ * is logged and surfaced as status=500 — Teams will not retry consent
+ * invokes; the consent card stays clickable until it expires.
+ */
+async function handleFileConsentInvoke(context: TurnContext): Promise<void> {
+  const activity = context.activity
+  const value = ((activity as any).value ?? {}) as {
+    action?: string
+    context?: { token?: string }
+    uploadInfo?: {
+      uploadUrl?: string
+      contentUrl?: string
+      uniqueId?: string
+      name?: string
+      fileType?: string
+    }
+  }
+  const action = String(value.action ?? '').trim()
+  const token = String(value.context?.token ?? '').trim()
+  const invokeConvId = String(activity.conversation?.id ?? '').trim()
+  const invokeAad = String((activity.from as any)?.aadObjectId ?? '').trim()
+
+  // Tell BotFrameworkAdapter the invoke status to write back. Status 200 +
+  // empty body is the Bot Framework convention for "consent handled".
+  const sendInvokeStatus = async (status: number) => {
+    await context.sendActivity({
+      type: 'invokeResponse',
+      value: { status, body: {} },
+    } as any)
+  }
+
+  // Look up the record under the lock. If the conversation id (or aadObjectId,
+  // when present on both sides) doesn't match what we recorded when the consent
+  // card was sent, treat the token as compromised: drop it and decline. The
+  // token is an unguessable uuid, but binding it to the conversation prevents
+  // a leaked token from being replayed in a different chat.
+  //
+  // r3 (P1 BLOCKING + P2): under the same lock we ALSO re-validate the stored
+  // path (lstat + realpath + containment + size equality) and reserve the
+  // token by deleting it BEFORE releasing the lock for the PUT. Reservation
+  // closes the second-accept race against the single-use Teams upload URL;
+  // re-validation closes the consent-send→accept TOCTOU symlink-swap window.
+  // Bytes are read inside the lock too so a path swap can't race the read.
+  type LockedAccept = { kind: 'ok'; record: OutboundConsentRecord; bytes: Buffer }
+  type LockedReject = { kind: 'reject'; status: number; reason: string }
+  type LockedNone = undefined
+  const handled = await withConsentLock(async (): Promise<LockedAccept | LockedReject | LockedNone> => {
+    const store = loadOutboundConsents()
+    const rec = token ? store[token] : undefined
+    if (!rec) return undefined
+    if (rec.conversation_id && invokeConvId && invokeConvId !== rec.conversation_id) {
+      process.stderr.write(
+        `teams channel: fileConsent conversation mismatch token=${token} ` +
+          `invoke=${invokeConvId} stored=${rec.conversation_id}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return undefined
+    }
+    const storedAad = String((rec as any).aad_object_id ?? '').trim()
+    if (storedAad && invokeAad) {
+      if (storedAad !== invokeAad) {
+        process.stderr.write(
+          `teams channel: fileConsent aad mismatch token=${token} ` +
+            `invoke=${invokeAad} stored=${storedAad}\n`,
+        )
+        delete store[token]
+        saveOutboundConsents(store)
+        return undefined
+      }
+    } else if (storedAad || invokeAad) {
+      // r3 fix (NOTE #2): don't silently degrade — record the asymmetry so an
+      // operator notices if Teams stops sending aadObjectId on invokes (which
+      // would otherwise downgrade every check to conversation-only binding).
+      process.stderr.write(
+        `teams channel: fileConsent aadObjectId bind asymmetric token=${token} ` +
+          `stored=${storedAad ? 'present' : 'absent'} invoke=${invokeAad ? 'present' : 'absent'}; ` +
+          `proceeding with conversation-only bind\n`,
+      )
+    }
+
+    // Accept-action specific work (re-validate + reserve). Decline and other
+    // actions take the existing fast path outside the lock so we don't block
+    // the mutex on path I/O for non-upload flows.
+    if (action !== 'accept') {
+      return { kind: 'ok', record: rec, bytes: Buffer.alloc(0) }
+    }
+
+    // r3 (P1 BLOCKING): re-run lstat + realpath + containment + size equality
+    // against the STORED abs_path. The stored path was already realpath-pinned
+    // at consent-send time (see sendFileConsentCard caller), but the inode
+    // chain can still be swapped under us during the send→accept window. We
+    // refuse on any of: lstat-is-symlink, realpath change, containment break,
+    // size drift, not-a-file.
+    let allowRootReal: string
+    try {
+      allowRootReal = resolveOutboundAllowRoot()
+    } catch (err) {
+      process.stderr.write(
+        `teams channel: fileConsent allow-root resolve failed token=${token}: ${(err as Error)?.message ?? err}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 500, reason: 'allow-root unresolved' }
+    }
+
+    let nowReal: string
+    try {
+      const linkStat = lstatSync(rec.abs_path)
+      if (linkStat.isSymbolicLink()) {
+        process.stderr.write(
+          `teams channel: fileConsent upload-time symlink detected token=${token} path=${rec.abs_path}\n`,
+        )
+        delete store[token]
+        saveOutboundConsents(store)
+        return { kind: 'reject', status: 404, reason: 'symlink swap' }
+      }
+      nowReal = realpathSync(rec.abs_path)
+    } catch (err) {
+      process.stderr.write(
+        `teams channel: fileConsent upload-time path resolve failed token=${token}: ${(err as Error)?.message ?? err}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 404, reason: 'path unresolved' }
+    }
+
+    if (nowReal !== allowRootReal && !nowReal.startsWith(allowRootReal + '/')) {
+      process.stderr.write(
+        `teams channel: fileConsent upload-time path escaped allow root token=${token} ` +
+          `path=${nowReal} root=${allowRootReal}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 404, reason: 'escaped allow root' }
+    }
+
+    let stat
+    try {
+      stat = statSync(nowReal)
+    } catch (err) {
+      process.stderr.write(
+        `teams channel: fileConsent upload-time stat failed token=${token}: ${(err as Error)?.message ?? err}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 404, reason: 'stat failed' }
+    }
+    if (!stat.isFile()) {
+      process.stderr.write(
+        `teams channel: fileConsent upload-time path is not a regular file token=${token} path=${nowReal}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 404, reason: 'not a regular file' }
+    }
+    if (stat.size !== rec.size) {
+      // r3: size drift now refuses (was a warning). A change in size between
+      // consent and accept is also a swap signal — fail closed.
+      process.stderr.write(
+        `teams channel: fileConsent size drift token=${token} stored=${rec.size} actual=${stat.size}; refusing\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 404, reason: 'size drift' }
+    }
+
+    let bytes: Buffer
+    try {
+      bytes = readFileSync(nowReal)
+    } catch (err) {
+      process.stderr.write(
+        `teams channel: fileConsent upload-time read failed token=${token}: ${(err as Error)?.message ?? err}\n`,
+      )
+      delete store[token]
+      saveOutboundConsents(store)
+      return { kind: 'reject', status: 500, reason: 'read failed' }
+    }
+
+    // r3 (P2): reserve the token by deleting it INSIDE the lock before the
+    // PUT runs. A concurrent accept replay will now 404 on the lookup above
+    // rather than racing the consumed Teams upload URL with a second PUT.
+    // Failure of the PUT does NOT restore the record (the upload URL is
+    // single-use, so a retry would 4xx at Teams anyway).
+    delete store[token]
+    saveOutboundConsents(store)
+    return { kind: 'ok', record: rec, bytes }
+  })
+
+  if (!handled) {
+    process.stderr.write(`teams channel: fileConsent invoke for unknown token=${token}\n`)
+    await sendInvokeStatus(404)
+    return
+  }
+  if (handled.kind === 'reject') {
+    try {
+      await context.sendActivity(`File delivery failed: ${handled.reason}`)
+    } catch {}
+    await sendInvokeStatus(handled.status)
+    return
+  }
+
+  const record = handled.record
+  const bytes = handled.bytes
+
+  if (action === 'decline') {
+    await withConsentLock(async () => {
+      const store = loadOutboundConsents()
+      delete store[token]
+      saveOutboundConsents(store)
+    })
+    try {
+      await context.sendActivity(`File delivery declined: ${record.display_name}`)
+    } catch (err) {
+      process.stderr.write(`teams channel: decline reply failed: ${err}\n`)
+    }
+    await sendInvokeStatus(200)
+    return
+  }
+
+  if (action !== 'accept') {
+    process.stderr.write(`teams channel: fileConsent unknown action=${action}\n`)
+    await sendInvokeStatus(400)
+    return
+  }
+
+  const uploadUrl = String(value.uploadInfo?.uploadUrl ?? '').trim()
+  if (!uploadUrl) {
+    process.stderr.write(`teams channel: fileConsent accept missing uploadUrl token=${token}\n`)
+    // Record is already consumed; nothing to clean up.
+    await sendInvokeStatus(400)
+    return
+  }
+
+  // Teams upload protocol: PUT with Content-Range covering the whole file.
+  // For a single-chunk upload the range is `bytes 0-(size-1)/size`. The PUT
+  // intentionally runs OUTSIDE the consent lock so a slow upload doesn't
+  // serialize sibling invokes in the same process.
+  const last = Math.max(0, bytes.byteLength - 1)
+  const contentRange = `bytes 0-${last}/${bytes.byteLength}`
+  let uploadOk = false
+  let uploadErr = ''
+  try {
+    // Bun's fetch accepts Buffer as body; cast to keep strict tsc happy
+    // (DOM lib BodyInit doesn't list Node Buffer).
+    const resp = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: {
+        'Content-Length': String(bytes.byteLength),
+        'Content-Range': contentRange,
+      },
+      body: bytes as unknown as BodyInit,
+    })
+    uploadOk = resp.ok
+    if (!uploadOk) uploadErr = `HTTP ${resp.status}`
+  } catch (err) {
+    uploadErr = String((err as Error)?.message ?? err)
+  }
+
+  if (!uploadOk) {
+    // Token was already reserved (deleted) inside the consent lock — a retry
+    // 404s rather than re-PUTting against the now-consumed upload URL. See
+    // r3 (P2) note on handleFileConsentInvoke.
+    process.stderr.write(`teams channel: fileConsent upload failed token=${token}: ${uploadErr}\n`)
+    try {
+      await context.sendActivity(`File upload failed: ${record.display_name}`)
+    } catch {}
+    await sendInvokeStatus(502)
+    return
+  }
+
+  // Post a FileInfoCard so the user gets a clickable link to the uploaded
+  // file. Best-effort: a posting failure after a successful upload still
+  // counts as success — the file is in the user's OneDrive.
+  try {
+    const fileInfoAttachment = {
+      contentType: TEAMS_FILE_INFO_CARD_TYPE,
+      name: record.display_name,
+      contentUrl: value.uploadInfo?.contentUrl,
+      content: {
+        uniqueId: value.uploadInfo?.uniqueId,
+        fileType: value.uploadInfo?.fileType,
+      },
+    }
+    await context.sendActivity({
+      type: ActivityTypes.Message,
+      attachments: [fileInfoAttachment as any],
+    } as Partial<Activity>)
+  } catch (err) {
+    process.stderr.write(`teams channel: fileInfo post failed (upload succeeded): ${err}\n`)
+  }
+
+  // Token already reserved (deleted) inside the consent lock — no cleanup needed.
+  await sendInvokeStatus(200)
+}
+
 const adapter = new BotFrameworkAdapter({
   appId: APP_ID,
   appPassword: APP_PASSWORD,
@@ -704,14 +1324,36 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
       name: 'reply',
-      description: 'Reply to a Teams conversation. Pass chat_id from the inbound message.',
+      description:
+        'Reply to a Teams conversation. Optionally attach general files (personal chats only — group/channel returns attachments_not_supported_in_groupchat).',
       inputSchema: {
         type: 'object',
         properties: {
           chat_id: { type: 'string', description: 'Teams conversation id from inbound meta.chat_id.' },
           text: { type: 'string', description: 'Message text to send.' },
+          attachments: {
+            type: 'array',
+            description:
+              'Optional file attachments. Personal chats only (Phase 1). Cards rejected. Max 10 per message. Each path must be absolute and within TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT (default: $TEAMS_STATE_DIR/outbound).',
+            items: {
+              type: 'object',
+              properties: {
+                path: {
+                  type: 'string',
+                  description:
+                    'Absolute path to file (must be within TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT, regular file).',
+                },
+                name: {
+                  type: 'string',
+                  description: 'Optional display name shown in Teams; defaults to basename(path).',
+                },
+              },
+              required: ['path'],
+            },
+            maxItems: OUTBOUND_MAX_ATTACHMENTS_PER_MESSAGE,
+          },
         },
-        required: ['chat_id', 'text'],
+        required: ['chat_id'],
       },
     },
     {
@@ -734,21 +1376,164 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     case 'reply': {
       const chatId = String(args.chat_id ?? '').trim()
       let text = String(args.text ?? '').trim()
+      const attachmentsArg = Array.isArray(args.attachments) ? args.attachments : []
       if (!chatId) throw new Error('chat_id is required')
-      if (!text) throw new Error('text is required')
-      const guarded = runPromptGuard('sanitize', text)
-      if (guarded?.blocked) {
-        text = '[Agent Bridge] outbound reply blocked by prompt guard.'
-      } else if (guarded?.was_modified && typeof guarded.sanitized_text === 'string') {
-        text = guarded.sanitized_text
+      if (!text && attachmentsArg.length === 0) {
+        throw new Error('text or attachments is required')
+      }
+      if (attachmentsArg.length > OUTBOUND_MAX_ATTACHMENTS_PER_MESSAGE) {
+        throw new Error(
+          `too many attachments: ${attachmentsArg.length} > ${OUTBOUND_MAX_ATTACHMENTS_PER_MESSAGE}`,
+        )
+      }
+      if (text) {
+        const guarded = runPromptGuard('sanitize', text)
+        if (guarded?.blocked) {
+          text = '[Agent Bridge] outbound reply blocked by prompt guard.'
+        } else if (guarded?.was_modified && typeof guarded.sanitized_text === 'string') {
+          text = guarded.sanitized_text
+        }
       }
       const refs = loadJson<Record<string, ConversationReference>>(REFERENCES_FILE, {})
       const ref = refs[chatId]
-      if (!ref) throw new Error(`conversation reference not found for ${chatId}; wait for an inbound Teams message first`)
-      await adapter.continueConversation(ref, async context => {
-        await context.sendActivity(text)
-      })
-      return { content: [{ type: 'text', text: `sent: ${chatId}` }] }
+      if (!ref) {
+        throw new Error(
+          `conversation reference not found for ${chatId}; wait for an inbound Teams message first`,
+        )
+      }
+
+      if (attachmentsArg.length === 0) {
+        // Text-only path — unchanged behavior, backwards-compatible.
+        await adapter.continueConversation(ref, async context => {
+          await context.sendActivity(text)
+        })
+        return { content: [{ type: 'text', text: `sent: ${chatId}` }] }
+      }
+
+      // Attachment path. Phase 1 supports personal chats only — group/channel
+      // outbound files require SharePoint upload and are deferred to Phase 2.
+      const conversationType = String((ref as any).conversation?.conversationType ?? '').trim()
+      if (conversationType !== 'personal') {
+        throw new Error(
+          `attachments_not_supported_in_groupchat: outbound files only supported in personal chats ` +
+            `(conversationType=${conversationType || 'unknown'})`,
+        )
+      }
+
+      // Validate each attachment up front before sending any consent cards so a
+      // single bad path doesn't leave half the files in pending consent state.
+      const allowRoot = resolveOutboundAllowRoot()
+      // realpath the allow root once: if the root itself is a symlink chain we
+      // need to compare resolved-to-resolved. resolveOutboundAllowRoot mkdirs
+      // the root, so this should always succeed; on failure fall back to the
+      // raw root and let the per-path check below reject anything outside it.
+      let allowRootReal: string
+      try {
+        allowRootReal = realpathSync(allowRoot)
+      } catch {
+        allowRootReal = allowRoot
+      }
+      const maxBytes = resolveOutboundMaxBytes()
+      const validated: {
+        absPath: string
+        displayName: string
+        size: number
+        contentType: string
+      }[] = []
+      for (const item of attachmentsArg) {
+        const rawPath = String((item as any)?.path ?? '').trim()
+        if (!rawPath) throw new Error('attachment.path is required')
+        if (!pathIsAbsolute(rawPath)) {
+          throw new Error(`attachment.path must be absolute: ${rawPath}`)
+        }
+        const absPath = pathResolve(rawPath)
+        // Reject symlinks outright before realpath: the supplied path must
+        // point directly at a regular file. A symlink whose TARGET is inside
+        // the allow root would pass realpath containment but is a more
+        // surprising input vector than necessary — and a symlink whose target
+        // moves between lstat and read is a TOCTOU primitive we don't need to
+        // accept. lstat (NOT stat) so we see the link itself, not its target.
+        let lstat
+        try {
+          lstat = lstatSync(absPath)
+        } catch (err) {
+          throw new Error(`attachment.path not found: ${absPath} (${(err as Error).message})`)
+        }
+        if (lstat.isSymbolicLink()) {
+          throw new Error(`attachment.path must not be a symlink: ${absPath}`)
+        }
+        // Containment via realpath: resolve the full chain (including any
+        // symlinks in PARENT directories) and compare against the realpath of
+        // the allow root. This closes the symlink-escape hole left by the
+        // pre-realpath pathResolve.startsWith check, where a malicious entry
+        // inside the allow root could point at /etc/shadow and be uploaded.
+        let absPathReal: string
+        try {
+          absPathReal = realpathSync(absPath)
+        } catch (err) {
+          throw new Error(`attachment.path not found: ${absPath} (${(err as Error).message})`)
+        }
+        if (absPathReal !== allowRootReal && !absPathReal.startsWith(allowRootReal + '/')) {
+          throw new Error(
+            `attachment.path resolves outside TEAMS_OUTBOUND_ATTACHMENTS_ALLOW_ROOT ` +
+              `(${allowRootReal}): ${absPath} -> ${absPathReal}`,
+          )
+        }
+        // statSync on the realpath is now safe (containment proven, lstat
+        // already confirmed the supplied entry isn't a link).
+        let stat
+        try {
+          stat = statSync(absPathReal)
+        } catch (err) {
+          throw new Error(`attachment.path not found: ${absPath} (${(err as Error).message})`)
+        }
+        if (!stat.isFile()) {
+          throw new Error(`attachment.path is not a regular file: ${absPath}`)
+        }
+        if (stat.size > maxBytes) {
+          throw new Error(`attachment too large: ${absPath} (${stat.size} > ${maxBytes})`)
+        }
+        const rawName = String((item as any)?.name ?? '').trim() || basename(absPath)
+        const safeName = sanitizeFilename(rawName)
+        if (!safeName) {
+          throw new Error(`attachment.name rejected by sanitizer: ${rawName}`)
+        }
+        const ct = inferContentType(safeName)
+        if (isCardContentType(ct)) {
+          throw new Error(`attachment content_type is a card type (not allowed): ${ct}`)
+        }
+        validated.push({ absPath: absPathReal, displayName: safeName, size: stat.size, contentType: ct })
+      }
+
+      // Send one consent card per file. The agent's text rides on the first
+      // card so the user sees the message once; subsequent cards have empty
+      // text so we don't repeat it. The user accepts each card independently;
+      // each accept triggers a fileConsent/invoke handled by
+      // handleFileConsentInvoke below.
+      const tokens: string[] = []
+      for (let i = 0; i < validated.length; i++) {
+        const v = validated[i]
+        const messageForCard = i === 0 ? text : ''
+        const token = await sendFileConsentCard(
+          ref,
+          chatId,
+          v.absPath,
+          v.displayName,
+          v.size,
+          v.contentType,
+          messageForCard,
+        )
+        tokens.push(token)
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `consent_cards_sent: ${chatId} count=${tokens.length}`,
+          },
+        ],
+      }
     }
     case 'fetch_messages': {
       const chatId = String(args.chat_id ?? '').trim()
@@ -763,6 +1548,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
 async function handleActivity(context: TurnContext): Promise<void> {
   const activity = context.activity
+  // Outbound file consent flow: when the user clicks Accept/Decline on a
+  // consent card sent by the `reply` MCP tool, Teams delivers a
+  // fileConsent/invoke. We handle it before the access gate because the
+  // bot itself initiated the conversation — the per-conversation gate
+  // already approved this user when the inbound message that triggered the
+  // reply was accepted. Returning early after invoke handling is intentional;
+  // invoke activities are not chat messages to deliver to Claude.
+  if (activity.type === ActivityTypes.Invoke && (activity as any).name === 'fileConsent/invoke') {
+    await handleFileConsentInvoke(context)
+    return
+  }
   // Supported activity types:
   //   - Message       — new chat message from a Teams user.
   //   - MessageUpdate — Teams edit of an existing message; reuses the
@@ -1069,6 +1865,15 @@ if (CLI_SUBCOMMAND === '_smoke-record-activity' || CLI_SUBCOMMAND === '_smoke-sh
   process.stdout.write(JSON.stringify({ should_skip: isBotOrSelf }) + '\n')
   process.exit(0)
 }
+
+// Sweep stale outbound file consents (older than 24h) on plugin start so a
+// long-lived state file doesn't accumulate unbounded pending records. Best
+// effort: a sweep failure logs but never blocks listener startup. The sweep
+// runs through the per-process consent mutex so a concurrent invoke during
+// startup can't trample it.
+sweepOutboundConsents().catch(err => {
+  process.stderr.write(`teams channel: outbound consent sweep failed: ${err}\n`)
+})
 
 httpServer.listen(PORT, HOST, () => {
   process.stderr.write(`teams channel: listening on http://${HOST}:${PORT} (/api/messages, /auth/callback)\n`)
