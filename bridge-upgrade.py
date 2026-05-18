@@ -369,6 +369,75 @@ def detect_session_type(agent_dir: Path, admin_agent: str) -> str:
     return "static-claude"
 
 
+def v2_session_type_candidates(agent_dir: Path) -> list[Path]:
+    """Return existing per-agent SESSION-TYPE.md paths across v1/v2 layouts.
+
+    Issue #906: v2 layout splits per-agent state across three roots:
+    - ``agents/<agent>/``                  (profile source, watchdog-authoritative)
+    - ``data/agents/<agent>/home/``        (runtime home)
+    - ``data/agents/<agent>/workdir/``     (profile target)
+
+    Operator-mutated state (onboarding completion, channel choice) can land
+    in any of them depending on the install's history. Callers that need to
+    preserve operator state across a template re-render must consult all
+    three before overwriting. Returned in priority order (source first).
+    """
+    # ``agent_dir`` is ``<target_root>/agents/<agent>``. The v2 data root is
+    # ``<target_root>/data/agents/<agent>`` — two levels up and over.
+    target_root = agent_dir.parent.parent
+    v2_root = target_root / "data" / "agents" / agent_dir.name
+    return [
+        agent_dir / "SESSION-TYPE.md",
+        v2_root / "workdir" / "SESSION-TYPE.md",
+        v2_root / "home" / "SESSION-TYPE.md",
+    ]
+
+
+def detect_prior_onboarding_complete(agent_dir: Path) -> bool:
+    """Return True iff any existing SESSION-TYPE.md says ``Onboarding State: complete``.
+
+    Issue #906: ``agent-bridge upgrade --apply`` re-templates
+    ``agents/<agent>/SESSION-TYPE.md`` from a fresh template that ships with
+    ``Onboarding State: pending``. On a host that already completed
+    onboarding, the prior ``complete`` state typically lives in
+    ``data/agents/<agent>/{workdir,home}/SESSION-TYPE.md`` (v2 layout). The
+    upgrade must not UN-onboard an already-onboarded install — onboarding
+    state is a one-way ratchet from pending → complete. If any candidate
+    says complete, the re-render must carry that forward.
+    """
+    pattern = re.compile(r"^-?\s*Onboarding State:\s*complete\b", re.MULTILINE | re.IGNORECASE)
+    for path in v2_session_type_candidates(agent_dir):
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, PermissionError):
+            # Per-UID isolated trees can be unreadable by the controller;
+            # match migrate_agent_home's tolerance and skip silently.
+            continue
+        if pattern.search(text):
+            return True
+    return False
+
+
+def apply_onboarding_state_complete(text: str) -> str:
+    """Rewrite a rendered SESSION-TYPE.md so its Onboarding State reads ``complete``.
+
+    Issue #906: counterpart to detect_prior_onboarding_complete. Mirrors the
+    in-place rewrite that bridge-agent.sh already performs for static-claude
+    homes, but applied at template-render time during upgrade migration so
+    that the source-of-truth file at ``agents/<agent>/SESSION-TYPE.md``
+    matches the operator's prior state instead of regressing to pending.
+    """
+    return re.sub(
+        r"(^-?\s*Onboarding State:\s*)([A-Za-z0-9._-]+)",
+        r"\1complete",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+
 def detect_engine(agent_dir: Path, session_type: str) -> str:
     if session_type == "static-codex":
         return "codex"
@@ -435,11 +504,26 @@ def migrate_agent_home(agent_dir: Path, template_root: Path, admin_agent: str, d
     if not session_target.exists() and session_template.exists():
         added_files.append("SESSION-TYPE.md")
         if not dry_run:
-            session_target.parent.mkdir(parents=True, exist_ok=True)
-            session_target.write_text(
-                render_template(session_template.read_text(encoding="utf-8"), agent, display_name, role_text, engine, session_type),
-                encoding="utf-8",
+            # Issue #906: preserve prior `Onboarding State: complete` across
+            # the v2 layout's source/home/workdir split before stamping the
+            # fresh template. Without this, every upgrade on an already-
+            # onboarded install regresses the source to `pending`, which
+            # triggers recurring watchdog profile-drift tasks and flips
+            # restart_readiness to onboarding-pending (the admin tmux
+            # session would `stop` instead of background-restarting).
+            preserve_complete = detect_prior_onboarding_complete(agent_dir)
+            rendered = render_template(
+                session_template.read_text(encoding="utf-8"),
+                agent,
+                display_name,
+                role_text,
+                engine,
+                session_type,
             )
+            if preserve_complete:
+                rendered = apply_onboarding_state_complete(rendered)
+            session_target.parent.mkdir(parents=True, exist_ok=True)
+            session_target.write_text(rendered, encoding="utf-8")
 
     claude_template = template_root / "CLAUDE.md"
     claude_target = agent_dir / "CLAUDE.md"
