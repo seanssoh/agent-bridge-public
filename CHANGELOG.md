@@ -51,7 +51,10 @@ This is a `-beta` prerelease; the matching tag is `v0.14.5-beta` and the GitHub 
 ### Issues closed
 
 - #905, #906, #907, #909
-- #959 — partially addressed (operator workaround shipped; upstream Claude Code fix tracked separately)
+
+### Issues referenced (not closed)
+
+- #959 — operator-visible workaround shipped via `TEAMS_DELIVERY_MODE` (PR #961 is `refs #959`, not `closes`). The issue remains open pending live verification and an upstream Claude Code fix to the notification-handler silent-drop.
 
 ## [0.14.4] — 2026-05-18
 
