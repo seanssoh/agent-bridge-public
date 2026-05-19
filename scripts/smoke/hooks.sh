@@ -58,6 +58,9 @@ claude_hooks_contract() {
   smoke_assert_contains "$payload" "session-start.py" "Claude SessionStart hook command"
   smoke_assert_contains "$payload" "mark-idle.sh" "Claude Stop hook command"
   smoke_assert_contains "$payload" "clear-idle.sh" "Claude prompt hook command"
+  smoke_assert_contains "$payload" "$BRIDGE_HOME/hooks/session-start.py" "Claude hook commands use absolute bridge-home paths"
+  smoke_assert_contains "$payload" "$BRIDGE_HOME/hooks/prompt_timestamp.py" "Claude prompt timestamp hook uses absolute bridge-home path"
+  smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks" "Claude hook commands do not depend on runtime HOME"
   smoke_assert_contains "$payload" "$BRIDGE_HOME/hooks/prompt_timestamp.py" \
     "Claude prompt timestamp hook uses controller bridge home"
   smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks/prompt_timestamp.py" \
@@ -268,6 +271,28 @@ EOF
     "v2 shared Claude config prompt hook must not resolve through agent HOME"
 }
 
+controller_home_bridge_hook_paths_are_absolute() {
+  local case_dir controller_home bridge_home workdir payload
+
+  case_dir="$SMOKE_TMP_ROOT/controller-home-paths"
+  controller_home="$case_dir/home"
+  bridge_home="$controller_home/.agent-bridge"
+  workdir="$case_dir/workdir"
+  mkdir -p "$bridge_home/hooks" "$workdir"
+
+  HOME="$controller_home" python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" ensure-prompt-hook \
+    --workdir "$workdir" \
+    --bridge-home "$bridge_home" \
+    --bash-bin bash \
+    --python-bin "$(command -v python3)" >/dev/null
+
+  payload="$(cat "$workdir/.claude/settings.json")"
+  smoke_assert_contains "$payload" "$bridge_home/hooks/prompt_timestamp.py" \
+    "bridge-home under controller HOME still renders absolute prompt hook path"
+  smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks" \
+    "bridge-home under controller HOME is not abbreviated with tilde"
+}
+
 claude_settings_mode_source_gate() {
   # Issue #516: bridge_claude_settings_mode must gate the registered-workdir
   # branch on source=static. Dynamic claude agents register a workdir in
@@ -410,6 +435,7 @@ main() {
   smoke_run "Claude hooks ensure/status" claude_hooks_contract
   smoke_run "Claude shared settings context defaults" claude_shared_settings_context_defaults
   smoke_run "v2 shared agent Claude config settings" v2_shared_agent_claude_config_settings
+  smoke_run "controller-home bridge hook paths stay absolute" controller_home_bridge_hook_paths_are_absolute
   smoke_run "v2 managed static workdir shared settings" managed_v2_workdir_shared_settings
   smoke_run "claude settings mode source=static gate (#516)" claude_settings_mode_source_gate
   smoke_run "hook runtime helper output" hook_runtime_helpers
