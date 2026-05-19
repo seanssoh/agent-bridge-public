@@ -2225,6 +2225,71 @@ if [[ $RESTART_AGENTS -eq 1 ]]; then
   # candidate under Bash 5.3.9. Stage via tempfile.
   bridge_upgrade_capture_to_var AGENT_RESTART_JSON \
     bridge_upgrade_agent_restart_json "$AGENT_RESTART_REPORT" 1 "$DRY_RUN"
+
+  # Issue #978 (closes #978, refs #879): post-restart agents — especially
+  # codex-engine agents — frequently land on an interactive picker that
+  # the controller-side auto-accept watcher does not arm for. The picker-
+  # sweep cron (`*/10 * * * *`) eventually unsticks them, but that leaves
+  # an operator-visible 10-minute window where the codex pane sits at
+  # "Press enter to continue" and inbox/queue progress stalls.
+  #
+  # Run picker-sweep one-shot synchronously now so codex pickers (and any
+  # Claude pickers the cold-start watcher missed) are cleared before the
+  # upgrade returns. This is the reactive primitive that already handles
+  # BOTH engines (see scripts/picker-sweep.sh's _PICKER_CODEX_CONFIRM_RE
+  # added 2026-05-16); we just invoke it earlier than the next cron tick.
+  #
+  # Skip when dry-run (no actual restart happened), when no agent reached
+  # status="restarted" (avoids running against an all-attached install),
+  # and when no admin agent is configured (the cron payload uses the
+  # admin for SELF/NOTIFY; same contract here).
+  if [[ $DRY_RUN -ne 1 ]] \
+      && printf '%s\n' "$AGENT_RESTART_REPORT" | grep -qE $'\t''restarted'$'\t' \
+      && [[ -n "${ADMIN_AGENT_ID:-}" ]]; then
+    if [[ -x "$TARGET_ROOT/scripts/picker-sweep.sh" || -r "$TARGET_ROOT/scripts/picker-sweep.sh" ]]; then
+      _picker_sweep_post_restart_output=""
+      # Run picker-sweep under bridge_upgrade_with_target_env so the
+      # sweep's children (bridge-task, bridge-auth, bridge-queue) see a
+      # clean target-rooted env and never inherit the caller's source-
+      # checkout BRIDGE_* paths or any agent-scoped BRIDGE_AGENT_ID /
+      # BRIDGE_ACTIVE_AGENT_DIR. Without this wrap, picker-sweep's
+      # task-create notification could write to the wrong BRIDGE_TASK_DB
+      # or under the wrong agent scope.
+      #
+      # bridge_with_timeout can't be invoked directly from a target-env
+      # subprocess we exec'd with `env -i` (it's a shell function defined
+      # in bridge-lib.sh, not a binary). Source bridge-lib.sh inside the
+      # target-env bash -c body and call bridge_with_timeout from there
+      # — that preserves both target-env isolation AND bridge_with_timeout's
+      # portable Tier 2 (python3 subprocess.run) fallback for hosts
+      # without GNU timeout/gtimeout (notably bare macOS). The `*/10`
+      # picker-sweep cron remains as the hard backstop.
+      if _picker_sweep_post_restart_output="$(
+        bridge_upgrade_with_target_env "$TARGET_ROOT" \
+          "$BRIDGE_BASH_BIN" -c '
+            set -u
+            target_root="$1"
+            admin_id="$2"
+            # shellcheck disable=SC1091
+            source "$target_root/bridge-lib.sh"
+            bridge_with_timeout 15 "upgrade_post_restart_picker_sweep" \
+              env BRIDGE_PICKER_SWEEP_ENABLED=1 \
+                  BRIDGE_PICKER_SWEEP_SELF="$admin_id" \
+                  BRIDGE_PICKER_SWEEP_NOTIFY="$admin_id" \
+              bash "$target_root/scripts/picker-sweep.sh"
+          ' bridge_upgrade_picker_sweep "$TARGET_ROOT" "$ADMIN_AGENT_ID" 2>&1
+      )"; then
+        if [[ -n "$_picker_sweep_post_restart_output" ]]; then
+          printf '%s\n' "$_picker_sweep_post_restart_output" >&2
+        fi
+      else
+        # Sweep failure (timeout, non-zero exit) is non-fatal — the
+        # */10 cron will retry and any stuck pane is still operator-
+        # actionable. Surface the failure to stderr without aborting.
+        echo "[bridge-upgrade] WARN: post-restart picker-sweep failed (non-fatal — cron will retry): $_picker_sweep_post_restart_output" >&2
+      fi
+    fi
+  fi
 fi
 
 if [[ $JSON -eq 1 ]]; then
