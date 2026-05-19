@@ -7180,9 +7180,8 @@ mkdir -p "$HUD_TAP_NOHUD_WORKDIR/.claude"
 echo '{}' >"$HUD_TAP_NOHUD_WORKDIR/.claude/settings.json"
 HUD_TAP_NOHUD_OUT="$(python3 "$REPO_ROOT/bridge-hooks.py" status-hud-usage-tap --workdir "$HUD_TAP_NOHUD_WORKDIR" --bridge-home "$BRIDGE_HOME" || true)"
 assert_contains "$HUD_TAP_NOHUD_OUT" "no-hud"
-# Shell wrapper path: bridge_ensure_hud_usage_tap sources bridge-lib.sh and
-# calls bridge-hooks.py. Verify the shared-base path works end-to-end by
-# seeding a fresh unpatched HUD settings.json and calling the bash wrapper.
+# Shell wrapper — local (per-workdir) path: workdir outside BRIDGE_AGENT_HOME_ROOT
+# takes the else branch (lib/bridge-hooks.sh:370) which patches workdir settings.json.
 HUD_TAP_WRAP_WORKDIR="$TMP_ROOT/hud-tap-wrap-workdir"
 mkdir -p "$HUD_TAP_WRAP_WORKDIR/.claude"
 python3 -c "
@@ -7195,12 +7194,40 @@ cfg = {
 }
 pathlib.Path('$HUD_TAP_WRAP_WORKDIR/.claude/settings.json').write_text(json.dumps(cfg, indent=2))
 "
-HUD_TAP_WRAP_OUT="$("$BASH4_BIN" -lc "
+"$BASH4_BIN" -lc "
   source '$REPO_ROOT/bridge-lib.sh' >/dev/null 2>&1
   bridge_ensure_hud_usage_tap '$HUD_TAP_WRAP_WORKDIR' '' '' 2>&1 || true
-" 2>&1 || true)"
-# The call must not error; the settings must now contain hud-usage-tap
+" 2>&1 || true
 assert_contains "$(cat "$HUD_TAP_WRAP_WORKDIR/.claude/settings.json")" "hud-usage-tap"
+# Shell wrapper — shared path: workdir under BRIDGE_AGENT_HOME_ROOT triggers shared
+# mode (lib/bridge-hooks.sh:361-368). Seed the shared base with an unpatched HUD
+# command, verify the base is patched, and spy that bridge_install_isolated_home_settings
+# is reached (the r4 isolated-propagation block). The spy overrides the function after
+# sourcing so no actual sudo / real OS user is required.
+HUD_TAP_SHARED_AGENT="hud-tap-smoke-agent"
+HUD_TAP_SHARED_WDIR="$BRIDGE_HOME/agents/$HUD_TAP_SHARED_AGENT/workdir"
+HUD_TAP_SHARED_BASE_DIR="$BRIDGE_HOME/agents/.claude"
+mkdir -p "$HUD_TAP_SHARED_WDIR" "$HUD_TAP_SHARED_BASE_DIR"
+python3 -c "
+import json, pathlib
+cfg = {
+  'statusLine': {
+    'type': 'command',
+    'command': 'bash -c \'plugin_dir=x; exec \"/usr/bin/bun\" --env-file /dev/null \"\${plugin_dir}src/index.ts\"\''
+  }
+}
+pathlib.Path('$HUD_TAP_SHARED_BASE_DIR/settings.json').write_text(json.dumps(cfg, indent=2))
+"
+HUD_TAP_ISOLATED_SPY="$TMP_ROOT/hud-isolated-spy"
+"$BASH4_BIN" -lc "
+  export BRIDGE_HOME='$BRIDGE_HOME'
+  export BRIDGE_AGENT_HOME_ROOT='$BRIDGE_HOME/agents'
+  source '$REPO_ROOT/bridge-lib.sh' >/dev/null 2>&1
+  bridge_install_isolated_home_settings() { touch '$HUD_TAP_ISOLATED_SPY'; return 0; }
+  bridge_ensure_hud_usage_tap '$HUD_TAP_SHARED_WDIR' '' '$HUD_TAP_SHARED_AGENT' 2>&1 || true
+" 2>&1 || true
+assert_contains "$(cat "$HUD_TAP_SHARED_BASE_DIR/settings.json")" "hud-usage-tap"
+[[ -f "$HUD_TAP_ISOLATED_SPY" ]] || die "isolated propagation: bridge_install_isolated_home_settings not reached from shared-mode branch"
 
 log "ensuring Claude project trust seed and startup blocker detection"
 CLAUDE_USER_FILE="$TMP_ROOT/claude-user.json"
