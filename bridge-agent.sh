@@ -2011,6 +2011,17 @@ overlay_payload = load_object(overlay_path, "overlay")
 managed_defaults = hooks.managed_claude_settings_defaults(launch_cmd or None, agent_class or None)
 expected = hooks.merge_settings(managed_defaults, base_payload)
 expected = hooks.merge_settings(expected, overlay_payload)
+# PR #970: `cmd_render_shared_settings` rewrites `~/.agent-bridge/hooks/`
+# prefixes in the merged settings to absolute `<BRIDGE_HOME>/hooks/` paths
+# before writing the effective file. The plan must apply the same rewrite
+# to `expected` so the post-apply `effective_payload == expected` check
+# (driving `effective.matches_expected` and ultimately the apply-row
+# `rerendered` vs `needs-rerender` status) stays symmetric. Without this,
+# every install whose base `agents/.claude/settings.json` ships the legacy
+# `~/.agent-bridge/hooks/...` literals (the tracked source default) would
+# report `needs-rerender` after a successful apply on every run.
+if hasattr(hooks, "_normalize_bridge_hook_paths") and hasattr(hooks, "_bridge_home_from_base_settings"):
+    hooks._normalize_bridge_hook_paths(expected, hooks._bridge_home_from_base_settings(base_path))
 
 current_error = ""
 try:
