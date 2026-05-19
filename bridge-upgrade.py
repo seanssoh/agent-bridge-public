@@ -695,8 +695,17 @@ DAILY_BACKUP_HARDCODED_ROOT_EXCLUDES: tuple[tuple[str, ...], ...] = (
 
 # Path-part excludes: drop any path that contains one of these components at
 # any depth (mirrors the legacy __pycache__ skip). Cheap defense against
-# committing or backing up vendored / generated trees.
-DAILY_BACKUP_PATH_PART_EXCLUDES: tuple[str, ...] = ("__pycache__", "node_modules")
+# committing or backing up vendored / generated trees. Entries containing a
+# "/" match a consecutive sequence of components (e.g. "plugins/cache" matches
+# .../<anything>/plugins/cache/... so the agent-name path segment doesn't
+# matter). Issue #974: "plugins/cache" excludes the Claude plugin cache
+# (~100-300 MB per agent home, 1+ GB on a 6-agent install, fully regenerable)
+# which otherwise pushes the daily-backup walk past the default timeout.
+DAILY_BACKUP_PATH_PART_EXCLUDES: tuple[str, ...] = (
+    "__pycache__",
+    "node_modules",
+    "plugins/cache",
+)
 
 # Raw sqlite databases that must never enter the tarball — they're handled
 # via online snapshot dumps instead. Keep the list small and explicit; new
@@ -799,7 +808,17 @@ def should_skip_daily_backup_relpath(
     if not parts:
         return False
     for skip_part in path_part_excludes:
-        if skip_part in parts:
+        # Multi-component entry (e.g. "plugins/cache"): match a consecutive
+        # subsequence anywhere in the path. Single-component entries keep
+        # the legacy fast-path `in parts` check.
+        if "/" in skip_part:
+            sub = tuple(p for p in skip_part.split("/") if p)
+            if sub:
+                n = len(sub)
+                for i in range(len(parts) - n + 1):
+                    if parts[i : i + n] == sub:
+                        return True
+        elif skip_part in parts:
             return True
     relpath_posix = relpath.as_posix()
     for raw_relpath in DAILY_BACKUP_RAW_SQLITE_EXCLUDES:
@@ -849,13 +868,14 @@ def _resolve_grace_seconds(override: int | None = None) -> int:
     # file, so only files older than (daemon_timeout + grace) are removed.
     # Issue #745: default raised 180 -> 360 to track the daemon-side
     # BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS default bump (120 -> 300) plus
-    # the original 60s slack.
+    # the original 60s slack. Issue #975: bumped again 360 -> 660 to track
+    # the timeout default bump (300 -> 600); preserves the 60s slack.
     if override is not None:
         return max(0, int(override))
     raw = os.environ.get("BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS", "")
     if raw.isdigit():
         return max(0, int(raw))
-    return 360
+    return 660
 
 
 def reap_stale_daily_backup_tmp(

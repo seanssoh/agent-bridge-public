@@ -243,11 +243,12 @@ step_cleanup_residue_happy_path() {
 }
 
 step_timeout_resolution() {
-  # Issue #745: bridge_daily_backup_resolve_timeout honours
-  # BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS, defaults to 300, and clamps
-  # invalid input (0, negative, non-numeric) back to 300. Also asserts
-  # the env var name appears in the daemon's rc=124 failure detail wiring
-  # so operators see actionable guidance.
+  # Issue #745 / #975: bridge_daily_backup_resolve_timeout honours
+  # BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS, defaults to 600 (history: 120 in
+  # the original, 300 post-#745, 600 post-#975), and clamps invalid input
+  # (0, negative, non-numeric) back to that default. Also asserts the env
+  # var name appears in the daemon's rc=124 failure detail wiring so
+  # operators see actionable guidance.
   local daemon_src="$SMOKE_REPO_ROOT/bridge-daemon.sh"
   [[ -f "$daemon_src" ]] \
     || smoke_fail "timeout_resolution: bridge-daemon.sh missing at $daemon_src"
@@ -268,11 +269,11 @@ step_timeout_resolution() {
   # given env value, then prints the resolved timeout.
   local case_input case_want got
   for case_pair in \
-      "::300" \
-      "600:600" \
-      "0:300" \
-      "-1:300" \
-      "abc:300"; do
+      "::600" \
+      "900:900" \
+      "0:600" \
+      "-1:600" \
+      "abc:600"; do
     case_input="${case_pair%%:*}"
     case_want="${case_pair##*:}"
     if [[ -z "$case_input" ]]; then

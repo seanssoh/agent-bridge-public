@@ -901,17 +901,18 @@ bridge_daily_backup_int() {
   fi
 }
 
-# Issue #745: resolve the daily-backup timeout from
-# BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS. Default 300s (was hardcoded 120s)
-# so installs with ~1.4GB+ tarballs don't trip the timeout. Rejects 0,
-# negatives, and non-numeric input back to the default — never returns
-# an unsafe value that would make `bridge_with_timeout` complain.
+# Issue #745 / #975: resolve the daily-backup timeout from
+# BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS. Default 600s (history: 120 -> 300
+# in #745, 300 -> 600 in #975) so multi-agent installs whose tarball walk
+# takes well over 300s don't fire spurious backup-failed:timeout urgents.
+# Rejects 0, negatives, and non-numeric input back to the default — never
+# returns an unsafe value that would make `bridge_with_timeout` complain.
 bridge_daily_backup_resolve_timeout() {
-  local raw="${BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS:-300}"
+  local raw="${BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS:-600}"
   if [[ "$raw" =~ ^[0-9]+$ ]] && (( raw > 0 )); then
     printf '%s' "$raw"
   else
-    printf '%s' "300"
+    printf '%s' "600"
   fi
 }
 
@@ -1280,7 +1281,7 @@ detail: ${detail:-(no detail)}
 
 ## What this could mean
 
-- \`timeout\`: the backup walk exceeded the ${backup_timeout}s daemon timeout. Check whether \`$BRIDGE_HOME\` has unexpectedly large directories (e.g. an unbacked \`shared/\` or accidentally-included \`worktrees/\`). Tune \`BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS\` to skip transient subtrees, or raise \`BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS\` (default 300) for larger installs.
+- \`timeout\`: the backup walk exceeded the ${backup_timeout}s daemon timeout. Check whether \`$BRIDGE_HOME\` has unexpectedly large directories (e.g. an unbacked \`shared/\` or accidentally-included \`worktrees/\`). Tune \`BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS\` to skip transient subtrees, or raise \`BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS\` (default 600) for larger installs.
 - \`parse\` / \`subprocess_rc_*\`: the python3 helper exited unexpectedly. Stderr should be in the daemon log; \`tail -n 200 $BRIDGE_HOME/state/daemon.log\`.
 - \`error_sqlite_snapshot\`: \`state/tasks.db\` exists but its hot snapshot failed (corruption, locked). Run \`python3 $BRIDGE_HOME/bridge-upgrade.py verify-tasks-db --target-root $BRIDGE_HOME\` to diagnose.
 - \`error_oserror_*\`: filesystem error from tar write or rename. Check disk health.
@@ -1806,10 +1807,10 @@ process_daily_backup() {
   # Issue #265 proposal A: daily-backup walks BRIDGE_HOME (large file tree on
   # long-lived installs) and writes a tarball; a hung filesystem (NFS,
   # external mount, full disk waiting on flush) would otherwise stall the
-  # daemon main loop. Issue #745: the ceiling is now resolved from
-  # BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS (default 300s, raised from the
-  # original 120s) so operators with larger installs can tune without
-  # patching source.
+  # daemon main loop. Issue #745 / #975: the ceiling is now resolved from
+  # BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS (default 600s; history: 120 -> 300
+  # in #745, 300 -> 600 in #975) so multi-agent installs don't trip the
+  # timeout without operator-side tuning.
   # Bug #507: capture stderr too (separate file) so an error_detail can be
   # surfaced to state.env / audit instead of silently swallowed.
   #
