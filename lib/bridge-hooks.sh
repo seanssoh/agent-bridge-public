@@ -165,6 +165,9 @@ bridge_link_claude_settings_to_shared() {
   local agent="${3-}"
   local effective_file
   local agent_class=""
+  local agent_claude_config_dir=""
+  local agent_claude_home=""
+  local agent_effective_file=""
   if [[ -n "$agent" ]]; then
     effective_file="$(bridge_hook_per_agent_settings_effective_file "$agent")"
     # Issue #593: source class drives the managed autoCompactWindow default
@@ -187,6 +190,31 @@ bridge_link_claude_settings_to_shared() {
     --launch-cmd "$launch_cmd" \
     --agent-class "$agent_class" >/dev/null
   bridge_hooks_python link-shared-settings --workdir "$workdir" --shared-settings-file "$effective_file"
+
+  # v2 non-isolated agents launch Claude with CLAUDE_CONFIG_DIR under
+  # bridge_agent_default_home (<agent>/home/.claude), while the legacy shared
+  # settings link above still targets the workdir-side managed settings file.
+  # Mirror the rendered file into the launched Claude config dir so runtime
+  # hooks do not keep reading stale ~/.agent-bridge commands from agent HOME.
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_claude_config_dir >/dev/null 2>&1 \
+      && { ! command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+           || ! bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; }; then
+    agent_claude_config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+    if [[ -n "$agent_claude_config_dir" ]]; then
+      agent_effective_file="$agent_claude_config_dir/settings.effective.json"
+      if [[ "$(bridge_hook_paths_equal "$effective_file" "$agent_effective_file")" != "1" ]]; then
+        agent_claude_home="${agent_claude_config_dir%/.claude}"
+        bridge_hooks_python render-shared-settings \
+          --base-settings-file "$(bridge_hook_shared_settings_base_file)" \
+          --overlay-settings-file "$(bridge_hook_shared_settings_overlay_file)" \
+          --effective-settings-file "$agent_effective_file" \
+          --launch-cmd "$launch_cmd" \
+          --agent-class "$agent_class" >/dev/null
+        bridge_hooks_python link-shared-settings --workdir "$agent_claude_home" --shared-settings-file "$agent_effective_file" >/dev/null
+      fi
+    fi
+  fi
 }
 
 bridge_ensure_claude_project_trust() {

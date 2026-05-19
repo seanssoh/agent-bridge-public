@@ -452,6 +452,36 @@ bridge_run_schedule_dev_channels_accept() {
   ) </dev/null >>"$LOGFILE" 2>>"$ERRFILE" &
 }
 
+bridge_run_agent_claude_root() {
+  # Resolve the Claude config root the launched agent will actually use.
+  # Keep this in one place so the dev-plugin cache sync and plugin enable
+  # preflight operate on the same per-agent HOME/CLAUDE_CONFIG_DIR as the
+  # final LAUNCH_CMD. Otherwise shared agents can sync into their agent
+  # home but run `claude plugin enable` against the controller's home,
+  # leaving the launched Claude process with the channel plugin disabled.
+  local _agent_os_user_local=""
+
+  if ! bridge_isolation_disabled_by_env && bridge_agent_linux_user_isolation_effective "$AGENT"; then
+    _agent_os_user_local="$(bridge_agent_os_user "$AGENT")"
+    printf '%s/.claude' "$(bridge_agent_linux_user_home "$_agent_os_user_local")"
+  else
+    printf '%s/.claude' "$(bridge_agent_default_home "$AGENT")"
+  fi
+}
+
+bridge_run_ensure_claude_launch_channel_plugins() {
+  local agent_claude_root=""
+  local agent_home=""
+
+  agent_claude_root="$(bridge_run_agent_claude_root)"
+  agent_home="${agent_claude_root%/.claude}"
+  (
+    export HOME="$agent_home"
+    export CLAUDE_CONFIG_DIR="$agent_claude_root"
+    bridge_ensure_claude_launch_channel_plugins "$AGENT"
+  )
+}
+
 bridge_run_sync_dev_plugin_cache() {
   # v0.9.7 RC6 (refs #781): the Python linker is now criticality-aware.
   # Channel-required plugin failures (declared via BRIDGE_AGENT_CHANNELS=
@@ -513,23 +543,8 @@ bridge_run_sync_dev_plugin_cache() {
     optional_csv="$_opt_qualified"
   fi
 
-  # Resolve per-agent Claude plugin roots so the cache materializes under the
-  # same Claude config home the agent actually launches into. Without this,
-  # non-isolated agents fall back to Path.home()/.claude in the Python helper,
-  # which is the controller's global Claude dir — the agent's Claude never
-  # sees the marketplace and reports `plugin not installed` (#TBD).
-  #
-  # BRIDGE_DISABLE_ISOLATION=1 rollback path: bridge-run runs the agent as the
-  # controller even when the roster declares an isolated os_user. Honour the
-  # disabled-boundary by using the controller-side default home in that case.
   local agent_claude_root=""
-  local _agent_os_user_local=""
-  if ! bridge_isolation_disabled_by_env && bridge_agent_linux_user_isolation_effective "$AGENT"; then
-    _agent_os_user_local="$(bridge_agent_os_user "$AGENT")"
-    agent_claude_root="$(bridge_agent_linux_user_home "$_agent_os_user_local")/.claude"
-  else
-    agent_claude_root="$(bridge_agent_default_home "$AGENT")/.claude"
-  fi
+  agent_claude_root="$(bridge_run_agent_claude_root)"
 
   output="$(BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT="$agent_claude_root/plugins/cache" \
     BRIDGE_CLAUDE_PLUGINS_ROOT="$agent_claude_root/plugins" \
@@ -556,6 +571,31 @@ bridge_run_sync_dev_plugin_cache() {
     return "$rc"
   fi
   return 0
+}
+
+bridge_run_prune_legacy_teams_mcp() {
+  local channels=""
+  local output=""
+  local line=""
+  local rc=0
+
+  [[ "$ENGINE" == "claude" ]] || return 0
+  [[ $SAFE_MODE -eq 0 ]] || return 0
+  channels="$(bridge_agent_effective_dev_channels_csv "$AGENT")"
+  bridge_channel_csv_contains "$channels" "plugin:teams" || return 0
+
+  output="$(python3 "$SCRIPT_DIR/scripts/python-helpers/prune-legacy-teams-mcp.py" \
+    --agent "$AGENT" \
+    --workdir "$WORK_DIR" \
+    --agent-root "$BRIDGE_AGENT_HOME_ROOT/$AGENT" \
+    2>&1)" || rc=$?
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    log_line "[legacy-teams-mcp] $line"
+  done <<<"$output"
+
+  return "$rc"
 }
 
 bridge_run_safe_mode_resume_hint() {
@@ -761,7 +801,14 @@ while true; do
       # was started for.
       exit 65
     fi
-    bridge_ensure_claude_launch_channel_plugins "$AGENT"
+    if ! bridge_run_prune_legacy_teams_mcp; then
+      bridge_audit_log state legacy_teams_mcp_prune_failed "$AGENT" \
+        --field reason="failed to remove stale mcpServers.teams entry" \
+        >/dev/null 2>&1 || true
+      log_line "[error] aborting launch: stale Teams MCP cleanup failed for ${AGENT}"
+      exit 66
+    fi
+    bridge_run_ensure_claude_launch_channel_plugins
     bridge_run_schedule_dev_channels_accept "$LAUNCH_CMD"
     bridge_run_schedule_idle_marker_and_inbox_bootstrap "$previous_session_id"
   fi

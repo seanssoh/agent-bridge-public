@@ -56,6 +56,56 @@ def resolve_managed_autocompact_window(
     return BRIDGE_AUTOCOMPACT_WINDOW_DEFAULT
 
 
+def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str, Any]:
+    if not launch_cmd:
+        return {}
+    try:
+        tokens = shlex.split(launch_cmd)
+    except ValueError:
+        tokens = launch_cmd.split()
+
+    plugin_specs: list[str] = []
+    seen: set[str] = set()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        value = ""
+        if token == "--dangerously-load-development-channels" and index + 1 < len(tokens):
+            value = tokens[index + 1]
+            index += 2
+        elif token.startswith("--dangerously-load-development-channels="):
+            value = token.split("=", 1)[1]
+            index += 1
+        else:
+            index += 1
+            continue
+        if not value.startswith("plugin:") or not value.endswith("@agent-bridge"):
+            continue
+        spec = value[len("plugin:") :]
+        if spec in seen:
+            continue
+        seen.add(spec)
+        plugin_specs.append(spec)
+
+    if not plugin_specs:
+        return {}
+
+    bridge_home = os.environ.get("BRIDGE_HOME", "").strip()
+    if not bridge_home:
+        bridge_home = str(Path(__file__).resolve().parent)
+    return {
+        "enabledPlugins": {spec: True for spec in plugin_specs},
+        "extraKnownMarketplaces": {
+            "agent-bridge": {
+                "source": {
+                    "source": "directory",
+                    "path": bridge_home,
+                }
+            }
+        },
+    }
+
+
 def managed_claude_settings_defaults(
     launch_cmd: str | None,
     agent_class: str | None = None,
@@ -77,10 +127,14 @@ def managed_claude_settings_defaults(
     # Operators who attach interactively and want it back can set
     # `promptSuggestionEnabled: true` in the per-agent overlay
     # (`settings.local.json`) — overlay wins over managed defaults.
-    return {
+    defaults = {
         "autoCompactWindow": resolve_managed_autocompact_window(launch_cmd, agent_class),
         "promptSuggestionEnabled": False,
     }
+    plugin_settings = agent_bridge_development_plugin_settings(launch_cmd)
+    if plugin_settings:
+        defaults = merge_settings(defaults, plugin_settings)
+    return defaults
 
 
 def load_json(path: Path) -> Any:
@@ -114,15 +168,7 @@ def merge_settings(base: Any, overlay: Any) -> Any:
 
 
 def shell_path(path: Path) -> str:
-    expanded = path.expanduser()
-    home = Path.home().expanduser()
-    try:
-        rel = expanded.relative_to(home)
-    except ValueError:
-        return str(expanded)
-    if str(rel) == ".":
-        return "~"
-    return f"~/{rel.as_posix()}"
+    return str(path.expanduser())
 
 
 def shell_command(program: str, path_str: str, *extra: str) -> str:
@@ -944,6 +990,45 @@ PRESERVED_USER_KEYS = (
 )
 
 
+def _bridge_home_from_base_settings(base_path: Path) -> Path | None:
+    expanded = base_path.expanduser()
+    try:
+        if (
+            expanded.name == "settings.json"
+            and expanded.parent.name == ".claude"
+            and expanded.parent.parent.name == "agents"
+        ):
+            return expanded.parent.parent.parent
+    except IndexError:
+        return None
+    return None
+
+
+def _normalize_bridge_hook_paths(settings: dict[str, Any], bridge_home: Path | None) -> None:
+    if bridge_home is None:
+        return
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return
+    old_prefix = "~/.agent-bridge/hooks/"
+    new_prefix = f"{bridge_home}/hooks/"
+    for groups in hooks.values():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            entries = group.get("hooks")
+            if not isinstance(entries, list):
+                continue
+            for hook in entries:
+                if not isinstance(hook, dict):
+                    continue
+                command = hook.get("command")
+                if isinstance(command, str) and old_prefix in command:
+                    hook["command"] = command.replace(old_prefix, new_prefix)
+
+
 def _load_preserved_user_keys(effective_path: Path) -> dict[str, Any]:
     """Read the user-owned subset of an existing effective settings file.
 
@@ -986,6 +1071,7 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     merged = merge_settings(merged, overlay_payload)
     if preserved:
         merged = merge_settings(merged, preserved)
+    _normalize_bridge_hook_paths(merged, _bridge_home_from_base_settings(base_path))
     save_json(effective_path, merged)
 
     payload = {
@@ -1070,6 +1156,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     merged = merge_settings(merged, overlay_payload)
     if preserved:
         merged = merge_settings(merged, preserved)
+    _normalize_bridge_hook_paths(merged, _bridge_home_from_base_settings(base_path))
 
     # 3. Atomic write of the effective file (mode 0644 so the isolated UID
     # can read it; ownership stays with whoever invoked us — controller

@@ -34,7 +34,7 @@ codex_hooks_contract() {
 }
 
 claude_hooks_contract() {
-  local workdir status_out payload
+  local operator_home home_bridge home_workdir workdir status_out payload
 
   workdir="$SMOKE_TMP_ROOT/claude-workdir"
   mkdir -p "$workdir"
@@ -58,6 +58,15 @@ claude_hooks_contract() {
   smoke_assert_contains "$payload" "session-start.py" "Claude SessionStart hook command"
   smoke_assert_contains "$payload" "mark-idle.sh" "Claude Stop hook command"
   smoke_assert_contains "$payload" "clear-idle.sh" "Claude prompt hook command"
+  smoke_assert_contains "$payload" "$BRIDGE_HOME/hooks/session-start.py" "Claude hook commands use absolute bridge-home paths"
+  smoke_assert_contains "$payload" "$BRIDGE_HOME/hooks/prompt_timestamp.py" "Claude prompt timestamp hook uses absolute bridge-home path"
+  # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
+  smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks" "Claude hook commands do not depend on runtime HOME"
+  smoke_assert_contains "$payload" "$BRIDGE_HOME/hooks/prompt_timestamp.py" \
+    "Claude prompt timestamp hook uses controller bridge home"
+  # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
+  smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks/prompt_timestamp.py" \
+    "Claude prompt timestamp hook must not resolve through agent HOME"
 
   status_out="$(python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" status-session-start-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)")"
   smoke_assert_contains "$status_out" "ok" "Claude SessionStart hook status"
@@ -65,6 +74,22 @@ claude_hooks_contract() {
   smoke_assert_contains "$status_out" "ok" "Claude Stop hook status"
   status_out="$(python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" status-prompt-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin bash)"
   smoke_assert_contains "$status_out" "ok" "Claude prompt hook status"
+
+  operator_home="$SMOKE_TMP_ROOT/operator-home"
+  home_bridge="$operator_home/.agent-bridge"
+  home_workdir="$SMOKE_TMP_ROOT/home-relative-bridge-workdir"
+  mkdir -p "$home_bridge" "$home_workdir"
+  HOME="$operator_home" python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" ensure-prompt-hook \
+    --workdir "$home_workdir" \
+    --bridge-home "$home_bridge" \
+    --bash-bin bash \
+    --python-bin "$(command -v python3)" >/dev/null
+  payload="$(cat "$home_workdir/.claude/settings.json")"
+  smoke_assert_contains "$payload" "$home_bridge/hooks/prompt_timestamp.py" \
+    "Claude prompt timestamp hook remains absolute when bridge home is under HOME"
+  # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
+  smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks/prompt_timestamp.py" \
+    "Claude prompt timestamp hook does not resolve through runtime HOME"
 }
 
 assert_claude_auto_compact_window() {
@@ -208,6 +233,71 @@ EOF
   assert_claude_auto_compact_window "$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json" "1000000" "v2 managed shared settings"
 }
 
+v2_shared_agent_claude_config_settings() {
+  local agent agent_home bash4_bin config_settings config_effective output workdir
+
+  agent="shared-config-agent"
+  workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
+  agent_home="$BRIDGE_AGENT_ROOT_V2/$agent/home"
+  mkdir -p "$workdir" "$agent_home"
+  cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
+bridge_add_agent_id_if_missing "$agent"
+BRIDGE_AGENT_ENGINE["$agent"]="claude"
+BRIDGE_AGENT_SOURCE["$agent"]="static"
+BRIDGE_AGENT_SESSION["$agent"]="$agent"
+BRIDGE_AGENT_WORKDIR["$agent"]="$workdir"
+BRIDGE_AGENT_ISOLATION_MODE["$agent"]="shared"
+EOF
+
+  bash4_bin="$BASH"
+  if (( BASH_VERSINFO[0] < 4 )); then
+    if [[ -x /opt/homebrew/bin/bash ]]; then
+      bash4_bin="/opt/homebrew/bin/bash"
+    elif [[ -x /usr/local/bin/bash ]]; then
+      bash4_bin="/usr/local/bin/bash"
+    fi
+  fi
+
+  output="$(
+    "$bash4_bin" -c 'repo="$1"; workdir="$2"; agent="$3"; source "$repo/bridge-lib.sh"; bridge_load_roster; bridge_ensure_claude_prompt_hook "$workdir" "" "$agent"' \
+      _ "$SMOKE_REPO_ROOT" "$workdir" "$agent"
+  )"
+  smoke_assert_contains "$output" "settings_file: $workdir/.claude/settings.json" "v2 shared workdir settings link output"
+
+  config_settings="$agent_home/.claude/settings.json"
+  config_effective="$agent_home/.claude/settings.effective.json"
+  [[ -L "$config_settings" ]] || smoke_fail "v2 shared Claude config settings.json should be a symlink"
+  smoke_assert_file_exists "$config_effective" "v2 shared Claude config effective settings rendered"
+  smoke_assert_contains "$(cat "$config_settings")" "$BRIDGE_HOME/hooks/prompt_timestamp.py" \
+    "v2 shared Claude config prompt hook uses controller bridge home"
+  # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
+  smoke_assert_not_contains "$(cat "$config_settings")" "~/.agent-bridge/hooks/prompt_timestamp.py" \
+    "v2 shared Claude config prompt hook must not resolve through agent HOME"
+}
+
+controller_home_bridge_hook_paths_are_absolute() {
+  local case_dir controller_home bridge_home workdir payload
+
+  case_dir="$SMOKE_TMP_ROOT/controller-home-paths"
+  controller_home="$case_dir/home"
+  bridge_home="$controller_home/.agent-bridge"
+  workdir="$case_dir/workdir"
+  mkdir -p "$bridge_home/hooks" "$workdir"
+
+  HOME="$controller_home" python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" ensure-prompt-hook \
+    --workdir "$workdir" \
+    --bridge-home "$bridge_home" \
+    --bash-bin bash \
+    --python-bin "$(command -v python3)" >/dev/null
+
+  payload="$(cat "$workdir/.claude/settings.json")"
+  smoke_assert_contains "$payload" "$bridge_home/hooks/prompt_timestamp.py" \
+    "bridge-home under controller HOME still renders absolute prompt hook path"
+  # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
+  smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks" \
+    "bridge-home under controller HOME is not abbreviated with tilde"
+}
+
 claude_settings_mode_source_gate() {
   # Issue #516: bridge_claude_settings_mode must gate the registered-workdir
   # branch on source=static. Dynamic claude agents register a workdir in
@@ -349,6 +439,8 @@ main() {
   smoke_run "Codex hooks ensure/status" codex_hooks_contract
   smoke_run "Claude hooks ensure/status" claude_hooks_contract
   smoke_run "Claude shared settings context defaults" claude_shared_settings_context_defaults
+  smoke_run "v2 shared agent Claude config settings" v2_shared_agent_claude_config_settings
+  smoke_run "controller-home bridge hook paths stay absolute" controller_home_bridge_hook_paths_are_absolute
   smoke_run "v2 managed static workdir shared settings" managed_v2_workdir_shared_settings
   smoke_run "claude settings mode source=static gate (#516)" claude_settings_mode_source_gate
   smoke_run "hook runtime helper output" hook_runtime_helpers

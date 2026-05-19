@@ -3761,11 +3761,31 @@ bridge_linux_install_isolated_channel_symlink() {
 
 bridge_agent_default_home() {
   local agent="$1"
-  if [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
     printf '%s/%s/home' "$BRIDGE_AGENT_ROOT_V2" "$agent"
     return 0
   fi
   printf '%s/%s' "$BRIDGE_AGENT_HOME_ROOT" "$agent"
+}
+
+bridge_agent_claude_home_dir() {
+  local agent="$1"
+  local os_user=""
+
+  if ! bridge_isolation_disabled_by_env && bridge_agent_linux_user_isolation_effective "$agent"; then
+    os_user="$(bridge_agent_os_user "$agent")"
+    if [[ -n "$os_user" ]]; then
+      bridge_agent_linux_user_home "$os_user"
+      return 0
+    fi
+  fi
+
+  bridge_agent_default_home "$agent"
+}
+
+bridge_agent_claude_config_dir() {
+  local agent="$1"
+  printf '%s/.claude' "$(bridge_agent_claude_home_dir "$agent")"
 }
 
 bridge_agent_onboarding_state() {
@@ -3805,7 +3825,7 @@ bridge_agent_default_profile_home() {
   # reads CLAUDE.md from workdir, so the deploy target (this function)
   # must point at workdir too, otherwise `agent-bridge profile deploy`
   # would land in v2 home/ where nothing reads it.
-  if [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
     printf '%s/%s/workdir' "$BRIDGE_AGENT_ROOT_V2" "$agent"
     return 0
   fi
@@ -3887,13 +3907,28 @@ bridge_agent_workdir() {
   #     Fall through to the explicit-then-default resolution so the
   #     operator's cwd is honored for shared dynamic agents.
   local _isolation_mode=""
-  if [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
     _isolation_mode="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || printf '')"
     if [[ "$_isolation_mode" == "linux-user" ]]; then
       printf '%s/%s/workdir' "$BRIDGE_AGENT_ROOT_V2" "$agent"
       return 0
     fi
-    # Any non-linux-user mode (shared, unknown, "") falls through.
+    # Static shared agents created before the v2 anchor split still keep
+    # their real state/cwd under <agent>/workdir while roster workdir may
+    # point at the base agent dir. Preserve explicit custom shared cwd for
+    # dynamic agents and static project overrides; only align legacy
+    # default-home static rows to the existing v2 workdir.
+    if [[ "$(bridge_agent_source "$agent")" == "static" ]]; then
+      local _legacy_v2_workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
+      local _default_home=""
+      local _legacy_base_home="$BRIDGE_AGENT_HOME_ROOT/$agent"
+      _default_home="$(bridge_agent_default_home "$agent")"
+      if [[ -d "$_legacy_v2_workdir" && ( -z "$explicit" || "$explicit" == "$_default_home" || "$explicit" == "$_legacy_base_home" ) ]]; then
+        printf '%s' "$_legacy_v2_workdir"
+        return 0
+      fi
+    fi
+    # Other non-linux-user modes (shared dynamic, unknown, "") fall through.
   fi
 
   if [[ -n "$explicit" ]]; then
@@ -4206,6 +4241,123 @@ bridge_filter_approved_channels_csv() {
   done
 
   printf '%s' "$filtered"
+}
+
+bridge_filter_server_channels_csv() {
+  local csv="${1:-}"
+  local item=""
+  local filtered=""
+  local -a items=()
+
+  [[ -n "$csv" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  IFS=',' read -r -a items <<<"$csv"
+  for item in "${items[@]}"; do
+    item="$(bridge_trim_whitespace "$item")"
+    [[ -n "$item" ]] || continue
+    item="$(bridge_qualify_channel_item "$item")"
+    if [[ "$item" == server:* ]]; then
+      filtered="$(bridge_append_csv_unique "$filtered" "$item")"
+    fi
+  done
+
+  printf '%s' "$filtered"
+}
+
+bridge_plugin_source_dir_for_channel_item() {
+  local item="${1:-}"
+  local plugin_id=""
+  local plugin_name=""
+  local marketplace=""
+  local source_dir=""
+  local plugins_root=""
+
+  item="$(bridge_qualify_channel_item "$item")"
+  [[ "$item" == plugin:*@* ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  plugin_id="${item#plugin:}"
+  plugin_name="${plugin_id%@*}"
+  marketplace="${plugin_id#*@}"
+
+  if [[ "$marketplace" == "agent-bridge" && -d "$BRIDGE_SCRIPT_DIR/plugins/$plugin_name" ]]; then
+    printf '%s' "$BRIDGE_SCRIPT_DIR/plugins/$plugin_name"
+    return 0
+  fi
+
+  if plugins_root="$(bridge_isolation_v2_shared_plugins_root 2>/dev/null)" && [[ -n "$plugins_root" ]]; then
+    source_dir="$(bridge_resolve_plugin_install_path "$plugin_id" "$plugins_root" 2>/dev/null || true)"
+    if [[ -n "$source_dir" && -d "$source_dir" ]]; then
+      printf '%s' "$source_dir"
+      return 0
+    fi
+  fi
+
+  if [[ -n "${HOME:-}" && -d "$HOME/.claude/plugins" ]]; then
+    source_dir="$(bridge_resolve_plugin_install_path "$plugin_id" "$HOME/.claude/plugins" 2>/dev/null || true)"
+    if [[ -n "$source_dir" && -d "$source_dir" ]]; then
+      printf '%s' "$source_dir"
+      return 0
+    fi
+  fi
+
+  printf '%s' ""
+}
+
+bridge_plugin_mcp_server_selectors_csv_for_item() {
+  local item="${1:-}"
+  local source_dir=""
+  local manifest=""
+
+  item="$(bridge_qualify_channel_item "$item")"
+  [[ "$item" == plugin:*@* ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  source_dir="$(bridge_plugin_source_dir_for_channel_item "$item")"
+  manifest="$source_dir/.mcp.json"
+  [[ -n "$source_dir" && -f "$manifest" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  bridge_require_python
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/mcp-server-selectors-from-manifest.py" "$manifest"
+}
+
+bridge_dev_channel_server_selectors_csv() {
+  local csv="${1:-}"
+  local item=""
+  local selectors=""
+  local item_selectors=""
+  local -a items=()
+
+  [[ -n "$csv" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  IFS=',' read -r -a items <<<"$csv"
+  for item in "${items[@]}"; do
+    item="$(bridge_trim_whitespace "$item")"
+    [[ -n "$item" ]] || continue
+    item="$(bridge_qualify_channel_item "$item")"
+    bridge_channel_item_is_development "$item" || continue
+    bridge_plugin_mcp_is_probeable_item "$item" || continue
+    item_selectors="$(bridge_plugin_mcp_server_selectors_csv_for_item "$item")"
+    selectors="$(bridge_merge_channels_csv "$selectors" "$item_selectors")"
+  done
+
+  printf '%s' "$selectors"
 }
 
 bridge_channel_csv_is_subset() {
@@ -4720,19 +4872,19 @@ bridge_channel_state_dir_for_item() {
 
   item="$(bridge_qualify_channel_item "$item")"
   case "$item" in
-    plugin:discord|plugin:discord@*)
+    plugin:discord|plugin:discord@*|server:discord)
       bridge_agent_discord_state_dir "$agent"
       ;;
-    plugin:telegram|plugin:telegram@*)
+    plugin:telegram|plugin:telegram@*|server:telegram)
       bridge_agent_telegram_state_dir "$agent"
       ;;
-    plugin:teams|plugin:teams@*)
+    plugin:teams|plugin:teams@*|server:teams)
       bridge_agent_teams_state_dir "$agent"
       ;;
-    plugin:ms365|plugin:ms365@*)
+    plugin:ms365|plugin:ms365@*|server:ms365)
       bridge_agent_ms365_state_dir "$agent"
       ;;
-    plugin:mattermost|plugin:mattermost@*)
+    plugin:mattermost|plugin:mattermost@*|server:mattermost)
       bridge_agent_mattermost_state_dir "$agent"
       ;;
     *)
@@ -5315,6 +5467,7 @@ bridge_agent_channel_runtime_drift_reason() {
 bridge_agent_launch_channels_csv() {
   local agent="$1"
   local channels=""
+  local source_channels=""
 
   if [[ "${BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS:-0}" == "1" ]]; then
     # Issue #832: under suppress-missing-channels, fold controller-blind
@@ -5322,10 +5475,11 @@ bridge_agent_launch_channels_csv() {
     # credentials from the controller, but we also cannot prove they are
     # broken — dropping them would silently strip a working channel from
     # an isolated agent's launch flags.
-    channels="$(bridge_merge_channels_csv "$(bridge_agent_ready_channels_csv "$agent")" "$(bridge_agent_controller_blind_channels_csv "$agent")")"
-    channels="$(bridge_filter_approved_channels_csv "$channels")"
+    source_channels="$(bridge_merge_channels_csv "$(bridge_agent_ready_channels_csv "$agent")" "$(bridge_agent_controller_blind_channels_csv "$agent")")"
+    channels="$(bridge_filter_approved_channels_csv "$source_channels")"
   else
-    channels="$(bridge_filter_approved_channels_csv "$(bridge_agent_channels_csv "$agent")")"
+    source_channels="$(bridge_agent_channels_csv "$agent")"
+    channels="$(bridge_filter_approved_channels_csv "$source_channels")"
   fi
   bridge_filter_claude_plugin_channels_csv "$channels"
 }
@@ -5515,13 +5669,17 @@ bridge_agent_missing_plugin_mcp_channels_csv() {
 bridge_agent_required_launch_channels_csv() {
   local agent="$1"
 
-  bridge_filter_claude_plugin_channels_csv "$(bridge_filter_approved_channels_csv "$(bridge_agent_channels_csv "$agent")")"
+  bridge_agent_launch_channels_csv "$agent"
 }
 
 bridge_agent_required_dev_channels_csv() {
   local agent="$1"
+  local dev_channels=""
+  local server_channels=""
 
-  bridge_filter_claude_plugin_channels_csv "$(bridge_agent_dev_channels_csv "$agent")"
+  dev_channels="$(bridge_agent_dev_channels_csv "$agent")"
+  server_channels="$(bridge_filter_server_channels_csv "$(bridge_agent_launch_channels_csv "$agent")")"
+  bridge_filter_claude_plugin_channels_csv "$(bridge_merge_channels_csv "$dev_channels" "$server_channels")"
 }
 
 bridge_agent_required_runtime_channels_csv() {

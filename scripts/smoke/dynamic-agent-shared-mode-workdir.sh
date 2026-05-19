@@ -33,8 +33,14 @@
 #      to case 1. Without this case, a future edit that special-cases
 #      "explicit shared" but forgets the unset path could silently
 #      regress dynamic spawn for fresh-install agents.
+#   4. static shared legacy row + default-home workdir + existing v2
+#      workdir → resolver returns the v2 workdir, preserving pre-#895
+#      static agent state/cwd layout.
+#   5. static shared custom explicit cwd + existing v2 workdir → resolver
+#      still returns the custom cwd, so the legacy alignment does not
+#      blanket-rewrite explicit project overrides.
 #
-# All three cases are asserted because one-sided coverage would let any
+# All cases are asserted because one-sided coverage would let any
 # direction silently break the other.
 
 set -uo pipefail
@@ -70,7 +76,8 @@ fi
 SHARED_CWD="$SMOKE_TMP_ROOT/fake-project-shared"
 LU_CWD="$SMOKE_TMP_ROOT/fake-project-lu"
 UNSET_CWD="$SMOKE_TMP_ROOT/fake-project-unset"
-mkdir -p "$SHARED_CWD" "$LU_CWD" "$UNSET_CWD"
+STATIC_CUSTOM_CWD="$SMOKE_TMP_ROOT/fake-project-static-custom"
+mkdir -p "$SHARED_CWD" "$LU_CWD" "$UNSET_CWD" "$STATIC_CUSTOM_CWD"
 
 # Drive the resolver inside a fresh Bash 4+ shell that sources the full
 # library tree. We deliberately keep the controller-shell scope free of
@@ -178,6 +185,43 @@ smoke_assert_not_contains "$unset_resolved" "$BRIDGE_AGENT_ROOT_V2" \
   "no-mode resolver must not return any path under \$BRIDGE_AGENT_ROOT_V2 ($unset_anchor)"
 
 smoke_log "case 3: no isolation_mode entry → explicit cwd honored (resolved=$unset_resolved)"
+
+# ----------------------------------------------------------------------
+# Case 4 — static shared legacy rows with default-home workdir align back
+# to the existing v2 workdir. This is the static-agent exception to the
+# dynamic shared-mode behavior pinned above.
+# ----------------------------------------------------------------------
+
+legacy_agent="static_legacy"
+legacy_default_home="$BRIDGE_AGENT_HOME_ROOT/$legacy_agent"
+legacy_expected="$BRIDGE_AGENT_ROOT_V2/$legacy_agent/workdir"
+mkdir -p "$legacy_default_home" "$legacy_expected"
+
+legacy_resolved="$(run_resolver "$legacy_agent" "shared" "$legacy_default_home")" \
+  || smoke_fail "static legacy shared resolver invocation failed (resolved='$legacy_resolved')"
+
+smoke_assert_eq "$legacy_expected" "$legacy_resolved" \
+  "static shared legacy default-home row: resolver returns existing v2 workdir"
+
+smoke_log "case 4: static shared legacy default-home row → v2 workdir aligned (resolved=$legacy_resolved)"
+
+# ----------------------------------------------------------------------
+# Case 5 — static shared custom explicit cwd remains explicit even when a
+# v2 workdir exists. This keeps the #895 fix from turning into a blanket
+# rollback for shared-mode agents with project-specific cwd.
+# ----------------------------------------------------------------------
+
+custom_agent="static_custom"
+custom_expected="$BRIDGE_AGENT_ROOT_V2/$custom_agent/workdir"
+mkdir -p "$custom_expected"
+
+custom_resolved="$(run_resolver "$custom_agent" "shared" "$STATIC_CUSTOM_CWD")" \
+  || smoke_fail "static custom shared resolver invocation failed (resolved='$custom_resolved')"
+
+smoke_assert_eq "$STATIC_CUSTOM_CWD" "$custom_resolved" \
+  "static shared custom explicit cwd: resolver keeps project override despite existing v2 workdir"
+
+smoke_log "case 5: static shared custom explicit cwd → explicit cwd honored (resolved=$custom_resolved)"
 
 # ----------------------------------------------------------------------
 # Done

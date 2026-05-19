@@ -109,9 +109,31 @@ bridge_agent_update_caller_is_admin() {
   [[ -n "$admin" && -n "$agent" && "$agent" == "$admin" ]]
 }
 
+# bridge_agent_update_validate_channel_token — accepts the channel token
+# forms Claude understands on argv: plugin:NAME@SPEC and server:NAME.
+bridge_agent_update_validate_channel_token() {
+  local flag="$1"
+  local token="$2"
+
+  case "$token" in
+    plugin:*@*)
+      if [[ "$token" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
+        return 0
+      fi
+      ;;
+    server:*)
+      if [[ "$token" =~ ^server:[A-Za-z0-9_.-]+$ ]]; then
+        return 0
+      fi
+      ;;
+  esac
+
+  bridge_die "$flag token invalid (need plugin:NAME@SPEC or server:NAME): $token"
+}
+
 # bridge_agent_update_validate_channels_csv — split a --channels-set
 # CSV on `,`, strip per-token whitespace, and reject any non-empty token
-# that does not match the plugin:NAME@SPEC shape (codex r1 finding 4).
+# that is not a supported Claude channel selector.
 # Trailing-comma tolerance: empty tokens are skipped silently, so an
 # operator can pass `plugin:foo@m,` without tripping the validator.
 # Calls bridge_die on the first invalid token.
@@ -126,9 +148,7 @@ bridge_agent_update_validate_channels_csv() {
   for tok in "${_tokens[@]}"; do
     trimmed="$(printf '%s' "$tok" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
     [[ -z "$trimmed" ]] && continue
-    if [[ ! "$trimmed" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
-      bridge_die "$flag token invalid (need plugin:NAME@SPEC): $trimmed"
-    fi
+    bridge_agent_update_validate_channel_token "$flag" "$trimmed"
   done
 }
 

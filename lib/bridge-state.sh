@@ -356,6 +356,8 @@ bridge_claude_launch_with_channel_state_dirs() {
   local telegram_dir=""
   local teams_dir=""
   local ms365_dir=""
+  local claude_home_dir=""
+  local claude_config_dir=""
 
   required="$(bridge_agent_effective_launch_plugin_channels_csv "$agent")"
   launch_channels="$(bridge_extract_channels_from_command "$original")"
@@ -372,6 +374,8 @@ bridge_claude_launch_with_channel_state_dirs() {
   telegram_dir="$(bridge_agent_telegram_state_dir "$agent")"
   teams_dir="$(bridge_agent_teams_state_dir "$agent")"
   ms365_dir="$(bridge_agent_ms365_state_dir "$agent")"
+  claude_home_dir="$(bridge_agent_claude_home_dir "$agent")"
+  claude_config_dir="$(bridge_agent_claude_config_dir "$agent")"
 
   bridge_require_python
   # #946 L1 (r2 codex P1 #1): missing in r1. Substitution-safe guard. This
@@ -383,7 +387,8 @@ bridge_claude_launch_with_channel_state_dirs() {
     return 1
   fi
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-claude-channel-state-dirs.py" \
-    "$original" "$required" "$discord_dir" "$telegram_dir" "$teams_dir" "$ms365_dir"
+    "$original" "$required" "$discord_dir" "$telegram_dir" "$teams_dir" "$ms365_dir" \
+    "$claude_home_dir" "$claude_config_dir"
 }
 
 bridge_build_static_claude_launch_cmd() {
@@ -1501,7 +1506,7 @@ bridge_state_v2_isolated_target() {
   [[ -n "$agent" && -n "$target" ]] || return 1
   [[ "$(bridge_host_platform 2>/dev/null || uname)" == "Linux" ]] || return 1
   bridge_isolation_v2_active 2>/dev/null || return 1
-  [[ -n "$BRIDGE_AGENT_ROOT_V2" ]] || return 1
+  [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]] || return 1
   case "$target" in
     "$BRIDGE_AGENT_ROOT_V2"/"$agent"/*) ;;
     *) return 1 ;;
@@ -1932,7 +1937,7 @@ bridge_agent_idle_marker_dir() {
 
 bridge_agent_runtime_state_dir() {
   local agent="$1"
-  if bridge_isolation_v2_active && [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if bridge_isolation_v2_active && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
     printf '%s/%s/runtime' "$BRIDGE_AGENT_ROOT_V2" "$agent"
     return 0
   fi
@@ -2115,7 +2120,7 @@ PY
 
 bridge_agent_log_dir() {
   local agent="$1"
-  if bridge_isolation_v2_active && [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if bridge_isolation_v2_active && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
     printf '%s/%s/logs' "$BRIDGE_AGENT_ROOT_V2" "$agent"
     return 0
   fi
