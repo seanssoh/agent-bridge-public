@@ -383,7 +383,7 @@ scripts/smoke-test.sh	6070	C3	ab9cecab8191e7ab7f6442135decb2ce957f06f2bb6bcec6fe
 scripts/smoke-test.sh	6132	C3	5d7874fbee829996c4bd948490154ff044f08d081d72d33f640cc604a3fa506a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	6167	C3	3bb70cfd28687e4ad34ed146e9b9dfc72b4758050bdaf1ade032e15ce8e01e7e	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	6196	C3	c3141e83b99c73fbb1e88c0785e3fecfda7ab1e2fe7b6c8d15a4f12bf3db425c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6207	C3	29a053a8503443eff8a4a675bbeef3b7b18dd3bc79c1436d3a7b90a50e3b602c	interpreter heredoc, no capture		
+scripts/smoke-test.sh	6207	C3	29a053a8503443eff8a4a675bbeef3b7b18dd3bc79c1436d3a7b90a50e3b602c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F (PR #970 Teams)
 scripts/smoke-test.sh	6279	C3	a26ffeb108bee2e578e87efff5ff38e81e7a58229b95f4b4d3e5e37476ffe2a9	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	6390	C3	f2740667907706f819f0e2ab742ddec16e2284e080c9c437a4e452bcfcae030e	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	6555	C3	fa0c50dd95283b711fd2799bb484a40d9308a11c724288a9d8ef9cd9480e04eb	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
@@ -584,7 +584,7 @@ scripts/smoke/per-agent-settings-rendering.sh	64	C3	35aa990aa74d451003242d6fd7e3
 scripts/smoke/pre-compact-envelope-roundtrip.sh	75	C3	b264257d5e58c2055cad131f7c32300262bb01ed174f5c74639899bd54c3691c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/pre-compact-envelope-roundtrip.sh	134	C3	3f27914646de3d3930294253d977619d655395d8bea8b31ae6c2754522528f20	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/pre-compact-envelope-roundtrip.sh	173	C3	e8bf1e7bb1b6621c14ab49bfd63e04f88482877b034bd2b19e5959787443d3ce	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke/prune-legacy-teams-mcp.sh	57	C3	1cf2acd18e27aeb6c9365d3d3b76b63bb7a10c0e9e36d50ffb98f45410c1273e	interpreter heredoc, no capture		
+scripts/smoke/prune-legacy-teams-mcp.sh	57	C3	1cf2acd18e27aeb6c9365d3d3b76b63bb7a10c0e9e36d50ffb98f45410c1273e	interpreter heredoc, no capture	patch-dev	Phase 6 PR F (PR #970 Teams)
 scripts/smoke/queue.sh	57	C1	9312c346bf44c1593cb43e20042a6e5dd516a1ef1ad8a9f40e612d5465cd87ba	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
 scripts/smoke/queue.sh	262	C1	33a4c2ede24bfd27c26122c45faecda13962db315a1bcf9264db9df1690dbcda	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
 scripts/smoke/queue.sh	516	C3	f3f3b3f0296c1c5ff36fe573ff63f33d4a5103028d8002ca3de38d9182fe033f	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
