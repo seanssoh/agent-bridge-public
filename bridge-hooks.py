@@ -1584,6 +1584,135 @@ def _relink_agent_profile_paths(agent_home: Path, home_dir: Path) -> dict[str, l
     return result
 
 
+def _is_hud_status_line(cmd: str) -> bool:
+    """Return True if *cmd* looks like a claude-hud statusLine command."""
+    return "claude-hud" in cmd or "src/index.ts" in cmd or "index.js" in cmd
+
+
+def _hud_tap_present(cmd: str) -> bool:
+    return "hud-usage-tap" in cmd
+
+
+def _patch_hud_command(cmd: str, tap_path: str) -> str:
+    """Insert `python3 <tap_path> |` before the final bun/node exec call.
+
+    Handles both `exec "…bun…"` and `exec "…node…"` patterns.  If no
+    exec-runtime pattern is found, prepend the tap unconditionally so the
+    tap is still active (minor format change is better than silent no-op).
+    """
+    import re
+
+    tap_prefix = f"python3 {shlex.quote(tap_path)} | "
+    pattern = re.compile(r'(exec\s+"[^"]*(?:bun|node)[^"]*")')
+    if pattern.search(cmd):
+        return pattern.sub(rf"{tap_prefix}\1", cmd, count=1)
+    # Fallback: prepend at start of last semicolon-separated clause.
+    parts = cmd.rsplit(";", 1)
+    if len(parts) == 2:
+        return parts[0] + "; " + tap_prefix + parts[1].lstrip()
+    return tap_prefix + cmd
+
+
+def cmd_ensure_hud_usage_tap(args: argparse.Namespace) -> int:
+    """Patch a HUD statusLine command to pipe through hud-usage-tap.py.
+
+    Reads the current statusLine.command from settings.json.  If it is a
+    HUD command but does not yet include the tap, rewrites it in-place to
+    prepend `python3 <bridge_home>/scripts/hud-usage-tap.py |` before the
+    bun/node exec call.  Idempotent: re-running after patching is a no-op.
+    """
+    bridge_home = Path(args.bridge_home).expanduser()
+    tap_path = str(bridge_home / "scripts" / "hud-usage-tap.py")
+    settings_path = resolve_settings_path(args)
+    settings = ensure_settings_root(settings_path)
+
+    sl = settings.get("statusLine")
+    if not isinstance(sl, dict):
+        payload = {
+            "HOOK_SETTINGS_FILE": str(settings_path),
+            "HOOK_STATUS": "no-hud",
+            "HOOK_STOP_HOOK": "",
+            "HOOK_PROMPT_HOOK": "",
+            "HOOK_COMMAND": "",
+        }
+        print_payload(payload, args.format)
+        if args.format != "shell":
+            print("hud_usage_tap: no-hud (statusLine not present or not a dict)")
+        return 1
+
+    cmd = sl.get("command", "")
+    if not isinstance(cmd, str) or not _is_hud_status_line(cmd):
+        payload = {
+            "HOOK_SETTINGS_FILE": str(settings_path),
+            "HOOK_STATUS": "no-hud",
+            "HOOK_STOP_HOOK": "",
+            "HOOK_PROMPT_HOOK": "",
+            "HOOK_COMMAND": cmd,
+        }
+        print_payload(payload, args.format)
+        if args.format != "shell":
+            print("hud_usage_tap: no-hud (statusLine.command is not a HUD command)")
+        return 1
+
+    if _hud_tap_present(cmd):
+        payload = {
+            "HOOK_SETTINGS_FILE": str(settings_path),
+            "HOOK_STATUS": "present",
+            "HOOK_STOP_HOOK": "",
+            "HOOK_PROMPT_HOOK": "",
+            "HOOK_COMMAND": cmd,
+        }
+        print_payload(payload, args.format)
+        if args.format != "shell":
+            print("hud_usage_tap: present")
+        return 0
+
+    patched = _patch_hud_command(cmd, tap_path)
+    settings["statusLine"]["command"] = patched
+    save_json(settings_path, settings)
+
+    payload = {
+        "HOOK_SETTINGS_FILE": str(settings_path),
+        "HOOK_STATUS": "updated",
+        "HOOK_STOP_HOOK": "",
+        "HOOK_PROMPT_HOOK": "",
+        "HOOK_COMMAND": patched,
+    }
+    print_payload(payload, args.format)
+    if args.format != "shell":
+        print("hud_usage_tap: updated")
+    return 0
+
+
+def cmd_status_hud_usage_tap(args: argparse.Namespace) -> int:
+    settings_path = resolve_settings_path(args)
+    settings = ensure_settings_root(settings_path)
+
+    sl = settings.get("statusLine")
+    cmd = (sl or {}).get("command", "") if isinstance(sl, dict) else ""
+    if not cmd or not _is_hud_status_line(cmd):
+        status = "no-hud"
+        rc = 1
+    elif _hud_tap_present(cmd):
+        status = "present"
+        rc = 0
+    else:
+        status = "missing"
+        rc = 1
+
+    payload = {
+        "HOOK_SETTINGS_FILE": str(settings_path),
+        "HOOK_STATUS": status,
+        "HOOK_STOP_HOOK": "",
+        "HOOK_PROMPT_HOOK": "",
+        "HOOK_COMMAND": cmd,
+    }
+    print_payload(payload, args.format)
+    if args.format != "shell":
+        print(f"hud_usage_tap: {status}")
+    return rc
+
+
 def _resolve_agent_home_root(args: argparse.Namespace) -> Path:
     """Return the directory under which `<agent>/` agent homes live."""
     if getattr(args, "agent_home_root", None):
@@ -1852,6 +1981,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Emit a JSON payload instead of the human-readable summary.",
     )
     relink_profile_parser.set_defaults(handler=cmd_relink_agent_profile_paths)
+
+    hud_tap_ensure_parser = subparsers.add_parser(
+        "ensure-hud-usage-tap",
+        help="Patch a HUD statusLine command to pipe through hud-usage-tap.py.",
+    )
+    hud_tap_ensure_parser.add_argument("--workdir")
+    hud_tap_ensure_parser.add_argument("--settings-file")
+    hud_tap_ensure_parser.add_argument("--bridge-home", required=True)
+    hud_tap_ensure_parser.add_argument("--python-bin", required=True)
+    hud_tap_ensure_parser.add_argument(
+        "--format", choices=("text", "shell"), default="text"
+    )
+    hud_tap_ensure_parser.set_defaults(handler=cmd_ensure_hud_usage_tap)
+
+    hud_tap_status_parser = subparsers.add_parser(
+        "status-hud-usage-tap",
+        help="Report whether the HUD statusLine command includes hud-usage-tap.py.",
+    )
+    hud_tap_status_parser.add_argument("--workdir")
+    hud_tap_status_parser.add_argument("--settings-file")
+    hud_tap_status_parser.add_argument("--bridge-home", required=True)
+    hud_tap_status_parser.add_argument(
+        "--format", choices=("text", "shell"), default="text"
+    )
+    hud_tap_status_parser.set_defaults(handler=cmd_status_hud_usage_tap)
 
     return parser
 

@@ -28,6 +28,34 @@ import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
+
+
+def _to_iso(value: Any) -> str | None:
+    """Normalise a reset-at value to an ISO-8601 string.
+
+    Claude Code stdin emits resets_at as epoch seconds (integer) or an ISO
+    string. bridge-usage.py's reset_cycle_advanced/format_reset parse the
+    stored value with datetime.fromisoformat, which rejects bare integers.
+    Normalise here so the latch-clearing path works across reset windows.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str) and value.strip():
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return value
+        except ValueError:
+            pass
+        # fall through to epoch parse below
+    if isinstance(value, (int, float)) and value > 0:
+        ts = float(value)
+        if ts > 1e11:  # milliseconds → seconds
+            ts /= 1000
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S+00:00"
+        )
+    return None
 
 
 def _write_cache(data: dict) -> None:
@@ -58,8 +86,8 @@ def _write_cache(data: dict) -> None:
                 "planName": "subscription",
                 "fiveHour": fh,
                 "sevenDay": sd,
-                "fiveHourResetAt": five_hour.get("resets_at"),
-                "sevenDayResetAt": seven_day.get("resets_at"),
+                "fiveHourResetAt": _to_iso(five_hour.get("resets_at")),
+                "sevenDayResetAt": _to_iso(seven_day.get("resets_at")),
             },
             "_source": "stdin-tap",
             "_written_at": datetime.now(timezone.utc).isoformat(),
