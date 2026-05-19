@@ -2225,6 +2225,48 @@ if [[ $RESTART_AGENTS -eq 1 ]]; then
   # candidate under Bash 5.3.9. Stage via tempfile.
   bridge_upgrade_capture_to_var AGENT_RESTART_JSON \
     bridge_upgrade_agent_restart_json "$AGENT_RESTART_REPORT" 1 "$DRY_RUN"
+
+  # Issue #978 (closes #978, refs #879): post-restart agents — especially
+  # codex-engine agents — frequently land on an interactive picker that
+  # the controller-side auto-accept watcher does not arm for. The picker-
+  # sweep cron (`*/10 * * * *`) eventually unsticks them, but that leaves
+  # an operator-visible 10-minute window where the codex pane sits at
+  # "Press enter to continue" and inbox/queue progress stalls.
+  #
+  # Run picker-sweep one-shot synchronously now so codex pickers (and any
+  # Claude pickers the cold-start watcher missed) are cleared before the
+  # upgrade returns. This is the reactive primitive that already handles
+  # BOTH engines (see scripts/picker-sweep.sh's _PICKER_CODEX_CONFIRM_RE
+  # added 2026-05-16); we just invoke it earlier than the next cron tick.
+  #
+  # Skip when dry-run (no actual restart happened), when no agent reached
+  # status="restarted" (avoids running against an all-attached install),
+  # and when no admin agent is configured (the cron payload uses the
+  # admin for SELF/NOTIFY; same contract here).
+  if [[ $DRY_RUN -ne 1 ]] \
+      && printf '%s\n' "$AGENT_RESTART_REPORT" | grep -qE $'\t''restarted'$'\t' \
+      && [[ -n "${ADMIN_AGENT_ID:-}" ]]; then
+    if [[ -x "$TARGET_ROOT/scripts/picker-sweep.sh" || -r "$TARGET_ROOT/scripts/picker-sweep.sh" ]]; then
+      _picker_sweep_post_restart_output=""
+      if _picker_sweep_post_restart_output="$(
+        bridge_with_timeout 15 "upgrade_post_restart_picker_sweep" \
+          env BRIDGE_PICKER_SWEEP_ENABLED=1 \
+              BRIDGE_PICKER_SWEEP_SELF="$ADMIN_AGENT_ID" \
+              BRIDGE_PICKER_SWEEP_NOTIFY="$ADMIN_AGENT_ID" \
+              BRIDGE_HOME="$TARGET_ROOT" \
+          "$BRIDGE_BASH_BIN" "$TARGET_ROOT/scripts/picker-sweep.sh" 2>&1
+      )"; then
+        if [[ -n "$_picker_sweep_post_restart_output" ]]; then
+          printf '%s\n' "$_picker_sweep_post_restart_output" >&2
+        fi
+      else
+        # Sweep failure (timeout, non-zero exit) is non-fatal — the
+        # */10 cron will retry and any stuck pane is still operator-
+        # actionable. Surface the failure to stderr without aborting.
+        echo "[bridge-upgrade] WARN: post-restart picker-sweep failed (non-fatal — cron will retry): $_picker_sweep_post_restart_output" >&2
+      fi
+    fi
+  fi
 fi
 
 if [[ $JSON -eq 1 ]]; then
