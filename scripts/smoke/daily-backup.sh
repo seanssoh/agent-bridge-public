@@ -243,11 +243,12 @@ step_cleanup_residue_happy_path() {
 }
 
 step_timeout_resolution() {
-  # Issue #745: bridge_daily_backup_resolve_timeout honours
-  # BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS, defaults to 300, and clamps
-  # invalid input (0, negative, non-numeric) back to 300. Also asserts
-  # the env var name appears in the daemon's rc=124 failure detail wiring
-  # so operators see actionable guidance.
+  # Issue #745 / #975: bridge_daily_backup_resolve_timeout honours
+  # BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS, defaults to 600 (history: 120 in
+  # the original, 300 post-#745, 600 post-#975), and clamps invalid input
+  # (0, negative, non-numeric) back to that default. Also asserts the env
+  # var name appears in the daemon's rc=124 failure detail wiring so
+  # operators see actionable guidance.
   local daemon_src="$SMOKE_REPO_ROOT/bridge-daemon.sh"
   [[ -f "$daemon_src" ]] \
     || smoke_fail "timeout_resolution: bridge-daemon.sh missing at $daemon_src"
@@ -268,11 +269,11 @@ step_timeout_resolution() {
   # given env value, then prints the resolved timeout.
   local case_input case_want got
   for case_pair in \
-      "::300" \
-      "600:600" \
-      "0:300" \
-      "-1:300" \
-      "abc:300"; do
+      "::600" \
+      "900:900" \
+      "0:600" \
+      "-1:600" \
+      "abc:600"; do
     case_input="${case_pair%%:*}"
     case_want="${case_pair##*:}"
     if [[ -z "$case_input" ]]; then
@@ -304,6 +305,27 @@ step_timeout_resolution() {
   smoke_log "timeout_resolution OK (5/5 cases + rc=124 detail wiring)"
 }
 
+# issue #974 — multi-component path-part exclude (`plugins/cache`)
+# must match a consecutive subsequence anywhere in the relpath, must NOT
+# false-positive on (a) the components alone, (b) the components in the
+# wrong order, or (c) substring-only matches like `cache_other`. Legacy
+# single-component entries (`__pycache__`, `node_modules`) must keep the
+# fast-path `in parts` behaviour.
+step_path_part_excludes_multicomponent() {
+  smoke_log "step 8: path-part subsequence matcher (#974 regression)"
+  # Helper extracted to its own .py file to avoid heredoc-in-command-
+  # substitution (Footgun #11 ratchet — see lib/upgrade-helpers/).
+  local result
+  result="$(python3 "$SCRIPT_DIR/daily-backup-path-part-test.py" \
+    "$SMOKE_REPO_ROOT/bridge-upgrade.py" 2>&1)" \
+    || smoke_fail "path-part subsequence matcher failed: $result"
+
+  if [[ "$result" != PASS* ]]; then
+    smoke_fail "path-part subsequence matcher unexpected output: $result"
+  fi
+  smoke_log "path-part excludes OK ($result)"
+}
+
 main() {
   smoke_log "starting issue #507 regression smoke"
   step_snapshot_content
@@ -313,6 +335,7 @@ main() {
   step_corrupted_tasks_db_blocks_archive
   step_cleanup_residue_happy_path
   step_timeout_resolution
+  step_path_part_excludes_multicomponent
   smoke_log "all daily-backup checks passed"
 }
 
