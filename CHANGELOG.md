@@ -6,6 +6,53 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta] — 2026-05-19
+
+### Highlight — prerelease patch wave (4 fixes layered on v0.14.4)
+
+Operator-cued **prerelease** bundling the 4 fix PRs merged to `main` after the v0.14.4 ship (2026-05-18). Targets the v0.14.5 stabilization window: post-upgrade onboarding drift (#906), v2 shared-mode boot wedge (#909), watchdog alert noise (#905/#907), and a Teams inbound-wake fallback for #959. No new features; behavior of existing callers is preserved unless the bug shape changed.
+
+This is a `-beta` prerelease; the matching tag is `v0.14.5-beta` and the GitHub release is marked **Pre-release**. Stable `v0.14.5` will follow once the bundle has burned in.
+
+### Operator-visible
+
+- **`agent-bridge upgrade --apply` no longer regresses onboarded admins back to `Onboarding State: pending`** (closes #906 / PR #964). The v2 migrator now scans all three layout roots (`agents/<agent>/`, `data/agents/<agent>/{home,workdir}/`) for prior onboarding state before stamping `SESSION-TYPE.md` from template. One-way ratchet: pending → complete only; operators are never un-onboarded by an upgrade. Watchdog no longer files recurring high-priority profile-drift tasks for already-completed admins, and `restart_readiness` stays `ready` instead of flipping to `onboarding-pending`.
+- **`agent create <name>` on a v2-active shared-only install stays bootable** (closes #909 / PR #963). Previously the v2 isolation logic emitted a `linux-user` matrix (per-agent UID `agent-bridge-<X>`, group `ab-agent-<X>`) regardless of the agent's `isolation_mode`; on a shared-only install those identities don't exist, `chown` failed, and the daemon entered a ~15–30s restart loop the operator could not exit from inside an agent session (`agent update --loop off` is a TTY-protected mutation). The matrix now branches on `bridge_agent_isolation_mode`: shared agents get a controller-owned row family (operator + operator-primary-group, modes 2750 / 2770), no isolated-user-home, no per-agent plugin rows. Linux-user matrix is byte-identical to legacy shape. Belt-and-braces guard in `apply_row` also skips (warn + rc=0) when a resolved owner or group does not exist on the host.
+- **Watchdog stops filing admin-inbox tasks for two non-actionable conditions** (closes #905 + #907 / PR #962):
+  - **Engine-aware profile check (#905)** — Codex agents no longer drift on missing Claude-profile files (`CLAUDE.md`, `SOUL.md`, `MEMORY-SCHEMA.md`, `MEMORY.md`, `SESSION-TYPE.md`). The required-file set is now per-engine; codex returns empty, and onboarding-stale + managed-block checks are Claude-only.
+  - **Dynamic-agent fresh-state skip (#907)** — newly-provisioned dynamic agents (e.g. `librarian`) no longer trip the `missing_block` warn signal for the system-provisioned fresh shape (`onboarding_state: pending` + `missing_managed_claude_block: yes`). Actionable drift (broken symlinks, etc.) still surfaces — only the default fresh-provision shape is suppressed. Legacy listing-only fallback (`--no-registry-anchored` or registry lookup failure) preserves pre-fix Claude-required behavior so a broken registry never silently disables drift detection.
+- **Teams inbound — new `TEAMS_DELIVERY_MODE` env opt-in for queue-based fallback** (refs #959 / PR #961). Issue #959 surfaced a window where `notifications/claude/channel` is acked at the MCP layer but Claude Code silently drops the wake, leaving the agent idle while `messages.jsonl` is populated. Root cause lives in Claude Code; this patch ships an operator-visible workaround:
+
+  | Mode      | Behavior |
+  | --------- | --- |
+  | `channel` | Current behavior (default). One `mcp.notification` per message. No change for existing installs. |
+  | `bridge`  | Skip the channel notification; enqueue the message via `bridge-task.sh create`. Daemon wakes the agent through the standard inbox path. |
+  | `both`    | Fire the notification AND enqueue the queue task. Belt-and-braces; operator accepts possible duplicate delivery. |
+
+  Resolved once at module load (invalid values warn once on boot, not per message). Bridge-enqueue failures log to stderr but never throw — only channel-mode failures still surface to the Teams webhook so it retries. README §Delivery Mode rewritten with the three modes and trade-offs. Operators repro-ing #959 should set `TEAMS_DELIVERY_MODE=both` to keep both wake paths alive while the upstream notification-handler fix is investigated.
+
+### Files changed (vs v0.14.4)
+
+- `bridge-agent.sh` (+34) — `agent create` runs `bridge_isolation_v2_apply_grant_matrix_for_agent --apply` for shared agents on a v2-active install
+- `bridge-upgrade.py` (+92) — three onboarding-state preservation helpers + migration call site
+- `bridge-watchdog.py` (+187) — engine-aware required-files + dynamic-agent fresh-state suppression + 2 helper extractions
+- `lib/bridge-isolation-v2.sh` (+262) — `matrix_rows_for_agent` shared-mode branch, `apply_row` belt-and-braces, 2 new identity helpers
+- `plugins/teams/README.md` (+16) — §Delivery Mode rewrite (3-mode table + trade-offs)
+- `plugins/teams/server.ts` (+244) — `DELIVERY_MODE` resolver + `deliverViaBridgeQueue()` + reworked `handleActivity` delivery block
+- `scripts/smoke/isolation-v2-macos-noise-suppression.sh` (+2) — touched in PR #962 path
+- `scripts/smoke/watchdog-registry-anchored.sh` (+96) — 3 new cases (C8/C9/C9b) for the watchdog fix
+
+### Verification
+
+- All 4 PRs went through codex pair-review and shipped `implement-ok` before merging to `main`.
+- macOS / Linux compatibility preserved across all 4 paths (the v2 matrix fix in particular explicitly verifies macOS no-group surface with the belt-and-braces guard).
+- Operator host-level verification deferred — this is the purpose of the `-beta` channel.
+
+### Issues closed
+
+- #905, #906, #907, #909
+- #959 — partially addressed (operator workaround shipped; upstream Claude Code fix tracked separately)
+
 ## [0.14.4] — 2026-05-18
 
 ### Highlight — Teams plugin: bidirectional file attachments (Phase 1)
