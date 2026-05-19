@@ -8,9 +8,9 @@ version bumps via the `VERSION` file.
 
 ## [0.14.5-beta] — 2026-05-19
 
-### Highlight — prerelease patch wave (4 fixes layered on v0.14.4)
+### Highlight — prerelease patch wave (4 operator-visible fixes + 1 CI unblock)
 
-Operator-cued **prerelease** bundling the 4 fix PRs merged to `main` after the v0.14.4 ship (2026-05-18). Targets the v0.14.5 stabilization window: post-upgrade onboarding drift (#906), v2 shared-mode boot wedge (#909), watchdog alert noise (#905/#907), and a Teams inbound-wake fallback for #959. No new features; behavior of existing callers is preserved unless the bug shape changed.
+Operator-cued **prerelease** bundling the 4 operator-visible fix PRs merged to `main` after the v0.14.4 ship (2026-05-18) plus a smoke-only CI gate restoration. Targets the v0.14.5 stabilization window: post-upgrade onboarding drift (#906), v2 shared-mode boot wedge (#909), watchdog alert noise (#905/#907), a Teams inbound-wake fallback for #959, and the smoke-only fix (#969) that restored the `unit/static smoke` CI gate after main had been red for 2+ days. No new features; behavior of existing callers is preserved unless the bug shape changed.
 
 This is a `-beta` prerelease; the matching tag is `v0.14.5-beta` and the GitHub release is marked **Pre-release**. Stable `v0.14.5` will follow once the bundle has burned in.
 
@@ -31,6 +31,10 @@ This is a `-beta` prerelease; the matching tag is `v0.14.5-beta` and the GitHub 
 
   Resolved once at module load (invalid values warn once on boot, not per message). Bridge-enqueue failures log to stderr but never throw — only channel-mode failures still surface to the Teams webhook so it retries. README §Delivery Mode rewritten with the three modes and trade-offs. Operators repro-ing #959 should set `TEAMS_DELIVERY_MODE=both` to keep both wake paths alive while the upstream notification-handler fix is investigated.
 
+### Dev / CI unblock (no operator-visible behavior change)
+
+- **`unit/static smoke` CI gate restored** (PR #969). main had been CI-red since 2026-05-17 13:01 UTC because (a) `scripts/smoke/upgrade-source-preservation.sh:117` asserted unquoted `BRIDGE_ADMIN_AGENT_ID=patch` after the writer in `bridge-setup.sh` started emitting the quoted form `BRIDGE_ADMIN_AGENT_ID="patch"` (defensive against future values with spaces), and (b) `scripts/smoke/admin-pair-no-auto-backfill.sh:C1` called `bridge-init.sh --dry-run` which early-gates with `bridge_init_require_command codex` even though the GH Actions Ubuntu runner has no `codex` (or `claude`) binary on PATH. Fix is smoke-only: assertion now matches the quoted writer form, and the dry-run probe plants exit-0 `codex` + `claude` shims in a mktemp dir and prepends to PATH for the probe scope only. No production code changed (bridge-init.sh, bridge-setup.sh untouched). No CI image changed. Operator + dev hosts that have the real engine binary on PATH are unaffected (the shim is shadowed and dry-run never invokes it).
+
 ### Files changed (vs v0.14.4)
 
 - `bridge-agent.sh` (+34) — `agent create` runs `bridge_isolation_v2_apply_grant_matrix_for_agent --apply` for shared agents on a v2-active install
@@ -41,6 +45,8 @@ This is a `-beta` prerelease; the matching tag is `v0.14.5-beta` and the GitHub 
 - `plugins/teams/server.ts` (+244) — `DELIVERY_MODE` resolver + `deliverViaBridgeQueue()` + reworked `handleActivity` delivery block
 - `scripts/smoke/isolation-v2-macos-noise-suppression.sh` (+2) — touched in PR #962 path
 - `scripts/smoke/watchdog-registry-anchored.sh` (+96) — 3 new cases (C8/C9/C9b) for the watchdog fix
+- `scripts/smoke/admin-pair-no-auto-backfill.sh` (+16/-5) — codex/claude shim for the dry-run probe (PR #969 CI unblock)
+- `scripts/smoke/upgrade-source-preservation.sh` (+1/-1) — assertion matches writer's quoted form (PR #969 CI unblock)
 
 ### Verification
 
