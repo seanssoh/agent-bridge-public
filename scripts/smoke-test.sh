@@ -6176,22 +6176,23 @@ results = payload["results"]
 assert len(results) == 1, results
 row = results[0]
 assert row["plugin"] == "teams", row
-assert row["status"] in {"linked", "updated", "unchanged"}, row
+assert row["status"] in {"linked-verified", "updated-verified", "unchanged-verified"}, row
 assert row["cache_type"] == "directory", row
-assert row["node_modules_status"] == "linked", row
+assert row["node_modules_status"] == "present", row
 assert cache_version.is_dir() and not cache_version.is_symlink(), cache_version
 assert (cache_version / "server.ts").read_text(encoding="utf-8") == "source server\n"
 assert not (cache_version / ".orphaned_at").exists()
 source_node_modules = source / "node_modules"
 cache_node_modules = cache_version / "node_modules"
-assert source_node_modules.is_symlink(), source_node_modules
-assert source_node_modules.resolve() == cache_node_modules.resolve(), (source_node_modules, cache_node_modules)
-assert (source_node_modules / "@smoke-dep" / "package.json").exists()
+assert not source_node_modules.exists(), source_node_modules
+assert (cache_node_modules / "@smoke-dep" / "package.json").exists()
 mcp = json.loads((source / ".mcp.json").read_text(encoding="utf-8"))
 args = mcp["mcpServers"]["teams"]["args"]
 assert args[:2] == ["--cwd", "${CLAUDE_PLUGIN_ROOT}"], args
 assert args[2:] == ["--no-install", "${CLAUDE_PLUGIN_ROOT}/server.ts"], args
 PY
+mkdir -p "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/teams/node_modules/@source-only"
+printf '{"name":"@source-only"}\n' >"$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/teams/node_modules/@source-only/package.json"
 python3 - "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/ms365/.mcp.json" <<'PY'
 import json
 import sys
@@ -6203,13 +6204,19 @@ assert args[:2] == ["--cwd", "${CLAUDE_PLUGIN_ROOT}"], args
 assert args[2:] == ["--no-install", "${CLAUDE_PLUGIN_ROOT}/server.ts"], args
 PY
 DEV_PLUGIN_CACHE_JSON_AGAIN="$(python3 "$REPO_ROOT/bridge-dev-plugin-cache.py" sync --channels "plugin:teams@agent-bridge" --root "$DEV_PLUGIN_MARKETPLACE_ROOT" --json)"
-python3 - "$DEV_PLUGIN_CACHE_JSON_AGAIN" <<'PY'
+python3 - "$DEV_PLUGIN_CACHE_JSON_AGAIN" "$DEV_PLUGIN_MARKETPLACE_ROOT/plugins/teams" "$TEAMS_CACHE_VERSION_DIR" <<'PY'
 import json
 import sys
+from pathlib import Path
 
 payload = json.loads(sys.argv[1])
-assert payload["results"][0]["status"] == "unchanged", payload
-assert payload["results"][0]["node_modules_status"] == "unchanged", payload
+source = Path(sys.argv[2])
+cache_version = Path(sys.argv[3])
+assert payload["results"][0]["status"] == "unchanged-verified", payload
+assert payload["results"][0]["node_modules_status"] == "present", payload
+assert (source / "node_modules" / "@source-only" / "package.json").exists(), source
+assert (cache_version / "node_modules" / "@smoke-dep" / "package.json").exists()
+assert not (cache_version / "node_modules" / "@source-only").exists(), cache_version
 PY
 
 log "syncing third-party dev-loaded plugin cache via known_marketplaces.json"

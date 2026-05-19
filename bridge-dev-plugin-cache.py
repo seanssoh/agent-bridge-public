@@ -518,7 +518,12 @@ def _is_symlink_outside_source_root(entry: Path, source_root: Path) -> bool:
             return True
 
 
-def _overlay_dir(src: Path, dst: Path, source_root: Path) -> bool:
+def _overlay_dir(
+    src: Path,
+    dst: Path,
+    source_root: Path,
+    skip_names: set[str] | None = None,
+) -> bool:
     """Recursively overlay src onto dst. Returns True if anything was written.
 
     r4 codex catch — entries that are symlinks-to-directory (created
@@ -540,7 +545,10 @@ def _overlay_dir(src: Path, dst: Path, source_root: Path) -> bool:
     if dst.exists() and not dst.is_dir():
         remove_tree(dst)
     dst.mkdir(parents=True, exist_ok=True)
+    skip_names = skip_names or set()
     for entry in src.iterdir():
+        if entry.name in skip_names:
+            continue
         target = dst / entry.name
         if _is_symlink_outside_source_root(entry, source_root):
             sys.stderr.write(
@@ -550,7 +558,7 @@ def _overlay_dir(src: Path, dst: Path, source_root: Path) -> bool:
             )
             continue
         if entry.is_dir():  # includes symlinks-to-directory (resolved-stat)
-            if _overlay_dir(entry, target, source_root):
+            if _overlay_dir(entry, target, source_root, skip_names=skip_names):
                 changed = True
         elif entry.is_file() or entry.is_symlink():
             if _copy_file_if_changed(entry, target):
@@ -562,8 +570,14 @@ def overlay_source_to_cache(
     source_path: Path,
     cache_version_path: Path,
     source_root: Path | None = None,
+    skip_names: set[str] | None = None,
 ) -> bool:
-    """Mirror EVERYTHING from source onto cache, including node_modules.
+    """Mirror source into cache.
+
+    First-time installs and migrations mirror everything, including
+    node_modules. Existing cache refreshes may pass ``skip_names`` to
+    preserve expensive subtrees in place while still picking up source
+    edits to plugin code and metadata.
 
     r3 codex catch — earlier overlay skipped node_modules and
     link_source_node_modules then symlinked source/node_modules → cache,
@@ -597,7 +611,10 @@ def overlay_source_to_cache(
     else:
         source_root = source_root.resolve()
     changed = False
+    skip_names = skip_names or set()
     for entry in source_path.iterdir():
+        if entry.name in skip_names:
+            continue
         target = cache_version_path / entry.name
         if _is_symlink_outside_source_root(entry, source_root):
             sys.stderr.write(
@@ -610,7 +627,7 @@ def overlay_source_to_cache(
         # materialized into the cache as a real directory copy. Old
         # ordering matched is_symlink first → shutil.copy2 → corrupt cache.
         if entry.is_dir():
-            if _overlay_dir(entry, target, source_root):
+            if _overlay_dir(entry, target, source_root, skip_names=skip_names):
                 changed = True
         elif entry.is_file() or entry.is_symlink():
             if _copy_file_if_changed(entry, target):
@@ -801,11 +818,19 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
             cache_type = "directory"
         elif cache_version_path.is_dir():
             # Already a real per-agent directory. Overlay source files
-            # (except node_modules) so operator edits to source reach
-            # the cache, while preserving the cache's installed
-            # node_modules dir. The source root's node_modules is then
-            # linked back to the cache below.
-            changed = overlay_source_to_cache(source_path, cache_version_path, source_root=root)
+            # except node_modules so operator edits to source reach the
+            # cache while the expensive dependency tree is preserved in
+            # place. Re-walking node_modules on every agent start can
+            # block launch behind filesystem/AV scans on live installs.
+            skip_names = set()
+            if (cache_version_path / NODE_MODULES_NAME).is_dir():
+                skip_names.add(NODE_MODULES_NAME)
+            changed = overlay_source_to_cache(
+                source_path,
+                cache_version_path,
+                source_root=root,
+                skip_names=skip_names,
+            )
             status = "updated" if changed else "unchanged"
             cache_type = "directory"
         elif cache_version_path.exists():
