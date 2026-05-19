@@ -2248,13 +2248,46 @@ if [[ $RESTART_AGENTS -eq 1 ]]; then
       && [[ -n "${ADMIN_AGENT_ID:-}" ]]; then
     if [[ -x "$TARGET_ROOT/scripts/picker-sweep.sh" || -r "$TARGET_ROOT/scripts/picker-sweep.sh" ]]; then
       _picker_sweep_post_restart_output=""
+      # Run picker-sweep under bridge_upgrade_with_target_env so the
+      # sweep's children (bridge-task, bridge-auth, bridge-queue) see a
+      # clean target-rooted env and never inherit the caller's source-
+      # checkout BRIDGE_* paths or any agent-scoped BRIDGE_AGENT_ID /
+      # BRIDGE_ACTIVE_AGENT_DIR. Without this wrap, picker-sweep's
+      # task-create notification could write to the wrong BRIDGE_TASK_DB
+      # or under the wrong agent scope.
+      #
+      # bridge_with_timeout can't wrap a shell function (it execs `timeout
+      # <secs> <argv>` and `timeout` only knows how to exec binaries), so
+      # we apply the 15s envelope INSIDE the target-env subprocess by
+      # routing through bash -c that invokes GNU timeout itself when
+      # available and otherwise falls through (the */10 picker-sweep cron
+      # remains as the hard backstop for any hang).
       if _picker_sweep_post_restart_output="$(
-        bridge_with_timeout 15 "upgrade_post_restart_picker_sweep" \
-          env BRIDGE_PICKER_SWEEP_ENABLED=1 \
-              BRIDGE_PICKER_SWEEP_SELF="$ADMIN_AGENT_ID" \
-              BRIDGE_PICKER_SWEEP_NOTIFY="$ADMIN_AGENT_ID" \
-              BRIDGE_HOME="$TARGET_ROOT" \
-          "$BRIDGE_BASH_BIN" "$TARGET_ROOT/scripts/picker-sweep.sh" 2>&1
+        bridge_upgrade_with_target_env "$TARGET_ROOT" \
+          "$BRIDGE_BASH_BIN" -c '
+            set -u
+            target_root="$1"
+            admin_id="$2"
+            if command -v timeout >/dev/null 2>&1; then
+              timeout_bin=timeout
+            elif command -v gtimeout >/dev/null 2>&1; then
+              timeout_bin=gtimeout
+            else
+              timeout_bin=""
+            fi
+            sweep_cmd=(
+              env
+                BRIDGE_PICKER_SWEEP_ENABLED=1
+                BRIDGE_PICKER_SWEEP_SELF="$admin_id"
+                BRIDGE_PICKER_SWEEP_NOTIFY="$admin_id"
+                bash "$target_root/scripts/picker-sweep.sh"
+            )
+            if [[ -n "$timeout_bin" ]]; then
+              "$timeout_bin" 15 "${sweep_cmd[@]}"
+            else
+              "${sweep_cmd[@]}"
+            fi
+          ' bridge_upgrade_picker_sweep "$TARGET_ROOT" "$ADMIN_AGENT_ID" 2>&1
       )"; then
         if [[ -n "$_picker_sweep_post_restart_output" ]]; then
           printf '%s\n' "$_picker_sweep_post_restart_output" >&2
