@@ -64,6 +64,15 @@ invoke_renderer() {
     --launch-cmd ""
 }
 
+invoke_renderer_with_agent_bridge_plugin() {
+  BRIDGE_HOME="$FIXTURE_BRIDGE_HOME" \
+    python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" render-shared-settings \
+      --base-settings-file "$BASE" \
+      --overlay-settings-file "$OVERLAY" \
+      --effective-settings-file "$EFFECTIVE" \
+      --launch-cmd "claude --dangerously-load-development-channels plugin:teams@agent-bridge"
+}
+
 assert_fresh_render_has_no_user_keys() {
   invoke_renderer >/dev/null
 
@@ -113,6 +122,20 @@ PY
     "non-allowlisted operator key dropped (allowlist is tight)"
 }
 
+assert_agent_bridge_plugin_settings_rendered() {
+  rm -f "$EFFECTIVE"
+  invoke_renderer_with_agent_bridge_plugin >/dev/null
+
+  local content
+  content="$(cat "$EFFECTIVE")"
+  smoke_assert_contains "$content" '"teams@agent-bridge": true' \
+    "Agent Bridge dev plugin is enabled from launch command"
+  smoke_assert_contains "$content" '"extraKnownMarketplaces"' \
+    "Agent Bridge marketplace settings are rendered"
+  smoke_assert_contains "$content" "\"path\": \"$FIXTURE_BRIDGE_HOME\"" \
+    "Agent Bridge marketplace path points at BRIDGE_HOME"
+}
+
 assert_idempotent() {
   local before after
   before="$(python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$EFFECTIVE")"
@@ -131,6 +154,8 @@ main() {
     assert_user_keys_preserved_on_rerender
   smoke_run "rerender is idempotent" \
     assert_idempotent
+  smoke_run "Agent Bridge dev plugin settings rendered from launch command" \
+    assert_agent_bridge_plugin_settings_rendered
 
   smoke_log "PASS"
 }
