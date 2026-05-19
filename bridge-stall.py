@@ -126,6 +126,32 @@ AGENT_GLYPH_PREFIXES = (
     "•", "│", "└",
 )
 
+# Raw provider/system error prefixes that should break out of an in-agent
+# block and reach classification even when they immediately follow a glyph
+# line without a blank separator. Without this escape hatch, a real stall
+# like `Error: HTTP 429 too many requests` arriving directly under a codex
+# `• Running smoke` head line would be swallowed by the in-block skip — an
+# actually-rate-limited agent would appear idle to bridge-stall.
+#
+# Anchored at the *raw* line start (no leading whitespace allowed) + word
+# boundary + colon-or-whitespace separator. Indentation matters here:
+# codex renders tool/diff output as indented continuation lines under a
+# glyph head, and a continuation that quotes a prior error (e.g.
+# `  Error: HTTP 429 ...` two spaces in, transcript inside a tool block)
+# must NOT escape. Only flush-left raw provider output qualifies. Casual
+# narration ("the user got an error", "errors are common") and diff bodies
+# ("1 +error_message =") cannot match the line-start anchor either.
+# Tool-output continuations like `└ tool: error: file not found` are not
+# affected here — those start with the `└` glyph and are skipped by
+# AGENT_GLYPH_PREFIXES before this rule is evaluated. The keyword set is
+# the minimal shape of raw provider/runtime error lines we have actually
+# seen in stall captures; extend only when a new false-negative is
+# reproduced.
+RAW_ERROR_PREFIXES_RE = re.compile(
+    r"^(error|err|warning|fatal|panic|exception)\b\s*[:\s]",
+    re.IGNORECASE,
+)
+
 
 def looks_like_agent_output(stripped: str) -> bool:
     # Re-enter capture after an [Agent Bridge] nudge as soon as we see either
@@ -220,6 +246,19 @@ def classify(normalized: str) -> tuple[str, str, str]:
     # output: top-level pane items are separated by blank lines, and any
     # rendering inside one item is the agent narrating. Issue #329 Track D's
     # walk-line-by-line semantics and matched_line_hash dedup are preserved.
+    #
+    # Escape hatch: raw provider/system error lines (`Error: HTTP 429 ...`,
+    # `Fatal: ...`, etc.) that land directly under a glyph head without a
+    # blank separator MUST still classify — otherwise an actually-rate-
+    # limited agent appears idle to bridge-stall. The block-skip is gated
+    # on RAW_ERROR_PREFIXES_RE matched against the *raw* line (with
+    # original leading whitespace) so an indented continuation that quotes
+    # an error inside a tool block (`  Error: HTTP 429 ...` two spaces in)
+    # stays suppressed; only flush-left raw provider output escapes. Diff
+    # bodies (`1 +HTTP/1.1 401 Unauthorized`), tool output continuations
+    # (`└ HTTP/1.1 200 OK` — already glyph-skipped), and flush-left wrap
+    # continuations (`-0)`) do not start with one of the raw-error keywords
+    # and therefore stay suppressed.
     in_agent_block = False
     for raw in normalized.splitlines():
         stripped = raw.strip()
@@ -229,7 +268,7 @@ def classify(normalized: str) -> tuple[str, str, str]:
         if stripped.startswith(AGENT_GLYPH_PREFIXES):
             in_agent_block = True
             continue
-        if in_agent_block:
+        if in_agent_block and not RAW_ERROR_PREFIXES_RE.match(raw):
             continue
         haystack = stripped.lower()
         for classification, patterns in PATTERN_GROUPS:

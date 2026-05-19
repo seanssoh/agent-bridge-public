@@ -951,6 +951,54 @@ run_stall_classify_case "CJK prose discussing access -> silent" \
   "" \
   $'승인 안 된 액세스를 묘님이 검토 중\n'
 
+log "stall-detector codex glyph in-block raw-error escape (PR #965 fixer)"
+# PR #965 originally skipped every line inside an agent-glyph block until
+# the next blank line, to suppress false-positives from codex wrap
+# continuations (`-0)`) and diff bodies (`1 +HTTP/1.1 401 Unauthorized`).
+# That swallowed real raw provider errors landing directly under a glyph
+# head without a blank — e.g. `• Running smoke\nError: HTTP 429 ...`
+# would classify as silent, hiding an actually-rate-limited agent from
+# bridge-stall. The follow-up gates the in-block skip on
+# RAW_ERROR_PREFIXES_RE so lines starting with `Error:` / `Fatal:` /
+# `Warning:` / `Panic:` / `Exception:` break out and still classify.
+# Verify both the recovered false-negative cases AND the original
+# false-positive guards.
+run_stall_classify_case "glyph + Error: HTTP 429 (no blank) -> rate_limit" \
+  "rate_limit" \
+  $'• Running smoke\nError: HTTP 429 too many requests\n'
+run_stall_classify_case "glyph + blank + Error: HTTP 429 -> rate_limit" \
+  "rate_limit" \
+  $'• Running smoke\n\nError: HTTP 429 too many requests\n'
+run_stall_classify_case "glyph + Fatal: connection reset -> network" \
+  "network" \
+  $'• Running smoke\nFatal: connection reset by peer\n'
+# Negative regressions: the original false-positive set PR #965 was
+# protecting against must remain silent.
+run_stall_classify_case "glyph + box-drawing tail HTTP 200 -> silent" \
+  "" \
+  $'• Running smoke\n└ Processing request 1 of 12\n└ HTTP/1.1 200 OK\n'
+run_stall_classify_case "glyph + box-drawing tail HTTP 401 (smoke transcript) -> silent" \
+  "" \
+  $'• Running smoke\n└ HTTP/1.1 401 Unauthorized\n'
+run_stall_classify_case "glyph + flush-left wrap continuation -> silent" \
+  "" \
+  $'• Added /very/long/path/to/file.md (+34\n-0)\n1 +HTTP/1.1 401 Unauthorized\n'
+run_stall_classify_case "glyph + tool-output error continuation -> silent" \
+  "" \
+  $'• Tool call\n└ tool: error: file not found\n'
+# Indented continuation quoting an error inside a tool block must stay
+# silent: the raw-error escape hatch is anchored to flush-left raw lines
+# only. Any leading whitespace means it is a tool/diff continuation, not
+# a fresh provider error stream.
+run_stall_classify_case "glyph + indented Error: continuation -> silent" \
+  "" \
+  $'• Running smoke\n  Error: HTTP 429 too many requests\n'
+# Block reset across consecutive glyph blocks: after a blank line, a
+# fresh raw error must still classify (in_agent_block is reset).
+run_stall_classify_case "two glyph blocks separated by blank + trailing error -> rate_limit" \
+  "rate_limit" \
+  $'• Glyph A\n• Glyph B\n\nError: HTTP 429 rate limit exceeded\n'
+
 log "stall-detector matched_line_hash dedup (#329 Track D)"
 # Track D fallback: even if a future false-positive slips past the narrowed
 # regex, dedup on the matched line itself (not the shifting excerpt window)
