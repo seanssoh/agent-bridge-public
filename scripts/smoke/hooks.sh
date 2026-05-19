@@ -227,6 +227,47 @@ EOF
   assert_claude_auto_compact_window "$BRIDGE_AGENT_HOME_ROOT/.claude/settings.effective.json" "1000000" "v2 managed shared settings"
 }
 
+v2_shared_agent_claude_config_settings() {
+  local agent agent_home bash4_bin config_settings config_effective output workdir
+
+  agent="shared-config-agent"
+  workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
+  agent_home="$BRIDGE_AGENT_ROOT_V2/$agent/home"
+  mkdir -p "$workdir" "$agent_home"
+  cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
+bridge_add_agent_id_if_missing "$agent"
+BRIDGE_AGENT_ENGINE["$agent"]="claude"
+BRIDGE_AGENT_SOURCE["$agent"]="static"
+BRIDGE_AGENT_SESSION["$agent"]="$agent"
+BRIDGE_AGENT_WORKDIR["$agent"]="$workdir"
+BRIDGE_AGENT_ISOLATION_MODE["$agent"]="shared"
+EOF
+
+  bash4_bin="$BASH"
+  if (( BASH_VERSINFO[0] < 4 )); then
+    if [[ -x /opt/homebrew/bin/bash ]]; then
+      bash4_bin="/opt/homebrew/bin/bash"
+    elif [[ -x /usr/local/bin/bash ]]; then
+      bash4_bin="/usr/local/bin/bash"
+    fi
+  fi
+
+  output="$(
+    "$bash4_bin" -c 'repo="$1"; workdir="$2"; agent="$3"; source "$repo/bridge-lib.sh"; bridge_load_roster; bridge_ensure_claude_prompt_hook "$workdir" "" "$agent"' \
+      _ "$SMOKE_REPO_ROOT" "$workdir" "$agent"
+  )"
+  smoke_assert_contains "$output" "settings_file: $workdir/.claude/settings.json" "v2 shared workdir settings link output"
+
+  config_settings="$agent_home/.claude/settings.json"
+  config_effective="$agent_home/.claude/settings.effective.json"
+  [[ -L "$config_settings" ]] || smoke_fail "v2 shared Claude config settings.json should be a symlink"
+  smoke_assert_file_exists "$config_effective" "v2 shared Claude config effective settings rendered"
+  smoke_assert_contains "$(cat "$config_settings")" "$BRIDGE_HOME/hooks/prompt_timestamp.py" \
+    "v2 shared Claude config prompt hook uses controller bridge home"
+  smoke_assert_not_contains "$(cat "$config_settings")" "~/.agent-bridge/hooks/prompt_timestamp.py" \
+    "v2 shared Claude config prompt hook must not resolve through agent HOME"
+}
+
 claude_settings_mode_source_gate() {
   # Issue #516: bridge_claude_settings_mode must gate the registered-workdir
   # branch on source=static. Dynamic claude agents register a workdir in
@@ -368,6 +409,7 @@ main() {
   smoke_run "Codex hooks ensure/status" codex_hooks_contract
   smoke_run "Claude hooks ensure/status" claude_hooks_contract
   smoke_run "Claude shared settings context defaults" claude_shared_settings_context_defaults
+  smoke_run "v2 shared agent Claude config settings" v2_shared_agent_claude_config_settings
   smoke_run "v2 managed static workdir shared settings" managed_v2_workdir_shared_settings
   smoke_run "claude settings mode source=static gate (#516)" claude_settings_mode_source_gate
   smoke_run "hook runtime helper output" hook_runtime_helpers
