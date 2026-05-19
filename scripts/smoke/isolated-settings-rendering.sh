@@ -142,6 +142,10 @@ assert_hook_entries_present() {
     "UserPromptSubmit includes prompt_timestamp.py"
   smoke_assert_contains "$content" 'permission_escalation.py' \
     "PermissionDenied points at permission_escalation.py"
+  smoke_assert_contains "$content" "$FIXTURE_BRIDGE_HOME/hooks/permission_escalation.py" \
+    "PermissionDenied hook uses an absolute bridge-home path"
+  smoke_assert_not_contains "$content" "~/.agent-bridge/hooks" \
+    "rendered hook commands do not depend on runtime HOME"
 }
 
 assert_settings_is_symlink() {

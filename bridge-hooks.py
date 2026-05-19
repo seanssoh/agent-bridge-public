@@ -990,6 +990,45 @@ PRESERVED_USER_KEYS = (
 )
 
 
+def _bridge_home_from_base_settings(base_path: Path) -> Path | None:
+    expanded = base_path.expanduser()
+    try:
+        if (
+            expanded.name == "settings.json"
+            and expanded.parent.name == ".claude"
+            and expanded.parent.parent.name == "agents"
+        ):
+            return expanded.parent.parent.parent
+    except IndexError:
+        return None
+    return None
+
+
+def _normalize_bridge_hook_paths(settings: dict[str, Any], bridge_home: Path | None) -> None:
+    if bridge_home is None:
+        return
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return
+    old_prefix = "~/.agent-bridge/hooks/"
+    new_prefix = f"{bridge_home}/hooks/"
+    for groups in hooks.values():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            entries = group.get("hooks")
+            if not isinstance(entries, list):
+                continue
+            for hook in entries:
+                if not isinstance(hook, dict):
+                    continue
+                command = hook.get("command")
+                if isinstance(command, str) and old_prefix in command:
+                    hook["command"] = command.replace(old_prefix, new_prefix)
+
+
 def _load_preserved_user_keys(effective_path: Path) -> dict[str, Any]:
     """Read the user-owned subset of an existing effective settings file.
 
@@ -1032,6 +1071,7 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     merged = merge_settings(merged, overlay_payload)
     if preserved:
         merged = merge_settings(merged, preserved)
+    _normalize_bridge_hook_paths(merged, _bridge_home_from_base_settings(base_path))
     save_json(effective_path, merged)
 
     payload = {
@@ -1116,6 +1156,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     merged = merge_settings(merged, overlay_payload)
     if preserved:
         merged = merge_settings(merged, preserved)
+    _normalize_bridge_hook_paths(merged, _bridge_home_from_base_settings(base_path))
 
     # 3. Atomic write of the effective file (mode 0644 so the isolated UID
     # can read it; ownership stays with whoever invoked us — controller
