@@ -15,6 +15,8 @@
 #      confirmation prompts that codex r1 flagged as a false-positive vector)
 #   5b. Picker option line + tail combined → send Enter (canonical positive)
 #   6. Notify-empty path: BRIDGE_PICKER_SWEEP_NOTIFY="" → send Enter, no task
+#   6b. Rate-limit picker triggers at most one claude-token rotation attempt
+#       per sweep, while non-rate-limit pickers do not rotate.
 #
 # Test seams: this smoke replaces tmux + agent-bridge calls with mock shell
 # functions exported through BRIDGE_PICKER_SWEEP_*_FN env vars. The mocks
@@ -45,6 +47,7 @@ mkdir -p "$FIXTURE_DIR"
 # Captured side effects from the mocks (one line per call).
 SEND_LOG="$FIXTURE_DIR/sent-keys.log"
 TASK_LOG="$FIXTURE_DIR/created-tasks.log"
+ROTATE_LOG="$FIXTURE_DIR/token-rotations.log"
 
 # ---------------------------------------------------------------------------
 # Mock harness — written to a file the test can sourceable as functions.
@@ -94,7 +97,13 @@ mock_create_task() {
         "$recipient" "$title" "$body" >> "$TASK_LOG"
 }
 
-export -f mock_list_sessions mock_capture_pane mock_send_enter mock_send_option mock_create_task
+mock_rotate_claude_token() {
+    local target="$1"
+    printf '%s\n' "$target" >> "$ROTATE_LOG"
+    printf '{"status":"rotated","active_token_id":"next","reason":"smoke"}\n'
+}
+
+export -f mock_list_sessions mock_capture_pane mock_send_enter mock_send_option mock_create_task mock_rotate_claude_token
 MOCK_EOF
 # shellcheck source=/dev/null
 source "$MOCK_LIB"
@@ -105,18 +114,21 @@ export BRIDGE_PICKER_SWEEP_CAPTURE_PANE_FN=mock_capture_pane
 export BRIDGE_PICKER_SWEEP_SEND_ENTER_FN=mock_send_enter
 export BRIDGE_PICKER_SWEEP_SEND_OPTION_FN=mock_send_option
 export BRIDGE_PICKER_SWEEP_CREATE_TASK_FN=mock_create_task
+export BRIDGE_PICKER_SWEEP_ROTATE_CLAUDE_TOKEN_FN=mock_rotate_claude_token
 
 # Pin the log file so the smoke can inspect it.
 export BRIDGE_PICKER_SWEEP_LOG="$FIXTURE_DIR/picker-sweep.log"
 SEND_OPTION_LOG="$FIXTURE_DIR/sent-options.log"
-export FIXTURE_DIR SEND_LOG SEND_OPTION_LOG TASK_LOG
+export FIXTURE_DIR SEND_LOG SEND_OPTION_LOG TASK_LOG ROTATE_LOG
 
 reset_fixture() {
-    rm -f "$FIXTURE_DIR/sessions" "$FIXTURE_DIR"/pane-* "$SEND_LOG" "$SEND_OPTION_LOG" "$TASK_LOG" "$BRIDGE_PICKER_SWEEP_LOG"
+    rm -f "$FIXTURE_DIR/sessions" "$FIXTURE_DIR"/pane-* "$SEND_LOG" "$SEND_OPTION_LOG" "$TASK_LOG" "$ROTATE_LOG" "$BRIDGE_PICKER_SWEEP_LOG"
     : >"$FIXTURE_DIR/sessions"
     : >"$SEND_LOG"
     : >"$SEND_OPTION_LOG"
     : >"$TASK_LOG"
+    : >"$ROTATE_LOG"
+    rm -rf "$BRIDGE_HOME/state/picker-sweep"
 }
 
 run_sweep() {
@@ -222,10 +234,13 @@ PANE
 run_sweep
 smoke_assert_eq "1" "$(count_lines "$SEND_LOG")" "4 one send"
 smoke_assert_contains "$(cat "$SEND_LOG")" "stuck-agent" "4 send target"
+smoke_assert_eq "1" "$(count_lines "$ROTATE_LOG")" "4 one claude-token rotate attempt"
+smoke_assert_contains "$(cat "$ROTATE_LOG")" "stuck-agent" "4 rotate attributed to rate-limit agent"
 smoke_assert_eq "1" "$(grep -c "^---$" "$TASK_LOG" || true)" "4 one task"
 smoke_assert_contains "$(cat "$TASK_LOG")" "recipient=admin" "4 task recipient"
 smoke_assert_contains "$(cat "$TASK_LOG")" "1 agent(s) auto-unstuck" "4 task title"
 smoke_assert_contains "$(cat "$TASK_LOG")" "stuck-agent:picker option line + tail (sent Enter)" "4 task body lists agent + action"
+smoke_assert_contains "$(cat "$TASK_LOG")" "Rate-limit token rotation attempts:" "4 task body includes rotation section"
 
 # ---------------------------------------------------------------------------
 # Test 5 — Tail-only (no option line) must be REJECTED.
@@ -268,6 +283,7 @@ PANE
 run_sweep
 smoke_assert_eq "1" "$(count_lines "$SEND_LOG")" "5b one send (option+tail match)"
 smoke_assert_contains "$(cat "$SEND_LOG")" "full-picker-agent" "5b send target"
+smoke_assert_eq "0" "$(count_lines "$ROTATE_LOG")" "5b resume picker does not rotate claude token"
 
 # ---------------------------------------------------------------------------
 # Test 6 — Notify-empty path.
@@ -285,8 +301,39 @@ PANE
 export BRIDGE_PICKER_SWEEP_NOTIFY=""
 run_sweep
 smoke_assert_eq "1" "$(count_lines "$SEND_LOG")" "6 one send"
+smoke_assert_eq "0" "$(count_lines "$ROTATE_LOG")" "6 resume picker does not rotate claude token"
 smoke_assert_eq "0" "$(count_lines "$TASK_LOG")" "6 no task (notify empty)"
 smoke_assert_contains "$(cat "$BRIDGE_PICKER_SWEEP_LOG")" "BRIDGE_PICKER_SWEEP_NOTIFY unset" "6 notify-skip logged"
+
+# ---------------------------------------------------------------------------
+# Test 6b — Multiple rate-limit pickers in one sweep should produce one token
+# rotation attempt total. Without this, one cron tick could cycle through
+# every configured token if several agents are simultaneously blocked on the
+# same exhausted Claude account.
+# ---------------------------------------------------------------------------
+
+smoke_log "6b. multiple rate-limit pickers → one claude-token rotate attempt"
+reset_fixture
+printf '%s\n%s\n' "limited-a" "limited-b" > "$FIXTURE_DIR/sessions"
+cat >"$FIXTURE_DIR/pane-limited-a" <<'PANE'
+❯ 1. Stop and wait for limit to reset
+  2. Switch to extra usage
+  3. Switch to Team plan
+Enter to confirm · Esc to cancel
+PANE
+cat >"$FIXTURE_DIR/pane-limited-b" <<'PANE'
+❯ 1. Stop and wait for limit to reset
+  2. Switch to extra usage
+  3. Switch to Team plan
+Enter to confirm · Esc to cancel
+PANE
+
+export BRIDGE_PICKER_SWEEP_NOTIFY="admin"
+run_sweep
+smoke_assert_eq "2" "$(count_lines "$SEND_LOG")" "6b both pickers get Enter"
+smoke_assert_eq "1" "$(count_lines "$ROTATE_LOG")" "6b only one rotate attempt per sweep"
+smoke_assert_contains "$(cat "$ROTATE_LOG")" "limited-a" "6b first rate-limit agent triggers rotation"
+smoke_assert_contains "$(cat "$BRIDGE_PICKER_SWEEP_LOG")" "already attempted this sweep" "6b second rate-limit agent skips extra rotation"
 
 
 # ---------------------------------------------------------------------------
