@@ -113,10 +113,44 @@ IGNORED_LINES = {
     "The current task appears stalled. Check the current state, summarize what is blocking progress, and continue if work can proceed.",
 }
 
-# Claude Code UI glyphs used to mark agent-authored output lines (prompt
-# carets, tool-call markers, status pips, etc.). Any line beginning with
-# one of these is the agent narrating — never raw provider error output.
-AGENT_GLYPH_PREFIXES = ("❯", ">", "›", "⏺", "⎿", "✢", "✻", "✱", "ℹ", "✓", "✗")
+# Agent-authored output glyphs. Any line beginning with one of these is the
+# agent narrating — never raw provider error output.
+#   Claude Code: ❯ > › ⏺ ⎿ ✢ ✻ ✱ ℹ ✓ ✗  (prompt caret, tool-call markers,
+#       status pips).
+#   Codex CLI: • │ └  (tool/action bullet, continuation body, continuation
+#       tail). Without codex glyphs here, lines like `└ HTTP/1.1 401
+#       Unauthorized` produced by an intentional smoke test re-fire as
+#       false-positive auth stalls every daemon tick.
+AGENT_GLYPH_PREFIXES = (
+    "❯", ">", "›", "⏺", "⎿", "✢", "✻", "✱", "ℹ", "✓", "✗",
+    "•", "│", "└",
+)
+
+# Raw provider/system error prefixes that should break out of an in-agent
+# block and reach classification even when they immediately follow a glyph
+# line without a blank separator. Without this escape hatch, a real stall
+# like `Error: HTTP 429 too many requests` arriving directly under a codex
+# `• Running smoke` head line would be swallowed by the in-block skip — an
+# actually-rate-limited agent would appear idle to bridge-stall.
+#
+# Anchored at the *raw* line start (no leading whitespace allowed) + word
+# boundary + colon-or-whitespace separator. Indentation matters here:
+# codex renders tool/diff output as indented continuation lines under a
+# glyph head, and a continuation that quotes a prior error (e.g.
+# `  Error: HTTP 429 ...` two spaces in, transcript inside a tool block)
+# must NOT escape. Only flush-left raw provider output qualifies. Casual
+# narration ("the user got an error", "errors are common") and diff bodies
+# ("1 +error_message =") cannot match the line-start anchor either.
+# Tool-output continuations like `└ tool: error: file not found` are not
+# affected here — those start with the `└` glyph and are skipped by
+# AGENT_GLYPH_PREFIXES before this rule is evaluated. The keyword set is
+# the minimal shape of raw provider/runtime error lines we have actually
+# seen in stall captures; extend only when a new false-negative is
+# reproduced.
+RAW_ERROR_PREFIXES_RE = re.compile(
+    r"^(error|err|warning|fatal|panic|exception)\b\s*[:\s]",
+    re.IGNORECASE,
+)
 
 
 def looks_like_agent_output(stripped: str) -> bool:
@@ -191,25 +225,56 @@ def classify(normalized: str) -> tuple[str, str, str]:
     # the agent narrating a previous error (e.g. "⏺ inbox empty, no 429
     # reoccurrence"). Without this, agent replies referencing past errors
     # become a self-sustaining stall loop.
-    candidate_lines: list[str] = []
+    #
+    # Block-aware extension: codex renders tool/diff output as a glyph-prefixed
+    # head line followed by continuation lines that carry no glyph (wrapped
+    # diff bodies, multi-line tool stdout). Glyph-only filtering let those
+    # continuation lines reach classify and match e.g. "401 Unauthorized"
+    # quoted from a smoke test or from a tracked review report.
+    #
+    # An earlier version of this rule treated the block as "indented lines
+    # only" — but codex wraps long head lines too, e.g.
+    #     • Added /very/long/path/to/file.md (+34
+    #     -0)
+    #     1 +...
+    # where `-0)` lands flush-left and looks like a block exit. Once exited,
+    # the indented diff body that followed was eligible to match. The rule
+    # below treats *any* non-empty line inside an agent block as part of the
+    # block, regardless of indentation; the block ends on the next blank line.
+    # A subsequent glyph line restarts the block. This is broader than the
+    # original indented-only rule but matches how codex actually structures
+    # output: top-level pane items are separated by blank lines, and any
+    # rendering inside one item is the agent narrating. Issue #329 Track D's
+    # walk-line-by-line semantics and matched_line_hash dedup are preserved.
+    #
+    # Escape hatch: raw provider/system error lines (`Error: HTTP 429 ...`,
+    # `Fatal: ...`, etc.) that land directly under a glyph head without a
+    # blank separator MUST still classify — otherwise an actually-rate-
+    # limited agent appears idle to bridge-stall. The block-skip is gated
+    # on RAW_ERROR_PREFIXES_RE matched against the *raw* line (with
+    # original leading whitespace) so an indented continuation that quotes
+    # an error inside a tool block (`  Error: HTTP 429 ...` two spaces in)
+    # stays suppressed; only flush-left raw provider output escapes. Diff
+    # bodies (`1 +HTTP/1.1 401 Unauthorized`), tool output continuations
+    # (`└ HTTP/1.1 200 OK` — already glyph-skipped), and flush-left wrap
+    # continuations (`-0)`) do not start with one of the raw-error keywords
+    # and therefore stay suppressed.
+    in_agent_block = False
     for raw in normalized.splitlines():
         stripped = raw.strip()
-        if not stripped or stripped.startswith(AGENT_GLYPH_PREFIXES):
+        if not stripped:
+            in_agent_block = False
             continue
-        candidate_lines.append(stripped)
-    if not candidate_lines:
-        return "", "", ""
-    # Issue #329 Track D: walk lines individually so the classifier can return
-    # the actual matched line. Previously classify() searched the joined
-    # haystack and only knew which (group, pattern) fired; the daemon dedup
-    # therefore had to fall back on excerpt_hash, which churned every loop
-    # whenever any other text moved through the pane.
-    for line in candidate_lines:
-        haystack = line.lower()
+        if stripped.startswith(AGENT_GLYPH_PREFIXES):
+            in_agent_block = True
+            continue
+        if in_agent_block and not RAW_ERROR_PREFIXES_RE.match(raw):
+            continue
+        haystack = stripped.lower()
         for classification, patterns in PATTERN_GROUPS:
             for pattern in patterns:
                 if re.search(pattern, haystack, flags=re.IGNORECASE):
-                    return classification, pattern, _normalize_matched_line(line)
+                    return classification, pattern, _normalize_matched_line(stripped)
     return "", "", ""
 
 
