@@ -250,12 +250,12 @@ def main() -> int:
 
     env_prefix = match.group("prefix")
     command = match.group("command")
-    assignments: list[tuple[str, str]] = []
+    assignments: list[tuple[str, str, bool]] = []
 
     if claude_home_dir:
-        assignments.append(("HOME", claude_home_dir))
+        assignments.append(("HOME", claude_home_dir, True))
     if claude_config_dir:
-        assignments.append(("CLAUDE_CONFIG_DIR", claude_config_dir))
+        assignments.append(("CLAUDE_CONFIG_DIR", claude_config_dir, True))
 
     if any(
         item == "plugin:discord"
@@ -263,30 +263,31 @@ def main() -> int:
         or item == "server:discord"
         for item in required
     ):
-        assignments.append(("DISCORD_STATE_DIR", discord_dir))
+        assignments.append(("DISCORD_STATE_DIR", discord_dir, True))
     if any(
         item == "plugin:telegram"
         or item.startswith("plugin:telegram@")
         or item == "server:telegram"
         for item in required
     ):
-        assignments.append(("TELEGRAM_STATE_DIR", telegram_dir))
+        assignments.append(("TELEGRAM_STATE_DIR", telegram_dir, True))
     if any(
         item == "plugin:teams"
         or item.startswith("plugin:teams@")
         or item == "server:teams"
         for item in required
     ):
-        assignments.append(("TEAMS_STATE_DIR", teams_dir))
+        assignments.append(("TEAMS_STATE_DIR", teams_dir, True))
+        assignments.append(("TEAMS_DELIVERY_MODE", "both", False))
     if any(
         item == "plugin:ms365"
         or item.startswith("plugin:ms365@")
         or item == "server:ms365"
         for item in required
     ):
-        assignments.append(("MS365_STATE_DIR", ms365_dir))
+        assignments.append(("MS365_STATE_DIR", ms365_dir, True))
 
-    for name, value in assignments:
+    for name, value, replace_existing in assignments:
         # r4 codex review of #776 — preserve original byte form for tokens
         # we are NOT replacing. The r3 shlex.split + shlex.quote round-trip
         # destroyed unquoted shell expansions: `OTHER=$HOME` round-tripped
@@ -314,6 +315,10 @@ def main() -> int:
             if env_prefix[s_:e_].startswith(prefix_form)
         ]
         if spans:
+            if not replace_existing:
+                if env_prefix and not env_prefix.endswith((" ", "\t")):
+                    env_prefix += " "
+                continue
             # r2 codex catch on PR #790: replace the FIRST matching span
             # with canonical, drop all subsequent spans entirely. Otherwise
             # `NAME=/old1 NAME=/old2` produces two canonical entries

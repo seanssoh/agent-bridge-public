@@ -174,6 +174,8 @@ assert_agent_bridge_teams_server_selector() {
     "channel launch pins Claude HOME to the agent-scoped home"
   smoke_assert_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=" \
     "channel launch pins Claude config dir to the agent-scoped home"
+  smoke_assert_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=both" \
+    "Teams channel launch enables queue fallback for silent channel-notification drops"
 }
 
 assert_explicit_server_selector_gets_dev_allowance() {
@@ -189,10 +191,28 @@ assert_explicit_server_selector_gets_dev_allowance() {
     "explicit server:teams selector receives required development-channel allowance"
   smoke_assert_contains "$launch_cmd" "TEAMS_STATE_DIR=" \
     "server:teams selector still injects Teams state dir"
+  smoke_assert_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=both" \
+    "server:teams selector enables Teams queue fallback"
   smoke_assert_contains "$launch_cmd" "HOME=" \
     "server:teams selector pins Claude HOME to the agent-scoped home"
   smoke_assert_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=" \
     "server:teams selector pins Claude config dir to the agent-scoped home"
+}
+
+assert_explicit_teams_delivery_mode_is_preserved() {
+  local launch_cmd mode_count
+  BRIDGE_AGENT_CHANNELS["worker"]="server:teams"
+  BRIDGE_AGENT_LAUNCH_CMD["worker"]="TEAMS_DELIVERY_MODE=bridge claude --dangerously-skip-permissions"
+
+  launch_cmd="$(bridge_agent_launch_cmd worker)"
+
+  smoke_assert_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=bridge" \
+    "operator-provided Teams delivery mode is preserved"
+  smoke_assert_not_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=both" \
+    "default Teams delivery mode does not overwrite operator-provided mode"
+  mode_count="$(count_substring "$launch_cmd" "TEAMS_DELIVERY_MODE=")"
+  smoke_assert_eq "1" "$mode_count" \
+    "launch command has exactly one Teams delivery mode assignment"
 }
 
 assert_stale_claude_home_prefix_is_rewritten() {
@@ -231,6 +251,7 @@ main() {
   smoke_run "non-dev (official) channel does not get dev-load token" assert_non_dev_channel_untouched
   smoke_run "dev plugin .mcp.json server selector reaches launch"    assert_agent_bridge_teams_server_selector
   smoke_run "explicit server selector gets dev allowance"            assert_explicit_server_selector_gets_dev_allowance
+  smoke_run "explicit Teams delivery mode is preserved"              assert_explicit_teams_delivery_mode_is_preserved
   smoke_run "stale Claude home prefix is rewritten"                  assert_stale_claude_home_prefix_is_rewritten
   smoke_log "passed"
 }
