@@ -60,9 +60,11 @@ claude_hooks_contract() {
   smoke_assert_contains "$payload" "clear-idle.sh" "Claude prompt hook command"
   smoke_assert_contains "$payload" "$BRIDGE_HOME/hooks/session-start.py" "Claude hook commands use absolute bridge-home paths"
   smoke_assert_contains "$payload" "$BRIDGE_HOME/hooks/prompt_timestamp.py" "Claude prompt timestamp hook uses absolute bridge-home path"
+  # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
   smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks" "Claude hook commands do not depend on runtime HOME"
   smoke_assert_contains "$payload" "$BRIDGE_HOME/hooks/prompt_timestamp.py" \
     "Claude prompt timestamp hook uses controller bridge home"
+  # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
   smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks/prompt_timestamp.py" \
     "Claude prompt timestamp hook must not resolve through agent HOME"
 
@@ -85,6 +87,7 @@ claude_hooks_contract() {
   payload="$(cat "$home_workdir/.claude/settings.json")"
   smoke_assert_contains "$payload" "$home_bridge/hooks/prompt_timestamp.py" \
     "Claude prompt timestamp hook remains absolute when bridge home is under HOME"
+  # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
   smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks/prompt_timestamp.py" \
     "Claude prompt timestamp hook does not resolve through runtime HOME"
 }
@@ -267,6 +270,7 @@ EOF
   smoke_assert_file_exists "$config_effective" "v2 shared Claude config effective settings rendered"
   smoke_assert_contains "$(cat "$config_settings")" "$BRIDGE_HOME/hooks/prompt_timestamp.py" \
     "v2 shared Claude config prompt hook uses controller bridge home"
+  # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
   smoke_assert_not_contains "$(cat "$config_settings")" "~/.agent-bridge/hooks/prompt_timestamp.py" \
     "v2 shared Claude config prompt hook must not resolve through agent HOME"
 }
@@ -289,6 +293,7 @@ controller_home_bridge_hook_paths_are_absolute() {
   payload="$(cat "$workdir/.claude/settings.json")"
   smoke_assert_contains "$payload" "$bridge_home/hooks/prompt_timestamp.py" \
     "bridge-home under controller HOME still renders absolute prompt hook path"
+  # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
   smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks" \
     "bridge-home under controller HOME is not abbreviated with tilde"
 }

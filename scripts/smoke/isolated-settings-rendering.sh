@@ -144,6 +144,7 @@ assert_hook_entries_present() {
     "PermissionDenied points at permission_escalation.py"
   smoke_assert_contains "$content" "$FIXTURE_BRIDGE_HOME/hooks/permission_escalation.py" \
     "PermissionDenied hook uses an absolute bridge-home path"
+  # shellcheck disable=SC2088  # literal tilde regression assertion — must not expand
   smoke_assert_not_contains "$content" "~/.agent-bridge/hooks" \
     "rendered hook commands do not depend on runtime HOME"
 }
