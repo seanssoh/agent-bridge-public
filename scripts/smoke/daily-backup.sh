@@ -313,54 +313,12 @@ step_timeout_resolution() {
 # fast-path `in parts` behaviour.
 step_path_part_excludes_multicomponent() {
   smoke_log "step 8: path-part subsequence matcher (#974 regression)"
+  # Helper extracted to its own .py file to avoid heredoc-in-command-
+  # substitution (Footgun #11 ratchet — see lib/upgrade-helpers/).
   local result
-  result="$(python3 -c "$(cat <<'PY'
-import importlib.util, pathlib, sys
-spec = importlib.util.spec_from_file_location(
-    "bridge_upgrade",
-    str(pathlib.Path(sys.argv[1]).resolve()),
-)
-mod = importlib.util.module_from_spec(spec)
-# Register in sys.modules BEFORE exec so dataclass+ClassVar field
-# resolution can introspect the module under Python 3.9 (the dataclass
-# machinery looks up cls.__module__ in sys.modules).
-sys.modules["bridge_upgrade"] = mod
-spec.loader.exec_module(mod)
-
-def excluded(relpath_str: str) -> bool:
-    return mod.should_skip_daily_backup_relpath(
-        pathlib.Path(relpath_str),
-        [],
-    )
-
-cases = [
-    # (relpath, expected_excluded, label)
-    ("agents/patch/home/.claude/plugins/cache/foo", True, "target case (excluded)"),
-    ("agents/patch/home/.claude/plugins/cache", True, "no trailing slash (excluded)"),
-    ("plugins/cache/foo", True, "top-level adjacency (excluded)"),
-    ("foo/__pycache__/bar", True, "legacy single-component __pycache__"),
-    ("node_modules/x", True, "legacy single-component node_modules"),
-    ("plugins/elsewhere.json", False, "plugins alone, no cache adjacency (kept)"),
-    ("agents/cache/home/x.txt", False, "cache alone, not after plugins (kept)"),
-    ("state/cache/plugins/x.txt", False, "reversed order (kept)"),
-    ("random/plugins/cache_other/x", False, "cache_other != cache (kept)"),
-    ("plugins-archive/cache/x", False, "plugins-archive != plugins (kept)"),
-]
-
-failures = []
-for relpath, expected, label in cases:
-    got = excluded(relpath)
-    if got != expected:
-        failures.append(f"{label}: relpath={relpath!r} expected={expected} got={got}")
-
-if failures:
-    print("FAIL")
-    for f in failures:
-        print("  -", f)
-    sys.exit(1)
-print(f"PASS ({len(cases)} cases)")
-PY
-)" "$SMOKE_REPO_ROOT/bridge-upgrade.py" 2>&1)" || smoke_fail "path-part subsequence matcher failed: $result"
+  result="$(python3 "$SCRIPT_DIR/daily-backup-path-part-test.py" \
+    "$SMOKE_REPO_ROOT/bridge-upgrade.py" 2>&1)" \
+    || smoke_fail "path-part subsequence matcher failed: $result"
 
   if [[ "$result" != PASS* ]]; then
     smoke_fail "path-part subsequence matcher unexpected output: $result"
