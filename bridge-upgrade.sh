@@ -384,6 +384,11 @@ bridge_upgrade_propagate_claude_hooks() {
       # no settings.json wire. Adding it here closes that gap on every
       # subsequent upgrade.
       bridge_ensure_claude_pre_compact_hook "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
+      # Patch HUD statusLine to include hud-usage-tap.py so bridge-usage.py
+      # keeps receiving .usage-cache.json data after claude-hud v0.0.12+
+      # removed background OAuth polling. No-op for agents without a HUD
+      # statusLine or those already patched.
+      bridge_ensure_hud_usage_tap "$workdir" "$launch_cmd" "$agent" >/dev/null 2>&1 || true
     done
   ' -- "$target_root"
 }

@@ -764,6 +764,7 @@ while true; do
     bridge_ensure_claude_launch_channel_plugins "$AGENT"
     bridge_run_schedule_dev_channels_accept "$LAUNCH_CMD"
     bridge_run_schedule_idle_marker_and_inbox_bootstrap "$previous_session_id"
+    bridge_ensure_hud_usage_tap "$WORKDIR" "$LAUNCH_CMD" "$AGENT" >/dev/null 2>&1 || true
   fi
 
   log_line "실행: ${local_launch_cmd_display}"

@@ -7145,6 +7145,42 @@ assert_contains "$(cat "$REPO_ROOT/.claude/skills/memory-wiki/SKILL.md")" "memor
 assert_contains "$(cat "$REPO_ROOT/.claude/skills/memory-wiki/SKILL.md")" "Raw-Source Ingest Workflow"
 assert_contains "$(cat "$REPO_ROOT/.claude/skills/memory-wiki/SKILL.md")" "capture -> ingest"
 
+log "ensuring HUD usage tap statusLine patching (ensure-hud-usage-tap)"
+HUD_TAP_WORKDIR="$TMP_ROOT/hud-tap-workdir"
+mkdir -p "$HUD_TAP_WORKDIR/.claude"
+# Seed an unpatched HUD statusLine in settings.json
+python3 -c "
+import json, pathlib
+cfg = {
+  'statusLine': {
+    'type': 'command',
+    'command': 'bash -c \'plugin_dir=x; exec \"/usr/bin/bun\" --env-file /dev/null \"\${plugin_dir}src/index.ts\"\''
+  }
+}
+pathlib.Path('$HUD_TAP_WORKDIR/.claude/settings.json').write_text(json.dumps(cfg, indent=2))
+"
+HUD_TAP_STATUS_BEFORE="$(python3 "$REPO_ROOT/bridge-hooks.py" status-hud-usage-tap --workdir "$HUD_TAP_WORKDIR" --bridge-home "$BRIDGE_HOME")"
+assert_contains "$HUD_TAP_STATUS_BEFORE" "status: missing"
+assert_contains "$HUD_TAP_STATUS_BEFORE" "hud_usage_tap: missing"
+HUD_TAP_ENSURE_OUTPUT="$(python3 "$REPO_ROOT/bridge-hooks.py" ensure-hud-usage-tap --workdir "$HUD_TAP_WORKDIR" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)")"
+assert_contains "$HUD_TAP_ENSURE_OUTPUT" "status: updated"
+assert_contains "$HUD_TAP_ENSURE_OUTPUT" "hud_usage_tap: updated"
+assert_contains "$(cat "$HUD_TAP_WORKDIR/.claude/settings.json")" "hud-usage-tap"
+HUD_TAP_STATUS_AFTER="$(python3 "$REPO_ROOT/bridge-hooks.py" status-hud-usage-tap --workdir "$HUD_TAP_WORKDIR" --bridge-home "$BRIDGE_HOME")"
+assert_contains "$HUD_TAP_STATUS_AFTER" "status: present"
+assert_contains "$HUD_TAP_STATUS_AFTER" "hud_usage_tap: present"
+# Idempotent: second ensure must not change the file
+HUD_TAP_BEFORE_HASH="$(md5sum "$HUD_TAP_WORKDIR/.claude/settings.json" | cut -d' ' -f1)"
+python3 "$REPO_ROOT/bridge-hooks.py" ensure-hud-usage-tap --workdir "$HUD_TAP_WORKDIR" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)" >/dev/null
+HUD_TAP_AFTER_HASH="$(md5sum "$HUD_TAP_WORKDIR/.claude/settings.json" | cut -d' ' -f1)"
+[[ "$HUD_TAP_BEFORE_HASH" == "$HUD_TAP_AFTER_HASH" ]] || die "ensure-hud-usage-tap is not idempotent: settings.json changed on second call"
+# No-HUD settings must return no-hud
+HUD_TAP_NOHUD_WORKDIR="$TMP_ROOT/hud-tap-nohud"
+mkdir -p "$HUD_TAP_NOHUD_WORKDIR/.claude"
+echo '{}' >"$HUD_TAP_NOHUD_WORKDIR/.claude/settings.json"
+HUD_TAP_NOHUD_OUT="$(python3 "$REPO_ROOT/bridge-hooks.py" status-hud-usage-tap --workdir "$HUD_TAP_NOHUD_WORKDIR" --bridge-home "$BRIDGE_HOME" || true)"
+assert_contains "$HUD_TAP_NOHUD_OUT" "no-hud"
+
 log "ensuring Claude project trust seed and startup blocker detection"
 CLAUDE_USER_FILE="$TMP_ROOT/claude-user.json"
 echo '{}' >"$CLAUDE_USER_FILE"

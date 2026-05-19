@@ -321,6 +321,23 @@ bridge_ensure_claude_pre_compact_hook() {
   fi
 }
 
+# Patch the HUD statusLine command to pipe through hud-usage-tap.py so
+# bridge-usage.py keeps receiving .usage-cache.json data even after
+# claude-hud v0.0.12+ removed background OAuth polling.  No-op when:
+# (a) no statusLine is configured, (b) the statusLine is not a HUD
+# command, or (c) the tap is already present.  Idempotent.
+bridge_ensure_hud_usage_tap() {
+  local workdir="$1"
+  local launch_cmd="${2-}"
+  local agent="${3-}"
+  if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
+    bridge_hooks_python ensure-hud-usage-tap --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
+    bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
+  else
+    bridge_hooks_python ensure-hud-usage-tap --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
+  fi
+}
+
 # Issue #544 PR2 — install bridge-managed Claude hook entries into the
 # isolated UID's HOME `.claude/settings.json` (as a controller-owned
 # symlink to a controller-owned `settings.effective.json` rendered next
