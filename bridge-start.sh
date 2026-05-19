@@ -266,6 +266,23 @@ bridge_start_schedule_dev_channels_accept() {
   ) </dev/null >>"$logfile" 2>>"$errfile" &
 }
 
+bridge_start_prepare_agent_log_files() {
+  local agent="$1"
+  local log_dir=""
+  local logfile=""
+  local errfile=""
+
+  log_dir="$(bridge_agent_log_dir "$agent")"
+  [[ -n "$log_dir" ]] || return 0
+  mkdir -p "$log_dir" 2>/dev/null || return 0
+
+  logfile="$log_dir/$(date '+%Y%m%d').log"
+  errfile="$log_dir/$(date '+%Y%m%d').err.log"
+  touch "$logfile" "$errfile" 2>/dev/null || true
+  chmod g+rwx "$log_dir" 2>/dev/null || true
+  chmod g+rw "$logfile" "$errfile" 2>/dev/null || true
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --list)
@@ -650,6 +667,7 @@ bridge_agent_clear_prompt_ready "$AGENT"
 # is still present, `bridge-run.sh` will trip the circuit breaker again
 # and re-write the marker on the first post-unblock failure cycle.
 bridge_agent_clear_broken_launch "$AGENT"
+bridge_start_prepare_agent_log_files "$AGENT"
 
 # Refresh the launch window so a new session id can be detected for this run.
 # shellcheck disable=SC2034

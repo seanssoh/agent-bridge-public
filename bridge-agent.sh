@@ -2965,22 +2965,13 @@ run_update() {
         ;;
       --launch-cmd-add-dev-channel)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        # plugin:NAME@SPEC shape (codex r1 finding 3): the spec is appended
-        # as an argv token to BRIDGE_AGENT_LAUNCH_CMD which bash -lc
-        # executes downstream. Restrict NAME and SPEC to the same
-        # `[A-Za-z0-9_.-]+` charset the existing roster fixtures and
-        # bridge_qualify_channel_item assume.
-        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
-          bridge_die "--launch-cmd-add-dev-channel 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
-        fi
+        bridge_agent_update_validate_channel_token "--launch-cmd-add-dev-channel" "$2"
         add_launch_cmd_op "add-dev-channel" "$2"
         shift 2
         ;;
       --launch-cmd-remove-dev-channel)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
-          bridge_die "--launch-cmd-remove-dev-channel 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
-        fi
+        bridge_agent_update_validate_channel_token "--launch-cmd-remove-dev-channel" "$2"
         add_launch_cmd_op "remove-dev-channel" "$2"
         shift 2
         ;;
@@ -2997,17 +2988,13 @@ run_update() {
         ;;
       --channels-add)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
-          bridge_die "--channels-add 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
-        fi
+        bridge_agent_update_validate_channel_token "--channels-add" "$2"
         add_channels_op "channels-add" "$2"
         shift 2
         ;;
       --channels-remove)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        if [[ ! "$2" =~ ^plugin:[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$ ]]; then
-          bridge_die "--channels-remove 는 plugin:NAME@SPEC 형식이어야 합니다: $2"
-        fi
+        bridge_agent_update_validate_channel_token "--channels-remove" "$2"
         add_channels_op "channels-remove" "$2"
         shift 2
         ;;

@@ -199,6 +199,81 @@ def load_known_marketplaces() -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _marketplace_entry_matches_root(entry: object, root: Path) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    root_s = str(root)
+    if str(entry.get("installLocation") or "").strip() != root_s:
+        return False
+    source = entry.get("source")
+    if not isinstance(source, dict):
+        return False
+    return (
+        str(source.get("source") or "").strip() == "directory"
+        and str(source.get("path") or "").strip() == root_s
+    )
+
+
+def ensure_known_marketplace_for_root(root: Path, marketplace_name: str) -> tuple[bool, str]:
+    """Ensure Claude can resolve plugin:<name>@<marketplace> to this root.
+
+    The cache linker can install plugin files without touching
+    known_marketplaces.json, but Claude's development-channel loader also
+    consults that catalog when it expands a marketplace-scoped plugin into
+    its .mcp.json servers. Shared agents that only had installed_plugins.json
+    could therefore see `plugin:teams@agent-bridge` but still report
+    `server:teams · no MCP server configured with that name`.
+    """
+    if not marketplace_name:
+        return True, "no-marketplace"
+    try:
+        _require_safe_path_component(
+            marketplace_name,
+            role="marketplace name",
+            context="known marketplace catalog update",
+        )
+    except ValueError as exc:
+        return False, str(exc)
+
+    path = known_marketplaces_path()
+    root = root.resolve()
+    try:
+        payload = load_known_marketplaces()
+        existing = payload.get(marketplace_name)
+        if _marketplace_entry_matches_root(existing, root):
+            return True, "already-correct"
+
+        payload[marketplace_name] = {
+            "source": {"source": "directory", "path": str(root)},
+            "installLocation": str(root),
+            "lastUpdated": _now_iso_utc(),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing_mode = 0o600
+        if path.exists():
+            try:
+                existing_mode = path.stat().st_mode & 0o777
+            except OSError:
+                existing_mode = 0o600
+        tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        try:
+            tmp_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(tmp_path, existing_mode)
+            os.replace(tmp_path, path)
+        finally:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
+        return True, "updated"
+    except OSError as exc:
+        return False, f"write-failed: {exc}"
+
+
 def channel_marketplace(channel: str) -> str:
     if not channel.startswith("plugin:") or "@" not in channel:
         return ""
@@ -638,6 +713,16 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
             "reason": f"marketplace-mismatch:{plugin_marketplace}",
         }
 
+    catalog_ok, catalog_reason = ensure_known_marketplace_for_root(root, marketplace_name)
+    if not catalog_ok:
+        return {
+            "channel": channel,
+            "plugin": plugin_name,
+            "marketplace": marketplace_name,
+            "status": "catalog-write-failed",
+            "reason": catalog_reason,
+        }
+
     metadata = plugins.get(plugin_name)
     if metadata is None:
         return {"channel": channel, "plugin": plugin_name, "status": "missing", "reason": "not-in-marketplace"}
@@ -832,6 +917,7 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
         "cache": str(cache_version_path),
         "cache_type": cache_type,
         "status": verified_status,
+        "known_marketplace": catalog_reason,
         "node_modules_status": node_modules_status,
         "node_modules_target": node_modules_target,
         "orphan_removed": str(orphan_removed),

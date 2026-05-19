@@ -188,6 +188,48 @@ assert "remove-dev-channel plugin:foo@m" in payload["actions"], payload
   smoke_assert_not_contains "$after_line" "plugin:foo@m" "roster argv no longer carries dev-channel spec"
 }
 
+assert_server_channel_tokens_allowed() {
+  local output line
+
+  output="$(run_update --launch-cmd-add-dev-channel server:teams)"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is True, payload
+assert "server:teams" in payload["after"]["launch_cmd"], payload
+assert "add-dev-channel server:teams" in payload["actions"], payload
+' "$output"
+  line="$(read_field "BRIDGE_AGENT_LAUNCH_CMD")"
+  smoke_assert_contains "$line" "server:teams" "launch_cmd dev-channel mutation accepts server: selector"
+
+  output="$(run_update --launch-cmd-remove-dev-channel server:teams)"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is True, payload
+assert "server:teams" not in payload["after"]["launch_cmd"], payload
+assert "remove-dev-channel server:teams" in payload["actions"], payload
+' "$output"
+
+  output="$(run_update --channels-add server:teams)"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is True, payload
+assert "server:teams" in payload["after"]["channels"], payload
+' "$output"
+  line="$(read_field "BRIDGE_AGENT_CHANNELS")"
+  smoke_assert_contains "$line" "server:teams" "channels mutation accepts server: selector"
+
+  output="$(run_update --channels-remove server:teams)"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is True, payload
+assert "server:teams" not in payload["after"]["channels"], payload
+' "$output"
+}
+
 assert_set_launch_cmd_full_replace() {
   # Codex r1 finding 5: --set-launch-cmd (full replace) was the only
   # mutation flag the smoke did not exercise. Cover round-trip on the
@@ -365,6 +407,7 @@ main() {
   smoke_run "remove-env reverts the prepend"             assert_remove_env_reverts
   smoke_run "add-dev-channel appends option/spec pair"   assert_add_dev_channel_appends_pair
   smoke_run "remove-dev-channel cleans up pair + token"  assert_remove_dev_channel_cleans_pair
+  smoke_run "server channel tokens accepted by updater"  assert_server_channel_tokens_allowed
   smoke_run "set-launch-cmd full replace + idempotent"   assert_set_launch_cmd_full_replace
   smoke_run "channels add/set/remove family round-trip"  assert_channels_family
   smoke_run "dry-run does not mutate roster"             assert_dry_run_does_not_mutate

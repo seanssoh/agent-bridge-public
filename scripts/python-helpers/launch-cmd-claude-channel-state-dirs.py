@@ -21,6 +21,8 @@ Args (positional, order-sensitive):
     sys.argv[4] — telegram_dir
     sys.argv[5] — teams_dir
     sys.argv[6] — ms365_dir
+    sys.argv[7] — claude_home_dir
+    sys.argv[8] — claude_config_dir
 
 Stdout: launch_cmd with `<PLUGIN>_STATE_DIR=<dir>` env assignments
 prepended (or replacing existing stale values in place, byte-preserving
@@ -232,7 +234,9 @@ def main() -> int:
         telegram_dir,
         teams_dir,
         ms365_dir,
-    ) = sys.argv[1:7]
+        claude_home_dir,
+        claude_config_dir,
+    ) = sys.argv[1:9]
 
     required = normalize(required_csv)
     if not required:
@@ -248,17 +252,38 @@ def main() -> int:
     command = match.group("command")
     assignments: list[tuple[str, str]] = []
 
-    if any(item == "plugin:discord" or item.startswith("plugin:discord@") for item in required):
+    if claude_home_dir:
+        assignments.append(("HOME", claude_home_dir))
+    if claude_config_dir:
+        assignments.append(("CLAUDE_CONFIG_DIR", claude_config_dir))
+
+    if any(
+        item == "plugin:discord"
+        or item.startswith("plugin:discord@")
+        or item == "server:discord"
+        for item in required
+    ):
         assignments.append(("DISCORD_STATE_DIR", discord_dir))
     if any(
         item == "plugin:telegram"
         or item.startswith("plugin:telegram@")
+        or item == "server:telegram"
         for item in required
     ):
         assignments.append(("TELEGRAM_STATE_DIR", telegram_dir))
-    if any(item == "plugin:teams" or item.startswith("plugin:teams@") for item in required):
+    if any(
+        item == "plugin:teams"
+        or item.startswith("plugin:teams@")
+        or item == "server:teams"
+        for item in required
+    ):
         assignments.append(("TEAMS_STATE_DIR", teams_dir))
-    if any(item == "plugin:ms365" or item.startswith("plugin:ms365@") for item in required):
+    if any(
+        item == "plugin:ms365"
+        or item.startswith("plugin:ms365@")
+        or item == "server:ms365"
+        for item in required
+    ):
         assignments.append(("MS365_STATE_DIR", ms365_dir))
 
     for name, value in assignments:

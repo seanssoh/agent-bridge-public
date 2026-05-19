@@ -15,6 +15,10 @@
 # 5. non-dev untouched: an official-marketplace plugin does NOT acquire a
 #    --dangerously-load-development-channels token, while a co-declared dev
 #    channel does.
+# 6. `.mcp.json` server key parity: dev-loaded Agent Bridge Teams emits
+#    `--channels server:teams` plus the matching development-channel allowance.
+# 7. explicit server selectors also get the matching development-channel
+#    allowance, because Claude requires it for server-shaped channels.
 
 set -euo pipefail
 
@@ -149,6 +153,72 @@ assert_non_dev_channel_untouched() {
     "exactly one dev-channel token emitted when one dev + one non-dev channel are declared"
 }
 
+assert_agent_bridge_teams_server_selector() {
+  local launch_cmd
+  BRIDGE_AGENT_CHANNELS["worker"]="plugin:teams@agent-bridge,plugin:ms365@agent-bridge"
+  BRIDGE_AGENT_LAUNCH_CMD["worker"]="claude --dangerously-skip-permissions"
+
+  launch_cmd="$(bridge_agent_launch_cmd worker)"
+
+  smoke_assert_contains "$launch_cmd" "--channels server:teams" \
+    "Teams dev plugin .mcp.json key reaches Claude as a server-shaped channel selector"
+  smoke_assert_contains "$launch_cmd" "--dangerously-load-development-channels plugin:teams@agent-bridge" \
+    "Teams dev plugin still reaches Claude development-channel loading"
+  smoke_assert_contains "$launch_cmd" "--dangerously-load-development-channels plugin:ms365@agent-bridge" \
+    "MS365 dev plugin still reaches Claude development-channel loading"
+  smoke_assert_contains "$launch_cmd" "--dangerously-load-development-channels server:teams" \
+    "server:teams receives the matching development-channel allowance"
+  smoke_assert_not_contains "$launch_cmd" "--channels server:ms365" \
+    "MS365 tool plugin does not get an inbound-channel server selector"
+  smoke_assert_contains "$launch_cmd" "HOME=" \
+    "channel launch pins Claude HOME to the agent-scoped home"
+  smoke_assert_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=" \
+    "channel launch pins Claude config dir to the agent-scoped home"
+}
+
+assert_explicit_server_selector_gets_dev_allowance() {
+  local launch_cmd
+  BRIDGE_AGENT_CHANNELS["worker"]="server:teams"
+  BRIDGE_AGENT_LAUNCH_CMD["worker"]="claude --dangerously-skip-permissions"
+
+  launch_cmd="$(bridge_agent_launch_cmd worker)"
+
+  smoke_assert_contains "$launch_cmd" "--channels server:teams" \
+    "explicit server:teams selector reaches Claude --channels"
+  smoke_assert_contains "$launch_cmd" "--dangerously-load-development-channels server:teams" \
+    "explicit server:teams selector receives required development-channel allowance"
+  smoke_assert_contains "$launch_cmd" "TEAMS_STATE_DIR=" \
+    "server:teams selector still injects Teams state dir"
+  smoke_assert_contains "$launch_cmd" "HOME=" \
+    "server:teams selector pins Claude HOME to the agent-scoped home"
+  smoke_assert_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=" \
+    "server:teams selector pins Claude config dir to the agent-scoped home"
+}
+
+assert_stale_claude_home_prefix_is_rewritten() {
+  local launch_cmd home_count config_count
+  BRIDGE_AGENT_CHANNELS["worker"]="server:teams"
+  BRIDGE_AGENT_LAUNCH_CMD["worker"]="HOME=/home/ec2-user CLAUDE_CONFIG_DIR=/home/ec2-user/.claude claude --dangerously-skip-permissions"
+
+  launch_cmd="$(bridge_agent_launch_cmd worker)"
+
+  smoke_assert_contains "$launch_cmd" "HOME=$BRIDGE_AGENT_ROOT_V2/worker/home" \
+    "stale inherited HOME is rewritten to the agent-scoped home"
+  smoke_assert_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=$BRIDGE_AGENT_ROOT_V2/worker/home/.claude" \
+    "stale inherited Claude config dir is rewritten to the agent-scoped config dir"
+  smoke_assert_not_contains "$launch_cmd" "HOME=/home/ec2-user " \
+    "stale controller HOME does not survive"
+  smoke_assert_not_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=/home/ec2-user/.claude" \
+    "stale controller Claude config dir does not survive"
+
+  home_count="$(count_substring "$launch_cmd" "HOME=")"
+  config_count="$(count_substring "$launch_cmd" "CLAUDE_CONFIG_DIR=")"
+  smoke_assert_eq "1" "$home_count" \
+    "rewritten launch command has exactly one HOME assignment"
+  smoke_assert_eq "1" "$config_count" \
+    "rewritten launch command has exactly one CLAUDE_CONFIG_DIR assignment"
+}
+
 main() {
   smoke_require_cmd python3
   smoke_setup_bridge_home "launch-dev-channels-injection"
@@ -159,6 +229,9 @@ main() {
   smoke_run "multi-channel injection preserves declaration order"    assert_multi_channel_order_stable
   smoke_run "diagnostic launch_allowlisted matches real builder"     assert_diagnostic_alignment
   smoke_run "non-dev (official) channel does not get dev-load token" assert_non_dev_channel_untouched
+  smoke_run "dev plugin .mcp.json server selector reaches launch"    assert_agent_bridge_teams_server_selector
+  smoke_run "explicit server selector gets dev allowance"            assert_explicit_server_selector_gets_dev_allowance
+  smoke_run "stale Claude home prefix is rewritten"                  assert_stale_claude_home_prefix_is_rewritten
   smoke_log "passed"
 }
 
