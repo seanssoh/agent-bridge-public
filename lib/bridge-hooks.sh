@@ -333,6 +333,12 @@ bridge_ensure_hud_usage_tap() {
   if [[ "$(bridge_claude_settings_mode "$workdir")" == "shared" ]]; then
     bridge_hooks_python ensure-hud-usage-tap --settings-file "$(bridge_hook_shared_settings_base_file)" --bridge-home "$BRIDGE_HOME" --python-bin python3 >/dev/null
     bridge_link_claude_settings_to_shared "$workdir" "$launch_cmd" "$agent"
+    # bridge_link_claude_settings_to_shared skips linux-user isolated agents
+    # (the mirror is under a foreign UID). Re-render the isolated home so the
+    # patched shared base propagates there too. No-op for non-isolated agents.
+    if [[ -n "$agent" ]] && command -v bridge_install_isolated_home_settings >/dev/null 2>&1; then
+      bridge_install_isolated_home_settings "$agent" "$launch_cmd" >/dev/null 2>&1 || true
+    fi
   else
     bridge_hooks_python ensure-hud-usage-tap --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
   fi

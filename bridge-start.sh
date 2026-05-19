@@ -460,6 +460,11 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   if ! bridge_ensure_claude_tool_policy_hooks "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null; then
     bridge_die "Claude tool policy hook 설정에 실패했습니다: $WORK_DIR"
   fi
+  # Ensure HUD stdin tap is in place before the sudo-wrap so that linux-user
+  # isolated agents get their isolated-home settings rendered from controller
+  # context. bridge_ensure_hud_usage_tap is a no-op when no HUD statusLine is
+  # configured or when the tap is already present.
+  bridge_ensure_hud_usage_tap "$WORK_DIR" "$AGENT_LAUNCH_CMD" "$AGENT" >/dev/null 2>&1 || true
   if ! bridge_disable_claude_webhook_channel "$AGENT" "$WORK_DIR" >/dev/null 2>&1; then
     bridge_warn "Claude backlog webhook channel cleanup skipped: $WORK_DIR"
   fi
