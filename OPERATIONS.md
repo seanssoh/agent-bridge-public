@@ -246,9 +246,9 @@ Backup 동작 조정 환경변수 (모두 `agent-roster.local.sh` 또는 systemd
 | `BRIDGE_DAILY_BACKUP_HOUR` | `4` | 시도 시작 시각 (0–23). |
 | `BRIDGE_DAILY_BACKUP_RETAIN_DAYS` | `7` | tarball + SQL snapshot 보관 일수. v0.7.2 에서 30 → 7 로 축소 (#507). |
 | `BRIDGE_DAILY_BACKUP_FAILURE_COOLDOWN_SECONDS` | `3600` | 실패 후 다음 시도 억제 시간. cooldown window 당 `daemon_warn` + audit row 1회. |
-| `BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS` | `300` | daemon-side daily-backup walk+tar+gzip 의 `bridge_with_timeout` 상한 (#745, v0.13.x 에서 hardcoded 120s → env-driven 300s). ~1.4GB+ tarball 을 가진 큰 install 은 더 올려서 사용 (예: 600). 비숫자/0/음수는 기본값 300 으로 폴백. |
-| `BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS` | `360` | `*.tgz.tmp.*` reaper 가 무시할 최소 나이 (= daemon timeout 300s + grace 60s). #745 에서 180 → 360 으로 갱신; 직접 `BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS` 를 올리면 이 값도 비례해서 함께 올리는 것을 권장. |
-| `BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS` | (empty) | tar walk 추가 exclude (콜론 또는 콤마 구분 relpath). hardcoded 기본 제외: `logs/`, `worktrees/`, `runtime/{assets,media,extensions}/`, `.claude/worktrees/`, `state/backup-snapshots/`, plus any-depth `__pycache__` / `node_modules`. |
+| `BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS` | `600` | daemon-side daily-backup walk+tar+gzip 의 `bridge_with_timeout` 상한 (#745 에서 hardcoded 120s → env-driven 300s, #975 에서 300s → 600s 로 multi-agent install 의 fresh-default timeout 여유 확보). 큰 install 은 더 올려서 사용 (예: 900). 비숫자/0/음수는 기본값 600 으로 폴백. |
+| `BRIDGE_DAILY_BACKUP_TMP_GRACE_SECONDS` | `660` | `*.tgz.tmp.*` reaper 가 무시할 최소 나이 (= daemon timeout 600s + grace 60s). #745 에서 180 → 360 으로, #975 에서 360 → 660 으로 갱신; 직접 `BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS` 를 올리면 이 값도 비례해서 함께 올리는 것을 권장. |
+| `BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS` | (empty) | tar walk 추가 exclude (콜론 또는 콤마 구분 relpath). hardcoded 기본 제외: `logs/`, `worktrees/`, `runtime/{assets,media,extensions}/`, `.claude/worktrees/`, `state/backup-snapshots/`, plus any-depth `__pycache__` / `node_modules` / `plugins/cache` (#974 — Claude plugin cache, fully regenerable). |
 | `BRIDGE_UPGRADE_BACKUP_RETAIN_COUNT` | `5` | upgrade-* snapshot 최소 보존 개수 (현재 BACKUP_ROOT 는 항상 추가 보존). |
 | `BRIDGE_UPGRADE_BACKUP_RETAIN_DAYS` | `14` | retain count 를 넘긴 upgrade-* 중 이 일수보다 오래된 것만 prune. |
 
