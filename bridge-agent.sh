@@ -4225,9 +4225,27 @@ run_restart() {
   # `bridge-run.sh` had a chance to re-trip the circuit breaker.
   bridge_agent_clear_broken_launch "$agent" 2>/dev/null || true
 
+  # #981: snapshot the resume session_id BEFORE the kill so an operator-
+  # initiated restart resumes the previous conversation. The abrupt SIGKILL
+  # interrupts Claude's transcript writer, after which the post-kill resolver
+  # path (`bridge_normalize_agent_session_id` → `bridge_resolve_resume_session_id`)
+  # could reject the persisted id and `bridge_clear_agent_session_id` would
+  # wipe it. The kill itself doesn't touch the in-memory map, but the new
+  # `bridge-start.sh` subprocess re-hydrates from disk and re-runs the
+  # resolver gate. Snapshotting here and re-injecting after the kill puts the
+  # id back on disk so the first restart attempt's launch builder finds a
+  # non-empty `BRIDGE_AGENT_SESSION_ID[$agent]` and emits `--resume <id>`.
+  # The existing quarantine / freshness logic still applies on subsequent
+  # passes if the id is truly stale, so this is additive — not a bypass.
+  local resume_session_snapshot=""
+  resume_session_snapshot="$(bridge_agent_session_id "$agent" 2>/dev/null || true)"
+
   if bridge_tmux_session_exists "$session"; then
     bridge_kill_agent_session "$agent"
     bridge_refresh_runtime_state
+    if [[ -n "$resume_session_snapshot" ]]; then
+      bridge_set_agent_session_id "$agent" "$resume_session_snapshot" 2>/dev/null || true
+    fi
   fi
 
   if [[ $attach_mode -eq 1 ]]; then
@@ -4282,8 +4300,17 @@ run_restart() {
     verify_attempts=$(( verify_attempts + 1 ))
     bridge_warn "Claude plugin MCP liveness missing after restart for '$agent' (attempt ${verify_attempts}/${verify_max_attempts}). Retrying with a fresh session."
     if bridge_tmux_session_exists "$session"; then
+      # #981: re-snapshot before each kill — the prior restart_once may have
+      # advanced the session_id to a fresh transcript that we still want to
+      # resume on the next attempt. See the comment above the first kill
+      # block for the full rationale.
+      bridge_load_roster >/dev/null 2>&1 || true
+      resume_session_snapshot="$(bridge_agent_session_id "$agent" 2>/dev/null || true)"
       bridge_kill_agent_session "$agent" >/dev/null 2>&1 || true
       bridge_refresh_runtime_state
+      if [[ -n "$resume_session_snapshot" ]]; then
+        bridge_set_agent_session_id "$agent" "$resume_session_snapshot" 2>/dev/null || true
+      fi
     fi
     if ! restart_once; then
       return 1

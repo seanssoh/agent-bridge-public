@@ -190,6 +190,20 @@ bridge_clear_agent_session_id() {
   bridge_persist_agent_state "$agent"
 }
 
+# bridge_set_agent_session_id — the symmetric inverse of bridge_clear_agent_
+# session_id. Writes <session_id> to BRIDGE_AGENT_SESSION_ID[$agent] and
+# persists it to the authoritative on-disk state file (history env / dynamic
+# .env). Empty <session_id> is rejected — callers that want to clear must use
+# bridge_clear_agent_session_id explicitly so the intent is obvious at the
+# call site. Issue #981 (run_restart snapshot+restore around the kill).
+bridge_set_agent_session_id() {
+  local agent="$1"
+  local session_id="$2"
+  [[ -n "$agent" && -n "$session_id" ]] || return 1
+  BRIDGE_AGENT_SESSION_ID["$agent"]="$session_id"
+  bridge_persist_agent_state "$agent"
+}
+
 bridge_claude_resume_session_id_for_agent() {
   local agent="$1"
   local session_id=""

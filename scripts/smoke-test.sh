@@ -11326,4 +11326,15 @@ bash "$REPO_ROOT/scripts/smoke/daemon-tick-guards-l2-l4.sh"
 log "running watchdog-silence-stderr-capture smoke (#946 L3)"
 bash "$REPO_ROOT/scripts/smoke/watchdog-silence-stderr-capture.sh"
 
+# Issue #981 — operator-initiated `agent restart` previously lost the
+# in-flight conversation because bridge_kill_agent_session's SIGKILL
+# interrupted Claude's transcript flush and the post-kill resolver gate
+# wiped the persisted session_id. run_restart now snapshots the live
+# session_id before each kill and re-injects it via the new symmetric
+# setter bridge_set_agent_session_id so the next launch sees the id
+# on disk and issues `--resume <id>`. This smoke pins the setter
+# contract + the snapshot+restore round-trip at the function level.
+log "running 981-restart-session-resume-snapshot smoke (issue #981)"
+bash "$REPO_ROOT/scripts/smoke/981-restart-session-resume-snapshot.sh"
+
 log "smoke test passed"
