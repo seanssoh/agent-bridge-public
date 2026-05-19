@@ -328,6 +328,25 @@ function compactText(text: string): string {
   return text.replace(/<at>[^<]+<\/at>/g, '').trim()
 }
 
+// Extract plain text from an HTML string. Used when Teams delivers the message
+// body as an inline text/html attachment (activity.text is empty) rather than
+// in activity.text directly. Handles common inline elements and basic entities.
+function htmlToText(html: string): string {
+  return html
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/p>/gi, '\n')
+    .replace(/<\/div>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&amp;/g, '&')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
 function idsFor(activity: Activity): string[] {
   const from = activity.from ?? {}
   const aad = String((from as any).aadObjectId ?? '').trim()
@@ -1744,7 +1763,20 @@ async function handleActivity(context: TurnContext): Promise<void> {
   const userName = String(activity.from?.name ?? activity.from?.id ?? 'teams-user')
   const userIds = idsFor(activity)
   const aad = userIds[0] ?? ''
-  const text = compactText(activity.text ?? '')
+  // Teams wraps formatted/multiline messages as an inline text/html attachment
+  // with activity.text set to empty string. Extract the body in that case so
+  // the message is not silently dropped (issue #983).
+  let text = compactText(activity.text ?? '')
+  if (!text && Array.isArray(activity.attachments)) {
+    const htmlAtt = activity.attachments.find(
+      att => String(att.contentType ?? '').trim() === 'text/html'
+        && typeof (att as any).content === 'string'
+        && (att as any).content,
+    )
+    if (htmlAtt) {
+      text = htmlToText(String((htmlAtt as any).content ?? ''))
+    }
+  }
   const guarded = runPromptGuard('scan', text)
   if (guarded?.blocked) return
   const ts = activity.timestamp instanceof Date ? activity.timestamp.toISOString() : new Date().toISOString()
