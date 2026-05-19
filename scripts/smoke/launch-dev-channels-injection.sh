@@ -174,8 +174,8 @@ assert_agent_bridge_teams_server_selector() {
     "channel launch pins Claude HOME to the agent-scoped home"
   smoke_assert_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=" \
     "channel launch pins Claude config dir to the agent-scoped home"
-  smoke_assert_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=both" \
-    "Teams channel launch enables queue fallback for silent channel-notification drops"
+  smoke_assert_not_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=both" \
+    "Teams channel launch does not enable queue fallback by default"
 }
 
 assert_explicit_server_selector_gets_dev_allowance() {
@@ -191,8 +191,8 @@ assert_explicit_server_selector_gets_dev_allowance() {
     "explicit server:teams selector receives required development-channel allowance"
   smoke_assert_contains "$launch_cmd" "TEAMS_STATE_DIR=" \
     "server:teams selector still injects Teams state dir"
-  smoke_assert_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=both" \
-    "server:teams selector enables Teams queue fallback"
+  smoke_assert_not_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=both" \
+    "server:teams selector does not enable Teams queue fallback by default"
   smoke_assert_contains "$launch_cmd" "HOME=" \
     "server:teams selector pins Claude HOME to the agent-scoped home"
   smoke_assert_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=" \

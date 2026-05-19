@@ -573,6 +573,31 @@ bridge_run_sync_dev_plugin_cache() {
   return 0
 }
 
+bridge_run_prune_legacy_teams_mcp() {
+  local channels=""
+  local output=""
+  local line=""
+  local rc=0
+
+  [[ "$ENGINE" == "claude" ]] || return 0
+  [[ $SAFE_MODE -eq 0 ]] || return 0
+  channels="$(bridge_agent_effective_dev_channels_csv "$AGENT")"
+  bridge_channel_csv_contains "$channels" "plugin:teams" || return 0
+
+  output="$(python3 "$SCRIPT_DIR/scripts/python-helpers/prune-legacy-teams-mcp.py" \
+    --agent "$AGENT" \
+    --workdir "$WORK_DIR" \
+    --agent-root "$BRIDGE_AGENT_HOME_ROOT/$AGENT" \
+    2>&1)" || rc=$?
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    log_line "[legacy-teams-mcp] $line"
+  done <<<"$output"
+
+  return "$rc"
+}
+
 bridge_run_safe_mode_resume_hint() {
   local mode=""
   local admin_agent=""
@@ -775,6 +800,13 @@ while true; do
       # continue and the agent would launch missing the very channel it
       # was started for.
       exit 65
+    fi
+    if ! bridge_run_prune_legacy_teams_mcp; then
+      bridge_audit_log state legacy_teams_mcp_prune_failed "$AGENT" \
+        --field reason="failed to remove stale mcpServers.teams entry" \
+        >/dev/null 2>&1 || true
+      log_line "[error] aborting launch: stale Teams MCP cleanup failed for ${AGENT}"
+      exit 66
     fi
     bridge_run_ensure_claude_launch_channel_plugins
     bridge_run_schedule_dev_channels_accept "$LAUNCH_CMD"

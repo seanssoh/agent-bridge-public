@@ -278,7 +278,6 @@ def main() -> int:
         for item in required
     ):
         assignments.append(("TEAMS_STATE_DIR", teams_dir, True))
-        assignments.append(("TEAMS_DELIVERY_MODE", "both", False))
     if any(
         item == "plugin:ms365"
         or item.startswith("plugin:ms365@")
