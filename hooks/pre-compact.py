@@ -285,7 +285,13 @@ def _build_envelope(agent: str, home: Path, payload: dict, snapshot_path: str) -
         "trigger": trigger,
         "source": "pre-compact-hook",
         "custom_instructions_excerpt": custom[:CUSTOM_EXCERPT_LIMIT],
-        "suggested_entities": [],
+        # Route pre-compact dumps to the `agents` wiki kind via the
+        # `agents/` prefix in ENTITY_KIND_PREFIXES (see
+        # scripts/librarian-process-ingest.py). Without this hint,
+        # infer_kind() falls through to DEFAULT_KIND=operating-rules,
+        # which the librarian §9 guard rejects as agent content, causing
+        # a [librarian-ambiguous] escalation loop. See issue #976.
+        "suggested_entities": [f"agents/{agent}/session-transcripts/"],
         "suggested_concepts": [],
         "suggested_slug": "",
         "suggested_title": "",
