@@ -180,7 +180,7 @@ bridge_isolation_v2_agent_root() {
   # Print the v2 per-agent root path. Caller MUST gate on
   # bridge_isolation_v2_active first; this helper does not re-check.
   local agent="$1"
-  [[ -n "$agent" && -n "$BRIDGE_AGENT_ROOT_V2" ]] || return 1
+  [[ -n "$agent" && -n "${BRIDGE_AGENT_ROOT_V2:-}" ]] || return 1
   printf '%s/%s' "$BRIDGE_AGENT_ROOT_V2" "$agent"
 }
 

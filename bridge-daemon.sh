@@ -1564,7 +1564,7 @@ bridge_daemon_periodic_token_sync_due() {
   # First-call case: no state file yet — fire immediately so a freshly-started
   # daemon does not wait a full interval before first sync.
   [[ -f "$file" ]] || return 0
-  last_ts="$(cat "$file" 2>/dev/null | tr -dc '0-9' || printf '0')"
+  last_ts="$(tr -dc '0-9' < "$file" 2>/dev/null || printf '0')"
   [[ -n "$last_ts" ]] || last_ts=0
   now="$(date +%s)"
   elapsed=$(( now - last_ts ))

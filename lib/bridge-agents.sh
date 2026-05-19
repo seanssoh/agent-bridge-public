@@ -3761,7 +3761,7 @@ bridge_linux_install_isolated_channel_symlink() {
 
 bridge_agent_default_home() {
   local agent="$1"
-  if [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
     printf '%s/%s/home' "$BRIDGE_AGENT_ROOT_V2" "$agent"
     return 0
   fi
@@ -3825,7 +3825,7 @@ bridge_agent_default_profile_home() {
   # reads CLAUDE.md from workdir, so the deploy target (this function)
   # must point at workdir too, otherwise `agent-bridge profile deploy`
   # would land in v2 home/ where nothing reads it.
-  if [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
     printf '%s/%s/workdir' "$BRIDGE_AGENT_ROOT_V2" "$agent"
     return 0
   fi
@@ -3907,7 +3907,7 @@ bridge_agent_workdir() {
   #     Fall through to the explicit-then-default resolution so the
   #     operator's cwd is honored for shared dynamic agents.
   local _isolation_mode=""
-  if [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
     _isolation_mode="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || printf '')"
     if [[ "$_isolation_mode" == "linux-user" ]]; then
       printf '%s/%s/workdir' "$BRIDGE_AGENT_ROOT_V2" "$agent"
@@ -5468,7 +5468,6 @@ bridge_agent_launch_channels_csv() {
   local agent="$1"
   local channels=""
   local source_channels=""
-  local server_channels=""
 
   if [[ "${BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS:-0}" == "1" ]]; then
     # Issue #832: under suppress-missing-channels, fold controller-blind
@@ -5482,8 +5481,6 @@ bridge_agent_launch_channels_csv() {
     source_channels="$(bridge_agent_channels_csv "$agent")"
     channels="$(bridge_filter_approved_channels_csv "$source_channels")"
   fi
-  server_channels="$(bridge_dev_channel_server_selectors_csv "$(bridge_filter_development_channels_csv "$source_channels")")"
-  channels="$(bridge_merge_channels_csv "$channels" "$server_channels")"
   bridge_filter_claude_plugin_channels_csv "$channels"
 }
 

@@ -168,15 +168,7 @@ def merge_settings(base: Any, overlay: Any) -> Any:
 
 
 def shell_path(path: Path) -> str:
-    expanded = path.expanduser()
-    home = Path.home().expanduser()
-    try:
-        rel = expanded.relative_to(home)
-    except ValueError:
-        return str(expanded)
-    if str(rel) == ".":
-        return "~"
-    return f"~/{rel.as_posix()}"
+    return str(path.expanduser())
 
 
 def shell_command(program: str, path_str: str, *extra: str) -> str:

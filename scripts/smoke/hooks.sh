@@ -34,7 +34,7 @@ codex_hooks_contract() {
 }
 
 claude_hooks_contract() {
-  local workdir status_out payload
+  local operator_home home_bridge home_workdir workdir status_out payload
 
   workdir="$SMOKE_TMP_ROOT/claude-workdir"
   mkdir -p "$workdir"
@@ -58,6 +58,10 @@ claude_hooks_contract() {
   smoke_assert_contains "$payload" "session-start.py" "Claude SessionStart hook command"
   smoke_assert_contains "$payload" "mark-idle.sh" "Claude Stop hook command"
   smoke_assert_contains "$payload" "clear-idle.sh" "Claude prompt hook command"
+  smoke_assert_contains "$payload" "$BRIDGE_HOME/hooks/prompt_timestamp.py" \
+    "Claude prompt timestamp hook uses controller bridge home"
+  smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks/prompt_timestamp.py" \
+    "Claude prompt timestamp hook must not resolve through agent HOME"
 
   status_out="$(python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" status-session-start-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)")"
   smoke_assert_contains "$status_out" "ok" "Claude SessionStart hook status"
@@ -65,6 +69,21 @@ claude_hooks_contract() {
   smoke_assert_contains "$status_out" "ok" "Claude Stop hook status"
   status_out="$(python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" status-prompt-hook --workdir "$workdir" --bridge-home "$BRIDGE_HOME" --bash-bin bash)"
   smoke_assert_contains "$status_out" "ok" "Claude prompt hook status"
+
+  operator_home="$SMOKE_TMP_ROOT/operator-home"
+  home_bridge="$operator_home/.agent-bridge"
+  home_workdir="$SMOKE_TMP_ROOT/home-relative-bridge-workdir"
+  mkdir -p "$home_bridge" "$home_workdir"
+  HOME="$operator_home" python3 "$SMOKE_REPO_ROOT/bridge-hooks.py" ensure-prompt-hook \
+    --workdir "$home_workdir" \
+    --bridge-home "$home_bridge" \
+    --bash-bin bash \
+    --python-bin "$(command -v python3)" >/dev/null
+  payload="$(cat "$home_workdir/.claude/settings.json")"
+  smoke_assert_contains "$payload" "$home_bridge/hooks/prompt_timestamp.py" \
+    "Claude prompt timestamp hook remains absolute when bridge home is under HOME"
+  smoke_assert_not_contains "$payload" "~/.agent-bridge/hooks/prompt_timestamp.py" \
+    "Claude prompt timestamp hook does not resolve through runtime HOME"
 }
 
 assert_claude_auto_compact_window() {

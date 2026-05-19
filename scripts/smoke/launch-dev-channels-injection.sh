@@ -15,8 +15,8 @@
 # 5. non-dev untouched: an official-marketplace plugin does NOT acquire a
 #    --dangerously-load-development-channels token, while a co-declared dev
 #    channel does.
-# 6. `.mcp.json` server key parity: dev-loaded Agent Bridge Teams emits
-#    `--channels server:teams` plus the matching development-channel allowance.
+# 6. Agent Bridge Teams dev plugin launch stays plugin-scoped; its private
+#    `.mcp.json` key must not be promoted to a global `server:teams` channel.
 # 7. explicit server selectors also get the matching development-channel
 #    allowance, because Claude requires it for server-shaped channels.
 
@@ -153,21 +153,21 @@ assert_non_dev_channel_untouched() {
     "exactly one dev-channel token emitted when one dev + one non-dev channel are declared"
 }
 
-assert_agent_bridge_teams_server_selector() {
+assert_agent_bridge_teams_plugin_selector() {
   local launch_cmd
   BRIDGE_AGENT_CHANNELS["worker"]="plugin:teams@agent-bridge,plugin:ms365@agent-bridge"
   BRIDGE_AGENT_LAUNCH_CMD["worker"]="claude --dangerously-skip-permissions"
 
   launch_cmd="$(bridge_agent_launch_cmd worker)"
 
-  smoke_assert_contains "$launch_cmd" "--channels server:teams" \
-    "Teams dev plugin .mcp.json key reaches Claude as a server-shaped channel selector"
+  smoke_assert_not_contains "$launch_cmd" "--channels server:teams" \
+    "Teams dev plugin does not emit a global server-shaped channel selector"
   smoke_assert_contains "$launch_cmd" "--dangerously-load-development-channels plugin:teams@agent-bridge" \
     "Teams dev plugin still reaches Claude development-channel loading"
   smoke_assert_contains "$launch_cmd" "--dangerously-load-development-channels plugin:ms365@agent-bridge" \
     "MS365 dev plugin still reaches Claude development-channel loading"
-  smoke_assert_contains "$launch_cmd" "--dangerously-load-development-channels server:teams" \
-    "server:teams receives the matching development-channel allowance"
+  smoke_assert_not_contains "$launch_cmd" "--dangerously-load-development-channels server:teams" \
+    "implicit server:teams does not get a development-channel allowance"
   smoke_assert_not_contains "$launch_cmd" "--channels server:ms365" \
     "MS365 tool plugin does not get an inbound-channel server selector"
   smoke_assert_contains "$launch_cmd" "HOME=" \
@@ -249,7 +249,7 @@ main() {
   smoke_run "multi-channel injection preserves declaration order"    assert_multi_channel_order_stable
   smoke_run "diagnostic launch_allowlisted matches real builder"     assert_diagnostic_alignment
   smoke_run "non-dev (official) channel does not get dev-load token" assert_non_dev_channel_untouched
-  smoke_run "dev plugin .mcp.json server selector reaches launch"    assert_agent_bridge_teams_server_selector
+  smoke_run "Agent Bridge Teams dev plugin stays plugin-scoped"       assert_agent_bridge_teams_plugin_selector
   smoke_run "explicit server selector gets dev allowance"            assert_explicit_server_selector_gets_dev_allowance
   smoke_run "explicit Teams delivery mode is preserved"              assert_explicit_teams_delivery_mode_is_preserved
   smoke_run "stale Claude home prefix is rewritten"                  assert_stale_claude_home_prefix_is_rewritten

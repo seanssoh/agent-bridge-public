@@ -1506,7 +1506,7 @@ bridge_state_v2_isolated_target() {
   [[ -n "$agent" && -n "$target" ]] || return 1
   [[ "$(bridge_host_platform 2>/dev/null || uname)" == "Linux" ]] || return 1
   bridge_isolation_v2_active 2>/dev/null || return 1
-  [[ -n "$BRIDGE_AGENT_ROOT_V2" ]] || return 1
+  [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]] || return 1
   case "$target" in
     "$BRIDGE_AGENT_ROOT_V2"/"$agent"/*) ;;
     *) return 1 ;;
@@ -1937,7 +1937,7 @@ bridge_agent_idle_marker_dir() {
 
 bridge_agent_runtime_state_dir() {
   local agent="$1"
-  if bridge_isolation_v2_active && [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if bridge_isolation_v2_active && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
     printf '%s/%s/runtime' "$BRIDGE_AGENT_ROOT_V2" "$agent"
     return 0
   fi
@@ -2120,7 +2120,7 @@ PY
 
 bridge_agent_log_dir() {
   local agent="$1"
-  if bridge_isolation_v2_active && [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$agent" ]]; then
+  if bridge_isolation_v2_active && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
     printf '%s/%s/logs' "$BRIDGE_AGENT_ROOT_V2" "$agent"
     return 0
   fi

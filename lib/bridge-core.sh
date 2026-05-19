@@ -571,7 +571,7 @@ bridge_queue_gateway_root() {
   # here is therefore the per-agent root parent (BRIDGE_AGENT_ROOT_V2),
   # and bridge_queue_gateway_agent_dir composes "<root>/<agent>" the
   # same way as the legacy "<state>/queue-gateway/<agent>" path.
-  if bridge_isolation_v2_active && [[ -n "$BRIDGE_AGENT_ROOT_V2" ]]; then
+  if bridge_isolation_v2_active && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
     printf '%s' "$BRIDGE_AGENT_ROOT_V2"
     return 0
   fi
@@ -1172,7 +1172,7 @@ bridge_history_file_for() {
   # bridge_load_static_agent_history, shell assignments in
   # bridge_write_agent_state_file, the session-id rewrite path) work
   # without a format migration. Only the location changes.
-  if bridge_isolation_v2_active && [[ -n "$BRIDGE_AGENT_ROOT_V2" && -n "$name" ]]; then
+  if bridge_isolation_v2_active && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$name" ]]; then
     printf '%s/%s/runtime/history.env' "$BRIDGE_AGENT_ROOT_V2" "$name"
     return 0
   fi
