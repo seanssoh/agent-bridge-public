@@ -206,10 +206,15 @@ admin_pair_runtime_dry_run_text() {
   local out=""
   local budget="${BRIDGE_SMOKE_INIT_TIMEOUT:-45}"
   # bridge-init.sh accepts only `claude` or `codex` as --engine values.
-  # `codex` is on PATH in the supported smoke-test environments (the
-  # operator's macOS dev box, the Ubuntu 24.04 CI host, the Linux
-  # production server). The dry-run path never invokes the engine
-  # binary; it just gates with `command -v <engine>`.
+  # The dry-run path never invokes the engine binary, but bridge-init.sh
+  # still gates with `bridge_init_require_command <engine>` early in the
+  # flow (so a real init can fail loudly on misconfiguration). The CI
+  # runner does not have `codex` on PATH (only tmux + shellcheck are
+  # apt-installed by .github/workflows/ci.yml), and `claude` is also
+  # absent — both engines fail the same probe. To keep the smoke
+  # self-contained without imposing CI image obligations, we plant a
+  # no-op `codex` shim in a tmp dir and prepend it to PATH. The shim
+  # is exit-0 only; bridge-init.sh dry-run never invokes it for real.
   #
   # Text output (NOT --json) is used here because bridge-init.sh's
   # `bridge_init_emit_json` helper (line 57) uses `python3 - … <<'PY'`
@@ -221,15 +226,21 @@ admin_pair_runtime_dry_run_text() {
   # The `timeout` wrapper bounds the call so a host that nevertheless
   # hits a different heredoc deadlock degrades to "no output" rather
   # than blocking the smoke indefinitely.
+  local shim_dir
+  shim_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-bridge-${label}-shim.XXXXXX")"
+  printf '#!/bin/sh\nexit 0\n' >"$shim_dir/codex"
+  printf '#!/bin/sh\nexit 0\n' >"$shim_dir/claude"
+  chmod +x "$shim_dir/codex" "$shim_dir/claude"
   out="$(timeout --kill-after=5s "${budget}s" \
         env -u BRIDGE_ADMIN_AGENT_ID \
             BRIDGE_HOME="$bridge_home" \
+            PATH="$shim_dir:$PATH" \
             bash "$SMOKE_REPO_ROOT/bridge-init.sh" \
               --skip-channel-setup --skip-validate --skip-send-test \
               --dry-run \
               --engine codex \
               "$@" 2>/dev/null)" || true
-  rm -rf -- "$(dirname "$bridge_home")"
+  rm -rf -- "$(dirname "$bridge_home")" "$shim_dir"
   printf '%s' "$out"
 }
 
