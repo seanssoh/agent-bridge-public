@@ -114,7 +114,7 @@ assert_explicit_setup_admin_writes_scalar() {
   # scalar post-#4769. Confirm the recovery recipe (reclassify → setup
   # admin) lands the scalar exactly once and flips the admin flag.
   BRIDGE_HOME="$BRIDGE_HOME" "$SMOKE_REPO_ROOT/agent-bridge" setup admin patch >/dev/null
-  smoke_assert_contains "$(cat "$BRIDGE_ROSTER_LOCAL_FILE")" "BRIDGE_ADMIN_AGENT_ID=patch" \
+  smoke_assert_contains "$(cat "$BRIDGE_ROSTER_LOCAL_FILE")" 'BRIDGE_ADMIN_AGENT_ID="patch"' \
     "explicit setup admin persists admin scalar"
   smoke_assert_eq "yes" "$(agent_admin_flag patch)" \
     "explicit setup admin flips admin flag"
