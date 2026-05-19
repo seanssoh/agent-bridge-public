@@ -6,6 +6,31 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta2] — 2026-05-20
+
+### Highlight — Teams inbound regression close-out wave (3 fixes)
+
+Operator-cued **second prerelease** in the v0.14.5 stabilization window. Bundles three independent fixes that landed after v0.14.5-beta (2026-05-19). All three were caught + pair-reviewed by codex (Wave 2026-05-20: `agb-dev-claude` + `agb-dev-codex`). No new features. This is a `-beta2` prerelease; the matching tag is `v0.14.5-beta2` and the GitHub release is marked **Pre-release**. Stable `v0.14.5` follows once the wave burns in on operator hosts.
+
+### Operator-visible
+
+- **Teams inbound delivery — direct channel restored for isolated + shared agents** (refs #959 / PR #970). The v0.14.5-beta `TEAMS_DELIVERY_MODE` env opt-in was a queue-based workaround for the wake-drop symptom; this fix closes the underlying contract violations that broke direct channel delivery in the first place. Two distinct root causes were addressed:
+  - **Isolated agents (`dev_mun` class)** — stale `~/.agent-bridge/agents/<agent>/.mcp.json` could contain bare `mcpServers.teams` entries that shadowed the plugin namespace (`plugin:teams@agent-bridge`). New helper `scripts/python-helpers/prune-legacy-teams-mcp.py` removes legacy bridge-managed shadows from agent root + workdir `.mcp.json` files; user-authored MCP entries are preserved. Launch path is now plugin-scoped only — dev-plugin private `.mcp.json` server entries are no longer auto-promoted to global `server:<name>` selectors.
+  - **Shared agents (`sales_choi` class)** — managed hook commands rendered as `~/.agent-bridge/hooks/...` collided with v2 shared launch `HOME=<bridge_home>/agents/<agent>/home`, breaking `UserPromptSubmit` even though Teams delivery itself worked. Managed hook commands are now normalized to absolute bridge-home paths on both shared and isolated agents; Claude settings are mirrored into the launched `CLAUDE_CONFIG_DIR` so hook resolution no longer depends on runtime `HOME`.
+  - 5 new regression smokes guard the path: `hooks.sh` (absolute hook paths), `isolated-settings-rendering.sh` (config-home mirror), `launch-dev-channels-injection.sh` (plugin-scoped launch), `prune-legacy-teams-mcp.sh` (preserve user MCPs), `shared-settings-preserve-user-keys.sh` (operator overlay precedence).
+  - The fix also closed a transient regression caught by the existing `upgrade-shared-settings-propagate` smoke: the rerender plan's `expected` JSON was not receiving the same hook-path normalization as the effective settings file, causing "operator overlay wins over managed default" to report `needs-rerender` instead of `rerendered`. Plan path now mirrors the normalization symmetrically (`bridge-agent.sh` plan JSON ↔ `bridge-hooks.py` rendering).
+- **picker-sweep rate-limit rotation — cross-process race fixed** (closes #971). Two concurrent picker-sweep cron runs could both pass `_psw_rate_limit_rotation_due` simultaneously and both call `bridge-auth.sh claude-token rotate`, burning two Claude tokens for one rate-limit event. The in-process `rate_limit_rotation_attempted` flag only deduped within a single sweep. New `mkdir`-based cross-process lock under `$BRIDGE_HOME/state/picker-sweep/rotation.lock` serializes the due-check + claim + rotate + cooldown-write critical section. PID-based stale reclaim with `BRIDGE_PICKER_SWEEP_ROTATION_LOCK_STALE_SECONDS` (default 300s); never reclaims silently (WARN log audit trail). Defer path logs `"another sweep holds the rotation lock"` and sets the in-process flag so the deferring sweep doesn't re-log on subsequent agents. New `picker-sweep-concurrent-rotation` smoke launches 2 parallel sweeps and asserts exactly 1 rotate call per round (5 rounds default; verified to fail at round 1 with "got 2" when the lock is disabled).
+- **bridge-stall codex glyph false-negative — real provider errors no longer suppressed** (closes #965). The original `bridge-stall.py` glyph-block skip swallowed every non-empty line under a codex agent glyph (`•`, `→`, ...) until the next blank, so a real stall like `• Running smoke\nError: HTTP 429 too many requests\n` was classified as silent — hiding actually rate-limited agents from the stall detector. The fix introduces `RAW_ERROR_PREFIXES_RE` (anchored at raw line start, word-boundary + separator) matching `Error:` / `Err:` / `Warning:` / `Fatal:` / `Panic:` / `Exception:`. The match runs against the **pre-strip** line, so only flush-left provider output escapes; indented tool/diff continuations stay suppressed. Casual narration like "the user got an error" does not match. 9 new regression cases cover 3 recovery shapes, 5 false-positive guards, and 1 multi-block reset.
+
+### Architecture follow-up tracked
+
+- **#972 plugin canonical runtime identity (umbrella, NOT in this release)**: the Teams root cause is the first visible symptom of a broader class — every bridge-managed plugin needs one canonical runtime identity per agent (declaration, cache, state dir, settings, launch selector, transcript namespace must all agree), with preflight quarantine of legacy shadows + success measured at transcript-origin level. 6-track plan: generic preflight classifier → 3 lifecycle callsite wirings → `ARCHITECTURE.md` contract section → `agent doctor` canonical-identity output → CI smoke matrix (Teams + non-Teams plugin) → `TEAMS_DELIVERY_MODE` deprecation timeline. Tracks the structural fix; not in v0.14.5-beta2 scope.
+
+### Internal
+
+- `.lint-heredoc-baseline.tsv` re-synced for PR #970's line-number shifts; 5 new sites accepted with audit-trail (`Phase 6 PR F (PR #970 Teams)` for the two new C3 sites, all H3 sites remain `Phase 5 PR E`). `lint-heredoc-ban` CI gate stays green.
+- Codex pair-review chain (Wave 2026-05-20): 9 acceptance criteria on #970 + 8 on #971 + regression-test coverage on #965; r1→r2→r3 rounds converged within the CLAUDE.md soft-agreement protocol.
+
 ## [0.14.5-beta] — 2026-05-19
 
 ### Highlight — prerelease patch wave (4 operator-visible fixes + 1 CI unblock)
