@@ -281,6 +281,119 @@ _psw_compact_one_line() {
     tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//' | cut -c1-300
 }
 
+# ---------------------------------------------------------------------------
+# Cross-process rotation lock — codex PR #971 r1 BLOCKING fix.
+#
+# `_psw_rate_limit_rotation_due` reads the cooldown state file and
+# `_psw_rotate_claude_token` calls `bridge-auth.sh claude-token rotate`
+# without any inter-process serialisation. Two cron-driven picker-sweep
+# runs that co-fire (the */10 picker-sweep cron + a manual `bash
+# scripts/picker-sweep.sh`, two separate cron crontab entries, an OS cron
+# tick that overruns its predecessor by a few seconds, etc.) can both
+# pass the due check, both rotate, and burn two Claude tokens for one
+# rate-limit event.
+#
+# We guard the (due-check → rotate → note-attempt) critical section with
+# a mkdir-as-lock at $BRIDGE_HOME/state/picker-sweep/rotation.lock. mkdir
+# is the only POSIX-portable atomic single-step "create directory if it
+# does not already exist" primitive — flock(1) is unavailable on macOS
+# bash without coreutils, and a touch-based lock is not atomic.
+#
+# Stale-lock reclaim: if mkdir fails, we read `owner.pid` from the lock
+# dir. If the PID is no longer alive AND the lock dir mtime is older
+# than BRIDGE_PICKER_SWEEP_ROTATION_LOCK_STALE_SECONDS (default 300s),
+# we log a warning and reclaim. We never reclaim silently — a stale
+# lock is a real signal (previous sweep crashed before releasing) and
+# the warning is the only audit trail.
+#
+# In-process dedup (rate_limit_rotation_attempted=0 below) still handles
+# the multi-agent case within ONE sweep. The cross-process lock handles
+# concurrent sweeps. The two layers are complementary, not redundant.
+# ---------------------------------------------------------------------------
+
+_psw_rotation_lock_dir() {
+    printf '%s' "${BRIDGE_PICKER_SWEEP_ROTATION_LOCK_DIR:-$BRIDGE_HOME/state/picker-sweep/rotation.lock}"
+}
+
+# Stat-based mtime epoch; portable across macOS and Linux. Returns 0
+# when the path doesn't exist or stat fails (caller should treat zero
+# as "newly created, ignore staleness").
+_psw_rotation_lock_mtime() {
+    local path="$1" mtime=0
+    if [[ -e "$path" ]]; then
+        mtime="$(stat -f %m "$path" 2>/dev/null || stat -c %Y "$path" 2>/dev/null || printf '0')"
+    fi
+    [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+    printf '%s' "$mtime"
+}
+
+# Returns 0 if PID is alive, 1 otherwise. `kill -0` is POSIX and does
+# not actually deliver a signal — it just checks signal-deliverability.
+_psw_pid_alive() {
+    local pid="$1"
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+_psw_acquire_rotation_lock() {
+    local lock_dir="" stale_secs="${BRIDGE_PICKER_SWEEP_ROTATION_LOCK_STALE_SECONDS:-300}"
+    local owner_pid="" mtime=0 now=0 age=0
+    lock_dir="$(_psw_rotation_lock_dir)"
+
+    [[ "$stale_secs" =~ ^[0-9]+$ ]] || stale_secs=300
+
+    mkdir -p "$(dirname "$lock_dir")" 2>/dev/null || return 1
+
+    if mkdir "$lock_dir" 2>/dev/null; then
+        printf '%s\n' "$$" >"$lock_dir/owner.pid" 2>/dev/null || true
+        return 0
+    fi
+
+    # mkdir failed — lock is held. Decide between honouring the holder
+    # and reclaiming a stale lock.
+    owner_pid="$(cat "$lock_dir/owner.pid" 2>/dev/null || true)"
+    mtime="$(_psw_rotation_lock_mtime "$lock_dir")"
+    now="$(date +%s)"
+    age=$(( now - mtime ))
+
+    if [[ -n "$owner_pid" ]] && _psw_pid_alive "$owner_pid"; then
+        # Live holder. Defer to it.
+        return 1
+    fi
+
+    if (( age < stale_secs )); then
+        # Owner PID is dead (or unreadable) but the lock is recent —
+        # the holder may still be in a window between mkdir and pid
+        # write, or the PID file race. Defer one more cycle.
+        return 1
+    fi
+
+    # Stale. Surface it loudly and reclaim.
+    _psw_log "warn: rotation lock at $lock_dir is stale (owner_pid=${owner_pid:-unknown} age=${age}s threshold=${stale_secs}s) — reclaiming"
+    rm -rf "$lock_dir" 2>/dev/null || true
+    if mkdir "$lock_dir" 2>/dev/null; then
+        printf '%s\n' "$$" >"$lock_dir/owner.pid" 2>/dev/null || true
+        return 0
+    fi
+    # Lost a reclaim race with another process — let them have it.
+    return 1
+}
+
+_psw_release_rotation_lock() {
+    local lock_dir="" current_owner=""
+    lock_dir="$(_psw_rotation_lock_dir)"
+    # Only release a lock we actually own. Defensive against the EXIT
+    # trap firing after a reclaim handed the lock to another sweep
+    # mid-flight (vanishingly rare but worth the cheap guard).
+    if [[ -f "$lock_dir/owner.pid" ]]; then
+        current_owner="$(cat "$lock_dir/owner.pid" 2>/dev/null || true)"
+        if [[ "$current_owner" != "$$" ]]; then
+            return 0
+        fi
+    fi
+    rm -rf "$lock_dir" 2>/dev/null || true
+}
+
 _psw_default_rotate_claude_token() {
     local agent="$1"
     local scope="${BRIDGE_PICKER_SWEEP_TOKEN_ROTATE_AGENTS:-${BRIDGE_CLAUDE_TOKEN_SYNC_AGENTS:-static}}"
@@ -437,20 +550,41 @@ while IFS= read -r agent; do
                 _psw_log "rate-limit picker on '$agent' — claude-token auto-rotate disabled by BRIDGE_PICKER_SWEEP_RATE_LIMIT_ROTATE_ENABLED"
             elif [[ "$rate_limit_rotation_attempted" -ne 0 ]]; then
                 _psw_log "rate-limit picker on '$agent' — claude-token auto-rotate skipped (already attempted this sweep)"
-            elif ! _psw_rate_limit_rotation_due; then
-                _psw_log "rate-limit picker on '$agent' — claude-token auto-rotate skipped (cooldown active)"
             else
-                rate_limit_rotation_attempted=1
-                rotate_output="$(_psw_rotate_claude_token "$agent" 2>&1)"
-                rotate_rc=$?
-                _psw_note_rate_limit_rotation_attempt
-                rotate_summary="$(printf '%s' "$rotate_output" | _psw_compact_one_line)"
-                if [[ "$rotate_rc" -eq 0 ]]; then
-                    _psw_log "rate-limit picker on '$agent' — claude-token auto-rotate result: ${rotate_summary:-ok}"
+                # Acquire the cross-process rotation lock BEFORE checking
+                # cooldown — otherwise two concurrent sweeps would both
+                # observe "due", both pass the check, and both rotate.
+                # Codex PR #971 r1 BLOCKING finding.
+                if ! _psw_acquire_rotation_lock; then
+                    _psw_log "rate-limit picker on '$agent' — claude-token auto-rotate deferred (another sweep holds the rotation lock)"
+                    # Mark attempted so subsequent agents this cycle don't
+                    # also try and re-log the same defer. The lock holder
+                    # will write the cooldown; this sweep should not.
+                    rate_limit_rotation_attempted=1
+                elif ! _psw_rate_limit_rotation_due; then
+                    _psw_release_rotation_lock
+                    _psw_log "rate-limit picker on '$agent' — claude-token auto-rotate skipped (cooldown active)"
+                    rate_limit_rotation_attempted=1
                 else
-                    _psw_log "rate-limit picker on '$agent' — claude-token auto-rotate failed rc=$rotate_rc: ${rotate_summary:-no output}"
+                    # Critical section: due-check passed under the lock,
+                    # rotate, then write the cooldown, then release. The
+                    # EXIT trap ensures the lock is freed even if the
+                    # rotate call traps or the script is killed mid-flight.
+                    trap '_psw_release_rotation_lock' EXIT INT TERM
+                    rate_limit_rotation_attempted=1
+                    rotate_output="$(_psw_rotate_claude_token "$agent" 2>&1)"
+                    rotate_rc=$?
+                    _psw_note_rate_limit_rotation_attempt
+                    _psw_release_rotation_lock
+                    trap - EXIT INT TERM
+                    rotate_summary="$(printf '%s' "$rotate_output" | _psw_compact_one_line)"
+                    if [[ "$rotate_rc" -eq 0 ]]; then
+                        _psw_log "rate-limit picker on '$agent' — claude-token auto-rotate result: ${rotate_summary:-ok}"
+                    else
+                        _psw_log "rate-limit picker on '$agent' — claude-token auto-rotate failed rc=$rotate_rc: ${rotate_summary:-no output}"
+                    fi
+                    rate_limit_rotations+=("$agent:rc=$rotate_rc ${rotate_summary:-no output}")
                 fi
-                rate_limit_rotations+=("$agent:rc=$rotate_rc ${rotate_summary:-no output}")
             fi
         fi
     fi
