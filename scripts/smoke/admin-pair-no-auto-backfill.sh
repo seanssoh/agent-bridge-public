@@ -221,14 +221,26 @@ admin_pair_runtime_dry_run_text() {
   # The `timeout` wrapper bounds the call so a host that nevertheless
   # hits a different heredoc deadlock degrades to "no output" rather
   # than blocking the smoke indefinitely.
+  # DEBUG (temp, not for merge): capture stderr to a per-call file so the CI
+  # log shows why bridge-init.sh exits early on Linux when admin-pair smoke
+  # fails with '<missing-from-dry-run-output>'. Stdout still flows through
+  # the function so the parser is unchanged; stderr lands in a tmp file
+  # whose tail we echo to stderr post-run for CI capture.
+  local stderr_capture
+  stderr_capture="$(mktemp "${TMPDIR:-/tmp}/bridge-init-stderr-${label}.XXXXXX")"
   out="$(timeout --kill-after=5s "${budget}s" \
         env -u BRIDGE_ADMIN_AGENT_ID \
             BRIDGE_HOME="$bridge_home" \
-            bash "$SMOKE_REPO_ROOT/bridge-init.sh" \
+            bash -x "$SMOKE_REPO_ROOT/bridge-init.sh" \
               --skip-channel-setup --skip-validate --skip-send-test \
               --dry-run \
               --engine codex \
-              "$@" 2>/dev/null)" || true
+              "$@" 2>"$stderr_capture")" || true
+  local rc=$?
+  printf '\n=== DEBUG: bridge-init.sh stderr trace (label=%s, rc=%s) ===\n' "$label" "$rc" >&2
+  tail -n 80 "$stderr_capture" >&2 || true
+  printf '=== END DEBUG (label=%s) ===\n\n' "$label" >&2
+  rm -f "$stderr_capture"
   rm -rf -- "$(dirname "$bridge_home")"
   printf '%s' "$out"
 }
