@@ -2949,6 +2949,30 @@ bridge_resolve_resume_session_id() {
   local max_age_hours="${5:-${BRIDGE_RESUME_MAX_AGE_HOURS:-48}}"
   local exclude_csv="${6:-}"
 
+  # Antigravity (`agy`) gets a real resolution path with stale-id
+  # rejection — it must NOT fall through to the blind passthrough below.
+  # A conversation id older than max_age_hours resolves to empty + rc=1
+  # so the agent launches a fresh conversation rather than false-resuming
+  # a dead one (the resume-builder routes `agy --conversation <id>` only
+  # when a non-empty session_id survives). The Python body is a standalone
+  # helper invoked file-as-argv (footgun #11).
+  if [[ "$engine" == "antigravity" ]]; then
+    [[ -n "$workdir" ]] || return 1
+    # Issue #820 parity: when the caller passed no explicit exclude list
+    # but supplied an agent, inherit the per-agent resume-quarantine CSV.
+    if [[ -z "$exclude_csv" && -n "$agent" ]]; then
+      exclude_csv="$(bridge_agent_resume_quarantine_ids "$agent" 2>/dev/null || true)"
+    fi
+    if ! bridge_resolve_script_dir_check; then
+      return 1
+    fi
+    python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-antigravity-resume-session-id.py" \
+      "$workdir" "$candidate" "$max_age_hours" "$agent" "$exclude_csv" \
+      "$(bridge_antigravity_history_file)" \
+      "$(bridge_antigravity_conversation_state_dir)"
+    return $?
+  fi
+
   if [[ "$engine" != "claude" ]]; then
     if [[ -n "$candidate" ]]; then printf '%s' "$candidate"; fi
     return 0
@@ -3069,6 +3093,34 @@ print(best[1] if best else "")
 PY
 }
 
+# bridge_detect_antigravity_session_id <workdir> <since_hint> <exclude_csv>
+#
+# Resolves the most recent Antigravity (`agy`) conversation id for the
+# agent's workdir by parsing the agy conversation index
+# (~/.gemini/antigravity-cli/history.jsonl) and confirming the
+# conversation's `<id>.pb` state file still exists under conversations/.
+# Mirrors the recency / since-hint / exclude semantics of
+# bridge_detect_codex_session_id. The agy config root honors GEMINI_HOME
+# via bridge_antigravity_config_root (Track C1), so isolated tests can
+# point at a fixture tree. The Python body lives in a standalone helper
+# invoked file-as-argv — NOT a Python heredoc-stdin — for the footgun #11
+# deadlock reason documented on bridge_detect_claude_session_id.
+bridge_detect_antigravity_session_id() {
+  local workdir="$1"
+  local since_hint="${2:-0}"
+  local exclude_csv="${3:-}"
+
+  # #946 L1: substitution-safe guard. This helper is called exclusively
+  # from `$(...)` substitutions (callers parse stdout).
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/detect-antigravity-session-id.py" \
+    "$workdir" "$since_hint" "$exclude_csv" \
+    "$(bridge_antigravity_history_file)" \
+    "$(bridge_antigravity_conversation_state_dir)"
+}
+
 bridge_detect_session_id() {
   local engine="$1"
   local workdir="$2"
@@ -3082,12 +3134,21 @@ bridge_detect_session_id() {
     claude)
       bridge_detect_claude_session_id "$workdir" "$since_hint" "$exclude_csv"
       ;;
+    antigravity)
+      bridge_detect_antigravity_session_id "$workdir" "$since_hint" "$exclude_csv"
+      ;;
     *)
       printf '%s' ""
       ;;
   esac
 }
 
+# Persists the live session/conversation id into the per-agent history
+# slot once the session is up. Engine-agnostic: it routes detection
+# through bridge_detect_session_id, so the `antigravity` arm added there
+# is all that is needed for an agy agent's conversation id to be detected,
+# stored in BRIDGE_AGENT_SESSION_ID, and persisted — no explicit
+# antigravity branch is required in this function.
 bridge_refresh_agent_session_id() {
   local agent="$1"
   local attempts="${2:-8}"
