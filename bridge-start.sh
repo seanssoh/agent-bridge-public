@@ -504,8 +504,9 @@ elif [[ "$ENGINE" == "antigravity" && $SAFE_MODE -eq 0 ]]; then
   # ensures here — the launch-time `agy -i <bootstrap-prompt>` (built by
   # bridge_antigravity_dynamic_launch_cmd) is the SessionStart analogue.
   # Preseed the agy settings.json BEFORE launch: trust the workdir
-  # (pre-empts the trust selector), allow the bridge CLIs, and force
-  # altScreenMode=inline so tmux capture-pane idle detection works.
+  # (pre-empts the trust selector), allow the bridge CLIs, and pin
+  # altScreenMode=always so tmux capture-pane idle detection is
+  # deterministic (agy v1.0.0 rejects the "inline" value).
   if ! bridge_antigravity_settings_preseed "$WORK_DIR"; then
     bridge_warn "Antigravity settings preseed skipped or failed: $WORK_DIR"
   fi
