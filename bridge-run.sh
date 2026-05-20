@@ -347,7 +347,14 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
   local marker_file=""
   local previous_session_id="${1:-}"
 
-  [[ "$ENGINE" == "claude" ]] || return 0
+  # Antigravity wave B1: agy joins claude on the runtime inbox-bootstrap
+  # re-injection path — a queue task that lands after launch gets the
+  # `agb inbox` nudge at prompt-ready time. (codex deliberately stays off
+  # this path; its launch-time bootstrap is its only injection point.)
+  case "$ENGINE" in
+    claude|antigravity) ;;
+    *) return 0 ;;
+  esac
   [[ $SAFE_MODE -eq 0 ]] || return 0
   marker_file="$(bridge_agent_initial_inbox_marker_file "$AGENT")"
 
@@ -360,15 +367,21 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
       marker_file="$4"
       next_file="$5"
       previous_session_id="$6"
+      engine="$7"
       source "$script_dir/bridge-lib.sh"
-      if bridge_tmux_wait_for_prompt "$session" claude 30; then
-        if [[ -f "$next_file" && -n "$previous_session_id" ]]; then
-          bridge_refresh_agent_session_id "$agent" 24 0.5 "$previous_session_id" >/dev/null 2>&1 || true
-        elif [[ -z "$(bridge_agent_session_id "$agent")" ]]; then
-          # Claude session metadata can appear after tmux startup. Refresh once
-          # more at prompt-ready time so static resume state is persisted before
-          # the agent later goes inactive.
-          bridge_refresh_agent_session_id "$agent" 24 0.5 >/dev/null 2>&1 || true
+      if bridge_tmux_wait_for_prompt "$session" "$engine" 30; then
+        # Session-id refresh is claude-only: the agy conversation-id
+        # detector/resolver is Track A1 and is not wired here. claude keeps
+        # its post-startup metadata refresh; agy skips it until A1 lands.
+        if [[ "$engine" == "claude" ]]; then
+          if [[ -f "$next_file" && -n "$previous_session_id" ]]; then
+            bridge_refresh_agent_session_id "$agent" 24 0.5 "$previous_session_id" >/dev/null 2>&1 || true
+          elif [[ -z "$(bridge_agent_session_id "$agent")" ]]; then
+            # Claude session metadata can appear after tmux startup. Refresh once
+            # more at prompt-ready time so static resume state is persisted before
+            # the agent later goes inactive.
+            bridge_refresh_agent_session_id "$agent" 24 0.5 >/dev/null 2>&1 || true
+          fi
         fi
         bridge_agent_mark_idle_now "$agent"
         if [[ ! -f "$next_file" && ! -f "$marker_file" ]]; then
@@ -379,13 +392,13 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
             else
               inject_text="[Agent Bridge] ACTION REQUIRED — queued tasks detected. Run exactly: ~/.agent-bridge/agb inbox $agent"
             fi
-            bridge_tmux_send_and_submit "$session" claude "$inject_text" "$agent"
+            bridge_tmux_send_and_submit "$session" "$engine" "$inject_text" "$agent"
           fi
           mkdir -p "$(dirname "$marker_file")"
           printf "%s\n" "$(date +%s)" >"$marker_file"
         fi
       fi
-    ' -- "$SCRIPT_DIR" "$SESSION" "$AGENT" "$marker_file" "$next_file" "$previous_session_id"
+    ' -- "$SCRIPT_DIR" "$SESSION" "$AGENT" "$marker_file" "$next_file" "$previous_session_id" "$ENGINE"
   ) >/dev/null 2>&1 &
 }
 

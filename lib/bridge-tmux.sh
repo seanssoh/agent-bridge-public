@@ -17,6 +17,28 @@
 # Only `tmux send-keys` is wrapped — `tmux capture-pane`, `display-message`,
 # `set-buffer`, etc. are not on the documented hang path and wrapping them
 # would add cost to hot, well-behaved calls.
+# Antigravity wave B1: bridge_tmux_command_name_matches_engine /
+# bridge_agent_engine_process_alive route the engine VALUE through
+# bridge_engine_binary_name (defined in lib/bridge-core.sh, sourced before
+# this file by bridge-lib.sh). A few smoke harnesses
+# (scripts/smoke/status-engine-detect.sh,
+# scripts/smoke/835-static-admin-launch-helpers/engine-alive-driver.sh)
+# deliberately source ONLY this module to avoid triggering bridge_load_roster.
+# Provide a self-contained fallback so those direct-source paths do not exit
+# 127 ("bridge_engine_binary_name: command not found"). When bridge-core.sh
+# IS loaded its definition is sourced first and wins — this guard is inert.
+if ! declare -F bridge_engine_binary_name >/dev/null 2>&1; then
+  bridge_engine_binary_name() {
+    local engine="${1:-}"
+    case "$engine" in
+      antigravity) printf 'agy' ;;
+      claude) printf 'claude' ;;
+      codex) printf 'codex' ;;
+      *) printf '%s' "$engine" ;;
+    esac
+  }
+fi
+
 bridge_tmux_send_keys_with_timeout() {
   local label="$1"
   shift
@@ -68,19 +90,26 @@ bridge_tmux_command_name_is_claude() {
 
 # Issue #835 Wave B: generalized engine-name predicate used by the
 # tmux-without-engine detection helper. Mirrors bridge_tmux_command_name_is_claude
-# but covers both claude and codex by argument. Kept as a separate function
-# (rather than absorbing into _is_claude with an extra arg) so existing
+# but covers claude, codex and antigravity by argument. Kept as a separate
+# function (rather than absorbing into _is_claude with an extra arg) so existing
 # claude-only call sites keep their narrow contract and a future engine
 # kind (e.g., a wrapper "claude-code") is added by extending the case here.
+#
+# Antigravity wave B1: the engine VALUE ("antigravity") differs from its
+# on-disk binary base name ("agy"), so the engine arg is routed through A0's
+# bridge_engine_binary_name before the basename match. claude/codex are
+# value==binary so they are unaffected.
 bridge_tmux_command_name_matches_engine() {
   local command_name="${1:-}"
   local engine="${2:-}"
   local base=""
+  local binary=""
 
   [[ -n "$command_name" ]] || return 1
   [[ -n "$engine" ]] || return 1
   base="${command_name##*/}"
-  case "$engine" in
+  binary="$(bridge_engine_binary_name "$engine")"
+  case "$binary" in
     claude)
       case "$base" in
         claude|claude-*|claude.*) return 0 ;;
@@ -90,6 +119,12 @@ bridge_tmux_command_name_matches_engine() {
     codex)
       case "$base" in
         codex|codex-*|codex.*) return 0 ;;
+        *) return 1 ;;
+      esac
+      ;;
+    agy)
+      case "$base" in
+        agy|agy-*|agy.*) return 0 ;;
         *) return 1 ;;
       esac
       ;;
@@ -218,9 +253,11 @@ bridge_agent_engine_process_alive() {
   fi
   # Defined only for prompt-driven engines. Anything else returns 1
   # (caller must treat the helper as "unknown" / fall through to the
-  # legacy active-by-tmux check).
+  # legacy active-by-tmux check). antigravity is prompt-driven (B1);
+  # bridge_tmux_process_tree_has_engine routes the engine value through
+  # bridge_engine_binary_name so the `agy` process is matched.
   case "$engine" in
-    claude|codex) ;;
+    claude|codex|antigravity) ;;
     *) return 1 ;;
   esac
 
@@ -320,7 +357,7 @@ bridge_tmux_engine_requires_prompt() {
   local engine="$1"
 
   case "$engine" in
-    claude|codex)
+    claude|codex|antigravity)
       return 0
       ;;
     *)
@@ -413,6 +450,35 @@ bridge_tmux_codex_prompt_line_ready() {
   [[ "$trimmed" == ›* || "$trimmed" == '>'* ]]
 }
 
+# Antigravity wave B1: agy (Antigravity CLI v1.0.0) ready-for-input detection.
+#
+# Pinned against a live bridge-managed agy session 2026-05-21. The agy TUI
+# always draws a composer box whose input line is a bare `>` framed by
+# horizontal-rule lines — that glyph is present *both* at a ready prompt and
+# mid-turn, so a codex-style bare-`>` line check would false-positive while
+# agy is generating. The reliable ready/busy discriminator is the status
+# footer:
+#   ready : "? for shortcuts" ............ "Gemini <model>"
+#   busy  : "esc to cancel"   ............ "Gemini <model>"  (+ a
+#           "<spinner> Generating..." line above the composer)
+# So a prompt is ready iff the capture footer carries the "? for shortcuts"
+# affordance AND no in-flight "esc to cancel" / "Generating..." marker.
+#
+# This is a whole-capture predicate (the ready and busy signals live on
+# different lines), so it is evaluated once on the full text rather than per
+# line in the bridge_tmux_session_has_prompt_from_text iterator.
+bridge_tmux_antigravity_prompt_ready_from_text() {
+  local text="$1"
+
+  [[ -n "$text" ]] || return 1
+  # In-flight turn: the footer shows the cancel affordance and/or the
+  # generation spinner line. Either one means agy is busy, not ready.
+  [[ "$text" == *"esc to cancel"* ]] && return 1
+  [[ "$text" == *"Generating..."* ]] && return 1
+  # Ready: the idle footer affordance is drawn.
+  [[ "$text" == *"? for shortcuts"* ]]
+}
+
 bridge_tmux_prompt_line_has_pending_input() {
   local engine="$1"
   local trimmed="$2"
@@ -482,6 +548,15 @@ bridge_tmux_session_has_prompt_from_text() {
 
   bridge_tmux_engine_requires_prompt "$engine" || return 0
   [[ -n "$recent" ]] || return 1
+
+  # Antigravity wave B1: agy's ready/busy signals live on distinct footer
+  # lines, so it is a whole-capture predicate evaluated before the per-line
+  # iterator (the bare `>` composer glyph is drawn mid-turn too — see
+  # bridge_tmux_antigravity_prompt_ready_from_text).
+  if [[ "$engine" == "antigravity" ]]; then
+    bridge_tmux_antigravity_prompt_ready_from_text "$recent"
+    return $?
+  fi
 
   # Issue #815 Wave A: feeding a large tmux capture into the iterator via
   # here-string blocked Bash in `heredoc_write` on the operator's stale
@@ -1203,6 +1278,15 @@ bridge_tmux_send_and_submit() {
   case "$engine" in
     claude)
       bridge_tmux_type_and_submit "$session" "$text" "$engine"
+      ;;
+    antigravity)
+      # Antigravity wave B1: agy accepts bracketed paste into its composer
+      # and submits on C-m, like codex — verified against a live agy session
+      # 2026-05-21 (queued task pasted + submitted, processed to completion).
+      # The codex-specific placeholder/composer-state retries inside
+      # bridge_tmux_paste_and_submit are guarded by `engine == codex`, so the
+      # agy path takes the plain paste + verify/retry-on-C-m flow.
+      bridge_tmux_paste_and_submit "$session" "$text" "$engine"
       ;;
     *)
       bridge_tmux_paste_and_submit "$session" "$text" "$engine"
