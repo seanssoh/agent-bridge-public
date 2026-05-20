@@ -825,6 +825,15 @@ while true; do
     bridge_run_schedule_dev_channels_accept "$LAUNCH_CMD"
     bridge_run_schedule_idle_marker_and_inbox_bootstrap "$previous_session_id"
     bridge_ensure_hud_usage_tap "$WORK_DIR" "$LAUNCH_CMD" "$AGENT" >/dev/null 2>&1 || true
+  elif [[ "$ENGINE" == "antigravity" && $SAFE_MODE -eq 0 ]]; then
+    # Antigravity wave: agy has none of claude's channel-plugin /
+    # teams-mcp / dev-channels / hud preflight above, but it DOES need the
+    # runtime inbox-bootstrap re-injection — a queue task that lands after
+    # launch gets the `agb inbox` nudge at prompt-ready time. The helper
+    # itself is engine-aware (claude|antigravity) and SAFE_MODE-guarded;
+    # this dedicated elif keeps claude's preflight from running for agy
+    # while still reaching the shared inbox-bootstrap step.
+    bridge_run_schedule_idle_marker_and_inbox_bootstrap "$previous_session_id"
   fi
 
   log_line "실행: ${local_launch_cmd_display}"
