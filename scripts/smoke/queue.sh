@@ -329,16 +329,25 @@ queue_gateway_socket_group_mode_contract() {
     socket_gid="$(stat -c '%g' "$socket_path")"
     [[ "$socket_gid" == "$shared_gid" ]] \
       || smoke_fail "socket group should be $shared_grp (gid=$shared_gid), got gid=$socket_gid"
-    [[ "$socket_mode" == *60 ]] \
-      || smoke_fail "socket mode should be ?660 (group-rw), got $socket_mode"
+    [[ "$socket_mode" == "660" ]] \
+      || smoke_fail "socket mode should be 660 (group-rw), got $socket_mode"
+    # Instance dir must also be owned by ab-shared with setgid+rwx (2770)
+    local instance_dir inst_gid inst_mode
+    instance_dir="$(dirname "$socket_path")"
+    inst_gid="$(stat -c '%g' "$instance_dir")"
+    inst_mode="$(stat -c '%a' "$instance_dir")"
+    [[ "$inst_gid" == "$shared_gid" ]] \
+      || smoke_fail "instance dir group should be $shared_grp (gid=$shared_gid), got gid=$inst_gid"
+    [[ "$inst_mode" == "2770" ]] \
+      || smoke_fail "instance dir mode should be 2770 (setgid+rwx), got $inst_mode"
     # No named-user ACL entries (if getfacl is available)
     if command -v getfacl >/dev/null 2>&1; then
-      local acl_body
+      local acl_body named_acl
       acl_body="$(getfacl -cp "$socket_path")"
-      # named-user entries look like "user:<name>:"; owner entry is "user::<perms>" (empty name)
-      if echo "$acl_body" | grep -qP '^user:[^:]+:[^:]+$' | grep -qv '^user::'; then
-        smoke_fail "socket must have no named-user ACL entries; got: $(echo "$acl_body" | grep '^user:[^:]')"
-      fi
+      # named-user entries look like "user:<name>:"; owner entry is "user::<perms>" (empty name field)
+      named_acl="$(printf '%s\n' "$acl_body" | grep -E '^user:[^:]+:' || true)"
+      [[ -z "$named_acl" ]] \
+        || smoke_fail "socket must have no named-user ACL entries; got: $named_acl"
     fi
   else
     # ab-shared absent (smoke/dev fallback): assert owner-only (mode 0600) and no world bits
