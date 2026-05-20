@@ -2109,9 +2109,8 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
 
   # Platform/policy gate (non-Linux / BRIDGE_ISOLATION_REQUIRED=no → skip)
   _bridge_isolation_v2_cred_platform_ok || return 0
-  # ACL tooling gate (no setfacl/getfacl package → skip)
-  command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1 || return 0
-  # Group resolution — run in parent shell so bridge_die exits the parent, not a subshell
+  # Group resolution before ACL tooling gate: missing group on live is always fatal,
+  # even when setfacl/getfacl are absent.
   local _grp_gid
   _grp_gid="$(_bridge_isolation_v2_shared_group)"
   if [[ -z "$_grp_gid" ]]; then
@@ -2122,6 +2121,8 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
       return 0
     fi
   fi
+  # ACL tooling gate (no setfacl/getfacl package → skip gracefully)
+  command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1 || return 0
 
   local ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
   [[ -n "$ctrl_user" ]] || {
@@ -2228,9 +2229,8 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
 
   # Platform/policy gate
   _bridge_isolation_v2_cred_platform_ok || return 0
-  # ACL tooling gate
-  command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1 || return 0
-  # Group resolution in parent shell (bridge_die must not run inside $())
+  # Group resolution before ACL tooling gate: missing group on live is always fatal,
+  # even when setfacl/getfacl are absent.
   local _grp_gid
   _grp_gid="$(_bridge_isolation_v2_shared_group)"
   if [[ -z "$_grp_gid" ]]; then
@@ -2241,6 +2241,8 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
       return 0
     fi
   fi
+  # ACL tooling gate (no setfacl/getfacl package → skip gracefully)
+  command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1 || return 0
 
   local _pfx="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}"
 
