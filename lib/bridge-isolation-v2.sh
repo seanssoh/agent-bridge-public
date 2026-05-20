@@ -2164,6 +2164,7 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
         _bridge_isolation_v2_run_root_or_sudo \
           setfacl -x "u:${_u}" "$anc" 2>/dev/null || {
             bridge_warn "apply_controller_credentials_read_grant: setfacl -x u:${_u} on $anc failed"
+            return 1
           }
       done <<<"$_existing_named"
     fi
@@ -2197,17 +2198,18 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
     _bridge_isolation_v2_run_root_or_sudo \
       chgrp "${BRIDGE_SHARED_GROUP:-ab-shared}" "$anc" 2>/dev/null || {
         bridge_warn "apply_controller_credentials_read_grant: chgrp ab-shared on $anc failed"
-        continue
+        return 1
       }
     _bridge_isolation_v2_run_root_or_sudo chmod g+x "$anc" 2>/dev/null || {
       bridge_warn "apply_controller_credentials_read_grant: chmod g+x on $anc failed"
-      continue
+      return 1
     }
     # Explicitly set base group::--x so the entry is effective even when
     # unrelated ACLs are present (mask can otherwise clamp group access)
     _bridge_isolation_v2_run_root_or_sudo \
       setfacl -m "group::--x" "$anc" 2>/dev/null || {
         bridge_warn "apply_controller_credentials_read_grant: setfacl -m group::--x on $anc failed"
+        return 1
       }
   done < <(_bridge_isolation_v2_cred_ancestors "$cred_file")
 
@@ -2277,14 +2279,11 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
     [[ "$anc_gid" == "$_grp_gid" ]] || return 1
     # g+x in stat: group digit (second from right) is 1,3,5,7
     [[ "${_anc_mode: -2:1}" =~ ^[1357]$ ]] || return 1
-    # base group::--x (or r-x) in getfacl
+    # base group::--x (traverse only, no listing) in getfacl
     local _anc_grp
     _anc_grp="$(printf '%s\n' "$anc_acl" \
       | awk -F: '/^group::/ {print substr($3,1,3)}' | head -n1)"
-    case "$_anc_grp" in
-      --x|r-x) : ;;
-      *) return 1 ;;
-    esac
+    [[ "$_anc_grp" == "--x" ]] || return 1
   done < <(_bridge_isolation_v2_cred_ancestors "$path")
 
   return 0
