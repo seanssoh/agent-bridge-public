@@ -6,8 +6,9 @@
 # bridge context the Claude/Codex agents get via SessionStart hooks:
 #
 #   - bridge_antigravity_settings_preseed — atomic preseed of the agy
-#     settings.json (trust workspace, allow the bridge CLIs, force
-#     altScreenMode=inline so tmux idle detection works).
+#     settings.json (trust workspace, allow the bridge CLIs, pin
+#     altScreenMode=always so tmux capture-pane idle detection is
+#     deterministic — agy v1.0.0 rejects the "inline" value).
 #   - bridge_antigravity_dynamic_launch_cmd — builds the launch argv with
 #     the mandatory `-i <bootstrap-prompt>` for fresh sessions and the
 #     `--conversation <id>` resume form.
@@ -52,7 +53,7 @@ bridge_antigravity_history_file() {
 #
 # Atomic read-modify-write of the agy settings.json: add <workdir> to
 # trustedWorkspaces (pre-empts the trust selector), add the bridge CLIs to
-# permissions.allow, and force altScreenMode=inline. All pre-existing keys
+# permissions.allow, and pin altScreenMode=always. All pre-existing keys
 # are preserved; idempotent. Runs BEFORE launch — not a reactive tmux
 # workaround. The JSON mutation is done by a standalone python helper
 # invoked file-as-argv (no heredoc-stdin — footgun #11).

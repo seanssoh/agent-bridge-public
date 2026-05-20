@@ -13,7 +13,7 @@
 # Assertions:
 # T1: preseed preserves ALL pre-existing keys, adds the workdir to
 #     trustedWorkspaces, adds both command(...) allow entries, sets
-#     altScreenMode=inline.
+#     altScreenMode=always (overwriting the fixture's prior value).
 # T2: preseed is idempotent — a second run adds nothing duplicate.
 # T3: fresh launch cmd carries `agy --dangerously-skip-permissions -i
 #     <bootstrap-prompt>`; resume launch cmd carries `--conversation <id>`
@@ -58,7 +58,7 @@ assert_preseed_preserves_and_adds() {
     "allow": ["command(/usr/bin/git)"],
     "deny": ["command(/bin/rm)"]
   },
-  "altScreenMode": "always"
+  "altScreenMode": "auto"
 }
 JSON
 
@@ -80,7 +80,7 @@ JSON
   smoke_assert_contains "$dump" "denyPreserved=True"      "T1: permissions.deny preserved"
   smoke_assert_contains "$dump" "agbAllow=True"           "T1: agb command(...) allow added"
   smoke_assert_contains "$dump" "agentBridgeAllow=True"   "T1: agent-bridge command(...) allow added"
-  smoke_assert_contains "$dump" "altScreenMode=inline"    "T1: altScreenMode set to inline"
+  smoke_assert_contains "$dump" "altScreenMode=always"    "T1: altScreenMode set to always (overwrote fixture's 'auto')"
 }
 
 assert_preseed_idempotent() {
