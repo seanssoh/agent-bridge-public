@@ -22,13 +22,13 @@ bridge-agent.sh	1601	H3	65f16bf24c33c0cb82a15db911bf36c2c64ff5239a0c91558a011a46
 bridge-agent.sh	1709	H3	de915434d9efb6ac3e0eca1de16fe39fa5a8677a3c0b29417f4e5dd2bb5738d5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-agent.sh	1788	H3	284c4b8ea0187f630fe41146d5d4304b0da61a8bf2f6c5cc1cefe06befb2c4e5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-agent.sh	1887	H3	a7b5c9a8b686430b9652756d923f7993923fce9d9954ee757edda76f55d8f61a	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	3116	H3	0015efd5b1e788c2848282f1dcadcc1f171322f7a573ccf3fff41f92a93fd742	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	3124	H3	a6cd1b770d440b091038c69272244d04bde3a542dce5b2b27f0bded1103b4137	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	3233	C1	bf0523c33b08261f92642d54ec18cb2ac7373e07fe2df60567652166b7c1631c	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch	Phase 2 PR B candidate
-bridge-agent.sh	3522	C1	a9fc8ebeff76410ff071ebf09f5452b39e55a68feb485a6e604f255dce001723	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
-bridge-agent.sh	3672	C3	924679e48aea308abd6dc02be9a6699171635564c6027867e8ef8a13851dc96f	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-agent.sh	3983	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-agent.sh	4085	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-agent.sh	3127	H3	0015efd5b1e788c2848282f1dcadcc1f171322f7a573ccf3fff41f92a93fd742	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	3135	H3	a6cd1b770d440b091038c69272244d04bde3a542dce5b2b27f0bded1103b4137	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	3244	C1	bf0523c33b08261f92642d54ec18cb2ac7373e07fe2df60567652166b7c1631c	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch	Phase 2 PR B candidate
+bridge-agent.sh	3544	C1	a9fc8ebeff76410ff071ebf09f5452b39e55a68feb485a6e604f255dce001723	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
+bridge-agent.sh	3694	C3	924679e48aea308abd6dc02be9a6699171635564c6027867e8ef8a13851dc96f	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-agent.sh	4005	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-agent.sh	4107	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-audit.sh	46	H3	61a92b52c42511fb472a672926f0bf92dd5bf8eb38cfc68961d624ae8a033797	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-auth.sh	187	C3	916ea3234694270e5a77bcc0178e3163ecc902cae3b68c58226f0012428da8f4	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-auth.sh	326	H3	25a1d9fe293aaa39b67439a679addbb8a932f1e79d870356616753d39d6e5a08	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -47,18 +47,18 @@ bridge-cron.sh	494	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940
 bridge-cron.sh	1018	C3	e922c8981a5dc87928344cdc8dc56501cf7cfdad8d360c59e7754c66f1600478	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-daemon.sh	404	H3	f1c1630f31d4bc24ae47602958be739975b927a70ec87c7bf819402ad94b9b0f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-daemon.sh	626	H3	16a961e912bc1612646a256a1b085d41178d7b1c282775a10dc8f83244b92ea8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	1479	H3	23c0313bf8a6711cc33242c92c06468b8b19bc33e2b16b421f3bc60de187a677	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	1675	H3	16ff48070939ced82df89c9c5a5aee6d60abfa8ce48e66cbc1affbe12e89db37	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	1746	H3	f423c7e06b3b4c0cddc08ab8d3564f61837e3c8ad7db470ce969c038eeecfea9	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	1851	H3	f2f7bbaa1522f4f128ab0ff3593fc0130f85aa9bcb007449d281ee9c49a93d46	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	3428	H3	82396450ad2047810650fbf7be3229b2838ced50ff8db7c1bcc7ec17a03469ab	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	4034	H3	80372715b714b8d52d32ef0bc620d9647fb08253c6721eead53477ed2e1b86af	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	5463	H3	47703942eaf8af97fb67249b0328bddd3d275c6ff6c808f6e0180036f1beb4a3	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	5534	H3	80372715b714b8d52d32ef0bc620d9647fb08253c6721eead53477ed2e1b86af	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	5596	H3	efed83d847aea81244ff9ae53de03d93bc2da5b37093fdf0b28bdb4a5d314bd1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	5781	H3	c01d23cff987c3906cdba09639c4aed6e981b89ab017d5ffba6c964e6e5a2775	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	6929	H3	29559f61586cbb5244c6adbfc937edcd6e5181587de3c51a92a101df4fcdeb6b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	7003	H3	32e64212066ea50d5c52673c6ab72d46a3979164ed4d30276da8e54651fe5ed5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	1480	H3	23c0313bf8a6711cc33242c92c06468b8b19bc33e2b16b421f3bc60de187a677	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	1676	H3	16ff48070939ced82df89c9c5a5aee6d60abfa8ce48e66cbc1affbe12e89db37	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	1747	H3	f423c7e06b3b4c0cddc08ab8d3564f61837e3c8ad7db470ce969c038eeecfea9	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	1852	H3	f2f7bbaa1522f4f128ab0ff3593fc0130f85aa9bcb007449d281ee9c49a93d46	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	3429	H3	82396450ad2047810650fbf7be3229b2838ced50ff8db7c1bcc7ec17a03469ab	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	4035	H3	80372715b714b8d52d32ef0bc620d9647fb08253c6721eead53477ed2e1b86af	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	5464	H3	47703942eaf8af97fb67249b0328bddd3d275c6ff6c808f6e0180036f1beb4a3	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	5535	H3	80372715b714b8d52d32ef0bc620d9647fb08253c6721eead53477ed2e1b86af	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	5597	H3	efed83d847aea81244ff9ae53de03d93bc2da5b37093fdf0b28bdb4a5d314bd1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	5782	H3	c01d23cff987c3906cdba09639c4aed6e981b89ab017d5ffba6c964e6e5a2775	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	6944	H3	29559f61586cbb5244c6adbfc937edcd6e5181587de3c51a92a101df4fcdeb6b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	7023	H3	32e64212066ea50d5c52673c6ab72d46a3979164ed4d30276da8e54651fe5ed5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-diagnose.sh	111	H3	dc966cbceac005436f03cf335da5d06c882711801ffdee2573674d17e5bbcc7a	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-diagnose.sh	121	C3	8682be12f674bdc8f3d517e38f41f2bef8873716d2b434400017fa5e126426a1	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-diagnose.sh	204	H3	dca120fec631dee0ec9fb9d1930cefeb4cadac7d223746f1db4b53990a18815c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -83,7 +83,7 @@ bridge-review.sh	137	H3	703b24afbe03d28c1a3c3c2072a949aac074c881f00496a189df9f83
 bridge-run.sh	561	H3	284c4b8ea0187f630fe41146d5d4304b0da61a8bf2f6c5cc1cefe06befb2c4e5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-run.sh	596	H3	284c4b8ea0187f630fe41146d5d4304b0da61a8bf2f6c5cc1cefe06befb2c4e5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-run.sh	735	H3	fbe2e0c1fc0d55af86d8804be8589ce21a6b8977b22417398cdd4eb53fb20d4d	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-run.sh	854	H3	47d2fd5207afca069a9aa0cd6c99771977fbe606e62ab3d1122f660a3851e8b7	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-run.sh	855	H3	47d2fd5207afca069a9aa0cd6c99771977fbe606e62ab3d1122f660a3851e8b7	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-setup.sh	107	C3	dfa7cb8653e0fa5030cfb74dc10e3f9b1cea067a4a736f616072077c28737eda	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-setup.sh	131	C3	dfa7cb8653e0fa5030cfb74dc10e3f9b1cea067a4a736f616072077c28737eda	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-setup.sh	154	C3	25149f22b708794256a01db1a4cfb75cb8fc1b962478687d785a0ad389755c7a	interpreter heredoc, no capture	patch	Phase 3 PR C
@@ -94,38 +94,38 @@ bridge-setup.sh	243	C3	d2d4d11fd0b97e758767ae8c23dfebc20abfe1e8b88aedad8f4f3c3ce
 bridge-setup.sh	281	C3	6fd6478facabcc009786128e48fbe52d949b12c5eae3df433b405153ee7e5827	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-setup.sh	326	C3	97e1c2b90939f2fb90d579c9ab8366699d1ab8ca2066ce114e88afdbf0463096	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-setup.sh	401	H3	eab0ecf8c86be79c508d9cac10c3e5ce8c9d6f1c8bb9bf8eb6434009ab9e4e7b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-setup.sh	772	H3	672f54d53c4336a592a111f7a5e7dc2bd1e7e65a3c4206462279b6d8a88a7d0f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-setup.sh	775	H3	73008b63dd1d96352d89b3d811fd9dfe5deded91465d5b85ba74e4b1225fb5bf	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-setup.sh	777	H3	52cde646fd975d60d2e8a8e6c3cb36b011d45ed2f487caeb8060a25a330ef61e	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-setup.sh	778	H3	baf972f9f9ee6a2b71442a33e3b18c8fb52557e9fe15952cff144bfdca0b598b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-setup.sh	787	H3	672f54d53c4336a592a111f7a5e7dc2bd1e7e65a3c4206462279b6d8a88a7d0f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-setup.sh	798	H3	73008b63dd1d96352d89b3d811fd9dfe5deded91465d5b85ba74e4b1225fb5bf	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-setup.sh	807	H3	52cde646fd975d60d2e8a8e6c3cb36b011d45ed2f487caeb8060a25a330ef61e	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-setup.sh	808	H3	baf972f9f9ee6a2b71442a33e3b18c8fb52557e9fe15952cff144bfdca0b598b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-setup.sh	789	H3	672f54d53c4336a592a111f7a5e7dc2bd1e7e65a3c4206462279b6d8a88a7d0f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-setup.sh	792	H3	73008b63dd1d96352d89b3d811fd9dfe5deded91465d5b85ba74e4b1225fb5bf	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-setup.sh	794	H3	52cde646fd975d60d2e8a8e6c3cb36b011d45ed2f487caeb8060a25a330ef61e	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-setup.sh	795	H3	baf972f9f9ee6a2b71442a33e3b18c8fb52557e9fe15952cff144bfdca0b598b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-setup.sh	804	H3	672f54d53c4336a592a111f7a5e7dc2bd1e7e65a3c4206462279b6d8a88a7d0f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-setup.sh	815	H3	73008b63dd1d96352d89b3d811fd9dfe5deded91465d5b85ba74e4b1225fb5bf	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-setup.sh	824	H3	52cde646fd975d60d2e8a8e6c3cb36b011d45ed2f487caeb8060a25a330ef61e	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-setup.sh	825	H3	baf972f9f9ee6a2b71442a33e3b18c8fb52557e9fe15952cff144bfdca0b598b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-sync.sh	90	H3	a49abc35efe1b717a38f3ddef548271f4817dcffe4ec124538d83f68b11a23ee	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-task.sh	86	H3	db08948a6d11d787c963199cc79ecd1d30e4c1a1abe1bfff0745d5e9d3909829	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-task.sh	121	C1	49df791be91c50d4dffaa081c019863ebecc1ad5db41e2eef744182e8b8ca163	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
 bridge-task.sh	164	H3	db08948a6d11d787c963199cc79ecd1d30e4c1a1abe1bfff0745d5e9d3909829	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-task.sh	454	H3	5514150afa7054f60667759a82770d85a89681c16bd1abd4161dec74a824f3e9	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-task.sh	753	H3	db08948a6d11d787c963199cc79ecd1d30e4c1a1abe1bfff0745d5e9d3909829	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-upgrade.sh	663	C3	e4941c470a8a634d15efe67a011dc562cea9cf9375994a887d305c813415cec0	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	766	C3	cb60ec27bf8f37ea3ef3f2e9649752ee314614fd8f7c791d576f5cb81fb916f1	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	791	C3	6c51a4883fcd57d62f4fc1bbb02b241b41878c92fa051311dc35999bc0bf13c4	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1201	C3	bab16fe92cd44e5ddd3310f75c4b71cbcbd9a08b9ddc86f33c7bf6edf78b7c7b	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1321	C3	745dd209a20999047eeffc755bbf76df07821e98b0564775dbcc38727bb243a3	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1332	C3	5f4e158f87ad3d5724106737736060aacb068b62bdb2ce8016614b2a7dcb6918	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1384	C3	c34cd8688dd332ed27b12d9fbe5dea7f46ac4d3bb10a70511c1ae3fd311df0ec	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1398	C3	674269ba5d1496f502b9f41abdf80da2864580442023f5b7c44d69b05d9261a4	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1652	C3	ee2531cb84d04ac3f1033740f7befe85df1e4dd0efe556e0062c98c267ca6c5c	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1704	C3	fc4776a956841e63c8d8f102d10565d33762638341c9940f87a2585e8b3e41da	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1902	C3	8dd953f98d8205a0a40ad0a0d211508193419f78dc107f0d83d48aedfe711b8e	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2265	C3	00cfa9265325e4f8d9d18009831fc9564186c5905b2af18ee9103a5aaa32a82c	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2397	C3	3b7b007634879006d9b95ee9e8f13693d64b0fe8244029b5690b38c4cf246344	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2404	C3	b919ffe917ff2abbde55677ee2b8c9fa5c91292bc8b9770d8e1a355f2fbc7023	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2417	C3	3479551ea337120bba6074762c98d92546f9f020aa56f21a9969bd0e11d93079	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2427	C3	a92d97bf4bdbac66d088fdb7598c601ce72cde7b48665ef7e5332e972e82f476	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2454	C3	954ee5bc5b2158c6e0e7b20748a9f1827dd0dca850d08bed692ed499e127ef1d	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2489	C3	f260289bf565528bca5d1ecf9c6c7707f5b7f65b407c2c23704785b186735493	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	690	C3	e4941c470a8a634d15efe67a011dc562cea9cf9375994a887d305c813415cec0	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	810	C3	cb60ec27bf8f37ea3ef3f2e9649752ee314614fd8f7c791d576f5cb81fb916f1	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	835	C3	6c51a4883fcd57d62f4fc1bbb02b241b41878c92fa051311dc35999bc0bf13c4	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1245	C3	bab16fe92cd44e5ddd3310f75c4b71cbcbd9a08b9ddc86f33c7bf6edf78b7c7b	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1365	C3	745dd209a20999047eeffc755bbf76df07821e98b0564775dbcc38727bb243a3	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1376	C3	5f4e158f87ad3d5724106737736060aacb068b62bdb2ce8016614b2a7dcb6918	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1428	C3	c34cd8688dd332ed27b12d9fbe5dea7f46ac4d3bb10a70511c1ae3fd311df0ec	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1442	C3	674269ba5d1496f502b9f41abdf80da2864580442023f5b7c44d69b05d9261a4	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1696	C3	ee2531cb84d04ac3f1033740f7befe85df1e4dd0efe556e0062c98c267ca6c5c	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1748	C3	fc4776a956841e63c8d8f102d10565d33762638341c9940f87a2585e8b3e41da	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1968	C3	8dd953f98d8205a0a40ad0a0d211508193419f78dc107f0d83d48aedfe711b8e	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2484	C3	00cfa9265325e4f8d9d18009831fc9564186c5905b2af18ee9103a5aaa32a82c	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2616	C3	3b7b007634879006d9b95ee9e8f13693d64b0fe8244029b5690b38c4cf246344	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2623	C3	b919ffe917ff2abbde55677ee2b8c9fa5c91292bc8b9770d8e1a355f2fbc7023	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2636	C3	3479551ea337120bba6074762c98d92546f9f020aa56f21a9969bd0e11d93079	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2646	C3	a92d97bf4bdbac66d088fdb7598c601ce72cde7b48665ef7e5332e972e82f476	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2673	C3	954ee5bc5b2158c6e0e7b20748a9f1827dd0dca850d08bed692ed499e127ef1d	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2708	C3	f260289bf565528bca5d1ecf9c6c7707f5b7f65b407c2c23704785b186735493	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upstream.sh	26	C3	61be7f11413c4788744477b9d1233d24940fe6b70653f980cc432d8b699452a7	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upstream.sh	41	C3	35aa990aa74d451003242d6fd7e31d42bb787a9a3d7bb1911d388771e5cf3464	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upstream.sh	131	C2	db87846a2d1466a114eb490ccd6db871093609275e493fdedbd7b7107ceecaea	cat heredoc in capture	patch	Phase 2 PR B
@@ -151,42 +151,42 @@ lib/bridge-agents.sh	2572	H3	616d9c02986bfc424668896ce49adca31d72a9ab4adfc67b3da
 lib/bridge-agents.sh	2587	H3	b77649487099afb4ed1fdde9105917c571c0daba8ed55e4f4ec994aa40d945c3	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-agents.sh	2694	H3	89bfc2aff8c48f9e5e5e6b2b33fb260791355676e4aa64ebdd5bb8256657d1b7	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-agents.sh	2800	H3	3dbcfafd7722051258c95e899018eb180509325ac8f1fed7d06e085f40b88cbc	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	3553	H3	96fd6e36d81f8c7cce0d07fc005dd83d9c35427d43e19a65fadb3103e52c6293	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	3970	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	3999	H3	bfa000209eb11f96aa65ad5a08f2d0d0e011c8867ff4ddebd51592e7a23d6d22	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4071	H3	5d422c2faa9f26afe588ea2e4a743ebf26664f9465d63744e2eefd8c12dce0d7	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4148	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4185	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4209	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4233	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4257	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4349	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4370	H3	00df29be2d24a6c5fecd33e1852b799d46617ceb760063a18085a6cc8155d84f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4371	H3	5352c3cbc3a73c61a6cf8ead945818730508f1846d9fd9b487d0dfb6710eba99	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4437	H3	538a9ca8eae8c411b0ecb31dadf3d8ed200b88ccf101a8d9f54a6a3e87d3dab4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4495	C3	80fcc340a0b98b0ce607e977f247e1ff449866103e9e57e75dff5c987d458c9f	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	4984	C3	c83c54b6c2bfa499e3fcb336d45a2ab60f0dd93871ccd1f17f3fcf372ae83b36	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	5086	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	5162	C3	86d8be2f8efb1c66475f8381b2c220041e644fd78aa619f3c5b93b618dfa4fb9	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	5268	C3	a86b7f9ed439e40c69ca6402d6328478729610504db5f88174402f909953fb0f	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	5360	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	5399	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	5424	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	5564	C3	25fc7454bc30fed6111370dbff634436b085bbb8a68a8ef67500cb506a91c583	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	5653	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	5702	H3	e470978788504a3913cff8fd33088c6a864b692cda56dbbfb5db1cc2f49d54a4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	6154	C3	213e3f988afdf73ba76b10171d1f078404e5add7f856942860650ebd3d394665	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	6214	C3	7fd9d92ec0f389cfd150c18d07df9816e0d7430b3943e364f3ff4f1ac8b4caf2	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	6247	C3	2a37cc61060152656d688f197079816b3c801180d26b9cd05b49acccbe19cef2	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	6462	H3	28c851126fa7ff64d39080d7ce681118cd8bc7ca09b01c53484eee24282647ba	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	6515	H3	28c851126fa7ff64d39080d7ce681118cd8bc7ca09b01c53484eee24282647ba	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	6876	H3	7df84eb9232986fb58e31393fb467f8fae42994efe8452977643e6d5de2448f4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	6937	H3	7df84eb9232986fb58e31393fb467f8fae42994efe8452977643e6d5de2448f4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7017	H3	967276bccff3eae7ab3fe0ebb717d60a4a3793d2edc085f88df3c7390b65841f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7027	H3	517c30da87631f8f67c6fe9a62c6d41356de325963a22b9d2cc713e6c3a1ef9f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7076	H3	65f16bf24c33c0cb82a15db911bf36c2c64ff5239a0c91558a011a46b9242199	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7151	H3	9da0241aa62971ce7348d069bf368dc3f43fa96218983c0ec24e5d728da74d8a	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7241	C3	753d10fefcef9d65bc723e1c347bafdc1ab99b4689b49b11da6dbf7d9473e014	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	3657	H3	96fd6e36d81f8c7cce0d07fc005dd83d9c35427d43e19a65fadb3103e52c6293	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4074	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4103	H3	bfa000209eb11f96aa65ad5a08f2d0d0e011c8867ff4ddebd51592e7a23d6d22	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4175	H3	5d422c2faa9f26afe588ea2e4a743ebf26664f9465d63744e2eefd8c12dce0d7	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4252	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4289	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4313	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4337	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4361	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4453	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4474	H3	00df29be2d24a6c5fecd33e1852b799d46617ceb760063a18085a6cc8155d84f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4475	H3	5352c3cbc3a73c61a6cf8ead945818730508f1846d9fd9b487d0dfb6710eba99	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4541	H3	538a9ca8eae8c411b0ecb31dadf3d8ed200b88ccf101a8d9f54a6a3e87d3dab4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4599	C3	80fcc340a0b98b0ce607e977f247e1ff449866103e9e57e75dff5c987d458c9f	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	5088	C3	c83c54b6c2bfa499e3fcb336d45a2ab60f0dd93871ccd1f17f3fcf372ae83b36	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	5190	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	5266	C3	86d8be2f8efb1c66475f8381b2c220041e644fd78aa619f3c5b93b618dfa4fb9	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	5372	C3	a86b7f9ed439e40c69ca6402d6328478729610504db5f88174402f909953fb0f	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	5464	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	5503	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	5528	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	5668	C3	25fc7454bc30fed6111370dbff634436b085bbb8a68a8ef67500cb506a91c583	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	5757	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	5806	H3	e470978788504a3913cff8fd33088c6a864b692cda56dbbfb5db1cc2f49d54a4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	6258	C3	213e3f988afdf73ba76b10171d1f078404e5add7f856942860650ebd3d394665	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	6318	C3	7fd9d92ec0f389cfd150c18d07df9816e0d7430b3943e364f3ff4f1ac8b4caf2	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	6351	C3	2a37cc61060152656d688f197079816b3c801180d26b9cd05b49acccbe19cef2	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	6566	H3	28c851126fa7ff64d39080d7ce681118cd8bc7ca09b01c53484eee24282647ba	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	6619	H3	28c851126fa7ff64d39080d7ce681118cd8bc7ca09b01c53484eee24282647ba	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	6980	H3	7df84eb9232986fb58e31393fb467f8fae42994efe8452977643e6d5de2448f4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7041	H3	7df84eb9232986fb58e31393fb467f8fae42994efe8452977643e6d5de2448f4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7121	H3	967276bccff3eae7ab3fe0ebb717d60a4a3793d2edc085f88df3c7390b65841f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7131	H3	517c30da87631f8f67c6fe9a62c6d41356de325963a22b9d2cc713e6c3a1ef9f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7180	H3	65f16bf24c33c0cb82a15db911bf36c2c64ff5239a0c91558a011a46b9242199	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7255	H3	9da0241aa62971ce7348d069bf368dc3f43fa96218983c0ec24e5d728da74d8a	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7345	C3	753d10fefcef9d65bc723e1c347bafdc1ab99b4689b49b11da6dbf7d9473e014	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-channels.sh	144	C3	28c211234a01352ec3a0c87c4ce9cab53ba60e168fa4663482f1738383a3fa19	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-channels.sh	234	H3	8b19f0a7707fef140d1598934bd1208cb7fecaa437dc0e50d49609323eef73ac	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-channels.sh	368	C3	011f1d4418e8f0e4cd28ce77a92161e0945c93eb9c8684bd2add1a8ddbe741be	interpreter heredoc, no capture	patch	Phase 3 PR C
@@ -229,15 +229,13 @@ lib/bridge-isolation-v2.sh	471	C3	0219e632757ae998b0f976b9c59d6c18ea72f2139ba255
 lib/bridge-isolation-v2.sh	1928	H3	01c839785d78efd2144369683041e308b0ce282f4761be3dac2f55a5faf12c99	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v2.sh	2007	H3	9053c9fe41afc7646b557e15d97d0a337cf2ad874e5f0b2009583bbc72f80c05	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v2.sh	2036	H3	01c839785d78efd2144369683041e308b0ce282f4761be3dac2f55a5faf12c99	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2134	H3	a5b9c245008c127eae7215ab8c2bfb8ac5b4f64521cffa93ecfa0c4e7211356b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2157	H3	00d56ae812506a4d9770a2c5bab60acb352b818b8fd49a517633f38819b84013	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2171	H3	b9235f198c3ce03de9a83a645e9646ea124cdf328aacc5f247fa3221702f3316	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2261	H3	a5b9c245008c127eae7215ab8c2bfb8ac5b4f64521cffa93ecfa0c4e7211356b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2274	H3	00d56ae812506a4d9770a2c5bab60acb352b818b8fd49a517633f38819b84013	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2292	H3	b9235f198c3ce03de9a83a645e9646ea124cdf328aacc5f247fa3221702f3316	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2376	H3	a5b9c245008c127eae7215ab8c2bfb8ac5b4f64521cffa93ecfa0c4e7211356b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2464	H3	d0877f32de550b0816b9747b7d3a55dd89d3f305802a810f2453f091e49ac829	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2478	H3	9eda9c795348d0986fd6eaeb89c40922c99755b0578df9289ac594a4d63dc153	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2168	H3	71b634ac5ee39a265c89fbe6aa01962da11e48af1857e829e91757984c7df8c1	here-string/procsub, non-interpreter consumer		
+lib/bridge-isolation-v2.sh	2170	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	here-string/procsub, non-interpreter consumer		
+lib/bridge-isolation-v2.sh	2213	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	here-string/procsub, non-interpreter consumer		
+lib/bridge-isolation-v2.sh	2300	H3	58a0b7f22b5c4ee542c9dab74c5b4b42a91ebe63e6221f3e5ab657a398647407	here-string/procsub, non-interpreter consumer		
+lib/bridge-isolation-v2.sh	2369	H3	a5b9c245008c127eae7215ab8c2bfb8ac5b4f64521cffa93ecfa0c4e7211356b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2457	H3	d0877f32de550b0816b9747b7d3a55dd89d3f305802a810f2453f091e49ac829	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2471	H3	9eda9c795348d0986fd6eaeb89c40922c99755b0578df9289ac594a4d63dc153	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v3-channel-dotenv.sh	508	H3	6ea2bf841d5322aa59c0f8097db35b7e96c081e55a995361e6b266badbd089a6	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-migration.sh	74	C3	6702fdf57ae0cefde8722a08390e40596652642313009dad2e89585410426973	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-migration.sh	474	H3	f64739c8415ed716683a8a0d9c83f6f72857a67e8a1d1fe24ed920e0538accfa	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -251,26 +249,26 @@ lib/bridge-skills.sh	449	C3	db9d375045077e262c2650012bf524f3d3be1a67bf919dbdc892
 lib/bridge-skills.sh	558	C1	95e1afee709a3095f044e1215cab2d5a37525795dcc2aceb7f04330f7e03a563	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
 lib/bridge-skills.sh	757	H3	94efe7ab81b306534cc1fa3c395ef9bddcd9498dfebd197af08a08da686bdddd	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-skills.sh	758	H3	6e332f79328fa9ce227f9148a5c9a96c28195127e5c166c10e8901f5cd527a81	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	841	H3	efed83d847aea81244ff9ae53de03d93bc2da5b37093fdf0b28bdb4a5d314bd1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	1191	H3	cd5da78810a676b546897e5a7d1aa326c1c663115029e3dbe5f97961651afbc5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	1443	H3	ff99eb1e07e002b13c88e97ec4fa627093fa0cadc38864e3e611f6f8923acee8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	1464	H3	473bb897043d72225442fb5ca2eb4883856009fea8e9480c4eef7507a504e4eb	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	1585	C2	42a386bbf12b89ad1cd4fb035c4f68b29c6e08db5ce4ea483b2d650673cd7151	cat heredoc in capture	patch	Phase 2 PR B
-lib/bridge-state.sh	1709	H3	489229e46ac80f30dcb2d8efe66b4f43ebe7becdaa9f5263b64451fc164e0f73	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	1744	H3	489229e46ac80f30dcb2d8efe66b4f43ebe7becdaa9f5263b64451fc164e0f73	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	1767	C1	7da7a80fd73b831c6cc214d0a1f9e7734ce6792fd0fa00343307e279fa11b21c	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
-lib/bridge-state.sh	1836	C1	9ae67e49cb65dd577b4a455cd40f7ceae54869fd8e451554a8319006589a6e3e	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch	Phase 2 PR B candidate
-lib/bridge-state.sh	1854	H3	489229e46ac80f30dcb2d8efe66b4f43ebe7becdaa9f5263b64451fc164e0f73	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	2012	C3	8cb5f1ac691156314d6bbecda1b2ff87775d42d4469cd5fa1fd20cfb1890ecfa	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-state.sh	2345	C3	35aa990aa74d451003242d6fd7e31d42bb787a9a3d7bb1911d388771e5cf3464	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-state.sh	2523	C3	e52b1214b1e40e5ae1cd92393e61de522b4a7bc0132b5a875a193fad6c36aa30	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-state.sh	2977	C3	c0193e8a22c5720ba156d699245975d707209d4f7aaca24f464f503f82157754	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-state.sh	3070	H3	688797f6d87543c8a3fc9fd7c0324346d2a13383f69055bf1167be935b674e44	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	3079	H3	d16f276288d55853ee942078a85879d63d531f176d0ae2313068e4d172bfb756	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	3156	H3	ee225b1f6caa6419e0c444c37882edc4a11036c41060f285e0ce0b354df8c315	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	3296	H3	3a22fb0aacbf3ac047bf958e9c6d59afe7c15d81a6c439882142e1b1d7768c03	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	3488	H3	2d1415157f155d264dc2139bbb567dea0d911d96963b286af6c28f135f7ac051	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	3505	H3	119b66ca6c294cdd844f2e70bc527d58310b8621cdc0f7e4434f0375d69455c8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	855	H3	efed83d847aea81244ff9ae53de03d93bc2da5b37093fdf0b28bdb4a5d314bd1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	1205	H3	cd5da78810a676b546897e5a7d1aa326c1c663115029e3dbe5f97961651afbc5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	1457	H3	ff99eb1e07e002b13c88e97ec4fa627093fa0cadc38864e3e611f6f8923acee8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	1478	H3	473bb897043d72225442fb5ca2eb4883856009fea8e9480c4eef7507a504e4eb	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	1599	C2	42a386bbf12b89ad1cd4fb035c4f68b29c6e08db5ce4ea483b2d650673cd7151	cat heredoc in capture	patch	Phase 2 PR B
+lib/bridge-state.sh	1723	H3	489229e46ac80f30dcb2d8efe66b4f43ebe7becdaa9f5263b64451fc164e0f73	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	1758	H3	489229e46ac80f30dcb2d8efe66b4f43ebe7becdaa9f5263b64451fc164e0f73	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	1781	C1	7da7a80fd73b831c6cc214d0a1f9e7734ce6792fd0fa00343307e279fa11b21c	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
+lib/bridge-state.sh	1850	C1	9ae67e49cb65dd577b4a455cd40f7ceae54869fd8e451554a8319006589a6e3e	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch	Phase 2 PR B candidate
+lib/bridge-state.sh	1868	H3	489229e46ac80f30dcb2d8efe66b4f43ebe7becdaa9f5263b64451fc164e0f73	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	2026	C3	8cb5f1ac691156314d6bbecda1b2ff87775d42d4469cd5fa1fd20cfb1890ecfa	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-state.sh	2359	C3	35aa990aa74d451003242d6fd7e31d42bb787a9a3d7bb1911d388771e5cf3464	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-state.sh	2537	C3	e52b1214b1e40e5ae1cd92393e61de522b4a7bc0132b5a875a193fad6c36aa30	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-state.sh	2991	C3	c0193e8a22c5720ba156d699245975d707209d4f7aaca24f464f503f82157754	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-state.sh	3084	H3	688797f6d87543c8a3fc9fd7c0324346d2a13383f69055bf1167be935b674e44	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	3093	H3	d16f276288d55853ee942078a85879d63d531f176d0ae2313068e4d172bfb756	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	3170	H3	ee225b1f6caa6419e0c444c37882edc4a11036c41060f285e0ce0b354df8c315	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	3310	H3	3a22fb0aacbf3ac047bf958e9c6d59afe7c15d81a6c439882142e1b1d7768c03	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	3502	H3	2d1415157f155d264dc2139bbb567dea0d911d96963b286af6c28f135f7ac051	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	3519	H3	119b66ca6c294cdd844f2e70bc527d58310b8621cdc0f7e4434f0375d69455c8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-tmux.sh	162	H3	07d40500dcb55ba9f5212423fd3d97cdac9ac8951f10bee4f43c7d08ed54ebd7	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-wave.sh	176	H3	871fd2b87719a0274c808fddb0b5f47073df66f7ff45bd8bbbbf24ac2df59fd1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-wave.sh	218	H3	a16e4579bf253f8cb913c2f67df903d921a7b620db45f2946458d717c0ec983f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -310,168 +308,168 @@ scripts/memory-enforce.sh	111	H3	4a610e6f770fdec3b12f5876e0931c200a200702de6a605
 scripts/memory-enforce.sh	165	H3	23a774a8a3452d702581db11d0ebc99dcb0098a39a6f5f6f266e58a1e654cb9e	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
 scripts/memory-enforce.sh	219	C3	023f53f90a625fd2f0b0c46a190a713090498aedbf5aeeec8a0024a7707d6c2b	interpreter heredoc, no capture	patch	Phase 4 PR D
 scripts/oss-preflight.sh	67	C3	ace286f24dd5b0d1eadcdd90bf11de5bf4f381ea07377544ad3e2f6fa1afd9a6	interpreter heredoc, no capture	patch	Phase 4 PR D
-scripts/picker-sweep.sh	374	H3	53accdf730c3912522ed33fa2642efc7ee0991b0293f4498004cb8976f0609df	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
+scripts/picker-sweep.sh	591	H3	53accdf730c3912522ed33fa2642efc7ee0991b0293f4498004cb8976f0609df	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
 scripts/repair-task-db.sh	68	C1	5366f4ed4070e0624f6dab11c54940f597c754ede5dac249ff935e3ecc25be8a	interpreter heredoc in capture (deadlock class)	patch	Phase 4 PR D
 scripts/repair-task-db.sh	74	C1	eb80f28d83e53bf6bee81a00fc75a82f4ea3fe86490ae28fe8a12113eb907f2f	interpreter heredoc in capture (deadlock class)	patch	Phase 4 PR D
 scripts/smoke-test.sh	179	H3	efed83d847aea81244ff9ae53de03d93bc2da5b37093fdf0b28bdb4a5d314bd1	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	209	C3	cdc34849e8c6219b76216d7c959cf17755ad97574a802d4eeed3054f25cf26f8	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	260	C1	16d4a1bad3b4a2e2eb4604d8ef59dc629d8eefba31c08358ffcde0c02ccfc503	heredoc in capture	patch-dev	Phase 6 PR F
 scripts/smoke-test.sh	918	H3	5f80494e00b5314b6d063944821bf0692ff0d4700fe178ed37c0f0f4ec3f99c2	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	1754	H3	f2039b6ce94e92888cc2f4b98fa60bb8e84c5586a5753592863916dd7b4aa333	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	2068	C3	5e6a29d252d41fb4d6e02f40833353ab7e48f9123c42853be97da593227952c7	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	2236	C3	584857424fc5ab2742e59bcc2fd1930bd683775b4d5bfb8ff72f15f4a6b080af	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	2297	C3	a83728cced5894b7d88dfdd1c03dfacc50d76627dce3aa02248d6335c2b424b1	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	2330	C1	248d970ab73aff4a3b89d2ad430b9a1df2e00fd2732ce1483c69e641758f9b12	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	2380	C1	b7fb089138285365b2865d1f4934a5743baf820f0282e29823936b7cad088a4a	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	Phase 2 PR B candidate
-scripts/smoke-test.sh	2572	C3	942378be6eeb1e5ae98a2a3fcb880950c5ff505e9f6f70db81f2a986f1c98254	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	2600	C3	0fd487929fdadbd18dcc4561d7fc90e19a624d02c79843c9ac8d7e7c5091610d	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3110	C3	baf13e50d73e26da419e163732b2b901d2474fd01a750cb6f0e2f83cd1a378c1	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3385	C3	a462490c70f389e0fcf1eb91408d7020ff53001b7ccba6d4ef6226ad826b2921	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3438	C1	5ccb2685ca25f47db71a8831c9d2cbd26a2ee5226e3e61f9edda202c00a314fb	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3452	C1	a392c08171778c980329006b11a67e7081f71154a4ce20feff977adb7ed68360	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3467	C1	bcdeda4950380174d5b3cb1d20875e56b0090162fae2f73208235601c92b571c	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3481	C1	a3f0ed1cc100a7ee238b550a4da36155cb6baf0ada56b1d16daa28e8d715039f	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3512	C3	11d7dcda5a5abecccb687c1f2dff26948409a6670d6ed859a4d209f9f951db41	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3529	C2	eaf3c7f97ab716d53cef83c228b1a5b06f47c9d292e4db19cc75029626a62228	cat heredoc in capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3563	C3	11d7dcda5a5abecccb687c1f2dff26948409a6670d6ed859a4d209f9f951db41	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3584	C3	395a2b470a17f5ab4140ed8cf8b3d1247b4aaccc385a9c607c8e272637adf889	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3612	C3	395a2b470a17f5ab4140ed8cf8b3d1247b4aaccc385a9c607c8e272637adf889	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3633	C1	ea300fff682be8a42a35cbcf494a088ce75641ec9754fdaf6596b26fe9f95825	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3662	C1	a46dccfc2a4ea7c9093e8dd2e0f5c79cd98070e13668a79ab24c1baabeef439b	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3705	C1	0578b71e4de716857b0fec91605a49700aac7b4e40991c0d5557ef3fe7e4fe96	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3728	C1	7b382f76874376b3bcc5ccca8978f49ac7439cbc8be8814f74c9def09d89668c	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	3769	C1	13290746ec1ac9208d2d7fa29176cc7b876b44d0990ceaa96ed23be7ec8d5e59	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4013	C3	13f988d1b45818f4204c8e0277460c10f77f98cbef7722c929fbbe224dc4bb78	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4202	C1	f6954c891c87753095e5ccbbd1ee3b54c8fda41a67fc3b549a60507788c912fc	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4223	C1	724f04e465fff3370999791f469e6457e4fe98d30b5ba30032359523ea1583ce	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4380	C3	dea66aefc9cc8090b8de73ec7e8353665eec2aaa86eb1613ce1f64b6d9b86d22	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4447	C3	0e4e4ab0659006822e1f2bf01ab9963270800cd761c22a376346f4ea70a3d0b5	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4501	C3	1bbbcf53b47db74f00dc8448d5b321dcbb378b2d4e410d3baf366ee446249f33	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4815	C3	961c2a0ce4fc7fda58bc897a3b2fa4e542bb5604184258d15ffb73d179f732d4	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4870	C1	27c7e6c1b4214285a1af5736d47f26d902225fba0c9c1fe02928220fe1a553dc	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4915	C3	d7305a2b174dba86293db7f81475963547beae7750ee973af9c007e377662003	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4939	C1	c972da6882bc05bda68002a012865e11cb057a8e14add8be1f54a2dfec8834ee	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4945	C1	7ec857e727eeaa1a38b2dcf53d0c2b645d9212c9c8e6898b5e38b5fe2b823e64	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4956	C1	3e542d831869f763c980862767e18526c1824e6ba070dbe8af816225e9b8972a	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4968	C1	8dc48481580d6cb593d1e95192dded62f67a0e8202f7826ecbf8bf3e59372997	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4987	C1	4fe72fa965c955380ab8e8ebd91db0286c469673f57c3e0217a4cf65b4fffdfc	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	4996	C1	1e252a6f708488caf79af3d84622db58fb31eb95024ab66c22289c8a0c513f8d	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5006	C1	3e542d831869f763c980862767e18526c1824e6ba070dbe8af816225e9b8972a	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5018	C1	8dc48481580d6cb593d1e95192dded62f67a0e8202f7826ecbf8bf3e59372997	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5169	C1	ddfb1a048a645b25c50708b93950ddef4835562904bba2bf27640162716aa1fc	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5265	C3	8e3c5c5eb59543eafb5e7d8f722e80ba5206e0868f584263c36828279e5cfdf2	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5278	C3	4dfd79f988e6464ff54b66bc2f2638006da0f44be0766a257ed2a859f38441b9	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5300	C3	7fa0b0407fc076ce9a6a4837c3a567159892670fb980d4c82858f438ab6521aa	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5443	C3	6318927d0e0a7261684817304bba9e493c9d18db5590407a663ccda4561ae775	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5551	C3	c3c79935993b47b9f5a4b4b7236672a86ec4beab5e1259fea45be0e3dfbf748b	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5562	C3	dab1882305529202920453690dd015680a6e27339be62ffb8ea79f48e3f38d88	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5589	C3	7870c5770514d3e9e61a2fc74dfa4dddcae7b4f5c2ea9e2fbc2f30af28b33723	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5605	C3	ca96acac9631cacc525570309ee82eaacd5aa468572c46ef8c3e2891b1cba0c0	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5640	C3	ca1109c31177bfa80ec7964ddf3f18922e8d9799bfafdd28fb3b87d5f9390db0	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5657	C3	498481c8d60bd51ddfa1f1bf18801bda2a0ed0a0926d8e2d5151d9b873a495a7	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5767	C3	27de9b0b8f06d4fedc9290d9d7990e083b37e3eed15ee6adb9f06a5e3e49752a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5782	C1	e6bceaf296ce40e200c63ef8050fe12f79cc8f05a28338957a08c47b4da98f3d	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5848	C3	8d587a78f690a6d451f2bafe470dddf4f016cb97cd0b2b1a36e4ad8b77b2e5fb	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5893	C3	b133bc71bf04bfb970cf000e1ae15b4a0d566a7a40ccc9f3faa28b31c6a097e3	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5921	C3	cf1ef87234502c27658ea3948964bb84e50a262e89d3ad01d51c56da2cbfeeb8	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5967	C3	5dab90a1d73d87f4fa431a5acf93302bee6ffc93aafd9f1fffd9781def84abfa	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	5984	C3	0c4fe1f559b3e97d1e164183881c5c0ce3320942caa256d63843953222a0f1c4	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6018	C3	65fc0bbc93f1d26dae371622305c8779443a7d81770ec64450d7b7a12e71275c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6031	C1	b495be763fa9491006373e0aca7efa61ebb11f70c70dcdcd4e6192f2fd15d910	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6051	C3	2c321e1aa813c454e63b97e3b54f5a4e96088bc0d2e47e7cbd2a519a74bd3c76	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6070	C3	ab9cecab8191e7ab7f6442135decb2ce957f06f2bb6bcec6fe1a614839221bdc	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6132	C3	5d7874fbee829996c4bd948490154ff044f08d081d72d33f640cc604a3fa506a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6167	C3	3bb70cfd28687e4ad34ed146e9b9dfc72b4758050bdaf1ade032e15ce8e01e7e	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6196	C3	c3141e83b99c73fbb1e88c0785e3fecfda7ab1e2fe7b6c8d15a4f12bf3db425c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6207	C3	29a053a8503443eff8a4a675bbeef3b7b18dd3bc79c1436d3a7b90a50e3b602c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F (PR #970 Teams)
-scripts/smoke-test.sh	6279	C3	a26ffeb108bee2e578e87efff5ff38e81e7a58229b95f4b4d3e5e37476ffe2a9	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6390	C3	f2740667907706f819f0e2ab742ddec16e2284e080c9c437a4e452bcfcae030e	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6555	C3	fa0c50dd95283b711fd2799bb484a40d9308a11c724288a9d8ef9cd9480e04eb	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6589	C2	5ec829abbf751c9035d54bca1d7b7ea11ab79c47538438c7f49b7fba2f2b850e	cat heredoc inside `bash -c '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
-scripts/smoke-test.sh	6604	C3	66ca824f70ebe7d4ee2f06963fda0a69960f7d1af057c01feb14d39eb2be6fb3	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6619	C2	5ec829abbf751c9035d54bca1d7b7ea11ab79c47538438c7f49b7fba2f2b850e	cat heredoc inside `bash -c '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
-scripts/smoke-test.sh	6636	C3	fffd9c06f5d0ca4b3e2b6dc13aaf5df5bdf917e6748808e298e9e1f1d9c1d571	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6651	C3	0228b8d1729096915cb5de56816e3f2375c0097e811d00d625ff32d619d64c80	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6680	C3	0228b8d1729096915cb5de56816e3f2375c0097e811d00d625ff32d619d64c80	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6880	C2	9c17650fd4a24b01644eee4a1437a392e82633645b9a484a4e4b19685079ce50	cat heredoc inside `bash -c '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
-scripts/smoke-test.sh	6889	C2	9c17650fd4a24b01644eee4a1437a392e82633645b9a484a4e4b19685079ce50	cat heredoc inside `bash -c '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
-scripts/smoke-test.sh	6927	C3	1baac16e6606207c103bff9431c067592cf1b7aaf82355c5a76b2ae67203cb02	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6967	C3	f36f51e9656390f5be860712a781a75082c3d1fcd990d5603b8eba0649a4a9e4	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	6984	C3	1f02b2a6d4fe0862c550af835dc59472e144863b848dc97e134cc6eb05113fdd	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7000	C3	bb2f7d1d6c79ba14a50d848813f45333dcb9ec28b302e66ee6d1980b67e008f5	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7014	C3	ee61a75814a2bf92c617855184ccb5a855814498f74eb66c6683ab0d9a48d6c3	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7054	C3	2f6f79012f5cc83102860c6a3923080a68b13007f910e8a91b047355f83b9422	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7203	C3	9a60b4e8f609e4d6179d517120d8c59744ada72b3fadee4be4526a23e6dd4865	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7312	C1	fe5e4b33294aab47409b8725a796cd5044a83279c97fcd0d1b6efe0f07eeb630	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7333	C3	253ce406f2d6359c91e77b12cc470a8c345c4e77b43ff516ed0263aefdb7a4ed	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7369	C3	8029d018d899fd5b49f169d22cc1c4a7434ebc2486e6ceddfdc62f4273605e90	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7380	C3	d03dbd86423454474436428c47d972c19a2d7629cfe2452fe55eff0565bc4fe5	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7395	C1	3bfc9e5e8a0968c41a5292edf55d9a55a4d340577d6977f243a96c78a14f8a6c	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7405	C3	b2e46d89646667a165a1e0385985a39aa3809668126dab8cce232bcd120fcd75	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7415	C1	e0b2d5bcabf4379ba9537e7cfe5cbe83d842753498d3a4b5c0baedb60db3321b	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7426	C1	5c1df89be6f88b8667bbb9bfe5981e2b4b44ea42a57cc2e4b6cfd6d0548b7d29	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7439	C3	2b7c85a1e1cb480777d4e3e049fab47534ab5a24bd98f8329d4e76155f26b164	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7466	C3	b2e46d89646667a165a1e0385985a39aa3809668126dab8cce232bcd120fcd75	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7492	C3	daa1350a7335f0549f088a2f042355e86702d7852ed230e53921642117cc70a3	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7511	C1	bfc1e6c4d6d4f045b1bc640a5a40b68f0ed11764af74c1c9a03f11c6d1ff34c6	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7544	C1	e6404ff9f1b12001370624eeffa6ee2c92b62233a7c431d6e2dd7e7045402e11	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7614	C3	e887b6b2d468f4346c7be6e7a04e1ee42bc1bef9ee2739cc495916a40b410c04	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7653	C3	2b5bd64727f50b9d6206764585d9a5abdd30f4ed772278de9917734c9f8f5db0	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7673	C3	853e9679ecc47f9b0341ac5b46687d44390d3ccf41c5cce45c8c87bc6ad1dfe3	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7696	C3	50e3e91c2021e010fb7d2e3bf96dbaf5405c24d18a8d3a487ff3c717b1a4d673	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7741	C3	8f4f17fb4ea26f14db150b337988728a62e0636c9aa34d8486231141bde0a4ce	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7822	H3	6673b709616bd42d036719594b65e9b89635a4fca73aebd71fec348167c548f7	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	7939	C3	0873a8dea1132ce518ac06b96bccf685b6a3edfe432a4c1e1e61860834183f61	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	8018	C3	09b5270faf4e3ea52e52bee4d58ea75ffa07caa819a41df3a7c08323d2446c2a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	8031	C3	09b5270faf4e3ea52e52bee4d58ea75ffa07caa819a41df3a7c08323d2446c2a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	8062	C3	09b5270faf4e3ea52e52bee4d58ea75ffa07caa819a41df3a7c08323d2446c2a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	8092	C3	09b5270faf4e3ea52e52bee4d58ea75ffa07caa819a41df3a7c08323d2446c2a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	8143	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	8200	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	8510	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	8594	C3	ce513333e990f27ddf8e3d534b0a55ce6e08d74e4e50ee3427427dfcc605783f	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	8631	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	8770	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	8962	C3	5f1f39732b887e709132cd0c6b37abfeeb5e7c0c3a31f454e6af0ad4e3da654e	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9123	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9181	C3	296a8b282a1018de44f6645612c776f6f237a1b886786a867edeb53f9e865ae8	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9204	C3	ef30e03d306e33ffe2dad39e48572b9caf5d9fe0c4d13b5b8f2941a1e7f87ae2	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9247	C3	6505e1c048836ef62d08d7535df1237784345f65b358f2e24e256e7d9e2c4559	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9261	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9289	C3	296a8b282a1018de44f6645612c776f6f237a1b886786a867edeb53f9e865ae8	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9343	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9402	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9452	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9493	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9542	C3	e23f03d0039dc52dcfd70b43bfe4d235fe35f528ff11038a9be635e15bd277cf	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9670	C3	78418001371a18311ff4d802463f5559a9a990274fcbc78a05283422db5bffeb	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9688	C3	78418001371a18311ff4d802463f5559a9a990274fcbc78a05283422db5bffeb	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9724	C3	27f7bb0c699f1b8c7881c62f75926730c11fcececb1fa485ce80d4adaad8242b	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9838	C3	39326ec4cef8c9196b63029ec30c383ad772ac73de38466051d4eeea93007f39	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9855	C3	0fb78168aedace11ea2784f83ca88fc8f025df17f90d9a9c1ef7975d0af06103	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	9874	C2	62cd7c747faf0d8a828015cfde2bb2d1114eecfb237d48f75e005fd93507b0ef	cat heredoc inside `bash -lc '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
-scripts/smoke-test.sh	9882	C2	2aa7ee0243e051c6992e815328a9568005adf01d71cd47dc56c13cb5edc6173c	cat heredoc inside `bash -lc '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
-scripts/smoke-test.sh	9887	C2	1f6022f89ba36e41dae91398f67988eb454aa415c7338aa35e10cc4a22eb6d87	cat heredoc inside `bash -lc '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
-scripts/smoke-test.sh	9892	C2	3e03f3d169981b4c925fc1bda1b1fab8f65b62965a9023a0ef7d26825327cc28	cat heredoc inside `bash -lc '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
-scripts/smoke-test.sh	9902	C3	67c1fbe11823a2becd0c56db9a2b5ea592739c129ab9aea42b581baedc59f937	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10027	C1	bbfb6dae0847dbe4a86aa8c9cc0fe04d82c19920301a0ee5ea4e626c1ce0672e	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10140	C2	164034bda2381fda77729a058519d8f8b0f611ed0afb650059fc4e24bc63f164	cat heredoc in capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10308	C3	ae0d06c9ade70e4ea5cecb0ebd7daee8d84ff13c84601ce56f2058425fae22cf	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10316	C3	3e02b939382d79adcfd21ba980363ef7f255cac32bfbb390ed55603baf4c8c01	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10325	C3	bfcb08909303192fe1ac89e64d43f4592f7f19ec20df4c238583d1787626b96a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10367	C3	53fd7df3edf5558444a6853b7c64bef2345b6cd508875fbfcadc969642a6e657	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10392	C3	4f314d66b61678df50d778c75e36c64fea86b3c8fbcc1250ef9912aa4cef3e45	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10462	C3	1daabc5641ebf32211dba500c3c0bb800b4954d274564c810fb5e195da393e19	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10484	C3	e897900c3f52ace2c9984266748fea9ddab17ecf81aac0fe816487aa297161da	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10492	C3	57dcf8b7678b3c772387160fa3755033e32460363f9ec0d3ae5562f5fbeb4529	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10584	C3	768dba9bad74f45bb8e7ef8a980a2baea707441e071dc08591c1642da9d27b40	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10592	C3	c9013eaaaf5f07350a1cc85c7a885db2fe5bc4002a7bb22646cfa1589222ce44	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10728	C1	f31b0bc80e9003f8a634909d4b1f3fcb59061ed4afe3601b94b61420a0c7e81c	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10792	C1	d8f9bc0dcc538ab1438fe51a06f80512c7e55932a1da033d0d7f86ecde247181	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10813	C3	9ec0f5a19e3f50d183c2a15efa02e3d5f3221741e685c9b19a9ae20771f60cc0	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10864	C3	9a0596bb486fe5caca52edaca74c9f7c696f1fa7b8d963999dc72f9544e46f3a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10881	C3	11cbfaf88e84998d813a1eaf6709ad3906475c4ae20d8ae011e68c22560bfc93	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke-test.sh	10932	C1	7127f83126ea2276ef915af63d277558b0b02ebbea55335d0fa21665b117295e	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	process-boundary-safe
+scripts/smoke-test.sh	1802	H3	f2039b6ce94e92888cc2f4b98fa60bb8e84c5586a5753592863916dd7b4aa333	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	2116	C3	5e6a29d252d41fb4d6e02f40833353ab7e48f9123c42853be97da593227952c7	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	2284	C3	584857424fc5ab2742e59bcc2fd1930bd683775b4d5bfb8ff72f15f4a6b080af	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	2345	C3	a83728cced5894b7d88dfdd1c03dfacc50d76627dce3aa02248d6335c2b424b1	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	2378	C1	248d970ab73aff4a3b89d2ad430b9a1df2e00fd2732ce1483c69e641758f9b12	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	2428	C1	b7fb089138285365b2865d1f4934a5743baf820f0282e29823936b7cad088a4a	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	Phase 2 PR B candidate
+scripts/smoke-test.sh	2620	C3	942378be6eeb1e5ae98a2a3fcb880950c5ff505e9f6f70db81f2a986f1c98254	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	2648	C3	0fd487929fdadbd18dcc4561d7fc90e19a624d02c79843c9ac8d7e7c5091610d	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3167	C3	baf13e50d73e26da419e163732b2b901d2474fd01a750cb6f0e2f83cd1a378c1	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3442	C3	a462490c70f389e0fcf1eb91408d7020ff53001b7ccba6d4ef6226ad826b2921	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3495	C1	5ccb2685ca25f47db71a8831c9d2cbd26a2ee5226e3e61f9edda202c00a314fb	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3509	C1	a392c08171778c980329006b11a67e7081f71154a4ce20feff977adb7ed68360	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3524	C1	bcdeda4950380174d5b3cb1d20875e56b0090162fae2f73208235601c92b571c	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3538	C1	a3f0ed1cc100a7ee238b550a4da36155cb6baf0ada56b1d16daa28e8d715039f	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3569	C3	11d7dcda5a5abecccb687c1f2dff26948409a6670d6ed859a4d209f9f951db41	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3586	C2	eaf3c7f97ab716d53cef83c228b1a5b06f47c9d292e4db19cc75029626a62228	cat heredoc in capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3620	C3	11d7dcda5a5abecccb687c1f2dff26948409a6670d6ed859a4d209f9f951db41	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3641	C3	395a2b470a17f5ab4140ed8cf8b3d1247b4aaccc385a9c607c8e272637adf889	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3669	C3	395a2b470a17f5ab4140ed8cf8b3d1247b4aaccc385a9c607c8e272637adf889	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3690	C1	ea300fff682be8a42a35cbcf494a088ce75641ec9754fdaf6596b26fe9f95825	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3719	C1	a46dccfc2a4ea7c9093e8dd2e0f5c79cd98070e13668a79ab24c1baabeef439b	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3762	C1	0578b71e4de716857b0fec91605a49700aac7b4e40991c0d5557ef3fe7e4fe96	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3785	C1	7b382f76874376b3bcc5ccca8978f49ac7439cbc8be8814f74c9def09d89668c	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	3826	C1	13290746ec1ac9208d2d7fa29176cc7b876b44d0990ceaa96ed23be7ec8d5e59	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	4070	C3	13f988d1b45818f4204c8e0277460c10f77f98cbef7722c929fbbe224dc4bb78	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	4259	C1	f6954c891c87753095e5ccbbd1ee3b54c8fda41a67fc3b549a60507788c912fc	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	4280	C1	724f04e465fff3370999791f469e6457e4fe98d30b5ba30032359523ea1583ce	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	4437	C3	dea66aefc9cc8090b8de73ec7e8353665eec2aaa86eb1613ce1f64b6d9b86d22	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	4504	C3	0e4e4ab0659006822e1f2bf01ab9963270800cd761c22a376346f4ea70a3d0b5	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	4558	C3	1bbbcf53b47db74f00dc8448d5b321dcbb378b2d4e410d3baf366ee446249f33	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	4872	C3	961c2a0ce4fc7fda58bc897a3b2fa4e542bb5604184258d15ffb73d179f732d4	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	4927	C1	27c7e6c1b4214285a1af5736d47f26d902225fba0c9c1fe02928220fe1a553dc	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	4972	C3	d7305a2b174dba86293db7f81475963547beae7750ee973af9c007e377662003	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	4996	C1	c972da6882bc05bda68002a012865e11cb057a8e14add8be1f54a2dfec8834ee	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5002	C1	7ec857e727eeaa1a38b2dcf53d0c2b645d9212c9c8e6898b5e38b5fe2b823e64	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5013	C1	3e542d831869f763c980862767e18526c1824e6ba070dbe8af816225e9b8972a	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5025	C1	8dc48481580d6cb593d1e95192dded62f67a0e8202f7826ecbf8bf3e59372997	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5044	C1	4fe72fa965c955380ab8e8ebd91db0286c469673f57c3e0217a4cf65b4fffdfc	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5053	C1	1e252a6f708488caf79af3d84622db58fb31eb95024ab66c22289c8a0c513f8d	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5063	C1	3e542d831869f763c980862767e18526c1824e6ba070dbe8af816225e9b8972a	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5075	C1	8dc48481580d6cb593d1e95192dded62f67a0e8202f7826ecbf8bf3e59372997	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5226	C1	ddfb1a048a645b25c50708b93950ddef4835562904bba2bf27640162716aa1fc	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5322	C3	8e3c5c5eb59543eafb5e7d8f722e80ba5206e0868f584263c36828279e5cfdf2	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5335	C3	4dfd79f988e6464ff54b66bc2f2638006da0f44be0766a257ed2a859f38441b9	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5357	C3	7fa0b0407fc076ce9a6a4837c3a567159892670fb980d4c82858f438ab6521aa	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5500	C3	6318927d0e0a7261684817304bba9e493c9d18db5590407a663ccda4561ae775	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5608	C3	c3c79935993b47b9f5a4b4b7236672a86ec4beab5e1259fea45be0e3dfbf748b	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5619	C3	dab1882305529202920453690dd015680a6e27339be62ffb8ea79f48e3f38d88	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5646	C3	7870c5770514d3e9e61a2fc74dfa4dddcae7b4f5c2ea9e2fbc2f30af28b33723	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5662	C3	ca96acac9631cacc525570309ee82eaacd5aa468572c46ef8c3e2891b1cba0c0	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5697	C3	ca1109c31177bfa80ec7964ddf3f18922e8d9799bfafdd28fb3b87d5f9390db0	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5714	C3	498481c8d60bd51ddfa1f1bf18801bda2a0ed0a0926d8e2d5151d9b873a495a7	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5824	C3	27de9b0b8f06d4fedc9290d9d7990e083b37e3eed15ee6adb9f06a5e3e49752a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5839	C1	e6bceaf296ce40e200c63ef8050fe12f79cc8f05a28338957a08c47b4da98f3d	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5905	C3	8d587a78f690a6d451f2bafe470dddf4f016cb97cd0b2b1a36e4ad8b77b2e5fb	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5950	C3	b133bc71bf04bfb970cf000e1ae15b4a0d566a7a40ccc9f3faa28b31c6a097e3	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	5978	C3	cf1ef87234502c27658ea3948964bb84e50a262e89d3ad01d51c56da2cbfeeb8	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6024	C3	5dab90a1d73d87f4fa431a5acf93302bee6ffc93aafd9f1fffd9781def84abfa	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6041	C3	0c4fe1f559b3e97d1e164183881c5c0ce3320942caa256d63843953222a0f1c4	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6075	C3	65fc0bbc93f1d26dae371622305c8779443a7d81770ec64450d7b7a12e71275c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6088	C1	b495be763fa9491006373e0aca7efa61ebb11f70c70dcdcd4e6192f2fd15d910	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6108	C3	2c321e1aa813c454e63b97e3b54f5a4e96088bc0d2e47e7cbd2a519a74bd3c76	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6127	C3	ab9cecab8191e7ab7f6442135decb2ce957f06f2bb6bcec6fe1a614839221bdc	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6189	C3	5d7874fbee829996c4bd948490154ff044f08d081d72d33f640cc604a3fa506a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6224	C3	3bb70cfd28687e4ad34ed146e9b9dfc72b4758050bdaf1ade032e15ce8e01e7e	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6253	C3	c3141e83b99c73fbb1e88c0785e3fecfda7ab1e2fe7b6c8d15a4f12bf3db425c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6264	C3	29a053a8503443eff8a4a675bbeef3b7b18dd3bc79c1436d3a7b90a50e3b602c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F (PR #970 Teams)
+scripts/smoke-test.sh	6336	C3	a26ffeb108bee2e578e87efff5ff38e81e7a58229b95f4b4d3e5e37476ffe2a9	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6447	C3	f2740667907706f819f0e2ab742ddec16e2284e080c9c437a4e452bcfcae030e	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6612	C3	fa0c50dd95283b711fd2799bb484a40d9308a11c724288a9d8ef9cd9480e04eb	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6646	C2	5ec829abbf751c9035d54bca1d7b7ea11ab79c47538438c7f49b7fba2f2b850e	cat heredoc inside `bash -c '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
+scripts/smoke-test.sh	6661	C3	66ca824f70ebe7d4ee2f06963fda0a69960f7d1af057c01feb14d39eb2be6fb3	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6676	C2	5ec829abbf751c9035d54bca1d7b7ea11ab79c47538438c7f49b7fba2f2b850e	cat heredoc inside `bash -c '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
+scripts/smoke-test.sh	6693	C3	fffd9c06f5d0ca4b3e2b6dc13aaf5df5bdf917e6748808e298e9e1f1d9c1d571	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6708	C3	0228b8d1729096915cb5de56816e3f2375c0097e811d00d625ff32d619d64c80	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6737	C3	0228b8d1729096915cb5de56816e3f2375c0097e811d00d625ff32d619d64c80	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	6937	C2	9c17650fd4a24b01644eee4a1437a392e82633645b9a484a4e4b19685079ce50	cat heredoc inside `bash -c '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
+scripts/smoke-test.sh	6946	C2	9c17650fd4a24b01644eee4a1437a392e82633645b9a484a4e4b19685079ce50	cat heredoc inside `bash -c '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
+scripts/smoke-test.sh	6984	C3	1baac16e6606207c103bff9431c067592cf1b7aaf82355c5a76b2ae67203cb02	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7024	C3	f36f51e9656390f5be860712a781a75082c3d1fcd990d5603b8eba0649a4a9e4	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7041	C3	1f02b2a6d4fe0862c550af835dc59472e144863b848dc97e134cc6eb05113fdd	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7057	C3	bb2f7d1d6c79ba14a50d848813f45333dcb9ec28b302e66ee6d1980b67e008f5	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7071	C3	ee61a75814a2bf92c617855184ccb5a855814498f74eb66c6683ab0d9a48d6c3	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7111	C3	2f6f79012f5cc83102860c6a3923080a68b13007f910e8a91b047355f83b9422	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7359	C3	9a60b4e8f609e4d6179d517120d8c59744ada72b3fadee4be4526a23e6dd4865	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7468	C1	fe5e4b33294aab47409b8725a796cd5044a83279c97fcd0d1b6efe0f07eeb630	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7489	C3	253ce406f2d6359c91e77b12cc470a8c345c4e77b43ff516ed0263aefdb7a4ed	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7525	C3	8029d018d899fd5b49f169d22cc1c4a7434ebc2486e6ceddfdc62f4273605e90	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7536	C3	d03dbd86423454474436428c47d972c19a2d7629cfe2452fe55eff0565bc4fe5	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7551	C1	3bfc9e5e8a0968c41a5292edf55d9a55a4d340577d6977f243a96c78a14f8a6c	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7561	C3	b2e46d89646667a165a1e0385985a39aa3809668126dab8cce232bcd120fcd75	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7571	C1	e0b2d5bcabf4379ba9537e7cfe5cbe83d842753498d3a4b5c0baedb60db3321b	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7582	C1	5c1df89be6f88b8667bbb9bfe5981e2b4b44ea42a57cc2e4b6cfd6d0548b7d29	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7595	C3	2b7c85a1e1cb480777d4e3e049fab47534ab5a24bd98f8329d4e76155f26b164	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7622	C3	b2e46d89646667a165a1e0385985a39aa3809668126dab8cce232bcd120fcd75	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7648	C3	daa1350a7335f0549f088a2f042355e86702d7852ed230e53921642117cc70a3	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7667	C1	bfc1e6c4d6d4f045b1bc640a5a40b68f0ed11764af74c1c9a03f11c6d1ff34c6	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7700	C1	e6404ff9f1b12001370624eeffa6ee2c92b62233a7c431d6e2dd7e7045402e11	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7770	C3	e887b6b2d468f4346c7be6e7a04e1ee42bc1bef9ee2739cc495916a40b410c04	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7809	C3	2b5bd64727f50b9d6206764585d9a5abdd30f4ed772278de9917734c9f8f5db0	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7829	C3	853e9679ecc47f9b0341ac5b46687d44390d3ccf41c5cce45c8c87bc6ad1dfe3	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7852	C3	50e3e91c2021e010fb7d2e3bf96dbaf5405c24d18a8d3a487ff3c717b1a4d673	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7909	C3	8f4f17fb4ea26f14db150b337988728a62e0636c9aa34d8486231141bde0a4ce	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	7990	H3	6673b709616bd42d036719594b65e9b89635a4fca73aebd71fec348167c548f7	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	8107	C3	0873a8dea1132ce518ac06b96bccf685b6a3edfe432a4c1e1e61860834183f61	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	8186	C3	09b5270faf4e3ea52e52bee4d58ea75ffa07caa819a41df3a7c08323d2446c2a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	8199	C3	09b5270faf4e3ea52e52bee4d58ea75ffa07caa819a41df3a7c08323d2446c2a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	8230	C3	09b5270faf4e3ea52e52bee4d58ea75ffa07caa819a41df3a7c08323d2446c2a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	8260	C3	09b5270faf4e3ea52e52bee4d58ea75ffa07caa819a41df3a7c08323d2446c2a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	8311	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	8368	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	8678	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	8762	C3	ce513333e990f27ddf8e3d534b0a55ce6e08d74e4e50ee3427427dfcc605783f	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	8799	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	8938	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9130	C3	5f1f39732b887e709132cd0c6b37abfeeb5e7c0c3a31f454e6af0ad4e3da654e	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9291	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9349	C3	296a8b282a1018de44f6645612c776f6f237a1b886786a867edeb53f9e865ae8	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9372	C3	ef30e03d306e33ffe2dad39e48572b9caf5d9fe0c4d13b5b8f2941a1e7f87ae2	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9415	C3	6505e1c048836ef62d08d7535df1237784345f65b358f2e24e256e7d9e2c4559	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9429	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9457	C3	296a8b282a1018de44f6645612c776f6f237a1b886786a867edeb53f9e865ae8	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9511	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9570	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9620	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9661	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9710	C3	e23f03d0039dc52dcfd70b43bfe4d235fe35f528ff11038a9be635e15bd277cf	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9838	C3	78418001371a18311ff4d802463f5559a9a990274fcbc78a05283422db5bffeb	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9856	C3	78418001371a18311ff4d802463f5559a9a990274fcbc78a05283422db5bffeb	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	9892	C3	27f7bb0c699f1b8c7881c62f75926730c11fcececb1fa485ce80d4adaad8242b	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10006	C3	39326ec4cef8c9196b63029ec30c383ad772ac73de38466051d4eeea93007f39	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10023	C3	0fb78168aedace11ea2784f83ca88fc8f025df17f90d9a9c1ef7975d0af06103	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10042	C2	62cd7c747faf0d8a828015cfde2bb2d1114eecfb237d48f75e005fd93507b0ef	cat heredoc inside `bash -lc '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
+scripts/smoke-test.sh	10050	C2	2aa7ee0243e051c6992e815328a9568005adf01d71cd47dc56c13cb5edc6173c	cat heredoc inside `bash -lc '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
+scripts/smoke-test.sh	10055	C2	1f6022f89ba36e41dae91398f67988eb454aa415c7338aa35e10cc4a22eb6d87	cat heredoc inside `bash -lc '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
+scripts/smoke-test.sh	10060	C2	3e03f3d169981b4c925fc1bda1b1fab8f65b62965a9023a0ef7d26825327cc28	cat heredoc inside `bash -lc '...'` literal argument (inner-shell, process boundary breaks deadlock chain)	patch-dev	r3 cross-line audit detection (PR #954)
+scripts/smoke-test.sh	10070	C3	67c1fbe11823a2becd0c56db9a2b5ea592739c129ab9aea42b581baedc59f937	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10195	C1	bbfb6dae0847dbe4a86aa8c9cc0fe04d82c19920301a0ee5ea4e626c1ce0672e	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10308	C2	164034bda2381fda77729a058519d8f8b0f611ed0afb650059fc4e24bc63f164	cat heredoc in capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10476	C3	ae0d06c9ade70e4ea5cecb0ebd7daee8d84ff13c84601ce56f2058425fae22cf	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10484	C3	3e02b939382d79adcfd21ba980363ef7f255cac32bfbb390ed55603baf4c8c01	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10493	C3	bfcb08909303192fe1ac89e64d43f4592f7f19ec20df4c238583d1787626b96a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10535	C3	53fd7df3edf5558444a6853b7c64bef2345b6cd508875fbfcadc969642a6e657	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10560	C3	4f314d66b61678df50d778c75e36c64fea86b3c8fbcc1250ef9912aa4cef3e45	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10630	C3	1daabc5641ebf32211dba500c3c0bb800b4954d274564c810fb5e195da393e19	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10652	C3	e897900c3f52ace2c9984266748fea9ddab17ecf81aac0fe816487aa297161da	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10660	C3	57dcf8b7678b3c772387160fa3755033e32460363f9ec0d3ae5562f5fbeb4529	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10752	C3	768dba9bad74f45bb8e7ef8a980a2baea707441e071dc08591c1642da9d27b40	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10760	C3	c9013eaaaf5f07350a1cc85c7a885db2fe5bc4002a7bb22646cfa1589222ce44	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10896	C1	f31b0bc80e9003f8a634909d4b1f3fcb59061ed4afe3601b94b61420a0c7e81c	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10960	C1	d8f9bc0dcc538ab1438fe51a06f80512c7e55932a1da033d0d7f86ecde247181	interpreter heredoc in capture (deadlock class)	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	10981	C3	9ec0f5a19e3f50d183c2a15efa02e3d5f3221741e685c9b19a9ae20771f60cc0	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	11032	C3	9a0596bb486fe5caca52edaca74c9f7c696f1fa7b8d963999dc72f9544e46f3a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	11049	C3	11cbfaf88e84998d813a1eaf6709ad3906475c4ae20d8ae011e68c22560bfc93	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke-test.sh	11100	C1	7127f83126ea2276ef915af63d277558b0b02ebbea55335d0fa21665b117295e	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	process-boundary-safe
 scripts/smoke/835-static-admin-launch.sh	156	H3	07d40500dcb55ba9f5212423fd3d97cdac9ac8951f10bee4f43c7d08ed54ebd7	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 scripts/smoke/agent-delete-task-gc.sh	88	C3	0182027337e83c775ede47f3bf6f9a5ac9b3819cf0c7bb832775648f4241195c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/agent-delete-task-gc.sh	105	C3	8f28a4af15141235437a082bc6935b5743dad553108fd5d34077a562ef4bf28d	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
@@ -562,8 +560,8 @@ scripts/smoke/daemon-tick-guards-l2-l4.sh	609	H3	e9587b956408338746cdcf308916770
 scripts/smoke/daemon.sh	51	C1	ee533f8d26b942dea8f8520d1341d77feb59bc552a112724fba875cae0366d1a	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch-dev	Phase 2 PR B candidate
 scripts/smoke/daemon.sh	219	C3	386265357e7ac1ba13e6fc6e717fb460cda89271256d722cf15f0eebfa139f3c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/daemon.sh	258	C3	386265357e7ac1ba13e6fc6e717fb460cda89271256d722cf15f0eebfa139f3c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke/daemon.sh	716	C3	837e1fcae70db802be257ee7dc7ff8da1843d1a72f457d4d512dfd98c9a50006	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
-scripts/smoke/daemon.sh	794	C3	837e1fcae70db802be257ee7dc7ff8da1843d1a72f457d4d512dfd98c9a50006	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke/daemon.sh	788	C3	837e1fcae70db802be257ee7dc7ff8da1843d1a72f457d4d512dfd98c9a50006	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke/daemon.sh	866	C3	837e1fcae70db802be257ee7dc7ff8da1843d1a72f457d4d512dfd98c9a50006	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/daily-backup.sh	34	C2	b7e76bda13d63929982251e46bf14e685d8853a3eda6659708d7924631928f9f	cat heredoc in capture	patch-dev	Phase 6 PR F
 scripts/smoke/daily-backup.sh	41	C2	8a4f4742c70c69c97f77c20b679e3e8cc1a8a13cf5664c5d81d00141a5300d61	cat heredoc in capture	patch-dev	Phase 6 PR F
 scripts/smoke/daily-backup.sh	51	C2	4b5bb8f6bb1fdc987fa1d9b91148cb60a1a2e1927b1b7c63113e4bed8b2d4b4c	cat heredoc in capture	patch-dev	Phase 6 PR F
