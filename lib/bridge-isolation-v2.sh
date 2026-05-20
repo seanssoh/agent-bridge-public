@@ -2083,29 +2083,14 @@ _bridge_isolation_v2_cred_ancestors() {
 # Gate shared by apply and check.
 # Returns 0 and prints the shared-group gid when the caller should proceed.
 # Returns non-zero (skip gracefully) when platform/group preconditions fail.
-_bridge_isolation_v2_cred_group_gate() {
-  # Use auto_resolve directly — NOT bridge_isolation_v2_enforce — because
-  # enforce calls _bridge_isolation_discriminator_primitives_ready which
-  # returns 1 when ab-shared is missing, silently skipping the exact live
-  # broken state we must catch and fail-close on.
+# Platform/policy skip check for credential group-mode helpers.
+# Returns 0 when Linux + auto/yes isolation policy is active.
+# Returns 1 for graceful skip (non-Linux, BRIDGE_ISOLATION_REQUIRED=no, etc.).
+# Does NOT check group existence — callers must resolve the group in their own
+# shell so bridge_die can exit the parent shell, not a command-substitution subshell.
+_bridge_isolation_v2_cred_platform_ok() {
   bridge_isolation_discriminator_auto_resolve >/dev/null
-  [[ "$_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED" == "yes" ]] || return 1
-
-  # Require ACL tooling (skip gracefully on hosts without the acl package)
-  command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1 || return 1
-
-  local _grp_gid
-  _grp_gid="$(_bridge_isolation_v2_shared_group)"
-  if [[ -z "$_grp_gid" ]]; then
-    if _bridge_isolation_v2_cred_is_live; then
-      bridge_die "controller credential group-mode: group '${BRIDGE_SHARED_GROUP:-ab-shared}' is missing. Create the group and add controller + isolated agent users, then restart."
-    else
-      bridge_warn "controller credential group-mode: group '${BRIDGE_SHARED_GROUP:-ab-shared}' missing; skipping (non-live)"
-      return 1
-    fi
-  fi
-  printf '%s' "$_grp_gid"
-  return 0
+  [[ "$_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED" == "yes" ]]
 }
 
 bridge_isolation_v2_apply_controller_credentials_read_grant() {
@@ -2122,8 +2107,21 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
     return 1
   }
 
+  # Platform/policy gate (non-Linux / BRIDGE_ISOLATION_REQUIRED=no → skip)
+  _bridge_isolation_v2_cred_platform_ok || return 0
+  # ACL tooling gate (no setfacl/getfacl package → skip)
+  command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1 || return 0
+  # Group resolution — run in parent shell so bridge_die exits the parent, not a subshell
   local _grp_gid
-  _grp_gid="$(_bridge_isolation_v2_cred_group_gate)" || return 0
+  _grp_gid="$(_bridge_isolation_v2_shared_group)"
+  if [[ -z "$_grp_gid" ]]; then
+    if _bridge_isolation_v2_cred_is_live; then
+      bridge_die "controller credential group-mode: group '${BRIDGE_SHARED_GROUP:-ab-shared}' is missing. Create the group and add controller + isolated agent users, then restart."
+    else
+      bridge_warn "controller credential group-mode: group '${BRIDGE_SHARED_GROUP:-ab-shared}' missing; skipping (non-live)"
+      return 0
+    fi
+  fi
 
   local ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
   [[ -n "$ctrl_user" ]] || {
@@ -2228,8 +2226,21 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
   [[ -n "$agent" && -n "$path" ]] || return 1
   [[ -f "$path" ]] || return 1
 
+  # Platform/policy gate
+  _bridge_isolation_v2_cred_platform_ok || return 0
+  # ACL tooling gate
+  command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1 || return 0
+  # Group resolution in parent shell (bridge_die must not run inside $())
   local _grp_gid
-  _grp_gid="$(_bridge_isolation_v2_cred_group_gate)" || return 0
+  _grp_gid="$(_bridge_isolation_v2_shared_group)"
+  if [[ -z "$_grp_gid" ]]; then
+    if _bridge_isolation_v2_cred_is_live; then
+      bridge_die "controller credential group-mode: group '${BRIDGE_SHARED_GROUP:-ab-shared}' is missing. Create the group and add controller + isolated agent users, then restart."
+    else
+      bridge_warn "controller credential group-mode: group '${BRIDGE_SHARED_GROUP:-ab-shared}' missing; skipping (non-live)"
+      return 0
+    fi
+  fi
 
   local _pfx="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}"
 
