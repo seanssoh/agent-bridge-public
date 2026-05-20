@@ -7229,6 +7229,21 @@ HUD_TAP_ISOLATED_SPY="$TMP_ROOT/hud-isolated-spy"
 assert_contains "$(cat "$HUD_TAP_SHARED_BASE_DIR/settings.json")" "hud-usage-tap"
 [[ -f "$HUD_TAP_ISOLATED_SPY" ]] || die "isolated propagation: bridge_install_isolated_home_settings not reached from shared-mode branch"
 
+# Regression guard: bridge-run.sh runs under `set -u`, so an unset variable
+# in the launch-preflight block aborts the shell before `|| true` can catch
+# it — and shellcheck's SC2154 deliberately does NOT flag all-caps names
+# (they may be environment vars), so a `$WORKDIR`-for-`$WORK_DIR` typo slips
+# past CI lint. (That exact bug shipped in the first cut of this PR and
+# would have aborted every Claude bridge-run.sh launch loop.) bridge-run.sh
+# defines the launch workdir as WORK_DIR; assert no bare $WORKDIR survives
+# and that the HUD-tap call uses the correct name.
+HUD_TAP_RUN_SH="$REPO_ROOT/bridge-run.sh"
+if grep -nE '\$\{?WORKDIR\}?\b' "$HUD_TAP_RUN_SH"; then
+  die "bridge-run.sh references undefined \$WORKDIR (set -u abort risk); the launch workdir variable is \$WORK_DIR"
+fi
+HUD_TAP_RUN_CALL="$(grep -n 'bridge_ensure_hud_usage_tap' "$HUD_TAP_RUN_SH" || true)"
+assert_contains "$HUD_TAP_RUN_CALL" 'bridge_ensure_hud_usage_tap "$WORK_DIR"'
+
 log "ensuring Claude project trust seed and startup blocker detection"
 CLAUDE_USER_FILE="$TMP_ROOT/claude-user.json"
 echo '{}' >"$CLAUDE_USER_FILE"
