@@ -221,7 +221,15 @@ select_for_path() {
       # cron-only static agents do not go stale between rotation events.
       # daemon-periodic-token-sync covers the due-check / tick / audit /
       # state-file cadence contract.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync
+      #
+      # Antigravity wave Track A1: lib/bridge-state.sh's detection region
+      # hosts bridge_detect_antigravity_session_id and the antigravity
+      # resolution path in bridge_resolve_resume_session_id (stale-id
+      # rejection). antigravity-conversation-resume pins the detector /
+      # resolver / `agy --conversation` resume contract — run it on every
+      # bridge-state.sh move so a future PR cannot silently regress the
+      # stale-id rejection.
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync antigravity-conversation-resume
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -435,6 +443,18 @@ select_for_path() {
       # must re-run the Wave C regression smoke that asserts the call
       # returns in <2s.
       add_required 835-static-admin-launch launch launch-dev-channels-injection channel-env-readiness
+      add_integration integration-minimal
+      ;;
+
+    scripts/python-helpers/detect-antigravity-session-id.py|scripts/python-helpers/resolve-antigravity-resume-session-id.py)
+      # Antigravity wave Track A1: these standalone helpers hold the agy
+      # conversation-id detector + resolver bodies (file-as-argv, footgun
+      # #11 mitigation). antigravity-conversation-resume asserts the
+      # detector recency/exclude/workspace scoping AND the resolver's
+      # stale-id rejection (an id older than BRIDGE_RESUME_MAX_AGE_HOURS
+      # must resolve to empty so the agent launches fresh). Any change to
+      # these helpers must re-run that smoke.
+      add_required antigravity-conversation-resume antigravity-engine-acceptance
       add_integration integration-minimal
       ;;
 
