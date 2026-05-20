@@ -300,93 +300,106 @@ PY
   smoke_assert_not_contains "$log_body" "${secret}" "socket gateway log stays payload-free after restart"
 }
 
-queue_gateway_socket_acl_contract() {
-  local socket_path server_log nobody_uid acl_body socket_mode
-
-  if ! command -v setfacl >/dev/null 2>&1 || ! command -v getfacl >/dev/null 2>&1; then
-    smoke_log "skip: queue gateway socket peer ACL contract requires setfacl/getfacl"
-    return 0
-  fi
-  if ! nobody_uid="$(id -u nobody 2>/dev/null)"; then
-    smoke_log "skip: queue gateway socket peer ACL contract requires nobody user"
-    return 0
-  fi
+queue_gateway_socket_group_mode_contract() {
+  # Verifies that the socket uses group-mode permissions (ab-shared, mode 0660)
+  # instead of named-user ACEs. If BRIDGE_SHARED_GROUP / ab-shared does not
+  # exist on this host (smoke/dev), asserts graceful fallback to 0600 with no
+  # world bits set.
+  local socket_path server_log socket_mode socket_gid shared_grp shared_gid
 
   queue_gateway_stop_socket_server
   queue_gateway_socket_env
-  export BRIDGE_QUEUE_GATEWAY_PEERS="$(id -u):worker-a,${nobody_uid}:worker-b"
   BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" init >/dev/null
   python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" ensure-runtime --bridge-home "$BRIDGE_HOME" --strict >/dev/null
   socket_path="$(queue_gateway_socket_path)"
-  server_log="$SMOKE_TMP_ROOT/queue-gateway-socket-acl.log"
+  server_log="$SMOKE_TMP_ROOT/queue-gateway-socket-group-mode.log"
   queue_gateway_start_socket_server "$socket_path" "$server_log"
 
   socket_mode="$(stat -c '%a' "$socket_path")"
+  # No world bits ever (last octet must be 0)
   case "$socket_mode" in
     *[1-7])
-      smoke_fail "queue gateway ACL socket must not be world-writable/readable; mode=$socket_mode"
+      smoke_fail "queue gateway socket must not be world-accessible; mode=$socket_mode"
       ;;
   esac
-  acl_body="$(getfacl -cp "$socket_path")"
-  smoke_assert_contains "$acl_body" "user:nobody:rw-" "socket ACL grants known non-controller peer UID"
-  smoke_assert_contains "$acl_body" "other::---" "socket ACL denies unknown users at filesystem layer"
+
+  shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
+  if shared_gid="$(getent group "$shared_grp" 2>/dev/null | cut -d: -f3)" && [[ -n "$shared_gid" ]]; then
+    # ab-shared exists: assert group=ab-shared mode=0660
+    socket_gid="$(stat -c '%g' "$socket_path")"
+    [[ "$socket_gid" == "$shared_gid" ]] \
+      || smoke_fail "socket group should be $shared_grp (gid=$shared_gid), got gid=$socket_gid"
+    [[ "$socket_mode" == *60 ]] \
+      || smoke_fail "socket mode should be ?660 (group-rw), got $socket_mode"
+    # No named-user ACL entries (if getfacl is available)
+    if command -v getfacl >/dev/null 2>&1; then
+      local acl_body
+      acl_body="$(getfacl -cp "$socket_path")"
+      # named-user entries look like "user:<name>:"; owner entry is "user::<perms>" (empty name)
+      if echo "$acl_body" | grep -qP '^user:[^:]+:[^:]+$' | grep -qv '^user::'; then
+        smoke_fail "socket must have no named-user ACL entries; got: $(echo "$acl_body" | grep '^user:[^:]')"
+      fi
+    fi
+  else
+    # ab-shared absent (smoke/dev fallback): assert owner-only (mode 0600) and no world bits
+    smoke_log "note: $shared_grp group not found; asserting fallback mode 0600"
+    [[ "$socket_mode" == *00 ]] \
+      || smoke_fail "socket fallback mode should be ?600, got $socket_mode"
+  fi
 
   queue_gateway_stop_socket_server
 }
 
-queue_gateway_socket_acl_refresh_contract() {
-  local socket_path server_log nobody_uid acl_body current_user i
-
-  if ! command -v setfacl >/dev/null 2>&1 || ! command -v getfacl >/dev/null 2>&1; then
-    smoke_log "skip: queue gateway socket ACL refresh contract requires setfacl/getfacl"
-    return 0
-  fi
-  if ! nobody_uid="$(id -u nobody 2>/dev/null)"; then
-    smoke_log "skip: queue gateway socket ACL refresh contract requires nobody user"
-    return 0
-  fi
+queue_gateway_socket_perms_refresh_contract() {
+  # Verifies that _refresh_socket_perms reasserts group/mode on the socket
+  # (does not revert to 0600) after a refresh tick. Uses a 1-second interval.
+  # Uses env-based peer discovery to avoid the bash roster probe path, keeping
+  # this test focused on the permission-refresh invariant rather than discovery.
+  local socket_path server_log socket_mode socket_mode_after i _i
 
   queue_gateway_stop_socket_server
   queue_gateway_socket_env
-  unset BRIDGE_QUEUE_GATEWAY_PEERS
+  # Keep BRIDGE_QUEUE_GATEWAY_PEERS set (env-based discovery, same as group-mode
+  # contract). This avoids the roster probe subprocess that is not relevant here.
   export BRIDGE_QUEUE_GATEWAY_ACL_REFRESH_SECONDS=1
-  current_user="$(id -un)"
-  cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
-bridge_add_agent_id_if_missing "worker-a"
-BRIDGE_AGENT_ENGINE["worker-a"]="claude"
-BRIDGE_AGENT_SESSION["worker-a"]="worker-a"
-BRIDGE_AGENT_WORKDIR["worker-a"]="$SMOKE_TMP_ROOT/worker-a"
-BRIDGE_AGENT_ISOLATION_MODE["worker-a"]="linux-user"
-BRIDGE_AGENT_OS_USER["worker-a"]="$current_user"
-EOF
-
   BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" init >/dev/null
   python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" ensure-runtime --bridge-home "$BRIDGE_HOME" --strict >/dev/null
   socket_path="$(queue_gateway_socket_path)"
-  server_log="$SMOKE_TMP_ROOT/queue-gateway-socket-acl-refresh.log"
+  server_log="$SMOKE_TMP_ROOT/queue-gateway-socket-perms-refresh.log"
   queue_gateway_start_socket_server "$socket_path" "$server_log"
-  acl_body="$(getfacl -cp "$socket_path")"
-  smoke_assert_not_contains "$acl_body" "user:nobody:rw-" "socket ACL starts without future peer"
 
-  cat >>"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
-bridge_add_agent_id_if_missing "worker-b"
-BRIDGE_AGENT_ENGINE["worker-b"]="claude"
-BRIDGE_AGENT_SESSION["worker-b"]="worker-b"
-BRIDGE_AGENT_WORKDIR["worker-b"]="$SMOKE_TMP_ROOT/worker-b"
-BRIDGE_AGENT_ISOLATION_MODE["worker-b"]="linux-user"
-BRIDGE_AGENT_OS_USER["worker-b"]="nobody"
-EOF
+  # Wait for the server's "queue_gateway_listener" line: emitted after
+  # server.listen(), guaranteeing _set_socket_group_mode has completed.
+  for ((_i = 0; _i < 50; _i++)); do
+    grep -q "queue_gateway_listener" "$server_log" 2>/dev/null && break
+    sleep 0.1
+  done
+  if ! [[ -S "$socket_path" ]]; then
+    smoke_fail "socket vanished before first stat; log: $(cat "$server_log" 2>/dev/null || true)"
+  fi
 
-  for ((i = 0; i < 30; i++)); do
-    acl_body="$(getfacl -cp "$socket_path")"
-    if [[ "$acl_body" == *"user:nobody:rw-"* ]]; then
-      queue_gateway_stop_socket_server
-      unset BRIDGE_QUEUE_GATEWAY_ACL_REFRESH_SECONDS
-      return 0
-    fi
+  socket_mode="$(stat -c '%a' "$socket_path")"
+
+  # Wait for at least two refresh ticks (interval=1s, wait 3s) then re-stat.
+  # The refresh must reassert group/mode, not revert to 0600.
+  for ((i = 0; i < 15; i++)); do
     sleep 0.2
   done
-  smoke_fail "queue gateway socket ACL did not refresh for newly rostered isolated peer"
+
+  if ! [[ -S "$socket_path" ]]; then
+    smoke_fail "socket vanished during refresh wait; log: $(cat "$server_log" 2>/dev/null || true)"
+  fi
+  socket_mode_after="$(stat -c '%a' "$socket_path")"
+  [[ "$socket_mode_after" == "$socket_mode" ]] \
+    || smoke_fail "socket mode changed after perms refresh: before=$socket_mode after=$socket_mode_after"
+  case "$socket_mode_after" in
+    *[1-7])
+      smoke_fail "socket must not be world-accessible after refresh; mode=$socket_mode_after"
+      ;;
+  esac
+
+  queue_gateway_stop_socket_server
+  unset BRIDGE_QUEUE_GATEWAY_ACL_REFRESH_SECONDS
 }
 
 queue_gateway_socket_duplicate_uid_contract() {
@@ -1076,8 +1089,8 @@ main() {
   # the queue smoke suite green on operator workstations.
   if smoke_is_linux; then
     smoke_run "queue gateway socket peer auth contract" queue_gateway_socket_contract
-    smoke_run "queue gateway socket peer ACL contract" queue_gateway_socket_acl_contract
-    smoke_run "queue gateway socket ACL refresh contract" queue_gateway_socket_acl_refresh_contract
+    smoke_run "queue gateway socket group-mode contract" queue_gateway_socket_group_mode_contract
+    smoke_run "queue gateway socket perms refresh contract" queue_gateway_socket_perms_refresh_contract
     smoke_run "queue gateway socket duplicate UID contract" queue_gateway_socket_duplicate_uid_contract
     smoke_run "queue gateway body-file inlining contract" queue_gateway_body_file_inlining_contract
     smoke_run "queue gateway inline argv privacy contract" queue_gateway_inline_argv_privacy_contract

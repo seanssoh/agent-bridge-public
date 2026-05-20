@@ -30,7 +30,6 @@ import os
 import pwd
 import secrets
 import signal
-import shutil
 import socket
 import sqlite3
 import stat
@@ -47,6 +46,7 @@ SOCKET_NAME = "queue-gateway.sock"
 MAX_SOCKET_BYTES = 2 * 1024 * 1024
 SOCKET_TIMEOUT_SECONDS = 5.0
 SOCKET_ACL_REFRESH_SECONDS = 30.0
+BRIDGE_SHARED_GROUP_DEFAULT = "ab-shared"
 INLINE_OVERHEAD_BYTES = 64 * 1024
 INLINE_BODY_CAP_BYTES = MAX_SOCKET_BYTES - INLINE_OVERHEAD_BYTES
 SOCKET_LINUX_ONLY_MESSAGE = (
@@ -367,8 +367,18 @@ def verify_runtime_layout(home: str) -> tuple[bool, str]:
         return False, "parent_owner_mode"
 
     child = inst.stat()
-    if child.st_uid != current_uid or stat.S_IMODE(child.st_mode) != 0o711:
+    if child.st_uid != current_uid:
         return False, "instance_owner_mode"
+    shared_grp = _shared_group()
+    is_live = str(gateway_runtime_root()) == LIVE_GATEWAY_RUNTIME_ROOT
+    if shared_grp is not None:
+        if stat.S_IMODE(child.st_mode) != 0o2770 or child.st_gid != shared_grp.gr_gid:
+            return False, "instance_owner_mode"
+    elif is_live:
+        return False, "instance_shared_group_missing"
+    else:
+        if stat.S_IMODE(child.st_mode) != 0o711:
+            return False, "instance_owner_mode"
 
     return True, "ok"
 
@@ -417,7 +427,11 @@ def _conf_contents(home: str) -> tuple[str, str]:
         parent_user = user
         parent_group = group
     parent = f"d {root} 0755 {parent_user} {parent_group} -\n"
-    child = f"d {inst} 0711 {user} {group} -\n"
+    shared_grp = _shared_group()
+    if shared_grp is not None:
+        child = f"d {inst} 2770 {user} {shared_grp.gr_name} -\n"
+    else:
+        child = f"d {inst} 0711 {user} {group} -\n"
     return parent, child
 
 
@@ -436,8 +450,13 @@ def _apply_tmpfiles_shim(home: str) -> None:
     if str(root) == LIVE_GATEWAY_RUNTIME_ROOT and os.geteuid() == 0:
         os.chown(root, 0, 0)
     inst.mkdir(parents=True, exist_ok=True)
-    os.chmod(inst, 0o711)
-    os.chown(inst, os.getuid(), os.getgid())
+    shared_grp = _shared_group()
+    if shared_grp is not None:
+        os.chown(inst, os.getuid(), shared_grp.gr_gid)
+        os.chmod(inst, 0o2770)
+    else:
+        os.chown(inst, os.getuid(), os.getgid())
+        os.chmod(inst, 0o711)
 
 
 def _sudo_available() -> bool:
@@ -780,53 +799,46 @@ def _socket_acl_refresh_seconds() -> float:
     return value
 
 
-def _run_setfacl(args: list[str], context: str) -> None:
-    proc = subprocess.run(
-        args,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        detail = proc.stderr.strip() or f"setfacl exited {proc.returncode}"
-        raise SystemExit(f"queue gateway socket {context} failed: {detail}")
+def _shared_group() -> grp.struct_group | None:
+    """Return the ab-shared group struct, or None if not present on this host."""
+    name = os.environ.get("BRIDGE_SHARED_GROUP", BRIDGE_SHARED_GROUP_DEFAULT).strip()
+    try:
+        return grp.getgrnam(name)
+    except KeyError:
+        return None
 
 
-def _set_socket_acl(path: Path, peer_map: dict[int, str]) -> None:
-    """Restrict socket access to the controller plus known isolated peer UIDs."""
-    setfacl = shutil.which("setfacl")
-    if setfacl:
-        _run_setfacl([setfacl, "-b", str(path)], "ACL reset")
-    os.chmod(path, 0o600)
-    current_uid = os.getuid()
-    specs = []
-    for uid, agent in sorted(peer_map.items()):
-        if uid == current_uid:
-            continue
-        try:
-            user = pwd.getpwuid(uid).pw_name
-        except KeyError as exc:
-            raise SystemExit(f"queue gateway socket peer has no local user: uid={uid} agent={agent}") from exc
-        specs.append(f"u:{user}:rw")
+def _set_socket_group_mode(path: Path, live: bool = False) -> None:
+    """Set socket to group=ab-shared mode 0660 — no named-user ACEs needed.
 
-    if not specs:
+    All isolated agent OS users are ab-shared members, so they get access
+    automatically without per-agent setfacl. In live mode, a missing group
+    is a hard failure. In smoke/dev mode, fall back to 0600 (owner-only).
+    """
+    g = _shared_group()
+    if g is None:
+        name = os.environ.get("BRIDGE_SHARED_GROUP", BRIDGE_SHARED_GROUP_DEFAULT).strip()
+        if live:
+            raise SystemExit(
+                f"queue gateway socket requires group '{name}' (BRIDGE_SHARED_GROUP). "
+                f"Create the group and add all isolated agent users to it, then restart the daemon."
+            )
+        os.chmod(path, 0o600)
         return
-
-    if not setfacl:
-        raise SystemExit("queue gateway socket peer ACL requires setfacl for isolated UID peers")
-
-    _run_setfacl(
-        [setfacl, "-m", ",".join(specs + ["m::rw"]), str(path)],
-        "peer ACL",
-    )
+    os.chown(path, -1, g.gr_gid)
+    os.chmod(path, 0o660)
 
 
-def _refresh_socket_acl(path: Path, peer_map: dict[int, str], script_dir: Path) -> None:
+def _refresh_socket_perms(path: Path, peer_map: dict[int, str], script_dir: Path, live: bool = False) -> None:
+    """Refresh peer_map from roster and reassert group/mode on the socket.
+
+    peer_map is kept current for SO_PEERCRED authorization in _handle_socket_request.
+    The filesystem permission change (group mode) makes it self-healing on each tick.
+    """
     latest = _peer_map_from_roster(script_dir)
     peer_map.clear()
     peer_map.update(latest)
-    _set_socket_acl(path, peer_map)
+    _set_socket_group_mode(path, live=live)
 
 
 def _task_row(home: str, task_id: int) -> sqlite3.Row | None:
@@ -1225,6 +1237,7 @@ def cmd_socket_server(args: argparse.Namespace) -> int:
     queue_script = Path(args.queue_script).expanduser()
     script_dir = queue_script.resolve().parent
     peer_map = _peer_map_from_roster(script_dir)
+    is_live = str(gateway_runtime_root()) == LIVE_GATEWAY_RUNTIME_ROOT
     acl_refresh_seconds = _socket_acl_refresh_seconds()
     next_acl_refresh = time.monotonic() + acl_refresh_seconds
     running = True
@@ -1260,7 +1273,7 @@ def cmd_socket_server(args: argparse.Namespace) -> int:
             server.bind(str(path))
         finally:
             os.umask(old_umask)
-        _set_socket_acl(path, peer_map)
+        _set_socket_group_mode(path, live=is_live)
         server.listen(64)
         server.settimeout(1.0)
         print(f"queue_gateway_listener socket={path}", file=sys.stderr, flush=True)
@@ -1269,7 +1282,7 @@ def cmd_socket_server(args: argparse.Namespace) -> int:
                 conn, _addr = server.accept()
             except (TimeoutError, socket.timeout):
                 if time.monotonic() >= next_acl_refresh:
-                    _refresh_socket_acl(path, peer_map, script_dir)
+                    _refresh_socket_perms(path, peer_map, script_dir, live=is_live)
                     next_acl_refresh = time.monotonic() + acl_refresh_seconds
                 continue
             except OSError:
