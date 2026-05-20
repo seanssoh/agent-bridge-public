@@ -29,8 +29,10 @@ What it exercises:
 """
 
 import json
+import os
 import pathlib
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -130,7 +132,90 @@ def main():
     noattach_summary = run_summary(noattach_payload)
     assert "agent_restart_warning:" not in noattach_summary, noattach_summary
 
+    # 3. Dedupe contract (PR #996 r2). The [restart-required] task filer in
+    #    bridge-upgrade.sh probes the target queue with `bridge-queue.py
+    #    find-open --title-prefix <exact title>` and SKIPS creating a second
+    #    task when an open one already exists — otherwise an operator who
+    #    re-runs `upgrade --restart-agents` while staying attached gets the
+    #    admin inbox spammed with duplicate manual-restart tasks. Exercise
+    #    that exact primitive against a real temp queue DB so a regression
+    #    in find-open (or its title-match) reproduces here.
+    _check_restart_required_dedupe(repo_root)
+
     print("smoke-restart-attached-notice: OK")
+
+
+def _check_restart_required_dedupe(repo_root):
+    queue_py = repo_root / "bridge-queue.py"
+    if not queue_py.is_file():
+        raise SystemExit(f"missing file: {queue_py}")
+    title = "[restart-required] a1 — upgrade to v9.9.9"
+    other_version_title = "[restart-required] a1 — upgrade to v9.9.10"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = pathlib.Path(tmp)
+        db_path = tmp_path / "tasks.db"
+        env = {**os.environ, "BRIDGE_TASK_DB": str(db_path)}
+
+        def queue(*qargs, expect_zero=True):
+            proc = subprocess.run(
+                ["python3", str(queue_py), *qargs],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            if expect_zero and proc.returncode != 0:
+                raise SystemExit(
+                    f"bridge-queue.py {qargs} failed: {proc.stderr.strip()}"
+                )
+            return proc
+
+        body = tmp_path / "rr-body.md"
+        body.write_text("manual restart body\n")
+
+        # File the first [restart-required] task.
+        queue(
+            "create", "--to", "admin", "--from", "admin",
+            "--priority", "normal", "--title", title,
+            "--body-file", str(body),
+        )
+
+        # The dedupe probe: an open task with this exact title must be
+        # found (exit 0, prints the id) — this is what makes the filer
+        # SKIP a second create on a repeated identical upgrade.
+        found = queue(
+            "find-open", "--agent", "admin",
+            "--title-prefix", title, "--format", "id",
+            expect_zero=False,
+        )
+        assert found.returncode == 0, found.stderr
+        assert found.stdout.strip().isdigit(), found.stdout
+
+        # A genuinely different upgrade version must NOT be deduped — the
+        # title pins the version, so a new upgrade still gets a task.
+        other = queue(
+            "find-open", "--agent", "admin",
+            "--title-prefix", other_version_title, "--format", "id",
+            expect_zero=False,
+        )
+        assert other.returncode != 0, other.stdout
+        assert other.stdout.strip() == "", other.stdout
+
+        # The filer's second run SKIPS the create because find-open
+        # matched — so the open-task count for this title must stay at 1.
+        # A regression that drops the skip branch would INSERT a 2nd row.
+        conn = sqlite3.connect(str(db_path))
+        try:
+            open_count = conn.execute(
+                "SELECT COUNT(*) FROM tasks "
+                "WHERE title = ? AND status IN ('queued', 'claimed', 'blocked')",
+                (title,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert open_count == 1, (
+            f"expected 1 open [restart-required] task, got {open_count}"
+        )
 
 
 if __name__ == "__main__":

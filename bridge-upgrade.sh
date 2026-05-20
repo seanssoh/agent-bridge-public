@@ -2284,15 +2284,41 @@ POST_EOF
     # Issue #980: file a dedicated [restart-required] task per
     # attached-skipped agent so the manual restart is not lost in the
     # body of the larger [upgrade-complete] task. The title carries the
-    # agent ID + target version, so a re-run of the SAME upgrade re-files
-    # the same-titled task (the admin closes it once the restart is done;
-    # a duplicate is harmless and self-evidently the same item) and a
-    # genuinely new upgrade gets its own distinct task. Failure to file
-    # is non-fatal — the notice is already in the [upgrade-complete] body
-    # and the upgrade summary — so a WARN on stderr is sufficient.
+    # agent ID + target version so a genuinely new upgrade gets its own
+    # distinct task.
+    #
+    # Dedupe (PR #996 r2): the queue layer does NOT dedupe — every
+    # `task create` unconditionally INSERTs a row — so an operator who
+    # re-runs `upgrade --restart-agents` while staying attached (common:
+    # they are attached *because* they are working) would otherwise get
+    # the admin inbox spammed with duplicate [restart-required] tasks.
+    # Before creating, probe the target install's queue for an already-
+    # open task with the exact same title (`find-open --title-prefix`
+    # over queued|claimed|blocked rows — the same primitive
+    # bridge-task.sh uses for [task-blocked] idempotency) and skip the
+    # create when one is present. Exact-title match is sufficient: the
+    # title pins both agent id and target version.
+    #
+    # Failure to file is non-fatal — the notice is already in the
+    # [upgrade-complete] body and the upgrade summary — so a WARN on
+    # stderr is sufficient.
     if [[ -n "$_attached_skipped_agents" ]]; then
       printf '%s\n' "$_attached_skipped_agents" | while IFS= read -r _rr_agent; do
         [[ -n "$_rr_agent" ]] || continue
+        _rr_title="[restart-required] $_rr_agent — upgrade to $SOURCE_VERSION"
+        # Skip when an open [restart-required] task for this agent+version
+        # already exists in the target queue. `find-open` exits 0 and
+        # prints the id on a match, exits non-zero with no output when
+        # none is open; the `|| true` keeps `set -e` from aborting on the
+        # no-match exit.
+        _rr_existing="$(bridge_upgrade_with_target_env "$TARGET_ROOT" \
+          python3 "$TARGET_ROOT/bridge-queue.py" find-open \
+          --agent "$_post_admin" --title-prefix "$_rr_title" --format id \
+          2>/dev/null || true)"
+        if [[ -n "$_rr_existing" ]]; then
+          echo "[bridge-upgrade] restart-required task already queued for $_rr_agent (task #$_rr_existing) — not re-filing"
+          continue
+        fi
         _rr_body="$(mktemp "${TMPDIR:-/tmp}/bridge-upgrade-restart-req.XXXXXX")"
         {
           printf '# Manual agent restart required\n\n'
@@ -2305,7 +2331,7 @@ POST_EOF
         } >"$_rr_body"
         if ! bridge_upgrade_with_target_env "$TARGET_ROOT" "$TARGET_ROOT/agent-bridge" task create \
             --to "$_post_admin" --priority normal --from "$_post_admin" \
-            --title "[restart-required] $_rr_agent — upgrade to $SOURCE_VERSION" \
+            --title "$_rr_title" \
             --body-file "$_rr_body" >/dev/null 2>&1; then
           echo "[bridge-upgrade] WARN: could not file [restart-required] task for agent=$_rr_agent (notice still present in [upgrade-complete] body and upgrade summary)" >&2
         fi
