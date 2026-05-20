@@ -105,6 +105,15 @@ EOF
     fi
   fi
 
+  # Normalize agy/gemini aliases to the canonical `antigravity` value before
+  # validation so `--worker-engine agy` is accepted (A0: all engine ingest
+  # points route through bridge_normalize_engine). On an unknown engine the
+  # normalizer fails non-zero — keep the raw value so the error below names it.
+  local _normalized_engine
+  if _normalized_engine="$(bridge_normalize_engine "$worker_engine" 2>/dev/null)"; then
+    worker_engine="$_normalized_engine"
+  fi
+
   if [[ "$worker_engine" != "claude" && "$worker_engine" != "codex" && "$worker_engine" != "antigravity" ]]; then
     bridge_die "wave dispatch: --worker-engine must be claude, codex or antigravity (got: $worker_engine)"
   fi

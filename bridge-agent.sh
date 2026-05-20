@@ -207,7 +207,12 @@ import sys
 
 source = Path(sys.argv[1])
 agent_id, display_name, role_text, engine, session_type = sys.argv[2:]
-runtime = "Claude Code CLI" if engine == "claude" else "Codex CLI"
+if engine == "claude":
+    runtime = "Claude Code CLI"
+elif engine == "antigravity":
+    runtime = "Antigravity CLI"
+else:
+    runtime = "Codex CLI"
 text = source.read_text(encoding="utf-8")
 replacements = {
     "<Agent Name>": display_name,
@@ -221,7 +226,7 @@ replacements = {
     "<Session Type>": session_type,
     "<핵심 책임>": role_text,
     "<주 요청자>": "관리자 에이전트",
-    "<Claude Code CLI | Codex CLI>": runtime,
+    "<Claude Code CLI | Codex CLI | Antigravity CLI>": runtime,
     "<반드시 지킬 운영 규칙>": "큐를 source of truth로 삼고, claim/done note를 생략하지 않는다.",
     "<위험 작업 제한>": "크리티컬 변경 전에는 dry-run 또는 관련 상태 확인을 먼저 수행한다.",
     "<보고 방식>": "결과는 요청자 채널 또는 task queue로 반드시 남긴다.",
