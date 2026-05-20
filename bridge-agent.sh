@@ -81,7 +81,7 @@ override) — same trust model as 'agent-bridge config set'. Repeatable.
   --channels-add <token>               append unique CSV token
   --channels-remove <token>            remove matching CSV token
   --desc <text>                        set BRIDGE_AGENT_DESC
-  --engine claude|codex                set BRIDGE_AGENT_ENGINE
+  --engine claude|codex|antigravity    set BRIDGE_AGENT_ENGINE
   --workdir <path>                     set BRIDGE_AGENT_WORKDIR
   --loop on|off                        set BRIDGE_AGENT_LOOP (off persists explicitly)
   --continue on|off                    set BRIDGE_AGENT_CONTINUE
@@ -90,14 +90,14 @@ override) — same trust model as 'agent-bridge config set'. Repeatable.
   --dry-run                            do not mutate; emit planned diff
 
 Create options:
-  --engine claude|codex        Agent runtime engine (default: claude)
+  --engine claude|codex|antigravity  Agent runtime engine (default: claude)
   --session <name>             tmux session name (default: <agent>)
   --workdir <path>             live home / workdir (default: \$BRIDGE_AGENT_HOME_ROOT/<agent>)
   --profile-home <path>        tracked profile target when different from workdir
   --description <text>         roster description
   --display-name <text>        scaffold display name (default: <agent>)
   --role <text>                scaffold role summary
-  --session-type <type>        admin|static-claude|static-codex|dynamic|cron
+  --session-type <type>        admin|static-claude|static-codex|static-antigravity|dynamic|cron
   --user <id[:display-name]>   scaffold one user memory partition (repeatable; defaults to shared users)
   --launch-cmd <cmd>           explicit launch command
   --channels <csv>             required Claude channels metadata
@@ -179,6 +179,14 @@ bridge_agent_default_launch_cmd() {
       # same injection helper in lib/bridge-state.sh).
       printf '%s' 'codex -c features.fast_mode=true --dangerously-bypass-approvals-and-sandbox --no-alt-screen'
       ;;
+    antigravity)
+      # Antigravity wave (Track A0): minimal launch command so static
+      # `create --engine antigravity` succeeds end-to-end. This is the
+      # bare form (no `-i` bootstrap) — actual launch is still blocked by
+      # the temporary guard in bridge-start.sh. Track C1 upgrades this
+      # arm to the bootstrap-carrying contract.
+      printf '%s' 'agy --dangerously-skip-permissions'
+      ;;
     *)
       bridge_die "지원하지 않는 engine 입니다: $engine"
       ;;
@@ -199,7 +207,12 @@ import sys
 
 source = Path(sys.argv[1])
 agent_id, display_name, role_text, engine, session_type = sys.argv[2:]
-runtime = "Claude Code CLI" if engine == "claude" else "Codex CLI"
+if engine == "claude":
+    runtime = "Claude Code CLI"
+elif engine == "antigravity":
+    runtime = "Antigravity CLI"
+else:
+    runtime = "Codex CLI"
 text = source.read_text(encoding="utf-8")
 replacements = {
     "<Agent Name>": display_name,
@@ -213,7 +226,7 @@ replacements = {
     "<Session Type>": session_type,
     "<핵심 책임>": role_text,
     "<주 요청자>": "관리자 에이전트",
-    "<Claude Code CLI | Codex CLI>": runtime,
+    "<Claude Code CLI | Codex CLI | Antigravity CLI>": runtime,
     "<반드시 지킬 운영 규칙>": "큐를 source of truth로 삼고, claim/done note를 생략하지 않는다.",
     "<위험 작업 제한>": "크리티컬 변경 전에는 dry-run 또는 관련 상태 확인을 먼저 수행한다.",
     "<보고 방식>": "결과는 요청자 채널 또는 task queue로 반드시 남긴다.",
@@ -2635,8 +2648,16 @@ report and reap test-fixture agents per their pattern."
     fi
   fi
 
+  # Antigravity wave (Track A0): normalize the engine token so `agy`/
+  # `gemini` aliases resolve to the canonical `antigravity` value before
+  # validation and storage.
+  if engine="$(bridge_normalize_engine "$engine")"; then
+    :
+  else
+    bridge_die "지원하지 않는 engine 입니다: $engine"
+  fi
   case "$engine" in
-    claude|codex) ;;
+    claude|codex|antigravity) ;;
     *) bridge_die "지원하지 않는 engine 입니다: $engine" ;;
   esac
 
@@ -2644,10 +2665,11 @@ report and reap test-fixture agents per their pattern."
     case "$engine" in
       claude) session_type="static-claude" ;;
       codex) session_type="static-codex" ;;
+      antigravity) session_type="static-antigravity" ;;
     esac
   fi
   case "$session_type" in
-    admin|static-claude|static-codex|dynamic|cron) ;;
+    admin|static-claude|static-codex|static-antigravity|dynamic|cron) ;;
     *) bridge_die "지원하지 않는 session type 입니다: $session_type" ;;
   esac
   case "$isolation_mode" in
@@ -2657,6 +2679,13 @@ report and reap test-fixture agents per their pattern."
 
   if [[ "$isolation_mode" == "shared" && -n "$os_user" ]]; then
     bridge_die "--os-user 는 --isolation linux-user 와 함께만 사용할 수 있습니다."
+  fi
+
+  # Antigravity wave (Track A0): agy is macOS/shared-mode only this wave.
+  # linux-user isolation for antigravity agents is explicitly out of scope
+  # — reject it loudly at create time rather than producing a broken agent.
+  if [[ "$engine" == "antigravity" && "$isolation_mode" == "linux-user" ]]; then
+    bridge_die "antigravity 엔진은 linux-user isolation을 아직 지원하지 않습니다 (shared mode 전용)."
   fi
 
   session="${session:-$agent}"
@@ -3035,12 +3064,18 @@ run_update() {
         ;;
       --engine)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        case "$2" in
-          claude|codex) ;;
-          *) bridge_die "--engine 는 claude|codex 만 가능합니다: $2" ;;
+        # Antigravity wave (Track A0): normalize `agy`/`gemini` aliases to
+        # the canonical `antigravity` engine value before validation.
+        if engine_value="$(bridge_normalize_engine "$2")"; then
+          :
+        else
+          bridge_die "--engine 는 claude|codex|antigravity 만 가능합니다: $2"
+        fi
+        case "$engine_value" in
+          claude|codex|antigravity) ;;
+          *) bridge_die "--engine 는 claude|codex|antigravity 만 가능합니다: $2" ;;
         esac
         engine_present=1
-        engine_value="$2"
         mutation_present=1
         shift 2
         ;;

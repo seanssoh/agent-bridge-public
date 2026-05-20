@@ -1185,12 +1185,16 @@ PY
   bridge_linux_sudo_root chown -h "$os_user" "$target" >/dev/null 2>&1 || true
 }
 
-# Resolve the absolute path of an engine CLI (claude/codex) on the
-# controller's PATH. Returns empty string if not found.
+# Resolve the absolute path of an engine CLI (claude/codex/antigravity) on
+# the controller's PATH. Returns empty string if not found. The engine
+# VALUE is mapped to its on-disk binary via `bridge_engine_binary_name`
+# (antigravity -> agy), so an agy agent resolves the `agy` binary.
 bridge_resolve_engine_cli() {
   local engine="$1"
   case "$engine" in
-    claude|codex) command -v "$engine" 2>/dev/null || true ;;
+    claude|codex|antigravity)
+      command -v "$(bridge_engine_binary_name "$engine")" 2>/dev/null || true
+      ;;
     *) printf '' ;;
   esac
 }

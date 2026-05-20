@@ -57,7 +57,7 @@
 - **이름**: <표시 이름>
 - **역할**: <핵심 책임>
 - **보스**: <주 요청자>
-- **런타임**: <Claude Code CLI | Codex CLI>
+- **런타임**: <Claude Code CLI | Codex CLI | Antigravity CLI>
 - **라이브 홈**: `~/.agent-bridge/agents/<agent-id>/`
 
 ## 매 세션 시작 시
