@@ -515,6 +515,11 @@ run_discord() {
       bridge_setup_write_local_assoc "BRIDGE_AGENT_NOTIFY_ACCOUNT" "$agent" "$channel_account" >/dev/null
     fi
     bridge_ensure_claude_channel_plugins "$agent"
+    # Issue #989: bridge_setup_add_agent_channel rewrote BRIDGE_AGENT_CHANNELS
+    # in agent-roster.local.sh — refresh the isolated agent's cached
+    # runtime/agent-env.sh so its launch cmd cannot keep a pre-v2 channel
+    # state path. NO-OP for non-isolated agents.
+    bridge_refresh_isolated_agent_env_after_channel_mutation "$agent"
   fi
 }
 
@@ -582,6 +587,10 @@ run_telegram() {
       bridge_setup_write_local_assoc "BRIDGE_AGENT_NOTIFY_ACCOUNT" "$agent" "$channel_account" >/dev/null
     fi
     bridge_ensure_claude_channel_plugins "$agent"
+    # Issue #989: bridge_setup_replace_agent_telegram_channel rewrote
+    # BRIDGE_AGENT_CHANNELS in agent-roster.local.sh — refresh the isolated
+    # agent's cached runtime/agent-env.sh. NO-OP for non-isolated agents.
+    bridge_refresh_isolated_agent_env_after_channel_mutation "$agent"
   fi
 }
 
@@ -651,6 +660,14 @@ run_teams() {
       bridge_setup_write_local_assoc "BRIDGE_AGENT_NOTIFY_ACCOUNT" "$agent" "$channel_account" >/dev/null
     fi
     bridge_ensure_claude_channel_plugins "$agent"
+    # Issue #989: setup teams rewrote BOTH BRIDGE_AGENT_CHANNELS
+    # (bridge_setup_add_agent_channel) AND BRIDGE_AGENT_LAUNCH_CMD
+    # (bridge_setup_ensure_development_channels_launch_flag) in
+    # agent-roster.local.sh. Refresh the isolated agent's cached
+    # runtime/agent-env.sh AFTER both writes so the regenerated launch
+    # cmd reflects the channel add and the dev-channel launch flag.
+    # NO-OP for non-isolated agents.
+    bridge_refresh_isolated_agent_env_after_channel_mutation "$agent"
   fi
 }
 

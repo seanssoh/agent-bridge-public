@@ -1734,6 +1734,28 @@ PY
       if [[ -n "$RELAY_CLEANUP_JSON" ]]; then
         bridge_audit_log upgrade telegram_relay_residue_cleanup_applied "$TARGET_VERSION" \
           --detail summary="$RELAY_CLEANUP_JSON" >/dev/null 2>&1 || true
+        # Issue #989: bridge-relay-cleanup.py rewrote BRIDGE_AGENT_CHANNELS
+        # / BRIDGE_AGENT_LAUNCH_CMD in agent-roster.local.sh (dropping the
+        # legacy telegram-relay channel + dev-channel loader). For a
+        # linux-user isolated agent the cached runtime/agent-env.sh now
+        # carries a stale launch cmd — and isolation-v2-migrate already
+        # ran earlier in this upgrade, so nothing downstream regenerates
+        # it. Refresh every isolated agent's cache via the shared helper
+        # so the next start does not bind a pre-v2 channel state path
+        # (#771-class silent inbound delivery failure). NO-OP for
+        # non-isolated agents; tolerant on failure so cleanup success is
+        # not downgraded by a per-agent regen hiccup.
+        bridge_upgrade_with_target_env "$TARGET_ROOT" "$BRIDGE_BASH_BIN" -lc '
+          set -euo pipefail
+          source "$1/bridge-lib.sh"
+          bridge_load_roster
+          for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+            command -v bridge_refresh_isolated_agent_env_after_channel_mutation \
+              >/dev/null 2>&1 || continue
+            bridge_refresh_isolated_agent_env_after_channel_mutation "$agent" \
+              >/dev/null 2>&1 || true
+          done
+        ' -- "$SOURCE_ROOT" >/dev/null 2>&1 || true
       fi
     fi
     rm -rf "$_relay_cleanup_preview_dir"

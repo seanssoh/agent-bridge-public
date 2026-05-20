@@ -3340,6 +3340,17 @@ PY
       "$new_class" \
       "$loop_explicit_off_arg" >/dev/null
     after_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
+
+    # Issue #989: bridge_write_role_block just rewrote the roster file —
+    # for a linux-user isolated agent the cached `runtime/agent-env.sh`
+    # (the only roster snapshot the isolated UID can read) now holds a
+    # stale BRIDGE_AGENT_LAUNCH_CMD whose embedded channel state paths
+    # may be pre-v2 (`agents/<X>/.teams` instead of
+    # `agents/<X>/workdir/.teams`) → EACCES → silent inbound delivery
+    # loss (#771 regression). The shared helper invalidates the
+    # per-process roster cache, reloads from disk, and regenerates the
+    # cached env file. NO-OP for non-isolated agents.
+    bridge_refresh_isolated_agent_env_after_channel_mutation "$agent"
   else
     after_sha="$before_sha"
   fi

@@ -3332,6 +3332,110 @@ EOF
   fi
 }
 
+# Issue #989: refresh the cached `runtime/agent-env.sh` for a linux-user
+# isolated agent so a roster mutation (channel-add / channel-remove /
+# launch-cmd edit) can never leave the cached `BRIDGE_AGENT_LAUNCH_CMD`
+# pointing at a pre-v2 channel state path.
+#
+# Background. `runtime/agent-env.sh` is the ONLY roster snapshot an
+# isolated UID can read (the real roster files are not group-reachable;
+# `bridge_write_linux_agent_env_file` sets BRIDGE_ROSTER_FILE="" inside
+# the emitted file). The cached launch cmd embeds `TEAMS_STATE_DIR` and
+# the sibling `*_STATE_DIR` assignments. For a v0.7->v0.8-migrated agent
+# the raw roster launch cmd still carries the pre-v2 path
+# `agents/<X>/.teams` (owned ec2-user mode 700); the v2-correct
+# `agents/<X>/workdir/.teams` is injected at launch by
+# `bridge_claude_launch_with_channel_state_dirs`, but ONLY for channels
+# still present in the effective channel set. `agent update --channels-*`
+# rewrites the roster yet never regenerated this cache, so the stale
+# snapshot survived until the next full `bridge-start.sh` run — and a
+# channel server that bound the pre-v2 path got EACCES and silently
+# stopped delivering inbound messages (the #771 regression this closes).
+#
+# This is the same recompute `isolation-v2-reapply` performs (see
+# lib/bridge-isolation-v2-reapply.sh:448-528). Calling it eagerly after
+# a roster mutation keeps the cache v2-correct without waiting for a
+# reapply pass.
+#
+# NO-OP contract: returns 0 immediately for non-isolated (shared-mode /
+# non-linux-user) agents — only linux-user isolation has the cached
+# `runtime/agent-env.sh`. Also a no-op when isolation is disabled by env
+# or when the writer / path helpers are not loaded in the current entry
+# path (load-order guard mirrors isolation-v2-reapply.sh:471).
+bridge_ensure_isolated_agent_env_current() {
+  local agent="$1"
+
+  [[ -n "$agent" ]] || return 0
+  if command -v bridge_isolation_disabled_by_env >/dev/null 2>&1 \
+      && bridge_isolation_disabled_by_env; then
+    return 0
+  fi
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || return 0
+
+  # Load-order guard: these helpers may not be sourced in every entry
+  # path. A silent skip would mask the regression, so warn loudly —
+  # mirrors the isolation-v2-reapply contract.
+  if ! command -v bridge_write_linux_agent_env_file >/dev/null 2>&1 \
+      || ! command -v bridge_agent_linux_env_file >/dev/null 2>&1; then
+    bridge_warn "bridge_ensure_isolated_agent_env_current: writer/path helper not loaded for '$agent' (load-order regression?); cached agent-env.sh left stale — channel servers may bind pre-v2 state paths"
+    return 1
+  fi
+
+  local env_file=""
+  env_file="$(bridge_agent_linux_env_file "$agent" 2>/dev/null || true)"
+  [[ -n "$env_file" ]] || return 0
+
+  # Idempotency: generate to a temp path first; if the existing file is
+  # a regular file already byte-identical to what the writer produces,
+  # skip the rewrite to preserve mtime/ctime (matches the reapply
+  # tool's already-canonical short-circuit).
+  local tmp_env=""
+  tmp_env="$(mktemp "${TMPDIR:-/tmp}/agent-env.regen.XXXXXX" 2>/dev/null || true)"
+  if [[ -n "$tmp_env" ]] \
+      && bridge_write_linux_agent_env_file "$agent" "$tmp_env" 2>/dev/null; then
+    if [[ -f "$env_file" && ! -L "$env_file" ]] \
+        && cmp -s "$tmp_env" "$env_file" 2>/dev/null; then
+      rm -f "$tmp_env"
+      return 0
+    fi
+    rm -f "$tmp_env"
+    if bridge_write_linux_agent_env_file "$agent" "$env_file" 2>/dev/null; then
+      return 0
+    fi
+    bridge_warn "bridge_ensure_isolated_agent_env_current: failed to regenerate $env_file for '$agent' (next agent start will use stale BRIDGE_AGENT_LAUNCH_CMD — channel servers may bind pre-v2 state paths)"
+    return 1
+  fi
+  [[ -n "$tmp_env" ]] && rm -f "$tmp_env"
+  bridge_warn "bridge_ensure_isolated_agent_env_current: failed to stage temp agent-env.sh for '$agent'"
+  return 1
+}
+
+# Issue #989: shared post-mutation refresh for the channel-list / launch-cmd
+# write paths. A mutator that rewrites agent-roster.local.sh (run_update's
+# bridge_write_role_block, or bridge-setup.sh's bridge_setup_write_local_assoc)
+# leaves the per-process roster cache stale: bridge_load_roster short-circuits
+# on BRIDGE_ROSTER_CACHE_LOADED=1 (issue #848 memo), so a bare reload replays
+# the pre-mutation in-memory maps and bridge_ensure_isolated_agent_env_current
+# would regenerate runtime/agent-env.sh from the OLD channel set. Invalidate
+# the cache first so the reload re-reads disk, then regenerate. NO-OP for
+# non-isolated agents (the inner helper gates on isolation).
+#
+# Call this from EVERY roster-mutation path that touches BRIDGE_AGENT_CHANNELS
+# or BRIDGE_AGENT_LAUNCH_CMD, after the on-disk write completes.
+bridge_refresh_isolated_agent_env_after_channel_mutation() {
+  local agent="$1"
+
+  [[ -n "$agent" ]] || return 0
+  if command -v bridge_roster_cache_invalidate >/dev/null 2>&1; then
+    bridge_roster_cache_invalidate
+  fi
+  if command -v bridge_load_roster >/dev/null 2>&1; then
+    bridge_load_roster
+  fi
+  bridge_ensure_isolated_agent_env_current "$agent" \
+    || bridge_warn "channel mutation: cached agent-env.sh regeneration reported a problem for '$agent'; run 'agent-bridge migrate isolation v2 --apply --agent $agent' before the next restart"
+}
+
 bridge_linux_prepare_agent_isolation() {
   local agent="$1"
   local os_user="$2"
