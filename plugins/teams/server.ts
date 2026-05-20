@@ -324,29 +324,33 @@ function loadAccess(): Access {
   return BOOT_ACCESS ?? loadJson<Access>(ACCESS_FILE, defaultAccess())
 }
 
+// Normalize CRLF and bare CR to LF. Applied by both compactText and htmlToText
+// so every text path into runPromptGuard/channel delivery is LF-only.
+function normalizeLineEndings(s: string): string {
+  return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+}
+
 function compactText(text: string): string {
-  return text
-    .replace(/<at>[^<]+<\/at>/g, '')
-    .replace(/\r\n/g, '\n')
-    .replace(/\r/g, '\n')
-    .trim()
+  return normalizeLineEndings(text.replace(/<at>[^<]+<\/at>/g, '')).trim()
 }
 
 // Extract plain text from an HTML string. Used when Teams delivers the message
 // body as an inline text/html attachment (activity.text is empty) rather than
 // in activity.text directly. Handles common inline elements and basic entities.
 function htmlToText(html: string): string {
-  return html
-    .replace(/<br\s*\/?>/gi, '\n')
-    .replace(/<\/p>/gi, '\n')
-    .replace(/<\/div>/gi, '\n')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&amp;/g, '&')
-    .replace(/&nbsp;/g, ' ')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
+  return normalizeLineEndings(
+    html
+      .replace(/<br\s*\/?>/gi, '\n')
+      .replace(/<\/p>/gi, '\n')
+      .replace(/<\/div>/gi, '\n')
+      .replace(/<[^>]+>/g, '')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&')
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+  )
     .replace(/\n{3,}/g, '\n\n')
     .trim()
 }
