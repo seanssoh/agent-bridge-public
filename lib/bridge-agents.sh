@@ -3410,6 +3410,32 @@ bridge_ensure_isolated_agent_env_current() {
   return 1
 }
 
+# Issue #989: shared post-mutation refresh for the channel-list / launch-cmd
+# write paths. A mutator that rewrites agent-roster.local.sh (run_update's
+# bridge_write_role_block, or bridge-setup.sh's bridge_setup_write_local_assoc)
+# leaves the per-process roster cache stale: bridge_load_roster short-circuits
+# on BRIDGE_ROSTER_CACHE_LOADED=1 (issue #848 memo), so a bare reload replays
+# the pre-mutation in-memory maps and bridge_ensure_isolated_agent_env_current
+# would regenerate runtime/agent-env.sh from the OLD channel set. Invalidate
+# the cache first so the reload re-reads disk, then regenerate. NO-OP for
+# non-isolated agents (the inner helper gates on isolation).
+#
+# Call this from EVERY roster-mutation path that touches BRIDGE_AGENT_CHANNELS
+# or BRIDGE_AGENT_LAUNCH_CMD, after the on-disk write completes.
+bridge_refresh_isolated_agent_env_after_channel_mutation() {
+  local agent="$1"
+
+  [[ -n "$agent" ]] || return 0
+  if command -v bridge_roster_cache_invalidate >/dev/null 2>&1; then
+    bridge_roster_cache_invalidate
+  fi
+  if command -v bridge_load_roster >/dev/null 2>&1; then
+    bridge_load_roster
+  fi
+  bridge_ensure_isolated_agent_env_current "$agent" \
+    || bridge_warn "channel mutation: cached agent-env.sh regeneration reported a problem for '$agent'; run 'agent-bridge migrate isolation v2 --apply --agent $agent' before the next restart"
+}
+
 bridge_linux_prepare_agent_isolation() {
   local agent="$1"
   local os_user="$2"
