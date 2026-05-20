@@ -325,7 +325,11 @@ function loadAccess(): Access {
 }
 
 function compactText(text: string): string {
-  return text.replace(/<at>[^<]+<\/at>/g, '').trim()
+  return text
+    .replace(/<at>[^<]+<\/at>/g, '')
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    .trim()
 }
 
 // Extract plain text from an HTML string. Used when Teams delivers the message
