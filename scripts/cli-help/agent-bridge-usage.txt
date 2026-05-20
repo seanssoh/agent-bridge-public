@@ -81,7 +81,7 @@ Usage:
   __CLI_NAME__ profile status [agent|--all]
   __CLI_NAME__ profile diff <agent>
   __CLI_NAME__ profile deploy <agent> [--dry-run] [--force]
-  __CLI_NAME__ agent create <agent> [--engine claude|codex] [--session <name>] [--workdir <path>] [--always-on] [--dry-run] [--json]
+  __CLI_NAME__ agent create <agent> [--engine claude|codex|antigravity] [--session <name>] [--workdir <path>] [--always-on] [--dry-run] [--json]
   __CLI_NAME__ agent list [--json]
   __CLI_NAME__ agent registry [--json]
   __CLI_NAME__ agent show <agent> [--json]
@@ -129,7 +129,7 @@ Usage:
   __CLI_NAME__ migrate workspace plan <agent>
   __CLI_NAME__ migrate workspace copy <agent> [--dry-run]
   __CLI_NAME__ migrate workspace cutover <agent> --dry-run
-  __CLI_NAME__ --codex|--claude --name <agent> [--loop] [--no-continue] [--workdir <dir>] [--replace] [--no-attach] [--no-project-skill] [--prefer wake|new|shared] [--test-fixture]
+  __CLI_NAME__ --codex|--claude|--antigravity --name <agent> [--loop] [--no-continue] [--workdir <dir>] [--replace] [--no-attach] [--no-project-skill] [--prefer wake|new|shared] [--test-fixture]
 
 Examples:
   __CLI_NAME__ status

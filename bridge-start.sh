@@ -355,6 +355,18 @@ SESSION="$(bridge_agent_session "$AGENT")"
 WORK_DIR="$(bridge_agent_workdir "$AGENT")"
 DEFAULT_WORK_DIR="$(bridge_agent_default_home "$AGENT")"
 ENGINE="$(bridge_agent_engine "$AGENT")"
+
+# Antigravity wave (Track A0): temporary no-launch guard. A0 makes every
+# public surface ACCEPT the `antigravity` engine (CLI flags, wave, static
+# create/update) but the launch path is not built yet. bridge-start.sh is
+# the single launch chokepoint — both the `agent-bridge` dynamic path
+# (which execs into here) and direct static starts pass through — so the
+# intermediate integration state fails loudly on every launch attempt.
+# Temporary guard — Track C1 removes it when the agy launch branch lands.
+if [[ "$ENGINE" == "antigravity" ]]; then
+  bridge_die "antigravity 엔진 런치 경로는 아직 준비되지 않았습니다 (C1 트랙 대기)"
+fi
+
 RUNNER="$SCRIPT_DIR/bridge-run.sh"
 ENV_PREFIX="$(bridge_export_env_prefix)"
 EFFECTIVE_CONTINUE_MODE="$(bridge_agent_continue "$AGENT")"

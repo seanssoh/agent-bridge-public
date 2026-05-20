@@ -17,7 +17,7 @@ bridge_load_roster
 usage() {
   cat <<EOF
 Usage:
-  agent-bridge wave dispatch <issue|brief-file> [--tracks A,B] [--main-agent <agent>] [--worker-engine claude|codex] [--reviewer <name>] [--dry-run] [--json]
+  agent-bridge wave dispatch <issue|brief-file> [--tracks A,B] [--main-agent <agent>] [--worker-engine claude|codex|antigravity] [--reviewer <name>] [--dry-run] [--json]
   agent-bridge wave list [--all] [--json]
   agent-bridge wave show <wave-id> [--json]
   agent-bridge wave templates

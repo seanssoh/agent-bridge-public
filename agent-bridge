@@ -393,7 +393,7 @@ if [[ $# -gt 0 ]]; then
             ADMIN_ARGS+=("$1")
             shift
             ;;
-          --name|--workdir|--codex|--claude)
+          --name|--workdir|--codex|--claude|--antigravity|--agy)
             bridge_die "'$CLI_NAME admin'은(는) 관리자 역할의 engine/workdir/name을 고정 사용합니다."
             ;;
           *)
@@ -969,6 +969,10 @@ while [[ $# -gt 0 ]]; do
       ENGINE="claude"
       shift
       ;;
+    --antigravity|--agy)
+      ENGINE="antigravity"
+      shift
+      ;;
     --name)
       [[ $# -lt 2 ]] && bridge_die "--name 뒤에 에이전트 이름을 지정하세요."
       NAME="$2"
@@ -1026,7 +1030,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$ENGINE" ]] && bridge_die "--codex 또는 --claude 중 하나를 지정하세요."
+[[ -z "$ENGINE" ]] && bridge_die "--codex, --claude, --antigravity 중 하나를 지정하세요."
 [[ -z "$NAME" ]] && bridge_die "--name은 필수입니다."
 
 if ! bridge_validate_agent_name "$NAME"; then

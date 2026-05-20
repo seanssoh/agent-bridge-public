@@ -18,7 +18,7 @@ If you are resuming development, read in this order:
 There are two kinds of agents:
 
 - Static roles: defined in `agent-roster.sh` or `agent-roster.local.sh`
-- Dynamic agents: created with `agent-bridge --codex|--claude --name ...`
+- Dynamic agents: created with `agent-bridge --codex|--claude|--antigravity --name ...`
 
 Static roles are optional. Fresh installs ship with an empty static roster.
 

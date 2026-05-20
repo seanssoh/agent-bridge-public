@@ -428,6 +428,38 @@ bridge_source_head() {
   git -C "$BRIDGE_SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null || printf '-'
 }
 
+# Antigravity wave (Track A0): the engine VALUE stored in the roster is not
+# always the on-disk binary name. `antigravity` is launched via the `agy`
+# binary; `claude`/`codex` happen to match. Every site that does
+# `command -v "$engine"` assuming value==binary must route through this so
+# the daemon/agents do not permanently skip an agy agent as
+# `engine-cli-missing:antigravity`.
+bridge_engine_binary_name() {
+  local engine="${1:-}"
+  case "$engine" in
+    antigravity) printf 'agy' ;;
+    claude) printf 'claude' ;;
+    codex) printf 'codex' ;;
+    # Unknown engine: echo the input unchanged so callers degrade safely
+    # (a `command -v` of an unknown token simply fails, as before).
+    *) printf '%s' "$engine" ;;
+  esac
+}
+
+# Antigravity wave (Track A0): normalize an operator-supplied engine token
+# to the canonical stored engine VALUE. `agy` and `gemini` are accepted
+# aliases for `antigravity`; `claude`/`codex` pass through. An unknown
+# token returns non-zero with an empty stdout so callers can `bridge_die`.
+bridge_normalize_engine() {
+  local engine="${1:-}"
+  case "$engine" in
+    antigravity|agy|gemini) printf 'antigravity' ;;
+    claude) printf 'claude' ;;
+    codex) printf 'codex' ;;
+    *) return 1 ;;
+  esac
+}
+
 # Expand a leading `~` or `~/...` to $HOME. Bash-native equivalent of
 # `pathlib.Path(p).expanduser()` for the agent-bridge path patterns the
 # roster actually uses (`~`, `~/foo`, `/abs/...`, or a relative path).

@@ -78,7 +78,7 @@ bridge_wave_dispatch() {
       --json)           json_out=1; shift ;;
       -h|--help)
         cat <<EOF
-agent-bridge wave dispatch <issue-or-brief> [--tracks A,B] [--main-agent <agent>] [--worker-engine claude|codex] [--reviewer <name>] [--repo-root <dir>] [--dry-run] [--json]
+agent-bridge wave dispatch <issue-or-brief> [--tracks A,B] [--main-agent <agent>] [--worker-engine claude|codex|antigravity] [--reviewer <name>] [--repo-root <dir>] [--dry-run] [--json]
 EOF
         return 0
         ;;
@@ -105,8 +105,8 @@ EOF
     fi
   fi
 
-  if [[ "$worker_engine" != "claude" && "$worker_engine" != "codex" ]]; then
-    bridge_die "wave dispatch: --worker-engine must be claude or codex (got: $worker_engine)"
+  if [[ "$worker_engine" != "claude" && "$worker_engine" != "codex" && "$worker_engine" != "antigravity" ]]; then
+    bridge_die "wave dispatch: --worker-engine must be claude, codex or antigravity (got: $worker_engine)"
   fi
 
   local helper
@@ -249,7 +249,7 @@ _bridge_wave_dispatch_member() {
   #   2: member_id (also used as the worker agent name; one-to-one)
   #   3: track
   #   4: main_agent
-  #   5: worker_engine (claude|codex)
+  #   5: worker_engine (claude|codex|antigravity)
   #   6: repo_root (absolute path to the source repo)
   #   7: brief_abs_path
   #   8: state_file

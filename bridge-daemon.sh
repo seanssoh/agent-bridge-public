@@ -5403,9 +5403,13 @@ process_on_demand_agents() {
         # failure once per backoff window. Operator log: `daemon_info`
         # (not bridge_warn) since this is an install-state issue,
         # not a daemon bug.
+        # Antigravity wave (Track A0): the engine VALUE is not always the
+        # on-disk binary (antigravity -> agy). Resolve through
+        # `bridge_resolve_engine_cli` so an agy agent is not permanently
+        # skipped as `engine-cli-missing:antigravity`.
         local _agent_engine
         _agent_engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
-        if [[ -n "$_agent_engine" ]] && ! command -v "$_agent_engine" >/dev/null 2>&1; then
+        if [[ -n "$_agent_engine" ]] && [[ -z "$(bridge_resolve_engine_cli "$_agent_engine")" ]]; then
           bridge_daemon_note_autostart_failure "$agent" "engine-cli-missing:$_agent_engine"
           daemon_info "auto-start skipped ${agent} — engine CLI '$_agent_engine' not on PATH"
           unset _agent_engine
