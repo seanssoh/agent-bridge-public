@@ -95,9 +95,14 @@ fi
 # Build a driver script that:
 #   1. exports the same v2 env the live runtime would have,
 #   2. sources bridge-lib.sh,
-#   3. extracts and sources just `bridge_scaffold_agent_home` (line
-#      385..613) + its small `bridge_agent_manage_python` /
-#      `bridge_render_template_string` deps from `bridge-agent.sh`,
+#   3. extracts and sources just `bridge_scaffold_agent_home` from
+#      `bridge-agent.sh` by FUNCTION NAME (`/^name() {/,/^}/`), not by
+#      hardcoded line ranges — line-range extraction silently truncated
+#      the function whenever `bridge-agent.sh` gained lines (e.g. the
+#      antigravity engine arms), producing a mid-`case` syntax error.
+#      `bridge_render_template_string` / `bridge_agent_manage_python`
+#      are no longer extracted: the former is stubbed below and the
+#      latter is only reachable through it, so neither is needed.
 #   4. stubs `bridge_render_template_string` to a no-op so the template
 #      loop does not depend on session-template lookup / python3 / etc.,
 #   5. calls scaffold with caller-provided isolation args and asserts on
@@ -119,11 +124,7 @@ write_driver_script() {
     'SCRIPT_DIR="$REPO_ROOT"' \
     'source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1' \
     'FUNC_TMP="$DRIVER_TMP_DIR/scaffold-funcs.sh"' \
-    '{' \
-    '  sed -n "128,139p" "$REPO_ROOT/bridge-agent.sh"' \
-    '  sed -n "188,257p" "$REPO_ROOT/bridge-agent.sh"' \
-    '  sed -n "385,613p" "$REPO_ROOT/bridge-agent.sh"' \
-    '} > "$FUNC_TMP"' \
+    'sed -n "/^bridge_scaffold_agent_home() {/,/^}/p" "$REPO_ROOT/bridge-agent.sh" > "$FUNC_TMP"' \
     'source "$FUNC_TMP"' \
     'declare -F bridge_scaffold_agent_home >/dev/null 2>&1 || { echo "DRIVER_FAIL: bridge_scaffold_agent_home not loaded"; exit 91; }' \
     '# Stub template renderer to a no-op so scaffold returns immediately' \
