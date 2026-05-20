@@ -724,6 +724,11 @@ DAILY_BACKUP_SQLITE_SNAPSHOT_TARGETS: tuple[tuple[str, str], ...] = (
 )
 
 DAILY_BACKUP_SNAPSHOT_DIR_REL = "state/backup-snapshots"
+# Issue #979: operator-facing persistent exclude config. One relpath per line,
+# `#`-prefixed and blank lines ignored. Read in addition to (union with) the
+# BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS env var and the hardcoded excludes — no
+# shell eval, so it's editable with a plain editor and survives upgrades.
+DAILY_BACKUP_EXCLUDES_CONF_REL = "state/daily-backup/excludes.conf"
 DAILY_BACKUP_LOCK_FILENAME = ".daily-backup.lock"
 DAILY_BACKUP_TMP_GLOB = "*.tgz.tmp.*"
 DAILY_BACKUP_FREE_SPACE_FLOOR_BYTES = 100 * 1024 * 1024  # 100 MiB
@@ -779,12 +784,42 @@ def _parse_extra_excluded_roots(value: str | None) -> list[tuple[str, ...]]:
     return parsed
 
 
+def _parse_excludes_conf_file(conf_path: Path) -> list[tuple[str, ...]]:
+    # Issue #979: parse the operator-facing excludes.conf — one relpath per
+    # line, `#`-prefixed lines and blank lines ignored, leading/trailing
+    # whitespace stripped. Each surviving line is normalized through
+    # `_parse_extra_excluded_roots` so it produces the same root tuples as the
+    # env var. A missing or unreadable file is treated as "no excludes".
+    try:
+        raw = conf_path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    except OSError:
+        return []
+    parsed: list[tuple[str, ...]] = []
+    for line in raw.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parsed.extend(_parse_extra_excluded_roots(stripped))
+    return parsed
+
+
 def resolve_daily_backup_excluded_roots(
     target_root: Path,
     backup_dir: Path,
     *,
     extra_excludes_env: str | None = None,
 ) -> list[tuple[str, ...]]:
+    # Excluded roots are the UNION of three sources, none of which overrides
+    # another (Issue #979):
+    #   1. DAILY_BACKUP_HARDCODED_ROOT_EXCLUDES — baked-in defaults.
+    #   2. BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS env var — one-shot / daemon-env.
+    #   3. <target_root>/state/daily-backup/excludes.conf — operator-facing
+    #      persistent config, the recommended way to set excludes permanently.
+    # The file path derives from target_root so isolated-BRIDGE_HOME tests and
+    # non-standard installs resolve it correctly. Order-equivalent duplicates
+    # are dropped while preserving first-seen order.
     excluded: list[tuple[str, ...]] = list(DAILY_BACKUP_HARDCODED_ROOT_EXCLUDES)
     try:
         relative_backup_dir = backup_dir.resolve().relative_to(target_root.resolve())
@@ -795,7 +830,17 @@ def resolve_daily_backup_excluded_roots(
     if extra_excludes_env is None:
         extra_excludes_env = os.environ.get("BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS", "")
     excluded.extend(_parse_extra_excluded_roots(extra_excludes_env))
-    return excluded
+    excluded.extend(
+        _parse_excludes_conf_file(target_root / DAILY_BACKUP_EXCLUDES_CONF_REL)
+    )
+    deduped: list[tuple[str, ...]] = []
+    seen: set[tuple[str, ...]] = set()
+    for parts in excluded:
+        if parts in seen:
+            continue
+        seen.add(parts)
+        deduped.append(parts)
+    return deduped
 
 
 def should_skip_daily_backup_relpath(
