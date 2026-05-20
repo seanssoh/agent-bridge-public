@@ -958,7 +958,7 @@ The contract itself is documented in source at
 | `$BRIDGE_DATA_ROOT/agents/<agent>/credentials/` | controller | `ab-agent-<agent>` | `2750` | controller writes, agent reads via group |
 | `$BRIDGE_DATA_ROOT/agents/<agent>/credentials/launch-secrets.env` | controller | `ab-agent-<agent>` | `0640` | |
 | `$BRIDGE_DATA_ROOT/agents/<agent>/agent-env.sh` | controller | `ab-agent-<agent>` | `0640` | |
-| `$BRIDGE_DATA_ROOT/agents/<agent>/workdir/.teams/.env`, `.../.ms365/.env` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `0640` | controller readiness probe reads via group |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/workdir/.<provider>/.env`, `access.json`, `state.json` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `0600` | isolated-UID owned; controller reads via passwordless sudo (BRIDGE_AGENT_SUDOERS) |
 | `/home/agent-bridge-<agent>/` (the agent's actual Linux home) | `agent-bridge-<agent>` | `agent-bridge-<agent>` | `0700` | **agent owns. No ACL of any kind.** |
 | `/home/agent-bridge-<agent>/.claude/`, sub-tree | `agent-bridge-<agent>` | `agent-bridge-<agent>` | `0700` | same — agent-only, no ACL |
 
@@ -1263,10 +1263,16 @@ layout with zero named-user ACL surface. Scope:
   - **channel symlink target dir**: chown `<isolated_user>`, chgrp
     `ab-agent-<name>`, chmod 2770 (setgid; new files inside inherit
     group + group rw).
+  - **channel dotenv/state files** (`.env`, `access.json`, `state.json`,
+    `mcp.json` under `workdir/.<provider>/`): chown `<isolated_user>`,
+    chmod 0600 — **no group read** (v3 contract, #998 PR B). Controller
+    reads via passwordless sudo (`BRIDGE_AGENT_SUDOERS`), not the group
+    bit. Run `agent-bridge migrate isolation v3 --check` to verify.
   - **bridge-run.sh launches**: `umask 007` is applied via
     `bridge_run_apply_v2_umask_if_needed` after `bridge_require_agent`,
-    so files created by the agent process tree land at 0660 with
-    correct group ownership.
+    so most files created by the agent process tree land at 0660 with
+    correct group ownership (channel dotenv/state files are excepted —
+    see above).
 
 - **No transitional exception (PR #641, v0.8.0 T2).** v0.7.x carried a
   single transitional exception for `~/.claude/.credentials.json` via

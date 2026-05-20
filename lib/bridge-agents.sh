@@ -3644,9 +3644,9 @@ bridge_linux_prepare_agent_isolation() {
   # entry that has a known state-dir helper, plant a root-owned symlink at
   # `$user_home/.claude/channels/<id>` -> `$workdir/.<id>/`. The symlink
   # itself is root-owned (the isolated UID cannot relink it elsewhere); the
-  # target dir is owned by the isolated UID and ACL'd for the controller via
-  # the existing workdir grants (see recursive_write_paths above), so file
-  # contents written through the link are visible to both sides.
+  # target dir is 2770/agent-group for traversal; dotenv/state files inside
+  # are 0600/isolated-UID (v3 contract). The controller reads them via
+  # passwordless sudo, not group visibility.
   local _ch_csv=""
   local _ch_token=""
   local _ch_id=""
@@ -3817,9 +3817,11 @@ bridge_linux_install_isolated_channel_symlink() {
   # v2 normalize block — applies whether $target was just created or
   # already existed. setgid (2770) ensures new files inside inherit
   # ab-agent-<name>; combined with the agent-launch umask 007 wired into
-  # bridge-run.sh (`bridge_run_apply_v2_umask_if_needed`), files created
-  # by the isolated process land at 0660/group=ab-agent-<name>, giving
-  # both controller and isolated UID rw access through the group contract.
+  # bridge-run.sh (`bridge_run_apply_v2_umask_if_needed`), most files
+  # created by the isolated process land at 0660/group=ab-agent-<name>.
+  # Exception: channel dotenv/state files (.env, access.json, etc.) land
+  # at 0600/isolated-UID (v3 contract); the controller reads them via
+  # passwordless sudo, not the group bit.
   # r4.4 TOCTOU guard: refuse to mutate a symlink even though `test -d`
   # earlier passed (a symlink-to-dir slips through that check).
   if bridge_linux_sudo_root test -L "$target"; then
@@ -5965,7 +5967,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:discord:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+      printf 'controller-blind:plugin:discord:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
         "$discord_dir" "$(bridge_channel_env_file_acl_diagnostic "$discord_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -5988,7 +5990,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:telegram:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+      printf 'controller-blind:plugin:telegram:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
         "$telegram_dir" "$(bridge_channel_env_file_acl_diagnostic "$telegram_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6011,7 +6013,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
         "$teams_dir" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6026,7 +6028,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
         "$teams_dir" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6049,7 +6051,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
         "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6064,7 +6066,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
         "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6079,7 +6081,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
         "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6103,7 +6105,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:mattermost:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) %s' \
+      printf 'controller-blind:plugin:mattermost:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
         "$mattermost_dir" "$(bridge_channel_env_file_acl_diagnostic "$mattermost_dir/.env" "$repair_attempts")"
       return 0
     fi

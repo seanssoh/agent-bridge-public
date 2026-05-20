@@ -168,7 +168,7 @@ chmod 600 "$F5"
 # --- C6: status mapping: controller-blind reason -> "unknown" ----------------
 step "C6: bridge_agent_channel_status returns 'unknown' for controller-blind reason"
 STUB_REQUIRED_CSV="plugin:discord"
-STUB_STATUS_REASON='controller-blind:plugin:discord:/some/path/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS or grant agent dotenv read via group ACL) {"mode":"600"}'
+STUB_STATUS_REASON='controller-blind:plugin:discord:/some/path/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) {"mode":"600"}'
 out="$(bridge_agent_channel_status agent-test)"
 if [[ "$out" == "unknown" ]]; then ok; else err "got '$out'"; fi
 
