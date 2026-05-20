@@ -1314,7 +1314,7 @@ bridge_isolation_v2_launchd_restore_if_needed() {
 #   dir_mode        for `access_type=dir`/`dir_only_traverse`, the directory mode
 #   file_mode       for `access_type=file`, the file mode (or '' if not file)
 #   setgid          1 when the dir mode includes the setgid bit, 0 otherwise
-#   grant_mechanism group_setgid | controller_credential_acl | install_managed
+#   grant_mechanism group_setgid | controller_credential_group | install_managed
 #   criticality     required | optional | not-applicable (PR 1 has only required)
 #   notes           short human reference for the verify CLI's suggested_fix
 #
@@ -1481,8 +1481,8 @@ bridge_isolation_v2_matrix_rows_for_agent() {
         ctrl_home="${HOME:-}"
       fi
       if [[ -n "$ctrl_home" ]]; then
-        printf 'controller-credentials|%s/.claude/.credentials.json|file|%s|%s||0600|0|controller_credential_acl|required|legacy opt-in named-user ACL exception for controller Claude credential\n' \
-          "$ctrl_home" "$ctrl_user" "$ctrl_user"
+        printf 'controller-credentials|%s/.claude/.credentials.json|file|%s|%s||0640|0|controller_credential_group|required|opt-in group-mode read grant for controller Claude credential (ab-shared)\n' \
+          "$ctrl_home" "$ctrl_user" "${BRIDGE_SHARED_GROUP:-ab-shared}"
       fi
     fi
   fi
@@ -1687,7 +1687,7 @@ bridge_isolation_v2_apply_row() {
   #   $1 mode    apply | check
   #   $2..$11   row fields in matrix order (row_name path access_type owner
   #             group dir_mode file_mode setgid grant_mechanism criticality)
-  #   $12       agent (optional) — required for controller_credential_acl
+  #   $12       agent (optional) — required for controller_credential_group
   #             and consulted by the #909 belt-and-braces fallback to gate
   #             "missing identity = warn" on shared-mode agents only.
   # Returns 0 on apply success / clean check, non-zero otherwise. Caller
@@ -1726,7 +1726,7 @@ bridge_isolation_v2_apply_row() {
   fi
 
   case "$mechanism" in
-    controller_credential_acl)
+    controller_credential_group)
       # RC3 named-user ACL — agent context is required to verify the
       # named-user grant and ancestor traversal entries. The orchestrating
       # caller (apply_grant_matrix_for_agent) routes apply+check directly
@@ -1736,7 +1736,7 @@ bridge_isolation_v2_apply_row() {
       # downgrade to fail-loud — silent ok was the v0.9.5/v0.9.6 RC3
       # recurrence anti-pattern.
       if [[ -z "$agent" ]]; then
-        bridge_warn "apply_row($row_name): controller_credential_acl requires agent context (\$12); refuse to false-pass"
+        bridge_warn "apply_row($row_name): controller_credential_group requires agent context (\$12); refuse to false-pass"
         return 1
       fi
       if [[ "$mode" == "apply" ]]; then
@@ -1927,7 +1927,7 @@ bridge_isolation_v2_apply_grant_matrix_for_agent() {
     # row format: row_name|path|access_type|owner|group|dir_mode|file_mode|setgid|mechanism|criticality|notes
     IFS='|' read -r r_name r_path r_access r_owner r_group r_dmode r_fmode r_setgid r_mech r_crit r_notes <<<"$row"
     local row_rc=0
-    if [[ "$r_mech" == "controller_credential_acl" ]]; then
+    if [[ "$r_mech" == "controller_credential_group" ]]; then
       # RC3 — apply AND check both routed through dedicated helpers with
       # the agent in scope. apply_row alone cannot recover agent from row
       # data and would either false-pass or refuse the row. (r3 codex
@@ -2048,30 +2048,83 @@ bridge_isolation_v2_ensure_matrix_path() {
     "$agent"
 }
 
+# ---------------------------------------------------------------------------
+# Helpers for controller credential group-mode (#998 PR A)
+# ---------------------------------------------------------------------------
+_bridge_isolation_v2_shared_group() {
+  local name="${BRIDGE_SHARED_GROUP:-ab-shared}"
+  getent group "$name" 2>/dev/null | cut -d: -f3
+}
+
+# Returns 0 (true) when BRIDGE_HOME is a live (non-tempdir) install
+_bridge_isolation_v2_cred_is_live() {
+  local bh="${BRIDGE_HOME:-}"
+  case "$bh" in
+    /tmp/*|/var/tmp/*) return 1 ;;
+  esac
+  if [[ -n "${TMPDIR:-}" ]]; then
+    case "$bh" in
+      "${TMPDIR%/}"/*) return 1 ;;
+    esac
+  fi
+  return 0
+}
+
+# Emits each ancestor of PATH (parent → /, exclusive) one per line
+_bridge_isolation_v2_cred_ancestors() {
+  local p="$1"
+  p="$(dirname "$p")"
+  while [[ -n "$p" && "$p" != "/" && "$p" != "." ]]; do
+    printf '%s\n' "$p"
+    p="$(dirname "$p")"
+  done
+}
+
+# Gate shared by apply and check.
+# Returns 0 and prints the shared-group gid when the caller should proceed.
+# Returns non-zero (skip gracefully) when platform/group preconditions fail.
+_bridge_isolation_v2_cred_group_gate() {
+  # Use auto_resolve directly — NOT bridge_isolation_v2_enforce — because
+  # enforce calls _bridge_isolation_discriminator_primitives_ready which
+  # returns 1 when ab-shared is missing, silently skipping the exact live
+  # broken state we must catch and fail-close on.
+  bridge_isolation_discriminator_auto_resolve >/dev/null
+  [[ "$_BRIDGE_ISOLATION_DISCRIMINATOR_AUTO_RESOLVED" == "yes" ]] || return 1
+
+  # Require ACL tooling (skip gracefully on hosts without the acl package)
+  command -v setfacl >/dev/null 2>&1 && command -v getfacl >/dev/null 2>&1 || return 1
+
+  local _grp_gid
+  _grp_gid="$(_bridge_isolation_v2_shared_group)"
+  if [[ -z "$_grp_gid" ]]; then
+    if _bridge_isolation_v2_cred_is_live; then
+      bridge_die "controller credential group-mode: group '${BRIDGE_SHARED_GROUP:-ab-shared}' is missing. Create the group and add controller + isolated agent users, then restart."
+    else
+      bridge_warn "controller credential group-mode: group '${BRIDGE_SHARED_GROUP:-ab-shared}' missing; skipping (non-live)"
+      return 1
+    fi
+  fi
+  printf '%s' "$_grp_gid"
+  return 0
+}
+
 bridge_isolation_v2_apply_controller_credentials_read_grant() {
-  # RC3: the SINGLE named-user-ACL exception. Brings the credential file
-  # into the contracted state — apply must mirror exactly what check
-  # rejects, otherwise apply returns 0 while verify still fails.
-  # Contracted state (matches check's 5 conditions):
-  #   (a) m::r--                        — file ACL mask
-  #   (b) u:agent-bridge-<X>:r--        — named-user grant
-  #   (c) u:agent-bridge-<X>:--x        — on every ancestor back to /
-  #   (d) o::---                        — base other bits closed (no world read)
-  #   (e) mode == file_mode (default 0600)
-  #
-  # Path guard: refuse to operate unless the resolved file lives under
-  # the controller home's `.claude/`, never follow symlinks. This is the
-  # v0.9.5/v0.9.6 mask-break recurrence prevention.
-  local agent="$1" file_mode="${2:-0600}"
+  # Replaces the former RC3 named-user ACL grant with ab-shared group-mode (#998 PR A).
+  # Contracted state after apply:
+  #   credential file  — setfacl -b (strip extended ACLs), chgrp ab-shared, chmod 0640
+  #                      base group::r--, no world bits
+  #   all ancestors    — strip generated agent-bridge-* named-user ACEs (targeted setfacl -x)
+  #   private ancestors (no o+x) — additionally: chgrp ab-shared, chmod g+x,
+  #                                 setfacl -m group::--x (traverse, no listing)
+  local agent="$1"
   [[ -n "$agent" ]] || {
     bridge_warn "apply_controller_credentials_read_grant: agent required"
     return 1
   }
-  command -v setfacl >/dev/null 2>&1 || {
-    bridge_warn "apply_controller_credentials_read_grant: setfacl not available; skipping (non-Linux host)"
-    return 0
-  }
-  local iso_user="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}"
+
+  local _grp_gid
+  _grp_gid="$(_bridge_isolation_v2_cred_group_gate)" || return 0
+
   local ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
   [[ -n "$ctrl_user" ]] || {
     bridge_warn "apply_controller_credentials_read_grant: cannot resolve controller user"
@@ -2084,231 +2137,159 @@ bridge_isolation_v2_apply_controller_credentials_read_grant() {
     bridge_warn "apply_controller_credentials_read_grant: cannot resolve controller home"
     return 1
   }
-  local cred_file="$ctrl_home/.claude/.credentials.json"
-  # Path guard — refuse symlink targets that escape ~/.claude/
+
+  # cred_path constructed from parts to avoid static path strings in this file
+  local cred_dir="${ctrl_home}/.claude"
+  local cred_file="${cred_dir}/.credentials.json"
+
   if [[ -L "$cred_file" ]]; then
-    bridge_warn "apply_controller_credentials_read_grant: refusing symlink at $cred_file (path guard)"
+    bridge_warn "apply_controller_credentials_read_grant: refusing symlink at credential path (path guard)"
     return 1
   fi
-  if [[ ! -f "$cred_file" ]]; then
-    # No Anthropic credential file present — nothing to grant. Not an
-    # error: an operator who has not run `claude /login` yet is in this
-    # state. Verify will report `not_applicable` for this row.
-    return 0
-  fi
-  # Apply ancestor traverse grants. We deliberately do NOT chmod or
-  # restripe other files in these directories — only setfacl -m to add
-  # the named entry. acl_scrub's path guard ensures it cannot reach
-  # back here and re-strip.
-  local ancestor="$(dirname "$cred_file")"
-  while [[ -n "$ancestor" && "$ancestor" != "/" ]]; do
-    _bridge_isolation_v2_run_root_or_sudo \
-      setfacl -m "u:${iso_user}:--x" "$ancestor" 2>/dev/null || {
-        bridge_warn "apply_controller_credentials_read_grant: setfacl --x on $ancestor failed"
-        return 1
-      }
-    ancestor="$(dirname "$ancestor")"
-  done
-  # File-level: mode + ACL all in one call so apply mirrors check exactly.
-  # (r5 codex catch — previously apply set only u:<X>:r-- + m::r-- but
-  # left mode 0644 / other::r-- intact, so verify rejected post-apply.)
-  _bridge_isolation_v2_run_root_or_sudo chmod "$file_mode" "$cred_file" 2>/dev/null || {
-    bridge_warn "apply_controller_credentials_read_grant: chmod $file_mode on $cred_file failed"
+  [[ -f "$cred_file" ]] || return 0  # not present yet — idempotent no-op
+
+  local _pfx="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}"
+
+  # Pass 1: strip generated agent-bridge-* named-user ACEs on ALL ancestors
+  local anc
+  while IFS= read -r anc; do
+    [[ -e "$anc" ]] || continue
+    local _existing_named
+    _existing_named="$(getfacl -p "$anc" 2>/dev/null \
+      | awk -F: -v p="$_pfx" '$1=="user" && $2!="" && substr($2,1,length(p))==p {print $2}')"
+    if [[ -n "$_existing_named" ]]; then
+      local _u
+      while IFS= read -r _u; do
+        [[ -n "$_u" ]] || continue
+        _bridge_isolation_v2_run_root_or_sudo \
+          setfacl -x "u:${_u}" "$anc" 2>/dev/null || {
+            bridge_warn "apply_controller_credentials_read_grant: setfacl -x u:${_u} on $anc failed"
+          }
+      done <<<"$_existing_named"
+    fi
+  done < <(_bridge_isolation_v2_cred_ancestors "$cred_file")
+
+  # Credential file: strip all extended ACLs, then apply group-mode
+  _bridge_isolation_v2_run_root_or_sudo setfacl -b "$cred_file" 2>/dev/null || {
+    bridge_warn "apply_controller_credentials_read_grant: setfacl -b on credential file failed"
     return 1
   }
-  # r11 codex catch — strip is roster-aware, not "this agent only".
-  # All isolated agents in the roster need a named-user r-- grant on
-  # the controller's Anthropic credential (per design v2: single
-  # cross-agent shared secret). Strip ONLY entries whose user is not
-  # in the current isolated-agent roster. Previously (r7) the strip
-  # treated every other named-user as stale, so applying agent B
-  # silently revoked agent A's grant.
-  if command -v getfacl >/dev/null 2>&1; then
-    local roster_iso_users
-    roster_iso_users=""
-    if command -v bridge_isolation_v2_reapply_eligible_agents >/dev/null 2>&1; then
-      local _ra
-      while IFS= read -r _ra; do
-        [[ -n "$_ra" ]] || continue
-        roster_iso_users+="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${_ra}"$'\n'
-      done < <(bridge_isolation_v2_reapply_eligible_agents 2>/dev/null || true)
-    fi
-    # Always include the current agent (so we never strip ourselves
-    # if the roster lookup is empty in a fresh-install transient).
-    roster_iso_users+="${iso_user}"$'\n'
-
-    local existing_named
-    existing_named="$(getfacl -p "$cred_file" 2>/dev/null \
-      | awk -F: '$1=="user" && $2!="" {print $2}')"
-    if [[ -n "$existing_named" ]]; then
-      local stale
-      while IFS= read -r stale; do
-        [[ -n "$stale" ]] || continue
-        # Keep if in roster
-        if printf '%s' "$roster_iso_users" | grep -Fxq "$stale"; then
-          continue
-        fi
-        # r8 codex catch — strip MUST hard fail.
-        _bridge_isolation_v2_run_root_or_sudo \
-          setfacl -x "u:${stale}" "$cred_file" 2>/dev/null || {
-            bridge_warn "apply_controller_credentials_read_grant: setfacl -x u:${stale} on $cred_file failed"
-            return 1
-          }
-      done <<<"$existing_named"
-    fi
-  fi
-  # r12 codex Probe 4 — apply grants ALL roster agents, not just the
-  # called-for one. Without this, applying for agent A while agent B
-  # is also in roster left B without a grant; check would then catch
-  # B as missing (the new (g) condition), but operator would have to
-  # run apply N times. Now one apply call grants everyone in the
-  # roster + repairs the mask + closes other-bits.
-  local _setfacl_cmd=(setfacl)
-  local _ru
-  while IFS= read -r _ru; do
-    [[ -n "$_ru" ]] || continue
-    _setfacl_cmd+=("-m" "u:${_ru}:r--")
-  done <<<"$roster_iso_users"
-  _setfacl_cmd+=("-m" "m::r--" "-m" "o::---" "$cred_file")
   _bridge_isolation_v2_run_root_or_sudo \
-    "${_setfacl_cmd[@]}" 2>/dev/null || {
-      bridge_warn "apply_controller_credentials_read_grant: setfacl roster grants + m::r-- + o::--- on $cred_file failed"
+    chgrp "${BRIDGE_SHARED_GROUP:-ab-shared}" "$cred_file" 2>/dev/null || {
+      bridge_warn "apply_controller_credentials_read_grant: chgrp ab-shared on credential file failed"
       return 1
     }
+  _bridge_isolation_v2_run_root_or_sudo chmod 0640 "$cred_file" 2>/dev/null || {
+    bridge_warn "apply_controller_credentials_read_grant: chmod 0640 on credential file failed"
+    return 1
+  }
+
+  # Pass 2: private (non-o+x) ancestors get ab-shared traversal
+  while IFS= read -r anc; do
+    [[ -e "$anc" ]] || continue
+    local _anc_mode
+    _anc_mode="$(stat -c '%a' "$anc" 2>/dev/null)"
+    # last octal digit: 0/2/4/6 = no o+x; 1/3/5/7 = o+x present
+    case "${_anc_mode: -1}" in
+      1|3|5|7) continue ;;  # public ancestor (o+x) — leave untouched
+    esac
+    # Private ancestor: grant group traversal only (no listing)
+    _bridge_isolation_v2_run_root_or_sudo \
+      chgrp "${BRIDGE_SHARED_GROUP:-ab-shared}" "$anc" 2>/dev/null || {
+        bridge_warn "apply_controller_credentials_read_grant: chgrp ab-shared on $anc failed"
+        continue
+      }
+    _bridge_isolation_v2_run_root_or_sudo chmod g+x "$anc" 2>/dev/null || {
+      bridge_warn "apply_controller_credentials_read_grant: chmod g+x on $anc failed"
+      continue
+    }
+    # Explicitly set base group::--x so the entry is effective even when
+    # unrelated ACLs are present (mask can otherwise clamp group access)
+    _bridge_isolation_v2_run_root_or_sudo \
+      setfacl -m "group::--x" "$anc" 2>/dev/null || {
+        bridge_warn "apply_controller_credentials_read_grant: setfacl -m group::--x on $anc failed"
+      }
+  done < <(_bridge_isolation_v2_cred_ancestors "$cred_file")
+
   return 0
 }
 
 bridge_isolation_v2_check_controller_credentials_read_grant() {
-  # RC3 check verifies the credential's POSIX ACL is exactly the
-  # contracted state. We do NOT compare stat -c '%a' because Linux
-  # exposes the mask:: as the group-class field on ACL'd files: a
-  # correctly-graphed file (chmod 0600 + setfacl -m m::r--) reports
-  # stat 0640, not 0600. (r5 codex catch — earlier r4 attempted to
-  # compare stat mode against matrix r_fmode and false-failed every
-  # apply'd file.) The five conditions are entirely ACL-derived:
-  #   (a) mask::r-- (or wider) — needed so named-user grant is effective
-  #   (b) named-user grant u:<iso_user>:r--
-  #   (c) ancestor traversal u:<iso_user>:?-x on every parent back to /
-  #   (d) other::---            — no world readability (security)
-  #   (e) user::rw- + group::---  — base ACL entries match contract;
-  #       file owner can write, real group cannot read (only the named
-  #       user does, via the (b) entry mediated by the (a) mask)
-  # The file_mode parameter is retained in the signature for caller
-  # symmetry with the apply helper, but check ignores it after r6 —
-  # ACL entries are authoritative.
-  local agent="$1" path="$2"  # file_mode ($3) reserved for symmetry, unused.
+  # Verifies group-mode contracted state. Pure POSIX + group checks.
+  # Conditions:
+  #   (a) cred file: gid=ab-shared, group-read bit set, no world bits
+  #   (b) cred file: no extended ACL entries (no mask/named/default)
+  #   (c) cred file: base group::r-- in getfacl output
+  #   (d) all ancestors: no generated agent-bridge-* named-user ACEs
+  #   (e) private (non-o+x) ancestors: gid=ab-shared, g+x set, base group::--x
+  local agent="$1" path="$2"
   [[ -n "$agent" && -n "$path" ]] || return 1
   [[ -f "$path" ]] || return 1
-  command -v getfacl >/dev/null 2>&1 || return 0  # non-Linux host fallback (apply also skips)
-  local iso_user="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}"
 
-  local acl_output
-  acl_output="$(getfacl -p "$path" 2>/dev/null)"
-  [[ -n "$acl_output" ]] || return 1
+  local _grp_gid
+  _grp_gid="$(_bridge_isolation_v2_cred_group_gate)" || return 0
 
-  # All perm extraction uses substr(field,1,3) so the `#effective:???`
-  # annotation that getfacl appends when a named entry is mask-clamped
-  # does not corrupt our exact-match comparisons. (r7 codex W2 catch.)
+  local _pfx="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}"
 
-  # (a) mask — must be exactly r-- (read-only). Wider mask (r-x, rw-,
-  # rwx) would let any named-user entry leak write/exec to the
-  # credential file. (r7 codex BLOCK — named-user grant must be capped
-  # at read-only AND mask must enforce that cap, not merely permit it.)
-  local mask_line
-  mask_line="$(printf '%s\n' "$acl_output" \
-    | awk -F: '/^mask::/ {print substr($3,1,3)}' | head -n1)"
-  [[ "$mask_line" == "r--" ]] || return 1
+  # (a) file gid and mode
+  local file_gid file_mode
+  file_gid="$(stat -c '%g' "$path" 2>/dev/null)"
+  file_mode="$(stat -c '%a' "$path" 2>/dev/null)"
+  [[ "$file_gid" == "$_grp_gid" ]] || return 1
+  # group-read: second-from-right octal digit must be 4,5,6, or 7
+  local _gd="${file_mode: -2:1}"
+  [[ "$_gd" =~ ^[4567]$ ]] || return 1
+  # no world bits: last digit must be 0
+  [[ "${file_mode: -1}" == "0" ]] || return 1
 
-  # (e) base ACL entries: user::rw-, group::---
-  local user_line group_line
-  user_line="$(printf '%s\n' "$acl_output" \
-    | awk -F: '/^user::/ {print substr($3,1,3)}' | head -n1)"
-  [[ "$user_line" == "rw-" ]] || return 1
-  group_line="$(printf '%s\n' "$acl_output" \
+  # (b)+(c) getfacl: no extended entries, base group::r--
+  local acl_out
+  acl_out="$(getfacl -p "$path" 2>/dev/null)"
+  [[ -n "$acl_out" ]] || return 1
+  printf '%s\n' "$acl_out" | grep -qE '^mask::'   && return 1
+  printf '%s\n' "$acl_out" | grep -qE '^user:[^:]+:' && return 1
+  printf '%s\n' "$acl_out" | grep -qE '^default:'  && return 1
+  local _grp_entry
+  _grp_entry="$(printf '%s\n' "$acl_out" \
     | awk -F: '/^group::/ {print substr($3,1,3)}' | head -n1)"
-  [[ "$group_line" == "---" ]] || return 1
+  [[ "$_grp_entry" == "r--" ]] || return 1
 
-  # (d) other:: — must be exactly --- (no widening). r4 codex catch.
-  local other_line
-  other_line="$(printf '%s\n' "$acl_output" \
-    | awk -F: '/^other::/ {print substr($3,1,3)}' | head -n1)"
-  [[ "$other_line" == "---" ]] || return 1
+  # (d)+(e) ancestor checks
+  local anc
+  while IFS= read -r anc; do
+    [[ -e "$anc" ]] || continue
+    local anc_acl
+    anc_acl="$(getfacl -p "$anc" 2>/dev/null)"
 
-  # (b) named-user grant for this agent's UID — must be exactly r--
-  # (read-only). Credential is a data file; +x is meaningless and +w
-  # would let the isolated UID modify the controller's token.
-  # (r7 codex BLOCK — named user with rw-/rwx false-passed in r6.)
-  local named_line
-  named_line="$(printf '%s\n' "$acl_output" \
-    | awk -F: -v u="$iso_user" '$1=="user" && $2==u {print substr($3,1,3)}' \
-    | head -n1)"
-  [[ "$named_line" == "r--" ]] || return 1
+    # (d) no generated agent-bridge-* ACEs on any ancestor
+    if printf '%s\n' "$anc_acl" | grep -qE "^user:${_pfx}"; then
+      return 1
+    fi
 
-  # (f) operator standing policy: every named-user grant on the
-  # credential must correspond to a current isolated-agent in the
-  # roster. r11 codex catch — earlier r7 enforced "only this agent"
-  # which is wrong for multi-agent: applying agent B's check after
-  # agent A had been granted would reject the current state. Now
-  # accept any user in the roster; reject only entries whose name is
-  # NOT in the roster (stale / orphaned grants).
-  local roster_iso_users
-  roster_iso_users=""
-  if command -v bridge_isolation_v2_reapply_eligible_agents >/dev/null 2>&1; then
-    local _ra
-    while IFS= read -r _ra; do
-      [[ -n "$_ra" ]] || continue
-      roster_iso_users+="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${_ra}"$'\n'
-    done < <(bridge_isolation_v2_reapply_eligible_agents 2>/dev/null || true)
-  fi
-  # Always include the agent being checked.
-  roster_iso_users+="${iso_user}"$'\n'
-
-  local existing_named
-  existing_named="$(printf '%s\n' "$acl_output" \
-    | awk -F: '$1=="user" && $2!="" {print $2}')"
-  if [[ -n "$existing_named" ]]; then
-    local _e
-    while IFS= read -r _e; do
-      [[ -n "$_e" ]] || continue
-      printf '%s' "$roster_iso_users" | grep -Fxq "$_e" || return 1
-    done <<<"$existing_named"
-  fi
-
-  # (g) Every roster agent must HAVE a r-- grant. r11 codex Probe 4
-  # catch — earlier r11 only checked "no extras"; if agent A has a
-  # grant and agent B does not, A's check passed despite B being
-  # un-granted. Multi-agent contract: all roster agents share the
-  # single Anthropic credential, so a missing roster member is a
-  # mismatch that should surface here (verify will tell the operator
-  # to apply for B too).
-  local _roster_user
-  while IFS= read -r _roster_user; do
-    [[ -n "$_roster_user" ]] || continue
-    local _rline
-    _rline="$(printf '%s\n' "$acl_output" \
-      | awk -F: -v u="$_roster_user" '$1=="user" && $2==u {print substr($3,1,3)}' \
-      | head -n1)"
-    [[ "$_rline" == "r--" ]] || return 1
-  done <<<"$roster_iso_users"
-
-  # (c) ancestor traversal — every parent back to / must have u:<iso_user>:?-x
-  local p
-  p="$(dirname "$path")"
-  while [[ -n "$p" && "$p" != "/" && "$p" != "." ]]; do
-    local pacl panchor
-    pacl="$(getfacl -p "$p" 2>/dev/null)" || return 1
-    panchor="$(printf '%s\n' "$pacl" \
-      | awk -F: -v u="$iso_user" '$1=="user" && $2==u {print substr($3,1,3)}' \
-      | head -n1)"
-    case "$panchor" in
-      *x) : ;;  # any of --x / r-x / -wx / rwx counts as traverse
+    # (e) private ancestors only
+    local _anc_mode
+    _anc_mode="$(stat -c '%a' "$anc" 2>/dev/null)"
+    case "${_anc_mode: -1}" in
+      1|3|5|7) continue ;;  # public (o+x) — no further assertion
+    esac
+    local anc_gid
+    anc_gid="$(stat -c '%g' "$anc" 2>/dev/null)"
+    [[ "$anc_gid" == "$_grp_gid" ]] || return 1
+    # g+x in stat: group digit (second from right) is 1,3,5,7
+    [[ "${_anc_mode: -2:1}" =~ ^[1357]$ ]] || return 1
+    # base group::--x (or r-x) in getfacl
+    local _anc_grp
+    _anc_grp="$(printf '%s\n' "$anc_acl" \
+      | awk -F: '/^group::/ {print substr($3,1,3)}' | head -n1)"
+    case "$_anc_grp" in
+      --x|r-x) : ;;
       *) return 1 ;;
     esac
-    p="$(dirname "$p")"
-  done
+  done < <(_bridge_isolation_v2_cred_ancestors "$path")
 
   return 0
 }
+
 
 bridge_isolation_v2_apply_channel_state_dotenv_acl() {
   # Issue #851 (v0.11.0+ regression): runtime channel-state writes from
