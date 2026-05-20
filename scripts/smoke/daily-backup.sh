@@ -326,6 +326,38 @@ step_path_part_excludes_multicomponent() {
   smoke_log "path-part excludes OK ($result)"
 }
 
+# issue #979 — operator-facing persistent exclude config. The resolver
+# must read state/daily-backup/excludes.conf (one relpath per line, `#`
+# comments + blank lines ignored) and UNION it with the env var and the
+# hardcoded excludes — none overrides another.
+step_excludes_conf_file() {
+  smoke_log "step 9: excludes.conf persistent config (#979 regression)"
+  setup_bridge_home
+
+  mkdir -p "$BRIDGE_HOME/state/daily-backup"
+  # One relpath per line + a `#` comment + a blank line. The commented
+  # path must not leak into the resolved excludes.
+  {
+    printf '# regenerable plugin caches — see issue #974/#979\n'
+    printf 'agents/patch/home/.claude/plugins/cache\n'
+    printf '\n'
+    printf '   state/huge-regenerable   \n'
+    printf '# commented/out/path\n'
+  } >"$BRIDGE_HOME/state/daily-backup/excludes.conf"
+
+  # Helper extracted to its own .py file to avoid heredoc-in-command-
+  # substitution (Footgun #11 ratchet — see lib/upgrade-helpers/).
+  local result
+  result="$(python3 "$SCRIPT_DIR/daily-backup-excludes-conf-test.py" \
+    "$SMOKE_REPO_ROOT/bridge-upgrade.py" "$BRIDGE_HOME" 2>&1)" \
+    || smoke_fail "excludes.conf resolver failed: $result"
+
+  if [[ "$result" != PASS* ]]; then
+    smoke_fail "excludes.conf resolver unexpected output: $result"
+  fi
+  smoke_log "excludes_conf_file OK ($result)"
+}
+
 main() {
   smoke_log "starting issue #507 regression smoke"
   step_snapshot_content
@@ -336,6 +368,7 @@ main() {
   step_cleanup_residue_happy_path
   step_timeout_resolution
   step_path_part_excludes_multicomponent
+  step_excludes_conf_file
   smoke_log "all daily-backup checks passed"
 }
 
