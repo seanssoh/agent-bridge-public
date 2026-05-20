@@ -2223,7 +2223,7 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
   #   (c) cred file: base group::r-- in getfacl output
   #   (d) all ancestors: no generated agent-bridge-* named-user ACEs
   #   (e) private (non-o+x) ancestors: gid=ab-shared, g+x set, base group::--x
-  local agent="$1" path="$2"
+  local agent="$1" path="$2" file_mode="${3:-0640}"
   [[ -n "$agent" && -n "$path" ]] || return 1
   [[ -f "$path" ]] || return 1
 
@@ -2246,16 +2246,20 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
 
   local _pfx="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}"
 
-  # (a) file gid and mode
-  local file_gid file_mode
+  # (a) file gid and EXACT mode. apply chmods the credential to exactly
+  # $file_mode (matrix default 0640); check must reject any widened mode
+  # (0660 group-write, 0670/0770 group/owner-exec, etc.) — a loose
+  # "group-read bit set + no world bits" test false-passes those and
+  # re-opens the RC3 apply/verify-divergence recurrence (#778/#441/...).
+  local file_gid file_mode_actual
   file_gid="$(stat -c '%g' "$path" 2>/dev/null)"
-  file_mode="$(stat -c '%a' "$path" 2>/dev/null)"
+  file_mode_actual="$(stat -c '%a' "$path" 2>/dev/null)"
   [[ "$file_gid" == "$_grp_gid" ]] || return 1
-  # group-read: second-from-right octal digit must be 4,5,6, or 7
-  local _gd="${file_mode: -2:1}"
-  [[ "$_gd" =~ ^[4567]$ ]] || return 1
-  # no world bits: last digit must be 0
-  [[ "${file_mode: -1}" == "0" ]] || return 1
+  # normalize both to canonical octal (strips leading-zero / width diffs)
+  local _exp_mode _got_mode
+  _exp_mode="$(printf '%o' "$((8#${file_mode#0}))" 2>/dev/null || printf '%s' "${file_mode#0}")"
+  _got_mode="$(printf '%o' "$((8#${file_mode_actual:-0}))" 2>/dev/null || printf '%s' "$file_mode_actual")"
+  [[ -n "$_got_mode" && "$_got_mode" == "$_exp_mode" ]] || return 1
 
   # (b)+(c) getfacl: no extended entries, base group::r--
   local acl_out
