@@ -341,12 +341,9 @@ sudo chown -R "$USER:$USER" "$LINUX_HOME"
 sudo chmod -R u+rwX,go-rwx "$LINUX_HOME"
 sudo setfacl -bR "$LINUX_HOME"
 
-# 2. Realign plugin readiness state files to the v2 group-read contract
-#    (controller readiness probe reads via the per-agent group).
-for f in "$BRIDGE_DATA_ROOT/agents/$A/workdir/.teams/.env" \
-         "$BRIDGE_DATA_ROOT/agents/$A/workdir/.ms365/.env"; do
-  [[ -f "$f" ]] && sudo chgrp "$GROUP" "$f" && sudo chmod 0640 "$f"
-done
+# 2. Realign plugin state files to v3 isolated-UID-owned 0600 contract.
+#    (controller accesses via passwordless sudo, not group read).
+agent-bridge migrate isolation v3 --apply --agent "$A"
 
 # 3. Create the controller-side .claude/ shadow if missing.
 sudo install -d -o "$CTRL" -g "$CTRL" -m 0700 \

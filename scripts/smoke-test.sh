@@ -11126,13 +11126,19 @@ bash "$REPO_ROOT/scripts/test-stale-resume.sh"
 log "running channel-probe-isolated regression suite (issue #832)"
 bash "$REPO_ROOT/scripts/test-channel-probe-isolated.sh"
 
-# Issue #851 — runtime channel dotenv ACL mask reverts to --- after plugin
-# writes inherit the controller umask. Pins the new self-heal helper
-# bridge_isolation_v2_apply_channel_state_dotenv_acl that the daemon health
-# loop + pre-launch path call when an isolated agent's dotenv flips to
-# auth=unreadable.
-log "running channel-dotenv-mask-repair regression suite (issue #851)"
-bash "$REPO_ROOT/scripts/test-channel-dotenv-mask-repair.sh"
+# Issue #998 PR B — the ACL stop-gap helper
+# bridge_isolation_v2_apply_channel_state_dotenv_acl has been retired. Pin
+# that the function no longer exists in the isolation-v2 module and that the
+# v3 channel-dotenv CLI entry point is present.
+log "smoke: v3 channel-dotenv contract — stop-gap retired, v3 CLI present"
+if grep -q 'bridge_isolation_v2_apply_channel_state_dotenv_acl[[:space:]]*(' \
+    "$REPO_ROOT/lib/bridge-isolation-v2.sh" 2>/dev/null; then
+  fatal "stop-gap bridge_isolation_v2_apply_channel_state_dotenv_acl still defined in bridge-isolation-v2.sh"
+fi
+if ! grep -q 'bridge_isolation_v3_channel_dotenv_cli[[:space:]]*()' \
+    "$REPO_ROOT/lib/bridge-isolation-v3-channel-dotenv.sh" 2>/dev/null; then
+  fatal "bridge_isolation_v3_channel_dotenv_cli not found in bridge-isolation-v3-channel-dotenv.sh"
+fi
 
 # Issue #831 — usage monitor must read each Claude agent's own usage cache
 # (per-agent latching), not just the controller's $HOME. Without this, two

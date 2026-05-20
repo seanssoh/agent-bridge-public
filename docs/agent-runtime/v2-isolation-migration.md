@@ -43,7 +43,7 @@ backing Linux UID is `agent-bridge-<agent>`, its private group is
 | `$BRIDGE_DATA_ROOT/agents/<agent>/credentials/` | controller | `ab-agent-<agent>` | `2750` | controller writes, agent reads |
 | `$BRIDGE_DATA_ROOT/agents/<agent>/credentials/launch-secrets.env` | controller | `ab-agent-<agent>` | `0640` | |
 | `$BRIDGE_DATA_ROOT/agents/<agent>/agent-env.sh` | controller | `ab-agent-<agent>` | `0640` | |
-| `$BRIDGE_DATA_ROOT/agents/<agent>/workdir/.teams/.env`, `.../.ms365/.env` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `0640` | controller readiness probe via group |
+| `$BRIDGE_DATA_ROOT/agents/<agent>/workdir/.<provider>/.env`, `access.json`, `state.json` | `agent-bridge-<agent>` | `ab-agent-<agent>` | `0600` | isolated-UID owned; controller reads via sudo (v3 contract) |
 | `/home/agent-bridge-<agent>/` | `agent-bridge-<agent>` | `agent-bridge-<agent>` | `0700` | agent's actual Linux home, no ACL |
 | `/home/agent-bridge-<agent>/.claude/`, sub-tree | `agent-bridge-<agent>` | `agent-bridge-<agent>` | `0700` | same — no ACL |
 
@@ -113,22 +113,24 @@ controller ACL and reports false-positive drift.
 ~/.agent-bridge/agents/<agent>/workdir/.ms365/.env       <controller>:<controller>  0600
 ```
 
-**v2 expects**:
+**v3 contract expects** (v0.13.4+, #857/#998):
 
 ```text
-~/.agent-bridge/agents/<agent>/workdir/.teams/.env   agent-bridge-<agent>:ab-agent-<agent>  0640
-~/.agent-bridge/agents/<agent>/workdir/.ms365/.env   agent-bridge-<agent>:ab-agent-<agent>  0640
+~/.agent-bridge/agents/<agent>/workdir/.teams/.env   agent-bridge-<agent>:ab-agent-<agent>  0600
+~/.agent-bridge/agents/<agent>/workdir/.ms365/.env   agent-bridge-<agent>:ab-agent-<agent>  0600
 ```
 
 Cause: pre-v2 the readiness probe ran as the controller against a
-controller-owned file. v2 moved the probe behind a group read so the
-file must be agent-owned with `ab-agent-<agent>` group + `0640`.
+controller-owned file. v0.8.0 (v2) moved the probe behind a group read
+(`0640`). v0.13.4 (v3 dotenv contract) replaced the group-read probe
+with a passwordless-sudo read, so the file is now `0600` (no group
+visibility) and the controller accesses it via `sudo -u agent-bridge-<agent>`.
 
-Why this matters: the controller-side readiness probe for a Teams /
-MS365 plugin can no longer read the file it is probing, because the
-agent process now writes through the v2 umask and the file lands
-agent-owned, not controller-owned. The probe surfaces as a perpetual
-"not ready".
+Why this matters: if the file is still `<controller>:<controller> 0600`
+the isolated agent cannot write its own token, and if still
+`agent-bridge-<agent>:ab-agent-<agent> 0640` the group read is an
+unnecessary ACL surface. Run `agent-bridge migrate isolation v3 --check`
+to detect and `--apply` to remediate.
 
 ### 2.3 Missing `agents/<agent>/.claude/`
 
@@ -217,14 +219,8 @@ sudo chown -R "$USER:$USER" "$LINUX_HOME"
 sudo chmod -R u+rwX,go-rwx "$LINUX_HOME"
 sudo setfacl -bR "$LINUX_HOME"
 
-# 2. Realign plugin state files to v2 group-read contract.
-for f in "$BRIDGE_DATA_ROOT/agents/$A/workdir/.teams/.env" \
-         "$BRIDGE_DATA_ROOT/agents/$A/workdir/.ms365/.env"; do
-  if [[ -f "$f" ]]; then
-    sudo chown "$USER:$GROUP" "$f"
-    sudo chmod 0640 "$f"
-  fi
-done
+# 2. Realign plugin state files to v3 isolated-UID-owned 0600 contract.
+agent-bridge migrate isolation v3 --apply --agent "$A"
 
 # 3. Create the controller-side .claude/ shadow if missing.
 sudo install -d -o "$CTRL" -g "$CTRL" -m 0700 \
@@ -278,9 +274,11 @@ sudo stat -c "%U:%G %a" "/home/$USER"
 sudo getfacl --skip-base "/home/$USER"
 sudo getfacl --skip-base "/home/$USER/.claude" 2>/dev/null
 
-# Plugin state files: should be `<USER>:<GROUP> 640`.
+# Channel dotenv/state files: should be `<isolated_user>:<GROUP> 600` (v3 contract).
 stat -c "%U:%G %a" "$BRIDGE_DATA_ROOT/agents/$A/workdir/.teams/.env" 2>/dev/null
 stat -c "%U:%G %a" "$BRIDGE_DATA_ROOT/agents/$A/workdir/.ms365/.env" 2>/dev/null
+# Or use the canonical checker:
+agent-bridge migrate isolation v3 --check --agent "$A"
 
 # Per-agent group membership (controller + agent UID).
 getent group "$GROUP"

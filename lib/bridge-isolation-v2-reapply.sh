@@ -37,7 +37,9 @@
 #   2. Plugin state files (`workdir/.teams/.env`, `workdir/.ms365/.env`)
 #      ended up `agent:controller 0600` — controller readiness probes
 #      cannot read them via group, and the documented `setup teams`
-#      recovery path also fails for the same reason.
+#      recovery path also fails for the same reason. (v3 contract,
+#      #998 PR B: these files are now isolated-UID-owned 0600/no-ACL;
+#      controller accesses via passwordless sudo, not group read.)
 #   3. `/home/agent-bridge-<agent>/` (the isolated agent's actual Linux
 #      home) is owned by `root:agent-bridge-<agent>` with a transitional
 #      v0.7-era named-user POSIX ACL granting only the controller `r-x`,
@@ -55,8 +57,9 @@
 #   agents/<agent>/credentials/        controller:ab-agent-<agent> 2750
 #   agents/<agent>/.claude/            controller:controller       0700
 #   agents/<agent>/agent-env.sh        controller:ab-agent-<agent> 0640
-#   agents/<agent>/workdir/.teams/.env,
-#     .ms365/.env                      agent:ab-agent-<agent>     0660
+#   agents/<agent>/workdir/.<provider>/ agent:ab-agent-<agent>     2770  (dir node only)
+#     .env, access.json, state.json,   agent:ab-agent-<agent>     0600  (v3 contract,
+#     mcp.json                                                           no group read)
 #   /home/agent-bridge-<agent>/        agent:agent                u+rwX,go-rwx
 #                                      (no extended POSIX ACL)
 #
@@ -193,6 +196,31 @@ bridge_isolation_v2_reapply_has_named_acl() {
   return 0
 }
 
+bridge_isolation_v2_reapply_has_extended_acl() {
+  # Returns 0 when `getfacl` reports ANY extended ACL entry on $1 — a
+  # named user/group, a `mask::` entry, or a `default:` entry. Broader
+  # than has_named_acl, which matches named rows only.
+  #
+  # The v3 channel-dotenv contract is "no extended ACL at all" (the
+  # isolated UID owns its own 0600 dotenv — there is nothing to grant).
+  # A residual `mask::` with no named rows still violates that contract,
+  # so the v3 detector MUST use this predicate: has_named_acl would
+  # false-clean a mask-only file and let `--check` emit
+  # `ok:already-canonical` / `--apply` skip `setfacl -b`.
+  #
+  # `--skip-base` already drops the base user::/group::/other:: triad,
+  # so any remaining user:/group:/mask:/default: line is an extended
+  # entry. Returns 1 when there is none, the path is missing, or
+  # `getfacl` is not installed (acl package absent → nothing to strip).
+  local target="$1"
+  command -v getfacl >/dev/null 2>&1 || return 1
+  [[ -e "$target" || -L "$target" ]] || return 1
+  getfacl --absolute-names --skip-base "$target" 2>/dev/null \
+    | grep -Eq '^(user|group|mask|default):' \
+    || return 1
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # 4. mutation helpers — direct-then-sudo, fail-loud
 # ---------------------------------------------------------------------------
@@ -229,9 +257,8 @@ bridge_isolation_v2_reapply_chown_chmod_file() {
   local file="$3"
   bridge_isolation_v2_reapply_run_priv chown "$owner_group" "$file" || return 1
   # If an extended ACL is present, Linux chmod updates the ACL mask rather
-  # than the owning-group entry. Strip first so target modes like 0660 really
-  # restore group::rw- for v2 channel env files that were rewritten as 0600
-  # with a stale mask::--- ACL.
+  # than the owning-group entry. Strip first so the target mode is applied
+  # cleanly (no stale mask entry overriding the chmod result).
   if bridge_isolation_v2_reapply_has_named_acl "$file"; then
     bridge_isolation_v2_reapply_run_priv setfacl -b "$file" || return 1
   fi
@@ -349,26 +376,15 @@ bridge_isolation_v2_reapply_one_agent() {
     "$mode" "$apply" "$actions_file" "$errors_file" \
     "file" "$agent_root/agent-env.sh" "$controller_user:$agent_grp" "0640"
 
-  # Plugin state .env files: present only after a `setup teams` /
-  # `setup ms365` round. When absent, do not invent.
-  #
-  # Issue #771 v0.9.5: mode 0660 (group rw) so the controller — a member
-  # of `ab-agent-<X>` per the v2 design contract (lib/bridge-agents.sh:
-  # 3917-3919 comment "v2: no ACL repair retry. The per-agent group +
-  # setgid contract handles controller access") — can read the .env via
-  # the base group bit. Pre-fix mode 0640 + the strip_layout_acls pass
-  # below could leave the file with `group::---` (base group entry
-  # never set) on certain `acl` package builds, blocking the controller
-  # from reading TEAMS_APP_ID / TEAMS_APP_PASSWORD via the channel
-  # readiness probe and surfacing as `creds_status=unreadable`. 0660
-  # asserts the canonical group-readable+writable state explicitly.
-  bridge_isolation_v2_reapply_assert \
-    "$mode" "$apply" "$actions_file" "$errors_file" \
-    "file" "$agent_root/workdir/.teams/.env" "$os_user:$agent_grp" "0660"
-
-  bridge_isolation_v2_reapply_assert \
-    "$mode" "$apply" "$actions_file" "$errors_file" \
-    "file" "$agent_root/workdir/.ms365/.env" "$os_user:$agent_grp" "0660"
+  # Channel state dir nodes: 2770/agent-group for traversal. File contents
+  # are isolated-UID-owned 0600/no-ACL (v3 contract, #998 PR B) and are
+  # excluded from the workdir recursive pass below — assert only the dirs.
+  local _cs_dir
+  for _cs_dir in .teams .ms365 .discord .telegram .mattermost; do
+    bridge_isolation_v2_reapply_assert \
+      "$mode" "$apply" "$actions_file" "$errors_file" \
+      "dir" "$agent_root/workdir/$_cs_dir" "$os_user:$agent_grp" "2770"
+  done
 
   # v0.9.7 (refs #781): the duplicated writable-subdir block (this used
   # to appear twice — once at line 368 and once at line 415, identical
@@ -386,8 +402,17 @@ bridge_isolation_v2_reapply_one_agent() {
   for _writable_sub in home workdir runtime logs requests responses; do
     [[ -d "$agent_root/$_writable_sub" ]] || continue
     if [[ "$apply" == "1" ]]; then
+      # workdir: exclude channel state dir contents (v3 0600/no-ACL contract,
+      # #998 PR B). Dir nodes are covered by the reapply_assert loop above.
+      local -a _ws_excl=()
+      if [[ "$_writable_sub" == "workdir" ]]; then
+        _ws_excl=(--exclude-subdir .teams --exclude-subdir .ms365
+                  --exclude-subdir .discord --exclude-subdir .telegram
+                  --exclude-subdir .mattermost)
+      fi
       if bridge_isolation_v2_chgrp_setgid_recursive \
-            "$agent_grp" 2770 0660 "$agent_root/$_writable_sub" 2>/dev/null; then
+            "$agent_grp" 2770 0660 "$agent_root/$_writable_sub" \
+            "${_ws_excl[@]}" 2>/dev/null; then
         bridge_isolation_v2_reapply_record_action \
           "$actions_file" "$agent_root/$_writable_sub" \
           "chgrp_chmod_recursive" "drift|unknown" "$agent_grp 2770/0660" "ok"
@@ -1139,13 +1164,12 @@ v0.7 → v0.8 upgrade drift. Covers:
                             controller:controller       0700  (created if absent)
   - agents/<agent>/agent-env.sh
                             controller:ab-agent-<agent> 0640
-  - agents/<agent>/workdir/.teams/.env, .ms365/.env
-                            agent:ab-agent-<agent>     0660  (if present)
-                            (group rw — controller is a member of
-                            ab-agent-<agent>, the v2 design treats
-                            this as a write-capability group; the
-                            channel readiness probe needs base group
-                            read after `setfacl -bR` strip)
+  - agents/<agent>/workdir/.<provider>/
+                            dir node: agent:ab-agent-<agent> 2770
+                            file contents (.env, access.json, etc.):
+                            v3 contract — isolated-UID-owned 0600, no ACL
+                            (not touched by v2 reapply; use
+                            `agent-bridge migrate isolation v3 --check`)
   - agents/<agent>/         strip every named-user/named-group POSIX ACL
   - /home/agent-bridge-<agent>/
                             agent:agent / u+rwX,go-rwx / setfacl -bR

@@ -30,8 +30,7 @@
 #   state.json    isolated-UID:ab-agent-<slug>  0600  no extended ACL  (teams only)
 #   mcp.json      isolated-UID:ab-agent-<slug>  0600  no extended ACL  (mattermost only)
 #
-# Path guards (mirror the stop-gap helper at
-# lib/bridge-isolation-v2.sh:bridge_isolation_v2_apply_channel_state_dotenv_acl):
+# Path guards:
 #   - refuse symlinks
 #   - refuse non-regular files
 #   - parent dir basename MUST equal `.<provider>`
@@ -47,9 +46,8 @@
 # bits on already-existing channel dotenvs. It does not stop or restart
 # the daemon and does not touch the queue. Operators may run --apply on
 # a live install; worst case is a transient probe miss during the
-# chown window — the stop-gap self-heal at
-# bridge_isolation_v2_apply_channel_state_dotenv_acl catches this on
-# the next start cycle.
+# chown window (bridge-start and the daemon carry no self-heal fallback
+# for channel dotenvs — this tool is the canonical recovery path).
 #
 # Why a separate tool from v2 reapply:
 #
@@ -63,11 +61,11 @@
 # via sudo-as-isolated-UID for BOTH read AND write, so the channel
 # dotenv goes to mode 0600 (owner-only) and no extended ACL is needed.
 # This v3 tool migrates existing installs that still carry the legacy
-# 0640/0660 + ACL-grant shape to the new 0600 + no-ACL shape. Once an
-# agent is migrated, the stop-gap helper
-# `bridge_isolation_v2_apply_channel_state_dotenv_acl` runs as a no-op
-# (no named-user ACL to repair) and #857 PR-5 will retire the helper
-# entirely next cycle.
+# 0640/0660 + ACL-grant shape to the new 0600 + no-ACL shape.
+# The stop-gap helper bridge_isolation_v2_apply_channel_state_dotenv_acl
+# that previously ran at start/daemon as a self-heal has been retired
+# (#998 PR B); `agent-bridge migrate isolation v3 --check` is the
+# canonical path for diagnosing and repairing drift.
 
 # ---------------------------------------------------------------------------
 # 1. helpers — agent enumeration
@@ -145,7 +143,10 @@ bridge_isolation_v3_channel_dotenv_assert_path() {
   current_og="${probe% *}"
   current_mode="${probe##* }"
   current_acl="no"
-  if bridge_isolation_v2_reapply_has_named_acl "$path"; then
+  # v3 contract is "no extended ACL at all" — detect named entries AND a
+  # residual `mask::` / `default:` (has_named_acl would false-clean a
+  # mask-only file and let --check claim already-canonical).
+  if bridge_isolation_v2_reapply_has_extended_acl "$path"; then
     current_acl="yes"
   fi
 
@@ -237,7 +238,7 @@ bridge_isolation_v3_channel_dotenv_assert_path() {
   local after_probe after_acl after_repr_ok
   after_probe="$(bridge_isolation_v2_reapply_probe_owner_group_mode "$path")"
   after_acl="no"
-  if bridge_isolation_v2_reapply_has_named_acl "$path"; then
+  if bridge_isolation_v2_reapply_has_extended_acl "$path"; then
     after_acl="yes"
   fi
   after_repr_ok="$after_probe acl=$after_acl"
