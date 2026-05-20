@@ -350,10 +350,10 @@ queue_gateway_socket_group_mode_contract() {
         || smoke_fail "socket must have no named-user ACL entries; got: $named_acl"
     fi
   else
-    # ab-shared absent (smoke/dev fallback): assert owner-only (mode 0600) and no world bits
+    # ab-shared absent (smoke/dev fallback): assert owner-only — exactly 0600.
     smoke_log "note: $shared_grp group not found; asserting fallback mode 0600"
-    [[ "$socket_mode" == *00 ]] \
-      || smoke_fail "socket fallback mode should be ?600, got $socket_mode"
+    [[ "$socket_mode" == "600" ]] \
+      || smoke_fail "socket fallback mode should be exactly 600, got $socket_mode"
   fi
 
   queue_gateway_stop_socket_server

@@ -513,12 +513,45 @@ def ensure_runtime_layout(home: str, strict: bool) -> bool:
         if not _sudo_install_tmpfiles(home):
             return False
     else:
-        print(
-            "queue gateway runtime setup requires root once; run: "
-            f"sudo install -d -m 0755 -o root -g root {gateway_runtime_root()} && "
-            f"sudo install -d -m 0711 -o {_user_name(os.getuid())} -g {_group_name(os.getgid())} {gateway_instance_dir(home)}",
-            file=sys.stderr,
-        )
+        # The remediation must match what verify_runtime_layout() now requires
+        # for the instance dir, which depends on whether the shared group is
+        # present and whether this is a live runtime root:
+        #   - shared group present  -> 2770, group=<shared group>
+        #   - absent + live         -> no valid layout; the group itself must
+        #                              be created first (the old 0711 layout
+        #                              can never pass the live verifier)
+        #   - absent + non-live     -> 0711 owner-only (smoke/dev fallback)
+        root = gateway_runtime_root()
+        inst = gateway_instance_dir(home)
+        shared_grp = _shared_group()
+        if shared_grp is not None:
+            print(
+                "queue gateway runtime setup requires root once; run: "
+                f"sudo install -d -m 0755 -o root -g root {root} && "
+                f"sudo install -d -m 2770 -o {_user_name(os.getuid())} "
+                f"-g {shared_grp.gr_name} {inst}",
+                file=sys.stderr,
+            )
+        elif str(root) == LIVE_GATEWAY_RUNTIME_ROOT:
+            name = os.environ.get(
+                "BRIDGE_SHARED_GROUP", BRIDGE_SHARED_GROUP_DEFAULT
+            ).strip()
+            print(
+                f"queue gateway runtime setup requires the '{name}' group "
+                "(override via BRIDGE_SHARED_GROUP). Create the group, add the "
+                "controller user and every isolated agent user to it, then "
+                "restart the daemon. The pre-ab-shared owner-only layout is no "
+                "longer accepted on a live runtime root.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "queue gateway runtime setup requires root once; run: "
+                f"sudo install -d -m 0755 -o root -g root {root} && "
+                f"sudo install -d -m 0711 -o {_user_name(os.getuid())} "
+                f"-g {_group_name(os.getgid())} {inst}",
+                file=sys.stderr,
+            )
         return not strict
 
     ok, reason = verify_runtime_layout(home)
