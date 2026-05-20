@@ -27,6 +27,12 @@ bridge_project_skill_dir_for() {
     codex)
       printf '%s/.agents/skills/agent-bridge' "$workdir"
       ;;
+    antigravity)
+      # Track C1: agy reuses codex's `.agents/skills/` path — the skill
+      # content is engine-neutral markdown and agy can also pull it via
+      # `agy plugin import claude`.
+      printf '%s/.agents/skills/agent-bridge' "$workdir"
+      ;;
     claude)
       printf '%s/.claude/skills/agent-bridge' "$workdir"
       ;;
@@ -796,6 +802,16 @@ Use this skill when the task depends on the shared agent bridge in \`${bridge_ho
 EOF
 }
 
+# Track C1: the agy project skill is byte-identical to codex's — both are
+# `.agents/skills/agent-bridge` engine-neutral markdown. Delegate rather
+# than duplicate the body so the two renderers cannot drift. The arm in
+# bridge_bootstrap_project_skill must still exist and call this (not fall
+# through `*) return 0`), otherwise `bridge_bootstrap_project_skill
+# antigravity` would silently write nothing.
+bridge_render_antigravity_project_skill() {
+  bridge_render_codex_project_skill "$@"
+}
+
 bridge_render_claude_project_skill() {
   local bridge_home="$1"
 
@@ -871,6 +887,10 @@ bridge_bootstrap_project_skill() {
     codex)
       legacy_skill_dir="$workdir/.agents/skills/agent-bridge-project"
       ;;
+    antigravity)
+      # Track C1: agy shares codex's `.agents/skills/` path.
+      legacy_skill_dir="$workdir/.agents/skills/agent-bridge-project"
+      ;;
     claude)
       legacy_skill_dir="$workdir/.claude/skills/agent-bridge-project"
       ;;
@@ -882,6 +902,11 @@ bridge_bootstrap_project_skill() {
   case "$engine" in
     codex)
       bridge_render_codex_project_skill "$BRIDGE_HOME" | bridge_write_managed_markdown "$skill_file" "Codex bridge skill" || return 1
+      ;;
+    antigravity)
+      # Track C1: explicit arm — without it the `*) return 0` below would
+      # make `bridge_bootstrap_project_skill antigravity` a silent no-op.
+      bridge_render_antigravity_project_skill "$BRIDGE_HOME" | bridge_write_managed_markdown "$skill_file" "Antigravity bridge skill" || return 1
       ;;
     claude)
       bridge_render_claude_project_skill "$BRIDGE_HOME" | bridge_write_managed_markdown "$skill_file" "Claude bridge skill" || return 1

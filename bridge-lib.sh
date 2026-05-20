@@ -361,6 +361,11 @@ bridge_source_module "bridge-agents.sh"
 # helpers depend on bridge_agent_os_user /
 # bridge_agent_linux_user_isolation_effective.
 bridge_source_module "bridge-isolation-helpers.sh"
+# Antigravity (`agy`) launch contract (Track C1). Sourced after bridge-core.sh
+# / bridge-agents.sh (its deps: bridge_join_quoted, bridge_require_python,
+# bridge_resolve_script_dir_check, BRIDGE_HOME) and before bridge-skills.sh /
+# bridge-state.sh, which call its launch-builder + path helpers.
+bridge_source_module "bridge-antigravity.sh"
 bridge_source_module "bridge-guard.sh"
 bridge_source_module "bridge-tmux.sh"
 bridge_source_module "bridge-skills.sh"

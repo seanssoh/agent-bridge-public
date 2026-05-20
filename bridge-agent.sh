@@ -162,6 +162,7 @@ bridge_ensure_memory_precompact_hook() {
 
 bridge_agent_default_launch_cmd() {
   local engine="$1"
+  local agent="${2:-}"
 
   case "$engine" in
     claude)
@@ -180,12 +181,13 @@ bridge_agent_default_launch_cmd() {
       printf '%s' 'codex -c features.fast_mode=true --dangerously-bypass-approvals-and-sandbox --no-alt-screen'
       ;;
     antigravity)
-      # Antigravity wave (Track A0): minimal launch command so static
-      # `create --engine antigravity` succeeds end-to-end. This is the
-      # bare form (no `-i` bootstrap) — actual launch is still blocked by
-      # the temporary guard in bridge-start.sh. Track C1 upgrades this
-      # arm to the bootstrap-carrying contract.
-      printf '%s' 'agy --dangerously-skip-permissions'
+      # Antigravity wave (Track C1): a static agy agent's stored roster
+      # launch_cmd carries the mandatory `-i` bootstrap (the SessionStart-
+      # injection analogue) via the canonical launch builder. The fresh
+      # form is selected by passing continue=0 / empty session_id. When no
+      # agent id is supplied (defensive call sites) the builder still emits
+      # a well-formed bootstrap prompt addressed to the bare role name.
+      bridge_antigravity_dynamic_launch_cmd "$agent" 0 ""
       ;;
     *)
       bridge_die "지원하지 않는 engine 입니다: $engine"
@@ -1085,7 +1087,7 @@ bridge_agent_reclassify_static_admin() {
   workdir="$(bridge_expand_user_path "$(bridge_agent_workdir "$agent")")"
   profile_home="$(bridge_expand_user_path "$(bridge_agent_profile_home "$agent")")"
   launch_cmd="$(bridge_agent_launch_cmd_raw "$agent")"
-  [[ -n "$launch_cmd" ]] || launch_cmd="$(bridge_agent_default_launch_cmd "$engine")"
+  [[ -n "$launch_cmd" ]] || launch_cmd="$(bridge_agent_default_launch_cmd "$engine" "$agent")"
   channels="$(bridge_agent_channels_csv "$agent")"
   discord_channel="$(bridge_agent_discord_channel_id "$agent")"
   notify_kind="$(bridge_agent_notify_kind "$agent")"
@@ -2695,7 +2697,7 @@ report and reap test-fixture agents per their pattern."
   description="${description:-$agent static role}"
   display_name="${display_name:-$agent}"
   role_text="${role_text:-Long-lived agent role}"
-  launch_cmd="${launch_cmd:-$(bridge_agent_default_launch_cmd "$engine")}"
+  launch_cmd="${launch_cmd:-$(bridge_agent_default_launch_cmd "$engine" "$agent")}"
   channels="$(bridge_normalize_channels_csv "$channels")"
   users_json="$(bridge_normalize_user_specs_json "${user_specs[@]}")"
   if [[ "$isolation_mode" == "linux-user" ]]; then
