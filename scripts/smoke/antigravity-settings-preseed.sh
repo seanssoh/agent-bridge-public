@@ -65,26 +65,12 @@ JSON
   GEMINI_HOME="$gemini_root" bridge_antigravity_settings_preseed "$workdir" \
     || smoke_fail "T1: preseed exited non-zero"
 
+  # Assertion logic lives in a standalone file invoked file-as-argv (not an
+  # inline `python3 - <<'PY'` heredoc-stdin) — capturing a heredoc-fed
+  # subprocess in `$(...)` is the footgun #11 deadlock shape.
   local dump
-  dump="$(python3 - "$settings" "$workdir" <<'PY'
-import json, sys
-settings, workdir = sys.argv[1], sys.argv[2]
-with open(settings, encoding="utf-8") as fh:
-    data = json.load(fh)
-checks = []
-checks.append("colorScheme=%s" % data.get("colorScheme"))
-checks.append("enableTelemetry=%s" % data.get("enableTelemetry"))
-checks.append("preExistingTrust=%s" % ("/pre/existing/dir" in data.get("trustedWorkspaces", [])))
-checks.append("workdirTrust=%s" % (workdir in data.get("trustedWorkspaces", [])))
-allow = data.get("permissions", {}).get("allow", [])
-checks.append("preExistingAllow=%s" % ("command(/usr/bin/git)" in allow))
-checks.append("denyPreserved=%s" % ("command(/bin/rm)" in data.get("permissions", {}).get("deny", [])))
-checks.append("agbAllow=%s" % any(e.endswith("/agb)") for e in allow))
-checks.append("agentBridgeAllow=%s" % any(e.endswith("/agent-bridge)") for e in allow))
-checks.append("altScreenMode=%s" % data.get("altScreenMode"))
-print(" ".join(checks))
-PY
-)"
+  dump="$(python3 "$SCRIPT_DIR/antigravity-settings-preseed-assert.py" \
+    preserve "$settings" "$workdir")"
 
   smoke_assert_contains "$dump" "colorScheme=dark"        "T1: colorScheme preserved"
   smoke_assert_contains "$dump" "enableTelemetry=False"   "T1: enableTelemetry preserved"
@@ -107,20 +93,8 @@ assert_preseed_idempotent() {
     || smoke_fail "T2: second preseed exited non-zero"
 
   local counts
-  counts="$(python3 - "$settings" "$workdir" <<'PY'
-import json, sys
-settings, workdir = sys.argv[1], sys.argv[2]
-with open(settings, encoding="utf-8") as fh:
-    data = json.load(fh)
-trusted = data.get("trustedWorkspaces", [])
-allow = data.get("permissions", {}).get("allow", [])
-print("trustWorkdir=%d allowAgb=%d allowBridge=%d" % (
-    trusted.count(workdir),
-    sum(1 for e in allow if e.endswith("/agb)")),
-    sum(1 for e in allow if e.endswith("/agent-bridge)")),
-))
-PY
-)"
+  counts="$(python3 "$SCRIPT_DIR/antigravity-settings-preseed-assert.py" \
+    counts "$settings" "$workdir")"
 
   smoke_assert_contains "$counts" "trustWorkdir=1"  "T2: workdir trusted exactly once"
   smoke_assert_contains "$counts" "allowAgb=1"      "T2: agb allow entry present exactly once"
