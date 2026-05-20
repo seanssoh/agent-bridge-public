@@ -196,6 +196,31 @@ bridge_isolation_v2_reapply_has_named_acl() {
   return 0
 }
 
+bridge_isolation_v2_reapply_has_extended_acl() {
+  # Returns 0 when `getfacl` reports ANY extended ACL entry on $1 — a
+  # named user/group, a `mask::` entry, or a `default:` entry. Broader
+  # than has_named_acl, which matches named rows only.
+  #
+  # The v3 channel-dotenv contract is "no extended ACL at all" (the
+  # isolated UID owns its own 0600 dotenv — there is nothing to grant).
+  # A residual `mask::` with no named rows still violates that contract,
+  # so the v3 detector MUST use this predicate: has_named_acl would
+  # false-clean a mask-only file and let `--check` emit
+  # `ok:already-canonical` / `--apply` skip `setfacl -b`.
+  #
+  # `--skip-base` already drops the base user::/group::/other:: triad,
+  # so any remaining user:/group:/mask:/default: line is an extended
+  # entry. Returns 1 when there is none, the path is missing, or
+  # `getfacl` is not installed (acl package absent → nothing to strip).
+  local target="$1"
+  command -v getfacl >/dev/null 2>&1 || return 1
+  [[ -e "$target" || -L "$target" ]] || return 1
+  getfacl --absolute-names --skip-base "$target" 2>/dev/null \
+    | grep -Eq '^(user|group|mask|default):' \
+    || return 1
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # 4. mutation helpers — direct-then-sudo, fail-loud
 # ---------------------------------------------------------------------------

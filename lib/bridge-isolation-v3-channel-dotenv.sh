@@ -143,7 +143,10 @@ bridge_isolation_v3_channel_dotenv_assert_path() {
   current_og="${probe% *}"
   current_mode="${probe##* }"
   current_acl="no"
-  if bridge_isolation_v2_reapply_has_named_acl "$path"; then
+  # v3 contract is "no extended ACL at all" — detect named entries AND a
+  # residual `mask::` / `default:` (has_named_acl would false-clean a
+  # mask-only file and let --check claim already-canonical).
+  if bridge_isolation_v2_reapply_has_extended_acl "$path"; then
     current_acl="yes"
   fi
 
@@ -235,7 +238,7 @@ bridge_isolation_v3_channel_dotenv_assert_path() {
   local after_probe after_acl after_repr_ok
   after_probe="$(bridge_isolation_v2_reapply_probe_owner_group_mode "$path")"
   after_acl="no"
-  if bridge_isolation_v2_reapply_has_named_acl "$path"; then
+  if bridge_isolation_v2_reapply_has_extended_acl "$path"; then
     after_acl="yes"
   fi
   after_repr_ok="$after_probe acl=$after_acl"

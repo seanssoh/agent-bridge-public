@@ -54,6 +54,20 @@ file_has_named_acl() {
   return 0
 }
 
+# Detect ANY extended POSIX ACL entry — named user/group, a `mask::`
+# entry, or a `default:` entry. Broader than file_has_named_acl; used
+# by the mask-only drift case (A10) to prove the v3 detector treats a
+# residual mask as drift, not as already-canonical.
+file_has_extended_acl() {
+  local path="$1"
+  command -v getfacl >/dev/null 2>&1 || return 1
+  [[ -e "$path" ]] || return 1
+  getfacl --absolute-names --skip-base "$path" 2>/dev/null \
+    | grep -Eq '^(user|group|mask|default):' \
+    || return 1
+  return 0
+}
+
 # Source the v3 module + its v2-reapply dependency directly. We avoid
 # pulling all of bridge-lib.sh (which side-effects the roster, hooks,
 # state dirs) because the smoke only exercises the migrator's pure
@@ -559,6 +573,83 @@ case_a9_idempotent_reapply() {
 
 # --- main --------------------------------------------------------------------
 
+# --- case A10: mask-only extended ACL on an otherwise-canonical dotenv ----
+# Regression for PR #1000 r1 (codex): the v3 detector previously used the
+# named-only `has_named_acl` predicate, so a dotenv at the correct
+# isolated-UID owner + 0600 mode but carrying a residual `mask::` ACL
+# (no named entries) was mis-reported as `acl=no` → `--check` emitted
+# `ok:already-canonical` and `--apply` skipped `setfacl -b`, leaving the
+# extended ACL in place while claiming the v3 contract was satisfied.
+# The detector now uses `has_extended_acl` (named OR mask OR default).
+case_a10_mask_only_acl_drift() {
+  local fixture workdir os_user group
+  fixture="$(case_fixture_root a10)"
+  workdir="$fixture/workdir"
+  os_user="$(id -un)"
+  group="$(id -gn)"
+  make_agent_workdir "$workdir" telegram
+  local target="$workdir/.telegram/.env"
+  write_fixture_file "$target" "telegram=true"
+  # Owner + mode are already canonical (0600); the ONLY drift is a
+  # residual mask:: extended ACL with no named entries.
+  chmod 0600 "$target"
+
+  if [[ "$(uname -s)" != "Linux" ]]; then
+    smoke_log "skip: A10 requires Linux for setfacl/getfacl mask semantics"
+    return 0
+  fi
+  if ! command -v setfacl >/dev/null 2>&1; then
+    smoke_log "skip: A10 requires setfacl (acl package)"
+    return 0
+  fi
+  # A mask entry only appears once the ACL has at least one named entry,
+  # so add a named user, then remove it — the mask survives as a residual.
+  setfacl -m "u:$os_user:r--" "$target" 2>/dev/null || true
+  setfacl -x "u:$os_user" "$target" 2>/dev/null || true
+  if ! file_has_extended_acl "$target"; then
+    smoke_log "skip: A10 — this host did not retain a residual mask:: ACL"
+    return 0
+  fi
+  # Precondition: the residual is mask-only (no named entries) — that is
+  # the exact shape has_named_acl would false-clean.
+  if file_has_named_acl "$target"; then
+    smoke_log "skip: A10 — residual ACL has named entries; not the mask-only case"
+    return 0
+  fi
+
+  (
+    import_v3_module
+    install_agent_mocks "agent-test" "$workdir" "$os_user" "$group"
+
+    local out rc out_rows
+
+    # --check: a mask-only residual must report drift, NOT already-canonical.
+    rc=0
+    out="$(bridge_isolation_v3_channel_dotenv_cli --check 2>&1)" || rc=$?
+    smoke_assert_eq 0 "$rc" "A10.1: --check on mask-only residual -> rc=0"
+    smoke_assert_contains "$out" "drift" "A10.1: mask-only residual recorded as drift"
+    out_rows="$(printf '%s\n' "$out" | sed '/^summary:/d' | sed '/^==/d')"
+    [[ "$out_rows" != *"ok:already-canonical"* ]] \
+      || smoke_fail "A10.1: mask-only residual must NOT be reported already-canonical, got: $out"
+
+    # --apply: strips ALL extended ACLs via setfacl -b.
+    rc=0
+    out="$(bridge_isolation_v3_channel_dotenv_cli --apply 2>&1)" || rc=$?
+    smoke_assert_eq 0 "$rc" "A10.2: --apply on mask-only residual -> rc=0"
+    if file_has_extended_acl "$target"; then
+      smoke_fail "A10.2: extended ACL (mask::) not stripped post-apply on $target"
+    fi
+    smoke_assert_eq "600" "$(file_mode "$target")" "A10.2: mode still 0600 post-apply"
+
+    # Re-check: now genuinely canonical.
+    rc=0
+    out="$(bridge_isolation_v3_channel_dotenv_cli --check 2>&1)" || rc=$?
+    smoke_assert_eq 0 "$rc" "A10.3: re-check post-apply rc=0"
+    smoke_assert_contains "$out" "ok:already-canonical" "A10.3: post-apply tree is canonical"
+  ) || smoke_fail "A10 sub-shell failed"
+  smoke_log "ok: A10 (mask-only extended ACL -> drift -> --apply strips -> canonical)"
+}
+
 main() {
   smoke_setup_bridge_home "$SMOKE_NAME"
 
@@ -571,6 +662,7 @@ main() {
   case_a7_single_agent_filter
   case_a8_json_output_parses
   case_a9_idempotent_reapply
+  case_a10_mask_only_acl_drift
 
   smoke_log "passed"
 }
