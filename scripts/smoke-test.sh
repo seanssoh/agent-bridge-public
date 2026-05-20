@@ -7773,6 +7773,18 @@ assert_not_contains "$UPGRADE_DRY_RUN_TEXT" "agent_restart_would_restart:"
 assert_not_contains "$UPGRADE_DRY_RUN_TEXT" "agent_restart_would_agents:"
 assert_not_contains "$UPGRADE_DRY_RUN_TEXT" "agent_restart_restarted:"
 
+log "upgrade restart summary surfaces a manual-restart warning for attached-skipped agents (#980)"
+# Issue #980: --restart-agents correctly declines to restart an agent whose
+# tmux session the operator has attached, but the upgrade used to complete
+# silently — leaving the operator unaware their own agent still runs old
+# code. The assertion logic (JSON aggregator skipped_attached_agents + the
+# text-summary agent_restart_warning block, with a synthetic 7-column
+# report) lives in a standalone file-as-argv helper so this smoke check
+# adds no heredoc-stdin subprocess site (heredoc-ban ratchet, footgun #11).
+RESTART_NOTICE_OUT="$(python3 "$REPO_ROOT/scripts/smoke/restart-attached-notice.py" "$REPO_ROOT" 2>&1)" \
+  || die "restart-attached-notice smoke helper failed: $RESTART_NOTICE_OUT"
+assert_contains "$RESTART_NOTICE_OUT" "smoke-restart-attached-notice: OK"
+
 log "isolating upgrade restart analysis from caller BRIDGE env"
 UPGRADE_ENV_LIVE_HOME="$TMP_ROOT/upgrade-env-live"
 UPGRADE_ENV_TARGET_HOME="$TMP_ROOT/upgrade-env-target"

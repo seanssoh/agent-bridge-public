@@ -53,6 +53,12 @@ payload = {
     "failed_details": [],
     "recovered_by_daemon_details": [],
     "skipped_reasons": {},
+    # Issue #980: per-agent names of static agents skipped with
+    # reason="attached" — i.e. the operator's own live tmux session was
+    # attached so the in-upgrade restart was (correctly) declined. The
+    # aggregate skipped_reasons["attached"] count is not actionable on
+    # its own; the operator needs the agent IDs to run a manual restart.
+    "skipped_attached_agents": [],
 }
 
 
@@ -121,5 +127,10 @@ for raw in report.splitlines():
     else:
         payload["skipped"] += 1
         payload["skipped_reasons"][reason] = payload["skipped_reasons"].get(reason, 0) + 1
+        # Issue #980: capture the agent IDs behind reason="attached" so the
+        # summary + post-upgrade task can tell the operator exactly which
+        # agents are still running the old code.
+        if reason == "attached":
+            payload["skipped_attached_agents"].append(agent)
 
 print(json.dumps(payload, ensure_ascii=False))

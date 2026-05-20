@@ -651,6 +651,28 @@ bridge_upgrade_agent_restart_json() {
     "$enabled" "$dry_run" "$report"
 }
 
+# Issue #980: extract the agent IDs that an agent-restart report skipped
+# with reason="attached" (the operator's own live tmux session was attached
+# so the restart was declined). Echoes one agent ID per line; empty output
+# when no agent was attached-skipped. The report argument is the 7-column
+# tab-separated tuple from `bridge_upgrade_collect_agent_restart_report`.
+#
+# Footgun #11 (refs #265 / #800 / #815): the report is streamed through a
+# pipe into `while read`, never a here-string, to keep Bash 5.3.9 out of
+# the `read_comsub` wedge during apply leaps.
+bridge_upgrade_attached_skipped_agents() {
+  local report="$1"
+  local _tab agent status reason
+  _tab="$(printf '\t')"
+  [[ -n "$report" ]] || return 0
+  printf '%s\n' "$report" | while IFS="$_tab" read -r agent status reason _; do
+    [[ -n "$agent" ]] || continue
+    if [[ "$status" == "skipped" && "$reason" == "attached" ]]; then
+      printf '%s\n' "$agent"
+    fi
+  done
+}
+
 bridge_upgrade_print_agent_restart_summary() {
   local payload="$1"
 
@@ -723,6 +745,23 @@ if payload.get("recovered_by_daemon", 0) > 0 and not payload.get("dry_run"):
     )
 for reason in sorted(payload.get("skipped_reasons", {})):
     print(f"agent_restart_skipped_{reason}: {payload['skipped_reasons'][reason]}")
+# Issue #980: an `attached`-skipped agent is the operator's own live
+# session — the upgrade (correctly) declined to restart it, but that
+# agent is now running the OLD code. A bare `agent_restart_skipped_attached`
+# count is easy to miss, so surface an explicit manual-restart notice with
+# the exact agent IDs and the command to run.
+attached_skipped = payload.get("skipped_attached_agents") or []
+if attached_skipped:
+    print(
+        "agent_restart_warning: the following agent(s) are running OLD "
+        "code and need a manual restart:"
+    )
+    for agent_id in attached_skipped:
+        print(f"  {agent_id}  (skipped: active tmux session attached)")
+    print(
+        "agent_restart_warning: when ready, run: "
+        f"agent-bridge agent restart {' '.join(attached_skipped)}"
+    )
 if payload.get("dry_run") and payload.get("restart_eligible"):
     print(
         "agent_restart_note: dry-run reports pre-launch eligibility only. "
@@ -2195,6 +2234,36 @@ POST_EOF
       printf '\n'
       bridge_cleanup_render_verification_block "$TARGET_ROOT"
     } >>"$_post_body"
+    # Issue #980: when --restart-agents was requested but one or more
+    # static agents were skipped because the operator's own tmux session
+    # was attached, those agents are still running the OLD code. Append an
+    # explicit manual-restart notice to the post-upgrade task body so the
+    # admin sees it without having to re-derive it from the restart
+    # summary, and queue a dedicated [restart-required] task below so it
+    # is not forgotten. A dry-run-style collection (dry_run=1) is used:
+    # it reads roster + tmux state to compute reason="attached" without
+    # ever invoking `bridge-agent.sh restart`, so it is side-effect free.
+    _attached_skipped_agents=""
+    if [[ $RESTART_AGENTS -eq 1 ]]; then
+      _attached_skip_report="$(bridge_upgrade_collect_agent_restart_report "$TARGET_ROOT" 1 2>/dev/null || true)"
+      _attached_skipped_agents="$(bridge_upgrade_attached_skipped_agents "$_attached_skip_report" || true)"
+    fi
+    if [[ -n "$_attached_skipped_agents" ]]; then
+      # Footgun #11 (refs #265 / #800 / #815): stream the agent list
+      # through a pipe into `while read`, never a here-string, to keep
+      # Bash 5.3.9 out of the `read_comsub` wedge on the apply leap path.
+      _attached_restart_cmd="agent-bridge agent restart $(printf '%s' "$_attached_skipped_agents" | tr '\n' ' ' | sed 's/ *$//')"
+      {
+        printf '\n## Agents needing a manual restart (issue #980)\n\n'
+        printf '%s\n\n' '`--restart-agents` skipped the agent(s) below because your live tmux session was attached. They are still running the OLD code from before this upgrade:'
+        printf '%s\n' "$_attached_skipped_agents" | while IFS= read -r _att_agent; do
+          [[ -n "$_att_agent" ]] || continue
+          printf -- '- `%s` (skipped: active tmux session attached)\n' "$_att_agent"
+        done
+        printf '\nWhen ready, restart them with:\n\n'
+        printf '```\n%s\n```\n' "$_attached_restart_cmd"
+      } >>"$_post_body"
+    fi
     # Persist the task body in state/ so the recovery command the
     # WARN block prints is actually rerunnable. Tempfiles vanish on
     # exit and leave the operator with guidance instead of a command
@@ -2233,6 +2302,64 @@ POST_EOF
       } >&2
     fi
     rm -f "$_post_body" "$_post_task_log"
+
+    # Issue #980: file a dedicated [restart-required] task per
+    # attached-skipped agent so the manual restart is not lost in the
+    # body of the larger [upgrade-complete] task. The title carries the
+    # agent ID + target version so a genuinely new upgrade gets its own
+    # distinct task.
+    #
+    # Dedupe (PR #996 r2): the queue layer does NOT dedupe — every
+    # `task create` unconditionally INSERTs a row — so an operator who
+    # re-runs `upgrade --restart-agents` while staying attached (common:
+    # they are attached *because* they are working) would otherwise get
+    # the admin inbox spammed with duplicate [restart-required] tasks.
+    # Before creating, probe the target install's queue for an already-
+    # open task with the exact same title (`find-open --title-prefix`
+    # over queued|claimed|blocked rows — the same primitive
+    # bridge-task.sh uses for [task-blocked] idempotency) and skip the
+    # create when one is present. Exact-title match is sufficient: the
+    # title pins both agent id and target version.
+    #
+    # Failure to file is non-fatal — the notice is already in the
+    # [upgrade-complete] body and the upgrade summary — so a WARN on
+    # stderr is sufficient.
+    if [[ -n "$_attached_skipped_agents" ]]; then
+      printf '%s\n' "$_attached_skipped_agents" | while IFS= read -r _rr_agent; do
+        [[ -n "$_rr_agent" ]] || continue
+        _rr_title="[restart-required] $_rr_agent — upgrade to $SOURCE_VERSION"
+        # Skip when an open [restart-required] task for this agent+version
+        # already exists in the target queue. `find-open` exits 0 and
+        # prints the id on a match, exits non-zero with no output when
+        # none is open; the `|| true` keeps `set -e` from aborting on the
+        # no-match exit.
+        _rr_existing="$(bridge_upgrade_with_target_env "$TARGET_ROOT" \
+          python3 "$TARGET_ROOT/bridge-queue.py" find-open \
+          --agent "$_post_admin" --title-prefix "$_rr_title" --format id \
+          2>/dev/null || true)"
+        if [[ -n "$_rr_existing" ]]; then
+          echo "[bridge-upgrade] restart-required task already queued for $_rr_agent (task #$_rr_existing) — not re-filing"
+          continue
+        fi
+        _rr_body="$(mktemp "${TMPDIR:-/tmp}/bridge-upgrade-restart-req.XXXXXX")"
+        {
+          printf '# Manual agent restart required\n\n'
+          printf -- '- agent: `%s`\n' "$_rr_agent"
+          printf -- '- to_version: %s\n' "$SOURCE_VERSION"
+          printf -- '- reason: `--restart-agents` skipped this agent during the upgrade because its tmux session was attached (the operator was using it). It is still running the OLD code.\n\n'
+          printf 'When ready, restart it with:\n\n'
+          printf '```\nagent-bridge agent restart %s\n```\n\n' "$_rr_agent"
+          printf 'Close this task once the agent has been restarted.\n'
+        } >"$_rr_body"
+        if ! bridge_upgrade_with_target_env "$TARGET_ROOT" "$TARGET_ROOT/agent-bridge" task create \
+            --to "$_post_admin" --priority normal --from "$_post_admin" \
+            --title "$_rr_title" \
+            --body-file "$_rr_body" >/dev/null 2>&1; then
+          echo "[bridge-upgrade] WARN: could not file [restart-required] task for agent=$_rr_agent (notice still present in [upgrade-complete] body and upgrade summary)" >&2
+        fi
+        rm -f "$_rr_body"
+      done
+    fi
   fi
 fi
 
