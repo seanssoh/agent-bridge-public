@@ -11,8 +11,11 @@ Read-modify-write of `~/.gemini/antigravity-cli/settings.json`:
     pre-empted before launch;
   - add `command(<agb>)` and `command(<agent-bridge>)` to
     `permissions.allow` so the bridge CLIs run without per-call prompts;
-  - set `altScreenMode` to `inline` so `tmux capture-pane` idle detection
-    works on the normal screen (mandated by the wave plan — de-risks B1).
+  - set `altScreenMode` to `always` so the agy render mode is deterministic
+    for `tmux capture-pane` idle detection. (The wave plan first specified
+    `inline`, but agy v1.0.0 rejects that value with a blocking "Settings
+    Error" selector — verified live at Phase-5b QA. `always` is accepted and
+    `tmux capture-pane` reads the alternate screen fine.)
 
 ALL pre-existing keys are preserved. Idempotent: a second run adds nothing
 duplicate. The write is atomic (temp file in the same directory + rename).
@@ -85,8 +88,10 @@ def main(argv: list[str]) -> int:
         if entry not in allow:
             allow.append(entry)
 
-    # altScreenMode — inline keeps tmux capture-pane idle detection working.
-    data["altScreenMode"] = "inline"
+    # altScreenMode — pin a deterministic render mode for tmux capture-pane
+    # idle detection. agy v1.0.0 rejects "inline" (blocking Settings Error);
+    # "always" is accepted and capture-pane reads the alternate screen fine.
+    data["altScreenMode"] = "always"
 
     target_dir = os.path.dirname(os.path.abspath(settings_file)) or "."
     try:
