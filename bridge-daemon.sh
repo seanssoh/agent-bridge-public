@@ -6069,6 +6069,14 @@ bridge_start_queue_gateway_socket_listener() {
   return 0
 }
 
+bridge_daemon_ensure_queue_gateway_socket_listener() {
+  if bridge_start_queue_gateway_socket_listener; then
+    return 0
+  fi
+  daemon_log_event "queue gateway socket listener ensure failed"
+  return 1
+}
+
 bridge_stop_queue_gateway_socket_listener() {
   # PR #571 r3 finding 4: only signal the recorded pid when ALL three
   # are true: pid alive, socket file present, AND connect probe accepts.
@@ -6796,7 +6804,9 @@ cmd_run() {
   BRIDGE_DAEMON_LAST_STEP="startup"
   echo "$$" >"$BRIDGE_DAEMON_PID_FILE"
   BRIDGE_DAEMON_LAST_STEP="queue_gateway_socket_listener"
-  bridge_start_queue_gateway_socket_listener
+  if ! bridge_daemon_ensure_queue_gateway_socket_listener; then
+    :
+  fi
   BRIDGE_DAEMON_LAST_STEP="startup"
 
   # Issue #265: emit a periodic audit `daemon_tick` so external monitoring
@@ -6827,6 +6837,10 @@ cmd_run() {
   last_heartbeat_ts="$now_ts"
 
   while true; do
+    BRIDGE_DAEMON_LAST_STEP="queue_gateway_socket_listener"
+    if ! bridge_daemon_ensure_queue_gateway_socket_listener; then
+      :
+    fi
     BRIDGE_DAEMON_LAST_STEP="sync_cycle"
     if cmd_sync_cycle; then
       :
@@ -6974,6 +6988,7 @@ cmd_stop() {
 
 cmd_status() {
   local socket_status="off"
+  local daemon_running=0
   if bridge_queue_gateway_listener_requested; then
     socket_status="stopped"
     if bridge_queue_gateway_socket_is_running; then
@@ -6981,9 +6996,13 @@ cmd_status() {
     fi
   fi
   if bridge_daemon_is_running; then
+    daemon_running=1
     echo "running pid=$(bridge_daemon_pid) interval=${BRIDGE_DAEMON_INTERVAL}s db=${BRIDGE_TASK_DB} socket_listener=${socket_status}"
   else
     echo "stopped socket_listener=${socket_status}"
+  fi
+  if [[ $daemon_running -eq 1 && "$socket_status" == "stopped" ]]; then
+    echo "warning: socket_listener=stopped (queue gateway socket listener requested but not accepting connections; daemon will retry)"
   fi
 
   # Issue #815 Wave C: surface tick freshness + derived health so

@@ -689,6 +689,78 @@ EOF
   [[ ! -S "$socket_path" ]] || smoke_fail "daemon exit should remove queue socket"
 }
 
+daemon_socket_listener_loop_restart() {
+  local bridge_id socket_path pid_file daemon_log first_pid second_pid create_out task_id show_out i
+
+  export BRIDGE_GATEWAY_TRANSPORT=file
+  export BRIDGE_GATEWAY_LISTENER=auto
+  export BRIDGE_AGENT_ID=""
+  export BRIDGE_AGENT_ENV_FILE=""
+  export BRIDGE_QUEUE_GATEWAY_PEERS="$(id -u):worker-a"
+  export BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT="$SMOKE_TMP_ROOT/daemon-socket-runtime-loop"
+  export BRIDGE_TMPFILES_DIR="$SMOKE_TMP_ROOT/tmpfiles-loop.d"
+  export BRIDGE_TMPFILES_DRIVER=shim
+  export BRIDGE_QUEUE_GATEWAY_SOCKET_START_WAIT_SECONDS=2
+  export BRIDGE_DAEMON_INTERVAL=1
+
+  bridge_id="$(python3 "$SMOKE_REPO_ROOT/bridge-queue-gateway.py" print-runtime-id --bridge-home "$BRIDGE_HOME")"
+  socket_path="$BRIDGE_QUEUE_GATEWAY_RUNTIME_ROOT/$bridge_id/queue-gateway.sock"
+  pid_file="$BRIDGE_STATE_DIR/queue-gateway-socket.pid"
+  daemon_log="$SMOKE_TMP_ROOT/daemon-loop-restart.log"
+  cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
+bridge_add_agent_id_if_missing "worker-a"
+BRIDGE_AGENT_ENGINE["worker-a"]="claude"
+BRIDGE_AGENT_SESSION["worker-a"]="worker-a"
+BRIDGE_AGENT_WORKDIR["worker-a"]="$SMOKE_TMP_ROOT/worker-a"
+BRIDGE_AGENT_LAUNCH_CMD["worker-a"]="BRIDGE_GATEWAY_TRANSPORT=socket claude"
+BRIDGE_AGENT_ISOLATION_MODE["worker-a"]="linux-user"
+BRIDGE_AGENT_OS_USER["worker-a"]="agent-bridge-worker-a"
+EOF
+  mkdir -p "$SMOKE_TMP_ROOT/worker-a"
+  bash "$SMOKE_REPO_ROOT/bridge-daemon.sh" run >"$daemon_log" 2>&1 &
+  DAEMON_SOCKET_PID="$!"
+
+  for ((i = 0; i < 50; i++)); do
+    if [[ -S "$socket_path" && -f "$pid_file" ]] && kill -0 "$DAEMON_SOCKET_PID" 2>/dev/null; then
+      first_pid="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
+      [[ "$first_pid" =~ ^[0-9]+$ ]] && break
+    fi
+    sleep 0.1
+  done
+  [[ "$first_pid" =~ ^[0-9]+$ ]] || smoke_fail "loop-restart: daemon did not start initial listener; log=$(cat "$daemon_log" 2>/dev/null || true)"
+
+  kill "$first_pid" >/dev/null 2>&1 || true
+
+  second_pid=""
+  for ((i = 0; i < 80; i++)); do
+    if [[ -S "$socket_path" && -f "$pid_file" ]] && kill -0 "$DAEMON_SOCKET_PID" 2>/dev/null; then
+      second_pid="$(sed -n '1p' "$pid_file" 2>/dev/null || true)"
+      if [[ "$second_pid" =~ ^[0-9]+$ && "$second_pid" != "$first_pid" ]]; then
+        break
+      fi
+    fi
+    sleep 0.1
+  done
+  [[ "$second_pid" =~ ^[0-9]+$ && "$second_pid" != "$first_pid" ]] \
+    || smoke_fail "loop-restart: daemon did not restart dead queue socket listener (first=$first_pid second=${second_pid:-}); log=$(cat "$daemon_log" 2>/dev/null || true)"
+
+  create_out="$(
+    BRIDGE_GATEWAY_PROXY=1 BRIDGE_AGENT_ID=worker-a BRIDGE_GATEWAY_TRANSPORT=socket python3 "$SMOKE_REPO_ROOT/bridge-queue.py" create \
+      --to worker-a \
+      --from forged \
+      --title "daemon socket restart smoke" \
+      --body "daemon socket restart body" \
+      --format shell
+  )"
+  task_id="$(smoke_shell_field TASK_ID "$create_out")"
+  show_out="$(BRIDGE_GATEWAY_PROXY=0 python3 "$SMOKE_REPO_ROOT/bridge-queue.py" show "$task_id" --format shell)"
+  smoke_assert_contains "$show_out" "TASK_CREATED_BY=worker-a" "loop-restarted socket listener proxies as peer"
+
+  kill "$DAEMON_SOCKET_PID" >/dev/null 2>&1 || true
+  wait "$DAEMON_SOCKET_PID" >/dev/null 2>&1 || true
+  DAEMON_SOCKET_PID=""
+}
+
 # r2 finding 4: daemon listener lifecycle joint pid+socket validation.
 # A stale pid file (process gone, no socket) plus a stale socket file
 # (no owning pid) must both be cleaned up before the next start, so the
@@ -861,10 +933,12 @@ main() {
   # non-Linux so the daemon smoke stays green on operator workstations.
   if smoke_is_linux; then
     smoke_run "queue gateway socket listener lifecycle" daemon_socket_listener_contract
+    smoke_run "queue gateway socket listener loop restart" daemon_socket_listener_loop_restart
     smoke_run "queue gateway socket listener stale recovery" daemon_socket_listener_stale_recovery
     smoke_run "queue gateway socket listener false-positive liveness" daemon_socket_listener_false_positive_liveness
   else
     smoke_skip "queue gateway socket listener lifecycle" "non-Linux"
+    smoke_skip "queue gateway socket listener loop restart" "non-Linux"
     smoke_skip "queue gateway socket listener stale recovery" "non-Linux"
     smoke_skip "queue gateway socket listener false-positive liveness" "non-Linux"
   fi

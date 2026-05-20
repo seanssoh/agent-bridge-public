@@ -2699,6 +2699,7 @@ assert restart_end is not None, "run_restart end `}` not found"
 preflight_idx = None
 clear_idx_agent = None
 dry_run_idx_agent = None
+isolated_self_guard_idx = None
 for i in range(restart_start, restart_end + 1):
     line = agent_src[i]
     if "bridge_agent_restart_preflight_reason" in line and preflight_idx is None:
@@ -2707,9 +2708,17 @@ for i in range(restart_start, restart_end + 1):
         clear_idx_agent = i
     if "if [[ $dry_run_mode -eq 1 ]]; then" in line and dry_run_idx_agent is None:
         dry_run_idx_agent = i
+    if "cannot restart itself from inside its linux-user session" in line and isolated_self_guard_idx is None:
+        isolated_self_guard_idx = i
 assert preflight_idx is not None, "run_restart no longer calls bridge_agent_restart_preflight_reason"
 assert clear_idx_agent is not None, "run_restart must call bridge_agent_clear_broken_launch"
 assert dry_run_idx_agent is not None, "run_restart no longer branches on dry_run_mode"
+assert isolated_self_guard_idx is not None, "run_restart must reject isolated self-service restart with a clean error before bridge-start hook setup"
+assert isolated_self_guard_idx < dry_run_idx_agent, (
+    f"run_restart isolated-self guard is at line {isolated_self_guard_idx + 1}, "
+    f"after the dry-run bridge-start path at line {dry_run_idx_agent + 1}. "
+    "That lets an isolated self `agent restart --dry-run` enter bridge-start hook setup and traceback on controller-owned settings."
+)
 assert clear_idx_agent > preflight_idx, (
     f"run_restart clears broken-launch at line {clear_idx_agent + 1}, "
     f"which is before the preflight guard at line {preflight_idx + 1}. "

@@ -4172,10 +4172,20 @@ run_restart() {
   # timeout created a death loop (issue #69 Defect C). Default 5.
   local verify_max_attempts="${BRIDGE_AGENT_RESTART_CHANNEL_VERIFY_MAX_ATTEMPTS:-5}"
   local verify_attempts=0
+  local os_user=""
+  local current_user=""
 
   shift || true
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") restart <agent> [...]"
   bridge_require_agent "$agent"
+  if [[ "${BRIDGE_AGENT_ID:-}" == "$agent" ]] \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    current_user="$(id -un 2>/dev/null || true)"
+    if [[ -n "$os_user" && "$current_user" == "$os_user" ]]; then
+      bridge_die "isolated agent '$agent' cannot restart itself from inside its linux-user session. Ask a controller/admin agent to run: agent-bridge agent restart $agent"
+    fi
+  fi
   session="$(bridge_agent_session "$agent")"
   [[ -n "$session" ]] || bridge_die "세션 이름이 없습니다: $agent"
   engine="$(bridge_agent_engine "$agent")"
