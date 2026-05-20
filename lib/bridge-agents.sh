@@ -4658,20 +4658,22 @@ bridge_env_file_has_any_nonempty_key() {
 
 # Issue #534: isolation-aware readiness probe for channel `.env` files.
 #
-# Returns one of "present" | "missing" | "unreadable" via stdout. Suppresses
-# raw grep stderr (which previously leaked `Permission denied` to the daemon
-# log on every channel-health cycle in linux-user isolation when the
-# controller-side ACL had drifted). Distinguishes:
+# Returns one of "present" | "missing" | "unreadable" | "controller-blind"
+# via stdout. Suppresses raw grep stderr (which previously leaked
+# `Permission denied` to the daemon log on every channel-health cycle in
+# linux-user isolation). Distinguishes:
 #
-#   - "present"    — file readable and at least one of the requested keys
-#                    has a non-empty value.
-#   - "missing"    — file absent OR file readable but no requested key is
-#                    present with a non-empty value.
-#   - "unreadable" — file exists but the controller cannot read it (EACCES).
-#                    Under v2 the per-agent group + setgid contract covers
-#                    controller access; a persistent unreadable result here
-#                    means a non-ACL filesystem issue (mode drift, ownership
-#                    drift) and the caller surfaces it as a channel-health miss.
+#   - "present"         — file readable and at least one of the requested
+#                         keys has a non-empty value.
+#   - "missing"         — file absent OR file readable but no requested key
+#                         is present with a non-empty value.
+#   - "unreadable"      — file exists but controller cannot read it AND the
+#                         sudo-as-agent probe also fails (ownership/mode
+#                         drift or sudo/probe drift); caller surfaces as
+#                         channel-health miss.
+#   - "controller-blind"— isolated agent + passwordless sudo unavailable;
+#                         caller degrades to status=unknown (fail-open) to
+#                         avoid a false channel_health_miss row.
 #
 # rc=1 vs rc=2 from grep:
 #   The internal grep helper returns 1 on "no match" and 2 on file/permission
@@ -4796,9 +4798,10 @@ exit 1
     esac
   fi
 
-  # v2: no ACL repair retry. The per-agent group + setgid contract
-  # handles controller access; a persistent unreadable result here is
-  # a non-ACL filesystem drift the caller surfaces as channel-health miss.
+  # v3: the sudo-as-agent probe handled the isolated case above.
+  # Reaching here means the file is genuinely unreadable to both the
+  # controller and the isolated UID probe, indicating ownership/mode or
+  # sudo drift — not something fixable via group/ACL grants.
 
   # Suppress unused-warning shellcheck when item is reserved for future
   # per-channel scoped repair; ms365/teams currently share the agent-wide
