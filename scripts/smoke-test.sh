@@ -11337,4 +11337,11 @@ bash "$REPO_ROOT/scripts/smoke/watchdog-silence-stderr-capture.sh"
 log "running 981-restart-session-resume-snapshot smoke (issue #981)"
 bash "$REPO_ROOT/scripts/smoke/981-restart-session-resume-snapshot.sh"
 
+# Issue #989 — a roster mutation (channel-add/remove, launch-cmd edit)
+# must refresh the cached runtime/agent-env.sh for a linux-user isolated
+# agent so the cached launch cmd can never regress to a pre-v2 channel
+# state path (the #771-class silent Teams inbound delivery failure).
+log "running 989-isolated-agent-env-state-dir smoke (issue #989)"
+bash "$REPO_ROOT/scripts/smoke/989-isolated-agent-env-state-dir.sh"
+
 log "smoke test passed"

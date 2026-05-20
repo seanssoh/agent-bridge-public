@@ -3340,6 +3340,27 @@ PY
       "$new_class" \
       "$loop_explicit_off_arg" >/dev/null
     after_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
+
+    # Issue #989: a channel-list / launch-cmd mutation must refresh the
+    # cached `runtime/agent-env.sh` for a linux-user isolated agent.
+    # bridge_write_role_block only rewrites the roster file — the
+    # in-memory roster maps still hold the pre-mutation values, and the
+    # cached agent-env.sh (the only roster snapshot an isolated UID can
+    # read) keeps a stale BRIDGE_AGENT_LAUNCH_CMD until the next full
+    # bridge-start.sh run. A stale launch cmd carries a pre-v2 channel
+    # state path (e.g. agents/<X>/.teams instead of
+    # agents/<X>/workdir/.teams), which gives the isolated UID EACCES on
+    # the channel state dir and silently breaks inbound delivery (#771
+    # regression). Invalidate the per-process roster cache (issue #848 —
+    # bridge_load_roster short-circuits on BRIDGE_ROSTER_CACHE_LOADED=1
+    # otherwise, and the writer would replay the pre-mutation maps) then
+    # reload so the writer sees the new channels, then regenerate. Same
+    # invalidate+reload pattern as the create path above. NO-OP for
+    # non-isolated agents.
+    bridge_roster_cache_invalidate
+    bridge_load_roster
+    bridge_ensure_isolated_agent_env_current "$agent" \
+      || bridge_warn "agent update: cached agent-env.sh regeneration reported a problem for '$agent'; run 'agent-bridge migrate isolation v2 --apply --agent $agent' before the next restart"
   else
     after_sha="$before_sha"
   fi
