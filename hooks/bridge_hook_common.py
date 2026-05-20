@@ -19,6 +19,29 @@ from typing import Any, Iterable, Optional
 
 PRIORITY_ORDER = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
 
+# Exact keys from bridge_render_template_string (bridge-agent.sh) that are
+# substituted at scaffold time. Stored as frozenset for O(1) membership checks.
+# Do NOT replace with a generic <…> regex — managed docs intentionally contain
+# non-placeholder angle-bracket tokens such as <user-id>, <self>, <task_id>,
+# <agent-home>, and <configured-admin-agent>.
+IDENTITY_PLACEHOLDER_PATTERNS: frozenset[str] = frozenset({
+    "<Agent Name>",
+    "<agent-id>",
+    "<Role>",
+    "<Role Summary>",
+    "<Runtime>",
+    "<Boss>",
+    "<한 줄 역할 설명>",
+    "<표시 이름>",
+    "<Session Type>",
+    "<핵심 책임>",
+    "<주 요청자>",
+    "<Claude Code CLI | Codex CLI>",
+    "<반드시 지킬 운영 규칙>",
+    "<위험 작업 제한>",
+    "<보고 방식>",
+})
+
 
 def bridge_task_db() -> Path:
     explicit = os.environ.get("BRIDGE_TASK_DB", "").strip()
@@ -358,6 +381,23 @@ def onboarding_state_from_file(path: Path | None) -> str:
     if not match:
         return "missing"
     return match.group(1)
+
+
+def _residual_placeholders_in(path: Path | None) -> list[str]:
+    """Return sorted list of scaffold placeholder strings still present in path.
+
+    Returns [] when the file is absent, unreadable, or clean.
+    Uses IDENTITY_PLACEHOLDER_PATTERNS — an explicit audited set from
+    bridge_render_template_string — to avoid false-positives on intentional
+    angle-bracket tokens like <user-id> or <configured-admin-agent>.
+    """
+    if not path or not path.exists():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    return sorted(p for p in IDENTITY_PLACEHOLDER_PATTERNS if p in text)
 
 
 def _stamp_next_session_delivered(agent: str, next_session: Path) -> str | None:
@@ -702,6 +742,25 @@ def bootstrap_artifact_context(agent: str) -> str:
             f"Onboarding pending: {session_type} says Onboarding State: pending. "
             "Stay in onboarding flow until it is complete before doing unrelated work."
         )
+
+    # Detect scaffold placeholder residue in SOUL.md / CLAUDE.md.
+    # An agent can have SESSION-TYPE.md marked 'complete' while still
+    # carrying unfilled template tokens — e.g. when scaffolded before
+    # bridge_render_template_string existed or without explicit identity args.
+    # Warn independently of onboarding_state so the agent self-corrects even
+    # when SESSION-TYPE.md already says complete.
+    for _fname in ("SOUL.md", "CLAUDE.md"):
+        _candidate = first_existing_path(
+            [workdir / _fname, default_home / _fname]
+        )
+        _residual = _residual_placeholders_in(_candidate)
+        if _residual:
+            lines.append(
+                f"Template placeholder residue: {_candidate} still contains "
+                f"unfilled scaffold tokens: {', '.join(_residual)}. "
+                "Fill the 핵심 정보 block in SOUL.md and CLAUDE.md before "
+                "proceeding with normal work."
+            )
 
     # Issue #132a: surface any pending-attention spool entries queued while the
     # agent was busy so the operator knows replays will follow once the input
