@@ -356,17 +356,6 @@ WORK_DIR="$(bridge_agent_workdir "$AGENT")"
 DEFAULT_WORK_DIR="$(bridge_agent_default_home "$AGENT")"
 ENGINE="$(bridge_agent_engine "$AGENT")"
 
-# Antigravity wave (Track A0): temporary no-launch guard. A0 makes every
-# public surface ACCEPT the `antigravity` engine (CLI flags, wave, static
-# create/update) but the launch path is not built yet. bridge-start.sh is
-# the single launch chokepoint — both the `agent-bridge` dynamic path
-# (which execs into here) and direct static starts pass through — so the
-# intermediate integration state fails loudly on every launch attempt.
-# Temporary guard — Track C1 removes it when the agy launch branch lands.
-if [[ "$ENGINE" == "antigravity" ]]; then
-  bridge_die "antigravity 엔진 런치 경로는 아직 준비되지 않았습니다 (C1 트랙 대기)"
-fi
-
 RUNNER="$SCRIPT_DIR/bridge-run.sh"
 ENV_PREFIX="$(bridge_export_env_prefix)"
 EFFECTIVE_CONTINUE_MODE="$(bridge_agent_continue "$AGENT")"
@@ -508,6 +497,25 @@ elif [[ "$ENGINE" == "codex" && $SAFE_MODE -eq 0 ]]; then
   fi
   if ! bridge_ensure_codex_hooks >/dev/null; then
     bridge_die "Codex hook 설정에 실패했습니다: $WORK_DIR"
+  fi
+elif [[ "$ENGINE" == "antigravity" && $SAFE_MODE -eq 0 ]]; then
+  # Antigravity wave (Track C1): the real agy launch path. agy has no
+  # native Claude-style SessionStart-hook surface, so there are no hook
+  # ensures here — the launch-time `agy -i <bootstrap-prompt>` (built by
+  # bridge_antigravity_dynamic_launch_cmd) is the SessionStart analogue.
+  # Preseed the agy settings.json BEFORE launch: trust the workdir
+  # (pre-empts the trust selector), allow the bridge CLIs, and force
+  # altScreenMode=inline so tmux capture-pane idle detection works.
+  if ! bridge_antigravity_settings_preseed "$WORK_DIR"; then
+    bridge_warn "Antigravity settings preseed skipped or failed: $WORK_DIR"
+  fi
+  if ! bridge_project_skill_bootstrap_needed "$ENGINE" "$WORK_DIR"; then
+    FORCE_FRESH_SESSION=1
+  fi
+  if [[ $INSTALL_PROJECT_SKILL -eq 1 ]]; then
+    if ! bridge_bootstrap_project_skill "$ENGINE" "$WORK_DIR"; then
+      bridge_warn "Antigravity bridge skill bootstrap skipped or conflicted: $WORK_DIR"
+    fi
   fi
 fi
 

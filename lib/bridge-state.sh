@@ -130,6 +130,13 @@ bridge_build_dynamic_launch_cmd() {
       fi
       bridge_claude_dynamic_launch_cmd "$agent" "$effective_continue" "$continue_fallback" "$session_id"
       ;;
+    antigravity)
+      # Track C1: agy carries the mandatory `-i` bootstrap on fresh
+      # sessions; resume (continue=1 + a non-empty session_id) uses the
+      # `--conversation <id>` form. The session_id here is hydrated by
+      # bridge_normalize_agent_session_id above (the non-claude branch).
+      bridge_antigravity_dynamic_launch_cmd "$agent" "$continue_mode" "$session_id"
+      ;;
     *)
       printf '%s' "${BRIDGE_AGENT_LAUNCH_CMD[$agent]-}"
       ;;
@@ -177,6 +184,12 @@ bridge_build_resume_launch_cmd() {
       else
         printf '%s' "$resume_cmd"
       fi
+      ;;
+    antigravity)
+      # Track C1: the early-return guard above already proved
+      # continue_mode==1 and session_id non-empty, so the launch builder
+      # deterministically emits the `--conversation <id>` resume form.
+      bridge_antigravity_dynamic_launch_cmd "$agent" 1 "$session_id"
       ;;
     *)
       return 1
@@ -533,6 +546,18 @@ bridge_build_safe_launch_cmd() {
         launch_cmd="$(bridge_build_dynamic_launch_cmd "$agent")"
         bridge_codex_launch_with_hooks "$launch_cmd"
       fi
+      ;;
+    antigravity)
+      # Track C1: safe-mode launches agy BARE — no `-i` bootstrap, no
+      # settings preseed, no project-skill bootstrap. This mirrors
+      # claude/codex safe-mode, which also skip the bridge context
+      # injection so an operator can recover a wedged agent without the
+      # managed setup. (codex/claude safe-mode still route through their
+      # hook-pinning wrapper; agy has no hook surface to pin, so the bare
+      # `agy --dangerously-skip-permissions` is the deliberate analogue.)
+      # Explicit arm rather than the `*)` passthrough so the bare launch
+      # is auditable and not an accidental fall-through.
+      bridge_join_quoted agy --dangerously-skip-permissions
       ;;
     *)
       printf '%s' "${BRIDGE_AGENT_LAUNCH_CMD[$agent]-}"

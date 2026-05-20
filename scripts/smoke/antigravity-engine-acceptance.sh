@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# scripts/smoke/antigravity-engine-acceptance.sh — Antigravity wave Track A0.
+# scripts/smoke/antigravity-engine-acceptance.sh — Antigravity wave Track A0
+# (T6 updated by Track C1 — the A0 launch guard it removed is now gone).
 #
 # Validates that the `antigravity` engine is accepted on every public
 # surface A0 owns, that `agy`/`gemini` aliases normalize to the canonical
-# `antigravity` value, and that launching is still blocked by the
-# temporary bridge-start.sh guard (Track C1 removes that guard).
+# `antigravity` value, and that the dynamic spawn parser still recognizes
+# the `--agy` flag now that the real C1 launch branch has landed.
 #
 # Assertions:
 # T1: helper-level — bridge_engine_binary_name maps engine VALUE -> binary
@@ -17,10 +18,10 @@
 # T4: `agent create ... --engine agy --dry-run` — the alias normalizes;
 #     the planned engine is stored as `antigravity`.
 # T5: linux-user + antigravity create is refused with a clear message.
-# T6: `agent-bridge --agy --name ... --no-attach` parses all the way
-#     through and stops only at the bridge-start.sh launch guard.
-# T7: positive control — `agent-bridge --codex` is unaffected (does not
-#     hit the antigravity launch guard).
+# T6: `agent-bridge --agy --name ... --no-attach` parses the flag and
+#     proceeds PAST the (C1-removed) A0 launch guard.
+# T7: positive control — `agent-bridge --codex` is unaffected (never
+#     emitted the antigravity launch guard).
 
 set -euo pipefail
 
@@ -148,17 +149,20 @@ assert_linux_user_guard() {
     "create antigravity + linux-user refused with a clear message"
 }
 
-assert_spawn_reaches_launch_guard() {
+assert_spawn_past_launch_guard() {
   reset_runtime
   local probe_dir="$SMOKE_TMP_ROOT/agy-probe"
   mkdir -p "$probe_dir"
   local out
-  # --no-attach keeps us out of an interactive tmux attach. The flag
-  # parses through, validation + scaffold run, and the launch finally
-  # stops at the temporary bridge-start.sh guard.
+  # --no-attach keeps us out of an interactive tmux attach. Track C1
+  # removed the temporary bridge-start.sh launch guard and landed the
+  # real agy launch branch, so the spawn now parses + proceeds PAST the
+  # (removed) guard. This smoke only asserts the guard is gone and the
+  # flag still parses — the full launch contract is covered by
+  # antigravity-settings-preseed.sh and the C1 launch-builder checks.
   out="$(run_agent_bridge --agy --name agyprobe --workdir "$probe_dir" --no-attach)"
-  smoke_assert_contains "$out" "C1 트랙 대기" \
-    "--agy spawn reaches the temporary bridge-start.sh launch guard"
+  smoke_assert_not_contains "$out" "C1 트랙 대기" \
+    "--agy spawn no longer hits the (removed) A0 launch guard"
   smoke_assert_not_contains "$out" "알 수 없는 옵션" \
     "--agy flag is recognized by the dynamic spawn parser"
 }
@@ -180,7 +184,7 @@ main() {
   smoke_run "T3: create --engine antigravity"      assert_create_antigravity
   smoke_run "T4: create --engine agy alias"        assert_create_agy_alias
   smoke_run "T5: linux-user + antigravity guard"   assert_linux_user_guard
-  smoke_run "T6: --agy spawn reaches launch guard" assert_spawn_reaches_launch_guard
+  smoke_run "T6: --agy spawn past launch guard"    assert_spawn_past_launch_guard
   smoke_run "T7: --codex unaffected"               assert_codex_unaffected
 
   smoke_log "PASS"
