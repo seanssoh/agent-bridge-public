@@ -983,8 +983,15 @@ bridge_isolation_v2_migrate_normalize_layout() {
     # files group-rw so the isolated UID can write its runtime state).
     for sub in "${writable_subs[@]}"; do
       [[ -d "$agent_root/$sub" ]] || continue
+      # workdir: exclude channel state dir contents (v3 0600/no-ACL, #998 PR B)
+      local -a _sub_excl=()
+      if [[ "$sub" == "workdir" ]]; then
+        _sub_excl=(--exclude-subdir .teams --exclude-subdir .ms365
+                   --exclude-subdir .discord --exclude-subdir .telegram
+                   --exclude-subdir .mattermost)
+      fi
       bridge_isolation_v2_chgrp_setgid_recursive \
-        "$agent_grp" 2770 0660 "$agent_root/$sub" \
+        "$agent_grp" 2770 0660 "$agent_root/$sub" "${_sub_excl[@]}" \
         || { bridge_warn "normalize_layout: agents/$agent/$sub chgrp_setgid_recursive failed"; return 1; }
     done
 
@@ -1003,7 +1010,10 @@ bridge_isolation_v2_migrate_normalize_layout() {
     # so the operator can grep the migration log for "workdir-verify".
     if [[ -d "$agent_root/workdir" ]]; then
       if bridge_isolation_v2_verify_chgrp_setgid_recursive \
-            "$agent_grp" 2770 0660 "$agent_root/workdir" 2>/dev/null; then
+            "$agent_grp" 2770 0660 "$agent_root/workdir" \
+            --exclude-subdir .teams --exclude-subdir .ms365 \
+            --exclude-subdir .discord --exclude-subdir .telegram \
+            --exclude-subdir .mattermost 2>/dev/null; then
         printf '[migrate] workdir-verify ok agent=%s grp=%s\n' "$agent" "$agent_grp" >&2
       else
         bridge_warn "[migrate] workdir-verify FAIL agent=$agent grp=$agent_grp — see preceding warnings"
