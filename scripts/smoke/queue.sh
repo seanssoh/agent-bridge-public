@@ -80,6 +80,15 @@ queue_daemon_step_contract() {
   task_id="$(smoke_shell_field TASK_ID "$create_out")"
   now_ts="$(date +%s)"
   activity_ts="$((now_ts - 300))"
+  # Issue #1014 A: the daemon idle-nudge now gates on task-queued age — a
+  # task younger than the nudge redelivery window does NOT re-nudge (the
+  # task-arrival push already covered it). This contract exercises the
+  # nudge-candidate path, so backdate created_ts past the window so the
+  # task is eligible for an ACTION REQUIRED nudge. The backdate runs
+  # through a standalone file-as-argv helper (no interpreter
+  # heredoc-stdin — footgun #11; see scripts/lint-heredoc-ban.sh).
+  python3 "$SCRIPT_DIR/nudge-task-age-gate-helpers/backdate-task-created-ts.py" \
+    "$BRIDGE_TASK_DB" "$((now_ts - 600))" "$task_id"
   snapshot="$SMOKE_TMP_ROOT/agent-summary.tsv"
   cat >"$snapshot" <<EOF
 agent	queued	claimed	blocked	active	idle	last_seen	last_nudge	session	engine	workdir	session_activity_ts
@@ -115,6 +124,12 @@ EOF
       --format shell
   )"
   second_id="$(smoke_shell_field TASK_ID "$create_out")"
+  # Issue #1014 A: backdate the second task past the redelivery window
+  # too — a never-nudged task only counts as a fresh nudge trigger once
+  # it has aged past the window (a still-fresh task is covered by its
+  # task-arrival push).
+  python3 "$SCRIPT_DIR/nudge-task-age-gate-helpers/backdate-task-created-ts.py" \
+    "$BRIDGE_TASK_DB" "$((now_ts - 600))" "$second_id"
   new_out="$(
     python3 "$SMOKE_REPO_ROOT/bridge-queue.py" daemon-step \
       --snapshot "$snapshot" \

@@ -180,7 +180,7 @@ bridge_layout_resolver_validate_env() {
           # `tmux setenv -u -g` cleanup that actually removes the
           # server-level leak (bridge-upgrade.sh).
           if [[ -z "${_BRIDGE_LAYOUT_STALE_ENV_WARNED:-}" ]]; then
-            bridge_warn "BRIDGE_LAYOUT=${layout} is a stale pre-v0.8.0 env override; marker ${_stale_marker_path} pins this install to v2. Preferring marker. To silence: \`unset BRIDGE_LAYOUT\` in your shell rc (and run \`agent-bridge upgrade --apply\` once to clear any tmux server-level leak)."
+            bridge_warn "BRIDGE_LAYOUT=${layout} is a stale pre-v0.8.0 env override; marker ${_stale_marker_path} pins this install to v2. Preferring marker. To silence: \`unset BRIDGE_LAYOUT\` in your shell rc, then stop and restart the bridge daemon from a clean shell (\`bash bridge-daemon.sh stop\` then \`bash bridge-daemon.sh start\`) so long-running daemon/agent processes stop re-injecting the stale value. A leftover tmux server-level leak is cleared by \`agent-bridge upgrade --apply\`."
             export _BRIDGE_LAYOUT_STALE_ENV_WARNED=1
           fi
           BRIDGE_LAYOUT_IGNORED_PARTIAL_ENV="BRIDGE_LAYOUT (stale ${layout} override; marker=v2)"

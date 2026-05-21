@@ -527,6 +527,37 @@ _READ_INTENT_BASH_COMMANDS = frozenset(
 )
 
 
+# Issue #1014 C: provably non-mutating shell builtins that routinely
+# appear as a *prelude* stage in a read pipeline — `cd ~/.agent-bridge &&
+# grep BRIDGE agent-roster.local.sh`, `test -f roster && cat roster`,
+# `echo "checking"; grep …`. None of these can mutate the filesystem:
+# `cd`/`pwd` only move/print the working directory, `test`/`[` are
+# read-only predicates, `echo`/`printf` write to stdout (any redirection
+# is independently rejected by the per-token write-redirect check below),
+# and `true`/`false`/`:` are no-ops. Before #1014 a neutral prelude stage
+# disqualified the whole pipeline, so a routine `cd … && grep <protected>`
+# read was mis-classified as a write and drew the write-oriented
+# `config set` deny. Treating these stages as transparent does NOT widen
+# the write surface — a genuine write stage (or any output redirection)
+# anywhere in the pipeline still flips the classification to write-intent.
+_NEUTRAL_PRELUDE_BASH_COMMANDS = frozenset(
+    {
+        "cd",
+        "pushd",
+        "popd",
+        "pwd",
+        "test",
+        "[",
+        "[[",
+        "echo",
+        "printf",
+        "true",
+        "false",
+        ":",
+    }
+)
+
+
 def _stage_first_token(stage: str) -> str:
     """Return the leading command word of a single pipeline stage.
 
@@ -646,6 +677,12 @@ def _is_read_intent_bash(command: str) -> bool:
             continue
         # Strip any path component so `/usr/bin/cat` classifies as `cat`.
         leaf = first.rsplit("/", 1)[-1]
+        # Issue #1014 C: a neutral prelude stage (`cd`, `test`, `echo`, …)
+        # cannot mutate state — output redirection is already rejected by
+        # the per-token check above — so it must not disqualify an
+        # otherwise read-intent pipeline.
+        if leaf in _NEUTRAL_PRELUDE_BASH_COMMANDS:
+            continue
         if leaf in _READ_INTENT_BASH_COMMANDS:
             # Reject the in-place / write-mode flag forms even for tools
             # that are normally read-only (e.g. `sed -i`, `awk -i inplace`).
@@ -1018,7 +1055,70 @@ def _command_substring_hits_protected_needle(command: str) -> bool:
     return False
 
 
-def _token_matches_protected(token: str, protected: Path) -> bool:
+def _command_cd_base_dir(command: str) -> Path | None:
+    """Resolve the working directory established by a leading ``cd`` stage.
+
+    Issue #1014 C: a routine diagnostic prelude — ``cd $BRIDGE_HOME &&
+    grep BRIDGE agent-roster.local.sh`` — names the protected roster
+    file with a CWD-relative path. The argv path check compares each
+    token against the protected *absolute* path, so the relative
+    ``agent-roster.local.sh`` token never matches and the roster
+    allow(read)/deny(write) branch never fires — reads pass by accident
+    and, worse, writes pass too (a protected-path bypass).
+
+    This resolves a *simple* leading ``cd <dir>`` prelude so the caller
+    can also test relative path fragments against ``<dir>``. Deliberately
+    conservative: only a ``cd`` that is the first command stage and has
+    exactly one directory argument is honored. A `cd` buried later in
+    the pipeline, a `cd` with options, or a `cd -`/`cd ~`-with-no-arg is
+    not resolved — those are not the #1014 shape and resolving them would
+    widen surface for no benefit. Returns the absolute directory Path or
+    None.
+
+    Stage detection uses the raw command string and ``_COMMAND_OPERATOR_RE``
+    — the same shell-operator model ``_is_read_intent_bash`` uses — so the
+    first stage is recognized regardless of the separator form: ``&&``,
+    ``;``, ``||``, ``|``, ``&``, or a newline, with or without surrounding
+    whitespace. ``shlex.split`` does NOT emit ``;`` / newline as standalone
+    operator tokens in the no-space form (``cd $X;echo`` arrives as a
+    single ``$X;echo`` token), so relying on token equality missed those
+    shapes (codex r2 catch on PR #1019).
+    """
+    if not command.strip():
+        return None
+    # First shell stage = text before the first &&/;/|/||/&/newline.
+    first_stage = _COMMAND_OPERATOR_RE.split(command, maxsplit=1)[0].strip()
+    if not first_stage:
+        return None
+    try:
+        stage_tokens = shlex.split(first_stage, posix=True, comments=False)
+    except ValueError:
+        return None
+    if len(stage_tokens) < 2 or stage_tokens[0] != "cd":
+        return None
+    # Exactly one argument: `cd <dir>`. Reject `cd -`, option flags, and
+    # multi-arg forms — none are the #1014 prelude shape.
+    dir_args = [t for t in stage_tokens[1:] if t]
+    if len(dir_args) != 1:
+        return None
+    raw_dir = dir_args[0]
+    if raw_dir.startswith("-"):
+        return None
+    expanded = os.path.expandvars(os.path.expanduser(raw_dir))
+    if not expanded:
+        return None
+    try:
+        candidate = Path(expanded)
+    except Exception:
+        return None
+    if not candidate.is_absolute():
+        return None
+    return candidate
+
+
+def _token_matches_protected(
+    token: str, protected: Path, base_dir: Path | None = None
+) -> bool:
     for fragment in _alias_path_fragments(token):
         expanded = os.path.expandvars(os.path.expanduser(fragment))
         if not expanded:
@@ -1029,6 +1129,17 @@ def _token_matches_protected(token: str, protected: Path) -> bool:
             continue
         if candidate == protected:
             return True
+        # Issue #1014 C: a CWD-relative fragment under a resolved `cd`
+        # prelude — `cd $BRIDGE_HOME && … agent-roster.local.sh` — must
+        # also be tested against the prelude directory so a relative
+        # reference to the protected file is detected (and the
+        # read/write branch then fires correctly).
+        if base_dir is not None and not candidate.is_absolute():
+            try:
+                if (base_dir / candidate) == protected:
+                    return True
+            except Exception:
+                pass
     return False
 
 
@@ -1314,8 +1425,15 @@ def _bash_argv_references_path(command: str, protected: Path) -> bool:
     except ValueError:
         return protected_str in command
 
+    # Issue #1014 C: resolve a leading `cd <dir>` prelude so a CWD-relative
+    # reference to the protected file (`cd $BRIDGE_HOME && … agent-roster
+    # .local.sh`) is detected, not silently missed. Pass the RAW command —
+    # the prelude detector splits on the shell-operator model so `;` /
+    # newline separators (no-space forms) are recognized too.
+    cd_base_dir = _command_cd_base_dir(command)
+
     def _check_value_token(value: str) -> bool:
-        return _token_matches_protected(value, protected)
+        return _token_matches_protected(value, protected, cd_base_dir)
 
     skip_next_payload = False
     treat_next_as_value = False
@@ -1351,7 +1469,7 @@ def _bash_argv_references_path(command: str, protected: Path) -> bool:
             if _check_value_token(value):
                 return True
             continue
-        if _token_matches_protected(tok, protected):
+        if _token_matches_protected(tok, protected, cd_base_dir):
             return True
     return False
 
@@ -1388,6 +1506,12 @@ def _bash_argv_references_system_config(command: str) -> bool:
         # by a space still passes — see _PATH_PREFIX_CHARS for rationale.
         return _command_substring_hits_protected_needle(command)
 
+    # Issue #1014 C: resolve a leading `cd <dir>` prelude so a CWD-relative
+    # reference to a protected system-config file is detected — same
+    # bypass class as the roster path in _bash_argv_references_path. Pass
+    # the RAW command so `;` / newline separators are recognized.
+    cd_base_dir = _command_cd_base_dir(command)
+
     def _check_value(value: str) -> bool:
         for fragment in _alias_path_fragments(value):
             expanded = os.path.expandvars(os.path.expanduser(fragment))
@@ -1399,6 +1523,12 @@ def _bash_argv_references_system_config(command: str) -> bool:
                 continue
             if is_protected_path(candidate):
                 return True
+            if cd_base_dir is not None and not candidate.is_absolute():
+                try:
+                    if is_protected_path(cd_base_dir / candidate):
+                        return True
+                except Exception:
+                    pass
         return False
 
     skip_next_payload = False

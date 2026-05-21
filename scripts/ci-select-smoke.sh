@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-no-auto-backfill mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir
+  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-no-auto-backfill mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir agent-env-no-stale-bridge-layout
 }
 
 add_all_integration() {
@@ -199,7 +199,11 @@ select_for_path() {
       ;;
 
     bridge-queue.py|bridge-task.sh|bridge-audit.py)
-      add_required queue
+      # Issue #1014 A: bridge-queue.py's daemon idle-nudge now gates the
+      # ACTION REQUIRED nudge on task-queued age so a freshly-pushed task
+      # is not re-nudged within the redelivery window. Cover the
+      # regression smoke whenever the queue backend moves.
+      add_required queue nudge-task-age-gate
       add_integration integration-minimal
       ;;
 
@@ -283,7 +287,12 @@ select_for_path() {
       # credential deny surfaces (raw mention, env dump, argv path,
       # input path). Cover the regression smoke whenever tool-policy.py
       # moves so the exemption + mutation deny contract stays pinned.
-      add_required hooks agent-update v2-cross-class-read admin-hook-exemption
+      # Issue #1014 C: the Bash read-intent classifier now treats a
+      # neutral prelude stage (cd / test / echo / …) as transparent so a
+      # routine `cd … && grep agent-roster.local.sh` read is no longer
+      # mis-classified as a write. Cover the classifier regression smoke
+      # whenever tool-policy.py moves.
+      add_required hooks agent-update v2-cross-class-read admin-hook-exemption tool-policy-roster-read-classify
       add_integration integration-minimal
       ;;
 
