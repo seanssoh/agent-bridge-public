@@ -454,6 +454,19 @@ select_for_path() {
       add_live live-tmux-daemon
       ;;
 
+    bridge-watchdog.py)
+      # bridge-watchdog.py owns the home-profile-contract check
+      # (has_home_profile_contract): the required profile files, the
+      # managed CLAUDE.md block, and the onboarding-staleness signal only
+      # apply to Claude static agents. A new engine (antigravity, v0.14.5)
+      # otherwise falls through to the Claude default and surfaces as a
+      # false status=error. Cover the contract truth-table smoke plus the
+      # registry-anchoring and stderr-capture regressions whenever the
+      # watchdog moves.
+      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture queue
+      add_integration integration-minimal
+      ;;
+
     bridge-docs.py)
       # v0.13.6 hotfix track 1: bridge-docs.py owns AGENT_SHARED_LINKS and
       # the shared-doc render dispatch. The admin-protocol-shared-link
