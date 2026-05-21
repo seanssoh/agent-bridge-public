@@ -50,10 +50,15 @@ def main() -> int:
     check("contract: claude+dynamic", has_contract("claude", "dynamic"), False)
     check("contract: codex+static", has_contract("codex", "static"), False)
     check("contract: codex+dynamic", has_contract("codex", "dynamic"), False)
-    # The antigravity regression: a newer engine must be exempt by
-    # construction, not fall through to the Claude default.
+    # The antigravity regression: a *known* newer engine must be exempt
+    # by construction (it is in NON_CONTRACT_ENGINES).
     check("contract: antigravity+static", has_contract("antigravity", "static"), False)
     check("contract: antigravity+dynamic", has_contract("antigravity", "dynamic"), False)
+    # An *unknown* engine string is NOT exempted — it stays under the
+    # conservative Claude-default contract so a new engine surfaces as
+    # drift instead of silently skipping the check.
+    check("contract: unknown-engine+static", has_contract("future-engine", "static"), True)
+    check("contract: unknown-engine+dynamic", has_contract("future-engine", "dynamic"), False)
 
     # --- required_profile_files -----------------------------------------
     check(
@@ -77,6 +82,12 @@ def main() -> int:
         required_profile_files("claude", "dynamic"),
         (),
     )
+    # An unknown engine stays under the conservative contract.
+    check(
+        "required: unknown-engine+static -> CLAUDE_REQUIRED_FILES",
+        required_profile_files("future-engine", "static"),
+        claude_required,
+    )
 
     # --- classify_status: regression guard ------------------------------
     # A Claude static agent missing profile files must still be error.
@@ -87,6 +98,35 @@ def main() -> int:
             session_type="admin", agent_source="static", engine="claude",
         ),
         "error",
+    )
+    # An unknown engine is held to the conservative contract: missing
+    # files still escalate to error.
+    check(
+        "classify: unknown-engine+static+missing-files -> error",
+        classify_status(
+            ["CLAUDE.md"], [], "complete", False,
+            session_type="", agent_source="static", engine="future-engine",
+        ),
+        "error",
+    )
+    # classify_status gates missing_files through the predicate too: a
+    # non-contract agent with missing_files passed in must not error,
+    # independent of whether the caller pre-emptied `required`.
+    check(
+        "classify: codex+static+missing-files -> ok",
+        classify_status(
+            ["CLAUDE.md"], [], "missing", False,
+            session_type="unknown", agent_source="static", engine="codex",
+        ),
+        "ok",
+    )
+    check(
+        "classify: claude+dynamic+missing-files -> ok",
+        classify_status(
+            ["CLAUDE.md"], [], "pending", False,
+            session_type="dynamic", agent_source="dynamic", engine="claude",
+        ),
+        "ok",
     )
 
     # --- classify_status: antigravity exemptions (the fix) --------------

@@ -266,6 +266,16 @@ def heartbeat_age_seconds(agent_dir: Path) -> tuple[bool, int | None]:
 NON_ONBOARDING_SESSION_TYPES = frozenset({"dynamic", "cron"})
 
 
+# Engines with no Claude-runtime profile contract at the agent home root
+# — none of these CLIs read CLAUDE.md / SOUL.md / SESSION-TYPE.md, so the
+# watchdog must not assert profile drift on them. This is an explicit
+# allowlist, NOT "anything that isn't claude": a genuinely unknown engine
+# string stays under the conservative Claude-default contract so a new
+# engine surfaces as drift (prompting a watchdog update) instead of
+# silently skipping the check. Add a new exempt engine here.
+NON_CONTRACT_ENGINES = frozenset({"codex", "antigravity"})
+
+
 def has_home_profile_contract(engine: str, agent_source: str) -> bool:
     """Whether the watchdog should hold this agent to the Claude-style
     home-profile contract: the ``CLAUDE_REQUIRED_FILES`` set, the managed
@@ -277,24 +287,29 @@ def has_home_profile_contract(engine: str, agent_source: str) -> bool:
     (``antigravity``, v0.14.5) then fell through to the Claude default and
     surfaced as a false ``status=error`` on every scan, because none of
     those three call sites knew about it. This predicate is the single
-    gate so a new engine is exempt by construction.
+    gate so a known exempt engine is exempt by construction.
 
-    Only Claude *static* (or unknown-source — the conservative legacy
-    default) agents carry the contract:
+    The contract holds for:
 
-      - ``agent_source == "dynamic"`` is a full exemption regardless of
+      - Claude agents, static or unknown-source.
+      - Any *unknown* engine string, static or unknown-source — the
+        conservative legacy default (#905). An unknown engine is held to
+        the contract so it surfaces as drift; the fix is to add it to
+        ``NON_CONTRACT_ENGINES`` once the watchdog is taught about it.
+
+    The contract is waived for:
+
+      - ``agent_source == "dynamic"`` — a full exemption regardless of
         engine. Dynamic agents are ad-hoc spawns
         (``agent-bridge --<engine> --name``) that never run
         ``bridge_scaffold_agent_home``, so legitimately have no profile
         files, no managed block, and no SESSION-TYPE.md. The watchdog has
         no finer "scaffolded vs ad-hoc" signal than ``agent_source``.
-      - Non-Claude engines (codex, antigravity) have no Claude-runtime
-        profile-file contract at the agent home root — none of those CLIs
-        read CLAUDE.md / SOUL.md / SESSION-TYPE.md.
+      - The known non-Claude engines in ``NON_CONTRACT_ENGINES``.
     """
     if agent_source == "dynamic":
         return False
-    return engine == "claude"
+    return engine not in NON_CONTRACT_ENGINES
 
 
 def required_profile_files(engine: str, agent_source: str = "") -> tuple[str, ...]:
@@ -321,18 +336,21 @@ def classify_status(
     agent_source: str = "",
     engine: str = "claude",
 ) -> str:
-    if missing_files:
-        return "error"
-    # The onboarding-staleness and managed-block signals only apply to
-    # agents under the home-profile contract (see
-    # has_home_profile_contract). Non-Claude engines have no
-    # SESSION-TYPE.md / managed-CLAUDE.md contract (#905, originally codex
-    # only — now also antigravity), and dynamic agents are ad-hoc spawns
-    # that legitimately land with `missing_managed_claude_block=yes` and
-    # `onboarding_state=pending` until their first run; flagging either is
-    # admin alert-fatigue for a condition admin cannot resolve (#907,
-    # #303/#304/#343 anti-pattern).
+    # All three drift signals — missing required files, managed-block,
+    # onboarding staleness — are gated on the home-profile contract (see
+    # has_home_profile_contract). Known non-Claude engines have no
+    # SESSION-TYPE.md / managed-CLAUDE.md / required-file contract (#905,
+    # originally codex only — now also antigravity), and dynamic agents
+    # are ad-hoc spawns that legitimately land with
+    # `missing_managed_claude_block=yes` and `onboarding_state=pending`
+    # until their first run; flagging any of these is admin alert-fatigue
+    # for a condition admin cannot resolve (#907, #303/#304/#343
+    # anti-pattern). missing_files is gated here too so classify_status is
+    # internally consistent and does not depend on the caller having
+    # pre-emptied `required` via required_profile_files.
     contract = has_home_profile_contract(engine, agent_source)
+    if missing_files and contract:
+        return "error"
     onboarding_stale = (
         contract
         and onboarding_state in {"pending", "missing"}
@@ -369,12 +387,15 @@ def scan_agent(
         required = required_profile_files(engine, agent_source)
         missing_files = [name for name in required if not (agent_dir / name).exists()]
         # The `missing_managed_claude_block` FIELD records actual file
-        # state, so it is gated on engine alone: only Claude agents own a
-        # CLAUDE.md to inspect (codex / antigravity don't). A dynamic
-        # Claude agent still gets an accurate field — #907 keeps the field
-        # truthful and suppresses only the classification *signal*, which
-        # classify_status gates through has_home_profile_contract.
-        if engine == "claude":
+        # state, so it is gated on engine alone, NOT the contract: any
+        # engine that could own a CLAUDE.md (Claude + unknown engines —
+        # same conservative set as the contract) gets a truthful field;
+        # the known non-Claude engines in NON_CONTRACT_ENGINES definitively
+        # don't own one. A dynamic Claude agent still gets an accurate
+        # field — #907 keeps the field truthful and suppresses only the
+        # classification *signal*, which classify_status gates through
+        # has_home_profile_contract.
+        if engine not in NON_CONTRACT_ENGINES:
             claude_text = read_text(agent_dir / "CLAUDE.md") if (agent_dir / "CLAUDE.md").exists() else ""
             missing_block = MANAGED_START not in claude_text or MANAGED_END not in claude_text
         else:
