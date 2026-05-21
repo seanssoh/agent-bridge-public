@@ -22,6 +22,14 @@ Args (positional, order-sensitive):
         in this set are skipped during fs-scan; a candidate that matches an
         entry is treated as quarantined and resolves to the freshest other
         eligible transcript (rc=2) instead of being accepted as-is.
+    sys.argv[6] — claude_config_dir (optional, issue #1015): the agent's
+        Claude config directory (`CLAUDE_CONFIG_DIR`). Isolation-v2 launches
+        Claude with a custom HOME/CLAUDE_CONFIG_DIR, so the session JSON and
+        transcripts live under `<agent-home>/.claude/`, not the daemon
+        process's `~/.claude/`. When this argument is empty the resolver
+        falls back to the `CLAUDE_CONFIG_DIR` env var, then `<HOME>/.claude`,
+        then `os.path.expanduser("~/.claude")` — keeping the non-isolated
+        path and existing call sites byte-for-byte unchanged.
 
 Stdout: accepted session id, or empty when there is nothing to resume.
 Exit code:
@@ -69,6 +77,25 @@ def ordered_slug_candidates(paths):
     return candidates
 
 
+def claude_config_root(explicit: str = "") -> str:
+    """Resolve the Claude config root for the agent being resumed.
+
+    Priority (issue #1015): an explicit argument the bash shim passes >
+    the `CLAUDE_CONFIG_DIR` env var > `<HOME>/.claude` > the ambient
+    `~/.claude`. The last two preserve the pre-#1015 daemon-HOME behaviour
+    for non-isolated agents and call sites that supply nothing.
+    """
+    if explicit:
+        return explicit
+    env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env_dir:
+        return env_dir
+    home = os.environ.get("HOME")
+    if home:
+        return os.path.join(home, ".claude")
+    return os.path.expanduser("~/.claude")
+
+
 def pid_is_alive(pid):
     try:
         pid_int = int(pid)
@@ -101,6 +128,9 @@ def main() -> int:
         for x in (sys.argv[5] if len(sys.argv) > 5 else "").split(",")
         if x
     }
+    config_root = claude_config_root(
+        sys.argv[6] if len(sys.argv) > 6 else ""
+    )
 
     cutoff = time.time() - max_age_hours * 3600
 
@@ -113,7 +143,7 @@ def main() -> int:
     # path below.
     if candidate:
         for session_path in glob.glob(
-            os.path.expanduser("~/.claude/sessions/*.json")
+            os.path.join(config_root, "sessions", "*.json")
         ):
             try:
                 with open(session_path, "r", encoding="utf-8") as fh:
@@ -142,7 +172,7 @@ def main() -> int:
     eligible = []
     seen_stems = set()
     for slug in ordered_slug_candidates([input_workdir, workdir]):
-        base = os.path.expanduser(f"~/.claude/projects/{slug}")
+        base = os.path.join(config_root, "projects", slug)
         if not os.path.isdir(base):
             continue
         try:

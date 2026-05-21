@@ -104,6 +104,7 @@ prune_missing_dynamic_agents() {
 
 refresh_missing_session_ids() {
   local agent sid exclude_csv created_at detected key _resolved _rc
+  local _claude_config_dir
   local -a excluded
   local persisted_any=0
 
@@ -129,11 +130,18 @@ refresh_missing_session_ids() {
       created_at="0"
     fi
 
+    # Issue #1015: pass the agent's CLAUDE_CONFIG_DIR so isolation-v2
+    # agents are detected against their own `<agent-home>/.claude/`.
+    _claude_config_dir=""
+    if command -v bridge_agent_claude_config_dir >/dev/null 2>&1; then
+      _claude_config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+    fi
     detected="$(bridge_detect_session_id \
       "$(bridge_agent_engine "$agent")" \
       "$(bridge_agent_workdir "$agent")" \
       "$created_at" \
-      "$exclude_csv")"
+      "$exclude_csv" \
+      "$_claude_config_dir")"
 
     if [[ -z "$detected" ]]; then
       continue

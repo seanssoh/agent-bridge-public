@@ -234,7 +234,13 @@ bridge_claude_resume_session_id_for_agent() {
   _max_hours_int="${_max_hours_int%.*}"
   [[ "$_max_hours_int" =~ ^[0-9]+$ ]] || _max_hours_int=48
   local _since_ms=$(( ($(date +%s) - _max_hours_int * 3600) * 1000 ))
-  detected="$(bridge_detect_claude_session_id "$workdir" "$_since_ms" "$_quarantine_csv" 2>/dev/null || true)"
+  # Issue #1015: pass the agent's CLAUDE_CONFIG_DIR so isolation-v2 agents
+  # detect transcripts under their own `<agent-home>/.claude/`.
+  local _claude_config_dir=""
+  if command -v bridge_agent_claude_config_dir >/dev/null 2>&1; then
+    _claude_config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+  fi
+  detected="$(bridge_detect_claude_session_id "$workdir" "$_since_ms" "$_quarantine_csv" "$_claude_config_dir" 2>/dev/null || true)"
   [[ -n "$detected" ]] || return 1
   # Belt-and-suspenders: round-trip through the resolver so a missed slug or
   # detection-side regression cannot reintroduce a stale id past this point.
@@ -2889,6 +2895,12 @@ bridge_detect_claude_session_id() {
   local workdir="$1"
   local since_ms="${2:-0}"
   local exclude_csv="${3:-}"
+  # Issue #1015: optional Claude config dir. Isolation-v2 agents launch
+  # Claude with a custom HOME/CLAUDE_CONFIG_DIR, so their session JSON and
+  # transcripts live under `<agent-home>/.claude/`, not the daemon's
+  # `~/.claude/`. Passed through to the helper as a trailing arg; empty
+  # keeps the pre-#1015 daemon-HOME fallback for non-isolated callers.
+  local claude_config_dir="${4:-}"
 
   # #946 L1 (r2): substitution-safe guard. This helper is called
   # exclusively from `$(...)` substitutions (callers parse stdout).
@@ -2896,7 +2908,7 @@ bridge_detect_claude_session_id() {
     return 1
   fi
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/detect-claude-session-id.py" \
-    "$workdir" "$since_ms" "$exclude_csv"
+    "$workdir" "$since_ms" "$exclude_csv" "$claude_config_dir"
 }
 
 # bridge_resolve_resume_session_id is the single source of truth for whether
@@ -2949,8 +2961,22 @@ bridge_resolve_resume_session_id() {
   if ! bridge_resolve_script_dir_check; then
     return 1
   fi
+
+  # Issue #1015: isolation-v2 agents run Claude with a custom
+  # HOME/CLAUDE_CONFIG_DIR, so the session JSON and transcripts live under
+  # `<agent-home>/.claude/`, not the daemon's `~/.claude/`. Resolve the
+  # agent's config dir and pass it through; empty (no agent / helper
+  # unavailable) leaves the helper on its daemon-HOME fallback so the
+  # non-isolated path and other call sites are unchanged.
+  local claude_config_dir=""
+  if [[ -n "$agent" ]] \
+    && command -v bridge_agent_claude_config_dir >/dev/null 2>&1; then
+    claude_config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+  fi
+
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-claude-resume-session-id.py" \
-    "$workdir" "$candidate" "$max_age_hours" "$agent" "$exclude_csv"
+    "$workdir" "$candidate" "$max_age_hours" "$agent" "$exclude_csv" \
+    "$claude_config_dir"
 }
 
 # Returns 0 (true) if the given workdir has any in-window
@@ -3049,13 +3075,18 @@ bridge_detect_session_id() {
   local workdir="$2"
   local since_hint="$3"
   local exclude_csv="${4:-}"
+  # Issue #1015: optional Claude config dir, threaded to the claude branch
+  # so isolation-v2 agents resolve their own `<agent-home>/.claude/` rather
+  # than the daemon's `~/.claude/`. Ignored for codex; empty is harmless.
+  local claude_config_dir="${5:-}"
 
   case "$engine" in
     codex)
       bridge_detect_codex_session_id "$workdir" "$since_hint" "$exclude_csv"
       ;;
     claude)
-      bridge_detect_claude_session_id "$workdir" "$since_hint" "$exclude_csv"
+      bridge_detect_claude_session_id "$workdir" "$since_hint" "$exclude_csv" \
+        "$claude_config_dir"
       ;;
     *)
       printf '%s' ""
@@ -3112,11 +3143,18 @@ bridge_refresh_agent_session_id() {
     done
     exclude_csv="$(IFS=,; echo "${excluded[*]}")"
 
+    # Issue #1015: thread the agent's CLAUDE_CONFIG_DIR through so
+    # isolation-v2 agents detect their own `<agent-home>/.claude/`.
+    local _claude_config_dir=""
+    if command -v bridge_agent_claude_config_dir >/dev/null 2>&1; then
+      _claude_config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+    fi
     detected="$(bridge_detect_session_id \
       "$(bridge_agent_engine "$agent")" \
       "$(bridge_agent_workdir "$agent")" \
       "$since_hint" \
-      "$exclude_csv")"
+      "$exclude_csv" \
+      "$_claude_config_dir")"
 
     if [[ -n "$detected" ]]; then
       BRIDGE_AGENT_SESSION_ID["$agent"]="$detected"

@@ -221,7 +221,14 @@ select_for_path() {
       # cron-only static agents do not go stale between rotation events.
       # daemon-periodic-token-sync covers the due-check / tick / audit /
       # state-file cadence contract.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync
+      #
+      # Issue #1015: lib/bridge-state.sh hosts the resume/detect shims
+      # (bridge_detect_claude_session_id, bridge_detect_session_id,
+      # bridge_resolve_resume_session_id) that thread the agent's
+      # CLAUDE_CONFIG_DIR to the python helpers; bridge-sync.sh's
+      # refresh_missing_session_ids is one of the callers. Cover the
+      # config-root resolution smoke whenever either file moves.
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -435,6 +442,18 @@ select_for_path() {
       # must re-run the Wave C regression smoke that asserts the call
       # returns in <2s.
       add_required 835-static-admin-launch launch launch-dev-channels-injection channel-env-readiness
+      add_integration integration-minimal
+      ;;
+
+    scripts/python-helpers/detect-claude-session-id.py|scripts/python-helpers/resolve-claude-resume-session-id.py)
+      # Issue #1015: these helpers resolve the Claude session JSON +
+      # transcript roots. They must key off the agent's CLAUDE_CONFIG_DIR
+      # (isolation-v2 custom HOME) rather than the daemon process's HOME,
+      # otherwise static agents launch a fresh session on every restart.
+      # 1015-resume-claude-config-dir pins the config-root resolution
+      # (trailing arg > CLAUDE_CONFIG_DIR env > daemon-HOME fallback) and
+      # the backward-compatible non-isolated path.
+      add_required 1015-resume-claude-config-dir 981-restart-session-resume-snapshot
       add_integration integration-minimal
       ;;
 
