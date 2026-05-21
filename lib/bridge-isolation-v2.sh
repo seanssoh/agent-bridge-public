@@ -2379,16 +2379,31 @@ bridge_isolation_v2_reap_isolated_agent_account() {
   # user; nothing to reap. Skip silently.
   [[ "$(uname -s)" == "Linux" ]] || return 0
 
-  # Gate 2 — exact-name match. The resolved OS user MUST be exactly
-  # "<prefix><agent>". This is the core safety gate: it guarantees we
-  # never run userdel/groupdel/setfacl against an account the bridge did
-  # not create or that does not belong to this delete target. A loose
-  # pattern match is explicitly avoided.
-  local pfx="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}"
-  local expected="${pfx}${agent}"
+  # Gate 2 — exact-name match. The resolved OS user MUST exactly equal the
+  # generated bridge-managed account name for this agent. This is the core
+  # safety gate: it guarantees we never run userdel/groupdel/setfacl
+  # against an account the bridge did not create or that does not belong
+  # to this delete target. A loose pattern match is explicitly avoided.
+  #
+  # The expected name MUST be computed via bridge_agent_default_os_user —
+  # the same helper `agent create` uses (bridge-agent.sh) — NOT a raw
+  # "<prefix><agent>" concatenation. `agent create` accepts agent names
+  # longer than the Linux 32-char account budget and that helper
+  # TRUNCATES the composed name to fit. A raw prefix+agent string would
+  # not equal the truncated account the bridge actually created, so the
+  # gate would skip cleanup for every long-named isolated agent — leaving
+  # behind exactly the orphan this function exists to reap (issue #1010).
   if [[ -z "$os_user" ]]; then
     # No OS user resolved from the roster — agent was never an isolated
     # linux-user agent (or its account is already gone). Nothing to do.
+    return 0
+  fi
+  local expected=""
+  if command -v bridge_agent_default_os_user >/dev/null 2>&1; then
+    expected="$(bridge_agent_default_os_user "$agent" 2>/dev/null || printf '')"
+  fi
+  if [[ -z "$expected" ]]; then
+    bridge_warn "agent delete: skipping OS-user cleanup for '$agent' — could not compute the expected bridge account name (refusing to act without an exact-match reference)"
     return 0
   fi
   if [[ "$os_user" != "$expected" ]]; then
@@ -2454,13 +2469,20 @@ bridge_isolation_v2_reap_isolated_agent_account() {
   # ---------------------------------------------------------------------
   # Step 3 — drop the per-agent group, if one was created.
   #
-  # Optional and exact-match guarded: only "<group-prefix><agent>". Best-
-  # effort; a non-empty group (still has members) makes groupdel fail and
-  # that is fine — report and move on.
+  # Optional and exact-match guarded. The group name MUST be composed via
+  # bridge_isolation_v2_agent_group_name — the same helper the grant path
+  # uses — NOT a raw "<group-prefix><agent>" concatenation. On Linux that
+  # helper hash-truncates any name that would exceed the 32-char groupadd
+  # limit, so a raw concatenation would miss (and never groupdel) the real
+  # hashed group for every long-named agent. Best-effort; a non-empty
+  # group (still has members) makes groupdel fail and that is fine —
+  # report and move on.
   # ---------------------------------------------------------------------
-  local grp_pfx="${BRIDGE_AGENT_GROUP_PREFIX:-ab-agent-}"
-  local agent_grp="${grp_pfx}${agent}"
-  if getent group "$agent_grp" >/dev/null 2>&1; then
+  local agent_grp=""
+  if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+    agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+  fi
+  if [[ -n "$agent_grp" ]] && getent group "$agent_grp" >/dev/null 2>&1; then
     if command -v groupdel >/dev/null 2>&1; then
       if ! _bridge_isolation_v2_run_root_or_sudo groupdel "$agent_grp"; then
         bridge_warn "agent delete: groupdel '$agent_grp' failed (best-effort — group may still have members; manual 'groupdel $agent_grp' may be needed)"

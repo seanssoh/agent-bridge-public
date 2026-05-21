@@ -43,6 +43,16 @@ source "$SCRIPT_DIR/lib.sh"
 #   SETFACL -x <u:user> <path>
 #   GROUPDEL <group>
 #   WARN <text>
+#
+# The OS-account / group identity the reaper composes for its exact-match
+# safety gate is computed inside the reaper via bridge_agent_default_os_user
+# and bridge_isolation_v2_agent_group_name — the SAME helpers `agent create`
+# and the grant path use, including Linux 32-char truncation / hash. The
+# probe therefore does NOT hardcode the expected names: getent passwd
+# resolves the exact `os_user` it is handed, and getent group resolves any
+# `${grp_pfx}*` name (the reaper computed it correctly or it would not be
+# asking). This is what lets the long-name case (C5) verify the truncation
+# path without the test re-deriving the composition.
 run_reap_probe() {
   local fake_uname="$1"
   local agent="$2"
@@ -58,8 +68,10 @@ uname() { printf '%s\n' "${fake_uname}"; }
 userdel() { printf 'USERDEL %s\n' "\$*"; return 0; }
 groupdel() { printf 'GROUPDEL %s\n' "\$*"; return 0; }
 setfacl() { printf 'SETFACL %s\n' "\$*"; return 0; }
-# getent: passwd <user> resolves only the exact probe user; group <grp>
-# resolves only the exact per-agent group. Everything else is "absent".
+# getent: passwd <user> resolves only the exact user the reaper was handed
+# (it never composes a passwd lookup itself — it uses the resolved arg);
+# group <grp> resolves any ab-agent-* name (the reaper composed it via
+# bridge_isolation_v2_agent_group_name). Everything else is "absent".
 getent() {
   case "\$1" in
     passwd)
@@ -67,7 +79,7 @@ getent() {
       return 2
       ;;
     group)
-      [[ "\$2" == "ab-agent-${agent}" ]] && { printf '%s:x:9999:\n' "\$2"; return 0; }
+      [[ "\$2" == ab-agent-* ]] && { printf '%s:x:9999:\n' "\$2"; return 0; }
       return 2
       ;;
   esac
@@ -82,27 +94,69 @@ getfacl() {
   return 0
 }
 command() {
-  # Make the helper believe userdel/groupdel/setfacl/getfacl exist.
+  # Make the helper believe userdel/groupdel/setfacl/getfacl exist, and
+  # that the composition helpers (resolved below) are present.
   if [[ "\$1" == "-v" ]]; then
     case "\$2" in
-      userdel|groupdel|setfacl|getfacl) printf '%s\n' "\$2"; return 0 ;;
+      userdel|groupdel|setfacl|getfacl|bridge_agent_default_os_user|bridge_isolation_v2_agent_group_name)
+        printf '%s\n' "\$2"; return 0 ;;
     esac
   fi
   builtin command "\$@"
 }
 bridge_warn() { printf 'WARN %s\n' "\$*" >&2; }
 bridge_die()  { printf 'DIE %s\n' "\$*" >&2; exit 1; }
+bridge_require_python() { :; }
+
+# bridge_agent_default_os_user lives in lib/bridge-agents.sh, which is too
+# heavy to source standalone. Reproduce it here VERBATIM from
+# lib/bridge-agents.sh:990-1007 — the smoke breaks loudly if that logic
+# drifts, which is the intended coupling (the reaper's exact-match gate
+# depends on this exact composition).
+bridge_agent_default_os_user() {
+  python3 - "\$1" <<'PY'
+import re, sys
+agent = sys.argv[1].strip().lower()
+slug = re.sub(r"[^a-z0-9_-]+", "-", agent).strip("-")
+slug = slug or "agent"
+prefix = "agent-bridge-"
+max_len = 32
+keep = max_len - len(prefix)
+if keep < 1:
+    keep = 1
+print(prefix + slug[:keep])
+PY
+}
 
 # The helper walks credential ancestors of \$HOME/.claude/.credentials.json.
 # Point HOME at the temp dir whose tree contains the designated ace_dir so
 # _bridge_isolation_v2_cred_ancestors yields it.
 export HOME="${SMOKE_TMP_ROOT}/ctrlhome"
 export SUDO_USER="" USER="probe" LOGNAME="probe"
+export BRIDGE_AGENT_GROUP_PREFIX="ab-agent-"
 
 source "${SMOKE_REPO_ROOT}/lib/bridge-isolation-v2.sh"
 
 bridge_isolation_v2_reap_isolated_agent_account "${agent}" "${os_user}" 2>&1
 PROBE
+}
+
+# Compute the expected generated OS-user name the same way agent create
+# does (lib/bridge-agents.sh) — the test caller uses this to construct a
+# correctly-truncated `os_user` argument for the exact-match cases.
+expected_os_user() {
+  python3 - "$1" <<'PY'
+import re, sys
+agent = sys.argv[1].strip().lower()
+slug = re.sub(r"[^a-z0-9_-]+", "-", agent).strip("-")
+slug = slug or "agent"
+prefix = "agent-bridge-"
+max_len = 32
+keep = max_len - len(prefix)
+if keep < 1:
+    keep = 1
+print(prefix + slug[:keep])
+PY
 }
 
 # Build a controller-home tree whose .claude ancestor chain contains a
@@ -130,12 +184,18 @@ test_non_linux_skips() {
 }
 
 # ---------------------------------------------------------------------------
-# C2 — Linux + exact name match: full reap (userdel + setfacl -x + groupdel).
+# C2 — Linux + exact name match (short name): full reap (userdel +
+# setfacl -x + groupdel). For a short name the generated account name
+# equals the raw `agent-bridge-<name>` concatenation.
 # ---------------------------------------------------------------------------
 test_linux_exact_match_reaps() {
   setup_ctrl_home
+  local os_user
+  os_user="$(expected_os_user "bob")"
+  smoke_assert_eq "agent-bridge-bob" "$os_user" \
+    "C2 pre: short name composes to the un-truncated account name"
   local out
-  out="$(run_reap_probe "Linux" "bob" "agent-bridge-bob" \
+  out="$(run_reap_probe "Linux" "bob" "$os_user" \
     "$SMOKE_TMP_ROOT/ctrlhome/.claude" "yes")"
 
   smoke_assert_contains "$out" "USERDEL agent-bridge-bob" \
@@ -186,19 +246,67 @@ test_empty_os_user_noop() {
     "C4: empty OS user is a clean silent no-op (no warnings)"
 }
 
+# ---------------------------------------------------------------------------
+# C5 — Linux + LONG valid agent name: the reaper must compose the expected
+# account/group identity through bridge_agent_default_os_user (32-char
+# truncated) and bridge_isolation_v2_agent_group_name (hash-truncated), NOT
+# a raw `agent-bridge-<name>` / `ab-agent-<name>` concatenation. A long name
+# is the exact case where a raw concatenation would not equal the account
+# the bridge created — the gate would skip and leave the orphan behind
+# (the #1010 bug). This case proves the truncation/hash composition path is
+# used: the reaper must still attempt the full reap.
+# ---------------------------------------------------------------------------
+test_long_name_uses_truncated_identity() {
+  setup_ctrl_home
+  # 41 chars — well past the agent-bridge- prefixed 32-char Linux budget.
+  local long_agent="worker-very-long-isolated-agent-name-here"
+  local os_user
+  os_user="$(expected_os_user "$long_agent")"
+
+  # Sanity: the generated account name IS truncated to <=32 and is NOT the
+  # raw concatenation — otherwise the case would not exercise the bug.
+  smoke_assert_eq "agent-bridge-worker-very-long-is" "$os_user" \
+    "C5 pre: long name composes to a 32-char-truncated account name"
+  if [[ "$os_user" == "agent-bridge-${long_agent}" ]]; then
+    smoke_fail "C5 pre: truncated account name unexpectedly equals raw concatenation"
+  fi
+
+  local out
+  out="$(run_reap_probe "Linux" "$long_agent" "$os_user" \
+    "$SMOKE_TMP_ROOT/ctrlhome/.claude" "yes")"
+
+  # With the raw-concatenation bug the exact-match gate would reject this
+  # (raw != truncated) and emit nothing destructive. The fix composes via
+  # bridge_agent_default_os_user so the gate matches and the reap runs.
+  smoke_assert_contains "$out" "USERDEL ${os_user}" \
+    "C5: userdel attempted on the truncated generated account for a long name"
+  smoke_assert_contains "$out" "SETFACL -x u:${os_user}" \
+    "C5: traversal ACE stripped using the truncated account name"
+  # Group name is composed via bridge_isolation_v2_agent_group_name; on
+  # Linux a long name is hash-truncated. Assert a groupdel happened against
+  # an ab-agent-* group (the shim resolved whatever the reaper composed).
+  smoke_assert_contains "$out" "GROUPDEL ab-agent-" \
+    "C5: per-agent group dropped using the composed (hash-truncated) name"
+  smoke_assert_not_contains "$out" "does not exactly match" \
+    "C5: long name does NOT trip the mismatch gate (identity composed correctly)"
+}
+
 main() {
   smoke_require_cmd bash
+  smoke_require_cmd python3
   smoke_make_temp_root "isolated-agent-delete-reap"
   trap smoke_cleanup_temp_root EXIT
 
   smoke_run "C1 non-Linux host: reap helper is a complete no-op" \
     test_non_linux_skips
-  smoke_run "C2 Linux + exact agent-bridge-<name> match: full reap" \
+  smoke_run "C2 Linux + exact agent-bridge-<name> match (short name): full reap" \
     test_linux_exact_match_reaps
   smoke_run "C3 naming gate: non-matching resolved user is not touched" \
     test_naming_gate_blocks_mismatch
   smoke_run "C4 empty OS user (never isolated): silent no-op" \
     test_empty_os_user_noop
+  smoke_run "C5 long valid name: reap uses truncated/hashed composition" \
+    test_long_name_uses_truncated_identity
 
   smoke_log "passed"
 }
