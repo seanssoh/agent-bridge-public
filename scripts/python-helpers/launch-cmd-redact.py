@@ -145,10 +145,19 @@ def redact_launch_ops(ops_tsv: str) -> str:
 
     Output: one ``launch:<op>=<payload>`` line per op — the redacted
     form bridge-agent.sh then flattens (``tr '\\n' ','``) into the
-    comma-joined operation summary. The only op whose payload embeds a
-    value is ``add-env`` (KEY=VALUE); every other op's payload
-    (``set-launch-cmd`` / ``remove-env`` / dev-channel specs) is passed
-    through verbatim.
+    comma-joined operation summary.
+
+    Two op payloads embed a secret-bearing env VALUE and are redacted:
+      - ``add-env``        — payload is ``KEY=VALUE``; redact the value.
+      - ``set-launch-cmd`` — payload is a FULL launch command, whose
+        leading env-prefix can carry secrets; redact it the same way
+        before/after_launch_cmd is redacted (issue #1023 codex r2
+        BLOCKING — set-launch-cmd was passed through verbatim and the
+        raw value reached the audit ``operation`` field).
+    The remaining ops carry no env value and pass through verbatim:
+      - ``remove-env``     — payload is a bare KEY (validated key-only).
+      - ``add-dev-channel`` / ``remove-dev-channel`` — payload is a
+        channel spec (``plugin:foo@m`` / ``server:teams``), not env.
 
     Redacting AFTER the comma-join is unsound — the join is lossy: a
     comma inside a value is indistinguishable from an op delimiter, so
@@ -165,6 +174,8 @@ def redact_launch_ops(ops_tsv: str) -> str:
         payload = parts[1] if len(parts) == 2 else ""
         if op == "add-env":
             payload = _redact_env_token(payload)
+        elif op == "set-launch-cmd":
+            payload = redact_launch_cmd(payload)
         out.append(f"launch:{op}={payload}")
     return "\n".join(out)
 

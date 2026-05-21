@@ -295,6 +295,78 @@ for line in sys.argv[1].splitlines():
   run_update --json --launch-cmd-remove-env MS365_CLIENT_SECRET >/dev/null
 }
 
+assert_set_launch_cmd_secret_redacted_everywhere() {
+  # Issue #1023 codex r2 BLOCKING regression: `--set-launch-cmd` replaces
+  # the WHOLE launch command, and that payload can carry a credential-
+  # bearing env-prefix. The op-stream redactor passed `set-launch-cmd`
+  # through verbatim, so the raw env value reached the audit `operation`
+  # field. The redactor now runs the set-launch-cmd payload through the
+  # same launch-cmd redactor used for before/after_launch_cmd.
+  : >"$BRIDGE_AUDIT_LOG" 2>/dev/null || true
+
+  local secret_cmd
+  secret_cmd="MS365_CLIENT_SECRET=${COMMA_SECRET_VALUE} claude --dangerously-skip-permissions"
+
+  # Default mode prints plain text.
+  local output
+  output="$(run_update --set-launch-cmd "$secret_cmd")"
+  assert_no_secret "set-launch-cmd plain-text result" "$output"
+  smoke_assert_contains "$output" "***REDACTED***" \
+    "set-launch-cmd plain-text result is redacted"
+
+  # --json envelope.
+  output="$(run_update --json --set-launch-cmd "$secret_cmd")"
+  assert_no_secret "set-launch-cmd --json envelope" "$output"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+suffix = sys.argv[2]
+blob = json.dumps(payload)
+assert suffix not in blob, f"set-launch-cmd secret in --json: {payload}"
+assert "MS365_CLIENT_SECRET=" in payload["after"]["launch_cmd"], payload
+assert "***REDACTED***" in payload["after"]["launch_cmd"], payload
+' "$output" "$SECRET_VALUE"
+
+  # Audit `operation` field — the exact surface codex r2 flagged. The
+  # set-launch-cmd above wrote an audit row.
+  if [[ ! -s "$BRIDGE_AUDIT_LOG" ]]; then
+    smoke_fail "expected an audit row after a set-launch-cmd mutation"
+  fi
+  local audit_blob
+  audit_blob="$(cat "$BRIDGE_AUDIT_LOG")"
+  assert_no_secret "set-launch-cmd audit.jsonl" "$audit_blob"
+  python3 -c '
+import json, sys
+suffix = sys.argv[2]
+saw_set = False
+for line in sys.argv[1].splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    row = json.loads(line)
+    detail = row.get("detail") or {}
+    op = detail.get("operation", "")
+    assert suffix not in op, f"set-launch-cmd secret in audit operation: {op!r}"
+    if "set-launch-cmd" in op:
+        saw_set = True
+assert saw_set, "expected a set-launch-cmd audit operation row"
+' "$audit_blob" "$SECRET_VALUE"
+
+  # Dry-run must redact the set-launch-cmd payload too.
+  output="$(run_update --dry-run --set-launch-cmd "$secret_cmd")"
+  assert_no_secret "set-launch-cmd dry-run output" "$output"
+
+  # The applied launch command on disk still carries the REAL value.
+  local line
+  line="$(read_launch_line)"
+  smoke_assert_contains "$line" "$COMMA_SECRET_VALUE" \
+    "applied launch_cmd on disk still carries the real set-launch-cmd value"
+
+  # Restore the fixture launch cmd for any downstream assertion.
+  run_update --json \
+    --set-launch-cmd "claude --dangerously-skip-permissions" >/dev/null
+}
+
 main() {
   smoke_require_cmd python3
   smoke_require_cmd bash
@@ -312,6 +384,8 @@ main() {
     assert_dry_run_redacts_secret
   smoke_run "comma-containing secret value redacted in every surface" \
     assert_comma_value_secret_redacted_everywhere
+  smoke_run "set-launch-cmd secret value redacted in every surface" \
+    assert_set_launch_cmd_secret_redacted_everywhere
   smoke_log "passed"
 }
 
