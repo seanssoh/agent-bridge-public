@@ -1055,7 +1055,7 @@ def _command_substring_hits_protected_needle(command: str) -> bool:
     return False
 
 
-def _command_cd_base_dir(tokens: list[str]) -> Path | None:
+def _command_cd_base_dir(command: str) -> Path | None:
     """Resolve the working directory established by a leading ``cd`` stage.
 
     Issue #1014 C: a routine diagnostic prelude — ``cd $BRIDGE_HOME &&
@@ -1074,19 +1074,31 @@ def _command_cd_base_dir(tokens: list[str]) -> Path | None:
     not resolved — those are not the #1014 shape and resolving them would
     widen surface for no benefit. Returns the absolute directory Path or
     None.
+
+    Stage detection uses the raw command string and ``_COMMAND_OPERATOR_RE``
+    — the same shell-operator model ``_is_read_intent_bash`` uses — so the
+    first stage is recognized regardless of the separator form: ``&&``,
+    ``;``, ``||``, ``|``, ``&``, or a newline, with or without surrounding
+    whitespace. ``shlex.split`` does NOT emit ``;`` / newline as standalone
+    operator tokens in the no-space form (``cd $X;echo`` arrives as a
+    single ``$X;echo`` token), so relying on token equality missed those
+    shapes (codex r2 catch on PR #1019).
     """
-    # Find the first non-empty command stage.
-    first_stage: list[str] = []
-    for tok in tokens:
-        # A shell operator token ends the first stage.
-        if tok in (";", "&&", "||", "|", "&"):
-            break
-        first_stage.append(tok)
-    if len(first_stage) < 2 or first_stage[0] != "cd":
+    if not command.strip():
+        return None
+    # First shell stage = text before the first &&/;/|/||/&/newline.
+    first_stage = _COMMAND_OPERATOR_RE.split(command, maxsplit=1)[0].strip()
+    if not first_stage:
+        return None
+    try:
+        stage_tokens = shlex.split(first_stage, posix=True, comments=False)
+    except ValueError:
+        return None
+    if len(stage_tokens) < 2 or stage_tokens[0] != "cd":
         return None
     # Exactly one argument: `cd <dir>`. Reject `cd -`, option flags, and
     # multi-arg forms — none are the #1014 prelude shape.
-    dir_args = [t for t in first_stage[1:] if t]
+    dir_args = [t for t in stage_tokens[1:] if t]
     if len(dir_args) != 1:
         return None
     raw_dir = dir_args[0]
@@ -1415,8 +1427,10 @@ def _bash_argv_references_path(command: str, protected: Path) -> bool:
 
     # Issue #1014 C: resolve a leading `cd <dir>` prelude so a CWD-relative
     # reference to the protected file (`cd $BRIDGE_HOME && … agent-roster
-    # .local.sh`) is detected, not silently missed.
-    cd_base_dir = _command_cd_base_dir(tokens)
+    # .local.sh`) is detected, not silently missed. Pass the RAW command —
+    # the prelude detector splits on the shell-operator model so `;` /
+    # newline separators (no-space forms) are recognized too.
+    cd_base_dir = _command_cd_base_dir(command)
 
     def _check_value_token(value: str) -> bool:
         return _token_matches_protected(value, protected, cd_base_dir)
@@ -1494,8 +1508,9 @@ def _bash_argv_references_system_config(command: str) -> bool:
 
     # Issue #1014 C: resolve a leading `cd <dir>` prelude so a CWD-relative
     # reference to a protected system-config file is detected — same
-    # bypass class as the roster path in _bash_argv_references_path.
-    cd_base_dir = _command_cd_base_dir(tokens)
+    # bypass class as the roster path in _bash_argv_references_path. Pass
+    # the RAW command so `;` / newline separators are recognized.
+    cd_base_dir = _command_cd_base_dir(command)
 
     def _check_value(value: str) -> bool:
         for fragment in _alias_path_fragments(value):

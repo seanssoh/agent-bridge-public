@@ -66,13 +66,14 @@ AGENT_HOME="$BRIDGE_AGENT_HOME_ROOT/$AGENT"
 mkdir -p "$AGENT_HOME"
 printf -- '- session type: admin\n' >"$AGENT_HOME/SESSION-TYPE.md"
 
-# JSON-escape a Bash command string for embedding in the payload. Only
-# `\` and `"` need escaping for a JSON string; the smoke commands carry
-# neither control chars nor newlines.
+# JSON-escape a Bash command string for embedding in the payload.
+# Escapes `\`, `"`, and a literal newline (the newline-separated cd
+# prelude case carries one) as the JSON `\n` escape.
 json_escape() {
   local s="$1"
   s="${s//\\/\\\\}"
   s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
   printf '%s' "$s"
 }
 
@@ -127,20 +128,65 @@ assert_hook_verdict() {
 
 echo "[smoke:${SMOKE_NAME}] layer 2 — real PreToolUse hook end-to-end"
 
-# The exact codex r1 repro set.
+# The exact codex r1 repro set — `&&` separator.
 assert_hook_verdict \
-  "cd-prelude grep (read) of roster" \
+  "cd-prelude (&&) grep (read) of roster" \
   "cd $BRIDGE_HOME && grep BRIDGE agent-roster.local.sh" \
   "ALLOW"
 
 assert_hook_verdict \
-  "cd-prelude echo-redirect (write) to roster" \
+  "cd-prelude (&&) echo-redirect (write) to roster" \
   "cd $BRIDGE_HOME && echo x > agent-roster.local.sh" \
   "DENY"
 
 assert_hook_verdict \
-  "cd-prelude sed -i (write) of roster" \
+  "cd-prelude (&&) sed -i (write) of roster" \
   "cd $BRIDGE_HOME && sed -i s/a/b/ agent-roster.local.sh" \
+  "DENY"
+
+# codex r2 repro set — `;` (no surrounding space) and newline separators.
+# shlex.split() does not emit `;`/newline as standalone operator tokens
+# in these forms, so the r2 cd-prelude detector missed them and the
+# write bypass survived. The detector now uses the raw-string operator
+# model, so every separator form must behave identically.
+assert_hook_verdict \
+  "cd-prelude (; no space) grep (read) of roster" \
+  "cd $BRIDGE_HOME;grep BRIDGE agent-roster.local.sh" \
+  "ALLOW"
+
+assert_hook_verdict \
+  "cd-prelude (; no space) echo-redirect (write) to roster" \
+  "cd $BRIDGE_HOME;echo x > agent-roster.local.sh" \
+  "DENY"
+
+assert_hook_verdict \
+  "cd-prelude (; no space) sed -i (write) of roster" \
+  "cd $BRIDGE_HOME;sed -i s/a/b/ agent-roster.local.sh" \
+  "DENY"
+
+assert_hook_verdict \
+  "cd-prelude (; spaced) echo-redirect (write) to roster" \
+  "cd $BRIDGE_HOME ; echo x > agent-roster.local.sh" \
+  "DENY"
+
+assert_hook_verdict \
+  "cd-prelude (newline) grep (read) of roster" \
+  "$(printf 'cd %s\ngrep BRIDGE agent-roster.local.sh' "$BRIDGE_HOME")" \
+  "ALLOW"
+
+assert_hook_verdict \
+  "cd-prelude (newline) echo-redirect (write) to roster" \
+  "$(printf 'cd %s\necho x > agent-roster.local.sh' "$BRIDGE_HOME")" \
+  "DENY"
+
+assert_hook_verdict \
+  "cd-prelude (newline) tee (write) of roster" \
+  "$(printf 'cd %s\ntee agent-roster.local.sh' "$BRIDGE_HOME")" \
+  "DENY"
+
+assert_hook_verdict \
+  "cd-prelude (||) echo-redirect (write) to roster" \
+  "cd $BRIDGE_HOME || echo x > agent-roster.local.sh" \
   "DENY"
 
 assert_hook_verdict \
