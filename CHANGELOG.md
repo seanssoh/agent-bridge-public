@@ -6,6 +6,57 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta4] — 2026-05-22
+
+### Highlight — runtime-friction closeout wave
+
+Operator-cued **fourth prerelease** in the v0.14.5 stabilization window. Bundles
+the six PRs that landed after `v0.14.5-beta3` (2026-05-21): two close-out PRs
+merged directly to `main` (#1009, #1008) plus a four-fixer runtime-friction wave
+(#1007, #1015, #1010, #1014) shipped through the `feat/wave-v0145-integration`
+branch. Every PR was codex pair-reviewed (`agb-dev-claude` + `agb-dev-codex`);
+the integration branch additionally passed a full-branch codex review and a
+`scripts/smoke-test.sh` pass. No new features. `-beta4` prerelease; matching tag
+`v0.14.5-beta4`, GitHub release marked **Pre-release**.
+
+The #1010 isolated-agent reap path exercises destructive `userdel` / `setfacl` /
+`groupdel`; CI and review verified the gating *decision* (Linux-only, exact
+generated-user match). The live destructive path still warrants a Linux-host
+spot check before stable `v0.14.5`.
+
+### Operator-visible
+
+- **Session resume under custom `CLAUDE_CONFIG_DIR`** (#1015) — static Claude
+  agents with a custom `HOME` / `CLAUDE_CONFIG_DIR` (isolation-v2) no longer
+  start a fresh session on every restart. The resume + detect session-id helpers
+  now resolve `~/.claude` from the agent's config dir, not the daemon HOME;
+  unregistered/test callers keep the daemon-HOME fallback unchanged.
+- **Runtime friction trio** (#1014) — (A) a freshly-pushed task no longer gets a
+  redundant `ACTION REQUIRED` idle-nudge within the redelivery window; (B) a
+  stale `BRIDGE_LAYOUT=legacy` is no longer baked into the generated agent
+  env file when a v2 layout marker exists, and the warning text gives accurate
+  remediation; (C) a `cd $BRIDGE_HOME && grep agent-roster.local.sh`-style read
+  of the protected roster is correctly classified as a read across all shell
+  separators, while writes to it stay denied.
+- **Isolated-agent delete cleanup** (#1010) — `agent delete` on a linux-user
+  isolated agent now reaps the dedicated OS user and strips its named-user
+  traversal ACEs (best-effort, Linux-only, exact generated-user match required).
+- **Watchdog engine-aware contract** (#1009) — the watchdog's profile-file /
+  managed-`CLAUDE.md` drift checks no longer false-positive on `codex` /
+  `antigravity` agents; a genuinely unknown engine still surfaces as drift.
+- **Machine-local common-instructions override** (#1008) — an upgrade-preserved
+  `shared/COMMON-INSTRUCTIONS.local.md` is appended to the generated shared docs
+  under explicit markers; absent/empty/unreadable degrades to a byte-identical
+  no-op.
+
+### Test harness
+
+- `smoke_setup_bridge_home` now isolates the cron state vars and
+  `BRIDGE_LAYOUT_MARKER_DIR` so an isolated daemon's cron tick can no longer
+  read or rewrite the operator's live `cron/jobs.json` (#1007).
+- All five new wave smokes are registered in `scripts/smoke-test.sh` and wired
+  into `scripts/ci-select-smoke.sh` self-edit + production-file triggers.
+
 ## [0.14.5-beta3] — 2026-05-21
 
 ### Highlight — ACL-deprecation set (#998) + accumulated stabilization wave
