@@ -11497,4 +11497,16 @@ bash "$REPO_ROOT/scripts/smoke/989-isolated-agent-env-state-dir.sh"
 log "running nudge-task-age-gate smoke (issue #1014 A)"
 bash "$REPO_ROOT/scripts/smoke/nudge-task-age-gate.sh"
 
+# A static Claude agent with a custom CLAUDE_CONFIG_DIR resumed fresh every
+# restart because the session-id helpers expanded ~/.claude against the daemon
+# HOME. Smoke pins that both helpers resolve roots from the agent config dir.
+log "running 1015-resume-claude-config-dir smoke (issue #1015)"
+bash "$REPO_ROOT/scripts/smoke/1015-resume-claude-config-dir.sh"
+
+# Deleting an isolated agent left the dedicated OS user + named-user ACEs
+# behind. Smoke pins the reaper's gating decision (Linux-only, exact
+# generated-user match) for short and long agent names.
+log "running isolated-agent-delete-reap smoke (issue #1010)"
+bash "$REPO_ROOT/scripts/smoke/isolated-agent-delete-reap.sh"
+
 log "smoke test passed"
