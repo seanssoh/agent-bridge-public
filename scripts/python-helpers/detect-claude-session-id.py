@@ -16,6 +16,14 @@ Args (positional, order-sensitive):
     sys.argv[1] — workdir (will be `os.path.realpath`-resolved)
     sys.argv[2] — since_ms (integer string; "0" = no time gate)
     sys.argv[3] — exclude_csv (comma-separated session ids to skip)
+    sys.argv[4] — claude_config_dir (optional, issue #1015): the agent's
+        Claude config directory (`CLAUDE_CONFIG_DIR`). Isolation-v2 launches
+        Claude with a custom HOME/CLAUDE_CONFIG_DIR, so the live session
+        JSON and transcripts live under `<agent-home>/.claude/`, not the
+        daemon process's `~/.claude/`. When empty the helper falls back to
+        the `CLAUDE_CONFIG_DIR` env var, then `<HOME>/.claude`, then
+        `os.path.expanduser("~/.claude")` — keeping the non-isolated path
+        and existing call sites byte-for-byte unchanged.
 
 Stdout: the detected session id, or empty string if none. Always exits 0.
 
@@ -83,6 +91,25 @@ def workdir_slug_candidates(path: str):
     return candidates
 
 
+def claude_config_root(explicit: str = "") -> str:
+    """Resolve the Claude config root for the agent being detected.
+
+    Priority (issue #1015): an explicit argument the bash shim passes >
+    the `CLAUDE_CONFIG_DIR` env var > `<HOME>/.claude` > the ambient
+    `~/.claude`. The last two preserve the pre-#1015 daemon-HOME behaviour
+    for non-isolated agents and call sites that supply nothing.
+    """
+    if explicit:
+        return explicit
+    env_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env_dir:
+        return env_dir
+    home = os.environ.get("HOME")
+    if home:
+        return os.path.join(home, ".claude")
+    return os.path.expanduser("~/.claude")
+
+
 def pid_is_alive(pid):
     # Issue #827: live-session acceptance hinges on this. Accept any pid
     # that responds to kill -0 without ESRCH. EPERM means the process
@@ -110,10 +137,13 @@ def main() -> int:
     if 0 < since_ms < 10**11:
         since_ms *= 1000
     exclude = {x for x in sys.argv[3].split(",") if x}
+    config_root = claude_config_root(
+        sys.argv[4] if len(sys.argv) > 4 else ""
+    )
     best = None
 
     # Primary: live sessions/<pid>.json records.
-    for path in glob.glob(os.path.expanduser("~/.claude/sessions/*.json")):
+    for path in glob.glob(os.path.join(config_root, "sessions", "*.json")):
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
@@ -128,15 +158,15 @@ def main() -> int:
             continue
         transcript = None
         for slug in workdir_slug_candidates(workdir):
-            candidate = os.path.expanduser(
-                f"~/.claude/projects/{slug}/{sid}.jsonl"
+            candidate = os.path.join(
+                config_root, "projects", slug, f"{sid}.jsonl"
             )
             if os.path.isfile(candidate):
                 transcript = candidate
                 break
         if transcript is None:
             for candidate in glob.glob(
-                os.path.expanduser(f"~/.claude/projects/**/{sid}.jsonl"),
+                os.path.join(config_root, "projects", "**", f"{sid}.jsonl"),
                 recursive=True,
             ):
                 if os.path.isfile(candidate):
@@ -172,7 +202,7 @@ def main() -> int:
         for slug in workdir_slug_candidates(workdir):
             transcripts.extend(
                 glob.glob(
-                    os.path.expanduser(f"~/.claude/projects/{slug}/*.jsonl")
+                    os.path.join(config_root, "projects", slug, "*.jsonl")
                 )
             )
         for transcript in transcripts:
