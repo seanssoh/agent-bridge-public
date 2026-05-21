@@ -38,7 +38,10 @@ smoke_setup_bridge_home() {
   unset BRIDGE_LAYOUT_MARKER_DIR \
     BRIDGE_CRON_STATE_DIR \
     BRIDGE_CRON_HOME_DIR \
-    BRIDGE_NATIVE_CRON_JOBS_FILE
+    BRIDGE_NATIVE_CRON_JOBS_FILE \
+    BRIDGE_CRON_DISPATCH_WORKER_DIR \
+    BRIDGE_SOURCE_CRON_JOBS_FILE \
+    BRIDGE_OPENCLAW_CRON_JOBS_FILE
 
   export BRIDGE_HOME="$SMOKE_TMP_ROOT/bridge-home"
   export BRIDGE_STATE_DIR="$BRIDGE_HOME/state"
@@ -66,6 +69,13 @@ smoke_setup_bridge_home() {
   export BRIDGE_CRON_STATE_DIR="$BRIDGE_STATE_DIR/cron"
   export BRIDGE_CRON_HOME_DIR="$BRIDGE_HOME/cron"
   export BRIDGE_NATIVE_CRON_JOBS_FILE="$BRIDGE_CRON_HOME_DIR/jobs.json"
+  export BRIDGE_CRON_DISPATCH_WORKER_DIR="$BRIDGE_CRON_STATE_DIR/workers"
+  # Legacy/source cron jobs path family — bridge_cron_source_jobs_file()
+  # falls back to BRIDGE_SOURCE_CRON_JOBS_FILE when the native jobs file is
+  # absent, so an inherited live value must not survive. Pin both under the
+  # isolated root (BRIDGE_OPENCLAW_CRON_JOBS_FILE is the same path family).
+  export BRIDGE_SOURCE_CRON_JOBS_FILE="$BRIDGE_CRON_HOME_DIR/legacy-jobs.json"
+  export BRIDGE_OPENCLAW_CRON_JOBS_FILE="$BRIDGE_SOURCE_CRON_JOBS_FILE"
 
   mkdir -p \
     "$BRIDGE_HOME" \
@@ -81,7 +91,8 @@ smoke_setup_bridge_home() {
     "$BRIDGE_RUNTIME_ROOT" \
     "$BRIDGE_HOOKS_DIR" \
     "$BRIDGE_CRON_STATE_DIR" \
-    "$BRIDGE_CRON_HOME_DIR"
+    "$BRIDGE_CRON_HOME_DIR" \
+    "$BRIDGE_CRON_DISPATCH_WORKER_DIR"
   : >"$BRIDGE_ROSTER_FILE"
   : >"$BRIDGE_ROSTER_LOCAL_FILE"
   cat >"$BRIDGE_STATE_DIR/layout-marker.sh" <<EOF
