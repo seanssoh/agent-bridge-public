@@ -39,10 +39,29 @@ Refs:
       to completion on Bash 5.3.9 hosts. Standalone helper invoked
       file-as-argv keeps the path off the broken surface, same
       precedent as PR #940's registry/list/show extraction.
+    - Issue #1023: launch commands routinely carry credential-bearing
+      env values. This helper writes them into the audit-log detail
+      (before/after launch_cmd + the recorded add-env actions), so it
+      routes both through the shared launch-cmd-redact module before
+      emission. The audit log keeps the SHA chain for tamper-evidence;
+      it does not need the raw secret.
 """
 
 import json
+import os
 import sys
+
+sys.path.insert(
+    0,
+    os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+        "scripts",
+        "python-helpers",
+    ),
+)
+import importlib  # noqa: E402
+
+_redact = importlib.import_module("launch-cmd-redact")
 
 
 def main() -> int:
@@ -75,6 +94,10 @@ def main() -> int:
         actions_json,
     ) = sys.argv[1:]
 
+    # Issue #1023: redact credential-bearing env values before they
+    # land in the audit log. The redaction is value-only — env key
+    # names stay visible — so audit readers still see which keys
+    # changed.
     detail = {
         "kind": "system_config_mutation",
         "actor": actor,
@@ -85,8 +108,8 @@ def main() -> int:
         "operation": operation,
         "matched_pattern": "agent-roster.local.sh",
         "target_agent": target_agent,
-        "before_launch_cmd": before_launch_cmd,
-        "after_launch_cmd": after_launch_cmd,
+        "before_launch_cmd": _redact.redact_launch_cmd(before_launch_cmd),
+        "after_launch_cmd": _redact.redact_launch_cmd(after_launch_cmd),
         "before_channels": before_channels,
         "after_channels": after_channels,
     }
@@ -95,9 +118,10 @@ def main() -> int:
     if reason:
         detail["reason"] = reason
     try:
-        detail["actions"] = json.loads(actions_json) if actions_json else []
+        actions = json.loads(actions_json) if actions_json else []
     except (TypeError, ValueError):
-        detail["actions"] = []
+        actions = []
+    detail["actions"] = _redact.redact_actions(actions)
 
     print(json.dumps(detail, ensure_ascii=True, sort_keys=True))
     return 0

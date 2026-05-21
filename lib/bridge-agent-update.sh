@@ -303,6 +303,14 @@ bridge_agent_update_emit_audit() {
 }
 
 # bridge_agent_update_emit_json — pretty-print the result envelope.
+#
+# Footgun #11 (KNOWN_ISSUES.md §26): the body used to be a
+# `python3 - … <<'PY' … PY` heredoc-stdin block. Issue #1023 also needs
+# this surface to redact credential-bearing launch-cmd env values, so
+# the body was extracted to lib/agent-cli-helpers/agent-update-result-json.py
+# (invoked file-as-argv) — the heredoc-stdin path is gone and the
+# redaction lives in the shared launch-cmd-redact module the helper
+# imports.
 bridge_agent_update_emit_json() {
   local agent="$1"
   local changed="$2"
@@ -316,7 +324,11 @@ bridge_agent_update_emit_json() {
   local actions_json="${10}"
 
   bridge_require_python
-  python3 - \
+  # #946 L1: stale-source guard before the python3 fork.
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  python3 "$BRIDGE_SCRIPT_DIR/lib/agent-cli-helpers/agent-update-result-json.py" \
     "$agent" \
     "$changed" \
     "$dry_run" \
@@ -326,44 +338,5 @@ bridge_agent_update_emit_json() {
     "$after_channels" \
     "$before_sha" \
     "$after_sha" \
-    "$actions_json" <<'PY'
-import json
-import sys
-
-(
-    agent,
-    changed,
-    dry_run,
-    before_launch_cmd,
-    after_launch_cmd,
-    before_channels,
-    after_channels,
-    before_sha,
-    after_sha,
-    actions_json,
-) = sys.argv[1:]
-
-try:
-    actions = json.loads(actions_json) if actions_json else []
-except (TypeError, ValueError):
-    actions = []
-
-payload = {
-    "agent": agent,
-    "changed": changed == "1",
-    "dry_run": dry_run == "1",
-    "before": {
-        "launch_cmd": before_launch_cmd,
-        "channels": before_channels,
-    },
-    "after": {
-        "launch_cmd": after_launch_cmd,
-        "channels": after_channels,
-    },
-    "before_sha": before_sha,
-    "after_sha": after_sha,
-    "actions": actions,
-}
-print(json.dumps(payload, ensure_ascii=False, indent=2))
-PY
+    "$actions_json"
 }

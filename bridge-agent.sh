@@ -3166,6 +3166,17 @@ run_update() {
     } | tr '\n' ',' | sed 's/,$//'
   )"
 
+  # Issue #1023: a `--launch-cmd-add-env KEY=VALUE` op puts the raw
+  # value into the operation summary (`launch:add-env=KEY=VALUE`). The
+  # summary flows into the audit detail and is otherwise log-visible —
+  # redact credential-bearing env values before any downstream use.
+  # Value-only: env key names stay visible so audit readers still see
+  # which key changed.
+  operation_summary="$(
+    python3 "$SCRIPT_DIR/scripts/python-helpers/launch-cmd-redact.py" \
+      op-summary "$operation_summary"
+  )"
+
   # Caller validation: admin identity + operator-trusted source.
   local caller_agent caller_source
   caller_agent="$(bridge_agent_update_caller_agent "$from_agent")"
@@ -3391,11 +3402,26 @@ PY
     return 0
   fi
 
+  # Issue #1023: the plain-text result echoes the full before/after
+  # launch command, whose leading env-prefix routinely carries
+  # credential-bearing values. Redact secret env values (value-only,
+  # key name kept) before printing. Output-rendering only — the stored
+  # launch command written above is unchanged.
+  local before_launch_cmd_display new_launch_cmd_display
+  before_launch_cmd_display="$(
+    python3 "$SCRIPT_DIR/scripts/python-helpers/launch-cmd-redact.py" \
+      launch-cmd "$before_launch_cmd"
+  )"
+  new_launch_cmd_display="$(
+    python3 "$SCRIPT_DIR/scripts/python-helpers/launch-cmd-redact.py" \
+      launch-cmd "$new_launch_cmd"
+  )"
+
   printf 'agent: %s\n' "$agent"
   printf 'changed: %s\n' "$([[ $changed -eq 1 ]] && echo yes || echo no)"
   printf 'dry_run: %s\n' "$([[ $dry_run -eq 1 ]] && echo yes || echo no)"
-  printf 'before_launch_cmd: %s\n' "$before_launch_cmd"
-  printf 'after_launch_cmd: %s\n' "$new_launch_cmd"
+  printf 'before_launch_cmd: %s\n' "$before_launch_cmd_display"
+  printf 'after_launch_cmd: %s\n' "$new_launch_cmd_display"
   printf 'before_channels: %s\n' "$before_channels"
   printf 'after_channels: %s\n' "$new_channels"
   printf 'before_sha: %s\n' "$before_sha"
