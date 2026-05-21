@@ -78,6 +78,10 @@ is no per-agent ACL to maintain or silently break.
 - **SOUL.md / CLAUDE.md scaffold-placeholder detection** (#988) — SessionStart
   surfaces a warning when an agent's profile still carries unfilled template
   tokens despite `SESSION-TYPE.md` marked complete.
+- **pre-compact dump routing fixed** (#982, closes #976) — the pre-compact hook
+  populates `suggested_entities` so librarian routes session dumps to the
+  `agents` wiki kind instead of falling through to `operating-rules` and
+  triggering a `[librarian-ambiguous]` escalation loop.
 - **isolated restart + socket listener recovery hardened** (#992), **Teams
   inbound text extraction + CRLF normalization** (#986/#987).
 
