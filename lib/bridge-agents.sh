@@ -3389,19 +3389,49 @@ EOF
 
   # Issue #1025: when the build was staged into a controller-owned
   # tempfile, hand the finished file off to its real destination under
-  # the per-agent `runtime/` via sudo. `install` creates the parent dir
-  # implicitly with `-D` and lands a regular file with controller
-  # ownership; the per-agent root (2750) and `runtime/` (2770) are
-  # agent-group-owned, which the controller's *running* process cannot
-  # write directly because its supplementary group set is stale within
-  # the same `agent create --isolate` invocation. After the install,
-  # `file` points at the real destination so the v2 chgrp/chmod below
-  # operates on it.
+  # the per-agent `runtime/` via sudo in a SINGLE privileged `install`
+  # invocation that sets owner, group, and mode atomically. The
+  # isolation-v2 matrix contract for `agent-env-sh` is
+  # `controller:<agent_grp>` mode `0640` (lib/bridge-isolation-v2.sh
+  # `agent-env-sh` row). Doing the metadata in one `install -o -g -m`
+  # — rather than `install` then a separate sudo `chgrp`/`chmod` —
+  # closes a TOCTOU window: `runtime/` is isolated-UID-owned and
+  # group-writable (2770), so a live isolated agent could swap
+  # `agent-env.sh` for a symlink between a bare install and a
+  # follow-prone second metadata touch. With no second touch, the file
+  # lands at the correct owner/group/mode in one step and the v2
+  # chgrp/chmod block below is skipped for the staged path.
   if [[ $_env_isolated_write -eq 1 ]]; then
-    bridge_linux_sudo_root install -D -m 0600 "$_env_stage_target" "$_env_final" \
+    local _env_install_owner _env_install_group
+    _env_install_owner="$(bridge_current_user 2>/dev/null || id -un 2>/dev/null || printf '')"
+    _env_install_group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+    if [[ -z "$_env_install_owner" || -z "$_env_install_group" ]]; then
+      rm -f "$_env_stage_target"
+      bridge_die "bridge_write_linux_agent_env_file: cannot resolve controller user / agent group for '$agent' — refusing to install env file without the v2 owner:group contract"
+    fi
+    # Ensure the parent `runtime/` exists via sudo (prepare normally
+    # created it 2770 already — this is an idempotent safety net and
+    # also the operation that gets past the stale-group traversal block
+    # that is the #1025 root cause). `mkdir -p` is not used with
+    # `install -D` because BSD `install` does not create parent dirs;
+    # an explicit sudo `mkdir -p` is portable and keeps the file
+    # creation a single atomic `install`.
+    bridge_linux_sudo_root mkdir -p "$(dirname "$_env_final")" \
       || {
         rm -f "$_env_stage_target"
-        bridge_die "bridge_write_linux_agent_env_file: sudo install of staged env file to '$_env_final' failed"
+        bridge_die "bridge_write_linux_agent_env_file: sudo mkdir of runtime dir for '$_env_final' failed"
+      }
+    # Single privileged `install` lands the file with owner, group, and
+    # mode set atomically — the isolation-v2 `agent-env-sh` matrix
+    # contract is `controller:<agent_grp>` mode 0640. No separate
+    # post-install chgrp/chmod (that second touch would reopen a TOCTOU
+    # symlink window on the group-writable 2770 `runtime/` dir).
+    bridge_linux_sudo_root install \
+        -o "$_env_install_owner" -g "$_env_install_group" -m 0640 \
+        "$_env_stage_target" "$_env_final" \
+      || {
+        rm -f "$_env_stage_target"
+        bridge_die "bridge_write_linux_agent_env_file: sudo install of staged env file to '$_env_final' (owner=$_env_install_owner group=$_env_install_group mode=0640) failed"
       }
     rm -f "$_env_stage_target"
     file="$_env_final"
@@ -3410,10 +3440,15 @@ EOF
   # group-mode contract — chgrp ab-agent-<name> + chmod 0640. The agent
   # group has both the isolated UID (read) and the controller (read+
   # owner write) as members per PR-C, so 0640 covers both without ACL.
-  # Owner stays controller (the install above lands a controller-owned
-  # file; the stale-inode drop earlier in this function self-heals
-  # any prior chowned-to-os_user state).
-  if [[ "$isolation_mode" == "linux-user" \
+  # Skipped entirely for the staged-write path above (#1025): the single
+  # `install -o -g -m` already set owner:group:mode atomically, and a
+  # separate post-install chgrp/chmod would reopen a TOCTOU symlink
+  # window on the group-writable `runtime/` dir. This block remains the
+  # contract enforcer ONLY for the direct (non-staged) write path —
+  # e.g. macOS, or callers passing an explicit controller-writable
+  # tempfile destination.
+  if [[ $_env_isolated_write -eq 0 \
+        && "$isolation_mode" == "linux-user" \
         && -n "$os_user" \
         && "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]]; then
     local _v2_grp
