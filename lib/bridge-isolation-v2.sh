@@ -2349,6 +2349,152 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
   return 0
 }
 
+# bridge_isolation_v2_reap_isolated_agent_account — issue #1010.
+#
+# Cleanup hook for `agent delete` on an isolated (linux-user) agent. Reaps
+# the dedicated OS user `agent-bridge-<name>`, strips its named-user
+# traversal ACEs from the controller credential ancestor set, and (best-
+# effort) drops a matching per-agent group. ALL destructive steps are
+# hard-gated and best-effort: a failure never aborts the delete, but every
+# failure is reported visibly via bridge_warn so the operator can clean up
+# by hand.
+#
+# Args:
+#   $1 — agent name (the `<name>` being deleted)
+#   $2 — expected OS user, resolved by the caller from the roster. This
+#        function will ONLY ever act on a user whose name is EXACTLY
+#        "${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}<name>" — a non-
+#        matching argument is rejected outright (never userdel a user the
+#        bridge did not create).
+#
+# Returns 0 always (best-effort); skips silently on non-Linux / missing
+# tooling / non-isolated agents.
+bridge_isolation_v2_reap_isolated_agent_account() {
+  local agent="$1"
+  local os_user="$2"
+
+  [[ -n "$agent" ]] || return 0
+
+  # Gate 1 — Linux only. macOS / shared-mode hosts have no dedicated OS
+  # user; nothing to reap. Skip silently.
+  [[ "$(uname -s)" == "Linux" ]] || return 0
+
+  # Gate 2 — exact-name match. The resolved OS user MUST exactly equal the
+  # generated bridge-managed account name for this agent. This is the core
+  # safety gate: it guarantees we never run userdel/groupdel/setfacl
+  # against an account the bridge did not create or that does not belong
+  # to this delete target. A loose pattern match is explicitly avoided.
+  #
+  # The expected name MUST be computed via bridge_agent_default_os_user —
+  # the same helper `agent create` uses (bridge-agent.sh) — NOT a raw
+  # "<prefix><agent>" concatenation. `agent create` accepts agent names
+  # longer than the Linux 32-char account budget and that helper
+  # TRUNCATES the composed name to fit. A raw prefix+agent string would
+  # not equal the truncated account the bridge actually created, so the
+  # gate would skip cleanup for every long-named isolated agent — leaving
+  # behind exactly the orphan this function exists to reap (issue #1010).
+  if [[ -z "$os_user" ]]; then
+    # No OS user resolved from the roster — agent was never an isolated
+    # linux-user agent (or its account is already gone). Nothing to do.
+    return 0
+  fi
+  local expected=""
+  if command -v bridge_agent_default_os_user >/dev/null 2>&1; then
+    expected="$(bridge_agent_default_os_user "$agent" 2>/dev/null || printf '')"
+  fi
+  if [[ -z "$expected" ]]; then
+    bridge_warn "agent delete: skipping OS-user cleanup for '$agent' — could not compute the expected bridge account name (refusing to act without an exact-match reference)"
+    return 0
+  fi
+  if [[ "$os_user" != "$expected" ]]; then
+    bridge_warn "agent delete: skipping OS-user cleanup for '$agent' — resolved user '$os_user' does not exactly match expected '$expected' (refusing to touch a non-bridge account)"
+    return 0
+  fi
+
+  # ---------------------------------------------------------------------
+  # Step 2 (run before Step 1) — strip the named-user traversal ACEs.
+  #
+  # Must happen while the user still exists: setfacl -x by name resolves
+  # the principal, and stripping after userdel would leave numeric stale
+  # entries. Reuse isolation-v2's own credential-ancestor logic
+  # (_bridge_isolation_v2_cred_ancestors) so the ancestor set matches
+  # exactly what the grant path operated on — do not re-derive it.
+  # ---------------------------------------------------------------------
+  if command -v setfacl >/dev/null 2>&1; then
+    local ctrl_user ctrl_home
+    ctrl_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+    if [[ -n "$ctrl_user" ]]; then
+      ctrl_home="$(getent passwd "$ctrl_user" 2>/dev/null | cut -d: -f6)"
+      [[ -n "$ctrl_home" ]] || ctrl_home="${HOME:-}"
+    fi
+    if [[ -n "${ctrl_home:-}" ]]; then
+      # Same credential-file path the grant path uses.
+      local cred_file="${ctrl_home}/.claude/.credentials.json"
+      local anc
+      while IFS= read -r anc; do
+        [[ -e "$anc" ]] || continue
+        # Only act when the ACE is actually present, so a clean host
+        # produces no noise. getfacl is best-effort.
+        if command -v getfacl >/dev/null 2>&1; then
+          getfacl -p "$anc" 2>/dev/null \
+            | grep -qE "^user:${os_user}:" || continue
+        fi
+        if ! _bridge_isolation_v2_run_root_or_sudo \
+             setfacl -x "u:${os_user}" "$anc"; then
+          bridge_warn "agent delete: failed to strip traversal ACE u:${os_user} from $anc (best-effort; manual 'setfacl -x u:${os_user} $anc' may be needed)"
+        fi
+      done < <(_bridge_isolation_v2_cred_ancestors "$cred_file")
+    else
+      bridge_warn "agent delete: could not resolve controller home — skipping traversal-ACE strip for '$os_user' (manual cleanup may be needed)"
+    fi
+  fi
+
+  # ---------------------------------------------------------------------
+  # Step 1 — remove the dedicated OS user.
+  #
+  # Gate: the user must actually exist in passwd AND match the exact
+  # expected name (already verified above). A userdel failure (user
+  # logged in, processes running, etc.) is non-fatal but reported.
+  # ---------------------------------------------------------------------
+  if getent passwd "$os_user" >/dev/null 2>&1; then
+    if command -v userdel >/dev/null 2>&1; then
+      if ! _bridge_isolation_v2_run_root_or_sudo userdel "$os_user"; then
+        bridge_warn "agent delete: userdel '$os_user' failed (best-effort — the user may be logged in or have running processes; manual 'userdel $os_user' may be needed)"
+      fi
+    else
+      bridge_warn "agent delete: userdel not available — orphan OS user '$os_user' left behind (manual cleanup needed)"
+    fi
+  fi
+
+  # ---------------------------------------------------------------------
+  # Step 3 — drop the per-agent group, if one was created.
+  #
+  # Optional and exact-match guarded. The group name MUST be composed via
+  # bridge_isolation_v2_agent_group_name — the same helper the grant path
+  # uses — NOT a raw "<group-prefix><agent>" concatenation. On Linux that
+  # helper hash-truncates any name that would exceed the 32-char groupadd
+  # limit, so a raw concatenation would miss (and never groupdel) the real
+  # hashed group for every long-named agent. Best-effort; a non-empty
+  # group (still has members) makes groupdel fail and that is fine —
+  # report and move on.
+  # ---------------------------------------------------------------------
+  local agent_grp=""
+  if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+    agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+  fi
+  if [[ -n "$agent_grp" ]] && getent group "$agent_grp" >/dev/null 2>&1; then
+    if command -v groupdel >/dev/null 2>&1; then
+      if ! _bridge_isolation_v2_run_root_or_sudo groupdel "$agent_grp"; then
+        bridge_warn "agent delete: groupdel '$agent_grp' failed (best-effort — group may still have members; manual 'groupdel $agent_grp' may be needed)"
+      fi
+    else
+      bridge_warn "agent delete: groupdel not available — per-agent group '$agent_grp' left behind (manual cleanup needed)"
+    fi
+  fi
+
+  return 0
+}
+
 bridge_isolation_v2_write_agent_state_marker() {
   # Atomic-ish writer for daemon-side per-agent state markers
   # (idle-since, manual-stop, missing-marker-retries, etc.). Ensures the
