@@ -6,6 +6,50 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-antigravity-preview] — 2026-05-21
+
+### Highlight — Antigravity (`agy`) engine support — PREVIEW build
+
+**Off-main preview release.** This is NOT a `main`-line release: it is the
+`feat/antigravity-engine-integration` branch tagged as a separate version so
+the operator can install and exercise the new Antigravity engine on a real
+host before it is folded into a `main` beta (`v0.14.5-beta4` or `v0.14.6`,
+TBD). The matching tag is `v0.14.5-antigravity-preview`, marked **Pre-release**
+on GitHub.
+
+Adds Antigravity CLI (`agy`) as a third orchestratable engine alongside
+`claude` and `codex`. Built by the `agy-wave` dedicated wave-orchestrator
+through the full 5-phase wave: codex plan-agreement (r1→r4), four
+implementation tracks each codex Phase-4 pair-reviewed, a full-branch
+integration review, and a live 6/6 agy QA pass on the macOS host.
+
+### Operator-visible
+
+- **`antigravity` engine** — `agent-bridge --antigravity` (alias `--agy`) spawns
+  an Antigravity CLI session under the daemon/queue/tmux framework, the same as
+  `--claude` / `--codex` (#1001).
+- **Launch contract** (#1002) — `agy --dangerously-skip-permissions`; agent
+  workdir auto-added to `trustedWorkspaces` and the `agb`/`agent-bridge` CLI
+  paths to `permissions.allow` in `~/.gemini/antigravity-cli/settings.json`
+  before launch (no interactive trust prompt); SessionStart context injected
+  via the `-i` initial-prompt bootstrap.
+- **Conversation resume** (#1003) — restart resumes the prior agy conversation
+  via `agy --conversation <id>`; conversation ids are detected from agy state
+  and persisted in the per-agent slot, mirroring the claude resume path.
+- **tmux submit semantics** (#1004) — daemon idle/prompt detection + send-keys
+  tuned for the agy console; runtime inbox-bootstrap reaches agy sessions.
+- **Render mode** (#1006) — the launch preseed pins `altScreenMode: always` for
+  bridge-managed agy agents (agy v1.0.0 rejected an explicit `inline` value at
+  build time; per-workdir config remains the operator's to adjust).
+
+### Scope / caveats
+
+- Preview only — macOS host. Linux-user isolation for agy agents is **out of
+  scope** for this build (deferred follow-up).
+- The ACL-deprecation set (#998: #995/#999/#1000) is on `main` and is **not**
+  fully included here — the integration branch forked before #1000 landed.
+  The matching-`main` beta that folds Antigravity in will carry the full set.
+
 ## [0.14.5-beta2] — 2026-05-20
 
 ### Highlight — Teams inbound regression close-out wave (3 fixes)
