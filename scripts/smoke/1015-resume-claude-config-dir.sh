@@ -2,9 +2,21 @@
 # shellcheck shell=bash
 # scripts/smoke/1015-resume-claude-config-dir.sh — Issue #1015.
 #
-# Pins the contract that the Claude session-id helpers resolve their
-# `~/.claude/sessions` + `~/.claude/projects` roots from the *agent's*
-# CLAUDE_CONFIG_DIR, not the daemon process's HOME.
+# Re-exec under bash 4+ so we can `source bridge-lib.sh` directly for the
+# shim-level coverage (matches scripts/smoke/claude-live-session-
+# pretranscript.sh).
+if [[ "${BRIDGE_SMOKE_BASH4_REEXEC:-0}" != "1" && "${BASH_VERSINFO[0]:-0}" -lt 4 ]]; then
+  for _candidate in /opt/homebrew/bin/bash /usr/local/bin/bash; do
+    if [[ -x "$_candidate" ]] && "$_candidate" -lc '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
+      BRIDGE_SMOKE_BASH4_REEXEC=1 exec "$_candidate" "$0" "$@"
+    fi
+  done
+  echo "[smoke:1015-resume-claude-config-dir][error] bash 4+ required (got ${BASH_VERSION:-unknown})" >&2
+  exit 1
+fi
+#
+# Pins the contract that the Claude session-id resolution keys off the
+# *agent's* CLAUDE_CONFIG_DIR, not the daemon process's HOME.
 #
 # Root cause (issue #1015): static Claude agents launched by the
 # isolation-v2 stack run with a custom HOME / CLAUDE_CONFIG_DIR, so the
@@ -15,30 +27,45 @@
 #
 # The fix: both helpers resolve the config root from, in priority order,
 # an explicit trailing argument > the CLAUDE_CONFIG_DIR env var >
-# <HOME>/.claude > os.path.expanduser("~/.claude"). The last two preserve
-# the pre-#1015 daemon-HOME behaviour for non-isolated agents.
+# <HOME>/.claude > os.path.expanduser("~/.claude"). The bash shims
+# (bridge_detect_claude_session_id / bridge_resolve_resume_session_id)
+# auto-supply that trailing argument ONLY for registered, genuinely
+# isolated agents whose config dir exists on disk
+# (bridge_resolve_agent_claude_config_dir) — so test / unregistered /
+# non-isolated callers that rely on a per-call HOME keep the daemon-HOME
+# fallback exactly as on `main`.
 #
-# Test plan (all run directly against the two python helpers, no live
-# tmux, no bridge runtime):
-#   T1. detect-claude-session-id.py finds the live session id when the
-#       agent's config dir is passed as the trailing argument.
-#   T2. detect-claude-session-id.py finds it via the CLAUDE_CONFIG_DIR
-#       env var when no argument is supplied.
-#   T3. detect-claude-session-id.py with no config dir and no env var
-#       falls back to the ambient HOME — the fixture lives elsewhere so
-#       it must NOT be discovered (backward-compatible non-isolated path).
-#   T4. resolve-claude-resume-session-id.py accepts the candidate id
-#       (rc=0) when the agent's config dir is passed as the trailing arg.
-#   T5. resolve-claude-resume-session-id.py accepts it via the
-#       CLAUDE_CONFIG_DIR env var.
-#   T6. resolve-claude-resume-session-id.py with no config dir and no env
-#       var rejects the candidate (rc=1) — the daemon-HOME fallback finds
-#       no transcript, exactly as before #1015.
+# Test plan — two layers:
 #
-# Isolation: a self-contained fixture dir under SMOKE_TMP_ROOT; the smoke
-# never reads or writes the operator's live `~/.claude` or bridge runtime.
-# Each "no config dir" case runs with HOME pointed at an empty temp dir so
-# the operator's real `~/.claude` cannot mask the fallback assertion.
+#   Direct helper coverage (the helpers invoked as standalone scripts):
+#   T1. detect-claude-session-id.py resolves the session via the trailing
+#       config-dir argument.
+#   T2. detect-claude-session-id.py resolves it via CLAUDE_CONFIG_DIR env.
+#   T3. detect-claude-session-id.py with no config dir / env falls back to
+#       the ambient HOME — fixture lives elsewhere so nothing is found.
+#   T4. resolve-claude-resume-session-id.py accepts the candidate (rc=0)
+#       via the trailing config-dir argument.
+#   T5. resolve-claude-resume-session-id.py accepts it via CLAUDE_CONFIG_DIR.
+#   T6. resolve-claude-resume-session-id.py with no config dir / env
+#       rejects the candidate (rc=1) — daemon-HOME fallback, unchanged.
+#
+#   Shim coverage (the actual Bash functions, the layer the #1018 r1
+#   regression slipped past because the smoke only tested the helpers):
+#   T7. bridge_detect_claude_session_id for a REGISTERED isolated agent
+#       resolves the session under the agent's <agent-home>/.claude/.
+#   T8. bridge_resolve_resume_session_id for the same registered isolated
+#       agent accepts the candidate (rc=0).
+#   T9. bridge_detect_claude_session_id for an UNREGISTERED agent with a
+#       per-call HOME does NOT shadow that HOME — the guard returns empty
+#       and the helper finds the fixture under the per-call HOME
+#       (backward-compatible fallback).
+#   T10. bridge_resolve_resume_session_id for an UNREGISTERED agent with a
+#        per-call HOME likewise accepts the candidate via that HOME — the
+#        regression vector from PR #1018 r1 (codex item 1).
+#
+# Isolation: temp BRIDGE_HOME via smoke_setup_bridge_home (v2 layout);
+# the smoke never reads or writes the operator's live `~/.claude` or
+# bridge runtime. The fallback cases pin HOME at a temp dir.
 #
 # Footgun #11 (heredoc_write deadlock class): this fixture uses only
 # `printf` / `cat >file <<EOF` plain-body writes — no command
@@ -59,7 +86,7 @@ trap cleanup EXIT
 
 smoke_require_cmd python3
 
-smoke_make_temp_root "1015-resume-claude-config-dir"
+smoke_setup_bridge_home "1015-resume-claude-config-dir"
 
 REPO_ROOT="$SMOKE_REPO_ROOT"
 DETECT_HELPER="$REPO_ROOT/scripts/python-helpers/detect-claude-session-id.py"
@@ -68,28 +95,31 @@ RESOLVE_HELPER="$REPO_ROOT/scripts/python-helpers/resolve-claude-resume-session-
 [[ -f "$DETECT_HELPER" ]] || smoke_fail "missing helper: $DETECT_HELPER"
 [[ -f "$RESOLVE_HELPER" ]] || smoke_fail "missing helper: $RESOLVE_HELPER"
 
-# --- Fixture: an agent config dir with a live session + matching
-#     transcript, mimicking what an isolation-v2 agent writes under
-#     <agent-home>/.claude/ . -----------------------------------------
+# Seed a Claude config dir (sessions/<pid>.json + matching fresh
+# transcript) under a given root, mimicking what an isolation-v2 agent
+# writes under <agent-home>/.claude/ .
+seed_claude_config_dir() {
+  local config_dir="$1"
+  local workdir="$2"
+  local session_id="$3"
+  local slug now_ms
+  slug="${workdir//\//-}"
+  mkdir -p "$config_dir/sessions" "$config_dir/projects/$slug"
+  now_ms=$(( $(date +%s) * 1000 ))
+  cat >"$config_dir/sessions/$$.json" <<EOF
+{"sessionId":"$session_id","cwd":"$workdir","pid":$$,"startedAt":$now_ms}
+EOF
+  printf '{"sessionId":"%s"}\n' "$session_id" \
+    >"$config_dir/projects/$slug/$session_id.jsonl"
+}
+
+# --- Direct-helper fixture ----------------------------------------------
 AGENT_CONFIG_DIR="$SMOKE_TMP_ROOT/agent-home/.claude"
 WORKDIR="$SMOKE_TMP_ROOT/agent-workdir"
 SESSION_ID="abc12345-1015-resume-fixture"
 mkdir -p "$WORKDIR"
-
-# Claude encodes the project dir by replacing "/" with "-".
-WORKDIR_SLUG="${WORKDIR//\//-}"
-mkdir -p "$AGENT_CONFIG_DIR/sessions" "$AGENT_CONFIG_DIR/projects/$WORKDIR_SLUG"
-
-# Live `sessions/<pid>.json` — use this shell's own pid so pid_is_alive()
-# returns true (the #827 live-session shortcut both helpers honour).
-NOW_MS=$(( $(date +%s) * 1000 ))
-cat >"$AGENT_CONFIG_DIR/sessions/$$.json" <<EOF
-{"sessionId":"$SESSION_ID","cwd":"$WORKDIR","pid":$$,"startedAt":$NOW_MS}
-EOF
-
-# Matching fresh transcript so the transcript-scan path also resolves.
-printf '{"sessionId":"%s"}\n' "$SESSION_ID" \
-  >"$AGENT_CONFIG_DIR/projects/$WORKDIR_SLUG/$SESSION_ID.jsonl"
+WORKDIR="$(cd -P "$WORKDIR" && pwd -P)"
+seed_claude_config_dir "$AGENT_CONFIG_DIR" "$WORKDIR" "$SESSION_ID"
 
 # An empty HOME for the "no config dir" fallback cases, so the operator's
 # real ~/.claude cannot accidentally satisfy (or break) the assertion.
@@ -168,11 +198,123 @@ test_resolve_fallback_rejects() {
     "T6 resolve helper daemon-HOME fallback rejects candidate (rc=1)"
 }
 
-smoke_run "T1 detect resolves via trailing argument"   test_detect_via_argument
-smoke_run "T2 detect resolves via CLAUDE_CONFIG_DIR"    test_detect_via_env
-smoke_run "T3 detect fallback finds no fixture"         test_detect_fallback_finds_nothing
-smoke_run "T4 resolve accepts via trailing argument"    test_resolve_via_argument
-smoke_run "T5 resolve accepts via CLAUDE_CONFIG_DIR"    test_resolve_via_env
-smoke_run "T6 resolve fallback rejects candidate"       test_resolve_fallback_rejects
+# --- Shim coverage: source bridge-lib.sh and exercise the Bash shims ----
+#
+# bridge-lib.sh transitively sources lib/bridge-state.sh (the shims) and
+# lib/bridge-agents.sh (bridge_agent_exists / bridge_agent_claude_config_dir).
+# shellcheck source=bridge-lib.sh disable=SC1091
+source "$REPO_ROOT/bridge-lib.sh"
+
+declare -F bridge_detect_claude_session_id >/dev/null \
+  || smoke_fail "bridge_detect_claude_session_id not defined after sourcing bridge-lib.sh"
+declare -F bridge_resolve_resume_session_id >/dev/null \
+  || smoke_fail "bridge_resolve_resume_session_id not defined"
+declare -F bridge_resolve_agent_claude_config_dir >/dev/null \
+  || smoke_fail "bridge_resolve_agent_claude_config_dir not defined (issue #1015 guard)"
+declare -F bridge_reset_roster_maps >/dev/null \
+  || smoke_fail "bridge_reset_roster_maps not defined"
+
+# Register one isolated agent. Its config dir resolves to
+# $BRIDGE_AGENT_ROOT_V2/<agent>/home/.claude (bridge_agent_claude_config_dir
+# under the v2 layout that smoke_setup_bridge_home installs). Seed the
+# fixture there so the guard's "registered AND dir exists" check passes.
+bridge_reset_roster_maps
+
+ISO_AGENT="rcd-1015"
+ISO_WORKDIR="$SMOKE_TMP_ROOT/iso-workdir"
+ISO_SESSION_ID="def67890-1015-iso-fixture"
+mkdir -p "$ISO_WORKDIR"
+ISO_WORKDIR="$(cd -P "$ISO_WORKDIR" && pwd -P)"
+
+BRIDGE_AGENT_IDS=("$ISO_AGENT")
+BRIDGE_AGENT_DESC["$ISO_AGENT"]="$ISO_AGENT smoke fixture"
+BRIDGE_AGENT_ENGINE["$ISO_AGENT"]="claude"
+BRIDGE_AGENT_SESSION["$ISO_AGENT"]="$ISO_AGENT"
+BRIDGE_AGENT_WORKDIR["$ISO_AGENT"]="$ISO_WORKDIR"
+BRIDGE_AGENT_LOOP["$ISO_AGENT"]="1"
+BRIDGE_AGENT_CONTINUE["$ISO_AGENT"]="1"
+BRIDGE_AGENT_SOURCE["$ISO_AGENT"]="static"
+BRIDGE_AGENT_CREATED_AT["$ISO_AGENT"]="$(date +%s)"
+BRIDGE_AGENT_SESSION_ID["$ISO_AGENT"]=""
+
+ISO_CONFIG_DIR="$(bridge_agent_claude_config_dir "$ISO_AGENT")"
+[[ -n "$ISO_CONFIG_DIR" ]] \
+  || smoke_fail "bridge_agent_claude_config_dir returned empty for registered agent"
+seed_claude_config_dir "$ISO_CONFIG_DIR" "$ISO_WORKDIR" "$ISO_SESSION_ID"
+
+# T7 — bridge_detect_claude_session_id resolves the registered isolated
+# agent's session under its own <agent-home>/.claude/ . The guard
+# auto-supplies the config dir; HOME is irrelevant here.
+test_shim_detect_isolated_agent() {
+  local detected="" _cfg=""
+  _cfg="$(bridge_resolve_agent_claude_config_dir "$ISO_AGENT")"
+  smoke_assert_eq "$ISO_CONFIG_DIR" "$_cfg" \
+    "T7 guard resolves the registered isolated agent's config dir"
+  detected="$(bridge_detect_claude_session_id "$ISO_WORKDIR" 0 "" "$_cfg" 2>/dev/null)"
+  smoke_assert_eq "$ISO_SESSION_ID" "$detected" \
+    "T7 shim detects session under the isolated agent's CLAUDE_CONFIG_DIR"
+}
+
+# T8 — bridge_resolve_resume_session_id accepts the candidate (rc=0) for
+# the registered isolated agent; the shim auto-resolves the config dir.
+test_shim_resolve_isolated_agent() {
+  local resolved="" rc=0
+  set +e
+  resolved="$(bridge_resolve_resume_session_id \
+    claude "$ISO_AGENT" "$ISO_WORKDIR" "$ISO_SESSION_ID" 2>/dev/null)"
+  rc=$?
+  set -e
+  smoke_assert_eq "0" "$rc" \
+    "T8 shim resolve rc=0 for registered isolated agent"
+  smoke_assert_eq "$ISO_SESSION_ID" "$resolved" \
+    "T8 shim resolve accepts the isolated agent's live session id"
+}
+
+# T9 — bridge_detect_claude_session_id for an UNREGISTERED agent with a
+# per-call HOME must NOT shadow that HOME. The guard returns empty (agent
+# not in the roster) so the helper falls back to HOME/.claude — where the
+# direct-helper fixture lives. This is the regression vector from #1018 r1.
+test_shim_detect_unregistered_home_fallback() {
+  local guard_out="" detected=""
+  guard_out="$(bridge_resolve_agent_claude_config_dir "unregistered-xyz")"
+  smoke_assert_eq "" "$guard_out" \
+    "T9 guard returns empty for an unregistered agent (no HOME shadowing)"
+  # The shim takes the config dir as an explicit arg; with the guard
+  # returning empty, the caller passes "" and the helper uses HOME.
+  detected="$(HOME="$SMOKE_TMP_ROOT/agent-home" \
+    bridge_detect_claude_session_id "$WORKDIR" 0 "" "" 2>/dev/null)"
+  smoke_assert_eq "$SESSION_ID" "$detected" \
+    "T9 shim detect honours the per-call HOME fallback (no config dir)"
+}
+
+# T10 — bridge_resolve_resume_session_id for an UNREGISTERED agent with a
+# per-call HOME accepts the candidate via that HOME. Direct re-creation of
+# the claude-live-session-pretranscript T1 regression vector: prior to the
+# r1 fix the shim auto-computed a derived config dir for the unregistered
+# `test`-style agent and overrode HOME, breaking the fallback.
+test_shim_resolve_unregistered_home_fallback() {
+  local resolved="" rc=0
+  set +e
+  resolved="$(HOME="$SMOKE_TMP_ROOT/agent-home" \
+    bridge_resolve_resume_session_id \
+    claude "unregistered-xyz" "$WORKDIR" "$SESSION_ID" 2>/dev/null)"
+  rc=$?
+  set -e
+  smoke_assert_eq "0" "$rc" \
+    "T10 shim resolve rc=0 via per-call HOME for an unregistered agent"
+  smoke_assert_eq "$SESSION_ID" "$resolved" \
+    "T10 shim resolve accepts candidate via the per-call HOME fallback"
+}
+
+smoke_run "T1 detect resolves via trailing argument"     test_detect_via_argument
+smoke_run "T2 detect resolves via CLAUDE_CONFIG_DIR"      test_detect_via_env
+smoke_run "T3 detect fallback finds no fixture"           test_detect_fallback_finds_nothing
+smoke_run "T4 resolve accepts via trailing argument"      test_resolve_via_argument
+smoke_run "T5 resolve accepts via CLAUDE_CONFIG_DIR"      test_resolve_via_env
+smoke_run "T6 resolve fallback rejects candidate"         test_resolve_fallback_rejects
+smoke_run "T7 shim detect for registered isolated agent"  test_shim_detect_isolated_agent
+smoke_run "T8 shim resolve for registered isolated agent" test_shim_resolve_isolated_agent
+smoke_run "T9 shim detect honours per-call HOME"          test_shim_detect_unregistered_home_fallback
+smoke_run "T10 shim resolve honours per-call HOME"        test_shim_resolve_unregistered_home_fallback
 
 smoke_log "all checks passed"

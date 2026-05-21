@@ -131,11 +131,10 @@ refresh_missing_session_ids() {
     fi
 
     # Issue #1015: pass the agent's CLAUDE_CONFIG_DIR so isolation-v2
-    # agents are detected against their own `<agent-home>/.claude/`.
-    _claude_config_dir=""
-    if command -v bridge_agent_claude_config_dir >/dev/null 2>&1; then
-      _claude_config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
-    fi
+    # agents are detected against their own `<agent-home>/.claude/`. The
+    # resolver returns empty for unregistered / non-isolated agents so the
+    # helper keeps its daemon-HOME fallback.
+    _claude_config_dir="$(bridge_resolve_agent_claude_config_dir "$agent" 2>/dev/null || true)"
     detected="$(bridge_detect_session_id \
       "$(bridge_agent_engine "$agent")" \
       "$(bridge_agent_workdir "$agent")" \

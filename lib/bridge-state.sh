@@ -235,11 +235,11 @@ bridge_claude_resume_session_id_for_agent() {
   [[ "$_max_hours_int" =~ ^[0-9]+$ ]] || _max_hours_int=48
   local _since_ms=$(( ($(date +%s) - _max_hours_int * 3600) * 1000 ))
   # Issue #1015: pass the agent's CLAUDE_CONFIG_DIR so isolation-v2 agents
-  # detect transcripts under their own `<agent-home>/.claude/`.
+  # detect transcripts under their own `<agent-home>/.claude/`. The
+  # resolver returns empty for unregistered / non-isolated agents so the
+  # helper keeps its daemon-HOME fallback.
   local _claude_config_dir=""
-  if command -v bridge_agent_claude_config_dir >/dev/null 2>&1; then
-    _claude_config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
-  fi
+  _claude_config_dir="$(bridge_resolve_agent_claude_config_dir "$agent")"
   detected="$(bridge_detect_claude_session_id "$workdir" "$_since_ms" "$_quarantine_csv" "$_claude_config_dir" 2>/dev/null || true)"
   [[ -n "$detected" ]] || return 1
   # Belt-and-suspenders: round-trip through the resolver so a missed slug or
@@ -2881,6 +2881,35 @@ bridge_persist_agent_state() {
   bridge_write_agent_state_file "$agent" "$(bridge_history_file_for_agent "$agent")"
 }
 
+# Issue #1015: resolve the Claude config dir to hand the session-id
+# helpers — but ONLY when `agent` is a genuinely registered agent whose
+# computed config dir actually exists on disk. For test / unregistered /
+# non-isolated callers, `bridge_agent_claude_config_dir` still returns a
+# *derived* path (e.g. `$BRIDGE_AGENT_HOME_ROOT/<name>/.claude`) that does
+# not exist; passing that to the helper would OVERRIDE the per-call
+# `HOME` the caller relies on and search the wrong tree. Returning empty
+# in that case lets the helper fall back to `CLAUDE_CONFIG_DIR` env /
+# `HOME` / `~` exactly as on `main`. Echoes the config dir on stdout, or
+# nothing when no isolated config dir is in play.
+bridge_resolve_agent_claude_config_dir() {
+  local agent="$1"
+  local config_dir=""
+
+  [[ -n "$agent" ]] || return 0
+  command -v bridge_agent_claude_config_dir >/dev/null 2>&1 || return 0
+  # Only registered agents get an isolation-aware config dir. An
+  # unregistered name (smoke fixtures, ad hoc probes) must fall through
+  # to the helper's daemon-HOME fallback.
+  if command -v bridge_agent_exists >/dev/null 2>&1; then
+    bridge_agent_exists "$agent" || return 0
+  fi
+  config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+  # A derived-but-absent path means the agent is not actually isolated on
+  # this host; do not let it shadow the caller's HOME.
+  [[ -n "$config_dir" && -d "$config_dir" ]] || return 0
+  printf '%s' "$config_dir"
+}
+
 # Issue #827: live-session acceptance (sessions/<pid>.json present, pid
 # alive, cwd matches, no transcript jsonl yet) is implemented in the
 # Python helper. The bash body uses `python3 "$BRIDGE_SCRIPT_DIR/scripts
@@ -2965,14 +2994,12 @@ bridge_resolve_resume_session_id() {
   # Issue #1015: isolation-v2 agents run Claude with a custom
   # HOME/CLAUDE_CONFIG_DIR, so the session JSON and transcripts live under
   # `<agent-home>/.claude/`, not the daemon's `~/.claude/`. Resolve the
-  # agent's config dir and pass it through; empty (no agent / helper
-  # unavailable) leaves the helper on its daemon-HOME fallback so the
-  # non-isolated path and other call sites are unchanged.
+  # agent's config dir ONLY when it is a registered, genuinely isolated
+  # agent (see bridge_resolve_agent_claude_config_dir) — empty leaves the
+  # helper on its CLAUDE_CONFIG_DIR-env / daemon-HOME fallback so the
+  # non-isolated path and test/unregistered callers are unchanged.
   local claude_config_dir=""
-  if [[ -n "$agent" ]] \
-    && command -v bridge_agent_claude_config_dir >/dev/null 2>&1; then
-    claude_config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
-  fi
+  claude_config_dir="$(bridge_resolve_agent_claude_config_dir "$agent")"
 
   python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-claude-resume-session-id.py" \
     "$workdir" "$candidate" "$max_age_hours" "$agent" "$exclude_csv" \
@@ -3144,11 +3171,10 @@ bridge_refresh_agent_session_id() {
     exclude_csv="$(IFS=,; echo "${excluded[*]}")"
 
     # Issue #1015: thread the agent's CLAUDE_CONFIG_DIR through so
-    # isolation-v2 agents detect their own `<agent-home>/.claude/`.
+    # isolation-v2 agents detect their own `<agent-home>/.claude/`. Empty
+    # for unregistered / non-isolated agents (daemon-HOME fallback kept).
     local _claude_config_dir=""
-    if command -v bridge_agent_claude_config_dir >/dev/null 2>&1; then
-      _claude_config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
-    fi
+    _claude_config_dir="$(bridge_resolve_agent_claude_config_dir "$agent")"
     detected="$(bridge_detect_session_id \
       "$(bridge_agent_engine "$agent")" \
       "$(bridge_agent_workdir "$agent")" \
