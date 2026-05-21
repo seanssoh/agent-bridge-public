@@ -6,6 +6,90 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta3] — 2026-05-21
+
+### Highlight — ACL-deprecation set (#998) + accumulated stabilization wave
+
+Operator-cued **third prerelease** in the v0.14.5 stabilization window. Bundles
+15 commits that landed after `v0.14.5-beta2` (2026-05-20): the three-PR
+ACL-deprecation set (#998) plus the 2026-05-20 stabilization wave and HUD fix.
+Every PR was codex pair-reviewed (Waves 2026-05-20/21: `agb-dev-claude` +
+`agb-dev-codex`). No new features. `-beta3` prerelease; matching tag
+`v0.14.5-beta3`, GitHub release marked **Pre-release**. Stable `v0.14.5`
+follows once the wave burns in on operator hosts.
+
+The ACL set was additionally validated by a live VM QA pass (2026-05-21) on
+OrbStack Linux (`agb-test`, Oracle Linux 9) and a macOS VM (`agb-mac-seq`,
+Sequoia 15.7.3) — real `setfacl` / isolated-UID / `ab-shared` group behavior,
+all green, no defect attributable to #995/#999/#1000.
+
+### Operator-visible — ACL-deprecation set (#998)
+
+The recurring `mask::---` ACL-regression family (#778/#441/#534/#543/#851) is
+closed by replacing per-agent named-user `setfacl` ACEs with `ab-shared`
+group-mode ownership. The isolated-agent OS users are already `ab-shared`
+members (the upgrade's isolation-v2 migration backfills membership), so there
+is no per-agent ACL to maintain or silently break.
+
+- **Queue gateway socket** (#995, closes #994) — named-user ACEs replaced by
+  group ownership: socket `chgrp ab-shared` + `0660`, instance dir
+  `chgrp ab-shared` + `2770` (setgid). `SO_PEERCRED` request authorization is
+  unchanged. When `ab-shared` is absent: `0600` owner-only fallback (smoke/dev)
+  or a hard fail with an actionable create-the-group message (live runtime).
+- **Controller Claude credential** (#999, #998 PR A) — `~/.claude/.credentials.json`
+  moves from named-user ACEs to `ab-shared` group-mode (`0640`, group
+  `ab-shared`, extended ACLs stripped). The verifier enforces the **exact**
+  contracted file mode — a widened mode (`0660`/`0670`/`0770`…) now fails the
+  check instead of false-passing (RC3 apply/verify-divergence guard).
+- **Channel-dotenv stop-gap retired** (#1000, #998 PR B) — the runtime
+  `apply_channel_state_dotenv_acl` self-heal is removed; the v3 channel-dotenv
+  contract (isolated-UID owns its own `0600` dotenv, no extended ACL) is
+  canonical, and `agent-bridge migrate isolation v3 --check/--apply` is the
+  recovery path. The v3 detector now flags **any** extended ACL (named *or* a
+  residual `mask::` *or* `default:`), so a mask-only residual is reported as
+  drift instead of false `already-canonical`.
+
+### Operator-visible — 2026-05-20 stabilization wave + HUD
+
+- **HUD token-rotation usage cache restored** (#977) — `claude-hud` v0.0.12+
+  dropped the OAuth-polling loop that wrote `.usage-cache.json`; a stdin-tap
+  script in the HUD statusLine pipeline restores the cache that the
+  token-rotation / rate-limit monitor depends on.
+- **Isolated agent Teams-path regression fixed** (#993, closes #989) — a
+  channel-list change + restart no longer leaves the cached
+  `runtime/agent-env.sh` with a stale pre-v2 `*_STATE_DIR`; the shared
+  refresh helper now also covers the `bridge-setup.sh` (`setup teams/discord/
+  telegram`) and upgrade-time relay-cleanup mutation paths.
+- **`upgrade --restart-agents` attached-skip notice** (#996, closes #980) —
+  agents skipped because their tmux session is attached are now surfaced in
+  the upgrade output, the `[upgrade-complete]` task body, and a dedicated
+  deduplicated `[restart-required]` task.
+- **agent restart preserves `--resume`** (#985, closes #981) — the session id
+  is snapshotted before the kill so an operator-initiated restart resumes the
+  prior conversation instead of starting fresh.
+- **Daily-backup defaults** (#983, closes #974/#975) — `plugins/cache` excluded
+  from the backup walk; `BRIDGE_DAILY_BACKUP_TIMEOUT_SECONDS` default raised
+  300→600s. **Persistent exclude config** (#997, closes #979) — a
+  `state/daily-backup/excludes.conf` file (one relpath per line) is now read in
+  addition to the env var; no shell eval, survives upgrades.
+- **upgrade picker-sweep** (#984, closes #978) — a one-shot picker-sweep runs
+  after `--restart-agents` so codex agents are not left at the cwd-confirm
+  picker until the next cron tick.
+- **SOUL.md / CLAUDE.md scaffold-placeholder detection** (#988) — SessionStart
+  surfaces a warning when an agent's profile still carries unfilled template
+  tokens despite `SESSION-TYPE.md` marked complete.
+- **isolated restart + socket listener recovery hardened** (#992), **Teams
+  inbound text extraction + CRLF normalization** (#986/#987).
+
+### Known follow-ups (not in this prerelease)
+
+- `agent delete` does not clean up an isolated agent's dedicated OS user or its
+  stale traversal ACEs on ancestor dirs — tracked as #1010.
+- A dedicated `controller_credential_group` apply→check regression smoke for
+  #999 — tracked fast-follow.
+- Antigravity (`agy`) engine support is on a separate preview track
+  (`v0.14.5-antigravity-preview`); it folds into a later beta once tested.
+
 ## [0.14.5-beta2] — 2026-05-20
 
 ### Highlight — Teams inbound regression close-out wave (3 fixes)
