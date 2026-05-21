@@ -1841,7 +1841,23 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
     blocked_reminder_seconds = max(0, int(args.blocked_reminder_seconds))
     blocked_escalate_seconds = max(0, int(args.blocked_escalate_seconds))
     admin_agent = str(args.admin_agent or "").strip()
+    # Issue #1014 A: a freshly-queued task already triggered the task-arrival
+    # push notification. The daemon idle-nudge measures agent-idle-duration, so
+    # an agent parked idle past idle_threshold gets a redundant ACTION REQUIRED
+    # nudge on the very next tick (~5s) for a task it is already acting on.
+    # Gate the nudge on task-queued age: a queued task younger than the nudge
+    # redelivery window does not count as a fresh nudge trigger. Once it ages
+    # past the window without progress, the nudge fires normally.
+    try:
+        nudge_redelivery_seconds = int(
+            os.environ.get("BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS", "60")
+        )
+    except (TypeError, ValueError):
+        nudge_redelivery_seconds = 60
+    if nudge_redelivery_seconds < 0:
+        nudge_redelivery_seconds = 0
     queued_ids_by_agent: dict[str, list[int]] = {}
+    queued_created_by_id: dict[int, int] = {}
 
     with closing(connect()) as conn, conn:
         for row in snapshot_rows:
@@ -2099,7 +2115,7 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
 
         rows = conn.execute(
             """
-            SELECT assigned_to, id
+            SELECT assigned_to, id, created_ts
             FROM tasks
             WHERE status = 'queued'
               AND title NOT LIKE '[cron-dispatch]%'
@@ -2107,7 +2123,9 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
             """
         ).fetchall()
         for row in rows:
-            queued_ids_by_agent.setdefault(str(row["assigned_to"]), []).append(int(row["id"]))
+            task_id = int(row["id"])
+            queued_ids_by_agent.setdefault(str(row["assigned_to"]), []).append(task_id)
+            queued_created_by_id[task_id] = int(row["created_ts"] or 0)
 
         rows = conn.execute(
             f"""
@@ -2163,7 +2181,27 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
         if zombie:
             continue
         last_nudged_ids = {item for item in last_nudge_key.split(",") if item}
-        has_new_queue_ids = any(str(task_id) not in last_nudged_ids for task_id in queue_ids)
+        # Issue #1014 A: a "new" queued task id only counts as a fresh nudge
+        # trigger once it has aged past the redelivery window. A task younger
+        # than that window already drew a task-arrival push, so an ACTION
+        # REQUIRED re-nudge for it on the next tick is redundant noise.
+        # nudge_redelivery_seconds <= 0 disables the gate entirely.
+        new_queue_ids = [
+            task_id for task_id in queue_ids if str(task_id) not in last_nudged_ids
+        ]
+        has_new_queue_ids = any(
+            nudge_redelivery_seconds <= 0
+            or (current_ts - queued_created_by_id.get(task_id, 0))
+            >= nudge_redelivery_seconds
+            for task_id in new_queue_ids
+        )
+        # Issue #1014 A: if every queued task is both never-nudged AND still
+        # inside its redelivery window, there is nothing nudge-worthy yet —
+        # the task-arrival push is doing its job. Skip rather than emit a
+        # redundant ACTION REQUIRED. (A previously-nudged task that needs
+        # redelivery is in last_nudged_ids, so it does not gate here.)
+        if not last_nudged_ids and not has_new_queue_ids:
+            continue
         if last_nudge_ts and current_ts - last_nudge_ts < nudge_cooldown and not has_new_queue_ids:
             continue
         # Suppress repeats for the same queue until the session shows activity again,

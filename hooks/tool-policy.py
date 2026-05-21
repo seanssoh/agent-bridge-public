@@ -527,6 +527,37 @@ _READ_INTENT_BASH_COMMANDS = frozenset(
 )
 
 
+# Issue #1014 C: provably non-mutating shell builtins that routinely
+# appear as a *prelude* stage in a read pipeline — `cd ~/.agent-bridge &&
+# grep BRIDGE agent-roster.local.sh`, `test -f roster && cat roster`,
+# `echo "checking"; grep …`. None of these can mutate the filesystem:
+# `cd`/`pwd` only move/print the working directory, `test`/`[` are
+# read-only predicates, `echo`/`printf` write to stdout (any redirection
+# is independently rejected by the per-token write-redirect check below),
+# and `true`/`false`/`:` are no-ops. Before #1014 a neutral prelude stage
+# disqualified the whole pipeline, so a routine `cd … && grep <protected>`
+# read was mis-classified as a write and drew the write-oriented
+# `config set` deny. Treating these stages as transparent does NOT widen
+# the write surface — a genuine write stage (or any output redirection)
+# anywhere in the pipeline still flips the classification to write-intent.
+_NEUTRAL_PRELUDE_BASH_COMMANDS = frozenset(
+    {
+        "cd",
+        "pushd",
+        "popd",
+        "pwd",
+        "test",
+        "[",
+        "[[",
+        "echo",
+        "printf",
+        "true",
+        "false",
+        ":",
+    }
+)
+
+
 def _stage_first_token(stage: str) -> str:
     """Return the leading command word of a single pipeline stage.
 
@@ -646,6 +677,12 @@ def _is_read_intent_bash(command: str) -> bool:
             continue
         # Strip any path component so `/usr/bin/cat` classifies as `cat`.
         leaf = first.rsplit("/", 1)[-1]
+        # Issue #1014 C: a neutral prelude stage (`cd`, `test`, `echo`, …)
+        # cannot mutate state — output redirection is already rejected by
+        # the per-token check above — so it must not disqualify an
+        # otherwise read-intent pipeline.
+        if leaf in _NEUTRAL_PRELUDE_BASH_COMMANDS:
+            continue
         if leaf in _READ_INTENT_BASH_COMMANDS:
             # Reject the in-place / write-mode flag forms even for tools
             # that are normally read-only (e.g. `sed -i`, `awk -i inplace`).

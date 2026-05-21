@@ -3091,6 +3091,30 @@ bridge_write_linux_agent_env_file() {
       rm -f "$file"
     fi
   fi
+  # Issue #1014 B: the launch envelope must not bake a stale BRIDGE_LAYOUT
+  # value into the per-agent env file. When a valid v2 layout marker exists
+  # the marker is authoritative — the child re-resolves the layout at startup
+  # via bridge_resolve_layout. Baking `BRIDGE_LAYOUT=legacy` here (the old
+  # `${BRIDGE_LAYOUT:-legacy}` default) made the stale value self-perpetuate
+  # through the daemon → agent-env → CLI process tree, so every restart
+  # re-injected it and the resolver's "stale pre-v0.8.0 env override" warning
+  # never cleared. Normalize to the marker value when a marker is present;
+  # only fall back to an explicit ambient BRIDGE_LAYOUT (no marker case).
+  local _agent_env_layout=""
+  local _agent_env_marker_path
+  _agent_env_marker_path="$(bridge_isolation_v2_marker_path 2>/dev/null || true)"
+  if [[ -n "$_agent_env_marker_path" && -f "$_agent_env_marker_path" ]] \
+      && bridge_isolation_v2_marker_validate "$_agent_env_marker_path" >/dev/null 2>&1; then
+    # Marker present and valid — it is the source of truth. Emit the
+    # marker-pinned value so the child never sees a stale legacy override.
+    _agent_env_layout="v2"
+  else
+    # No valid marker — preserve the prior behavior so markerless installs
+    # still carry an explicit layout, but never invent a stale `legacy`
+    # default: only propagate a BRIDGE_LAYOUT the caller actually set.
+    _agent_env_layout="${BRIDGE_LAYOUT:-}"
+  fi
+
   cat >"$file" <<EOF
 #!/usr/bin/env bash
 # shellcheck shell=bash disable=SC2034
@@ -3127,7 +3151,7 @@ BRIDGE_RUNTIME_SECRETS_DIR=$(printf '%q' "$BRIDGE_RUNTIME_SECRETS_DIR")
 BRIDGE_RUNTIME_CONFIG_FILE=$(printf '%q' "$BRIDGE_RUNTIME_CONFIG_FILE")
 BRIDGE_HOOKS_DIR=$(printf '%q' "$BRIDGE_HOOKS_DIR")
 BRIDGE_SHARED_DIR=$(printf '%q' "$BRIDGE_SHARED_DIR")
-BRIDGE_LAYOUT=$(printf '%q' "${BRIDGE_LAYOUT:-legacy}")
+BRIDGE_LAYOUT=$(printf '%q' "$_agent_env_layout")
 BRIDGE_DATA_ROOT=$(printf '%q' "${BRIDGE_DATA_ROOT:-}")
 BRIDGE_SHARED_ROOT=$(printf '%q' "${BRIDGE_SHARED_ROOT:-}")
 BRIDGE_AGENT_ROOT_V2=$(printf '%q' "${BRIDGE_AGENT_ROOT_V2:-}")
