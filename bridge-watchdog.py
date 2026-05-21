@@ -266,24 +266,65 @@ def heartbeat_age_seconds(agent_dir: Path) -> tuple[bool, int | None]:
 NON_ONBOARDING_SESSION_TYPES = frozenset({"dynamic", "cron"})
 
 
-def required_profile_files(engine: str) -> tuple[str, ...]:
-    """Per-engine required profile-file set.
+# Engines with no Claude-runtime profile contract at the agent home root
+# — none of these CLIs read CLAUDE.md / SOUL.md / SESSION-TYPE.md, so the
+# watchdog must not assert profile drift on them. This is an explicit
+# allowlist, NOT "anything that isn't claude": a genuinely unknown engine
+# string stays under the conservative Claude-default contract so a new
+# engine surfaces as drift (prompting a watchdog update) instead of
+# silently skipping the check. Add a new exempt engine here.
+NON_CONTRACT_ENGINES = frozenset({"codex", "antigravity"})
 
-    Issue #905: the watchdog used to assert ``CLAUDE_REQUIRED_FILES`` on
-    every agent regardless of engine, so codex agents (which don't read
-    any of those Claude-runtime files) surfaced as ``status=error`` with
-    every required file marked missing. Codex CLI has no equivalent
-    required-file contract at the agent home root, so the codex path
-    returns an empty tuple — the missing-files check effectively becomes
-    a no-op for codex and the watchdog stops manufacturing drift for an
-    engine it doesn't actually monitor.
+
+def has_home_profile_contract(engine: str, agent_source: str) -> bool:
+    """Whether the watchdog should hold this agent to the Claude-style
+    home-profile contract: the ``CLAUDE_REQUIRED_FILES`` set, the managed
+    ``CLAUDE.md`` block, and the ``SESSION-TYPE.md`` onboarding state.
+
+    Issues #905 / #907 each special-cased one slice of this — codex was
+    exempted from required files, the managed block, and onboarding;
+    dynamic agents were exempted from the managed block. A third engine
+    (``antigravity``, v0.14.5) then fell through to the Claude default and
+    surfaced as a false ``status=error`` on every scan, because none of
+    those three call sites knew about it. This predicate is the single
+    gate so a known exempt engine is exempt by construction.
+
+    The contract holds for:
+
+      - Claude agents, static or unknown-source.
+      - Any *unknown* engine string, static or unknown-source — the
+        conservative legacy default (#905). An unknown engine is held to
+        the contract so it surfaces as drift; the fix is to add it to
+        ``NON_CONTRACT_ENGINES`` once the watchdog is taught about it.
+
+    The contract is waived for:
+
+      - ``agent_source == "dynamic"`` — a full exemption regardless of
+        engine. Dynamic agents are ad-hoc spawns
+        (``agent-bridge --<engine> --name``) that never run
+        ``bridge_scaffold_agent_home``, so legitimately have no profile
+        files, no managed block, and no SESSION-TYPE.md. The watchdog has
+        no finer "scaffolded vs ad-hoc" signal than ``agent_source``.
+      - The known non-Claude engines in ``NON_CONTRACT_ENGINES``.
     """
-    if engine == "codex":
-        return ()
-    # Claude (and any future / unknown engine — conservative default
-    # preserves the pre-#905 behavior so missing roster metadata never
-    # silently turns off the drift check for a real Claude agent).
-    return CLAUDE_REQUIRED_FILES
+    if agent_source == "dynamic":
+        return False
+    return engine not in NON_CONTRACT_ENGINES
+
+
+def required_profile_files(engine: str, agent_source: str = "") -> tuple[str, ...]:
+    """Required profile-file set for an agent.
+
+    Returns ``CLAUDE_REQUIRED_FILES`` only for agents under the
+    home-profile contract (see :func:`has_home_profile_contract`); every
+    other agent returns an empty tuple so the missing-files check is a
+    no-op. ``agent_source`` defaults to ``""`` so a legacy positional
+    ``required_profile_files(engine)`` call keeps the conservative
+    Claude-default behavior for an unknown source.
+    """
+    if has_home_profile_contract(engine, agent_source):
+        return CLAUDE_REQUIRED_FILES
+    return ()
 
 
 def classify_status(
@@ -295,32 +336,27 @@ def classify_status(
     agent_source: str = "",
     engine: str = "claude",
 ) -> str:
-    if missing_files:
+    # All three drift signals — missing required files, managed-block,
+    # onboarding staleness — are gated on the home-profile contract (see
+    # has_home_profile_contract). Known non-Claude engines have no
+    # SESSION-TYPE.md / managed-CLAUDE.md / required-file contract (#905,
+    # originally codex only — now also antigravity), and dynamic agents
+    # are ad-hoc spawns that legitimately land with
+    # `missing_managed_claude_block=yes` and `onboarding_state=pending`
+    # until their first run; flagging any of these is admin alert-fatigue
+    # for a condition admin cannot resolve (#907, #303/#304/#343
+    # anti-pattern). missing_files is gated here too so classify_status is
+    # internally consistent and does not depend on the caller having
+    # pre-emptied `required` via required_profile_files.
+    contract = has_home_profile_contract(engine, agent_source)
+    if missing_files and contract:
         return "error"
-    # Issue #905: codex agents have no SESSION-TYPE.md / onboarding-state
-    # contract — they're operated entirely through the Codex CLI, which
-    # never reads either file. The watchdog's onboarding-staleness check
-    # was firing on every codex agent (`session_type=unknown`,
-    # `onboarding_state=missing`) and contributing to problem_count even
-    # after the missing-files check was made engine-aware. Skip the
-    # onboarding-stale signal entirely for codex.
     onboarding_stale = (
-        engine != "codex"
+        contract
         and onboarding_state in {"pending", "missing"}
         and session_type not in NON_ONBOARDING_SESSION_TYPES
     )
-    # Issue #907: dynamic agents (system-provisioned, e.g. `librarian`)
-    # land with `missing_managed_claude_block=yes` until their first run
-    # fills the block in. The watchdog was emitting a high-priority
-    # admin-inbox profile-drift task on every cycle for that
-    # fresh-provision default — a condition admin has no authority to
-    # resolve per ADMIN-PROTOCOL's static/dynamic boundary (#303/#304/
-    # #343 anti-pattern). Suppress the `missing_block` warn signal for
-    # dynamic agents so a fresh-provisioned dynamic with no other drift
-    # classifies as `ok` and never reaches `problem_count`.
-    effective_missing_block = missing_block
-    if agent_source == "dynamic":
-        effective_missing_block = False
+    effective_missing_block = missing_block if contract else False
     if broken_links or effective_missing_block or onboarding_stale:
         return "warn"
     return "ok"
@@ -348,16 +384,22 @@ def scan_agent(
     # `broken_links` channel keeps the existing markdown render
     # unchanged (no new `AgentWatch` fields, per spec).
     try:
-        required = required_profile_files(engine)
+        required = required_profile_files(engine, agent_source)
         missing_files = [name for name in required if not (agent_dir / name).exists()]
-        # The managed-block check only applies to Claude — codex agents
-        # don't own a CLAUDE.md and shouldn't be flagged for a block they
-        # have no contract to maintain (#905).
-        if engine == "codex":
-            missing_block = False
-        else:
+        # The `missing_managed_claude_block` FIELD records actual file
+        # state, so it is gated on engine alone, NOT the contract: any
+        # engine that could own a CLAUDE.md (Claude + unknown engines —
+        # same conservative set as the contract) gets a truthful field;
+        # the known non-Claude engines in NON_CONTRACT_ENGINES definitively
+        # don't own one. A dynamic Claude agent still gets an accurate
+        # field — #907 keeps the field truthful and suppresses only the
+        # classification *signal*, which classify_status gates through
+        # has_home_profile_contract.
+        if engine not in NON_CONTRACT_ENGINES:
             claude_text = read_text(agent_dir / "CLAUDE.md") if (agent_dir / "CLAUDE.md").exists() else ""
             missing_block = MANAGED_START not in claude_text or MANAGED_END not in claude_text
+        else:
+            missing_block = False
         session_type, onboarding_state = parse_session_type(agent_dir)
         heartbeat_present, heartbeat_age = heartbeat_age_seconds(agent_dir)
         broken_links = collect_broken_links(agent_dir)
