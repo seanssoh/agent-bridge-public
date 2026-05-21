@@ -256,7 +256,10 @@ select_for_path() {
       # bridge-agent.sh::bridge_agent_activity_state consumes them.
       # Cover both Wave C's integration smoke + Wave B's unit smoke
       # whenever either file moves.
-      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch
+      # Issue #1010: bridge-agent.sh::run_delete now calls the isolated-
+      # agent OS-user reap helper; cover its gating-decision smoke so a
+      # regression in the delete-path wire-up is caught.
+      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -305,7 +308,11 @@ select_for_path() {
       # (T1-T5 marker-write contract + T6 post-marker workdir resolver)
       # for every isolation-lib + bridge-migrate.sh move so the fast-path
       # stays covered.
-      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions launch
+      # Issue #1010: bridge_isolation_v2_reap_isolated_agent_account
+      # (isolated-agent OS-user + traversal-ACE reaper) lives in
+      # lib/bridge-isolation-v2.sh; pull its gating-decision smoke for
+      # every isolation-lib move.
+      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions launch isolated-agent-delete-reap
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
