@@ -3141,12 +3141,32 @@ run_update() {
     bridge_die "agent update 변경 플래그가 하나 이상 필요합니다."
   fi
 
+  # Issue #1023: a `--launch-cmd-add-env KEY=VALUE` op carries a raw,
+  # possibly comma-containing secret value. Redact each launch op's
+  # payload HERE — while the ops are still the discrete TSV stream
+  # `launch_cmd_ops` — so a comma inside a value is never confused with
+  # an op delimiter. The redactor emits the `launch:<op>=<payload>`
+  # lines directly; redacting AFTER the comma-join would strand the
+  # value's suffix as a bare token that escapes redaction. Value-only:
+  # env key names stay visible so audit readers see which key changed.
+  # `launch_cmd_ops` itself is untouched — the applier downstream still
+  # sees the real value.
+  local launch_ops_summary_lines=""
+  if [[ -n "$launch_cmd_ops" ]]; then
+    launch_ops_summary_lines="$(
+      python3 "$SCRIPT_DIR/scripts/python-helpers/launch-cmd-redact.py" \
+        launch-ops "$launch_cmd_ops"
+    )"
+  fi
+
   # Capture the operation summary for the audit row (compact one-line
   # description of what the operator asked for).
   local operation_summary=""
   operation_summary="$(
     {
-      printf '%s' "$launch_cmd_ops" | sed 's/\t/=/' | sed 's/^/launch:/'
+      if [[ -n "$launch_ops_summary_lines" ]]; then
+        printf '%s\n' "$launch_ops_summary_lines"
+      fi
       printf '%s' "$channels_ops" | sed 's/\t/=/' | sed 's/^/chan:/'
       # Issue #580 Track 2: surface typed-flag mutations in the audit
       # operation summary so audit-log readers see the same shape they
@@ -3391,11 +3411,26 @@ PY
     return 0
   fi
 
+  # Issue #1023: the plain-text result echoes the full before/after
+  # launch command, whose leading env-prefix routinely carries
+  # credential-bearing values. Redact secret env values (value-only,
+  # key name kept) before printing. Output-rendering only — the stored
+  # launch command written above is unchanged.
+  local before_launch_cmd_display new_launch_cmd_display
+  before_launch_cmd_display="$(
+    python3 "$SCRIPT_DIR/scripts/python-helpers/launch-cmd-redact.py" \
+      launch-cmd "$before_launch_cmd"
+  )"
+  new_launch_cmd_display="$(
+    python3 "$SCRIPT_DIR/scripts/python-helpers/launch-cmd-redact.py" \
+      launch-cmd "$new_launch_cmd"
+  )"
+
   printf 'agent: %s\n' "$agent"
   printf 'changed: %s\n' "$([[ $changed -eq 1 ]] && echo yes || echo no)"
   printf 'dry_run: %s\n' "$([[ $dry_run -eq 1 ]] && echo yes || echo no)"
-  printf 'before_launch_cmd: %s\n' "$before_launch_cmd"
-  printf 'after_launch_cmd: %s\n' "$new_launch_cmd"
+  printf 'before_launch_cmd: %s\n' "$before_launch_cmd_display"
+  printf 'after_launch_cmd: %s\n' "$new_launch_cmd_display"
   printf 'before_channels: %s\n' "$before_channels"
   printf 'after_channels: %s\n' "$new_channels"
   printf 'before_sha: %s\n' "$before_sha"

@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-no-auto-backfill mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir isolated-agent-delete-reap nudge-task-age-gate tool-policy-roster-read-classify
+  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-no-auto-backfill mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-update-launch-cmd-redaction agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir isolated-agent-delete-reap nudge-task-age-gate tool-policy-roster-read-classify
 }
 
 add_all_integration() {
@@ -270,7 +270,13 @@ select_for_path() {
       # Issue #1010: bridge-agent.sh::run_delete now calls the isolated-
       # agent OS-user reap helper; cover its gating-decision smoke so a
       # regression in the delete-path wire-up is caught.
-      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap
+      # Issue #1023: the typed `agent update --launch-cmd-*` path now
+      # redacts credential-bearing env values across every output
+      # surface (diff / operation_summary / actions / audit detail /
+      # --json / plain text / dry-run). Pull the redaction smoke
+      # whenever bridge-agent.sh or lib/bridge-agent-update.sh moves so
+      # a future PR cannot regress a secret-leak surface.
+      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update agent-update-launch-cmd-redaction agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -457,7 +463,11 @@ select_for_path() {
       # `bridge_agent_launch_cmd` path. Any modification to these helpers
       # must re-run the Wave C regression smoke that asserts the call
       # returns in <2s.
-      add_required 835-static-admin-launch launch launch-dev-channels-injection channel-env-readiness
+      # Issue #1023: scripts/python-helpers/launch-cmd-redact.py is the
+      # shared secret-redaction surface every `agent update --launch-cmd-*`
+      # output path routes through; pull its regression smoke whenever
+      # any launch-cmd helper moves.
+      add_required 835-static-admin-launch launch launch-dev-channels-injection channel-env-readiness agent-update-launch-cmd-redaction
       add_integration integration-minimal
       ;;
 
@@ -514,6 +524,15 @@ select_for_path() {
       # COMMON-INSTRUCTIONS.local.md override; pin the no-op-when-absent
       # contract so a bridge-docs.py move can't regress it.
       add_required common-instructions-local-override
+      add_integration integration-minimal
+      ;;
+
+    lib/agent-cli-helpers/audit-detail-json.py|lib/agent-cli-helpers/agent-update-result-json.py)
+      # Issue #1023: these helpers render the `agent update` audit
+      # detail and the --json result envelope; both route launch-cmd
+      # values through the shared launch-cmd-redact module. Pull the
+      # redaction regression smoke whenever either renderer moves.
+      add_required agent-update agent-update-launch-cmd-redaction
       add_integration integration-minimal
       ;;
 
