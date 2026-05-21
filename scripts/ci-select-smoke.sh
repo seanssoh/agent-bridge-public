@@ -475,6 +475,10 @@ select_for_path() {
       # symlinks it from every agent home. Cover it on every bridge-docs.py
       # move so the dispatch table and link tuple stay in lockstep.
       add_required admin-protocol-shared-link
+      # render_shared_common_instructions_md() appends the machine-local
+      # COMMON-INSTRUCTIONS.local.md override; pin the no-op-when-absent
+      # contract so a bridge-docs.py move can't regress it.
+      add_required common-instructions-local-override
       add_integration integration-minimal
       ;;
 
