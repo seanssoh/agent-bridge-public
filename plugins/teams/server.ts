@@ -928,11 +928,10 @@ function runPromptGuard(command: 'scan' | 'sanitize', text: string): Record<stri
 }
 
 /**
- * Build the channel meta object used by BOTH the `notifications/claude/channel`
- * notification AND the bridge-mode queue task body. Centralizing here keeps
- * the two delivery paths from drifting (PR #961 r1 found bridge body was
- * missing conversation_id / tenant_id / service_url / attachment_count that
- * the channel notification carries).
+ * Build the rich Teams metadata used by bridge-mode queue task bodies and
+ * local replay/audit paths. Keep notifications/claude/channel on the scalar
+ * projection below: Claude Code channel delivery has silently dropped some
+ * notifications when nested arrays/objects are present in params.meta.
  */
 function buildChannelMeta(
   activity: Activity,
@@ -966,6 +965,54 @@ function buildChannelMeta(
         }
       : {}),
   }
+}
+
+function compactMetaList(values: Array<string | undefined>): string {
+  const cleaned = values
+    .map(value => String(value ?? '').trim())
+    .filter(value => value.length > 0)
+  return cleaned.join(', ').slice(0, 1000)
+}
+
+/**
+ * Claude channel notification metadata must stay flat and string-only. Rich
+ * attachment details remain available in buildChannelMeta for bridge-mode and
+ * fetch/replay flows; this projection keeps direct channel injection from
+ * depending on nested JSON support in Claude Code's notification handler.
+ */
+function buildChannelNotificationMeta(
+  activity: Activity,
+  stored: StoredMessage,
+  attachments: StoredAttachment[],
+): Record<string, string> {
+  const meta: Record<string, string> = {
+    source: 'teams',
+    chat_id: stored.chat_id,
+    conversation_id: stored.chat_id,
+    message_id: stored.message_id,
+    user: stored.user,
+    user_id: stored.user_id,
+    aad_object_id: stored.aad_object_id,
+    tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
+    service_url: String(activity.serviceUrl ?? ''),
+    text: stored.text,
+    ts: stored.ts,
+  }
+  if (stored.revision) meta.revision = stored.revision
+  if (attachments.length > 0) {
+    meta.attachment_count = String(attachments.length)
+    const names = compactMetaList(attachments.map(att => att.name))
+    const contentTypes = compactMetaList(attachments.map(att => att.content_type))
+    const downloadStatuses = compactMetaList(attachments.map(att => att.download_status))
+    const localPaths = compactMetaList(attachments.map(att => att.local_path))
+    const downloadErrors = compactMetaList(attachments.map(att => att.download_error))
+    if (names) meta.attachment_names = names
+    if (contentTypes) meta.attachment_content_types = contentTypes
+    if (downloadStatuses) meta.attachment_download_statuses = downloadStatuses
+    if (localPaths) meta.attachment_local_paths = localPaths
+    if (downloadErrors) meta.attachment_download_errors = downloadErrors
+  }
+  return meta
 }
 
 /**
@@ -1823,7 +1870,7 @@ async function handleActivity(context: TurnContext): Promise<void> {
         method: 'notifications/claude/channel',
         params: {
           content: text || (attachments.length > 0 ? '(attachment)' : ''),
-          meta: buildChannelMeta(activity, stored, attachments),
+          meta: buildChannelNotificationMeta(activity, stored, attachments),
         },
       })
       channelDelivered = true
@@ -2019,9 +2066,15 @@ if (CLI_SUBCOMMAND === 'send-managed') {
 // `_smoke-record-activity` invokes writeTeamsActivityIndex directly so the
 // smoke can validate the activity-index file schema without spinning up a
 // full Bot Framework adapter. `_smoke-should-record` reports whether a
-// synthesized activity would be skipped by the bot-self filter. Both
+// synthesized activity would be skipped by the bot-self filter.
+// `_smoke-channel-meta` asserts the direct Claude channel notification uses
+// scalar metadata, not the richer bridge queue payload. All smoke commands
 // short-circuit before httpServer.listen.
-if (CLI_SUBCOMMAND === '_smoke-record-activity' || CLI_SUBCOMMAND === '_smoke-should-record') {
+if (
+  CLI_SUBCOMMAND === '_smoke-record-activity'
+  || CLI_SUBCOMMAND === '_smoke-should-record'
+  || CLI_SUBCOMMAND === '_smoke-channel-meta'
+) {
   const argv = process.argv.slice(3)
   const flags: Record<string, string> = {}
   for (let i = 0; i < argv.length; i++) {
@@ -2043,6 +2096,32 @@ if (CLI_SUBCOMMAND === '_smoke-record-activity' || CLI_SUBCOMMAND === '_smoke-sh
       process.exit(2)
     }
     writeTeamsActivityIndex(agent, channelId, messageId, userId, new Date(tsMs))
+    process.exit(0)
+  }
+  if (CLI_SUBCOMMAND === '_smoke-channel-meta') {
+    const fakeActivity: any = {
+      channelData: { tenant: { id: 'tenant-smoke' } },
+      serviceUrl: 'https://example.invalid/teams',
+    }
+    const stored: StoredMessage = {
+      chat_id: 'chat-smoke',
+      message_id: 'message-smoke',
+      user: 'Smoke User',
+      user_id: 'user-smoke',
+      aad_object_id: 'aad-smoke',
+      text: 'hello smoke',
+      ts: '2026-01-01T00:00:00.000Z',
+      revision: 'revision-smoke',
+    }
+    const attachments: StoredAttachment[] = [
+      {
+        attachment_id: 'attachment-smoke',
+        name: 'smoke.html',
+        content_type: 'text/html',
+        download_status: 'skipped_non_file',
+      },
+    ]
+    process.stdout.write(JSON.stringify(buildChannelNotificationMeta(fakeActivity, stored, attachments)) + '\n')
     process.exit(0)
   }
   // _smoke-should-record
