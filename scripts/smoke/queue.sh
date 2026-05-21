@@ -84,15 +84,11 @@ queue_daemon_step_contract() {
   # task younger than the nudge redelivery window does NOT re-nudge (the
   # task-arrival push already covered it). This contract exercises the
   # nudge-candidate path, so backdate created_ts past the window so the
-  # task is eligible for an ACTION REQUIRED nudge.
-  python3 - "$BRIDGE_TASK_DB" "$task_id" "$((now_ts - 600))" <<'PY'
-import sqlite3, sys
-db, task_id, aged = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-conn = sqlite3.connect(db)
-conn.execute("UPDATE tasks SET created_ts = ? WHERE id = ?", (aged, task_id))
-conn.commit()
-conn.close()
-PY
+  # task is eligible for an ACTION REQUIRED nudge. The backdate runs
+  # through a standalone file-as-argv helper (no interpreter
+  # heredoc-stdin — footgun #11; see scripts/lint-heredoc-ban.sh).
+  python3 "$SCRIPT_DIR/nudge-task-age-gate-helpers/backdate-task-created-ts.py" \
+    "$BRIDGE_TASK_DB" "$((now_ts - 600))" "$task_id"
   snapshot="$SMOKE_TMP_ROOT/agent-summary.tsv"
   cat >"$snapshot" <<EOF
 agent	queued	claimed	blocked	active	idle	last_seen	last_nudge	session	engine	workdir	session_activity_ts
@@ -132,14 +128,8 @@ EOF
   # too — a never-nudged task only counts as a fresh nudge trigger once
   # it has aged past the window (a still-fresh task is covered by its
   # task-arrival push).
-  python3 - "$BRIDGE_TASK_DB" "$second_id" "$((now_ts - 600))" <<'PY'
-import sqlite3, sys
-db, task_id, aged = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-conn = sqlite3.connect(db)
-conn.execute("UPDATE tasks SET created_ts = ? WHERE id = ?", (aged, task_id))
-conn.commit()
-conn.close()
-PY
+  python3 "$SCRIPT_DIR/nudge-task-age-gate-helpers/backdate-task-created-ts.py" \
+    "$BRIDGE_TASK_DB" "$((now_ts - 600))" "$second_id"
   new_out="$(
     python3 "$SMOKE_REPO_ROOT/bridge-queue.py" daemon-step \
       --snapshot "$snapshot" \

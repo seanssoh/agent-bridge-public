@@ -20,17 +20,24 @@
 #      a nudge candidate (within the redelivery window).
 #   2. The SAME task, once its created_ts is aged past the window, IS
 #      emitted as a nudge candidate.
+#
+# Footgun #11: the task is created via `bridge-queue.py create` and the
+# created_ts backdate is done by the standalone file-as-argv helper
+# nudge-task-age-gate-helpers/backdate-task-created-ts.py — no
+# interpreter heredoc-stdin, no `<<<` here-string (see
+# scripts/lint-heredoc-ban.sh).
 
 set -euo pipefail
 
 SMOKE_NAME="nudge-task-age-gate"
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 REPO_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd -P)"
+HELPER_DIR="$SCRIPT_DIR/nudge-task-age-gate-helpers"
 
 echo "[smoke:${SMOKE_NAME}] starting"
 
 TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agb-nudge.XXXXXX")"
-trap 'rm -f /tmp/agb-nudge-*.tmp 2>/dev/null; rm -rf "$TMP_DIR"' EXIT
+trap 'rm -rf "$TMP_DIR"' EXIT
 
 DB="$TMP_DIR/tasks.db"
 SNAPSHOT="$TMP_DIR/snapshot.tsv"
@@ -56,36 +63,27 @@ run_daemon_step() {
     --format text
 }
 
+# True iff $1 (daemon-step output) lists $AGENT as a nudge candidate.
+output_nudges_agent() {
+  printf '%s\n' "$1" | grep -qE "^${AGENT}[[:space:]]"
+}
+
 failed=0
 
 # --- Phase 1: fresh task — must NOT be a nudge candidate -------------
-# Insert a queued task whose created_ts is NOW (fresh).
-python3 - "$DB" "$AGENT" "$NOW" <<'PY'
-import sqlite3, sys
-db, agent, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
-conn = sqlite3.connect(db)
-conn.execute("PRAGMA journal_mode=WAL")
-conn.execute(
-    """CREATE TABLE IF NOT EXISTS tasks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,
-      assigned_to TEXT NOT NULL, created_by TEXT NOT NULL,
-      priority TEXT NOT NULL DEFAULT 'normal',
-      status TEXT NOT NULL DEFAULT 'queued',
-      created_ts INTEGER NOT NULL, updated_ts INTEGER NOT NULL,
-      body_text TEXT, body_path TEXT, claimed_by TEXT,
-      claimed_ts INTEGER, lease_until_ts INTEGER, closed_ts INTEGER)"""
-)
-conn.execute(
-    "INSERT INTO tasks (title, assigned_to, created_by, status, created_ts, updated_ts)"
-    " VALUES ('fresh task', ?, 'smoke', 'queued', ?, ?)",
-    (agent, now, now),
-)
-conn.commit()
-conn.close()
-PY
+# Create a queued task via the real CLI; created_ts is NOW (fresh).
+python3 "$REPO_ROOT/bridge-queue.py" create \
+  --to "$AGENT" \
+  --from requester \
+  --title "fresh task" \
+  --body "fresh body" \
+  --format shell >"$TMP_DIR/create-out.sh"
+# shellcheck disable=SC1090
+source "$TMP_DIR/create-out.sh"
+task_id="$TASK_ID"
 
 OUT_FRESH="$(run_daemon_step)"
-if grep -qE "^${AGENT}[[:space:]]" <<<"$OUT_FRESH"; then
+if output_nudges_agent "$OUT_FRESH"; then
   echo "  FAIL  fresh task emitted as nudge candidate (should be gated)" >&2
   echo "        output: ${OUT_FRESH}" >&2
   failed=1
@@ -94,18 +92,11 @@ else
 fi
 
 # --- Phase 2: age the task past the window — must BE a candidate -----
-AGED_TS=$(( NOW - 600 ))   # 600s old, well past the 60s redelivery window
-python3 - "$DB" "$AGED_TS" <<'PY'
-import sqlite3, sys
-db, aged = sys.argv[1], int(sys.argv[2])
-conn = sqlite3.connect(db)
-conn.execute("UPDATE tasks SET created_ts = ?, updated_ts = ?", (aged, aged))
-conn.commit()
-conn.close()
-PY
+# Backdate created_ts 600s into the past, well past the 60s window.
+python3 "$HELPER_DIR/backdate-task-created-ts.py" "$DB" "$(( NOW - 600 ))" "$task_id"
 
 OUT_AGED="$(run_daemon_step)"
-if grep -qE "^${AGENT}[[:space:]]" <<<"$OUT_AGED"; then
+if output_nudges_agent "$OUT_AGED"; then
   echo "  PASS  aged queued task IS nudged once past the redelivery window"
 else
   echo "  FAIL  aged task not emitted as nudge candidate (should fire)" >&2
