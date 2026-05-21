@@ -3685,6 +3685,25 @@ PY
     rm -f "$BRIDGE_STATE_DIR/daemon-autostart/$agent.env" 2>/dev/null || true
   fi
 
+  # Issue #1010: reap the dedicated OS user + its named-user traversal
+  # ACEs for an isolated (linux-user) agent. Unlike --purge-home (which
+  # only removes home *files*), the orphan OS user and stale
+  # `user:agent-bridge-<name>:--x` ACEs are a host-level leak that
+  # accumulates on every isolated create/delete cycle — so this runs
+  # unconditionally on the delete path, not behind a flag. The helper is
+  # hard-gated (Linux only, exact `agent-bridge-<name>` name match) and
+  # fully best-effort: every failure is reported via bridge_warn but
+  # never aborts the delete (the roster mutation already succeeded).
+  # Non-isolated / macOS / shared-mode agents have no dedicated OS user;
+  # the helper skips silently for those.
+  if command -v bridge_isolation_v2_reap_isolated_agent_account >/dev/null 2>&1 \
+     && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+     && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    local _delete_os_user
+    _delete_os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+    bridge_isolation_v2_reap_isolated_agent_account "$agent" "$_delete_os_user"
+  fi
+
   if [[ $purge_crons -eq 1 ]]; then
     # Best-effort: list native crons for this agent and delete each.
     # Failures are non-fatal — the roster block is already gone and

@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-no-auto-backfill mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir
+  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-no-auto-backfill mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir isolated-agent-delete-reap nudge-task-age-gate tool-policy-roster-read-classify
 }
 
 add_all_integration() {
@@ -199,7 +199,11 @@ select_for_path() {
       ;;
 
     bridge-queue.py|bridge-task.sh|bridge-audit.py)
-      add_required queue
+      # Issue #1014 A: bridge-queue.py's daemon idle-nudge now gates the
+      # ACTION REQUIRED nudge on task-queued age so a freshly-pushed task
+      # is not re-nudged within the redelivery window. Cover the
+      # regression smoke whenever the queue backend moves.
+      add_required queue nudge-task-age-gate
       add_integration integration-minimal
       ;;
 
@@ -221,7 +225,14 @@ select_for_path() {
       # cron-only static agents do not go stale between rotation events.
       # daemon-periodic-token-sync covers the due-check / tick / audit /
       # state-file cadence contract.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync
+      #
+      # Issue #1015: lib/bridge-state.sh hosts the resume/detect shims
+      # (bridge_detect_claude_session_id, bridge_detect_session_id,
+      # bridge_resolve_resume_session_id) that thread the agent's
+      # CLAUDE_CONFIG_DIR to the python helpers; bridge-sync.sh's
+      # refresh_missing_session_ids is one of the callers. Cover the
+      # config-root resolution smoke whenever either file moves.
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -256,7 +267,10 @@ select_for_path() {
       # bridge-agent.sh::bridge_agent_activity_state consumes them.
       # Cover both Wave C's integration smoke + Wave B's unit smoke
       # whenever either file moves.
-      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch
+      # Issue #1010: bridge-agent.sh::run_delete now calls the isolated-
+      # agent OS-user reap helper; cover its gating-decision smoke so a
+      # regression in the delete-path wire-up is caught.
+      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -273,7 +287,12 @@ select_for_path() {
       # credential deny surfaces (raw mention, env dump, argv path,
       # input path). Cover the regression smoke whenever tool-policy.py
       # moves so the exemption + mutation deny contract stays pinned.
-      add_required hooks agent-update v2-cross-class-read admin-hook-exemption
+      # Issue #1014 C: the Bash read-intent classifier now treats a
+      # neutral prelude stage (cd / test / echo / …) as transparent so a
+      # routine `cd … && grep agent-roster.local.sh` read is no longer
+      # mis-classified as a write. Cover the classifier regression smoke
+      # whenever tool-policy.py moves.
+      add_required hooks agent-update v2-cross-class-read admin-hook-exemption tool-policy-roster-read-classify
       add_integration integration-minimal
       ;;
 
@@ -305,7 +324,11 @@ select_for_path() {
       # (T1-T5 marker-write contract + T6 post-marker workdir resolver)
       # for every isolation-lib + bridge-migrate.sh move so the fast-path
       # stays covered.
-      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions launch
+      # Issue #1010: bridge_isolation_v2_reap_isolated_agent_account
+      # (isolated-agent OS-user + traversal-ACE reaper) lives in
+      # lib/bridge-isolation-v2.sh; pull its gating-decision smoke for
+      # every isolation-lib move.
+      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions launch isolated-agent-delete-reap
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -435,6 +458,18 @@ select_for_path() {
       # must re-run the Wave C regression smoke that asserts the call
       # returns in <2s.
       add_required 835-static-admin-launch launch launch-dev-channels-injection channel-env-readiness
+      add_integration integration-minimal
+      ;;
+
+    scripts/python-helpers/detect-claude-session-id.py|scripts/python-helpers/resolve-claude-resume-session-id.py)
+      # Issue #1015: these helpers resolve the Claude session JSON +
+      # transcript roots. They must key off the agent's CLAUDE_CONFIG_DIR
+      # (isolation-v2 custom HOME) rather than the daemon process's HOME,
+      # otherwise static agents launch a fresh session on every restart.
+      # 1015-resume-claude-config-dir pins the config-root resolution
+      # (trailing arg > CLAUDE_CONFIG_DIR env > daemon-HOME fallback) and
+      # the backward-compatible non-isolated path.
+      add_required 1015-resume-claude-config-dir 981-restart-session-resume-snapshot
       add_integration integration-minimal
       ;;
 

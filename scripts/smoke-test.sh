@@ -11370,6 +11370,15 @@ bash "$REPO_ROOT/scripts/smoke/classify-stale-dynamic-exemption.sh"
 log "running bridge-export-prefix-no-stale-layout smoke (patch #4725)"
 bash "$REPO_ROOT/scripts/smoke/bridge-export-prefix-no-stale-layout.sh"
 
+# Issue #1014 B: bridge_write_linux_agent_env_file (lib/bridge-agents.sh)
+# baked BRIDGE_LAYOUT=${BRIDGE_LAYOUT:-legacy} into the per-agent launch
+# envelope, so a stale legacy value self-perpetuated through the
+# daemon -> agent-env -> CLI process tree. The writer now normalizes to
+# the v2 marker value when a marker exists. Smoke pins that the
+# generated agent-env.sh never carries a stale pre-v2 BRIDGE_LAYOUT.
+log "running agent-env-no-stale-bridge-layout smoke (issue #1014 B)"
+bash "$REPO_ROOT/scripts/smoke/agent-env-no-stale-bridge-layout.sh"
+
 # Companion regression to patch #4725: PR #926 stopped the bridge-core
 # export prefix from forwarding stale BRIDGE_LAYOUT/BRIDGE_DATA_ROOT,
 # but did not clean values that already lived in the tmux server's
@@ -11387,6 +11396,16 @@ bash "$REPO_ROOT/scripts/smoke/tmux-server-bridge-layout-cleanup.sh"
 # truth-table cases (operator-flagged 2026-05-16).
 log "running tool-policy-process-dump-regex smoke"
 bash "$REPO_ROOT/scripts/smoke/tool-policy-process-dump-regex.sh"
+
+# Issue #1014 C: the tool-policy Bash read-intent classifier required
+# every pipeline stage to lead with a read tool, so a routine
+# `cd ~/.agent-bridge && grep agent-roster.local.sh` diagnostic was
+# mis-classified as a write and drew the write-oriented `config set`
+# deny. The classifier now treats neutral prelude builtins (cd / test /
+# echo / …) as transparent. Smoke pins the #1014 shapes as read-intent
+# while genuine write shapes stay write-intent.
+log "running tool-policy-roster-read-classify smoke (issue #1014 C)"
+bash "$REPO_ROOT/scripts/smoke/tool-policy-roster-read-classify.sh"
 
 # bridge_worktree_doctor previously left daemonized children alive after
 # pruning their worktree dir — Sean observed 7 orphaned bridge-watchdog
@@ -11469,5 +11488,25 @@ bash "$REPO_ROOT/scripts/smoke/981-restart-session-resume-snapshot.sh"
 # state path (the #771-class silent Teams inbound delivery failure).
 log "running 989-isolated-agent-env-state-dir smoke (issue #989)"
 bash "$REPO_ROOT/scripts/smoke/989-isolated-agent-env-state-dir.sh"
+
+# Issue #1014 A — bridge-queue.py's daemon idle-nudge measured idle as
+# agent-idle-duration, so an agent parked idle past the threshold got a
+# redundant ACTION REQUIRED nudge on the next tick for a task it was
+# just pushed. The nudge scan now gates on task-queued age: a task
+# younger than the redelivery window does not re-nudge.
+log "running nudge-task-age-gate smoke (issue #1014 A)"
+bash "$REPO_ROOT/scripts/smoke/nudge-task-age-gate.sh"
+
+# A static Claude agent with a custom CLAUDE_CONFIG_DIR resumed fresh every
+# restart because the session-id helpers expanded ~/.claude against the daemon
+# HOME. Smoke pins that both helpers resolve roots from the agent config dir.
+log "running 1015-resume-claude-config-dir smoke (issue #1015)"
+bash "$REPO_ROOT/scripts/smoke/1015-resume-claude-config-dir.sh"
+
+# Deleting an isolated agent left the dedicated OS user + named-user ACEs
+# behind. Smoke pins the reaper's gating decision (Linux-only, exact
+# generated-user match) for short and long agent names.
+log "running isolated-agent-delete-reap smoke (issue #1010)"
+bash "$REPO_ROOT/scripts/smoke/isolated-agent-delete-reap.sh"
 
 log "smoke test passed"
