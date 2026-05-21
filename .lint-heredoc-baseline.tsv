@@ -232,6 +232,7 @@ lib/bridge-isolation-v2.sh	2079	H3	01c839785d78efd2144369683041e308b0ce282f4761b
 lib/bridge-isolation-v2.sh	2211	H3	71b634ac5ee39a265c89fbe6aa01962da11e48af1857e829e91757984c7df8c1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v2.sh	2213	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v2.sh	2256	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2446	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	same cred-ancestors procsub pattern as existing baselined sites L2213/L2256/L2347 - bash function consumer, not an interpreter subprocess; footgun #11 N/A	agb-dev-claude wave v0145	Phase 5 PR E (review per site)
 lib/bridge-isolation-v2.sh	2347	H3	58a0b7f22b5c4ee542c9dab74c5b4b42a91ebe63e6221f3e5ab657a398647407	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v3-channel-dotenv.sh	506	H3	6ea2bf841d5322aa59c0f8097db35b7e96c081e55a995361e6b266badbd089a6	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-migration.sh	74	C3	6702fdf57ae0cefde8722a08390e40596652642313009dad2e89585410426973	interpreter heredoc, no capture	patch	Phase 3 PR C

@@ -109,23 +109,13 @@ bridge_die()  { printf 'DIE %s\n' "\$*" >&2; exit 1; }
 bridge_require_python() { :; }
 
 # bridge_agent_default_os_user lives in lib/bridge-agents.sh, which is too
-# heavy to source standalone. Reproduce it here VERBATIM from
-# lib/bridge-agents.sh:990-1007 — the smoke breaks loudly if that logic
-# drifts, which is the intended coupling (the reaper's exact-match gate
-# depends on this exact composition).
+# heavy to source standalone. The reaper composes the expected account
+# name through it, so the probe stands it in with the sidecar
+# scripts/smoke/isolated-agent-delete-reap.py — which reproduces
+# bridge-agents.sh:990-1007 verbatim. The sidecar (file-as-argv, not
+# heredoc-stdin) keeps this off footgun #11's broken surface.
 bridge_agent_default_os_user() {
-  python3 - "\$1" <<'PY'
-import re, sys
-agent = sys.argv[1].strip().lower()
-slug = re.sub(r"[^a-z0-9_-]+", "-", agent).strip("-")
-slug = slug or "agent"
-prefix = "agent-bridge-"
-max_len = 32
-keep = max_len - len(prefix)
-if keep < 1:
-    keep = 1
-print(prefix + slug[:keep])
-PY
+  python3 "${SMOKE_REPO_ROOT}/scripts/smoke/isolated-agent-delete-reap.py" "\$1"
 }
 
 # The helper walks credential ancestors of \$HOME/.claude/.credentials.json.
@@ -143,20 +133,11 @@ PROBE
 
 # Compute the expected generated OS-user name the same way agent create
 # does (lib/bridge-agents.sh) — the test caller uses this to construct a
-# correctly-truncated `os_user` argument for the exact-match cases.
+# correctly-truncated `os_user` argument for the exact-match cases. The
+# composition lives in the sidecar scripts/smoke/isolated-agent-delete-reap.py
+# (file-as-argv, not heredoc-stdin — footgun #11 immune).
 expected_os_user() {
-  python3 - "$1" <<'PY'
-import re, sys
-agent = sys.argv[1].strip().lower()
-slug = re.sub(r"[^a-z0-9_-]+", "-", agent).strip("-")
-slug = slug or "agent"
-prefix = "agent-bridge-"
-max_len = 32
-keep = max_len - len(prefix)
-if keep < 1:
-    keep = 1
-print(prefix + slug[:keep])
-PY
+  python3 "$SMOKE_REPO_ROOT/scripts/smoke/isolated-agent-delete-reap.py" "$1"
 }
 
 # Build a controller-home tree whose .claude ancestor chain contains a
