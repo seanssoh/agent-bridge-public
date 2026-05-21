@@ -40,6 +40,12 @@ WORKER="testworker"
 # The secret literals. These must never appear in any rendered output.
 SECRET_VALUE="supersecretClientSecretXYZ"
 BEARER_VALUE="BearerTok-abc123def456"
+# A sensitive value that CONTAINS a comma — `--launch-cmd-add-env` only
+# rejects newlines, so a comma is a valid value char. The redactor must
+# redact the whole value structurally; a post-comma-join redactor would
+# strand SECRET_VALUE (the suffix) as a bare token (issue #1023 codex
+# r1 BLOCKING).
+COMMA_SECRET_VALUE="left,${SECRET_VALUE}"
 # A benign env value — must survive un-redacted in the diff.
 BENIGN_VALUE="benign-debug-flag-99"
 
@@ -212,6 +218,83 @@ assert sys.argv[2] not in json.dumps(payload), payload
     "dry-run did not mutate the roster launch_cmd line"
 }
 
+assert_comma_value_secret_redacted_everywhere() {
+  # Issue #1023 codex r1 BLOCKING regression: a sensitive add-env value
+  # containing a comma. The operation summary is built by comma-joining
+  # the op stream; redacting AFTER that join split the value at its
+  # comma and let the suffix (SECRET_VALUE) survive as a bare token in
+  # the audit `operation` string. The redactor now operates on the
+  # structured op, so the whole value — comma and all — is redacted in
+  # EVERY surface: --json, plain text, audit detail, operation summary,
+  # actions, dry-run.
+  : >"$BRIDGE_AUDIT_LOG" 2>/dev/null || true
+
+  # --json + plain text in one apply run (default mode prints text).
+  local output
+  output="$(run_update \
+    --launch-cmd-add-env "MS365_CLIENT_SECRET=${COMMA_SECRET_VALUE}")"
+  assert_no_secret "comma-value plain-text result" "$output"
+  smoke_assert_contains "$output" "***REDACTED***" \
+    "comma-value plain-text result is redacted"
+
+  output="$(run_update --json --launch-cmd-remove-env MS365_CLIENT_SECRET)"
+  # Re-add via --json so we can assert the envelope too.
+  output="$(run_update --json \
+    --launch-cmd-add-env "MS365_CLIENT_SECRET=${COMMA_SECRET_VALUE}")"
+  assert_no_secret "comma-value --json envelope" "$output"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+suffix = sys.argv[2]
+blob = json.dumps(payload)
+assert suffix not in blob, f"comma-value secret suffix in --json: {payload}"
+assert "MS365_CLIENT_SECRET=" in payload["after"]["launch_cmd"], payload
+assert "***REDACTED***" in payload["after"]["launch_cmd"], payload
+joined = " ".join(a for a in payload["actions"] if isinstance(a, str))
+assert suffix not in joined, payload
+' "$output" "$SECRET_VALUE"
+
+  # Audit log: the `operation` summary string is the surface the
+  # post-join redactor leaked through. Assert the suffix is gone there.
+  if [[ ! -s "$BRIDGE_AUDIT_LOG" ]]; then
+    smoke_fail "expected an audit row after a comma-value launch-cmd mutation"
+  fi
+  local audit_blob
+  audit_blob="$(cat "$BRIDGE_AUDIT_LOG")"
+  assert_no_secret "comma-value audit.jsonl" "$audit_blob"
+  # Explicitly pull the audit `operation` field and assert the suffix
+  # is absent — this is the exact field the lossy comma-join leaked.
+  python3 -c '
+import json, sys
+suffix = sys.argv[2]
+for line in sys.argv[1].splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    row = json.loads(line)
+    detail = row.get("detail") or {}
+    op = detail.get("operation", "")
+    assert suffix not in op, f"comma-value secret suffix in audit operation: {op!r}"
+' "$audit_blob" "$SECRET_VALUE"
+  smoke_assert_contains "$audit_blob" "MS365_CLIENT_SECRET" \
+    "comma-value audit detail still records which key changed"
+
+  # Dry-run must redact the comma value too.
+  output="$(run_update --dry-run \
+    --launch-cmd-add-env "MS365_CLIENT_SECRET=${COMMA_SECRET_VALUE}")"
+  assert_no_secret "comma-value dry-run output" "$output"
+
+  # The applied launch command on disk still carries the REAL comma
+  # value — redaction is output-rendering only.
+  local line
+  line="$(read_launch_line)"
+  smoke_assert_contains "$line" "$COMMA_SECRET_VALUE" \
+    "applied launch_cmd on disk still carries the real comma value"
+
+  # Clean up so downstream assertions start from a known state.
+  run_update --json --launch-cmd-remove-env MS365_CLIENT_SECRET >/dev/null
+}
+
 main() {
   smoke_require_cmd python3
   smoke_require_cmd bash
@@ -227,6 +310,8 @@ main() {
     assert_audit_log_redacts_secret
   smoke_run "dry-run output (default + --json) redacts secret" \
     assert_dry_run_redacts_secret
+  smoke_run "comma-containing secret value redacted in every surface" \
+    assert_comma_value_secret_redacted_everywhere
   smoke_log "passed"
 }
 

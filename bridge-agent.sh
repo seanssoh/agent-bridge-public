@@ -3141,12 +3141,32 @@ run_update() {
     bridge_die "agent update 변경 플래그가 하나 이상 필요합니다."
   fi
 
+  # Issue #1023: a `--launch-cmd-add-env KEY=VALUE` op carries a raw,
+  # possibly comma-containing secret value. Redact each launch op's
+  # payload HERE — while the ops are still the discrete TSV stream
+  # `launch_cmd_ops` — so a comma inside a value is never confused with
+  # an op delimiter. The redactor emits the `launch:<op>=<payload>`
+  # lines directly; redacting AFTER the comma-join would strand the
+  # value's suffix as a bare token that escapes redaction. Value-only:
+  # env key names stay visible so audit readers see which key changed.
+  # `launch_cmd_ops` itself is untouched — the applier downstream still
+  # sees the real value.
+  local launch_ops_summary_lines=""
+  if [[ -n "$launch_cmd_ops" ]]; then
+    launch_ops_summary_lines="$(
+      python3 "$SCRIPT_DIR/scripts/python-helpers/launch-cmd-redact.py" \
+        launch-ops "$launch_cmd_ops"
+    )"
+  fi
+
   # Capture the operation summary for the audit row (compact one-line
   # description of what the operator asked for).
   local operation_summary=""
   operation_summary="$(
     {
-      printf '%s' "$launch_cmd_ops" | sed 's/\t/=/' | sed 's/^/launch:/'
+      if [[ -n "$launch_ops_summary_lines" ]]; then
+        printf '%s\n' "$launch_ops_summary_lines"
+      fi
       printf '%s' "$channels_ops" | sed 's/\t/=/' | sed 's/^/chan:/'
       # Issue #580 Track 2: surface typed-flag mutations in the audit
       # operation summary so audit-log readers see the same shape they
@@ -3164,17 +3184,6 @@ run_update() {
       fi
       if [[ $class_present    -eq 1 ]]; then printf 'class=%s\n' "$class_value"; fi
     } | tr '\n' ',' | sed 's/,$//'
-  )"
-
-  # Issue #1023: a `--launch-cmd-add-env KEY=VALUE` op puts the raw
-  # value into the operation summary (`launch:add-env=KEY=VALUE`). The
-  # summary flows into the audit detail and is otherwise log-visible —
-  # redact credential-bearing env values before any downstream use.
-  # Value-only: env key names stay visible so audit readers still see
-  # which key changed.
-  operation_summary="$(
-    python3 "$SCRIPT_DIR/scripts/python-helpers/launch-cmd-redact.py" \
-      op-summary "$operation_summary"
   )"
 
   # Caller validation: admin identity + operator-trusted source.

@@ -18,16 +18,16 @@ env **key name** visible — `MS365_CLIENT_SECRET=supersecret` becomes
 transform only: the stored/applied launch command is never mutated.
 
 Importable API:
-    redact_launch_cmd(value)         -> str
-    redact_action(action)            -> str
-    redact_actions(actions)          -> list[str]
-    redact_operation_summary(summary)-> str
-    is_sensitive_key(key)            -> bool
+    redact_launch_cmd(value)     -> str
+    redact_action(action)        -> str
+    redact_actions(actions)      -> list[str]
+    redact_launch_ops(ops_tsv)   -> str
+    is_sensitive_key(key)        -> bool
 
 CLI (file-as-argv, no heredoc-stdin — footgun #11 / KNOWN_ISSUES.md §26):
     launch-cmd-redact.py launch-cmd  <value>
     launch-cmd-redact.py action      <action>
-    launch-cmd-redact.py op-summary  <summary>
+    launch-cmd-redact.py launch-ops  <tsv-op-stream>
 Each prints the redacted form on stdout.
 """
 
@@ -133,36 +133,47 @@ def redact_actions(actions: list) -> list:
     ]
 
 
-def redact_operation_summary(summary: str) -> str:
-    """Redact a comma-joined operation summary.
+def redact_launch_ops(ops_tsv: str) -> str:
+    """Redact a TAB-separated launch-cmd op stream, structured.
 
-    The launch-cmd chunks have the shape ``launch:add-env=KEY=VALUE``
-    (bridge-agent.sh builds them with ``sed 's/\\t/=/'`` over the TSV
-    op list). Only the ``launch:add-env=`` chunk embeds a value; the
-    rest of the summary (``chan:*``, ``desc=set``, ``engine=*``, …) is
-    left verbatim.
+    Input is the raw ``op<TAB>payload`` newline-delimited stream
+    bridge-agent.sh accumulates via ``add_launch_cmd_op``. Redaction
+    happens HERE — while each op and its full payload are still
+    discrete structured entries — so a value containing a comma (a
+    valid ``--launch-cmd-add-env KEY=v1,v2`` input) is never confused
+    with an op delimiter.
+
+    Output: one ``launch:<op>=<payload>`` line per op — the redacted
+    form bridge-agent.sh then flattens (``tr '\\n' ','``) into the
+    comma-joined operation summary. The only op whose payload embeds a
+    value is ``add-env`` (KEY=VALUE); every other op's payload
+    (``set-launch-cmd`` / ``remove-env`` / dev-channel specs) is passed
+    through verbatim.
+
+    Redacting AFTER the comma-join is unsound — the join is lossy: a
+    comma inside a value is indistinguishable from an op delimiter, so
+    a post-join ``split(',')`` strands the value's suffix as a bare
+    non-``KEY=`` token that escapes redaction (issue #1023 codex r1
+    BLOCKING). Operating on the structured op closes that bypass.
     """
-    if not summary:
-        return summary
-    chunks = summary.split(",")
-    redacted: list[str] = []
-    add_env_prefix = "launch:add-env="
-    for chunk in chunks:
-        if chunk.startswith(add_env_prefix):
-            redacted.append(
-                add_env_prefix
-                + _redact_env_token(chunk[len(add_env_prefix):])
-            )
-        else:
-            redacted.append(chunk)
-    return ",".join(redacted)
+    out: list[str] = []
+    for line in ops_tsv.split("\n"):
+        if not line:
+            continue
+        parts = line.split("\t", 1)
+        op = parts[0]
+        payload = parts[1] if len(parts) == 2 else ""
+        if op == "add-env":
+            payload = _redact_env_token(payload)
+        out.append(f"launch:{op}={payload}")
+    return "\n".join(out)
 
 
 def _main(argv: list) -> int:
     if len(argv) != 3:
         print(
             "usage: launch-cmd-redact.py "
-            "<launch-cmd|action|op-summary> <value>",
+            "<launch-cmd|action|launch-ops> <value>",
             file=sys.stderr,
         )
         return 2
@@ -171,8 +182,8 @@ def _main(argv: list) -> int:
         print(redact_launch_cmd(value))
     elif mode == "action":
         print(redact_action(value))
-    elif mode == "op-summary":
-        print(redact_operation_summary(value))
+    elif mode == "launch-ops":
+        print(redact_launch_ops(value))
     else:
         print(f"launch-cmd-redact.py: unknown mode: {mode}", file=sys.stderr)
         return 2
