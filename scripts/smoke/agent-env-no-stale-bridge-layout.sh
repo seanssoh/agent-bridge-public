@@ -103,15 +103,34 @@ seed_agent() {
   BRIDGE_AGENT_OS_USER["$agent"]="agent-bridge-$agent"
 }
 
-# Run the writer in a sub-shell so an ambient BRIDGE_LAYOUT export does
-# not leak across cases. Echoes the BRIDGE_LAYOUT assignment line from
-# the produced agent-env.sh (empty string if the writer omitted it).
+# Run the writer in a sub-shell so neither an ambient BRIDGE_LAYOUT
+# export nor the platform stub below leaks across cases. Echoes the
+# BRIDGE_LAYOUT assignment line from the produced agent-env.sh (empty
+# string if the writer omitted it).
 generate_and_extract_layout() {
   local agent="$1"
   local layout_env="$2"   # stale value to export as BRIDGE_LAYOUT
   (
     seed_agent "$agent"
     export BRIDGE_LAYOUT="$layout_env"
+    # Host-portability: bridge_write_linux_agent_env_file has a
+    # Linux-only `chgrp ab-agent-<name>` / `chmod 0640` branch
+    # (lib/bridge-agents.sh) gated on `bridge_host_platform == Linux`.
+    # That per-agent group does not exist in this in-memory smoke
+    # fixture, so on the Linux CI runner the chgrp fails and the
+    # writer bridge_die()s. Stub bridge_host_platform to a non-Linux
+    # value so the chgrp/chmod branch is skipped on every host —
+    # mirrors the predicate-stub convention in
+    # scripts/smoke/989-isolated-agent-env-state-dir.sh and
+    # scripts/smoke/857-pr1-isolation-write-helper.sh. This is
+    # host-independent: the chgrp/chmod branch is the ONLY code in
+    # bridge_write_linux_agent_env_file gated on bridge_host_platform
+    # == Linux, and B-B's BRIDGE_LAYOUT=v2 assertion depends only on
+    # the marker resolver (bridge_isolation_v2_marker_*), which does
+    # not consult bridge_host_platform — so the stub cannot weaken
+    # what this smoke verifies.
+    # shellcheck disable=SC2329  # invoked indirectly by the real writer
+    bridge_host_platform() { printf 'Darwin\n'; }
     env_file="$(bridge_agent_linux_env_file "$agent")"
     mkdir -p "$(dirname "$env_file")"
     bridge_write_linux_agent_env_file "$agent" "$env_file" >/dev/null
