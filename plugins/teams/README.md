@@ -69,7 +69,12 @@ When a Teams user attaches a file or image, the plugin downloads each attachment
 <TEAMS_STATE_DIR>/attachments/<message_id>/<filename>
 ```
 
-(directory mode 0700, file mode 0600). The Claude channel notification meta gains an `attachments` array with `name`, `content_type`, `download_status` (`ok` / `skipped_non_file` / `failed`), and — on success — `local_path` and `size_bytes`. Cards (`application/vnd.microsoft.card.*` and `application/vnd.microsoft.teams.card.*`) are recorded with `skipped_non_file` so the agent still sees the metadata.
+(directory mode 0700, file mode 0600). Attachment metadata is exposed in two shapes:
+
+- **Direct Claude channel notification** (`notifications/claude/channel`) — meta is kept **flat and string-only**: scalar `attachment_count` and `attachment_names` fields. It does **not** carry a nested `attachments` array. The flat shape is what keeps the direct channel notification reliable (see #1022).
+- **Bridge queue / audit / replay body** — retains the rich nested `attachments` array, each entry with `name`, `content_type`, `download_status` (`ok` / `skipped_non_file` / `failed`), and — on success — `local_path` and `size_bytes`.
+
+Cards (`application/vnd.microsoft.card.*` and `application/vnd.microsoft.teams.card.*`) are recorded with `skipped_non_file` so the agent still sees the metadata.
 
 Downloaded content types:
 
