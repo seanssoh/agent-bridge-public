@@ -728,7 +728,19 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
   # subdirs are pruned from all find passes; the dir nodes themselves are
   # still chgrp/chmod'd (v3 channel state dirs stay 2770/agent-group while
   # their files remain isolated-UID 0600).
+  #
+  # Optional --exclude-path <abs-path> args (#1021): an ABSOLUTE path
+  # whose whole subtree — the node itself AND its contents — is pruned
+  # from every find pass. Unlike --exclude-subdir (a leaf name relative
+  # to $root), --exclude-path takes a fully-qualified path so a caller
+  # can fence off a shared tree (e.g. the shared plugins cache) that
+  # might be reachable inside $root via a bind mount, a real nested
+  # directory, or — when $root itself is a symlink that `find` follows
+  # from the command line — a sibling subtree. This guarantees the
+  # recursive chgrp/chmod can never re-group shared plugin material to
+  # the per-agent group and break other isolated agents.
   local -a _excl_names=()
+  local -a _excl_paths=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --exclude-subdir)
@@ -737,6 +749,14 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
           return 1
         }
         _excl_names+=("$2"); shift 2
+        ;;
+      --exclude-path)
+        [[ $# -ge 2 ]] || {
+          bridge_warn "chgrp_setgid_recursive: --exclude-path requires a value"
+          return 1
+        }
+        [[ -n "$2" ]] && _excl_paths+=("$2")
+        shift 2
         ;;
       *) bridge_warn "chgrp_setgid_recursive: unknown option: $1"; return 1 ;;
     esac
@@ -748,10 +768,23 @@ bridge_isolation_v2_chgrp_setgid_recursive() {
   for _fp_n in "${_excl_names[@]}"; do
     _find_prune+=('-path' "$root/$_fp_n/*" '-prune' '-o')
   done
+  # --exclude-path prunes the matched node AND everything beneath it:
+  # `-path "$abs" -prune -o -path "$abs/*" -prune -o`. The bare `-path
+  # "$abs"` prune covers the node itself so it is neither chgrp'd nor
+  # chmod'd; the `/*` prune covers its contents.
+  local _fp_p
+  for _fp_p in "${_excl_paths[@]}"; do
+    _find_prune+=('-path' "$_fp_p" '-prune' '-o'
+                  '-path' "$_fp_p/*" '-prune' '-o')
+  done
   local -a _excl_args=()
   local _ea_n
   for _ea_n in "${_excl_names[@]}"; do
     _excl_args+=('--exclude-subdir' "$_ea_n")
+  done
+  local _ea_p
+  for _ea_p in "${_excl_paths[@]}"; do
+    _excl_args+=('--exclude-path' "$_ea_p")
   done
   # Platform discriminator gate (S5 Track A1, extending S3 pattern):
   # recursive chgrp + setgid bit only has a security model on hosts
@@ -865,9 +898,11 @@ bridge_isolation_v2_verify_chgrp_setgid_recursive() {
   }
   [[ -d "$root" ]] || return 0  # nothing to verify
   local -a _excl_names=()
+  local -a _excl_paths=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --exclude-subdir) _excl_names+=("$2"); shift 2 ;;
+      --exclude-path) [[ -n "${2:-}" ]] && _excl_paths+=("$2"); shift 2 ;;
       *) shift ;;
     esac
   done
@@ -875,6 +910,14 @@ bridge_isolation_v2_verify_chgrp_setgid_recursive() {
   local _fp_n
   for _fp_n in "${_excl_names[@]}"; do
     _find_prune+=('-path' "$root/$_fp_n/*" '-prune' '-o')
+  done
+  # #1021: prune --exclude-path subtrees from the verify scan too, so a
+  # deliberately-excluded shared tree (left at its shared group on
+  # purpose) does not register as a verify mismatch.
+  local _fp_p
+  for _fp_p in "${_excl_paths[@]}"; do
+    _find_prune+=('-path' "$_fp_p" '-prune' '-o'
+                  '-path' "$_fp_p/*" '-prune' '-o')
   done
 
   # Normalize expected modes to %04o so `stat` output ("2770", "660")

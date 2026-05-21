@@ -398,6 +398,31 @@ bridge_isolation_v2_reapply_one_agent() {
   # bridge_isolation_v2_chgrp_setgid_recursive remains the helper that
   # matrix apply ultimately calls (the matrix dispatcher uses the same
   # mutation primitive set).
+  # Issue #1021: shared plugin material must NEVER be re-grouped to this
+  # agent's private group by a per-agent reapply — doing so drops the
+  # `ab-shared` group / world-read contract and breaks every OTHER
+  # isolated agent that loads the same shared plugin source. Fence the
+  # shared plugin roots out of the recursive chgrp/chmod with absolute
+  # --exclude-path prunes. Two roots are covered: the v2 canonical
+  # shared plugins cache (`$BRIDGE_SHARED_ROOT/plugins-cache`) and the
+  # legacy install-rooted plugins dir (`$BRIDGE_HOME/plugins`). Both are
+  # passed even when not reachable inside `$agent_root/<sub>` — the
+  # prune is a harmless no-op when the path is not in the tree, and is
+  # the load-bearing guard when it IS (bind mount, real nested dir, or
+  # a symlinked `<sub>` that `find` follows from the command line).
+  local -a _shared_plugin_excl=()
+  local _shared_plugins_cache=""
+  if command -v bridge_isolation_v2_shared_plugins_root >/dev/null 2>&1; then
+    _shared_plugins_cache="$(bridge_isolation_v2_shared_plugins_root 2>/dev/null || true)"
+  fi
+  if [[ -z "$_shared_plugins_cache" && -n "${BRIDGE_SHARED_ROOT:-}" ]]; then
+    _shared_plugins_cache="$BRIDGE_SHARED_ROOT/plugins-cache"
+  fi
+  [[ -n "$_shared_plugins_cache" ]] \
+    && _shared_plugin_excl+=(--exclude-path "$_shared_plugins_cache")
+  [[ -n "${BRIDGE_HOME:-}" ]] \
+    && _shared_plugin_excl+=(--exclude-path "$BRIDGE_HOME/plugins")
+
   local _writable_sub
   for _writable_sub in home workdir runtime logs requests responses; do
     [[ -d "$agent_root/$_writable_sub" ]] || continue
@@ -412,7 +437,8 @@ bridge_isolation_v2_reapply_one_agent() {
       fi
       if bridge_isolation_v2_chgrp_setgid_recursive \
             "$agent_grp" 2770 0660 "$agent_root/$_writable_sub" \
-            "${_ws_excl[@]}" 2>/dev/null; then
+            "${_ws_excl[@]}" \
+            "${_shared_plugin_excl[@]}" 2>/dev/null; then
         bridge_isolation_v2_reapply_record_action \
           "$actions_file" "$agent_root/$_writable_sub" \
           "chgrp_chmod_recursive" "drift|unknown" "$agent_grp 2770/0660" "ok"
