@@ -84,7 +84,7 @@ tracked source에 두면 안 되는 것:
 - private roster override
 - 사설 팀 전용 프롬프트/규칙/사람 정보
 
-machine-local 값은 `agent-roster.local.sh` 같은 local runtime 쪽에 둔다.
+machine-local 값은 `agent-roster.local.sh` 같은 local runtime 쪽에 둔다. 한 설치에만 적용할 공통 운영 규칙은 `shared/COMMON-INSTRUCTIONS.local.md`에 두면 `bridge-docs.py`가 생성된 `COMMON-INSTRUCTIONS.md` 끝에 명시적 마커와 함께 덧붙이고, `agb upgrade`는 이 override 파일을 보존한다 (파일이 없거나 비어 있으면 출력은 종전과 byte-identical).
 
 ### generated/runtime artifact를 source처럼 수정하지 않는다
 
