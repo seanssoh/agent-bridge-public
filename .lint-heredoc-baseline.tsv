@@ -649,7 +649,7 @@ scripts/wiki-daily-ingest.sh	311	H3	aeca7dbf051d209b49346dfb9acc551038fb454e0423
 scripts/wiki-daily-ingest.sh	347	H3	c05e859bebfb4d250ab8dc9c51afa7e02a7f4033512feada29ab5c00cd4fa554	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
 scripts/wiki-daily-ingest.sh	362	H3	d9cc3ad67895a83c92be05a6c1fa6d2a173d4aa44cac96a5c032d8b8c67699c9	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
 scripts/wiki-daily-ingest.sh	377	H3	da2db271969819bac7bc6b449b3d10a9f56231c50c467647b19e8c61ef4ab394	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
-scripts/wiki-daily-ingest.sh	416	H3	871edb3d54d942423d29629f16ea66d62a8f81f2824195107baa0e013245f1c6	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
+scripts/wiki-daily-ingest.sh	425	H3	408af6beac8a3c42d1065a147bbe40ed23aa839e210c3808f6e93b9880e9d865	here-string/procsub, non-interpreter consumer (Lane B raw walk; #679 added a find-name exclusion - bash while-read consumer, not an interpreter subprocess; footgun #11 N/A)	agb-dev-claude wave v0145	Phase 4 PR D
 scripts/wiki-dedup-weekly.sh	67	C1	1cd8d3fff70d684d4e2d169a6cd15c3c75387ff8cba388fec7fcded01db898c3	heredoc in capture	patch	Phase 4 PR D
 scripts/wiki-monthly-summarize.sh	40	H3	dbefc36c1d598843a58948df87155436f8684c38611571d1654ea77e9db914ae	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
 scripts/wiki-v2-rebuild.sh	132	H3	dbefc36c1d598843a58948df87155436f8684c38611571d1654ea77e9db914ae	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
