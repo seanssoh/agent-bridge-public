@@ -405,6 +405,19 @@ other_count=${other_count:-0}
 # and raw are deduped through the shared roots array).
 # Same empty-array guard as the research/other walks: every active agent
 # may legitimately be linux-user-isolated, leaving AGENT_MEMORY_ROOTS empty.
+#
+# Issue #679: the PreCompact hook routes through `bridge-memory.py capture`
+# with `--title "pre-compact dump (auto|manual)"`, so each dump lands in this
+# inbox as `<timestamp>-pre-compact-dump-{auto,manual}.json` on every context
+# compaction. Those envelopes carry no `suggested_slug/title`, so the librarian
+# classifier falls through to DEFAULT_KIND and §9 rejects them — but they keep
+# piling up in the inbox and generate a daily [librarian-ambiguous] escalation.
+# Exclude exactly those two dump shapes from Lane B selection — the slug
+# terminates at `auto`/`manual` immediately before `.json`, so anchoring on
+# `*-pre-compact-dump-{auto,manual}.json` matches every dump while leaving
+# legitimate near-miss captures (e.g. `*-pre-compact-dump-research.json`,
+# `pre-compact-dump-reference.md`) and every other raw envelope eligible.
+# Lane A and the curated research/projects/decisions branches are unaffected.
 touched_raw=""
 if (( ${#AGENT_MEMORY_ROOTS[@]} > 0 )); then
   for _root in "${AGENT_MEMORY_ROOTS[@]}"; do
@@ -413,7 +426,9 @@ if (( ${#AGENT_MEMORY_ROOTS[@]} > 0 )); then
     [[ -d "$_raw_inbox" ]] || continue
     while IFS= read -r _f; do
       [[ -n "$_f" ]] && touched_raw+="$_f"$'\n'
-    done < <(find "$_raw_inbox" -type f \( -name '*.json' -o -name '*.md' \) -mtime -1 2>/dev/null)
+    done < <(find "$_raw_inbox" -type f \( -name '*.json' -o -name '*.md' \) \
+      ! -name '*-pre-compact-dump-auto.json' \
+      ! -name '*-pre-compact-dump-manual.json' -mtime -1 2>/dev/null)
   done
 fi
 touched_raw=$(printf '%s' "$touched_raw" | sed '/^$/d' | sort -u)
