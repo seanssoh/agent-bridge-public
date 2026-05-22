@@ -234,11 +234,17 @@ def main(argv: list[str] | None = None) -> int:
         context = "\n\n".join(parts)
 
     if args.format == "codex":
+        # Codex 0.133.0's SessionStartHookSpecificOutputWire is
+        # `deny_unknown_fields` / `additionalProperties: false` and accepts
+        # only `hookEventName` + `additionalContext`. Emitting `matcher`
+        # made `parse_session_start` reject the object, failing the
+        # SessionStart hook on every codex agent (issue #1055). `matcher`
+        # is still read from stdin above for internal behavior; it just
+        # must not be echoed in the Codex output object.
         json.dump(
             {
                 "hookSpecificOutput": {
                     "hookEventName": "SessionStart",
-                    "matcher": matcher or "startup",
                     "additionalContext": context,
                 }
             },
