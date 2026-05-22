@@ -570,19 +570,25 @@ function sanitizeFilename(name: string): string {
 }
 
 // Token-leak guard: the bot's Bot Framework access token must only ever be
-// attached to Bot Framework / Teams-hosted attachment endpoints. A malicious
-// or misconfigured `contentUrl` could otherwise exfiltrate the bot token to an
-// arbitrary host. We send the Authorization header only when the download URL
-// resolves to one of these known Microsoft attachment hosts (exact host or a
-// subdomain of one). Inline-image / general-attachment content URLs live on
-// `*.asm.skype.com` (AMS), `smba.trafficmanager.net` (service-url attachment
-// paths), and `*.botframework.com`.
-const BOT_FRAMEWORK_ATTACHMENT_HOSTS = [
-  'asm.skype.com',
-  'skype.com',
-  'botframework.com',
-  'trafficmanager.net',
+// attached to a host that is provably a Bot Framework / AMS attachment
+// endpoint. A malicious or misconfigured `contentUrl` could otherwise
+// exfiltrate the bot token to an arbitrary host.
+//
+// Matching is by EXACT host, never by bare suffix — a bare suffix like
+// `trafficmanager.net` would also match `attacker.trafficmanager.net` (anyone
+// can create an Azure Traffic Manager hostname) and `skype.com` would match
+// every non-AMS Skype host. Both are token-exfiltration surfaces.
+//
+//  - `smba.trafficmanager.net` — Bot Framework service-url attachment host
+//    (`/v3/attachments/...`). Exact host only; regional variants, if any,
+//    must be enumerated exactly here rather than suffix-matched.
+//  - `*.asm.skype.com` — Azure Media Service (AMS) hosts for inline-image /
+//    general-attachment content URLs (e.g. `api.asm.skype.com`). Allowed as
+//    the exact host `asm.skype.com` or a true subdomain of it.
+const BOT_FRAMEWORK_ATTACHMENT_EXACT_HOSTS = [
+  'smba.trafficmanager.net',
 ]
+const AMS_ATTACHMENT_HOST = 'asm.skype.com'
 
 function isBotFrameworkAttachmentHost(url: string): boolean {
   let host: string
@@ -593,9 +599,12 @@ function isBotFrameworkAttachmentHost(url: string): boolean {
   } catch {
     return false
   }
-  return BOT_FRAMEWORK_ATTACHMENT_HOSTS.some(
-    (h) => host === h || host.endsWith(`.${h}`),
-  )
+  if (BOT_FRAMEWORK_ATTACHMENT_EXACT_HOSTS.includes(host)) return true
+  // AMS: exact host or a true subdomain of asm.skype.com. The leading-dot
+  // check on a true subdomain rejects spoofs like `asm.skype.com.evil.com`.
+  if (host === AMS_ATTACHMENT_HOST) return true
+  if (host.endsWith(`.${AMS_ATTACHMENT_HOST}`)) return true
+  return false
 }
 
 async function streamDownload(
