@@ -31,6 +31,11 @@ fixes were re-verified live on an OrbStack Oracle Linux 9 VM
 `v0.14.5-beta4` tag and GitHub prerelease are updated to the merged re-cut
 release commit.
 
+**Re-cut round 2 (2026-05-22):** still before any download, `v0.14.5-beta4` was
+re-cut a second time to fold in two further bug-class issues (#1031, #679) — see
+the "Re-cut round 2" subsection below. The tag and prerelease move again to the
+round-2 release commit.
+
 ### Re-cut — verification follow-ups (2026-05-22)
 
 - **Isolated `agent create` no longer aborts** (#1025) — the isolation-v2
@@ -58,6 +63,24 @@ release commit.
 - **Teams channel notification no longer silent-drops** (#1022) — the direct
   `notifications/claude/channel` metadata is kept flat/string-only; the rich
   nested `attachments` array is retained for the bridge queue/audit/replay body.
+
+### Re-cut round 2 — additional bug fixes (2026-05-22)
+
+`v0.14.5-beta4` was re-cut a second time (still before any download) to fold in
+two more bug-class issues. Both PRs were codex pair-reviewed through the
+`feat/wave-v0145-b4r2-integration` branch, which passed a full-branch codex review.
+
+- **Teams attachment downloads authenticate** (#1031) — a Teams user pasting or
+  dragging an inline image triggered a download that failed `HTTP 401`:
+  `streamDownload()` issued a bare unauthenticated `fetch()`. The download now
+  attaches the bot's `Authorization: Bearer` token, scoped by **exact-host
+  match** to the Bot Framework / AMS attachment endpoints only (no token leak to
+  other hosts); the pre-signed `file.download.info` path stays unauthenticated.
+- **wiki-daily-ingest skips PreCompact dumps** (#679) — Lane B ingested the
+  PreCompact hook's `pre-compact-dump-{auto,manual}*.json` capture envelopes,
+  accumulating stuck captures. Lane B now excludes exactly those two dump
+  shapes; ordinary raw captures (including unrelated `pre-compact-dump-*` names)
+  are still ingested.
 
 The #1010 isolated-agent reap path exercises destructive `userdel` / `setfacl` /
 `groupdel`; CI and review verified the gating *decision* (Linux-only, exact
