@@ -103,9 +103,13 @@ def main(argv: list[str]) -> int:
     Emits a single line: `STATUS=<code> BODY=<json-or-text>` so the shell
     can assert on it.
 
-    Two utility scenarios (no network enqueue) support the smoke harness:
-      free-port            print a free loopback TCP port
-      wait-port <port>     exit 0 once <port> accepts connections (else 1)
+    Utility scenarios (no network enqueue) support the smoke harness:
+      free-port               print a free loopback TCP port
+      wait-port <port>        exit 0 once <port> accepts connections (else 1)
+      wedge-sending <db>      force every outbox row in <db> into a
+                              crashed-runner state (status='sending' with
+                              an already-expired lease) — exercises the
+                              stale-lease reclaim path.
     """
     scenario = argv[0]
 
@@ -114,6 +118,21 @@ def main(argv: list[str]) -> int:
         return 0
     if scenario == "wait-port":
         return 0 if _port_open(int(argv[1])) else 1
+    if scenario == "wedge-sending":
+        import sqlite3
+        import time as _t
+        conn = sqlite3.connect(argv[1], timeout=30.0)
+        try:
+            conn.execute(
+                "UPDATE outbox SET status='sending', "
+                "lease_owner='crashed-runner', lease_expires_ts=?, "
+                "updated_ts=? WHERE status IN ('pending', 'retry')",
+                (int(_t.time()) - 9999, int(_t.time())),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return 0
 
     base_url = argv[1]
     peer_id = argv[2]

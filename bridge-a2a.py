@@ -82,7 +82,15 @@ def cmd_send(args: argparse.Namespace) -> int:
         return die("body is empty; pass --body/--body-file or "
                    "--allow-empty-body") or 1
 
-    sender_bridge = cfg.get("bridge_id") or socket.gethostname()
+    # bridge_id is the authenticated sender identity — it is what the
+    # delivery runner signs + sends as X-AGB-Peer, and what the receiver
+    # looks up in its inbound peer table. It MUST be explicitly set (a
+    # hostname fallback would never match the receiver's allowlist).
+    sender_bridge = cfg.get("bridge_id", "").strip()
+    if not sender_bridge:
+        return die("config has no 'bridge_id' — set it in handoff.local.json "
+                   "to this bridge's id (the receiver matches it against "
+                   "its inbound peer allowlist).") or 1
     sender_agent = args.from_agent or os.environ.get("BRIDGE_AGENT_ID") or os.environ.get("USER", "unknown")
     message_id = a2a.new_message_id(sender_bridge)
 
@@ -333,22 +341,31 @@ def _post_envelope(
     address: str,
     port: int,
     path: str,
-    peer_id: str,
+    local_bridge_id: str,
     message_id: str,
     secret: str,
     envelope_bytes: bytes,
     timeout: float,
 ) -> tuple[int, dict[str, str], bytes]:
-    """Sign and POST a single attempt. Returns (status, headers, body)."""
+    """Sign and POST a single attempt. Returns (status, headers, body).
+
+    `X-AGB-Peer` (and the peer-id field of the canonical signing string)
+    carries the SENDER's own local bridge id — i.e. the authenticated
+    sender identity the receiver looks up in its inbound peer table. The
+    destination peer only determines routing (address/port) and which
+    HMAC secret to sign with; it is NOT what goes on the wire as the peer
+    identity.
+    """
     timestamp = str(a2a.now_ts())
     body_hash = a2a.body_sha256(envelope_bytes)
-    canonical = a2a.canonical_string("POST", path, peer_id, message_id, timestamp, body_hash)
+    canonical = a2a.canonical_string(
+        "POST", path, local_bridge_id, message_id, timestamp, body_hash)
     signature = a2a.sign(secret, canonical)
     url = f"http://{address}:{port}{path}"
     req = urllib.request.Request(url, data=envelope_bytes, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("X-AGB-Protocol", a2a.PROTOCOL_VERSION)
-    req.add_header("X-AGB-Peer", peer_id)
+    req.add_header("X-AGB-Peer", local_bridge_id)
     req.add_header("X-AGB-Message-Id", message_id)
     req.add_header("X-AGB-Timestamp", timestamp)
     req.add_header("X-AGB-Body-SHA256", body_hash)
@@ -363,7 +380,14 @@ def _post_envelope(
 def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
     """Attempt one outbox row. Returns a short status word for logging."""
     message_id = row["message_id"]
+    # `peer_id` here is the DESTINATION peer — it selects routing +
+    # secret. The identity we sign + send is our OWN local bridge id.
     peer_id = row["peer"]
+    local_bridge_id = cfg.get("bridge_id", "")
+    if not local_bridge_id:
+        _mark_dead(conn, message_id,
+                   "config has no bridge_id (cannot identify sender)")
+        return "dead(no-bridge-id)"
     try:
         peer = a2a.find_peer(cfg, peer_id)
     except a2a.A2AError as exc:
@@ -392,7 +416,8 @@ def _deliver_one(conn, cfg: dict[str, Any], row, *, timeout: float) -> str:
     attempts = int(row["attempts"]) + 1
     try:
         status, headers, resp_body = _post_envelope(
-            address=address, port=port, path=path, peer_id=peer_id,
+            address=address, port=port, path=path,
+            local_bridge_id=local_bridge_id,
             message_id=message_id, secret=secret,
             envelope_bytes=envelope_bytes, timeout=timeout,
         )
@@ -488,6 +513,25 @@ def cmd_deliver(args: argparse.Namespace) -> int:
     delivered = 0
     try:
         now = a2a.now_ts()
+
+        # Reclaim crashed-runner rows: a row stuck in status='sending'
+        # with an expired lease means the runner that claimed it died
+        # mid-attempt. Demote it back to 'retry' (and clear the lease) so
+        # the candidate scan below picks it up again — otherwise it would
+        # sit wedged forever, since the scan only selects pending/retry.
+        reclaimed = conn.execute(
+            "UPDATE outbox SET status='retry', lease_owner=NULL, "
+            "lease_expires_ts=0, next_attempt_ts=?, updated_ts=?, "
+            "last_error='reclaimed: prior runner lease expired' "
+            "WHERE status='sending' AND lease_expires_ts < ?",
+            (now, now, now),
+        )
+        conn.commit()
+        if reclaimed.rowcount:
+            info(f"reclaimed {reclaimed.rowcount} stale 'sending' "
+                 f"entr{'y' if reclaimed.rowcount == 1 else 'ies'} "
+                 "(expired lease)")
+
         # Per-entry lease: claim due rows so two runners cannot double-send.
         candidates = conn.execute(
             "SELECT message_id FROM outbox WHERE status IN ('pending', 'retry') "

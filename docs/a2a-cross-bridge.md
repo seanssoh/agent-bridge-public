@@ -49,18 +49,28 @@ Three fixed decisions shape the design:
 ## Security model
 
 - **Bind**: the receiver binds ONLY to the configured tailnet IP. Startup
-  fails closed if the bind address is `0.0.0.0`, `::`, a loopback, or not
-  in the local Tailscale address set (CGNAT `100.64.0.0/10` / ULA
-  `fd7a:115c:a1e0::/48` are accepted as a structural fallback when the
-  `tailscale` CLI is unavailable). `remote_addr == configured peer
-  tailnet IP` is enforced before the request body is read.
+  fails **closed** if the bind address is `0.0.0.0`, `::`, a loopback, or
+  not proven to be in this node's actual local Tailscale address set
+  (the exact output of `tailscale ip`). There is no CIDR-shape fallback:
+  a "tailnet-shaped" address (e.g. inside `100.64.0.0/10`) does not prove
+  it is a real Tailscale interface, since a host can have a non-Tailscale
+  CGNAT interface. If the `tailscale` CLI / local Tailscale address set
+  cannot be determined, the daemon refuses to serve. `remote_addr ==
+  configured peer tailnet IP` is enforced before the request body is read.
 - **HMAC-signed requests** (not raw bearer tokens — avoids replayable
   strings in process/log surfaces). The peer-pair secret is the HMAC key.
   - Headers: `X-AGB-Protocol: a2a-enqueue-v1`, `X-AGB-Peer`,
     `X-AGB-Message-Id`, `X-AGB-Timestamp`, `X-AGB-Body-SHA256`,
     `X-AGB-Signature: v1=<hex>`.
-  - Canonical string (newline-delimited): method, path, peer id, message
-    id, timestamp, body sha256.
+  - **`X-AGB-Peer` is the SENDER's own `bridge_id`** — the authenticated
+    sender identity the receiver looks up in its inbound peer table. It
+    is *not* the destination peer id. The sender resolves routing
+    (address/port) and which HMAC secret to sign with by the destination
+    peer, but signs + sends its own `bridge_id` as the peer identity. The
+    receiver additionally rejects (`422`) any request whose envelope
+    `sender.bridge` does not match the authenticated `X-AGB-Peer`.
+  - Canonical string (newline-delimited): method, path, sender bridge id,
+    message id, timestamp, body sha256.
   - Signed **per HTTP attempt** (not at outbox creation) so retries after
     sleep carry fresh timestamps.
 - **Replay defense**: the receiver durably dedupes on `message_id`. Same
@@ -131,6 +141,10 @@ runner loops from double-sending.
 - Retry only on timeout / connection-refused / `429` / `5xx`; honor
   `Retry-After`; exponential backoff with jitter + ceiling.
 - Permanent-fail on `400/401/403/404/409/413/422` → dead-letter.
+- **Crashed-runner reclaim**: a row left in `status='sending'` with an
+  expired lease (the runner that claimed it died mid-attempt) is demoted
+  back to `retry` at the start of the next `deliver` tick, so it is
+  re-attempted instead of wedged forever.
 - GC: max attempts or max age → `dead`. Caps on total outbox bytes +
   per-peer pending count; over-cap, new sends fail locally with a clear
   remediation message (no silent unbounded disk growth).

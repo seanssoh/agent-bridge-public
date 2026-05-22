@@ -97,6 +97,37 @@ fail_closed_wildcard() {
   smoke_assert_contains "$out" "bind_wildcard" "wildcard bind reports bind_wildcard"
 }
 
+# BLOCKING #2 regression guard: with the `tailscale` CLI unavailable the
+# receiver must FAIL CLOSED — it must not fall back to a CIDR-shape guess
+# and approve a tailnet-shaped address. Builds a PATH that has python3
+# but no `tailscale`, then preflights a config with a tailnet-shaped
+# (100.64.0.0/10) bind address that is NOT a real local interface.
+fail_closed_without_tailscale_cli() {
+  cat >"$BRIDGE_HOME/handoff-cgnat.json" <<'EOF'
+{
+  "bridge_id": "bridge-b",
+  "listen": { "address": "100.64.0.10", "port": 8787 },
+  "peers": []
+}
+EOF
+  chmod 0600 "$BRIDGE_HOME/handoff-cgnat.json"
+
+  local pybin pydir nopath_bin out rc=0
+  pybin="$(command -v python3)"
+  pydir="$SMOKE_TMP_ROOT/nopath-bin"
+  mkdir -p "$pydir"
+  ln -sf "$pybin" "$pydir/python3"
+  nopath_bin="$pydir"
+
+  out="$(PATH="$nopath_bin" python3 "$SMOKE_REPO_ROOT/bridge-handoffd.py" \
+    preflight --config "$BRIDGE_HOME/handoff-cgnat.json" 2>&1)" || rc=$?
+  smoke_assert_eq "1" "$rc" "preflight fails closed when tailscale CLI absent"
+  smoke_assert_contains "$out" "tailscale_unavailable" \
+    "no-tailscale-CLI reports tailscale_unavailable (no CIDR-shape fallback)"
+  smoke_assert_not_contains "$out" "preflight] OK" \
+    "tailnet-shaped CGNAT address NOT approved without a real local match"
+}
+
 start_receiver() {
   A2A_PORT="$(pick_free_port)"
   write_a2a_config "$A2A_PORT"
@@ -185,20 +216,22 @@ duplicate_hash_conflict() {
   smoke_assert_contains "$out" "STATUS=409" "message-id reuse w/ different body -> 409"
 }
 
-receiver_down_retry() {
-  # Configure a sender outbox pointing at a dead port; deliver once and
-  # assert the entry is retried (status=retry), not dead-lettered.
-  local dead_port
-  dead_port="$(pick_free_port)"
+# Write a sender-side A2A config: bridge_id=bridge-a, one peer 'bridge-b'
+# at 127.0.0.1:<port>. The receiver's own config (write_a2a_config) has
+# bridge_id=bridge-b and an inbound peer 'bridge-a' allowlisting reviewer,
+# so the reciprocal pair lines up: the sender signs + sends X-AGB-Peer as
+# its OWN id 'bridge-a', which is exactly what the receiver looks up.
+write_sender_config() {
+  local port="$1"
   cat >"$BRIDGE_HOME/handoff-sender.json" <<EOF
 {
   "bridge_id": "bridge-a",
-  "listen": { "address": "127.0.0.1", "port": ${dead_port} },
+  "listen": { "address": "127.0.0.1", "port": ${port} },
   "peers": [
     {
       "id": "bridge-b",
       "address": "127.0.0.1",
-      "port": ${dead_port},
+      "port": ${port},
       "secret": "${A2A_SECRET}",
       "inbound_allowlist": ["reviewer"]
     }
@@ -206,38 +239,98 @@ receiver_down_retry() {
 }
 EOF
   chmod 0600 "$BRIDGE_HOME/handoff-sender.json"
+}
 
+sender_outbox() {
   BRIDGE_A2A_CONFIG="$BRIDGE_HOME/handoff-sender.json" \
-    python3 "$SMOKE_REPO_ROOT/bridge-a2a.py" send \
-      --peer bridge-b --to reviewer --from senderX \
-      --title "retry probe" --body "will not connect" >/dev/null
+    python3 "$SMOKE_REPO_ROOT/bridge-a2a.py" "$@"
+}
+
+# BLOCKING #1 regression guard: drive the REAL bridge-a2a.py send +
+# deliver path against the LIVE receiver and assert a 200 ACK + a local
+# enqueue. The earlier 11-scenario smoke posted the success case via the
+# helper (peer_id=bridge-a) directly and only ran send+deliver against a
+# DEAD receiver, so it missed the X-AGB-Peer identity mismatch entirely.
+live_send_deliver() {
+  write_sender_config "$A2A_PORT"
+
+  sender_outbox send --peer bridge-b --to reviewer --from senderX \
+    --title "live send deliver" --body "real send+deliver body" >/dev/null
+
+  local before
+  before="$(sender_outbox outbox list)"
+  smoke_assert_contains "$before" "pending" "real send created a pending outbox row"
+
+  sender_outbox deliver --timeout 5 >/dev/null 2>&1 || true
+
+  local after
+  after="$(sender_outbox outbox list)"
+  smoke_assert_contains "$after" "acked" "real deliver against live receiver -> acked"
+  smoke_assert_not_contains "$after" "dead" "real send+deliver did not dead-letter"
+
+  # The acked outbox row must carry the remote task id, and that task
+  # must be visible in the receiver's local inbox.
+  local inbox_out
+  inbox_out="$("$SMOKE_REPO_ROOT/agent-bridge" inbox reviewer)"
+  smoke_assert_contains "$inbox_out" "live send deliver" \
+    "send+deliver handoff visible in receiver local inbox"
+}
+
+receiver_down_retry() {
+  # Configure a sender outbox pointing at a dead port; deliver once and
+  # assert the entry is retried (status=retry), not dead-lettered.
+  local dead_port
+  dead_port="$(pick_free_port)"
+  write_sender_config "$dead_port"
+
+  sender_outbox send --peer bridge-b --to reviewer --from senderX \
+    --title "retry probe" --body "will not connect" >/dev/null
 
   local outbox_before
-  outbox_before="$(BRIDGE_A2A_CONFIG="$BRIDGE_HOME/handoff-sender.json" \
-    python3 "$SMOKE_REPO_ROOT/bridge-a2a.py" outbox list)"
+  outbox_before="$(sender_outbox outbox list)"
   smoke_assert_contains "$outbox_before" "pending" "send created a pending outbox entry"
 
-  BRIDGE_A2A_CONFIG="$BRIDGE_HOME/handoff-sender.json" \
-    python3 "$SMOKE_REPO_ROOT/bridge-a2a.py" deliver --timeout 3 >/dev/null 2>&1 || true
+  sender_outbox deliver --timeout 3 >/dev/null 2>&1 || true
 
   local outbox_after
-  outbox_after="$(BRIDGE_A2A_CONFIG="$BRIDGE_HOME/handoff-sender.json" \
-    python3 "$SMOKE_REPO_ROOT/bridge-a2a.py" outbox list)"
+  outbox_after="$(sender_outbox outbox list)"
   smoke_assert_contains "$outbox_after" "retry" "unreachable receiver -> outbox entry retried"
   smoke_assert_not_contains "$outbox_after" "dead" "transient failure not dead-lettered on first attempt"
+}
+
+# BLOCKING #3 regression guard: a row left in status='sending' with an
+# expired lease (its runner crashed mid-attempt) must be reclaimed by the
+# next deliver tick, not skipped forever.
+stale_lease_reclaim() {
+  write_sender_config "$A2A_PORT"
+
+  sender_outbox send --peer bridge-b --to reviewer --from senderX \
+    --title "stale lease probe" --body "crashed-runner body" >/dev/null
+
+  # Force the freshly-queued row into a crashed-runner state: status
+  # 'sending' with a lease that already expired.
+  python3 "$SCRIPT_DIR/a2a-cross-bridge-helper.py" wedge-sending \
+    "$BRIDGE_STATE_DIR/handoff/outbox.db"
+  local wedged
+  wedged="$(sender_outbox outbox list)"
+  smoke_assert_contains "$wedged" "sending" "row forced into stale 'sending' state"
+
+  # A deliver tick must reclaim it and (against the live receiver) ack it.
+  sender_outbox deliver --timeout 5 >/dev/null 2>&1 || true
+  local after
+  after="$(sender_outbox outbox list)"
+  smoke_assert_not_contains "$after" "sending" "stale 'sending' row no longer wedged"
+  smoke_assert_contains "$after" "acked" "reclaimed row delivered on the next tick"
 }
 
 dry_run_no_outbox_write() {
   # --dry-run must not persist anything to the outbox.
   local out before after
-  before="$(BRIDGE_A2A_CONFIG="$BRIDGE_HOME/handoff-sender.json" \
-    python3 "$SMOKE_REPO_ROOT/bridge-a2a.py" outbox list | grep -c . || true)"
-  out="$(BRIDGE_A2A_CONFIG="$BRIDGE_HOME/handoff-sender.json" \
-    python3 "$SMOKE_REPO_ROOT/bridge-a2a.py" send \
-      --peer bridge-b --to reviewer --title "dry one" --body "x" --dry-run)"
+  before="$(sender_outbox outbox list | grep -c . || true)"
+  out="$(sender_outbox send --peer bridge-b --to reviewer \
+    --title "dry one" --body "x" --dry-run)"
   smoke_assert_contains "$out" '"dry_run": true' "dry-run reports dry_run flag"
-  after="$(BRIDGE_A2A_CONFIG="$BRIDGE_HOME/handoff-sender.json" \
-    python3 "$SMOKE_REPO_ROOT/bridge-a2a.py" outbox list | grep -c . || true)"
+  after="$(sender_outbox outbox list | grep -c . || true)"
   smoke_assert_eq "$before" "$after" "dry-run did not add an outbox row"
 }
 
@@ -247,6 +340,7 @@ main() {
   write_a2a_roster
 
   smoke_run "receiver fail-closed on wildcard bind" fail_closed_wildcard
+  smoke_run "receiver fail-closed when tailscale CLI absent" fail_closed_without_tailscale_cli
   smoke_run "start loopback receiver (test-bind)" start_receiver
   smoke_run "HMAC auth failure -> 401" auth_fail
   smoke_run "allowlist failure -> 403" allowlist_fail
@@ -255,7 +349,9 @@ main() {
   smoke_run "successful enqueue -> local inbox visibility" successful_enqueue
   smoke_run "duplicate same-hash -> idempotent" duplicate_same_hash
   smoke_run "duplicate hash-conflict -> 409" duplicate_hash_conflict
+  smoke_run "real send+deliver -> live receiver 200 + enqueue" live_send_deliver
   smoke_run "receiver-down delivery -> outbox retry" receiver_down_retry
+  smoke_run "stale 'sending' lease reclaimed on next tick" stale_lease_reclaim
   smoke_run "send --dry-run writes no outbox row" dry_run_no_outbox_write
 
   smoke_log "passed"

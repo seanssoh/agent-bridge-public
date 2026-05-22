@@ -63,45 +63,64 @@ def audit(event: str, **fields: Any) -> None:
 # Tailscale address discovery + bind validation (fail-closed)
 # --------------------------------------------------------------------------
 
+class TailscaleUnavailable(a2a.A2AError):
+    """The local Tailscale address set could not be determined.
+
+    Distinct from "Tailscale is up but reports no addresses" — the bind
+    validation MUST fail closed when this is raised (we cannot prove the
+    bind address is a real local Tailscale interface).
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="tailscale_unavailable")
+
+
 def tailscale_addresses() -> list[str]:
-    """Return the local node's Tailscale IPs, or [] if unavailable."""
-    addrs: list[str] = []
+    """Return the local node's Tailscale IPs.
+
+    Raises TailscaleUnavailable if the `tailscale` CLI is not on PATH or
+    the query fails — the caller must fail closed in that case rather
+    than guessing from a CIDR shape. An *empty* list (CLI ran fine but
+    the node has no Tailscale address) is returned as `[]`.
+    """
     try:
         out = subprocess.run(
             ["tailscale", "ip"],
             capture_output=True, text=True, timeout=5,
         )
-        if out.returncode == 0:
-            for line in out.stdout.splitlines():
-                line = line.strip()
-                if line:
-                    addrs.append(line)
-    except (FileNotFoundError, subprocess.SubprocessError, OSError):
-        pass
+    except FileNotFoundError as exc:
+        raise TailscaleUnavailable(
+            "the 'tailscale' CLI is not on PATH — cannot prove the bind "
+            "address is a real local Tailscale interface. Install Tailscale "
+            "(or set BRIDGE_A2A_ALLOW_TEST_BIND=1 for a loopback test bind)."
+        ) from exc
+    except (subprocess.SubprocessError, OSError) as exc:
+        raise TailscaleUnavailable(
+            f"'tailscale ip' failed to run: {exc}"
+        ) from exc
+    if out.returncode != 0:
+        raise TailscaleUnavailable(
+            f"'tailscale ip' exited {out.returncode}: "
+            f"{(out.stderr or '').strip()[:200]}"
+        )
+    addrs: list[str] = []
+    for line in out.stdout.splitlines():
+        line = line.strip()
+        if line:
+            addrs.append(line)
     return addrs
 
 
 def is_tailnet_address(addr: str, allowed: list[str]) -> bool:
-    """True if `addr` is one of the local node's tailnet IPs.
+    """True only if `addr` is in THIS node's actual Tailscale address set.
 
-    `allowed` is the result of `tailscale ip`. The tailnet CGNAT range
-    (100.64.0.0/10) and the Tailscale ULA (fd7a:115c:a1e0::/48) are used
-    as a structural fallback so a config-declared tailnet IP still passes
-    when the `tailscale` CLI is not on PATH.
+    `allowed` is the exact output of `tailscale ip`. There is deliberately
+    NO CIDR-shape fallback: a host can have a non-Tailscale interface
+    inside 100.64.0.0/10, so "tailnet-shaped" does not prove "this node's
+    Tailscale interface". When the local address set cannot be determined
+    the caller raises TailscaleUnavailable and fails closed.
     """
-    if addr in allowed:
-        return True
-    try:
-        ip = ipaddress.ip_address(addr)
-    except ValueError:
-        return False
-    if ip.is_loopback or ip.is_unspecified:
-        return False
-    if ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10"):
-        return True
-    if ip.version == 6 and ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"):
-        return True
-    return False
+    return addr in allowed
 
 
 def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
@@ -117,12 +136,14 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
     port = int(listen.get("port", 8787))
 
     if not bind:
+        # Auto-select fails closed: tailscale_addresses() raises
+        # TailscaleUnavailable when the local address set is unknowable.
         tailnet = tailscale_addresses()
         if not tailnet:
             raise a2a.A2AError(
                 "no listen.address configured and 'tailscale ip' returned "
-                "nothing. Set listen.address to this node's tailnet IP in "
-                "handoff.local.json.",
+                "no addresses. Set listen.address to this node's tailnet IP "
+                "in handoff.local.json.",
                 code="bind_unresolved",
             )
         bind = tailnet[0]
@@ -164,12 +185,16 @@ def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
             code="bind_loopback",
         )
 
+    # Fail closed: the bind address MUST be proven to be in this node's
+    # actual local Tailscale address set. tailscale_addresses() raises
+    # TailscaleUnavailable (a subclass of A2AError) if the local set
+    # cannot be determined — that propagates and the daemon refuses to
+    # serve. There is no CIDR-shape fallback.
     allowed = tailscale_addresses()
     if not is_tailnet_address(bind, allowed):
         raise a2a.A2AError(
             f"listen.address {bind!r} is not in this node's Tailscale "
-            f"address set ({allowed or 'tailscale CLI unavailable'}) and is "
-            "not within the tailnet CGNAT/ULA range. Refusing to start "
+            f"address set ({allowed or 'empty'}). Refusing to start "
             "(fail-closed).",
             code="bind_not_tailnet",
         )
@@ -395,6 +420,20 @@ class HandoffHandler(BaseHTTPRequestHandler):
                   header_id=message_id, envelope_id=env.get("message_id"),
                   security=True)
             self._reply(422, {"ok": False, "error": "message id header/body mismatch"})
+            return
+
+        # The envelope's declared sender bridge must match the
+        # authenticated peer identity (the signed X-AGB-Peer header).
+        # Without this an otherwise valid signed request could carry a
+        # spoofed `sender.bridge` in the provenance block.
+        env_sender_bridge = env.get("sender", {}).get("bridge", "")
+        if env_sender_bridge != peer_id:
+            audit("reject_sender_mismatch", peer=peer_id, client=client_ip,
+                  envelope_sender=env_sender_bridge, message_id=message_id,
+                  security=True)
+            self._reply(422, {"ok": False,
+                              "error": "envelope sender bridge does not match "
+                                       "authenticated peer"})
             return
 
         target = env["target_agent"]

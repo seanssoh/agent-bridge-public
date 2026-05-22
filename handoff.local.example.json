@@ -1,10 +1,11 @@
 {
   "_comment": "A2A cross-bridge handoff config. Copy to handoff.local.json in your BRIDGE_HOME ($HOME/.agent-bridge by default), edit, then `chmod 0600` it. This file is data-only JSON — it is parsed, never executed. It carries peer-pair HMAC secrets, so it MUST be mode 0600 and MUST stay git-ignored. See docs/a2a-cross-bridge.md.",
 
+  "_bridge_id_comment": "REQUIRED. This bridge's own id. It is the authenticated sender identity: the delivery runner signs it + sends it as the X-AGB-Peer header, and a peer receiver looks it up in its inbound peer allowlist. A receiving peer's config must list a peer entry whose 'id' equals this value.",
   "bridge_id": "bridge-a",
 
   "listen": {
-    "_comment": "The receiver binds to this tailnet IP ONLY. Leave 'address' empty to auto-select the first `tailscale ip`. The daemon FAILS CLOSED if the address is a wildcard (0.0.0.0/::), loopback, or not in this node's Tailscale address set.",
+    "_comment": "The receiver binds to this tailnet IP ONLY. Leave 'address' empty to auto-select the first `tailscale ip`. The daemon FAILS CLOSED if the address is a wildcard (0.0.0.0/::), loopback, or cannot be proven to be in this node's actual Tailscale address set (the exact output of `tailscale ip`) — there is no CIDR-shape fallback, and if the tailscale CLI is unavailable the daemon refuses to serve.",
     "address": "100.64.0.10",
     "port": 8787,
     "enqueue_path": "/enqueue"
