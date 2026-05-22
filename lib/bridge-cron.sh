@@ -607,17 +607,29 @@ bridge_cron_normalize_shell_run_artifacts() {
 }
 
 bridge_cron_run_dir_grant_isolation() {
-  # v2 isolation contract: the agent group (inherited via the setgid on the
-  # parent state/cron/runs/ dir) needs rwx so the isolated agent UID can
-  # traverse the run dir and write sidecar artifacts (e.g.
-  # authoritative-memory-daily.json). umask 077 in bridge-lib.sh strips all
-  # group bits at mkdir time, leaving drwx--S--- (2700). chmod 2770 here
-  # restores drwxrws--- so the isolated UID (which is in the group) can write.
+  # v2 isolation contract fix (two problems):
+  #
+  # 1. Directory access: umask 077 in bridge-lib.sh strips all group bits at
+  #    mkdir time, leaving drwx--S--- (2700). The isolated agent UID (in
+  #    ab-shared via parent setgid) has zero access. chmod 2770 restores
+  #    drwxrws--- so the isolated UID can traverse and write.
+  #
+  # 2. File readability: files written by the isolated agent inside the dir
+  #    also inherit umask 077, landing at 0600 (owner-only). The controller
+  #    (ec2-user, in ab-shared) cannot read the sidecar. We set a default ACL
+  #    (default:group::rw-) so new files inherit group read/write from the ACL
+  #    entry, overriding the umask for the group column. setfacl is
+  #    best-effort; hosts without it degrade gracefully (sidecar read may fall
+  #    back to child-fallback, but dispatch is not blocked).
+  #
   # Shell payloads skip this call and use bridge_cron_normalize_shell_run_artifacts
-  # instead (chmod 0700 is intentional there — shell runner writes as controller).
+  # (chmod 0700) instead — controller writes are intentional there.
   local run_dir="$1"
   [[ -n "$run_dir" && -d "$run_dir" ]] || return 0
   chmod 2770 "$run_dir" 2>/dev/null || return 1
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m "default:group::rw-,default:mask::rw-" "$run_dir" 2>/dev/null || true
+  fi
   return 0
 }
 
