@@ -23,6 +23,8 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 source "$SCRIPT_DIR/lib/bridge-host-profile.sh"
 # shellcheck source=lib/bridge-init-default-crons.sh
 source "$SCRIPT_DIR/lib/bridge-init-default-crons.sh"
+# shellcheck source=lib/bridge-init-codex-pair.sh
+source "$SCRIPT_DIR/lib/bridge-init-codex-pair.sh"
 # bridge_load_roster is deferred until after argument parsing so that
 # `init --dry-run` is mutation-free (bridge_load_roster -> bridge_init_dirs
 # would otherwise create $BRIDGE_HOME/state on a fresh-install-candidate and
@@ -511,12 +513,14 @@ else
   bridge_load_roster
 fi
 
-# Issue #4769 (reverts #517): no auto-backfill of `<admin>-dev` codex pair.
-# Operator runs `agent-bridge setup admin <agent>` explicitly to set the
-# admin identifier, and creates any sibling dev agent (e.g. `patch-dev`)
-# with `agent-bridge agent create <name> --engine codex …` when desired.
-# Auto-creating a sibling defeated the model-diversity intent of the
-# `patch (claude) + patch-dev (codex)` standard pair.
+# Issue #1052 (reconsiders #4769, which reverted #517): the `<admin>-dev`
+# codex pair IS auto-provisioned on a fresh install — but only when the codex
+# CLI is present AND the resolved host profile is `server`. That gated
+# provisioning happens below, after host-profile resolution and before the
+# picker-sweep cron registration (whose target is `<admin>-dev`). On a `dev`
+# profile the install stays admin-only and the dev advisory prints the manual
+# `agent create <admin>-dev --engine codex …` recipe; when codex is absent the
+# claude admin runs solo.
 
 if [[ $dry_run -eq 0 ]] && [[ "$(bridge_agent_engine "$admin_agent" 2>/dev/null || printf '%s' "$engine")" == "claude" ]]; then
   admin_workdir="$(bridge_agent_workdir "$admin_agent" 2>/dev/null || true)"
@@ -562,6 +566,15 @@ if [[ $dry_run -eq 0 ]]; then
       bridge_init_append_warning "host_profile=dev: requested channels (${channels}) — channel bootstrap skipped this init. Re-run \`agb setup <channel> ${admin_agent}\` later or pass \`--profile server\` to enable on this install."
     fi
   fi
+  # Issue #1052: auto-provision the admin's `<admin>-dev` codex pair before
+  # the picker-sweep cron registration below — the cron targets `<admin>-dev`,
+  # so the pair must exist first or the registration skips. The helper is
+  # gated on codex-CLI presence AND host_profile == server (the `dev` path
+  # stays admin-only and keeps its manual-create advisory), and is idempotent
+  # + non-fatal — re-running init when the pair already exists is a no-op and
+  # any failure is logged without blocking init.
+  bridge_init_provision_admin_codex_pair "$host_profile_cli" "$admin_agent" "$host_profile_chosen" || true
+
   # Track D follow-up to #713 / #809, follow-on to #833: auto-register the
   # picker-sweep bridge-native cron on every fresh install, regardless of
   # host_profile. The helper is idempotent (short-circuits when a job titled

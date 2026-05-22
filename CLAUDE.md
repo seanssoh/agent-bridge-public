@@ -150,9 +150,9 @@ Before processing 2+ open issues / PRs / tracks (or any work with back-reference
 This repo is normally operated by Claude + one or more Codex agents running side by side. The full collaboration contract lives in [`AGENTS.md` §"Multi-Agent Collaboration"](./AGENTS.md). The pieces you need to remember as a Claude author:
 
 1. **Never touch another agent's branch in the shared worktree.** Do not run `git checkout <other-branch>`, `git commit --amend`, `git reset`, or `git worktree prune` in the operator's primary checkout. If you need a clean workspace for a helper operation (e.g. verifying a Codex-authored PR), do it in a temp clone. Codex sessions themselves are expected to run inside their own `--prefer new` worktree; assume they do, and do not hand them paths inside your own.
-2. **Pair-review every non-trivial PR.** Default reviewer is `agb-dev-codex-2`. Workflow:
+2. **Pair-review every non-trivial PR.** Default reviewer is the admin's codex pair, `<admin>-dev` (e.g. `patch-dev` on a `patch`-admin install — auto-provisioned at install time on a server host, see `bridge-init.sh`). Workflow:
    - Write a review brief to `/tmp/agb-<pr-number>-codex-review.md`: background, focus checklist, expected output shape (`implement-ok` / `needs-more: …`).
-   - Queue it: `bash bridge-task.sh create --from agb-dev-claude --to agb-dev-codex-2 --title "[PR #<N> review] <subject>" --body-file /tmp/agb-<pr-number>-codex-review.md`.
+   - Queue it: `bash bridge-task.sh create --from <admin> --to <admin>-dev --title "[PR #<N> review] <subject>" --body-file /tmp/agb-<pr-number>-codex-review.md`.
    - Wait for the `[task-complete]` notification, `agb claim`, read the completion note.
    - If `needs-more: …`, fix and enqueue the next round with a bumped title (`[PR #<N> re-review]`, then `r3`, etc.) and its own brief file. Each round is a fresh `bridge-task create`, not an edit of the prior task.
    - Merge only after the final reviewer note opens with `implement-ok`. Codex may squash-merge itself when the operator has granted that permission; otherwise you perform the merge.

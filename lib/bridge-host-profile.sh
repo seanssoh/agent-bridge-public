@@ -485,8 +485,9 @@ bridge_host_profile_emit_dev_advisories() {
   fi
   printf '  - picker-sweep 자동 unstick: skip (BRIDGE_PICKER_SWEEP_ENABLED=1 로 override 가능)\n'
   printf '\n'
-  printf '정적 에이전트는 우선 admin(`%s`) 1 개만 등록합니다 (issue #4769).\n' "$admin_agent"
-  printf '모델 다양성용 codex 페어(`%s`)는 다음 명령으로 명시 등록할 수 있습니다:\n' "$admin_pair"
+  printf 'dev 프로파일에서는 정적 에이전트로 admin(`%s`) 1 개만 등록합니다.\n' "$admin_agent"
+  printf '(server 프로파일은 codex CLI 가 있으면 `%s` codex 페어를 자동 등록합니다 — issue #1052.)\n' "$admin_pair"
+  printf '모델 다양성용 codex 페어(`%s`)는 dev 호스트에서 다음 명령으로 명시 등록할 수 있습니다:\n' "$admin_pair"
   printf '  agent-bridge agent create %s --engine codex \\\n' "$admin_pair"
   printf '    --workdir "$(agent-bridge agent show %s --field workdir)" \\\n' "$admin_agent"
   printf '    --allow-shared-workdir --always-on\n'
