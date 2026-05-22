@@ -15,9 +15,12 @@ Operator-cued **fifth prerelease** in the v0.14.5 stabilization window. A
 during fresh-install verification on a brand-new server), shipped through the
 `release/v0.14.5-beta5-integration` branch. Every PR was codex pair-reviewed
 (`agb-dev-claude` + `agb-dev-codex`); the integration branch additionally
-passed a full-branch codex review, a `scripts/smoke-test.sh` pass, and a live
-Linux-VM verification of the isolation-v2 fixes. `-beta5` prerelease; matching
-tag `v0.14.5-beta5`, GitHub release marked **Pre-release**.
+passed a full-branch codex review and a live Linux-VM verification of the
+isolation-v2 fixes. Targeted modular smokes and the `lint-heredoc-ban`
+baseline pass; the full `scripts/smoke-test.sh` run hits only the known
+pre-existing #4793 leaked-agent-dirs / status-activity environmental failures.
+`-beta5` prerelease; matching tag `v0.14.5-beta5`, GitHub release marked
+**Pre-release**.
 
 ### Fixed — daily-backup
 
