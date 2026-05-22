@@ -363,7 +363,23 @@ SUPPRESS_MISSING_CHANNELS=0
 CHANNEL_REASON=""
 AGENT_ENV_FILE=""
 
-if [[ ! -d "$WORK_DIR" ]]; then
+# workdir existence: for a linux-user isolated agent the agent root
+# (`<data-root>/agents/<agent>/`) is `root:ab-agent-<agent>` mode 0750
+# and `workdir/` is 2770 — the controller user is not in the agent
+# group at process scope, so a plain `[[ -d "$WORK_DIR" ]]` cannot
+# traverse the 0750 parent and false-negates even when workdir exists
+# (#1028). Probe via the existing sudo-handoff helper for isolated
+# agents; non-isolated agents keep the plain controller-side test.
+WORK_DIR_PRESENT=0
+if bridge_agent_linux_user_isolation_effective "$AGENT"; then
+  if bridge_linux_sudo_root test -d "$WORK_DIR" 2>/dev/null; then
+    WORK_DIR_PRESENT=1
+  fi
+elif [[ -d "$WORK_DIR" ]]; then
+  WORK_DIR_PRESENT=1
+fi
+
+if [[ $WORK_DIR_PRESENT -eq 0 ]]; then
   # Two auto-rebuild paths cover the post-migration "workdir vanished"
   # gap from #714 (item 10 — `patch-dev` static-role with no workdir
   # tree at all). #4 in the per-symptom table:
@@ -397,7 +413,13 @@ if [[ ! -d "$WORK_DIR" ]]; then
       bridge_linux_sudo_root mkdir -p "$WORK_DIR" || \
         bridge_die "workdir 자동 재생성 실패: $WORK_DIR"
     fi
-    if [[ ! -d "$WORK_DIR" ]]; then
+    # Post-regen re-check: same privilege-aware probe — a plain
+    # `[[ ! -d ]]` here false-negates on the isolated 0750 layout and
+    # would spuriously bridge_die even though workdir now exists (#1028).
+    if bridge_agent_linux_user_isolation_effective "$AGENT"; then
+      bridge_linux_sudo_root test -d "$WORK_DIR" 2>/dev/null \
+        || bridge_die "workdir 자동 재생성 후에도 존재하지 않음: $WORK_DIR"
+    elif [[ ! -d "$WORK_DIR" ]]; then
       bridge_die "workdir 자동 재생성 후에도 존재하지 않음: $WORK_DIR"
     fi
   else

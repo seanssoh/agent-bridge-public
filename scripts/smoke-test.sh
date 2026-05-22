@@ -6152,6 +6152,8 @@ PY
   assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "agent-bridge urgent"
   assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "spawnSync(agb, ['urgent'"
   assert_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "ignoring deprecated TEAMS_BRIDGE_MODE"
+  TEAMS_CHANNEL_META_OUTPUT="$(cd "$REPO_ROOT/plugins/teams" && TEAMS_STATE_DIR="$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams" bun server.ts _smoke-channel-meta)"
+  python3 "$REPO_ROOT/scripts/smoke/teams-channel-meta-assert.py" "$TEAMS_CHANNEL_META_OUTPUT"
   TEAMS_DEDUPE_OUTPUT="$(cd "$REPO_ROOT/plugins/teams" && bun -e 'import { createRecentMessageDeduper } from "./dedupe.ts"; const dedupe = createRecentMessageDeduper(2); console.log(JSON.stringify([dedupe.seen("1775901127484"), dedupe.seen("1775901127484"), dedupe.seen("1775901127485"), dedupe.seen("1775901127486"), dedupe.seen("1775901127484")]))')"
   assert_contains "$TEAMS_DEDUPE_OUTPUT" "[false,true,false,false,false]"
   # Round-2: channel-failure path — forget() must roll back the dedupe entry
