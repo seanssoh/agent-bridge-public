@@ -174,7 +174,10 @@ role_text="Manager/admin role"
 description=""
 channels=""
 channel_account=""
-runtime_config="$HOME/.agent-bridge/runtime/bridge-config.json"
+# Default to the canonical runtime config path resolved by bridge-lib.sh
+# (rooted at $BRIDGE_HOME), not the operator's $HOME — a custom BRIDGE_HOME
+# install must not read/write channel config under the default ~/.agent-bridge.
+runtime_config="$BRIDGE_RUNTIME_CONFIG_FILE"
 data_root_flag=""
 skip_channel_setup=0
 test_start=0
