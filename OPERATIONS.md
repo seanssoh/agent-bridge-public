@@ -507,6 +507,40 @@ Default is `--dry-run`; pass `--apply` to actually run `git worktree remove
 -f`. See `agb worktree doctor --help` for `--target-branch`, `--max-age-days`,
 `--include-stale`, and `--prune-branches`.
 
+## A2A Cross-Bridge Handoff
+
+A2A lets an agent on one Agent Bridge install enqueue a task directly into
+another install's inbox queue over a Tailscale tailnet — no human relay. Each
+install runs an HMAC-authenticated receiver daemon plus a durable sender
+outbox. Full protocol + security model:
+[`docs/a2a-cross-bridge.md`](./docs/a2a-cross-bridge.md).
+
+**Setup.** Copy [`handoff.local.example.json`](./handoff.local.example.json) to
+`$BRIDGE_HOME/handoff.local.json`, fill in this bridge's `bridge_id`, the
+tailnet `listen` IP, and each `peers[]` entry (peer id, tailnet address,
+ordered-pair HMAC `secret`, `inbound_allowlist`), then `chmod 0600` it. The
+file carries peer secrets, is git-ignored, and the loader refuses any mode
+other than 0600.
+
+```bash
+agb a2a daemon start|stop|restart|status|tick   # receiver daemon lifecycle
+agb a2a send --peer <peer> --to <agent> --title <t> --body <text>
+agb a2a deliver                                 # drain the sender outbox once
+agb a2a outbox list|retry <id>|drop <id>|gc
+agb a2a peers list|test <peer>
+```
+
+The receiver binds to the configured tailnet IP **only** and fails closed at
+startup if the bind address is a wildcard / loopback / not in this node's
+`tailscale ip` set, or if the `tailscale` CLI cannot be located. The CLI is
+resolved on `PATH` first, then well-known locations (`/opt/homebrew/bin`,
+`/usr/local/bin`, the macOS app bundle, `/usr/bin`); `BRIDGE_A2A_TAILSCALE_CLI`
+overrides discovery for a non-standard install.
+
+`handoff.local.json` and `state/handoff/` (durable outbox/inbox DBs + staged
+bodies) are live-only operator-owned state — preserved across `agb upgrade`
+like `state/`, `logs/`, and the local roster.
+
 ## Status And Debugging
 
 Use these first:

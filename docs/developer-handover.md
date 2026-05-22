@@ -115,6 +115,7 @@ tracked templates다.
 - [`bridge-sync.sh`](../bridge-sync.sh): live roster/state sync
 - [`bridge-status.sh`](../bridge-status.sh): dashboard 출력
 - [`bridge-upgrade.sh`](../bridge-upgrade.sh): live install 업그레이드
+- [`bridge-handoff-daemon.sh`](../bridge-handoff-daemon.sh): A2A cross-bridge handoff lifecycle (수신 데몬 + 송신 delivery-runner)
 
 ### `lib/` 모듈
 
@@ -127,6 +128,7 @@ tracked templates다.
 - `bridge-cron.sh`: cron inventory, enqueue manifest helper
 - `bridge-skills.sh`: project skill bootstrap/sync
 - `bridge-hooks.sh`: Claude hook 관련 helper
+- `bridge-a2a.sh`: A2A 수신 데몬 + delivery-runner lifecycle helper (`bridge-handoff-daemon.sh`가 source)
 
 새 로직을 추가할 때는 루트 스크립트에 큰 함수를 쌓기보다 `lib/`로 내리는 편이
 맞다.
@@ -137,6 +139,9 @@ Python은 보조 역할이다. 대표적으로:
 
 - [`bridge-queue.py`](../bridge-queue.py): SQLite queue backend
 - [`bridge-cron.py`](../bridge-cron.py): cron inventory/metadata
+- [`bridge-handoffd.py`](../bridge-handoffd.py): A2A 수신 데몬 — tailnet-bound HTTP listener, HMAC 검증 후 `bridge-task.sh create` 경유 enqueue
+- [`bridge-a2a.py`](../bridge-a2a.py): A2A CLI (`send`/`outbox`/`inbox-dedupe`/`peers`/`deliver`) — `agb a2a ...`로 호출
+- [`bridge_a2a_common.py`](../bridge_a2a_common.py): A2A 공통 모듈 — wire protocol, HMAC 서명, data-only JSON config loader, outbox/inbox SQLite 스키마
 - `bridge-*.py` 일부: docs, release, audit, guard, intake, dashboard 등
 
 핵심 orchestration은 Bash 중심이지만, structured state 처리나 JSON/SQLite 작업은

@@ -38,6 +38,7 @@ Tracked source must stay machine-agnostic. Machine-specific roster overrides, ch
 - [`lib/`](./lib): shared Bash implementation. Core modules: `bridge-core.sh`, `bridge-agents.sh`, `bridge-tmux.sh`, `bridge-state.sh`, `bridge-cron.sh`, `bridge-skills.sh`, `bridge-hooks.sh`, `bridge-channels.sh`, `bridge-cleanup.sh`. Isolation-v2 stack (v0.8.0+): `bridge-marker-bootstrap.sh`, `bridge-layout-resolver.sh`, `bridge-isolation-v2.sh`, `bridge-isolation-v2-migrate.sh`, `bridge-isolation-v2-reapply.sh`, `bridge-isolation-runtime.sh`, `bridge-isolation-v3-channel-dotenv.sh`, `bridge-isolation-helpers.sh`, `bridge-migration.sh`, `bridge-host-profile.sh`. See `ARCHITECTURE.md` §"Shell Module Layout" for the full annotated list.
 - [`lib/upgrade-helpers/`](./lib/upgrade-helpers) (v0.13.9+): standalone scripts invoked by `bridge-upgrade.sh` with file-as-argv to bypass the Bash 5.3.9 heredoc-stdin deadlock (footgun #11). Six files: `channel-guard-report.sh`, `channel-guard-json.py`, `agent-restart-json.py`, `recorded-source-root.py`, `isolation-v2-migrate.sh`, `emit-failure-json.py`. **Anti-pattern**: do NOT add new `<<EOF` / `<<'PY'` heredoc-stdin to subprocess in `bridge-upgrade.sh` — extract to a standalone helper instead. See `KNOWN_ISSUES.md` §26.
 - Python is used for structured work: queue backend (`bridge-queue.py`), cron inventory (`bridge-cron.py`), docs/audit/intake/dashboard helpers.
+- A2A cross-bridge handoff (v0.14.5-beta4+): `bridge-handoff-daemon.sh` + `lib/bridge-a2a.sh` (receiver/runner lifecycle), `bridge-handoffd.py` (tailnet-bound receiver daemon), `bridge-a2a.py` (`agb a2a` CLI), `bridge_a2a_common.py` (wire protocol + HMAC + data-only config loader + outbox/inbox SQLite schemas). See `docs/a2a-cross-bridge.md`.
 - [`agents/`](./agents): tracked portable agent profile templates (not runtime homes).
 - [`scripts/`](./scripts): install + smoke + deploy helpers.
 
@@ -111,6 +112,7 @@ Acceptable: prep VERSION + CHANGELOG drafts, run codex-rescue review on a releas
 - `BRIDGE_HOME` — override live runtime root; essential for isolated tests.
 - `AGENT_BRIDGE_SOURCE_DIR` — tell the upgrader where the source checkout is when it's not at `~/.agent-bridge-source`.
 - `BRIDGE_ROSTER_FILE`, `BRIDGE_ROSTER_LOCAL_FILE`, `BRIDGE_STATE_DIR`, `BRIDGE_TASK_DB`, `BRIDGE_WORKTREE_ROOT`, `BRIDGE_CRON_STATE_DIR`.
+- A2A: `BRIDGE_A2A_CONFIG` (override `handoff.local.json` path), `BRIDGE_A2A_TAILSCALE_CLI` (explicit `tailscale` binary path), `BRIDGE_A2A_OUTBOX_DB` / `BRIDGE_A2A_INBOX_DB`, `BRIDGE_A2A_ALLOW_TEST_BIND` (loopback test bind — never in production).
 
 ## High-Risk Areas (edit with care)
 
@@ -119,6 +121,7 @@ Acceptable: prep VERSION + CHANGELOG drafts, run codex-rescue review on a releas
 3. **Upgrade path (`bridge-upgrade.sh`, `bridge-upgrade.py`, `scripts/deploy-live-install.sh`)** — must preserve `state/`, `logs/`, `shared/`, local roster, and live agent homes. The upgrader must also tolerate non-standard source-checkout paths.
 4. **Worktree isolation (`state/worktrees/`, `~/.agent-bridge/worktrees/<repo>/<agent>`)** — getting this wrong can corrupt a shared repo or run an agent against the wrong branch.
 5. **Hooks / tool policy / prompt guard (`hooks/`, `bridge-hooks.py`, `bridge-guard.py`)** — containment/audit layer, not a sandbox. Changes here affect every Claude session's settings.
+6. **A2A receiver (`bridge-handoffd.py`, `bridge_a2a_common.py`)** — the only component that handles untrusted *remote* traffic. The fail-closed tailnet bind, HMAC verification, `remote_addr` check, allowlist, and dedupe are security-critical; never weaken the bind proof or expose `--skip-companion-validate` to remote peers.
 
 ## Platform Notes
 

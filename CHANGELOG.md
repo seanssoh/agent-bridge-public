@@ -36,6 +36,15 @@ re-cut a second time to fold in two further bug-class issues (#1031, #679) — s
 the "Re-cut round 2" subsection below. The tag and prerelease move again to the
 round-2 release commit.
 
+**Re-cut round 3 (2026-05-22):** still before any download, `v0.14.5-beta4`
+was re-cut a third time to fold in the **A2A cross-bridge task handoff**
+feature (#1032) plus a macOS portability fix found while validating it
+(#1037) — see the "Re-cut round 3" subsection below. This round adds a new
+feature, so the "No new features" note above applies to the first cut and
+re-cut rounds 1–2 only. A2A was rigorously validated across a macOS VM and a
+Linux VM over real Tailscale before this fold-in. The tag and prerelease move
+again to the round-3 release commit.
+
 ### Re-cut — verification follow-ups (2026-05-22)
 
 - **Isolated `agent create` no longer aborts** (#1025) — the isolation-v2
@@ -86,6 +95,40 @@ The #1010 isolated-agent reap path exercises destructive `userdel` / `setfacl` /
 `groupdel`; CI and review verified the gating *decision* (Linux-only, exact
 generated-user match). The live destructive path still warrants a Linux-host
 spot check before stable `v0.14.5`.
+
+### Re-cut round 3 — A2A cross-bridge task handoff (2026-05-22)
+
+`v0.14.5-beta4` was re-cut a third time (still before any download) to fold in
+the A2A feature and its verification follow-up. Both PRs were codex
+pair-reviewed.
+
+- **A2A cross-bridge task handoff** (#1032, PR #1035) — an agent on one Agent
+  Bridge install can enqueue a task directly into another install's inbox
+  queue, replacing the manual copy-paste / ssh relay. A direct-mesh push
+  gateway over a Tailscale tailnet: each install runs an HMAC-authenticated
+  receiver daemon (`bridge-handoffd.py`) bound to a tailnet IP only — failing
+  closed on a wildcard/loopback bind or an address it cannot prove against
+  `tailscale ip` — plus a durable SQLite sender outbox with retry/backoff and
+  `message_id` dedupe. New CLI surface `agb a2a
+  send|outbox|inbox-dedupe|peers|deliver|daemon`; data-only, git-ignored,
+  mode-0600 config `handoff.local.json`. New modules `bridge-handoffd.py`,
+  `bridge-a2a.py`, `bridge_a2a_common.py`, `bridge-handoff-daemon.sh`,
+  `lib/bridge-a2a.sh`. See `docs/a2a-cross-bridge.md`.
+- **A2A receiver locates the `tailscale` CLI outside `PATH`** (#1037) — the
+  receiver preflight resolved `tailscale` via `PATH` only, so a daemon started
+  from cron/launchd/systemd on a macOS host with Homebrew-installed Tailscale
+  failed closed even though Tailscale was installed and up. Discovery now
+  probes `PATH` then well-known install locations (`/opt/homebrew/bin`,
+  `/usr/local/bin`, the macOS app bundle, `/usr/bin`);
+  `BRIDGE_A2A_TAILSCALE_CLI` overrides. The fail-closed contract — exact
+  membership in `tailscale ip` output, no CIDR-shape guessing — is unchanged.
+
+A2A was validated on `agb-mac-seq` (macOS Sequoia) ↔ `agb-test` (Oracle Linux
+9) over real Tailscale — happy-path handoff both directions, allowlist
+rejection, HMAC auth failure, body-size cap, dedupe idempotency + hash
+conflict, receiver-down → outbox-retry → recovery, daemon lifecycle, secret
+rotation overlap, fail-closed wildcard/loopback bind, clock-skew rejection,
+and `remote_addr` enforcement: 12/12 pass, no secret leakage in audit logs.
 
 ### Operator-visible
 
