@@ -6,12 +6,14 @@
 4. Copy the Tenant ID.
 5. Add the bot to Teams and send it one message from the intended user.
 6. Use the Teams AAD object ID or Teams user ID as `--allow-from`.
-7. Run Agent Bridge setup:
+7. Run Agent Bridge setup. Pass the client secret via the
+   `BRIDGE_TEAMS_APP_PASSWORD` environment variable (or `--app-password-file
+   <path>`) so it is not exposed in shell history or the process table:
 
 ```bash
+export BRIDGE_TEAMS_APP_PASSWORD='<client-secret>'
 agb setup teams patch \
   --app-id "<app-id>" \
-  --app-password "<client-secret>" \
   --tenant-id "<tenant-id>" \
   --allow-from "<aad-object-id-or-user-id>" \
   --yes
@@ -20,9 +22,9 @@ agb setup teams patch \
 For team channels, also add a conversation/channel id:
 
 ```bash
+export BRIDGE_TEAMS_APP_PASSWORD='<client-secret>'
 agb setup teams patch \
   --app-id "<app-id>" \
-  --app-password "<client-secret>" \
   --tenant-id "<tenant-id>" \
   --conversation "<teams-conversation-or-channel-id>" \
   --require-mention \

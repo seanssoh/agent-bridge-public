@@ -6270,7 +6270,7 @@ bridge_agent_channel_setup_guidance() {
     printf "\nRun: %s setup telegram %s --token <TELEGRAM_BOT_TOKEN> --allow-from <TELEGRAM_USER_ID> --default-chat <TELEGRAM_CHAT_ID>" "$cli" "$agent"
   fi
   if bridge_channel_csv_contains "$required" "plugin:teams"; then
-    printf "\nRun: %s setup teams %s --app-id <TEAMS_APP_ID> --app-password <TEAMS_APP_PASSWORD> --allow-from <TEAMS_USER_ID>" "$cli" "$agent"
+    printf "\nRun: BRIDGE_TEAMS_APP_PASSWORD=<TEAMS_APP_PASSWORD> %s setup teams %s --app-id <TEAMS_APP_ID> --allow-from <TEAMS_USER_ID>" "$cli" "$agent"
   fi
   if bridge_channel_csv_contains "$required" "plugin:mattermost"; then
     printf "\nRun: %s setup mattermost %s --url <MATTERMOST_URL> --bot-token <BOT_TOKEN> --allow-from <USER_ID>" "$cli" "$agent"

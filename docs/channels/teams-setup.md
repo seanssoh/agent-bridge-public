@@ -51,10 +51,14 @@ Persist it with your distro's normal iptables save path if needed.
 
 ## Recommended Setup Command
 
+Pass the client secret via the `BRIDGE_TEAMS_APP_PASSWORD` environment variable
+(or `--app-password-file <path>`) so it is not exposed in shell history or the
+process table.
+
 ```bash
+export BRIDGE_TEAMS_APP_PASSWORD='<client-secret>'
 agb setup teams patch \
   --app-id "<azure-bot-app-id>" \
-  --app-password "<client-secret>" \
   --tenant-id "<tenant-id>" \
   --allow-from "<aad-object-id-or-teams-user-id>" \
   --messaging-endpoint "https://bot.example.com/api/messages" \

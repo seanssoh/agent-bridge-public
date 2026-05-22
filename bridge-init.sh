@@ -16,7 +16,10 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 _BRIDGE_INIT_BYPASS_NONCE="$(date -u '+%Y%m%dT%H%M%SZ')-$$-${RANDOM}${RANDOM}"
 export BRIDGE_LAYOUT_RESOLVER_BYPASS="fresh-install:${_BRIDGE_INIT_BYPASS_NONCE}"
 export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
-trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
+# A staged channel-secret temp file (see bridge_init_stage_secret); removed on
+# exit so a legacy --teams-app-password value never outlives this process.
+_BRIDGE_INIT_SECRET_TMPFILE=""
+trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID; [[ -n "${_BRIDGE_INIT_SECRET_TMPFILE:-}" ]] && rm -f "$_BRIDGE_INIT_SECRET_TMPFILE"' EXIT
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 # shellcheck source=lib/bridge-host-profile.sh
@@ -34,7 +37,11 @@ source "$SCRIPT_DIR/lib/bridge-init-codex-pair.sh"
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") [--admin <agent>] [--engine claude|codex] [--session <name>] [--workdir <path>] [--user <id[:display-name]>]... [--channels <csv>] [--discord-channel <id>]... [--allow-from <id>]... [--default-chat <id>] [--teams-app-id <id>] [--teams-app-password <secret>] [--teams-tenant-id <id>] [--teams-allow-from <id>]... [--teams-conversation <id>]... [--channel-account <account>] [--runtime-config <path>] [--api-base-url <url>] [--profile server|dev] [--reconfigure] [--skip-validate] [--skip-send-test] [--skip-channel-setup] [--test-start] [--dry-run] [--json]
+  $(basename "$0") [--admin <agent>] [--engine claude|codex] [--session <name>] [--workdir <path>] [--user <id[:display-name]>]... [--channels <csv>] [--discord-channel <id>]... [--allow-from <id>]... [--default-chat <id>] [--teams-app-id <id>] [--teams-app-password-file <path>] [--teams-tenant-id <id>] [--teams-allow-from <id>]... [--teams-conversation <id>]... [--channel-account <account>] [--runtime-config <path>] [--api-base-url <url>] [--profile server|dev] [--reconfigure] [--skip-validate] [--skip-send-test] [--skip-channel-setup] [--test-start] [--dry-run] [--json]
+
+  The Teams client secret may also be supplied via the BRIDGE_TEAMS_APP_PASSWORD
+  environment variable. --teams-app-password <secret> is still accepted but
+  deprecated: it exposes the secret in shell history and process argv.
 
 Examples:
   $(basename "$0") --admin patch --engine claude --channels plugin:telegram@claude-plugins-official --allow-from 123456789 --default-chat 123456789 --channel-account default
@@ -88,6 +95,22 @@ PY
 bridge_init_require_command() {
   local cmd="$1"
   command -v "$cmd" >/dev/null 2>&1 || bridge_die "필수 명령을 찾지 못했습니다: $cmd"
+}
+
+bridge_init_stage_secret() {
+  # Stage a secret value into a private (mode 600) temp file so it can be
+  # forwarded downstream by path — a path is safe in argv, the secret is not.
+  # Assigns _BRIDGE_INIT_SECRET_TMPFILE immediately after mktemp — before the
+  # chmod/write steps — so the EXIT trap can still remove the file if a later
+  # step fails. MUST NOT be called in a command substitution: it sets a global
+  # (a subshell assignment would not survive). Only one staged secret per run.
+  local value="$1"
+  local tmpfile
+  tmpfile="$(mktemp "${TMPDIR:-/tmp}/bridge-init-secret.XXXXXX")" \
+    || bridge_die "비밀 값을 임시 파일로 옮기지 못했습니다"
+  _BRIDGE_INIT_SECRET_TMPFILE="$tmpfile"
+  chmod 600 "$tmpfile"
+  printf '%s' "$value" >"$tmpfile"
 }
 
 bridge_init_runtime_present() {
@@ -197,7 +220,7 @@ discord_channels=()
 telegram_allow_from=()
 default_chat=""
 teams_app_id=""
-teams_app_password=""
+teams_app_password_file=""
 teams_tenant_id=""
 teams_service_url=""
 teams_allow_from=()
@@ -285,7 +308,22 @@ while [[ $# -gt 0 ]]; do
       ;;
     --teams-app-password)
       [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-      teams_app_password="$2"
+      bridge_warn "--teams-app-password는 셸 히스토리와 프로세스 argv에 client secret을 노출합니다. --teams-app-password-file <path> 또는 BRIDGE_TEAMS_APP_PASSWORD 환경변수를 사용하세요."
+      # Stage the secret out of argv immediately so it is never re-exposed
+      # in the bridge-setup.sh / bridge-setup.py argv downstream. A repeated
+      # flag replaces the prior staged file so no orphan outlives the trap,
+      # which only tracks the most recent _BRIDGE_INIT_SECRET_TMPFILE.
+      # bridge_init_stage_secret sets _BRIDGE_INIT_SECRET_TMPFILE directly
+      # (not via $() — see its comment) so the trap sees the path even if a
+      # later staging step fails.
+      [[ -n "$_BRIDGE_INIT_SECRET_TMPFILE" ]] && rm -f "$_BRIDGE_INIT_SECRET_TMPFILE"
+      bridge_init_stage_secret "$2"
+      teams_app_password_file="$_BRIDGE_INIT_SECRET_TMPFILE"
+      shift 2
+      ;;
+    --teams-app-password-file)
+      [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+      teams_app_password_file="$2"
       shift 2
       ;;
     --teams-tenant-id)
@@ -641,7 +679,7 @@ if [[ $skip_channel_setup -eq 0 ]] && [[ $dry_run -eq 0 ]]; then
     fi
   fi
   if bridge_channel_csv_contains "$channels" "plugin:teams"; then
-    if ((${#teams_allow_from[@]} > 0)) || ((${#teams_conversations[@]} > 0)) || [[ -n "$channel_account" ]] || [[ -n "$teams_app_id" && -n "$teams_app_password" ]] || bridge_init_runtime_present teams "$admin_agent"; then
+    if ((${#teams_allow_from[@]} > 0)) || ((${#teams_conversations[@]} > 0)) || [[ -n "$channel_account" ]] || { [[ -n "$teams_app_id" ]] && { [[ -n "$teams_app_password_file" ]] || [[ -n "${BRIDGE_TEAMS_APP_PASSWORD:-}" ]]; }; } || bridge_init_runtime_present teams "$admin_agent"; then
       setup_args=(teams "$admin_agent")
       for item in "${teams_allow_from[@]}"; do
         setup_args+=(--allow-from "$item")
@@ -650,7 +688,9 @@ if [[ $skip_channel_setup -eq 0 ]] && [[ $dry_run -eq 0 ]]; then
         setup_args+=(--conversation "$item")
       done
       [[ -n "$teams_app_id" ]] && setup_args+=(--app-id "$teams_app_id")
-      [[ -n "$teams_app_password" ]] && setup_args+=(--app-password "$teams_app_password")
+      # Forward the client secret by path only — BRIDGE_TEAMS_APP_PASSWORD, if
+      # set, is inherited by the bridge-setup.sh child without appearing in argv.
+      [[ -n "$teams_app_password_file" ]] && setup_args+=(--app-password-file "$teams_app_password_file")
       [[ -n "$teams_tenant_id" ]] && setup_args+=(--tenant-id "$teams_tenant_id")
       [[ -n "$teams_service_url" ]] && setup_args+=(--service-url "$teams_service_url")
       [[ -n "$channel_account" ]] && setup_args+=(--channel-account "$channel_account")

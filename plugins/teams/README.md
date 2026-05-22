@@ -58,7 +58,7 @@ For the full operator guide, including ALB / nginx / iptables paths and setup va
 Agent Bridge writes this file through:
 
 ```bash
-agb setup teams <agent> --app-id ... --app-password ... --tenant-id ... --allow-from ... --messaging-endpoint https://bot.example.com/api/messages --webhook-host 0.0.0.0
+BRIDGE_TEAMS_APP_PASSWORD=... agb setup teams <agent> --app-id ... --tenant-id ... --allow-from ... --messaging-endpoint https://bot.example.com/api/messages --webhook-host 0.0.0.0
 ```
 
 ## Inbound Attachments

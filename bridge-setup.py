@@ -622,6 +622,33 @@ def load_claude_plugin_channel_token(kind: str) -> str:
     return extract_token_from_text(env_path.read_text(encoding="utf-8"), kind)
 
 
+def read_secret_value(flag_value: str, flag_name: str, file_path: str, env_name: str) -> str:
+    """Resolve a channel secret without requiring it on the command line.
+
+    Precedence: a `--<name>-file <path>` (a path is safe to pass in argv) wins,
+    then the env var, then the legacy `--<name> <secret>` flag. Passing the
+    secret as a bare argv value still works for compatibility but emits a
+    one-line warning, since it then lands in shell history and the process
+    table (`ps`, `/proc/<pid>/cmdline`).
+    """
+    if file_path:
+        path = Path(file_path).expanduser()
+        if not path.is_file():
+            raise SetupError(f"Secret file not found: {file_path}")
+        return path.read_text(encoding="utf-8").strip()
+    env_value = os.environ.get(env_name, "").strip()
+    if env_value:
+        return env_value
+    flag_value = str(flag_value or "").strip()
+    if flag_value:
+        print(
+            f"[warn] {flag_name} exposes the secret in shell history and process "
+            f"argv; prefer {flag_name}-file <path> or the {env_name} env var.",
+            file=sys.stderr,
+        )
+    return flag_value
+
+
 def candidate_channel_accounts(agent: str, accounts: dict[str, dict[str, Any]]) -> list[str]:
     candidates = [agent]
     if "-" in agent:
@@ -1393,8 +1420,14 @@ def cmd_teams(args: argparse.Namespace) -> int:
                     credential_source = f"channel:{choice}"
 
         app_id = str(args.app_id or account_cfg.get("appId") or account_cfg.get("app_id") or inspected["app_id"]).strip()
+        app_password_arg = read_secret_value(
+            flag_value=args.app_password,
+            flag_name="--app-password",
+            file_path=args.app_password_file,
+            env_name="BRIDGE_TEAMS_APP_PASSWORD",
+        )
         app_password = str(
-            args.app_password
+            app_password_arg
             or account_cfg.get("appPassword")
             or account_cfg.get("app_password")
             or account_cfg.get("clientSecret")
@@ -1414,7 +1447,7 @@ def cmd_teams(args: argparse.Namespace) -> int:
         messaging_endpoint = str(args.messaging_endpoint or "").strip()
 
         if not credential_source:
-            if args.app_id or args.app_password or args.tenant_id:
+            if args.app_id or app_password_arg or args.tenant_id:
                 credential_source = "flag"
             elif inspected["app_id"] or inspected["app_password"]:
                 credential_source = "existing:.teams/.env"
@@ -1440,7 +1473,7 @@ def cmd_teams(args: argparse.Namespace) -> int:
             ingress_port = prompt_text("Optional reverse proxy/backend target port", ingress_port)
 
         if not app_id or not app_password:
-            raise SetupError("Teams app id and app password are required. Pass --app-id/--app-password, --channel-account, or run in an interactive TTY.")
+            raise SetupError("Teams app id and app password are required. Pass --app-id and one of --app-password-file/BRIDGE_TEAMS_APP_PASSWORD/--app-password, or --channel-account, or run in an interactive TTY.")
         if not re.fullmatch(r"\d{2,5}", webhook_port):
             raise SetupError(f"Webhook port must be a TCP port number: {webhook_port}")
         if ingress_port and not re.fullmatch(r"\d{2,5}", ingress_port):
@@ -1833,6 +1866,7 @@ def build_parser() -> argparse.ArgumentParser:
     teams_parser.add_argument("--channel-account")
     teams_parser.add_argument("--app-id", default="")
     teams_parser.add_argument("--app-password", default="")
+    teams_parser.add_argument("--app-password-file", default="")
     teams_parser.add_argument("--tenant-id", default="")
     teams_parser.add_argument("--service-url", default="")
     teams_parser.add_argument("--messaging-endpoint", default="")
