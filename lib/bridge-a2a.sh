@@ -92,15 +92,49 @@ bridge_a2a_receiver_start() {
     return 1
   fi
 
+  # Stale pid file from a previous (now-dead) receiver would otherwise let
+  # the new launch's success check pass against the old pid.
+  rm -f "$pid_file"
+
+  # `serve --detach` double-forks into its own session AFTER the socket
+  # bind, so the receiver is reparented out of this shell's process group
+  # and survives the launching (managed agent) shell exiting. A bare
+  # `nohup ... &` did not detach from the process group, so the listener
+  # could be torn down with the tool session — issue #1043. The detached
+  # grandchild owns the pid file, so the recorded pid is the durable
+  # listener rather than a transient launcher pid.
   nohup python3 "$repo_root/bridge-handoffd.py" serve --config "$config" \
+    --detach --pidfile "$pid_file" \
     >>"$log_file" 2>&1 &
-  local pid=$!
-  printf '%s\n' "$pid" >"$pid_file"
-  # Give the process a beat to fail-closed on bind; if it died, report it.
-  sleep 1
-  if ! kill -0 "$pid" 2>/dev/null; then
+  local launcher_pid=$!
+  # The launcher process exits 0 once the detached child is running; if the
+  # bind failed closed, it exits non-zero before any detach. Guard the wait
+  # so a non-zero exit does not trip the caller's `set -e`.
+  local launcher_rc=0
+  wait "$launcher_pid" || launcher_rc=$?
+  if (( launcher_rc != 0 )); then
     rm -f "$pid_file"
-    echo "[a2a][error] receiver exited immediately; see $log_file" >&2
+    echo "[a2a][error] receiver failed to start (exit $launcher_rc); see $log_file" >&2
+    return 1
+  fi
+
+  # Wait for the detached child to publish its pid, then verify it is a
+  # live process — this confirms a durable listener, not a false success.
+  local waited=0 pid=""
+  while (( waited < 10 )); do
+    if [[ -f "$pid_file" ]]; then
+      pid="$(cat "$pid_file" 2>/dev/null || true)"
+      if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        break
+      fi
+    fi
+    sleep 1
+    waited=$((waited + 1))
+    pid=""
+  done
+  if [[ -z "$pid" ]]; then
+    rm -f "$pid_file"
+    echo "[a2a][error] receiver did not come up durably; see $log_file" >&2
     return 1
   fi
   echo "[a2a] receiver started (pid $pid); log: $log_file"

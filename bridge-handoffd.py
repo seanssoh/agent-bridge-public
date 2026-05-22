@@ -16,6 +16,7 @@ local Tailscale address set.
 
 Usage:
   bridge-handoffd.py serve   --config <path>   [--once]
+                             [--detach --pidfile <path>]
   bridge-handoffd.py preflight --config <path>   # validate bind, exit
 """
 
@@ -635,6 +636,41 @@ def cmd_preflight(args: argparse.Namespace) -> int:
     return 0
 
 
+def _write_pidfile(path: str) -> None:
+    """Record the calling process's pid to `path` (atomic replace)."""
+    pid_path = Path(path)
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = pid_path.with_suffix(pid_path.suffix + f".{os.getpid()}.tmp")
+    tmp.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    os.replace(tmp, pid_path)
+
+
+def _detach_into_own_session() -> None:
+    """Reparent the current process into its own session + process group.
+
+    After this returns, the process is a session leader detached from the
+    launching shell's controlling terminal and process group, so it is NOT
+    torn down when that shell / managed agent tool session exits. Uses the
+    POSIX double-fork idiom, which is portable across macOS and Linux (no
+    dependency on the `setsid` CLI, which macOS lacks). The socket is bound
+    BEFORE this is called, so a fail-closed bind error is still surfaced
+    synchronously to the launcher.
+    """
+    if os.fork() > 0:
+        os._exit(0)  # original launcher process exits; shell regains control
+    os.setsid()  # become session + process-group leader, drop controlling tty
+    if os.fork() > 0:
+        os._exit(0)  # intermediate exits so the daemon cannot reacquire a tty
+    # Grandchild: detach stdin from the terminal; stdout/stderr stay pointed
+    # at the caller-provided log redirection.
+    try:
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull, 0)
+        os.close(devnull)
+    except OSError:
+        pass
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     try:
         cfg = a2a.load_config(Path(args.config) if args.config else None)
@@ -652,8 +688,25 @@ def cmd_serve(args: argparse.Namespace) -> int:
         audit("bind_fail", address=bind, port=port, detail=str(exc))
         return 1
 
+    # Bind succeeded — fail-closed preflight is satisfied. Now (optionally)
+    # detach into our own session so the receiver outlives the launching
+    # shell / managed agent tool session. The double-fork happens AFTER the
+    # bind so the launcher still sees a non-zero exit on a bad bind.
+    if getattr(args, "detach", False):
+        _detach_into_own_session()
+    if getattr(args, "pidfile", None):
+        # Written by whichever process owns the long-lived server (the
+        # detached grandchild when --detach is set), so the recorded pid is
+        # the durable listener, not a transient launcher pid.
+        try:
+            _write_pidfile(args.pidfile)
+        except OSError as exc:
+            log(f"FATAL: cannot write pidfile {args.pidfile}: {exc}")
+            server.server_close()
+            return 1
+
     audit("listening", address=bind, port=port,
-          peers=len(cfg.get("peers", [])))
+          peers=len(cfg.get("peers", [])), pid=os.getpid())
     log(f"A2A receiver listening on {bind}:{port}")
     try:
         if args.once:
@@ -664,6 +717,13 @@ def cmd_serve(args: argparse.Namespace) -> int:
         log("interrupted")
     finally:
         server.server_close()
+        if getattr(args, "pidfile", None):
+            try:
+                pid_path = Path(args.pidfile)
+                if pid_path.read_text(encoding="utf-8").strip() == str(os.getpid()):
+                    pid_path.unlink()
+            except (OSError, ValueError):
+                pass
         audit("stopped")
     return 0
 
@@ -680,6 +740,11 @@ def build_parser() -> argparse.ArgumentParser:
                          help="path to handoff.local.json")
     p_serve.add_argument("--once", action="store_true",
                          help="handle a single request then exit (test mode)")
+    p_serve.add_argument("--detach", action="store_true",
+                         help="double-fork into an own session after bind, so "
+                              "the receiver outlives the launching shell")
+    p_serve.add_argument("--pidfile", default=None,
+                         help="write the durable listener's pid to this path")
     p_serve.set_defaults(func=cmd_serve)
 
     p_pre = sub.add_parser("preflight", help="validate bind + config, then exit")
