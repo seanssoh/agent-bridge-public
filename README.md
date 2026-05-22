@@ -332,12 +332,12 @@ Tenant ID는 [tenant id]야.
 허용할 Teams 사용자 ID 또는 AAD object ID는 [user id]야.
 ```
 
-직접 실행할 때는 production bring-up 명령을 권장합니다 (messaging endpoint + webhook ingress 까지 포함):
+직접 실행할 때는 production bring-up 명령을 권장합니다 (messaging endpoint + webhook ingress 까지 포함). client secret은 셸 히스토리·프로세스 argv 노출을 피하려고 `BRIDGE_TEAMS_APP_PASSWORD` 환경변수(또는 `--app-password-file <path>`)로 전달합니다:
 
 ```bash
+export BRIDGE_TEAMS_APP_PASSWORD='<client-secret>'
 agb setup teams patch \
   --app-id "<azure-bot-app-id>" \
-  --app-password "<client-secret>" \
   --tenant-id "<tenant-id>" \
   --allow-from "<aad-object-id-or-teams-user-id>" \
   --messaging-endpoint "https://<your-domain>/api/messages" \
@@ -392,7 +392,7 @@ claude plugin enable --scope user telegram@claude-plugins-official
 ```bash
 agb setup discord <agent> --token <DISCORD_BOT_TOKEN> --channel <DISCORD_CHANNEL_ID>
 agb setup telegram <agent> --token <TELEGRAM_BOT_TOKEN> --allow-from <TELEGRAM_USER_ID> --default-chat <TELEGRAM_CHAT_ID>
-agb setup teams <agent> --app-id <TEAMS_APP_ID> --app-password <TEAMS_APP_PASSWORD> --tenant-id <TEAMS_TENANT_ID> --allow-from <TEAMS_USER_ID>
+BRIDGE_TEAMS_APP_PASSWORD=<TEAMS_APP_PASSWORD> agb setup teams <agent> --app-id <TEAMS_APP_ID> --tenant-id <TEAMS_TENANT_ID> --allow-from <TEAMS_USER_ID>
 ```
 
 참고: `claude mcp list`를 Agent Bridge 밖에서 실행하면 Claude Code의 기본 전역 경로(`~/.claude/channels/...`)를 기준으로 실패가 보일 수 있습니다. Agent Bridge가 실제로 쓰는 기준은 위의 에이전트별 state dir입니다. 검증은 `agb agent show <agent>`에서 `channel_diagnostics`를 보거나, `agb agent start <agent> --dry-run`, `agb status`로 확인하세요.

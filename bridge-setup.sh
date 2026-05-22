@@ -13,7 +13,7 @@ usage() {
 Usage:
   $(basename "$0") discord <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--channel <id>]... [--allow-from <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
-  $(basename "$0") teams <agent> [--app-id <id>] [--app-password <secret>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start] [setup options...]
   $(basename "$0") admin <agent>
 
@@ -46,7 +46,7 @@ EOF
     teams)
       cat <<EOF
 Usage:
-  $(basename "$0") teams <agent> [--app-id <id>] [--app-password <secret>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
 EOF
       ;;
     agent)
@@ -617,7 +617,7 @@ run_teams() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --app-id|--app-password|--tenant-id|--service-url|--messaging-endpoint|--webhook-host|--webhook-port|--ingress-port|--channel-account|--runtime-config|--allow-from|--conversation)
+      --app-id|--app-password|--app-password-file|--tenant-id|--service-url|--messaging-endpoint|--webhook-host|--webhook-port|--ingress-port|--channel-account|--runtime-config|--allow-from|--conversation)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
         if [[ "$1" == "--channel-account" ]]; then
           channel_account="$2"
@@ -748,7 +748,7 @@ run_agent() {
         telegram_args+=("$1" "$2")
         shift 2
         ;;
-      --conversation|--app-id|--app-password|--tenant-id|--service-url|--messaging-endpoint|--webhook-host|--webhook-port|--ingress-port)
+      --conversation|--app-id|--app-password|--app-password-file|--tenant-id|--service-url|--messaging-endpoint|--webhook-host|--webhook-port|--ingress-port)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
         teams_args+=("$1" "$2")
         shift 2
