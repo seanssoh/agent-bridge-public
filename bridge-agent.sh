@@ -2641,6 +2641,24 @@ report and reap test-fixture agents per their pattern."
     fi
   fi
 
+  # Issue #1047: caller-trust gating. `agent create` writes a managed-role
+  # block to agent-roster.local.sh — the same protected system-config file
+  # `agent update` / `agent delete` mutate. Those verbs reject an
+  # `agent-direct` caller via bridge_agent_update_caller_source(); `create`
+  # used to be ungated, an incoherent split privilege boundary (an agent
+  # process could add a roster entry but not remove or modify one). Gate
+  # `create` on the SAME single caller-source contract: the source must be
+  # operator-tui / operator-trusted-id (a TTY-detected operator, or a
+  # sanctioned non-interactive caller that sets BRIDGE_CALLER_SOURCE). An
+  # `agent-direct` caller is denied here just as it is for update/delete.
+  # Placed after name validation so a refused-name caller still gets the
+  # name-specific error; applies to --dry-run too, mirroring update/delete.
+  local create_caller_source
+  create_caller_source="$(bridge_agent_update_caller_source)"
+  if [[ "$create_caller_source" != "operator-tui" && "$create_caller_source" != "operator-trusted-id" ]]; then
+    bridge_die "deny: caller source $create_caller_source is not allowed to mutate system config (need operator-tui or operator-trusted-id)"
+  fi
+
   case "$engine" in
     claude|codex) ;;
     *) bridge_die "지원하지 않는 engine 입니다: $engine" ;;

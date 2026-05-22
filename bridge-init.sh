@@ -496,7 +496,13 @@ else
   if [[ $always_on -eq 1 ]]; then
     create_args+=(--always-on)
   fi
-  "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "${create_args[@]}" >/dev/null
+  # Issue #1047: `agent create` is now caller-trust gated and rejects an
+  # `agent-direct` source. This fresh-install admin create is an
+  # operator-initiated bootstrap step, but it runs as a subprocess with a
+  # redirected stdout so TTY detection would demote it to `agent-direct`.
+  # Mark it as a sanctioned operator-trusted caller so the gate allows it.
+  BRIDGE_CALLER_SOURCE="operator-trusted-id" \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "${create_args[@]}" >/dev/null
   created=1
   # Issue #848: the child `agent create` invocation mutated the roster
   # files on disk, so the next `bridge_load_roster` MUST re-parse them
