@@ -1853,19 +1853,20 @@ process_daily_backup() {
   # `IFS=$'\t' read` treats a tab as IFS *whitespace* — a run of adjacent
   # tabs (produced whenever a middle field such as error_detail is empty)
   # collapses to a single delimiter, shifting every later column left and
-  # landing free_bytes (~hundreds of GB) into pruned_count. Split on tab
-  # explicitly via `mapfile -d` so empty fields are preserved positionally.
-  local backup_fields=()
-  mapfile -t -d $'\t' backup_fields < <(printf '%s' "$parse_payload")
-  outcome="${backup_fields[0]:-}"
-  error_detail="${backup_fields[1]:-}"
-  archive_path="${backup_fields[2]:-}"
-  pruned_count="${backup_fields[3]:-0}"
-  free_bytes="${backup_fields[4]:-0}"
-  # The final field carries a trailing newline from the helper's print();
-  # strip it so needed_bytes stays a clean integer.
-  needed_bytes="${backup_fields[5]:-0}"
-  needed_bytes="${needed_bytes%$'\n'}"
+  # landing free_bytes (~hundreds of GB) into pruned_count. Extract each
+  # column with `cut -f`, which splits on a literal tab and preserves empty
+  # fields positionally. One `cut` per field on a once-per-daily-backup path
+  # is cheap, and avoids the process-substitution / here-string the
+  # CI heredoc-ban ratchet rejects.
+  outcome="$(printf '%s' "$parse_payload" | cut -f1)"
+  error_detail="$(printf '%s' "$parse_payload" | cut -f2)"
+  archive_path="$(printf '%s' "$parse_payload" | cut -f3)"
+  pruned_count="$(printf '%s' "$parse_payload" | cut -f4)"
+  free_bytes="$(printf '%s' "$parse_payload" | cut -f5)"
+  needed_bytes="$(printf '%s' "$parse_payload" | cut -f6)"
+  [[ -n "$pruned_count" ]] || pruned_count=0
+  [[ -n "$free_bytes" ]] || free_bytes=0
+  [[ -n "$needed_bytes" ]] || needed_bytes=0
 
   # Issue #1039: guard against an implausible pruned_count reaching state.env.
   # A daily-backup prune count is tiny (one archive per day, retained for a
