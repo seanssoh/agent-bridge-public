@@ -650,7 +650,20 @@ def _is_read_intent_bash(command: str) -> bool:
     # `2>/dev/null/extra` is a real write to a path under /dev/null/,
     # not a stderr discard, and must NOT be stripped (issue #574 r2).
     sanitized = _SAFE_REDIRECT_RE.sub(" ", command)
-    for stage in _COMMAND_OPERATOR_RE.split(sanitized):
+    # Split on shell operators with quote-awareness: a literal `|` / `;` /
+    # `&` inside a quoted argument (e.g. the alternation in `grep -nE
+    # 'format|codex' <path>`) must NOT start a new stage, or the read
+    # would be misclassified as write-intent (issue #1054). A genuine
+    # `... | tee <path>` still splits — the `tee` stage is unknown and
+    # disqualifies the command, so the guard is not weakened.
+    stages, balanced = _split_command_stages(sanitized)
+    # Fail closed on an unterminated quote: an unbalanced quote masks
+    # every operator after it, so a `... | tee <protected>` write would
+    # hide behind the open quote. An un-parseable command is never a safe
+    # read (issue #1054 codex r1).
+    if not balanced:
+        return False
+    for stage in stages:
         stage_stripped = stage.strip()
         if not stage_stripped:
             continue
@@ -954,6 +967,63 @@ _FILE_VALUED_FLAGS = frozenset(
 # We split each token on these operators so a trailing operator doesn't hide
 # a real path argv from the Path comparison below.
 _COMMAND_OPERATOR_RE = re.compile(r"&&|\|\||\||;|&|\n")
+
+
+def _split_command_stages(command: str) -> tuple[list[str], bool]:
+    """Split *command* into shell stages, ignoring operators inside quotes.
+
+    Returns ``(stages, balanced)``. ``balanced`` is ``False`` when the
+    string ends while still inside an unterminated single or double
+    quote — the command is not parseable as written.
+
+    A bare :func:`_COMMAND_OPERATOR_RE.split` is not shell-quote aware: a
+    literal operator character inside a single- or double-quoted argument
+    — most commonly the ``|`` in an extended-regex alternation such as
+    ``grep -nE 'format|codex' <path>`` — is torn into a spurious new
+    stage, whose leading token (``codex'``) is unknown, so a read-only
+    command is misclassified as write-intent (issue #1054).
+
+    This walks the string once, tracking single/double quote state, and
+    only honors an operator match that begins outside any quoted span.
+    Quoting semantics match POSIX shells: a single quote is literal (a
+    double quote inside it is not a quote), and vice versa; backslash
+    escaping is not modelled because the operator regex never matches a
+    backslash and an escaped quote inside the *other* quote style is
+    already inert. Genuine pipelines / separators outside quotes still
+    split exactly as before, so the guard is not weakened.
+
+    An *unbalanced* quote masks every operator after it (the parser stays
+    "inside" the quote to end-of-string), which would hide a real
+    ``| tee <protected>`` write. The caller must fail closed on
+    ``balanced=False`` — an un-parseable command is never a safe read
+    (issue #1054 codex r1).
+    """
+    stages: list[str] = []
+    start = 0
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        match = _COMMAND_OPERATOR_RE.match(command, i)
+        if match:
+            stages.append(command[start:i])
+            start = match.end()
+            i = match.end()
+            continue
+        i += 1
+    stages.append(command[start:])
+    return stages, quote is None
+
 
 # Redirection prefixes that can ride with the path token (`<file`, `>out`,
 # `2>err`, `&>log`, `>>append`). We peel the prefix before the expanduser /
