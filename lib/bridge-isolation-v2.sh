@@ -1442,16 +1442,23 @@ bridge_isolation_v2_matrix_rows_for_agent() {
   # (chown to nonexistent user/group), so write_agent_state_marker returns
   # 1, the idle-since marker never lands, and the always-on daemon
   # restart-loops the tmux session indefinitely.
-  local _v2_isolation_mode="linux-user"
+  # #1048: an indeterminate isolation_mode (the function undefined, a
+  # nonzero exit, or an empty/unknown value from a roster read that raced
+  # a concurrent typed-roster rewrite) must fall back to `shared`, NOT
+  # `linux-user`. The shared rows are group-less and reference no
+  # per-agent UID, so they apply cleanly on any install. The linux-user
+  # rows demand `ab-agent-<X>` / `agent-bridge-<X>` plumbing that a
+  # shared-only install never created — defaulting an indeterminate
+  # result there makes ensure_matrix_path fail on every state-marker
+  # write for a misclassified shared agent. Only an explicit
+  # `linux-user` selects the linux-user matrix.
+  local _v2_isolation_mode="shared"
   if command -v bridge_agent_isolation_mode >/dev/null 2>&1; then
-    _v2_isolation_mode="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || printf 'linux-user')"
+    _v2_isolation_mode="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || printf 'shared')"
   fi
-  # Anything outside the {shared, linux-user} pair (unknown / "") preserves
-  # the legacy linux-user matrix — defensive default for any roster entry
-  # that pre-dates the isolation_mode field.
   case "$_v2_isolation_mode" in
-    shared) ;;
-    *) _v2_isolation_mode="linux-user" ;;
+    linux-user) ;;
+    *) _v2_isolation_mode="shared" ;;
   esac
 
   # r2 P1 #1: defer agent_grp resolution until we know we're in linux-user
