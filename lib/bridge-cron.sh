@@ -607,10 +607,17 @@ bridge_cron_normalize_shell_run_artifacts() {
 }
 
 bridge_cron_run_dir_grant_isolation() {
-  # v2 hard-cut: the per-agent group + setgid contract on the per-agent
-  # root covers cron per-run dirs reachable by the isolated UID. No
-  # per-run-dir named-user ACL grant is applied. Retained as a no-op
-  # stub so callers (`dispatch_cron_run`) link cleanly.
+  # v2 isolation contract: the agent group (inherited via the setgid on the
+  # parent state/cron/runs/ dir) needs rwx so the isolated agent UID can
+  # traverse the run dir and write sidecar artifacts (e.g.
+  # authoritative-memory-daily.json). umask 077 in bridge-lib.sh strips all
+  # group bits at mkdir time, leaving drwx--S--- (2700). chmod 2770 here
+  # restores drwxrws--- so the isolated UID (which is in the group) can write.
+  # Shell payloads skip this call and use bridge_cron_normalize_shell_run_artifacts
+  # instead (chmod 0700 is intentional there — shell runner writes as controller).
+  local run_dir="$1"
+  [[ -n "$run_dir" && -d "$run_dir" ]] || return 0
+  chmod 2770 "$run_dir" 2>/dev/null || return 1
   return 0
 }
 
