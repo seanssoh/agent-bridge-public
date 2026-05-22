@@ -84,10 +84,18 @@ BRIDGE_SCRIPTS_ROOT="$REPO_ROOT/scripts"
 # returns empty stdout which the strict parser rejects, so the smoke
 # uses a tiny hermetic mock that returns a valid empty list and
 # fails non-zero for unrelated subcommands.
-BRIDGE_AGB="$REPO_ROOT/tests/wiki-daily-ingest/agb-mock.sh"
-chmod +x "$BRIDGE_AGB" 2>/dev/null || true
+#
+# Issue #1042: the mock must live *inside* the fixture BRIDGE_HOME — Lane B's
+# same-install guard (lane_b_same_install) refuses to enqueue a librarian
+# task when BRIDGE_AGB resolves outside BRIDGE_HOME (so a hermetic repro
+# cannot leak fixture-derived tasks into a different install's queue). A
+# real install always has its `agent-bridge` CLI under BRIDGE_HOME, so the
+# mock is installed at $BRIDGE_HOME/agent-bridge to mirror that layout.
 WIKI_WATERMARK_FILE="$BRIDGE_STATE_DIR/wiki/last-ingest.txt"
 mkdir -p "$BRIDGE_STATE_DIR" "$BRIDGE_AGENTS_ROOT" "$BRIDGE_WIKI_ROOT/_audit"
+BRIDGE_AGB="$BRIDGE_HOME/agent-bridge"
+cp "$REPO_ROOT/tests/wiki-daily-ingest/agb-mock.sh" "$BRIDGE_AGB"
+chmod +x "$BRIDGE_AGB" 2>/dev/null || true
 
 export BRIDGE_HOME BRIDGE_STATE_DIR BRIDGE_AGENTS_ROOT \
        BRIDGE_SHARED_ROOT BRIDGE_WIKI_ROOT BRIDGE_SCRIPTS_ROOT BRIDGE_AGB
@@ -806,6 +814,16 @@ export BRIDGE_DATA_ROOT="$BRIDGE_DATA_ROOT_FIXTURE"
 # passthrough must still produce exactly one [librarian-ingest] task — this
 # is the regression sentinel that proves the Track C filter does not
 # accidentally suppress task creation for non-isolated agents.
+#
+# Issue #1042: Lane B's librarian gate (lane_b_librarian_enabled) no-ops on a
+# dev host profile. Write an explicit `server` host-profile.json so this
+# enqueue-asserting scenario exercises the enabled path deterministically —
+# independent of whether the agb mock answers `cron list` (it does not, so
+# the gate's cron check stays permissive, but the profile is the load-bearing
+# signal and is made explicit here).
+mkdir -p "$BRIDGE_STATE_DIR/install"
+printf '{"profile":"server","set_at":"smoke","set_by":"smoke"}\n' \
+  >"$BRIDGE_STATE_DIR/install/host-profile.json"
 S12_TASK_LOG="$SMOKE_ROOT/s12.task-log"
 : >"$S12_TASK_LOG"
 export AGB_MOCK_TASK_LOG="$S12_TASK_LOG"

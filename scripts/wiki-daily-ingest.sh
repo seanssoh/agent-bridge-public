@@ -41,6 +41,27 @@ WIKI="$BRIDGE_WIKI_ROOT"
 SCRIPTS_ROOT="$BRIDGE_SCRIPTS_ROOT"
 DATE=$(date +%Y-%m-%d)
 
+# Source the host-profile helper so Lane B's librarian gate (issue #1042)
+# can call bridge_host_profile_is_dev() directly — that helper applies the
+# correct env-override semantics (BRIDGE_HOST_PROFILE=server is an explicit
+# not-dev that wins over a JSON file) and avoids reimplementing the JSON
+# read inline. bridge-host-profile.sh sources standalone (no loader chain).
+# Resolution: the lib lives one level up from scripts/ in a source checkout
+# and under $BRIDGE_HOME/lib in a deployed install; try both. If neither is
+# readable the gate falls back to a profile-agnostic check (see
+# lane_b_librarian_enabled).
+_WDI_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+for _wdi_hp_lib in \
+  "$_WDI_SCRIPT_DIR/../lib/bridge-host-profile.sh" \
+  "$BRIDGE_HOME/lib/bridge-host-profile.sh"; do
+  if [[ -r "$_wdi_hp_lib" ]]; then
+    # shellcheck source=../lib/bridge-host-profile.sh
+    source "$_wdi_hp_lib"
+    break
+  fi
+done
+unset _wdi_hp_lib
+
 # compute_since_date — resolve effective --since for Lane A.
 #
 # Reads the persisted watermark if it exists and parses as YYYY-MM-DD.
@@ -498,57 +519,33 @@ non_daily_total=$(( research_count + other_count + raw_count ))
 #     is permissive (returns 0) so a healthy server install whose cron list
 #     is briefly unavailable still ingests.
 lane_b_librarian_enabled() {
-  # Host-profile dev check — inline JSON read, mirrors
-  # bridge_host_profile_is_dev() without sourcing the full lib chain.
-  local hp_path=""
-  if [[ -n "${BRIDGE_HOST_PROFILE:-}" ]]; then
-    [[ "$BRIDGE_HOST_PROFILE" == "dev" ]] && return 1
-  fi
-  if [[ -f "$BRIDGE_HOME/state/install/host-profile.json" ]]; then
-    hp_path="$BRIDGE_HOME/state/install/host-profile.json"
-  elif [[ -f "$BRIDGE_STATE_DIR/install/host-profile.json" ]]; then
-    hp_path="$BRIDGE_STATE_DIR/install/host-profile.json"
-  fi
-  if [[ -n "$hp_path" ]] && command -v "$BRIDGE_PYTHON" >/dev/null 2>&1; then
-    local _profile
-    _profile="$("$BRIDGE_PYTHON" - "$hp_path" <<'PY' 2>/dev/null
-import json, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as fh:
-        data = json.load(fh)
-    p = data.get("profile", "")
-    if p in ("server", "dev"):
-        print(p)
-except Exception:
-    pass
-PY
-)"
-    [[ "$_profile" == "dev" ]] && return 1
+  # Host-profile dev check. Use the canonical helper bridge_host_profile_is_dev
+  # from lib/bridge-host-profile.sh (sourced at the top of this script) so the
+  # env-override semantics are correct: BRIDGE_HOST_PROFILE=server is an
+  # explicit not-dev that returns BEFORE any JSON file is read. When the lib
+  # could not be sourced (function undefined) the gate skips the profile check
+  # entirely and falls through to the cron-enablement check below — that keeps
+  # the gate profile-agnostic rather than guessing from a partial reimpl.
+  if declare -F bridge_host_profile_is_dev >/dev/null 2>&1; then
+    if bridge_host_profile_is_dev; then
+      return 1
+    fi
   fi
 
   # `wiki-daily-ingest` cron enablement check. A non-zero exit / missing
   # cron inventory is treated as permissive (do not block a server install
-  # whose cron list is momentarily unavailable).
+  # whose cron list is momentarily unavailable). The JSON is parsed by the
+  # standalone file-as-argv helper scripts/wiki-ingest-cron-enabled.py — a
+  # heredoc-stdin python3 invocation here would be a banned footgun-#11 site.
   local cron_json=""
   if ! cron_json="$("$BRIDGE_AGB" cron list --json 2>/dev/null)"; then
     return 0
   fi
   [[ -n "$cron_json" ]] || return 0
   command -v "$BRIDGE_PYTHON" >/dev/null 2>&1 || return 0
-  "$BRIDGE_PYTHON" - "$cron_json" <<'PY'
-import json, sys
-try:
-    data = json.loads(sys.argv[1])
-except Exception:
-    sys.exit(0)  # unparseable → permissive
-jobs = data.get("jobs", []) if isinstance(data, dict) else []
-for job in jobs:
-    if not isinstance(job, dict):
-        continue
-    if job.get("name") == "wiki-daily-ingest":
-        sys.exit(0 if job.get("enabled") else 1)
-sys.exit(0)  # cron not registered → permissive (pre-#1042 behaviour)
-PY
+  local _cron_helper="$_WDI_SCRIPT_DIR/wiki-ingest-cron-enabled.py"
+  [[ -r "$_cron_helper" ]] || return 0  # helper missing → permissive
+  "$BRIDGE_PYTHON" "$_cron_helper" "$cron_json"
 }
 
 # Gate 2 — same-install guard.
@@ -567,18 +564,14 @@ lane_b_same_install() {
   # Resolve the task DB path the same way bridge-queue.py does:
   #   BRIDGE_TASK_DB → BRIDGE_STATE_DIR/tasks.db → BRIDGE_HOME/state/tasks.db
   local task_db="${BRIDGE_TASK_DB:-$BRIDGE_STATE_DIR/tasks.db}"
-  "$BRIDGE_PYTHON" - "$BRIDGE_HOME" "$BRIDGE_AGB" "$task_db" "$BRIDGE_STATE_DIR" <<'PY'
-import os, sys
-home, agb, task_db, state_dir = sys.argv[1:5]
-def canon(p):
-    return os.path.realpath(os.path.abspath(os.path.expanduser(p)))
-home_c = canon(home)
-def under(p):
-    pc = canon(p)
-    return pc == home_c or pc.startswith(home_c + os.sep)
-# All three live-install anchors must resolve under $BRIDGE_HOME.
-sys.exit(0 if (under(agb) and under(task_db) and under(state_dir)) else 1)
-PY
+  # Path canonicalisation + prefix check runs in the standalone file-as-argv
+  # helper scripts/wiki-ingest-same-install.py — a heredoc-stdin python3
+  # invocation here would be a banned footgun-#11 site. Helper missing →
+  # fail closed (treat as cross-install) since the guard cannot be proven.
+  local _same_helper="$_WDI_SCRIPT_DIR/wiki-ingest-same-install.py"
+  [[ -r "$_same_helper" ]] || return 1
+  "$BRIDGE_PYTHON" "$_same_helper" \
+    "$BRIDGE_HOME" "$BRIDGE_AGB" "$task_db" "$BRIDGE_STATE_DIR"
 }
 
 # Queue librarian task only for non-daily work. Lane A already handled
