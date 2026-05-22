@@ -519,8 +519,8 @@ outbox. Full protocol + security model:
 `$BRIDGE_HOME/handoff.local.json`, fill in this bridge's `bridge_id`, the
 tailnet `listen` IP, and each `peers[]` entry (peer id, tailnet address,
 ordered-pair HMAC `secret`, `inbound_allowlist`), then `chmod 0600` it. The
-file carries peer secrets, is git-ignored, and the loader refuses any mode
-other than 0600.
+file carries peer secrets, is git-ignored, and the loader refuses it if any
+group/world permission bit is set — `0600` is the recommended mode.
 
 ```bash
 agb a2a daemon start|stop|restart|status|tick   # receiver daemon lifecycle
