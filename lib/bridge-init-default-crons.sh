@@ -2,16 +2,22 @@
 # shellcheck shell=bash
 # bridge-init-default-crons.sh — fresh-install default cron registrations.
 #
-# Track D follow-up to #713 / #809, follow-on to #833: a fresh install (server
-# OR dev) should not need an extra step to enable the essentials. picker-sweep
-# is the first essential we auto-register here. The helper is invoked from
-# bridge-init.sh AFTER bridge_host_profile_run returns. Registration is
-# unconditional with respect to host_profile — the registered cron payload
-# sets BRIDGE_PICKER_SWEEP_ENABLED=1, which overrides the runtime
-# host_profile=dev default-skip in scripts/picker-sweep.sh. Operators who
-# want the sweep disabled can `agb cron update picker-sweep --disable` after
-# init. The helper is intentionally idempotent: re-running init must not
-# double-register.
+# Track D follow-up to #713 / #809, follow-on to #833: a fresh install should
+# not need an extra step to enable the essentials. picker-sweep is the first
+# essential we auto-register here. The helper is invoked from bridge-init.sh
+# AFTER bridge_host_profile_run returns. Registration is GATED on the cron
+# target `<admin>-dev` existing in the roster (see the function-level comment
+# below): after issue #1052 that pair is auto-provisioned at install time only
+# on a `server` host with the codex CLI present, so a server+codex install
+# registers the sweep in the same init run. A `dev` install (admin-only by
+# design) or a codex-absent host has no `<admin>-dev` pair and the helper logs
+# a skip until the operator creates the pair (or a server host re-runs
+# bridge-bootstrap.sh). Once registered, the cron payload sets
+# BRIDGE_PICKER_SWEEP_ENABLED=1, which overrides the runtime host_profile=dev
+# default-skip in scripts/picker-sweep.sh so the sweep still runs on a dev
+# host that has the pair. Operators who want the sweep disabled can
+# `agb cron update picker-sweep --disable` after init. The helper is
+# intentionally idempotent: re-running init must not double-register.
 #
 # Future essentials (e.g. additional unstick / hygiene crons) belong here too;
 # keep each registration in its own function so re-runs can be reasoned about

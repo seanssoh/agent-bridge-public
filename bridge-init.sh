@@ -536,14 +536,16 @@ fi
 
 # Issue #713 follow-up: ask the operator whether this is a server (always-on
 # production host) or a developer PC, then let the dev branch short-circuit the
-# heavy server-only setup that follows. Must run AFTER the admin agent and its
-# codex pair exist (the dev advisory references them by id) but BEFORE channel
-# bootstrap so a `dev` answer skips Discord/Telegram/Teams/Mattermost setup
-# entirely instead of forcing the operator to confirm or `--skip-channel-setup`
-# every flag. Re-running init on an already-answered host is idempotent unless
-# `--reconfigure` is passed; non-interactive (`--json`, no TTY) defaults to
-# `server` to preserve today's behavior on hosted installs. Skipped on
-# `--dry-run` (mutation-free contract).
+# heavy server-only setup that follows. Must run AFTER the admin agent exists
+# (the dev advisory references the admin and the `<admin>-dev` pair by id only
+# — it does not require the pair to exist; issue #1052 provisions the codex
+# pair LATER, just below, gated on the host_profile this step resolves) but
+# BEFORE channel bootstrap so a `dev` answer skips Discord/Telegram/Teams/
+# Mattermost setup entirely instead of forcing the operator to confirm or
+# `--skip-channel-setup` every flag. Re-running init on an already-answered
+# host is idempotent unless `--reconfigure` is passed; non-interactive
+# (`--json`, no TTY) defaults to `server` to preserve today's behavior on
+# hosted installs. Skipped on `--dry-run` (mutation-free contract).
 if [[ $dry_run -eq 0 ]]; then
   bridge_init_ensure_live_cli
   # Prefer the live CLI deployed under $BRIDGE_HOME (canonical post-init
@@ -576,12 +578,19 @@ if [[ $dry_run -eq 0 ]]; then
   bridge_init_provision_admin_codex_pair "$host_profile_cli" "$admin_agent" "$host_profile_chosen" || true
 
   # Track D follow-up to #713 / #809, follow-on to #833: auto-register the
-  # picker-sweep bridge-native cron on every fresh install, regardless of
-  # host_profile. The helper is idempotent (short-circuits when a job titled
-  # `picker-sweep` already exists), and the registered cron payload sets
-  # `BRIDGE_PICKER_SWEEP_ENABLED=1` — that env var wins against the runtime
-  # host_profile=dev default-skip in scripts/picker-sweep.sh, so a dev install
-  # gets a working sweep without an extra opt-in step. Operators who want the
+  # picker-sweep bridge-native cron. The helper is idempotent (short-circuits
+  # when a job titled `picker-sweep` already exists), and the registered cron
+  # payload sets `BRIDGE_PICKER_SWEEP_ENABLED=1` — that env var wins against
+  # the runtime host_profile=dev default-skip in scripts/picker-sweep.sh, so
+  # the sweep runs once it is registered. Registration itself, however, is
+  # gated on the cron target `<admin>-dev` existing in the roster (see
+  # lib/bridge-init-default-crons.sh): after issue #1052 that pair is
+  # auto-provisioned just above ONLY on a `server` host with the codex CLI
+  # present, so a server+codex install registers the sweep in this same init
+  # run. A `dev` install (admin-only by design) or a codex-absent host has no
+  # `<admin>-dev` pair, so the helper logs a skip; the sweep is registered
+  # later when the operator creates the pair by hand, or when a server host
+  # with the codex CLI re-runs `bridge-bootstrap.sh`. Operators who want the
   # sweep disabled can `agb cron update picker-sweep --disable` after init.
   # Non-fatal: helper logs and returns 0 on any failure so init keeps going.
   if [[ -n "$host_profile_chosen" ]]; then
