@@ -21,13 +21,15 @@ the integration branch additionally passed a full-branch codex review and a
 
 **Re-cut (2026-05-22):** `v0.14.5-beta4` was re-cut to fold in the bug found
 during its own live-VM verification plus the issues/PRs opened against beta4.
-The first-cut content above is retained; the re-cut adds the five items in the
-"Re-cut" subsection below. All five PRs (#1024, #1026, #1027, #1029) were codex
-pair-reviewed through the `feat/wave-v0145-b4recut-integration` branch, which
-passed a full-branch codex review; the `#1025`/`#1028` isolated-create fixes
-were re-verified live on an OrbStack Oracle Linux 9 VM (`agent create --isolate`
-→ `rc=0`, clean `start_dry_run`). The `v0.14.5-beta4` tag and GitHub prerelease
-point at this re-cut HEAD.
+The first-cut content above is retained; the re-cut adds the five follow-up
+items in the "Re-cut" subsection below, delivered by four PRs (#1024, #1026,
+#1027, #1029 — #1027 carries both #1025 and #1021). All four re-cut PRs were
+codex pair-reviewed through the `feat/wave-v0145-b4recut-integration` branch,
+which passed a full-branch codex review; the `#1025`/`#1028` isolated-create
+fixes were re-verified live on an OrbStack Oracle Linux 9 VM
+(`agent create --isolate` → `rc=0`, clean `start_dry_run`). The
+`v0.14.5-beta4` tag and GitHub prerelease are updated to the merged re-cut
+release commit.
 
 ### Re-cut — verification follow-ups (2026-05-22)
 
