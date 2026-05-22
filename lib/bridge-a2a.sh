@@ -47,30 +47,42 @@ bridge_a2a_log_file() {
   printf '%s' "${BRIDGE_LOG_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/logs}/a2a-handoffd.log"
 }
 
-# True if `pid` is alive AND its command line is the A2A receiver
-# (`bridge-handoffd.py serve`). A bare `kill -0` is not enough: after the
-# real receiver dies, PID reuse can hand that number to an unrelated live
-# process, and a stale pid file would then read as "running" — making
-# `start` short-circuit to a false "already running" with no listener
-# (issue #1043 review finding). `ps -p <pid> -o command=` is portable
-# across macOS and Linux.
+# True if `pid` is alive AND its command line is the A2A receiver for
+# THIS install — i.e. a `bridge-handoffd.py serve` process launched with
+# `--pidfile <pid_file>`. A bare `kill -0` is not enough: after the real
+# receiver dies, PID reuse can hand that number to an unrelated live
+# process (issue #1043 review r1). Matching only `bridge-handoffd.py` +
+# `serve` is also not enough: another Agent Bridge install / config runs
+# the same binary, so a stale pid file pointing at *that* install's
+# receiver would still read as "running" here (review r2). The receiver
+# is launched as `bridge-handoffd.py serve --config <config>
+# --detach --pidfile <pid_file>`, and the pidfile path is unique per
+# `$BRIDGE_HOME`, so requiring the exact `--pidfile <pid_file>` token in
+# the cmdline ties the process to the exact pidfile being read.
+# `ps -p <pid> -o command=` is portable across macOS and Linux.
+#
+# Args: $1 = pid, $2 = expected pidfile path the process must reference.
 bridge_a2a_receiver_pid_is_receiver() {
-  local pid="$1" cmd
+  local pid="$1" expect_pid_file="$2" cmd
   [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "$expect_pid_file" ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  [[ "$cmd" == *bridge-handoffd.py* && "$cmd" == *serve* ]]
+  [[ "$cmd" == *bridge-handoffd.py* && "$cmd" == *serve* ]] || return 1
+  # Bind the match to this install: the running cmdline must carry the
+  # exact `--pidfile` value of the pid file we just read.
+  [[ "$cmd" == *"--pidfile $expect_pid_file"* ]]
 }
 
 # True if a receiver daemon is running: pid file present, the pid is
-# alive, AND that pid is genuinely the A2A receiver process (not a
-# coincidental PID-reuse match).
+# alive, AND that pid is genuinely THIS install's A2A receiver process
+# (not a coincidental PID-reuse match, nor another install's receiver).
 bridge_a2a_receiver_running() {
   local pid_file pid
   pid_file="$(bridge_a2a_pid_file)"
   [[ -f "$pid_file" ]] || return 1
   pid="$(cat "$pid_file" 2>/dev/null || true)"
-  bridge_a2a_receiver_pid_is_receiver "$pid"
+  bridge_a2a_receiver_pid_is_receiver "$pid" "$pid_file"
 }
 
 bridge_a2a_receiver_pid() {
@@ -119,8 +131,13 @@ bridge_a2a_receiver_start() {
   # could be torn down with the tool session — issue #1043. The detached
   # grandchild owns the pid file, so the recorded pid is the durable
   # listener rather than a transient launcher pid.
-  nohup python3 "$repo_root/bridge-handoffd.py" serve --config "$config" \
-    --detach --pidfile "$pid_file" \
+  #
+  # `--pidfile` is placed before `--config` so the per-install unique key
+  # that bridge_a2a_receiver_pid_is_receiver() matches on appears early in
+  # the cmdline, ahead of the (potentially long) config path, in case
+  # `ps -o command=` truncates very long command lines.
+  nohup python3 "$repo_root/bridge-handoffd.py" serve \
+    --pidfile "$pid_file" --detach --config "$config" \
     >>"$log_file" 2>&1 &
   local launcher_pid=$!
   # The launcher process exits 0 once the detached child is running; if the
@@ -141,7 +158,7 @@ bridge_a2a_receiver_start() {
   while (( waited < 10 )); do
     if [[ -f "$pid_file" ]]; then
       pid="$(cat "$pid_file" 2>/dev/null || true)"
-      if bridge_a2a_receiver_pid_is_receiver "$pid"; then
+      if bridge_a2a_receiver_pid_is_receiver "$pid" "$pid_file"; then
         break
       fi
     fi
