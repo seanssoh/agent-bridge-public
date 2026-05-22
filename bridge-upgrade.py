@@ -1062,6 +1062,40 @@ def _fsync_path(path: Path) -> None:
         os.close(fd)
 
 
+# Issue #1041: `sqlite3.Connection.iterdump()` emits the internal
+# `sqlite_sequence` maintenance statements (DELETE/INSERT) up front — before
+# the `CREATE TABLE` of the AUTOINCREMENT tables that cause SQLite to
+# auto-create `sqlite_sequence`. A stdlib `executescript` restore of that
+# stream therefore fails with `no such table: sqlite_sequence`. Matches only
+# the top-level maintenance statements (a `CREATE TRIGGER` body that mentions
+# the table is left in place).
+_SQLITE_SEQUENCE_MAINT_RE = re.compile(
+    r'^\s*(?:DELETE\s+FROM|INSERT\s+INTO|UPDATE)\s+"?sqlite_sequence"?\b',
+    re.IGNORECASE,
+)
+
+
+def _reorder_iterdump_for_restore(lines: Iterator[str]) -> list[str]:
+    """Reorder an ``iterdump()`` stream so it restores via ``executescript``.
+
+    Defers every ``sqlite_sequence`` maintenance statement to just before the
+    final ``COMMIT;`` — by that point every AUTOINCREMENT table (and thus the
+    auto-created ``sqlite_sequence`` table) exists. All other statements keep
+    their original relative order.
+    """
+    head: list[str] = []
+    deferred: list[str] = []
+    commit: list[str] = []
+    for line in lines:
+        if _SQLITE_SEQUENCE_MAINT_RE.match(line):
+            deferred.append(line)
+        elif line.strip() == "COMMIT;":
+            commit.append(line)
+        else:
+            head.append(line)
+    return head + deferred + commit
+
+
 def dump_sqlite_snapshot(
     target_root: Path,
     today: date,
@@ -1131,8 +1165,12 @@ def dump_sqlite_snapshot(
             tmp_conn = sqlite3.connect(str(tmp_db_path))
             src_conn.backup(tmp_conn)
             # Now iterdump the consistent temp copy, not the live DB.
+            # Issue #1041: reorder the stream so the `sqlite_sequence`
+            # maintenance statements land after every `CREATE TABLE`, making
+            # the snapshot restorable via stdlib `executescript`.
+            dump_lines = _reorder_iterdump_for_restore(tmp_conn.iterdump())
             with gzip.open(partial_path, "wt", encoding="utf-8", compresslevel=6) as gz:
-                for line in tmp_conn.iterdump():
+                for line in dump_lines:
                     gz.write(line)
                     gz.write("\n")
             _fsync_path(partial_path)
