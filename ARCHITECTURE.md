@@ -41,6 +41,9 @@ Tracked long-lived agent profiles live under `agents/`. That tree is the portabl
 - [`bridge-lib.sh`](./bridge-lib.sh): thin loader that sources the shell modules under [`lib/`](./lib)
 - [`bridge-queue.py`](./bridge-queue.py): persistent queue and daemon-side bookkeeping
 - [`bridge-cron.py`](./bridge-cron.py): legacy cron inventory parsing, recurring error reports, metadata export, and cleanup pruning
+- [`bridge-handoff-daemon.sh`](./bridge-handoff-daemon.sh): A2A cross-bridge handoff lifecycle (receiver daemon start/stop/status + delivery-runner tick)
+- [`bridge-handoffd.py`](./bridge-handoffd.py): A2A receiver daemon — tailnet-bound HTTP listener that HMAC-verifies + enqueues remote handoffs
+- [`bridge-a2a.py`](./bridge-a2a.py): A2A CLI (`send` / `outbox` / `inbox-dedupe` / `peers` / `deliver`) reached through `agent-bridge a2a ...`
 
 ## Shell Module Layout
 
@@ -86,6 +89,11 @@ Shared Bash implementation is split under [`lib/`](./lib):
 
 - `bridge-wave.sh`: wave-orchestration runtime support (used by skill `wave-orchestration`)
 
+**A2A cross-bridge handoff** (added v0.15.0-class, issue #1032)
+
+- `bridge-a2a.sh`: receiver-daemon + delivery-runner lifecycle helpers sourced by `bridge-handoff-daemon.sh` (pid-file tracking, fail-closed preflight, outbox-drain tick)
+- `bridge_a2a_common.py` (repo root, not under `lib/`): shared A2A module — wire protocol, HMAC signing scheme, data-only JSON config loader, durable `outbox.db` / `inbox.db` SQLite schemas. Imported by both `bridge-a2a.py` and `bridge-handoffd.py`. See [`docs/a2a-cross-bridge.md`](./docs/a2a-cross-bridge.md).
+
 ## State Layout
 
 Runtime state lives under `state/` and is intentionally untracked:
@@ -97,6 +105,7 @@ Runtime state lives under `state/` and is intentionally untracked:
 - `state/worktrees/`: metadata for managed isolated workers
 - `state/profiles/`: deploy manifests for tracked agent profiles
 - `state/daemon.pid` and `state/daemon.log`: daemon process tracking
+- `state/handoff/`: A2A cross-bridge handoff working dir — `outbox.db` (sender), `inbox.db` (receiver dedupe), `incoming/` + `outgoing/` staged bodies (mode 0600), `handoffd.pid`
 
 Human or agent handoff text belongs in `shared/`. Operator logs belong in `logs/`.
 

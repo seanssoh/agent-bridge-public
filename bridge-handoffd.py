@@ -1,0 +1,613 @@
+#!/usr/bin/env python3
+"""bridge-handoffd.py — Agent Bridge A2A receiver daemon.
+
+Listens on the Tailscale tailnet interface ONLY for `POST /enqueue`
+cross-bridge task handoffs. Every request is HMAC-verified against the
+ordered-pair peer secret, source-address-checked against the configured
+peer, allowlist-checked against `(peer, target_agent)`, and durably
+deduped on `message_id`. Accepted handoffs are staged to disk and enqueued
+through the EXISTING `bridge-task.sh create` boundary (never the queue
+backend directly) so local validation / prompt-guard / notification all
+run unchanged.
+
+Fail-closed contract: the server REFUSES to start if the configured bind
+address is `0.0.0.0` / `::` / a loopback address / or not present in the
+local Tailscale address set.
+
+Usage:
+  bridge-handoffd.py serve   --config <path>   [--once]
+  bridge-handoffd.py preflight --config <path>   # validate bind, exit
+"""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import subprocess
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Optional
+
+import bridge_a2a_common as a2a
+
+# Hard cap on a request body the server will read off the socket before
+# any parsing. Larger than the per-peer cap so an oversized body is
+# rejected with a clean 413 rather than truncated.
+ABSOLUTE_MAX_REQUEST_BYTES = 4 * 1024 * 1024
+
+
+def log(msg: str) -> None:
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(f"[handoffd] {stamp} {msg}", file=sys.stderr, flush=True)
+
+
+def audit(event: str, **fields: Any) -> None:
+    """Append a structured audit line — never logs secrets or full bodies."""
+    record = {"ts": int(time.time()), "component": "a2a-handoffd", "event": event}
+    record.update(fields)
+    log_dir = Path(os.environ.get("BRIDGE_LOG_DIR", str(a2a.bridge_home() / "logs")))
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / "a2a-handoff.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+    log(f"{event} " + " ".join(f"{k}={v}" for k, v in fields.items()))
+
+
+# --------------------------------------------------------------------------
+# Tailscale address discovery + bind validation (fail-closed)
+# --------------------------------------------------------------------------
+
+def tailscale_addresses() -> list[str]:
+    """Return the local node's Tailscale IPs, or [] if unavailable."""
+    addrs: list[str] = []
+    try:
+        out = subprocess.run(
+            ["tailscale", "ip"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if out.returncode == 0:
+            for line in out.stdout.splitlines():
+                line = line.strip()
+                if line:
+                    addrs.append(line)
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        pass
+    return addrs
+
+
+def is_tailnet_address(addr: str, allowed: list[str]) -> bool:
+    """True if `addr` is one of the local node's tailnet IPs.
+
+    `allowed` is the result of `tailscale ip`. The tailnet CGNAT range
+    (100.64.0.0/10) and the Tailscale ULA (fd7a:115c:a1e0::/48) are used
+    as a structural fallback so a config-declared tailnet IP still passes
+    when the `tailscale` CLI is not on PATH.
+    """
+    if addr in allowed:
+        return True
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    if ip.is_loopback or ip.is_unspecified:
+        return False
+    if ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10"):
+        return True
+    if ip.version == 6 and ip in ipaddress.ip_network("fd7a:115c:a1e0::/48"):
+        return True
+    return False
+
+
+def resolve_bind(cfg: dict[str, Any]) -> tuple[str, int]:
+    """Resolve + fail-closed-validate the receiver bind address.
+
+    Raises A2AError if the bind is missing, loopback, wildcard, or not a
+    tailnet address.
+    """
+    listen = cfg.get("listen", {})
+    if not isinstance(listen, dict):
+        raise a2a.A2AError("config 'listen' must be an object", code="bind_config")
+    bind = listen.get("address", "").strip()
+    port = int(listen.get("port", 8787))
+
+    if not bind:
+        tailnet = tailscale_addresses()
+        if not tailnet:
+            raise a2a.A2AError(
+                "no listen.address configured and 'tailscale ip' returned "
+                "nothing. Set listen.address to this node's tailnet IP in "
+                "handoff.local.json.",
+                code="bind_unresolved",
+            )
+        bind = tailnet[0]
+        log(f"listen.address not set; auto-selected tailnet IP {bind}")
+
+    lowered = bind.lower()
+    if lowered in ("0.0.0.0", "::", "*"):
+        raise a2a.A2AError(
+            f"refusing to bind to wildcard address {bind!r} — the A2A "
+            "receiver MUST bind to a tailnet IP only.",
+            code="bind_wildcard",
+        )
+
+    # Test-only escape hatch for the smoke harness: bind to a loopback
+    # address when BRIDGE_A2A_ALLOW_TEST_BIND=1. This is NEVER honored for
+    # wildcard addresses (the check above already rejected those) and is
+    # not surfaced anywhere in the operator-facing config or CLI. Smoke
+    # tests cannot exercise a real tailnet, so this lets the loopback
+    # end-to-end smoke run without weakening the production fail-closed
+    # contract for any unset/normal environment.
+    if os.environ.get("BRIDGE_A2A_ALLOW_TEST_BIND") == "1":
+        try:
+            test_ip = ipaddress.ip_address(bind)
+        except ValueError as exc:
+            raise a2a.A2AError(f"listen.address {bind!r} is not an IP: {exc}",
+                               code="bind_not_ip") from exc
+        if test_ip.is_loopback:
+            log(f"BRIDGE_A2A_ALLOW_TEST_BIND=1 — binding loopback {bind} (test mode)")
+            return bind, port
+    try:
+        ip = ipaddress.ip_address(bind)
+    except ValueError as exc:
+        raise a2a.A2AError(f"listen.address {bind!r} is not an IP: {exc}",
+                           code="bind_not_ip") from exc
+    if ip.is_loopback:
+        raise a2a.A2AError(
+            f"refusing to bind to loopback {bind!r} — A2A must be reachable "
+            "by tailnet peers.",
+            code="bind_loopback",
+        )
+
+    allowed = tailscale_addresses()
+    if not is_tailnet_address(bind, allowed):
+        raise a2a.A2AError(
+            f"listen.address {bind!r} is not in this node's Tailscale "
+            f"address set ({allowed or 'tailscale CLI unavailable'}) and is "
+            "not within the tailnet CGNAT/ULA range. Refusing to start "
+            "(fail-closed).",
+            code="bind_not_tailnet",
+        )
+    return bind, port
+
+
+# --------------------------------------------------------------------------
+# Enqueue boundary — call the EXISTING bridge-task.sh create
+# --------------------------------------------------------------------------
+
+def enqueue_via_bridge_task(
+    *,
+    target: str,
+    sender_bridge: str,
+    sender_agent: str,
+    priority: str,
+    title: str,
+    body_file: Path,
+) -> tuple[bool, str, str]:
+    """Invoke `bridge-task.sh create` as an argv array (never a shell string).
+
+    Returns (ok, task_id, detail). On failure `detail` carries the stderr
+    tail and `task_id` is empty.
+    """
+    script = Path(__file__).resolve().parent / "bridge-task.sh"
+    bash = os.environ.get("BRIDGE_BASH_BIN", "bash")
+    argv = [
+        bash, str(script), "create",
+        "--to", target,
+        "--from", f"a2a:{sender_bridge}:{sender_agent}",
+        "--priority", priority,
+        "--title", title,
+        "--body-file", str(body_file),
+    ]
+    # NOTE: --skip-companion-validate is deliberately NOT passed — remote
+    # peers must not bypass companion-review validation.
+    try:
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=120,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        return False, "", f"bridge-task.sh invocation failed: {exc}"
+
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[-400:]
+        return False, "", detail or f"bridge-task.sh exited {proc.returncode}"
+
+    # Parse `created task #<id> for <agent> ...`.
+    task_id = ""
+    for token in (proc.stdout or "").split():
+        if token.startswith("#") and token[1:].isdigit():
+            task_id = token[1:]
+            break
+    return True, task_id, (proc.stdout or "").strip()
+
+
+def staged_body_text(env: dict[str, Any]) -> str:
+    """Build the local task body with a provenance block prepended."""
+    sender = env.get("sender", {})
+    reply = env.get("reply_to", {})
+    header = [
+        "<!-- A2A cross-bridge handoff — provenance -->",
+        f"remote peer  : {sender.get('bridge', '?')}",
+        f"remote agent : {sender.get('agent', '?')}",
+        f"message id   : {env.get('message_id', '?')}",
+        "",
+        "Reply with:",
+        f"  agent-bridge a2a send --peer {reply.get('peer', '?')} "
+        f"--to {reply.get('agent', '?')} --title \"<re: ...>\" --body \"...\"",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(header) + env.get("body", "")
+
+
+# --------------------------------------------------------------------------
+# Request handling
+# --------------------------------------------------------------------------
+
+class HandoffServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, addr, handler, cfg: dict[str, Any]) -> None:
+        super().__init__(addr, handler)
+        self.cfg = cfg
+
+
+class HandoffHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "AgentBridgeHandoffd/1"
+
+    # Silence the default stderr access log; we audit explicitly.
+    def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003
+        return
+
+    def _reply(self, status: int, payload: dict[str, Any],
+               extra_headers: Optional[dict[str, str]] = None) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for key, val in (extra_headers or {}).items():
+            self.send_header(key, val)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass
+
+    def _client_ip(self) -> str:
+        return self.client_address[0] if self.client_address else ""
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server API
+        if self.path == "/healthz":
+            self._reply(200, {"ok": True, "service": "a2a-handoffd"})
+            return
+        self._reply(404, {"ok": False, "error": "not found"})
+
+    def do_POST(self) -> None:  # noqa: N802 - http.server API
+        cfg: dict[str, Any] = self.server.cfg  # type: ignore[attr-defined]
+        enqueue_path = cfg.get("listen", {}).get("enqueue_path", "/enqueue")
+        if self.path != enqueue_path:
+            self._reply(404, {"ok": False, "error": "not found"})
+            return
+
+        client_ip = self._client_ip()
+        peer_id = self.headers.get("X-AGB-Peer", "")
+        message_id = self.headers.get("X-AGB-Message-Id", "")
+        timestamp = self.headers.get("X-AGB-Timestamp", "")
+        body_hash_hdr = self.headers.get("X-AGB-Body-SHA256", "")
+        signature = self.headers.get("X-AGB-Signature", "")
+        protocol = self.headers.get("X-AGB-Protocol", "")
+
+        if protocol != a2a.PROTOCOL_VERSION:
+            audit("reject_protocol", peer=peer_id, client=client_ip, got=protocol)
+            self._reply(400, {"ok": False, "error": "unsupported protocol"})
+            return
+
+        # --- peer must be configured ---
+        try:
+            peer = a2a.find_peer(cfg, peer_id)
+        except a2a.A2AError:
+            audit("reject_unknown_peer", peer=peer_id, client=client_ip)
+            self._reply(403, {"ok": False, "error": "unknown peer"})
+            return
+
+        # --- remote_addr == configured peer (checked before body read) ---
+        peer_addr = peer.get("address", "")
+        if not peer_addr or client_ip != peer_addr:
+            audit("reject_addr_mismatch", peer=peer_id, client=client_ip,
+                  expected=peer_addr, security=True)
+            self._reply(403, {"ok": False, "error": "source address mismatch"})
+            return
+
+        # --- size guard before reading the body ---
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = -1
+        if content_length < 0:
+            self._reply(411, {"ok": False, "error": "length required"})
+            return
+        max_body = int(a2a.peer_cap(peer, "max_body_bytes", a2a.DEFAULT_MAX_BODY_BYTES))
+        if content_length > min(ABSOLUTE_MAX_REQUEST_BYTES, max_body):
+            audit("reject_oversize", peer=peer_id, client=client_ip,
+                  declared=content_length, cap=max_body)
+            self._reply(413, {"ok": False, "error": "body too large"})
+            return
+
+        raw = self.rfile.read(content_length) if content_length else b""
+
+        # --- HMAC + timestamp before parsing ---
+        secrets = a2a.peer_secrets(peer)
+        if not secrets:
+            audit("reject_no_secret", peer=peer_id, client=client_ip, security=True)
+            self._reply(403, {"ok": False, "error": "peer not provisioned"})
+            return
+
+        computed_hash = a2a.body_sha256(raw)
+        if body_hash_hdr != computed_hash:
+            audit("reject_body_hash", peer=peer_id, client=client_ip, security=True)
+            self._reply(401, {"ok": False, "error": "body hash mismatch"})
+            return
+
+        skew = int(cfg.get("timestamp_skew_seconds", a2a.DEFAULT_TIMESTAMP_SKEW_SECONDS))
+        receiver_now = a2a.now_ts()
+        try:
+            req_ts = int(timestamp)
+        except (TypeError, ValueError):
+            audit("reject_bad_timestamp", peer=peer_id, client=client_ip, security=True)
+            self._reply(401, {"ok": False, "error": "bad timestamp"})
+            return
+        if abs(receiver_now - req_ts) > skew:
+            audit("reject_clock_skew", peer=peer_id, client=client_ip,
+                  request_ts=req_ts, receiver_ts=receiver_now, skew_limit=skew,
+                  security=True)
+            self._reply(401, {"ok": False,
+                              "error": "timestamp outside skew window",
+                              "receiver_ts": receiver_now})
+            return
+
+        canonical = a2a.canonical_string(
+            "POST", self.path, peer_id, message_id, timestamp, computed_hash)
+        if not a2a.verify_signature(secrets, canonical, signature):
+            audit("reject_bad_signature", peer=peer_id, client=client_ip,
+                  message_id=message_id, security=True)
+            self._reply(401, {"ok": False, "error": "signature verification failed"})
+            return
+
+        # --- parse envelope ---
+        try:
+            env = a2a.parse_envelope(raw)
+        except a2a.A2AError as exc:
+            audit("reject_envelope", peer=peer_id, client=client_ip,
+                  code=exc.code, message_id=message_id)
+            self._reply(422, {"ok": False, "error": str(exc)})
+            return
+
+        if env.get("message_id") != message_id:
+            audit("reject_id_mismatch", peer=peer_id, client=client_ip,
+                  header_id=message_id, envelope_id=env.get("message_id"),
+                  security=True)
+            self._reply(422, {"ok": False, "error": "message id header/body mismatch"})
+            return
+
+        target = env["target_agent"]
+        title = env["title"]
+        priority = env.get("priority", "normal")
+
+        # --- allowlist: exact (peer, target) match, no wildcard default ---
+        allowlist = peer.get("inbound_allowlist", [])
+        if not isinstance(allowlist, list) or target not in allowlist:
+            audit("reject_allowlist", peer=peer_id, client=client_ip,
+                  target=target, message_id=message_id, security=True)
+            self._reply(403, {"ok": False,
+                              "error": f"target '{target}' not in allowlist for peer"})
+            return
+
+        # --- title size cap ---
+        max_title = int(a2a.peer_cap(peer, "max_title_bytes", a2a.DEFAULT_MAX_TITLE_BYTES))
+        if len(title.encode("utf-8")) > max_title:
+            audit("reject_title_size", peer=peer_id, client=client_ip,
+                  message_id=message_id)
+            self._reply(413, {"ok": False, "error": "title too large"})
+            return
+
+        # --- durable dedupe ---
+        try:
+            self._handle_dedupe_and_enqueue(cfg, peer, env, computed_hash, client_ip)
+        except Exception as exc:  # noqa: BLE001 - last-resort guard
+            audit("error_internal", peer=peer_id, client=client_ip,
+                  message_id=message_id, detail=str(exc)[:300])
+            self._reply(500, {"ok": False, "error": "internal error"})
+
+    def _handle_dedupe_and_enqueue(
+        self, cfg: dict[str, Any], peer: dict[str, Any],
+        env: dict[str, Any], body_hash: str, client_ip: str,
+    ) -> None:
+        message_id = env["message_id"]
+        peer_id = peer.get("id", "")
+        a2a.ensure_handoff_dirs()
+        conn = a2a.open_inbox()
+        try:
+            existing = conn.execute(
+                "SELECT body_sha256, created_task_id FROM inbox_dedupe "
+                "WHERE message_id=?", (message_id,)
+            ).fetchone()
+            if existing is not None:
+                if existing["body_sha256"] == body_hash:
+                    # Same id + same body → idempotent success.
+                    conn.execute(
+                        "UPDATE inbox_dedupe SET last_seen_ts=?, "
+                        "delivery_count=delivery_count+1 WHERE message_id=?",
+                        (a2a.now_ts(), message_id),
+                    )
+                    conn.commit()
+                    audit("accept_duplicate", peer=peer_id, client=client_ip,
+                          message_id=message_id,
+                          task_id=existing["created_task_id"])
+                    self._reply(200, {"ok": True, "duplicate": True,
+                                      "task_id": existing["created_task_id"]})
+                    return
+                # Same id + different body → security event, conflict.
+                conn.execute(
+                    "UPDATE inbox_dedupe SET last_seen_ts=?, "
+                    "delivery_count=delivery_count+1 WHERE message_id=?",
+                    (a2a.now_ts(), message_id),
+                )
+                conn.commit()
+                audit("reject_hash_conflict", peer=peer_id, client=client_ip,
+                      message_id=message_id, security=True)
+                self._reply(409, {"ok": False,
+                                  "error": "message id reused with different body"})
+                return
+
+            # --- backpressure: max open remote tasks per peer/target ---
+            max_open = a2a.peer_cap(peer, "max_open_tasks", None)
+            if max_open is not None:
+                open_count = conn.execute(
+                    "SELECT COUNT(*) AS n FROM inbox_dedupe WHERE peer=? "
+                    "AND created_task_id IS NOT NULL", (peer_id,)
+                ).fetchone()["n"]
+                if int(open_count) >= int(max_open):
+                    audit("reject_backpressure", peer=peer_id, client=client_ip,
+                          message_id=message_id, open=open_count)
+                    self._reply(429, {"ok": False, "error": "peer task quota reached"},
+                                extra_headers={"Retry-After": "120"})
+                    return
+
+            # --- stage body + enqueue via bridge-task.sh ---
+            staged = a2a.incoming_dir() / f"{message_id.replace(':', '_').replace('/', '_')}.md"
+            staged.write_text(staged_body_text(env), encoding="utf-8")
+            try:
+                os.chmod(staged, 0o600)
+            except OSError:
+                pass
+
+            sender = env.get("sender", {})
+            ok, task_id, detail = enqueue_via_bridge_task(
+                target=env["target_agent"],
+                sender_bridge=sender.get("bridge", "unknown"),
+                sender_agent=sender.get("agent", "unknown"),
+                priority=env.get("priority", "normal"),
+                title=env["title"],
+                body_file=staged,
+            )
+            if not ok:
+                # Distinguish a transient lock failure (retryable 503) from
+                # a permanent validation/guard/allowlist rejection (422).
+                lowered = detail.lower()
+                transient = any(s in lowered for s in
+                                ("locked", "database is locked", "timeout",
+                                 "temporarily"))
+                if transient:
+                    audit("enqueue_transient_fail", peer=peer_id,
+                          message_id=message_id, detail=detail[:200])
+                    self._reply(503, {"ok": False, "error": "queue busy, retry"},
+                                extra_headers={"Retry-After": "30"})
+                else:
+                    audit("enqueue_permanent_fail", peer=peer_id,
+                          message_id=message_id, detail=detail[:200])
+                    self._reply(422, {"ok": False,
+                                      "error": f"enqueue rejected: {detail[:200]}"})
+                return
+
+            now = a2a.now_ts()
+            conn.execute(
+                "INSERT INTO inbox_dedupe (message_id, peer, body_sha256, "
+                "created_task_id, first_seen_ts, last_seen_ts, delivery_count) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1)",
+                (message_id, peer_id, body_hash, task_id, now, now),
+            )
+            conn.commit()
+            audit("accept", peer=peer_id, client=client_ip,
+                  message_id=message_id, target=env["target_agent"],
+                  task_id=task_id)
+            self._reply(200, {"ok": True, "duplicate": False, "task_id": task_id})
+        finally:
+            conn.close()
+
+
+# --------------------------------------------------------------------------
+# entry points
+# --------------------------------------------------------------------------
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    try:
+        cfg = a2a.load_config(Path(args.config) if args.config else None)
+        bind, port = resolve_bind(cfg)
+    except a2a.A2AError as exc:
+        print(f"[handoffd][preflight] FAIL: {exc} ({exc.code})", file=sys.stderr)
+        return 1
+    print(f"[handoffd][preflight] OK: would bind {bind}:{port}, "
+          f"{len(cfg.get('peers', []))} peer(s) configured")
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    try:
+        cfg = a2a.load_config(Path(args.config) if args.config else None)
+        bind, port = resolve_bind(cfg)
+    except a2a.A2AError as exc:
+        log(f"FATAL: {exc} ({exc.code})")
+        audit("startup_fail", code=exc.code, detail=str(exc)[:300])
+        return 1
+
+    a2a.ensure_handoff_dirs()
+    try:
+        server = HandoffServer((bind, port), HandoffHandler, cfg)
+    except OSError as exc:
+        log(f"FATAL: cannot bind {bind}:{port}: {exc}")
+        audit("bind_fail", address=bind, port=port, detail=str(exc))
+        return 1
+
+    audit("listening", address=bind, port=port,
+          peers=len(cfg.get("peers", [])))
+    log(f"A2A receiver listening on {bind}:{port}")
+    try:
+        if args.once:
+            server.handle_request()
+        else:
+            server.serve_forever()
+    except KeyboardInterrupt:
+        log("interrupted")
+    finally:
+        server.server_close()
+        audit("stopped")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="bridge-handoffd.py",
+        description="Agent Bridge A2A receiver daemon (tailnet-bound).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_serve = sub.add_parser("serve", help="run the receiver daemon")
+    p_serve.add_argument("--config", default=None,
+                         help="path to handoff.local.json")
+    p_serve.add_argument("--once", action="store_true",
+                         help="handle a single request then exit (test mode)")
+    p_serve.set_defaults(func=cmd_serve)
+
+    p_pre = sub.add_parser("preflight", help="validate bind + config, then exit")
+    p_pre.add_argument("--config", default=None)
+    p_pre.set_defaults(func=cmd_preflight)
+
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

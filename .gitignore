@@ -19,6 +19,9 @@ node_modules/
 backups/
 .oss-preflight-patterns
 agent-roster.local.sh
+# A2A cross-bridge handoff peer config (secrets + tailnet addresses).
+# Tracked example: handoff.local.example.json.
+handoff.local.json
 HEARTBEAT.md
 agents/*/.claude/
 # Shared agent settings (symlink target) is tracked
