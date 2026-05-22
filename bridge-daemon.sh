@@ -1849,7 +1849,32 @@ process_daily_backup() {
     bridge_note_daily_backup_failure "parse" "python3 invocation failed"
     return 1
   fi
-  IFS=$'\t' read -r outcome error_detail archive_path pruned_count free_bytes needed_bytes <<<"$parse_payload"
+  # Issue #1039: the helper emits a fixed six-field tab-separated row, but
+  # `IFS=$'\t' read` treats a tab as IFS *whitespace* — a run of adjacent
+  # tabs (produced whenever a middle field such as error_detail is empty)
+  # collapses to a single delimiter, shifting every later column left and
+  # landing free_bytes (~hundreds of GB) into pruned_count. Split on tab
+  # explicitly via `mapfile -d` so empty fields are preserved positionally.
+  local backup_fields=()
+  mapfile -t -d $'\t' backup_fields < <(printf '%s' "$parse_payload")
+  outcome="${backup_fields[0]:-}"
+  error_detail="${backup_fields[1]:-}"
+  archive_path="${backup_fields[2]:-}"
+  pruned_count="${backup_fields[3]:-0}"
+  free_bytes="${backup_fields[4]:-0}"
+  # The final field carries a trailing newline from the helper's print();
+  # strip it so needed_bytes stays a clean integer.
+  needed_bytes="${backup_fields[5]:-0}"
+  needed_bytes="${needed_bytes%$'\n'}"
+
+  # Issue #1039: guard against an implausible pruned_count reaching state.env.
+  # A daily-backup prune count is tiny (one archive per day, retained for a
+  # handful of days). Reject non-numeric or oversized values so a future
+  # column-misalignment regression cannot record a byte magnitude.
+  if [[ ! "$pruned_count" =~ ^[0-9]+$ ]] || (( pruned_count > 10000 )); then
+    daemon_warn "daily-backup: implausible pruned_count '${pruned_count}' from backup-parse; recording 0"
+    pruned_count=0
+  fi
 
   case "$outcome" in
     PARSE_ERROR)
