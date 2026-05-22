@@ -47,14 +47,30 @@ bridge_a2a_log_file() {
   printf '%s' "${BRIDGE_LOG_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/logs}/a2a-handoffd.log"
 }
 
-# True if a receiver daemon is running (pid file present + process alive).
+# True if `pid` is alive AND its command line is the A2A receiver
+# (`bridge-handoffd.py serve`). A bare `kill -0` is not enough: after the
+# real receiver dies, PID reuse can hand that number to an unrelated live
+# process, and a stale pid file would then read as "running" — making
+# `start` short-circuit to a false "already running" with no listener
+# (issue #1043 review finding). `ps -p <pid> -o command=` is portable
+# across macOS and Linux.
+bridge_a2a_receiver_pid_is_receiver() {
+  local pid="$1" cmd
+  [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [[ "$cmd" == *bridge-handoffd.py* && "$cmd" == *serve* ]]
+}
+
+# True if a receiver daemon is running: pid file present, the pid is
+# alive, AND that pid is genuinely the A2A receiver process (not a
+# coincidental PID-reuse match).
 bridge_a2a_receiver_running() {
   local pid_file pid
   pid_file="$(bridge_a2a_pid_file)"
   [[ -f "$pid_file" ]] || return 1
   pid="$(cat "$pid_file" 2>/dev/null || true)"
-  [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
-  kill -0 "$pid" 2>/dev/null
+  bridge_a2a_receiver_pid_is_receiver "$pid"
 }
 
 bridge_a2a_receiver_pid() {
@@ -118,13 +134,14 @@ bridge_a2a_receiver_start() {
     return 1
   fi
 
-  # Wait for the detached child to publish its pid, then verify it is a
-  # live process — this confirms a durable listener, not a false success.
+  # Wait for the detached child to publish its pid, then verify the pid is
+  # genuinely the A2A receiver process — confirms a durable listener, not a
+  # false success against a coincidental pid.
   local waited=0 pid=""
   while (( waited < 10 )); do
     if [[ -f "$pid_file" ]]; then
       pid="$(cat "$pid_file" 2>/dev/null || true)"
-      if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+      if bridge_a2a_receiver_pid_is_receiver "$pid"; then
         break
       fi
     fi
