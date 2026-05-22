@@ -321,6 +321,24 @@ else
   fail "scenario 15: Track E helper call missing from bridge_write_idle_ready_agents"
 fi
 
+# --- Scenario 16: issue #1054 — quoted `|` in a read command argument
+# `grep -nE 'a|b' <peer-read>` is read-intent: the `|` lives inside the
+# single-quoted extended-regex alternation and must NOT be split into a
+# spurious pipeline stage. Before the quote-aware split it misclassified
+# as write-intent and the peer-read carve-out was defeated.
+out="$(run_hook "$SYSTEM_AGENT" system "grep -nE 'projects|body' $PROJECTS_FILE" 2>/dev/null)"
+assert_allow "scenario 16 (#1054 quoted | in grep -E peer read)" "$out"
+
+# --- Scenario 17: issue #1054 codex r1 — unbalanced quote fails CLOSED.
+# An unterminated quote masks every operator after it, so the `| tee`
+# write to a forbidden path hides behind the open quote. `_split_command_
+# stages` reports the open-quote state and `_is_read_intent_bash` must
+# return False (not read-intent) — the command stays write-intent and the
+# cross-agent / forbidden write is denied. An un-parseable command is
+# never treated as a safe read.
+out="$(run_hook "$SYSTEM_AGENT" system "cat $PROJECTS_FILE ' | tee $SHARED_PRIVATE_FILE" 2>/dev/null)"
+assert_deny "scenario 17 (#1054 r1 unbalanced quote masks | tee — fail closed)" "$out"
+
 # --- Summary
 printf '\n[smoke] PASS=%d FAIL=%d\n' "$PASS" "$FAIL"
 if (( FAIL > 0 )); then

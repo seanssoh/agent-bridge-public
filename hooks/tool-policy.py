@@ -656,7 +656,14 @@ def _is_read_intent_bash(command: str) -> bool:
     # would be misclassified as write-intent (issue #1054). A genuine
     # `... | tee <path>` still splits — the `tee` stage is unknown and
     # disqualifies the command, so the guard is not weakened.
-    for stage in _split_command_stages(sanitized):
+    stages, balanced = _split_command_stages(sanitized)
+    # Fail closed on an unterminated quote: an unbalanced quote masks
+    # every operator after it, so a `... | tee <protected>` write would
+    # hide behind the open quote. An un-parseable command is never a safe
+    # read (issue #1054 codex r1).
+    if not balanced:
+        return False
+    for stage in stages:
         stage_stripped = stage.strip()
         if not stage_stripped:
             continue
@@ -962,8 +969,12 @@ _FILE_VALUED_FLAGS = frozenset(
 _COMMAND_OPERATOR_RE = re.compile(r"&&|\|\||\||;|&|\n")
 
 
-def _split_command_stages(command: str) -> list[str]:
+def _split_command_stages(command: str) -> tuple[list[str], bool]:
     """Split *command* into shell stages, ignoring operators inside quotes.
+
+    Returns ``(stages, balanced)``. ``balanced`` is ``False`` when the
+    string ends while still inside an unterminated single or double
+    quote — the command is not parseable as written.
 
     A bare :func:`_COMMAND_OPERATOR_RE.split` is not shell-quote aware: a
     literal operator character inside a single- or double-quoted argument
@@ -980,6 +991,12 @@ def _split_command_stages(command: str) -> list[str]:
     backslash and an escaped quote inside the *other* quote style is
     already inert. Genuine pipelines / separators outside quotes still
     split exactly as before, so the guard is not weakened.
+
+    An *unbalanced* quote masks every operator after it (the parser stays
+    "inside" the quote to end-of-string), which would hide a real
+    ``| tee <protected>`` write. The caller must fail closed on
+    ``balanced=False`` — an un-parseable command is never a safe read
+    (issue #1054 codex r1).
     """
     stages: list[str] = []
     start = 0
@@ -1005,7 +1022,7 @@ def _split_command_stages(command: str) -> list[str]:
             continue
         i += 1
     stages.append(command[start:])
-    return stages
+    return stages, quote is None
 
 
 # Redirection prefixes that can ride with the path token (`<file`, `>out`,
