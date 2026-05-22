@@ -8,7 +8,7 @@ version bumps via the `VERSION` file.
 
 ## [0.14.5-beta4] — 2026-05-22
 
-### Highlight — runtime-friction closeout wave
+### Highlight — runtime-friction closeout wave (+ verification re-cut)
 
 Operator-cued **fourth prerelease** in the v0.14.5 stabilization window. Bundles
 the six PRs that landed after `v0.14.5-beta3` (2026-05-21): two close-out PRs
@@ -18,6 +18,44 @@ branch. Every PR was codex pair-reviewed (`agb-dev-claude` + `agb-dev-codex`);
 the integration branch additionally passed a full-branch codex review and a
 `scripts/smoke-test.sh` pass. No new features. `-beta4` prerelease; matching tag
 `v0.14.5-beta4`, GitHub release marked **Pre-release**.
+
+**Re-cut (2026-05-22):** `v0.14.5-beta4` was re-cut to fold in the bug found
+during its own live-VM verification plus the issues/PRs opened against beta4.
+The first-cut content above is retained; the re-cut adds the five items in the
+"Re-cut" subsection below. All five PRs (#1024, #1026, #1027, #1029) were codex
+pair-reviewed through the `feat/wave-v0145-b4recut-integration` branch, which
+passed a full-branch codex review; the `#1025`/`#1028` isolated-create fixes
+were re-verified live on an OrbStack Oracle Linux 9 VM (`agent create --isolate`
+→ `rc=0`, clean `start_dry_run`). The `v0.14.5-beta4` tag and GitHub prerelease
+point at this re-cut HEAD.
+
+### Re-cut — verification follow-ups (2026-05-22)
+
+- **Isolated `agent create` no longer aborts** (#1025) — the isolation-v2
+  isolated-create scaffold built `runtime/agent-env.sh` with a controller-side
+  non-`sudo` write under the `root:ab-agent-<name>` `0750` agent root, so the
+  create aborted with `Permission denied`. The env file is now staged and
+  installed in one privileged `install -o <controller> -g <agent_grp> -m 0640`
+  (atomic owner/group/mode, no TOCTOU window), matching the v2 matrix contract.
+- **`start_dry_run` workdir false-error fixed** (#1028) — after #1025 unblocked
+  create, the post-create `start_dry_run` still emitted a false
+  `[오류] workdir … 존재하지 않음` because the controller-side `[[ -d ]]` check
+  cannot traverse the `0750` agent root. The workdir existence checks are now
+  privilege-aware (sudo-backed) for linux-user isolated agents.
+- **isolation-v2 apply no longer corrupts shared plugin perms** (#1021) —
+  `migrate isolation v2 --apply` recursively re-grouped shared plugin
+  `node_modules` to a private agent group, breaking other isolated agents that
+  load the same plugin source. The recursive chgrp/chmod now excludes shared
+  plugin material.
+- **`agent update` no longer leaks secrets** (#1023) — `agent update
+  --launch-cmd-*` printed credential-bearing env values (OAuth/MS365 secrets)
+  into terminal output, `--json`, dry-run, and `audit.jsonl`. Sensitive env
+  values are now redacted across every output surface (value redacted, key name
+  kept) — case-insensitively on `SECRET`/`TOKEN`/`PASSWORD`/`KEY`/`CREDENTIAL`/
+  `AUTH`/`AUTHORIZATION`/`BEARER`/`COOKIE`/`SESSION`/`JWT`.
+- **Teams channel notification no longer silent-drops** (#1022) — the direct
+  `notifications/claude/channel` metadata is kept flat/string-only; the rich
+  nested `attachments` array is retained for the bridge queue/audit/replay body.
 
 The #1010 isolated-agent reap path exercises destructive `userdel` / `setfacl` /
 `groupdel`; CI and review verified the gating *decision* (Linux-only, exact
