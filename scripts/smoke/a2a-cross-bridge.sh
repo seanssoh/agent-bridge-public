@@ -99,9 +99,12 @@ fail_closed_wildcard() {
 
 # BLOCKING #2 regression guard: with the `tailscale` CLI unavailable the
 # receiver must FAIL CLOSED — it must not fall back to a CIDR-shape guess
-# and approve a tailnet-shaped address. Builds a PATH that has python3
-# but no `tailscale`, then preflights a config with a tailnet-shaped
-# (100.64.0.0/10) bind address that is NOT a real local interface.
+# and approve a tailnet-shaped address. `BRIDGE_A2A_TAILSCALE_CLI` points
+# CLI discovery at a path that does not exist (the genuine "unavailable"
+# condition — deterministic regardless of whether the test host happens
+# to have `tailscale` on PATH or in a standard install location), then
+# preflights a config with a tailnet-shaped (100.64.0.0/10) bind address
+# that is NOT a real local interface.
 fail_closed_without_tailscale_cli() {
   cat >"$BRIDGE_HOME/handoff-cgnat.json" <<'EOF'
 {
@@ -112,18 +115,13 @@ fail_closed_without_tailscale_cli() {
 EOF
   chmod 0600 "$BRIDGE_HOME/handoff-cgnat.json"
 
-  local pybin pydir nopath_bin out rc=0
-  pybin="$(command -v python3)"
-  pydir="$SMOKE_TMP_ROOT/nopath-bin"
-  mkdir -p "$pydir"
-  ln -sf "$pybin" "$pydir/python3"
-  nopath_bin="$pydir"
-
-  out="$(PATH="$nopath_bin" python3 "$SMOKE_REPO_ROOT/bridge-handoffd.py" \
+  local out rc=0
+  out="$(BRIDGE_A2A_TAILSCALE_CLI="$SMOKE_TMP_ROOT/no-such-tailscale" \
+    python3 "$SMOKE_REPO_ROOT/bridge-handoffd.py" \
     preflight --config "$BRIDGE_HOME/handoff-cgnat.json" 2>&1)" || rc=$?
   smoke_assert_eq "1" "$rc" "preflight fails closed when tailscale CLI absent"
   smoke_assert_contains "$out" "tailscale_unavailable" \
-    "no-tailscale-CLI reports tailscale_unavailable (no CIDR-shape fallback)"
+    "absent tailscale CLI reports tailscale_unavailable (no CIDR-shape fallback)"
   smoke_assert_not_contains "$out" "preflight] OK" \
     "tailnet-shaped CGNAT address NOT approved without a real local match"
 }

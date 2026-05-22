@@ -25,6 +25,7 @@ import argparse
 import ipaddress
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -75,24 +76,70 @@ class TailscaleUnavailable(a2a.A2AError):
         super().__init__(message, code="tailscale_unavailable")
 
 
+# Well-known absolute locations for the `tailscale` CLI, probed when it
+# is not on PATH. A receiver started from cron / launchd / systemd often
+# has a minimal PATH that omits /opt/homebrew/bin, so PATH-only discovery
+# would fail closed on a macOS host that DOES have Tailscale installed
+# (e.g. via Homebrew). Probing these does not weaken the bind proof — the
+# resolved binary is still run and its `tailscale ip` output is still the
+# only thing trusted.
+_TAILSCALE_FALLBACK_PATHS = (
+    "/opt/homebrew/bin/tailscale",                            # Homebrew (Apple Silicon)
+    "/usr/local/bin/tailscale",                               # Homebrew (Intel) / manual
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",   # macOS App Store app
+    "/usr/bin/tailscale",                                     # Linux package
+    "/usr/sbin/tailscale",
+)
+
+
+def resolve_tailscale_cli() -> Optional[str]:
+    """Locate the `tailscale` CLI: PATH first, then well-known locations.
+
+    `BRIDGE_A2A_TAILSCALE_CLI` overrides discovery entirely (an explicit
+    path for non-standard installs; also lets the smoke exercise the
+    genuinely-absent path deterministically). Returns the resolved path,
+    or None when no candidate exists — the caller fails closed on None.
+    """
+    override = os.environ.get("BRIDGE_A2A_TAILSCALE_CLI")
+    if override:
+        return override
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    for cand in _TAILSCALE_FALLBACK_PATHS:
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
 def tailscale_addresses() -> list[str]:
     """Return the local node's Tailscale IPs.
 
-    Raises TailscaleUnavailable if the `tailscale` CLI is not on PATH or
-    the query fails — the caller must fail closed in that case rather
+    Raises TailscaleUnavailable if the `tailscale` CLI cannot be located
+    or the query fails — the caller must fail closed in that case rather
     than guessing from a CIDR shape. An *empty* list (CLI ran fine but
     the node has no Tailscale address) is returned as `[]`.
     """
+    cli = resolve_tailscale_cli()
+    if cli is None:
+        raise TailscaleUnavailable(
+            "the 'tailscale' CLI was not found on PATH or in any standard "
+            "install location (/opt/homebrew/bin, /usr/local/bin, "
+            "/Applications/Tailscale.app/Contents/MacOS, /usr/bin) — cannot "
+            "prove the bind address is a real local Tailscale interface. "
+            "Install Tailscale, set BRIDGE_A2A_TAILSCALE_CLI to its path, "
+            "or set BRIDGE_A2A_ALLOW_TEST_BIND=1 for a loopback test bind."
+        )
     try:
         out = subprocess.run(
-            ["tailscale", "ip"],
+            [cli, "ip"],
             capture_output=True, text=True, timeout=5,
         )
     except FileNotFoundError as exc:
         raise TailscaleUnavailable(
-            "the 'tailscale' CLI is not on PATH — cannot prove the bind "
-            "address is a real local Tailscale interface. Install Tailscale "
-            "(or set BRIDGE_A2A_ALLOW_TEST_BIND=1 for a loopback test bind)."
+            f"the 'tailscale' CLI path {cli!r} does not exist or is not "
+            "executable — cannot prove the bind address is a real local "
+            "Tailscale interface."
         ) from exc
     except (subprocess.SubprocessError, OSError) as exc:
         raise TailscaleUnavailable(
