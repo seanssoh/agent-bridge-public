@@ -55,8 +55,14 @@ Three fixed decisions shape the design:
   a "tailnet-shaped" address (e.g. inside `100.64.0.0/10`) does not prove
   it is a real Tailscale interface, since a host can have a non-Tailscale
   CGNAT interface. If the `tailscale` CLI / local Tailscale address set
-  cannot be determined, the daemon refuses to serve. `remote_addr ==
-  configured peer tailnet IP` is enforced before the request body is read.
+  cannot be determined, the daemon refuses to serve. The `tailscale` CLI
+  is located on `PATH` first, then in well-known install locations
+  (`/opt/homebrew/bin`, `/usr/local/bin`,
+  `/Applications/Tailscale.app/Contents/MacOS`, `/usr/bin`) — a receiver
+  started from cron/launchd/systemd often has a minimal `PATH`. Set
+  `BRIDGE_A2A_TAILSCALE_CLI` to an explicit path for a non-standard
+  install. `remote_addr == configured peer tailnet IP` is enforced
+  before the request body is read.
 - **HMAC-signed requests** (not raw bearer tokens — avoids replayable
   strings in process/log surfaces). The peer-pair secret is the HMAC key.
   - Headers: `X-AGB-Protocol: a2a-enqueue-v1`, `X-AGB-Peer`,
