@@ -21,8 +21,13 @@
 # The helper is invoked from bridge-init.sh AFTER host-profile resolution and
 # BEFORE bridge_init_register_default_picker_sweep — the picker-sweep cron
 # targets `<admin>-dev`, so the pair must exist first or the cron registration
-# skips. Non-fatal on every failure path: a codex-pair backfill must never fail
-# an otherwise-successful admin install.
+# skips. Because the pair is created by a child `agent create` subprocess, the
+# helper invalidates + reloads the parent's roster cache after a successful
+# create so the in-memory `bridge_agent_exists` check inside the picker-sweep
+# registration sees the freshly created pair on this same first-run init (the
+# #848 child-mutation pattern, mirroring the admin create at bridge-init.sh).
+# Non-fatal on every failure path: a codex-pair backfill must never fail an
+# otherwise-successful admin install.
 
 # Auto-provision the admin's `<admin>-dev` codex pair when codex is present and
 # the host profile is `server`.
@@ -122,6 +127,18 @@ bridge_init_provision_admin_codex_pair() {
       "$pair_name" "$pair_name" "$create_output" >&2
     return 0
   fi
+
+  # Issue #848 pattern (also applied to the admin create at
+  # bridge-init.sh:509-513): the child `agent create` invocation above
+  # mutated `agent-roster.local.sh` on disk, but the parent bridge-init.sh
+  # process still holds a roster cache loaded BEFORE the pair existed. The
+  # very next caller — bridge_init_register_default_picker_sweep — gates on
+  # `bridge_agent_exists "<admin>-dev"`, which reads in-memory roster state
+  # only; without this refresh it sees the stale cache and skips the cron on
+  # this same first-run init. Invalidate + reload the parent's cache here so
+  # the picker-sweep registration that follows sees the freshly created pair.
+  bridge_roster_cache_invalidate
+  bridge_load_roster
 
   printf '[init] codex-pair auto-provisioned: %s (engine=codex, always-on) — admin pair for %s\n' \
     "$pair_name" "$admin_agent" >&2

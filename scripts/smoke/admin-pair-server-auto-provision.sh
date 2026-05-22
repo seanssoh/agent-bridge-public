@@ -96,6 +96,11 @@ run_provision_probe() {
     # Stub: workdir resolution — admin has a known workdir.
     printf '%s\n' 'bridge_agent_workdir() { printf "/tmp/admin-workdir"; }'
     printf '%s\n' 'bridge_agent_default_home() { printf "/tmp/%s-home" "$1"; }'
+    # Stub: roster cache refresh — no-op here (this isolated probe does not
+    # source bridge-lib.sh; the dedicated first-run ordering probe below
+    # exercises the REAL cache machinery).
+    printf '%s\n' 'bridge_roster_cache_invalidate() { :; }'
+    printf '%s\n' 'bridge_load_roster() { :; }'
     printf 'source %q\n' "$SMOKE_REPO_ROOT/lib/bridge-init-codex-pair.sh"
     printf 'bridge_init_provision_admin_codex_pair %q %q %q\n' \
       "$cli_shim" "$admin" "$profile"
@@ -114,6 +119,107 @@ run_provision_probe() {
 probe_create_log() {
   local out="$1"
   printf '%s\n' "$out" | sed -n '/^__CREATE_LOG_START__$/,/^__CREATE_LOG_END__$/p' \
+    | sed '1d;$d'
+}
+
+# First-run ORDERING probe — exercises the real sequence a server install
+# takes: bridge_init_provision_admin_codex_pair (creates `<admin>-dev`, which
+# mutates agent-roster.local.sh) immediately followed by
+# bridge_init_register_default_picker_sweep (gates on `bridge_agent_exists
+# <admin>-dev`). Both helpers run in ONE sourced process against the REAL
+# roster machinery from bridge-lib.sh — so the parent's in-memory roster cache
+# is genuinely stale after the child create unless the provisioning helper
+# invalidates + reloads it. This is what catches the codex r1 BLOCKING finding
+# (stale cache → picker-sweep skipped on first run).
+#
+# The CLI shim genuinely mutates `agent-roster.local.sh` on `agent create`
+# (appending the `bridge_add_agent_id_if_missing` line a real create writes),
+# and records `cron create` invocations to a log. The smoke then asserts the
+# picker-sweep cron WAS registered (gate passed = cache was refreshed) and
+# that the "not in roster" skip message did NOT fire.
+#
+# Echoes the helper diagnostics, then a marker block with the recorded
+# `cron create` log.
+run_ordering_probe() {
+  local admin="$1"
+  local probe_dir
+  probe_dir="$(mktemp -d "${TMPDIR:-/tmp}/agent-bridge-ordering.XXXXXX")"
+  local cron_log="$probe_dir/cron-create.log"
+  : >"$cron_log"
+
+  # Isolated roster file: starts with the admin only (the pre-create state a
+  # first-run init reaches after the admin `agent create`).
+  local roster_local="$probe_dir/agent-roster.local.sh"
+  printf 'bridge_add_agent_id_if_missing %q\n' "$admin" >"$roster_local"
+
+  # CLI shim: handles the two subcommands the helpers invoke.
+  #   - `agent create <name> …` → append a roster block that registers the
+  #     agent the way a real `agent create` does (id + BRIDGE_AGENT_SESSION,
+  #     the map `bridge_agent_exists` actually checks), so the on-disk roster
+  #     genuinely changes and the parent cache goes stale until reloaded.
+  #   - `cron list --json`      → empty job list (fresh install).
+  #   - `cron create …`        → record the invocation; this is the assertion
+  #     surface — it only runs if the picker-sweep `bridge_agent_exists` gate
+  #     passed, i.e. the cache was refreshed.
+  local cli_shim="$probe_dir/agent-bridge"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf 'ROSTER_LOCAL=%q\n' "$roster_local"
+    printf 'CRON_LOG=%q\n' "$cron_log"
+    printf '%s\n' 'if [[ "$1" == "agent" && "$2" == "create" ]]; then'
+    printf '%s\n' '  printf "bridge_add_agent_id_if_missing %q\\nBRIDGE_AGENT_SESSION[%q]=%q\\n" "$3" "$3" "$3" >> "$ROSTER_LOCAL"'
+    printf '%s\n' '  exit 0'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'if [[ "$1" == "cron" && "$2" == "list" ]]; then'
+    printf '%s\n' '  printf "{\\"jobs\\":[]}\\n"'
+    printf '%s\n' '  exit 0'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'if [[ "$1" == "cron" && "$2" == "create" ]]; then'
+    printf '%s\n' '  printf "%s\\n" "$*" >> "$CRON_LOG"'
+    printf '%s\n' '  exit 0'
+    printf '%s\n' 'fi'
+    printf '%s\n' 'exit 0'
+  } >"$cli_shim"
+  chmod +x "$cli_shim"
+
+  # Driver: source the real bridge-lib.sh (real bridge_load_roster /
+  # bridge_agent_exists / bridge_roster_cache_invalidate) + both helper libs,
+  # pre-load the roster (cache now has admin only), then run the two helpers
+  # in sequence exactly as bridge-init.sh does.
+  local driver="$probe_dir/driver.sh"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'set -euo pipefail'
+    printf 'export BRIDGE_ROSTER_LOCAL_FILE=%q\n' "$roster_local"
+    # codex must resolve as present so the provisioning helper proceeds.
+    printf 'export PATH=%q\n' "$probe_dir/bin:$PATH"
+    printf 'source %q\n' "$SMOKE_REPO_ROOT/bridge-lib.sh"
+    printf 'source %q\n' "$SMOKE_REPO_ROOT/lib/bridge-init-codex-pair.sh"
+    printf 'source %q\n' "$SMOKE_REPO_ROOT/lib/bridge-init-default-crons.sh"
+    # Prime the parent cache BEFORE the create — this is the stale-cache setup.
+    printf '%s\n' 'bridge_load_roster >/dev/null 2>&1 || true'
+    printf 'bridge_init_provision_admin_codex_pair %q %q server\n' \
+      "$cli_shim" "$admin"
+    printf 'bridge_init_register_default_picker_sweep %q %q\n' \
+      "$cli_shim" "$admin"
+  } >"$driver"
+
+  # codex CLI stub on PATH so bridge_resolve_engine_cli resolves it.
+  mkdir -p "$probe_dir/bin"
+  printf '#!/bin/sh\nexit 0\n' >"$probe_dir/bin/codex"
+  chmod +x "$probe_dir/bin/codex"
+
+  # shellcheck disable=SC1090
+  "$BRIDGE_BASH_BIN_FALLBACK" "$driver" 2>&1 || true
+  printf '__CRON_LOG_START__\n'
+  cat "$cron_log"
+  printf '__CRON_LOG_END__\n'
+  rm -rf -- "$probe_dir"
+}
+
+probe_cron_log() {
+  local out="$1"
+  printf '%s\n' "$out" | sed -n '/^__CRON_LOG_START__$/,/^__CRON_LOG_END__$/p' \
     | sed '1d;$d'
 }
 
@@ -166,6 +272,37 @@ assert_server_codex_absent_solo() {
     "server+codex-absent: helper must log that codex is unavailable"
   smoke_assert_contains "$out" "runs solo" \
     "server+codex-absent: helper must note the claude admin runs solo"
+}
+
+# First-run ordering: server+codex → `<admin>-dev` created AND the picker-sweep
+# cron registered in the SAME run. Catches the stale-parent-roster-cache bug
+# (codex r1 BLOCKING): the provisioning helper must invalidate + reload the
+# parent's roster cache after the child `agent create`, or the immediately
+# following picker-sweep `bridge_agent_exists` gate sees stale state and skips.
+assert_first_run_provisions_and_registers_cron() {
+  local out cron_log
+  out="$(run_ordering_probe patch)"
+  cron_log="$(probe_cron_log "$out")"
+  smoke_assert_contains "$out" "codex-pair auto-provisioned" \
+    "first-run ordering: provisioning helper must create the pair"
+  smoke_assert_not_contains "$out" "picker-sweep cron skipped" \
+    "first-run ordering: picker-sweep must NOT skip — stale roster cache means the provisioning helper failed to refresh it"
+  [[ -n "$cron_log" ]] || smoke_fail "first-run ordering: picker-sweep cron was not registered in the same run (stale-cache regression). Helper output: $out"
+  smoke_assert_contains "$cron_log" "picker-sweep" \
+    "first-run ordering: registered cron must be the picker-sweep job"
+  smoke_assert_contains "$cron_log" "--agent patch-dev" \
+    "first-run ordering: picker-sweep cron must target the freshly created <admin>-dev pair"
+}
+
+# Source-level guard: the provisioning helper must refresh the parent's roster
+# cache after a successful create (the #848 child-mutation pattern), or the
+# picker-sweep registration that follows skips on a stale cache.
+assert_helper_refreshes_roster_cache() {
+  local helper="$SMOKE_REPO_ROOT/lib/bridge-init-codex-pair.sh"
+  grep -q 'bridge_roster_cache_invalidate' "$helper" \
+    || smoke_fail "lib/bridge-init-codex-pair.sh: must call bridge_roster_cache_invalidate after the child create"
+  grep -q 'bridge_load_roster' "$helper" \
+    || smoke_fail "lib/bridge-init-codex-pair.sh: must call bridge_load_roster after invalidating the cache"
 }
 
 # Source-level guard: the helper must be wired into bridge-init.sh AFTER
@@ -279,8 +416,12 @@ main() {
     assert_dev_profile_admin_only
   smoke_run "server + codex absent → claude admin runs solo (no pair)" \
     assert_server_codex_absent_solo
+  smoke_run "first-run ordering → pair created AND picker-sweep cron registered in one run" \
+    assert_first_run_provisions_and_registers_cron
   smoke_run "bridge-init.sh wires helper after profile resolution, before picker-sweep" \
     assert_init_wires_helper_before_picker_sweep
+  smoke_run "helper refreshes parent roster cache after the child create (#848 pattern)" \
+    assert_helper_refreshes_roster_cache
   smoke_run "helper uses non-fatal codex detection (bridge_resolve_engine_cli)" \
     assert_helper_uses_nonfatal_codex_detection
   smoke_run "upgrade-time legacy-pair advisory still short-circuits + idempotent" \

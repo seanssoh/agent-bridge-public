@@ -465,18 +465,24 @@ agb --claude --name pr-fix --prefer shared   # primary checkout 강제 (reducer 
 
 > 참고: 스태틱 에이전트는 기본적으로 `--loop`이 켜져 있습니다. 백그라운드 crash는 5초 후 자동 재시작되며, 10회 연속 실패 시에는 60초 대기 후 재시도합니다.
 
-### Admin codex pair (`<admin>-dev`) — 명시 등록 contract
+### Admin codex pair (`<admin>-dev`) — server 자동 등록 / dev 명시 등록 contract
 
-권장 admin 페어는 모델 다양성을 보장하는 `patch (claude) + patch-dev (codex)` 조합입니다. v0.14.1 까지 존재했던 `<admin>-dev` 자동 생성은 issue #4769 에서 제거됐습니다 — 다른 엔진의 sibling 을 자동으로 등록해서 다양성 의도가 깨지는 회귀가 있었습니다. 이제는 운영자가 명시적으로 한 번 등록하면 됩니다:
+권장 admin 페어는 모델 다양성을 보장하는 `patch (claude) + patch-dev (codex)` 조합입니다. issue #1052 (reconsiders #4769) 부터 `<admin>-dev` 자동 등록은 **두 조건이 모두 충족될 때만** 설치 시점에 일어납니다:
+
+- **host profile = `server` 이고 codex CLI 가 설치돼 있을 때** → `bridge-bootstrap.sh` / `agent-bridge init` 이 admin claude 에이전트와 함께 `<admin>-dev` (codex) 를 자동 생성·활성화합니다. 별도 명령이 필요 없습니다.
+- **host profile = `dev` 일 때** → codex CLI 가 있어도 `<admin>-dev` 는 자동 생성되지 않습니다 (dev 프로파일은 의도적으로 admin 1 개만 등록). 필요하면 아래 명령으로 직접 등록합니다.
+- **codex CLI 가 없을 때** → 페어 프로그래밍은 사용할 수 없고 claude admin 만 단독 실행됩니다.
+
+`dev` 호스트에서, 또는 codex CLI 를 나중에 설치한 server 호스트에서 페어를 수동으로 등록하려면:
 
 ```bash
 agent-bridge setup admin patch                          # BRIDGE_ADMIN_AGENT_ID 저장
 agent-bridge agent create patch-dev --engine codex \
   --workdir "$(agent-bridge agent show patch --field workdir)" \
-  --allow-shared-workdir --always-on                    # pair 등록 (선택)
+  --allow-shared-workdir --always-on                    # pair 등록
 ```
 
-pair-programming SOP — admin 이 plan, dev 가 review/implement — 는 위 두 명령을 모두 수행한 호스트에서만 운영자가 admin 의 `CLAUDE.md` 에 직접 작성해 사용합니다. picker-sweep cron 은 `<admin>-dev` 가 roster 에 등록된 상태에서 다음 `bridge-bootstrap.sh` / `agent-bridge upgrade --apply` 실행 시 자동 backfill 됩니다.
+pair-programming SOP — admin 이 plan, dev 가 review/implement — 는 페어가 등록된 호스트에서 운영자가 admin 의 `CLAUDE.md` 에 직접 작성해 사용합니다. picker-sweep cron 은 `<admin>-dev` 가 roster 에 등록된 상태에서 등록되며, server + codex 자동 등록 경로에서는 같은 init 실행 안에서 backfill 됩니다 (codex CLI 를 나중에 설치한 server 호스트는 `bridge-bootstrap.sh` 재실행 시 페어 + cron 모두 backfill).
 
 **다이나믹 에이전트는 이런 때 씁니다**:
 - 잠깐 작업하고 버릴 워커가 필요할 때 (크론/서브에이전트와 달리 사용자가 실시간으로 조종 가능)
