@@ -38,7 +38,13 @@ trap cleanup EXIT
 run_create() {
   # Capture stdout+stderr together; never let a non-zero exit kill the
   # test before we assert on the captured text.
-  bash "$SMOKE_REPO_ROOT/bridge-agent.sh" create "$@" 2>&1 || true
+  # Issue #1047: `agent create` is caller-trust gated and rejects an
+  # `agent-direct` source. This smoke exercises name validation and the
+  # dry-run plan path, not the gate — force a trusted source so the
+  # positive controls reach those code paths. Name-validation failures
+  # fire earlier, so the negative cases are unaffected by the env.
+  BRIDGE_CALLER_SOURCE="operator-trusted-id" \
+    bash "$SMOKE_REPO_ROOT/bridge-agent.sh" create "$@" 2>&1 || true
 }
 
 run_agent_bridge() {

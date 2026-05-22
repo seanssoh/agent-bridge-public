@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-no-auto-backfill mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-update agent-update-launch-cmd-redaction agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir isolated-agent-delete-reap nudge-task-age-gate tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge
+  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-update agent-update-launch-cmd-redaction agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir isolated-agent-delete-reap nudge-task-age-gate tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge
 }
 
 add_all_integration() {
@@ -295,7 +295,12 @@ select_for_path() {
       # false-negates on the 0750 isolated agent root). Pull its unit
       # smoke whenever bridge-start.sh moves so a future PR cannot
       # regress the privilege-aware probe back to the plain check.
-      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-update agent-update-launch-cmd-redaction agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1028-isolated-workdir-check
+      # Issue #1047: bridge-agent.sh::run_create is now caller-trust gated
+      # (an agent-direct source is denied, mirroring update/delete). Pull
+      # its gate smoke whenever bridge-agent.sh or lib/bridge-agent-update.sh
+      # moves so a future PR cannot regress the create/update/delete trust
+      # symmetry back to an ungated create.
+      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-update agent-update-launch-cmd-redaction agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1028-isolated-workdir-check
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -470,7 +475,7 @@ select_for_path() {
       # marker-only fast-path. Pull the regression smoke (T3 specifically
       # asserts the env-propagation contract — fast-path NOT fired when
       # BRIDGE_UPGRADE_CONTEXT is unset) whenever the upgrade entry moves.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-no-auto-backfill telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate
       add_integration integration-minimal
       ;;
 
@@ -489,8 +494,19 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
-    bridge-init.sh)
-      add_required admin-pair-no-auto-backfill upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering
+    bridge-init.sh|lib/bridge-init-codex-pair.sh|lib/bridge-init-default-crons.sh|lib/bridge-host-profile.sh)
+      # Issue #1047: bridge-init.sh's fresh-install admin `agent create`
+      # runs as a subprocess (no TTY) and must mark itself an
+      # operator-trusted caller, or the new create gate would deny the
+      # bootstrap. Pull the gate smoke so a future PR cannot drop that
+      # trusted-source marker and silently break first install.
+      # Issue #1052: lib/bridge-init-codex-pair.sh auto-provisions the
+      # `<admin>-dev` codex pair on a server host; the picker-sweep cron
+      # (lib/bridge-init-default-crons.sh) targets it, and the host-profile
+      # advisory (lib/bridge-host-profile.sh) carries the dev-path manual
+      # recipe. Pull admin-pair-server-auto-provision whenever any of the
+      # four touches so the server/dev gate matrix stays pinned.
+      add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering
       add_integration integration-minimal
       ;;
 

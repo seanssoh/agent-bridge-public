@@ -5149,6 +5149,12 @@ REVIEW_BYPASS_OUTPUT="$("$REPO_ROOT/agent-bridge" review request --from "$SMOKE_
 assert_contains "$REVIEW_BYPASS_OUTPUT" "review_bypassed: yes"
 assert_contains "$REVIEW_BYPASS_OUTPUT" "reason: trivial"
 
+# Issue #1047: `agent create` is now caller-trust gated and rejects an
+# `agent-direct` source. These smoke creates run inside `$(...)` captures
+# (no TTY), so without an explicit trusted source the gate would deny them.
+# Mark the create block as a sanctioned operator-trusted caller; unset
+# right after so later subcommands keep their default source detection.
+export BRIDGE_CALLER_SOURCE="operator-trusted-id"
 SHARED_USER_CREATE_JSON="$("$REPO_ROOT/agent-bridge" agent create "$SHARED_USER_AGENT" --engine claude --session "$SHARED_USER_SESSION" --dry-run --json)"
 assert_contains "$SHARED_USER_CREATE_JSON" "\"id\": \"owner\""
 SHARED_USER_CREATE_OUTPUT="$("$REPO_ROOT/agent-bridge" agent create "$SHARED_USER_AGENT" --engine claude --session "$SHARED_USER_SESSION")"
@@ -5169,6 +5175,8 @@ assert_contains "$CREATE_JSON_OUTPUT_NO_REGISTRY" "\"channels\": \"plugin:telegr
 CREATE_TEAMS_JSON_OUTPUT="$("$REPO_ROOT/agent-bridge" agent create "${CREATED_AGENT}-teams" --engine claude --session "${CREATED_SESSION}-teams" --channels plugin:teams --dry-run --json)"
 assert_contains "$CREATE_TEAMS_JSON_OUTPUT" "\"channels\": \"plugin:teams@agent-bridge\""
 CREATE_OUTPUT="$("$REPO_ROOT/agent-bridge" agent create "$CREATED_AGENT" --engine claude --session "$CREATED_SESSION" --role "Smoke created role" --channels plugin:telegram --user owner:Owner --user reviewer:Reviewer)"
+# Issue #1047: end of the gated-create block — restore default source detection.
+unset BRIDGE_CALLER_SOURCE
 assert_contains "$CREATE_OUTPUT" "create: ok"
 assert_contains "$CREATE_OUTPUT" "start_dry_run: ok"
 assert_contains "$(cat "$BRIDGE_ROSTER_LOCAL_FILE")" "BRIDGE_AGENT_ENGINE[\"$CREATED_AGENT\"]=claude"

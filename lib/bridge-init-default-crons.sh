@@ -2,16 +2,22 @@
 # shellcheck shell=bash
 # bridge-init-default-crons.sh — fresh-install default cron registrations.
 #
-# Track D follow-up to #713 / #809, follow-on to #833: a fresh install (server
-# OR dev) should not need an extra step to enable the essentials. picker-sweep
-# is the first essential we auto-register here. The helper is invoked from
-# bridge-init.sh AFTER bridge_host_profile_run returns. Registration is
-# unconditional with respect to host_profile — the registered cron payload
-# sets BRIDGE_PICKER_SWEEP_ENABLED=1, which overrides the runtime
-# host_profile=dev default-skip in scripts/picker-sweep.sh. Operators who
-# want the sweep disabled can `agb cron update picker-sweep --disable` after
-# init. The helper is intentionally idempotent: re-running init must not
-# double-register.
+# Track D follow-up to #713 / #809, follow-on to #833: a fresh install should
+# not need an extra step to enable the essentials. picker-sweep is the first
+# essential we auto-register here. The helper is invoked from bridge-init.sh
+# AFTER bridge_host_profile_run returns. Registration is GATED on the cron
+# target `<admin>-dev` existing in the roster (see the function-level comment
+# below): after issue #1052 that pair is auto-provisioned at install time only
+# on a `server` host with the codex CLI present, so a server+codex install
+# registers the sweep in the same init run. A `dev` install (admin-only by
+# design) or a codex-absent host has no `<admin>-dev` pair and the helper logs
+# a skip until the operator creates the pair (or a server host re-runs
+# bridge-bootstrap.sh). Once registered, the cron payload sets
+# BRIDGE_PICKER_SWEEP_ENABLED=1, which overrides the runtime host_profile=dev
+# default-skip in scripts/picker-sweep.sh so the sweep still runs on a dev
+# host that has the pair. Operators who want the sweep disabled can
+# `agb cron update picker-sweep --disable` after init. The helper is
+# intentionally idempotent: re-running init must not double-register.
 #
 # Future essentials (e.g. additional unstick / hygiene crons) belong here too;
 # keep each registration in its own function so re-runs can be reasoned about
@@ -27,13 +33,14 @@
 #
 # Per OPERATIONS.md "picker-sweep utility" §B (Bridge-native cron with a
 # Codex target): the cron runner wraps payloads in `claude -p` (or `codex
-# exec`), so we target `<admin>-dev` (the codex pair that the operator
-# explicitly registers alongside the admin, e.g. `patch-dev` for the
-# default `patch` admin). Targeting the Claude admin would route
+# exec`), so we target `<admin>-dev` (the admin's codex pair, e.g. `patch-dev`
+# for the default `patch` admin). Targeting the Claude admin would route
 # picker-sweep through the very picker it is meant to clear — see
-# OPERATIONS.md. Issue #4769 (reverts #517): the `<admin>-dev` pair is
-# no longer auto-created on init; the existence guard below already
-# short-circuits when the operator hasn't registered it yet.
+# OPERATIONS.md. Issue #1052: on a `server` host with the codex CLI present
+# the `<admin>-dev` pair is auto-provisioned earlier in init, so this guard
+# passes on the common path; the existence guard below still short-circuits
+# gracefully on a `dev` host, a codex-absent host, or before the operator has
+# created the pair by hand.
 bridge_init_register_default_picker_sweep() {
   local agent_bridge_cli="$1"
   local admin_agent="$2"
@@ -50,15 +57,17 @@ bridge_init_register_default_picker_sweep() {
 
   # Skip when the cron target <admin>-dev (the codex pair) is not in the
   # roster. Without this guard the cron persists a job referencing an
-  # agent that does not exist — every dispatch then fails. After issue
-  # #4769 the `<admin>-dev` pair is no longer auto-created on init: the
-  # operator registers it explicitly with `agent-bridge agent create
-  # <admin>-dev --engine codex …`. Operators who skip the dev pair (or
-  # haven't installed the codex CLI yet) keep the skip message below;
-  # re-running `bridge-bootstrap.sh` after registering the pair will
-  # backfill the cron on its next invocation.
+  # agent that does not exist — every dispatch then fails. Issue #1052
+  # auto-provisions `<admin>-dev` earlier in init on a `server` host when
+  # the codex CLI is present, so this guard passes on the common path. It
+  # still short-circuits on a `dev` host (admin-only by design) or when the
+  # codex CLI is absent: in those cases the operator creates the pair by
+  # hand with `agent-bridge agent create <admin>-dev --engine codex …`, then
+  # re-runs `bridge-bootstrap.sh` to backfill the cron. On a `server` host
+  # with the codex CLI installed, re-running `bridge-bootstrap.sh` will
+  # auto-provision the pair AND backfill this cron on the next invocation.
   if ! bridge_agent_exists "$cron_agent" 2>/dev/null; then
-    printf '[init] picker-sweep cron skipped — target agent %s not in roster (codex pair absent). Install codex CLI and re-run bridge-bootstrap.sh to backfill.\n' "$cron_agent" >&2
+    printf '[init] picker-sweep cron skipped — target agent %s not in roster (codex pair absent). Create it with `agent-bridge agent create %s --engine codex …`, or on a server host install the codex CLI and re-run bridge-bootstrap.sh to auto-provision the pair and backfill.\n' "$cron_agent" "$cron_agent" >&2
     return 0
   fi
 

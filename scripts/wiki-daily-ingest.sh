@@ -41,6 +41,27 @@ WIKI="$BRIDGE_WIKI_ROOT"
 SCRIPTS_ROOT="$BRIDGE_SCRIPTS_ROOT"
 DATE=$(date +%Y-%m-%d)
 
+# Source the host-profile helper so Lane B's librarian gate (issue #1042)
+# can call bridge_host_profile_is_dev() directly — that helper applies the
+# correct env-override semantics (BRIDGE_HOST_PROFILE=server is an explicit
+# not-dev that wins over a JSON file) and avoids reimplementing the JSON
+# read inline. bridge-host-profile.sh sources standalone (no loader chain).
+# Resolution: the lib lives one level up from scripts/ in a source checkout
+# and under $BRIDGE_HOME/lib in a deployed install; try both. If neither is
+# readable the gate falls back to a profile-agnostic check (see
+# lane_b_librarian_enabled).
+_WDI_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+for _wdi_hp_lib in \
+  "$_WDI_SCRIPT_DIR/../lib/bridge-host-profile.sh" \
+  "$BRIDGE_HOME/lib/bridge-host-profile.sh"; do
+  if [[ -r "$_wdi_hp_lib" ]]; then
+    # shellcheck source=../lib/bridge-host-profile.sh
+    source "$_wdi_hp_lib"
+    break
+  fi
+done
+unset _wdi_hp_lib
+
 # compute_since_date — resolve effective --since for Lane A.
 #
 # Reads the persisted watermark if it exists and parses as YYYY-MM-DD.
@@ -473,19 +494,125 @@ non_daily_total=$(( research_count + other_count + raw_count ))
   fi
 } > "$LOG"
 
+# -------------------------------------------------------------------------
+# Lane B routing gates (issue #1042)
+#
+# `agb agent show librarian` succeeding only proves the role *exists* — not
+# that librarian ingest is *enabled* for this host profile, nor that the
+# enqueue would land in the intended live task DB. Two gates run before the
+# librarian enqueue; either failing routes Lane B to a no-op with an audit
+# reason instead of accumulating unserviceable queue residue or leaking
+# hermetic fixture artifacts into the live DB.
+# -------------------------------------------------------------------------
+
+# Gate 1 — librarian ingest enabled for this host profile.
+#
+# On a dev-profile install the librarian/watchdog/wiki-ingest cron family is
+# disabled (see lib/bridge-host-profile.sh) and the librarian session is not
+# kept awake, so enqueued [librarian-ingest] tasks are never serviced.
+# Returns 0 (enabled) only when BOTH:
+#   - the host profile is not "dev" (server / unknown both pass — unknown
+#     keeps the pre-#1042 behaviour for installs that never ran host-profile
+#     onboarding), AND
+#   - the `wiki-daily-ingest` cron — the job that drives this very script —
+#     is currently enabled. If the cron inventory cannot be read the gate
+#     is permissive (returns 0) so a healthy server install whose cron list
+#     is briefly unavailable still ingests.
+lane_b_librarian_enabled() {
+  # Host-profile dev check. Use the canonical helper bridge_host_profile_is_dev
+  # from lib/bridge-host-profile.sh (sourced at the top of this script) so the
+  # env-override semantics are correct: BRIDGE_HOST_PROFILE=server is an
+  # explicit not-dev that returns BEFORE any JSON file is read. When the lib
+  # could not be sourced (function undefined) the gate skips the profile check
+  # entirely and falls through to the cron-enablement check below — that keeps
+  # the gate profile-agnostic rather than guessing from a partial reimpl.
+  if declare -F bridge_host_profile_is_dev >/dev/null 2>&1; then
+    if bridge_host_profile_is_dev; then
+      return 1
+    fi
+  fi
+
+  # `wiki-daily-ingest` cron enablement check. A non-zero exit / missing
+  # cron inventory is treated as permissive (do not block a server install
+  # whose cron list is momentarily unavailable). The JSON is parsed by the
+  # standalone file-as-argv helper scripts/wiki-ingest-cron-enabled.py — a
+  # heredoc-stdin python3 invocation here would be a banned footgun-#11 site.
+  local cron_json=""
+  if ! cron_json="$("$BRIDGE_AGB" cron list --json 2>/dev/null)"; then
+    return 0
+  fi
+  [[ -n "$cron_json" ]] || return 0
+  command -v "$BRIDGE_PYTHON" >/dev/null 2>&1 || return 0
+  local _cron_helper="$_WDI_SCRIPT_DIR/wiki-ingest-cron-enabled.py"
+  [[ -r "$_cron_helper" ]] || return 0  # helper missing → permissive
+  "$BRIDGE_PYTHON" "$_cron_helper" "$cron_json"
+}
+
+# Gate 2 — same-install guard.
+#
+# A hermetic smoke/repro run sets BRIDGE_HOME to an isolated fixture (e.g.
+# /private/var/.../tmp.*/bridge-home) but can still inherit a BRIDGE_AGB or
+# BRIDGE_TASK_DB pointing at the live install — which leaks fixture-derived
+# [librarian-ingest] tasks into the live queue (#1042). This proves the AGB
+# binary AND the resolved task DB AND the state root all resolve under the
+# current $BRIDGE_HOME before any task is created. A path-prefix string
+# match is not enough — paths are canonicalised first so symlinks / `..`
+# cannot defeat the check. Returns 0 only when all three resolve inside
+# $BRIDGE_HOME.
+lane_b_same_install() {
+  command -v "$BRIDGE_PYTHON" >/dev/null 2>&1 || return 1
+  # Resolve the task DB path the same way bridge-queue.py does:
+  #   BRIDGE_TASK_DB → BRIDGE_STATE_DIR/tasks.db → BRIDGE_HOME/state/tasks.db
+  local task_db="${BRIDGE_TASK_DB:-$BRIDGE_STATE_DIR/tasks.db}"
+  # Path canonicalisation + prefix check runs in the standalone file-as-argv
+  # helper scripts/wiki-ingest-same-install.py — a heredoc-stdin python3
+  # invocation here would be a banned footgun-#11 site. Helper missing →
+  # fail closed (treat as cross-install) since the guard cannot be proven.
+  local _same_helper="$_WDI_SCRIPT_DIR/wiki-ingest-same-install.py"
+  [[ -r "$_same_helper" ]] || return 1
+  "$BRIDGE_PYTHON" "$_same_helper" \
+    "$BRIDGE_HOME" "$BRIDGE_AGB" "$task_db" "$BRIDGE_STATE_DIR"
+}
+
 # Queue librarian task only for non-daily work. Lane A already handled
 # daily notes and did not produce a task. Falls back to the admin agent
 # (default: patch) only if the librarian is not provisioned on this
 # install — treated as an install incompleteness signal, not a routine
 # routing choice.
+lane_b_enqueue_status="skipped-no-work"
 if [ "$non_daily_total" -gt 0 ]; then
-  target="$BRIDGE_ADMIN_AGENT"
-  if "$BRIDGE_AGB" agent show librarian >/dev/null 2>&1; then
-    target="librarian"
+  if ! lane_b_librarian_enabled; then
+    lane_b_enqueue_status="skipped-librarian-disabled"
+    {
+      echo ""
+      echo "## Lane B enqueue skipped"
+      echo ""
+      echo "reason: librarian ingest is not enabled for this host profile"
+      echo "(host profile=dev or wiki-daily-ingest cron disabled). $non_daily_total"
+      echo "non-daily file(s) detected but no [librarian-ingest] task created —"
+      echo "re-enable with \`agb cron update wiki-daily-ingest --enable\`."
+    } >> "$LOG"
+  elif ! lane_b_same_install; then
+    lane_b_enqueue_status="skipped-cross-install"
+    {
+      echo ""
+      echo "## Lane B enqueue skipped"
+      echo ""
+      echo "reason: same-install guard failed — BRIDGE_AGB / task DB / state"
+      echo "root do not all resolve under BRIDGE_HOME=$BRIDGE_HOME. Refusing to"
+      echo "enqueue a [librarian-ingest] task to avoid leaking fixture-derived"
+      echo "work into a different install's queue (#1042)."
+    } >> "$LOG"
+  else
+    target="$BRIDGE_ADMIN_AGENT"
+    if "$BRIDGE_AGB" agent show librarian >/dev/null 2>&1; then
+      target="librarian"
+    fi
+    "$BRIDGE_AGB" task create --to "$target" --priority normal --from "$BRIDGE_ADMIN_AGENT" \
+      --title "[librarian-ingest] $non_daily_total 파일 ingest 필요 — $DATE" \
+      --body-file "$LOG" >/dev/null 2>&1 || true
+    lane_b_enqueue_status="enqueued-$target"
   fi
-  "$BRIDGE_AGB" task create --to "$target" --priority normal --from "$BRIDGE_ADMIN_AGENT" \
-    --title "[librarian-ingest] $non_daily_total 파일 ingest 필요 — $DATE" \
-    --body-file "$LOG" >/dev/null 2>&1 || true
 fi
 
 # Advance the watermark only when Lane A reported errors=0 AND the copy
@@ -505,4 +632,4 @@ skipped_isolated_csv=""
 if (( skipped_isolated_count > 0 )); then
   skipped_isolated_csv="$(IFS=,; echo "${SKIPPED_ISOLATED_AGENTS[*]}")"
 fi
-echo "wiki-daily-ingest: date=$DATE since=$YESTERDAY lane-a ${copy_summary} lane-b research=$research_count other=$other_count raw=$raw_count total=$non_daily_total skipped-isolated=$skipped_isolated_count skipped-isolated-reason=$LANE_B_ISOLATED_SKIP_REASON skipped-isolated-agents=${skipped_isolated_csv:-none} log=$LOG"
+echo "wiki-daily-ingest: date=$DATE since=$YESTERDAY lane-a ${copy_summary} lane-b research=$research_count other=$other_count raw=$raw_count total=$non_daily_total enqueue=$lane_b_enqueue_status skipped-isolated=$skipped_isolated_count skipped-isolated-reason=$LANE_B_ISOLATED_SKIP_REASON skipped-isolated-agents=${skipped_isolated_csv:-none} log=$LOG"

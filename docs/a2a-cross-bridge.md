@@ -190,6 +190,15 @@ backpressure: over quota → `429` with `Retry-After`.
 The delivery runner can be daemon-driven or cron-driven (`a2a daemon
 tick` ensures the receiver is up, then drains the outbox once).
 
+`a2a daemon start` launches the receiver with a POSIX double-fork detach
+(`bridge-handoffd.py serve --detach`) **after** the tailnet bind succeeds,
+so the listener is reparented into its own session and survives the
+launching shell / managed agent tool session exiting — a bare background
+job is not durable from such shells. The detached process owns the pid
+file, so `a2a daemon status` reflects the real long-lived listener. A
+fail-closed bind error still surfaces synchronously as a non-zero exit
+from `start` (the bind happens before the detach).
+
 ## Configuration
 
 Copy `handoff.local.example.json` to `$BRIDGE_HOME/handoff.local.json`,

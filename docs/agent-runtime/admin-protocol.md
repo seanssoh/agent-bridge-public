@@ -115,12 +115,17 @@ cron child가 자기 부모 에이전트(`target_agent`)에게 보내는 `[cron-
 
 Admin이 사용자의 "앞으로 계속" 지시를 받으면 [`user-preference-injection.md`](user-preference-injection.md) 규칙을 따라 승격한다. Team-wide scope의 preference는 admin 승인 후에만 `docs/agent-runtime/active-preferences.md`에 쓴다. Agent-local scope는 대상 에이전트의 `ACTIVE-PREFERENCES.md`로 전달한다.
 
-## Admin pair contract — explicit setup, model-diverse pair
+## Admin pair contract — server 자동 등록 / dev 명시 등록, model-diverse pair
 
-issue #4769 (reverts #517) 부터 admin agent + sibling codex pair 는 운영자가 **명시적으로** 한 번 등록해야 한다. v0.14.0 까지 동작하던 "upgrade 마다 `<admin>-dev` 자동 생성" 동작은 제거됐다. 이유:
+issue #1052 (reconsiders #4769) 부터 admin agent 의 sibling codex pair (`<admin>-dev`) 는 **host profile 과 codex CLI 가용성에 따라** 등록 방식이 갈린다:
 
-- 자동 등록은 `BRIDGE_ADMIN_AGENT_ID` 를 운영자가 고른 값(보통 `patch`) 에서 literal `admin` 으로 silently 덮어썼다. 운영자 자율성 회귀.
-- 자동 등록된 `admin-dev` 는 `admin` 과 같은 엔진(codex)이라, 권장 표준인 `patch (claude) + patch-dev (codex)` 의 **model diversity** 의도가 깨졌다. 두 codex 페어는 같은 inference 한계를 공유해 review loop 가 약해진다.
+- **host profile = `server` + codex CLI 설치됨** → `bridge-bootstrap.sh` / `agent-bridge init` 이 설치 시점에 `<admin>-dev` (codex) 를 자동 생성·활성화한다. 운영자 명령 불필요.
+- **host profile = `dev`** → codex CLI 가 있어도 자동 생성하지 않는다. dev 프로파일은 의도적으로 admin 1 개만 등록한다 (#4769 dev-minimal 철학). 페어가 필요하면 아래 절차로 직접 등록한다.
+- **codex CLI 없음** → 페어 프로그래밍 불가, claude admin 만 단독 실행.
+
+`<admin>-dev` 는 admin (`patch`) 과 같은 엔진(codex)이 아니다 — admin 은 claude, pair 는 codex 다. 이 **model diversity** 가 권장 표준 `patch (claude) + patch-dev (codex)` 의 핵심이다. 두 codex 페어는 같은 inference 한계를 공유해 review loop 가 약해지므로, 자동 등록 경로는 항상 `--engine codex` sibling 을 claude admin 옆에 붙인다.
+
+`BRIDGE_ADMIN_AGENT_ID` 는 운영자가 고른 값(보통 `patch`)으로만 유지된다 — 자동 페어 등록은 이 스칼라를 건드리지 않는다.
 
 ### 권장 표준 페어
 
@@ -129,19 +134,23 @@ issue #4769 (reverts #517) 부터 admin agent + sibling codex pair 는 운영자
 | Admin      | `patch`     | claude    | plan / coordinate / 운영자 surface              |
 | Pair (dev) | `patch-dev` | codex     | implement / review — model-diverse second view  |
 
-### 등록 절차 (운영자가 1 회)
+### 등록 절차 (`dev` 호스트, 또는 codex 를 나중에 설치한 server 호스트)
+
+server + codex 자동 등록 경로가 아닌 경우 운영자가 1 회 등록한다:
 
 ```bash
 # 1. admin identifier 를 명시 (BRIDGE_ADMIN_AGENT_ID 저장)
 agent-bridge setup admin patch
 
-# 2. (선택) sibling codex pair 등록. 위 표의 권장 표준이 필요할 때만.
+# 2. sibling codex pair 등록.
 agent-bridge agent create patch-dev \
   --engine codex \
   --workdir "$(agent-bridge agent show patch --field workdir)" \
   --allow-shared-workdir \
   --always-on
 ```
+
+server 호스트에 codex CLI 를 나중에 설치했다면, 위 명령 대신 `bridge-bootstrap.sh` 를 재실행하면 페어가 자동 backfill 된다 (#1052 의 idempotent 자동 등록 경로).
 
 `agent-bridge setup admin <agent>` 는 `BRIDGE_ADMIN_AGENT_ID` 를 `agent-roster.local.sh` 에 쓰는 유일한 코드 경로다. dynamic→static reclassify (operator-invoked OR upgrade-invoked), install, upgrade 같은 다른 경로는 더 이상 이 스칼라를 silently 쓰지 않는다. v0.14.0 부터 v0.14.1 까지는 `agent reclassify --apply` 가 admin 스칼라도 함께 backfill 했고, `bridge-upgrade.sh` 가 매 non-dry-run upgrade 마다 그 reclassify pass 를 자동 호출했다 — 이게 운영자가 고른 `BRIDGE_ADMIN_AGENT_ID=patch` 를 literal `admin` 으로 silently 덮어쓰는 회귀의 정확한 경로였다. #4769 부터는 reclassify 가 순수하게 source 분류 복구만 한다.
 

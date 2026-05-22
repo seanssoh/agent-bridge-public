@@ -23,6 +23,8 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 source "$SCRIPT_DIR/lib/bridge-host-profile.sh"
 # shellcheck source=lib/bridge-init-default-crons.sh
 source "$SCRIPT_DIR/lib/bridge-init-default-crons.sh"
+# shellcheck source=lib/bridge-init-codex-pair.sh
+source "$SCRIPT_DIR/lib/bridge-init-codex-pair.sh"
 # bridge_load_roster is deferred until after argument parsing so that
 # `init --dry-run` is mutation-free (bridge_load_roster -> bridge_init_dirs
 # would otherwise create $BRIDGE_HOME/state on a fresh-install-candidate and
@@ -496,7 +498,13 @@ else
   if [[ $always_on -eq 1 ]]; then
     create_args+=(--always-on)
   fi
-  "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "${create_args[@]}" >/dev/null
+  # Issue #1047: `agent create` is now caller-trust gated and rejects an
+  # `agent-direct` source. This fresh-install admin create is an
+  # operator-initiated bootstrap step, but it runs as a subprocess with a
+  # redirected stdout so TTY detection would demote it to `agent-direct`.
+  # Mark it as a sanctioned operator-trusted caller so the gate allows it.
+  BRIDGE_CALLER_SOURCE="operator-trusted-id" \
+    "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/agent-bridge" "${create_args[@]}" >/dev/null
   created=1
   # Issue #848: the child `agent create` invocation mutated the roster
   # files on disk, so the next `bridge_load_roster` MUST re-parse them
@@ -505,12 +513,14 @@ else
   bridge_load_roster
 fi
 
-# Issue #4769 (reverts #517): no auto-backfill of `<admin>-dev` codex pair.
-# Operator runs `agent-bridge setup admin <agent>` explicitly to set the
-# admin identifier, and creates any sibling dev agent (e.g. `patch-dev`)
-# with `agent-bridge agent create <name> --engine codex …` when desired.
-# Auto-creating a sibling defeated the model-diversity intent of the
-# `patch (claude) + patch-dev (codex)` standard pair.
+# Issue #1052 (reconsiders #4769, which reverted #517): the `<admin>-dev`
+# codex pair IS auto-provisioned on a fresh install — but only when the codex
+# CLI is present AND the resolved host profile is `server`. That gated
+# provisioning happens below, after host-profile resolution and before the
+# picker-sweep cron registration (whose target is `<admin>-dev`). On a `dev`
+# profile the install stays admin-only and the dev advisory prints the manual
+# `agent create <admin>-dev --engine codex …` recipe; when codex is absent the
+# claude admin runs solo.
 
 if [[ $dry_run -eq 0 ]] && [[ "$(bridge_agent_engine "$admin_agent" 2>/dev/null || printf '%s' "$engine")" == "claude" ]]; then
   admin_workdir="$(bridge_agent_workdir "$admin_agent" 2>/dev/null || true)"
@@ -526,14 +536,16 @@ fi
 
 # Issue #713 follow-up: ask the operator whether this is a server (always-on
 # production host) or a developer PC, then let the dev branch short-circuit the
-# heavy server-only setup that follows. Must run AFTER the admin agent and its
-# codex pair exist (the dev advisory references them by id) but BEFORE channel
-# bootstrap so a `dev` answer skips Discord/Telegram/Teams/Mattermost setup
-# entirely instead of forcing the operator to confirm or `--skip-channel-setup`
-# every flag. Re-running init on an already-answered host is idempotent unless
-# `--reconfigure` is passed; non-interactive (`--json`, no TTY) defaults to
-# `server` to preserve today's behavior on hosted installs. Skipped on
-# `--dry-run` (mutation-free contract).
+# heavy server-only setup that follows. Must run AFTER the admin agent exists
+# (the dev advisory references the admin and the `<admin>-dev` pair by id only
+# — it does not require the pair to exist; issue #1052 provisions the codex
+# pair LATER, just below, gated on the host_profile this step resolves) but
+# BEFORE channel bootstrap so a `dev` answer skips Discord/Telegram/Teams/
+# Mattermost setup entirely instead of forcing the operator to confirm or
+# `--skip-channel-setup` every flag. Re-running init on an already-answered
+# host is idempotent unless `--reconfigure` is passed; non-interactive
+# (`--json`, no TTY) defaults to `server` to preserve today's behavior on
+# hosted installs. Skipped on `--dry-run` (mutation-free contract).
 if [[ $dry_run -eq 0 ]]; then
   bridge_init_ensure_live_cli
   # Prefer the live CLI deployed under $BRIDGE_HOME (canonical post-init
@@ -556,13 +568,29 @@ if [[ $dry_run -eq 0 ]]; then
       bridge_init_append_warning "host_profile=dev: requested channels (${channels}) — channel bootstrap skipped this init. Re-run \`agb setup <channel> ${admin_agent}\` later or pass \`--profile server\` to enable on this install."
     fi
   fi
+  # Issue #1052: auto-provision the admin's `<admin>-dev` codex pair before
+  # the picker-sweep cron registration below — the cron targets `<admin>-dev`,
+  # so the pair must exist first or the registration skips. The helper is
+  # gated on codex-CLI presence AND host_profile == server (the `dev` path
+  # stays admin-only and keeps its manual-create advisory), and is idempotent
+  # + non-fatal — re-running init when the pair already exists is a no-op and
+  # any failure is logged without blocking init.
+  bridge_init_provision_admin_codex_pair "$host_profile_cli" "$admin_agent" "$host_profile_chosen" || true
+
   # Track D follow-up to #713 / #809, follow-on to #833: auto-register the
-  # picker-sweep bridge-native cron on every fresh install, regardless of
-  # host_profile. The helper is idempotent (short-circuits when a job titled
-  # `picker-sweep` already exists), and the registered cron payload sets
-  # `BRIDGE_PICKER_SWEEP_ENABLED=1` — that env var wins against the runtime
-  # host_profile=dev default-skip in scripts/picker-sweep.sh, so a dev install
-  # gets a working sweep without an extra opt-in step. Operators who want the
+  # picker-sweep bridge-native cron. The helper is idempotent (short-circuits
+  # when a job titled `picker-sweep` already exists), and the registered cron
+  # payload sets `BRIDGE_PICKER_SWEEP_ENABLED=1` — that env var wins against
+  # the runtime host_profile=dev default-skip in scripts/picker-sweep.sh, so
+  # the sweep runs once it is registered. Registration itself, however, is
+  # gated on the cron target `<admin>-dev` existing in the roster (see
+  # lib/bridge-init-default-crons.sh): after issue #1052 that pair is
+  # auto-provisioned just above ONLY on a `server` host with the codex CLI
+  # present, so a server+codex install registers the sweep in this same init
+  # run. A `dev` install (admin-only by design) or a codex-absent host has no
+  # `<admin>-dev` pair, so the helper logs a skip; the sweep is registered
+  # later when the operator creates the pair by hand, or when a server host
+  # with the codex CLI re-runs `bridge-bootstrap.sh`. Operators who want the
   # sweep disabled can `agb cron update picker-sweep --disable` after init.
   # Non-fatal: helper logs and returns 0 on any failure so init keeps going.
   if [[ -n "$host_profile_chosen" ]]; then

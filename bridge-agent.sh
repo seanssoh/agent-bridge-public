@@ -412,21 +412,27 @@ bridge_scaffold_agent_home() {
   local rel=""
   local target=""
 
-  # v2 layout (issue #686): bridge_agent_workdir resolves to a sibling
-  # `workdir/` next to `home/` when BRIDGE_AGENT_ROOT_V2 is active. The
-  # canonical ASCII art at the top of lib/bridge-isolation-v2.sh lists
-  # both as required per-agent subdirs (`home/` is the isolated process
-  # HOME, `workdir/` is the project tree the agent operates in). Without
-  # this, every fresh `agent create` on v2 leaves `<agent-root>/workdir`
-  # missing, so `bridge-start.sh --dry-run` (and any resolver-relative
-  # tooling like doctor/status) bombs with `workdir가 없습니다`.
-  # Compute the v2 workdir target up-front so the isolated/non-isolated
-  # branches below can both pre-create it alongside `$home`. Legacy
-  # installs (no BRIDGE_AGENT_ROOT_V2) keep `home == workdir` per
-  # bridge_agent_workdir's fallback, so this stays empty and is a no-op.
-  local _scaffold_v2_workdir=""
+  # v2 layout (issue #686): the canonical per-agent layout has two sibling
+  # subdirs — `home/` (isolated process HOME) and `workdir/` (the project
+  # tree the agent operates in, and the resolver-resolved runtime cwd).
+  # `$home` (this function's $2) is whichever one the create flow chose as
+  # the scaffold target. #1045/#1046: the create flow now defaults that to
+  # the resolved `workdir/` so the profile lands where the runtime looks.
+  # The OTHER sibling must still exist as a directory so resolvers and
+  # tooling (doctor/status/start --dry-run) do not bomb with `... 없습니다`.
+  # Compute that sibling up-front so the isolated/non-isolated branches
+  # below can both pre-create it alongside `$home`. Legacy installs (no
+  # BRIDGE_AGENT_ROOT_V2) keep `home == workdir`, so this stays empty and
+  # is a no-op.
+  local _scaffold_v2_sibling=""
   if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then
-    _scaffold_v2_workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
+    local _scaffold_v2_home="$BRIDGE_AGENT_ROOT_V2/$agent/home"
+    local _scaffold_v2_workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
+    if [[ "$home" == "$_scaffold_v2_workdir" ]]; then
+      _scaffold_v2_sibling="$_scaffold_v2_home"
+    else
+      _scaffold_v2_sibling="$_scaffold_v2_workdir"
+    fi
   fi
 
   # v0.8.5 #677: when the agent will be linux-user isolated under v2,
@@ -528,25 +534,25 @@ bridge_scaffold_agent_home() {
         || bridge_die "scaffold sudo chown $_scaffold_controller failed: $home"
       bridge_linux_sudo_root chmod 0755 "$home" \
         || bridge_die "scaffold sudo chmod 0755 failed: $home"
-      # v2 sibling workdir/ (issue #686) — same parent-owned-by-root
-      # problem applies. Pre-create via sudo with controller ownership
-      # so the resolver lookup succeeds; prepare's `chown -R $os_user
-      # $workdir` will retake ownership for the isolated UID after
-      # scaffold completes.
-      if [[ -n "$_scaffold_v2_workdir" ]]; then
-        bridge_linux_sudo_root mkdir -p "$_scaffold_v2_workdir" \
-          || bridge_die "scaffold sudo mkdir failed: $_scaffold_v2_workdir"
-        bridge_linux_sudo_root chown "$_scaffold_controller" "$_scaffold_v2_workdir" \
-          || bridge_die "scaffold sudo chown $_scaffold_controller failed: $_scaffold_v2_workdir"
-        bridge_linux_sudo_root chmod 0755 "$_scaffold_v2_workdir" \
-          || bridge_die "scaffold sudo chmod 0755 failed: $_scaffold_v2_workdir"
+      # v2 sibling dir (issue #686) — the home/ or workdir/ that is NOT
+      # the scaffold target. Same parent-owned-by-root problem applies.
+      # Pre-create via sudo with controller ownership so the resolver
+      # lookup succeeds; prepare's `chown -R $os_user $workdir` will
+      # retake ownership for the isolated UID after scaffold completes.
+      if [[ -n "$_scaffold_v2_sibling" ]]; then
+        bridge_linux_sudo_root mkdir -p "$_scaffold_v2_sibling" \
+          || bridge_die "scaffold sudo mkdir failed: $_scaffold_v2_sibling"
+        bridge_linux_sudo_root chown "$_scaffold_controller" "$_scaffold_v2_sibling" \
+          || bridge_die "scaffold sudo chown $_scaffold_controller failed: $_scaffold_v2_sibling"
+        bridge_linux_sudo_root chmod 0755 "$_scaffold_v2_sibling" \
+          || bridge_die "scaffold sudo chmod 0755 failed: $_scaffold_v2_sibling"
       fi
     fi
   fi
 
   mkdir -p "$home"
-  if [[ -n "$_scaffold_v2_workdir" ]]; then
-    mkdir -p "$_scaffold_v2_workdir"
+  if [[ -n "$_scaffold_v2_sibling" ]]; then
+    mkdir -p "$_scaffold_v2_sibling"
   fi
   [[ -d "$template_root" ]] || bridge_die "agent template root가 없습니다: $template_root"
   [[ -f "$session_template" ]] || bridge_die "session type template가 없습니다: $session_type"
@@ -2635,6 +2641,24 @@ report and reap test-fixture agents per their pattern."
     fi
   fi
 
+  # Issue #1047: caller-trust gating. `agent create` writes a managed-role
+  # block to agent-roster.local.sh — the same protected system-config file
+  # `agent update` / `agent delete` mutate. Those verbs reject an
+  # `agent-direct` caller via bridge_agent_update_caller_source(); `create`
+  # used to be ungated, an incoherent split privilege boundary (an agent
+  # process could add a roster entry but not remove or modify one). Gate
+  # `create` on the SAME single caller-source contract: the source must be
+  # operator-tui / operator-trusted-id (a TTY-detected operator, or a
+  # sanctioned non-interactive caller that sets BRIDGE_CALLER_SOURCE). An
+  # `agent-direct` caller is denied here just as it is for update/delete.
+  # Placed after name validation so a refused-name caller still gets the
+  # name-specific error; applies to --dry-run too, mirroring update/delete.
+  local create_caller_source
+  create_caller_source="$(bridge_agent_update_caller_source)"
+  if [[ "$create_caller_source" != "operator-tui" && "$create_caller_source" != "operator-trusted-id" ]]; then
+    bridge_die "deny: caller source $create_caller_source is not allowed to mutate system config (need operator-tui or operator-trusted-id)"
+  fi
+
   case "$engine" in
     claude|codex) ;;
     *) bridge_die "지원하지 않는 engine 입니다: $engine" ;;
@@ -2661,6 +2685,23 @@ report and reap test-fixture agents per their pattern."
 
   session="${session:-$agent}"
   default_home="$(bridge_agent_default_home "$agent")"
+  # #1045/#1046: on a v2 install the runtime resolver (bridge_agent_workdir)
+  # resolves the agent's cwd — the path preflight / start_dry_run / `agent
+  # show` use, and the dir the live session is launched in — to the sibling
+  # `<agent-root>/workdir`, NOT `<agent-root>/home` (which is the process
+  # HOME). bridge_agent_default_home returns the `home/` path, so defaulting
+  # the scaffold target to it lands the entire profile (CLAUDE.md, SOUL.md,
+  # .claude/...) under `home/` while the resolved `workdir/` stays empty —
+  # the exact fresh-install (#1045) and `agent create --isolate` (#1046)
+  # break. When the operator did not pass an explicit `--workdir`, default
+  # the scaffold target to the resolved v2 `workdir/` so the profile lands
+  # where the runtime actually looks. The `home/` sibling is still created
+  # by bridge_scaffold_agent_home. An explicit `--workdir` is honored as-is.
+  local _workdir_is_v2_default=0
+  if [[ -z "$workdir" && -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
+    workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
+    _workdir_is_v2_default=1
+  fi
   workdir="$(bridge_expand_user_path "${workdir:-$default_home}")"
   profile_home="$(bridge_expand_user_path "${profile_home:-}")"
   description="${description:-$agent static role}"
@@ -2688,7 +2729,12 @@ report and reap test-fixture agents per their pattern."
   fi
 
   default_home="$(bridge_expand_user_path "$default_home")"
-  if [[ -z "$profile_home" && "$workdir" != "$default_home" ]]; then
+  # Auto-derive profile_home only for a genuinely custom operator-supplied
+  # workdir. The canonical v2 `workdir/` (auto-defaulted above) is already
+  # the v2 profile-home default (bridge_agent_default_profile_home), so
+  # pinning it explicitly here would add roster noise without changing
+  # behavior — and #1045/#1046 must not change the profile-deploy contract.
+  if [[ -z "$profile_home" && "$workdir" != "$default_home" && $_workdir_is_v2_default -eq 0 ]]; then
     profile_home="$workdir"
   fi
 
