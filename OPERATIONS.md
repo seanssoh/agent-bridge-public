@@ -116,11 +116,28 @@ without guessing.
 
 표준 upgrade 절차는 [`UPGRADING.md`](UPGRADING.md) 에 정리되어 있다. 모든 install 에서 동일한 명령으로 진행한다:
 
+**Current target**: upgrade to **v0.14.5-beta4** — the latest release. The
+v0.14.5 line is an ongoing prerelease series with no separate stable tag, so
+the latest `v0.14.5-betaN` is the current target. A single
+`agent-bridge upgrade --apply` lands there from any v0.7.x+ source; the
+v0.13.7-v0.13.9 heredoc-chain fixes (extracted to `lib/upgrade-helpers/`) keep
+the leap-path safe on Bash 5.3.9 hosts:
+
+```bash
+cd <source-checkout>
+git fetch origin
+git checkout v0.14.5-beta4
+./agent-bridge upgrade --apply
+```
+
+The per-release subsections below are operator follow-up notes (newest first),
+kept as historical context — they are **not** separate upgrade hops.
+
 ### v0.14.1 completeness pass (2026-05-16) — operator follow-up
 
 Patch release after the v0.14.0 E2E test on a fresh Ubuntu 24.04 VM. 8 fixes batched (6 clean-install regressions + 2 audit-A backlog).
 
-**Recommended upgrade path** (any v0.7.x+ install):
+**Upgrade path** (v0.14.1-era operator follow-up — for the current target see *Current target* at the top of this section):
 
 ```bash
 cd <source-checkout>
@@ -139,12 +156,12 @@ Single atomic step works from any v0.7.x / v0.8.x / v0.9.x / v0.10.x / v0.11.x /
 - macOS `bridge-rerender-plan.XXXXXX.py` BSD `mktemp` literal-path bug fixed — settings rerender no longer blocks on stale file.
 - `bridge-bootstrap.sh` on hosts without codex CLI: skips `<admin>-dev` pair creation + picker-sweep cron registration (was crash-looping). Operator can install codex + re-run bootstrap to backfill.
 
-**Linux operators on v0.13.x or earlier with errors**: this release is the recommended target. Symptoms like:
+**Linux operators on v0.13.x or earlier with errors**: the symptoms below were closed by v0.14.1 and remain closed on the current target. Symptoms like:
 - Hard-die at `current_layout=markerless(existing-install)` on clean install,
 - Stop-hook spam `ensure_matrix_path failed`,
 - Always-on auto-start retry loop on missing engine CLI,
 
-...are all closed in v0.14.1. Single `agent-bridge upgrade --apply` from your current version lands at v0.14.1 cleanly.
+...are all closed as of v0.14.1. A single `agent-bridge upgrade --apply` from your current version lands at the current target (see top of section) cleanly.
 
 **Runtime stop-gap removal**: operators who hand-patched `~/.agent-bridge/lib/bridge-isolation-v2.sh` (Darwin gate workaround for pre-v0.14.0) — the upgrade overwrites the stop-gap with the proper discriminator-based fix. No manual cleanup needed.
 
@@ -152,9 +169,9 @@ For per-stage detail, see `CHANGELOG.md` `[0.14.1]`.
 
 ### v0.14.0 stabilization milestone (2026-05-16) — operator follow-up
 
-v0.14.0 batches S0-S3 + S5 Track A1/A2 of the v0.14.x stabilization plan. Recommended target for fresh upgrades and for v0.13.10 installs that hit operator-visible noise.
+v0.14.0 batches S0-S3 + S5 Track A1/A2 of the v0.14.x stabilization plan. (Historical operator follow-up — for the current target see the top of the Upgrade section.)
 
-**Recommended upgrade path**:
+**Upgrade path** (v0.14.0-era):
 
 ```bash
 cd <source-checkout>
@@ -180,9 +197,9 @@ For per-stage detail, see `CHANGELOG.md` `[0.14.0]`. For the stabilization roadm
 
 ### v0.13.x hotfix wave (2026-05-15) — historical context
 
-**Current recommendation**: upgrade directly to v0.14.0 (see the v0.14.0 section above). This section is preserved for operators pinned below v0.14.0 (e.g., post-v0.13.10 staging environments waiting for v0.14.0 acceptance) and as historical context for the leap-path blockers that v0.13.7-v0.13.10 resolved.
+**Current recommendation**: upgrade to the current target (v0.14.5-beta4 — see the top of the Upgrade section). This section is preserved as historical context for the leap-path blockers that v0.13.7-v0.13.10 resolved.
 
-The v0.13.7-v0.13.10 cycle fixed a four-stage `agent-bridge upgrade --apply` blocker that affected the v0.7.x → v0.13.x leap on Bash 5.3.9 hosts (matched by recent Linux distros). Operators on macOS were similarly affected by a markerless-existing-install layout reject. v0.14.0 carries those fixes forward — operators can leap directly from v0.7.x/v0.8.x/v0.9.x/v0.10.x/v0.11.x/v0.12.x to v0.14.0 in a single `agent-bridge upgrade --apply` step.
+The v0.13.7-v0.13.10 cycle fixed a four-stage `agent-bridge upgrade --apply` blocker that affected the v0.7.x → v0.13.x leap on Bash 5.3.9 hosts (matched by recent Linux distros). Operators on macOS were similarly affected by a markerless-existing-install layout reject. The v0.14.x line carries those fixes forward — operators can leap directly from v0.7.x/v0.8.x/v0.9.x/v0.10.x/v0.11.x/v0.12.x to the current target in a single `agent-bridge upgrade --apply` step.
 
 **Minimum-safe fallback upgrade path** (only if pinning below v0.14.0):
 
