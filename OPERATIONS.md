@@ -255,8 +255,8 @@ Backup 동작 조정 환경변수 (모두 `agent-roster.local.sh` 또는 systemd
 추가 exclude 를 영구 설정하려면 (#979) env var 대신 `state/daily-backup/excludes.conf` 파일을 쓰는 것이 권장 방법이다 — 한 줄에 relpath 하나, `#` 로 시작하는 줄과 빈 줄은 무시한다. shell eval 이 없어 일반 에디터로 바로 편집할 수 있고 upgrade 후에도 유지된다. 파일이 없으면 무시되며, 최종 exclude 집합은 hardcoded ∪ `BRIDGE_DAILY_BACKUP_EXCLUDE_ROOTS` ∪ 이 파일의 합집합이다. 예시:
 
 ```
-# regenerable plugin caches — see issue #974/#979
-agents/patch/home/.claude/plugins/cache
+# example: an operator-chosen path to skip — one relpath per line
+data/agents/<agent>/output
 ```
 
 Health check (post-upgrade):
