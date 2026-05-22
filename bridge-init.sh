@@ -303,7 +303,10 @@ while [[ $# -gt 0 ]]; do
       [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
       bridge_warn "--teams-app-password는 셸 히스토리와 프로세스 argv에 client secret을 노출합니다. --teams-app-password-file <path> 또는 BRIDGE_TEAMS_APP_PASSWORD 환경변수를 사용하세요."
       # Stage the secret out of argv immediately so it is never re-exposed
-      # in the bridge-setup.sh / bridge-setup.py argv downstream.
+      # in the bridge-setup.sh / bridge-setup.py argv downstream. A repeated
+      # flag replaces the prior staged file so no orphan outlives the trap,
+      # which only tracks the most recent _BRIDGE_INIT_SECRET_TMPFILE.
+      [[ -n "$_BRIDGE_INIT_SECRET_TMPFILE" ]] && rm -f "$_BRIDGE_INIT_SECRET_TMPFILE"
       _BRIDGE_INIT_SECRET_TMPFILE="$(bridge_init_stage_secret "$2")"
       teams_app_password_file="$_BRIDGE_INIT_SECRET_TMPFILE"
       shift 2
