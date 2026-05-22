@@ -6,6 +6,91 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta5] — 2026-05-23
+
+### Highlight — fresh-install bug-fix wave
+
+Operator-cued **fifth prerelease** in the v0.14.5 stabilization window. A
+13-issue parallel fixer wave bundling bugs registered 2026-05-22 (most found
+during fresh-install verification on a brand-new server), shipped through the
+`release/v0.14.5-beta5-integration` branch. Every PR was codex pair-reviewed
+(`agb-dev-claude` + `agb-dev-codex`); the integration branch additionally
+passed a full-branch codex review, a `scripts/smoke-test.sh` pass, and a live
+Linux-VM verification of the isolation-v2 fixes. `-beta5` prerelease; matching
+tag `v0.14.5-beta5`, GitHub release marked **Pre-release**.
+
+### Fixed — daily-backup
+
+- **#1039** — `DAILY_BACKUP_LAST_PRUNED_COUNT` recorded a byte value, not a
+  count: an empty `error_detail` field collapsed under `IFS=$'\t' read`,
+  shifting `free_bytes` into `pruned_count`. The daily-backup payload is now
+  parsed without IFS-whitespace collapsing, plus a `pruned_count` sanity bound.
+- **#1041** — the daily-backup SQL snapshot was not restorable:
+  `dump_sqlite_snapshot()`'s `iterdump()` emitted `sqlite_sequence` maintenance
+  before the AUTOINCREMENT tables existed. The dump now defers those
+  statements so the snapshot restores cleanly via stdlib `executescript`.
+
+### Fixed — wiki tooling
+
+- **#1040** — `wiki-mention-scan` matched bash `[[ ]]` expressions inside
+  fenced code blocks as wikilinks; fenced (and `~~~`-fenced) regions are now
+  blanked before wikilink matching.
+- **#1042** — `wiki-daily-ingest` enqueued librarian Lane-B tasks whenever the
+  `librarian` role merely existed. The enqueue is now gated on librarian
+  ingest being *enabled* for the host profile AND a same-install guard
+  (`BRIDGE_AGB` / task DB / state root all resolve under `$BRIDGE_HOME`), so an
+  isolated fixture cannot leak tasks into the live DB.
+
+### Fixed — A2A cross-bridge
+
+- **#1043** — `agb a2a daemon start` reported success but the A2A receiver
+  died when the launching shell exited. The receiver now double-forks into its
+  own session (portable macOS + Linux) and the liveness check verifies the pid
+  is genuinely this install's receiver (`--pidfile` identity match), so a
+  stale/foreign pidfile no longer yields a false "already running".
+
+### Fixed — hooks
+
+- **#1054** — the tool-policy guard's `_is_read_intent_bash` split commands on
+  `|`/`;`/`&` without quote-awareness, wrongly denying read-only commands like
+  `grep -E 'a|b'` against protected paths. The split is now quote-aware and
+  fails closed on an unbalanced quote (an un-parseable command is never
+  classified read-intent).
+- **#1055** — the codex SessionStart hook emitted `hookSpecificOutput.matcher`,
+  which Codex 0.133.0's `deny_unknown_fields` schema rejects; the codex-format
+  output now emits only `hookEventName` + `additionalContext`.
+
+### Fixed — isolation-v2
+
+- **#1045 / #1046** — a fresh v2 install's `agent create` (and the bootstrap
+  admin scaffold) populated the agent profile under `home/` while the runtime
+  resolved the agent's cwd to the sibling `workdir/`, leaving the runtime
+  `workdir/` empty. `agent create` now defaults the scaffold target to the
+  resolved `workdir/`, fully populated; the `home/` sibling is still
+  materialized.
+- **#1048** — `bridge_isolation_v2_matrix_rows_for_agent` fell back to
+  `linux-user` for any non-`shared` isolation-mode value (including an empty
+  result from a concurrently-rewritten roster), making a shared-mode agent
+  demand a nonexistent `ab-agent-<agent>` group. The indeterminate fallback now
+  resolves to `shared`.
+
+### Fixed — agent policy
+
+- **#1047** — `agent create` was ungated while `agent delete`/`update`
+  required a trusted caller source. `agent create` is now gated symmetrically
+  on the same caller-source contract (`agent-direct` denied,
+  `operator-tui`/`operator-trusted-id` allowed); sanctioned non-interactive
+  callsites (bootstrap admin create, librarian provision, smokes) pass a
+  trusted source.
+
+### Restored — codex pair auto-provisioning
+
+- **#1052 / #1053** — install-time auto-provisioning of the `<admin>-dev` codex
+  pair is restored, gated on codex-CLI detection AND a `server` host profile
+  (a `dev` profile stays admin-only). Stale post-#4769 guidance — the
+  picker-sweep cron skip message, the `CLAUDE.md` reviewer reference, and the
+  README / admin-protocol contract — is corrected to the new server/dev split.
+
 ## [0.14.5-beta4] — 2026-05-22
 
 ### Highlight — runtime-friction closeout wave (+ verification re-cut)
