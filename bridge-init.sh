@@ -98,15 +98,17 @@ bridge_init_require_command() {
 bridge_init_stage_secret() {
   # Stage a secret value into a private (mode 600) temp file so it can be
   # forwarded downstream by path — a path is safe in argv, the secret is not.
-  # The caller assigns the path to _BRIDGE_INIT_SECRET_TMPFILE so the EXIT
-  # trap removes it. Only one staged secret is supported per init run.
+  # Assigns _BRIDGE_INIT_SECRET_TMPFILE immediately after mktemp — before the
+  # chmod/write steps — so the EXIT trap can still remove the file if a later
+  # step fails. MUST NOT be called in a command substitution: it sets a global
+  # (a subshell assignment would not survive). Only one staged secret per run.
   local value="$1"
   local tmpfile
   tmpfile="$(mktemp "${TMPDIR:-/tmp}/bridge-init-secret.XXXXXX")" \
     || bridge_die "비밀 값을 임시 파일로 옮기지 못했습니다"
+  _BRIDGE_INIT_SECRET_TMPFILE="$tmpfile"
   chmod 600 "$tmpfile"
   printf '%s' "$value" >"$tmpfile"
-  printf '%s' "$tmpfile"
 }
 
 bridge_init_runtime_present() {
@@ -306,8 +308,11 @@ while [[ $# -gt 0 ]]; do
       # in the bridge-setup.sh / bridge-setup.py argv downstream. A repeated
       # flag replaces the prior staged file so no orphan outlives the trap,
       # which only tracks the most recent _BRIDGE_INIT_SECRET_TMPFILE.
+      # bridge_init_stage_secret sets _BRIDGE_INIT_SECRET_TMPFILE directly
+      # (not via $() — see its comment) so the trap sees the path even if a
+      # later staging step fails.
       [[ -n "$_BRIDGE_INIT_SECRET_TMPFILE" ]] && rm -f "$_BRIDGE_INIT_SECRET_TMPFILE"
-      _BRIDGE_INIT_SECRET_TMPFILE="$(bridge_init_stage_secret "$2")"
+      bridge_init_stage_secret "$2"
       teams_app_password_file="$_BRIDGE_INIT_SECRET_TMPFILE"
       shift 2
       ;;
