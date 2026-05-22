@@ -247,7 +247,7 @@ For ambiguous scope decisions, the consensus rule (per operator directive): proc
 
 ## Progress log
 
-Reconciled 2026-05-22 against the v0.14.5-beta4 tree (commit `a9bbc10`). The
+Reconciled 2026-05-23 against the v0.14.5-beta5 tree (commit `0ff5e92`). The
 earlier per-stage "pending" entries were never updated after the stages landed;
 the table below is the current state.
 
