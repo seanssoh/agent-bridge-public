@@ -13,21 +13,23 @@
 # of `bridge_scaffold_agent_home` cannot silently regress the sibling
 # mkdir. Coverage spans BOTH scaffold branches:
 #
-#   T1 — non-isolated (shared) v2 scaffold (`bridge-agent.sh:547-550`)
-#        creates BOTH `home/` and `workdir/` siblings under
-#        `$BRIDGE_AGENT_ROOT_V2/<agent>/` via plain `mkdir -p`. Note: as
-#        of Track C v0.13.10 (#895), `bridge_agent_workdir` no longer
-#        returns the v2 `workdir/` anchor for shared agents — it gates
-#        the v2-anchor override on `linux-user` isolation and falls
-#        through to the explicit/default resolution otherwise. The
-#        sibling mkdir is therefore vestigial for shared agents on
-#        current main, but pinning it is still correct: (a) the scaffold
-#        still emits it on both branches and an accidental removal
-#        should be a deliberate decision, not a silent drop; (b) the
-#        sibling is load-bearing for the linux-user branch covered by
-#        T2 and the two branches share the `_scaffold_v2_workdir` local.
-#   T2 — isolated v2 scaffold (`bridge-agent.sh:536-542`) creates the same
-#        `home/` + `workdir/` sibling pair via the `bridge_linux_sudo_root
+#   T1 — non-isolated (shared) v2 scaffold (the plain-`mkdir -p` block
+#        near the end of `bridge_scaffold_agent_home`) creates BOTH
+#        `home/` and `workdir/` siblings under
+#        `$BRIDGE_AGENT_ROOT_V2/<agent>/`. The scaffold materializes its
+#        `$home` argument plus the OTHER v2 sibling
+#        (`_scaffold_v2_sibling`). Note: as of Track C v0.13.10 (#895),
+#        `bridge_agent_workdir` does not return the v2 `workdir/` anchor
+#        for shared agents — it gates the v2-anchor override on
+#        `linux-user` isolation and falls through to the explicit/default
+#        resolution otherwise. Pinning the sibling mkdir is still
+#        correct: (a) the scaffold still emits it on both branches and
+#        an accidental removal should be a deliberate decision, not a
+#        silent drop; (b) the sibling is load-bearing for the linux-user
+#        branch covered by T2 and the two branches share the
+#        `_scaffold_v2_sibling` local.
+#   T2 — isolated v2 scaffold (the `bridge_linux_sudo_root mkdir` block)
+#        creates the same `home/` + `workdir/` sibling pair via the
 #        mkdir` path that the linux-user isolation branch uses on a fresh
 #        install where `data/agents/` is `root:root mode 755`. Asserts
 #        the resolver-agreement invariant (`bridge_agent_workdir` returns
@@ -53,11 +55,11 @@
 # the same reason — the unit under test is the v2 sibling mkdir, not
 # template rendering.
 #
-# Regression bite: this smoke FAILS if the `if [[ -n "$_scaffold_v2_workdir" ]];
+# Regression bite: this smoke FAILS if the `if [[ -n "$_scaffold_v2_sibling" ]];
 # then mkdir -p ...; fi` block is reverted in EITHER scaffold branch —
-# T1 fails if `bridge-agent.sh:548-550` (non-isolated) regresses, T2
-# (when its gate is met) fails if `bridge-agent.sh:536-542` (isolated)
-# regresses.
+# T1 fails if the non-isolated plain-`mkdir` block regresses, T2 (when
+# its gate is met) fails if the isolated `bridge_linux_sudo_root mkdir`
+# block regresses.
 
 set -uo pipefail
 
@@ -96,7 +98,7 @@ fi
 #   1. exports the same v2 env the live runtime would have,
 #   2. sources bridge-lib.sh,
 #   3. extracts and sources just `bridge_scaffold_agent_home` (line
-#      385..613) + its small `bridge_agent_manage_python` /
+#      385..618) + its small `bridge_agent_manage_python` /
 #      `bridge_render_template_string` deps from `bridge-agent.sh`,
 #   4. stubs `bridge_render_template_string` to a no-op so the template
 #      loop does not depend on session-template lookup / python3 / etc.,
@@ -122,7 +124,7 @@ write_driver_script() {
     '{' \
     '  sed -n "128,139p" "$REPO_ROOT/bridge-agent.sh"' \
     '  sed -n "188,257p" "$REPO_ROOT/bridge-agent.sh"' \
-    '  sed -n "385,613p" "$REPO_ROOT/bridge-agent.sh"' \
+    '  sed -n "385,618p" "$REPO_ROOT/bridge-agent.sh"' \
     '} > "$FUNC_TMP"' \
     'source "$FUNC_TMP"' \
     'declare -F bridge_scaffold_agent_home >/dev/null 2>&1 || { echo "DRIVER_FAIL: bridge_scaffold_agent_home not loaded"; exit 91; }' \
