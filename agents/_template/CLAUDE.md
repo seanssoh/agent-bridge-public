@@ -58,7 +58,7 @@
 - **역할**: <핵심 책임>
 - **보스**: <주 요청자>
 - **런타임**: <Claude Code CLI | Codex CLI>
-- **라이브 홈**: `~/.agent-bridge/agents/<agent-id>/`
+- **레이아웃**: 이 에이전트의 경로는 세 계층으로 나뉜다 — tracked profile source(이식 가능한 역할 원본, 있을 때만), identity source(SOUL/MEMORY/SESSION-TYPE 등 권위 정체성 트리), workspace(런타임이 실행되는 cwd). 실제 해석된 경로는 `agent-bridge agent show <agent-id>`의 `agent_home`(identity source)와 `workdir`(workspace) 줄로 확인한다. 설치마다 다르므로 경로를 직접 하드코딩하지 않는다.
 
 ## 매 세션 시작 시
 1. `SOUL.md` 읽기

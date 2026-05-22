@@ -633,6 +633,14 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "agent=$AGENT"
   echo "session=$SESSION"
   echo "workdir=$WORK_DIR"
+  # Issue #1060 D2: surface the identity source (layer 2) alongside the
+  # workspace (layer 3) so dry-run and `agent show` report the same
+  # three-layer model. `workdir` is the cwd the runtime launches in;
+  # `agent_home` is the authored canonical identity tree. On a v2 install
+  # the two diverge — before #1060 dry-run only printed `workdir`.
+  if declare -F bridge_layout_agent_home >/dev/null 2>&1; then
+    echo "agent_home=$(bridge_layout_agent_home "$AGENT")"
+  fi
   echo "continue=$EFFECTIVE_CONTINUE_MODE"
   echo "safe_mode=$SAFE_MODE"
   echo "channels=$(bridge_agent_channels_csv "$AGENT")"

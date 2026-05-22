@@ -38,15 +38,21 @@ by this session's id. Run:
 # not always the same as the session's working directory. Resolve them
 # separately.
 #
-#   AGENT_HOME  — where `memory/<today>.md` gets written. Always the
-#                 bridge-managed home; matches `bridge-agent.sh`
-#                 scaffolding and PR 1A's autoMemoryDirectory seed.
+#   AGENT_HOME  — where `memory/<today>.md` gets written. The IDENTITY
+#                 SOURCE (issue #1060 layer 2) — matches `bridge-agent.sh`
+#                 scaffolding and PR 1A's autoMemoryDirectory seed. On a
+#                 v2 install this is `$BRIDGE_AGENT_ROOT_V2/<agent>/home`,
+#                 NOT `$BRIDGE_AGENT_HOME_ROOT/<agent>` (that path is the
+#                 tracked profile source on v2 — writing the daily note
+#                 there is the #1060 model-drift bug).
 #   WORKDIR     — the session's cwd, used by current-session-id to
 #                 derive the `~/.claude/projects/<slug>/` lookup key.
 #                 Claude scopes transcripts by the git root of the
 #                 session cwd, so conflating this with AGENT_HOME sends
 #                 the scan to a directory that has no jsonl files.
-if [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" ]]; then
+if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
+  AGENT_HOME="$BRIDGE_AGENT_ROOT_V2/$BRIDGE_AGENT_ID/home"
+elif [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" ]]; then
   AGENT_HOME="$BRIDGE_AGENT_HOME_ROOT/$BRIDGE_AGENT_ID"
 else
   AGENT_HOME="$HOME/.agent-bridge/agents/$BRIDGE_AGENT_ID"

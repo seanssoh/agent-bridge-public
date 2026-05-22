@@ -132,13 +132,34 @@ def cmd_remove_webhook_server(args: argparse.Namespace) -> int:
     payload = ensure_mcp_root(mcp_path)
     servers = mcp_servers(payload)
     removed = servers.pop(args.server_name, None) is not None
+    status = "removed" if removed else "absent"
     if removed:
-        save_json(mcp_path, payload)
+        # beta5 QA finding #1: on `agent create --isolate` this legacy-
+        # webhook cleanup step runs against a workdir owned by the
+        # isolated UID, so `save_json` (mkdir / tmp-write / replace)
+        # raises PermissionError. The step is non-essential — the agent
+        # is created fine either way — but an uncaught exception dumped
+        # a full Python traceback into the create output (the caller in
+        # bridge-start.sh / bridge-setup.sh captures stderr and echoes
+        # it). Catch the PermissionError / OSError quietly: emit a
+        # one-line note in MCP_STATUS, no traceback, and keep rc=0 so the
+        # create outcome is unchanged. A genuine cleanup is then the
+        # operator's manual follow-up (the callers already warn about a
+        # residual `.mcp.json` entry).
+        try:
+            save_json(mcp_path, payload)
+        except (PermissionError, OSError) as exc:
+            status = "remove-skipped (not writable)"
+            print(
+                f"bridge-channels: webhook cleanup skipped — {mcp_path} "
+                f"not writable ({exc.__class__.__name__})",
+                file=sys.stderr,
+            )
 
     print_payload(
         {
             "MCP_FILE": str(mcp_path),
-            "MCP_STATUS": "removed" if removed else "absent",
+            "MCP_STATUS": status,
             "MCP_SERVER_NAME": args.server_name,
             "MCP_WEBHOOK_PORT": str(args.port),
             "MCP_COMMAND": "",
