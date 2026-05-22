@@ -11511,4 +11511,10 @@ bash "$REPO_ROOT/scripts/smoke/1015-resume-claude-config-dir.sh"
 log "running isolated-agent-delete-reap smoke (issue #1010)"
 bash "$REPO_ROOT/scripts/smoke/isolated-agent-delete-reap.sh"
 
+# A2A cross-bridge task handoff (#1032): receiver fail-closed bind, HMAC
+# auth, allowlist, durable dedupe (idempotent + hash-conflict), body-size
+# cap, sender outbox retry, and end-to-end enqueue -> local inbox.
+log "running a2a-cross-bridge smoke (issue #1032)"
+bash "$REPO_ROOT/scripts/smoke/a2a-cross-bridge.sh"
+
 log "smoke test passed"

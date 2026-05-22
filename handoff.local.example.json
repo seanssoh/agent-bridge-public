@@ -1,0 +1,37 @@
+{
+  "_comment": "A2A cross-bridge handoff config. Copy to handoff.local.json in your BRIDGE_HOME ($HOME/.agent-bridge by default), edit, then `chmod 0600` it. This file is data-only JSON — it is parsed, never executed. It carries peer-pair HMAC secrets, so it MUST be mode 0600 and MUST stay git-ignored. See docs/a2a-cross-bridge.md.",
+
+  "_bridge_id_comment": "REQUIRED. This bridge's own id. It is the authenticated sender identity: the delivery runner signs it + sends it as the X-AGB-Peer header, and a peer receiver looks it up in its inbound peer allowlist. A receiving peer's config must list a peer entry whose 'id' equals this value.",
+  "bridge_id": "bridge-a",
+
+  "listen": {
+    "_comment": "The receiver binds to this tailnet IP ONLY. Leave 'address' empty to auto-select the first `tailscale ip`. The daemon FAILS CLOSED if the address is a wildcard (0.0.0.0/::), loopback, or cannot be proven to be in this node's actual Tailscale address set (the exact output of `tailscale ip`) — there is no CIDR-shape fallback, and if the tailscale CLI is unavailable the daemon refuses to serve.",
+    "address": "100.64.0.10",
+    "port": 8787,
+    "enqueue_path": "/enqueue"
+  },
+
+  "timestamp_skew_seconds": 300,
+  "delivery_max_attempts": 12,
+  "outbox_max_total_bytes": 67108864,
+  "outbox_max_pending_per_peer": 500,
+
+  "peers": [
+    {
+      "_comment": "Each peer is an ordered-pair relationship. 'address' is the peer's tailnet IP — the receiver enforces remote_addr == this value. 'secret' is the shared HMAC key for this pair; 'secret_next' is optional and only set during a rotation overlap window. 'inbound_allowlist' lists the LOCAL agents this peer may enqueue to (exact match, no wildcard).",
+      "id": "bridge-b",
+      "address": "100.64.0.20",
+      "port": 8787,
+      "enqueue_path": "/enqueue",
+      "secret": "REPLACE-WITH-A-LONG-RANDOM-SHARED-SECRET",
+      "secret_next": "",
+      "inbound_allowlist": ["reviewer", "ops"],
+      "caps": {
+        "max_body_bytes": 262144,
+        "max_title_bytes": 1024,
+        "max_pending": 500,
+        "max_open_tasks": 200
+      }
+    }
+  ]
+}

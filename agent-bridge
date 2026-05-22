@@ -183,7 +183,7 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 # (if a future patch adds the subcommand handler) does not eat the
 # roster cost either.
 case "${1:-}" in
-  version|status|daemon|agent|task|inbox|help|--help|-h|--version|-V) ;;
+  version|status|daemon|agent|task|inbox|a2a|help|--help|-h|--version|-V) ;;
   init)
     # bridge-isolation-v2.sh's `BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"`
     # default fires during our bridge-lib.sh source above and exports the
@@ -605,6 +605,43 @@ PY
     wave)
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-wave.sh" "$@"
+      ;;
+    a2a)
+      # AB-to-AB cross-bridge task handoff (#1032). The `daemon` action
+      # is a lifecycle verb routed to bridge-handoff-daemon.sh; every
+      # other action (send / outbox / inbox-dedupe / peers / deliver) is
+      # the structured CLI in bridge-a2a.py. See docs/a2a-cross-bridge.md.
+      shift
+      bridge_require_python
+      case "${1:-}" in
+        daemon)
+          shift
+          exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-handoff-daemon.sh" "$@"
+          ;;
+        -h|--help|help|"")
+          cat <<'A2A_HELP'
+Usage: agent-bridge a2a <command> [args]
+
+  send          Stage an outbound cross-bridge handoff into the outbox.
+                  agent-bridge a2a send --peer <peer> --to <agent> \
+                    --title <t> [--body <text>|--body-file <path>] \
+                    [--priority low|normal|high|urgent] [--dry-run]
+  outbox        list | retry <id> | drop <id> | gc — manage the outbox.
+  inbox-dedupe  list | gc — inspect/prune the receiver dedupe ledger.
+  peers         list | test <peer> — inspect configured peers.
+  deliver       Drain the outbox once (sender delivery runner).
+  daemon        start | stop | restart | status | tick — receiver daemon
+                lifecycle (bridge-handoff-daemon.sh).
+
+Config: handoff.local.json (data-only JSON, mode 0600, git-ignored).
+See docs/a2a-cross-bridge.md for the protocol + security model.
+A2A_HELP
+          exit 0
+          ;;
+        *)
+          exec python3 "$SCRIPT_DIR/bridge-a2a.py" "$@"
+          ;;
+      esac
       ;;
     list)
       if [[ $# -ne 1 ]]; then
