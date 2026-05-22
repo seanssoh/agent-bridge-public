@@ -15,6 +15,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { BotFrameworkAdapter, TurnContext, ActivityTypes } from 'botbuilder'
 import type { ConversationReference, Activity } from 'botbuilder'
+import { MicrosoftAppCredentials } from 'botframework-connector'
 import { createServer } from 'http'
 import { randomUUID } from 'crypto'
 import { spawnSync } from 'child_process'
@@ -568,12 +569,51 @@ function sanitizeFilename(name: string): string {
   return clean
 }
 
+// Token-leak guard: the bot's Bot Framework access token must only ever be
+// attached to Bot Framework / Teams-hosted attachment endpoints. A malicious
+// or misconfigured `contentUrl` could otherwise exfiltrate the bot token to an
+// arbitrary host. We send the Authorization header only when the download URL
+// resolves to one of these known Microsoft attachment hosts (exact host or a
+// subdomain of one). Inline-image / general-attachment content URLs live on
+// `*.asm.skype.com` (AMS), `smba.trafficmanager.net` (service-url attachment
+// paths), and `*.botframework.com`.
+const BOT_FRAMEWORK_ATTACHMENT_HOSTS = [
+  'asm.skype.com',
+  'skype.com',
+  'botframework.com',
+  'trafficmanager.net',
+]
+
+function isBotFrameworkAttachmentHost(url: string): boolean {
+  let host: string
+  try {
+    const parsed = new URL(url)
+    if (parsed.protocol !== 'https:') return false
+    host = parsed.hostname.toLowerCase()
+  } catch {
+    return false
+  }
+  return BOT_FRAMEWORK_ATTACHMENT_HOSTS.some(
+    (h) => host === h || host.endsWith(`.${h}`),
+  )
+}
+
 async function streamDownload(
   url: string,
   destPath: string,
   maxBytes: number,
+  authToken?: string,
 ): Promise<{ ok: true; size: number } | { ok: false; error: string }> {
-  const resp = await fetch(url)
+  // Attach the bot token only on the secured Bot Framework attachment path
+  // (the inline-image / general-attachment URL that 401s). The token-leak
+  // guard keeps the token off any non-Bot-Framework host even if a caller
+  // passes one in. The pre-signed file-picker downloadUrl path passes no
+  // token and is unaffected.
+  const headers: Record<string, string> = {}
+  if (authToken && isBotFrameworkAttachmentHost(url)) {
+    headers['Authorization'] = `Bearer ${authToken}`
+  }
+  const resp = await fetch(url, { headers })
   if (!resp.ok) return { ok: false, error: `HTTP ${resp.status}` }
   const cl = resp.headers.get('content-length')
   if (cl !== null) {
@@ -846,6 +886,31 @@ async function downloadAttachments(
   if (items.length === 0) return []
   const safeMessageId = sanitizeMessageId(messageId)
   const results: StoredAttachment[] = []
+
+  // Bot Framework attachment URLs (inline paste / drag-drop images, general
+  // files) require the bot's access token. The native file-picker path
+  // (TEAMS_FILE_DOWNLOAD_TYPE) uses a pre-signed downloadUrl and stays
+  // unauthenticated, so only fetch a token when a general-file attachment is
+  // present. MicrosoftAppCredentials caches the token internally — one call
+  // per activity covers every image attachment in the message. A token-fetch
+  // failure logs and falls through: the affected download still lands as
+  // download_status: failed with a clear download_error rather than crashing.
+  let botToken: string | undefined
+  const needsBotToken = items.some((a) => {
+    const ct = String(a.contentType ?? '').trim()
+    return ct !== TEAMS_FILE_DOWNLOAD_TYPE && isGeneralFileContentType(ct)
+  })
+  if (needsBotToken && APP_ID && APP_PASSWORD) {
+    try {
+      const creds = new MicrosoftAppCredentials(APP_ID, APP_PASSWORD, TENANT_ID || undefined)
+      botToken = await creds.getToken()
+    } catch (err) {
+      process.stderr.write(
+        `teams channel: failed to get bot token for attachment download: ${err}\n`,
+      )
+    }
+  }
+
   for (let i = 0; i < items.length; i++) {
     const att = items[i]
     const rawId = String((att as any).id ?? (att as any).contentUrl ?? '').trim()
@@ -859,11 +924,15 @@ async function downloadAttachments(
       download_status: 'skipped_non_file',
     }
     let downloadUrl = ''
+    // Only the general-file path hands streamDownload a secured Bot Framework
+    // URL that needs the bot token; the file-picker path is pre-signed.
+    let isGeneralFilePath = false
     if (contentType === TEAMS_FILE_DOWNLOAD_TYPE) {
       // Teams native file picker — downloadUrl lives inside content.
       const content = ((att as any).content ?? {}) as { downloadUrl?: string }
       downloadUrl = String(content.downloadUrl ?? '').trim() || String((att as any).contentUrl ?? '').trim()
     } else if (isGeneralFileContentType(contentType)) {
+      isGeneralFilePath = true
       // Generic file (PDF/DOCX/octet-stream/image/etc) from drag-drop, paste,
       // or external integrations. contentUrl is the common case; fall back to
       // content.downloadUrl which some Teams clients use for drag-drop. Cards
@@ -894,7 +963,12 @@ async function downloadAttachments(
       const dir = join(ATTACHMENTS_DIR, safeMessageId)
       mkdirSync(dir, { recursive: true, mode: 0o700 })
       const localPath = join(dir, safeName)
-      const dl = await streamDownload(downloadUrl, localPath, ATTACHMENT_MAX_BYTES)
+      const dl = await streamDownload(
+        downloadUrl,
+        localPath,
+        ATTACHMENT_MAX_BYTES,
+        isGeneralFilePath ? botToken : undefined,
+      )
       if (dl.ok) {
         stored.local_path = localPath
         stored.size_bytes = dl.size
