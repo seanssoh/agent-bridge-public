@@ -473,19 +473,153 @@ non_daily_total=$(( research_count + other_count + raw_count ))
   fi
 } > "$LOG"
 
+# -------------------------------------------------------------------------
+# Lane B routing gates (issue #1042)
+#
+# `agb agent show librarian` succeeding only proves the role *exists* — not
+# that librarian ingest is *enabled* for this host profile, nor that the
+# enqueue would land in the intended live task DB. Two gates run before the
+# librarian enqueue; either failing routes Lane B to a no-op with an audit
+# reason instead of accumulating unserviceable queue residue or leaking
+# hermetic fixture artifacts into the live DB.
+# -------------------------------------------------------------------------
+
+# Gate 1 — librarian ingest enabled for this host profile.
+#
+# On a dev-profile install the librarian/watchdog/wiki-ingest cron family is
+# disabled (see lib/bridge-host-profile.sh) and the librarian session is not
+# kept awake, so enqueued [librarian-ingest] tasks are never serviced.
+# Returns 0 (enabled) only when BOTH:
+#   - the host profile is not "dev" (server / unknown both pass — unknown
+#     keeps the pre-#1042 behaviour for installs that never ran host-profile
+#     onboarding), AND
+#   - the `wiki-daily-ingest` cron — the job that drives this very script —
+#     is currently enabled. If the cron inventory cannot be read the gate
+#     is permissive (returns 0) so a healthy server install whose cron list
+#     is briefly unavailable still ingests.
+lane_b_librarian_enabled() {
+  # Host-profile dev check — inline JSON read, mirrors
+  # bridge_host_profile_is_dev() without sourcing the full lib chain.
+  local hp_path=""
+  if [[ -n "${BRIDGE_HOST_PROFILE:-}" ]]; then
+    [[ "$BRIDGE_HOST_PROFILE" == "dev" ]] && return 1
+  fi
+  if [[ -f "$BRIDGE_HOME/state/install/host-profile.json" ]]; then
+    hp_path="$BRIDGE_HOME/state/install/host-profile.json"
+  elif [[ -f "$BRIDGE_STATE_DIR/install/host-profile.json" ]]; then
+    hp_path="$BRIDGE_STATE_DIR/install/host-profile.json"
+  fi
+  if [[ -n "$hp_path" ]] && command -v "$BRIDGE_PYTHON" >/dev/null 2>&1; then
+    local _profile
+    _profile="$("$BRIDGE_PYTHON" - "$hp_path" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        data = json.load(fh)
+    p = data.get("profile", "")
+    if p in ("server", "dev"):
+        print(p)
+except Exception:
+    pass
+PY
+)"
+    [[ "$_profile" == "dev" ]] && return 1
+  fi
+
+  # `wiki-daily-ingest` cron enablement check. A non-zero exit / missing
+  # cron inventory is treated as permissive (do not block a server install
+  # whose cron list is momentarily unavailable).
+  local cron_json=""
+  if ! cron_json="$("$BRIDGE_AGB" cron list --json 2>/dev/null)"; then
+    return 0
+  fi
+  [[ -n "$cron_json" ]] || return 0
+  command -v "$BRIDGE_PYTHON" >/dev/null 2>&1 || return 0
+  "$BRIDGE_PYTHON" - "$cron_json" <<'PY'
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)  # unparseable → permissive
+jobs = data.get("jobs", []) if isinstance(data, dict) else []
+for job in jobs:
+    if not isinstance(job, dict):
+        continue
+    if job.get("name") == "wiki-daily-ingest":
+        sys.exit(0 if job.get("enabled") else 1)
+sys.exit(0)  # cron not registered → permissive (pre-#1042 behaviour)
+PY
+}
+
+# Gate 2 — same-install guard.
+#
+# A hermetic smoke/repro run sets BRIDGE_HOME to an isolated fixture (e.g.
+# /private/var/.../tmp.*/bridge-home) but can still inherit a BRIDGE_AGB or
+# BRIDGE_TASK_DB pointing at the live install — which leaks fixture-derived
+# [librarian-ingest] tasks into the live queue (#1042). This proves the AGB
+# binary AND the resolved task DB AND the state root all resolve under the
+# current $BRIDGE_HOME before any task is created. A path-prefix string
+# match is not enough — paths are canonicalised first so symlinks / `..`
+# cannot defeat the check. Returns 0 only when all three resolve inside
+# $BRIDGE_HOME.
+lane_b_same_install() {
+  command -v "$BRIDGE_PYTHON" >/dev/null 2>&1 || return 1
+  # Resolve the task DB path the same way bridge-queue.py does:
+  #   BRIDGE_TASK_DB → BRIDGE_STATE_DIR/tasks.db → BRIDGE_HOME/state/tasks.db
+  local task_db="${BRIDGE_TASK_DB:-$BRIDGE_STATE_DIR/tasks.db}"
+  "$BRIDGE_PYTHON" - "$BRIDGE_HOME" "$BRIDGE_AGB" "$task_db" "$BRIDGE_STATE_DIR" <<'PY'
+import os, sys
+home, agb, task_db, state_dir = sys.argv[1:5]
+def canon(p):
+    return os.path.realpath(os.path.abspath(os.path.expanduser(p)))
+home_c = canon(home)
+def under(p):
+    pc = canon(p)
+    return pc == home_c or pc.startswith(home_c + os.sep)
+# All three live-install anchors must resolve under $BRIDGE_HOME.
+sys.exit(0 if (under(agb) and under(task_db) and under(state_dir)) else 1)
+PY
+}
+
 # Queue librarian task only for non-daily work. Lane A already handled
 # daily notes and did not produce a task. Falls back to the admin agent
 # (default: patch) only if the librarian is not provisioned on this
 # install — treated as an install incompleteness signal, not a routine
 # routing choice.
+lane_b_enqueue_status="skipped-no-work"
 if [ "$non_daily_total" -gt 0 ]; then
-  target="$BRIDGE_ADMIN_AGENT"
-  if "$BRIDGE_AGB" agent show librarian >/dev/null 2>&1; then
-    target="librarian"
+  if ! lane_b_librarian_enabled; then
+    lane_b_enqueue_status="skipped-librarian-disabled"
+    {
+      echo ""
+      echo "## Lane B enqueue skipped"
+      echo ""
+      echo "reason: librarian ingest is not enabled for this host profile"
+      echo "(host profile=dev or wiki-daily-ingest cron disabled). $non_daily_total"
+      echo "non-daily file(s) detected but no [librarian-ingest] task created —"
+      echo "re-enable with \`agb cron update wiki-daily-ingest --enable\`."
+    } >> "$LOG"
+  elif ! lane_b_same_install; then
+    lane_b_enqueue_status="skipped-cross-install"
+    {
+      echo ""
+      echo "## Lane B enqueue skipped"
+      echo ""
+      echo "reason: same-install guard failed — BRIDGE_AGB / task DB / state"
+      echo "root do not all resolve under BRIDGE_HOME=$BRIDGE_HOME. Refusing to"
+      echo "enqueue a [librarian-ingest] task to avoid leaking fixture-derived"
+      echo "work into a different install's queue (#1042)."
+    } >> "$LOG"
+  else
+    target="$BRIDGE_ADMIN_AGENT"
+    if "$BRIDGE_AGB" agent show librarian >/dev/null 2>&1; then
+      target="librarian"
+    fi
+    "$BRIDGE_AGB" task create --to "$target" --priority normal --from "$BRIDGE_ADMIN_AGENT" \
+      --title "[librarian-ingest] $non_daily_total 파일 ingest 필요 — $DATE" \
+      --body-file "$LOG" >/dev/null 2>&1 || true
+    lane_b_enqueue_status="enqueued-$target"
   fi
-  "$BRIDGE_AGB" task create --to "$target" --priority normal --from "$BRIDGE_ADMIN_AGENT" \
-    --title "[librarian-ingest] $non_daily_total 파일 ingest 필요 — $DATE" \
-    --body-file "$LOG" >/dev/null 2>&1 || true
 fi
 
 # Advance the watermark only when Lane A reported errors=0 AND the copy
@@ -505,4 +639,4 @@ skipped_isolated_csv=""
 if (( skipped_isolated_count > 0 )); then
   skipped_isolated_csv="$(IFS=,; echo "${SKIPPED_ISOLATED_AGENTS[*]}")"
 fi
-echo "wiki-daily-ingest: date=$DATE since=$YESTERDAY lane-a ${copy_summary} lane-b research=$research_count other=$other_count raw=$raw_count total=$non_daily_total skipped-isolated=$skipped_isolated_count skipped-isolated-reason=$LANE_B_ISOLATED_SKIP_REASON skipped-isolated-agents=${skipped_isolated_csv:-none} log=$LOG"
+echo "wiki-daily-ingest: date=$DATE since=$YESTERDAY lane-a ${copy_summary} lane-b research=$research_count other=$other_count raw=$raw_count total=$non_daily_total enqueue=$lane_b_enqueue_status skipped-isolated=$skipped_isolated_count skipped-isolated-reason=$LANE_B_ISOLATED_SKIP_REASON skipped-isolated-agents=${skipped_isolated_csv:-none} log=$LOG"

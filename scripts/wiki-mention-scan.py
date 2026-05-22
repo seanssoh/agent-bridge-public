@@ -53,6 +53,12 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]|#]+)(?:[|#][^\]]*)?\]\]")
 # Codespan detection — skip wikilinks inside `...` because those are
 # prose illustrations, not live references.
 _CODESPAN_RE = re.compile(r"(`+)(?!`)(.+?)\1(?!`)")
+# Fenced code block fence line: a run of >=3 backticks or tildes at the
+# start of a (optionally indented) line, optionally followed by an info
+# string. A closing fence must use the same character and be at least as
+# long as the opening fence (CommonMark). Bash `[[ ... ]]` tests and
+# `[:space:]` classes inside such blocks are code, not wikilinks.
+_FENCE_LINE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})")
 
 # Skip these top-level wiki subtrees during scans. They are not content.
 _SKIP_TOP_DIRS = {"_workspace", "_audit", "_index", ".obsidian"}
@@ -295,6 +301,46 @@ def _split_inline_list(inner: str) -> list[str]:
     return items
 
 
+def blank_fenced_code(text: str) -> str:
+    """Return ``text`` with every fenced code block region blanked out.
+
+    Each character inside a ```` ``` ````- or ``~~~``-fenced region (the
+    fence lines included) is replaced by a space, preserving the original
+    length and every newline so byte offsets stay aligned for callers that
+    track positions. A wikilink never lives inside a fenced code block, so
+    blanking the whole region prevents bash ``[[ ... ]]`` tests and
+    ``[:space:]`` POSIX classes from satisfying ``_WIKILINK_RE``.
+
+    Fence matching follows CommonMark's basics: an opening fence is a run
+    of >=3 backticks or tildes; the closing fence must use the same
+    character and be at least as long. An unterminated fence runs to EOF.
+    """
+    lines = text.split("\n")
+    out: list[str] = []
+    fence_char: str | None = None
+    fence_len = 0
+    for line in lines:
+        m = _FENCE_LINE_RE.match(line)
+        if fence_char is None:
+            if m:
+                fence_char = m.group(1)[0]
+                fence_len = len(m.group(1))
+                out.append(" " * len(line))
+            else:
+                out.append(line)
+        else:
+            # Inside a fenced region — blank every line, and check for the
+            # matching closing fence (same char, >= opening length, and no
+            # trailing info string per CommonMark).
+            out.append(" " * len(line))
+            if m and m.group(1)[0] == fence_char and len(m.group(1)) >= fence_len:
+                rest = line[m.end():].strip()
+                if not rest:
+                    fence_char = None
+                    fence_len = 0
+    return "\n".join(out)
+
+
 def codespan_ranges(text: str) -> list[tuple[int, int]]:
     return [(m.start(), m.end()) for m in _CODESPAN_RE.finditer(text)]
 
@@ -309,12 +355,18 @@ def inside_codespan(pos: int, ranges: list[tuple[int, int]]) -> bool:
 
 
 def iter_wikilinks(text: str):
-    """Yield (surface_form, position) for each [[...]] not in codespan.
+    """Yield (surface_form, position) for each [[...]] not in code.
 
     surface_form is the part BEFORE any ``|`` or ``#`` (i.e. the link target).
+
+    Code regions are excluded before matching: fenced code blocks are
+    blanked first (length-preserving so positions stay aligned), then
+    inline codespans are skipped via ``codespan_ranges``. A real markdown
+    wikilink never lives inside either.
     """
-    ranges = codespan_ranges(text)
-    for match in _WIKILINK_RE.finditer(text):
+    scan_text = blank_fenced_code(text)
+    ranges = codespan_ranges(scan_text)
+    for match in _WIKILINK_RE.finditer(scan_text):
         if inside_codespan(match.start(), ranges):
             continue
         surface = match.group(1).strip()
