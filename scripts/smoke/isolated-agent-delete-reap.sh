@@ -60,7 +60,12 @@ run_reap_probe() {
   local ace_dir="$4"
   local ace_present="$5"
 
-  bash <<PROBE
+  # r2 (codex integration review #5818): extract probe body to file via
+  # `cat > file <<PROBE` (write-to-file is safe), then `bash $file`.
+  # Avoids the bare `bash <<TAG` shape that is the same family as
+  # footgun #11.
+  local probe_file="$SMOKE_TMP_ROOT/probe-$$-${RANDOM}.sh"
+  cat >"$probe_file" <<PROBE
 set -uo pipefail
 
 # --- shims: record decisions instead of mutating the host ---------------
@@ -129,6 +134,10 @@ source "${SMOKE_REPO_ROOT}/lib/bridge-isolation-v2.sh"
 
 bridge_isolation_v2_reap_isolated_agent_account "${agent}" "${os_user}" 2>&1
 PROBE
+  bash "$probe_file"
+  local probe_rc=$?
+  rm -f "$probe_file"
+  return $probe_rc
 }
 
 # Compute the expected generated OS-user name the same way agent create

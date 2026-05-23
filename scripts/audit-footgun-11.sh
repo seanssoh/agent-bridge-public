@@ -210,6 +210,16 @@ RE_INTERP='(^|[^A-Za-z0-9_/.-])(bash|sh|zsh|python3?|perl|ruby|node|awk)[[:space
 RE_CAT_HEREDOC='(^|[^A-Za-z0-9_])cat[[:space:]]*(>[^|<>]*|>>[^|<>]*)?[[:space:]]*<<-?'
 RE_REDIR_OUT='>[[:space:]]*"?[^|<>[:space:]]+"?[[:space:]]*<<-?'
 RE_BASH_S='(^|[^A-Za-z0-9_/.-])bash[[:space:]]+-s([[:space:]]|$)'
+# r2 (codex integration review #5818): bare `bash <<TAG` is the same
+# heredoc-stdin-to-bash-subprocess shape as `bash -s <<TAG`. Earlier
+# the scanner only matched `-s`; this catches the bare form so
+# slipped-through smokes get flagged.
+#
+# r3 (codex #5825): widened to also catch `bash << TAG` (whitespace
+# between `<<` and the tag, which bash accepts). Matches any heredoc
+# operator immediately following `bash<whitespace>` regardless of
+# whether the tag is directly attached.
+RE_BASH_BARE_HEREDOC='(^|[^A-Za-z0-9_/.-])bash[[:space:]]+<<-?[[:space:]]*'
 
 # Is the heredoc operator on this line preceded by `$(` or backtick on
 # the SAME line — i.e. it opens a capture-wrapped heredoc? Cross-line
@@ -256,6 +266,12 @@ line_has_heredoc_like() {
   if [[ "$line" =~ $RE_HERESTRING ]]; then return 0; fi
   if [[ "$line" =~ $RE_PROCSUB_IN ]]; then return 0; fi
   if [[ "$line" =~ $RE_PROCSUB_OUT ]]; then return 0; fi
+  # r4 (codex #5834): include the scoped bare-bash-heredoc form so
+  # `bash << TAG` (whitespace between op + tag) reaches classify_line.
+  # The original RE_HEREDOC_OP refuses whitespace before unquoted tag
+  # (to avoid false positives on string content like `elapsed << interval`),
+  # so we add this guard arm that REQUIRES the leading `bash` keyword.
+  if [[ "$line" =~ $RE_BASH_BARE_HEREDOC ]]; then return 0; fi
   return 1
 }
 
@@ -284,15 +300,40 @@ classify_line() {
     return
   fi
 
-  local has_heredoc_op=0 has_herestring=0 has_procsub=0
+  local has_heredoc_op=0 has_herestring=0 has_procsub=0 has_bare_bash_heredoc=0
   [[ "$line" =~ $RE_HEREDOC_OP ]] && has_heredoc_op=1
   [[ "$line" =~ $RE_HERESTRING  ]] && has_herestring=1
   if [[ "$line" =~ $RE_PROCSUB_IN ]] || [[ "$line" =~ $RE_PROCSUB_OUT ]]; then
     has_procsub=1
   fi
+  # r3 (codex #5830): bash << TAG (whitespace) detection. Scoped to
+  # the bash-bare pattern so we don't false-positive on string content
+  # that contains `<<` (e.g. assertion labels "elapsed << interval").
+  if [[ "$line" =~ $RE_BASH_BARE_HEREDOC ]]; then
+    has_bare_bash_heredoc=1
+  fi
 
-  if (( has_heredoc_op == 0 && has_herestring == 0 && has_procsub == 0 )); then
+  if (( has_heredoc_op == 0 && has_herestring == 0 && has_procsub == 0 && has_bare_bash_heredoc == 0 )); then
     printf 'NONE|no-heredoc\n'
+    return
+  fi
+  # r3 (codex #5830): if ONLY the bare-bash-heredoc pattern matched,
+  # classify and return — the line otherwise lacks the RE_HEREDOC_OP
+  # signal that other arms expect.
+  # r6 (codex #5838): capture-aware classification. Use C1 when this
+  # line opens inside a `$(...)` capture (either same-line or carried
+  # from a prior open) — same shape as the normal in_capture_line
+  # detection but inlined here because RE_HEREDOC_OP didn't match.
+  if (( has_heredoc_op == 0 && has_herestring == 0 && has_procsub == 0 && has_bare_bash_heredoc == 1 )); then
+    if (( entry_capture == 1 )); then
+      printf 'C1|bare bash heredoc in capture (cross-line)\n'
+      return
+    fi
+    if in_capture_line "$line"; then
+      printf 'C1|bare bash heredoc in capture\n'
+      return
+    fi
+    printf 'C4|bare bash heredoc, no capture\n'
     return
   fi
 
@@ -343,6 +384,12 @@ classify_line() {
   # Outside capture.
   if [[ "$line" =~ $RE_BASH_S ]] && [[ "$line" =~ $RE_HEREDOC_OP ]]; then
     printf 'C4|bash -s heredoc, no capture\n'
+    return
+  fi
+  # r2 (codex integration review #5818): bare `bash <<TAG` is same C4
+  # bug class as `bash -s <<TAG` — heredoc-stdin to bash subprocess.
+  if [[ "$line" =~ $RE_BASH_BARE_HEREDOC ]]; then
+    printf 'C4|bare bash heredoc, no capture\n'
     return
   fi
   if [[ "$line" =~ $RE_INTERP ]]; then

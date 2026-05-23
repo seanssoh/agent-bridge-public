@@ -100,7 +100,16 @@ declare -a TARGETS=(
 
 # Core danger pattern. Anchored to "command name + space + heredoc op + tag",
 # but NOT anchored to start-of-line — so wrapper shape is irrelevant.
-danger_pattern='(bash[[:space:]]+-s|python3[[:space:]]+-)[[:space:]].*<<-?["'"'"']?(EOF|PY)["'"'"']?'
+#
+# r4 (codex integration review #5818): extended to catch bare
+# `bash <<TAG` (no `-s` flag) which slipped past the scanner in
+# scripts/smoke/1121-agent-delete-os-purge.sh. The two sub-patterns:
+#   - `bash -s ... <<EOF|<<PY` — original wave-pinned shape
+#   - `python3 - ... <<EOF|<<PY` — original
+#   - `bash[[:space:]]*<<TAG` — bare bash heredoc-stdin (catches `bash <<PROBE`).
+#     Tag must be uppercase identifier so `bash << EOF` and quoted variants
+#     all match, but `cat > file <<TAG` (write-to-file, safe) does NOT match.
+danger_pattern='(bash[[:space:]]+-s|python3[[:space:]]+-)[[:space:]].*<<-?["'"'"']?(EOF|PY)["'"'"']?|bash[[:space:]]+<<-?[[:space:]]*["'"'"']?[A-Z_][A-Z0-9_]+["'"'"']?'
 
 # Comment-prefix on `grep -nE` output (format: LINENO:CONTENT). Lines whose
 # CONTENT (after optional whitespace) begins with `#` are comment-only.
@@ -152,15 +161,24 @@ result="$(printf '%s' "$json" | bash -s -- "$arg" <<'EOF')"
 nested="$(other "$(bar)" | python3 - "$payload" <<'PY')"
 backtick=`python3 - "$payload" <<'PY'`
 echo "doc string with python3 - <<PY embedded" >/dev/null
+# r2 (codex integration review #5818): bare `bash <<TAG` positives —
+# new sub-pattern catches the heredoc-stdin-to-bash shape that earlier
+# slipped past the `bash -s` requirement.
+bash <<PROBE
+bash <<'PROBE'
+out=$(bash <<PROBE)
+bash << PROBE
+bash << "PROBE"
 echo done
 true
 FIXTURE
 
-  # 18 positives: every non-comment line containing the danger pattern.
-  # Includes broad-match positives — nested $(), backtick wrapper, and the
-  # doc-string literal — to make the broad-match contract explicit.
-  # 5 negatives: 3 comment lines + 2 trailing no-ops.
-  local expected=18
+  # 23 positives: every non-comment line containing the danger pattern.
+  # Includes broad-match positives — nested $(), backtick wrapper, the
+  # doc-string literal, three bare `bash <<TAG` positives (r2 #5818),
+  # AND two `bash << TAG` (whitespace between op + tag) positives
+  # (r3 #5825).
+  local expected=23
   local got
   got="$(count_sites "$fixture")"
 

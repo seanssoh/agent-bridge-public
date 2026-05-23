@@ -78,7 +78,14 @@ run_reap_probe() {
   mkdir -p "$SMOKE_TMP_ROOT/ctrlhome/.claude"
   : >"$SMOKE_TMP_ROOT/ctrlhome/.claude/.credentials.json"
 
-  bash <<PROBE
+  # r4 (codex integration review #5818 BLOCKING): write probe body
+  # to a file via `cat > file <<...` (file-as-argv via `bash $file`)
+  # instead of `bash <<PROBE` (heredoc-stdin-to-subprocess). The latter
+  # is the same family as footgun #11 — the linter scanner only matches
+  # `bash -s`, so this shape slipped past `lint-heredoc-ban.sh`. Writing
+  # to a file with heredoc-to-file is fine (no parser is reading stdin).
+  local probe_file="$SMOKE_TMP_ROOT/probe-$$-${RANDOM}.sh"
+  cat >"$probe_file" <<PROBE
 set -uo pipefail
 
 # --- shims: record decisions instead of mutating the host ---------------
@@ -141,26 +148,22 @@ bridge_agent_default_os_user() {
 export HOME="${SMOKE_TMP_ROOT}/ctrlhome"
 export SUDO_USER="" USER="probe" LOGNAME="probe"
 export BRIDGE_AGENT_GROUP_PREFIX="ab-agent-"
-# r3 (codex #5740): no env-controlled sudoers root. The smoke calls
-# the internal "_bridge_isolation_v2_reap_sudoers_drop_in" helper
-# directly with the tmpdir as the third argument — the production
-# "bridge_isolation_v2_reap_isolated_agent_account" always passes
-# /etc/sudoers.d hardcoded.
 source "${SMOKE_REPO_ROOT}/lib/bridge-isolation-v2.sh"
 
-# r3 (codex #5740): production passes /etc/sudoers.d hardcoded via
-# bridge_isolation_v2_reap_isolated_agent_account. The smoke calls the
-# internal "_bridge_isolation_v2_reap_sudoers_drop_in" helper directly
-# with the literal smoke-fixture path so the rm-decision logic is
-# exercised without any env-controlled bypass. C1 (non-Linux) and C4
-# (Gate-2 bad os_user) exercise the outer entrypoint because Gate-1/2
-# live there and are tested upstream of the internal helper.
+# Production calls bridge_isolation_v2_reap_isolated_agent_account which
+# passes /etc/sudoers.d hardcoded; the internal helper takes the path
+# as an explicit argument so the smoke can pass the tmpdir directly.
+# C1/C4 route through outer (Gate-1/2 lives there); others go internal.
 if [[ "${test_via}" == "outer" ]]; then
   bridge_isolation_v2_reap_isolated_agent_account "${agent}" "${os_user}" 2>&1
 else
   _bridge_isolation_v2_reap_sudoers_drop_in "${agent}" "${os_user}" "${SMOKE_TMP_ROOT}/etc/sudoers.d" 2>&1
 fi
 PROBE
+  bash "$probe_file"
+  local probe_rc=$?
+  rm -f "$probe_file"
+  return $probe_rc
 }
 
 expected_os_user() {
