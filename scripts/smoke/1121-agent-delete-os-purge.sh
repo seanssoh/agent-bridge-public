@@ -12,14 +12,14 @@
 # — same shim-record approach as scripts/smoke/isolated-agent-delete-reap.sh:
 # `userdel`/`groupdel`/`setfacl`/`rm` are replaced by bash functions that
 # record argv. The sudoers root directory is redirected to the smoke
-# tempdir via the production override `BRIDGE_SUDOERS_DIR` (which
+# tempdir via the production override `BRIDGE_TEST_SUDOERS_DIR_OVERRIDE` (which
 # production code never sets — its sole consumer is this smoke).
 #
 # Cases:
 #   C1. Non-Linux host — the helper must skip Step 4 entirely
 #       (sudoers cleanup never triggers on macOS / non-Linux).
 #   C2. Linux + exact-name match + sudoers file exists — the helper
-#       must rm exactly the matching `${BRIDGE_SUDOERS_DIR}/agent-bridge-<os_user>`
+#       must rm exactly the matching `${BRIDGE_TEST_SUDOERS_DIR_OVERRIDE}/agent-bridge-<os_user>`
 #       drop-in (defence-in-depth path-pattern gate accepts this shape).
 #   C3. Sudoers file does NOT exist on the host — Step 4 is a clean
 #       silent no-op (no rm, no warning row).
@@ -142,8 +142,8 @@ export SUDO_USER="" USER="probe" LOGNAME="probe"
 export BRIDGE_AGENT_GROUP_PREFIX="ab-agent-"
 # Test-only override of the sudoers root — production code path uses
 # /etc/sudoers.d/ when this is unset. The reaper composes the final path
-# as "\${BRIDGE_SUDOERS_DIR}/agent-bridge-<os_user>".
-export BRIDGE_SUDOERS_DIR="${SMOKE_TMP_ROOT}/etc/sudoers.d"
+# as "\${BRIDGE_TEST_SUDOERS_DIR_OVERRIDE}/agent-bridge-<os_user>".
+export BRIDGE_TEST_SUDOERS_DIR_OVERRIDE="${SMOKE_TMP_ROOT}/etc/sudoers.d"
 
 source "${SMOKE_REPO_ROOT}/lib/bridge-isolation-v2.sh"
 
@@ -182,12 +182,12 @@ test_linux_exact_match_removes_sudoers() {
   out="$(run_reap_probe "Linux" "bob" "$os_user" "present" "ok")"
 
   # Path mirrors lib/bridge-migration.sh:793 writer:
-  # "${BRIDGE_SUDOERS_DIR}/agent-bridge-${os_user}". For os_user already
+  # "${BRIDGE_TEST_SUDOERS_DIR_OVERRIDE}/agent-bridge-${os_user}". For os_user already
   # carrying the "agent-bridge-" prefix the resulting filename is
   # double-prefixed (agent-bridge-agent-bridge-bob) — by design, the
   # reaper mirrors the writer exactly so the file actually gets hit.
   smoke_assert_contains "$out" "RM_F ${SMOKE_TMP_ROOT}/etc/sudoers.d/agent-bridge-${os_user}" \
-    "C2: sudoers drop-in removed at exactly \${BRIDGE_SUDOERS_DIR}/agent-bridge-<os_user>"
+    "C2: sudoers drop-in removed at exactly \${BRIDGE_TEST_SUDOERS_DIR_OVERRIDE}/agent-bridge-<os_user>"
   smoke_assert_not_contains "$out" "refusing to rm" \
     "C2: strict pattern gate accepts the canonical agent-bridge-<slug> shape"
 }

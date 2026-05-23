@@ -2611,18 +2611,25 @@ bridge_isolation_v2_reap_isolated_agent_account() {
   # (lib/bridge-migration.sh): the writer emits to
   # `${sudoers_dir}/agent-bridge-${os_user}`. Use the same root so the
   # reaper targets the exact file the migrator created.
-  # BRIDGE_SUDOERS_DIR is a test-only override (defaults to /etc/sudoers.d)
-  # — production never sets it; the smoke at scripts/smoke/1121-agent-delete-os-purge.sh
-  # points it at a tempdir so the decision logic can be exercised without
-  # mutating the host's real sudoers tree.
-  local sudoers_dir="${BRIDGE_SUDOERS_DIR:-/etc/sudoers.d}"
+  #
+  # r2 (codex task #5722 BLOCKING): the prior design accepted a generic
+  # `BRIDGE_SUDOERS_DIR` env var, which a misconfigured caller (or an
+  # attacker who controls env) could weaponize to rm files outside
+  # /etc/sudoers.d. Production now ALWAYS hardcodes /etc/sudoers.d.
+  # The smoke uses a dedicated, test-only-named override
+  # `BRIDGE_TEST_SUDOERS_DIR_OVERRIDE` that production code paths never
+  # set. The variable name itself makes accidental production use
+  # obviously wrong on inspection.
+  local sudoers_dir="/etc/sudoers.d"
+  if [[ -n "${BRIDGE_TEST_SUDOERS_DIR_OVERRIDE:-}" ]]; then
+    sudoers_dir="$BRIDGE_TEST_SUDOERS_DIR_OVERRIDE"
+  fi
   local sudoers_path="${sudoers_dir}/agent-bridge-${os_user}"
   # Defence-in-depth: enforce both the directory location AND the literal
   # filename shape before any destructive call. The basename MUST match
   # the exact bridge-managed `agent-bridge-<slug>` form; the directory
-  # MUST be the production `/etc/sudoers.d` unless an explicit
-  # BRIDGE_SUDOERS_DIR override was supplied (test path). Anything else
-  # is a refusal — never rm an arbitrary sudoers file. The regex pins:
+  # MUST be /etc/sudoers.d unless the explicit test override is set.
+  # The regex pins:
   #   - prefix:     agent-bridge-
   #   - slug:       [a-zA-Z0-9_-]+
   #   - end-anchor: $
@@ -2630,7 +2637,7 @@ bridge_isolation_v2_reap_isolated_agent_account() {
   # `agent-bridge-foo*` could ever slip through.
   local sudoers_base="${sudoers_path##*/}"
   local sudoers_parent="${sudoers_path%/*}"
-  if [[ -z "${BRIDGE_SUDOERS_DIR:-}" && "$sudoers_parent" != "/etc/sudoers.d" ]]; then
+  if [[ -z "${BRIDGE_TEST_SUDOERS_DIR_OVERRIDE:-}" && "$sudoers_parent" != "/etc/sudoers.d" ]]; then
     bridge_warn "agent delete: skipping sudoers cleanup for '$agent' — composed parent '$sudoers_parent' is not /etc/sudoers.d (refusing to rm)"
   elif [[ ! "$sudoers_base" =~ ^agent-bridge-[a-zA-Z0-9_-]+$ ]]; then
     bridge_warn "agent delete: skipping sudoers cleanup for '$agent' — composed path '$sudoers_path' does not match strict pattern (refusing to rm)"
