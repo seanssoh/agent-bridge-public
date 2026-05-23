@@ -48,7 +48,7 @@ matching tag `v0.14.5-beta10`, GitHub release marked **Pre-release**.
     `bridge_ensure_project_claude_guidance` (post-Step-A v2 path now
     sudo-reads via O_NOFOLLOW Python helper then sudo-installs + chown
     + atomic mv).
-  
+
   Three review rounds: r1 (DEFER at all 5 sites — wrong: dropped
   configured runtime skills + project CLAUDE.md) → r2 (SUDO-ESCALATE
   at the two load-bearing sites — but with `sudo cat` that followed
