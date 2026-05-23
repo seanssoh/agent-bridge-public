@@ -425,7 +425,7 @@ select_for_path() {
       add_integration integration-minimal
       ;;
 
-    lib/bridge-isolation*.sh|lib/bridge-migration.sh|bridge-migrate.sh|lib/bridge-marker-bootstrap.sh|tests/isolation*)
+    lib/bridge-isolation*.sh|lib/bridge-migration.sh|bridge-migrate.sh|lib/bridge-marker-bootstrap.sh|lib/bridge-layout-resolver.sh|tests/isolation*)
       # Issue #583 closure smoke (v0.8.0 T4): the cross-class read
       # boundary depends directly on lib/bridge-isolation-v2.sh
       # primitives (group + setgid model), so cover it whenever any
@@ -503,11 +503,19 @@ select_for_path() {
       # Issue #1161: the three production layout-marker writers
       # (lib/bridge-isolation-v2-migrate.sh: marker_write +
       # marker_write_minimal; lib/bridge-layout-resolver.sh:
-      # bridge_layout_write_v2_marker) chmod the marker to 0644 so
-      # isolated UIDs can read it without depending on `ab-shared`
-      # group membership. Pull 1161-marker-readable-by-isolated on
-      # every isolation-lib + marker-bootstrap move so a revert to
-      # 0640 in any writer immediately fails the regression contract.
+      # bridge_layout_write_v2_marker) chmod the marker file to 0644
+      # AND chmod the marker parent dir to 0711 so isolated UIDs can
+      # both traverse INTO state/ and `open()` the marker without
+      # depending on `ab-shared` group membership. The matrix rows for
+      # state-root + state-agents-root in lib/bridge-isolation-v2.sh
+      # also moved 0710 → 0711 to match. Pull
+      # 1161-marker-readable-by-isolated on every isolation-lib +
+      # marker-bootstrap + layout-resolver move so a revert at any
+      # site immediately fails the regression contract.
+      # r2 (#1162) added `lib/bridge-layout-resolver.sh` to the
+      # path-pattern arm above — writer #3 lives there, so a
+      # resolver-only regression now selects this smoke through
+      # changed-file selection.
       add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup
       add_integration integration-minimal
       add_live live-tmux-daemon

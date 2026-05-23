@@ -497,7 +497,14 @@ bridge_layout_write_v2_marker() {
   local tmp="$marker_path.tmp.$$"
 
   mkdir -p "$marker_dir"
-  chmod 0750 "$marker_dir" 2>/dev/null || true
+  # #1161 r2: parent dir gets mode 0711 (others --x) so isolated UIDs
+  # that are NOT members of `ab-shared` can traverse INTO state/ and
+  # `open()` the marker file by name. With 0750 the marker file's mode
+  # 0644 grant was useless — POSIX traversal fails at the parent before
+  # the file mode is consulted. Dir contents stay non-listable; only
+  # specific files reachable by full path. See sibling sites in
+  # lib/bridge-isolation-v2-migrate.sh for the full rationale.
+  chmod 0711 "$marker_dir" 2>/dev/null || true
 
   cat >"$tmp" <<EOF
 # Agent Bridge v2 layout marker. Written by \`agent-bridge init\`.

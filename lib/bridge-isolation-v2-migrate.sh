@@ -928,11 +928,17 @@ bridge_isolation_v2_migrate_normalize_layout() {
     # siblings. Direct chmod (no recursion) to avoid clobbering
     # state/agents/<X>/ — those leaves get their own per-agent matrix
     # apply below.
+    # #1161 r2: mode 0711 (was 0710) so isolated UIDs that are NOT
+    # members of `ab-shared` can traverse INTO state/ to reach the
+    # layout marker at state/layout-marker.sh. ab-shared group grant
+    # remains the primary path; `others --x` is the fallback for hosts
+    # where group membership did not survive (the #1161 premise).
+    # Matches the matrix row in lib/bridge-isolation-v2.sh state-root.
     _bridge_isolation_v2_run_root_or_sudo chgrp "$shared_grp" "$data_root/state" 2>/dev/null || true
-    _bridge_isolation_v2_run_root_or_sudo chmod 0710 "$data_root/state" 2>/dev/null || true
+    _bridge_isolation_v2_run_root_or_sudo chmod 0711 "$data_root/state" 2>/dev/null || true
     if [[ -d "$data_root/state/agents" ]]; then
       _bridge_isolation_v2_run_root_or_sudo chgrp "$shared_grp" "$data_root/state/agents" 2>/dev/null || true
-      _bridge_isolation_v2_run_root_or_sudo chmod 0710 "$data_root/state/agents" 2>/dev/null || true
+      _bridge_isolation_v2_run_root_or_sudo chmod 0711 "$data_root/state/agents" 2>/dev/null || true
     fi
     # state/runtime/ stays controller-only (daemon config lives there).
     if [[ -d "$data_root/state/runtime" ]]; then
@@ -1359,8 +1365,17 @@ bridge_isolation_v2_migrate_marker_write() {
   marker_path="$(bridge_isolation_v2_marker_path)"
 
   bridge_isolation_v2_migrate_mkstate
-  install -d -m 0750 "$(dirname "$marker_path")" 2>/dev/null \
+  # #1161 r2: parent dir gets mode 0711 so isolated UIDs that are NOT
+  # members of `ab-shared` can still traverse INTO the marker dir and
+  # `open()` the marker file by name. 0750 made the marker file's mode
+  # 0644 grant irrelevant — POSIX traversal fails at the parent before
+  # the file mode is consulted. 0711 = owner rwx, group --x, others --x;
+  # dir contents are NOT listable (no +r for non-owner), only the
+  # specific marker file is reachable by full path. Trade-off accepted:
+  # operator can `ls` as owner; isolated UIDs do `cat <marker>` by name.
+  install -d -m 0711 "$(dirname "$marker_path")" 2>/dev/null \
     || mkdir -p "$(dirname "$marker_path")"
+  chmod 0711 "$(dirname "$marker_path")" 2>/dev/null || true
 
   local tmp="${marker_path}.tmp.$$"
   {
@@ -1425,8 +1440,12 @@ bridge_isolation_v2_migrate_marker_write_minimal() {
   marker_path="$(bridge_isolation_v2_marker_path)"
 
   bridge_isolation_v2_migrate_mkstate
-  install -d -m 0750 "$(dirname "$marker_path")" 2>/dev/null \
+  # #1161 r2: same parent-dir traversal grant as marker_write — 0711 so
+  # isolated UIDs without `ab-shared` membership can reach the marker
+  # file by name. See full rationale on the sibling site above.
+  install -d -m 0711 "$(dirname "$marker_path")" 2>/dev/null \
     || mkdir -p "$(dirname "$marker_path")"
+  chmod 0711 "$(dirname "$marker_path")" 2>/dev/null || true
 
   local tmp="${marker_path}.tmp.$$"
   {

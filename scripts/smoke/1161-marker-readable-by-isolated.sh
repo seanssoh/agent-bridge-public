@@ -304,4 +304,160 @@ if (( T6_FAIL != 0 )); then
 fi
 smoke_log "T6 PASS: all three production writers source-assert mode 0644 (regression contract intact)"
 
-smoke_log "all 6 tests PASS (#1161 marker writers chmod 0644 — readable by isolated UIDs)"
+# ---------- T7 — parent marker dir is mode 0711 at every writer site ----------
+#
+# r1 codex review caught the parent-dir traversal gap: the marker file
+# can be mode 0644, but if its parent dir is 0750 / 0710 (no others --x)
+# then POSIX traversal from a non-`ab-shared` UID fails BEFORE the file
+# mode matters. The r2 fix promotes the parent dir to 0711 (owner rwx,
+# group --x, others --x) so isolated UIDs can `open()` the marker by
+# full path even without ab-shared group membership.
+#
+# This test reads the parent dir of each writer's marker file (produced
+# by T1/T2/T3 above) and asserts the dir mode contains the `others +x`
+# bit. The drivers run as the test user under the temp root, so the
+# matrix's `chgrp ab-controller` step is a best-effort no-op; the
+# direct `chmod 0711` survives.
+T7_FAIL=0
+for _idx in 1 2 3; do
+  _home_var="T${_idx}_HOME"
+  _marker_var="T${_idx}_MARKER"
+  _dir="$(dirname "${!_marker_var}")"
+  _mode="$(file_mode_octal "$_dir")"
+  case "$_mode" in
+    711|0711) smoke_log "T7 PASS[T${_idx}]: parent dir $_dir → mode $_mode" ;;
+    751|0751|755|0755)
+      # Acceptable variants (others --x present, group rights vary).
+      smoke_log "T7 PASS[T${_idx}]: parent dir $_dir → mode $_mode (others --x present)"
+      ;;
+    *)
+      smoke_log "T7 FAIL[T${_idx}]: parent dir $_dir mode $_mode lacks others --x — non-ab-shared UID cannot traverse"
+      T7_FAIL=1
+      ;;
+  esac
+done
+
+# Static-source assertion: every writer site sets parent dir to 0711.
+# Boomerang: reverting any writer to `install -d -m 0750` or `chmod 0750
+# "$marker_dir"` immediately fails this test. Scope each grep to the
+# literal line so an unrelated 0750 in the file is not confused.
+T7_SOURCE_MIGRATE="$REPO_ROOT/lib/bridge-isolation-v2-migrate.sh"
+T7_SOURCE_RESOLVER="$REPO_ROOT/lib/bridge-layout-resolver.sh"
+T7_SOURCE_MATRIX="$REPO_ROOT/lib/bridge-isolation-v2.sh"
+
+# marker_write + marker_write_minimal each have one `install -d -m 0711`
+# line for the marker parent. There are two writers, so we expect two
+# occurrences total of the literal install -d line, and at least two
+# `chmod 0711 "$(dirname "$marker_path")"` follow-up calls.
+_install_count=$(grep -c 'install -d -m 0711 "\$(dirname "\$marker_path")"' "$T7_SOURCE_MIGRATE" || true)
+if (( _install_count < 2 )); then
+  smoke_log "T7 FAIL: bridge-isolation-v2-migrate.sh has $_install_count 'install -d -m 0711' marker-parent sites, expected >= 2 (marker_write + marker_write_minimal)"
+  T7_FAIL=1
+fi
+# Anti-pattern: 0750 must NOT appear on the marker-parent install line.
+if grep -q 'install -d -m 0750 "\$(dirname "\$marker_path")"' "$T7_SOURCE_MIGRATE"; then
+  smoke_log "T7 FAIL: bridge-isolation-v2-migrate.sh still has 'install -d -m 0750' on a marker-parent site (regression)"
+  T7_FAIL=1
+fi
+
+# Writer #3 fresh-init: `chmod 0711 "$marker_dir"` (NOT 0750).
+if grep -q '^  chmod 0750 "$marker_dir"' "$T7_SOURCE_RESOLVER"; then
+  smoke_log "T7 FAIL: bridge-layout-resolver.sh still chmods marker_dir to 0750 (regression)"
+  T7_FAIL=1
+fi
+grep -q '^  chmod 0711 "$marker_dir"' "$T7_SOURCE_RESOLVER" \
+  || { smoke_log "T7 FAIL: bridge-layout-resolver.sh missing expected 'chmod 0711 \"\$marker_dir\"' line"; T7_FAIL=1; }
+
+# Matrix rows: state-root + state-agents-root must be 0711 (not 0710).
+# Grep the literal mode token in the matrix-row printf line.
+if grep -q "^    printf 'state-root|%s|dir_only_traverse|controller|%s|0710" "$T7_SOURCE_MATRIX"; then
+  smoke_log "T7 FAIL: bridge-isolation-v2.sh state-root matrix row still 0710 (regression)"
+  T7_FAIL=1
+fi
+if grep -q "^    printf 'state-agents-root|%s|dir_only_traverse|controller|%s|0710" "$T7_SOURCE_MATRIX"; then
+  smoke_log "T7 FAIL: bridge-isolation-v2.sh state-agents-root matrix row still 0710 (regression)"
+  T7_FAIL=1
+fi
+grep -q "^    printf 'state-root|%s|dir_only_traverse|controller|%s|0711" "$T7_SOURCE_MATRIX" \
+  || { smoke_log "T7 FAIL: bridge-isolation-v2.sh state-root matrix row missing 0711"; T7_FAIL=1; }
+grep -q "^    printf 'state-agents-root|%s|dir_only_traverse|controller|%s|0711" "$T7_SOURCE_MATRIX" \
+  || { smoke_log "T7 FAIL: bridge-isolation-v2.sh state-agents-root matrix row missing 0711"; T7_FAIL=1; }
+
+# Live chmod call in normalize_layout: state/ + state/agents/ must be 0711.
+if grep -q '_bridge_isolation_v2_run_root_or_sudo chmod 0710 "\$data_root/state"' "$T7_SOURCE_MIGRATE"; then
+  smoke_log "T7 FAIL: bridge-isolation-v2-migrate.sh normalize_layout still chmods state/ to 0710 (regression)"
+  T7_FAIL=1
+fi
+grep -q '_bridge_isolation_v2_run_root_or_sudo chmod 0711 "\$data_root/state"' "$T7_SOURCE_MIGRATE" \
+  || { smoke_log "T7 FAIL: bridge-isolation-v2-migrate.sh normalize_layout missing 'chmod 0711 \"\$data_root/state\"' line"; T7_FAIL=1; }
+
+if (( T7_FAIL != 0 )); then
+  smoke_fail "T7 parent-dir traversal contract failed (see T7 FAIL lines above)"
+fi
+smoke_log "T7 PASS: marker parent dir mode 0711 at every writer site (runtime + source + matrix)"
+
+# ---------- T8 — cross-UID actual `cat` (Linux-only) ----------
+#
+# This is the test r1's smoke missed: spawn a different UID (not the
+# test-user, not in ab-shared) and `cat` the marker. Asserts the
+# parent-chain traversal + file-mode grant compose correctly end-to-end.
+#
+# Requires: Linux + nobody UID exists + we have sudo to su to it.
+# macOS dev hosts lack the ab-shared layout and the `nobody` semantics
+# differ; we SKIP with a clear breadcrumb that the assertion was
+# verified on the patch operator's Linux host.
+if ! smoke_is_linux; then
+  smoke_skip "T8" "cross-UID cat is Linux-only; verified on patch host (macOS skip)"
+elif ! command -v sudo >/dev/null 2>&1; then
+  smoke_skip "T8" "sudo not available — cannot spawn cross-UID cat"
+else
+  # Pick a non-controller UID that exists and is NOT in ab-shared.
+  # `nobody` is the canonical non-privileged UID on every Linux distro.
+  T8_TEST_USER="${BRIDGE_TEST_NON_SHARED_USER:-nobody}"
+  if ! id "$T8_TEST_USER" >/dev/null 2>&1; then
+    smoke_skip "T8" "test user '$T8_TEST_USER' does not exist on this host"
+  else
+    # Probe sudo: must be passwordless to this user, or we can't run.
+    if ! sudo -n -u "$T8_TEST_USER" true >/dev/null 2>&1; then
+      smoke_skip "T8" "passwordless sudo to '$T8_TEST_USER' unavailable (CI gate)"
+    else
+      # Pre-flight: tempdir + its parents (/tmp/agent-bridge-...) must
+      # already be world-traversable. mktemp -d gives 0700 by default;
+      # widen to 0711 along the chain so the test isolates the marker
+      # parent dir behavior, not the tempdir mode.
+      _t8_chain="$SMOKE_TMP_ROOT"
+      while [[ "$_t8_chain" != "/" && "$_t8_chain" != "" ]]; do
+        chmod o+x "$_t8_chain" 2>/dev/null || true
+        _t8_chain="$(dirname "$_t8_chain")"
+      done
+
+      T8_FAIL=0
+      for _idx in 1 2 3; do
+        _marker_var="T${_idx}_MARKER"
+        _marker="${!_marker_var}"
+        if [[ ! -f "$_marker" ]]; then
+          smoke_log "T8 FAIL[T${_idx}]: marker missing at $_marker (T${_idx} prerequisite)"
+          T8_FAIL=1
+          continue
+        fi
+        _out="$(sudo -n -u "$T8_TEST_USER" cat "$_marker" 2>&1)" || {
+          smoke_log "T8 FAIL[T${_idx}]: cross-UID cat ($T8_TEST_USER) failed for $_marker: $_out"
+          T8_FAIL=1
+          continue
+        }
+        if ! printf '%s' "$_out" | grep -q '^BRIDGE_LAYOUT=v2$'; then
+          smoke_log "T8 FAIL[T${_idx}]: cross-UID cat got unexpected content for $_marker: $_out"
+          T8_FAIL=1
+          continue
+        fi
+        smoke_log "T8 PASS[T${_idx}]: cross-UID ($T8_TEST_USER) cat $_marker OK (BRIDGE_LAYOUT=v2)"
+      done
+      if (( T8_FAIL != 0 )); then
+        smoke_fail "T8 cross-UID traversal failed (see T8 FAIL lines above)"
+      fi
+      smoke_log "T8 PASS: cross-UID ($T8_TEST_USER, not in ab-shared) can cat marker at every writer site"
+    fi
+  fi
+fi
+
+smoke_log "all tests PASS (#1161 marker writers chmod 0644 + parent dir 0711 — readable by isolated UIDs)"
