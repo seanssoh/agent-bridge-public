@@ -4197,12 +4197,86 @@ bridge_ensure_claude_first_run_config() {
   return 0
 }
 
+# bridge_agent_onboarding_markers_complete <agent> <dir>
+#
+# #1139 sub-B helper. Checks whether the canonical onboarding markers
+# (CLAUDE.md SOUL.md SESSION-TYPE.md MEMORY.md MEMORY-SCHEMA.md — the
+# same list `bridge-setup.sh` walks in its half-scaffolded check)
+# exist alongside SESSION-TYPE.md in `<dir>`. Mirrors the controller-
+# first / iso-UID-probe-fallback trust path that
+# `bridge_agent_onboarding_state` uses for SESSION-TYPE.md itself, so
+# the marker check honors the same access reality.
+#
+# Exits:
+#   0 — all markers present
+#   1 — at least one marker missing
+#   2 — controller blind + iso-UID probe unavailable (cannot verify)
+bridge_agent_onboarding_markers_complete() {
+  local agent="$1"
+  local dir="$2"
+  local marker=""
+  local sudo_rc=0
+  local script_out=""
+  local controller_can_traverse=0
+  local saw_unverifiable=0
+
+  if [[ -d "$dir" ]]; then
+    controller_can_traverse=1
+  fi
+  if [[ $controller_can_traverse -eq 1 ]]; then
+    for marker in CLAUDE.md SOUL.md SESSION-TYPE.md MEMORY.md MEMORY-SCHEMA.md; do
+      [[ -f "$dir/$marker" ]] || return 1
+    done
+    return 0
+  fi
+  # Controller cannot traverse `<dir>` — route through the iso UID with
+  # the same helper that the parent function uses. The probe script
+  # exits 0 when ALL markers exist, 1 when any are missing, 2 when the
+  # dir itself is unreadable even to the iso UID.
+  if declare -F bridge_isolation_run_as_agent_user_via_bash >/dev/null 2>&1; then
+    sudo_rc=0
+    # shellcheck disable=SC2016  # single-quoted on purpose: $1 is the script arg
+    script_out="$(bridge_isolation_run_as_agent_user_via_bash "$agent" '
+target_dir="$1"
+[[ -d "$target_dir" ]] || exit 2
+for marker in CLAUDE.md SOUL.md SESSION-TYPE.md MEMORY.md MEMORY-SCHEMA.md; do
+  [[ -f "$target_dir/$marker" ]] || exit 1
+done
+exit 0
+' "$dir" 2>/dev/null)" || sudo_rc=$?
+    : "${script_out:=}"  # silence "unused" lint — script body is side-effect only
+    case "$sudo_rc" in
+      0) return 0 ;;
+      1) return 1 ;;
+      2) saw_unverifiable=1 ;;
+      # Helper rc 3/4 shift the probe script's rc 1/2 up by 2. rc=3
+      # means "iso UID confirmed at least one marker missing" — treat
+      # as missing. rc=4 means "iso UID can't read the dir" — flip to
+      # unverifiable.
+      3) return 1 ;;
+      4) saw_unverifiable=1 ;;
+      *)
+        # Other helper rc (e.g. rc=1 = agent not isolated → the
+        # controller `[[ -d ]]` test above is authoritative and we
+        # already returned 1 there) — treat as missing.
+        return 1
+        ;;
+    esac
+  fi
+  if [[ $saw_unverifiable -eq 1 ]]; then
+    return 2
+  fi
+  return 1
+}
+
 bridge_agent_onboarding_state() {
   local agent="$1"
   local path=""
   local line=""
   local sudo_rc=0
   local saw_unreadable=0
+  local parsed_state=""
+  local markers_rc=0
 
   # #1120 sub-B: on v2 linux-user isolation the SESSION-TYPE.md candidate
   # paths live under `<v2-root>/<agent>/workdir/` (mode 2770 owned by the
@@ -4226,21 +4300,32 @@ bridge_agent_onboarding_state() {
   # emit `unverifiable` so `agent show` surfaces "controller cannot
   # confirm" instead of the false `missing` that watchdog hooks treat as
   # "needs re-onboarding".
+  #
+  # #1139 sub-B: after parsing the state from SESSION-TYPE.md, sanity-
+  # check the other canonical markers (CLAUDE.md / SOUL.md / MEMORY.md
+  # / MEMORY-SCHEMA.md) in the same dir. A half-scaffolded workdir (one
+  # or more markers missing — the failure mode `bridge-setup.sh`
+  # already detects post-PR-#1133) must downgrade to `partial` instead
+  # of inheriting the SESSION-TYPE.md-only `complete` reading that
+  # `agent show` used to surface as a false-positive while
+  # `setup agent` correctly flagged the half-scaffold. Marker probe
+  # uses the same controller-first / iso-UID fallback trust path as
+  # the SESSION-TYPE.md read above.
   for path in "$(bridge_agent_workdir "$agent")/SESSION-TYPE.md" "$(bridge_agent_default_home "$agent")/SESSION-TYPE.md"; do
+    parsed_state=""
     if [[ -f "$path" ]]; then
       line="$(grep -E 'Onboarding State:[[:space:]]*[A-Za-z0-9._-]+' "$path" 2>/dev/null | head -n 1 || true)"
       if [[ "$line" =~ Onboarding[[:space:]]+State:[[:space:]]*([A-Za-z0-9._-]+) ]]; then
-        printf '%s' "${BASH_REMATCH[1]}"
-        return 0
+        parsed_state="${BASH_REMATCH[1]}"
+      else
+        # File readable but no matching line — treat as a true "missing"
+        # data point and keep walking the candidate list.
+        continue
       fi
-      # File readable but no matching line — treat as a true "missing"
-      # data point and keep walking the candidate list.
-      continue
-    fi
-    # `[[ -f ]]` returned false. On v2 isolation this is almost always
-    # "controller cannot traverse the parent" rather than "the file is
-    # absent" — probe via the isolated UID before declaring missing.
-    if declare -F bridge_isolation_run_as_agent_user_via_bash >/dev/null 2>&1; then
+    elif declare -F bridge_isolation_run_as_agent_user_via_bash >/dev/null 2>&1; then
+      # `[[ -f ]]` returned false. On v2 isolation this is almost always
+      # "controller cannot traverse the parent" rather than "the file is
+      # absent" — probe via the isolated UID before declaring missing.
       sudo_rc=0
       # shellcheck disable=SC2016  # single-quoted on purpose: $1 is the script arg
       line="$(bridge_isolation_run_as_agent_user_via_bash "$agent" '
@@ -4252,11 +4337,11 @@ grep -E "Onboarding State:[[:space:]]*[A-Za-z0-9._-]+" "$file" 2>/dev/null | hea
       case "$sudo_rc" in
         0)
           if [[ "$line" =~ Onboarding[[:space:]]+State:[[:space:]]*([A-Za-z0-9._-]+) ]]; then
-            printf '%s' "${BASH_REMATCH[1]}"
-            return 0
+            parsed_state="${BASH_REMATCH[1]}"
+          else
+            # iso UID read the file but no matching line — keep walking
+            continue
           fi
-          # iso UID read the file but no matching line — keep walking
-          continue
           ;;
         2)
           # Agent isolated + passwordless sudo unavailable. We can't
@@ -4282,7 +4367,42 @@ grep -E "Onboarding State:[[:space:]]*[A-Za-z0-9._-]+" "$file" 2>/dev/null | hea
           continue
           ;;
       esac
+    else
+      # No iso-UID probe available and controller `[[ -f ]]` returned
+      # false — treat this candidate as missing and keep walking.
+      continue
     fi
+
+    # `parsed_state` is set. #1139 sub-B: validate the surrounding
+    # canonical markers before honoring it. Only downgrade `complete`
+    # (the value that drives the false-positive); other states already
+    # imply incomplete onboarding so the marker check is informational.
+    if [[ "$parsed_state" == "complete" ]]; then
+      markers_rc=0
+      bridge_agent_onboarding_markers_complete "$agent" "${path%/SESSION-TYPE.md}" || markers_rc=$?
+      case "$markers_rc" in
+        0)
+          printf '%s' "complete"
+          return 0
+          ;;
+        1)
+          # One or more canonical markers missing — half-scaffolded.
+          # `agent show` users + watchdog consumers see `partial`
+          # instead of the false-positive `complete`.
+          printf '%s' "partial"
+          return 0
+          ;;
+        2)
+          # Marker check itself was unverifiable; trust the SESSION-
+          # TYPE.md reading rather than inventing a false `partial`.
+          printf '%s' "complete"
+          return 0
+          ;;
+      esac
+    fi
+
+    printf '%s' "$parsed_state"
+    return 0
   done
 
   # Differentiate "controller could not confirm" from "candidate files
