@@ -392,6 +392,14 @@ bridge_source_module "bridge-isolation-v3-channel-dotenv.sh"
 # already defined (the runtime state helper composes the two).
 bridge_source_module "bridge-isolation-runtime.sh"
 bridge_source_module "bridge-profiles.sh"
+# Issue #1060: typed agent-layout resolver + minimal engine descriptor.
+# Sourced after bridge-agents.sh (the resolver wraps
+# `bridge_agent_default_home` / `bridge_agent_workdir`) and
+# bridge-profiles.sh (the profile-source layer wraps
+# `bridge_profile_source_root`). The descriptor depends on the layout
+# resolver for workspace/home resolution, so it loads second.
+bridge_source_module "bridge-agent-layout.sh"
+bridge_source_module "bridge-engine-descriptor.sh"
 bridge_source_module "bridge-cron.sh"
 bridge_source_module "bridge-discord.sh"
 bridge_source_module "bridge-notify.sh"

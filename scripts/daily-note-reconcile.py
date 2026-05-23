@@ -1019,17 +1019,40 @@ def _bridge_home(args: argparse.Namespace) -> Path:
     return (Path.home() / ".agent-bridge").resolve()
 
 
+def _agent_memory_dir_default(bridge_root: Path, agent: str) -> Path:
+    """Per-agent memory dir default — the identity source's ``memory/``.
+
+    Issue #1060 D4: this MUST match the shell layout resolver
+    (``bridge_layout_memory_dir`` = ``agent_home/memory``). On a v2-
+    isolation install the identity source is
+    ``$BRIDGE_AGENT_ROOT_V2/<agent>/home`` — NOT
+    ``$BRIDGE_HOME/agents/<agent>`` (that path is the tracked profile
+    source on v2). The legacy ``<BRIDGE_HOME>/agents/<agent>/memory``
+    default sent the daily note into the wrong tree, the exact #1060
+    model-drift bug for memory tooling.
+
+    Resolution order mirrors the shell side:
+      * ``BRIDGE_AGENT_ROOT_V2`` set  → ``<root>/<agent>/home/memory``
+      * otherwise (legacy install)    → ``<BRIDGE_HOME>/agents/<agent>/memory``
+    """
+    v2_root = os.environ.get("BRIDGE_AGENT_ROOT_V2")
+    if v2_root:
+        return Path(v2_root).expanduser().resolve() / agent / "home" / "memory"
+    return bridge_root / "agents" / agent / "memory"
+
+
 def _resolve_memory_dir(args: argparse.Namespace, agent: str) -> Path:
     """Resolve the daily-note directory.
 
-    Default: ``<BRIDGE_HOME>/agents/<agent>/memory``. If ``--memory-dir``
+    Default: the identity source's ``memory/`` — see
+    ``_agent_memory_dir_default`` (issue #1060 D4). If ``--memory-dir``
     is provided, the resolved path MUST live inside the resolved bridge
     home (Item 6 — closes ``--memory-dir /etc/passwd``-style escapes).
     Raises ``ValueError`` on a containment violation.
     """
     bridge_root = _bridge_home(args)
     if not args.memory_dir:
-        return bridge_root / "agents" / agent / "memory"
+        return _agent_memory_dir_default(bridge_root, agent)
     candidate = Path(args.memory_dir).expanduser().resolve()
     try:
         candidate.relative_to(bridge_root)

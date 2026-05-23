@@ -1759,7 +1759,19 @@ run_show() {
     printf 'admin: %s\n' "$admin"
     printf 'session: %s\n' "$session"
     printf 'session_id: %s\n' "${session_id:--}"
+    # Issue #1060 D2: the three-layer agent-layout model exposed as three
+    # distinct, resolver-derived lines so `agent show` stops conflating
+    # them. `agent_home` is the IDENTITY SOURCE (layer 2 — the authored
+    # canonical identity tree); `workdir` is the WORKSPACE (layer 3 — the
+    # process cwd the runtime launches in, the value already carried by
+    # the TSV `workdir` column = `bridge_agent_workdir`). On a v2 install
+    # the two diverge (`<agent-root>/home` vs `<agent-root>/workdir`);
+    # before #1060 only `workdir` was shown, so the operator could not
+    # tell which tree held the authored identity.
     printf 'workdir: %s\n' "$workdir"
+    if declare -F bridge_layout_agent_home >/dev/null 2>&1; then
+      printf 'agent_home: %s\n' "$(bridge_layout_agent_home "$row_agent")"
+    fi
     printf 'profile_home: %s\n' "${profile_home:--}"
     printf 'profile_source: %s\n' "$profile_source"
     printf 'active: %s\n' "$active"
@@ -2685,18 +2697,23 @@ report and reap test-fixture agents per their pattern."
 
   session="${session:-$agent}"
   default_home="$(bridge_agent_default_home "$agent")"
-  # #1045/#1046: on a v2 install the runtime resolver (bridge_agent_workdir)
-  # resolves the agent's cwd — the path preflight / start_dry_run / `agent
-  # show` use, and the dir the live session is launched in — to the sibling
-  # `<agent-root>/workdir`, NOT `<agent-root>/home` (which is the process
-  # HOME). bridge_agent_default_home returns the `home/` path, so defaulting
-  # the scaffold target to it lands the entire profile (CLAUDE.md, SOUL.md,
-  # .claude/...) under `home/` while the resolved `workdir/` stays empty —
-  # the exact fresh-install (#1045) and `agent create --isolate` (#1046)
-  # break. When the operator did not pass an explicit `--workdir`, default
-  # the scaffold target to the resolved v2 `workdir/` so the profile lands
-  # where the runtime actually looks. The `home/` sibling is still created
-  # by bridge_scaffold_agent_home. An explicit `--workdir` is honored as-is.
+  # Issue #1060: the three-layer agent-layout model. `agent create`
+  # authors the canonical per-agent identity (SOUL / SESSION-TYPE /
+  # MEMORY* / role payload) into the IDENTITY SOURCE — layer 2,
+  # `bridge_layout_agent_home` = v2 `<agent-root>/home`. It is no longer
+  # the empty/stale sibling: the create flow scaffolds INTO it, then runs
+  # a materialization step that delivers the identity fileset into the
+  # engine's materialization target (the workspace `workdir/` for v2
+  # static Claude) so the runtime — which keeps reading `workdir/`
+  # exactly as before (no reader flip) — receives a populated, current
+  # identity. This closes the #1046/#1060 model drift: scaffold no longer
+  # treats `home/` as the runtime home while the resolver launches the
+  # empty `workdir/`.
+  #
+  # `workdir` here stays the WORKSPACE (layer 3) — process cwd, the path
+  # `bridge_agent_workdir` resolves and the live session launches in.
+  # When the operator did not pass an explicit `--workdir`, default it to
+  # the resolved v2 `workdir/`. An explicit `--workdir` is honored as-is.
   local _workdir_is_v2_default=0
   if [[ -z "$workdir" && -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
     workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
@@ -2765,13 +2782,60 @@ report and reap test-fixture agents per their pattern."
         bridge_die "workdir가 이미 존재하고 비어 있지 않습니다: $workdir"
       fi
     fi
+    # Issue #1060 D1: scaffold the authored identity into the IDENTITY
+    # SOURCE (layer 2). On a v2 install the identity source is ALWAYS
+    # `bridge_layout_agent_home` = `<agent-root>/home` — regardless of
+    # whether the workspace is the v2-default `workdir/` or an explicit
+    # `--workdir` (including a *shared* project tree). Authoring the
+    # identity into `home/` is what keeps per-agent identity OUT of a
+    # shared workspace (the shared-workdir rule): the materialization
+    # step below then delivers it into the workspace ONLY when the
+    # workspace is not shared. On a legacy install (no BRIDGE_AGENT_ROOT_V2)
+    # the identity source and workspace coincide, so the target stays
+    # `$workdir` and materialization is a no-op. `bridge_scaffold_agent_home`
+    # still creates the v2 sibling, so both `home/` and `workdir/` exist
+    # after this call.
+    local scaffold_target="$workdir"
+    if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]] \
+        && declare -F bridge_layout_agent_home >/dev/null 2>&1; then
+      scaffold_target="$(bridge_expand_user_path "$(bridge_layout_agent_home "$agent")")"
+    fi
     # v0.8.5 #693 (Wave-3): pass isolation_mode + os_user so scaffold's
     # sudo-handoff predicate (added by PR #688 for #677) actually fires
     # on `agent create --isolate ...`. Without these explicit args, the
     # in-roster lookup inside scaffold would short-circuit the sudo path
     # — see the comment on `bridge_scaffold_agent_home`'s signature.
-    bridge_scaffold_agent_home "$agent" "$workdir" "$display_name" "$role_text" "$engine" "$session_type" "$isolation_mode" "$os_user"
-    bridge_scaffold_user_partitions "$workdir" "$users_json"
+    bridge_scaffold_agent_home "$agent" "$scaffold_target" "$display_name" "$role_text" "$engine" "$session_type" "$isolation_mode" "$os_user"
+    # Per-user partitions (`users/<id>/USER.md`) are per-agent identity,
+    # so they are scaffolded into the IDENTITY SOURCE alongside the rest
+    # of the authored identity — the `users/` skeleton template lands
+    # under `$scaffold_target`. The materialization step below delivers
+    # the populated `users/` tree into the workspace read target.
+    bridge_scaffold_user_partitions "$scaffold_target" "$users_json"
+    # Issue #1060 D1: deliver the authored identity into the engine's
+    # materialization target (the workspace `workdir/` for v2 static
+    # Claude) so the runtime read target is never the empty/stale
+    # sibling that caused the #1046/#1060 re-onboarding loop. No-op when
+    # scaffold_target == the materialization target (legacy / custom
+    # --workdir). Honors the shared-workspace rule internally.
+    if [[ "$scaffold_target" != "$workdir" ]] \
+        && declare -F bridge_layout_materialize_identity >/dev/null 2>&1; then
+      # Pass $workdir explicitly: the roster reload that
+      # `bridge_agent_workdir` (and therefore the descriptor's target
+      # lookup) depends on runs AFTER bridge_write_role_block below, so
+      # the create flow hands the already-resolved workspace directly.
+      #
+      # Codex r1 BLOCKING 1: propagate the operator's --allow-shared-workdir
+      # intent into the materializer so a normal project workspace (no
+      # marker text) is NOT stamped over. The materializer's marker-based
+      # detection alone is insufficient for markerless shared projects.
+      if [[ "${allow_shared_workdir:-0}" == "1" ]]; then
+        BRIDGE_LAYOUT_WORKSPACE_SHARED=1 \
+          bridge_layout_materialize_identity "$agent" "$engine" "$workdir"
+      else
+        bridge_layout_materialize_identity "$agent" "$engine" "$workdir"
+      fi
+    fi
     if [[ "$engine" == "claude" ]]; then
       bridge_ensure_project_claude_guidance "$workdir" >/dev/null 2>&1 || true
       bridge_ensure_auto_memory_isolation "$agent" "$workdir"
