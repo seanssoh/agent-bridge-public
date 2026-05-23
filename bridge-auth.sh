@@ -269,6 +269,38 @@ bridge_auth_fix_legacy_secret_file_mode() {
   chmod "$file_mode" "$file" 2>/dev/null || bridge_auth_run_privileged chmod "$file_mode" "$file"
 }
 
+bridge_auth_controller_credentials_path() {
+  # #1075 — resolve the controller's ``~/.claude/.credentials.json`` from the
+  # same controller-user view that the isolation-v2 layer uses
+  # (`bridge_isolation_v2_controller_user`). Returns the path even when the
+  # file does not yet exist; ``cmd_sync_agent`` only reads it on the
+  # no-active-token fallback branch and surfaces a clean error if missing.
+  #
+  # Precedence: ``$BRIDGE_CONTROLLER_HOME`` (explicit override, used in tests)
+  # → ``bridge_isolation_v2_controller_user`` → ``$SUDO_USER`` → ``$HOME``.
+  local controller_user=""
+  local controller_home=""
+  if [[ -n "${BRIDGE_CONTROLLER_HOME:-}" ]]; then
+    controller_home="$BRIDGE_CONTROLLER_HOME"
+  fi
+  if [[ -z "$controller_home" ]]; then
+    if declare -F bridge_isolation_v2_controller_user >/dev/null 2>&1; then
+      controller_user="$(bridge_isolation_v2_controller_user 2>/dev/null || true)"
+    fi
+    if [[ -z "$controller_user" ]]; then
+      controller_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+    fi
+    if [[ -n "$controller_user" ]]; then
+      controller_home="$(getent passwd "$controller_user" 2>/dev/null | cut -d: -f6 || true)"
+    fi
+    if [[ -z "$controller_home" ]]; then
+      controller_home="${HOME:-}"
+    fi
+  fi
+  [[ -n "$controller_home" ]] || return 1
+  printf '%s/.claude/.credentials.json' "$controller_home"
+}
+
 bridge_auth_sync_agent_python() {
   local agent="$1"
   local registry="$2"
@@ -278,11 +310,17 @@ bridge_auth_sync_agent_python() {
   local os_user=""
   local owner_uid=""
   local owner_gid=""
+  local controller_cred=""
   local -a workdir_args=()
   local -a owner_args=()
+  local -a controller_cred_args=()
 
   workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
   [[ -n "$workdir" ]] && workdir_args=(--workdir "$workdir")
+  controller_cred="$(bridge_auth_controller_credentials_path 2>/dev/null || true)"
+  if [[ -n "$controller_cred" ]]; then
+    controller_cred_args=(--controller-credentials "$controller_cred")
+  fi
 
   # PR #799 r2 codex findings 2 + 3 — pass the isolated UID/GID + allowed
   # filesystem root to Python so:
@@ -308,7 +346,7 @@ bridge_auth_sync_agent_python() {
     fi
     bridge_linux_sudo_root python3 "$SCRIPT_DIR/bridge-auth.py" \
       --registry "$registry" sync-agent --agent "$agent" --file "$file" \
-      "${workdir_args[@]}" "${owner_args[@]}" --json
+      "${workdir_args[@]}" "${owner_args[@]}" "${controller_cred_args[@]}" --json
     return $?
   fi
   # Non-isolated dev install — Python still gets the agent's resolved home as
@@ -320,7 +358,7 @@ bridge_auth_sync_agent_python() {
   fi
   python3 "$SCRIPT_DIR/bridge-auth.py" \
     --registry "$registry" sync-agent --agent "$agent" --file "$file" \
-    "${workdir_args[@]}" "${owner_args[@]}" --json
+    "${workdir_args[@]}" "${owner_args[@]}" "${controller_cred_args[@]}" --json
 }
 
 bridge_auth_selected_agents() {
