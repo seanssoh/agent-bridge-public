@@ -1117,26 +1117,21 @@ def read_controller_claude_credentials_payload(path: Path) -> dict[str, Any]:
         raise PermissionError(
             f"refusing to read symlinked controller credentials: {path}"
         )
-    # Codex r1 BLOCKING: the file-level symlink check alone is bypassable
-    # via a symlinked `.claude` parent dir (parent-swap). Walk every
-    # ancestor of `path` up to the user's home and refuse if ANY component
-    # is itself a symlink — closes the parent-symlink vector.
-    _ancestor = path.parent
-    try:
-        _home = Path.home()
-    except RuntimeError:
-        _home = None
-    while True:
-        if _ancestor.is_symlink():
-            raise PermissionError(
-                f"refusing to read controller credentials under symlinked "
-                f"ancestor: {_ancestor}"
-            )
-        if _home is not None and _ancestor == _home:
-            break
-        if _ancestor.parent == _ancestor:
-            break  # filesystem root
-        _ancestor = _ancestor.parent
+    # Codex r1 BLOCKING / r2 over-reject: the file-level symlink check
+    # is bypassable via a symlinked `.claude` parent (parent-swap). The
+    # r2 ancestor-walk-to-$HOME over-rejected legitimate paths under
+    # symlinked system roots (e.g. macOS /var/folders/... test temp paths
+    # where /var is itself a symlink) — `Path.home()` is the wrong
+    # boundary when the controller home is an explicit override
+    # (BRIDGE_CONTROLLER_HOME / sudo / test). Check ONLY the immediate
+    # `.claude` parent (the swap vector); anything beyond that is the
+    # caller's responsibility — the caller (bridge-auth.sh) already
+    # resolved + validated the controller home root.
+    if path.parent.is_symlink():
+        raise PermissionError(
+            f"refusing to read controller credentials under symlinked "
+            f"parent: {path.parent}"
+        )
     if not path.is_file():
         raise FileNotFoundError(f"controller credentials not found: {path}")
     try:
