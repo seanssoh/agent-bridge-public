@@ -7323,28 +7323,77 @@ while [[ $# -gt 0 ]]; do
 done
 
 CMD="${1:-}"
+shift || true
+
+# Issue #1114: -h/--help/help on the top-level dispatcher prints usage
+# and exits 0. ALSO defend the silently-dangerous case where the
+# operator types `daemon ensure --help` (or `daemon start --help`)
+# expecting help — historically the dispatcher consumed the verb,
+# matched `ensure)`, and called `cmd_start` unconditionally, starting
+# the daemon. Each verb now scans its remaining args for -h/--help/help
+# and prints usage instead of executing the cmd_*.
+daemon_args_have_help() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -h|--help|help) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 case "$CMD" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
   start)
+    if daemon_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
     cmd_start
     ;;
   ensure)
+    if daemon_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
     cmd_start
     ;;
   run)
+    if daemon_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
     cmd_run
     ;;
   run-cron-worker)
-    shift || true
+    if daemon_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
     cmd_run_cron_worker "$@"
     ;;
   stop)
-    shift || true
+    if daemon_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
     cmd_stop "$@"
     ;;
   status)
+    if daemon_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
     cmd_status
     ;;
   sync)
+    if daemon_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
     cmd_sync_cycle
     ;;
   *)

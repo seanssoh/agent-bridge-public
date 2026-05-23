@@ -939,6 +939,25 @@ bridge_upgrade_conflicts_dispatch() {
   # superseded; the python-side `list` adds the
   # `live_target_hash_changed_since_write` column needed by the new
   # reconcile contract.
+  #
+  # Issue #1114: short-circuit -h/--help/help BEFORE binding $sub so
+  # `agb upgrade conflicts --help` prints the same usage block the
+  # mid-loop --help branch already prints instead of falling through
+  # to the "지원하지 않는 하위 명령" error path.
+  case "${1:-}" in
+    -h|--help|help)
+      cat <<'USAGE'
+Usage:
+  agb upgrade conflicts list     [--target <bridge-home>] [--json]
+  agb upgrade conflicts diff     [--target <bridge-home>] <conflict-path>
+  agb upgrade conflicts adopt    [--target <bridge-home>] [--yes] <conflict-path>
+  agb upgrade conflicts discard  [--target <bridge-home>] [--yes] <conflict-path>
+  agb upgrade conflicts archive  [--target <bridge-home>] [--yes] <conflict-path>
+  agb upgrade conflicts reconcile [--target <bridge-home>] [--auto-archive]
+USAGE
+      return 0
+      ;;
+  esac
   local sub="${1:-list}"
   shift || true
   local target="${BRIDGE_HOME:-$HOME/.agent-bridge}"
