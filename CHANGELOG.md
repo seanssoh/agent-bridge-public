@@ -33,8 +33,9 @@ implement-ok (task #5993). `-beta13` prerelease; matching tag
   isolated context, choosing the simplest end-to-end path over
   invasive group-membership investigation:
   - **Marker file mode 0640 → 0644** at all three writer sites
-    (`lib/bridge-isolation-v2-migrate.sh:_marker_write` +
-    `_marker_write_minimal`, plus the fresh-init writer
+    (`lib/bridge-isolation-v2-migrate.sh:bridge_isolation_v2_migrate_marker_write` +
+    `bridge_isolation_v2_migrate_marker_write_minimal`, plus the
+    fresh-init writer
     `lib/bridge-layout-resolver.sh:bridge_layout_write_v2_marker`).
     Marker content is non-secret (`BRIDGE_LAYOUT=v2` +
     `BRIDGE_DATA_ROOT=<abs-path>`). Validator's mode gate at
@@ -62,14 +63,18 @@ implement-ok (task #5993). `-beta13` prerelease; matching tag
 
 ### Deferred — `ab-shared` group membership latent bug
 
-`bridge_isolation_v2_ensure_user_in_group "$os_user" "ab-shared"`
-(`lib/bridge-agents.sh:3797`) is supposed to add isolated UIDs to
-the `ab-shared` group during `agent create`. On the remote QA host,
-`getent group ab-shared` showed only the controller user, suggesting
-either the call is not executed in the linux-user prepare path or
-`usermod -aG` silently fails under sudo. With #1161's chmod 0644 +
-0711 parent-traversal fix, the marker is now world-readable so this
-no longer blocks end-to-end agent start. The membership bug is a
+`bridge_isolation_v2_ensure_user_in_group "$os_user" "$_v2_shared_grp"`
+(`lib/bridge-agents.sh:3807-3811`) is supposed to add isolated UIDs
+to the `ab-shared` group during `agent create`. On the remote QA
+host, `getent group ab-shared` showed only the controller user. The
+helper returns failure on sudo failure
+(`lib/bridge-isolation-v2.sh:649-651`), so this is an unproven
+runtime/group-refresh hypothesis — the call may not be executed in
+the linux-user prepare path for that install, or the group-set
+refresh after `usermod -aG` may not propagate to already-running
+controller processes (see KNOWN_ISSUES §28). With #1161's chmod 0644
++ 0711 parent-traversal fix, the marker is now world-readable so
+this no longer blocks end-to-end agent start. The membership bug is a
 latent issue that will be addressed in a follow-up release once the
 A2A QA loop stabilizes.
 
