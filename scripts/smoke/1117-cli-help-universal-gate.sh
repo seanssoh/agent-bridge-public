@@ -10,13 +10,15 @@
 #
 # Contract pinned by this smoke:
 #
-#   T1. Every TOP-LEVEL command enumerated in
-#       `scripts/cli-help/agent-bridge-usage.txt`'s `__CLI_NAME__ <cmd>`
-#       lines accepts both `--help` and `-h` with rc==0 + non-empty
-#       stdout. The list is parsed from the usage template and
-#       cross-checked against the agent-bridge dispatcher's
-#       `case "$1" in` block + the `_top_valid` typo-suggestion array
-#       (which #1115 already pins for set-equality).
+#   T1. Every TOP-LEVEL command routed by the `agent-bridge` dispatcher's
+#       `case "$1" in` block accepts both `--help` and `-h` with rc==0
+#       + non-empty stdout. This pins the RUNTIME contract — the smoke
+#       parses the dispatcher itself (not the usage template) so any
+#       command actually wired into the case-switch must honor the
+#       contract regardless of whether the operator-facing usage.txt
+#       documents it. #1115 pins the separate set-equality between
+#       case-switch ↔ usage.txt ↔ `_top_valid` typo array; this smoke
+#       owns the per-command rc/stdout assertion at runtime.
 #
 #   T2. Every SUB-VERB enumerated in a dispatcher's `case "$subcommand"`
 #       / `case "$COMMAND"` / `case "$CMD"` block (bridge-agent.sh,
