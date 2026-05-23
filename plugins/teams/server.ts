@@ -15,7 +15,7 @@ import {
 } from '@modelcontextprotocol/sdk/types.js'
 import { BotFrameworkAdapter, TurnContext, ActivityTypes } from 'botbuilder'
 import type { ConversationReference, Activity } from 'botbuilder'
-import { MicrosoftAppCredentials } from 'botframework-connector'
+import { ConnectorClient, MicrosoftAppCredentials } from 'botframework-connector'
 import { createServer } from 'http'
 import { randomUUID } from 'crypto'
 import { spawnSync } from 'child_process'
@@ -1207,6 +1207,121 @@ function recentMessages(chatId: string, limit: number): StoredMessage[] {
 }
 
 /**
+ * Derive a Teams service URL for proactive sends. The service URL is tenant-
+ * and region-specific (e.g. https://smba.trafficmanager.net/amer/). We obtain
+ * it in preference order:
+ *   1. TEAMS_SERVICE_URL env var (operator override for multi-region setups).
+ *   2. serviceUrl from any stored ConversationReference (populated after the
+ *      first inbound message from a user).
+ *   3. Hard-coded global Teams endpoint as a last resort.
+ */
+function resolveServiceUrl(): string {
+  const override = process.env.TEAMS_SERVICE_URL
+  if (override && /^https?:\/\//.test(override)) return override.replace(/\/$/, '') + '/'
+  const refs = loadJson<Record<string, ConversationReference>>(REFERENCES_FILE, {})
+  for (const ref of Object.values(refs)) {
+    if (ref.serviceUrl) return ref.serviceUrl.replace(/\/$/, '') + '/'
+  }
+  // Global Teams endpoint -- works for most commercial tenants.
+  return 'https://smba.trafficmanager.net/amer/'
+}
+
+/**
+ * Proactive 1:1 send via Bot Framework createConversation.
+ *
+ * Creates a new 1:1 conversation with the target Teams user (identified by
+ * their Teams user ID or AAD object ID) and posts the message. If a stored
+ * ConversationReference already exists for a past conversation with this user
+ * we skip createConversation and reuse the existing reference -- this is
+ * faster and avoids duplicate conversations.
+ *
+ * Returns a result object with `ok`, `conversation_id`, `message_id`, and
+ * `error` fields. Never throws -- all Bot Framework errors are caught and
+ * mapped to the error envelope so the agent can report them clearly.
+ */
+async function sendMessageProactive(
+  targetId: string,
+  text: string,
+): Promise<{ ok: boolean; conversation_id: string; message_id: string; error?: string }> {
+  // Fast path: if we already have a ConversationReference for a conversation
+  // where this user was the "from" party, reuse it.
+  const refs = loadJson<Record<string, ConversationReference>>(REFERENCES_FILE, {})
+  let existingRef: ConversationReference | undefined
+  for (const ref of Object.values(refs)) {
+    const refFrom = (ref as any).user ?? ref.from
+    if (!refFrom) continue
+    const refAad = String((refFrom as any).aadObjectId ?? '').trim()
+    const refId = String((refFrom as any).id ?? refFrom?.id ?? '').trim()
+    if ((refAad && refAad === targetId) || (refId && refId === targetId)) {
+      existingRef = ref
+      break
+    }
+  }
+
+  if (existingRef) {
+    let sentId = ''
+    try {
+      await adapter.continueConversation(existingRef, async context => {
+        const sent = await context.sendActivity(text)
+        sentId = (sent as any)?.id ?? ''
+      })
+      return { ok: true, conversation_id: String((existingRef as any).conversation?.id ?? ''), message_id: sentId }
+    } catch (err) {
+      return { ok: false, conversation_id: '', message_id: '', error: String((err as Error)?.message ?? err) }
+    }
+  }
+
+  // Cold path: no stored reference -- initiate via createConversation.
+  const serviceUrl = resolveServiceUrl()
+  let creds: MicrosoftAppCredentials
+  try {
+    creds = new MicrosoftAppCredentials(APP_ID!, APP_PASSWORD!, TENANT_ID || undefined)
+  } catch (err) {
+    return { ok: false, conversation_id: '', message_id: '', error: `credentials_error: ${(err as Error)?.message ?? err}` }
+  }
+
+  let client: ConnectorClient
+  try {
+    client = new ConnectorClient(creds, { baseUri: serviceUrl })
+  } catch (err) {
+    return { ok: false, conversation_id: '', message_id: '', error: `connector_error: ${(err as Error)?.message ?? err}` }
+  }
+
+  const params = {
+    isGroup: false,
+    bot: { id: APP_ID!, name: 'Bot' },
+    members: [{ id: targetId, name: '' }],
+    ...(TENANT_ID ? { tenantId: TENANT_ID, channelData: { tenant: { id: TENANT_ID } } } : { channelData: {} }),
+  }
+
+  let conversationId = ''
+  let messageId = ''
+  try {
+    const result = await client.conversations.createConversation(params as any)
+    conversationId = String((result as any).id ?? '').trim()
+    if (!conversationId) {
+      return { ok: false, conversation_id: '', message_id: '', error: 'createConversation returned no conversation id' }
+    }
+    const sendResult = await client.conversations.sendToConversation(
+      conversationId,
+      { type: 'message', text } as any,
+    )
+    messageId = String((sendResult as any)?.id ?? '').trim()
+    return { ok: true, conversation_id: conversationId, message_id: messageId }
+  } catch (err) {
+    const msg = String((err as Error)?.message ?? err)
+    // Surface Bot Framework error codes as actionable hints.
+    let error = `bot_framework_error: ${msg}`
+    if (/403|forbidden|not authorized/i.test(msg)) {
+      error = `bot_not_installed_or_auth_failed: ${msg} -- ensure the bot app is installed in the target user's Teams personal scope, and that TEAMS_APP_ID / TEAMS_APP_PASSWORD / TEAMS_TENANT_ID match the Azure Bot registration`
+    } else if (/404|not found/i.test(msg)) {
+      error = `user_not_found: ${msg} -- confirm the target user id is the correct AAD object id or Teams user id for this tenant`
+    }
+    return { ok: false, conversation_id: conversationId, message_id: '', error }
+  }
+}
+
+/**
  * Send a Teams file consent card for one outbound file. Teams renders a card
  * in the conversation; when the user clicks Accept, the bot receives a
  * `fileConsent/invoke` activity with an upload URL. The bot PUTs file bytes
@@ -1673,6 +1788,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: 'send_message',
+      description:
+        'Proactively send a 1:1 Teams message to an allowlisted user without requiring an inbound message first. ' +
+        'Uses the Bot Framework createConversation pattern when no stored conversation reference exists. ' +
+        'The target user must appear in the access.json allowFrom list. ' +
+        "Requires the bot app to be installed in the target user's Teams personal scope.",
+      inputSchema: {
+        type: 'object',
+        properties: {
+          to: {
+            type: 'string',
+            description:
+              'AAD object ID or Teams user ID of the target user. Must match an entry in access.json allowFrom.',
+          },
+          text: {
+            type: 'string',
+            description: 'Message text to send.',
+          },
+        },
+        required: ['to', 'text'],
+      },
+    },
   ],
 }))
 
@@ -1846,6 +1984,40 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       const limit = Number(args.limit ?? 20)
       const rows = recentMessages(chatId, Number.isFinite(limit) ? limit : 20)
       return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) }] }
+    }
+    case 'send_message': {
+      const to = String(args.to ?? '').trim()
+      let text = String(args.text ?? '').trim()
+      if (!to) throw new Error('to is required')
+      if (!text) throw new Error('text is required')
+
+      // Authorization: target must be in access.json allowFrom.
+      const access = loadAccess()
+      const allowed = access.allowFrom ?? []
+      if (allowed.length > 0 && !allowed.includes(to)) {
+        throw new Error(
+          `send_message: target "${to}" is not in the access.json allowFrom list; ` +
+          `add the user's AAD object id or Teams user id to --allow-from before sending`,
+        )
+      }
+
+      // Prompt guard: sanitize outbound text before send.
+      const guarded = runPromptGuard('sanitize', text)
+      if (guarded?.blocked) {
+        text = '[Agent Bridge] outbound message blocked by prompt guard.'
+      } else if (guarded?.was_modified && typeof guarded.sanitized_text === 'string') {
+        text = guarded.sanitized_text
+      }
+
+      const result = await sendMessageProactive(to, text)
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(result),
+          },
+        ],
+      }
     }
     default:
       throw new Error(`unknown tool: ${req.params.name}`)
