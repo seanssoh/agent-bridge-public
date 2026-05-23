@@ -1538,6 +1538,17 @@ run_list() {
         json_mode=1
         shift
         ;;
+      -h|--help|help)
+        # Issue #1114: `agent list --help` was caught by the `*)` arm
+        # as a "지원하지 않는 옵션" error.
+        cat <<'AGENT_LIST_HELP'
+Usage: agent-bridge agent list [--json]
+
+List every agent known on this host (active sessions and roster
+entries) as a human-readable table, or as JSON with --json.
+AGENT_LIST_HELP
+        return 0
+        ;;
       *)
         bridge_die "지원하지 않는 agent list 옵션입니다: $1"
         ;;
@@ -1605,6 +1616,18 @@ run_registry() {
         # symmetry with `agent list --json` so callers can keep a
         # single argv shape across both endpoints.
         shift
+        ;;
+      -h|--help|help)
+        # Issue #1114: `agent registry --help` was caught by the `*)`
+        # arm as a "지원하지 않는 옵션" error.
+        cat <<'AGENT_REGISTRY_HELP'
+Usage: agent-bridge agent registry [--json]
+
+Read-only enumeration of every agent id known on this host
+(static + dynamic + system) with cleanup-class and provenance.
+JSON-only by design — the human shape is `agent list`.
+AGENT_REGISTRY_HELP
+        return 0
         ;;
       *)
         bridge_die "지원하지 않는 agent registry 옵션입니다: $1"
@@ -4943,6 +4966,20 @@ PY
 
 run_start() {
   local agent="${1:-}"
+  # Issue #1114: -h/--help/help in the agent slot prints usage instead
+  # of being passed to bridge_require_agent (which dies with a roster
+  # mismatch message).
+  case "$agent" in
+    -h|--help|help)
+      cat <<'AGENT_START_HELP'
+Usage: agent-bridge agent start <agent> [bridge-start.sh forwards...]
+
+Start (or re-attach to) a static or dynamic agent session. Extra
+options after <agent> are forwarded verbatim to bridge-start.sh.
+AGENT_START_HELP
+      return 0
+      ;;
+  esac
   shift || true
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") start <agent> [...]"
   bridge_require_agent "$agent"
@@ -4960,6 +4997,21 @@ run_safe_mode() {
 run_stop() {
   local agent="${1:-}"
   local session=""
+
+  # Issue #1114: -h/--help/help in the agent slot prints usage instead
+  # of being passed to bridge_require_agent (which dies with a roster
+  # mismatch message).
+  case "$agent" in
+    -h|--help|help)
+      cat <<'AGENT_STOP_HELP'
+Usage: agent-bridge agent stop <agent>
+
+Stop the live tmux session for <agent>. No-op if the session is
+already absent.
+AGENT_STOP_HELP
+      return 0
+      ;;
+  esac
 
   shift || true
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") stop <agent>"

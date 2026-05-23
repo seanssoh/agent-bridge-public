@@ -95,6 +95,12 @@ while [[ $# -gt 0 ]]; do
       WAIT_SECONDS="$2"
       shift 2
       ;;
+    -h|--help|help)
+      # Issue #1114: print usage and exit 0 instead of dying with
+      # "알 수 없는 옵션: --help" via the -*) catch-all.
+      usage
+      exit 0
+      ;;
     -*)
       bridge_die "알 수 없는 옵션: $1"
       ;;

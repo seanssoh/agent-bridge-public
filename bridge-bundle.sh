@@ -91,6 +91,17 @@ command="${1:-}"
 [[ -n "$command" ]] || { usage; exit 1; }
 shift || true
 
+# Issue #1114: -h/--help/help on the top-level dispatcher prints usage
+# and exits 0. `parse_common_flag` recognizes --help but is never
+# reached when the dispatcher's "지원하지 않는 bundle 명령" arm fires
+# first.
+case "$command" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
+
 case "$command" in
   create)
     target=""

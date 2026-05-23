@@ -40,13 +40,35 @@ cmd_sync() {
   bridge_discord_relay_step
 }
 
+discord_args_have_help() {
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -h|--help|help) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 case "${1:-}" in
   status)
-    [[ $# -eq 1 ]] || bridge_die "Usage: bash $SCRIPT_DIR/bridge-discord-relay.sh status"
+    shift
+    # Issue #1114: accept `discord status --help` without the strict
+    # arity check rejecting the help flag itself.
+    if discord_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
+    [[ $# -eq 0 ]] || bridge_die "Usage: bash $SCRIPT_DIR/bridge-discord-relay.sh status"
     cmd_status
     ;;
   sync)
-    [[ $# -eq 1 ]] || bridge_die "Usage: bash $SCRIPT_DIR/bridge-discord-relay.sh sync"
+    shift
+    if discord_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
+    [[ $# -eq 0 ]] || bridge_die "Usage: bash $SCRIPT_DIR/bridge-discord-relay.sh sync"
     cmd_sync
     ;;
   -h|--help|help)

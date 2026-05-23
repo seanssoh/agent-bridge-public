@@ -1119,6 +1119,16 @@ run_errors() {
   local errors_cmd="${1:-}"
   shift || true
 
+  # Issue #1114: short-circuit -h/--help/help BEFORE the
+  # bridge_require_cron_source_jobs guard so `cron errors --help` works
+  # on hosts without a populated cron source jobs file.
+  case "$errors_cmd" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+  esac
+
   local jobs_file
   jobs_file="$(bridge_cron_source_jobs_file || true)"
   bridge_require_cron_source_jobs "$jobs_file"
@@ -1160,6 +1170,16 @@ run_errors() {
 run_cleanup() {
   local cleanup_cmd="${1:-}"
   shift || true
+
+  # Issue #1114: short-circuit -h/--help/help BEFORE the
+  # bridge_require_cron_source_jobs guard so `cron cleanup --help` works
+  # on hosts without a populated cron source jobs file.
+  case "$cleanup_cmd" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+  esac
 
   # Issue #533 — for `--mode run-artifacts` and `--mode all` the cleanup
   # operates on BRIDGE_HOME directly and does not need a jobs file. We

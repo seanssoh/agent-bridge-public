@@ -26,6 +26,16 @@ run_status() {
   local py_args=()
   local i
 
+  # Issue #1114: -h/--help/help in the agent slot prints usage instead
+  # of being treated as an agent id (which then dies in
+  # bridge_require_agent with a roster mismatch).
+  case "${1:-}" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+  esac
+
   if [[ "${1:-}" == "--all" ]]; then
     all=1
     shift
