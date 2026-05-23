@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
-# scripts/smoke/1145-option1-deferral-guard.sh — Issue #1145 Option 1.
+# scripts/smoke/1145-option1-deferral-guard.sh — Issue #1145 Option 1 (r2).
 #
 # Beta9 follow-up to #1145. PR #1146 added try/except OSError wrapping in
 # `cmd_link_shared_settings` (containment). The deeper diagnostic identified
@@ -21,12 +21,27 @@
 # PermissionErrors begins.
 #
 # Fix (Option 1 — `lib/bridge-hooks.sh:192`):
-#   When v2 isolation is effective for the agent AND the workdir hasn't been
-#   materialized yet, `bridge_link_claude_settings_to_shared` returns 0
-#   without invoking `bridge_hooks_python link-shared-settings`. Agent start
-#   re-triggers the hook after Step A runs, so the deferral is correct (NOT
-#   permanently skipped). Legacy non-isolated callers + post-Step-A callers
-#   keep the existing behavior.
+#   When v2 isolation is effective for the agent AND the workdir has not yet
+#   been NORMALIZED by Step A (owner != `agent-bridge-*`),
+#   `bridge_link_claude_settings_to_shared` returns 0 without invoking
+#   `bridge_hooks_python link-shared-settings`. Agent start re-triggers the
+#   hook after Step A runs, so the deferral is correct (NOT permanently
+#   skipped). Legacy non-isolated callers + post-Step-A callers keep the
+#   existing behavior.
+#
+# r2 (codex BLOCKING — 2026-05-24):
+#   The r1 fixer's existence-based guard (`[[ ! -d "$workdir" ]]`) did NOT
+#   fire in the canonical v2 fresh-create path because
+#   `_scaffold_v2_sibling` pre-creates the workdir as the controller user
+#   BEFORE `bridge_linux_prepare_agent_isolation` runs. Step-A completion
+#   must be detected by OWNERSHIP, not existence. Pre-r2 T2 asserted
+#   "workdir present → proceed", which masked exactly the failing
+#   production shape. T2 is now split into T2a (owner = agent-bridge-*,
+#   Step A complete, proceed) + T2b (owner = controller-style, pre-Step-A,
+#   defer). T5 adds an integration-style assertion that
+#   `bridge_hooks_python link-shared-settings` is NOT invoked when the
+#   guard fires. T2b + T5 catch the r1 gap — they FAIL against the
+#   existence-only implementation.
 #
 # Companion (Sub-B — `lib/bridge-agents.sh:4395`):
 #   When `bridge_agent_onboarding_markers_complete` rc=2 (controller blind +
@@ -37,8 +52,10 @@
 #   diagnostics agree.
 #
 # This smoke is HOST-AGNOSTIC: every driver runs in a fixture tree with
-# stubs for the bridge-side functions. No sudo, no python invocation, no
-# real workdir provisioning.
+# stubs for the bridge-side functions plus a PATH-prepended fake `stat`
+# wrapper that returns a chosen owner string for the test workdir. No
+# sudo, no python invocation, no real workdir provisioning, no
+# `agent-bridge-*` user creation on the host.
 #
 # Footgun #11 (heredoc_write deadlock class): every driver is built with
 # `printf '%s\n' >file`; no `<<<` / `<<EOF` feeds into bash functions; no
@@ -70,15 +87,61 @@ if [[ "$(uname -s 2>/dev/null || printf '')" == "Darwin" ]]; then
   fi
 fi
 
+# ---------- fake stat wrapper ----------
+#
+# The r2 guard calls `stat -c %U "$workdir"` (GNU/Linux) with `stat -f %Su`
+# (BSD/macOS) as a fallback. Both flavors return the owner-name string. The
+# smoke runs as the test user; `agent-bridge-*` accounts do not exist, so
+# we cannot chown a real fixture to that owner without sudo.
+#
+# Workaround: prepend a wrapper directory to `$PATH` that contains a `stat`
+# shim. The shim only handles the `-c %U` and `-f %Su` invocations the
+# guard makes; everything else falls through to the real `stat` so the
+# rest of the bridge code (which we don't actually call here, but might
+# in future T5 expansions) still sees real behavior.
+#
+# The shim reads the chosen owner from $SMOKE_FAKE_STAT_OWNER. An empty
+# value (or "FAIL") makes both flavors exit non-zero, exercising the
+# `|| true` fallback in the guard (T5).
+FAKE_BIN="$SMOKE_TMP_ROOT/fake-bin"
+mkdir -p "$FAKE_BIN"
+FAKE_STAT="$FAKE_BIN/stat"
+# Resolve the real stat at smoke-construction time so the shim can dispatch
+# unrelated calls without re-running command lookup.
+REAL_STAT="$(command -v stat 2>/dev/null || true)"
+[[ -n "$REAL_STAT" ]] || smoke_fail "host has no stat in PATH — smoke needs a real stat to fall back to for non-owner calls"
+printf '%s\n' '#!/usr/bin/env bash' >"$FAKE_STAT"
+# shellcheck disable=SC2129  # per-line emit keeps footgun #11 off the table
+printf '%s\n' '# Fake stat shim for 1145-option1-deferral-guard.' >>"$FAKE_STAT"
+printf '%s\n' 'set -u' >>"$FAKE_STAT"
+printf '%s\n' "REAL_STAT='$REAL_STAT'" >>"$FAKE_STAT"
+printf '%s\n' 'owner="${SMOKE_FAKE_STAT_OWNER:-}"' >>"$FAKE_STAT"
+printf '%s\n' '# Match the exact argv shapes the guard uses.' >>"$FAKE_STAT"
+printf '%s\n' 'if [[ "$#" -ge 2 && ( "$1" == "-c" || "$1" == "-f" ) ]]; then' >>"$FAKE_STAT"
+printf '%s\n' '  fmt="$2"' >>"$FAKE_STAT"
+printf '%s\n' '  if [[ "$fmt" == "%U" || "$fmt" == "%Su" ]]; then' >>"$FAKE_STAT"
+printf '%s\n' '    if [[ "$owner" == "FAIL" || -z "$owner" ]]; then' >>"$FAKE_STAT"
+printf '%s\n' '      exit 1' >>"$FAKE_STAT"
+printf '%s\n' '    fi' >>"$FAKE_STAT"
+printf '%s\n' '    printf "%s\n" "$owner"' >>"$FAKE_STAT"
+printf '%s\n' '    exit 0' >>"$FAKE_STAT"
+printf '%s\n' '  fi' >>"$FAKE_STAT"
+printf '%s\n' 'fi' >>"$FAKE_STAT"
+printf '%s\n' '# Fall through to the real stat for anything else.' >>"$FAKE_STAT"
+printf '%s\n' 'exec "$REAL_STAT" "$@"' >>"$FAKE_STAT"
+chmod +x "$FAKE_STAT"
+
 # ---------- shared driver template ----------
 #
-# Each T1/T2/T3 case builds a tiny bash driver that:
+# Each T1/T2a/T2b/T3/T5 case builds a tiny bash driver that:
 #   1. Sources the extracted `bridge_link_claude_settings_to_shared` function.
 #   2. Pins stub implementations of every bridge-side function the body
 #      reaches (settings mode, render path, bridge_hooks_python, isolation
 #      check, etc.). Stubs append a one-line tag to `$CALL_LOG` so the test
 #      can assert which branches fired.
 #   3. Invokes the function under test with controlled inputs.
+#   4. Prepends $FAKE_BIN to $PATH so the guard's `stat -c %U` / `stat -f %Su`
+#      calls hit the shim instead of the real stat.
 #
 # The function body itself is extracted verbatim from
 # `lib/bridge-hooks.sh` via awk between the `^bridge_link_claude_settings_to_shared() {`
@@ -99,6 +162,8 @@ build_driver() {
   printf '%s\n' 'CALL_LOG="$3"' >>"$driver"
   printf '%s\n' 'WORKDIR="$4"' >>"$driver"
   printf '%s\n' 'AGENT="$5"' >>"$driver"
+  printf '%s\n' 'FAKE_BIN="$6"' >>"$driver"
+  printf '%s\n' 'export PATH="$FAKE_BIN:$PATH"' >>"$driver"
   printf '%s\n' ': >"$CALL_LOG"' >>"$driver"
   printf '%s\n' '# Extract the function under test (verbatim from source).' >>"$driver"
   printf '%s\n' 'EXTRACT="$(dirname "$CALL_LOG")/link-fn.sh"' >>"$driver"
@@ -141,10 +206,14 @@ write_common_stubs() {
 # ---------- T1 — isolation effective + workdir missing → deferral ----------
 #
 # When isolation is effective AND the workdir does NOT yet exist (the
-# Step-A-not-yet-run shape), the function must return 0 WITHOUT calling
-# `bridge_hooks_python link-shared-settings`. The render call (which
-# writes to a separate `effective_file` controller-owned path) is allowed
-# to run — it's the link step that races Step A.
+# earliest-possible pre-Step-A shape), the function must return 0 WITHOUT
+# calling `bridge_hooks_python link-shared-settings`. The render call
+# (which writes to a separate `effective_file` controller-owned path) is
+# allowed to run — it's the link step that races Step A.
+#
+# Pre-r2 contract: existence-based guard fires here. Post-r2: ownership-
+# based guard also fires here (workdir doesn't exist → owner empty →
+# `[[ -z "$_wd_owner" ]]` branch defers). Same observable outcome.
 T1_DIR="$SMOKE_TMP_ROOT/t1"
 mkdir -p "$T1_DIR"
 T1_STUBS="$T1_DIR/stubs.sh"
@@ -156,9 +225,11 @@ build_driver "$T1_DRIVER" "$T1_STUBS"
 
 T1_CALL_LOG="$T1_DIR/calls.log"
 # Deliberately point at a path that does NOT exist — the deferral guard's
-# trigger condition.
+# original trigger condition (and still a valid pre-Step-A shape for r2).
 T1_WORKDIR="$T1_DIR/workdir-does-not-exist"
-"$BRIDGE_BASH" "$T1_DRIVER" "$REPO_ROOT" "$T1_STUBS" "$T1_CALL_LOG" "$T1_WORKDIR" "smoke-agent" 2>"$T1_DIR/err" \
+SMOKE_FAKE_STAT_OWNER="" \
+  "$BRIDGE_BASH" "$T1_DRIVER" "$REPO_ROOT" "$T1_STUBS" "$T1_CALL_LOG" "$T1_WORKDIR" "smoke-agent" "$FAKE_BIN" \
+  2>"$T1_DIR/err" \
   || smoke_fail "T1 driver rc=$? — see $T1_DIR/err"
 
 T1_LINK_CALLED=0
@@ -172,28 +243,75 @@ grep -q '^RC=0$' "$T1_CALL_LOG" \
   || smoke_fail "T1 expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T1_CALL_LOG")"
 smoke_log "T1 PASS: isolation-effective + workdir-missing → link-shared-settings deferred, return 0"
 
-# ---------- T2 — isolation effective + workdir exists → proceeds ----------
+# ---------- T2a — workdir exists + owner = agent-bridge-* → proceeds ----------
 #
-# Once Step A has materialized the workdir, the deferral guard's
-# `[[ ! -d "$workdir" ]]` condition is false and the link step proceeds.
-T2_DIR="$SMOKE_TMP_ROOT/t2"
-mkdir -p "$T2_DIR"
-T2_STUBS="$T2_DIR/stubs.sh"
-write_common_stubs "$T2_STUBS"
-printf '%s\n' '# T2: isolation EFFECTIVE, workdir present.' >>"$T2_STUBS"
-printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T2_STUBS"
-T2_DRIVER="$T2_DIR/driver.sh"
-build_driver "$T2_DRIVER" "$T2_STUBS"
+# Step A has completed: the workdir directory exists AND ownership has been
+# normalized to `agent-bridge-<agent>`. The guard's ownership check finds
+# the agent-bridge-* prefix and short-circuits to `false` → link-shared-
+# settings fires (the legacy "happy path" after Step A).
+T2A_DIR="$SMOKE_TMP_ROOT/t2a"
+mkdir -p "$T2A_DIR"
+T2A_STUBS="$T2A_DIR/stubs.sh"
+write_common_stubs "$T2A_STUBS"
+printf '%s\n' '# T2a: isolation EFFECTIVE, workdir present, owner = agent-bridge-<agent> (Step A complete).' >>"$T2A_STUBS"
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T2A_STUBS"
+T2A_DRIVER="$T2A_DIR/driver.sh"
+build_driver "$T2A_DRIVER" "$T2A_STUBS"
 
-T2_CALL_LOG="$T2_DIR/calls.log"
-T2_WORKDIR="$T2_DIR/workdir-exists"
-mkdir -p "$T2_WORKDIR"
-"$BRIDGE_BASH" "$T2_DRIVER" "$REPO_ROOT" "$T2_STUBS" "$T2_CALL_LOG" "$T2_WORKDIR" "smoke-agent" 2>"$T2_DIR/err" \
-  || smoke_fail "T2 driver rc=$? — see $T2_DIR/err"
+T2A_CALL_LOG="$T2A_DIR/calls.log"
+T2A_WORKDIR="$T2A_DIR/workdir-exists"
+mkdir -p "$T2A_WORKDIR"
+SMOKE_FAKE_STAT_OWNER="agent-bridge-smoke-agent" \
+  "$BRIDGE_BASH" "$T2A_DRIVER" "$REPO_ROOT" "$T2A_STUBS" "$T2A_CALL_LOG" "$T2A_WORKDIR" "smoke-agent" "$FAKE_BIN" \
+  2>"$T2A_DIR/err" \
+  || smoke_fail "T2a driver rc=$? — see $T2A_DIR/err"
 
-grep -q '^bridge_hooks_python:link-shared-settings$' "$T2_CALL_LOG" \
-  || smoke_fail "T2 expected bridge_hooks_python:link-shared-settings to fire (workdir present). calls: $(tr '\n' '|' <"$T2_CALL_LOG")"
-smoke_log "T2 PASS: isolation-effective + workdir-present → link-shared-settings proceeds"
+grep -q '^bridge_hooks_python:link-shared-settings$' "$T2A_CALL_LOG" \
+  || smoke_fail "T2a expected bridge_hooks_python:link-shared-settings to fire (owner=agent-bridge-*, Step A complete). calls: $(tr '\n' '|' <"$T2A_CALL_LOG")"
+smoke_log "T2a PASS: isolation-effective + workdir-present + owner=agent-bridge-* → link-shared-settings proceeds"
+
+# ---------- T2b — workdir exists + owner = controller → defers (codex r1 BLOCKING) ----------
+#
+# This is the canonical v2 fresh-create shape that the pre-r2 existence-only
+# guard missed: `_scaffold_v2_sibling` pre-creates the workdir as the
+# controller (e.g. awfmanager) BEFORE `bridge_linux_prepare_agent_isolation`
+# runs, so the workdir EXISTS but is NOT owned by `agent-bridge-*`. Pre-r2
+# the guard's `[[ ! -d "$workdir" ]]` was false here → link-shared-settings
+# proceeded → controller-as-awfmanager mkdir'd `.claude/` with wrong owner
+# → Step A later raced and the cascade began.
+#
+# Post-r2: the ownership-based guard catches this exact shape and defers.
+# THIS test FAILS against the r1 implementation — that's the regression
+# contract.
+T2B_DIR="$SMOKE_TMP_ROOT/t2b"
+mkdir -p "$T2B_DIR"
+T2B_STUBS="$T2B_DIR/stubs.sh"
+write_common_stubs "$T2B_STUBS"
+printf '%s\n' '# T2b: isolation EFFECTIVE, workdir present, owner = controller-style (pre-Step-A — codex BLOCKING shape).' >>"$T2B_STUBS"
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T2B_STUBS"
+T2B_DRIVER="$T2B_DIR/driver.sh"
+build_driver "$T2B_DRIVER" "$T2B_STUBS"
+
+T2B_CALL_LOG="$T2B_DIR/calls.log"
+T2B_WORKDIR="$T2B_DIR/workdir-exists"
+mkdir -p "$T2B_WORKDIR"
+# `awfmanager` is the canonical controller account name on the Linux server
+# host; the test value just needs to NOT start with `agent-bridge-`.
+SMOKE_FAKE_STAT_OWNER="awfmanager" \
+  "$BRIDGE_BASH" "$T2B_DRIVER" "$REPO_ROOT" "$T2B_STUBS" "$T2B_CALL_LOG" "$T2B_WORKDIR" "smoke-agent" "$FAKE_BIN" \
+  2>"$T2B_DIR/err" \
+  || smoke_fail "T2b driver rc=$? — see $T2B_DIR/err"
+
+T2B_LINK_CALLED=0
+if grep -q '^bridge_hooks_python:link-shared-settings$' "$T2B_CALL_LOG"; then
+  T2B_LINK_CALLED=1
+fi
+if [[ $T2B_LINK_CALLED -ne 0 ]]; then
+  smoke_fail "T2b expected NO bridge_hooks_python:link-shared-settings call (workdir present but pre-Step-A, owner=controller — codex BLOCKING shape). calls: $(tr '\n' '|' <"$T2B_CALL_LOG"). NOTE: this test FAILS against the r1 existence-only guard by design."
+fi
+grep -q '^RC=0$' "$T2B_CALL_LOG" \
+  || smoke_fail "T2b expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T2B_CALL_LOG")"
+smoke_log "T2b PASS: isolation-effective + workdir-present + owner=controller → link-shared-settings deferred (codex r1 BLOCKING shape caught)"
 
 # ---------- T3 — isolation NOT effective → proceeds regardless ----------
 #
@@ -201,7 +319,7 @@ smoke_log "T2 PASS: isolation-effective + workdir-present → link-shared-settin
 # pre-#1145 behavior. The guard's first conjunct
 # (`bridge_agent_linux_user_isolation_effective` returns non-zero) short-
 # circuits the check, so the link step fires even when the workdir doesn't
-# yet exist on disk.
+# yet exist on disk AND even with a non-agent-bridge owner.
 T3_DIR="$SMOKE_TMP_ROOT/t3"
 mkdir -p "$T3_DIR"
 T3_STUBS="$T3_DIR/stubs.sh"
@@ -214,7 +332,11 @@ build_driver "$T3_DRIVER" "$T3_STUBS"
 T3_CALL_LOG="$T3_DIR/calls.log"
 T3_WORKDIR="$T3_DIR/workdir-not-yet"
 # NB: workdir absent — but isolation NOT effective → guard does NOT fire.
-"$BRIDGE_BASH" "$T3_DRIVER" "$REPO_ROOT" "$T3_STUBS" "$T3_CALL_LOG" "$T3_WORKDIR" "smoke-agent" 2>"$T3_DIR/err" \
+# Owner string is irrelevant here because the first conjunct short-circuits;
+# pass empty to confirm the legacy non-isolated path doesn't even consult stat.
+SMOKE_FAKE_STAT_OWNER="" \
+  "$BRIDGE_BASH" "$T3_DRIVER" "$REPO_ROOT" "$T3_STUBS" "$T3_CALL_LOG" "$T3_WORKDIR" "smoke-agent" "$FAKE_BIN" \
+  2>"$T3_DIR/err" \
   || smoke_fail "T3 driver rc=$? — see $T3_DIR/err"
 
 grep -q '^bridge_hooks_python:link-shared-settings$' "$T3_CALL_LOG" \
@@ -268,4 +390,48 @@ T4_RC1_OUT="$("$BRIDGE_BASH" "$T4_DRIVER" "$REPO_ROOT" "$T4_DIR" 1 2>"$T4_DIR/rc
 
 smoke_log "T4 PASS: onboarding_state agrees with markers helper (rc=2→unverifiable, rc=0→complete, rc=1→partial)"
 
-smoke_log "all 4 tests PASS (#1145 Option 1)"
+# ---------- T5 — defensive: stat both flavors fail → defer ----------
+#
+# Integration-shaped assertion for the deferral case: workdir exists but
+# `stat` itself returns non-zero on both `-c %U` (GNU) and `-f %Su` (BSD)
+# flavors. This is the defensive branch — empty owner string flows into
+# the `[[ -z "$_wd_owner" ]]` arm of the guard predicate. Realistic when
+# the controller process can't read the path (e.g. permission denied on a
+# sudo-owned tree it doesn't yet own, or stat-flag mismatch on an exotic
+# platform). Same observable outcome as T2b: NO `bridge_hooks_python
+# link-shared-settings` call, RC=0.
+#
+# This case ALSO fails against the r1 existence-only guard if the workdir
+# happens to exist on disk — same shape as T2b. T5 codifies the
+# "fail-closed on unknown ownership" contract that the r2 guard adds.
+T5_DIR="$SMOKE_TMP_ROOT/t5"
+mkdir -p "$T5_DIR"
+T5_STUBS="$T5_DIR/stubs.sh"
+write_common_stubs "$T5_STUBS"
+printf '%s\n' '# T5: isolation EFFECTIVE, workdir present, stat returns no owner (defensive defer).' >>"$T5_STUBS"
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T5_STUBS"
+T5_DRIVER="$T5_DIR/driver.sh"
+build_driver "$T5_DRIVER" "$T5_STUBS"
+
+T5_CALL_LOG="$T5_DIR/calls.log"
+T5_WORKDIR="$T5_DIR/workdir-exists"
+mkdir -p "$T5_WORKDIR"
+# Owner = "FAIL" makes the fake stat exit non-zero on both flavors → guard
+# sees empty `_wd_owner` → `[[ -z "$_wd_owner" ]]` branch defers.
+SMOKE_FAKE_STAT_OWNER="FAIL" \
+  "$BRIDGE_BASH" "$T5_DRIVER" "$REPO_ROOT" "$T5_STUBS" "$T5_CALL_LOG" "$T5_WORKDIR" "smoke-agent" "$FAKE_BIN" \
+  2>"$T5_DIR/err" \
+  || smoke_fail "T5 driver rc=$? — see $T5_DIR/err"
+
+T5_LINK_CALLED=0
+if grep -q '^bridge_hooks_python:link-shared-settings$' "$T5_CALL_LOG"; then
+  T5_LINK_CALLED=1
+fi
+if [[ $T5_LINK_CALLED -ne 0 ]]; then
+  smoke_fail "T5 expected NO bridge_hooks_python:link-shared-settings call (stat returned no owner → guard must fail-closed). calls: $(tr '\n' '|' <"$T5_CALL_LOG")"
+fi
+grep -q '^RC=0$' "$T5_CALL_LOG" \
+  || smoke_fail "T5 expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T5_CALL_LOG")"
+smoke_log "T5 PASS: isolation-effective + workdir-present + stat-fails → link-shared-settings deferred (defensive fail-closed)"
+
+smoke_log "all 6 tests PASS (#1145 Option 1, r2: T1 + T2a + T2b + T3 + T4 + T5)"
