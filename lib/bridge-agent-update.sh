@@ -38,9 +38,21 @@
 # bridge_agent_update_caller_source — return one of operator-tui /
 # operator-trusted-id / agent-direct, mirroring
 # bridge-config.py:detect_caller_source. Bash equivalent: respect an
-# explicit BRIDGE_CALLER_SOURCE env override first, then fall back to
-# TTY detection (stdin+stdout both attached). Anything else is
-# agent-direct, which the wrapper rejects.
+# explicit BRIDGE_CALLER_SOURCE env override first, then auto-promote
+# admin-agent sessions (issue #1122), then fall back to TTY detection
+# (stdin+stdout both attached). Anything else is agent-direct, which
+# the wrapper rejects.
+#
+# Issue #1122 — admin Claude Code sessions: when the caller is
+# identifiably the admin agent (`BRIDGE_AGENT_ID == BRIDGE_ADMIN_AGENT_ID`,
+# both non-empty), promote the source to `operator-trusted-id` even
+# without an explicit `BRIDGE_CALLER_SOURCE` override. The Claude Code
+# Bash tool runs each command in a non-interactive subshell that the
+# TTY-detection branch never matches, so the only practical workaround
+# from inside an admin session was to hard-set the env on every
+# mutating subcommand. The auto-promotion closes that workflow gap
+# without weakening the non-admin rejection: a non-admin session with
+# no explicit override still falls through to agent-direct.
 bridge_agent_update_caller_source() {
   # Strip leading/trailing whitespace before lowercasing — operators
   # editing env files commonly leave a stray space that would otherwise
@@ -61,11 +73,86 @@ bridge_agent_update_caller_source() {
       return 0
       ;;
   esac
+  # Issue #1122: admin-session auto-promotion. Placed BEFORE the TTY
+  # branch so a Claude Code Bash tool subshell (no TTY) inside the
+  # admin agent is treated as operator-trusted. The agent-id check
+  # mirrors bridge_agent_update_caller_is_admin: both sides stripped,
+  # both must be non-empty, and they must compare equal. A non-admin
+  # session (BRIDGE_AGENT_ID set but not equal to BRIDGE_ADMIN_AGENT_ID)
+  # is NOT promoted and falls through to TTY / agent-direct.
+  local _session_agent _admin_agent
+  _session_agent="${BRIDGE_AGENT_ID:-}"
+  _session_agent="$(printf '%s' "$_session_agent" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  _admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
+  _admin_agent="$(printf '%s' "$_admin_agent" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+  if [[ -n "$_session_agent" && -n "$_admin_agent" && "$_session_agent" == "$_admin_agent" ]]; then
+    bridge_agent_update_emit_caller_source_auto_promotion_audit "$_session_agent" "admin-agent-signal"
+    printf '%s' "operator-trusted-id"
+    return 0
+  fi
   if [[ -t 0 && -t 1 ]]; then
     printf '%s' "operator-tui"
     return 0
   fi
   printf '%s' "agent-direct"
+}
+
+# bridge_agent_update_emit_caller_source_auto_promotion_audit — issue
+# #1122. Emit a single `caller_source_auto_promotion` audit row when the
+# admin-session signal upgrades an otherwise-agent-direct caller to
+# `operator-trusted-id`. Once-per-process (gated by
+# `BRIDGE_AGENT_CALLER_SOURCE_AUTO_PROMOTED`) so a single CLI
+# invocation that calls bridge_agent_update_caller_source() multiple
+# times produces exactly one audit row. Best-effort: failure to write
+# the audit row never blocks the underlying mutation, since the row is
+# diagnostic — the existing system_config_mutation row remains the
+# authoritative apply/deny record.
+bridge_agent_update_emit_caller_source_auto_promotion_audit() {
+  local actor="$1"
+  local derived_from="$2"
+  if [[ "${BRIDGE_AGENT_CALLER_SOURCE_AUTO_PROMOTED:-0}" == "1" ]]; then
+    return 0
+  fi
+  export BRIDGE_AGENT_CALLER_SOURCE_AUTO_PROMOTED=1
+  # Resolve audit log path the same way bridge_agent_update_emit_audit
+  # does — honor BRIDGE_AUDIT_LOG override, else default under
+  # BRIDGE_HOME. Skip entirely when neither is resolvable; the audit
+  # event is diagnostic and the mutation itself is still gated.
+  local _audit_log="${BRIDGE_AUDIT_LOG:-}"
+  if [[ -z "$_audit_log" ]]; then
+    if [[ -n "${BRIDGE_HOME:-}" ]]; then
+      _audit_log="$BRIDGE_HOME/logs/audit.jsonl"
+    else
+      return 0
+    fi
+  fi
+  # Ensure the parent directory exists (best-effort) so the first
+  # auto-promotion in a fresh BRIDGE_HOME does not silently lose the
+  # row to a missing logs/ dir.
+  mkdir -p "$(dirname "$_audit_log")" 2>/dev/null || true
+  command -v python3 >/dev/null 2>&1 || return 0
+  # Resolve BRIDGE_SCRIPT_DIR — fall back to the parent of this file's
+  # `lib/` so the helper works when sourced standalone (no caller has
+  # initialized BRIDGE_SCRIPT_DIR yet).
+  local _script_dir="${BRIDGE_SCRIPT_DIR:-}"
+  if [[ -z "$_script_dir" || ! -x "$_script_dir/bridge-audit.py" ]]; then
+    _script_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd -P)"
+  fi
+  [[ -f "$_script_dir/bridge-audit.py" ]] || return 0
+  local _helper="$_script_dir/lib/agent-cli-helpers/caller-source-auto-promotion-detail-json.py"
+  [[ -f "$_helper" ]] || return 0
+  local _detail_json
+  # Footgun #11 guard: invoke the detail-json helper file-as-argv (no
+  # heredoc-stdin inside the `$()` capture). Same shape PR #940 used
+  # for registry/list/show, and PR #4773's audit-detail-json extraction
+  # for agent update/delete.
+  _detail_json="$(python3 "$_helper" "$actor" "$derived_from")"
+  python3 "$_script_dir/bridge-audit.py" write \
+    --file "$_audit_log" \
+    --actor "$actor" \
+    --action "caller_source_auto_promotion" \
+    --target "$actor" \
+    --detail-json "$_detail_json" >/dev/null 2>&1 || true
 }
 
 # bridge_agent_update_caller_agent — caller agent id from --from <agent>
