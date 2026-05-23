@@ -8,26 +8,38 @@
 # intentionally decoupled from bridge-upgrade.sh / bridge-init.sh /
 # bridge-bootstrap.sh and must never be called from those paths.
 #
-# Contract: export → plan → verify (apply DEFERRED to beta7, see #1087).
-# Never mutates the source in-place. apply is gated behind
-# BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE=1 for internal beta7 development only.
+# Contract: export → plan → apply → verify (issue #1087 closed all four
+# subcommands for v0.14.5-beta7+). Never mutates the source in-place.
 #
-# Subcommands (beta6 user-facing):
+# Subcommands:
 #   export  --source <old-BRIDGE_HOME> --bundle <dir>   (read-only on source)
 #   plan    --bundle <dir>  --target <new-BRIDGE_HOME>   (read-only inspection)
+#   apply   --bundle <dir>  --target <new-BRIDGE_HOME>   (writes target identity)
 #   verify  --target <new-BRIDGE_HOME>                   (read-only check)
 #
-# Subcommand (gated, beta7 follow-up):
-#   apply   --bundle <dir>  --target <new-BRIDGE_HOME>
-#             Refuses by default. Tracked in issue #1087 for beta7 rework
-#             (clean-target gate, layout-resolver consumption, credential
-#             re-entry write paths). NOT for operator use in beta6.
-#
-# Safety design (apply, beta7 target):
-#   - apply will be EXPLICIT / off-by-default — must invoke `apply` subcommand.
-#   - target must be a CLEAN / FRESH install (not populated); apply refuses otherwise.
-#   - a backup + manifest are written to target before any mutation.
-#   - credentials are never copied; apply prompts for re-entry via file / env / stdin.
+# Safety design (apply):
+#   - apply is EXPLICIT / off-by-default — must invoke `apply` subcommand.
+#   - target must be a CLEAN / FRESH install (not populated); apply refuses
+#     otherwise. The cleanliness gate covers every apply write path
+#     (state/agents, state/tasks.db, state/cron, data/agents, agents/,
+#     agent-roster.sh, agent-roster.local.sh, cron/jobs.json,
+#     handoff.local.json, .env, .migrator-apply-result.json).
+#   - canonical per-agent paths come from `bridge_layout_agent_home` /
+#     `bridge_layout_workspace_dir` / `bridge_layout_memory_dir` via the
+#     layout shim (scripts/python-helpers/migrate-layout-shim.sh) — apply
+#     does NOT compute layout paths itself.
+#   - apply runs atomically: every write lands under
+#     `target/.migrator-apply-staging` first, then is moved into the
+#     canonical layout via `os.replace`. Failure mid-flight restores the
+#     target's pre-apply file contents from the backup tree.
+#   - a pre-apply content backup (NOT just a hash manifest) is written
+#     to `.migrator-pre-apply-backup/files/` before any mutation.
+#   - source secrets are NEVER copied; operator-supplied credentials via
+#     --a2a-secret-file / --app-password-file (or BRIDGE_A2A_SHARED_SECRET
+#     / BRIDGE_TEAMS_APP_PASSWORD env) ARE written to the target with
+#     mode 0600.
+#   - cron `payload.env` is filtered through CRON_ENV_ALLOWLIST (no
+#     keyword heuristic); custom env keys are dropped.
 #   - migrator is never wired into upgrade / init / bootstrap flows.
 #
 # Classification of items:
@@ -72,27 +84,33 @@ Subcommands:
             Compute and print the apply plan (read-only on both sides).
 
   apply   --bundle <dir> --target <new-BRIDGE_HOME>
-            **DEFERRED to beta7** — the r1 review of the beta6 PR surfaced
-            three contract gaps (clean-target gate doesn't check the actual
-            write paths; layout-resolver bypass; supplied secrets are read
-            but never written). beta6 ships export/plan/verify; drive the
-            actual writes by hand from the bundle/plan output.
-            (Internal dev only: BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE=1 keeps
-            the in-progress code path runnable. Do NOT use against a real
-            install.)
+            Apply the bundle to a clean/fresh target. Writes per-agent
+            identity, cron definitions, and operator-supplied secrets
+            (via --a2a-secret-file / --app-password-file). Atomic: every
+            write is staged under .migrator-apply-staging and moved into
+            place at the end; failure mid-flight rolls back to a
+            byte-for-byte pre-apply backup. Refuses non-empty targets.
 
   verify  --target <new-BRIDGE_HOME>
             Run the verification gate against the migrated target.
+            Drives the same layout resolver apply uses, so verify and
+            apply cannot drift apart.
 
 Options:
-  --help, -h    Print this help and exit.
+  --help, -h                        Print this help and exit.
+  --a2a-secret-file <path>          Apply only — file containing the A2A
+                                    HMAC shared secret. Written to the
+                                    target's handoff.local.json (mode 0600).
+  --app-password-file <path>        Apply only — file containing the Teams
+                                    app password. Written to the target's
+                                    .env (mode 0600).
 
 Safety:
-  apply is deferred to beta7 (see above). The export/plan/verify flow is
-  read-only on both sides — safe to run against any install.
   Secrets (Teams client secret, A2A HMAC keys) are NEVER copied from the
-  source bundle in any subcommand; the bundle marks them as deliberately
-  absent and the operator must re-enter them at apply time.
+  source bundle. The bundle marks them as deliberately absent. Apply
+  ONLY writes secrets that the operator supplied via --a2a-secret-file /
+  --app-password-file (or the matching env vars BRIDGE_A2A_SHARED_SECRET
+  / BRIDGE_TEAMS_APP_PASSWORD).
 
 This tool is OPERATOR-RUN ONLY. Never invoke from upgrade / init / bootstrap.
 USAGE

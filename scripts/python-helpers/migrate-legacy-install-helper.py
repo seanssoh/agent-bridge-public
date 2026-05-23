@@ -118,11 +118,43 @@ ROSTER_SECRET_KEYS = frozenset({
     "BRIDGE_AGENT_LAUNCH_CMD",  # may embed tokens via env injection
 })
 
-# Target MUST be fresh/clean if these dirs are absent or empty.
+# Target MUST be fresh/clean if these dirs/files are absent or empty
+# (issue #1087: codex r1 BLOCKING #1 — beta6 list checked only
+# state/agents / state/tasks.db / data/agents, but apply also writes
+# to target/agents/<a>, agent-roster.sh, agent-roster.local.sh,
+# cron/jobs.json, state/cron, handoff.local.json, .env. A target whose
+# state/* was empty could still hold a legacy-shape agents/admin tree
+# that apply would silently overwrite.)
+#
+# This is the inclusive-list option from the brief (option (a)): every
+# path apply may write to is added here. _target_is_clean treats a
+# non-empty file or non-empty directory at any listed path as a hard
+# refusal blocker, and _backup_target_contents captures the real file
+# bytes (not just hashes) for atomic-apply rollback.
 CLEAN_TARGET_REQUIRED_ABSENT = (
+    # v2 (canonical) state.
     "state/agents",
     "state/tasks.db",
+    "state/cron",
+    "state/layout-marker.sh",
+    # v2 agent root.
     "data/agents",
+    # Legacy-shape agent root — apply may still write here when the
+    # resolver classifies the target as legacy.
+    "agents",
+    # Roster files — apply rewrites identity metadata into these.
+    "agent-roster.sh",
+    "agent-roster.local.sh",
+    # Cron home — apply writes jobs.json here.
+    "cron/jobs.json",
+    # Secret files apply may author when --a2a-secret-file /
+    # --app-password-file is supplied.
+    "handoff.local.json",
+    ".env",
+    # Migrator's own apply-result + backup tree — a populated
+    # backup tree means a previous apply ran; refuse to clobber it.
+    ".migrator-apply-result.json",
+    ".migrator-pre-apply-backup",
 )
 
 # Verification checks.
@@ -369,11 +401,61 @@ def _collect_agent_identity(
     }
 
 
+# Cron payload.env allowlist (issue #1087: codex r1 BLOCKING #3 — replaces
+# the beta6 keyword heuristic `TOKEN/SECRET/PASSWORD/KEY/PASS` which
+# silently passed org-specific names like AUTHORIZATION, COOKIE, PAT).
+#
+# Anything NOT in this allowlist is dropped. The allowlist is intentionally
+# tiny — anything that smells like a credential or a host-private path is
+# off the list, and a cron job that needs custom env must have it
+# re-entered by the operator post-apply.
+CRON_ENV_ALLOWLIST = frozenset({
+    # Locale and shell PATH — needed for the cron job to find binaries
+    # and render UTF-8 correctly. These never carry credentials.
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    # Bridge runtime — the daemon already sets these per-process; the
+    # cron payload carries them as a hint and they are safe to import
+    # because the target install resets them at run time.
+    "BRIDGE_HOME",
+    "BRIDGE_AGENT_ID",
+})
+
+
+def _scrub_cron_env(
+    env_block: Dict[str, Any],
+    job_label: str,
+) -> Dict[str, Any]:
+    """
+    Apply CRON_ENV_ALLOWLIST to a cron payload's env map. Returns the
+    allowlisted subset; everything else is dropped with a warning so the
+    operator knows custom keys did not survive the migration.
+    """
+    if not isinstance(env_block, dict):
+        return {}
+    kept: Dict[str, Any] = {}
+    for k, v in env_block.items():
+        if k in CRON_ENV_ALLOWLIST:
+            kept[k] = v
+        else:
+            _warn(
+                f"  cron job '{job_label}': env key '{k}' not in allowlist — dropped from bundle "
+                "(re-enter via cron edit after apply if intentional)"
+            )
+    return kept
+
+
 def _sanitize_cron_job(job: Dict[str, Any]) -> Dict[str, Any]:
     """
     Keep portable cron definition fields; strip runtime state.
     Schedule, target, title, payload_kind, enabled, timezone, followup_policy.
     Active run leases, run ids, last_run_* fields are non-portable.
+
+    payload.env is filtered through CRON_ENV_ALLOWLIST (not a keyword
+    heuristic) so org-specific credential keys cannot leak.
     """
     keep = (
         "id", "name", "title", "target", "schedule", "timezone",
@@ -385,16 +467,14 @@ def _sanitize_cron_job(job: Dict[str, Any]) -> Dict[str, Any]:
     for key in keep:
         if key in job:
             sanitized[key] = job[key]
-    # Payload env vars may contain secrets — warn and strip.
+    # payload.env allowlist — drop everything not explicitly safe.
     if "payload" in sanitized and isinstance(sanitized["payload"], dict):
         env_block = sanitized["payload"].get("env", {})
-        secret_keys: List[str] = []
-        for k in list(env_block.keys()):
-            if any(kw in k.upper() for kw in ("TOKEN", "SECRET", "PASSWORD", "KEY", "PASS")):
-                secret_keys.append(k)
-        for k in secret_keys:
-            del env_block[k]
-            _warn(f"  cron job '{sanitized.get('name','?')}': env key '{k}' looks like a secret — stripped from bundle")
+        if isinstance(env_block, dict):
+            sanitized["payload"]["env"] = _scrub_cron_env(
+                env_block,
+                sanitized.get("name") or sanitized.get("id") or "?",
+            )
     return sanitized
 
 
@@ -628,21 +708,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
 
     print()
     print("=== TARGET CLEANLINESS CHECK ===")
-    target_ok = True
-    for rel in CLEAN_TARGET_REQUIRED_ABSENT:
-        p = target / rel
-        if p.exists():
-            if p.is_file() or any(True for _ in p.iterdir() if p.is_dir()):
-                print(f"  WARN: target already has: {rel} — apply will REFUSE")
-                target_ok = False
-    if target_ok:
-        # beta6 honesty: apply is gated (deferred to beta7) — see #1087.
-        # Don't tell the operator "apply may proceed" when the user-facing
-        # default refuses. plan is inspection-only in beta6.
-        print(
-            "  target appears clean/fresh — but apply is DEFERRED to beta7 "
-            "(see #1087); plan is inspection-only in beta6"
-        )
+    is_clean, blockers = _target_is_clean(target)
+    if not is_clean:
+        for rel in blockers:
+            print(f"  WARN: target already has: {rel} — apply will REFUSE")
+    else:
+        print("  target appears clean/fresh — apply may proceed")
 
     return 0
 
@@ -650,6 +721,113 @@ def cmd_plan(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 # apply subcommand
 # ---------------------------------------------------------------------------
+
+def _find_bash() -> str:
+    """
+    Locate a Bash 4+ binary suitable for invoking the layout shim.
+    bridge-lib.sh's re-exec into Homebrew bash 5.x trips when called via
+    /bin/bash on macOS (Bash 3.2), so we prefer the same candidate list
+    bridge-lib.sh checks itself before falling back to PATH.
+    """
+    for candidate in (
+        "/opt/homebrew/bin/bash",
+        "/usr/local/bin/bash",
+        shutil.which("bash"),
+    ):
+        if not candidate:
+            continue
+        if not Path(candidate).is_file():
+            continue
+        try:
+            rc, out, _err = _run_cmd([candidate, "-c", "echo $BASH_VERSION"])
+        except OSError:
+            continue
+        if rc != 0:
+            continue
+        version = (out or "").strip()
+        # Accept Bash 4+ (the layout shim requires associative arrays).
+        if not version:
+            continue
+        try:
+            major = int(version.split(".", 1)[0])
+        except ValueError:
+            continue
+        if major >= 4:
+            return candidate
+    _die(
+        "no Bash 4+ binary available — install Homebrew Bash and ensure "
+        "/opt/homebrew/bin/bash or /usr/local/bin/bash exists, or put a "
+        "Bash 4+ shell ahead of /bin in PATH."
+    )
+    return ""  # unreachable; keeps mypy/pyright happy.
+
+
+def _run_layout_shim(
+    repo_root: Path,
+    target: Path,
+    agent_ids: List[str],
+) -> Dict[str, Any]:
+    """
+    Invoke `scripts/python-helpers/migrate-layout-shim.sh` to get the
+    canonical per-agent layout paths for a target install. Returns a
+    dict with:
+      - layout: "v2" | "legacy"
+      - data_root, agent_root_v2, agent_home_root
+      - agents: { <agent_id>: { home_dir, workspace_dir, memory_dir } }
+    Aborts the process on shim failure — apply/verify cannot proceed
+    without canonical paths (issue #1087 BLOCKING #2: refuse to fall
+    back to local path math, which is what the resolver bypass was).
+    """
+    shim_path = repo_root / "scripts" / "python-helpers" / "migrate-layout-shim.sh"
+    if not shim_path.is_file():
+        _die(f"layout shim missing: {shim_path}")
+    bash_bin = _find_bash()
+    cmd = [bash_bin, str(shim_path), str(target)] + list(agent_ids)
+    rc, stdout, stderr = _run_cmd(cmd)
+    if rc != 0:
+        _die(
+            "layout shim failed — refusing to fall back to in-process path "
+            f"math (issue #1087 layout-resolver-bypass contract).\n"
+            f"  cmd: {' '.join(cmd)}\n"
+            f"  stderr: {(stderr or '').strip()}"
+        )
+
+    top: Dict[str, Any] = {}
+    agents: Dict[str, Dict[str, str]] = {}
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fields = line.split("\t")
+        rec: Dict[str, str] = {}
+        for field in fields:
+            if "=" in field:
+                k, _, v = field.partition("=")
+                rec[k] = v
+        rec_type = rec.get("type")
+        if rec_type == "top":
+            top = {
+                "layout": rec.get("layout", ""),
+                "target": rec.get("target", ""),
+                "data_root": rec.get("data_root", ""),
+                "agent_root_v2": rec.get("agent_root_v2", ""),
+                "agent_home_root": rec.get("agent_home_root", ""),
+            }
+        elif rec_type == "agent":
+            aid = rec.get("id")
+            if aid:
+                agents[aid] = {
+                    "home_dir": rec.get("home_dir", ""),
+                    "workspace_dir": rec.get("workspace_dir", ""),
+                    "memory_dir": rec.get("memory_dir", ""),
+                }
+
+    if not top:
+        _die(f"layout shim returned no top record:\nstdout: {stdout}\nstderr: {stderr}")
+
+    top["agents"] = agents
+    return top
+
 
 def _target_is_clean(target: Path) -> Tuple[bool, List[str]]:
     """Return (is_clean, list_of_blocking_paths)."""
@@ -671,23 +849,100 @@ def _target_is_clean(target: Path) -> Tuple[bool, List[str]]:
     return (len(blockers) == 0, blockers)
 
 
-def _write_backup_manifest(backup_dir: Path, target: Path) -> Path:
-    """Write a manifest of what existed in the target before apply."""
+def _backup_target_contents(target: Path, backup_dir: Path) -> Dict[str, Any]:
+    """
+    Capture the actual file contents of the target before apply (issue
+    #1087 BLOCKING #1 — beta6 only wrote a hash manifest, which cannot
+    be replayed on rollback). Returns a manifest dict that
+    _restore_target_from_backup consumes; the file bodies live under
+    `backup_dir/files/<relpath>`.
+    """
+    backup_files_root = backup_dir / "files"
+    backup_files_root.mkdir(parents=True, exist_ok=True)
+
     entries: List[Dict[str, str]] = []
     if target.is_dir():
         for p in sorted(target.rglob("*")):
-            if p.is_file():
-                rel = str(p.relative_to(target))
-                entries.append({"rel_path": rel, "sha256": _sha256_file(p)})
+            if not p.is_file():
+                continue
+            rel = p.relative_to(target)
+            # Skip the backup tree itself — recursion would balloon.
+            if rel.parts and rel.parts[0] == ".migrator-pre-apply-backup":
+                continue
+            sha = _sha256_file(p)
+            dst = backup_files_root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(p), str(dst))
+            entries.append({
+                "rel_path": str(rel),
+                "sha256": sha,
+                "size_bytes": str(p.stat().st_size),
+            })
+
     manifest = {
         "backup_at": _now_iso(),
         "target": str(target),
         "file_count": len(entries),
         "files": entries,
+        "files_root": str(backup_files_root),
     }
     mpath = backup_dir / "pre-apply-backup-manifest.json"
     mpath.write_text(json.dumps(manifest, indent=2))
-    return mpath
+    return manifest
+
+
+def _restore_target_from_backup(target: Path, backup_dir: Path) -> int:
+    """
+    On apply failure, restore the target's pre-mutation file contents
+    from the backup tree (issue #1087 SHOULD-FIX — atomic apply with
+    rollback). New files written by apply that did not exist before
+    are removed; pre-existing files are restored byte-for-byte.
+    Returns the number of files restored.
+    """
+    manifest_path = backup_dir / "pre-apply-backup-manifest.json"
+    if not manifest_path.is_file():
+        _warn(f"no backup manifest at {manifest_path} — cannot rollback")
+        return 0
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        _warn(f"backup manifest unreadable: {e}")
+        return 0
+
+    files_root = Path(manifest.get("files_root", str(backup_dir / "files")))
+    pre_apply_relpaths = {entry["rel_path"] for entry in manifest.get("files", [])}
+
+    # Step 1: remove any file in target that was NOT present pre-apply.
+    if target.is_dir():
+        for p in list(target.rglob("*")):
+            if not p.is_file():
+                continue
+            rel = str(p.relative_to(target))
+            if rel.startswith(".migrator-pre-apply-backup"):
+                continue
+            if rel not in pre_apply_relpaths:
+                try:
+                    p.unlink()
+                except OSError as e:
+                    _warn(f"  rollback: could not unlink {rel}: {e}")
+
+    # Step 2: restore pre-apply file contents.
+    restored = 0
+    for entry in manifest.get("files", []):
+        rel = entry["rel_path"]
+        src = files_root / rel
+        dst = target / rel
+        if not src.is_file():
+            _warn(f"  rollback: backup file missing for {rel} — skipping")
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(src), str(dst))
+            restored += 1
+        except OSError as e:
+            _warn(f"  rollback: could not restore {rel}: {e}")
+
+    return restored
 
 
 def _read_secret_file(path: str) -> str:
@@ -706,38 +961,125 @@ def _prompt_secret(prompt: str) -> str:
         return ""
 
 
-def cmd_apply(args: argparse.Namespace) -> int:
-    # beta6 fold-back per codex r1 review: `apply` is deferred to beta7.
-    # The r1 review surfaced three contract gaps that are too substantial
-    # to address in a beta6 r2 cycle:
-    #   - clean-target gate insufficient (does not check actual write paths)
-    #   - layout-resolver bypass (hardcoded path inference instead of
-    #     `bridge_layout_agent_home`/etc.)
-    #   - secrets are read but never written to the target (handoff.local.json,
-    #     Teams .env), and the cron env scrub is keyword-heuristic.
-    # The brief's explicit fallback was: "If you cannot meet every apply
-    # gate within reasonable change size, SHIP export+plan+verify only and
-    # leave apply as a documented beta7 follow-up."
-    # An opt-in env var keeps the existing code path runnable for follow-up
-    # work without exposing the unsafe path as the user-facing default.
-    if os.environ.get("BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE", "") != "1":
-        _die(
-            "apply is deferred to beta7 — the r1 review surfaced three "
-            "contract gaps (clean-target gate, layout-resolver bypass, "
-            "secret re-entry) that are tracked as a beta7 follow-up. Use "
-            "'export'+'plan'+'verify' in beta6 to inspect and validate; "
-            "drive the actual writes by hand from the bundle/plan. To run "
-            "the unsafe in-progress apply for follow-up development only, "
-            "set BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE=1."
-        )
-    sys.stderr.write(
-        "[warn] BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE=1 set — running the "
-        "unsafe in-progress apply path. Do NOT use this against a real "
-        "install; see codex r1 review for the three open contract gaps.\n"
+def _atomic_write_file(
+    path: Path,
+    content: bytes,
+    mode: int = 0o600,
+) -> None:
+    """
+    Write `content` to `path` atomically: write to a temp file in the
+    same directory, fchmod to `mode`, then os.replace into place.
+    Used for credential files (issue #1087 BLOCKING #3) and for files
+    that must survive a partial-apply abort.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path_str = tempfile.mkstemp(
+        prefix="." + path.name + ".",
+        suffix=".tmp",
+        dir=str(path.parent),
     )
+    try:
+        os.write(fd, content)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(tmp_path_str, mode)
+        os.replace(tmp_path_str, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp_path_str)
+        except OSError:
+            pass
+        raise
+
+
+def _staging_root(target: Path) -> Path:
+    """Return the temp staging tree path used for atomic apply."""
+    return target / ".migrator-apply-staging"
+
+
+def _move_staging_into_target(staging_root: Path, target: Path) -> List[str]:
+    """
+    Move every file from the staging tree into its final location under
+    target. Returns the list of relative paths actually moved. Caller is
+    responsible for `staging_root.exists()` and for removing the staging
+    root afterward.
+    """
+    moved: List[str] = []
+    for src in sorted(staging_root.rglob("*")):
+        if not src.is_file():
+            continue
+        rel = src.relative_to(staging_root)
+        dst = target / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(str(src), str(dst))
+        moved.append(str(rel))
+    return moved
+
+
+def _write_a2a_handoff_local(staging_root: Path, secret: str) -> Path:
+    """
+    Author a minimal handoff.local.json with the operator-supplied A2A
+    HMAC peer key. Schema mirrors what `agb a2a init` writes (bridge_id +
+    peers[]); apply seeds an empty peers list because cross-bridge peer
+    pairing requires both bridges' bridge-ids, which the migrator does
+    not own.
+    """
+    path = staging_root / "handoff.local.json"
+    payload = {
+        "bridge_id": "",
+        "peers": [],
+        "hmac_secret": secret,
+        "migrator_seeded": True,
+    }
+    body = json.dumps(payload, indent=2).encode("utf-8")
+    _atomic_write_file(path, body, mode=0o600)
+    return path
+
+
+def _write_teams_env(staging_root: Path, password: str) -> Path:
+    """
+    Author a minimal .env carrying the operator-supplied Teams app
+    password. The target install's bridge-setup teams path will overwrite
+    everything else (client id, tenant id, channel mapping); the
+    password is the one credential the operator must re-enter.
+    """
+    path = staging_root / ".env"
+    body = f"TEAMS_APP_PASSWORD={password}\n".encode("utf-8")
+    _atomic_write_file(path, body, mode=0o600)
+    return path
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    # Issue #1087: apply ships as the user-facing default. The beta6
+    # opt-in env-var gate is gone — apply now closes the three codex r1
+    # contract gaps:
+    #
+    #   1. clean-target gate covers every apply write path (not just
+    #      state/agents / state/tasks.db / data/agents). See
+    #      CLEAN_TARGET_REQUIRED_ABSENT.
+    #   2. canonical per-agent paths come from the layout shim
+    #      (scripts/python-helpers/migrate-layout-shim.sh) which sources
+    #      the live resolver — no hardcoded `data/agents/<a>/home` path
+    #      inference. Apply and verify consume the same shim, closing the
+    #      verify ↔ layout seam from PR #1111.
+    #   3. operator-supplied secrets (--a2a-secret-file, --app-password-
+    #      file, or the equivalent env vars) ARE written to the target
+    #      as `handoff.local.json` / `.env` with mode 0600. Source-side
+    #      secrets remain stripped at export — the "never copy from
+    #      source" contract is preserved.
+    #
+    # Apply is also wrapped in a write-to-staging + atomic rename + rollback
+    # pattern: every file authored during apply lands in
+    # `.migrator-apply-staging/` first, and only the final move step
+    # publishes the changes into the canonical layout. If anything
+    # fails mid-flight, the rollback path restores file contents from
+    # the pre-apply backup tree (Gap 1 + SHOULD-FIX from the brief).
 
     bundle_dir = Path(args.bundle).expanduser().resolve()
     target = Path(args.target).expanduser().resolve()
+    repo_root = Path(args.repo_root).expanduser().resolve()
 
     if not bundle_dir.is_dir():
         _die(f"bundle directory does not exist: {bundle_dir}")
@@ -751,6 +1093,7 @@ def cmd_apply(args: argparse.Namespace) -> int:
     _info(f"target: {target}")
 
     # --- Gate 1: target must be clean/fresh ---
+    target.mkdir(parents=True, exist_ok=True)
     is_clean, blockers = _target_is_clean(target)
     if not is_clean:
         _die(
@@ -760,14 +1103,19 @@ def cmd_apply(args: argparse.Namespace) -> int:
         )
     _info("target cleanliness: PASS")
 
-    # --- Gate 2: mandatory backup + manifest ---
+    # --- Gate 2: mandatory content backup + manifest ---
+    # Beta6 wrote a hash manifest only, which cannot be replayed on
+    # rollback. We now copy the actual file bytes into the backup tree
+    # so _restore_target_from_backup can byte-for-byte restore.
     backup_dir = target / ".migrator-pre-apply-backup"
     backup_dir.mkdir(parents=True, exist_ok=True)
-    backup_manifest_path = _write_backup_manifest(backup_dir, target)
-    _info(f"pre-apply backup manifest: {backup_manifest_path}")
+    backup_manifest = _backup_target_contents(target, backup_dir)
+    _info(
+        f"pre-apply backup: {backup_manifest['file_count']} files → {backup_dir}/files/ "
+        f"(manifest: pre-apply-backup-manifest.json)"
+    )
 
-    # --- Gate 3: secrets are never copied; re-enter ---
-    # A2A secret (from file, env, or skip).
+    # --- Gate 3: operator-supplied secrets (never copied from source) ---
     a2a_secret: Optional[str] = None
     teams_secret: Optional[str] = None
 
@@ -777,9 +1125,6 @@ def cmd_apply(args: argparse.Namespace) -> int:
     elif os.environ.get("BRIDGE_A2A_SHARED_SECRET"):
         a2a_secret = os.environ["BRIDGE_A2A_SHARED_SECRET"].strip()
         _info("A2A HMAC secret: loaded from BRIDGE_A2A_SHARED_SECRET env")
-    else:
-        _warn("A2A HMAC secret not supplied. A2A peer config will not be written.")
-        _warn("  Supply via --a2a-secret-file or BRIDGE_A2A_SHARED_SECRET env.")
 
     if args.app_password_file:
         teams_secret = _read_secret_file(args.app_password_file)
@@ -788,78 +1133,185 @@ def cmd_apply(args: argparse.Namespace) -> int:
         teams_secret = os.environ["BRIDGE_TEAMS_APP_PASSWORD"].strip()
         _info("Teams app password: loaded from BRIDGE_TEAMS_APP_PASSWORD env")
     else:
-        # Check if source had Teams config — if so, prompt.
+        # The user-prompt re-entry path is only useful when the source
+        # actually had Teams secrets configured AND we are running on a
+        # TTY. Otherwise stay silent — apply will simply skip secret
+        # writes, the operator runs `bridge-setup teams` post-apply.
         stripped = manifest.get("secrets_stripped", [])
         teams_present = any("client-secret" in s or "teams" in s.lower() for s in stripped)
-        if teams_present:
+        if teams_present and sys.stdin.isatty():
             _warn("Teams client secret detected in source — not copied.")
-            if sys.stdin.isatty():
-                teams_secret_input = _prompt_secret("[migrator] Enter Teams app password (or press Enter to skip): ")
-                if teams_secret_input:
-                    teams_secret = teams_secret_input
-                    _info("Teams app password: entered interactively")
-                else:
-                    _info("Teams app password: skipped (enter manually after apply)")
-            else:
-                _warn("Non-interactive: Teams app password skipped. Enter manually after apply.")
+            teams_secret_input = _prompt_secret(
+                "[migrator] Enter Teams app password (or press Enter to skip): "
+            )
+            if teams_secret_input:
+                teams_secret = teams_secret_input
+                _info("Teams app password: entered interactively")
 
-    # --- Apply: write agent identity into target ---
+    # --- Resolve canonical per-agent paths via the layout shim ---
+    agent_ids = [entry["agent_id"] for entry in manifest.get("agents", [])]
+    layout_info = _run_layout_shim(repo_root, target, agent_ids)
+    _info(f"resolved layout: {layout_info.get('layout')}")
+
+    # --- Apply, staged: every write lands under target/.migrator-apply-staging ---
+    staging_root = _staging_root(target)
+    if staging_root.exists():
+        shutil.rmtree(str(staging_root))
+    staging_root.mkdir(parents=True, exist_ok=True)
+
     agents_bundle = bundle_dir / "agents"
     applied_agents: List[str] = []
+    move_failure: Optional[BaseException] = None
 
-    for agent_entry in manifest.get("agents", []):
-        aid = agent_entry["agent_id"]
-        agent_bundle_dir = agents_bundle / aid
-        if not agent_bundle_dir.is_dir():
-            _warn(f"  agent {aid}: bundle dir missing — skipping")
-            continue
-
-        # Determine target agent_home.
-        # On a v2 target: data/agents/<agent>/home
-        # On a legacy target: agents/<agent>
-        target_marker = target / "state" / "layout-marker.sh"
-        if target_marker.is_file() and "BRIDGE_LAYOUT=v2" in target_marker.read_text():
-            agent_home_target = target / "data" / "agents" / aid / "home"
-        else:
-            agent_home_target = target / "agents" / aid
-
-        agent_home_target.mkdir(parents=True, exist_ok=True)
-
-        # Copy identity files.
-        copied = 0
-        for finfo in agent_entry.get("files", []):
-            rel = finfo["rel_path"]
-            cls = finfo.get("classification", "portable")
-            if cls != "portable":
-                continue  # never apply non-portable or secret items
-            src = agent_bundle_dir / rel
-            dst = agent_home_target / rel
-            if not src.is_file():
+    try:
+        # --- Stage: agent identity ---
+        for agent_entry in manifest.get("agents", []):
+            aid = agent_entry["agent_id"]
+            agent_bundle_dir = agents_bundle / aid
+            if not agent_bundle_dir.is_dir():
+                _warn(f"  agent {aid}: bundle dir missing — skipping")
                 continue
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(src), str(dst))
-            copied += 1
 
-        applied_agents.append(aid)
-        _info(f"  agent {aid}: {copied} identity files → {agent_home_target}")
+            # Canonical path from the resolver — never local math.
+            paths = layout_info.get("agents", {}).get(aid)
+            if not paths:
+                _die(
+                    f"layout shim returned no record for agent '{aid}'. "
+                    "This is a contract violation — refusing to apply."
+                )
+            agent_home_target = Path(paths["home_dir"])
+            try:
+                rel_home = agent_home_target.relative_to(target)
+            except ValueError:
+                _die(
+                    f"layout shim returned out-of-target home for '{aid}': {agent_home_target}"
+                )
+            staged_home = staging_root / rel_home
+            staged_home.mkdir(parents=True, exist_ok=True)
 
-    # --- Apply: cron definitions ---
-    cron_jobs = manifest.get("cron_jobs", [])
-    if cron_jobs:
-        cron_home = target / "cron"
-        cron_home.mkdir(parents=True, exist_ok=True)
-        jobs_path = cron_home / "jobs.json"
-        if jobs_path.is_file():
-            _warn("target cron/jobs.json already exists — merging not supported; skipping cron import")
-            _warn("  Manually merge from bundle/cron-definitions.json after apply.")
-        else:
-            jobs_path.write_text(json.dumps(cron_jobs, indent=2))
-            _info(f"cron definitions: {len(cron_jobs)} imported → {jobs_path}")
-        # Write a reference copy regardless.
-        ref_path = backup_dir / "cron-definitions-from-bundle.json"
-        ref_path.write_text(json.dumps(cron_jobs, indent=2))
+            copied = 0
+            for finfo in agent_entry.get("files", []):
+                rel = finfo["rel_path"]
+                cls = finfo.get("classification", "portable")
+                if cls != "portable":
+                    continue
+                src = agent_bundle_dir / rel
+                dst = staged_home / rel
+                if not src.is_file():
+                    continue
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src), str(dst))
+                copied += 1
 
-    # --- Apply: write apply-result manifest ---
+            applied_agents.append(aid)
+            _info(f"  agent {aid}: {copied} identity files → {agent_home_target} (staged)")
+
+        # --- Stage: cron definitions ---
+        cron_jobs = manifest.get("cron_jobs", [])
+        if cron_jobs:
+            staged_cron_home = staging_root / "cron"
+            staged_cron_home.mkdir(parents=True, exist_ok=True)
+            staged_jobs_path = staged_cron_home / "jobs.json"
+            # Cleanliness gate already refused if the live jobs.json
+            # existed, so there is no merge case to consider here.
+            staged_jobs_path.write_text(json.dumps(cron_jobs, indent=2))
+            _info(f"cron definitions: {len(cron_jobs)} staged → cron/jobs.json")
+            # Reference copy in the backup dir (the live backup tree is
+            # NOT inside staging; write it directly).
+            ref_path = backup_dir / "cron-definitions-from-bundle.json"
+            ref_path.write_text(json.dumps(cron_jobs, indent=2))
+
+        # --- Stage: operator-supplied secrets, mode 0600 ---
+        secret_files_written: List[str] = []
+        if a2a_secret:
+            handoff_path = _write_a2a_handoff_local(staging_root, a2a_secret)
+            secret_files_written.append(str(handoff_path.relative_to(staging_root)))
+            _info("A2A handoff.local.json: staged (mode 0600)")
+        if teams_secret:
+            env_path = _write_teams_env(staging_root, teams_secret)
+            secret_files_written.append(str(env_path.relative_to(staging_root)))
+            _info("Teams .env: staged (mode 0600)")
+
+        # --- Stage: layout marker so the migrated target is startable ---
+        # Codex r2 finding 1: without this, apply publishes the agent
+        # tree but the resolver dies on next startup because the target
+        # is markerless. The migrator IS the init flow for a legacy →
+        # clean-cut handoff, so it must author the marker.
+        staged_marker_dir = staging_root / "state"
+        staged_marker_dir.mkdir(parents=True, exist_ok=True)
+        marker_body = (
+            "# Managed by agent-bridge. Regenerated by migrate-legacy-install.\n"
+            "BRIDGE_LAYOUT=v2\n"
+            f"BRIDGE_DATA_ROOT={target}/data\n"
+        )
+        (staged_marker_dir / "layout-marker.sh").write_text(marker_body)
+        _info("layout marker: staged (BRIDGE_LAYOUT=v2)")
+
+        # Test-only hook: simulate a mid-apply failure before publish so
+        # smoke can exercise the rollback path. Never set this in
+        # production — the migrator deliberately leaves no production
+        # code path that triggers a forced failure.
+        if os.environ.get("BRIDGE_MIGRATOR_TEST_FAIL_BEFORE_PUBLISH"):
+            raise RuntimeError(
+                "BRIDGE_MIGRATOR_TEST_FAIL_BEFORE_PUBLISH set — "
+                "simulated mid-apply failure for rollback smoke"
+            )
+
+        # --- Atomic publish: move staging into the live tree ---
+        moved = _move_staging_into_target(staging_root, target)
+        _info(f"atomic publish: {len(moved)} files moved into target")
+
+        # --- Re-assert secret-file modes post-publish ---
+        # The mode survives os.replace because we set it on the source,
+        # but defense-in-depth: confirm explicitly.
+        for rel in secret_files_written:
+            try:
+                os.chmod(str(target / rel), 0o600)
+            except OSError as e:
+                _warn(f"  secret {rel}: chmod 0600 failed post-publish: {e}")
+
+    except BaseException as exc:  # noqa: BLE001 (intentional: rollback any failure)
+        move_failure = exc
+        _warn(f"apply failure mid-flight: {exc}")
+        _warn("rolling back from pre-apply backup …")
+        restored = _restore_target_from_backup(target, backup_dir)
+        _warn(f"rollback restored {restored} files from backup")
+        if staging_root.exists():
+            try:
+                shutil.rmtree(str(staging_root))
+            except OSError:
+                pass
+        # Codex r2 finding 2: the cleanliness gate treats
+        # .migrator-pre-apply-backup/ as a blocker (see
+        # CLEAN_TARGET_REQUIRED_ABSENT), so leaving it in place after a
+        # rollback would brick the retry. Move it to a timestamped
+        # `.migrator-failed-backup-<ts>/` instead so the operator still
+        # has the audit trail and the cleanliness gate stops blocking.
+        # The failed-backup name is intentionally NOT in
+        # CLEAN_TARGET_REQUIRED_ABSENT — apply tolerates leftover
+        # diagnostics from prior aborted runs.
+        if backup_dir.exists():
+            failed_name = f".migrator-failed-backup-{int(time.time())}"
+            failed_dir = target / failed_name
+            try:
+                os.replace(str(backup_dir), str(failed_dir))
+                _warn(f"pre-apply backup preserved as {failed_name}/ for inspection")
+            except OSError as e:
+                _warn(f"could not rename backup dir for retry: {e}")
+        _die(f"apply failed and rolled back: {exc}")
+    finally:
+        # Whether success or failure, the staging tree should be gone.
+        if staging_root.exists():
+            try:
+                shutil.rmtree(str(staging_root))
+            except OSError:
+                pass
+
+    if move_failure is not None:
+        # Defensive — _die above should have already exited.
+        return 1
+
+    # --- Apply: write apply-result manifest (canonical post-publish) ---
     apply_manifest = {
         "schema_version": MIGRATOR_SCHEMA_VERSION,
         "migrator_tag": args.migrator_tag,
@@ -867,9 +1319,16 @@ def cmd_apply(args: argparse.Namespace) -> int:
         "source_bundle": str(bundle_dir),
         "target": str(target),
         "applied_agents": applied_agents,
-        "cron_jobs_imported": len(cron_jobs),
+        "cron_jobs_imported": len(manifest.get("cron_jobs", [])),
         "a2a_secret_supplied": a2a_secret is not None,
+        "a2a_secret_written": a2a_secret is not None,
         "teams_secret_supplied": teams_secret is not None,
+        "teams_secret_written": teams_secret is not None,
+        "layout": layout_info.get("layout"),
+        "agent_paths": {
+            aid: layout_info.get("agents", {}).get(aid, {})
+            for aid in applied_agents
+        },
     }
     apply_result_path = target / ".migrator-apply-result.json"
     apply_result_path.write_text(json.dumps(apply_manifest, indent=2))
@@ -892,12 +1351,15 @@ def cmd_apply(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_verify(args: argparse.Namespace) -> int:
-    # beta6 contract: verify is a target-FS inspection helper. It intentionally
-    # does NOT shell out to `bridge_layout_*` resolvers from bridge-lib.sh —
-    # the layout-resolver integration is bundled with `apply` and is deferred
-    # to beta7 (#1087). Verify infers v2-vs-legacy by reading the target's
-    # `state/layout-marker.sh` directly so it can run against any install
-    # without needing the source checkout's bridge-lib.sh sourceable.
+    # Issue #1087: verify consumes the same layout shim as apply, closing
+    # the verify ↔ layout seam codex r1 flagged in PR #1111 (verify and
+    # apply must agree on where the per-agent home lives, or a successful
+    # apply can still trip a verify FAIL on the next leap step).
+    #
+    # apply-result.json records the applied_agents list and the canonical
+    # paths the shim returned at apply time. Verify re-runs the shim to
+    # pick up any layout drift since apply, then asserts every agent's
+    # identity is present at the canonical home.
     target = Path(args.target).expanduser().resolve()
     repo_root = Path(args.repo_root).expanduser().resolve()
 
@@ -920,34 +1382,52 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     # --- Check 2: apply result manifest ---
     apply_result = target / ".migrator-apply-result.json"
+    applied_agent_ids: List[str] = []
     if apply_result.is_file():
         try:
             ar = json.loads(apply_result.read_text())
-            applied_agents = ar.get("applied_agents", [])
-            passes.append(f"apply-result: found ({len(applied_agents)} agents)")
+            applied_agent_ids = list(ar.get("applied_agents", []))
+            passes.append(f"apply-result: found ({len(applied_agent_ids)} agents)")
         except (json.JSONDecodeError, OSError):
             failures.append("apply-result: unreadable")
     else:
         failures.append("apply-result: .migrator-apply-result.json not found (apply not run?)")
 
-    # --- Check 3: agent homes exist ---
-    is_v2 = marker.is_file() and "BRIDGE_LAYOUT=v2" in (marker.read_text() if marker.is_file() else "")
-    agent_home_root = (target / "data" / "agents") if is_v2 else (target / "agents")
+    # --- Check 3: agent homes exist (via layout shim) ---
+    # Drive path resolution through the same shim apply used so verify
+    # cannot drift from the canonical contract. Fail closed when the shim
+    # itself errors — that's a target the operator cannot trust.
+    if applied_agent_ids:
+        try:
+            layout_info = _run_layout_shim(repo_root, target, applied_agent_ids)
+        except SystemExit:
+            failures.append("layout-shim: failed to resolve canonical paths (target unusable)")
+            layout_info = {"agents": {}}
+    else:
+        layout_info = {"agents": {}}
 
-    agent_dirs: List[str] = []
-    if agent_home_root.is_dir():
-        agent_dirs = [e.name for e in sorted(agent_home_root.iterdir()) if e.is_dir() and not e.name.startswith(".")]
-
-    if agent_dirs:
-        passes.append(f"agent-homes: {len(agent_dirs)} found: {', '.join(agent_dirs)}")
-        # Check each has at least one identity file.
-        for aid in agent_dirs:
-            home = agent_home_root / aid / "home" if is_v2 else agent_home_root / aid
+    agent_paths = layout_info.get("agents", {})
+    if applied_agent_ids and agent_paths:
+        passes.append(
+            f"agent-homes (via resolver): {len(applied_agent_ids)} agents — "
+            f"{', '.join(applied_agent_ids)}"
+        )
+        for aid in applied_agent_ids:
+            home_str = agent_paths.get(aid, {}).get("home_dir")
+            if not home_str:
+                failures.append(f"  agent {aid}: layout shim returned no home_dir")
+                continue
+            home = Path(home_str)
+            if not home.is_dir():
+                failures.append(f"  agent {aid}: home_dir missing on disk: {home}")
+                continue
             has_identity = any((home / f).is_file() for f in IDENTITY_FILES)
             if has_identity:
-                passes.append(f"  agent {aid}: identity files present")
+                passes.append(f"  agent {aid}: identity files present at {home}")
             else:
                 failures.append(f"  agent {aid}: no identity files found in {home}")
+    elif applied_agent_ids:
+        failures.append("agent-homes: layout shim returned no per-agent records")
     else:
         passes.append("agent-homes: none (no agents migrated)")
 
