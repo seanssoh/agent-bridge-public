@@ -199,7 +199,7 @@ json_escape() {
 # r3 P2 #2 case (the only whitespace-tolerant shape that has shown up in
 # the tree). r3 fix for codex PR #954 r2 finding P2 #2 — combined with the
 # tightening above to avoid prose-text false positives.
-RE_HEREDOC_OP='<<-?([[:space:]]*["'"'"'][A-Za-z_][A-Za-z0-9_]*["'"'"']|[[:space:]]*[A-Za-z_][A-Za-z0-9_]*)'
+RE_HEREDOC_OP='<<-?([[:space:]]*["'"'"'][A-Za-z_][A-Za-z0-9_]*["'"'"']|["'"'"']?[A-Za-z_][A-Za-z0-9_]*["'"'"']?)'
 RE_HERESTRING='<<<'
 RE_PROCSUB_IN='<[[:space:]]+<\('
 RE_PROCSUB_OUT='>[[:space:]]+>\('
@@ -294,15 +294,28 @@ classify_line() {
     return
   fi
 
-  local has_heredoc_op=0 has_herestring=0 has_procsub=0
+  local has_heredoc_op=0 has_herestring=0 has_procsub=0 has_bare_bash_heredoc=0
   [[ "$line" =~ $RE_HEREDOC_OP ]] && has_heredoc_op=1
   [[ "$line" =~ $RE_HERESTRING  ]] && has_herestring=1
   if [[ "$line" =~ $RE_PROCSUB_IN ]] || [[ "$line" =~ $RE_PROCSUB_OUT ]]; then
     has_procsub=1
   fi
+  # r3 (codex #5830): bash << TAG (whitespace) detection. Scoped to
+  # the bash-bare pattern so we don't false-positive on string content
+  # that contains `<<` (e.g. assertion labels "elapsed << interval").
+  if [[ "$line" =~ $RE_BASH_BARE_HEREDOC ]]; then
+    has_bare_bash_heredoc=1
+  fi
 
-  if (( has_heredoc_op == 0 && has_herestring == 0 && has_procsub == 0 )); then
+  if (( has_heredoc_op == 0 && has_herestring == 0 && has_procsub == 0 && has_bare_bash_heredoc == 0 )); then
     printf 'NONE|no-heredoc\n'
+    return
+  fi
+  # r3 (codex #5830): if ONLY the bare-bash-heredoc pattern matched,
+  # classify directly as C4 and return — the line otherwise lacks the
+  # RE_HEREDOC_OP signal that other arms expect.
+  if (( has_heredoc_op == 0 && has_herestring == 0 && has_procsub == 0 && has_bare_bash_heredoc == 1 )); then
+    printf 'C4|bare bash heredoc, no capture\n'
     return
   fi
 
