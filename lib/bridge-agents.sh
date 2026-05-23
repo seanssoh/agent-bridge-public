@@ -1029,6 +1029,62 @@ bridge_agent_linux_user_isolation_effective() {
   return 0
 }
 
+# bridge_agent_workdir_step_a_complete <agent> <workdir>
+#
+# Issue #1151 (beta9 follow-up): the PR #1149 ownership-based defer pattern
+# that lives inline at `lib/bridge-hooks.sh:237-251` is lifted into a
+# reusable predicate so the same race-safe gate can be applied uniformly to
+# every controller-side helper that mutates `$workdir/.claude/*`.
+#
+# Returns 0 when the workdir owner matches the agent's roster-resolved
+# `os_user` — i.e. `bridge_linux_prepare_agent_isolation` (Step A) has
+# already chowned the v2 subtree to the isolated UID, so controller-direct
+# mutations would race the wrong way and must defer / escalate.
+#
+# Returns 1 in EVERY other case (workdir missing, stat unable to read,
+# roster lookup empty, owner != expected). Callers should treat 1 as "not
+# yet complete — defer or escalate".
+#
+# IMPORTANT: this helper does NOT short-circuit on `!bridge_agent_linux_user_
+# isolation_effective`. It only checks the ownership invariant. Callers
+# MUST pair-gate with `bridge_agent_linux_user_isolation_effective` to
+# preserve legacy (non-v2) behavior — see the recommended usage at the
+# bottom of this comment.
+#
+# `stat -c %U` is GNU/Linux; `stat -f %Su` is BSD/macOS. v2 isolation is
+# Linux-only in practice, but the helper runs on every platform (callers
+# in `lib/bridge-hooks.sh` etc. run on macOS too), so we defend against
+# missing stat flavors via the chained fallback.
+#
+# Recommended call shape at every controller-touch site:
+#
+#   if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+#       && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
+#     # v2 isolation effective AND Step A pending → defer (or sudo-escalate)
+#     return 0
+#   fi
+#   # legacy or post-Step-A → proceed as usual
+#
+# See `lib/bridge-hooks.sh::bridge_link_claude_settings_to_shared` for the
+# canonical caller (PR #1149) and `scripts/smoke/1151-step-a-helper.sh` for
+# the unit smoke pinning the contract.
+bridge_agent_workdir_step_a_complete() {
+  local agent="$1"
+  local workdir="$2"
+
+  [[ -d "$workdir" ]] || return 1
+
+  local _wd_owner=""
+  _wd_owner="$(stat -c %U "$workdir" 2>/dev/null || stat -f %Su "$workdir" 2>/dev/null || true)"
+  [[ -n "$_wd_owner" ]] || return 1
+
+  local _expected_owner=""
+  if command -v bridge_agent_os_user >/dev/null 2>&1; then
+    _expected_owner="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+  fi
+  [[ -n "$_expected_owner" && "$_wd_owner" == "$_expected_owner" ]]
+}
+
 bridge_current_user() {
   id -un
 }

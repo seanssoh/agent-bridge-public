@@ -105,10 +105,26 @@ PY
 bridge_link_shared_claude_skill() {
   local workdir="$1"
   local skill_name="$2"
+  # Issue #1151: optional 3rd arg threads the agent id through so the v2-
+  # isolation Step-A defer guard below can resolve roster `os_user`. Legacy
+  # callers (`bridge_bootstrap_claude_shared_skills` without an agent arg)
+  # keep the empty default → guard silently skips, behavior unchanged.
+  local agent="${3-}"
   local source_dir=""
   local link_dir=""
 
   [[ "$(bridge_path_is_within_root "$workdir" "$BRIDGE_AGENT_HOME_ROOT")" == "1" ]] || return 0
+
+  # Issue #1151 (DEFER policy): controller-direct `mkdir` / `symlink` into
+  # the isolated workdir tree races Step A under v2 isolation. Skill links
+  # re-trigger on the next agent start (the bootstrap path re-fires once
+  # the workdir has been normalized), so deferring loses no data.
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
+    return 0
+  fi
 
   source_dir="$(bridge_shared_claude_skill_source_dir "$skill_name")"
   [[ -d "$source_dir" ]] || return 0
@@ -131,6 +147,33 @@ bridge_sync_claude_runtime_skills() {
   local configured_skill=""
 
   [[ "$(bridge_path_is_within_root "$workdir" "$BRIDGE_AGENT_HOME_ROOT")" == "1" ]] || return 0
+
+  # Issue #1151 (DEFER policy): controller-direct mkdir / rm / symlink under
+  # `$workdir/.claude/skills/` races Step A under v2 isolation. Under v2,
+  # Claude launches with CLAUDE_CONFIG_DIR pointed at the isolated home's
+  # `.claude/` (see `bridge_run_agent_claude_root` in bridge-run.sh:491-496),
+  # not at `$workdir/.claude/`. The isolated home's skill set is populated
+  # separately by `bridge_sync_isolated_home_claude_skills` (line 234 in
+  # `bridge_bootstrap_claude_shared_skills`) using `bridge_linux_sudo_root`
+  # — that path is load-bearing for v2. The workdir-side skills directory
+  # this function writes is the legacy non-isolated path; for v2 agents it
+  # is dead-code under the runtime engine wiring. Deferring here keeps the
+  # legacy non-isolated behavior intact while preventing the controller
+  # mkdir/rm Permission denied flood under v2.
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
+    return 0
+  fi
+  # Even when Step A is complete, v2 isolation means controller cannot write
+  # under the isolated workdir. Defer to the isolated-home sync path (already
+  # invoked by bridge_bootstrap_claude_shared_skills at line ~234) which
+  # handles the load-bearing case via bridge_linux_sudo_root.
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    return 0
+  fi
+
   skills_dir="$workdir/.claude/skills"
   mkdir -p "$skills_dir"
 
@@ -191,16 +234,20 @@ bridge_bootstrap_claude_shared_skills() {
     workdir="$1"
   fi
 
-  bridge_link_shared_claude_skill "$workdir" "agent-bridge-runtime"
-  bridge_link_shared_claude_skill "$workdir" "cron-manager"
-  bridge_link_shared_claude_skill "$workdir" "memory-wiki"
+  # Issue #1151: thread `$agent` through so the helper can resolve the v2
+  # isolation Step-A defer guard from the roster `os_user`. When agent is
+  # empty (legacy single-arg caller), the guard short-circuits and behavior
+  # is unchanged.
+  bridge_link_shared_claude_skill "$workdir" "agent-bridge-runtime" "$agent"
+  bridge_link_shared_claude_skill "$workdir" "cron-manager" "$agent"
+  bridge_link_shared_claude_skill "$workdir" "memory-wiki" "$agent"
   # v0.8.6: wave-orchestration is the shared parallel-PR-ship pattern
   # (issue-fixer dispatch into worktrees, codex-rescue review, squash-
   # merge with structured notes). Distribute to every Agent Bridge agent
   # so admin / dynamic / static agents all share the same orchestration
   # spine — operators do not need to copy the skill into per-agent
   # `.claude/skills/` manually.
-  bridge_link_shared_claude_skill "$workdir" "wave-orchestration"
+  bridge_link_shared_claude_skill "$workdir" "wave-orchestration" "$agent"
 
   if [[ -n "$agent" ]]; then
     bridge_sync_claude_runtime_skills "$agent" "$workdir"
@@ -334,73 +381,195 @@ bridge_sync_isolated_home_claude_skills() {
   bridge_linux_sudo_root chown "$os_user:$os_user" "$skills_root" 2>/dev/null || true
   bridge_linux_sudo_root chmod 0755 "$skills_root" 2>/dev/null || true
 
-  while IFS= read -r skill_name; do
-    [[ -n "$skill_name" ]] || continue
+  # Cache the bridge-native skill name list once into a local array so the
+  # per-skill membership checks below avoid spawning subshells (and avoid
+  # piling extra `done < <(bridge_isolated_home_shared_skill_names)` sites
+  # into the heredoc-ban baseline). The existing process-substitution feed
+  # below is already baselined; this preserves that single site.
+  local _native_names=()
+  local _native_line=""
+  while IFS= read -r _native_line; do
+    [[ -n "$_native_line" ]] || continue
+    _native_names+=("$_native_line")
+  done < <(bridge_isolated_home_shared_skill_names)
+
+  local _n=""
+  for _n in "${_native_names[@]}"; do
+    skill_name="$_n"
     source_dir="$(bridge_shared_claude_skill_source_dir "$skill_name")"
     if [[ ! -d "$source_dir" ]]; then
       bridge_warn "isolated skills sync: source missing for skill '$skill_name' (looked under $source_dir)"
       continue
     fi
-    target_dir="$skills_root/$skill_name"
-    bridge_linux_sudo_root mkdir -p "$target_dir" 2>/dev/null || {
-      bridge_warn "isolated skills sync: cannot mkdir $target_dir"
-      continue
-    }
+    bridge_isolated_home_install_one_skill \
+      "$skill_name" "$source_dir" "$skills_root" "$os_user"
+  done
 
-    # Walk every regular file under the source skill dir and either
-    # render (text) or copy verbatim (binary). Preserve subdirectory
-    # structure under references/ etc.
-    while IFS= read -r -d '' source_file; do
-      rel="${source_file#"$source_dir/"}"
-      target_file="$target_dir/$rel"
-      bridge_linux_sudo_root mkdir -p "$(dirname "$target_file")" 2>/dev/null || continue
-      # Atomic install via tmp + mv -f inside the isolated tree so any
-      # concurrent reader (e.g. an isolated agent already mid-launch)
-      # never observes a truncated file. The renderer / source-copy
-      # writes a controller-owned temp file, which is sudo-installed to
-      # `${target_file}.tmp.$$` (same directory as the final target so
-      # the rename stays within one filesystem), and only then renamed
-      # over `$target_file`. `mv -f` on POSIX is an atomic rename within
-      # a filesystem; if it fails the tmp sibling is removed so the
-      # isolated tree never carries a stale `.tmp.$$` artifact. Mirrors
-      # the controller-side os.replace pattern used by
-      # bridge_render_skill_file_for_isolated.
-      local _tmp_target="${target_file}.tmp.$$"
-      if bridge_skill_file_is_text "$source_file" 2>/dev/null; then
-        # Render to a controller-owned temp file, then sudo-stage into
-        # the isolated tree's tmp sibling. Two-step is required because
-        # the renderer writes as the controller UID.
-        local _tmp_rendered=""
-        _tmp_rendered="$(mktemp)" || continue
-        if bridge_render_skill_file_for_isolated "$source_file" "$_tmp_rendered" "$BRIDGE_HOME"; then
-          if bridge_linux_sudo_root install -m 0644 "$_tmp_rendered" "$_tmp_target" 2>/dev/null; then
-            bridge_linux_sudo_root mv -f "$_tmp_target" "$target_file" 2>/dev/null || {
-              bridge_linux_sudo_root rm -f "$_tmp_target" 2>/dev/null || true
-              bridge_warn "isolated skills sync: atomic mv failed for $target_file"
-            }
-          else
-            bridge_linux_sudo_root rm -f "$_tmp_target" 2>/dev/null || true
-            bridge_warn "isolated skills sync: install failed for $target_file"
-          fi
-        else
-          bridge_warn "isolated skills sync: render failed for $source_file"
-        fi
-        rm -f "$_tmp_rendered"
-      else
-        if bridge_linux_sudo_root install -m 0644 "$source_file" "$_tmp_target" 2>/dev/null; then
+  # Issue #1151 r2 — Codex BLOCKING 1: also sync per-agent configured runtime
+  # skills (`BRIDGE_AGENT_SKILLS["<agent>"]="..."`) into the isolated home.
+  # Pre-r1 the legacy `bridge_sync_claude_runtime_skills` linked these under
+  # `$workdir/.claude/skills/`, but under v2 isolation Claude reads from
+  # `$isolated_home/.claude/skills/` (CLAUDE_CONFIG_DIR is pointed there).
+  # The r1 patch DEFERed the legacy path without a v2 replacement, dropping
+  # configured runtime skills for v2 agents entirely. This loop restores
+  # them via the same sudo-backed install primitive the bridge-native list
+  # already uses.
+  #
+  # Source dir is `$BRIDGE_RUNTIME_SKILLS_DIR/<skill>` (the runtime skills
+  # path, NOT the shared `$BRIDGE_HOME/.claude/skills/`). Bridge-native
+  # skills already covered by `bridge_isolated_home_shared_skill_names` are
+  # skipped (`_native_names` membership) to avoid double-install. Skill
+  # names are validated against the same regex the legacy path used.
+  local _configured=""
+  _configured="$(bridge_agent_skills_csv "$agent" 2>/dev/null || true)"
+  if [[ -n "$_configured" ]]; then
+    local _skill=""
+    local _runtime_source=""
+    local _is_native=0
+    for _skill in $_configured; do
+      [[ "$_skill" =~ ^[A-Za-z0-9._-]+$ ]] || continue
+      bridge_is_shared_claude_skill_name "$_skill" && continue
+      _is_native=0
+      for _n in "${_native_names[@]}"; do
+        [[ "$_n" == "$_skill" ]] && { _is_native=1; break; }
+      done
+      (( _is_native == 1 )) && continue
+      _runtime_source="$(bridge_runtime_claude_skill_source_dir "$_skill" 2>/dev/null || true)"
+      if [[ -z "$_runtime_source" ]]; then
+        bridge_warn "isolated skills sync: runtime skill '$_skill' configured for '$agent' but missing under $BRIDGE_RUNTIME_SKILLS_DIR"
+        continue
+      fi
+      bridge_isolated_home_install_one_skill \
+        "$_skill" "$_runtime_source" "$skills_root" "$os_user"
+    done
+  fi
+
+  # Issue #1151 r2 — Codex BLOCKING 1 (removal half): drop stale configured
+  # skills from `$skills_root` when the CSV no longer lists them. Mirrors
+  # the legacy `bridge_sync_claude_runtime_skills` removal arm (lines
+  # 182-208 pre-r1). Skips bridge-native skill names and shared skill
+  # names so legitimate fixed installs are never deleted. Only removes
+  # entries that look like a previously-installed runtime skill (i.e. the
+  # entry name resolves to a `$BRIDGE_RUNTIME_SKILLS_DIR/<name>` source
+  # dir) — opaque user-managed directories under
+  # `$isolated_home/.claude/skills/` are left alone.
+  #
+  # Implementation: capture the directory list into a temp file via
+  # sudo + `>` redirect (no process-substitution / no here-string into a
+  # bash consumer; avoids the heredoc-ban H3 class). Read the temp file
+  # back as a plain redirect.
+  if bridge_linux_sudo_root test -d "$skills_root" 2>/dev/null; then
+    local _ls_tmp=""
+    _ls_tmp="$(mktemp)" || return 0
+    bridge_linux_sudo_root find "$skills_root" -mindepth 1 -maxdepth 1 -type d >"$_ls_tmp" 2>/dev/null || true
+    local _present_entry=""
+    local _present_name=""
+    local _is_native_present=0
+    local _still_configured=0
+    local _cfg=""
+    while IFS= read -r _present_entry <&7; do
+      [[ -n "$_present_entry" ]] || continue
+      _present_name="$(basename "$_present_entry")"
+      [[ -n "$_present_name" ]] || continue
+      bridge_is_shared_claude_skill_name "$_present_name" && continue
+      _is_native_present=0
+      for _n in "${_native_names[@]}"; do
+        [[ "$_n" == "$_present_name" ]] && { _is_native_present=1; break; }
+      done
+      (( _is_native_present == 1 )) && continue
+      # Only candidate for removal if it maps to a runtime skill source.
+      [[ -n "$(bridge_runtime_claude_skill_source_dir "$_present_name" 2>/dev/null || true)" ]] || continue
+      # Keep when the skill is still configured for this agent.
+      _still_configured=0
+      for _cfg in $_configured; do
+        [[ "$_cfg" == "$_present_name" ]] && { _still_configured=1; break; }
+      done
+      (( _still_configured == 1 )) && continue
+      bridge_linux_sudo_root rm -rf "$_present_entry" 2>/dev/null || \
+        bridge_warn "isolated skills sync: stale runtime skill rm failed for $_present_entry"
+    done 7<"$_ls_tmp"
+    rm -f "$_ls_tmp"
+  fi
+}
+
+# Install one rendered skill directory under the isolated home's
+# `.claude/skills/<skill>/`. Shared with two callers in
+# `bridge_sync_isolated_home_claude_skills`: the bridge-native fixed list
+# and the per-agent configured runtime CSV (Issue #1151 r2 BLOCKING 1).
+#
+# Mirrors the existing per-skill body verbatim — render text files via
+# `bridge_render_skill_file_for_isolated`, copy binaries via `install`,
+# atomic mv into place, then chown the final tree to the isolated UID.
+# Best-effort: warns but never aborts the caller.
+bridge_isolated_home_install_one_skill() {
+  local skill_name="$1"
+  local source_dir="$2"
+  local skills_root="$3"
+  local os_user="$4"
+  local target_dir=""
+  local source_file=""
+  local rel=""
+  local target_file=""
+
+  target_dir="$skills_root/$skill_name"
+  bridge_linux_sudo_root mkdir -p "$target_dir" 2>/dev/null || {
+    bridge_warn "isolated skills sync: cannot mkdir $target_dir"
+    return 0
+  }
+
+  # Walk every regular file under the source skill dir and either
+  # render (text) or copy verbatim (binary). Preserve subdirectory
+  # structure under references/ etc.
+  while IFS= read -r -d '' source_file; do
+    rel="${source_file#"$source_dir/"}"
+    target_file="$target_dir/$rel"
+    bridge_linux_sudo_root mkdir -p "$(dirname "$target_file")" 2>/dev/null || continue
+    # Atomic install via tmp + mv -f inside the isolated tree so any
+    # concurrent reader (e.g. an isolated agent already mid-launch)
+    # never observes a truncated file. The renderer / source-copy
+    # writes a controller-owned temp file, which is sudo-installed to
+    # `${target_file}.tmp.$$` (same directory as the final target so
+    # the rename stays within one filesystem), and only then renamed
+    # over `$target_file`. `mv -f` on POSIX is an atomic rename within
+    # a filesystem; if it fails the tmp sibling is removed so the
+    # isolated tree never carries a stale `.tmp.$$` artifact. Mirrors
+    # the controller-side os.replace pattern used by
+    # bridge_render_skill_file_for_isolated.
+    local _tmp_target="${target_file}.tmp.$$"
+    if bridge_skill_file_is_text "$source_file" 2>/dev/null; then
+      # Render to a controller-owned temp file, then sudo-stage into
+      # the isolated tree's tmp sibling. Two-step is required because
+      # the renderer writes as the controller UID.
+      local _tmp_rendered=""
+      _tmp_rendered="$(mktemp)" || continue
+      if bridge_render_skill_file_for_isolated "$source_file" "$_tmp_rendered" "$BRIDGE_HOME"; then
+        if bridge_linux_sudo_root install -m 0644 "$_tmp_rendered" "$_tmp_target" 2>/dev/null; then
           bridge_linux_sudo_root mv -f "$_tmp_target" "$target_file" 2>/dev/null || {
             bridge_linux_sudo_root rm -f "$_tmp_target" 2>/dev/null || true
             bridge_warn "isolated skills sync: atomic mv failed for $target_file"
           }
         else
           bridge_linux_sudo_root rm -f "$_tmp_target" 2>/dev/null || true
-          bridge_warn "isolated skills sync: copy failed for $target_file"
+          bridge_warn "isolated skills sync: install failed for $target_file"
         fi
+      else
+        bridge_warn "isolated skills sync: render failed for $source_file"
       fi
-    done < <(find "$source_dir" -type f -print0 2>/dev/null)
+      rm -f "$_tmp_rendered"
+    else
+      if bridge_linux_sudo_root install -m 0644 "$source_file" "$_tmp_target" 2>/dev/null; then
+        bridge_linux_sudo_root mv -f "$_tmp_target" "$target_file" 2>/dev/null || {
+          bridge_linux_sudo_root rm -f "$_tmp_target" 2>/dev/null || true
+          bridge_warn "isolated skills sync: atomic mv failed for $target_file"
+        }
+      else
+        bridge_linux_sudo_root rm -f "$_tmp_target" 2>/dev/null || true
+        bridge_warn "isolated skills sync: copy failed for $target_file"
+      fi
+    fi
+  done < <(find "$source_dir" -type f -print0 2>/dev/null)
 
-    bridge_linux_sudo_root chown -R "$os_user:$os_user" "$target_dir" 2>/dev/null || true
-  done < <(bridge_isolated_home_shared_skill_names)
+  bridge_linux_sudo_root chown -R "$os_user:$os_user" "$target_dir" 2>/dev/null || true
 }
 
 bridge_agent_skills_registry_json() {
@@ -546,14 +715,192 @@ bridge_project_claude_guidance_needed() {
 
 bridge_ensure_project_claude_guidance() {
   local workdir="$1"
+  # Issue #1151: optional 2nd arg threads the agent id through so the v2-
+  # isolation guard polarity below can resolve roster `os_user`. Legacy
+  # single-arg callers keep the empty default → the legacy
+  # `BRIDGE_AGENT_HOME_ROOT` opt-out path applies as before.
+  local agent="${2-}"
   local claude_file=""
+  # Mode: legacy | v2-sudo (set when entering the v2 post-Step-A branch).
+  local _v2_isolated=0
+  local _v2_os_user=""
 
-  if [[ "$(bridge_path_is_within_root "$workdir" "$BRIDGE_AGENT_HOME_ROOT")" == "1" ]]; then
+  # Issue #1151 (FIX GUARD POLARITY): for v2 linux-user isolated agents the
+  # workdir lives under `$BRIDGE_AGENT_ROOT_V2/<agent>/workdir`, which in the
+  # default layout collapses to the same directory as `$BRIDGE_AGENT_HOME_ROOT`
+  # (both default to `$BRIDGE_HOME/agents`). The legacy opt-out branch below
+  # therefore caught the v2 isolated workdir AND the legacy non-isolated
+  # agent-home shape with the same gate, blanketing v2 agents out of the
+  # project-CLAUDE.md guidance write. For v2 isolated agents the workdir IS
+  # the project workspace (operator's project files materialize there), so
+  # the guidance write is desired — but the workdir is owned by the isolated
+  # UID so a controller-direct write would fail with Permission denied.
+  #
+  # r1 policy: DEFER both pre- and post-Step-A. Codex BLOCKING 2 — `git grep`
+  # finds no isolated-side renderer that writes the CLAUDE.md guidance block;
+  # the only production write site is this function. Post-Step-A DEFER drops
+  # the guidance permanently for v2 agents.
+  #
+  # r2 policy (Codex fix): DEFER only when Step A is pending (workdir not yet
+  # owned by isolated UID). Post-Step-A we SUDO-ESCALATE the write: render
+  # the updated content to a controller-owned tmpfile, then
+  # `bridge_linux_sudo_root install -o $os_user -g $os_user -m 0644` it into
+  # `$workdir/CLAUDE.md`. v2 Claude reads CLAUDE.md from workdir per the v2
+  # profile contract (bridge-agents.sh:4497-4500), so the file must exist at
+  # the workdir path with isolated-UID ownership.
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    if ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
+      return 0  # Step A pending → defer (workdir not yet owned by isolated UID)
+    fi
+    # Step A complete under v2 → mark for sudo-escalated write below.
+    _v2_isolated=1
+    _v2_os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    if [[ -z "$_v2_os_user" ]]; then
+      bridge_warn "project CLAUDE.md guidance: roster os_user empty for '$agent' under v2 isolation; skipping"
+      return 0
+    fi
+  fi
+
+  # Legacy non-isolated path: opt out when workdir is the agent's own home
+  # (the agent-home CLAUDE.md is owned by a different scaffold). Under v2
+  # isolated mode this gate is intentionally bypassed — the workdir IS the
+  # project workspace and may live under `$BRIDGE_AGENT_HOME_ROOT` (default
+  # layout collapses both paths). The `_v2_isolated == 1` short-circuit
+  # ensures the v2 sudo-escalate branch always runs.
+  if (( _v2_isolated == 0 )) \
+      && [[ "$(bridge_path_is_within_root "$workdir" "$BRIDGE_AGENT_HOME_ROOT")" == "1" ]]; then
     return 0
   fi
   claude_file="$(bridge_project_claude_file "$workdir")"
-  [[ -f "$claude_file" ]] || return 0
+  # Legacy non-isolated path keeps the simple [-f] probe. v2 isolation
+  # branches deeper below using a symlink-safe sudo Python helper, so the
+  # bash-level probe is intentionally absent for the v2 path — both the
+  # missing-file fall-through and the symlink-rejection fail-closed paths
+  # are encoded in the helper's exit codes.
+  if (( _v2_isolated == 0 )); then
+    [[ -f "$claude_file" ]] || return 0
+  fi
 
+  if (( _v2_isolated == 1 )); then
+    # v2 sudo-escalate path. Read → transform → write via a controller-side
+    # tmpfile pair; only the final install crosses the isolation boundary.
+    #
+    # Issue #1151 r3 (codex BLOCKING): the previous Step-1 used a
+    # ``test -f`` probe followed by ``bridge_linux_sudo_root cat`` redirect.
+    # Both follow symlinks. After Step A the workdir is owned by the
+    # isolated UID, so a cooperating agent can race the controller and
+    # swap ``$workdir/CLAUDE.md`` for a symlink to any path the controller
+    # sudoers entry permits ``cat`` on (typically root-readable). The sudo
+    # cat then reads the secret and the render writes the captured content
+    # into a fresh regular ``CLAUDE.md`` owned by the isolated UID — i.e.,
+    # the agent gains a copy of root-only material at predictable timing.
+    #
+    # The fix opens via ``os.O_RDONLY|O_NOFOLLOW`` and ``fstat`` /
+    # ``S_ISREG`` validates the same descriptor we then read — so there is
+    # no TOCTOU window. The helper signals four distinct conditions via
+    # exit codes (see lib/skills-helpers/claude-md-safe-read.py docstring):
+    #   0  → content streamed to $_src_tmp, proceed
+    #   10 → file does not exist → fresh-render path (empty $_src_tmp is
+    #        already on disk, falls through to the same Step-2 render)
+    #   11 → refused (symlink / permission / other open-time error)
+    #   12 → opened but not a regular file (dir / socket / FIFO / device)
+    # 11 + 12 are unsafe states; we warn + bail rather than escalate.
+    #
+    # The helper is invoked file-as-argv (not heredoc-stdin) to keep
+    # footgun #11 (Bash 5.3.9 ``read_comsub``/``heredoc_write`` deadlock)
+    # off the table even though ``bridge_linux_sudo_root`` does not shell
+    # through ``bash -c`` — this matches the project pattern in
+    # ``lib/upgrade-helpers/`` / ``lib/cron-helpers/`` / ``lib/daemon-helpers/``.
+    local _src_tmp=""
+    _src_tmp="$(mktemp)" || {
+      bridge_warn "project CLAUDE.md guidance: cannot mktemp src copy for '$agent'"
+      return 0
+    }
+    bridge_require_python
+    local _safe_read_helper="${BRIDGE_SCRIPT_DIR:-}/lib/skills-helpers/claude-md-safe-read.py"
+    if [[ ! -f "$_safe_read_helper" ]]; then
+      bridge_warn "project CLAUDE.md guidance: missing helper $_safe_read_helper"
+      rm -f "$_src_tmp"
+      return 0
+    fi
+    local _read_rc=0
+    bridge_linux_sudo_root python3 "$_safe_read_helper" "$claude_file" >"$_src_tmp" 2>/dev/null \
+      || _read_rc=$?
+    case "$_read_rc" in
+      0)
+        : ;;  # content captured, fall through to Step 2
+      10)
+        # File absent under v2. Mirror the legacy bash-level
+        # `[[ -f "$claude_file" ]] || return 0` short-circuit.
+        rm -f "$_src_tmp"
+        return 0
+        ;;
+      11|12)
+        bridge_warn "project CLAUDE.md guidance: refused read of $claude_file (rc=$_read_rc; symlink or non-regular file). Skipping; clean up workdir/CLAUDE.md and retry."
+        rm -f "$_src_tmp"
+        return 0
+        ;;
+      *)
+        bridge_warn "project CLAUDE.md guidance: sudo-read helper failed for $claude_file (rc=$_read_rc)"
+        rm -f "$_src_tmp"
+        return 0
+        ;;
+    esac
+    # Step 2: render the transformed content into a sibling tmp.
+    local _dst_tmp=""
+    _dst_tmp="$(mktemp)" || {
+      bridge_warn "project CLAUDE.md guidance: cannot mktemp dst render for '$agent'"
+      rm -f "$_src_tmp"
+      return 0
+    }
+    # Issue #1151 r3 (codex SHOULD-FIX): the previous form
+    # ``if ! python3 ...; then local _py_rc=$?`` captured the rc of ``!``
+    # (always 0), not Python's rc, so ``sys.exit(2)`` ("already current
+    # content, no-op") was silently misread as 0 and the controller
+    # proceeded to the install branch with an unwritten $_dst_tmp.
+    # Capture rc directly via ``|| _py_rc=$?``.
+    local _render_helper="${BRIDGE_SCRIPT_DIR:-}/lib/skills-helpers/claude-md-render.py"
+    if [[ ! -f "$_render_helper" ]]; then
+      bridge_warn "project CLAUDE.md guidance: missing helper $_render_helper"
+      rm -f "$_src_tmp" "$_dst_tmp"
+      return 0
+    fi
+    local _py_rc=0
+    python3 "$_render_helper" "$_src_tmp" "$_dst_tmp" "$BRIDGE_HOME" \
+      "$(bridge_project_claude_marker_start)" \
+      "$(bridge_project_claude_marker_end)" \
+      "$BRIDGE_MANAGED_MARKER" || _py_rc=$?
+    if (( _py_rc != 0 )); then
+      rm -f "$_src_tmp" "$_dst_tmp"
+      if (( _py_rc == 2 )); then
+        return 0  # already-current content → no install needed
+      fi
+      bridge_warn "project CLAUDE.md guidance: python render failed (rc=$_py_rc) for $claude_file"
+      return 0
+    fi
+    # Step 3: sudo-install with isolated UID ownership. `install -o $u -g $g`
+    # would require sudo to honor those flags; use the canonical
+    # `bridge_linux_sudo_root install` + `chown` pattern (mirrors the
+    # bridge-native isolated-home sync above).
+    local _stage_path="${claude_file}.bridge-stage.$$"
+    if ! bridge_linux_sudo_root install -m 0644 "$_dst_tmp" "$_stage_path" 2>/dev/null; then
+      bridge_warn "project CLAUDE.md guidance: sudo install (stage) failed for $claude_file"
+      rm -f "$_src_tmp" "$_dst_tmp"
+      bridge_linux_sudo_root rm -f "$_stage_path" 2>/dev/null || true
+      return 0
+    fi
+    bridge_linux_sudo_root chown "$_v2_os_user:$_v2_os_user" "$_stage_path" 2>/dev/null || true
+    if ! bridge_linux_sudo_root mv -f "$_stage_path" "$claude_file" 2>/dev/null; then
+      bridge_warn "project CLAUDE.md guidance: atomic mv failed for $claude_file"
+      bridge_linux_sudo_root rm -f "$_stage_path" 2>/dev/null || true
+    fi
+    rm -f "$_src_tmp" "$_dst_tmp"
+    return 0
+  fi
+
+  # Legacy non-isolated path (unchanged from pre-r1).
   bridge_require_python
   python3 - "$claude_file" "$BRIDGE_HOME" "$(bridge_project_claude_marker_start)" "$(bridge_project_claude_marker_end)" "$BRIDGE_MANAGED_MARKER" <<'PY'
 from pathlib import Path
