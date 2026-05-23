@@ -598,6 +598,10 @@ PY
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-bundle.sh" "$@"
       ;;
+    plugins)
+      shift
+      exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-plugins.sh" "$@"
+      ;;
     intake)
       shift
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-intake.sh" "$@"
@@ -975,7 +979,7 @@ EOF
   # sqlite3 fallback path. Reject with an intent-recovery suggestion
   # before the spawn parser sees it.
   if [[ -n "${1:-}" && "${1:0:1}" != "-" ]]; then
-    _top_valid="admin bootstrap init version upgrade daemon auth escalate upstream review user guard diagnose doctor knowledge config bundle intake list status kill attach urgent task profile setup agent cron memory audit usage watchdog discord migrate wiki isolate unisolate worktree inbox show claim done cancel update handoff summary create"
+    _top_valid="admin bootstrap init version upgrade daemon auth escalate upstream review user guard diagnose doctor knowledge config bundle plugins intake list status kill attach urgent task profile setup agent cron memory audit usage watchdog discord migrate wiki isolate unisolate worktree inbox show claim done cancel update handoff summary create"
     _hint="$(bridge_suggest_subcommand "$1" "$_top_valid")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 명령입니다: $1"
