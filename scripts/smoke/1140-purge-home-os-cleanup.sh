@@ -315,8 +315,27 @@ main() {
     test_step6_strict_slug_gate_refuses
   smoke_run "C8 Step 6 rm failure: structured WARN, helper returns 0" \
     test_step6_rm_failure_emits_warning_row
+  smoke_run "C9 Step 5 non-default home root: BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT respected" \
+    test_step5_non_default_home_root
 
   smoke_log "passed"
+}
+
+# ---------------------------------------------------------------------------
+# C9 (codex #5863 r2) — Step 5 must respect BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT.
+# Installs with a non-default isolated-user home root (e.g. /opt/iso-users)
+# create the OS home there; the reaper must rm from the SAME root.
+# ---------------------------------------------------------------------------
+test_step5_non_default_home_root() {
+  local home_root="$SMOKE_TMP_ROOT/opt/iso-users"
+  rm -rf "$home_root"
+  local out
+  out="$(run_helper_probe "os_home" "bob" "agent-bridge-bob" "present" "ok" "$home_root")"
+
+  smoke_assert_contains "$out" "RM_RF ${home_root}/agent-bridge-bob" \
+    "C9: OS home dir removed at the non-default home root"
+  smoke_assert_not_contains "$out" "WARN" \
+    "C9: no warning on successful rm at non-default root"
 }
 
 main "$@"

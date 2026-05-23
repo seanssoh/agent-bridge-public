@@ -2788,7 +2788,11 @@ bridge_isolation_v2_reap_isolated_agent_account() {
   # mirrors the #1121 r3 BLOCKING contract that no env var redirects
   # the rm).
   # ---------------------------------------------------------------------
-  _bridge_isolation_v2_reap_os_home_dir "$agent" "$os_user" "/home"
+  # r2 (codex #5863 BLOCKING): respect BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT
+  # (the same env var that bridge_agent_default_os_home / migration paths read
+  # — defaults to /home but installs can override). Hardcoding /home leaked
+  # the OS home dir for any non-default install.
+  _bridge_isolation_v2_reap_os_home_dir "$agent" "$os_user" "${BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT:-/home}"
 
   # ---------------------------------------------------------------------
   # Step 6 — reap the v2 per-agent workdir tree (#1140).
