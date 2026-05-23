@@ -1304,19 +1304,24 @@ def _isolated_workdir_owner(workdir: Path) -> str | None:
     # #1120 sub-A: the per-agent root (`<v2-root>/<agent>/`) is
     # `root:ab-agent-<slug> mode 2750` so the owner is root, not an
     # `agent-bridge-*` user. Recover the isolated UID name from the
-    # group when (a) the existing ancestor is NOT controller-owned and
-    # (b) its group name starts with `ab-agent-`. Mirrors the
-    # `agent-bridge-<slug>` ↔ `ab-agent-<slug>` mapping established by
-    # `bridge_isolation_v2_agent_group_name`.
+    # group by enumerating /etc/passwd for the user whose PRIMARY gid
+    # matches the ancestor's gid AND whose name starts with
+    # `agent-bridge-`. This is robust against the user/group name
+    # truncation mismatch that codex r1 (#5726 BLOCKING #2) flagged:
+    # `bridge_isolation_v2_agent_group_name` hash-truncates long group
+    # names while `bridge_agent_default_os_user` simple-truncates user
+    # names, so reconstructing the user by string-replacing
+    # `ab-agent-` → `agent-bridge-` is wrong for any agent name >19
+    # chars. The /etc/passwd lookup uses the GID as the authoritative
+    # linkage and avoids the truncation-strategy mismatch entirely.
     if stat_result.st_uid != os.getuid():
         try:
-            import grp
-            group_name = grp.getgrgid(stat_result.st_gid).gr_name
+            import pwd
+            for entry in pwd.getpwall():
+                if entry.pw_gid == stat_result.st_gid and entry.pw_name.startswith("agent-bridge-"):
+                    return entry.pw_name
         except (KeyError, ImportError):
-            group_name = ""
-        if group_name.startswith("ab-agent-"):
-            iso_user = "agent-bridge-" + group_name[len("ab-agent-"):]
-            return iso_user
+            pass
     return None
 
 

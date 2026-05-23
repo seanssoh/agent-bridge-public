@@ -124,9 +124,20 @@ printf '%s\n' '        return pwd.struct_passwd(("root", "x", uid, 0, "", "/root
 printf '%s\n' '    raise KeyError(uid)' >>"$T1_T2_HARNESS"
 printf '%s\n' 'def fake_getgrgid(gid):' >>"$T1_T2_HARNESS"
 printf '%s\n' '    if gid == ISO_GID:' >>"$T1_T2_HARNESS"
-printf '%s\n' '        return grp.struct_group(("ab-agent-" + AGENT_SLUG, "x", gid, []))' >>"$T1_T2_HARNESS"
+# r2 (codex #5726 BLOCKING #2): r1 used the group name to reconstruct the
+# isolated user via "ab-agent-<X>" → "agent-bridge-<X>" string replace, but
+# user/group truncation strategies diverge for long agent names. The fix
+# uses pwd.getpwall() lookup by primary gid instead. Stub a hash-truncated
+# group name AND a separately-truncated user name to exercise this gap.
+printf '%s\n' '        return grp.struct_group(("ab-agent-" + AGENT_SLUG[:7] + "-65c189b", "x", gid, []))' >>"$T1_T2_HARNESS"
 printf '%s\n' '    raise KeyError(gid)' >>"$T1_T2_HARNESS"
+printf '%s\n' 'def fake_getpwall():' >>"$T1_T2_HARNESS"
+printf '%s\n' '    return [' >>"$T1_T2_HARNESS"
+printf '%s\n' '        pwd.struct_passwd(("agent-bridge-" + AGENT_SLUG, "x", ISO_UID, ISO_GID, "", "/var/empty", "/usr/sbin/nologin")),' >>"$T1_T2_HARNESS"
+printf '%s\n' '        pwd.struct_passwd(("root", "x", 0, 0, "", "/root", "/bin/bash")),' >>"$T1_T2_HARNESS"
+printf '%s\n' '    ]' >>"$T1_T2_HARNESS"
 printf '%s\n' 'pwd.getpwuid = fake_getpwuid' >>"$T1_T2_HARNESS"
+printf '%s\n' 'pwd.getpwall = fake_getpwall' >>"$T1_T2_HARNESS"
 printf '%s\n' 'grp.getgrgid = fake_getgrgid' >>"$T1_T2_HARNESS"
 printf '%s\n' '# Stub lstat for arbitrary fixture paths: encode (uid, gid) in a file inside' >>"$T1_T2_HARNESS"
 printf '%s\n' '# the path tree. The harness creates real dirs but lstat returns a synthetic' >>"$T1_T2_HARNESS"
