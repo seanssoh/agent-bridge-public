@@ -607,7 +607,7 @@ bridge_cron_normalize_shell_run_artifacts() {
 }
 
 bridge_cron_run_dir_grant_isolation() {
-  # v2 isolation contract fix (two problems):
+  # v2 isolation contract fix (two problems), scoped to isolated targets only:
   #
   # 1. Directory access: umask 077 in bridge-lib.sh strips all group bits at
   #    mkdir time, leaving drwx--S--- (2700). The isolated agent UID (in
@@ -622,10 +622,25 @@ bridge_cron_run_dir_grant_isolation() {
   #    best-effort; hosts without it degrade gracefully (sidecar read may fall
   #    back to child-fallback, but dispatch is not blocked).
   #
+  # **Scope gate (codex r1):** apply ONLY when the target agent has effective
+  # linux-user isolation. Without the gate this helper would broaden every
+  # non-shell cron run dir on shared/macOS hosts from a private umask-077 dir
+  # to a group-writable dir — over-permissioning. Non-isolated targets keep
+  # the existing umask-077 mode.
+  #
   # Shell payloads skip this call and use bridge_cron_normalize_shell_run_artifacts
   # (chmod 0700) instead — controller writes are intentional there.
   local run_dir="$1"
+  local target_agent="$2"
   [[ -n "$run_dir" && -d "$run_dir" ]] || return 0
+  # No target → cannot prove isolation is in effect; no-op safely.
+  [[ -n "$target_agent" ]] || return 0
+  if ! declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! bridge_agent_linux_user_isolation_effective "$target_agent" 2>/dev/null; then
+    return 0
+  fi
   chmod 2770 "$run_dir" 2>/dev/null || return 1
   if command -v setfacl >/dev/null 2>&1; then
     setfacl -m "default:group::rw-,default:mask::rw-" "$run_dir" 2>/dev/null || true
