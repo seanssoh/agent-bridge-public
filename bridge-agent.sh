@@ -2824,7 +2824,17 @@ report and reap test-fixture agents per their pattern."
       # `bridge_agent_workdir` (and therefore the descriptor's target
       # lookup) depends on runs AFTER bridge_write_role_block below, so
       # the create flow hands the already-resolved workspace directly.
-      bridge_layout_materialize_identity "$agent" "$engine" "$workdir"
+      #
+      # Codex r1 BLOCKING 1: propagate the operator's --allow-shared-workdir
+      # intent into the materializer so a normal project workspace (no
+      # marker text) is NOT stamped over. The materializer's marker-based
+      # detection alone is insufficient for markerless shared projects.
+      if [[ "${allow_shared_workdir:-0}" == "1" ]]; then
+        BRIDGE_LAYOUT_WORKSPACE_SHARED=1 \
+          bridge_layout_materialize_identity "$agent" "$engine" "$workdir"
+      else
+        bridge_layout_materialize_identity "$agent" "$engine" "$workdir"
+      fi
     fi
     if [[ "$engine" == "claude" ]]; then
       bridge_ensure_project_claude_guidance "$workdir" >/dev/null 2>&1 || true

@@ -106,7 +106,22 @@ write_driver() {
     'bridge_layout_materialize_identity "$CODEX_ID" codex "$SHARED_WS"' \
     'WS_AFTER="$(cat "$SHARED_WS/CLAUDE.md")"' \
     'if [[ "$WS_BEFORE" == "$WS_AFTER" ]]; then echo "SHARED_WS_CLAUDE_UNTOUCHED: yes"; else echo "SHARED_WS_CLAUDE_UNTOUCHED: no"; fi' \
-    'if [[ -f "$SHARED_WS/SOUL.md" ]]; then echo "SHARED_WS_HAS_SOUL: yes"; else echo "SHARED_WS_HAS_SOUL: no"; fi'
+    'if [[ -f "$SHARED_WS/SOUL.md" ]]; then echo "SHARED_WS_HAS_SOUL: yes"; else echo "SHARED_WS_HAS_SOUL: no"; fi' \
+    '' \
+    '# T2 regression (codex r1 BLOCKING 1): markerless existing project file' \
+    '# MUST also be protected when the create flow propagates the shared' \
+    '# intent via BRIDGE_LAYOUT_WORKSPACE_SHARED=1 (the way bridge-agent.sh' \
+    '# does when --allow-shared-workdir is passed).' \
+    'MARKERLESS_WS="$BRIDGE_DATA_ROOT/markerless-project"' \
+    'mkdir -p "$MARKERLESS_WS"' \
+    '# A normal project CLAUDE.md — no shared-workdir marker text.' \
+    'printf "%s\n" "# normal project — does NOT name the agent" > "$MARKERLESS_WS/CLAUDE.md"' \
+    'BRIDGE_AGENT_WORKDIR["$ADMIN_ID"]="$MARKERLESS_WS"' \
+    'M_BEFORE="$(cat "$MARKERLESS_WS/CLAUDE.md")"' \
+    'BRIDGE_LAYOUT_WORKSPACE_SHARED=1 bridge_layout_materialize_identity "$ADMIN_ID" claude "$MARKERLESS_WS"' \
+    'M_AFTER="$(cat "$MARKERLESS_WS/CLAUDE.md")"' \
+    'if [[ "$M_BEFORE" == "$M_AFTER" ]]; then echo "MARKERLESS_WS_CLAUDE_UNTOUCHED: yes"; else echo "MARKERLESS_WS_CLAUDE_UNTOUCHED: no"; fi' \
+    'if [[ -f "$MARKERLESS_WS/SOUL.md" ]]; then echo "MARKERLESS_WS_HAS_SOUL: yes"; else echo "MARKERLESS_WS_HAS_SOUL: no"; fi'
   do
     printf '%s\n' "$line" >>"$out"
   done
@@ -192,6 +207,14 @@ fi
 smoke_assert_eq "yes" "$(extract_line "$OUT" "SHARED_WS_CLAUDE_UNTOUCHED")" \
   "T1: materialization left the shared workspace CLAUDE.md untouched (per-agent identity stays in agent_home)"
 smoke_assert_eq "no" "$(extract_line "$OUT" "SHARED_WS_HAS_SOUL")" \
+  "T1: shared workspace did NOT receive per-agent SOUL.md"
+# T2 regression — markerless shared project: bridge-agent.sh passes
+# BRIDGE_LAYOUT_WORKSPACE_SHARED=1 when --allow-shared-workdir is set, even
+# without marker text. The materializer must respect that and leave the
+# workspace untouched. Codex r1 BLOCKING 1.
+smoke_assert_eq "yes" "$(extract_line "$OUT" "MARKERLESS_WS_CLAUDE_UNTOUCHED")" \
+  "T2: markerless shared workspace + BRIDGE_LAYOUT_WORKSPACE_SHARED=1 — CLAUDE.md NOT overwritten"
+smoke_assert_eq "no" "$(extract_line "$OUT" "MARKERLESS_WS_HAS_SOUL")" \
   "T1: materialization did not write a per-agent SOUL.md into the shared workspace"
 
 smoke_log "all tests PASS — issue #1060 D5 smoke 3: shared-workdir pair isolation verified"

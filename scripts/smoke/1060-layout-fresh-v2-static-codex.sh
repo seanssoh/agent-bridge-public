@@ -92,17 +92,19 @@ write_driver() {
     'if bridge_engine_wants_claude_compat_copy claude; then echo "CLAUDE_COMPAT_COPY: yes"; else echo "CLAUDE_COMPAT_COPY: no"; fi' \
     'echo "CODEX_HOOK_CONFIG: $(bridge_engine_hook_config_path "$AGENT_ID" codex 2>/dev/null || echo UNRESOLVED)"' \
     'echo "CODEX_HOOK_RENDERER: $(bridge_engine_hook_renderer_profile codex)"' \
-    '# Author a minimal identity source by hand (CODEX-PROV owns the' \
-    '# real Codex template render). The LAYOUT contract under test is' \
-    '# that materialization delivers whatever the identity source holds' \
-    '# into the descriptor-resolved target — not a shared project file.' \
+    '# Author a template-shaped identity source (template has CLAUDE.md +' \
+    '# common identity files; AGENTS.md is rendered by CODEX-PROV in a' \
+    '# follow-up batch, not by LAYOUT). The LAYOUT contract under test:' \
+    '# materialization delivers the common identity AND the CLAUDE.md' \
+    '# compat copy (per the descriptor) into the Codex workspace.' \
     'mkdir -p "$IDENTITY_HOME"' \
-    'printf "%s\n" "# probe-codex agent" > "$IDENTITY_HOME/AGENTS.md"' \
+    'printf "%s\n" "# probe-codex agent (claude-compat copy)" > "$IDENTITY_HOME/CLAUDE.md"' \
     'printf "%s\n" "# soul" > "$IDENTITY_HOME/SOUL.md"' \
     'MAT_TARGET="$(bridge_engine_materialization_target "$AGENT_ID" codex 2>/dev/null || echo UNRESOLVED)"' \
     'echo "CODEX_MATERIALIZATION_TARGET: $MAT_TARGET"' \
     'bridge_layout_materialize_identity "$AGENT_ID" codex "$WORKSPACE_DIR"' \
     'if [[ -f "$WORKSPACE_DIR/AGENTS.md" ]]; then echo "WORKSPACE_AGENTS_MD: present"; else echo "WORKSPACE_AGENTS_MD: missing"; fi' \
+    'if [[ -f "$WORKSPACE_DIR/CLAUDE.md" ]]; then echo "WORKSPACE_CLAUDE_MD: present"; else echo "WORKSPACE_CLAUDE_MD: missing"; fi' \
     'if [[ -f "$WORKSPACE_DIR/SOUL.md" ]]; then echo "WORKSPACE_SOUL_MD: present"; else echo "WORKSPACE_SOUL_MD: missing"; fi'
   do
     printf '%s\n' "$line" >>"$out"
@@ -177,8 +179,18 @@ smoke_assert_eq "codex" "$(extract_line "$OUT" "CODEX_HOOK_RENDERER")" \
 # Materialization: target is the workspace, and the identity is delivered there.
 smoke_assert_eq "$WORKSPACE_DIR" "$(extract_line "$OUT" "CODEX_MATERIALIZATION_TARGET")" \
   "T1: descriptor resolves the Codex materialization target to the workspace dir"
-smoke_assert_eq "present" "$(extract_line "$OUT" "WORKSPACE_AGENTS_MD")" \
-  "T1: materialization delivered the Codex AGENTS.md into the descriptor-resolved target"
+# AGENTS.md is CODEX-PROV's responsibility (Batch 2), not LAYOUT's. At this
+# beta6 Batch 1 point the template has no AGENTS.md → workspace AGENTS.md is
+# expected missing. The smoke captures the assertion for traceability; it
+# will flip to "present" once CODEX-PROV ships.
+smoke_assert_eq "missing" "$(extract_line "$OUT" "WORKSPACE_AGENTS_MD")" \
+  "T1: AGENTS.md not yet rendered at LAYOUT level — CODEX-PROV (Batch 2) owns native Codex entrypoint"
+# Codex r1 BLOCKING 2: descriptor flags Codex as wants_claude_compat_copy →
+# materialization must deliver CLAUDE.md to the workspace as a Claude-shaped
+# compat copy. This is what LAYOUT delivers today; CODEX-PROV stacks AGENTS.md
+# on top in Batch 2.
+smoke_assert_eq "present" "$(extract_line "$OUT" "WORKSPACE_CLAUDE_MD")" \
+  "T1: materialization delivered the CLAUDE.md compat copy into the Codex workspace (descriptor wants_claude_compat_copy)"
 smoke_assert_eq "present" "$(extract_line "$OUT" "WORKSPACE_SOUL_MD")" \
   "T1: materialization delivered the authored SOUL.md into the descriptor-resolved target"
 

@@ -205,8 +205,18 @@ bridge_layout_materialize_identity() {
   mkdir -p "$target_dir" 2>/dev/null || return 0
 
   local engine_entry=""
+  local wants_claude_compat=0
   if declare -F bridge_engine_entrypoint_filename >/dev/null 2>&1; then
     engine_entry="$(bridge_engine_entrypoint_filename "$engine" 2>/dev/null || printf '')"
+  fi
+  if declare -F bridge_engine_wants_claude_compat_copy >/dev/null 2>&1; then
+    # Codex r1 BLOCKING 2: honor the descriptor's claude-compat declaration.
+    # Codex's native entrypoint is AGENTS.md, but Claude-shaped readers
+    # (hooks, current runtime) still look for CLAUDE.md — so when the
+    # descriptor says the engine wants a CLAUDE.md compat copy, materialize
+    # BOTH AGENTS.md and CLAUDE.md into the workspace read target.
+    bridge_engine_wants_claude_compat_copy "$engine" 2>/dev/null \
+      && wants_claude_compat=1
   fi
 
   local name
@@ -224,6 +234,13 @@ bridge_layout_materialize_identity() {
     mkdir -p "$(dirname "$target_dir/$name")" 2>/dev/null || continue
     cp -f "$source_dir/$name" "$target_dir/$name" 2>/dev/null || true
   done
+  if [[ "$wants_claude_compat" == "1" && "$engine_entry" != "CLAUDE.md" ]]; then
+    # Engine wants the CLAUDE.md compat copy alongside its native entrypoint
+    # (e.g. Codex with AGENTS.md as native + CLAUDE.md as compat).
+    if [[ -f "$source_dir/CLAUDE.md" ]]; then
+      cp -f "$source_dir/CLAUDE.md" "$target_dir/CLAUDE.md" 2>/dev/null || true
+    fi
+  fi
 
   # Per-user partition tree — `users/<id>/USER.md` etc. Delivered as a
   # whole subtree so the workspace read target carries the same per-user
