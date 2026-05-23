@@ -326,7 +326,22 @@ bridge_isolation_v2_reapply_one_agent() {
     return 1
   fi
 
-  local agent_root="$BRIDGE_AGENT_HOME_ROOT/$agent"
+  # Issue #1077: this tool repairs a v2 isolated agent — its on-disk
+  # layout lives under `$BRIDGE_AGENT_ROOT_V2/<agent>/` (e.g.
+  # `$BRIDGE_DATA_ROOT/agents/<agent>/`), NOT under the legacy
+  # `$BRIDGE_AGENT_HOME_ROOT/<agent>/` (which on a v2 install is the
+  # tracked profile-template tree). Using the legacy path makes every
+  # per-agent grant-matrix row land on a non-existent (or wrong) directory
+  # and emit `skipped:no-such-directory`, so the tool repairs nothing.
+  # Route through the v2 typed resolver so the matrix repair stays in
+  # lockstep with the rest of the isolation-v2 stack (PR #1081 LAYOUT).
+  local agent_root
+  agent_root="$(bridge_isolation_v2_agent_root "$agent" 2>/dev/null || true)"
+  if [[ -z "$agent_root" ]]; then
+    printf '%s\n' "agent_root: bridge_isolation_v2_agent_root returned empty for agent '$agent' (BRIDGE_AGENT_ROOT_V2 unset — v2 layout not active?)" \
+      >> "$errors_file"
+    return 1
+  fi
 
   # ------------------------------------------------------------------
   # Layout target table
