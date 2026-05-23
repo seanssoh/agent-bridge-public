@@ -4108,8 +4108,18 @@ bridge_ensure_claude_first_run_config() {
   fi
 
   if (( _seed_isolated == 1 )); then
-    bridge_linux_sudo_root sudo -n -u "$_iso_user" \
-      python3 "$helper" "$config_dir" "$workdir" >/dev/null 2>&1 || return 0
+    # Codex r3 BLOCKING fix: the project's sudoers contract whitelists
+    # operator → isolated user for `tmux` + `bash` ONLY (see
+    # `lib/bridge-migration.sh:773-783` + `bridge-agent.sh:492-499`).
+    # Direct `sudo -u <iso> python3 ...` is NOT covered; existing
+    # isolated-user helpers (`lib/bridge-isolation-helpers.sh:104-112`)
+    # wrap the inner command in `bash -c '...'` so the whitelist matches.
+    # Also call `sudo` directly (no `bridge_linux_sudo_root` wrap) so we
+    # don't end up with `sudo -n sudo -n -u <iso> ...` (double sudo).
+    local _bash_bin="${BRIDGE_BASH_BIN:-bash}"
+    sudo -n -u "$_iso_user" "$_bash_bin" -c \
+      'exec python3 "$1" "$2" "$3"' -- "$helper" "$config_dir" "$workdir" \
+      >/dev/null 2>&1 || return 0
   else
     python3 "$helper" "$config_dir" "$workdir" >/dev/null 2>&1 || return 0
   fi
