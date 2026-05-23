@@ -668,11 +668,12 @@ A2A_HELP
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-status.sh" "$@"
       ;;
     kill)
-      # Issue #1114: short-circuit -h/--help/help before the arity
-      # check so `agb kill --help` prints usage instead of being
-      # interpreted as a target name.
+      # Issue #1114 (codex r1 follow-up): short-circuit -h/--help
+      # before the arity check so `agb kill --help` prints usage
+      # instead of being interpreted as a target name. Restricted to
+      # the dashed forms — bare `help` could be a legitimate agent id.
       case "${2:-}" in
-        -h|--help|help)
+        -h|--help)
           echo "Usage: $CLI_NAME kill <number|name|all>"
           exit 0
           ;;
@@ -696,11 +697,12 @@ A2A_HELP
       exit 0
       ;;
     attach)
-      # Issue #1114: short-circuit -h/--help/help before the arity
-      # check so `agb attach --help` prints usage instead of being
-      # treated as the attach target.
+      # Issue #1114 (codex r1 follow-up): short-circuit -h/--help
+      # before the arity check so `agb attach --help` prints usage
+      # instead of being treated as the attach target. Restricted to
+      # the dashed forms — bare `help` could be a legitimate agent id.
       case "${2:-}" in
-        -h|--help|help)
+        -h|--help)
           echo "Usage: $CLI_NAME attach [number|name]"
           exit 0
           ;;
@@ -739,12 +741,15 @@ A2A_HELP
       ;;
     urgent)
       shift
-      # Issue #1114: forwarding -h/--help/help to bridge-send.sh used
-      # to die with "알 수 없는 옵션: --help" because bridge-send.sh's
-      # `-*)` arm rejected unknown options before reaching any usage
-      # path. Print usage directly here for the agent-bridge surface.
+      # Issue #1114 (codex r1 follow-up): forwarding -h/--help to
+      # bridge-send.sh used to die with "알 수 없는 옵션: --help"
+      # because bridge-send.sh's `-*)` arm rejected unknown options
+      # before reaching any usage path. Print usage directly here for
+      # the agent-bridge surface. Restricted to the dashed forms —
+      # bare `help` could be a legitimate agent id positional in
+      # `agb urgent <agent> ...`.
       case "${1:-}" in
-        -h|--help|help)
+        -h|--help)
           cat <<URGENT_HELP
 Usage: $CLI_NAME urgent <agent> "<message>" [--wait <seconds>]
        $CLI_NAME urgent --list

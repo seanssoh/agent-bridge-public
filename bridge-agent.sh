@@ -4966,11 +4966,12 @@ PY
 
 run_start() {
   local agent="${1:-}"
-  # Issue #1114: -h/--help/help in the agent slot prints usage instead
-  # of being passed to bridge_require_agent (which dies with a roster
-  # mismatch message).
+  # Issue #1114 (codex r1 follow-up): -h/--help in the agent slot
+  # prints usage instead of being passed to bridge_require_agent
+  # (which dies with a roster mismatch). Restricted to the dashed
+  # forms — bare `help` could be a legitimate agent id.
   case "$agent" in
-    -h|--help|help)
+    -h|--help)
       cat <<'AGENT_START_HELP'
 Usage: agent-bridge agent start <agent> [bridge-start.sh forwards...]
 
@@ -4998,11 +4999,12 @@ run_stop() {
   local agent="${1:-}"
   local session=""
 
-  # Issue #1114: -h/--help/help in the agent slot prints usage instead
-  # of being passed to bridge_require_agent (which dies with a roster
-  # mismatch message).
+  # Issue #1114 (codex r1 follow-up): -h/--help in the agent slot
+  # prints usage instead of being passed to bridge_require_agent
+  # (which dies with a roster mismatch). Restricted to the dashed
+  # forms — bare `help` could be a legitimate agent id.
   case "$agent" in
-    -h|--help|help)
+    -h|--help)
       cat <<'AGENT_STOP_HELP'
 Usage: agent-bridge agent stop <agent>
 

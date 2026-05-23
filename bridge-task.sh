@@ -843,12 +843,13 @@ cmd_summary() {
   local args=(summary)
   local agent
 
-  # Issue #1114: -h/--help/help in the agent argv was passed to
-  # bridge_require_agent which then dumped the roster and died. Print
-  # usage and exit 0 before the loop runs.
+  # Issue #1114 (codex r1 follow-up): -h/--help in the agent argv was
+  # passed to bridge_require_agent which then dumped the roster and
+  # died. Print usage and exit 0 before the loop runs. Restricted to
+  # the dashed forms — bare `help` could be a legitimate agent id.
   for agent in "$@"; do
     case "$agent" in
-      -h|--help|help)
+      -h|--help)
         cat <<'TASK_SUMMARY_HELP'
 Usage: agent-bridge task summary [agent...]
 
