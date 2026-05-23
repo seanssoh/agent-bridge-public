@@ -607,10 +607,57 @@ bridge_cron_normalize_shell_run_artifacts() {
 }
 
 bridge_cron_run_dir_grant_isolation() {
-  # v2 hard-cut: the per-agent group + setgid contract on the per-agent
-  # root covers cron per-run dirs reachable by the isolated UID. No
-  # per-run-dir named-user ACL grant is applied. Retained as a no-op
-  # stub so callers (`dispatch_cron_run`) link cleanly.
+  # v2 isolation contract fix (two problems), scoped to isolated targets only:
+  #
+  # 1. Directory access: umask 077 in bridge-lib.sh strips all group bits at
+  #    mkdir time, leaving drwx--S--- (2700). The isolated agent UID (in
+  #    ab-shared via parent setgid) has zero access. chmod 2770 restores
+  #    drwxrws--- so the isolated UID can traverse and write.
+  #
+  # 2. File readability: files written by the isolated agent inside the dir
+  #    also inherit umask 077, landing at 0600 (owner-only). The controller
+  #    (ec2-user, in ab-shared) cannot read the sidecar. We set a default ACL
+  #    (default:group::rw-) so new files inherit group read/write from the ACL
+  #    entry, overriding the umask for the group column. setfacl is
+  #    best-effort; hosts without it degrade gracefully (sidecar read may fall
+  #    back to child-fallback, but dispatch is not blocked).
+  #
+  # **Scope gate (codex r1):** apply ONLY when the target agent has effective
+  # linux-user isolation. Without the gate this helper would broaden every
+  # non-shell cron run dir on shared/macOS hosts from a private umask-077 dir
+  # to a group-writable dir — over-permissioning. Non-isolated targets keep
+  # the existing umask-077 mode.
+  #
+  # Shell payloads skip this call and use bridge_cron_normalize_shell_run_artifacts
+  # (chmod 0700) instead — controller writes are intentional there.
+  local run_dir="$1"
+  local target_agent="$2"
+  [[ -n "$run_dir" && -d "$run_dir" ]] || return 0
+  # No target → cannot prove isolation is in effect; no-op safely.
+  [[ -n "$target_agent" ]] || return 0
+  if ! declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then
+    return 0
+  fi
+  if ! bridge_agent_linux_user_isolation_effective "$target_agent" 2>/dev/null; then
+    return 0
+  fi
+  # Bind the leaf to the target's per-agent group (e.g. ab-agent-<X>) before
+  # chmod 2770. Without this chgrp the leaf inherits the controller primary
+  # group (umask 077 + non-setgid parent), which the isolated UID is not in;
+  # group=2770 would then be useless. The chgrp confines access to
+  # controller + the target's isolated UID — and only them. ab-shared on the
+  # parents lets isolated UIDs TRAVERSE but not read other agents' run dirs.
+  if declare -F bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+    local agent_grp
+    agent_grp="$(bridge_isolation_v2_agent_group_name "$target_agent" 2>/dev/null)" || agent_grp=""
+    if [[ -n "$agent_grp" ]]; then
+      chgrp "$agent_grp" "$run_dir" 2>/dev/null || return 1
+    fi
+  fi
+  chmod 2770 "$run_dir" 2>/dev/null || return 1
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m "default:group::rw-,default:mask::rw-" "$run_dir" 2>/dev/null || true
+  fi
   return 0
 }
 

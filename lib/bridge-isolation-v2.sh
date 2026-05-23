@@ -1425,6 +1425,13 @@ bridge_isolation_v2_matrix_rows_for_agent() {
   local state_root="${BRIDGE_HOME:-}/state"
   local state_agents_root="${state_root}/agents"
   local state_agent_dir="${state_agents_root}/$agent"
+  # state/cron/{,runs} are dispatch-shared parents that the isolated agent
+  # UID must be able to TRAVERSE into in order to reach the per-run leaf
+  # (the leaf itself is grant_isolation'd to 2770 in lib/bridge-cron.sh).
+  # See bridge-lib.sh:225 (BRIDGE_CRON_STATE_DIR) + lib/bridge-cron.sh:202
+  # (run dir layout).
+  local state_cron_root="${BRIDGE_CRON_STATE_DIR:-${state_root}/cron}"
+  local state_cron_runs_root="${state_cron_root}/runs"
   local shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
   local ctrl_grp="${BRIDGE_CONTROLLER_GROUP:-ab-controller}"
   local iso_user="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}${agent}"
@@ -1541,6 +1548,15 @@ bridge_isolation_v2_matrix_rows_for_agent() {
       "$state_root" "$shared_grp"
     printf 'state-agents-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|isolated UID needs --x to reach its own leaf\n' \
       "$state_agents_root" "$shared_grp"
+    # state/cron/{,runs} get traverse-only via ab-shared so cron dispatch
+    # writes (controller side) + the isolated UID's reads of its own
+    # per-run leaf both work. The leaf itself is granted 2770 + default
+    # ACL in lib/bridge-cron.sh::bridge_cron_run_dir_grant_isolation —
+    # this row only opens the traversal path.
+    printf 'state-cron-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|isolated UID needs --x to reach state/cron/runs/<run_id>\n' \
+      "$state_cron_root" "$shared_grp"
+    printf 'state-cron-runs-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|isolated UID needs --x to reach its own per-run leaf\n' \
+      "$state_cron_runs_root" "$shared_grp"
     if [[ "$_v2_isolation_mode" == "shared" ]]; then
       # #909: state-agent-dir under shared mode is operator-owned; the
       # `ab-agent-<X>` group does not exist. write_agent_state_marker
