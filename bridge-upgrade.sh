@@ -1619,6 +1619,74 @@ except Exception:
   # state and BRIDGE_LAYOUT would stay empty, which downstream v2
   # helpers treat as legacy.
   unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID
+
+  # Issue #1113: v0.14.5-beta6 anchored bridge-watchdog.py's scan on the
+  # v2 runtime workspace (`$BRIDGE_DATA_ROOT/agents/<a>/workdir/`), but
+  # for two upgrade vintages that workspace is missing the canonical
+  # identity markers:
+  #   1. agents scaffolded BEFORE #1108 landed — identity files live
+  #      only under the tracked profile tree `$BRIDGE_HOME/agents/<a>/`;
+  #   2. agents migrated via the marker-only v2 fast-path (PR #897
+  #      Track A, v0.13.10) — marker-only-no-isolated-roster writes the
+  #      v2 layout marker but does NOT replay the legacy → v2 mirror.
+  # The post-beta6 watchdog scans the workspace, sees no CLAUDE.md /
+  # SOUL.md / SESSION-TYPE.md / MEMORY-SCHEMA.md / MEMORY.md, and
+  # reports `status: error` on every legacy agent every cron tick.
+  #
+  # Back-fill the identity markers from the tracked profile tree into
+  # the workspace once, at upgrade time. Idempotent (existence-checks),
+  # never overwrites operator edits, never invents files when the
+  # tracked tree is empty. Runs after the v2 migrate step so the
+  # markerless-existing-install fast-path has already written the
+  # layout marker — the back-fill resolver's `bridge_layout_workspace_dir`
+  # call depends on the marker being valid to return the v2 workspace
+  # path. Skipped on dry-run for symmetry with the migrate step.
+  #
+  # Failure mode: non-fatal. The helper logs a `bridge_warn` line per
+  # failed marker and continues to the next; the back-fill JSON
+  # summary is captured for the upgrade audit trail. apply-live
+  # proceeds regardless — the watchdog will surface any residual
+  # `missing_files` row on the next tick, which is the same fallback
+  # behavior the operator's manual `cp` workaround was already
+  # producing on every upgrade prior to this step.
+  #
+  # Footgun #11: the helper body lives at
+  # lib/upgrade-helpers/isolation-v2-workdir-backfill.sh and is invoked
+  # with the file as argv (no heredoc-stdin anywhere on this path).
+  WORKDIR_BACKFILL_JSON='{"mode":"isolation-v2-workdir-backfill","status":"skipped","reason":"helper-not-invoked"}'
+  set +e
+  _wd_backfill_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-wdbf.XXXXXX")"
+  # Stderr destination resolution. Preferred destination is the target
+  # install's logs/ tree so an operator debugging a back-fill warning
+  # can grep the right tree. The parent shell's `BRIDGE_LOG_DIR` is NOT
+  # initialized at this point in the upgrade flow (bridge_load_roster —
+  # which seeds it — runs in the `bridge_upgrade_with_target_env`
+  # child, not the parent), so resolve the path explicitly against
+  # `$TARGET_ROOT/logs`.
+  #
+  # Resilience contract (codex r2 finding): if the target logs/ dir
+  # cannot be created/opened (e.g. parent is read-only, disk full, NFS
+  # mount stale), the redirect `2>>"$file"` would itself fail BEFORE
+  # the bash invocation runs — leaving WORKDIR_BACKFILL_JSON at the
+  # skipped-default. Probe writability first via an explicit append
+  # attempt; on failure fall back to `/dev/null` so the helper still
+  # runs and the JSON envelope still records the actual outcome. The
+  # back-fill itself stays non-fatal, but the upgrade must not become
+  # "silently degraded" because a log file's parent is unwritable.
+  _wd_backfill_stderr="$TARGET_ROOT/logs/upgrade-workdir-backfill.stderr"
+  mkdir -p "$TARGET_ROOT/logs" 2>/dev/null
+  if ! { : >>"$_wd_backfill_stderr"; } 2>/dev/null; then
+    _wd_backfill_stderr="/dev/null"
+  fi
+  bridge_upgrade_with_target_env "$TARGET_ROOT" \
+    "$BRIDGE_BASH_BIN" \
+    "$SOURCE_ROOT/lib/upgrade-helpers/isolation-v2-workdir-backfill.sh" \
+    "$SOURCE_ROOT" "$TARGET_ROOT" >"$_wd_backfill_tmp" 2>>"$_wd_backfill_stderr" || true
+  if [[ -s "$_wd_backfill_tmp" ]]; then
+    WORKDIR_BACKFILL_JSON="$(<"$_wd_backfill_tmp")"
+  fi
+  rm -f -- "$_wd_backfill_tmp"
+  set -e
 fi
 
 apply_args=(apply-live --source-root "$SOURCE_ROOT" --target-root "$TARGET_ROOT" --run-id "$UPGRADE_RUN_ID")
@@ -2496,6 +2564,12 @@ if [[ $JSON -eq 1 ]]; then
   # placeholder on dry-run. Always-present so JSON consumers can branch on
   # the field's contents instead of having to handle missing-key vs value.
   printf '%s' "${ISOLATION_V2_MIGRATION_JSON:-}" >"$_json_payload_dir/isolation-v2-migration.json"
+  # Issue #1113: surface the workdir-identity back-fill payload in --json
+  # output so operators / monitoring can read `agents_with_writes` and
+  # `markers_copied` programmatically. Empty string when the back-fill
+  # never ran (dry-run paths) — load_optional_json then yields null and
+  # the consumer branches accordingly.
+  printf '%s' "${WORKDIR_BACKFILL_JSON:-}" >"$_json_payload_dir/workdir-backfill.json"
   # Issue #752 W3d: emit dedup'd partial-failure subsystem names as a
   # JSON array file so the python envelope below can branch
   # `status:"partial"` + `partial_failures:[...]`. Empty array on the
@@ -2508,9 +2582,9 @@ if [[ $JSON -eq 1 ]]; then
     printf '[]' >"$_json_payload_dir/partial-failures.json"
   fi
   set +e
-  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" "$_json_payload_dir/isolation-v2-migration.json" "$_json_payload_dir/partial-failures.json" <<'PY'
+  python3 - "$SOURCE_ROOT" "$TARGET_ROOT" "$PULL" "$DRY_RUN" "$RESTART_DAEMON" "$RESTART_AGENTS" "$BACKUP" "$MIGRATE_AGENTS" "$BACKUP_ROOT" "$STRICT_MERGE" "$CHANNEL" "$SOURCE_VERSION" "$SOURCE_REF" "$SOURCE_HEAD" "$TARGET_REF" "$TARGET_VERSION" "$TARGET_HEAD" "$_json_payload_dir/backup.json" "$_json_payload_dir/migration.json" "$_json_payload_dir/apply.json" "$_json_payload_dir/analysis.json" "$_json_payload_dir/agent-restart.json" "$_json_payload_dir/channel-guard.json" "$_json_payload_dir/source-reclassify.json" "$_json_payload_dir/shared-settings-rerender.json" "$_json_payload_dir/cleanup.json" "$_json_payload_dir/isolation-v2-migration.json" "$_json_payload_dir/workdir-backfill.json" "$_json_payload_dir/partial-failures.json" <<'PY'
 import json, sys
-source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file, isolation_v2_migration_json_file, partial_failures_json_file = sys.argv[1:]
+source_root, target_root, pull, dry_run, restart_daemon, restart_agents, backup_enabled, migrate_agents, backup_root, strict_merge, channel, source_version, source_ref, source_head, target_ref, target_version, target_head, backup_json_file, migration_json_file, apply_json_file, analysis_json_file, agent_restart_json_file, channel_guard_json_file, source_reclassify_json_file, shared_settings_rerender_json_file, cleanup_json_file, isolation_v2_migration_json_file, workdir_backfill_json_file, partial_failures_json_file = sys.argv[1:]
 
 def load_json(path):
     with open(path, encoding="utf-8") as fh:
@@ -2544,6 +2618,12 @@ cleanup_payload = load_optional_json(cleanup_json_file)
 # null when the variable was empty (defensive — current code paths always
 # set ISOLATION_V2_MIGRATION_JSON before reaching the JSON envelope).
 isolation_v2_migration_payload = load_optional_json(isolation_v2_migration_json_file)
+# Issue #1113: post-marker back-fill of canonical identity markers from
+# the tracked profile tree into the v2 runtime workspace for legacy /
+# marker-only-migrated agents. Null when the back-fill step did not run
+# (dry-run, helper not invoked). Populated as `agents_with_writes`,
+# `markers_copied` so JSON consumers can audit the post-upgrade state.
+workdir_backfill_payload = load_optional_json(workdir_backfill_json_file)
 # Issue #752 W3d: late-stage subsystems (shared rerender / channel-policy
 # refresh / profile relink) append their stable name to this list when
 # their post-step probe reports failures. `status:"partial"` surfaces the
@@ -2592,6 +2672,7 @@ payload = {
     "agent_restart": agent_restart_payload,
     "agent_migration": migration_payload,
     "isolation_v2_migration": isolation_v2_migration_payload,
+    "workdir_backfill": workdir_backfill_payload,
     "source_reclassify": source_reclassify_payload,
     "shared_settings_rerender": shared_settings_rerender_payload,
     "cleanup": cleanup_payload,
