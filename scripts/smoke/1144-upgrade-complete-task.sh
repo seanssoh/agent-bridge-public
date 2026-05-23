@@ -71,7 +71,13 @@ extract_block() {
 
 HELPER_VERSION_FROM_FILE="$(extract_block '^bridge_upgrade_version_from_file()' '^}$')"
 HELPER_INSTALLED_FIELD="$(extract_block '^bridge_upgrade_installed_field()' '^}$')"
-CAPTURE_BLOCK="$(extract_block '^# Issue #1144: capture the pre-apply VERSION' '^fi$')"
+# r2 (issue #1144 follow-up): the capture block now lives inside the
+# `if [[ "$SUBCOMMAND" == "apply" ]]; then` outer block (indented two
+# spaces) and BEFORE the `git checkout TARGET_REF` step. The start marker
+# is the literal first comment line; the end marker is a sentinel comment
+# we added so the inner indented `fi` keywords don't collide with the
+# outer apply block's terminator.
+CAPTURE_BLOCK="$(extract_block '^[[:space:]]*# Issue #1144: capture the pre-apply VERSION' '^[[:space:]]*# END: Issue #1144 INSTALLED_VERSION capture block')"
 
 if [[ -z "$HELPER_VERSION_FROM_FILE" ]]; then
   printf 'FAIL (bootstrap): could not extract bridge_upgrade_version_from_file\n' >&2
@@ -242,6 +248,84 @@ else
   err "persist file missing rendered from_version line; contents:"
   sed 's/^/    /' "$_post_body_persist" >&2
 fi
+
+# ---------------------------------------------------------------------------
+# T5 — SOURCE_ROOT == TARGET_ROOT ordering (issue #1144 r2 regression).
+# ---------------------------------------------------------------------------
+# On a git-clone install (UPGRADING.md §97-105) the live install IS the
+# source checkout: SOURCE_ROOT == TARGET_ROOT. In that layout, the
+# `git -C "$SOURCE_ROOT" checkout -q "$TARGET_REF"` step at
+# bridge-upgrade.sh:~1375 rewrites TARGET_ROOT/VERSION in place — so any
+# INSTALLED_VERSION capture that runs AFTER the checkout reads the NEW
+# (target) version, not the previously-installed one.
+#
+# T5 simulates the apply path's ordering directly:
+#   1. Fixture: TARGET_ROOT/VERSION = 0.14.5-beta7 (the pre-upgrade install).
+#   2. Run the capture block FIRST (mirroring the r2 placement).
+#   3. Mutate TARGET_ROOT/VERSION = 0.14.5-beta8 (simulating the
+#      `git checkout TARGET_REF` step that follows in the apply path).
+#   4. Assert INSTALLED_VERSION == 0.14.5-beta7 (pre-checkout value).
+#
+# Then a negative control: re-run the capture block AFTER the simulated
+# checkout from a clean state — INSTALLED_VERSION would be 0.14.5-beta8.
+# This demonstrates that placement (not the capture helpers themselves)
+# determines the outcome — exactly the codex r1 BLOCKING finding.
+printf '== T5 — SOURCE_ROOT == TARGET_ROOT ordering ==\n'
+
+T5_ROOT="$TMP/t5-source-equals-target"
+mkdir -p "$T5_ROOT"
+printf '%s\n' '0.14.5-beta7' >"$T5_ROOT/VERSION"
+
+# In a same-root install, SOURCE_ROOT and TARGET_ROOT are the same path.
+# The capture block in bridge-upgrade.sh only references TARGET_ROOT, so
+# we drive it with TARGET_ROOT only; the implicit equivalence with
+# SOURCE_ROOT is the precondition we are modelling.
+TARGET_ROOT="$T5_ROOT"
+unset INSTALLED_VERSION 2>/dev/null || true
+
+# Step 1: capture BEFORE the simulated checkout — this is the r2
+# placement under test.
+eval "$CAPTURE_BLOCK"
+_t5_pre_checkout="${INSTALLED_VERSION:-}"
+
+# Step 2: simulate `git -C "$SOURCE_ROOT" checkout -q "$TARGET_REF"`
+# rewriting TARGET_ROOT/VERSION in place (same-root install).
+printf '%s\n' '0.14.5-beta8' >"$T5_ROOT/VERSION"
+
+step "T5 INSTALLED_VERSION captured BEFORE checkout == pre-upgrade version"
+if [[ "$_t5_pre_checkout" == "0.14.5-beta7" ]]; then
+  ok
+else
+  err "expected INSTALLED_VERSION=0.14.5-beta7 (pre-checkout), got '$_t5_pre_checkout'"
+fi
+
+step "T5 INSTALLED_VERSION is NOT the post-checkout value"
+if [[ "$_t5_pre_checkout" != "0.14.5-beta8" ]]; then
+  ok
+else
+  err "INSTALLED_VERSION leaked the post-checkout VERSION ('0.14.5-beta8') — placement is wrong"
+fi
+
+# Negative control: confirm the helpers themselves are not magic. If the
+# capture were placed AFTER the checkout (the pre-r2 buggy ordering), the
+# block would read the mutated VERSION file and INSTALLED_VERSION would
+# be the target release. This proves the ordering is what matters.
+step "T5 (control) capture AFTER simulated checkout would yield the wrong (target) version"
+unset INSTALLED_VERSION 2>/dev/null || true
+eval "$CAPTURE_BLOCK"
+_t5_post_checkout="${INSTALLED_VERSION:-}"
+if [[ "$_t5_post_checkout" == "0.14.5-beta8" ]]; then
+  ok
+else
+  err "control failed: expected post-checkout capture to read 0.14.5-beta8, got '$_t5_post_checkout'"
+fi
+
+step "T5 body template with pre-r2 ordering would render the wrong from_version"
+_t5_buggy_rendered="$(printf -- '- from_version: %s\n' "${_t5_post_checkout:-unknown}")"
+case "$_t5_buggy_rendered" in
+  *"from_version: 0.14.5-beta8"*) ok ;;
+  *) err "control failed: rendered body did not reflect post-checkout VERSION: $_t5_buggy_rendered" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Summary

@@ -1346,6 +1346,35 @@ EOF
     fi
   fi
 
+  # Issue #1144: capture the pre-apply VERSION (the installed version we are
+  # upgrading FROM) BEFORE any SOURCE_ROOT checkout/pull below can mutate
+  # TARGET_ROOT/VERSION. The post-upgrade [upgrade-complete] task body
+  # downstream (line ~2210) reads ${INSTALLED_VERSION} for its
+  # `from_version:` field and for the OPERATOR_ACTIONS_PENDING
+  # `applies_when_upgrading_from` lookup. The variable was previously only
+  # assigned inside the --check branch, so the normal apply path always
+  # rendered `from_version: unknown`.
+  #
+  # r2 (issue #1144 follow-up): placement must precede the
+  # `git -C "$SOURCE_ROOT" checkout -q "$TARGET_REF"` below. On a git-clone
+  # install (UPGRADING.md §97-105) SOURCE_ROOT == TARGET_ROOT, so that
+  # checkout rewrites the live VERSION file in place. Capturing AFTER the
+  # checkout would yield the target release version and the task body
+  # would render `from_version: <new>` instead of the previous installed
+  # version.
+  #
+  # Prefer the live VERSION file at TARGET_ROOT (source of truth for the
+  # currently-installed code); fall back to bridge_upgrade_installed_field
+  # (state/upgrade/last-upgrade.json) when the VERSION file is missing or
+  # zero-length on legacy installs.
+  if [[ -z "${INSTALLED_VERSION:-}" ]]; then
+    INSTALLED_VERSION="$(bridge_upgrade_version_from_file "$TARGET_ROOT")"
+    if [[ -z "$INSTALLED_VERSION" || "$INSTALLED_VERSION" == "0.0.0-dev" ]]; then
+      INSTALLED_VERSION="$(bridge_upgrade_installed_field "$TARGET_ROOT" version)"
+    fi
+  fi
+  # END: Issue #1144 INSTALLED_VERSION capture block
+
   if [[ -n "$TARGET_REF" && $DRY_RUN -eq 0 ]]; then
     git -C "$SOURCE_ROOT" checkout -q "$TARGET_REF"
   fi
@@ -1370,25 +1399,6 @@ SOURCE_HEAD="$(git -C "$SOURCE_ROOT" rev-parse HEAD 2>/dev/null || true)"
 if [[ $DRY_RUN -eq 0 || -z "$TARGET_VERSION" ]]; then
   TARGET_VERSION="$SOURCE_VERSION"
   TARGET_HEAD="$SOURCE_HEAD"
-fi
-
-# Issue #1144: capture the pre-apply VERSION (the installed version we are
-# upgrading FROM) before apply-live swaps the live VERSION file. The
-# post-upgrade [upgrade-complete] task body downstream (line ~2210) reads
-# ${INSTALLED_VERSION} for its `from_version:` field and for the
-# OPERATOR_ACTIONS_PENDING `applies_when_upgrading_from` lookup. The
-# variable was previously only assigned inside the --check branch, so
-# the normal apply path always rendered `from_version: unknown`.
-#
-# Prefer the live VERSION file at TARGET_ROOT (source of truth for the
-# currently-installed code); fall back to bridge_upgrade_installed_field
-# (state/upgrade/last-upgrade.json) when the VERSION file is missing or
-# zero-length on legacy installs.
-if [[ -z "${INSTALLED_VERSION:-}" ]]; then
-  INSTALLED_VERSION="$(bridge_upgrade_version_from_file "$TARGET_ROOT")"
-  if [[ -z "$INSTALLED_VERSION" || "$INSTALLED_VERSION" == "0.0.0-dev" ]]; then
-    INSTALLED_VERSION="$(bridge_upgrade_installed_field "$TARGET_ROOT" version)"
-  fi
 fi
 
 if [[ $RESTART_DAEMON -eq 0 && $RESTART_AGENTS_EXPLICIT -eq 0 ]]; then
