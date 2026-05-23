@@ -6,6 +6,128 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta7] — 2026-05-24
+
+### Highlight — post-beta6 stabilization + v2 isolation deployment unblock wave
+
+Operator-cued **seventh prerelease** in the v0.14.5 stabilization window. A
+14-PR wave on `release/v0.14.5-beta7-integration` lands the v2-isolation
+deployment fixes uncovered while bringing up beta6 on a fresh Linux server
+(5 newly-reported issues #1118-#1122) plus 7 post-beta6 follow-up fixes
+including the carried-over migrator apply scope (#1087, deferred from
+beta6 to beta7), CLI `--help` universal contract (#1114 + 16 audit sites),
+and the `--always-on no` symmetric inverse feature (#1136).
+
+Every PR was codex pair-reviewed; the full integration branch passed a
+final codex r2 review (footgun #11 regression caught + resolved in PR
+#1135). Operator runs Linux-VM QA personally.
+`-beta7` prerelease; matching tag `v0.14.5-beta7`, GitHub release marked
+**Pre-release**.
+
+### Fixed — watchdog (v2 isolation interop)
+
+- **#1113 (PR #1123)** — `bridge-upgrade.sh` now back-fills the canonical
+  identity markers (`CLAUDE.md`, `SOUL.md`, `SESSION-TYPE.md`,
+  `MEMORY-SCHEMA.md`, `MEMORY.md`) from `agents/<a>/` into
+  `data/agents/<a>/workdir/` for v2-migrated agents whose runtime workdir
+  was empty post-beta6 (`status: error` on every legacy agent). Idempotent
+  + roster-active only.
+- **#1119 (PR #1124)** — `bridge-watchdog.py` no longer crashes on a
+  single v2-isolated agent's `PermissionError`. Per-agent `try/except`
+  isolates failures; new `status="scan_error"` + `error_kind` +
+  `error_path` row keeps the other agents scanning.
+- **#1108 follow-through** — back-fill (#1113) + permission-error
+  containment (#1119) together close the watchdog cascade on legacy v2
+  installs.
+
+### Fixed — v2 isolation deployment
+
+- **#1118 (PR #1126)** — engine binary resolution for `linux-user`
+  isolated agents: controller's `~/.local/bin/claude` was not on the
+  service user's PATH, so first-start died with `start-command-failed`.
+  Engine binary now resolved to absolute path on the controller and
+  threaded through the sudo wrapper via `BRIDGE_ENGINE_BIN`. Env-prefix
+  preservation in `launch-cmd-engine-bin-rewrite.py` keeps
+  `PATH=$VAR:$PATH claude ...` style delayed expansion intact.
+- **#1120 (PR #1133)** — controller-side ops on v2-isolated workdirs no
+  longer leak `PermissionError` (in `bridge-hooks.py:_ensure_dir_with_sudo`
+  + `agent show` false-missing). `_isolated_workdir_owner` enumerates
+  `/etc/passwd` by primary gid (truncation-safe for long agent names);
+  `bridge_agent_onboarding_state` adds `unverifiable` state for
+  controller-blind paths with sudo probe fallback.
+- **#1121 (PR #1129)** — `agent delete --purge-home` now reaps the
+  per-agent sudoers drop-in at `/etc/sudoers.d/agent-bridge-<a>` alongside
+  user/group/home. Production path is hardcoded
+  `/etc/sudoers.d`; smoke uses the internal helper directly with a
+  tmpdir (no env-controlled bypass).
+- **#1122 (PR #1131)** — admin Claude Code sessions auto-promote
+  `caller-source` to `operator-trusted-id` when
+  `BRIDGE_AGENT_ID == BRIDGE_ADMIN_AGENT_ID` (both non-empty). Removes
+  the per-command `BRIDGE_CALLER_SOURCE=` override friction. Audit row
+  records the auto-promotion.
+
+### Fixed — agent CLI + audit
+
+- **#1105 (PR #1127)** — `agent add` now emits the
+  `system_config_mutation` audit row that `agent update` already emitted
+  (closes audit-trail asymmetry from PR #1102). Emission position: after
+  `bridge_write_role_block` succeeds, before `_CREATE_ROLLBACK_COMPLETE=1`
+  (rollback path never emits).
+- **#1106 (PR #1128)** — daemon nudge fanout now re-queries task
+  eligibility in the shell dispatcher immediately before dispatch via new
+  `bridge-daemon-helpers.py nudge-eligibility-recheck`. Closes the
+  micro-race window between Python eligibility decision and shell
+  delivery (PR #1103 follow-up).
+
+### Fixed — CLI `--help` contract
+
+- **#1114 (PR #1132)** — `--help` / `-h` now accepted across **16
+  subcommand groups + sub-subcommand handlers** that previously
+  rejected it (operator had to read the error message to discover
+  available verbs). Critical safety fix: `daemon ensure --help` no
+  longer silently starts the daemon. Includes 2 r1 follow-up fixes
+  (bridge-send `help` payload swallow + free-form-positional dispatcher
+  tightening).
+- **#1115 + #1116 (PR #1125)** — usage template + `_top_valid`
+  typo-suggestion list now include `a2a`, `plugins`, `skills`,
+  `isolation`, `wave` (previously dispatched but not documented).
+  `agent` / `cron` usage lines synced with dispatcher.
+
+### Added — features
+
+- **#1087 (PR #1130)** — MIGRATOR `apply` contract gaps closed
+  (deferred from beta6 #1086). Inclusive clean-target gate covers every
+  apply write path with real content backup. Layout-resolver shim
+  (`scripts/python-helpers/migrate-layout-shim.sh`) eliminates path
+  drift; verify + apply both consume it. Atomic apply via stage-publish
+  + rollback restores file bytes on mid-flight failure. Secrets written
+  at mode 0600. Cron env scrub uses allowlist. Shim fails-closed on
+  non-v2 marker. `BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE` env-gate removed —
+  `apply` is the user-facing default.
+- **#1117 (PR #1134)** — universal `--help`/`-h` CI smoke gate
+  (`scripts/smoke/1117-cli-help-universal-gate.sh`) — 139 assertions
+  across 52 `_top_valid` candidates + dispatched verbs. 14 KNOWN_BROKEN
+  entries pinned for follow-up. Ratchet semantics: if a pinned verb
+  starts passing, smoke fails to prompt operator to prune.
+- **#1136 (PR #1137)** — `agent update`/`add --always-on no` (must
+  pair with `--idle-timeout <N>`) — symmetric inverse to `--always-on
+  yes` (#1093). Pure declarative: persistence identical to bare
+  `--idle-timeout`, side effect is new `expressed_intent` audit field
+  (`always_on_yes` / `always_on_no`) so operators can grep for
+  policy-flip events even when numeric values are identical
+  (re-affirmation case).
+
+### Internal — footgun #11 scanner extension
+
+- **PR #1135 (codex r2 integration review)** — scanner extended to
+  catch bare `bash <<TAG` AND `bash << TAG` (whitespace form), with
+  capture-aware classification (C1 capture-wrapped, C4 non-capture).
+  Fixed the pre-existing site at
+  `scripts/smoke/isolated-agent-delete-reap.sh:63`. Self-test fixture
+  grew from 18 → 23 positives. `RE_BASH_BARE_HEREDOC` scoped to require
+  the `bash` keyword so string content (e.g. assertion labels
+  `elapsed << interval`) doesn't false-positive.
+
 ## [0.14.5-beta6] — 2026-05-23
 
 ### Highlight — clean-cut foundation wave

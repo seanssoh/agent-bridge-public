@@ -428,16 +428,23 @@ assert payload["after"]["idle_timeout"] == "0", payload
   after_line="$(read_field "BRIDGE_AGENT_IDLE_TIMEOUT")"
   smoke_assert_contains "$after_line" '="0"' "roster carries IDLE_TIMEOUT=0 after --always-on yes"
 
-  # `--always-on no` is refused in v1 with a clear reason.
+  # Issue #1136: `--always-on no` is now accepted when paired with
+  # `--idle-timeout <positive>`. A bare `--always-on no` (no co-flag)
+  # still rejects, but with the new English contract string. The full
+  # symmetric + expressed_intent coverage lives in
+  # scripts/smoke/1136-always-on-no.sh; this case continues to pin the
+  # update-side "missing co-flag" rejection.
   local rc=0 err_output
   set +e
   err_output="$(run_update --always-on no 2>&1)"
   rc=$?
   set -e
   if [[ $rc -eq 0 ]]; then
-    smoke_fail "expected --always-on no to be refused; output=$err_output"
+    smoke_fail "expected --always-on no without --idle-timeout to be refused; output=$err_output"
   fi
-  smoke_assert_contains "$err_output" "v1 에서 지원하지 않습니다" "deny reason mentions v1 contract"
+  smoke_assert_contains "$err_output" \
+    "--always-on no requires --idle-timeout <seconds> (positive integer)" \
+    "deny reason names the missing-coflag contract"
 }
 
 assert_loop_yes_no_alias() {

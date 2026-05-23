@@ -87,7 +87,8 @@ override) — same trust model as 'agent-bridge config set'. Repeatable.
   --continue on|off                    set BRIDGE_AGENT_CONTINUE
   --class user|system                  set BRIDGE_AGENT_CLASS (privilege boundary)
   --idle-timeout <seconds>             set BRIDGE_AGENT_IDLE_TIMEOUT (integer ≥0; 0 = always on)
-  --always-on yes                      sugar for --idle-timeout 0 (v1 does not accept "no")
+  --always-on yes                      sugar for --idle-timeout 0 (records expressed_intent=always_on_yes)
+  --always-on no                       requires --idle-timeout <positive>; records expressed_intent=always_on_no
   --json                               emit JSON envelope
   --dry-run                            do not mutate; emit planned diff
 
@@ -111,7 +112,8 @@ Create options:
   --isolate                    shorthand for --isolation linux-user
   --os-user <user>             explicit Linux service user for linux-user isolation
   --loop [yes|no|on|off]       mark the role as loop-enabled (bare form ≡ yes; "no" persists LOOP="0")
-  --always-on [yes]            configure IDLE_TIMEOUT=0 for this role (v1 does not accept "no")
+  --always-on [yes|no]         direction-declared policy flip; "no" requires --idle-timeout <positive>;
+                               records expressed_intent on the audit row
   --idle-timeout <seconds>     set BRIDGE_AGENT_IDLE_TIMEOUT (integer ≥0; 0 = always on)
   --continue|--no-continue     explicit continue mode (default: continue)
   --dry-run                    print the planned role block without writing
@@ -1293,12 +1295,24 @@ emit_create_json() {
   # LOOP="0", empty when the line was omitted (default-1 fallback).
   local idle_timeout_persisted="${14:-}"
   local loop_persisted="${15:-}"
+  # Issue #1136: declarative direction the operator passed via
+  # `--always-on yes|no` (legacy bare `--always-on` is `yes`). Empty when
+  # the flag wasn't used. Surfaced as `policy.expressed_intent` in the
+  # JSON envelope; omitted entirely when empty so callers that didn't
+  # pass the flag see a byte-stable envelope.
+  local expressed_intent="${16:-}"
 
-  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" <<'PY'
+  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" "$expressed_intent" <<'PY'
 import json
 import sys
 
-agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user, idle_timeout_persisted, loop_persisted = sys.argv[1:]
+agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user, idle_timeout_persisted, loop_persisted, expressed_intent = sys.argv[1:]
+policy = {
+    "idle_timeout": idle_timeout_persisted,
+    "loop": loop_persisted,
+}
+if expressed_intent:
+    policy["expressed_intent"] = expressed_intent
 payload = {
     "agent": agent,
     "engine": engine,
@@ -1315,10 +1329,7 @@ payload = {
     "roster_file": roster_file,
     "dry_run": dry_run == "1",
     "users": json.loads(users_json),
-    "policy": {
-        "idle_timeout": idle_timeout_persisted,
-        "loop": loop_persisted,
-    },
+    "policy": policy,
     "next_steps": [
         f"agent-bridge setup agent {agent}",
         f"agent-bridge status --all-agents",
@@ -1538,6 +1549,17 @@ run_list() {
         json_mode=1
         shift
         ;;
+      -h|--help|help)
+        # Issue #1114: `agent list --help` was caught by the `*)` arm
+        # as a "지원하지 않는 옵션" error.
+        cat <<'AGENT_LIST_HELP'
+Usage: agent-bridge agent list [--json]
+
+List every agent known on this host (active sessions and roster
+entries) as a human-readable table, or as JSON with --json.
+AGENT_LIST_HELP
+        return 0
+        ;;
       *)
         bridge_die "지원하지 않는 agent list 옵션입니다: $1"
         ;;
@@ -1605,6 +1627,18 @@ run_registry() {
         # symmetry with `agent list --json` so callers can keep a
         # single argv shape across both endpoints.
         shift
+        ;;
+      -h|--help|help)
+        # Issue #1114: `agent registry --help` was caught by the `*)`
+        # arm as a "지원하지 않는 옵션" error.
+        cat <<'AGENT_REGISTRY_HELP'
+Usage: agent-bridge agent registry [--json]
+
+Read-only enumeration of every agent id known on this host
+(static + dynamic + system) with cleanup-class and provenance.
+JSON-only by design — the human shape is `agent list`.
+AGENT_REGISTRY_HELP
+        return 0
         ;;
       *)
         bridge_die "지원하지 않는 agent registry 옵션입니다: $1"
@@ -2619,6 +2653,13 @@ run_create() {
   # path still triggers for `agent add --always-on`. When non-empty, the
   # writer emits BRIDGE_AGENT_IDLE_TIMEOUT="<value>" verbatim.
   local idle_timeout_value=""
+  # Issue #1136: declarative direction the operator passed via
+  # `--always-on yes|no` (including the legacy bare `--always-on` shape,
+  # which is treated as `yes`). Threaded through to the audit emit's
+  # `expressed_intent` field so the create-side audit row carries the
+  # same searchable receipt the update-side does.
+  local always_on_intent=""
+  local always_on_no_present=0
   local dry_run=0
   local json_mode=0
   local user_specs=()
@@ -2784,26 +2825,47 @@ run_create() {
         shift
         ;;
       --always-on)
-        # Issue #1093: extended `--always-on yes` shape. Legacy bare
-        # `--always-on` (no value, OR followed by another flag) remains
-        # an on-only toggle. v1 does not accept `--always-on no` — see
-        # issue rationale. Non-flag non-"yes" values are typos.
+        # Issue #1093 / #1136: extended `--always-on yes|no` shape. Legacy
+        # bare `--always-on` (no value, OR followed by another flag)
+        # remains an on-only toggle (= `yes`). `--always-on no` is the
+        # symmetric inverse — must be paired with a positive
+        # `--idle-timeout <seconds>`; enforced post-parse so flag
+        # ordering doesn't matter. Both directions stamp the audit row's
+        # `expressed_intent` field.
         if [[ $# -ge 2 && "$2" != -* ]]; then
           case "$2" in
             yes|YES|Yes)
+              if [[ -n "$always_on_intent" && "$always_on_intent" != "always_on_yes" ]]; then
+                bridge_die "--always-on yes 와 --always-on no 는 함께 지정할 수 없습니다."
+              fi
               always_on=1
+              always_on_intent="always_on_yes"
               shift 2
               continue
               ;;
             no|NO|No)
-              bridge_die "--always-on no 는 v1 에서 지원하지 않습니다. 명시적 유한 idle timeout 은 --idle-timeout <seconds> 를 사용하세요."
+              if [[ -n "$always_on_intent" && "$always_on_intent" != "always_on_no" ]]; then
+                bridge_die "--always-on yes 와 --always-on no 는 함께 지정할 수 없습니다."
+              fi
+              always_on_intent="always_on_no"
+              always_on_no_present=1
+              shift 2
+              continue
               ;;
             *)
-              bridge_die "--always-on 는 yes 만 가능합니다 (v1): $2"
+              bridge_die "--always-on 는 yes|no 만 가능합니다: $2"
               ;;
           esac
         fi
+        # Legacy bare `--always-on` is `yes` (preserved byte-identical
+        # to PR #1102 behaviour); still record the intent so audit-log
+        # grep on `expressed_intent=always_on_yes` returns the legacy
+        # callers too.
+        if [[ -n "$always_on_intent" && "$always_on_intent" != "always_on_yes" ]]; then
+          bridge_die "--always-on yes 와 --always-on no 는 함께 지정할 수 없습니다."
+        fi
         always_on=1
+        always_on_intent="always_on_yes"
         shift
         ;;
       --idle-timeout)
@@ -2854,6 +2916,28 @@ run_create() {
         ;;
     esac
   done
+
+  # Issue #1136: validate the `--always-on` combination matrix. Same
+  # rules as the update path (see run_update post-parse block) — refuse
+  # contradictory direction/idle-timeout pairs and require the explicit
+  # positive co-flag on `--always-on no`. The intent string
+  # (`always_on_intent`) survives normalisation because the audit emit
+  # below threads it through verbatim.
+  case "$always_on_intent" in
+    always_on_yes)
+      if [[ -n "$idle_timeout_value" && "$idle_timeout_value" != "0" ]]; then
+        bridge_die "--always-on yes 는 --idle-timeout <positive> 와 함께 사용할 수 없습니다 (의미 충돌). 항상-on 은 --always-on yes 또는 --idle-timeout 0 만 사용하세요."
+      fi
+      ;;
+    always_on_no)
+      if [[ -z "$idle_timeout_value" ]]; then
+        bridge_die "--always-on no requires --idle-timeout <seconds> (positive integer)"
+      fi
+      if [[ "$idle_timeout_value" == "0" ]]; then
+        bridge_die "--always-on no with --idle-timeout 0 is contradictory; use --always-on yes for always-on, or pass a positive idle-timeout for on-demand"
+      fi
+      ;;
+  esac
 
   # Issue #598 Track 4: refuse names that match a test-artifact pattern
   # (smoke-, test-, bootstrap-, created-agent-, pref-, *-repro-<N>) unless
@@ -3126,6 +3210,15 @@ report and reap test-fixture agents per their pattern."
     if [[ "$engine" == "codex" ]]; then
       bridge_ensure_codex_agent_hooks "$agent" "$scaffold_target" >/dev/null 2>&1 || true
     fi
+    # Issue #1105: capture the roster-file sha BEFORE the write so the
+    # system_config_mutation audit row emitted below carries a real
+    # before/after sha chain. On a markerless fresh-install the roster
+    # file may not exist yet — bridge_agent_update_file_sha256 returns
+    # an empty string in that case, which audit-detail-json.py treats as
+    # the documented "file did not exist" sentinel.
+    local _create_audit_roster_path="$BRIDGE_ROSTER_LOCAL_FILE"
+    local _create_audit_before_sha
+    _create_audit_before_sha="$(bridge_agent_update_file_sha256 "$_create_audit_roster_path")"
     # Issue #1093: pass positional 20 (loop_explicit_off) and positional
     # 21 (idle_timeout_value) so `agent add --loop no` persists the
     # explicit-off line and `--idle-timeout <seconds>` writes the
@@ -3159,6 +3252,13 @@ report and reap test-fixture agents per their pattern."
     # start --dry-run) raises — without this flag, a post-roster failure
     # leaves a registered-but-broken agent (the exact bug).
     _CREATE_ROLLBACK_ROSTER_WRITTEN=1
+    # Issue #1105: capture after_sha right after the write so the audit
+    # detail emitted at end-of-create (below, after every other mutation
+    # has cleared) reflects exactly what landed on disk. We compute it
+    # here rather than later so a downstream step that itself touches the
+    # roster file (none today, but future-proof) cannot confuse the chain.
+    local _create_audit_after_sha
+    _create_audit_after_sha="$(bridge_agent_update_file_sha256 "$_create_audit_roster_path")"
     # Issue #848: bridge_write_role_block just appended a new entry to
     # the local roster file; invalidate the per-process cache so the
     # next load re-reads disk instead of replaying the pre-create map.
@@ -3237,6 +3337,82 @@ report and reap test-fixture agents per their pattern."
     else
       start_dry_run_status="warn (rc=$?)"
     fi
+    # Issue #1105: emit a system_config_mutation audit row mirroring the
+    # `agent update` path's shape so operators get an audit trail for the
+    # original create too (not just later updates). PR #1102 added the
+    # update-side flags (--idle-timeout / --loop / --always-on) but the
+    # create-side asymmetry (write_role_block silently mutating the
+    # protected roster without an audit emit) predates that and is the
+    # gap this row closes. Emitted just before _CREATE_ROLLBACK_COMPLETE=1
+    # so if any earlier step raised, the trap excises the roster entry
+    # AND we never reach the emitter — the audit log only ever carries
+    # rows for creates that actually landed. before_* fields are empty
+    # (the agent did not exist pre-create); after_* mirror the values
+    # just persisted. The persisted idle_timeout / loop string derivation
+    # is the same one `emit_create_json` uses below so the audit and the
+    # --json envelope agree byte-for-byte on what landed on disk.
+    local _create_audit_caller_agent _create_audit_actor
+    _create_audit_caller_agent="$(bridge_agent_update_caller_agent "")"
+    _create_audit_actor="$_create_audit_caller_agent"
+    if [[ -z "$_create_audit_actor" ]]; then
+      if [[ "$create_caller_source" == "operator-tui" ]]; then
+        _create_audit_actor="operator"
+      else
+        _create_audit_actor="unknown"
+      fi
+    fi
+    local _create_audit_idle_timeout=""
+    if [[ -n "$idle_timeout_value" ]]; then
+      _create_audit_idle_timeout="$idle_timeout_value"
+    elif [[ $always_on -eq 1 ]]; then
+      _create_audit_idle_timeout="0"
+    fi
+    local _create_audit_loop=""
+    if [[ $loop_explicit_off -eq 1 ]]; then
+      _create_audit_loop="0"
+    elif [[ $loop_mode -eq 1 ]]; then
+      _create_audit_loop="1"
+    fi
+    local _create_audit_summary
+    _create_audit_summary="$(
+      {
+        printf 'engine=%s\n' "$engine"
+        printf 'session_type=%s\n' "$session_type"
+        printf 'isolation_mode=%s\n' "$isolation_mode"
+        if [[ -n "$os_user" ]]; then
+          printf 'os_user=%s\n' "$os_user"
+        fi
+        if [[ -n "$_create_audit_idle_timeout" ]]; then
+          printf 'idle_timeout=%s\n' "$_create_audit_idle_timeout"
+        fi
+        if [[ -n "$_create_audit_loop" ]]; then
+          printf 'loop=%s\n' "$_create_audit_loop"
+        fi
+        if [[ $always_on -eq 1 ]]; then
+          printf 'always_on=yes\n'
+        fi
+      } | tr '\n' ',' | sed 's/,$//'
+    )"
+    bridge_agent_update_emit_audit \
+      "agent-create-apply" \
+      "$_create_audit_actor" \
+      "$create_caller_source" \
+      "$agent" \
+      "$_create_audit_roster_path" \
+      "$_create_audit_before_sha" \
+      "$_create_audit_after_sha" \
+      "agent_create $_create_audit_summary" \
+      "" \
+      "" \
+      "$launch_cmd" \
+      "" \
+      "$channels" \
+      "[]" \
+      "" \
+      "$_create_audit_idle_timeout" \
+      "" \
+      "$_create_audit_loop" \
+      "$always_on_intent"
     # Issue #1076: every mutation in the create flow has now completed.
     # Mark complete + disarm the EXIT trap so a normal exit does NOT roll
     # back a successful create. A failure ANYWHERE above this line leaves
@@ -3268,7 +3444,7 @@ report and reap test-fixture agents per their pattern."
       "$agent" "$engine" "$session" "$workdir" "$profile_home" \
       "$launch_cmd" "$channels" "$BRIDGE_ROSTER_LOCAL_FILE" "$dry_run" \
       "$users_json" "$session_type" "$isolation_mode" "$os_user" \
-      "$_emit_idle_timeout" "$_emit_loop"
+      "$_emit_idle_timeout" "$_emit_loop" "$always_on_intent"
     exit 0
   fi
 
@@ -3372,6 +3548,15 @@ run_update() {
   # against `^[0-9]+$` at parse time so a bad write never lands.
   local idle_timeout_present=0
   local idle_timeout_value=""
+  # Issue #1136: declarative direction the operator passed via
+  # `--always-on yes|no`. Empty when the flag was not used (bare
+  # `--idle-timeout <N>` records the numeric delta only). "always_on_yes"
+  # / "always_on_no" otherwise. Surfaced verbatim as the `expressed_intent`
+  # field on the audit row + `--json` envelope, including on the
+  # `changed=false` no-op mutation case (re-affirming policy still
+  # produces a searchable audit receipt).
+  local always_on_intent=""
+  local always_on_no_present=0
 
   add_launch_cmd_op() {
     launch_cmd_ops+="$1"$'\t'"$2"$'\n'
@@ -3560,21 +3745,35 @@ run_update() {
         shift 2
         ;;
       --always-on)
-        # Issue #1093: sugar that maps to `--idle-timeout 0`. v1 does
-        # not accept `--always-on no` — the inverse is ambiguous because
-        # missing BRIDGE_AGENT_IDLE_TIMEOUT reads as 0 by default.
-        # Admins set a finite idle timeout via `--idle-timeout <N>`.
+        # Issue #1093 / #1136: `--always-on yes` is sugar for
+        # `--idle-timeout 0`. `--always-on no` (added by #1136) is the
+        # symmetric inverse — it MUST be paired with an explicit
+        # `--idle-timeout <positive>` so the target value is never
+        # implicit. Both directions stamp `expressed_intent` on the audit
+        # row (always_on_intent) so audit-log grep returns every
+        # operator-declared policy-flip event regardless of numeric delta.
+        # The contradictory-combination matrix (yes + --idle-timeout
+        # <positive>, no without --idle-timeout, no + --idle-timeout 0,
+        # yes after a prior no, no after a prior yes) is enforced after
+        # the parse loop so flag ordering doesn't matter.
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
         case "$2" in
           yes|YES|Yes)
-            idle_timeout_present=1
-            idle_timeout_value="0"
+            if [[ -n "$always_on_intent" && "$always_on_intent" != "always_on_yes" ]]; then
+              bridge_die "--always-on yes 와 --always-on no 는 함께 지정할 수 없습니다."
+            fi
+            always_on_intent="always_on_yes"
             mutation_present=1
             ;;
           no|NO|No)
-            bridge_die "--always-on no 는 v1 에서 지원하지 않습니다. 명시적 유한 idle timeout 은 --idle-timeout <seconds> 를 사용하세요."
+            if [[ -n "$always_on_intent" && "$always_on_intent" != "always_on_no" ]]; then
+              bridge_die "--always-on yes 와 --always-on no 는 함께 지정할 수 없습니다."
+            fi
+            always_on_intent="always_on_no"
+            always_on_no_present=1
+            mutation_present=1
             ;;
-          *) bridge_die "--always-on 는 yes 만 가능합니다 (v1): $2" ;;
+          *) bridge_die "--always-on 는 yes|no 만 가능합니다: $2" ;;
         esac
         shift 2
         ;;
@@ -3613,6 +3812,38 @@ run_update() {
         ;;
     esac
   done
+
+  # Issue #1136: validate the `--always-on` combination matrix BEFORE
+  # the mutual-exclusion checks below, then apply the sugar / co-flag
+  # rules so downstream presence/value logic sees a single normalised
+  # idle_timeout target. The intent string (`always_on_intent`) survives
+  # post-normalisation because it's what threads through to the audit
+  # `expressed_intent` field; the numeric mapping is handled inline here.
+  case "$always_on_intent" in
+    always_on_yes)
+      # `--always-on yes` + `--idle-timeout <positive>` are contradictory
+      # — yes means "no idle timeout (=0)" and a positive value flips the
+      # other direction. Refuse at parse time; the operator should pick
+      # one shape.
+      if [[ $idle_timeout_present -eq 1 && "$idle_timeout_value" != "0" ]]; then
+        bridge_die "--always-on yes 는 --idle-timeout <positive> 와 함께 사용할 수 없습니다 (의미 충돌). 항상-on 은 --always-on yes 또는 --idle-timeout 0 만 사용하세요."
+      fi
+      # Apply the sugar: --always-on yes -> idle_timeout=0.
+      idle_timeout_present=1
+      idle_timeout_value="0"
+      ;;
+    always_on_no)
+      # Symmetric inverse requires an explicit positive idle_timeout
+      # co-flag. The implicit "default" semantics would be ambiguous
+      # because missing BRIDGE_AGENT_IDLE_TIMEOUT reads as 0 (always-on).
+      if [[ $idle_timeout_present -ne 1 ]]; then
+        bridge_die "--always-on no requires --idle-timeout <seconds> (positive integer)"
+      fi
+      if [[ "$idle_timeout_value" == "0" ]]; then
+        bridge_die "--always-on no with --idle-timeout 0 is contradictory; use --always-on yes for always-on, or pass a positive idle-timeout for on-demand"
+      fi
+      ;;
+  esac
 
   # Mutual-exclusion: --set-launch-cmd is a full replace; combining it
   # with the additive/removal flags is ambiguous. Same for --channels-set.
@@ -3685,6 +3916,17 @@ run_update() {
       if [[ $idle_timeout_present -eq 1 ]]; then
         printf 'idle_timeout=%s\n' "$idle_timeout_value"
       fi
+      # Issue #1136: surface the operator-declared `--always-on` direction
+      # in the same one-line summary so audit-log readers see policy-flip
+      # events without joining on `expressed_intent`. Empty when the flag
+      # was not used (bare `--idle-timeout` records the numeric delta
+      # only).
+      if [[ -n "$always_on_intent" ]]; then
+        case "$always_on_intent" in
+          always_on_yes) printf 'always_on=yes\n' ;;
+          always_on_no)  printf 'always_on=no\n' ;;
+        esac
+      fi
     } | tr '\n' ',' | sed 's/,$//'
   )"
 
@@ -3735,7 +3977,12 @@ run_update() {
       "" \
       "$before_channels" \
       "" \
-      "[]"
+      "[]" \
+      "" \
+      "" \
+      "" \
+      "" \
+      "$always_on_intent"
     bridge_die "deny: $deny_reason"
   fi
 
@@ -3978,7 +4225,8 @@ PY
     "$audit_before_idle" \
     "$audit_after_idle" \
     "$audit_before_loop" \
-    "$audit_after_loop"
+    "$audit_after_loop" \
+    "$always_on_intent"
 
   if [[ $json_mode -eq 1 ]]; then
     bridge_agent_update_emit_json \
@@ -3995,7 +4243,8 @@ PY
       "$audit_before_idle" \
       "$audit_after_idle" \
       "$audit_before_loop" \
-      "$audit_after_loop"
+      "$audit_after_loop" \
+      "$always_on_intent"
     return 0
   fi
 
@@ -4852,6 +5101,21 @@ PY
 
 run_start() {
   local agent="${1:-}"
+  # Issue #1114 (codex r1 follow-up): -h/--help in the agent slot
+  # prints usage instead of being passed to bridge_require_agent
+  # (which dies with a roster mismatch). Restricted to the dashed
+  # forms — bare `help` could be a legitimate agent id.
+  case "$agent" in
+    -h|--help)
+      cat <<'AGENT_START_HELP'
+Usage: agent-bridge agent start <agent> [bridge-start.sh forwards...]
+
+Start (or re-attach to) a static or dynamic agent session. Extra
+options after <agent> are forwarded verbatim to bridge-start.sh.
+AGENT_START_HELP
+      return 0
+      ;;
+  esac
   shift || true
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") start <agent> [...]"
   bridge_require_agent "$agent"
@@ -4869,6 +5133,22 @@ run_safe_mode() {
 run_stop() {
   local agent="${1:-}"
   local session=""
+
+  # Issue #1114 (codex r1 follow-up): -h/--help in the agent slot
+  # prints usage instead of being passed to bridge_require_agent
+  # (which dies with a roster mismatch). Restricted to the dashed
+  # forms — bare `help` could be a legitimate agent id.
+  case "$agent" in
+    -h|--help)
+      cat <<'AGENT_STOP_HELP'
+Usage: agent-bridge agent stop <agent>
+
+Stop the live tmux session for <agent>. No-op if the session is
+already absent.
+AGENT_STOP_HELP
+      return 0
+      ;;
+  esac
 
   shift || true
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") stop <agent>"

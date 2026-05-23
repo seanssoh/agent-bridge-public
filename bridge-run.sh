@@ -806,6 +806,16 @@ while true; do
     LAUNCH_CMD="$(bridge_agent_launch_cmd "$AGENT")"
   fi
   [[ -n "$LAUNCH_CMD" ]] || bridge_die "'$AGENT'의 launch command가 비어 있습니다."
+  # Issue #1118: when bridge-start.sh resolved the engine binary on the
+  # controller side and propagated it via BRIDGE_ENGINE_BIN, rewrite the
+  # leading `claude`/`codex` token in LAUNCH_CMD to that absolute path.
+  # The rewrite happens AFTER the launch_cmd builders so the existing
+  # `--resume`/`--name`/channels logic stays in one place. The helper is a
+  # no-op when BRIDGE_ENGINE_BIN is empty or the engine token has already
+  # been pinned to an absolute path by an operator override.
+  if [[ -n "${BRIDGE_ENGINE_BIN:-}" ]]; then
+    LAUNCH_CMD="$(bridge_rewrite_launch_cmd_engine_bin "$LAUNCH_CMD" "$BRIDGE_ENGINE_BIN")"
+  fi
   local_launch_cmd_display="$(bridge_redact_inline_env_secrets "$LAUNCH_CMD")"
 
   if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then

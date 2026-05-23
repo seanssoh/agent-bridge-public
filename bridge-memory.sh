@@ -38,6 +38,17 @@ command="${1:-}"
 [[ -n "$command" ]] || { usage; exit 1; }
 shift || true
 
+# Issue #1114: -h/--help/help on the top-level dispatcher prints usage
+# and exits 0 instead of falling through to the "지원하지 않는 memory
+# 명령입니다" error path. The sub-command --help branches lower in the
+# file are unreachable when the dispatcher rejects the sub first.
+case "$command" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
+
 agent=""
 users=()
 dry_run=0

@@ -1251,39 +1251,78 @@ def _isolated_workdir_owner(workdir: Path) -> str | None:
     # We don't have the agent name in this entry-point's argv, so derive
     # the target user from the workdir's filesystem owner — that's the
     # account the isolated UID was provisioned as. Returns None on
-    # non-Linux hosts, when stat fails, when the owner looks like
-    # root/controller, or when /etc/passwd lookup fails. The caller
-    # gates sudo escalation on a non-None return.
+    # non-Linux hosts, when stat fails on every ancestor, when the owner
+    # looks like root/controller, or when /etc/passwd lookup fails. The
+    # caller gates sudo escalation on a non-None return.
+    #
+    # #1120 sub-A: when `workdir` itself does not exist yet (mid-create,
+    # link-shared-settings runs before `bridge_linux_prepare_agent_
+    # isolation` has materialized the per-agent workdir tree), the lstat
+    # below FileNotFoundError'd → returned None → `_ensure_dir_with_sudo`
+    # fell back to controller-direct `path.mkdir(parents=True)` which
+    # raised PermissionError because the v2 per-agent root is
+    # `root:ab-agent-<slug> mode 2750` (controller has no write).
+    # Walk up the path to the deepest existing ancestor so we can still
+    # discover the isolated UID via the parent dir's group when the leaf
+    # is missing.
     if sys.platform != "linux":
         return None
-    try:
-        # v0.8.8 r2 (codex CHECK 4): use lstat so a workdir that is itself
-        # a symlink (rare but possible when a dynamic agent's worktree is
-        # symlinked into ~/.agent-bridge/agents/<name>) reports the link's
-        # owner rather than the dereferenced target. The fallback below
-        # only escalates to `sudo -n -u agent-bridge-<slug>`, so reading
-        # the link itself is the right signal — escalating to the target's
-        # owner would be a category error.
-        stat_result = workdir.lstat()
-    except OSError:
-        # Workdir parent likely also unreadable — let the direct path
-        # raise the original PermissionError so callers see the same
-        # error shape they had before.
+    candidate: Path | None = workdir
+    stat_result = None
+    while candidate is not None:
+        try:
+            # v0.8.8 r2 (codex CHECK 4): use lstat so a workdir that is
+            # itself a symlink (rare but possible when a dynamic agent's
+            # worktree is symlinked into ~/.agent-bridge/agents/<name>)
+            # reports the link's owner rather than the dereferenced
+            # target. The fallback only escalates to
+            # `sudo -n -u agent-bridge-<slug>`, so reading the link
+            # itself is the right signal — escalating to the target's
+            # owner would be a category error.
+            stat_result = candidate.lstat()
+            break
+        except OSError:
+            # Walk up — same ancestor may carry the `ab-agent-<slug>`
+            # group signature we use to recover the isolated UID even
+            # when the leaf is missing.
+            parent = candidate.parent
+            if parent == candidate:
+                return None
+            candidate = parent
+    if stat_result is None:
         return None
     try:
         import pwd
         owner = pwd.getpwuid(stat_result.st_uid).pw_name
     except (KeyError, ImportError):
-        return None
-    # Only escalate when the owner is clearly an isolated agent user.
-    # The bridge-isolation-v2 layout names them `agent-bridge-<slug>`;
-    # avoid escalating for controller-owned (current uid) workdirs so
-    # this is a no-op for shared-mode agents.
-    if stat_result.st_uid == os.getuid():
-        return None
-    if not owner.startswith("agent-bridge-"):
-        return None
-    return owner
+        owner = ""
+    # Direct match: the existing ancestor IS owned by an isolated agent
+    # user. This covers the canonical case where workdir itself is
+    # `agent-bridge-<slug>:ab-agent-<slug> 2770`.
+    if owner.startswith("agent-bridge-") and stat_result.st_uid != os.getuid():
+        return owner
+    # #1120 sub-A: the per-agent root (`<v2-root>/<agent>/`) is
+    # `root:ab-agent-<slug> mode 2750` so the owner is root, not an
+    # `agent-bridge-*` user. Recover the isolated UID name from the
+    # group by enumerating /etc/passwd for the user whose PRIMARY gid
+    # matches the ancestor's gid AND whose name starts with
+    # `agent-bridge-`. This is robust against the user/group name
+    # truncation mismatch that codex r1 (#5726 BLOCKING #2) flagged:
+    # `bridge_isolation_v2_agent_group_name` hash-truncates long group
+    # names while `bridge_agent_default_os_user` simple-truncates user
+    # names, so reconstructing the user by string-replacing
+    # `ab-agent-` → `agent-bridge-` is wrong for any agent name >19
+    # chars. The /etc/passwd lookup uses the GID as the authoritative
+    # linkage and avoids the truncation-strategy mismatch entirely.
+    if stat_result.st_uid != os.getuid():
+        try:
+            import pwd
+            for entry in pwd.getpwall():
+                if entry.pw_gid == stat_result.st_gid and entry.pw_name.startswith("agent-bridge-"):
+                    return entry.pw_name
+        except (KeyError, ImportError):
+            pass
+    return None
 
 
 def _sudo_run_as(os_user: str, *cmd: str) -> int:
@@ -1310,21 +1349,42 @@ def _sudo_run_as(os_user: str, *cmd: str) -> int:
 
 
 def _ensure_dir_with_sudo(path: Path, os_user: str | None) -> None:
-    # Try direct mkdir first — non-isolated hosts and already-existing
-    # dirs hit this branch. On PermissionError, fall back to
-    # `sudo -n -u <agent-user> mkdir -p` so the isolated workdir gets
-    # `.claude/` created with the right owner. If sudo also fails the
-    # original PermissionError is re-raised so the caller's stderr
-    # shows the same error shape pre-#714.
-    try:
-        path.mkdir(parents=True, exist_ok=True)
-        return
-    except PermissionError:
-        if os_user is None:
-            raise
+    # #1120 sub-A: function name promised sudo escalation but the body
+    # only reached sudo AFTER a controller-direct `path.mkdir(...)`
+    # raised PermissionError. On v2 isolation the parent dir
+    # (`<v2-root>/<agent>/` is `root:ab-agent-<slug> 2750`) blocks
+    # controller writes, so the direct mkdir always raised and the
+    # caller printed a Python traceback before the sudo fallback even
+    # got a chance to silence it on its own line.
+    #
+    # New contract:
+    #   - If `os_user` is set (caller already detected isolation),
+    #     route through `sudo -n -u <os_user> mkdir -p <path>` FIRST.
+    #     The isolated UID owns `<v2-root>/<agent>/workdir/` (mode
+    #     2770) so creating `<workdir>/.claude/` under it succeeds
+    #     without controller intervention. On success, return cleanly
+    #     (no PermissionError raised at all → no traceback).
+    #   - If sudo escalation is unavailable (`_sudo_run_as` rc 127,
+    #     non-Linux dev host) or fails (typically because the leaf
+    #     ancestor is missing — caller's create flow has not yet
+    #     materialized the workdir), fall back to a controller-direct
+    #     `path.mkdir(parents=True, exist_ok=True)`. On v2 isolation
+    #     that controller-direct mkdir will itself fail with
+    #     PermissionError — re-raise so the caller sees a real error
+    #     rather than silent partial state.
+    #   - If `os_user` is None (non-isolated host), keep the existing
+    #     controller-direct `mkdir` shape — byte-for-byte unchanged for
+    #     shared-mode agents.
+    if os_user is not None:
         rc = _sudo_run_as(os_user, "mkdir", "-p", str(path))
-        if rc != 0:
-            raise
+        if rc == 0:
+            return
+        # Fall through to controller-direct attempt. This succeeds when
+        # the path is actually controller-owned (mis-detection of iso
+        # ownership via a group-only signature on a controller-owned
+        # tree, etc.). When it fails with PermissionError we let it
+        # propagate — better surface a real error than fail silently.
+    path.mkdir(parents=True, exist_ok=True)
 
 
 def _safe_path_check(check: str, path: Path, os_user: str | None) -> bool:
