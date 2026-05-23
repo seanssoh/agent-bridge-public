@@ -1399,6 +1399,72 @@ read access, engine CLI exec via the isolated UID, and the
 channel target dir. These cannot be substituted by rootless
 fake-group assertions.
 
+### Supplementary group refresh after first v2 isolated agent
+
+When the first v2-isolated agent is created (or any time the controller
+account is newly added to an `ab-agent-<agent>` group via
+`usermod -aG` / `agent-bridge agent add --isolated`), already-running
+controller processes — the daemon, every existing shell session, the
+tmux server, hook subprocesses spawned from those parents — still hold
+the **pre-add supplementary group set** until they restart. Linux
+captures the supplementary group set at process exec time and does not
+refresh it on later `usermod -aG`.
+
+Until the controller side re-reads its group set, the new
+`ab-agent-<agent>` group bit cannot be used to traverse into the
+isolated tree even though the filesystem ownership is already correct.
+Operators reproducing #1145-class issues from a fresh install (with no
+controller restart in between) will see worse behavior than operators
+who have already relogged after the most recent isolated-agent add.
+
+Symptoms of skipping the refresh:
+
+- Controller-side helpers cannot read into `$BRIDGE_DATA_ROOT/agents/<agent>/`
+  even though `getent group ab-agent-<agent>` shows the controller as a
+  member.
+- `agent-bridge agent add --isolated` / `agent create` flow reports
+  `Permission denied` on scaffold writes (`mkdir`, `mv`, `chown`) that
+  vanish after a relog/restart.
+- `agent start` exits before the Claude REPL is reached on the first
+  v2-isolated agent of a fresh install.
+- `agent-bridge watchdog scan` reports `scan_error/permission_denied`
+  for the new isolated agent.
+
+**Workarounds** (pick whichever matches the operator's daemon model):
+
+- **Operator-shell-managed daemon (the common case).** Log out of the
+  controller shell and log back in, OR start a fresh login shell via
+  `newgrp ab-agent-<agent>` (one group per session — only refreshes
+  that one group), THEN restart the daemon so it inherits the new
+  group set:
+
+  ```bash
+  # Fresh login picks up every ab-agent-* group at once.
+  exec $SHELL -l                 # or: log out and back in
+  agent-bridge daemon restart
+  agent-bridge agent start <agent>
+  ```
+
+- **systemd-managed daemon (Linux).** Group membership changes are
+  picked up on the next service start; the operator's interactive
+  shell still needs `newgrp` / relogin separately.
+
+  ```bash
+  sudo systemctl restart agent-bridge
+  newgrp ab-agent-<agent>        # in the operator's own shell, if needed
+  ```
+
+- **launchd-managed daemon (macOS).** v2 isolation is not supported on
+  macOS (see `KNOWN_ISSUES.md` §27 "Isolated-agent group setup on
+  macOS"); this section is Linux-only.
+
+This is a kernel-level behavior — not an Agent Bridge bug — but every
+fresh install and every `agent add --isolated` adds the controller to a
+new group, so it is the single most common source of "v2 isolation
+broke after I added a new agent" reports. See
+[`KNOWN_ISSUES.md` §28](./KNOWN_ISSUES.md#28-supplementary-group-refresh-required-after-first-v2-isolated-agent)
+for the issue entry.
+
 ## Release Checklist
 
 Before pushing bridge changes:

@@ -739,3 +739,38 @@ Stop hooks on macOS emit `[경고] write_agent_state_marker: ensure_matrix_path 
 ### Audit findings
 
 See `docs/audit-2026-05-15.md` for the full P0/P1/P2 catalog (31 bug-surface + 17 stability + 20 isolation-v2 top sites + 5 isolation-v2 buried-assumption + 10 refactor + 17 test/doc-drift findings). Each has an owner-stage in the stabilization plan.
+
+## 28. Supplementary group refresh required after first v2 isolated agent
+
+First-time v2 isolated-agent setup on Linux requires the controller's
+**supplementary group set** to refresh before the controller can
+traverse into the new `ab-agent-<agent>` group's tree. This is a Linux
+kernel behavior — the group set is captured at process exec time and
+not refreshed on later `usermod -aG` — but the symptom looks like a
+permission bug because the on-disk group ownership is already correct.
+
+Symptom (observed during #1151 verification on `cm-prod-agentworkflow-vm01`):
+
+- The controller user IS a member of `ab-agent-<agent>` on disk
+  (`getent group ab-agent-<agent>` shows it).
+- Running controller processes (daemon, operator shell, tmux server,
+  hook subprocesses spawned from those parents) still hold the
+  pre-add supplementary group set.
+- `agent start` / scaffold helpers report `Permission denied` on
+  writes into `$BRIDGE_DATA_ROOT/agents/<agent>/` even though the
+  filesystem ACL looks correct, and the agent never reaches the
+  Claude REPL on first try.
+
+Resolution: log out and log back in (refreshes the full group set in
+one go), or `newgrp ab-agent-<agent>` for a single-group refresh in the
+current shell, THEN restart the daemon (`agent-bridge daemon restart`,
+or `sudo systemctl restart agent-bridge` on a systemd install) so the
+daemon inherits the new group set. See
+[`OPERATIONS.md` §"Supplementary group refresh after first v2 isolated agent"](./OPERATIONS.md#supplementary-group-refresh-after-first-v2-isolated-agent)
+for the full runbook including the systemd / launchd variants.
+
+The defer-guard pattern in PR #1149 / #1151 Track A handles the cases
+where the deferral can be applied at code time; this entry covers the
+operator-side action that is required regardless of how many code
+paths defer correctly, because the group set itself lives in the
+kernel process table.
