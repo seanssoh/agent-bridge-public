@@ -1207,10 +1207,38 @@ bridge_write_managed_markdown() {
 bridge_bootstrap_project_skill() {
   local engine="$1"
   local workdir="$2"
+  # Issue #1155: optional 3rd arg threads the agent id through so the v2-
+  # isolation guard below can resolve roster `os_user`. Legacy callers
+  # without an agent arg (or call sites where agent context is not
+  # resolvable) keep the empty default → guard silently skips, legacy
+  # behavior unchanged. Mirrors the pattern beta10 used for
+  # `bridge_link_shared_claude_skill` (lib/bridge-skills.sh:108-112).
+  local agent="${3-}"
   local skill_dir skill_file reference_file
   local legacy_skill_dir=""
 
   if ! skill_dir="$(bridge_project_skill_dir_for "$engine" "$workdir")"; then
+    return 0
+  fi
+
+  # Issue #1155: under v2 linux-user isolation the workdir is owned by the
+  # isolated UID after Step A, so the controller cannot `mkdir`/`mv` under
+  # `$workdir/.claude/skills/agent-bridge/` (the path written by
+  # `bridge_write_managed_markdown` below). The workdir-side project skill
+  # is dead-code under v2 anyway: Claude launches with `CLAUDE_CONFIG_DIR`
+  # pointed at the isolated home's `.claude/` (see `bridge_run_agent_claude_
+  # root` in bridge-run.sh) and the isolated-home skill set is populated by
+  # `bridge_sync_isolated_home_claude_skills` via `bridge_linux_sudo_root`.
+  # Same reasoning as `bridge_sync_claude_runtime_skills`'s always-skip-
+  # under-v2 branch (lib/bridge-skills.sh:172-175). Without this guard the
+  # unredirected call sites in bridge-start.sh:475/:525 flood operator
+  # stdout with `mkdir: cannot create…` / `mv: failed to access…` right
+  # before tmux session death. Defer when agent context is available and
+  # isolation is effective; legacy non-isolated callers and call sites
+  # without resolvable agent context fall through to the original behavior.
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
     return 0
   fi
 

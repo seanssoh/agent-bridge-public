@@ -882,7 +882,8 @@ run_agent() {
     # Issue #1151: thread $agent so v2-isolation guard polarity fix can
     # resolve roster os_user.
     bridge_ensure_project_claude_guidance "$workdir" "$agent" >/dev/null 2>&1 || true
-    bridge_bootstrap_project_skill "$engine" "$workdir" >/dev/null 2>&1 || true
+    # Issue #1155: thread $agent so v2-isolation guard can resolve roster os_user.
+    bridge_bootstrap_project_skill "$engine" "$workdir" "$agent" >/dev/null 2>&1 || true
     bridge_bootstrap_claude_shared_skills "$agent" "$workdir" >/dev/null 2>&1 || true
     bridge_sync_skill_docs "$agent" >/dev/null 2>&1 || true
     printf 'claude_bridge_guidance: %s\n' "$workdir/CLAUDE.md"
@@ -981,7 +982,8 @@ run_agent() {
   elif [[ "$engine" == "codex" ]]; then
     echo
     echo "== Codex Skills =="
-    bridge_bootstrap_project_skill "$engine" "$workdir" >/dev/null 2>&1 || true
+    # Issue #1155: thread $agent so v2-isolation guard can resolve roster os_user.
+    bridge_bootstrap_project_skill "$engine" "$workdir" "$agent" >/dev/null 2>&1 || true
     bridge_sync_skill_docs "$agent" >/dev/null 2>&1 || true
     printf 'project_skill: %s\n' "$workdir/.codex/skills/agent-bridge/SKILL.md"
 
