@@ -4393,9 +4393,16 @@ grep -E "Onboarding State:[[:space:]]*[A-Za-z0-9._-]+" "$file" 2>/dev/null | hea
           return 0
           ;;
         2)
-          # Marker check itself was unverifiable; trust the SESSION-
-          # TYPE.md reading rather than inventing a false `partial`.
-          printf '%s' "complete"
+          # Issue #1145 sub-B: marker check was unverifiable (controller
+          # couldn't traverse the workdir AND iso-UID probe was
+          # unavailable). Previously this path printed `complete` based
+          # on the SESSION-TYPE.md reading alone, which produced the
+          # false-positive `onboarding_state: complete` that `agent show`
+          # surfaced even when `agent list` correctly flagged the workdir
+          # as `[unreadable]` and `watchdog scan` reported
+          # `scan_error/permission_denied`. Emit `unverifiable` here so
+          # all three diagnostics agree.
+          printf '%s' "unverifiable"
           return 0
           ;;
       esac

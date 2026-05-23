@@ -1370,25 +1370,43 @@ def _ensure_dir_with_sudo(path: Path, os_user: str | None) -> None:
     # caller printed a Python traceback before the sudo fallback even
     # got a chance to silence it on its own line.
     #
-    # New contract:
-    #   - If `os_user` is set (caller already detected isolation),
-    #     route through `sudo -n -u <os_user> mkdir -p <path>` FIRST.
-    #     The isolated UID owns `<v2-root>/<agent>/workdir/` (mode
-    #     2770) so creating `<workdir>/.claude/` under it succeeds
-    #     without controller intervention. On success, return cleanly
-    #     (no PermissionError raised at all → no traceback).
+    # Contract:
+    #   - If `os_user` is None, attempt a best-effort recovery via
+    #     `_isolated_workdir_owner(path)`. Callers that don't already
+    #     know the isolation owner (e.g. callers that derive the path
+    #     from a configuration field without consulting the workdir
+    #     stat) can pass None and still get sudo-first routing on
+    #     isolated trees. Returns None on non-Linux hosts and on
+    #     controller-owned paths, in which case the function preserves
+    #     the original controller-direct `mkdir` shape — byte-for-byte
+    #     unchanged for shared-mode agents.
+    #   - If `os_user` resolves to a name that is NOT the current
+    #     process user, route through `sudo -n -u <os_user> mkdir -p
+    #     <path>` FIRST. The isolated UID owns
+    #     `<v2-root>/<agent>/workdir/` (mode 2770) so creating
+    #     `<workdir>/.claude/` under it succeeds without controller
+    #     intervention. On success, return cleanly (no PermissionError
+    #     raised at all → no traceback).
     #   - If sudo escalation is unavailable (`_sudo_run_as` rc 127,
-    #     non-Linux dev host) or fails (typically because the leaf
-    #     ancestor is missing — caller's create flow has not yet
-    #     materialized the workdir), fall back to a controller-direct
+    #     non-Linux dev host) or fails (typically because an ancestor
+    #     dir denies group write — e.g. `<v2-root>/<agent>/` mode 2750
+    #     where the iso UID is in the group but cannot write, the
+    #     #1145 shape), fall back to a controller-direct
     #     `path.mkdir(parents=True, exist_ok=True)`. On v2 isolation
     #     that controller-direct mkdir will itself fail with
     #     PermissionError — re-raise so the caller sees a real error
-    #     rather than silent partial state.
-    #   - If `os_user` is None (non-isolated host), keep the existing
-    #     controller-direct `mkdir` shape — byte-for-byte unchanged for
-    #     shared-mode agents.
-    if os_user is not None:
+    #     rather than silent partial state. The caller is responsible
+    #     for try/except OSError to surface a structured warning
+    #     (#1145, #1119 / PR #1124 pattern).
+    if os_user is None:
+        os_user = _isolated_workdir_owner(path)
+    current_user = ""
+    try:
+        import pwd
+        current_user = pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, ImportError):
+        current_user = ""
+    if os_user is not None and os_user != current_user:
         rc = _sudo_run_as(os_user, "mkdir", "-p", str(path))
         if rc == 0:
             return
@@ -1471,24 +1489,64 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
     # On non-isolated agents `os_user` is None and every fallback is a
     # no-op — the direct ops succeed first try, byte-for-byte
     # unchanged.
+    #
+    # #1145: even with uid-first owner detection (PR #1142) AND sudo-
+    # first escalation in `_ensure_dir_with_sudo` (PR #1133), the
+    # `sudo -u agent-bridge-<slug> mkdir -p` step can still fail when
+    # the per-agent root `<v2-root>/<agent>/` is `root:ab-agent-<slug>
+    # mode 2750` — the isolated UID is in the group but `2750` denies
+    # group write, so creating `workdir/.claude/` under it requires
+    # root (or a pre-scaffolded `workdir/` with mode 2770 owned by the
+    # iso UID). When `link-shared-settings` runs before the
+    # scaffold-as-root step that materializes `workdir/`, BOTH the
+    # sudo-as-iso mkdir AND the controller-direct fallback raise
+    # PermissionError. Pre-#1145 that bubbled up as a stacked
+    # traceback and the wrapping `agent create` flow lost the rest of
+    # its work. Apply the proven #1119 / PR #1124 watchdog pattern:
+    # wrap the per-agent file-system ops in `try/except OSError`,
+    # emit a structured single-line warning (no traceback), surface
+    # `HOOK_STATUS=permission_denied` in the payload, and return 0 so
+    # the create flow continues. The downstream `bridge_linux_prepare_
+    # agent_isolation` step (which DOES run with root) re-materializes
+    # the link, so the failure is recoverable.
     workdir = Path(args.workdir).expanduser()
-    os_user = _isolated_workdir_owner(workdir)
-    _ensure_dir_with_sudo(settings_path.parent, os_user)
-    _ensure_dir_with_sudo(shared_path.parent, None)
+    try:
+        os_user = _isolated_workdir_owner(workdir)
+        _ensure_dir_with_sudo(settings_path.parent, os_user)
+        _ensure_dir_with_sudo(shared_path.parent, None)
 
-    backup_path = ""
-    status = "unchanged"
+        backup_path = ""
+        status = "unchanged"
 
-    if _safe_path_check("is_symlink", settings_path, os_user):
-        current_target = _safe_realpath(settings_path, os_user)
-        # `shared_path` is controller-owned (lives under shared/ in the
-        # bridge runtime, never inside an isolated workdir). Pass
-        # os_user=None to keep the realpath straightforward and avoid
-        # an unnecessary sudo escalation surface.
-        desired_target = _safe_realpath(shared_path, None)
-        if current_target == desired_target:
-            status = "unchanged"
-        else:
+        if _safe_path_check("is_symlink", settings_path, os_user):
+            current_target = _safe_realpath(settings_path, os_user)
+            # `shared_path` is controller-owned (lives under shared/ in the
+            # bridge runtime, never inside an isolated workdir). Pass
+            # os_user=None to keep the realpath straightforward and avoid
+            # an unnecessary sudo escalation surface.
+            desired_target = _safe_realpath(shared_path, None)
+            if current_target == desired_target:
+                status = "unchanged"
+            else:
+                try:
+                    settings_path.unlink()
+                except PermissionError:
+                    if os_user is None:
+                        raise
+                    rc = _sudo_run_as(os_user, "rm", "-f", str(settings_path))
+                    if rc != 0:
+                        raise
+                status = "updated"
+        elif _safe_path_check("exists", settings_path, os_user):
+            backup = next_backup_path(settings_path)
+            try:
+                shutil.copy2(settings_path, backup)
+            except PermissionError:
+                if os_user is None:
+                    raise
+                rc = _sudo_run_as(os_user, "cp", "-p", str(settings_path), str(backup))
+                if rc != 0:
+                    raise
             try:
                 settings_path.unlink()
             except PermissionError:
@@ -1497,40 +1555,58 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
                 rc = _sudo_run_as(os_user, "rm", "-f", str(settings_path))
                 if rc != 0:
                     raise
+            backup_path = str(backup)
             status = "updated"
-    elif _safe_path_check("exists", settings_path, os_user):
-        backup = next_backup_path(settings_path)
-        try:
-            shutil.copy2(settings_path, backup)
-        except PermissionError:
-            if os_user is None:
-                raise
-            rc = _sudo_run_as(os_user, "cp", "-p", str(settings_path), str(backup))
-            if rc != 0:
-                raise
-        try:
-            settings_path.unlink()
-        except PermissionError:
-            if os_user is None:
-                raise
-            rc = _sudo_run_as(os_user, "rm", "-f", str(settings_path))
-            if rc != 0:
-                raise
-        backup_path = str(backup)
-        status = "updated"
-    else:
-        status = "updated"
+        else:
+            status = "updated"
 
-    if not _safe_path_check("exists", settings_path, os_user):
-        rel_target = os.path.relpath(shared_path, start=settings_path.parent)
-        try:
-            settings_path.symlink_to(rel_target)
-        except PermissionError:
-            if os_user is None:
-                raise
-            rc = _sudo_run_as(os_user, "ln", "-s", rel_target, str(settings_path))
-            if rc != 0:
-                raise
+        if not _safe_path_check("exists", settings_path, os_user):
+            rel_target = os.path.relpath(shared_path, start=settings_path.parent)
+            try:
+                settings_path.symlink_to(rel_target)
+            except PermissionError:
+                if os_user is None:
+                    raise
+                rc = _sudo_run_as(os_user, "ln", "-s", rel_target, str(settings_path))
+                if rc != 0:
+                    raise
+    except OSError as exc:
+        # #1145: surface a structured single-line warning so the operator
+        # sees WHY the link failed (which UID, which path, what errno
+        # name) without a Python traceback that obscures the rest of the
+        # `agent create` envelope. Matches the watchdog #1119/PR #1124
+        # `scan_error` shape: stable `error_kind` token + the failing
+        # path. The downstream isolation-prepare step is privileged and
+        # will re-link the settings under root; returning 0 with the
+        # structured payload keeps the wrapping create flow intact.
+        if isinstance(exc, PermissionError):
+            error_kind = "permission_denied"
+        elif isinstance(exc, FileNotFoundError):
+            error_kind = "not_found"
+        else:
+            error_kind = "os_error"
+        error_path = getattr(exc, "filename", None) or str(settings_path)
+        print(
+            f"[bridge-hooks] link-shared-settings: "
+            f"{type(exc).__name__} ({exc.strerror or exc}); "
+            f"path={error_path}; iso_user={os_user or '-'}",
+            file=sys.stderr,
+        )
+        failure_payload = {
+            "HOOK_SETTINGS_FILE": str(settings_path),
+            "HOOK_STATUS": error_kind,
+            "HOOK_STOP_HOOK": "",
+            "HOOK_PROMPT_HOOK": "",
+            "HOOK_COMMAND": str(shared_path),
+            "HOOK_ADDITIONAL_CONTEXT": f"error_path={error_path}",
+        }
+        print_payload(failure_payload, args.format)
+        if args.format == "shell":
+            print(shell_line("HOOK_BACKUP_FILE", ""))
+            print(shell_line("HOOK_SYMLINK_TARGET", ""))
+            print(shell_line("HOOK_ERROR_KIND", error_kind))
+            print(shell_line("HOOK_ERROR_PATH", str(error_path)))
+        return 0
 
     payload = {
         "HOOK_SETTINGS_FILE": str(settings_path),
