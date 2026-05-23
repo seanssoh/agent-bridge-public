@@ -3233,7 +3233,8 @@ report and reap test-fixture agents per their pattern."
       bridge_ensure_project_claude_guidance "$workdir" "$agent" >/dev/null 2>&1 || true
       bridge_ensure_auto_memory_isolation "$agent" "$workdir"
     fi
-    bridge_bootstrap_project_skill "$engine" "$workdir" >/dev/null 2>&1 || true
+    # Issue #1155: thread $agent so v2-isolation guard can resolve roster os_user.
+    bridge_bootstrap_project_skill "$engine" "$workdir" "$agent" >/dev/null 2>&1 || true
     if [[ "$engine" == "claude" ]]; then
       bridge_bootstrap_claude_shared_skills "$agent" "$workdir" >/dev/null 2>&1 || true
       # Plan-D memory stack: ensure PreCompact hook at scaffold time so new
