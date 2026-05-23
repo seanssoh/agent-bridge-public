@@ -199,7 +199,7 @@ json_escape() {
 # r3 P2 #2 case (the only whitespace-tolerant shape that has shown up in
 # the tree). r3 fix for codex PR #954 r2 finding P2 #2 — combined with the
 # tightening above to avoid prose-text false positives.
-RE_HEREDOC_OP='<<-?([[:space:]]*["'"'"'][A-Za-z_][A-Za-z0-9_]*["'"'"']|["'"'"']?[A-Za-z_][A-Za-z0-9_]*["'"'"']?)'
+RE_HEREDOC_OP='<<-?([[:space:]]*["'"'"'][A-Za-z_][A-Za-z0-9_]*["'"'"']|[[:space:]]*[A-Za-z_][A-Za-z0-9_]*)'
 RE_HERESTRING='<<<'
 RE_PROCSUB_IN='<[[:space:]]+<\('
 RE_PROCSUB_OUT='>[[:space:]]+>\('
@@ -214,7 +214,12 @@ RE_BASH_S='(^|[^A-Za-z0-9_/.-])bash[[:space:]]+-s([[:space:]]|$)'
 # heredoc-stdin-to-bash-subprocess shape as `bash -s <<TAG`. Earlier
 # the scanner only matched `-s`; this catches the bare form so
 # slipped-through smokes get flagged.
-RE_BASH_BARE_HEREDOC='(^|[^A-Za-z0-9_/.-])bash[[:space:]]+<<-?'
+#
+# r3 (codex #5825): widened to also catch `bash << TAG` (whitespace
+# between `<<` and the tag, which bash accepts). Matches any heredoc
+# operator immediately following `bash<whitespace>` regardless of
+# whether the tag is directly attached.
+RE_BASH_BARE_HEREDOC='(^|[^A-Za-z0-9_/.-])bash[[:space:]]+<<-?[[:space:]]*'
 
 # Is the heredoc operator on this line preceded by `$(` or backtick on
 # the SAME line — i.e. it opens a capture-wrapped heredoc? Cross-line
