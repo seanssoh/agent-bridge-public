@@ -3782,7 +3782,12 @@ PY
   # always-on" on a previously-unconfigured agent reports `changed=true`
   # and the writer persists the IDLE_TIMEOUT="0" line.
   local before_idle_timeout_configured=0
-  if [[ -f "$roster_path" ]] && grep -q "^BRIDGE_AGENT_IDLE_TIMEOUT\[\"${agent}\"\]=" "$roster_path"; then
+  # Codex r1 BLOCKING: use -F (fixed-string) so a `.` (or any regex
+  # metacharacter) in the agent name doesn't act as a wildcard — an
+  # agent named `a.b` would otherwise falsely match `axb`'s timeout
+  # line. The key form is structurally unique inside the roster, so a
+  # fixed-string contains-match is correct.
+  if [[ -f "$roster_path" ]] && grep -qF "BRIDGE_AGENT_IDLE_TIMEOUT[\"${agent}\"]=" "$roster_path"; then
     before_idle_timeout_configured=1
   fi
 
