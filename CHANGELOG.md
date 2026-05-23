@@ -32,7 +32,7 @@ implement-ok (task #5975). `-beta12` prerelease; matching tag
   start. This was a **long-standing** ordering gap, not a beta11
   regression — beta9/10's controller-side Permission denied flood
   crashed agents before they ever reached the marker check.
-  
+
   Three-layer fix:
   - **Marker validator identity exemption** — accepts
     `BRIDGE_CONTROLLER_UID` (already exported by
@@ -51,7 +51,7 @@ implement-ok (task #5975). `-beta12` prerelease; matching tag
     No-op currently (controller doesn't export the variable at fork
     time outside `bridge-cron.sh`), but defensive for any future
     controller-export path.
-  
+
   Three review rounds: r1 BLOCKING (identity exemption correct but
   load-order makes it no-op) → r2 BOTH-strategy fix + load-order
   smoke → r3 BLOCKING (load-order smoke missing from ci-select-smoke.sh)
