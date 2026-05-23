@@ -106,7 +106,10 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed isolated-agent-delete-reap nudge-task-age-gate nudge-redundant-active-agent tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1058-bootstrap-tmux-ux legacy-install-migrator 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1113-watchdog-legacy-backfill
+
+  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed isolated-agent-delete-reap nudge-task-age-gate nudge-redundant-active-agent tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1058-bootstrap-tmux-ux legacy-install-migrator 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1113-watchdog-legacy-backfill 1115-cli-usage-drift
+
+
 }
 
 add_all_integration() {
@@ -198,6 +201,15 @@ select_for_path() {
       add_all_live
       ;;
 
+    scripts/cli-help/*)
+      # Issues #1115 + #1116: the operator-facing CLI usage template
+      # (scripts/cli-help/agent-bridge-usage.txt) must stay in lockstep
+      # with the dispatcher's case-switch. Pull 1115-cli-usage-drift on
+      # every template edit so a future PR cannot regress the documented
+      # surface (a missing PUBLIC subcommand or a leaked INTERNAL one).
+      add_required 1115-cli-usage-drift
+      ;;
+
     bridge-setup.py|bridge-setup.sh|bridge-status.py|bridge-status.sh)
       # Issue #835 Wave B: bridge-status.py gained the
       # `starting/stalled before engine` rendering branch — cover the
@@ -217,7 +229,13 @@ select_for_path() {
       # handoffs through bridge-task.sh create as its enqueue boundary,
       # so a change to that boundary must re-run the A2A end-to-end
       # smoke alongside the queue regression smokes.
-      add_required queue nudge-task-age-gate nudge-redundant-active-agent a2a-cross-bridge 1100-audit-since-tz
+      #
+      # Issues #1115 + #1116: bridge-task.sh hosts the `create` shorthand
+      # that agent-bridge dispatches via the inbox|show|claim|done|…|create
+      # alt and the smoke's T2 documents-every-public-toplevel check. Pull
+      # 1115-cli-usage-drift so a change to bridge-task.sh's case dispatch
+      # cannot silently invalidate the operator-facing shorthand surface.
+      add_required queue nudge-task-age-gate nudge-redundant-active-agent a2a-cross-bridge 1100-audit-since-tz 1115-cli-usage-drift
       add_integration integration-minimal
       ;;
 
@@ -254,7 +272,13 @@ select_for_path() {
       # CLAUDE_CONFIG_DIR to the python helpers; bridge-sync.sh's
       # refresh_missing_session_ids is one of the callers. Cover the
       # config-root resolution smoke whenever either file moves.
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir
+      # Issue #1116: bridge-cron.sh's `case "$subcommand" in` block must
+      # stay in lockstep with the operator-facing usage template's
+      # `cron <…>` line + the typo-suggestion candidate list. Pull
+      # 1115-cli-usage-drift on every cron dispatcher move so a future
+      # PR cannot regress an internal subcommand back into the public
+      # surface (or drop a public one).
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -316,7 +340,13 @@ select_for_path() {
       # three-layer agent-layout smokes whenever bridge-agent.sh or
       # bridge-start.sh moves so a future PR cannot regress the D1
       # scaffold-then-materialize inversion back to the empty-sibling bug.
-      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1028-isolated-workdir-check v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning
+      # Issues #1115 + #1116: the agent-bridge top-level dispatch + the
+      # bridge-agent.sh subcommand surface must stay in lockstep with the
+      # operator-facing usage template at scripts/cli-help/agent-bridge-
+      # usage.txt and with the `_top_valid` typo-suggestion array. Pull
+      # 1115-cli-usage-drift on every dispatcher move so a future PR
+      # cannot silently regress the documented surface.
+      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1028-isolated-workdir-check v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning 1115-cli-usage-drift
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;

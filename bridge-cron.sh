@@ -22,7 +22,6 @@ Usage:
   $(basename "$0") enqueue <job-name-or-id> [--slot <slot-key>] [--target <bridge-agent>] [--from <actor>] [--priority normal|high] [--dry-run]
   $(basename "$0") sync [--dry-run] [--json] [--since <iso-datetime>] [--now <iso-datetime>]
   $(basename "$0") run-subagent <run-id> [--dry-run]
-  $(basename "$0") finalize-run <run-id> [--json]
   $(basename "$0") errors report [--agent <agent>] [--family <family>] [--limit <count>] [--json]
   $(basename "$0") cleanup report [--mode expired-one-shot] [--json]
   $(basename "$0") cleanup prune [--mode expired-one-shot] [--dry-run]
@@ -1293,8 +1292,13 @@ case "$subcommand" in
   *)
     # Issue #163: attach an intent-recovery suggestion before dying so the
     # caller sees "혹시 X?" instead of just the bare rejection.
+    # Refs #1116: `finalize-run` is an internal runtime callback (only
+    # bridge-daemon.sh invokes it on cron run completion) — keep it
+    # dispatchable above but absent from this typo-suggestion list so
+    # operators don't reverse-engineer it from the rejection path. Every
+    # other entry is operator-facing.
     _hint="$(bridge_suggest_subcommand "cron $subcommand" \
-      "inventory show import list create update delete rebalance-memory-daily migrate-payloads enqueue sync run-subagent finalize-run errors cleanup")"
+      "inventory show import list create update delete rebalance-memory-daily migrate-payloads enqueue sync run-subagent errors cleanup")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 cron 명령입니다: $subcommand"
     ;;

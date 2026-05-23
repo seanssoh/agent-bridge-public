@@ -979,7 +979,13 @@ EOF
   # sqlite3 fallback path. Reject with an intent-recovery suggestion
   # before the spawn parser sees it.
   if [[ -n "${1:-}" && "${1:0:1}" != "-" ]]; then
-    _top_valid="admin bootstrap init version upgrade daemon auth escalate upstream review user guard diagnose doctor knowledge config bundle plugins intake list status kill attach urgent task profile setup agent cron memory audit usage watchdog discord migrate wiki isolate unisolate worktree inbox show claim done cancel update handoff summary create"
+    # Refs #1115: include every top-level branch enumerated in the
+    # `case "$1" in` block above (admin..wave..a2a..worktree, plus the
+    # inbox|show|claim|done|cancel|update|handoff|summary|create alt).
+    # `1115-cli-usage-drift` smoke asserts this list stays synchronized
+    # with the dispatcher so a future PR cannot silently regress the
+    # typo-suggestion blind spot.
+    _top_valid="a2a admin agent attach audit auth bootstrap bundle cancel claim config create cron daemon diagnose discord doctor done escalate guard handoff inbox init intake isolate isolation kill knowledge list memory migrate plugins profile review setup show skills status summary task unisolate update upgrade upstream urgent usage user version watchdog wave wiki worktree"
     _hint="$(bridge_suggest_subcommand "$1" "$_top_valid")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 명령입니다: $1"
