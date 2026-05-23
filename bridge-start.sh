@@ -598,6 +598,23 @@ fi
 if [[ -n "$AGENT_ENV_FILE" ]]; then
   SESSION_CMD="BRIDGE_AGENT_ENV_FILE=$(printf '%q' "$AGENT_ENV_FILE") ${SESSION_CMD}"
 fi
+# Issue #1158 r2: inline BRIDGE_CONTROLLER_UID into the SESSION_CMD env
+# prefix so it is available at bridge-lib.sh source time inside the
+# isolated child (i.e. when bridge-marker-bootstrap.sh validates the
+# layout marker). The per-agent env file at $BRIDGE_AGENT_ENV_FILE also
+# carries this value (lib/bridge-agents.sh:3461-3462), but that file is
+# only sourced LATER inside bridge_load_roster — AFTER marker
+# validation has already run. Without this inline prefix the marker
+# validator sees an empty exported controller UID and rejects a
+# controller-owned marker under sudo -u <agent_user>, killing v2
+# linux-user isolated starts (#1158). Belt-and-suspenders: the variable
+# is also in bridge_agent_preserved_env_vars() so any future controller
+# path that exports it flows through too.
+if [[ -z "${BRIDGE_CONTROLLER_UID:-}" ]]; then
+  SESSION_CMD="BRIDGE_CONTROLLER_UID=$(printf '%q' "$(id -u)") ${SESSION_CMD}"
+else
+  SESSION_CMD="BRIDGE_CONTROLLER_UID=$(printf '%q' "$BRIDGE_CONTROLLER_UID") ${SESSION_CMD}"
+fi
 # Issue #1118: resolve the engine binary's absolute path on the controller
 # and propagate it into the sudo'd child via the SESSION_CMD env prefix.
 # Without this, a v2 linux-user-isolated agent's `bash -lc "claude ..."`
