@@ -235,15 +235,36 @@ bridge_auth_fix_legacy_secret_file_mode() {
   local group=""
   local file_mode="0600"
 
+  # The Claude Code token is a controller-shared secret (one credential,
+  # all agents share the same login). The correct isolation primitive is
+  # ab-shared (#998 PR A), NOT the per-agent ab-agent-<name> group (#998
+  # PR B) which applies only to per-agent secrets such as channel dotenvs.
+  #
+  # Branch on the agent's effective isolation mode:
+  #   - shared-mode: controller and agent are the same UID — no cross-UID
+  #     gap to bridge. Apply 0600 and return; chown is a no-op.
+  #   - linux-user isolated: chown to <controller>:ab-shared (mode 0640) so
+  #     the isolated UID (a member of ab-shared) can read the credential.
   if bridge_isolation_v2_active 2>/dev/null; then
-    group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
-    if [[ -n "$group" ]] && bridge_isolation_v2_group_exists "$group"; then
-      file_mode="0640"
-      bridge_auth_run_privileged chown "$(id -un):$group" "$file" || return 1
-    elif [[ "${BRIDGE_CLAUDE_TOKEN_SYNC_ALLOW_CURRENT_GROUP_FALLBACK:-0}" != "1" ]]; then
-      printf '[error] v2 group missing after legacy secret scrub for %s: %s\n' "$agent" "$group" >&2
-      return 1
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      group="${BRIDGE_SHARED_GROUP:-ab-shared}"
+      if bridge_isolation_v2_group_exists "$group"; then
+        file_mode="0640"
+        bridge_auth_run_privileged chown "$(id -un):$group" "$file" || return 1
+      else
+        # Codex r1 BLOCKING: linux-user isolated agent without the
+        # shared group means the install is misconfigured. Returning success
+        # with mode 0600 here would let sync report status=ok while the next
+        # isolated launch fails — `bridge_isolation_v2_load_secret_env`
+        # cannot read the controller-owned 0600 secret env file under the
+        # isolated UID. Hard-fail so `bridge_auth_sync_agents` records the
+        # agent as failed. Shared-mode agents never reach this branch (they
+        # short-circuit on the predicate above), so the M2 fix is preserved.
+        printf '[error] auth sync: %s group missing for isolated agent %s; install misconfigured\n' "$group" "$agent" >&2
+        return 1
+      fi
     fi
+    # shared-mode agent: same UID as controller — 0600 is correct, no chown needed.
   fi
   chmod "$file_mode" "$file" 2>/dev/null || bridge_auth_run_privileged chmod "$file_mode" "$file"
 }
