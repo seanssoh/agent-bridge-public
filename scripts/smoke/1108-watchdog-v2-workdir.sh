@@ -114,42 +114,9 @@ OUT_JSON="$("$PY_BIN" "$REPO_ROOT/bridge-watchdog.py" scan --json \
 # registry id (not "workdir" — the basename of the resolved scan path).
 # `set -e` is not in effect (the file opts out for finer cleanup control)
 # so wrap the python assertions in an explicit rc check.
-"$PY_BIN" - "$OUT_JSON" "$AGENT" "$V2_WORKDIR" <<'PY' || smoke_fail "T1+T2 assertions failed (see traceback above) — pre-fix watchdog scanned the wrong tree"
-import json, sys
-payload = json.loads(sys.argv[1])
-agent_id = sys.argv[2]
-expected_workdir = sys.argv[3]
-rows = {row["agent"]: row for row in payload["agents"]}
-assert agent_id in rows, (
-    f"T2 FAIL: agent field is not the registry id. rows={list(rows)} "
-    f"(expected key '{agent_id}'). "
-    f"If 'workdir' appears as an agent name, the watchdog leaked the "
-    f"basename of the resolved scan path through agent_dir.name."
-)
-row = rows[agent_id]
-assert row["missing_files"] == [], (
-    f"T1 FAIL: missing_files non-empty on v2 agent — watchdog still "
-    f"scanning the tracked-tree dir instead of the registry workdir. "
-    f"missing_files={row['missing_files']}"
-)
-assert row["status"] == "ok", (
-    f"T1 FAIL: status={row['status']} for v2 agent with full profile "
-    f"in registry workdir ({expected_workdir}). Pre-fix this was "
-    f"'error' due to the dual-tree scan. row={row}"
-)
-assert row["missing_managed_claude_block"] is False, (
-    f"T1 FAIL: managed block flagged missing on v2 agent — watchdog "
-    f"reading the wrong CLAUDE.md. row={row}"
-)
-assert row["session_type"] == "static-claude", (
-    f"T1 FAIL: session_type not parsed from registry workdir's "
-    f"SESSION-TYPE.md. row={row}"
-)
-assert payload["problem_count"] == 0, (
-    f"T1 FAIL: problem_count={payload['problem_count']} — v2 agent "
-    f"with full runtime profile must not surface as a problem."
-)
-PY
+"$PY_BIN" "$REPO_ROOT/scripts/smoke/1108-helpers/assert-v2-watchdog.py" \
+  "$OUT_JSON" "$AGENT" "$V2_WORKDIR" \
+  || smoke_fail "T1+T2 assertions failed — pre-fix watchdog scanned the wrong tree (codex r1 footgun #11 fix: extracted to helper)"
 smoke_log "T1+T2 PASS: v2 agent with runtime profile in data/agents/<a>/workdir/ classifies ok"
 
 # T3: legacy / no-workdir shape — the registry payload lacks `workdir`,
@@ -192,21 +159,9 @@ EOF
 OUT_LEGACY_JSON="$("$PY_BIN" "$REPO_ROOT/bridge-watchdog.py" scan --json \
   --agent-registry-json "$REGISTRY_LEGACY_JSON" 2>>"$SMOKE_TMP_ROOT/stderr.log")"
 
-"$PY_BIN" - "$OUT_LEGACY_JSON" "$LEGACY_AGENT" <<'PY' || smoke_fail "T3 assertions failed (see traceback above)"
-import json, sys
-payload = json.loads(sys.argv[1])
-agent_id = sys.argv[2]
-rows = {row["agent"]: row for row in payload["agents"]}
-assert agent_id in rows, rows
-row = rows[agent_id]
-assert row["status"] == "ok", (
-    f"T3 FAIL: legacy fallback broken. status={row['status']} on a "
-    f"well-formed legacy agent (no workdir in registry). The "
-    f"watchdog must keep scanning <agent_home_root>/<name>/ when the "
-    f"registry has no workdir. row={row}"
-)
-assert row["missing_files"] == [], row
-PY
+"$PY_BIN" "$REPO_ROOT/scripts/smoke/1108-helpers/assert-legacy-watchdog.py" \
+  "$OUT_LEGACY_JSON" "$LEGACY_AGENT" \
+  || smoke_fail "T3 assertions failed (codex r1 footgun #11 fix: extracted to helper)"
 smoke_log "T3 PASS: legacy (no-workdir-in-registry) agent still scans the tracked tree"
 
 smoke_log "all 3 tests PASS (#1108)"
