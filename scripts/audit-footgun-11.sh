@@ -266,6 +266,12 @@ line_has_heredoc_like() {
   if [[ "$line" =~ $RE_HERESTRING ]]; then return 0; fi
   if [[ "$line" =~ $RE_PROCSUB_IN ]]; then return 0; fi
   if [[ "$line" =~ $RE_PROCSUB_OUT ]]; then return 0; fi
+  # r4 (codex #5834): include the scoped bare-bash-heredoc form so
+  # `bash << TAG` (whitespace between op + tag) reaches classify_line.
+  # The original RE_HEREDOC_OP refuses whitespace before unquoted tag
+  # (to avoid false positives on string content like `elapsed << interval`),
+  # so we add this guard arm that REQUIRES the leading `bash` keyword.
+  if [[ "$line" =~ $RE_BASH_BARE_HEREDOC ]]; then return 0; fi
   return 1
 }
 
