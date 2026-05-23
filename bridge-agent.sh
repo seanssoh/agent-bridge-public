@@ -130,6 +130,12 @@ bridge_agent_manage_python() {
   python3 - "$@"
 }
 
+# bridge_scaffold_codex_entrypoint and bridge_ensure_codex_agent_hooks are
+# defined in lib/bridge-agents.sh and lib/bridge-hooks.sh respectively,
+# which bridge-lib.sh sources before this script runs. They are available
+# to smoke drivers via bridge-lib.sh without sourcing bridge-agent.sh.
+# See issue #1067 (S03, S08) for the contract.
+
 # bridge_ensure_memory_precompact_hook — wire the Plan-D PreCompact hook
 # into an agent's .claude/settings.json. Safe to call repeatedly; the
 # bridge-hooks.py helper already short-circuits when the hook is present.
@@ -2806,6 +2812,14 @@ report and reap test-fixture agents per their pattern."
     # in-roster lookup inside scaffold would short-circuit the sudo path
     # — see the comment on `bridge_scaffold_agent_home`'s signature.
     bridge_scaffold_agent_home "$agent" "$scaffold_target" "$display_name" "$role_text" "$engine" "$session_type" "$isolation_mode" "$os_user"
+    # Issue #1067 S03: create the engine-native instruction-file entrypoint
+    # in the identity source. The template scaffold loop places CLAUDE.md for
+    # every engine; for Codex (entrypoint=AGENTS.md) this step copies that
+    # payload to AGENTS.md so the Codex runtime finds its role contract under
+    # the canonical filename. bridge_layout_materialize_identity (below) then
+    # delivers AGENTS.md into the workspace. No-op for Claude (entrypoint is
+    # already CLAUDE.md).
+    bridge_scaffold_codex_entrypoint "$scaffold_target" "$engine" 2>/dev/null || true
     # Per-user partitions (`users/<id>/USER.md`) are per-agent identity,
     # so they are scaffolded into the IDENTITY SOURCE alongside the rest
     # of the authored identity — the `users/` skeleton template lands
@@ -2846,6 +2860,16 @@ report and reap test-fixture agents per their pattern."
       # Plan-D memory stack: ensure PreCompact hook at scaffold time so new
       # agents come up fully wired without a separate bootstrap pass.
       bridge_ensure_memory_precompact_hook "$agent" "$workdir" >/dev/null 2>&1 || true
+    fi
+    # Issue #1067 S08: render + verify the Codex hook surface for codex-engine
+    # agents. The descriptor-owned path is <agent_home>/.codex/hooks.json —
+    # NOT the shared $HOME/.codex/hooks.json. scaffold_target is the resolved
+    # identity source (bridge_layout_agent_home on v2). bridge_engine_render_
+    # hooks_on_create returns true for codex, so we gate on engine == "codex"
+    # to stay forward-compatible without branching on the descriptor (which
+    # the descriptor owns for future engines).
+    if [[ "$engine" == "codex" ]]; then
+      bridge_ensure_codex_agent_hooks "$agent" "$scaffold_target" >/dev/null 2>&1 || true
     fi
     bridge_write_role_block \
       "$agent" \

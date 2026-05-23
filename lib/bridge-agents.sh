@@ -7616,3 +7616,33 @@ bridge_upsert_env_value() {
   fi
   mv "$tmp_file" "$env_file"
 }
+
+# bridge_scaffold_codex_entrypoint <home> <engine>
+#
+# Issue #1067 S03: write AGENTS.md as the engine-native entrypoint for a
+# Codex agent into its identity source (agent_home). The template scaffold
+# loop places CLAUDE.md for every engine (the template only has CLAUDE.md);
+# for Codex the native instruction-file convention is AGENTS.md. This
+# function creates AGENTS.md as a copy of CLAUDE.md in the same directory
+# so the Codex runtime finds its role contract under the canonical filename,
+# and bridge_layout_materialize_identity then delivers AGENTS.md into the
+# workspace (the descriptor already lists the engine entrypoint in its copy
+# set). Safe to call for any engine — it is a no-op when the descriptor
+# entrypoint is CLAUDE.md (i.e., not Codex).
+#
+# Called from bridge-agent.sh (post-scaffold, before materialize) and
+# available from lib so smoke drivers sourcing bridge-lib.sh can assert
+# the S03 contract without sourcing the full bridge-agent.sh script.
+bridge_scaffold_codex_entrypoint() {
+  local home="$1"
+  local engine="$2"
+  [[ -n "$home" && -n "$engine" ]] || return 0
+  local entrypoint=""
+  if declare -F bridge_engine_entrypoint_filename >/dev/null 2>&1; then
+    entrypoint="$(bridge_engine_entrypoint_filename "$engine" 2>/dev/null || printf '')"
+  fi
+  [[ -n "$entrypoint" && "$entrypoint" != "CLAUDE.md" ]] || return 0
+  [[ -f "$home/CLAUDE.md" ]] || return 0
+  [[ -f "$home/$entrypoint" ]] && return 0
+  cp -f "$home/CLAUDE.md" "$home/$entrypoint" 2>/dev/null || true
+}

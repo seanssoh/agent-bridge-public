@@ -121,10 +121,15 @@ write_driver_script() {
     'SCRIPT_DIR="$REPO_ROOT"' \
     'source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1' \
     'FUNC_TMP="$DRIVER_TMP_DIR/scaffold-funcs.sh"' \
+    '# Line ranges updated post-CODEX-PROV (#1067): scaffold moved from' \
+    '# 385→391 and render_template ranges shifted. Function-by-name extract' \
+    '# via awk is fragile here because render_template_string contains a' \
+    '# Python heredoc whose dict closes with `^}$` mid-function. Sticking' \
+    '# with explicit line ranges, kept in sync when bridge-agent.sh changes.' \
     '{' \
-    '  sed -n "128,139p" "$REPO_ROOT/bridge-agent.sh"' \
-    '  sed -n "188,257p" "$REPO_ROOT/bridge-agent.sh"' \
-    '  sed -n "385,618p" "$REPO_ROOT/bridge-agent.sh"' \
+    '  sed -n "128,131p" "$REPO_ROOT/bridge-agent.sh"' \
+    '  sed -n "194,231p" "$REPO_ROOT/bridge-agent.sh"' \
+    '  sed -n "391,624p" "$REPO_ROOT/bridge-agent.sh"' \
     '} > "$FUNC_TMP"' \
     'source "$FUNC_TMP"' \
     'declare -F bridge_scaffold_agent_home >/dev/null 2>&1 || { echo "DRIVER_FAIL: bridge_scaffold_agent_home not loaded"; exit 91; }' \
