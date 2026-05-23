@@ -8,7 +8,11 @@
 #   4  reconcile succeeds (transcript_path on stdin) → daily note has new content
 #   5  reconcile fails (jsonl unreadable) → exit 0 + non-blocking error
 #   6  reconcile times out (sleep 60 stub) → exit 0 + timeout warning
-#   7  agents/_template/.claude/settings.json is valid JSON
+#   7  agents/.claude/settings.json (shared renderer base) is valid JSON
+#      and registers the full Stop suite — surface-reply-enforce.py +
+#      session-stop.py. The renderer is the SSOT (#1068), so the suite
+#      is verified on the rendered base, not on the now-minimal
+#      agents/_template/.claude/settings.json bootstrap marker.
 #
 # Exit code: 0 if all cases PASS, 1 otherwise.
 #
@@ -272,8 +276,13 @@ else
 fi
 
 # ---------- case 7: settings.json is valid JSON ----------
-banner 7 "agents/_template/.claude/settings.json validates"
-SETTINGS="$REPO_ROOT/agents/_template/.claude/settings.json"
+# #1068 HOOKS-SSOT: the SSOT for the rendered hook surface is
+# agents/.claude/settings.json (the renderer's base), not the
+# now-minimal agents/_template/.claude/settings.json bootstrap marker.
+# Verify the full Stop suite (surface-reply-enforce.py + session-stop.py
+# with timeout 35) is present on the shared base.
+banner 7 "agents/.claude/settings.json (renderer base) validates Stop suite"
+SETTINGS="$REPO_ROOT/agents/.claude/settings.json"
 if "$PYTHON" -c "
 import json, sys
 data = json.load(open('$SETTINGS', encoding='utf-8'))
@@ -293,6 +302,12 @@ for entry in stop:
         if 'session-stop.py' in (h.get('command') or ''):
             if h.get('timeout') != 35:
                 sys.exit(f'session-stop timeout != 35 (got {h.get(\"timeout\")})')
+# Verify the template marker is the empty bootstrap shape {} — anything
+# else would be a second source of truth for the hook surface.
+TEMPLATE = '$REPO_ROOT/agents/_template/.claude/settings.json'
+template = json.load(open(TEMPLATE, encoding='utf-8'))
+if template != {}:
+    sys.exit(f'template marker must be empty bootstrap shape; got {template!r}')
 "; then
   pass 7
 else

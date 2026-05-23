@@ -4,6 +4,33 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+
+# Issue #1101: defensive unset of stale BRIDGE_LAYOUT/BRIDGE_DATA_ROOT before
+# sourcing bridge-lib.sh. This is the launch envelope tmux runs as the pane's
+# session command, so anything we drop here is never seen by the child agent
+# process (Claude/Codex) or any Bash-tool subshells it spawns inside the pane.
+#
+# Background: PR #1019 §B stopped the daemon's launch-envelope writer
+# (`bridge_write_linux_agent_env_file`) from baking `BRIDGE_LAYOUT=legacy`
+# into the per-agent env file, and the layout-resolver demotes the same
+# value when a v2 marker exists. But on installs that ran a pre-#1019 daemon
+# with `BRIDGE_LAYOUT=legacy` in its ambient env (operator shell rc, stale
+# tmux server env, …), the value was already copied into the parent process
+# chain (daemon → bridge-start.sh → tmux new-session) BEFORE the resolver
+# demoted it, so every pane this script launches still inherits the stale
+# value. The resolver in the resulting child shells then re-fires the
+# "stale pre-v0.8.0 env override" warning on every CLI call.
+#
+# Gating: only drop when a valid v2 layout marker is present. Without a
+# marker the resolver's hard-die path is the correct outcome — operators on
+# legacy installs need the upgrade prompt, not a silent normalization.
+_bridge_run_layout_marker="${BRIDGE_LAYOUT_MARKER_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}/layout-marker.sh"
+if [[ -f "$_bridge_run_layout_marker" ]] \
+    && [[ "${BRIDGE_LAYOUT:-}" == "legacy" || "${BRIDGE_LAYOUT:-}" == "v1" ]]; then
+  unset BRIDGE_LAYOUT BRIDGE_DATA_ROOT
+fi
+unset _bridge_run_layout_marker
+
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 

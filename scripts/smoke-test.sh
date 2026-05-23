@@ -3918,7 +3918,11 @@ assert_contains "$CODEX_LAUNCH_DRY_RUN" "launch=codex -c features.codex_hooks=tr
 # so a roster with only codex_hooks (pre-hotfix default) gets fast_mode
 # auto-injected on next wake; this assertion locks the post-hotfix shape.
 assert_contains "$CODEX_LAUNCH_DRY_RUN" "features.fast_mode=true"
-CODEX_SESSION_START_OUTPUT="$(BRIDGE_AGENT_ID="$SMOKE_AGENT" python3 "$REPO_ROOT/hooks/codex-session-start.py")"
+# #1068 HOOKS-SSOT: the renderer installs the direct `session-start.py
+# --format codex` spelling; the legacy `codex-session-start.py` wrapper
+# was removed. Smoke verifies the direct form satisfies the Codex
+# SessionStart hook contract.
+CODEX_SESSION_START_OUTPUT="$(BRIDGE_AGENT_ID="$SMOKE_AGENT" python3 "$REPO_ROOT/hooks/session-start.py" --format codex)"
 assert_contains "$CODEX_SESSION_START_OUTPUT" "\"hookEventName\": \"SessionStart\""
 assert_contains "$CODEX_SESSION_START_OUTPUT" "agb inbox $SMOKE_AGENT"
 cat >"$CLAUDE_STATIC_WORKDIR/NEXT-SESSION.md" <<'EOF'
@@ -4080,11 +4084,15 @@ CODEX_STOP_TASK_OUTPUT="$(bash "$REPO_ROOT/bridge-task.sh" create --to "$SMOKE_A
 assert_contains "$CODEX_STOP_TASK_OUTPUT" "created task #"
 CODEX_STOP_TASK_ID="$(printf '%s\n' "$CODEX_STOP_TASK_OUTPUT" | sed -n 's/^created task #\([0-9][0-9]*\).*/\1/p' | head -n1)"
 [[ -n "$CODEX_STOP_TASK_ID" ]] || die "expected codex stop task id"
-CODEX_STOP_OUTPUT="$(printf '%s' '{"stop_hook_active": false}' | BRIDGE_AGENT_ID="$SMOKE_AGENT" BRIDGE_HOME="$BRIDGE_HOME" BRIDGE_TASK_DB="$BRIDGE_TASK_DB" python3 "$REPO_ROOT/hooks/codex-stop.py")"
+# #1068 HOOKS-SSOT: the renderer installs the direct `check-inbox.py
+# --format codex` spelling; the legacy `codex-stop.py` wrapper was
+# removed. Smoke verifies the direct form satisfies the Codex Stop hook
+# contract (block on pending queue + empty {} on stop_hook_active).
+CODEX_STOP_OUTPUT="$(printf '%s' '{"stop_hook_active": false}' | BRIDGE_AGENT_ID="$SMOKE_AGENT" BRIDGE_HOME="$BRIDGE_HOME" BRIDGE_TASK_DB="$BRIDGE_TASK_DB" python3 "$REPO_ROOT/hooks/check-inbox.py" --format codex)"
 assert_contains "$CODEX_STOP_OUTPUT" "\"decision\": \"block\""
 assert_contains "$CODEX_STOP_OUTPUT" "agb inbox $SMOKE_AGENT"
 assert_not_contains "$CODEX_STOP_OUTPUT" "\"hookSpecificOutput\""
-CODEX_STOP_ACTIVE_OUTPUT="$(printf '%s' '{"stop_hook_active": true}' | BRIDGE_AGENT_ID="$SMOKE_AGENT" BRIDGE_HOME="$BRIDGE_HOME" BRIDGE_TASK_DB="$BRIDGE_TASK_DB" python3 "$REPO_ROOT/hooks/codex-stop.py")"
+CODEX_STOP_ACTIVE_OUTPUT="$(printf '%s' '{"stop_hook_active": true}' | BRIDGE_AGENT_ID="$SMOKE_AGENT" BRIDGE_HOME="$BRIDGE_HOME" BRIDGE_TASK_DB="$BRIDGE_TASK_DB" python3 "$REPO_ROOT/hooks/check-inbox.py" --format codex)"
 assert_contains "$CODEX_STOP_ACTIVE_OUTPUT" "{}"
 python3 "$REPO_ROOT/bridge-queue.py" done "$CODEX_STOP_TASK_ID" --agent "$SMOKE_AGENT" --note "codex hook smoke cleanup" >/dev/null
 
@@ -11507,11 +11515,31 @@ bash "$REPO_ROOT/scripts/smoke/989-isolated-agent-env-state-dir.sh"
 log "running nudge-task-age-gate smoke (issue #1014 A)"
 bash "$REPO_ROOT/scripts/smoke/nudge-task-age-gate.sh"
 
+# Issue #1099 — PR #1019's age gate covered only the never-nudged path.
+# Three guard paths in cmd_daemon_step (is_ready_agent bypass, prior-
+# history guard, cooldown/activity-advance guards) still let a fresh-
+# only queue through for any agent with prior nudge history. Active
+# dynamic agents got idle_seconds=1 ACTION REQUIRED nudges seconds
+# after a task landed. The fix widens the gate from agent-level to
+# task-level: a queued task younger than the redelivery window is
+# never a fresh nudge trigger regardless of last_nudge_key state.
+log "running nudge-redundant-active-agent smoke (issue #1099)"
+bash "$REPO_ROOT/scripts/smoke/nudge-redundant-active-agent.sh"
+
 # A static Claude agent with a custom CLAUDE_CONFIG_DIR resumed fresh every
 # restart because the session-id helpers expanded ~/.claude against the daemon
 # HOME. Smoke pins that both helpers resolve roots from the agent config dir.
 log "running 1015-resume-claude-config-dir smoke (issue #1015)"
 bash "$REPO_ROOT/scripts/smoke/1015-resume-claude-config-dir.sh"
+
+# Issue #1073: a fresh non-admin Claude channel agent with its own
+# CLAUDE_CONFIG_DIR cannot start because Claude CLI's first-run prompts
+# (theme picker, Bypass Permissions warning) block the tmux session and
+# bridge-run.sh's foreground detection kills + relaunches in a loop.
+# Smoke pins (a) the per-agent .claude.json seed + (b) the managed
+# settings.json default that suppress both prompts.
+log "running 1073-fresh-channel-first-run-seed smoke (issue #1073)"
+bash "$REPO_ROOT/scripts/smoke/1073-fresh-channel-first-run-seed.sh"
 
 # Deleting an isolated agent left the dedicated OS user + named-user ACEs
 # behind. Smoke pins the reaper's gating decision (Linux-only, exact
@@ -11524,5 +11552,20 @@ bash "$REPO_ROOT/scripts/smoke/isolated-agent-delete-reap.sh"
 # cap, sender outbox retry, and end-to-end enqueue -> local inbox.
 log "running a2a-cross-bridge smoke (issue #1032)"
 bash "$REPO_ROOT/scripts/smoke/a2a-cross-bridge.sh"
+
+# `agent create` rollback on mid-flow failure + `agent delete --purge-home`
+# residue removal. T1 forces a mid-create PermissionError on the v2 workdir's
+# .claude mkdir and asserts the agent is NOT registered + no scaffold remains.
+# T2 runs create → delete --purge-home → re-create and asserts the cycle
+# succeeds (the issue's user repro on Linux v0.14.5-beta5).
+log "running create-atomicity-and-purge smoke (issue #1076)"
+bash "$REPO_ROOT/scripts/smoke/1076-create-atomicity-and-purge.sh"
+
+# `agb audit list --since` previously raised TypeError when the operator
+# supplied a naive datetime against a tz-aware audit record. Pin that
+# both naive (`2026-05-23T12:00`) and aware (`+09:00`) inputs work and
+# return identical record sets under a fixed TZ.
+log "running audit-since-tz smoke (issue #1100)"
+bash "$REPO_ROOT/scripts/smoke/1100-audit-since-tz.sh"
 
 log "smoke test passed"

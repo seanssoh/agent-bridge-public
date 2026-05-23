@@ -4937,6 +4937,144 @@ start_cron_worker() {
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-daemon.sh" "$task_id" "$log_file" >/dev/null
 }
 
+# Issue #1096: extract the cron family name from a `[cron-dispatch] <family>
+# (<slot>)` title so the wake log/audit can carry it. Falls back to the empty
+# string for malformed titles — callers must tolerate that.
+bridge_daemon_cron_dispatch_family_from_title() {
+  local title="${1:-}"
+  local family=""
+  if [[ "$title" =~ ^\[cron-dispatch\][[:space:]]+([^[:space:]]+) ]]; then
+    family="${BASH_REMATCH[1]}"
+  fi
+  printf '%s' "$family"
+}
+
+# Issue #1096: per-agent rate-limit window for cron-dispatch auto-wake. We
+# keep a single timestamp file per agent under
+# `$BRIDGE_STATE_DIR/cron-dispatch-wake/<agent>.ts`. The window guards
+# against firing `bridge-start.sh` twice in the same daemon-poll burst when
+# multiple ready rows target the same stopped agent — the first wake is
+# still progressing through its ~5–15s tmux + engine cold start and a
+# second invocation in that window would race the cron worker against the
+# bootstrapping session.
+bridge_daemon_cron_dispatch_wake_state_file() {
+  local agent="$1"
+  printf '%s/cron-dispatch-wake/%s.ts' "$BRIDGE_STATE_DIR" "$agent"
+}
+
+# Issue #1096: cron-dispatch auto-wake gate. Called per ready row inside
+# `start_cron_dispatch_workers`, BEFORE `claim_cron_task_with_retry`, so
+# the daemon can stand a stopped static target back up before the cron
+# worker spawns the disposable child. Returns:
+#   0  — target is already active, or wake fired (caller proceeds to claim)
+#   1  — gated by operator intent or quarantine (caller MUST NOT claim;
+#        the row stays queued and is audited via cron_dispatch_wake_refused)
+#   2  — rate-limit window open (caller MUST NOT claim this pass; the row
+#        stays queued and is picked up on the next tick when the wake from
+#        the first row has completed)
+#
+# Eligibility for wake fires (all must hold):
+#   - target agent exists in the roster
+#   - source = static
+#   - loop = 1 (operator did not turn the role off)
+#   - manual_stop_active is false (operator did not manually stop it)
+#   - bridge_daemon_autostart_allowed is true (no broken-launch quarantine
+#     and no active autostart backoff — issue #256 gate)
+#   - bridge_agent_is_active is false (no live tmux session yet)
+#
+# Gated reasons emit a one-line warn + a `cron_dispatch_wake_refused`
+# audit row with one of: loop_zero / manual_stop / broken_launch /
+# autostart_backoff / unknown_agent. Operator clears the gate the same
+# way as the existing on-demand autostart surface.
+bridge_daemon_cron_dispatch_wake() {
+  local agent="$1"
+  local task_id="$2"
+  local family="${3:-}"
+  local now_ts
+  local last_ts=0
+  local window="${BRIDGE_CRON_DISPATCH_WAKE_WINDOW_SECONDS:-60}"
+  local state_file
+  local refusal_reason=""
+
+  [[ "$window" =~ ^[0-9]+$ ]] || window=60
+
+  if ! bridge_agent_exists "$agent"; then
+    bridge_warn "cron-dispatch wake refused ${agent} (reason=unknown_agent, task=#${task_id})"
+    bridge_audit_log daemon cron_dispatch_wake_refused "$agent" \
+      --detail task_id="$task_id" \
+      --detail family="$family" \
+      --detail reason=unknown_agent 2>/dev/null || true
+    return 1
+  fi
+
+  # Already active → claim path is unchanged, no wake needed.
+  if bridge_agent_is_active "$agent"; then
+    return 0
+  fi
+
+  if [[ "$(bridge_agent_source "$agent")" != "static" ]]; then
+    # Non-static dispatch targets (dynamic / one-off) do not get wake
+    # treatment — the cron worker path was already a no-op for them and
+    # this fix does not change that. Let the claim proceed.
+    return 0
+  fi
+
+  if [[ "$(bridge_agent_loop "$agent")" == "0" ]]; then
+    refusal_reason="loop_zero"
+  elif bridge_agent_manual_stop_active "$agent"; then
+    refusal_reason="manual_stop"
+  elif [[ -f "$(bridge_agent_broken_launch_file "$agent")" ]]; then
+    refusal_reason="broken_launch"
+  elif ! bridge_daemon_autostart_allowed "$agent"; then
+    refusal_reason="autostart_backoff"
+  fi
+
+  if [[ -n "$refusal_reason" ]]; then
+    bridge_warn "cron-dispatch wake refused ${agent} (reason=${refusal_reason}, task=#${task_id})"
+    bridge_audit_log daemon cron_dispatch_wake_refused "$agent" \
+      --detail task_id="$task_id" \
+      --detail family="$family" \
+      --detail reason="$refusal_reason" 2>/dev/null || true
+    return 1
+  fi
+
+  now_ts="$(date +%s 2>/dev/null || echo 0)"
+  state_file="$(bridge_daemon_cron_dispatch_wake_state_file "$agent")"
+  if [[ -f "$state_file" ]]; then
+    last_ts="$(<"$state_file")" 2>/dev/null || last_ts=0
+    [[ "$last_ts" =~ ^[0-9]+$ ]] || last_ts=0
+    if (( now_ts - last_ts < window )); then
+      daemon_info "cron-dispatch wake throttled ${agent} (within ${window}s window, task=#${task_id})"
+      return 2
+    fi
+  fi
+
+  mkdir -p "$(dirname "$state_file")"
+  printf '%s' "$now_ts" >"$state_file"
+
+  if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
+    daemon_info "auto-waked ${agent} (trigger=cron-dispatch #${task_id} family=${family})"
+    bridge_audit_log daemon cron_dispatch_wake "$agent" \
+      --detail task_id="$task_id" \
+      --detail family="$family" 2>/dev/null || true
+    bridge_daemon_clear_autostart_failure "$agent"
+    return 0
+  fi
+
+  # Wake attempt failed (bridge-start.sh non-zero). Record the failure so
+  # the existing autostart backoff path applies, mirroring
+  # process_on_demand_agents' behaviour for the same failure shape, and
+  # tell the caller to skip this row for now — leaving it queued for the
+  # next tick once the backoff clears.
+  bridge_daemon_note_autostart_failure "$agent" "cron-dispatch-wake-failed"
+  bridge_warn "cron-dispatch wake failed ${agent} (task=#${task_id})"
+  bridge_audit_log daemon cron_dispatch_wake_refused "$agent" \
+    --detail task_id="$task_id" \
+    --detail family="$family" \
+    --detail reason=start_command_failed 2>/dev/null || true
+  return 1
+}
+
 start_cron_dispatch_workers() {
   local max_parallel="${BRIDGE_CRON_DISPATCH_MAX_PARALLEL:-0}"
   local running_count
@@ -4945,9 +5083,11 @@ start_cron_dispatch_workers() {
   local task_id
   local agent
   local _priority
-  local _title
+  local title
   local _body_path
   local started=0
+  local family=""
+  local wake_rc=0
   # Footgun #11 (refs #815 Wave B): tempfile-route ready_rows.
   local _ready_tmp=""
   _ready_tmp="$(mktemp)"
@@ -4968,9 +5108,25 @@ start_cron_dispatch_workers() {
 
   printf '%s\n' "$ready_rows" > "$_ready_tmp"
 
-  while IFS=$'\t' read -r task_id agent _priority _title _body_path; do
+  while IFS=$'\t' read -r task_id agent _priority title _body_path; do
     [[ -n "$task_id" && -n "$agent" ]] || continue
     (( running_count < max_parallel )) || break
+
+    # Issue #1096: when the dispatch's target is a stopped static agent,
+    # wake it before claiming. The wake gate checks the same operator-
+    # intent + quarantine surfaces that process_on_demand_agents already
+    # consults (manual_stop, autostart_allowed) plus loop=1, and refuses-
+    # with-audit when any of them blocks. A refusal MUST leave the row
+    # queued (no claim) so the existing stuck-task surface can show the
+    # row to the operator.
+    family="$(bridge_daemon_cron_dispatch_family_from_title "$title")"
+    wake_rc=0
+    bridge_daemon_cron_dispatch_wake "$agent" "$task_id" "$family" || wake_rc=$?
+    if (( wake_rc != 0 )); then
+      # Gated (rc=1) or throttled (rc=2): in either case, do not claim
+      # this row in this pass. The row stays queued for the next tick.
+      continue
+    fi
 
     if ! claim_cron_task_with_retry "$task_id" "$agent" "$BRIDGE_CRON_DISPATCH_LEASE_SECONDS"; then
       continue
@@ -5104,6 +5260,21 @@ cmd_run_cron_worker() {
       --detail family="${CRON_FAMILY:-}" \
       --detail slot="${CRON_SLOT:-}" \
       --detail reason=memory_pressure_deferral
+    # Issue #1096: emit a dedicated breadcrumb so tooling can search by
+    # event class without having to disambiguate the more general
+    # `cron_followup_suppressed` row (which also covers below-threshold
+    # burst suppression and human-config drift). Without this, a
+    # pre-flight memory-pressure defer was effectively a silent loss —
+    # the cron-followup never surfaced and the only trace was a generic
+    # suppression line. Pair-symmetry with `cron_dispatch_wake` /
+    # `cron_dispatch_wake_refused` (issue #1096's wake-side
+    # counterpart): a deferred slot can now be correlated to the wake
+    # row that ran (or refused to run) just before it.
+    bridge_audit_log daemon cron_dispatch_memory_pressure_deferred "$TASK_ASSIGNED_TO" \
+      --detail run_id="$run_id" \
+      --detail job_name="${CRON_JOB_NAME:-$run_id}" \
+      --detail family="${CRON_FAMILY:-}" \
+      --detail slot="${CRON_SLOT:-}" 2>/dev/null || true
     daemon_info "skipped cron-followup for memory_pressure deferral of ${CRON_FAMILY:-${CRON_JOB_NAME:-$run_id}}"
   fi
 

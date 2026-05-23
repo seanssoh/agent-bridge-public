@@ -235,17 +235,70 @@ bridge_auth_fix_legacy_secret_file_mode() {
   local group=""
   local file_mode="0600"
 
+  # The Claude Code token is a controller-shared secret (one credential,
+  # all agents share the same login). The correct isolation primitive is
+  # ab-shared (#998 PR A), NOT the per-agent ab-agent-<name> group (#998
+  # PR B) which applies only to per-agent secrets such as channel dotenvs.
+  #
+  # Branch on the agent's effective isolation mode:
+  #   - shared-mode: controller and agent are the same UID — no cross-UID
+  #     gap to bridge. Apply 0600 and return; chown is a no-op.
+  #   - linux-user isolated: chown to <controller>:ab-shared (mode 0640) so
+  #     the isolated UID (a member of ab-shared) can read the credential.
   if bridge_isolation_v2_active 2>/dev/null; then
-    group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
-    if [[ -n "$group" ]] && bridge_isolation_v2_group_exists "$group"; then
-      file_mode="0640"
-      bridge_auth_run_privileged chown "$(id -un):$group" "$file" || return 1
-    elif [[ "${BRIDGE_CLAUDE_TOKEN_SYNC_ALLOW_CURRENT_GROUP_FALLBACK:-0}" != "1" ]]; then
-      printf '[error] v2 group missing after legacy secret scrub for %s: %s\n' "$agent" "$group" >&2
-      return 1
+    if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+      group="${BRIDGE_SHARED_GROUP:-ab-shared}"
+      if bridge_isolation_v2_group_exists "$group"; then
+        file_mode="0640"
+        bridge_auth_run_privileged chown "$(id -un):$group" "$file" || return 1
+      else
+        # Codex r1 BLOCKING: linux-user isolated agent without the
+        # shared group means the install is misconfigured. Returning success
+        # with mode 0600 here would let sync report status=ok while the next
+        # isolated launch fails — `bridge_isolation_v2_load_secret_env`
+        # cannot read the controller-owned 0600 secret env file under the
+        # isolated UID. Hard-fail so `bridge_auth_sync_agents` records the
+        # agent as failed. Shared-mode agents never reach this branch (they
+        # short-circuit on the predicate above), so the M2 fix is preserved.
+        printf '[error] auth sync: %s group missing for isolated agent %s; install misconfigured\n' "$group" "$agent" >&2
+        return 1
+      fi
     fi
+    # shared-mode agent: same UID as controller — 0600 is correct, no chown needed.
   fi
   chmod "$file_mode" "$file" 2>/dev/null || bridge_auth_run_privileged chmod "$file_mode" "$file"
+}
+
+bridge_auth_controller_credentials_path() {
+  # #1075 — resolve the controller's ``~/.claude/.credentials.json`` from the
+  # same controller-user view that the isolation-v2 layer uses
+  # (`bridge_isolation_v2_controller_user`). Returns the path even when the
+  # file does not yet exist; ``cmd_sync_agent`` only reads it on the
+  # no-active-token fallback branch and surfaces a clean error if missing.
+  #
+  # Precedence: ``$BRIDGE_CONTROLLER_HOME`` (explicit override, used in tests)
+  # → ``bridge_isolation_v2_controller_user`` → ``$SUDO_USER`` → ``$HOME``.
+  local controller_user=""
+  local controller_home=""
+  if [[ -n "${BRIDGE_CONTROLLER_HOME:-}" ]]; then
+    controller_home="$BRIDGE_CONTROLLER_HOME"
+  fi
+  if [[ -z "$controller_home" ]]; then
+    if declare -F bridge_isolation_v2_controller_user >/dev/null 2>&1; then
+      controller_user="$(bridge_isolation_v2_controller_user 2>/dev/null || true)"
+    fi
+    if [[ -z "$controller_user" ]]; then
+      controller_user="${SUDO_USER:-${USER:-${LOGNAME:-}}}"
+    fi
+    if [[ -n "$controller_user" ]]; then
+      controller_home="$(getent passwd "$controller_user" 2>/dev/null | cut -d: -f6 || true)"
+    fi
+    if [[ -z "$controller_home" ]]; then
+      controller_home="${HOME:-}"
+    fi
+  fi
+  [[ -n "$controller_home" ]] || return 1
+  printf '%s/.claude/.credentials.json' "$controller_home"
 }
 
 bridge_auth_sync_agent_python() {
@@ -257,11 +310,17 @@ bridge_auth_sync_agent_python() {
   local os_user=""
   local owner_uid=""
   local owner_gid=""
+  local controller_cred=""
   local -a workdir_args=()
   local -a owner_args=()
+  local -a controller_cred_args=()
 
   workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
   [[ -n "$workdir" ]] && workdir_args=(--workdir "$workdir")
+  controller_cred="$(bridge_auth_controller_credentials_path 2>/dev/null || true)"
+  if [[ -n "$controller_cred" ]]; then
+    controller_cred_args=(--controller-credentials "$controller_cred")
+  fi
 
   # PR #799 r2 codex findings 2 + 3 — pass the isolated UID/GID + allowed
   # filesystem root to Python so:
@@ -287,7 +346,7 @@ bridge_auth_sync_agent_python() {
     fi
     bridge_linux_sudo_root python3 "$SCRIPT_DIR/bridge-auth.py" \
       --registry "$registry" sync-agent --agent "$agent" --file "$file" \
-      "${workdir_args[@]}" "${owner_args[@]}" --json
+      "${workdir_args[@]}" "${owner_args[@]}" "${controller_cred_args[@]}" --json
     return $?
   fi
   # Non-isolated dev install — Python still gets the agent's resolved home as
@@ -299,7 +358,7 @@ bridge_auth_sync_agent_python() {
   fi
   python3 "$SCRIPT_DIR/bridge-auth.py" \
     --registry "$registry" sync-agent --agent "$agent" --file "$file" \
-    "${workdir_args[@]}" "${owner_args[@]}" --json
+    "${workdir_args[@]}" "${owner_args[@]}" "${controller_cred_args[@]}" --json
 }
 
 bridge_auth_selected_agents() {

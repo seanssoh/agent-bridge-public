@@ -13,7 +13,7 @@ usage() {
 Usage:
   $(basename "$0") discord <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--channel <id>]... [--allow-from <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
-  $(basename "$0") teams <agent> [--app-id <id>] [--app-password <secret>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start] [setup options...]
   $(basename "$0") admin <agent>
 
@@ -46,7 +46,7 @@ EOF
     teams)
       cat <<EOF
 Usage:
-  $(basename "$0") teams <agent> [--app-id <id>] [--app-password <secret>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+  $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
 EOF
       ;;
     agent)
@@ -617,7 +617,7 @@ run_teams() {
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --app-id|--app-password|--tenant-id|--service-url|--messaging-endpoint|--webhook-host|--webhook-port|--ingress-port|--channel-account|--runtime-config|--allow-from|--conversation)
+      --app-id|--app-password|--app-password-file|--tenant-id|--service-url|--messaging-endpoint|--webhook-host|--webhook-port|--ingress-port|--channel-account|--runtime-config|--allow-from|--conversation)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
         if [[ "$1" == "--channel-account" ]]; then
           channel_account="$2"
@@ -648,6 +648,16 @@ run_teams() {
   )
 
   bridge_setup_python "${base_args[@]}" "${py_args[@]}"
+  # Issue #1074: the Teams MCP server is a Bun TypeScript plugin invoked
+  # with `bun ... --no-install`, so the bun runtime AND
+  # plugins/teams/node_modules must be provisioned BEFORE the
+  # dev-plugin-cache copies source into the per-agent cache at agent
+  # start. Run the provisioning at channel-setup time (here) — it is
+  # idempotent and honors --dry-run via the passed-through flag. Failure
+  # surfaces a bridge_warn but does not abort setup so the access.json /
+  # runtime config still get recorded; the operator sees the gap and the
+  # documented workaround.
+  bridge_provision_teams_plugin_runtime "$dry_run" || true
   if [[ $dry_run -eq 0 ]]; then
     bridge_setup_add_agent_channel "$agent" "plugin:teams"
     if bridge_setup_ensure_development_channels_launch_flag "$agent"; then
@@ -748,7 +758,7 @@ run_agent() {
         telegram_args+=("$1" "$2")
         shift 2
         ;;
-      --conversation|--app-id|--app-password|--tenant-id|--service-url|--messaging-endpoint|--webhook-host|--webhook-port|--ingress-port)
+      --conversation|--app-id|--app-password|--app-password-file|--tenant-id|--service-url|--messaging-endpoint|--webhook-host|--webhook-port|--ingress-port)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
         teams_args+=("$1" "$2")
         shift 2
@@ -929,6 +939,43 @@ run_agent() {
       failures=$((failures + 1))
       warnings+=("Add a CLAUDE.md file in the tracked profile or live workdir before cutover.")
     fi
+
+    # Issue #1076: half-scaffold detection. A failed `agent create`
+    # before this PR could leave an agent registered in the roster but
+    # missing the core managed-profile files (CLAUDE.md, SOUL.md,
+    # SESSION-TYPE.md, MEMORY.md, MEMORY-SCHEMA.md) in the identity
+    # source. Without this check, `setup agent` reported `start_dry_run:
+    # ok` and `session_smoke: ok` despite an empty profile, and the
+    # next `agent start` launched a session that died with the
+    # watchdog later flagging the missing files. Refuse the success-
+    # shaped exit until the operator repairs (delete + re-create, or
+    # profile redeploy). Read from the identity source (layer 2,
+    # bridge_layout_agent_home) since that's where bridge_scaffold_
+    # agent_home authors on v2; materialization may not have run if
+    # create failed mid-flow.
+    local _profile_home_dir=""
+    if declare -F bridge_layout_agent_home >/dev/null 2>&1; then
+      _profile_home_dir="$(bridge_layout_agent_home "$agent" 2>/dev/null || printf '')"
+    fi
+    if [[ -z "$_profile_home_dir" ]] && declare -F bridge_agent_default_home >/dev/null 2>&1; then
+      _profile_home_dir="$(bridge_agent_default_home "$agent" 2>/dev/null || printf '')"
+    fi
+    if [[ -n "$_profile_home_dir" ]]; then
+      local _missing_core_files=()
+      local _required_file
+      for _required_file in CLAUDE.md SOUL.md SESSION-TYPE.md MEMORY.md MEMORY-SCHEMA.md; do
+        if [[ ! -f "$_profile_home_dir/$_required_file" ]]; then
+          _missing_core_files+=("$_required_file")
+        fi
+      done
+      if [[ ${#_missing_core_files[@]} -gt 0 ]]; then
+        printf 'managed_profile: incomplete (missing: %s)\n' "$(IFS=,; echo "${_missing_core_files[*]}")"
+        failures=$((failures + 1))
+        warnings+=("Profile source $_profile_home_dir is half-scaffolded (missing: ${_missing_core_files[*]}). Run 'agent-bridge agent delete $agent --purge-home --force' then re-create.")
+      else
+        printf 'managed_profile: ok\n'
+      fi
+    fi
   elif [[ "$engine" == "codex" ]]; then
     echo
     echo "== Codex Skills =="
@@ -969,8 +1016,31 @@ run_agent() {
 
   echo
   echo "== Start dry-run =="
+  # Issue #1076: when the managed-profile drift check above already
+  # reported missing core files, refuse to emit `start_dry_run: ok` even
+  # if bridge-start.sh --dry-run returns rc=0 — the agent would launch
+  # but die on its first prompt because CLAUDE.md / SOUL.md are missing.
+  # Surface the half-scaffold state in the start_dry_run line so the
+  # operator sees both signals without scrolling.
+  local _setup_profile_incomplete=0
+  if [[ "$engine" == "claude" ]]; then
+    local _required_file
+    if [[ -n "${_profile_home_dir:-}" ]]; then
+      for _required_file in CLAUDE.md SOUL.md SESSION-TYPE.md MEMORY.md MEMORY-SCHEMA.md; do
+        if [[ ! -f "$_profile_home_dir/$_required_file" ]]; then
+          _setup_profile_incomplete=1
+          break
+        fi
+      done
+    fi
+  fi
   if start_output="$("$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --dry-run 2>&1)"; then
-    echo "start_dry_run: ok"
+    if [[ $_setup_profile_incomplete -eq 1 ]]; then
+      echo "start_dry_run: blocked (managed_profile incomplete)"
+      failures=$((failures + 1))
+    else
+      echo "start_dry_run: ok"
+    fi
     echo "$start_output"
   else
     echo "start_dry_run: error"

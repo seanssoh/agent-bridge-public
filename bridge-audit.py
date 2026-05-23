@@ -165,7 +165,15 @@ def parse_since(text: str | None) -> datetime | None:
     raw = text
     if raw.endswith("Z"):
         raw = raw[:-1] + "+00:00"
-    return datetime.fromisoformat(raw)
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        # Audit records are always tz-aware (see now_iso()), so a naive input
+        # would TypeError on direct comparison. Assume operator-local tz so
+        # `--since 2026-05-23T12:00` means 12:00 local time, matching the
+        # record timestamps the operator sees in the audit log.
+        local_tz = datetime.now(timezone.utc).astimezone().tzinfo
+        parsed = parsed.replace(tzinfo=local_tz)
+    return parsed
 
 
 def iter_input_files(paths: Iterable[Path]) -> list[Path]:

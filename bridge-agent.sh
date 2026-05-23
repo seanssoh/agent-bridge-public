@@ -83,9 +83,11 @@ override) — same trust model as 'agent-bridge config set'. Repeatable.
   --desc <text>                        set BRIDGE_AGENT_DESC
   --engine claude|codex                set BRIDGE_AGENT_ENGINE
   --workdir <path>                     set BRIDGE_AGENT_WORKDIR
-  --loop on|off                        set BRIDGE_AGENT_LOOP (off persists explicitly)
+  --loop on|off|yes|no                 set BRIDGE_AGENT_LOOP (off persists explicitly)
   --continue on|off                    set BRIDGE_AGENT_CONTINUE
   --class user|system                  set BRIDGE_AGENT_CLASS (privilege boundary)
+  --idle-timeout <seconds>             set BRIDGE_AGENT_IDLE_TIMEOUT (integer ≥0; 0 = always on)
+  --always-on yes                      sugar for --idle-timeout 0 (v1 does not accept "no")
   --json                               emit JSON envelope
   --dry-run                            do not mutate; emit planned diff
 
@@ -108,8 +110,9 @@ Create options:
   --isolation <mode>           shared|linux-user (default: shared)
   --isolate                    shorthand for --isolation linux-user
   --os-user <user>             explicit Linux service user for linux-user isolation
-  --loop                       mark the role as loop-enabled
-  --always-on                  configure IDLE_TIMEOUT=0 for this role
+  --loop [yes|no|on|off]       mark the role as loop-enabled (bare form ≡ yes; "no" persists LOOP="0")
+  --always-on [yes]            configure IDLE_TIMEOUT=0 for this role (v1 does not accept "no")
+  --idle-timeout <seconds>     set BRIDGE_AGENT_IDLE_TIMEOUT (integer ≥0; 0 = always on)
   --continue|--no-continue     explicit continue mode (default: continue)
   --dry-run                    print the planned role block without writing
   --json                       emit JSON instead of human text
@@ -128,6 +131,123 @@ EOF
 bridge_agent_manage_python() {
   bridge_require_python
   python3 - "$@"
+}
+
+# bridge_scaffold_codex_entrypoint and bridge_ensure_codex_agent_hooks are
+# defined in lib/bridge-agents.sh and lib/bridge-hooks.sh respectively,
+# which bridge-lib.sh sources before this script runs. They are available
+# to smoke drivers via bridge-lib.sh without sourcing bridge-agent.sh.
+# See issue #1067 (S03, S08) for the contract.
+
+# bridge_agent_create_rollback — issue #1076. Unwind a partial `agent create`
+# when a mid-flow step raises so the agent does NOT end up "registered but
+# half-scaffolded". Called from run_create's EXIT trap; the trap is armed
+# before the first mutation and disarmed only on successful completion.
+#
+# Inputs are conveyed via the matching _CREATE_ROLLBACK_* shell variables
+# (run_create's locals). Best-effort: every step is independent and
+# failures are logged via bridge_warn but never re-raise. Order: roster
+# excision first (so the agent stops showing up in `agb status` /
+# `agb agent list`), then scaffold/workdir rm, then v2 sibling rm — match
+# the inverse of the create-time ordering.
+#
+# Safety: every path is validated against the known agent-root prefixes
+# (BRIDGE_AGENT_HOME_ROOT, BRIDGE_AGENT_ROOT_V2) before recursive rm.
+# Anything outside those roots is a resolver bug we'd rather leave on
+# disk than rm.
+bridge_agent_create_rollback() {
+  local agent="${_CREATE_ROLLBACK_AGENT:-}"
+  local roster_path="${_CREATE_ROLLBACK_ROSTER:-}"
+  local scaffold_target="${_CREATE_ROLLBACK_SCAFFOLD_TARGET:-}"
+  local workdir="${_CREATE_ROLLBACK_WORKDIR:-}"
+  local v2_root="${_CREATE_ROLLBACK_V2_ROOT:-}"
+  local roster_written="${_CREATE_ROLLBACK_ROSTER_WRITTEN:-0}"
+  local scaffold_created="${_CREATE_ROLLBACK_SCAFFOLD_CREATED:-0}"
+  local workdir_created="${_CREATE_ROLLBACK_WORKDIR_CREATED:-0}"
+
+  [[ -n "$agent" ]] || return 0
+
+  bridge_warn "agent create: rolling back partial create for '$agent' (mid-flow failure)"
+
+  # 1. Roster excision — undo bridge_write_role_block if it ran.
+  if [[ "$roster_written" == "1" && -n "$roster_path" && -f "$roster_path" ]]; then
+    if [[ -n "${SCRIPT_DIR:-}" ]] \
+        && [[ -f "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" ]]; then
+      python3 "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" \
+        "$roster_path" "$agent" >/dev/null 2>&1 \
+        || bridge_warn "agent create rollback: roster excision failed for '$agent' in $roster_path"
+    fi
+    # Drop the daemon auto-start state file so the next daemon tick does
+    # not warn about a roster-removed agent (same pattern as run_delete).
+    if [[ -n "${BRIDGE_STATE_DIR:-}" ]]; then
+      rm -f "$BRIDGE_STATE_DIR/daemon-autostart/$agent.env" 2>/dev/null || true
+    fi
+  fi
+
+  # 2. Scaffold target — the per-agent identity source / home tree.
+  if [[ "$scaffold_created" == "1" && -n "$scaffold_target" ]]; then
+    bridge_agent_create_rollback_rmtree "$scaffold_target"
+  fi
+
+  # 3. Workdir — only if create authored it (default v2 workdir/ default).
+  # Skip when workdir equals scaffold_target (legacy install) so we don't
+  # double-rm, and skip explicit operator --workdir paths which we did
+  # NOT create. The _CREATE_ROLLBACK_WORKDIR_CREATED flag is set only
+  # when the workdir was empty / autoderived under BRIDGE_AGENT_ROOT_V2.
+  if [[ "$workdir_created" == "1" && -n "$workdir" && "$workdir" != "$scaffold_target" ]]; then
+    bridge_agent_create_rollback_rmtree "$workdir"
+  fi
+
+  # 4. v2 per-agent root parent (only when we created it). bridge_scaffold_
+  # agent_home pre-creates $BRIDGE_AGENT_ROOT_V2/<agent>/ before the v2 home/
+  # and workdir/ children, and run_delete --purge-home does not see this
+  # parent on a non-rolled-back delete — so rollback owns the parent rm to
+  # match the inverse-of-create contract.
+  if [[ -n "$v2_root" && "$scaffold_created" == "1" ]]; then
+    bridge_agent_create_rollback_rmtree "$v2_root"
+  fi
+
+  # 5. Tracked-profile-source residue. bridge_scaffold_agent_home does not
+  # write under $BRIDGE_HOME/agents/<a>/ for v2 installs (it writes under
+  # $BRIDGE_AGENT_ROOT_V2/<agent>/), but a prior partial create or legacy
+  # migration may have left a stub there. Only remove when the dir is empty
+  # so we never blow away a legitimate tracked-profile source.
+  if [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" ]]; then
+    local profile_src="$BRIDGE_AGENT_HOME_ROOT/$agent"
+    if [[ -d "$profile_src" ]] \
+        && [[ -z "$(find "$profile_src" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]]; then
+      rmdir "$profile_src" 2>/dev/null \
+        || bridge_warn "agent create rollback: rmdir failed for empty $profile_src"
+    fi
+  fi
+}
+
+# bridge_agent_create_rollback_rmtree — guarded recursive rm. Refuses any
+# path that is not under one of the known agent-root prefixes. Uses sudo
+# when the controller cannot rm directly (isolated parents from a prior
+# linux-user create that didn't get to bridge_linux_prepare_agent_isolation).
+bridge_agent_create_rollback_rmtree() {
+  local target="$1"
+  [[ -n "$target" ]] || return 0
+  [[ -d "$target" ]] || return 0
+
+  case "$target" in
+    "${BRIDGE_AGENT_HOME_ROOT:-/dev/null/none}"/*|"${BRIDGE_AGENT_ROOT_V2:-/dev/null/none}"/*) ;;
+    *)
+      bridge_warn "agent create rollback: refusing to rm target outside agent roots: $target"
+      return 0
+      ;;
+  esac
+
+  if rm -rf -- "$target" 2>/dev/null; then
+    return 0
+  fi
+  if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+    bridge_linux_sudo_root rm -rf -- "$target" 2>/dev/null \
+      || bridge_warn "agent create rollback: rm -rf failed for $target (manual cleanup may be required)"
+  else
+    bridge_warn "agent create rollback: rm -rf failed for $target (manual cleanup may be required)"
+  fi
 }
 
 # bridge_ensure_memory_precompact_hook — wire the Plan-D PreCompact hook
@@ -801,6 +921,14 @@ bridge_write_role_block() {
   # writer below preserves the legacy emission shape when they are unset.
   local agent_class="${19:-}"
   local loop_explicit_off="${20:-0}"
+  # Issue #1093: optional positional 21 carries an explicit
+  # BRIDGE_AGENT_IDLE_TIMEOUT value (string of digits). Empty means "no
+  # explicit value supplied" — the legacy always_on==1 → IDLE_TIMEOUT="0"
+  # path still triggers, and no IDLE_TIMEOUT line is emitted otherwise.
+  # When non-empty, the explicit value overrides always_on so `--always-on`
+  # (which sets always_on=1) and `--idle-timeout 0` produce the same byte
+  # emission, and `--idle-timeout 300` writes the literal `"300"`.
+  local idle_timeout_value="${21:-}"
 
   bridge_agent_manage_python \
     "$BRIDGE_ROSTER_LOCAL_FILE" \
@@ -823,7 +951,8 @@ bridge_write_role_block() {
     "$os_user" \
     "$replace_existing" \
     "$agent_class" \
-    "$loop_explicit_off" <<'PY'
+    "$loop_explicit_off" \
+    "$idle_timeout_value" <<'PY'
 from pathlib import Path
 import shlex
 import sys
@@ -851,6 +980,7 @@ import re
     replace_existing,
     agent_class,
     loop_explicit_off,
+    idle_timeout_value,
 ) = sys.argv[1:]
 
 path = Path(path_str)
@@ -905,7 +1035,15 @@ if continue_mode == "1":
     lines.append(f'BRIDGE_AGENT_CONTINUE["{agent}"]="1"')
 else:
     lines.append(f'BRIDGE_AGENT_CONTINUE["{agent}"]="0"')
-if always_on == "1":
+# Issue #1093: explicit idle_timeout_value (any non-empty digit string)
+# takes precedence over the legacy always_on flag. `--idle-timeout 0` and
+# `--always-on` therefore emit the same `"0"` line; `--idle-timeout 300`
+# writes `"300"`. The legacy path (always_on=="1", value empty) keeps the
+# byte-identical pre-#1093 emission for the create / reclassify callers
+# that do not supply positional 21.
+if idle_timeout_value:
+    lines.append(f'BRIDGE_AGENT_IDLE_TIMEOUT["{agent}"]="{idle_timeout_value}"')
+elif always_on == "1":
     lines.append(f'BRIDGE_AGENT_IDLE_TIMEOUT["{agent}"]="0"')
 if isolation_mode:
     # Emit the isolation mode verbatim (including "shared") so roster
@@ -1145,12 +1283,22 @@ emit_create_json() {
   local session_type="${11}"
   local isolation_mode="${12}"
   local os_user="${13}"
+  # Issue #1093: surface the persisted idle_timeout / loop policy in the
+  # JSON envelope so the caller can verify what landed in the roster.
+  # Optional positionals (default empty) keep existing callers working.
+  # `idle_timeout` mirrors what the writer emitted: empty for "no
+  # IDLE_TIMEOUT line" (i.e. default-0 fallback), "0" for always-on, or
+  # the explicit value supplied to `--idle-timeout <seconds>`. `loop`
+  # mirrors the writer: "yes" when LOOP="1" line is present, "no" when
+  # LOOP="0", empty when the line was omitted (default-1 fallback).
+  local idle_timeout_persisted="${14:-}"
+  local loop_persisted="${15:-}"
 
-  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" <<'PY'
+  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" <<'PY'
 import json
 import sys
 
-agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user = sys.argv[1:]
+agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user, idle_timeout_persisted, loop_persisted = sys.argv[1:]
 payload = {
     "agent": agent,
     "engine": engine,
@@ -1167,6 +1315,10 @@ payload = {
     "roster_file": roster_file,
     "dry_run": dry_run == "1",
     "users": json.loads(users_json),
+    "policy": {
+        "idle_timeout": idle_timeout_persisted,
+        "loop": loop_persisted,
+    },
     "next_steps": [
         f"agent-bridge setup agent {agent}",
         f"agent-bridge status --all-agents",
@@ -1759,7 +1911,19 @@ run_show() {
     printf 'admin: %s\n' "$admin"
     printf 'session: %s\n' "$session"
     printf 'session_id: %s\n' "${session_id:--}"
+    # Issue #1060 D2: the three-layer agent-layout model exposed as three
+    # distinct, resolver-derived lines so `agent show` stops conflating
+    # them. `agent_home` is the IDENTITY SOURCE (layer 2 — the authored
+    # canonical identity tree); `workdir` is the WORKSPACE (layer 3 — the
+    # process cwd the runtime launches in, the value already carried by
+    # the TSV `workdir` column = `bridge_agent_workdir`). On a v2 install
+    # the two diverge (`<agent-root>/home` vs `<agent-root>/workdir`);
+    # before #1060 only `workdir` was shown, so the operator could not
+    # tell which tree held the authored identity.
     printf 'workdir: %s\n' "$workdir"
+    if declare -F bridge_layout_agent_home >/dev/null 2>&1; then
+      printf 'agent_home: %s\n' "$(bridge_layout_agent_home "$row_agent")"
+    fi
     printf 'profile_home: %s\n' "${profile_home:--}"
     printf 'profile_source: %s\n' "$profile_source"
     printf 'active: %s\n' "$active"
@@ -2443,8 +2607,18 @@ run_create() {
   local isolation_mode="shared"
   local os_user=""
   local loop_mode=0
+  # Issue #1093: explicit-off support on `agent add --loop no`. Used as
+  # positional 20 in bridge_write_role_block (loop_explicit_off) so the
+  # writer emits BRIDGE_AGENT_LOOP="0" instead of dropping the line and
+  # letting bridge_agent_loop default it back to "1" on next load.
+  local loop_explicit_off=0
   local continue_mode=1
   local always_on=0
+  # Issue #1093: explicit idle_timeout value supplied via --idle-timeout.
+  # Empty means "no override" — the legacy always_on=1 → IDLE_TIMEOUT=0
+  # path still triggers for `agent add --always-on`. When non-empty, the
+  # writer emits BRIDGE_AGENT_IDLE_TIMEOUT="<value>" verbatim.
+  local idle_timeout_value=""
   local dry_run=0
   local json_mode=0
   local user_specs=()
@@ -2579,12 +2753,72 @@ run_create() {
         shift 2
         ;;
       --loop)
+        # Issue #1093: extended `--loop yes|no` shape. The legacy bare
+        # `--loop` (no value, OR followed by another `-` flag) keeps the
+        # on-only semantics for callers that predate the value form. A
+        # non-flag next argv MUST be a recognised value token
+        # (yes/no/on/off, case-insensitive) — anything else is a typo
+        # and we refuse it at parse time rather than silently re-interpret
+        # `--loop bogus` as bare-on + unknown positional `bogus`.
+        if [[ $# -ge 2 && "$2" != -* ]]; then
+          case "$2" in
+            yes|YES|Yes|on|ON|On)
+              loop_mode=1
+              loop_explicit_off=0
+              shift 2
+              continue
+              ;;
+            no|NO|No|off|OFF|Off)
+              loop_mode=0
+              loop_explicit_off=1
+              shift 2
+              continue
+              ;;
+            *)
+              bridge_die "--loop 는 yes|no|on|off 만 가능합니다: $2"
+              ;;
+          esac
+        fi
         loop_mode=1
+        loop_explicit_off=0
         shift
         ;;
       --always-on)
+        # Issue #1093: extended `--always-on yes` shape. Legacy bare
+        # `--always-on` (no value, OR followed by another flag) remains
+        # an on-only toggle. v1 does not accept `--always-on no` — see
+        # issue rationale. Non-flag non-"yes" values are typos.
+        if [[ $# -ge 2 && "$2" != -* ]]; then
+          case "$2" in
+            yes|YES|Yes)
+              always_on=1
+              shift 2
+              continue
+              ;;
+            no|NO|No)
+              bridge_die "--always-on no 는 v1 에서 지원하지 않습니다. 명시적 유한 idle timeout 은 --idle-timeout <seconds> 를 사용하세요."
+              ;;
+            *)
+              bridge_die "--always-on 는 yes 만 가능합니다 (v1): $2"
+              ;;
+          esac
+        fi
         always_on=1
         shift
+        ;;
+      --idle-timeout)
+        # Issue #1093: integer ≥0 (seconds). 0 is the always-on
+        # convention used by bridge_agent_is_always_on. Validate at
+        # parse time so a bad value never reaches the writer.
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        if [[ ! "$2" =~ ^[0-9]+$ ]]; then
+          bridge_die "--idle-timeout 는 0 이상의 정수여야 합니다: $2"
+        fi
+        idle_timeout_value="$2"
+        if [[ "$2" == "0" ]]; then
+          always_on=1
+        fi
+        shift 2
         ;;
       --continue)
         continue_mode=1
@@ -2685,18 +2919,23 @@ report and reap test-fixture agents per their pattern."
 
   session="${session:-$agent}"
   default_home="$(bridge_agent_default_home "$agent")"
-  # #1045/#1046: on a v2 install the runtime resolver (bridge_agent_workdir)
-  # resolves the agent's cwd — the path preflight / start_dry_run / `agent
-  # show` use, and the dir the live session is launched in — to the sibling
-  # `<agent-root>/workdir`, NOT `<agent-root>/home` (which is the process
-  # HOME). bridge_agent_default_home returns the `home/` path, so defaulting
-  # the scaffold target to it lands the entire profile (CLAUDE.md, SOUL.md,
-  # .claude/...) under `home/` while the resolved `workdir/` stays empty —
-  # the exact fresh-install (#1045) and `agent create --isolate` (#1046)
-  # break. When the operator did not pass an explicit `--workdir`, default
-  # the scaffold target to the resolved v2 `workdir/` so the profile lands
-  # where the runtime actually looks. The `home/` sibling is still created
-  # by bridge_scaffold_agent_home. An explicit `--workdir` is honored as-is.
+  # Issue #1060: the three-layer agent-layout model. `agent create`
+  # authors the canonical per-agent identity (SOUL / SESSION-TYPE /
+  # MEMORY* / role payload) into the IDENTITY SOURCE — layer 2,
+  # `bridge_layout_agent_home` = v2 `<agent-root>/home`. It is no longer
+  # the empty/stale sibling: the create flow scaffolds INTO it, then runs
+  # a materialization step that delivers the identity fileset into the
+  # engine's materialization target (the workspace `workdir/` for v2
+  # static Claude) so the runtime — which keeps reading `workdir/`
+  # exactly as before (no reader flip) — receives a populated, current
+  # identity. This closes the #1046/#1060 model drift: scaffold no longer
+  # treats `home/` as the runtime home while the resolver launches the
+  # empty `workdir/`.
+  #
+  # `workdir` here stays the WORKSPACE (layer 3) — process cwd, the path
+  # `bridge_agent_workdir` resolves and the live session launches in.
+  # When the operator did not pass an explicit `--workdir`, default it to
+  # the resolved v2 `workdir/`. An explicit `--workdir` is honored as-is.
   local _workdir_is_v2_default=0
   if [[ -z "$workdir" && -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
     workdir="$BRIDGE_AGENT_ROOT_V2/$agent/workdir"
@@ -2765,13 +3004,107 @@ report and reap test-fixture agents per their pattern."
         bridge_die "workdir가 이미 존재하고 비어 있지 않습니다: $workdir"
       fi
     fi
+    # Issue #1076: arm the rollback trap BEFORE the first mutation. The
+    # trap fires on any non-zero exit (including bridge_die / an unhandled
+    # PermissionError in a python helper / set -e propagation) until the
+    # success-clear at the end of the create block sets _CREATE_ROLLBACK_
+    # COMPLETE=1. Persists the create state through shell vars (locals
+    # captured by the rollback helper) so the trap body stays trivial.
+    _CREATE_ROLLBACK_AGENT="$agent"
+    _CREATE_ROLLBACK_ROSTER="$BRIDGE_ROSTER_LOCAL_FILE"
+    _CREATE_ROLLBACK_ROSTER_WRITTEN=0
+    _CREATE_ROLLBACK_SCAFFOLD_CREATED=0
+    _CREATE_ROLLBACK_WORKDIR_CREATED=0
+    _CREATE_ROLLBACK_SCAFFOLD_TARGET=""
+    _CREATE_ROLLBACK_WORKDIR=""
+    _CREATE_ROLLBACK_V2_ROOT=""
+    _CREATE_ROLLBACK_COMPLETE=0
+    # Record the v2 per-agent root parent so rollback can rm it too —
+    # bridge_scaffold_agent_home pre-creates this on isolated installs and
+    # run_delete --purge-home does not see it on a non-rolled-back delete.
+    if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && $_workdir_is_v2_default -eq 1 ]]; then
+      _CREATE_ROLLBACK_V2_ROOT="$BRIDGE_AGENT_ROOT_V2/$agent"
+    fi
+    # _workdir_is_v2_default == 1 means we authored workdir under the v2
+    # tree (it wasn't an explicit operator --workdir), so rollback may rm it.
+    if [[ $_workdir_is_v2_default -eq 1 ]]; then
+      _CREATE_ROLLBACK_WORKDIR="$workdir"
+    fi
+    # shellcheck disable=SC2064
+    trap '[[ "${_CREATE_ROLLBACK_COMPLETE:-0}" == "1" ]] || bridge_agent_create_rollback' EXIT
+    # Issue #1060 D1: scaffold the authored identity into the IDENTITY
+    # SOURCE (layer 2). On a v2 install the identity source is ALWAYS
+    # `bridge_layout_agent_home` = `<agent-root>/home` — regardless of
+    # whether the workspace is the v2-default `workdir/` or an explicit
+    # `--workdir` (including a *shared* project tree). Authoring the
+    # identity into `home/` is what keeps per-agent identity OUT of a
+    # shared workspace (the shared-workdir rule): the materialization
+    # step below then delivers it into the workspace ONLY when the
+    # workspace is not shared. On a legacy install (no BRIDGE_AGENT_ROOT_V2)
+    # the identity source and workspace coincide, so the target stays
+    # `$workdir` and materialization is a no-op. `bridge_scaffold_agent_home`
+    # still creates the v2 sibling, so both `home/` and `workdir/` exist
+    # after this call.
+    local scaffold_target="$workdir"
+    if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]] \
+        && declare -F bridge_layout_agent_home >/dev/null 2>&1; then
+      scaffold_target="$(bridge_expand_user_path "$(bridge_layout_agent_home "$agent")")"
+    fi
+    # Issue #1076: record scaffold_target before the mutation so rollback
+    # can rm it if a later step fails. Setting _CREATE_ROLLBACK_SCAFFOLD_
+    # CREATED=1 BEFORE the call means even a mid-scaffold raise (e.g. sudo
+    # mkdir denied) is treated as "we tried to author this tree" — the
+    # rollback rmtree is no-op when the tree never materialized, but YES-op
+    # when bridge_scaffold_agent_home wrote some templates then aborted.
+    _CREATE_ROLLBACK_SCAFFOLD_TARGET="$scaffold_target"
+    _CREATE_ROLLBACK_SCAFFOLD_CREATED=1
+    if [[ -n "$_CREATE_ROLLBACK_WORKDIR" ]]; then
+      _CREATE_ROLLBACK_WORKDIR_CREATED=1
+    fi
     # v0.8.5 #693 (Wave-3): pass isolation_mode + os_user so scaffold's
     # sudo-handoff predicate (added by PR #688 for #677) actually fires
     # on `agent create --isolate ...`. Without these explicit args, the
     # in-roster lookup inside scaffold would short-circuit the sudo path
     # — see the comment on `bridge_scaffold_agent_home`'s signature.
-    bridge_scaffold_agent_home "$agent" "$workdir" "$display_name" "$role_text" "$engine" "$session_type" "$isolation_mode" "$os_user"
-    bridge_scaffold_user_partitions "$workdir" "$users_json"
+    bridge_scaffold_agent_home "$agent" "$scaffold_target" "$display_name" "$role_text" "$engine" "$session_type" "$isolation_mode" "$os_user"
+    # Issue #1067 S03: create the engine-native instruction-file entrypoint
+    # in the identity source. The template scaffold loop places CLAUDE.md for
+    # every engine; for Codex (entrypoint=AGENTS.md) this step copies that
+    # payload to AGENTS.md so the Codex runtime finds its role contract under
+    # the canonical filename. bridge_layout_materialize_identity (below) then
+    # delivers AGENTS.md into the workspace. No-op for Claude (entrypoint is
+    # already CLAUDE.md).
+    bridge_scaffold_codex_entrypoint "$scaffold_target" "$engine" 2>/dev/null || true
+    # Per-user partitions (`users/<id>/USER.md`) are per-agent identity,
+    # so they are scaffolded into the IDENTITY SOURCE alongside the rest
+    # of the authored identity — the `users/` skeleton template lands
+    # under `$scaffold_target`. The materialization step below delivers
+    # the populated `users/` tree into the workspace read target.
+    bridge_scaffold_user_partitions "$scaffold_target" "$users_json"
+    # Issue #1060 D1: deliver the authored identity into the engine's
+    # materialization target (the workspace `workdir/` for v2 static
+    # Claude) so the runtime read target is never the empty/stale
+    # sibling that caused the #1046/#1060 re-onboarding loop. No-op when
+    # scaffold_target == the materialization target (legacy / custom
+    # --workdir). Honors the shared-workspace rule internally.
+    if [[ "$scaffold_target" != "$workdir" ]] \
+        && declare -F bridge_layout_materialize_identity >/dev/null 2>&1; then
+      # Pass $workdir explicitly: the roster reload that
+      # `bridge_agent_workdir` (and therefore the descriptor's target
+      # lookup) depends on runs AFTER bridge_write_role_block below, so
+      # the create flow hands the already-resolved workspace directly.
+      #
+      # Codex r1 BLOCKING 1: propagate the operator's --allow-shared-workdir
+      # intent into the materializer so a normal project workspace (no
+      # marker text) is NOT stamped over. The materializer's marker-based
+      # detection alone is insufficient for markerless shared projects.
+      if [[ "${allow_shared_workdir:-0}" == "1" ]]; then
+        BRIDGE_LAYOUT_WORKSPACE_SHARED=1 \
+          bridge_layout_materialize_identity "$agent" "$engine" "$workdir"
+      else
+        bridge_layout_materialize_identity "$agent" "$engine" "$workdir"
+      fi
+    fi
     if [[ "$engine" == "claude" ]]; then
       bridge_ensure_project_claude_guidance "$workdir" >/dev/null 2>&1 || true
       bridge_ensure_auto_memory_isolation "$agent" "$workdir"
@@ -2783,6 +3116,22 @@ report and reap test-fixture agents per their pattern."
       # agents come up fully wired without a separate bootstrap pass.
       bridge_ensure_memory_precompact_hook "$agent" "$workdir" >/dev/null 2>&1 || true
     fi
+    # Issue #1067 S08: render + verify the Codex hook surface for codex-engine
+    # agents. The descriptor-owned path is <agent_home>/.codex/hooks.json —
+    # NOT the shared $HOME/.codex/hooks.json. scaffold_target is the resolved
+    # identity source (bridge_layout_agent_home on v2). bridge_engine_render_
+    # hooks_on_create returns true for codex, so we gate on engine == "codex"
+    # to stay forward-compatible without branching on the descriptor (which
+    # the descriptor owns for future engines).
+    if [[ "$engine" == "codex" ]]; then
+      bridge_ensure_codex_agent_hooks "$agent" "$scaffold_target" >/dev/null 2>&1 || true
+    fi
+    # Issue #1093: pass positional 20 (loop_explicit_off) and positional
+    # 21 (idle_timeout_value) so `agent add --loop no` persists the
+    # explicit-off line and `--idle-timeout <seconds>` writes the
+    # parameterised value. Positional 18 (replace_existing) stays "0" —
+    # add never rewrites — and positional 19 (agent_class) stays empty;
+    # agent class is a Track-2 update-only knob.
     bridge_write_role_block \
       "$agent" \
       "$description" \
@@ -2800,7 +3149,16 @@ report and reap test-fixture agents per their pattern."
       "$continue_mode" \
       "$always_on" \
       "$isolation_mode" \
-      "$os_user" >/dev/null
+      "$os_user" \
+      "0" \
+      "" \
+      "$loop_explicit_off" \
+      "$idle_timeout_value" >/dev/null
+    # Issue #1076: the agent is now registered. Mark for rollback excision
+    # if any later step (shared-settings link, grant-matrix apply,
+    # start --dry-run) raises — without this flag, a post-roster failure
+    # leaves a registered-but-broken agent (the exact bug).
+    _CREATE_ROLLBACK_ROSTER_WRITTEN=1
     # Issue #848: bridge_write_role_block just appended a new entry to
     # the local roster file; invalidate the per-process cache so the
     # next load re-reads disk instead of replaying the pre-create map.
@@ -2852,6 +3210,18 @@ report and reap test-fixture agents per their pattern."
           bridge_die "agent create: v2 shared-mode grant-matrix apply failed for '$agent' — first daemon pass would wedge on missing rows. Inspect output above, then 'agb agent delete $agent --force --purge-home' to roll back (the scaffolded home directory must be removed too)."
         }
     fi
+    # Issue #1073 (codex r1 BLOCKING): pre-seed the per-agent
+    # CLAUDE_CONFIG_DIR's `.claude.json` AFTER isolation prep so the
+    # target dir exists for linux-user isolated agents. Pre-r2 the call
+    # ran BEFORE prepare and the isolated home/`.claude` tree did not
+    # exist yet, so the seed silently failed and #1073 remained open
+    # for the production shape. Now: prepare creates + chowns the home
+    # tree first, then the seed writes inside it; the shim is
+    # isolation-aware and chowns the seeded file to the isolated UID
+    # when isolated, preserving the read path under the isolated user.
+    if [[ "$engine" == "claude" ]]; then
+      bridge_ensure_claude_first_run_config "$agent" "$workdir" >/dev/null 2>&1 || true
+    fi
     # Issue #680: bridge-start.sh --dry-run is purely informational here — its
     # output is reprinted to the user as `start_dry_run:` for diagnostic
     # context. Letting its rc propagate via command-substitution + set -e
@@ -2867,10 +3237,38 @@ report and reap test-fixture agents per their pattern."
     else
       start_dry_run_status="warn (rc=$?)"
     fi
+    # Issue #1076: every mutation in the create flow has now completed.
+    # Mark complete + disarm the EXIT trap so a normal exit does NOT roll
+    # back a successful create. A failure ANYWHERE above this line leaves
+    # _CREATE_ROLLBACK_COMPLETE=0, and the trap rolls back on shell exit.
+    _CREATE_ROLLBACK_COMPLETE=1
+    trap - EXIT
   fi
 
   if [[ $json_mode -eq 1 ]]; then
-    emit_create_json "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$BRIDGE_ROSTER_LOCAL_FILE" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user"
+    # Issue #1093: derive the persisted-policy fields the same way the
+    # writer does so the JSON envelope agrees with what landed on disk.
+    # idle_timeout_persisted: "0" when --always-on (legacy behavior), the
+    # raw --idle-timeout value otherwise, or empty for the default
+    # (writer omits the line). loop_persisted: "yes" / "no" / empty,
+    # mirroring the LOOP="1" / LOOP="0" / omitted writer paths.
+    local _emit_idle_timeout=""
+    if [[ -n "$idle_timeout_value" ]]; then
+      _emit_idle_timeout="$idle_timeout_value"
+    elif [[ $always_on -eq 1 ]]; then
+      _emit_idle_timeout="0"
+    fi
+    local _emit_loop=""
+    if [[ $loop_explicit_off -eq 1 ]]; then
+      _emit_loop="no"
+    elif [[ $loop_mode -eq 1 ]]; then
+      _emit_loop="yes"
+    fi
+    emit_create_json \
+      "$agent" "$engine" "$session" "$workdir" "$profile_home" \
+      "$launch_cmd" "$channels" "$BRIDGE_ROSTER_LOCAL_FILE" "$dry_run" \
+      "$users_json" "$session_type" "$isolation_mode" "$os_user" \
+      "$_emit_idle_timeout" "$_emit_loop"
     exit 0
   fi
 
@@ -2894,6 +3292,18 @@ report and reap test-fixture agents per their pattern."
   printf 'roster_file: %s\n' "$BRIDGE_ROSTER_LOCAL_FILE"
   if [[ $always_on -eq 1 ]]; then
     echo "always_on: yes"
+  fi
+  # Issue #1093: surface the persisted idle_timeout / loop policy so the
+  # caller's text output reflects what landed in the roster. always_on=yes
+  # already implies idle_timeout=0, so the explicit line is suppressed in
+  # that case to keep the output minimal.
+  if [[ -n "$idle_timeout_value" && $always_on -ne 1 ]]; then
+    printf 'idle_timeout: %s\n' "$idle_timeout_value"
+  fi
+  if [[ $loop_explicit_off -eq 1 ]]; then
+    echo "loop: no"
+  elif [[ $loop_mode -eq 1 ]]; then
+    echo "loop: yes"
   fi
   if [[ $dry_run -eq 1 ]]; then
     echo "dry_run: yes"
@@ -2956,6 +3366,12 @@ run_update() {
   local continue_value=""    # "1" (on) | "0" (off)
   local class_present=0
   local class_value=""
+  # Issue #1093: typed flag for BRIDGE_AGENT_IDLE_TIMEOUT mutation. Same
+  # tri-state shape the other typed flags use — presence drives whether
+  # the writer overrides the current value, and value is validated
+  # against `^[0-9]+$` at parse time so a bad write never lands.
+  local idle_timeout_present=0
+  local idle_timeout_value=""
 
   add_launch_cmd_op() {
     launch_cmd_ops+="$1"$'\t'"$2"$'\n'
@@ -3111,20 +3527,55 @@ run_update() {
         shift 2
         ;;
       --loop)
-        # `on|off` only. Production reader (bridge_agent_loop) defaults
-        # to "1", treats anything truthy as "on". `--loop off` opts the
-        # writer into emitting BRIDGE_AGENT_LOOP="0" via positional 20
-        # (loop_explicit_off=1). Time-window seconds are intentionally
-        # out of scope for Track 2 — there is no production reader for
-        # them today.
+        # Issue #1093: `--loop` accepts on|off (Track-2 legacy) AND
+        # yes|no (the create-symmetric form). Production reader
+        # (bridge_agent_loop) defaults to "1", treats anything truthy as
+        # "on". `--loop off` / `--loop no` opts the writer into emitting
+        # BRIDGE_AGENT_LOOP="0" via positional 20 (loop_explicit_off=1).
+        # Time-window seconds are intentionally out of scope for Track 2
+        # — there is no production reader for them today.
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
         case "$2" in
-          on)  loop_value="1" ;;
-          off) loop_value="0" ;;
-          *)   bridge_die "--loop 는 on|off 만 가능합니다: $2" ;;
+          on|yes|YES|Yes|ON|On)   loop_value="1" ;;
+          off|no|NO|No|OFF|Off)   loop_value="0" ;;
+          *) bridge_die "--loop 는 on|off|yes|no 만 가능합니다: $2" ;;
         esac
         loop_present=1
         mutation_present=1
+        shift 2
+        ;;
+      --idle-timeout)
+        # Issue #1093: integer ≥0 (seconds). 0 is the always-on
+        # convention used by bridge_agent_is_always_on (no separate
+        # field). Validate at parse time so a bad value never reaches
+        # the writer; emits BRIDGE_AGENT_IDLE_TIMEOUT="<value>" via
+        # positional 21 (idle_timeout_value).
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        if [[ ! "$2" =~ ^[0-9]+$ ]]; then
+          bridge_die "--idle-timeout 는 0 이상의 정수여야 합니다: $2"
+        fi
+        idle_timeout_present=1
+        idle_timeout_value="$2"
+        mutation_present=1
+        shift 2
+        ;;
+      --always-on)
+        # Issue #1093: sugar that maps to `--idle-timeout 0`. v1 does
+        # not accept `--always-on no` — the inverse is ambiguous because
+        # missing BRIDGE_AGENT_IDLE_TIMEOUT reads as 0 by default.
+        # Admins set a finite idle timeout via `--idle-timeout <N>`.
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        case "$2" in
+          yes|YES|Yes)
+            idle_timeout_present=1
+            idle_timeout_value="0"
+            mutation_present=1
+            ;;
+          no|NO|No)
+            bridge_die "--always-on no 는 v1 에서 지원하지 않습니다. 명시적 유한 idle timeout 은 --idle-timeout <seconds> 를 사용하세요."
+            ;;
+          *) bridge_die "--always-on 는 yes 만 가능합니다 (v1): $2" ;;
+        esac
         shift 2
         ;;
       --continue)
@@ -3229,6 +3680,11 @@ run_update() {
         if [[ "$continue_value" == "1" ]]; then printf 'continue=on\n'; else printf 'continue=off\n'; fi
       fi
       if [[ $class_present    -eq 1 ]]; then printf 'class=%s\n' "$class_value"; fi
+      # Issue #1093: idle_timeout mutation surfaces verbatim in the audit
+      # summary so log readers see what value the operator persisted.
+      if [[ $idle_timeout_present -eq 1 ]]; then
+        printf 'idle_timeout=%s\n' "$idle_timeout_value"
+      fi
     } | tr '\n' ',' | sed 's/,$//'
   )"
 
@@ -3317,13 +3773,35 @@ PY
 
   # Issue #580 Track 2: capture before/after values for the typed-flag
   # set so changed-detection and the audit row reflect the full surface.
+  # Issue #1093: idle_timeout added to the captured set so the audit row
+  # carries before/after idle_timeout deltas and the no-op short-circuit
+  # below recognises a repeated `--idle-timeout` as `changed=false`.
   local before_desc before_engine before_workdir before_loop before_continue before_class
+  local before_idle_timeout
   before_desc="$(bridge_agent_desc "$agent")"
   before_engine="$(bridge_agent_engine "$agent")"
   before_workdir="$(bridge_agent_workdir "$agent")"
   before_loop="$(bridge_agent_loop "$agent")"
   before_continue="$(bridge_agent_continue "$agent")"
   before_class="$(bridge_agent_class "$agent")"
+  before_idle_timeout="$(bridge_agent_idle_timeout "$agent")"
+  # Issue #1093: detect real configured-ness from the roster FILE rather
+  # than the in-memory map. bridge-state.sh:1236 backfills
+  # BRIDGE_AGENT_IDLE_TIMEOUT for every loaded agent to the default 0, so
+  # bridge_agent_idle_timeout_configured (which checks `-v
+  # BRIDGE_AGENT_IDLE_TIMEOUT[$agent]`) is always true after load. Grep
+  # the protected file for the explicit assignment line so "configure as
+  # always-on" on a previously-unconfigured agent reports `changed=true`
+  # and the writer persists the IDLE_TIMEOUT="0" line.
+  local before_idle_timeout_configured=0
+  # Codex r1 BLOCKING: use -F (fixed-string) so a `.` (or any regex
+  # metacharacter) in the agent name doesn't act as a wildcard — an
+  # agent named `a.b` would otherwise falsely match `axb`'s timeout
+  # line. The key form is structurally unique inside the roster, so a
+  # fixed-string contains-match is correct.
+  if [[ -f "$roster_path" ]] && grep -qF "BRIDGE_AGENT_IDLE_TIMEOUT[\"${agent}\"]=" "$roster_path"; then
+    before_idle_timeout_configured=1
+  fi
 
   local new_desc="$before_desc"
   local new_engine="$before_engine"
@@ -3331,12 +3809,18 @@ PY
   local new_loop="$before_loop"
   local new_continue="$before_continue"
   local new_class="$before_class"
-  [[ $desc_present -eq 1 ]]     && new_desc="$desc_value"
-  [[ $engine_present -eq 1 ]]   && new_engine="$engine_value"
-  [[ $workdir_present -eq 1 ]]  && new_workdir="$workdir_value"
-  [[ $loop_present -eq 1 ]]     && new_loop="$loop_value"
-  [[ $continue_present -eq 1 ]] && new_continue="$continue_value"
-  [[ $class_present -eq 1 ]]    && new_class="$class_value"
+  local new_idle_timeout="$before_idle_timeout"
+  local new_idle_timeout_configured="$before_idle_timeout_configured"
+  [[ $desc_present -eq 1 ]]         && new_desc="$desc_value"
+  [[ $engine_present -eq 1 ]]       && new_engine="$engine_value"
+  [[ $workdir_present -eq 1 ]]      && new_workdir="$workdir_value"
+  [[ $loop_present -eq 1 ]]         && new_loop="$loop_value"
+  [[ $continue_present -eq 1 ]]     && new_continue="$continue_value"
+  [[ $class_present -eq 1 ]]        && new_class="$class_value"
+  if [[ $idle_timeout_present -eq 1 ]]; then
+    new_idle_timeout="$idle_timeout_value"
+    new_idle_timeout_configured=1
+  fi
 
   local changed=0
   if [[ "$new_launch_cmd" != "$before_launch_cmd" \
@@ -3346,7 +3830,9 @@ PY
         || "$new_workdir" != "$before_workdir" \
         || "$new_loop" != "$before_loop" \
         || "$new_continue" != "$before_continue" \
-        || "$new_class" != "$before_class" ]]; then
+        || "$new_class" != "$before_class" \
+        || "$new_idle_timeout" != "$before_idle_timeout" \
+        || "$new_idle_timeout_configured" != "$before_idle_timeout_configured" ]]; then
     changed=1
   fi
 
@@ -3358,18 +3844,32 @@ PY
     # for the lines we are touching.
     local session profile_home discord_channel
     local notify_kind notify_target notify_account
-    local idle_timeout always_on isolation_mode os_user
+    local always_on isolation_mode os_user
     session="$(bridge_agent_session "$agent")"
     profile_home="$(bridge_agent_profile_home "$agent")"
     discord_channel="$(bridge_agent_discord_channel_id "$agent")"
     notify_kind="$(bridge_agent_notify_kind "$agent")"
     notify_target="$(bridge_agent_notify_target "$agent")"
     notify_account="$(bridge_agent_notify_account "$agent")"
-    idle_timeout="$(bridge_agent_idle_timeout "$agent")"
     isolation_mode="$(bridge_agent_isolation_mode "$agent")"
     os_user="$(bridge_agent_os_user "$agent")"
-    if [[ "$idle_timeout" == "0" ]]; then
-      always_on=1
+    # Issue #1093: the writer's `always_on==1 → IDLE_TIMEOUT="0"` legacy
+    # path is now subordinate to positional 21 (idle_timeout_value).
+    # When idle_timeout is NOT configured in the current roster AND the
+    # caller did not pass --idle-timeout, leave always_on=0 so the writer
+    # omits the IDLE_TIMEOUT line — preserving byte-identical emission
+    # for updates that only touch other fields (e.g. --desc). When the
+    # roster has it OR the caller is setting it, the value flows through
+    # positional 21 below and always_on is informational only. Use the
+    # file-grep configured bit captured above — the in-memory
+    # _idle_timeout_configured check is unreliable because the loader
+    # backfills the map.
+    if [[ "$new_idle_timeout_configured" == "1" ]]; then
+      if [[ "$new_idle_timeout" == "0" ]]; then
+        always_on=1
+      else
+        always_on=0
+      fi
     else
       always_on=0
     fi
@@ -3383,6 +3883,16 @@ PY
     local loop_explicit_off_arg=0
     if [[ "$new_loop" == "0" ]]; then
       loop_explicit_off_arg=1
+    fi
+    # Issue #1093: positional 21 (idle_timeout_value) carries the
+    # post-mutation value. Always pass it on the update path so a
+    # rewrite that touches OTHER fields (e.g. --desc) preserves the
+    # roster's current IDLE_TIMEOUT line when it had one. Use the
+    # file-grep configured bit to determine whether the line should be
+    # written (the loader-backfilled in-memory map is unreliable).
+    local idle_timeout_writer_arg=""
+    if [[ "$new_idle_timeout_configured" == "1" ]]; then
+      idle_timeout_writer_arg="$new_idle_timeout"
     fi
     bridge_write_role_block \
       "$agent" \
@@ -3404,7 +3914,8 @@ PY
       "$os_user" \
       "1" \
       "$new_class" \
-      "$loop_explicit_off_arg" >/dev/null
+      "$loop_explicit_off_arg" \
+      "$idle_timeout_writer_arg" >/dev/null
     after_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
 
     # Issue #989: bridge_write_role_block just rewrote the roster file —
@@ -3426,6 +3937,29 @@ PY
     trigger_label="agent-update-dry-run"
   fi
 
+  # Issue #1093: surface policy deltas in the audit row and JSON
+  # envelope only when this mutation actually touched idle_timeout or
+  # loop. The helpers default to dropping empty pairs, so leaving the
+  # args empty for unrelated mutations keeps the existing detail shape.
+  # The values mirror what `bridge_agent_idle_timeout` / `bridge_agent_loop`
+  # would return (default "0" / "1" for unconfigured agents) so audit
+  # readers see the runtime-observable value. The first-time configure
+  # case (unset → "0") still surfaces because the configured-ness
+  # transition trips the `changed` bit above and forces the pair to be
+  # emitted, even though the numeric value matches.
+  local audit_before_idle="" audit_after_idle=""
+  local audit_before_loop="" audit_after_loop=""
+  if [[ "$new_idle_timeout" != "$before_idle_timeout" \
+        || "$new_idle_timeout_configured" != "$before_idle_timeout_configured" \
+        || $idle_timeout_present -eq 1 ]]; then
+    audit_before_idle="$before_idle_timeout"
+    audit_after_idle="$new_idle_timeout"
+  fi
+  if [[ "$new_loop" != "$before_loop" || $loop_present -eq 1 ]]; then
+    audit_before_loop="$before_loop"
+    audit_after_loop="$new_loop"
+  fi
+
   bridge_agent_update_emit_audit \
     "$trigger_label" \
     "$actor_label" \
@@ -3440,7 +3974,11 @@ PY
     "$new_launch_cmd" \
     "$before_channels" \
     "$new_channels" \
-    "$merged_actions_json"
+    "$merged_actions_json" \
+    "$audit_before_idle" \
+    "$audit_after_idle" \
+    "$audit_before_loop" \
+    "$audit_after_loop"
 
   if [[ $json_mode -eq 1 ]]; then
     bridge_agent_update_emit_json \
@@ -3453,7 +3991,11 @@ PY
       "$new_channels" \
       "$before_sha" \
       "$after_sha" \
-      "$merged_actions_json"
+      "$merged_actions_json" \
+      "$audit_before_idle" \
+      "$audit_after_idle" \
+      "$audit_before_loop" \
+      "$audit_after_loop"
     return 0
   fi
 
@@ -3479,6 +4021,17 @@ PY
   printf 'after_launch_cmd: %s\n' "$new_launch_cmd_display"
   printf 'before_channels: %s\n' "$before_channels"
   printf 'after_channels: %s\n' "$new_channels"
+  # Issue #1093: surface idle_timeout / loop deltas in plain-text output
+  # when the mutation touched them. Empty audit values mean "policy
+  # untouched" so the lines are suppressed to keep output minimal.
+  if [[ -n "$audit_before_idle" || -n "$audit_after_idle" ]]; then
+    printf 'before_idle_timeout: %s\n' "$audit_before_idle"
+    printf 'after_idle_timeout: %s\n' "$audit_after_idle"
+  fi
+  if [[ -n "$audit_before_loop" || -n "$audit_after_loop" ]]; then
+    printf 'before_loop: %s\n' "$audit_before_loop"
+    printf 'after_loop: %s\n' "$audit_after_loop"
+  fi
   printf 'before_sha: %s\n' "$before_sha"
   printf 'after_sha: %s\n' "$after_sha"
 }
@@ -3852,6 +4405,74 @@ PY
         bridge_warn "agent delete: --purge-home refused: resolved home outside expected agent roots: $home_dir"
         ;;
     esac
+
+    # Issue #1076: on a v2 install, `bridge_agent_default_home` resolves
+    # to `$BRIDGE_AGENT_ROOT_V2/<agent>/home` — ONE of the two children of
+    # the per-agent root. The sibling `workdir/` and the per-agent root
+    # itself are NOT covered above and accumulate root-owned residue from
+    # a prior isolated create that aborted mid-flow. Without this purge
+    # the next `agent create <same-name>` re-hits the same PermissionError
+    # the issue documents (`agents/<a>/.claude` mkdir fails because the
+    # parent is root-owned 2750). Use the layout accessor when available
+    # so the path source is consistent with the create flow.
+    if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
+      local v2_agent_root="$BRIDGE_AGENT_ROOT_V2/$agent"
+      if [[ -d "$v2_agent_root" ]]; then
+        # Sibling workdir under the per-agent root.
+        local v2_workdir="$v2_agent_root/workdir"
+        if [[ -d "$v2_workdir" ]]; then
+          if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+            bridge_linux_sudo_root rm -rf -- "$v2_workdir" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $v2_workdir"
+          else
+            rm -rf -- "$v2_workdir" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $v2_workdir"
+          fi
+        fi
+        # The per-agent root parent — root-owned 2750 on isolated installs.
+        # Rm it last so its children are gone first. Use sudo when the
+        # controller cannot rm directly (isolated parent ownership).
+        if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+          bridge_linux_sudo_root rm -rf -- "$v2_agent_root" || \
+            bridge_warn "agent delete: --purge-home best-effort rm failed: $v2_agent_root"
+        else
+          rm -rf -- "$v2_agent_root" || \
+            bridge_warn "agent delete: --purge-home best-effort rm failed: $v2_agent_root"
+        fi
+      fi
+    fi
+
+    # Issue #1076: the tracked-profile-source location
+    # (`$BRIDGE_HOME/agents/<a>/`, via bridge_layout_profile_source_dir)
+    # also accumulates residue — managed agents that go through the v2
+    # shared-settings render path materialize `agents/<a>/.claude/` even
+    # though their canonical home is under the v2 root, and the legacy
+    # layout uses this exact dir as the home tree. Purge it too so a
+    # subsequent create starts clean. Validate the path resolves under
+    # $BRIDGE_AGENT_HOME_ROOT (= $BRIDGE_HOME/agents on a standard
+    # install) before rm so we never escape the agent roots.
+    local profile_src=""
+    if declare -F bridge_layout_profile_source_dir >/dev/null 2>&1; then
+      profile_src="$(bridge_layout_profile_source_dir "$agent" 2>/dev/null || printf '')"
+    elif [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" ]]; then
+      profile_src="$BRIDGE_AGENT_HOME_ROOT/$agent"
+    fi
+    if [[ -n "$profile_src" ]] && [[ -d "$profile_src" ]]; then
+      case "$profile_src" in
+        "${BRIDGE_AGENT_HOME_ROOT:-/dev/null}"/*)
+          if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+            bridge_linux_sudo_root rm -rf -- "$profile_src" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $profile_src"
+          else
+            rm -rf -- "$profile_src" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $profile_src"
+          fi
+          ;;
+        *)
+          bridge_warn "agent delete: --purge-home refused tracked-profile residue outside BRIDGE_AGENT_HOME_ROOT: $profile_src"
+          ;;
+      esac
+    fi
 
     # Issue #737 Q6: also cover the isolated agent's actual Linux home
     # (`/home/agent-bridge-<agent>/`). `bridge_agent_default_home` only

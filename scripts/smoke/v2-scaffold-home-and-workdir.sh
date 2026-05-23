@@ -121,11 +121,9 @@ write_driver_script() {
     'SCRIPT_DIR="$REPO_ROOT"' \
     'source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1' \
     'FUNC_TMP="$DRIVER_TMP_DIR/scaffold-funcs.sh"' \
-    '{' \
-    '  sed -n "128,139p" "$REPO_ROOT/bridge-agent.sh"' \
-    '  sed -n "188,257p" "$REPO_ROOT/bridge-agent.sh"' \
-    '  sed -n "385,618p" "$REPO_ROOT/bridge-agent.sh"' \
-    '} > "$FUNC_TMP"' \
+    '# Extract by function name (heredoc-aware) so the smoke survives' \
+    '# line shifts in bridge-agent.sh. See scripts/smoke/helpers/extract-shell-fn.py.' \
+    'python3 "$REPO_ROOT/scripts/smoke/helpers/extract-shell-fn.py" "$REPO_ROOT/bridge-agent.sh" bridge_agent_manage_python bridge_render_template_string bridge_scaffold_agent_home > "$FUNC_TMP"' \
     'source "$FUNC_TMP"' \
     'declare -F bridge_scaffold_agent_home >/dev/null 2>&1 || { echo "DRIVER_FAIL: bridge_scaffold_agent_home not loaded"; exit 91; }' \
     '# Stub template renderer to a no-op so scaffold returns immediately' \

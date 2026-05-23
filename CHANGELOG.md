@@ -6,6 +6,211 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta6] — 2026-05-23
+
+### Highlight — clean-cut foundation wave
+
+Operator-cued **sixth prerelease** in the v0.14.5 stabilization window. A
+24-PR wave on `release/v0.14.5-beta6-integration` lays the foundation for
+the upcoming v1.0 clean-cut refactor: the typed three-layer agent layout
+(identity / workspace / engine materialization), descriptor-driven engine
+provisioning, hooks-SSOT consolidation, and a standalone legacy → clean
+install migrator (export/plan/verify; `apply` deferred to beta7 #1087).
+The wave also folds in **17 newly-reported upstream issues** (#1062, #1063,
+#1065, #1073-#1078, #1082, #1083, #1093, #1096, #1099-#1101, #1108).
+
+Every PR was codex pair-reviewed (`agb-dev-claude` + `agb-dev-codex`); the
+integration branch additionally passed a full-branch codex review (r1
+returned 2 BLOCKING + 1 SHOULD-FIX → addressed in PR #1111 → r2
+`implement-ok`). Operator runs Linux-VM QA personally on a fresh install.
+`-beta6` prerelease; matching tag `v0.14.5-beta6`, GitHub release marked
+**Pre-release**.
+
+### Added — typed layout + engine descriptor
+
+- **#1060 (PR #1081)** — typed agent-layout resolver
+  (`lib/bridge-agent-layout.sh`) + minimal engine descriptor
+  (`lib/bridge-engine-descriptor.sh`). Establishes the three-layer
+  v2 model: identity source → workspace materialization target →
+  engine-specific entrypoint. Lays the foundation for cleanly
+  decoupling identity authoring from engine packaging. D1-D5 smokes +
+  three release-gate smokes lock the resolver contract.
+
+### Added — managed tmux bootstrap
+
+- **#1058 (PR #1080)** — managed tmux UX defaults block for Claude/Codex
+  TUI sessions. The bootstrap installs documented defaults (window/pane
+  titles, status line, key bindings) so first-time users get a sensible
+  TUI without hunting through dotfiles.
+
+### Added — descriptor-driven Codex static provisioning
+
+- **#1067 (PR #1088)** — Codex static agents now provision through the
+  engine descriptor: AGENTS.md entrypoint, per-agent `.codex/hooks.json`,
+  and an upgrade-time propagation helper. Replaces ad-hoc Codex profile
+  scaffolding with the same descriptor pipeline Claude uses.
+
+### Added — hooks SSOT
+
+- **#1068 (PR #1092)** — `bridge-hooks.py` is now the canonical hooks
+  source-of-truth. The session-template's `hooks.json` reduces to `{}`
+  (minimal marker), the per-agent install wires through the SSOT
+  renderer, wrapper directories consolidate to a single layout, and
+  predicates carry legacy-wrapper migration courtesy for in-place
+  upgrades.
+
+### Added — agent CLI flags
+
+- **#1093 (PR #1102)** — `agent add` and `agent update` accept
+  `--idle-timeout`, `--loop yes|no`, and `--always-on` for setting daemon
+  behavior at create or modify time instead of requiring a separate edit.
+  Create-path audit gap deferred to #1105.
+
+### Added — Teams MCP proactive send
+
+- **#1083 (PR #1085)** — Teams MCP gains a `send_message` tool so an
+  agent can proactively initiate a 1:1 Teams thread (vs only replying).
+  Fail-closed gate keeps it disabled when the Teams channel is not
+  configured.
+
+### Added — standalone legacy-install migrator
+
+- **#1086** — `scripts/migrate-legacy-install.sh` ships
+  `export` / `plan` / `verify` for migrating a legacy-shaped install to
+  a clean target. `apply` is deferred to beta7 (#1087) with codex r1
+  contract gaps documented inline. `verify` is intentionally a
+  target-FS inspection helper for beta6; layout-resolver integration
+  bundles with `apply`.
+
+### Fixed — channel runtime config under BRIDGE_HOME
+
+- **#1062 (PR #1071)** — channel runtime-config files were resolved
+  against `$HOME` instead of `$BRIDGE_HOME`, so isolated installs read
+  the controller's config. Resolution now anchors on `$BRIDGE_HOME`.
+
+### Fixed — Teams setup secret leak
+
+- **#1063 (PR #1072)** — `bridge-setup.sh` Teams client-secret prompt
+  exported the secret as a CLI argument, exposing it in `ps`/`/proc`.
+  The secret is now passed via stdin only.
+
+### Fixed — docs reconcile
+
+- **#1065 (PR #1069)** — `README`, `CLAUDE.md`, `AGENTS.md`, and
+  `docs/audit-2026-05-15.md` references to old versions, removed plans,
+  or relocated audit files reconciled to current state.
+
+### Fixed — cron isolated-UID grant
+
+- **#1079** — cron run dirs (`state/cron`, `state/cron/runs`) did not
+  carry the group-write + default-ACL grant that isolated-UID agents
+  need. The grant now applies gated on `linux-user` isolation, and the
+  per-agent leaf is `chgrp`'d to `ab-agent-<agent>` so the isolated UID
+  can write its own job artifacts. 4-round codex convergence to land
+  the gate + matrix rows + leaf chgrp.
+
+### Fixed — claude-token sync for isolation modes
+
+- **#1082 (PR #1084)** — `claude-token` sync was a no-op for shared
+  agents and used the wrong group for isolated agents, breaking auth
+  refresh. Shared mode is now correctly a no-op; isolated mode writes
+  to `ab-shared` so the isolated UID can read the refreshed token.
+
+### Fixed — Teams bun runtime + plugin node_modules
+
+- **#1074 (PR #1090)** — Teams channel setup did not provision the bun
+  runtime + plugin `node_modules`, so the Teams MCP failed on first use
+  with `bun: command not found` or missing dependency errors.
+  Provisioning now lands at channel-setup time.
+
+### Fixed — per-agent CLAUDE_CONFIG_DIR cred seed
+
+- **#1075 (PR #1094)** — `CLAUDE_CONFIG_DIR` was not seeded with the
+  controller's credentials, so per-agent Claude sessions hit a fresh
+  login flow on every cold start. Cred file is now seeded with a
+  parent-symlink reject guard.
+
+### Fixed — agent create atomicity + purge-home
+
+- **#1076 (PR #1095)** — partial-failure `agent create` left an
+  orphaned half-scaffolded home. Create now stages into a temp dir and
+  atomically renames on success (rollback trap removes the temp dir on
+  failure). `agent delete --purge-home` now also removes the workdir
+  sibling and the isolation-v2 data root entries.
+
+### Fixed — migrate-isolation-v2 wrong dir
+
+- **#1077 (PR #1089)** — `migrate-isolation-v2` repair tool walked the
+  tracked profile path (`agents/<a>/`) instead of the v2 runtime root
+  (`data/agents/<a>/workdir`), so the repair was a no-op on actual v2
+  installs. Now uses the v2 root resolver.
+
+### Fixed — channel-agent isolation umbrella (#1078)
+
+- **#1091** — umbrella for #1078 (F1+F2+F3+F5): plugin-catalog seed,
+  data-root + data-agents-root matrix rows, chain-of-0700 walker.
+  F4/F6 (channel cleanup symmetry + uninstall path) deferred to
+  follow-up.
+
+### Fixed — channel-agent first-run config seed
+
+- **#1073 (PR #1097)** — first-run config prompts fired on every cold
+  start of a channel agent because `CLAUDE_CONFIG_DIR` was unseeded.
+  Pre-seed now runs after `bridge_linux_prepare_agent_isolation` via
+  `sudo -n -u <iso> bash -c 'exec python3 ...'` (4-round codex
+  convergence to land the right sudoers contract).
+
+### Fixed — cron-dispatch auto-wake
+
+- **#1096 (PR #1098)** — cron-dispatch rows targeting a `stopped` static
+  agent did not wake the target, so the dispatched task sat queued
+  forever. Daemon now auto-wakes a stopped static target when a
+  cron-dispatch row targets it.
+
+### Fixed — idle-nudge age gate
+
+- **#1099 (PR #1103)** — daemon idle-nudge fired on any in-flight
+  task age, including tasks legitimately mid-flight. The gate now widens
+  to a task-level invariant (claimed-but-not-progressed > nudge
+  threshold). Shell-fanout race deferred to #1106.
+
+### Fixed — audit --since timezone normalization
+
+- **#1100 (PR #1104)** — `agb audit list --since <naive>` compared a
+  naive timestamp against tz-aware records, returning empty for valid
+  input. Naive `--since` now normalizes to local TZ.
+
+### Fixed — defensive BRIDGE_LAYOUT unset
+
+- **#1101 (PR #1107)** — pane launch envelope inherited a stale
+  `BRIDGE_LAYOUT` from the caller's shell, breaking layout resolution
+  inside the new pane. Envelope now defensively unsets it.
+
+### Fixed — watchdog scans wrong tree on v2
+
+- **#1108 (PR #1109)** — `bridge-watchdog.py` enumerated
+  `agents/<a>/` (tracked profile) but v2 runtime profiles live under
+  `data/agents/<a>/workdir/`, causing false-positive
+  `missing_files: CLAUDE.md, SOUL.md, ...` on every v2 agent every
+  scan. Resolver now anchors on the registry-stored agent record.
+
+### Changed — repo hygiene
+
+- **#1110** — removed three stale planning / handoff docs (618 lines):
+  `docs/handoff/219-linux-isolation-e2e.md`,
+  `docs/stabilization-plan-2026-05-15.md`,
+  `docs/audit-2026-05-15.md`. Replaced with topical CHANGELOG note
+  for the historical reference.
+
+### Fixed — beta6 r2 integration review
+
+- **#1111** — codex full-branch r1 review surfaced 2 BLOCKING + 1
+  SHOULD-FIX: scaffold smoke driver-fail on hardcoded sed line ranges
+  (fixed via new heredoc-aware `scripts/smoke/helpers/extract-shell-fn.py`),
+  MIGRATOR verify ↔ LAYOUT seam contract drift (verify contract
+  amended — target-FS inspection only, resolver integration to beta7
+  #1087), and CHANGELOG stale reference cleanup. r2 `implement-ok`.
+
 ## [0.14.5-beta5] — 2026-05-23
 
 ### Highlight — fresh-install bug-fix wave
@@ -4812,8 +5017,8 @@ v0.6.17; pulling latest `main` is sufficient.
   isolated subprocesses can still benefit from the grant when ACL
   infrastructure is available.
 - Docs: `docs/agent-runtime/memory-daily-harvest.md` §10 rewritten;
-  new `docs/handoff/219-linux-isolation-e2e.md` (Linux server admin
-  patch E2E runbook).
+  added Linux server admin patch E2E runbook (later removed in
+  v0.14.5-beta6 repo cleanup, #1110).
 - Smoke additions: scenario 9 (shared/aggregate path), scenario 14
   (stub isolation + readable `.claude/projects` → `--transcripts-home`
   dispatch, no sudo), scenario 15 (unreadable target → structured

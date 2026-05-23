@@ -35,6 +35,26 @@ For the full operator guide, including ALB / nginx / iptables paths and setup va
 
 - `reply`: send a message back to a Teams conversation that has already passed access control. Accepts `chat_id` (required), `text` (optional if `attachments` is non-empty), and `attachments` (optional array; personal chats only — see §Outbound Attachments).
 - `fetch_messages`: read the local rolling message log captured by the plugin.
+- `send_message`: proactively initiate a 1:1 message to an allowlisted Teams user without requiring an inbound message first. Accepts `to` (required — AAD object ID or Teams user ID matching an entry in `access.json` allowFrom) and `text` (required). Uses the Bot Framework `createConversation` / `sendActivity` pattern when no stored conversation reference exists; reuses the stored reference if the user has messaged the bot before. Requires the bot app to be installed in the target user's Teams personal scope.
+
+  Example:
+  ```jsonc
+  { "to": "<aad-object-id-or-teams-user-id>", "text": "Setup complete — bridge is online." }
+  ```
+
+  Return shape:
+  ```jsonc
+  { "ok": true, "conversation_id": "...", "message_id": "..." }
+  // or on error:
+  { "ok": false, "conversation_id": "", "message_id": "", "error": "bot_not_installed_or_auth_failed: ..." }
+  ```
+
+  Common errors:
+  - `send_message: target "..." is not in the access.json allowFrom list` — add the user's id via `agb setup teams <agent> --allow-from <id> --yes`.
+  - `bot_not_installed_or_auth_failed` — ensure the bot app is installed in the user's Teams personal scope (Apps -> search for the bot), or have a tenant admin push it via Graph `installedApps`. Also verify `TEAMS_APP_ID` / `TEAMS_APP_PASSWORD` / `TEAMS_TENANT_ID` match the Azure Bot registration.
+  - `user_not_found` — confirm the `to` value is the correct AAD object ID or Teams user ID for this tenant.
+
+  For multi-region tenants where the Teams service URL differs from the default (`smba.trafficmanager.net/amer`), set `TEAMS_SERVICE_URL` in `.env`. The plugin derives the URL automatically from any stored conversation reference once the user has messaged the bot at least once.
 
 ## Access
 
@@ -58,7 +78,7 @@ For the full operator guide, including ALB / nginx / iptables paths and setup va
 Agent Bridge writes this file through:
 
 ```bash
-agb setup teams <agent> --app-id ... --app-password ... --tenant-id ... --allow-from ... --messaging-endpoint https://bot.example.com/api/messages --webhook-host 0.0.0.0
+BRIDGE_TEAMS_APP_PASSWORD=... agb setup teams <agent> --app-id ... --tenant-id ... --allow-from ... --messaging-endpoint https://bot.example.com/api/messages --webhook-host 0.0.0.0
 ```
 
 ## Inbound Attachments

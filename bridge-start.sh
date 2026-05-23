@@ -475,6 +475,14 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
     fi
   fi
   bridge_bootstrap_claude_shared_skills "$AGENT" "$WORK_DIR" || true
+  # Issue #1073: defensive seed of the per-agent CLAUDE_CONFIG_DIR's
+  # `.claude.json` for agents created before this seed was added to the
+  # `agent create` flow. Idempotent (`setdefault` semantics on every key)
+  # and a no-op for engines other than Claude. Without this, an existing
+  # fresh channel agent that was created on a prior bridge version would
+  # still hit the theme-picker / trust-dialog restart loop on its next
+  # start until the operator manually ran `auth claude-token sync`.
+  bridge_ensure_claude_first_run_config "$AGENT" "$WORK_DIR" >/dev/null 2>&1 || true
   if ! bridge_ensure_claude_project_trust "$WORK_DIR" >/dev/null 2>&1; then
     bridge_warn "Claude project trust seed failed: $WORK_DIR"
   fi
@@ -633,6 +641,14 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "agent=$AGENT"
   echo "session=$SESSION"
   echo "workdir=$WORK_DIR"
+  # Issue #1060 D2: surface the identity source (layer 2) alongside the
+  # workspace (layer 3) so dry-run and `agent show` report the same
+  # three-layer model. `workdir` is the cwd the runtime launches in;
+  # `agent_home` is the authored canonical identity tree. On a v2 install
+  # the two diverge — before #1060 dry-run only printed `workdir`.
+  if declare -F bridge_layout_agent_home >/dev/null 2>&1; then
+    echo "agent_home=$(bridge_layout_agent_home "$AGENT")"
+  fi
   echo "continue=$EFFECTIVE_CONTINUE_MODE"
   echo "safe_mode=$SAFE_MODE"
   echo "channels=$(bridge_agent_channels_csv "$AGENT")"

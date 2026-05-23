@@ -247,33 +247,34 @@ For ambiguous scope decisions, the consensus rule (per operator directive): proc
 
 ## Progress log
 
-Append below as stages complete.
+Reconciled 2026-05-23 against the v0.14.5-beta5 tree (commit `0ff5e92`). The
+earlier per-stage "pending" entries were never updated after the stages landed;
+the table below is the current state.
 
-### Stage 0 — Plan write-up
-- **Started**: 2026-05-15 22:30 KST
-- **Status**: codex r1 needs-more (5 items) → r2 needs-more (3 doc consistency items) → r3 dispatched
-- **PR**: #901, branch `chore/stabilization-plan-2026-05-15`
-- **Next**: r3 implement-ok → merge → S1 dispatch
+| stage | status | evidence |
+|---|---|---|
+| S0 — plan write-up | **landed** | merged via PR #901 |
+| S1 — doc catch-up + audit archive | **landed** | `docs/audit-2026-05-15.md` exists; E06–E10 closed by PR #902 |
+| S1.5 — heredoc-ban lint guard | **landed** (expanded) | `scripts/lint-heredoc-ban.sh`, `.lint-heredoc-baseline.tsv`; broadened beyond the original bridge-upgrade-only guard |
+| S2 — operator-visible blockers | **landed** | `isolation-v2-macos-noise-suppression` + `layout-resolver-marker-over-env` smokes registered |
+| S3 — platform discriminator | **landed** | `lib/bridge-isolation-discriminator.sh`, sourced from `bridge-lib.sh` |
+| S4 — Bash 3.2 re-exec removal | open | deferred per plan (post-S5); `bridge-lib.sh` still re-execs |
+| S5 — Bucket 2 enforcement gates | partial | discriminator + `isolation-v2-bucket2-gates` smoke landed; not all sites proved closed |
+| S6 — Bucket 3 / Bucket 4 | open / partial | `bridge_isolation_v2_require_linux` exists; wide rollout not done |
+| S7 — Audit A P1 cleanup | partial | daemon-hang / heredoc hardening landed in v0.14.2–v0.14.3; many Audit-A rows still open |
+| S8 — Audit B P1 cleanup | open / partial | queue still lacks `busy_timeout` PRAGMA (A13/B01) |
+| S9 — refactor wave | open | large files + env-var sprawl remain |
+| S10 — heredoc late cleanup | partial | baseline ratchet landed; remaining grandfathered sites still open |
 
-### Stage 1 — Doc catch-up + audit ground truth archive
-- **Status**: pending S0 merge
-
-### Stage 1.5 — Heredoc-ban lint guard
-- **Status**: pending S1 (per codex r2 ordering)
-
-### Stage 2 — Operator-visible blockers (macOS noise + env-leak)
-- **Status**: pending S1.5
-
-### Stage 3 — Platform discriminator foundation
-- **Status**: pending S2
-
-(remaining stages pending)
+Per-finding status lives in `docs/audit-2026-05-15.md`; update rows there as PRs merge.
 
 ## Audit raw output — archived in S1
 
-S1 must create `docs/audit-2026-05-15.md` with the structured row format (`id | severity | category | file:line | one-line | risk | owner-stage | status`). Until S1 lands, this section is intentionally incomplete and **S1 is blocked on archiving the evidence** (the audit subagent outputs only exist in this session's task notifications).
-
-Next session: do NOT proceed past S1 without verifying `docs/audit-2026-05-15.md` exists and is non-empty.
+S1 has landed: the structured findings are archived in
+[`docs/audit-2026-05-15.md`](./audit-2026-05-15.md) with the row format
+(`id | severity | category | file:line | one-line | risk | owner-stage | status`).
+That file is the ground truth for per-finding status; this plan tracks
+stage-level progress only.
 
 ## Recovery from misuse
 

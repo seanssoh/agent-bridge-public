@@ -495,3 +495,139 @@ bridge_write_idle_ready_agents() {
     printf '%s\n' "$agent" >>"$file"
   done
 }
+
+# --- Teams plugin runtime provisioning (issue #1074) -----------------------
+#
+# The bundled Teams channel plugin (plugins/teams/) is a Bun TypeScript MCP
+# server. Its .mcp.json invokes `bun ... --no-install server.ts`, which means
+# Bun will refuse to auto-install missing deps at runtime; node_modules must
+# already exist when the MCP boots. On a fresh install neither the `bun`
+# runtime nor the plugin's node_modules are provisioned, so the
+# channel-required Teams MCP cannot start (dev-plugin-cache reports
+# `node_modules=missing` and the spawn fails with `bun: not found`).
+#
+# These helpers provision both at `agent-bridge setup teams` time. They are
+# idempotent: a second call with bun + node_modules already in place is a
+# no-op. `--dry-run` short-circuits both side effects.
+
+# Resolve a usable `bun` executable. Prefers PATH (covers Homebrew, asdf,
+# operator-managed installs), falls back to the canonical $HOME/.bun/bin/bun
+# location used by the official installer — which is not always on the
+# daemon-spawned PATH but is still a valid runtime. Prints the resolved
+# absolute path on stdout; returns non-zero with no output when none found.
+bridge_resolve_bun_executable() {
+  # Codex r1 BLOCKING: the Teams MCP launches bare `bun` (plugins/teams/
+  # .mcp.json), so a bun binary that exists at $HOME/.bun/bin/bun is only
+  # usable if that path is on the agent's PATH. Accepting a $HOME/.bun/bin
+  # fallback here would mark setup successful while the downstream daemon
+  # -spawned MCP still hits `bun: not found`. Require PATH-reachability via
+  # `command -v` so setup's success claim is truthful end-to-end.
+  local candidate=""
+  if candidate="$(command -v bun 2>/dev/null)" && [[ -n "$candidate" && -x "$candidate" ]]; then
+    printf '%s' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+# Install the Bun runtime via the official installer
+# (https://bun.sh/install). Honors --dry-run by reporting the intended action
+# without touching the host. Fails closed with a clear operator message when
+# `curl` is absent (network-blocked CI / sandbox) — surface the documented
+# workaround from issue #1074 rather than hanging in an opaque restart loop.
+#
+# Returns 0 on success, non-zero with bridge_warn on failure.
+bridge_install_bun_runtime() {
+  local dry_run="${1:-0}"
+
+  if [[ "$dry_run" == "1" ]]; then
+    bridge_info "[setup] [dry-run] would install bun via https://bun.sh/install"
+    return 0
+  fi
+
+  if ! command -v curl >/dev/null 2>&1; then
+    bridge_warn "bun runtime missing and curl is not available — install bun manually (see https://bun.sh/install) and re-run setup teams"
+    return 1
+  fi
+
+  bridge_info "[setup] installing bun runtime (https://bun.sh/install)…"
+  if ! curl -fsSL https://bun.sh/install | bash >&2; then
+    bridge_warn "bun installer failed — install bun manually (see https://bun.sh/install) and re-run setup teams"
+    return 1
+  fi
+
+  if ! bridge_resolve_bun_executable >/dev/null; then
+    bridge_warn "bun installer reported success but \`bun\` is not on PATH — the official installer drops it at \$HOME/.bun/bin/bun and prints a line to add that to your shell rc. Open a new shell (or add \$HOME/.bun/bin to PATH globally for the daemon), then re-run \`agb setup teams <agent>\`."
+    return 1
+  fi
+
+  return 0
+}
+
+# Run `bun install --frozen-lockfile` in the Teams plugin source dir so the
+# MCP's deps are resolved at the source. The dev-plugin-cache linker
+# (bridge-dev-plugin-cache.py) copies node_modules from source into the
+# per-agent cache, so source-side install is the authoritative provisioning
+# step. `--frozen-lockfile` keeps the install deterministic against
+# `plugins/teams/bun.lock`. Idempotent: skipped when node_modules already
+# exists. Honors dry-run.
+bridge_install_teams_plugin_node_modules() {
+  local dry_run="${1:-0}"
+  local bun_bin="${2:-}"
+  local plugin_dir=""
+
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  plugin_dir="$BRIDGE_SCRIPT_DIR/plugins/teams"
+
+  if [[ ! -d "$plugin_dir" ]]; then
+    bridge_warn "Teams plugin source not found at $plugin_dir — skipping bun install"
+    return 1
+  fi
+
+  if [[ -d "$plugin_dir/node_modules" ]]; then
+    bridge_info "[setup] $plugin_dir/node_modules already present — skipping bun install"
+    return 0
+  fi
+
+  if [[ "$dry_run" == "1" ]]; then
+    bridge_info "[setup] [dry-run] would run: bun install --frozen-lockfile in $plugin_dir"
+    return 0
+  fi
+
+  if [[ -z "$bun_bin" ]]; then
+    bun_bin="$(bridge_resolve_bun_executable)" || {
+      bridge_warn "bun executable missing after provisioning — cannot bun install in $plugin_dir"
+      return 1
+    }
+  fi
+
+  bridge_info "[setup] running bun install --frozen-lockfile in $plugin_dir"
+  if ! ( cd "$plugin_dir" && "$bun_bin" install --frozen-lockfile --no-summary >&2 ); then
+    bridge_warn "bun install failed in $plugin_dir — Teams MCP will not start until deps resolve"
+    return 1
+  fi
+
+  return 0
+}
+
+# Channel-setup-time entry point: ensure bun + plugins/teams/node_modules
+# are provisioned. Called from bridge-setup.sh `run_teams()` after the
+# Python config write succeeds. Failure does not abort setup (operator may
+# still want the access.json / runtime config recorded), but emits a clear
+# bridge_warn so the operator sees the gap and the workaround.
+bridge_provision_teams_plugin_runtime() {
+  local dry_run="${1:-0}"
+  local bun_bin=""
+
+  if bun_bin="$(bridge_resolve_bun_executable)"; then
+    bridge_info "[setup] bun runtime present at $bun_bin"
+  else
+    bridge_install_bun_runtime "$dry_run" || return 1
+    bun_bin="$(bridge_resolve_bun_executable || true)"
+  fi
+
+  bridge_install_teams_plugin_node_modules "$dry_run" "$bun_bin" || return 1
+  return 0
+}

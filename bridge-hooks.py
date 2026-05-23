@@ -131,6 +131,21 @@ def managed_claude_settings_defaults(
         "autoCompactWindow": resolve_managed_autocompact_window(launch_cmd, agent_class),
         "promptSuggestionEnabled": False,
     }
+    # Issue #1073: bridge-managed Claude agents launch with
+    # `--dangerously-skip-permissions`. On a fresh per-agent `CLAUDE_CONFIG_DIR`
+    # the CLI displays a one-shot "Bypass Permissions mode" warning picker that
+    # blocks the tmux session, which `bridge-run.sh`'s foreground-detect kills
+    # and relaunches → infinite restart loop. `skipDangerousModePermissionPrompt`
+    # = True in settings.json is Claude's documented opt-out. Setting it as a
+    # managed default (rather than relying on operator-run `auth claude-token
+    # sync`) ensures the prompt is suppressed on the very first launch of a
+    # fresh channel agent — admin agents reusing the controller's already-
+    # onboarded `~/.claude` never hit this, so it was only caught when the
+    # first per-agent-config Claude agent (a Teams channel agent) was created.
+    # Operator overlay (`settings.local.json`) still wins via the
+    # `managed < base < overlay < preserved` merge order.
+    if launch_cmd and "--dangerously-skip-permissions" in launch_cmd:
+        defaults["skipDangerousModePermissionPrompt"] = True
     plugin_settings = agent_bridge_development_plugin_settings(launch_cmd)
     if plugin_settings:
         defaults = merge_settings(defaults, plugin_settings)
@@ -234,11 +249,6 @@ def pre_compact_hook_command(bridge_home: Path, python_bin: str) -> str:
     return shell_command(python_bin, shell_path(hook_path))
 
 
-def codex_session_start_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "codex-session-start.py"
-    return shell_command(python_bin, shell_path(hook_path))
-
-
 def codex_stop_hook_command(bridge_home: Path, python_bin: str) -> str:
     hook_path = bridge_home / "hooks" / "check-inbox.py"
     return shell_command(python_bin, shell_path(hook_path), "--format", "codex")
@@ -298,6 +308,12 @@ def is_session_stop_hook(command: str) -> bool:
 
 
 def is_session_start_hook(command: str) -> bool:
+    # Recognize both the active rendered spelling (`session-start.py
+    # [--format codex]`) and the legacy `codex-session-start.py` wrapper
+    # spelling so re-rendering an existing install rewrites the command
+    # in place rather than appending a duplicate hook. The wrapper file
+    # itself was removed in #1068 (HOOKS-SSOT); only the predicate match
+    # remains as a migration courtesy.
     command = str(command)
     return "session-start.py" in command or "codex-session-start.py" in command
 
@@ -327,6 +343,12 @@ def is_codex_session_start_hook(command: str) -> bool:
 
 
 def is_codex_stop_hook(command: str) -> bool:
+    # Recognize both the active rendered spelling (`check-inbox.py
+    # --format codex`) and the legacy `codex-stop.py` wrapper spelling
+    # so re-rendering an existing install rewrites the command in place
+    # rather than appending a duplicate hook. The wrapper file itself
+    # was removed in #1068 (HOOKS-SSOT); only the predicate match
+    # remains as a migration courtesy.
     command = str(command)
     return "check-inbox.py" in command or "codex-stop.py" in command
 

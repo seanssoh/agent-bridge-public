@@ -282,6 +282,30 @@ sanitization. Together with `hooks/bridge_hook_common.py` it is the
 containment/audit layer (not a sandbox — see CLAUDE.md "High-Risk
 Areas" item 5).
 
+### Hook config SSOT (#1068)
+
+`bridge-hooks.py` is the single source of truth for the effective
+`<workdir>/.claude/settings.json` (Claude) and `<agent_home>/.codex/hooks.json`
+(Codex) hook surfaces. Per-engine branching for hook config path /
+renderer profile lives in `lib/bridge-engine-descriptor.sh` — do not
+add new `case "$ENGINE"` branches for hook config in callers.
+
+- `agents/.claude/settings.json` — the shared base the renderer composes
+  against. Edit here when you need to add/change a hook the renderer
+  installs.
+- `agents/_template/.claude/settings.json` — `{}` bootstrap marker only.
+  The scaffold walker copies it into new agent homes; the renderer then
+  replaces the per-agent file with a symlink to the rendered effective
+  file. Do NOT add hook policy here — it would be a second source of
+  truth for the hook surface, defeating the SSOT.
+- Codex hook entries are written by `bridge-hooks.py ensure-codex-hooks`
+  to a per-agent `<agent_home>/.codex/hooks.json` (descriptor contract;
+  `bridge_engine_hook_config_path <agent> codex`). The renderer installs
+  the direct executable forms (`session-start.py --format codex`,
+  `check-inbox.py --format codex`); the predicates still recognize the
+  legacy `codex-session-start.py` / `codex-stop.py` wrapper spellings so
+  re-rendering an existing install rewrites the command in place.
+
 ### Agent class
 
 Each agent has a class (`user` by default; `system` opt-in via roster).

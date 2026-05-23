@@ -58,6 +58,12 @@ WATCHDOG_SKIP_NAMES = frozenset({"_template", "shared"})
 # the subset of registry fields the watchdog needs:
 #   - "engine":       "claude" | "codex" | ""
 #   - "agent_source": "static" | "dynamic" | ""
+#   - "workdir":      absolute path to the per-agent runtime workdir
+#                     (#1108). On v2 layouts this is
+#                     `$BRIDGE_DATA_ROOT/agents/<a>/workdir`, the tree
+#                     the materialization step authors the .md profile
+#                     into. Empty for legacy/v1 installs where the
+#                     tracked-tree dir IS the runtime profile.
 # A dedicated type alias keeps the signatures readable without dragging
 # the whole registry schema into the watchdog.
 RegistryMeta = dict[str, dict[str, str]]
@@ -218,11 +224,73 @@ def _registry_ids_from_payload(
         # fresh-state suppression (#907). Missing fields → empty string;
         # the scan loop maps empty engine → "claude" (legacy behavior)
         # and empty source → no #907 suppression (conservative).
+        # `workdir` (#1108): the v2 runtime profile path. The registry
+        # producer (`bridge-agent.sh:run_registry`) populates this from
+        # `bridge_agent_workdir`, which on a v2 install returns
+        # `$BRIDGE_DATA_ROOT/agents/<a>/workdir` — the tree the
+        # materialization step writes the canonical CLAUDE.md / SOUL.md
+        # / SESSION-TYPE.md / MEMORY*.md into. Without this signal the
+        # watchdog walked the tracked profile-template tree
+        # ($BRIDGE_HOME/agents/<a>/) on v2 and reported every runtime
+        # .md as `missing_files`. Empty string falls back to the legacy
+        # `<root>/<name>` path so the v1 / no-registry path is unchanged.
         meta[agent_id] = {
             "engine": str(row.get("engine") or "").strip(),
             "agent_source": str(row.get("agent_source") or "").strip(),
+            "workdir": str(row.get("workdir") or "").strip(),
         }
     return ids, meta
+
+
+def resolve_scan_path(
+    agent_name: str,
+    default_path: Path,
+    registry_meta: RegistryMeta,
+) -> Path:
+    """Resolve the on-disk directory the watchdog should actually scan
+    for ``agent_name`` (#1108).
+
+    The watchdog used to scan the directory under
+    ``$BRIDGE_AGENT_HOME_ROOT/<name>`` unconditionally. On a v2 layout
+    install (`bridge_resolve_layout` → ``v2``) that path is the tracked
+    profile-template tree — typically empty or holding only ``.claude/``
+    + a handful of symlinks. The actual runtime profile (the canonical
+    CLAUDE.md / SOUL.md / SESSION-TYPE.md / MEMORY*.md materialized by
+    ``bridge_layout_materialize_identity``) lives at
+    ``$BRIDGE_DATA_ROOT/agents/<name>/workdir/``. Scanning the wrong
+    tree produced a false-positive ``status: error,
+    missing_files: CLAUDE.md, SOUL.md, …`` on every v2 agent on every
+    run, and the librarian-watchdog cron then enqueued phantom drift
+    tasks to the admin inbox.
+
+    Resolution rule:
+
+      * If the registry payload exposes a ``workdir`` for this agent
+        (``bridge_agent_workdir`` propagated via
+        ``bridge-agent.sh:run_registry``) **and** that path exists on
+        disk, scan it. On v2 that path is the runtime workdir; on a
+        legacy install it equals the tracked-tree dir, so the behavior
+        is unchanged.
+      * Otherwise fall through to ``default_path`` — the legacy
+        ``<agent_home_root>/<name>`` location the caller already
+        computed from ``list_agent_dirs``. This preserves backward
+        compat for v1 installs, the ``--no-registry-anchored`` legacy
+        mode, and the fallback enumeration that fires when the registry
+        endpoint is unavailable.
+
+    Existence is checked because a registry ``workdir`` whose directory
+    is missing is itself drift the watchdog must surface (status=error
+    via ``missing_files``) — scanning the present-on-disk default is
+    the closest signal in that case. The materialize step also runs at
+    agent-create time on v2, so an existing v2 agent should always have
+    a populated workdir directory; a missing one is genuine drift.
+    """
+    workdir_str = registry_meta.get(agent_name, {}).get("workdir", "")
+    if workdir_str:
+        candidate = Path(workdir_str).expanduser()
+        if candidate.is_dir():
+            return candidate
+    return default_path
 
 
 def collect_broken_links(agent_dir: Path) -> list[str]:
@@ -366,7 +434,16 @@ def scan_agent(
     agent_dir: Path,
     engine: str = "claude",
     agent_source: str = "",
+    agent_name: str | None = None,
 ) -> AgentWatch:
+    # `agent_name` (#1108) is the registry id, threaded through
+    # explicitly because on v2 layouts ``agent_dir`` resolves to
+    # ``$BRIDGE_DATA_ROOT/agents/<a>/workdir`` — so ``agent_dir.name``
+    # is "workdir", not the agent id. Falling back to
+    # ``agent_dir.name`` keeps every legacy caller (smoke tests,
+    # ``watchdog scan <agent>`` ad-hoc invocations that pass a Path
+    # directly) unchanged.
+    resolved_name = agent_name if agent_name is not None else agent_dir.name
     # v0.8.8 #715-B / #694: linux-user-isolated agents own
     # `agents/<name>/CLAUDE.md` as `agent-bridge-<name>:<group> 0640`.
     # When the controller process credentials don't include the new
@@ -413,7 +490,7 @@ def scan_agent(
             engine,
         )
         return AgentWatch(
-            agent=agent_dir.name,
+            agent=resolved_name,
             session_type=session_type,
             onboarding_state=onboarding_state,
             status=status,
@@ -427,13 +504,13 @@ def scan_agent(
         )
     except (PermissionError, FileNotFoundError) as exc:
         print(
-            f"[bridge-watchdog] skipped {agent_dir.name}: "
+            f"[bridge-watchdog] skipped {resolved_name}: "
             f"{type(exc).__name__} during scan ({exc.strerror or exc}); "
             f"likely isolated agent unreadable to controller",
             file=sys.stderr,
         )
         return AgentWatch(
-            agent=agent_dir.name,
+            agent=resolved_name,
             session_type="unknown",
             onboarding_state="unknown",
             status="warn",
@@ -553,11 +630,21 @@ def main() -> int:
             # Disable the id filter; keep the meta map.
             registry_ids = None
     scan_paths, orphan_directories = list_agent_dirs(agent_root, args.agents, registry_ids)
+    # #1108: redirect each registered agent's scan path to the registry's
+    # `workdir` field when it exists on disk. On a v2 layout install that
+    # path is `$BRIDGE_DATA_ROOT/agents/<a>/workdir` — the tree the
+    # canonical .md profile is materialized into — instead of the
+    # tracked-tree dir under `$BRIDGE_HOME/agents/<a>/` (which on v2 holds
+    # only `.claude/` + symlinks and produces false-positive
+    # `missing_files`). The agent name is threaded through `scan_agent`
+    # explicitly so the `agent` field stays the registry id, not the
+    # basename of the resolved workdir path (which is "workdir" on v2).
     records = [
         scan_agent(
-            path,
+            resolve_scan_path(path.name, path, registry_meta),
             engine=(registry_meta.get(path.name, {}).get("engine") or "claude"),
             agent_source=registry_meta.get(path.name, {}).get("agent_source", ""),
+            agent_name=path.name,
         )
         for path in scan_paths
     ]

@@ -2459,7 +2459,7 @@ bridge_linux_share_plugin_catalog() {
         && [[ -z "$_v2_pcg_plugins" ]]; then
       return 0
     fi
-    bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) but agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries. Populate the shared plugins cache (\`agb bundle install\` or seed installed_plugins.json into \$BRIDGE_SHARED_ROOT/plugins-cache) before starting v2-isolated agents that require plugins."
+    bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) but agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries. Run \`agb plugins seed\` to populate the shared plugin catalog from the bundled agent-bridge marketplace, then retry. (For an external marketplace: \`agb plugins seed --marketplace-root <path>\`.)"
   fi
 
   local isolated_plugins="$user_home/.claude/plugins"
@@ -4025,6 +4025,105 @@ bridge_agent_claude_home_dir() {
 bridge_agent_claude_config_dir() {
   local agent="$1"
   printf '%s/.claude' "$(bridge_agent_claude_home_dir "$agent")"
+}
+
+# bridge_ensure_claude_first_run_config <agent>
+#
+# Issue #1073 — pre-seed a Claude agent's per-agent ``CLAUDE_CONFIG_DIR``
+# so the CLI skips first-run interactive prompts (theme picker,
+# onboarding, project-trust dialog). Without this, a fresh non-admin
+# Claude channel agent that has its own ``CLAUDE_CONFIG_DIR`` cannot
+# start: the picker blocks the tmux session, ``bridge-run.sh``'s
+# foreground detection kills the session, and relaunch loops
+# indefinitely (admin agents reuse the controller's already-onboarded
+# ``~/.claude`` and never trip this).
+#
+# Writes ``<config_dir>/.claude.json`` with the same bootstrap payload
+# ``auth claude-token sync`` uses (``hasCompletedOnboarding``,
+# ``firstStartTime``, project ``hasTrustDialogAccepted`` etc.). The
+# companion ``skipDangerousModePermissionPrompt`` key for the Bypass
+# Permissions warning is a managed default in ``settings.json``
+# (`bridge-hooks.py::managed_claude_settings_defaults`) — that side
+# rides through the existing render path.
+#
+# Idempotent: ``setdefault`` semantics on every bootstrap key. Safe to
+# call from both ``agent create`` (first-run wire-up) and
+# ``bridge-start.sh`` (defensive seed for agents created before this
+# fix). No-op when the agent is not a Claude agent.
+#
+# For linux-user isolated agents: this runs as controller BEFORE
+# ``bridge_linux_prepare_agent_isolation`` chowns the home tree, so the
+# seeded file naturally inherits the isolated UID with the rest of the
+# scaffold. For start-path defensive seeding on an already-isolated
+# agent, the seed becomes a no-op when the file already exists with the
+# bootstrap keys (or skips when the controller cannot write).
+bridge_ensure_claude_first_run_config() {
+  local agent="$1"
+  local workdir="${2-}"
+  local engine=""
+  local config_dir=""
+  local helper=""
+
+  [[ -n "$agent" ]] || return 0
+
+  engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+  [[ "$engine" == "claude" ]] || return 0
+
+  config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+  [[ -n "$config_dir" ]] || return 0
+
+  if [[ -z "$workdir" ]]; then
+    workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  fi
+
+  helper="${BRIDGE_SCRIPT_DIR:-}/scripts/python-helpers/seed-claude-first-run-config.py"
+  if [[ ! -f "$helper" ]]; then
+    # Source-checkout / bridge-home divergence — silently skip rather
+    # than abort the create / start path. The seeded keys are a
+    # defense-in-depth layer; existing `auth claude-token sync` flows
+    # still cover the operator-driven case.
+    return 0
+  fi
+
+  # Codex r2 BLOCKING: post-`bridge_linux_prepare_agent_isolation`,
+  # the isolated agent's `<home>/.claude/` is owned `iso_user:iso_grp`
+  # mode 2750 (`lib/bridge-agents.sh:3745-3759`). The controller is only
+  # a group member (r-x), NOT a group writer — a plain controller
+  # python3 write into that dir FAILS, gets swallowed by `|| return 0`,
+  # and the chown step never repairs anything. The seed has to be
+  # written through the privileged handoff.
+  #
+  # For linux-user isolated agents: run the helper via
+  # `bridge_linux_sudo_root sudo -u <iso_user>` so the write happens AS
+  # the isolated UID — file lands `iso_user:iso_grp` mode 0644 naturally
+  # readable by Claude CLI launched under that UID. For non-isolated
+  # agents: plain controller python3.
+  local _seed_isolated=0
+  local _iso_user=""
+  if ! bridge_isolation_disabled_by_env 2>/dev/null \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    _iso_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    [[ -n "$_iso_user" ]] && command -v bridge_linux_sudo_root >/dev/null 2>&1 \
+      && _seed_isolated=1
+  fi
+
+  if (( _seed_isolated == 1 )); then
+    # Codex r3 BLOCKING fix: the project's sudoers contract whitelists
+    # operator → isolated user for `tmux` + `bash` ONLY (see
+    # `lib/bridge-migration.sh:773-783` + `bridge-agent.sh:492-499`).
+    # Direct `sudo -u <iso> python3 ...` is NOT covered; existing
+    # isolated-user helpers (`lib/bridge-isolation-helpers.sh:104-112`)
+    # wrap the inner command in `bash -c '...'` so the whitelist matches.
+    # Also call `sudo` directly (no `bridge_linux_sudo_root` wrap) so we
+    # don't end up with `sudo -n sudo -n -u <iso> ...` (double sudo).
+    local _bash_bin="${BRIDGE_BASH_BIN:-bash}"
+    sudo -n -u "$_iso_user" "$_bash_bin" -c \
+      'exec python3 "$1" "$2" "$3"' -- "$helper" "$config_dir" "$workdir" \
+      >/dev/null 2>&1 || return 0
+  else
+    python3 "$helper" "$config_dir" "$workdir" >/dev/null 2>&1 || return 0
+  fi
+  return 0
 }
 
 bridge_agent_onboarding_state() {
@@ -6270,7 +6369,7 @@ bridge_agent_channel_setup_guidance() {
     printf "\nRun: %s setup telegram %s --token <TELEGRAM_BOT_TOKEN> --allow-from <TELEGRAM_USER_ID> --default-chat <TELEGRAM_CHAT_ID>" "$cli" "$agent"
   fi
   if bridge_channel_csv_contains "$required" "plugin:teams"; then
-    printf "\nRun: %s setup teams %s --app-id <TEAMS_APP_ID> --app-password <TEAMS_APP_PASSWORD> --allow-from <TEAMS_USER_ID>" "$cli" "$agent"
+    printf "\nRun: BRIDGE_TEAMS_APP_PASSWORD=<TEAMS_APP_PASSWORD> %s setup teams %s --app-id <TEAMS_APP_ID> --allow-from <TEAMS_USER_ID>" "$cli" "$agent"
   fi
   if bridge_channel_csv_contains "$required" "plugin:mattermost"; then
     printf "\nRun: %s setup mattermost %s --url <MATTERMOST_URL> --bot-token <BOT_TOKEN> --allow-from <USER_ID>" "$cli" "$agent"
@@ -7615,4 +7714,34 @@ bridge_upsert_env_value() {
     printf '%s=%s\n' "$key" "$value" >>"$tmp_file"
   fi
   mv "$tmp_file" "$env_file"
+}
+
+# bridge_scaffold_codex_entrypoint <home> <engine>
+#
+# Issue #1067 S03: write AGENTS.md as the engine-native entrypoint for a
+# Codex agent into its identity source (agent_home). The template scaffold
+# loop places CLAUDE.md for every engine (the template only has CLAUDE.md);
+# for Codex the native instruction-file convention is AGENTS.md. This
+# function creates AGENTS.md as a copy of CLAUDE.md in the same directory
+# so the Codex runtime finds its role contract under the canonical filename,
+# and bridge_layout_materialize_identity then delivers AGENTS.md into the
+# workspace (the descriptor already lists the engine entrypoint in its copy
+# set). Safe to call for any engine — it is a no-op when the descriptor
+# entrypoint is CLAUDE.md (i.e., not Codex).
+#
+# Called from bridge-agent.sh (post-scaffold, before materialize) and
+# available from lib so smoke drivers sourcing bridge-lib.sh can assert
+# the S03 contract without sourcing the full bridge-agent.sh script.
+bridge_scaffold_codex_entrypoint() {
+  local home="$1"
+  local engine="$2"
+  [[ -n "$home" && -n "$engine" ]] || return 0
+  local entrypoint=""
+  if declare -F bridge_engine_entrypoint_filename >/dev/null 2>&1; then
+    entrypoint="$(bridge_engine_entrypoint_filename "$engine" 2>/dev/null || printf '')"
+  fi
+  [[ -n "$entrypoint" && "$entrypoint" != "CLAUDE.md" ]] || return 0
+  [[ -f "$home/CLAUDE.md" ]] || return 0
+  [[ -f "$home/$entrypoint" ]] && return 0
+  cp -f "$home/CLAUDE.md" "$home/$entrypoint" 2>/dev/null || true
 }

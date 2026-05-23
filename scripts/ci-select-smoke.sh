@@ -106,7 +106,7 @@ add_live() {
 }
 
 add_all_required_static() {
-  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-update agent-update-launch-cmd-redaction agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir isolated-agent-delete-reap nudge-task-age-gate tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge
+  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed isolated-agent-delete-reap nudge-task-age-gate nudge-redundant-active-agent tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1058-bootstrap-tmux-ux legacy-install-migrator 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir
 }
 
 add_all_integration() {
@@ -176,6 +176,15 @@ select_for_path() {
     docs/agent-runtime/admin-protocol.md)
       add_required admin-protocol-shared-link
       ;;
+    agents/_template/CLAUDE.md|agents/_template/.claude/commands/wrap-up.md)
+      # Issue #1060 D3/D4: these tracked templates carry the
+      # resolver-derived layout wording (CLAUDE.md) and the per-agent
+      # memory-dir resolution (wrap-up.md). They are .md files, so the
+      # is_docs_only_path early-return below would otherwise select only
+      # the global required smokes. This case precedes that return so a
+      # template-text drift still pulls the #1060 layout smokes.
+      add_required 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning
+      ;;
   esac
 
   if is_docs_only_path "$path"; then
@@ -208,7 +217,7 @@ select_for_path() {
       # handoffs through bridge-task.sh create as its enqueue boundary,
       # so a change to that boundary must re-run the A2A end-to-end
       # smoke alongside the queue regression smokes.
-      add_required queue nudge-task-age-gate a2a-cross-bridge
+      add_required queue nudge-task-age-gate nudge-redundant-active-agent a2a-cross-bridge 1100-audit-since-tz
       add_integration integration-minimal
       ;;
 
@@ -300,7 +309,14 @@ select_for_path() {
       # its gate smoke whenever bridge-agent.sh or lib/bridge-agent-update.sh
       # moves so a future PR cannot regress the create/update/delete trust
       # symmetry back to an ungated create.
-      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-update agent-update-launch-cmd-redaction agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1028-isolated-workdir-check
+      # Issue #1060: bridge-agent.sh::run_create scaffolds the authored
+      # identity into the identity source (layer 2) and runs a
+      # materialization step into the engine read target; bridge-start.sh's
+      # dry-run now surfaces `agent_home` alongside `workdir`. Pull the
+      # three-layer agent-layout smokes whenever bridge-agent.sh or
+      # bridge-start.sh moves so a future PR cannot regress the D1
+      # scaffold-then-materialize inversion back to the empty-sibling bug.
+      add_required launch launch-dev-channels-injection tmux-injection upgrade-source-preservation upgrade-shared-settings-propagate agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction agent-doctor upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering status-engine-detect 835-static-admin-launch isolated-agent-delete-reap 1028-isolated-workdir-check v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -368,7 +384,13 @@ select_for_path() {
       # `agent-env-sh` matrix contract (controller:<agent_grp> 0640)
       # defined in lib/bridge-isolation-v2.sh; pull its smoke on every
       # isolation-lib move so a matrix-row change re-checks the writer.
-      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install launch isolated-agent-delete-reap
+      # Issue #1077: `bridge_isolation_v2_reapply_one_agent` resolves
+      # `agent_root` through `bridge_isolation_v2_agent_root` so per-agent
+      # grant-matrix rows land on `$BRIDGE_DATA_ROOT/agents/<a>/`, not the
+      # tracked profile template at `$BRIDGE_HOME/agents/<a>/`. Pull its
+      # regression smoke for every isolation-lib + bridge-migrate.sh move
+      # so the dual-tree confusion class stays caught at PR time.
+      add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir launch isolated-agent-delete-reap
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -450,7 +472,16 @@ select_for_path() {
       # tool-policy's `is_admin_agent`. The admin-hook-exemption smoke
       # covers both the prompt-guard branch and the tool-policy
       # credential-deny exemption.
-      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption
+      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning
+      add_integration integration-minimal
+      ;;
+
+    scripts/migrate-legacy-install.sh|scripts/python-helpers/migrate-legacy-install-helper.py|scripts/python-helpers/migrator-smoke-helpers.py|scripts/smoke/legacy-install-migrator.sh)
+      # clean-cut wave beta6: standalone legacy-install migrator (export/plan/apply/verify).
+      # The migrator and its smoke are independent of the upgrade path; pull only
+      # the migration smoke + queue baseline so a change here doesn't rerun the
+      # full upgrade matrix unnecessarily.
+      add_required legacy-install-migrator queue
       add_integration integration-minimal
       ;;
 
@@ -475,7 +506,7 @@ select_for_path() {
       # marker-only fast-path. Pull the regression smoke (T3 specifically
       # asserts the env-propagation contract — fast-path NOT fired when
       # BRIDGE_UPGRADE_CONTEXT is unset) whenever the upgrade entry moves.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning
       add_integration integration-minimal
       ;;
 
@@ -507,6 +538,16 @@ select_for_path() {
       # recipe. Pull admin-pair-server-auto-provision whenever any of the
       # four touches so the server/dev gate matrix stays pinned.
       add_required admin-pair-server-auto-provision agent-create-caller-trust-gate upgrade-shared-settings-propagate managed-autocompact-window per-agent-settings-rendering
+      add_integration integration-minimal
+      ;;
+
+    bridge-bootstrap.sh|lib/bridge-tmux-ux.sh)
+      # Issue #1058: bridge-bootstrap.sh sources lib/bridge-tmux-ux.sh and
+      # runs bridge_setup_tmux_ux, which writes an idempotent managed tmux
+      # UX block to ~/.tmux.conf. Pull the idempotency / graceful-degradation
+      # smoke whenever either file moves so a future PR cannot regress the
+      # in-place block replacement or the version/terminfo gating.
+      add_required 1058-bootstrap-tmux-ux agent-create-caller-trust-gate
       add_integration integration-minimal
       ;;
 
@@ -562,7 +603,12 @@ select_for_path() {
       # false status=error. Cover the contract truth-table smoke plus the
       # registry-anchoring and stderr-capture regressions whenever the
       # watchdog moves.
-      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture queue
+      # Issue #1108: the watchdog now routes the per-agent scan target
+      # through the registry's `workdir` field on v2 layouts so it stops
+      # false-positive-reporting `missing_files: CLAUDE.md, SOUL.md, …`
+      # on every cron tick. Pull 1108-watchdog-v2-workdir on every
+      # watchdog move so the dual-tree confusion class stays caught.
+      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir queue
       add_integration integration-minimal
       ;;
 
@@ -587,6 +633,27 @@ select_for_path() {
       # values through the shared launch-cmd-redact module. Pull the
       # redaction regression smoke whenever either renderer moves.
       add_required agent-update agent-update-launch-cmd-redaction
+      add_integration integration-minimal
+      ;;
+
+    lib/bridge-agent-layout.sh|lib/bridge-engine-descriptor.sh|scripts/daily-note-reconcile.py)
+      # Issue #1060: the typed agent-layout resolver + minimal engine
+      # descriptor + the D4 memory-tooling default. All three feed the
+      # three-layer agent-layout model the #1060 D5 smokes pin — run them
+      # whenever any of these move so a future PR cannot drift the
+      # resolver / descriptor / memory-default out of agreement. (The D3
+      # template .md files are dispatched in the pre-docs-return case
+      # above.)
+      add_required 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair 1067-codex-provisioning v2-scaffold-home-and-workdir agent-doctor
+      add_integration integration-minimal
+      ;;
+
+    bridge-channels.py|bridge-channels.sh)
+      # Issue #1060 (beta5 QA finding #1): bridge-channels.py's
+      # remove-webhook-server now catches PermissionError/OSError quietly
+      # so `agent create --isolate` no longer dumps a traceback. Cover the
+      # channel-plugins regression smoke whenever the channel modules move.
+      add_required channel-plugins channel-env-readiness
       add_integration integration-minimal
       ;;
 

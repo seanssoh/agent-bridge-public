@@ -12,10 +12,13 @@ Important files:
 - `.env`: contains `TEAMS_APP_ID`, `TEAMS_APP_PASSWORD`, and `TEAMS_TENANT_ID`.
 - `access.json`: contains user allowlists and conversation policies.
 
-Prefer the deterministic Agent Bridge setup command instead of hand-editing credentials:
+Prefer the deterministic Agent Bridge setup command instead of hand-editing
+credentials. Pass the client secret via the `BRIDGE_TEAMS_APP_PASSWORD`
+environment variable (or `--app-password-file <path>`) so it is not exposed in
+shell history or the process table:
 
 ```bash
-agb setup teams <agent> --app-id <app-id> --app-password <secret> --tenant-id <tenant-id> --allow-from <aad-object-id> --yes
+BRIDGE_TEAMS_APP_PASSWORD=<secret> agb setup teams <agent> --app-id <app-id> --tenant-id <tenant-id> --allow-from <aad-object-id> --yes
 ```
 
 For team channels, require mentions unless the user explicitly asks for every message in the channel to wake the agent:

@@ -35,8 +35,8 @@ Each Claude hook below has a classification that determines whether a Codex twin
 
 | Claude hook | Classification | Codex disposition |
 |---|---|---|
-| `session_start.py` (SessionStart) | **shared** | Already wired via `session-start.py --format codex` (rendered by `session_start_hook_command(..., "codex")` in `bridge-hooks.py`). The standalone `codex-session-start.py` is a compatibility wrapper, not the active rendered command. Keep as-is. |
-| `mark-idle.sh` + `check_inbox.py` (Stop) | **shared** | Codex Stop wired via `check-inbox.py --format codex` (rendered by `codex_stop_hook_command()`). The standalone `codex-stop.py` is a compatibility wrapper, not the active rendered command. Inbox concern is the same; verify wrapper signature in smoke test. |
+| `session_start.py` (SessionStart) | **shared** | Wired via `session-start.py --format codex` (rendered by `session_start_hook_command(..., "codex")` in `bridge-hooks.py`). The legacy `codex-session-start.py` wrapper was removed in #1068 (HOOKS-SSOT); the renderer's predicate still matches the old spelling so re-rendering an existing install rewrites the command in place. |
+| `mark-idle.sh` + `check_inbox.py` (Stop) | **shared** | Codex Stop wired via `check-inbox.py --format codex` (rendered by `codex_stop_hook_command()`). The legacy `codex-stop.py` wrapper was removed in #1068 (HOOKS-SSOT); the renderer's predicate still matches the old spelling so re-rendering an existing install rewrites the command in place. |
 | `prompt_timestamp.py` (UserPromptSubmit) | **shared** | Already shared between engines. |
 | `prompt-guard.py` (UserPromptSubmit) | **channel-facing** | Codex does not receive untrusted prompt-shaped input from external channels. Companion-role *task body* validation is a separate concern handled by the queue-time validator (preferred) or `codex-task-body-validate.py` hook fallback. Do not mirror `prompt-guard` directly. |
 | `tool-policy.py` (PreToolUse) | **shared-with-adapter** | Codex executes the same dangerous local tools (Bash, file writes, network calls). Policy concern is shared. Implementation needs a Codex `PreToolUse` event adapter and a schema pass before it runs blocking; ship in dry-run/audit-only first. |
@@ -126,12 +126,12 @@ Reverting: unset the env vars (or set them to `audit`) and restart.
 
 Several Claude hook wrappers were written in early April and have not been updated since. They are minimal (10–30 lines) and call the underlying implementation, but no smoke test verifies that the wrapper signature still matches the implementation:
 
-- `session-start.py` → `session_start.main()`
-- `check-inbox.py` → `check_inbox.main()`
+- `session-start.py` → `session_start.main()` (also handles Codex via `--format codex`)
+- `check-inbox.py` → `check_inbox.main()` (also handles Codex via `--format codex`)
 - `mark-idle.sh` → `bridge_agent_mark_idle_now` + queue summary
 - `clear-idle.sh` → `bridge_agent_clear_idle_marker`
-- `codex-session-start.py` → `session_start.main(["--format", "codex"])`
-- `codex-stop.py` → `check_inbox.main(["--format", "codex"])`
+
+The legacy `codex-session-start.py` and `codex-stop.py` standalone wrappers were removed in #1068 (HOOKS-SSOT). The renderer installs the direct shared modules with `--format codex`; predicate-side recognition of the old wrapper spelling remains as a migration courtesy so re-render rewrites the legacy command in place.
 
 **Smoke coverage** for these is tracked separately (Stage 3 of the hook audit). It must verify that each wrapper's `main()` invocation succeeds with the current implementation signature, and that the codex hooks file (`~/.codex/hooks.json` template) lists the expected entries.
 
