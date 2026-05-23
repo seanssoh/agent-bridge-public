@@ -4,17 +4,22 @@
 # Synthetic legacy-install repro for scripts/migrate-legacy-install.sh.
 #
 # Builds a fake old-style install (two agents + cron + memory + channel config),
-# then runs: export → plan → apply-to-clean → verify.
+# then runs: export → plan → confirm-apply-deferred.
 #
-# Assertions:
+# beta6 fold-back per codex r1 review: apply is DEFERRED to beta7 (three
+# contract gaps — clean-target gate, layout-resolver bypass, secret re-entry).
+# The smoke now asserts the user-facing apply default is refused with a clear
+# beta7 deferral message and does NOT mutate the target. The full apply +
+# post-apply verify smoke moves to beta7 alongside the apply rework.
+#
+# Assertions (beta6):
 #   1. export writes a manifest + agent identity files to bundle dir.
 #   2. plan prints apply plan and target-cleanliness check without error.
-#   3. apply REFUSES a non-empty target (safety gate).
-#   4. apply SUCCEEDS into a clean target; identity lands in agent_home.
-#   5. workspace / project-tree files are NOT copied (non-portable).
-#   6. secrets are NOT in the bundle (Teams secret, A2A key).
-#   7. verify PASSES on the migrated target.
-#   8. apply writes .migrator-apply-result.json with correct agent list.
+#   3. secrets are NOT in the bundle (Teams secret, A2A key).
+#   4. workspace / project-tree files are NOT in the bundle (non-portable).
+#   5. apply default invocation is REFUSED (beta7 deferral message).
+#   6. deferred apply does NOT mutate the target (no apply-result manifest,
+#      no target/agents/ created).
 
 set -euo pipefail
 
@@ -149,81 +154,38 @@ smoke_assert_contains "$plan_out" "clean/fresh" "plan detects clean target"
 smoke_log "assertion: plan output correct — PASS"
 
 # ---------------------------------------------------------------------------
-# 3. apply REFUSES non-empty target
+# 3. apply is deferred to beta7 — confirm default invocation refuses to run.
 # ---------------------------------------------------------------------------
-smoke_log "testing apply refuses dirty target"
-mkdir -p "$DIRTY_TARGET/state/agents/admin"
-printf '{}' >"$DIRTY_TARGET/state/tasks.db"
-set +e
-apply_refuse_out="$(bash "$MIGRATOR" apply --bundle "$BUNDLE_DIR" --target "$DIRTY_TARGET" 2>&1)"
-apply_refuse_rc=$?
-set -e
-if [[ "$apply_refuse_rc" -eq 0 ]]; then
-  smoke_fail "apply must refuse a non-empty target (returned 0 on dirty target)"
-fi
-smoke_assert_contains "$apply_refuse_out" "not clean" "apply refuse message mentions not clean"
-smoke_log "assertion: apply refused dirty target — PASS"
-
-# ---------------------------------------------------------------------------
-# 4. apply to clean target
-# ---------------------------------------------------------------------------
-smoke_log "running apply to clean target"
+# beta6 fold-back per codex r1 review: apply has three open contract gaps
+# (clean-target gate insufficient, layout-resolver bypass, supplied secrets
+# never written) and is gated behind BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE=1
+# for follow-up dev only. The user-facing default refuses with a clear
+# message. Verify regression (post-apply) moves to beta7 alongside the
+# apply rework.
+smoke_log "testing apply default invocation is deferred (beta7 contract gate)"
 rm -rf "$CLEAN_TARGET"
 mkdir -p "$CLEAN_TARGET"
-bash "$MIGRATOR" apply --bundle "$BUNDLE_DIR" --target "$CLEAN_TARGET"
-
-# Verify apply result manifest exists.
-smoke_assert_file_exists "$CLEAN_TARGET/.migrator-apply-result.json" "apply-result manifest"
-
-# Check applied_agents list in result.
-applied_agents="$(python3 "$HELPER_DIR/migrator-smoke-helpers.py" apply-result-agents "$CLEAN_TARGET/.migrator-apply-result.json")"
-smoke_assert_contains "$applied_agents" "admin" "apply result lists admin agent"
-smoke_assert_contains "$applied_agents" "reviewer" "apply result lists reviewer agent"
-smoke_log "assertion: apply result applied_agents correct — PASS"
-
-# Identity files land in legacy-layout agent homes (legacy source → legacy target).
-smoke_assert_file_exists "$CLEAN_TARGET/agents/admin/SOUL.md" "admin SOUL.md in target agent home"
-smoke_assert_file_exists "$CLEAN_TARGET/agents/admin/MEMORY.md" "admin MEMORY.md in target agent home"
-smoke_assert_file_exists "$CLEAN_TARGET/agents/admin/memory/notes.md" "admin memory/notes.md in target"
-smoke_assert_file_exists "$CLEAN_TARGET/agents/admin/users/alice/USER.md" "admin users/alice/USER.md in target"
-smoke_assert_file_exists "$CLEAN_TARGET/agents/reviewer/SOUL.md" "reviewer SOUL.md in target"
-smoke_log "assertion: identity files in correct agent_home paths — PASS"
-
-# Non-portable files must NOT be in target.
-if [[ -f "$CLEAN_TARGET/agents/admin/session_id" ]]; then
-  smoke_fail "session_id must not be in applied target (non-portable)"
+set +e
+apply_deferred_out="$(bash "$MIGRATOR" apply --bundle "$BUNDLE_DIR" --target "$CLEAN_TARGET" 2>&1)"
+apply_deferred_rc=$?
+set -e
+if [[ "$apply_deferred_rc" -eq 0 ]]; then
+  smoke_fail "apply default invocation must refuse (beta7 deferral); rc=0 instead"
 fi
-if [[ -f "$CLEAN_TARGET/agents/admin/pid" ]]; then
-  smoke_fail "pid must not be in applied target (non-portable)"
-fi
-smoke_log "assertion: non-portable files absent from target — PASS"
+smoke_assert_contains "$apply_deferred_out" "deferred to beta7" \
+  "apply refusal mentions beta7 deferral"
+# Confirm the unsafe env var is the documented dev escape hatch.
+smoke_assert_contains "$apply_deferred_out" "BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE" \
+  "apply refusal documents the dev opt-in env var"
+smoke_log "assertion: apply deferred to beta7 (default invocation refused) — PASS"
 
-# Secrets must NOT be in target.
-if [[ -f "$CLEAN_TARGET/handoff.local.json" ]]; then
-  smoke_fail "handoff.local.json (A2A secret) must not be in applied target"
+# Confirm the target was NOT mutated by the deferred apply.
+if [[ -f "$CLEAN_TARGET/.migrator-apply-result.json" ]]; then
+  smoke_fail "deferred apply must not write any apply-result manifest"
 fi
-if [[ -f "$CLEAN_TARGET/.env" ]]; then
-  smoke_fail ".env (Teams secret) must not be in applied target"
+if [[ -d "$CLEAN_TARGET/agents" ]]; then
+  smoke_fail "deferred apply must not create target/agents/"
 fi
-smoke_log "assertion: secrets absent from applied target — PASS"
-
-# Cron definitions imported.
-smoke_assert_file_exists "$CLEAN_TARGET/cron/jobs.json" "cron jobs.json in target"
-cron_target_count="$(python3 "$HELPER_DIR/migrator-smoke-helpers.py" cron-job-count "$CLEAN_TARGET/cron/jobs.json")"
-if [[ "$cron_target_count" -lt 1 ]]; then
-  smoke_fail "cron jobs.json in target should have >=1 entry, got $cron_target_count"
-fi
-smoke_log "assertion: cron definitions in target count=$cron_target_count — PASS"
-
-# ---------------------------------------------------------------------------
-# 5. verify
-# ---------------------------------------------------------------------------
-smoke_log "running verify on migrated target"
-verify_out="$(bash "$MIGRATOR" verify --target "$CLEAN_TARGET")"
-smoke_assert_contains "$verify_out" "PASS" "verify reports PASSes"
-if echo "$verify_out" | grep -q "FAIL"; then
-  smoke_fail "verify reported FAIL on correctly migrated target"
-fi
-smoke_log "assertion: verify PASS — PASS"
+smoke_log "assertion: deferred apply did NOT mutate target — PASS"
 
 smoke_log "all assertions passed"

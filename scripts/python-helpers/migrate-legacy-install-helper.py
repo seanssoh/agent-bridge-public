@@ -701,6 +701,35 @@ def _prompt_secret(prompt: str) -> str:
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
+    # beta6 fold-back per codex r1 review: `apply` is deferred to beta7.
+    # The r1 review surfaced three contract gaps that are too substantial
+    # to address in a beta6 r2 cycle:
+    #   - clean-target gate insufficient (does not check actual write paths)
+    #   - layout-resolver bypass (hardcoded path inference instead of
+    #     `bridge_layout_agent_home`/etc.)
+    #   - secrets are read but never written to the target (handoff.local.json,
+    #     Teams .env), and the cron env scrub is keyword-heuristic.
+    # The brief's explicit fallback was: "If you cannot meet every apply
+    # gate within reasonable change size, SHIP export+plan+verify only and
+    # leave apply as a documented beta7 follow-up."
+    # An opt-in env var keeps the existing code path runnable for follow-up
+    # work without exposing the unsafe path as the user-facing default.
+    if os.environ.get("BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE", "") != "1":
+        _die(
+            "apply is deferred to beta7 — the r1 review surfaced three "
+            "contract gaps (clean-target gate, layout-resolver bypass, "
+            "secret re-entry) that are tracked as a beta7 follow-up. Use "
+            "'export'+'plan'+'verify' in beta6 to inspect and validate; "
+            "drive the actual writes by hand from the bundle/plan. To run "
+            "the unsafe in-progress apply for follow-up development only, "
+            "set BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE=1."
+        )
+    sys.stderr.write(
+        "[warn] BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE=1 set — running the "
+        "unsafe in-progress apply path. Do NOT use this against a real "
+        "install; see codex r1 review for the three open contract gaps.\n"
+    )
+
     bundle_dir = Path(args.bundle).expanduser().resolve()
     target = Path(args.target).expanduser().resolve()
 

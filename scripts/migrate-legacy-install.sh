@@ -65,10 +65,14 @@ Subcommands:
             Compute and print the apply plan (read-only on both sides).
 
   apply   --bundle <dir> --target <new-BRIDGE_HOME>
-            [EXPLICIT / off-by-default] Write the bundle into a clean target.
-            Requires: clean/fresh target, mandatory backup, secrets re-entered.
-            Optional: --app-password-file <file>  (Teams client secret)
-                      --a2a-secret-file <file>     (A2A HMAC key file, JSON)
+            **DEFERRED to beta7** — the r1 review of the beta6 PR surfaced
+            three contract gaps (clean-target gate doesn't check the actual
+            write paths; layout-resolver bypass; supplied secrets are read
+            but never written). beta6 ships export/plan/verify; drive the
+            actual writes by hand from the bundle/plan output.
+            (Internal dev only: BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE=1 keeps
+            the in-progress code path runnable. Do NOT use against a real
+            install.)
 
   verify  --target <new-BRIDGE_HOME>
             Run the verification gate against the migrated target.
@@ -77,10 +81,11 @@ Options:
   --help, -h    Print this help and exit.
 
 Safety:
-  apply refuses a non-empty / already-populated target.
+  apply is deferred to beta7 (see above). The export/plan/verify flow is
+  read-only on both sides — safe to run against any install.
   Secrets (Teams client secret, A2A HMAC keys) are NEVER copied from the
-  source bundle. Supply them via --app-password-file / --a2a-secret-file,
-  BRIDGE_TEAMS_APP_PASSWORD env var, or interactive stdin prompt.
+  source bundle in any subcommand; the bundle marks them as deliberately
+  absent and the operator must re-enter them at apply time.
 
 This tool is OPERATOR-RUN ONLY. Never invoke from upgrade / init / bootstrap.
 USAGE
