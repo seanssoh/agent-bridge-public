@@ -11561,4 +11561,11 @@ bash "$REPO_ROOT/scripts/smoke/a2a-cross-bridge.sh"
 log "running create-atomicity-and-purge smoke (issue #1076)"
 bash "$REPO_ROOT/scripts/smoke/1076-create-atomicity-and-purge.sh"
 
+# `agb audit list --since` previously raised TypeError when the operator
+# supplied a naive datetime against a tz-aware audit record. Pin that
+# both naive (`2026-05-23T12:00`) and aware (`+09:00`) inputs work and
+# return identical record sets under a fixed TZ.
+log "running audit-since-tz smoke (issue #1100)"
+bash "$REPO_ROOT/scripts/smoke/1100-audit-since-tz.sh"
+
 log "smoke test passed"
