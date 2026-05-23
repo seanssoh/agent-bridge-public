@@ -469,8 +469,12 @@ bridge_layout_status_summary() {
 
 bridge_layout_write_v2_marker() {
   # Write a minimal v2 layout marker into $BRIDGE_LAYOUT_MARKER_DIR. Caller
-  # supplies BRIDGE_DATA_ROOT (absolute path). The marker is mode 0640 so
-  # group-readable controllers can re-read it after PR-E group setgid.
+  # supplies BRIDGE_DATA_ROOT (absolute path). The marker is mode 0644 so
+  # every isolated UID can read it without depending on `ab-shared` group
+  # membership (#1161). Marker content is non-secret (BRIDGE_LAYOUT=v2 +
+  # BRIDGE_DATA_ROOT=<abs-path>); the validator's mode check rejects only
+  # group/world WRITE bits (mode_int & 0022), so 0644 stays valid against
+  # the existing gate.
   #
   # Safety:
   #   - data_root must be absolute.
@@ -502,7 +506,7 @@ bridge_layout_write_v2_marker() {
 BRIDGE_LAYOUT=v2
 BRIDGE_DATA_ROOT='$data_root'
 EOF
-  chmod 0640 "$tmp"
+  chmod 0644 "$tmp"
   # Validate before publishing. If the just-written marker would be
   # rejected on the next process boot, unlink and die rather than leave
   # a poison artifact that the resolver would later attribute to

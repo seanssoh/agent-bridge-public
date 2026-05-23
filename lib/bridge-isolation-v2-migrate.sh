@@ -1368,25 +1368,25 @@ bridge_isolation_v2_migrate_marker_write() {
     printf 'BRIDGE_DATA_ROOT=%s\n' "$(printf %q "$data_root")"
   } > "$tmp"
 
-  chmod 0640 "$tmp" || { rm -f "$tmp"; bridge_die "marker chmod failed"; }
+  chmod 0644 "$tmp" || { rm -f "$tmp"; bridge_die "marker chmod failed"; }
   mv -f "$tmp" "$marker_path" || bridge_die "marker mv failed"
 
-  # Issue #864 R1: chown marker to `root:<shared-group>` mode 0640 so the
-  # validator (lib/bridge-marker-bootstrap.sh:69-75) accepts it under any
-  # caller UID. The validator short-circuits owner_uid==0 unconditionally;
-  # without root ownership, `bridge-run.sh` running under `sudo -u
-  # agent-bridge-<name>` sees the marker as owned by the controller UID
-  # (e.g. 1000) which is neither root nor the running isolated UID, falls
-  # back to `markerless(existing-install)`, and dies. `ab-shared` is the
-  # broader group every isolated agent + the controller already join via
-  # `bridge_isolation_v2_groups_apply`. Best-effort: a rootless dev tree
-  # where the caller can't sudo just leaves marker as caller-owned, which
-  # is also a valid validator state (owner_uid == current controller UID
-  # is the second short-circuit branch). The migrator never runs as a
-  # third party.
+  # Issue #864 R1 / #1161: chown marker to `root:<shared-group>` mode 0644
+  # so the validator (lib/bridge-marker-bootstrap.sh:69-75) accepts it
+  # under any caller UID *and* every isolated UID can read it. The
+  # validator's mode check rejects only group/world WRITE bits
+  # (mode_int & 0022), not READ — 0644 stays valid against the existing
+  # gate. Prior 0640 required `ab-shared` group membership to read; in
+  # practice isolated UIDs were not reliably joined to `ab-shared` on
+  # real installs (#1161), so the marker became unreadable from the
+  # isolated agent's `sudo -u` context and the resolver fell back to
+  # `markerless(existing-install)` and died. Marker content is non-secret
+  # (BRIDGE_LAYOUT=v2 + BRIDGE_DATA_ROOT=<abs-path>); broadening to
+  # world-read removes the membership dependency without weakening the
+  # write-gate that protects v2 activation integrity.
   local _r1_shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
   _bridge_isolation_v2_run_root_or_sudo chown "root:${_r1_shared_grp}" "$marker_path" >/dev/null 2>&1 || true
-  _bridge_isolation_v2_run_root_or_sudo chmod 0640 "$marker_path" >/dev/null 2>&1 || true
+  _bridge_isolation_v2_run_root_or_sudo chmod 0644 "$marker_path" >/dev/null 2>&1 || true
 
   if ! bridge_isolation_v2_marker_validate "$marker_path"; then
     rm -f "$marker_path"
@@ -1434,7 +1434,7 @@ bridge_isolation_v2_migrate_marker_write_minimal() {
     printf 'BRIDGE_DATA_ROOT=%s\n' "$(printf %q "$data_root")"
   } > "$tmp" || { rm -f "$tmp"; bridge_warn "marker_write_minimal: write to $tmp failed"; return 1; }
 
-  chmod 0640 "$tmp" || { rm -f "$tmp"; bridge_warn "marker_write_minimal: chmod failed"; return 1; }
+  chmod 0644 "$tmp" || { rm -f "$tmp"; bridge_warn "marker_write_minimal: chmod failed"; return 1; }
   mv -f "$tmp" "$marker_path" || { bridge_warn "marker_write_minimal: mv to $marker_path failed"; return 1; }
 
   if ! bridge_isolation_v2_marker_validate "$marker_path"; then
