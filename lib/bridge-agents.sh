@@ -2459,7 +2459,7 @@ bridge_linux_share_plugin_catalog() {
         && [[ -z "$_v2_pcg_plugins" ]]; then
       return 0
     fi
-    bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) but agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries. Populate the shared plugins cache (\`agb bundle install\` or seed installed_plugins.json into \$BRIDGE_SHARED_ROOT/plugins-cache) before starting v2-isolated agents that require plugins."
+    bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) but agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries. Run \`agb plugins seed\` to populate the shared plugin catalog from the bundled agent-bridge marketplace, then retry. (For an external marketplace: \`agb plugins seed --marketplace-root <path>\`.)"
   fi
 
   local isolated_plugins="$user_home/.claude/plugins"

@@ -1484,6 +1484,33 @@ bridge_isolation_v2_matrix_rows_for_agent() {
     }
   fi
 
+  # ----- BRIDGE_DATA_ROOT + BRIDGE_AGENT_ROOT_V2 traverse rows (#1078 F2) -----
+  # Issue #1078 F2: a fresh v2 install creates `data/` (BRIDGE_DATA_ROOT)
+  # and `data/agents/` (BRIDGE_AGENT_ROOT_V2) under the controller's umask,
+  # which is often 077 → mode 0700. With 0700 the isolated UID (a member
+  # of ab-shared, not the controller) cannot traverse `data/agents/` to
+  # reach its own `data/agents/<X>/` (which is 2750 root:ab-agent-<X>).
+  # The result: every isolated agent is fundamentally non-functional —
+  # bridge-start.sh fails to enter the per-agent workdir, the daemon's
+  # state-marker writes return EACCES, and there is no `isolation verify`
+  # row for these parents to surface the drift.
+  #
+  # Layout comment at top of file documents `$BRIDGE_DATA_ROOT/  mode 755
+  # (others traverse)`. We pick the same `dir_only_traverse` pattern as
+  # state-root / state-agents-root — controller:ab-shared 0710 — so every
+  # isolated UID (always a member of ab-shared) gets `--x` and nothing
+  # else. 0711 (others +x) would also work but widens the surface
+  # unnecessarily; 0710 + ab-shared narrows to the exact set of
+  # accounts that should be reaching v2 agent dirs.
+  if [[ -n "$data_root" ]]; then
+    printf 'data-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|#1078 F2: isolated UID needs --x to reach data/agents/<X>\n' \
+      "$data_root" "$shared_grp"
+  fi
+  if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
+    printf 'data-agents-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|#1078 F2: isolated UID needs --x to reach its own agent dir\n' \
+      "$BRIDGE_AGENT_ROOT_V2" "$shared_grp"
+  fi
+
   # ----- shared/ row family (catalog/source only — RC6 per-agent cache
   # lands in PR 2 as a separate row family) -----
   if [[ -n "$shared_root" ]]; then

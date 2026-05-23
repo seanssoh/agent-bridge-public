@@ -362,6 +362,13 @@ def _safe_path_check(check: str, path: Path, os_user: str | None) -> bool:
     test -e/-h <path>` so the controller can still detect "exists" and
     take the recovery path. `os_user=None` (non-Linux / non-isolated)
     re-raises so callers preserve the original error shape.
+
+    Issue #1078 F3/F5: when the caller could not resolve `os_user`
+    upfront (every lstat in the ancestor chain hit PermissionError),
+    fall back to the walker before re-raising — the walker climbs until
+    an existing ancestor whose lstat succeeds reveals the isolated UID.
+    Only re-raise when even the walker comes back empty (truly
+    non-isolated, non-Linux, or sudo unavailable).
     """
     try:
         if check == "exists":
@@ -370,7 +377,9 @@ def _safe_path_check(check: str, path: Path, os_user: str | None) -> bool:
             return path.is_symlink()
     except PermissionError:
         if os_user is None:
-            raise
+            os_user = _resolve_isolated_owner_for_path(path)
+            if os_user is None:
+                raise
         flag = "-e" if check == "exists" else "-h"
         result = _sudo_run_as(os_user, "test", flag, str(path))
         return result.returncode == 0
@@ -398,8 +407,22 @@ def _safe_read_env(path: Path) -> dict[str, str]:
     when no isolated owner can be identified (non-Linux, non-isolated,
     or sudo unavailable) so the caller surfaces the same error shape it
     had before.
+
+    Issue #1078 F3: when the entire chain — `.teams/.env`, `.teams/`,
+    and the workdir itself — is 0700-owned by the isolated UID, a
+    single-level `lstat(path)` / `lstat(path.parent)` raises
+    PermissionError (caught) and returns None, so the controller falls
+    through to the plain `path.exists()` in `_safe_path_check` and
+    re-raises. Use the walker (`_resolve_isolated_owner_for_path`) which
+    climbs ancestors until it finds an existing dir whose lstat
+    succeeds — that node's owner is the same isolated UID by
+    construction, so the sudo fallback can identify the right user.
     """
-    os_user = _isolated_workdir_owner(path) or _isolated_workdir_owner(path.parent)
+    os_user = (
+        _isolated_workdir_owner(path)
+        or _isolated_workdir_owner(path.parent)
+        or _resolve_isolated_owner_for_path(path)
+    )
     if not _safe_path_check("exists", path, os_user):
         return {}
     try:
@@ -432,8 +455,15 @@ def _safe_load_json(path: Path, default: Any) -> Any:
     `load_json`) or when the sudo fallback succeeds but the body is
     not valid JSON (best-effort — recovery flow rebuilds the doc from
     operator input).
+
+    Issue #1078 F5: same chain-of-0700 wedge as F3. The walker is the
+    backstop when single-level lstats hit PermissionError.
     """
-    os_user = _isolated_workdir_owner(path) or _isolated_workdir_owner(path.parent)
+    os_user = (
+        _isolated_workdir_owner(path)
+        or _isolated_workdir_owner(path.parent)
+        or _resolve_isolated_owner_for_path(path)
+    )
     if not _safe_path_check("exists", path, os_user):
         return default
     try:
