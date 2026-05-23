@@ -3126,6 +3126,15 @@ report and reap test-fixture agents per their pattern."
     if [[ "$engine" == "codex" ]]; then
       bridge_ensure_codex_agent_hooks "$agent" "$scaffold_target" >/dev/null 2>&1 || true
     fi
+    # Issue #1105: capture the roster-file sha BEFORE the write so the
+    # system_config_mutation audit row emitted below carries a real
+    # before/after sha chain. On a markerless fresh-install the roster
+    # file may not exist yet — bridge_agent_update_file_sha256 returns
+    # an empty string in that case, which audit-detail-json.py treats as
+    # the documented "file did not exist" sentinel.
+    local _create_audit_roster_path="$BRIDGE_ROSTER_LOCAL_FILE"
+    local _create_audit_before_sha
+    _create_audit_before_sha="$(bridge_agent_update_file_sha256 "$_create_audit_roster_path")"
     # Issue #1093: pass positional 20 (loop_explicit_off) and positional
     # 21 (idle_timeout_value) so `agent add --loop no` persists the
     # explicit-off line and `--idle-timeout <seconds>` writes the
@@ -3159,6 +3168,13 @@ report and reap test-fixture agents per their pattern."
     # start --dry-run) raises — without this flag, a post-roster failure
     # leaves a registered-but-broken agent (the exact bug).
     _CREATE_ROLLBACK_ROSTER_WRITTEN=1
+    # Issue #1105: capture after_sha right after the write so the audit
+    # detail emitted at end-of-create (below, after every other mutation
+    # has cleared) reflects exactly what landed on disk. We compute it
+    # here rather than later so a downstream step that itself touches the
+    # roster file (none today, but future-proof) cannot confuse the chain.
+    local _create_audit_after_sha
+    _create_audit_after_sha="$(bridge_agent_update_file_sha256 "$_create_audit_roster_path")"
     # Issue #848: bridge_write_role_block just appended a new entry to
     # the local roster file; invalidate the per-process cache so the
     # next load re-reads disk instead of replaying the pre-create map.
@@ -3237,6 +3253,81 @@ report and reap test-fixture agents per their pattern."
     else
       start_dry_run_status="warn (rc=$?)"
     fi
+    # Issue #1105: emit a system_config_mutation audit row mirroring the
+    # `agent update` path's shape so operators get an audit trail for the
+    # original create too (not just later updates). PR #1102 added the
+    # update-side flags (--idle-timeout / --loop / --always-on) but the
+    # create-side asymmetry (write_role_block silently mutating the
+    # protected roster without an audit emit) predates that and is the
+    # gap this row closes. Emitted just before _CREATE_ROLLBACK_COMPLETE=1
+    # so if any earlier step raised, the trap excises the roster entry
+    # AND we never reach the emitter — the audit log only ever carries
+    # rows for creates that actually landed. before_* fields are empty
+    # (the agent did not exist pre-create); after_* mirror the values
+    # just persisted. The persisted idle_timeout / loop string derivation
+    # is the same one `emit_create_json` uses below so the audit and the
+    # --json envelope agree byte-for-byte on what landed on disk.
+    local _create_audit_caller_agent _create_audit_actor
+    _create_audit_caller_agent="$(bridge_agent_update_caller_agent "")"
+    _create_audit_actor="$_create_audit_caller_agent"
+    if [[ -z "$_create_audit_actor" ]]; then
+      if [[ "$create_caller_source" == "operator-tui" ]]; then
+        _create_audit_actor="operator"
+      else
+        _create_audit_actor="unknown"
+      fi
+    fi
+    local _create_audit_idle_timeout=""
+    if [[ -n "$idle_timeout_value" ]]; then
+      _create_audit_idle_timeout="$idle_timeout_value"
+    elif [[ $always_on -eq 1 ]]; then
+      _create_audit_idle_timeout="0"
+    fi
+    local _create_audit_loop=""
+    if [[ $loop_explicit_off -eq 1 ]]; then
+      _create_audit_loop="0"
+    elif [[ $loop_mode -eq 1 ]]; then
+      _create_audit_loop="1"
+    fi
+    local _create_audit_summary
+    _create_audit_summary="$(
+      {
+        printf 'engine=%s\n' "$engine"
+        printf 'session_type=%s\n' "$session_type"
+        printf 'isolation_mode=%s\n' "$isolation_mode"
+        if [[ -n "$os_user" ]]; then
+          printf 'os_user=%s\n' "$os_user"
+        fi
+        if [[ -n "$_create_audit_idle_timeout" ]]; then
+          printf 'idle_timeout=%s\n' "$_create_audit_idle_timeout"
+        fi
+        if [[ -n "$_create_audit_loop" ]]; then
+          printf 'loop=%s\n' "$_create_audit_loop"
+        fi
+        if [[ $always_on -eq 1 ]]; then
+          printf 'always_on=yes\n'
+        fi
+      } | tr '\n' ',' | sed 's/,$//'
+    )"
+    bridge_agent_update_emit_audit \
+      "agent-create-apply" \
+      "$_create_audit_actor" \
+      "$create_caller_source" \
+      "$agent" \
+      "$_create_audit_roster_path" \
+      "$_create_audit_before_sha" \
+      "$_create_audit_after_sha" \
+      "agent_create $_create_audit_summary" \
+      "" \
+      "" \
+      "$launch_cmd" \
+      "" \
+      "$channels" \
+      "[]" \
+      "" \
+      "$_create_audit_idle_timeout" \
+      "" \
+      "$_create_audit_loop"
     # Issue #1076: every mutation in the create flow has now completed.
     # Mark complete + disarm the EXIT trap so a normal exit does NOT roll
     # back a successful create. A failure ANYWHERE above this line leaves
