@@ -189,6 +189,23 @@ bridge_link_claude_settings_to_shared() {
     --effective-settings-file "$effective_file" \
     --launch-cmd "$launch_cmd" \
     --agent-class "$agent_class" >/dev/null
+  # Issue #1145: defer `cmd_link_shared_settings` under v2 isolation when the
+  # workdir hasn't been materialized yet by
+  # `bridge_linux_prepare_agent_isolation` (Step A). Step B (this controller-
+  # side hook, running as awfmanager) cannot `mkdir` into the isolated tree —
+  # it would race Step A and create the leaf with the wrong ownership
+  # (`awfmanager:awfmanager 0755` under an `agent-bridge-<a>:` workdir),
+  # cascading into PermissionErrors on every subsequent round. Agent start
+  # re-triggers this hook after Step A has materialized the tree, so the
+  # deferral here is correct (NOT permanently skipped). Guarded on `agent`
+  # being set so legacy callers (no agent arg → no v2 semantics) keep their
+  # current behavior.
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && [[ ! -d "$workdir" ]]; then
+    return 0
+  fi
   bridge_hooks_python link-shared-settings --workdir "$workdir" --shared-settings-file "$effective_file"
 
   # v2 non-isolated agents launch Claude with CLAUDE_CONFIG_DIR under
