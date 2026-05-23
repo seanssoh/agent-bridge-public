@@ -55,17 +55,20 @@ AUDIT_LOG="$SMOKE_TMP_ROOT/audit.jsonl"
 #
 # Pre-12:00 record (should be filtered OUT by `--since 2026-05-23T12:00`):
 # Post-12:00 record (should be returned):
-cat >"$AUDIT_LOG" <<'EOF'
-{"ts":"2026-05-23T11:00:00+09:00","actor":"smoke","action":"pre","target":"pre","detail":{},"pid":1,"host":"smoke","prev_hash":"","hash":"pre-hash"}
-{"ts":"2026-05-23T12:51:54+09:00","actor":"smoke","action":"post","target":"post","detail":{},"pid":1,"host":"smoke","prev_hash":"pre-hash","hash":"post-hash"}
-EOF
+{
+  printf '%s\n' '{"ts":"2026-05-23T11:00:00+09:00","actor":"smoke","action":"pre","target":"pre","detail":{},"pid":1,"host":"smoke","prev_hash":"","hash":"pre-hash"}'
+  printf '%s\n' '{"ts":"2026-05-23T12:51:54+09:00","actor":"smoke","action":"post","target":"post","detail":{},"pid":1,"host":"smoke","prev_hash":"pre-hash","hash":"post-hash"}'
+} > "$AUDIT_LOG"
 
 # T1 — Naive `--since` (the issue reproduction case). Pre-fix this
 # raised TypeError; post-fix it returns the post-12:00 record only.
 test_naive_since() {
   local out="" rc=0
   set +e
-  out="$(python3 "$AUDIT_HELPER" list --file "$AUDIT_LOG" \
+  # Codex r1 BLOCKING: pin TZ=Asia/Seoul so naive --since input
+  # normalizes to the same wall-clock as the +09:00-offset record. The
+  # smoke is then host-TZ-deterministic (matches T2b's pattern).
+  out="$(TZ=Asia/Seoul python3 "$AUDIT_HELPER" list --file "$AUDIT_LOG" \
     --since "2026-05-23T12:00" 2>&1)"
   rc=$?
   set -e
