@@ -2585,6 +2585,61 @@ bridge_isolation_v2_reap_isolated_agent_account() {
     fi
   fi
 
+  # ---------------------------------------------------------------------
+  # Step 4 — drop the per-agent sudoers drop-in, if one was installed.
+  #
+  # bridge_migration_install_sudoers writes the entry to a single fixed
+  # path: `/etc/sudoers.d/agent-bridge-<os_user>`. The reap mirrors that
+  # writer's path shape exactly — anything else is a refusal. This is
+  # the strict path-pattern safety gate the issue (#1121) calls for:
+  # we never `rm` a sudoers file that does not match the EXACT generated
+  # name, even if a misconfigured caller passed a different `os_user`.
+  #
+  # Constraints (mirror Steps 1-3):
+  #   - Linux only (Gate 1 above already enforces).
+  #   - `os_user` already passed Gate 2 (exact `agent-bridge-<name>` match
+  #     via bridge_agent_default_os_user). The sudoers filename is built
+  #     from that same gated value, so no separate gate is needed here —
+  #     but we re-validate the FINAL absolute path shape against the
+  #     literal pattern as a defence-in-depth check before the `rm`.
+  #   - Best-effort: missing file is a clean no-op (no warning).
+  #   - Use `rm -f` (NOT `rm -rf`) — the sudoers entry is a single
+  #     regular file, never a directory. `-f` swallows "missing" so a
+  #     host without the drop-in produces no noise.
+  # ---------------------------------------------------------------------
+  # Path composition mirrors bridge_migration_install_sudoers
+  # (lib/bridge-migration.sh): the writer emits to
+  # `${sudoers_dir}/agent-bridge-${os_user}`. Use the same root so the
+  # reaper targets the exact file the migrator created.
+  # BRIDGE_SUDOERS_DIR is a test-only override (defaults to /etc/sudoers.d)
+  # — production never sets it; the smoke at scripts/smoke/1121-agent-delete-os-purge.sh
+  # points it at a tempdir so the decision logic can be exercised without
+  # mutating the host's real sudoers tree.
+  local sudoers_dir="${BRIDGE_SUDOERS_DIR:-/etc/sudoers.d}"
+  local sudoers_path="${sudoers_dir}/agent-bridge-${os_user}"
+  # Defence-in-depth: enforce both the directory location AND the literal
+  # filename shape before any destructive call. The basename MUST match
+  # the exact bridge-managed `agent-bridge-<slug>` form; the directory
+  # MUST be the production `/etc/sudoers.d` unless an explicit
+  # BRIDGE_SUDOERS_DIR override was supplied (test path). Anything else
+  # is a refusal — never rm an arbitrary sudoers file. The regex pins:
+  #   - prefix:     agent-bridge-
+  #   - slug:       [a-zA-Z0-9_-]+
+  #   - end-anchor: $
+  # so neither leading `..`/symlinked-out paths nor a glob like
+  # `agent-bridge-foo*` could ever slip through.
+  local sudoers_base="${sudoers_path##*/}"
+  local sudoers_parent="${sudoers_path%/*}"
+  if [[ -z "${BRIDGE_SUDOERS_DIR:-}" && "$sudoers_parent" != "/etc/sudoers.d" ]]; then
+    bridge_warn "agent delete: skipping sudoers cleanup for '$agent' — composed parent '$sudoers_parent' is not /etc/sudoers.d (refusing to rm)"
+  elif [[ ! "$sudoers_base" =~ ^agent-bridge-[a-zA-Z0-9_-]+$ ]]; then
+    bridge_warn "agent delete: skipping sudoers cleanup for '$agent' — composed path '$sudoers_path' does not match strict pattern (refusing to rm)"
+  elif [[ -e "$sudoers_path" ]]; then
+    if ! _bridge_isolation_v2_run_root_or_sudo rm -f -- "$sudoers_path"; then
+      bridge_warn "agent delete: failed to remove sudoers drop-in '$sudoers_path' (best-effort — manual 'sudo rm -f $sudoers_path' may be needed)"
+    fi
+  fi
+
   return 0
 }
 

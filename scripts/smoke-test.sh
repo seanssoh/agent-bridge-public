@@ -11547,6 +11547,13 @@ bash "$REPO_ROOT/scripts/smoke/1073-fresh-channel-first-run-seed.sh"
 log "running isolated-agent-delete-reap smoke (issue #1010)"
 bash "$REPO_ROOT/scripts/smoke/isolated-agent-delete-reap.sh"
 
+# Step-4 sudoers drop-in cleanup added to the same reaper (#1121). Pins
+# the path-pattern gate, the BRIDGE_SUDOERS_DIR override, and the
+# best-effort rm-failure behavior so the OS-resource leak documented in
+# #1121 cannot regress on a future isolation-lib change.
+log "running 1121-agent-delete-os-purge smoke (issue #1121)"
+bash "$REPO_ROOT/scripts/smoke/1121-agent-delete-os-purge.sh"
+
 # A2A cross-bridge task handoff (#1032): receiver fail-closed bind, HMAC
 # auth, allowlist, durable dedupe (idempotent + hash-conflict), body-size
 # cap, sender outbox retry, and end-to-end enqueue -> local inbox.
