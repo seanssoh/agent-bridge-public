@@ -296,9 +296,9 @@ scripts/install-daemon-liveness-launchagent.sh	122	C2	da0701b0df27849ec55841dda7
 scripts/install-daemon-liveness-systemd.sh	126	C2	468e917ae21bcbc0d2af1fdfbe6b026cfb01fad034a66f23b3ad5fc217969460	static service-template generation (no live capture wedge)	permanent	permanent
 scripts/install-daemon-liveness-systemd.sh	143	C2	0025f1207254e50ef8a9be87e489324d585a84e7265b3b5da6cc0d891ca30dda	static service-template generation (no live capture wedge)	permanent	permanent
 scripts/install-daemon-systemd.sh	80	C2	2df1f1b2028e2cfeb70db337a6d3b2576d2fdb2b7f9c59b4b2ea24d46dec1e0d	static service-template generation (no live capture wedge)	permanent	permanent
-scripts/install-shell-integration.sh	52	H3	de727406a1afbe58d6a6ce8b256ab274cc5ec78a03fb9663687e796b58f0643a	here-string/procsub, non-interpreter consumer		
-scripts/install-shell-integration.sh	58	H3	092d707b851a81a13e72688eb61c516d3881a31807b672f4c05eabcfc759e179	here-string/procsub, non-interpreter consumer		
-scripts/install-shell-integration.sh	80	C1	60e95e7e92fadc9f2dd727e6007d32f11a4e3b8bfa2cb80870cbd83d3e827ccf	interpreter heredoc in capture (deadlock class) (cross-line capture)		
+scripts/install-shell-integration.sh	52	H3	de727406a1afbe58d6a6ce8b256ab274cc5ec78a03fb9663687e796b58f0643a	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+scripts/install-shell-integration.sh	58	H3	092d707b851a81a13e72688eb61c516d3881a31807b672f4c05eabcfc759e179	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+scripts/install-shell-integration.sh	80	C1	60e95e7e92fadc9f2dd727e6007d32f11a4e3b8bfa2cb80870cbd83d3e827ccf	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch	Phase 5 PR E (review per site)
 scripts/install-watchdog-silence-launchagent.sh	164	C2	da0701b0df27849ec55841dda7c5407d2f9b2d972f5809616c4745a85749eb0a	static service-template generation (no live capture wedge)	permanent	permanent
 scripts/install-watchdog-silence-systemd.sh	134	C2	468e917ae21bcbc0d2af1fdfbe6b026cfb01fad034a66f23b3ad5fc217969460	static service-template generation (no live capture wedge)	permanent	permanent
 scripts/memory-enforce.sh	111	H3	4a610e6f770fdec3b12f5876e0931c200a200702de6a6058352deda1559ee018	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
@@ -820,11 +820,11 @@ tests/tool-policy-bash-system-class/smoke.sh	115	C1	8b40ac1ae47b8dc42bb883423f19
 tests/tool-policy-bash-system-class/smoke.sh	130	H3	8983fa977b37ee4a8f50f74ce401778bd9fc69d94937f3b220a18c888cba466d	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 tests/tool-policy-bash-system-class/smoke.sh	280	H3	8293e229c5c17adeb0cb6ff34680a60c285a87d8f52bd071892657bc4e582b59	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 tests/tool-policy-bash-system-class/smoke.sh	292	C1	6e0939ca717ff89799fa8c677ebb4f6c4d2e2a931db4122f64c666764c58e754	heredoc in capture	patch-dev	Phase 6 PR F
-tests/upgrade-conflicts/smoke.sh	44	H3	32654bcb8db5bde664f3fc57da76105c5b132acd6fb5a1893aacf01f3074794b	here-string/procsub, non-interpreter consumer		
-tests/upgrade-conflicts/smoke.sh	45	H3	5efb886ec8e86c2932d80c9a6bcafd90bc1a546f64ddaced5cf13bd0b6b87099	here-string/procsub, non-interpreter consumer		
-tests/upgrade-conflicts/smoke.sh	55	H3	eca4709747f1c703c624a4d00b97567a1ae5e5dba982f4fa74097135e12bfa89	here-string/procsub, non-interpreter consumer		
-tests/upgrade-conflicts/smoke.sh	84	C3	47a648d3b429becb73df855c982f50727d103eb6399f9195fd90b1471c42d438	interpreter heredoc, no capture		
-tests/upgrade-conflicts/smoke.sh	122	C3	5f9ce4d3f04f93deb3d4ec84bd741b18ff3f919fb901f162e1fd9023bba34783	interpreter heredoc, no capture		
+tests/upgrade-conflicts/smoke.sh	44	H3	32654bcb8db5bde664f3fc57da76105c5b132acd6fb5a1893aacf01f3074794b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+tests/upgrade-conflicts/smoke.sh	45	H3	5efb886ec8e86c2932d80c9a6bcafd90bc1a546f64ddaced5cf13bd0b6b87099	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+tests/upgrade-conflicts/smoke.sh	55	H3	eca4709747f1c703c624a4d00b97567a1ae5e5dba982f4fa74097135e12bfa89	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+tests/upgrade-conflicts/smoke.sh	84	C3	47a648d3b429becb73df855c982f50727d103eb6399f9195fd90b1471c42d438	interpreter heredoc, no capture	patch	Phase 5 PR E (review per site)
+tests/upgrade-conflicts/smoke.sh	122	C3	5f9ce4d3f04f93deb3d4ec84bd741b18ff3f919fb901f162e1fd9023bba34783	interpreter heredoc, no capture	patch	Phase 5 PR E (review per site)
 tests/upgrade-precompact-wire/smoke.sh	156	C1	2d7cce2d5fac151e4067ce461d79bccb13953299e2be4616504a5ee9ca2a1fdb	heredoc in capture	patch-dev	Phase 6 PR F
 tests/upgrade-precompact-wire/smoke.sh	302	H3	7ca0d041452f0a0234a5e6a382aea04300a53ef76e78b9c3b67890709268e998	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 tests/upgrade-precompact-wire/smoke.sh	305	H3	4368e7981698486ca61ed2450134f8e586b41a93f7a88d656cc37eab3a678d2e	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
