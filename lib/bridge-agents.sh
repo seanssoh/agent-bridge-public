@@ -4086,6 +4086,24 @@ bridge_ensure_claude_first_run_config() {
   fi
 
   python3 "$helper" "$config_dir" "$workdir" >/dev/null 2>&1 || return 0
+
+  # Codex r1 BLOCKING: when the agent is linux-user isolated, the seed
+  # file is now written by the controller into the isolated home (this
+  # function runs AFTER bridge_linux_prepare_agent_isolation per the
+  # bridge-agent.sh call-site move). The isolated UID needs to OWN the
+  # seed file so Claude CLI can read it under the isolated user. chown
+  # via the privileged helper; non-isolated agents leave ownership
+  # unchanged. Best-effort; create-path failure here is non-fatal (the
+  # downstream start path will defensively re-seed and re-chown).
+  if ! bridge_isolation_disabled_by_env 2>/dev/null \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    local _iso_user
+    _iso_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    if [[ -n "$_iso_user" ]] && command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+      bridge_linux_sudo_root chown "$_iso_user:" "$config_dir/.claude.json" \
+        >/dev/null 2>&1 || true
+    fi
+  fi
   return 0
 }
 

@@ -3165,17 +3165,6 @@ report and reap test-fixture agents per their pattern."
     bridge_roster_cache_invalidate
     bridge_load_roster
     if [[ "$engine" == "claude" ]]; then
-      # Issue #1073: pre-seed the per-agent CLAUDE_CONFIG_DIR's
-      # `.claude.json` with `hasCompletedOnboarding` etc. so Claude
-      # CLI's first-run picker (theme picker, project-trust dialog)
-      # does not block the tmux session and trigger a restart loop
-      # under `bridge-run.sh`. Admin agents reusing the controller's
-      # already-onboarded `~/.claude` never hit this; the failure mode
-      # only surfaces on a fresh per-agent-config Claude agent (the
-      # first channel agent on most installs). Runs BEFORE the shared
-      # settings render so the bootstrap file is in place before the
-      # rest of the scaffold proceeds.
-      bridge_ensure_claude_first_run_config "$agent" "$workdir" >/dev/null 2>&1 || true
       # Issue #570: managed autoCompactWindow default is unconditionally
       # 1_000_000; launch_cmd is forwarded only for caller-signature parity
       # with helpers that still accept it (no longer consulted by the renderer).
@@ -3220,6 +3209,18 @@ report and reap test-fixture agents per their pattern."
           fi
           bridge_die "agent create: v2 shared-mode grant-matrix apply failed for '$agent' — first daemon pass would wedge on missing rows. Inspect output above, then 'agb agent delete $agent --force --purge-home' to roll back (the scaffolded home directory must be removed too)."
         }
+    fi
+    # Issue #1073 (codex r1 BLOCKING): pre-seed the per-agent
+    # CLAUDE_CONFIG_DIR's `.claude.json` AFTER isolation prep so the
+    # target dir exists for linux-user isolated agents. Pre-r2 the call
+    # ran BEFORE prepare and the isolated home/`.claude` tree did not
+    # exist yet, so the seed silently failed and #1073 remained open
+    # for the production shape. Now: prepare creates + chowns the home
+    # tree first, then the seed writes inside it; the shim is
+    # isolation-aware and chowns the seeded file to the isolated UID
+    # when isolated, preserving the read path under the isolated user.
+    if [[ "$engine" == "claude" ]]; then
+      bridge_ensure_claude_first_run_config "$agent" "$workdir" >/dev/null 2>&1 || true
     fi
     # Issue #680: bridge-start.sh --dry-run is purely informational here — its
     # output is reprinted to the user as `start_dry_run:` for diagnostic
