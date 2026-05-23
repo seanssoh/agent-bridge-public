@@ -20,31 +20,34 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "$SCRIPT_DIR/bridge-lib.sh"
 
 usage() {
-  cat <<EOF
-Usage:
-  $(basename "$0") seed [--marketplace-root <path>] [--channels <csv>] [--dry-run]
-  $(basename "$0") show [--json]
-
-Seed populates the v2 shared plugin catalog at
-\$BRIDGE_SHARED_ROOT/plugins-cache/ from the in-repo agent-bridge
-marketplace (or --marketplace-root <path> for an external marketplace).
-
-Show prints the resolved shared-catalog state (root path, populated
-status, manifest plugin count).
-
-Requires BRIDGE_LAYOUT=v2 with BRIDGE_DATA_ROOT + BRIDGE_SHARED_ROOT
-resolved by the layout resolver.
-
-Examples:
-  # Fresh v2 install — seed the bundled agent-bridge marketplace
-  $(basename "$0") seed
-
-  # Seed a specific subset of plugins
-  $(basename "$0") seed --channels plugin:teams@agent-bridge,plugin:ms365@agent-bridge
-
-  # Inspect current shared-catalog state
-  $(basename "$0") show --json
-EOF
+  # printf-based usage to avoid `cat <<EOF` (footgun #11 — heredoc to a
+  # subprocess). Each printf line ends with \n; backslashes inside
+  # `\$BRIDGE_*` etc. are preserved by the %s placeholder.
+  local prog
+  prog="$(basename "$0")"
+  printf 'Usage:\n'
+  printf '  %s seed [--marketplace-root <path>] [--channels <csv>] [--dry-run]\n' "$prog"
+  printf '  %s show [--json]\n' "$prog"
+  printf '\n'
+  printf 'Seed populates the v2 shared plugin catalog at\n'
+  printf '$BRIDGE_SHARED_ROOT/plugins-cache/ from the in-repo agent-bridge\n'
+  printf 'marketplace (or --marketplace-root <path> for an external marketplace).\n'
+  printf '\n'
+  printf 'Show prints the resolved shared-catalog state (root path, populated\n'
+  printf 'status, manifest plugin count).\n'
+  printf '\n'
+  printf 'Requires BRIDGE_LAYOUT=v2 with BRIDGE_DATA_ROOT + BRIDGE_SHARED_ROOT\n'
+  printf 'resolved by the layout resolver.\n'
+  printf '\n'
+  printf 'Examples:\n'
+  printf '  # Fresh v2 install — seed the bundled agent-bridge marketplace\n'
+  printf '  %s seed\n' "$prog"
+  printf '\n'
+  printf '  # Seed a specific subset of plugins\n'
+  printf '  %s seed --channels plugin:teams@agent-bridge,plugin:ms365@agent-bridge\n' "$prog"
+  printf '\n'
+  printf '  # Inspect current shared-catalog state\n'
+  printf '  %s show --json\n' "$prog"
 }
 
 bridge_plugins_require_v2() {
@@ -73,23 +76,9 @@ bridge_plugins_default_channels_csv() {
     bridge_warn "agb plugins seed: marketplace.json not found at $mkt_json"
     return 1
   }
-  python3 - "$mkt_json" <<'PY'
-import json, sys
-p = sys.argv[1]
-try:
-    payload = json.load(open(p, "r", encoding="utf-8"))
-except Exception as exc:
-    sys.stderr.write(f"failed to read {p}: {exc}\n")
-    sys.exit(1)
-mkt_name = (payload.get("name") or "").strip()
-plugins = payload.get("plugins") or []
-items = []
-for entry in plugins:
-    name = (entry.get("name") or "").strip()
-    if name and mkt_name:
-        items.append(f"plugin:{name}@{mkt_name}")
-print(",".join(items))
-PY
+  # File-as-argv per footgun #11 (no heredoc-stdin to a subprocess);
+  # see lib/upgrade-helpers/plugins-seed-derive-channels.py.
+  python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-seed-derive-channels.py" "$mkt_json"
 }
 
 bridge_plugins_apply_canonical_modes() {
@@ -246,39 +235,9 @@ bridge_plugins_cmd_show() {
   bridge_isolation_v2_shared_plugins_root_populated 2>/dev/null && populated="true"
 
   if (( json_output == 1 )); then
-    python3 - "$plugins_cache" "$manifest" "$known" "$populated" <<'PY'
-import json, os, sys
-plugins_cache, manifest, known, populated = sys.argv[1:5]
-out = {
-    "plugins_cache": plugins_cache,
-    "populated": populated == "true",
-    "installed_plugins_json": manifest if os.path.isfile(manifest) else "",
-    "known_marketplaces_json": known if os.path.isfile(known) else "",
-    "plugin_count": 0,
-    "marketplaces": [],
-}
-if os.path.isfile(manifest):
-    try:
-        payload = json.load(open(manifest, "r", encoding="utf-8"))
-        out["plugin_count"] = len((payload.get("plugins") or {}))
-    except Exception as exc:
-        out["error"] = f"manifest-unreadable: {exc}"
-if os.path.isfile(known):
-    try:
-        payload = json.load(open(known, "r", encoding="utf-8"))
-        # known_marketplaces.json is a flat {<marketplace-name>: <metadata>} map
-        # at the top level (see bridge-dev-plugin-cache.py
-        # ensure_known_marketplace_for_root). Tolerate a future wrapping
-        # `marketplaces` key by falling back to it.
-        if isinstance(payload, dict):
-            if isinstance(payload.get("marketplaces"), dict):
-                out["marketplaces"] = sorted(payload["marketplaces"].keys())
-            else:
-                out["marketplaces"] = sorted(k for k in payload.keys() if isinstance(k, str))
-    except Exception:
-        pass
-print(json.dumps(out, ensure_ascii=False, sort_keys=True))
-PY
+    # File-as-argv per footgun #11; see lib/upgrade-helpers/plugins-show-json.py.
+    python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-show-json.py" \
+      "$plugins_cache" "$manifest" "$known" "$populated"
     return 0
   fi
 
