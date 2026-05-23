@@ -1991,13 +1991,31 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       if (!to) throw new Error('to is required')
       if (!text) throw new Error('text is required')
 
-      // Authorization: target must be in access.json allowFrom.
+      // Codex r1 BLOCKING: mirror the inbound DM gate (fail-closed).
+      // Inbound personal-DM is allowed when dmPolicy === 'open' OR the
+      // sender id is in allowFrom; the previous send_message gate was
+      // inverted (allowed.length > 0 && !allowed.includes(to)) so a
+      // default empty allowFrom would let any target through.
       const access = loadAccess()
       const allowed = access.allowFrom ?? []
-      if (allowed.length > 0 && !allowed.includes(to)) {
+      const dmPolicy = access.dmPolicy ?? 'allowlist'
+      if (dmPolicy === 'disabled') {
+        throw new Error('send_message: dmPolicy is "disabled"; proactive DMs are not allowed.')
+      }
+      if (dmPolicy !== 'open' && !allowed.includes(to)) {
         throw new Error(
-          `send_message: target "${to}" is not in the access.json allowFrom list; ` +
-          `add the user's AAD object id or Teams user id to --allow-from before sending`,
+          `send_message: target "${to}" is not in the access.json allowFrom list ` +
+          `(dmPolicy=${dmPolicy}); add the user's AAD object id or Teams user id to ` +
+          `--allow-from before sending, or set dmPolicy=open if proactive sends to any target are intended.`,
+        )
+      }
+
+      // Codex r1 SHOULD-FIX: fail fast on missing TEAMS_TENANT_ID rather
+      // than deferring to a downstream Bot Framework/network error.
+      if (!TENANT_ID) {
+        throw new Error(
+          'send_message: TEAMS_TENANT_ID env var is required for proactive ' +
+          'createConversation; set it in plugins/teams/.env',
         )
       }
 
