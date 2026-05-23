@@ -6,6 +6,78 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta13] — 2026-05-24
+
+### Highlight — beta12 install-path follow-up (#1161 — fifth A2A QA cycle)
+
+Operator-cued **thirteenth prerelease** — closes the marker file mode
++ parent-dir traversal gap that beta12's validator/exemption fix
+exposed at the install-path layer. Fifth cycle of the A2A-driven QA
+loop. Remote QA peer reported beta12 structurally correct but
+isolated UIDs still could not read the marker because:
+
+1. Marker file was `0640` (group-only), and the marker's
+   `ab-shared` group did not actually contain the isolated UIDs on
+   the live install (Patch B latent bug, deferred).
+2. Marker parent directory was `0750` and `state/` was `0710`, so
+   even with file `0644` an isolated UID couldn't traverse the
+   parent chain to reach it.
+
+Single-PR wave (PR #1162). Two-round codex chain. Integration r1
+implement-ok (task #5993). `-beta13` prerelease; matching tag
+`v0.14.5-beta13`, GitHub release marked **Pre-release**.
+
+### Fixed — isolation-v2 marker readable by isolated UIDs (#1161)
+
+- **#1161 (PR #1162)** — Two-layer fix for marker accessibility from
+  isolated context, choosing the simplest end-to-end path over
+  invasive group-membership investigation:
+  - **Marker file mode 0640 → 0644** at all three writer sites
+    (`lib/bridge-isolation-v2-migrate.sh:bridge_isolation_v2_migrate_marker_write` +
+    `bridge_isolation_v2_migrate_marker_write_minimal`, plus the
+    fresh-init writer
+    `lib/bridge-layout-resolver.sh:bridge_layout_write_v2_marker`).
+    Marker content is non-secret (`BRIDGE_LAYOUT=v2` +
+    `BRIDGE_DATA_ROOT=<abs-path>`). Validator's mode gate at
+    `lib/bridge-marker-bootstrap.sh` (mode_int & 0o22) rejects
+    group/world WRITE only; world-readable stays valid.
+  - **Marker parent dir + `state/` + `state/agents/` mode 0750/0710
+    → 0711** at the same three writer sites + `normalize_layout` in
+    `lib/bridge-isolation-v2-migrate.sh:925-942` + the matrix spec
+    rows `state-root` / `state-agents-root` in
+    `lib/bridge-isolation-v2.sh:1567-1586` (spec-then-apply pair
+    kept in lockstep). Mode 0711 grants owner full, group execute
+    (parity with prior 0710), others execute (the new traversal
+    bit). Directory contents stay non-listable for non-owner; only
+    specific files reachable by full path. Direct state children
+    remain protected by their own modes (`0600` files, `0700`
+    nested dirs, `2770` per-agent leaves).
+
+  Two review rounds: r1 BLOCKING (file mode alone insufficient
+  because parent dir still 0750 — POSIX traversal fails before file
+  mode matters; codex caught) → r2 added parent-dir + state
+  normalize + matrix spec pair → implement-ok. New smoke
+  `1161-marker-readable-by-isolated.sh` with 8 cases including
+  cross-UID `sudo -n -u nobody cat <marker>` (T8 Linux-only;
+  patch's host exercises the real end-to-end gate).
+
+### Deferred — `ab-shared` group membership latent bug
+
+`bridge_isolation_v2_ensure_user_in_group "$os_user" "$_v2_shared_grp"`
+(`lib/bridge-agents.sh:3807-3811`) is supposed to add isolated UIDs
+to the `ab-shared` group during `agent create`. On the remote QA
+host, `getent group ab-shared` showed only the controller user. The
+helper returns failure on sudo failure
+(`lib/bridge-isolation-v2.sh:649-651`), so this is an unproven
+runtime/group-refresh hypothesis — the call may not be executed in
+the linux-user prepare path for that install, or the group-set
+refresh after `usermod -aG` may not propagate to already-running
+controller processes (see KNOWN_ISSUES §28). With #1161's chmod 0644
++ 0711 parent-traversal fix, the marker is now world-readable so
+this no longer blocks end-to-end agent start. The membership bug is a
+latent issue that will be addressed in a follow-up release once the
+A2A QA loop stabilizes.
+
 ## [0.14.5-beta12] — 2026-05-24
 
 ### Highlight — beta11 follow-up exposed long-standing marker validator gap (#1158)

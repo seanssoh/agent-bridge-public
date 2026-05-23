@@ -1571,9 +1571,18 @@ bridge_isolation_v2_matrix_rows_for_agent() {
     # can reach the per-agent leaf without opening daemon-owned siblings.
     # The leaf directory itself takes the writable per-agent contract so
     # idle-since etc. can be unlinked by the isolated UID (RC2 fix).
-    printf 'state-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|isolated UID needs --x to reach state/agents/<X>\n' \
+    # #1161 r2: mode broadened from 0710 to 0711 (others --x). The
+    # ab-shared group grant remains the primary traversal path; the
+    # extra `others --x` covers isolated UIDs that are NOT reliably
+    # joined to `ab-shared` on real installs (the marker readability
+    # premise of #1161). Dir contents are still non-listable for the
+    # non-owner — only specific files reachable by full path. Without
+    # this, state-root at 0710 blocks isolated `sudo -u <agent> cat
+    # $BRIDGE_HOME/state/layout-marker.sh` before the file's 0644 mode
+    # matters (POSIX traversal fails at the parent).
+    printf 'state-root|%s|dir_only_traverse|controller|%s|0711||0|group_setgid|required|isolated UID needs --x to reach state/agents/<X> and state/layout-marker.sh (#1161)\n' \
       "$state_root" "$shared_grp"
-    printf 'state-agents-root|%s|dir_only_traverse|controller|%s|0710||0|group_setgid|required|isolated UID needs --x to reach its own leaf\n' \
+    printf 'state-agents-root|%s|dir_only_traverse|controller|%s|0711||0|group_setgid|required|isolated UID needs --x to reach its own leaf (#1161)\n' \
       "$state_agents_root" "$shared_grp"
     # state/cron/{,runs} get traverse-only via ab-shared so cron dispatch
     # writes (controller side) + the isolated UID's reads of its own

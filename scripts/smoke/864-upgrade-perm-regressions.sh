@@ -3,9 +3,12 @@
 #
 # Coverage:
 #   R1 — bridge_isolation_v2_migrate_marker_write: marker ends up at
-#        `root:<shared-group> mode 0640` (or, when sudo is unavailable
-#        in the dev tree, at caller-owned mode 0640 — both satisfy the
-#        validator).
+#        `root:<shared-group> mode 0644` (or, when sudo is unavailable
+#        in the dev tree, at caller-owned mode 0644 — both satisfy the
+#        validator). Mode broadened from 0640 → 0644 by #1161 so isolated
+#        UIDs can read the marker without depending on `ab-shared`
+#        group membership; the validator rejects only group/world WRITE
+#        bits, not READ.
 #   R2 — bridge-upgrade.sh post-apply chmod a+rX pass: directory under
 #        `$TARGET_ROOT/scripts/` created at mode 0700 is normalized to
 #        a+rX (0755 typical); files inside keep their 0644 mode.
@@ -49,7 +52,9 @@ file_owner_uid() {
 }
 
 # ---------------------------------------------------------------------------
-# R1 — marker write chowns to root + shared group, mode 0640.
+# R1 — marker write chowns to root + shared group, mode 0644 (was 0640
+# pre-#1161). Mode broadened so isolated UIDs can read the marker without
+# `ab-shared` group membership.
 # ---------------------------------------------------------------------------
 printf '== R1 — marker write owner/mode ==\n'
 
@@ -58,7 +63,7 @@ mkdir -p "$R1_HOME/state"
 
 # Pre-stage a marker file owned by current user (simulating the pre-upgrade
 # ec2-user-owned marker shape) so we can verify the marker_write helper
-# replaces it with a root-or-caller-owned 0640 file.
+# replaces it with a root-or-caller-owned 0644 file.
 R1_MARKER="$R1_HOME/state/layout-marker.sh"
 {
   printf 'BRIDGE_LAYOUT=legacy\n'
@@ -137,8 +142,8 @@ else
   #       still accepts this branch (owner_uid == current controller).
   # Both satisfy bridge_isolation_v2_marker_validate. Either rejection
   # would block sudo -u <iso> bridge-run.sh from reading the marker.
-  if [[ "$_r1_mode" != "640" && "$_r1_mode" != "0640" ]]; then
-    err "expected mode 640, got $_r1_mode"
+  if [[ "$_r1_mode" != "644" && "$_r1_mode" != "0644" ]]; then
+    err "expected mode 644, got $_r1_mode"
   elif [[ "$_r1_uid" != "0" && "$_r1_uid" != "$_self_uid" ]]; then
     err "expected uid 0 or $_self_uid (caller), got $_r1_uid"
   else
