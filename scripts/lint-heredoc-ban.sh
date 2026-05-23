@@ -100,7 +100,16 @@ declare -a TARGETS=(
 
 # Core danger pattern. Anchored to "command name + space + heredoc op + tag",
 # but NOT anchored to start-of-line — so wrapper shape is irrelevant.
-danger_pattern='(bash[[:space:]]+-s|python3[[:space:]]+-)[[:space:]].*<<-?["'"'"']?(EOF|PY)["'"'"']?'
+#
+# r4 (codex integration review #5818): extended to catch bare
+# `bash <<TAG` (no `-s` flag) which slipped past the scanner in
+# scripts/smoke/1121-agent-delete-os-purge.sh. The two sub-patterns:
+#   - `bash -s ... <<EOF|<<PY` — original wave-pinned shape
+#   - `python3 - ... <<EOF|<<PY` — original
+#   - `bash[[:space:]]*<<TAG` — bare bash heredoc-stdin (catches `bash <<PROBE`).
+#     Tag must be uppercase identifier so `bash << EOF` and quoted variants
+#     all match, but `cat > file <<TAG` (write-to-file, safe) does NOT match.
+danger_pattern='(bash[[:space:]]+-s|python3[[:space:]]+-)[[:space:]].*<<-?["'"'"']?(EOF|PY)["'"'"']?|bash[[:space:]]*<<-?["'"'"']?[A-Z_][A-Z0-9_]+["'"'"']?'
 
 # Comment-prefix on `grep -nE` output (format: LINENO:CONTENT). Lines whose
 # CONTENT (after optional whitespace) begins with `#` are comment-only.
