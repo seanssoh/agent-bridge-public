@@ -79,12 +79,12 @@ write_driver() {
     'SCRIPT_DIR="$REPO_ROOT"' \
     'source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1' \
     'FUNC_TMP="$DRIVER_TMP_DIR/scaffold-funcs.sh"' \
-    '# Line ranges realigned for CODEX-PROV (#1067): scaffold moved from' \
-    '# 385→391; render_template_string was wider than needed.' \
+    '# Line ranges realigned for #1076 (atomic create rollback) — scaffold' \
+    '# moved from 391→502, render_template_string moved from 194→305.' \
     '{' \
     '  sed -n "128,131p" "$REPO_ROOT/bridge-agent.sh"' \
-    '  sed -n "194,231p" "$REPO_ROOT/bridge-agent.sh"' \
-    '  sed -n "391,624p" "$REPO_ROOT/bridge-agent.sh"' \
+    '  sed -n "305,342p" "$REPO_ROOT/bridge-agent.sh"' \
+    '  sed -n "502,735p" "$REPO_ROOT/bridge-agent.sh"' \
     '} > "$FUNC_TMP"' \
     'source "$FUNC_TMP"' \
     'declare -F bridge_scaffold_agent_home >/dev/null 2>&1 || { echo "DRIVER_FAIL: scaffold not loaded"; exit 91; }' \

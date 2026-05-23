@@ -136,6 +136,117 @@ bridge_agent_manage_python() {
 # to smoke drivers via bridge-lib.sh without sourcing bridge-agent.sh.
 # See issue #1067 (S03, S08) for the contract.
 
+# bridge_agent_create_rollback — issue #1076. Unwind a partial `agent create`
+# when a mid-flow step raises so the agent does NOT end up "registered but
+# half-scaffolded". Called from run_create's EXIT trap; the trap is armed
+# before the first mutation and disarmed only on successful completion.
+#
+# Inputs are conveyed via the matching _CREATE_ROLLBACK_* shell variables
+# (run_create's locals). Best-effort: every step is independent and
+# failures are logged via bridge_warn but never re-raise. Order: roster
+# excision first (so the agent stops showing up in `agb status` /
+# `agb agent list`), then scaffold/workdir rm, then v2 sibling rm — match
+# the inverse of the create-time ordering.
+#
+# Safety: every path is validated against the known agent-root prefixes
+# (BRIDGE_AGENT_HOME_ROOT, BRIDGE_AGENT_ROOT_V2) before recursive rm.
+# Anything outside those roots is a resolver bug we'd rather leave on
+# disk than rm.
+bridge_agent_create_rollback() {
+  local agent="${_CREATE_ROLLBACK_AGENT:-}"
+  local roster_path="${_CREATE_ROLLBACK_ROSTER:-}"
+  local scaffold_target="${_CREATE_ROLLBACK_SCAFFOLD_TARGET:-}"
+  local workdir="${_CREATE_ROLLBACK_WORKDIR:-}"
+  local v2_root="${_CREATE_ROLLBACK_V2_ROOT:-}"
+  local roster_written="${_CREATE_ROLLBACK_ROSTER_WRITTEN:-0}"
+  local scaffold_created="${_CREATE_ROLLBACK_SCAFFOLD_CREATED:-0}"
+  local workdir_created="${_CREATE_ROLLBACK_WORKDIR_CREATED:-0}"
+
+  [[ -n "$agent" ]] || return 0
+
+  bridge_warn "agent create: rolling back partial create for '$agent' (mid-flow failure)"
+
+  # 1. Roster excision — undo bridge_write_role_block if it ran.
+  if [[ "$roster_written" == "1" && -n "$roster_path" && -f "$roster_path" ]]; then
+    if [[ -n "${SCRIPT_DIR:-}" ]] \
+        && [[ -f "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" ]]; then
+      python3 "$SCRIPT_DIR/lib/agent-cli-helpers/roster-excise-block.py" \
+        "$roster_path" "$agent" >/dev/null 2>&1 \
+        || bridge_warn "agent create rollback: roster excision failed for '$agent' in $roster_path"
+    fi
+    # Drop the daemon auto-start state file so the next daemon tick does
+    # not warn about a roster-removed agent (same pattern as run_delete).
+    if [[ -n "${BRIDGE_STATE_DIR:-}" ]]; then
+      rm -f "$BRIDGE_STATE_DIR/daemon-autostart/$agent.env" 2>/dev/null || true
+    fi
+  fi
+
+  # 2. Scaffold target — the per-agent identity source / home tree.
+  if [[ "$scaffold_created" == "1" && -n "$scaffold_target" ]]; then
+    bridge_agent_create_rollback_rmtree "$scaffold_target"
+  fi
+
+  # 3. Workdir — only if create authored it (default v2 workdir/ default).
+  # Skip when workdir equals scaffold_target (legacy install) so we don't
+  # double-rm, and skip explicit operator --workdir paths which we did
+  # NOT create. The _CREATE_ROLLBACK_WORKDIR_CREATED flag is set only
+  # when the workdir was empty / autoderived under BRIDGE_AGENT_ROOT_V2.
+  if [[ "$workdir_created" == "1" && -n "$workdir" && "$workdir" != "$scaffold_target" ]]; then
+    bridge_agent_create_rollback_rmtree "$workdir"
+  fi
+
+  # 4. v2 per-agent root parent (only when we created it). bridge_scaffold_
+  # agent_home pre-creates $BRIDGE_AGENT_ROOT_V2/<agent>/ before the v2 home/
+  # and workdir/ children, and run_delete --purge-home does not see this
+  # parent on a non-rolled-back delete — so rollback owns the parent rm to
+  # match the inverse-of-create contract.
+  if [[ -n "$v2_root" && "$scaffold_created" == "1" ]]; then
+    bridge_agent_create_rollback_rmtree "$v2_root"
+  fi
+
+  # 5. Tracked-profile-source residue. bridge_scaffold_agent_home does not
+  # write under $BRIDGE_HOME/agents/<a>/ for v2 installs (it writes under
+  # $BRIDGE_AGENT_ROOT_V2/<agent>/), but a prior partial create or legacy
+  # migration may have left a stub there. Only remove when the dir is empty
+  # so we never blow away a legitimate tracked-profile source.
+  if [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" ]]; then
+    local profile_src="$BRIDGE_AGENT_HOME_ROOT/$agent"
+    if [[ -d "$profile_src" ]] \
+        && [[ -z "$(find "$profile_src" -mindepth 1 -maxdepth 1 2>/dev/null | head -n 1)" ]]; then
+      rmdir "$profile_src" 2>/dev/null \
+        || bridge_warn "agent create rollback: rmdir failed for empty $profile_src"
+    fi
+  fi
+}
+
+# bridge_agent_create_rollback_rmtree — guarded recursive rm. Refuses any
+# path that is not under one of the known agent-root prefixes. Uses sudo
+# when the controller cannot rm directly (isolated parents from a prior
+# linux-user create that didn't get to bridge_linux_prepare_agent_isolation).
+bridge_agent_create_rollback_rmtree() {
+  local target="$1"
+  [[ -n "$target" ]] || return 0
+  [[ -d "$target" ]] || return 0
+
+  case "$target" in
+    "${BRIDGE_AGENT_HOME_ROOT:-/dev/null/none}"/*|"${BRIDGE_AGENT_ROOT_V2:-/dev/null/none}"/*) ;;
+    *)
+      bridge_warn "agent create rollback: refusing to rm target outside agent roots: $target"
+      return 0
+      ;;
+  esac
+
+  if rm -rf -- "$target" 2>/dev/null; then
+    return 0
+  fi
+  if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+    bridge_linux_sudo_root rm -rf -- "$target" 2>/dev/null \
+      || bridge_warn "agent create rollback: rm -rf failed for $target (manual cleanup may be required)"
+  else
+    bridge_warn "agent create rollback: rm -rf failed for $target (manual cleanup may be required)"
+  fi
+}
+
 # bridge_ensure_memory_precompact_hook — wire the Plan-D PreCompact hook
 # into an agent's .claude/settings.json. Safe to call repeatedly; the
 # bridge-hooks.py helper already short-circuits when the hook is present.
@@ -2788,6 +2899,34 @@ report and reap test-fixture agents per their pattern."
         bridge_die "workdir가 이미 존재하고 비어 있지 않습니다: $workdir"
       fi
     fi
+    # Issue #1076: arm the rollback trap BEFORE the first mutation. The
+    # trap fires on any non-zero exit (including bridge_die / an unhandled
+    # PermissionError in a python helper / set -e propagation) until the
+    # success-clear at the end of the create block sets _CREATE_ROLLBACK_
+    # COMPLETE=1. Persists the create state through shell vars (locals
+    # captured by the rollback helper) so the trap body stays trivial.
+    _CREATE_ROLLBACK_AGENT="$agent"
+    _CREATE_ROLLBACK_ROSTER="$BRIDGE_ROSTER_LOCAL_FILE"
+    _CREATE_ROLLBACK_ROSTER_WRITTEN=0
+    _CREATE_ROLLBACK_SCAFFOLD_CREATED=0
+    _CREATE_ROLLBACK_WORKDIR_CREATED=0
+    _CREATE_ROLLBACK_SCAFFOLD_TARGET=""
+    _CREATE_ROLLBACK_WORKDIR=""
+    _CREATE_ROLLBACK_V2_ROOT=""
+    _CREATE_ROLLBACK_COMPLETE=0
+    # Record the v2 per-agent root parent so rollback can rm it too —
+    # bridge_scaffold_agent_home pre-creates this on isolated installs and
+    # run_delete --purge-home does not see it on a non-rolled-back delete.
+    if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && $_workdir_is_v2_default -eq 1 ]]; then
+      _CREATE_ROLLBACK_V2_ROOT="$BRIDGE_AGENT_ROOT_V2/$agent"
+    fi
+    # _workdir_is_v2_default == 1 means we authored workdir under the v2
+    # tree (it wasn't an explicit operator --workdir), so rollback may rm it.
+    if [[ $_workdir_is_v2_default -eq 1 ]]; then
+      _CREATE_ROLLBACK_WORKDIR="$workdir"
+    fi
+    # shellcheck disable=SC2064
+    trap '[[ "${_CREATE_ROLLBACK_COMPLETE:-0}" == "1" ]] || bridge_agent_create_rollback' EXIT
     # Issue #1060 D1: scaffold the authored identity into the IDENTITY
     # SOURCE (layer 2). On a v2 install the identity source is ALWAYS
     # `bridge_layout_agent_home` = `<agent-root>/home` — regardless of
@@ -2805,6 +2944,17 @@ report and reap test-fixture agents per their pattern."
     if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]] \
         && declare -F bridge_layout_agent_home >/dev/null 2>&1; then
       scaffold_target="$(bridge_expand_user_path "$(bridge_layout_agent_home "$agent")")"
+    fi
+    # Issue #1076: record scaffold_target before the mutation so rollback
+    # can rm it if a later step fails. Setting _CREATE_ROLLBACK_SCAFFOLD_
+    # CREATED=1 BEFORE the call means even a mid-scaffold raise (e.g. sudo
+    # mkdir denied) is treated as "we tried to author this tree" — the
+    # rollback rmtree is no-op when the tree never materialized, but YES-op
+    # when bridge_scaffold_agent_home wrote some templates then aborted.
+    _CREATE_ROLLBACK_SCAFFOLD_TARGET="$scaffold_target"
+    _CREATE_ROLLBACK_SCAFFOLD_CREATED=1
+    if [[ -n "$_CREATE_ROLLBACK_WORKDIR" ]]; then
+      _CREATE_ROLLBACK_WORKDIR_CREATED=1
     fi
     # v0.8.5 #693 (Wave-3): pass isolation_mode + os_user so scaffold's
     # sudo-handoff predicate (added by PR #688 for #677) actually fires
@@ -2889,6 +3039,11 @@ report and reap test-fixture agents per their pattern."
       "$always_on" \
       "$isolation_mode" \
       "$os_user" >/dev/null
+    # Issue #1076: the agent is now registered. Mark for rollback excision
+    # if any later step (shared-settings link, grant-matrix apply,
+    # start --dry-run) raises — without this flag, a post-roster failure
+    # leaves a registered-but-broken agent (the exact bug).
+    _CREATE_ROLLBACK_ROSTER_WRITTEN=1
     # Issue #848: bridge_write_role_block just appended a new entry to
     # the local roster file; invalidate the per-process cache so the
     # next load re-reads disk instead of replaying the pre-create map.
@@ -2955,6 +3110,12 @@ report and reap test-fixture agents per their pattern."
     else
       start_dry_run_status="warn (rc=$?)"
     fi
+    # Issue #1076: every mutation in the create flow has now completed.
+    # Mark complete + disarm the EXIT trap so a normal exit does NOT roll
+    # back a successful create. A failure ANYWHERE above this line leaves
+    # _CREATE_ROLLBACK_COMPLETE=0, and the trap rolls back on shell exit.
+    _CREATE_ROLLBACK_COMPLETE=1
+    trap - EXIT
   fi
 
   if [[ $json_mode -eq 1 ]]; then
@@ -3940,6 +4101,74 @@ PY
         bridge_warn "agent delete: --purge-home refused: resolved home outside expected agent roots: $home_dir"
         ;;
     esac
+
+    # Issue #1076: on a v2 install, `bridge_agent_default_home` resolves
+    # to `$BRIDGE_AGENT_ROOT_V2/<agent>/home` — ONE of the two children of
+    # the per-agent root. The sibling `workdir/` and the per-agent root
+    # itself are NOT covered above and accumulate root-owned residue from
+    # a prior isolated create that aborted mid-flow. Without this purge
+    # the next `agent create <same-name>` re-hits the same PermissionError
+    # the issue documents (`agents/<a>/.claude` mkdir fails because the
+    # parent is root-owned 2750). Use the layout accessor when available
+    # so the path source is consistent with the create flow.
+    if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
+      local v2_agent_root="$BRIDGE_AGENT_ROOT_V2/$agent"
+      if [[ -d "$v2_agent_root" ]]; then
+        # Sibling workdir under the per-agent root.
+        local v2_workdir="$v2_agent_root/workdir"
+        if [[ -d "$v2_workdir" ]]; then
+          if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+            bridge_linux_sudo_root rm -rf -- "$v2_workdir" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $v2_workdir"
+          else
+            rm -rf -- "$v2_workdir" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $v2_workdir"
+          fi
+        fi
+        # The per-agent root parent — root-owned 2750 on isolated installs.
+        # Rm it last so its children are gone first. Use sudo when the
+        # controller cannot rm directly (isolated parent ownership).
+        if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+          bridge_linux_sudo_root rm -rf -- "$v2_agent_root" || \
+            bridge_warn "agent delete: --purge-home best-effort rm failed: $v2_agent_root"
+        else
+          rm -rf -- "$v2_agent_root" || \
+            bridge_warn "agent delete: --purge-home best-effort rm failed: $v2_agent_root"
+        fi
+      fi
+    fi
+
+    # Issue #1076: the tracked-profile-source location
+    # (`$BRIDGE_HOME/agents/<a>/`, via bridge_layout_profile_source_dir)
+    # also accumulates residue — managed agents that go through the v2
+    # shared-settings render path materialize `agents/<a>/.claude/` even
+    # though their canonical home is under the v2 root, and the legacy
+    # layout uses this exact dir as the home tree. Purge it too so a
+    # subsequent create starts clean. Validate the path resolves under
+    # $BRIDGE_AGENT_HOME_ROOT (= $BRIDGE_HOME/agents on a standard
+    # install) before rm so we never escape the agent roots.
+    local profile_src=""
+    if declare -F bridge_layout_profile_source_dir >/dev/null 2>&1; then
+      profile_src="$(bridge_layout_profile_source_dir "$agent" 2>/dev/null || printf '')"
+    elif [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" ]]; then
+      profile_src="$BRIDGE_AGENT_HOME_ROOT/$agent"
+    fi
+    if [[ -n "$profile_src" ]] && [[ -d "$profile_src" ]]; then
+      case "$profile_src" in
+        "${BRIDGE_AGENT_HOME_ROOT:-/dev/null}"/*)
+          if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+            bridge_linux_sudo_root rm -rf -- "$profile_src" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $profile_src"
+          else
+            rm -rf -- "$profile_src" || \
+              bridge_warn "agent delete: --purge-home best-effort rm failed: $profile_src"
+          fi
+          ;;
+        *)
+          bridge_warn "agent delete: --purge-home refused tracked-profile residue outside BRIDGE_AGENT_HOME_ROOT: $profile_src"
+          ;;
+      esac
+    fi
 
     # Issue #737 Q6: also cover the isolated agent's actual Linux home
     # (`/home/agent-bridge-<agent>/`). `bridge_agent_default_home` only

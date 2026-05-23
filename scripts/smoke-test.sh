@@ -11525,4 +11525,12 @@ bash "$REPO_ROOT/scripts/smoke/isolated-agent-delete-reap.sh"
 log "running a2a-cross-bridge smoke (issue #1032)"
 bash "$REPO_ROOT/scripts/smoke/a2a-cross-bridge.sh"
 
+# `agent create` rollback on mid-flow failure + `agent delete --purge-home`
+# residue removal. T1 forces a mid-create PermissionError on the v2 workdir's
+# .claude mkdir and asserts the agent is NOT registered + no scaffold remains.
+# T2 runs create → delete --purge-home → re-create and asserts the cycle
+# succeeds (the issue's user repro on Linux v0.14.5-beta5).
+log "running create-atomicity-and-purge smoke (issue #1076)"
+bash "$REPO_ROOT/scripts/smoke/1076-create-atomicity-and-purge.sh"
+
 log "smoke test passed"
