@@ -1291,16 +1291,29 @@ def _isolated_workdir_owner(workdir: Path) -> str | None:
             candidate = parent
     if stat_result is None:
         return None
+    # #1139 sub-A: uid-first lookup. When the workdir / ancestor is owned
+    # by `agent-bridge-<slug>` directly, the `pwd.getpwuid` lookup is the
+    # authoritative signal — its name carries the isolated UID identity
+    # regardless of what the PRIMARY gid on that inode happens to be.
+    # The pre-#1139 code gated this branch on `stat_result.st_uid !=
+    # os.getuid()` AND used the result only as a fallback signal for the
+    # gid-based enumeration below; on a host where the scaffold left the
+    # workdir with `agent-bridge-<slug>:<controller-gid>` (gid != ab-agent
+    # group), the gid-based enumeration would find no `agent-bridge-*`
+    # user whose PRIMARY gid matched the controller's gid and the
+    # function returned None — falling back to a controller-direct
+    # `path.mkdir(...)` that re-raised PermissionError. Trusting the uid
+    # → name lookup unconditionally for an `agent-bridge-*` prefix
+    # closes that gap. A `KeyError` from `getpwuid` (e.g. on a non-Linux
+    # dev host with the platform check stubbed for tests) falls through
+    # to the existing gid-based enumeration.
     try:
         import pwd
         owner = pwd.getpwuid(stat_result.st_uid).pw_name
+        if owner.startswith("agent-bridge-"):
+            return owner
     except (KeyError, ImportError):
-        owner = ""
-    # Direct match: the existing ancestor IS owned by an isolated agent
-    # user. This covers the canonical case where workdir itself is
-    # `agent-bridge-<slug>:ab-agent-<slug> 2770`.
-    if owner.startswith("agent-bridge-") and stat_result.st_uid != os.getuid():
-        return owner
+        pass
     # #1120 sub-A: the per-agent root (`<v2-root>/<agent>/`) is
     # `root:ab-agent-<slug> mode 2750` so the owner is root, not an
     # `agent-bridge-*` user. Recover the isolated UID name from the
