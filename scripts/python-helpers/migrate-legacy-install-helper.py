@@ -636,7 +636,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 print(f"  WARN: target already has: {rel} — apply will REFUSE")
                 target_ok = False
     if target_ok:
-        print("  target appears clean/fresh — apply may proceed")
+        # beta6 honesty: apply is gated (deferred to beta7) — see #1087.
+        # Don't tell the operator "apply may proceed" when the user-facing
+        # default refuses. plan is inspection-only in beta6.
+        print(
+            "  target appears clean/fresh — but apply is DEFERRED to beta7 "
+            "(see #1087); plan is inspection-only in beta6"
+        )
 
     return 0
 

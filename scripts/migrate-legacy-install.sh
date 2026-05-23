@@ -8,19 +8,26 @@
 # intentionally decoupled from bridge-upgrade.sh / bridge-init.sh /
 # bridge-bootstrap.sh and must never be called from those paths.
 #
-# Contract: export → plan → apply → verify. Never mutates the source in-place.
+# Contract: export → plan → verify (apply DEFERRED to beta7, see #1087).
+# Never mutates the source in-place. apply is gated behind
+# BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE=1 for internal beta7 development only.
 #
-# Subcommands:
+# Subcommands (beta6 user-facing):
 #   export  --source <old-BRIDGE_HOME> --bundle <dir>   (read-only on source)
-#   plan    --bundle <dir>  --target <new-BRIDGE_HOME>   (read-only on target)
-#   apply   --bundle <dir>  --target <new-BRIDGE_HOME>   (writes to target)
+#   plan    --bundle <dir>  --target <new-BRIDGE_HOME>   (read-only inspection)
 #   verify  --target <new-BRIDGE_HOME>                   (read-only check)
 #
-# Safety gates (apply only):
-#   - apply is EXPLICIT / off-by-default — must invoke `apply` subcommand.
+# Subcommand (gated, beta7 follow-up):
+#   apply   --bundle <dir>  --target <new-BRIDGE_HOME>
+#             Refuses by default. Tracked in issue #1087 for beta7 rework
+#             (clean-target gate, layout-resolver consumption, credential
+#             re-entry write paths). NOT for operator use in beta6.
+#
+# Safety design (apply, beta7 target):
+#   - apply will be EXPLICIT / off-by-default — must invoke `apply` subcommand.
 #   - target must be a CLEAN / FRESH install (not populated); apply refuses otherwise.
 #   - a backup + manifest are written to target before any mutation.
-#   - secrets are never copied; apply prompts for re-entry via file / env / stdin.
+#   - credentials are never copied; apply prompts for re-entry via file / env / stdin.
 #   - migrator is never wired into upgrade / init / bootstrap flows.
 #
 # Classification of items:
