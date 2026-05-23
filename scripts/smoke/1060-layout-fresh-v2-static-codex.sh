@@ -20,12 +20,12 @@
 #     the descriptor-resolved materialization target (the workspace),
 #     not into a shared project file.
 #
-# Full Codex *provisioning* (rendering AGENTS.md from a Codex template,
-# wiring the SessionStart surface) is CODEX-PROV's job (#1067). This
-# smoke's scope is the LAYOUT contract CODEX-PROV builds on: the
-# descriptor resolves the right per-engine targets, and the
-# materialization writes the authored identity there. CODEX-PROV extends
-# this smoke when it lands.
+# Extended by CODEX-PROV (#1067, Batch 2) to also assert full provisioning:
+#   * bridge_scaffold_codex_entrypoint places AGENTS.md in the identity
+#     source after scaffold (S03),
+#   * bridge-hooks.py ensure-codex-hooks renders the Codex hook surface at
+#     the descriptor-owned per-agent path (S08),
+#   * materialization delivers AGENTS.md into the workspace (S02 via D1).
 #
 # Footgun #11: driver emitted via printf-to-file, no heredoc-stdin.
 
@@ -70,6 +70,8 @@ write_driver() {
     'source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1' \
     'declare -F bridge_engine_entrypoint_filename >/dev/null 2>&1 || { echo "DRIVER_FAIL: engine descriptor not loaded"; exit 91; }' \
     'declare -F bridge_layout_agent_home >/dev/null 2>&1 || { echo "DRIVER_FAIL: layout resolver not loaded"; exit 92; }' \
+    'declare -F bridge_scaffold_codex_entrypoint >/dev/null 2>&1 || { echo "DRIVER_FAIL: bridge_scaffold_codex_entrypoint not loaded (#1067 CODEX-PROV)"; exit 93; }' \
+    'declare -F bridge_ensure_codex_agent_hooks >/dev/null 2>&1 || { echo "DRIVER_FAIL: bridge_ensure_codex_agent_hooks not loaded (#1067 CODEX-PROV)"; exit 94; }' \
     'declare -A BRIDGE_AGENT_WORKDIR 2>/dev/null || true' \
     'declare -A BRIDGE_AGENT_ISOLATION_MODE 2>/dev/null || true' \
     'declare -A BRIDGE_AGENT_OS_USER 2>/dev/null || true' \
@@ -90,22 +92,30 @@ write_driver() {
     'echo "CLAUDE_ENTRYPOINT: $(bridge_engine_entrypoint_filename claude)"' \
     'if bridge_engine_wants_claude_compat_copy codex; then echo "CODEX_COMPAT_COPY: yes"; else echo "CODEX_COMPAT_COPY: no"; fi' \
     'if bridge_engine_wants_claude_compat_copy claude; then echo "CLAUDE_COMPAT_COPY: yes"; else echo "CLAUDE_COMPAT_COPY: no"; fi' \
-    'echo "CODEX_HOOK_CONFIG: $(bridge_engine_hook_config_path "$AGENT_ID" codex 2>/dev/null || echo UNRESOLVED)"' \
+    'CODEX_HOOK_CONFIG="$(bridge_engine_hook_config_path "$AGENT_ID" codex 2>/dev/null || echo UNRESOLVED)"' \
+    'echo "CODEX_HOOK_CONFIG: $CODEX_HOOK_CONFIG"' \
     'echo "CODEX_HOOK_RENDERER: $(bridge_engine_hook_renderer_profile codex)"' \
-    '# Author a template-shaped identity source (template has CLAUDE.md +' \
-    '# common identity files; AGENTS.md is rendered by CODEX-PROV in a' \
-    '# follow-up batch, not by LAYOUT). The LAYOUT contract under test:' \
-    '# materialization delivers the common identity AND the CLAUDE.md' \
-    '# compat copy (per the descriptor) into the Codex workspace.' \
+    '# Author a template-shaped identity source: CLAUDE.md + common files.' \
+    '# CODEX-PROV (#1067) adds AGENTS.md via bridge_scaffold_codex_entrypoint' \
+    '# (S03) and renders hooks via bridge_ensure_codex_agent_hooks (S08).' \
     'mkdir -p "$IDENTITY_HOME"' \
     'printf "%s\n" "# probe-codex agent (claude-compat copy)" > "$IDENTITY_HOME/CLAUDE.md"' \
     'printf "%s\n" "# soul" > "$IDENTITY_HOME/SOUL.md"' \
+    '# S03: bridge_scaffold_codex_entrypoint copies CLAUDE.md -> AGENTS.md in identity source.' \
+    'bridge_scaffold_codex_entrypoint "$IDENTITY_HOME" codex 2>/dev/null || true' \
+    'if [[ -f "$IDENTITY_HOME/AGENTS.md" ]]; then echo "IDENTITY_AGENTS_MD: present"; else echo "IDENTITY_AGENTS_MD: missing"; fi' \
     'MAT_TARGET="$(bridge_engine_materialization_target "$AGENT_ID" codex 2>/dev/null || echo UNRESOLVED)"' \
     'echo "CODEX_MATERIALIZATION_TARGET: $MAT_TARGET"' \
+    '# Deliver identity into workspace (D1). AGENTS.md is present in identity_home now,' \
+    '# so materialization will deliver it into the workspace (descriptor engine_entry).' \
     'bridge_layout_materialize_identity "$AGENT_ID" codex "$WORKSPACE_DIR"' \
     'if [[ -f "$WORKSPACE_DIR/AGENTS.md" ]]; then echo "WORKSPACE_AGENTS_MD: present"; else echo "WORKSPACE_AGENTS_MD: missing"; fi' \
     'if [[ -f "$WORKSPACE_DIR/CLAUDE.md" ]]; then echo "WORKSPACE_CLAUDE_MD: present"; else echo "WORKSPACE_CLAUDE_MD: missing"; fi' \
-    'if [[ -f "$WORKSPACE_DIR/SOUL.md" ]]; then echo "WORKSPACE_SOUL_MD: present"; else echo "WORKSPACE_SOUL_MD: missing"; fi'
+    'if [[ -f "$WORKSPACE_DIR/SOUL.md" ]]; then echo "WORKSPACE_SOUL_MD: present"; else echo "WORKSPACE_SOUL_MD: missing"; fi' \
+    '# S08: bridge_ensure_codex_agent_hooks renders .codex/hooks.json at the descriptor path.' \
+    'bridge_ensure_codex_agent_hooks "$AGENT_ID" "$IDENTITY_HOME" 2>/dev/null || true' \
+    'if [[ -f "$CODEX_HOOK_CONFIG" ]]; then echo "CODEX_HOOKS_FILE: present"; else echo "CODEX_HOOKS_FILE: missing"; fi' \
+    'if [[ -f "$CODEX_HOOK_CONFIG" ]] && grep -q "SessionStart" "$CODEX_HOOK_CONFIG" 2>/dev/null; then echo "CODEX_HOOKS_SESSION_START: present"; else echo "CODEX_HOOKS_SESSION_START: missing"; fi'
   do
     printf '%s\n' "$line" >>"$out"
   done
@@ -179,19 +189,29 @@ smoke_assert_eq "codex" "$(extract_line "$OUT" "CODEX_HOOK_RENDERER")" \
 # Materialization: target is the workspace, and the identity is delivered there.
 smoke_assert_eq "$WORKSPACE_DIR" "$(extract_line "$OUT" "CODEX_MATERIALIZATION_TARGET")" \
   "T1: descriptor resolves the Codex materialization target to the workspace dir"
-# AGENTS.md is CODEX-PROV's responsibility (Batch 2), not LAYOUT's. At this
-# beta6 Batch 1 point the template has no AGENTS.md → workspace AGENTS.md is
-# expected missing. The smoke captures the assertion for traceability; it
-# will flip to "present" once CODEX-PROV ships.
-smoke_assert_eq "missing" "$(extract_line "$OUT" "WORKSPACE_AGENTS_MD")" \
-  "T1: AGENTS.md not yet rendered at LAYOUT level — CODEX-PROV (Batch 2) owns native Codex entrypoint"
+
+# S03 (CODEX-PROV #1067): AGENTS.md must be present in the identity source
+# after bridge_scaffold_codex_entrypoint runs (copied from CLAUDE.md).
+smoke_assert_eq "present" "$(extract_line "$OUT" "IDENTITY_AGENTS_MD")" \
+  "T1: AGENTS.md present in identity source after bridge_scaffold_codex_entrypoint (S03, #1067)"
+
+# S02 (via D1 materialization): AGENTS.md delivered into workspace once it
+# exists in the identity source — CODEX-PROV + LAYOUT together close this gap.
+smoke_assert_eq "present" "$(extract_line "$OUT" "WORKSPACE_AGENTS_MD")" \
+  "T1: materialization delivered AGENTS.md into the Codex workspace (S02 via D1, #1067+#1060)"
+
 # Codex r1 BLOCKING 2: descriptor flags Codex as wants_claude_compat_copy →
 # materialization must deliver CLAUDE.md to the workspace as a Claude-shaped
-# compat copy. This is what LAYOUT delivers today; CODEX-PROV stacks AGENTS.md
-# on top in Batch 2.
+# compat copy alongside the native AGENTS.md.
 smoke_assert_eq "present" "$(extract_line "$OUT" "WORKSPACE_CLAUDE_MD")" \
   "T1: materialization delivered the CLAUDE.md compat copy into the Codex workspace (descriptor wants_claude_compat_copy)"
 smoke_assert_eq "present" "$(extract_line "$OUT" "WORKSPACE_SOUL_MD")" \
   "T1: materialization delivered the authored SOUL.md into the descriptor-resolved target"
 
-smoke_log "all tests PASS — issue #1060 D5 smoke 2: fresh v2 static Codex descriptor + materialization verified"
+# S08 (CODEX-PROV #1067): Codex hook surface rendered at descriptor-owned path.
+smoke_assert_eq "present" "$(extract_line "$OUT" "CODEX_HOOKS_FILE")" \
+  "T1: Codex hooks.json rendered at descriptor-owned per-agent path (S08, #1067)"
+smoke_assert_eq "present" "$(extract_line "$OUT" "CODEX_HOOKS_SESSION_START")" \
+  "T1: Codex hooks.json contains SessionStart entry (S08, #1067)"
+
+smoke_log "all tests PASS — issue #1060 D5 smoke 2 + #1067 CODEX-PROV: fresh v2 static Codex full provisioning verified"

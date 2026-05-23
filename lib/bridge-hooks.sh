@@ -583,3 +583,40 @@ bridge_codex_hooks_status() {
 bridge_ensure_codex_hooks() {
   bridge_hooks_python ensure-codex-hooks --codex-hooks-file "$(bridge_codex_hooks_file)" --bridge-home "$BRIDGE_HOME" --python-bin "$(command -v python3)"
 }
+
+# bridge_ensure_codex_agent_hooks <agent> <agent_home>
+#
+# Issue #1067 S08: render + verify the Codex hook surface for a single
+# agent at the descriptor-owned path (<agent_home>/.codex/hooks.json).
+# bridge-hooks.py:ensure-codex-hooks is idempotent — already-present
+# entries are left in place. Safe to call on upgrade (the descriptor path
+# is stable and per-agent, not the shared $HOME/.codex/hooks.json).
+#
+# The hook config path is <agent_home>/.codex/hooks.json — matching the
+# descriptor's contract for the codex engine (`bridge_engine_hook_config_path
+# <agent> codex` returns `<agent_home>/.codex/hooks.json`). The caller
+# passes the already-resolved agent_home directly so this function works
+# correctly even when the agent is not yet in the roster (create flow),
+# without re-invoking the descriptor's roster-dependent resolver.
+#
+# Called from bridge-agent.sh (codex engine create path) and
+# lib/upgrade-helpers/codex-hooks-propagate.sh (upgrade path). Exported
+# from lib so smoke drivers sourcing bridge-lib.sh can assert S08 directly.
+bridge_ensure_codex_agent_hooks() {
+  local agent="$1"
+  local agent_home="$2"
+  [[ -n "$agent" && -n "$agent_home" ]] || return 0
+  # Descriptor contract: codex hook config is <agent_home>/.codex/hooks.json.
+  # Use the caller-provided agent_home directly rather than re-resolving via
+  # bridge_engine_hook_config_path — the resolver calls bridge_layout_agent_home
+  # which depends on the roster being loaded, but at create time the agent is
+  # not yet registered. The result is identical to the descriptor's resolution
+  # for a registered agent on a v2 install.
+  local hook_config_path="$agent_home/.codex/hooks.json"
+  mkdir -p "$(dirname "$hook_config_path")" 2>/dev/null || return 0
+  bridge_hooks_python ensure-codex-hooks \
+    --codex-hooks-file "$hook_config_path" \
+    --bridge-home "${BRIDGE_HOME:-$BRIDGE_SCRIPT_DIR}" \
+    --python-bin "$(command -v python3 || printf '/usr/bin/python3')" \
+    >/dev/null 2>&1 || true
+}

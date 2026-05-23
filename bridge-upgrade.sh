@@ -404,6 +404,24 @@ bridge_upgrade_propagate_claude_shared_settings() {
     "$BRIDGE_BASH_BIN" "$target_root/bridge-agent.sh" rerender-settings --apply --json
 }
 
+# bridge_upgrade_propagate_codex_hooks <target_root>
+#
+# Issue #1067 S08: re-render Codex hooks for every codex-engine agent during
+# upgrade. Mirrors bridge_upgrade_propagate_claude_hooks but for the Codex
+# hook surface. Writes to the descriptor-owned per-agent path
+# (<agent_home>/.codex/hooks.json), not the shared $HOME/.codex/hooks.json.
+#
+# The body lives in lib/upgrade-helpers/codex-hooks-propagate.sh (file-as-
+# argv pattern) to avoid the Bash 5.3.9 heredoc-stdin deadlock (footgun #11).
+# No-op when no codex-engine agents are registered.
+bridge_upgrade_propagate_codex_hooks() {
+  local target_root="$1"
+  local _helper="$SOURCE_ROOT/lib/upgrade-helpers/codex-hooks-propagate.sh"
+  [[ -f "$_helper" ]] || return 0
+  bridge_upgrade_with_target_env "$target_root" \
+    "$BRIDGE_BASH_BIN" "$_helper" "$SOURCE_ROOT" "$target_root" >/dev/null 2>&1 || true
+}
+
 bridge_upgrade_collect_agent_restart_report() {
   local target_root="$1"
   local dry_run="${2:-0}"
@@ -1719,6 +1737,15 @@ PY
     _upgrade_partial_failures+=("shared_rerender")
   fi
   rm -rf "$_shared_rerender_verify_dir"
+fi
+
+# Issue #1067 S08: propagate Codex hooks to every codex-engine agent.
+# Runs after Claude shared-settings rerender so the two hook-surface
+# propagations stay in the same upgrade phase. Non-fatal: a missing
+# codex agent home or hooks.py error produces a WARN but does not abort
+# the upgrade (same posture as bridge_upgrade_propagate_claude_hooks).
+if [[ $DRY_RUN -eq 0 ]]; then
+  bridge_upgrade_propagate_codex_hooks "$TARGET_ROOT" 2>/dev/null || true
 fi
 
 # v0.7.0 → v0.7.1 transition cleanup. Idempotent best-effort removal of
