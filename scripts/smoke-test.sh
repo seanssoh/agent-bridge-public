@@ -11521,6 +11521,15 @@ bash "$REPO_ROOT/scripts/smoke/nudge-task-age-gate.sh"
 log "running 1015-resume-claude-config-dir smoke (issue #1015)"
 bash "$REPO_ROOT/scripts/smoke/1015-resume-claude-config-dir.sh"
 
+# Issue #1073: a fresh non-admin Claude channel agent with its own
+# CLAUDE_CONFIG_DIR cannot start because Claude CLI's first-run prompts
+# (theme picker, Bypass Permissions warning) block the tmux session and
+# bridge-run.sh's foreground detection kills + relaunches in a loop.
+# Smoke pins (a) the per-agent .claude.json seed + (b) the managed
+# settings.json default that suppress both prompts.
+log "running 1073-fresh-channel-first-run-seed smoke (issue #1073)"
+bash "$REPO_ROOT/scripts/smoke/1073-fresh-channel-first-run-seed.sh"
+
 # Deleting an isolated agent left the dedicated OS user + named-user ACEs
 # behind. Smoke pins the reaper's gating decision (Linux-only, exact
 # generated-user match) for short and long agent names.

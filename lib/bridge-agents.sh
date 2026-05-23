@@ -4027,6 +4027,68 @@ bridge_agent_claude_config_dir() {
   printf '%s/.claude' "$(bridge_agent_claude_home_dir "$agent")"
 }
 
+# bridge_ensure_claude_first_run_config <agent>
+#
+# Issue #1073 — pre-seed a Claude agent's per-agent ``CLAUDE_CONFIG_DIR``
+# so the CLI skips first-run interactive prompts (theme picker,
+# onboarding, project-trust dialog). Without this, a fresh non-admin
+# Claude channel agent that has its own ``CLAUDE_CONFIG_DIR`` cannot
+# start: the picker blocks the tmux session, ``bridge-run.sh``'s
+# foreground detection kills the session, and relaunch loops
+# indefinitely (admin agents reuse the controller's already-onboarded
+# ``~/.claude`` and never trip this).
+#
+# Writes ``<config_dir>/.claude.json`` with the same bootstrap payload
+# ``auth claude-token sync`` uses (``hasCompletedOnboarding``,
+# ``firstStartTime``, project ``hasTrustDialogAccepted`` etc.). The
+# companion ``skipDangerousModePermissionPrompt`` key for the Bypass
+# Permissions warning is a managed default in ``settings.json``
+# (`bridge-hooks.py::managed_claude_settings_defaults`) — that side
+# rides through the existing render path.
+#
+# Idempotent: ``setdefault`` semantics on every bootstrap key. Safe to
+# call from both ``agent create`` (first-run wire-up) and
+# ``bridge-start.sh`` (defensive seed for agents created before this
+# fix). No-op when the agent is not a Claude agent.
+#
+# For linux-user isolated agents: this runs as controller BEFORE
+# ``bridge_linux_prepare_agent_isolation`` chowns the home tree, so the
+# seeded file naturally inherits the isolated UID with the rest of the
+# scaffold. For start-path defensive seeding on an already-isolated
+# agent, the seed becomes a no-op when the file already exists with the
+# bootstrap keys (or skips when the controller cannot write).
+bridge_ensure_claude_first_run_config() {
+  local agent="$1"
+  local workdir="${2-}"
+  local engine=""
+  local config_dir=""
+  local helper=""
+
+  [[ -n "$agent" ]] || return 0
+
+  engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+  [[ "$engine" == "claude" ]] || return 0
+
+  config_dir="$(bridge_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+  [[ -n "$config_dir" ]] || return 0
+
+  if [[ -z "$workdir" ]]; then
+    workdir="$(bridge_agent_workdir "$agent" 2>/dev/null || true)"
+  fi
+
+  helper="${BRIDGE_SCRIPT_DIR:-}/scripts/python-helpers/seed-claude-first-run-config.py"
+  if [[ ! -f "$helper" ]]; then
+    # Source-checkout / bridge-home divergence — silently skip rather
+    # than abort the create / start path. The seeded keys are a
+    # defense-in-depth layer; existing `auth claude-token sync` flows
+    # still cover the operator-driven case.
+    return 0
+  fi
+
+  python3 "$helper" "$config_dir" "$workdir" >/dev/null 2>&1 || return 0
+  return 0
+}
+
 bridge_agent_onboarding_state() {
   local agent="$1"
   local path=""

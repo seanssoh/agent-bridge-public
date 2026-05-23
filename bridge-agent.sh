@@ -3165,6 +3165,17 @@ report and reap test-fixture agents per their pattern."
     bridge_roster_cache_invalidate
     bridge_load_roster
     if [[ "$engine" == "claude" ]]; then
+      # Issue #1073: pre-seed the per-agent CLAUDE_CONFIG_DIR's
+      # `.claude.json` with `hasCompletedOnboarding` etc. so Claude
+      # CLI's first-run picker (theme picker, project-trust dialog)
+      # does not block the tmux session and trigger a restart loop
+      # under `bridge-run.sh`. Admin agents reusing the controller's
+      # already-onboarded `~/.claude` never hit this; the failure mode
+      # only surfaces on a fresh per-agent-config Claude agent (the
+      # first channel agent on most installs). Runs BEFORE the shared
+      # settings render so the bootstrap file is in place before the
+      # rest of the scaffold proceeds.
+      bridge_ensure_claude_first_run_config "$agent" "$workdir" >/dev/null 2>&1 || true
       # Issue #570: managed autoCompactWindow default is unconditionally
       # 1_000_000; launch_cmd is forwarded only for caller-signature parity
       # with helpers that still accept it (no longer consulted by the renderer).
