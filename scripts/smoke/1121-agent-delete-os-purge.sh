@@ -62,6 +62,7 @@ run_reap_probe() {
   local os_user="$3"
   local sudoers_state="$4"
   local rm_mode="$5"
+  local test_via="${6:-internal}"
 
   # Set up the smoke's faked sudoers root before forking the probe.
   local sudoers_dir="$SMOKE_TMP_ROOT/etc/sudoers.d"
@@ -85,7 +86,7 @@ uname() { printf '%s\n' "${fake_uname}"; }
 userdel() { printf 'USERDEL %s\n' "\$*"; return 0; }
 groupdel() { printf 'GROUPDEL %s\n' "\$*"; return 0; }
 setfacl() { printf 'SETFACL %s\n' "\$*"; return 0; }
-# rm: shim ONLY when called with \`-f --\` (the Step-4 sudoers rm form).
+# rm: shim ONLY when called with two leading args matching the Step-4 sudoers rm form.
 # Other rm invocations (none expected in this code path) fall through to
 # the real binary so the test never silently masks an unintended rm.
 rm() {
@@ -141,23 +142,23 @@ export HOME="${SMOKE_TMP_ROOT}/ctrlhome"
 export SUDO_USER="" USER="probe" LOGNAME="probe"
 export BRIDGE_AGENT_GROUP_PREFIX="ab-agent-"
 # r3 (codex #5740): no env-controlled sudoers root. The smoke calls
-# the internal `_bridge_isolation_v2_reap_sudoers_drop_in` helper
+# the internal "_bridge_isolation_v2_reap_sudoers_drop_in" helper
 # directly with the tmpdir as the third argument — the production
-# `bridge_isolation_v2_reap_isolated_agent_account` always passes
+# "bridge_isolation_v2_reap_isolated_agent_account" always passes
 # /etc/sudoers.d hardcoded.
 source "${SMOKE_REPO_ROOT}/lib/bridge-isolation-v2.sh"
 
 # r3 (codex #5740): production passes /etc/sudoers.d hardcoded via
 # bridge_isolation_v2_reap_isolated_agent_account. The smoke calls the
-# internal `_bridge_isolation_v2_reap_sudoers_drop_in` helper directly
+# internal "_bridge_isolation_v2_reap_sudoers_drop_in" helper directly
 # with the literal smoke-fixture path so the rm-decision logic is
-# exercised without any env-controlled bypass. C1 (non-Linux) still
-# exercises the outer entrypoint because Gate 1 (uname == Linux) lives
-# there.
-if [[ "${fake_uname}" == "Linux" ]]; then
-  _bridge_isolation_v2_reap_sudoers_drop_in "${agent}" "${os_user}" "${SMOKE_TMP_ROOT}/etc/sudoers.d" 2>&1
-else
+# exercised without any env-controlled bypass. C1 (non-Linux) and C4
+# (Gate-2 bad os_user) exercise the outer entrypoint because Gate-1/2
+# live there and are tested upstream of the internal helper.
+if [[ "${test_via}" == "outer" ]]; then
   bridge_isolation_v2_reap_isolated_agent_account "${agent}" "${os_user}" 2>&1
+else
+  _bridge_isolation_v2_reap_sudoers_drop_in "${agent}" "${os_user}" "${SMOKE_TMP_ROOT}/etc/sudoers.d" 2>&1
 fi
 PROBE
 }
@@ -173,7 +174,9 @@ test_non_linux_skips_sudoers() {
   local os_user
   os_user="$(expected_os_user "bob")"
   local out
-  out="$(run_reap_probe "Darwin" "bob" "$os_user" "present" "ok")"
+  # C1 routes through the outer function so Gate-1 (uname == Linux)
+  # gets exercised on a Darwin uname.
+  out="$(run_reap_probe "Darwin" "bob" "$os_user" "present" "ok" "outer")"
 
   smoke_assert_not_contains "$out" "RM_F" \
     "C1: no rm -f attempted on non-Linux host"
@@ -226,7 +229,9 @@ test_naming_gate_blocks_sudoers() {
   # Agent is `bob` but the roster resolved a non-matching user. The
   # production reap returns at Gate 2 (production path).
   local out
-  out="$(run_reap_probe "Linux" "bob" "operator" "present" "ok")"
+  # C4 routes through the outer function so Gate-2 (exact-name check)
+  # gets exercised; the internal helper would bypass Gate-2.
+  out="$(run_reap_probe "Linux" "bob" "operator" "present" "ok" "outer")"
 
   smoke_assert_not_contains "$out" "RM_F" \
     "C4: rm NOT attempted when resolved user != agent-bridge-<name>"
@@ -242,16 +247,20 @@ test_rm_failure_emits_warning_row() {
   local os_user
   os_user="$(expected_os_user "bob")"
   local out
+  # C5 routes through the internal helper with tmpdir + present file +
+  # rm_mode=fail so the failing rm path produces the structured WARN.
+  # Steps 1-3 are tested separately by isolated-agent-delete-reap.sh —
+  # this case focuses on Step 4 best-effort behavior alone.
   out="$(run_reap_probe "Linux" "bob" "$os_user" "present" "fail")"
 
   smoke_assert_contains "$out" "failed to remove sudoers drop-in" \
     "C5: rm failure produces a structured WARN row (best-effort delete)"
   smoke_assert_contains "$out" "WARN" \
     "C5: warning is emitted via bridge_warn (visible in audit/log)"
-  # The reap function returns 0 regardless of Step 4 outcome; if the
-  # probe reached Steps 1-3 the run did not abort on the Step 4 failure.
-  smoke_assert_contains "$out" "USERDEL agent-bridge-bob" \
-    "C5: Steps 1-3 still run (reap never aborts on Step 4 failure)"
+  # Step 4 helper returns 0 even on rm failure (best-effort). Steps 1-3
+  # of the outer reap are tested separately by isolated-agent-delete-reap.sh.
+  smoke_assert_contains "$out" "RM_F_FAIL" \
+    "C5: rm shim recorded the failing call (helper never aborts on Step 4 failure)"
 }
 
 # ---------------------------------------------------------------------------
