@@ -598,25 +598,41 @@ def scan_agent(
             engine=engine or "claude",
             agent_source=agent_source,
         )
-    except (PermissionError, FileNotFoundError) as exc:
+    except (PermissionError, FileNotFoundError, OSError) as exc:
+        # #1119 r2: even when the outer `resolve_scan_path` sudo probe
+        # succeeded, the inner file reads above can still raise (the
+        # sudo probe only checked `test -d`, not per-file `read`).
+        # Emit the structured `scan_error` row in that case too so the
+        # contract holds end-to-end on Linux hosts where the controller
+        # has sudo for `test -d` but not the named-pipe access the
+        # actual reads need.
+        if isinstance(exc, PermissionError):
+            error_kind = "permission_denied"
+        elif isinstance(exc, FileNotFoundError):
+            error_kind = "not_found"
+        else:
+            error_kind = "os_error"
+        error_path = getattr(exc, "filename", None) or str(agent_dir)
         print(
-            f"[bridge-watchdog] skipped {resolved_name}: "
+            f"[bridge-watchdog] {resolved_name}: "
             f"{type(exc).__name__} during scan ({exc.strerror or exc}); "
-            f"likely isolated agent unreadable to controller",
+            f"path={error_path}",
             file=sys.stderr,
         )
         return AgentWatch(
             agent=resolved_name,
             session_type="unknown",
             onboarding_state="unknown",
-            status="warn",
+            status="scan_error",
             missing_files=[],
-            broken_links=[f"permission denied during scan: {type(exc).__name__}"],
+            broken_links=[],
             missing_managed_claude_block=False,
             heartbeat_present=False,
             heartbeat_age_seconds=None,
             engine=engine or "claude",
             agent_source=agent_source,
+            error_kind=error_kind,
+            error_path=str(error_path),
         )
 
 
