@@ -43,6 +43,27 @@
 #   guard fires. T2b + T5 catch the r1 gap — they FAIL against the
 #   existence-only implementation.
 #
+# r3 (codex BLOCKING — 2026-05-24):
+#   The r2 prefix glob `agent-bridge-*` is both too loose AND too tight.
+#   False-positive: any sibling agent-bridge-<other> owner matches the
+#   prefix and is treated as Step-A-complete for THIS agent. False-
+#   negative: agents created with `--os-user svc-foo` (a documented
+#   linux-user isolation override) have a valid post-Step-A workdir
+#   owned by `svc-foo` that never matches the prefix → defer forever.
+#   Fix: cross-check workdir ownership against `bridge_agent_os_user
+#   "$agent"` (the roster source of truth — the same value Step A
+#   passes to chown). Defer unless both owner strings are nonempty and
+#   the workdir owner matches the expected OS user EXACTLY. T2a is
+#   reframed as T2a-prefix-default (owner == expected default
+#   agent-bridge-<agent>, proceed). Two new cases enforce the r3
+#   contract: T2c-custom-os-user (owner=svc-foo == expected svc-foo via
+#   --os-user override, proceed — FAILS against r2 prefix glob) and
+#   T2d-wrong-agent-owner (owner=agent-bridge-other != expected
+#   agent-bridge-smoke-agent, defer — FAILS against r2 prefix glob's
+#   false-positive). The common stub block now also defines
+#   `bridge_agent_os_user` reading $SMOKE_FAKE_OS_USER so each case can
+#   drive the expected-owner side independently.
+#
 # Companion (Sub-B — `lib/bridge-agents.sh:4395`):
 #   When `bridge_agent_onboarding_markers_complete` rc=2 (controller blind +
 #   iso-UID probe unavailable, the v2 isolation shape), the onboarding state
@@ -201,6 +222,14 @@ write_common_stubs() {
   printf '%s\n' '  echo "bridge_hooks_python:$1" >>"$CALL_LOG"' >>"$stubs"
   printf '%s\n' '  return 0' >>"$stubs"
   printf '%s\n' '}' >>"$stubs"
+  # r3: the guard cross-checks against bridge_agent_os_user "$agent" (the
+  # roster source of truth, same value Step A passes to chown). The stub
+  # reads $SMOKE_FAKE_OS_USER (default = agent-bridge-smoke-agent) so each
+  # case can drive the expected-owner side independently of the actual
+  # workdir owner string returned by the fake stat shim.
+  printf '%s\n' 'bridge_agent_os_user() {' >>"$stubs"
+  printf '%s\n' '  echo "${SMOKE_FAKE_OS_USER:-agent-bridge-smoke-agent}"' >>"$stubs"
+  printf '%s\n' '}' >>"$stubs"
 }
 
 # ---------- T1 — isolation effective + workdir missing → deferral ----------
@@ -228,6 +257,7 @@ T1_CALL_LOG="$T1_DIR/calls.log"
 # original trigger condition (and still a valid pre-Step-A shape for r2).
 T1_WORKDIR="$T1_DIR/workdir-does-not-exist"
 SMOKE_FAKE_STAT_OWNER="" \
+  SMOKE_FAKE_OS_USER="agent-bridge-smoke-agent" \
   "$BRIDGE_BASH" "$T1_DRIVER" "$REPO_ROOT" "$T1_STUBS" "$T1_CALL_LOG" "$T1_WORKDIR" "smoke-agent" "$FAKE_BIN" \
   2>"$T1_DIR/err" \
   || smoke_fail "T1 driver rc=$? — see $T1_DIR/err"
@@ -243,17 +273,18 @@ grep -q '^RC=0$' "$T1_CALL_LOG" \
   || smoke_fail "T1 expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T1_CALL_LOG")"
 smoke_log "T1 PASS: isolation-effective + workdir-missing → link-shared-settings deferred, return 0"
 
-# ---------- T2a — workdir exists + owner = agent-bridge-* → proceeds ----------
+# ---------- T2a-prefix-default — workdir owner = expected default → proceeds ----------
 #
 # Step A has completed: the workdir directory exists AND ownership has been
-# normalized to `agent-bridge-<agent>`. The guard's ownership check finds
-# the agent-bridge-* prefix and short-circuits to `false` → link-shared-
-# settings fires (the legacy "happy path" after Step A).
+# normalized to the default `agent-bridge-<agent>` value. The guard's exact-
+# match check (owner == bridge_agent_os_user(agent)) succeeds → link-shared-
+# settings fires (the legacy "happy path" after Step A under the default
+# roster — no explicit `--os-user`).
 T2A_DIR="$SMOKE_TMP_ROOT/t2a"
 mkdir -p "$T2A_DIR"
 T2A_STUBS="$T2A_DIR/stubs.sh"
 write_common_stubs "$T2A_STUBS"
-printf '%s\n' '# T2a: isolation EFFECTIVE, workdir present, owner = agent-bridge-<agent> (Step A complete).' >>"$T2A_STUBS"
+printf '%s\n' '# T2a-prefix-default: isolation EFFECTIVE, owner = expected default agent-bridge-<agent> (Step A complete).' >>"$T2A_STUBS"
 printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T2A_STUBS"
 T2A_DRIVER="$T2A_DIR/driver.sh"
 build_driver "$T2A_DRIVER" "$T2A_STUBS"
@@ -262,27 +293,28 @@ T2A_CALL_LOG="$T2A_DIR/calls.log"
 T2A_WORKDIR="$T2A_DIR/workdir-exists"
 mkdir -p "$T2A_WORKDIR"
 SMOKE_FAKE_STAT_OWNER="agent-bridge-smoke-agent" \
+  SMOKE_FAKE_OS_USER="agent-bridge-smoke-agent" \
   "$BRIDGE_BASH" "$T2A_DRIVER" "$REPO_ROOT" "$T2A_STUBS" "$T2A_CALL_LOG" "$T2A_WORKDIR" "smoke-agent" "$FAKE_BIN" \
   2>"$T2A_DIR/err" \
   || smoke_fail "T2a driver rc=$? — see $T2A_DIR/err"
 
 grep -q '^bridge_hooks_python:link-shared-settings$' "$T2A_CALL_LOG" \
-  || smoke_fail "T2a expected bridge_hooks_python:link-shared-settings to fire (owner=agent-bridge-*, Step A complete). calls: $(tr '\n' '|' <"$T2A_CALL_LOG")"
-smoke_log "T2a PASS: isolation-effective + workdir-present + owner=agent-bridge-* → link-shared-settings proceeds"
+  || smoke_fail "T2a expected bridge_hooks_python:link-shared-settings to fire (owner == expected default, Step A complete). calls: $(tr '\n' '|' <"$T2A_CALL_LOG")"
+smoke_log "T2a-prefix-default PASS: owner == bridge_agent_os_user(agent) (default agent-bridge-<agent>) → link-shared-settings proceeds"
 
-# ---------- T2b — workdir exists + owner = controller → defers (codex r1 BLOCKING) ----------
+# ---------- T2b — workdir owner = controller → defers (codex r1 BLOCKING) ----------
 #
 # This is the canonical v2 fresh-create shape that the pre-r2 existence-only
 # guard missed: `_scaffold_v2_sibling` pre-creates the workdir as the
 # controller (e.g. awfmanager) BEFORE `bridge_linux_prepare_agent_isolation`
-# runs, so the workdir EXISTS but is NOT owned by `agent-bridge-*`. Pre-r2
-# the guard's `[[ ! -d "$workdir" ]]` was false here → link-shared-settings
-# proceeded → controller-as-awfmanager mkdir'd `.claude/` with wrong owner
-# → Step A later raced and the cascade began.
+# runs, so the workdir EXISTS but is NOT owned by the agent's expected
+# OS user. Pre-r2 the guard's `[[ ! -d "$workdir" ]]` was false here →
+# link-shared-settings proceeded → controller-as-awfmanager mkdir'd
+# `.claude/` with wrong owner → Step A later raced and the cascade began.
 #
-# Post-r2: the ownership-based guard catches this exact shape and defers.
-# THIS test FAILS against the r1 implementation — that's the regression
-# contract.
+# Post-r2/r3: the ownership-based guard catches this exact shape and defers
+# (owner=awfmanager != expected agent-bridge-smoke-agent). THIS test FAILS
+# against the r1 implementation — that's the regression contract.
 T2B_DIR="$SMOKE_TMP_ROOT/t2b"
 mkdir -p "$T2B_DIR"
 T2B_STUBS="$T2B_DIR/stubs.sh"
@@ -296,8 +328,9 @@ T2B_CALL_LOG="$T2B_DIR/calls.log"
 T2B_WORKDIR="$T2B_DIR/workdir-exists"
 mkdir -p "$T2B_WORKDIR"
 # `awfmanager` is the canonical controller account name on the Linux server
-# host; the test value just needs to NOT start with `agent-bridge-`.
+# host; the test value just needs to NOT match the expected agent owner.
 SMOKE_FAKE_STAT_OWNER="awfmanager" \
+  SMOKE_FAKE_OS_USER="agent-bridge-smoke-agent" \
   "$BRIDGE_BASH" "$T2B_DRIVER" "$REPO_ROOT" "$T2B_STUBS" "$T2B_CALL_LOG" "$T2B_WORKDIR" "smoke-agent" "$FAKE_BIN" \
   2>"$T2B_DIR/err" \
   || smoke_fail "T2b driver rc=$? — see $T2B_DIR/err"
@@ -311,7 +344,82 @@ if [[ $T2B_LINK_CALLED -ne 0 ]]; then
 fi
 grep -q '^RC=0$' "$T2B_CALL_LOG" \
   || smoke_fail "T2b expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T2B_CALL_LOG")"
-smoke_log "T2b PASS: isolation-effective + workdir-present + owner=controller → link-shared-settings deferred (codex r1 BLOCKING shape caught)"
+smoke_log "T2b PASS: owner=controller != expected agent owner → link-shared-settings deferred (codex r1 BLOCKING shape caught)"
+
+# ---------- T2c-custom-os-user — owner = svc-foo, expected = svc-foo → proceeds (codex r2 BLOCKING) ----------
+#
+# `bridge-agent.sh` documents `--os-user <user>` as an explicit linux-user
+# isolation override (`:111-113`, parsed at `:2791-2794`, retained for
+# linux-user mode at `:3000-3001` / `:3036-3050`). Step A chowns the v2
+# subdirs to that exact value at `lib/bridge-agents.sh:3766-3770` and
+# `:3802`. So an agent created with `--os-user svc-foo` has a valid post-
+# Step-A workdir owned by `svc-foo` — NOT by any `agent-bridge-*` user.
+#
+# The r2 prefix glob `agent-bridge-*` would reject this owner and defer
+# forever even though Step A completed cleanly. r3 exact-match against
+# `bridge_agent_os_user "$agent"` (which returns `svc-foo` from the roster)
+# succeeds → link-shared-settings proceeds. THIS test FAILS against the
+# r2 prefix glob — regression contract for the r2→r3 transition.
+T2C_DIR="$SMOKE_TMP_ROOT/t2c"
+mkdir -p "$T2C_DIR"
+T2C_STUBS="$T2C_DIR/stubs.sh"
+write_common_stubs "$T2C_STUBS"
+printf '%s\n' '# T2c-custom-os-user: isolation EFFECTIVE, owner = svc-foo (--os-user override), expected = svc-foo.' >>"$T2C_STUBS"
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T2C_STUBS"
+T2C_DRIVER="$T2C_DIR/driver.sh"
+build_driver "$T2C_DRIVER" "$T2C_STUBS"
+
+T2C_CALL_LOG="$T2C_DIR/calls.log"
+T2C_WORKDIR="$T2C_DIR/workdir-exists"
+mkdir -p "$T2C_WORKDIR"
+SMOKE_FAKE_STAT_OWNER="svc-foo" \
+  SMOKE_FAKE_OS_USER="svc-foo" \
+  "$BRIDGE_BASH" "$T2C_DRIVER" "$REPO_ROOT" "$T2C_STUBS" "$T2C_CALL_LOG" "$T2C_WORKDIR" "smoke-agent" "$FAKE_BIN" \
+  2>"$T2C_DIR/err" \
+  || smoke_fail "T2c driver rc=$? — see $T2C_DIR/err"
+
+grep -q '^bridge_hooks_python:link-shared-settings$' "$T2C_CALL_LOG" \
+  || smoke_fail "T2c expected bridge_hooks_python:link-shared-settings to fire (owner=svc-foo == expected svc-foo from --os-user). calls: $(tr '\n' '|' <"$T2C_CALL_LOG"). NOTE: this test FAILS against the r2 agent-bridge-* prefix glob by design."
+smoke_log "T2c-custom-os-user PASS: owner == bridge_agent_os_user(agent) (svc-foo via --os-user override) → link-shared-settings proceeds (codex r2 BLOCKING shape caught)"
+
+# ---------- T2d-wrong-agent-owner — owner = agent-bridge-other → defers (codex r2 BLOCKING) ----------
+#
+# False-positive guard for the r2 prefix glob: a workdir owned by some
+# OTHER agent-bridge-* account (e.g. a sibling agent's tree mounted into
+# view, or a residual chown from a prior agent that previously occupied
+# the same v2 slot) would PASS the prefix glob check and be treated as
+# Step-A-complete for THIS agent. r3 exact-match catches this — owner=
+# `agent-bridge-other` does NOT equal expected `agent-bridge-smoke-agent`
+# → defer. THIS test FAILS against the r2 prefix glob — regression
+# contract for the r2→r3 false-positive guard.
+T2D_DIR="$SMOKE_TMP_ROOT/t2d"
+mkdir -p "$T2D_DIR"
+T2D_STUBS="$T2D_DIR/stubs.sh"
+write_common_stubs "$T2D_STUBS"
+printf '%s\n' '# T2d-wrong-agent-owner: isolation EFFECTIVE, owner = agent-bridge-other != expected agent-bridge-smoke-agent.' >>"$T2D_STUBS"
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T2D_STUBS"
+T2D_DRIVER="$T2D_DIR/driver.sh"
+build_driver "$T2D_DRIVER" "$T2D_STUBS"
+
+T2D_CALL_LOG="$T2D_DIR/calls.log"
+T2D_WORKDIR="$T2D_DIR/workdir-exists"
+mkdir -p "$T2D_WORKDIR"
+SMOKE_FAKE_STAT_OWNER="agent-bridge-other" \
+  SMOKE_FAKE_OS_USER="agent-bridge-smoke-agent" \
+  "$BRIDGE_BASH" "$T2D_DRIVER" "$REPO_ROOT" "$T2D_STUBS" "$T2D_CALL_LOG" "$T2D_WORKDIR" "smoke-agent" "$FAKE_BIN" \
+  2>"$T2D_DIR/err" \
+  || smoke_fail "T2d driver rc=$? — see $T2D_DIR/err"
+
+T2D_LINK_CALLED=0
+if grep -q '^bridge_hooks_python:link-shared-settings$' "$T2D_CALL_LOG"; then
+  T2D_LINK_CALLED=1
+fi
+if [[ $T2D_LINK_CALLED -ne 0 ]]; then
+  smoke_fail "T2d expected NO bridge_hooks_python:link-shared-settings call (owner=agent-bridge-other != expected agent-bridge-smoke-agent — codex r2 BLOCKING false-positive shape). calls: $(tr '\n' '|' <"$T2D_CALL_LOG"). NOTE: this test FAILS against the r2 agent-bridge-* prefix glob by design."
+fi
+grep -q '^RC=0$' "$T2D_CALL_LOG" \
+  || smoke_fail "T2d expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T2D_CALL_LOG")"
+smoke_log "T2d-wrong-agent-owner PASS: owner=agent-bridge-other != expected agent-bridge-smoke-agent → link-shared-settings deferred (codex r2 BLOCKING false-positive caught)"
 
 # ---------- T3 — isolation NOT effective → proceeds regardless ----------
 #
@@ -335,6 +443,7 @@ T3_WORKDIR="$T3_DIR/workdir-not-yet"
 # Owner string is irrelevant here because the first conjunct short-circuits;
 # pass empty to confirm the legacy non-isolated path doesn't even consult stat.
 SMOKE_FAKE_STAT_OWNER="" \
+  SMOKE_FAKE_OS_USER="agent-bridge-smoke-agent" \
   "$BRIDGE_BASH" "$T3_DRIVER" "$REPO_ROOT" "$T3_STUBS" "$T3_CALL_LOG" "$T3_WORKDIR" "smoke-agent" "$FAKE_BIN" \
   2>"$T3_DIR/err" \
   || smoke_fail "T3 driver rc=$? — see $T3_DIR/err"
@@ -419,6 +528,7 @@ mkdir -p "$T5_WORKDIR"
 # Owner = "FAIL" makes the fake stat exit non-zero on both flavors → guard
 # sees empty `_wd_owner` → `[[ -z "$_wd_owner" ]]` branch defers.
 SMOKE_FAKE_STAT_OWNER="FAIL" \
+  SMOKE_FAKE_OS_USER="agent-bridge-smoke-agent" \
   "$BRIDGE_BASH" "$T5_DRIVER" "$REPO_ROOT" "$T5_STUBS" "$T5_CALL_LOG" "$T5_WORKDIR" "smoke-agent" "$FAKE_BIN" \
   2>"$T5_DIR/err" \
   || smoke_fail "T5 driver rc=$? — see $T5_DIR/err"
@@ -434,4 +544,4 @@ grep -q '^RC=0$' "$T5_CALL_LOG" \
   || smoke_fail "T5 expected RC=0 (deferral returns 0). calls: $(tr '\n' '|' <"$T5_CALL_LOG")"
 smoke_log "T5 PASS: isolation-effective + workdir-present + stat-fails → link-shared-settings deferred (defensive fail-closed)"
 
-smoke_log "all 6 tests PASS (#1145 Option 1, r2: T1 + T2a + T2b + T3 + T4 + T5)"
+smoke_log "all 8 tests PASS (#1145 Option 1, r3: T1 + T2a + T2b + T2c + T2d + T3 + T4 + T5)"
