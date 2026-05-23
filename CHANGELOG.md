@@ -25,9 +25,10 @@ implement-ok (task #5975). `-beta12` prerelease; matching tag
 
 - **#1158 (PR #1159)** — `lib/bridge-marker-bootstrap.sh:bridge_isolation_v2_marker_validate`
   previously accepted only **root** or **current-process** owner for
-  the layout marker. Controller-owned markers (UID = `awfmanager`)
-  were rejected when consumed from an isolated context (`sudo -u
-  agent-bridge-<a>`), so `bridge-die: Agent Bridge v0.8.0 requires
+  the layout marker. Controller-owned markers (owner UID = the
+  controller's numeric UID) were rejected when consumed from an
+  isolated context (`sudo -u agent-bridge-<a>`), so
+  `bridge-die: Agent Bridge v0.8.0 requires
   isolation-v2 (POSIX group + setgid)` aborted every isolated agent
   start. This was a **long-standing** ordering gap, not a beta11
   regression — beta9/10's controller-side Permission denied flood
