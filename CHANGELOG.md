@@ -16,7 +16,7 @@ the upcoming v1.0 clean-cut refactor: the typed three-layer agent layout
 (identity / workspace / engine materialization), descriptor-driven engine
 provisioning, hooks-SSOT consolidation, and a standalone legacy → clean
 install migrator (export/plan/verify; `apply` deferred to beta7 #1087).
-The wave also folds in **12 newly-reported upstream issues** (#1062, #1063,
+The wave also folds in **17 newly-reported upstream issues** (#1062, #1063,
 #1065, #1073-#1078, #1082, #1083, #1093, #1096, #1099-#1101, #1108).
 
 Every PR was codex pair-reviewed (`agb-dev-claude` + `agb-dev-codex`); the
