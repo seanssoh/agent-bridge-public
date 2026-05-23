@@ -6,6 +6,45 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta8] — 2026-05-24
+
+### Highlight — beta7 fix completion wave
+
+Operator-cued **eighth prerelease** — closes 2 incomplete beta7 fixes that
+the operator reproduced on a live Linux server during beta7 QA. Both
+issues were follow-ups to merged beta7 PRs whose live-host behavior
+diverged from the test-fixture coverage.
+
+Every PR was codex pair-reviewed; the integration branch passed a final
+codex review (task #5870 implement-ok). Operator runs Linux-VM QA
+personally on a fresh install.
+`-beta8` prerelease; matching tag `v0.14.5-beta8`, GitHub release marked
+**Pre-release**.
+
+### Fixed — v2 isolation deployment (beta7 follow-up)
+
+- **#1139 (PR #1142)** — `bridge-hooks.py:_isolated_workdir_owner` now
+  resolves the owning **uid first** and returns when it matches
+  `agent-bridge-*`, before falling through to the gid-based getpwall()
+  enumeration. The beta7 fix (#1133) gated the uid-lookup on
+  `st_uid != getuid()` AND relied on gid for ancestor walks — but the
+  failing host's `.claude/` dir is `agent-bridge-<a>:awfmanager 0700`
+  (controller gid, isolated uid), so the gid enumeration returned None
+  and `_ensure_dir_with_sudo` fell back to controller `mkdir` →
+  PermissionError. Plus: new `bridge_agent_onboarding_markers_complete`
+  helper — `bridge_agent_onboarding_state` now downgrades parsed
+  `complete` to `partial` when canonical markers are missing (closes
+  the false-positive on half-scaffolded workdirs).
+- **#1140 (PR #1141)** — `agent delete --purge-home --purge-crons` now
+  reaps **OS home dir** (`/home/agent-bridge-<a>/`) AND **v2 workdir
+  tree** (`$BRIDGE_HOME/data/agents/<a>/`) in addition to the
+  user/group/sudoers cleanup PR #1129 already shipped. New internal
+  helpers `_bridge_isolation_v2_reap_os_home_dir` +
+  `_bridge_isolation_v2_reap_v2_workdir` parallel to the sudoers reap;
+  production hardcodes the strict path patterns, smoke uses tmpdir
+  arg (no env-controlled bypass per #1121 r3 contract). Respects
+  `BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT` for non-default installs.
+
 ## [0.14.5-beta7] — 2026-05-24
 
 ### Highlight — post-beta6 stabilization + v2 isolation deployment unblock wave

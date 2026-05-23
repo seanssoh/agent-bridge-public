@@ -11554,6 +11554,16 @@ bash "$REPO_ROOT/scripts/smoke/isolated-agent-delete-reap.sh"
 log "running 1121-agent-delete-os-purge smoke (issue #1121)"
 bash "$REPO_ROOT/scripts/smoke/1121-agent-delete-os-purge.sh"
 
+# Step-5 (OS home dir) + Step-6 (v2 workdir) reap added to the same
+# reaper (#1140) — PR #1129 closed #1121 partially (user/group/sudoers
+# only), leaving `/home/agent-bridge-<a>` + `data/agents/<a>/` behind
+# on every isolated create/delete cycle. Smoke pins the strict
+# path-pattern gates, the absent-target silent no-op, the
+# empty-`agent_root_v2` legacy short-circuit, and the best-effort
+# rm-failure behavior so the orphan-accumulation leak cannot regress.
+log "running 1140-purge-home-os-cleanup smoke (issue #1140)"
+bash "$REPO_ROOT/scripts/smoke/1140-purge-home-os-cleanup.sh"
+
 # A2A cross-bridge task handoff (#1032): receiver fail-closed bind, HMAC
 # auth, allowlist, durable dedupe (idempotent + hash-conflict), body-size
 # cap, sender outbox retry, and end-to-end enqueue -> local inbox.
