@@ -3977,7 +3977,12 @@ run_update() {
       "" \
       "$before_channels" \
       "" \
-      "[]"
+      "[]" \
+      "" \
+      "" \
+      "" \
+      "" \
+      "$always_on_intent"
     bridge_die "deny: $deny_reason"
   fi
 
