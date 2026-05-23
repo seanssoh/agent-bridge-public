@@ -6,6 +6,60 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta12] — 2026-05-24
+
+### Highlight — beta11 follow-up exposed long-standing marker validator gap (#1158)
+
+Operator-cued **twelfth prerelease** — closes a long-standing
+isolation-v2 marker validation gap that beta11's controller-helper
+fixes finally exposed. Fourth cycle of the A2A-driven QA loop. Remote
+QA peer reported beta11 closed #1155 at create-time but `agent start`
+hit a different wall earlier obscured by the now-fixed Permission
+denied flood.
+
+Single-PR wave (PR #1159). Three-round codex chain. Integration r1
+implement-ok (task #5975). `-beta12` prerelease; matching tag
+`v0.14.5-beta12`, GitHub release marked **Pre-release**.
+
+### Fixed — isolation-v2 marker validator accepts controller-UID owner (#1158)
+
+- **#1158 (PR #1159)** — `lib/bridge-marker-bootstrap.sh:bridge_isolation_v2_marker_validate`
+  previously accepted only **root** or **current-process** owner for
+  the layout marker. Controller-owned markers (owner UID = the
+  controller's numeric UID) were rejected when consumed from an
+  isolated context (`sudo -u agent-bridge-<a>`), so
+  `bridge-die: Agent Bridge v0.8.0 requires
+  isolation-v2 (POSIX group + setgid)` aborted every isolated agent
+  start. This was a **long-standing** ordering gap, not a beta11
+  regression — beta9/10's controller-side Permission denied flood
+  crashed agents before they ever reached the marker check.
+
+  Three-layer fix:
+  - **Marker validator identity exemption** — accepts
+    `BRIDGE_CONTROLLER_UID` (already exported by
+    `lib/bridge-agents.sh:3461-3462`) in addition to root and current
+    process. The group/world-write mode reject (the load-bearing
+    security gate) stays intact.
+  - **`bridge-start.sh` inline env prefix** — propagates
+    `BRIDGE_CONTROLLER_UID=$(id -u)` into the sudo-wrapped child's
+    environment BEFORE `bridge-lib.sh` sources the marker bootstrap.
+    Load-bearing for production: codex r1 caught that without this
+    propagation, the marker validator fix is a no-op because
+    `bridge-lib.sh` sources `bridge-marker-bootstrap.sh` before
+    `bridge-state.sh` (where the env file would otherwise be loaded).
+  - **`bridge_agent_preserved_env_vars` defensive add** —
+    `BRIDGE_CONTROLLER_UID` added to the sudo `--preserve-env=` list.
+    No-op currently (controller doesn't export the variable at fork
+    time outside `bridge-cron.sh`), but defensive for any future
+    controller-export path.
+
+  Three review rounds: r1 BLOCKING (identity exemption correct but
+  load-order makes it no-op) → r2 BOTH-strategy fix + load-order
+  smoke → r3 BLOCKING (load-order smoke missing from ci-select-smoke.sh)
+  → implement-ok. New smokes `1158-marker-controller-uid-exemption.sh`
+  (7 cases) + `1158-marker-load-order.sh` (4 cases), both registered
+  in `__ALL__` static + bridge-start + marker-bootstrap selectors.
+
 ## [0.14.5-beta11] — 2026-05-24
 
 ### Highlight — beta10 fix-completion wave (#1155 — third A2A QA cycle)

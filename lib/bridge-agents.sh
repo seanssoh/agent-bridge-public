@@ -1159,7 +1159,20 @@ bridge_agent_preserved_env_vars() {
   # re-exports all BRIDGE_* runtime paths inside the bash -c child, so sudo
   # only needs to pass through the terminal/locale bits and the two
   # launch-time markers that are not in ENV_PREFIX.
-  printf '%s' "TERM,LANG,LC_ALL,BRIDGE_AGENT_ENV_FILE,BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS,BRIDGE_ENGINE_BIN"
+  #
+  # BRIDGE_CONTROLLER_UID is preserved so that any controller path that
+  # exports it (bridge-cron.sh:490, future controller-side sets) flows
+  # through the sudo boundary. The variable is ALSO inlined into the
+  # SESSION_CMD env prefix at bridge-start.sh:598-599 because the bridge
+  # daemon / agent-start controller does not export it in its own
+  # environment (issue #1158 r2). Both paths are belt-and-suspenders: the
+  # inline prefix is the load-bearing one for marker validation at
+  # bridge-lib.sh source time inside the isolated child (the env file at
+  # $BRIDGE_AGENT_ENV_FILE is sourced LATER inside bridge_load_roster,
+  # AFTER bridge-marker-bootstrap.sh has already run), and the
+  # preserve-list keeps controller-side exports flowing for any future
+  # path that sets the variable before sudo.
+  printf '%s' "TERM,LANG,LC_ALL,BRIDGE_AGENT_ENV_FILE,BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS,BRIDGE_ENGINE_BIN,BRIDGE_CONTROLLER_UID"
 }
 
 # Issue #1118: resolve the engine binary's absolute path on the controller.

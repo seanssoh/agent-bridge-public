@@ -12,7 +12,14 @@
 #
 # Validation:
 #   - regular file, not symlink
-#   - owner is root (UID 0) or current controller (caller's UID)
+#   - owner is root (UID 0), the current process UID (caller's `id -u`),
+#     or the exported controller UID ($BRIDGE_CONTROLLER_UID, set by the
+#     controller in lib/bridge-agents.sh and propagated to the isolated
+#     agent's env file). This third exemption lets a controller-owned
+#     marker validate from an isolated-agent context (sudo -u <agent>
+#     reads the controller-written marker) without weakening the mode
+#     check below — group/world write bits remain rejected regardless of
+#     owner identity. (#1158)
 #   - mode has no group/world write bits
 #   - content lines match an allowlist of KEY=value assignments
 #   - when BRIDGE_LAYOUT=v2, BRIDGE_DATA_ROOT must be absolute non-empty
@@ -67,10 +74,22 @@ bridge_isolation_v2_marker_validate() {
     return 1
   fi
   if (( owner_uid != 0 )); then
-    local controller_uid
+    local controller_uid exported_controller_uid
     controller_uid="$(id -u 2>/dev/null || true)"
-    if [[ -z "$controller_uid" || "$owner_uid" != "$controller_uid" ]]; then
-      bridge_warn "layout-marker.sh ignored: owner UID $owner_uid is neither root nor current controller"
+    # `printf '%q'` may have wrapped the exported value in quotes
+    # (e.g. when the original UID string contained shell metacharacters,
+    # which won't happen for a numeric UID but the writer side hardens
+    # against future drift). Strip surrounding single/double quotes
+    # defensively so the equality compare against `owner_uid` (raw
+    # numeric bytes from stat) doesn't trip on quoting.
+    exported_controller_uid="${BRIDGE_CONTROLLER_UID:-}"
+    exported_controller_uid="${exported_controller_uid#\'}"
+    exported_controller_uid="${exported_controller_uid%\'}"
+    exported_controller_uid="${exported_controller_uid#\"}"
+    exported_controller_uid="${exported_controller_uid%\"}"
+    if [[ -z "$controller_uid" || "$owner_uid" != "$controller_uid" ]] \
+        && [[ -z "$exported_controller_uid" || "$owner_uid" != "$exported_controller_uid" ]]; then
+      bridge_warn "layout-marker.sh ignored: owner UID $owner_uid is neither root, current process (${controller_uid:-?}), nor exported controller (${exported_controller_uid:-?})"
       return 1
     fi
   fi
