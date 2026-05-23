@@ -234,11 +234,6 @@ def pre_compact_hook_command(bridge_home: Path, python_bin: str) -> str:
     return shell_command(python_bin, shell_path(hook_path))
 
 
-def codex_session_start_hook_command(bridge_home: Path, python_bin: str) -> str:
-    hook_path = bridge_home / "hooks" / "codex-session-start.py"
-    return shell_command(python_bin, shell_path(hook_path))
-
-
 def codex_stop_hook_command(bridge_home: Path, python_bin: str) -> str:
     hook_path = bridge_home / "hooks" / "check-inbox.py"
     return shell_command(python_bin, shell_path(hook_path), "--format", "codex")
@@ -298,6 +293,12 @@ def is_session_stop_hook(command: str) -> bool:
 
 
 def is_session_start_hook(command: str) -> bool:
+    # Recognize both the active rendered spelling (`session-start.py
+    # [--format codex]`) and the legacy `codex-session-start.py` wrapper
+    # spelling so re-rendering an existing install rewrites the command
+    # in place rather than appending a duplicate hook. The wrapper file
+    # itself was removed in #1068 (HOOKS-SSOT); only the predicate match
+    # remains as a migration courtesy.
     command = str(command)
     return "session-start.py" in command or "codex-session-start.py" in command
 
@@ -327,6 +328,12 @@ def is_codex_session_start_hook(command: str) -> bool:
 
 
 def is_codex_stop_hook(command: str) -> bool:
+    # Recognize both the active rendered spelling (`check-inbox.py
+    # --format codex`) and the legacy `codex-stop.py` wrapper spelling
+    # so re-rendering an existing install rewrites the command in place
+    # rather than appending a duplicate hook. The wrapper file itself
+    # was removed in #1068 (HOOKS-SSOT); only the predicate match
+    # remains as a migration courtesy.
     command = str(command)
     return "check-inbox.py" in command or "codex-stop.py" in command
 

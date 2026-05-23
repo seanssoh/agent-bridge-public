@@ -3918,7 +3918,11 @@ assert_contains "$CODEX_LAUNCH_DRY_RUN" "launch=codex -c features.codex_hooks=tr
 # so a roster with only codex_hooks (pre-hotfix default) gets fast_mode
 # auto-injected on next wake; this assertion locks the post-hotfix shape.
 assert_contains "$CODEX_LAUNCH_DRY_RUN" "features.fast_mode=true"
-CODEX_SESSION_START_OUTPUT="$(BRIDGE_AGENT_ID="$SMOKE_AGENT" python3 "$REPO_ROOT/hooks/codex-session-start.py")"
+# #1068 HOOKS-SSOT: the renderer installs the direct `session-start.py
+# --format codex` spelling; the legacy `codex-session-start.py` wrapper
+# was removed. Smoke verifies the direct form satisfies the Codex
+# SessionStart hook contract.
+CODEX_SESSION_START_OUTPUT="$(BRIDGE_AGENT_ID="$SMOKE_AGENT" python3 "$REPO_ROOT/hooks/session-start.py" --format codex)"
 assert_contains "$CODEX_SESSION_START_OUTPUT" "\"hookEventName\": \"SessionStart\""
 assert_contains "$CODEX_SESSION_START_OUTPUT" "agb inbox $SMOKE_AGENT"
 cat >"$CLAUDE_STATIC_WORKDIR/NEXT-SESSION.md" <<'EOF'
@@ -4080,11 +4084,15 @@ CODEX_STOP_TASK_OUTPUT="$(bash "$REPO_ROOT/bridge-task.sh" create --to "$SMOKE_A
 assert_contains "$CODEX_STOP_TASK_OUTPUT" "created task #"
 CODEX_STOP_TASK_ID="$(printf '%s\n' "$CODEX_STOP_TASK_OUTPUT" | sed -n 's/^created task #\([0-9][0-9]*\).*/\1/p' | head -n1)"
 [[ -n "$CODEX_STOP_TASK_ID" ]] || die "expected codex stop task id"
-CODEX_STOP_OUTPUT="$(printf '%s' '{"stop_hook_active": false}' | BRIDGE_AGENT_ID="$SMOKE_AGENT" BRIDGE_HOME="$BRIDGE_HOME" BRIDGE_TASK_DB="$BRIDGE_TASK_DB" python3 "$REPO_ROOT/hooks/codex-stop.py")"
+# #1068 HOOKS-SSOT: the renderer installs the direct `check-inbox.py
+# --format codex` spelling; the legacy `codex-stop.py` wrapper was
+# removed. Smoke verifies the direct form satisfies the Codex Stop hook
+# contract (block on pending queue + empty {} on stop_hook_active).
+CODEX_STOP_OUTPUT="$(printf '%s' '{"stop_hook_active": false}' | BRIDGE_AGENT_ID="$SMOKE_AGENT" BRIDGE_HOME="$BRIDGE_HOME" BRIDGE_TASK_DB="$BRIDGE_TASK_DB" python3 "$REPO_ROOT/hooks/check-inbox.py" --format codex)"
 assert_contains "$CODEX_STOP_OUTPUT" "\"decision\": \"block\""
 assert_contains "$CODEX_STOP_OUTPUT" "agb inbox $SMOKE_AGENT"
 assert_not_contains "$CODEX_STOP_OUTPUT" "\"hookSpecificOutput\""
-CODEX_STOP_ACTIVE_OUTPUT="$(printf '%s' '{"stop_hook_active": true}' | BRIDGE_AGENT_ID="$SMOKE_AGENT" BRIDGE_HOME="$BRIDGE_HOME" BRIDGE_TASK_DB="$BRIDGE_TASK_DB" python3 "$REPO_ROOT/hooks/codex-stop.py")"
+CODEX_STOP_ACTIVE_OUTPUT="$(printf '%s' '{"stop_hook_active": true}' | BRIDGE_AGENT_ID="$SMOKE_AGENT" BRIDGE_HOME="$BRIDGE_HOME" BRIDGE_TASK_DB="$BRIDGE_TASK_DB" python3 "$REPO_ROOT/hooks/check-inbox.py" --format codex)"
 assert_contains "$CODEX_STOP_ACTIVE_OUTPUT" "{}"
 python3 "$REPO_ROOT/bridge-queue.py" done "$CODEX_STOP_TASK_ID" --agent "$SMOKE_AGENT" --note "codex hook smoke cleanup" >/dev/null
 
