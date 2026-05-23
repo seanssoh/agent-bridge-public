@@ -56,6 +56,22 @@ def _is_env_assignment(token: str) -> bool:
     return bool(_ENV_KEY_RE.match(key))
 
 
+_ENV_PREFIX_RE = re.compile(
+    r"""
+    ^\s*
+    (?P<prefix>
+      (?:
+        [A-Za-z_][A-Za-z0-9_]*=
+        (?:"[^"]*"|'[^']*'|[^\s'"]*)
+        \s+
+      )*
+    )
+    (?P<rest>.*)$
+    """,
+    re.VERBOSE,
+)
+
+
 def rewrite(engine_bin: str, original: str) -> str:
     if not engine_bin or not original:
         return original
@@ -64,37 +80,34 @@ def rewrite(engine_bin: str, original: str) -> str:
     # disk between resolution and exec.
     if not engine_bin.startswith("/"):
         return original
+    # r3 (codex task #5732 BLOCKING #2): preserve the env-assignment
+    # prefix VERBATIM from the original input so `KEY=$VAR` /
+    # `PATH=$DIR:$PATH` keep their delayed-expansion semantics. r1 used
+    # shlex.quote on the whole token (broke env-assignment shape); r2
+    # used shlex.quote on the value side (preserved shape but converted
+    # `$VAR` into a literal string). The fixtures at
+    # scripts/smoke-test.sh:4656 / :7026 rely on shell expansion of
+    # `$MCP_RESTART_BIN_DIR` / `$CIRCUIT_CLAUDE_BIN_DIR` at exec time.
+    # Regex-split the env-assignment prefix, shlex only the rest, and
+    # concatenate.
+    match = _ENV_PREFIX_RE.match(original)
+    if not match:
+        return original
+    env_prefix = match.group("prefix")
+    rest = match.group("rest")
     try:
-        tokens = shlex.split(original)
+        tokens = shlex.split(rest)
     except ValueError:
         return original
     if not tokens:
         return original
-    idx = 0
-    while idx < len(tokens) and _is_env_assignment(tokens[idx]):
-        idx += 1
-    if idx >= len(tokens):
-        return original
-    if tokens[idx] not in _ENGINE_TOKENS:
+    if tokens[0] not in _ENGINE_TOKENS:
         # Already absolute, or some non-standard engine override —
         # leave it alone.
         return original
-    tokens[idx] = engine_bin
-    # Re-emit. Env-assignment tokens (KEY=VALUE) must NOT be wrapped in
-    # outer single-quotes — bash interprets `'KEY=VALUE'` as a command
-    # name, not an env-assignment word. Codex r1 (task #5719) caught
-    # this against `PATH=/tmp/custom:$PATH claude ...` fixtures used in
-    # scripts/smoke-test.sh:4656 / :7026. Emit `KEY=<shlex.quote(VALUE)>`
-    # for assignment tokens so the value-side stays safely quoted while
-    # the assignment shape survives.
-    parts: list[str] = []
-    for i, token in enumerate(tokens):
-        if i < idx and _is_env_assignment(token):
-            key, _, value = token.partition("=")
-            parts.append(f"{key}={shlex.quote(value)}")
-        else:
-            parts.append(shlex.quote(token))
-    return " ".join(parts)
+    tokens[0] = engine_bin
+    rewritten_rest = " ".join(shlex.quote(t) for t in tokens)
+    return env_prefix + rewritten_rest
 
 
 def main() -> int:
