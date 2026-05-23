@@ -472,7 +472,13 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
     FORCE_FRESH_SESSION=1
   fi
   if [[ $INSTALL_PROJECT_SKILL -eq 1 ]]; then
-    if ! bridge_bootstrap_project_skill "$ENGINE" "$WORK_DIR"; then
+    # Issue #1155: thread $AGENT (3rd arg) so the v2-isolation guard in
+    # bridge_bootstrap_project_skill can resolve roster os_user. Without
+    # this thread-through, the helper's `bridge_write_managed_markdown`
+    # call would `mkdir -p` / `mv` under the isolated-UID-owned workdir
+    # and surface Permission denied to operator stdout right before the
+    # tmux session dies (the call here is unredirected — see #1155).
+    if ! bridge_bootstrap_project_skill "$ENGINE" "$WORK_DIR" "$AGENT"; then
       bridge_warn "Claude bridge skill bootstrap skipped or conflicted: $WORK_DIR"
     fi
   fi
@@ -522,7 +528,10 @@ elif [[ "$ENGINE" == "codex" && $SAFE_MODE -eq 0 ]]; then
     FORCE_FRESH_SESSION=1
   fi
   if [[ $INSTALL_PROJECT_SKILL -eq 1 ]]; then
-    if ! bridge_bootstrap_project_skill "$ENGINE" "$WORK_DIR"; then
+    # Issue #1155: thread $AGENT (3rd arg) for the v2-isolation guard.
+    # Same rationale as the Claude branch above — unredirected here, so
+    # any controller-side mkdir/mv failure would reach operator stdout.
+    if ! bridge_bootstrap_project_skill "$ENGINE" "$WORK_DIR" "$AGENT"; then
       bridge_warn "Codex bridge skill bootstrap skipped or conflicted: $WORK_DIR"
     fi
   fi

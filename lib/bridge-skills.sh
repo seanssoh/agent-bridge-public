@@ -1207,11 +1207,81 @@ bridge_write_managed_markdown() {
 bridge_bootstrap_project_skill() {
   local engine="$1"
   local workdir="$2"
+  # Issue #1155: optional 3rd arg threads the agent id through so the v2-
+  # isolation guard below can resolve roster `os_user`. Legacy callers
+  # without an agent arg (or call sites where agent context is not
+  # resolvable) keep the empty default → guard silently skips, legacy
+  # behavior unchanged. Mirrors the pattern beta10 used for
+  # `bridge_link_shared_claude_skill` (lib/bridge-skills.sh:108-112).
+  local agent="${3-}"
   local skill_dir skill_file reference_file
   local legacy_skill_dir=""
 
   if ! skill_dir="$(bridge_project_skill_dir_for "$engine" "$workdir")"; then
     return 0
+  fi
+
+  # Issue #1155 r2 — engine-aware v2-isolation policy.
+  #
+  # Why per-engine: r1's blanket DEFER under v2 was engine-agnostic, but
+  # the "workdir-side is dead-code" reasoning only holds for Claude. r1
+  # codex review (BLOCKING 1) confirmed: Codex has no isolated-home
+  # reading path. There is no `CODEX_CONFIG_DIR` analog, no
+  # `bridge_sync_isolated_home_codex_skills`, and the documented
+  # project-local contract (README.md:657, scripts/cli-help/agent-bridge-
+  # usage.txt:231-233) places the Codex skill at
+  # `$workdir/.agents/skills/agent-bridge/SKILL.md`. Codex is launched
+  # from `cd "$WORK_DIR"` (bridge-run.sh:226) and reads the skill from
+  # CWD. The r1 blanket DEFER therefore silently dropped the project
+  # skill for v2 Codex agents.
+  #
+  # Per-engine policy:
+  #   - Claude under v2: workdir-side write IS dead-code. Claude launches
+  #     with `CLAUDE_CONFIG_DIR` pointed at the isolated home's
+  #     `.claude/` (`bridge_run_agent_claude_root`, bridge-run.sh:491-496),
+  #     and the isolated-home skill set is populated by
+  #     `bridge_sync_isolated_home_claude_skills` via
+  #     `bridge_linux_sudo_root`. DEFER (return 0). Mirrors
+  #     `bridge_sync_claude_runtime_skills` always-skip-under-v2
+  #     (lib/bridge-skills.sh:172-175).
+  #   - Codex under v2: workdir IS the read path. Pre-Step-A we DEFER
+  #     (workdir not yet chowned to isolated UID; controller-direct
+  #     mkdir/mv would race the chown). Post-Step-A we SUDO-ESCALATE
+  #     the workdir write — same model as the r3 fix to
+  #     `bridge_ensure_project_claude_guidance`
+  #     (lib/bridge-skills.sh:783-901). Render to controller-owned
+  #     tmpfiles, install via `bridge_linux_sudo_root install`, chown to
+  #     the isolated UID. The write site is the documented contract
+  #     path; not writing it would be a feature gap.
+  #
+  # Legacy non-isolated callers and call sites without resolvable agent
+  # context fall through to the legacy direct-write branch unchanged.
+  local _v2_isolated=0
+  local _v2_os_user=""
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    case "$engine" in
+      claude)
+        return 0  # workdir-side is dead-code under v2; isolated-home path handles it
+        ;;
+      codex)
+        if ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
+          # Step A pending → defer; the next bridge-start fires this again
+          # once the workdir has been chowned to the isolated UID.
+          return 0
+        fi
+        _v2_isolated=1
+        _v2_os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+        if [[ -z "$_v2_os_user" ]]; then
+          bridge_warn "codex project skill: roster os_user empty for '$agent' under v2 isolation; skipping"
+          return 0
+        fi
+        ;;
+      *)
+        return 0
+        ;;
+    esac
   fi
 
   case "$engine" in
@@ -1225,6 +1295,77 @@ bridge_bootstrap_project_skill() {
 
   skill_file="${skill_dir}/SKILL.md"
   reference_file="${skill_dir}/references/bridge-commands.md"
+
+  if (( _v2_isolated == 1 )); then
+    # v2 Codex sudo-escalate path. Render both files to controller-owned
+    # tmpfiles, then install each via the canonical
+    # `bridge_linux_sudo_root install` + chown pattern (same as
+    # `bridge_ensure_project_claude_guidance` r3 staging dance, no
+    # heredoc-stdin → footgun #11 stays off the table). Stage path uses
+    # `$$` to avoid colliding with a concurrent agent restart.
+    local _skill_tmp="" _ref_tmp=""
+    _skill_tmp="$(mktemp)" || {
+      bridge_warn "codex project skill: cannot mktemp for SKILL.md ($agent)"
+      return 0
+    }
+    _ref_tmp="$(mktemp)" || {
+      bridge_warn "codex project skill: cannot mktemp for reference ($agent)"
+      rm -f "$_skill_tmp"
+      return 0
+    }
+    if ! bridge_render_codex_project_skill "$BRIDGE_HOME" >"$_skill_tmp"; then
+      bridge_warn "codex project skill: render failed for $agent"
+      rm -f "$_skill_tmp" "$_ref_tmp"
+      return 0
+    fi
+    if ! bridge_render_project_bridge_reference "$BRIDGE_HOME" >"$_ref_tmp"; then
+      bridge_warn "codex project skill: reference render failed for $agent"
+      rm -f "$_skill_tmp" "$_ref_tmp"
+      return 0
+    fi
+
+    # Ensure the parent skill dir + references subdir exist with isolated
+    # UID ownership before installing the files. `install` does not create
+    # intermediate directories.
+    bridge_linux_sudo_root mkdir -p "${skill_dir}/references" 2>/dev/null || {
+      bridge_warn "codex project skill: sudo mkdir failed for ${skill_dir}/references"
+      rm -f "$_skill_tmp" "$_ref_tmp"
+      return 0
+    }
+    bridge_linux_sudo_root chown -R "$_v2_os_user:$_v2_os_user" "$skill_dir" 2>/dev/null || true
+
+    # Stage each file via a sibling tmp path then atomic mv, mirroring
+    # bridge_ensure_project_claude_guidance r3.
+    local _skill_stage="${skill_file}.bridge-stage.$$"
+    if ! bridge_linux_sudo_root install -m 0644 "$_skill_tmp" "$_skill_stage" 2>/dev/null; then
+      bridge_warn "codex project skill: sudo install (stage) failed for $skill_file"
+      bridge_linux_sudo_root rm -f "$_skill_stage" 2>/dev/null || true
+      rm -f "$_skill_tmp" "$_ref_tmp"
+      return 0
+    fi
+    bridge_linux_sudo_root chown "$_v2_os_user:$_v2_os_user" "$_skill_stage" 2>/dev/null || true
+    if ! bridge_linux_sudo_root mv -f "$_skill_stage" "$skill_file" 2>/dev/null; then
+      bridge_warn "codex project skill: atomic mv failed for $skill_file"
+      bridge_linux_sudo_root rm -f "$_skill_stage" 2>/dev/null || true
+      rm -f "$_skill_tmp" "$_ref_tmp"
+      return 0
+    fi
+
+    local _ref_stage="${reference_file}.bridge-stage.$$"
+    if ! bridge_linux_sudo_root install -m 0644 "$_ref_tmp" "$_ref_stage" 2>/dev/null; then
+      bridge_warn "codex project skill: sudo install (stage) failed for $reference_file"
+      bridge_linux_sudo_root rm -f "$_ref_stage" 2>/dev/null || true
+      rm -f "$_skill_tmp" "$_ref_tmp"
+      return 0
+    fi
+    bridge_linux_sudo_root chown "$_v2_os_user:$_v2_os_user" "$_ref_stage" 2>/dev/null || true
+    if ! bridge_linux_sudo_root mv -f "$_ref_stage" "$reference_file" 2>/dev/null; then
+      bridge_warn "codex project skill: atomic mv failed for $reference_file"
+      bridge_linux_sudo_root rm -f "$_ref_stage" 2>/dev/null || true
+    fi
+    rm -f "$_skill_tmp" "$_ref_tmp"
+    return 0
+  fi
 
   case "$engine" in
     codex)

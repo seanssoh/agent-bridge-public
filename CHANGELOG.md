@@ -6,6 +6,62 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta11] — 2026-05-24
+
+### Highlight — beta10 fix-completion wave (#1155 — third A2A QA cycle)
+
+Operator-cued **eleventh prerelease** — closes the 7th controller-touch
+site that beta10 missed. Third cycle of the A2A-driven
+upstream→fixer→downstream release loop introduced in beta9; the remote
+QA peer's beta10 verification reported 2/4 gates PASS, with a single
+missed helper (`bridge_bootstrap_project_skill`) responsible for the
+remaining failures and for the stdout flood during `agent start`.
+
+Single-PR wave. PR codex pair-reviewed (r1 BLOCKING — engine-agnostic
+skip dropped Codex `.agents/skills` + smoke Claude-only → r2
+implement-ok). Integration r1 implement-ok (task #5956). `-beta11`
+prerelease; matching tag `v0.14.5-beta11`, GitHub release marked
+**Pre-release**.
+
+### Fixed — v2 isolation: `bridge_bootstrap_project_skill` engine-aware guard (#1155)
+
+- **#1155 (PR #1156)** — `bridge_bootstrap_project_skill`
+  (`lib/bridge-skills.sh`) — beta10's 6-site Step-A guard application
+  missed this helper. The function calls `bridge_write_managed_markdown`,
+  which does shell-level `mkdir -p` + `mv` on
+  `$workdir/.claude/skills/agent-bridge/{SKILL.md,references/...}`
+  for Claude or `$workdir/.agents/skills/agent-bridge/...` for Codex.
+  Two of the five call sites (`bridge-start.sh:481`, `:534`) were
+  unredirected, so failures flooded operator stdout during
+  `agent start` even though `agent create` looked clean.
+
+  Engine-aware fix:
+  - **Claude + v2 isolation** → DEFER (the isolated-home replacement
+    path `bridge_sync_isolated_home_claude_skills` already installs
+    skills at `$isolated_home/.claude/skills/`, where v2 Claude reads
+    via `CLAUDE_CONFIG_DIR`)
+  - **Codex + v2 isolation + Step A pending** → DEFER (workdir not
+    yet owned by isolated UID; agent start re-triggers the helper
+    after ownership normalization)
+  - **Codex + v2 isolation + Step A complete** → SUDO-ESCALATE
+    (Codex has no `CODEX_CONFIG_DIR` / isolated-home read path; it
+    reads `.agents/skills/agent-bridge/` from the workdir directly,
+    so the install path is sudo-rendered via `bridge_linux_sudo_root`:
+    mktemp render → `mkdir -p` → `install -m 0644` → `chown` isolated
+    UID → atomic `mv -f`, same race-correct pattern as PR #1153 r3
+    `bridge_ensure_project_claude_guidance`)
+  - **Legacy non-isolated** → unchanged
+
+  Side-fix: `bridge-setup.sh` doctor diagnostic path corrected from
+  `.codex/skills` (nonexistent) to `.agents/skills` (production
+  contract per `bridge_project_skill_dir_for`).
+
+  Two review rounds: r1 BLOCKING ×2 (engine-agnostic skip dropped
+  Codex; smoke Claude-only with wrong production path stub) → r2
+  implement-ok. New smoke `1155-bootstrap-skill-guard.sh` with 6
+  cases covering both engines, Step-A-pending defer, and the
+  sudo-escalate ownership/mode/argv contract.
+
 ## [0.14.5-beta10] — 2026-05-24
 
 ### Highlight — beta9 fix-completion wave (#1151 — second A2A QA cycle)
