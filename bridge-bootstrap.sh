@@ -17,6 +17,9 @@ export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$
 trap 'unset BRIDGE_LAYOUT_RESOLVER_BYPASS BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID' EXIT
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
+# Issue #1058: managed tmux UX defaults for Claude/Codex TUI sessions.
+# shellcheck source=lib/bridge-tmux-ux.sh
+source "$SCRIPT_DIR/lib/bridge-tmux-ux.sh"
 
 usage() {
   cat <<EOF
@@ -27,6 +30,7 @@ Bootstrap options:
   --shell <name>          Shell to integrate (default: current shell basename, fallback zsh)
   --rcfile <path>         Override shell rc file target
   --skip-shell-integration
+  --skip-tmux-ux           Do not write the managed tmux UX block to ~/.tmux.conf
   --skip-daemon
   --skip-launchagent      Do not install/load the macOS LaunchAgent
   --skip-systemd          Do not install/enable the Linux systemd user unit
@@ -47,6 +51,7 @@ bootstrap_shell="${SHELL##*/}"
 bootstrap_shell="${bootstrap_shell:-zsh}"
 bootstrap_rcfile=""
 skip_shell_integration=0
+skip_tmux_ux=0
 skip_daemon=0
 skip_launchagent=0
 skip_systemd=0
@@ -70,6 +75,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-shell-integration)
       skip_shell_integration=1
+      shift
+      ;;
+    --skip-tmux-ux)
+      skip_tmux_ux=1
       shift
       ;;
     --skip-daemon)
@@ -133,6 +142,7 @@ fi
 bridge_require_python
 
 shell_status="skipped"
+tmux_ux_status="skipped"
 daemon_status="skipped"
 launchagent_status="skipped"
 systemd_status="skipped"
@@ -149,6 +159,21 @@ if [[ $skip_shell_integration -eq 0 ]]; then
     [[ -n "$bootstrap_rcfile" ]] && shell_args+=(--rcfile "$bootstrap_rcfile")
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/install-shell-integration.sh" "${shell_args[@]}" >/dev/null
     shell_status="applied"
+  fi
+fi
+
+# Issue #1058: managed tmux UX defaults. Claude/Codex run inside tmux, and a
+# fresh server's stock tmux settings (default-terminal screen, mouse off,
+# escape-time 500) degrade the TUI. bridge_setup_tmux_ux writes an idempotent
+# managed block to ~/.tmux.conf and is non-fatal by contract — it always
+# returns 0, so a tmux/terminfo gap never aborts bootstrap.
+if [[ $skip_tmux_ux -eq 0 ]]; then
+  tmux_ux_status="planned"
+  if [[ $dry_run -eq 0 ]]; then
+    bridge_setup_tmux_ux >&2 || true
+    tmux_ux_status="applied"
+  else
+    bridge_setup_tmux_ux --dry-run >&2 || true
   fi
 fi
 
@@ -265,7 +290,7 @@ if [[ $skip_watchdog_silence -eq 0 ]]; then
 fi
 
 if [[ $json_mode -eq 1 ]]; then
-  python3 - "$init_json" "$shell_status" "$bootstrap_shell" "$bootstrap_rcfile" "$daemon_status" "$launchagent_status" "$systemd_status" "$next_command" "$reload_command" "$liveness_status" "$watchdog_silence_status" <<'PY'
+  python3 - "$init_json" "$shell_status" "$bootstrap_shell" "$bootstrap_rcfile" "$daemon_status" "$launchagent_status" "$systemd_status" "$next_command" "$reload_command" "$liveness_status" "$watchdog_silence_status" "$tmux_ux_status" <<'PY'
 import json
 import sys
 
@@ -283,6 +308,7 @@ payload = {
     "systemd": {"status": sys.argv[7]},
     "liveness": {"status": sys.argv[10]},
     "watchdog_silence": {"status": sys.argv[11]},
+    "tmux_ux": {"status": sys.argv[12]},
     "next_command": sys.argv[8],
     "reload_command": sys.argv[9],
     "handoff_steps": [
@@ -306,6 +332,7 @@ PY
 echo "== Agent Bridge bootstrap =="
 printf 'admin_agent: %s\n' "$admin_agent"
 printf 'shell_integration: %s\n' "$shell_status"
+printf 'tmux_ux: %s\n' "$tmux_ux_status"
 printf 'daemon: %s\n' "$daemon_status"
 printf 'launchagent: %s\n' "$launchagent_status"
 printf 'systemd: %s\n' "$systemd_status"

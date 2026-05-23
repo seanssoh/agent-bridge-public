@@ -38,8 +38,8 @@ bridge-auth.sh	383	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940
 bridge-auth.sh	433	C3	be734a9ab6e1e4554130ae202bee469fb32defc53c8202b83d609506ec2b5942	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-auth.sh	492	C3	06e4a68f62d8ceb22b0b00b37059a905bccba312c6175aa988d10304af6487e6	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-auth.sh	561	C1	df5b170e11ad07c2aaef6c7bffd08a009027f749d05756a1fe426e3eb37be6b9	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
-bridge-bootstrap.sh	268	C3	0bd9af5acad175c98293fdba3547bcaf6c36f948b6ab99b0048c69d37f8ef49d	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-bootstrap.sh	300	C1	651e7839c3b224ee71c7b1becc614957612b81b00a666ad1a0faca905090fc03	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
+bridge-bootstrap.sh	293	C3	7c4dfeb9b916d5d41a5a623c76a0944552b4ded96d4df3438834bc54b28c2e4e	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-bootstrap.sh	326	C1	651e7839c3b224ee71c7b1becc614957612b81b00a666ad1a0faca905090fc03	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
 bridge-bundle.sh	204	C1	552e8aefc9e1f31895071e48d57b3565a72a1cdd8b0d56cdaef1c02184a45e98	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
 bridge-bundle.sh	210	C1	f1f45712a9bcd402065e58e8bc5a9172757ca57130c83d06746b9b2ae440fd42	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
 bridge-bundle.sh	258	C3	6f0f0de39b34583f95ce0bd957987db4c62f2151e97dd99e5d22df148d7b8939	interpreter heredoc, no capture	patch	Phase 3 PR C
