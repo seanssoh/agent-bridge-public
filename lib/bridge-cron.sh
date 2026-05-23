@@ -641,6 +641,19 @@ bridge_cron_run_dir_grant_isolation() {
   if ! bridge_agent_linux_user_isolation_effective "$target_agent" 2>/dev/null; then
     return 0
   fi
+  # Bind the leaf to the target's per-agent group (e.g. ab-agent-<X>) before
+  # chmod 2770. Without this chgrp the leaf inherits the controller primary
+  # group (umask 077 + non-setgid parent), which the isolated UID is not in;
+  # group=2770 would then be useless. The chgrp confines access to
+  # controller + the target's isolated UID — and only them. ab-shared on the
+  # parents lets isolated UIDs TRAVERSE but not read other agents' run dirs.
+  if declare -F bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+    local agent_grp
+    agent_grp="$(bridge_isolation_v2_agent_group_name "$target_agent" 2>/dev/null)" || agent_grp=""
+    if [[ -n "$agent_grp" ]]; then
+      chgrp "$agent_grp" "$run_dir" 2>/dev/null || return 1
+    fi
+  fi
   chmod 2770 "$run_dir" 2>/dev/null || return 1
   if command -v setfacl >/dev/null 2>&1; then
     setfacl -m "default:group::rw-,default:mask::rw-" "$run_dir" 2>/dev/null || true
