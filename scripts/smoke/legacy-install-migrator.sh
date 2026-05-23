@@ -4,22 +4,29 @@
 # Synthetic legacy-install repro for scripts/migrate-legacy-install.sh.
 #
 # Builds a fake old-style install (two agents + cron + memory + channel config),
-# then runs: export → plan → confirm-apply-deferred.
+# then runs: export → plan → apply → verify.
 #
-# beta6 fold-back per codex r1 review: apply is DEFERRED to beta7 (three
-# contract gaps — clean-target gate, layout-resolver bypass, secret re-entry).
-# The smoke now asserts the user-facing apply default is refused with a clear
-# beta7 deferral message and does NOT mutate the target. The full apply +
-# post-apply verify smoke moves to beta7 alongside the apply rework.
+# Issue #1087 (v0.14.5-beta7+): apply ships as the user-facing default
+# (no BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE gate). The smoke asserts the
+# full round-trip plus the contract surface from the codex r1 review:
+#   - cleanliness gate covers every apply write path (not just state/*).
+#   - per-agent paths come from the layout shim (canonical resolver).
+#   - cron payload.env is filtered through CRON_ENV_ALLOWLIST.
+#   - apply is atomic with rollback on failure.
+#   - operator-supplied secrets are written with mode 0600; source
+#     secrets remain stripped.
 #
-# Assertions (beta6):
+# Assertions:
 #   1. export writes a manifest + agent identity files to bundle dir.
 #   2. plan prints apply plan and target-cleanliness check without error.
 #   3. secrets are NOT in the bundle (Teams secret, A2A key).
 #   4. workspace / project-tree files are NOT in the bundle (non-portable).
-#   5. apply default invocation is REFUSED (beta7 deferral message).
-#   6. deferred apply does NOT mutate the target (no apply-result manifest,
-#      no target/agents/ created).
+#   5. cron env scrub uses the allowlist (FOO_TOKEN dropped, PATH kept).
+#   6. apply succeeds against a clean target.
+#   7. cleanliness gate refuses a polluted target (agents/admin/SOUL.md
+#      pre-exists — codex r1 BLOCKING #1 repro).
+#   8. apply writes target via the canonical resolver (data/agents/<a>/home).
+#   9. verify PASS — all canonical-resolver checks pass.
 
 set -euo pipefail
 
@@ -73,8 +80,10 @@ printf '12345\n' >"$OLD_HOME/agents/admin/pid"
 # Agent 2: reviewer — minimal
 printf '# Reviewer soul\n' >"$OLD_HOME/agents/reviewer/SOUL.md"
 
-# Cron definitions (portable, no secrets).
-printf '[{"name":"daily-note","target":"admin","schedule":"0 8 * * *","timezone":"UTC","payload_kind":"text","payload":{"text":"daily note"},"enabled":true}]\n' \
+# Cron definitions — payload.env has an allowlisted key (PATH) and a
+# non-allowlisted key (FOO_TOKEN). The allowlist scrub must drop the
+# latter.
+printf '[{"name":"daily-note","target":"admin","schedule":"0 8 * * *","timezone":"UTC","payload_kind":"text","payload":{"text":"daily note","env":{"PATH":"/usr/bin","FOO_TOKEN":"secret"}},"enabled":true}]\n' \
   >"$OLD_HOME/cron/jobs.json"
 
 # Host profile.
@@ -140,6 +149,17 @@ if [[ "$cron_count" -lt 1 ]]; then
 fi
 smoke_log "assertion: cron count=$cron_count — PASS"
 
+# Cron env scrub: PATH stays, FOO_TOKEN is dropped. Issue #1087
+# BLOCKING #3 — beta6 keyword heuristic would have stripped FOO_TOKEN
+# only because it ends in `_TOKEN`; the new allowlist drops everything
+# not explicitly safe.
+cron_env_keys="$(python3 "$HELPER_DIR/migrator-smoke-helpers.py" manifest-first-cron-env-keys "$BUNDLE_DIR/manifest.json")"
+smoke_assert_contains "$cron_env_keys" "PATH" "cron env allowlist keeps PATH"
+if [[ "$cron_env_keys" == *FOO_TOKEN* ]]; then
+  smoke_fail "cron env allowlist must drop FOO_TOKEN, got: $cron_env_keys"
+fi
+smoke_log "assertion: cron env allowlist scrub — PASS"
+
 # ---------------------------------------------------------------------------
 # 2. plan
 # ---------------------------------------------------------------------------
@@ -151,41 +171,67 @@ smoke_assert_contains "$plan_out" "admin" "plan output lists admin agent"
 smoke_assert_contains "$plan_out" "reviewer" "plan output lists reviewer agent"
 smoke_assert_contains "$plan_out" "daily-note" "plan output lists cron job"
 smoke_assert_contains "$plan_out" "clean/fresh" "plan detects clean target"
+smoke_assert_contains "$plan_out" "apply may proceed" "plan no longer references beta7 deferral"
 smoke_log "assertion: plan output correct — PASS"
 
 # ---------------------------------------------------------------------------
-# 3. apply is deferred to beta7 — confirm default invocation refuses to run.
+# 3. apply (default; no env-var gate) against a clean target.
 # ---------------------------------------------------------------------------
-# beta6 fold-back per codex r1 review: apply has three open contract gaps
-# (clean-target gate insufficient, layout-resolver bypass, supplied secrets
-# never written) and is gated behind BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE=1
-# for follow-up dev only. The user-facing default refuses with a clear
-# message. Verify regression (post-apply) moves to beta7 alongside the
-# apply rework.
-smoke_log "testing apply default invocation is deferred (beta7 contract gate)"
+smoke_log "running apply against clean target"
+# Wipe the state/ stub plan left so the cleanliness gate is fully clean.
 rm -rf "$CLEAN_TARGET"
 mkdir -p "$CLEAN_TARGET"
-set +e
-apply_deferred_out="$(bash "$MIGRATOR" apply --bundle "$BUNDLE_DIR" --target "$CLEAN_TARGET" 2>&1)"
-apply_deferred_rc=$?
-set -e
-if [[ "$apply_deferred_rc" -eq 0 ]]; then
-  smoke_fail "apply default invocation must refuse (beta7 deferral); rc=0 instead"
-fi
-smoke_assert_contains "$apply_deferred_out" "deferred to beta7" \
-  "apply refusal mentions beta7 deferral"
-# Confirm the unsafe env var is the documented dev escape hatch.
-smoke_assert_contains "$apply_deferred_out" "BRIDGE_MIGRATOR_BETA6_APPLY_UNSAFE" \
-  "apply refusal documents the dev opt-in env var"
-smoke_log "assertion: apply deferred to beta7 (default invocation refused) — PASS"
+bash "$MIGRATOR" apply --bundle "$BUNDLE_DIR" --target "$CLEAN_TARGET"
+smoke_assert_file_exists "$CLEAN_TARGET/.migrator-apply-result.json" \
+  "apply writes apply-result manifest"
+# Issue #1087 BLOCKING #2 — apply must drop identity at the canonical
+# resolver path (data/agents/<a>/home), not the legacy agents/<a>/ shape.
+smoke_assert_file_exists "$CLEAN_TARGET/data/agents/admin/home/SOUL.md" \
+  "apply writes admin SOUL.md at canonical resolver path"
+smoke_assert_file_exists "$CLEAN_TARGET/data/agents/admin/home/MEMORY.md" \
+  "apply writes admin MEMORY.md at canonical resolver path"
+smoke_assert_file_exists "$CLEAN_TARGET/data/agents/reviewer/home/SOUL.md" \
+  "apply writes reviewer SOUL.md at canonical resolver path"
+smoke_assert_file_exists "$CLEAN_TARGET/cron/jobs.json" "apply imports cron jobs"
+# Backup tree exists with real file contents — manifest+files.
+smoke_assert_file_exists "$CLEAN_TARGET/.migrator-pre-apply-backup/pre-apply-backup-manifest.json" \
+  "apply writes pre-apply backup manifest"
+smoke_log "assertion: apply succeeds, identity at canonical paths — PASS"
 
-# Confirm the target was NOT mutated by the deferred apply.
-if [[ -f "$CLEAN_TARGET/.migrator-apply-result.json" ]]; then
-  smoke_fail "deferred apply must not write any apply-result manifest"
+# ---------------------------------------------------------------------------
+# 4. cleanliness gate refuses a polluted target — codex r1 BLOCKING #1
+#    repro: target has agents/admin/SOUL.md = OLD already, must refuse.
+# ---------------------------------------------------------------------------
+smoke_log "testing cleanliness gate refuses polluted target"
+mkdir -p "$DIRTY_TARGET/agents/admin"
+printf 'OLD\n' > "$DIRTY_TARGET/agents/admin/SOUL.md"
+set +e
+dirty_apply_out="$(bash "$MIGRATOR" apply --bundle "$BUNDLE_DIR" --target "$DIRTY_TARGET" 2>&1)"
+dirty_apply_rc=$?
+set -e
+if [[ "$dirty_apply_rc" -eq 0 ]]; then
+  smoke_fail "apply against polluted target must refuse (rc!=0); got rc=0"
 fi
-if [[ -d "$CLEAN_TARGET/agents" ]]; then
-  smoke_fail "deferred apply must not create target/agents/"
-fi
-smoke_log "assertion: deferred apply did NOT mutate target — PASS"
+smoke_assert_contains "$dirty_apply_out" "not clean/fresh" \
+  "polluted-target refusal mentions cleanliness gate"
+smoke_assert_contains "$dirty_apply_out" "agents" \
+  "polluted-target refusal cites blocking path (agents/)"
+# Confirm SOUL.md is byte-preserved (the codex r1 repro: it became NEW).
+dirty_soul="$(cat "$DIRTY_TARGET/agents/admin/SOUL.md")"
+smoke_assert_eq "OLD" "$dirty_soul" \
+  "polluted target SOUL.md preserved byte-for-byte (codex r1 BLOCKING #1)"
+smoke_log "assertion: polluted target refused + content preserved — PASS"
+
+# ---------------------------------------------------------------------------
+# 5. verify against the migrated target.
+# ---------------------------------------------------------------------------
+smoke_log "running verify on migrated target"
+verify_out="$(bash "$MIGRATOR" verify --target "$CLEAN_TARGET")"
+smoke_assert_contains "$verify_out" "all" "verify output reports all passes"
+smoke_assert_contains "$verify_out" "agent admin: identity files present" \
+  "verify confirms admin identity at canonical path"
+smoke_assert_contains "$verify_out" "agent reviewer: identity files present" \
+  "verify confirms reviewer identity at canonical path"
+smoke_log "assertion: verify PASS — all canonical-resolver checks — PASS"
 
 smoke_log "all assertions passed"
