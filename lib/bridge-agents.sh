@@ -1103,7 +1103,78 @@ bridge_agent_preserved_env_vars() {
   # re-exports all BRIDGE_* runtime paths inside the bash -c child, so sudo
   # only needs to pass through the terminal/locale bits and the two
   # launch-time markers that are not in ENV_PREFIX.
-  printf '%s' "TERM,LANG,LC_ALL,BRIDGE_AGENT_ENV_FILE,BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS"
+  printf '%s' "TERM,LANG,LC_ALL,BRIDGE_AGENT_ENV_FILE,BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS,BRIDGE_ENGINE_BIN"
+}
+
+# Issue #1118: resolve the engine binary's absolute path on the controller.
+#
+# v2 linux-user isolation runs the agent's launch_cmd under a sudo wrap
+# (`sudo -n -u <service_user> -H -- bash -lc "<cmd>"`). The service user
+# is auto-provisioned and its PATH is sudo's default
+# (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`). The
+# controller's per-user `claude` install (typically `~/.local/bin/claude`
+# from `npm i -g` or the official installer) is not on that PATH, so the
+# `bash -lc "claude ..."` child dies with `claude: command not found`
+# and the daemon reports the opaque `start-command-failed`.
+#
+# This helper resolves the engine binary via `command -v` against the
+# CONTROLLER's PATH (i.e. the PATH inherited by the bridge daemon /
+# `agent-bridge` invocation). Callers propagate the result into the
+# sudo'd child via the `BRIDGE_ENGINE_BIN` env var (added to
+# `bridge_agent_preserved_env_vars` above); `bridge-run.sh` then
+# rewrites the leading bare `claude`/`codex` token in `LAUNCH_CMD` to
+# this absolute path before execution.
+#
+# Returns the absolute path on stdout (rc=0) when resolved; prints
+# nothing and returns rc=1 when the binary is missing from the
+# controller's PATH (caller decides whether to warn or fall through
+# to the legacy bare-name behavior).
+bridge_resolve_engine_binary() {
+  local engine="$1"
+  local resolved=""
+  case "$engine" in
+    claude|codex) : ;;
+    *) return 1 ;;
+  esac
+  resolved="$(command -v "$engine" 2>/dev/null || true)"
+  [[ -n "$resolved" ]] || return 1
+  # `command -v` may return a shell function/alias name on some hosts;
+  # require an absolute path on disk to avoid propagating a token the
+  # service user cannot resolve.
+  [[ "$resolved" == /* && -x "$resolved" ]] || return 1
+  printf '%s' "$resolved"
+}
+
+# Issue #1118: rewrite a launch_cmd so its engine token uses the absolute
+# binary path resolved by bridge_resolve_engine_binary.
+#
+# Accepts the launch_cmd on stdin OR as $1, and the engine binary
+# absolute path as $2. Walks past any leading `KEY=VALUE` env-prefix
+# tokens (matching the regex used by launch-cmd-static-claude-build.py)
+# and replaces the first non-assignment token IFF it equals the bare
+# `claude` or `codex` engine name. Tokens that already look absolute
+# (start with `/`) are left untouched so an operator who pinned a
+# specific binary via `BRIDGE_AGENT_LAUNCH_CMD` retains their override.
+#
+# This is intentionally a Python helper rather than inline shell — the
+# parsing must handle shell-quoted KEY=VALUE prefixes the same way the
+# existing launch-cmd builders do, and the Python `shlex` module is the
+# only parser the rest of bridge-state.sh already trusts for this job
+# (see scripts/python-helpers/launch-cmd-*-build.py).
+bridge_rewrite_launch_cmd_engine_bin() {
+  local launch_cmd="$1"
+  local engine_bin="$2"
+  [[ -n "$launch_cmd" && -n "$engine_bin" ]] || {
+    printf '%s' "$launch_cmd"
+    return 0
+  }
+  bridge_require_python
+  if ! bridge_resolve_script_dir_check; then
+    printf '%s' "$launch_cmd"
+    return 0
+  fi
+  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/launch-cmd-engine-bin-rewrite.py" \
+    "$engine_bin" "$launch_cmd"
 }
 
 bridge_linux_require_setfacl() {
