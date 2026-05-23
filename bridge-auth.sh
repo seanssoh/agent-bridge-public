@@ -252,7 +252,16 @@ bridge_auth_fix_legacy_secret_file_mode() {
         file_mode="0640"
         bridge_auth_run_privileged chown "$(id -un):$group" "$file" || return 1
       else
-        printf '[warn] auth sync: ab-shared group missing for isolated agent %s; file kept 0600\n' "$agent" >&2
+        # Codex r1 BLOCKING: linux-user isolated agent without the
+        # shared group means the install is misconfigured. Returning success
+        # with mode 0600 here would let sync report status=ok while the next
+        # isolated launch fails — `bridge_isolation_v2_load_secret_env`
+        # cannot read the controller-owned 0600 secret env file under the
+        # isolated UID. Hard-fail so `bridge_auth_sync_agents` records the
+        # agent as failed. Shared-mode agents never reach this branch (they
+        # short-circuit on the predicate above), so the M2 fix is preserved.
+        printf '[error] auth sync: %s group missing for isolated agent %s; install misconfigured\n' "$group" "$agent" >&2
+        return 1
       fi
     fi
     # shared-mode agent: same UID as controller — 0600 is correct, no chown needed.
