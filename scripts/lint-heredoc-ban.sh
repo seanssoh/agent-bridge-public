@@ -161,15 +161,22 @@ result="$(printf '%s' "$json" | bash -s -- "$arg" <<'EOF')"
 nested="$(other "$(bar)" | python3 - "$payload" <<'PY')"
 backtick=`python3 - "$payload" <<'PY'`
 echo "doc string with python3 - <<PY embedded" >/dev/null
+# r2 (codex integration review #5818): bare `bash <<TAG` positives —
+# new sub-pattern catches the heredoc-stdin-to-bash shape that earlier
+# slipped past the `bash -s` requirement.
+bash <<PROBE
+bash <<'PROBE'
+out=$(bash <<PROBE)
 echo done
 true
 FIXTURE
 
-  # 18 positives: every non-comment line containing the danger pattern.
-  # Includes broad-match positives — nested $(), backtick wrapper, and the
-  # doc-string literal — to make the broad-match contract explicit.
-  # 5 negatives: 3 comment lines + 2 trailing no-ops.
-  local expected=18
+  # 21 positives: every non-comment line containing the danger pattern.
+  # Includes broad-match positives — nested $(), backtick wrapper, the
+  # doc-string literal, AND three bare `bash <<TAG` positives added in
+  # r2 (codex integration review #5818).
+  # 6 negatives: 4 comment lines + 2 trailing no-ops.
+  local expected=21
   local got
   got="$(count_sites "$fixture")"
 

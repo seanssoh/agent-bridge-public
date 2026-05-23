@@ -210,6 +210,11 @@ RE_INTERP='(^|[^A-Za-z0-9_/.-])(bash|sh|zsh|python3?|perl|ruby|node|awk)[[:space
 RE_CAT_HEREDOC='(^|[^A-Za-z0-9_])cat[[:space:]]*(>[^|<>]*|>>[^|<>]*)?[[:space:]]*<<-?'
 RE_REDIR_OUT='>[[:space:]]*"?[^|<>[:space:]]+"?[[:space:]]*<<-?'
 RE_BASH_S='(^|[^A-Za-z0-9_/.-])bash[[:space:]]+-s([[:space:]]|$)'
+# r2 (codex integration review #5818): bare `bash <<TAG` is the same
+# heredoc-stdin-to-bash-subprocess shape as `bash -s <<TAG`. Earlier
+# the scanner only matched `-s`; this catches the bare form so
+# slipped-through smokes get flagged.
+RE_BASH_BARE_HEREDOC='(^|[^A-Za-z0-9_/.-])bash[[:space:]]+<<-?'
 
 # Is the heredoc operator on this line preceded by `$(` or backtick on
 # the SAME line — i.e. it opens a capture-wrapped heredoc? Cross-line
@@ -343,6 +348,12 @@ classify_line() {
   # Outside capture.
   if [[ "$line" =~ $RE_BASH_S ]] && [[ "$line" =~ $RE_HEREDOC_OP ]]; then
     printf 'C4|bash -s heredoc, no capture\n'
+    return
+  fi
+  # r2 (codex integration review #5818): bare `bash <<TAG` is same C4
+  # bug class as `bash -s <<TAG` — heredoc-stdin to bash subprocess.
+  if [[ "$line" =~ $RE_BASH_BARE_HEREDOC ]]; then
+    printf 'C4|bare bash heredoc, no capture\n'
     return
   fi
   if [[ "$line" =~ $RE_INTERP ]]; then
