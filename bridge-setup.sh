@@ -648,6 +648,16 @@ run_teams() {
   )
 
   bridge_setup_python "${base_args[@]}" "${py_args[@]}"
+  # Issue #1074: the Teams MCP server is a Bun TypeScript plugin invoked
+  # with `bun ... --no-install`, so the bun runtime AND
+  # plugins/teams/node_modules must be provisioned BEFORE the
+  # dev-plugin-cache copies source into the per-agent cache at agent
+  # start. Run the provisioning at channel-setup time (here) — it is
+  # idempotent and honors --dry-run via the passed-through flag. Failure
+  # surfaces a bridge_warn but does not abort setup so the access.json /
+  # runtime config still get recorded; the operator sees the gap and the
+  # documented workaround.
+  bridge_provision_teams_plugin_runtime "$dry_run" || true
   if [[ $dry_run -eq 0 ]]; then
     bridge_setup_add_agent_channel "$agent" "plugin:teams"
     if bridge_setup_ensure_development_channels_launch_flag "$agent"; then
