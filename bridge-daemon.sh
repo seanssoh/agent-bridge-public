@@ -3471,6 +3471,63 @@ nudge_agent_session() {
     return 0
   fi
 
+  # Issue #1106 (beta7 follow-up from PR #1103): re-apply the task-level
+  # age gate immediately before dispatch. The Python daemon-step
+  # eligibility decision in bridge-queue.py::cmd_daemon_step uses
+  # `BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS` to suppress nudges for a
+  # fresh-only queue. The shell live_state recheck above only proves
+  # "the agent has SOMETHING queued right now" — not "the queued set
+  # still passes the age gate". If between the Python step and this
+  # point the aged task that triggered emission was claimed/done while
+  # a fresh queued task remains, the live queue is fresh-only and the
+  # ACTION REQUIRED dispatch is no longer correct.
+  #
+  # Skip-only: on any helper failure (rc/timeout/empty) we fall through
+  # to the prior behavior so this guard cannot regress the existing
+  # dispatch path; the Python step still gates eligibility upstream.
+  # The audit row records the skip reason for operator triage.
+  local redelivery_seconds="${BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS:-60}"
+  if [[ "$redelivery_seconds" =~ ^[0-9]+$ ]] && (( redelivery_seconds > 0 )); then
+    local eligibility_row=""
+    local eligibility_rc=0
+    set +e
+    eligibility_row="$(bridge_with_timeout 15 nudge_eligibility_recheck python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" nudge-eligibility-recheck "$BRIDGE_TASK_DB" "$agent" "$redelivery_seconds" 2>/dev/null)"
+    eligibility_rc=$?
+    set -e
+    if (( eligibility_rc == 0 )) && [[ -n "$eligibility_row" ]]; then
+      # Footgun #11: parse the leading tab-separated field via
+      # parameter expansion instead of `read ... <<<"$row"` to avoid
+      # the `heredoc_write` / here-string deadlock class — see
+      # scripts/lint-heredoc-ban.sh and the broader catalog at
+      # KNOWN_ISSUES.md §26. We only need the count for the dispatch
+      # decision; the eligible-id csv is informational only and is
+      # surfaced via $live_nudge_key on the audit row below.
+      local eligibility_count="${eligibility_row%%$'\t'*}"
+      [[ "$eligibility_count" =~ ^[0-9]+$ ]] || eligibility_count=0
+      if (( eligibility_count <= 0 )); then
+        bridge_audit_log daemon session_nudge_dropped_stale "$agent" \
+          --detail queued_snapshot="$queued" \
+          --detail claimed_snapshot="$claimed" \
+          --detail queued_live="$live_queued" \
+          --detail claimed_live="$live_claimed" \
+          --detail reason=live_recheck_no_eligible_tasks \
+          --detail redelivery_seconds="$redelivery_seconds" \
+          --detail live_nudge_key="${live_nudge_key:-$nudge_key}"
+        daemon_info "skipped stale nudge for ${agent} (live recheck found no age-eligible tasks; live queued=${live_queued}, redelivery=${redelivery_seconds}s)"
+        return 0
+      fi
+    elif (( eligibility_rc == 124 || eligibility_rc == 137 )); then
+      bridge_audit_log daemon daemon_subprocess_timeout "$agent" \
+        --detail call_site=nudge_eligibility_recheck \
+        --detail target_agent="$agent" \
+        --detail timeout_seconds=15 \
+        --detail exit_code="$eligibility_rc" \
+        --detail action=skip_this_tick
+      daemon_warn "nudge eligibility recheck for ${agent} timed out (rc=${eligibility_rc}); skipping nudge this tick"
+      return 0
+    fi
+  fi
+
   # Issue #767: fingerprint-based dedup. The live-state query already returned
   # the comma-separated queued IDs; reuse that as the canonical pending-task
   # set. If the same set was nudged within the redelivery window, suppress —

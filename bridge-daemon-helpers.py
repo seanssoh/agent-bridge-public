@@ -265,6 +265,77 @@ def cmd_nudge_live_state(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_nudge_eligibility_recheck(args: argparse.Namespace) -> int:
+    """Original site: bridge-daemon.sh::nudge_agent_session (issue #1106).
+
+    Issue #1106 (beta7 follow-up from PR #1103): the Python daemon-step
+    nudge candidate emitter applies a task-level age gate against
+    ``BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS``, but the shell-side
+    ``nudge_agent_session`` then re-queries the LIVE queued-id set via
+    ``cmd_nudge_live_state`` to compute ``live_nudge_key`` and decide
+    whether to dispatch. If, between the Python step and the shell
+    fanout, the aged task that made the Python step emit a candidate
+    is claimed/done by another worker AND a fresh queued task remains,
+    the shell currently fires an ACTION REQUIRED nudge for a
+    fresh-only live queue (race window narrower than #1099 but
+    observable).
+
+    This helper re-applies the task-level age gate at shell dispatch
+    time. Output (single row):
+      eligible_count \\t comma_separated_eligible_queued_ids
+
+    ``eligible`` ≡ row in ``tasks`` with status='queued', assigned to
+    the agent, title NOT LIKE '[cron-dispatch]%', AND
+    ``created_ts <= (now - redelivery_seconds)``.
+
+    Contract knob: ``redelivery_seconds <= 0`` disables the gate
+    (preserves pre-#1019 behavior) — every queued id is reported
+    eligible, matching the Python emitter's ``not eligible_queue_ids``
+    short-circuit semantics.
+
+    sqlite errors fall through to a non-zero exit so the bash
+    callsite's ``|| true`` keeps the loop intact; the wrapper applies
+    a 15s timeout with audit-only fallback.
+    """
+    db_path = args.db_path
+    agent = args.agent
+    try:
+        redelivery_seconds = int(args.redelivery_seconds)
+    except (TypeError, ValueError):
+        redelivery_seconds = 0
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    cutoff_ts = now_ts - max(0, redelivery_seconds)
+    with sqlite3.connect(db_path) as conn:
+        if redelivery_seconds > 0:
+            rows = conn.execute(
+                """
+                SELECT id
+                FROM tasks
+                WHERE assigned_to = ?
+                  AND status = 'queued'
+                  AND title NOT LIKE '[cron-dispatch]%'
+                  AND created_ts <= ?
+                ORDER BY id
+                """,
+                (agent, cutoff_ts),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id
+                FROM tasks
+                WHERE assigned_to = ?
+                  AND status = 'queued'
+                  AND title NOT LIKE '[cron-dispatch]%'
+                ORDER BY id
+                """,
+                (agent,),
+            ).fetchall()
+    eligible_ids = [str(row[0]) for row in rows]
+    print(f"{len(eligible_ids)}\t{','.join(eligible_ids)}")
+    return 0
+
+
 def cmd_memory_daily_orphan_scan(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:4840 (process_memory_daily_orphan_sweep).
 
@@ -497,6 +568,18 @@ SUBCOMMANDS = {
             ("agent", "agent id to query"),
         ],
         "Single tab-separated row: queued_count, claimed_count, csv queued ids.",
+    ),
+    "nudge-eligibility-recheck": (
+        cmd_nudge_eligibility_recheck,
+        [
+            ("db_path", "path to the queue sqlite DB"),
+            ("agent", "agent id to query"),
+            (
+                "redelivery_seconds",
+                "task-queued-age threshold (seconds); <=0 disables the gate",
+            ),
+        ],
+        "Single tab-separated row: eligible_count, csv eligible queued ids.",
     ),
     "memory-daily-orphan-scan": (
         cmd_memory_daily_orphan_scan,
