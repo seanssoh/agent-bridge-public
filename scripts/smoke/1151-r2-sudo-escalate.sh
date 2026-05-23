@@ -214,6 +214,12 @@ printf '%s\n' 'WORKDIR="$2"' >>"$T8_DRIVER"
 printf '%s\n' 'export BRIDGE_HOME="$3"' >>"$T8_DRIVER"
 printf '%s\n' 'export BRIDGE_AGENT_HOME_ROOT="$WORKDIR-not-a-real-prefix"' >>"$T8_DRIVER"
 printf '%s\n' 'export BRIDGE_MANAGED_MARKER="agent-bridge-managed"' >>"$T8_DRIVER"
+# r3 (#1151): the v2 sudo-read + render branches now invoke
+# lib/skills-helpers/*.py via file-as-argv; the function under test
+# resolves the helper paths via BRIDGE_SCRIPT_DIR. The unit harness
+# does not run through bridge-lib.sh (where the global is normally
+# set), so export it explicitly to the repo root.
+printf '%s\n' 'export BRIDGE_SCRIPT_DIR="$REPO_ROOT"' >>"$T8_DRIVER"
 printf '%s\n' 'declare -A BRIDGE_AGENT_SKILLS' >>"$T8_DRIVER"
 printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }' >>"$T8_DRIVER"
 printf '%s\n' 'bridge_require_python() { command -v python3 >/dev/null 2>&1; }' >>"$T8_DRIVER"
@@ -252,4 +258,231 @@ grep -Fq "Existing project content." "$T8_CLAUDE_FILE" \
 
 smoke_log "T8 PASS: v2 post-Step-A sudo-escalate write installed guidance block into workdir/CLAUDE.md (no DEFER drop)"
 
-smoke_log "all 4 tests PASS (#1151 r2 sudo-escalate contract)"
+# ---------- T9 — Symlink-CLAUDE.md is REFUSED, target content NOT copied (#1151 r3) ----------
+#
+# Codex r2 BLOCKING. Post-Step-A workdir is owned by isolated UID. An
+# agent that swaps $workdir/CLAUDE.md for a symlink to a root-readable
+# secret can race the controller's sudo read — the previous
+# `bridge_linux_sudo_root cat ...` followed the link and the render
+# materialized the captured secret in the agent's workdir.
+#
+# The fix opens via os.O_NOFOLLOW + stat.S_ISREG; the helper exits
+# with rc=11 on ELOOP / refused open. The caller now warns + bails
+# without proceeding to the install branch.
+#
+# Fixture:
+#   - Workdir whose CLAUDE.md is a symlink to $T9_DIR/secret
+#   - Secret content: a recognizable string the test asserts NEVER
+#     appears in the final CLAUDE.md
+#   - Same stubs as T8 (passthrough sudo, isolation effective,
+#     Step A complete)
+#
+# Assertions:
+#   - The driver runs to completion (no crash; bridge_warn surfaces
+#     in $T9_LOG)
+#   - $T9_WORKDIR/CLAUDE.md is STILL a symlink (helper refused →
+#     no install branch → no atomic mv that would have replaced it)
+#   - The secret content does NOT appear in the workdir CLAUDE.md
+#     contents read via readlink-aware grep (i.e., we read the
+#     symlink target via `cat` because that's what would catch a
+#     "secret leaked into the workdir file" regression)
+#
+# Note on the previous behavior, for clarity: BEFORE the r3 fix, the
+# sudo cat would read the secret into $_src_tmp, the render would
+# splice the bridge guidance block into the secret content, and the
+# atomic mv would replace the symlink with a regular file containing
+# both the guidance block and the secret. The "secret_NEVER" check
+# below would have failed because the workdir CLAUDE.md (now a
+# regular file) would contain the secret.
+
+T9_DIR="$SMOKE_TMP_ROOT/t9"
+mkdir -p "$T9_DIR"
+T9_WORKDIR="$T9_DIR/workdir"
+mkdir -p "$T9_WORKDIR"
+T9_SECRET_FILE="$T9_DIR/secret"
+T9_SECRET_TOKEN="t9-secret-token-must-not-leak-$(date +%s%N 2>/dev/null || echo "$(date +%s)$$")"
+printf '# Pretend-secret\n%s\nMore secret content here.\n' "$T9_SECRET_TOKEN" >"$T9_SECRET_FILE"
+ln -s "$T9_SECRET_FILE" "$T9_WORKDIR/CLAUDE.md"
+[[ -L "$T9_WORKDIR/CLAUDE.md" ]] || smoke_fail "T9 fixture: expected symlink at $T9_WORKDIR/CLAUDE.md but got a regular file"
+
+T9_DRIVER="$T9_DIR/driver.sh"
+T9_LOG="$T9_DIR/log"
+
+# Driver mirrors T8 but the workdir CLAUDE.md is a symlink. The function
+# under test should refuse to read the target and return 0 without
+# writing anything to workdir.
+printf '%s\n' '#!/usr/bin/env bash' >"$T9_DRIVER"
+# shellcheck disable=SC2129  # per-line emit keeps footgun #11 off the table
+printf '%s\n' 'set -uo pipefail' >>"$T9_DRIVER"
+printf '%s\n' 'REPO_ROOT="$1"' >>"$T9_DRIVER"
+printf '%s\n' 'WORKDIR="$2"' >>"$T9_DRIVER"
+printf '%s\n' 'export BRIDGE_HOME="$3"' >>"$T9_DRIVER"
+printf '%s\n' 'export BRIDGE_AGENT_HOME_ROOT="$WORKDIR-not-a-real-prefix"' >>"$T9_DRIVER"
+printf '%s\n' 'export BRIDGE_MANAGED_MARKER="agent-bridge-managed"' >>"$T9_DRIVER"
+printf '%s\n' 'export BRIDGE_SCRIPT_DIR="$REPO_ROOT"' >>"$T9_DRIVER"
+printf '%s\n' 'declare -A BRIDGE_AGENT_SKILLS' >>"$T9_DRIVER"
+printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }' >>"$T9_DRIVER"
+printf '%s\n' 'bridge_require_python() { command -v python3 >/dev/null 2>&1; }' >>"$T9_DRIVER"
+printf '%s\n' 'bridge_path_is_within_root() { echo "0"; }' >>"$T9_DRIVER"
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T9_DRIVER"
+printf '%s\n' 'bridge_agent_workdir_step_a_complete() { return 0; }' >>"$T9_DRIVER"
+printf '%s\n' 'bridge_agent_os_user() { echo "$(id -un)"; }' >>"$T9_DRIVER"
+printf '%s\n' 'bridge_linux_sudo_root() { "$@"; }' >>"$T9_DRIVER"
+printf '%s\n' '# shellcheck disable=SC1090' >>"$T9_DRIVER"
+printf '%s\n' 'source "$REPO_ROOT/lib/bridge-skills.sh"' >>"$T9_DRIVER"
+printf '%s\n' 'bridge_ensure_project_claude_guidance "$WORKDIR" "smoke-agent"' >>"$T9_DRIVER"
+printf '%s\n' 'echo "RC=$?"' >>"$T9_DRIVER"
+chmod +x "$T9_DRIVER"
+
+"$BRIDGE_BASH" "$T9_DRIVER" "$REPO_ROOT" "$T9_WORKDIR" "$T9_DIR/bridge-home" >"$T9_LOG" 2>&1 \
+  || smoke_fail "T9 driver failed: $(tr '\n' '|' <"$T9_LOG" | tail -c 800)"
+
+# The CLAUDE.md path in the workdir should STILL be the original
+# symlink — the helper refused the read so the install branch never
+# ran, no atomic mv replaced the link. (If the bug were unfixed, the
+# symlink would have been replaced by a regular file containing the
+# secret content + the guidance block.)
+if [[ ! -L "$T9_WORKDIR/CLAUDE.md" ]]; then
+  smoke_fail "T9: workdir CLAUDE.md is no longer a symlink — helper followed the link or install branch ran. content: $(head -c 600 "$T9_WORKDIR/CLAUDE.md" 2>/dev/null | tr '\n' '|')"
+fi
+
+# The secret token MUST NOT appear in any controller-side file written
+# under the workdir. (The symlink itself still resolves to the secret;
+# the test is whether the controller copied the secret content into a
+# new regular file in the workdir.)
+# Walk the workdir for regular files and grep them. If the helper kept
+# the symlink in place, there are no regular files under workdir other
+# than what we ourselves created (none in this fixture).
+# Avoid `< <(find ...)` process-substitution (would add an H3 site to
+# lint-heredoc-ban baseline). Spool the find output to a tmpfile and
+# read it line-by-line; symlinks are excluded via `-type f` so the
+# original symlink at workdir/CLAUDE.md is not counted as a regular
+# file even though it resolves to one.
+T9_FIND_OUT="$T9_DIR/find-out"
+find "$T9_WORKDIR" -type f >"$T9_FIND_OUT" 2>/dev/null || true
+T9_LEAK_FOUND=0
+while IFS= read -r candidate; do
+  [[ -n "$candidate" ]] || continue
+  if grep -Fq "$T9_SECRET_TOKEN" "$candidate" 2>/dev/null; then
+    T9_LEAK_FOUND=1
+    smoke_log "T9 LEAK candidate: $candidate"
+  fi
+done <"$T9_FIND_OUT"
+if (( T9_LEAK_FOUND == 1 )); then
+  smoke_fail "T9: secret token leaked into a regular file under workdir — symlink-traversal attack was NOT mitigated"
+fi
+
+# The warn message should also have surfaced so an operator can spot
+# the refusal. We accept either "refused read" (the new helper's
+# wording) or any bridge_warn line mentioning CLAUDE.md to keep the
+# assertion forgiving across minor wording tweaks.
+if ! grep -Eq "(refused read|refused open|not a regular file|symlink or non-regular)" "$T9_LOG"; then
+  smoke_log "T9 note: refusal warn was not surfaced in driver log (informational; not a hard fail)"
+fi
+
+smoke_log "T9 PASS: symlink CLAUDE.md refused; secret target content did NOT leak into workdir (BLOCKING fixed)"
+
+# ---------- T10 — exit-code-2 sentinel is detected (no spurious warn, no install) (#1151 r3) ----------
+#
+# Codex r2 SHOULD-FIX. The render helper exits with rc=2 when the
+# rendered content is byte-identical to the source — "no-op fast path".
+# The previous bash form `if ! python3 ...; then local _py_rc=$?`
+# captured the rc of `!`, not Python — so rc=2 was misread as 0 and
+# the caller proceeded to the install branch with an unwritten dst
+# tmpfile (which the atomic mv then propagated as an empty file). The
+# r3 fix captures the rc via `|| _py_rc=$?` so rc=2 is correctly
+# observed.
+#
+# Fixture:
+#   - workdir/CLAUDE.md already contains the guidance block
+#     (rendered by a prior pass). A second invocation should detect
+#     "no change" and skip the install branch entirely.
+#   - We do not have a clean signal that "install branch did not
+#     run" from inside the unit-style harness, but we can test the
+#     observable: after the second pass, the file is byte-identical
+#     to its pre-call state (mtime check via stat, OR md5 check via
+#     `cksum`).
+#
+# Assertions:
+#   - The driver returns 0.
+#   - The CLAUDE.md content after the second pass is byte-identical
+#     to the content before. (Pre-r3 fix would still write a copy via
+#     the install branch, so even though content matched, mtime and
+#     inode would change.)
+#   - The driver log does NOT contain "python render failed" — the
+#     generic-failure path that the misread rc=2 falls through to.
+
+T10_DIR="$SMOKE_TMP_ROOT/t10"
+mkdir -p "$T10_DIR"
+T10_WORKDIR="$T10_DIR/workdir"
+mkdir -p "$T10_WORKDIR"
+
+# Seed with the SAME content the render helper produces. We do this
+# by running the render helper standalone against an empty src tmp,
+# then dropping the result into the workdir as CLAUDE.md.
+T10_SEED_SRC="$T10_DIR/seed-src"
+T10_SEED_DST="$T10_DIR/seed-dst"
+: >"$T10_SEED_SRC"
+python3 "$REPO_ROOT/lib/skills-helpers/claude-md-render.py" \
+  "$T10_SEED_SRC" "$T10_SEED_DST" \
+  "$T10_DIR/bridge-home" \
+  "<!-- BEGIN AGENT BRIDGE PROJECT GUIDANCE -->" \
+  "<!-- END AGENT BRIDGE PROJECT GUIDANCE -->" \
+  "agent-bridge-managed" \
+  || smoke_fail "T10 seed render failed"
+cp "$T10_SEED_DST" "$T10_WORKDIR/CLAUDE.md"
+
+# Capture pre-call cksum so we can detect ANY rewrite (the bug would
+# rewrite the file via the install branch even though content matched).
+T10_PRE_CKSUM="$(cksum <"$T10_WORKDIR/CLAUDE.md")"
+
+T10_DRIVER="$T10_DIR/driver.sh"
+T10_LOG="$T10_DIR/log"
+
+printf '%s\n' '#!/usr/bin/env bash' >"$T10_DRIVER"
+# shellcheck disable=SC2129  # per-line emit keeps footgun #11 off the table
+printf '%s\n' 'set -uo pipefail' >>"$T10_DRIVER"
+printf '%s\n' 'REPO_ROOT="$1"' >>"$T10_DRIVER"
+printf '%s\n' 'WORKDIR="$2"' >>"$T10_DRIVER"
+printf '%s\n' 'export BRIDGE_HOME="$3"' >>"$T10_DRIVER"
+printf '%s\n' 'export BRIDGE_AGENT_HOME_ROOT="$WORKDIR-not-a-real-prefix"' >>"$T10_DRIVER"
+printf '%s\n' 'export BRIDGE_MANAGED_MARKER="agent-bridge-managed"' >>"$T10_DRIVER"
+printf '%s\n' 'export BRIDGE_SCRIPT_DIR="$REPO_ROOT"' >>"$T10_DRIVER"
+printf '%s\n' 'declare -A BRIDGE_AGENT_SKILLS' >>"$T10_DRIVER"
+printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }' >>"$T10_DRIVER"
+printf '%s\n' 'bridge_require_python() { command -v python3 >/dev/null 2>&1; }' >>"$T10_DRIVER"
+printf '%s\n' 'bridge_path_is_within_root() { echo "0"; }' >>"$T10_DRIVER"
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T10_DRIVER"
+printf '%s\n' 'bridge_agent_workdir_step_a_complete() { return 0; }' >>"$T10_DRIVER"
+printf '%s\n' 'bridge_agent_os_user() { echo "$(id -un)"; }' >>"$T10_DRIVER"
+printf '%s\n' 'bridge_linux_sudo_root() { "$@"; }' >>"$T10_DRIVER"
+printf '%s\n' '# shellcheck disable=SC1090' >>"$T10_DRIVER"
+printf '%s\n' 'source "$REPO_ROOT/lib/bridge-skills.sh"' >>"$T10_DRIVER"
+printf '%s\n' 'bridge_ensure_project_claude_guidance "$WORKDIR" "smoke-agent"' >>"$T10_DRIVER"
+printf '%s\n' 'echo "RC=$?"' >>"$T10_DRIVER"
+chmod +x "$T10_DRIVER"
+
+# Use the same bridge-home seed dir so the rendered block matches.
+"$BRIDGE_BASH" "$T10_DRIVER" "$REPO_ROOT" "$T10_WORKDIR" "$T10_DIR/bridge-home" >"$T10_LOG" 2>&1 \
+  || smoke_fail "T10 driver failed: $(tr '\n' '|' <"$T10_LOG" | tail -c 800)"
+
+# Sentinel detection: caller should have returned 0 via the rc==2
+# branch and skipped the install. The file must be byte-identical to
+# its pre-call state (cksum unchanged). NOTE: this also catches the
+# pre-r3 bug shape where rc=2 was misread as 0 and the install branch
+# ran an empty-dst mv (the post-call file would have been empty).
+T10_POST_CKSUM="$(cksum <"$T10_WORKDIR/CLAUDE.md")"
+if [[ "$T10_PRE_CKSUM" != "$T10_POST_CKSUM" ]]; then
+  smoke_fail "T10: CLAUDE.md was rewritten across the no-op call. pre=$T10_PRE_CKSUM post=$T10_POST_CKSUM — rc=2 sentinel was misread (probably the pre-r3 \`if ! python3 ...; then local _py_rc=\$?\` bug)"
+fi
+
+# The warn path "python render failed" must NOT have fired — that's
+# the symptom of the misread sentinel (rc=2 falling through to the
+# generic-failure branch).
+if grep -Fq "python render failed" "$T10_LOG"; then
+  smoke_fail "T10: 'python render failed' warning surfaced — rc=2 sentinel was misread as generic failure. log: $(tr '\n' '|' <"$T10_LOG" | tail -c 800)"
+fi
+
+smoke_log "T10 PASS: rc=2 sentinel (no-op) detected — no install branch, no spurious warn"
+
+smoke_log "all 6 tests PASS (#1151 r3 symlink-safe sudo read + exit-2 sentinel capture)"

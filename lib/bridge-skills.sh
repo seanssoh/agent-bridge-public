@@ -774,12 +774,12 @@ bridge_ensure_project_claude_guidance() {
     return 0
   fi
   claude_file="$(bridge_project_claude_file "$workdir")"
-  # File-exists probe needs sudo under v2 (workdir owned by isolated UID; the
-  # parent dir mode may be 0700/0750 so the controller may not be able to
-  # stat through). Use sudo test for the v2 branch.
-  if (( _v2_isolated == 1 )); then
-    bridge_linux_sudo_root test -f "$claude_file" 2>/dev/null || return 0
-  else
+  # Legacy non-isolated path keeps the simple [-f] probe. v2 isolation
+  # branches deeper below using a symlink-safe sudo Python helper, so the
+  # bash-level probe is intentionally absent for the v2 path — both the
+  # missing-file fall-through and the symlink-rejection fail-closed paths
+  # are encoded in the helper's exit codes.
+  if (( _v2_isolated == 0 )); then
     [[ -f "$claude_file" ]] || return 0
   fi
 
@@ -787,17 +787,67 @@ bridge_ensure_project_claude_guidance() {
     # v2 sudo-escalate path. Read → transform → write via a controller-side
     # tmpfile pair; only the final install crosses the isolation boundary.
     #
-    # Step 1: sudo-read the current file into a controller-owned tmp.
+    # Issue #1151 r3 (codex BLOCKING): the previous Step-1 used a
+    # ``test -f`` probe followed by ``bridge_linux_sudo_root cat`` redirect.
+    # Both follow symlinks. After Step A the workdir is owned by the
+    # isolated UID, so a cooperating agent can race the controller and
+    # swap ``$workdir/CLAUDE.md`` for a symlink to any path the controller
+    # sudoers entry permits ``cat`` on (typically root-readable). The sudo
+    # cat then reads the secret and the render writes the captured content
+    # into a fresh regular ``CLAUDE.md`` owned by the isolated UID — i.e.,
+    # the agent gains a copy of root-only material at predictable timing.
+    #
+    # The fix opens via ``os.O_RDONLY|O_NOFOLLOW`` and ``fstat`` /
+    # ``S_ISREG`` validates the same descriptor we then read — so there is
+    # no TOCTOU window. The helper signals four distinct conditions via
+    # exit codes (see lib/skills-helpers/claude-md-safe-read.py docstring):
+    #   0  → content streamed to $_src_tmp, proceed
+    #   10 → file does not exist → fresh-render path (empty $_src_tmp is
+    #        already on disk, falls through to the same Step-2 render)
+    #   11 → refused (symlink / permission / other open-time error)
+    #   12 → opened but not a regular file (dir / socket / FIFO / device)
+    # 11 + 12 are unsafe states; we warn + bail rather than escalate.
+    #
+    # The helper is invoked file-as-argv (not heredoc-stdin) to keep
+    # footgun #11 (Bash 5.3.9 ``read_comsub``/``heredoc_write`` deadlock)
+    # off the table even though ``bridge_linux_sudo_root`` does not shell
+    # through ``bash -c`` — this matches the project pattern in
+    # ``lib/upgrade-helpers/`` / ``lib/cron-helpers/`` / ``lib/daemon-helpers/``.
     local _src_tmp=""
     _src_tmp="$(mktemp)" || {
       bridge_warn "project CLAUDE.md guidance: cannot mktemp src copy for '$agent'"
       return 0
     }
-    if ! bridge_linux_sudo_root cat "$claude_file" >"$_src_tmp" 2>/dev/null; then
-      bridge_warn "project CLAUDE.md guidance: sudo-read failed for $claude_file"
+    bridge_require_python
+    local _safe_read_helper="${BRIDGE_SCRIPT_DIR:-}/lib/skills-helpers/claude-md-safe-read.py"
+    if [[ ! -f "$_safe_read_helper" ]]; then
+      bridge_warn "project CLAUDE.md guidance: missing helper $_safe_read_helper"
       rm -f "$_src_tmp"
       return 0
     fi
+    local _read_rc=0
+    bridge_linux_sudo_root python3 "$_safe_read_helper" "$claude_file" >"$_src_tmp" 2>/dev/null \
+      || _read_rc=$?
+    case "$_read_rc" in
+      0)
+        : ;;  # content captured, fall through to Step 2
+      10)
+        # File absent under v2. Mirror the legacy bash-level
+        # `[[ -f "$claude_file" ]] || return 0` short-circuit.
+        rm -f "$_src_tmp"
+        return 0
+        ;;
+      11|12)
+        bridge_warn "project CLAUDE.md guidance: refused read of $claude_file (rc=$_read_rc; symlink or non-regular file). Skipping; clean up workdir/CLAUDE.md and retry."
+        rm -f "$_src_tmp"
+        return 0
+        ;;
+      *)
+        bridge_warn "project CLAUDE.md guidance: sudo-read helper failed for $claude_file (rc=$_read_rc)"
+        rm -f "$_src_tmp"
+        return 0
+        ;;
+    esac
     # Step 2: render the transformed content into a sibling tmp.
     local _dst_tmp=""
     _dst_tmp="$(mktemp)" || {
@@ -805,52 +855,24 @@ bridge_ensure_project_claude_guidance() {
       rm -f "$_src_tmp"
       return 0
     }
-    bridge_require_python
-    if ! python3 - "$_src_tmp" "$_dst_tmp" "$BRIDGE_HOME" \
-        "$(bridge_project_claude_marker_start)" \
-        "$(bridge_project_claude_marker_end)" \
-        "$BRIDGE_MANAGED_MARKER" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-src_tmp = Path(sys.argv[1])
-dst_tmp = Path(sys.argv[2])
-bridge_home = sys.argv[3]
-marker_start = sys.argv[4]
-marker_end = sys.argv[5]
-managed_marker = sys.argv[6]
-
-original = src_tmp.read_text(encoding="utf-8")
-block = f"""{marker_start}
-<!-- {managed_marker} -->
-## Agent Bridge
-- When a task involves bridge coordination, use the `agent-bridge` skill before improvising commands.
-- Do not guess bridge commands. Use `{bridge_home}/agb --help`, `{bridge_home}/agent-bridge --help`, or the local bridge skill reference.
-- Your sender id is your current bridge agent id. Prefer `$BRIDGE_AGENT_ID`; if it is missing, verify the agent from `{bridge_home}/state/active-roster.md`.
-- When you create or hand off work, set `--from "$BRIDGE_AGENT_ID"` when running outside a bridge-managed wrapper.
-- Queue state is source of truth. Use `{bridge_home}/agb inbox|show|claim|done` instead of direct sqlite access.
-- Do not invent subcommands such as `agb send`. If you are unsure, check the bridge skill or CLI help first.
-{marker_end}"""
-
-pattern = re.compile(rf"{re.escape(marker_start)}.*?{re.escape(marker_end)}\n*", re.S)
-normalized = re.sub(pattern, "", original).rstrip()
-
-if normalized.startswith("# "):
-    first, rest = normalized.split("\n", 1) if "\n" in normalized else (normalized, "")
-    updated = f"{first}\n\n{block}\n\n{rest.lstrip()}"
-else:
-    updated = f"{block}\n\n{normalized}\n" if normalized else f"{block}\n"
-
-if updated == original:
-    # No-op — write a sentinel so the bash caller can detect & skip install.
-    sys.exit(2)
-
-dst_tmp.write_text(updated, encoding="utf-8")
-sys.exit(0)
-PY
-    then
-      local _py_rc=$?
+    # Issue #1151 r3 (codex SHOULD-FIX): the previous form
+    # ``if ! python3 ...; then local _py_rc=$?`` captured the rc of ``!``
+    # (always 0), not Python's rc, so ``sys.exit(2)`` ("already current
+    # content, no-op") was silently misread as 0 and the controller
+    # proceeded to the install branch with an unwritten $_dst_tmp.
+    # Capture rc directly via ``|| _py_rc=$?``.
+    local _render_helper="${BRIDGE_SCRIPT_DIR:-}/lib/skills-helpers/claude-md-render.py"
+    if [[ ! -f "$_render_helper" ]]; then
+      bridge_warn "project CLAUDE.md guidance: missing helper $_render_helper"
+      rm -f "$_src_tmp" "$_dst_tmp"
+      return 0
+    fi
+    local _py_rc=0
+    python3 "$_render_helper" "$_src_tmp" "$_dst_tmp" "$BRIDGE_HOME" \
+      "$(bridge_project_claude_marker_start)" \
+      "$(bridge_project_claude_marker_end)" \
+      "$BRIDGE_MANAGED_MARKER" || _py_rc=$?
+    if (( _py_rc != 0 )); then
       rm -f "$_src_tmp" "$_dst_tmp"
       if (( _py_rc == 2 )); then
         return 0  # already-current content → no install needed
