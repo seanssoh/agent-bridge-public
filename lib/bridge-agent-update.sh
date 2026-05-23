@@ -256,6 +256,15 @@ bridge_agent_update_emit_audit() {
   local before_channels="${12:-}"
   local after_channels="${13:-}"
   local actions_json="${14:-[]}"
+  # Issue #1093: optional before/after idle_timeout and loop deltas.
+  # Optional positionals (default empty strings) keep existing callers
+  # working byte-identically — the audit-detail helper emits the new
+  # fields only when at least one value is supplied so old audit-log
+  # parsers stay forward-compatible.
+  local before_idle_timeout="${15:-}"
+  local after_idle_timeout="${16:-}"
+  local before_loop="${17:-}"
+  local after_loop="${18:-}"
 
   bridge_require_python
   # #946 L1 (r2): stale-source guard before either of the two python3
@@ -291,7 +300,11 @@ bridge_agent_update_emit_audit() {
       "$after_launch_cmd" \
       "$before_channels" \
       "$after_channels" \
-      "$actions_json"
+      "$actions_json" \
+      "$before_idle_timeout" \
+      "$after_idle_timeout" \
+      "$before_loop" \
+      "$after_loop"
   )"
 
   python3 "$BRIDGE_SCRIPT_DIR/bridge-audit.py" write \
@@ -322,6 +335,15 @@ bridge_agent_update_emit_json() {
   local before_sha="$8"
   local after_sha="$9"
   local actions_json="${10}"
+  # Issue #1093: optional before/after idle_timeout and loop deltas.
+  # Optional positionals (default empty) so existing callers stay
+  # working; the result helper drops empty deltas from the JSON
+  # envelope so a no-policy-mutation call still produces a byte-stable
+  # output for downstream pipelines.
+  local before_idle_timeout="${11:-}"
+  local after_idle_timeout="${12:-}"
+  local before_loop="${13:-}"
+  local after_loop="${14:-}"
 
   bridge_require_python
   # #946 L1: stale-source guard before the python3 fork.
@@ -338,5 +360,9 @@ bridge_agent_update_emit_json() {
     "$after_channels" \
     "$before_sha" \
     "$after_sha" \
-    "$actions_json"
+    "$actions_json" \
+    "$before_idle_timeout" \
+    "$after_idle_timeout" \
+    "$before_loop" \
+    "$after_loop"
 }

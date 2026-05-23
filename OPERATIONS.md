@@ -480,8 +480,11 @@ listing):
 
 - `create` — scaffold a new static role (agent home + roster block).
 - `update` — typed audited mutation of protected managed-role fields
-  (`--desc`, `--engine`, `--workdir`, `--loop on|off`,
-  `--continue on|off`, `--class user|system`, `--set-launch-cmd`,
+  (`--desc`, `--engine`, `--workdir`, `--loop on|off|yes|no`,
+  `--continue on|off`, `--class user|system`,
+  `--idle-timeout <seconds>` (integer ≥0; `0` = always on, issue #1093),
+  `--always-on yes` (sugar for `--idle-timeout 0`; v1 does not accept
+  `--always-on no`), `--set-launch-cmd`,
   `--launch-cmd-add-env`/`--launch-cmd-remove-env`,
   `--launch-cmd-add-dev-channel`/`--launch-cmd-remove-dev-channel`,
   `--channels-set`/`--channels-add`/`--channels-remove`).

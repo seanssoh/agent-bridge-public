@@ -367,6 +367,106 @@ assert_audit_sha_chain() {
   run_update --launch-cmd-remove-env CHAIN >/dev/null
 }
 
+assert_idle_timeout_flag() {
+  # Issue #1093: --idle-timeout <N> sets BRIDGE_AGENT_IDLE_TIMEOUT["<agent>"]="<N>".
+  # Validate the round-trip on the JSON envelope, on-disk roster line,
+  # and the idempotent re-run. Restore the fixture first so prior
+  # mutation tests don't leak state into these assertions.
+  write_roster_fixture
+
+  local output before_line after_line
+  before_line="$(read_field "BRIDGE_AGENT_IDLE_TIMEOUT" || true)"
+  if [[ -n "$before_line" ]]; then
+    smoke_fail "fixture should not start with BRIDGE_AGENT_IDLE_TIMEOUT line"
+  fi
+
+  output="$(run_update --idle-timeout 300)"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is True, payload
+assert payload["before"]["idle_timeout"] == "0", payload
+assert payload["after"]["idle_timeout"] == "300", payload
+' "$output"
+  after_line="$(read_field "BRIDGE_AGENT_IDLE_TIMEOUT")"
+  smoke_assert_contains "$after_line" '="300"' "roster carries IDLE_TIMEOUT=300"
+
+  # Idempotent re-run: changed=false, sha stable.
+  output="$(run_update --idle-timeout 300)"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is False, payload
+' "$output"
+
+  # Set always-on (idle_timeout=0) via the typed flag.
+  output="$(run_update --idle-timeout 0)"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is True, payload
+assert payload["after"]["idle_timeout"] == "0", payload
+' "$output"
+  after_line="$(read_field "BRIDGE_AGENT_IDLE_TIMEOUT")"
+  smoke_assert_contains "$after_line" '="0"' "roster carries IDLE_TIMEOUT=0 after --idle-timeout 0"
+}
+
+assert_always_on_sugar() {
+  # Issue #1093: --always-on yes is sugar for --idle-timeout 0.
+  # Restore the worker fixture (idle_timeout line dropped) by
+  # rewriting the roster cleanly.
+  write_roster_fixture
+
+  local output after_line
+  output="$(run_update --always-on yes)"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is True, payload
+assert payload["after"]["idle_timeout"] == "0", payload
+' "$output"
+  after_line="$(read_field "BRIDGE_AGENT_IDLE_TIMEOUT")"
+  smoke_assert_contains "$after_line" '="0"' "roster carries IDLE_TIMEOUT=0 after --always-on yes"
+
+  # `--always-on no` is refused in v1 with a clear reason.
+  local rc=0 err_output
+  set +e
+  err_output="$(run_update --always-on no 2>&1)"
+  rc=$?
+  set -e
+  if [[ $rc -eq 0 ]]; then
+    smoke_fail "expected --always-on no to be refused; output=$err_output"
+  fi
+  smoke_assert_contains "$err_output" "v1 에서 지원하지 않습니다" "deny reason mentions v1 contract"
+}
+
+assert_loop_yes_no_alias() {
+  # Issue #1093: --loop accepts yes|no in addition to on|off.
+  write_roster_fixture
+
+  local output after_line
+  output="$(run_update --loop no)"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is True, payload
+assert payload["before"]["loop"] == "1", payload
+assert payload["after"]["loop"] == "0", payload
+' "$output"
+  after_line="$(read_field "BRIDGE_AGENT_LOOP")"
+  smoke_assert_contains "$after_line" '="0"' "roster carries LOOP=0 after --loop no"
+
+  output="$(run_update --loop yes)"
+  python3 -c '
+import json, sys
+payload = json.loads(sys.argv[1])
+assert payload["changed"] is True, payload
+assert payload["after"]["loop"] == "1", payload
+' "$output"
+  after_line="$(read_field "BRIDGE_AGENT_LOOP")"
+  smoke_assert_contains "$after_line" '="1"' "roster carries LOOP=1 after --loop yes"
+}
+
 assert_managed_block_preserved() {
   # The rewritten roster must still carry the BEGIN/END delimiters and
   # the bridge_add_agent_id_if_missing line that bridge_write_role_block
@@ -414,6 +514,9 @@ main() {
   smoke_run "non-admin caller is denied with reason"     assert_caller_validation_denies_non_admin
   smoke_run "audit chain SHA advances + idempotent stays" assert_audit_sha_chain
   smoke_run "managed-role block delimiters/order preserved" assert_managed_block_preserved
+  smoke_run "--idle-timeout sets BRIDGE_AGENT_IDLE_TIMEOUT"  assert_idle_timeout_flag
+  smoke_run "--always-on yes is sugar for idle-timeout 0"    assert_always_on_sugar
+  smoke_run "--loop accepts yes|no aliases"                  assert_loop_yes_no_alias
   smoke_log "passed"
 }
 

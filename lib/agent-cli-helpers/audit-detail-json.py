@@ -24,6 +24,11 @@ strings):
     sys.argv[13] = after_channels
     sys.argv[14] = actions_json (JSON array literal; empty/invalid is
                    coerced to [])
+    sys.argv[15] = before_idle_timeout (issue #1093; optional, empty
+                   when policy was unchanged or caller predates v0.14.5)
+    sys.argv[16] = after_idle_timeout  (issue #1093; optional)
+    sys.argv[17] = before_loop         (issue #1093; optional)
+    sys.argv[18] = after_loop          (issue #1093; optional)
 
 Output: a single JSON object on stdout, matching the wrapper-apply /
 wrapper-deny detail shape that `bridge-config.py:cmd_set` writes for
@@ -65,34 +70,68 @@ _redact = importlib.import_module("launch-cmd-redact")
 
 
 def main() -> int:
-    # 14 payload args + script name == 15.
-    if len(sys.argv) != 15:
+    # 14 payload args (legacy) + 4 optional policy delta args (issue
+    # #1093) + script name. Accept either 15 or 19 argv to keep callers
+    # that predate the policy-delta extension working byte-identically.
+    if len(sys.argv) not in (15, 19):
         print(
             "usage: audit-detail-json.py "
             "<trigger> <actor> <actor_source> <target_agent> <path> "
             "<before_sha> <after_sha> <operation> <reason> "
             "<before_launch_cmd> <after_launch_cmd> "
-            "<before_channels> <after_channels> <actions_json>",
+            "<before_channels> <after_channels> <actions_json> "
+            "[<before_idle_timeout> <after_idle_timeout> "
+            "<before_loop> <after_loop>]",
             file=sys.stderr,
         )
         return 2
 
-    (
-        trigger,
-        actor,
-        actor_source,
-        target_agent,
-        path,
-        before_sha,
-        after_sha,
-        operation,
-        reason,
-        before_launch_cmd,
-        after_launch_cmd,
-        before_channels,
-        after_channels,
-        actions_json,
-    ) = sys.argv[1:]
+    # Issue #1093: accept the legacy 14-arg shape AND the extended 18-arg
+    # shape. The trailing four positionals carry before/after deltas for
+    # idle_timeout + loop. When absent (legacy callers), default to empty
+    # strings and the new audit-detail fields are suppressed below.
+    before_idle_timeout = ""
+    after_idle_timeout = ""
+    before_loop = ""
+    after_loop = ""
+    if len(sys.argv) == 19:
+        (
+            trigger,
+            actor,
+            actor_source,
+            target_agent,
+            path,
+            before_sha,
+            after_sha,
+            operation,
+            reason,
+            before_launch_cmd,
+            after_launch_cmd,
+            before_channels,
+            after_channels,
+            actions_json,
+            before_idle_timeout,
+            after_idle_timeout,
+            before_loop,
+            after_loop,
+        ) = sys.argv[1:]
+    else:
+        (
+            trigger,
+            actor,
+            actor_source,
+            target_agent,
+            path,
+            before_sha,
+            after_sha,
+            operation,
+            reason,
+            before_launch_cmd,
+            after_launch_cmd,
+            before_channels,
+            after_channels,
+            actions_json,
+        ) = sys.argv[1:]
 
     # Issue #1023: redact credential-bearing env values before they
     # land in the audit log. The redaction is value-only — env key
@@ -122,6 +161,16 @@ def main() -> int:
     except (TypeError, ValueError):
         actions = []
     detail["actions"] = _redact.redact_actions(actions)
+    # Issue #1093: surface idle_timeout / loop deltas in the audit detail
+    # when the caller supplied them AND a real change occurred (or at
+    # least one side carries a value). Drop entirely-empty pairs so a
+    # mutation that didn't touch policy stays byte-stable in the log.
+    if before_idle_timeout or after_idle_timeout:
+        detail["before_idle_timeout"] = before_idle_timeout
+        detail["after_idle_timeout"] = after_idle_timeout
+    if before_loop or after_loop:
+        detail["before_loop"] = before_loop
+        detail["after_loop"] = after_loop
 
     print(json.dumps(detail, ensure_ascii=True, sort_keys=True))
     return 0

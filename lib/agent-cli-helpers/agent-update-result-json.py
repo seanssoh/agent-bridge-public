@@ -14,6 +14,10 @@ strings):
     sys.argv[8]  = before_sha
     sys.argv[9]  = after_sha
     sys.argv[10] = actions_json (JSON array literal; empty/invalid -> [])
+    sys.argv[11] = before_idle_timeout (issue #1093; optional)
+    sys.argv[12] = after_idle_timeout  (issue #1093; optional)
+    sys.argv[13] = before_loop         (issue #1093; optional)
+    sys.argv[14] = after_loop          (issue #1093; optional)
 
 Output: a single pretty-printed JSON object on stdout.
 
@@ -46,29 +50,56 @@ _redact = importlib.import_module("launch-cmd-redact")
 
 
 def main() -> int:
-    # 10 payload args + script name == 11.
-    if len(sys.argv) != 11:
+    # 10 payload args (legacy) + 4 optional policy delta args (issue
+    # #1093) + script name. Accept either 11 or 15 argv so legacy
+    # callers that predate the policy-delta extension keep working
+    # byte-identically.
+    if len(sys.argv) not in (11, 15):
         print(
             "usage: agent-update-result-json.py "
             "<agent> <changed> <dry_run> <before_launch_cmd> "
             "<after_launch_cmd> <before_channels> <after_channels> "
-            "<before_sha> <after_sha> <actions_json>",
+            "<before_sha> <after_sha> <actions_json> "
+            "[<before_idle_timeout> <after_idle_timeout> "
+            "<before_loop> <after_loop>]",
             file=sys.stderr,
         )
         return 2
 
-    (
-        agent,
-        changed,
-        dry_run,
-        before_launch_cmd,
-        after_launch_cmd,
-        before_channels,
-        after_channels,
-        before_sha,
-        after_sha,
-        actions_json,
-    ) = sys.argv[1:]
+    before_idle_timeout = ""
+    after_idle_timeout = ""
+    before_loop = ""
+    after_loop = ""
+    if len(sys.argv) == 15:
+        (
+            agent,
+            changed,
+            dry_run,
+            before_launch_cmd,
+            after_launch_cmd,
+            before_channels,
+            after_channels,
+            before_sha,
+            after_sha,
+            actions_json,
+            before_idle_timeout,
+            after_idle_timeout,
+            before_loop,
+            after_loop,
+        ) = sys.argv[1:]
+    else:
+        (
+            agent,
+            changed,
+            dry_run,
+            before_launch_cmd,
+            after_launch_cmd,
+            before_channels,
+            after_channels,
+            before_sha,
+            after_sha,
+            actions_json,
+        ) = sys.argv[1:]
 
     try:
         actions = json.loads(actions_json) if actions_json else []
@@ -91,6 +122,15 @@ def main() -> int:
         "after_sha": after_sha,
         "actions": _redact.redact_actions(actions),
     }
+    # Issue #1093: surface policy deltas under before/after when present.
+    # Drop empty-on-both-sides entries so the envelope stays minimal for
+    # mutations that didn't touch idle_timeout / loop.
+    if before_idle_timeout or after_idle_timeout:
+        payload["before"]["idle_timeout"] = before_idle_timeout
+        payload["after"]["idle_timeout"] = after_idle_timeout
+    if before_loop or after_loop:
+        payload["before"]["loop"] = before_loop
+        payload["after"]["loop"] = after_loop
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
