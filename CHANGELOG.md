@@ -4812,8 +4812,8 @@ v0.6.17; pulling latest `main` is sufficient.
   isolated subprocesses can still benefit from the grant when ACL
   infrastructure is available.
 - Docs: `docs/agent-runtime/memory-daily-harvest.md` §10 rewritten;
-  new `docs/handoff/219-linux-isolation-e2e.md` (Linux server admin
-  patch E2E runbook).
+  added Linux server admin patch E2E runbook (later removed in
+  v0.14.5-beta6 repo cleanup, #1110).
 - Smoke additions: scenario 9 (shared/aggregate path), scenario 14
   (stub isolation + readable `.claude/projects` → `--transcripts-home`
   dispatch, no sudo), scenario 15 (unreadable target → structured

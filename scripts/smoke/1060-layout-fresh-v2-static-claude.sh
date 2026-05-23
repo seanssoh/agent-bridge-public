@@ -79,13 +79,9 @@ write_driver() {
     'SCRIPT_DIR="$REPO_ROOT"' \
     'source "$REPO_ROOT/bridge-lib.sh" >/dev/null 2>&1' \
     'FUNC_TMP="$DRIVER_TMP_DIR/scaffold-funcs.sh"' \
-    '# Line ranges realigned for #1076 (atomic create rollback) — scaffold' \
-    '# moved from 391→502, render_template_string moved from 194→305.' \
-    '{' \
-    '  sed -n "128,131p" "$REPO_ROOT/bridge-agent.sh"' \
-    '  sed -n "305,342p" "$REPO_ROOT/bridge-agent.sh"' \
-    '  sed -n "502,735p" "$REPO_ROOT/bridge-agent.sh"' \
-    '} > "$FUNC_TMP"' \
+    '# Extract by function name (heredoc-aware) so the smoke survives' \
+    '# line shifts in bridge-agent.sh. See scripts/smoke/helpers/extract-shell-fn.py.' \
+    'python3 "$REPO_ROOT/scripts/smoke/helpers/extract-shell-fn.py" "$REPO_ROOT/bridge-agent.sh" bridge_agent_manage_python bridge_render_template_string bridge_scaffold_agent_home > "$FUNC_TMP"' \
     'source "$FUNC_TMP"' \
     'declare -F bridge_scaffold_agent_home >/dev/null 2>&1 || { echo "DRIVER_FAIL: scaffold not loaded"; exit 91; }' \
     'declare -F bridge_layout_agent_home >/dev/null 2>&1 || { echo "DRIVER_FAIL: layout resolver not loaded"; exit 92; }' \

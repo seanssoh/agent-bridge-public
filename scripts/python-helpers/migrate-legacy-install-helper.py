@@ -892,6 +892,12 @@ def cmd_apply(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 def cmd_verify(args: argparse.Namespace) -> int:
+    # beta6 contract: verify is a target-FS inspection helper. It intentionally
+    # does NOT shell out to `bridge_layout_*` resolvers from bridge-lib.sh —
+    # the layout-resolver integration is bundled with `apply` and is deferred
+    # to beta7 (#1087). Verify infers v2-vs-legacy by reading the target's
+    # `state/layout-marker.sh` directly so it can run against any install
+    # without needing the source checkout's bridge-lib.sh sourceable.
     target = Path(args.target).expanduser().resolve()
     repo_root = Path(args.repo_root).expanduser().resolve()
 
