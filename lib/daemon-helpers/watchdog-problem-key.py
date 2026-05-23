@@ -39,6 +39,14 @@ def main() -> int:
             # Age advances every scan; keep heartbeat_present, but exclude the
             # volatile age value so unchanged drift dedupes correctly.
             stable.pop("heartbeat_age_seconds", None)
+            # #1119 r2: drop empty error_kind/error_path on healthy rows so
+            # dedup hashes pre/post-#1119 match for unchanged problems. The
+            # fields stay in the watchdog JSON output (so consumers can read
+            # them when populated); only the dedup signature ignores them
+            # when empty.
+            for empty_field in ("error_kind", "error_path"):
+                if stable.get(empty_field, "") == "":
+                    stable.pop(empty_field, None)
             agents.append(stable)
         else:
             agents.append(item)

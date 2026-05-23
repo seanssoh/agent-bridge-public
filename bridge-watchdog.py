@@ -41,6 +41,20 @@ class AgentWatch:
     # explicitly tags the agent as dynamic.
     engine: str = "claude"
     agent_source: str = ""
+    # #1119: structured fail-soft fields for the scan_error path. Empty
+    # on every healthy row. When the watchdog cannot even reach the
+    # scan target — e.g. a v2-linux-user-isolated workdir whose mode
+    # denies the controller and the host has no passwordless sudo to
+    # the isolated agent user — the per-agent try/except in ``main()``
+    # constructs a ``status="scan_error"`` row with ``error_kind`` set
+    # to a stable token (``permission_denied`` for ``PermissionError``,
+    # ``not_found`` for ``FileNotFoundError``, ``os_error`` otherwise)
+    # and ``error_path`` set to the path that raised. The librarian-
+    # watchdog cron can then route the row to a different escalation
+    # bucket than ``status=error`` drift instead of the whole pass
+    # crashing on one isolated agent.
+    error_kind: str = ""
+    error_path: str = ""
 
 
 def read_text(path: Path) -> str:
@@ -242,6 +256,53 @@ def _registry_ids_from_payload(
     return ids, meta
 
 
+def _isolated_workdir_owner(workdir: Path) -> str | None:
+    """Return the isolated-agent OS user that owns ``workdir``, or ``None``.
+
+    Mirrors ``bridge-hooks.py::_isolated_workdir_owner`` so the watchdog
+    can decide when to escalate to ``sudo -n -u <agent-user>``. Returns
+    ``None`` on non-Linux hosts, when ``lstat`` fails (parent likely
+    also unreadable), when the owner is the controller uid, when the
+    owner does not look like a bridge-provisioned isolated agent
+    (``agent-bridge-<slug>``), or when ``/etc/passwd`` lookup fails.
+    """
+    if sys.platform != "linux":
+        return None
+    try:
+        stat_result = workdir.lstat()
+    except OSError:
+        return None
+    try:
+        import pwd
+        owner = pwd.getpwuid(stat_result.st_uid).pw_name
+    except (KeyError, ImportError):
+        return None
+    if stat_result.st_uid == os.getuid():
+        return None
+    if not owner.startswith("agent-bridge-"):
+        return None
+    return owner
+
+
+def _sudo_test(os_user: str, flag: str, path: Path) -> int | None:
+    """Run ``sudo -n -u <os_user> test <flag> <path>``; return rc or ``None``.
+
+    Returns ``None`` when sudo is unavailable on the host (non-Linux
+    dev box, sudo not in PATH). Callers map ``None`` to "escalation
+    impossible — surface the structured scan_error instead". Mirrors
+    ``bridge-hooks.py::_sudo_run_as``.
+    """
+    try:
+        proc = subprocess.run(
+            ["sudo", "-n", "-u", os_user, "test", flag, str(path)],
+            check=False,
+            capture_output=True,
+        )
+    except FileNotFoundError:
+        return None
+    return proc.returncode
+
+
 def resolve_scan_path(
     agent_name: str,
     default_path: Path,
@@ -284,12 +345,47 @@ def resolve_scan_path(
     the closest signal in that case. The materialize step also runs at
     agent-create time on v2, so an existing v2 agent should always have
     a populated workdir directory; a missing one is genuine drift.
+
+    Issue #1119: on a v2-linux-user-isolated install, the workdir is
+    chowned to ``agent-bridge-<slug>:ab-agent-<slug>`` mode ``0700``
+    (or ``2750`` with setgid + ACLs). Controller-side ``Path.is_dir()``
+    walks every ancestor's ``x`` bit and raises ``PermissionError`` on
+    a workdir whose mode denies the controller — which kills the whole
+    watchdog walk before any agent's row is scanned. Two-stage
+    resolution to avoid that:
+
+      1. Try direct ``is_dir()``. On ``PermissionError``, drop down to
+         step 2 instead of propagating.
+      2. If the workdir's owner looks like an isolated agent account
+         (``agent-bridge-<slug>``) and the host has passwordless
+         ``sudo`` to that user available, shell out to
+         ``sudo -n -u <iso> test -d <workdir>``. ``rc == 0`` means the
+         workdir exists; we return it as the scan path (per-file reads
+         inside ``scan_agent`` will fall through their own sudo-aware
+         helpers / structured error path).
+      3. Otherwise re-raise the ``PermissionError``. The caller wraps
+         the resolve+scan in a per-agent try/except that maps that to
+         a ``status: scan_error`` row, preserving the watchdog's
+         "diagnostic of last resort never crashes" contract.
     """
     workdir_str = registry_meta.get(agent_name, {}).get("workdir", "")
     if workdir_str:
         candidate = Path(workdir_str).expanduser()
-        if candidate.is_dir():
-            return candidate
+        try:
+            if candidate.is_dir():
+                return candidate
+        except PermissionError:
+            # #1119: the controller can't peek into a v2-isolated
+            # workdir. Try a sudo-helper probe before giving up — if
+            # the workdir does exist, scanning it (and surfacing the
+            # per-file reads as structured errors) is more useful than
+            # silently falling back to the empty tracked-tree default.
+            os_user = _isolated_workdir_owner(candidate)
+            if os_user is not None:
+                rc = _sudo_test(os_user, "-d", candidate)
+                if rc == 0:
+                    return candidate
+            raise
     return default_path
 
 
@@ -502,25 +598,41 @@ def scan_agent(
             engine=engine or "claude",
             agent_source=agent_source,
         )
-    except (PermissionError, FileNotFoundError) as exc:
+    except (PermissionError, FileNotFoundError, OSError) as exc:
+        # #1119 r2: even when the outer `resolve_scan_path` sudo probe
+        # succeeded, the inner file reads above can still raise (the
+        # sudo probe only checked `test -d`, not per-file `read`).
+        # Emit the structured `scan_error` row in that case too so the
+        # contract holds end-to-end on Linux hosts where the controller
+        # has sudo for `test -d` but not the named-pipe access the
+        # actual reads need.
+        if isinstance(exc, PermissionError):
+            error_kind = "permission_denied"
+        elif isinstance(exc, FileNotFoundError):
+            error_kind = "not_found"
+        else:
+            error_kind = "os_error"
+        error_path = getattr(exc, "filename", None) or str(agent_dir)
         print(
-            f"[bridge-watchdog] skipped {resolved_name}: "
+            f"[bridge-watchdog] {resolved_name}: "
             f"{type(exc).__name__} during scan ({exc.strerror or exc}); "
-            f"likely isolated agent unreadable to controller",
+            f"path={error_path}",
             file=sys.stderr,
         )
         return AgentWatch(
             agent=resolved_name,
             session_type="unknown",
             onboarding_state="unknown",
-            status="warn",
+            status="scan_error",
             missing_files=[],
-            broken_links=[f"permission denied during scan: {type(exc).__name__}"],
+            broken_links=[],
             missing_managed_claude_block=False,
             heartbeat_present=False,
             heartbeat_age_seconds=None,
             engine=engine or "claude",
             agent_source=agent_source,
+            error_kind=error_kind,
+            error_path=str(error_path),
         )
 
 
@@ -572,6 +684,13 @@ def render_markdown(
             lines.extend(f"  - {entry}" for entry in item.broken_links)
         if item.missing_managed_claude_block:
             lines.append("- missing_managed_claude_block: yes")
+        # #1119: surface the scan_error fields directly under the agent
+        # block so a markdown report (the shape `shared/watchdog/latest.md`
+        # feeds the operator) names what went wrong and which path raised.
+        if item.error_kind:
+            lines.append(f"- error_kind: {item.error_kind}")
+        if item.error_path:
+            lines.append(f"- error_path: {item.error_path}")
         if item.status == "ok":
             lines.append("- issues: none")
         lines.append("")
@@ -639,15 +758,78 @@ def main() -> int:
     # `missing_files`). The agent name is threaded through `scan_agent`
     # explicitly so the `agent` field stays the registry id, not the
     # basename of the resolved workdir path (which is "workdir" on v2).
-    records = [
-        scan_agent(
-            resolve_scan_path(path.name, path, registry_meta),
-            engine=(registry_meta.get(path.name, {}).get("engine") or "claude"),
-            agent_source=registry_meta.get(path.name, {}).get("agent_source", ""),
-            agent_name=path.name,
-        )
-        for path in scan_paths
-    ]
+    #
+    # #1119: wrap the per-agent resolve+scan in a try/except so a single
+    # ``PermissionError`` from a v2-linux-user-isolated workdir does not
+    # kill the whole pass. The watchdog is the diagnostic of last resort
+    # — when the librarian-watchdog cron tick or an operator-typed
+    # ``watchdog scan`` hits one unreadable workdir, every *other*
+    # agent's row must still appear. Build a structured ``scan_error``
+    # row for the unreachable agent and continue. ``scan_agent`` itself
+    # already wraps the inside-the-workdir reads, but the outer
+    # resolve_scan_path → list_dir bootstrap can raise before
+    # ``scan_agent`` is even invoked (the original #1119 crash site at
+    # ``resolve_scan_path``'s ``candidate.is_dir()``), and a future
+    # caller of either helper outside ``scan_agent``'s try/except would
+    # re-introduce the same crash class — the outer guard closes both.
+    records: list[AgentWatch] = []
+    for path in scan_paths:
+        agent_name = path.name
+        agent_meta = registry_meta.get(agent_name, {})
+        engine = agent_meta.get("engine") or "claude"
+        agent_source = agent_meta.get("agent_source", "")
+        try:
+            target = resolve_scan_path(agent_name, path, registry_meta)
+            records.append(
+                scan_agent(
+                    target,
+                    engine=engine,
+                    agent_source=agent_source,
+                    agent_name=agent_name,
+                )
+            )
+        except (PermissionError, FileNotFoundError, OSError) as exc:
+            # Structured fail-soft row. ``error_kind`` is a stable token
+            # the librarian-watchdog cron and downstream alert rules can
+            # branch on without parsing the human-readable summary.
+            # ``error_path`` is the path that raised (when the exception
+            # carries one) so the operator can find which workdir is
+            # unreachable. Order matters: PermissionError and
+            # FileNotFoundError are subclasses of OSError, so they must
+            # be matched first.
+            if isinstance(exc, PermissionError):
+                error_kind = "permission_denied"
+            elif isinstance(exc, FileNotFoundError):
+                error_kind = "not_found"
+            else:
+                error_kind = "os_error"
+            error_path = getattr(exc, "filename", "") or ""
+            if not error_path:
+                workdir_str = agent_meta.get("workdir", "")
+                error_path = workdir_str or str(path)
+            print(
+                f"[bridge-watchdog] {agent_name}: scan_error "
+                f"({error_kind}, path={error_path!r}); continuing with "
+                f"the rest of the roster (#1119)",
+                file=sys.stderr,
+            )
+            records.append(
+                AgentWatch(
+                    agent=agent_name,
+                    session_type="unknown",
+                    onboarding_state="unknown",
+                    status="scan_error",
+                    missing_files=[],
+                    broken_links=[],
+                    missing_managed_claude_block=False,
+                    heartbeat_present=False,
+                    heartbeat_age_seconds=None,
+                    engine=engine,
+                    agent_source=agent_source,
+                    error_kind=error_kind,
+                    error_path=error_path,
+                )
+            )
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
         "bridge_home": str(bridge_home),
