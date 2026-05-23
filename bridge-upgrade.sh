@@ -1372,6 +1372,25 @@ if [[ $DRY_RUN -eq 0 || -z "$TARGET_VERSION" ]]; then
   TARGET_HEAD="$SOURCE_HEAD"
 fi
 
+# Issue #1144: capture the pre-apply VERSION (the installed version we are
+# upgrading FROM) before apply-live swaps the live VERSION file. The
+# post-upgrade [upgrade-complete] task body downstream (line ~2210) reads
+# ${INSTALLED_VERSION} for its `from_version:` field and for the
+# OPERATOR_ACTIONS_PENDING `applies_when_upgrading_from` lookup. The
+# variable was previously only assigned inside the --check branch, so
+# the normal apply path always rendered `from_version: unknown`.
+#
+# Prefer the live VERSION file at TARGET_ROOT (source of truth for the
+# currently-installed code); fall back to bridge_upgrade_installed_field
+# (state/upgrade/last-upgrade.json) when the VERSION file is missing or
+# zero-length on legacy installs.
+if [[ -z "${INSTALLED_VERSION:-}" ]]; then
+  INSTALLED_VERSION="$(bridge_upgrade_version_from_file "$TARGET_ROOT")"
+  if [[ -z "$INSTALLED_VERSION" || "$INSTALLED_VERSION" == "0.0.0-dev" ]]; then
+    INSTALLED_VERSION="$(bridge_upgrade_installed_field "$TARGET_ROOT" version)"
+  fi
+fi
+
 if [[ $RESTART_DAEMON -eq 0 && $RESTART_AGENTS_EXPLICIT -eq 0 ]]; then
   RESTART_AGENTS=0
 fi
@@ -2386,8 +2405,15 @@ POST_EOF
     # Persist the task body in state/ so the recovery command the
     # WARN block prints is actually rerunnable. Tempfiles vanish on
     # exit and leave the operator with guidance instead of a command
-    # that would copy-paste into "no such file". The persistent copy
-    # is deleted only on successful task create.
+    # that would copy-paste into "no such file".
+    #
+    # Issue #1144: keep the persistent copy on disk even on successful
+    # task creation. `bridge-queue.py` stores the body_file path in the
+    # task row's `body_path` column verbatim (paths under bridge-managed
+    # roots are NOT relocated to state/queue/bodies/ by stabilize_body_file).
+    # The admin runbook and `agb show <id>` both surface `body_file:` for
+    # the consumer to open — deleting the file post-create regresses that
+    # path to ENOENT (the issue #1144 symptom).
     _post_body_persist_dir="$TARGET_ROOT/state/bridge-upgrade/post-task"
     mkdir -p "$_post_body_persist_dir"
     _post_body_persist="$_post_body_persist_dir/upgrade-complete-$(date -u +%Y%m%dT%H%M%SZ).md"
@@ -2397,9 +2423,13 @@ POST_EOF
         --to "$_post_admin" --priority normal --from "$_post_admin" \
         --title "[upgrade-complete] Agent Bridge $SOURCE_VERSION — run bootstrap" \
         --body-file "$_post_body_persist" >"$_post_task_log" 2>&1; then
-      # Task created successfully — queue kept a durable copy of the
-      # body; the persist file in state/ is redundant.
-      rm -f "$_post_body_persist"
+      # Task created successfully — the persistent body file remains on
+      # disk so the task row's body_path reference is openable by the
+      # admin runbook and by `agb show <id>` consumers. The queue row
+      # additionally carries an inline copy of the body text for fast
+      # access, but the file-on-disk contract is what the post-upgrade
+      # body_file path advertises (issue #1144).
+      :
     else
       # Surface failure on stderr so the operator sees it on upgrade.
       # A silent `|| true` here was the R9 reliability gap — the
