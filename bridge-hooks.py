@@ -131,6 +131,21 @@ def managed_claude_settings_defaults(
         "autoCompactWindow": resolve_managed_autocompact_window(launch_cmd, agent_class),
         "promptSuggestionEnabled": False,
     }
+    # Issue #1073: bridge-managed Claude agents launch with
+    # `--dangerously-skip-permissions`. On a fresh per-agent `CLAUDE_CONFIG_DIR`
+    # the CLI displays a one-shot "Bypass Permissions mode" warning picker that
+    # blocks the tmux session, which `bridge-run.sh`'s foreground-detect kills
+    # and relaunches → infinite restart loop. `skipDangerousModePermissionPrompt`
+    # = True in settings.json is Claude's documented opt-out. Setting it as a
+    # managed default (rather than relying on operator-run `auth claude-token
+    # sync`) ensures the prompt is suppressed on the very first launch of a
+    # fresh channel agent — admin agents reusing the controller's already-
+    # onboarded `~/.claude` never hit this, so it was only caught when the
+    # first per-agent-config Claude agent (a Teams channel agent) was created.
+    # Operator overlay (`settings.local.json`) still wins via the
+    # `managed < base < overlay < preserved` merge order.
+    if launch_cmd and "--dangerously-skip-permissions" in launch_cmd:
+        defaults["skipDangerousModePermissionPrompt"] = True
     plugin_settings = agent_bridge_development_plugin_settings(launch_cmd)
     if plugin_settings:
         defaults = merge_settings(defaults, plugin_settings)
