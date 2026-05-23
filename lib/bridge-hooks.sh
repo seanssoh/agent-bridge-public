@@ -168,6 +168,7 @@ bridge_link_claude_settings_to_shared() {
   local agent_claude_config_dir=""
   local agent_claude_home=""
   local agent_effective_file=""
+  local _wd_owner=""
   if [[ -n "$agent" ]]; then
     effective_file="$(bridge_hook_per_agent_settings_effective_file "$agent")"
     # Issue #593: source class drives the managed autoCompactWindow default
@@ -189,6 +190,65 @@ bridge_link_claude_settings_to_shared() {
     --effective-settings-file "$effective_file" \
     --launch-cmd "$launch_cmd" \
     --agent-class "$agent_class" >/dev/null
+  # Issue #1145: defer `cmd_link_shared_settings` under v2 isolation when the
+  # workdir hasn't been normalized yet by
+  # `bridge_linux_prepare_agent_isolation` (Step A). Step B (this controller-
+  # side hook, running as awfmanager) cannot `mkdir` into the isolated tree —
+  # it would race Step A and create the leaf with the wrong ownership
+  # (`awfmanager:awfmanager 0755` under an `agent-bridge-<a>:` workdir),
+  # cascading into PermissionErrors on every subsequent round. Agent start
+  # re-triggers this hook after Step A has materialized the tree, so the
+  # deferral here is correct (NOT permanently skipped). Guarded on `agent`
+  # being set so legacy callers (no agent arg → no v2 semantics) keep their
+  # current behavior.
+  #
+  # r2 (codex BLOCKING): Step-A completion is detected by workdir OWNERSHIP,
+  # not by existence. The default v2 fresh-create flow scaffolds workdir as
+  # the controller user (`_scaffold_v2_sibling` in `bridge-agent.sh:550-557`,
+  # pre-created at `:664-670` / `:675-678`) BEFORE
+  # `bridge_linux_prepare_agent_isolation` runs at `bridge-agent.sh:3277`. So
+  # at this hook site (which fires via the roster-reload path through
+  # `bridge_ensure_claude_shared_settings_for_managed_workdir` at `:3273`)
+  # the workdir directory already exists but ownership has NOT yet flipped
+  # to the agent's resolved OS user. The pre-r2 existence-only guard
+  # therefore did NOT fire in the canonical production shape — the race
+  # remained.
+  #
+  # r3 (codex BLOCKING): the prefix glob `agent-bridge-*` is both too loose
+  # AND too tight. False-positive: any workdir owned by some other
+  # `agent-bridge-<other>` user (e.g. a sibling agent's tree mounted into
+  # view) matches the prefix and is treated as Step-A-complete for THIS
+  # agent. False-negative: `bridge-agent.sh:111-113` documents `--os-user
+  # <user>` as a supported linux-user isolation option, parsed at
+  # `bridge-agent.sh:2791-2794` and retained for linux-user mode at
+  # `:3000-3001` / `:3036-3050`; Step A chowns the v2 subdirs to that exact
+  # value at `lib/bridge-agents.sh:3766-3770` and `:3802`. A valid agent
+  # created with `--os-user svc-foo` would be normalized to owner `svc-foo`
+  # by Step A, but the prefix glob would never match → defer forever.
+  #
+  # Fix: cross-check workdir ownership against `bridge_agent_os_user
+  # "$agent"` (the roster source of truth — the same value Step A passes to
+  # chown). Both fail-closed conditions: empty `_wd_owner` (stat unable to
+  # read), empty `_expected_owner` (roster lookup failed), or mismatch →
+  # defer. `stat -c %U` is GNU/Linux; `stat -f %Su` is BSD/macOS; the
+  # chained fallback keeps the guard portable. v2 isolation is Linux-only
+  # in practice, but this hook runs on every platform, so we still defend
+  # against missing `stat` flavors.
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    local _expected_owner=""
+    _wd_owner=""
+    if [[ -d "$workdir" ]]; then
+      _wd_owner="$(stat -c %U "$workdir" 2>/dev/null || stat -f %Su "$workdir" 2>/dev/null || true)"
+    fi
+    if command -v bridge_agent_os_user >/dev/null 2>&1; then
+      _expected_owner="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    fi
+    if [[ -z "$_wd_owner" || -z "$_expected_owner" || "$_wd_owner" != "$_expected_owner" ]]; then
+      return 0
+    fi
+  fi
   bridge_hooks_python link-shared-settings --workdir "$workdir" --shared-settings-file "$effective_file"
 
   # v2 non-isolated agents launch Claude with CLAUDE_CONFIG_DIR under
