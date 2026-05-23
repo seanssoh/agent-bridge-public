@@ -267,6 +267,30 @@ bridge_ensure_memory_precompact_hook() {
   if [[ -z "$workdir" || ! -f "$settings" ]]; then
     return 0
   fi
+  # Issue #1151 (DEFER policy): under v2 isolation Claude launches with
+  # CLAUDE_CONFIG_DIR pointed at the isolated home's `.claude/` (see
+  # `bridge_run_agent_claude_root` at bridge-run.sh:491-496), not at the
+  # workdir's `.claude/`. The PreCompact hook is rendered into the
+  # isolated-home settings tree by the shared-settings linker
+  # (`bridge_link_claude_settings_to_shared` already guards via the same
+  # helper). Calling bridge-hooks.py against `$workdir/.claude/settings.json`
+  # as the controller would either no-op (file under controller-write but
+  # Claude doesn't read it under v2) or trip Permission denied if the
+  # workdir tree is owned by the isolated UID. Defer cleanly — the
+  # isolated-home rendering path handles the load-bearing case.
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
+    return 0
+  fi
+  # Post-Step-A v2 isolated path: same reasoning — settings the controller
+  # writes here are not what Claude reads at launch under v2.
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    return 0
+  fi
   local python_bin
   python_bin="${BRIDGE_PYTHON_BIN:-$(command -v python3 || echo /usr/bin/python3)}"
   if ! "$python_bin" "$SCRIPT_DIR/bridge-hooks.py" status-pre-compact-hook \
@@ -387,6 +411,20 @@ bridge_ensure_auto_memory_isolation() {
     return 0
   fi
   if [[ ! -d "$workdir" ]]; then
+    return 0
+  fi
+
+  # Issue #1151 (DEFER policy): controller-direct `mkdir -p "$workdir/.claude"`
+  # races `bridge_linux_prepare_agent_isolation` (Step A) under v2 isolation.
+  # When Step A has already chowned the workdir to the isolated UID, this
+  # mkdir fails with Permission denied. Auto-memory will re-trigger on the
+  # first claude session start AFTER Step A completes, so deferring loses
+  # no data — the hook is idempotent and the next bridge_ensure_auto_memory_
+  # isolation call will land cleanly with the isolated tree already owned
+  # by the agent. See `lib/bridge-agents.sh::bridge_agent_workdir_step_a_complete`.
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
     return 0
   fi
 
@@ -3190,7 +3228,9 @@ report and reap test-fixture agents per their pattern."
       fi
     fi
     if [[ "$engine" == "claude" ]]; then
-      bridge_ensure_project_claude_guidance "$workdir" >/dev/null 2>&1 || true
+      # Issue #1151: thread $agent so the v2-isolation guard polarity fix
+      # in bridge_ensure_project_claude_guidance can resolve roster os_user.
+      bridge_ensure_project_claude_guidance "$workdir" "$agent" >/dev/null 2>&1 || true
       bridge_ensure_auto_memory_isolation "$agent" "$workdir"
     fi
     bridge_bootstrap_project_skill "$engine" "$workdir" >/dev/null 2>&1 || true

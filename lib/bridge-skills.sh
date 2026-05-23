@@ -105,10 +105,26 @@ PY
 bridge_link_shared_claude_skill() {
   local workdir="$1"
   local skill_name="$2"
+  # Issue #1151: optional 3rd arg threads the agent id through so the v2-
+  # isolation Step-A defer guard below can resolve roster `os_user`. Legacy
+  # callers (`bridge_bootstrap_claude_shared_skills` without an agent arg)
+  # keep the empty default → guard silently skips, behavior unchanged.
+  local agent="${3-}"
   local source_dir=""
   local link_dir=""
 
   [[ "$(bridge_path_is_within_root "$workdir" "$BRIDGE_AGENT_HOME_ROOT")" == "1" ]] || return 0
+
+  # Issue #1151 (DEFER policy): controller-direct `mkdir` / `symlink` into
+  # the isolated workdir tree races Step A under v2 isolation. Skill links
+  # re-trigger on the next agent start (the bootstrap path re-fires once
+  # the workdir has been normalized), so deferring loses no data.
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
+    return 0
+  fi
 
   source_dir="$(bridge_shared_claude_skill_source_dir "$skill_name")"
   [[ -d "$source_dir" ]] || return 0
@@ -131,6 +147,33 @@ bridge_sync_claude_runtime_skills() {
   local configured_skill=""
 
   [[ "$(bridge_path_is_within_root "$workdir" "$BRIDGE_AGENT_HOME_ROOT")" == "1" ]] || return 0
+
+  # Issue #1151 (DEFER policy): controller-direct mkdir / rm / symlink under
+  # `$workdir/.claude/skills/` races Step A under v2 isolation. Under v2,
+  # Claude launches with CLAUDE_CONFIG_DIR pointed at the isolated home's
+  # `.claude/` (see `bridge_run_agent_claude_root` in bridge-run.sh:491-496),
+  # not at `$workdir/.claude/`. The isolated home's skill set is populated
+  # separately by `bridge_sync_isolated_home_claude_skills` (line 234 in
+  # `bridge_bootstrap_claude_shared_skills`) using `bridge_linux_sudo_root`
+  # — that path is load-bearing for v2. The workdir-side skills directory
+  # this function writes is the legacy non-isolated path; for v2 agents it
+  # is dead-code under the runtime engine wiring. Deferring here keeps the
+  # legacy non-isolated behavior intact while preventing the controller
+  # mkdir/rm Permission denied flood under v2.
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
+    return 0
+  fi
+  # Even when Step A is complete, v2 isolation means controller cannot write
+  # under the isolated workdir. Defer to the isolated-home sync path (already
+  # invoked by bridge_bootstrap_claude_shared_skills at line ~234) which
+  # handles the load-bearing case via bridge_linux_sudo_root.
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    return 0
+  fi
+
   skills_dir="$workdir/.claude/skills"
   mkdir -p "$skills_dir"
 
@@ -191,16 +234,20 @@ bridge_bootstrap_claude_shared_skills() {
     workdir="$1"
   fi
 
-  bridge_link_shared_claude_skill "$workdir" "agent-bridge-runtime"
-  bridge_link_shared_claude_skill "$workdir" "cron-manager"
-  bridge_link_shared_claude_skill "$workdir" "memory-wiki"
+  # Issue #1151: thread `$agent` through so the helper can resolve the v2
+  # isolation Step-A defer guard from the roster `os_user`. When agent is
+  # empty (legacy single-arg caller), the guard short-circuits and behavior
+  # is unchanged.
+  bridge_link_shared_claude_skill "$workdir" "agent-bridge-runtime" "$agent"
+  bridge_link_shared_claude_skill "$workdir" "cron-manager" "$agent"
+  bridge_link_shared_claude_skill "$workdir" "memory-wiki" "$agent"
   # v0.8.6: wave-orchestration is the shared parallel-PR-ship pattern
   # (issue-fixer dispatch into worktrees, codex-rescue review, squash-
   # merge with structured notes). Distribute to every Agent Bridge agent
   # so admin / dynamic / static agents all share the same orchestration
   # spine — operators do not need to copy the skill into per-agent
   # `.claude/skills/` manually.
-  bridge_link_shared_claude_skill "$workdir" "wave-orchestration"
+  bridge_link_shared_claude_skill "$workdir" "wave-orchestration" "$agent"
 
   if [[ -n "$agent" ]]; then
     bridge_sync_claude_runtime_skills "$agent" "$workdir"
@@ -546,8 +593,44 @@ bridge_project_claude_guidance_needed() {
 
 bridge_ensure_project_claude_guidance() {
   local workdir="$1"
+  # Issue #1151: optional 2nd arg threads the agent id through so the v2-
+  # isolation guard polarity below can resolve roster `os_user`. Legacy
+  # single-arg callers keep the empty default → the legacy
+  # `BRIDGE_AGENT_HOME_ROOT` opt-out path applies as before.
+  local agent="${2-}"
   local claude_file=""
 
+  # Issue #1151 (FIX GUARD POLARITY): for v2 linux-user isolated agents the
+  # workdir lives under `$BRIDGE_AGENT_ROOT_V2/<agent>/workdir`, which in the
+  # default layout collapses to the same directory as `$BRIDGE_AGENT_HOME_ROOT`
+  # (both default to `$BRIDGE_HOME/agents`). The legacy opt-out branch below
+  # therefore caught the v2 isolated workdir AND the legacy non-isolated
+  # agent-home shape with the same gate, blanketing v2 agents out of the
+  # project-CLAUDE.md guidance write. For v2 isolated agents the workdir IS
+  # the project workspace (operator's project files materialize there), so
+  # the guidance write is desired — but the workdir is owned by the isolated
+  # UID so a controller-direct write would fail with Permission denied.
+  #
+  # Policy: invert the legacy opt-out for v2 isolated agents; defer when
+  # Step A is pending; when Step A is complete, the workdir is owned by the
+  # isolated UID and the controller-direct python write would fail. Defer
+  # in that case too — the agent picks up the guidance through its own
+  # isolated-side rendering path on next start. (A sudo-escalate write
+  # variant is a future hardening; the defer is correct-by-default and
+  # preserves legacy non-isolated behavior unchanged.)
+  if [[ -n "$agent" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    if ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
+      return 0  # Step A pending → defer
+    fi
+    # Step A complete under v2 → workdir owned by isolated UID; controller
+    # cannot write directly. Defer for this controller-side helper.
+    return 0
+  fi
+
+  # Legacy non-isolated path: opt out when workdir is the agent's own home
+  # (the agent-home CLAUDE.md is owned by a different scaffold).
   if [[ "$(bridge_path_is_within_root "$workdir" "$BRIDGE_AGENT_HOME_ROOT")" == "1" ]]; then
     return 0
   fi
