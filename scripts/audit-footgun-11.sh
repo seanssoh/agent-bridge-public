@@ -318,9 +318,21 @@ classify_line() {
     return
   fi
   # r3 (codex #5830): if ONLY the bare-bash-heredoc pattern matched,
-  # classify directly as C4 and return — the line otherwise lacks the
-  # RE_HEREDOC_OP signal that other arms expect.
+  # classify and return — the line otherwise lacks the RE_HEREDOC_OP
+  # signal that other arms expect.
+  # r6 (codex #5838): capture-aware classification. Use C1 when this
+  # line opens inside a `$(...)` capture (either same-line or carried
+  # from a prior open) — same shape as the normal in_capture_line
+  # detection but inlined here because RE_HEREDOC_OP didn't match.
   if (( has_heredoc_op == 0 && has_herestring == 0 && has_procsub == 0 && has_bare_bash_heredoc == 1 )); then
+    if (( entry_capture == 1 )); then
+      printf 'C1|bare bash heredoc in capture (cross-line)\n'
+      return
+    fi
+    if in_capture_line "$line"; then
+      printf 'C1|bare bash heredoc in capture\n'
+      return
+    fi
     printf 'C4|bare bash heredoc, no capture\n'
     return
   fi
