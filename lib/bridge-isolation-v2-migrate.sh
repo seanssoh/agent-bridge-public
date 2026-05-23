@@ -928,11 +928,17 @@ bridge_isolation_v2_migrate_normalize_layout() {
     # siblings. Direct chmod (no recursion) to avoid clobbering
     # state/agents/<X>/ — those leaves get their own per-agent matrix
     # apply below.
+    # #1161 r2: mode 0711 (was 0710) so isolated UIDs that are NOT
+    # members of `ab-shared` can traverse INTO state/ to reach the
+    # layout marker at state/layout-marker.sh. ab-shared group grant
+    # remains the primary path; `others --x` is the fallback for hosts
+    # where group membership did not survive (the #1161 premise).
+    # Matches the matrix row in lib/bridge-isolation-v2.sh state-root.
     _bridge_isolation_v2_run_root_or_sudo chgrp "$shared_grp" "$data_root/state" 2>/dev/null || true
-    _bridge_isolation_v2_run_root_or_sudo chmod 0710 "$data_root/state" 2>/dev/null || true
+    _bridge_isolation_v2_run_root_or_sudo chmod 0711 "$data_root/state" 2>/dev/null || true
     if [[ -d "$data_root/state/agents" ]]; then
       _bridge_isolation_v2_run_root_or_sudo chgrp "$shared_grp" "$data_root/state/agents" 2>/dev/null || true
-      _bridge_isolation_v2_run_root_or_sudo chmod 0710 "$data_root/state/agents" 2>/dev/null || true
+      _bridge_isolation_v2_run_root_or_sudo chmod 0711 "$data_root/state/agents" 2>/dev/null || true
     fi
     # state/runtime/ stays controller-only (daemon config lives there).
     if [[ -d "$data_root/state/runtime" ]]; then
@@ -1359,8 +1365,17 @@ bridge_isolation_v2_migrate_marker_write() {
   marker_path="$(bridge_isolation_v2_marker_path)"
 
   bridge_isolation_v2_migrate_mkstate
-  install -d -m 0750 "$(dirname "$marker_path")" 2>/dev/null \
+  # #1161 r2: parent dir gets mode 0711 so isolated UIDs that are NOT
+  # members of `ab-shared` can still traverse INTO the marker dir and
+  # `open()` the marker file by name. 0750 made the marker file's mode
+  # 0644 grant irrelevant — POSIX traversal fails at the parent before
+  # the file mode is consulted. 0711 = owner rwx, group --x, others --x;
+  # dir contents are NOT listable (no +r for non-owner), only the
+  # specific marker file is reachable by full path. Trade-off accepted:
+  # operator can `ls` as owner; isolated UIDs do `cat <marker>` by name.
+  install -d -m 0711 "$(dirname "$marker_path")" 2>/dev/null \
     || mkdir -p "$(dirname "$marker_path")"
+  chmod 0711 "$(dirname "$marker_path")" 2>/dev/null || true
 
   local tmp="${marker_path}.tmp.$$"
   {
@@ -1368,25 +1383,25 @@ bridge_isolation_v2_migrate_marker_write() {
     printf 'BRIDGE_DATA_ROOT=%s\n' "$(printf %q "$data_root")"
   } > "$tmp"
 
-  chmod 0640 "$tmp" || { rm -f "$tmp"; bridge_die "marker chmod failed"; }
+  chmod 0644 "$tmp" || { rm -f "$tmp"; bridge_die "marker chmod failed"; }
   mv -f "$tmp" "$marker_path" || bridge_die "marker mv failed"
 
-  # Issue #864 R1: chown marker to `root:<shared-group>` mode 0640 so the
-  # validator (lib/bridge-marker-bootstrap.sh:69-75) accepts it under any
-  # caller UID. The validator short-circuits owner_uid==0 unconditionally;
-  # without root ownership, `bridge-run.sh` running under `sudo -u
-  # agent-bridge-<name>` sees the marker as owned by the controller UID
-  # (e.g. 1000) which is neither root nor the running isolated UID, falls
-  # back to `markerless(existing-install)`, and dies. `ab-shared` is the
-  # broader group every isolated agent + the controller already join via
-  # `bridge_isolation_v2_groups_apply`. Best-effort: a rootless dev tree
-  # where the caller can't sudo just leaves marker as caller-owned, which
-  # is also a valid validator state (owner_uid == current controller UID
-  # is the second short-circuit branch). The migrator never runs as a
-  # third party.
+  # Issue #864 R1 / #1161: chown marker to `root:<shared-group>` mode 0644
+  # so the validator (lib/bridge-marker-bootstrap.sh:69-75) accepts it
+  # under any caller UID *and* every isolated UID can read it. The
+  # validator's mode check rejects only group/world WRITE bits
+  # (mode_int & 0022), not READ — 0644 stays valid against the existing
+  # gate. Prior 0640 required `ab-shared` group membership to read; in
+  # practice isolated UIDs were not reliably joined to `ab-shared` on
+  # real installs (#1161), so the marker became unreadable from the
+  # isolated agent's `sudo -u` context and the resolver fell back to
+  # `markerless(existing-install)` and died. Marker content is non-secret
+  # (BRIDGE_LAYOUT=v2 + BRIDGE_DATA_ROOT=<abs-path>); broadening to
+  # world-read removes the membership dependency without weakening the
+  # write-gate that protects v2 activation integrity.
   local _r1_shared_grp="${BRIDGE_SHARED_GROUP:-ab-shared}"
   _bridge_isolation_v2_run_root_or_sudo chown "root:${_r1_shared_grp}" "$marker_path" >/dev/null 2>&1 || true
-  _bridge_isolation_v2_run_root_or_sudo chmod 0640 "$marker_path" >/dev/null 2>&1 || true
+  _bridge_isolation_v2_run_root_or_sudo chmod 0644 "$marker_path" >/dev/null 2>&1 || true
 
   if ! bridge_isolation_v2_marker_validate "$marker_path"; then
     rm -f "$marker_path"
@@ -1425,8 +1440,12 @@ bridge_isolation_v2_migrate_marker_write_minimal() {
   marker_path="$(bridge_isolation_v2_marker_path)"
 
   bridge_isolation_v2_migrate_mkstate
-  install -d -m 0750 "$(dirname "$marker_path")" 2>/dev/null \
+  # #1161 r2: same parent-dir traversal grant as marker_write — 0711 so
+  # isolated UIDs without `ab-shared` membership can reach the marker
+  # file by name. See full rationale on the sibling site above.
+  install -d -m 0711 "$(dirname "$marker_path")" 2>/dev/null \
     || mkdir -p "$(dirname "$marker_path")"
+  chmod 0711 "$(dirname "$marker_path")" 2>/dev/null || true
 
   local tmp="${marker_path}.tmp.$$"
   {
@@ -1434,7 +1453,7 @@ bridge_isolation_v2_migrate_marker_write_minimal() {
     printf 'BRIDGE_DATA_ROOT=%s\n' "$(printf %q "$data_root")"
   } > "$tmp" || { rm -f "$tmp"; bridge_warn "marker_write_minimal: write to $tmp failed"; return 1; }
 
-  chmod 0640 "$tmp" || { rm -f "$tmp"; bridge_warn "marker_write_minimal: chmod failed"; return 1; }
+  chmod 0644 "$tmp" || { rm -f "$tmp"; bridge_warn "marker_write_minimal: chmod failed"; return 1; }
   mv -f "$tmp" "$marker_path" || { bridge_warn "marker_write_minimal: mv to $marker_path failed"; return 1; }
 
   if ! bridge_isolation_v2_marker_validate "$marker_path"; then
