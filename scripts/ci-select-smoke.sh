@@ -611,7 +611,13 @@ select_for_path() {
       # only-migrated agents. Pull its regression smoke whenever the
       # upgrade entry moves so the dual-tree gap that #1108/#1109
       # exposed stays closed.
-      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill
+      # Issue #1144: bridge-upgrade.sh captures the pre-apply VERSION
+      # into INSTALLED_VERSION (previously assigned only in --check),
+      # and keeps the post-task body_file on disk after a successful
+      # task create. Pull the regression smoke whenever the upgrade
+      # entry moves so neither of those two beta8 regressions can
+      # recur.
+      add_required upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision telegram-relay-residue-cleanup upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering upgrade-isolated-agent-migrate 864-upgrade-perm-regressions cleanup-payload-empty-stdin-872 isolation-v2-marker-only-migrate 1067-codex-provisioning 1113-watchdog-legacy-backfill 1144-upgrade-complete-task
       add_integration integration-minimal
       ;;
 
