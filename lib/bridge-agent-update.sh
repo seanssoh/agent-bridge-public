@@ -352,6 +352,12 @@ bridge_agent_update_emit_audit() {
   local after_idle_timeout="${16:-}"
   local before_loop="${17:-}"
   local after_loop="${18:-}"
+  # Issue #1136: optional operator-declared direction
+  # (`always_on_yes` / `always_on_no` / empty). Threaded to the
+  # audit-detail helper verbatim — the field is omitted from the audit
+  # log row when empty so bare `--idle-timeout <N>` mutations stay
+  # byte-stable.
+  local expressed_intent="${19:-}"
 
   bridge_require_python
   # #946 L1 (r2): stale-source guard before either of the two python3
@@ -391,7 +397,8 @@ bridge_agent_update_emit_audit() {
       "$before_idle_timeout" \
       "$after_idle_timeout" \
       "$before_loop" \
-      "$after_loop"
+      "$after_loop" \
+      "$expressed_intent"
   )"
 
   python3 "$BRIDGE_SCRIPT_DIR/bridge-audit.py" write \
@@ -431,6 +438,13 @@ bridge_agent_update_emit_json() {
   local after_idle_timeout="${12:-}"
   local before_loop="${13:-}"
   local after_loop="${14:-}"
+  # Issue #1136: optional operator-declared direction
+  # (`always_on_yes` / `always_on_no` / empty). Surfaced as
+  # `expressed_intent` on the JSON envelope so pipelines that
+  # post-process `agent update --json` (typically the wave-orchestration
+  # apply / dry-run dispatcher) can identify policy-flip events without
+  # joining against the audit log.
+  local expressed_intent="${15:-}"
 
   bridge_require_python
   # #946 L1: stale-source guard before the python3 fork.
@@ -451,5 +465,6 @@ bridge_agent_update_emit_json() {
     "$before_idle_timeout" \
     "$after_idle_timeout" \
     "$before_loop" \
-    "$after_loop"
+    "$after_loop" \
+    "$expressed_intent"
 }

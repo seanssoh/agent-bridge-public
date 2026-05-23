@@ -18,6 +18,10 @@ strings):
     sys.argv[12] = after_idle_timeout  (issue #1093; optional)
     sys.argv[13] = before_loop         (issue #1093; optional)
     sys.argv[14] = after_loop          (issue #1093; optional)
+    sys.argv[15] = expressed_intent    (issue #1136; optional. One of
+                   "always_on_yes" / "always_on_no" when the operator
+                   passed `--always-on yes|no`. Empty otherwise — the
+                   field is omitted from the envelope in that case.)
 
 Output: a single pretty-printed JSON object on stdout.
 
@@ -51,17 +55,17 @@ _redact = importlib.import_module("launch-cmd-redact")
 
 def main() -> int:
     # 10 payload args (legacy) + 4 optional policy delta args (issue
-    # #1093) + script name. Accept either 11 or 15 argv so legacy
-    # callers that predate the policy-delta extension keep working
-    # byte-identically.
-    if len(sys.argv) not in (11, 15):
+    # #1093) + 1 optional expressed_intent arg (issue #1136) + script
+    # name. Accept 11 / 15 / 16 argv so callers that predate each
+    # extension keep working byte-identically.
+    if len(sys.argv) not in (11, 15, 16):
         print(
             "usage: agent-update-result-json.py "
             "<agent> <changed> <dry_run> <before_launch_cmd> "
             "<after_launch_cmd> <before_channels> <after_channels> "
             "<before_sha> <after_sha> <actions_json> "
             "[<before_idle_timeout> <after_idle_timeout> "
-            "<before_loop> <after_loop>]",
+            "<before_loop> <after_loop> [<expressed_intent>]]",
             file=sys.stderr,
         )
         return 2
@@ -70,7 +74,26 @@ def main() -> int:
     after_idle_timeout = ""
     before_loop = ""
     after_loop = ""
-    if len(sys.argv) == 15:
+    expressed_intent = ""
+    if len(sys.argv) == 16:
+        (
+            agent,
+            changed,
+            dry_run,
+            before_launch_cmd,
+            after_launch_cmd,
+            before_channels,
+            after_channels,
+            before_sha,
+            after_sha,
+            actions_json,
+            before_idle_timeout,
+            after_idle_timeout,
+            before_loop,
+            after_loop,
+            expressed_intent,
+        ) = sys.argv[1:]
+    elif len(sys.argv) == 15:
         (
             agent,
             changed,
@@ -131,6 +154,13 @@ def main() -> int:
     if before_loop or after_loop:
         payload["before"]["loop"] = before_loop
         payload["after"]["loop"] = after_loop
+    # Issue #1136: surface the operator-declared direction. Top-level
+    # `expressed_intent` (not nested under before/after) because it
+    # reflects what the operator passed on this invocation, not a value
+    # transition on the agent. Omitted entirely when empty so callers
+    # that didn't use `--always-on yes|no` see a byte-stable envelope.
+    if expressed_intent:
+        payload["expressed_intent"] = expressed_intent
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 

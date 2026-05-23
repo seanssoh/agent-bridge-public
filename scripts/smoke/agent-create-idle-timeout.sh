@@ -127,6 +127,13 @@ assert_idle_timeout_validation() {
 }
 
 assert_always_on_no_refused() {
+  # Issue #1136: `--always-on no` is now accepted on `agent add` when
+  # paired with `--idle-timeout <positive>`. The legacy v1 deny string
+  # ("v1 에서 지원하지 않습니다") was retired with PR #1136 — the bare
+  # `--always-on no` (no co-flag) shape now rejects with the English
+  # contract string below. The new symmetric path is covered end-to-end
+  # by scripts/smoke/1136-always-on-no.sh; this smoke continues to pin
+  # the "missing co-flag" rejection surface.
   reset_runtime
   local rc=0 out
   set +e
@@ -134,9 +141,11 @@ assert_always_on_no_refused() {
   rc=$?
   set -e
   if [[ $rc -eq 0 ]]; then
-    smoke_fail "expected --always-on no to be refused; output=$out"
+    smoke_fail "expected --always-on no without --idle-timeout to be refused; output=$out"
   fi
-  smoke_assert_contains "$out" "v1 에서 지원하지 않습니다" "v1 contract surfaces in reject reason"
+  smoke_assert_contains "$out" \
+    "--always-on no requires --idle-timeout <seconds> (positive integer)" \
+    "missing-coflag contract surfaces in reject reason"
 }
 
 assert_create_json_carries_policy() {
@@ -163,7 +172,7 @@ main() {
   smoke_run "--loop no persists LOOP=0"                            assert_loop_no_persists_zero
   smoke_run "--loop yes persists LOOP=1"                           assert_loop_yes_persists_one
   smoke_run "--idle-timeout rejects non-integer values"            assert_idle_timeout_validation
-  smoke_run "--always-on no is refused in v1"                      assert_always_on_no_refused
+  smoke_run "--always-on no without --idle-timeout is refused"     assert_always_on_no_refused
   smoke_run "--json envelope carries policy { idle_timeout, loop }" assert_create_json_carries_policy
   smoke_log "passed"
 }

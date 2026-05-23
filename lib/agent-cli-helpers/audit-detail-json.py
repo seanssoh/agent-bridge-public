@@ -29,6 +29,15 @@ strings):
     sys.argv[16] = after_idle_timeout  (issue #1093; optional)
     sys.argv[17] = before_loop         (issue #1093; optional)
     sys.argv[18] = after_loop          (issue #1093; optional)
+    sys.argv[19] = expressed_intent    (issue #1136; optional. One of
+                   "always_on_yes" / "always_on_no" when the operator
+                   passed `--always-on yes|no` (including legacy bare
+                   `--always-on` on `agent add`, which is `yes`). Empty
+                   when only a bare `--idle-timeout <N>` was passed —
+                   the field is omitted from the audit detail in that
+                   case. Recorded even on `changed=false` no-op
+                   mutations so re-affirmation calls still produce a
+                   searchable receipt.)
 
 Output: a single JSON object on stdout, matching the wrapper-apply /
 wrapper-deny detail shape that `bridge-config.py:cmd_set` writes for
@@ -71,9 +80,10 @@ _redact = importlib.import_module("launch-cmd-redact")
 
 def main() -> int:
     # 14 payload args (legacy) + 4 optional policy delta args (issue
-    # #1093) + script name. Accept either 15 or 19 argv to keep callers
-    # that predate the policy-delta extension working byte-identically.
-    if len(sys.argv) not in (15, 19):
+    # #1093) + 1 optional expressed_intent arg (issue #1136) + script
+    # name. Accept 15 / 19 / 20 argv to keep callers that predate each
+    # extension working byte-identically.
+    if len(sys.argv) not in (15, 19, 20):
         print(
             "usage: audit-detail-json.py "
             "<trigger> <actor> <actor_source> <target_agent> <path> "
@@ -81,7 +91,7 @@ def main() -> int:
             "<before_launch_cmd> <after_launch_cmd> "
             "<before_channels> <after_channels> <actions_json> "
             "[<before_idle_timeout> <after_idle_timeout> "
-            "<before_loop> <after_loop>]",
+            "<before_loop> <after_loop> [<expressed_intent>]]",
             file=sys.stderr,
         )
         return 2
@@ -90,11 +100,36 @@ def main() -> int:
     # shape. The trailing four positionals carry before/after deltas for
     # idle_timeout + loop. When absent (legacy callers), default to empty
     # strings and the new audit-detail fields are suppressed below.
+    # Issue #1136: accept an optional 19th payload positional carrying
+    # the operator-declared direction (`always_on_yes` / `always_on_no`).
     before_idle_timeout = ""
     after_idle_timeout = ""
     before_loop = ""
     after_loop = ""
-    if len(sys.argv) == 19:
+    expressed_intent = ""
+    if len(sys.argv) == 20:
+        (
+            trigger,
+            actor,
+            actor_source,
+            target_agent,
+            path,
+            before_sha,
+            after_sha,
+            operation,
+            reason,
+            before_launch_cmd,
+            after_launch_cmd,
+            before_channels,
+            after_channels,
+            actions_json,
+            before_idle_timeout,
+            after_idle_timeout,
+            before_loop,
+            after_loop,
+            expressed_intent,
+        ) = sys.argv[1:]
+    elif len(sys.argv) == 19:
         (
             trigger,
             actor,
@@ -171,6 +206,15 @@ def main() -> int:
     if before_loop or after_loop:
         detail["before_loop"] = before_loop
         detail["after_loop"] = after_loop
+    # Issue #1136: stamp the operator-declared direction when supplied.
+    # Recorded even on `changed=false` no-op mutations (the audit emit
+    # in run_update fires regardless of the changed bit, by design — a
+    # re-affirmation call still gets a searchable receipt). Bare
+    # `--idle-timeout <N>` invocations pass an empty string and the
+    # field is omitted so audit-log readers can grep on the verb's
+    # presence to find direction-declared events.
+    if expressed_intent:
+        detail["expressed_intent"] = expressed_intent
 
     print(json.dumps(detail, ensure_ascii=True, sort_keys=True))
     return 0
