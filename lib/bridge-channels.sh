@@ -516,19 +516,17 @@ bridge_write_idle_ready_agents() {
 # daemon-spawned PATH but is still a valid runtime. Prints the resolved
 # absolute path on stdout; returns non-zero with no output when none found.
 bridge_resolve_bun_executable() {
+  # Codex r1 BLOCKING: the Teams MCP launches bare `bun` (plugins/teams/
+  # .mcp.json), so a bun binary that exists at $HOME/.bun/bin/bun is only
+  # usable if that path is on the agent's PATH. Accepting a $HOME/.bun/bin
+  # fallback here would mark setup successful while the downstream daemon
+  # -spawned MCP still hits `bun: not found`. Require PATH-reachability via
+  # `command -v` so setup's success claim is truthful end-to-end.
   local candidate=""
-
   if candidate="$(command -v bun 2>/dev/null)" && [[ -n "$candidate" && -x "$candidate" ]]; then
     printf '%s' "$candidate"
     return 0
   fi
-
-  candidate="${HOME:-}/.bun/bin/bun"
-  if [[ -n "${HOME:-}" && -x "$candidate" ]]; then
-    printf '%s' "$candidate"
-    return 0
-  fi
-
   return 1
 }
 
@@ -559,7 +557,7 @@ bridge_install_bun_runtime() {
   fi
 
   if ! bridge_resolve_bun_executable >/dev/null; then
-    bridge_warn "bun installer reported success but bun is still not on PATH or at \$HOME/.bun/bin/bun — install bun manually and re-run setup teams"
+    bridge_warn "bun installer reported success but \`bun\` is not on PATH — the official installer drops it at \$HOME/.bun/bin/bun and prints a line to add that to your shell rc. Open a new shell (or add \$HOME/.bun/bin to PATH globally for the daemon), then re-run \`agb setup teams <agent>\`."
     return 1
   fi
 
