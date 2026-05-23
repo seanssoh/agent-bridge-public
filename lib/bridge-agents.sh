@@ -4201,16 +4201,98 @@ bridge_agent_onboarding_state() {
   local agent="$1"
   local path=""
   local line=""
+  local sudo_rc=0
+  local saw_unreadable=0
 
+  # #1120 sub-B: on v2 linux-user isolation the SESSION-TYPE.md candidate
+  # paths live under `<v2-root>/<agent>/workdir/` (mode 2770 owned by the
+  # isolated UID) or `<v2-root>/<agent>/home/` (also isolated-UID-owned).
+  # The controller cannot `[[ -f ]]` either one — the traverse on
+  # `<v2-root>/<agent>/` (mode 2750, no group write/read for non-members)
+  # short-circuits to "missing". Before this fix the function returned
+  # `missing` for every isolated agent → `agent show` reported a false
+  # `onboarding_state: missing` and downstream onboarding triggers
+  # (watchdog, restart-readiness, attached-exit-behavior) wedged on a
+  # signal that did not match the filesystem reality.
+  #
+  # Post-fix: when the controller cannot read the candidate, route the
+  # presence + grep through the agent's isolated UID via
+  # `bridge_isolation_run_as_agent_user_via_bash` (the same pattern
+  # `bridge_channel_env_file_readiness` (#832) uses for dotenv probes).
+  # The script returns 0 (state captured), 1 (file present but no
+  # matching line), or 2 (file unreadable / missing even to the iso
+  # UID). When the controller is blind AND sudo to the iso UID is
+  # unavailable (rc=2 from `bridge_isolation_run_as_agent_user_via_bash`),
+  # emit `unverifiable` so `agent show` surfaces "controller cannot
+  # confirm" instead of the false `missing` that watchdog hooks treat as
+  # "needs re-onboarding".
   for path in "$(bridge_agent_workdir "$agent")/SESSION-TYPE.md" "$(bridge_agent_default_home "$agent")/SESSION-TYPE.md"; do
-    [[ -f "$path" ]] || continue
-    line="$(grep -E 'Onboarding State:[[:space:]]*[A-Za-z0-9._-]+' "$path" 2>/dev/null | head -n 1 || true)"
-    if [[ "$line" =~ Onboarding[[:space:]]+State:[[:space:]]*([A-Za-z0-9._-]+) ]]; then
-      printf '%s' "${BASH_REMATCH[1]}"
-      return 0
+    if [[ -f "$path" ]]; then
+      line="$(grep -E 'Onboarding State:[[:space:]]*[A-Za-z0-9._-]+' "$path" 2>/dev/null | head -n 1 || true)"
+      if [[ "$line" =~ Onboarding[[:space:]]+State:[[:space:]]*([A-Za-z0-9._-]+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+        return 0
+      fi
+      # File readable but no matching line — treat as a true "missing"
+      # data point and keep walking the candidate list.
+      continue
+    fi
+    # `[[ -f ]]` returned false. On v2 isolation this is almost always
+    # "controller cannot traverse the parent" rather than "the file is
+    # absent" — probe via the isolated UID before declaring missing.
+    if declare -F bridge_isolation_run_as_agent_user_via_bash >/dev/null 2>&1; then
+      sudo_rc=0
+      # shellcheck disable=SC2016  # single-quoted on purpose: $1 is the script arg
+      line="$(bridge_isolation_run_as_agent_user_via_bash "$agent" '
+file="$1"
+[[ -f "$file" ]] || exit 2
+[[ -r "$file" ]] || exit 2
+grep -E "Onboarding State:[[:space:]]*[A-Za-z0-9._-]+" "$file" 2>/dev/null | head -n 1
+' "$path" 2>/dev/null)" || sudo_rc=$?
+      case "$sudo_rc" in
+        0)
+          if [[ "$line" =~ Onboarding[[:space:]]+State:[[:space:]]*([A-Za-z0-9._-]+) ]]; then
+            printf '%s' "${BASH_REMATCH[1]}"
+            return 0
+          fi
+          # iso UID read the file but no matching line — keep walking
+          continue
+          ;;
+        2)
+          # Agent isolated + passwordless sudo unavailable. We can't
+          # confirm presence either way; remember this so we can flip
+          # the final answer from "missing" to "unverifiable" instead
+          # of misreporting.
+          saw_unreadable=1
+          continue
+          ;;
+        3 | 4)
+          # iso UID also couldn't read (script rc 1/2 shifted into 3+
+          # band by the helper). Treat as "file truly missing for this
+          # candidate" and keep walking — but track the unreadable
+          # signal so we can disambiguate from a true missing when no
+          # candidate yields a hit.
+          saw_unreadable=1
+          continue
+          ;;
+        *)
+          # Other helper rc (e.g. rc=1 means agent not in linux-user
+          # isolation → the controller test above is authoritative,
+          # so a missing file IS missing).
+          continue
+          ;;
+      esac
     fi
   done
 
+  # Differentiate "controller could not confirm" from "candidate files
+  # truly absent". `unverifiable` matches the `agent list` text-mode
+  # `[unreadable]` shape so callers (operator-facing show output,
+  # watchdog, restart-readiness) can stop conflating the two.
+  if [[ $saw_unreadable -eq 1 ]]; then
+    printf '%s' "unverifiable"
+    return 0
+  fi
   printf '%s' "missing"
 }
 
