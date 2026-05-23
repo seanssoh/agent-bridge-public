@@ -230,6 +230,28 @@ write_common_stubs() {
   printf '%s\n' 'bridge_agent_os_user() {' >>"$stubs"
   printf '%s\n' '  echo "${SMOKE_FAKE_OS_USER:-agent-bridge-smoke-agent}"' >>"$stubs"
   printf '%s\n' '}' >>"$stubs"
+  # Issue #1151: the inline predicate the smoke previously asserted has been
+  # lifted into `bridge_agent_workdir_step_a_complete` (lib/bridge-agents.sh).
+  # `bridge_link_claude_settings_to_shared` now pair-gates on this helper, so
+  # the smoke must provide an implementation that mirrors the real one's
+  # contract (workdir-existence + stat-flavor fallback + exact-match against
+  # bridge_agent_os_user). The unit smoke for the lifted helper lives at
+  # scripts/smoke/1151-step-a-helper.sh; this stub is the integration shim
+  # so the existing 1145 cases continue to verify the end-to-end behavior
+  # of the deferral guard at its canonical caller site. Same logic as the
+  # source helper — kept inline (rather than sourcing bridge-agents.sh) so
+  # the smoke remains a self-contained fixture.
+  printf '%s\n' 'bridge_agent_workdir_step_a_complete() {' >>"$stubs"
+  printf '%s\n' '  local agent="$1"' >>"$stubs"
+  printf '%s\n' '  local workdir="$2"' >>"$stubs"
+  printf '%s\n' '  [[ -d "$workdir" ]] || return 1' >>"$stubs"
+  printf '%s\n' '  local _wd_owner=""' >>"$stubs"
+  printf '%s\n' '  _wd_owner="$(stat -c %U "$workdir" 2>/dev/null || stat -f %Su "$workdir" 2>/dev/null || true)"' >>"$stubs"
+  printf '%s\n' '  [[ -n "$_wd_owner" ]] || return 1' >>"$stubs"
+  printf '%s\n' '  local _expected_owner=""' >>"$stubs"
+  printf '%s\n' '  _expected_owner="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"' >>"$stubs"
+  printf '%s\n' '  [[ -n "$_expected_owner" && "$_wd_owner" == "$_expected_owner" ]]' >>"$stubs"
+  printf '%s\n' '}' >>"$stubs"
 }
 
 # ---------- T1 — isolation effective + workdir missing → deferral ----------

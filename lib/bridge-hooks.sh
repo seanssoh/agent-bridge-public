@@ -168,7 +168,6 @@ bridge_link_claude_settings_to_shared() {
   local agent_claude_config_dir=""
   local agent_claude_home=""
   local agent_effective_file=""
-  local _wd_owner=""
   if [[ -n "$agent" ]]; then
     effective_file="$(bridge_hook_per_agent_settings_effective_file "$agent")"
     # Issue #593: source class drives the managed autoCompactWindow default
@@ -234,20 +233,20 @@ bridge_link_claude_settings_to_shared() {
   # chained fallback keeps the guard portable. v2 isolation is Linux-only
   # in practice, but this hook runs on every platform, so we still defend
   # against missing `stat` flavors.
+  # Issue #1151 (v0.14.5-beta10): predicate lifted to
+  # `bridge_agent_workdir_step_a_complete` in `lib/bridge-agents.sh` so the
+  # same race-safe gate can be applied at every controller-side helper that
+  # mutates `$workdir/.claude/*` (4 more sites in addition to this one — see
+  # the issue body for the full list). Behavior here is unchanged: when v2
+  # isolation is effective for the agent AND the workdir hasn't been
+  # normalized to the agent's expected OS user yet, defer; otherwise proceed.
+  # The shared helper preserves all r1-r3 properties (existence check,
+  # stat-flavor fallback, exact-match against roster `os_user`).
   if [[ -n "$agent" ]] \
       && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
-      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
-    local _expected_owner=""
-    _wd_owner=""
-    if [[ -d "$workdir" ]]; then
-      _wd_owner="$(stat -c %U "$workdir" 2>/dev/null || stat -f %Su "$workdir" 2>/dev/null || true)"
-    fi
-    if command -v bridge_agent_os_user >/dev/null 2>&1; then
-      _expected_owner="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
-    fi
-    if [[ -z "$_wd_owner" || -z "$_expected_owner" || "$_wd_owner" != "$_expected_owner" ]]; then
-      return 0
-    fi
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null \
+      && ! bridge_agent_workdir_step_a_complete "$agent" "$workdir"; then
+    return 0
   fi
   bridge_hooks_python link-shared-settings --workdir "$workdir" --shared-settings-file "$effective_file"
 

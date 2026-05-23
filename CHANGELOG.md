@@ -6,6 +6,86 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta10] — 2026-05-24
+
+### Highlight — beta9 fix-completion wave (#1151 — second A2A QA cycle)
+
+Operator-cued **tenth prerelease** — closes the v2-isolation gaps that
+the remote QA peer flagged in her beta9 4-gate verification (1/4 PASS
+on beta9; #1144 was clean but #1145 only partial). Second cycle of the
+A2A-driven upstream→fixer→downstream release loop introduced in
+beta9.
+
+Every PR was codex pair-reviewed; the integration branch passed r1
+codex review (task #5938 implement-ok). `-beta10` prerelease;
+matching tag `v0.14.5-beta10`, GitHub release marked **Pre-release**.
+
+### Fixed — v2 isolation: controller-side helper guard generalized (#1151)
+
+- **#1151 (PR #1153)** — beta9's PR #1149 added an ownership-based
+  defer at exactly **one** controller-touch site
+  (`bridge_link_claude_settings_to_shared`). beta9 verification on a
+  remote Linux v2 host proved the same race / post-Step-A wall
+  recurred at five sibling helpers. This PR lifts the predicate into a
+  shared helper `bridge_agent_workdir_step_a_complete(agent, workdir)`
+  in `lib/bridge-agents.sh` and applies it at six total sites with
+  per-site policy:
+  - **DEFER** (return 0 when isolation effective + Step A pending,
+    agent start re-triggers): `bridge_link_claude_settings_to_shared`,
+    `bridge_link_shared_claude_skill`,
+    `bridge_ensure_auto_memory_isolation`,
+    `bridge_ensure_memory_precompact_hook` — workdir-side writes that
+    are either re-driven on next launch (auto-memory, link-settings)
+    or shadowed by the isolated-home rendering path
+    (precompact-hook → isolated-home settings render).
+  - **SUDO-ESCALATE** (proceed via isolated-UID sudo for v2 isolated
+    agents post-Step-A, fall back to controller-direct for legacy):
+    `bridge_sync_claude_runtime_skills` (extended
+    `bridge_sync_isolated_home_claude_skills` to consume
+    `bridge_agent_skills_csv "$agent"` — configured non-shared runtime
+    skills are now synced into `$isolated_home/.claude/skills/` where
+    v2 Claude reads them via `CLAUDE_CONFIG_DIR`),
+    `bridge_ensure_project_claude_guidance` (post-Step-A v2 path now
+    sudo-reads via O_NOFOLLOW Python helper then sudo-installs + chown
+    + atomic mv).
+
+  Three review rounds: r1 (DEFER at all 5 sites — wrong: dropped
+  configured runtime skills + project CLAUDE.md) → r2 (SUDO-ESCALATE
+  at the two load-bearing sites — but with `sudo cat` that followed
+  symlinks, a controller-side privilege escalation vector) → r3
+  (symlink-safe O_NOFOLLOW Python helper + rc-capture fix for the
+  exit-code-2 no-op sentinel) implement-ok. New smokes
+  `1151-step-a-helper.sh` (6 cases, predicate truth table) +
+  `1151-r2-sudo-escalate.sh` (6 cases including T9 symlink-refusal
+  regression contract + T10 sentinel-detection regression contract).
+
+### Documented — supplementary group refresh after first v2 isolated agent (#1151)
+
+- **#1151 (PR #1152)** — Linux supplementary group set is a process
+  credential established at login / `setgroups` / `newgrp` and
+  inherited across `fork`+`exec`; a later `usermod -aG` does NOT
+  propagate to already-running processes, and `exec $SHELL` from
+  inside the stale shell preserves the credential. After the first v2
+  isolated agent create, the controller user IS a member of the new
+  `ab-agent-<a>` group on disk but the daemon + operator shell still
+  hold the pre-add set. New OPERATIONS.md subsection §"Supplementary
+  group refresh after first v2 isolated agent" + KNOWN_ISSUES.md §28
+  document the resolution paths (full relogin / ssh reconnect /
+  `newgrp ab-agent-<a>` for a single-group refresh, followed by
+  `agent-bridge daemon restart` so the daemon inherits the new set).
+  Two review rounds: r1 BLOCKING (`exec $SHELL -l` recipe was wrong)
+  → r2 implement-ok.
+
+### Internal — Python helper extraction (footgun #11 baseline)
+
+The symlink-safe-read + render-body extractions in PR #1153 net-
+decrement the lint baseline by one C1 (deadlock-class capture) site:
+`scripts/lint-heredoc-ban.sh --baseline-check` reports
+`C1=104 C2=54 C3=315 C4=0 H3=364 SAFE=642`. New helpers:
+`lib/skills-helpers/claude-md-safe-read.py` (O_NOFOLLOW probe + 4 exit
+codes) and `lib/skills-helpers/claude-md-render.py` (render body
+file-as-argv).
+
 ## [0.14.5-beta9] — 2026-05-24
 
 ### Highlight — beta8 fix completion wave (A2A-driven QA loop)

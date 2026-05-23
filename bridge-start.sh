@@ -449,7 +449,9 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
     FORCE_FRESH_SESSION=1
   fi
   if [[ $INSTALL_PROJECT_SKILL -eq 1 ]]; then
-    bridge_ensure_project_claude_guidance "$WORK_DIR" >/dev/null 2>&1 || true
+    # Issue #1151: thread $AGENT so v2-isolation guard polarity fix can
+    # resolve roster os_user.
+    bridge_ensure_project_claude_guidance "$WORK_DIR" "$AGENT" >/dev/null 2>&1 || true
   fi
   if ! bridge_project_skill_bootstrap_needed "$ENGINE" "$WORK_DIR"; then
     FORCE_FRESH_SESSION=1

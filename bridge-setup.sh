@@ -879,7 +879,9 @@ run_agent() {
   if [[ "$engine" == "claude" ]]; then
     echo
     echo "== Claude Skills =="
-    bridge_ensure_project_claude_guidance "$workdir" >/dev/null 2>&1 || true
+    # Issue #1151: thread $agent so v2-isolation guard polarity fix can
+    # resolve roster os_user.
+    bridge_ensure_project_claude_guidance "$workdir" "$agent" >/dev/null 2>&1 || true
     bridge_bootstrap_project_skill "$engine" "$workdir" >/dev/null 2>&1 || true
     bridge_bootstrap_claude_shared_skills "$agent" "$workdir" >/dev/null 2>&1 || true
     bridge_sync_skill_docs "$agent" >/dev/null 2>&1 || true
