@@ -46,9 +46,10 @@ prerelease; matching tag `v0.14.5-beta11`, GitHub release marked
   - **Codex + v2 isolation + Step A complete** → SUDO-ESCALATE
     (Codex has no `CODEX_CONFIG_DIR` / isolated-home read path; it
     reads `.agents/skills/agent-bridge/` from the workdir directly,
-    so the install path is sudo-rendered through `_sudo_run_as`:
-    mktemp render → chown isolated UID → atomic `mv -f`, same race-
-    correct pattern as PR #1153 r3 `bridge_ensure_project_claude_guidance`)
+    so the install path is sudo-rendered via `bridge_linux_sudo_root`:
+    mktemp render → `mkdir -p` → `install -m 0644` → `chown` isolated
+    UID → atomic `mv -f`, same race-correct pattern as PR #1153 r3
+    `bridge_ensure_project_claude_guidance`)
   - **Legacy non-isolated** → unchanged
 
   Side-fix: `bridge-setup.sh` doctor diagnostic path corrected from
