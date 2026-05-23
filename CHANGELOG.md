@@ -11,13 +11,13 @@ version bumps via the `VERSION` file.
 ### Highlight — beta8 fix completion wave (A2A-driven QA loop)
 
 Operator-cued **ninth prerelease** — closes the two remaining
-post-beta8 issues that `patch` (Linux QA admin on
-`cm-prod-agentworkflow-vm01`) reported via the new **A2A cross-bridge
-handoff** (v0.14.5-beta4+ feature). First production use of A2A for
-upstream feedback loop: patch → A2A → agb-dev-claude inbox →
-wave-orchestration → release → A2A back to patch. Both
-issues were upstreamed with complete reproductions and code
-diagnostics embedded in the issue body.
+post-beta8 issues that an operator-provided remote Linux QA peer
+reported via the **A2A cross-bridge handoff** (v0.14.5-beta4+
+feature). First production use of A2A for the upstream feedback
+loop: remote QA admin → A2A → upstream maintainer inbox →
+wave-orchestration → release → A2A reply. Both issues were
+upstreamed with complete reproductions and code diagnostics
+embedded in the issue body.
 
 Every PR was codex pair-reviewed; the integration branch passed
 two-round codex review (task #5906 r1 BLOCKING — missing __ALL__
@@ -27,13 +27,14 @@ prerelease; matching tag `v0.14.5-beta9`, GitHub release marked
 
 ### Fixed — v2 isolation create-time race (beta8 root cause)
 
-- **#1145 (PR #1149)** — `lib/bridge-hooks.sh:cmd_link_shared_settings`
+- **#1145 (PR #1149)** — `lib/bridge-hooks.sh:bridge_link_claude_settings_to_shared`
+  (the shell-side wrapper that invokes `bridge_hooks_python link-shared-settings`)
   now **defers under v2 isolation when the workdir owner ≠ the
   roster-resolved os_user** (Step A — `bridge_linux_prepare_agent_isolation`
   — pending). Root cause: the v2 fresh-create flow scaffolded the
-  workdir as the controller (`awfmanager`) before Step A normalized
-  ownership to `agent-bridge-<a>`; the controller-side
-  `cmd_link_shared_settings` raced ahead, walked into the wrong
+  workdir as the controller user before Step A normalized
+  ownership to the isolated os_user; the controller-side
+  `cmd_link_shared_settings` (`bridge-hooks.py`) raced ahead, walked into the wrong
   ownership, and `path.mkdir()` fell through to controller-direct
   create → cascade of PermissionError tracebacks on every subsequent
   round. The deferral guard uses exact roster owner match (NOT a
@@ -46,7 +47,7 @@ prerelease; matching tag `v0.14.5-beta9`, GitHub release marked
   carries 8 cases including T2c/T2d regression contract (must fail
   against r2 prefix-glob by design).
 - **#1145 (PR #1146)** — companion containment: `cmd_link_shared_settings`
-  now **catches OSError** and emits a structured `HOOK_STATUS=permission_denied`
+  (`bridge-hooks.py:1479`) now **catches OSError** and emits a structured `HOOK_STATUS=permission_denied`
   warning instead of a Python traceback when the link operation cannot
   proceed. Belt-and-suspenders for any unforeseen state where the
   upstream deferral guard misses; routine pre-Step-A flows do not
@@ -57,17 +58,21 @@ prerelease; matching tag `v0.14.5-beta9`, GitHub release marked
 ### Fixed — upgrade-complete task body (beta8 regression)
 
 - **#1144 (PR #1147)** — `bridge-upgrade.sh` now **captures
-  `INSTALLED_VERSION` BEFORE the `git checkout TARGET_REF` step**
-  (and before any pull paths). Beta8 placed the capture AFTER the
-  checkout, which is fine for `--source <other-checkout>` upgrades
-  but corrupts the read for git-clone installs where
-  `SOURCE_ROOT == TARGET_ROOT` — the checkout itself mutates the live
-  VERSION file before the capture reads it, so the post-upgrade
-  `[upgrade-complete]` task body rendered `from_version: <new>`
-  instead of the pre-upgrade version (effectively `unknown` via the
-  fallback chain). Two review rounds: r1 (capture-after-checkout
-  ordering) → r2 (moved before checkout, sentinel-comment added for
-  smoke marker extraction stability) implement-ok. Plus: the
+  `INSTALLED_VERSION` on the apply path** (and BEFORE any
+  `git checkout TARGET_REF` / pull step). Beta8 only assigned
+  `INSTALLED_VERSION` inside the `--check` subcommand branch, so the
+  normal `apply` path left it unset and the post-upgrade
+  `[upgrade-complete]` task body rendered `from_version: unknown`
+  via the `${INSTALLED_VERSION:-unknown}` fallback. r1 added the
+  apply-path capture but placed it AFTER the `SOURCE_ROOT` checkout —
+  which is fine for `--source <other-checkout>` upgrades but corrupts
+  the read for git-clone installs where `SOURCE_ROOT == TARGET_ROOT`
+  (the checkout itself mutates the live VERSION file before the
+  capture reads it). r2 moved the capture above the checkout +
+  pull blocks and added a `# END:` sentinel comment so the smoke's
+  marker-based extraction has a stable boundary. Two review rounds:
+  r1 (capture-after-checkout ordering) → r2 (moved before checkout)
+  implement-ok. Plus: the
   persistent post-task body file is no longer `rm -f`'d after a
   successful task create — `bridge-queue.py` stores the body_path
   verbatim for bridge-managed paths, and the admin runbook + `agb
@@ -77,17 +82,14 @@ prerelease; matching tag `v0.14.5-beta9`, GitHub release marked
 
 ### A2A cross-bridge loop (operator directive 2026-05-24)
 
-First operational use of A2A for upstream → fixer → downstream
-release loop. Memory recorded at
-`reference_linux_qa_server_a2a.md`: each beta release triggers an
-A2A message to `patch@cm-prod-agentworkflow-vm01` (tailnet
-`100.76.208.4`) requesting update + QA + new-issue
-upstream-via-inbox-task. Loop continues until patch confirms no
-new findings. Setup itself surfaced a UX backlog issue
-(#1148) — bidirectional handshake needed 5+ round-trips on first
-pair (inbound_allowlist semantics + peer id confusion + 403 source
-address mismatch debugging). Codex polished the issue body for
-backlog.
+First operational use of A2A for the upstream → fixer → downstream
+release loop. Each beta release now triggers an A2A message to the
+operator-provided remote QA peer requesting update + QA + new-issue
+upstream-via-inbox-task; the loop continues until the QA peer
+confirms no new findings. Setup itself surfaced a UX backlog issue
+(#1148) — bidirectional handshake needed 5+ round-trips on the first
+pair (`inbound_allowlist` semantics + peer id confusion + 403 source
+address mismatch debugging).
 
 ## [0.14.5-beta8] — 2026-05-24
 
