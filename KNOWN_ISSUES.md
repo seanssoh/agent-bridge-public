@@ -745,11 +745,15 @@ See `docs/audit-2026-05-15.md` for the full P0/P1/P2 catalog (31 bug-surface + 1
 First-time v2 isolated-agent setup on Linux requires the controller's
 **supplementary group set** to refresh before the controller can
 traverse into the new `ab-agent-<agent>` group's tree. This is a Linux
-kernel behavior — the group set is captured at process exec time and
-not refreshed on later `usermod -aG` — but the symptom looks like a
-permission bug because the on-disk group ownership is already correct.
+process-credential behavior — the supplementary group set is
+established at login / `setgroups` / `newgrp` and inherited across
+fork+exec; a later `usermod -aG` does NOT propagate to already-running
+processes, and a plain `exec $SHELL` inside the same shell preserves
+the stale set. The symptom looks like a permission bug because the
+on-disk group ownership is already correct.
 
-Symptom (observed during #1151 verification on `cm-prod-agentworkflow-vm01`):
+Symptom (observed during #1151 verification on an operator-provided
+remote Linux QA host):
 
 - The controller user IS a member of `ab-agent-<agent>` on disk
   (`getent group ab-agent-<agent>` shows it).

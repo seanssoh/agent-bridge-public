@@ -1407,8 +1407,12 @@ account is newly added to an `ab-agent-<agent>` group via
 controller processes — the daemon, every existing shell session, the
 tmux server, hook subprocesses spawned from those parents — still hold
 the **pre-add supplementary group set** until they restart. Linux
-captures the supplementary group set at process exec time and does not
-refresh it on later `usermod -aG`.
+treats the supplementary group set as a process credential established
+at login / `setgroups` / `newgrp` and inherited across fork+exec — a
+later `usermod -aG` does NOT propagate to already-running processes,
+and a plain `exec $SHELL` inside the same shell preserves the stale
+credential. Only a fresh login (or `newgrp` for a single group) builds
+a new group set.
 
 Until the controller side re-reads its group set, the new
 `ab-agent-<agent>` group bit cannot be used to traverse into the
@@ -1432,15 +1436,23 @@ Symptoms of skipping the refresh:
 
 **Workarounds** (pick whichever matches the operator's daemon model):
 
-- **Operator-shell-managed daemon (the common case).** Log out of the
-  controller shell and log back in, OR start a fresh login shell via
-  `newgrp ab-agent-<agent>` (one group per session — only refreshes
-  that one group), THEN restart the daemon so it inherits the new
-  group set:
+- **Operator-shell-managed daemon (the common case).** A full relogin
+  (log out of the controller session and back in) builds a fresh
+  supplementary group set including every `ab-agent-*` group the
+  operator now belongs to. Alternatives that work from inside an open
+  ssh/terminal session: reconnect the ssh session, or `newgrp
+  ab-agent-<agent>` (one group per invocation — only refreshes that
+  one group). A plain `exec $SHELL -l` from inside the stale shell does
+  NOT refresh — the new shell inherits the parent's credential set.
+  After the operator side has a fresh group set, restart the daemon
+  so it inherits the new set too:
 
   ```bash
-  # Fresh login picks up every ab-agent-* group at once.
-  exec $SHELL -l                 # or: log out and back in
+  # Pick one of these to refresh the operator shell:
+  #   - log out + log back in (recommended on first install)
+  #   - reconnect the ssh session
+  #   - newgrp ab-agent-<agent>     # one group at a time
+  # Then:
   agent-bridge daemon restart
   agent-bridge agent start <agent>
   ```
