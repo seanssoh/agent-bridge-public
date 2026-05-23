@@ -48,6 +48,22 @@ AGENT_IDS=("$@")
 
 [[ -d "$TARGET_HOME" ]] || _die "target BRIDGE_HOME does not exist: $TARGET_HOME"
 
+# r2 (codex #5723 BLOCKING #2): fail-closed when the target's marker
+# disagrees with v2. The migrator only produces v2 installs; if the
+# target carries a legacy or unknown marker, the shim must NOT silently
+# override it (that's how a malformed target slipped past verify in r1).
+EXISTING_MARKER="$(cd -P "$TARGET_HOME" && pwd -P)/state/layout-marker.sh"
+if [[ -f "$EXISTING_MARKER" ]]; then
+  # Parse BRIDGE_LAYOUT= line conservatively without sourcing untrusted
+  # input. Accept both quoted and bare forms.
+  MARKER_LAYOUT="$(grep -E '^[[:space:]]*BRIDGE_LAYOUT=' "$EXISTING_MARKER" 2>/dev/null \
+                   | tail -n1 \
+                   | sed -E 's/^[[:space:]]*BRIDGE_LAYOUT=["'\'']?([^"'\'']*)["'\'']?[[:space:]]*$/\1/')"
+  if [[ -n "$MARKER_LAYOUT" && "$MARKER_LAYOUT" != "v2" ]]; then
+    _die "target marker reports BRIDGE_LAYOUT='$MARKER_LAYOUT' (expected 'v2'); refusing to force v2 override on a non-v2 install"
+  fi
+fi
+
 # Repoint BRIDGE_HOME at the target install so the resolver computes
 # target-side paths. Clear inherited layout vars so bridge-lib's
 # marker-bootstrap + layout-resolver decides fresh against the target,

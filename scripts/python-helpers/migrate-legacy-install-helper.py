@@ -155,6 +155,13 @@ CLEAN_TARGET_REQUIRED_ABSENT = (
     # backup tree means a previous apply ran; refuse to clobber it.
     ".migrator-apply-result.json",
     ".migrator-pre-apply-backup",
+    # r2 (codex #5723 SHOULD-FIX): scratch staging tree — apply
+    # silently rmtrees this BEFORE writing, so a populated tree is a
+    # prior-failed apply we must NOT clobber without operator review.
+    # Production code paths only land here via the apply staged-publish
+    # pattern; finding it pre-apply means the previous apply crashed
+    # before rollback completed.
+    ".migrator-apply-staging",
 )
 
 # Verification checks.
@@ -1270,6 +1277,40 @@ def cmd_apply(args: argparse.Namespace) -> int:
             except OSError as e:
                 _warn(f"  secret {rel}: chmod 0600 failed post-publish: {e}")
 
+        # r2 (codex #5723 BLOCKING #3): apply-result manifest must be
+        # written INSIDE the rollback-protected try, so a write failure
+        # here triggers full rollback rather than leaving a half-migrated
+        # target. The manifest is the final atomic "apply succeeded"
+        # marker — if we can't write it, the apply is not actually
+        # complete.
+        apply_manifest = {
+            "schema_version": MIGRATOR_SCHEMA_VERSION,
+            "migrator_tag": args.migrator_tag,
+            "applied_at": _now_iso(),
+            "source_bundle": str(bundle_dir),
+            "target": str(target),
+            "applied_agents": applied_agents,
+            "cron_jobs_imported": len(manifest.get("cron_jobs", [])),
+            "a2a_secret_supplied": a2a_secret is not None,
+            "a2a_secret_written": a2a_secret is not None,
+            "teams_secret_supplied": teams_secret is not None,
+            "teams_secret_written": teams_secret is not None,
+            "layout": layout_info.get("layout"),
+            "agent_paths": {
+                aid: layout_info.get("agents", {}).get(aid, {})
+                for aid in applied_agents
+            },
+        }
+        apply_result_path = target / ".migrator-apply-result.json"
+        # Use atomic-rename for the manifest write so even a partial
+        # write doesn't leave a torn file.
+        _atomic_write_file(
+            apply_result_path,
+            json.dumps(apply_manifest, indent=2).encode("utf-8"),
+            mode=0o644,
+        )
+        _info(f"apply result: {apply_result_path}")
+
     except BaseException as exc:  # noqa: BLE001 (intentional: rollback any failure)
         move_failure = exc
         _warn(f"apply failure mid-flight: {exc}")
@@ -1310,29 +1351,6 @@ def cmd_apply(args: argparse.Namespace) -> int:
     if move_failure is not None:
         # Defensive — _die above should have already exited.
         return 1
-
-    # --- Apply: write apply-result manifest (canonical post-publish) ---
-    apply_manifest = {
-        "schema_version": MIGRATOR_SCHEMA_VERSION,
-        "migrator_tag": args.migrator_tag,
-        "applied_at": _now_iso(),
-        "source_bundle": str(bundle_dir),
-        "target": str(target),
-        "applied_agents": applied_agents,
-        "cron_jobs_imported": len(manifest.get("cron_jobs", [])),
-        "a2a_secret_supplied": a2a_secret is not None,
-        "a2a_secret_written": a2a_secret is not None,
-        "teams_secret_supplied": teams_secret is not None,
-        "teams_secret_written": teams_secret is not None,
-        "layout": layout_info.get("layout"),
-        "agent_paths": {
-            aid: layout_info.get("agents", {}).get(aid, {})
-            for aid in applied_agents
-        },
-    }
-    apply_result_path = target / ".migrator-apply-result.json"
-    apply_result_path.write_text(json.dumps(apply_manifest, indent=2))
-    _info(f"apply result: {apply_result_path}")
 
     _info("apply complete")
     print()
