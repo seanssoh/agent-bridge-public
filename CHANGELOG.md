@@ -34,7 +34,7 @@ prerelease; matching tag `v0.14.5-beta11`, GitHub release marked
   Two of the five call sites (`bridge-start.sh:481`, `:534`) were
   unredirected, so failures flooded operator stdout during
   `agent start` even though `agent create` looked clean.
-  
+
   Engine-aware fix:
   - **Claude + v2 isolation** → DEFER (the isolated-home replacement
     path `bridge_sync_isolated_home_claude_skills` already installs
@@ -50,11 +50,11 @@ prerelease; matching tag `v0.14.5-beta11`, GitHub release marked
     mktemp render → chown isolated UID → atomic `mv -f`, same race-
     correct pattern as PR #1153 r3 `bridge_ensure_project_claude_guidance`)
   - **Legacy non-isolated** → unchanged
-  
+
   Side-fix: `bridge-setup.sh` doctor diagnostic path corrected from
   `.codex/skills` (nonexistent) to `.agents/skills` (production
   contract per `bridge_project_skill_dir_for`).
-  
+
   Two review rounds: r1 BLOCKING ×2 (engine-agnostic skip dropped
   Codex; smoke Claude-only with wrong production path stub) → r2
   implement-ok. New smoke `1155-bootstrap-skill-guard.sh` with 6
