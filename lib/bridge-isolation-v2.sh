@@ -2460,6 +2460,40 @@ bridge_isolation_v2_check_controller_credentials_read_grant() {
 #        matching argument is rejected outright (never userdel a user the
 #        bridge did not create).
 #
+# r3 (codex task #5740): internal helper for the sudoers drop-in
+# removal decision. Takes the sudoers root as an EXPLICIT ARGUMENT —
+# production passes /etc/sudoers.d hardcoded; the smoke at
+# scripts/smoke/1121-agent-delete-os-purge.sh invokes this helper
+# directly with a tmpdir to exercise the decision logic. There is no
+# env-controlled root anymore (closes the r1/r2 bypass vector).
+#
+# Args:
+#   $1 — agent (for warning messages only)
+#   $2 — os_user (gated upstream by Gate 2 exact-match check)
+#   $3 — sudoers_dir (production = /etc/sudoers.d; tests = tmpdir)
+#
+# The basename regex still pins `agent-bridge-<slug>` strictly; the
+# sudoers_dir argument carries the trusted root. Best-effort: missing
+# file is a clean no-op.
+_bridge_isolation_v2_reap_sudoers_drop_in() {
+  local agent="$1"
+  local os_user="$2"
+  local sudoers_dir="$3"
+  local sudoers_path="${sudoers_dir}/agent-bridge-${os_user}"
+  local sudoers_base="${sudoers_path##*/}"
+  # The basename regex is the load-bearing defence — sudoers_dir is the
+  # caller-trusted root and the caller is the production-hardcoded
+  # /etc/sudoers.d or the smoke-fixture tmpdir; either way the basename
+  # MUST be exactly `agent-bridge-<slug>` (no `..`, no glob).
+  if [[ ! "$sudoers_base" =~ ^agent-bridge-[a-zA-Z0-9_-]+$ ]]; then
+    bridge_warn "agent delete: skipping sudoers cleanup for '$agent' — composed path '$sudoers_path' does not match strict pattern (refusing to rm)"
+  elif [[ -e "$sudoers_path" ]]; then
+    if ! _bridge_isolation_v2_run_root_or_sudo rm -f -- "$sudoers_path"; then
+      bridge_warn "agent delete: failed to remove sudoers drop-in '$sudoers_path' (best-effort — manual 'sudo rm -f $sudoers_path' may be needed)"
+    fi
+  fi
+}
+
 # Returns 0 always (best-effort); skips silently on non-Linux / missing
 # tooling / non-isolated agents.
 bridge_isolation_v2_reap_isolated_agent_account() {
@@ -2607,45 +2641,22 @@ bridge_isolation_v2_reap_isolated_agent_account() {
   #     regular file, never a directory. `-f` swallows "missing" so a
   #     host without the drop-in produces no noise.
   # ---------------------------------------------------------------------
-  # Path composition mirrors bridge_migration_install_sudoers
-  # (lib/bridge-migration.sh): the writer emits to
-  # `${sudoers_dir}/agent-bridge-${os_user}`. Use the same root so the
-  # reaper targets the exact file the migrator created.
+  # Production code path: pass /etc/sudoers.d HARDCODED as the third
+  # argument. The smoke at scripts/smoke/1121-agent-delete-os-purge.sh
+  # invokes the internal `_bridge_isolation_v2_reap_sudoers_drop_in`
+  # helper directly with a temporary sudoers root, so the production
+  # function never sees a non-`/etc/sudoers.d` value.
   #
-  # r2 (codex task #5722 BLOCKING): the prior design accepted a generic
-  # `BRIDGE_SUDOERS_DIR` env var, which a misconfigured caller (or an
-  # attacker who controls env) could weaponize to rm files outside
-  # /etc/sudoers.d. Production now ALWAYS hardcodes /etc/sudoers.d.
-  # The smoke uses a dedicated, test-only-named override
-  # `BRIDGE_TEST_SUDOERS_DIR_OVERRIDE` that production code paths never
-  # set. The variable name itself makes accidental production use
-  # obviously wrong on inspection.
-  local sudoers_dir="/etc/sudoers.d"
-  if [[ -n "${BRIDGE_TEST_SUDOERS_DIR_OVERRIDE:-}" ]]; then
-    sudoers_dir="$BRIDGE_TEST_SUDOERS_DIR_OVERRIDE"
-  fi
-  local sudoers_path="${sudoers_dir}/agent-bridge-${os_user}"
-  # Defence-in-depth: enforce both the directory location AND the literal
-  # filename shape before any destructive call. The basename MUST match
-  # the exact bridge-managed `agent-bridge-<slug>` form; the directory
-  # MUST be /etc/sudoers.d unless the explicit test override is set.
-  # The regex pins:
-  #   - prefix:     agent-bridge-
-  #   - slug:       [a-zA-Z0-9_-]+
-  #   - end-anchor: $
-  # so neither leading `..`/symlinked-out paths nor a glob like
-  # `agent-bridge-foo*` could ever slip through.
-  local sudoers_base="${sudoers_path##*/}"
-  local sudoers_parent="${sudoers_path%/*}"
-  if [[ -z "${BRIDGE_TEST_SUDOERS_DIR_OVERRIDE:-}" && "$sudoers_parent" != "/etc/sudoers.d" ]]; then
-    bridge_warn "agent delete: skipping sudoers cleanup for '$agent' — composed parent '$sudoers_parent' is not /etc/sudoers.d (refusing to rm)"
-  elif [[ ! "$sudoers_base" =~ ^agent-bridge-[a-zA-Z0-9_-]+$ ]]; then
-    bridge_warn "agent delete: skipping sudoers cleanup for '$agent' — composed path '$sudoers_path' does not match strict pattern (refusing to rm)"
-  elif [[ -e "$sudoers_path" ]]; then
-    if ! _bridge_isolation_v2_run_root_or_sudo rm -f -- "$sudoers_path"; then
-      bridge_warn "agent delete: failed to remove sudoers drop-in '$sudoers_path' (best-effort — manual 'sudo rm -f $sudoers_path' may be needed)"
-    fi
-  fi
+  # r3 (codex task #5740 BLOCKING): r1/r2 used an env-var override
+  # (`BRIDGE_SUDOERS_DIR` then `BRIDGE_TEST_SUDOERS_DIR_OVERRIDE`) to
+  # let the smoke redirect the rm. Codex flagged that any
+  # env-controlled root is still a bypass vector — an attacker who
+  # controls process env (or a script that leaks the var) could rm
+  # arbitrary files matching the basename pattern. The new design has
+  # NO env-controlled root: production hardcodes the literal
+  # `/etc/sudoers.d` argument; tests pass a tmpdir to the same internal
+  # helper directly (function-arg-controlled, not env-controlled).
+  _bridge_isolation_v2_reap_sudoers_drop_in "$agent" "$os_user" "/etc/sudoers.d"
 
   return 0
 }
