@@ -80,7 +80,21 @@ def rewrite(engine_bin: str, original: str) -> str:
         # leave it alone.
         return original
     tokens[idx] = engine_bin
-    return " ".join(shlex.quote(token) for token in tokens)
+    # Re-emit. Env-assignment tokens (KEY=VALUE) must NOT be wrapped in
+    # outer single-quotes — bash interprets `'KEY=VALUE'` as a command
+    # name, not an env-assignment word. Codex r1 (task #5719) caught
+    # this against `PATH=/tmp/custom:$PATH claude ...` fixtures used in
+    # scripts/smoke-test.sh:4656 / :7026. Emit `KEY=<shlex.quote(VALUE)>`
+    # for assignment tokens so the value-side stays safely quoted while
+    # the assignment shape survives.
+    parts: list[str] = []
+    for i, token in enumerate(tokens):
+        if i < idx and _is_env_assignment(token):
+            key, _, value = token.partition("=")
+            parts.append(f"{key}={shlex.quote(value)}")
+        else:
+            parts.append(shlex.quote(token))
+    return " ".join(parts)
 
 
 def main() -> int:

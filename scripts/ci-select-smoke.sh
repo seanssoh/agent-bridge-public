@@ -611,7 +611,7 @@ select_for_path() {
       # shared secret-redaction surface every `agent update --launch-cmd-*`
       # output path routes through; pull its regression smoke whenever
       # any launch-cmd helper moves.
-      add_required 835-static-admin-launch launch launch-dev-channels-injection channel-env-readiness agent-update-launch-cmd-redaction
+      add_required 835-static-admin-launch launch launch-dev-channels-injection channel-env-readiness agent-update-launch-cmd-redaction 1118-v2-engine-binary-path
       add_integration integration-minimal
       ;;
 
