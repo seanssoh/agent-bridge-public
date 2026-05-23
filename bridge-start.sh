@@ -587,6 +587,21 @@ fi
 if [[ -n "$AGENT_ENV_FILE" ]]; then
   SESSION_CMD="BRIDGE_AGENT_ENV_FILE=$(printf '%q' "$AGENT_ENV_FILE") ${SESSION_CMD}"
 fi
+# Issue #1118: resolve the engine binary's absolute path on the controller
+# and propagate it into the sudo'd child via the SESSION_CMD env prefix.
+# Without this, a v2 linux-user-isolated agent's `bash -lc "claude ..."`
+# child dies with `claude: command not found` because the controller's
+# per-user install (typically `~/.local/bin/claude`) is not on the service
+# user's PATH. bridge-run.sh rewrites the leading `claude`/`codex` token in
+# LAUNCH_CMD to this absolute path before exec, so the lookup never depends
+# on the service user's PATH. The variable is empty (and the rewrite a
+# no-op) when the engine binary cannot be resolved on the controller —
+# falling back to the legacy bare-name behavior so a hand-installed engine
+# at a non-default location is no worse off than today.
+ENGINE_BIN_RESOLVED=""
+if ENGINE_BIN_RESOLVED="$(bridge_resolve_engine_binary "$ENGINE")"; then
+  SESSION_CMD="BRIDGE_ENGINE_BIN=$(printf '%q' "$ENGINE_BIN_RESOLVED") ${SESSION_CMD}"
+fi
 if [[ $SUPPRESS_MISSING_CHANNELS -eq 1 ]]; then
   SESSION_CMD="BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS=1 ${SESSION_CMD}"
 fi
