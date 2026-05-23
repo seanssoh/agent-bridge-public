@@ -2494,6 +2494,116 @@ _bridge_isolation_v2_reap_sudoers_drop_in() {
   fi
 }
 
+# Issue #1140: parallel of _bridge_isolation_v2_reap_sudoers_drop_in.
+#
+# Reap the OS-level home directory `<home_root>/<os_user>` left over after
+# Step 1 `userdel <os_user>` (which intentionally runs without -r so we
+# retain explicit control over the rm). PR #1129 closed #1121 partially
+# (user/group/sudoers were cleaned) but `/home/agent-bridge-<a>` survived
+# every isolated create/delete cycle and accumulated as orphan_directory
+# rows in the watchdog scan.
+#
+# Args:
+#   $1 — agent (for warning messages only — Gate 2 already validated)
+#   $2 — os_user (already gated upstream by Gate 2 exact-match check
+#                 against bridge_agent_default_os_user(agent))
+#   $3 — home_root (production = "/home"; tests = tmpdir under
+#                   $SMOKE_TMP_ROOT/home so the smoke can stage the
+#                   exact tree without touching the real /home/*)
+#
+# Defence-in-depth:
+#   - os_user basename MUST match `^agent-bridge-[a-zA-Z0-9_-]+$`. The
+#     final absolute path is `<home_root>/<os_user>` and the basename
+#     check pins the leaf to the exact account-name shape the bridge
+#     auto-provisions via bridge_agent_default_os_user.
+#   - Path must exist as a directory; a missing tree is a clean silent
+#     no-op (no warning) so a host where the reap raced an external
+#     cleanup does not produce alarm noise.
+#   - `rm -rf` uses `--` separator so a path containing a leading `-`
+#     (defence-only — the basename regex already rejects it) cannot be
+#     interpreted as an option.
+#   - Uses `_bridge_isolation_v2_run_root_or_sudo` (direct-first, sudo
+#     fallback) because the tree is owned by the now-removed isolated
+#     UID and the controller alone cannot recursively rm it on most
+#     hosts. Failure emits a structured warning and returns 0 (never
+#     aborts the reap — Step 2/3/4/6 still need to fire).
+#
+# Env-controlled root is explicitly OUT OF SCOPE (mirror the #1121 r3
+# contract): production hardcodes `/home`; tests pass a tmpdir as a
+# direct function argument.
+_bridge_isolation_v2_reap_os_home_dir() {
+  local agent="$1"
+  local os_user="$2"
+  local home_root="$3"
+  local home_path="${home_root}/${os_user}"
+  local home_base="${home_path##*/}"
+  if [[ ! "$home_base" =~ ^agent-bridge-[a-zA-Z0-9_-]+$ ]]; then
+    bridge_warn "agent delete: skipping OS home cleanup for '$agent' — composed path '$home_path' does not match strict pattern (refusing to rm)"
+    return 0
+  fi
+  if [[ ! -d "$home_path" ]]; then
+    return 0
+  fi
+  if ! _bridge_isolation_v2_run_root_or_sudo rm -rf -- "$home_path"; then
+    bridge_warn "agent delete: failed to remove OS home dir '$home_path' (best-effort — manual 'sudo rm -rf $home_path' may be needed)"
+  fi
+  return 0
+}
+
+# Issue #1140: parallel of _bridge_isolation_v2_reap_sudoers_drop_in.
+#
+# Reap the v2 per-agent workdir tree at `<agent_root_v2>/<agent>`. On a
+# v2 install this directory tree is `root:ab-agent-<a>` mode 2750 with
+# `home/`, `workdir/`, `runtime/`, `logs/` children. PR #1129 left this
+# tree behind because the sudoers reap focused on /etc/sudoers.d only;
+# the watchdog correctly reported it as an orphan_directory (#1119) but
+# the create/delete loop kept accumulating these trees on every cycle.
+#
+# Args:
+#   $1 — agent (for warning messages + path composition; the basename
+#                check pins it to the exact slug shape `agent create`
+#                accepts so a misconfigured caller cannot escape the
+#                v2 agent root)
+#   $2 — agent_root_v2 (production = $BRIDGE_AGENT_ROOT_V2; tests = a
+#                       tmpdir under $SMOKE_TMP_ROOT/data/agents)
+#
+# Defence-in-depth:
+#   - agent basename MUST match `^[a-zA-Z0-9_-]+$`. The composed path
+#     is `<agent_root_v2>/<agent>`; the basename check pins the leaf
+#     to the same slug regex `agent create` validates against, so a
+#     `..`, glob, or absolute path cannot be smuggled in.
+#   - `agent_root_v2` must be a non-empty argument. If the production
+#     caller could not resolve $BRIDGE_AGENT_ROOT_V2 (legacy install,
+#     unset env) the helper is a clean silent no-op rather than
+#     composing an attacker-controlled `/<agent>` rm target.
+#   - Path must exist as a directory; missing tree = clean no-op.
+#   - `rm -rf -- <path>` for the same reason as the sudoers helper.
+#   - Uses `_bridge_isolation_v2_run_root_or_sudo` because the tree
+#     parent is root-owned (mode 2750) on a v2 install — the
+#     controller alone cannot rm the per-agent root without sudo.
+#
+# This helper does NOT touch `$BRIDGE_AGENT_ROOT_V2` itself or any
+# sibling agent's directory; it only reaps the single `<agent>` child.
+_bridge_isolation_v2_reap_v2_workdir() {
+  local agent="$1"
+  local agent_root_v2="$2"
+  if [[ -z "$agent_root_v2" ]]; then
+    return 0
+  fi
+  if [[ ! "$agent" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    bridge_warn "agent delete: skipping v2 workdir cleanup for '$agent' — agent slug does not match strict pattern (refusing to rm)"
+    return 0
+  fi
+  local workdir_path="${agent_root_v2}/${agent}"
+  if [[ ! -d "$workdir_path" ]]; then
+    return 0
+  fi
+  if ! _bridge_isolation_v2_run_root_or_sudo rm -rf -- "$workdir_path"; then
+    bridge_warn "agent delete: failed to remove v2 workdir '$workdir_path' (best-effort — manual 'sudo rm -rf $workdir_path' may be needed)"
+  fi
+  return 0
+}
+
 # Returns 0 always (best-effort); skips silently on non-Linux / missing
 # tooling / non-isolated agents.
 bridge_isolation_v2_reap_isolated_agent_account() {
@@ -2657,6 +2767,46 @@ bridge_isolation_v2_reap_isolated_agent_account() {
   # `/etc/sudoers.d` argument; tests pass a tmpdir to the same internal
   # helper directly (function-arg-controlled, not env-controlled).
   _bridge_isolation_v2_reap_sudoers_drop_in "$agent" "$os_user" "/etc/sudoers.d"
+
+  # ---------------------------------------------------------------------
+  # Step 5 — reap the OS-level home directory (#1140).
+  #
+  # `useradd` provisioned `/home/agent-bridge-<a>` (mode 0700, owner
+  # agent-bridge-<a>) for the isolated account. Step 1 above ran
+  # `userdel <os_user>` WITHOUT `-r`, leaving the tree on disk. Before
+  # #1140 the tree leaked on every isolated create/delete cycle.
+  #
+  # Step ordering matters: this MUST run AFTER Step 1 userdel so the
+  # rm target's owner UID is already unallocated — anyone re-acquiring
+  # the same UID before the rm cannot see partial-deletion debris.
+  #
+  # Production hardcodes the literal "/home" argument (same shape as
+  # /etc/sudoers.d for Step 4); the smoke at
+  # scripts/smoke/1140-purge-home-os-cleanup.sh invokes the internal
+  # helper directly with a temporary home root, so the production
+  # function never sees a non-"/home" value (no env-controlled root —
+  # mirrors the #1121 r3 BLOCKING contract that no env var redirects
+  # the rm).
+  # ---------------------------------------------------------------------
+  _bridge_isolation_v2_reap_os_home_dir "$agent" "$os_user" "/home"
+
+  # ---------------------------------------------------------------------
+  # Step 6 — reap the v2 per-agent workdir tree (#1140).
+  #
+  # On a v2 install `agent create` scaffolds `<BRIDGE_AGENT_ROOT_V2>/<a>`
+  # with `home/`, `workdir/`, `runtime/`, `logs/` children (root-owned
+  # 2750). PR #1129's sudoers reap left this tree behind so #1119's
+  # watchdog scan kept reporting it as an orphan_directory on every
+  # cycle. This step closes the loop.
+  #
+  # The agent_root_v2 argument is read from the live env (production
+  # caller path) rather than hardcoded because the v2 root is a
+  # per-install variable, not a fixed FS path. On a legacy (v1)
+  # install BRIDGE_AGENT_ROOT_V2 is empty and the helper is a clean
+  # silent no-op (early `[[ -z "$agent_root_v2" ]]` return). The
+  # smoke invokes the helper directly with a tmpdir.
+  # ---------------------------------------------------------------------
+  _bridge_isolation_v2_reap_v2_workdir "$agent" "${BRIDGE_AGENT_ROOT_V2:-}"
 
   return 0
 }
