@@ -9,6 +9,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
 import stat
 import subprocess
@@ -1069,6 +1070,106 @@ def write_claude_credentials_file(
     )
 
 
+def write_claude_credentials_payload(
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    owner_uid: int | None = None,
+    owner_gid: int | None = None,
+    allowed_root: Path | None = None,
+) -> None:
+    """Write a pre-parsed Claude OAuth credential payload to ``path``.
+
+    Used by the controller-credentials fallback in ``cmd_sync_agent`` so
+    fields like ``refreshToken`` carried by a real ``claude.ai`` login
+    survive the copy into the per-agent ``CLAUDE_CONFIG_DIR``. The
+    token-based path ``write_claude_credentials_file`` synthesizes a
+    minimal payload from a setup-token string; this helper preserves
+    whatever the controller already has.
+    """
+    _ensure_claude_dir_safe(path, allowed_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(payload, ensure_ascii=True, indent=2) + "\n"
+    write_private_file_atomic(
+        path,
+        text,
+        mode=0o600,
+        prefix=".credentials.",
+        owner_uid=owner_uid,
+        owner_gid=owner_gid,
+    )
+
+
+def read_controller_claude_credentials_payload(path: Path) -> dict[str, Any]:
+    """Read and validate the controller's ``~/.claude/.credentials.json``.
+
+    Returns the parsed JSON payload (a dict containing at least
+    ``claudeAiOauth.accessToken``). Raises ``ValueError`` /
+    ``FileNotFoundError`` / ``PermissionError`` on the obvious problems so
+    ``cmd_sync_agent`` can surface a clean failure to the caller.
+
+    Used by the #1075 fallback when no Claude setup-token is registered:
+    the operator is logged in via ``claude.ai`` OAuth (Max subscription)
+    and per-agent ``CLAUDE_CONFIG_DIR`` dirs need credentials seeded from
+    that login so channel agents do not start up ``Not logged in``.
+    """
+    if path.is_symlink():
+        raise PermissionError(
+            f"refusing to read symlinked controller credentials: {path}"
+        )
+    if not path.is_file():
+        raise FileNotFoundError(f"controller credentials not found: {path}")
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"controller credentials file is not valid JSON: {path}: {exc}"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"controller credentials file must contain a JSON object: {path}"
+        )
+    oauth = parsed.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        raise ValueError(
+            f"controller credentials missing 'claudeAiOauth' object: {path}"
+        )
+    access_token = oauth.get("accessToken")
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise ValueError(
+            f"controller credentials missing 'claudeAiOauth.accessToken': {path}"
+        )
+    return parsed
+
+
+def resolve_controller_claude_credentials_path(
+    explicit: str | os.PathLike[str] | None = None,
+) -> Path:
+    """Resolve the controller's ``~/.claude/.credentials.json`` path.
+
+    Precedence:
+      1. The ``explicit`` argument (passed in via ``--controller-credentials``
+         from ``bridge-auth.sh``, which resolves the controller user the same
+         way ``bridge_isolation_v2_controller_user`` does).
+      2. ``$BRIDGE_CONTROLLER_HOME/.claude/.credentials.json`` when set.
+      3. ``$SUDO_USER``'s home (when running under sudo for isolated agents).
+      4. ``Path.home() / '.claude' / '.credentials.json'`` as the final fallback.
+    """
+    if explicit:
+        return Path(os.fspath(explicit)).expanduser()
+    explicit_home = os.environ.get("BRIDGE_CONTROLLER_HOME", "").strip()
+    if explicit_home:
+        return Path(explicit_home).expanduser() / ".claude" / ".credentials.json"
+    sudo_user = os.environ.get("SUDO_USER", "").strip()
+    if sudo_user:
+        try:
+            entry = pwd.getpwnam(sudo_user)
+            return Path(entry.pw_dir) / ".claude" / ".credentials.json"
+        except KeyError:
+            pass
+    return Path.home() / ".claude" / ".credentials.json"
+
+
 def write_private_file_atomic(
     path: Path,
     text: str,
@@ -1214,15 +1315,27 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
     try:
         registry = load_registry(Path(args.registry).expanduser())
         active_id = str(registry.get("active_token_id") or "")
-        if not active_id:
-            raise ValueError("no active token id")
-        row = find_token(registry, active_id)
-        if row is None:
-            raise ValueError(f"active token id is missing from registry: {active_id}")
-        if not bool(row.get("enabled", True)):
-            raise ValueError(f"active token id is disabled: {active_id}")
-        token = str(row.get("token") or "")
-        validate_token(token)
+        token = ""
+        source = "claude_token_registry"
+        row: dict[str, Any] | None = None
+        if active_id:
+            row = find_token(registry, active_id)
+            if row is None:
+                raise ValueError(
+                    f"active token id is missing from registry: {active_id}"
+                )
+            if not bool(row.get("enabled", True)):
+                raise ValueError(f"active token id is disabled: {active_id}")
+            token = str(row.get("token") or "")
+            validate_token(token)
+        else:
+            # #1075 fallback — no Claude setup-token is registered, but the
+            # controller is logged in via ``claude.ai`` OAuth. Provision the
+            # per-agent ``CLAUDE_CONFIG_DIR/.credentials.json`` from the
+            # controller's ``~/.claude/.credentials.json`` so channel agents
+            # do not start up ``Not logged in``. Preserves the full payload
+            # (refreshToken etc.) instead of synthesizing a minimal one.
+            source = "controller_credentials"
         credential_file = Path(args.file).expanduser()
         trusted_workdirs = [str(Path(item).expanduser()) for item in (args.workdir or []) if item]
         owner_uid = args.owner_uid if args.owner_uid is not None and args.owner_uid >= 0 else None
@@ -1230,13 +1343,32 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
         allowed_root = (
             Path(args.allowed_root).expanduser() if args.allowed_root else None
         )
-        write_claude_credentials_file(
-            credential_file,
-            token,
-            owner_uid=owner_uid,
-            owner_gid=owner_gid,
-            allowed_root=allowed_root,
-        )
+        if source == "controller_credentials":
+            controller_path = resolve_controller_claude_credentials_path(
+                args.controller_credentials
+            )
+            controller_payload = read_controller_claude_credentials_payload(
+                controller_path
+            )
+            write_claude_credentials_payload(
+                credential_file,
+                controller_payload,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+                allowed_root=allowed_root,
+            )
+            fingerprint = token_fingerprint(
+                str(controller_payload["claudeAiOauth"]["accessToken"])
+            )
+        else:
+            write_claude_credentials_file(
+                credential_file,
+                token,
+                owner_uid=owner_uid,
+                owner_gid=owner_gid,
+                allowed_root=allowed_root,
+            )
+            fingerprint = token_fingerprint(token)
         config_file = ensure_claude_config_file(
             credential_file.parent,
             trusted_workdirs,
@@ -1261,12 +1393,19 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
         "delivery": "claude_credentials_file",
         "trusted_workdirs": trusted_workdirs,
         "active_token_id": active_id,
-        "fingerprint": token_fingerprint(token),
+        "source": source,
+        "fingerprint": fingerprint,
     }
     if json_mode:
         json_dump(payload)
     else:
-        print(f"synced: {args.agent} <- {active_id} ({payload['fingerprint']})")
+        if source == "controller_credentials":
+            print(
+                f"synced: {args.agent} <- controller-credentials "
+                f"({payload['fingerprint']})"
+            )
+        else:
+            print(f"synced: {args.agent} <- {active_id} ({payload['fingerprint']})")
     return 0
 
 
@@ -1349,6 +1488,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--allowed-root",
         default=None,
         help="require resolved credential dir to stay under this real path (PR #799 r2 symlink hardening)",
+    )
+    sync_parser.add_argument(
+        "--controller-credentials",
+        default=None,
+        help=(
+            "explicit path to the controller's .claude/.credentials.json — used "
+            "for the #1075 fallback when no Claude setup-token is registered"
+        ),
     )
     sync_parser.add_argument("--json", action="store_true")
     sync_parser.set_defaults(handler=cmd_sync_agent)

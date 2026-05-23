@@ -1088,6 +1088,27 @@ defense-in-depth residual in [`KNOWN_ISSUES.md` §25](./KNOWN_ISSUES.md#25-claud
 A credential-helper enhancement is planned to close that gap in a
 follow-up PR.
 
+#### claude.ai OAuth fallback (#1075)
+
+Setup tokens are the preferred provisioning path, but the operator may already
+be logged in via `claude.ai` OAuth (Max subscription) on the controller and
+not want to register a separate setup-token. In that case
+`agent-bridge auth claude-token sync` falls back to seeding each per-agent
+`CLAUDE_CONFIG_DIR/.credentials.json` from the controller's
+`~/.claude/.credentials.json` — preserving the full payload
+(`refreshToken`, scopes, etc.). Without this fallback a fresh non-admin
+Claude agent reaches the REPL with `Not logged in` and any channel is
+reported as `not currently available`.
+
+The fallback uses the same per-agent ownership contract as the token-based
+path: shared-mode agents get mode `0600` owned by the controller (same UID
+as the agent); linux-user-isolated agents get the file chowned to the
+isolated UID before `os.replace` and the symlink-rejection / `--allowed-root`
+realpath check applies on both the per-agent destination and the controller
+source. If neither a registered setup-token nor a readable controller
+`.credentials.json` is present, sync fails per-agent with a clear
+`controller credentials not found: …` error.
+
 ```bash
 agent-bridge auth claude-token auto-rotate enable --threshold 99
 ```
