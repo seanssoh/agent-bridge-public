@@ -1117,6 +1117,26 @@ def read_controller_claude_credentials_payload(path: Path) -> dict[str, Any]:
         raise PermissionError(
             f"refusing to read symlinked controller credentials: {path}"
         )
+    # Codex r1 BLOCKING: the file-level symlink check alone is bypassable
+    # via a symlinked `.claude` parent dir (parent-swap). Walk every
+    # ancestor of `path` up to the user's home and refuse if ANY component
+    # is itself a symlink — closes the parent-symlink vector.
+    _ancestor = path.parent
+    try:
+        _home = Path.home()
+    except RuntimeError:
+        _home = None
+    while True:
+        if _ancestor.is_symlink():
+            raise PermissionError(
+                f"refusing to read controller credentials under symlinked "
+                f"ancestor: {_ancestor}"
+            )
+        if _home is not None and _ancestor == _home:
+            break
+        if _ancestor.parent == _ancestor:
+            break  # filesystem root
+        _ancestor = _ancestor.parent
     if not path.is_file():
         raise FileNotFoundError(f"controller credentials not found: {path}")
     try:
