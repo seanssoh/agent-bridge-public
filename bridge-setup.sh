@@ -985,7 +985,11 @@ run_agent() {
     # Issue #1155: thread $agent so v2-isolation guard can resolve roster os_user.
     bridge_bootstrap_project_skill "$engine" "$workdir" "$agent" >/dev/null 2>&1 || true
     bridge_sync_skill_docs "$agent" >/dev/null 2>&1 || true
-    printf 'project_skill: %s\n' "$workdir/.codex/skills/agent-bridge/SKILL.md"
+    # Issue #1155 r2: Codex project skill lives at $workdir/.agents/skills/agent-bridge/
+    # (per bridge_project_skill_dir_for + README:657 + cli-help/agent-bridge-usage.txt:231-233),
+    # not $workdir/.codex/skills/. The previous wrong path made the doctor diagnostic
+    # report a nonexistent location.
+    printf 'project_skill: %s\n' "$workdir/.agents/skills/agent-bridge/SKILL.md"
 
     echo
     echo "== Codex Hooks =="
