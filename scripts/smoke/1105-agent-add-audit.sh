@@ -70,67 +70,22 @@ reset_runtime() {
 
 # Lift the last `system_config_mutation` row's detail JSON from the
 # audit log. The detail is stored as a JSON-encoded string inside the
-# outer audit envelope's `detail` key — caller may also accept the
+# outer audit envelope's `detail` key — the helper also accepts the
 # legacy shape where `detail` is already a dict.
+#
+# Footgun #11 (KNOWN_ISSUES.md §26): the body used to live as
+# `python3 - "$BRIDGE_AUDIT_LOG" <<'PY' … PY` here. Codex r1 review of
+# this PR flagged it as a new heredoc-stdin trip site. The body is now
+# a standalone helper invoked file-as-argv, same precedent as
+# lib/upgrade-helpers/.
 last_create_audit_detail() {
-  python3 - "$BRIDGE_AUDIT_LOG" <<'PY'
-import json
-import sys
-
-last = None
-with open(sys.argv[1], encoding="utf-8") as fh:
-    for line in fh:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if row.get("action") != "system_config_mutation":
-            continue
-        detail = row.get("detail")
-        if isinstance(detail, str):
-            try:
-                detail = json.loads(detail)
-            except ValueError:
-                continue
-        if not isinstance(detail, dict):
-            continue
-        if detail.get("trigger") != "agent-create-apply":
-            continue
-        last = detail
-if last is None:
-    sys.exit("no agent-create-apply row in audit log")
-print(json.dumps(last))
-PY
+  python3 "$SCRIPT_DIR/1105-helpers/last-create-audit-detail.py" "$BRIDGE_AUDIT_LOG"
 }
 
 # Count system_config_mutation rows in the audit log (any trigger).
+# Footgun #11: standalone helper (see last_create_audit_detail).
 audit_row_count() {
-  python3 - "$BRIDGE_AUDIT_LOG" <<'PY'
-import json
-import sys
-
-count = 0
-try:
-    fh = open(sys.argv[1], encoding="utf-8")
-except FileNotFoundError:
-    print(0)
-    sys.exit(0)
-with fh:
-    for line in fh:
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if row.get("action") == "system_config_mutation":
-            count += 1
-print(count)
-PY
+  python3 "$SCRIPT_DIR/1105-helpers/audit-row-count.py" "$BRIDGE_AUDIT_LOG"
 }
 
 roster_sha() {
