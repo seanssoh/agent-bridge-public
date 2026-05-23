@@ -11515,6 +11515,17 @@ bash "$REPO_ROOT/scripts/smoke/989-isolated-agent-env-state-dir.sh"
 log "running nudge-task-age-gate smoke (issue #1014 A)"
 bash "$REPO_ROOT/scripts/smoke/nudge-task-age-gate.sh"
 
+# Issue #1099 — PR #1019's age gate covered only the never-nudged path.
+# Three guard paths in cmd_daemon_step (is_ready_agent bypass, prior-
+# history guard, cooldown/activity-advance guards) still let a fresh-
+# only queue through for any agent with prior nudge history. Active
+# dynamic agents got idle_seconds=1 ACTION REQUIRED nudges seconds
+# after a task landed. The fix widens the gate from agent-level to
+# task-level: a queued task younger than the redelivery window is
+# never a fresh nudge trigger regardless of last_nudge_key state.
+log "running nudge-redundant-active-agent smoke (issue #1099)"
+bash "$REPO_ROOT/scripts/smoke/nudge-redundant-active-agent.sh"
+
 # A static Claude agent with a custom CLAUDE_CONFIG_DIR resumed fresh every
 # restart because the session-id helpers expanded ~/.claude against the daemon
 # HOME. Smoke pins that both helpers resolve roots from the agent config dir.

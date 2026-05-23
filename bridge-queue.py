@@ -2181,25 +2181,53 @@ def cmd_daemon_step(args: argparse.Namespace) -> int:
         if zombie:
             continue
         last_nudged_ids = {item for item in last_nudge_key.split(",") if item}
-        # Issue #1014 A: a "new" queued task id only counts as a fresh nudge
-        # trigger once it has aged past the redelivery window. A task younger
-        # than that window already drew a task-arrival push, so an ACTION
-        # REQUIRED re-nudge for it on the next tick is redundant noise.
-        # nudge_redelivery_seconds <= 0 disables the gate entirely.
-        new_queue_ids = [
-            task_id for task_id in queue_ids if str(task_id) not in last_nudged_ids
+        # Issue #1099 (#1014-A follow-up): widen PR #1019's nudge-redelivery
+        # age gate from an agent-level invariant ("agent has no prior nudge
+        # history") to a task-level invariant ("a queued task younger than
+        # the redelivery window is not a fresh nudge trigger, period").
+        #
+        # Pre-fix, PR #1019 gated only the never-nudged path (`not
+        # last_nudged_ids and not has_new_queue_ids`). Three guard paths
+        # still let a fresh-only queue through for any agent with prior
+        # nudge history: (1) `is_ready_agent` bypassing the idle gate at
+        # line 2172, (2) the post-cooldown branch at line 2205, and (3)
+        # the activity-advance branch at line 2209. Active dynamic agents
+        # mid-claim got `idle_seconds=1` ACTION REQUIRED nudges seconds
+        # after a task landed (issue #1099 evidence: task #5653 fired at
+        # `idle_seconds:"1"` ~1s into the post-arrival grace window).
+        #
+        # Compute `eligible_queue_ids` on the FULL current queued set; the
+        # eligibility set must precede the `last_nudged_ids` subtraction,
+        # because the bug scenario is "entire queue is fresh and agent has
+        # prior nudge history". If the gate is on and no queued task has
+        # aged past the window, no candidate is emitted regardless of
+        # last_nudge_key state — the task-arrival push already covered it.
+        # nudge_redelivery_seconds <= 0 disables the gate entirely
+        # (restores pre-#1019 behavior).
+        if nudge_redelivery_seconds > 0:
+            eligible_queue_ids = [
+                task_id
+                for task_id in queue_ids
+                if (current_ts - queued_created_by_id.get(task_id, 0))
+                >= nudge_redelivery_seconds
+            ]
+        else:
+            eligible_queue_ids = list(queue_ids)
+        # Task-level invariant: fresh-only queue is never a daemon-nudge
+        # candidate. Closes Paths 1/2/3 (ready-agent bypass, prior-history
+        # guard, cooldown/activity-advance guards) in one place.
+        if nudge_redelivery_seconds > 0 and not eligible_queue_ids:
+            continue
+        eligible_new_queue_ids = [
+            task_id
+            for task_id in eligible_queue_ids
+            if str(task_id) not in last_nudged_ids
         ]
-        has_new_queue_ids = any(
-            nudge_redelivery_seconds <= 0
-            or (current_ts - queued_created_by_id.get(task_id, 0))
-            >= nudge_redelivery_seconds
-            for task_id in new_queue_ids
-        )
-        # Issue #1014 A: if every queued task is both never-nudged AND still
-        # inside its redelivery window, there is nothing nudge-worthy yet —
-        # the task-arrival push is doing its job. Skip rather than emit a
-        # redundant ACTION REQUIRED. (A previously-nudged task that needs
-        # redelivery is in last_nudged_ids, so it does not gate here.)
+        has_new_queue_ids = bool(eligible_new_queue_ids)
+        # PR #1019's original never-nudged-agent guard, now redundant with
+        # the task-level eligibility check above on the gate-on path but
+        # still required when the gate is disabled (preserves pre-#1019
+        # behavior end-to-end for `BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS=0`).
         if not last_nudged_ids and not has_new_queue_ids:
             continue
         if last_nudge_ts and current_ts - last_nudge_ts < nudge_cooldown and not has_new_queue_ids:
