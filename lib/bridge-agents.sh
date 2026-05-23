@@ -4085,24 +4085,33 @@ bridge_ensure_claude_first_run_config() {
     return 0
   fi
 
-  python3 "$helper" "$config_dir" "$workdir" >/dev/null 2>&1 || return 0
-
-  # Codex r1 BLOCKING: when the agent is linux-user isolated, the seed
-  # file is now written by the controller into the isolated home (this
-  # function runs AFTER bridge_linux_prepare_agent_isolation per the
-  # bridge-agent.sh call-site move). The isolated UID needs to OWN the
-  # seed file so Claude CLI can read it under the isolated user. chown
-  # via the privileged helper; non-isolated agents leave ownership
-  # unchanged. Best-effort; create-path failure here is non-fatal (the
-  # downstream start path will defensively re-seed and re-chown).
+  # Codex r2 BLOCKING: post-`bridge_linux_prepare_agent_isolation`,
+  # the isolated agent's `<home>/.claude/` is owned `iso_user:iso_grp`
+  # mode 2750 (`lib/bridge-agents.sh:3745-3759`). The controller is only
+  # a group member (r-x), NOT a group writer — a plain controller
+  # python3 write into that dir FAILS, gets swallowed by `|| return 0`,
+  # and the chown step never repairs anything. The seed has to be
+  # written through the privileged handoff.
+  #
+  # For linux-user isolated agents: run the helper via
+  # `bridge_linux_sudo_root sudo -u <iso_user>` so the write happens AS
+  # the isolated UID — file lands `iso_user:iso_grp` mode 0644 naturally
+  # readable by Claude CLI launched under that UID. For non-isolated
+  # agents: plain controller python3.
+  local _seed_isolated=0
+  local _iso_user=""
   if ! bridge_isolation_disabled_by_env 2>/dev/null \
       && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
-    local _iso_user
     _iso_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
-    if [[ -n "$_iso_user" ]] && command -v bridge_linux_sudo_root >/dev/null 2>&1; then
-      bridge_linux_sudo_root chown "$_iso_user:" "$config_dir/.claude.json" \
-        >/dev/null 2>&1 || true
-    fi
+    [[ -n "$_iso_user" ]] && command -v bridge_linux_sudo_root >/dev/null 2>&1 \
+      && _seed_isolated=1
+  fi
+
+  if (( _seed_isolated == 1 )); then
+    bridge_linux_sudo_root sudo -n -u "$_iso_user" \
+      python3 "$helper" "$config_dir" "$workdir" >/dev/null 2>&1 || return 0
+  else
+    python3 "$helper" "$config_dir" "$workdir" >/dev/null 2>&1 || return 0
   fi
   return 0
 }
