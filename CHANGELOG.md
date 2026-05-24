@@ -6,6 +6,116 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta17] — 2026-05-25
+
+### Highlight — declarative install-tree reconciler (Phase 2 architectural refactor)
+
+Operator-cued **seventeenth prerelease** cut for remote-host acceptance
+of the Phase 2 refactor. After eight A2A-driven QA cycles (beta9-beta16)
+applied helper-layer fixes (#1165 → #1170 → #1175 → #1178), Phase 1 VM
+testing on `agb-clean-test` proved the install tree itself was never
+designed for v2 isolated UID access. Phase 2 replaces the accreted
+inline chmod/chgrp patches with a single declarative matrix +
+reconciler. Stabilization-mode release: codex pair-review was skipped
+on the merge (per the operator's mode-switch directive); the
+verification gate is remote-host clean install + bidirectional Teams
+DM on the acceptance peer.
+
+`-beta17` prerelease; matching tag `v0.14.5-beta17`, GitHub release
+marked **Pre-release**.
+
+### Fixed / Added — Declarative install-tree reconciler (#1180)
+
+- **`lib/bridge-isolation-v2-reconcile.sh` (NEW, ~1151 LOC)** —
+  declarative matrix + reconciler owning install-tree ownership and
+  mode contracts for v2 isolation. 7 row kinds (`path_traverse`,
+  `dir`, `dir_recursive`, `file_glob`, `state_scaffold`,
+  `credential_grant`, `marker_read_path`). Public API:
+  `bridge_isolation_v2_apply_install_tree_matrix --mode check|apply
+  [--agent <name>|--all-agents] [--reason install|upgrade|
+  agent-create|manual] [--json]`. Deny-by-default protected-path
+  guard refuses `agent-roster*`, `handoff.local*`, `*.pem`/`.key`/
+  `.token`, `.credentials.json`, `state/history/`, `runtime/
+  credentials|secrets/`, `*.lock`.
+
+- **Four invocation triggers** — install (bridge-init), upgrade
+  (`bridge-upgrade.sh --apply` via `lib/upgrade-helpers/
+  isolation-v2-reconcile.sh`), agent-create
+  (`bridge_linux_prepare_agent_isolation`), and manual operator
+  escape hatch (`agent-bridge isolation reconcile [--check|--apply]
+  [--agent <X>|--all] [--json]`).
+
+- **`bridge_isolation_v2_migrate_normalize_layout`** — Layer 13/14
+  inline chmod/chgrp block (commits `195be18` + `36fb70f` on the
+  stabilize branch) removed; the reconciler owns the same surface
+  through declarative rows with the per-row protected guard.
+
+- **Layer 17 marker writer guard** — `lib/bridge-marker-bootstrap.sh`
+  gains `_bridge_marker_writer_is_controller_uid`. Marker writers
+  (`bridge_isolation_v2_migrate_marker_write` +
+  `bridge_isolation_v2_migrate_marker_write_minimal`) refuse the
+  write when the effective UID is neither root nor the controller,
+  closing the Phase 1 VM failure mode where an isolated UID under a
+  stray sudo-handoff tried to write the marker into its own home.
+
+- **Dispatcher `BRIDGE_CONTROLLER_UID` recovery refinement** —
+  the `agent-bridge` dispatcher recovery block (added in beta14 #1165
+  Gap 8) now skips when `marker_owner == 0`. After the #1161 marker
+  chown contract (root-owned marker), the recovery's read of the
+  marker owner produced `BRIDGE_CONTROLLER_UID=0`, mis-resolving
+  every downstream `controller` token to root.
+
+### Added — Python helper lift (Phase 2 D7)
+
+- **`lib/bridge_iso_paths.py`** — three new canonical helpers:
+  `safe_realpath`, `ensure_dir`, `write_text_atomic_as_owner`.
+  Consumers (`bridge-hooks.py`, `bridge-setup.py`,
+  `bridge-watchdog.py`) updated to delegate to the canonical names;
+  the bash inline atomic-write script body lives once in the module
+  rather than duplicated across consumers.
+
+- **`scripts/lint-raw-pathlib-on-isolated.sh`** scope expanded from
+  two files (`bridge-setup.py` + `bridge-hooks.py`) to all
+  `bridge-*.py` at repo root via glob-at-lint-time. Baseline
+  regenerated; ratchet ceilings recorded for 42 files (~860 sites).
+  New sites must explicitly `noqa` or refactor through the canonical
+  helpers.
+
+### Tests
+
+- **`scripts/smoke/phase2-install-tree-reconciler.sh`** — 8-case
+  smoke covering matrix-row generation, `--check` drift detection,
+  `--apply` idempotency, state-scaffold creation, credential-grant
+  routing, marker non-write guard from isolated UID, protected-files
+  exclusion, and regression boomerang.
+
+- **`scripts/smoke/{1120,1139,1145}-*.sh`** — patched to monkey-patch
+  the canonical `bridge_iso_paths.sudo_run_as` in addition to the
+  `bridge-hooks._sudo_run_as` alias, restoring stub recording after
+  the D7 helper lift moved the actual escalation into the canonical
+  module.
+
+- **`scripts/smoke/1118-v2-engine-binary-path.sh`** — T1/T1b/T1c
+  pin `BRIDGE_LAYOUT=v2` in the inner subshell so the layout
+  resolver takes the env-override path on a fresh CI checkout
+  without a `state/layout-marker.sh` on disk.
+
+### Verification
+
+- **VM acceptance** (OrbStack `agb-phase2-fresh`, Ubuntu noble
+  arm64) — destructive clean install on a fresh VM: `bridge-init.sh`
+  fresh-install path OK, v2 marker written; first isolated agent
+  create OK with auto-provisioned `ab-shared` + `ab-agent-worker`
+  groups and `2770 root:ab-agent-worker` workdir; reconciler
+  `--check` 9/10 rows OK; smoke sweep 110/113 PASS (3 pre-existing
+  fails: missing `bun` on bare VM, plus #1121+#1140 which also fail
+  on `main`).
+
+- **Known cosmetic follow-up** — #1182 `runtime-dir` reconciler row
+  reports `mismatch` when `runtime/` is empty on a fresh install
+  (probe falls back to `(none)`; actual perms are correct).
+  Non-blocking, scheduled for the next reconciler-row pass.
+
 ## [0.14.5-beta16] — 2026-05-24
 
 ### Highlight — exhaustive pathlib audit + canonical helper extraction (#1175 — eighth A2A QA cycle)
