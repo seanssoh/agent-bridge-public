@@ -289,16 +289,37 @@ def _resolve_isolated_owner_for_path(path: Path) -> str | None:
         cur = parent
 
 
-def _isolation_aware_mkdir(path: Path) -> None:
+def _isolation_aware_mkdir(
+    path: Path,
+    mode: int = 0o2750,
+    group: str | None = None,
+) -> None:
     """`mkdir -p` with isolation awareness. If `path` does not exist and
     its nearest existing ancestor is owned by an isolated
     `agent-bridge-<slug>` UID, create the missing components as that
-    UID via `sudo -n -u <owner> bash -c 'umask 0077; mkdir -p "$1"'`.
-    Otherwise falls back to `Path.mkdir(parents=True, exist_ok=True)`.
+    UID via `sudo -n -u <owner> bash -c '...'`. Otherwise falls back to
+    `Path.mkdir(parents=True, exist_ok=True)`.
 
-    The umask=0077 ensures the new dir lands at mode 0700 owned by the
-    isolated UID, mirroring the v0700/0750 mode the isolation-prepare
-    flow uses for precreated channel state dirs.
+    For isolated channel state dirs (`.teams/`, `.telegram/`, `.discord/`,
+    `.mattermost/`) the default mode is `0o2750` (setgid + group r-x), so
+    the controller (a member of the agent group `ab-agent-<slug>`) keeps
+    traversal permission after the chown to the isolated UID lands.
+    Pre-#1165 the helper used `umask 0077` which produced mode 0700 and
+    locked the controller out of every subsequent `os.stat` against the
+    channel state files (#1165 Gap 1 — `setup teams` then failed on the
+    next `inspect_teams_dir` with PermissionError).
+
+    Args:
+      path: directory to create.
+      mode: target mode for the new directory. Defaults to `0o2750`
+        which matches the v2 isolation contract for channel state dirs.
+      group: optional group name to `chgrp` after the mkdir+chmod step.
+        When None and the isolated owner's primary group resolves via
+        `id -gn`, that primary group is used (the iso UID's primary
+        group is always `ab-agent-<slug>` on a v2 install). When the
+        probe fails the chgrp step is skipped silently — the chmod
+        already widened group traversal in absolute terms; chgrp is
+        belt-and-braces to land the correct setgid inheritance target.
     """
     if path.exists():
         return
@@ -306,16 +327,48 @@ def _isolation_aware_mkdir(path: Path) -> None:
     if owner is None:
         path.mkdir(parents=True, exist_ok=True)
         return
-    script = (
-        'set -e\n'
-        'umask 0077\n'
-        'mkdir -p "$1"\n'
-        'exit 0\n'
-    )
+    # Resolve the agent group name. The iso UID's primary group is the
+    # per-agent group (`ab-agent-<slug>` on a v2 install); `id -gn` is
+    # authoritative on the local host so we do not have to mirror the
+    # 32-char hash-truncation branch from
+    # bridge_isolation_v2_agent_group_name.
+    resolved_group = group
+    if resolved_group is None:
+        try:
+            id_proc = subprocess.run(
+                ["id", "-gn", owner],
+                check=False, capture_output=True, text=True,
+            )
+        except FileNotFoundError:
+            id_proc = None
+        if id_proc is not None and id_proc.returncode == 0:
+            candidate = id_proc.stdout.strip()
+            if candidate:
+                resolved_group = candidate
+    # Build the script with mode encoded in octal (e.g. 0o2750 -> "2750").
+    # The mkdir runs under umask 0077 to guarantee a deterministic
+    # starting point; the explicit chmod afterwards lands the target
+    # mode regardless of the inherited umask. chgrp is best-effort on
+    # the isolated UID's own primary group — failure does not abort
+    # because the chmod alone restores controller traversal on the
+    # common v2 case (group already matches the agent group).
+    mode_oct = format(mode, 'o')
+    script_lines = [
+        'set -e',
+        'umask 0077',
+        'mkdir -p "$1"',
+        'chmod "$2" "$1"',
+    ]
+    if resolved_group:
+        script_lines.append('chgrp "$3" "$1" 2>/dev/null || true')
+    script_lines.append('exit 0')
+    script = '\n'.join(script_lines) + '\n'
     full = [
         "sudo", "-n", "-u", owner, "bash", "-c", script,
-        "bridge-isolation", str(path),
+        "bridge-isolation", str(path), mode_oct,
     ]
+    if resolved_group:
+        full.append(resolved_group)
     try:
         proc = subprocess.run(
             full, check=False, capture_output=True, text=True

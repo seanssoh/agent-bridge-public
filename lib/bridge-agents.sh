@@ -3885,18 +3885,34 @@ bridge_linux_prepare_agent_isolation() {
   local isolated_claude_dir="$user_home/.claude"
   bridge_linux_sudo_root mkdir -p "$isolated_claude_dir"
   bridge_linux_sudo_root chown "$os_user" "$isolated_claude_dir" >/dev/null 2>&1 || true
-  # v2: chgrp ab-agent-<name> + chmod 2750 (setgid so new subdirs like
-  # projects/ inherit the group) so the controller (group member of
-  # ab-agent-<name>) can reach ~/.claude/projects/ for the memory-daily
-  # harvester without any named-user ACL.
+  # v2: chgrp ab-agent-<name> + chmod 2770 (setgid so new subdirs like
+  # projects/ and session-env/ inherit the group) so the controller
+  # (group member of ab-agent-<name>) can reach ~/.claude/projects/ for
+  # the memory-daily harvester without any named-user ACL.
+  #
+  # #1165 Gap 2: mode broadened from 2750 to 2770. The owner bit was
+  # rwx pre-fix (so an owner-UID mkdir should have worked), but the
+  # observed SessionStart hook failure shape is `mkdir: cannot create
+  # directory '/home/agent-bridge-<a>/.claude/session-env': Permission
+  # denied` — i.e. the hook process's effective UID is not the dir
+  # owner in practice (suspected tmux/sudo wrapper stripping owner
+  # identity on the SessionStart spawn path). Widening to 2770 makes
+  # the group bit writable, which unblocks the hook via the
+  # supplementary-group path. Security model: the only group members
+  # are the controller user + the isolated UID itself (PR-C agent-
+  # group composition); no third party gains write. setgid (2xxx) is
+  # preserved so new subdirs inside ~/.claude (projects/, session-env/,
+  # statsig/, etc.) inherit the agent group rather than the writer's
+  # primary group, keeping the controller harvester's group-r-x path
+  # working on every new file.
   local _claude_v2_grp=""
   _claude_v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
   [[ -n "$_claude_v2_grp" ]] \
     || bridge_die "isolation v2: cannot resolve agent group for ~/.claude of '$agent'"
   bridge_linux_sudo_root chgrp "$_claude_v2_grp" "$isolated_claude_dir" \
     || bridge_die "isolation v2: chgrp $_claude_v2_grp on '$isolated_claude_dir' failed"
-  bridge_linux_sudo_root chmod 2750 "$isolated_claude_dir" \
-    || bridge_die "isolation v2: chmod 2750 on '$isolated_claude_dir' failed"
+  bridge_linux_sudo_root chmod 2770 "$isolated_claude_dir" \
+    || bridge_die "isolation v2: chmod 2770 on '$isolated_claude_dir' failed"
   # Channel-ownership-aware plugin sharing. Without this the isolated UID's
   # ~/.claude/plugins/ is empty and Claude starts with no MCP servers loaded
   # (Teams/ms365/cosmax-* all silently missing). The helper writes a per-UID

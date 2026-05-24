@@ -609,6 +609,24 @@ bridge_install_teams_plugin_node_modules() {
     return 1
   fi
 
+  # #1165 Gap 3: bun install runs as the controller, so
+  # plugins/teams/node_modules/ inherits the controller umask (often
+  # 077 → mode 0700 awfmanager-owned). bridge-dev-plugin-cache.py
+  # then runs under the isolated UID's `sudo -u agent-bridge-<a>`
+  # context and fails to copy with `Permission denied:
+  # '.../plugins/teams/node_modules/.bin/...'`. Widen the tree to
+  # `go+rX` (read + traverse for group/other) so any isolated UID can
+  # copy it during the per-agent plugin cache materialize step. Plugin
+  # source files are non-secret git content; the bun lockfile and
+  # package.json are already world-readable in the source tree, so this
+  # only re-aligns the post-install node_modules tree with the rest of
+  # the plugin source. The chmod is best-effort: a failure here does
+  # not block setup (the operator may chmod after the fact), but a
+  # warning surfaces so the gap is visible.
+  if ! chmod -R go+rX "$plugin_dir/node_modules" 2>/dev/null; then
+    bridge_warn "chmod -R go+rX failed on $plugin_dir/node_modules — isolated agents may fail to copy via bridge-dev-plugin-cache"
+  fi
+
   return 0
 }
 
