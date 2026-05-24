@@ -181,9 +181,20 @@ if [[ -z "${BRIDGE_CONTROLLER_UID:-}" ]]; then
       _bridge_recovery_owner="$(stat -c '%u' "$_bridge_recovery_marker" 2>/dev/null || true)"
     fi
     _bridge_recovery_current="$(id -u 2>/dev/null || true)"
+    # Phase 2 refinement: skip recovery when the marker is root-owned
+    # (#1161 contract since beta13: `chown root:ab-shared` on the
+    # marker file for validator-owner-exemption symmetry). A
+    # root-owned marker carries no controller-identity signal — using
+    # it to set BRIDGE_CONTROLLER_UID=0 makes every controller
+    # invocation look like "controller is root" downstream, which
+    # mis-resolves matrix `controller` tokens to root in the new
+    # install-tree reconciler (Phase 2 D5). The original recovery
+    # intent (iso UID reading a controller-owned marker pre-#1161)
+    # still works when the marker's owner is a real user UID.
     if [[ -n "$_bridge_recovery_owner" \
         && -n "$_bridge_recovery_current" \
-        && "$_bridge_recovery_owner" != "$_bridge_recovery_current" ]]; then
+        && "$_bridge_recovery_owner" != "$_bridge_recovery_current" \
+        && "$_bridge_recovery_owner" != "0" ]]; then
       export BRIDGE_CONTROLLER_UID="$_bridge_recovery_owner"
     fi
     unset _bridge_recovery_owner _bridge_recovery_current
