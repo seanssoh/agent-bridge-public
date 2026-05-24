@@ -855,8 +855,16 @@ _bridge_iso_reconcile_row_agent_home_contract() {
       "$notes (helper rc=$helper_rc)"
     return 1
   fi
-  local _hp _hstatus _howner_grp _hmode
-  IFS=$'\t' read -r _hp _hstatus _howner_grp _hmode <<<"$helper_line"
+  # Parse tab-separated `helper_line` via parameter expansion — avoids
+  # the `<<<` here-string heredoc-stdin class (footgun #11) that the
+  # lint baseline ratchet refuses.
+  local _hp _hstatus _howner_grp _hmode _hrest
+  _hp="${helper_line%%$'\t'*}"
+  _hrest="${helper_line#*$'\t'}"
+  _hstatus="${_hrest%%$'\t'*}"
+  _hrest="${_hrest#*$'\t'}"
+  _howner_grp="${_hrest%%$'\t'*}"
+  _hmode="${_hrest#*$'\t'}"
   local _hreport_status=""
   case "$_hstatus" in
     ok)      _hreport_status="$BRIDGE_ISO_RECONCILE_STATUS_OK" ;;
