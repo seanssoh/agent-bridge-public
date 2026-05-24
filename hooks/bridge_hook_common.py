@@ -300,7 +300,6 @@ def _current_isolation_mode() -> str:
 
 def write_audit(action: str, target: str, detail: dict[str, Any]) -> None:
     path = audit_log_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "ts": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
         "actor": "hook",
@@ -313,8 +312,27 @@ def write_audit(action: str, target: str, detail: dict[str, Any]) -> None:
         "acting_os_user": _acting_os_user(),
         "isolation_mode": _current_isolation_mode(),
     }
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+    # Issue #1165 Gap 7: under linux-user isolation the audit log path
+    # resolves to ``$BRIDGE_HOME/logs/agents/<agent>/audit.jsonl`` —
+    # a controller-owned tree the isolated UID cannot mkdir into or
+    # append to. Without a guard, every PostToolUse hook from inside the
+    # isolated Claude REPL ends with a PermissionError traceback that
+    # Claude surfaces as a ``PostToolUseFailure`` flood per tool call.
+    # Same "check-then-skip rather than fail-with-traceback" pattern as
+    # the recent v2-isolation fixes (#1145, #1151, #1155): when the
+    # writer cannot satisfy the controller-only path AND the calling UID
+    # is a linux-user-isolated agent (not the controller), silently
+    # no-op. Controller-side callers retain the original raise-on-error
+    # behavior so a genuine logs-dir permission regression is still
+    # surfaced (the controller is supposed to own the tree).
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+    except (PermissionError, OSError):
+        if current_isolated_agent() is not None:
+            return
+        raise
 
 
 def queue_gateway_root() -> Path:

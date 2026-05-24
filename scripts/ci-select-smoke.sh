@@ -209,6 +209,19 @@ select_for_path() {
   case "$path" in
     agent-bridge|agb|bridge-upgrade.sh|bridge-memory.sh|bridge-intake.sh|bridge-bundle.sh|bridge-cron.sh|bridge-daemon.sh|bridge-discord-relay.sh|bridge-send.sh|bridge-agent.sh|bridge-profile.sh|bridge-task.sh)
       add_required 1114-cli-help-contract 1117-cli-help-universal-gate
+      # Issue #1165 Gap 8: the agent-bridge dispatcher head carries
+      # the BRIDGE_CONTROLLER_UID recovery block that re-arms the
+      # marker validator's owner exemption (#1158) when agb is
+      # invoked directly from an isolated UID (not through the
+      # bridge-start.sh sudo wrapper). Pull the Track C smoke on
+      # every dispatcher move so a future PR cannot regress the
+      # recovery + marker-stat formula away from
+      # lib/bridge-marker-bootstrap.sh's path resolution.
+      case "$path" in
+        agent-bridge|agb)
+          add_required 1165-track-c-hooks-and-dispatcher
+          ;;
+      esac
       ;;
     lib/bridge-cron.sh|lib/bridge-state.sh)
       # Issue #1117: lib/bridge-cron.sh hosts bridge_cron_python +
@@ -627,7 +640,7 @@ select_for_path() {
       # isolation, link-shared-claude-skill, sync-claude-runtime-skills,
       # ensure-memory-precompact-hook, ensure-project-claude-guidance) stays
       # pinned.
-      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper
+      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher
       add_integration integration-minimal
       ;;
 
