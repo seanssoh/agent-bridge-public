@@ -1006,15 +1006,22 @@ def cmd_ensure_codex_hooks(args: argparse.Namespace) -> int:
     return 0
 
 
-def next_backup_path(path: Path) -> Path:
-    # Controller-side backup-name collision loop. Callers operate on
-    # paths sitting next to the original (same parent dir, same owner)
-    # so when the original is controller-readable so is the candidate.
-    # Iso-routed callers should resolve a safe path upstream.
+def next_backup_path(path: Path, os_user: str | None = None) -> Path:
+    # Backup-name collision loop. The candidate sits next to the
+    # original (same parent dir, same owner), so when `os_user` is
+    # provided we route the existence probe through `_safe_path_check`
+    # — the same proactive-sudo + fail-closed wrapper the caller used
+    # to confirm the original — instead of a raw `candidate.exists()`
+    # that can raise PermissionError on a blind isolated directory
+    # before the caller's sudo-backed copy2/rm fallback can fire
+    # (#1175 r2 / PR #1176 codex review). When `os_user` is None the
+    # wrapper falls through to the direct pathlib check with the
+    # ancestor-walker recovery, so controller-only callers stay
+    # well-behaved.
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     candidate = path.with_name(f"{path.stem}.agent-bridge.bak-{stamp}{path.suffix}")
     index = 1
-    while candidate.exists():  # noqa: raw-pathlib-controller-only — backup name uniquification next to a controller-readable original
+    while _safe_path_check("exists", candidate, os_user):
       candidate = path.with_name(f"{path.stem}.agent-bridge.bak-{stamp}-{index}{path.suffix}")
       index += 1
     return candidate
@@ -1484,7 +1491,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
                         raise
                 status = "updated"
         elif _safe_path_check("exists", settings_path, os_user):
-            backup = next_backup_path(settings_path)
+            backup = next_backup_path(settings_path, os_user)
             try:
                 shutil.copy2(settings_path, backup)
             except PermissionError:

@@ -44,9 +44,9 @@
 #
 # - Lines containing `# noqa: raw-pathlib-controller-only` are skipped.
 #   These mark deliberate controller-only call sites (operator-supplied
-#   token-file paths, controller-owned channels-home dotenv,
-#   `next_backup_path` collision loop, etc.) and the import-time lib-dir
-#   probe.
+#   token-file paths, controller-owned channels-home dotenv, primitives
+#   used by both controller and iso-routed callers, etc.) and the
+#   import-time lib-dir probe.
 # - Lines whose first non-whitespace char is `#` are skipped (comments).
 # - Lines inside triple-quoted strings (docstring text) are skipped via
 #   a heuristic: if the matched expression is preceded by a backtick or
