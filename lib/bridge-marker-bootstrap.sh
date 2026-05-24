@@ -33,8 +33,67 @@ bridge_isolation_v2_marker_path() {
   # Marker is anchored on BRIDGE_LAYOUT_MARKER_DIR, never BRIDGE_STATE_DIR.
   # Falls back through env vars so isolated tempdir tests and child processes
   # without bridge-lib.sh sourced still resolve a sensible default.
+  #
+  # Phase 2 (post-v0.14.5-beta16, Layer 17): the canonical marker path is
+  # ALWAYS absolute. When BRIDGE_LAYOUT_MARKER_DIR is exported into a
+  # sudo/as-agent launch (lib/bridge-agents.sh:3358), the isolated UID's
+  # marker resolution short-circuits via that env var and never
+  # accidentally falls into the iso UID's local `$HOME/.agent-bridge/state/`
+  # path (the symlink chain that wedged in Phase 1 testing — iso UID
+  # had `$HOME/.agent-bridge -> /home/<controller>/.agent-bridge`, and
+  # the resolver computed `$HOME/.agent-bridge/state/layout-marker.sh`
+  # BEFORE the symlink resolved to a writable target). The absolute
+  # path from the env var is the only correct answer.
   printf '%s/layout-marker.sh' \
     "${BRIDGE_LAYOUT_MARKER_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+}
+
+_bridge_marker_writer_is_controller_uid() {
+  # Returns 0 (true) when the current effective UID is allowed to WRITE
+  # the marker file: either root (UID 0) or the controller UID (either
+  # the current process is the controller, or BRIDGE_CONTROLLER_UID
+  # matches the current process). Returns 1 for any other context —
+  # including isolated agent UIDs `agent-bridge-<slug>` which must
+  # NEVER take the "create if absent" path on marker writes (Layer 17).
+  #
+  # Rationale (Phase 2, Layer 17): Phase 1 VM testing on agb-clean-test
+  # surfaced the failure mode — an isolated UID running bridge-run.sh
+  # (or any controller-side helper sudo-escalated into the iso context)
+  # tried to mkdir + write the marker file at its own
+  # `$HOME/.agent-bridge/state/layout-marker.sh` path, hit EACCES, and
+  # the upstream caller saw `markerless(existing-install)` from the
+  # layout resolver. The right answer is to refuse the write in the
+  # iso UID branch and let the controller's own marker live in its
+  # canonical location (which the env var already points at).
+  local current_uid
+  current_uid="$(id -u 2>/dev/null || true)"
+  [[ -n "$current_uid" ]] || return 1
+  if (( current_uid == 0 )); then
+    return 0
+  fi
+  # Controller UID from the env var that the controller's own
+  # `bridge_write_linux_agent_env_file` exports into every launch
+  # envelope. Numeric comparison so a stale `printf %q`-quoted value
+  # (covered already by bridge_isolation_v2_marker_validate's strip
+  # logic) doesn't trip on quoting.
+  local exported_controller_uid="${BRIDGE_CONTROLLER_UID:-}"
+  exported_controller_uid="${exported_controller_uid#\'}"
+  exported_controller_uid="${exported_controller_uid%\'}"
+  exported_controller_uid="${exported_controller_uid#\"}"
+  exported_controller_uid="${exported_controller_uid%\"}"
+  if [[ -n "$exported_controller_uid" && "$exported_controller_uid" =~ ^[0-9]+$ ]]; then
+    if (( current_uid == exported_controller_uid )); then
+      return 0
+    fi
+  fi
+  # When no exported controller UID is present, the current process is
+  # presumed to be the controller itself (this only happens in the
+  # original controller's shell, not in a sudo-escalated child). Fall
+  # back to "yes" so the controller's first-ever marker write succeeds.
+  if [[ -z "$exported_controller_uid" ]]; then
+    return 0
+  fi
+  return 1
 }
 
 # Portable stat shims — GNU coreutils uses `-c <fmt>`, BSD/macOS uses

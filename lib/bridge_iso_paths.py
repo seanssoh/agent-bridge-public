@@ -596,6 +596,159 @@ def safe_load_json(path: Path, default: Any) -> Any:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 lift — Realpath / ensure_dir / atomic write
+# Consolidated from bridge-hooks.py (_safe_realpath, _ensure_dir_with_sudo)
+# and bridge-setup.py (_sudo_write_as) so the helper layer has one canonical
+# implementation. Pre-Phase 2: each consumer file carried near-identical
+# private duplicates and a bug fixed in one didn't land in the other (the
+# same class as cycle 9-12 cost).
+# ---------------------------------------------------------------------------
+
+
+def safe_realpath(path: Path, os_user: str | None) -> str:
+    """PermissionError-safe `os.path.realpath` for isolated workdirs.
+
+    `os.path.realpath` resolves symlinks by stat-ing each component;
+    on an isolated workdir the controller can hit PermissionError mid-
+    resolution. When `os_user` is provided, falls back to
+    `sudo -n -u <agent-user> readlink -f`. Returns the original path
+    string when the sudo fallback also fails (best-effort — callers
+    compare two realpaths for equality, so falling back to the raw
+    string just forces the "not equal" branch and re-creates whatever
+    the caller wanted to recreate).
+
+    Lifted from bridge-hooks.py:_safe_realpath (Phase 2). The hooks-
+    side wrapper now delegates to this canonical implementation; the
+    private name remains via the back-compat alias below for any
+    legacy unit-test introspection.
+    """
+    try:
+        return os.path.realpath(path)
+    except PermissionError:
+        if os_user is None:
+            raise
+        # captured-stdio so we can read the result back; rc-only would
+        # discard the answer.
+        result = sudo_run_as_capture(os_user, "readlink", "-f", str(path))
+        if result.returncode == 0:
+            return (result.stdout or "").strip() or str(path)
+        return str(path)
+
+
+def ensure_dir(path: Path, os_user: str | None) -> None:
+    """`mkdir -p` with isolation awareness.
+
+    When `os_user` is provided and is NOT the current process user,
+    route through `sudo -n -u <os_user> mkdir -p <path>` FIRST. The
+    isolated UID owns its workdir (mode 2770) so creating subdirs
+    under it succeeds without controller intervention.
+
+    Fallback: when sudo escalation is unavailable (rc=127 / non-Linux
+    dev host) or fails, attempt the controller-direct
+    `path.mkdir(parents=True, exist_ok=True)`. On v2 isolation that
+    controller-direct mkdir will itself fail with PermissionError —
+    re-raise so the caller sees a real error rather than silent
+    partial state. The caller is responsible for try/except OSError
+    to surface a structured warning (the #1145 / #1119 / PR #1124
+    pattern).
+
+    Lifted from bridge-hooks.py:_ensure_dir_with_sudo (Phase 2). The
+    consumer's `os_user is None → resolve via _isolated_workdir_owner`
+    fallback is preserved in the wrapper, not here — this canonical
+    function takes the resolved owner as input so callers stay
+    explicit about who they're escalating to.
+    """
+    current_user = ""
+    try:
+        import pwd
+        current_user = pwd.getpwuid(os.getuid()).pw_name
+    except (KeyError, ImportError):
+        current_user = ""
+    if os_user is not None and os_user != current_user:
+        rc = sudo_run_as(os_user, "mkdir", "-p", str(path))
+        if rc == 0:
+            return
+        # Fall through — sudo failed (rc=127 missing, or sudo rc≠0).
+        # The controller-direct attempt below will re-raise the real
+        # PermissionError if the path is actually isolated.
+    path.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — canonical fallback after sudo-first
+
+
+# Inline bash that the atomic-write contract relies on. Same body as
+# bridge-setup.py:_ISOLATED_WRITE_SCRIPT and
+# bridge_isolation_write_file_as_agent_user_via_bash — mktemp in the
+# DEST dir (so the final mv is rename-on-same-FS atomic), chmod
+# before rename, mv -f. Argv positions:
+#   $0  literal "bridge-isolation"  (for ps display only)
+#   $1  dest_path
+#   $2  mode (octal, no leading zero)
+_ATOMIC_WRITE_SCRIPT = (
+    'set -eo pipefail\n'
+    'dest_path="$1"\n'
+    'mode="$2"\n'
+    'dest_dir="$(dirname "$dest_path")"\n'
+    '[[ -d "$dest_dir" ]] || exit 5\n'
+    'tmp="$(mktemp "$dest_dir/.$(basename "$dest_path").bridge-write-tmp.XXXXXX")" || exit 6\n'
+    'trap \'rm -f "$tmp" 2>/dev/null\' EXIT INT TERM\n'
+    'if ! cat - >"$tmp"; then exit 7; fi\n'
+    'if ! chmod "$mode" "$tmp"; then exit 8; fi\n'
+    'if ! mv -f "$tmp" "$dest_path"; then exit 9; fi\n'
+    'trap - EXIT INT TERM\n'
+    'exit 0\n'
+)
+
+
+def write_text_atomic_as_owner(
+    os_user: str,
+    dest_path: Path,
+    content: str,
+    mode: int = 0o600,
+) -> "subprocess.CompletedProcess[str]":
+    """Atomic write of `content` to `dest_path` as `os_user`.
+
+    Streams `content` via stdin to `bash -c <inline-script>` running
+    as `os_user` under `sudo -n`. The inline script writes via
+    mktemp-in-target-dir + chmod-before-rename — same atomicity
+    contract as `bridge_isolation_write_file_as_agent_user_via_bash`
+    (the bash sibling in `lib/bridge-isolation-helpers.sh`).
+
+    Returns the `CompletedProcess` so callers can inspect
+    `returncode` / `stderr`. Does NOT raise on non-zero rc — caller
+    is responsible for surfacing the failure shape. Mirrors the
+    pre-Phase 2 `bridge-setup.py:_sudo_write_as` ergonomics.
+
+    Exit codes from the inline script:
+       5 — dest_dir does not exist (caller should mkdir parent first)
+       6 — mktemp in dest_dir failed (permission / disk full)
+       7 — cat stdin → tmp failed
+       8 — chmod tmp failed
+       9 — mv tmp → dest_path failed
+     127 — sudo not installed (synthetic, from FileNotFoundError catch)
+
+    Lifted from bridge-setup.py:_sudo_write_as (Phase 2). The setup-
+    side wrapper now delegates here; the inline script lives in this
+    module so both consumers share one bash body.
+    """
+    full = [
+        "sudo", "-n", "-u", os_user, "bash", "-c", _ATOMIC_WRITE_SCRIPT,
+        "bridge-isolation", str(dest_path), f"{mode:o}",
+    ]
+    try:
+        return subprocess.run(
+            full, input=content, check=False, capture_output=True, text=True
+        )
+    except FileNotFoundError:
+        print(
+            f"[bridge-iso-paths] sudo not available; cannot write {dest_path} "
+            f"as '{os_user}'",
+            file=sys.stderr,
+        )
+        return subprocess.CompletedProcess(
+            args=full, returncode=127, stdout="", stderr=""
+        )
+
+
+# ---------------------------------------------------------------------------
 # Back-compat aliases for legacy private-name introspection
 # (e.g. unit-test harnesses that stub `mod._sudo_run_as` after a
 # from-import). The aliases point to the same callable, so swapping
@@ -610,6 +763,13 @@ _safe_path_check = safe_path_check
 _safe_read_env = safe_read_env
 _safe_load_json = safe_load_json
 _parse_dotenv_text = parse_dotenv_text
+# Phase 2 aliases — same back-compat shape so consumer-side wrappers
+# (bridge-hooks.py:_safe_realpath / _ensure_dir_with_sudo,
+# bridge-setup.py:_sudo_write_as) can route through these names if a
+# test harness ever monkey-patches the module-level callable.
+_safe_realpath = safe_realpath
+_ensure_dir = ensure_dir
+_write_text_atomic_as_owner = write_text_atomic_as_owner
 # `_sudo_stat_owner` is #1178 private helper used by the cycle 12 entry
 # points (resolve_isolated_owner_for_path + isolated_workdir_owner). It
 # is named with a leading underscore at `def` time, so no separate
@@ -626,6 +786,10 @@ __all__ = [
     "safe_read_env",
     "safe_load_json",
     "parse_dotenv_text",
+    # Phase 2 canonical names
+    "safe_realpath",
+    "ensure_dir",
+    "write_text_atomic_as_owner",
     # back-compat aliases
     "_isolated_workdir_owner",
     "_resolve_isolated_owner_for_path",
@@ -635,6 +799,9 @@ __all__ = [
     "_safe_read_env",
     "_safe_load_json",
     "_parse_dotenv_text",
+    "_safe_realpath",
+    "_ensure_dir",
+    "_write_text_atomic_as_owner",
     # #1178 private helper (exposed for test introspection only)
     "_sudo_stat_owner",
 ]

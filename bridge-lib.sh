@@ -383,6 +383,13 @@ bridge_source_module "bridge-isolation-v2.sh"
 # credential grants during upgrade. Source it here so every entry
 # point sees the helper.
 bridge_source_module "bridge-isolation-v2-reapply.sh"
+# Phase 2 (post-v0.14.5-beta16): declarative install-tree reconciler.
+# Sourced AFTER bridge-isolation-v2-reapply.sh because
+# `apply_install_tree_matrix --all-agents` defers to
+# `bridge_isolation_v2_reapply_eligible_agents` to enumerate the
+# isolated roster. Sourced BEFORE bridge-isolation-v3-channel-dotenv.sh
+# (no dependency) so the load order stays grouped under the v2 family.
+bridge_source_module "bridge-isolation-v2-reconcile.sh"
 # #857 PR-6 (v0.13.4): channel-dotenv migrator. Depends on v2-reapply
 # primitives (record_action / run_priv / has_named_acl /
 # probe_owner_group_mode / chown_chmod_file) — source after v2-reapply.

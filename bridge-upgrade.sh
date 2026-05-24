@@ -1808,6 +1808,41 @@ if [[ $DRY_RUN -eq 0 ]]; then
   rm -rf "$_write_state_payload_dir"
 fi
 
+# Phase 2 (post-v0.14.5-beta16): re-apply the declarative install-tree
+# reconciler on every `upgrade --apply` so existing installs (beta9-16)
+# converge to the canonical group/mode contract that v2 isolation
+# demands. The reconciler is idempotent — a clean tree shows zero
+# changes — and protected paths (agent-roster*, handoff.local*,
+# secrets) are refused by the per-row protected guard. Non-zero exit
+# surfaces as a warning (not bridge_die): the operator can run
+# `agent-bridge isolation reconcile --check` manually to inspect drift
+# and `--apply` to repair, without blocking the rest of the upgrade
+# from completing. Skip on dry-run for symmetry with shared-settings
+# rerender.
+if [[ $DRY_RUN -eq 0 ]]; then
+  set +e
+  _iso_reconcile_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-iso-recon.XXXXXX")"
+  # Footgun #11: invoke the helper as a standalone script with args via
+  # argv (no heredoc-stdin into a subprocess). The helper sources
+  # bridge-lib.sh from $TARGET_ROOT so the reconciler module loads
+  # against the upgraded install tree.
+  bridge_upgrade_with_target_env "$TARGET_ROOT" \
+    "$BRIDGE_BASH_BIN" \
+    "$SOURCE_ROOT/lib/upgrade-helpers/isolation-v2-reconcile.sh" \
+    "$SOURCE_ROOT" "$TARGET_ROOT" >"$_iso_reconcile_tmp" 2>&1
+  _iso_reconcile_rc=$?
+  set -e
+  if [[ $_iso_reconcile_rc -ne 0 ]]; then
+    echo "[bridge-upgrade] WARN: install-tree reconciler reported drift or partial apply (rc=$_iso_reconcile_rc)" >&2
+    echo "[bridge-upgrade] WARN: run 'agent-bridge isolation reconcile --check' on the target install to inspect, then '--apply' to converge" >&2
+    _upgrade_partial_failures+=("iso_reconcile")
+    # Tail the reconciler output into the upgrade log for the audit
+    # trail. Cap at 50 lines so a noisy run doesn't flood stderr.
+    tail -n 50 "$_iso_reconcile_tmp" >&2 || true
+  fi
+  rm -f -- "$_iso_reconcile_tmp"
+fi
+
 # Footgun #11: `bridge_upgrade_agent_restart_json` feeds python via heredoc;
 # `$()` capture would deadlock under Bash 5.3.9 once a real report ships
 # enough output to fill the pipe (the leap path traverses this twice).

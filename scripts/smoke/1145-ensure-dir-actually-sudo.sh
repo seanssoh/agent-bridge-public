@@ -96,6 +96,11 @@ printf '%s\n' '    if cmd and cmd[0] == "mkdir":' >>"$T1_HARNESS"
 printf '%s\n' '        _os.makedirs(cmd[-1], exist_ok=True)' >>"$T1_HARNESS"
 printf '%s\n' '    return 0' >>"$T1_HARNESS"
 printf '%s\n' 'mod._sudo_run_as = fake_sudo_run_as' >>"$T1_HARNESS"
+# Phase 2 D7 lift: _ensure_dir_with_sudo delegates to bridge_iso_paths.ensure_dir,
+# which calls sudo_run_as from its own module globals — patch both sites.
+printf '%s\n' 'import importlib' >>"$T1_HARNESS"
+printf '%s\n' 'iso_paths = importlib.import_module("bridge_iso_paths")' >>"$T1_HARNESS"
+printf '%s\n' 'iso_paths.sudo_run_as = fake_sudo_run_as' >>"$T1_HARNESS"
 printf '%s\n' 'mod._ensure_dir_with_sudo(Path(target), iso_user)' >>"$T1_HARNESS"
 printf '%s\n' '# Print the FIRST recorded call (must be sudo: ..., never mkdir: ...).' >>"$T1_HARNESS"
 printf '%s\n' 'with open(call_log) as f:' >>"$T1_HARNESS"
@@ -148,6 +153,12 @@ printf '%s\n' 'target = sys.argv[3]' >>"$T2_HARNESS"
 printf '%s\n' 'def fake_sudo_run_as(os_user, *cmd):' >>"$T2_HARNESS"
 printf '%s\n' '    return 127  # sudo unavailable' >>"$T2_HARNESS"
 printf '%s\n' 'mod._sudo_run_as = fake_sudo_run_as' >>"$T2_HARNESS"
+# Phase 2 D7 lift: also patch bridge_iso_paths.sudo_run_as so the stub
+# fires from the canonical helper. T2 needs rc=127 from both sites for
+# the controller-direct fallback path to be exercised.
+printf '%s\n' 'import importlib' >>"$T2_HARNESS"
+printf '%s\n' 'iso_paths = importlib.import_module("bridge_iso_paths")' >>"$T2_HARNESS"
+printf '%s\n' 'iso_paths.sudo_run_as = fake_sudo_run_as' >>"$T2_HARNESS"
 printf '%s\n' 'mod._ensure_dir_with_sudo(Path(target), iso_user)' >>"$T2_HARNESS"
 printf '%s\n' 'print("OK" if Path(target).is_dir() else "MISSING")' >>"$T2_HARNESS"
 

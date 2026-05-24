@@ -2,33 +2,33 @@
 # Schema: path<TAB>line<TAB>category<TAB>snippet_hash<TAB>reason<TAB>owner<TAB>expires_or_phase
 # Identity column is snippet_hash; line numbers are advisory.
 path	line	category	snippet_hash	reason	owner	expires_or_phase
-agent-bridge	489	C3	cc220a62dc7a5d056fd7e18ea17f2e1859ec43860341cb16e686acccdf4769c4	interpreter heredoc, no capture	patch	Phase 3 PR C
-agent-bridge	524	C3	99b39b0478da9a718dde0e83b21c7e3f236073606f3776baf08ed74fc6f9f741	interpreter heredoc, no capture	patch	Phase 3 PR C
-agent-bridge	901	C3	649517293b74ef7cd498ce9b6be8bcfe1ab708fe6340226fd7b1e2198880cc43	interpreter heredoc, no capture	patch	Phase 3 PR C
-agent-bridge	955	H3	c0cc27c28d8f74f422feed8ff51f341770c10d2f91e34e4c40bec682a0d18aa1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-agent-bridge	1226	H3	c710562d9ddf2425c58cf40fd60a4ab0ee708797d8c52a9a496b2d6b14935e17	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+agent-bridge	538	C3	cc220a62dc7a5d056fd7e18ea17f2e1859ec43860341cb16e686acccdf4769c4	interpreter heredoc, no capture	patch	Phase 3 PR C
+agent-bridge	573	C3	99b39b0478da9a718dde0e83b21c7e3f236073606f3776baf08ed74fc6f9f741	interpreter heredoc, no capture	patch	Phase 3 PR C
+agent-bridge	950	C3	649517293b74ef7cd498ce9b6be8bcfe1ab708fe6340226fd7b1e2198880cc43	interpreter heredoc, no capture	patch	Phase 3 PR C
+agent-bridge	1004	H3	c0cc27c28d8f74f422feed8ff51f341770c10d2f91e34e4c40bec682a0d18aa1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+agent-bridge	1360	H3	c710562d9ddf2425c58cf40fd60a4ab0ee708797d8c52a9a496b2d6b14935e17	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bootstrap-memory-system.sh	301	C1	ba0376d8f60682f3cd1590738e7e6e9e45976475684cbef3c54cbb53445c6145	heredoc in capture	patch	Phase 2 PR B
 bootstrap-memory-system.sh	933	C1	a2b89f3de0fdfb92587f62242da35014d1f0f1adea14a6d37739c0405c2ef5fa	heredoc in capture	patch	Phase 2 PR B
 bootstrap-memory-system.sh	991	C1	aefe79a4cc7bf815495db4797ba352161ff4df05ab62f644fc6d55940d7b7846	heredoc in capture	patch	Phase 2 PR B
 bootstrap-memory-system.sh	1138	H3	f66b5405e54c9bd6b2fa9fa1d34d544730c6de4fd84414117f8a82c253048655	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bootstrap-memory-system.sh	1326	H3	4c31126525964961c3323320a67edece7ebb7727e2b3efc38fc5ede52ec13106	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	688	H3	433a13bc74420c3264a2c90940478061526092124a084873174b86191153800e	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	698	C3	7410c03c5dc8221c83fbd7dcbe1c7ddcce4065f5c5dc6ac443ccd6b98efdd017	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-agent.sh	718	H3	f0c3d9c85a566717e1d3f30f6fa1ac4715ba6cd15b9ec46a511a39184bc7d190	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	732	H3	6260af024610e02538a2389fc51a39d88c2832e6d11f5641c558bb03ed58feeb	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	736	H3	1bb25f05058ff13a0c4681ae7619f0e25f0b6989d0c62cda7512c20cdc6ed231	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	1360	H3	119b66ca6c294cdd844f2e70bc527d58310b8621cdc0f7e4434f0375d69455c8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	1791	H3	65f16bf24c33c0cb82a15db911bf36c2c64ff5239a0c91558a011a46b9242199	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	1899	H3	de915434d9efb6ac3e0eca1de16fe39fa5a8677a3c0b29417f4e5dd2bb5738d5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	1990	H3	284c4b8ea0187f630fe41146d5d4304b0da61a8bf2f6c5cc1cefe06befb2c4e5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	2089	H3	a7b5c9a8b686430b9652756d923f7993923fce9d9954ee757edda76f55d8f61a	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	3853	H3	0015efd5b1e788c2848282f1dcadcc1f171322f7a573ccf3fff41f92a93fd742	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	3861	H3	a6cd1b770d440b091038c69272244d04bde3a542dce5b2b27f0bded1103b4137	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-agent.sh	4006	C1	bf0523c33b08261f92642d54ec18cb2ac7373e07fe2df60567652166b7c1631c	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch	Phase 2 PR B candidate
-bridge-agent.sh	4420	C1	a9fc8ebeff76410ff071ebf09f5452b39e55a68feb485a6e604f255dce001723	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
-bridge-agent.sh	4589	C3	924679e48aea308abd6dc02be9a6699171635564c6027867e8ef8a13851dc96f	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-agent.sh	4968	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-agent.sh	5070	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-agent.sh	753	H3	433a13bc74420c3264a2c90940478061526092124a084873174b86191153800e	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	763	C3	7410c03c5dc8221c83fbd7dcbe1c7ddcce4065f5c5dc6ac443ccd6b98efdd017	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-agent.sh	783	H3	f0c3d9c85a566717e1d3f30f6fa1ac4715ba6cd15b9ec46a511a39184bc7d190	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	797	H3	6260af024610e02538a2389fc51a39d88c2832e6d11f5641c558bb03ed58feeb	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	801	H3	1bb25f05058ff13a0c4681ae7619f0e25f0b6989d0c62cda7512c20cdc6ed231	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	1425	H3	119b66ca6c294cdd844f2e70bc527d58310b8621cdc0f7e4434f0375d69455c8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	1856	H3	65f16bf24c33c0cb82a15db911bf36c2c64ff5239a0c91558a011a46b9242199	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	1964	H3	de915434d9efb6ac3e0eca1de16fe39fa5a8677a3c0b29417f4e5dd2bb5738d5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	2055	H3	284c4b8ea0187f630fe41146d5d4304b0da61a8bf2f6c5cc1cefe06befb2c4e5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	2154	H3	a7b5c9a8b686430b9652756d923f7993923fce9d9954ee757edda76f55d8f61a	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	3921	H3	0015efd5b1e788c2848282f1dcadcc1f171322f7a573ccf3fff41f92a93fd742	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	3929	H3	a6cd1b770d440b091038c69272244d04bde3a542dce5b2b27f0bded1103b4137	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-agent.sh	4079	C1	bf0523c33b08261f92642d54ec18cb2ac7373e07fe2df60567652166b7c1631c	interpreter heredoc in capture (deadlock class) (cross-line capture)	patch	Phase 2 PR B candidate
+bridge-agent.sh	4493	C1	a9fc8ebeff76410ff071ebf09f5452b39e55a68feb485a6e604f255dce001723	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
+bridge-agent.sh	4662	C3	924679e48aea308abd6dc02be9a6699171635564c6027867e8ef8a13851dc96f	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-agent.sh	5041	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-agent.sh	5143	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-audit.sh	46	H3	61a92b52c42511fb472a672926f0bf92dd5bf8eb38cfc68961d624ae8a033797	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-auth.sh	187	C3	916ea3234694270e5a77bcc0178e3163ecc902cae3b68c58226f0012428da8f4	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-auth.sh	385	H3	25a1d9fe293aaa39b67439a679addbb8a932f1e79d870356616753d39d6e5a08	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -45,19 +45,19 @@ bridge-bundle.sh	221	C1	f1f45712a9bcd402065e58e8bc5a9172757ca57130c83d06746b9b2a
 bridge-bundle.sh	269	C3	6f0f0de39b34583f95ce0bd957987db4c62f2151e97dd99e5d22df148d7b8939	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-cron.sh	493	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-cron.sh	1017	C3	e922c8981a5dc87928344cdc8dc56501cf7cfdad8d360c59e7754c66f1600478	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-daemon.sh	404	H3	f1c1630f31d4bc24ae47602958be739975b927a70ec87c7bf819402ad94b9b0f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	626	H3	16a961e912bc1612646a256a1b085d41178d7b1c282775a10dc8f83244b92ea8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	1480	H3	23c0313bf8a6711cc33242c92c06468b8b19bc33e2b16b421f3bc60de187a677	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	1676	H3	16ff48070939ced82df89c9c5a5aee6d60abfa8ce48e66cbc1affbe12e89db37	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	1747	H3	f423c7e06b3b4c0cddc08ab8d3564f61837e3c8ad7db470ce969c038eeecfea9	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	3455	H3	82396450ad2047810650fbf7be3229b2838ced50ff8db7c1bcc7ec17a03469ab	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	4118	H3	80372715b714b8d52d32ef0bc620d9647fb08253c6721eead53477ed2e1b86af	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	5688	H3	47703942eaf8af97fb67249b0328bddd3d275c6ff6c808f6e0180036f1beb4a3	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	5759	H3	80372715b714b8d52d32ef0bc620d9647fb08253c6721eead53477ed2e1b86af	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	5821	H3	efed83d847aea81244ff9ae53de03d93bc2da5b37093fdf0b28bdb4a5d314bd1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	6006	H3	c01d23cff987c3906cdba09639c4aed6e981b89ab017d5ffba6c964e6e5a2775	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	7168	H3	29559f61586cbb5244c6adbfc937edcd6e5181587de3c51a92a101df4fcdeb6b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-bridge-daemon.sh	7247	H3	32e64212066ea50d5c52673c6ab72d46a3979164ed4d30276da8e54651fe5ed5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	500	H3	f1c1630f31d4bc24ae47602958be739975b927a70ec87c7bf819402ad94b9b0f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	722	H3	16a961e912bc1612646a256a1b085d41178d7b1c282775a10dc8f83244b92ea8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	1576	H3	23c0313bf8a6711cc33242c92c06468b8b19bc33e2b16b421f3bc60de187a677	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	1772	H3	16ff48070939ced82df89c9c5a5aee6d60abfa8ce48e66cbc1affbe12e89db37	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	1843	H3	f423c7e06b3b4c0cddc08ab8d3564f61837e3c8ad7db470ce969c038eeecfea9	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	3551	H3	82396450ad2047810650fbf7be3229b2838ced50ff8db7c1bcc7ec17a03469ab	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	4214	H3	80372715b714b8d52d32ef0bc620d9647fb08253c6721eead53477ed2e1b86af	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	5784	H3	47703942eaf8af97fb67249b0328bddd3d275c6ff6c808f6e0180036f1beb4a3	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	5855	H3	80372715b714b8d52d32ef0bc620d9647fb08253c6721eead53477ed2e1b86af	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	5917	H3	efed83d847aea81244ff9ae53de03d93bc2da5b37093fdf0b28bdb4a5d314bd1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	6102	H3	c01d23cff987c3906cdba09639c4aed6e981b89ab017d5ffba6c964e6e5a2775	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	7276	H3	29559f61586cbb5244c6adbfc937edcd6e5181587de3c51a92a101df4fcdeb6b	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+bridge-daemon.sh	7355	H3	32e64212066ea50d5c52673c6ab72d46a3979164ed4d30276da8e54651fe5ed5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-diagnose.sh	111	H3	dc966cbceac005436f03cf335da5d06c882711801ffdee2573674d17e5bbcc7a	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 bridge-diagnose.sh	121	C3	8682be12f674bdc8f3d517e38f41f2bef8873716d2b434400017fa5e126426a1	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-diagnose.sh	204	H3	dca120fec631dee0ec9fb9d1930cefeb4cadac7d223746f1db4b53990a18815c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -111,20 +111,20 @@ bridge-upgrade.sh	708	C3	e4941c470a8a634d15efe67a011dc562cea9cf9375994a887d305c8
 bridge-upgrade.sh	828	C3	cb60ec27bf8f37ea3ef3f2e9649752ee314614fd8f7c791d576f5cb81fb916f1	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upgrade.sh	853	C3	6c51a4883fcd57d62f4fc1bbb02b241b41878c92fa051311dc35999bc0bf13c4	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upgrade.sh	1282	C3	bab16fe92cd44e5ddd3310f75c4b71cbcbd9a08b9ddc86f33c7bf6edf78b7c7b	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1402	C3	745dd209a20999047eeffc755bbf76df07821e98b0564775dbcc38727bb243a3	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1413	C3	5f4e158f87ad3d5724106737736060aacb068b62bdb2ce8016614b2a7dcb6918	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1465	C3	c34cd8688dd332ed27b12d9fbe5dea7f46ac4d3bb10a70511c1ae3fd311df0ec	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1479	C3	674269ba5d1496f502b9f41abdf80da2864580442023f5b7c44d69b05d9261a4	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1801	C3	ee2531cb84d04ac3f1033740f7befe85df1e4dd0efe556e0062c98c267ca6c5c	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	1862	C3	fc4776a956841e63c8d8f102d10565d33762638341c9940f87a2585e8b3e41da	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2082	C3	8dd953f98d8205a0a40ad0a0d211508193419f78dc107f0d83d48aedfe711b8e	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2604	C3	7a105d5644aa6d7aac4c5fb50edbc9cce1d8b012e4bfcd24a61cfda00da86fa1	interpreter heredoc, no capture (issue #1113: argv list extended by workdir-backfill.json)	patch	Phase 3 PR C
-bridge-upgrade.sh	2743	C3	3b7b007634879006d9b95ee9e8f13693d64b0fe8244029b5690b38c4cf246344	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2750	C3	b919ffe917ff2abbde55677ee2b8c9fa5c91292bc8b9770d8e1a355f2fbc7023	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2763	C3	3479551ea337120bba6074762c98d92546f9f020aa56f21a9969bd0e11d93079	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2773	C3	a92d97bf4bdbac66d088fdb7598c601ce72cde7b48665ef7e5332e972e82f476	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2800	C3	954ee5bc5b2158c6e0e7b20748a9f1827dd0dca850d08bed692ed499e127ef1d	interpreter heredoc, no capture	patch	Phase 3 PR C
-bridge-upgrade.sh	2835	C3	f260289bf565528bca5d1ecf9c6c7707f5b7f65b407c2c23704785b186735493	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1431	C3	745dd209a20999047eeffc755bbf76df07821e98b0564775dbcc38727bb243a3	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1442	C3	5f4e158f87ad3d5724106737736060aacb068b62bdb2ce8016614b2a7dcb6918	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1494	C3	c34cd8688dd332ed27b12d9fbe5dea7f46ac4d3bb10a70511c1ae3fd311df0ec	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1508	C3	674269ba5d1496f502b9f41abdf80da2864580442023f5b7c44d69b05d9261a4	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1865	C3	ee2531cb84d04ac3f1033740f7befe85df1e4dd0efe556e0062c98c267ca6c5c	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	1926	C3	fc4776a956841e63c8d8f102d10565d33762638341c9940f87a2585e8b3e41da	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2146	C3	8dd953f98d8205a0a40ad0a0d211508193419f78dc107f0d83d48aedfe711b8e	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2679	C3	7a105d5644aa6d7aac4c5fb50edbc9cce1d8b012e4bfcd24a61cfda00da86fa1	interpreter heredoc, no capture (issue #1113: argv list extended by workdir-backfill.json)	patch	Phase 3 PR C
+bridge-upgrade.sh	2818	C3	3b7b007634879006d9b95ee9e8f13693d64b0fe8244029b5690b38c4cf246344	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2825	C3	b919ffe917ff2abbde55677ee2b8c9fa5c91292bc8b9770d8e1a355f2fbc7023	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2838	C3	3479551ea337120bba6074762c98d92546f9f020aa56f21a9969bd0e11d93079	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2848	C3	a92d97bf4bdbac66d088fdb7598c601ce72cde7b48665ef7e5332e972e82f476	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2875	C3	954ee5bc5b2158c6e0e7b20748a9f1827dd0dca850d08bed692ed499e127ef1d	interpreter heredoc, no capture	patch	Phase 3 PR C
+bridge-upgrade.sh	2910	C3	f260289bf565528bca5d1ecf9c6c7707f5b7f65b407c2c23704785b186735493	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upstream.sh	26	C3	61be7f11413c4788744477b9d1233d24940fe6b70653f980cc432d8b699452a7	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upstream.sh	41	C3	35aa990aa74d451003242d6fd7e31d42bb787a9a3d7bb1911d388771e5cf3464	interpreter heredoc, no capture	patch	Phase 3 PR C
 bridge-upstream.sh	131	C2	db87846a2d1466a114eb490ccd6db871093609275e493fdedbd7b7107ceecaea	cat heredoc in capture	patch	Phase 2 PR B
@@ -136,59 +136,59 @@ lib/bridge-agent-update.sh	232	H3	8a05785b84be70631c084eb13aabd2c0c71df974c02a1d
 lib/bridge-agent-update.sh	257	C3	35aa990aa74d451003242d6fd7e31d42bb787a9a3d7bb1911d388771e5cf3464	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-agents.sh	591	H3	a136495e3e9bbd04fa9f36486509c8dd42d990272e6331fb5a93004ccabe215f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-agents.sh	994	C3	74f9e370ac58d064746ff099b0da657bba6753550412891d7d29c9a6d48521ea	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	1235	C1	0f0c1201586eb1fd76ab38c280803efd4dba085d89a4574ee9327bc8098e2fda	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
-lib/bridge-agents.sh	1318	H3	72fa552e860ffb429ba58fcbfa42f391daa95966d7428844a0efa2c1ca815c76	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	1383	C3	300c33f9ca5dfabf8a7d6a9abdb5e0c6035293e298e936275e95076be2483419	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	1484	C3	ff6768f27c0f94084daf9131cc6a8712121d56139c64818c72eaa7403c6a4062	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	1612	C3	e4a0c8821c0b4f090a46e356c6336a0ead31a194acd8cf955643b9451e841e1d	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	1804	C3	5daa1a1b769bf6c4dc7625dc716873efe8bcb8a8f3e7d0dba8583897850fc7e0	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	2094	C3	c2dcc07777c89e851eaa408c5552cfee094addc399c7277369f8e9b4a75d8020	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	2129	C3	2b3ab708bed2f642df6d075583fa936bc49ace9bddae411fe08cec2d96605d3c	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	2207	C3	9a9df89f40799007d7b0cb056db45094d2ab058e6f22ba711e0e5edbb347f41c	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	2628	H3	2cd3cce7dbe125776abee1bff816c1ad585bf2ab72fd32c1ff9b8321122c23e1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	2643	H3	616d9c02986bfc424668896ce49adca31d72a9ab4adfc67b3da05c9986a35318	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	2658	H3	b77649487099afb4ed1fdde9105917c571c0daba8ed55e4f4ec994aa40d945c3	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	2765	H3	89bfc2aff8c48f9e5e5e6b2b33fb260791355676e4aa64ebdd5bb8256657d1b7	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	2871	H3	3dbcfafd7722051258c95e899018eb180509325ac8f1fed7d06e085f40b88cbc	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	3861	H3	96fd6e36d81f8c7cce0d07fc005dd83d9c35427d43e19a65fadb3103e52c6293	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4461	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4490	H3	bfa000209eb11f96aa65ad5a08f2d0d0e011c8867ff4ddebd51592e7a23d6d22	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4562	H3	5d422c2faa9f26afe588ea2e4a743ebf26664f9465d63744e2eefd8c12dce0d7	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4639	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4676	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4700	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4724	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4748	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4840	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4861	H3	00df29be2d24a6c5fecd33e1852b799d46617ceb760063a18085a6cc8155d84f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4862	H3	5352c3cbc3a73c61a6cf8ead945818730508f1846d9fd9b487d0dfb6710eba99	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4928	H3	538a9ca8eae8c411b0ecb31dadf3d8ed200b88ccf101a8d9f54a6a3e87d3dab4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	4986	C3	80fcc340a0b98b0ce607e977f247e1ff449866103e9e57e75dff5c987d458c9f	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	5478	C3	c83c54b6c2bfa499e3fcb336d45a2ab60f0dd93871ccd1f17f3fcf372ae83b36	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	5580	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	5656	C3	86d8be2f8efb1c66475f8381b2c220041e644fd78aa619f3c5b93b618dfa4fb9	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	5762	C3	a86b7f9ed439e40c69ca6402d6328478729610504db5f88174402f909953fb0f	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	1304	C1	0f0c1201586eb1fd76ab38c280803efd4dba085d89a4574ee9327bc8098e2fda	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
+lib/bridge-agents.sh	1387	H3	72fa552e860ffb429ba58fcbfa42f391daa95966d7428844a0efa2c1ca815c76	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	1452	C3	300c33f9ca5dfabf8a7d6a9abdb5e0c6035293e298e936275e95076be2483419	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	1553	C3	ff6768f27c0f94084daf9131cc6a8712121d56139c64818c72eaa7403c6a4062	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	1681	C3	e4a0c8821c0b4f090a46e356c6336a0ead31a194acd8cf955643b9451e841e1d	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	1873	C3	5daa1a1b769bf6c4dc7625dc716873efe8bcb8a8f3e7d0dba8583897850fc7e0	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	2163	C3	c2dcc07777c89e851eaa408c5552cfee094addc399c7277369f8e9b4a75d8020	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	2198	C3	2b3ab708bed2f642df6d075583fa936bc49ace9bddae411fe08cec2d96605d3c	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	2276	C3	9a9df89f40799007d7b0cb056db45094d2ab058e6f22ba711e0e5edbb347f41c	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	2697	H3	2cd3cce7dbe125776abee1bff816c1ad585bf2ab72fd32c1ff9b8321122c23e1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	2712	H3	616d9c02986bfc424668896ce49adca31d72a9ab4adfc67b3da05c9986a35318	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	2727	H3	b77649487099afb4ed1fdde9105917c571c0daba8ed55e4f4ec994aa40d945c3	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	2834	H3	89bfc2aff8c48f9e5e5e6b2b33fb260791355676e4aa64ebdd5bb8256657d1b7	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	2940	H3	3dbcfafd7722051258c95e899018eb180509325ac8f1fed7d06e085f40b88cbc	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	3946	H3	96fd6e36d81f8c7cce0d07fc005dd83d9c35427d43e19a65fadb3103e52c6293	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4691	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4720	H3	bfa000209eb11f96aa65ad5a08f2d0d0e011c8867ff4ddebd51592e7a23d6d22	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4792	H3	5d422c2faa9f26afe588ea2e4a743ebf26664f9465d63744e2eefd8c12dce0d7	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4869	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4906	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4930	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4954	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	4978	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	5070	H3	d726ebbda810cf66b10311ae7b9b4e6a487629d6b56dc960ca3ebe379b800cd0	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	5091	H3	00df29be2d24a6c5fecd33e1852b799d46617ceb760063a18085a6cc8155d84f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	5092	H3	5352c3cbc3a73c61a6cf8ead945818730508f1846d9fd9b487d0dfb6710eba99	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	5158	H3	538a9ca8eae8c411b0ecb31dadf3d8ed200b88ccf101a8d9f54a6a3e87d3dab4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	5216	C3	80fcc340a0b98b0ce607e977f247e1ff449866103e9e57e75dff5c987d458c9f	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	5752	C3	c83c54b6c2bfa499e3fcb336d45a2ab60f0dd93871ccd1f17f3fcf372ae83b36	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-agents.sh	5854	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	5893	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	5918	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	6058	C3	25fc7454bc30fed6111370dbff634436b085bbb8a68a8ef67500cb506a91c583	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	6147	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	6196	H3	e470978788504a3913cff8fd33088c6a864b692cda56dbbfb5db1cc2f49d54a4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	6648	C3	213e3f988afdf73ba76b10171d1f078404e5add7f856942860650ebd3d394665	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	6708	C3	7fd9d92ec0f389cfd150c18d07df9816e0d7430b3943e364f3ff4f1ac8b4caf2	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	6741	C3	2a37cc61060152656d688f197079816b3c801180d26b9cd05b49acccbe19cef2	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-agents.sh	6956	H3	28c851126fa7ff64d39080d7ce681118cd8bc7ca09b01c53484eee24282647ba	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7009	H3	28c851126fa7ff64d39080d7ce681118cd8bc7ca09b01c53484eee24282647ba	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7370	H3	7df84eb9232986fb58e31393fb467f8fae42994efe8452977643e6d5de2448f4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7431	H3	7df84eb9232986fb58e31393fb467f8fae42994efe8452977643e6d5de2448f4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7511	H3	967276bccff3eae7ab3fe0ebb717d60a4a3793d2edc085f88df3c7390b65841f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7521	H3	517c30da87631f8f67c6fe9a62c6d41356de325963a22b9d2cc713e6c3a1ef9f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7570	H3	65f16bf24c33c0cb82a15db911bf36c2c64ff5239a0c91558a011a46b9242199	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7645	H3	9da0241aa62971ce7348d069bf368dc3f43fa96218983c0ec24e5d728da74d8a	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-agents.sh	7735	C3	753d10fefcef9d65bc723e1c347bafdc1ab99b4689b49b11da6dbf7d9473e014	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	5930	C3	86d8be2f8efb1c66475f8381b2c220041e644fd78aa619f3c5b93b618dfa4fb9	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	6036	C3	a86b7f9ed439e40c69ca6402d6328478729610504db5f88174402f909953fb0f	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	6128	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	6167	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	6192	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	6332	C3	25fc7454bc30fed6111370dbff634436b085bbb8a68a8ef67500cb506a91c583	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	6421	H3	675fac53d03e29028782d24040eb4eedca3ab68963b8c7acb4dd2a8a8f03567c	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	6470	H3	e470978788504a3913cff8fd33088c6a864b692cda56dbbfb5db1cc2f49d54a4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	6931	C3	213e3f988afdf73ba76b10171d1f078404e5add7f856942860650ebd3d394665	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	6991	C3	7fd9d92ec0f389cfd150c18d07df9816e0d7430b3943e364f3ff4f1ac8b4caf2	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	7024	C3	2a37cc61060152656d688f197079816b3c801180d26b9cd05b49acccbe19cef2	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-agents.sh	7239	H3	28c851126fa7ff64d39080d7ce681118cd8bc7ca09b01c53484eee24282647ba	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7292	H3	28c851126fa7ff64d39080d7ce681118cd8bc7ca09b01c53484eee24282647ba	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7653	H3	7df84eb9232986fb58e31393fb467f8fae42994efe8452977643e6d5de2448f4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7714	H3	7df84eb9232986fb58e31393fb467f8fae42994efe8452977643e6d5de2448f4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7794	H3	967276bccff3eae7ab3fe0ebb717d60a4a3793d2edc085f88df3c7390b65841f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7804	H3	517c30da87631f8f67c6fe9a62c6d41356de325963a22b9d2cc713e6c3a1ef9f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7853	H3	65f16bf24c33c0cb82a15db911bf36c2c64ff5239a0c91558a011a46b9242199	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	7928	H3	9da0241aa62971ce7348d069bf368dc3f43fa96218983c0ec24e5d728da74d8a	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-agents.sh	8018	C3	753d10fefcef9d65bc723e1c347bafdc1ab99b4689b49b11da6dbf7d9473e014	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-channels.sh	144	C3	28c211234a01352ec3a0c87c4ce9cab53ba60e168fa4663482f1738383a3fa19	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-channels.sh	234	H3	8b19f0a7707fef140d1598934bd1208cb7fecaa437dc0e50d49609323eef73ac	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-channels.sh	368	C3	011f1d4418e8f0e4cd28ce77a92161e0945c93eb9c8684bd2add1a8ddbe741be	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-channels.sh	237	H3	8b19f0a7707fef140d1598934bd1208cb7fecaa437dc0e50d49609323eef73ac	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-channels.sh	371	C3	011f1d4418e8f0e4cd28ce77a92161e0945c93eb9c8684bd2add1a8ddbe741be	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-core.sh	494	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-core.sh	507	C3	c5a19ca66d0088387de551f481ce08c0218765bdc1221891c961bb801d2ea2f7	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-core.sh	560	C3	f8fb9fe483d3ac0c38ced0173139a79e612c6ab535249af3209b7f9940352e38	interpreter heredoc, no capture	patch	Phase 3 PR C
@@ -213,39 +213,44 @@ lib/bridge-host-profile.sh	203	C3	71eccee67da1310243de68add85154e68165f16059df93
 lib/bridge-host-profile.sh	273	H3	24060087d519f37a2d9f47765c64adbda24ceb59fe155510b4e209c5fd95a8de	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-host-profile.sh	307	H3	24060087d519f37a2d9f47765c64adbda24ceb59fe155510b4e209c5fd95a8de	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v2-migrate.sh	838	H3	f76308bcc7f5051dda9a60057540bfd3985f9d8364f1b7cb8689ef7850e07185	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2-migrate.sh	954	H3	c2d06bebe53400eca7b3da976ac9c1986bb8e2ba030db1d3b44abe171861bbd4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2-migrate.sh	1091	H3	8641a4b0bfee263cf01bfcfca9354cd3efa54a918663d364a06f1fe327290bfa	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2-migrate.sh	1095	H3	2a266e0375ff91ddfa86dc69923e8bf8c488c762496b01998ebd2db061c509ab	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2-migrate.sh	1114	H3	1af3587bf09a449f797f7faac8e10fc46a1b93dd8a64af1e6ae77a722e76da66	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2-migrate.sh	1118	H3	8641a4b0bfee263cf01bfcfca9354cd3efa54a918663d364a06f1fe327290bfa	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2-migrate.sh	1198	H3	712aa7d779a843f4522955b3c56defe3fa38cd684f98f66b51f2267660784554	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2-migrate.sh	1634	H3	dd4b018ceea710a7128f53a2bb435aa41d1a67355b829a8e25a92eb4eaac061f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2-migrate.sh	1669	H3	df256ad3cdd7ec3248ff0f519794845a62dedc8789689c15f7a35db02a6fc824	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2-migrate.sh	1721	C3	5c48462d99097e98f693dbd02a47fe58ee2a74fe9c81d5dfcea6d17b3d0b7898	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-isolation-v2-migrate.sh	986	H3	c2d06bebe53400eca7b3da976ac9c1986bb8e2ba030db1d3b44abe171861bbd4	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2-migrate.sh	1123	H3	8641a4b0bfee263cf01bfcfca9354cd3efa54a918663d364a06f1fe327290bfa	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2-migrate.sh	1127	H3	2a266e0375ff91ddfa86dc69923e8bf8c488c762496b01998ebd2db061c509ab	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2-migrate.sh	1146	H3	1af3587bf09a449f797f7faac8e10fc46a1b93dd8a64af1e6ae77a722e76da66	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2-migrate.sh	1150	H3	8641a4b0bfee263cf01bfcfca9354cd3efa54a918663d364a06f1fe327290bfa	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2-migrate.sh	1230	H3	712aa7d779a843f4522955b3c56defe3fa38cd684f98f66b51f2267660784554	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2-migrate.sh	1702	H3	dd4b018ceea710a7128f53a2bb435aa41d1a67355b829a8e25a92eb4eaac061f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2-migrate.sh	1737	H3	df256ad3cdd7ec3248ff0f519794845a62dedc8789689c15f7a35db02a6fc824	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2-migrate.sh	1789	C3	5c48462d99097e98f693dbd02a47fe58ee2a74fe9c81d5dfcea6d17b3d0b7898	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-isolation-v2-reapply.sh	1094	C3	a77180f716fa1a9961db70ef77c3e0748adbb5ee4b1dea4e6268e23b1ff0f4df	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-isolation-v2-reconcile.sh	562	H3	4400a8034a521ed8663d70a89bcadbf47c12f1e40a18d1038ae768cad206d2f6	here-string/procsub, non-interpreter consumer	patch	Phase 2 v0.14.5 — H3 read-<<< / C3 python-stdout (no capture, no deadlock surface)
+lib/bridge-isolation-v2-reconcile.sh	1004	H3	a5b9c245008c127eae7215ab8c2bfb8ac5b4f64521cffa93ecfa0c4e7211356b	here-string/procsub, non-interpreter consumer	patch	Phase 2 v0.14.5 — H3 read-<<< / C3 python-stdout (no capture, no deadlock surface)
+lib/bridge-isolation-v2-reconcile.sh	1029	H3	72256f92055c4baf72f573b1b5694d6707f91e4c5ed3e29d18cf6c5b165b2618	here-string/procsub, non-interpreter consumer	patch	Phase 2 v0.14.5 — H3 read-<<< / C3 python-stdout (no capture, no deadlock surface)
+lib/bridge-isolation-v2-reconcile.sh	1051	H3	3a4e1be3761240c43b1b3991deffeb20663f0f73fdd899fd3c57565b1914ba62	here-string/procsub, non-interpreter consumer	patch	Phase 2 v0.14.5 — H3 read-<<< / C3 python-stdout (no capture, no deadlock surface)
+lib/bridge-isolation-v2-reconcile.sh	1112	C3	fff0dec7aa6f70afcef623fb99ef3199360dbd887d071f384c2b1bbf66931448	interpreter heredoc, no capture	patch	Phase 2 v0.14.5 — H3 read-<<< / C3 python-stdout (no capture, no deadlock surface)
 lib/bridge-isolation-v2.sh	364	H3	3bcf9cf8bf2d74c066cde478b02a8a01baa4f46cce8c6c70fc79f523f5995683	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-isolation-v2.sh	471	C3	0219e632757ae998b0f976b9c59d6c18ea72f2139ba255a775c1a0fa4c940ac0	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-isolation-v2.sh	2064	H3	01c839785d78efd2144369683041e308b0ce282f4761be3dac2f55a5faf12c99	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2143	H3	9053c9fe41afc7646b557e15d97d0a337cf2ad874e5f0b2009583bbc72f80c05	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2172	H3	01c839785d78efd2144369683041e308b0ce282f4761be3dac2f55a5faf12c99	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2304	H3	71b634ac5ee39a265c89fbe6aa01962da11e48af1857e829e91757984c7df8c1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2306	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	same cred-ancestors procsub pattern as existing baselined sites L2213/L2256/L2347 - bash function consumer, not an interpreter subprocess; footgun #11 N/A	agb-dev-claude wave v0145	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2349	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	same cred-ancestors procsub pattern as existing baselined sites L2213/L2256/L2347 - bash function consumer, not an interpreter subprocess; footgun #11 N/A	agb-dev-claude wave v0145	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2440	H3	58a0b7f22b5c4ee542c9dab74c5b4b42a91ebe63e6221f3e5ab657a398647407	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-isolation-v2.sh	2573	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	same cred-ancestors procsub pattern as existing baselined sites L2213/L2256/L2347 - bash function consumer, not an interpreter subprocess; footgun #11 N/A	agb-dev-claude wave v0145	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2090	H3	01c839785d78efd2144369683041e308b0ce282f4761be3dac2f55a5faf12c99	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2169	H3	9053c9fe41afc7646b557e15d97d0a337cf2ad874e5f0b2009583bbc72f80c05	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2198	H3	01c839785d78efd2144369683041e308b0ce282f4761be3dac2f55a5faf12c99	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2330	H3	71b634ac5ee39a265c89fbe6aa01962da11e48af1857e829e91757984c7df8c1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2332	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	same cred-ancestors procsub pattern as existing baselined sites L2213/L2256/L2347 - bash function consumer, not an interpreter subprocess; footgun #11 N/A	agb-dev-claude wave v0145	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2375	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	same cred-ancestors procsub pattern as existing baselined sites L2213/L2256/L2347 - bash function consumer, not an interpreter subprocess; footgun #11 N/A	agb-dev-claude wave v0145	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2466	H3	58a0b7f22b5c4ee542c9dab74c5b4b42a91ebe63e6221f3e5ab657a398647407	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-isolation-v2.sh	2709	H3	319caf7d2408586ea437f1ee5a220f5473fd59db5e01ed1bc85a8d5bac625ca1	same cred-ancestors procsub pattern as existing baselined sites L2213/L2256/L2347 - bash function consumer, not an interpreter subprocess; footgun #11 N/A	agb-dev-claude wave v0145	Phase 5 PR E (review per site)
 lib/bridge-isolation-v3-channel-dotenv.sh	509	H3	6ea2bf841d5322aa59c0f8097db35b7e96c081e55a995361e6b266badbd089a6	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-migration.sh	74	C3	6702fdf57ae0cefde8722a08390e40596652642313009dad2e89585410426973	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-migration.sh	474	H3	f64739c8415ed716683a8a0d9c83f6f72857a67e8a1d1fe24ed920e0538accfa	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-skills.sh	80	C3	f3cebbf19540e5f4cdba6f0f143808a5b81a181d641e5c10c2a93279eddad24d	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-skills.sh	243	C3	fe8a9493d7a1c499bc1832983f841ccc242f3cdba7a65f3a15c3a896243f054c	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-skills.sh	274	C3	35aa990aa74d451003242d6fd7e31d42bb787a9a3d7bb1911d388771e5cf3464	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-skills.sh	400	H3	838c25a2ad47301e443b01c60d5f21f90c8163f50eae68a08da52de3db9246c5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-skills.sh	403	H3	dcb77c64e1929150466caf6a1205d4254d475c8e83a8b321d10c53cfb2cddc10	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-skills.sh	415	C3	8f5026dea206d188fef2638ba0d39f3b15d7f302913f941c5f4c870042b58e0a	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-skills.sh	449	C3	db9d375045077e262c2650012bf524f3d3be1a67bf919dbdc892079b00ae0560	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-skills.sh	558	C1	95e1afee709a3095f044e1215cab2d5a37525795dcc2aceb7f04330f7e03a563	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
-lib/bridge-skills.sh	757	H3	94efe7ab81b306534cc1fa3c395ef9bddcd9498dfebd197af08a08da686bdddd	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-skills.sh	758	H3	6e332f79328fa9ce227f9148a5c9a96c28195127e5c166c10e8901f5cd527a81	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-skills.sh	290	C3	fe8a9493d7a1c499bc1832983f841ccc242f3cdba7a65f3a15c3a896243f054c	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-skills.sh	321	C3	35aa990aa74d451003242d6fd7e31d42bb787a9a3d7bb1911d388771e5cf3464	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-skills.sh	394	H3	dcb77c64e1929150466caf6a1205d4254d475c8e83a8b321d10c53cfb2cddc10	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-skills.sh	570	H3	838c25a2ad47301e443b01c60d5f21f90c8163f50eae68a08da52de3db9246c5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-skills.sh	584	C3	8f5026dea206d188fef2638ba0d39f3b15d7f302913f941c5f4c870042b58e0a	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-skills.sh	618	C3	db9d375045077e262c2650012bf524f3d3be1a67bf919dbdc892079b00ae0560	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-skills.sh	905	C1	95e1afee709a3095f044e1215cab2d5a37525795dcc2aceb7f04330f7e03a563	interpreter heredoc in capture (deadlock class)	patch	Phase 2 PR B
+lib/bridge-skills.sh	1104	H3	94efe7ab81b306534cc1fa3c395ef9bddcd9498dfebd197af08a08da686bdddd	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-skills.sh	1105	H3	6e332f79328fa9ce227f9148a5c9a96c28195127e5c166c10e8901f5cd527a81	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-state.sh	861	H3	efed83d847aea81244ff9ae53de03d93bc2da5b37093fdf0b28bdb4a5d314bd1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-state.sh	1211	H3	cd5da78810a676b546897e5a7d1aa326c1c663115029e3dbe5f97961651afbc5	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-state.sh	1463	H3	ff99eb1e07e002b13c88e97ec4fa627093fa0cadc38864e3e611f6f8923acee8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -259,13 +264,13 @@ lib/bridge-state.sh	1874	H3	489229e46ac80f30dcb2d8efe66b4f43ebe7becdaa9f5263b644
 lib/bridge-state.sh	2032	C3	8cb5f1ac691156314d6bbecda1b2ff87775d42d4469cd5fa1fd20cfb1890ecfa	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-state.sh	2365	C3	35aa990aa74d451003242d6fd7e31d42bb787a9a3d7bb1911d388771e5cf3464	interpreter heredoc, no capture	patch	Phase 3 PR C
 lib/bridge-state.sh	2543	C3	e52b1214b1e40e5ae1cd92393e61de522b4a7bc0132b5a875a193fad6c36aa30	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-state.sh	3044	C3	c0193e8a22c5720ba156d699245975d707209d4f7aaca24f464f503f82157754	interpreter heredoc, no capture	patch	Phase 3 PR C
-lib/bridge-state.sh	3142	H3	688797f6d87543c8a3fc9fd7c0324346d2a13383f69055bf1167be935b674e44	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	3151	H3	d16f276288d55853ee942078a85879d63d531f176d0ae2313068e4d172bfb756	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	3234	H3	ee225b1f6caa6419e0c444c37882edc4a11036c41060f285e0ce0b354df8c315	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	3374	H3	3a22fb0aacbf3ac047bf958e9c6d59afe7c15d81a6c439882142e1b1d7768c03	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	3566	H3	2d1415157f155d264dc2139bbb567dea0d911d96963b286af6c28f135f7ac051	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
-lib/bridge-state.sh	3583	H3	119b66ca6c294cdd844f2e70bc527d58310b8621cdc0f7e4434f0375d69455c8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	3050	C3	c0193e8a22c5720ba156d699245975d707209d4f7aaca24f464f503f82157754	interpreter heredoc, no capture	patch	Phase 3 PR C
+lib/bridge-state.sh	3148	H3	688797f6d87543c8a3fc9fd7c0324346d2a13383f69055bf1167be935b674e44	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	3157	H3	d16f276288d55853ee942078a85879d63d531f176d0ae2313068e4d172bfb756	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	3240	H3	ee225b1f6caa6419e0c444c37882edc4a11036c41060f285e0ce0b354df8c315	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	3380	H3	3a22fb0aacbf3ac047bf958e9c6d59afe7c15d81a6c439882142e1b1d7768c03	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	3572	H3	2d1415157f155d264dc2139bbb567dea0d911d96963b286af6c28f135f7ac051	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
+lib/bridge-state.sh	3589	H3	119b66ca6c294cdd844f2e70bc527d58310b8621cdc0f7e4434f0375d69455c8	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-tmux.sh	162	H3	07d40500dcb55ba9f5212423fd3d97cdac9ac8951f10bee4f43c7d08ed54ebd7	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-wave.sh	176	H3	871fd2b87719a0274c808fddb0b5f47073df66f7ff45bd8bbbbf24ac2df59fd1	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
 lib/bridge-wave.sh	218	H3	a16e4579bf253f8cb913c2f67df903d921a7b620db45f2946458d717c0ec983f	here-string/procsub, non-interpreter consumer	patch	Phase 5 PR E (review per site)
@@ -283,7 +288,7 @@ scripts/apply-channel-policy.sh	706	H3	679ed356c8ce96e8b1e6d28f2ac1d7999f1db38d1
 scripts/apply-channel-policy.sh	728	C1	b1a7ddd672d8c6940b6c114da09ffb5cd66992eeb8e4d33244a2596242a96dec	heredoc in capture	patch	Phase 4 PR D
 scripts/bulk-register-precompact.sh	168	C3	8682be12f674bdc8f3d517e38f41f2bef8873716d2b434400017fa5e126426a1	interpreter heredoc, no capture	patch	Phase 4 PR D
 scripts/bulk-register-precompact.sh	282	H3	f4cf964d5e36a30023dae50a0c999e9e1857abbfffc37c52913b84404fc1a3dc	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
-scripts/ci-select-smoke.sh	772	H3	fe7c9141e5488a4453e5df131cbcb60490e482f52fea58de9162fa084bdf80af	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
+scripts/ci-select-smoke.sh	991	H3	fe7c9141e5488a4453e5df131cbcb60490e482f52fea58de9162fa084bdf80af	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
 scripts/deploy-live-install.sh	252	H3	250b4fb26fd07deb1a4039e487b2e6f04c577e53239b25512f11a1f3ebfc27b3	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
 scripts/deploy-live-install.sh	260	H3	250b4fb26fd07deb1a4039e487b2e6f04c577e53239b25512f11a1f3ebfc27b3	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
 scripts/deploy-live-install.sh	265	H3	250b4fb26fd07deb1a4039e487b2e6f04c577e53239b25512f11a1f3ebfc27b3	here-string/procsub, non-interpreter consumer	patch	Phase 4 PR D
@@ -513,7 +518,7 @@ scripts/smoke/agent-retire.sh	289	H3	add0590372abfef68f6ae15add6a914485b97224ca5
 scripts/smoke/agent-retire.sh	290	H3	7f6be6d60b94efe2548c9df5e57904fae0f2a7d1d7f539a447b8d94c01692c26	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 scripts/smoke/agent-retire.sh	300	H3	36e64d2712aca2a7045b33418508738569395206cecb519824a5bc47fc044a8c	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 scripts/smoke/agent-retire.sh	317	H3	add0590372abfef68f6ae15add6a914485b97224ca58528946c120d0105ddabf	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
-scripts/smoke/agent-update.sh	483	C3	47eb419db0269543793d920c54023e2774fdda1ecc28842d75e3fda593391a0a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke/agent-update.sh	490	C3	47eb419db0269543793d920c54023e2774fdda1ecc28842d75e3fda593391a0a	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/bridge-export-prefix-no-stale-layout.sh	72	H3	88187ba6826d04a8329e6dd79b3b314261349e65bdb5d68dceb2b6525af9a9df	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 scripts/smoke/bridge-export-prefix-no-stale-layout.sh	80	H3	0cfcbe5955fdc5a1c34d12a4d07744880ff64f68e74e9e1c0340b7fa68179721	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 scripts/smoke/bridge-export-prefix-no-stale-layout.sh	88	H3	c316fce813ad6d916e41ef42e7dff9aa86090425a12d6aa140c1a62dca21364c	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
@@ -576,6 +581,8 @@ scripts/smoke/orphan-agent-dir.sh	154	H3	524275149cf21cac40424f661c09599d05bb0c3
 scripts/smoke/orphan-agent-dir.sh	296	H3	648af92b5109e5e4aafbc4cb6ec4d8edc68b2942481bdb310822d7e0503cfcb2	here-string/procsub, non-interpreter consumer	patch-dev	Phase 6 PR F
 scripts/smoke/per-agent-settings-rendering.sh	51	C3	7f13750cc7aedd07037fe5dddc06b338b9ef3a8507c8b273d1c588b4412b00af	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/per-agent-settings-rendering.sh	64	C3	35aa990aa74d451003242d6fd7e31d42bb787a9a3d7bb1911d388771e5cf3464	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
+scripts/smoke/phase2-install-tree-reconciler.sh	237	H3	60600ec578040691cf2d276a5dadd8a957ddefe3f42fa33eec3b5181242628c1	here-string/procsub, non-interpreter consumer	patch	Phase 2 v0.14.5 — H3 awk-<<< / read-<<< inside smoke harness (no subprocess deadlock surface)
+scripts/smoke/phase2-install-tree-reconciler.sh	241	H3	750b9fa748a086fee251a42078aa124c2eb23ef64125d589dda094410efd6f79	here-string/procsub, non-interpreter consumer	patch	Phase 2 v0.14.5 — H3 awk-<<< / read-<<< inside smoke harness (no subprocess deadlock surface)
 scripts/smoke/pre-compact-envelope-roundtrip.sh	75	C3	b264257d5e58c2055cad131f7c32300262bb01ed174f5c74639899bd54c3691c	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/pre-compact-envelope-roundtrip.sh	134	C3	3f27914646de3d3930294253d977619d655395d8bea8b31ae6c2754522528f20	interpreter heredoc, no capture	patch-dev	Phase 6 PR F
 scripts/smoke/pre-compact-envelope-roundtrip.sh	173	C3	e8bf1e7bb1b6621c14ab49bfd63e04f88482877b034bd2b19e5959787443d3ce	interpreter heredoc, no capture	patch-dev	Phase 6 PR F

@@ -34,6 +34,11 @@ from bridge_iso_paths import (  # noqa: E402
     safe_read_env as _safe_read_env,
     safe_load_json as _safe_load_json,
     parse_dotenv_text as _parse_dotenv_text,
+    # Phase 2 lift: pull canonical atomic-write helper. The local
+    # `_sudo_write_as` wrapper now delegates here, so the inline bash
+    # body lives in lib/bridge_iso_paths.py (one source of truth, same
+    # contract as bridge_isolation_write_file_as_agent_user_via_bash).
+    write_text_atomic_as_owner as _write_text_atomic_as_owner_canonical,
 )
 
 
@@ -153,32 +158,20 @@ def _sudo_write_as(
     content: str,
     mode: int = 0o600,
 ) -> subprocess.CompletedProcess[str]:
-    """Symmetric write counterpart to `_sudo_run_as`. Streams `content` via
-    stdin to `bash -c <inline-script>` running as `os_user` under
-    `sudo -n`. The inline script atomically writes to `dest_path` at
-    `mode` using mktemp-in-target-dir + chmod-before-rename — same
-    contract as `bridge_isolation_write_file_as_agent_user_via_bash`.
+    """Atomic write of `content` to `dest_path` as `os_user`.
 
-    Does NOT raise on non-zero rc — caller inspects `proc.returncode`
-    against the contract above. Matches `_sudo_run_as` ergonomics.
+    Phase 2: thin delegating wrapper around
+    `bridge_iso_paths.write_text_atomic_as_owner`. The inline atomic-
+    write bash body lives in `lib/bridge_iso_paths.py` so a fix to
+    the contract (mktemp position, chmod-before-mv, trap shape) lands
+    in ONE place. The local `_ISOLATED_WRITE_SCRIPT` constant above
+    is kept for reference / unit-test introspection.
+
+    Does NOT raise on non-zero rc — caller inspects `proc.returncode`.
     """
-    full = [
-        "sudo", "-n", "-u", os_user, "bash", "-c", _ISOLATED_WRITE_SCRIPT,
-        "bridge-isolation", str(dest_path), f"{mode:o}",
-    ]
-    try:
-        return subprocess.run(
-            full, input=content, check=False, capture_output=True, text=True
-        )
-    except FileNotFoundError:
-        print(
-            f"[bridge-setup] sudo not available; cannot escalate to "
-            f"'{os_user}' for write to {dest_path}",
-            file=sys.stderr,
-        )
-        return subprocess.CompletedProcess(
-            args=full, returncode=127, stdout="", stderr=""
-        )
+    return _write_text_atomic_as_owner_canonical(
+        os_user, dest_path, content, mode
+    )
 
 
 def _isolation_aware_save_text(path: Path, text: str, mode: int = 0o600) -> None:

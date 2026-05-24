@@ -3991,6 +3991,24 @@ bridge_linux_prepare_agent_isolation() {
       return 1
     fi
   fi
+
+  # Phase 2 (post-v0.14.5-beta16): apply the install-tree reconciler
+  # for this newly-created isolated agent. This fires the per-agent
+  # rows (state-agent-leaf scaffold, credential-grant for the
+  # controller credential file) AND re-asserts the install-scope rows
+  # so a freshly created agent finds the tree canonical on first
+  # launch. Non-fatal — the per-agent grant matrix above already
+  # verified the per-agent leaf, and the install-scope rows may
+  # legitimately drift on macOS dev hosts that this prepare path is
+  # exercised on. Operator escape: `agent-bridge isolation reconcile
+  # --apply --agent <name>` reruns the same logic standalone.
+  if command -v bridge_isolation_v2_apply_install_tree_matrix >/dev/null 2>&1; then
+    if ! bridge_isolation_v2_apply_install_tree_matrix \
+          --mode apply --agent "$agent" --reason agent-create \
+          >/dev/null 2>&1; then
+      bridge_warn "bridge_linux_prepare_agent_isolation: install-tree reconciler reported drift for agent=$agent (non-fatal; run: agent-bridge isolation reconcile --apply --agent $agent)"
+    fi
+  fi
 }
 bridge_linux_install_isolated_channel_symlink() {
   # Plant a root-owned symlink at $user_home/.claude/channels/<channel>

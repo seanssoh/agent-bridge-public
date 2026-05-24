@@ -80,10 +80,38 @@ REPO_ROOT="$(cd -P "$SCRIPT_DIR/.." && pwd -P)"
 
 BASELINE_FILE="${BRIDGE_RAW_PATHLIB_BASELINE_FILE:-$REPO_ROOT/scripts/baselines/raw-pathlib-baseline.txt}"
 
-declare -a TARGETS=(
-  "bridge-setup.py"
-  "bridge-hooks.py"
-)
+# Phase 2 (post-v0.14.5-beta16): scope widened from the original
+# 2-file set (bridge-setup.py + bridge-hooks.py) to every root-level
+# Python entry point. Rationale — cycle 11 (#1175) already proved the
+# raw-pathlib trip can ride from any controller-side helper into an
+# isolated tree (bridge-watchdog.py was the next site identified), and
+# the Phase 2 lift moved canonical write/realpath/ensure_dir helpers
+# into lib/bridge_iso_paths.py. Without expanding the lint scope a
+# future new entry point could quietly re-introduce the same class of
+# bug. The baseline file records per-file ceilings; existing sites
+# survive untouched (they ratchet-only).
+#
+# Discovery: every `bridge-*.py` at repo root + the `agb` / `agent-bridge`
+# dispatchers (those are bash, not python — excluded). The TARGETS
+# array is populated by globbing at lint time so a new bridge-*.py file
+# is in scope from its first commit. Files are filtered to those that
+# actually exist (a TARGETS entry for a deleted file would FAIL the
+# missing-file branch in run_check below).
+TARGETS=()
+# File discovery written to a tmpfile to avoid process-substitution
+# (`done < <(...)`) which trips the sister `lint-heredoc-ban.sh` H3
+# rule. footgun #11 family: heredoc-stdin + here-string + procsub all
+# share the same Bash 5.3.9 deadlock class on subprocess capture.
+_lint_targets_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-lint-tgts.XXXXXX")"
+# shellcheck disable=SC2064  # capture tmp path at trap-set time
+trap "rm -f '$_lint_targets_tmp' 2>/dev/null" EXIT
+( cd "$REPO_ROOT" \
+    && ls -1 bridge-*.py 2>/dev/null \
+    | sort -u >"$_lint_targets_tmp" )
+while IFS= read -r _t; do
+  [[ -n "$_t" ]] || continue
+  TARGETS+=("$_t")
+done <"$_lint_targets_tmp"
 
 # Pattern: match probe + mutator surfaces.
 #

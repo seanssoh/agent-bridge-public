@@ -14,6 +14,22 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Phase 2 lift: use the canonical isolation-aware helpers from
+# lib/bridge_iso_paths.py rather than re-implementing the lstat-owner
+# probe + sudo escalation. The local `_isolated_workdir_owner` /
+# `_sudo_test` wrappers below delegate to these names.
+_BRIDGE_WATCHDOG_LIB_DIR = Path(__file__).resolve().parent / "lib"
+if _BRIDGE_WATCHDOG_LIB_DIR.is_dir() and str(_BRIDGE_WATCHDOG_LIB_DIR) not in sys.path:  # noqa: raw-pathlib-controller-only — import-time controller-side lib dir probe
+    sys.path.insert(0, str(_BRIDGE_WATCHDOG_LIB_DIR))
+try:
+    from bridge_iso_paths import (
+        isolated_workdir_owner as _isolated_workdir_owner_canonical,
+        sudo_run_as as _sudo_run_as_canonical,
+    )
+except ImportError:
+    _isolated_workdir_owner_canonical = None
+    _sudo_run_as_canonical = None
+
 MANAGED_START = "<!-- BEGIN AGENT BRIDGE DOC MIGRATION -->"
 MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
 # Claude-runtime profile files. Codex agents don't read these — see #905.
@@ -259,48 +275,35 @@ def _registry_ids_from_payload(
 def _isolated_workdir_owner(workdir: Path) -> str | None:
     """Return the isolated-agent OS user that owns ``workdir``, or ``None``.
 
-    Mirrors ``bridge-hooks.py::_isolated_workdir_owner`` so the watchdog
-    can decide when to escalate to ``sudo -n -u <agent-user>``. Returns
-    ``None`` on non-Linux hosts, when ``lstat`` fails (parent likely
-    also unreadable), when the owner is the controller uid, when the
-    owner does not look like a bridge-provisioned isolated agent
-    (``agent-bridge-<slug>``), or when ``/etc/passwd`` lookup fails.
+    Phase 2: delegates to the canonical
+    ``bridge_iso_paths.isolated_workdir_owner`` so the lstat-owner +
+    pwd-lookup + `agent-bridge-` prefix probe lives in one place. The
+    canonical helper has additional recovery (gid-fallback via
+    pwd.getpwall when stat.st_uid lookup returns the controller),
+    which the watchdog now inherits for free.
+
+    Returns None when the canonical helper is unavailable (import
+    failed, non-Linux host, etc.).
     """
-    if sys.platform != "linux":
+    if _isolated_workdir_owner_canonical is None:
         return None
-    try:
-        stat_result = workdir.lstat()
-    except OSError:
-        return None
-    try:
-        import pwd
-        owner = pwd.getpwuid(stat_result.st_uid).pw_name
-    except (KeyError, ImportError):
-        return None
-    if stat_result.st_uid == os.getuid():
-        return None
-    if not owner.startswith("agent-bridge-"):
-        return None
-    return owner
+    return _isolated_workdir_owner_canonical(workdir)
 
 
 def _sudo_test(os_user: str, flag: str, path: Path) -> int | None:
     """Run ``sudo -n -u <os_user> test <flag> <path>``; return rc or ``None``.
 
-    Returns ``None`` when sudo is unavailable on the host (non-Linux
-    dev box, sudo not in PATH). Callers map ``None`` to "escalation
-    impossible — surface the structured scan_error instead". Mirrors
-    ``bridge-hooks.py::_sudo_run_as``.
+    Phase 2: delegates to canonical ``bridge_iso_paths.sudo_run_as``.
+    The wrapper translates the canonical's `rc=127 = sudo missing`
+    contract back to `None` so existing watchdog callers (which map
+    `None → structured scan_error`) keep working unchanged.
     """
-    try:
-        proc = subprocess.run(
-            ["sudo", "-n", "-u", os_user, "test", flag, str(path)],
-            check=False,
-            capture_output=True,
-        )
-    except FileNotFoundError:
+    if _sudo_run_as_canonical is None:
         return None
-    return proc.returncode
+    rc = _sudo_run_as_canonical(os_user, "test", flag, str(path))
+    if rc == 127:
+        return None
+    return rc
 
 
 def resolve_scan_path(

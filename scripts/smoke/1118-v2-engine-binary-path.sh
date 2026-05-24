@@ -98,7 +98,15 @@ resolved_t1="$(
     set -e
     SCRIPT_DIR="'"$REPO_ROOT"'"
     BRIDGE_SCRIPT_DIR="$SCRIPT_DIR"
-    export BRIDGE_SCRIPT_DIR
+    # bridge-layout-resolver.sh runs `bridge_resolve_layout` at source
+    # time (lib/bridge-layout-resolver.sh:530). On a fresh CI checkout
+    # without a layout-marker.sh on disk it dies with "Agent Bridge
+    # v0.8.0 requires isolation-v2" unless BRIDGE_LAYOUT is set to v2
+    # (env-override path). Other smokes pin this via
+    # smoke_setup_bridge_home; T1-T4 here only need the temp root, so
+    # set BRIDGE_LAYOUT directly for the inner subshell.
+    BRIDGE_LAYOUT="v2"
+    export BRIDGE_SCRIPT_DIR BRIDGE_LAYOUT
     source "$SCRIPT_DIR/bridge-lib.sh" >/dev/null 2>&1
     bridge_resolve_engine_binary claude
   ' 2>/dev/null
@@ -110,7 +118,8 @@ if PATH="$FAKE_BIN_DIR:$PATH" "$_bash_bin" -c '
   set -e
   SCRIPT_DIR="'"$REPO_ROOT"'"
   BRIDGE_SCRIPT_DIR="$SCRIPT_DIR"
-  export BRIDGE_SCRIPT_DIR
+  BRIDGE_LAYOUT="v2"
+  export BRIDGE_SCRIPT_DIR BRIDGE_LAYOUT
   source "$SCRIPT_DIR/bridge-lib.sh" >/dev/null 2>&1
   bridge_resolve_engine_binary not-an-engine
 ' >/dev/null 2>&1; then
@@ -122,7 +131,8 @@ if PATH="" "$_bash_bin" -c '
   set -e
   SCRIPT_DIR="'"$REPO_ROOT"'"
   BRIDGE_SCRIPT_DIR="$SCRIPT_DIR"
-  export BRIDGE_SCRIPT_DIR
+  BRIDGE_LAYOUT="v2"
+  export BRIDGE_SCRIPT_DIR BRIDGE_LAYOUT
   source "$SCRIPT_DIR/bridge-lib.sh" >/dev/null 2>&1
   bridge_resolve_engine_binary claude
 ' >/dev/null 2>&1; then

@@ -181,9 +181,20 @@ if [[ -z "${BRIDGE_CONTROLLER_UID:-}" ]]; then
       _bridge_recovery_owner="$(stat -c '%u' "$_bridge_recovery_marker" 2>/dev/null || true)"
     fi
     _bridge_recovery_current="$(id -u 2>/dev/null || true)"
+    # Phase 2 refinement: skip recovery when the marker is root-owned
+    # (#1161 contract since beta13: `chown root:ab-shared` on the
+    # marker file for validator-owner-exemption symmetry). A
+    # root-owned marker carries no controller-identity signal — using
+    # it to set BRIDGE_CONTROLLER_UID=0 makes every controller
+    # invocation look like "controller is root" downstream, which
+    # mis-resolves matrix `controller` tokens to root in the new
+    # install-tree reconciler (Phase 2 D5). The original recovery
+    # intent (iso UID reading a controller-owned marker pre-#1161)
+    # still works when the marker's owner is a real user UID.
     if [[ -n "$_bridge_recovery_owner" \
         && -n "$_bridge_recovery_current" \
-        && "$_bridge_recovery_owner" != "$_bridge_recovery_current" ]]; then
+        && "$_bridge_recovery_owner" != "$_bridge_recovery_current" \
+        && "$_bridge_recovery_owner" != "0" ]]; then
       export BRIDGE_CONTROLLER_UID="$_bridge_recovery_owner"
     fi
     unset _bridge_recovery_owner _bridge_recovery_current
@@ -1006,14 +1017,99 @@ PY
           fi
           exit "$_iso_rc"
           ;;
+        reconcile)
+          # Phase 2 (post-v0.14.5-beta16): manual operator escape hatch
+          # for the declarative install-tree reconciler. Same code path
+          # the install / upgrade / agent-create triggers run, exposed
+          # standalone so an operator who hit perm drift (e.g. after an
+          # umask-077 file landed under lib/) can repair without re-
+          # running the full upgrader.
+          shift
+          _iso_recon_mode="check"
+          _iso_recon_agent=""
+          _iso_recon_all=0
+          _iso_recon_json=0
+          while [[ $# -gt 0 ]]; do
+            case "$1" in
+              --check)
+                _iso_recon_mode="check"
+                shift
+                ;;
+              --apply)
+                _iso_recon_mode="apply"
+                shift
+                ;;
+              --agent)
+                _iso_recon_agent="$2"
+                shift 2
+                ;;
+              --all|--all-agents)
+                _iso_recon_all=1
+                shift
+                ;;
+              --json)
+                _iso_recon_json=1
+                shift
+                ;;
+              -h|--help)
+                cat <<EOF
+Usage: $CLI_NAME isolation reconcile [--check|--apply] [--agent <name>|--all] [--json]
+
+Walk the declarative install-tree matrix for the v2 layout. Default
+mode is --check (read-only drift report).
+
+  --check         read-only; emit drift report, exit non-zero on
+                   required mismatch (default)
+  --apply         mutate filesystem state to reach canonical; idempotent
+  --agent <X>     process the named agent's rows (state-leaf scaffold,
+                   credential grant) on top of the install-scope rows
+  --all           process every isolated agent's rows
+  --json          emit machine-readable JSON instead of pipe-separated lines
+
+The reconciler is deny-by-default: only enumerated rows
+(\$BRIDGE_HOME, lib/, scripts/, hooks/, runtime/, shared/, root
+entrypoints, state/layout-marker.sh, state/agents/<a>) are touched.
+Protected paths (agent-roster*, handoff.local*, *.pem/*.key/*.token,
+state/tasks.db, etc.) are refused by the per-row protected guard.
+EOF
+                exit 0
+                ;;
+              *)
+                bridge_die "지원하지 않는 isolation reconcile 옵션입니다: $1"
+                ;;
+            esac
+          done
+
+          if ! command -v bridge_isolation_v2_apply_install_tree_matrix >/dev/null 2>&1; then
+            bridge_die "isolation reconcile: reconciler helper not loaded (BRIDGE_LAYOUT=v2 required)"
+          fi
+
+          _iso_recon_args=(--mode "$_iso_recon_mode" --reason manual)
+          if [[ -n "$_iso_recon_agent" ]]; then
+            _iso_recon_args+=(--agent "$_iso_recon_agent")
+          elif (( _iso_recon_all == 1 )); then
+            _iso_recon_args+=(--all-agents)
+          fi
+          if (( _iso_recon_json == 1 )); then
+            _iso_recon_args+=(--json)
+          fi
+
+          bridge_isolation_v2_apply_install_tree_matrix "${_iso_recon_args[@]}"
+          exit $?
+          ;;
         ""|-h|--help)
           cat <<EOF
-Usage: $CLI_NAME isolation <verify> [options]
+Usage: $CLI_NAME isolation <verify|reconcile> [options]
 
   verify --agent <X> [--json] [--strict-optional]
        Read-only verification of the v2 grant matrix for one agent.
 
-Refs #781.
+  reconcile [--check|--apply] [--agent <X>|--all] [--json]
+       Walk the declarative install-tree matrix. --check reports drift,
+       --apply converges. Operator escape hatch for the same code path
+       the install/upgrade/agent-create triggers run.
+
+Refs #781 (verify), Phase 2 (reconcile).
 EOF
           exit 0
           ;;
