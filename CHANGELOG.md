@@ -13,7 +13,7 @@ version bumps via the `VERSION` file.
 Operator-cued **sixteenth prerelease** — eighth cycle of the A2A-driven
 QA loop, and the first to apply operator-coaching directly: cycles 9-10
 had each fixed one site of the same family with the next call surfacing
-the same bug. Sean's call: exhaust-audit + single PR closes the family.
+the same bug. Operator decision: exhaust-audit + single PR closes the family.
 
 Remote QA peer audited `bridge-setup.py` + `bridge-hooks.py` end-to-end
 and filed #1175 with the full inventory (4 HIGH in bridge-setup.py,
