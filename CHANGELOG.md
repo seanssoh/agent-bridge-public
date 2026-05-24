@@ -6,6 +6,134 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta18] — 2026-05-25
+
+### Highlight — Phase 3 isolation contract fix (8 gaps + restart-reverter regression)
+
+Operator-cued **eighteenth prerelease** cut for remote-host
+re-verification of Phase 3 — patch's clean install on `v0.14.5-beta17`
+surfaced 8 isolation contract gaps and the architectural restart-
+reverter (workarounds reset on every `agent restart`). codex r1
+implement-ok; single-PR fixer (#1186) closes all 8 gaps + the
+restart-reverter root cause.
+
+`-beta18` prerelease; matching tag `v0.14.5-beta18`, GitHub release
+marked **Pre-release**.
+
+### Fixed / Added — Install-tree row expansion + isolated HOME contract helper (#1186)
+
+- **`lib/bridge-agents.sh`** — new helper
+  `bridge_linux_normalize_isolated_home_contract "$agent" "$os_user"
+  "$user_home"`. Normalizes the isolated-UID's HOME root
+  (`$os_user:ab-agent-<a>` mode `2750`) + `.claude/`, `.claude/plugins/`,
+  `.claude/session-env/` (`root:ab-agent-<a>` mode **`3770`**: sticky +
+  setgid). Symlink rejection + path-anchor guard
+  (`BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT`) + live-tmux-session refuse
+  (override via `BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING=1`). Sticky mode
+  preserves the integrity boundary on root-owned `settings.json` /
+  `settings.effective.json` (isolated UID cannot unlink), while the
+  group-write bit unblocks the SessionStart hook's `.claude/session-env`
+  mkdir via the supplementary-group path. Operator override available:
+  `BRIDGE_ISO_HOME_CONTRACT_MODE=2770` falls back to non-sticky with a
+  `bridge_warn` audit line.
+
+- **3 helper call sites** route through the new function:
+  1. `bridge_linux_prepare_agent_isolation` (agent-create path) —
+     replaces the inline `chgrp` + `chmod 2770` block.
+  2. **`bridge_install_isolated_home_settings` at
+     `lib/bridge-hooks.sh:530-535` — THE restart-reverter**. Was
+     recreating `.claude` as `root:$os_user 0750` after every restart,
+     reverting the prepare-side contract. Now delegates to the helper.
+     **Closes #1165 Gap 2 regression at the architectural root**, not
+     the symptom.
+  3. `bridge_auth_prepare_credential_file` (credential-prepare isolated
+     branch) — replaces the inline `mkdir/chown $os_user:$primary_group/
+     chmod 0700` parent-dir step. Token sync helper PermissionError on
+     isolated agent credentials path now closed (no `sg ab-agent-<a>`
+     wrapper needed).
+
+- **4 new install-tree reconciler rows** in
+  `lib/bridge-isolation-v2-reconcile.sh` (controller-side HOME tree):
+  - `claude-plugin-dir` — `$BRIDGE_HOME/.claude-plugin` owner controller
+    group ab-shared mode 0750 (optional when absent).
+  - `plugins-root` — `$BRIDGE_HOME/plugins` owner controller group
+    ab-shared mode 0750 (readable root for plugin discovery; optional
+    when absent).
+  - `plugins-channel-trees` — `$BRIDGE_HOME/plugins/*` group ab-shared
+    `g+rX` recursive (`dir_recursive`; protected-path guard active).
+  - `agents-root` — `$BRIDGE_HOME/agents` owner controller group
+    ab-shared mode 0710 (required: iso UID traverse, no list).
+
+- **New row kind `agent_home_contract`** in the reconciler with
+  `mechanism=helper:bridge_linux_normalize_isolated_home_contract`,
+  emitted only when `--agent` is provided. 4 child rows from the helper
+  (HOME / `.claude` / `.claude/plugins` / `.claude/session-env`).
+  Computed literal `os_user` and literal `agent_group` inside
+  `bridge_isolation_v2_install_tree_matrix_rows` — the existing token
+  resolver doesn't handle `agent_user` / `ab-agent-<a>` tokens.
+
+- **`lib/bridge-isolation-v2.sh:1659-1662`** — stale
+  `isolated-user-home` matrix text updated (`0700` → `2750`) so a
+  future audit doesn't find conflicting contract documentation.
+
+### Fixed — Reconciler parse path (footgun #11 H3 recurrence)
+
+- **`lib/bridge-isolation-v2-reconcile.sh`** — replace `<<<` here-string
+  tab-split with pure parameter expansion. The here-string class is
+  the same Bash 5.3.9 footgun the lint baseline ratchet refuses; no
+  subprocess, no tmp file, no procsub — just `${var%%$'\t'*}` /
+  `${var#*$'\t'}` chains.
+
+### Tests
+
+- **`scripts/smoke/phase3-agent-home-contract.sh` (NEW)** — 7 cases
+  covering helper signature, Linux gate, path-anchor guard, symlink
+  rejection, live-session rejection, sticky/non-sticky mode toggle,
+  reconciler dispatcher registration. Registered alongside phase2
+  smoke in `scripts/ci-select-smoke.sh`.
+
+- **`scripts/smoke/phase2-install-tree-reconciler.sh`** T1 asserts the
+  4 new install rows appear in matrix output.
+
+- **`scripts/smoke/1165-track-a-scaffold-modes.sh`** T2/T2b/T2c
+  updated: fails if `bridge_install_isolated_home_settings` (and the
+  prepare path) contains `chown "root:$os_user" "$target_dir"` or
+  `chmod 0750 "$target_dir"`; passes only when the helper is called.
+  Closes the smoke-coverage gap that let the #1165 Gap 2 regression
+  through to beta14 → beta17.
+
+- **`tests/isolation-claude-read-lens/smoke.sh`** updated to follow
+  the helper delegation: asserts prepare path calls the helper +
+  helper body contains the mkdir/chown/chmod primitives,
+  ab-agent-group resolution, and `3770` default mode.
+
+- **`scripts/smoke/1118-v2-engine-binary-path.sh`** — T1/T1b/T1c now
+  pin `BRIDGE_DATA_ROOT` alongside `BRIDGE_LAYOUT=v2`. Phase 2's
+  `BRIDGE_LAYOUT=v2`-only pin was incomplete: the validator at
+  `lib/bridge-layout-resolver.sh:128-141` rejects partial env
+  override (requires both vars together) and falls through to
+  fresh-install-candidate hard-die. Closes the latent fail that
+  Phase 2 PR admin-merged with.
+
+### Verification
+
+- **VM acceptance** (OrbStack `agb-clean-test`, Ubuntu noble arm64)
+  — 8 steps PASS via fixer's destructive clean-install repro:
+  bridge-init.sh OK; iso agent create OK; reconcile `--check` rc=0
+  across all rows including the 4 new Family 1 + 4 new
+  `agent_home_contract`; agent start + restart preserves contract on
+  all 8 paths from patch's table (**architectural fix verified**);
+  iso UID can mkdir `.claude/session-env` + `.claude/plugins`;
+  controller HOME `.claude-plugin` / `plugins` / `agents` traversable
+  by iso UID; token sync without `sg` wrapper succeeds; sticky bit
+  blocks iso UID unlink of root-owned settings files.
+
+- **Pre-existing CI fragility (unchanged)** — `1121-agent-delete-os-purge`
+  C5 / `1140-purge-home-os-cleanup` C4 / mattermost-plugin (CI bun)
+  fail on `main` and `stabilize` independent of this change.
+  `bridge_warn` stderr vs smoke stdout capture mismatch; separate
+  follow-up.
+
 ## [0.14.5-beta17] — 2026-05-25
 
 ### Highlight — declarative install-tree reconciler (Phase 2 architectural refactor)
