@@ -2703,13 +2703,16 @@ bridge_agent_mark_idle_now() {
   ts="$(date +%s)"
 
   # v0.9.7 RC2 (refs #781): route through the matrix-aware writer so the
-  # per-agent state/agents/<X>/ leaf is canonicalized (group ab-agent-<X>,
-  # 2770, setgid) before write. Without this the daemon's previous plain
-  # `mkdir -p` + redirection produced ec2-user:ab-controller 0600 files
-  # that the isolated UserPromptSubmit hook could not unlink, surfacing
-  # as the "rm: cannot remove '.../idle-since': Permission denied" error
-  # in the operator's session output. Falls back to the legacy direct
-  # write path when the matrix helper isn't loaded (test fixtures).
+  # per-agent state/agents/<X>/ leaf is canonicalized (group
+  # ab-agent-<X>, mode 2770, setgid) before write. Without this the
+  # daemon's previous plain `mkdir -p` + redirection produced
+  # ec2-user:ab-controller 0600 files that the isolated UserPromptSubmit
+  # hook could not unlink, surfacing as the "rm: cannot remove
+  # '.../idle-since': Permission denied" error in the operator's
+  # session output. The writer itself sudo-escalates as the agent's iso
+  # UID when called from inside an isolated hook (#1165 Gap 6 r2).
+  # Falls back to the legacy direct write path when the matrix helper
+  # isn't loaded (test fixtures).
   # r12 codex Probe 9 — drop the direct-write fallback when the
   # matrix-aware writer fails. Falling back to plain mkdir+printf
   # silently defeated the r10 BUG #4 hard-fail propagation: the
@@ -2739,12 +2742,13 @@ bridge_agent_mark_manual_stop() {
 
   # v0.9.7 RC2 (refs #781): same matrix-aware route as
   # bridge_agent_mark_idle_now. manual-stop participates in the same
-  # state/agents/<X>/ leaf contract; without the matrix grant the
-  # isolated `bridge_agent_clear_manual_stop` rm path fell back to a
-  # sudo handoff in PR #714 — the matrix grant makes the sudo handoff
-  # unnecessary because the isolated UID is now in ab-agent-<X> and the
-  # parent dir is 2770. The sudo handoff stays as a fallback for hosts
-  # where the matrix has not been applied yet (rolling upgrade window).
+  # state/agents/<X>/ leaf contract; the matrix grant
+  # (`controller:ab-agent-<X>:2770`) lets the isolated UID write via
+  # per-agent group membership when the writer is invoked in the
+  # controller's context, and the writer's `sudo -n -u <iso>` path
+  # (#1165 Gap 6 r2) handles invocation from inside an isolated hook.
+  # The sudo handoff stays as a fallback for hosts where the matrix
+  # has not been applied yet (rolling upgrade window).
   # r12 codex Probe 9 — same direct-write fallback removal as
   # bridge_agent_mark_idle_now above. Hard fail when matrix writer
   # fails so verify and apply stay in sync.
@@ -2766,8 +2770,10 @@ bridge_agent_clear_idle_marker() {
   file="$(bridge_agent_idle_since_file "$agent")"
   dir="$(bridge_agent_idle_marker_dir "$agent")"
   # v0.9.7 RC2 (refs #781): when the matrix grant has been applied, the
-  # isolated UID is in ab-agent-<X> and the parent dir is 2770 setgid,
-  # so this plain `rm -f` succeeds from the isolated hook context.
+  # isolated UID is in `ab-agent-<X>` and the parent dir is
+  # `controller:ab-agent-<X>:2770` setgid, so this plain `rm -f`
+  # succeeds from the isolated hook context via per-agent group write
+  # — without granting any cross-agent reach.
   # If it still fails, log a diagnostic so the verify CLI's
   # `agent-bridge isolation verify` operator-side run can flag that the
   # matrix is out of sync and `migrate isolation v2 --apply --agent <X>`

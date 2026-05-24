@@ -707,6 +707,31 @@ bridge_scaffold_agent_home() {
         bridge_linux_sudo_root chmod 0755 "$_scaffold_v2_sibling" \
           || bridge_die "scaffold sudo chmod 0755 failed: $_scaffold_v2_sibling"
       fi
+      # #1165 Gap 4: legacy per-agent tracked-profile dir at
+      # $BRIDGE_AGENT_HOME_ROOT/<agent>/ (e.g.
+      # ~/.agent-bridge/agents/<a>/). On a markerless-existing-install
+      # upgrade path, this dir was scaffolded by an older code path
+      # under the controller's umask (mode 0700 awfmanager-owned). The
+      # legacy-teams-mcp pruner and other Python helpers walk into it
+      # later (looking for residual .mcp.json files) and trip
+      # `PermissionError: '/home/awfmanager/.agent-bridge/agents/<a>/.mcp.json'`
+      # because the isolated UID running the pruner can't even stat the
+      # parent. The v2 _scaffold_v2_root above only normalizes the
+      # `data/agents/<a>/` v2 layout — the legacy `agents/<a>/` is not
+      # the same path. Idempotent: pre-create + chown + chmod 0755 so
+      # the controller can write into it (template renders, JSON files)
+      # AND any other UID on the box can traverse into it for read-only
+      # inventories. Contents stay non-secret (channel state files live
+      # under workdir/.<channel>/ with their own ACLs).
+      if [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" && -n "$agent" ]]; then
+        local _scaffold_legacy_root="$BRIDGE_AGENT_HOME_ROOT/$agent"
+        bridge_linux_sudo_root mkdir -p "$_scaffold_legacy_root" \
+          || bridge_die "scaffold sudo mkdir failed: $_scaffold_legacy_root"
+        bridge_linux_sudo_root chown "$_scaffold_controller" "$_scaffold_legacy_root" \
+          || bridge_die "scaffold sudo chown $_scaffold_controller failed: $_scaffold_legacy_root"
+        bridge_linux_sudo_root chmod 0755 "$_scaffold_legacy_root" \
+          || bridge_die "scaffold sudo chmod 0755 failed: $_scaffold_legacy_root"
+      fi
     fi
   fi
 

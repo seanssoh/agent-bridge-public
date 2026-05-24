@@ -153,6 +153,44 @@ case "${1:-}" in
     ;;
 esac
 
+# Issue #1165 Gap 8: PR #1159 inlined BRIDGE_CONTROLLER_UID into the
+# agent-start sudo wrapper at bridge-start.sh:613-617 so the isolated
+# Claude session inherits the controller UID across `sudo -u <agent>`.
+# Any agb / agent-bridge invocation that does NOT go through that start
+# path (e.g. an iso Claude bash subprocess running `agb inbox <agent>`,
+# or `BRIDGE_CONTROLLER_UID= agb status` from a manual sudo shell) lands
+# in bridge-marker-bootstrap.sh's validator with no exported controller
+# UID, fails the owner check, and rejects the marker — surfaced to the
+# operator as "markerless(existing-install)". Recover defensively here:
+# if the variable is unset AND the marker file's owner differs from the
+# calling UID, infer that we are the iso UID reading a controller-owned
+# marker, and re-export BRIDGE_CONTROLLER_UID from the marker stat
+# before sourcing bridge-lib.sh (which then triggers marker validation
+# via bridge-marker-bootstrap.sh). Markerless installs (legacy / pre-
+# v0.8 / fresh-install candidates) skip the recovery — the validator
+# falls back silently to legacy in that case, so agb works regardless.
+# Mirror the marker path formula at lib/bridge-marker-bootstrap.sh:37.
+if [[ -z "${BRIDGE_CONTROLLER_UID:-}" ]]; then
+  _bridge_recovery_home="${BRIDGE_HOME:-$HOME/.agent-bridge}"
+  _bridge_recovery_marker="${BRIDGE_LAYOUT_MARKER_DIR:-$_bridge_recovery_home/state}/layout-marker.sh"
+  if [[ -f "$_bridge_recovery_marker" ]]; then
+    _bridge_recovery_owner=""
+    if [[ "$(uname)" == "Darwin" ]]; then
+      _bridge_recovery_owner="$(stat -f '%u' "$_bridge_recovery_marker" 2>/dev/null || true)"
+    else
+      _bridge_recovery_owner="$(stat -c '%u' "$_bridge_recovery_marker" 2>/dev/null || true)"
+    fi
+    _bridge_recovery_current="$(id -u 2>/dev/null || true)"
+    if [[ -n "$_bridge_recovery_owner" \
+        && -n "$_bridge_recovery_current" \
+        && "$_bridge_recovery_owner" != "$_bridge_recovery_current" ]]; then
+      export BRIDGE_CONTROLLER_UID="$_bridge_recovery_owner"
+    fi
+    unset _bridge_recovery_owner _bridge_recovery_current
+  fi
+  unset _bridge_recovery_home _bridge_recovery_marker
+fi
+
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 

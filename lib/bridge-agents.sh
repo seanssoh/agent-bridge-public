@@ -3885,18 +3885,34 @@ bridge_linux_prepare_agent_isolation() {
   local isolated_claude_dir="$user_home/.claude"
   bridge_linux_sudo_root mkdir -p "$isolated_claude_dir"
   bridge_linux_sudo_root chown "$os_user" "$isolated_claude_dir" >/dev/null 2>&1 || true
-  # v2: chgrp ab-agent-<name> + chmod 2750 (setgid so new subdirs like
-  # projects/ inherit the group) so the controller (group member of
-  # ab-agent-<name>) can reach ~/.claude/projects/ for the memory-daily
-  # harvester without any named-user ACL.
+  # v2: chgrp ab-agent-<name> + chmod 2770 (setgid so new subdirs like
+  # projects/ and session-env/ inherit the group) so the controller
+  # (group member of ab-agent-<name>) can reach ~/.claude/projects/ for
+  # the memory-daily harvester without any named-user ACL.
+  #
+  # #1165 Gap 2: mode broadened from 2750 to 2770. The owner bit was
+  # rwx pre-fix (so an owner-UID mkdir should have worked), but the
+  # observed SessionStart hook failure shape is `mkdir: cannot create
+  # directory '/home/agent-bridge-<a>/.claude/session-env': Permission
+  # denied` — i.e. the hook process's effective UID is not the dir
+  # owner in practice (suspected tmux/sudo wrapper stripping owner
+  # identity on the SessionStart spawn path). Widening to 2770 makes
+  # the group bit writable, which unblocks the hook via the
+  # supplementary-group path. Security model: the only group members
+  # are the controller user + the isolated UID itself (PR-C agent-
+  # group composition); no third party gains write. setgid (2xxx) is
+  # preserved so new subdirs inside ~/.claude (projects/, session-env/,
+  # statsig/, etc.) inherit the agent group rather than the writer's
+  # primary group, keeping the controller harvester's group-r-x path
+  # working on every new file.
   local _claude_v2_grp=""
   _claude_v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
   [[ -n "$_claude_v2_grp" ]] \
     || bridge_die "isolation v2: cannot resolve agent group for ~/.claude of '$agent'"
   bridge_linux_sudo_root chgrp "$_claude_v2_grp" "$isolated_claude_dir" \
     || bridge_die "isolation v2: chgrp $_claude_v2_grp on '$isolated_claude_dir' failed"
-  bridge_linux_sudo_root chmod 2750 "$isolated_claude_dir" \
-    || bridge_die "isolation v2: chmod 2750 on '$isolated_claude_dir' failed"
+  bridge_linux_sudo_root chmod 2770 "$isolated_claude_dir" \
+    || bridge_die "isolation v2: chmod 2770 on '$isolated_claude_dir' failed"
   # Channel-ownership-aware plugin sharing. Without this the isolated UID's
   # ~/.claude/plugins/ is empty and Claude starts with no MCP servers loaded
   # (Teams/ms365/cosmax-* all silently missing). The helper writes a per-UID
@@ -5392,6 +5408,50 @@ exit 1
   return 0
 }
 
+# Issue #1165 Gap 5: presence probe for channel access.json files that
+# live under the per-agent workdir. Under linux-user isolation v2 the
+# workdir is chowned to the isolated UID with mode 2750/0700 so the
+# controller (running `bridge_agent_runtime_channel_status_reason`)
+# cannot satisfy `[[ -f ... ]]` on the file directly — the test returns
+# false even when the file is present, and the readiness gate
+# false-negatives the channel into "missing access.json" (which then
+# blocks `agent start` for any --require-channel agent).
+#
+# Same family as #1145 (controller direct touch on isolated tree) and
+# #1155 (engine-aware sudo-escalate paradigm). The fix mirrors the
+# established pattern at `lib/bridge-agents.sh:1403,1415` and
+# `lib/bridge-skills.sh:461`: try the controller-side test first
+# (non-iso install, or post-Step-A workdir the controller still owns),
+# then fall back to `bridge_linux_sudo_root test -f` which escalates
+# to root via the passwordless sudoers entry installed by
+# `bridge_migration_sudoers_entry`. Root can stat any path, so the
+# probe succeeds regardless of the workdir's owner/mode.
+#
+# Returns:
+#   0 — file exists (probed directly or via sudo-root escalation).
+#   1 — file does not exist (verified by both paths) OR sudo is
+#       unavailable AND the direct probe could not confirm presence.
+#       Caller treats this as "absent" — same shape as the legacy
+#       `[[ ! -f ]]` test it replaces.
+#
+# Suppress stderr from the sudo path so a missing passwordless sudo
+# entry does not leak EACCES/policy-denied chatter into the daemon
+# log; controllers without sudo simply degrade to the legacy probe
+# result.
+bridge_channel_access_file_present() {
+  local file="$1"
+  [[ -n "$file" ]] || return 1
+
+  if [[ -f "$file" ]]; then
+    return 0
+  fi
+  if command -v bridge_linux_sudo_root >/dev/null 2>&1 \
+      && bridge_linux_sudo_root test -f "$file" 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
 # Issue #534: produce a single-line diagnostic blob for an unreadable
 # channel `.env` file. Composed from `stat` and `getfacl` (Linux only;
 # Darwin lacks both POSIX named-user ACLs and a compatible getfacl).
@@ -6537,7 +6597,10 @@ bridge_agent_runtime_channel_status_reason() {
 
   if bridge_channel_csv_contains "$required" "plugin:discord"; then
     discord_dir="$(bridge_agent_discord_state_dir "$agent")"
-    if [[ ! -f "$discord_dir/access.json" ]]; then
+    # Issue #1165 Gap 5: sudo-escalate the access.json presence probe so
+    # the controller doesn't false-negative on an isolated workdir it
+    # cannot stat directly. See bridge_channel_access_file_present.
+    if ! bridge_channel_access_file_present "$discord_dir/access.json"; then
       printf 'missing Discord access file under %s (access.json required)' "$discord_dir"
       return 0
     fi
@@ -6563,7 +6626,8 @@ bridge_agent_runtime_channel_status_reason() {
 
   if bridge_channel_csv_contains "$required" "plugin:telegram"; then
     telegram_dir="$(bridge_agent_telegram_state_dir "$agent")"
-    if [[ ! -f "$telegram_dir/access.json" ]]; then
+    # Issue #1165 Gap 5: sudo-escalate the access.json presence probe.
+    if ! bridge_channel_access_file_present "$telegram_dir/access.json"; then
       printf 'missing Telegram access file under %s (access.json required)' "$telegram_dir"
       return 0
     fi
@@ -6586,7 +6650,11 @@ bridge_agent_runtime_channel_status_reason() {
 
   if bridge_channel_csv_contains "$required" "plugin:teams"; then
     teams_dir="$(bridge_agent_teams_state_dir "$agent")"
-    if [[ ! -f "$teams_dir/access.json" ]]; then
+    # Issue #1165 Gap 5: sudo-escalate the access.json presence probe.
+    # This is the canonical reproducer site from the issue body — the
+    # other three plugin branches (discord/telegram/mattermost) share
+    # the same shape so the fix is applied uniformly.
+    if ! bridge_channel_access_file_present "$teams_dir/access.json"; then
       printf 'missing Teams access file under %s (access.json required)' "$teams_dir"
       return 0
     fi
@@ -6678,7 +6746,8 @@ bridge_agent_runtime_channel_status_reason() {
   if bridge_channel_csv_contains "$required" "plugin:mattermost"; then
     local mattermost_dir=""
     mattermost_dir="$(bridge_agent_mattermost_state_dir "$agent")"
-    if [[ ! -f "$mattermost_dir/access.json" ]]; then
+    # Issue #1165 Gap 5: sudo-escalate the access.json presence probe.
+    if ! bridge_channel_access_file_present "$mattermost_dir/access.json"; then
       printf 'missing Mattermost access file under %s (access.json required)' "$mattermost_dir"
       return 0
     fi

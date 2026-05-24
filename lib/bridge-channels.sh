@@ -205,10 +205,13 @@ bridge_allocate_dynamic_webhook_port() {
 
   port_file="$(bridge_agent_webhook_port_file "$agent")"
   # v0.9.7 (refs #781 RC2): ensure the per-agent state leaf is canonical
-  # (group ab-agent-<X>, 2770, setgid) before writing webhook-port. The
-  # daemon writes this file on behalf of the isolated UID; without the
-  # matrix grant the file lands as ec2-user:ab-controller 0644 and the
-  # isolated UID may need to re-read it through the leaf.
+  # (group `ab-agent-<X>`, mode 2770, setgid) before writing
+  # webhook-port. The daemon (controller) writes this file on behalf of
+  # the isolated UID; without the matrix grant the file lands as
+  # ec2-user:ab-controller 0644 and the isolated UID cannot re-read it
+  # through the leaf. (The per-agent group keeps the integrity boundary
+  # — #1165 Gap 6 r2; isolated-hook callers go via the writer's
+  # sudo-as-iso path inside bridge_isolation_v2_write_agent_state_marker.)
   if command -v bridge_isolation_v2_ensure_matrix_path >/dev/null 2>&1 \
       && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
       && bridge_isolation_v2_active 2>/dev/null; then
@@ -462,8 +465,11 @@ bridge_write_idle_ready_agents() {
             else
               # v0.9.7 RC2 (refs #781): write retries via the matrix-aware
               # marker writer so the per-agent state leaf inherits the
-              # canonical ab-agent-<X> 2770 contract. Falls back to plain
-              # mkdir/redirect when the matrix helper isn't loaded.
+              # canonical 2770 contract (group `ab-agent-<X>`; #1165 Gap
+              # 6 r2 keeps the per-agent integrity boundary and lets the
+              # writer sudo-as-iso when invoked from an isolated hook).
+              # Falls back to plain mkdir/redirect when the matrix
+              # helper isn't loaded.
               # r13 codex Probe F+H catch — drop direct-write fallback.
               # mark_idle_now / mark_manual_stop / webhook-port already
               # propagate hard fail in r12; this writer was missed in
@@ -586,7 +592,29 @@ bridge_install_teams_plugin_node_modules() {
     return 1
   fi
 
+  # #1165 Gap 3 (r2): the chmod -R go+rX must run on EVERY call when
+  # node_modules exists, not only after a fresh `bun install`. The
+  # idempotent path (early return when node_modules is already present)
+  # is the common case on a re-run of `agb setup teams` after a
+  # previous install — if the existing tree was created with the
+  # controller's umask (077 → mode 0700), the isolated UID is still
+  # locked out and bridge-dev-plugin-cache.py still fails on
+  # `Permission denied: '.../plugins/teams/node_modules/.bin/...'`.
+  # #1165 r1 only chmod'd after the fresh-install branch (codex catch
+  # BLOCKING 2), leaving pre-existing trees unreadable.
+  #
+  # Apply chmod first (idempotent + cheap when modes are already
+  # widened), then decide whether to skip the install. Plugin source
+  # files are non-secret git content; the bun lockfile and package.json
+  # are already world-readable in the source tree, so this only
+  # re-aligns the post-install node_modules tree with the rest of the
+  # plugin source. The chmod is best-effort: a failure here does not
+  # block setup (the operator may chmod after the fact), but a warning
+  # surfaces so the gap is visible.
   if [[ -d "$plugin_dir/node_modules" ]]; then
+    if ! chmod -R go+rX "$plugin_dir/node_modules" 2>/dev/null; then
+      bridge_warn "chmod -R go+rX failed on $plugin_dir/node_modules — isolated agents may fail to copy via bridge-dev-plugin-cache"
+    fi
     bridge_info "[setup] $plugin_dir/node_modules already present — skipping bun install"
     return 0
   fi
@@ -607,6 +635,21 @@ bridge_install_teams_plugin_node_modules() {
   if ! ( cd "$plugin_dir" && "$bun_bin" install --frozen-lockfile --no-summary >&2 ); then
     bridge_warn "bun install failed in $plugin_dir — Teams MCP will not start until deps resolve"
     return 1
+  fi
+
+  # #1165 Gap 3: bun install runs as the controller, so
+  # plugins/teams/node_modules/ inherits the controller umask (often
+  # 077 → mode 0700 awfmanager-owned). bridge-dev-plugin-cache.py
+  # then runs under the isolated UID's `sudo -u agent-bridge-<a>`
+  # context and fails to copy with `Permission denied:
+  # '.../plugins/teams/node_modules/.bin/...'`. Widen the tree to
+  # `go+rX` (read + traverse for group/other) so any isolated UID can
+  # copy it during the per-agent plugin cache materialize step. The
+  # chmod is best-effort: a failure here does not block setup (the
+  # operator may chmod after the fact), but a warning surfaces so the
+  # gap is visible.
+  if ! chmod -R go+rX "$plugin_dir/node_modules" 2>/dev/null; then
+    bridge_warn "chmod -R go+rX failed on $plugin_dir/node_modules — isolated agents may fail to copy via bridge-dev-plugin-cache"
   fi
 
   return 0
