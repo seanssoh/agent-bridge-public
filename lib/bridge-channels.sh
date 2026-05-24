@@ -586,7 +586,29 @@ bridge_install_teams_plugin_node_modules() {
     return 1
   fi
 
+  # #1165 Gap 3 (r2): the chmod -R go+rX must run on EVERY call when
+  # node_modules exists, not only after a fresh `bun install`. The
+  # idempotent path (early return when node_modules is already present)
+  # is the common case on a re-run of `agb setup teams` after a
+  # previous install — if the existing tree was created with the
+  # controller's umask (077 → mode 0700), the isolated UID is still
+  # locked out and bridge-dev-plugin-cache.py still fails on
+  # `Permission denied: '.../plugins/teams/node_modules/.bin/...'`.
+  # #1165 r1 only chmod'd after the fresh-install branch (codex catch
+  # BLOCKING 2), leaving pre-existing trees unreadable.
+  #
+  # Apply chmod first (idempotent + cheap when modes are already
+  # widened), then decide whether to skip the install. Plugin source
+  # files are non-secret git content; the bun lockfile and package.json
+  # are already world-readable in the source tree, so this only
+  # re-aligns the post-install node_modules tree with the rest of the
+  # plugin source. The chmod is best-effort: a failure here does not
+  # block setup (the operator may chmod after the fact), but a warning
+  # surfaces so the gap is visible.
   if [[ -d "$plugin_dir/node_modules" ]]; then
+    if ! chmod -R go+rX "$plugin_dir/node_modules" 2>/dev/null; then
+      bridge_warn "chmod -R go+rX failed on $plugin_dir/node_modules — isolated agents may fail to copy via bridge-dev-plugin-cache"
+    fi
     bridge_info "[setup] $plugin_dir/node_modules already present — skipping bun install"
     return 0
   fi
@@ -616,13 +638,10 @@ bridge_install_teams_plugin_node_modules() {
   # context and fails to copy with `Permission denied:
   # '.../plugins/teams/node_modules/.bin/...'`. Widen the tree to
   # `go+rX` (read + traverse for group/other) so any isolated UID can
-  # copy it during the per-agent plugin cache materialize step. Plugin
-  # source files are non-secret git content; the bun lockfile and
-  # package.json are already world-readable in the source tree, so this
-  # only re-aligns the post-install node_modules tree with the rest of
-  # the plugin source. The chmod is best-effort: a failure here does
-  # not block setup (the operator may chmod after the fact), but a
-  # warning surfaces so the gap is visible.
+  # copy it during the per-agent plugin cache materialize step. The
+  # chmod is best-effort: a failure here does not block setup (the
+  # operator may chmod after the fact), but a warning surfaces so the
+  # gap is visible.
   if ! chmod -R go+rX "$plugin_dir/node_modules" 2>/dev/null; then
     bridge_warn "chmod -R go+rX failed on $plugin_dir/node_modules — isolated agents may fail to copy via bridge-dev-plugin-cache"
   fi

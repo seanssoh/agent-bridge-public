@@ -289,10 +289,68 @@ def _resolve_isolated_owner_for_path(path: Path) -> str | None:
         cur = parent
 
 
+def _v2_agent_group_name(agent: str) -> str | None:
+    """Pure-Python mirror of `bridge_isolation_v2_agent_group_name`
+    (lib/bridge-isolation-v2.sh:406-460).
+
+    The v2 prepare path creates `ab-agent-<agent>` as a SUPPLEMENTARY
+    group of the isolated UID — `useradd -r` on a fresh user does NOT
+    set `-g <ab-agent>`, so the isolated UID's PRIMARY group is whatever
+    `useradd` defaulted to (often the system's `users` group or a
+    per-UID equivalent). `id -gn <isolated-uid>` returns that primary
+    group, NOT `ab-agent-<agent>` (#1165 r2 BLOCKING 1 — codex catch).
+    The controller is added to `ab-agent-<agent>` as a supplementary
+    member but NOT to the primary group, so a `chgrp <primary-group>`
+    on `.teams/` would re-lock the controller out of every subsequent
+    `os.stat`. This helper composes the deterministic `ab-agent-<slug>`
+    group name the v2 grant path actually uses.
+
+    Mirrors the bash helper's platform-branched length policy:
+      - Linux: hard 32-char cap on group names; for `ab-agent-<agent>`
+        compositions exceeding 32 chars, the agent segment is reduced
+        to `<head>-<7-char-sha256(agent)>` so two long agent names with
+        a shared head still resolve to distinct groups.
+      - Darwin: `dseditgroup` tolerates 255-char group names; pass
+        through unchanged up to that limit.
+
+    Returns None for invalid agent names (groupadd accepts only
+    [a-z_][a-z0-9_-]*) or when the macOS 255-char limit is exceeded —
+    matching the bash helper's `return 1` paths.
+
+    Cross-language pair: keep in lock-step with
+    `bridge_isolation_v2_agent_group_name` in lib/bridge-isolation-v2.sh.
+    Any change to one side (prefix override, length policy, hash width)
+    MUST land on both sides in the same commit.
+    """
+    if not agent:
+        return None
+    if not re.match(r'^[a-z_][a-z0-9_-]*$', agent):
+        return None
+    prefix = os.environ.get("BRIDGE_AGENT_GROUP_PREFIX", "ab-agent-")
+    composed = f"{prefix}{agent}"
+    if sys.platform == "darwin":
+        if len(composed) > 255:
+            return None
+        return composed
+    # Linux: 32-char hard cap with hash-truncation on overflow.
+    if len(composed) <= 32:
+        return composed
+    prefix_len = len(prefix)
+    avail = 32 - prefix_len
+    # Need at least 1 char + '-' + 7-char hash = 9 chars for the segment.
+    if avail < 9:
+        return None
+    keep = avail - 1 - 7
+    digest = hashlib.sha256(agent.encode("utf-8")).hexdigest()[:7]
+    head = agent[:keep]
+    return f"{prefix}{head}-{digest}"
+
+
 def _isolation_aware_mkdir(
     path: Path,
     mode: int = 0o2750,
     group: str | None = None,
+    agent: str | None = None,
 ) -> None:
     """`mkdir -p` with isolation awareness. If `path` does not exist and
     its nearest existing ancestor is owned by an isolated
@@ -313,13 +371,23 @@ def _isolation_aware_mkdir(
       path: directory to create.
       mode: target mode for the new directory. Defaults to `0o2750`
         which matches the v2 isolation contract for channel state dirs.
-      group: optional group name to `chgrp` after the mkdir+chmod step.
-        When None and the isolated owner's primary group resolves via
-        `id -gn`, that primary group is used (the iso UID's primary
-        group is always `ab-agent-<slug>` on a v2 install). When the
-        probe fails the chgrp step is skipped silently — the chmod
-        already widened group traversal in absolute terms; chgrp is
-        belt-and-braces to land the correct setgid inheritance target.
+      group: explicit group name to `chgrp` after the mkdir+chmod step.
+        Highest priority when set; useful for tests that need to pin a
+        non-default group.
+      agent: the agent slug (e.g., `args.agent` in the channel setup
+        commands). When set and `group` is None, the v2 `ab-agent-<slug>`
+        group is computed via the local `_v2_agent_group_name` mirror
+        of `bridge_isolation_v2_agent_group_name`. This is the correct
+        group to chgrp to — see #1165 r2 BLOCKING 1: the v2 prepare
+        path makes `ab-agent-<agent>` a SUPPLEMENTARY group of the
+        isolated UID, and `id -gn <isolated-uid>` returns the PRIMARY
+        group which the controller is NOT a member of, so falling back
+        to `id -gn` re-locks the controller out of `.teams/`.
+      (legacy) When both `group` and `agent` are None, falls back to
+        `id -gn <isolated-uid>` as a last-resort probe. This fallback
+        is unreliable on v2 hosts (returns the primary group, not the
+        controller-readable supplementary group) and should not be
+        relied on by new callers — pass `agent=` instead.
     """
     if path.exists():
         return
@@ -327,13 +395,24 @@ def _isolation_aware_mkdir(
     if owner is None:
         path.mkdir(parents=True, exist_ok=True)
         return
-    # Resolve the agent group name. The iso UID's primary group is the
-    # per-agent group (`ab-agent-<slug>` on a v2 install); `id -gn` is
-    # authoritative on the local host so we do not have to mirror the
-    # 32-char hash-truncation branch from
-    # bridge_isolation_v2_agent_group_name.
+    # Resolve the target group. Priority: explicit `group=` >
+    # v2-helper-via-`agent=` > `id -gn` legacy fallback. The v2 helper
+    # is authoritative on a v2 install — it composes the same
+    # `ab-agent-<slug>` group the bash grant path used to add the
+    # controller as a supplementary member. `id -gn <isolated-uid>`
+    # returns the isolated user's PRIMARY group, NOT the per-agent
+    # supplementary group; using it would re-lock the controller out
+    # of `.teams/` because the controller is not a member of the
+    # isolated UID's primary group on v2 installs (#1165 r2 BLOCKING 1).
     resolved_group = group
+    if resolved_group is None and agent is not None:
+        resolved_group = _v2_agent_group_name(agent)
     if resolved_group is None:
+        # Last-resort fallback: probe the isolated UID's primary group.
+        # On a v2 install this is NOT the controller-readable group
+        # (see docstring); kept for legacy callers that have no
+        # `agent` handle. New callers must pass `agent=` so the v2
+        # helper is exercised instead.
         try:
             id_proc = subprocess.run(
                 ["id", "-gn", owner],
@@ -1296,7 +1375,7 @@ def cmd_discord(args: argparse.Namespace) -> int:
             print_result(result)
             return 0
 
-        _isolation_aware_mkdir(discord_dir)
+        _isolation_aware_mkdir(discord_dir, agent=args.agent)
         _isolation_aware_save_text(inspected["env_path"], f"DISCORD_BOT_TOKEN={token}\n")
         _isolation_aware_save_json(inspected["access_path"], access_doc)
         result["write_status"] = "ok"
@@ -1424,7 +1503,7 @@ def cmd_telegram(args: argparse.Namespace) -> int:
             print_telegram_result(result)
             return 0
 
-        _isolation_aware_mkdir(telegram_dir)
+        _isolation_aware_mkdir(telegram_dir, agent=args.agent)
         _isolation_aware_save_text(inspected["env_path"], f"TELEGRAM_BOT_TOKEN={token}\n")
         _isolation_aware_save_json(inspected["access_path"], access_doc)
         result["write_status"] = "ok"
@@ -1623,7 +1702,7 @@ def cmd_teams(args: argparse.Namespace) -> int:
             print_teams_result(result)
             return 0
 
-        _isolation_aware_mkdir(teams_dir)
+        _isolation_aware_mkdir(teams_dir, agent=args.agent)
         env_lines = [
             f"TEAMS_APP_ID={app_id}",
             f"TEAMS_APP_PASSWORD={app_password}",
@@ -1877,7 +1956,7 @@ def cmd_mattermost(args: argparse.Namespace) -> int:
             print_mattermost_result(result)
             return 0
 
-        _isolation_aware_mkdir(mattermost_dir)
+        _isolation_aware_mkdir(mattermost_dir, agent=args.agent)
         _isolation_aware_save_text(env_path, env_text)
         _isolation_aware_save_json(access_path, access_doc)
         _isolation_aware_save_json(mcp_path, mcp_doc)
