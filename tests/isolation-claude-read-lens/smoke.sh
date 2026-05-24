@@ -33,29 +33,38 @@ def body(name: str) -> str:
 
 
 prepare = body("bridge_linux_prepare_agent_isolation")
+# Phase 3 (#1186): inline `.claude/` mkdir + chown + chgrp + chmod block
+# moved into `bridge_linux_normalize_isolated_home_contract`. Prepare
+# path now delegates via a helper call; the contract operations
+# themselves are exercised inside the helper body below.
 required_prepare_fragments = [
     'local isolated_claude_dir="$user_home/.claude"',
-    'bridge_linux_sudo_root mkdir -p "$isolated_claude_dir"',
-    'bridge_linux_sudo_root chown "$os_user" "$isolated_claude_dir"',
-    'bridge_linux_sudo_root chgrp "$_claude_v2_grp" "$isolated_claude_dir"',
-    # #1165 Gap 2: widened from 2750 to 2770 so the SessionStart hook's
-    # `mkdir .claude/session-env/` can succeed via the supplementary-
-    # group path. The controller (group member of ab-agent-<name>) still
-    # reaches ~/.claude/projects/ via group r-x; the group-write bit
-    # only adds group writability, which is bounded by the v2 agent-
-    # group composition (controller + the isolated UID itself).
-    'bridge_linux_sudo_root chmod 2770 "$isolated_claude_dir"',
-    # The "controller (group member of" string used to live on a single
-    # source line; the #1165 Gap 2 comment expansion now wraps that
-    # phrasing across two lines. The two halves below match the
-    # post-expansion shape; reverting either to a single-line form
-    # (which is fine) still satisfies the half-fragment assertion.
-    'group member of ab-agent-<name>',
+    'bridge_linux_normalize_isolated_home_contract',
     'without any named-user ACL',
 ]
 missing = [fragment for fragment in required_prepare_fragments if fragment not in prepare]
 if missing:
     raise SystemExit(f"v2 read-lens prepare path missing fragments: {missing}")
+
+helper = body("bridge_linux_normalize_isolated_home_contract")
+required_helper_fragments = [
+    # mode 3770 default (Phase 3 codex design: sticky + setgid). Fallback
+    # 2770 via BRIDGE_ISO_HOME_CONTRACT_MODE override remains available.
+    'BRIDGE_ISO_HOME_CONTRACT_MODE',
+    'claude_mode="3770"',
+    'home_mode="2750"',
+    # mkdir + chown + chmod via bridge_linux_sudo_root — same primitives
+    # the prepare path used inline pre-#1186 (sites now in `_bridge_normalize_one`).
+    'bridge_linux_sudo_root mkdir -p',
+    'bridge_linux_sudo_root chown',
+    'bridge_linux_sudo_root chmod',
+    # ab-agent-<name> resolved via bridge_isolation_v2_agent_group_name
+    # (replaces the prior inline chgrp "$_claude_v2_grp").
+    'bridge_isolation_v2_agent_group_name',
+]
+missing_helper = [fragment for fragment in required_helper_fragments if fragment not in helper]
+if missing_helper:
+    raise SystemExit(f"v2 read-lens helper missing fragments: {missing_helper}")
 
 for stale in [
     "bridge_linux_repair_isolated_claude_read_lens",
