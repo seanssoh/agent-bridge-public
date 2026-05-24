@@ -136,7 +136,6 @@ bridge_auth_prepare_credential_file() {
   local dir=""
   local user_home=""
   local os_user=""
-  local os_group=""
 
   dir="$(dirname "$file")"
   user_home="$(bridge_auth_resolved_user_home_for_agent "$agent")" || return 1
@@ -147,18 +146,25 @@ bridge_auth_prepare_credential_file() {
       printf '[error] cannot resolve isolated os_user for agent: %s\n' "$agent" >&2
       return 1
     }
-    os_group="$(id -gn "$os_user" 2>/dev/null || printf '%s' "$os_user")"
-    if ! bridge_auth_run_privileged test -d "$dir"; then
-      # PR #799 r2 codex finding 2 — verify_safe_claude_dir above already
-      # rejected pre-existing symlinks / non-dirs. The ``mkdir -p`` here is
-      # safe because the parent ``$user_home`` is the privileged-owned
-      # isolated root and ``.claude`` does not yet exist.
-      bridge_auth_run_privileged mkdir -p "$dir" || {
-        printf '[error] cannot create Claude credentials dir: %s\n' "$dir" >&2
-        return 1
-      }
-      bridge_auth_run_privileged chown "$os_user:$os_group" "$dir" || return 1
-      bridge_auth_run_privileged chmod 0700 "$dir" || return 1
+    # Phase 3 codex design: route the parent-dir contract through the
+    # shared helper so token sync, prepare, and the restart reverter
+    # all converge on the same `.claude` contract (root:ab-agent-<agent>
+    # mode 3770/2770 with sticky for integrity). The credential file
+    # itself (`.credentials.json`) is still owned by the isolated UID
+    # with mode 0600, written by the token-sync writer downstream; only
+    # the parent-dir contract goes through the helper.
+    #
+    # Previously this branch ran `mkdir/chown $os_user:$primary_group/
+    # chmod 0700`, which set the wrong primary group on `.claude` and
+    # locked the controller's harvester out of `~/.claude/projects/`
+    # after the next prepare/restart cycle (#1180 sequel: gap E).
+    # ALLOW_RUNNING=1: token sync runs against live agents; the helper
+    # is internal-caller safe here (no chmod-while-write race because
+    # the writer has not yet opened the credential file).
+    if ! BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING=1 \
+          bridge_linux_normalize_isolated_home_contract "$agent" "$os_user" "$user_home" >/dev/null; then
+      printf '[error] cannot normalize isolated home contract for agent: %s\n' "$agent" >&2
+      return 1
     fi
     return 0
   fi

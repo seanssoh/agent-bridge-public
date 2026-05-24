@@ -106,7 +106,13 @@ resolved_t1="$(
     # smoke_setup_bridge_home; T1-T4 here only need the temp root, so
     # set BRIDGE_LAYOUT directly for the inner subshell.
     BRIDGE_LAYOUT="v2"
-    export BRIDGE_SCRIPT_DIR BRIDGE_LAYOUT
+    # bridge_layout_resolver_validate_env requires BRIDGE_DATA_ROOT to
+    # accompany BRIDGE_LAYOUT=v2 (partial env is rejected — see
+    # lib/bridge-layout-resolver.sh:128-141). Otherwise the validator
+    # returns 1, the resolver falls through to fresh-install-candidate,
+    # and bridge_die fires with "markerless(fresh-install-candidate)".
+    BRIDGE_DATA_ROOT="${SMOKE_TMP_ROOT:-/tmp}/agent-bridge-data"
+    export BRIDGE_SCRIPT_DIR BRIDGE_LAYOUT BRIDGE_DATA_ROOT
     source "$SCRIPT_DIR/bridge-lib.sh" >/dev/null 2>&1
     bridge_resolve_engine_binary claude
   ' 2>/dev/null

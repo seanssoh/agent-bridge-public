@@ -168,27 +168,96 @@ T1C_OUT="$("$PY_BIN" "$T1C_HARNESS" "$REPO_ROOT" "$T1C_TMP" 2>&1)" || smoke_fail
 [[ "$T1C_OUT" == *"OK"* ]] || smoke_fail "T1c expected 'OK', got: $T1C_OUT"
 smoke_log "T1c PASS: _isolation_aware_mkdir accepts default + (mode,) + (mode, group) call shapes"
 
-# ---------- T2 — bridge_linux_prepare_agent_isolation: ~/.claude is 2770 ----------
+# ---------- T2 — bridge_linux_prepare_agent_isolation calls shared helper ----------
 #
-# Static-source assertion against lib/bridge-agents.sh. The chmod line
-# for `isolated_claude_dir` must read 2770 (not 2750). Boomerang: a
-# revert to 2750 trips this immediately.
+# Static-source assertion against lib/bridge-agents.sh. Phase 3 codex
+# design (#1180 sequel): the inline `chgrp ab-agent + chmod 2770` block
+# under `bridge_linux_prepare_agent_isolation` was replaced with a
+# single call to `bridge_linux_normalize_isolated_home_contract`. The
+# helper applies the canonical contract (HOME 2750 + .claude/.claude
+# subdirs 3770/2770) across THREE call sites — prepare, the restart
+# reverter (lib/bridge-hooks.sh), and the credential-prepare path
+# (bridge-auth.sh).
+#
+# Regressions caught here:
+#   * direct re-introduction of `chmod 2770 "$isolated_claude_dir"`
+#     (the per-site inline form Phase 3 is replacing).
+#   * direct re-introduction of `chmod 2750 "$isolated_claude_dir"`
+#     (the pre-#1165 pre-widening form).
+#   * absence of the helper call in prepare (means we'd silently
+#     stop normalizing the agent group / mode).
 
 T2_SOURCE="$REPO_ROOT/lib/bridge-agents.sh"
 if grep -q '^  bridge_linux_sudo_root chmod 2750 "$isolated_claude_dir"' "$T2_SOURCE"; then
-  smoke_fail "T2 regression: lib/bridge-agents.sh still has 'chmod 2750 \"\$isolated_claude_dir\"' (Gap 2 closed by widening to 2770)"
+  smoke_fail "T2 regression: lib/bridge-agents.sh still has 'chmod 2750 \"\$isolated_claude_dir\"' (Phase 3: replaced by shared helper)"
 fi
-grep -q '^  bridge_linux_sudo_root chmod 2770 "$isolated_claude_dir"' "$T2_SOURCE" \
-  || smoke_fail "T2 expected 'chmod 2770 \"\$isolated_claude_dir\"' line in $T2_SOURCE (Gap 2 widening missing)"
-# Sanity: the bridge_die error message should also be updated to match
-# the new mode. A stale "chmod 2750" error message points to a
-# half-applied edit.
-if grep -q 'isolation v2: chmod 2750 on .\$isolated_claude_dir.' "$T2_SOURCE"; then
-  smoke_fail "T2 stale error message: lib/bridge-agents.sh still references 'chmod 2750' in bridge_die for isolated_claude_dir"
+if grep -q '^  bridge_linux_sudo_root chmod 2770 "$isolated_claude_dir"' "$T2_SOURCE"; then
+  smoke_fail "T2 regression: lib/bridge-agents.sh still has 'chmod 2770 \"\$isolated_claude_dir\"' inline (Phase 3 routes this through bridge_linux_normalize_isolated_home_contract — see #1180 sequel)"
 fi
-grep -q 'isolation v2: chmod 2770 on .\$isolated_claude_dir.' "$T2_SOURCE" \
-  || smoke_fail "T2 expected bridge_die error message referencing 'chmod 2770' for isolated_claude_dir in $T2_SOURCE"
-smoke_log "T2 PASS: ~/.claude chmod widened to 2770 (Gap 2 closed)"
+# Helper must be defined.
+grep -q '^bridge_linux_normalize_isolated_home_contract()' "$T2_SOURCE" \
+  || smoke_fail "T2 expected shared helper 'bridge_linux_normalize_isolated_home_contract()' definition in $T2_SOURCE (Phase 3 isolated HOME contract)"
+# Helper must be called from inside bridge_linux_prepare_agent_isolation.
+"$PY_BIN" - "$T2_SOURCE" <<'PY' || smoke_fail "T2 expected bridge_linux_prepare_agent_isolation to call bridge_linux_normalize_isolated_home_contract (Phase 3 call-site #1)"
+import sys, re
+src = open(sys.argv[1]).read()
+m = re.search(
+    r'^bridge_linux_prepare_agent_isolation\(\)\s*\{(.*?)\n\}\n',
+    src, re.S | re.M,
+)
+sys.exit(0 if (m and 'bridge_linux_normalize_isolated_home_contract' in m.group(1)) else 1)
+PY
+smoke_log "T2 PASS: bridge_linux_prepare_agent_isolation routes through bridge_linux_normalize_isolated_home_contract (Phase 3)"
+
+# ---------- T2b — restart reverter calls shared helper (Family 3 fix) ----------
+#
+# This is the architectural fix for the H regression patch reported
+# during Phase 3 acceptance: `bridge_install_isolated_home_settings`
+# (lib/bridge-hooks.sh) previously did
+#   `chown "root:$os_user" "$target_dir" && chmod 0750 "$target_dir"`
+# which silently reverted the prepare-side contract on every restart.
+# The beta14 #1165 Gap 2 smoke verified prepare set 2770 but did NOT
+# verify the restart path preserved it.
+#
+# Phase 3 fix: restart reverter routes through the shared helper. This
+# smoke fails on any re-introduction of the old per-site chown/chmod.
+T2B_SOURCE="$REPO_ROOT/lib/bridge-hooks.sh"
+# Regression: pre-Phase-3 inline contract.
+if grep -q 'chown "root:\$os_user" "\$target_dir"' "$T2B_SOURCE"; then
+  smoke_fail "T2b regression: lib/bridge-hooks.sh still has 'chown \"root:\$os_user\" \"\$target_dir\"' — restart reverter must route through bridge_linux_normalize_isolated_home_contract (Phase 3 Family 3 root cause)"
+fi
+if grep -q 'chmod 0750 "\$target_dir"' "$T2B_SOURCE"; then
+  smoke_fail "T2b regression: lib/bridge-hooks.sh still has 'chmod 0750 \"\$target_dir\"' — restart reverter must route through bridge_linux_normalize_isolated_home_contract (Phase 3 Family 3 root cause)"
+fi
+# Required: helper invocation inside bridge_install_isolated_home_settings.
+"$PY_BIN" - "$T2B_SOURCE" <<'PY' || smoke_fail "T2b expected bridge_install_isolated_home_settings to call bridge_linux_normalize_isolated_home_contract (Phase 3 Family 3 fix)"
+import sys, re
+src = open(sys.argv[1]).read()
+m = re.search(
+    r'^bridge_install_isolated_home_settings\(\)\s*\{(.*?)\n\}\n',
+    src, re.S | re.M,
+)
+sys.exit(0 if (m and 'bridge_linux_normalize_isolated_home_contract' in m.group(1)) else 1)
+PY
+smoke_log "T2b PASS: restart reverter (bridge_install_isolated_home_settings) routes through bridge_linux_normalize_isolated_home_contract (Phase 3 Family 3 closed)"
+
+# ---------- T2c — bridge_auth_prepare_credential_file calls shared helper ----------
+T2C_SOURCE="$REPO_ROOT/bridge-auth.sh"
+# Regression: pre-Phase-3 isolated-branch inline contract.
+if grep -q 'chmod 0700 "\$dir"' "$T2C_SOURCE" \
+    && grep -q 'chown "\$os_user:\$os_group" "\$dir"' "$T2C_SOURCE"; then
+  smoke_fail "T2c regression: bridge-auth.sh still has the pre-Phase-3 isolated-branch inline 'chown \$os_user:\$os_group + chmod 0700 \$dir' contract (Phase 3 routes this through bridge_linux_normalize_isolated_home_contract)"
+fi
+"$PY_BIN" - "$T2C_SOURCE" <<'PY' || smoke_fail "T2c expected bridge_auth_prepare_credential_file (isolated branch) to call bridge_linux_normalize_isolated_home_contract"
+import sys, re
+src = open(sys.argv[1]).read()
+m = re.search(
+    r'^bridge_auth_prepare_credential_file\(\)\s*\{(.*?)\n\}\n',
+    src, re.S | re.M,
+)
+sys.exit(0 if (m and 'bridge_linux_normalize_isolated_home_contract' in m.group(1)) else 1)
+PY
+smoke_log "T2c PASS: bridge_auth_prepare_credential_file (isolated branch) routes through bridge_linux_normalize_isolated_home_contract"
 
 # ---------- T3 — bridge_install_teams_plugin_node_modules: chmod -R go+rX ----------
 #

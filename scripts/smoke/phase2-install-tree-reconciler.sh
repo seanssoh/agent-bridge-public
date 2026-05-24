@@ -216,9 +216,20 @@ test_t1_matrix_rows() {
     smoke_assert_contains "$rows_out" "$row_name|" "T1: missing install row $row_name"
   done
 
+  # Phase 3 (codex design 2026-05-24) Family 1 install-tree rows.
+  # Four new rows close patch's Phase 3 acceptance gaps A/B/C/D:
+  #   A. .claude-plugin/, B. plugins/, C. plugins/*, D. agents/
+  for row_name in claude-plugin-dir plugins-root plugins-channel-trees agents-root; do
+    smoke_assert_contains "$rows_out" "$row_name|" \
+      "T1: Phase 3 Family 1 install row '$row_name' missing"
+  done
+
   # No per-agent rows when no --agent passed
   smoke_assert_not_contains "$rows_out" "agent-state-leaf|" \
     "T1: agent-state-leaf must be absent when no --agent"
+  # Phase 3 Family 2 rows are also per-agent only.
+  smoke_assert_not_contains "$rows_out" "agent-home-contract-home|" \
+    "T1: agent-home-contract-* rows must be absent when no --agent"
 
   # Now with --agent
   local rows_agent
@@ -229,6 +240,18 @@ test_t1_matrix_rows() {
   " 2>/dev/null)"
   smoke_assert_contains "$rows_agent" "agent-state-leaf|" \
     "T1: agent-state-leaf must appear when --agent is given"
+  # Phase 3 Family 2 per-agent rows are gated on the agent being a real
+  # isolated agent (the matrix probes the roster via
+  # bridge_agent_linux_user_isolation_effective). On a synthetic
+  # fake_agent_smoke that does NOT exist in the test roster the rows
+  # legitimately skip — so we assert their PRESENCE only when an agent
+  # IS resolvable. Simpler / portable: assert the row kind appears in
+  # the matrix SCHEMA via the test on a known-isolated synthetic. For
+  # the fake_agent path we just confirm they don't emit garbage. The
+  # functional fixture test (scripts/smoke/phase3-agent-home-contract.sh)
+  # is the place that exercises the helper end-to-end with a real
+  # isolated UID; the matrix output check here is intentionally
+  # narrow.
 
   # Format validation — each row must have ≥13 pipe-separated fields.
   while IFS= read -r line; do
