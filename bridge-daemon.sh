@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 bridge_load_roster
 
 usage() {
-  echo "Usage: bash $SCRIPT_DIR/bridge-daemon.sh [--skip-plugin-liveness] <start|ensure|run|status|sync|stop [--force]>"
+  echo "Usage: bash $SCRIPT_DIR/bridge-daemon.sh [--skip-plugin-liveness] <start|ensure|run|status|sync|stop [--force]|restart [--force]>"
 }
 
 daemon_log_event() {
@@ -29,6 +29,102 @@ daemon_info() {
 daemon_warn() {
   local message="$1"
   printf '[%s] [warn] %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$message" >&2
+}
+
+# Issue #1178 (cycle 12, Deliverable C): warn at daemon startup when the
+# running process's supplementary-group set is stale compared to the
+# shadow DB. Linux process credentials make this a real silent failure:
+# the controller's supp-group set is established at login (or systemd
+# unit start, or the last `newgrp`) and inherited across fork+exec. A
+# later `usermod -aG` (which scaffold-as-root and the v2 isolation
+# grant runner perform) updates `/etc/group` but does NOT propagate to
+# already-running processes. The daemon then forks children that
+# inherit the stale set, so even after `getent group ab-agent-<a>`
+# shows the controller as a member, spawned hooks/setup helpers still
+# can't `+x` into the per-agent tree. See KNOWN_ISSUES.md §28.
+#
+# Detection: compare the running process's `id -G` (kernel-side
+# supplementary GIDs) against `id -G <user>` (which re-resolves through
+# NSS / getent — picks up any post-login `usermod -aG`). If they differ
+# AND the missing set contains any `ab-agent-*` group, emit a
+# one-line warning pointing at the resolution recipe.
+#
+# Bash-daemon caveat: we cannot fix this in-process — refreshing
+# supp-groups in bash requires either `exec sg <group>` (single-group
+# only, invasive — would lose every TERM/INT/HUP handler the daemon
+# just installed) or a log-out/log-in cycle. So this is a WARN, not an
+# auto-recover. The operator's runbook (OPERATIONS.md §"Supplementary
+# group refresh after first v2 isolated agent") covers the manual
+# resolution.
+#
+# Best-effort: silently no-op on macOS (sys.platform != linux check via
+# uname), when `id`/`getent` are unavailable, or when the comparison
+# can't be made (e.g. systemd-run / nsswitch returning malformed
+# output). The check must never block startup.
+bridge_daemon_warn_if_supp_groups_stale() {
+  # Linux-only: macOS dev hosts don't run v2 isolation and have a
+  # different `id` flag set; skip cleanly so we don't false-positive on
+  # the operator's laptop.
+  case "$(uname -s 2>/dev/null || true)" in
+    Linux) ;;
+    *) return 0 ;;
+  esac
+  command -v id >/dev/null 2>&1 || return 0
+
+  local current_user="" process_gids="" canonical_gids=""
+  # Resolve the daemon's own user name. Prefer pwd via `id -un` (works
+  # even when $USER/$LOGNAME are unset under launchd/systemd).
+  current_user="$(id -un 2>/dev/null || true)"
+  [[ -n "$current_user" ]] || return 0
+
+  # `id -G` (no user arg) reports THIS PROCESS's kernel-side
+  # supplementary GIDs (stale-after-usermod by design).
+  process_gids="$(id -G 2>/dev/null || true)"
+  # `id -G <user>` re-resolves via NSS so the answer reflects the
+  # current /etc/group state (fresh).
+  canonical_gids="$(id -G "$current_user" 2>/dev/null || true)"
+  [[ -n "$process_gids" && -n "$canonical_gids" ]] || return 0
+
+  # Normalize to one-per-line, sorted, deduped — set difference via
+  # comm is the cleanest comparison shape that doesn't require an
+  # associative array per Bash 3.2 compat.
+  local process_sorted canonical_sorted missing_gids
+  process_sorted="$(printf '%s\n' "$process_gids" | tr ' ' '\n' | sort -u)"
+  canonical_sorted="$(printf '%s\n' "$canonical_gids" | tr ' ' '\n' | sort -u)"
+  # Groups present in canonical but NOT in process = stale supp set.
+  missing_gids="$(comm -23 <(printf '%s\n' "$canonical_sorted") <(printf '%s\n' "$process_sorted") 2>/dev/null || true)"
+  [[ -n "$missing_gids" ]] || return 0
+
+  # Resolve each missing GID to a group name and check for ab-agent-*.
+  # `getent group <gid>` returns `name:x:gid:members` — we want field 1.
+  # Iterate via positional-arg expansion (avoids `<<<` here-string per
+  # lint-heredoc-ban contract — footgun #11 family even though this is
+  # a `read` loop not a subprocess feed).
+  local gid name has_iso_drift="" iso_names=""
+  local _saved_ifs="$IFS"
+  IFS=$'\n'
+  # shellcheck disable=SC2086  # word-split missing_gids by IFS=$'\n' on purpose
+  set -- $missing_gids
+  IFS="$_saved_ifs"
+  for gid in "$@"; do
+    [[ -n "$gid" ]] || continue
+    name="$(getent group "$gid" 2>/dev/null | cut -d: -f1)"
+    [[ -n "$name" ]] || continue
+    if [[ "$name" == ab-agent-* ]]; then
+      has_iso_drift="yes"
+      if [[ -z "$iso_names" ]]; then
+        iso_names="$name"
+      else
+        iso_names="$iso_names $name"
+      fi
+    fi
+  done
+
+  [[ -n "$has_iso_drift" ]] || return 0
+
+  daemon_warn "daemon supplementary-group set is stale: missing ab-agent group(s) [${iso_names}]. Spawned children will inherit the stale set, leading to PermissionError on isolated agent paths even though /etc/group shows the controller as a member."
+  daemon_warn "resolution: log out + log back in (refreshes the full group set), or 'newgrp <group>' for a single-group refresh, then restart the daemon ('agent-bridge daemon restart' or 'sudo systemctl restart agent-bridge'). See KNOWN_ISSUES.md §28 / OPERATIONS.md for the systemd/launchd runbook."
+  return 0
 }
 
 # PR #953 r3 (refs #4807, codex r2 P2 #1): centralized dispatcher for the
@@ -7027,6 +7123,18 @@ cmd_run() {
 
   BRIDGE_DAEMON_LAST_STEP="startup"
   echo "$$" >"$BRIDGE_DAEMON_PID_FILE"
+
+  # Issue #1178 (cycle 12, Deliverable C): emit a one-line warning when
+  # the daemon's running supp-group set is stale vs the shadow DB. The
+  # daemon cannot self-recover (bash has no `os.initgroups()` analog;
+  # a re-exec to refresh would lose the trap handlers installed above
+  # and orphan the queue-gateway socket child), so this is observability
+  # only — the operator-side runbook (KNOWN_ISSUES.md §28) covers
+  # resolution. Best-effort; never blocks startup. The check fires
+  # before queue_gateway_socket_listener so the warning lands ahead of
+  # any spawned-child error surface that the stale set would cause.
+  bridge_daemon_warn_if_supp_groups_stale || true
+
   BRIDGE_DAEMON_LAST_STEP="queue_gateway_socket_listener"
   if ! bridge_daemon_ensure_queue_gateway_socket_listener; then
     :
@@ -7329,6 +7437,33 @@ shift || true
 # and exits 0. ALSO defend the silently-dangerous case where the
 # operator types `daemon ensure --help` (or `daemon start --help`)
 # expecting help — historically the dispatcher consumed the verb,
+# Issue #1178 r2 (codex r1 BLOCKING 1, refs PR #1179 review): the daemon
+# supp-groups stale-set warning (`bridge_daemon_warn_if_supp_groups_stale`,
+# above) recommends `agent-bridge daemon restart` as part of the recovery
+# recipe. That recommendation must point at a real subcommand. The
+# existing dispatch had `start`, `ensure`, `stop`, `status`, `sync`,
+# `run`, `run-cron-worker` but no `restart`; bare `bash bridge-daemon.sh
+# restart` fell into the `*)` arm, printed usage, and exited rc=1.
+#
+# This wrapper implements the operator-natural verb as stop → start.
+# `cmd_stop` carries the active-agent guard (#314 Layer 3) and the
+# --force bypass; we pass remaining args through so `daemon restart
+# --force` (the documented warning-recipe form) reaches the guard the
+# same way `daemon stop --force` already does. If stop refuses, restart
+# refuses with the same rc (the operator must address the active-agent
+# state before retrying or pass --force). On a clean stop we call
+# `cmd_start` (not `cmd_run`); start is the public-facing async
+# entry point (forks a background daemon and returns), matching what
+# `agent-bridge daemon start` already does.
+cmd_restart() {
+  local stop_rc=0
+  cmd_stop "$@" || stop_rc=$?
+  if (( stop_rc != 0 )); then
+    return "$stop_rc"
+  fi
+  cmd_start
+}
+
 # matched `ensure)`, and called `cmd_start` unconditionally, starting
 # the daemon. Each verb now scans its remaining args for -h/--help/help
 # and prints usage instead of executing the cmd_*.
@@ -7381,6 +7516,13 @@ case "$CMD" in
       exit 0
     fi
     cmd_stop "$@"
+    ;;
+  restart)
+    if daemon_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
+    cmd_restart "$@"
     ;;
   status)
     if daemon_args_have_help "$@"; then

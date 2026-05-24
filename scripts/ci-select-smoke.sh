@@ -107,7 +107,7 @@ add_live() {
 
 add_all_required_static() {
 
-  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift
+  add_required queue daemon daemon-periodic-token-sync launch launch-dev-channels-injection tmux-injection isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env bsd-mktemp-portability upgrade-isolated-agent-migrate channel-plugins channel-env-readiness hooks upgrade upgrade-source-preservation upgrade-shared-settings-propagate admin-pair-server-auto-provision mattermost-plugin pre-compact-envelope-roundtrip telegram-relay-residue-cleanup agent-create-name-validation agent-create-caller-trust-gate agent-create-idle-timeout 1105-agent-add-audit 1100-audit-since-tz agent-update agent-update-launch-cmd-redaction 1122-admin-auto-caller-source 1136-always-on-no agent-doctor cron-run-artifacts-retention cron-migrate-payloads cron-mutation-audit cron-shell-runner 1114-cli-help-contract upgrade-conflicts-lifecycle managed-autocompact-window per-agent-settings-rendering 1120-controller-ops-isolated 1139-link-shared-settings-perm 1144-upgrade-complete-task 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1151-r2-sudo-escalate 1155-bootstrap-skill-guard 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-a-scaffold-modes 1165-track-b-sudo-escalate-and-state 1165-track-c-hooks-and-dispatcher 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp shared-settings-preserve-user-keys status-engine-detect 835-static-admin-launch 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1028-isolated-workdir-check 1118-v2-engine-binary-path admin-protocol-shared-link bridge-notify-no-default-discord-875 cleanup-payload-empty-stdin-872 dynamic-agent-shared-mode-workdir v2-scaffold-home-and-workdir 1060-layout-fresh-v2-static-claude 1060-layout-fresh-v2-static-codex 1060-layout-shared-workdir-pair agent-env-no-stale-bridge-layout 1015-resume-claude-config-dir 1073-fresh-channel-first-run-seed isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup nudge-task-age-gate 1106-nudge-shell-recheck nudge-redundant-active-agent tool-policy-roster-read-classify 679-wiki-ingest-exclude-precompact a2a-cross-bridge 1058-bootstrap-tmux-ux legacy-install-migrator 1117-cli-help-universal-gate 1087-migrator-apply-contract 1067-codex-provisioning 1077-migrate-iso-v2-data-dir 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill 1115-cli-usage-drift
 
 
 }
@@ -293,7 +293,14 @@ select_for_path() {
       # idempotency, L1873 mattermost MCP, L1995 channel access preserve),
       # and the lint-raw-pathlib-on-isolated regression guard cannot
       # silently regress.
-      add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit
+      # Issue #1178 (cycle 12 architectural root): bridge-setup.py's
+      # `_isolation_aware_mkdir` traceback at L368 was unblocked by
+      # routing the new `_sudo_stat_owner` recovery in
+      # `lib/bridge_iso_paths.py`. The L368 raw mkdir is now noqa'd as
+      # the controller-owned post-helper fallback. Pull
+      # 1178-helper-contract-daemon-supp on every bridge-setup.py move
+      # so the L368 reproducer + extended lint baseline cannot regress.
+      add_required queue upgrade-conflicts-lifecycle status-engine-detect 835-static-admin-launch 1155-bootstrap-skill-guard 1165-track-a-scaffold-modes 1170-safe-path-check-sudo-escalate 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp
       add_integration integration-minimal
       ;;
 
@@ -356,7 +363,13 @@ select_for_path() {
       # 1115-cli-usage-drift on every cron dispatcher move so a future
       # PR cannot regress an internal subcommand back into the public
       # surface (or drop a public one).
-      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift
+      # Issue #1178 (cycle 12, Deliverable C): bridge-daemon.sh gained
+      # a startup supplementary-group staleness warning
+      # (bridge_daemon_warn_if_supp_groups_stale). Pull
+      # 1178-helper-contract-daemon-supp on every bridge-daemon.sh move
+      # so the warning behavior + macOS no-op gate cannot regress
+      # silently.
+      add_required daemon queue launch-dev-channels-injection channel-env-readiness cron-run-artifacts-retention cron-shell-runner status-engine-detect 835-static-admin-launch bridge-sync-roster-memo daemon-periodic-token-sync 1015-resume-claude-config-dir 1115-cli-usage-drift 1178-helper-contract-daemon-supp
       add_integration integration-minimal
       add_live live-tmux-daemon
       ;;
@@ -457,7 +470,14 @@ select_for_path() {
       # shared module risks breaking both surfaces simultaneously;
       # pull the consolidated regression smoke + the canonical-shape
       # 1170 smoke + the per-area smokes for both consumers.
-      add_required 1175-exhaustive-pathlib-audit 1170-safe-path-check-sudo-escalate 1165-track-a-scaffold-modes 1165-track-c-hooks-and-dispatcher hooks
+      # Issue #1178 (cycle 12 architectural root): the canonical
+      # helpers gained a `_sudo_stat_owner` recovery so a
+      # PermissionError on lstat()/exists() during the walker is no
+      # longer silently swallowed. Pull 1178-helper-contract-daemon-supp
+      # on every lib/bridge_iso_paths.py / lint /
+      # raw-pathlib-baseline.txt move so the helper contract + lint
+      # extension + boomerang test cannot regress.
+      add_required 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp 1170-safe-path-check-sudo-escalate 1165-track-a-scaffold-modes 1165-track-c-hooks-and-dispatcher hooks
       add_integration integration-minimal
       ;;
 
@@ -721,7 +741,12 @@ select_for_path() {
       # rerender / scan flow with PermissionError tracebacks (the
       # PostToolUseFailure flood that drove #1165 Gap 7). Pull
       # 1175-exhaustive-pathlib-audit on every bridge-hooks.py move.
-      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit
+      # Issue #1178 (cycle 12): bridge-hooks.py gained noqa'd mutator
+      # sites (cmd_render_isolated_home_settings, _ensure_dir_with_sudo
+      # fallback, cmd_link_shared_settings sudo-recovery loop) under
+      # the extended lint surface. Pull 1178-helper-contract-daemon-supp
+      # so the noqa contract + helper integration cannot regress.
+      add_required hooks upgrade-shared-settings-propagate managed-autocompact-window isolated-settings-rendering per-agent-settings-rendering shared-settings-preserve-user-keys admin-hook-exemption 1067-codex-provisioning 1120-controller-ops-isolated 1139-link-shared-settings-perm 1145-ensure-dir-actually-sudo 1145-option1-deferral-guard 1151-step-a-helper 1165-track-c-hooks-and-dispatcher 1175-exhaustive-pathlib-audit 1178-helper-contract-daemon-supp
       add_integration integration-minimal
       ;;
 

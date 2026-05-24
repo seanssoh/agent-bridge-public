@@ -184,7 +184,7 @@ def load_json(path: Path) -> Any:
 
 
 def save_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-owned hook scaffold; iso-routed callers stage via _ensure_dir_with_sudo upstream
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -926,7 +926,7 @@ def cmd_status_codex_hooks(args: argparse.Namespace) -> int:
 def cmd_ensure_codex_hooks(args: argparse.Namespace) -> int:
     bridge_home = Path(args.bridge_home).expanduser()
     hooks_path = codex_hooks_path(args)
-    hooks_path.parent.mkdir(parents=True, exist_ok=True)
+    hooks_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — codex hooks live under ~/.codex (controller-owned), not under isolated agent tree
     session_command = session_start_hook_command(bridge_home, args.python_bin, "codex")
     stop_command = codex_stop_hook_command(bridge_home, args.python_bin)
     prompt_command = prompt_timestamp_hook_command(bridge_home, args.python_bin, "codex")
@@ -1191,7 +1191,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     agent_class = (getattr(args, "agent_class", "") or "") or None
 
     target_dir = isolated_home / ".claude"
-    target_dir.mkdir(parents=True, exist_ok=True)
+    target_dir.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — render flow runs sudo-backed externally when the isolated home denies controller writes
     effective_path = target_dir / "settings.effective.json"
     settings_link = target_dir / "settings.json"
 
@@ -1264,7 +1264,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # 3. Atomic write of the effective file (mode 0644 so the isolated UID
     # can read it; ownership stays with whoever invoked us — controller
     # under the normal start path, root under sudo-backed reapply).
-    effective_path.parent.mkdir(parents=True, exist_ok=True)
+    effective_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — already-staged by target_dir.mkdir above; sudo-backed reapply caller has write access
     tmp = effective_path.with_suffix(effective_path.suffix + ".tmp")
     # E2E test on Ubuntu 24.04 VM (2026-05-16) caught a race: under
     # concurrent bootstrap (bridge-bootstrap.sh) + patch first-start +
@@ -1287,7 +1287,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     except FileNotFoundError:
         # Race window — parent dir got nuked between mkdir and replace,
         # or tmp got removed by a sibling cleanup. Retry once.
-        effective_path.parent.mkdir(parents=True, exist_ok=True)
+        effective_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — retry of the upstream mkdir; same sudo-backed-reapply contract
         try:
             _atomic_write_effective()
         except FileNotFoundError as exc:
@@ -1309,8 +1309,8 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # cannot proceed without write access; the safe-probe was only
     # there to avoid raising on the read probe).
     if _safe_path_check("is_symlink", settings_link, _settings_link_owner) or _safe_path_check("exists", settings_link, _settings_link_owner):
-        settings_link.unlink()
-    settings_link.symlink_to("settings.effective.json")
+        settings_link.unlink()  # noqa: raw-pathlib-controller-only — gated by safe_path_check above; symlink/unlink need direct write access by design (sudo-backed reapply caller has it)
+    settings_link.symlink_to("settings.effective.json")  # noqa: raw-pathlib-controller-only — paired with the .unlink() above; needs direct write access on the isolated home, sudo-backed reapply caller has it (see #1178 r2)
 
     payload = {
         "isolated_home": str(isolated_home),
@@ -1390,7 +1390,7 @@ def _ensure_dir_with_sudo(path: Path, os_user: str | None) -> None:
         # ownership via a group-only signature on a controller-owned
         # tree, etc.). When it fails with PermissionError we let it
         # propagate — better surface a real error than fail silently.
-    path.mkdir(parents=True, exist_ok=True)
+    path.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — sudo-first branch above already tried iso escalation; this is the documented controller-direct fallback
 
 
 # #1175: `_safe_path_check` moved to `lib/bridge_iso_paths.py`
@@ -1482,7 +1482,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
                 status = "unchanged"
             else:
                 try:
-                    settings_path.unlink()
+                    settings_path.unlink()  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo rm fallback below
                 except PermissionError:
                     if os_user is None:
                         raise
@@ -1493,7 +1493,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
         elif _safe_path_check("exists", settings_path, os_user):
             backup = next_backup_path(settings_path, os_user)
             try:
-                shutil.copy2(settings_path, backup)
+                shutil.copy2(settings_path, backup)  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo cp -p fallback below
             except PermissionError:
                 if os_user is None:
                     raise
@@ -1501,7 +1501,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
                 if rc != 0:
                     raise
             try:
-                settings_path.unlink()
+                settings_path.unlink()  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo rm fallback below
             except PermissionError:
                 if os_user is None:
                     raise
@@ -1516,7 +1516,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
         if not _safe_path_check("exists", settings_path, os_user):
             rel_target = os.path.relpath(shared_path, start=settings_path.parent)
             try:
-                settings_path.symlink_to(rel_target)
+                settings_path.symlink_to(rel_target)  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo ln fallback below (mirrors the .unlink() pattern at line 1504, see #1178 r2)
             except PermissionError:
                 if os_user is None:
                     raise
