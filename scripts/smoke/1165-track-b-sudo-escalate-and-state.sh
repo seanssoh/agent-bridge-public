@@ -76,7 +76,17 @@
 #                          atomic write. sudo-as-iso helper MUST NOT be
 #                          invoked (Stop-hook-from-isolated-session
 #                          reproducer; controller-scoped sudoers makes
-#                          Path A rc=2 from the iso UID).
+#                          Path A rc=2 from the iso UID). r4 extension:
+#                          assert published marker mode is 0660 (matches
+#                          sudo-as-iso helper exit-8 mode + Path B chmod
+#                          target).
+#   T4a-chmod-fail (Gap 6 r4): Path A0's chmod 0660 was changed from
+#                              soft-fail (`|| true`) to hard-fail per
+#                              codex r3 BLOCKING. Stub chmod to fail,
+#                              assert: writer rc != 0, marker NOT
+#                              published (cleanup), bridge_warn emitted.
+#                              Regression contract: revert hard-fail →
+#                              marker IS published with 0600 mode and rc=0.
 #   T4d (Gap 6 r3): euid != target + sudo helper rc=2 → fall through to
 #                   Path B (controller direct write via
 #                   ensure_matrix_path). Pins the cross-agent
@@ -504,7 +514,123 @@ T4AD_CONTENT="$(<"$T4AD_AGENT_DIR/idle-since")"
 [[ "$T4AD_CONTENT" == "1700000300" ]] \
   || smoke_fail "T4a-direct: idle-since content mismatch. want '1700000300', got '$T4AD_CONTENT'"
 
-smoke_log "T4a-direct PASS: Path A0 direct write fires when euid matches target os_user; sudo-as-iso helper NOT invoked"
+# r4 codex BLOCKING — assert the published marker's mode is the
+# canonical 0660 (controller:ab-agent-<X>:0660 contract; matches
+# sudo-as-iso helper exit-8 mode arg + Path B chmod target). Before
+# the r4 fix, Path A0 used `chmod 0660 ... 2>/dev/null || true`, so a
+# chmod failure left mktemp's 0600 in place and the controller (member
+# of ab-agent-<X>, not the iso UID) could no longer read it. Use
+# python3 for portable 4-digit-octal mode read (macOS BSD `stat -f` and
+# Linux GNU `stat -c` differ; see scripts/smoke/864-...:42-49).
+T4AD_MODE="$(python3 -c 'import os, sys; print(f"{os.stat(sys.argv[1]).st_mode & 0o7777:04o}")' "$T4AD_AGENT_DIR/idle-since" 2>/dev/null)"
+[[ "$T4AD_MODE" == "0660" ]] \
+  || smoke_fail "T4a-direct: published marker mode mismatch. want '0660', got '$T4AD_MODE' for $T4AD_AGENT_DIR/idle-since"
+
+smoke_log "T4a-direct PASS: Path A0 direct write fires when euid matches target os_user; sudo-as-iso helper NOT invoked; published mode 0660"
+
+# ---------- T4a-chmod-fail — Gap 6 r4: Path A0 hard-fails on chmod failure ----------
+#
+# Regression contract for codex r3 BLOCKING. Before r4, Path A0 used
+# `chmod 0660 "$_tmp" 2>/dev/null || true` — a chmod failure was
+# silently swallowed and `mv -f` then published mktemp's default 0600
+# file, leaving the controller (member of `ab-agent-<X>`, not the iso
+# UID) unable to read the marker via the matrix `controller:agent_grp:
+# 0660` contract. Same state-drift class the r11/r14 `|| true → return
+# 1` comments explicitly prevent in the sudo-as-iso helper (exit 8)
+# and Path B (`return 1` after bridge_warn).
+#
+# Reproducer: stub `chmod` (via PATH-prepend bin override) to fail
+# with rc=1, drive Path A0 the same way T4a-direct does. Asserts:
+#   - Writer returns non-zero.
+#   - The target marker file was NOT published (cleanup happened).
+#   - bridge_warn was emitted with the diagnostic string.
+# Regression: revert the r4 hard-fail to `|| true` → this test fails
+# because the marker IS published (mv-f after the silently-failed
+# chmod) and writer returns 0.
+
+T4ACF_DIR="$SMOKE_TMP_ROOT/t4a-chmod-fail"
+mkdir -p "$T4ACF_DIR"
+T4ACF_CALL_LOG="$T4ACF_DIR/calls.log"
+T4ACF_AGENT_DIR="$T4ACF_DIR/state/agents/delta"
+mkdir -p "$T4ACF_AGENT_DIR"
+# Bin stub dir: override `id` (Path A0 short-circuit) AND `chmod`
+# (force the new hard-fail branch). PATH-prepended so the stubs win
+# over /bin/chmod and /usr/bin/id without touching real binaries.
+T4ACF_BIN="$T4ACF_DIR/bin"
+mkdir -p "$T4ACF_BIN"
+printf '%s\n' '#!/usr/bin/env bash' >"$T4ACF_BIN/id"
+# shellcheck disable=SC2129
+printf '%s\n' '# Stub `id` to simulate euid == target os_user for Path A0.' >>"$T4ACF_BIN/id"
+printf '%s\n' 'if [[ "${1:-}" == "-un" ]]; then' >>"$T4ACF_BIN/id"
+printf '%s\n' '  printf "agent-bridge-delta\n"' >>"$T4ACF_BIN/id"
+printf '%s\n' '  exit 0' >>"$T4ACF_BIN/id"
+printf '%s\n' 'fi' >>"$T4ACF_BIN/id"
+printf '%s\n' 'exec /usr/bin/env -u PATH /usr/bin/id "$@" 2>/dev/null || command id "$@"' >>"$T4ACF_BIN/id"
+chmod +x "$T4ACF_BIN/id"
+# `chmod` stub: always fail with rc=1, exercising the new hard-fail
+# branch. Print a one-line diagnostic to stderr so any unexpected
+# extra invocations surface in the driver log.
+printf '%s\n' '#!/usr/bin/env bash' >"$T4ACF_BIN/chmod"
+# shellcheck disable=SC2129
+printf '%s\n' 'printf "stub-chmod-fail: %s\n" "$*" >&2' >>"$T4ACF_BIN/chmod"
+printf '%s\n' 'exit 1' >>"$T4ACF_BIN/chmod"
+chmod +x "$T4ACF_BIN/chmod"
+
+T4ACF_DRIVER="$T4ACF_DIR/driver.sh"
+printf '%s\n' '#!/usr/bin/env bash' >"$T4ACF_DRIVER"
+# shellcheck disable=SC2129
+printf '%s\n' 'set -uo pipefail' >>"$T4ACF_DRIVER"
+printf '%s\n' 'REPO_ROOT="$1"' >>"$T4ACF_DRIVER"
+printf '%s\n' 'AGENT_DIR="$2"' >>"$T4ACF_DRIVER"
+printf '%s\n' 'CALL_LOG="$3"' >>"$T4ACF_DRIVER"
+printf '%s\n' 'STUB_BIN="$4"' >>"$T4ACF_DRIVER"
+printf '%s\n' 'export PATH="$STUB_BIN:$PATH"' >>"$T4ACF_DRIVER"
+printf '%s\n' 'bridge_agent_os_user() {' >>"$T4ACF_DRIVER"
+printf '%s\n' '  if [[ "${1:-}" == "delta" ]]; then printf "agent-bridge-delta"; fi' >>"$T4ACF_DRIVER"
+printf '%s\n' '}' >>"$T4ACF_DRIVER"
+printf '%s\n' 'bridge_isolation_write_file_as_agent_user_via_bash() {' >>"$T4ACF_DRIVER"
+printf '%s\n' '  printf "UNEXPECTED sudo-as-iso call: %s\n" "$*" >>"$CALL_LOG"' >>"$T4ACF_DRIVER"
+printf '%s\n' '  cat - >/dev/null' >>"$T4ACF_DRIVER"
+printf '%s\n' '  return 0' >>"$T4ACF_DRIVER"
+printf '%s\n' '}' >>"$T4ACF_DRIVER"
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T4ACF_DRIVER"
+printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s" "$AGENT_DIR"; }' >>"$T4ACF_DRIVER"
+printf '%s\n' 'bridge_isolation_v2_ensure_matrix_path() { printf "UNEXPECTED ensure_matrix_path: %s\n" "$*" >>"$CALL_LOG"; return 99; }' >>"$T4ACF_DRIVER"
+# Capture bridge_warn lines so we can assert the diagnostic fired.
+printf '%s\n' 'bridge_warn() { printf "warn: %s\n" "$*"; printf "warn: %s\n" "$*" >&2; }' >>"$T4ACF_DRIVER"
+printf '%s\n' '# shellcheck disable=SC1090' >>"$T4ACF_DRIVER"
+printf '%s\n' 'source "$REPO_ROOT/lib/bridge-core.sh"' >>"$T4ACF_DRIVER"
+printf '%s\n' 'bridge_warn() { printf "warn: %s\n" "$*"; printf "warn: %s\n" "$*" >&2; }' >>"$T4ACF_DRIVER"
+printf '%s\n' 'WRITER_DEF="$(awk "/^bridge_isolation_v2_write_agent_state_marker\\(\\) \\{/,/^\\}/" "$REPO_ROOT/lib/bridge-isolation-v2.sh")"' >>"$T4ACF_DRIVER"
+printf '%s\n' 'eval "$WRITER_DEF"' >>"$T4ACF_DRIVER"
+printf '%s\n' 'bridge_isolation_v2_write_agent_state_marker "delta" "idle-since" "1700000400"' >>"$T4ACF_DRIVER"
+printf '%s\n' 'echo "RC=$?"' >>"$T4ACF_DRIVER"
+chmod +x "$T4ACF_DRIVER"
+
+T4ACF_LOG="$T4ACF_DIR/log"
+"$BRIDGE_BASH" "$T4ACF_DRIVER" "$REPO_ROOT" "$T4ACF_AGENT_DIR" "$T4ACF_CALL_LOG" "$T4ACF_BIN" >"$T4ACF_LOG" 2>&1 \
+  || true
+
+# Writer must return non-zero (hard-fail branch).
+grep -q '^RC=0$' "$T4ACF_LOG" \
+  && smoke_fail "T4a-chmod-fail: writer returned 0 (chmod hard-fail did not fire). log: $(tr '\n' '|' <"$T4ACF_LOG" | tail -c 800)"
+grep -qE '^RC=[1-9][0-9]*$' "$T4ACF_LOG" \
+  || smoke_fail "T4a-chmod-fail: writer did not emit non-zero RC. log: $(tr '\n' '|' <"$T4ACF_LOG" | tail -c 800)"
+# Marker file must NOT be published (cleanup happened before mv).
+if [[ -e "$T4ACF_AGENT_DIR/idle-since" ]]; then
+  smoke_fail "T4a-chmod-fail: marker $T4ACF_AGENT_DIR/idle-since WAS published despite chmod failure (silent state-drift regression). log: $(tr '\n' '|' <"$T4ACF_LOG" | tail -c 800)"
+fi
+# bridge_warn must have emitted the Path A0 chmod diagnostic.
+grep -q 'Path A0 chmod 0660 failed' "$T4ACF_LOG" \
+  || smoke_fail "T4a-chmod-fail: bridge_warn diagnostic 'Path A0 chmod 0660 failed' not emitted. log: $(tr '\n' '|' <"$T4ACF_LOG" | tail -c 800)"
+# No sudo-as-iso / ensure_matrix_path fall-through (Path A0 owns the
+# failure — we don't want a chmod failure to cascade into Path A or B
+# and accidentally succeed via the controller path).
+if [[ -s "$T4ACF_CALL_LOG" ]]; then
+  smoke_fail "T4a-chmod-fail: unexpected fall-through to Path A/B after Path A0 chmod failure. calls: $(cat "$T4ACF_CALL_LOG"). log: $(tr '\n' '|' <"$T4ACF_LOG" | tail -c 800)"
+fi
+
+smoke_log "T4a-chmod-fail PASS: Path A0 hard-fails on chmod failure (cleanup + warn + non-zero rc; no Path A/B fall-through)"
 
 # ---------- T4d — Gap 6 r3: Path A0 mismatch + iso effective routes to Path A ----------
 #

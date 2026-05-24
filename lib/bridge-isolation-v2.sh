@@ -2944,7 +2944,19 @@ bridge_isolation_v2_write_agent_state_marker() {
           bridge_warn "write_agent_state_marker: Path A0 write failed: $_tmp"
           return 1
         }
-        chmod 0660 "$_tmp" 2>/dev/null || true
+        # r4 codex BLOCKING — soft-fail chmod was a state-drift trap.
+        # mktemp leaves 0600 owner-only by default; if the chmod 0660
+        # silently failed, the controller/daemon (member of the
+        # ab-agent-<X> group, not the iso UID) could no longer read
+        # the published marker. Match the sudo-as-iso helper (exit 8)
+        # and Path B (`return 1` after bridge_warn) contracts: cleanup
+        # the temp file, warn, hard-fail. Same parity rationale as the
+        # adjacent `|| true → return 1` comments on r11/r14.
+        chmod 0660 "$_tmp" 2>/dev/null || {
+          rm -f "$_tmp" 2>/dev/null || true
+          bridge_warn "write_agent_state_marker: Path A0 chmod 0660 failed: $_tmp"
+          return 1
+        }
         mv -f "$_tmp" "$target" || {
           rm -f "$_tmp" 2>/dev/null || true
           bridge_warn "write_agent_state_marker: Path A0 rename failed: $_tmp → $target"
