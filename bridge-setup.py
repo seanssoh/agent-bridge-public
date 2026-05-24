@@ -490,18 +490,72 @@ def _safe_path_check(check: str, path: Path, os_user: str | None) -> bool:
     isolated installs, `path.exists()` may raise PermissionError before
     `load_dotenv`/`load_json` ever run (e.g. when the plugin dir's
     parent is mode 0700 owned by the agent user, leaving the controller
-    without `+x` traversal). Falls back to `sudo -n -u <agent-user>
-    test -e/-h <path>` so the controller can still detect "exists" and
-    take the recovery path. `os_user=None` (non-Linux / non-isolated)
-    re-raises so callers preserve the original error shape.
+    without `+x` traversal). When `os_user` is provided, proactively
+    runs `sudo -n -u <agent-user> test -e/-h <path>` first so the
+    controller never trips a PermissionError it could have skipped —
+    even with v2 Track A (`_isolation_aware_mkdir` mode 2750 +
+    `ab-agent-<a>` group, PR #1166) the controller may still not be a
+    member of the per-agent group (#1170). Falls through to the direct
+    pathlib check on sudo unavailability (rc 127 / FileNotFoundError /
+    TimeoutExpired); on the direct path a final PermissionError is
+    swallowed and reported as "absent" (fail-closed) so callers like
+    `_safe_read_env` skip the read instead of bubbling a traceback up
+    to `setup teams|telegram|discord`.
+
+    #1170 r2: the proactive sudo call goes through `subprocess.run`
+    directly (NOT `_sudo_run_as`) so we can attach a 5s `timeout=`
+    AND inspect stderr to distinguish a clean `test` rc=1 (path is
+    authoritatively absent) from a `sudo -n` policy/auth failure
+    (which also exits rc=1 with a "sudo:" prefixed stderr — e.g.
+    "sudo: a password is required" when the controller lacks a
+    cached NOPASSWD entry). Conflating the two would let setup
+    teams|telegram|discord treat existing preserved `.env` /
+    `access.json` state as absent and overwrite it whenever sudo is
+    installed-but-not-currently-authorized. `_sudo_run_as` doesn't
+    currently plumb `timeout=`, and bypassing it here is the
+    smaller-surface fix vs widening that helper's signature
+    (follow-up if other callers need the same).
 
     Issue #1078 F3/F5: when the caller could not resolve `os_user`
     upfront (every lstat in the ancestor chain hit PermissionError),
-    fall back to the walker before re-raising — the walker climbs until
-    an existing ancestor whose lstat succeeds reveals the isolated UID.
-    Only re-raise when even the walker comes back empty (truly
-    non-isolated, non-Linux, or sudo unavailable).
+    the walker fallback in the PermissionError branch climbs ancestors
+    until one with a readable lstat reveals the isolated UID. The
+    walker only fires when the proactive sudo path was skipped
+    (os_user was None going in).
     """
+    if os_user:
+        flag = "-e" if check == "exists" else "-h"
+        # Direct subprocess.run (NOT _sudo_run_as) so we can plumb
+        # timeout= and inspect stderr. See docstring above (#1170 r2).
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "-u", os_user, "test", flag, str(path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError):
+            # sudo missing / stuck (stuck PAM / NSS lookup) / outright
+            # blocked — fall through to the direct pathlib check below.
+            result = None
+        if result is not None:
+            if result.returncode == 0:
+                return True
+            stderr = (result.stderr or "").strip()
+            if stderr.startswith("sudo:"):
+                # `sudo -n` policy/auth failure (e.g. "sudo: a password
+                # is required", "sudo: ... command not allowed"). The
+                # underlying `test` never ran, so rc=1 here is NOT an
+                # authoritative "path absent" — fall through to direct
+                # pathlib so an already-readable path is still observed.
+                pass
+            elif result.returncode == 1:
+                # Clean `test` rc=1 from inside the isolated UID — path
+                # does not exist. Authoritative; do not fall through.
+                return False
+            # rc=2 (test misuse) / rc=127 (sudo missing surfaced as rc) /
+            # any other rc → fall through to direct pathlib check below.
     try:
         if check == "exists":
             return path.exists()
@@ -510,11 +564,16 @@ def _safe_path_check(check: str, path: Path, os_user: str | None) -> bool:
     except PermissionError:
         if os_user is None:
             os_user = _resolve_isolated_owner_for_path(path)
-            if os_user is None:
-                raise
-        flag = "-e" if check == "exists" else "-h"
-        result = _sudo_run_as(os_user, "test", flag, str(path))
-        return result.returncode == 0
+            if os_user is not None:
+                flag = "-e" if check == "exists" else "-h"
+                result = _sudo_run_as(os_user, "test", flag, str(path))
+                if result.returncode in (0, 1):
+                    return result.returncode == 0
+        # Controller blind to isolated tree and sudo unavailable. Fail
+        # closed: caller treats path as absent and either skips the read
+        # (`_safe_read_env`) or surfaces a clean recovery prompt instead
+        # of a raw traceback (#1170).
+        return False
     return False
 
 

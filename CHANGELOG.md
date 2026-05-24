@@ -6,6 +6,75 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta15] — 2026-05-24
+
+### Highlight — beta14 Track A Python-side sibling (#1170 — seventh A2A QA cycle)
+
+Operator-cued **fifteenth prerelease** — closes the Python-side
+sibling that beta14 Track A's bash-side `_isolation_aware_mkdir` fix
+exposed. Seventh cycle of the A2A-driven QA loop. Remote QA peer's
+beta14 verification confirmed `agent create` clean, but the very
+next step (`agb setup teams`) aborted with a PermissionError
+traceback from `bridge-setup.py:_safe_path_check`'s raw
+`pathlib.Path.exists()` (controller process not in
+`ab-agent-<a>` group → `path.stat()` raises). Function's docstring
+promised sudo-escalate behavior; implementation didn't deliver.
+
+Single-PR wave (PR #1172). Two-round codex chain. Integration r1
+implement-ok (task #6062). `-beta15` prerelease; matching tag
+`v0.14.5-beta15`, GitHub release marked **Pre-release**.
+
+### Fixed — `_safe_path_check` proactive sudo-escalate (#1170)
+
+- **#1170 (PR #1172)** — `bridge-setup.py:_safe_path_check` now does
+  proactive sudo-escalate when `os_user` is provided:
+  ```
+  # flag = '-e' for check="exists", '-h' for check="is_symlink"
+  subprocess.run(['sudo', '-n', '-u', os_user, 'test',
+                  flag, str(path)],
+                 capture_output=True, timeout=5, text=True)
+  ```
+  Disposition by sudo rc + stderr:
+  - rc=0 → True
+  - rc=1 + `sudo:` stderr (policy/auth failure) → fall through to
+    direct pathlib (do NOT treat as path-absent)
+  - rc=1 + clean stderr (authoritative `test` rc=1) → False
+  - `TimeoutExpired` / `FileNotFoundError` (sudo missing/stuck) →
+    fall through
+  - Direct pathlib `PermissionError` → fail-closed False (was
+    raise — bubbled traceback to operator)
+
+  Two review rounds:
+  - r1 BLOCKING: initial impl conflated `sudo` rc=1 (policy failure)
+    with `test` rc=1 (path absent). `sudo -n -u root test -e /tmp`
+    exits rc=1 with `sudo:` stderr when sudo not authorized; the
+    PR would have treated this as "path absent" and dropped
+    preserved `.env` / `access.json` config during `setup teams|
+    telegram|discord` rebuild. Plus SHOULD-FIX: brief promised 5s
+    timeout but `_sudo_run_as` didn't plumb `timeout=` to
+    `subprocess.run`.
+  - r2 implement-ok: switched to direct `subprocess.run` (bypasses
+    `_sudo_run_as` for this call site so timeout actually applies),
+    added stderr-prefix discrimination, smoke gained T8 (sudo
+    policy failure → fall through) + T9 (clean rc=1 → authoritative
+    False) + T10 (TimeoutExpired → fall through).
+
+### Filed as backlog (carryover from beta15 review)
+
+- **#1171** — `agent-bridge upgrade --channel stable` silently
+  downgrades prerelease installs to the most recent GA. UX nit
+  flagged during beta14 verification (cycle 10) when patch hit
+  the footgun trying to upgrade to beta14. Recovery is one
+  `--channel current` command. Backlog priority — recoverable.
+- **#1173** — `bridge-hooks.py:_safe_path_check` (line ~1421-1450)
+  has the same reactive-shape bug as #1170. Docstring claims
+  "Mirror of bridge-setup.py" but implementation is the old raw
+  pathlib check. Probably surfaces in a subsequent verification
+  round when isolated agent's tools touch controller-only paths
+  the hooks side mediates. Filed during PR #1172 r1 review as
+  non-blocking follow-up. Best path: extract canonical
+  `_safe_path_check` into shared module both files import.
+
 ## [0.14.5-beta14] — 2026-05-24
 
 ### Highlight — v2 isolation × channel plugin surface expansion (#1165 — sixth A2A QA cycle)
