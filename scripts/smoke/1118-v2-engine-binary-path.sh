@@ -96,63 +96,21 @@ _bash_bin="${BASH:-/usr/bin/env bash}"
 resolved_t1="$(
   PATH="$FAKE_BIN_DIR:$PATH" "$_bash_bin" -c '
     set -e
-    # Defensive: scrub any shell-level shadow of `claude` (alias /
-    # function / hashed path) that CI runners or inherited shell
-    # environments may have installed. `command -v` is precedence-
-    # aware (alias > builtin > function > PATH); a shadow returns
-    # a non-absolute token and trips bridge_resolve_engine_binary'\''s
-    # `[[ "$resolved" == /* ]]` check, yielding "" + rc=1.
-    unalias claude 2>/dev/null || true
-    unset -f claude 2>/dev/null || true
-    hash -d claude 2>/dev/null || true
     SCRIPT_DIR="'"$REPO_ROOT"'"
     BRIDGE_SCRIPT_DIR="$SCRIPT_DIR"
-    export BRIDGE_SCRIPT_DIR
+    # bridge-layout-resolver.sh runs `bridge_resolve_layout` at source
+    # time (lib/bridge-layout-resolver.sh:530). On a fresh CI checkout
+    # without a layout-marker.sh on disk it dies with "Agent Bridge
+    # v0.8.0 requires isolation-v2" unless BRIDGE_LAYOUT is set to v2
+    # (env-override path). Other smokes pin this via
+    # smoke_setup_bridge_home; T1-T4 here only need the temp root, so
+    # set BRIDGE_LAYOUT directly for the inner subshell.
+    BRIDGE_LAYOUT="v2"
+    export BRIDGE_SCRIPT_DIR BRIDGE_LAYOUT
     source "$SCRIPT_DIR/bridge-lib.sh" >/dev/null 2>&1
     bridge_resolve_engine_binary claude
   ' 2>/dev/null
 )"
-if [[ "$resolved_t1" != "$FAKE_CLAUDE" ]]; then
-  # Diagnostic dump on fail so the next CI iteration shows root cause
-  # without another round trip. Same subshell shape, stderr enabled.
-  diag="$(
-    PATH="$FAKE_BIN_DIR:$PATH" "$_bash_bin" -c '
-      unalias claude 2>/dev/null || true
-      unset -f claude 2>/dev/null || true
-      hash -d claude 2>/dev/null || true
-      SCRIPT_DIR="'"$REPO_ROOT"'"
-      BRIDGE_SCRIPT_DIR="$SCRIPT_DIR"
-      export BRIDGE_SCRIPT_DIR
-      echo "PATH=$PATH"
-      echo "BASH_ENV=${BASH_ENV:-unset}"
-      echo "BASH_VERSION=$BASH_VERSION"
-      echo "fake_exists=$(test -x "'"$FAKE_CLAUDE"'" && echo yes || echo no)"
-      echo "command-v-claude=$(command -v claude || echo EMPTY)"
-      echo "type-claude=$(type -t claude 2>/dev/null || echo none)"
-      # Probe source in a subshell first so an exit-1 inside bridge-lib.sh
-      # only kills the probe, not the outer diagnostic shell. This lets
-      # us SEE the stderr that the silenced source would otherwise hide.
-      src_capture="$( ( source "$SCRIPT_DIR/bridge-lib.sh" ) 2>&1 1>/dev/null )"
-      src_subshell_rc=$?
-      echo "source-subshell-rc=$src_subshell_rc"
-      echo "source-stderr-captured=$src_capture"
-      # Now the real source (still silenced — if it exits, the rest of
-      # the diag block is lost, but the subshell capture above already
-      # has the answer).
-      source "$SCRIPT_DIR/bridge-lib.sh" >/dev/null 2>&1
-      src_real_rc=$?
-      echo "source-real-rc=$src_real_rc"
-      if command -v bridge_resolve_engine_binary >/dev/null 2>&1; then
-        result="$(bridge_resolve_engine_binary claude 2>&1)"
-        echo "resolver-rc=$?"
-        echo "resolver-stdout=$result"
-      else
-        echo "resolver-undefined"
-      fi
-    ' 2>&1
-  )"
-  smoke_fail "T1 DIAG: $diag"
-fi
 smoke_assert_eq "$FAKE_CLAUDE" "$resolved_t1" "T1: bridge_resolve_engine_binary should return the fake absolute claude path"
 
 # T1b: rejects an unsupported engine name.
@@ -160,7 +118,8 @@ if PATH="$FAKE_BIN_DIR:$PATH" "$_bash_bin" -c '
   set -e
   SCRIPT_DIR="'"$REPO_ROOT"'"
   BRIDGE_SCRIPT_DIR="$SCRIPT_DIR"
-  export BRIDGE_SCRIPT_DIR
+  BRIDGE_LAYOUT="v2"
+  export BRIDGE_SCRIPT_DIR BRIDGE_LAYOUT
   source "$SCRIPT_DIR/bridge-lib.sh" >/dev/null 2>&1
   bridge_resolve_engine_binary not-an-engine
 ' >/dev/null 2>&1; then
@@ -172,7 +131,8 @@ if PATH="" "$_bash_bin" -c '
   set -e
   SCRIPT_DIR="'"$REPO_ROOT"'"
   BRIDGE_SCRIPT_DIR="$SCRIPT_DIR"
-  export BRIDGE_SCRIPT_DIR
+  BRIDGE_LAYOUT="v2"
+  export BRIDGE_SCRIPT_DIR BRIDGE_LAYOUT
   source "$SCRIPT_DIR/bridge-lib.sh" >/dev/null 2>&1
   bridge_resolve_engine_binary claude
 ' >/dev/null 2>&1; then
