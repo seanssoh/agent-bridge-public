@@ -6,6 +6,132 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta14] — 2026-05-24
+
+### Highlight — v2 isolation × channel plugin surface expansion (#1165 — sixth A2A QA cycle)
+
+Operator-cued **fourteenth prerelease** — surface expansion from the
+beta9-13 isolation cluster (closed at beta13) into the v2-isolation
+× channel plugin (Teams) contract. Sixth cycle of the A2A-driven QA
+loop. Remote QA peer's beta13 verification confirmed v0.14.5 isolation
+core contract closed; the next real-world end-to-end exercise (create
+fresh `linux-user` isolated Claude agent, attach Teams channel,
+exchange bidirectional DM with operator) surfaced 8 distinct contract
+gaps that each required manual `sudo chmod/chown` workarounds before
+the agent could even boot.
+
+These are **NOT v0.14.5 regressions** — they are pre-existing v2
+contract gaps that the beta9-13 closure made reachable for the first
+time on this install. Most predate v0.14.5.
+
+3-track parallel wave (PR #1166 + #1167 + #1168). 11 codex review
+rounds across the wave (Track A r1→r2, Track B r1→r2→r3→r4, Track C
+r1→r2, integration r1→r2). `-beta14` prerelease; matching tag
+`v0.14.5-beta14`, GitHub release marked **Pre-release**.
+
+### Fixed — Track A: scaffold/mode widening (Gaps 1-4 of #1165)
+
+- **PR #1166** — Gaps 1-4 covered:
+  - **Gap 1** (`bridge-setup.py:_isolation_aware_mkdir`): added
+    `mode=`/`agent=` kwargs; v2 group lookup via new pure-Python
+    `_v2_agent_group_name(agent)` mirror of bash
+    `bridge_isolation_v2_agent_group_name` (Linux 32-char
+    hash-truncation + Darwin 255-char pass-through); priority order
+    `group=` > `agent=` > `id -gn` legacy. Cross-language pair —
+    bash + Python helpers must change in lockstep. r1 BLOCKING
+    caught `id -gn` derivation was wrong (returns primary group, but
+    v2 puts `ab-agent-<X>` only as supplementary).
+  - **Gap 2** (`lib/bridge-agents.sh:3886`): `~/.claude` mode 2750
+    → 2770. SessionStart hook needs group-write under
+    `ab-claude-<a>` membership. Hook process effective UID
+    investigation deferred to future round.
+  - **Gap 3** (`lib/bridge-channels.sh:608`): `chmod -R go+rX
+    node_modules` moved BEFORE the early-return on existing
+    `node_modules/` so re-runs of `agb setup teams` widen
+    pre-existing controller-umask-0700 trees. r1 BLOCKING caught
+    chmod was skipped on the idempotent path.
+  - **Gap 4** (`bridge-agent.sh:686`): legacy
+    `$BRIDGE_AGENT_HOME_ROOT/$agent` added to v2 scaffold
+    `chmod 0755` list so the markerless-existing-install upgrade
+    path doesn't strand the per-agent template dir as 0700.
+
+### Fixed — Track B: sudo-escalate channel readiness + idle-since marker (Gaps 5-6 of #1165)
+
+- **PR #1168** — Gaps 5-6 covered with a security-careful 4-round
+  codex chain:
+  - **Gap 5** (`lib/bridge-agents.sh:5425`): new
+    `bridge_channel_access_file_present` helper sudo-escalates the
+    controller `-f` test on isolated `.teams/access.json` (and
+    Discord/Telegram/Mattermost equivalents). Same family as PR
+    #1149's controller-direct-touch fix.
+  - **Gap 6** (`lib/bridge-isolation-v2.sh:bridge_isolation_v2_write_agent_state_marker`):
+    new three-path writer for the Stop-hook `idle-since` marker:
+    - **Path A0** (NEW) — when effective UID matches the agent's
+      `bridge_agent_os_user`, do an atomic direct write (mktemp +
+      chmod 0660 + mv -f) with hard-fail on chmod failure (parity
+      with the sudo helper exit-8 and Path B return-1 contracts).
+      This is the load-bearing path for the Stop-hook scenario
+      (hook runs as iso UID = target UID, no sudo needed).
+    - **Path A** — when euid mismatches but sudo helper is available
+      (controller writing as iso UID), use
+      `bridge_isolation_write_file_as_agent_user_via_bash` (existing
+      helper from #832).
+    - **Path B** — legacy `ensure_matrix_path` fallback for
+      non-isolated installs.
+
+    Round-by-round: r1 BLOCKING (widen state-agent-dir to
+    `ab-shared` was a cross-agent integrity vector — any iso agent
+    could write `manual-stop` / `broken-launch` into another agent's
+    state dir, disabling autostart) → r2 BLOCKING (narrow sudo-as-iso
+    helper requires `operator ALL=(os_user)` sudoers and isolated
+    Stop hook running as agent-X can't `sudo -u agent-X` because the
+    per-agent sudoers entry doesn't grant agent-to-self) → r3
+    BLOCKING (silent chmod failure inconsistent with helper/Path B
+    hard-fails) → r4 implement-ok. The 4-round chain hardened both
+    the security model and the correctness contract.
+
+### Fixed — Track C: PostToolUse hook + agb dispatcher controller-UID recovery (Gaps 7-8 of #1165)
+
+- **PR #1167** — Gaps 7-8 covered:
+  - **Gap 7** (`hooks/bridge_hook_common.py:write_audit`): new
+    `_under_isolated_uid()` helper gates the PermissionError/OSError
+    swallow on a 3-condition AND: `current_isolated_agent()` is set
+    (env signal) AND `BRIDGE_CONTROLLER_UID` is non-empty and
+    parseable AND `os.geteuid() != int(BRIDGE_CONTROLLER_UID)`.
+    Missing/unparsable CONTROLLER_UID fails closed (re-raise) so
+    controller-side processes inheriting linux-user env do NOT
+    silently swallow permission failures. r1 BLOCKING caught the
+    initial swallow was env-only (controller UID with iso env also
+    swallowed).
+  - **Gap 8** (`agent-bridge`): dispatcher recovers
+    `BRIDGE_CONTROLLER_UID` from `state/layout-marker.sh` owner via
+    `stat -c %U` / `stat -f %u` when env is unset. Allows direct
+    `agb <subcmd>` invocation from inside an isolated Claude session
+    without re-running through the start-sudo wrapper. Recovery
+    placed between BRIDGE_HOME resolution and `source bridge-lib.sh`
+    so the marker validator sees the recovered UID. Markerless
+    installs gracefully no-op.
+
+### Known carryover — Gap 9 (Teams MCP spawn-at-session-start)
+
+The operator's completion criterion for v0.14.x line closure is
+bidirectional Teams DM echo on a fresh isolated agent. Gaps 1-8
+unblock the agent boot path + channel readiness check + scaffold
+modes + hook flood + dispatcher recovery, but there's a suspected
+9th gap (Teams MCP plugin auto-spawn at session start vs. spawn-on-
+first-tool-call) that the remote QA peer hasn't isolated to a
+specific code site yet. May surface in beta14's verification round
+as a separate follow-up issue.
+
+### Wave shape
+
+3-track parallel dispatch (`wave-orchestration` skill). Each track's
+fixer ran in isolated worktree; codex pair-review at each round.
+11 codex review rounds total (Track A 2, Track B 4, Track C 2,
+integration 2, release pending). Track B's 4-round chain reflects
+the security depth of the marker-writer surface: each round
+uncovered a deeper architectural assumption that needed fixing.
+
 ## [0.14.5-beta13] — 2026-05-24
 
 ### Highlight — beta12 install-path follow-up (#1161 — fifth A2A QA cycle)
