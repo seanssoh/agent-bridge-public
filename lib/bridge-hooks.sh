@@ -506,33 +506,61 @@ bridge_install_isolated_home_settings() {
   # Integrity boundary: keep `.claude/` under controller/root ownership so
   # the isolated UID cannot unlink-or-replace the root-owned settings
   # files inside it. The dir owner (root) keeps full rwx; the isolated
-  # UID gets group r-x via group=os_user + mode 0750. The hook commands
-  # themselves still execute under the isolated UID — Claude Code reads
-  # `<isolated-home>/.claude/settings.json` and exec()s the listed
-  # commands; we only need *read* on the dir + the file, not write.
+  # UID gets group rwx via group=ab-agent-<agent> + mode 3770 (sticky +
+  # setgid + group rwx). Sticky blocks unlink-by-non-owner so the
+  # root-owned `settings.json` / `settings.effective.json` cannot be
+  # removed by the isolated UID, even though it can write its own
+  # files inside (`projects/`, `session-env/`).
   #
-  # Codex r1 needs-more on PR #561: previously this dir was chowned to
-  # the isolated UID, so even though the inner files were root-owned,
-  # the isolated UID could rm/replace them via the parent's write bit.
-  # Switching the parent to root-owned + 0750 closes that gap. The
-  # isolated UID can still create files at `<isolated-home>/foo` (its
-  # own home), just not under `.claude/`.
-  # Internal failure (mkdir/render/install/mv): return 1 so the caller
-  # can flag the rerender row as failed. The early predicate-style
-  # returns above (lines ~368-379) stay `return 0` because they mean
-  # "this agent is not in scope for isolated install" — not a failure.
-  # Callers in the migration path (`lib/bridge-migration.sh`) already
-  # handle nonzero with `|| bridge_warn …` so they continue best-effort
-  # while surfacing the failure. The rerender path (`bridge-agent.sh`,
-  # PR #673) catches rc and increments `failed_count`. (Issue #669 r2:
-  # codex BLOCKING — silent `return 0` was the same silent-failure
+  # ARCHITECTURAL ROOT OF FAMILY 3 (Phase 3 acceptance gap H — patch
+  # 2026-05-24): this block previously chowned `.claude` to
+  # `root:$os_user` mode `0750`, which directly contradicted the
+  # prepare contract (`root:ab-agent-<agent>` mode `3770`/`2770`).
+  # Every restart silently reverted the directory back to a state
+  # where the isolated UID could not mkdir `.claude/session-env/`
+  # from the supplementary-group path (the hook's effective UID in
+  # practice — see lib/bridge-agents.sh #1165 Gap 2 comment). The
+  # beta14 #1165 Gap 2 smoke only verified prepare set 2770; it did
+  # not verify restart preserved it.
+  #
+  # Phase 3 fix: route through the shared helper
+  # `bridge_linux_normalize_isolated_home_contract` so prepare,
+  # restart, and credential-prepare all converge on the same contract
+  # for HOME / .claude / .claude/plugins / .claude/session-env.
+  #
+  # Codex r1 needs-more on PR #561 (historical): previously this dir
+  # was chowned to the isolated UID directly, so even though the
+  # inner files were root-owned, the isolated UID could rm/replace
+  # them via the parent's write bit. Switching to root-owned + sticky
+  # + setgid + group rwx (3770) closes that gap while still letting
+  # the isolated UID's hook process create its own subdirs.
+  #
+  # Internal failure (helper/render/install/mv): return 1 so the
+  # caller can flag the rerender row as failed. The early
+  # predicate-style returns above (lines ~368-379) stay `return 0`
+  # because they mean "this agent is not in scope for isolated
+  # install" — not a failure. Callers in the migration path
+  # (`lib/bridge-migration.sh`) already handle nonzero with
+  # `|| bridge_warn …` so they continue best-effort while surfacing
+  # the failure. The rerender path (`bridge-agent.sh`, PR #673)
+  # catches rc and increments `failed_count`. (Issue #669 r2: codex
+  # BLOCKING — silent `return 0` was the same silent-failure
   # pattern as #666.)
-  bridge_linux_sudo_root mkdir -p "$target_dir" 2>/dev/null || {
-    bridge_warn "isolated home settings install: cannot mkdir $target_dir for $agent (sudo unavailable?)"
+  # ALLOW_RUNNING=1: this code path is called from
+  # `bridge_ensure_hud_usage_tap` (mid-session) and the restart path
+  # (just after `--replace` stop, before the next start). In both
+  # cases the controller is the legitimate writer and the helper's
+  # external-caller race guard is not the right safety mechanism
+  # here. The reconciler `--apply` path (operator-invoked from CLI)
+  # keeps the default `BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING=0` and
+  # refuses on a running session, because the operator must stop the
+  # agent first.
+  local _isolated_home="$isolated_home"
+  if ! BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING=1 \
+        bridge_linux_normalize_isolated_home_contract "$agent" "$os_user" "$_isolated_home" >/dev/null; then
+    bridge_warn "isolated home settings install: home contract normalize failed for $agent (sudo unavailable or symlink injection); skipping render"
     return 1
-  }
-  bridge_linux_sudo_root chown "root:$os_user" "$target_dir" 2>/dev/null || true
-  bridge_linux_sudo_root chmod 0750 "$target_dir" 2>/dev/null || true
+  fi
 
   # Stage the render in a controller-owned temp directory. The renderer
   # walks `<stage_home>/.claude/`, which mirrors the layout it expects

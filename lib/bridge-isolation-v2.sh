@@ -1657,7 +1657,18 @@ bridge_isolation_v2_matrix_rows_for_agent() {
   # controller's own ~/.claude (the legacy path) instead of the per-agent
   # isolated home.
   if [[ -n "$iso_home_root" ]] && [[ "$_v2_isolation_mode" != "shared" ]]; then
-    printf 'isolated-user-home|%s|dir|%s|%s|0700||0|install_managed|required|isolated UIDs private home\n' \
+    # Phase 3 (codex design 2026-05-24): the isolated HOME contract is
+    # 2750 owner=$iso_user group=ab-agent-<agent>, NOT 0700 owner=iso
+    # group=iso. The 0700 here was a v0.9.7-era contract that was
+    # already superseded by `bridge_linux_prepare_agent_isolation`
+    # (lib/bridge-agents.sh) and is now formalized in the shared
+    # helper `bridge_linux_normalize_isolated_home_contract`. The
+    # per-agent matrix path remains a no-op for the new reconciler
+    # (the install-tree matrix at
+    # `bridge_isolation_v2_install_tree_matrix_rows` emits the
+    # canonical `agent_home_contract` rows), but we update this stale
+    # contract here so a future audit trap doesn't catch a reader.
+    printf 'isolated-user-home|%s|dir|%s|ab-agent-%s|2750||1|install_managed|required|isolated UIDs private home — owner=iso, group=ab-agent-<agent>, setgid+2750 (see bridge_linux_normalize_isolated_home_contract for SSOT)\n' \
       "$iso_home" "$iso_user" "$iso_user"
 
     # ----- v0.9.7 PR 2 (refs #781) RC6: per-agent plugin subsystem rows -----

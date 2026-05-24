@@ -41,7 +41,11 @@
 #
 # scope         install | per-agent | host
 # kind          path_traverse | dir | dir_recursive | file_glob |
-#               state_scaffold | credential_grant | marker_read_path
+#               state_scaffold | credential_grant | marker_read_path |
+#               agent_home_contract (Phase 3 — isolated HOME + .claude
+#                                    + .claude/plugins + .claude/session-env;
+#                                    helper-backed for symlink + live-session
+#                                    race safety)
 # owner         literal user / `controller` / `agent_user` / `root`
 # group         literal / `ab-shared` / `ab-agent-<agent>` / `ab-controller`
 # dir_mode      octal (0710, 2750, 0755, etc.) or `-`
@@ -727,6 +731,150 @@ _bridge_iso_reconcile_row_credential_grant() {
   return 1
 }
 
+_bridge_iso_reconcile_row_agent_home_contract() {
+  # kind=agent_home_contract — Phase 3 Family 2 (codex design 2026-05-24).
+  #
+  # One row per sub-path (HOME, .claude, .claude/plugins, .claude/session-env)
+  # but the contract is normalized in a single helper call so all four
+  # sub-paths converge atomically. In check mode the dispatcher does its
+  # own stat-and-compare against the row's expected owner/group/mode —
+  # no helper invocation, no mutation. In apply mode it routes to the
+  # shared helper `bridge_linux_normalize_isolated_home_contract`, which
+  # already covers the symlink-rejection / live-session race guards and
+  # is idempotent across the four sub-paths.
+  #
+  # Dedupe note: because the matrix emits four rows but the helper does
+  # all four paths in one call, the second/third/fourth row in a given
+  # agent's matrix pass would re-invoke the same helper. We accept that
+  # cost — the helper is idempotent and short — rather than carrying
+  # cross-row state through the dispatcher. The audit signal stays
+  # honest (each row reports the status of its own sub-path).
+  local mode="$1" row_name="$2" path="$3" agent="$4" owner_resolved="$5" \
+        group_resolved="$6" dir_mode="$7" notes="$8"
+
+  if _bridge_iso_reconcile_path_is_protected "$path"; then
+    _bridge_iso_reconcile_emit_row "$row_name" \
+      "$BRIDGE_ISO_RECONCILE_STATUS_SKIPPED" "$path" \
+      "$owner_resolved:$group_resolved $dir_mode" "(protected)" "$notes"
+    return 0
+  fi
+
+  if [[ -z "$agent" ]]; then
+    _bridge_iso_reconcile_emit_row "$row_name" \
+      "$BRIDGE_ISO_RECONCILE_STATUS_SKIPPED" "$path" \
+      "agent_home_contract" "(no agent context)" "$notes"
+    return 0
+  fi
+
+  # Refuse on symlinks BEFORE any mutation. This duplicates the helper's
+  # guard so check-mode never accidentally widens an attacker-planted
+  # symlink.
+  if [[ -L "$path" ]]; then
+    _bridge_iso_reconcile_emit_row "$row_name" \
+      "$BRIDGE_ISO_RECONCILE_STATUS_FAILED" "$path" \
+      "$owner_resolved:$group_resolved $dir_mode" "(symlink rejected)" \
+      "$notes (refuses symlink at path; investigate before retry)"
+    return 1
+  fi
+
+  # check mode — stat + compare, no helper call.
+  if [[ "$mode" == "check" ]]; then
+    if [[ ! -d "$path" ]]; then
+      _bridge_iso_reconcile_emit_row "$row_name" \
+        "$BRIDGE_ISO_RECONCILE_STATUS_MISSING" "$path" \
+        "$owner_resolved:$group_resolved $dir_mode" "(absent)" "$notes"
+      return 1
+    fi
+    local actual_mode actual_og expected_mode_norm actual_mode_norm
+    actual_mode="$(_bridge_iso_reconcile_stat_mode "$path")"
+    actual_og="$(_bridge_iso_reconcile_stat_owner_group "$path")"
+    expected_mode_norm="$(_bridge_iso_reconcile_normalize_mode "$dir_mode")"
+    actual_mode_norm="$(_bridge_iso_reconcile_normalize_mode "${actual_mode:-0}")"
+    local expected_og="$owner_resolved:$group_resolved"
+    if [[ "$expected_mode_norm" == "$actual_mode_norm" \
+          && "$expected_og" == "$actual_og" ]]; then
+      _bridge_iso_reconcile_emit_row "$row_name" \
+        "$BRIDGE_ISO_RECONCILE_STATUS_OK" "$path" \
+        "$expected_og $expected_mode_norm" \
+        "$actual_og $actual_mode_norm" "$notes"
+      return 0
+    fi
+    _bridge_iso_reconcile_emit_row "$row_name" \
+      "$BRIDGE_ISO_RECONCILE_STATUS_MISMATCH" "$path" \
+      "$expected_og $expected_mode_norm" \
+      "$actual_og $actual_mode_norm" "$notes"
+    return 1
+  fi
+
+  # apply mode — route to the helper. The helper normalizes ALL four
+  # sub-paths for the agent in one call; we filter its tab-separated
+  # status output for the line matching THIS row's path so the row's
+  # status reflects this sub-path specifically.
+  if ! command -v bridge_linux_normalize_isolated_home_contract >/dev/null 2>&1; then
+    _bridge_iso_reconcile_emit_row "$row_name" \
+      "$BRIDGE_ISO_RECONCILE_STATUS_SKIPPED" "$path" \
+      "$owner_resolved:$group_resolved $dir_mode" "(helper missing)" "$notes"
+    return 0
+  fi
+  # Resolve os_user + user_home for the helper. user_home is the agent's
+  # HOME root row (parent of .claude / plugins / session-env). For the
+  # HOME row itself, $path IS the user_home; for the others, strip the
+  # `/.claude*` suffix.
+  local os_user user_home
+  os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+  user_home="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || printf '')"
+  if [[ -z "$os_user" || -z "$user_home" ]]; then
+    _bridge_iso_reconcile_emit_row "$row_name" \
+      "$BRIDGE_ISO_RECONCILE_STATUS_FAILED" "$path" \
+      "$owner_resolved:$group_resolved $dir_mode" \
+      "(cannot resolve os_user/user_home for $agent)" "$notes"
+    return 1
+  fi
+  # Capture the helper's status output (one tab-separated line per
+  # sub-path) into a temp file. Avoid `$()` capture of a function that
+  # internally invokes other functions with stdin to dodge footgun #11
+  # (the heredoc-stdin / read_comsub class).
+  local helper_out_tmp
+  helper_out_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-iso-home-contract.XXXXXX")"
+  local helper_rc=0
+  # ALLOW_RUNNING=0 here so the operator-invoked reconciler apply
+  # honors the stopped-session guard. Internal callers (the prepare
+  # path, the restart reverter, token sync) pass ALLOW_RUNNING=1
+  # themselves via environment because they know they own the writer.
+  bridge_linux_normalize_isolated_home_contract "$agent" "$os_user" "$user_home" >"$helper_out_tmp" 2>/dev/null \
+    || helper_rc=1
+  # Look up the line matching $path (tab-separated: path\tstatus\towner:group\tmode).
+  local helper_line
+  helper_line="$(grep -F "$(printf '%s\t' "$path")" "$helper_out_tmp" 2>/dev/null | head -n1 || true)"
+  rm -f "$helper_out_tmp" 2>/dev/null || true
+  if [[ -z "$helper_line" ]]; then
+    _bridge_iso_reconcile_emit_row "$row_name" \
+      "$BRIDGE_ISO_RECONCILE_STATUS_FAILED" "$path" \
+      "$owner_resolved:$group_resolved $dir_mode" \
+      "(helper emitted no status line for $path)" \
+      "$notes (helper rc=$helper_rc)"
+    return 1
+  fi
+  local _hp _hstatus _howner_grp _hmode
+  IFS=$'\t' read -r _hp _hstatus _howner_grp _hmode <<<"$helper_line"
+  local _hreport_status=""
+  case "$_hstatus" in
+    ok)      _hreport_status="$BRIDGE_ISO_RECONCILE_STATUS_OK" ;;
+    changed) _hreport_status="$BRIDGE_ISO_RECONCILE_STATUS_CHANGED" ;;
+    *)
+      _bridge_iso_reconcile_emit_row "$row_name" \
+        "$BRIDGE_ISO_RECONCILE_STATUS_FAILED" \
+        "$path" "$owner_resolved:$group_resolved $dir_mode" \
+        "${_howner_grp:-?} ${_hmode:-?} (helper status: $_hstatus)" \
+        "$notes (helper rc=$helper_rc — see bridge_warn above for the rejected sub-path)"
+      return 1
+      ;;
+  esac
+  _bridge_iso_reconcile_emit_row "$row_name" "$_hreport_status" \
+    "$path" "$_howner_grp $_hmode" "$_howner_grp $_hmode" "$notes"
+  return 0
+}
+
 _bridge_iso_reconcile_row_marker_read_path() {
   # kind=marker_read_path — marker dir (parent) and marker file
   # (state/layout-marker.sh). Contract:
@@ -874,8 +1022,103 @@ bridge_isolation_v2_install_tree_matrix_rows() {
   printf '%s\n' \
     "marker-path-file|install|$marker_file|marker_read_path|root|ab-shared|-|0644|0|0|inherit|direct|required|marker file 0644 root:ab-shared — validator accepts; world-read is non-secret content (LAYOUT + DATA_ROOT)"
 
+  # ----- Phase 3 Family 1 (codex design 2026-05-24): controller install-tree gaps -----
+  #
+  # patch's Phase 3 acceptance flagged 4 install-tree paths that isolated
+  # UIDs need to traverse / read but that no reconciler row was covering:
+  #
+  #   A. $BRIDGE_HOME/.claude-plugin  (controller plugin manifest dir)
+  #   B. $BRIDGE_HOME/plugins         (plugin cache root)
+  #   C. $BRIDGE_HOME/plugins/*       (per-channel plugin trees — Teams, ms365, …)
+  #   D. $BRIDGE_HOME/agents          (per-agent agent-bridge runtime homes)
+  #
+  # Pre-Phase 3: these dirs landed at the operator umask (typically 0700
+  # under umask 077). Isolated UIDs in ab-shared could not traverse
+  # ($BRIDGE_HOME/agents → per-agent home failures, plugin catalog
+  # discovery failures). The dir rows below converge them onto the same
+  # ab-shared contract as `data-root` / `lib-dir` / `scripts-dir` etc.,
+  # using mode 0750 (controller rwX, group r-X, no world) for the
+  # discovery roots and 0710 (controller rwX, group --x, no world) for
+  # `agents/` so iso UIDs can traverse to their own per-agent home
+  # without being able to LIST the controller's full agent inventory.
+  #
+  # All four rows are `optional` (skip-on-absent): fresh installs may
+  # not have created `plugins/` yet, and `.claude-plugin/` is created on
+  # demand by plugin discovery — enforcing them as `required` would
+  # surface false drift on a vanilla install that has not yet been
+  # touched by plugin code.
+  #
+  # The protected-path guard remains active for the recursive plugin
+  # tree row, so lockfiles (`*.lock`) and any future plugin secret files
+  # are never widened.
+  printf '%s\n' \
+    "claude-plugin-dir|install|$data_root/.claude-plugin|dir|controller|ab-shared|0750|-|0|0|inherit|direct|optional|controller-owned .claude-plugin manifest dir — ab-shared g+rx so plugin discovery from iso UIDs can read the manifest"
+  printf '%s\n' \
+    "plugins-root|install|$data_root/plugins|dir|controller|ab-shared|0750|-|0|0|inherit|direct|optional|controller-owned plugins cache root — ab-shared g+rx so iso UIDs can list and read non-secret plugin metadata"
+  printf '%s\n' \
+    "plugins-channel-trees|install|$data_root/plugins/*|dir_recursive|controller|ab-shared|-|-|0|1|inherit|direct|optional|per-channel plugin trees (teams/ms365/cosmax-*) chgrp -R ab-shared + g+rX so iso UIDs can read package files; *.lock + secrets protected by guard"
+  printf '%s\n' \
+    "agents-root|install|$data_root/agents|dir|controller|ab-shared|0710|-|0|0|inherit|direct|required|per-agent runtime-home root — controller rwX, group --x for traverse to each per-agent leaf without listing the full agent inventory (iso UIDs must traverse to their own home, not see siblings)"
+
   # ----- per-agent rows (only when --agent is provided) -----
   if [[ -n "$agent" ]]; then
+    # ----- Phase 3 Family 2 (codex design 2026-05-24): isolated HOME contract -----
+    #
+    # Four child rows for the per-agent HOME / .claude / .claude/plugins /
+    # .claude/session-env contract. Each row is `agent_home_contract`
+    # kind; the dispatcher routes the whole set to
+    # `bridge_linux_normalize_isolated_home_contract` (one call per
+    # apply, scraping the per-sub-path status lines).
+    #
+    # Codex resolver gotcha (lib/bridge-isolation-v2-reconcile.sh:148-187):
+    # `_bridge_iso_reconcile_resolve_owner_token` and `_resolve_group_token`
+    # do NOT resolve `agent_user` or `ab-agent-<agent>` tokens. The matrix
+    # generator therefore computes literal `os_user` and literal
+    # `agent_group` here and bakes them into the row owner/group fields
+    # so apply-time token resolution returns them unchanged.
+    #
+    # On non-Linux hosts or for shared-mode agents these rows would
+    # be skipped at apply time (the helper returns 0 on non-Linux and
+    # the per-agent isolation predicate gates emission). We still emit
+    # the rows so reconciler `--check --json` audit reports show the
+    # rows as "skipped" rather than hiding them — the operator can
+    # tell apart "row not in matrix" from "row present but inert".
+    local _v2_iso_os_user=""
+    local _v2_iso_user_home=""
+    local _v2_iso_agent_group=""
+    local _v2_iso_active=0
+    if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then
+      if bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+        _v2_iso_active=1
+      fi
+    fi
+    if (( _v2_iso_active == 1 )); then
+      if command -v bridge_agent_os_user >/dev/null 2>&1; then
+        _v2_iso_os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+      fi
+      if [[ -n "$_v2_iso_os_user" ]] \
+          && command -v bridge_agent_linux_user_home >/dev/null 2>&1; then
+        _v2_iso_user_home="$(bridge_agent_linux_user_home "$_v2_iso_os_user" 2>/dev/null || printf '')"
+      fi
+      _v2_iso_agent_group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+    fi
+    if [[ -n "$_v2_iso_os_user" && -n "$_v2_iso_user_home" && -n "$_v2_iso_agent_group" ]]; then
+      # Emit 4 child rows. owner/group fields are LITERAL (already
+      # resolved) so the token resolver returns them as-is. The mode
+      # for the .claude subdirs follows BRIDGE_ISO_HOME_CONTRACT_MODE
+      # (default 3770 — sticky + setgid; fallback 2770 — setgid only).
+      local _v2_iso_claude_mode="${BRIDGE_ISO_HOME_CONTRACT_MODE:-3770}"
+      case "$_v2_iso_claude_mode" in 3770|2770) : ;; *) _v2_iso_claude_mode="3770" ;; esac
+      printf '%s\n' \
+        "agent-home-contract-home|per-agent|$_v2_iso_user_home|agent_home_contract|$_v2_iso_os_user|$_v2_iso_agent_group|2750|-|1|0|inherit|helper:bridge_linux_normalize_isolated_home_contract|required|isolated HOME root — owner=iso_uid, group=ab-agent-<agent>, mode 2750 (no group write, setgid)"
+      printf '%s\n' \
+        "agent-home-contract-claude|per-agent|$_v2_iso_user_home/.claude|agent_home_contract|root|$_v2_iso_agent_group|$_v2_iso_claude_mode|-|1|0|inherit|helper:bridge_linux_normalize_isolated_home_contract|required|.claude integrity boundary — root-owned, group=ab-agent-<agent>, mode $_v2_iso_claude_mode (sticky+setgid+group rwx, preserves root-owned settings.json from unlink)"
+      printf '%s\n' \
+        "agent-home-contract-plugins|per-agent|$_v2_iso_user_home/.claude/plugins|agent_home_contract|root|$_v2_iso_agent_group|$_v2_iso_claude_mode|-|1|0|inherit|helper:bridge_linux_normalize_isolated_home_contract|required|.claude/plugins — same contract as .claude (iso UID writes plugin runtime state, controller harvester reads via group)"
+      printf '%s\n' \
+        "agent-home-contract-session-env|per-agent|$_v2_iso_user_home/.claude/session-env|agent_home_contract|root|$_v2_iso_agent_group|$_v2_iso_claude_mode|-|1|0|inherit|helper:bridge_linux_normalize_isolated_home_contract|required|.claude/session-env — Claude SessionStart hook mkdir target (the H regression — without this row's contract the hook fails on first start after restart)"
+    fi
+
     local state_root="${BRIDGE_STATE_DIR:-$data_root/state}"
     local state_agents_root="$state_root/agents"
     local state_agent_dir="$state_agents_root/$agent"
@@ -1089,6 +1332,11 @@ _bridge_iso_reconcile_process_one_row() {
       _bridge_iso_reconcile_row_marker_read_path \
         "$mode" "$row_name" "$path_expr" "$owner_resolved" \
         "$group_resolved" "$dir_mode" "$file_mode" "$notes"
+      ;;
+    agent_home_contract)
+      _bridge_iso_reconcile_row_agent_home_contract \
+        "$mode" "$row_name" "$path_expr" "$agent" "$owner_resolved" \
+        "$group_resolved" "$dir_mode" "$notes"
       ;;
     *)
       bridge_warn "process_one_row: unknown kind '$kind' for row '$row_name'"

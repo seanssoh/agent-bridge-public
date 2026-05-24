@@ -3709,6 +3709,247 @@ bridge_refresh_isolated_agent_env_after_channel_mutation() {
     || bridge_warn "channel mutation: cached agent-env.sh regeneration reported a problem for '$agent'; run 'agent-bridge migrate isolation v2 --apply --agent $agent' before the next restart"
 }
 
+# ---------------------------------------------------------------------------
+# Shared isolated-home contract helper (Phase 3, codex design 2026-05-24)
+# ---------------------------------------------------------------------------
+#
+# Single source of truth for the per-agent isolated-home POSIX contract.
+# Three call sites previously rolled their own (slightly different)
+# variants of the same set of mkdir / chown / chmod calls:
+#
+#   1. `bridge_linux_prepare_agent_isolation`        (lib/bridge-agents.sh)
+#   2. `bridge_install_isolated_home_settings`       (lib/bridge-hooks.sh — THE RESTART REVERTER)
+#   3. `bridge_auth_prepare_credential_file`         (bridge-auth.sh, isolated branch)
+#
+# The restart reverter is the architectural root of Family 3 (the
+# session-env regression patch reported during Phase 3 acceptance).
+# `bridge_install_isolated_home_settings` previously chowned
+# `<isolated-home>/.claude` to `root:$os_user` mode `0750`, which directly
+# contradicted the prepare-side contract (`root:ab-agent-<agent>` mode
+# `3770`/`2770`). Every restart would silently revert the dir back to a
+# state where the isolated UID could not mkdir `.claude/session-env/` from
+# the supplementary-group path.
+#
+# Contract (codex design 2026-05-24, implement-ok):
+#
+#   $user_home                          owner=$os_user  group=ab-agent-<agent>  mode 2750
+#   $user_home/.claude                  owner=root      group=ab-agent-<agent>  mode 3770 (or 2770 fallback)
+#   $user_home/.claude/plugins          owner=root      group=ab-agent-<agent>  mode 3770 (or 2770 fallback)
+#   $user_home/.claude/session-env      owner=root      group=ab-agent-<agent>  mode 3770 (or 2770 fallback)
+#
+# Mode 3770 = sticky (1000) + setgid (2000) + group rwx. Sticky on a
+# group-writable directory prevents the isolated UID from unlinking
+# root-owned files inside (`settings.json`, `settings.effective.json`),
+# preserving the integrity boundary documented in
+# lib/bridge-hooks.sh:506-519. setgid keeps new subdir creation
+# inheriting `ab-agent-<agent>` so the controller harvester's group-r-X
+# path keeps working without re-running prepare. Mode 2770 (no sticky)
+# is the compat fallback if a future host rejects sticky on a
+# group-writable dir — see `BRIDGE_ISO_HOME_CONTRACT_MODE` below.
+#
+# Safety properties (anti-race, anti-symlink):
+#
+#   * Linux-only: no-op success on non-Linux. macOS dseditgroup / launchctl
+#     never enters this path.
+#   * Required inputs: `agent`, `os_user`, `user_home` must all be
+#     non-empty.
+#   * `$user_home` must resolve under the canonical isolated-home root
+#     (`BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT`). The controller's own
+#     `$HOME` is never a valid target.
+#   * Each target path is rejected if it is a symlink or non-directory
+#     BEFORE any mutation. The isolated UID owns `$user_home` and can
+#     swap `.claude` for a symlink between check and mutate; the
+#     `BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING` opt-out is intentionally
+#     gated to running-tmux-session checks, not to symlink checks.
+#   * The agent's tmux session must be stopped UNLESS this is the
+#     initial create/start path (the same gate
+#     `bridge_linux_prepare_agent_isolation` already enforces) or
+#     `BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING=1` is set (smoke fixtures).
+#
+# Status output (stdout, one tab-separated line per sub-path):
+#
+#   <path>\t<status>\t<owner>:<group>\t<mode>
+#
+#   status ∈ ok | changed | failed | rejected
+#
+# Caller can scrape these lines to emit reconciler child rows (the
+# `agent_home_contract` row kind in lib/bridge-isolation-v2-reconcile.sh
+# emits 4 child rows from this output, one per sub-path).
+#
+# Return code: 0 on full success (every sub-path OK or CHANGED), 1 on any
+# rejected/failed sub-path. Callers like the restart reverter return 0 on
+# the function's 0 + propagate 1 up; rendering still happens regardless
+# because the helper makes the dir contract canonical before render.
+bridge_linux_normalize_isolated_home_contract() {
+  local agent="$1"
+  local os_user="$2"
+  local user_home="$3"
+
+  # Linux-only — no-op success elsewhere.
+  [[ "$(bridge_host_platform)" == "Linux" ]] || return 0
+
+  [[ -n "$agent" && -n "$os_user" && -n "$user_home" ]] || {
+    bridge_warn "normalize_isolated_home_contract: agent/os_user/user_home all required (got agent='$agent' os_user='$os_user' user_home='$user_home')"
+    return 1
+  }
+
+  # Resolve the agent group up front so a malformed agent name surfaces
+  # the same `bridge_die` shape as the prepare path's existing
+  # `bridge_isolation_v2_agent_group_name` call.
+  local agent_group=""
+  agent_group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+  [[ -n "$agent_group" ]] || {
+    bridge_warn "normalize_isolated_home_contract: cannot resolve agent group for '$agent'"
+    return 1
+  }
+
+  # Path-anchor guard: refuse to operate on anything outside the
+  # canonical isolated-home root. The variable is set in bridge-lib.sh /
+  # bridge-core.sh; if unset we conservatively decline (a misconfigured
+  # caller should not be able to chmod arbitrary paths via this helper).
+  if [[ -z "${BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT:-}" ]]; then
+    bridge_warn "normalize_isolated_home_contract: BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT unset; declining (cannot validate user_home anchor)"
+    return 1
+  fi
+  case "$user_home" in
+    "$BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT"/*) : ;;
+    *)
+      bridge_warn "normalize_isolated_home_contract: user_home '$user_home' not under '$BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT' — refusing"
+      return 1
+      ;;
+  esac
+
+  # Stopped-session guard (skip on initial create/start path and the
+  # smoke opt-out). Mirrors the prepare-side check at lib/bridge-agents.sh.
+  if [[ "${BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING:-0}" != "1" ]]; then
+    local _quiesce_session=""
+    if command -v bridge_agent_session >/dev/null 2>&1; then
+      _quiesce_session="$(bridge_agent_session "$agent" 2>/dev/null || printf '')"
+    fi
+    if [[ -n "$_quiesce_session" ]] \
+        && command -v tmux >/dev/null 2>&1 \
+        && command -v bridge_tmux_session_exists >/dev/null 2>&1 \
+        && bridge_tmux_session_exists "$_quiesce_session"; then
+      # The prepare-side path bridge_die's here, but this helper is also
+      # called from the restart reverter mid-rerender. Bail soft so the
+      # caller's audit log surfaces the skip rather than killing the
+      # process. The matrix reconciler row will surface this as a
+      # `failed` row to the operator.
+      bridge_warn "normalize_isolated_home_contract: tmux session '$_quiesce_session' is alive — refusing (set BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING=1 for smoke fixtures, or stop the agent first)"
+      return 1
+    fi
+  fi
+
+  # Resolve sticky-vs-no-sticky mode for the .claude subdirs. Default
+  # is 3770 (sticky + setgid) per codex design. Operator can override
+  # with BRIDGE_ISO_HOME_CONTRACT_MODE=2770 if a future kernel/FS combo
+  # rejects sticky on group-writable dirs. The HOME root stays 2750
+  # regardless (no group write, no sticky needed).
+  local claude_mode="${BRIDGE_ISO_HOME_CONTRACT_MODE:-3770}"
+  case "$claude_mode" in
+    3770|2770) : ;;
+    *)
+      bridge_warn "normalize_isolated_home_contract: BRIDGE_ISO_HOME_CONTRACT_MODE='$claude_mode' not in {3770,2770}; using 3770"
+      claude_mode="3770"
+      ;;
+  esac
+  local home_mode="2750"
+
+  # Targets, in mkdir order (parent before child).
+  local target_home="$user_home"
+  local target_claude="$user_home/.claude"
+  local target_plugins="$user_home/.claude/plugins"
+  local target_session_env="$user_home/.claude/session-env"
+
+  # Symlink / non-dir rejection. Iterate ALL targets first, refuse
+  # before any mutation if any one is a symlink. The isolated UID owns
+  # `$user_home` (mode 2770 elsewhere on prepare), so it can drop a
+  # symlink at `.claude` between two prepare runs. Test via
+  # bridge_linux_sudo_root so the controller sees the real fs (the
+  # isolated UID's view may differ if a hostile rebind is in progress).
+  local target overall_rc=0
+  for target in "$target_home" "$target_claude" "$target_plugins" "$target_session_env"; do
+    if bridge_linux_sudo_root test -L "$target" 2>/dev/null; then
+      printf '%s\tfailed\t-\t-\n' "$target"
+      bridge_warn "normalize_isolated_home_contract: refusing — '$target' is a symlink (anti-race / anti-redirect)"
+      overall_rc=1
+    fi
+    # `-e && ! -d` = exists but is not a directory (regular file, fifo,
+    # etc.). Refuse before mutation so we don't chmod a regular file
+    # and leave it in a confusing state.
+    if bridge_linux_sudo_root test -e "$target" 2>/dev/null \
+        && ! bridge_linux_sudo_root test -d "$target" 2>/dev/null \
+        && ! bridge_linux_sudo_root test -L "$target" 2>/dev/null; then
+      printf '%s\tfailed\t-\t-\n' "$target"
+      bridge_warn "normalize_isolated_home_contract: refusing — '$target' exists but is not a directory"
+      overall_rc=1
+    fi
+  done
+  if (( overall_rc != 0 )); then
+    return 1
+  fi
+
+  # Per-target normalize. mkdir first (idempotent), then chown, then chmod.
+  # Each step uses bridge_linux_sudo_root so the controller can mutate
+  # root-owned `.claude` even though the parent `$user_home` is owned by
+  # the isolated UID.
+  _bridge_normalize_one() {
+    # $1 = path, $2 = owner, $3 = group, $4 = mode
+    local path="$1" want_owner="$2" want_group="$3" want_mode="$4"
+
+    if ! bridge_linux_sudo_root mkdir -p "$path" 2>/dev/null; then
+      printf '%s\tfailed\t-\t-\n' "$path"
+      return 1
+    fi
+
+    local actual_owner_group actual_mode
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+      actual_owner_group="$(bridge_linux_sudo_root stat -f '%Su:%Sg' "$path" 2>/dev/null || printf '')"
+      actual_mode="$(bridge_linux_sudo_root stat -f '%Lp' "$path" 2>/dev/null || printf '')"
+    else
+      actual_owner_group="$(bridge_linux_sudo_root stat -c '%U:%G' "$path" 2>/dev/null || printf '')"
+      actual_mode="$(bridge_linux_sudo_root stat -c '%a' "$path" 2>/dev/null || printf '')"
+    fi
+    local want_owner_group="$want_owner:$want_group"
+    # Normalize mode (printf %o handles trimming leading zeros for ==).
+    local want_mode_norm actual_mode_norm
+    want_mode_norm="$(printf '%o' "$((8#${want_mode#0}))" 2>/dev/null || printf '%s' "$want_mode")"
+    actual_mode_norm="$(printf '%o' "$((8#${actual_mode:-0}))" 2>/dev/null || printf '%s' "$actual_mode")"
+
+    if [[ "$actual_owner_group" == "$want_owner_group" \
+          && "$actual_mode_norm" == "$want_mode_norm" ]]; then
+      printf '%s\tok\t%s\t%s\n' "$path" "$want_owner_group" "$want_mode_norm"
+      return 0
+    fi
+
+    local rc=0
+    if [[ "$actual_owner_group" != "$want_owner_group" ]]; then
+      if ! bridge_linux_sudo_root chown "$want_owner_group" "$path" 2>/dev/null; then
+        rc=1
+      fi
+    fi
+    if (( rc == 0 )) && [[ "$actual_mode_norm" != "$want_mode_norm" ]]; then
+      if ! bridge_linux_sudo_root chmod "$want_mode" "$path" 2>/dev/null; then
+        rc=1
+      fi
+    fi
+    if (( rc == 0 )); then
+      printf '%s\tchanged\t%s\t%s\n' "$path" "$want_owner_group" "$want_mode_norm"
+      return 0
+    fi
+    printf '%s\tfailed\t%s\t%s\n' "$path" "$want_owner_group" "$want_mode_norm"
+    return 1
+  }
+
+  _bridge_normalize_one "$target_home"        "$os_user" "$agent_group" "$home_mode"   || overall_rc=1
+  _bridge_normalize_one "$target_claude"      "root"     "$agent_group" "$claude_mode" || overall_rc=1
+  _bridge_normalize_one "$target_plugins"     "root"     "$agent_group" "$claude_mode" || overall_rc=1
+  _bridge_normalize_one "$target_session_env" "root"     "$agent_group" "$claude_mode" || overall_rc=1
+
+  unset -f _bridge_normalize_one 2>/dev/null || true
+  return "$overall_rc"
+}
+
 bridge_linux_prepare_agent_isolation() {
   local agent="$1"
   local os_user="$2"
@@ -3872,47 +4113,39 @@ bridge_linux_prepare_agent_isolation() {
   bridge_linux_sudo_root chown -R "$os_user" "$runtime_state_dir" "$log_dir"
   bridge_linux_sudo_root chown "$os_user" "$audit_file" "$history_file"
 
-  # memory-daily transcripts read-access (issue #219 v1.3): grant the
-  # controller user r-X on the isolated user's ~/.claude/projects/ so the
-  # (controller-UID) harvester can _scan_transcripts under the target.
-  # We intentionally do NOT grant write — this is a strict read lens.
+  # Isolated-home POSIX contract (HOME + .claude + .claude/plugins +
+  # .claude/session-env). Phase 3 codex design: one shared helper at
+  # three call sites so the prepare path, the restart reverter
+  # (bridge_install_isolated_home_settings — lib/bridge-hooks.sh), and
+  # bridge_auth_prepare_credential_file can never disagree about
+  # owner/group/mode on these four paths.
   #
-  # We pre-create $user_home/.claude (owned by the isolated UID, 0700) so
-  # the default ACL lands before the first Claude session runs. Otherwise a
-  # fresh agent's first `.claude/projects/` directory would be created
-  # without the controller r-X inheritance, and the next harvester run
-  # would fall back to --skipped-permission until the next reapply.
+  # Contract:
+  #   $user_home                      $os_user:ab-agent-<agent> 2750
+  #   $user_home/.claude              root:ab-agent-<agent>     3770 (or 2770 fallback)
+  #   $user_home/.claude/plugins      root:ab-agent-<agent>     3770 (or 2770 fallback)
+  #   $user_home/.claude/session-env  root:ab-agent-<agent>     3770 (or 2770 fallback)
+  #
+  # Sticky (3000) on the group-writable .claude subdirs preserves the
+  # integrity boundary documented in lib/bridge-hooks.sh:506-519: the
+  # isolated UID is in the agent group, so without sticky it could
+  # unlink the root-owned settings.json under .claude. Sticky blocks
+  # unlink-by-non-owner. setgid (2000) keeps new subdir creation
+  # inheriting `ab-agent-<agent>` so the controller harvester's
+  # group-r-X read path keeps working on every new file under
+  # ~/.claude/projects/, ~/.claude/session-env/, etc., without
+  # re-running prepare.
+  #
+  # On a non-Linux host this helper is a no-op success. On Linux it
+  # bridge_warn + return 1 if any sub-path was rejected for being a
+  # symlink / non-dir; we bridge_die on that here so the prepare flow
+  # fails fast like the previous inline block did.
+  bridge_linux_normalize_isolated_home_contract "$agent" "$os_user" "$user_home" \
+      >/dev/null \
+    || bridge_die "isolation v2: cannot normalize isolated-home contract for '$agent' (~/$user_home; see bridge_warn above for the rejected sub-path)"
+  # Keep `isolated_claude_dir` available for callers below that still
+  # reference it (memory-daily ACL grant, channel state seeding, etc.).
   local isolated_claude_dir="$user_home/.claude"
-  bridge_linux_sudo_root mkdir -p "$isolated_claude_dir"
-  bridge_linux_sudo_root chown "$os_user" "$isolated_claude_dir" >/dev/null 2>&1 || true
-  # v2: chgrp ab-agent-<name> + chmod 2770 (setgid so new subdirs like
-  # projects/ and session-env/ inherit the group) so the controller
-  # (group member of ab-agent-<name>) can reach ~/.claude/projects/ for
-  # the memory-daily harvester without any named-user ACL.
-  #
-  # #1165 Gap 2: mode broadened from 2750 to 2770. The owner bit was
-  # rwx pre-fix (so an owner-UID mkdir should have worked), but the
-  # observed SessionStart hook failure shape is `mkdir: cannot create
-  # directory '/home/agent-bridge-<a>/.claude/session-env': Permission
-  # denied` — i.e. the hook process's effective UID is not the dir
-  # owner in practice (suspected tmux/sudo wrapper stripping owner
-  # identity on the SessionStart spawn path). Widening to 2770 makes
-  # the group bit writable, which unblocks the hook via the
-  # supplementary-group path. Security model: the only group members
-  # are the controller user + the isolated UID itself (PR-C agent-
-  # group composition); no third party gains write. setgid (2xxx) is
-  # preserved so new subdirs inside ~/.claude (projects/, session-env/,
-  # statsig/, etc.) inherit the agent group rather than the writer's
-  # primary group, keeping the controller harvester's group-r-x path
-  # working on every new file.
-  local _claude_v2_grp=""
-  _claude_v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
-  [[ -n "$_claude_v2_grp" ]] \
-    || bridge_die "isolation v2: cannot resolve agent group for ~/.claude of '$agent'"
-  bridge_linux_sudo_root chgrp "$_claude_v2_grp" "$isolated_claude_dir" \
-    || bridge_die "isolation v2: chgrp $_claude_v2_grp on '$isolated_claude_dir' failed"
-  bridge_linux_sudo_root chmod 2770 "$isolated_claude_dir" \
-    || bridge_die "isolation v2: chmod 2770 on '$isolated_claude_dir' failed"
   # Channel-ownership-aware plugin sharing. Without this the isolated UID's
   # ~/.claude/plugins/ is empty and Claude starts with no MCP servers loaded
   # (Teams/ms365/cosmax-* all silently missing). The helper writes a per-UID
