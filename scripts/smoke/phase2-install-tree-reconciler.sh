@@ -83,11 +83,11 @@ smoke_setup_bridge_home "$SMOKE_NAME"
 REPO_ROOT="$SMOKE_REPO_ROOT"
 PY_BIN="${PYTHON3:-python3}"
 smoke_require_cmd "$PY_BIN"
-smoke_require_cmd "/opt/homebrew/bin/bash" 2>/dev/null \
-  || smoke_require_cmd "bash"
 
-# Pick a bash 4+ binary; macOS /bin/bash 3.2 doesn't support associative
-# arrays the reconciler relies on. Honor BASH_BIN if set (CI nominates it).
+# Pick a bash 4+ binary. macOS /bin/bash is 3.2 (no associative arrays
+# the reconciler relies on); Homebrew bash lives at /opt/homebrew/bin/bash
+# or /usr/local/bin/bash. On Linux, /usr/bin/bash (or /bin/bash) is bash
+# 4+ already. Honor BASH_BIN if set (CI nominates it).
 if [[ -n "${BASH_BIN:-}" ]]; then
   SMOKE_BASH="$BASH_BIN"
 elif [[ -x /opt/homebrew/bin/bash ]]; then
@@ -96,6 +96,15 @@ elif [[ -x /usr/local/bin/bash ]]; then
   SMOKE_BASH="/usr/local/bin/bash"
 else
   SMOKE_BASH="$(command -v bash)"
+fi
+[[ -n "$SMOKE_BASH" && -x "$SMOKE_BASH" ]] \
+  || smoke_fail "no bash binary found"
+# Refuse to run on bash <4 (macOS /bin/bash 3.2): the reconciler uses
+# `local -a` arrays + `${!arr[@]}` indexing on a bash 4-shape array
+# initializer.
+_smoke_bash_major="$("$SMOKE_BASH" -c 'echo "${BASH_VERSINFO[0]}"' 2>/dev/null)"
+if [[ -z "$_smoke_bash_major" ]] || (( _smoke_bash_major < 4 )); then
+  smoke_fail "bash $SMOKE_BASH is too old (major=$_smoke_bash_major, need 4+). On macOS install Homebrew bash or set BASH_BIN."
 fi
 
 # Force the reconciler's platform discriminator to consider this host

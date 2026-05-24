@@ -427,8 +427,15 @@ _bridge_iso_reconcile_row_dir_recursive() {
   probe_file="$(find "$path" -maxdepth 2 -type f -print -quit 2>/dev/null \
                 || true)"
   if [[ -n "$probe_file" ]]; then
-    probe_group="$(stat -f '%Sg' "$probe_file" 2>/dev/null \
-                 || stat -c '%G' "$probe_file" 2>/dev/null)"
+    # Cross-platform stat: GNU `stat -c %G` vs BSD `stat -f %Sg`.
+    # Avoid `stat -f %Sg || stat -c %G` fallthrough — GNU's `-f` is
+    # filesystem-info format, not file-info, so it returns garbage
+    # success without firing the fallback.
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+      probe_group="$(stat -f '%Sg' "$probe_file" 2>/dev/null)"
+    else
+      probe_group="$(stat -c '%G' "$probe_file" 2>/dev/null)"
+    fi
     probe_mode="$(_bridge_iso_reconcile_stat_mode "$probe_file")"
   fi
   local probe_mode_int=$(( 8#${probe_mode:-0} ))
@@ -525,8 +532,15 @@ _bridge_iso_reconcile_row_file_glob() {
     fi
     ((matched++)) || true
     local fg fmode
-    fg="$(stat -f '%Sg' "$file" 2>/dev/null \
-           || stat -c '%G' "$file" 2>/dev/null)"
+    # Same Darwin/Linux split as the dir_recursive probe — GNU stat's
+    # `-f` is fs-info format, not file-info, so the previous fallback
+    # `stat -f ... || stat -c ...` silently returned fs garbage on
+    # Linux.
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+      fg="$(stat -f '%Sg' "$file" 2>/dev/null)"
+    else
+      fg="$(stat -c '%G' "$file" 2>/dev/null)"
+    fi
     fmode="$(_bridge_iso_reconcile_stat_mode "$file")"
     local fmode_int=$(( 8#${fmode:-0} ))
     if [[ "$fg" == "$group_resolved" ]] && (( fmode_int & 040 )); then
