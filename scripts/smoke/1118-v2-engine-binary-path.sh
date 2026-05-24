@@ -129,8 +129,26 @@ if [[ "$resolved_t1" != "$FAKE_CLAUDE" ]]; then
       echo "fake_exists=$(test -x "'"$FAKE_CLAUDE"'" && echo yes || echo no)"
       echo "command-v-claude=$(command -v claude || echo EMPTY)"
       echo "type-claude=$(type -t claude 2>/dev/null || echo none)"
-      source "$SCRIPT_DIR/bridge-lib.sh" >/dev/null 2>&1 && echo "sourced=ok" || echo "sourced=fail-rc=$?"
-      bridge_resolve_engine_binary claude 2>&1 && echo "" || echo "resolver-rc=$?"
+      # Probe source in a subshell first so an exit-1 inside bridge-lib.sh
+      # only kills the probe, not the outer diagnostic shell. This lets
+      # us SEE the stderr that the silenced source would otherwise hide.
+      src_capture="$( ( source "$SCRIPT_DIR/bridge-lib.sh" ) 2>&1 1>/dev/null )"
+      src_subshell_rc=$?
+      echo "source-subshell-rc=$src_subshell_rc"
+      echo "source-stderr-captured=$src_capture"
+      # Now the real source (still silenced — if it exits, the rest of
+      # the diag block is lost, but the subshell capture above already
+      # has the answer).
+      source "$SCRIPT_DIR/bridge-lib.sh" >/dev/null 2>&1
+      src_real_rc=$?
+      echo "source-real-rc=$src_real_rc"
+      if command -v bridge_resolve_engine_binary >/dev/null 2>&1; then
+        result="$(bridge_resolve_engine_binary claude 2>&1)"
+        echo "resolver-rc=$?"
+        echo "resolver-stdout=$result"
+      else
+        echo "resolver-undefined"
+      fi
     ' 2>&1
   )"
   smoke_fail "T1 DIAG: $diag"
