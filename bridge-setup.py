@@ -95,7 +95,7 @@ def load_json(path: Path, default: Any) -> Any:
 
 
 def save_json(path: Path, payload: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-owned scaffold; callers that target an isolated tree route through _isolation_aware_mkdir first
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -106,7 +106,7 @@ def save_json(path: Path, payload: Any) -> None:
 
 
 def save_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — controller-owned scaffold; callers that target an isolated tree route through _isolation_aware_mkdir first
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text, encoding="utf-8")
     os.chmod(tmp, 0o600)
@@ -365,7 +365,15 @@ def _isolation_aware_mkdir(
     if _safe_path_check("exists", path, owner):
         return
     if owner is None:
-        path.mkdir(parents=True, exist_ok=True)
+        # #1178 (cycle 12): post-helper-A `owner is None` is now an
+        # authoritative signal of non-isolated lineage — the helper
+        # uses `_sudo_stat_owner` to recover the isolated owner when
+        # PermissionError fires (the cycle 12 root cause was that
+        # `except OSError: pass` silently mapped "path IS isolated"
+        # to None, producing this raw mkdir at L368 → PermissionError
+        # → operator-visible traceback). With #1178 in place, this raw
+        # mkdir only runs on truly controller-owned trees.
+        path.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — owner is None means non-isolated per #1178 helper contract
         return
     # Resolve the target group. Priority: explicit `group=` >
     # v2-helper-via-`agent=` > `id -gn` legacy fallback. The v2 helper

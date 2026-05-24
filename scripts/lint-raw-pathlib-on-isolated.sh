@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 # shellcheck shell=bash
 # scripts/lint-raw-pathlib-on-isolated.sh — ratchet lint preventing NEW raw
-# `Path.exists()` / `is_file()` / `is_dir()` / `is_symlink()` / `stat()`
-# calls in `bridge-setup.py` + `bridge-hooks.py` that could land on paths
-# under a v2-isolated agent's tree.
+# pathlib metadata probes AND raw pathlib mutators in `bridge-setup.py` +
+# `bridge-hooks.py` that could land on paths under a v2-isolated agent's
+# tree.
+#
+# Caught patterns:
+#   - probes : `.exists()`, `.is_file()`, `.is_dir()`, `.is_symlink()`,
+#              `.stat()`
+#   - mutators (#1178 Deliverable Lint): `.mkdir(`, `.unlink(`, `.touch(`,
+#              `.rmdir(`, `shutil.copy(`, `shutil.copy2(`, `shutil.move(`,
+#              `shutil.rmtree(`, `os.makedirs(`, `os.remove(`, `os.rename(`
 #
 # Context: cycles 9-10-11 (#1165 → #1170 → #1175) all surfaced the same
 # class of bug — a raw pathlib metadata probe inside the controller-side
@@ -17,6 +24,14 @@
 # wrapper (`_safe_path_check` / `_safe_read_env` / `_safe_load_json` from
 # the shared module) OR carry an explicit `# noqa: raw-pathlib-controller-only`
 # whitelist marker.
+#
+# Cycle 12 (#1178) extended the pattern to mutators after a setup teams
+# rerun hit a raw `path.mkdir(parents=True, exist_ok=True)` in the
+# `owner is None` branch of `_isolation_aware_mkdir` (the helper
+# returned None because PermissionError was incorrectly swallowed as
+# "no isolated lineage" — fixed in the same PR by routing through the
+# new `_sudo_stat_owner` recovery). The lint extension catches the
+# same class of bugs forward.
 #
 # ## Why two surfaces and not one
 #
@@ -70,12 +85,26 @@ declare -a TARGETS=(
   "bridge-hooks.py"
 )
 
-# Pattern: match `.exists()`, `.is_file()`, `.is_dir()`, `.is_symlink()`,
-# `.stat()` immediately following an identifier-or-`)`-or-`]` character.
-# This catches `path.exists()`, `entry.is_dir()`, `result.stat()`, etc.
-# Does NOT match `.exists` in docstrings (which usually appear as
-# `Path.exists()` in backticks — those are filtered downstream).
-danger_pattern='\.(exists|is_file|is_dir|is_symlink|stat)\(\)'
+# Pattern: match probe + mutator surfaces.
+#
+# Probes (zero-arg): `.exists()`, `.is_file()`, `.is_dir()`,
+# `.is_symlink()`, `.stat()` — these always carry empty parens.
+#
+# Mutators: open-paren only (the calls may carry kwargs like
+# `parents=True, exist_ok=True` for `.mkdir`, or `missing_ok=True` for
+# `.unlink`, or positional args for `shutil.copy*` / `os.rename`). Match
+# the start of the call shape (`.mkdir(`, etc.) and let argument
+# matching extend naturally to the line's content; argv content does
+# not need to be re-validated by the pattern.
+#
+# `shutil.copy(` is matched separately so it does not also match
+# `shutil.copy2(` (the open-paren anchor would otherwise double-count).
+# Same for `os.remove(` vs `os.rename(`.
+#
+# The pattern is anchored to a non-identifier character so a function
+# definition like `def mkdir_unrelated(` does not trip the lint
+# (`def mkdir_unrelated(` does not contain `.mkdir(`).
+danger_pattern='\.(exists|is_file|is_dir|is_symlink|stat)\(\)|\.(mkdir|unlink|touch|rmdir)\(|shutil\.(copy|copy2|move|rmtree)\(|os\.(makedirs|remove|rename)\('
 
 # Whitelist marker: a line with `# noqa: raw-pathlib-controller-only`
 # anywhere in it is skipped (deliberate controller-only call site).
@@ -109,8 +138,11 @@ list_sites() {
         idx2 = index(rest, ":")
         content = substr(rest, idx2 + 1)
         # If the danger pattern is wrapped in backticks on this line, treat as docstring.
-        # Simple heuristic: presence of "`...exists()`" / "`...is_dir()`" etc.
+        # Simple heuristic: presence of "`...exists()`" / "`...is_dir()`" / "`...mkdir(`" etc.
         if (content ~ /`[^`]*\.(exists|is_file|is_dir|is_symlink|stat)\(\)/) next
+        if (content ~ /`[^`]*\.(mkdir|unlink|touch|rmdir)\(/) next
+        if (content ~ /`[^`]*shutil\.(copy|copy2|move|rmtree)\(/) next
+        if (content ~ /`[^`]*os\.(makedirs|remove|rename)\(/) next
         # Also skip lines that are clearly inside docstring blocks
         # (lines starting with quote characters of triple-quote, or
         # entirely-text continuation lines that contain no `(` other
@@ -215,11 +247,13 @@ run_self_test() {
   # shellcheck disable=SC2064
   trap "rm -f '$fixture'" RETURN
 
-  # Build fixture with one positive + one whitelisted + one comment + one
-  # docstring backtick + one nested.
+  # Build fixture with positives across probe + mutator surfaces +
+  # whitelisted + comment + docstring backtick samples.
   cat >"$fixture" <<'PYEOF'
 # Comment line mentioning path.exists() — should NOT match.
     """Docstring mentioning `path.exists()` — should NOT match either."""
+    """Docstring mentioning `path.mkdir(parents=True)` — should NOT match."""
+    """Docstring mentioning `shutil.copy2(a, b)` — should NOT match."""
 def foo():
     return path.exists()
 def bar():
@@ -227,12 +261,27 @@ def bar():
 def baz():
     if entry.is_file():
         return True
+def quux():
+    path.mkdir(parents=True, exist_ok=True)
+def qux():
+    target.unlink()  # noqa: raw-pathlib-controller-only — whitelisted
+def freem():
+    shutil.copy2(src, dst)
+def garply():
+    os.makedirs(path)
 PYEOF
 
-  # Expected positives: 2 (`path.exists()` line + `entry.is_file()` line).
+  # Expected positives:
+  #   path.exists()    — line 6
+  #   entry.is_file()  — line 10
+  #   path.mkdir(...)  — line 13 (NEW #1178)
+  #   shutil.copy2     — line 17 (NEW #1178)
+  #   os.makedirs      — line 19 (NEW #1178)
+  # Filtered out: comment line, 3 docstring lines (backtick-wrapped),
+  # 2 whitelist-marked lines.
   local got expected
   got="$(count_sites "$fixture")"
-  expected=2
+  expected=5
   if [[ "$got" != "$expected" ]]; then
     echo "[lint-raw-pathlib-on-isolated] SELF-TEST FAIL: expected $expected, got $got" >&2
     echo "[lint-raw-pathlib-on-isolated] matches:" >&2
