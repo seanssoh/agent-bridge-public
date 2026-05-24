@@ -502,6 +502,20 @@ def _safe_path_check(check: str, path: Path, os_user: str | None) -> bool:
     `_safe_read_env` skip the read instead of bubbling a traceback up
     to `setup teams|telegram|discord`.
 
+    #1170 r2: the proactive sudo call goes through `subprocess.run`
+    directly (NOT `_sudo_run_as`) so we can attach a 5s `timeout=`
+    AND inspect stderr to distinguish a clean `test` rc=1 (path is
+    authoritatively absent) from a `sudo -n` policy/auth failure
+    (which also exits rc=1 with a "sudo:" prefixed stderr — e.g.
+    "sudo: a password is required" when the controller lacks a
+    cached NOPASSWD entry). Conflating the two would let setup
+    teams|telegram|discord treat existing preserved `.env` /
+    `access.json` state as absent and overwrite it whenever sudo is
+    installed-but-not-currently-authorized. `_sudo_run_as` doesn't
+    currently plumb `timeout=`, and bypassing it here is the
+    smaller-surface fix vs widening that helper's signature
+    (follow-up if other callers need the same).
+
     Issue #1078 F3/F5: when the caller could not resolve `os_user`
     upfront (every lstat in the ancestor chain hit PermissionError),
     the walker fallback in the PermissionError branch climbs ancestors
@@ -511,15 +525,37 @@ def _safe_path_check(check: str, path: Path, os_user: str | None) -> bool:
     """
     if os_user:
         flag = "-e" if check == "exists" else "-h"
-        result = _sudo_run_as(os_user, "test", flag, str(path))
-        if result.returncode == 0:
-            return True
-        if result.returncode == 1:
-            # `test` rc=1 → path does not exist (authoritative answer
-            # from inside the isolated UID). Do not fall through.
-            return False
-        # rc=127 (sudo missing) / any other rc → fall through to direct
-        # pathlib check below.
+        # Direct subprocess.run (NOT _sudo_run_as) so we can plumb
+        # timeout= and inspect stderr. See docstring above (#1170 r2).
+        try:
+            result = subprocess.run(
+                ["sudo", "-n", "-u", os_user, "test", flag, str(path)],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired, PermissionError):
+            # sudo missing / stuck (stuck PAM / NSS lookup) / outright
+            # blocked — fall through to the direct pathlib check below.
+            result = None
+        if result is not None:
+            if result.returncode == 0:
+                return True
+            stderr = (result.stderr or "").strip()
+            if stderr.startswith("sudo:"):
+                # `sudo -n` policy/auth failure (e.g. "sudo: a password
+                # is required", "sudo: ... command not allowed"). The
+                # underlying `test` never ran, so rc=1 here is NOT an
+                # authoritative "path absent" — fall through to direct
+                # pathlib so an already-readable path is still observed.
+                pass
+            elif result.returncode == 1:
+                # Clean `test` rc=1 from inside the isolated UID — path
+                # does not exist. Authoritative; do not fall through.
+                return False
+            # rc=2 (test misuse) / rc=127 (sudo missing surfaced as rc) /
+            # any other rc → fall through to direct pathlib check below.
     try:
         if check == "exists":
             return path.exists()
