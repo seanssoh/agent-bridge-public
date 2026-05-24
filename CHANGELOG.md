@@ -24,10 +24,11 @@ These are **NOT v0.14.5 regressions** — they are pre-existing v2
 contract gaps that the beta9-13 closure made reachable for the first
 time on this install. Most predate v0.14.5.
 
-3-track parallel wave (PR #1166 + #1167 + #1168). 11 codex review
-rounds across the wave (Track A r1→r2, Track B r1→r2→r3→r4, Track C
-r1→r2, integration r1→r2). `-beta14` prerelease; matching tag
-`v0.14.5-beta14`, GitHub release marked **Pre-release**.
+3-track parallel wave (PR #1166 + #1167 + #1168). 10 codex review
+rounds across the wave through integration (Track A r1→r2, Track B
+r1→r2→r3→r4, Track C r1→r2, integration r1→r2) + the release-PR
+review. `-beta14` prerelease; matching tag `v0.14.5-beta14`, GitHub
+release marked **Pre-release**.
 
 ### Fixed — Track A: scaffold/mode widening (Gaps 1-4 of #1165)
 
@@ -43,8 +44,8 @@ r1→r2, integration r1→r2). `-beta14` prerelease; matching tag
     v2 puts `ab-agent-<X>` only as supplementary).
   - **Gap 2** (`lib/bridge-agents.sh:3886`): `~/.claude` mode 2750
     → 2770. SessionStart hook needs group-write under
-    `ab-claude-<a>` membership. Hook process effective UID
-    investigation deferred to future round.
+    `ab-agent-<a>` (per-agent v2 group) membership. Hook process
+    effective UID investigation deferred to future round.
   - **Gap 3** (`lib/bridge-channels.sh:608`): `chmod -R go+rX
     node_modules` moved BEFORE the early-return on existing
     `node_modules/` so re-runs of `agb setup teams` widen
@@ -105,7 +106,8 @@ r1→r2, integration r1→r2). `-beta14` prerelease; matching tag
     swallowed).
   - **Gap 8** (`agent-bridge`): dispatcher recovers
     `BRIDGE_CONTROLLER_UID` from `state/layout-marker.sh` owner via
-    `stat -c %U` / `stat -f %u` when env is unset. Allows direct
+    `stat -c '%u'` (GNU) / `stat -f '%u'` (BSD) when env is unset.
+    Allows direct
     `agb <subcmd>` invocation from inside an isolated Claude session
     without re-running through the start-sudo wrapper. Recovery
     placed between BRIDGE_HOME resolution and `source bridge-lib.sh`
@@ -127,10 +129,11 @@ as a separate follow-up issue.
 
 3-track parallel dispatch (`wave-orchestration` skill). Each track's
 fixer ran in isolated worktree; codex pair-review at each round.
-11 codex review rounds total (Track A 2, Track B 4, Track C 2,
-integration 2, release pending). Track B's 4-round chain reflects
-the security depth of the marker-writer surface: each round
-uncovered a deeper architectural assumption that needed fixing.
+10 codex review rounds through integration (Track A 2, Track B 4,
+Track C 2, integration 2) plus the release-PR review for this cap.
+Track B's 4-round chain reflects the security depth of the
+marker-writer surface: each round uncovered a deeper architectural
+assumption that needed fixing.
 
 ## [0.14.5-beta13] — 2026-05-24
 
