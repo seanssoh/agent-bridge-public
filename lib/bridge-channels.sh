@@ -205,10 +205,11 @@ bridge_allocate_dynamic_webhook_port() {
 
   port_file="$(bridge_agent_webhook_port_file "$agent")"
   # v0.9.7 (refs #781 RC2): ensure the per-agent state leaf is canonical
-  # (group ab-agent-<X>, 2770, setgid) before writing webhook-port. The
-  # daemon writes this file on behalf of the isolated UID; without the
-  # matrix grant the file lands as ec2-user:ab-controller 0644 and the
-  # isolated UID may need to re-read it through the leaf.
+  # (group ab-shared after #1165 Gap 6 widening — formerly ab-agent-<X>,
+  # mode 2770, setgid) before writing webhook-port. The daemon writes
+  # this file on behalf of the isolated UID; without the matrix grant
+  # the file lands as ec2-user:ab-controller 0644 and the isolated UID
+  # may need to re-read it through the leaf.
   if command -v bridge_isolation_v2_ensure_matrix_path >/dev/null 2>&1 \
       && command -v bridge_isolation_v2_active >/dev/null 2>&1 \
       && bridge_isolation_v2_active 2>/dev/null; then
@@ -462,7 +463,8 @@ bridge_write_idle_ready_agents() {
             else
               # v0.9.7 RC2 (refs #781): write retries via the matrix-aware
               # marker writer so the per-agent state leaf inherits the
-              # canonical ab-agent-<X> 2770 contract. Falls back to plain
+              # canonical 2770 contract (group widened to ab-shared by
+              # #1165 Gap 6 — was ab-agent-<X>). Falls back to plain
               # mkdir/redirect when the matrix helper isn't loaded.
               # r13 codex Probe F+H catch — drop direct-write fallback.
               # mark_idle_now / mark_manual_stop / webhook-port already

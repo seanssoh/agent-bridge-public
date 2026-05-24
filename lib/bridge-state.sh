@@ -2703,8 +2703,9 @@ bridge_agent_mark_idle_now() {
   ts="$(date +%s)"
 
   # v0.9.7 RC2 (refs #781): route through the matrix-aware writer so the
-  # per-agent state/agents/<X>/ leaf is canonicalized (group ab-agent-<X>,
-  # 2770, setgid) before write. Without this the daemon's previous plain
+  # per-agent state/agents/<X>/ leaf is canonicalized (group ab-shared
+  # after #1165 Gap 6 widening — formerly ab-agent-<X>, mode 2770,
+  # setgid) before write. Without this the daemon's previous plain
   # `mkdir -p` + redirection produced ec2-user:ab-controller 0600 files
   # that the isolated UserPromptSubmit hook could not unlink, surfacing
   # as the "rm: cannot remove '.../idle-since': Permission denied" error
@@ -2742,9 +2743,10 @@ bridge_agent_mark_manual_stop() {
   # state/agents/<X>/ leaf contract; without the matrix grant the
   # isolated `bridge_agent_clear_manual_stop` rm path fell back to a
   # sudo handoff in PR #714 — the matrix grant makes the sudo handoff
-  # unnecessary because the isolated UID is now in ab-agent-<X> and the
-  # parent dir is 2770. The sudo handoff stays as a fallback for hosts
-  # where the matrix has not been applied yet (rolling upgrade window).
+  # unnecessary because the isolated UID is in ab-shared (#1165 Gap 6;
+  # formerly ab-agent-<X>) and the parent dir is 2770. The sudo handoff
+  # stays as a fallback for hosts where the matrix has not been applied
+  # yet (rolling upgrade window).
   # r12 codex Probe 9 — same direct-write fallback removal as
   # bridge_agent_mark_idle_now above. Hard fail when matrix writer
   # fails so verify and apply stay in sync.
@@ -2766,8 +2768,9 @@ bridge_agent_clear_idle_marker() {
   file="$(bridge_agent_idle_since_file "$agent")"
   dir="$(bridge_agent_idle_marker_dir "$agent")"
   # v0.9.7 RC2 (refs #781): when the matrix grant has been applied, the
-  # isolated UID is in ab-agent-<X> and the parent dir is 2770 setgid,
-  # so this plain `rm -f` succeeds from the isolated hook context.
+  # isolated UID is in ab-shared (#1165 Gap 6; formerly ab-agent-<X>)
+  # and the parent dir is 2770 setgid, so this plain `rm -f` succeeds
+  # from the isolated hook context.
   # If it still fails, log a diagnostic so the verify CLI's
   # `agent-bridge isolation verify` operator-side run can flag that the
   # matrix is out of sync and `migrate isolation v2 --apply --agent <X>`

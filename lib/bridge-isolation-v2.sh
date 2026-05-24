@@ -1602,14 +1602,52 @@ bridge_isolation_v2_matrix_rows_for_agent() {
       printf 'state-agent-dir|%s|dir|controller|controller_group|2770|0660|1|group_setgid|required|#909 shared-mode per-agent state leaf\n' \
         "$state_agent_dir"
     else
-      printf 'state-agent-dir|%s|dir|controller|%s|2770|0660|1|group_setgid|required|RC1: per-agent state leaf, isolated UID + controller rwx\n' \
-        "$state_agent_dir" "$agent_grp"
+      # Issue #1165 Gap 6: widen the linux-user state-agent-dir row's
+      # group from `ab-agent-<X>` to `ab-shared` so the Stop hook
+      # (which runs as the isolated UID) can satisfy `ensure_matrix_path
+      # "state-agent-dir"` from inside `bridge_isolation_v2_write_agent_
+      # state_marker` without needing chown/chmod escalation.
+      #
+      # Failure mode before this fix: the Stop hook called from inside
+      # the Claude REPL spawns as the isolated UID. `ensure_matrix_path`
+      # invokes `apply_row check`, which compares the on-disk
+      # owner:group:mode to the row's expected
+      # `controller:ab-agent-<X>:2770`. Any drift (e.g., a leaf that was
+      # created by a non-prepare path and inherited `ab-shared` from the
+      # `state-agents-root` parent's setgid bit at 0711) causes `check`
+      # to fail. `apply_row apply` then attempts `chown
+      # controller:ab-agent-<X>` via `_bridge_isolation_v2_run_root_or_
+      # sudo`, which from the Stop hook's isolated-UID context cannot
+      # escalate (no sudoers entry covers arbitrary chown), so the call
+      # returns non-zero and the operator sees
+      # `write_agent_state_marker: ensure_matrix_path failed for
+      # agent=<X> marker=idle-since` on every Stop event.
+      #
+      # The isolated UID is already a member of `ab-shared` (joined by
+      # `bridge_migration_create_groups` + `bridge_linux_prepare_agent_
+      # isolation`), and the parent rows `state-root` / `state-agents-
+      # root` both use `ab-shared` at mode 0711. Aligning the per-agent
+      # leaf's group to `ab-shared` (mode kept at 2770 so writes still
+      # work) makes the apply contract uniform across the whole state/
+      # subtree and removes the apply-fallback dependency.
+      #
+      # Security trade-off: any isolated UID in ab-shared can now read
+      # AND write any other agent's state-agent-dir contents
+      # (idle-since timestamp, manual-stop marker, missing-marker-
+      # retries counter, webhook-port, next-session.sha). All of these
+      # are operational metadata — none of them are agent-private
+      # secrets. Channel credentials (Discord/Telegram/Teams `.env` +
+      # `access.json`) live under the per-agent workdir, NOT under
+      # state/agents/<X>, so this widening does not affect the secrets
+      # surface.
+      printf 'state-agent-dir|%s|dir|controller|%s|2770|0660|1|group_setgid|required|#1165 Gap 6: ab-shared group lets Stop hook satisfy ensure_matrix_path from isolated UID without sudo escalation\n' \
+        "$state_agent_dir" "$shared_grp"
     fi
     # RC2: file-level rows are not enforced for files that may be absent
     # at apply time (idle-since, manual-stop, missing-marker-retries,
     # webhook-port, next-session.sha). The matrix grants the parent +
-    # setgid so the writers inherit ab-agent-<X> automatically; the
-    # writer helper sets mode 0660 explicitly.
+    # setgid so the writers inherit ab-shared automatically (#1165 Gap 6);
+    # the writer helper sets mode 0660 explicitly.
   fi
 
   # ----- Legacy opt-in: controller Anthropic credentials read grant -----
@@ -1987,10 +2025,12 @@ bridge_isolation_v2_apply_row() {
       [[ "$want" == "$got" ]] || return 1
       # r2 codex catch — also compare owner:group. Without this, RC1-style
       # group drift (e.g. state/agents/<X> owned by ab-controller instead
-      # of ab-agent-<X>) false-passes the check despite mode being correct.
-      # apply path (chown above) doesn't accept token names ("controller"
-      # etc.) — caller must already resolve tokens to actual user/group
-      # names — so check uses the same resolved comparison.
+      # of the row's expected group — ab-shared after #1165 Gap 6,
+      # formerly ab-agent-<X>) false-passes the check despite mode being
+      # correct. apply path (chown above) doesn't accept token names
+      # ("controller" etc.) — caller must already resolve tokens to
+      # actual user/group names — so check uses the same resolved
+      # comparison.
       local actual_og want_og
       actual_og="$(stat -c '%U:%G' "$path" 2>/dev/null || stat -f '%Su:%Sg' "$path" 2>/dev/null)"
       [[ -n "$actual_og" ]] || return 1
