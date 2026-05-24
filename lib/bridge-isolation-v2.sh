@@ -1602,52 +1602,30 @@ bridge_isolation_v2_matrix_rows_for_agent() {
       printf 'state-agent-dir|%s|dir|controller|controller_group|2770|0660|1|group_setgid|required|#909 shared-mode per-agent state leaf\n' \
         "$state_agent_dir"
     else
-      # Issue #1165 Gap 6: widen the linux-user state-agent-dir row's
-      # group from `ab-agent-<X>` to `ab-shared` so the Stop hook
-      # (which runs as the isolated UID) can satisfy `ensure_matrix_path
-      # "state-agent-dir"` from inside `bridge_isolation_v2_write_agent_
-      # state_marker` without needing chown/chmod escalation.
+      # Issue #1165 Gap 6 (r2): the per-agent state-agent-dir leaf keeps
+      # its per-agent group `ab-agent-<X>` (NOT `ab-shared`). The r1 fix
+      # widened to `ab-shared` so the Stop hook (running as the isolated
+      # UID) could satisfy `ensure_matrix_path` without escalation, but
+      # that opened a cross-agent integrity hole: any isolated UID in
+      # `ab-shared` could create/delete `manual-stop` and
+      # `broken-launch` markers in any OTHER agent's leaf and suppress
+      # that agent's autostart / daemon wake.
       #
-      # Failure mode before this fix: the Stop hook called from inside
-      # the Claude REPL spawns as the isolated UID. `ensure_matrix_path`
-      # invokes `apply_row check`, which compares the on-disk
-      # owner:group:mode to the row's expected
-      # `controller:ab-agent-<X>:2770`. Any drift (e.g., a leaf that was
-      # created by a non-prepare path and inherited `ab-shared` from the
-      # `state-agents-root` parent's setgid bit at 0711) causes `check`
-      # to fail. `apply_row apply` then attempts `chown
-      # controller:ab-agent-<X>` via `_bridge_isolation_v2_run_root_or_
-      # sudo`, which from the Stop hook's isolated-UID context cannot
-      # escalate (no sudoers entry covers arbitrary chown), so the call
-      # returns non-zero and the operator sees
-      # `write_agent_state_marker: ensure_matrix_path failed for
-      # agent=<X> marker=idle-since` on every Stop event.
-      #
-      # The isolated UID is already a member of `ab-shared` (joined by
-      # `bridge_migration_create_groups` + `bridge_linux_prepare_agent_
-      # isolation`), and the parent rows `state-root` / `state-agents-
-      # root` both use `ab-shared` at mode 0711. Aligning the per-agent
-      # leaf's group to `ab-shared` (mode kept at 2770 so writes still
-      # work) makes the apply contract uniform across the whole state/
-      # subtree and removes the apply-fallback dependency.
-      #
-      # Security trade-off: any isolated UID in ab-shared can now read
-      # AND write any other agent's state-agent-dir contents
-      # (idle-since timestamp, manual-stop marker, missing-marker-
-      # retries counter, webhook-port, next-session.sha). All of these
-      # are operational metadata — none of them are agent-private
-      # secrets. Channel credentials (Discord/Telegram/Teams `.env` +
-      # `access.json`) live under the per-agent workdir, NOT under
-      # state/agents/<X>, so this widening does not affect the secrets
-      # surface.
-      printf 'state-agent-dir|%s|dir|controller|%s|2770|0660|1|group_setgid|required|#1165 Gap 6: ab-shared group lets Stop hook satisfy ensure_matrix_path from isolated UID without sudo escalation\n' \
-        "$state_agent_dir" "$shared_grp"
+      # The r2 fix preserves the per-agent integrity boundary
+      # (`controller:ab-agent-<X>:2770`) and addresses the Stop-hook
+      # failure mode at the writer instead — see
+      # `bridge_isolation_v2_write_agent_state_marker` below, which
+      # routes through `bridge_isolation_write_file_as_agent_user_via_bash`
+      # (sudo-escalate as the isolated UID, bound to that agent's own
+      # leaf scope via the per-agent sudoers entry).
+      printf 'state-agent-dir|%s|dir|controller|%s|2770|0660|1|group_setgid|required|RC1: per-agent state leaf, isolated UID + controller rwx (per-agent integrity boundary; writes from iso hook go via sudo writer)\n' \
+        "$state_agent_dir" "$agent_grp"
     fi
     # RC2: file-level rows are not enforced for files that may be absent
     # at apply time (idle-since, manual-stop, missing-marker-retries,
     # webhook-port, next-session.sha). The matrix grants the parent +
-    # setgid so the writers inherit ab-shared automatically (#1165 Gap 6);
-    # the writer helper sets mode 0660 explicitly.
+    # setgid so the writers inherit `ab-agent-<X>` automatically; the
+    # writer helper sets mode 0660 explicitly.
   fi
 
   # ----- Legacy opt-in: controller Anthropic credentials read grant -----
@@ -2025,12 +2003,11 @@ bridge_isolation_v2_apply_row() {
       [[ "$want" == "$got" ]] || return 1
       # r2 codex catch — also compare owner:group. Without this, RC1-style
       # group drift (e.g. state/agents/<X> owned by ab-controller instead
-      # of the row's expected group — ab-shared after #1165 Gap 6,
-      # formerly ab-agent-<X>) false-passes the check despite mode being
-      # correct. apply path (chown above) doesn't accept token names
-      # ("controller" etc.) — caller must already resolve tokens to
-      # actual user/group names — so check uses the same resolved
-      # comparison.
+      # of the row's expected `ab-agent-<X>`) false-passes the check
+      # despite mode being correct. apply path (chown above) doesn't
+      # accept token names ("controller" etc.) — caller must already
+      # resolve tokens to actual user/group names — so check uses the
+      # same resolved comparison.
       local actual_og want_og
       actual_og="$(stat -c '%U:%G' "$path" 2>/dev/null || stat -f '%Su:%Sg' "$path" 2>/dev/null)"
       [[ -n "$actual_og" ]] || return 1
@@ -2866,8 +2843,29 @@ bridge_isolation_v2_reap_isolated_agent_account() {
 
 bridge_isolation_v2_write_agent_state_marker() {
   # Atomic-ish writer for daemon-side per-agent state markers
-  # (idle-since, manual-stop, missing-marker-retries, etc.). Ensures the
-  # state-agent-dir matrix row is canonical, then writes mode 0660.
+  # (idle-since, manual-stop, missing-marker-retries, etc.).
+  #
+  # Two write paths:
+  #
+  #   (A) Linux-user isolation effective for `agent` → route the write
+  #       through `bridge_isolation_write_file_as_agent_user_via_bash`,
+  #       which `sudo -n -u <agent's own os_user>`s into the isolated
+  #       UID's context and atomic-writes to its OWN state leaf. The
+  #       per-agent sudoers entry (installed by
+  #       `bridge_migration_sudoers_entry`) only whitelists that one
+  #       os_user, so the caller can never reach a different agent's
+  #       `state/agents/<other>/` leaf — per-agent integrity boundary
+  #       preserved (issue #1165 Gap 6 r2 codex catch).
+  #
+  #       This path skips `ensure_matrix_path "state-agent-dir"` because
+  #       the matrix repair requires chown/chmod escalation that the
+  #       Stop hook's iso UID cannot perform (only bash/tmux are in
+  #       sudoers). Canonical chown/chmod is the responsibility of the
+  #       controller-side prepare/reapply path, not the per-write hook.
+  #
+  #   (B) Non-isolated (legacy / shared-mode / tests) → original
+  #       controller direct-write path with `ensure_matrix_path` gate.
+  #
   # Args: agent, marker_name, content
   local agent="$1"
   local marker_name="$2"
@@ -2876,6 +2874,51 @@ bridge_isolation_v2_write_agent_state_marker() {
     bridge_warn "write_agent_state_marker: agent and marker_name required"
     return 1
   }
+
+  local dir
+  dir="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null)" \
+    || dir="${BRIDGE_ACTIVE_AGENT_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state/agents}/$agent"
+  local target="$dir/$marker_name"
+
+  # ---- Path (A): sudo-escalate as the agent's own iso UID ----
+  #
+  # Only attempt when both helpers are loaded AND the agent is
+  # linux-user isolated. The helper itself re-verifies isolation
+  # effective + sudo availability and returns:
+  #   0  → wrote OK
+  #   1  → agent NOT in linux-user iso (fall through to Path B)
+  #   2  → iso but sudo unavailable (fall through to Path B; controller
+  #         path will then either succeed (controller-driven write) or
+  #         report a clean failure)
+  #   3+ → iso + sudo OK but inline script failed (dest dir missing,
+  #         mktemp failed, etc.); surface a hard fail because the iso
+  #         UID's environment is the canonical writer for its own leaf.
+  if command -v bridge_isolation_write_file_as_agent_user_via_bash >/dev/null 2>&1 \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    local _sudo_rc=0
+    printf '%s\n' "$content" \
+      | bridge_isolation_write_file_as_agent_user_via_bash "$agent" "$target" "0660" \
+      || _sudo_rc=$?
+    case "$_sudo_rc" in
+      0)
+        return 0
+        ;;
+      1|2)
+        # Fall through to Path B (controller direct write). Path B will
+        # either succeed (controller has write to the leaf via direct
+        # ownership) or fail cleanly with bridge_warn.
+        :
+        ;;
+      *)
+        bridge_warn "write_agent_state_marker: sudo-as-iso writer failed (rc=$_sudo_rc) for agent=$agent marker=$marker_name target=$target"
+        return 1
+        ;;
+    esac
+  fi
+
+  # ---- Path (B): controller direct write (legacy / non-iso) ----
+  #
   # r11 codex BUG #4 — was `|| true`. Same anti-pattern as the other
   # apply/check paths: ensure_matrix_path failure was swallowed, so the
   # subsequent mkdir/write proceeded against a state-dir that may have
@@ -2887,16 +2930,12 @@ bridge_isolation_v2_write_agent_state_marker() {
     bridge_warn "write_agent_state_marker: ensure_matrix_path failed for agent=$agent marker=$marker_name"
     return 1
   }
-  local dir
-  dir="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null)" \
-    || dir="${BRIDGE_ACTIVE_AGENT_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state/agents}/$agent"
   mkdir -p "$dir" 2>/dev/null \
     || _bridge_isolation_v2_run_root_or_sudo mkdir -p "$dir" \
     || {
       bridge_warn "write_agent_state_marker: cannot create $dir"
       return 1
     }
-  local target="$dir/$marker_name"
   local tmp="${target}.tmp.$$"
   printf '%s\n' "$content" > "$tmp" 2>/dev/null || {
     # Direct write failed — fall back to sudo for controller-write paths.

@@ -21,28 +21,39 @@
 # `lib/bridge-agents.sh:1415`). All 4 plugin branches route through the
 # helper.
 #
-# Gap 6 — `bridge_isolation_v2_write_agent_state_marker` calls
-# `ensure_matrix_path "state-agent-dir" "$agent"` before writing the
-# `idle-since` (and `manual-stop` / `missing-marker-retries` /
-# `webhook-port`) markers. The matrix row for `state-agent-dir` under
-# linux-user mode previously expected group `ab-agent-<X>`; from the
-# Stop hook (which runs as the isolated UID, not the controller),
-# `apply_row check` fails whenever the on-disk group is not
-# `ab-agent-<X>` (e.g., drift from a non-prepare path), and the
-# `apply_row apply` fallback cannot chown without sudo (the Stop hook
-# spawn has no sudoers entry beyond bash/tmux).
+# Gap 6 r2 — `bridge_isolation_v2_write_agent_state_marker` previously
+# called `ensure_matrix_path "state-agent-dir" "$agent"` before writing
+# the `idle-since` / `manual-stop` / `missing-marker-retries` /
+# `webhook-port` markers. The matrix row for `state-agent-dir` under
+# linux-user mode expects group `ab-agent-<X>`; from the Stop hook
+# (which runs as the isolated UID, not the controller), `apply_row
+# check` fails whenever the on-disk group is not `ab-agent-<X>` (e.g.,
+# drift from a non-prepare path), and the `apply_row apply` fallback
+# cannot chown without sudo (the Stop hook spawn has no sudoers entry
+# beyond bash/tmux).
 #
-# The fix widens the linux-user `state-agent-dir` row's group from
-# `agent_grp` (=ab-agent-<X>) to `shared_grp` (=ab-shared). The
-# isolated UID is already a member of `ab-shared` (joined by
-# `bridge_migration_create_groups` + `bridge_linux_prepare_agent_
-# isolation`); aligning the leaf row to `ab-shared` matches the parent
-# rows (`state-root`, `state-agents-root`) and removes the apply-
-# fallback dependency.
+# The r1 attempt widened the row's group from `agent_grp` (=ab-agent-<X>)
+# to `shared_grp` (=ab-shared) so the iso UID could satisfy `check`
+# directly via shared group membership. Codex r1 BLOCKING catch: that
+# also lets ANY isolated UID create/delete `manual-stop` and
+# `broken-launch` files in ANY other agent's `state/agents/<other>/`
+# leaf (mere existence of `broken-launch` disables autostart;
+# `manual-stop` containing digits suppresses daemon wake). The widening
+# therefore opens a cross-agent integrity hole.
 #
-# This smoke is HOST-AGNOSTIC: stubs sudo, isolation-effective, and
-# os_user resolution. No real `agent-bridge-*` users or `ab-shared`
-# group on the host required.
+# The r2 fix preserves the per-agent integrity boundary
+# (`controller:ab-agent-<X>:2770`, no widening) and addresses the
+# Stop-hook failure mode at the writer instead: when isolation is
+# effective for `<agent>`, the writer routes through
+# `bridge_isolation_write_file_as_agent_user_via_bash`, which
+# sudo-escalates as that agent's OWN os_user (`agent-bridge-<X>`) and
+# atomic-writes inside the iso UID's authority. The per-agent sudoers
+# entry only whitelists that one os_user, so the writer can never reach
+# another agent's leaf — per-agent integrity intact.
+#
+# This smoke is HOST-AGNOSTIC: stubs sudo, isolation-effective, the
+# sudo-as-iso helper, and os_user resolution. No real `agent-bridge-*`
+# users or `ab-shared` group on the host required.
 #
 # Tests:
 #   T1 (Gap 5): iso-effective + access.json present under root-only
@@ -52,13 +63,29 @@
 #               (negative gate preserved).
 #   T3 (Gap 5): non-iso (legacy) path, file present → helper succeeds
 #               on the direct `[[ -f ]]` probe alone (no sudo needed).
-#   T4 (Gap 6): linux-user matrix row for `state-agent-dir` emits
-#               group `ab-shared` (NOT `ab-agent-<X>`). Static-source
-#               assertion that future revert to `ab-agent-<X>` makes
-#               this smoke fail.
-#   T5 (Gap 6): shared-mode `state-agent-dir` row preserves
-#               `controller_group` (no collateral regression to the
-#               #909 shared-mode contract).
+#   T4  (Gap 6 r2): static-source — linux-user `state-agent-dir` matrix
+#                   row stays `controller:$agent_grp:2770` (per-agent
+#                   integrity boundary preserved; r1 widen to
+#                   `$shared_grp` reverted per codex BLOCKING).
+#   T4a (Gap 6 r2): iso-effective writer call routes through
+#                   `bridge_isolation_write_file_as_agent_user_via_bash`
+#                   with the requesting agent's own identity, mode
+#                   0660, and the target under that agent's own
+#                   state-agent-dir leaf only.
+#   T4b (Gap 6 r2): the target path passed to the sudo-as-iso helper is
+#                   ALWAYS derived from the writer's `$agent` argument
+#                   (no shell expansion of caller-controlled content) —
+#                   so a caller running as agent Y cannot redirect a
+#                   write to agent X's leaf via the writer. The per-
+#                   agent sudoers entry (covered separately by
+#                   bridge-migration.sh) enforces the rest of the
+#                   integrity boundary.
+#   T4c (Gap 6 r2): non-iso path → writer falls through to Path B
+#                   (controller direct write via `ensure_matrix_path`
+#                   + `printf > tmp` + `mv -f`).
+#   T5  (Gap 6 r2): shared-mode `state-agent-dir` row preserves
+#                   `controller_group` (no collateral regression to the
+#                   #909 shared-mode contract).
 #
 # Footgun #11 (heredoc_write deadlock class): every driver is built
 # with `printf '%s\n' >file`; no `<<<` / `<<EOF` feeds into bash
@@ -251,62 +278,256 @@ if [[ -s "$T3_SUDO_LOG" ]]; then
 fi
 smoke_log "T3 PASS: non-iso fast path (direct [[ -f ]]) wins; no sudo escalation invoked"
 
-# ---------- T4 — Gap 6: matrix row for state-agent-dir (linux-user) emits ab-shared ----------
+# ---------- T4 — Gap 6 r2: linux-user state-agent-dir row stays $agent_grp ----------
 #
-# Static-source assertion. The widening from `ab-agent-<X>` to
-# `ab-shared` is the load-bearing change for Gap 6. A future revert
-# would re-introduce the Stop hook failure pattern.
+# Static-source assertion. The r1 attempt widened the row's group to
+# `$shared_grp` (ab-shared) so the Stop hook could satisfy
+# `ensure_matrix_path` via shared group membership. Codex r1 BLOCKING
+# catch: that lets ANY isolated UID in `ab-shared` create/delete
+# `manual-stop` and `broken-launch` markers in ANY other agent's
+# `state/agents/<other>/` leaf (mere existence of `broken-launch`
+# disables autostart; `manual-stop` containing digits suppresses daemon
+# wake) — cross-agent integrity hole.
 #
-# Grep the literal printf line under the linux-user `else` branch
-# inside `bridge_isolation_v2_matrix_rows_for_agent`. The
-# `shared_grp` token in the line confirms the widening.
+# r2 reverts the matrix row to the per-agent group (`$agent_grp` =
+# `ab-agent-<X>`) and addresses the Stop-hook failure mode at the
+# writer instead (see T4a / T4b below).
 
 T4_SOURCE="$REPO_ROOT/lib/bridge-isolation-v2.sh"
 
-# Positive assertion: the linux-user row uses $shared_grp.
-grep -q "printf 'state-agent-dir|%s|dir|controller|%s|2770|0660|1|group_setgid|required|#1165 Gap 6" "$T4_SOURCE" \
-  || smoke_fail "T4: linux-user state-agent-dir row missing the Gap 6 widening header. expected '#1165 Gap 6' annotation in $T4_SOURCE"
+# Positive assertion: the linux-user row uses $agent_grp (per-agent
+# integrity boundary intact).
+grep -Fq '"$state_agent_dir" "$agent_grp"' "$T4_SOURCE" \
+  || smoke_fail "T4: linux-user state-agent-dir printf args line does not pass \$agent_grp as the group token (per-agent integrity boundary broken). file=$T4_SOURCE"
 
-# Anti-pattern: the linux-user `else` branch must NOT reference
-# `$agent_grp` (the pre-fix per-agent group). The shared-mode `if`
-# branch above legitimately uses `controller_group` (T5 confirms);
-# only the linux-user branch is widened.
-#
-# Use awk to extract just the linux-user else block (the printf line
-# right after the `else` inside the state-root section). The full
-# matrix function is large; this block is small.
-# The linux-user `state-agent-dir` printf is a 2-line statement
-# (printf '...' \<newline>"$state_agent_dir" "$shared_grp"). grep the
-# args line directly: it must contain `"$state_agent_dir" "$shared_grp"`
-# and the matrix file must NOT contain the pre-fix `"$state_agent_dir"
-# "$agent_grp"` (which referenced the per-agent group).
-grep -Fq '"$state_agent_dir" "$shared_grp"' "$T4_SOURCE" \
-  || smoke_fail "T4: linux-user state-agent-dir printf args line does not pass \$shared_grp as the group token. file=$T4_SOURCE"
-
-# Reject the pre-fix shape (passes $agent_grp).
-if grep -Fq '"$state_agent_dir" "$agent_grp"' "$T4_SOURCE"; then
-  smoke_fail "T4: linux-user state-agent-dir still references \$agent_grp (Gap 6 fix reverted). file=$T4_SOURCE"
+# Reject the r1 shape: the linux-user row must NOT reference
+# `$shared_grp` (the cross-agent widening that codex BLOCKED). The
+# shared-mode branch legitimately uses `controller_group` (T5
+# confirms); only the linux-user `else` branch is in scope here.
+if grep -Fq '"$state_agent_dir" "$shared_grp"' "$T4_SOURCE"; then
+  smoke_fail "T4: linux-user state-agent-dir references \$shared_grp (cross-agent integrity hole — r1 widening re-introduced). file=$T4_SOURCE"
 fi
 
-smoke_log "T4 PASS: matrix row for linux-user state-agent-dir uses \$shared_grp (ab-shared) — Gap 6 widening intact"
+# Header anchor: r2 row description must NOT advertise itself as the
+# Gap 6 widening (an artifact of the r1 comment). The current line
+# describes the per-agent integrity boundary instead.
+if grep -q "#1165 Gap 6: ab-shared group lets" "$T4_SOURCE"; then
+  smoke_fail "T4: stale r1 row header ('Gap 6: ab-shared group lets...') still present — r1 widening not fully reverted. file=$T4_SOURCE"
+fi
+
+smoke_log "T4 PASS: matrix row for linux-user state-agent-dir uses \$agent_grp (ab-agent-<X>) — per-agent integrity boundary preserved"
+
+# ---------- T4a — Gap 6 r2: writer routes iso-effective call through sudo-as-iso helper ----------
+#
+# Drive `bridge_isolation_v2_write_agent_state_marker` with iso
+# effective for the agent. Stub the sudo-as-iso helper to record its
+# args (agent, target_path, mode) and return 0. Assert:
+#   - The helper was invoked exactly once.
+#   - It received the writer's `$agent` argument unchanged.
+#   - The target path is `<state-agent-dir>/<marker_name>` (under that
+#     agent's OWN leaf — never another agent's path).
+#   - Mode is `0660` (matches the matrix file_mode contract).
+#   - The writer returned 0 (success).
+
+T4A_DIR="$SMOKE_TMP_ROOT/t4a"
+mkdir -p "$T4A_DIR"
+T4A_CALL_LOG="$T4A_DIR/sudo-iso-calls.log"
+T4A_AGENT_DIR="$T4A_DIR/state/agents/alpha"
+mkdir -p "$T4A_AGENT_DIR"
+
+T4A_DRIVER="$T4A_DIR/driver.sh"
+printf '%s\n' '#!/usr/bin/env bash' >"$T4A_DRIVER"
+# shellcheck disable=SC2129
+printf '%s\n' 'set -uo pipefail' >>"$T4A_DRIVER"
+printf '%s\n' 'REPO_ROOT="$1"' >>"$T4A_DRIVER"
+printf '%s\n' 'AGENT_DIR="$2"' >>"$T4A_DRIVER"
+printf '%s\n' 'CALL_LOG="$3"' >>"$T4A_DRIVER"
+# Stub: record call + consume stdin (so the producer pipeline does not block) + return 0.
+printf '%s\n' 'bridge_isolation_write_file_as_agent_user_via_bash() {' >>"$T4A_DRIVER"
+printf '%s\n' '  local agent="$1" dest="$2" mode="${3:-0600}"' >>"$T4A_DRIVER"
+printf '%s\n' '  local content' >>"$T4A_DRIVER"
+printf '%s\n' '  content="$(cat -)"' >>"$T4A_DRIVER"
+printf '%s\n' '  printf "agent=%s dest=%s mode=%s content=%s\n" "$agent" "$dest" "$mode" "$content" >>"$CALL_LOG"' >>"$T4A_DRIVER"
+printf '%s\n' '  return 0' >>"$T4A_DRIVER"
+printf '%s\n' '}' >>"$T4A_DRIVER"
+# Stub: iso effective for ANY agent passed in.
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T4A_DRIVER"
+# Stub: marker dir = the agent state dir we control.
+printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s" "$AGENT_DIR"; }' >>"$T4A_DRIVER"
+# Stub: ensure_matrix_path should NOT be hit on Path A — if it is, fail loud.
+printf '%s\n' 'bridge_isolation_v2_ensure_matrix_path() { printf "UNEXPECTED ensure_matrix_path: %s\n" "$*" >>"$CALL_LOG"; return 99; }' >>"$T4A_DRIVER"
+# Stub: bridge_warn — visible in driver log.
+printf '%s\n' 'bridge_warn() { printf "warn: %s\n" "$*" >&2; }' >>"$T4A_DRIVER"
+printf '%s\n' '# shellcheck disable=SC1090' >>"$T4A_DRIVER"
+printf '%s\n' 'source "$REPO_ROOT/lib/bridge-core.sh"' >>"$T4A_DRIVER"
+# Re-stub bridge_warn after sourcing (bridge-core defines it).
+printf '%s\n' 'bridge_warn() { printf "warn: %s\n" "$*" >&2; }' >>"$T4A_DRIVER"
+# Extract ONLY the writer function from bridge-isolation-v2.sh.
+printf '%s\n' 'WRITER_DEF="$(awk "/^bridge_isolation_v2_write_agent_state_marker\\(\\) \\{/,/^\\}/" "$REPO_ROOT/lib/bridge-isolation-v2.sh")"' >>"$T4A_DRIVER"
+printf '%s\n' 'eval "$WRITER_DEF"' >>"$T4A_DRIVER"
+# Re-stub after eval — `eval` does not redefine stubs, but the writer
+# may now resolve names. The stubs defined above stay in scope.
+printf '%s\n' 'bridge_isolation_v2_write_agent_state_marker "alpha" "idle-since" "1700000000"' >>"$T4A_DRIVER"
+printf '%s\n' 'echo "RC=$?"' >>"$T4A_DRIVER"
+chmod +x "$T4A_DRIVER"
+
+T4A_LOG="$T4A_DIR/log"
+"$BRIDGE_BASH" "$T4A_DRIVER" "$REPO_ROOT" "$T4A_AGENT_DIR" "$T4A_CALL_LOG" >"$T4A_LOG" 2>&1 \
+  || true
+
+grep -q '^RC=0$' "$T4A_LOG" \
+  || smoke_fail "T4a: writer did not return 0. log: $(tr '\n' '|' <"$T4A_LOG" | tail -c 600)"
+[[ -s "$T4A_CALL_LOG" ]] \
+  || smoke_fail "T4a: sudo-as-iso helper was NOT called when iso effective. driver log: $(tr '\n' '|' <"$T4A_LOG" | tail -c 600)"
+# Exactly one call.
+T4A_CALL_COUNT="$(wc -l <"$T4A_CALL_LOG" | tr -d ' ')"
+[[ "$T4A_CALL_COUNT" == "1" ]] \
+  || smoke_fail "T4a: expected exactly 1 sudo-as-iso call, got $T4A_CALL_COUNT. log: $(cat "$T4A_CALL_LOG")"
+# Argument shape.
+T4A_CALL="$(cat "$T4A_CALL_LOG")"
+case "$T4A_CALL" in
+  "agent=alpha dest=$T4A_AGENT_DIR/idle-since mode=0660 content=1700000000")
+    : # ok
+    ;;
+  *)
+    smoke_fail "T4a: sudo-as-iso call args wrong. want 'agent=alpha dest=$T4A_AGENT_DIR/idle-since mode=0660 content=1700000000', got '$T4A_CALL'"
+    ;;
+esac
+# ensure_matrix_path MUST NOT have fired on the iso path.
+if grep -q '^UNEXPECTED ensure_matrix_path' "$T4A_CALL_LOG"; then
+  smoke_fail "T4a: ensure_matrix_path was invoked on the iso-effective path (Path A should skip it). log: $(cat "$T4A_CALL_LOG")"
+fi
+
+smoke_log "T4a PASS: iso-effective writer routes through bridge_isolation_write_file_as_agent_user_via_bash with agent/target/mode preserved"
+
+# ---------- T4b — Gap 6 r2: target path always under writer's $agent leaf ----------
+#
+# Static-source assertion. The cross-agent integrity boundary lives in
+# two layers:
+#   (1) per-agent sudoers entries (each `agent-bridge-<X>` os_user can
+#       only sudo to its own UID — enforced outside this writer).
+#   (2) the writer must pass its `$agent` argument unchanged to the
+#       sudo-as-iso helper, so a caller cannot redirect the write to a
+#       sibling agent's leaf via the writer.
+#
+# Verify (2) statically: the writer's call site to
+# `bridge_isolation_write_file_as_agent_user_via_bash` must pass `$agent`
+# as the first arg (NOT a literal, NOT a computed path that escapes the
+# leaf). Likewise the `target` value passed as the second arg must be
+# derived from `bridge_agent_idle_marker_dir "$agent"` (which routes
+# through `BRIDGE_ACTIVE_AGENT_DIR/$agent`, not a caller-controllable
+# path).
+
+T4B_SOURCE="$REPO_ROOT/lib/bridge-isolation-v2.sh"
+
+# Anchor 1: helper invocation must pass `"$agent"` as the first arg
+# and `"$target"` as the second arg. Match the producer-pipe call shape.
+grep -Eq 'bridge_isolation_write_file_as_agent_user_via_bash[[:space:]]+"\$agent"[[:space:]]+"\$target"[[:space:]]+"0660"' "$T4B_SOURCE" \
+  || smoke_fail "T4b: writer's sudo-as-iso call does not pass (\"\$agent\", \"\$target\", \"0660\") in that order. file=$T4B_SOURCE"
+
+# Anchor 2: `$target` must be derived from `$dir/$marker_name`, where
+# `$dir` comes from `bridge_agent_idle_marker_dir "$agent"` (or the
+# fallback `BRIDGE_ACTIVE_AGENT_DIR/$agent`). The writer must never
+# construct `$target` from caller-supplied strings.
+grep -Fq 'local target="$dir/$marker_name"' "$T4B_SOURCE" \
+  || smoke_fail "T4b: writer's target path is not the canonical \$dir/\$marker_name derivation. file=$T4B_SOURCE"
+grep -Fq 'dir="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null)"' "$T4B_SOURCE" \
+  || smoke_fail "T4b: writer's \$dir is not derived from bridge_agent_idle_marker_dir \"\$agent\". file=$T4B_SOURCE"
+
+# Anchor 3: the iso-effective gate must also use the writer's `$agent`
+# parameter (not a sibling) — so the iso check and the sudo target are
+# the same agent's identity.
+grep -Fq 'bridge_agent_linux_user_isolation_effective "$agent"' "$T4B_SOURCE" \
+  || smoke_fail "T4b: iso-effective gate does not check the writer's \$agent. file=$T4B_SOURCE"
+
+smoke_log "T4b PASS: writer's target path is always \$agent-derived; sudo-as-iso call passes (\$agent, \$target, 0660) — caller cannot redirect across agent boundaries via this writer"
+
+# ---------- T4c — Gap 6 r2: non-iso path falls through to controller direct write ----------
+#
+# When iso is NOT effective (legacy install, shared mode, test
+# fixtures), the writer must use Path B: `ensure_matrix_path` →
+# `mkdir -p $dir` → `printf > tmp` → `mv -f tmp target` → `chmod 0660`.
+# Stub the sudo-as-iso helper to record its call (we want to verify
+# it is NEVER called); stub iso-effective to return false.
+
+T4C_DIR="$SMOKE_TMP_ROOT/t4c"
+mkdir -p "$T4C_DIR"
+T4C_CALL_LOG="$T4C_DIR/sudo-iso-calls.log"
+T4C_AGENT_DIR="$T4C_DIR/state/agents/beta"
+mkdir -p "$T4C_AGENT_DIR"
+
+T4C_DRIVER="$T4C_DIR/driver.sh"
+printf '%s\n' '#!/usr/bin/env bash' >"$T4C_DRIVER"
+# shellcheck disable=SC2129
+printf '%s\n' 'set -uo pipefail' >>"$T4C_DRIVER"
+printf '%s\n' 'REPO_ROOT="$1"' >>"$T4C_DRIVER"
+printf '%s\n' 'AGENT_DIR="$2"' >>"$T4C_DRIVER"
+printf '%s\n' 'CALL_LOG="$3"' >>"$T4C_DRIVER"
+# Stub: helper recorded if invoked (it MUST NOT be).
+printf '%s\n' 'bridge_isolation_write_file_as_agent_user_via_bash() {' >>"$T4C_DRIVER"
+printf '%s\n' '  printf "UNEXPECTED sudo-as-iso call: %s\n" "$*" >>"$CALL_LOG"' >>"$T4C_DRIVER"
+printf '%s\n' '  return 0' >>"$T4C_DRIVER"
+printf '%s\n' '}' >>"$T4C_DRIVER"
+# Stub: iso NOT effective.
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 1; }' >>"$T4C_DRIVER"
+# Stub: marker dir.
+printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s" "$AGENT_DIR"; }' >>"$T4C_DRIVER"
+# Stub: ensure_matrix_path returns success (we are in non-iso path).
+printf '%s\n' 'bridge_isolation_v2_ensure_matrix_path() { return 0; }' >>"$T4C_DRIVER"
+# Stub: run_root_or_sudo passthrough (should not be reached if direct write succeeds).
+printf '%s\n' '_bridge_isolation_v2_run_root_or_sudo() { "$@"; }' >>"$T4C_DRIVER"
+printf '%s\n' 'bridge_warn() { printf "warn: %s\n" "$*" >&2; }' >>"$T4C_DRIVER"
+printf '%s\n' '# shellcheck disable=SC1090' >>"$T4C_DRIVER"
+printf '%s\n' 'source "$REPO_ROOT/lib/bridge-core.sh"' >>"$T4C_DRIVER"
+printf '%s\n' 'bridge_warn() { printf "warn: %s\n" "$*" >&2; }' >>"$T4C_DRIVER"
+printf '%s\n' 'WRITER_DEF="$(awk "/^bridge_isolation_v2_write_agent_state_marker\\(\\) \\{/,/^\\}/" "$REPO_ROOT/lib/bridge-isolation-v2.sh")"' >>"$T4C_DRIVER"
+printf '%s\n' 'eval "$WRITER_DEF"' >>"$T4C_DRIVER"
+printf '%s\n' 'bridge_isolation_v2_write_agent_state_marker "beta" "idle-since" "1700000099"' >>"$T4C_DRIVER"
+printf '%s\n' 'echo "RC=$?"' >>"$T4C_DRIVER"
+chmod +x "$T4C_DRIVER"
+
+T4C_LOG="$T4C_DIR/log"
+"$BRIDGE_BASH" "$T4C_DRIVER" "$REPO_ROOT" "$T4C_AGENT_DIR" "$T4C_CALL_LOG" >"$T4C_LOG" 2>&1 \
+  || true
+
+grep -q '^RC=0$' "$T4C_LOG" \
+  || smoke_fail "T4c: writer did not return 0 on non-iso path. log: $(tr '\n' '|' <"$T4C_LOG" | tail -c 600)"
+# sudo-as-iso helper must NOT have been called.
+if [[ -s "$T4C_CALL_LOG" ]]; then
+  smoke_fail "T4c: sudo-as-iso helper invoked on non-iso path (should fall through to Path B). log: $(cat "$T4C_CALL_LOG")"
+fi
+# The controller direct write must have produced the target file.
+if [[ ! -f "$T4C_AGENT_DIR/idle-since" ]]; then
+  smoke_fail "T4c: controller direct write did not create $T4C_AGENT_DIR/idle-since. driver log: $(tr '\n' '|' <"$T4C_LOG" | tail -c 600)"
+fi
+# And the content is the writer's input.
+T4C_CONTENT="$(<"$T4C_AGENT_DIR/idle-since")"
+[[ "$T4C_CONTENT" == "1700000099" ]] \
+  || smoke_fail "T4c: idle-since content mismatch. want '1700000099', got '$T4C_CONTENT'"
+
+smoke_log "T4c PASS: non-iso (legacy) path falls through to controller direct write — Path B intact"
 
 # ---------- T5 — Shared-mode state-agent-dir row unchanged (no #909 regression) ----------
 #
-# The Gap 6 fix only touches the linux-user `else` branch of the
-# state-agent-dir row. The shared-mode `if` branch (introduced for
-# #909) must still emit `controller_group` so shared-mode agents on a
-# host without `ab-shared` continue to work.
+# The Gap 6 r2 fix only touches the linux-user `else` branch of the
+# state-agent-dir row and the writer body. The shared-mode `if` branch
+# (introduced for #909) must still emit `controller_group` so
+# shared-mode agents on a host without `ab-shared` continue to work.
 
 T5_SHARED_LINE="$(grep "printf 'state-agent-dir|%s|dir|controller|controller_group|2770|0660" "$T4_SOURCE" || true)"
 [[ -n "$T5_SHARED_LINE" ]] \
   || smoke_fail "T5: shared-mode state-agent-dir row missing the controller_group emit (collateral #909 regression). file=$T4_SOURCE"
 
 # And the shared-mode row must NOT reference $shared_grp (that would
-# break shared-only installs without the v2 groups created).
+# break shared-only installs without the v2 groups created) or
+# $agent_grp (which only exists on linux-user installs).
 if echo "$T5_SHARED_LINE" | grep -q '\$shared_grp'; then
-  smoke_fail "T5: shared-mode state-agent-dir row now references \$shared_grp — Gap 6 widening must not bleed into shared-mode. line: $T5_SHARED_LINE"
+  smoke_fail "T5: shared-mode state-agent-dir row references \$shared_grp — Gap 6 widening must not bleed into shared-mode. line: $T5_SHARED_LINE"
+fi
+if echo "$T5_SHARED_LINE" | grep -q '\$agent_grp'; then
+  smoke_fail "T5: shared-mode state-agent-dir row references \$agent_grp — per-agent group only exists on linux-user installs. line: $T5_SHARED_LINE"
 fi
 
-smoke_log "T5 PASS: shared-mode state-agent-dir row unchanged (controller_group, no \$shared_grp leak) — #909 contract intact"
+smoke_log "T5 PASS: shared-mode state-agent-dir row unchanged (controller_group, no \$shared_grp / \$agent_grp leak) — #909 contract intact"
 
-smoke_log "ALL 5 PASS"
+smoke_log "ALL 7 PASS"
