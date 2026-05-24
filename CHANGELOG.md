@@ -29,8 +29,9 @@ implement-ok (task #6062). `-beta15` prerelease; matching tag
 - **#1170 (PR #1172)** — `bridge-setup.py:_safe_path_check` now does
   proactive sudo-escalate when `os_user` is provided:
   ```
+  # flag = '-e' for check="exists", '-h' for check="is_symlink"
   subprocess.run(['sudo', '-n', '-u', os_user, 'test',
-                  '-e'|'-f'|'-d', str(path)],
+                  flag, str(path)],
                  capture_output=True, timeout=5, text=True)
   ```
   Disposition by sudo rc + stderr:
