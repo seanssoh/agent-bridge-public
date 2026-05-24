@@ -96,6 +96,15 @@ _bash_bin="${BASH:-/usr/bin/env bash}"
 resolved_t1="$(
   PATH="$FAKE_BIN_DIR:$PATH" "$_bash_bin" -c '
     set -e
+    # Defensive: scrub any shell-level shadow of `claude` (alias /
+    # function / hashed path) that CI runners or inherited shell
+    # environments may have installed. `command -v` is precedence-
+    # aware (alias > builtin > function > PATH); a shadow returns
+    # a non-absolute token and trips bridge_resolve_engine_binary'\''s
+    # `[[ "$resolved" == /* ]]` check, yielding "" + rc=1.
+    unalias claude 2>/dev/null || true
+    unset -f claude 2>/dev/null || true
+    hash -d claude 2>/dev/null || true
     SCRIPT_DIR="'"$REPO_ROOT"'"
     BRIDGE_SCRIPT_DIR="$SCRIPT_DIR"
     export BRIDGE_SCRIPT_DIR
@@ -103,6 +112,29 @@ resolved_t1="$(
     bridge_resolve_engine_binary claude
   ' 2>/dev/null
 )"
+if [[ "$resolved_t1" != "$FAKE_CLAUDE" ]]; then
+  # Diagnostic dump on fail so the next CI iteration shows root cause
+  # without another round trip. Same subshell shape, stderr enabled.
+  diag="$(
+    PATH="$FAKE_BIN_DIR:$PATH" "$_bash_bin" -c '
+      unalias claude 2>/dev/null || true
+      unset -f claude 2>/dev/null || true
+      hash -d claude 2>/dev/null || true
+      SCRIPT_DIR="'"$REPO_ROOT"'"
+      BRIDGE_SCRIPT_DIR="$SCRIPT_DIR"
+      export BRIDGE_SCRIPT_DIR
+      echo "PATH=$PATH"
+      echo "BASH_ENV=${BASH_ENV:-unset}"
+      echo "BASH_VERSION=$BASH_VERSION"
+      echo "fake_exists=$(test -x "'"$FAKE_CLAUDE"'" && echo yes || echo no)"
+      echo "command-v-claude=$(command -v claude || echo EMPTY)"
+      echo "type-claude=$(type -t claude 2>/dev/null || echo none)"
+      source "$SCRIPT_DIR/bridge-lib.sh" >/dev/null 2>&1 && echo "sourced=ok" || echo "sourced=fail-rc=$?"
+      bridge_resolve_engine_binary claude 2>&1 && echo "" || echo "resolver-rc=$?"
+    ' 2>&1
+  )"
+  smoke_fail "T1 DIAG: $diag"
+fi
 smoke_assert_eq "$FAKE_CLAUDE" "$resolved_t1" "T1: bridge_resolve_engine_binary should return the fake absolute claude path"
 
 # T1b: rejects an unsupported engine name.
