@@ -922,67 +922,31 @@ bridge_isolation_v2_migrate_normalize_layout() {
   # The fix splits state into traversal-only (state/, state/agents/) and
   # per-agent rwx (state/agents/<X>/) — see the matrix in
   # lib/bridge-isolation-v2.sh.
-  # v0.14.5 stabilization (Layer 13 — VM-discovered): isolated UID
-  # traversal chain must reach BRIDGE_HOME from /. The full chain is:
-  #   /            755 root:root (system default)
-  #   /home        755 root:root (system default)
-  #   $HOME        often 750 owner:owner (Linux default-on-create) → BLOCKS
-  #   $data_root   often 700 owner:owner (install default) → BLOCKS
-  #   $data_root/data/agents  710 owner:ab-shared (handled by existing matrix)
-  #   $data_root/data/agents/<a>/workdir  2770 isolated:ab-agent-<a> (handled)
-  # Even with all per-agent paths correct, iso UID `mkdir`/stat/cat into
-  # workdir traverses ANCESTORS first. Without these two chmods, every
-  # sudo-as-iso-UID operation fails with "cannot create directory '$HOME':
-  # Permission denied" at the ancestor stat.
-  #
-  # $data_root (== BRIDGE_HOME): chgrp ab-shared + g+x. iso UIDs are in
-  # ab-shared, so they can traverse but NOT list/read. controller still
-  # owns + has full rwx.
-  #
-  # $HOME (operator's home, parent of BRIDGE_HOME when BRIDGE_HOME is the
-  # default $HOME/.agent-bridge): chmod o+x (POSIX "others may traverse,
-  # not read or list"). Conservative — matches /tmp, /usr defaults.
-  # Skipped if BRIDGE_HOME is NOT under $HOME (advanced install layouts).
-  if [[ -d "$data_root" ]]; then
-    _bridge_isolation_v2_run_root_or_sudo chgrp "$shared_grp" "$data_root" 2>/dev/null || true
-    _bridge_isolation_v2_run_root_or_sudo chmod g+x "$data_root" 2>/dev/null || true
+  # Phase 2 (post-v0.14.5-beta16): the Layer 13/14 inline chmod/chgrp
+  # block that lived here is superseded by the declarative install-tree
+  # reconciler in lib/bridge-isolation-v2-reconcile.sh. The reconciler
+  # owns:
+  #   * $HOME traverse (was Layer 13 host-row path_traverse)
+  #   * BRIDGE_HOME chgrp ab-shared + g+x (Layer 13 install-row dir)
+  #   * lib/, scripts/, hooks/, runtime/, shared/ chgrp -R + g+rX
+  #     (Layer 14 install-row dir_recursive)
+  #   * root entrypoint file g+r (Layer 14 install-row file_glob)
+  # Single source of truth — operators can audit via `agent-bridge
+  # isolation reconcile --check`, CI gates via the new phase2 smoke,
+  # and the row-by-row protected guard refuses to touch
+  # agent-roster*/handoff.local*/secrets that the inline code listed
+  # by hand.
+  if command -v bridge_isolation_v2_apply_install_tree_matrix >/dev/null 2>&1; then
+    # Best-effort apply: stay non-fatal in normalize_layout (the caller
+    # may be a probe path or a partial migrate where the reconciler
+    # contract is over-ambitious for the current tree). The reconciler
+    # itself logs per-row outcomes; we only need to capture the
+    # aggregate signal here. apply-grant-matrix-for-agent below will
+    # surface a separate hard failure if the per-agent matrix fails.
+    bridge_isolation_v2_apply_install_tree_matrix \
+      --mode apply --reason install >/dev/null 2>&1 \
+      || bridge_warn "normalize_layout: install-tree reconciler returned non-zero (apply install). Operator may run: agent-bridge isolation reconcile --apply"
   fi
-  local _bridge_home_parent=""
-  _bridge_home_parent="$(dirname "$data_root")"
-  if [[ -n "${HOME:-}" && "$_bridge_home_parent" == "$HOME" && -d "$_bridge_home_parent" ]]; then
-    # User owns $HOME — chmod doesn't need sudo. POSIX traverse only.
-    chmod o+x "$_bridge_home_parent" 2>/dev/null || \
-      bridge_warn "Layer 13: could not chmod o+x \$HOME ($_bridge_home_parent) — isolated UIDs may not traverse to BRIDGE_HOME. Run: chmod o+x $_bridge_home_parent"
-  fi
-
-  # v0.14.5 stabilization (Layer 14 — VM-discovered): static install
-  # subdirs (lib/, scripts/, hooks/, runtime/, shared/) carry executable
-  # code + shared resources that isolated agents must source/exec. They
-  # default to 700 sean:sean from the installer's umask; iso UID then
-  # cannot read bridge-lib.sh, bridge-session-patterns.sh, hook scripts,
-  # etc. Make them ab-shared-readable via g+rX (read + traverse-only on
-  # dirs; preserves any existing x-bit on files).
-  #
-  # Root-level files (agent-bridge, agb, bridge-*.sh, bridge-*.py) need
-  # g+r so iso UID can source bridge-lib.sh, exec bridge-run.sh. Excludes
-  # agent-roster* (may contain secrets) and handoff.local* (HMAC secret).
-  local _static_subdir
-  for _static_subdir in lib scripts hooks runtime shared; do
-    if [[ -d "$data_root/$_static_subdir" ]]; then
-      _bridge_isolation_v2_run_root_or_sudo chgrp -R "$shared_grp" "$data_root/$_static_subdir" 2>/dev/null || true
-      _bridge_isolation_v2_run_root_or_sudo chmod -R g+rX "$data_root/$_static_subdir" 2>/dev/null || true
-    fi
-  done
-  local _root_file _root_base
-  while IFS= read -r _root_file; do
-    [[ -n "$_root_file" ]] || continue
-    _root_base="$(basename "$_root_file")"
-    case "$_root_base" in
-      agent-roster*|handoff.local*) continue ;;  # may contain secrets
-    esac
-    _bridge_isolation_v2_run_root_or_sudo chgrp "$shared_grp" "$_root_file" 2>/dev/null || true
-    _bridge_isolation_v2_run_root_or_sudo chmod g+r "$_root_file" 2>/dev/null || true
-  done < <(find "$data_root" -maxdepth 1 -type f -print 2>/dev/null)
 
   if [[ -d "$data_root/state" ]]; then
     # Top-level state/: traversal-only via the shared group so isolated
@@ -1426,6 +1390,18 @@ bridge_isolation_v2_migrate_marker_write() {
   local marker_path
   marker_path="$(bridge_isolation_v2_marker_path)"
 
+  # Phase 2 (Layer 17): refuse the write outright if the effective UID
+  # is not root and not the controller. An isolated agent UID running
+  # this path (via a stray sudo-handoff or a controller helper that
+  # didn't drop privileges) would otherwise write a marker into its
+  # OWN home, leaving the real install's marker in an inconsistent
+  # state. bridge_die is correct here — the caller has a bug and
+  # silent fallback would propagate the wedge.
+  if command -v _bridge_marker_writer_is_controller_uid >/dev/null 2>&1 \
+      && ! _bridge_marker_writer_is_controller_uid; then
+    bridge_die "marker_write: refusing to write layout-marker.sh from non-controller UID $(id -u 2>/dev/null) — this is a controller-only operation. Run as the controller user or under root."
+  fi
+
   bridge_isolation_v2_migrate_mkstate
   # #1161 r2: parent dir gets mode 0711 so isolated UIDs that are NOT
   # members of `ab-shared` can still traverse INTO the marker dir and
@@ -1497,6 +1473,17 @@ bridge_isolation_v2_migrate_marker_write_minimal() {
     bridge_warn "marker_write_minimal: --data-root <abs-path> required"
     return 1
   }
+
+  # Phase 2 (Layer 17): same controller-only guard as the full
+  # `marker_write`. The fast-path is invoked from
+  # `bridge_isolation_v2_migrate_apply_for_upgrade` under the upgrader's
+  # controller-or-root context, so this should never fail in production
+  # — it exists as a guard against future call-site drift.
+  if command -v _bridge_marker_writer_is_controller_uid >/dev/null 2>&1 \
+      && ! _bridge_marker_writer_is_controller_uid; then
+    bridge_warn "marker_write_minimal: refusing to write layout-marker.sh from non-controller UID $(id -u 2>/dev/null)"
+    return 1
+  fi
 
   local marker_path
   marker_path="$(bridge_isolation_v2_marker_path)"
