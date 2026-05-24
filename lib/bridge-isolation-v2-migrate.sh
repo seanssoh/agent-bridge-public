@@ -955,6 +955,35 @@ bridge_isolation_v2_migrate_normalize_layout() {
       bridge_warn "Layer 13: could not chmod o+x \$HOME ($_bridge_home_parent) — isolated UIDs may not traverse to BRIDGE_HOME. Run: chmod o+x $_bridge_home_parent"
   fi
 
+  # v0.14.5 stabilization (Layer 14 — VM-discovered): static install
+  # subdirs (lib/, scripts/, hooks/, runtime/, shared/) carry executable
+  # code + shared resources that isolated agents must source/exec. They
+  # default to 700 sean:sean from the installer's umask; iso UID then
+  # cannot read bridge-lib.sh, bridge-session-patterns.sh, hook scripts,
+  # etc. Make them ab-shared-readable via g+rX (read + traverse-only on
+  # dirs; preserves any existing x-bit on files).
+  #
+  # Root-level files (agent-bridge, agb, bridge-*.sh, bridge-*.py) need
+  # g+r so iso UID can source bridge-lib.sh, exec bridge-run.sh. Excludes
+  # agent-roster* (may contain secrets) and handoff.local* (HMAC secret).
+  local _static_subdir
+  for _static_subdir in lib scripts hooks runtime shared; do
+    if [[ -d "$data_root/$_static_subdir" ]]; then
+      _bridge_isolation_v2_run_root_or_sudo chgrp -R "$shared_grp" "$data_root/$_static_subdir" 2>/dev/null || true
+      _bridge_isolation_v2_run_root_or_sudo chmod -R g+rX "$data_root/$_static_subdir" 2>/dev/null || true
+    fi
+  done
+  local _root_file _root_base
+  while IFS= read -r _root_file; do
+    [[ -n "$_root_file" ]] || continue
+    _root_base="$(basename "$_root_file")"
+    case "$_root_base" in
+      agent-roster*|handoff.local*) continue ;;  # may contain secrets
+    esac
+    _bridge_isolation_v2_run_root_or_sudo chgrp "$shared_grp" "$_root_file" 2>/dev/null || true
+    _bridge_isolation_v2_run_root_or_sudo chmod g+r "$_root_file" 2>/dev/null || true
+  done < <(find "$data_root" -maxdepth 1 -type f -print 2>/dev/null)
+
   if [[ -d "$data_root/state" ]]; then
     # Top-level state/: traversal-only via the shared group so isolated
     # hooks can reach their per-agent leaves without opening daemon
