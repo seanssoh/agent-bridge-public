@@ -14,6 +14,22 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+# Canonical isolation-aware pathlib helpers. Issue #1175: previously
+# duplicated in both bridge-setup.py and bridge-hooks.py; consolidated
+# to a single source of truth so a single fix lands in both files.
+_BRIDGE_HOOKS_LIB_DIR = Path(__file__).resolve().parent / "lib"
+if _BRIDGE_HOOKS_LIB_DIR.is_dir() and str(_BRIDGE_HOOKS_LIB_DIR) not in sys.path:  # noqa: raw-pathlib-controller-only — import-time controller-side lib dir probe
+    sys.path.insert(0, str(_BRIDGE_HOOKS_LIB_DIR))
+
+from bridge_iso_paths import (  # noqa: E402
+    isolated_workdir_owner as _isolated_workdir_owner,
+    resolve_isolated_owner_for_path as _resolve_isolated_owner_for_path,
+    sudo_run_as as _sudo_run_as,
+    safe_path_check as _safe_path_check,
+    safe_read_env as _safe_read_env,
+    safe_load_json as _safe_load_json,
+)
+
 
 # Claude Code 2.1.123 exposes autoCompactWindow in user settings. Avoid
 # setting CLAUDE_CODE_AUTO_COMPACT_WINDOW here because that env var takes
@@ -153,7 +169,15 @@ def managed_claude_settings_defaults(
 
 
 def load_json(path: Path) -> Any:
-    if not path.exists():
+    # Controller-side JSON reader. Callers that may operate on isolated
+    # paths must route through `_safe_load_json` (canonical helper in
+    # `lib/bridge_iso_paths.py`) instead of this primitive — that
+    # wrapper sudo-cats the body when the controller-direct read
+    # raises PermissionError. This function intentionally remains a
+    # thin pathlib wrapper for controller-only call sites
+    # (`ensure_settings_root` against the operator's own
+    # `<bridge_home>/.../settings.base.json`, etc.).
+    if not path.exists():  # noqa: raw-pathlib-controller-only — primitive used by both controller-only and iso-routed callers; iso callers wrap with _safe_load_json
         return {}
     with path.open("r", encoding="utf-8") as handle:
         return json.load(handle)
@@ -982,11 +1006,22 @@ def cmd_ensure_codex_hooks(args: argparse.Namespace) -> int:
     return 0
 
 
-def next_backup_path(path: Path) -> Path:
+def next_backup_path(path: Path, os_user: str | None = None) -> Path:
+    # Backup-name collision loop. The candidate sits next to the
+    # original (same parent dir, same owner), so when `os_user` is
+    # provided we route the existence probe through `_safe_path_check`
+    # — the same proactive-sudo + fail-closed wrapper the caller used
+    # to confirm the original — instead of a raw `candidate.exists()`
+    # that can raise PermissionError on a blind isolated directory
+    # before the caller's sudo-backed copy2/rm fallback can fire
+    # (#1175 r2 / PR #1176 codex review). When `os_user` is None the
+    # wrapper falls through to the direct pathlib check with the
+    # ancestor-walker recovery, so controller-only callers stay
+    # well-behaved.
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     candidate = path.with_name(f"{path.stem}.agent-bridge.bak-{stamp}{path.suffix}")
     index = 1
-    while candidate.exists():
+    while _safe_path_check("exists", candidate, os_user):
       candidate = path.with_name(f"{path.stem}.agent-bridge.bak-{stamp}-{index}{path.suffix}")
       index += 1
     return candidate
@@ -1057,8 +1092,19 @@ def _load_preserved_user_keys(effective_path: Path) -> dict[str, Any]:
     Returns an empty dict if the file is missing, unreadable, malformed,
     or not a JSON object. Callers merge the result *last* so user keys
     win over base/overlay/managed defaults.
+
+    #1175: existence probe uses the canonical safe wrapper so the
+    rerender that fires from `agent restart` against an isolated
+    home's `.claude/settings.effective.json` does not raise
+    PermissionError before the renderer can decide whether there is
+    a preserved-key payload to merge — the controller may be unable
+    to stat that path on a v2 isolated UID where the per-agent
+    supplementary group is not in the controller's grouplist (#1170
+    family). The owner is resolved via the walker so a leaf that
+    doesn't yet exist still picks up the isolated lineage.
     """
-    if not effective_path.exists():
+    owner = _resolve_isolated_owner_for_path(effective_path)
+    if not _safe_path_check("exists", effective_path, owner):
         return {}
     try:
         existing = load_json(effective_path)
@@ -1096,11 +1142,18 @@ def cmd_render_shared_settings(args: argparse.Namespace) -> int:
     _normalize_bridge_hook_paths(merged, _bridge_home_from_base_settings(base_path))
     save_json(effective_path, merged)
 
+    # #1175: report-only `overlay_present` probe routes through the
+    # canonical safe wrapper so the renderer does not raise a
+    # traceback for an isolated overlay file the controller cannot
+    # stat directly. The walker resolves the owner from the path's
+    # ancestor lineage; on shared (non-isolated) installs the owner
+    # is None and the wrapper degrades to a direct `path.exists()`.
+    _overlay_owner_report = _resolve_isolated_owner_for_path(overlay_path)
     payload = {
         "base_settings_file": str(base_path),
         "overlay_settings_file": str(overlay_path),
         "effective_settings_file": str(effective_path),
-        "overlay_present": "true" if overlay_path.exists() else "false",
+        "overlay_present": "true" if _safe_path_check("exists", overlay_path, _overlay_owner_report) else "false",
         "preserved_keys": ",".join(sorted(preserved.keys())),
     }
     if args.format == "shell":
@@ -1153,10 +1206,19 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     #     would silently drop the keys we preserved on the first pass,
     #     breaking idempotency and erasing the operator's user state
     #     on every subsequent rerender (e.g. agent restart).
+    # #1175: existence/symlink probes route through the canonical
+    # safe wrapper so a rerender against an isolated home (where the
+    # controller may not have +x traversal on `.claude/`) does not
+    # raise PermissionError before the renderer can pick a source-
+    # of-truth branch. The owner is resolved per-path via the walker
+    # so a leaf that doesn't yet exist still picks up the isolated
+    # lineage. On shared (non-isolated) installs the owner is None
+    # and the wrapper degrades to direct pathlib semantics.
+    _settings_link_owner = _resolve_isolated_owner_for_path(settings_link)
     preserved: dict[str, Any] = {}
-    if settings_link.exists() and not settings_link.is_symlink():
+    if _safe_path_check("exists", settings_link, _settings_link_owner) and not _safe_path_check("is_symlink", settings_link, _settings_link_owner):
         preserved = _load_preserved_user_keys(settings_link)
-    elif settings_link.is_symlink():
+    elif _safe_path_check("is_symlink", settings_link, _settings_link_owner):
         preserved = _load_preserved_user_keys(effective_path)
 
     # 2. Compose: managed defaults < base < overlay < preserved user keys.
@@ -1164,7 +1226,26 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # `load_json` raises on empty file; treat zero-byte as `{}` so the
     # renderer matches the operator-touch idiom (an empty overlay file
     # is a valid "no overrides" signal).
-    if overlay_path.exists() and overlay_path.stat().st_size == 0:
+    # #1175: existence probe through the safe wrapper. The subsequent
+    # `.stat()` call is only reached when the safe wrapper confirmed
+    # the path exists, so on isolated trees the stat is preceded by a
+    # successful sudo `test -e`; the controller is already known to
+    # have +x traversal on the parent at that point (otherwise the
+    # safe probe would have routed through sudo and returned True
+    # without ever stat-ing the inode directly). Still, wrap in a
+    # PermissionError-guarded try/except so a late-revoked group does
+    # not crash the renderer — fall through to load_json which then
+    # raises a structured FileNotFoundError or JSONDecodeError the
+    # caller can recover from.
+    _overlay_owner_isolated = _resolve_isolated_owner_for_path(overlay_path)
+    if _safe_path_check("exists", overlay_path, _overlay_owner_isolated):
+        try:
+            _overlay_is_empty = overlay_path.stat().st_size == 0  # noqa: raw-pathlib-controller-only — guarded by safe_path_check above + PermissionError-tolerant try/except
+        except (OSError, PermissionError):
+            _overlay_is_empty = False
+    else:
+        _overlay_is_empty = False
+    if _overlay_is_empty:
         overlay_payload: Any = {}
     else:
         overlay_payload = load_json(overlay_path)
@@ -1220,7 +1301,14 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # any prior regular file (we already preserved its user keys above) or
     # stale symlink. Use a relative target so the link survives if the
     # isolated home moves under it.
-    if settings_link.is_symlink() or settings_link.exists():
+    # #1175: probes route through the canonical safe wrapper (reuses
+    # the owner resolved upstream at step 1). The `.unlink()` /
+    # `.symlink_to()` calls themselves still need direct write access
+    # on the isolated home — if controller lacks it the call raises
+    # PermissionError, which is the correct surface (the renderer
+    # cannot proceed without write access; the safe-probe was only
+    # there to avoid raising on the read probe).
+    if _safe_path_check("is_symlink", settings_link, _settings_link_owner) or _safe_path_check("exists", settings_link, _settings_link_owner):
         settings_link.unlink()
     settings_link.symlink_to("settings.effective.json")
 
@@ -1242,123 +1330,10 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     return 0
 
 
-def _isolated_workdir_owner(workdir: Path) -> str | None:
-    # v0.8.8 #714 (item 3) / #694: bridge-hooks.py runs as the controller
-    # user. When the agent's workdir is owned by a linux-user-isolated
-    # account (`agent-bridge-<name>:agent-group mode 0750` from
-    # `bridge_isolation_v2_migrate_normalize_layout`), controller `mkdir`
-    # / `unlink` / `symlink_to` / `shutil.copy2` raise PermissionError.
-    # We don't have the agent name in this entry-point's argv, so derive
-    # the target user from the workdir's filesystem owner — that's the
-    # account the isolated UID was provisioned as. Returns None on
-    # non-Linux hosts, when stat fails on every ancestor, when the owner
-    # looks like root/controller, or when /etc/passwd lookup fails. The
-    # caller gates sudo escalation on a non-None return.
-    #
-    # #1120 sub-A: when `workdir` itself does not exist yet (mid-create,
-    # link-shared-settings runs before `bridge_linux_prepare_agent_
-    # isolation` has materialized the per-agent workdir tree), the lstat
-    # below FileNotFoundError'd → returned None → `_ensure_dir_with_sudo`
-    # fell back to controller-direct `path.mkdir(parents=True)` which
-    # raised PermissionError because the v2 per-agent root is
-    # `root:ab-agent-<slug> mode 2750` (controller has no write).
-    # Walk up the path to the deepest existing ancestor so we can still
-    # discover the isolated UID via the parent dir's group when the leaf
-    # is missing.
-    if sys.platform != "linux":
-        return None
-    candidate: Path | None = workdir
-    stat_result = None
-    while candidate is not None:
-        try:
-            # v0.8.8 r2 (codex CHECK 4): use lstat so a workdir that is
-            # itself a symlink (rare but possible when a dynamic agent's
-            # worktree is symlinked into ~/.agent-bridge/agents/<name>)
-            # reports the link's owner rather than the dereferenced
-            # target. The fallback only escalates to
-            # `sudo -n -u agent-bridge-<slug>`, so reading the link
-            # itself is the right signal — escalating to the target's
-            # owner would be a category error.
-            stat_result = candidate.lstat()
-            break
-        except OSError:
-            # Walk up — same ancestor may carry the `ab-agent-<slug>`
-            # group signature we use to recover the isolated UID even
-            # when the leaf is missing.
-            parent = candidate.parent
-            if parent == candidate:
-                return None
-            candidate = parent
-    if stat_result is None:
-        return None
-    # #1139 sub-A: uid-first lookup. When the workdir / ancestor is owned
-    # by `agent-bridge-<slug>` directly, the `pwd.getpwuid` lookup is the
-    # authoritative signal — its name carries the isolated UID identity
-    # regardless of what the PRIMARY gid on that inode happens to be.
-    # The pre-#1139 code gated this branch on `stat_result.st_uid !=
-    # os.getuid()` AND used the result only as a fallback signal for the
-    # gid-based enumeration below; on a host where the scaffold left the
-    # workdir with `agent-bridge-<slug>:<controller-gid>` (gid != ab-agent
-    # group), the gid-based enumeration would find no `agent-bridge-*`
-    # user whose PRIMARY gid matched the controller's gid and the
-    # function returned None — falling back to a controller-direct
-    # `path.mkdir(...)` that re-raised PermissionError. Trusting the uid
-    # → name lookup unconditionally for an `agent-bridge-*` prefix
-    # closes that gap. A `KeyError` from `getpwuid` (e.g. on a non-Linux
-    # dev host with the platform check stubbed for tests) falls through
-    # to the existing gid-based enumeration.
-    try:
-        import pwd
-        owner = pwd.getpwuid(stat_result.st_uid).pw_name
-        if owner.startswith("agent-bridge-"):
-            return owner
-    except (KeyError, ImportError):
-        pass
-    # #1120 sub-A: the per-agent root (`<v2-root>/<agent>/`) is
-    # `root:ab-agent-<slug> mode 2750` so the owner is root, not an
-    # `agent-bridge-*` user. Recover the isolated UID name from the
-    # group by enumerating /etc/passwd for the user whose PRIMARY gid
-    # matches the ancestor's gid AND whose name starts with
-    # `agent-bridge-`. This is robust against the user/group name
-    # truncation mismatch that codex r1 (#5726 BLOCKING #2) flagged:
-    # `bridge_isolation_v2_agent_group_name` hash-truncates long group
-    # names while `bridge_agent_default_os_user` simple-truncates user
-    # names, so reconstructing the user by string-replacing
-    # `ab-agent-` → `agent-bridge-` is wrong for any agent name >19
-    # chars. The /etc/passwd lookup uses the GID as the authoritative
-    # linkage and avoids the truncation-strategy mismatch entirely.
-    if stat_result.st_uid != os.getuid():
-        try:
-            import pwd
-            for entry in pwd.getpwall():
-                if entry.pw_gid == stat_result.st_gid and entry.pw_name.startswith("agent-bridge-"):
-                    return entry.pw_name
-        except (KeyError, ImportError):
-            pass
-    return None
-
-
-def _sudo_run_as(os_user: str, *cmd: str) -> int:
-    # Mirrors `bridge_linux_sudo_root` shape from `lib/bridge-agents.sh`
-    # but targets a specific isolated UID instead of root. Returns the
-    # subprocess return code; non-zero callers warn-and-continue.
-    full = ["sudo", "-n", "-u", os_user, *cmd]
-    try:
-        return subprocess.run(full, check=False).returncode
-    except FileNotFoundError:
-        # sudo missing — non-Linux dev hosts don't ship it. Treat as
-        # "escalation impossible" so the caller surfaces the original
-        # PermissionError instead of a confusing FileNotFoundError.
-        # v0.8.8 r2 (codex CHECK 6): emit a one-line warn so the
-        # operator sees *why* fallback is impossible (this would
-        # otherwise be a silent 127 → caller re-raises the original
-        # PermissionError without context).
-        print(
-            f"[bridge-hooks] sudo not available; cannot escalate to "
-            f"'{os_user}' for {cmd}",
-            file=sys.stderr,
-        )
-        return 127
+# #1175: `_isolated_workdir_owner` + `_sudo_run_as` moved to
+# `lib/bridge_iso_paths.py` (consolidated with the near-identical
+# bridge-setup.py duplicates). The private names remain available
+# via the top-of-file `from bridge_iso_paths import ... as _...`.
 
 
 def _ensure_dir_with_sudo(path: Path, os_user: str | None) -> None:
@@ -1418,37 +1393,15 @@ def _ensure_dir_with_sudo(path: Path, os_user: str | None) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _safe_path_check(check: str, path: Path, os_user: str | None) -> bool:
-    """PermissionError-safe filesystem predicate for isolated workdirs.
-
-    `check` is one of: "exists", "is_symlink".
-
-    v0.8.8 r2 (codex review needs-more, refs #715-B / #714-2 / #694):
-    `cmd_link_shared_settings` previously called `settings_path.is_symlink()`
-    and `settings_path.exists()` directly. On a linux-user-isolated workdir
-    (`agent-bridge-<slug>:agent-group 0750`), the controller process gets
-    `r-x` on the parent dir but the inode metadata read still succeeds in
-    practice — *until* the agent dir is locked down further (e.g. ACL
-    drift, group-membership timing post-relogin, or 0700 mode), at which
-    point `is_symlink()` / `exists()` raise PermissionError before the
-    rm/cp/ln fallback ever runs. Same isolated-permission shape that
-    drives the rest of this function. Wrap the metadata probes in a
-    sudo-fallback so the controller can interrogate the path via
-    `sudo -n -u agent-bridge-<slug> test -e/-h` when direct stat fails.
-    Falls back to plain raise when `os_user` is None (non-isolated).
-    """
-    try:
-        if check == "exists":
-            return path.exists()
-        if check == "is_symlink":
-            return path.is_symlink()
-    except PermissionError:
-        if os_user is None:
-            raise
-        flag = "-e" if check == "exists" else "-h"
-        rc = _sudo_run_as(os_user, "test", flag, str(path))
-        return rc == 0
-    return False  # unreachable on supported `check` values; satisfies type checkers
+# #1175: `_safe_path_check` moved to `lib/bridge_iso_paths.py`
+# (consolidated canonical implementation lifted from bridge-setup.py's
+# r2 form — proactive sudo + sudo-stderr discrimination + 5s timeout,
+# plus the bridge-hooks side's traceback-quiet fail-closed-on-blind-
+# pathlib semantics). Pre-#1175 the hooks-side helper was the
+# reactive shape — #1173 was the open ticket to bring it up to the
+# canonical form. The shared module's `safe_path_check` is the
+# canonical form, imported as `_safe_path_check` at the top of this
+# file for back-compat with the historical private-name call sites.
 
 
 def _safe_realpath(path: Path, os_user: str | None) -> str:
@@ -1538,7 +1491,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
                         raise
                 status = "updated"
         elif _safe_path_check("exists", settings_path, os_user):
-            backup = next_backup_path(settings_path)
+            backup = next_backup_path(settings_path, os_user)
             try:
                 shutil.copy2(settings_path, backup)
             except PermissionError:
@@ -1791,13 +1744,22 @@ def _relink_agent_profile_paths(agent_home: Path, home_dir: Path) -> dict[str, l
     # owned by agent-bridge-<name> under v2 layout; check each independently
     # because shared-mode agents have neither subdir owned by an isolated
     # user (helper returns None).
-    workdir_user = _isolated_workdir_owner(workdir) if workdir.exists() else None
-    home_user = _isolated_workdir_owner(home_root) if home_root.exists() else None
+    # #1175: resolve owners up-front via the walker (returns None on
+    # non-isolated paths). All subsequent `exists` / `is_dir` probes
+    # route through the canonical safe wrapper so a re-run scan
+    # against a v2 isolated tree the controller cannot stat directly
+    # does not raise PermissionError before the loop reaches its
+    # per-entry skip branch — the source of the PostToolUseFailure
+    # traceback flood (Gap 7).
+    workdir_user = _resolve_isolated_owner_for_path(workdir)
+    home_user = _resolve_isolated_owner_for_path(home_root)
+    skills_dir = home_root / ".claude" / "skills"
+    skills_dir_user = _resolve_isolated_owner_for_path(skills_dir)
 
     # Shared-doc links: workdir/<DOC>.md → ../../../shared/<DOC>.md.
     # 3 levels up from <bridge_home>/agents/<agent>/workdir/ lands at
     # <bridge_home>; the canonical shared/ tree lives directly under it.
-    if workdir.exists():
+    if _safe_path_check("exists", workdir, workdir_user):
         for name in PROFILE_SHARED_DOC_NAMES:
             link = workdir / name
             desired = f"../../../shared/{name}"
@@ -1814,30 +1776,50 @@ def _relink_agent_profile_paths(agent_home: Path, home_dir: Path) -> dict[str, l
     # Missing-source skills (operator removed the
     # $BRIDGE_HOME/.claude/skills/<skill> dir) still get the corrected link
     # target — if the operator restores the skill later the link will resolve.
-    skills_dir = home_root / ".claude" / "skills"
-    if skills_dir.is_dir():
-        for entry in sorted(skills_dir.iterdir()):
-            link = skills_dir / entry.name
-            # Only consider symlink entries — anything else (directory or
-            # regular file) we surface as skipped without clobbering.
-            if not os.path.islink(link):
-                if entry.is_dir():
-                    result["skipped"].append(
-                        f"home/.claude/skills/{entry.name}: real directory occupies link site"
-                    )
-                else:
-                    # Regular file (or other non-dir/non-symlink) at a
-                    # skill slot — surface so the operator sees it instead
-                    # of silently skipping. Do not clobber.
-                    result["skipped"].append(
-                        f"home/.claude/skills/{entry.name}: non-symlink/non-dir file occupies link site"
-                    )
-                continue
-            desired = f"../../../../../.claude/skills/{entry.name}"
-            state, detail = _relink_one(link, desired, home_user)
-            result[state].append(f"home/.claude/skills/{entry.name}: {detail}")
-    elif skills_dir.exists() and not skills_dir.is_dir():
-        result["skipped"].append("home/.claude/skills: not a directory")
+    #
+    # #1175: `skills_dir.is_dir()` was a HIGH site — under v2 isolation
+    # the controller's `is_dir` raises PermissionError on an isolated
+    # skills/ tree, contributing to the PostToolUseFailure traceback
+    # flood. Route the existence probe through the safe wrapper; the
+    # `iterdir()` and per-entry `is_dir()` still need direct read
+    # access (best-effort — fall through to surface "skipped" on
+    # PermissionError instead of crashing).
+    if _safe_path_check("exists", skills_dir, skills_dir_user):
+        try:
+            _skills_dir_is_dir = skills_dir.is_dir()  # noqa: raw-pathlib-controller-only — guarded by safe_path_check above; iterdir() below also needs direct read
+        except (OSError, PermissionError):
+            _skills_dir_is_dir = False
+        if _skills_dir_is_dir:
+            try:
+                _skills_entries = sorted(skills_dir.iterdir())
+            except (OSError, PermissionError):
+                _skills_entries = []
+            for entry in _skills_entries:
+                link = skills_dir / entry.name
+                # Only consider symlink entries — anything else (directory or
+                # regular file) we surface as skipped without clobbering.
+                if not os.path.islink(link):
+                    try:
+                        _entry_is_dir = entry.is_dir()  # noqa: raw-pathlib-controller-only — iterdir() result; PermissionError-tolerant try/except above
+                    except (OSError, PermissionError):
+                        _entry_is_dir = False
+                    if _entry_is_dir:
+                        result["skipped"].append(
+                            f"home/.claude/skills/{entry.name}: real directory occupies link site"
+                        )
+                    else:
+                        # Regular file (or other non-dir/non-symlink) at a
+                        # skill slot — surface so the operator sees it instead
+                        # of silently skipping. Do not clobber.
+                        result["skipped"].append(
+                            f"home/.claude/skills/{entry.name}: non-symlink/non-dir file occupies link site"
+                        )
+                    continue
+                desired = f"../../../../../.claude/skills/{entry.name}"
+                state, detail = _relink_one(link, desired, home_user)
+                result[state].append(f"home/.claude/skills/{entry.name}: {detail}")
+        else:
+            result["skipped"].append("home/.claude/skills: not a directory")
 
     return result
 
@@ -1987,15 +1969,35 @@ def cmd_relink_agent_profile_paths(args: argparse.Namespace) -> int:
     agent_home_root = _resolve_agent_home_root(args)
     home_dir = Path(os.environ.get("HOME") or str(Path.home())).expanduser()
 
+    # #1175: `agent_home_root` lives under `$BRIDGE_HOME/agents/` which is
+    # controller-owned on shared-mode installs but may carry isolated
+    # children under v2 (`<v2-root>/<agent>/` = `root:ab-agent-<a>` mode
+    # 2750). The `is_dir` probe must not raise on a sub-tree the
+    # controller cannot stat — route through the canonical safe wrapper.
+    _root_owner = _resolve_isolated_owner_for_path(agent_home_root)
+
     selected: list[str] = []
     if getattr(args, "all_agents", False):
-        if agent_home_root.is_dir():
-            for entry in sorted(agent_home_root.iterdir()):
-                if not entry.is_dir():
-                    continue
-                if entry.name.startswith(".") or entry.name in {"_template", "shared"}:
-                    continue
-                selected.append(entry.name)
+        if _safe_path_check("exists", agent_home_root, _root_owner):
+            try:
+                _is_root_dir = agent_home_root.is_dir()  # noqa: raw-pathlib-controller-only — guarded by safe_path_check above
+            except (OSError, PermissionError):
+                _is_root_dir = False
+            if _is_root_dir:
+                try:
+                    _agent_entries = sorted(agent_home_root.iterdir())
+                except (OSError, PermissionError):
+                    _agent_entries = []
+                for entry in _agent_entries:
+                    try:
+                        _entry_is_dir = entry.is_dir()  # noqa: raw-pathlib-controller-only — iterdir() result; PermissionError-tolerant try/except above
+                    except (OSError, PermissionError):
+                        _entry_is_dir = False
+                    if not _entry_is_dir:
+                        continue
+                    if entry.name.startswith(".") or entry.name in {"_template", "shared"}:
+                        continue
+                    selected.append(entry.name)
     elif getattr(args, "agent", None):
         selected = [args.agent]
     else:
@@ -2009,7 +2011,12 @@ def cmd_relink_agent_profile_paths(args: argparse.Namespace) -> int:
     overall_failed = 0
     for agent in selected:
         agent_home = agent_home_root / agent
-        if not agent_home.is_dir():
+        # #1175: per-agent existence/is_dir probe through the safe
+        # wrapper so a v2 isolated agent home that the controller
+        # cannot stat directly does not raise a traceback before the
+        # "agent home not found" skip can fire.
+        _agent_home_owner = _resolve_isolated_owner_for_path(agent_home)
+        if not _safe_path_check("exists", agent_home, _agent_home_owner):
             agents_payload.append(
                 {
                     "agent": agent,

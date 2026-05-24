@@ -6,6 +6,71 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta16] — 2026-05-24
+
+### Highlight — exhaustive pathlib audit + canonical helper extraction (#1175 — eighth A2A QA cycle)
+
+Operator-cued **sixteenth prerelease** — eighth cycle of the A2A-driven
+QA loop, and the first to apply operator-coaching directly: cycles 9-10
+had each fixed one site of the same family with the next call surfacing
+the same bug. Operator decision: exhaust-audit + single PR closes the family.
+
+Remote QA peer audited `bridge-setup.py` + `bridge-hooks.py` end-to-end
+and filed #1175 with the full inventory (4 HIGH in bridge-setup.py,
+14 HIGH in bridge-hooks.py). Single-PR wave (PR #1176). Two-round
+codex chain (r1 BLOCKING found a hidden sibling beyond patch's
+inventory: `next_backup_path` whitelisted but callsite gap → r2
+implement-ok). Integration r1 implement-ok (task #6093).
+
+`-beta16` prerelease; matching tag `v0.14.5-beta16`, GitHub release
+marked **Pre-release**.
+
+### Fixed — Canonical safe-path helpers + exhaustive sweep (#1175 subsumes #1173)
+
+- **#1175 (PR #1176)** — 4 deliverables:
+
+  1. **`lib/bridge_iso_paths.py` (NEW, 517 LOC)** — canonical shared
+     module consolidating 7 previously-duplicated helpers:
+     `_isolated_workdir_owner`, `_resolve_isolated_owner_for_path`,
+     `sudo_run_as` (int rc) + `sudo_run_as_capture` (CompletedProcess),
+     `safe_path_check`, `safe_read_env`, `safe_load_json`,
+     `_parse_dotenv_text`. Both `bridge-setup.py` and `bridge-hooks.py`
+     import from the shared module.
+
+  2. **`bridge-setup.py` sweep** — 4 HIGH sites rewritten through
+     safe wrappers (including L392 `_isolation_aware_mkdir` which was
+     patch's next reproducer on beta15).
+
+  3. **`bridge-hooks.py` sweep** — 14+ HIGH sites rewritten
+     (PostToolUse paths — the traceback-flood source — all guarded;
+     closes the #1173 sister).
+
+  4. **`scripts/lint-raw-pathlib-on-isolated.sh`** + baseline file —
+     hard CI fail when new raw `Path.exists()` / `is_file()` / etc
+     lands outside the canonical wrappers or the
+     `# noqa: raw-pathlib-controller-only` whitelist. Baseline starts
+     at 0/0.
+
+  Two review rounds: r1 BLOCKING — codex caught a hidden sibling
+  beyond patch's inventory: `next_backup_path` was whitelisted via
+  noqa but its only callsite (`cmd_link_shared_settings`) only
+  established sudo-readable existence, not controller-readable. On a
+  blind isolated dir the raw `candidate.exists()` raises before the
+  intended sudo-backed `shutil.copy2`/`rm` recovery → wedged
+  `HOOK_STATUS=permission_denied` even though the function has sudo
+  fallback machinery. r2 made `next_backup_path` accept an `os_user`
+  kwarg, routed the collision probe through `safe_path_check`,
+  removed the noqa exemption. Boomerang regression test T4b verified:
+  revert the fix → exact `PermissionError(13)` shape from r1 returns.
+
+  Smoke `1175-exhaustive-pathlib-audit.sh` carries 13 cases including
+  T5 lint self-test/check/boomerang and T6 back-compat aliases.
+
+### Subsumed
+
+- **#1173** (bridge-hooks.py:_safe_path_check sister) — closed by
+  the canonical extraction.
+
 ## [0.14.5-beta15] — 2026-05-24
 
 ### Highlight — beta14 Track A Python-side sibling (#1170 — seventh A2A QA cycle)
