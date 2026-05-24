@@ -542,14 +542,21 @@ select_for_path() {
       # path-pattern arm above — writer #3 lives there, so a
       # resolver-only regression now selects this smoke through
       # changed-file selection.
-      # Issue #1165 Gap 6: the linux-user state-agent-dir matrix row in
-      # lib/bridge-isolation-v2.sh widened group from `ab-agent-<X>` to
-      # `ab-shared` so the Stop hook (running as isolated UID) can
-      # satisfy `ensure_matrix_path "state-agent-dir"` without the
-      # apply-fallback's chown escalation. Pull
+      # Issue #1165 Gap 6 (r2 + r3): the linux-user state-agent-dir
+      # matrix row in lib/bridge-isolation-v2.sh stays
+      # `controller:ab-agent-<X>:2770` for per-agent integrity (r1's
+      # widen to `ab-shared` was reverted per codex BLOCKING: any iso
+      # UID could touch any other agent's manual-stop / broken-launch
+      # marker through the shared group). The Stop-hook failure mode is
+      # addressed inside the writer instead — r2 added a sudo-as-iso
+      # helper path, and r3 added Path A0 (direct write when effective
+      # UID already matches the target os_user, since the generated
+      # sudoers rule is controller-scoped and the iso UID cannot sudo
+      # back to itself). Pull
       # 1165-track-b-sudo-escalate-and-state on every isolation-lib
-      # move so a future revert to `ab-agent-<X>` re-introduces the
-      # Stop-hook regression at PR time.
+      # move so a future revert at any layer (row widening,
+      # writer's Path A0 / Path A removal) re-introduces the Stop-hook
+      # regression at PR time.
       add_required isolation isolated-bin-agb isolated-skills-sync isolated-settings-rendering isolated-cli-policy v2-cross-class-read isolation-v2-migrate-lock-portability isolation-v2-migrate-macos-skip isolation-v2-marker-only-migrate isolation-v2-macos-noise-suppression isolation-v2-platform-discriminator isolation-v2-bucket2-gates layout-resolver-marker-over-env 857-pr1-isolation-write-helper 857-pr6-isolation-v3-channel-dotenv-migrate 864-upgrade-perm-regressions 1021-isolation-v2-shared-plugin-perms 1025-isolated-create-agent-env-install 1077-migrate-iso-v2-data-dir 1113-watchdog-legacy-backfill 1158-marker-controller-uid-exemption 1158-marker-load-order 1161-marker-readable-by-isolated 1165-track-b-sudo-escalate-and-state launch isolated-agent-delete-reap 1121-agent-delete-os-purge 1140-purge-home-os-cleanup
       add_integration integration-minimal
       add_live live-tmux-daemon

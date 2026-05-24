@@ -67,11 +67,20 @@
 #                   row stays `controller:$agent_grp:2770` (per-agent
 #                   integrity boundary preserved; r1 widen to
 #                   `$shared_grp` reverted per codex BLOCKING).
-#   T4a (Gap 6 r2): iso-effective writer call routes through
-#                   `bridge_isolation_write_file_as_agent_user_via_bash`
+#   T4a (Gap 6 r2): iso-effective + euid != target writer call routes
+#                   through `bridge_isolation_write_file_as_agent_user_via_bash`
 #                   with the requesting agent's own identity, mode
 #                   0660, and the target under that agent's own
 #                   state-agent-dir leaf only.
+#   T4a-direct (Gap 6 r3): euid == target os_user → Path A0 direct
+#                          atomic write. sudo-as-iso helper MUST NOT be
+#                          invoked (Stop-hook-from-isolated-session
+#                          reproducer; controller-scoped sudoers makes
+#                          Path A rc=2 from the iso UID).
+#   T4d (Gap 6 r3): euid != target + sudo helper rc=2 → fall through to
+#                   Path B (controller direct write via
+#                   ensure_matrix_path). Pins the cross-agent
+#                   fall-through chain end-to-end.
 #   T4b (Gap 6 r2): the target path passed to the sudo-as-iso helper is
 #                   ALWAYS derived from the writer's `$agent` argument
 #                   (no shell expansion of caller-controlled content) —
@@ -400,6 +409,195 @@ fi
 
 smoke_log "T4a PASS: iso-effective writer routes through bridge_isolation_write_file_as_agent_user_via_bash with agent/target/mode preserved"
 
+# ---------- T4a-direct — Gap 6 r3: Path A0 fires when euid==target os_user ----------
+#
+# Stop-hook-from-isolated-session reproducer. The Claude/Codex Stop hook
+# in an isolated agent process runs as the agent's own os_user
+# (`agent-bridge-<X>`). Generated sudoers
+# (`lib/bridge-migration.sh` `operator ALL=(os_user)`) is controller-
+# scoped, so the iso UID cannot sudo back to itself via Path A's helper
+# (rc=2 → Path B → original ensure_matrix_path bug). Path A0 detects
+# `id -un == bridge_agent_os_user "$agent"` and does a direct atomic
+# write without invoking the sudo helper.
+#
+# Driver fakes the match by stubbing `id` to print the agent's os_user
+# and stubbing `bridge_agent_os_user` to return the same value. Asserts:
+#   - Writer returns 0.
+#   - The sudo-as-iso helper was NEVER invoked (Path A skipped).
+#   - The target file exists with the writer's content.
+#   - ensure_matrix_path (Path B) was NEVER hit either.
+#   - Regression contract: revert Path A0 → this test fails because the
+#     sudo-as-iso helper stub records an invocation.
+
+T4AD_DIR="$SMOKE_TMP_ROOT/t4a-direct"
+mkdir -p "$T4AD_DIR"
+T4AD_CALL_LOG="$T4AD_DIR/calls.log"
+T4AD_AGENT_DIR="$T4AD_DIR/state/agents/gamma"
+mkdir -p "$T4AD_AGENT_DIR"
+# Bin stub dir to override `id`.
+T4AD_BIN="$T4AD_DIR/bin"
+mkdir -p "$T4AD_BIN"
+printf '%s\n' '#!/usr/bin/env bash' >"$T4AD_BIN/id"
+# shellcheck disable=SC2129  # per-line emit keeps footgun #11 off the table
+printf '%s\n' '# Stub `id` to simulate euid == target os_user for Path A0.' >>"$T4AD_BIN/id"
+printf '%s\n' 'if [[ "${1:-}" == "-un" ]]; then' >>"$T4AD_BIN/id"
+printf '%s\n' '  printf "agent-bridge-gamma\n"' >>"$T4AD_BIN/id"
+printf '%s\n' '  exit 0' >>"$T4AD_BIN/id"
+printf '%s\n' 'fi' >>"$T4AD_BIN/id"
+printf '%s\n' 'exec /usr/bin/env -u PATH /usr/bin/id "$@" 2>/dev/null || command id "$@"' >>"$T4AD_BIN/id"
+chmod +x "$T4AD_BIN/id"
+
+T4AD_DRIVER="$T4AD_DIR/driver.sh"
+printf '%s\n' '#!/usr/bin/env bash' >"$T4AD_DRIVER"
+# shellcheck disable=SC2129
+printf '%s\n' 'set -uo pipefail' >>"$T4AD_DRIVER"
+printf '%s\n' 'REPO_ROOT="$1"' >>"$T4AD_DRIVER"
+printf '%s\n' 'AGENT_DIR="$2"' >>"$T4AD_DRIVER"
+printf '%s\n' 'CALL_LOG="$3"' >>"$T4AD_DRIVER"
+printf '%s\n' 'STUB_BIN="$4"' >>"$T4AD_DRIVER"
+# Prepend stub bin so the writer's `id -un` resolves to our stub.
+printf '%s\n' 'export PATH="$STUB_BIN:$PATH"' >>"$T4AD_DRIVER"
+# Stub: bridge_agent_os_user returns the matching os_user for `gamma`.
+printf '%s\n' 'bridge_agent_os_user() {' >>"$T4AD_DRIVER"
+printf '%s\n' '  if [[ "${1:-}" == "gamma" ]]; then printf "agent-bridge-gamma"; fi' >>"$T4AD_DRIVER"
+printf '%s\n' '}' >>"$T4AD_DRIVER"
+# Stub: sudo-as-iso helper — MUST NOT be invoked. Record + return 0 so
+# any accidental invocation surfaces as a failure assertion below.
+printf '%s\n' 'bridge_isolation_write_file_as_agent_user_via_bash() {' >>"$T4AD_DRIVER"
+printf '%s\n' '  printf "UNEXPECTED sudo-as-iso call: %s\n" "$*" >>"$CALL_LOG"' >>"$T4AD_DRIVER"
+printf '%s\n' '  cat - >/dev/null' >>"$T4AD_DRIVER"
+printf '%s\n' '  return 0' >>"$T4AD_DRIVER"
+printf '%s\n' '}' >>"$T4AD_DRIVER"
+# Stub: iso effective (still true — Path A0 runs regardless of this,
+# but Path A is only reached if A0 falls through, so set true to mirror
+# the real Stop-hook-from-iso-session topology).
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T4AD_DRIVER"
+# Stub: marker dir = the agent state dir we control.
+printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s" "$AGENT_DIR"; }' >>"$T4AD_DRIVER"
+# Stub: ensure_matrix_path MUST NOT be hit on Path A0 — record loud.
+printf '%s\n' 'bridge_isolation_v2_ensure_matrix_path() { printf "UNEXPECTED ensure_matrix_path: %s\n" "$*" >>"$CALL_LOG"; return 99; }' >>"$T4AD_DRIVER"
+printf '%s\n' 'bridge_warn() { printf "warn: %s\n" "$*" >&2; }' >>"$T4AD_DRIVER"
+printf '%s\n' '# shellcheck disable=SC1090' >>"$T4AD_DRIVER"
+printf '%s\n' 'source "$REPO_ROOT/lib/bridge-core.sh"' >>"$T4AD_DRIVER"
+printf '%s\n' 'bridge_warn() { printf "warn: %s\n" "$*" >&2; }' >>"$T4AD_DRIVER"
+printf '%s\n' 'WRITER_DEF="$(awk "/^bridge_isolation_v2_write_agent_state_marker\\(\\) \\{/,/^\\}/" "$REPO_ROOT/lib/bridge-isolation-v2.sh")"' >>"$T4AD_DRIVER"
+printf '%s\n' 'eval "$WRITER_DEF"' >>"$T4AD_DRIVER"
+printf '%s\n' 'bridge_isolation_v2_write_agent_state_marker "gamma" "idle-since" "1700000300"' >>"$T4AD_DRIVER"
+printf '%s\n' 'echo "RC=$?"' >>"$T4AD_DRIVER"
+chmod +x "$T4AD_DRIVER"
+
+T4AD_LOG="$T4AD_DIR/log"
+"$BRIDGE_BASH" "$T4AD_DRIVER" "$REPO_ROOT" "$T4AD_AGENT_DIR" "$T4AD_CALL_LOG" "$T4AD_BIN" >"$T4AD_LOG" 2>&1 \
+  || true
+
+grep -q '^RC=0$' "$T4AD_LOG" \
+  || smoke_fail "T4a-direct: writer did not return 0. log: $(tr '\n' '|' <"$T4AD_LOG" | tail -c 800)"
+# Path A0 fires → sudo-as-iso helper MUST NOT have been called.
+if [[ -s "$T4AD_CALL_LOG" ]]; then
+  smoke_fail "T4a-direct: sudo-as-iso helper or ensure_matrix_path was invoked when Path A0 should have short-circuited (euid==target os_user). calls: $(cat "$T4AD_CALL_LOG"). driver log: $(tr '\n' '|' <"$T4AD_LOG" | tail -c 800)"
+fi
+# Target file must exist with the writer's content.
+if [[ ! -f "$T4AD_AGENT_DIR/idle-since" ]]; then
+  smoke_fail "T4a-direct: Path A0 did not produce $T4AD_AGENT_DIR/idle-since. driver log: $(tr '\n' '|' <"$T4AD_LOG" | tail -c 800)"
+fi
+T4AD_CONTENT="$(<"$T4AD_AGENT_DIR/idle-since")"
+[[ "$T4AD_CONTENT" == "1700000300" ]] \
+  || smoke_fail "T4a-direct: idle-since content mismatch. want '1700000300', got '$T4AD_CONTENT'"
+
+smoke_log "T4a-direct PASS: Path A0 direct write fires when euid matches target os_user; sudo-as-iso helper NOT invoked"
+
+# ---------- T4d — Gap 6 r3: Path A0 mismatch + iso effective routes to Path A ----------
+#
+# Topology: cross-agent write attempt. Process running as
+# `agent-bridge-X` (effective UID) tries to write a marker into
+# `agent-Y`'s leaf. Path A0 must NOT fire (current user !=
+# bridge_agent_os_user "Y"). Writer falls through to Path A (sudo
+# helper). Stub the sudo helper to return rc=2 (no sudoers entry for
+# this os_user → typical real-world result). Writer then falls through
+# to Path B (controller direct write via ensure_matrix_path). Asserts:
+#   - Path A0 did NOT short-circuit (sudo helper WAS invoked).
+#   - sudo helper rc=2 caused fall-through to Path B (not a hard fail).
+#   - Path B succeeded (ensure_matrix_path stub returns 0 + direct write).
+#   - Final writer rc=0.
+#
+# This pins the cross-agent fall-through chain end-to-end so a future
+# Path A0 over-broadening (matching when current user != target) would
+# regress here.
+
+T4D_DIR="$SMOKE_TMP_ROOT/t4d"
+mkdir -p "$T4D_DIR"
+T4D_CALL_LOG="$T4D_DIR/calls.log"
+T4D_AGENT_DIR="$T4D_DIR/state/agents/delta"
+mkdir -p "$T4D_AGENT_DIR"
+# Stub `id` to print a DIFFERENT user than the writer's target os_user.
+T4D_BIN="$T4D_DIR/bin"
+mkdir -p "$T4D_BIN"
+printf '%s\n' '#!/usr/bin/env bash' >"$T4D_BIN/id"
+# shellcheck disable=SC2129  # per-line emit keeps footgun #11 off the table
+printf '%s\n' 'if [[ "${1:-}" == "-un" ]]; then' >>"$T4D_BIN/id"
+printf '%s\n' '  printf "agent-bridge-other\n"' >>"$T4D_BIN/id"
+printf '%s\n' '  exit 0' >>"$T4D_BIN/id"
+printf '%s\n' 'fi' >>"$T4D_BIN/id"
+printf '%s\n' 'exec /usr/bin/env -u PATH /usr/bin/id "$@" 2>/dev/null || command id "$@"' >>"$T4D_BIN/id"
+chmod +x "$T4D_BIN/id"
+
+T4D_DRIVER="$T4D_DIR/driver.sh"
+printf '%s\n' '#!/usr/bin/env bash' >"$T4D_DRIVER"
+# shellcheck disable=SC2129
+printf '%s\n' 'set -uo pipefail' >>"$T4D_DRIVER"
+printf '%s\n' 'REPO_ROOT="$1"' >>"$T4D_DRIVER"
+printf '%s\n' 'AGENT_DIR="$2"' >>"$T4D_DRIVER"
+printf '%s\n' 'CALL_LOG="$3"' >>"$T4D_DRIVER"
+printf '%s\n' 'STUB_BIN="$4"' >>"$T4D_DRIVER"
+printf '%s\n' 'export PATH="$STUB_BIN:$PATH"' >>"$T4D_DRIVER"
+# Target os_user = agent-bridge-delta (does NOT match `id -un` = agent-bridge-other).
+printf '%s\n' 'bridge_agent_os_user() {' >>"$T4D_DRIVER"
+printf '%s\n' '  if [[ "${1:-}" == "delta" ]]; then printf "agent-bridge-delta"; fi' >>"$T4D_DRIVER"
+printf '%s\n' '}' >>"$T4D_DRIVER"
+# Stub: sudo-as-iso helper — record call + return rc=2 (no sudoers).
+printf '%s\n' 'bridge_isolation_write_file_as_agent_user_via_bash() {' >>"$T4D_DRIVER"
+printf '%s\n' '  printf "sudo-as-iso call: %s\n" "$*" >>"$CALL_LOG"' >>"$T4D_DRIVER"
+printf '%s\n' '  cat - >/dev/null' >>"$T4D_DRIVER"
+printf '%s\n' '  return 2' >>"$T4D_DRIVER"
+printf '%s\n' '}' >>"$T4D_DRIVER"
+# Stub: iso effective so Path A is attempted.
+printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }' >>"$T4D_DRIVER"
+printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s" "$AGENT_DIR"; }' >>"$T4D_DRIVER"
+# Stub: ensure_matrix_path succeeds (Path B reachable).
+printf '%s\n' 'bridge_isolation_v2_ensure_matrix_path() { printf "ensure_matrix_path: %s\n" "$*" >>"$CALL_LOG"; return 0; }' >>"$T4D_DRIVER"
+# Stub: run_root_or_sudo passthrough — should not be reached when direct
+# write under our test runner succeeds.
+printf '%s\n' '_bridge_isolation_v2_run_root_or_sudo() { "$@"; }' >>"$T4D_DRIVER"
+printf '%s\n' 'bridge_warn() { printf "warn: %s\n" "$*" >&2; }' >>"$T4D_DRIVER"
+printf '%s\n' '# shellcheck disable=SC1090' >>"$T4D_DRIVER"
+printf '%s\n' 'source "$REPO_ROOT/lib/bridge-core.sh"' >>"$T4D_DRIVER"
+printf '%s\n' 'bridge_warn() { printf "warn: %s\n" "$*" >&2; }' >>"$T4D_DRIVER"
+printf '%s\n' 'WRITER_DEF="$(awk "/^bridge_isolation_v2_write_agent_state_marker\\(\\) \\{/,/^\\}/" "$REPO_ROOT/lib/bridge-isolation-v2.sh")"' >>"$T4D_DRIVER"
+printf '%s\n' 'eval "$WRITER_DEF"' >>"$T4D_DRIVER"
+printf '%s\n' 'bridge_isolation_v2_write_agent_state_marker "delta" "idle-since" "1700000400"' >>"$T4D_DRIVER"
+printf '%s\n' 'echo "RC=$?"' >>"$T4D_DRIVER"
+chmod +x "$T4D_DRIVER"
+
+T4D_LOG="$T4D_DIR/log"
+"$BRIDGE_BASH" "$T4D_DRIVER" "$REPO_ROOT" "$T4D_AGENT_DIR" "$T4D_CALL_LOG" "$T4D_BIN" >"$T4D_LOG" 2>&1 \
+  || true
+
+grep -q '^RC=0$' "$T4D_LOG" \
+  || smoke_fail "T4d: writer did not return 0 after Path A→rc=2→Path B fall-through. log: $(tr '\n' '|' <"$T4D_LOG" | tail -c 800)"
+# Path A (sudo helper) MUST have been invoked — Path A0 should NOT fire
+# because `id -un` != target os_user.
+grep -q '^sudo-as-iso call:' "$T4D_CALL_LOG" \
+  || smoke_fail "T4d: sudo-as-iso helper was NOT invoked — Path A0 may have over-fired across the cross-user boundary. calls: $(cat "$T4D_CALL_LOG")"
+# After rc=2, the writer must fall through to Path B (ensure_matrix_path).
+grep -q '^ensure_matrix_path:' "$T4D_CALL_LOG" \
+  || smoke_fail "T4d: ensure_matrix_path NOT invoked after sudo-as-iso rc=2 (Path B fall-through broken). calls: $(cat "$T4D_CALL_LOG")"
+# Path B direct write must have produced the file with our content.
+if [[ ! -f "$T4D_AGENT_DIR/idle-since" ]]; then
+  smoke_fail "T4d: Path B did not produce $T4D_AGENT_DIR/idle-since. calls: $(cat "$T4D_CALL_LOG"). driver log: $(tr '\n' '|' <"$T4D_LOG" | tail -c 800)"
+fi
+
+smoke_log "T4d PASS: cross-user write skips Path A0, sudo-as-iso rc=2 falls through to Path B which writes via ensure_matrix_path"
+
 # ---------- T4b — Gap 6 r2: target path always under writer's $agent leaf ----------
 #
 # Static-source assertion. The cross-agent integrity boundary lives in
@@ -530,4 +728,4 @@ fi
 
 smoke_log "T5 PASS: shared-mode state-agent-dir row unchanged (controller_group, no \$shared_grp / \$agent_grp leak) — #909 contract intact"
 
-smoke_log "ALL 7 PASS"
+smoke_log "ALL 9 PASS"

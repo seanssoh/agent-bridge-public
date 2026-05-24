@@ -2845,26 +2845,48 @@ bridge_isolation_v2_write_agent_state_marker() {
   # Atomic-ish writer for daemon-side per-agent state markers
   # (idle-since, manual-stop, missing-marker-retries, etc.).
   #
-  # Two write paths:
+  # Three write paths:
   #
-  #   (A) Linux-user isolation effective for `agent` → route the write
-  #       through `bridge_isolation_write_file_as_agent_user_via_bash`,
-  #       which `sudo -n -u <agent's own os_user>`s into the isolated
-  #       UID's context and atomic-writes to its OWN state leaf. The
-  #       per-agent sudoers entry (installed by
-  #       `bridge_migration_sudoers_entry`) only whitelists that one
-  #       os_user, so the caller can never reach a different agent's
-  #       `state/agents/<other>/` leaf — per-agent integrity boundary
-  #       preserved (issue #1165 Gap 6 r2 codex catch).
+  #   (A0) Effective UID already matches the agent's own os_user → atomic
+  #        direct write (mktemp + chmod + mv) as that user. No sudo
+  #        needed because we ARE the target UID. This is the Stop-hook-
+  #        from-isolated-session case: `bridge-start.sh` launches
+  #        linux-user agents under `sudo -n -u "$SUDO_WRAP_OS_USER"` so
+  #        the Claude/Codex Stop hook runs as `agent-bridge-<X>` writing
+  #        into `agent-bridge-<X>`'s OWN leaf. The generated sudoers
+  #        rule (`lib/bridge-migration.sh` `operator ALL=(os_user)`) is
+  #        controller-scoped — it does NOT grant
+  #        `agent-bridge-<X> ALL=(agent-bridge-<X>)`, so Path A's sudo
+  #        helper would rc=2 from the iso UID and fall through to Path B
+  #        (which fails on `ensure_matrix_path` for the same reason).
+  #        Path A0 fixes this by skipping sudo entirely when the
+  #        effective UID is already the target (#1165 Track B r3 codex
+  #        catch).
   #
-  #       This path skips `ensure_matrix_path "state-agent-dir"` because
-  #       the matrix repair requires chown/chmod escalation that the
-  #       Stop hook's iso UID cannot perform (only bash/tmux are in
-  #       sudoers). Canonical chown/chmod is the responsibility of the
-  #       controller-side prepare/reapply path, not the per-write hook.
+  #        Cross-agent integrity stays strict: Path A0 only fires when
+  #        the current user IS the writer's `$agent` os_user. An
+  #        isolated agent-X process cannot use Path A0 to reach agent-Y
+  #        (different os_users won't match the `id -un` check).
   #
-  #   (B) Non-isolated (legacy / shared-mode / tests) → original
-  #       controller direct-write path with `ensure_matrix_path` gate.
+  #   (A)  Linux-user isolation effective for `agent` + euid mismatches
+  #        the agent's os_user → route the write through
+  #        `bridge_isolation_write_file_as_agent_user_via_bash`, which
+  #        `sudo -n -u <agent's own os_user>`s into the isolated UID's
+  #        context and atomic-writes to its OWN state leaf. The
+  #        per-agent sudoers entry (installed by
+  #        `bridge_migration_sudoers_entry`) only whitelists that one
+  #        os_user, so the caller can never reach a different agent's
+  #        `state/agents/<other>/` leaf — per-agent integrity boundary
+  #        preserved (issue #1165 Gap 6 r2 codex catch).
+  #
+  #        This path skips `ensure_matrix_path "state-agent-dir"` because
+  #        the matrix repair requires chown/chmod escalation that the
+  #        Stop hook's iso UID cannot perform (only bash/tmux are in
+  #        sudoers). Canonical chown/chmod is the responsibility of the
+  #        controller-side prepare/reapply path, not the per-write hook.
+  #
+  #   (B)  Non-isolated (legacy / shared-mode / tests) → original
+  #        controller direct-write path with `ensure_matrix_path` gate.
   #
   # Args: agent, marker_name, content
   local agent="$1"
@@ -2879,6 +2901,59 @@ bridge_isolation_v2_write_agent_state_marker() {
   dir="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null)" \
     || dir="${BRIDGE_ACTIVE_AGENT_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state/agents}/$agent"
   local target="$dir/$marker_name"
+
+  # ---- Path (A0): euid already matches target → direct write, no sudo ----
+  #
+  # The Stop hook from an isolated Claude/Codex session runs as
+  # `agent-bridge-<X>` (bridge-start.sh launches the session under
+  # `sudo -n -u "$SUDO_WRAP_OS_USER"`). Generated sudoers
+  # (`lib/bridge-migration.sh` `operator ALL=(os_user)`) is
+  # controller-scoped, so the iso UID cannot sudo back to itself via
+  # Path A's helper (rc=2 → Path B → original ensure_matrix_path bug).
+  # When we are ALREADY the target user, skip sudo entirely and do an
+  # atomic write (mktemp + chmod + mv) directly. Same on-disk shape as
+  # the helper produces; only the privilege transition is omitted.
+  #
+  # Cross-agent guard: Path A0 only fires when `id -un` equals the
+  # writer's `$agent` os_user. Agent-X process trying to write agent-Y's
+  # marker will see id-un=agent-bridge-X, target os_user=agent-bridge-Y,
+  # equality fails, fall through to Path A — which in turn fails because
+  # the sudoers rule does not cross agent boundaries either.
+  if command -v bridge_agent_os_user >/dev/null 2>&1; then
+    local _target_os_user
+    _target_os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    if [[ -n "$_target_os_user" ]]; then
+      local _current_user
+      _current_user="$(id -un 2>/dev/null || true)"
+      if [[ -n "$_current_user" && "$_current_user" == "$_target_os_user" ]]; then
+        # Ensure the parent dir exists (best-effort — we already own it
+        # when euid==target_os_user under iso v2). Do NOT call
+        # ensure_matrix_path: same rationale as Path A — chown/chmod
+        # escalation is the controller's job, not the per-write hook.
+        mkdir -p "$dir" 2>/dev/null || {
+          bridge_warn "write_agent_state_marker: Path A0 cannot create $dir"
+          return 1
+        }
+        local _tmp
+        _tmp="$(mktemp "$target.XXXXXX" 2>/dev/null)" || {
+          bridge_warn "write_agent_state_marker: Path A0 mktemp failed under $dir"
+          return 1
+        }
+        printf '%s\n' "$content" >"$_tmp" || {
+          rm -f "$_tmp" 2>/dev/null || true
+          bridge_warn "write_agent_state_marker: Path A0 write failed: $_tmp"
+          return 1
+        }
+        chmod 0660 "$_tmp" 2>/dev/null || true
+        mv -f "$_tmp" "$target" || {
+          rm -f "$_tmp" 2>/dev/null || true
+          bridge_warn "write_agent_state_marker: Path A0 rename failed: $_tmp → $target"
+          return 1
+        }
+        return 0
+      fi
+    fi
+  fi
 
   # ---- Path (A): sudo-escalate as the agent's own iso UID ----
   #
