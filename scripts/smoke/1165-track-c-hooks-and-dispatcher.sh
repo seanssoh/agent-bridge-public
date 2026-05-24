@@ -15,6 +15,9 @@
 #               UID is a linux-user-isolated agent AND the audit-log
 #               path is unwritable. PostToolUse hook would have raised
 #               PermissionError on every tool call before the fix.
+#               r2: BRIDGE_CONTROLLER_UID is set to a value different
+#               from current euid so the effective-UID gate confirms
+#               we are the isolated UID and swallows correctly.
 #   T2 (Gap 7): write_audit still RAISES on controller-side callers
 #               (BRIDGE_AGENT_ISOLATION_MODE unset → no isolation).
 #               Without this counter-test a future patch could silently
@@ -36,6 +39,22 @@
 #               export). Legacy installs that don't have a marker
 #               also don't enforce marker validation, so agb works
 #               regardless.
+#   T6 (Gap 7 r2): controller UID + linux-user env still RAISES.
+#               Codex BLOCKING review caught the original env-only
+#               gate swallowing controller-side failures when the iso
+#               env happened to be inherited. With the effective-UID
+#               gate, the controller (euid == BRIDGE_CONTROLLER_UID)
+#               must still propagate PermissionError. Regression
+#               contract: revert the gate fix → T6 fails (swallow).
+#   T7 (Gap 7 r2): iso UID + linux-user env + matching CONTROLLER_UID
+#               (different from current euid) → swallow. Same outcome
+#               as T1, but explicitly pinning the contract that the
+#               distinguishing signal is the UID mismatch, not the
+#               env shape alone.
+#   T8 (Gap 7 r2): iso env + missing BRIDGE_CONTROLLER_UID → RAISES
+#               (fail-closed). When we cannot prove the caller is the
+#               isolated UID (legacy session, older controller, etc.)
+#               the safer default is to surface the error.
 #
 # Host-agnostic: no sudo required. T3's runtime probe uses a tiny
 # extracted-driver script that re-implements the recovery block with
@@ -147,10 +166,15 @@ T1_AUDIT="$T1_ROOT/locked/subdir/audit.jsonl"
 
 T1_OUT="$SMOKE_TMP_ROOT/t1-out.txt"
 T1_ERR="$SMOKE_TMP_ROOT/t1-err.txt"
+# r2: set BRIDGE_CONTROLLER_UID to a synthetic value different from the
+# current euid so the effective-UID gate sees euid != controller and
+# treats the caller as the isolated UID. 999999 is far outside any real
+# UID space the smoke runner could be using.
 DRIVER_HOOK_COMMON_PATH="$HOOK_COMMON_FILE" \
   BRIDGE_AUDIT_LOG="$T1_AUDIT" \
   BRIDGE_AGENT_ID="iso_smoke_agent" \
   BRIDGE_AGENT_ISOLATION_MODE="linux-user" \
+  BRIDGE_CONTROLLER_UID="999999" \
   "$PYTHON_BIN" "$T1_DRIVER" >"$T1_OUT" 2>"$T1_ERR"
 T1_RC=$?
 
@@ -359,5 +383,136 @@ if [[ -s "$SMOKE_TMP_ROOT/t5-runtime-err" ]]; then
   smoke_fail "T5: expected empty stderr on markerless install, got: $(cat "$SMOKE_TMP_ROOT/t5-runtime-err")"
 fi
 smoke_log "T5 PASS: markerless install → recovery block no-ops, BRIDGE_CONTROLLER_UID stays unset, no stderr"
+
+# ---------------------------------------------------------------------------
+# T6 (Gap 7 r2) — controller UID + linux-user env still RAISES.
+#
+# Reproduces the codex BLOCKING scenario: a controller-side process
+# happens to inherit linux-user iso env (BRIDGE_AGENT_ID +
+# BRIDGE_AGENT_ISOLATION_MODE=linux-user) AND its euid equals the
+# exported BRIDGE_CONTROLLER_UID. The original env-only gate would
+# swallow the PermissionError here; the effective-UID gate correctly
+# raises. Regression contract: revert the gate fix in
+# hooks/bridge_hook_common.py → T6 fails (reverts to "CLEAN").
+# ---------------------------------------------------------------------------
+smoke_log "T6: controller UID + linux-user env + unwritable path → RAISES (r2 BLOCKING fix)"
+
+T6_ROOT="$SMOKE_TMP_ROOT/t6-audit-root"
+mkdir -p "$T6_ROOT/locked"
+chmod 0500 "$T6_ROOT/locked"
+T6_AUDIT="$T6_ROOT/locked/subdir/audit.jsonl"
+
+T6_CURRENT_UID="$(id -u)"
+T6_OUT="$SMOKE_TMP_ROOT/t6-out.txt"
+T6_ERR="$SMOKE_TMP_ROOT/t6-err.txt"
+DRIVER_HOOK_COMMON_PATH="$HOOK_COMMON_FILE" \
+  BRIDGE_AUDIT_LOG="$T6_AUDIT" \
+  BRIDGE_AGENT_ID="iso_smoke_agent" \
+  BRIDGE_AGENT_ISOLATION_MODE="linux-user" \
+  BRIDGE_CONTROLLER_UID="$T6_CURRENT_UID" \
+  "$PYTHON_BIN" "$T1_DRIVER" >"$T6_OUT" 2>"$T6_ERR"
+T6_RC=$?
+
+chmod 0700 "$T6_ROOT/locked" 2>/dev/null || true
+if [[ $T6_RC -ne 0 ]]; then
+  smoke_fail "T6: driver exited with rc=$T6_RC (driver always exits 0 — it captures the exception). stdout: $(cat "$T6_OUT") stderr: $(cat "$T6_ERR")"
+fi
+T6_RESULT="$(cat "$T6_OUT" | tr -d '\n')"
+case "$T6_RESULT" in
+  RAISED:PermissionError:*|RAISED:OSError:*)
+    smoke_log "T6 PASS: controller-UID-with-iso-env write_audit propagated $T6_RESULT (effective-UID gate held)"
+    ;;
+  CLEAN)
+    smoke_fail "T6 REGRESSION: controller UID with linux-user env swallowed PermissionError (got 'CLEAN'). The effective-UID gate is missing or broken — see hooks/bridge_hook_common.py::_under_isolated_uid."
+    ;;
+  *)
+    smoke_fail "T6: expected RAISED:PermissionError:* (controller UID gate raises), got: '$T6_RESULT'. stderr: $(cat "$T6_ERR")"
+    ;;
+esac
+
+# ---------------------------------------------------------------------------
+# T7 (Gap 7 r2) — iso UID + linux-user env + matching CONTROLLER_UID
+# (different from current euid) → swallow.
+#
+# Mirror of T1 but explicit about the effective-UID contract: the
+# distinguishing signal is `os.geteuid() != int(BRIDGE_CONTROLLER_UID)`,
+# not the env shape alone. T1 covers the same code path; T7 pins the
+# contract independently so a future "simplify T1" refactor cannot
+# accidentally lose the swallow-path coverage.
+# ---------------------------------------------------------------------------
+smoke_log "T7: iso UID + linux-user env + non-matching CONTROLLER_UID → swallow"
+
+T7_ROOT="$SMOKE_TMP_ROOT/t7-audit-root"
+mkdir -p "$T7_ROOT/locked"
+chmod 0500 "$T7_ROOT/locked"
+T7_AUDIT="$T7_ROOT/locked/subdir/audit.jsonl"
+
+T7_OUT="$SMOKE_TMP_ROOT/t7-out.txt"
+T7_ERR="$SMOKE_TMP_ROOT/t7-err.txt"
+DRIVER_HOOK_COMMON_PATH="$HOOK_COMMON_FILE" \
+  BRIDGE_AUDIT_LOG="$T7_AUDIT" \
+  BRIDGE_AGENT_ID="iso_smoke_agent" \
+  BRIDGE_AGENT_ISOLATION_MODE="linux-user" \
+  BRIDGE_CONTROLLER_UID="999998" \
+  "$PYTHON_BIN" "$T1_DRIVER" >"$T7_OUT" 2>"$T7_ERR"
+T7_RC=$?
+
+chmod 0700 "$T7_ROOT/locked" 2>/dev/null || true
+if [[ $T7_RC -ne 0 ]]; then
+  smoke_fail "T7: driver exited with rc=$T7_RC. stdout: $(cat "$T7_OUT") stderr: $(cat "$T7_ERR")"
+fi
+T7_RESULT="$(cat "$T7_OUT" | tr -d '\n')"
+if [[ "$T7_RESULT" != "CLEAN" ]]; then
+  smoke_fail "T7: expected 'CLEAN' (iso UID swallows under non-matching CONTROLLER_UID), got: '$T7_RESULT'. stderr: $(cat "$T7_ERR")"
+fi
+if [[ -s "$T7_ERR" ]]; then
+  smoke_fail "T7: unexpected stderr noise on iso-UID swallow path: $(cat "$T7_ERR")"
+fi
+smoke_log "T7 PASS: iso UID (euid != BRIDGE_CONTROLLER_UID) under linux-user env swallowed quietly"
+
+# ---------------------------------------------------------------------------
+# T8 (Gap 7 r2) — iso env + missing BRIDGE_CONTROLLER_UID → RAISES.
+#
+# Fail-closed contract: when we cannot prove the caller is the isolated
+# UID (e.g. legacy session, older controller that pre-dates the
+# BRIDGE_CONTROLLER_UID propagation), the safer default is to surface
+# the PermissionError. Treating the caller as controller means a real
+# logs-dir permission regression is still caught; the only cost is the
+# original PostToolUseFailure flood reappearing for any operator on an
+# older controller — they should upgrade.
+# ---------------------------------------------------------------------------
+smoke_log "T8: iso env + missing BRIDGE_CONTROLLER_UID → RAISES (fail-closed)"
+
+T8_ROOT="$SMOKE_TMP_ROOT/t8-audit-root"
+mkdir -p "$T8_ROOT/locked"
+chmod 0500 "$T8_ROOT/locked"
+T8_AUDIT="$T8_ROOT/locked/subdir/audit.jsonl"
+
+T8_OUT="$SMOKE_TMP_ROOT/t8-out.txt"
+T8_ERR="$SMOKE_TMP_ROOT/t8-err.txt"
+env -u BRIDGE_CONTROLLER_UID \
+  DRIVER_HOOK_COMMON_PATH="$HOOK_COMMON_FILE" \
+  BRIDGE_AUDIT_LOG="$T8_AUDIT" \
+  BRIDGE_AGENT_ID="iso_smoke_agent" \
+  BRIDGE_AGENT_ISOLATION_MODE="linux-user" \
+  "$PYTHON_BIN" "$T1_DRIVER" >"$T8_OUT" 2>"$T8_ERR"
+T8_RC=$?
+
+chmod 0700 "$T8_ROOT/locked" 2>/dev/null || true
+if [[ $T8_RC -ne 0 ]]; then
+  smoke_fail "T8: driver exited with rc=$T8_RC. stdout: $(cat "$T8_OUT") stderr: $(cat "$T8_ERR")"
+fi
+T8_RESULT="$(cat "$T8_OUT" | tr -d '\n')"
+case "$T8_RESULT" in
+  RAISED:PermissionError:*|RAISED:OSError:*)
+    smoke_log "T8 PASS: missing BRIDGE_CONTROLLER_UID → fail-closed raise $T8_RESULT"
+    ;;
+  CLEAN)
+    smoke_fail "T8 REGRESSION: missing BRIDGE_CONTROLLER_UID swallowed PermissionError (got 'CLEAN'). Without controller UID we cannot prove caller is isolated; gate must fail-closed."
+    ;;
+  *)
+    smoke_fail "T8: expected RAISED:PermissionError:* (fail-closed), got: '$T8_RESULT'. stderr: $(cat "$T8_ERR")"
+    ;;
+esac
 
 smoke_log "all tests PASS (#1165 Track C — Gap 7 hook + Gap 8 dispatcher recovery)"

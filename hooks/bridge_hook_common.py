@@ -298,6 +298,38 @@ def _current_isolation_mode() -> str:
     return mode or "shared"
 
 
+def _under_isolated_uid() -> bool:
+    """True only when the process is actually running as a non-controller
+    UID under an isolated agent's env.
+
+    Issue #1165 Track C r2 (codex BLOCKING): the original Gap 7 guard
+    keyed on ``current_isolated_agent()`` alone, which only inspects env
+    (``BRIDGE_AGENT_ID`` + ``BRIDGE_AGENT_ISOLATION_MODE=linux-user``).
+    That meant any process inheriting those vars — including the
+    controller itself, e.g. an upgrade/dispatcher run that re-exported
+    them — silently swallowed audit-write failures. The contract is
+    "only the isolated UID may no-op," so we additionally verify the
+    effective UID differs from the controller UID exported by
+    ``bridge-start.sh``. When ``BRIDGE_CONTROLLER_UID`` is missing
+    (legacy session, older controller, anything that pre-dates the
+    propagation) we fail-closed and treat the process as controller —
+    a real permission regression continues to surface as before.
+    """
+    if not current_isolated_agent():
+        return False
+    controller_uid_raw = os.environ.get("BRIDGE_CONTROLLER_UID", "").strip()
+    if not controller_uid_raw:
+        # Fail-closed: without the controller UID we cannot prove the
+        # caller is the isolated UID. Treat as controller so genuine
+        # permission errors still raise.
+        return False
+    try:
+        controller_uid = int(controller_uid_raw)
+    except ValueError:
+        return False
+    return os.geteuid() != controller_uid
+
+
 def write_audit(action: str, target: str, detail: dict[str, Any]) -> None:
     path = audit_log_path()
     record = {
@@ -321,16 +353,22 @@ def write_audit(action: str, target: str, detail: dict[str, Any]) -> None:
     # Same "check-then-skip rather than fail-with-traceback" pattern as
     # the recent v2-isolation fixes (#1145, #1151, #1155): when the
     # writer cannot satisfy the controller-only path AND the calling UID
-    # is a linux-user-isolated agent (not the controller), silently
-    # no-op. Controller-side callers retain the original raise-on-error
+    # is actually a non-controller isolated UID, silently no-op.
+    # Controller-side callers retain the original raise-on-error
     # behavior so a genuine logs-dir permission regression is still
     # surfaced (the controller is supposed to own the tree).
+    #
+    # r2 hardening: the gate is the *effective UID vs controller UID*,
+    # not just env presence. See ``_under_isolated_uid`` for the
+    # rationale — codex BLOCKING review #1167 caught the original
+    # env-only predicate swallowing controller-side failures whenever
+    # the iso env happened to be inherited.
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=True) + "\n")
     except (PermissionError, OSError):
-        if current_isolated_agent() is not None:
+        if _under_isolated_uid():
             return
         raise
 
