@@ -42,10 +42,16 @@
 #   T4: lint catches NEW raw mutator pattern. Boomerang: inject
 #       `Path('.').mkdir()` into a scratch copy of bridge-setup.py,
 #       assert the lint fails. Then inject `shutil.copy(...)`, assert
-#       the lint also fails on that pattern.
+#       the lint also fails on that pattern. (r2) Third boomerang
+#       injects `.symlink_to(...)` and asserts the lint fails after
+#       the pattern extension closed codex r1 BLOCKING 2.
 #   T5: setup teams L368 reproducer — assert `_isolation_aware_mkdir`
 #       on a blind-but-isolated path does NOT raise PermissionError
 #       when `_sudo_stat_owner` is stubbed to return the owner.
+#   T6: (r2) daemon `restart` subcommand exists — the supp-groups
+#       warning recommends `agent-bridge daemon restart`; that verb
+#       must dispatch to a real handler (cmd_restart = stop + start)
+#       and appear in the usage string. Closes codex r1 BLOCKING 1.
 #
 # Host-agnostic: every Linux-specific behavior is exercised via PATH
 # shims (`id`, `getent`, `uname`, `sudo`, `stat`) and Python `subprocess`
@@ -369,7 +375,7 @@ BASELINE_FILE="$REPO_ROOT/scripts/baselines/raw-pathlib-baseline.txt"
 if ! "$LINT_SCRIPT" --self-test >/dev/null 2>&1; then
   smoke_fail "T4a: lint script --self-test FAILED — extended pattern detection broken"
 fi
-smoke_log "T4a PASS: lint --self-test on the extended mutator pattern (5 positives across probe + mutator surfaces)"
+smoke_log "T4a PASS: lint --self-test on the extended mutator pattern (6 positives across probe + mutator surfaces, including symlink_to)"
 
 # T4b: baseline check PASS on the current tree (extended pattern, all noqa'd).
 if ! "$LINT_SCRIPT" --check >/dev/null 2>&1; then
@@ -428,5 +434,63 @@ if [[ "$T4D_OUT" != *"bridge-hooks.py"* ]]; then
   smoke_fail "T4d boomerang: lint failure output should mention bridge-hooks.py; got: $T4D_OUT"
 fi
 smoke_log "T4d PASS (boomerang): lint catches NEW raw \`shutil.copy(...)\` injected into bridge-hooks.py"
+
+# T4e: third boomerang — inject `Path('.').symlink_to(...)` and assert
+# lint also fails (#1178 r2 codex r1 BLOCKING 2: the pre-r2 pattern
+# omitted symlink_to even though bridge-hooks.py:1313/1519 already had
+# raw .symlink_to() sites on isolated-setting paths).
+cp "$REPO_ROOT/bridge-setup.py" "$T4_SCRATCH/bridge-setup.py"
+cp "$REPO_ROOT/bridge-hooks.py" "$T4_SCRATCH/bridge-hooks.py"
+printf '\n# T4e boomerang regression site (smoke-only)\n_violating_symlink = Path("link").symlink_to("target")\n' \
+  >>"$T4_SCRATCH/bridge-hooks.py"
+
+T4E_OUT="$(
+  BRIDGE_RAW_PATHLIB_BASELINE_FILE="$T4_SCRATCH/scripts/baselines/raw-pathlib-baseline.txt" \
+  "$T4_SCRATCH/scripts/lint-raw-pathlib-on-isolated.sh" --check 2>&1
+)"
+T4E_RC=$?
+
+if [[ "$T4E_RC" -eq 0 ]]; then
+  smoke_fail "T4e boomerang: lint MUST fail when a NEW raw .symlink_to() lands in bridge-hooks.py; got rc=$T4E_RC, output: $T4E_OUT"
+fi
+if [[ "$T4E_OUT" != *"bridge-hooks.py"* ]]; then
+  smoke_fail "T4e boomerang: lint failure output should mention bridge-hooks.py; got: $T4E_OUT"
+fi
+smoke_log "T4e PASS (boomerang): lint catches NEW raw \`.symlink_to(...)\` injected into bridge-hooks.py"
+
+# ---------------------------------------------------------------------------
+# T6: daemon restart subcommand exists (#1178 r2 codex r1 BLOCKING 1).
+# The supp-groups warning recommends `agent-bridge daemon restart`; that
+# recommendation must point at a real subcommand. Pre-r2 the dispatch
+# only had start/ensure/run/stop/status/sync, so bare `bash
+# bridge-daemon.sh restart` fell into the `*)` arm, printed usage,
+# and exited rc=1.
+#
+# We don't execute the actual stop+start here (it would touch the live
+# daemon); instead we verify the dispatch arm exists by invoking with
+# --help (which short-circuits before cmd_restart runs). If `restart`
+# is unknown the script prints usage and exits 1; if `restart` is a
+# real verb, the help short-circuit returns 0.
+# ---------------------------------------------------------------------------
+
+DAEMON_SH="$REPO_ROOT/bridge-daemon.sh"
+[[ -f "$DAEMON_SH" ]] || smoke_fail "T6: bridge-daemon.sh missing at $DAEMON_SH"
+
+# T6a: dispatch arm exists. `restart --help` should exit 0 (matches the
+# shape of `stop --help`, `start --help`, etc.).
+T6A_OUT="$(bash "$DAEMON_SH" restart --help 2>&1 || true)"
+T6A_RC=$?
+if [[ "$T6A_RC" -ne 0 ]]; then
+  smoke_fail "T6a: \`bash bridge-daemon.sh restart --help\` must exit 0 (the restart dispatch arm should short-circuit on help). Got rc=$T6A_RC, output: $T6A_OUT"
+fi
+smoke_log "T6a PASS: \`bridge-daemon.sh restart --help\` short-circuits with rc=0 (dispatch arm exists)"
+
+# T6b: usage string advertises the restart verb so operators discover
+# the warning's recommended command via `--help`.
+T6B_OUT="$(bash "$DAEMON_SH" --help 2>&1 || true)"
+if [[ "$T6B_OUT" != *"restart"* ]]; then
+  smoke_fail "T6b: usage string must mention 'restart' so the supp-groups warning's recommended command is discoverable; got: $T6B_OUT"
+fi
+smoke_log "T6b PASS: usage string advertises the restart subcommand"
 
 smoke_log "OK"

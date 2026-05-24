@@ -1310,7 +1310,7 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
     # there to avoid raising on the read probe).
     if _safe_path_check("is_symlink", settings_link, _settings_link_owner) or _safe_path_check("exists", settings_link, _settings_link_owner):
         settings_link.unlink()  # noqa: raw-pathlib-controller-only — gated by safe_path_check above; symlink/unlink need direct write access by design (sudo-backed reapply caller has it)
-    settings_link.symlink_to("settings.effective.json")
+    settings_link.symlink_to("settings.effective.json")  # noqa: raw-pathlib-controller-only — paired with the .unlink() above; needs direct write access on the isolated home, sudo-backed reapply caller has it (see #1178 r2)
 
     payload = {
         "isolated_home": str(isolated_home),
@@ -1516,7 +1516,7 @@ def cmd_link_shared_settings(args: argparse.Namespace) -> int:
         if not _safe_path_check("exists", settings_path, os_user):
             rel_target = os.path.relpath(shared_path, start=settings_path.parent)
             try:
-                settings_path.symlink_to(rel_target)
+                settings_path.symlink_to(rel_target)  # noqa: raw-pathlib-controller-only — guarded by try/except PermissionError with sudo ln fallback below (mirrors the .unlink() pattern at line 1504, see #1178 r2)
             except PermissionError:
                 if os_user is None:
                     raise

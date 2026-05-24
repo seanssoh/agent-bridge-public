@@ -9,7 +9,7 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 bridge_load_roster
 
 usage() {
-  echo "Usage: bash $SCRIPT_DIR/bridge-daemon.sh [--skip-plugin-liveness] <start|ensure|run|status|sync|stop [--force]>"
+  echo "Usage: bash $SCRIPT_DIR/bridge-daemon.sh [--skip-plugin-liveness] <start|ensure|run|status|sync|stop [--force]|restart [--force]>"
 }
 
 daemon_log_event() {
@@ -7437,6 +7437,33 @@ shift || true
 # and exits 0. ALSO defend the silently-dangerous case where the
 # operator types `daemon ensure --help` (or `daemon start --help`)
 # expecting help — historically the dispatcher consumed the verb,
+# Issue #1178 r2 (codex r1 BLOCKING 1, refs PR #1179 review): the daemon
+# supp-groups stale-set warning (`bridge_daemon_warn_if_supp_groups_stale`,
+# above) recommends `agent-bridge daemon restart` as part of the recovery
+# recipe. That recommendation must point at a real subcommand. The
+# existing dispatch had `start`, `ensure`, `stop`, `status`, `sync`,
+# `run`, `run-cron-worker` but no `restart`; bare `bash bridge-daemon.sh
+# restart` fell into the `*)` arm, printed usage, and exited rc=1.
+#
+# This wrapper implements the operator-natural verb as stop → start.
+# `cmd_stop` carries the active-agent guard (#314 Layer 3) and the
+# --force bypass; we pass remaining args through so `daemon restart
+# --force` (the documented warning-recipe form) reaches the guard the
+# same way `daemon stop --force` already does. If stop refuses, restart
+# refuses with the same rc (the operator must address the active-agent
+# state before retrying or pass --force). On a clean stop we call
+# `cmd_start` (not `cmd_run`); start is the public-facing async
+# entry point (forks a background daemon and returns), matching what
+# `agent-bridge daemon start` already does.
+cmd_restart() {
+  local stop_rc=0
+  cmd_stop "$@" || stop_rc=$?
+  if (( stop_rc != 0 )); then
+    return "$stop_rc"
+  fi
+  cmd_start
+}
+
 # matched `ensure)`, and called `cmd_start` unconditionally, starting
 # the daemon. Each verb now scans its remaining args for -h/--help/help
 # and prints usage instead of executing the cmd_*.
@@ -7489,6 +7516,13 @@ case "$CMD" in
       exit 0
     fi
     cmd_stop "$@"
+    ;;
+  restart)
+    if daemon_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
+    cmd_restart "$@"
     ;;
   status)
     if daemon_args_have_help "$@"; then

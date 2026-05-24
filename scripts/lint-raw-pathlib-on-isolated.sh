@@ -92,19 +92,26 @@ declare -a TARGETS=(
 #
 # Mutators: open-paren only (the calls may carry kwargs like
 # `parents=True, exist_ok=True` for `.mkdir`, or `missing_ok=True` for
-# `.unlink`, or positional args for `shutil.copy*` / `os.rename`). Match
-# the start of the call shape (`.mkdir(`, etc.) and let argument
-# matching extend naturally to the line's content; argv content does
-# not need to be re-validated by the pattern.
+# `.unlink`, or positional args for `shutil.copy*` / `os.rename` /
+# `.symlink_to`). Match the start of the call shape (`.mkdir(`, etc.)
+# and let argument matching extend naturally to the line's content;
+# argv content does not need to be re-validated by the pattern.
 #
 # `shutil.copy(` is matched separately so it does not also match
 # `shutil.copy2(` (the open-paren anchor would otherwise double-count).
 # Same for `os.remove(` vs `os.rename(`.
 #
+# `.symlink_to(` (#1178 r2 codex r1 BLOCKING 2): the pre-r2 pattern
+# omitted symlink mutators, leaving raw `path.symlink_to(target)` sites
+# in bridge-hooks.py unlinted even though they mutate isolated-setting
+# paths the same way `.unlink()` does. Adding it here closes that gap
+# and makes the lint catch future regressions across the full pathlib
+# mutator surface.
+#
 # The pattern is anchored to a non-identifier character so a function
 # definition like `def mkdir_unrelated(` does not trip the lint
 # (`def mkdir_unrelated(` does not contain `.mkdir(`).
-danger_pattern='\.(exists|is_file|is_dir|is_symlink|stat)\(\)|\.(mkdir|unlink|touch|rmdir)\(|shutil\.(copy|copy2|move|rmtree)\(|os\.(makedirs|remove|rename)\('
+danger_pattern='\.(exists|is_file|is_dir|is_symlink|stat)\(\)|\.(mkdir|unlink|touch|rmdir|symlink_to)\(|shutil\.(copy|copy2|move|rmtree)\(|os\.(makedirs|remove|rename)\('
 
 # Whitelist marker: a line with `# noqa: raw-pathlib-controller-only`
 # anywhere in it is skipped (deliberate controller-only call site).
@@ -140,7 +147,7 @@ list_sites() {
         # If the danger pattern is wrapped in backticks on this line, treat as docstring.
         # Simple heuristic: presence of "`...exists()`" / "`...is_dir()`" / "`...mkdir(`" etc.
         if (content ~ /`[^`]*\.(exists|is_file|is_dir|is_symlink|stat)\(\)/) next
-        if (content ~ /`[^`]*\.(mkdir|unlink|touch|rmdir)\(/) next
+        if (content ~ /`[^`]*\.(mkdir|unlink|touch|rmdir|symlink_to)\(/) next
         if (content ~ /`[^`]*shutil\.(copy|copy2|move|rmtree)\(/) next
         if (content ~ /`[^`]*os\.(makedirs|remove|rename)\(/) next
         # Also skip lines that are clearly inside docstring blocks
@@ -254,6 +261,7 @@ run_self_test() {
     """Docstring mentioning `path.exists()` — should NOT match either."""
     """Docstring mentioning `path.mkdir(parents=True)` — should NOT match."""
     """Docstring mentioning `shutil.copy2(a, b)` — should NOT match."""
+    """Docstring mentioning `link.symlink_to("x")` — should NOT match."""
 def foo():
     return path.exists()
 def bar():
@@ -269,19 +277,22 @@ def freem():
     shutil.copy2(src, dst)
 def garply():
     os.makedirs(path)
+def waldo():
+    link.symlink_to("target")
 PYEOF
 
   # Expected positives:
-  #   path.exists()    — line 6
-  #   entry.is_file()  — line 10
-  #   path.mkdir(...)  — line 13 (NEW #1178)
-  #   shutil.copy2     — line 17 (NEW #1178)
-  #   os.makedirs      — line 19 (NEW #1178)
-  # Filtered out: comment line, 3 docstring lines (backtick-wrapped),
-  # 2 whitelist-marked lines.
+  #   path.exists()       — line 7
+  #   entry.is_file()     — line 11
+  #   path.mkdir(...)     — line 14 (NEW #1178)
+  #   shutil.copy2        — line 18 (NEW #1178)
+  #   os.makedirs         — line 20 (NEW #1178)
+  #   link.symlink_to(...) — line 22 (NEW #1178 r2)
+  # Filtered out: comment line, 4 docstring lines (backtick-wrapped,
+  # including the new symlink_to docstring), 2 whitelist-marked lines.
   local got expected
   got="$(count_sites "$fixture")"
-  expected=5
+  expected=6
   if [[ "$got" != "$expected" ]]; then
     echo "[lint-raw-pathlib-on-isolated] SELF-TEST FAIL: expected $expected, got $got" >&2
     echo "[lint-raw-pathlib-on-isolated] matches:" >&2
