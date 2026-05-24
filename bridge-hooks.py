@@ -28,6 +28,14 @@ from bridge_iso_paths import (  # noqa: E402
     safe_path_check as _safe_path_check,
     safe_read_env as _safe_read_env,
     safe_load_json as _safe_load_json,
+    # Phase 2 lift: pull the canonical realpath + ensure_dir helpers
+    # from the shared module. The local `_safe_realpath` and
+    # `_ensure_dir_with_sudo` wrappers below now delegate to these
+    # canonical names instead of re-implementing the sudo + fallback
+    # logic. A future bug fix on either side lands in ONE place
+    # (lib/bridge_iso_paths.py) rather than both files at once.
+    safe_realpath as _safe_realpath_canonical,
+    ensure_dir as _ensure_dir_canonical,
 )
 
 
@@ -1337,60 +1345,26 @@ def cmd_render_isolated_home_settings(args: argparse.Namespace) -> int:
 
 
 def _ensure_dir_with_sudo(path: Path, os_user: str | None) -> None:
-    # #1120 sub-A: function name promised sudo escalation but the body
-    # only reached sudo AFTER a controller-direct `path.mkdir(...)`
-    # raised PermissionError. On v2 isolation the parent dir
-    # (`<v2-root>/<agent>/` is `root:ab-agent-<slug> 2750`) blocks
-    # controller writes, so the direct mkdir always raised and the
-    # caller printed a Python traceback before the sudo fallback even
-    # got a chance to silence it on its own line.
-    #
-    # Contract:
-    #   - If `os_user` is None, attempt a best-effort recovery via
-    #     `_isolated_workdir_owner(path)`. Callers that don't already
-    #     know the isolation owner (e.g. callers that derive the path
-    #     from a configuration field without consulting the workdir
-    #     stat) can pass None and still get sudo-first routing on
-    #     isolated trees. Returns None on non-Linux hosts and on
-    #     controller-owned paths, in which case the function preserves
-    #     the original controller-direct `mkdir` shape — byte-for-byte
-    #     unchanged for shared-mode agents.
-    #   - If `os_user` resolves to a name that is NOT the current
-    #     process user, route through `sudo -n -u <os_user> mkdir -p
-    #     <path>` FIRST. The isolated UID owns
-    #     `<v2-root>/<agent>/workdir/` (mode 2770) so creating
-    #     `<workdir>/.claude/` under it succeeds without controller
-    #     intervention. On success, return cleanly (no PermissionError
-    #     raised at all → no traceback).
-    #   - If sudo escalation is unavailable (`_sudo_run_as` rc 127,
-    #     non-Linux dev host) or fails (typically because an ancestor
-    #     dir denies group write — e.g. `<v2-root>/<agent>/` mode 2750
-    #     where the iso UID is in the group but cannot write, the
-    #     #1145 shape), fall back to a controller-direct
-    #     `path.mkdir(parents=True, exist_ok=True)`. On v2 isolation
-    #     that controller-direct mkdir will itself fail with
-    #     PermissionError — re-raise so the caller sees a real error
-    #     rather than silent partial state. The caller is responsible
-    #     for try/except OSError to surface a structured warning
-    #     (#1145, #1119 / PR #1124 pattern).
+    """`mkdir -p` with isolation awareness.
+
+    Phase 2: the sudo-first / controller-direct fallback logic moved
+    to `bridge_iso_paths.ensure_dir`. This wrapper preserves the
+    hooks-side contract where callers can pass `os_user=None` and
+    expect a best-effort `_isolated_workdir_owner(path)` recovery
+    BEFORE delegation. The canonical helper takes the resolved owner
+    as input — pre-Phase 2 the resolution happened inside the local
+    helper, which made it impossible to share with bridge-setup.py
+    (whose `_isolation_aware_mkdir` does its own
+    `_resolve_isolated_owner_for_path` walk upstream).
+
+    Behavior unchanged: on a v2 isolation tree the sudo-first route
+    succeeds without raising; on a controller-owned tree the direct
+    `mkdir` runs. PermissionError on the controller-direct fallback
+    propagates so callers can structure-warn.
+    """
     if os_user is None:
         os_user = _isolated_workdir_owner(path)
-    current_user = ""
-    try:
-        import pwd
-        current_user = pwd.getpwuid(os.getuid()).pw_name
-    except (KeyError, ImportError):
-        current_user = ""
-    if os_user is not None and os_user != current_user:
-        rc = _sudo_run_as(os_user, "mkdir", "-p", str(path))
-        if rc == 0:
-            return
-        # Fall through to controller-direct attempt. This succeeds when
-        # the path is actually controller-owned (mis-detection of iso
-        # ownership via a group-only signature on a controller-owned
-        # tree, etc.). When it fails with PermissionError we let it
-        # propagate — better surface a real error than fail silently.
-    path.mkdir(parents=True, exist_ok=True)  # noqa: raw-pathlib-controller-only — sudo-first branch above already tried iso escalation; this is the documented controller-direct fallback
+    _ensure_dir_canonical(path, os_user)
 
 
 # #1175: `_safe_path_check` moved to `lib/bridge_iso_paths.py`
@@ -1407,26 +1381,14 @@ def _ensure_dir_with_sudo(path: Path, os_user: str | None) -> None:
 def _safe_realpath(path: Path, os_user: str | None) -> str:
     """PermissionError-safe `os.path.realpath` for isolated workdirs.
 
-    Companion to `_safe_path_check`. `os.path.realpath` resolves symlinks
-    by stat-ing each component; on an isolated workdir the controller
-    can hit PermissionError mid-resolution. Fall back to
-    `sudo -n -u <agent-user> readlink -f`. Returns the original path
-    string when the sudo fallback also fails (best-effort — the caller
-    compares two realpaths for equality, so falling back to the raw
-    string just forces the "not equal" branch and re-creates the link).
+    Phase 2: thin delegating wrapper around
+    `bridge_iso_paths.safe_realpath`. The canonical implementation
+    lives in `lib/bridge_iso_paths.py` so a fix to the sudo-fallback
+    shape lands in ONE place. Kept here under the historical private
+    name so existing call sites and any local stub harnesses work
+    unchanged.
     """
-    try:
-        return os.path.realpath(path)
-    except PermissionError:
-        if os_user is None:
-            raise
-        result = subprocess.run(
-            ["sudo", "-n", "-u", os_user, "readlink", "-f", str(path)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        return result.stdout.strip() or str(path)
+    return _safe_realpath_canonical(path, os_user)
 
 
 def cmd_link_shared_settings(args: argparse.Namespace) -> int:
