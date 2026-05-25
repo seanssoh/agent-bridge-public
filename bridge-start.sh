@@ -573,6 +573,100 @@ if [[ "$ENGINE" == "claude" && $SAFE_MODE -eq 0 ]]; then
   fi
 fi
 
+# Issue #1190/#1191 (beta22, codex r1 — 2026-05-25): idempotent start-time
+# hook for bundled plugins (plugins/teams, plugins/ms365, …) that ship a
+# `package.json`. The helper
+# `bridge_provision_bundled_plugins_node_modules` (lib/bridge-channels.sh)
+# was previously invoked only from `bridge-setup.sh run_teams()` and
+# `bridge-upgrade.sh` — meaning a fresh install path that never ran setup
+# or upgrade (e.g. operator added a plugin: channel via `agent create`
+# alone) reaches first launch with missing `node_modules`, and the MCP
+# server later fails with "Cannot find module ...".
+#
+# Runs BEFORE the isolation prep + bridge-run.sh exec so the shared
+# `plugins/<id>/node_modules` tree is in place by the time the iso-side
+# dev-plugin-cache copies it into /home/<iso>/.claude/plugins/cache/<…>.
+#
+# Idempotent: the helper's staleness check at lib/bridge-channels.sh:848-863
+# skips work when the existing node_modules is newer than both package.json
+# and bun.lock. The chmod widen always runs so iso UIDs can read.
+#
+# Fail-closed when an agent declares a plugin: channel that maps to a
+# bundled plugin (plugins/<id>) which has package.json AND bun is
+# unavailable: per brief, "don't let MCP startup fail later with
+# module-not-found". Operator guidance: install bun, or remove the
+# bundled plugin channel.
+#
+# Best-effort otherwise: a `bun install` failure inside the helper still
+# warns + returns nonzero, but we keep launching (the agent may still be
+# useful with degraded plugin functionality, and the operator can
+# recover via `agb setup teams`).
+#
+# Skips entirely when no plugin: channels are declared.
+if [[ $DRY_RUN -eq 0 ]]; then
+  _bundled_chan_csv="$(bridge_agent_channels_csv "$AGENT" 2>/dev/null || true)"
+  if [[ "$_bundled_chan_csv" == *plugin:* ]]; then
+    # Determine which bundled plugins the agent's channels actually
+    # require (have a package.json on disk). teams is covered by the
+    # teams-specific helper invoked from setup; ms365 / future bundled
+    # plugins go through bridge_provision_bundled_plugins_node_modules.
+    _bundled_required=""
+    _IFS_save="$IFS"
+    IFS=','
+    for _tok in $_bundled_chan_csv; do
+      _tok="${_tok// /}"
+      [[ "$_tok" == plugin:*@agent-bridge ]] || continue
+      _name="${_tok#plugin:}"
+      _name="${_name%@agent-bridge}"
+      # Only the bundled plugin types that actually have package.json
+      # under $BRIDGE_SCRIPT_DIR/plugins/ count toward "required".
+      if [[ -f "$BRIDGE_SCRIPT_DIR/plugins/$_name/package.json" ]]; then
+        _bundled_required="${_bundled_required:+$_bundled_required,}$_name"
+      fi
+    done
+    IFS="$_IFS_save"
+    unset _IFS_save _tok _name
+
+    if [[ -n "$_bundled_required" ]]; then
+      # bun preflight — fail closed for channel-required bundled plugins
+      # when bun is missing. The agent's declared channels would later
+      # crash the MCP servers with module-not-found if we let start
+      # proceed without node_modules.
+      _bun_bin=""
+      if declare -F bridge_resolve_bun_executable >/dev/null 2>&1; then
+        _bun_bin="$(bridge_resolve_bun_executable 2>/dev/null || true)"
+      fi
+      if [[ -z "$_bun_bin" ]]; then
+        bridge_audit_log state bundled_plugin_runtime_missing_bun "$AGENT" \
+          --field channels="$_bundled_chan_csv" \
+          --field required_bundled="$_bundled_required" >/dev/null 2>&1 || true
+        bridge_die "agent '$AGENT' declares bundled plugin channels ($_bundled_required) that require a node_modules tree under \$BRIDGE_SCRIPT_DIR/plugins/, but \`bun\` is not on PATH. Install bun (\`agb setup teams\` provisions it) or remove the bundled plugin channel(s) from this agent."
+      fi
+      # Run BOTH provisioners. The general helper SKIPS the `teams`
+      # plugin (covered by the teams-specific helper at
+      # lib/bridge-channels.sh:580), so we must invoke that separately
+      # when the agent declares plugin:teams@agent-bridge. Order matters
+      # only for log clarity — the two helpers operate on disjoint
+      # plugin trees.
+      case ",$_bundled_required," in
+        *,teams,*)
+          if declare -F bridge_install_teams_plugin_node_modules >/dev/null 2>&1; then
+            bridge_install_teams_plugin_node_modules 0 "$_bun_bin" || \
+              bridge_warn "teams plugin node_modules provisioning returned nonzero — see warns above; the agent will still launch but Teams MCP may fail until the operator runs \`agb setup teams\`."
+          fi
+          ;;
+      esac
+      if declare -F bridge_provision_bundled_plugins_node_modules >/dev/null 2>&1; then
+        bridge_provision_bundled_plugins_node_modules 0 "$_bun_bin" || \
+          bridge_warn "bundled plugin node_modules provisioning returned nonzero — see warns above; the agent will still launch but MCP for one or more bundled plugins may fail until the operator runs \`agb setup teams\`."
+      fi
+      unset _bun_bin
+    fi
+    unset _bundled_required
+  fi
+  unset _bundled_chan_csv
+fi
+
 if bridge_isolation_disabled_by_env; then
   bridge_warn "BRIDGE_DISABLE_ISOLATION=1 — skipping v2 isolation prep for '$AGENT' (security boundary disabled, agent will run as controller UID without sudo wrap or per-agent env file)"
 elif bridge_agent_linux_user_isolation_effective "$AGENT"; then
@@ -731,6 +825,34 @@ if [[ $SUDO_WRAP_ACTIVE -eq 1 ]]; then
   SUDO_WRAPPED_CMD+=" -- $(printf '%q' "$BRIDGE_BASH_BIN") -lc $(printf '%q' "$SESSION_CMD")"
   SESSION_CMD="$SUDO_WRAPPED_CMD"
 elif [[ -n "$SUDO_WRAP_OS_USER" && -n "$SUDO_WRAP_FALLBACK_REASON" && $DRY_RUN -eq 0 ]]; then
+  # L1-D Part A (beta22, #1196 sequel — codex r1 root-cause re-diagnosis,
+  # 2026-05-25): when the agent declares plugin: channels, the runner
+  # binds dev-plugin-cache to /home/<iso>/.claude/plugins via the iso
+  # HOME resolved by bridge-run.sh. If sudo-wrap is unavailable here, the
+  # SESSION_CMD continues to run as the controller UID but
+  # bridge-run.sh's `BRIDGE_CLAUDE_CONFIG_DIR` resolution will still point
+  # at the iso UID's HOME — so a controller-side dev-plugin-cache write
+  # tree-walks into root-owned /home/<iso>/.claude/plugins and trips
+  # EPERM on os.rename. That is exactly the L1-D symptom (patch agent
+  # report 2026-05-24): plugin-channel iso agent first-start, no
+  # operator chmod/sudo, wedges silently on EPERM. The legacy fallback
+  # path swallowed the actual blocker into a warn and let bridge-run.sh
+  # exec the controller into the iso HOME tree.
+  #
+  # Fail closed BEFORE the launch exec when plugin channels are declared.
+  # For non-plugin channel agents (or no channels at all) the legacy
+  # warn+fall-through path is preserved — shared-mode launch is harmless
+  # if no controller process targets the iso HOME plugin tree.
+  _l1d_chan_csv="$(bridge_agent_channels_csv "$AGENT" 2>/dev/null || true)"
+  if [[ "$_l1d_chan_csv" == *plugin:* ]]; then
+    bridge_audit_log state linux_user_sudo_unavailable_plugin_channels_fail_closed "$AGENT" \
+      --field os_user="$SUDO_WRAP_OS_USER" \
+      --field reason="$SUDO_WRAP_FALLBACK_REASON" \
+      --field channels="$_l1d_chan_csv" >/dev/null 2>&1 || true
+    unset _l1d_chan_csv
+    bridge_die "linux-user isolation for '$AGENT' has plugin: channels but UID switch is unavailable: $SUDO_WRAP_FALLBACK_REASON. Continuing as the controller UID would point dev-plugin-cache at /home/<iso>/.claude/plugins and trip EPERM on os.rename (L1-D root cause, codex r1 2026-05-25). Choose ONE of: (a) enable passwordless sudo for the iso UID — run \`agent-bridge isolate $AGENT --install-sudoers\` (Linux); (b) remove plugin: channels from this agent and re-run \`agent create\`; (c) use shared-mode isolation (BRIDGE_DISABLE_ISOLATION=1 in the agent env, security boundary disabled)."
+  fi
+  unset _l1d_chan_csv
   bridge_warn "linux-user isolation requested for '$AGENT' but UID switch unavailable: $SUDO_WRAP_FALLBACK_REASON. Falling back to shared-mode launch. Run 'agent-bridge isolate $AGENT --install-sudoers' or configure sudoers manually (see docs/linux-host-acceptance.md)."
   bridge_audit_log state linux_user_sudo_unavailable "$AGENT" \
     --field os_user="$SUDO_WRAP_OS_USER" \
