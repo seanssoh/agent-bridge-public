@@ -6,6 +6,142 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta23] — 2026-05-26
+
+### Highlight — `bridge_iso_run` unified facade + 4-commit Option A convergence
+
+Operator-cued **twenty-third prerelease**. Closes a 1-week
+regression bomb (beta9 → beta22, controller-blind family) by routing every
+controller→isolated-agent boundary read, write, mkdir, stat, and root-publish
+operation through a single audited helper. Single PR (#1200) — codex
+pair-review took two rounds: r1 surfaced a path-allowlist escape
+(lexical-only gate bypassable via `..` or symlink ancestor, including for
+`publish-root-file` root-published writes); r2 verified the canonicalization
+fix closes all 5 escape vectors with rc=40 and target files NOT created.
+
+iso v2 contract preserved byte-for-byte: NO ACL, NO `ab-shared` group
+relaxation, NO shared-mode, NO group changes. The helper exposes two
+execution classes behind one facade — agent ops (`sudo -n -u <iso-uid>`) for
+agent-owned runtime files, and root-publish ops for `root:ab-agent-<X> 0640`
+metadata (`installed_plugins.json`, `known_marketplaces.json`) so the
+isolated UID still cannot rewrite its own plugin allowlist.
+
+`-beta23` prerelease; matching tag `v0.14.5-beta23`, GitHub release marked
+**Pre-release**. Stay on beta per Sean's standing rule.
+
+### Added — `bridge_iso_run` unified facade (#1200)
+
+- **`lib/bridge-isolation-helpers.sh:bridge_iso_run`** — single helper with
+  12 ops: `stat`, `read-file`, `read-json`, `env-has-any-key`,
+  `read-env-key`, `mkdir-p`, `atomic-write`, `rename`, `state-marker-write`,
+  `scan-profile`, `publish-root-file`, `publish-root-symlink`. Structured rc
+  band (`0` success / `10` not-isolated / `20` sudo-unavailable / `30` absent
+  / `31` semantic-missing-key / `32` unreadable-even-to-iso / `40`
+  unsafe-path).
+- **Canonicalized path allowlist** (R2) — `..` segments rejected before
+  canonicalization (operator-readable error signal). Canonical allowlist
+  roots resolved once via `realpath` / `python3 -c
+  os.path.realpath(...)` / `cd -P` fallback chain (macOS BSD compatible).
+  For not-yet-created destinations the deepest existing ancestor is
+  canonicalized and the tail is re-checked for `..` / symlink-ancestor
+  escapes. Applied BEFORE `publish-root-file` / `publish-root-symlink`
+  reach the root-published `mktemp/tee/chown/chmod/mv` chain.
+- **Path allowlist roots**: `bridge_agent_workdir`,
+  `bridge_agent_default_home`, `bridge_agent_linux_user_home`,
+  `bridge_agent_idle_marker_dir`, plus `BRIDGE_ISO_RUN_ALLOWLIST_EXTRA` for
+  smoke harness only.
+- **CLI shim**: `agent-bridge iso-run --agent <a> --op <op> ...` (Python
+  callers route through this; never reimplement sudo/path logic in
+  Python).
+- **Python adapter**: `lib/bridge_iso_paths.py:iso_run(agent, op, ...)` —
+  pure `subprocess.run` shim to the CLI.
+- **Footgun #11 compliance**: every op script is single-quoted bash with
+  pipe-only stdin. No heredoc-stdin, no `<<<` here-string, no
+  process-substitution capture in the helper body.
+
+### Migrated — channel credential/status callsites (#1200)
+
+- `bridge_channel_env_file_readiness`, `bridge_channel_access_file_present`,
+  `bridge_agent_plugin_port_from_env_file`, `bridge_init_runtime_present`
+  now route through `bridge_iso_run`. The #1196 beta22 codepath (`rc=20` /
+  undefined-rc → controller-blind) is preserved byte-for-byte under the
+  new rc band: rc 31 = semantic missing-key, rc 32 = unreadable from iso
+  UID.
+- Removed 6 stale `migrate isolation v3 --check` controller-blind operator
+  guidance messages — Option A's only recovery surface is the
+  passwordless sudoers entry.
+
+### Removed — shared-mode escape-hatch (#1200)
+
+- `bridge-start.sh` no longer suggests `BRIDGE_DISABLE_ISOLATION=1` as
+  remediation option (c) on plugin-channel readiness failures. Shared-mode
+  was rejected by the final contract (cross-agent token leak: cosmax-crm
+  OAuth, ms365 client secret).
+
+### Added — regression gate (#1200)
+
+- `scripts/iso-helper-ratchet.sh` — baseline-by-count `rg` sweep on
+  tracked source for raw `.env` / `access.json` /
+  `installed_plugins.json` / `known_marketplaces.json` / `webhook-port` /
+  `settings.effective.json` / `agent-env.sh` references. New raw callsites
+  fail PR. Baseline at `scripts/baselines/iso-helper-baseline.txt`,
+  whole-file allowlist at `scripts/baselines/iso-helper-allowlist.txt`.
+  Wired into `scripts/oss-preflight.sh`. Sister to existing
+  `scripts/lint-heredoc-ban.sh` + `scripts/lint-raw-pathlib-on-isolated.sh`.
+- `scripts/iso-helper-smoke.sh` — 25 unit tests covering allowlist gate
+  variants, all 12 ops, CLI shim, Python adapter round-trip, 5 escape
+  vectors (`..` traversal, symlink ancestor, not-yet-created destination,
+  publish-root-file dotdot escape, publish-root-symlink via symlink
+  ancestor — all expecting rc=40 with target file NOT created).
+- `docs/developer-handover.md` Section 8 — public contract reference.
+
+### Compatibility wrappers (#1200) — accepted by codex r2
+
+Documented in helper docstrings + PR body; the ratchet baseline freezes
+existing raw-boundary footprint so new callsites MUST use `bridge_iso_run`:
+
+- Plugin catalog/manifest writers
+  (`bridge_write_isolated_known_marketplaces_catalog`,
+  `bridge_write_isolated_installed_plugins_manifest`,
+  `bridge_linux_share_plugin_catalog`,
+  `bridge-plugins.sh:bridge_plugins_seed_propagate_iso_known_marketplaces`,
+  `bridge-dev-plugin-cache.py:ensure_known_marketplace_for_root`,
+  `bridge-dev-plugin-cache.py:_update_installed_plugins_manifest`) — retain
+  inline `mktemp + python + chown + chgrp + chmod + mv -f` chain because
+  refactoring through `publish-root-file` would not safely transport the
+  `flock` + lock-on-same-fd patterns (especially the dev-plugin-cache
+  locking pattern whose lock fd must outlive the python invocation).
+- Watchdog/hooks/skills writers (`bridge-watchdog.py:scan_agent`,
+  `bridge-hooks.py:cmd_render_isolated_home_settings`,
+  `lib/bridge-hooks.sh:bridge_install_isolated_home_settings`,
+  `lib/bridge-skills.sh:bridge_isolated_home_install_one_skill`,
+  `lib/bridge-skills.sh:bridge_ensure_project_claude_guidance`) — already
+  route through `bridge_linux_sudo_root` + the same controller-side
+  `mktemp + chmod + chown + mv` chain. Refactoring would change behavior
+  under sudo-policy expiry mid-chain without behavioral improvement.
+- `bridge-discord-relay.py:load_dm_allowlist` + DM fanout — multi-agent
+  iteration scope exceeded the safe single-PR budget. Captured in the
+  ratchet baseline for future migration.
+
+### Fixed — nudge duplicate firing (#1199)
+
+- **`bridge-run.sh`** — inbox-bootstrap inject path now records the nudge
+  via `bridge_task_note_nudge` after the `bridge_tmux_send_and_submit`
+  call. Previously the inject path wrote no nudge audit row, so the
+  daemon's next nudge tick saw empty `last_nudge_key`, computed
+  `has_new_queue_ids=True`, and re-fired the same nudge — observed as
+  spam during agent first-start. Tactical 5-LOC fix pushed direct to
+  `stabilize/v0.14.5-vm-passes` (commit `c09383f`) to unblock beta23 cut
+  without bundling into the larger #1200 PR.
+
+### Notes
+
+- #959 (Claude Code MCP notification handler wake bug) is **NOT** addressed
+  by this release. External Anthropic bug. `TEAMS_DELIVERY_MODE=bridge`
+  remains the production path; channel mode may be less likely to fail
+  from local state/permission bugs after Option A but the wake gap is
+  unchanged.
+
 ## [0.14.5-beta22] — 2026-05-25
 
 ### Highlight — channel-validator controller-blind + L1-D fail-closed + A2A deliver tick + bundled-plugin start hook
