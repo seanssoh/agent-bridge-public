@@ -330,6 +330,21 @@ def _under_isolated_uid() -> bool:
     return os.geteuid() != controller_uid
 
 
+def under_isolated_uid() -> bool:
+    """Public wrapper for :func:`_under_isolated_uid`.
+
+    Hook modules outside ``bridge_hook_common`` (e.g. ``tool-policy.py``)
+    need the same effective-UID gate when they encounter a PermissionError
+    that is part of the iso v2 contract (controller-only-readable agent
+    home root, controller-only-writable state tree). Re-exporting the
+    private helper as a public symbol keeps the gate behind a single
+    SSOT — callers must NOT roll their own env-only predicate, which is
+    exactly the regression codex caught on issue #1167 (#1165 Track C r2).
+    See :func:`_under_isolated_uid` for the rationale on every branch.
+    """
+    return _under_isolated_uid()
+
+
 def write_audit(action: str, target: str, detail: dict[str, Any]) -> None:
     path = audit_log_path()
     record = {
@@ -895,13 +910,45 @@ def load_timestamp_state(agent: str) -> dict[str, int]:
 
 
 def save_timestamp_state(agent: str, payload: dict[str, int]) -> None:
+    # Issue #1205 Family B: the timestamp state path resolves to
+    # ``$BRIDGE_HOME/state/agents/<agent>/timestamp.json`` (parent mode
+    # ``drwx--x--x`` under iso v2). The isolated UID has no permission to
+    # mkdir / write into that controller-owned tree, so the entire write
+    # sequence (mkdir + temp write + chmod + replace + final chmod) can
+    # raise PermissionError or OSError at any step. Wrap the whole
+    # sequence and fail-open only when the calling UID is actually a
+    # non-controller iso UID — controller-side callers still raise so a
+    # genuine permission regression continues to surface. The advisory
+    # timestamp context (prompt_timestamp_context, remember_session_start)
+    # is intentionally non-critical; silently no-op under iso is the
+    # correct behavior until the controller-proxy gateway wave lands.
     path = timestamp_state_path(agent)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
-    os.chmod(path, 0o600)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(path)
+        os.chmod(path, 0o600)
+    except (PermissionError, OSError):
+        if _under_isolated_uid():
+            # Opportunistic audit attempt — best-effort, no stderr noise.
+            # write_audit() is already iso-UID-aware (#1165 Gap 7) so
+            # this call is safe to make under iso: it will no-op silently
+            # if the audit log path is also unwritable. No re-raise.
+            try:
+                write_audit(
+                    "hook_permission_fail_open.timestamp_state",
+                    str(path),
+                    {
+                        "operation": "save_timestamp_state",
+                        "isolation_mode": _current_isolation_mode(),
+                    },
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never block hooks
+                pass
+            return
+        raise
 
 
 def agent_timestamp_enabled(agent: str) -> bool:
