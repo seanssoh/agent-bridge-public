@@ -209,6 +209,26 @@ export PATH="$HOME/.local/bin:$HOME/.nix-profile/bin:/usr/local/bin:$PATH"
 export BRIDGE_AGENT_ID="$AGENT"
 export BRIDGE_ADMIN_AGENT_ID="$(bridge_admin_agent_id)"
 export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
+# Issue #1213 (known limitation, deferred to beta27): both
+# BRIDGE_AGENT_ISOLATION_MODE and BRIDGE_AGENT_OS_USER share their
+# names with associative arrays declared in lib/bridge-agents.sh:3410
+# and lib/bridge-state.sh:1008. Bash silently no-ops a scalar export
+# of a name bound to an assoc array (no error, ARR=value writes to
+# ARR[0] and `export ARR` refuses to export the array), so the
+# scalar values below never reach the child env. The Python hook
+# layer worked around this in #1213 by switching its predicates
+# off the mode-string env var to a UID-based check
+# (`_current_agent_under_foreign_uid`); see
+# hooks/bridge_hook_common.py:_current_agent_under_foreign_uid.
+# BRIDGE_AGENT_INJECT_TIMESTAMP on line 221 below is the same
+# class of bug (assoc array in lib/bridge-core.sh:867 vs scalar
+# export). The fail mode there is much milder — the hook at
+# bridge_hook_common.py:1017 falls open to the default-true
+# inject_timestamp behavior — so a fix is deferred to beta27
+# rather than expanded into the #1213 scope.
+# DO NOT `unset` either array name as a workaround: downstream
+# array readers in bridge-run.sh and lib/* expect the lookup table
+# to remain populated.
 export BRIDGE_AGENT_ISOLATION_MODE="$(bridge_agent_isolation_mode "$AGENT")"
 export BRIDGE_AGENT_OS_USER="$(bridge_agent_os_user "$AGENT")"
 # Issue #539: privilege class consumed by hooks/tool-policy.py to gate
