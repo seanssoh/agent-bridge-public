@@ -165,6 +165,52 @@ C5_RESULT="$out"
 if [[ "$out" == "controller-blind" ]]; then ok; else err "got '$out'"; fi
 chmod 600 "$F5"
 
+# --- C5b (#1196 beta22): outer sudo OK, inner run-helper raced rc=2 ---------
+# Codex r1 spec: bridge_isolation_can_sudo_to_agent succeeds (passwordless
+# sudo is configured), but the inner sudo-pre-flight inside
+# bridge_isolation_run_as_agent_user_via_bash returns 2 (transient sudoers
+# reload / ticket expiry / policy race between the two probes). The agent
+# IS isolated; we just cannot prove readiness on THIS probe. Expected
+# readiness = "controller-blind"; the channel must stay out of
+# bridge_agent_missing_channels_csv.
+step "C5b: isolated + outer sudo OK + run-helper rc=2 -> controller-blind (#1196)"
+F5B="$TMP_HOME/c5b.env"
+printf 'DISCORD_BOT_TOKEN=zzz\n' >"$F5B"
+chmod 000 "$F5B"
+# Build a stub combo: outer can_sudo says OK, inner run-helper says rc=2.
+# shellcheck disable=SC2329
+bridge_agent_linux_user_isolation_effective() { return 0; }
+# shellcheck disable=SC2329
+bridge_agent_os_user() { printf 'fake-user'; }
+# shellcheck disable=SC2329
+bridge_isolation_can_sudo_to_agent() { return 0; }
+# shellcheck disable=SC2329
+bridge_isolation_run_as_agent_user_via_bash() { return 2; }
+out="$(bridge_channel_env_file_readiness agent-test plugin:discord "$F5B" DISCORD_BOT_TOKEN)"
+if [[ "$out" == "controller-blind" ]]; then ok; else err "got '$out'"; fi
+chmod 600 "$F5B"
+
+# --- C5c (#1196 beta22): outer sudo OK, inner run-helper undefined rc -------
+# Codex r1: any other impossible probe error from an isolated agent should
+# prefer controller-blind + diagnostic over missing/unreadable. False-
+# negative channel miss is the exact regression we are closing here. Use
+# rc=99 (script-side internal error band, > 4) to exercise the `*)` arm.
+step "C5c: isolated + outer sudo OK + run-helper rc=99 -> controller-blind (#1196)"
+F5C="$TMP_HOME/c5c.env"
+printf 'DISCORD_BOT_TOKEN=zzz\n' >"$F5C"
+chmod 000 "$F5C"
+# shellcheck disable=SC2329
+bridge_agent_linux_user_isolation_effective() { return 0; }
+# shellcheck disable=SC2329
+bridge_agent_os_user() { printf 'fake-user'; }
+# shellcheck disable=SC2329
+bridge_isolation_can_sudo_to_agent() { return 0; }
+# shellcheck disable=SC2329
+bridge_isolation_run_as_agent_user_via_bash() { return 99; }
+out="$(bridge_channel_env_file_readiness agent-test plugin:discord "$F5C" DISCORD_BOT_TOKEN)"
+if [[ "$out" == "controller-blind" ]]; then ok; else err "got '$out'"; fi
+chmod 600 "$F5C"
+
 # --- C6: status mapping: controller-blind reason -> "unknown" ----------------
 step "C6: bridge_agent_channel_status returns 'unknown' for controller-blind reason"
 STUB_REQUIRED_CSV="plugin:discord"
@@ -281,6 +327,44 @@ else
   err "missing='$missing_out' ready='$ready_out' blind='$blind_out' (expected missing=empty ready=empty blind=plugin:discord)"
 fi
 chmod 600 "$F9"
+
+# --- C9b (#1196 beta22): same as C9 but with outer sudo OK + inner rc=2 ----
+# Codex r1: this is the actual L1-A regression path. The OUTER
+# bridge_isolation_can_sudo_to_agent says sudo is OK (returns 0), but
+# the INNER pre-flight inside bridge_isolation_run_as_agent_user_via_bash
+# races (returns rc=2 — transient sudoers reload / ticket expiry / policy
+# fault). Before the beta22 fix this fell through to the unreadable branch
+# and the channel hard-rejected restart via bridge_agent_missing_channels_csv.
+# Expected: missing=empty, ready=empty, blind=plugin:discord (channel
+# excluded from restart hard-reject, status maps to unknown).
+step "C9b: bridge_agent_missing_channels_csv excludes inner-race controller-blind (#1196)"
+F9B="$C9_DIR/.env"  # reuse C9 dir; same dotenv path
+printf 'DISCORD_BOT_TOKEN=zzz\n' >"$F9B"
+chmod 000 "$F9B"
+# Outer says OK, inner races.
+# shellcheck disable=SC2329
+bridge_agent_linux_user_isolation_effective() { return 0; }
+# shellcheck disable=SC2329
+bridge_agent_os_user() { printf 'fake-user'; }
+# shellcheck disable=SC2329
+bridge_isolation_can_sudo_to_agent() { return 0; }
+# shellcheck disable=SC2329
+bridge_isolation_run_as_agent_user_via_bash() { return 2; }
+# Channels CSV stays plugin:discord.
+# shellcheck disable=SC2329
+bridge_agent_channels_csv() { printf '%s' 'plugin:discord'; }
+# shellcheck disable=SC2329
+bridge_agent_channel_runtime_ready_for_item() { return 1; }
+
+missing_out="$(bridge_agent_missing_channels_csv agent-test)"
+ready_out="$(bridge_agent_ready_channels_csv agent-test)"
+blind_out="$(bridge_agent_controller_blind_channels_csv agent-test)"
+if [[ "$missing_out" == "" && "$ready_out" == "" && "$blind_out" == "plugin:discord" ]]; then
+  ok
+else
+  err "missing='$missing_out' ready='$ready_out' blind='$blind_out' (expected missing=empty ready=empty blind=plugin:discord)"
+fi
+chmod 600 "$F9B"
 
 # --- C10: diagnostics renderer shape (controller-blind ↔ ready=indeterminate)
 # Light-touch: we just confirm the readiness function's output is one of the

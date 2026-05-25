@@ -180,26 +180,85 @@ def cmd_send(args: argparse.Namespace) -> int:
 # a2a outbox
 # --------------------------------------------------------------------------
 
+def _format_seconds(s: int) -> str:
+    """Compact text form for staleness fields. 90 -> '1m', 7200 -> '2h'."""
+    if s < 0:
+        s = 0
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
 def cmd_outbox(args: argparse.Namespace) -> int:
     action = args.action
     conn = a2a.open_outbox()
     try:
         if action == "list":
+            # Issue #1197 (beta22, codex r1 — 2026-05-25): include
+            # created_ts, updated_ts, next_attempt_ts, lease_expires_ts so
+            # we can compute staleness fields. No schema change — these
+            # columns already exist in _OUTBOX_SCHEMA at
+            # bridge_a2a_common.py:309-328.
             rows = conn.execute(
                 "SELECT message_id, peer, target_agent, priority, status, "
-                "attempts, next_attempt_ts, last_error, acked_remote_task_id "
+                "attempts, next_attempt_ts, last_error, acked_remote_task_id, "
+                "created_ts, updated_ts, lease_expires_ts "
                 "FROM outbox ORDER BY created_ts DESC"
             ).fetchall()
+            now = a2a.now_ts()
+            enriched = []
+            for r in rows:
+                d = dict(r)
+                status = d.get("status") or ""
+                created_ts = int(d.get("created_ts") or 0)
+                next_attempt_ts = int(d.get("next_attempt_ts") or 0)
+                lease_expires_ts = int(d.get("lease_expires_ts") or 0)
+                d["age_seconds"] = max(0, now - created_ts) if created_ts else 0
+                d["due_for_seconds"] = None
+                d["next_attempt_in_seconds"] = None
+                d["lease_stale_seconds"] = None
+                if status in ("pending", "retry"):
+                    # next_attempt_ts==0 means "send now" (brand-new
+                    # pending row). Anchor due-since to created_ts in
+                    # that case so the staleness reflects "how long has
+                    # this entry been waiting for ANY runner to pick
+                    # it up", not "how long since next_attempt_ts=0".
+                    due_anchor = next_attempt_ts if next_attempt_ts > 0 else created_ts
+                    if due_anchor and due_anchor <= now:
+                        d["due_for_seconds"] = max(0, now - due_anchor)
+                    elif due_anchor and due_anchor > now:
+                        # Future scheduled retry — surface how long until
+                        # it becomes due.
+                        d["next_attempt_in_seconds"] = max(0, due_anchor - now)
+                if status == "sending" and lease_expires_ts and lease_expires_ts < now:
+                    d["lease_stale_seconds"] = max(0, now - lease_expires_ts)
+                enriched.append(d)
+
             if args.json:
-                print(json.dumps([dict(r) for r in rows], ensure_ascii=False, indent=2))
+                print(json.dumps(enriched, ensure_ascii=False, indent=2))
             else:
-                if not rows:
+                if not enriched:
                     print("(outbox empty)")
-                for r in rows:
-                    print(f"{r['message_id']}  {r['status']:8}  "
-                          f"{r['peer']}:{r['target_agent']}  "
-                          f"[{r['priority']}]  attempts={r['attempts']}  "
-                          f"{r['last_error'] or ''}")
+                for d in enriched:
+                    suffix_parts = []
+                    if d["due_for_seconds"] is not None:
+                        suffix_parts.append(f"due={_format_seconds(d['due_for_seconds'])}")
+                    if d["next_attempt_in_seconds"] is not None:
+                        suffix_parts.append(f"next={_format_seconds(d['next_attempt_in_seconds'])}")
+                    if d["lease_stale_seconds"] is not None:
+                        suffix_parts.append(
+                            f"lease_stale={_format_seconds(d['lease_stale_seconds'])}"
+                        )
+                    suffix = ("  " + "  ".join(suffix_parts)) if suffix_parts else ""
+                    print(f"{d['message_id']}  {d['status']:8}  "
+                          f"{d['peer']}:{d['target_agent']}  "
+                          f"[{d['priority']}]  attempts={d['attempts']}  "
+                          f"{d['last_error'] or ''}"
+                          f"{suffix}")
             return 0
 
         if action == "retry":

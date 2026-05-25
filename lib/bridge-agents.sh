@@ -4914,6 +4914,14 @@ bridge_append_csv_unique() {
   local csv="${1-}"
   local value="${2-}"
   local item=""
+  # Issue #1196 test-harness bug surfaced 2026-05-25: under `set -u` (e.g.
+  # scripts/test-channel-probe-isolated.sh extracts this fn and sources it
+  # with strict mode), `items` was used before being declared, tripping
+  # `items[@]: unbound variable`. The fix is defensive: declare it locally
+  # so the array is always defined even when csv is empty / produces no
+  # tokens. No behavior change for production callers (bridge-lib.sh
+  # sources without `set -u`).
+  local -a items=()
 
   value="$(bridge_trim_whitespace "$value")"
   [[ -n "$value" ]] || {
@@ -5624,9 +5632,36 @@ exit 1
             printf 'unreadable'
             return 0
             ;;
+          2)
+            # Issue #1196 (beta22): the OUTER bridge_isolation_can_sudo_to_agent
+            # said sudo was OK, but the inner pre-flight inside
+            # bridge_isolation_run_as_agent_user_via_bash returned rc=2 (sudo
+            # raced/declined between the two probes — sudoers reload, ticket
+            # expiry, transient policy fault). The agent IS isolated; we just
+            # cannot prove readiness either way on THIS probe. Degrade to
+            # controller-blind, NOT unreadable: a false-negative
+            # channel_health_miss is the exact regression we are closing here.
+            # Mirrors the OUTER rc=2 mapping below.
+            : "${item}"
+            printf 'controller-blind'
+            return 0
+            ;;
           *)
-            # Probe itself failed unexpectedly (e.g. sudoers raced) —
-            # fall through to the standard unreadable path.
+            # Issue #1196 (beta22): we know the OUTER sudo gate said OK (we
+            # are inside the sudo_rc=0 arm), the file exists, and the run
+            # helper returned an UNDEFINED rc (not 0/2/3/4). This is the
+            # "impossible probe error from an isolated agent" branch the
+            # codex r1 review called out: classifying as `missing` would
+            # fire a false channel_health_miss, classifying as `unreadable`
+            # would block restart on a per-restart hard-reject; neither
+            # state matches what we actually observed. Prefer
+            # controller-blind + diagnostic — caller maps to status=unknown
+            # (fail-open). The diagnostic is emitted by the dispatcher one
+            # level up via bridge_channel_env_file_acl_diagnostic when the
+            # caller observes the controller-blind reason.
+            : "${item}"
+            printf 'controller-blind'
+            return 0
             ;;
         esac
         ;;

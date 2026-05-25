@@ -1803,6 +1803,119 @@ process_claude_token_recovery() {
   [[ "$status" != "skipped" && "${checked_count:-0}" != "0" ]]
 }
 
+# Issue #1197 (beta22, codex r1 — 2026-05-25): daemon-loop A2A delivery tick.
+#
+# Codex r1 root-cause re-diagnosis: `bridge-handoffd.py` is receiver-only
+# (`ThreadingHTTPServer.serve_forever()`), it has NO scheduler tick. Outbound
+# delivery is a one-shot `bridge-a2a.py deliver` invoked by an external
+# caller (`bridge-handoff-daemon.sh tick` or now, this step). The 17h-then-
+# stop pattern Sean observed with rows stuck at `pending attempts=0` means
+# the delivery runner was never invoked after enqueue — there was no
+# scheduler external to bridge-handoff-daemon.sh wiring the tick into the
+# main bridge daemon.
+#
+# This step:
+#   1. No-ops silently when `handoff.local.json` is absent (most installs).
+#   2. Throttles to BRIDGE_A2A_DELIVER_INTERVAL_SECONDS (default 30; 0 = off).
+#   3. Wraps the deliver invocation with bridge_with_timeout so an HTTP /
+#      socket hang cannot wedge the main daemon loop (per-request timeout
+#      is already 20s in bridge-a2a.py; we set a daemon-side ceiling of
+#      60s to protect against batch / SQLite anomalies).
+#   4. Records last/next tick timestamps + processed count in a small
+#      env-style state file under $BRIDGE_STATE_DIR/handoff/deliver-tick.env
+#      so a daemon restart preserves throttle state.
+#   5. Logs one compact line per tick start/end (rc + processed) — does
+#      NOT spam the daemon log at interval cadence.
+process_a2a_deliver_tick() {
+  local interval_str="${BRIDGE_A2A_DELIVER_INTERVAL_SECONDS:-30}"
+  local interval
+  # Numeric guard — refuse a malformed env value so a typo cannot break
+  # the daemon loop.
+  if [[ "$interval_str" =~ ^[0-9]+$ ]]; then
+    interval="$interval_str"
+  else
+    daemon_warn "[a2a_deliver_tick] invalid BRIDGE_A2A_DELIVER_INTERVAL_SECONDS=$interval_str (must be a non-negative integer); skipping"
+    return 1
+  fi
+  # 0 disables the tick entirely (operator opt-out; e.g. for a host that
+  # runs A2A delivery from a separate cron entry).
+  (( interval == 0 )) && return 1
+
+  # No-op silently when handoff.local.json is absent — this is the
+  # normal-install path; logging here would spam every tick on hosts
+  # that have never configured A2A.
+  local config="${BRIDGE_A2A_CONFIG:-${BRIDGE_HOME:-$HOME/.agent-bridge}/handoff.local.json}"
+  [[ -f "$config" ]] || return 1
+
+  # Throttle state lives under $BRIDGE_STATE_DIR/handoff/. The file is
+  # `source`d so we can read A2A_DELIVER_NEXT_TS / A2A_DELIVER_LAST_TS
+  # cheaply without spawning python on every tick.
+  local handoff_dir="$BRIDGE_STATE_DIR/handoff"
+  mkdir -p "$handoff_dir" 2>/dev/null || true
+  local state_file="$handoff_dir/deliver-tick.env"
+  local now next=0
+  now="$(date +%s)"
+  if [[ -f "$state_file" ]]; then
+    # shellcheck source=/dev/null
+    # shellcheck disable=SC1090
+    source "$state_file" 2>/dev/null || true
+    next="${A2A_DELIVER_NEXT_TS:-0}"
+  fi
+  if [[ "$next" =~ ^[0-9]+$ ]] && (( now < next )); then
+    return 1
+  fi
+
+  daemon_log_event "[a2a_deliver_tick] start (interval=${interval}s)"
+  local tick_out=""
+  local rc=0
+  # Wrap with bridge_with_timeout — even with the per-request 20s ceiling
+  # in bridge-a2a.py, a SQLite lock or filesystem stall could keep the
+  # process alive past the per-request budget. 60s is a generous daemon-
+  # side ceiling that still bounds the cycle. bridge_with_timeout exec's
+  # the command via `timeout(1)` so it must be a real executable, not a
+  # shell function — invoke `python3 bridge-a2a.py deliver` directly
+  # (this is what lib/bridge-a2a.sh:bridge_a2a_deliver_tick does
+  # internally).
+  tick_out="$(bridge_with_timeout 60 a2a_deliver python3 "$SCRIPT_DIR/bridge-a2a.py" deliver 2>&1)" || rc=$?
+
+  # Extract processed count from `bridge-a2a.py deliver` stderr — the
+  # python wrapper emits `[a2a] processed N outbox entries` or
+  # `[a2a] no due outbox entries`. The number lets us surface a one-line
+  # `tick end rc=N processed=N` audit without parsing JSON.
+  local processed="0"
+  if [[ "$tick_out" == *"no due outbox entries"* ]]; then
+    processed="0"
+  else
+    # The stderr text is `[a2a] processed N outbox entries` (or "entry"
+    # for the singular case). Use a portable parse so a parameter
+    # substitution failure doesn't poison the tick.
+    local _proc
+    _proc="$(printf '%s\n' "$tick_out" | grep -oE 'processed [0-9]+ outbox' | head -1 | grep -oE '[0-9]+' || true)"
+    [[ "$_proc" =~ ^[0-9]+$ ]] && processed="$_proc"
+  fi
+
+  if (( rc == 0 )); then
+    daemon_log_event "[a2a_deliver_tick] end rc=0 processed=$processed"
+  else
+    daemon_warn "[a2a_deliver_tick] end rc=$rc processed=$processed"
+    if [[ -n "$tick_out" ]]; then
+      # Truncate to keep crash log compact — the operator can re-run
+      # `agb a2a deliver` interactively for a full trace.
+      daemon_log_event "[a2a_deliver_tick] output: ${tick_out:0:400}"
+    fi
+    bridge_audit_log daemon a2a_deliver_tick_failed daemon \
+      --detail rc="$rc" \
+      --detail processed="$processed" >/dev/null 2>&1 || true
+  fi
+
+  # Persist throttle state. Same-file rewrite — no temp + mv dance, this
+  # file is read-only metadata for the daemon's own throttling decision.
+  printf 'A2A_DELIVER_LAST_TS=%s\nA2A_DELIVER_NEXT_TS=%s\nA2A_DELIVER_LAST_RC=%s\nA2A_DELIVER_LAST_PROCESSED=%s\n' \
+    "$now" "$((now + interval))" "$rc" "$processed" >"$state_file" 2>/dev/null || true
+
+  return 0
+}
+
 process_release_monitor() {
   local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
   local monitor_json=""
@@ -6578,6 +6691,15 @@ cmd_sync_cycle() {
 
   BRIDGE_DAEMON_LAST_STEP="cron_dispatch_workers"
   start_cron_dispatch_workers || true
+
+  # Issue #1197 (beta22): A2A cross-bridge delivery tick. No-op silently
+  # when handoff.local.json is absent (most installs), throttled to
+  # BRIDGE_A2A_DELIVER_INTERVAL_SECONDS (default 30s), wrapped with
+  # bridge_with_timeout so an HTTP/socket hang cannot wedge the loop.
+  # Placement: after cron_dispatch_workers (where queue maintenance is
+  # done) and before nudge_agents (the cycle's last big external fanout).
+  BRIDGE_DAEMON_LAST_STEP="a2a_deliver_tick"
+  process_a2a_deliver_tick || true
 
   BRIDGE_DAEMON_LAST_STEP="nudge_agents"
   printf '%s\n' "$nudge_output" > "$_nudge_tmp"

@@ -237,7 +237,40 @@ def ensure_known_marketplace_for_root(root: Path, marketplace_name: str) -> tupl
 
     path = known_marketplaces_path()
     root = root.resolve()
+    # L1-D Part C (beta22, codex r1 race-safety, 2026-05-25):
+    # `merge_installed_plugins` already protects installed_plugins.json with
+    # a sidecar `installed_plugins.json.lock` flock; this writer (and the
+    # D2 seed-side `lib/upgrade-helpers/plugins-seed-merge-known-marketplace.py`)
+    # both touch the SAME per-UID `known_marketplaces.json` but had no
+    # shared lock. Concurrent runs (start hook + cron-driven seed +
+    # operator `agb plugins seed`) could lose updates — a read-modify-
+    # write race where the later writer overwrites the earlier writer's
+    # entry. Use a sidecar `known_marketplaces.json.lock` flock with the
+    # exact same convention (LOCK_EX on a same-dir lockfile, dropped on
+    # function exit). Identical writers in the seed-merge helper share
+    # the same lock path so they serialize against each other too.
+    import errno  # noqa: F401  (kept for parity with merge_installed_plugins)
+    import fcntl
+
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return False, f"mkdir-failed: {exc}"
+
+    lock_path = path.with_name(f"{path.name}.lock")
+    try:
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        return False, f"lock-open-failed: {exc}"
+
+    try:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError as exc:
+            return False, f"flock-failed: {exc}"
+
+        # Re-read under the lock to avoid losing a concurrent update that
+        # landed between our pre-lock load and the LOCK_EX acquire.
         payload = load_known_marketplaces()
         existing = payload.get(marketplace_name)
         if _marketplace_entry_matches_root(existing, root):
@@ -248,7 +281,6 @@ def ensure_known_marketplace_for_root(root: Path, marketplace_name: str) -> tupl
             "installLocation": str(root),
             "lastUpdated": _now_iso_utc(),
         }
-        path.parent.mkdir(parents=True, exist_ok=True)
         existing_mode = 0o600
         if path.exists():
             try:
@@ -272,6 +304,11 @@ def ensure_known_marketplace_for_root(root: Path, marketplace_name: str) -> tupl
         return True, "updated"
     except OSError as exc:
         return False, f"write-failed: {exc}"
+    finally:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
 
 
 def channel_marketplace(channel: str) -> str:
