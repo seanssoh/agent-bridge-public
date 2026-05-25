@@ -1877,6 +1877,38 @@ if [[ $DRY_RUN -eq 0 ]]; then
     tail -n 20 "$_bun_traverse_tmp" >&2 || true
   fi
   rm -f -- "$_bun_traverse_tmp"
+
+  # L1-J (beta20, 2026-05-25): every bundled plugin with a package.json
+  # needs node_modules at install/upgrade time. The teams plugin path
+  # (`agb setup teams`) does this for plugins/teams/ specifically; this
+  # helper generalizes to ms365 + any future bundled plugin so the iso
+  # UID's MCP spawn does not hit "Cannot find module" on first start.
+  #
+  # Best-effort, non-fatal — mirrors the bun-traverse helper. The
+  # helper logs per-plugin status and the overall upgrade continues
+  # even when one plugin's install fails (operator can re-run
+  # `agb setup <plugin> <agent>` or fix bun availability and retry).
+  #
+  # Footgun #11: file-as-argv via standalone helper (no heredoc-stdin).
+  set +e
+  _bundled_plugins_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-bundled-plugins.XXXXXX")"
+  bridge_upgrade_with_target_env "$TARGET_ROOT" \
+    "$BRIDGE_BASH_BIN" \
+    "$SOURCE_ROOT/lib/upgrade-helpers/bundled-plugins-bun-install.sh" \
+    "$SOURCE_ROOT" "$TARGET_ROOT" >"$_bundled_plugins_tmp" 2>&1
+  _bundled_plugins_rc=$?
+  set -e
+  # Surface info lines (per-plugin status) regardless of rc — the
+  # operator wants to see "ms365: node_modules installed + widened"
+  # in the upgrade log.
+  if [[ -s "$_bundled_plugins_tmp" ]]; then
+    tail -n 50 "$_bundled_plugins_tmp" >&2 || true
+  fi
+  if [[ $_bundled_plugins_rc -ne 0 ]]; then
+    echo "[bridge-upgrade] WARN: one or more bundled plugins failed bun install (rc=$_bundled_plugins_rc). Affected MCPs will not start until deps resolve — re-run \`agb setup <plugin> <agent>\` or check bun availability." >&2
+    _upgrade_partial_failures+=("bundled_plugins_bun_install")
+  fi
+  rm -f -- "$_bundled_plugins_tmp"
 fi
 
 # Footgun #11: `bridge_upgrade_agent_restart_json` feeds python via heredoc;
