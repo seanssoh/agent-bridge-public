@@ -44,6 +44,11 @@ trap _bridge_upgrade_exit_handler EXIT
 source "$SCRIPT_DIR/bridge-lib.sh"
 # shellcheck source=lib/bridge-cleanup.sh
 source "$SCRIPT_DIR/lib/bridge-cleanup.sh"
+# Beta20 L2 Variant 3A — bridge_host_profile_is_dev is defined in
+# lib/bridge-host-profile.sh (not pulled in by bridge-lib.sh). The
+# upgrade-time sudoers regeneration gate at line ~2243 depends on it.
+# shellcheck source=lib/bridge-host-profile.sh
+source "$SCRIPT_DIR/lib/bridge-host-profile.sh"
 ORIGINAL_ARGS=("$@")
 
 SOURCE_ROOT="$SCRIPT_DIR"
