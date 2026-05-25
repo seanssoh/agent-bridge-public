@@ -2230,6 +2230,29 @@ if [[ $DRY_RUN -eq 0 ]] && command -v tmux >/dev/null 2>&1; then
 fi
 
 
+# Beta20 L2 Variant 3A — regenerate the daemon-refresh sudoers drop-in
+# so an upgrade that changes BRIDGE_BASH_BIN or BRIDGE_HOME (rare but
+# possible when operators relocate) lands a matching authorized command
+# in the sudoers entry. Idempotent: the helper skips the install when
+# the existing file is byte-equal to a fresh render. Linux + server
+# profile only; failure is logged but does NOT abort the upgrade (the
+# operator can re-run `agent-bridge init sudoers daemon-refresh --apply`
+# afterwards).
+if [[ $DRY_RUN -eq 0 ]] \
+   && [[ "$(uname -s 2>/dev/null)" == "Linux" ]] \
+   && ! bridge_host_profile_is_dev \
+   && command -v bridge_daemon_control_install_sudoers >/dev/null 2>&1; then
+  _upgrade_sudoers_path=""
+  if _upgrade_sudoers_path="$(BRIDGE_HOME="$TARGET_ROOT" bridge_daemon_control_install_sudoers 2>&1)"; then
+    if [[ -n "$_upgrade_sudoers_path" ]]; then
+      echo "[bridge-upgrade] daemon-refresh sudoers: at $_upgrade_sudoers_path"
+    fi
+  else
+    echo "[bridge-upgrade] WARN: daemon-refresh sudoers regen failed; automatic supp-groups refresh may fall back to manual-required." >&2
+    echo "[bridge-upgrade] WARN: re-run: $TARGET_ROOT/agent-bridge init sudoers daemon-refresh --apply" >&2
+  fi
+fi
+
 # Bug #507 — auto-cleanup of daily-backup residue on every successful
 # `agb upgrade --apply`. Idempotent; reports failures via cleanup_failures
 # array. Skipped on dry-runs (no live state to mutate). Always runs before

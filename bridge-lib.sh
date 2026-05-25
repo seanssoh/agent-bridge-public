@@ -411,6 +411,14 @@ bridge_source_module "bridge-cron.sh"
 bridge_source_module "bridge-discord.sh"
 bridge_source_module "bridge-notify.sh"
 bridge_source_module "bridge-migration.sh"
+# Beta20 L2 Variant 3A — daemon refresh orchestration. Sourced AFTER
+# bridge-state.sh (provides bridge_daemon_pid / bridge_daemon_recorded_pid)
+# and bridge-agents.sh (bridge_current_user / bridge_linux_sudo_root) and
+# bridge-isolation-v2.sh (group membership probes). Provides
+# bridge_daemon_refresh_after_group_membership_change + sudoers installer
+# called by agent create / delete / isolate / `agent-bridge init sudoers
+# daemon-refresh`.
+bridge_source_module "bridge-daemon-control.sh"
 bridge_source_module "bridge-wave.sh"
 # bridge-agent-update.sh is the typed/audited mutation surface for the
 # protected agent-roster.local.sh managed-role fields (issue #528).

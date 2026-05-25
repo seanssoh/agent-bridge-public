@@ -618,6 +618,30 @@ if [[ $dry_run -eq 0 ]]; then
   # any failure is logged without blocking init.
   bridge_init_provision_admin_codex_pair "$host_profile_cli" "$admin_agent" "$host_profile_chosen" || true
 
+  # Beta20 L2 Variant 3A — install the daemon-refresh sudoers drop-in on
+  # Linux server hosts so subsequent `agent create --linux-user` calls
+  # can automatically refresh the daemon's supplementary groups. The
+  # helper no-ops on macOS (skipped-non-linux), on dev hosts (operators
+  # who manage their own daemons), and on systems lacking visudo. Failure
+  # is logged but does NOT block init — the operator can re-run
+  # `agent-bridge init sudoers daemon-refresh --apply` later (or live
+  # with the queue-only-fallback footgun until they do).
+  if [[ "$host_profile_chosen" == "server" ]] \
+     && [[ "$(uname -s 2>/dev/null)" == "Linux" ]] \
+     && [[ $dry_run -eq 0 ]] \
+     && command -v bridge_daemon_control_install_sudoers >/dev/null 2>&1; then
+    _init_sudoers_path=""
+    _init_sudoers_path="$(bridge_daemon_control_install_sudoers 2>&1)" \
+      && printf '[init] daemon-refresh sudoers: installed at %s\n' "$_init_sudoers_path" \
+      || bridge_init_append_warning "daemon-refresh sudoers install failed — automatic supp-groups refresh will fall back to manual-required. Re-run: agent-bridge init sudoers daemon-refresh --apply"
+    # Emit the preflight diagnostic row so operators see auto-refresh
+    # status in init output without an extra step.
+    if command -v bridge_daemon_control_preflight_row >/dev/null 2>&1; then
+      printf '[init] '
+      bridge_daemon_control_preflight_row || true
+    fi
+  fi
+
   # Track D follow-up to #713 / #809, follow-on to #833: auto-register the
   # picker-sweep bridge-native cron. The helper is idempotent (short-circuits
   # when a job titled `picker-sweep` already exists), and the registered cron
