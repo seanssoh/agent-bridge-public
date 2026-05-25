@@ -208,6 +208,30 @@ test_sudoers_render() {
     || fail "rendered doesn't contain expected daemon command path: $rendered"
   pass "rendered contains exact daemon command shape"
 
+  # r4: also authorize the bare `run` command so the sudo-wrapped
+  # systemd ExecStart is accepted by sudoers policy.
+  [[ "$rendered" == *"/Users/alice/.agent-bridge/bridge-daemon.sh run"* ]] \
+    || fail "r4: rendered doesn't contain the systemd-unit-authorized 'run' Cmnd: $rendered"
+  pass "r4: rendered contains the second authorized command (bridge-daemon.sh run)"
+
+  # r4: there must be EXACTLY two `alice ALL=(alice)` policy lines.
+  # More would mean someone added unrelated grants; fewer means the
+  # run Cmnd is missing.
+  local policy_lines
+  policy_lines="$(printf '%s\n' "$rendered" | grep -cF -- 'alice ALL=(alice)' || true)"
+  [[ "$policy_lines" == "2" ]] \
+    || fail "r4: expected 2 sudoers policy lines, got $policy_lines"
+  pass "r4: rendered template has exactly 2 sudoers policy lines"
+
+  # r4: still no wildcards. Only audit non-comment lines — the rendered
+  # template's header explanation legitimately mentions `restart *` /
+  # `BRIDGE_*` in human prose, so a naive grep over the full content
+  # would false-positive.
+  if printf '%s\n' "$rendered" | grep -vE '^[[:space:]]*#' | grep -qE '\*[[:space:]]|\*$'; then
+    fail "r4: rendered template (non-comment lines) contains forbidden sudoers wildcard"
+  fi
+  pass "r4: rendered template (non-comment lines) has no wildcards"
+
   # Reject non-absolute bash path.
   local rc=0
   rendered="$(bridge_daemon_control_sudoers_render \
@@ -276,6 +300,78 @@ test_cmd_restart_parser() {
   pass "cmd_restart parser shape preserved"
 }
 
+# ---------------------------------------------------------------------------
+# Test 10 (r4): install-daemon-systemd.sh renders sudo-wrapped ExecStart
+# when --sudo-self is forced. Auto-detect path is host-dependent so we
+# don't assert it here; --no-sudo-self and --sudo-self are the explicit
+# overrides we can lock down.
+# ---------------------------------------------------------------------------
+test_install_daemon_systemd_render() {
+  local script="$REPO_ROOT/scripts/install-daemon-systemd.sh"
+  [[ -x "$script" ]] || fail "install-daemon-systemd.sh missing or not executable"
+
+  # --no-sudo-self → legacy direct ExecStart, no refresh-mode env.
+  local out_legacy
+  out_legacy="$("$script" --bridge-home /tmp/agb-test --no-sudo-self 2>&1)"
+  [[ "$out_legacy" == *"sudo_self_active: 0"* ]] \
+    || fail "r4: --no-sudo-self should report sudo_self_active=0"
+  if printf '%s' "$out_legacy" | grep -qE '^ExecStart=.*sudo '; then
+    fail "r4: --no-sudo-self should NOT render sudo-prefixed ExecStart"
+  fi
+  if printf '%s' "$out_legacy" | grep -qF -- 'BRIDGE_DAEMON_SYSTEMD_REFRESH_MODE='; then
+    fail "r4: --no-sudo-self should NOT render the refresh-mode env marker"
+  fi
+  pass "r4: --no-sudo-self renders legacy direct ExecStart"
+
+  # --sudo-self: only proven on hosts with the sudoers drop-in already
+  # installed. Skip when sudoers absent (macOS smoke env, fresh VM).
+  local sudoers_present=0
+  local glob="/etc/sudoers.d/agent-bridge-daemon-refresh-$(id -un)-*"
+  # shellcheck disable=SC2086
+  set -- $glob
+  if [[ -e "$1" ]]; then
+    sudoers_present=1
+  fi
+  if (( sudoers_present == 1 )); then
+    local out_sudo rc=0
+    out_sudo="$("$script" --bridge-home /tmp/agb-test --sudo-self 2>&1)" || rc=$?
+    if (( rc == 0 )); then
+      [[ "$out_sudo" == *"sudo_self_active: 1"* ]] \
+        || fail "r4: --sudo-self should report sudo_self_active=1"
+      printf '%s' "$out_sudo" | grep -qE '^ExecStart=.*sudo .*-u .* -H .*--preserve-env=BRIDGE_HOME' \
+        || fail "r4: --sudo-self should render sudo-prefixed ExecStart with --preserve-env"
+      printf '%s' "$out_sudo" | grep -qF -- 'BRIDGE_DAEMON_SYSTEMD_REFRESH_MODE=sudo-self' \
+        || fail "r4: --sudo-self should render the refresh-mode env marker"
+      pass "r4: --sudo-self renders sudo-wrapped ExecStart"
+    else
+      pass "r4: --sudo-self correctly failed when probe rejects (rc=$rc) — host doesn't grant refresh"
+    fi
+  else
+    pass "r4: --sudo-self test skipped (no daemon-refresh sudoers drop-in on this host)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Test 11 (r4): systemd-detection helpers exist + parse correctly.
+# ---------------------------------------------------------------------------
+test_systemd_helpers() {
+  # _bridge_daemon_control_systemd_active should be defined and rc!=0
+  # on macOS / hosts without systemctl.
+  if command -v systemctl >/dev/null 2>&1; then
+    pass "r4: systemd helpers: host has systemctl (linux/wsl) — runtime check, no smoke assertion"
+    return 0
+  fi
+  if _bridge_daemon_control_systemd_active 2>/dev/null; then
+    fail "r4: _bridge_daemon_control_systemd_active should fail when systemctl is absent"
+  fi
+  pass "r4: _bridge_daemon_control_systemd_active returns rc!=0 without systemctl"
+
+  if _bridge_daemon_control_systemd_unit_is_refresh_capable 2>/dev/null; then
+    fail "r4: _bridge_daemon_control_systemd_unit_is_refresh_capable should fail without systemctl"
+  fi
+  pass "r4: _bridge_daemon_control_systemd_unit_is_refresh_capable returns rc!=0 without systemctl"
+}
+
 test_linux_gate
 test_arg_parser
 test_sanitizer
@@ -285,5 +381,7 @@ test_sudoers_render
 test_daemon_not_running_branch
 test_preflight_row
 test_cmd_restart_parser
+test_install_daemon_systemd_render
+test_systemd_helpers
 
 printf '\n[daemon-control] all unit smokes passed\n'

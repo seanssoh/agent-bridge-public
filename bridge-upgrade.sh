@@ -2248,13 +2248,46 @@ if [[ $DRY_RUN -eq 0 ]] \
    && ! bridge_host_profile_is_dev \
    && command -v bridge_daemon_control_install_sudoers >/dev/null 2>&1; then
   _upgrade_sudoers_path=""
+  _upgrade_sudoers_install_ok=0
   if _upgrade_sudoers_path="$(BRIDGE_HOME="$TARGET_ROOT" bridge_daemon_control_install_sudoers 2>&1)"; then
     if [[ -n "$_upgrade_sudoers_path" ]]; then
       echo "[bridge-upgrade] daemon-refresh sudoers: at $_upgrade_sudoers_path"
+      _upgrade_sudoers_install_ok=1
     fi
   else
     echo "[bridge-upgrade] WARN: daemon-refresh sudoers regen failed; automatic supp-groups refresh may fall back to manual-required." >&2
     echo "[bridge-upgrade] WARN: re-run: $TARGET_ROOT/agent-bridge init sudoers daemon-refresh --apply" >&2
+  fi
+
+  # Beta20 L2 Variant 3A r4 — regenerate the systemd-user unit so its
+  # ExecStart picks up the (possibly updated) sudo-wrapped shape. The
+  # install-daemon-systemd.sh helper auto-detects the sudoers drop-in
+  # and renders accordingly; we just re-apply + daemon-reload +
+  # restart-if-active. Without this step, an operator who upgrades
+  # from a pre-r4 install still has the legacy direct unit ExecStart,
+  # and `Restart=always` would keep defeating the r3 ad-hoc sudo
+  # restart at runtime.
+  if (( _upgrade_sudoers_install_ok == 1 )) \
+     && command -v systemctl >/dev/null 2>&1; then
+    _upgrade_systemd_rc=0
+    "$BRIDGE_BASH_BIN" "$TARGET_ROOT/scripts/install-daemon-systemd.sh" \
+      --bridge-home "$TARGET_ROOT" --apply \
+      || _upgrade_systemd_rc=$?
+    if (( _upgrade_systemd_rc == 0 )); then
+      if systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null; then
+        systemctl --user daemon-reload || true
+        if systemctl --user restart agent-bridge-daemon.service 2>/dev/null; then
+          echo "[bridge-upgrade] systemd-user unit regenerated (sudo-self) and restarted"
+        else
+          echo "[bridge-upgrade] WARN: systemctl --user restart agent-bridge-daemon.service failed after unit regen — retry manually" >&2
+        fi
+      else
+        echo "[bridge-upgrade] systemd-user unit regenerated (sudo-self) — service not active, will pick up on next start"
+      fi
+    else
+      echo "[bridge-upgrade] WARN: install-daemon-systemd.sh --apply returned rc=$_upgrade_systemd_rc — unit may carry legacy ExecStart" >&2
+      echo "[bridge-upgrade] WARN: re-run: $TARGET_ROOT/scripts/install-daemon-systemd.sh --bridge-home $TARGET_ROOT --apply" >&2
+    fi
   fi
 fi
 

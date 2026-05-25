@@ -23,4 +23,25 @@
 # Mode:        0440 root:root
 # Installed via: agent-bridge init sudoers daemon-refresh --apply
 # Validated via: visudo -cf
+#
+# Two authorized commands:
+#
+#  1. `bridge-daemon.sh restart --force --internal-reason=group-refresh`
+#     Used by `bridge_daemon_refresh_after_group_membership_change` to
+#     restart the daemon under sudo/PAM when systemd is NOT managing
+#     the daemon (launchd / non-Linux / explicit --no-sudo-self). r3
+#     contract.
+#
+#  2. `bridge-daemon.sh run`
+#     r4 follow-up — used by the sudo-wrapped systemd ExecStart so
+#     every systemd-driven daemon start crosses the same sudo/PAM
+#     refresh boundary. Without this entry the systemd-user manager
+#     (whose own supp set is captured at login and never refreshed)
+#     would launch sudo only for it to be rejected by sudoers policy,
+#     leaving the daemon down. See codex r4 spec at
+#     /tmp/agb-6281-l2-r4-systemd.md.
+#
+# No wildcards. No /usr/bin/env. Both Cmnds go through the same
+# SETENV preserve-env list configured on the respective invocations.
 {{controller_user}} ALL=({{controller_user}}) NOPASSWD: SETENV: {{bash_abs}} {{bridge_home_abs}}/bridge-daemon.sh restart --force --internal-reason=group-refresh
+{{controller_user}} ALL=({{controller_user}}) NOPASSWD: SETENV: {{bash_abs}} {{bridge_home_abs}}/bridge-daemon.sh run

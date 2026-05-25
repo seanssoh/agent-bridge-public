@@ -1365,13 +1365,22 @@ emit_create_json() {
   # pass the flag see a byte-stable envelope.
   local expressed_intent="${16:-}"
   # Beta20 L2 Variant 3A — daemon supplementary-groups refresh status
-  # surfaced to JSON callers. One of: ok / skipped-non-linux /
-  # skipped-daemon-not-running / skipped-daemon-already-has-group /
-  # manual-required-sudoers / manual-required-sudo-refresh-no-gid /
-  # failed-restart / failed-timeout / "" (no refresh attempted, e.g.
-  # shared-mode agent). When status is in the manual-required-* /
-  # failed-* family, the envelope also carries `manual_command` with
-  # the exact recovery command.
+  # surfaced to JSON callers. One of:
+  #   ok / ok-systemd-sudo-self                  (success)
+  #   skipped-non-linux / skipped-daemon-not-running /
+  #     skipped-daemon-already-has-group         (no-op success)
+  #   manual-required-sudoers /
+  #     manual-required-sudo-refresh-no-gid /
+  #     manual-required-systemd-unit-stale /
+  #     manual-required-systemd-sudoers          (operator must run a recovery cmd)
+  #   failed-restart / failed-timeout /
+  #     failed-systemctl-restart /
+  #     failed-systemd-refresh-no-gid            (refresh attempted but failed)
+  #   ""                                          (no refresh attempted, shared-mode/macOS)
+  #
+  # When status is in the manual-required-* / failed-* family the
+  # envelope also carries `manual_command` with the exact recovery
+  # shell line — the python branches below own the mapping.
   local daemon_group_refresh="${17:-}"
 
   bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" "$expressed_intent" "$daemon_group_refresh" <<'PY'
@@ -1410,7 +1419,10 @@ payload = {
 }
 # Beta20 L2 Variant 3A — only emit the field when refresh was actually
 # attempted (linux-user isolation on Linux). Shared-mode / macOS callers
-# see a byte-stable envelope without the new key.
+# see a byte-stable envelope without the new key. r4 added the systemd-
+# user managed status family — its recovery command differs from the
+# r3 ad-hoc sudo-restart path (operators on systemd hosts must regen
+# the unit + sudoers, not just retry a bare bridge-daemon.sh restart).
 if daemon_group_refresh:
     payload["daemon_group_refresh"] = daemon_group_refresh
     if daemon_group_refresh == "manual-required-sudoers":
@@ -1419,6 +1431,12 @@ if daemon_group_refresh:
         payload["manual_command"] = "bash bridge-daemon.sh restart --force"
     elif daemon_group_refresh in ("failed-restart", "failed-timeout"):
         payload["manual_command"] = "bash bridge-daemon.sh restart --force"
+    elif daemon_group_refresh == "manual-required-systemd-unit-stale":
+        payload["manual_command"] = "agent-bridge init sudoers daemon-refresh --apply && bash scripts/install-daemon-systemd.sh --apply --enable --bridge-home \"$BRIDGE_HOME\""
+    elif daemon_group_refresh == "manual-required-systemd-sudoers":
+        payload["manual_command"] = "agent-bridge init sudoers daemon-refresh --apply"
+    elif daemon_group_refresh in ("failed-systemctl-restart", "failed-systemd-refresh-no-gid"):
+        payload["manual_command"] = "systemctl --user restart agent-bridge-daemon.service"
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY
 }
@@ -3620,6 +3638,26 @@ report and reap test-fixture agents per their pattern."
           echo ""
           echo "[restart-required] daemon refresh failed ($daemon_group_refresh_status) — manual restart recommended."
           echo "Run: bash bridge-daemon.sh restart --force"
+          ;;
+        manual-required-systemd-unit-stale)
+          echo ""
+          echo "[restart-required] systemd-user unit is active but its ExecStart is the legacy direct-bash shape — automatic supp-groups refresh would race Restart=always."
+          echo "Run: agent-bridge init sudoers daemon-refresh --apply"
+          echo "Then: bash scripts/install-daemon-systemd.sh --apply --enable --bridge-home \"\$BRIDGE_HOME\""
+          echo "Then retry the agent operation or run: systemctl --user restart agent-bridge-daemon.service"
+          ;;
+        manual-required-systemd-sudoers)
+          echo ""
+          echo "[restart-required] systemd-user unit is sudo-wrapped but the daemon-refresh sudoers drop-in is missing/rejecting — daemon cannot start."
+          echo "Run: agent-bridge init sudoers daemon-refresh --apply"
+          echo "Then: systemctl --user restart agent-bridge-daemon.service"
+          ;;
+        failed-systemctl-restart|failed-systemd-refresh-no-gid)
+          echo ""
+          echo "[restart-required] systemd-driven daemon refresh failed ($daemon_group_refresh_status) — supp-groups still stale."
+          echo "Run: systemctl --user restart agent-bridge-daemon.service"
+          echo "If groups still stale after restart, regenerate the unit:"
+          echo "  bash scripts/install-daemon-systemd.sh --apply --enable --bridge-home \"\$BRIDGE_HOME\""
           ;;
       esac
     fi

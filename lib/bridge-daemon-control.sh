@@ -28,15 +28,29 @@
 # Groups line already contains the target GID also no-op.
 #
 # Status strings returned by bridge_daemon_refresh_after_group_membership_change:
-#   ok
+#   ok                                    bridge-managed sudo restart (r3 direct path)
+#   ok-systemd-sudo-self                  systemd-user managed; sudo-wrapped ExecStart
+#                                         refreshed the daemon on `systemctl --user
+#                                         restart agent-bridge-daemon.service` (r4)
 #   skipped-non-linux
 #   skipped-daemon-not-running
 #   skipped-daemon-already-has-group
-#   manual-required-sudoers              (sudo -n returned a sudoers-class rc)
-#   manual-required-sudo-refresh-no-gid  (sudo invoke succeeded but new daemon's
-#                                         Groups still lacks the target GID)
-#   failed-restart                       (restart cmd returned non-zero)
-#   failed-timeout                       (new daemon pid never appeared)
+#   manual-required-sudoers               (sudo -n returned a sudoers-class rc)
+#   manual-required-sudo-refresh-no-gid   (sudo invoke succeeded but new daemon's
+#                                          Groups still lacks the target GID)
+#   manual-required-systemd-unit-stale    (r4: unit is active but its ExecStart is
+#                                          the legacy direct-bash shape — needs
+#                                          regenerate + sudoers + restart)
+#   manual-required-systemd-sudoers       (r4: unit is sudo-wrapped but sudoers
+#                                          drop-in is missing or rejecting the
+#                                          authorized command)
+#   failed-restart                        (restart cmd returned non-zero)
+#   failed-systemctl-restart              (r4: systemctl --user restart returned !=0)
+#   failed-systemd-refresh-no-gid         (r4: systemctl restart succeeded but new
+#                                          daemon's Groups STILL lacks the GID —
+#                                          PAM/sudo refresh didn't take, host-config
+#                                          drift)
+#   failed-timeout                        (new daemon pid never appeared)
 #
 # All status strings are stable contract — consumed by JSON envelopes
 # in agent create / delete and by the `agent-bridge init sudoers
@@ -206,6 +220,40 @@ _bridge_daemon_control_lock_release() {
   return 0
 }
 
+# r4: detect whether the bridge daemon is currently managed by
+# systemd-user. Returns 0 (true) when the unit is active per
+# `systemctl --user is-active --quiet`, 1 otherwise (including
+# systemctl missing, non-Linux, or unit stopped). Output is silent —
+# callers branch on rc.
+_bridge_daemon_control_systemd_active() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null
+}
+
+# r4: check whether the installed systemd-user unit is refresh-capable
+# — i.e. its ExecStart crosses the sudo-to-self PAM boundary. Returns
+# 0 when the unit file contains either the explicit refresh-mode
+# environment marker (`BRIDGE_DAEMON_SYSTEMD_REFRESH_MODE=sudo-self`)
+# OR an ExecStart line that starts with sudo. rc=1 otherwise (legacy
+# direct-bash unit, missing unit, or unreadable).
+_bridge_daemon_control_systemd_unit_is_refresh_capable() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  local unit_file
+  # `systemctl --user cat` resolves the active unit file (drop-ins
+  # included). Quiet stderr to avoid noise on hosts that don't have
+  # the unit installed yet.
+  unit_file="$(systemctl --user cat agent-bridge-daemon.service 2>/dev/null || true)"
+  [[ -n "$unit_file" ]] || return 1
+  # Either marker satisfies the check:
+  if printf '%s' "$unit_file" | grep -qF -- 'BRIDGE_DAEMON_SYSTEMD_REFRESH_MODE=sudo-self'; then
+    return 0
+  fi
+  if printf '%s' "$unit_file" | grep -qE '^[[:space:]]*ExecStart=[[:space:]]*[^ ]*sudo[[:space:]]'; then
+    return 0
+  fi
+  return 1
+}
+
 # Resolve the controller user. Prefers BRIDGE_CONTROLLER_USER (set by
 # bridge-lib.sh when the operator is the controller); falls back to the
 # current effective user. Refuses to return root (sudoers MUST authorize
@@ -336,6 +384,101 @@ bridge_daemon_refresh_after_group_membership_change() {
     printf 'skipped-daemon-already-has-group'
     return 0
   fi
+
+  # ----- Beta20 L2 Variant 3A r4: systemd-user managed daemon branch -----
+  #
+  # When systemd-user is managing the daemon, a direct `sudo
+  # bridge-daemon.sh restart` races `Restart=always`: systemd notices
+  # the TERM-exit and immediately re-spawns the daemon from its OWN
+  # stale credential set (the user manager's supp groups were captured
+  # at login, before the `usermod -aG` for this agent). The r3 path
+  # would "succeed" briefly then get steamrolled.
+  #
+  # The fix (codex r4): make the systemd unit's ExecStart itself cross
+  # the sudo-to-self PAM boundary so every systemd-driven start gets
+  # fresh credentials. When that unit is in place (detected by
+  # BRIDGE_DAEMON_SYSTEMD_REFRESH_MODE=sudo-self env marker or a sudo-
+  # prefixed ExecStart line), `systemctl --user restart` IS the refresh
+  # mechanism — we don't need a bridge-managed direct sudo restart at
+  # all on systemd-managed hosts.
+  if _bridge_daemon_control_systemd_active; then
+    if _bridge_daemon_control_systemd_unit_is_refresh_capable; then
+      # Sudo-self ExecStart is in place. systemctl restart triggers
+      # PAM/initgroups via the sudo wrapper → fresh daemon credentials.
+      local _systemctl_rc=0
+      systemctl --user restart agent-bridge-daemon.service 2>/dev/null \
+        || _systemctl_rc=$?
+      if (( _systemctl_rc != 0 )); then
+        bridge_warn "daemon-refresh: systemctl --user restart agent-bridge-daemon.service failed (rc=$_systemctl_rc)"
+        printf 'failed-systemctl-restart'
+        return 1
+      fi
+
+      # Poll for cmdline-verified daemon up with target GID. Don't
+      # key on pid-changed — Linux recycles PIDs and the unit's main
+      # process may be `sudo` (KillMode=process keeps that as the
+      # tracked PID), with the actual `bridge-daemon.sh run` as the
+      # sudo child. bridge_daemon_pid resolves by cmdline so it
+      # returns the bash daemon child, not the sudo wrapper.
+      local _waited=0
+      local _new_pid=""
+      local _has_gid=0
+      while (( _waited < 15 )); do
+        _new_pid="$(bridge_daemon_pid 2>/dev/null || true)"
+        if [[ -n "$_new_pid" ]] && kill -0 "$_new_pid" 2>/dev/null; then
+          if _bridge_daemon_control_daemon_has_gid "$target_gid"; then
+            _has_gid=1
+            break
+          fi
+        fi
+        sleep 1
+        _waited=$(( _waited + 1 ))
+      done
+
+      if [[ -z "$_new_pid" ]] || ! kill -0 "$_new_pid" 2>/dev/null; then
+        bridge_warn "daemon-refresh: systemctl restart succeeded but no daemon pid observable within 15s"
+        printf 'failed-systemctl-restart'
+        return 1
+      fi
+      if (( _has_gid == 0 )); then
+        bridge_warn "daemon-refresh: systemd-restarted daemon pid=$_new_pid does NOT have GID $target_gid in supp groups — sudo/PAM did not refresh"
+        printf 'failed-systemd-refresh-no-gid'
+        return 1
+      fi
+
+      # r4: confirm exactly one bridge-daemon.sh run process is live
+      # (codex r4 risk note — KillMode=process + sudo-wrapped ExecStart
+      # could in principle leave orphan children if a previous restart
+      # was racy). We don't fail the refresh on >1 daemon — log it as
+      # a warning so the operator can investigate, but the GID check
+      # above already proves the resolved daemon is correct.
+      local _daemon_count
+      _daemon_count="$(pgrep -fc "bridge-daemon.sh run" 2>/dev/null || printf '0')"
+      if [[ "$_daemon_count" =~ ^[0-9]+$ ]] && (( _daemon_count > 1 )); then
+        bridge_warn "daemon-refresh: systemd-restart left $_daemon_count live bridge-daemon.sh run processes (expected 1) — pid=$_new_pid is the cmdline-verified primary"
+      fi
+
+      bridge_audit_log daemon daemon_refresh_systemd_sudo_self daemon \
+        --detail group="$group" \
+        --detail gid="$target_gid" \
+        --detail new_pid="$_new_pid" \
+        --detail daemon_count="$_daemon_count" \
+        --detail reason="$(_bridge_daemon_control_sanitize_reason "$reason")" >/dev/null 2>&1 || true
+
+      printf 'ok-systemd-sudo-self'
+      return 0
+    fi
+
+    # Systemd is active but the unit's ExecStart is the legacy direct
+    # `bash bridge-daemon.sh run` shape — `systemctl --user restart`
+    # would just re-fork from the stale user manager. Don't try the
+    # bridge-managed sudo restart either: Restart=always races us.
+    # Tell the operator how to regenerate the unit.
+    bridge_warn "daemon-refresh: systemd-user unit is active but ExecStart is NOT sudo-wrapped — refusing to race Restart=always"
+    printf 'manual-required-systemd-unit-stale'
+    return 1
+  fi
+  # ----- End systemd branch — fall through to r3 direct sudo path. -----
 
   # Step 6: invoke sudo. Exact shape from codex r3 §3.
   local controller_user=""
