@@ -6,6 +6,116 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta21] — 2026-05-25
+
+### Highlight — P0 wave-1 hotfix: state-leaf + iso-uid queue + start-path catalog
+
+Operator-cued **twenty-first prerelease**. patch's beta20 verify confirmed
+3 P0 wave-1 hotfix items blocking "iso agents as first-class citizens":
+session-resume break across restart, iso UID `agb task create` EACCES,
+and existing-iso-agent `marketplace-mismatch` on `agent start` after
+new marketplace seed. All closed in one PR (#1193) with codex r1
+guidance baked into the fixer brief.
+
+`-beta21` prerelease; matching tag `v0.14.5-beta21`, GitHub release
+marked **Pre-release**. Stay on beta per Sean's standing rule.
+
+### Fixed — L1-M state/agents/<a>/ contract aligned with grant matrix SSOT (#1193)
+
+- **`lib/bridge-isolation-v2-reconcile.sh`** — `agent-state-leaf`
+  reconciler row aligned to the existing per-agent grant matrix SSOT
+  (`lib/bridge-isolation-v2.sh:1596-1622`): `controller:ab-agent-<X>:2770
+  required` for linux-user agents, `controller:controller_group:2770
+  required` for shared-mode. Was previously `controller:ab-shared:0710
+  optional`, leaving a 5-step contract drift where iso UID couldn't
+  mkdir into `state/agents/<X>/` even though the per-agent grant matrix
+  expected to find it pre-created. Bridge writes (session-id, idle-since,
+  compact-snapshot) now succeed on every iso agent restart.
+
+- **Closes Claude `--resume <session_id>` failure on iso agent restart**.
+  test_iso3-class agents on patch's host accumulated 5 orphan `*.jsonl`
+  transcripts from successive fresh sessions; beta21 ensures session
+  continuity across restart. The 5 orphan transcripts on patch's host
+  stay as historical artifacts (no migration in this hotfix).
+
+### Fixed — L1-N iso UID queue access via scoped env + roster_local skip (#1193)
+
+- **`lib/bridge-state.sh:bridge_load_roster`** — extended scoped env
+  discovery to also try the v2 runtime path
+  `$BRIDGE_AGENT_ROOT_V2/<agent>/runtime/agent-env.sh` when
+  `BRIDGE_AGENT_ID` is set (legacy path `state/agents/<agent>/
+  agent-env.sh` checked first for back-compat). Scoped env sets
+  `BRIDGE_GATEWAY_PROXY=1` so queue commands route through the
+  daemon-side gateway instead of touching the SQLite DB directly,
+  bypassing the protected `BRIDGE_ROSTER_LOCAL_FILE` entirely.
+
+- **Queue-safe roster_local skip** (narrow, NOT global) — when
+  scoped env discovery fails AND effective UID is non-controller
+  AND `$BRIDGE_ROSTER_LOCAL_FILE` is unreadable AND the calling verb
+  is a known queue-safe verb (`task create`/`done`/`claim`, `inbox`,
+  `ack`), skip the source with one-shot `bridge_warn`. Non-queue verbs
+  fail-closed with actionable error pointing to scoped env or controller-
+  side invocation. **`BRIDGE_ROSTER_LOCAL_FILE` stays at 0600** —
+  no chmod.
+
+- **`bridge-task.sh`, `bridge-queue-gateway.py`, `agent-bridge`** —
+  queue verbs wired through the new discovery + skip path.
+
+- **`bridge-queue-gateway.py:atomic_write_json` chmod 0640 tail** —
+  controller-side response writes were landing at default umask 077
+  (0600 owned by controller), blocking the iso UID's response poll
+  even after L1-N unblocked the request side. `os.chmod(tmp, 0o640)`
+  + the setgid parent dir's ab-agent-<X> group inheritance gives
+  BOTH sides group read. Surface bounded by per-agent group
+  composition (controller + the iso UID).
+
+### Fixed — L1-D canonical share_plugin_catalog on start/restart path (#1193)
+
+- **`bridge-start.sh`** — calls `bridge_linux_share_plugin_catalog
+  "$os_user" "$user_home" "$controller_user" "$AGENT"` immediately
+  after `bridge_write_linux_agent_env_file` and before SESSION_CMD
+  launch (Linux-only). Was previously only invoked during
+  `bridge_linux_prepare_agent_isolation` (agent create / reapply
+  flows), missing the case where an operator seeds a new marketplace
+  AFTER agent create.
+
+- Uses the CANONICAL writer (not the seed-only D2 merge helper from
+  beta20 PR #1189). Per-UID `known_marketplaces.json` +
+  `installed_plugins.json` + marketplace symlinks re-derived from
+  shared cache on every start/restart, overwriting stale/manual
+  entries. **Closes the "operator drifted existing iso agent →
+  marketplace-mismatch" regression** patch flagged on beta20 verify.
+
+- `BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS=1` mode skips the share
+  call (preserves suppress-aware launcher contract). Normal start
+  with missing shared cache fails loud per existing UX.
+
+### Tests
+
+- **NEW `scripts/smoke/l1n-iso-uid-queue-roster-skip.sh`** — exercises
+  scoped env v2-runtime-path discovery and queue-safe roster_local
+  skip. Fixture simulates iso UID context (non-controller UID,
+  unreadable roster_local) + verifies `task create` succeeds via
+  scoped env + gateway, and a non-queue command fails-closed.
+
+- **`scripts/smoke/phase2-install-tree-reconciler.sh`** extended —
+  asserts `agent-state-leaf` row uses `2770 ab-agent-<X> required`
+  for linux-user agents.
+
+### Verification
+
+- **VM acceptance** (OrbStack `agb-clean-test`, Ubuntu noble arm64,
+  IN-PLACE UPGRADE from beta20) — 8-step matrix PASS per fixer
+  report (state-leaf 2770, restart preserves session resume,
+  `agb task create` from iso UID via gateway, `agent start` re-applies
+  marketplace catalog, `agent-bridge isolation reconcile --check
+  --agent <X>` agent-state-leaf row OK).
+
+- **Pre-existing CI fragility unchanged** — `1121-agent-delete-os-purge`
+  C5 (`bridge_warn` stderr vs smoke stdout capture mismatch) still
+  fails on `main` / `stabilize` independent of this PR. Merged via
+  admin override (Phase 2/3/L1/L2 pattern).
+
 ## [0.14.5-beta20] — 2026-05-25
 
 ### Highlight — L2 daemon supp-groups refresh + L1 wave 2 plugin-install closure
