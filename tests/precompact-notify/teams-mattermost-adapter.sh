@@ -523,6 +523,21 @@ t9_teams_writer_schema() {
     fail "$case" "expected last_user_inbound_recorded_ns numeric; got: $(cat "$index_path")"
     return
   fi
+  # L1 beta19 (codex r1 design 2026-05-25): the activity-index file must
+  # land at mode 0640 so the controller daemon's route lookup
+  # (bridge-channels.py:289-304) can read it through the ab-shared group
+  # when the file was created by an isolated UID. Prior to L1 beta19 the
+  # writer used 0600, which blocked the daemon read.
+  local actual_mode
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    actual_mode="$(stat -f '%Lp' "$index_path" 2>/dev/null)"
+  else
+    actual_mode="$(stat -c '%a' "$index_path" 2>/dev/null)"
+  fi
+  if [[ "$actual_mode" != "640" ]]; then
+    fail "$case" "expected activity-index file mode 0640 (L1 beta19); got mode $actual_mode at $index_path"
+    return
+  fi
   pass "$case"
 }
 

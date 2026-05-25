@@ -1841,6 +1841,37 @@ if [[ $DRY_RUN -eq 0 ]]; then
     tail -n 50 "$_iso_reconcile_tmp" >&2 || true
   fi
   rm -f -- "$_iso_reconcile_tmp"
+
+  # L1 beta19 (codex r1 design 2026-05-25): in-place upgrade is the
+  # beta19 acceptance path. patch may not rerun `agb setup teams`, so
+  # the bun-traverse helper has to fire here too — otherwise an upgrade
+  # from beta18 to beta19 leaves $HOME/.bun at the operator's umask
+  # (0750 on Debian/Ubuntu) and isolated Teams MCP startup hits EACCES
+  # on exec even though every install-tree row above converged.
+  #
+  # Best-effort, non-fatal: the bun-traverse helper emits bridge_warn on
+  # chmod failures but returns non-zero. Wrap in set +e so the upgrade
+  # does not abort. Linux + $HOME/.bun gating is internal to the helper
+  # (no-op elsewhere).
+  #
+  # Footgun #11: invoke via standalone helper in lib/upgrade-helpers/
+  # rather than -c with embedded script. Keeps the pattern symmetrical
+  # with isolation-v2-reconcile.sh and avoids any future heredoc-stdin
+  # temptation in this file.
+  set +e
+  _bun_traverse_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-bun-traverse.XXXXXX")"
+  bridge_upgrade_with_target_env "$TARGET_ROOT" \
+    "$BRIDGE_BASH_BIN" \
+    "$SOURCE_ROOT/lib/upgrade-helpers/bun-traverse-chmod.sh" \
+    "$SOURCE_ROOT" "$TARGET_ROOT" >"$_bun_traverse_tmp" 2>&1
+  _bun_traverse_rc=$?
+  set -e
+  if [[ $_bun_traverse_rc -ne 0 ]]; then
+    echo "[bridge-upgrade] WARN: bun-runtime traverse chmod reported failure (rc=$_bun_traverse_rc) — isolated agents may fail to exec bun. Run 'chmod o+x \$HOME/.bun \$HOME/.bun/bin' manually or set BRIDGE_BUN_CHMOD_OPT_OUT=1 to suppress." >&2
+    _upgrade_partial_failures+=("bun_traverse")
+    tail -n 20 "$_bun_traverse_tmp" >&2 || true
+  fi
+  rm -f -- "$_bun_traverse_tmp"
 fi
 
 # Footgun #11: `bridge_upgrade_agent_restart_json` feeds python via heredoc;

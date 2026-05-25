@@ -517,9 +517,25 @@ export function writeTeamsActivityIndex(
       last_user_inbound_user_id: userId,
       last_user_inbound_recorded_ns: nowNs,
     }
+    // L1 beta19 (codex r1 design 2026-05-25): activity-index files are
+    // read by the controller daemon's route lookup (bridge-channels.py:
+    // 289-304) even when the file was created by an isolated UID. Mode
+    // 0600 blocks the daemon's read; widen to 0640 so the ab-shared
+    // group (which the reconciler sets via setgid on
+    // state/channels/teams/) covers the controller read path while world
+    // remains locked out.
+    //
+    // We chmod both the tmp file (in case the rename races a reader that
+    // opens by name before chmod hits) and the final file after rename
+    // (atomic-mode replace on most filesystems, but chmodSync is the
+    // belt-and-braces invariant). Keep the generic per-agent state files
+    // routed through saveJson() at mode 0600 — only the activity index
+    // needs the daemon-group read grant.
     const tmp = `${path}.tmp`
-    writeFileSync(tmp, JSON.stringify(index, null, 2) + '\n', { mode: 0o600 })
+    writeFileSync(tmp, JSON.stringify(index, null, 2) + '\n', { mode: 0o640 })
+    chmodSync(tmp, 0o640)
     renameSync(tmp, path)
+    chmodSync(path, 0o640)
   } catch (err) {
     process.stderr.write(`teams channel: activity-index write failed: ${err}\n`)
   }
@@ -2218,6 +2234,65 @@ export function isInboundFromBotOrSelf(activity: Partial<Activity> & { from?: { 
   return false
 }
 
+/**
+ * L1 beta19 (codex r1 design 2026-05-25): BotFrameworkAdapter's
+ * processActivity assumes an Express-shaped response with `status()`
+ * and `send()`. Node's native http.ServerResponse only exposes
+ * `writeHead/end`, so the adapter throws TypeError on response-write
+ * paths (auth challenges, error replies). This shim adapts the
+ * native response to the Express subset the adapter actually calls.
+ *
+ * We deliberately do NOT migrate to CloudAdapter.processActivityDirect
+ * — that changes the auth/adapter semantics (CloudAdapter expects
+ * SingleTenant/MultiTenant credential resolution paths the current
+ * BotFrameworkAdapter setup does not have) and is well out of scope
+ * for an L1 stabilization fix.
+ *
+ * Exported for the shim smoke harness (server.ts `_smoke-shim`
+ * subcommand).
+ *
+ * Contract:
+ *   status(code)   → sets res.statusCode, returns the shim (chainable).
+ *   send(body)     → ends the native response exactly once.
+ *     Buffer / string  → res.end(body) as-is
+ *     object           → JSON.stringify + 'Content-Type: application/json'
+ *                        (only when no Content-Type already set)
+ *     undefined / null → res.end() with no body
+ *
+ * Second `send()` call is a no-op (defensive against the adapter
+ * accidentally double-ending on an error catch path).
+ */
+export function createExpressResponseShim(res: import('http').ServerResponse): {
+  status(code: number): any
+  send(body?: unknown): any
+} {
+  let ended = false
+  const shim: any = {
+    status(code: number) {
+      res.statusCode = code
+      return shim
+    },
+    send(body?: unknown) {
+      if (ended) return shim
+      ended = true
+      if (body === undefined || body === null) {
+        res.end()
+        return shim
+      }
+      if (Buffer.isBuffer(body) || typeof body === 'string') {
+        res.end(body)
+        return shim
+      }
+      if (!res.getHeader('Content-Type')) {
+        res.setHeader('Content-Type', 'application/json')
+      }
+      res.end(JSON.stringify(body))
+      return shim
+    },
+  }
+  return shim
+}
+
 const httpServer = createServer((req, res) => {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
   if (req.method === 'GET' && url.pathname === '/health') {
@@ -2231,7 +2306,8 @@ const httpServer = createServer((req, res) => {
     return
   }
   if (req.method === 'POST' && url.pathname === '/api/messages') {
-    adapter.processActivity(req, res, async context => {
+    const shim = createExpressResponseShim(res)
+    adapter.processActivity(req, shim as any, async context => {
       await handleActivity(context)
     }).catch(err => {
       process.stderr.write(`teams channel: processActivity failed: ${err}\n`)
@@ -2343,6 +2419,98 @@ if (CLI_SUBCOMMAND === 'send-managed') {
 // `_smoke-channel-meta` asserts the direct Claude channel notification uses
 // scalar metadata, not the richer bridge queue payload. All smoke commands
 // short-circuit before httpServer.listen.
+if (CLI_SUBCOMMAND === '_smoke-shim') {
+  // L1 beta19 (codex r1 design 2026-05-25): exercise createExpressResponseShim
+  // with a fake http.ServerResponse that has writeHead/end but no
+  // status/send. The shim is what closes the BotFrameworkAdapter
+  // TypeError. Asserts response completes cleanly (no thrown TypeError
+  // on `res.status(...).send(...)`), and that the status + content-type
+  // + body propagated through to the underlying response. Output is
+  // a single JSON line on stdout consumed by the smoke harness.
+  const argv = process.argv.slice(3)
+  const flags: Record<string, string> = {}
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    if (!arg.startsWith('--')) continue
+    const key = arg.slice(2)
+    const value = argv[i + 1] && !argv[i + 1].startsWith('--') ? argv[i + 1] : ''
+    if (value) i++
+    flags[key] = value
+  }
+  const variant = String(flags['variant'] ?? 'json').trim()
+  // Build a minimal ServerResponse stand-in: just statusCode, headers,
+  // writeHead, end, setHeader, getHeader. Express does not introspect
+  // beyond these for the status/send code paths.
+  const headers: Record<string, string | number | string[]> = {}
+  let body: any = undefined
+  let ended = false
+  let endCalls = 0
+  const fakeRes: any = {
+    statusCode: 0,
+    headersSent: false,
+    writeHead(code: number, hdrs?: Record<string, string | number>) {
+      fakeRes.statusCode = code
+      fakeRes.headersSent = true
+      if (hdrs) Object.assign(headers, hdrs)
+    },
+    setHeader(name: string, value: string | number | string[]) {
+      headers[name] = value
+    },
+    getHeader(name: string) {
+      return headers[name]
+    },
+    end(b?: any) {
+      endCalls++
+      ended = true
+      body = b
+    },
+  }
+  let threw = false
+  let errMsg = ''
+  try {
+    const shim = createExpressResponseShim(fakeRes as any)
+    if (variant === 'json') {
+      shim.status(202).send({ ok: true, smoke: 'shim' })
+    } else if (variant === 'string') {
+      shim.status(200).send('plain string body')
+    } else if (variant === 'buffer') {
+      shim.status(200).send(Buffer.from('buffer-body'))
+    } else if (variant === 'empty') {
+      shim.status(204).send()
+    } else if (variant === 'null') {
+      shim.status(204).send(null)
+    } else if (variant === 'double-send') {
+      shim.status(200).send({ first: true })
+      shim.send({ second: 'should be ignored' })
+    } else {
+      process.stderr.write(`teams _smoke-shim: unknown variant '${variant}'\n`)
+      process.exit(2)
+    }
+  } catch (e) {
+    threw = true
+    errMsg = String(e)
+  }
+  const result = {
+    variant,
+    threw,
+    err: errMsg,
+    ended,
+    endCalls,
+    statusCode: fakeRes.statusCode,
+    contentType: headers['Content-Type'] ?? null,
+    bodyKind: body === undefined
+      ? 'undefined'
+      : body === null
+        ? 'null'
+        : Buffer.isBuffer(body)
+          ? 'buffer'
+          : typeof body,
+    bodyString: body === undefined || body === null ? '' : String(body),
+  }
+  process.stdout.write(JSON.stringify(result) + '\n')
+  process.exit(0)
+}
+
 if (
   CLI_SUBCOMMAND === '_smoke-record-activity'
   || CLI_SUBCOMMAND === '_smoke-should-record'
