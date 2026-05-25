@@ -4061,6 +4061,29 @@ bridge_linux_prepare_agent_isolation() {
   bridge_isolation_v2_ensure_user_in_group "$controller_user" "$_v2_agent_group" \
     || bridge_die "isolation v2: cannot add controller '$controller_user' to '$_v2_agent_group'"
 
+  # Diagnostic warning for KNOWN_ISSUES §28 / #1207: a long-running shell
+  # or daemon does NOT pick up new supplementary groups until it restarts.
+  # The controller's `id -G` reflects login-time membership; an `agent create`
+  # that adds the controller to a fresh `ab-agent-<X>` group leaves any
+  # already-running process unable to traverse `data/agents/<X>/` until
+  # restart. Read/probe ops are protected by the #1207 literal-fallback in
+  # `bridge_iso_run_path_under_allowlist`, but write/publish ops still
+  # rely on canonicalization and benefit from the operator refreshing
+  # their shell. This is hint-only; first-touch correctness does NOT
+  # depend on the operator following the hint.
+  if [[ "$(uname -s 2>/dev/null)" == "Linux" ]]; then
+    local _current_supp_groups=""
+    _current_supp_groups="$(id -nG 2>/dev/null | tr ' ' '\n' || true)"
+    if ! printf '%s\n' "$_current_supp_groups" | grep -Fxq -- "$_v2_agent_group"; then
+      bridge_warn "isolation v2: this shell's supplementary group cache does not include the freshly created '$_v2_agent_group' (KNOWN_ISSUES §28)."
+      bridge_warn "             Read/probe paths (channel-required validator, .teams/.env, etc.) recover automatically via the iso-side fallback," # noqa: iso-helper-boundary
+      bridge_warn "             but controller-side writes under data/agents/$agent/ may need a refreshed shell. To refresh now, run:"
+      bridge_warn "               exec sg $_v2_agent_group -- \$SHELL"
+      bridge_warn "             OR wrap subsequent commands as: sg $_v2_agent_group -c \"...\"."
+      bridge_warn "             OR open a new terminal — supplementary groups refresh at login."
+    fi
+  fi
+
   # Shared-group membership. PR-C migration adds existing agents to
   # ab-shared, but a new/reapplied agent through prepare must also join so
   # bridge_linux_share_plugin_catalog can read the shared plugin cache.

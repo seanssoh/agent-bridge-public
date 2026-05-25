@@ -502,7 +502,136 @@ _bridge_iso_run_collect_canonical_roots() {
   unset -f _print_if_resolves 2>/dev/null || true
 }
 
-# bridge_iso_run_path_under_allowlist <agent> <path>
+# _bridge_iso_run_collect_raw_roster_roots <agent>
+# Print one RAW (unresolved) bridge-owned roster root per line to stdout.
+#
+# This is the fallback companion to _bridge_iso_run_collect_canonical_roots
+# for the #1207 stale-supp-groups case: when the controller's process can't
+# `readlink -f` an iso-owned root (because the supplementary group cache
+# is stale for a long-running shell/daemon), canonicalization returns
+# empty and the canonical compare fails. The literal-prefix fallback uses
+# THESE roots — but ONLY when accompanied by an isolated-UID probe that
+# proves the root actually exists on disk (see fallback predicate in
+# bridge_iso_run_path_under_allowlist).
+#
+# Differences from `_bridge_iso_run_collect_canonical_roots`:
+#   - Roots are emitted UNCANONICALIZED (literal roster values).
+#   - `BRIDGE_ISO_RUN_ALLOWLIST_EXTRA` is INTENTIONALLY EXCLUDED. The
+#     extra env is a smoke-only / operator-debug override and must NOT
+#     receive the stale-supp-groups fallback — otherwise the smoke
+#     sandbox could be widened by accident.
+#   - Roots are emitted only when they look like absolute paths and
+#     have no literal `..` segment. The fallback path consumer also
+#     re-checks both invariants on the requested path.
+_bridge_iso_run_collect_raw_roster_roots() {
+  local agent="$1"
+  local raw_root=""
+  local os_user=""
+
+  _print_if_safe_raw() {
+    local r="$1"
+    [[ -n "$r" ]] || return 0
+    # Must be absolute.
+    [[ "${r:0:1}" == "/" ]] || return 0
+    # Must have no literal `..` segment.
+    if _bridge_iso_run_has_dotdot_segment "$r"; then
+      return 0
+    fi
+    r="${r%/}"
+    printf '%s\n' "$r"
+  }
+
+  if declare -F bridge_agent_workdir >/dev/null 2>&1; then
+    raw_root="$(bridge_agent_workdir "$agent" 2>/dev/null || printf '')"
+    _print_if_safe_raw "$raw_root"
+  fi
+
+  if declare -F bridge_agent_default_home >/dev/null 2>&1; then
+    raw_root="$(bridge_agent_default_home "$agent" 2>/dev/null || printf '')"
+    _print_if_safe_raw "$raw_root"
+  fi
+
+  if declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    if declare -F bridge_agent_os_user >/dev/null 2>&1 \
+        && declare -F bridge_agent_linux_user_home >/dev/null 2>&1; then
+      os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+      if [[ -n "$os_user" ]]; then
+        raw_root="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || printf '')"
+        _print_if_safe_raw "$raw_root"
+      fi
+    fi
+  fi
+
+  if declare -F bridge_agent_idle_marker_dir >/dev/null 2>&1; then
+    raw_root="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null || printf '')"
+    _print_if_safe_raw "$raw_root"
+  fi
+
+  unset -f _print_if_safe_raw 2>/dev/null || true
+}
+
+# _bridge_iso_run_op_allows_literal_fallback <op>
+# Return 0 iff <op> is a read/probe op for which the literal-prefix
+# fallback is safe to enable when canonicalization fails (#1207).
+#
+# Read/probe ops only inspect file content/metadata — they CANNOT escape
+# the iso-owned subtree via a symlink ancestor any more than the iso UID
+# itself could (the op script still runs as the iso UID, which is also
+# subject to its own FS permissions).
+#
+# Write/publish ops are NOT eligible: mkdir-p / atomic-write / rename /
+# state-marker-write / publish-root-file / publish-root-symlink must
+# fail-closed under the canonical compare so the symlink-ancestor
+# write-side protection (codex r2 on beta23) stays intact.
+_bridge_iso_run_op_allows_literal_fallback() {
+  local op="$1"
+  case "$op" in
+    stat|read-file|read-json|env-has-any-key|read-env-key|scan-profile)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# _bridge_iso_run_iso_side_root_exists <agent> <raw_root>
+# Probe whether <raw_root> exists from the isolated UID's vantage point.
+# Used to distinguish "controller can't traverse because its supp-groups
+# cache is stale" from "root genuinely absent" in the literal-prefix
+# fallback (#1207).
+#
+# Returns:
+#   0 — iso UID confirms <raw_root> exists as a directory
+#   1 — iso UID confirms <raw_root> does not exist
+#   2 — could not probe (sudo unavailable, agent not isolated, etc.) —
+#       caller MUST fail closed since we cannot prove existence.
+_bridge_iso_run_iso_side_root_exists() {
+  local agent="$1"
+  local raw_root="$2"
+  [[ -n "$agent" && -n "$raw_root" ]] || return 2
+
+  if ! declare -F bridge_isolation_run_as_agent_user_via_bash >/dev/null 2>&1; then
+    return 2
+  fi
+
+  # Self-contained probe: stdin/argv-only, no heredoc, no here-string.
+  # Footgun #11 invariant.
+  local probe_script='[[ -d "$1" ]]'
+  local rc=0
+  bridge_isolation_run_as_agent_user_via_bash "$agent" "$probe_script" "$raw_root" \
+    >/dev/null 2>&1 || rc=$?
+  case "$rc" in
+    0) return 0 ;;
+    1) return 2 ;;  # agent NOT isolated — caller's controller-direct
+                    # path applies; we can't speak to iso-side existence.
+    2) return 2 ;;  # passwordless sudo unavailable — can't probe.
+    *) return 1 ;;  # script returned non-zero (path not -d) under iso UID.
+  esac
+}
+
+# bridge_iso_run_path_under_allowlist <agent> <path> [<op>]
 #
 # Returns 0 if <path> is under any allowlisted per-agent root, 1
 # otherwise.
@@ -528,14 +657,40 @@ _bridge_iso_run_collect_canonical_roots() {
 #      lexical-prefix on already-canonicalized strings. A symlink
 #      ancestor (e.g. `<allowed-root>/link -> /etc`) shows up as a
 #      canonical mismatch and is rejected.
+#   5. (#1207) If the canonical compare fails AND <op> is a read/probe
+#      op (stat / read-file / env-has-any-key / read-env-key /
+#      scan-profile), retry against the RAW roster roots and accept
+#      ONLY when ALL of:
+#        - request path is lexically under a raw roster root;
+#        - request path and root each have no `..` segment and are
+#          absolute;
+#        - controller canonicalize returned empty for the root
+#          (i.e. the canonical compare failed BECAUSE the controller
+#          couldn't traverse, not because the request was outside);
+#        - the iso UID (probed via bridge_isolation_run_as_agent_user_via_bash)
+#          confirms the root exists on disk.
+#      This recovers from KNOWN_ISSUES §28 (controller supp-groups go
+#      stale) for read/probe paths only — write/publish ops keep their
+#      canonical fail-closed behavior so the symlink-ancestor write-side
+#      protection is preserved.
+#
+# Args:
+#   $1 — agent name
+#   $2 — path to validate
+#   $3 — op (optional). When the canonical compare fails, the literal-
+#        path fallback is only attempted if <op> is a known read/probe
+#        op (see _bridge_iso_run_op_allows_literal_fallback).
 #
 # Return:
 #   0 — path canonicalizes under one of the canonical allowlist roots
-#   1 — escape detected (`..` segment, symlink ancestor, no canonical
-#       root match, canonicalization failure)
+#       (or, for read/probe ops, lexically under a raw root with
+#       iso-side existence proof)
+#   1 — escape detected (`..` segment, symlink ancestor, no root match,
+#       canonicalization failure, or fallback predicate not met)
 bridge_iso_run_path_under_allowlist() {
   local agent="$1"
   local path="$2"
+  local op="${3:-}"
   [[ -n "$agent" && -n "$path" ]] || return 1
 
   # Reject literal `..` segments BEFORE canonicalization. `..` would
@@ -553,13 +708,12 @@ bridge_iso_run_path_under_allowlist() {
   # walking up to the deepest existing ancestor).
   local canon_path=""
   canon_path="$(_bridge_iso_run_canonicalize_destination "$path" 2>/dev/null || true)"
+  local canon_path_ok=1
   if [[ -z "$canon_path" ]]; then
-    # Could not canonicalize — refuse rather than fall through. This
-    # is the fail-closed branch for paths whose entire ancestor chain
-    # is missing (rare but possible during agent bootstrap).
-    return 1
+    canon_path_ok=0
+  else
+    canon_path="${canon_path%/}"
   fi
-  canon_path="${canon_path%/}"
 
   # Collect canonical allowlist roots and prefix-match against them.
   local canon_roots_tmp
@@ -567,21 +721,89 @@ bridge_iso_run_path_under_allowlist() {
   # shellcheck disable=SC2064
   trap "rm -f '$canon_roots_tmp' 2>/dev/null" RETURN
 
-  _bridge_iso_run_collect_canonical_roots "$agent" >"$canon_roots_tmp" 2>/dev/null || true
+  if [[ "$canon_path_ok" -eq 1 ]]; then
+    _bridge_iso_run_collect_canonical_roots "$agent" >"$canon_roots_tmp" 2>/dev/null || true
 
-  local canon_root=""
-  local matched=0
-  while IFS= read -r canon_root; do
-    [[ -n "$canon_root" ]] || continue
-    if [[ "$canon_path" == "$canon_root" || "$canon_path" == "$canon_root"/* ]]; then
-      matched=1
-      break
+    local canon_root=""
+    local matched=0
+    while IFS= read -r canon_root; do
+      [[ -n "$canon_root" ]] || continue
+      if [[ "$canon_path" == "$canon_root" || "$canon_path" == "$canon_root"/* ]]; then
+        matched=1
+        break
+      fi
+    done <"$canon_roots_tmp"
+
+    if [[ "$matched" -eq 1 ]]; then
+      rm -f "$canon_roots_tmp" 2>/dev/null
+      trap - RETURN
+      return 0
     fi
-  done <"$canon_roots_tmp"
+  fi
+
+  # ---- read/probe-only literal-prefix fallback (#1207) ---------------------
+  #
+  # The canonical compare failed (or canonicalization of the request
+  # itself failed). For read/probe ops, attempt the literal-prefix
+  # fallback to recover from controller stale supp-groups. Write/publish
+  # ops keep the canonical fail-closed behavior — they must not slip
+  # past the symlink-ancestor protection.
+  if _bridge_iso_run_op_allows_literal_fallback "$op"; then
+    local raw_roots_tmp
+    raw_roots_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-iso-run-raw-roots.XXXXXX")" || {
+      rm -f "$canon_roots_tmp" 2>/dev/null
+      trap - RETURN
+      return 1
+    }
+
+    _bridge_iso_run_collect_raw_roster_roots "$agent" >"$raw_roots_tmp" 2>/dev/null || true
+
+    local raw_root=""
+    local raw_canon=""
+    local fallback_matched=0
+    while IFS= read -r raw_root; do
+      [[ -n "$raw_root" ]] || continue
+      # Predicate (a): lexically-under match. Raw root already had `..`
+      # rejected and absolute prefix verified by the collector.
+      if [[ "$path" != "$raw_root" && "$path" != "$raw_root"/* ]]; then
+        continue
+      fi
+      # Predicate (b): request path absolute (raw root collector
+      # guarantees `..`-free + absolute on its side; the request is
+      # `..`-free by the early reject at the top of this function).
+      [[ "${path:0:1}" == "/" ]] || continue
+      # Predicate (c): controller canonicalize returned empty FOR THE
+      # ROOT. If readlink -f works for the root from the controller's
+      # vantage, the canonical compare above would have matched (or
+      # legitimately rejected an outside path); falling here without a
+      # canonicalize failure means the request really is outside.
+      raw_canon="$(_bridge_iso_run_canonicalize "$raw_root" 2>/dev/null || true)"
+      if [[ -n "$raw_canon" ]]; then
+        continue
+      fi
+      # Predicate (d): iso UID confirms the root exists on disk. This
+      # is what distinguishes "stale supp-groups blinding controller"
+      # from "root genuinely absent". `rc=0` means iso UID sees the
+      # root as a directory; any other rc (1 = not -d under iso UID,
+      # 2 = could not probe / not isolated / no sudo) fails closed.
+      _bridge_iso_run_iso_side_root_exists "$agent" "$raw_root"
+      local probe_rc=$?
+      if [[ "$probe_rc" -ne 0 ]]; then
+        continue
+      fi
+      fallback_matched=1
+      break
+    done <"$raw_roots_tmp"
+
+    rm -f "$raw_roots_tmp" 2>/dev/null
+    rm -f "$canon_roots_tmp" 2>/dev/null
+    trap - RETURN
+    [[ "$fallback_matched" -eq 1 ]] && return 0
+    return 1
+  fi
 
   rm -f "$canon_roots_tmp" 2>/dev/null
   trap - RETURN
-  [[ "$matched" -eq 1 ]] && return 0
   return 1
 }
 
@@ -790,13 +1012,18 @@ bridge_iso_run() {
   [[ -n "$op" ]] || { printf 'bridge_iso_run: --op required\n' >&2; return 2; }
 
   # ---- path allowlist gate ----
+  #
+  # Pass <op> to bridge_iso_run_path_under_allowlist so it can enable
+  # the read/probe-only literal-prefix fallback for #1207. Write/publish
+  # ops (mkdir-p / atomic-write / rename / state-marker-write /
+  # publish-root-file / publish-root-symlink) keep canonical fail-closed.
   local primary_path=""
   case "$op" in
     publish-root-symlink) primary_path="$link_path" ;;
     rename)
       primary_path="$to_path"
       if [[ -n "$from_path" ]]; then
-        bridge_iso_run_path_under_allowlist "$agent" "$from_path" || return 40
+        bridge_iso_run_path_under_allowlist "$agent" "$from_path" "$op" || return 40
       fi
       ;;
     scan-profile)        primary_path="$workdir_path" ;;
@@ -809,7 +1036,7 @@ bridge_iso_run() {
     *)                   primary_path="$path" ;;
   esac
   if [[ -n "$primary_path" ]]; then
-    bridge_iso_run_path_under_allowlist "$agent" "$primary_path" || return 40
+    bridge_iso_run_path_under_allowlist "$agent" "$primary_path" "$op" || return 40
   fi
 
   # ---- isolation gate ----
@@ -1124,8 +1351,10 @@ _bridge_iso_run_state_marker_write() {
   [[ -n "$dir" ]] || return 5
   # Validate the resolved marker path is under the allowlist (defense in
   # depth; the dispatcher gate already passes since the marker dir IS
-  # one of the allowlisted roots).
-  bridge_iso_run_path_under_allowlist "$agent" "$dir/$marker" || return 40
+  # one of the allowlisted roots). Pass op="state-marker-write" so the
+  # gate keeps canonical fail-closed behavior (no #1207 literal fallback
+  # for writes).
+  bridge_iso_run_path_under_allowlist "$agent" "$dir/$marker" "state-marker-write" || return 40
 
   # mkdir-p the dir as the iso UID first (idempotent).
   _bridge_iso_run_agent_script "$agent" "$_BRIDGE_ISO_RUN_OP_MKDIR_P" "$dir" "0750"
