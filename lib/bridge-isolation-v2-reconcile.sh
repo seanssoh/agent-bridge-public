@@ -1222,17 +1222,48 @@ bridge_isolation_v2_install_tree_matrix_rows() {
     local state_root="${BRIDGE_STATE_DIR:-$data_root/state}"
     local state_agents_root="$state_root/agents"
     local state_agent_dir="$state_agents_root/$agent"
-    # state-agent-leaf creation lands here too so a freshly created
-    # isolated agent has its per-agent state dir present before the
-    # daemon's first marker write. The matrix in
-    # `bridge_isolation_v2_matrix_rows_for_agent` (lib/bridge-isolation-v2.sh)
-    # is the SSOT for the leaf's ownership/mode contract; this row
-    # only guarantees existence. apply mode does the mkdir, then the
-    # per-agent matrix's `state-agent-dir` row sets the leaf mode
-    # later in prepare flow (we don't replicate the ab-agent-<X>
-    # contract here to keep one source of truth).
-    printf '%s\n' \
-      "agent-state-leaf|per-agent|$state_agent_dir|state_scaffold|controller|ab-shared|0710|-|0|0|inherit|direct|optional|state/agents/$agent dir scaffold (per-agent matrix owns final mode)"
+    # state-agent-leaf — per-agent state/agents/<agent> dir scaffold.
+    #
+    # Codex L1-M r1 spec (PR #1196 / beta21): align this row to the SAME
+    # final contract that the per-agent grant matrix emits in
+    # `bridge_isolation_v2_matrix_rows_for_agent`
+    # (lib/bridge-isolation-v2.sh:1596-1622), so both `--reason
+    # agent-create` AND standalone `agent-bridge isolation reconcile
+    # --apply --agent <X>` converge to the SAME final state without an
+    # intermediate optional 0710 ab-shared stage. Without this
+    # alignment, the install-tree reconciler was leaving the leaf at
+    # 0710/ab-shared (its prior optional contract), and the per-agent
+    # matrix's `state-agent-dir` row would have to repair it on the
+    # next pass — which never reliably runs from the start-path, so
+    # state/agents/<agent>/ never landed at the final 2770 +
+    # ab-agent-<X> contract on existing iso agents. Claude session
+    # marker writes from the Stop hook then EACCESed and broke
+    # `--resume` continuity (the L1-M symptom).
+    #
+    # Contract per mode (matches matrix SSOT exactly):
+    #   linux-user agent  → owner=controller, group=ab-agent-<agent>,
+    #                       mode 2770, required.
+    #   shared-mode agent → owner=controller, group=controller_group,
+    #                       mode 2770, required.
+    #
+    # Note: the row's group field is emitted LITERAL for the
+    # linux-user case (`ab-agent-<agent>` is not in the resolver's
+    # token list at lib/bridge-isolation-v2-reconcile.sh:174-192) so
+    # apply-time token resolution returns it as-is. `controller_group`
+    # IS a resolver token and is resolved at apply time to the
+    # operator's primary group for the shared-mode branch.
+    local _v2_iso_mode_for_leaf=""
+    if command -v bridge_agent_isolation_mode >/dev/null 2>&1; then
+      _v2_iso_mode_for_leaf="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || true)"
+    fi
+    if [[ "$_v2_iso_mode_for_leaf" == "linux-user" \
+          && -n "$_v2_iso_agent_group" ]]; then
+      printf '%s\n' \
+        "agent-state-leaf|per-agent|$state_agent_dir|state_scaffold|controller|$_v2_iso_agent_group|2770|-|1|0|inherit|direct|required|state/agents/$agent dir scaffold — matrix SSOT (controller:ab-agent-<X>:2770) for linux-user; required so Stop-hook session marker writes and reconcile --apply both converge to the same final contract"
+    else
+      printf '%s\n' \
+        "agent-state-leaf|per-agent|$state_agent_dir|state_scaffold|controller|controller_group|2770|-|1|0|inherit|direct|required|state/agents/$agent dir scaffold — matrix SSOT (controller:controller_group:2770) for shared-mode; required so reconcile --apply converges to the same final state"
+    fi
 
     # ----- credential grant for this agent's iso UID context -----
     # Routed through the existing credential_grant helper which knows

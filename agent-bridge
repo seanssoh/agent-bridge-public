@@ -202,6 +202,26 @@ if [[ -z "${BRIDGE_CONTROLLER_UID:-}" ]]; then
   unset _bridge_recovery_home _bridge_recovery_marker
 fi
 
+# L1-N (beta21): mark this process as a queue-safe verb context BEFORE
+# sourcing bridge-lib.sh, so `bridge_load_roster` (inside the lib) can
+# fall through to the public-roster-only path when an iso UID runs an
+# `agb`-aliased queue verb (e.g. `agb show 123`, `agb done 123`) from
+# a controller-protected `BRIDGE_ROSTER_LOCAL_FILE`. The flag is only
+# set for the queue-shorthand verbs that line 1256 dispatches to
+# `bridge-task.sh` — every OTHER subcommand falls through unchanged
+# (channel/agent/admin verbs etc. still need roster_local and will
+# fail-closed on the iso-UID-without-scoped-env path).
+#
+# `task` and `inbox` skip `bridge_load_roster` at the wrapper level
+# (line 235 below) — bridge-task.sh sets the flag itself when invoked
+# directly, so they don't need to be enumerated here. The enumerated
+# tokens below mirror the dispatch table at line 1256.
+case "${1:-}" in
+  show|claim|done|cancel|update|handoff|summary|create)
+    export BRIDGE_QUEUE_SAFE_CONTEXT=1
+    ;;
+esac
+
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 

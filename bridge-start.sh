@@ -578,6 +578,68 @@ if bridge_isolation_disabled_by_env; then
 elif bridge_agent_linux_user_isolation_effective "$AGENT"; then
   AGENT_ENV_FILE="$(bridge_agent_linux_env_file "$AGENT")"
   bridge_write_linux_agent_env_file "$AGENT" "$AGENT_ENV_FILE"
+
+  # L1-D (beta21, codex r1 spec / PR #1196): re-derive the per-UID plugin
+  # catalog on every start/restart so an existing iso agent picks up
+  # marketplaces that were added AFTER the agent was created (via `agb
+  # plugins seed`, manual marketplace add, etc.). Without this, the
+  # per-UID `known_marketplaces.json` is only written at agent-create /
+  # reapply via `bridge_linux_prepare_agent_isolation` (lib/bridge-agents.sh:4156)
+  # and at `agb plugins seed` via the D2 merge helper (bridge-plugins.sh,
+  # PR #1189) — operator-side drift (e.g. iso HOME catalog reset, new
+  # external marketplace added to roster but no agent-recreate) leaves
+  # the iso UID with a stale catalog and dev-plugin-cache reports
+  # `marketplace-mismatch:<marketplace>` for every plugin that lives in
+  # the missing marketplace.
+  #
+  # The CANONICAL writer is `bridge_linux_share_plugin_catalog`
+  # (lib/bridge-agents.sh:2512+) — it re-derives the filtered per-UID
+  # catalog + installed_plugins.json + marketplace symlinks from the
+  # shared plugin cache and the agent's declared channels/plugins each
+  # time it runs. Stale or manually-edited per-UID state is therefore
+  # overwritten with the canonical state on every start, closing the
+  # "operator drifted existing agent" failure mode that D2 (seed-side
+  # merge) cannot reach.
+  #
+  # SUPPRESS_MISSING_CHANNELS=1 (line 568 above): the suppress-aware
+  # launcher is used when the agent is mid-onboarding and its channel
+  # runtime is incomplete. Calling the share helper here in that mode
+  # could turn a suppressed-channel recovery start into a NEW hard
+  # failure if the shared plugin cache is also absent (helper
+  # `bridge_die`s on a populated channel list but no cache). Skip the
+  # share call in that mode (codex r1 option (a)) — the agent's plugin
+  # channels are suppressed for launch anyway, so the per-UID catalog
+  # is not consulted in the launch path. The next non-suppressed start
+  # re-runs this helper and brings the catalog back to canonical.
+  #
+  # For normal starts that DO need plugin channels but lack the shared
+  # cache, the helper fails loud with its existing "run `agb plugins
+  # seed`" guidance — no silent no-op.
+  if [[ "$SUPPRESS_MISSING_CHANNELS" -eq 1 ]]; then
+    bridge_warn "BRIDGE_AGENT_SUPPRESS_MISSING_CHANNELS=1 — skipping per-UID plugin catalog re-derivation for '$AGENT' (suppress-aware launch; the next non-suppressed start re-derives)"
+  else
+    _l1d_os_user="$(bridge_agent_os_user "$AGENT" 2>/dev/null || true)"
+    if [[ -z "$_l1d_os_user" ]]; then
+      bridge_warn "bridge-start.sh L1-D: cannot resolve os_user for agent '$AGENT' — skipping per-UID plugin catalog re-derivation (the agent's plugin channels may report marketplace-mismatch on this launch; recover via \`agent-bridge isolate $AGENT\` to repair)"
+    else
+      _l1d_user_home="$(bridge_agent_linux_user_home "$_l1d_os_user")"
+      _l1d_controller_user="$(bridge_isolation_v2_controller_user 2>/dev/null || true)"
+      if [[ -z "$_l1d_controller_user" ]]; then
+        bridge_warn "bridge-start.sh L1-D: cannot resolve controller user for agent '$AGENT' — skipping per-UID plugin catalog re-derivation"
+      elif ! bridge_linux_share_plugin_catalog \
+              "$_l1d_os_user" "$_l1d_user_home" "$_l1d_controller_user" "$AGENT"; then
+        # Helper fails loud (bridge_die) on a populated channel list +
+        # absent shared cache; that path never returns here. Other
+        # failures (chown / chmod / symlink) are non-fatal for the
+        # start path — the agent may still launch with a stale (but
+        # non-empty) per-UID catalog from a prior create/seed pass.
+        # Surface a warn so the operator sees the drift.
+        bridge_warn "bridge-start.sh L1-D: per-UID plugin catalog re-derivation FAILED for agent '$AGENT' (start continues with the prior catalog; expect marketplace-mismatch reports if a marketplace was added since the last agent-create / seed)"
+      fi
+      unset _l1d_user_home _l1d_controller_user
+    fi
+    unset _l1d_os_user
+  fi
 fi
 
 SESSION_CMD="$(bridge_join_quoted "$BRIDGE_BASH_BIN" "$RUNNER" "$AGENT")"

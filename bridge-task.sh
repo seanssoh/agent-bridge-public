@@ -4,6 +4,18 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# L1-N (beta21): mark this process as a queue-safe verb context BEFORE
+# sourcing bridge-lib.sh, so `bridge_load_roster` (inside the lib) can
+# distinguish queue commands (which only need the public roster + the
+# gateway socket) from other commands that genuinely need the
+# protected `BRIDGE_ROSTER_LOCAL_FILE`. This is what lets an iso UID
+# fall through to `bridge_warn`-skip on EACCES instead of dying with
+# the misleading "queue gateway timed out" wrapper error.
+#
+# Every subcommand in this file is by design queue-safe (the whole
+# file IS the queue CLI). Marking the entire process is therefore
+# correct — no per-verb gate needed.
+export BRIDGE_QUEUE_SAFE_CONTEXT=1
 # shellcheck source=/dev/null
 source "$SCRIPT_DIR/bridge-lib.sh"
 
