@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import datetime
 import fcntl
+import grp
 import json
 import os
 import sys
@@ -88,6 +89,48 @@ def main(argv: list[str]) -> int:
         sys.stderr.write(f"lock-open-failed: {exc}\n")
         return 1
     try:
+        # Issue #1208: when called from `bridge_plugins_seed_propagate_iso_known_marketplaces`
+        # (D2 per-UID propagation), the lock file is created as root:600 by
+        # default — the iso UID has no group write access and cannot acquire
+        # `fcntl.flock` later when `bridge-dev-plugin-cache.py` runs. Fix:
+        # normalize the lock file to `root:$BRIDGE_PLUGIN_LOCK_GROUP 0660`
+        # so the iso UID (which is a member of the agent group via
+        # supplementary membership) can re-acquire the same flock.
+        #
+        # `BRIDGE_PLUGIN_LOCK_GROUP` is set by D2 to the agent group name
+        # (`ab-agent-<X>`). When absent (e.g. running on the controller's
+        # own `~/.claude/plugins/`), we leave the default `root:0600` in
+        # place — the controller is also the writer there and group
+        # widening is unnecessary.
+        #
+        # Mode is `0660` (group write only), NOT `0664` — world-rw access
+        # would expose the coordination lock to any UID on the host. Data
+        # manifests (installed_plugins.json, known_marketplaces.json) stay
+        # `root:ab-agent-<X> 0640`; the lock is coordination state only.
+        lock_group = os.environ.get("BRIDGE_PLUGIN_LOCK_GROUP") or ""  # noqa: iso-helper-boundary
+        lock_group = lock_group.strip()
+        if lock_group:
+            try:
+                gid = grp.getgrnam(lock_group).gr_gid
+            except KeyError:
+                sys.stderr.write(
+                    f"warning: BRIDGE_PLUGIN_LOCK_GROUP='{lock_group}' "
+                    "does not exist on this host; leaving lock at default ownership\n"
+                )
+            else:
+                try:
+                    os.fchown(lock_fd, -1, gid)
+                except OSError as exc:
+                    sys.stderr.write(
+                        f"warning: fchown lock to gid={gid} failed: {exc}\n"
+                    )
+                try:
+                    os.fchmod(lock_fd, 0o660)
+                except OSError as exc:
+                    sys.stderr.write(
+                        f"warning: fchmod lock to 0660 failed: {exc}\n"
+                    )
+
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
         except OSError as exc:

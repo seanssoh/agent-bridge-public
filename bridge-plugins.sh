@@ -725,8 +725,18 @@ bridge_plugins_seed_propagate_iso_known_marketplaces() {
     # never leave a half-merged file. We do the merge from the current
     # iso_known content (if any) → out path = iso_known. Run as root so
     # the file lands at the right owner; chown/chmod follow.
+    #
+    # Issue #1208: pass BRIDGE_PLUGIN_LOCK_GROUP=$agent_group so the
+    # helper's sidecar `known_marketplaces.json.lock` is created (or
+    # normalized) as `root:$agent_group 0660` — group-write so the iso
+    # UID's `bridge-dev-plugin-cache.py` writer can re-acquire the same
+    # flock during `agent start`. Without this, the lock lands as
+    # `root:root 0600` and iso UID's plugin cache write fails with
+    # EACCES, blocking `agent start` for any iso v2 agent with plugin
+    # channels.
     local rc=0
-    if ! bridge_linux_sudo_root python3 \
+    if ! bridge_linux_sudo_root \
+        env "BRIDGE_PLUGIN_LOCK_GROUP=${agent_group:-}" python3 \
         "$SCRIPT_DIR/lib/upgrade-helpers/plugins-seed-merge-known-marketplace.py" \
         "$iso_known" "$iso_known" "$mkt_name" "$mkt_root" >/dev/null 2>&1; then
       rc=$?
@@ -745,6 +755,37 @@ bridge_plugins_seed_propagate_iso_known_marketplaces() {
     fi
     bridge_linux_sudo_root chmod 0640 "$iso_known" >/dev/null 2>&1 \
       || bridge_warn "[plugins seed] D2: chmod 0640 $iso_known failed (agent '$agent')"
+
+    # Issue #1208 self-heal: normalize any pre-existing lock files
+    # owned by `root:root 0600` (left behind by beta24 OOTB installs
+    # before this fix landed). The python helper above creates a fresh
+    # lock with the right metadata when the env var is set, but a
+    # cached lock from an earlier seed run that pre-dates this patch
+    # would still be `root:root 0600`. Also normalize
+    # `installed_plugins.json.lock` to match the parent contract at
+    # `lib/bridge-isolation-v2.sh:1734-1747` (plugin manifest flocks
+    # are group-writable).
+    if [[ -n "$agent_group" ]]; then
+      local iso_known_lock="$iso_plugins_dir/known_marketplaces.json.lock" # noqa: iso-helper-boundary
+      local iso_installed_lock="$iso_plugins_dir/installed_plugins.json.lock" # noqa: iso-helper-boundary
+      if bridge_linux_sudo_root test -e "$iso_known_lock" 2>/dev/null; then
+        bridge_linux_sudo_root chown "root:$agent_group" "$iso_known_lock" \
+          >/dev/null 2>&1 \
+          || bridge_warn "[plugins seed] D2: chown lock root:$agent_group $iso_known_lock failed (agent '$agent')"
+        bridge_linux_sudo_root chmod 0660 "$iso_known_lock" \
+          >/dev/null 2>&1 \
+          || bridge_warn "[plugins seed] D2: chmod 0660 $iso_known_lock failed (agent '$agent')"
+      fi
+      if bridge_linux_sudo_root test -e "$iso_installed_lock" 2>/dev/null; then
+        bridge_linux_sudo_root chown "root:$agent_group" "$iso_installed_lock" \
+          >/dev/null 2>&1 \
+          || bridge_warn "[plugins seed] D2: chown lock root:$agent_group $iso_installed_lock failed (agent '$agent')"
+        bridge_linux_sudo_root chmod 0660 "$iso_installed_lock" \
+          >/dev/null 2>&1 \
+          || bridge_warn "[plugins seed] D2: chmod 0660 $iso_installed_lock failed (agent '$agent')"
+      fi
+    fi
+
     ((propagated++)) || true
   done < "$_eligible_stream_tmp"
   rm -f "$_eligible_stream_tmp" 2>/dev/null || true
