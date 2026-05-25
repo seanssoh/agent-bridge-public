@@ -6,6 +6,163 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta22] — 2026-05-25
+
+### Highlight — channel-validator controller-blind + L1-D fail-closed + A2A deliver tick + bundled-plugin start hook
+
+Operator-cued **twenty-second prerelease**. patch's beta21 verify
+confirmed L1-M/N PASS but surfaced 3 P0/P1 issues blocking the 6 OOTB
+acceptance gates: #1196 channel-validator iso-blind regression, L1-D
+EPERM persistence with architectural root in sudo-wrap path, and #1197
+A2A delivery scheduler wedge. Plus #1190/#1191 bundled-plugin
+provisioning was wired only in `setup` + `upgrade`, missing fresh-
+install + `agent start` path. All four closed in one PR (#1198).
+
+`-beta22` prerelease; matching tag `v0.14.5-beta22`, GitHub release
+marked **Pre-release**. Stay on beta per Sean's standing rule.
+
+### Fixed — #1196 channel-validator iso-blind regression (#1198)
+
+- **`lib/bridge-agents.sh:bridge_channel_env_file_readiness`** —
+  single-mapping fix: `probe_rc=2` from
+  `bridge_isolation_run_as_agent_user_via_bash` now maps to existing
+  `controller-blind` state (NOT new `unverifiable`). Channel readiness
+  enum already documents `present|missing|unreadable|controller-blind`,
+  and `bridge_agent_missing_channels_csv` already excludes
+  `controller-blind` from restart hard-reject (`lib/bridge-agents.sh:
+  6429-6435`). Any other impossible probe error from an isolated agent
+  prefers `controller-blind + diagnostic` over `missing` to avoid
+  false-negative miss.
+
+- Closes restart hard-reject on previously-working iso agents with
+  valid `.teams/.env` + `.ms365/.env` files when the iso UID probe
+  declines (rc=2). `setup ms365 <agent>` CLI was NOT the actual
+  blocker (validator only checks `.env` keys, not `access.json`);
+  deferred.
+
+- **Regression test**: `scripts/test-channel-probe-isolated.sh`
+  extended (+C5b/+C5c/+C9b) — `bridge_isolation_can_sudo_to_agent
+  rc=0` + `bridge_isolation_run_as_agent_user_via_bash rc=2` →
+  readiness `controller-blind` + channel stays out of
+  `missing_channels_csv`.
+
+### Fixed — L1-D EPERM cross-owner atomic-rename architectural root (#1198)
+
+- **`bridge-start.sh`** — fail-closed when linux-user isolation
+  requested + declared channels include `plugin:*` channels targeting
+  iso HOME + `SUDO_WRAP_ACTIVE=0` (passwordless sudo unavailable).
+  Operator guidance: enable passwordless sudo for the iso UID, OR
+  remove plugin channels, OR use shared-mode isolation. Previously
+  the path silently degraded to shared-mode + warn → then controller-
+  side `bridge-dev-plugin-cache.py` wedged on cross-UID atomic-rename
+  EPERM. Root cause was the wrong path being taken; the iso write
+  helper alone wouldn't fix it when sudo itself was unavailable.
+
+- **Race safety for shared `known_marketplaces.json` writer paths**:
+  - **`bridge-dev-plugin-cache.py:ensure_known_marketplace_for_root`**
+    — added sidecar `known_marketplaces.json.lock` `flock` (matches
+    the pattern `merge_installed_plugins` already uses).
+  - **`lib/upgrade-helpers/plugins-seed-merge-known-marketplace.py`**
+    — same sidecar flock + read-under-lock.
+  - Prevents lost updates when seed-side + start-path canonical
+    writers race on the same per-UID file.
+
+- **Existing helpers used** — `lib/bridge_iso_paths.py:
+  write_text_atomic_as_owner` + `lib/bridge-isolation-helpers.sh:
+  bridge_isolation_write_file_as_agent_user_via_bash` for agent-owned
+  output targets. Canonical per-UID plugin manifests stay
+  `root:ab-agent-<X>` mode 0640 (tamper-boundary contract documented
+  at `lib/bridge-agents.sh:2241-2248` + `2513-2522` preserved). No new
+  `bridge_iso_atomic_write` helper introduced.
+
+### Fixed — #1197 handoff daemon scheduler wedge → bridge-daemon loop integration (#1198)
+
+- **`bridge-daemon.sh:cmd_sync_cycle`** — new `process_a2a_deliver_tick`
+  step. Throttled invocation of `bridge-a2a.py deliver` via state file
+  `$BRIDGE_STATE_DIR/handoff/deliver-tick.env` (carries
+  `A2A_DELIVER_NEXT_TS` / `A2A_DELIVER_LAST_TS`). Default interval
+  `BRIDGE_A2A_DELIVER_INTERVAL_SECONDS=30` (`0` disables). Wrapped in
+  `bridge_with_timeout` so HTTP/socket hang can't wedge the main
+  daemon loop.
+- No-op silently when `handoff.local.json` is absent; doesn't
+  log-spam on installs that aren't A2A pairs.
+- Compact tick log: `a2a_deliver tick start` / `end rc=N processed=M`.
+
+- **NOT** a new scheduler in `bridge-handoffd.py` — that daemon's
+  main loop is `ThreadingHTTPServer.serve_forever()` (receiver-only),
+  no scheduler tick lives there. Real wedge is the missing main-loop
+  integration of the existing `bridge-a2a.py deliver` one-shot.
+
+- **`bridge-a2a.py outbox list`** — extended query to surface
+  staleness fields without schema change:
+  - `age_seconds = now - created_ts`
+  - `due_for_seconds` for pending/retry rows whose `next_attempt_ts <= now`
+  - `next_attempt_in_seconds` for retry rows not yet due
+  - `lease_stale_seconds` for `status='sending'` with expired lease
+  - Text rendering adds `due=31m` / `next=45s` / `lease_stale=3m`
+    suffix to the existing list row.
+  - JSON output includes all four numeric fields.
+
+  Closes Sean's "업스트림 안 일해?" misdirection — a stuck outbox row
+  is now visibly diagnosable via `agb a2a outbox list`.
+
+- **`scripts/smoke/a2a-cross-bridge.sh`** extended (+3 cases):
+  daemon-tick drains outbox to acked, no-op without config (no
+  log-spam), staleness fields shown in text + JSON.
+
+### Fixed — Bundled plugins start-time wiring (#1190 / #1191) (#1198)
+
+- **`bridge-start.sh`** — invokes
+  `bridge_provision_bundled_plugins_node_modules` before
+  `bridge-dev-plugin-cache.py` sync when the agent declares
+  `plugin:<bundled>@agent-bridge` channels with a `package.json`.
+  Helper existed but was only wired into `setup teams` and `upgrade
+  --apply` paths — fresh-install agents on `agent start` missed the
+  `bun install` for ms365/cosmax-ep-approval. Idempotent (helper's
+  internal staleness check at `lib/bridge-channels.sh:848-863` avoids
+  unnecessary reinstall). Fails closed when bun is unavailable and a
+  channel-required bundled plugin would otherwise hit a module-not-
+  found at MCP startup.
+
+### Tests
+
+- **`scripts/smoke/a2a-cross-bridge.sh`** — +3 beta22 cases:
+  daemon-tick drains outbox, daemon-tick no-op without config, outbox-
+  list staleness fields. Total 16/16 PASS on the beta22 fixer's VM
+  validation pass.
+
+- **`scripts/test-channel-probe-isolated.sh`** — +C5b/+C5c/+C9b
+  regression cases for the controller-blind mapping (C5b/C5c assert
+  the new behavior + C9b documents the bash 3.2 macOS quirk in
+  awk-extracted helpers — pre-existing, unrelated).
+
+### Verification
+
+- **VM acceptance** (OrbStack `agb-clean-test`, Ubuntu noble arm64,
+  IN-PLACE UPGRADE from beta21) — 7-step matrix:
+  - Gates 1, 2, 3, 6, 7: **PASS** (clean install + iso agent create
+    + agent start with linked-verified plugins + iso REPL queue +
+    daemon health OK + A2A tick drain).
+  - Gate 4 (stop+start session resume): **PARTIAL** — start-path
+    itself replays linked-verified cleanly on restart with no EPERM;
+    the claude session crashes on stub creds (out of beta22 scope
+    — real creds exercise resume continuity).
+  - Gate 5 (`agent-bridge watchdog scan`): **PRE-EXISTING FAIL** —
+    same `PermissionError ... CLAUDE.md` on test_iso3/5/8 on the
+    base `dda10e3` commit; unrelated to beta22.
+
+- **Pre-existing test/runtime issues observed** (NOT caused by this
+  PR, verified on base):
+  - `scripts/test-channel-probe-isolated.sh` C9/C9b bash 3.2 macOS
+    `set -u` × empty-array footgun (defensive `local -a items=()`
+    hardens but doesn't fully fix the bash 3.2 quirk; Linux + bash
+    5.x unaffected).
+  - `scripts/smoke-test.sh` spool-count flake (non-deterministic on
+    both base and PR).
+  - `1121-agent-delete-os-purge` C5 (`bridge_warn` stderr vs smoke
+    stdout capture mismatch) — admin-merged via override (Phase
+    2/3/L1/L2 pattern).
+
 ## [0.14.5-beta21] — 2026-05-25
 
 ### Highlight — P0 wave-1 hotfix: state-leaf + iso-uid queue + start-path catalog
