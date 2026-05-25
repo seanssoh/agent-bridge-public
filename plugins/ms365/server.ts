@@ -61,7 +61,30 @@ const MS365_CALLBACK_DIR =
   process.env.MS365_CALLBACK_SHARED_DIR ?? join(BRIDGE_HOME, 'shared', 'ms365-callbacks')
 
 function ensureDirs(): void {
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  // Issue #1215: STATE_DIR (the per-agent `.ms365/` parent) is shared
+  // between the isolated UID and the controller's `ab-agent-<slug>`
+  // group on iso v2 hosts. Pre-#1215 the dir was created with mode
+  // `0o700` which produced `drw---S---` after the v2 chown/chgrp pass
+  // (no traversal bit for the group), and the controller's `agent start`
+  // channel-required validator could not stat `.ms365/.env` to confirm
+  // MS365_CLIENT_ID. The brief mandates `0o2770` (setgid + rwx for
+  // owner AND group) to match the v2 isolation contract for agent
+  // workdirs and the other channel state dirs.
+  //
+  // Use an explicit `chmodSync` after `mkdirSync` so the helper also
+  // self-heals an existing bad-mode dir (`0o700`, `0o660`, etc.) on
+  // the next ms365 process startup — `mkdirSync({recursive: true})`
+  // is a no-op when the dir already exists, but `chmodSync` always
+  // runs and repairs the mode in place.
+  //
+  // `tokens/` and `pending/` stay `0o700`: tokens are per-UPN secrets
+  // the controller has no business reading. The brief explicitly
+  // forbids widening secret file modes beyond `0o600`; the directory
+  // mode is the public-vs-private boundary.
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o770 })
+  try {
+    chmodSync(STATE_DIR, 0o2770)
+  } catch {}
   mkdirSync(TOKENS_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(PENDING_DIR, { recursive: true, mode: 0o700 })
   mkdirSync(MS365_CALLBACK_DIR, { recursive: true, mode: 0o700 })

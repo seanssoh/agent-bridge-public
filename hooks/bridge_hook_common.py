@@ -226,13 +226,68 @@ def emit_system_cross_agent_read(
     )
 
 
-def current_isolated_agent() -> str | None:
+def _current_agent_under_foreign_uid() -> str | None:
+    """Return the calling agent slug iff this process is actually
+    running as a non-controller UID under the agent's env.
+
+    Issue #1213 root cause: ``BRIDGE_AGENT_ISOLATION_MODE`` is declared
+    as an associative array in ``lib/bridge-agents.sh:3410`` /
+    ``lib/bridge-state.sh:1008``. When ``bridge-run.sh:212`` later runs
+    ``export BRIDGE_AGENT_ISOLATION_MODE="linux-user"``, bash silently
+    no-ops the export (a scalar export of a name bound to an assoc
+    array is structurally impossible). The variable shows up "set" in
+    the current shell, but is absent from the child process's
+    ``/proc/<pid>/environ``. The same name-collision hits
+    ``BRIDGE_AGENT_OS_USER`` (also an assoc array exported as a scalar
+    on line 213). The pre-#1213 ``current_isolated_agent`` predicate
+    gated on this missing env var → returned ``None`` under iso v2 →
+    every PermissionError fail-open in ``_under_isolated_uid`` and
+    ``queue_cli`` was silently bypassed.
+
+    The new predicate proves the iso shape from the data we *can* see:
+    ``BRIDGE_AGENT_ID`` (singular scalar, propagates fine) +
+    ``BRIDGE_CONTROLLER_UID`` (scalar) + ``os.geteuid() !=
+    controller_uid``. The UID-differs-from-controller check defends
+    against a controller process inheriting ``BRIDGE_AGENT_ID`` and
+    being mis-attributed — the original #1167 codex BLOCKING scenario
+    — strictly more rigorously than the mode-string check did, because
+    a controller re-exporting the env still runs as the controller UID.
+
+    Returns the agent slug when the process is provably under a
+    foreign UID, ``None`` otherwise (no controller UID, malformed
+    controller UID, or matching UID).
+    """
     agent = current_agent()
     if not agent:
         return None
-    if os.environ.get("BRIDGE_AGENT_ISOLATION_MODE", "").strip() != "linux-user":
+    controller_uid_raw = os.environ.get("BRIDGE_CONTROLLER_UID", "").strip()
+    if not controller_uid_raw:
+        # Fail-closed: without the controller UID we cannot prove the
+        # caller is the isolated UID. Treat as controller.
+        return None
+    try:
+        controller_uid = int(controller_uid_raw)
+    except ValueError:
+        return None
+    if os.geteuid() == controller_uid:
         return None
     return agent
+
+
+def current_isolated_agent() -> str | None:
+    # Issue #1213: use the UID-based predicate instead of the
+    # ``BRIDGE_AGENT_ISOLATION_MODE`` mode-string check. The mode-string
+    # check structurally cannot survive the bash assoc-array name
+    # collision in ``bridge-run.sh:212``; the UID check proves the
+    # same property (foreign-UID iso shape) more strictly. See
+    # :func:`_current_agent_under_foreign_uid` for the rationale.
+    #
+    # This function is consumed by ``queue_cli()`` (this file, below)
+    # to route hook queue traffic through ``bridge-queue-gateway.py``
+    # — without this fix, iso v2 sessions stayed on the controller
+    # ``bridge-queue.py`` path and could not route through the
+    # gateway, leaving hook queue commands silently misrouted.
+    return _current_agent_under_foreign_uid()
 
 
 def current_agent_workdir() -> Path:
@@ -294,40 +349,47 @@ def _acting_os_user() -> str:
 
 
 def _current_isolation_mode() -> str:
+    # Issue #1213: ``BRIDGE_AGENT_ISOLATION_MODE`` is silently absent
+    # from iso v2 child environs because of the assoc-array name
+    # collision on the bash side (see
+    # :func:`_current_agent_under_foreign_uid`). When the env var is
+    # missing but the UID-based predicate proves the foreign-UID iso
+    # shape, return ``"linux-user"`` so diagnostics (audit envelopes,
+    # status reasons) do not lie and say ``"shared"`` under a proven
+    # iso process. Operator-supplied ``BRIDGE_AGENT_ISOLATION_MODE``
+    # still wins when set (back-compat for explicit mode overrides).
     mode = os.environ.get("BRIDGE_AGENT_ISOLATION_MODE", "").strip()
-    return mode or "shared"
+    if mode:
+        return mode
+    if _current_agent_under_foreign_uid() is not None:
+        return "linux-user"
+    return "shared"
 
 
 def _under_isolated_uid() -> bool:
     """True only when the process is actually running as a non-controller
     UID under an isolated agent's env.
 
-    Issue #1165 Track C r2 (codex BLOCKING): the original Gap 7 guard
-    keyed on ``current_isolated_agent()`` alone, which only inspects env
-    (``BRIDGE_AGENT_ID`` + ``BRIDGE_AGENT_ISOLATION_MODE=linux-user``).
-    That meant any process inheriting those vars — including the
-    controller itself, e.g. an upgrade/dispatcher run that re-exported
-    them — silently swallowed audit-write failures. The contract is
-    "only the isolated UID may no-op," so we additionally verify the
-    effective UID differs from the controller UID exported by
-    ``bridge-start.sh``. When ``BRIDGE_CONTROLLER_UID`` is missing
-    (legacy session, older controller, anything that pre-dates the
-    propagation) we fail-closed and treat the process as controller —
-    a real permission regression continues to surface as before.
+    Issue #1213: keys on the UID-side predicate
+    (``_current_agent_under_foreign_uid``) rather than the
+    mode-string ``BRIDGE_AGENT_ISOLATION_MODE`` env var. The mode
+    string was previously gated through ``current_isolated_agent()``
+    but cannot survive the assoc-array name collision in
+    ``bridge-run.sh:212`` (silently no-ops the scalar export). The
+    UID-based predicate proves the same property — the caller is
+    actually running as a non-controller UID under the agent's env —
+    strictly more rigorously, since a controller process re-exporting
+    ``BRIDGE_AGENT_ID`` still runs as the controller UID.
+
+    History: this was originally codified as the #1165 Track C r2
+    codex BLOCKING fix where the env-only predicate (``BRIDGE_AGENT_ID``
+    + ``BRIDGE_AGENT_ISOLATION_MODE=linux-user``) was caught swallowing
+    controller-side failures whenever the iso env happened to be
+    inherited. The UID-side guard was already added then; #1213
+    completes the contract by removing the mode-string dependency
+    so iso v2 itself can satisfy the gate.
     """
-    if not current_isolated_agent():
-        return False
-    controller_uid_raw = os.environ.get("BRIDGE_CONTROLLER_UID", "").strip()
-    if not controller_uid_raw:
-        # Fail-closed: without the controller UID we cannot prove the
-        # caller is the isolated UID. Treat as controller so genuine
-        # permission errors still raise.
-        return False
-    try:
-        controller_uid = int(controller_uid_raw)
-    except ValueError:
-        return False
-    return os.geteuid() != controller_uid
+    return _current_agent_under_foreign_uid() is not None
 
 
 def under_isolated_uid() -> bool:

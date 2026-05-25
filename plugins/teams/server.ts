@@ -249,7 +249,23 @@ const parentDeathWatch = setInterval(() => {
 parentDeathWatch.unref?.()
 
 function ensureStateDir(): void {
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  // Issue #1215: STATE_DIR (the per-agent `.teams/` parent) is shared
+  // between the isolated UID and the controller's `ab-agent-<slug>`
+  // group on iso v2 hosts. Pre-#1215 the dir was created with mode
+  // `0o700` which produced `drw---S---` after the v2 chown/chgrp pass
+  // (no traversal bit for the group). The explicit `chmodSync` after
+  // `mkdirSync` self-heals an existing bad-mode dir on the next teams
+  // process startup. Match the ms365 fix shape — same family.
+  //
+  // MS365_CALLBACK_DIR stays `0o700`: only the teams plugin's listener
+  // and the controller's callback-claim helper need to read it, and
+  // both run as the same UID. The shared-callback contract is a
+  // different family (ab-shared/3770) and explicitly out of scope per
+  // the #1215 brief.
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o770 })
+  try {
+    chmodSync(STATE_DIR, 0o2770)
+  } catch {}
   mkdirSync(MS365_CALLBACK_DIR, { recursive: true, mode: 0o700 })
 }
 
