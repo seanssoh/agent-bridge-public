@@ -6,6 +6,160 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta20] — 2026-05-25
+
+### Highlight — L2 daemon supp-groups refresh + L1 wave 2 plugin-install closure
+
+Operator-cued **twentieth prerelease**. Two parallel tracks land in
+beta20 closing the v0.14.5 isolation wave's remaining UX gaps:
+
+- **L2 Variant 3A (PR #1188)** — automatic daemon supplementary-groups
+  refresh via sudo + passwordless sudoers + sudo-wrapped systemd-user
+  ExecStart. Closes patch's 3 phase3-pass supp-groups family symptoms.
+  GID actually lands in `/proc/<daemon_pid>/status` Groups after
+  `agent create --linux-user` — architectural fix verified.
+
+- **L1 wave 2 (PR #1189)** — 6 plugin-install gaps (A/D/F/G + J/K)
+  closed in one PR. External-marketplace install, per-iso known_
+  marketplaces propagation, bundled-plugin `bun install` at upgrade
+  time, node version probe with fail-soft.
+
+Sean's standing directive: stay on beta tags. rc1 / v0.15.0 promote
+remains operator-explicit-go. `-beta20` prerelease; matching tag
+`v0.14.5-beta20`, GitHub release marked **Pre-release**.
+
+### Fixed / Added — L2 Variant 3A: automatic daemon supp-groups refresh (#1188)
+
+- **`lib/bridge-daemon-control.sh` (NEW, ~898 lines)** — public helper
+  `bridge_daemon_refresh_after_group_membership_change --group <name>
+  --reason <text> [--dry-run]`. Detects `/proc/<daemon_pid>/status`
+  Groups drift, acquires non-destructive lock, attempts fresh-credential
+  restart via sudo, polls new daemon, verifies GID present. Status
+  contract: `ok|ok-systemd-sudo-self|skipped-non-linux|
+  skipped-daemon-not-running|skipped-daemon-already-has-group|
+  manual-required-sudoers|manual-required-sudo-refresh-no-gid|
+  manual-required-systemd-unit-stale|failed-restart|failed-timeout|
+  failed-systemctl-restart|failed-systemd-refresh-no-gid`. systemd
+  active path uses `systemctl --user restart`, non-systemd path uses
+  direct `sudo -n -u <controller> bridge-daemon.sh restart`. Lock
+  contention re-checks under lock before mutating.
+
+- **`scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template`
+  (NEW)** — generator template, 2 authorized commands: `bridge-daemon.sh
+  restart --force --internal-reason=group-refresh` (r3) AND `bridge-
+  daemon.sh run` (r4 — sudo-wrapped systemd ExecStart). Named user,
+  absolute paths, no wildcards, `SETENV: BRIDGE_*` whitelist.
+
+- **`scripts/install-daemon-systemd.sh`** — auto-detects daemon-refresh
+  sudoers; when present, renders systemd-user unit with sudo-wrapped
+  ExecStart + `Environment=BRIDGE_DAEMON_SYSTEMD_REFRESH_MODE=sudo-self`
+  marker. Keeps `KillMode=process` and `Restart=always` semantics.
+
+- **`bridge-daemon.sh`** — `cmd_restart --internal-reason=group-refresh`
+  bypasses operator-facing bare-stop active-agent guard. Audit log entry.
+
+- **`agent-bridge init sudoers daemon-refresh --apply|--check`** — CLI
+  to install/regenerate/verify sudoers from template with `visudo -cf`
+  validate + atomic install at mode `0440 root:root`.
+
+- **4 hook sites** (`bridge-agent.sh:cmd_create` + `cmd_delete`,
+  `lib/bridge-migration.sh` isolate first-time + --reapply) — call
+  helper after group membership mutation. Refresh is non-fatal —
+  agent operation completes regardless of refresh result. Output:
+  `daemon_group_refresh: <status>` in text + JSON.
+
+- **`bridge-init.sh` + `bridge-upgrade.sh`** integration — Linux
+  server profile: sudoers first → unit regen (sudo-wrapped if sudoers
+  ok) → daemon-reload → restart-if-active.
+
+### Fixed / Added — L1 wave 2: plugin-install gaps for external marketplaces (#1189)
+
+- **A: `bridge_plugins_cmd_seed` propagates marketplace to controller
+  registry** — calls `claude plugin marketplace add` on controller
+  after seeding the shared cache. Idempotent (skips if list already
+  contains entry). Closes "Plugin not found in marketplace" on first
+  `agent start` after external-marketplace seed.
+
+- **D: same seed propagates to per-iso `known_marketplaces.json`** —
+  writes root-owned `/home/agent-bridge-<a>/.claude/plugins/
+  known_marketplaces.json` mode `0640 root:ab-agent-<a>` for each iso
+  agent whose channels reference the target marketplace.
+  `lib/upgrade-helpers/plugins-seed-merge-known-marketplace.py`
+  (file-as-argv, no heredoc) does the JSON merge.
+
+- **F: external marketplace clone dir gets `o+rX` recursive** — when
+  seeding from a `--marketplace-root` under operator HOME on Linux
+  with iso isolation active, `chmod -R o+rX` so iso UIDs can read
+  the marketplace source. Opt-out via `--no-iso-chmod`.
+
+- **G: `plugins-channel-trees` row converges from absent state** —
+  reconciler row switched to use shell glob iteration over actual
+  plugin subdirs (`teams`, `ms365`, `cosmax-marketplace`, etc.) with
+  per-subdir individual rows (`plugins-channel-tree-<name>`). Was
+  emitting `skipped (absent)` literal glob row that didn't walk
+  per-channel dirs; now emits one optional `dir_recursive` row per
+  detected plugin subdir.
+
+- **J: bundled-plugin `bun install` at install/upgrade time** —
+  `lib/upgrade-helpers/bundled-plugins-bun-install.sh` (new, file-as-
+  argv). Walks `$BRIDGE_HOME/plugins/<name>/` and runs `bun install`
+  when package.json exists and node_modules is absent/stale. Wired
+  into `bridge_provision_teams_plugin_runtime` and `bridge-upgrade.sh`.
+
+- **K: node version probe with fail-soft** — install/upgrade emits
+  `[bundled-plugins][node-check] node v<X> OK (>= 14)` or warns
+  `node v<X> < 14 — bundled plugins may fail to spawn. Install via
+  your package manager or nvm install --lts.` Non-fatal; lets the
+  install continue.
+
+### Fixed — 3 heredoc-stdin sites caught by lint baseline ratchet
+
+- **`bridge-plugins.sh:535`** `done <<<"$eligible"` → materialize to
+  `mktemp` file, read via `< "$tmp"`, cleanup after loop.
+- **`bridge-plugins.sh:551`** `IFS=',' read -r -a items <<<"$csv"` →
+  parameter-expansion split loop (no subprocess, no tmp file).
+- **`lib/bridge-isolation-v2-reconcile.sh:1107`** `done < <(compgen -G
+  "$data_root/plugins/*")` → shell glob + nullglob save/restore.
+- **`bridge-upgrade.sh:2274`** redirect `install-daemon-systemd.sh
+  --apply` stdout to stderr so the new sudoers/systemd integration
+  doesn't pollute `agent-bridge upgrade --json` envelope.
+
+### Tests
+
+- **`tests/daemon-control/smoke.sh` (NEW, 28 cases)** — 21 r3 unit
+  smokes (parser, lock, status strings, sudoers template render,
+  visudo validation, helper invocation) + 7 r4 unit smokes (systemd
+  branch detection, sudo-wrapped unit shape, `manual-required-systemd-*`
+  paths, drift detector on `/proc/.../status`).
+
+- **`scripts/smoke/phase2-install-tree-reconciler.sh`** — T1 asserts
+  per-channel `plugins-channel-tree-<name>` rows appear in matrix;
+  T9 new functional fixture for L1 wave 2 row converge-from-absent
+  flow.
+
+### Verification
+
+- **L2 VM acceptance** (OrbStack `agb-clean-test`, systemd-user Linux):
+  5+1 PASS. `/proc/<daemon_pid>/status` Groups contains `ab-agent-
+  test_iso5` GID 980 after `agent create` (architectural fix verified).
+  Process tree: systemd-user → sudo → bash bridge-daemon.sh run.
+  `bridge-send.sh --urgent` lock writes succeed. `agent restart`
+  channel readiness without `sg` wrapper.
+
+- **L1 wave 2 VM acceptance** (in-place upgrade beta19 → branch):
+  8/8 PASS. Controller's `claude plugin marketplace list` includes
+  seeded external marketplace, iso UID's `known_marketplaces.json`
+  contains the entry mode 0640, fixture clone dir traversable by iso
+  UID, `resolve_marketplace_root` from iso UID resolves correctly.
+  Bundled `bun install` ran on ms365 + mattermost from absent state.
+  Iso UID `bun -e 'import {Server} from "@modelcontextprotocol/sdk/..."'`
+  returns within 1s.
+
+- **Pre-existing CI fragility unchanged** — `1121-agent-delete-os-purge`
+  C5 / `1140-purge-home-os-cleanup` C4 / cron-shell-runner T36b timing
+  flake fail on `main` and `stabilize` independent of this PR. Both
+  merged via admin override (Phase 2 pattern).
+
 ## [0.14.5-beta19] — 2026-05-25
 
 ### Highlight — beta19 L1 wave: install-tree row expansion + Teams shim + bun traversal
