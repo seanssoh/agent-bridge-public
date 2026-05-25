@@ -105,7 +105,7 @@ DRIVER="$SMOKE_DIR/driver.py"
   printf '%s\n' '    return module'
   printf '%s\n' ''
   printf '%s\n' 'def main() -> int:'
-  printf '%s\n' '    common_path = Path(os.environ["DRIVER_HOOK_COMMON_PATH"])'
+  printf '%s\n' '    common_path = Path(os.environ["DRIVER_HOOK_COMMON_PATH"])'  # noqa: iso-helper-boundary
   printf '%s\n' '    module = load_module(common_path)'
   printf '%s\n' '    uid_pred = module.under_isolated_uid()'
   printf '%s\n' '    iso_agent = module.current_isolated_agent()'
@@ -248,7 +248,7 @@ T8_REPRO="$SMOKE_DIR/t8-repro.sh"
   # Verify the assoc array still works in this shell:
   printf '%s\n' 'echo "shell ARR[test_iso_v25]=${BRIDGE_AGENT_ISOLATION_MODE[test_iso_v25]}"'
   # Confirm the scalar export did NOT propagate to child env.
-  printf '%s\n' 'python3 -c "import os, sys; sys.stderr.write(\"child MODE=\" + os.environ.get(\"BRIDGE_AGENT_ISOLATION_MODE\", \"<UNSET>\") + chr(10))"'
+  printf '%s\n' 'python3 -c "import os, sys; sys.stderr.write(\"child MODE=\" + os.environ.get(\"BRIDGE_AGENT_ISOLATION_MODE\", \"<UNSET>\") + chr(10))"'  # noqa: iso-helper-boundary
   # Now run the predicate driver under the same env. The child python
   # process sees an empty BRIDGE_AGENT_ISOLATION_MODE but iso-uid
   # predicate must still return True because BRIDGE_AGENT_ID +

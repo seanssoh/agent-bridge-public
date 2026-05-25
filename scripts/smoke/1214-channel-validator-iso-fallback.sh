@@ -86,7 +86,7 @@ HARNESS="$SMOKE_DIR/harness.sh"
   # Then test driver.
   printf '%s\n' 'agent="${TEST_AGENT:-test_iso_v25}"'
   printf '%s\n' 'item="${TEST_ITEM:-plugin:ms365}"'
-  printf '%s\n' 'file="${TEST_FILE:-/nonexistent/.env}"'
+  printf '%s\n' 'file="${TEST_FILE:-/nonexistent/.env}"'  # noqa: iso-helper-boundary
   printf '%s\n' 'result="$(bridge_channel_env_file_readiness "$agent" "$item" "$file" MS365_CLIENT_ID)"'
   printf '%s\n' 'printf "%s\n" "$result"'
 } >>"$HARNESS"

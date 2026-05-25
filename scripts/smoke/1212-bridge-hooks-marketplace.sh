@@ -83,10 +83,10 @@ DRIVER="$SMOKE_DIR/driver.py"
   printf '%s\n' '    return module'
   printf '%s\n' ''
   printf '%s\n' 'def main() -> int:'
-  printf '%s\n' '    repo_root = Path(os.environ["DRIVER_REPO_ROOT"]).resolve()'
+  printf '%s\n' '    repo_root = Path(os.environ["DRIVER_REPO_ROOT"]).resolve()'  # noqa: iso-helper-boundary
   printf '%s\n' '    sys.path.insert(0, str(repo_root / "lib"))'
   printf '%s\n' '    mod = load_module("bridge_hooks", repo_root / "bridge-hooks.py")'
-  printf '%s\n' '    launch_cmd = os.environ.get("DRIVER_LAUNCH_CMD", "")'
+  printf '%s\n' '    launch_cmd = os.environ.get("DRIVER_LAUNCH_CMD", "")'  # noqa: iso-helper-boundary
   printf '%s\n' '    result = mod.agent_bridge_development_plugin_settings(launch_cmd)'
   printf '%s\n' '    print(json.dumps(result, sort_keys=True))'
   printf '%s\n' '    return 0'

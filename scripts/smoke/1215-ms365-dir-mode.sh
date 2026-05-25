@@ -122,7 +122,7 @@ T4_ERRORS=""
 if grep -E "writeFileSync\(.*mode: 0o(7|770|770|664|644)" "$MS365_TS" >/dev/null; then
   T4_ERRORS+="ms365 writeFileSync widened beyond 0o600 (secret file mode regression); "
 fi
-if grep -E "chmodSync\([^)]*\.env[^)]*0o(7|770|664|644)" "$MS365_TS" >/dev/null; then
+if grep -E "chmodSync\([^)]*\.env[^)]*0o(7|770|664|644)" "$MS365_TS" >/dev/null; then  # noqa: iso-helper-boundary
   T4_ERRORS+="ms365 ENV_FILE chmod widened beyond 0o600 (secret file mode regression); "
 fi
 if [[ -z "$T4_ERRORS" ]]; then
@@ -158,7 +158,7 @@ PLATFORM="$(uname -s 2>/dev/null || printf 'unknown')"
 if [[ "$PLATFORM" != "Linux" && "${BRIDGE_TEST_LINUX_ROOT:-0}" != "1" ]]; then
   _skip "T6: pre-existing bad-mode dir → mode repaired to 02770 (skipped on non-Linux; set BRIDGE_TEST_LINUX_ROOT=1 to force)"
   _skip "T7: fresh STATE_DIR mkdir lands at 02770 (skipped on non-Linux)"
-  _skip "T8: .env file mode stays at 0600 (skipped on non-Linux)"
+  _skip "T8: .env file mode stays at 0600 (skipped on non-Linux)"  # noqa: iso-helper-boundary
 else
   # Behavioral simulator. We mimic the JS shape directly in bash:
   #   mkdir -p STATE_DIR
@@ -218,14 +218,14 @@ else
   fi
 
   # T8 — .env file mode stays at 0600.
-  ENV_FILE="$FRESH_DIR/.env"
+  ENV_FILE="$FRESH_DIR/.env"  # noqa: iso-helper-boundary
   printf 'MS365_CLIENT_ID=test-id\n' >"$ENV_FILE"
   chmod 0600 "$ENV_FILE"
   T8_MODE_LINUX="$(stat -c '%a' "$ENV_FILE" 2>/dev/null)"
   T8_MODE_MACOS="$(stat -f '%Lp' "$ENV_FILE" 2>/dev/null)"
   T8_MODE="${T8_MODE_LINUX:-$T8_MODE_MACOS}"
   if [[ "$T8_MODE" == "600" ]]; then
-    _pass "T8: .env file mode stays at 0600 (no widening beyond 0600)"
+    _pass "T8: .env file mode stays at 0600 (no widening beyond 0600)"  # noqa: iso-helper-boundary
   else
     _fail "T8" "expected mode 600, got: '$T8_MODE'"
   fi
