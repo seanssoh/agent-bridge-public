@@ -77,6 +77,17 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install ripgrep
+        # scripts/oss-preflight.sh scans tracked files for secret/email
+        # leakage via `rg`. The default ubuntu-latest image ships without
+        # ripgrep, so the preflight bash_die'd with `rg: command not found`
+        # on every PR. Same package is needed by scripts/iso-helper-ratchet.sh
+        # when invoked manually; keep the install scoped to this job since
+        # ratchet is not currently wired into CI (codex r2 fixer follow-up).
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ripgrep
+
       - name: Run OSS preflight
         run: bash ./scripts/oss-preflight.sh
 

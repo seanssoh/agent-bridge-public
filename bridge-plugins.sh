@@ -253,6 +253,55 @@ bridge_plugins_cmd_seed() {
   bridge_plugins_seed_propagate_controller_registry "$marketplace_root" "$_seed_mkt_name" \
     || bridge_warn "[plugins seed] controller claude-registry propagation: non-fatal failure (continuing)"
 
+  # D4 (#1201): mirror the external marketplace tree into
+  # $plugins_cache/marketplaces/<id>/ so the iso UID's
+  # `~/.claude/plugins/marketplaces/<id>` symlink target exists.
+  # Without this, `bridge_known_marketplace_info` (lib/bridge-agents.sh:1664)
+  # skips the marketplace because the controller-side
+  # `<plugins_root>/marketplaces/<id>` mirror is absent, and the warning
+  # planted at lib/bridge-agents.sh:2884 fires at every `agent create`.
+  # Bundled `agent-bridge` is intentionally skipped: the install-tree
+  # reconciler already covers the bundled marketplace via the
+  # `installLocation`/`source.path` fallback at lib/bridge-agents.sh:2006-2013.
+  #
+  # codex r2 BLOCKING 1: helper failure on a non-bundled external
+  # marketplace is FATAL. Without the mirror, the downstream
+  # `bridge_known_marketplace_info` lookup at iso prep / start time
+  # fails the "directory != agent-bridge → skip" guard at
+  # lib/bridge-agents.sh:1843-1844, every `agent create` warns
+  # "no controller-side mirror exists", and the iso agent launches
+  # with a missing marketplace symlink. We must NOT continue to
+  # D3/D2 propagation in that case — D2 in particular writes the
+  # mirror path into per-UID `known_marketplaces.json`, and that
+  # would point at a non-existent dir.
+  #
+  # The mirror helper short-circuits with rc=0 for the bundled
+  # `agent-bridge` marketplace, so callers seeding the bundled
+  # marketplace never enter this fatal branch.
+  if ! bridge_plugins_seed_mirror_marketplace_root \
+        "$marketplace_root" "$_seed_mkt_name" "$plugins_cache"; then
+    bridge_die "agb plugins seed: marketplace mirror creation failed for '$_seed_mkt_name' under $plugins_cache/marketplaces/. The iso UID's marketplaces/<id> symlink target would be missing, so isolated agents would fail to load plugins from this marketplace. Resolve the underlying error (rsync availability, permissions on $plugins_cache, unsafe marketplace id) and re-run \`agb plugins seed --marketplace-root $marketplace_root\`."
+  fi
+
+  # Mirror path that D2/D3 propagation should reference as the
+  # controller-stable source for this marketplace. SHOULD-FIX 1 (codex
+  # r2): D2 used to pass the original `$marketplace_root` (e.g.
+  # `/tmp/pi-registry/`), which the per-UID `known_marketplaces.json`
+  # then recorded as `installLocation` / `source.path`. The original
+  # tree can disappear (tmp cleanup, repo move) after seed completes;
+  # the mirror under `$plugins_cache/marketplaces/<id>` is the
+  # controller-stable replacement that survives. For the bundled
+  # `agent-bridge` marketplace the helper short-circuited above and
+  # the mirror dir does NOT exist — fall back to the original
+  # `$marketplace_root` in that case (the existing
+  # `installLocation`/`source.path` fallback at
+  # lib/bridge-agents.sh:2006-2013 covers the bundled tree).
+  local _seed_d2_source_path="$marketplace_root"
+  if [[ "$_seed_mkt_name" != "agent-bridge" \
+        && -d "$plugins_cache/marketplaces/$_seed_mkt_name" ]]; then
+    _seed_d2_source_path="$plugins_cache/marketplaces/$_seed_mkt_name"
+  fi
+
   # D3 (L1-F): external marketplace clones often land at mode 0700
   # (operator umask), which iso UIDs cannot traverse → dev-plugin-cache
   # source-link / read fails. Recursively grant world traverse + read
@@ -283,10 +332,169 @@ bridge_plugins_cmd_seed() {
   # agents already exist) the per-UID catalog still lacks the entry.
   # This step covers that retrofit path. The per-agent prepare path
   # remains the canonical writer for fresh agent creation.
-  bridge_plugins_seed_propagate_iso_known_marketplaces "$marketplace_root" "$_seed_mkt_name" \
+  #
+  # codex r2 SHOULD-FIX 1: pass the MIRROR path
+  # (`$plugins_cache/marketplaces/<id>`) as the propagation source so
+  # per-UID `known_marketplaces.json` records a controller-stable
+  # location for the marketplace tree. See `_seed_d2_source_path`
+  # resolution above.
+  bridge_plugins_seed_propagate_iso_known_marketplaces "$_seed_d2_source_path" "$_seed_mkt_name" \
     || bridge_warn "[plugins seed] iso known_marketplaces.json propagation: non-fatal failure (continuing)"
 
   printf '[ok] seeded %s (installed_plugins.json present)\n' "$plugins_cache"
+}
+
+# D4 (#1201): mirror an external directory-source marketplace tree into
+# `$plugins_cache/marketplaces/<marketplace_id>/` so the per-UID
+# `marketplaces/<id>` symlink (planted by bridge_linux_share_plugin_catalog
+# in lib/bridge-agents.sh:2947-2974) lands on a real source dir. Without
+# this, `bridge_known_marketplace_info` (lib/bridge-agents.sh:1664) skips
+# every directory-source marketplace other than the bundled `agent-bridge`,
+# and `agent create --isolation linux-user` warns that the controller-side
+# mirror is missing.
+#
+# Args:
+#   $1 — source marketplace root (canonicalized absolute path); must
+#        contain `.claude-plugin/marketplace.json`.
+#   $2 — marketplace id (from the manifest's `name` field, already
+#        resolved by `bridge_plugins_cmd_seed`).
+#   $3 — `$plugins_cache` (`$BRIDGE_SHARED_ROOT/plugins-cache`).
+#
+# Bundled `agent-bridge` is intentionally NOT mirrored — the existing
+# fallback path in `bridge_known_marketplace_info` (line 1838-1844) uses
+# the `installLocation`/`source.path` from `known_marketplaces.json` for
+# the bundled marketplace only. Mirroring it here would duplicate the
+# entire repo on every seed.
+#
+# Idempotency: rsync without `--delete` so the mirror dir refreshes in
+# place. `--delete` is intentionally avoided per codex r1 spec — the iso
+# symlinks at `~/.claude/plugins/marketplaces/<id>` point at the mirror
+# tree, and a stray `--delete` during a sibling seed could erase files
+# the symlinks resolve through. Stale-file risk is acceptable on the
+# directory-source path because the seed is operator-driven.
+#
+# Permissions: after rsync, reuse
+# `bridge_plugins_apply_canonical_modes` so dirs end at `2750/ab-shared`
+# with setgid, files at `g+rX,g-w,o-rwx`. The controller remains the
+# owner; the iso UID reads via group membership (ab-shared).
+bridge_plugins_seed_mirror_marketplace_root() {
+  local mkt_root="$1"
+  local mkt_name="$2"
+  local plugins_cache="$3"
+
+  [[ -n "$mkt_root" ]] || {
+    bridge_warn "[plugins seed] D4: marketplace_root required"
+    return 1
+  }
+  [[ -n "$mkt_name" ]] || {
+    bridge_warn "[plugins seed] D4: marketplace name required (could not resolve from $mkt_root/.claude-plugin/marketplace.json)"
+    return 1
+  }
+  [[ -n "$plugins_cache" ]] || {
+    bridge_warn "[plugins seed] D4: plugins_cache required"
+    return 1
+  }
+  [[ -d "$mkt_root" ]] || {
+    bridge_warn "[plugins seed] D4: marketplace_root is not a directory: $mkt_root"
+    return 1
+  }
+
+  # Bundled in-repo marketplace exception. The bundled name is `agent-bridge`
+  # in the manifest at `.claude-plugin/marketplace.json` and the existing
+  # `bridge_known_marketplace_info` fallback covers its directory-source
+  # discovery via `installLocation`/`source.path`. Refuse to walk the
+  # entire repo into the mirror tree.
+  if [[ "$mkt_name" == "agent-bridge" ]]; then
+    bridge_info "[plugins seed] D4: marketplace '$mkt_name' is the bundled in-repo marketplace — relying on existing installLocation fallback (skipping mirror)"
+    return 0
+  fi
+
+  # Validate the marketplace id with the safe-alias rules. The id becomes
+  # the final path component under the controller-owned `marketplaces/`
+  # tree; the existing
+  # `bridge_isolation_alias_rejection_reason` rejects path-traversal /
+  # NUL / reserved-Windows-name / leading-dot etc. The iso symlink planter
+  # in lib/bridge-agents.sh:2855 enforces the same rule on the consumer
+  # side, but rejecting here keeps the failure local and the error message
+  # actionable. Defense in depth.
+  if command -v bridge_isolation_alias_rejection_reason >/dev/null 2>&1; then
+    local _alias_reason=""
+    _alias_reason="$(bridge_isolation_alias_rejection_reason "$mkt_name")"
+    if [[ -n "$_alias_reason" ]]; then
+      bridge_warn "[plugins seed] D4: refusing to mirror marketplace id '$mkt_name' — $_alias_reason. Rename the marketplace in $mkt_root/.claude-plugin/marketplace.json."
+      return 1
+    fi
+  fi
+
+  local mirror_parent="$plugins_cache/marketplaces"
+  local mirror_root="$mirror_parent/$mkt_name"
+
+  # Resolve canonical source to detect the same-source mirror-onto-self
+  # case. An operator passing `--marketplace-root $plugins_cache/marketplaces/<id>`
+  # (or any path inside it) would otherwise have rsync copy a tree onto
+  # itself and either silently succeed with no change or, worse, hit the
+  # rsync `source and destination are the same` warning. Skip the mirror
+  # in that case — the operator's source IS the mirror.
+  local _src_resolved="" _dst_resolved=""
+  if _src_resolved="$(cd -P "$mkt_root" 2>/dev/null && pwd -P)"; then
+    :
+  else
+    bridge_warn "[plugins seed] D4: could not canonicalize $mkt_root"
+    return 1
+  fi
+  if [[ -d "$mirror_root" ]]; then
+    _dst_resolved="$(cd -P "$mirror_root" 2>/dev/null && pwd -P || printf '')"
+  fi
+  if [[ -n "$_dst_resolved" && "$_src_resolved" == "$_dst_resolved" ]]; then
+    bridge_info "[plugins seed] D4: marketplace_root resolves to mirror destination ($_dst_resolved) — already mirrored, no-op"
+    # Re-apply modes idempotently in case ownership/perms drift since
+    # the previous seed.
+    bridge_plugins_apply_canonical_modes "$plugins_cache" || true
+    return 0
+  fi
+
+  if ! command -v rsync >/dev/null 2>&1; then
+    bridge_warn "[plugins seed] D4: rsync is not installed — refusing to mirror $mkt_root to $mirror_root. Install rsync (apt install rsync / brew install rsync) and re-run \`agb plugins seed\`."
+    return 1
+  fi
+
+  # Ensure the parent + mirror root exist. The mirror parent
+  # ($plugins_cache/marketplaces) inherits the canonical modes from
+  # bridge_plugins_apply_canonical_modes after rsync completes; we do not
+  # pre-chmod here. mkdir is sudo-aware via the same helper bridge-plugins.sh
+  # uses for plugins_cache itself.
+  _bridge_isolation_v2_run_root_or_sudo mkdir -p "$mirror_root" \
+    || {
+      bridge_warn "[plugins seed] D4: mkdir -p $mirror_root failed"
+      return 1
+    }
+
+  bridge_info "[plugins seed] D4: mirroring $mkt_root → $mirror_root (rsync -a, no --delete)"
+  # rsync -a preserves modes/owners where permitted (we'll re-apply
+  # canonical modes below regardless). Trailing slash on source =
+  # "contents of $mkt_root", paired with absolute $mirror_root as
+  # destination. Exclude `.git/` so a git-tracked source checkout does
+  # not bloat the mirror. No `--delete` per codex r1 spec.
+  local _rsync_rc=0
+  _bridge_isolation_v2_run_root_or_sudo rsync -a --exclude=.git/ \
+    "$_src_resolved"/ "$mirror_root"/ \
+    || _rsync_rc=$?
+  if (( _rsync_rc != 0 )); then
+    bridge_warn "[plugins seed] D4: rsync from $_src_resolved/ to $mirror_root/ failed (rc=$_rsync_rc)"
+    return 1
+  fi
+
+  # Re-apply canonical modes across the whole plugins-cache tree so the
+  # new mirror subtree picks up 2750 dirs + 0640 files under
+  # ab-shared. The existing `bridge_plugins_apply_canonical_modes`
+  # walks recursively via `bridge_isolation_v2_chgrp_setgid_recursive`,
+  # so we do not need a narrower scope here — the chgrp_setgid_dir +
+  # recursive contract already idempotently re-asserts the matrix on
+  # every node beneath plugins_cache. On macOS dev hosts both helpers
+  # short-circuit via the platform discriminator (no-op).
+  bridge_plugins_apply_canonical_modes "$plugins_cache" || true
+
+  return 0
 }
 
 # D1 (L1-A): add the marketplace to the controller's claude registry
@@ -622,23 +830,30 @@ bridge_plugins_cmd_show() {
   fi
 }
 
-case "${1:-}" in
-  ""|-h|--help|help)
-    usage
-    [[ "${1:-}" == "" ]] && exit 1
-    exit 0
-    ;;
-  seed)
-    shift
-    bridge_plugins_cmd_seed "$@"
-    ;;
-  show)
-    shift
-    bridge_plugins_cmd_show "$@"
-    ;;
-  *)
-    bridge_warn "지원하지 않는 plugins 명령입니다: $1"
-    usage
-    exit 2
-    ;;
-esac
+# Smoke / library callers that want the helpers without dispatching the
+# CLI can source this file with `BRIDGE_PLUGINS_LIB_ONLY=1`. The standard
+# `agb plugins` CLI entrypoint (`agb`, `agent-bridge`) sets nothing, so
+# the dispatch below runs normally. Same pattern used by other root
+# scripts to make smoke harnesses portable. (#1201 + #1202 smoke.)
+if [[ "${BRIDGE_PLUGINS_LIB_ONLY:-0}" != "1" ]]; then
+  case "${1:-}" in
+    ""|-h|--help|help)
+      usage
+      [[ "${1:-}" == "" ]] && exit 1
+      exit 0
+      ;;
+    seed)
+      shift
+      bridge_plugins_cmd_seed "$@"
+      ;;
+    show)
+      shift
+      bridge_plugins_cmd_show "$@"
+      ;;
+    *)
+      bridge_warn "지원하지 않는 plugins 명령입니다: $1"
+      usage
+      exit 2
+      ;;
+  esac
+fi

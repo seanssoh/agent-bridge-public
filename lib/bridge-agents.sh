@@ -7222,6 +7222,82 @@ bridge_agent_channel_status() {
   printf '%s' "ok"
 }
 
+# #1202 bridge-owned manifest probe. For linux-user isolated v2 agents, the
+# controller's `~/.claude/plugins/installed_plugins.json` and
+# `claude plugin list` are NOT the source of truth — the iso agent loads
+# plugins from its own per-UID manifest (root-owned, written by
+# `bridge_write_isolated_installed_plugins_manifest`) and from the shared
+# plugin cache the operator seeded with `agb plugins seed`. The
+# controller's view diverges (especially for directory-source external
+# marketplaces installed via `--scope user`: spec appears in
+# `enabledPlugins` and `claude plugin list` reports enabled, but
+# `installed_plugins.json` does not include the entry).
+#
+# This helper returns `present` if either of the bridge-owned manifests
+# declares the spec, `absent` otherwise. Always returns 0 — callers gate
+# on stdout content. Per-UID manifest is consulted first; the shared
+# cache manifest covers the seed-only / pre-prepare case (e.g. seed has
+# run but `agent create` has not yet planted the per-UID manifest).
+#
+# Args:
+#   $1 — agent id (used to resolve per-UID HOME)
+#   $2 — plugin spec ("<name>@<marketplace>" or bare id)
+_bridge_claude_plugin_bridge_manifest_has_spec() {
+  local agent="$1"
+  local plugin_spec="$2"
+  local os_user=""
+  local user_home=""
+  local iso_manifest=""
+  local shared_manifest=""
+  local result=""
+
+  [[ -n "$agent" && -n "$plugin_spec" ]] || {
+    printf '%s' "absent"
+    return 0
+  }
+
+  # 1. Per-UID isolated manifest (root-owned, mode 0640). Read via the
+  #    same sudo-root path the catalog writer uses so the controller
+  #    UID can reach it across the isolation boundary.
+  os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+  if [[ -n "$os_user" ]]; then
+    user_home="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || printf '')"
+    if [[ -n "$user_home" ]]; then
+      iso_manifest="$user_home/.claude/plugins/installed_plugins.json"  # noqa: iso-helper-boundary
+      if bridge_linux_sudo_root test -f "$iso_manifest" 2>/dev/null; then
+        bridge_require_python
+        result="$(bridge_linux_sudo_root python3 \
+          "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/claude-plugin-manifest-has-spec.py" \
+          "$iso_manifest" "$plugin_spec" 2>/dev/null || printf 'absent')"
+        if [[ "$result" == "present" ]]; then
+          printf '%s' "present"
+          return 0
+        fi
+      fi
+    fi
+  fi
+
+  # 2. Shared plugin cache manifest (`$BRIDGE_SHARED_ROOT/plugins-cache/
+  #    installed_plugins.json`). Populated by `agb plugins seed`. Readable
+  #    by every member of `ab-shared` so no sudo escalation is needed.
+  if [[ -n "${BRIDGE_SHARED_ROOT:-}" ]]; then
+    shared_manifest="$BRIDGE_SHARED_ROOT/plugins-cache/installed_plugins.json"  # noqa: iso-helper-boundary
+    if [[ -f "$shared_manifest" ]]; then
+      bridge_require_python
+      result="$(python3 \
+        "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/claude-plugin-manifest-has-spec.py" \
+        "$shared_manifest" "$plugin_spec" 2>/dev/null || printf 'absent')"
+      if [[ "$result" == "present" ]]; then
+        printf '%s' "present"
+        return 0
+      fi
+    fi
+  fi
+
+  printf '%s' "absent"
+  return 0
+}
+
 bridge_claude_plugin_status() {
   local plugin_spec="$1"
   # #852 controller-blind plugin trust: optional agent id lets isolation-
@@ -7235,6 +7311,7 @@ bridge_claude_plugin_status() {
   local manifest_owner=""
   local manifest_has_spec=""
   local output=""
+  local bridge_manifest_has_spec=""
 
   if [[ -n "$registry" && -f "$registry" ]]; then
     bridge_require_python
@@ -7254,6 +7331,45 @@ except Exception:
 plugins = payload.get("plugins") or {}
 print("enabled" if spec in plugins else "missing")
 PY
+    return 0
+  fi
+
+  # #1202: for linux-user isolated v2 agents, bridge-owned manifests
+  # (per-UID `installed_plugins.json` + shared `plugins-cache/
+  # installed_plugins.json`) are the authoritative source. Disagreement
+  # rule (codex r1 spec):
+  #   - Controller missing + bridge present → ready (enabled).
+  #   - Controller enabled + bridge missing → not ready for iso v2
+  #     (return `missing` so `bridge_ensure_claude_plugin_enabled` fails
+  #     closed with seed/mirror guidance instead of attempting a
+  #     `claude plugin install` against drifted controller state).
+  # This trumps the controller's `~/.claude/plugins/installed_plugins.json`
+  # probe at the #852 callsite below AND the `claude plugin list`
+  # fallback further down.
+  #
+  # codex r2: gate on EFFECTIVE isolation rather than roster-requested
+  # isolation. `bridge_agent_linux_user_isolation_effective` checks
+  # roster mode + Linux host + os_user populated, AND `bridge_isolation_
+  # disabled_by_env` covers the BRIDGE_DISABLE_ISOLATION=1 runtime
+  # hatch that `bridge-start.sh:670-672` honors. Without this dual
+  # gate, an operator using the disable hatch on a linux-user roster
+  # would unexpectedly hit the iso-v2 fail-closed path instead of
+  # falling through to the legacy controller install flow that
+  # bridge-start.sh:907-912 still drives in disabled-mode.
+  if [[ -n "$agent" ]] \
+      && ! bridge_isolation_disabled_by_env \
+      && bridge_agent_linux_user_isolation_effective "$agent"; then
+    bridge_manifest_has_spec="$(_bridge_claude_plugin_bridge_manifest_has_spec "$agent" "$plugin_spec")"
+    if [[ "$bridge_manifest_has_spec" == "present" ]]; then
+      printf '%s' "enabled"
+      return 0
+    fi
+    # Bridge-owned manifests are silent on this spec → iso v2 is NOT
+    # ready. Skip the controller-side fallbacks so the ensure helper
+    # can fail closed with actionable seed guidance instead of falling
+    # into `claude plugin install`, which only mutates controller
+    # state and cannot repair the shared cache contract.
+    printf '%s' "missing"
     return 0
   fi
 
@@ -7496,12 +7612,46 @@ bridge_ensure_claude_plugin_enabled() {
       if [[ -n "${BRIDGE_CLAUDE_INSTALLED_PLUGINS_FILE:-}" ]]; then
         bridge_die "Claude plugin registry is missing '$plugin_spec' in test mode."
       fi
+      marketplace="$(bridge_claude_plugin_marketplace "$plugin_spec")"
+      # #1202: for linux-user isolated v2 agents, fail closed instead
+      # of running `claude plugin install --scope user`. That command
+      # only mutates the controller's Claude state (which the iso agent
+      # does NOT load from) and cannot repair the shared plugin cache
+      # / per-UID manifest contract the iso UID actually consumes. The
+      # bridge-owned manifests reach `missing` only when seed has not
+      # been run for this marketplace OR the per-UID prepare did not
+      # write the spec into `bridge_write_isolated_installed_plugins_
+      # manifest` (typically because the marketplace mirror was absent
+      # at `agent create` time — see #1201).
+      #
+      # Actionable remediation: point the operator at `agb plugins seed
+      # [--marketplace-root <path>]` plus an `agent start` rerun, which
+      # rederives the per-UID catalog via `bridge_linux_share_plugin_
+      # catalog` (lib/bridge-agents.sh:4178). No `agent create` rerun
+      # required.
+      #
+      # codex r2: gate on EFFECTIVE isolation, matching the status
+      # probe above. See the long comment at the status-helper iso-v2
+      # short-circuit for the rationale (BRIDGE_DISABLE_ISOLATION=1
+      # runtime hatch + non-Linux host fallthrough).
+      if [[ -n "$agent" ]] \
+          && ! bridge_isolation_disabled_by_env \
+          && bridge_agent_linux_user_isolation_effective "$agent"; then
+        local _seed_hint="agb plugins seed"
+        if [[ -n "$marketplace" && "$marketplace" != "agent-bridge" ]]; then
+          _seed_hint="agb plugins seed --marketplace-root <path-to-${marketplace}-source>"
+        fi
+        bridge_die "Claude plugin '$plugin_spec' is not declared in the bridge-owned plugin manifest for isolated agent '$agent'. The shared plugin cache (\$BRIDGE_SHARED_ROOT/plugins-cache) and the per-UID plugin manifest are the source of truth for isolated v2 agents — \`claude plugin install\` would mutate controller-side state that the isolated agent does not load. Run: $_seed_hint && agent-bridge agent start $agent --no-attach"
+      fi
+      # Non-isolated (shared-mode) agents: preserve the existing
+      # install/marketplace-self-heal flow. The iso-v2 short-circuit
+      # above carved out only the isolated path.
+      #
       # #853: self-heal a silently-drifted controller marketplace before
       # the install shell-out. Non-zero return = "could not self-heal,
       # proceed with install as before"; the existing
       # bridge_force_refresh_claude_marketplace retry path below still
       # catches the directory-source agent-bridge marketplace case.
-      marketplace="$(bridge_claude_plugin_marketplace "$plugin_spec")"
       if [[ -n "$marketplace" && -n "$agent" ]]; then
         # codex r1 (#858): drop the stdout/stderr suppression so the
         # helper's own bridge_warn on `claude plugin marketplace add`
