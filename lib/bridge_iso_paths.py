@@ -749,6 +749,120 @@ def write_text_atomic_as_owner(
 
 
 # ---------------------------------------------------------------------------
+# bridge_iso_run thin Python adapter
+# Wraps `agent-bridge iso-run ...` so Python callers (bridge-setup.py,
+# bridge-hooks.py, bridge-watchdog.py, bridge-dev-plugin-cache.py) can
+# converge on the same unified op table that lib/bridge-isolation-helpers.sh
+# exposes to shell callers. Does NOT reimplement sudo/path logic — every
+# call routes through the shell facade.
+# ---------------------------------------------------------------------------
+
+
+def _agent_bridge_cli_path() -> str:
+    """Locate the `agent-bridge` dispatcher.
+
+    Prefers the parent of this file (lib/ -> repo root) since this module
+    ships inside the bridge source tree. Falls back to PATH lookup so
+    operator-installed shims still work.
+    """
+    here = Path(__file__).resolve().parent
+    candidate = here.parent / "agent-bridge"
+    if candidate.exists():
+        return str(candidate)
+    return "agent-bridge"
+
+
+def iso_run(
+    agent: str,
+    op: str,
+    *,
+    path: str | None = None,
+    from_path: str | None = None,
+    to_path: str | None = None,
+    link: str | None = None,
+    target: str | None = None,
+    mode: str | None = None,
+    name: str | None = None,
+    workdir: str | None = None,
+    fmt: str | None = None,
+    test: str | None = None,
+    keys: list[str] | None = None,
+    group_agent: str | None = None,
+    stdin: str | None = None,
+    legacy_ok: bool = False,
+    timeout: float | None = 15.0,
+) -> "subprocess.CompletedProcess[str]":
+    """Invoke `agent-bridge iso-run --agent <agent> --op <op> ...`.
+
+    Returns the raw `CompletedProcess`; callers inspect `returncode`
+    against the structured rc band documented in
+    `lib/bridge-isolation-helpers.sh` (0 success / 10 not-isolated /
+    20 sudo-unavail / 30 absent / 31 missing-key / 32 unreadable / 40
+    unsafe-path / 2 op-specific failure).
+
+    `stdin` (when provided) is fed via pipe — NO heredoc-stdin. This
+    function itself does not use heredocs; the `bash -c` body is the
+    static shell facade.
+
+    Footgun #11 compliance: subprocess.run with `input=stdin` streams
+    bytes via the parent process's pipe to the child stdin — same shape
+    as `write_text_atomic_as_owner`'s pattern in this module.
+    """
+    cli = _agent_bridge_cli_path()
+    argv: list[str] = [cli, "iso-run", "--agent", agent, "--op", op]
+    if path is not None:
+        argv += ["--path", path]
+    if from_path is not None:
+        argv += ["--from", from_path]
+    if to_path is not None:
+        argv += ["--to", to_path]
+    if link is not None:
+        argv += ["--link", link]
+    if target is not None:
+        argv += ["--target", target]
+    if mode is not None:
+        argv += ["--mode", mode]
+    if name is not None:
+        argv += ["--name", name]
+    if workdir is not None:
+        argv += ["--workdir", workdir]
+    if fmt is not None:
+        argv += ["--format", fmt]
+    if test is not None:
+        argv += ["--test", test]
+    if keys:
+        for k in keys:
+            argv += ["--key", k]
+    if group_agent is not None:
+        argv += ["--group-agent", group_agent]
+    if stdin is not None:
+        argv += ["--stdin"]
+    if legacy_ok:
+        argv += ["--legacy-ok"]
+    try:
+        return subprocess.run(
+            argv,
+            input=stdin if stdin is not None else None,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError:
+        print(
+            f"[bridge-iso-paths] {cli!r} not found; cannot invoke iso-run",
+            file=sys.stderr,
+        )
+        return subprocess.CompletedProcess(
+            args=argv, returncode=127, stdout="", stderr=""
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=argv, returncode=124, stdout="", stderr="timeout"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Back-compat aliases for legacy private-name introspection
 # (e.g. unit-test harnesses that stub `mod._sudo_run_as` after a
 # from-import). The aliases point to the same callable, so swapping
@@ -790,6 +904,8 @@ __all__ = [
     "safe_realpath",
     "ensure_dir",
     "write_text_atomic_as_owner",
+    # beta23 Option A — bridge_iso_run thin adapter
+    "iso_run",
     # back-compat aliases
     "_isolated_workdir_owner",
     "_resolve_isolated_owner_for_path",

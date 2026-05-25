@@ -252,7 +252,7 @@ source "$SCRIPT_DIR/bridge-lib.sh"
 # (if a future patch adds the subcommand handler) does not eat the
 # roster cost either.
 case "${1:-}" in
-  version|status|daemon|agent|task|inbox|a2a|help|--help|-h|--version|-V) ;;
+  version|status|daemon|agent|task|inbox|a2a|iso-run|help|--help|-h|--version|-V) ;;
   init)
     # bridge-isolation-v2.sh's `BRIDGE_LAYOUT="${BRIDGE_LAYOUT:-legacy}"`
     # default fires during our bridge-lib.sh source above and exports the
@@ -816,6 +816,34 @@ A2A_HELP
       fi
       bridge_list_active_agents_numbered
       exit 0
+      ;;
+    iso-run)
+      # Hidden CLI facade for the `bridge_iso_run` shell helper. Used
+      # by Python callers (`bridge_iso_paths.iso_run`) that need to
+      # invoke the unified controller->iso boundary helper from a
+      # non-shell process. Forwards argv unchanged after the
+      # `iso-run` token. See `lib/bridge-isolation-helpers.sh`
+      # header for the op catalog + structured rc band.
+      shift
+      case "${1:-}" in
+        -h|--help|help)
+          cat <<'ISO_RUN_HELP'
+Usage: agent-bridge iso-run --agent <agent> --op <op> [op-args]
+
+Hidden CLI facade for the bridge_iso_run shell helper. Used by Python
+callers that need to invoke the unified controller->iso boundary helper.
+
+Ops: stat, read-file, read-json, env-has-any-key, read-env-key,
+     mkdir-p, atomic-write, rename, state-marker-write,
+     scan-profile, publish-root-file, publish-root-symlink
+
+See lib/bridge-isolation-helpers.sh header for the full contract.
+ISO_RUN_HELP
+          exit 0
+          ;;
+      esac
+      bridge_iso_run "$@"
+      exit $?
       ;;
     status)
       shift
