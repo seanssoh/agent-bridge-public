@@ -263,8 +263,44 @@ bridge_plugins_cmd_seed() {
   # Bundled `agent-bridge` is intentionally skipped: the install-tree
   # reconciler already covers the bundled marketplace via the
   # `installLocation`/`source.path` fallback at lib/bridge-agents.sh:2006-2013.
-  bridge_plugins_seed_mirror_marketplace_root "$marketplace_root" "$_seed_mkt_name" "$plugins_cache" \
-    || bridge_warn "[plugins seed] marketplace mirror under $plugins_cache/marketplaces/$_seed_mkt_name: non-fatal failure (continuing)"
+  #
+  # codex r2 BLOCKING 1: helper failure on a non-bundled external
+  # marketplace is FATAL. Without the mirror, the downstream
+  # `bridge_known_marketplace_info` lookup at iso prep / start time
+  # fails the "directory != agent-bridge → skip" guard at
+  # lib/bridge-agents.sh:1843-1844, every `agent create` warns
+  # "no controller-side mirror exists", and the iso agent launches
+  # with a missing marketplace symlink. We must NOT continue to
+  # D3/D2 propagation in that case — D2 in particular writes the
+  # mirror path into per-UID `known_marketplaces.json`, and that
+  # would point at a non-existent dir.
+  #
+  # The mirror helper short-circuits with rc=0 for the bundled
+  # `agent-bridge` marketplace, so callers seeding the bundled
+  # marketplace never enter this fatal branch.
+  if ! bridge_plugins_seed_mirror_marketplace_root \
+        "$marketplace_root" "$_seed_mkt_name" "$plugins_cache"; then
+    bridge_die "agb plugins seed: marketplace mirror creation failed for '$_seed_mkt_name' under $plugins_cache/marketplaces/. The iso UID's marketplaces/<id> symlink target would be missing, so isolated agents would fail to load plugins from this marketplace. Resolve the underlying error (rsync availability, permissions on $plugins_cache, unsafe marketplace id) and re-run \`agb plugins seed --marketplace-root $marketplace_root\`."
+  fi
+
+  # Mirror path that D2/D3 propagation should reference as the
+  # controller-stable source for this marketplace. SHOULD-FIX 1 (codex
+  # r2): D2 used to pass the original `$marketplace_root` (e.g.
+  # `/tmp/pi-registry/`), which the per-UID `known_marketplaces.json`
+  # then recorded as `installLocation` / `source.path`. The original
+  # tree can disappear (tmp cleanup, repo move) after seed completes;
+  # the mirror under `$plugins_cache/marketplaces/<id>` is the
+  # controller-stable replacement that survives. For the bundled
+  # `agent-bridge` marketplace the helper short-circuited above and
+  # the mirror dir does NOT exist — fall back to the original
+  # `$marketplace_root` in that case (the existing
+  # `installLocation`/`source.path` fallback at
+  # lib/bridge-agents.sh:2006-2013 covers the bundled tree).
+  local _seed_d2_source_path="$marketplace_root"
+  if [[ "$_seed_mkt_name" != "agent-bridge" \
+        && -d "$plugins_cache/marketplaces/$_seed_mkt_name" ]]; then
+    _seed_d2_source_path="$plugins_cache/marketplaces/$_seed_mkt_name"
+  fi
 
   # D3 (L1-F): external marketplace clones often land at mode 0700
   # (operator umask), which iso UIDs cannot traverse → dev-plugin-cache
@@ -296,7 +332,13 @@ bridge_plugins_cmd_seed() {
   # agents already exist) the per-UID catalog still lacks the entry.
   # This step covers that retrofit path. The per-agent prepare path
   # remains the canonical writer for fresh agent creation.
-  bridge_plugins_seed_propagate_iso_known_marketplaces "$marketplace_root" "$_seed_mkt_name" \
+  #
+  # codex r2 SHOULD-FIX 1: pass the MIRROR path
+  # (`$plugins_cache/marketplaces/<id>`) as the propagation source so
+  # per-UID `known_marketplaces.json` records a controller-stable
+  # location for the marketplace tree. See `_seed_d2_source_path`
+  # resolution above.
+  bridge_plugins_seed_propagate_iso_known_marketplaces "$_seed_d2_source_path" "$_seed_mkt_name" \
     || bridge_warn "[plugins seed] iso known_marketplaces.json propagation: non-fatal failure (continuing)"
 
   printf '[ok] seeded %s (installed_plugins.json present)\n' "$plugins_cache"
