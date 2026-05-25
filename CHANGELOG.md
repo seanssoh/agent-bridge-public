@@ -6,6 +6,141 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta19] — 2026-05-25
+
+### Highlight — beta19 L1 wave: install-tree row expansion + Teams shim + bun traversal
+
+Operator-cued **nineteenth prerelease**. After Phase 3 (beta18) PASSED
+its bidirectional Cosmax Teams DM gate, patch's [phase3-pass] report
+surfaced 5 new findings — all surfaced AFTER the contract baseline
+closed, all manual-workaround-able but architecturally Phase 2-row-shaped.
+Sean directive: keep iterating — rc1/v0.15.0 holds until L1+L2 close.
+This is L1. L2 (Variant 3 admin-driven daemon self-restart) follows.
+
+`-beta19` prerelease; matching tag `v0.14.5-beta19`, GitHub release
+marked **Pre-release**.
+
+### Fixed / Added — Install-tree row expansion (5 new state-scaffold rows) (#1187)
+
+- **`lib/bridge-isolation-v2-reconcile.sh`** — 5 new `state_scaffold`
+  rows. Codex r1 corrected the brief: `dir` kind does NOT mkdir absent
+  dirs (`lib/bridge-isolation-v2-reconcile.sh:330-340`), so writer
+  paths created on first inbound (Teams callbacks, channel activity
+  index) needed `state_scaffold`:
+
+  | Row | Path | Owner:Group | Mode | Notes |
+  |---|---|---|---|---|
+  | `shared-ms365-callbacks-dir` | `$BRIDGE_HOME/shared/ms365-callbacks` | controller:ab-shared | **3770** | sticky+setgid+group-write — writers create/unlink callback files; sticky prevents cross-UID delete |
+  | `state-channels-root` | `$BRIDGE_HOME/state/channels` | controller:ab-shared | 0710 | parent traverse only |
+  | `state-channels-teams-dir` | `$BRIDGE_HOME/state/channels/teams` | controller:ab-shared | **3770** | isolated Teams writer creates `<agent>.json`; sticky limits cross-agent overwrite |
+  | `state-queue-dir` | `$BRIDGE_HOME/state/queue` | controller:ab-shared | 0710 | iso UID `agb inbox` access (closes the 30s gateway-timeout symptom) |
+  | `state-queue-bodies-dir` | `$BRIDGE_HOME/state/queue/bodies` | controller:ab-shared | 0710 | sibling per `bridge-queue.py:310-315` body storage |
+
+### Fixed — Teams plugin runtime (#959 + activity-index mode) (#1187)
+
+- **`plugins/teams/server.ts`** — local `createExpressResponseShim`
+  wraps the native `http.ServerResponse` for `processActivity(req, res, ...)`
+  calls (the `/api/messages` path only). Implements `status(code)` and
+  `send(body)` with Buffer/string/object/null variants. Closes #959
+  (TypeError 500 since first commit `9bbb09e` — BotFrameworkAdapter
+  expects Express-style response, was passing native HTTP res).
+  Migration to `CloudAdapter.processActivityDirect` is the cleaner
+  long-term answer but out of scope for this stabilization PR.
+
+- **`plugins/teams/server.ts`** `writeTeamsActivityIndex` — tmp file
+  write at `0640`, chmod final file `0640` post-rename. Reason: the
+  activity-index lives under `state/channels/teams/<agent>.json` and
+  is created by the isolated Teams writer UID. The controller daemon
+  route lookup (`bridge-channels.py:289-304`) must read it; the
+  previous `0600` mode blocked that. Setgid on the parent directory
+  (mode 3770) makes group `ab-shared`, so the controller can read
+  the file while world stays locked out.
+
+- **NEW `_smoke-shim` CLI subcommand** for plugin smoke fixtures.
+
+### Fixed — Bun runtime traversal for isolated UIDs (#1187)
+
+- **`lib/bridge-channels.sh`** — new helper
+  `bridge_ensure_bun_runtime_traversable_for_isolated`. When `bun` is
+  installed under `$HOME/.bun/` (the common bun installer default),
+  `chmod o+x` on `$HOME/.bun` and `$HOME/.bun/bin` so isolated UIDs
+  can traverse the symlink chain to the real `bun` binary. **Closes the
+  "Teams MCP tool 없네요" symptom**: PATH-visible `/usr/local/bin/bun`
+  pointed at `$HOME/.bun/bin/bun`, and isolated UIDs could not
+  traverse `$HOME/.bun` (mode 0700) → bun missing from iso PATH → Teams
+  MCP server never spawned. Helper is no-op when bun lives elsewhere,
+  no-op on non-Linux, and opt-out via `BRIDGE_BUN_CHMOD_OPT_OUT=1`.
+
+- **`lib/upgrade-helpers/bun-traverse-chmod.sh` (NEW)** — standalone
+  helper invoked from `bridge-upgrade.sh` (file-as-argv, no heredoc-
+  stdin per footgun #11). Wired after the install-tree reconciler pass
+  during upgrade, so in-place upgraders (patch's beta19 verify path)
+  pick up the traverse fix without a fresh `agb setup teams`.
+
+- **`lib/bridge-channels.sh:bridge_provision_teams_plugin_runtime`** —
+  helper invoked after Bun resolved/installed and before node_modules
+  provisioning. Keeps the PR #1090 invariant intact (setup still
+  requires PATH-reachable bun, doesn't fallback to `$HOME/.bun/bin/bun`
+  symlink-only).
+
+### Tests
+
+- **`scripts/smoke/phase2-install-tree-reconciler.sh`** — T1 extended
+  to assert all 5 new L1 rows appear in matrix output; T9 NEW
+  functional fixture starts from absent dirs, runs `--apply`, asserts
+  exact owner/group/mode (`3770` writer dirs, `0710` parent dirs);
+  T3 idempotence Linux-gated for macOS sticky-bit limitation.
+
+- **`scripts/smoke/teams-shim-roundtrip.sh` (NEW, 6 variants)** —
+  pipes 6 response variants (Buffer / string / object / null /
+  double-send / write-after-end) through `createExpressResponseShim`
+  with a fake native response and asserts contract: status code set,
+  body once, content-type inferred for objects.
+
+- **`scripts/smoke/bun-runtime-traverse.sh` (NEW, 3 cases)** —
+  fixture-based test of the bun helper: under-HOME bun → traverse
+  bits added (o+x, NOT o+r); opt-out → no chmod; non-HOME bun →
+  no-op.
+
+- **`tests/precompact-notify/teams-mattermost-adapter.sh`** — T9
+  asserts activity-index file mode is `0640`.
+
+### Verification
+
+- **VM acceptance** (OrbStack `agb-clean-test`, Ubuntu noble arm64,
+  IN-PLACE UPGRADE from beta18) — 8 steps PASS:
+  1. `agent-bridge upgrade --apply --channel current` — 126 files
+     copied, bun-traverse helper fired during upgrade.
+  2. `reconcile --check --all-agents --json` — all 5 new L1 rows
+     `status: ok` (3770/0710/3770/0710/0710).
+  3. Reused `test_iso3` from Phase 3.
+  4. Bun-traverse verified: `~/.bun` and `~/.bun/bin` widened from
+     0750 → 0751 (traverse-only, no read bit). Iso UID
+     `bun --version` → `1.3.14`.
+  5. `agb inbox test_iso3` from iso UID returns in **0.15s** (was
+     30s gateway timeout pre-fix).
+  6. Teams shim via `_smoke-shim`: `endCalls=1, statusCode=202,
+     contentType=application/json`, no TypeError. `processActivity`
+     500 closed.
+  7. Iso UID writes `shared/ms365-callbacks/iso-test-state-*.json`
+     (rc=0); file lands `agent-bridge-test_iso3:ab-shared 664` via
+     setgid.
+  8. Iso UID writes `state/channels/teams/test_iso3.json` via
+     `_smoke-record-activity`: mode `0640`, group `ab-shared`,
+     controller `json.load(...)` parses cleanly.
+
+- **Known carryover** — Phase 3 `plugins-channel-trees` row
+  (`dir_recursive` over `$BRIDGE_HOME/plugins/*`) reports `skipped`
+  on absent-on-fresh state. Manual `chgrp -R ab-shared` +
+  `chmod -R g+rX` unblocks the activity-index write smoke step.
+  Recursive row needs converge-from-absent enhancement; folded into
+  the next reconciler-row pass (does not block beta19).
+
+- **Pre-existing CI fragility unchanged** — `1121-agent-delete-
+  os-purge` C5 / `1140-purge-home-os-cleanup` C4 / `mattermost-plugin`
+  (CI bun, VM no-bun) fail on `main` and `stabilize` independent of
+  this change. Separate follow-up.
+
 ## [0.14.5-beta18] — 2026-05-25
 
 ### Highlight — Phase 3 isolation contract fix (8 gaps + restart-reverter regression)
