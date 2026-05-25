@@ -1050,9 +1050,52 @@ bridge_load_roster() {
   # This is what keeps the isolated UID from needing read access to the global
   # agent-roster.local.sh (which is 0600 and contains every agent's tokens).
   # See issue #116.
-  if [[ -z "$isolated_env_file" && -n "$scoped_agent_id" && -n "${BRIDGE_ACTIVE_AGENT_DIR:-}" ]]; then
-    scoped_env_file="$BRIDGE_ACTIVE_AGENT_DIR/$scoped_agent_id/agent-env.sh"
-    if [[ -r "$scoped_env_file" ]]; then
+  #
+  # L1-N (beta21, codex r1 spec): the scoped env writer for v2 puts the
+  # file at `$BRIDGE_AGENT_ROOT_V2/<agent>/runtime/agent-env.sh` (via
+  # `bridge_agent_linux_env_file` → `bridge_agent_runtime_state_dir`),
+  # NOT at the legacy `$BRIDGE_ACTIVE_AGENT_DIR/<agent>/agent-env.sh`
+  # path. Without checking BOTH paths, iso UID `agb task create`
+  # subprocesses (whose bridge-task.sh fork sources bridge-lib.sh, which
+  # calls bridge_load_roster) missed scoped env discovery on v2 hosts
+  # and fell through to sourcing the 0600 `BRIDGE_ROSTER_LOCAL_FILE` —
+  # which EACCESed under the iso UID and killed the wrapper. The scoped
+  # env is what sets `BRIDGE_TASK_DB=/dev/null` and
+  # `BRIDGE_GATEWAY_PROXY=1` so the queue command routes through the
+  # controller-side gateway socket (lib/bridge-core.sh:640-663,
+  # 781-811); finding it via either path keeps queue traffic safely
+  # gateway-routed without exposing the controller's roster to the iso
+  # UID.
+  if [[ -z "$isolated_env_file" && -n "$scoped_agent_id" ]]; then
+    # Try v2 runtime path first if BRIDGE_AGENT_ROOT_V2 is exported —
+    # that is the canonical writer location for the v2 layout. Prefer
+    # `bridge_agent_linux_env_file` when the helper is loaded; fall
+    # back to the literal path expression so this discovery still
+    # works in subshell contexts where the helper may not yet be
+    # defined (the function lives in lib/bridge-agents.sh, which IS
+    # sourced via bridge-lib.sh, but a defensive fallback costs us
+    # nothing and keeps the discovery independent of source order).
+    if [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" ]]; then
+      local _v2_scoped_env_file=""
+      if declare -F bridge_agent_linux_env_file >/dev/null 2>&1; then
+        _v2_scoped_env_file="$(bridge_agent_linux_env_file "$scoped_agent_id" 2>/dev/null || true)"
+      fi
+      if [[ -z "$_v2_scoped_env_file" ]]; then
+        _v2_scoped_env_file="$BRIDGE_AGENT_ROOT_V2/$scoped_agent_id/runtime/agent-env.sh"
+      fi
+      if [[ -r "$_v2_scoped_env_file" ]]; then
+        scoped_env_file="$_v2_scoped_env_file"
+      fi
+    fi
+    # Fall back to the legacy path under BRIDGE_ACTIVE_AGENT_DIR for
+    # pre-v2 installs and tests that still exercise that layout.
+    if [[ -z "$scoped_env_file" && -n "${BRIDGE_ACTIVE_AGENT_DIR:-}" ]]; then
+      local _legacy_scoped_env_file="$BRIDGE_ACTIVE_AGENT_DIR/$scoped_agent_id/agent-env.sh"
+      if [[ -r "$_legacy_scoped_env_file" ]]; then
+        scoped_env_file="$_legacy_scoped_env_file"
+      fi
+    fi
+    if [[ -n "$scoped_env_file" ]]; then
       isolated_env_file="$scoped_env_file"
       # Persist the discovered path so bridge_queue_gateway_proxy_agent
       # (lib/bridge-core.sh) can detect proxy mode without requiring
@@ -1074,9 +1117,60 @@ bridge_load_roster() {
       source "$BRIDGE_ROSTER_FILE"
     fi
 
+    # L1-N (beta21, codex r1): queue-safe iso UID fallback. When the
+    # scoped env was NOT discovered (above) AND the calling process is
+    # a non-controller (iso) UID AND `BRIDGE_ROSTER_LOCAL_FILE` is
+    # unreadable AND the caller is a known queue-safe verb, source
+    # only the public roster (already done above) and skip the
+    # protected local roster. Queue verbs (`task create|done|claim|
+    # cancel|update|handoff|summary|create`, top-level `inbox|show|
+    # claim|done|cancel|update|handoff|summary|create`) only need the
+    # agent inventory (in the public roster) to validate `--to <agent>`
+    # — they route through `bridge_queue_cli` which uses the gateway
+    # socket, NOT direct DB access, so they don't need any secret in
+    # `BRIDGE_ROSTER_LOCAL_FILE`.
+    #
+    # For NON-queue commands without scoped env, fail closed with an
+    # actionable error pointing the operator at controller-side
+    # invocation or scoped env. (channel mutations, agent mutations,
+    # admin verbs etc. legitimately need roster_local; running them as
+    # an iso UID without scoped env is a misuse).
+    #
+    # `BRIDGE_ROSTER_LOCAL_FILE` mode itself stays 0600 (protected,
+    # NOT chmod'd) — only the SOURCING is skipped for the queue verb
+    # case, the file remains controller-readable for legitimate
+    # controller-side roster_load callsites.
     if [[ -f "$BRIDGE_ROSTER_LOCAL_FILE" ]]; then
-      # shellcheck source=/dev/null
-      source "$BRIDGE_ROSTER_LOCAL_FILE"
+      if [[ -r "$BRIDGE_ROSTER_LOCAL_FILE" ]]; then
+        # shellcheck source=/dev/null
+        source "$BRIDGE_ROSTER_LOCAL_FILE"
+      else
+        # Unreadable: detect iso UID + queue-safe context.
+        local _is_iso_uid=0
+        if [[ "$EUID" -ne 0 ]] \
+            && [[ -n "${BRIDGE_CONTROLLER_UID:-}" ]] \
+            && [[ "$EUID" != "${BRIDGE_CONTROLLER_UID}" ]]; then
+          _is_iso_uid=1
+        fi
+        if (( _is_iso_uid == 1 )) \
+            && [[ "${BRIDGE_QUEUE_SAFE_CONTEXT:-0}" == "1" ]]; then
+          # Once-per-process warn so VM logs surface the path that
+          # was taken without flooding when an agent runs a batch of
+          # queue commands.
+          if [[ "${BRIDGE_ROSTER_LOCAL_SKIP_WARNED:-0}" != "1" ]]; then
+            bridge_warn "bridge_load_roster: iso UID detected (euid=$EUID, controller_uid=${BRIDGE_CONTROLLER_UID:-}), queue-safe verb context — skipping unreadable protected roster '$BRIDGE_ROSTER_LOCAL_FILE' (public roster + gateway proxy provide queue access; configure scoped env via \`agent-bridge isolate <agent>\` to silence)"
+            export BRIDGE_ROSTER_LOCAL_SKIP_WARNED=1
+          fi
+        else
+          # Fail closed: non-queue command from iso UID without scoped
+          # env, OR a controller-side caller that genuinely cannot
+          # read its own roster (filesystem damage). Either way we
+          # MUST NOT silently continue with a half-loaded roster —
+          # that was the pre-L1-N footgun (silent EACCES → wrapper
+          # error). Surface actionable guidance.
+          bridge_die "bridge_load_roster: cannot read protected roster '$BRIDGE_ROSTER_LOCAL_FILE' (euid=$EUID). For iso UID invocations, either (a) use a queue-safe verb (task create|done|claim|inbox|...) which routes through the gateway, (b) run the command as the controller via \`agb\` on the controller side, or (c) ensure the scoped agent env exists at \$BRIDGE_AGENT_ROOT_V2/<agent>/runtime/agent-env.sh (re-run \`agent-bridge isolate <agent>\` to regenerate)"
+        fi
+      fi
     fi
   fi
 

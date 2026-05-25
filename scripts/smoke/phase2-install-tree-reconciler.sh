@@ -277,6 +277,39 @@ test_t1_matrix_rows() {
   " 2>/dev/null)"
   smoke_assert_contains "$rows_agent" "agent-state-leaf|" \
     "T1: agent-state-leaf must appear when --agent is given"
+  # L1-M (beta21, codex r1 spec): agent-state-leaf must align with the
+  # per-agent grant matrix SSOT (`state-agent-dir` row at
+  # lib/bridge-isolation-v2.sh:1596-1622). For a synthetic
+  # fake_agent_smoke that is not in the roster, `bridge_agent_isolation_mode`
+  # defaults to "shared" — so we assert the shared-mode contract:
+  # owner=controller, group=controller_group, mode=2770, required (not
+  # the pre-beta21 controller:ab-shared:0710 optional contract).
+  local _leaf_line
+  _leaf_line="$(printf '%s\n' "$rows_agent" | grep "^agent-state-leaf|" | head -n 1)"
+  if [[ -z "$_leaf_line" ]]; then
+    smoke_fail "T1: agent-state-leaf row not isolatable for assertion"
+  fi
+  # Columns: row_name|scope|path|kind|owner|group|dir_mode|file_mode|setgid|recursive|children_policy|mechanism|criticality|notes
+  # Use printf | cut to avoid `<<<` here-strings (footgun #11
+  # lint-heredoc-ban H3 — Bash 5.3.9 deadlocks on here-string into
+  # command substitution under set -e).
+  local _leaf_owner _leaf_group _leaf_mode _leaf_criticality
+  _leaf_owner="$(printf '%s' "$_leaf_line" | cut -d'|' -f5)"
+  _leaf_group="$(printf '%s' "$_leaf_line" | cut -d'|' -f6)"
+  _leaf_mode="$(printf '%s' "$_leaf_line" | cut -d'|' -f7)"
+  _leaf_criticality="$(printf '%s' "$_leaf_line" | cut -d'|' -f13)"
+  if [[ "$_leaf_owner" != "controller" ]]; then
+    smoke_fail "T1: agent-state-leaf owner must be 'controller' (got '$_leaf_owner')"
+  fi
+  if [[ "$_leaf_group" != "controller_group" && "$_leaf_group" != ab-agent-* ]]; then
+    smoke_fail "T1: agent-state-leaf group must be 'controller_group' (shared) or 'ab-agent-<X>' (linux-user) — got '$_leaf_group'"
+  fi
+  if [[ "$_leaf_mode" != "2770" ]]; then
+    smoke_fail "T1: agent-state-leaf mode must be 2770 per matrix SSOT (got '$_leaf_mode' — beta21 L1-M corrects the prior 0710)"
+  fi
+  if [[ "$_leaf_criticality" != "required" ]]; then
+    smoke_fail "T1: agent-state-leaf criticality must be 'required' (got '$_leaf_criticality' — beta21 L1-M flips from optional so reconcile --apply repairs the leaf)"
+  fi
   # Phase 3 Family 2 per-agent rows are gated on the agent being a real
   # isolated agent (the matrix probes the roster via
   # bridge_agent_linux_user_isolation_effective). On a synthetic
