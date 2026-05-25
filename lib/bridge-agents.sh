@@ -1859,6 +1859,18 @@ bridge_write_isolated_known_marketplaces_catalog() {
   # controller's full file. This keeps undeclared marketplaces out of isolated
   # Claude's loader and rewrites installLocation/source.path to isolated-home
   # aliases that bridge controls read-only.
+  #
+  # beta23 Option A: this function IS the controller-published, root-owned
+  # writer for `known_marketplaces.json` (the iso UID must NOT be able to
+  # rewrite its own plugin marketplace catalog — security boundary). It
+  # implements the same contract as `bridge_iso_run --op publish-root-file
+  # --mode 0640 --group-agent <agent>`: mktemp-in-dest-dir + chmod+chown+chgrp
+  # before mv -f. The mktemp + python + chown/chgrp/chmod/mv chain below
+  # IS the canonical root-publish flow; the helper-API equivalent is
+  # the publish-root-file op. New callsites that need a root-published
+  # write for an agent's plugin manifest should call bridge_iso_run;
+  # this function remains the in-place compatibility wrapper that other
+  # legacy callers depend on for the catalog-filtering work.
   local os_user="$1"
   local isolated_plugins="$2"
   local controller_plugins="$3"
@@ -2245,6 +2257,16 @@ bridge_write_isolated_installed_plugins_manifest() {
   # actually-existing location resolved by
   # bridge_resolve_plugin_install_path. The file is owned by root so the
   # isolated UID cannot tamper with which plugins it loads.
+  #
+  # beta23 Option A: this function IS the controller-published, root-owned
+  # writer for `installed_plugins.json` (security boundary: iso UID must
+  # NOT be able to rewrite its own plugin allowlist). It implements the
+  # same contract as `bridge_iso_run --op publish-root-file --mode 0640
+  # --group-agent <agent>`: mktemp-in-dest-dir + chmod+chown+chgrp BEFORE
+  # mv -f. New callsites that need a root-published per-agent plugin
+  # manifest should call bridge_iso_run; this function remains the
+  # in-place compatibility wrapper because legacy callers depend on the
+  # catalog-filtering work it performs inline.
   #
   # Arguments:
   #   os_user             — isolated UID

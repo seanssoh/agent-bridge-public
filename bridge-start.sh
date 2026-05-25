@@ -850,7 +850,13 @@ elif [[ -n "$SUDO_WRAP_OS_USER" && -n "$SUDO_WRAP_FALLBACK_REASON" && $DRY_RUN -
       --field reason="$SUDO_WRAP_FALLBACK_REASON" \
       --field channels="$_l1d_chan_csv" >/dev/null 2>&1 || true
     unset _l1d_chan_csv
-    bridge_die "linux-user isolation for '$AGENT' has plugin: channels but UID switch is unavailable: $SUDO_WRAP_FALLBACK_REASON. Continuing as the controller UID would point dev-plugin-cache at /home/<iso>/.claude/plugins and trip EPERM on os.rename (L1-D root cause, codex r1 2026-05-25). Choose ONE of: (a) enable passwordless sudo for the iso UID — run \`agent-bridge isolate $AGENT --install-sudoers\` (Linux); (b) remove plugin: channels from this agent and re-run \`agent create\`; (c) use shared-mode isolation (BRIDGE_DISABLE_ISOLATION=1 in the agent env, security boundary disabled)."
+    # beta23 Option A: removed remediation option (c) "use shared-mode
+    # isolation (BRIDGE_DISABLE_ISOLATION=1)". The Option A contract
+    # rejects shared-mode as a recovery surface (it disables the
+    # security boundary). The only supported recovery is provisioning
+    # passwordless sudo for the iso UID (option a) or removing the
+    # plugin: channels declaration (option b).
+    bridge_die "linux-user isolation for '$AGENT' has plugin: channels but UID switch is unavailable: $SUDO_WRAP_FALLBACK_REASON. Continuing as the controller UID would point dev-plugin-cache at /home/<iso>/.claude/plugins and trip EPERM on os.rename (L1-D root cause, codex r1 2026-05-25). Choose ONE of: (a) enable passwordless sudo for the iso UID — run \`agent-bridge isolate $AGENT --install-sudoers\` (Linux); (b) remove plugin: channels from this agent and re-run \`agent create\`."
   fi
   unset _l1d_chan_csv
   bridge_warn "linux-user isolation requested for '$AGENT' but UID switch unavailable: $SUDO_WRAP_FALLBACK_REASON. Falling back to shared-mode launch. Run 'agent-bridge isolate $AGENT --install-sudoers' or configure sudoers manually (see docs/linux-host-acceptance.md)."
