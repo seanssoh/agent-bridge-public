@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import shlex
 import subprocess
@@ -81,6 +82,36 @@ def resolve_managed_autocompact_window(
 
 
 def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str, Any]:
+    # Issue #1212: previously this filter required every plugin spec to
+    # end with `@agent-bridge`, which silently dropped every third-party
+    # marketplace plugin (e.g. `plugin:cosmax-crm@cosmax-crm-marketplace`)
+    # from `enabledPlugins`. The plugin still loaded via the
+    # `--dangerously-load-development-channels` argv (so tools registered)
+    # but Claude Code's plugin runtime did not load its `hooks/hooks.json`
+    # — SessionStart hooks never fired. For `cosmax-crm` this is
+    # silent-fatal because its `.mcp.json` ships with a `Bearer
+    # __CRM_TOKEN_PLACEHOLDER__` that the SessionStart hook substitutes
+    # at startup; without the hook the placeholder reaches the server
+    # and the HTTP MCP handshake fails auth with 0 tools.
+    #
+    # The new filter accepts any `plugin:<name>@<marketplace>` spec
+    # (both sides non-empty, `@` as separator). For each accepted spec
+    # we also collect its marketplace id and emit an
+    # `extraKnownMarketplaces` entry pointing at the controller-side
+    # mirror under `$BRIDGE_HOME/data/shared/plugins-cache/marketplaces/<id>`
+    # — seeded by `bridge_plugins_seed_mirror_marketplace_root` (#1201/#1202).
+    #
+    # Safety guards before emitting a third-party marketplace entry:
+    #   - marketplace id is non-empty
+    #   - marketplace id matches `[A-Za-z0-9._-]+` (no `/` or other
+    #     filesystem separators)
+    #   - marketplace id is not `.` or `..` (no parent-traversal)
+    #   - resolved mirror dir is a real directory under the marketplaces
+    #     root (`is_dir()`).
+    # When any guard fails, the marketplace entry is skipped but the
+    # plugin stays in `enabledPlugins` (Claude's dev-channels argv still
+    # loads the plugin from disk; we just decline to materialize a
+    # marketplace identity for it).
     if not launch_cmd:
         return {}
     try:
@@ -90,6 +121,8 @@ def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str
 
     plugin_specs: list[str] = []
     seen: set[str] = set()
+    marketplace_ids: list[str] = []
+    marketplace_seen: set[str] = set()
     index = 0
     while index < len(tokens):
         token = tokens[index]
@@ -103,13 +136,24 @@ def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str
         else:
             index += 1
             continue
-        if not value.startswith("plugin:") or not value.endswith("@agent-bridge"):
+        # Accept only `plugin:<spec>` where spec contains `@` and both
+        # sides are non-empty. `rsplit("@", 1)` so the marketplace id is
+        # always the rightmost segment (defensive against a plugin name
+        # that itself contains `@`, even though current naming forbids
+        # it).
+        if not value.startswith("plugin:") or "@" not in value:
             continue
         spec = value[len("plugin:") :]
+        plugin_name, _sep, marketplace_id = spec.rpartition("@")
+        if not plugin_name or not marketplace_id:
+            continue
         if spec in seen:
             continue
         seen.add(spec)
         plugin_specs.append(spec)
+        if marketplace_id not in marketplace_seen:
+            marketplace_seen.add(marketplace_id)
+            marketplace_ids.append(marketplace_id)
 
     if not plugin_specs:
         return {}
@@ -117,16 +161,48 @@ def agent_bridge_development_plugin_settings(launch_cmd: str | None) -> dict[str
     bridge_home = os.environ.get("BRIDGE_HOME", "").strip()
     if not bridge_home:
         bridge_home = str(Path(__file__).resolve().parent)
+
+    marketplaces: dict[str, Any] = {
+        "agent-bridge": {
+            "source": {
+                "source": "directory",
+                "path": bridge_home,
+            }
+        }
+    }
+    # Third-party marketplace mirrors live under
+    # `$BRIDGE_HOME/data/shared/plugins-cache/marketplaces/<id>` — the
+    # same mirror root `bridge_plugins_seed_mirror_marketplace_root`
+    # writes to and `bridge_known_marketplace_info` reads from
+    # (lib/bridge-agents.sh:1664). Resolve relative to `bridge_home`
+    # but apply safety guards before trusting the id as a path segment.
+    marketplaces_root = Path(bridge_home) / "data" / "shared" / "plugins-cache" / "marketplaces"
+    safe_id_re = re.compile(r"^[A-Za-z0-9._-]+$")
+    for mkt_id in marketplace_ids:
+        if mkt_id == "agent-bridge":
+            continue
+        if not mkt_id or mkt_id in {".", ".."}:
+            continue
+        if not safe_id_re.match(mkt_id):
+            continue
+        candidate = marketplaces_root / mkt_id
+        try:
+            is_dir = candidate.is_dir()  # noqa: raw-pathlib-controller-only — controller-side mirror lookup; iso UID never reaches this code
+        except OSError:
+            is_dir = False
+        if not is_dir:
+            # Skip the marketplace entry but keep the plugin enabled —
+            # the dev-channels argv still loads the plugin from disk.
+            continue
+        marketplaces[mkt_id] = {
+            "source": {
+                "source": "directory",
+                "path": str(candidate),
+            }
+        }
     return {
         "enabledPlugins": {spec: True for spec in plugin_specs},
-        "extraKnownMarketplaces": {
-            "agent-bridge": {
-                "source": {
-                    "source": "directory",
-                    "path": bridge_home,
-                }
-            }
-        },
+        "extraKnownMarketplaces": marketplaces,
     }
 
 
