@@ -788,23 +788,30 @@ bridge_plugins_cmd_show() {
   fi
 }
 
-case "${1:-}" in
-  ""|-h|--help|help)
-    usage
-    [[ "${1:-}" == "" ]] && exit 1
-    exit 0
-    ;;
-  seed)
-    shift
-    bridge_plugins_cmd_seed "$@"
-    ;;
-  show)
-    shift
-    bridge_plugins_cmd_show "$@"
-    ;;
-  *)
-    bridge_warn "지원하지 않는 plugins 명령입니다: $1"
-    usage
-    exit 2
-    ;;
-esac
+# Smoke / library callers that want the helpers without dispatching the
+# CLI can source this file with `BRIDGE_PLUGINS_LIB_ONLY=1`. The standard
+# `agb plugins` CLI entrypoint (`agb`, `agent-bridge`) sets nothing, so
+# the dispatch below runs normally. Same pattern used by other root
+# scripts to make smoke harnesses portable. (#1201 + #1202 smoke.)
+if [[ "${BRIDGE_PLUGINS_LIB_ONLY:-0}" != "1" ]]; then
+  case "${1:-}" in
+    ""|-h|--help|help)
+      usage
+      [[ "${1:-}" == "" ]] && exit 1
+      exit 0
+      ;;
+    seed)
+      shift
+      bridge_plugins_cmd_seed "$@"
+      ;;
+    show)
+      shift
+      bridge_plugins_cmd_show "$@"
+      ;;
+    *)
+      bridge_warn "지원하지 않는 plugins 명령입니다: $1"
+      usage
+      exit 2
+      ;;
+  esac
+fi
