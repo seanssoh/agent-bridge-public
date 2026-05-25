@@ -5601,16 +5601,23 @@ bridge_channel_env_file_readiness() {
   local file="$3"
   shift 3 || true
   local rc=0
-  local sudo_rc=0
   local probe_rc=0
 
-  if [[ ! -e "$file" ]]; then
-    printf 'missing'
-    return 0
-  fi
+  # Issue #1214: do NOT short-circuit on `[[ ! -e "$file" ]]`. Under iso
+  # v2 the channel state dir is owned by the isolated UID with mode
+  # 02770 / `ab-agent-<slug>` group, and a long-running controller shell
+  # that started BEFORE the agent's supplementary group was applied
+  # cannot satisfy `-e` even when the file is present. The pre-#1214
+  # body returned 'missing' for that case which then bubbled up as the
+  # operator-visible
+  # `missing MS365 client id under .../workdir/.ms365 (.env with
+  # MS365_CLIENT_ID required)` error during `agent start`, defeating
+  # the beta25 #1207 read-fallback. Route the isolated probe directly
+  # so a controller-blind file still resolves via the iso UID.
 
   # First read attempt as the controller; suppress stderr so EACCES does
-  # not leak to the daemon log. rc captured separately.
+  # not leak to the daemon log. The internal helper returns 0 on
+  # found-non-empty, 1 on missing-key, and 2 on file/permission error.
   rc=0
   bridge_env_file_has_any_nonempty_key "$file" "$@" >/dev/null 2>&1 || rc=$?
   if [[ $rc -eq 0 ]]; then
@@ -5624,102 +5631,85 @@ bridge_channel_env_file_readiness() {
     return 0
   fi
 
-  # Issue #832: controller cannot read the file. Before declaring unreadable,
-  # see if we can probe via the agent's isolated UID (linux-user mode only).
-  # The agent's own UID can read its own dotenv when ACL drift left the
-  # controller unable to, and operators have correctly configured tokens.
-  # Without this branch the daemon would emit a false channel_health_miss
-  # for a healthy isolated agent.
-  # beta23 Option A: route the isolated-UID probe through the unified
-  # bridge_iso_run --op env-has-any-key facade. The structured rc band
-  # (0 ok / 31 missing-key / 32 unreadable-even-to-iso / 30 absent /
-  # 20 sudo-unavailable / 10 not-isolated / 40 unsafe-path) maps
-  # directly to the readiness enum values below.
+  # Issue #1214: the controller could not read the file. Route directly
+  # through `bridge_iso_run --op env-has-any-key` whenever the agent is
+  # effectively under linux-user isolation. The outer
+  # `bridge_isolation_can_sudo_to_agent` pre-gate (pre-#1214) added a
+  # second sudo probe that itself could fail under stale supp-groups on
+  # the controller shell, causing the iso-side fallback to never run
+  # even when `bridge_iso_run`'s internal read/probe-only allowlist
+  # fallback (added in #1207) would have succeeded. Removing the outer
+  # gate makes the validator follow the same single-helper contract
+  # that direct callers use.
   #
-  # The pre-existing outer bridge_isolation_can_sudo_to_agent probe is
-  # preserved as a fast-path discriminator: when rc=2 (sudo unavailable)
-  # we still want to emit controller-blind quickly without paying the
-  # full bridge_iso_run path. When rc=1 (not isolated) we fall through
-  # to the standard unreadable path.
-  if declare -F bridge_isolation_can_sudo_to_agent >/dev/null 2>&1; then
-    sudo_rc=0
-    bridge_isolation_can_sudo_to_agent "$agent" 2>/dev/null || sudo_rc=$?
-    case "$sudo_rc" in
+  # bridge_iso_run rc band (see lib/bridge-isolation-helpers.sh:258+):
+  #   0  — env-has-any-key found a non-empty key → 'present'
+  #   30 — file absent under the isolated UID's view → 'missing'
+  #   31 — file present but key empty/missing → 'missing'
+  #   32 — file unreadable even to the isolated UID → 'unreadable'
+  #   20 — passwordless sudo to the agent UID unavailable →
+  #        'controller-blind' (cannot prove readiness either way)
+  #   40 — unsafe path (root-canonicalize escape) →
+  #        'controller-blind' for safety; never collapses to 'missing'
+  #   10 — agent not in linux-user isolation → fall through to the
+  #        legacy unreadable path
+  #   other — defensive 'controller-blind' (preserves the beta22 codex
+  #        r1 behavior of preferring fail-open + diagnostic over false
+  #        miss).
+  if declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    local _iso_run_argv=(--agent "$agent" --op env-has-any-key --path "$file")
+    local _k=""
+    for _k in "$@"; do
+      _iso_run_argv+=(--key "$_k")
+    done
+    probe_rc=0
+    bridge_iso_run "${_iso_run_argv[@]}" >/dev/null 2>&1 || probe_rc=$?
+    case "$probe_rc" in
       0)
-        # Agent isolated AND we can sudo to its UID — probe via the
-        # bridge_iso_run facade. The op script lives in
-        # lib/bridge-isolation-helpers.sh:_BRIDGE_ISO_RUN_OP_ENV_HAS_ANY_KEY
-        # and matches the legacy inline body shape exactly.
-        local _iso_run_argv=(--agent "$agent" --op env-has-any-key --path "$file")
-        local _k=""
-        for _k in "$@"; do
-          _iso_run_argv+=(--key "$_k")
-        done
-        probe_rc=0
-        bridge_iso_run "${_iso_run_argv[@]}" >/dev/null 2>&1 || probe_rc=$?
-        case "$probe_rc" in
-          0)
-            : "${item}"
-            printf 'present'
-            return 0
-            ;;
-          31)
-            : "${item}"
-            printf 'missing'
-            return 0
-            ;;
-          32)
-            : "${item}"
-            printf 'unreadable'
-            return 0
-            ;;
-          30)
-            : "${item}"
-            printf 'missing'
-            return 0
-            ;;
-          20)
-            # Issue #1196 (beta22): the OUTER bridge_isolation_can_sudo_to_agent
-            # said sudo was OK, but the inner pre-flight inside
-            # bridge_iso_run returned rc=20 (sudo raced/declined between
-            # the two probes — sudoers reload, ticket expiry, transient
-            # policy fault). The agent IS isolated; we just cannot prove
-            # readiness either way on THIS probe. Degrade to
-            # controller-blind, NOT unreadable.
-            : "${item}"
-            printf 'controller-blind'
-            return 0
-            ;;
-          *)
-            # Undefined rc — preserve the beta22 codex r1 behaviour:
-            # prefer controller-blind + diagnostic. Caller maps to
-            # status=unknown (fail-open).
-            : "${item}"
-            printf 'controller-blind'
-            return 0
-            ;;
-        esac
+        : "${item}"
+        printf 'present'
+        return 0
         ;;
-      2)
-        # Agent IS isolated but passwordless sudo is unavailable. Controller
-        # cannot determine readiness either way — degrade to controller-blind
-        # rather than firing a false miss. Caller maps this to status=unknown.
+      30|31)
+        : "${item}"
+        printf 'missing'
+        return 0
+        ;;
+      32)
+        : "${item}"
+        printf 'unreadable'
+        return 0
+        ;;
+      20|40)
+        # 20: sudo to the agent's UID unavailable (controller cannot
+        # prove readiness either way). 40: unsafe path — never collapse
+        # to 'missing' because that would lie about a file the
+        # controller is structurally unable to inspect. Both degrade to
+        # controller-blind so the caller maps to status=unknown
+        # (fail-open) rather than firing a false channel_health_miss.
         : "${item}"
         printf 'controller-blind'
         return 0
         ;;
+      10)
+        # Agent not in linux-user isolation — fall through to the
+        # legacy unreadable path.
+        ;;
       *)
-        # rc=1 — agent not in linux-user isolation. Fall through to the
-        # standard unreadable path (true ACL drift on a controller-managed
-        # file).
+        # Undefined rc — preserve the beta22 codex r1 behaviour:
+        # prefer controller-blind + diagnostic over false miss.
+        : "${item}"
+        printf 'controller-blind'
+        return 0
         ;;
     esac
   fi
 
-  # v3: the sudo-as-agent probe handled the isolated case above.
   # Reaching here means the file is genuinely unreadable to both the
-  # controller and the isolated UID probe, indicating ownership/mode or
-  # sudo drift — not something fixable via group/ACL grants.
+  # controller and the isolated UID probe (or the agent is not under
+  # linux-user isolation at all), indicating ownership/mode or sudo
+  # drift — not something fixable via group/ACL grants.
 
   # Suppress unused-warning shellcheck when item is reserved for future
   # per-channel scoped repair; ms365/teams currently share the agent-wide
@@ -5857,20 +5847,29 @@ bridge_agent_channel_runtime_ready_for_item() {
   # rebind. discord/telegram are outbound bot connections — no LISTEN
   # socket — and ms365 shares the teams HTTP listener for the OAuth
   # callback, so neither gets a separate LISTEN probe here.
+  # Issue #1214: route access.json presence checks through
+  # `bridge_channel_access_file_present "$dir/access.json" "$agent"`
+  # so an isolated workdir the controller cannot directly stat still
+  # resolves via the same iso-aware probe family already used by the
+  # status-reason path at lib/bridge-agents.sh:6946/6978/7006/7101.
+  # Pre-#1214 these used a raw `[[ -f "$dir/access.json" ]]` test that
+  # silently returned 'not ready' on a long-running controller shell
+  # with stale supp-groups, defeating beta25 #1207's read-fallback the
+  # same way `bridge_channel_env_file_readiness` did.
   case "$item" in
     plugin:discord|plugin:discord@*)
       dir="$(bridge_agent_discord_state_dir "$agent")"
-      [[ -f "$dir/access.json" ]] || return 1
+      bridge_channel_access_file_present "$dir/access.json" "$agent" || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" DISCORD_BOT_TOKEN BOT_TOKEN TOKEN)" == "present" ]]
       ;;
     plugin:telegram|plugin:telegram@*)
       dir="$(bridge_agent_telegram_state_dir "$agent")"
-      [[ -f "$dir/access.json" ]] || return 1
+      bridge_channel_access_file_present "$dir/access.json" "$agent" || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TELEGRAM_BOT_TOKEN BOT_TOKEN TOKEN)" == "present" ]]
       ;;
     plugin:teams|plugin:teams@*)
       dir="$(bridge_agent_teams_state_dir "$agent")"
-      [[ -f "$dir/access.json" ]] || return 1
+      bridge_channel_access_file_present "$dir/access.json" "$agent" || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_ID MicrosoftAppId)" == "present" ]] || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" TEAMS_APP_PASSWORD MicrosoftAppPassword)" == "present" ]] || return 1
       # Issue #779: confirm the webhook listener is actually bound.
@@ -5891,7 +5890,7 @@ bridge_agent_channel_runtime_ready_for_item() {
       ;;
     plugin:mattermost|plugin:mattermost@*)
       dir="$(bridge_agent_mattermost_state_dir "$agent")"
-      [[ -f "$dir/access.json" ]] || return 1
+      bridge_channel_access_file_present "$dir/access.json" "$agent" || return 1
       [[ "$(bridge_channel_env_file_readiness "$agent" "$item" "$dir/.env" MATTERMOST_BOT_TOKEN MATTERMOST_PERSONAL_TOKEN)" == "present" ]]
       ;;
     *)
