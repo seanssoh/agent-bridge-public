@@ -1068,6 +1068,52 @@ bridge_isolation_v2_install_tree_matrix_rows() {
   printf '%s\n' \
     "agents-root|install|$data_root/agents|dir|controller|ab-shared|0710|-|0|0|inherit|direct|required|per-agent runtime-home root — controller rwX, group --x for traverse to each per-agent leaf without listing the full agent inventory (iso UIDs must traverse to their own home, not see siblings)"
 
+  # ----- L1 beta19 install-tree gaps (codex r1 design 2026-05-25) -----
+  #
+  # patch's beta18 Phase 3 acceptance flagged 5 install-tree dirs that the
+  # reconciler was not covering — every one of them is created on demand by
+  # the Teams MCP / MS365 callback flow / queue gateway under the isolated
+  # UID, and absent-without-row meant they spawned at the operator umask
+  # (077 → 0700) with iso UIDs locked out of traverse + write.
+  #
+  # All 5 use `state_scaffold` (NOT plain `dir`): plain `dir` only checks
+  # an existing path and fires MISSING/FAIL on absent. The Teams/MS365
+  # callback dirs may be absent on a fresh install (no callback received
+  # yet), and the queue body dir may be absent before the first body write
+  # (queue uses sqlite for small payloads, falls back to body files at
+  # `bridge-queue.py:310-315` only for over-threshold rows). state_scaffold
+  # mkdir's in `--apply` mode and then runs the same chown+chmod path
+  # as plain `dir`, so the rows converge whether the dir exists yet or not.
+  #
+  # Writer dirs (callback mailbox + activity-index dir) get mode 3770:
+  #   * setgid (2000) — children inherit group ab-shared so the controller
+  #     daemon (route lookup) can read iso-UID-written files without an
+  #     after-the-fact chgrp.
+  #   * sticky  (1000) — prevents one iso UID from deleting another iso
+  #     UID's callback / activity-index file (only the file owner +
+  #     directory owner can unlink under +t).
+  #   * 0770    — controller + ab-shared rwx, no world.
+  #   * The TS-side writer also drops the file mode to 0640 (see
+  #     plugins/teams/server.ts:writeTeamsActivityIndex) so the controller
+  #     can read the file via the ab-shared group without world-read.
+  #
+  # Parent-traverse-only dirs (state/channels root + state/queue + queue
+  # bodies) get mode 0710: controller rwX, group --x. Iso UIDs in ab-shared
+  # can traverse into their leaf but cannot list the directory or see
+  # sibling agents' state. Queue body files themselves stay controller-owned
+  # — the gateway path (`agb inbox <agent>` etc.) reads bodies through
+  # controller-mediated code, not direct file open from iso UID.
+  printf '%s\n' \
+    "shared-ms365-callbacks-dir|install|$data_root/shared/ms365-callbacks|state_scaffold|controller|ab-shared|3770|-|1|0|inherit|direct|required|MS365 OAuth callback mailbox — controller + ab-shared rwx, setgid + sticky. Teams MCP writes <state>.json from iso UID; MS365 plugin reads + unlinks from iso UID (plugins/teams/server.ts:299-306, plugins/ms365/server.ts:186-246). Sticky prevents cross-UID delete; setgid keeps group ab-shared on every child file"
+  printf '%s\n' \
+    "state-channels-root|install|$data_root/state/channels|state_scaffold|controller|ab-shared|0710|-|0|0|inherit|direct|required|state/channels parent — controller rwX, group --x for traverse only (iso UIDs reach state/channels/teams/<agent>.json but cannot list other channels' state)"
+  printf '%s\n' \
+    "state-channels-teams-dir|install|$data_root/state/channels/teams|state_scaffold|controller|ab-shared|3770|-|1|0|inherit|direct|required|Teams activity-index dir — controller + ab-shared rwx, setgid + sticky. Isolated Teams writer creates <agent>.json from iso UID at plugins/teams/server.ts:492-494; the file mode is held to 0640 in writeTeamsActivityIndex so the controller daemon's route lookup (bridge-channels.py:289-304) can read via ab-shared group. Sticky limits cross-agent file deletion"
+  printf '%s\n' \
+    "state-queue-dir|install|$data_root/state/queue|state_scaffold|controller|ab-shared|0710|-|0|0|inherit|direct|required|state/queue parent — controller rwX, group --x for traverse only. agb inbox / queue body lookups from iso UIDs traverse here to reach the body files; full directory listing intentionally denied"
+  printf '%s\n' \
+    "state-queue-bodies-dir|install|$data_root/state/queue/bodies|state_scaffold|controller|ab-shared|0710|-|0|0|inherit|direct|required|state/queue/bodies — bridge-queue.py:310-315 stores body files here. Without this row's parent traversal, a nested path lookup from iso UID still fails on EACCES even after state-queue-dir is fixed. Body file content stays controller-owned; iso UIDs reach bodies via gateway code paths only"
+
   # ----- per-agent rows (only when --agent is provided) -----
   if [[ -n "$agent" ]]; then
     # ----- Phase 3 Family 2 (codex design 2026-05-24): isolated HOME contract -----

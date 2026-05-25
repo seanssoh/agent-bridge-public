@@ -655,6 +655,112 @@ bridge_install_teams_plugin_node_modules() {
   return 0
 }
 
+# Make the operator's bun runtime traversable by isolated UIDs.
+#
+# L1 beta19 (codex r1 design 2026-05-25): the Teams MCP launches bare
+# `bun` (plugins/teams/.mcp.json). PR #1090 settled the contract that
+# setup requires `command -v bun` to resolve to a PATH-reachable binary
+# — but in practice that binary is often a symlink like
+# `/usr/local/bin/bun -> $HOME/.bun/bin/bun`. The PATH-visible side is
+# fine for the controller, but isolated UIDs need to actually traverse
+# `$HOME/.bun/` to reach the real binary. On a Linux box where the
+# operator's $HOME is mode 0750 (Debian/Ubuntu default), iso UIDs cannot
+# `cd` into `$HOME/.bun` and the MCP fails with EACCES on exec.
+#
+# Helper behavior:
+#   * No-op unless Linux.
+#   * No-op when BRIDGE_BUN_CHMOD_OPT_OUT=1 (operator escape hatch).
+#   * Resolves `command -v bun`, walks symlinks via `readlink -f` (or a
+#     Python fallback for BSD/macOS readlink absence) to the real target.
+#   * If the real target sits under $HOME/.bun/: `chmod o+x` on
+#     $HOME/.bun and $HOME/.bun/bin — TRAVERSE-ONLY. Never grants `o+r`
+#     (no directory listing, no read of $HOME/.bun internals beyond
+#     traversal). Other-execute lets iso UIDs reach the resolved file
+#     without leaking the rest of the operator's home.
+#   * If the real target is anywhere else (homebrew /opt, asdf, fnm
+#     shims, system /usr/bin): no-op. Those paths already have global
+#     traverse modes; widening them would be a no-op or wrong-scope.
+#   * chmod failures are bridge_warn'd, never bridge_die'd — the caller
+#     (bridge_provision_teams_plugin_runtime + bridge-upgrade.sh) treats
+#     this as best-effort.
+#
+# Honors --dry-run: emits the chmod commands it WOULD run without
+# touching the host. We deliberately do NOT bundle or system-install
+# bun: that would require root + system-PATH ownership decisions and
+# changes the operator's runtime update model. The chmod-traverse is
+# the smallest L1 fix.
+bridge_ensure_bun_runtime_traversable_for_isolated() {
+  local dry_run="${1:-0}"
+
+  if [[ "$(uname -s 2>/dev/null)" != "Linux" ]]; then
+    return 0
+  fi
+  if [[ "${BRIDGE_BUN_CHMOD_OPT_OUT:-0}" == "1" ]]; then
+    return 0
+  fi
+
+  local bun_path
+  if ! bun_path="$(command -v bun 2>/dev/null)" || [[ -z "$bun_path" ]]; then
+    # No bun on PATH — bridge_resolve_bun_executable will fail upstream
+    # and surface the canonical "missing bun" error. Stay quiet here.
+    return 0
+  fi
+
+  # Resolve symlinks. Prefer GNU `readlink -f` (Linux default); fall
+  # back to Python for portability (Linux without coreutils-style
+  # readlink is unusual but cheap to cover).
+  local real_target=""
+  if real_target="$(readlink -f "$bun_path" 2>/dev/null)" && [[ -n "$real_target" ]]; then
+    :
+  elif command -v python3 >/dev/null 2>&1; then
+    real_target="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$bun_path" 2>/dev/null || true)"
+  else
+    bridge_warn "bridge_ensure_bun_runtime_traversable_for_isolated: cannot resolve real path of $bun_path (no readlink -f, no python3); skipping traverse chmod"
+    return 0
+  fi
+  if [[ -z "$real_target" ]]; then
+    return 0
+  fi
+
+  # Only act on $HOME/.bun/ targets. Other PATH-resolved bun installs
+  # (homebrew /opt/homebrew, fnm shims under ~/.local/share/fnm, asdf,
+  # /usr/bin, etc.) are out of scope — those locations either already
+  # have global traverse OR their parent-mode contract is owned by
+  # another package manager / system policy we should not mutate.
+  local home_bun="${HOME:-}/.bun"
+  if [[ -z "${HOME:-}" || -z "$home_bun" ]]; then
+    return 0
+  fi
+  case "$real_target" in
+    "$home_bun"/*) ;;
+    *) return 0 ;;
+  esac
+
+  local bun_bin_dir="$home_bun/bin"
+
+  if [[ "$dry_run" == "1" ]]; then
+    bridge_info "[setup] [dry-run] would: chmod o+x $home_bun $bun_bin_dir (isolated-UID traverse for $real_target)"
+    return 0
+  fi
+
+  # TRAVERSE ONLY — `o+x`, not `o+rx`. Iso UIDs can `cd` into .bun/bin
+  # to reach the resolved binary but cannot list .bun/ contents.
+  local rc=0
+  if [[ -d "$home_bun" ]]; then
+    if ! chmod o+x "$home_bun" 2>/dev/null; then
+      bridge_warn "chmod o+x $home_bun failed — isolated UIDs may fail to exec bun (Teams MCP startup will hit EACCES)"
+      rc=1
+    fi
+  fi
+  if [[ -d "$bun_bin_dir" ]]; then
+    if ! chmod o+x "$bun_bin_dir" 2>/dev/null; then
+      bridge_warn "chmod o+x $bun_bin_dir failed — isolated UIDs may fail to exec bun (Teams MCP startup will hit EACCES)"
+      rc=1
+    fi
+  fi
+  return "$rc"
+}
+
 # Channel-setup-time entry point: ensure bun + plugins/teams/node_modules
 # are provisioned. Called from bridge-setup.sh `run_teams()` after the
 # Python config write succeeds. Failure does not abort setup (operator may
@@ -670,6 +776,12 @@ bridge_provision_teams_plugin_runtime() {
     bridge_install_bun_runtime "$dry_run" || return 1
     bun_bin="$(bridge_resolve_bun_executable || true)"
   fi
+
+  # L1 beta19 (codex r1 design 2026-05-25): before we provision
+  # node_modules (which iso UIDs will read), make sure they can also
+  # traverse to the bun binary itself. Best-effort, non-fatal — the
+  # helper warns on chmod failure but does not block setup.
+  bridge_ensure_bun_runtime_traversable_for_isolated "$dry_run" || true
 
   bridge_install_teams_plugin_node_modules "$dry_run" "$bun_bin" || return 1
   return 0
