@@ -2271,8 +2271,14 @@ if [[ $DRY_RUN -eq 0 ]] \
   if (( _upgrade_sudoers_install_ok == 1 )) \
      && command -v systemctl >/dev/null 2>&1; then
     _upgrade_systemd_rc=0
+    # install-daemon-systemd.sh emits [info] lines to stdout (designed
+    # for standalone CLI use). When invoked from inside `agent-bridge
+    # upgrade --json`, that chatter must not pollute the JSON envelope
+    # on our stdout. Redirect to stderr so --json callers (smokes, CI)
+    # get a clean JSON document; operator-facing terminal still sees
+    # the messages.
     "$BRIDGE_BASH_BIN" "$TARGET_ROOT/scripts/install-daemon-systemd.sh" \
-      --bridge-home "$TARGET_ROOT" --apply \
+      --bridge-home "$TARGET_ROOT" --apply >&2 \
       || _upgrade_systemd_rc=$?
     if (( _upgrade_systemd_rc == 0 )); then
       if systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null; then
