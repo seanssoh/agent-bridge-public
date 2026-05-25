@@ -6,6 +6,126 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta24] — 2026-05-26
+
+### Highlight — seed marketplace mirror + iso v2 plugin status fail-closed
+
+Operator-cued **twenty-fourth prerelease**. Closes #1201 + #1202 — the
+two directory-source external marketplace blockers that surfaced during
+beta23 OOTB acceptance verify (cosmax-ep-approval + cosmax-crm channels
+on isolated v2 agents).
+
+Codex pair-review took two rounds: r1 surfaced 3 BLOCKING (seed not
+fatal on mirror failure, requested-vs-effective isolation predicate
+gate, smoke ratchet regression) + 3 named SHOULD-FIX. r2 closed all
+items. CI workflow ripgrep install added so `oss-preflight` no longer
+fails for missing `rg` binary on the Linux runner.
+
+`-beta24` prerelease; matching tag `v0.14.5-beta24`, GitHub release
+marked **Pre-release**. Stay on beta per Sean's standing rule.
+
+### Fixed — #1201 `agb plugins seed` doesn't create marketplace mirror (#1203)
+
+- **`bridge-plugins.sh:bridge_plugins_seed_mirror_marketplace_root`** —
+  new helper that mirrors `<source_root>` → `$plugins_cache/marketplaces/
+  <marketplace_id>/` with `rsync -a` (no `--delete`), `.git/` excluded,
+  canonical modes (`2750/0640`) and group `ab-shared` via
+  `bridge_plugins_apply_canonical_modes` / `bridge_isolation_v2_chgrp_setgid_recursive`.
+  Marketplace id validated through existing safe-alias rules; helper
+  fails loudly on unsafe id, missing rsync, mkdir failure, or rsync
+  failure.
+- **`bridge_plugins_cmd_seed` D4 step** — mirror creation is now fatal
+  for non-bundled external marketplaces. Failure path invokes
+  `bridge_die` before D3/D2/`[ok] seeded` so an external marketplace
+  that didn't actually mirror leaves the command in a clear error
+  state, not a misleading success. Bundled `agent-bridge` marketplace
+  is exempt; the existing controller fallback at
+  `lib/bridge-agents.sh:1838-1844, 2006-2013` handles it as before.
+- **D2 propagation uses mirror path** — `bridge_plugins_cmd_seed` now
+  passes `$plugins_cache/marketplaces/$_seed_mkt_name` (the mirror) into
+  per-UID D2 propagation, not the original `$marketplace_root`. The
+  merge helper writes the mirror path into per-UID
+  `known_marketplaces.json` so iso UIDs become controller-stable: the
+  original external `/tmp/pi-registry/`-style path can disappear
+  without breaking iso agents.
+
+### Fixed — #1202 `claude plugin install` fails for directory-source marketplaces in iso v2 `agent start` (#1203)
+
+- **`lib/bridge-agents.sh:_bridge_claude_plugin_bridge_manifest_has_spec`**
+  — new helper that consults the bridge-owned manifests for plugin
+  presence: per-UID `~/.claude/plugins/installed_plugins.json` first
+  (via existing root/sudo path), then
+  `$BRIDGE_SHARED_ROOT/plugins-cache/installed_plugins.json`. Either
+  declaring the spec returns the existing `enabled` token for
+  backward-compatible call sites.
+- **`bridge_claude_plugin_status` short-circuit** — for **effective**
+  linux-user isolated v2 agents (`! bridge_isolation_disabled_by_env &&
+  bridge_agent_linux_user_isolation_effective`), bridge manifests
+  win over controller `~/.claude/plugins/installed_plugins.json` and
+  `claude plugin list`. Controller says missing but bridge manifest
+  present → returns `enabled` → no install call. Controller says
+  enabled but bridge manifest missing → returns `missing` (prevents
+  masking a missing shared-cache mirror). Non-isolated / shared-mode /
+  `BRIDGE_DISABLE_ISOLATION=1` agents preserve legacy install/enable
+  behavior byte-for-byte.
+- **`bridge_ensure_claude_plugin_enabled` fail-closed branch** — for
+  effective isolated v2 + `missing`, `claude plugin install --scope
+  user` no longer runs as the repair path. Bridge emits actionable
+  `agb plugins seed [--marketplace-root <path>]` guidance and exits
+  non-zero so the operator sees the actual root cause (mirror missing
+  for a declared channel) instead of a cryptic claude CLI failure.
+
+### Added — regression smoke
+
+- **`scripts/smoke/1201-1202-directory-marketplace-seed.sh`** —
+  10-test regression smoke covering: helper happy path + safe-alias
+  rejection + canonical mode/ownership; mirror discovery via
+  `bridge_known_marketplace_info`; `bridge_plugins_cmd_seed` caller-
+  level fatal behavior on forced helper failure (T10); bridge-manifest
+  status short-circuit recording that `bridge_ensure_claude_plugin_enabled`
+  does NOT invoke a stubbed `claude plugin install` when the bridge
+  manifest declares the spec; missing-spec iso path fails with seed
+  guidance.
+- Registered in `scripts/ci-select-smoke.sh` for `bridge-plugins.sh`,
+  `bridge-dev-plugin-cache.py`, `lib/bridge-agents.sh`, and any new
+  helper files.
+- 4 deliberate boundary-fixture lines annotated `# noqa:
+  iso-helper-boundary` so `scripts/iso-helper-ratchet.sh` (the
+  beta23-introduced regression gate) recognizes them as test fixtures,
+  not new raw production callsites.
+
+### Fixed — CI: missing ripgrep blocks `oss-preflight`
+
+- **`.github/workflows/ci.yml`** — `apt-get install -y ripgrep` step
+  added to the `oss-preflight` job before `scripts/oss-preflight.sh`
+  runs. Previously the Linux runner image lacked `rg`, so both
+  `oss-preflight` and `iso-helper-ratchet` (also invokes `rg`)
+  silently failed before any code check executed.
+
+### Migration
+
+- Fresh `agent create` — fixed by the new mirror + existing
+  `bridge_linux_share_plugin_catalog` retrofit.
+- Existing **stopped** iso agents — self-heal on next `agent start`:
+  `bridge-start.sh` already re-runs `bridge_linux_share_plugin_catalog`
+  before plugin ensure, so the mirror + bridge-manifest status path
+  pick up automatically.
+- Existing **running** iso agents — operator restart required to pick
+  up the regenerated per-UID catalog and the new status logic. No
+  `agent create` rerun.
+
+### Notes
+
+- **#1204** (`TEAMS_DELIVERY_MODE=bridge` is the silent-drop root cause,
+  not a workaround) and **#1205** (iso v2 hook scripts dump traceback
+  on expected PermissionError instead of failing open) are both filed
+  for beta25 fast-follow. Neither blocks beta24's acceptance scenarios.
+- `TEAMS_DELIVERY_MODE=bridge` should NEVER be injected into any
+  agent's `.teams/.env`. Direct channel mode (MCP injection) works
+  end-to-end; the bridge-mode delivery silently skips when
+  `BRIDGE_AGENT_ID` is unset, which it always is from the teams plugin
+  subprocess perspective.
+
 ## [0.14.5-beta23] — 2026-05-26
 
 ### Highlight — `bridge_iso_run` unified facade + 4-commit Option A convergence
