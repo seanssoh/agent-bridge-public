@@ -407,6 +407,15 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
               inject_text="[Agent Bridge] ACTION REQUIRED — queued tasks detected. Run exactly: ~/.agent-bridge/agb inbox $agent"
             fi
             bridge_tmux_send_and_submit "$session" claude "$inject_text" "$agent"
+            # Issue #1199 — record this injection as a nudge so the daemon
+            # nudge tick treats it as delivered for the queued set. Key =
+            # comma-separated task ids matching daemon nudge_key format
+            # (bridge-queue.py:2177). Without this, daemon fires again
+            # immediately (has_new_queue_ids=True since last_nudge_key empty).
+            queue_key=$(bridge_queue_cli find-open --agent "$agent" 2>/dev/null | tr "\012" "," | sed -e "s/,$//")
+            if [[ -n "$queue_key" ]]; then
+              bridge_task_note_nudge "$agent" "$queue_key" >/dev/null 2>&1 || true
+            fi
           fi
           mkdir -p "$(dirname "$marker_file")"
           printf "%s\n" "$(date +%s)" >"$marker_file"
