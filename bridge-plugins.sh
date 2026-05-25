@@ -26,7 +26,7 @@ usage() {
   local prog
   prog="$(basename "$0")"
   printf 'Usage:\n'
-  printf '  %s seed [--marketplace-root <path>] [--channels <csv>] [--dry-run]\n' "$prog"
+  printf '  %s seed [--marketplace-root <path>] [--channels <csv>] [--dry-run] [--no-iso-chmod]\n' "$prog"
   printf '  %s show [--json]\n' "$prog"
   printf '\n'
   printf 'Seed populates the v2 shared plugin catalog at\n'
@@ -121,6 +121,7 @@ bridge_plugins_cmd_seed() {
   local marketplace_root=""
   local channels_csv=""
   local dry_run=0
+  local no_iso_chmod=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --marketplace-root)
@@ -137,6 +138,15 @@ bridge_plugins_cmd_seed() {
         dry_run=1
         shift
         ;;
+      --no-iso-chmod)
+        # L1-F (beta20): skip the o+rX recursive grant on the marketplace
+        # source dir. Operators with a read-only mount or who want to
+        # manage UID visibility manually pass this; the iso UID side
+        # then needs an alternative read path (named-user ACL or a
+        # symlink under $BRIDGE_HOME/plugins owned by the controller).
+        no_iso_chmod=1
+        shift
+        ;;
       -h|--help)
         usage
         return 0
@@ -150,6 +160,15 @@ bridge_plugins_cmd_seed() {
   [[ -n "$marketplace_root" ]] || marketplace_root="$(bridge_plugins_default_marketplace_root)"
   if [[ ! -f "$marketplace_root/.claude-plugin/marketplace.json" ]]; then
     bridge_die "agb plugins seed: marketplace.json not found at $marketplace_root/.claude-plugin/marketplace.json. Pass --marketplace-root <path> to an Agent Bridge-format plugin marketplace."
+  fi
+  # Canonicalize so downstream propagation (controller registry +
+  # per-iso-UID known_marketplaces.json) writes a stable absolute path
+  # — Claude's marketplace resolver compares strings, not realpath, so
+  # `/tmp/foo` and `/tmp/./foo` would round-trip differently.
+  local _marketplace_root_resolved=""
+  if _marketplace_root_resolved="$(cd -P "$marketplace_root" 2>/dev/null && pwd -P)" \
+      && [[ -n "$_marketplace_root_resolved" ]]; then
+    marketplace_root="$_marketplace_root_resolved"
   fi
   if [[ -z "$channels_csv" ]]; then
     channels_csv="$(bridge_plugins_default_channels_csv "$marketplace_root")" \
@@ -166,6 +185,7 @@ bridge_plugins_cmd_seed() {
     printf '  channels         = %s\n' "$channels_csv"
     printf '  plugins_cache    = %s\n' "$plugins_cache"
     printf '  shared_group     = %s\n' "${BRIDGE_SHARED_GROUP:-ab-shared}"
+    printf '  no_iso_chmod     = %s\n' "$no_iso_chmod"
     return 0
   fi
 
@@ -212,7 +232,337 @@ bridge_plugins_cmd_seed() {
     bridge_die "agb plugins seed: sync completed but $plugins_cache/installed_plugins.json was not written. This usually means every channel was filtered out (check --channels CSV) or the marketplace at $marketplace_root has no resolvable plugins."
   fi
 
+  # ----- L1 wave 2 propagation steps (beta20, 2026-05-25) -----
+
+  # Resolve marketplace name for the propagation steps. Both controller
+  # registry add (D1) and per-iso-UID merge (D2) key off the name field
+  # from marketplace.json — keep it as a single source of truth.
+  local _seed_mkt_name=""
+  _seed_mkt_name="$(python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-seed-marketplace-name.py" \
+                    "$marketplace_root/.claude-plugin/marketplace.json" 2>/dev/null || printf '')"
+
+  # D1 (L1-A): propagate the marketplace to the controller's claude
+  # registry. Without this, `claude plugin install --scope user <spec>`
+  # in the launcher path needs a manual `claude plugin marketplace add`
+  # before it can resolve `<plugin>@<marketplace>`. We do the same
+  # already in `bridge_ensure_agent_bridge_claude_marketplace` for the
+  # bundled marketplace, but only on-demand when an agent's launch
+  # path hits a plugin: channel. Seeding should propagate up-front so
+  # an `agent start` on a fresh install does NOT spawn the slow
+  # marketplace-add side trip.
+  bridge_plugins_seed_propagate_controller_registry "$marketplace_root" "$_seed_mkt_name" \
+    || bridge_warn "[plugins seed] controller claude-registry propagation: non-fatal failure (continuing)"
+
+  # D3 (L1-F): external marketplace clones often land at mode 0700
+  # (operator umask), which iso UIDs cannot traverse → dev-plugin-cache
+  # source-link / read fails. Recursively grant world traverse + read
+  # (`o+rX`) so the iso UID can resolve the source path through the
+  # known_marketplaces.json entry written by D2. Gated to Linux + iso
+  # v2 + path-under-operator-HOME so the helper doesn't widen system
+  # directories or no-op-needlessly on macOS dev hosts.
+  if (( no_iso_chmod == 0 )); then
+    bridge_plugins_seed_external_marketplace_iso_readable "$marketplace_root" \
+      || bridge_warn "[plugins seed] external marketplace o+rX grant: non-fatal failure (continuing)"
+  else
+    bridge_info "[plugins seed] --no-iso-chmod set: skipping recursive o+rX on $marketplace_root (operator-managed)"
+  fi
+
+  # D2 (L1-D): propagate the marketplace entry to every linux-user
+  # isolated agent's per-UID known_marketplaces.json whose channels
+  # reference this marketplace. Without this, `resolve_marketplace_root`
+  # in bridge-dev-plugin-cache.py (running under BRIDGE_CLAUDE_PLUGINS_ROOT
+  # pointing at the iso HOME) falls back to the bundled agent-bridge
+  # marketplace and the plugin install silently mismatches.
+  #
+  # Pre-existing per-agent isolation prepare ALREADY writes a filtered
+  # per-UID catalog (bridge_write_isolated_known_marketplaces_catalog)
+  # — but that runs at `agent create --linux-user` time, not at seed
+  # time, and it reads from the CONTROLLER's known_marketplaces.json.
+  # Seed→per-agent-prepare is the canonical order on a clean install,
+  # but on a retrofit (operator runs `agb plugins seed` AFTER the iso
+  # agents already exist) the per-UID catalog still lacks the entry.
+  # This step covers that retrofit path. The per-agent prepare path
+  # remains the canonical writer for fresh agent creation.
+  bridge_plugins_seed_propagate_iso_known_marketplaces "$marketplace_root" "$_seed_mkt_name" \
+    || bridge_warn "[plugins seed] iso known_marketplaces.json propagation: non-fatal failure (continuing)"
+
   printf '[ok] seeded %s (installed_plugins.json present)\n' "$plugins_cache"
+}
+
+# D1 (L1-A): add the marketplace to the controller's claude registry
+# at `$HOME/.claude/plugins/known_marketplaces.json`. Idempotent —
+# `claude plugin marketplace list` is consulted first to avoid
+# duplicate writes.
+#
+# Args:
+#   $1 — marketplace_root (canonicalized absolute path)
+#   $2 — marketplace_name (from manifest)
+#
+# Returns:
+#   0 on success or already-present, non-zero if the add failed.
+#   Missing `claude` binary returns 0 with a bridge_info note — fresh
+#   installs that do not yet have the Claude CLI in PATH should not
+#   block the seed.
+bridge_plugins_seed_propagate_controller_registry() {
+  local mkt_root="$1"
+  local mkt_name="$2"
+
+  if ! command -v claude >/dev/null 2>&1; then
+    bridge_info "[plugins seed] D1: claude CLI not on PATH — skipping controller-registry add (will lazy-add via bridge_ensure_*_marketplace when an agent's plugin channel fires)"
+    return 0
+  fi
+
+  if [[ -z "$mkt_name" ]]; then
+    bridge_warn "[plugins seed] D1: could not resolve marketplace name from $mkt_root/.claude-plugin/marketplace.json — skipping controller-registry add"
+    return 1
+  fi
+
+  local list_output=""
+  list_output="$(claude plugin marketplace list 2>/dev/null || true)"
+  # Word-boundary match (mirrors bridge_claude_marketplace_ensure_present_for_isolated).
+  if printf '%s\n' "$list_output" \
+      | grep -Eq "(^|[[:space:]])${mkt_name}([[:space:]]|\$)"; then
+    bridge_info "[plugins seed] D1: marketplace '$mkt_name' already in controller registry (skipped)"
+    return 0
+  fi
+
+  bridge_info "[plugins seed] D1: adding marketplace '$mkt_name' to controller registry: $mkt_root"
+  if ! claude plugin marketplace add --scope user "$mkt_root" >/dev/null 2>&1; then
+    bridge_warn "[plugins seed] D1: \`claude plugin marketplace add --scope user $mkt_root\` failed — agents on this marketplace may need a manual marketplace add before first plugin install"
+    return 1
+  fi
+  return 0
+}
+
+# D3 (L1-F): grant world traverse+read recursively on an external
+# marketplace clone dir so iso UIDs can read package files via the
+# `known_marketplaces.json` directory source pointer.
+#
+# Gated to Linux + iso v2 active + path under $HOME (operator's home,
+# not a system path). On non-Linux hosts and on shared-mode installs
+# the grant is a no-op — there is no separate UID to grant to.
+#
+# Args:
+#   $1 — marketplace_root (canonicalized absolute path)
+bridge_plugins_seed_external_marketplace_iso_readable() {
+  local mkt_root="$1"
+
+  # Linux-only — macOS dev hosts run agents under the operator UID so
+  # the read path is already covered.
+  if [[ "$(uname -s 2>/dev/null)" != "Linux" ]]; then
+    return 0
+  fi
+  # Skip when iso v2 isn't active (shared-mode installs don't need
+  # this widening).
+  if ! bridge_isolation_v2_active 2>/dev/null; then
+    return 0
+  fi
+  # If the marketplace root IS the bundled in-repo marketplace
+  # (`$SCRIPT_DIR`), don't widen it here — the install-tree reconciler
+  # already covers `$BRIDGE_HOME/{lib,scripts,hooks,runtime,shared}` and
+  # the source checkout is covered by the operator's existing umask
+  # plus the matrix's `data-root`/`lib-dir` etc. rows.
+  local bundled_root="$SCRIPT_DIR"
+  if [[ "$mkt_root" == "$bundled_root" ]]; then
+    bridge_info "[plugins seed] D3: marketplace_root == bundled in-repo marketplace ($mkt_root) — install-tree reconciler covers it (skipping recursive o+rX)"
+    return 0
+  fi
+  # Only widen paths under $HOME — refuse to walk system paths so a
+  # mistake (e.g. `--marketplace-root /usr`) cannot accidentally widen
+  # /usr/local/* or similar.
+  local home_dir="${HOME:-}"
+  if [[ -z "$home_dir" ]]; then
+    bridge_warn "[plugins seed] D3: \$HOME is unset — refusing to widen $mkt_root (caller's HOME must be set for the safety gate)"
+    return 1
+  fi
+  case "$mkt_root" in
+    "$home_dir"|"$home_dir"/*)
+      :
+      ;;
+    /tmp/*|/var/tmp/*|/private/tmp/*|/private/var/tmp/*)
+      # tmpdirs are operator-writable and frequently used for fixture
+      # marketplaces (the brief's `/tmp/cosmax-crm-cli`, `/tmp/pi-registry`,
+      # smoke fixtures). Allow.
+      :
+      ;;
+    *)
+      bridge_info "[plugins seed] D3: marketplace_root $mkt_root is outside \$HOME and tmpdirs — skipping recursive o+rX (operator must manage read access for iso UIDs manually, or pass --no-iso-chmod and configure named-user ACL)"
+      return 0
+      ;;
+  esac
+  if [[ ! -d "$mkt_root" ]]; then
+    bridge_warn "[plugins seed] D3: marketplace_root is not a directory: $mkt_root — skipping recursive o+rX"
+    return 1
+  fi
+
+  bridge_info "[plugins seed] D3: granting recursive o+rX on $mkt_root so iso UIDs can read package files (use --no-iso-chmod to opt out)"
+  # `chmod -R o+rX` — POSIX X grants execute only on dirs (preserves
+  # the executable bit on files that already have it without
+  # promoting every file to executable). No sudo: this is the
+  # operator's own tree.
+  if ! chmod -R o+rX "$mkt_root" 2>/dev/null; then
+    bridge_warn "[plugins seed] D3: \`chmod -R o+rX $mkt_root\` failed — iso UIDs may not be able to read package files. Operator may have a read-only mount; re-run with --no-iso-chmod once an alternative read path (named-user ACL or controller-owned symlink) is configured."
+    return 1
+  fi
+  return 0
+}
+
+# D2 (L1-D): write/merge the marketplace entry into each linux-user
+# isolated agent's `~/.claude/plugins/known_marketplaces.json` whose
+# channels reference this marketplace. Runs as root via
+# `bridge_linux_sudo_root` because the destination is under
+# `/home/agent-bridge-<a>/` (root-owned with group=ab-agent-<a>).
+#
+# Args:
+#   $1 — marketplace_root (canonicalized absolute path)
+#   $2 — marketplace_name (from manifest)
+bridge_plugins_seed_propagate_iso_known_marketplaces() {
+  local mkt_root="$1"
+  local mkt_name="$2"
+
+  if [[ "$(uname -s 2>/dev/null)" != "Linux" ]]; then
+    return 0
+  fi
+  if ! bridge_isolation_v2_active 2>/dev/null; then
+    return 0
+  fi
+  if [[ -z "$mkt_name" ]]; then
+    bridge_warn "[plugins seed] D2: could not resolve marketplace name from $mkt_root/.claude-plugin/marketplace.json — skipping iso UID propagation"
+    return 1
+  fi
+
+  # Need the reapply-eligible helper + per-agent shell helpers.
+  if ! command -v bridge_isolation_v2_reapply_eligible_agents >/dev/null 2>&1; then
+    bridge_info "[plugins seed] D2: bridge_isolation_v2_reapply_eligible_agents not loaded — skipping iso UID propagation (no roster active)"
+    return 0
+  fi
+  if ! command -v bridge_agent_channels_csv >/dev/null 2>&1; then
+    bridge_info "[plugins seed] D2: bridge_agent_channels_csv not loaded — skipping iso UID propagation"
+    return 0
+  fi
+  if ! command -v bridge_agent_os_user >/dev/null 2>&1; then
+    bridge_info "[plugins seed] D2: bridge_agent_os_user not loaded — skipping iso UID propagation"
+    return 0
+  fi
+
+  # The seed command does not load the roster eagerly (the sync helper
+  # itself does not need per-agent declarations). D2 does — it walks
+  # every linux-user iso agent's channel list. Load the roster
+  # idempotently here. bridge_load_roster short-circuits on
+  # already-loaded state.
+  if command -v bridge_load_roster >/dev/null 2>&1; then
+    bridge_load_roster >/dev/null 2>&1 || true
+  fi
+
+  local eligible=""
+  eligible="$(bridge_isolation_v2_reapply_eligible_agents 2>/dev/null || true)"
+  if [[ -z "$eligible" ]]; then
+    bridge_info "[plugins seed] D2: no linux-user isolated agents in roster — nothing to propagate"
+    return 0
+  fi
+
+  local agent
+  local propagated=0
+  local skipped=0
+  local failed=0
+  while IFS= read -r agent; do
+    [[ -n "$agent" ]] || continue
+    local agent_channels=""
+    agent_channels="$(bridge_agent_channels_csv "$agent" 2>/dev/null || printf '')"
+    # Only propagate when at least one channel references THIS marketplace.
+    if ! _bridge_plugins_seed_channels_csv_uses_marketplace "$agent_channels" "$mkt_name"; then
+      ((skipped++)) || true
+      continue
+    fi
+
+    local os_user=""
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+    if [[ -z "$os_user" ]]; then
+      bridge_warn "[plugins seed] D2: agent '$agent' has no os_user resolved — skipping"
+      ((failed++)) || true
+      continue
+    fi
+
+    local user_home=""
+    if command -v bridge_agent_linux_user_home >/dev/null 2>&1; then
+      user_home="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || printf '')"
+    fi
+    if [[ -z "$user_home" || ! -d "$user_home" ]]; then
+      bridge_warn "[plugins seed] D2: agent '$agent' (os_user=$os_user) has no resolvable HOME ($user_home) — skipping"
+      ((failed++)) || true
+      continue
+    fi
+
+    local iso_plugins_dir="$user_home/.claude/plugins"
+    if ! bridge_linux_sudo_root test -d "$iso_plugins_dir" 2>/dev/null; then
+      bridge_info "[plugins seed] D2: agent '$agent' has no $iso_plugins_dir (iso prep has not run yet) — skipping; next \`agent create\` or reapply will write the catalog"
+      ((skipped++)) || true
+      continue
+    fi
+
+    local iso_known="$iso_plugins_dir/known_marketplaces.json"
+    local agent_group=""
+    if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+      agent_group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+    fi
+
+    # Write the merged catalog via the standalone helper. The helper is
+    # idempotent and uses a same-dir temp + os.replace so partial writes
+    # never leave a half-merged file. We do the merge from the current
+    # iso_known content (if any) → out path = iso_known. Run as root so
+    # the file lands at the right owner; chown/chmod follow.
+    local rc=0
+    if ! bridge_linux_sudo_root python3 \
+        "$SCRIPT_DIR/lib/upgrade-helpers/plugins-seed-merge-known-marketplace.py" \
+        "$iso_known" "$iso_known" "$mkt_name" "$mkt_root" >/dev/null 2>&1; then
+      rc=$?
+      bridge_warn "[plugins seed] D2: merge for agent '$agent' (target=$iso_known) failed with rc=$rc"
+      ((failed++)) || true
+      continue
+    fi
+    # root:ab-agent-<a> mode 0640 — matches the contract that
+    # bridge_write_isolated_known_marketplaces_catalog applies to
+    # the same file on the canonical per-agent prepare path.
+    if [[ -n "$agent_group" ]]; then
+      bridge_linux_sudo_root chown "root:$agent_group" "$iso_known" >/dev/null 2>&1 \
+        || bridge_warn "[plugins seed] D2: chown root:$agent_group $iso_known failed (agent '$agent')"
+    else
+      bridge_linux_sudo_root chown root:root "$iso_known" >/dev/null 2>&1 || true
+    fi
+    bridge_linux_sudo_root chmod 0640 "$iso_known" >/dev/null 2>&1 \
+      || bridge_warn "[plugins seed] D2: chmod 0640 $iso_known failed (agent '$agent')"
+    ((propagated++)) || true
+  done <<<"$eligible"
+
+  bridge_info "[plugins seed] D2: propagated=$propagated skipped=$skipped failed=$failed (target marketplace='$mkt_name')"
+  if (( failed > 0 )); then
+    return 1
+  fi
+  return 0
+}
+
+# Internal: returns 0 if the comma-separated channels list contains at
+# least one plugin: channel that references the target marketplace.
+_bridge_plugins_seed_channels_csv_uses_marketplace() {
+  local csv="${1:-}"
+  local mkt="${2:-}"
+  [[ -n "$csv" && -n "$mkt" ]] || return 1
+  local -a items=()
+  IFS=',' read -r -a items <<<"$csv"
+  local item plugin_spec marketplace
+  for item in "${items[@]}"; do
+    # trim whitespace
+    item="${item## }"
+    item="${item%% }"
+    [[ "$item" == plugin:* ]] || continue
+    plugin_spec="${item#plugin:}"
+    [[ "$plugin_spec" == *@* ]] || continue
+    marketplace="${plugin_spec##*@}"
+    if [[ "$marketplace" == "$mkt" ]]; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 bridge_plugins_cmd_show() {

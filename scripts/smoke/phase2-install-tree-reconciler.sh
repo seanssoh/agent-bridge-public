@@ -219,7 +219,18 @@ test_t1_matrix_rows() {
   # Phase 3 (codex design 2026-05-24) Family 1 install-tree rows.
   # Four new rows close patch's Phase 3 acceptance gaps A/B/C/D:
   #   A. .claude-plugin/, B. plugins/, C. plugins/*, D. agents/
-  for row_name in claude-plugin-dir plugins-root plugins-channel-trees agents-root; do
+  #
+  # L1-G (beta20, 2026-05-25): Gap C (per-channel plugin trees) was
+  # originally a single `plugins-channel-trees|…/plugins/*|dir_recursive`
+  # row, but `_bridge_iso_reconcile_row_dir_recursive` does not
+  # glob-expand its path arg — the row always reported `skipped
+  # (absent)`. The row is now glob-expanded at matrix-generation time:
+  # one `plugins-channel-tree-<subname>` row per actually-present
+  # subdir of `$BRIDGE_HOME/plugins`. The smoke fixture has no plugin
+  # subdirs (smoke_build_fixture does not create them), so the expanded
+  # rows are absent here — covered by T10 which materializes fixture
+  # subdirs and verifies expansion.
+  for row_name in claude-plugin-dir plugins-root agents-root; do
     smoke_assert_contains "$rows_out" "$row_name|" \
       "T1: Phase 3 Family 1 install row '$row_name' missing"
   done
@@ -714,6 +725,86 @@ test_t9_l1_beta19_scaffold_modes() {
 # Runner
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# T10 — L1-G (beta20): plugins-channel-trees row glob expansion
+# ---------------------------------------------------------------------------
+test_t10_l1g_plugins_channel_trees_glob() {
+  smoke_log "T10: L1-G plugins-channel-trees row expanded per-subdir"
+
+  # Materialize three plugin subdirs the way real installs see them
+  # (teams, ms365, cosmax-marketplace) plus a metadata file the matrix
+  # should NOT walk (installed_plugins.json).
+  mkdir -p "$BRIDGE_HOME/plugins/teams" \
+           "$BRIDGE_HOME/plugins/ms365" \
+           "$BRIDGE_HOME/plugins/cosmax-marketplace/.claude-plugin"
+  printf '# stub\n' >"$BRIDGE_HOME/plugins/teams/package.json"
+  printf '# stub\n' >"$BRIDGE_HOME/plugins/ms365/package.json"
+  printf '# stub\n' >"$BRIDGE_HOME/plugins/cosmax-marketplace/.claude-plugin/marketplace.json"
+  # Excluded metadata dirs (must NOT emit a row per the matrix logic).
+  mkdir -p "$BRIDGE_HOME/plugins/marketplaces" "$BRIDGE_HOME/plugins/cache"
+  printf '{}\n' >"$BRIDGE_HOME/plugins/installed_plugins.json"
+  printf '{}\n' >"$BRIDGE_HOME/plugins/known_marketplaces.json"
+
+  local rows_out
+  rows_out="$("$SMOKE_BASH" -c "
+    set -uo pipefail
+    source '$REPO_ROOT/bridge-lib.sh' >/dev/null 2>&1
+    bridge_isolation_v2_install_tree_matrix_rows
+  " 2>/dev/null)"
+
+  # Each populated plugin subdir gets its OWN row.
+  for plugin_name in teams ms365 cosmax-marketplace; do
+    smoke_assert_contains "$rows_out" "plugins-channel-tree-${plugin_name}|" \
+      "T10: per-channel row 'plugins-channel-tree-${plugin_name}' missing — glob did not expand for $plugin_name"
+    # Confirm path AND kind are correct.
+    local row_line
+    row_line="$(printf '%s\n' "$rows_out" | grep "^plugins-channel-tree-${plugin_name}|" | head -n 1)"
+    if [[ -z "$row_line" ]]; then
+      smoke_fail "T10: row 'plugins-channel-tree-${plugin_name}' visible by substring but not isolatable as a full line"
+    fi
+    local row_path row_kind
+    row_path="$(printf '%s\n' "$row_line" | awk -F'|' '{print $3}')"
+    row_kind="$(printf '%s\n' "$row_line" | awk -F'|' '{print $4}')"
+    if [[ "$row_path" != "$BRIDGE_HOME/plugins/${plugin_name}" ]]; then
+      smoke_fail "T10: row path expected '$BRIDGE_HOME/plugins/${plugin_name}', got '$row_path'"
+    fi
+    if [[ "$row_kind" != "dir_recursive" ]]; then
+      smoke_fail "T10: row kind expected 'dir_recursive', got '$row_kind'"
+    fi
+  done
+
+  # The old, never-fired glob-literal row must be gone.
+  smoke_assert_not_contains "$rows_out" "plugins-channel-trees|" \
+    "T10: legacy 'plugins-channel-trees' literal-glob row must be replaced by expanded per-subdir rows"
+
+  # Excluded subnames must NOT emit rows.
+  for excluded in marketplaces cache installed_plugins.json known_marketplaces.json marketplaces.json; do
+    smoke_assert_not_contains "$rows_out" "plugins-channel-tree-${excluded}|" \
+      "T10: excluded plugins subname '$excluded' must not emit a per-channel row"
+  done
+
+  # Sanity check — running with no plugins/* present produces zero
+  # plugins-channel-tree-* rows but does NOT error.
+  rm -rf "$BRIDGE_HOME/plugins/teams" \
+         "$BRIDGE_HOME/plugins/ms365" \
+         "$BRIDGE_HOME/plugins/cosmax-marketplace" \
+         "$BRIDGE_HOME/plugins/marketplaces" \
+         "$BRIDGE_HOME/plugins/cache"
+  rm -f "$BRIDGE_HOME/plugins/installed_plugins.json" \
+        "$BRIDGE_HOME/plugins/known_marketplaces.json"
+  rmdir "$BRIDGE_HOME/plugins" 2>/dev/null || true
+
+  rows_out="$("$SMOKE_BASH" -c "
+    set -uo pipefail
+    source '$REPO_ROOT/bridge-lib.sh' >/dev/null 2>&1
+    bridge_isolation_v2_install_tree_matrix_rows
+  " 2>/dev/null)"
+  smoke_assert_not_contains "$rows_out" "plugins-channel-tree-" \
+    "T10: no plugins/ dir → no per-channel rows expected"
+
+  smoke_log "T10 PASS"
+}
+
 smoke_run "T1 matrix-rows" test_t1_matrix_rows
 smoke_run "T2 check-drift" test_t2_check_drift
 smoke_run "T3 apply-idempotent" test_t3_apply_idempotent
@@ -723,6 +814,7 @@ smoke_run "T6 marker-non-write-guard" test_t6_marker_non_write_guard
 smoke_run "T7 protected-files" test_t7_protected_files
 smoke_run "T8 regression-boomerang" test_t8_regression_boomerang
 smoke_run "T9 l1-beta19-scaffold-modes" test_t9_l1_beta19_scaffold_modes
+smoke_run "T10 l1g-plugins-channel-trees-glob" test_t10_l1g_plugins_channel_trees_glob
 
 smoke_log "phase2-install-tree-reconciler: ALL TESTS PASS"
 exit 0

@@ -784,5 +784,104 @@ bridge_provision_teams_plugin_runtime() {
   bridge_ensure_bun_runtime_traversable_for_isolated "$dry_run" || true
 
   bridge_install_teams_plugin_node_modules "$dry_run" "$bun_bin" || return 1
+
+  # L1-J (beta20, 2026-05-25): also provision sibling bundled plugins
+  # (ms365, future). The teams-specific helper above covers
+  # plugins/teams/ explicitly; this generalized pass picks up any other
+  # bundled plugin under $BRIDGE_SCRIPT_DIR/plugins/ that has a
+  # package.json. Best-effort + idempotent — re-running on an already-
+  # installed plugin is a no-op.
+  if bridge_resolve_script_dir_check; then
+    bridge_provision_bundled_plugins_node_modules "$dry_run" "$bun_bin" || true
+  fi
   return 0
+}
+
+# L1-J (beta20, 2026-05-25): provision node_modules for EVERY bundled
+# plugin under $BRIDGE_SCRIPT_DIR/plugins/ that has a package.json.
+# Generalizes bridge_install_teams_plugin_node_modules so a new bundled
+# plugin (e.g. ms365) does not need its own helper.
+#
+# Skips a plugin when:
+#   - it has no package.json (not a node-based MCP)
+#   - it already has a node_modules dir newer than package.json + bun.lock
+#
+# Idempotent: the chmod widen always runs over node_modules so a
+# previously-installed-but-tight tree is opened up for iso-UID copy.
+bridge_provision_bundled_plugins_node_modules() {
+  local dry_run="${1:-0}"
+  local bun_bin="${2:-}"
+
+  if ! bridge_resolve_script_dir_check; then
+    return 1
+  fi
+  local plugins_root="$BRIDGE_SCRIPT_DIR/plugins"
+  if [[ ! -d "$plugins_root" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$bun_bin" ]]; then
+    bun_bin="$(bridge_resolve_bun_executable 2>/dev/null || true)"
+  fi
+  if [[ -z "$bun_bin" ]]; then
+    bridge_warn "[setup] bun executable missing — cannot provision bundled plugin node_modules. Install bun and re-run \`agb setup teams\`."
+    return 1
+  fi
+
+  local plugin_dir plugin_name pkg_json node_modules bun_lock
+  local overall_rc=0
+  shopt -s nullglob 2>/dev/null || true
+  for plugin_dir in "$plugins_root"/*/; do
+    plugin_dir="${plugin_dir%/}"
+    [[ -d "$plugin_dir" ]] || continue
+    plugin_name="$(basename -- "$plugin_dir")"
+    # Already covered by the teams-specific helper.
+    [[ "$plugin_name" == "teams" ]] && continue
+    case "$plugin_name" in
+      .*|marketplaces|cache) continue ;;
+    esac
+    pkg_json="$plugin_dir/package.json"
+    [[ -f "$pkg_json" ]] || continue
+    node_modules="$plugin_dir/node_modules"
+    bun_lock="$plugin_dir/bun.lock"
+
+    if [[ -d "$node_modules" ]]; then
+      local _stale=0
+      if [[ "$pkg_json" -nt "$node_modules" ]]; then
+        _stale=1
+      fi
+      if [[ -f "$bun_lock" && "$bun_lock" -nt "$node_modules" ]]; then
+        _stale=1
+      fi
+      if (( _stale == 0 )); then
+        chmod -R go+rX "$node_modules" 2>/dev/null \
+          || bridge_warn "[setup] chmod go+rX failed on $node_modules (non-fatal)"
+        bridge_info "[setup] $plugin_name: node_modules up to date (skipped)"
+        continue
+      fi
+      bridge_info "[setup] $plugin_name: node_modules stale — refreshing"
+    fi
+
+    if [[ "$dry_run" == "1" ]]; then
+      bridge_info "[setup] [dry-run] would run: bun install in $plugin_dir"
+      continue
+    fi
+
+    bridge_info "[setup] $plugin_name: running bun install in $plugin_dir"
+    local _rc=0
+    if [[ -f "$bun_lock" ]]; then
+      ( cd "$plugin_dir" && "$bun_bin" install --frozen-lockfile --no-summary >&2 ) || _rc=$?
+    else
+      ( cd "$plugin_dir" && "$bun_bin" install --no-summary >&2 ) || _rc=$?
+    fi
+    if (( _rc != 0 )); then
+      bridge_warn "[setup] $plugin_name: bun install failed (rc=$_rc) — MCP for this plugin will not start until deps resolve"
+      overall_rc=1
+      continue
+    fi
+    if ! chmod -R go+rX "$node_modules" 2>/dev/null; then
+      bridge_warn "[setup] $plugin_name: chmod -R go+rX failed on $node_modules — isolated agents may fail to copy via bridge-dev-plugin-cache"
+    fi
+  done
+  return "$overall_rc"
 }

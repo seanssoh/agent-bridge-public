@@ -44,6 +44,11 @@ trap _bridge_upgrade_exit_handler EXIT
 source "$SCRIPT_DIR/bridge-lib.sh"
 # shellcheck source=lib/bridge-cleanup.sh
 source "$SCRIPT_DIR/lib/bridge-cleanup.sh"
+# Beta20 L2 Variant 3A — bridge_host_profile_is_dev is defined in
+# lib/bridge-host-profile.sh (not pulled in by bridge-lib.sh). The
+# upgrade-time sudoers regeneration gate at line ~2243 depends on it.
+# shellcheck source=lib/bridge-host-profile.sh
+source "$SCRIPT_DIR/lib/bridge-host-profile.sh"
 ORIGINAL_ARGS=("$@")
 
 SOURCE_ROOT="$SCRIPT_DIR"
@@ -1872,6 +1877,38 @@ if [[ $DRY_RUN -eq 0 ]]; then
     tail -n 20 "$_bun_traverse_tmp" >&2 || true
   fi
   rm -f -- "$_bun_traverse_tmp"
+
+  # L1-J (beta20, 2026-05-25): every bundled plugin with a package.json
+  # needs node_modules at install/upgrade time. The teams plugin path
+  # (`agb setup teams`) does this for plugins/teams/ specifically; this
+  # helper generalizes to ms365 + any future bundled plugin so the iso
+  # UID's MCP spawn does not hit "Cannot find module" on first start.
+  #
+  # Best-effort, non-fatal — mirrors the bun-traverse helper. The
+  # helper logs per-plugin status and the overall upgrade continues
+  # even when one plugin's install fails (operator can re-run
+  # `agb setup <plugin> <agent>` or fix bun availability and retry).
+  #
+  # Footgun #11: file-as-argv via standalone helper (no heredoc-stdin).
+  set +e
+  _bundled_plugins_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-upg-bundled-plugins.XXXXXX")"
+  bridge_upgrade_with_target_env "$TARGET_ROOT" \
+    "$BRIDGE_BASH_BIN" \
+    "$SOURCE_ROOT/lib/upgrade-helpers/bundled-plugins-bun-install.sh" \
+    "$SOURCE_ROOT" "$TARGET_ROOT" >"$_bundled_plugins_tmp" 2>&1
+  _bundled_plugins_rc=$?
+  set -e
+  # Surface info lines (per-plugin status) regardless of rc — the
+  # operator wants to see "ms365: node_modules installed + widened"
+  # in the upgrade log.
+  if [[ -s "$_bundled_plugins_tmp" ]]; then
+    tail -n 50 "$_bundled_plugins_tmp" >&2 || true
+  fi
+  if [[ $_bundled_plugins_rc -ne 0 ]]; then
+    echo "[bridge-upgrade] WARN: one or more bundled plugins failed bun install (rc=$_bundled_plugins_rc). Affected MCPs will not start until deps resolve — re-run \`agb setup <plugin> <agent>\` or check bun availability." >&2
+    _upgrade_partial_failures+=("bundled_plugins_bun_install")
+  fi
+  rm -f -- "$_bundled_plugins_tmp"
 fi
 
 # Footgun #11: `bridge_upgrade_agent_restart_json` feeds python via heredoc;
@@ -2229,6 +2266,69 @@ if [[ $DRY_RUN -eq 0 ]] && command -v tmux >/dev/null 2>&1; then
   tmux setenv -u -g BRIDGE_DATA_ROOT 2>/dev/null || true
 fi
 
+
+# Beta20 L2 Variant 3A — regenerate the daemon-refresh sudoers drop-in
+# so an upgrade that changes BRIDGE_BASH_BIN or BRIDGE_HOME (rare but
+# possible when operators relocate) lands a matching authorized command
+# in the sudoers entry. Idempotent: the helper skips the install when
+# the existing file is byte-equal to a fresh render. Linux + server
+# profile only; failure is logged but does NOT abort the upgrade (the
+# operator can re-run `agent-bridge init sudoers daemon-refresh --apply`
+# afterwards).
+if [[ $DRY_RUN -eq 0 ]] \
+   && [[ "$(uname -s 2>/dev/null)" == "Linux" ]] \
+   && ! bridge_host_profile_is_dev \
+   && command -v bridge_daemon_control_install_sudoers >/dev/null 2>&1; then
+  _upgrade_sudoers_path=""
+  _upgrade_sudoers_install_ok=0
+  if _upgrade_sudoers_path="$(BRIDGE_HOME="$TARGET_ROOT" bridge_daemon_control_install_sudoers 2>&1)"; then
+    if [[ -n "$_upgrade_sudoers_path" ]]; then
+      # >&2 — info goes to stderr so --json mode's stdout stays parseable
+      echo "[bridge-upgrade] daemon-refresh sudoers: at $_upgrade_sudoers_path" >&2
+      _upgrade_sudoers_install_ok=1
+    fi
+  else
+    echo "[bridge-upgrade] WARN: daemon-refresh sudoers regen failed; automatic supp-groups refresh may fall back to manual-required." >&2
+    echo "[bridge-upgrade] WARN: re-run: $TARGET_ROOT/agent-bridge init sudoers daemon-refresh --apply" >&2
+  fi
+
+  # Beta20 L2 Variant 3A r4 — regenerate the systemd-user unit so its
+  # ExecStart picks up the (possibly updated) sudo-wrapped shape. The
+  # install-daemon-systemd.sh helper auto-detects the sudoers drop-in
+  # and renders accordingly; we just re-apply + daemon-reload +
+  # restart-if-active. Without this step, an operator who upgrades
+  # from a pre-r4 install still has the legacy direct unit ExecStart,
+  # and `Restart=always` would keep defeating the r3 ad-hoc sudo
+  # restart at runtime.
+  if (( _upgrade_sudoers_install_ok == 1 )) \
+     && command -v systemctl >/dev/null 2>&1; then
+    _upgrade_systemd_rc=0
+    # install-daemon-systemd.sh emits [info] lines to stdout (designed
+    # for standalone CLI use). When invoked from inside `agent-bridge
+    # upgrade --json`, that chatter must not pollute the JSON envelope
+    # on our stdout. Redirect to stderr so --json callers (smokes, CI)
+    # get a clean JSON document; operator-facing terminal still sees
+    # the messages.
+    "$BRIDGE_BASH_BIN" "$TARGET_ROOT/scripts/install-daemon-systemd.sh" \
+      --bridge-home "$TARGET_ROOT" --apply >&2 \
+      || _upgrade_systemd_rc=$?
+    if (( _upgrade_systemd_rc == 0 )); then
+      if systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null; then
+        systemctl --user daemon-reload || true
+        if systemctl --user restart agent-bridge-daemon.service 2>/dev/null; then
+          echo "[bridge-upgrade] systemd-user unit regenerated (sudo-self) and restarted" >&2
+        else
+          echo "[bridge-upgrade] WARN: systemctl --user restart agent-bridge-daemon.service failed after unit regen — retry manually" >&2
+        fi
+      else
+        echo "[bridge-upgrade] systemd-user unit regenerated (sudo-self) — service not active, will pick up on next start" >&2
+      fi
+    else
+      echo "[bridge-upgrade] WARN: install-daemon-systemd.sh --apply returned rc=$_upgrade_systemd_rc — unit may carry legacy ExecStart" >&2
+      echo "[bridge-upgrade] WARN: re-run: $TARGET_ROOT/scripts/install-daemon-systemd.sh --bridge-home $TARGET_ROOT --apply" >&2
+    fi
+  fi
+fi
 
 # Bug #507 — auto-cleanup of daily-backup residue on every successful
 # `agb upgrade --apply`. Idempotent; reports failures via cleanup_failures

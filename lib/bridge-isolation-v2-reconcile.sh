@@ -1063,8 +1063,49 @@ bridge_isolation_v2_install_tree_matrix_rows() {
     "claude-plugin-dir|install|$data_root/.claude-plugin|dir|controller|ab-shared|0750|-|0|0|inherit|direct|optional|controller-owned .claude-plugin manifest dir — ab-shared g+rx so plugin discovery from iso UIDs can read the manifest"
   printf '%s\n' \
     "plugins-root|install|$data_root/plugins|dir|controller|ab-shared|0750|-|0|0|inherit|direct|optional|controller-owned plugins cache root — ab-shared g+rx so iso UIDs can list and read non-secret plugin metadata"
-  printf '%s\n' \
-    "plugins-channel-trees|install|$data_root/plugins/*|dir_recursive|controller|ab-shared|-|-|0|1|inherit|direct|optional|per-channel plugin trees (teams/ms365/cosmax-*) chgrp -R ab-shared + g+rX so iso UIDs can read package files; *.lock + secrets protected by guard"
+  # plugins-channel-trees — per-channel plugin trees (teams/ms365/cosmax-*).
+  #
+  # L1-G (beta20, 2026-05-25 patch L1-extended): the prior row used a
+  # literal glob path `$data_root/plugins/*` with kind `dir_recursive`.
+  # `_bridge_iso_reconcile_row_dir_recursive` tests `[[ -d "$path" ]]`
+  # which DOES NOT glob-expand — the test ran against the literal string
+  # `…/plugins/*`, which always returns false, and the row always
+  # reported `skipped (absent)` even on installs with 4+ populated
+  # plugin dirs. Net effect: ms365, cosmax-marketplace, cosmax-crm-marketplace,
+  # etc. never had their group/mode normalized for iso UID read access.
+  #
+  # Fix: expand the glob at row-generation time and emit one
+  # `dir_recursive` row per actually-present subdir. Each row is
+  # `optional` (skipped quietly when the dir is absent) — channel install
+  # via `agb agent create --linux-user --channels plugin:<X>` creates the
+  # dir on first install, and the next reconciler pass picks it up.
+  # The protected-path guard remains active per-row, so secret files
+  # (*.lock, etc.) are still excluded by the existing per-file guard
+  # in `_bridge_iso_reconcile_row_dir_recursive` itself.
+  if [[ -d "$data_root/plugins" ]]; then
+    local _plugin_subdir _plugin_subname
+    # nullglob via subshell — we don't want to mutate the caller's shopt.
+    # `compgen -G` is the simpler primitive (file_glob row uses it too);
+    # use it here so a no-match produces an empty stream rather than the
+    # literal pattern.
+    while IFS= read -r _plugin_subdir; do
+      [[ -n "$_plugin_subdir" && -d "$_plugin_subdir" ]] || continue
+      _plugin_subname="$(basename -- "$_plugin_subdir")"
+      # `marketplaces` is a Claude-cache namespace under
+      # ~/.claude/plugins/ (and the matching dir under $BRIDGE_HOME/plugins/
+      # when the controller's known_marketplaces.json carries directory
+      # entries). It is controller-owned metadata. Iso UIDs should read
+      # via the shared-plugins-cache path, not this row — so the row
+      # walks per-channel subdirs only.
+      [[ "$_plugin_subname" == "marketplaces" ]] && continue
+      [[ "$_plugin_subname" == "cache" ]] && continue
+      [[ "$_plugin_subname" == "marketplaces.json" ]] && continue
+      [[ "$_plugin_subname" == "installed_plugins.json" ]] && continue
+      [[ "$_plugin_subname" == "known_marketplaces.json" ]] && continue
+      printf '%s\n' \
+        "plugins-channel-tree-${_plugin_subname}|install|$_plugin_subdir|dir_recursive|controller|ab-shared|-|-|0|1|inherit|direct|optional|per-channel plugin tree ($_plugin_subname) chgrp -R ab-shared + g+rX so iso UIDs can read package files; *.lock + secrets protected by guard"
+    done < <(compgen -G "$data_root/plugins/*" 2>/dev/null || true)
+  fi
   printf '%s\n' \
     "agents-root|install|$data_root/agents|dir|controller|ab-shared|0710|-|0|0|inherit|direct|required|per-agent runtime-home root — controller rwX, group --x for traverse to each per-agent leaf without listing the full agent inventory (iso UIDs must traverse to their own home, not see siblings)"
 
