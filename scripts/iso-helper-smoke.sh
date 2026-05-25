@@ -267,6 +267,100 @@ else
   _fail "publish-root-symlink creates symlink" "rc=$rc"
 fi
 
+# ---- Test: path allowlist canonicalization (codex r1 BLOCKING) -------------
+#
+# R2 hardening: bridge_iso_run must reject `..` traversal and symlink
+# ancestor escapes against the canonical allowlist roots. Lexical-only
+# prefix checks (the R1 implementation) let an attacker pass
+# `<allowed-root>/../outside/secret` and have the op script stat /
+# read / write the outside path. The 4 escape vectors below mirror
+# the codex r1 BLOCKING repro.
+
+# Setup escape sandbox INSIDE the smoke's existing $SANDBOX so the
+# allowlist override matches a canonical real directory.
+mkdir -p "$SANDBOX/escape-home"
+mkdir -p "$SANDBOX/escape-outside/sub"
+echo "top-secret" >"$SANDBOX/escape-outside/secret.txt"
+echo "deeper-secret" >"$SANDBOX/escape-outside/sub/inside.txt"
+ln -sfn "$SANDBOX/escape-outside" "$SANDBOX/escape-home/link"
+
+# Use a TIGHTER extra root so escape paths land OUTSIDE the allowlist.
+# The existing $SANDBOX-wide allowlist remains in scope for the
+# earlier (legitimate) tests via the unmodified env.
+
+# Test: literal `..` traversal escape — rc=40 expected.
+rc=0
+BRIDGE_ISO_RUN_ALLOWLIST_EXTRA="$SANDBOX/escape-home" \
+  bridge_iso_run --agent "$AGENT" --op stat \
+    --path "$SANDBOX/escape-home/../escape-outside/secret.txt" --test exists \
+  >/dev/null 2>&1 || rc=$?
+if [[ "$rc" -eq 40 ]]; then
+  _pass "allowlist rejects .. traversal escape with rc=40"
+else
+  _fail "allowlist rejects .. traversal escape with rc=40" "got rc=$rc"
+fi
+
+# Test: symlink ancestor escape — rc=40 expected.
+# escape-home/link -> escape-outside; path through link/sub/inside.txt
+# canonicalizes to escape-outside/sub/inside.txt which is OUTSIDE the
+# tightened allowlist (escape-home).
+rc=0
+BRIDGE_ISO_RUN_ALLOWLIST_EXTRA="$SANDBOX/escape-home" \
+  bridge_iso_run --agent "$AGENT" --op stat \
+    --path "$SANDBOX/escape-home/link/sub/inside.txt" --test exists \
+  >/dev/null 2>&1 || rc=$?
+if [[ "$rc" -eq 40 ]]; then
+  _pass "allowlist rejects symlink ancestor escape with rc=40"
+else
+  _fail "allowlist rejects symlink ancestor escape with rc=40" "got rc=$rc"
+fi
+
+# Test: not-yet-created destination escape (atomic-write) — rc=40,
+# file must NOT be created.
+nyc_target="$SANDBOX/escape-outside/newfile-from-escape"
+rm -f "$nyc_target"
+rc=0
+printf "x\n" | BRIDGE_ISO_RUN_ALLOWLIST_EXTRA="$SANDBOX/escape-home" \
+  bridge_iso_run --agent "$AGENT" --op atomic-write \
+    --path "$SANDBOX/escape-home/../escape-outside/newfile-from-escape" --mode 0644 \
+  >/dev/null 2>&1 || rc=$?
+if [[ "$rc" -eq 40 && ! -e "$nyc_target" ]]; then
+  _pass "allowlist rejects not-yet-created atomic-write escape with rc=40 (no file written)"
+else
+  _fail "allowlist rejects not-yet-created atomic-write escape with rc=40 (no file written)" \
+    "rc=$rc nyc_exists=$([[ -e $nyc_target ]] && echo yes || echo no)"
+fi
+
+# Test: publish-root-file escape — rc=40, file must NOT be published.
+pub_target="$SANDBOX/escape-outside/published-from-escape.json"
+rm -f "$pub_target"
+rc=0
+printf "x\n" | BRIDGE_ISO_RUN_ALLOWLIST_EXTRA="$SANDBOX/escape-home" \
+  bridge_iso_run --agent "$AGENT" --op publish-root-file \
+    --path "$SANDBOX/escape-home/../escape-outside/published-from-escape.json" \
+    --mode 0640 --group-agent "$AGENT" \
+  >/dev/null 2>&1 || rc=$?
+if [[ "$rc" -eq 40 && ! -e "$pub_target" ]]; then
+  _pass "allowlist rejects publish-root-file escape with rc=40 (no file published)"
+else
+  _fail "allowlist rejects publish-root-file escape with rc=40 (no file published)" \
+    "rc=$rc pub_exists=$([[ -e $pub_target ]] && echo yes || echo no)"
+fi
+
+# Sanity check: a LEGITIMATE path under escape-home still succeeds
+# (validates we didn't just reject everything).
+echo "inside-payload" >"$SANDBOX/escape-home/legit.txt"
+rc=0
+BRIDGE_ISO_RUN_ALLOWLIST_EXTRA="$SANDBOX/escape-home" \
+  bridge_iso_run --agent "$AGENT" --op stat \
+    --path "$SANDBOX/escape-home/legit.txt" --test exists \
+  >/dev/null 2>&1 || rc=$?
+if [[ "$rc" -eq 0 ]]; then
+  _pass "allowlist permits legitimate path under tightened root"
+else
+  _fail "allowlist permits legitimate path under tightened root" "got rc=$rc"
+fi
+
 # ---- Test: agent-bridge iso-run CLI shim -----------------------------------
 
 # Validate the CLI dispatch token works. Same op as above but via the

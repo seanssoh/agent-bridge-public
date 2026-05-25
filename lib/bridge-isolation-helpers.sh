@@ -314,35 +314,160 @@ exit 0
 # in this helper body. See `KNOWN_ISSUES.md` Section 26 and the v0.13.9
 # chain.
 
-# bridge_iso_run_path_under_allowlist <agent> <path>
-# Returns 0 if <path> is under any allowlisted per-agent root, 1
-# otherwise. Pure string-prefix check against existing root helpers;
-# does not stat (so it works for not-yet-created destinations).
-bridge_iso_run_path_under_allowlist() {
-  local agent="$1"
-  local path="$2"
-  local root=""
-  local os_user=""
-  [[ -n "$agent" && -n "$path" ]] || return 1
+# _bridge_iso_run_canonicalize <path>
+# Echo the canonical absolute form of <path>. <path> MUST exist; on
+# resolution failure, echoes empty and returns non-zero.
+#
+# Portable across Linux (`readlink -f` works) and macOS BSD (`readlink
+# -f` exists on Big Sur+; older macOS without it falls through to the
+# python3 fallback). All errors are squashed: callers MUST check the
+# return code AND verify non-empty stdout before trusting the result.
+_bridge_iso_run_canonicalize() {
+  local p="$1"
+  [[ -n "$p" ]] || return 1
+  if [[ ! -e "$p" ]]; then
+    return 1
+  fi
+  local out=""
+  if out="$(readlink -f -- "$p" 2>/dev/null)" && [[ -n "$out" ]]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    out="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$p" 2>/dev/null)" \
+      && [[ -n "$out" ]] && { printf '%s' "$out"; return 0; }
+  fi
+  # Last-resort: cd -P into dirname, append basename. Works for paths
+  # whose parent exists and is traversable; fails closed otherwise.
+  local d b
+  d="$(dirname -- "$p")" || return 1
+  b="$(basename -- "$p")" || return 1
+  out="$(cd -P -- "$d" 2>/dev/null && printf '%s/%s' "$PWD" "$b")" \
+    && [[ -n "$out" ]] && { printf '%s' "$out"; return 0; }
+  return 1
+}
 
-  # Lexical only (no realpath) - the path may not exist yet. The actual
-  # stat / sudo will fail safely if the resolved path escapes.
-  path="${path%/}"
+# _bridge_iso_run_canonicalize_destination <path>
+# Echo the canonical form of <path> when <path> may not exist yet.
+# Walks up to the deepest EXISTING ancestor, canonicalizes that, then
+# re-appends the tail components literally (which means the tail must
+# have already been verified to contain no `..` and no symlinks — the
+# caller is responsible for that pre-check via the literal `..` reject
+# in `bridge_iso_run_path_under_allowlist`).
+#
+# Why this is safe: by the time the tail is appended, the deepest
+# existing ancestor has been resolved through any symlink chain. The
+# tail being non-existent means a symlink cannot already sit on any
+# tail component (symlinks are inodes; they exist). So
+# `<canonical-existing-ancestor>/<literal-tail>` is the canonical form
+# of the requested destination, modulo the `..`/no-symlink invariant
+# on the tail which the gate enforces upstream.
+#
+# Echoes empty on failure (no traversable ancestor reached `/`).
+_bridge_iso_run_canonicalize_destination() {
+  local p="$1"
+  [[ -n "$p" ]] || return 1
+  # Already-existing path: canonicalize directly.
+  if [[ -e "$p" ]]; then
+    _bridge_iso_run_canonicalize "$p"
+    return $?
+  fi
+
+  # Walk up to the deepest existing ancestor.
+  local tail=""
+  local cur="$p"
+  local prev=""
+  while [[ "$cur" != "/" && "$cur" != "." && -n "$cur" ]]; do
+    if [[ -e "$cur" ]]; then
+      break
+    fi
+    prev="$cur"
+    cur="$(dirname -- "$cur")"
+    if [[ -z "$tail" ]]; then
+      tail="$(basename -- "$prev")"
+    else
+      tail="$(basename -- "$prev")/$tail"
+    fi
+    # Guard against pathological infinite loops (dirname of "/" is "/").
+    [[ "$cur" == "$prev" ]] && return 1
+  done
+
+  if [[ ! -e "$cur" ]]; then
+    return 1
+  fi
+
+  local canonical_ancestor=""
+  canonical_ancestor="$(_bridge_iso_run_canonicalize "$cur")" || return 1
+  [[ -n "$canonical_ancestor" ]] || return 1
+
+  if [[ -z "$tail" ]]; then
+    printf '%s' "$canonical_ancestor"
+  else
+    printf '%s/%s' "${canonical_ancestor%/}" "$tail"
+  fi
+  return 0
+}
+
+# _bridge_iso_run_has_dotdot_segment <path>
+# Returns 0 iff <path> contains a literal `..` path segment (between
+# slashes, or as the first/last segment). Examples:
+#   /a/b/../c   -> 0 (yes)
+#   /a/..b/c    -> 1 (no — `..b` is not `..`)
+#   ../a/b      -> 0 (yes)
+#   /a/b/..     -> 0 (yes)
+#   /a..b/c     -> 1 (no)
+_bridge_iso_run_has_dotdot_segment() {
+  local p="$1"
+  local _saved_IFS="$IFS"
+  IFS="/"
+  # shellcheck disable=SC2086  # word-split on / is intentional
+  local seg
+  for seg in $p; do
+    if [[ "$seg" == ".." ]]; then
+      IFS="$_saved_IFS"
+      return 0
+    fi
+  done
+  IFS="$_saved_IFS"
+  return 1
+}
+
+# _bridge_iso_run_collect_canonical_roots <agent>
+# Print one canonical allowlist root per line to stdout. Uses the same
+# root resolution as the legacy lexical gate but canonicalizes each
+# root via `_bridge_iso_run_canonicalize`. Skips roots that fail to
+# canonicalize (root does not exist — that's a layout config issue,
+# not an escape — the legacy lexical compare would not have matched
+# the canonical path anyway).
+#
+# Output may include duplicate canonical paths when multiple roots
+# resolve to the same canonical dir (e.g. legacy + v2 home both point
+# at the same symlink target). Callers dedupe via the prefix match
+# loop and don't need uniqueness.
+_bridge_iso_run_collect_canonical_roots() {
+  local agent="$1"
+  local raw_root=""
+  local canon=""
+  local os_user=""
+
+  _print_if_resolves() {
+    local r="$1"
+    [[ -n "$r" ]] || return 0
+    r="${r%/}"
+    canon="$(_bridge_iso_run_canonicalize "$r" 2>/dev/null || true)"
+    if [[ -n "$canon" ]]; then
+      printf '%s\n' "${canon%/}"
+    fi
+  }
 
   if declare -F bridge_agent_workdir >/dev/null 2>&1; then
-    root="$(bridge_agent_workdir "$agent" 2>/dev/null || printf '')"
-    if [[ -n "$root" ]]; then
-      root="${root%/}"
-      [[ "$path" == "$root" || "$path" == "$root"/* ]] && return 0
-    fi
+    raw_root="$(bridge_agent_workdir "$agent" 2>/dev/null || printf '')"
+    _print_if_resolves "$raw_root"
   fi
 
   if declare -F bridge_agent_default_home >/dev/null 2>&1; then
-    root="$(bridge_agent_default_home "$agent" 2>/dev/null || printf '')"
-    if [[ -n "$root" ]]; then
-      root="${root%/}"
-      [[ "$path" == "$root" || "$path" == "$root"/* ]] && return 0
-    fi
+    raw_root="$(bridge_agent_default_home "$agent" 2>/dev/null || printf '')"
+    _print_if_resolves "$raw_root"
   fi
 
   if declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
@@ -351,21 +476,15 @@ bridge_iso_run_path_under_allowlist() {
         && declare -F bridge_agent_linux_user_home >/dev/null 2>&1; then
       os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
       if [[ -n "$os_user" ]]; then
-        root="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || printf '')"
-        if [[ -n "$root" ]]; then
-          root="${root%/}"
-          [[ "$path" == "$root" || "$path" == "$root"/* ]] && return 0
-        fi
+        raw_root="$(bridge_agent_linux_user_home "$os_user" 2>/dev/null || printf '')"
+        _print_if_resolves "$raw_root"
       fi
     fi
   fi
 
   if declare -F bridge_agent_idle_marker_dir >/dev/null 2>&1; then
-    root="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null || printf '')"
-    if [[ -n "$root" ]]; then
-      root="${root%/}"
-      [[ "$path" == "$root" || "$path" == "$root"/* ]] && return 0
-    fi
+    raw_root="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null || printf '')"
+    _print_if_resolves "$raw_root"
   fi
 
   local extra="${BRIDGE_ISO_RUN_ALLOWLIST_EXTRA:-}"
@@ -374,16 +493,95 @@ bridge_iso_run_path_under_allowlist() {
     IFS=":"
     local r
     for r in $extra; do
-      r="${r%/}"
       [[ -n "$r" ]] || continue
-      if [[ "$path" == "$r" || "$path" == "$r"/* ]]; then
-        IFS="$_saved_IFS"
-        return 0
-      fi
+      _print_if_resolves "$r"
     done
     IFS="$_saved_IFS"
   fi
 
+  unset -f _print_if_resolves 2>/dev/null || true
+}
+
+# bridge_iso_run_path_under_allowlist <agent> <path>
+#
+# Returns 0 if <path> is under any allowlisted per-agent root, 1
+# otherwise.
+#
+# R2 hardening (codex r1 BLOCKING): the gate is no longer lexical-only.
+# Steps:
+#   1. Reject any literal `..` path segment in the raw <path>. This
+#      catches `<allowed-root>/../outside/...` shapes before any
+#      canonicalization step that would normalize them away. The
+#      filesystem itself would resolve them, but for the gate to be
+#      meaningful we MUST refuse the request rather than transparently
+#      resolving the escape — operators relying on the `..` reject as
+#      a clear signal that their input is bad.
+#   2. Collect canonical (symlink-resolved) forms of the allowlist
+#      roots. A root that does not exist on disk is silently dropped
+#      (would never match a real canonical path anyway).
+#   3. Canonicalize <path>. For not-yet-created destinations the
+#      deepest existing ancestor is canonicalized and the tail
+#      re-appended literally (tail is already `..`-free by step 1; a
+#      symlink cannot sit on a non-existent tail component by
+#      definition).
+#   4. Compare canonical <path> against each canonical root via
+#      lexical-prefix on already-canonicalized strings. A symlink
+#      ancestor (e.g. `<allowed-root>/link -> /etc`) shows up as a
+#      canonical mismatch and is rejected.
+#
+# Return:
+#   0 — path canonicalizes under one of the canonical allowlist roots
+#   1 — escape detected (`..` segment, symlink ancestor, no canonical
+#       root match, canonicalization failure)
+bridge_iso_run_path_under_allowlist() {
+  local agent="$1"
+  local path="$2"
+  [[ -n "$agent" && -n "$path" ]] || return 1
+
+  # Reject literal `..` segments BEFORE canonicalization. `..` would
+  # normalize away under `readlink -f`, but we want to refuse the
+  # request rather than silently resolve an escape.
+  if _bridge_iso_run_has_dotdot_segment "$path"; then
+    return 1
+  fi
+
+  # Strip trailing slash to keep the canonical-prefix match consistent
+  # against root entries which we also strip.
+  path="${path%/}"
+
+  # Canonicalize the path (handling not-yet-created destinations by
+  # walking up to the deepest existing ancestor).
+  local canon_path=""
+  canon_path="$(_bridge_iso_run_canonicalize_destination "$path" 2>/dev/null || true)"
+  if [[ -z "$canon_path" ]]; then
+    # Could not canonicalize — refuse rather than fall through. This
+    # is the fail-closed branch for paths whose entire ancestor chain
+    # is missing (rare but possible during agent bootstrap).
+    return 1
+  fi
+  canon_path="${canon_path%/}"
+
+  # Collect canonical allowlist roots and prefix-match against them.
+  local canon_roots_tmp
+  canon_roots_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-iso-run-roots.XXXXXX")" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -f '$canon_roots_tmp' 2>/dev/null" RETURN
+
+  _bridge_iso_run_collect_canonical_roots "$agent" >"$canon_roots_tmp" 2>/dev/null || true
+
+  local canon_root=""
+  local matched=0
+  while IFS= read -r canon_root; do
+    [[ -n "$canon_root" ]] || continue
+    if [[ "$canon_path" == "$canon_root" || "$canon_path" == "$canon_root"/* ]]; then
+      matched=1
+      break
+    fi
+  done <"$canon_roots_tmp"
+
+  rm -f "$canon_roots_tmp" 2>/dev/null
+  trap - RETURN
+  [[ "$matched" -eq 1 ]] && return 0
   return 1
 }
 
