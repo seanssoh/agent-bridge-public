@@ -135,6 +135,21 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    # L1-N (beta21) tail: chmod 0640 so the file-mode gateway's
+    # request/response pair is readable by EITHER side. Without this,
+    # the controller daemon writes responses at its own umask (typically
+    # 077 → 0600 owned by `sean`) into the per-agent responses/ dir,
+    # and the iso UID's poll loop can never read them — `agb task create`
+    # from iso UID would PermissionError on the response file even
+    # though L1-N fixed bridge_load_roster, the request was queued
+    # successfully, and the daemon processed it. The setgid bit on
+    # the parent dir already ensures the file inherits the
+    # ab-agent-<X> group, so 0640 (owner+group rw, owner+group r)
+    # gives BOTH the controller and the iso UID read access without
+    # widening the surface beyond the per-agent group. Same code path
+    # writes request files (iso UID → controller) and response files
+    # (controller → iso UID); both directions benefit.
+    os.chmod(tmp, 0o640)
     os.replace(tmp, path)
 
 
