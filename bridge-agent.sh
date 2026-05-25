@@ -1364,12 +1364,30 @@ emit_create_json() {
   # JSON envelope; omitted entirely when empty so callers that didn't
   # pass the flag see a byte-stable envelope.
   local expressed_intent="${16:-}"
+  # Beta20 L2 Variant 3A — daemon supplementary-groups refresh status
+  # surfaced to JSON callers. One of:
+  #   ok / ok-systemd-sudo-self                  (success)
+  #   skipped-non-linux / skipped-daemon-not-running /
+  #     skipped-daemon-already-has-group         (no-op success)
+  #   manual-required-sudoers /
+  #     manual-required-sudo-refresh-no-gid /
+  #     manual-required-systemd-unit-stale /
+  #     manual-required-systemd-sudoers          (operator must run a recovery cmd)
+  #   failed-restart / failed-timeout /
+  #     failed-systemctl-restart /
+  #     failed-systemd-refresh-no-gid            (refresh attempted but failed)
+  #   ""                                          (no refresh attempted, shared-mode/macOS)
+  #
+  # When status is in the manual-required-* / failed-* family the
+  # envelope also carries `manual_command` with the exact recovery
+  # shell line — the python branches below own the mapping.
+  local daemon_group_refresh="${17:-}"
 
-  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" "$expressed_intent" <<'PY'
+  bridge_agent_manage_python "$agent" "$engine" "$session" "$workdir" "$profile_home" "$launch_cmd" "$channels" "$roster_file" "$dry_run" "$users_json" "$session_type" "$isolation_mode" "$os_user" "$idle_timeout_persisted" "$loop_persisted" "$expressed_intent" "$daemon_group_refresh" <<'PY'
 import json
 import sys
 
-agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user, idle_timeout_persisted, loop_persisted, expressed_intent = sys.argv[1:]
+agent, engine, session, workdir, profile_home, launch_cmd, channels, roster_file, dry_run, users_json, session_type, isolation_mode, os_user, idle_timeout_persisted, loop_persisted, expressed_intent, daemon_group_refresh = sys.argv[1:]
 policy = {
     "idle_timeout": idle_timeout_persisted,
     "loop": loop_persisted,
@@ -1399,6 +1417,26 @@ payload = {
         f"bash bridge-start.sh {agent} --dry-run",
     ],
 }
+# Beta20 L2 Variant 3A — only emit the field when refresh was actually
+# attempted (linux-user isolation on Linux). Shared-mode / macOS callers
+# see a byte-stable envelope without the new key. r4 added the systemd-
+# user managed status family — its recovery command differs from the
+# r3 ad-hoc sudo-restart path (operators on systemd hosts must regen
+# the unit + sudoers, not just retry a bare bridge-daemon.sh restart).
+if daemon_group_refresh:
+    payload["daemon_group_refresh"] = daemon_group_refresh
+    if daemon_group_refresh == "manual-required-sudoers":
+        payload["manual_command"] = "agent-bridge init sudoers daemon-refresh --apply"
+    elif daemon_group_refresh == "manual-required-sudo-refresh-no-gid":
+        payload["manual_command"] = "bash bridge-daemon.sh restart --force"
+    elif daemon_group_refresh in ("failed-restart", "failed-timeout"):
+        payload["manual_command"] = "bash bridge-daemon.sh restart --force"
+    elif daemon_group_refresh == "manual-required-systemd-unit-stale":
+        payload["manual_command"] = "agent-bridge init sudoers daemon-refresh --apply && bash scripts/install-daemon-systemd.sh --apply --enable --bridge-home \"$BRIDGE_HOME\""
+    elif daemon_group_refresh == "manual-required-systemd-sudoers":
+        payload["manual_command"] = "agent-bridge init sudoers daemon-refresh --apply"
+    elif daemon_group_refresh in ("failed-systemctl-restart", "failed-systemd-refresh-no-gid"):
+        payload["manual_command"] = "systemctl --user restart agent-bridge-daemon.service"
 print(json.dumps(payload, ensure_ascii=False, indent=2))
 PY
 }
@@ -3487,6 +3525,32 @@ report and reap test-fixture agents per their pattern."
     trap - EXIT
   fi
 
+  # Beta20 L2 Variant 3A — refresh the daemon's supplementary groups so
+  # the new per-agent group becomes visible to bridge-send.sh --urgent
+  # writes / channel-readiness probes / Stop-hook idle-since checks. The
+  # refresh is non-fatal: an already-created agent stays created
+  # regardless of refresh result, and the rollback trap is already
+  # disarmed above so a refresh failure here CANNOT unwind the agent.
+  # Skipped on macOS, when the daemon isn't running, and when the daemon's
+  # /proc/<pid>/status Groups already contains the target GID. Status is
+  # surfaced via daemon_group_refresh / manual_command fields below.
+  local daemon_group_refresh_status=""
+  if [[ "$isolation_mode" == "linux-user" ]] \
+     && command -v bridge_daemon_refresh_after_group_membership_change >/dev/null 2>&1; then
+    local _v2_grp_for_refresh=""
+    if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+      _v2_grp_for_refresh="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+    fi
+    if [[ -n "$_v2_grp_for_refresh" ]]; then
+      daemon_group_refresh_status="$(
+        bridge_daemon_refresh_after_group_membership_change \
+          --group "$_v2_grp_for_refresh" \
+          --reason "agent-create:$agent" \
+          2>/dev/null || true
+      )"
+    fi
+  fi
+
   if [[ $json_mode -eq 1 ]]; then
     # Issue #1093: derive the persisted-policy fields the same way the
     # writer does so the JSON envelope agrees with what landed on disk.
@@ -3510,7 +3574,8 @@ report and reap test-fixture agents per their pattern."
       "$agent" "$engine" "$session" "$workdir" "$profile_home" \
       "$launch_cmd" "$channels" "$BRIDGE_ROSTER_LOCAL_FILE" "$dry_run" \
       "$users_json" "$session_type" "$isolation_mode" "$os_user" \
-      "$_emit_idle_timeout" "$_emit_loop" "$always_on_intent"
+      "$_emit_idle_timeout" "$_emit_loop" "$always_on_intent" \
+      "$daemon_group_refresh_status"
     exit 0
   fi
 
@@ -3551,6 +3616,51 @@ report and reap test-fixture agents per their pattern."
     echo "dry_run: yes"
   else
     echo "create: ok"
+    # Beta20 L2 Variant 3A — surface refresh status + manual recovery
+    # path so the operator sees the wedge BEFORE attempting the next
+    # urgent-send/restart that would silently fall through to queue-only.
+    if [[ -n "$daemon_group_refresh_status" ]]; then
+      echo "daemon_group_refresh: $daemon_group_refresh_status"
+      case "$daemon_group_refresh_status" in
+        manual-required-sudoers)
+          echo ""
+          echo "[restart-required] daemon supplementary groups stale — automatic refresh failed: sudoers config absent or rejected."
+          echo "Run: agent-bridge init sudoers daemon-refresh --apply"
+          echo "Then retry: bash bridge-daemon.sh restart --force --internal-reason=group-refresh"
+          ;;
+        manual-required-sudo-refresh-no-gid)
+          echo ""
+          echo "[restart-required] daemon supplementary groups stale — sudo/PAM did not refresh groups on this host."
+          echo "Verify: sudo -n -u \"$(id -un)\" -H -- bash -c 'id -G'"
+          echo "Then run: bash bridge-daemon.sh restart --force"
+          ;;
+        failed-restart|failed-timeout)
+          echo ""
+          echo "[restart-required] daemon refresh failed ($daemon_group_refresh_status) — manual restart recommended."
+          echo "Run: bash bridge-daemon.sh restart --force"
+          ;;
+        manual-required-systemd-unit-stale)
+          echo ""
+          echo "[restart-required] systemd-user unit is active but its ExecStart is the legacy direct-bash shape — automatic supp-groups refresh would race Restart=always."
+          echo "Run: agent-bridge init sudoers daemon-refresh --apply"
+          echo "Then: bash scripts/install-daemon-systemd.sh --apply --enable --bridge-home \"\$BRIDGE_HOME\""
+          echo "Then retry the agent operation or run: systemctl --user restart agent-bridge-daemon.service"
+          ;;
+        manual-required-systemd-sudoers)
+          echo ""
+          echo "[restart-required] systemd-user unit is sudo-wrapped but the daemon-refresh sudoers drop-in is missing/rejecting — daemon cannot start."
+          echo "Run: agent-bridge init sudoers daemon-refresh --apply"
+          echo "Then: systemctl --user restart agent-bridge-daemon.service"
+          ;;
+        failed-systemctl-restart|failed-systemd-refresh-no-gid)
+          echo ""
+          echo "[restart-required] systemd-driven daemon refresh failed ($daemon_group_refresh_status) — supp-groups still stale."
+          echo "Run: systemctl --user restart agent-bridge-daemon.service"
+          echo "If groups still stale after restart, regenerate the unit:"
+          echo "  bash scripts/install-daemon-systemd.sh --apply --enable --bridge-home \"\$BRIDGE_HOME\""
+          ;;
+      esac
+    fi
     echo "start_dry_run: $start_dry_run_status"
     echo "$start_dry_run"
     echo "next_steps:"
@@ -4651,6 +4761,24 @@ PY
     local _delete_os_user
     _delete_os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
     bridge_isolation_v2_reap_isolated_agent_account "$agent" "$_delete_os_user"
+
+    # Beta20 L2 Variant 3A — stale-extra-gid cleanup. The deleted agent's
+    # per-agent group has been reaped, but the running daemon's
+    # supplementary set still contains the now-stale GID. Refresh so
+    # subsequent agent-create on a same-named slot reads a clean group
+    # set; non-critical for the add-side bug but tidies the symptom for
+    # heavy churn workflows.
+    if command -v bridge_daemon_refresh_after_group_membership_change >/dev/null 2>&1 \
+       && command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+      local _v2_grp_for_delete_refresh
+      _v2_grp_for_delete_refresh="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+      if [[ -n "$_v2_grp_for_delete_refresh" ]]; then
+        bridge_daemon_refresh_after_group_membership_change \
+          --group "$_v2_grp_for_delete_refresh" \
+          --reason "agent-delete:$agent" \
+          >/dev/null 2>&1 || true
+      fi
+    fi
   fi
 
   if [[ $purge_crons -eq 1 ]]; then

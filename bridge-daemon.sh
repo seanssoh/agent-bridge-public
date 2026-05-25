@@ -7456,8 +7456,65 @@ shift || true
 # entry point (forks a background daemon and returns), matching what
 # `agent-bridge daemon start` already does.
 cmd_restart() {
+  # Beta20 L2 Variant 3A — `--internal-reason=group-refresh` is the
+  # sanctioned automation path (called via sudoers-authorized sudo by
+  # `bridge_daemon_refresh_after_group_membership_change` after a
+  # controller-side `usermod -aG` so PAM/initgroups rebuilds the new
+  # daemon's supplementary group set).
+  #
+  # When `--internal-reason=group-refresh` is present:
+  #   - Emit a `daemon_restart_internal` audit row with the reason + env
+  #     so the operator has a forensic trail for non-operator restarts.
+  #   - Pass `--force` through to cmd_stop so the active-agent guard
+  #     (#314 Layer 3) doesn't block the automation (the controller has
+  #     already authorized via sudoers).
+  #   - cmd_stop still parses --force / -f exactly as before; internal
+  #     reasons are NOT taught to cmd_stop directly (keeps the operator-
+  #     facing bare-stop guard intact — codex r3 spec §5).
+  #
+  # Bare operator restart (no --internal-reason) still hits the active-
+  # agent guard via cmd_stop.
+  local internal_reason=""
+  local force_flag=""
+  local -a stop_args=()
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --internal-reason=*)
+        internal_reason="${arg#--internal-reason=}"
+        ;;
+      --force|-f)
+        force_flag="$arg"
+        stop_args+=("$arg")
+        ;;
+      *)
+        stop_args+=("$arg")
+        ;;
+    esac
+  done
+
+  if [[ -n "$internal_reason" ]]; then
+    # Sanity-check the reason against the codex r3 §3 character class
+    # before logging — paranoid because this value crosses a sudo
+    # boundary and lands in the audit log.
+    local reason_clean
+    reason_clean="$(printf '%s' "$internal_reason" | LC_ALL=C tr -c 'A-Za-z0-9_.:=,+\-' '-')"
+    bridge_audit_log daemon daemon_restart_internal daemon \
+      --detail reason="$reason_clean" \
+      --detail refresh_reason="${BRIDGE_DAEMON_REFRESH_REASON:-}" \
+      --detail caller_uid="$(id -u 2>/dev/null || printf 'unknown')" \
+      --detail force_flag="$force_flag" >/dev/null 2>&1 || true
+    # Ensure --force is passed through even if the caller forgot.
+    # Without it the active-agent guard would reject the automation
+    # path — which is exactly the wedge L2 is designed to skirt.
+    case " ${stop_args[*]} " in
+      *' --force '*|*' -f '*) ;;
+      *) stop_args+=("--force") ;;
+    esac
+  fi
+
   local stop_rc=0
-  cmd_stop "$@" || stop_rc=$?
+  cmd_stop "${stop_args[@]}" || stop_rc=$?
   if (( stop_rc != 0 )); then
     return "$stop_rc"
   fi

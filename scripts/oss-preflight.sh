@@ -128,4 +128,28 @@ if [[ -x "$repo_root/scripts/lint-heredoc-ban.sh" ]]; then
   fi
 fi
 
+# Beta20 L2 Variant 3A — release-side ratchet for the daemon-refresh
+# sudoers template + helper module. The runtime preflight row
+# (daemon_group_refresh_sudoers=ok|missing|invalid|sudo-refresh-no-gid)
+# is emitted by `agent-bridge init sudoers daemon-refresh --check`; this
+# release check just makes sure the source tree carries the template +
+# helper so a fresh install can render+install the sudoers drop-in.
+if [[ ! -f "$repo_root/scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template" ]]; then
+  echo "[oss] fail: missing scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template (L2 Variant 3A)"
+  exit 1
+fi
+if [[ ! -f "$repo_root/lib/bridge-daemon-control.sh" ]]; then
+  echo "[oss] fail: missing lib/bridge-daemon-control.sh (L2 Variant 3A)"
+  exit 1
+fi
+# Belt-and-suspenders: the template must contain the three substitution
+# placeholders so an upstream edit that drops one fails the release gate
+# rather than landing a sudoers entry with a literal `{{...}}` in it.
+for _placeholder in '{{controller_user}}' '{{bash_abs}}' '{{bridge_home_abs}}'; do
+  if ! grep -qF -- "$_placeholder" "$repo_root/scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template"; then
+    echo "[oss] fail: sudoers template missing placeholder ${_placeholder}"
+    exit 1
+  fi
+done
+
 echo "[oss] preflight passed"

@@ -618,6 +618,62 @@ if [[ $dry_run -eq 0 ]]; then
   # any failure is logged without blocking init.
   bridge_init_provision_admin_codex_pair "$host_profile_cli" "$admin_agent" "$host_profile_chosen" || true
 
+  # Beta20 L2 Variant 3A — install the daemon-refresh sudoers drop-in on
+  # Linux server hosts so subsequent `agent create --linux-user` calls
+  # can automatically refresh the daemon's supplementary groups. The
+  # helper no-ops on macOS (skipped-non-linux), on dev hosts (operators
+  # who manage their own daemons), and on systems lacking visudo. Failure
+  # is logged but does NOT block init — the operator can re-run
+  # `agent-bridge init sudoers daemon-refresh --apply` later (or live
+  # with the queue-only-fallback footgun until they do).
+  if [[ "$host_profile_chosen" == "server" ]] \
+     && [[ "$(uname -s 2>/dev/null)" == "Linux" ]] \
+     && [[ $dry_run -eq 0 ]] \
+     && command -v bridge_daemon_control_install_sudoers >/dev/null 2>&1; then
+    _init_sudoers_path=""
+    _init_sudoers_install_ok=0
+    _init_sudoers_path="$(bridge_daemon_control_install_sudoers 2>&1)" \
+      && { printf '[init] daemon-refresh sudoers: installed at %s\n' "$_init_sudoers_path"; _init_sudoers_install_ok=1; } \
+      || bridge_init_append_warning "daemon-refresh sudoers install failed — automatic supp-groups refresh will fall back to manual-required. Re-run: agent-bridge init sudoers daemon-refresh --apply"
+    # Emit the preflight diagnostic row so operators see auto-refresh
+    # status in init output without an extra step.
+    if command -v bridge_daemon_control_preflight_row >/dev/null 2>&1; then
+      printf '[init] '
+      bridge_daemon_control_preflight_row || true
+    fi
+
+    # Beta20 L2 Variant 3A r4 — when the daemon-refresh sudoers landed,
+    # regenerate the systemd-user unit with the sudo-wrapped ExecStart
+    # so subsequent systemd-driven daemon starts cross the PAM refresh
+    # boundary. Without this, a stale systemd-user manager re-spawns
+    # the daemon with frozen supp groups and the r3 ad-hoc sudo
+    # restart from the runtime helper would lose the race with
+    # Restart=always. The install-daemon-systemd.sh auto-detects the
+    # sudoers drop-in and renders the sudo-wrapped unit on its own;
+    # we just re-run --apply + reload + restart-if-active. Non-fatal
+    # — failure leaves the operator with the legacy direct unit and a
+    # clear remediation path.
+    if (( _init_sudoers_install_ok == 1 )) \
+       && command -v systemctl >/dev/null 2>&1; then
+      _init_systemd_rc=0
+      "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/install-daemon-systemd.sh" \
+        --bridge-home "$BRIDGE_HOME" --apply \
+        || _init_systemd_rc=$?
+      if (( _init_systemd_rc == 0 )); then
+        if systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null; then
+          systemctl --user daemon-reload || true
+          systemctl --user restart agent-bridge-daemon.service \
+            || bridge_init_append_warning "systemctl --user restart agent-bridge-daemon.service failed after unit regen — retry manually with: systemctl --user restart agent-bridge-daemon.service"
+          printf '[init] systemd-user unit regenerated (sudo-self) and restarted\n'
+        else
+          printf '[init] systemd-user unit regenerated (sudo-self) — service not active, will pick up on next start\n'
+        fi
+      else
+        bridge_init_append_warning "install-daemon-systemd.sh --apply returned rc=$_init_systemd_rc — unit may still carry legacy ExecStart. Re-run: $BRIDGE_HOME/scripts/install-daemon-systemd.sh --bridge-home $BRIDGE_HOME --apply"
+      fi
+    fi
+  fi
+
   # Track D follow-up to #713 / #809, follow-on to #833: auto-register the
   # picker-sweep bridge-native cron. The helper is idempotent (short-circuits
   # when a job titled `picker-sweep` already exists), and the registered cron

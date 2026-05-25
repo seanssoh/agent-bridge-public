@@ -506,6 +506,91 @@ EOF
       ;;
     init)
       shift
+      # Beta20 L2 Variant 3A — `agent-bridge init sudoers daemon-refresh
+      # --apply|--check` intercept. Handled here BEFORE the exec to
+      # bridge-init.sh so the helper module loaded via bridge-lib.sh
+      # (sourced at the top of this file) is in-scope. The first-install
+      # path still routes through bridge-init.sh which calls the same
+      # helper after host-profile detection.
+      if [[ "${1:-}" == "sudoers" && "${2:-}" == "daemon-refresh" ]]; then
+        shift 2
+        _SUDO_REFRESH_MODE=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --apply) _SUDO_REFRESH_MODE="apply"; shift ;;
+            --check) _SUDO_REFRESH_MODE="check"; shift ;;
+            -h|--help)
+              cat <<EOF
+Usage: agent-bridge init sudoers daemon-refresh [--apply | --check]
+
+Manage the user-/install-scoped sudoers drop-in that authorizes the
+controller user to restart its own daemon for supplementary-groups
+refresh (post agent create / delete / isolate).
+
+  --apply   Render the template, validate with visudo -cf, install
+            atomically at /etc/sudoers.d/agent-bridge-daemon-refresh-<user>-<id>
+            (mode 0440 root:root). Requires sudo at install time.
+  --check   Verify the file is present, valid, and matches the expected
+            content. Probes sudo+PAM refresh via 'sudo -n -u <user> -H
+            bash -c id -G' and prints a one-line status row.
+
+Linux-only. On macOS this is a no-op and exits 0.
+
+See codex r3 spec at /tmp/agb-6270-l2-variant3a-r3.md for the security
+contract (named user, narrow command authorization, visudo validation).
+EOF
+              exit 0
+              ;;
+            *)
+              echo "[error] init sudoers daemon-refresh: unknown arg: $1" >&2
+              echo "Use --apply, --check, or --help." >&2
+              exit 2
+              ;;
+          esac
+        done
+        if [[ -z "$_SUDO_REFRESH_MODE" ]]; then
+          echo "[error] init sudoers daemon-refresh: --apply or --check required" >&2
+          exit 2
+        fi
+        # Linux gate via the helper (which no-ops on non-Linux).
+        if [[ "$(uname -s 2>/dev/null)" != "Linux" ]]; then
+          printf 'daemon_group_refresh_sudoers=skipped-non-linux\n'
+          exit 0
+        fi
+        case "$_SUDO_REFRESH_MODE" in
+          apply)
+            _INSTALL_PATH=""
+            _INSTALL_PATH="$(bridge_daemon_control_install_sudoers 2>&1)" || {
+              echo "[error] sudoers install failed:" >&2
+              printf '%s\n' "$_INSTALL_PATH" >&2
+              exit 1
+            }
+            printf 'installed: %s\n' "$_INSTALL_PATH"
+            # Verify + probe after install so the operator sees the
+            # diagnostic in one shot.
+            _CHECK_STATUS=""
+            _CHECK_STATUS="$(bridge_daemon_control_check_sudoers 2>/dev/null || true)"
+            printf 'daemon_group_refresh_sudoers=%s\n' "${_CHECK_STATUS:-invalid}"
+            case "$_CHECK_STATUS" in
+              ok) exit 0 ;;
+              sudo-refresh-no-gid)
+                echo "[warning] sudo invoke succeeded but PAM did NOT refresh supplementary groups." >&2
+                echo "          Verify with: sudo -n -u \"$(id -un)\" -H -- bash -c 'id -G'" >&2
+                exit 1
+                ;;
+              *) exit 1 ;;
+            esac
+            ;;
+          check)
+            _CHECK_STATUS="$(bridge_daemon_control_check_sudoers 2>/dev/null || true)"
+            printf 'daemon_group_refresh_sudoers=%s\n' "${_CHECK_STATUS:-missing}"
+            case "$_CHECK_STATUS" in
+              ok) exit 0 ;;
+              *) exit 1 ;;
+            esac
+            ;;
+        esac
+      fi
       exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-init.sh" "$@"
       ;;
     version)
