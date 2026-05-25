@@ -397,20 +397,21 @@ outbox_list_staleness_fields() {
     --title "staleness probe" --body "stale row body" >/dev/null
 
   # Age the row: set created_ts AND next_attempt_ts to (now-3600).
-  python3 - "$BRIDGE_STATE_DIR/handoff/outbox.db" <<'PY'
+  # python3 -c invocation (NOT heredoc-stdin) to satisfy lint-heredoc-ban
+  # baseline (footgun #11 class — no <<'PY' to subprocess).
+  python3 -c "
 import sqlite3, sys, time
 db = sys.argv[1]
 conn = sqlite3.connect(db)
 now = int(time.time())
 old = now - 3600
 conn.execute(
-    "UPDATE outbox SET created_ts=?, next_attempt_ts=?, updated_ts=? "
-    "WHERE status='pending'",
+    \"UPDATE outbox SET created_ts=?, next_attempt_ts=?, updated_ts=? WHERE status='pending'\",
     (old, old, old),
 )
 conn.commit()
 conn.close()
-PY
+" "$BRIDGE_STATE_DIR/handoff/outbox.db"
 
   local list_out
   list_out="$(sender_outbox outbox list)"
