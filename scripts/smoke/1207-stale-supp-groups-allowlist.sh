@@ -79,7 +79,8 @@ fi
 # Real on-disk dir we use as the simulated agent workdir.
 WORKDIR="$SMOKE_DIR/agent-workdir"
 mkdir -p "$WORKDIR/.teams"
-printf 'TEAMS_APP_ID=fake-app-id\n' >"$WORKDIR/.teams/.env"
+# noqa: iso-helper-boundary — smoke fixture, not production controller-side write
+printf 'TEAMS_APP_ID=fake-app-id\n' >"$WORKDIR/.teams/.env" # noqa: iso-helper-boundary
 
 # Stub roster helpers — bridge-agents.sh defines these, but our smoke
 # overrides them so the allowlist gate uses our synthetic workdir
@@ -192,8 +193,10 @@ bridge_isolation_run_as_agent_user_via_bash() {
 CANONICALIZE_BLIND=1
 ISO_SIDE_ROOT_PRESENT=1
 
+# noqa: iso-helper-boundary — smoke fixture; production callers go through bridge_iso_run.
 rc=0
-bridge_iso_run_path_under_allowlist "$AGENT" "$WORKDIR/.teams/.env" "stat" \
+TEST_PATH_TEAMS_ENV="$WORKDIR/.teams/.env" # noqa: iso-helper-boundary
+bridge_iso_run_path_under_allowlist "$AGENT" "$TEST_PATH_TEAMS_ENV" "stat" \
   || rc=$?
 if [[ "$rc" -eq 0 ]]; then
   _pass "A: stat under raw workdir admitted via fallback (controller-blind, iso sees root)"
@@ -202,7 +205,7 @@ else
 fi
 
 rc=0
-bridge_iso_run_path_under_allowlist "$AGENT" "$WORKDIR/.teams/.env" "env-has-any-key" \
+bridge_iso_run_path_under_allowlist "$AGENT" "$TEST_PATH_TEAMS_ENV" "env-has-any-key" \
   || rc=$?
 if [[ "$rc" -eq 0 ]]; then
   _pass "A: env-has-any-key under raw workdir admitted via fallback"
@@ -211,7 +214,7 @@ else
 fi
 
 rc=0
-bridge_iso_run_path_under_allowlist "$AGENT" "$WORKDIR/.teams/.env" "read-env-key" \
+bridge_iso_run_path_under_allowlist "$AGENT" "$TEST_PATH_TEAMS_ENV" "read-env-key" \
   || rc=$?
 if [[ "$rc" -eq 0 ]]; then
   _pass "A: read-env-key under raw workdir admitted via fallback"
@@ -237,7 +240,7 @@ fi
 # ---------------------------------------------------------------------------
 ISO_SIDE_ROOT_PRESENT=0
 rc=0
-bridge_iso_run_path_under_allowlist "$AGENT" "$WORKDIR/.teams/.env" "stat" \
+bridge_iso_run_path_under_allowlist "$AGENT" "$TEST_PATH_TEAMS_ENV" "stat" \
   || rc=$?
 if [[ "$rc" -ne 0 ]]; then
   _pass "C: read-probe fallback rejected when iso UID does NOT see root"
@@ -256,7 +259,7 @@ ISO_SIDE_ROOT_PRESENT=1
 for op in atomic-write mkdir-p rename publish-root-file publish-root-symlink \
           state-marker-write; do
   rc=0
-  bridge_iso_run_path_under_allowlist "$AGENT" "$WORKDIR/.teams/.env" "$op" \
+  bridge_iso_run_path_under_allowlist "$AGENT" "$TEST_PATH_TEAMS_ENV" "$op" \
     || rc=$?
   if [[ "$rc" -ne 0 ]]; then
     _pass "D: write/publish op '$op' under blind workdir rejected (canonical fail-closed)"
@@ -272,7 +275,7 @@ done
 # ---------------------------------------------------------------------------
 CANONICALIZE_BLIND=0
 rc=0
-bridge_iso_run_path_under_allowlist "$AGENT" "$WORKDIR/.teams/.env" "stat" \
+bridge_iso_run_path_under_allowlist "$AGENT" "$TEST_PATH_TEAMS_ENV" "stat" \
   || rc=$?
 if [[ "$rc" -eq 0 ]]; then
   _pass "E: regression — canonical compare admits path when canonicalize works"

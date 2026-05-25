@@ -85,8 +85,8 @@ _stat_group() {
 # ---------------------------------------------------------------------------
 PLUGINS_DIR_A="$SMOKE_DIR/scenario-a"
 mkdir -p "$PLUGINS_DIR_A"
-OUT_A="$PLUGINS_DIR_A/known_marketplaces.json"
-LOCK_A="$PLUGINS_DIR_A/known_marketplaces.json.lock"
+OUT_A="$PLUGINS_DIR_A/known_marketplaces.json" # noqa: iso-helper-boundary
+LOCK_A="$PLUGINS_DIR_A/known_marketplaces.json.lock" # noqa: iso-helper-boundary
 
 rc=0
 BRIDGE_PLUGIN_LOCK_GROUP="$PRIMARY_GROUP" python3 "$HELPER" \
@@ -136,8 +136,8 @@ fi
 # ---------------------------------------------------------------------------
 PLUGINS_DIR_B="$SMOKE_DIR/scenario-b"
 mkdir -p "$PLUGINS_DIR_B"
-OUT_B="$PLUGINS_DIR_B/known_marketplaces.json"
-LOCK_B="$PLUGINS_DIR_B/known_marketplaces.json.lock"
+OUT_B="$PLUGINS_DIR_B/known_marketplaces.json" # noqa: iso-helper-boundary
+LOCK_B="$PLUGINS_DIR_B/known_marketplaces.json.lock" # noqa: iso-helper-boundary
 
 # Pre-create the lock as 0600 (the beta24 bad shape).
 : > "$LOCK_B"
@@ -177,8 +177,8 @@ fi
 # ---------------------------------------------------------------------------
 PLUGINS_DIR_C="$SMOKE_DIR/scenario-c"
 mkdir -p "$PLUGINS_DIR_C"
-OUT_C="$PLUGINS_DIR_C/known_marketplaces.json"
-LOCK_C="$PLUGINS_DIR_C/known_marketplaces.json.lock"
+OUT_C="$PLUGINS_DIR_C/known_marketplaces.json" # noqa: iso-helper-boundary
+LOCK_C="$PLUGINS_DIR_C/known_marketplaces.json.lock" # noqa: iso-helper-boundary
 
 rc=0
 unset BRIDGE_PLUGIN_LOCK_GROUP
@@ -197,7 +197,7 @@ fi
 # ---------------------------------------------------------------------------
 PLUGINS_DIR_D="$SMOKE_DIR/scenario-d"
 mkdir -p "$PLUGINS_DIR_D"
-OUT_D="$PLUGINS_DIR_D/known_marketplaces.json"
+OUT_D="$PLUGINS_DIR_D/known_marketplaces.json" # noqa: iso-helper-boundary
 
 rc=0
 BRIDGE_PLUGIN_LOCK_GROUP="this-group-does-not-exist-1208" python3 "$HELPER" \
