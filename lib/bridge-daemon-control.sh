@@ -446,16 +446,33 @@ bridge_daemon_refresh_after_group_membership_change() {
         return 1
       fi
 
-      # r4: confirm exactly one bridge-daemon.sh run process is live
-      # (codex r4 risk note — KillMode=process + sudo-wrapped ExecStart
-      # could in principle leave orphan children if a previous restart
-      # was racy). We don't fail the refresh on >1 daemon — log it as
-      # a warning so the operator can investigate, but the GID check
-      # above already proves the resolved daemon is correct.
-      local _daemon_count
-      _daemon_count="$(pgrep -fc "bridge-daemon.sh run" 2>/dev/null || printf '0')"
-      if [[ "$_daemon_count" =~ ^[0-9]+$ ]] && (( _daemon_count > 1 )); then
-        bridge_warn "daemon-refresh: systemd-restart left $_daemon_count live bridge-daemon.sh run processes (expected 1) — pid=$_new_pid is the cmdline-verified primary"
+      # r4: confirm exactly one ACTUAL `bash bridge-daemon.sh run`
+      # process is live (codex r4 risk note — KillMode=process +
+      # sudo-wrapped ExecStart could in principle leave orphan
+      # children if a previous restart was racy). We don't fail the
+      # refresh on >1 daemon — log it as a warning so the operator
+      # can investigate, but the GID check above already proves the
+      # resolved daemon is correct.
+      #
+      # Implementation: enumerate /proc/<pid>/comm and /proc/<pid>/cmdline
+      # directly so we can exclude pgrep's own self-match. Looking for
+      # bash processes (comm == bash) whose cmdline ends with the
+      # bridge-daemon.sh run shape (no trailing arg). The sudo wrapper
+      # is excluded by the comm filter.
+      local _daemon_count=0
+      local _proc_entry _proc_pid _proc_comm _proc_cmdline
+      for _proc_entry in /proc/[0-9]*; do
+        [[ -d "$_proc_entry" ]] || continue
+        _proc_pid="${_proc_entry##*/}"
+        _proc_comm="$(cat "$_proc_entry/comm" 2>/dev/null || true)"
+        [[ "$_proc_comm" == "bash" ]] || continue
+        _proc_cmdline="$(tr '\0' ' ' <"$_proc_entry/cmdline" 2>/dev/null || true)"
+        case "$_proc_cmdline" in
+          *"bridge-daemon.sh run "|*"bridge-daemon.sh run") _daemon_count=$(( _daemon_count + 1 )) ;;
+        esac
+      done
+      if (( _daemon_count > 1 )); then
+        bridge_warn "daemon-refresh: systemd-restart left $_daemon_count live bash bridge-daemon.sh run processes (expected 1) — pid=$_new_pid is the cmdline-verified primary"
       fi
 
       bridge_audit_log daemon daemon_refresh_systemd_sudo_self daemon \
