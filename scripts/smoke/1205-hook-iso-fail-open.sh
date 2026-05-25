@@ -100,14 +100,14 @@ build_family_a_driver() {
     printf '%s\n' '    return module'
     printf '%s\n' ''
     printf '%s\n' 'def main() -> int:'
-    printf '%s\n' '    hooks_dir = Path(os.environ["DRIVER_HOOKS_DIR"]).resolve()'
-    printf '%s\n' '    repo_root = Path(os.environ["DRIVER_REPO_ROOT"]).resolve()'
+    printf '%s\n' '    hooks_dir = Path(os.environ["DRIVER_HOOKS_DIR"]).resolve()'  # noqa: iso-helper-boundary
+    printf '%s\n' '    repo_root = Path(os.environ["DRIVER_REPO_ROOT"]).resolve()'  # noqa: iso-helper-boundary
     # hooks_dir must come first on sys.path so tool-policy can import
     # bridge_hook_common as a module (its sys.path.insert mirrors this).
     printf '%s\n' '    sys.path.insert(0, str(hooks_dir))'
     printf '%s\n' '    sys.path.insert(0, str(repo_root / "lib"))'
     printf '%s\n' '    tp = load_module("tool_policy", hooks_dir / "tool-policy.py")'
-    printf '%s\n' '    agent = os.environ.get("DRIVER_AGENT", "smoke_agent")'
+    printf '%s\n' '    agent = os.environ.get("DRIVER_AGENT", "smoke_agent")'  # noqa: iso-helper-boundary
     printf '%s\n' '    try:'
     printf '%s\n' '        result = tp.other_agent_homes(agent)'
     printf '%s\n' '    except Exception as exc:'
@@ -148,9 +148,9 @@ build_family_b_driver() {
     printf '%s\n' '    return module'
     printf '%s\n' ''
     printf '%s\n' 'def main() -> int:'
-    printf '%s\n' '    common_path = Path(os.environ["DRIVER_HOOK_COMMON_PATH"])'
+    printf '%s\n' '    common_path = Path(os.environ["DRIVER_HOOK_COMMON_PATH"])'  # noqa: iso-helper-boundary
     printf '%s\n' '    module = load_module(common_path)'
-    printf '%s\n' '    agent = os.environ.get("DRIVER_AGENT", "smoke_agent")'
+    printf '%s\n' '    agent = os.environ.get("DRIVER_AGENT", "smoke_agent")'  # noqa: iso-helper-boundary
     printf '%s\n' '    try:'
     printf '%s\n' '        module.save_timestamp_state(agent, {"session_started_at": 1, "last_prompt_at": 2})'
     printf '%s\n' '    except Exception as exc:'
