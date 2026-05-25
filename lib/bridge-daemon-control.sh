@@ -388,31 +388,43 @@ bridge_daemon_refresh_after_group_membership_change() {
     return 1
   fi
 
-  # Step 7: poll new PID file for daemon up. The restart path exits as
-  # soon as the new daemon forks, but bridge_daemon_pid resolves via the
-  # cmdline-verified resolver so we wait until the new pid is observable.
+  # Step 7: poll for a live, cmdline-verified daemon with the target
+  # GID in its /proc/<pid>/status Groups line.
+  #
+  # NOTE: we deliberately do NOT key on `new_pid != daemon_pid`. The
+  # Linux kernel commonly recycles a freshly-freed PID for the very
+  # next process, so the new daemon often inherits the OLD daemon's
+  # PID number — observed live on agb-clean-test. The right
+  # discriminator is "daemon's supp set now contains the target GID",
+  # which is the load-bearing check anyway (the whole reason we
+  # restart). bridge_daemon_pid is cmdline-verified per #683, so a
+  # recycled-pid-pointing-to-some-other-process is still rejected.
   local waited=0
   local new_pid=""
+  local daemon_has_gid=0
   while (( waited < 10 )); do
     new_pid="$(bridge_daemon_pid 2>/dev/null || true)"
-    if [[ -n "$new_pid" ]] && kill -0 "$new_pid" 2>/dev/null \
-        && [[ "$new_pid" != "$daemon_pid" ]]; then
-      break
+    if [[ -n "$new_pid" ]] && kill -0 "$new_pid" 2>/dev/null; then
+      if _bridge_daemon_control_daemon_has_gid "$target_gid"; then
+        daemon_has_gid=1
+        break
+      fi
     fi
     sleep 1
     waited=$(( waited + 1 ))
-    new_pid=""
   done
-  if [[ -z "$new_pid" ]]; then
+
+  if [[ -z "$new_pid" ]] || ! kill -0 "$new_pid" 2>/dev/null; then
     bridge_warn "daemon-refresh: new daemon pid did not appear within 10s"
     printf 'failed-timeout'
     return 1
   fi
 
-  # Step 8: verify new daemon's Groups contains the target GID. If PAM
-  # didn't refresh (unusual sudo configuration), flag manual-required so
-  # the operator sees the diagnostic.
-  if ! _bridge_daemon_control_daemon_has_gid "$target_gid"; then
+  # Step 8: if the daemon is up but doesn't have the target GID after
+  # the poll window, sudo/PAM did NOT refresh supp groups. Surface the
+  # diagnostic so the operator knows to investigate /etc/pam.d/sudo or
+  # the host's nsswitch.conf rather than chase non-existent bugs.
+  if (( daemon_has_gid == 0 )); then
     bridge_warn "daemon-refresh: new daemon pid=$new_pid does NOT have GID $target_gid in supp groups — sudo/PAM did not refresh"
     printf 'manual-required-sudo-refresh-no-gid'
     return 1
