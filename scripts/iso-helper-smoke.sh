@@ -377,50 +377,15 @@ fi
 # ---- Test: Python adapter ---------------------------------------------------
 
 # Validate lib/bridge_iso_paths.py:iso_run dispatches correctly to the CLI.
-python3 - "$REPO_ROOT" "$SANDBOX" "$AGENT" <<'PY_SMOKE'
-import sys
-from pathlib import Path
-
-repo_root = sys.argv[1]
-sandbox = sys.argv[2]
-agent = sys.argv[3]
-sys.path.insert(0, str(Path(repo_root) / "lib"))
-
-from bridge_iso_paths import iso_run  # noqa
-
-# Stat the file we wrote earlier.
-result = iso_run(agent, "stat", path=f"{sandbox}/present.txt", test="exists")
-if result.returncode != 0:
-    print(f"py-smoke: stat exists FAIL rc={result.returncode}", file=sys.stderr)
-    sys.exit(1)
-
-# Read it back.
-result = iso_run(agent, "read-file", path=f"{sandbox}/present.txt")
-if result.returncode != 0 or result.stdout.strip() != "hello":
-    print(f"py-smoke: read-file FAIL rc={result.returncode} out={result.stdout!r}", file=sys.stderr)
-    sys.exit(1)
-
-# Write via stdin.
-result = iso_run(
-    agent, "atomic-write",
-    path=f"{sandbox}/py-write.out", mode="0644", stdin="py-payload\n",
-)
-if result.returncode != 0:
-    print(f"py-smoke: atomic-write FAIL rc={result.returncode} stderr={result.stderr!r}", file=sys.stderr)
-    sys.exit(1)
-written = Path(f"{sandbox}/py-write.out").read_text()
-if written != "py-payload\n":
-    print(f"py-smoke: payload mismatch {written!r}", file=sys.stderr)
-    sys.exit(1)
-
-# Unsafe path → 40.
-result = iso_run(agent, "stat", path="/etc/passwd", test="exists")
-if result.returncode != 40:
-    print(f"py-smoke: unsafe path FAIL rc={result.returncode}", file=sys.stderr)
-    sys.exit(1)
-
-print("py-smoke: OK")
-PY_SMOKE
+#
+# Body extracted to a standalone file-as-argv helper in PR #1216 r2
+# (codex r1 needs-more) so the C3 interpreter-heredoc class the
+# `lib/upgrade-helpers/` migration was designed to eliminate (footgun
+# #11 / lint-heredoc-ban) does not persist here either. The helper
+# itself is git-tracked beside this smoke; the contract is identical
+# to the previous heredoc form.
+python3 "$SCRIPT_DIR/smoke/iso-helper-smoke-py-roundtrip.py" \
+  "$REPO_ROOT" "$SANDBOX" "$AGENT"
 rc=$?
 if [[ "$rc" -eq 0 ]]; then
   _pass "Python adapter (bridge_iso_paths.iso_run) round-trip"

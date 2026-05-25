@@ -190,19 +190,21 @@ fi
 # T6 — source guard A: `_under_isolated_uid` body must NOT reference
 # `current_isolated_agent` or `BRIDGE_AGENT_ISOLATION_MODE`.
 # Extract the function body via awk (between the `def` line and the next
-# top-level `def`).
+# top-level `def`), stage it into a tmpfile so the grep guards can read it
+# via argv instead of a here-string (footgun #11 / lint-heredoc-ban H3).
 # ---------------------------------------------------------------------------
-T6_BODY="$(awk '
+T6_BODY_FILE="$SMOKE_DIR/t6-body.txt"
+awk '
   /^def _under_isolated_uid\b/ { capture=1; next }
   capture && /^def [A-Za-z_]/ { capture=0 }
   capture { print }
-' "$HOOK_COMMON")"
+' "$HOOK_COMMON" >"$T6_BODY_FILE"
 
 T6_ERRORS=""
-if grep -E '^[^#]*\bcurrent_isolated_agent\(' <<<"$T6_BODY" >/dev/null; then
+if grep -E '^[^#]*\bcurrent_isolated_agent\(' "$T6_BODY_FILE" >/dev/null; then
   T6_ERRORS+="_under_isolated_uid body references current_isolated_agent(); "
 fi
-if grep -E '^[^#]*BRIDGE_AGENT_ISOLATION_MODE' <<<"$T6_BODY" >/dev/null; then
+if grep -E '^[^#]*BRIDGE_AGENT_ISOLATION_MODE' "$T6_BODY_FILE" >/dev/null; then
   T6_ERRORS+="_under_isolated_uid body references BRIDGE_AGENT_ISOLATION_MODE; "
 fi
 if [[ -z "$T6_ERRORS" ]]; then
@@ -215,13 +217,14 @@ fi
 # T7 — source guard B: `current_isolated_agent` body must NOT reference
 # `BRIDGE_AGENT_ISOLATION_MODE`.
 # ---------------------------------------------------------------------------
-T7_BODY="$(awk '
+T7_BODY_FILE="$SMOKE_DIR/t7-body.txt"
+awk '
   /^def current_isolated_agent\b/ { capture=1; next }
   capture && /^def [A-Za-z_]/ { capture=0 }
   capture { print }
-' "$HOOK_COMMON")"
+' "$HOOK_COMMON" >"$T7_BODY_FILE"
 
-if grep -E '^[^#]*BRIDGE_AGENT_ISOLATION_MODE' <<<"$T7_BODY" >/dev/null; then
+if grep -E '^[^#]*BRIDGE_AGENT_ISOLATION_MODE' "$T7_BODY_FILE" >/dev/null; then
   _fail "T7" "current_isolated_agent body still references BRIDGE_AGENT_ISOLATION_MODE"
 else
   _pass "T7: source guard B — current_isolated_agent body free of mode-string deps"

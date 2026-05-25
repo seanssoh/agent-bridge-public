@@ -235,23 +235,35 @@ fi
 # T10 — `bridge_agent_channel_runtime_ready_for_item` uses
 # `bridge_channel_access_file_present` (not raw `[[ -f ]]`) for the
 # access.json checks. Source-level grep assertion.
+#
+# Body staged to a tmpfile so the grep guards read it via argv instead
+# of a here-string (footgun #11 / lint-heredoc-ban H3).
 # ---------------------------------------------------------------------------
-T10_BODY="$(awk '
+T10_BODY_FILE="$SMOKE_DIR/t10-body.txt"
+awk '
   /^bridge_agent_channel_runtime_ready_for_item\(\) \{$/ { capture=1 }
   capture { print }
   capture && /^\}$/ { exit }
-' "$AGENTS_FILE")"
+' "$AGENTS_FILE" >"$T10_BODY_FILE"
 
 T10_ERRORS=""
 # Should not contain a raw `-f "$dir/access.json"` test anymore. Ignore
 # comment lines (which reference the old pattern in past tense for
-# documentation purposes).
-if grep -vE '^\s*#' <<<"$T10_BODY" | grep -E '\[\[ -f "\$dir/access\.json" \]\]' >/dev/null; then
+# documentation purposes). Stage non-comment lines into a tmpfile to
+# avoid `<<< $VAR` + pipe chain.
+T10_NONCOMMENT_FILE="$SMOKE_DIR/t10-noncomment.txt"
+grep -vE '^\s*#' "$T10_BODY_FILE" >"$T10_NONCOMMENT_FILE" || true
+if grep -E '\[\[ -f "\$dir/access\.json" \]\]' "$T10_NONCOMMENT_FILE" >/dev/null; then
   T10_ERRORS+="bridge_agent_channel_runtime_ready_for_item still uses raw [[ -f \$dir/access.json ]]; "
 fi
 # Should contain at least 4 calls to bridge_channel_access_file_present
 # (discord/telegram/teams/mattermost).
-CALLS_COUNT="$(grep -cE 'bridge_channel_access_file_present "\$dir/access\.json" "\$agent"' <<<"$T10_BODY")"
+CALLS_COUNT="$(grep -cE 'bridge_channel_access_file_present "\$dir/access\.json" "\$agent"' "$T10_BODY_FILE" || true)"
+# `grep -c` returns 0 with empty stdout when not invoked via pipe stdin;
+# the explicit `|| true` keeps `set -uo pipefail` happy.
+if [[ -z "$CALLS_COUNT" ]]; then
+  CALLS_COUNT=0
+fi
 if [[ "$CALLS_COUNT" -lt 4 ]]; then
   T10_ERRORS+="expected >=4 bridge_channel_access_file_present calls, got $CALLS_COUNT; "
 fi
@@ -266,17 +278,19 @@ fi
 # return at the top of `bridge_channel_env_file_readiness` must NOT
 # reappear (would re-introduce the bug the fix closes).
 # ---------------------------------------------------------------------------
-T11_BODY="$(awk '
+T11_BODY_FILE="$SMOKE_DIR/t11-body.txt"
+awk '
   /^bridge_channel_env_file_readiness\(\) \{$/ { capture=1 }
   capture { print }
   capture && /^\}$/ { exit }
-' "$AGENTS_FILE")"
+' "$AGENTS_FILE" >"$T11_BODY_FILE"
 
-# The first 10 lines of the function body must not contain the early
+# The first 15 lines of the function body must not contain the early
 # `[[ ! -e ` test. (Later in the function the `-r` controller-read
 # probe still appears legitimately.)
-T11_HEAD="$(printf '%s\n' "$T11_BODY" | head -n 15)"
-if grep -E '^\s*if \[\[ ! -e "\$file" \]\]' <<<"$T11_HEAD" >/dev/null; then
+T11_HEAD_FILE="$SMOKE_DIR/t11-head.txt"
+head -n 15 "$T11_BODY_FILE" >"$T11_HEAD_FILE"
+if grep -E '^\s*if \[\[ ! -e "\$file" \]\]' "$T11_HEAD_FILE" >/dev/null; then
   _fail "T11" "early '[[ ! -e \"\$file\" ]] -> missing' return reintroduced — defeats #1214 fix"
 else
   _pass "T11: source guard — early -e short-circuit not reintroduced"

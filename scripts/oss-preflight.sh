@@ -38,7 +38,19 @@ check_email_patterns() {
 
   matches="$(rg -n --color never -e '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "${scan_files[@]}" || true)"
   # Public plugin manifests may use non-routable placeholder contacts.
-  matches="$(printf '%s\n' "$matches" | grep -Ev '@(agent-bridge\.local|example\.com|example\.test|local\.invalid|tenant\.com)([^A-Za-z0-9.-]|$)|@odata\.(bind|id|type)' || true)"
+  #
+  # The `git@github.com:` carve-out matches the canonical SSH URL prefix
+  # GitHub publishes (e.g. `git@github.com:<org>/<repo>.git`). It is a
+  # well-known URL form, not a contact address, and appears in:
+  #   - bridge-dev-plugin-cache.py (`_GITHUB_SSH_PREFIX` constant + the
+  #     `git@github.com:<org>/<repo>.git → <org>-<repo>` docstring)
+  #   - lib/bridge-agents.sh (the inline parity validator's same constant)
+  #   - tests/isolation-plugin-sharing.sh (alias-parse parity fixture)
+  #   - CHANGELOG.md (PR-C summary listing the five URL forms parsed).
+  # The match anchors on the literal `github.com:` host + colon so it
+  # cannot mask a real Gmail/Outlook/etc. contact address that happens
+  # to contain `github` in the local-part.
+  matches="$(printf '%s\n' "$matches" | grep -Ev '@(agent-bridge\.local|example\.com|example\.test|local\.invalid|tenant\.com)([^A-Za-z0-9.-]|$)|@odata\.(bind|id|type)|\bgit@github\.com:' || true)"
   if [[ -n "$matches" ]]; then
     echo "[oss] fail: email addresses in tracked content"
     echo "$matches"
