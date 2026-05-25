@@ -32,6 +32,7 @@ from bridge_hook_common import (  # noqa: E402
     load_guard_module,
     path_within,
     truncate_text,
+    under_isolated_uid,
     write_audit,
 )
 
@@ -405,8 +406,41 @@ def other_agent_homes(agent: str) -> list[Path]:
     root = agent_home_root()
     if not root.exists():
         return homes
-    for candidate in root.iterdir():
-        if not candidate.is_dir():
+    # Issue #1205 Family A: under iso v2 the agent-home root is owned by
+    # the controller with mode ``drwx--x---`` — the isolated UID has
+    # traverse-only permission and ``iterdir()`` raises PermissionError.
+    # That is the iso v2 contract working as designed (cross-agent peer
+    # enumeration is intentionally blocked from the iso UID). Catching
+    # PermissionError + OSError and returning ``[]`` under iso is safe
+    # because the OS already enforces the cross-agent boundary;
+    # downstream consumers (`target_agent_for_*`) failing to match a
+    # peer from the iso UID is fine. Controller-side callers still
+    # raise so a genuine permission regression continues to surface.
+    try:
+        candidates = list(root.iterdir())
+    except (PermissionError, OSError):
+        if under_isolated_uid():
+            try:
+                write_audit(
+                    "hook_permission_fail_open.agent_home_enumeration",
+                    str(root),
+                    {"operation": "iterdir"},
+                )
+            except Exception:  # noqa: BLE001 — best-effort, never block hooks
+                pass
+            return homes
+        raise
+    for candidate in candidates:
+        # ``is_dir()`` can also raise under iso (broken / dangling /
+        # cross-UID permission) — same gate: under iso skip, controller
+        # re-raises.
+        try:
+            is_dir = candidate.is_dir()
+        except (PermissionError, OSError):
+            if under_isolated_uid():
+                continue
+            raise
+        if not is_dir:
             continue
         name = candidate.name
         if not name:
