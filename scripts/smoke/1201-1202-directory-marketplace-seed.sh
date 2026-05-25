@@ -28,10 +28,12 @@
 #   T4. idempotency: re-running the mirror does not destroy / move the
 #       dir inode, and refreshes file content in place.
 #   T5. mirror refuses unsafe marketplace ids (defense in depth).
-#   T6. `bridge_linux_share_plugin_catalog` is exercised on Linux (skipped
-#       on macOS dev hosts): the per-UID `installed_plugins.json`,
-#       `known_marketplaces.json`, and `marketplaces/<id>` symlink end up
-#       at the expected paths once the seed mirror exists.
+#   T6. mirror dir is discoverable through `bridge_known_marketplace_info`
+#       as `present:directory` with the mirror tree as `source-dir`
+#       (the contract `bridge_linux_share_plugin_catalog` consumes to
+#       plant the iso UID's `marketplaces/<id>` symlink). codex r2
+#       SHOULD-FIX 2: previously a permanent skip; now exercises the
+#       discovery helper directly on every host (Linux + macOS).
 #   T7. `bridge_ensure_claude_plugin_enabled` does NOT invoke
 #       `claude plugin install` when the SHARED-cache bridge manifest
 #       declares the spec for an isolated v2 agent.
@@ -41,6 +43,10 @@
 #   T9. `bridge_ensure_claude_plugin_enabled` fails closed with seed
 #       guidance and does NOT invoke `claude plugin install` when both
 #       manifests are silent.
+#   T10. caller-level: `bridge_plugins_cmd_seed` exits non-zero, does
+#        NOT print `[ok] seeded`, and does NOT run D2 propagation when
+#        the mirror helper fails. codex r2 SHOULD-FIX 3 / catches the
+#        BLOCKING 1 downgrade-to-warning class at the CALLER level.
 #
 # Isolation: temp BRIDGE_HOME via smoke_setup_bridge_home (v2 layout).
 # `claude` is replaced by a stub binary that records invocations to a
@@ -101,6 +107,17 @@ export PATH="$STUB_BIN_DIR:$PATH"
 export BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT="$SMOKE_TMP_ROOT/iso-homes"
 mkdir -p "$BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT"
 
+# codex r2 (BLOCKING 2): `bridge_claude_plugin_status` +
+# `bridge_ensure_claude_plugin_enabled` now gate on
+# `bridge_agent_linux_user_isolation_effective`, which requires uname -s
+# == Linux. The platform helper honors `BRIDGE_HOST_PLATFORM_OVERRIDE`
+# (lib/bridge-agents.sh:1015-1021); pin it to "Linux" so the
+# effective-isolation predicate evaluates true on macOS dev hosts AND on
+# Linux CI runners. Without this, T7/T8/T9 on macOS would fall through
+# the iso-v2 short-circuit and the `claude` stub would be invoked,
+# producing a false "passes on macOS, fails on CI" signal.
+export BRIDGE_HOST_PLATFORM_OVERRIDE="Linux"
+
 # Source the bridge libraries. bridge-lib.sh sources core/isolation
 # v2/agents/etc.; bridge-plugins.sh defines the mirror helper. The
 # BRIDGE_PLUGINS_LIB_ONLY=1 guard inhibits the CLI dispatcher at the
@@ -127,20 +144,20 @@ mkdir -p "$EXTERNAL_MARKETPLACE_ROOT/.git/refs"
 {
   printf '{\n'
   printf '  "name": "%s",\n' "$EXTERNAL_MARKETPLACE_NAME"
-  printf '  "version": "0.0.1",\n'
   printf '  "owner": {"name": "smoke"},\n'
   printf '  "plugins": [\n'
-  printf '    {\n'
-  printf '      "name": "smoke-plugin",\n'
-  printf '      "source": {"source": "directory", "path": "./plugins/smoke-plugin"}\n'
-  printf '    }\n'
+  printf '    {"name": "smoke-plugin", "source": "./plugins/smoke-plugin", "version": "0.0.1"}\n'
   printf '  ]\n'
   printf '}\n'
 } >"$EXTERNAL_MARKETPLACE_ROOT/.claude-plugin/marketplace.json"
 
+# Plugin manifest format matches what `bridge-dev-plugin-cache.py sync`
+# expects: `<plugin>/.claude-plugin/plugin.json`. The sync helper reads
+# this to verify the plugin exists at the declared source path.
+mkdir -p "$EXTERNAL_MARKETPLACE_ROOT/plugins/smoke-plugin/.claude-plugin"
 {
   printf '{"name": "smoke-plugin", "version": "0.0.1"}\n'
-} >"$EXTERNAL_MARKETPLACE_ROOT/plugins/smoke-plugin/plugin.json"
+} >"$EXTERNAL_MARKETPLACE_ROOT/plugins/smoke-plugin/.claude-plugin/plugin.json"
 
 # .git fixture — must NOT be mirrored.
 printf 'ref: refs/heads/main\n' >"$EXTERNAL_MARKETPLACE_ROOT/.git/HEAD"
@@ -162,8 +179,8 @@ test_mirror_creates_subtree() {
     || smoke_fail "T1: expected mirror dir $MIRROR_ROOT to exist"
   smoke_assert_file_exists "$MIRROR_ROOT/.claude-plugin/marketplace.json" \
     "T1 mirror carries .claude-plugin/marketplace.json"
-  smoke_assert_file_exists "$MIRROR_ROOT/plugins/smoke-plugin/plugin.json" \
-    "T1 mirror carries plugins/smoke-plugin/plugin.json"
+  smoke_assert_file_exists "$MIRROR_ROOT/plugins/smoke-plugin/.claude-plugin/plugin.json" \
+    "T1 mirror carries plugins/smoke-plugin/.claude-plugin/plugin.json"
 }
 
 test_mirror_excludes_git() {
@@ -251,26 +268,80 @@ test_mirror_rejects_unsafe_id() {
     || smoke_fail "T5: unsafe id created an escape path"
 }
 
-# --- T6: bridge_linux_share_plugin_catalog ------------------------------
-# This requires the shared-cache manifest to exist + the per-UID prepare
-# pipeline to actually run. The full pipeline pulls in sudo/chown which
-# we cannot reliably exercise without root. Mark as Linux-rootless skip;
-# the iso-plugin-sharing test under tests/isolation-plugin-sharing.sh is
-# the end-to-end Linux check the brief explicitly defers to.
-test_share_plugin_catalog_smoke_skip() {
-  if ! smoke_is_linux; then
-    smoke_skip "T6 share-plugin-catalog" "non-Linux (full Linux pipeline pulls sudo/chown)"
-    return 0
-  fi
-  if [[ "$(id -u)" != "0" ]] && ! sudo -n true 2>/dev/null; then
-    smoke_skip "T6 share-plugin-catalog" "rootless host without passwordless sudo (covered by tests/isolation-plugin-sharing.sh)"
-    return 0
-  fi
-  # If we ever land in a root-or-sudo Linux CI, the existing
-  # tests/isolation-plugin-sharing.sh is the right driver — leave the
-  # hook here so a future fixture can be wired up without renaming the
-  # smoke.
-  smoke_skip "T6 share-plugin-catalog" "deferred to tests/isolation-plugin-sharing.sh end-to-end driver"
+# --- T6: mirror discoverable through bridge_known_marketplace_info -------
+# codex r2 SHOULD-FIX 2: T6 used to be a permanent skip. Replace with a
+# focused assertion that validates the load-bearing property the #1201
+# fix is supposed to enable: the controller-side mirror created by T1
+# MUST be discoverable through `bridge_known_marketplace_info`
+# (lib/bridge-agents.sh:1664) as a `present:directory` source for the
+# marketplace. Without this, the iso-side symlink planter at
+# lib/bridge-agents.sh:2849 would skip the marketplace and the warning
+# "no controller-side mirror exists" would fire on every `agent create`.
+#
+# We exercise the discovery helper directly rather than the full
+# `bridge_linux_share_plugin_catalog` pipeline because the latter pulls
+# in real Linux UIDs/groups (`ab-agent-<name>`) that CI runners do not
+# provision. The full end-to-end driver remains
+# `tests/isolation-plugin-sharing.sh` (Linux + root or passwordless
+# sudo + `useradd`/`groupadd` available), which the brief explicitly
+# defers to.
+#
+# macOS dev hosts: T1 already created the mirror via rsync (the
+# platform discriminator only no-ops chgrp/setgid, not the file copy),
+# so we can exercise the discovery contract identically on macOS.
+test_mirror_discoverable_via_known_marketplace_info() {
+  # Compose a synthetic controller-side `known_marketplaces.json`
+  # declaring our smoke marketplace as a directory source. The helper
+  # consults this file and looks under `<plugins_root>/marketplaces/<id>`
+  # for the actual tree — which T1 already populated.
+  local known_path="$PLUGINS_CACHE/known_marketplaces.json"  # noqa: iso-helper-boundary
+  python3 -c '
+import json, sys
+out = sys.argv[1]
+mkt = sys.argv[2]
+data = {
+    mkt: {
+        "source": {"source": "directory", "path": sys.argv[3]},
+    },
+}
+with open(out, "w") as f:
+    json.dump(data, f)
+' "$known_path" "$EXTERNAL_MARKETPLACE_NAME" "$EXTERNAL_MARKETPLACE_ROOT"
+
+  # Invoke the discovery helper. Expected output format:
+  #   "present:directory\t<source-dir>\t<alias>[ \t<alias>...]"
+  # The `<source-dir>` MUST resolve to the mirror dir T1 wrote — that
+  # is what `bridge_linux_share_plugin_catalog` then symlinks into the
+  # iso UID's `~/.claude/plugins/marketplaces/<alias>`.
+  local mkt_info
+  mkt_info="$(bridge_known_marketplace_info "$EXTERNAL_MARKETPLACE_NAME" "$PLUGINS_CACHE" 2>&1)"
+  case "$mkt_info" in
+    present:directory*) : ;;
+    *)
+      smoke_fail "T6: bridge_known_marketplace_info did not return present:directory for mirrored marketplace (got: $mkt_info)"
+      ;;
+  esac
+
+  # Verify the source-dir field points at the mirror dir, not the
+  # original external root. The format is tab-separated; field 2 is the
+  # canonicalized source dir. Use awk for portable extraction (no `<<<`
+  # here-string, footgun #11).
+  local source_dir
+  source_dir="$(printf '%s\n' "$mkt_info" | awk -F'\t' '{print $2; exit}')"
+  local expected_mirror
+  expected_mirror="$(cd -P "$MIRROR_ROOT" 2>/dev/null && pwd -P)"
+  smoke_assert_eq "$expected_mirror" "$source_dir" \
+    "T6 source-dir field must point at the mirror tree (not original external root)"
+
+  # And confirm the marketplace alias (id) is among the alias list
+  # (field 3+).
+  case "$mkt_info" in
+    *$'\t'"$EXTERNAL_MARKETPLACE_NAME"|*$'\t'"$EXTERNAL_MARKETPLACE_NAME"$'\t'*)
+      : ;;
+    *)
+      smoke_fail "T6: expected marketplace alias '$EXTERNAL_MARKETPLACE_NAME' in helper output (got: $mkt_info)"
+      ;;
+  esac
 }
 
 # --- T7/T8/T9: ensure helper fail-closed contract ------------------------
@@ -291,7 +362,7 @@ setup_iso_agent_in_roster() {
 
 write_shared_cache_manifest_declaring() {
   local spec="$1"
-  local out="$PLUGINS_CACHE/installed_plugins.json"
+  local out="$PLUGINS_CACHE/installed_plugins.json"  # noqa: iso-helper-boundary
   # Render via python3 -c (string arg, not heredoc-stdin) so the body
   # never traverses a shell here-doc class footgun #11 path.
   python3 -c '
@@ -315,13 +386,13 @@ out, spec = sys.argv[1], sys.argv[2]
 data = {"plugins": {spec: []}}
 with open(out, "w") as f:
     json.dump(data, f)
-' "$dir/installed_plugins.json" "$spec"
+' "$dir/installed_plugins.json" "$spec"  # noqa: iso-helper-boundary
 }
 
 clear_manifests() {
   local os_user="$1"
-  rm -f "$PLUGINS_CACHE/installed_plugins.json" 2>/dev/null || true
-  rm -f "$BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT/$os_user/.claude/plugins/installed_plugins.json" 2>/dev/null || true
+  rm -f "$PLUGINS_CACHE/installed_plugins.json" 2>/dev/null || true  # noqa: iso-helper-boundary
+  rm -f "$BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT/$os_user/.claude/plugins/installed_plugins.json" 2>/dev/null || true  # noqa: iso-helper-boundary
 }
 
 claude_log_lines() {
@@ -411,16 +482,74 @@ test_ensure_fails_closed_when_silent() {
   esac
 }
 
+# --- T10: caller-level seed must fail when mirror creation fails ---------
+# codex r2 SHOULD-FIX 3: catch the BLOCKING 1 regression class at the
+# CALLER level, not just at the helper. The seed function must propagate
+# helper failure into a non-zero exit code, NOT print `[ok] seeded`, and
+# NOT run D2 propagation. We force the failure by overriding the mirror
+# helper with a stub that always returns 1, then invoke
+# `bridge_plugins_cmd_seed` in a subshell so a `bridge_die` exit cannot
+# abort the smoke runner.
+#
+# The subshell also stubs `bridge_plugins_seed_propagate_iso_known_marketplaces`
+# with a sentinel-file writer so we can prove D2 was never invoked.
+test_seed_fatal_on_mirror_failure() {
+  local marker="$SMOKE_TMP_ROOT/t10-d2-was-called.marker"
+  rm -f "$marker"
+  local out_file="$SMOKE_TMP_ROOT/t10-stdout.log"
+  local err_file="$SMOKE_TMP_ROOT/t10-stderr.log"
+  local rc=0
+  (
+    set +e
+    # Override the helper to force failure regardless of input.
+    bridge_plugins_seed_mirror_marketplace_root() {
+      printf '[t10-stub] forced mirror failure\n' >&2
+      return 1
+    }
+    # Sentinel: D2 was called if this writes the marker. Asserted below.
+    bridge_plugins_seed_propagate_iso_known_marketplaces() {
+      printf 'd2-called\n' >"$marker"
+      return 0
+    }
+    bridge_plugins_cmd_seed \
+      --marketplace-root "$EXTERNAL_MARKETPLACE_ROOT" \
+      --channels "plugin:smoke-plugin@${EXTERNAL_MARKETPLACE_NAME}"
+  ) >"$out_file" 2>"$err_file" || rc=$?
+
+  [[ "$rc" != "0" ]] \
+    || smoke_fail "T10: bridge_plugins_cmd_seed must exit non-zero when mirror creation fails (got rc=0; stdout: $(cat "$out_file"); stderr: $(cat "$err_file"))"
+
+  if grep -Fq "[ok] seeded" "$out_file" 2>/dev/null; then
+    smoke_fail "T10: bridge_plugins_cmd_seed must NOT print '[ok] seeded' on mirror failure (stdout: $(cat "$out_file"))"
+  fi
+
+  [[ ! -f "$marker" ]] \
+    || smoke_fail "T10: D2 propagation MUST NOT run after mirror failure (sentinel exists at $marker)"
+
+  # The fail-loud error must mention the marketplace name + the
+  # `marketplaces/` mirror path so operators have actionable context.
+  local err_text
+  err_text="$(cat "$err_file" 2>/dev/null || printf '')"
+  case "$err_text" in
+    *"$EXTERNAL_MARKETPLACE_NAME"*"marketplaces"*)
+      : ;;
+    *)
+      smoke_fail "T10: bridge_die message must reference the marketplace id + 'marketplaces/' mirror path (got: $err_text)"
+      ;;
+  esac
+}
+
 main() {
   smoke_run "T1: mirror creates subtree" test_mirror_creates_subtree
   smoke_run "T2: mirror excludes .git/" test_mirror_excludes_git
   smoke_run "T3: canonical modes (linux-only)" test_mirror_canonical_modes_linux
   smoke_run "T4: mirror idempotency in-place" test_mirror_idempotent_in_place
   smoke_run "T5: unsafe id rejected" test_mirror_rejects_unsafe_id
-  smoke_run "T6: share-plugin-catalog (linux-root-only)" test_share_plugin_catalog_smoke_skip
+  smoke_run "T6: mirror discoverable via known_marketplace_info" test_mirror_discoverable_via_known_marketplace_info
   smoke_run "T7: ensure trusts shared-cache manifest" test_ensure_trusts_shared_cache_manifest
   smoke_run "T8: ensure trusts per-UID manifest" test_ensure_trusts_per_uid_manifest
   smoke_run "T9: ensure fails closed with seed guidance" test_ensure_fails_closed_when_silent
+  smoke_run "T10: seed fatal on mirror failure (caller-level)" test_seed_fatal_on_mirror_failure
   smoke_log "passed"
 }
 
