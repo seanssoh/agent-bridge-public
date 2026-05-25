@@ -354,6 +354,95 @@ mode, invoked from `scripts/oss-preflight.sh`) is preserved for
 back-compat and remains the floor for `bridge-upgrade.sh` and
 `bridge-agent.sh` specifically.
 
+### 8. controller→iso boundary — `bridge_iso_run` (v0.14.5-beta23+)
+
+Every controller→isolated-agent boundary read, write, mkdir, stat, and
+root-publish operation now goes through the unified `bridge_iso_run`
+facade in `lib/bridge-isolation-helpers.sh`. Two execution classes
+share the same entrypoint:
+
+1. **agent op** — drops to the isolated UID via existing passwordless
+   sudoers; used for read/stat/mkdir/atomic-write/state-marker/
+   scan-profile of agent-owned runtime files.
+2. **root-publish op** — controller-published writes for root-owned
+   per-agent metadata (`installed_plugins.json`,
+   `known_marketplaces.json`). Strict path allowlist + final
+   owner/group/mode enforcement. The iso UID must NOT be able to
+   rewrite its own plugin allowlist (security boundary).
+
+Shell signature:
+
+```
+bridge_iso_run --agent <agent> --op <op> [op-args]
+```
+
+Op catalog: `stat`, `read-file`, `read-json`, `env-has-any-key`,
+`read-env-key`, `mkdir-p`, `atomic-write`, `rename`,
+`state-marker-write`, `scan-profile`, `publish-root-file`,
+`publish-root-symlink`. Full header in
+`lib/bridge-isolation-helpers.sh`.
+
+Structured return codes:
+
+- `0` success
+- `10` agent not linux-user isolated (caller used `--legacy-ok`)
+- `20` sudo unavailable / passwordless sudoers missing
+- `30` path absent
+- `31` semantic missing key (`env-has-any-key`)
+- `32` unreadable even to the isolated UID
+- `40` unsafe path (not under allowlisted per-agent root)
+
+Python callers use the thin adapter
+`lib/bridge_iso_paths.py:iso_run(agent, op, ...)` which shells out to
+`agent-bridge iso-run` and inherits the same op catalog + rc band.
+
+**Path allowlist** (lexical prefix, supports not-yet-created paths):
+
+- `bridge_agent_workdir <agent>`
+- `bridge_agent_default_home <agent>`
+- `bridge_agent_linux_user_home <os_user-for-agent>` (when isolated)
+- `bridge_agent_idle_marker_dir <agent>`
+- `BRIDGE_ISO_RUN_ALLOWLIST_EXTRA` (colon-separated; smoke tests and
+  rare overrides only — never set in production)
+
+Unknown roots → `rc 40`.
+
+**Footgun #11 compliance**: the helper body uses pipe-only stdin to
+the `sudo -n -u <os_user> bash -c '<inline-script>'` chain. NO
+heredoc-stdin, NO `<<<` here-string, NO `done < <(...)` capture in
+any op script. Callers that stream payloads (`atomic-write`,
+`state-marker-write`, `publish-root-file`) must use a producer
+pipeline (`printf '%s\n' "$body" | bridge_iso_run --stdin ...`).
+
+**Ratchet**: `scripts/iso-helper-ratchet.sh` scans tracked source for
+boundary callsites and enforces baseline-by-count regression gate.
+Baseline at `scripts/baselines/iso-helper-baseline.txt`; whole-file
+allowlist at `scripts/baselines/iso-helper-allowlist.txt`. Sister to
+`scripts/lint-raw-pathlib-on-isolated.sh` and
+`scripts/lint-heredoc-ban.sh`. To intentionally migrate a site:
+update the code, run `--update-baseline`, commit the reduced
+baseline in the same PR.
+
+**Smoke**: `scripts/iso-helper-smoke.sh` exercises 20 unit checks
+against the non-isolated direct codepath. The isolated path requires
+a real provisioned `agent-bridge-<slug>` linux-user + sudoers entry
+and is covered by the live-install acceptance matrix.
+
+The compatibility wrappers
+`bridge_isolation_run_as_agent_user_via_bash` and
+`bridge_isolation_write_file_as_agent_user_via_bash` remain in
+`lib/bridge-isolation-helpers.sh` and are internally consumed by
+`bridge_iso_run`; legacy callers may still call them directly.
+
+The pre-existing root-publish writers
+(`bridge_write_isolated_known_marketplaces_catalog`,
+`bridge_write_isolated_installed_plugins_manifest`) ARE the
+compatibility wrappers for the `--op publish-root-file` boundary
+(security-critical chown/chgrp/chmod/mv chain); they implement the
+same contract internally and remain in place because their
+catalog-filtering work is non-trivial. New callsites that need a
+root-published per-agent manifest write should call `bridge_iso_run`.
+
 ## 6. 개발할 때의 기본 작업 흐름
 
 ### 상태 파악

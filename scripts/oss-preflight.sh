@@ -128,6 +128,17 @@ if [[ -x "$repo_root/scripts/lint-heredoc-ban.sh" ]]; then
   fi
 fi
 
+# beta23 Option A — controller->isolated boundary ratchet. Enforces
+# that no new raw boundary callsite is added beyond
+# scripts/baselines/iso-helper-baseline.txt. See
+# scripts/iso-helper-ratchet.sh for policy.
+if [[ -x "$repo_root/scripts/iso-helper-ratchet.sh" ]]; then
+  if ! "$repo_root/scripts/iso-helper-ratchet.sh"; then
+    echo "[oss] iso-helper boundary ratchet failed — see scripts/iso-helper-ratchet.sh policy"
+    exit 1
+  fi
+fi
+
 # Beta20 L2 Variant 3A — release-side ratchet for the daemon-refresh
 # sudoers template + helper module. The runtime preflight row
 # (daemon_group_refresh_sudoers=ok|missing|invalid|sudo-refresh-no-gid)
