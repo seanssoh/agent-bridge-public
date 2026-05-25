@@ -1084,11 +1084,16 @@ bridge_isolation_v2_install_tree_matrix_rows() {
   # in `_bridge_iso_reconcile_row_dir_recursive` itself.
   if [[ -d "$data_root/plugins" ]]; then
     local _plugin_subdir _plugin_subname
-    # nullglob via subshell — we don't want to mutate the caller's shopt.
-    # `compgen -G` is the simpler primitive (file_glob row uses it too);
-    # use it here so a no-match produces an empty stream rather than the
-    # literal pattern.
-    while IFS= read -r _plugin_subdir; do
+    # Iterate via shell glob in a save/restore-nullglob block. Avoids
+    # `< <(compgen -G ...)` procsub (footgun #11 class — lint-heredoc-ban
+    # ratchet rejects). `nullglob` makes the no-match case produce an
+    # empty list instead of the literal pattern.
+    local _nullglob_saved
+    _nullglob_saved="$(shopt -p nullglob 2>/dev/null || printf 'shopt -u nullglob\n')"
+    shopt -s nullglob
+    local -a _plugin_subdirs=( "$data_root/plugins"/* )
+    eval "$_nullglob_saved"
+    for _plugin_subdir in "${_plugin_subdirs[@]}"; do
       [[ -n "$_plugin_subdir" && -d "$_plugin_subdir" ]] || continue
       _plugin_subname="$(basename -- "$_plugin_subdir")"
       # `marketplaces` is a Claude-cache namespace under
@@ -1104,7 +1109,7 @@ bridge_isolation_v2_install_tree_matrix_rows() {
       [[ "$_plugin_subname" == "known_marketplaces.json" ]] && continue
       printf '%s\n' \
         "plugins-channel-tree-${_plugin_subname}|install|$_plugin_subdir|dir_recursive|controller|ab-shared|-|-|0|1|inherit|direct|optional|per-channel plugin tree ($_plugin_subname) chgrp -R ab-shared + g+rX so iso UIDs can read package files; *.lock + secrets protected by guard"
-    done < <(compgen -G "$data_root/plugins/*" 2>/dev/null || true)
+    done
   fi
   printf '%s\n' \
     "agents-root|install|$data_root/agents|dir|controller|ab-shared|0710|-|0|0|inherit|direct|required|per-agent runtime-home root — controller rwX, group --x for traverse to each per-agent leaf without listing the full agent inventory (iso UIDs must traverse to their own home, not see siblings)"

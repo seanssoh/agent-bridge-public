@@ -465,6 +465,12 @@ bridge_plugins_seed_propagate_iso_known_marketplaces() {
   local propagated=0
   local skipped=0
   local failed=0
+  # Materialize $eligible to a tmp file so the `while read` consumer
+  # avoids `<<<` here-string / `<()` procsub — both rejected by the
+  # lint-heredoc-ban ratchet (footgun #11 class). Cleanup after loop.
+  local _eligible_stream_tmp
+  _eligible_stream_tmp="$(mktemp)" || { bridge_warn "[plugins seed] D2: mktemp failed"; return 1; }
+  printf '%s\n' "$eligible" > "$_eligible_stream_tmp"
   while IFS= read -r agent; do
     [[ -n "$agent" ]] || continue
     local agent_channels=""
@@ -532,7 +538,8 @@ bridge_plugins_seed_propagate_iso_known_marketplaces() {
     bridge_linux_sudo_root chmod 0640 "$iso_known" >/dev/null 2>&1 \
       || bridge_warn "[plugins seed] D2: chmod 0640 $iso_known failed (agent '$agent')"
     ((propagated++)) || true
-  done <<<"$eligible"
+  done < "$_eligible_stream_tmp"
+  rm -f "$_eligible_stream_tmp" 2>/dev/null || true
 
   bridge_info "[plugins seed] D2: propagated=$propagated skipped=$skipped failed=$failed (target marketplace='$mkt_name')"
   if (( failed > 0 )); then
@@ -547,8 +554,15 @@ _bridge_plugins_seed_channels_csv_uses_marketplace() {
   local csv="${1:-}"
   local mkt="${2:-}"
   [[ -n "$csv" && -n "$mkt" ]] || return 1
+  # Split CSV via parameter expansion to avoid `<<<` here-string
+  # (footgun #11 class, lint-heredoc-ban ratchet rejects it).
   local -a items=()
-  IFS=',' read -r -a items <<<"$csv"
+  local _csv_rest="$csv"
+  while [[ -n "$_csv_rest" ]]; do
+    items+=("${_csv_rest%%,*}")
+    [[ "$_csv_rest" == *","* ]] || break
+    _csv_rest="${_csv_rest#*,}"
+  done
   local item plugin_spec marketplace
   for item in "${items[@]}"; do
     # trim whitespace
