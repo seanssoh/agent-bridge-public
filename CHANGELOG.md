@@ -6,6 +6,184 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta26] — 2026-05-26
+
+### Highlight — 4-track OOTB clean closure
+
+Operator-cued **twenty-sixth prerelease**. Closes the residual iso v2
+OOTB blockers that surfaced during beta25 fresh-agent verify on
+cm-prod-agentworkflow-vm01: the third-party marketplace SessionStart
+hook gap, the bash assoc-array/scalar-export collision that silently
+bypassed PR #1206's fail-open for ~12 hours, the channel-validator
+early-missing-return that the beta25 read-fallback couldn't reach, and
+the `.ms365` directory mode that needed an exec bit.
+
+After this release, fresh OOTB `agent create test_iso --linux-user
+--channels plugin:teams,plugin:ms365,plugin:cosmax-*` →
+`agent start` should succeed **without any operator `sg`, `chown`,
+`chmod`, or `settings.json` manual patch**, and the hook traceback
+noise that was previously visible to operators (claimed fixed in
+beta25 but silently bypassed) should finally be gone.
+
+`-beta26` prerelease; matching tag `v0.14.5-beta26`, GitHub release
+marked **Pre-release**. Stay on beta per Sean's standing rule.
+
+### Fixed — #1212 bridge-hooks.py @agent-bridge filter blocks third-party plugin hooks (#1216)
+
+- **`bridge-hooks.py`** — `agent_bridge_development_plugin_settings()`
+  drops the `value.endswith("@agent-bridge")` filter at lines 106-107.
+  Accepts any `plugin:<name>@<marketplace>` spec. Uses `rsplit("@", 1)`
+  so marketplace is the rightmost segment. Deduplicates full plugin
+  specs preserving insertion order for `enabledPlugins`. Collects
+  marketplace ids from all accepted specs.
+- `extraKnownMarketplaces` now emits per-marketplace entries with
+  shape `{ "source": { "source": "directory", "path": "<mirror>" } }`.
+  `agent-bridge` entry unchanged (path = `BRIDGE_HOME`). Third-party
+  marketplace path = `$BRIDGE_HOME/data/shared/plugins-cache/
+  marketplaces/<marketplace-id>` (the beta24 D4 mirror).
+- Safety guards: marketplace id matches `[A-Za-z0-9._-]+`, not `.` or
+  `..`, no leading dot, `(marketplaces_root / id).is_dir()`. Plugin
+  stays in `enabledPlugins` even if mirror missing.
+- Effect: third-party marketplace plugins' SessionStart hooks now fire
+  on agent launch. CRM token-sync hook substitutes the real M365
+  access token into the cached `.mcp.json` before claude reads it, so
+  CRM HTTP MCP tools register correctly on first session start.
+
+### Fixed — #1213 bash assoc-array vs scalar-export collision bypasses fail-open (#1216)
+
+- **Root cause**: `bridge-run.sh:212-213` did
+  `export BRIDGE_AGENT_ISOLATION_MODE="$(...)"` for a name already
+  bound to `declare -g -A BRIDGE_AGENT_ISOLATION_MODE` in
+  `lib/bridge-agents.sh:3410`. Bash silently writes the value to
+  `NAME[0]` and refuses to export the assoc array. Child claude env
+  had no `BRIDGE_AGENT_ISOLATION_MODE` entry. PR #1206's
+  `_under_isolated_uid()` predicate required this var equal
+  `"linux-user"`, so it returned False under iso v2, the fail-open
+  branch never fired, and the traceback flood Sean reported as "에러
+  미쳤네" persisted in every iso v2 session.
+- **`hooks/bridge_hook_common.py`** — introduced
+  `_current_agent_under_foreign_uid() -> str | None`, computed from
+  `BRIDGE_AGENT_ID` (set) + `BRIDGE_CONTROLLER_UID` (numeric) +
+  `os.geteuid() != controller_uid`. Used in **both**
+  `_under_isolated_uid()` and `current_isolated_agent()`. The latter
+  is also consumed by `queue_cli()` for iso hook gateway routing — if
+  only `_under_isolated_uid()` had been fixed, the env collision would
+  still keep iso hook queue ops off the gateway path.
+- Diagnostic fallback in `_current_isolation_mode()`: explicit
+  `BRIDGE_AGENT_ISOLATION_MODE` env if set, else `linux-user` when
+  foreign-UID predicate proves it, else `shared`. So tracebacks /
+  diagnostics no longer mis-report `shared` under a proven foreign UID.
+- `BRIDGE_AGENT_OS_USER` same-class collision audited: no Python hook
+  consumer depends on it (shell code reads the assoc array
+  directly). Left in place; not a runtime issue.
+- `BRIDGE_AGENT_INJECT_TIMESTAMP` has the same class of collision at
+  `bridge-run.sh:212` vs assoc array in `lib/bridge-core.sh`; hook
+  reads it at `bridge_hook_common.py:955`. Comment marker added at
+  `bridge-run.sh:212` for beta27 follow-up. Not blocking #1213 P0.
+
+### Fixed — #1214 channel-validator bypasses beta25 #1207 read-fallback (#1216)
+
+- **Root cause**: `bridge_channel_env_file_readiness` had an early
+  `[[ ! -e "$file" ]] -> missing` return at
+  `lib/bridge-agents.sh:5607-5609`. Under stale controller
+  supplementary groups, EACCES looks absent to the controller — so
+  the function returned `missing` before the beta25 #1207 read
+  fallback inside `bridge_iso_run_path_under_allowlist` could ever
+  run. beta25 release notes' #1207 closure claim was incomplete.
+- **`lib/bridge-agents.sh`** — removed the early missing-return.
+  Replaced with: controller-readable fast path
+  (`[[ -r "$file" ]]`), else if
+  `bridge_agent_linux_user_isolation_effective "$agent"`, route
+  directly through `bridge_iso_run --op env-has-any-key` **without**
+  the outer `bridge_isolation_can_sudo_to_agent` pre-gate (which had
+  its own short-circuit). rc mapping: `0 → present`, `30 → missing`,
+  `31 → missing` (semantic missing key), `32 → unreadable`,
+  `20 → controller-blind`, `40 → controller-blind` (never map a
+  permission failure to `missing`).
+- `bridge_agent_channel_runtime_ready_for_item` at
+  `lib/bridge-agents.sh:5863, 5868, 5873, 5894` now uses
+  `bridge_channel_access_file_present` (the same iso-aware probe
+  family the status-reason path already uses at `:6946, 6978, 7006,
+  7101`), so required-channel runtime readiness and status_reason
+  agree under iso v2 stale supp-groups.
+- Effect: `agent start` on a fresh iso v2 agent from a stale
+  controller shell no longer emits cryptic "missing MS365 client id"
+  / "missing Teams app id" when the file is present.
+
+### Fixed — #1215 `.ms365` directory created without exec bit (#1216)
+
+- **`bridge-setup.py`** — channel-dir call sites pass explicit
+  `mode=0o2770` to `_isolation_aware_mkdir` for `.teams`, `.discord`,
+  `.telegram`, `.mattermost`, `.ms365`. The directory needs the `x`
+  bit to be traversable; setgid keeps group inheritance.
+- **`plugins/ms365/server.ts:63-67`** — `STATE_DIR` is now
+  `mkdirSync(..., { recursive: true, mode: 0o770 })` plus an explicit
+  `chmodSync(STATE_DIR, 0o2770)` immediately after. The explicit
+  `chmodSync` repairs existing bad-mode `.ms365` directories on next
+  ms365 startup (self-heal). `tokens/` and `pending/` stay `0o700`;
+  token files and `.env` stay `0o600`.
+- **`plugins/teams/server.ts`** — same self-heal pattern for the
+  Teams `STATE_DIR`. Shared callback dirs (which have their own
+  `ab-shared`/`3770` reconciler contract) are explicitly NOT touched.
+- Effect: `setup teams` no longer leaves `.ms365` with mode
+  `drw---S---` blocking subsequent reads; operators no longer need
+  `chmod 0770 .ms365` workaround.
+
+### Added — 4 new regression smokes (#1216)
+
+- `scripts/smoke/1212-bridge-hooks-marketplace.sh` (7 tests) — 3-spec
+  launch cmd + synthetic mirror dirs + safety/idempotency cases.
+- `scripts/smoke/1213-iso-uid-predicate.sh` (8 tests) — UID-based
+  predicate matrix, source guard (no mode-string lookup in
+  `_under_isolated_uid()` body), bash array/scalar collision
+  reproducer.
+- `scripts/smoke/1214-channel-validator-iso-fallback.sh` (11 tests) —
+  stub controller-blind + stub iso probe, assert
+  `bridge_agent_runtime_channel_status_reason` doesn't false-miss; rc
+  mapping table preserved.
+- `scripts/smoke/1215-ms365-dir-mode.sh` (8 tests) — Linux-gated:
+  fresh `.ms365` mode `02770`, self-heal from `02660`, `.env` and
+  token files stay `0600`.
+- All 4 registered in both path-arm triggers AND
+  `scripts/ci-select-smoke.sh::add_all_required_static` for `__ALL__`
+  scheduled sweeps.
+
+### Fixed — CI/lint hygiene (#1216)
+
+- 6 new H3 here-string sites in 1213/1214 smokes rewritten to
+  tmpfile-staged argv form (pipe/argv-safe).
+- Pre-existing C3 site at `scripts/iso-helper-smoke.sh:380` migrated
+  to a new `scripts/smoke/iso-helper-smoke-py-roundtrip.py`
+  file-as-argv helper (file-as-argv pattern matching
+  `lib/upgrade-helpers/`). iso-helper-smoke still 25/25.
+- `scripts/oss-preflight.sh::check_email_patterns` extended with
+  `\bgit@github\.com:` carve-out anchored on the literal SSH URL
+  prefix. Pre-existing tracked SSH-URL examples in CHANGELOG.md,
+  `bridge-dev-plugin-cache.py`, `lib/bridge-agents.sh`, and
+  `tests/isolation-plugin-sharing.sh` no longer trip the preflight.
+
+### Notes
+
+- **#1204** (`TEAMS_DELIVERY_MODE` full code removal — Sean D1 verbatim
+  2026-05-26 17:22 UTC: "지워버려 필요 없는 모드잖아") — separate PR for
+  beta27 or v0.15.0 wave.
+- **#1209 + #1210** (MS365 OAuth: hardcoded `localhost:3978/auth/
+  callback` default + scope literal quotes) — patch-dev deep-dive
+  findings, beta27 / v0.15.0 scope.
+- `BRIDGE_AGENT_INJECT_TIMESTAMP` same assoc-array/scalar-export
+  collision class as #1213 — beta27 follow-up (commented at
+  `bridge-run.sh:212`).
+- Pre-existing `scripts/smoke/1121-agent-delete-os-purge.sh` C5 Linux
+  flake (warning-text mismatch `RM_F_FAIL` vs `failed to remove
+  sudoers drop-in`) has been failing across beta22-25 series; not
+  introduced by beta26. Tracked for separate hardening.
+- Adjacent hook PermissionError sites (`pre-compact.py`,
+  `session_start.py` marker writers, other `bridge_hook_common`
+  marker sites) — audit only, deferred to v0.15.0+ when actually
+  exercised.
+- Daemon supp-groups self-refresh on agent create/delete — v0.16
+  systemd design item (KNOWN_ISSUES §28).
+
 ## [0.14.5-beta25] — 2026-05-26
 
 ### Highlight — OOTB first-touch closure for iso v2 + hook fail-open
