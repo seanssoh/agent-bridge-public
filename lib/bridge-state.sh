@@ -1644,6 +1644,16 @@ bridge_state_sudo_install_v2_file() {
   # the owner — from creating the parent dir or replacing the file
   # via the direct path; sudo with the right `install` invocation
   # bypasses that without weakening the root mode.
+  #
+  # beta23 Option A: this function IS one of the compatibility wrappers
+  # for the `bridge_iso_run --op publish-root-file` boundary. The
+  # `install -m -o -g` chain is functionally equivalent to the
+  # publish-root-file op's chmod+chown+chgrp+mv sequence; the legacy
+  # `install` form is preserved here because callers
+  # (`bridge_state_write_agent_runtime`, history.env writers) pass
+  # explicit owner/group args that pre-date the per-agent group
+  # naming convention. New callsites that need a root-owned write
+  # under a v2 per-agent root should call bridge_iso_run.
   local target="$1"
   local mode="$2"
   local owner="$3"

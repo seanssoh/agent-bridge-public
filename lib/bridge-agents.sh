@@ -1859,6 +1859,18 @@ bridge_write_isolated_known_marketplaces_catalog() {
   # controller's full file. This keeps undeclared marketplaces out of isolated
   # Claude's loader and rewrites installLocation/source.path to isolated-home
   # aliases that bridge controls read-only.
+  #
+  # beta23 Option A: this function IS the controller-published, root-owned
+  # writer for `known_marketplaces.json` (the iso UID must NOT be able to
+  # rewrite its own plugin marketplace catalog — security boundary). It
+  # implements the same contract as `bridge_iso_run --op publish-root-file
+  # --mode 0640 --group-agent <agent>`: mktemp-in-dest-dir + chmod+chown+chgrp
+  # before mv -f. The mktemp + python + chown/chgrp/chmod/mv chain below
+  # IS the canonical root-publish flow; the helper-API equivalent is
+  # the publish-root-file op. New callsites that need a root-published
+  # write for an agent's plugin manifest should call bridge_iso_run;
+  # this function remains the in-place compatibility wrapper that other
+  # legacy callers depend on for the catalog-filtering work.
   local os_user="$1"
   local isolated_plugins="$2"
   local controller_plugins="$3"
@@ -2245,6 +2257,16 @@ bridge_write_isolated_installed_plugins_manifest() {
   # actually-existing location resolved by
   # bridge_resolve_plugin_install_path. The file is owned by root so the
   # isolated UID cannot tamper with which plugins it loads.
+  #
+  # beta23 Option A: this function IS the controller-published, root-owned
+  # writer for `installed_plugins.json` (security boundary: iso UID must
+  # NOT be able to rewrite its own plugin allowlist). It implements the
+  # same contract as `bridge_iso_run --op publish-root-file --mode 0640
+  # --group-agent <agent>`: mktemp-in-dest-dir + chmod+chown+chgrp BEFORE
+  # mv -f. New callsites that need a root-published per-agent plugin
+  # manifest should call bridge_iso_run; this function remains the
+  # in-place compatibility wrapper because legacy callers depend on the
+  # catalog-filtering work it performs inline.
   #
   # Arguments:
   #   os_user             — isolated UID
@@ -5585,80 +5607,70 @@ bridge_channel_env_file_readiness() {
   # controller unable to, and operators have correctly configured tokens.
   # Without this branch the daemon would emit a false channel_health_miss
   # for a healthy isolated agent.
+  # beta23 Option A: route the isolated-UID probe through the unified
+  # bridge_iso_run --op env-has-any-key facade. The structured rc band
+  # (0 ok / 31 missing-key / 32 unreadable-even-to-iso / 30 absent /
+  # 20 sudo-unavailable / 10 not-isolated / 40 unsafe-path) maps
+  # directly to the readiness enum values below.
+  #
+  # The pre-existing outer bridge_isolation_can_sudo_to_agent probe is
+  # preserved as a fast-path discriminator: when rc=2 (sudo unavailable)
+  # we still want to emit controller-blind quickly without paying the
+  # full bridge_iso_run path. When rc=1 (not isolated) we fall through
+  # to the standard unreadable path.
   if declare -F bridge_isolation_can_sudo_to_agent >/dev/null 2>&1; then
     sudo_rc=0
     bridge_isolation_can_sudo_to_agent "$agent" 2>/dev/null || sudo_rc=$?
     case "$sudo_rc" in
       0)
-        # Agent isolated AND we can sudo to its UID — probe via that UID.
-        # Self-contained inline script: tests readability and key presence
-        # without sourcing bridge-lib.sh inside the isolated UID.
-        # Exit codes from the inline script:
-        #   0 — readable and at least one nonempty matching KEY=value line
-        #   1 — readable but no matching nonempty key
-        #   2 — not readable even to the isolated UID
-        local probe_script
-        probe_script='
-file="$1"
-shift
-keys=("$@")
-[[ -r "$file" ]] || exit 2
-if [[ ${#keys[@]} -eq 0 ]]; then
-  grep -Eq "^[[:space:]]*(export[[:space:]]+)?[A-Za-z_][A-Za-z0-9_]*=[^[:space:]#]" "$file" && exit 0 || exit 1
-fi
-for k in "${keys[@]}"; do
-  grep -Eq "^[[:space:]]*(export[[:space:]]+)?${k}=[^[:space:]#].*" "$file" && exit 0
-done
-exit 1
-'
+        # Agent isolated AND we can sudo to its UID — probe via the
+        # bridge_iso_run facade. The op script lives in
+        # lib/bridge-isolation-helpers.sh:_BRIDGE_ISO_RUN_OP_ENV_HAS_ANY_KEY
+        # and matches the legacy inline body shape exactly.
+        local _iso_run_argv=(--agent "$agent" --op env-has-any-key --path "$file")
+        local _k=""
+        for _k in "$@"; do
+          _iso_run_argv+=(--key "$_k")
+        done
         probe_rc=0
-        bridge_isolation_run_as_agent_user_via_bash "$agent" "$probe_script" "$file" "$@" >/dev/null 2>&1 || probe_rc=$?
-        # The helper preserves script's exit code shifted into the 3+ band
-        # when nonzero (rc=0 stays 0; script-rc 1 -> 3; script-rc 2 -> 4).
-        # See lib/bridge-isolation-helpers.sh docstring.
+        bridge_iso_run "${_iso_run_argv[@]}" >/dev/null 2>&1 || probe_rc=$?
         case "$probe_rc" in
           0)
             : "${item}"
             printf 'present'
             return 0
             ;;
-          3)
+          31)
             : "${item}"
             printf 'missing'
             return 0
             ;;
-          4)
+          32)
             : "${item}"
             printf 'unreadable'
             return 0
             ;;
-          2)
+          30)
+            : "${item}"
+            printf 'missing'
+            return 0
+            ;;
+          20)
             # Issue #1196 (beta22): the OUTER bridge_isolation_can_sudo_to_agent
             # said sudo was OK, but the inner pre-flight inside
-            # bridge_isolation_run_as_agent_user_via_bash returned rc=2 (sudo
-            # raced/declined between the two probes — sudoers reload, ticket
-            # expiry, transient policy fault). The agent IS isolated; we just
-            # cannot prove readiness either way on THIS probe. Degrade to
-            # controller-blind, NOT unreadable: a false-negative
-            # channel_health_miss is the exact regression we are closing here.
-            # Mirrors the OUTER rc=2 mapping below.
+            # bridge_iso_run returned rc=20 (sudo raced/declined between
+            # the two probes — sudoers reload, ticket expiry, transient
+            # policy fault). The agent IS isolated; we just cannot prove
+            # readiness either way on THIS probe. Degrade to
+            # controller-blind, NOT unreadable.
             : "${item}"
             printf 'controller-blind'
             return 0
             ;;
           *)
-            # Issue #1196 (beta22): we know the OUTER sudo gate said OK (we
-            # are inside the sudo_rc=0 arm), the file exists, and the run
-            # helper returned an UNDEFINED rc (not 0/2/3/4). This is the
-            # "impossible probe error from an isolated agent" branch the
-            # codex r1 review called out: classifying as `missing` would
-            # fire a false channel_health_miss, classifying as `unreadable`
-            # would block restart on a per-restart hard-reject; neither
-            # state matches what we actually observed. Prefer
-            # controller-blind + diagnostic — caller maps to status=unknown
-            # (fail-open). The diagnostic is emitted by the dispatcher one
-            # level up via bridge_channel_env_file_acl_diagnostic when the
-            # caller observes the controller-blind reason.
+            # Undefined rc — preserve the beta22 codex r1 behaviour:
+            # prefer controller-blind + diagnostic. Caller maps to
+            # status=unknown (fail-open).
             : "${item}"
             printf 'controller-blind'
             return 0
@@ -5725,12 +5737,34 @@ exit 1
 # log; controllers without sudo simply degrade to the legacy probe
 # result.
 bridge_channel_access_file_present() {
+  # beta23 Option A: optional 2nd arg <agent_for_iso> routes through
+  # bridge_iso_run --op stat --test file when supplied. Callers in
+  # bridge_agent_runtime_channel_status_reason now pass the agent
+  # name so an isolated workdir whose access.json the controller
+  # cannot stat-directly still resolves via the iso UID.
+  #
+  # Without the agent arg the legacy controller-direct + sudo-root
+  # fallback path is taken (back-compat for callers without agent
+  # identity, e.g. operator-supplied controller-managed access files).
   local file="$1"
+  local agent_for_iso="${2:-}"
   [[ -n "$file" ]] || return 1
 
   if [[ -f "$file" ]]; then
     return 0
   fi
+
+  if [[ -n "$agent_for_iso" ]] && declare -F bridge_iso_run >/dev/null 2>&1; then
+    local iso_rc=0
+    bridge_iso_run --agent "$agent_for_iso" --op stat --path "$file" --test file \
+      >/dev/null 2>&1 || iso_rc=$?
+    case "$iso_rc" in
+      0)  return 0 ;;
+      10) ;;  # not isolated, fall through to legacy sudo-root
+      *)  ;;  # 20/30/40 — fall through to legacy
+    esac
+  fi
+
   if command -v bridge_linux_sudo_root >/dev/null 2>&1 \
       && bridge_linux_sudo_root test -f "$file" 2>/dev/null; then
     return 0
@@ -6886,7 +6920,7 @@ bridge_agent_runtime_channel_status_reason() {
     # Issue #1165 Gap 5: sudo-escalate the access.json presence probe so
     # the controller doesn't false-negative on an isolated workdir it
     # cannot stat directly. See bridge_channel_access_file_present.
-    if ! bridge_channel_access_file_present "$discord_dir/access.json"; then
+    if ! bridge_channel_access_file_present "$discord_dir/access.json" "$agent"; then
       printf 'missing Discord access file under %s (access.json required)' "$discord_dir"
       return 0
     fi
@@ -6900,7 +6934,12 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:discord:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      # beta23 Option A: removed stale `migrate isolation v3 --check`
+      # guidance. The recovery is now: provision passwordless sudoers
+      # for the controller -> agent-bridge-<slug> linux-user (see
+      # bridge_migration_sudoers_entry). The unified bridge_iso_run
+      # facade is the single boundary the operator needs to enable.
+      printf 'controller-blind:plugin:discord:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$discord_dir" "$(bridge_channel_env_file_acl_diagnostic "$discord_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6913,7 +6952,7 @@ bridge_agent_runtime_channel_status_reason() {
   if bridge_channel_csv_contains "$required" "plugin:telegram"; then
     telegram_dir="$(bridge_agent_telegram_state_dir "$agent")"
     # Issue #1165 Gap 5: sudo-escalate the access.json presence probe.
-    if ! bridge_channel_access_file_present "$telegram_dir/access.json"; then
+    if ! bridge_channel_access_file_present "$telegram_dir/access.json" "$agent"; then
       printf 'missing Telegram access file under %s (access.json required)' "$telegram_dir"
       return 0
     fi
@@ -6924,7 +6963,8 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:telegram:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      # beta23 Option A: same guidance update as discord branch above.
+      printf 'controller-blind:plugin:telegram:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$telegram_dir" "$(bridge_channel_env_file_acl_diagnostic "$telegram_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6940,7 +6980,7 @@ bridge_agent_runtime_channel_status_reason() {
     # This is the canonical reproducer site from the issue body — the
     # other three plugin branches (discord/telegram/mattermost) share
     # the same shape so the fix is applied uniformly.
-    if ! bridge_channel_access_file_present "$teams_dir/access.json"; then
+    if ! bridge_channel_access_file_present "$teams_dir/access.json" "$agent"; then
       printf 'missing Teams access file under %s (access.json required)' "$teams_dir"
       return 0
     fi
@@ -6951,7 +6991,8 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      # beta23 Option A: removed stale v3 migration guidance.
+      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$teams_dir" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6966,7 +7007,8 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      # beta23 Option A: removed stale v3 migration guidance.
+      printf 'controller-blind:plugin:teams:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$teams_dir" "$(bridge_channel_env_file_acl_diagnostic "$teams_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -6989,7 +7031,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -7004,7 +7046,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -7019,7 +7061,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      printf 'controller-blind:plugin:ms365:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$ms365_dir" "$(bridge_channel_env_file_acl_diagnostic "$ms365_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -7033,7 +7075,7 @@ bridge_agent_runtime_channel_status_reason() {
     local mattermost_dir=""
     mattermost_dir="$(bridge_agent_mattermost_state_dir "$agent")"
     # Issue #1165 Gap 5: sudo-escalate the access.json presence probe.
-    if ! bridge_channel_access_file_present "$mattermost_dir/access.json"; then
+    if ! bridge_channel_access_file_present "$mattermost_dir/access.json" "$agent"; then
       printf 'missing Mattermost access file under %s (access.json required)' "$mattermost_dir"
       return 0
     fi
@@ -7044,7 +7086,7 @@ bridge_agent_runtime_channel_status_reason() {
       return 0
     fi
     if [[ "$readiness" == "controller-blind" ]]; then
-      printf 'controller-blind:plugin:mattermost:%s/.env:no-passwordless-sudo (set BRIDGE_AGENT_SUDOERS; run: agent-bridge migrate isolation v3 --check) %s' \
+      printf 'controller-blind:plugin:mattermost:%s/.env:no-passwordless-sudo (provision BRIDGE_AGENT_SUDOERS for the iso UID) %s' \
         "$mattermost_dir" "$(bridge_channel_env_file_acl_diagnostic "$mattermost_dir/.env" "$repair_attempts")"
       return 0
     fi
@@ -7997,14 +8039,54 @@ bridge_refresh_runtime_state() {
 bridge_agent_plugin_port_from_env_file() {
   # Read a single <KEY>=<value> line from a plugin .env file and echo the
   # value if it parses as a port. Empty output on miss.
+  #
+  # beta23 Option A: when an agent name is in scope (callers pass it via
+  # the agent_for_iso optional 3rd arg), route through bridge_iso_run
+  # --op read-env-key so a controller-blind .env on an isolated agent
+  # still surfaces the value via the iso UID. Without the 3rd arg the
+  # legacy direct grep path is taken (back-compat for callers without
+  # an agent identity, e.g. operator-supplied token files outside the
+  # per-agent runtime).
   local env_file="$1"
   local key="$2"
+  local agent_for_iso="${3:-}"
   local line=""
   local value=""
 
-  [[ -n "$env_file" && -f "$env_file" ]] || return 0
+  [[ -n "$env_file" ]] || return 0
   [[ -n "$key" ]] || return 0
-  # Grab the last occurrence — plugin .env files are append-style in places.
+
+  if [[ -n "$agent_for_iso" ]] && declare -F bridge_iso_run >/dev/null 2>&1; then
+    # Path may be unreadable to controller but readable to iso UID —
+    # let bridge_iso_run sort it out. rc=0 with stdout = value.
+    local iso_rc=0
+    value="$(bridge_iso_run --agent "$agent_for_iso" --op read-env-key \
+              --path "$env_file" --key "$key" 2>/dev/null || true)"
+    iso_rc=$?
+    if [[ "$iso_rc" -eq 0 && -n "$value" ]]; then
+      # Strip surrounding quotes and whitespace, then validate as port.
+      value="${value%\"}"
+      value="${value#\"}"
+      value="${value%\'}"
+      value="${value#\'}"
+      value="${value//[[:space:]]/}"
+      if [[ "$value" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$value"
+        return 0
+      fi
+      return 0
+    fi
+    # iso_rc 10 -> not isolated; fall through to legacy direct grep.
+    # iso_rc 20/30/31/32 -> structured failure; the legacy path will
+    # produce the same empty-output behaviour without surprising
+    # operators who depended on rc=0+empty-stdout-on-miss.
+    if [[ "$iso_rc" -ne 10 ]]; then
+      return 0
+    fi
+  fi
+
+  # Legacy direct grep path (back-compat).
+  [[ -f "$env_file" ]] || return 0
   line="$(grep -E "^${key}=" "$env_file" 2>/dev/null | tail -n 1 || true)"
   [[ -n "$line" ]] || return 0
   value="${line#${key}=}"
@@ -8027,7 +8109,9 @@ bridge_agent_plugin_ports() {
   local port=""
 
   teams_env="$(bridge_agent_teams_state_dir "$agent")/.env"
-  port="$(bridge_agent_plugin_port_from_env_file "$teams_env" "TEAMS_WEBHOOK_PORT" 2>/dev/null || true)"
+  # beta23 Option A: pass agent name so the iso UID can read a
+  # controller-blind .env via bridge_iso_run --op read-env-key.
+  port="$(bridge_agent_plugin_port_from_env_file "$teams_env" "TEAMS_WEBHOOK_PORT" "$agent" 2>/dev/null || true)"
   if [[ -n "$port" ]]; then
     printf '%s\t%s\t%s\n' "$port" "bun" "teams"
   fi

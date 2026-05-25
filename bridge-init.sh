@@ -114,23 +114,34 @@ bridge_init_stage_secret() {
 }
 
 bridge_init_runtime_present() {
+  # beta23 Option A: route the controller-blind probe through
+  # bridge_iso_run --op stat. The legacy `[[ -f path ]]` direct test
+  # would false-negative on an isolated workdir the controller cannot
+  # stat (#1165 Gap 5 family). The helper transparently falls back
+  # to direct stat on non-isolated agents (rc=0 vs rc=30).
   local kind="$1"
   local agent="$2"
+  local dir=""
 
   case "$kind" in
-    discord)
-      [[ -f "$(bridge_agent_discord_state_dir "$agent")/.env" && -f "$(bridge_agent_discord_state_dir "$agent")/access.json" ]]
-      ;;
-    telegram)
-      [[ -f "$(bridge_agent_telegram_state_dir "$agent")/.env" && -f "$(bridge_agent_telegram_state_dir "$agent")/access.json" ]]
-      ;;
-    teams)
-      [[ -f "$(bridge_agent_teams_state_dir "$agent")/.env" && -f "$(bridge_agent_teams_state_dir "$agent")/access.json" ]]
-      ;;
-    *)
-      return 1
-      ;;
+    discord)  dir="$(bridge_agent_discord_state_dir "$agent")"  ;;
+    telegram) dir="$(bridge_agent_telegram_state_dir "$agent")" ;;
+    teams)    dir="$(bridge_agent_teams_state_dir "$agent")"    ;;
+    *)        return 1 ;;
   esac
+  [[ -n "$dir" ]] || return 1
+
+  if declare -F bridge_iso_run >/dev/null 2>&1; then
+    bridge_iso_run --agent "$agent" --op stat --path "$dir/.env" \
+      --test file >/dev/null 2>&1 || return 1
+    bridge_iso_run --agent "$agent" --op stat --path "$dir/access.json" \
+      --test file >/dev/null 2>&1 || return 1
+    return 0
+  fi
+
+  # Legacy fallback when bridge_iso_run is not loaded yet (very early
+  # init paths before bridge-lib has sourced the helper).
+  [[ -f "$dir/.env" && -f "$dir/access.json" ]]
 }
 
 bridge_init_append_warning() {
