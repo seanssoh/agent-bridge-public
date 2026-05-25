@@ -2251,7 +2251,8 @@ if [[ $DRY_RUN -eq 0 ]] \
   _upgrade_sudoers_install_ok=0
   if _upgrade_sudoers_path="$(BRIDGE_HOME="$TARGET_ROOT" bridge_daemon_control_install_sudoers 2>&1)"; then
     if [[ -n "$_upgrade_sudoers_path" ]]; then
-      echo "[bridge-upgrade] daemon-refresh sudoers: at $_upgrade_sudoers_path"
+      # >&2 — info goes to stderr so --json mode's stdout stays parseable
+      echo "[bridge-upgrade] daemon-refresh sudoers: at $_upgrade_sudoers_path" >&2
       _upgrade_sudoers_install_ok=1
     fi
   else
@@ -2277,12 +2278,12 @@ if [[ $DRY_RUN -eq 0 ]] \
       if systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null; then
         systemctl --user daemon-reload || true
         if systemctl --user restart agent-bridge-daemon.service 2>/dev/null; then
-          echo "[bridge-upgrade] systemd-user unit regenerated (sudo-self) and restarted"
+          echo "[bridge-upgrade] systemd-user unit regenerated (sudo-self) and restarted" >&2
         else
           echo "[bridge-upgrade] WARN: systemctl --user restart agent-bridge-daemon.service failed after unit regen — retry manually" >&2
         fi
       else
-        echo "[bridge-upgrade] systemd-user unit regenerated (sudo-self) — service not active, will pick up on next start"
+        echo "[bridge-upgrade] systemd-user unit regenerated (sudo-self) — service not active, will pick up on next start" >&2
       fi
     else
       echo "[bridge-upgrade] WARN: install-daemon-systemd.sh --apply returned rc=$_upgrade_systemd_rc — unit may carry legacy ExecStart" >&2
