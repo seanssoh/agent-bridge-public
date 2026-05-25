@@ -6,6 +6,127 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta25] — 2026-05-26
+
+### Highlight — OOTB first-touch closure for iso v2 + hook fail-open
+
+Operator-cued **twenty-fifth prerelease**. Closes the last three iso v2
+OOTB first-touch gaps surfaced during the beta23/beta24 acceptance verify
+sweep:
+
+- **#1205** — iso v2 hooks dump traceback on expected `PermissionError`.
+  Operator perceived "agb 안돼" was actually hook stderr spam; iso v2
+  filesystem boundary was working as designed. Fix wraps the two known
+  uncaught sites in iso-UID-gated `try/except`; controller/shared-mode
+  raise-on-error preserved.
+- **#1207** — controller stale supplementary groups break
+  `bridge_iso_run` allowlist canonicalization → channel-required
+  validator false-misses. KNOWN §28 escalated by beta23's
+  `bridge_iso_run` strict canonical gate. Fix adds a read/probe-only
+  literal-path fallback that uses an isolated-side existence probe to
+  distinguish stale-supp-groups vs truly-missing root. Write +
+  publish-root ops stay canonical-only — beta23 symlink-ancestor
+  escape protection is **not** weakened.
+- **#1208** — D2 plugin manifest propagation created
+  `known_marketplaces.json.lock` as `root:600`, blocking iso UID
+  catalog-write at agent start. Fix keeps the lock (race protection
+  between seed-side D2 and start-time catalog updates) but normalizes
+  metadata to `root:ab-agent-<X> 0660`. Shell-side post-normalizer
+  self-heals beta24 installs.
+
+After this release, fresh OOTB `agent create test_iso --linux-user
+--channels plugin:teams,plugin:ms365,plugin:cosmax-*` → `agent start`
+should succeed without any operator `sg`, `chown`, or `chmod`.
+
+`-beta25` prerelease; matching tag `v0.14.5-beta25`, GitHub release
+marked **Pre-release**. Stay on beta per Sean's standing rule.
+
+### Fixed — #1205 iso v2 hooks dump traceback on PermissionError (#1206)
+
+- **`hooks/bridge_hook_common.py`** — added public `under_isolated_uid()`
+  wrapper around the existing private `_under_isolated_uid()` predicate.
+  `save_timestamp_state()` now wraps the entire mkdir + write + chmod
+  + replace sequence in `try/except (PermissionError, OSError)`: under
+  iso UID return silently; controller/shared raise. Transitively fixes
+  `prompt_timestamp_context()` and `session_start.py:remember_session_start()`.
+- **`hooks/tool-policy.py`** — `other_agent_homes()` wraps
+  `root.iterdir()` AND `candidate.is_dir()` in the same iso-UID-gated
+  pattern. Returns `[]` under iso (peer enumeration is intentionally
+  blocked by iso v2 filesystem layout); re-raises under controller.
+- New host-agnostic smoke `scripts/smoke/1205-hook-iso-fail-open.sh`
+  with 6 tests including negative checks that controller UID and
+  isolation-env-absent still raise (prevents silent swallowing of
+  controller-side regressions). 5 `# noqa: iso-helper-boundary`
+  annotations on smoke generator lines for ratchet.
+
+### Fixed — #1207 stale supp-groups break bridge_iso_run allowlist canonicalization (#1211)
+
+- **`lib/bridge-isolation-helpers.sh`** — `bridge_iso_run_path_under_allowlist`
+  signature extended with `<op>` parameter; dispatcher passes it.
+- New `_bridge_iso_run_collect_raw_roster_roots` mirrors
+  `_bridge_iso_run_collect_canonical_roots` but returns only
+  bridge-owned roster roots: `bridge_agent_workdir`,
+  `bridge_agent_default_home`, `bridge_agent_linux_user_home`,
+  `bridge_agent_idle_marker_dir`. `BRIDGE_ISO_RUN_ALLOWLIST_EXTRA` is
+  **not** included.
+- New `_bridge_iso_run_op_allows_literal_fallback` op classifier:
+  allows fallback for `stat`, `read-file`, `read-json`,
+  `env-has-any-key`, `read-env-key`, `scan-profile`. Rejects fallback
+  for `mkdir-p`, `atomic-write`, `rename`, `state-marker-write`,
+  `publish-root-file`, `publish-root-symlink` (canonical-only —
+  preserves beta23 escape protection).
+- New `_bridge_iso_run_iso_side_root_exists` probe uses
+  `bridge_isolation_run_as_agent_user_via_bash` with `[[ -d "$1" ]]`
+  / `[[ -e "$1" ]]` to confirm root visible from iso UID.
+- Fallback predicate requires ALL: (a) lexically under raw roster
+  root, (b) raw path + raw root have no `..` segment and are absolute,
+  (c) canonical comparison failed because controller could not
+  canonicalize, (d) iso-side probe rc=0.
+- **`lib/bridge-agents.sh`** — diagnostic warning emitted after
+  `ensure_user_in_group` when current shell's `id -G` lacks the new
+  `ab-agent-<X>` group. Operator hint only; first-touch no longer
+  depends on the operator following the warning.
+- New smoke `scripts/smoke/1207-stale-supp-groups-allowlist.sh`
+  (14 tests including positive read/probe path + negative `..` +
+  negative iso-probe-missing + **negative write/publish-root must
+  still rc=40** key escape-protection regression check).
+
+### Fixed — #1208 known_marketplaces.json.lock created as root:600 blocks iso UID launch (#1211)
+
+- **`lib/upgrade-helpers/plugins-seed-merge-known-marketplace.py`** —
+  reads `BRIDGE_PLUGIN_LOCK_GROUP` env. After `os.open(lock_path, ...)`
+  and BEFORE `fcntl.flock`, applies `os.fchown(fd, -1, gid)` +
+  `os.fchmod(fd, 0o660)`. Falls back gracefully when env unset.
+- **`bridge-plugins.sh`** — D2 call site passes
+  `env BRIDGE_PLUGIN_LOCK_GROUP=$agent_group` to the Python helper.
+- **`bridge_plugins_seed_propagate_iso_known_marketplaces()` post-normalizer** —
+  after Python helper returns, normalizes existing
+  `$iso_plugins_dir/known_marketplaces.json.lock` AND
+  `installed_plugins.json.lock` (if present) to `root:$agent_group 0660`.
+  Self-heals beta24 installs without `agent delete --purge-home`.
+- Lock kept (NOT removed) — protects against lost read-modify-write
+  races between seed-side D2 and start-time catalog updates.
+- Data manifests (`known_marketplaces.json`, `installed_plugins.json`)
+  remain `root:ab-agent 0640` — lock is coordination state, not
+  authority over plugin allowlists.
+- New smoke `scripts/smoke/1208-lock-metadata-normalize.sh` (7 tests
+  including regression check that pre-existing `0600 root` lock is
+  normalized to `0660` + correct group).
+
+### Notes
+
+- **#1204** (`TEAMS_DELIVERY_MODE` full code removal) — Sean's D1
+  decision (verbatim 2026-05-26 17:22 UTC: "지워버려 필요 없는 모드잖아").
+  Separate PR for beta26 or v0.15.0 wave.
+- **#1209 + #1210** (MS365 OAuth: hardcoded localhost callback + scope
+  literal quotes) — patch-dev deep-dive findings, beta26 / v0.15.0
+  scope.
+- Adjacent hook PermissionError sites (`pre-compact.py`,
+  `session_start.py` marker writers, other `bridge_hook_common` marker
+  sites) — audit only, deferred to v0.15.0+ when actually exercised.
+- Daemon supp-groups self-refresh on agent create/delete — longer-term
+  v0.16 systemd design item.
+
 ## [0.14.5-beta24] — 2026-05-26
 
 ### Highlight — seed marketplace mirror + iso v2 plugin status fail-closed
