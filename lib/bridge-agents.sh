@@ -7346,7 +7346,19 @@ PY
   # This trumps the controller's `~/.claude/plugins/installed_plugins.json`
   # probe at the #852 callsite below AND the `claude plugin list`
   # fallback further down.
-  if [[ -n "$agent" ]] && bridge_agent_linux_user_isolation_requested "$agent"; then
+  #
+  # codex r2: gate on EFFECTIVE isolation rather than roster-requested
+  # isolation. `bridge_agent_linux_user_isolation_effective` checks
+  # roster mode + Linux host + os_user populated, AND `bridge_isolation_
+  # disabled_by_env` covers the BRIDGE_DISABLE_ISOLATION=1 runtime
+  # hatch that `bridge-start.sh:670-672` honors. Without this dual
+  # gate, an operator using the disable hatch on a linux-user roster
+  # would unexpectedly hit the iso-v2 fail-closed path instead of
+  # falling through to the legacy controller install flow that
+  # bridge-start.sh:907-912 still drives in disabled-mode.
+  if [[ -n "$agent" ]] \
+      && ! bridge_isolation_disabled_by_env \
+      && bridge_agent_linux_user_isolation_effective "$agent"; then
     bridge_manifest_has_spec="$(_bridge_claude_plugin_bridge_manifest_has_spec "$agent" "$plugin_spec")"
     if [[ "$bridge_manifest_has_spec" == "present" ]]; then
       printf '%s' "enabled"
@@ -7617,7 +7629,14 @@ bridge_ensure_claude_plugin_enabled() {
       # rederives the per-UID catalog via `bridge_linux_share_plugin_
       # catalog` (lib/bridge-agents.sh:4178). No `agent create` rerun
       # required.
-      if [[ -n "$agent" ]] && bridge_agent_linux_user_isolation_requested "$agent"; then
+      #
+      # codex r2: gate on EFFECTIVE isolation, matching the status
+      # probe above. See the long comment at the status-helper iso-v2
+      # short-circuit for the rationale (BRIDGE_DISABLE_ISOLATION=1
+      # runtime hatch + non-Linux host fallthrough).
+      if [[ -n "$agent" ]] \
+          && ! bridge_isolation_disabled_by_env \
+          && bridge_agent_linux_user_isolation_effective "$agent"; then
         local _seed_hint="agb plugins seed"
         if [[ -n "$marketplace" && "$marketplace" != "agent-bridge" ]]; then
           _seed_hint="agb plugins seed --marketplace-root <path-to-${marketplace}-source>"
