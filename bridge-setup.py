@@ -1199,7 +1199,14 @@ def cmd_discord(args: argparse.Namespace) -> int:
             print_result(result)
             return 0
 
-        _isolation_aware_mkdir(discord_dir, agent=args.agent)
+        # Issue #1215: pass explicit `mode=0o2770` so the channel state
+        # dir gets the setgid + rwx-for-group bits, not the helper's
+        # legacy `0o2750` default. Without the group write/exec bit
+        # the controller-side `agent start` channel-required validator
+        # cannot stat `.discord/.env` under the v2 isolation contract
+        # (drw-r-S--- on a long-running shell with stale supp-groups
+        # surfaced as `missing` on `agent start`).
+        _isolation_aware_mkdir(discord_dir, mode=0o2770, agent=args.agent)
         _isolation_aware_save_text(inspected["env_path"], f"DISCORD_BOT_TOKEN={token}\n")
         _isolation_aware_save_json(inspected["access_path"], access_doc)
         result["write_status"] = "ok"
@@ -1327,7 +1334,10 @@ def cmd_telegram(args: argparse.Namespace) -> int:
             print_telegram_result(result)
             return 0
 
-        _isolation_aware_mkdir(telegram_dir, agent=args.agent)
+        # Issue #1215: explicit `mode=0o2770` for the v2 isolation
+        # channel-state-dir contract (see discord_dir above for the
+        # rationale).
+        _isolation_aware_mkdir(telegram_dir, mode=0o2770, agent=args.agent)
         _isolation_aware_save_text(inspected["env_path"], f"TELEGRAM_BOT_TOKEN={token}\n")
         _isolation_aware_save_json(inspected["access_path"], access_doc)
         result["write_status"] = "ok"
@@ -1526,7 +1536,10 @@ def cmd_teams(args: argparse.Namespace) -> int:
             print_teams_result(result)
             return 0
 
-        _isolation_aware_mkdir(teams_dir, agent=args.agent)
+        # Issue #1215: explicit `mode=0o2770` for the v2 isolation
+        # channel-state-dir contract (see discord_dir above for the
+        # rationale).
+        _isolation_aware_mkdir(teams_dir, mode=0o2770, agent=args.agent)
         env_lines = [
             f"TEAMS_APP_ID={app_id}",
             f"TEAMS_APP_PASSWORD={app_password}",
@@ -1782,7 +1795,10 @@ def cmd_mattermost(args: argparse.Namespace) -> int:
             print_mattermost_result(result)
             return 0
 
-        _isolation_aware_mkdir(mattermost_dir, agent=args.agent)
+        # Issue #1215: explicit `mode=0o2770` for the v2 isolation
+        # channel-state-dir contract (see discord_dir above for the
+        # rationale).
+        _isolation_aware_mkdir(mattermost_dir, mode=0o2770, agent=args.agent)
         _isolation_aware_save_text(env_path, env_text)
         _isolation_aware_save_json(access_path, access_doc)
         _isolation_aware_save_json(mcp_path, mcp_doc)
