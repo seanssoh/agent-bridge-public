@@ -2071,6 +2071,222 @@ bridge_agent_idle_marker_dir() {
   printf '%s/%s' "$BRIDGE_ACTIVE_AGENT_DIR" "$agent"
 }
 
+# #1252: self-heal for the per-agent state leaf
+# `state/agents/<agent>/`. The directory MUST be created at
+# `agent create` time (lib/bridge-agents.sh -> matrix apply ->
+# state-agent-dir row), but if for any reason it is absent at runtime
+# (e.g. operator-side rm -rf, partial restore from backup, fresh-install
+# OOTB race) every daemon write into it fails with `Permission denied`
+# and the nudge path silently drops.
+#
+# r2 codex r1 BLOCKING #1252: also verifies mode=2770 AND group=
+# ab-agent-<a> on pre-existing dirs. Earlier R1 returned success for
+# any existing dir without checking mode/group, and ignored chgrp
+# failure on newly-created dirs. Both branches now fail-loud with a
+# structured reason when the canonical mode+group cannot be reached.
+#
+# r3 codex r2 BLOCKING #1252: the ab-agent-<a> group enforcement is
+# gated on `bridge_agent_linux_user_isolation_effective <agent>`. When
+# the predicate is FALSE (legacy install, non-Linux host, roster
+# `linux_user_isolation` not set, shared isolation) the verifier still
+# creates/verifies the dir at mode 2770 but does NOT chgrp to
+# ab-agent-<a> (which is not a real OS group on those installs).
+# Without this gate, r2 broke ordinary `agent create` for every non-
+# isolated agent (pillar smoke `1136-always-on-no` T7 regression).
+#
+# Returns:
+#   0 — dir exists with mode 2770 (auto-repaired if needed). Group is
+#       ab-agent-<a> when iso-v2 is effective; otherwise the dir
+#       retains the controller's primary group.
+#   1 — cannot reach canonical mode (always) or canonical group (iso-
+#       v2 effective branch only); structured reason emitted via
+#       bridge_warn + bridge_audit_log (where loaded). The caller
+#       (agent-create gate, daemon nudge tick) MUST NOT treat this as
+#       success.
+#
+# Idempotent. Safe to call from every nudge tick (cost = stat + chmod/
+# chgrp only when divergent).
+#
+# Structured reasons (stable for log scrapers):
+#   state_dir_mkdir_failed              — mkdir -m 2770 -p failed
+#   state_dir_group_resolver_empty      — bridge_isolation_v2_agent_group_name returned empty
+#   state_dir_chgrp_failed              — chgrp returned non-zero
+#   state_dir_chgrp_verify_failed       — chgrp returned 0 but re-stat
+#                                         shows the dir still has the
+#                                         wrong group
+#   state_dir_chmod_failed              — chmod 2770 returned non-zero
+#   state_dir_chmod_verify_failed       — chmod returned 0 but re-stat
+#                                         shows the wrong mode
+bridge_agent_state_dir_self_heal() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  local dir
+  dir="$(bridge_agent_idle_marker_dir "$agent")"
+
+  # Resolve canonical target group up-front; both the pre-existing-dir
+  # branch and the newly-created branch consult it. If the resolver is
+  # absent (non-v2 install) the verifier degrades to "mode-only", which
+  # matches the spec: the matrix apply at agent-create is the canonical
+  # owner-fixer on v2; on legacy installs there is no `ab-agent-<X>`
+  # group to begin with.
+  #
+  # r3 codex r2 BLOCKING: gate ab-agent enforcement on the
+  # iso-v2-effective predicate, not on mere resolver presence. The
+  # resolver (`bridge_isolation_v2_agent_group_name`) is sourced from
+  # `lib/bridge-isolation-v2.sh` on every install and returns a composed
+  # `ab-agent-<a>` name regardless of platform / roster `os_user` /
+  # shared-isolation mode. r2 (`_resolver_present`) gating therefore
+  # forced ordinary non-iso `agent create` to chgrp a group that does
+  # not exist, breaking `bridge-agent.sh:3551-3554` pre-create-ok gate
+  # for any non-iso/non-Linux agent (pillar smoke `1136-always-on-no`
+  # T7 regression).
+  #
+  # The effective predicate (`bridge_agent_linux_user_isolation_effective`)
+  # short-circuits on:
+  #   - roster `linux_user_isolation` not requested
+  #   - host platform != Linux
+  #   - resolved `os_user` empty (shared / fallback)
+  # which is exactly the set where ab-agent-<a> is NOT a real OS group
+  # and chgrp would fail.
+  local _agent_grp=""
+  local _iso_effective=0
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    _iso_effective=1
+    if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+      _agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+    fi
+  fi
+
+  # Helper: structured failure reporter. Single shape across both
+  # branches so log scrapers see the same prefix.
+  _state_dir_self_heal_fail() {
+    local _reason="$1"
+    local _detail="$2"
+    bridge_warn "bridge_agent_state_dir_self_heal: agent='$agent' dir='$dir' reason=$_reason detail=$_detail; daemon writes will silently drop until \`agent-bridge isolation reconcile --apply --agent $agent\` runs"
+    if command -v bridge_audit_log >/dev/null 2>&1; then
+      bridge_audit_log daemon state_dir_self_heal "$agent" \
+        --detail dir="$dir" \
+        --detail outcome=failed \
+        --detail reason="$_reason" \
+        --detail detail="$_detail" 2>/dev/null || true
+    fi
+    return 1
+  }
+
+  # Helper: portable mode read (BSD `stat -f %Lp` vs GNU `stat -c %a`).
+  _state_dir_read_mode() {
+    local _path="$1"
+    stat -c %a "$_path" 2>/dev/null || stat -f %Lp "$_path" 2>/dev/null
+  }
+
+  # Helper: portable group-name read.
+  _state_dir_read_group() {
+    local _path="$1"
+    stat -c %G "$_path" 2>/dev/null || stat -f %Sg "$_path" 2>/dev/null
+  }
+
+  if [[ -d "$dir" ]]; then
+    # PRE-EXISTING DIR PATH — verify mode + group; attempt repair if
+    # divergent; fail-loud if repair impossible.
+    local _cur_mode _cur_group
+    _cur_mode="$(_state_dir_read_mode "$dir")"
+    _cur_group="$(_state_dir_read_group "$dir")"
+
+    # Mode check. Accept 2770 (setgid) as canonical; some BSD `mkdir
+    # -m` strips setgid, so accept 770 too — but if neither, attempt
+    # chmod 2770 and verify.
+    if [[ "$_cur_mode" != "2770" && "$_cur_mode" != "770" ]]; then
+      if ! chmod 2770 "$dir" 2>/dev/null; then
+        _state_dir_self_heal_fail "state_dir_chmod_failed" "cur_mode=$_cur_mode target=2770"
+        return $?
+      fi
+      _cur_mode="$(_state_dir_read_mode "$dir")"
+      if [[ "$_cur_mode" != "2770" && "$_cur_mode" != "770" ]]; then
+        _state_dir_self_heal_fail "state_dir_chmod_verify_failed" "post_chmod_mode=$_cur_mode target=2770"
+        return $?
+      fi
+    fi
+
+    # Group check — only when iso-v2 is EFFECTIVE for this agent
+    # (r3 codex r2 BLOCKING: legacy / non-iso / non-Linux / shared
+    # paths must NOT chgrp to ab-agent-<a> since that group does not
+    # exist; pre-existing dir keeps its operator/install-default group).
+    if (( _iso_effective == 1 )); then
+      if [[ -z "$_agent_grp" ]]; then
+        _state_dir_self_heal_fail "state_dir_group_resolver_empty" "resolver=bridge_isolation_v2_agent_group_name"
+        return $?
+      fi
+      if [[ "$_cur_group" != "$_agent_grp" ]]; then
+        if ! chgrp "$_agent_grp" "$dir" 2>/dev/null; then
+          _state_dir_self_heal_fail "state_dir_chgrp_failed" "cur_group=$_cur_group target=$_agent_grp"
+          return $?
+        fi
+        _cur_group="$(_state_dir_read_group "$dir")"
+        if [[ "$_cur_group" != "$_agent_grp" ]]; then
+          _state_dir_self_heal_fail "state_dir_chgrp_verify_failed" "post_chgrp_group=$_cur_group target=$_agent_grp"
+          return $?
+        fi
+      fi
+    fi
+
+    # Pre-existing dir reached canonical mode+group.
+    return 0
+  fi
+
+  # NEWLY-CREATED DIR PATH — mkdir 2770 + chgrp + verify.
+  # The parent state/agents/ root is 0711 (others --x; see
+  # lib/bridge-isolation-v2.sh::state-agents-root row) so the
+  # controller can create children there as itself.
+  # shellcheck disable=SC2174  # only the leaf needs 2770 — parent state/agents/ is created by isolation-v2 matrix apply (state-agents-root row, mode 0711)
+  if ! mkdir -m 2770 -p "$dir" 2>/dev/null; then
+    _state_dir_self_heal_fail "state_dir_mkdir_failed" "parent=$BRIDGE_ACTIVE_AGENT_DIR"
+    return $?
+  fi
+
+  # chgrp + verify ONLY when iso-v2 is EFFECTIVE for this agent.
+  # r3 codex r2 BLOCKING: r2 gated on `_resolver_present`, but the
+  # resolver is globally loaded — that forced ordinary non-iso creates
+  # to chgrp to an ab-agent group that does not exist, breaking the
+  # pre-create-ok gate in `bridge-agent.sh:3551-3554`. The effective
+  # predicate is the contract: iso-v2 effective → enforce the canonical
+  # group; otherwise the dir keeps the controller's primary group
+  # (legacy / non-Linux / shared isolation), which is correct for those
+  # installs because there is no per-agent group at all.
+  # r2 codex r1 BLOCKING (still applies under iso-v2 path): empty
+  # resolver → fail-loud. Pre-r1 silently no-op'd, which left the dir
+  # owned by the controller's primary group and daemon writes still
+  # wedged.
+  if (( _iso_effective == 1 )); then
+    if [[ -z "$_agent_grp" ]]; then
+      _state_dir_self_heal_fail "state_dir_group_resolver_empty" "resolver=bridge_isolation_v2_agent_group_name"
+      return $?
+    fi
+    if ! chgrp "$_agent_grp" "$dir" 2>/dev/null; then
+      _state_dir_self_heal_fail "state_dir_chgrp_failed" "target=$_agent_grp post_mkdir"
+      return $?
+    fi
+    local _post_grp
+    _post_grp="$(_state_dir_read_group "$dir")"
+    if [[ "$_post_grp" != "$_agent_grp" ]]; then
+      _state_dir_self_heal_fail "state_dir_chgrp_verify_failed" "post_chgrp_group=$_post_grp target=$_agent_grp"
+      return $?
+    fi
+  fi
+
+  # Silent on success — emitting a warn here pollutes `--json` output
+  # surfaces (bridge-agent.sh create --json) where stderr and stdout
+  # are merged by callers. The audit-log row (when bridge_audit_log
+  # is loaded) records the self-heal for operator forensics without
+  # polluting CLI output.
+  if command -v bridge_audit_log >/dev/null 2>&1; then
+    bridge_audit_log daemon state_dir_self_heal "$agent" \
+      --detail dir="$dir" \
+      --detail outcome=created 2>/dev/null || true
+  fi
+  return 0
+}
+
 bridge_agent_runtime_state_dir() {
   local agent="$1"
   if bridge_isolation_v2_active && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then

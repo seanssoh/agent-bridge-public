@@ -3534,6 +3534,25 @@ report and reap test-fixture agents per their pattern."
     if [[ "$engine" == "claude" ]]; then
       bridge_ensure_claude_first_run_config "$agent" "$workdir" >/dev/null 2>&1 || true
     fi
+    # #1252: state/agents/<a>/ MUST exist before this agent appears to
+    # operators as `create:ok`. The v2 matrix apply above is the
+    # canonical creator (root:ab-agent-<X> 2770); this is a synchronous
+    # belt-and-braces check that catches:
+    #   - non-v2 installs (matrix apply branch was skipped)
+    #   - matrix apply succeeded but the state-agent-dir row was
+    #     `degraded` (optional criticality demotion, e.g. shared-mode
+    #     on a fresh tree where the controller_group is unresolved)
+    #   - any other path where the dir is somehow absent post-create
+    #
+    # Self-heal is idempotent and silent on success; failure flips agent
+    # create to a hard fail so the operator never sees `create:ok` for
+    # an agent whose first nudge will silently drop. Routes through the
+    # same helper the daemon uses on the nudge hot path (lib/bridge-state.sh).
+    if command -v bridge_agent_state_dir_self_heal >/dev/null 2>&1; then
+      if ! bridge_agent_state_dir_self_heal "$agent"; then
+        bridge_die "agent create: cannot create state-agent-dir for '$agent' — daemon writes would fail and nudges would silently drop (#1252). Inspect parent permissions on '$BRIDGE_ACTIVE_AGENT_DIR' and retry, or 'agb agent delete $agent --force --purge-home' to roll back."
+      fi
+    fi
     # Issue #680: bridge-start.sh --dry-run is purely informational here — its
     # output is reprinted to the user as `start_dry_run:` for diagnostic
     # context. Letting its rc propagate via command-substitution + set -e

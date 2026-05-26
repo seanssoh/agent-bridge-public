@@ -419,6 +419,36 @@ bridge_write_idle_ready_agents() {
     engine="$(bridge_agent_engine "$agent")"
     session="$(bridge_agent_session "$agent")"
 
+    # #1252: best-effort self-heal for the per-agent state leaf BEFORE
+    # any idle-marker reads/writes. The matrix apply at `agent create`
+    # is the canonical creator (root:ab-agent-<X> 2770); this is purely
+    # a floor against silent-drop when the dir is somehow absent at
+    # runtime. On failure, emit a structured `[nudge-skip]` audit line
+    # naming the agent + reason so the daemon log never silently swallows
+    # the missing-state-dir class again.
+    if command -v bridge_agent_state_dir_self_heal >/dev/null 2>&1; then
+      if ! bridge_agent_state_dir_self_heal "$agent" 2>/dev/null; then
+        # Structured nudge-skip audit log. Fixed prefix `[nudge-skip]`
+        # so log scrapers can grep one line per skip per tick. Fields:
+        # agent, reason, evidence (concrete path that failed).
+        #
+        # r2 codex r1 BLOCKING #1252: emit task=none (NOT task=-). This
+        # call site is on the idle-marker writer loop — no specific task
+        # id is in scope at this depth (the loop iterates over agents,
+        # not over queued tasks). `none` is the canonical sentinel per
+        # the [nudge-skip] task=<id|none> contract.
+        local _idle_dir
+        _idle_dir="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null || printf '<unknown>')"
+        bridge_warn "[nudge-skip] agent=$agent task=none reason=state-dir-missing evidence=$_idle_dir"
+        if command -v bridge_audit_log >/dev/null 2>&1; then
+          bridge_audit_log daemon nudge_skip "$agent" \
+            --detail reason=state-dir-missing \
+            --detail evidence="$_idle_dir" 2>/dev/null || true
+        fi
+        continue
+      fi
+    fi
+
     case "$engine" in
       claude)
         if ! bridge_agent_idle_marker_exists "$agent"; then

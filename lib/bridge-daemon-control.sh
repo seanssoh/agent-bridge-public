@@ -100,18 +100,118 @@ _bridge_daemon_control_resolve_gid() {
 # the target GID in its /proc/<pid>/status Groups line; rc=1 otherwise.
 # rc=2 if the daemon is not running or its /proc/<pid>/status cannot be
 # read (so callers can distinguish "no daemon" from "wrong groups").
+#
+# #1246: When BRIDGE_DAEMON_CONTROL_DECISION_LOG is set, this helper
+# ALSO emits a single structured decision-evidence line to that file
+# path so the operator can see *which* PID was probed, *what* groups
+# were observed, and *which* outcome was returned. Without that the
+# pre-check at lines 348/383 below could silently false-positive
+# (return 0 with stale on-disk cache) and the systemd-user auto-restart
+# branch at lines 404+ never fires.
+#
+# r2 codex r1 CONTRACT MISMATCH #1246: also emits `on_disk=<GIDs>` —
+# the supplementary group set resolved via `id -G <user>` for the
+# daemon's owner. Brief required both fields so the operator can
+# diagnose "on_disk has the GID but in_proc doesn't → daemon needs a
+# fresh exec; PAM/initgroups will pick up the new group" vs "on_disk
+# itself is missing the GID → the controller user was never added,
+# fix sudoers/usermod first". in_proc remains authoritative for the
+# refresh decision; on_disk is purely diagnostic.
+#
+# Format (single line, no trailing newline beyond the literal \n):
+#   [daemon-control] supp-group check: pid=<P> on_disk=<G1,G2,...> in_proc=<G1,G2,...> target_gid=<G> action=<refresh|skip> reason=<rationale>
 _bridge_daemon_control_daemon_has_gid() {
   local target_gid="$1"
   [[ -n "$target_gid" ]] || return 2
   local pid
   pid="$(bridge_daemon_pid 2>/dev/null || true)"
-  [[ -n "$pid" ]] || return 2
+  [[ -n "$pid" ]] || {
+    _bridge_daemon_control_emit_decision_log \
+      "" "" "" "$target_gid" "skip" "daemon-not-running"
+    return 2
+  }
   local groups_output
-  groups_output="$(_bridge_daemon_control_proc_groups "$pid" 2>/dev/null)" || return 2
+  groups_output="$(_bridge_daemon_control_proc_groups "$pid" 2>/dev/null)" || {
+    _bridge_daemon_control_emit_decision_log \
+      "$pid" "$(_bridge_daemon_control_proc_owner_on_disk_groups "$pid")" "" "$target_gid" "skip" "proc-status-unreadable"
+    return 2
+  }
+  # Normalize for the decision log: space-or-newline separated → comma.
+  # Use `tr -s` to squeeze runs of whitespace, then tr space→comma; this
+  # is portable across BSD/GNU sed (sed `\+` is a GNU-only extension).
+  local _flat_groups
+  _flat_groups="$(printf '%s' "$groups_output" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//' | tr ' ' ',')"
+  local _on_disk
+  _on_disk="$(_bridge_daemon_control_proc_owner_on_disk_groups "$pid")"
   if printf '%s\n' "$groups_output" | grep -Fxq -- "$target_gid"; then
+    _bridge_daemon_control_emit_decision_log \
+      "$pid" "$_on_disk" "$_flat_groups" "$target_gid" "skip" "already-has-group"
     return 0
   fi
+  _bridge_daemon_control_emit_decision_log \
+    "$pid" "$_on_disk" "$_flat_groups" "$target_gid" "refresh" "missing-from-supp-set"
   return 1
+}
+
+# r2 codex r1 CONTRACT MISMATCH #1246: resolve the daemon process
+# owner via /proc/<pid>/status `Uid:` and emit `id -G <user>` as a
+# comma-separated GID list. Empty string on any failure — the
+# decision-evidence line still has a stable shape so log scrapers do
+# not break.
+_bridge_daemon_control_proc_owner_on_disk_groups() {
+  local pid="$1"
+  [[ -n "$pid" ]] || return 0
+  local status_path="/proc/$pid/status"
+  [[ -r "$status_path" ]] || return 0
+  # Uid: line is `Uid:\tREAL\tEFFECTIVE\tSAVED\tFS`; take the effective
+  # uid (field 3) so a setuid process is resolved to the EUID under
+  # which it actually runs.
+  local uid
+  uid="$(awk '/^Uid:/ { print $3; exit }' "$status_path" 2>/dev/null)"
+  [[ -n "$uid" ]] || return 0
+  local user
+  user="$(getent passwd "$uid" 2>/dev/null | awk -F: '{ print $1; exit }')"
+  [[ -n "$user" ]] || return 0
+  # `id -G` emits space-separated GIDs; convert to comma-separated for
+  # log-scraper consistency with in_proc.
+  id -G "$user" 2>/dev/null | tr ' ' ',' | tr -d '\n'
+}
+
+# #1246: emit the structured decision-evidence line. Writes to
+# BRIDGE_DAEMON_CONTROL_DECISION_LOG when set; otherwise emits to the
+# daemon log via daemon_info when that helper is loaded; otherwise
+# silently no-ops. Single-line, fixed-shape so log scrapers can grep
+# the fixed prefix and parse the fields without parsing variable text.
+#
+# r2 codex r1: on_disk arg added (between pid and in_proc) so the
+# operator sees both sources in one line — see contract comment on
+# _bridge_daemon_control_daemon_has_gid above.
+_bridge_daemon_control_emit_decision_log() {
+  local pid="$1"
+  local on_disk="$2"
+  local in_proc="$3"
+  local target_gid="$4"
+  local action="$5"
+  local reason="$6"
+  local line
+  line="$(printf '[daemon-control] supp-group check: pid=%s on_disk=%s in_proc=%s target_gid=%s action=%s reason=%s' \
+    "${pid:-}" "${on_disk:-}" "${in_proc:-}" "${target_gid:-}" "${action:-}" "${reason:-}")"
+  if [[ -n "${BRIDGE_DAEMON_CONTROL_DECISION_LOG:-}" ]]; then
+    # Best-effort append; never fail the caller on log-write errors.
+    printf '%s\n' "$line" >>"$BRIDGE_DAEMON_CONTROL_DECISION_LOG" 2>/dev/null || true
+    return 0
+  fi
+  if command -v daemon_info >/dev/null 2>&1; then
+    daemon_info "$line" 2>/dev/null || true
+    return 0
+  fi
+  if command -v bridge_warn >/dev/null 2>&1; then
+    # bridge_warn is the only logger guaranteed to exist when this lib
+    # is sourced standalone (test fixtures). Route through it so the
+    # evidence still lands somewhere the operator can find.
+    bridge_warn "$line" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # Sanitize a free-form reason string to the codex r3 §3 character class.
