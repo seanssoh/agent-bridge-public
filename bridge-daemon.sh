@@ -49,19 +49,32 @@ daemon_warn() {
 # AND the missing set contains any `ab-agent-*` group, emit a
 # one-line warning pointing at the resolution recipe.
 #
-# Bash-daemon caveat: we cannot fix this in-process — refreshing
-# supp-groups in bash requires either `exec sg <group>` (single-group
-# only, invasive — would lose every TERM/INT/HUP handler the daemon
-# just installed) or a log-out/log-in cycle. So this is a WARN, not an
-# auto-recover. The operator's runbook (OPERATIONS.md §"Supplementary
-# group refresh after first v2 isolated agent") covers the manual
-# resolution.
+# Bash-daemon caveat: SIGHUP/setgroups does NOT refresh supp-groups in a
+# running process. Refreshing requires the PAM/initgroups boundary —
+# either re-login (operator-side) or process restart through the
+# sudo-self ExecStart unit / direct `sudo -u <user> bridge-daemon.sh
+# restart` path that `lib/bridge-daemon-control.sh:
+# bridge_daemon_refresh_after_group_membership_change` already drives.
+# Lane F (v0.15.0-beta1) adds an autonomous daemon-side poll
+# (`bridge_daemon_supp_groups_poll_and_dispatch`) that runs the existing
+# helper as a detached external process when the helper's explicit
+# create/delete/isolate callers were missed, stale, or blocked. See
+# `lib/bridge-daemon-control.sh` for the status-string contract.
 #
 # Best-effort: silently no-op on macOS (sys.platform != linux check via
 # uname), when `id`/`getent` are unavailable, or when the comparison
 # can't be made (e.g. systemd-run / nsswitch returning malformed
 # output). The check must never block startup.
-bridge_daemon_warn_if_supp_groups_stale() {
+
+# Lane F: data helper. Emits missing `ab-agent-*` group names to stdout,
+# one per line, sorted+deduped. No side effects, no logging. Returns
+# rc=0 always (best-effort — callers branch on empty/non-empty stdout).
+#
+# Splitting the detection out from the warn wrapper lets the autonomous
+# poll path (which dispatches a refresh worker, not just a warning)
+# share the same canonical detection logic. The warn wrapper preserves
+# the v0.14.5 startup-warning behavior on top.
+bridge_daemon_detect_stale_supp_groups() {
   # Linux-only: macOS dev hosts don't run v2 isolation and have a
   # different `id` flag set; skip cleanly so we don't false-positive on
   # the operator's laptop.
@@ -95,12 +108,13 @@ bridge_daemon_warn_if_supp_groups_stale() {
   missing_gids="$(comm -23 <(printf '%s\n' "$canonical_sorted") <(printf '%s\n' "$process_sorted") 2>/dev/null || true)"
   [[ -n "$missing_gids" ]] || return 0
 
-  # Resolve each missing GID to a group name and check for ab-agent-*.
-  # `getent group <gid>` returns `name:x:gid:members` — we want field 1.
-  # Iterate via positional-arg expansion (avoids `<<<` here-string per
-  # lint-heredoc-ban contract — footgun #11 family even though this is
-  # a `read` loop not a subprocess feed).
-  local gid name has_iso_drift="" iso_names=""
+  # Resolve each missing GID to a group name and emit `ab-agent-*`
+  # entries on stdout. `getent group <gid>` returns
+  # `name:x:gid:members` — we want field 1. Iterate via positional-arg
+  # expansion (avoids `<<<` here-string per lint-heredoc-ban contract —
+  # footgun #11 family even though this is a `read` loop not a
+  # subprocess feed).
+  local gid name
   local _saved_ifs="$IFS"
   IFS=$'\n'
   # shellcheck disable=SC2086  # word-split missing_gids by IFS=$'\n' on purpose
@@ -111,19 +125,261 @@ bridge_daemon_warn_if_supp_groups_stale() {
     name="$(getent group "$gid" 2>/dev/null | cut -d: -f1)"
     [[ -n "$name" ]] || continue
     if [[ "$name" == ab-agent-* ]]; then
-      has_iso_drift="yes"
-      if [[ -z "$iso_names" ]]; then
-        iso_names="$name"
-      else
-        iso_names="$iso_names $name"
-      fi
+      printf '%s\n' "$name"
     fi
-  done
+  done | sort -u
+  return 0
+}
 
-  [[ -n "$has_iso_drift" ]] || return 0
+# Presentation wrapper — preserves the v0.14.5 startup-warning shape
+# byte-for-byte (the 1178 smoke pins the exact wording). Calls the
+# data helper for detection and emits the human-readable warning if
+# any ab-agent-* groups are missing.
+bridge_daemon_warn_if_supp_groups_stale() {
+  local iso_names_lines
+  iso_names_lines="$(bridge_daemon_detect_stale_supp_groups 2>/dev/null || true)"
+  [[ -n "$iso_names_lines" ]] || return 0
+
+  # Reassemble space-separated for the warning text (preserves v0.14.5
+  # output shape — the 1178 smoke asserts `ab-agent-iso2` appears in
+  # the warning, not the list shape).
+  local iso_names
+  iso_names="$(printf '%s\n' "$iso_names_lines" | tr '\n' ' ' | sed 's/ $//')"
 
   daemon_warn "daemon supplementary-group set is stale: missing ab-agent group(s) [${iso_names}]. Spawned children will inherit the stale set, leading to PermissionError on isolated agent paths even though /etc/group shows the controller as a member."
   daemon_warn "resolution: log out + log back in (refreshes the full group set), or 'newgrp <group>' for a single-group refresh, then restart the daemon ('agent-bridge daemon restart' or 'sudo systemctl restart agent-bridge'). See KNOWN_ISSUES.md §28 / OPERATIONS.md for the systemd/launchd runbook."
+  return 0
+}
+
+# Lane F: throttle state file. Records last_attempt_ts, last_status,
+# last_group across daemon runs so a stale-systemd unit (where every
+# refresh attempt returns `manual-required-systemd-unit-stale`) does
+# not spam every BRIDGE_DAEMON_INTERVAL-second poll. Lives under
+# BRIDGE_STATE_DIR so it survives daemon restarts within the same
+# install but resets when state/ is recreated.
+bridge_daemon_supp_group_refresh_throttle_path() {
+  printf '%s/daemon.supp-refresh.state' "${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-/tmp}/state}"
+}
+
+# Read throttle state. Emits three lines on stdout (last_attempt_ts,
+# last_status, last_group); missing fields emit empty lines. rc=0 on
+# success (incl. missing file → all empty), rc=1 only on a malformed
+# file we cannot parse. The state file format is `key=value` per line,
+# whitespace-trimmed values.
+bridge_daemon_supp_group_refresh_throttle_read() {
+  local path
+  path="$(bridge_daemon_supp_group_refresh_throttle_path)"
+  if [[ ! -r "$path" ]]; then
+    printf '\n\n\n'
+    return 0
+  fi
+  local last_ts="" last_status="" last_group=""
+  local line key val
+  # Read file line-by-line via input redirect (NOT heredoc-stdin —
+  # footgun #11). The state file is operator-controlled state, small
+  # (3 lines), and read at every poll, so the redirect is cheap.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "$line" ]] || continue
+    key="${line%%=*}"
+    val="${line#*=}"
+    case "$key" in
+      last_attempt_ts) last_ts="$val" ;;
+      last_status)     last_status="$val" ;;
+      last_group)      last_group="$val" ;;
+    esac
+  done <"$path"
+  printf '%s\n%s\n%s\n' "$last_ts" "$last_status" "$last_group"
+  return 0
+}
+
+# Write throttle state atomically (mv-from-tmp). Args:
+#   $1 — last_attempt_ts (epoch seconds)
+#   $2 — last_status (e.g. ok / manual-required-* / failed-* / dispatched)
+#   $3 — last_group (the ab-agent-* group the attempt targeted)
+bridge_daemon_supp_group_refresh_throttle_write() {
+  local ts="${1:-}"
+  local status="${2:-}"
+  local group="${3:-}"
+  local path
+  path="$(bridge_daemon_supp_group_refresh_throttle_path)"
+  local dir
+  dir="$(dirname -- "$path")"
+  mkdir -p -- "$dir" 2>/dev/null || return 1
+  local tmp
+  tmp="$(mktemp "${path}.XXXXXX" 2>/dev/null)" || return 1
+  {
+    printf 'last_attempt_ts=%s\n' "$ts"
+    printf 'last_status=%s\n'     "$status"
+    printf 'last_group=%s\n'      "$group"
+  } >"$tmp" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null || true; return 1; }
+  mv -f -- "$tmp" "$path" 2>/dev/null || { rm -f -- "$tmp" 2>/dev/null || true; return 1; }
+  return 0
+}
+
+# Decide whether a refresh attempt should be made. Args:
+#   $1 — current epoch ts
+#   $2 — candidate group (the first ab-agent-* the detector returned)
+# Returns rc=0 when eligible, rc=1 when throttled. Throttle rules:
+#   - Refresh in flight (lockfile held by the helper) → skip
+#   - Last status was `manual-required-*` or `failed-*` and elapsed <
+#     BRIDGE_DAEMON_SUPP_REFRESH_BACKOFF_SECS (default 3600s) → skip
+#     (avoids per-poll spam when the operator hasn't fixed the unit
+#     yet — codex caveat #5)
+#   - Last status was `ok*` / `skipped-*` / `dispatched` and elapsed <
+#     BRIDGE_DAEMON_SUPP_REFRESH_MIN_INTERVAL_SECS (default 300s) →
+#     skip (avoids restart storm during burst create-many)
+#
+# Codex caveat #4: one missing group per refresh attempt is enough —
+# after the daemon restarts, the new daemon's next poll detects the
+# next missing group if any.
+bridge_daemon_supp_groups_should_refresh() {
+  local now_ts="${1:-}"
+  local candidate_group="${2:-}"
+  [[ -n "$now_ts" && -n "$candidate_group" ]] || return 1
+
+  # Bail out early if a refresh is currently in flight under the
+  # shared lock owned by bridge_daemon_refresh_after_group_membership_change.
+  # We probe by trying a non-blocking flock; if we fail to take it,
+  # another worker is mid-flight and we must not dispatch a duplicate.
+  local lock_path
+  lock_path="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-/tmp}/state}/daemon.refresh.lock"
+  if command -v flock >/dev/null 2>&1 && [[ -e "$lock_path" ]]; then
+    local probe_fd
+    if exec {probe_fd}>"$lock_path" 2>/dev/null; then
+      if ! flock -n "$probe_fd" 2>/dev/null; then
+        # Lock held by an active refresh worker — skip dispatch.
+        exec {probe_fd}>&- 2>/dev/null || true
+        return 1
+      fi
+      # We hold it momentarily — release immediately so the worker
+      # can re-acquire when we dispatch it.
+      exec {probe_fd}>&- 2>/dev/null || true
+    fi
+  fi
+
+  local state last_ts last_status last_group
+  state="$(bridge_daemon_supp_group_refresh_throttle_read 2>/dev/null || true)"
+  last_ts="$(printf '%s' "$state" | sed -n '1p')"
+  last_status="$(printf '%s' "$state" | sed -n '2p')"
+  last_group="$(printf '%s' "$state" | sed -n '3p')"
+
+  # No prior attempt — eligible.
+  if [[ -z "$last_ts" ]] || ! [[ "$last_ts" =~ ^[0-9]+$ ]]; then
+    return 0
+  fi
+
+  local elapsed=$(( now_ts - last_ts ))
+  (( elapsed >= 0 )) || elapsed=0
+
+  local min_interval="${BRIDGE_DAEMON_SUPP_REFRESH_MIN_INTERVAL_SECS:-300}"
+  local backoff_interval="${BRIDGE_DAEMON_SUPP_REFRESH_BACKOFF_SECS:-3600}"
+  [[ "$min_interval"     =~ ^[0-9]+$ ]] || min_interval=300
+  [[ "$backoff_interval" =~ ^[0-9]+$ ]] || backoff_interval=3600
+
+  case "$last_status" in
+    manual-required-*|failed-*)
+      # Hard-error path: stale systemd unit / missing sudoers / etc.
+      # Long backoff so the daemon doesn't spam audit + warn on every
+      # poll. Operator fixes the unit/sudoers, restarts the daemon,
+      # and the fresh daemon picks up the next eligible window.
+      if (( elapsed < backoff_interval )); then
+        # Same group with the same hard-error → skip.
+        if [[ "$last_group" == "$candidate_group" ]]; then
+          return 1
+        fi
+        # Different group than last time → still throttle but with the
+        # shorter min interval. The operator may have isolated a new
+        # agent whose group is unrelated; the unit-stale class will
+        # still bite, but at least the audit fires once per agent.
+        if (( elapsed < min_interval )); then
+          return 1
+        fi
+      fi
+      ;;
+    *)
+      # Soft-success path (ok / ok-systemd-sudo-self / skipped-* /
+      # dispatched) — short min interval. After a successful refresh
+      # the daemon restarted, so this branch is mostly hit when the
+      # poll fires before the new daemon has finished its own startup
+      # warn check.
+      if (( elapsed < min_interval )); then
+        return 1
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# Lane F entry point — called from the daemon's main poll loop. Runs
+# the detection, decides via throttle, and dispatches a DETACHED
+# refresh worker subprocess. The detached process calls the existing
+# `bridge_daemon_refresh_after_group_membership_change` helper, which
+# acquires the file lock at lib/bridge-daemon-control.sh:360, performs
+# the systemctl-restart or sudo-restart, and writes its own
+# audit row. Returns rc=0 always (poll-loop callers must never abort
+# on this path — codex caveat #1).
+#
+# Codex caveat #2: dispatch is via `bash bridge-daemon.sh
+# supp-refresh-worker <group>` as a backgrounded external process, so
+# the daemon's own shell is NOT the one waiting on the helper's
+# command substitution — a self-restart inside the helper cannot kill
+# the parent that dispatched it.
+bridge_daemon_supp_groups_poll_and_dispatch() {
+  # Linux-only — short-circuit before we read state files on macOS.
+  case "$(uname -s 2>/dev/null || true)" in
+    Linux) ;;
+    *) return 0 ;;
+  esac
+
+  local missing_names first_name
+  missing_names="$(bridge_daemon_detect_stale_supp_groups 2>/dev/null || true)"
+  [[ -n "$missing_names" ]] || return 0
+  # Codex caveat #4: one missing group per attempt — pick the first
+  # (already sort -u'd by the detector). After daemon restart, the new
+  # daemon's next poll iterates.
+  first_name="$(printf '%s\n' "$missing_names" | head -n1)"
+  [[ -n "$first_name" ]] || return 0
+
+  local now_ts
+  now_ts="$(date +%s 2>/dev/null || printf '0')"
+  if ! bridge_daemon_supp_groups_should_refresh "$now_ts" "$first_name"; then
+    return 0
+  fi
+
+  # Resolve the bridge home + bash for the detached worker invocation.
+  # SCRIPT_DIR is set at the top of bridge-daemon.sh; bash is the
+  # interpreter currently running this code.
+  local bash_abs="${BRIDGE_BASH_BIN:-}"
+  if [[ -z "$bash_abs" ]]; then
+    bash_abs="$(command -v bash 2>/dev/null || printf '/bin/bash')"
+  fi
+  local daemon_script="${SCRIPT_DIR:-${BRIDGE_HOME:-}}/bridge-daemon.sh"
+  if [[ ! -r "$daemon_script" ]]; then
+    return 0
+  fi
+
+  # Record the dispatch intent BEFORE forking so a race that loses the
+  # worker (e.g. nohup blocked) still throttles the next poll.
+  bridge_daemon_supp_group_refresh_throttle_write \
+    "$now_ts" "dispatched" "$first_name" 2>/dev/null || true
+
+  # Emit an audit row so the operator has a forensic trail for the
+  # autonomous dispatch (non-fatal — audit failure does not change
+  # the dispatch outcome).
+  bridge_audit_log daemon daemon_supp_groups_refresh_dispatch daemon \
+    --detail group="$first_name" \
+    --detail trigger="poll-auto" >/dev/null 2>&1 || true
+
+  # Fork the detached worker. Disown so it survives the daemon's own
+  # restart (which the worker itself triggers). Output/stderr to the
+  # worker log; the worker writes its own throttle-state final row.
+  local worker_log="${BRIDGE_LOG_DIR:-${BRIDGE_HOME:-/tmp}/logs}/daemon-supp-refresh.log"
+  mkdir -p -- "$(dirname -- "$worker_log")" 2>/dev/null || true
+  (
+    "$bash_abs" "$daemon_script" supp-refresh-worker "$first_name" \
+      >>"$worker_log" 2>&1 &
+    disown 2>/dev/null || true
+  ) 2>/dev/null || true
   return 0
 }
 
@@ -7295,6 +7551,22 @@ cmd_run() {
     if ! bridge_daemon_ensure_queue_gateway_socket_listener; then
       :
     fi
+    # Lane F (v0.15.0-beta1): autonomous supp-groups refresh poll.
+    # Runs the same staleness detector used at startup (issue #1178
+    # Deliverable C) and dispatches a DETACHED external refresh worker
+    # subprocess when a missing `ab-agent-*` group is found AND the
+    # throttle state allows. The dispatch is fully non-blocking: the
+    # daemon shell continues into sync_cycle on the same poll while the
+    # worker (in a different process) acquires the daemon-refresh
+    # lockfile and calls the existing sudo-self / systemctl-restart
+    # path. Codex caveat #1 (do NOT synchronously self-restart from
+    # inside the daemon shell), #2 (detach via external subprocess),
+    # #3 (existing lock at lib/bridge-daemon-control.sh:360 guards
+    # concurrent refreshes), #4 (one missing group per attempt),
+    # #5 (throttle for repeated manual-required-* statuses) all
+    # honored in `bridge_daemon_supp_groups_poll_and_dispatch`.
+    BRIDGE_DAEMON_LAST_STEP="supp_groups_refresh_poll"
+    bridge_daemon_supp_groups_poll_and_dispatch || true
     BRIDGE_DAEMON_LAST_STEP="sync_cycle"
     if cmd_sync_cycle; then
       :
@@ -7643,6 +7915,72 @@ cmd_restart() {
   cmd_start
 }
 
+# Lane F (v0.15.0-beta1): internal subcommand entry — invoked as a
+# DETACHED external process by `bridge_daemon_supp_groups_poll_and_dispatch`
+# so the calling daemon shell is not the parent waiting on the helper's
+# self-restart command substitution (codex caveat #2). Runs the existing
+# `bridge_daemon_refresh_after_group_membership_change` helper from
+# `lib/bridge-daemon-control.sh` and writes the final status into the
+# throttle state so the next daemon's poll sees the outcome class.
+#
+# Not advertised on the operator-facing `usage()` — this verb is the
+# private dispatch shape for the daemon's autonomous detection, never
+# meant to be typed by hand. If the operator hits it directly with a
+# legitimate group name we still execute (the helper is idempotent and
+# the sudoers entry covers the same path), but the daemon would never
+# print this verb as a recovery recipe.
+cmd_supp_refresh_worker() {
+  local group="${1:-}"
+  if [[ -z "$group" ]]; then
+    daemon_warn "supp-refresh-worker: --group required"
+    return 1
+  fi
+
+  # Source the daemon-control helpers. The library has its own
+  # _BRIDGE_DAEMON_CONTROL_SOURCED guard so double-source is a no-op.
+  if ! command -v bridge_daemon_refresh_after_group_membership_change >/dev/null 2>&1; then
+    # bridge-lib.sh loads bridge-daemon-control.sh; if it isn't loaded
+    # yet (entry via direct subcommand), source it now.
+    local control_lib="${SCRIPT_DIR:-${BRIDGE_HOME:-}}/lib/bridge-daemon-control.sh"
+    if [[ -r "$control_lib" ]]; then
+      # shellcheck source=/dev/null
+      source "$control_lib"
+    fi
+  fi
+
+  if ! command -v bridge_daemon_refresh_after_group_membership_change >/dev/null 2>&1; then
+    daemon_warn "supp-refresh-worker: bridge_daemon_refresh_after_group_membership_change unavailable"
+    bridge_daemon_supp_group_refresh_throttle_write \
+      "$(date +%s 2>/dev/null || printf '0')" "failed-helper-missing" "$group" 2>/dev/null || true
+    return 1
+  fi
+
+  local status=""
+  status="$(
+    bridge_daemon_refresh_after_group_membership_change \
+      --group "$group" \
+      --reason "supp-poll-auto" \
+      2>/dev/null || true
+  )"
+  [[ -n "$status" ]] || status="failed-no-status"
+
+  # Record the worker outcome. Re-read epoch so the timestamp reflects
+  # completion, not the dispatch instant.
+  bridge_daemon_supp_group_refresh_throttle_write \
+    "$(date +%s 2>/dev/null || printf '0')" "$status" "$group" 2>/dev/null || true
+
+  # Audit row for the worker outcome class. Non-fatal — audit failure
+  # does not change the worker exit status.
+  bridge_audit_log daemon daemon_supp_groups_refresh_worker_done daemon \
+    --detail group="$group" \
+    --detail status="$status" >/dev/null 2>&1 || true
+
+  case "$status" in
+    ok|ok-systemd-sudo-self|skipped-*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # matched `ensure)`, and called `cmd_start` unconditionally, starting
 # the daemon. Each verb now scans its remaining args for -h/--help/help
 # and prints usage instead of executing the cmd_*.
@@ -7716,6 +8054,18 @@ case "$CMD" in
       exit 0
     fi
     cmd_sync_cycle
+    ;;
+  supp-refresh-worker)
+    # Lane F internal subcommand — invoked as a detached external
+    # process by the daemon's autonomous supp-groups poll (codex
+    # caveat #2). Not advertised in usage(); behaves as a no-op when
+    # called without a group argument so manual operator invocation
+    # cannot crash a daemon shell.
+    if daemon_args_have_help "$@"; then
+      usage
+      exit 0
+    fi
+    cmd_supp_refresh_worker "$@"
     ;;
   *)
     usage
