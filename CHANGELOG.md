@@ -6,6 +6,62 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.0-beta3] — 2026-05-27
+
+### Highlight — Wave-1 OOTB blocker closure (#1246 / #1248 / #1249 / #1250 / #1251 / #1252) + Lane B plugin UX
+
+Operator-cued autonomous beta loop directive 2026-05-27: ship beta3 → A2A patch verify → loop until GREEN. Driven by patch's fresh-install OOTB verify on `cm-prod-agentworkflow-vm01` against beta2, which surfaced 10 issues. Wave-1 closed the blocker trio (#1246/#1248/#1252) + restart semantics #1251 + plugin UX bundle #1249/#1250 across 4 parallel lanes with 1-3 codex review rounds each. Wave-2 (#1247 + #1254) and Wave-3 (nits #1253/#1255) deferred pending patch fresh-install verify against this beta.
+
+`-beta3` prerelease, matching tag `v0.15.0-beta3`, GitHub release marked **Pre-release**.
+
+### Fixed — daemon supp-group pre-check authoritative + state/agents/<a>/ self-heal (#1246 + #1252, Lane A12 PR #1260)
+
+`agent create <agent> --isolate` was emitting `daemon_group_refresh: skipped-daemon-already-has-group` even when the running daemon's supplementary group set was provably stale (the freshly-created `ab-agent-<agent>` GID was NOT in `/proc/<daemon_pid>/status` → `Groups:`). The systemd-user auto-restart branch was bypassed; downstream session-id capture (#1248) + nudge path (#1252) both broke.
+
+- **`lib/bridge-daemon-control.sh`** — `_bridge_daemon_control_daemon_has_gid` rewritten to read authoritative `/proc/<daemon_pid>/status` Groups line instead of on-disk cache. New `_bridge_daemon_control_proc_owner_on_disk_groups` resolver (Uid → user → id -G) lets decision-evidence emit both `on_disk=<GIDs>` AND `in_proc=<GIDs>` so operators can diagnose stale-cache vs genuine-need-refresh quickly. Format: `[daemon-control] supp-group check: pid=<P> on_disk=<GIDs> in_proc=<GIDs> target_gid=<G> action=<refresh|skip> reason=<rationale>`.
+- **`lib/bridge-state.sh`** — new `bridge_agent_state_dir_self_heal` verifier with auto-repair. For iso-v2 agents (gated on `bridge_agent_linux_user_isolation_effective` after r3): pre-existing dirs verify mode `2770` AND group `ab-agent-<a>`; newly-created dirs get `mkdir -m 2770 -p` + `chgrp ab-agent-<a>` + post-chgrp verify. 6 structured fail reasons: `mkdir`, `chgrp`, `chgrp_verify`, `chmod`, `chmod_verify`, `group_resolver_empty`. Non-iso agents: helper creates dir but no-ops ab-agent enforcement (codex r2 catch — r1/r2 had over-enforced on all creates and broke ordinary `agent create`).
+- **`lib/bridge-channels.sh`** — `bridge_write_idle_ready_agents` calls self-heal helper + emits structured `[nudge-skip] agent=<a> task=<id|none> reason=<state-dir-missing|...>` audit line on failure. No silent drops.
+- **`bridge-agent.sh::run_create`** — synchronous self-heal call BEFORE returning `create:ok` (blocks until dir materialized with correct mode/group on iso-v2).
+- **`bridge-daemon.sh`** — three existing nudge-skip code paths (live-queued-empty / age-gate-failed / dedup-cooldown) now also emit structured `[nudge-skip]` lines with the actual task id (`task=none` only when no task in scope).
+- Smoke: `scripts/smoke/A12-beta3-1246-1252-daemon-supp-group-and-state-dir.sh` 17 tests including iso-v2 enforcement + non-iso passthrough + 3 teeth-checks (one per codex finding). ci-select-smoke.sh 5-site registration.
+
+### Fixed — `agent restart` session_id fail-loud + `--no-continue`/`continue=1` reconcile + bridge-start.sh swallow removed (#1248, Lane A3 PR #1259)
+
+`agent restart` on iso-v2 agent spawned a fresh Claude session instead of resuming. `session_id: ""` even with `continue: 1`. Layered cause: layer 1 was Lane A12 (state-dir write blocked by stale daemon group); layer 2 was silent swallow in the write helper; layer 3 was `--no-continue` vs `continue=1` propagation divergence.
+
+- **`lib/bridge-state.sh`** (layer 2) — write rc propagation + `bridge_die` on persist failure with structured reason (`state_dir_write_failed:session_id agent=<a> path=<file> rc=<N>`). `[session-id]` audit-log breadcrumb on success.
+- **`bridge-run.sh`** (layer 3) — new reconcile gate: `continue=1 + session_id present` → `--resume <id>`; `continue=1 + session_id empty` → `bridge_die` with (a)/(b)/(c) remediation text; `continue=0` or `--no-continue` → no resume verb. Dropped the silent stderr swallow on session-id capture.
+- **`bridge-start.sh`** (codex r1 BLOCKING fix) — `:982` previously routed `bridge_refresh_agent_session_id` through `>/dev/null 2>&1 || true`. With Layer 2's `bridge_die` semantics this swallowed the structured stderr AND `|| true` couldn't catch `exit` from inside the function — `bridge-start.sh` died silently after tmux creation. R2 dropped both swallows; structured reason now surfaces.
+- Smoke: `scripts/smoke/A3-beta3-1248-restart-session-id-resume.sh` 9 tests + caller audit (all 5 callers in repo enumerated). ci-select 3-site registration.
+
+### Added — `agent restart` 3-phase transactional flow + auto-rollback + `restart.in-progress` marker (#1251, Lane C1 PR #1256)
+
+`agent-bridge agent restart <agent>` that errored partway through (after stopping prior tmux session, before successfully launching new one) used to leave the agent **stopped** with channel update intact. Watchdog fired `[watchdog] agent profile drift`; operator had to manually re-start.
+
+- **Phase 1 — pre-flight validation** (BEFORE the kill): channel-spec canonical resolution (Lane G beta1), plugin catalog seeded (Lane β beta2), daemon supp-group present (Lane A12 beta3, conditional via `declare -f` guard), engine binary exists, session-id state consistent (Lane A3 beta3). Any check fails → abort, agent stays running, no state mutation.
+- **Phase 2 — snapshot + marker + execute**: snapshot captured from `agent-roster.local.sh` managed block BEFORE the channel update (codex r1 fix — earlier ordering captured the failing config). Marker `state/agents/<a>/restart.in-progress` written with schema (SSOT comment): `pid=<orchestrator-pid>`, `started=<unix-ts>`, `ttl=<seconds>` (default 60), `state=in_progress|rolled_back|completed`, `reason=<structured>`. Apply changes; stop + start tmux.
+- **Phase 3 — success cleanup or auto-rollback**: on success — remove marker + snapshot. On failure (any step) — restore roster from pre-update snapshot, re-start with PRIOR channels, marker state=rolled_back with structured reason.
+- Marker contract for Lane C2 (deferred #1254): `bridge_agent_restart_marker_active` requires both `kill -0 <pid>` AND TTL window AND `state=in_progress` (codex r1 fix — earlier version ignored PID liveness, allowed crashed orchestrator to block watchdog for full TTL).
+- Marker file mode `0640` + group `ab-agent-<a>` on Linux iso-v2 (codex r1 fix — earlier umask-default 0600 was unreadable by iso UID).
+- Smoke: `scripts/smoke/C1-beta3-1251-restart-preflight-rollback.sh` 11 tests including production-ordering rollback + dead-PID marker + marker mode + 5 teeth-checks. ci-select 3-site registration.
+
+### Added — `agb plugins add-marketplace` integrated verb + iso-v2 banner + seed auto bun-install with fail-loud (#1249 + #1250, Lane B PR #1258)
+
+For iso-v2 agents, controller `claude plugin install` silently diverges from what the iso agent will actually load. The 5-step operator dance (claude marketplace add → claude plugin install → agent update --channels-add → agent restart) silently failed at restart with `Claude plugin '<name>@<marketplace>' is not declared`. Separately, `agb plugins seed` reported `node_modules=missing` alongside `criticality=channel-required` and proceeded — silent runtime failure later.
+
+- **`agb plugins add-marketplace <url-or-path> [--channels <plugin-ref>,...]`** — single integrated verb: clone marketplace to shared cache (or register local path), run `bridge-plugins.sh seed --marketplace-root <path>`, apply iso v2 chmod (mode `2770` + chgrp `ab-shared`). Idempotent.
+- **`agb plugins help install`** advisory text — iso-v2 banner explaining controller / iso-agent plugin namespaces are separated by design.
+- **`agb plugins seed` auto bun-install** — when `node_modules=missing` AND deps declared (`dependencies`/`peerDependencies`/`bun.lockb`/`package-lock.json` present): runs `bun install` automatically. On failure with `criticality=channel-required`: emits structured `seed_status=incomplete node_modules=install_failed plugin=<name> criticality=channel-required rc=<N>` tokens (codex r2 fix — r1 dropped these and only printed generic remediation) + exits non-zero. `--no-auto-install` flag opts out (air-gapped).
+- New file-as-argv helper: `lib/upgrade-helpers/plugins-seed-parse-sync-output.py` (mode 100755 — codex r2 fix; r1 was 100644).
+- Smoke: `scripts/smoke/B-beta3-1249-1250-plugin-ux.sh` 7 tests with T6 grep-asserting all 3 structured tokens. ci-select 3-site registration.
+
+### Deferred to Wave-2 / Wave-3
+
+`agent restart` failure leaves stopped → handled by Wave-1 C1 (#1251). The following remain queued pending patch fresh-install verify:
+
+- Wave-2 (#1254 watchdog scan_error vs restart-in-progress + #1247 admin set auto-restart preserving session) — consumes C1's marker schema.
+- Wave-3 (#1253 `agb claim --note` + #1255 roster read-block softening) — nits, may defer further if not surfaced by patch verify.
+
 ## [0.15.0-beta2] — 2026-05-26
 
 ### Highlight — 7-lane parallel OOTB closure (#1231–#1238 + #6607)
