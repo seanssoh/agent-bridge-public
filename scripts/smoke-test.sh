@@ -306,6 +306,13 @@ BRIDGE_AGENT_ENGINE["dryrun-redact-smoke"]="claude"
 BRIDGE_AGENT_SESSION["dryrun-redact-smoke"]="dryrun-redact-smoke"
 BRIDGE_AGENT_WORKDIR["dryrun-redact-smoke"]="$LAUNCH_DRYRUN_WORKDIR"
 BRIDGE_AGENT_LAUNCH_CMD["dryrun-redact-smoke"]='MS365_CLIENT_SECRET=fake-secret-XYZ MY_API_TOKEN=fake-token-ABC BRIDGE_LAYOUT_MARKER_KEY=preserve-me claude --ok'
+# v0.15.0-beta3 Lane A3 (#1248): the new bridge-run.sh --no-continue
+# vs continue=1 reconcile gate fails loud when effective continue=1
+# AND session_id is empty. This smoke is testing the launch-cmd
+# redaction path, NOT the resume contract, so pin continue=0 explicitly
+# so the gate is bypassed. Without this, the smoke fails with the
+# session_id-missing remediation instead of exercising the redactor.
+BRIDGE_AGENT_CONTINUE["dryrun-redact-smoke"]=0
 EOF
 # Unset any inherited BRIDGE_ROSTER_* / BRIDGE_*_DIR overrides so the
 # isolated BRIDGE_HOME defaults bind to LAUNCH_DRYRUN_HOME. Without this,
@@ -2092,6 +2099,14 @@ BRIDGE_AGENT_DISCORD_CHANNEL_ID["$SMOKE_AGENT"]="123456789012345678"
 BRIDGE_AGENT_NOTIFY_ACCOUNT["$SMOKE_AGENT"]="smoke"
 BRIDGE_AGENT_CHANNELS["claude-static"]="plugin:discord@claude-plugins-official"
 BRIDGE_AGENT_CONTINUE["$ROSTER_RELOAD_AGENT"]="0"
+# v0.15.0-beta3 Lane A3 (#1248): the new bridge-run.sh reconcile gate
+# fails loud when effective continue=1 AND session_id is empty. The
+# codex CLI agent below is exercised via bridge-run.sh --dry-run at
+# line 3920 to verify the launch_cmd shape (codex_hooks + fast_mode
+# features), not the resume contract — pin continue=0 so the gate is
+# bypassed. Without this, the dry-run fails with the session_id-missing
+# remediation instead of exercising the launch_cmd builder.
+BRIDGE_AGENT_CONTINUE["$CODEX_CLI_AGENT"]="0"
 BRIDGE_CRON_AGENT_TARGET["legacy-ops"]="$AUTO_START_AGENT"
 BRIDGE_AGENT_LAUNCH_CMD["$SMOKE_AGENT"]='python3 -c "import time; print(\"smoke-agent ready\", flush=True); time.sleep(30)"'
 BRIDGE_AGENT_LAUNCH_CMD["$REQUESTER_AGENT"]='python3 -c "import time; print(\"requester-agent ready\", flush=True); time.sleep(30)"'

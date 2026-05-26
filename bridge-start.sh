@@ -979,7 +979,17 @@ if [[ "$ENGINE" == "claude" ]]; then
   bridge_agent_mark_idle_now "$AGENT" || true
 fi
 if [[ -z "$(bridge_agent_session_id "$AGENT")" ]]; then
-  bridge_refresh_agent_session_id "$AGENT" 12 0.25 >/dev/null 2>&1 || true
+  # Issue #1248 Lane A3 r2 (codex r1 BLOCKING): drop the
+  # `2>&1 ... || true` swallow. `bridge_refresh_agent_session_id`
+  # `bridge_die`s on persist-write failure (`state_dir_write_failed:
+  # session_id`); `bridge_die` calls `exit 1`, which the `|| true` cannot
+  # intercept — so the only practical effect of the swallow was to redirect
+  # the structured stderr reason and the `[session-id]` success breadcrumb
+  # to /dev/null while bridge-start.sh died silently. Let stderr through
+  # so the operator sees the structured reason on failure and the
+  # session_id capture breadcrumb on success. Stdout (the captured id)
+  # is still suppressed because nothing here consumes it.
+  bridge_refresh_agent_session_id "$AGENT" 12 0.25 >/dev/null
 fi
 echo "[info] 세션 '$SESSION' 시작 완료"
 

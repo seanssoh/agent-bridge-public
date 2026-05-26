@@ -178,6 +178,47 @@ if [[ $SAFE_MODE -eq 1 ]]; then
   ONCE=1
 fi
 
+# Issue #1248 Lane A3 — `--no-continue` vs `continue=1` reconcile.
+#
+# Source-of-truth matrix (applied AFTER --continue/--no-continue overrides
+# from CLI args have been folded into BRIDGE_AGENT_CONTINUE):
+#
+#   effective continue=1 + session_id non-empty  ->  resume verb in
+#       launch_cmd (engine-specific: claude --resume <id>, codex resume
+#       <id>); decided by the downstream launch-cmd builders.
+#   effective continue=1 + session_id EMPTY      ->  bridge_die here with
+#       structured remediation. This is the #1248 surface — silent
+#       persist-write failure (downstream of #1246) left session_id
+#       empty, and every subsequent restart spawned a fresh Claude
+#       session because the launch-cmd builder's
+#       `bridge_claude_has_resumable_session_state` fallback emitted
+#       --continue and the post-startup capture in
+#       bridge_run_schedule_idle_marker_and_inbox_bootstrap silently
+#       swallowed the persist failure. Failing here makes the missing
+#       capture ops-visible on the next restart instead of compounding
+#       into another orphan jsonl.
+#   effective continue=0 or --no-continue passed  ->  NO resume verb
+#       (intentional fresh session); decided by the downstream builders.
+#
+# Safe-mode short-circuit: BRIDGE_AGENT_RESUME_GATE_ENABLED=0 disables
+# the gate for the rare case an operator needs to bypass it during
+# incident triage (e.g. inspecting a known-broken roster). Audit-log a
+# one-line breadcrumb so the bypass is not invisible.
+_resume_gate_enabled="${BRIDGE_AGENT_RESUME_GATE_ENABLED:-1}"
+if [[ "$_resume_gate_enabled" == "1" && $SAFE_MODE -eq 0 ]]; then
+  _gate_continue="$(bridge_agent_continue "$AGENT")"
+  _gate_session_id="$(bridge_agent_session_id "$AGENT")"
+  if [[ "$_gate_continue" == "1" && -z "$_gate_session_id" ]]; then
+    bridge_audit_log state session_id_missing_resume_blocked "$AGENT" \
+      --detail continue_mode="$_gate_continue" \
+      --detail reason=session_id_empty_with_continue_1 \
+      2>/dev/null || true
+    bridge_die "session_id missing; one of: (a) run agent first interactively to capture, (b) set continue=0 explicitly, (c) check #1246 daemon supp-group state (agent=$AGENT continue=$_gate_continue session_id=empty)"
+  fi
+  unset _gate_continue _gate_session_id
+fi
+unset _resume_gate_enabled
+
 WORK_DIR="$(bridge_agent_workdir "$AGENT")"
 ENGINE="$(bridge_agent_engine "$AGENT")"
 SESSION="$(bridge_agent_session "$AGENT")"
@@ -421,13 +462,22 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
       previous_session_id="$6"
       source "$script_dir/bridge-lib.sh"
       if bridge_tmux_wait_for_prompt "$session" claude 30; then
+        # Issue #1248 Lane A3: drop the `>/dev/null 2>&1 || true` swallow
+        # that silently absorbed every persist-write failure (root
+        # symptom: session_id never landed on disk, every subsequent
+        # restart spawned a fresh Claude session). The function now
+        # `bridge_die`s on a persistence write failure; let stderr reach
+        # the parent subshell so the structured reason and the
+        # [session-id] success breadcrumb both land in the agent log.
+        # Suppress stdout (the captured id) — only stderr carries the
+        # ops-visible signal we care about here.
         if [[ -f "$next_file" && -n "$previous_session_id" ]]; then
-          bridge_refresh_agent_session_id "$agent" 24 0.5 "$previous_session_id" >/dev/null 2>&1 || true
+          bridge_refresh_agent_session_id "$agent" 24 0.5 "$previous_session_id" >/dev/null || true
         elif [[ -z "$(bridge_agent_session_id "$agent")" ]]; then
           # Claude session metadata can appear after tmux startup. Refresh once
           # more at prompt-ready time so static resume state is persisted before
           # the agent later goes inactive.
-          bridge_refresh_agent_session_id "$agent" 24 0.5 >/dev/null 2>&1 || true
+          bridge_refresh_agent_session_id "$agent" 24 0.5 >/dev/null || true
         fi
         bridge_agent_mark_idle_now "$agent"
         if [[ ! -f "$next_file" && ! -f "$marker_file" ]]; then
@@ -454,7 +504,7 @@ bridge_run_schedule_idle_marker_and_inbox_bootstrap() {
         fi
       fi
     ' -- "$SCRIPT_DIR" "$SESSION" "$AGENT" "$marker_file" "$next_file" "$previous_session_id"
-  ) >/dev/null 2>&1 &
+  ) </dev/null >/dev/null 2>>"$ERRFILE" &
 }
 
 bridge_run_should_auto_accept_dev_channels() {

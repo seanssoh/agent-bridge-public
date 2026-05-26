@@ -1742,8 +1742,20 @@ EOF
     bridge_warn "bridge_write_agent_state_file: sudo-handoff write failed for $file (agent=$agent); falling back to direct write — expect Permission denied if the per-agent root is not writable to the controller"
   fi
 
-  mkdir -p "$(dirname "$file")"
-  printf '%s' "$content" >"$file"
+  # Issue #1248 Lane A3: propagate mkdir / write failures so callers like
+  # `bridge_refresh_agent_session_id` can detect a state-dir-not-writable
+  # condition (downstream of #1246's stale supp-group set) and fail loud
+  # instead of silently leaving session_id empty. Prior to this change,
+  # `printf '%s' "$content" >"$file"` rc was the function rc, but
+  # `mkdir -p` errors were swallowed when the parent dir was missing AND
+  # uncreatable.
+  if ! mkdir -p "$(dirname "$file")" 2>/dev/null; then
+    return 1
+  fi
+  if ! printf '%s' "$content" >"$file"; then
+    return 1
+  fi
+  return 0
 }
 
 bridge_write_dynamic_agent_file() {
@@ -2984,9 +2996,17 @@ bridge_remove_dynamic_agent_file() {
 
 bridge_persist_agent_state() {
   local agent="$1"
+  local _rc=0
 
   if [[ "$(bridge_agent_source "$agent")" == "dynamic" ]]; then
-    bridge_write_dynamic_agent_file "$agent"
+    # Issue #1248 Lane A3: propagate dynamic-file write rc so
+    # bridge_refresh_agent_session_id can fail loud on persistence
+    # failure (the #1248 symptom: silent write failure left session_id
+    # empty and every restart spawned a fresh Claude session).
+    bridge_write_dynamic_agent_file "$agent" || _rc=$?
+    if (( _rc != 0 )); then
+      return "$_rc"
+    fi
   fi
   bridge_write_agent_state_file "$agent" "$(bridge_history_file_for_agent "$agent")"
 }
@@ -3294,7 +3314,35 @@ bridge_refresh_agent_session_id() {
 
     if [[ -n "$detected" ]]; then
       BRIDGE_AGENT_SESSION_ID["$agent"]="$detected"
-      bridge_persist_agent_state "$agent"
+      # Issue #1248 Lane A3: capture persist rc so a state-dir write
+      # failure (downstream of #1246) surfaces fail-loud instead of
+      # silently leaving session_id empty for every subsequent restart.
+      local _persist_rc=0
+      bridge_persist_agent_state "$agent" || _persist_rc=$?
+      if (( _persist_rc != 0 )); then
+        local _state_file
+        _state_file="$(bridge_history_file_for_agent "$agent" 2>/dev/null || printf '<unknown>')"
+        bridge_audit_log state session_id_persist_failed "$agent" \
+          --detail reason=state_dir_write_failed \
+          --detail path="$_state_file" \
+          --detail rc="$_persist_rc" \
+          2>/dev/null || true
+        bridge_die "state_dir_write_failed:session_id agent=$agent path=$_state_file rc=$_persist_rc"
+      fi
+      # Audit-log line on success — gives ops a visible breadcrumb that
+      # the session_id capture+persist round-trip completed. Short id
+      # (first 8 chars) keeps the audit row compact while still
+      # disambiguating across multiple captures.
+      local _short_id="${detected:0:8}"
+      bridge_audit_log state session_id_persisted "$agent" \
+        --detail short_id="$_short_id" \
+        --detail path="$(bridge_history_file_for_agent "$agent" 2>/dev/null || printf '<unknown>')" \
+        2>/dev/null || true
+      # Stable structured stderr breadcrumb for log scrapers / smoke
+      # assertions. Matches the [session-id] tag the brief calls out.
+      printf '[session-id] agent=%s id=%s written=%s\n' \
+        "$agent" "$_short_id" \
+        "$(bridge_history_file_for_agent "$agent" 2>/dev/null || printf '<unknown>')" >&2
       printf '%s' "$detected"
       return 0
     fi
