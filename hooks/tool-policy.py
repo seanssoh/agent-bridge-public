@@ -1835,22 +1835,96 @@ def _safe_slug_arg(value: str) -> bool:
     return bool(_SAFE_SLUG_RE.match(value))
 
 
-def _extract_flag_value(tokens: list[str], flag: str) -> str | None:
-    """Return the value of the first `--flag <value>` or `--flag=value`
-    occurrence in *tokens*, or None when absent / malformed.
+# Distinct sentinels for `_extract_flag_value` outcomes. The earlier
+# implementation collapsed "absent" and "malformed" into a single `None`
+# return — codex r1 (PR #1243) flagged this as a security regression
+# because the a2a-send allowlist treated "no --body-file arg" and "
+# --body-file at end of argv" identically (both allowed). Three malformed
+# shapes slipped through:
+#   - `agb a2a send --body-file`                 (flag, no value)
+#   - `agb a2a send --body-file --to peer`       (next token is another flag)
+#   - `agb a2a send --body-file /tmp/x --body-file ../../secret` (duplicate)
+# We now distinguish absent (allowed) from malformed/duplicate (denied)
+# with two singleton sentinels. Callers in the bridge-verb allowlist
+# branch on identity, NOT on `is None`, so a future refactor that
+# accidentally returns `None` is caught by a type/identity mismatch in
+# review rather than silently re-opening the bypass.
+class _FlagSentinel:
+    __slots__ = ("_label",)
 
-    `--flag` alone (no value) returns None — caller treats absence and
-    malformed identically.
+    def __init__(self, label: str) -> None:
+        self._label = label
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<{self._label}>"
+
+
+_FLAG_ABSENT = _FlagSentinel("FLAG_ABSENT")
+_FLAG_MALFORMED = _FlagSentinel("FLAG_MALFORMED")
+
+
+def _extract_flag_value(
+    tokens: list[str], flag: str
+) -> "str | _FlagSentinel":
+    """Return the value of `--flag <value>` / `--flag=value` in *tokens*.
+
+    Three distinct outcomes:
+    - `_FLAG_ABSENT`: flag not present at all. Caller may allow the
+      command (the flag is optional in the verb shape).
+    - `_FLAG_MALFORMED`: flag present but its value is missing or
+      smuggled — codex r1 cases. Specifically:
+        * `--flag` at end of argv (no following token);
+        * `--flag` followed by another `--flag-like` token (the next
+          token starts with `-` and is not a bare `-` stdin marker);
+        * the flag appears more than once (separated or packed), even
+          if every individual occurrence carries a value. Duplicates
+          are treated as a smuggling attempt (last-wins semantics would
+          let `--body-file /tmp/ok --body-file ../../secret` slip the
+          first occurrence past the allowlist).
+      Caller MUST deny these.
+    - `str`: flag present exactly once with a non-flag value. Caller
+      validates the string with `_safe_path_arg` / `_safe_slug_arg` /
+      similar before allowing.
     """
-    for idx, tok in enumerate(tokens):
+    found: str | None = None
+    seen = 0
+    idx = 0
+    n = len(tokens)
+    prefix = flag + "="
+    while idx < n:
+        tok = tokens[idx]
         if tok == flag:
-            if idx + 1 < len(tokens):
-                return tokens[idx + 1]
-            return None
-        prefix = flag + "="
+            seen += 1
+            if seen > 1:
+                return _FLAG_MALFORMED
+            if idx + 1 >= n:
+                return _FLAG_MALFORMED
+            nxt = tokens[idx + 1]
+            # A following token that looks like another flag (starts
+            # with `-` and is more than a single dash) is treated as a
+            # missing value — `agb a2a send --body-file --to peer`.
+            if nxt.startswith("-") and nxt != "-":
+                return _FLAG_MALFORMED
+            found = nxt
+            idx += 2
+            continue
         if tok.startswith(prefix):
-            return tok[len(prefix):]
-    return None
+            seen += 1
+            if seen > 1:
+                return _FLAG_MALFORMED
+            # `--flag=` (empty value) is malformed; `_safe_path_arg`
+            # would reject an empty string anyway, but the caller
+            # contract wants a clear deny shape.
+            value = tok[len(prefix):]
+            if value == "":
+                return _FLAG_MALFORMED
+            found = value
+        idx += 1
+    if seen == 0:
+        return _FLAG_ABSENT
+    # seen == 1 and we captured a non-flag, non-empty value above.
+    assert found is not None
+    return found
 
 
 def _emit_admin_bridge_verb_audit(
@@ -1880,6 +1954,41 @@ def _emit_admin_bridge_verb_audit(
         }
     write_audit(
         "tool_policy_admin_bridge_verb_allowed",
+        agent or "unknown",
+        detail,
+    )
+
+
+def _emit_admin_bridge_verb_denied_shape_audit(
+    agent: str,
+    *,
+    text: str,
+    tool_input: dict[str, Any] | None,
+    verb_path: tuple[str, ...],
+    reason: str,
+) -> None:
+    """Audit row for an admin bridge-verb shape-deny (codex r1 PR #1243).
+
+    Mirrors `_emit_admin_bridge_verb_audit` so a single audit consumer
+    can grep both allow + deny shape rows uniformly. The `reason` field
+    records the specific malformed-shape failure (missing value,
+    duplicate flag, etc.) so operators can triage smuggling attempts.
+    """
+    detail: dict[str, Any] = {
+        "tool": "Bash",
+        "verb": " ".join(verb_path),
+        "reason": reason,
+        "sample": truncate_text(text, 240),
+    }
+    if tool_input is not None:
+        detail["summary"] = tool_input_summary("Bash", tool_input)
+    else:
+        detail["summary"] = {
+            "command": truncate_text(text, 240),
+            "description": "",
+        }
+    write_audit(
+        "tool_policy_admin_bridge_verb_denied_shape",
         agent or "unknown",
         detail,
     )
@@ -1983,7 +2092,25 @@ def _admin_bridge_verb_check(
         if len(tokens) < 3 or tokens[2] != "send":
             return False, None
         body_file = _extract_flag_value(tokens[3:], "--body-file")
-        if body_file is not None and not _safe_path_arg(body_file):
+        if body_file is _FLAG_MALFORMED:
+            # codex r1 (PR #1243): `--body-file` alone, `--body-file
+            # --to peer`, and `--body-file /tmp/ok --body-file
+            # ../../secret` all reach here. Emit a distinct
+            # `_denied_shape` audit row (NOT the `_allowed` row) so
+            # operators can grep smuggling attempts and so the smoke
+            # counter-proofs can pin the deny shape.
+            _emit_admin_bridge_verb_denied_shape_audit(
+                agent,
+                text=text,
+                tool_input=tool_input,
+                verb_path=("a2a", "send"),
+                reason="malformed_or_duplicate_body_file",
+            )
+            return False, (
+                "agent-bridge a2a send: malformed --body-file "
+                "(missing value, smuggled flag, or duplicate)"
+            )
+        if body_file is not _FLAG_ABSENT and not _safe_path_arg(body_file):
             return False, (
                 "agent-bridge a2a send: unsafe --body-file path "
                 "(path traversal / shell metachar / empty)"

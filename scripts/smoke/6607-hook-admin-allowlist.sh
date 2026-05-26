@@ -272,6 +272,70 @@ assert_hook_verdict \
   "agb a2a send --to peer --body-file=../../secret" \
   "DENY" "0"
 
+# --- Denied: malformed --body-file shapes (codex r1 PR #1243) ---------------
+#
+# Codex r1 surfaced three malformed shapes that the prior `_extract_flag_value`
+# collapsed into the "absent" branch and audited as ALLOW:
+#   - `agb a2a send --body-file`                          (flag with no value)
+#   - `agb a2a send --body-file --to peer`                (next token is another flag)
+#   - `agb a2a send --body-file /tmp/ok --body-file ../../secret` (duplicate)
+# The r2 fix splits absent vs malformed via two sentinels and emits a
+# distinct `tool_policy_admin_bridge_verb_denied_shape` audit row for the
+# malformed branch. These three counter-proofs pin all three repro shapes
+# so a future refactor that silently re-collapses absent + malformed
+# trips this smoke immediately.
+assert_hook_shape_deny() {
+  local label="$1"
+  local agent="$2"
+  local command="$3"
+  local payload out got
+  payload="$SMOKE_TMP_ROOT/payload-shape-$RANDOM.json"
+  write_bash_payload "$payload" "$command"
+
+  local allowed_before allowed_after denied_before denied_after
+  allowed_before="$(count_audit_rows tool_policy_admin_bridge_verb_allowed "$agent")"
+  denied_before="$(count_audit_rows tool_policy_admin_bridge_verb_denied_shape "$agent")"
+
+  out="$(run_pretool_hook "$agent" "$payload")"
+  if [[ "$out" == *'"permissionDecision": "deny"'* ]]; then
+    got="DENY"
+  else
+    got="ALLOW"
+  fi
+  if [[ "$got" != "DENY" ]]; then
+    smoke_log "FAIL: ${label} -> ${got}, want DENY"
+    smoke_log "      command: ${command}"
+    smoke_log "      hook output: ${out:-<empty>}"
+    smoke_fail "${label}: expected DENY, got ${got}"
+  fi
+
+  allowed_after="$(count_audit_rows tool_policy_admin_bridge_verb_allowed "$agent")"
+  denied_after="$(count_audit_rows tool_policy_admin_bridge_verb_denied_shape "$agent")"
+
+  if (( allowed_after != allowed_before )); then
+    smoke_fail "${label}: must NOT emit _allowed audit row (got delta $((allowed_after - allowed_before)))"
+  fi
+  if (( denied_after != denied_before + 1 )); then
+    smoke_fail "${label}: expected +1 _denied_shape audit row, got delta $((denied_after - denied_before))"
+  fi
+  smoke_log "ok: ${label} -> DENY + _denied_shape audit row"
+}
+
+assert_hook_shape_deny \
+  "admin: a2a send --body-file (no value — codex r1 case 1)" \
+  "$ADMIN_AGENT" \
+  "agb a2a send --body-file"
+
+assert_hook_shape_deny \
+  "admin: a2a send --body-file --to peer (next token is flag — codex r1 case 2)" \
+  "$ADMIN_AGENT" \
+  "agb a2a send --body-file --to peer"
+
+assert_hook_shape_deny \
+  "admin: a2a send --body-file /tmp/ok --body-file ../../secret (duplicate — codex r1 case 3)" \
+  "$ADMIN_AGENT" \
+  "agb a2a send --body-file /tmp/ok --body-file ../../secret"
+
 # --- Denied: unknown flag smuggle attempts ---------------------------------
 
 # An unknown flag like `--exec` MUST be rejected — the allowlist is
