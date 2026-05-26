@@ -314,6 +314,11 @@ write_t3b_shims() {
 # Extract the helper definition + invoke harness. We avoid sourcing the
 # full bridge-daemon.sh (it would pull bridge-lib.sh + roster + everything),
 # extract just the helper function body via awk and define it standalone.
+#
+# v0.15.0-beta1 Lane F: the warn wrapper now delegates the detection to a
+# new data helper `bridge_daemon_detect_stale_supp_groups`. Both functions
+# must be present in the extract so the wrapper's `iso_names_lines=$(...)`
+# capture resolves correctly.
 extract_helper() {
   local source="$REPO_ROOT/bridge-daemon.sh"
   local out="$SMOKE_TMP_ROOT/helper-extract.sh"
@@ -323,6 +328,8 @@ extract_helper() {
     printf '%s\n' '#!/usr/bin/env bash'
     # Need daemon_warn too (helper calls it).
     awk '/^daemon_warn\(\) \{/,/^\}/' "$source"
+    printf '%s\n' ''
+    awk '/^bridge_daemon_detect_stale_supp_groups\(\) \{/,/^\}/' "$source"
     printf '%s\n' ''
     awk '/^bridge_daemon_warn_if_supp_groups_stale\(\) \{/,/^\}/' "$source"
     printf '%s\n' ''
