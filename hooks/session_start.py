@@ -31,6 +31,8 @@ from bridge_hook_common import (
     compact_recovery_context,
     remember_session_start,
     session_start_context,
+    under_isolated_uid,
+    write_audit,
 )
 
 # Issue #597 Track B: schema for the completed-marker the daemon observer
@@ -122,34 +124,58 @@ def _write_compact_completed_marker(agent: str, matcher: str) -> None:
         # process completions in chronological order without parsing JSON;
         # pid breaks ties on the unlikely same-second double-fire.
         target_dir = bridge_state_dir() / "precompact-events" / agent / "completed"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        marker_name = f"{completed_ts}-{hook_pid}.json"
-        target = target_dir / marker_name
-        marker = {
-            "schema_version": _COMPLETED_MARKER_SCHEMA_VERSION,
-            "agent": agent,
-            "completed_ts": completed_ts,
-            "completed_iso": completed_iso,
-            "hook_pid": hook_pid,
-            "matcher": matcher,
-        }
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(target_dir),
-            prefix=f".{marker_name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            json.dump(marker, fh, ensure_ascii=False)
-            fh.write("\n")
-            fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except OSError:
-                pass
-            tmp_path = fh.name
-        os.replace(tmp_path, target)
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            marker_name = f"{completed_ts}-{hook_pid}.json"
+            target = target_dir / marker_name
+            marker = {
+                "schema_version": _COMPLETED_MARKER_SCHEMA_VERSION,
+                "agent": agent,
+                "completed_ts": completed_ts,
+                "completed_iso": completed_iso,
+                "hook_pid": hook_pid,
+                "matcher": matcher,
+            }
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(target_dir),
+                prefix=f".{marker_name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as fh:
+                json.dump(marker, fh, ensure_ascii=False)
+                fh.write("\n")
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+                tmp_path = fh.name
+            os.replace(tmp_path, target)
+        except (PermissionError, OSError) as exc:
+            # Issue #1217 (beta27 Track E): under iso v2, the precompact
+            # completed-marker dir lives under a controller-owned state
+            # tree the isolated UID cannot mkdir into. Surface an audit
+            # event so operators have telemetry on which marker writer
+            # fell open; then return without dumping a traceback. Outside
+            # iso, raise so the existing outer generic except keeps the
+            # previous exit-0 contract (no observable behavior change for
+            # the controller-side path).
+            if under_isolated_uid():
+                try:
+                    write_audit(
+                        "hook_permission_fail_open.session_start.completed_marker",
+                        str(target_dir),
+                        {
+                            "operation": "mkdir_or_replace",
+                            "error_class": type(exc).__name__,
+                        },
+                    )
+                except Exception:  # noqa: BLE001 — best-effort audit
+                    pass
+                return
+            raise
     except Exception:
         # Hook stays exit-0; missing marker just means no follow-up gets sent.
         pass

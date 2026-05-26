@@ -79,12 +79,16 @@ try:
     from bridge_hook_common import (
         compact_recovery_enabled,
         gather_canonical_files,
+        under_isolated_uid,
+        write_audit,
         write_compact_snapshot,
     )
 except ImportError:  # pragma: no cover — keep pre-compact resilient if
     # bridge_hook_common is missing (e.g. hooks/ is partially deployed).
     compact_recovery_enabled = None  # type: ignore[assignment]
     gather_canonical_files = None  # type: ignore[assignment]
+    under_isolated_uid = None  # type: ignore[assignment]
+    write_audit = None  # type: ignore[assignment]
     write_compact_snapshot = None  # type: ignore[assignment]
 
 
@@ -203,27 +207,52 @@ def _write_started_marker(agent: str, payload: dict, trigger: str) -> None:
             marker["payload_keys"] = sorted(k for k in payload.keys() if isinstance(k, str))
 
         target_dir = _state_dir() / "precompact-events" / agent / "started"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target = target_dir / f"{event_id}.json"
-        # Atomic temp-then-replace so a half-written marker can never be
-        # read by the daemon mid-write.
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=str(target_dir),
-            prefix=f".{event_id}.",
-            suffix=".tmp",
-            delete=False,
-        ) as fh:
-            json.dump(marker, fh, ensure_ascii=False)
-            fh.write("\n")
-            fh.flush()
-            try:
-                os.fsync(fh.fileno())
-            except OSError:
-                pass
-            tmp_path = fh.name
-        os.replace(tmp_path, target)
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            target = target_dir / f"{event_id}.json"
+            # Atomic temp-then-replace so a half-written marker can never be
+            # read by the daemon mid-write.
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=str(target_dir),
+                prefix=f".{event_id}.",
+                suffix=".tmp",
+                delete=False,
+            ) as fh:
+                json.dump(marker, fh, ensure_ascii=False)
+                fh.write("\n")
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except OSError:
+                    pass
+                tmp_path = fh.name
+            os.replace(tmp_path, target)
+        except (PermissionError, OSError) as exc:
+            # Issue #1217 (beta27 Track E): under iso v2, the precompact
+            # marker dir lives under a controller-owned state tree the
+            # isolated UID cannot mkdir into. Surface an audit event so
+            # operators have telemetry on which marker writer fell open;
+            # then return without dumping a traceback. Outside iso, raise
+            # so the existing outer generic except keeps the previous
+            # exit-0 contract (no observable behavior change for the
+            # controller-side path).
+            if under_isolated_uid is not None and under_isolated_uid():
+                if write_audit is not None:
+                    try:
+                        write_audit(
+                            "hook_permission_fail_open.precompact.started_marker",
+                            str(target_dir),
+                            {
+                                "operation": "mkdir_or_replace",
+                                "error_class": type(exc).__name__,
+                            },
+                        )
+                    except Exception:  # noqa: BLE001 — best-effort audit
+                        pass
+                return
+            raise
     except Exception:
         # Hook stays exit-0; missing marker just means no notice gets sent.
         pass

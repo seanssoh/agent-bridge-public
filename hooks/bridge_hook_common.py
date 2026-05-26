@@ -1014,7 +1014,19 @@ def save_timestamp_state(agent: str, payload: dict[str, int]) -> None:
 
 
 def agent_timestamp_enabled(agent: str) -> bool:
-    raw = os.environ.get("BRIDGE_AGENT_INJECT_TIMESTAMP", "").strip().lower()
+    # Issue #1217 (beta27 Track D): bridge-run.sh exports
+    # BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED as a distinctly-named scalar
+    # alias because the bare BRIDGE_AGENT_INJECT_TIMESTAMP collides with
+    # the assoc array of the same name in lib/bridge-core.sh:867 (bash
+    # silently no-ops a scalar export of a name bound to an assoc array).
+    # Read RESOLVED first; fall back to the bare name so manual /
+    # non-bridge launches (where the collision does not exist) keep
+    # working unchanged.
+    raw = (
+        os.environ.get("BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED")
+        or os.environ.get("BRIDGE_AGENT_INJECT_TIMESTAMP")
+        or ""
+    ).strip().lower()
     if not raw:
         return True
     return raw not in {"0", "false", "no", "off"}
