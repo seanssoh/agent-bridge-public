@@ -209,26 +209,32 @@ export PATH="$HOME/.local/bin:$HOME/.nix-profile/bin:/usr/local/bin:$PATH"
 export BRIDGE_AGENT_ID="$AGENT"
 export BRIDGE_ADMIN_AGENT_ID="$(bridge_admin_agent_id)"
 export BRIDGE_AGENT_WORKDIR="$WORK_DIR"
-# Issue #1213 (known limitation, deferred to beta27): both
-# BRIDGE_AGENT_ISOLATION_MODE and BRIDGE_AGENT_OS_USER share their
-# names with associative arrays declared in lib/bridge-agents.sh:3410
-# and lib/bridge-state.sh:1008. Bash silently no-ops a scalar export
-# of a name bound to an assoc array (no error, ARR=value writes to
-# ARR[0] and `export ARR` refuses to export the array), so the
-# scalar values below never reach the child env. The Python hook
-# layer worked around this in #1213 by switching its predicates
-# off the mode-string env var to a UID-based check
-# (`_current_agent_under_foreign_uid`); see
-# hooks/bridge_hook_common.py:_current_agent_under_foreign_uid.
-# BRIDGE_AGENT_INJECT_TIMESTAMP on line 221 below is the same
-# class of bug (assoc array in lib/bridge-core.sh:867 vs scalar
-# export). The fail mode there is much milder — the hook at
-# bridge_hook_common.py:1017 falls open to the default-true
-# inject_timestamp behavior — so a fix is deferred to beta27
-# rather than expanded into the #1213 scope.
-# DO NOT `unset` either array name as a workaround: downstream
-# array readers in bridge-run.sh and lib/* expect the lookup table
-# to remain populated.
+# Issue #1213 / #1217 (beta27): BRIDGE_AGENT_ISOLATION_MODE,
+# BRIDGE_AGENT_OS_USER, and BRIDGE_AGENT_INJECT_TIMESTAMP all share
+# their names with associative arrays declared in
+# lib/bridge-agents.sh:3410 (ISOLATION_MODE, OS_USER) and
+# lib/bridge-core.sh:867 (INJECT_TIMESTAMP). Bash silently no-ops a
+# scalar export of a name bound to an associative array (no error,
+# ARR=value writes to ARR[0] and `export ARR` refuses to export the
+# array), so the bare-name exports below never reach the child env.
+#
+# Fixes:
+#   - BRIDGE_AGENT_ISOLATION_MODE / BRIDGE_AGENT_OS_USER: #1213
+#     switched the Python hook predicate off the mode-string env to
+#     a UID-based check (_current_agent_under_foreign_uid); see
+#     hooks/bridge_hook_common.py:_under_isolated_uid. The bare-name
+#     scalar exports stay as silent-no-ops to avoid breaking any
+#     out-of-band consumer that might still read them on a future host.
+#   - BRIDGE_AGENT_INJECT_TIMESTAMP: #1217 (beta27 Track D) adds a
+#     distinctly-named scalar alias BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED
+#     (same shape as BRIDGE_AGENT_CLASS_FOR_HOOK for #539). The Python
+#     hook reads RESOLVED first, with a fallback to the bare name for
+#     manual / non-bridge launches where the assoc-array collision
+#     does not exist.
+#
+# DO NOT `unset` either array name as a workaround: downstream array
+# readers in bridge-run.sh and lib/* expect the lookup table to remain
+# populated.
 export BRIDGE_AGENT_ISOLATION_MODE="$(bridge_agent_isolation_mode "$AGENT")"
 export BRIDGE_AGENT_OS_USER="$(bridge_agent_os_user "$AGENT")"
 # Issue #539: privilege class consumed by hooks/tool-policy.py to gate
@@ -238,7 +244,13 @@ export BRIDGE_AGENT_OS_USER="$(bridge_agent_os_user "$AGENT")"
 # array of every agent's class; the hook only needs the calling agent's
 # value, so we surface a scalar alias here).
 export BRIDGE_AGENT_CLASS_FOR_HOOK="$(bridge_agent_class "$AGENT")"
+# Issue #1217 (beta27 Track D): the bare BRIDGE_AGENT_INJECT_TIMESTAMP
+# export silently no-ops because of the assoc-array name collision
+# documented in the comment block above. Keep it for backwards
+# compatibility, and add BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED as the
+# distinctly-named scalar alias the Python hook actually reads.
 export BRIDGE_AGENT_INJECT_TIMESTAMP="$(bridge_agent_inject_timestamp "$AGENT")"
+export BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED="$(bridge_agent_inject_timestamp "$AGENT")"
 export BRIDGE_AGENT_PROMPT_GUARD_POLICY="$(bridge_guard_policy_raw "$AGENT")"
 export BRIDGE_PROMPT_GUARD_CANARY_TOKENS="$(bridge_agent_prompt_guard_canary "$AGENT")"
 
