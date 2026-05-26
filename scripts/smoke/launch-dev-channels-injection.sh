@@ -174,8 +174,8 @@ assert_agent_bridge_teams_plugin_selector() {
     "channel launch pins Claude HOME to the agent-scoped home"
   smoke_assert_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=" \
     "channel launch pins Claude config dir to the agent-scoped home"
-  smoke_assert_not_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=both" \
-    "Teams channel launch does not enable queue fallback by default"
+  smoke_assert_not_contains "$launch_cmd" "TEAMS_DELIVERY_MODE" \
+    "Teams channel launch never emits the removed TEAMS_DELIVERY_MODE knob (issue #1204)"
 }
 
 assert_explicit_server_selector_gets_dev_allowance() {
@@ -191,28 +191,32 @@ assert_explicit_server_selector_gets_dev_allowance() {
     "explicit server:teams selector receives required development-channel allowance"
   smoke_assert_contains "$launch_cmd" "TEAMS_STATE_DIR=" \
     "server:teams selector still injects Teams state dir"
-  smoke_assert_not_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=both" \
-    "server:teams selector does not enable Teams queue fallback by default"
+  smoke_assert_not_contains "$launch_cmd" "TEAMS_DELIVERY_MODE" \
+    "server:teams selector never emits the removed TEAMS_DELIVERY_MODE knob (issue #1204)"
   smoke_assert_contains "$launch_cmd" "HOME=" \
     "server:teams selector pins Claude HOME to the agent-scoped home"
   smoke_assert_contains "$launch_cmd" "CLAUDE_CONFIG_DIR=" \
     "server:teams selector pins Claude config dir to the agent-scoped home"
 }
 
-assert_explicit_teams_delivery_mode_is_preserved() {
-  local launch_cmd mode_count
-  BRIDGE_AGENT_CHANNELS["worker"]="server:teams"
-  BRIDGE_AGENT_LAUNCH_CMD["worker"]="TEAMS_DELIVERY_MODE=bridge claude --dangerously-skip-permissions"
-
-  launch_cmd="$(bridge_agent_launch_cmd worker)"
-
-  smoke_assert_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=bridge" \
-    "operator-provided Teams delivery mode is preserved"
-  smoke_assert_not_contains "$launch_cmd" "TEAMS_DELIVERY_MODE=both" \
-    "default Teams delivery mode does not overwrite operator-provided mode"
-  mode_count="$(count_substring "$launch_cmd" "TEAMS_DELIVERY_MODE=")"
-  smoke_assert_eq "1" "$mode_count" \
-    "launch command has exactly one Teams delivery mode assignment"
+assert_teams_delivery_mode_source_grep_gate() {
+  # Issue #1204: TEAMS_DELIVERY_MODE was removed entirely because the
+  # `bridge` mode silently dropped inbound messages when BRIDGE_AGENT_ID was
+  # not propagated into the plugin's environment. This grep gate locks the
+  # removal in: no shipped source — code or docs — may reintroduce the
+  # token. CHANGELOG.md is exempt so the historical release entry
+  # documenting the removal can keep the literal string for traceability;
+  # this smoke and scripts/smoke-test.sh are exempt because their own
+  # must-not-survive negative assertions necessarily mention the token they
+  # are forbidding.
+  local matches
+  matches="$(cd "$SMOKE_REPO_ROOT" && git grep -i -l 'TEAMS_DELIVERY_MODE' -- \
+    ':!CHANGELOG.md' \
+    ':!scripts/smoke/launch-dev-channels-injection.sh' \
+    ':!scripts/smoke-test.sh' \
+    2>/dev/null || true)"
+  smoke_assert_eq "" "$matches" \
+    "no shipped source reintroduces the removed TEAMS_DELIVERY_MODE knob"
 }
 
 assert_stale_claude_home_prefix_is_rewritten() {
@@ -251,7 +255,7 @@ main() {
   smoke_run "non-dev (official) channel does not get dev-load token" assert_non_dev_channel_untouched
   smoke_run "Agent Bridge Teams dev plugin stays plugin-scoped"       assert_agent_bridge_teams_plugin_selector
   smoke_run "explicit server selector gets dev allowance"            assert_explicit_server_selector_gets_dev_allowance
-  smoke_run "explicit Teams delivery mode is preserved"              assert_explicit_teams_delivery_mode_is_preserved
+  smoke_run "TEAMS_DELIVERY_MODE removal grep gate (#1204)"          assert_teams_delivery_mode_source_grep_gate
   smoke_run "stale Claude home prefix is rewritten"                  assert_stale_claude_home_prefix_is_rewritten
   smoke_log "passed"
 }
