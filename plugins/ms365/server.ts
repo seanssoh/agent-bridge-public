@@ -17,11 +17,22 @@
  *   MS365_DEFAULT_SCOPES  - Space-separated scopes to request during pairing
  *   MS365_REDIRECT_URI    - Redirect URI registered on the app registration.
  *                           Must match the Azure AD app configuration exactly.
- *                           In local dev this points at the Teams plugin's
- *                           /auth/callback listener; in a hosted deployment
- *                           it points at the public ingress fronting the
- *                           Teams plugin. Defaults to
- *                           http://localhost:3978/auth/callback.
+ *                           In a hosted deployment it points at the public
+ *                           ingress fronting the Teams plugin (which
+ *                           multiplexes /auth/callback). REQUIRED — if unset
+ *                           OR a localhost variant, the plugin fails loud
+ *                           at pair_start time with an actionable error
+ *                           naming `agent-bridge setup ms365 <agent>`.
+ *                           Issue #1209: the prior silent default of
+ *                           `http://localhost:3978/auth/callback` produced
+ *                           guaranteed AADSTS50011 failures any time the
+ *                           OAuth click happened on a different host than
+ *                           the bun listener (every realistic production
+ *                           deployment).
+ *   MS365_REDIRECT_URI_ALLOW_LOCALHOST - Set to `1` to opt back into a
+ *                           localhost MS365_REDIRECT_URI (e.g. for local
+ *                           dev where the click + listener are on the same
+ *                           host). Default: unset → localhost rejected.
  *   MS365_CALLBACK_SHARED_DIR - Where the Teams plugin drops captured callback
  *                           payloads (default $BRIDGE_HOME/shared/ms365-callbacks)
  *   BRIDGE_HOME           - Agent Bridge install root (default ~/.agent-bridge)
@@ -114,8 +125,67 @@ const DEFAULT_UPN = process.env.MS365_DEFAULT_UPN ?? ''
 const DEFAULT_SCOPES =
   process.env.MS365_DEFAULT_SCOPES ??
   'openid profile offline_access User.Read Mail.Read Mail.Send Calendars.Read Calendars.ReadWrite People.Read User.Read.All Directory.Read.All Chat.ReadWrite'
-const REDIRECT_URI =
-  process.env.MS365_REDIRECT_URI ?? 'http://localhost:3978/auth/callback'
+
+// Issue #1209: replace the silent localhost default with a fail-loud
+// resolver invoked lazily from pair_start. The previous fallback
+// produced `http://localhost:3978/auth/callback` any time
+// MS365_REDIRECT_URI was unset, which yields a guaranteed AADSTS50011
+// failure whenever the user's browser runs on a different host than
+// the bun listener (i.e. every realistic production deployment, since
+// the Bridge runs on a server and users click links on their laptops).
+//
+// Priority order:
+//   1. Explicit non-localhost MS365_REDIRECT_URI  → returned as-is.
+//   2. Explicit localhost MS365_REDIRECT_URI WITH
+//      MS365_REDIRECT_URI_ALLOW_LOCALHOST=1       → returned (local dev).
+//   3. Anything else (unset, or localhost without
+//      the allow flag)                             → throws with a
+//      message naming the `agent-bridge setup ms365` wizard so the
+//      operator gets an actionable next step at the first pair_start
+//      invocation, not at the user's failed Microsoft sign-in.
+export function resolveRedirectUri(): string {
+  const explicit = (process.env.MS365_REDIRECT_URI ?? '').trim()
+  const allowLocalhost = process.env.MS365_REDIRECT_URI_ALLOW_LOCALHOST === '1'
+  const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1)(:|\/|$)/i.test(explicit)
+  if (explicit && (!isLocalhost || allowLocalhost)) {
+    return explicit
+  }
+  throw new Error(
+    "MS365_REDIRECT_URI must be set to a publicly reachable URL " +
+      "(typically https://<your-bot-host>/auth/callback). " +
+      "Run 'agent-bridge setup ms365 <agent>' to persist it, " +
+      "and register the same URL on your Entra app's Authentication → Redirect URIs. " +
+      "(For local dev only: set MS365_REDIRECT_URI_ALLOW_LOCALHOST=1 to opt back into the localhost default.)",
+  )
+}
+
+// Issue #1210: normalize the scope string before handing it to
+// URLSearchParams. The bug was an input artifact, not a serializer
+// flaw — `MS365_DEFAULT_SCOPES` is a STRING, and when an operator's
+// .env had `MS365_DEFAULT_SCOPES="openid profile offline_access ..."`
+// the literal double-quotes flowed all the way into the authorize_url
+// as `scope=%22openid...%22`, tripping AADSTS70011 "scope is not
+// valid". URLSearchParams correctly percent-encoded the quotes — they
+// just shouldn't have been there.
+//
+// Contract:
+//   - Trim outer whitespace.
+//   - Strip ONE matching outer quote pair (`"..."` or `'...'`). Inner
+//     quotes are not OAuth scope characters and would already break
+//     scope parsing, so the surface bug is the outer wrap.
+//   - Split on any whitespace, drop empties, rejoin with single space.
+//   - Plain unquoted input round-trips unchanged.
+export function normalizeScopes(raw: unknown): string {
+  let s = String(raw ?? '').trim()
+  if (s.length >= 2) {
+    const first = s.charAt(0)
+    const last = s.charAt(s.length - 1)
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      s = s.slice(1, -1).trim()
+    }
+  }
+  return s.split(/\s+/).filter(Boolean).join(' ')
+}
 
 if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET) {
   process.stderr.write(
@@ -210,13 +280,13 @@ function callbackPath(state: string): string {
   return join(MS365_CALLBACK_DIR, `${state}.json`)
 }
 
-function startAuthCode(upn: string, scopes: string): PendingFile {
+function startAuthCode(upn: string, scopes: string, redirectUri: string): PendingFile {
   const state = randomUUID()
   const now = Math.floor(Date.now() / 1000)
   const authorizeParams = new URLSearchParams({
     client_id: CLIENT_ID,
     response_type: 'code',
-    redirect_uri: REDIRECT_URI,
+    redirect_uri: redirectUri,
     response_mode: 'query',
     scope: scopes,
     state,
@@ -276,7 +346,12 @@ async function exchangeAuthCode(
       client_id: CLIENT_ID,
       client_secret: CLIENT_SECRET,
       code: cb.code,
-      redirect_uri: REDIRECT_URI,
+      // Issue #1209: redirect_uri at the token endpoint MUST match
+      // the value used at pair_start. Resolver throws if unset, which
+      // is the desired surface here too (the pair_start that wrote
+      // the pending file would have already validated this — we
+      // re-call as defense in depth in case env changed mid-flight).
+      redirect_uri: resolveRedirectUri(),
       scope: pending.scopes,
     },
   )
@@ -480,15 +555,25 @@ const tools: ToolDef[] = [
     },
     handler: async args => {
       const upn = resolveUpn(args.upn)
-      const scopes = String(args.scopes ?? DEFAULT_SCOPES)
-      const pending = startAuthCode(upn, scopes)
+      // Issue #1210: normalize the scope string (strip accidental
+      // wrapping quotes, collapse whitespace) before passing to
+      // URLSearchParams. Without this the literal `"openid ..."` in
+      // an operator's .env became `%22openid...%22` in authorize_url
+      // and Microsoft Identity Platform rejected with AADSTS70011.
+      const scopes = normalizeScopes(args.scopes ?? DEFAULT_SCOPES)
+      // Issue #1209: resolve the redirect URI at pair_start time so
+      // any misconfiguration surfaces as a clear, actionable error
+      // here (with a pointer to `agent-bridge setup ms365`) instead
+      // of as AADSTS50011 on the user's failed Microsoft sign-in.
+      const redirectUri = resolveRedirectUri()
+      const pending = startAuthCode(upn, scopes, redirectUri)
       return textResult({
         upn,
         authorize_url: pending.authorize_url,
-        redirect_uri: REDIRECT_URI,
+        redirect_uri: redirectUri,
         state: pending.state,
         expires_in_seconds: pending.expires_at - Math.floor(Date.now() / 1000),
-        instructions: `Open the authorize_url in a browser, sign in as ${upn}, approve the requested permissions. The browser will redirect to ${REDIRECT_URI}. Then call pair_poll to finish.`,
+        instructions: `Open the authorize_url in a browser, sign in as ${upn}, approve the requested permissions. The browser will redirect to ${redirectUri}. Then call pair_poll to finish.`,
       })
     },
   },

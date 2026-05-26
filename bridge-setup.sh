@@ -14,6 +14,7 @@ Usage:
   $(basename "$0") discord <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--channel <id>]... [--allow-from <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run]
   $(basename "$0") agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start] [setup options...]
   $(basename "$0") admin <agent>
 
@@ -22,6 +23,8 @@ Examples:
   $(basename "$0") discord tester --channel-account default --channel 123456789012345678
   $(basename "$0") telegram tester --channel-account default --allow-from 123456789
   $(basename "$0") teams tester --channel-account default --allow-from 00000000-0000-0000-0000-000000000000
+  $(basename "$0") ms365 tester
+  $(basename "$0") ms365 tester --redirect-uri https://bot.example.com/auth/callback
   $(basename "$0") agent tester
   $(basename "$0") agent tester --test-start
   $(basename "$0") admin tester
@@ -47,6 +50,12 @@ EOF
       cat <<EOF
 Usage:
   $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
+EOF
+      ;;
+    ms365)
+      cat <<EOF
+Usage:
+  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run]
 EOF
       ;;
     agent)
@@ -681,6 +690,75 @@ run_teams() {
   fi
 }
 
+# Issue #1209: ms365 channel setup wizard. Persists MS365_REDIRECT_URI
+# (and optional CLIENT_ID/SECRET/TENANT_ID) to .ms365/.env so the
+# fail-loud `resolveRedirectUri()` in plugins/ms365/server.ts has a
+# valid value at pair_start time instead of throwing.
+run_ms365() {
+  local agent="${1:-}"
+  local ms365_dir=""
+  local teams_dir=""
+  local teams_state_file=""
+  local dry_run=0
+  local py_args=()
+  local base_args=()
+
+  shift || true
+  if [[ "$agent" == "-h" || "$agent" == "--help" || "$agent" == "help" ]]; then
+    setup_subcommand_usage "ms365"
+    return 0
+  fi
+  [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") ms365 <agent> [...]"
+  bridge_require_agent "$agent"
+  bridge_setup_require_claude_agent "$agent" "MS365"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --redirect-uri|--messaging-endpoint|--tenant-id|--client-id|--client-secret|--client-secret-file|--default-upn|--default-scopes)
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        py_args+=("$1" "$2")
+        shift 2
+        ;;
+      --allow-localhost|--yes|--dry-run)
+        # PR #1220 codex r1: --allow-localhost is a value-less flag
+        # that the Python wizard records as MS365_REDIRECT_URI_ALLOW_LOCALHOST=1.
+        [[ "$1" == "--dry-run" ]] && dry_run=1
+        py_args+=("$1")
+        shift
+        ;;
+      *)
+        bridge_die "지원하지 않는 setup ms365 옵션입니다: $1"
+        ;;
+    esac
+  done
+
+  ms365_dir="$(bridge_agent_ms365_state_dir "$agent")"
+  teams_dir="$(bridge_agent_teams_state_dir "$agent")"
+  teams_state_file="$teams_dir/state.json"
+
+  base_args=(
+    ms365
+    --agent "$agent"
+    --ms365-dir "$ms365_dir"
+    --teams-state-file "$teams_state_file"
+  )
+
+  bridge_setup_python "${base_args[@]}" "${py_args[@]}"
+  if [[ $dry_run -eq 0 ]]; then
+    bridge_setup_add_agent_channel "$agent" "plugin:ms365"
+    if bridge_setup_ensure_development_channels_launch_flag "$agent"; then
+      bridge_info "[info] added --dangerously-load-development-channels $(bridge_agent_dev_channels_csv "$agent") to $agent launch"
+    else
+      bridge_info "[info] $agent launch already allows development channels: $(bridge_agent_dev_channels_csv "$agent")"
+    fi
+    bridge_ensure_claude_channel_plugins "$agent"
+    # Issue #989 (same as teams): refresh the isolated agent's cached
+    # runtime/agent-env.sh AFTER writes so the regenerated launch cmd
+    # reflects the channel add and the dev-channel launch flag.
+    bridge_refresh_isolated_agent_env_after_channel_mutation "$agent"
+  fi
+}
+
 run_agent() {
   local agent="${1:-}"
   local skip_discord=0
@@ -1156,6 +1234,9 @@ case "$subcommand" in
   teams)
     run_teams "$@"
     ;;
+  ms365)
+    run_ms365 "$@"
+    ;;
   agent)
     run_agent "$@"
     ;;
@@ -1168,7 +1249,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "discord telegram teams agent admin")"
+      "discord telegram teams ms365 agent admin")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 setup 명령입니다: $subcommand"
     ;;
