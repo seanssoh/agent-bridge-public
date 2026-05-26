@@ -431,9 +431,15 @@ bridge_write_idle_ready_agents() {
         # Structured nudge-skip audit log. Fixed prefix `[nudge-skip]`
         # so log scrapers can grep one line per skip per tick. Fields:
         # agent, reason, evidence (concrete path that failed).
+        #
+        # r2 codex r1 BLOCKING #1252: emit task=none (NOT task=-). This
+        # call site is on the idle-marker writer loop — no specific task
+        # id is in scope at this depth (the loop iterates over agents,
+        # not over queued tasks). `none` is the canonical sentinel per
+        # the [nudge-skip] task=<id|none> contract.
         local _idle_dir
         _idle_dir="$(bridge_agent_idle_marker_dir "$agent" 2>/dev/null || printf '<unknown>')"
-        bridge_warn "[nudge-skip] agent=$agent task=- reason=state-dir-missing evidence=$_idle_dir"
+        bridge_warn "[nudge-skip] agent=$agent task=none reason=state-dir-missing evidence=$_idle_dir"
         if command -v bridge_audit_log >/dev/null 2>&1; then
           bridge_audit_log daemon nudge_skip "$agent" \
             --detail reason=state-dir-missing \

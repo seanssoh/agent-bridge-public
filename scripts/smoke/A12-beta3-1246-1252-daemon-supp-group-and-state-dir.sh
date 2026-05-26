@@ -45,19 +45,29 @@
 #       already exists.
 #
 #   T4: `bridge_write_idle_ready_agents` emits the structured
-#       `[nudge-skip] agent=<a> task=<id> reason=state-dir-missing
+#       `[nudge-skip] agent=<a> task=none reason=state-dir-missing
 #       evidence=<dir>` line when the per-agent state-dir is missing
 #       AND self-heal also fails. Asserted via static-source grep on
 #       lib/bridge-channels.sh because the helper is sourced through
 #       the full daemon stack at runtime — a host-agnostic behavioral
 #       repro would need the entire roster/state ladder.
 #
+#       r2 codex r1 BLOCKING #1252: contract is `task=<digits>` or
+#       `task=none`, NEVER `task=-`. R1 hard-coded `task=-` at all four
+#       new emitters and the smoke pinned the wrong shape. T4 + T11
+#       now assert the correct contract.
+#
 #   T5: the same decision-evidence log line shape appears in EVERY
 #       call site that triggers `_bridge_daemon_control_daemon_has_gid`
 #       (the predicate ALWAYS emits, so the pre-check at
 #       lib/bridge-daemon-control.sh:348 + 383 cannot silently false-
-#       positive again — operator sees both the in_proc set and the
-#       target_gid in the daemon log when reconstructing the wedge).
+#       positive again — operator sees the in_proc set, the on_disk
+#       set, and the target_gid in the daemon log when reconstructing
+#       the wedge).
+#
+#       r2 codex r1 CONTRACT MISMATCH #1246: brief contract is
+#       `pid=<P> on_disk=<GIDs> in_proc=<GIDs> target_gid=<G>` — R1
+#       only emitted in_proc. T1 + T12 now assert both fields.
 #
 #   T6 (teeth): revert the predicate's decision-emit — assert T1 fails
 #       loudly citing #1246. The teeth-check fixture writes a temporary
@@ -68,6 +78,44 @@
 #   T7 (teeth): revert the agent-create synchronous self-heal call —
 #       assert T2 fails loudly citing #1252. Same fixture pattern as T6
 #       against a temporary copy of bridge-agent.sh.
+#
+#   T8 (r2 codex r1 BLOCKING #1252): pre-existing-dir self-heal verifies
+#       mode (2770) AND group (ab-agent-<X>). Set up a dir at mode 0700,
+#       call self-heal: expect rc=0 with dir now mode 2770 (auto-repair)
+#       OR rc!=0 with structured reason citing chmod failure. R1
+#       returned success for ANY pre-existing dir without checking
+#       mode/group.
+#
+#   T9 (r2 codex r1 BLOCKING #1252): new-create branch's chgrp failure
+#       propagates instead of being silently ignored. Stub chgrp to fail
+#       (via PATH override), call self-heal on a missing dir: expect
+#       rc!=0 with structured reason `state_dir_chgrp_failed`.
+#
+#   T10 (r2 codex r1 BLOCKING #1252): empty group-resolver fail-loud.
+#        Stub `bridge_isolation_v2_agent_group_name` to return empty,
+#        call self-heal on a missing dir: expect rc!=0 with structured
+#        reason `state_dir_group_resolver_empty`.
+#
+#   T11 (r2 codex r1 BLOCKING #1252 nudge-skip task contract): all four
+#        new `[nudge-skip]` emitters cite either `task=<digits>` (when
+#        a task id is in scope) or `task=none` (when none is). NEVER
+#        `task=-` (R1 contract violation). Asserted via static-source
+#        grep against bridge-daemon.sh + lib/bridge-channels.sh.
+#
+#   T12 (r2 codex r1 CONTRACT MISMATCH #1246 on_disk field): the
+#        decision-evidence emit helper signature accepts on_disk between
+#        pid and in_proc, and ALL call sites in
+#        _bridge_daemon_control_daemon_has_gid pass it. Asserted via
+#        static-source grep against lib/bridge-daemon-control.sh.
+#
+#   T13 (teeth, r2 codex r1 finding 1): revert the nudge-skip
+#        task-contract fix back to `task=-` — assert T11 fails loudly.
+#
+#   T14 (teeth, r2 codex r1 finding 3): revert the on_disk evidence
+#        field — assert T1 + T12 fail loudly.
+#
+#   T15 (teeth, r2 codex r1 finding 2): revert the self-heal
+#        mode-verify on a pre-existing dir — assert T8 fails loudly.
 #
 # Footgun #11 (heredoc-stdin subprocess deadlock class): every
 # assertion uses `grep -n` against the source files OR builds harness
@@ -120,6 +168,9 @@ extract_predicate_lib() {
     printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
     awk '/^_bridge_daemon_control_proc_groups\(\) \{/,/^\}/' "$source"
     awk '/^_bridge_daemon_control_daemon_has_gid\(\) \{/,/^\}/' "$source"
+    # r2 codex r1: also pull in the on_disk helper so the predicate
+    # call sites can resolve it.
+    awk '/^_bridge_daemon_control_proc_owner_on_disk_groups\(\) \{/,/^\}/' "$source"
     awk '/^_bridge_daemon_control_emit_decision_log\(\) \{/,/^\}/' "$source"
   } >>"$out"
   printf '%s\n' "$out"
@@ -147,6 +198,11 @@ T1_DRIVER="$SMOKE_TMP_ROOT/t1-driver.sh"
   # the helper to read from it.
   printf '%s\n' 'bridge_daemon_pid() { printf "12345"; }'
   printf '%s\n' '_bridge_daemon_control_proc_groups() { printf "100\n200\n981\n"; }'
+  # r2 codex r1 CONTRACT MISMATCH #1246: stub the on_disk helper so the
+  # decision-evidence line carries a deterministic on_disk= field too.
+  # The real helper reads /proc/<pid>/status Uid + runs `id -G <user>`;
+  # the fixture short-circuits both for a host-agnostic assertion.
+  printf '%s\n' '_bridge_daemon_control_proc_owner_on_disk_groups() { printf "100,200,981,777"; }'
   # Case A: target GID 981 IS present in proc groups → action=skip reason=already-has-group
   printf '%s\n' '_bridge_daemon_control_daemon_has_gid 981; rc_a=$?'
   printf '%s\n' '# Case B: target GID 999 is NOT present → action=refresh reason=missing-from-supp-set'
@@ -163,17 +219,19 @@ T1_OUT="$(
     /usr/bin/env bash "$T1_DRIVER" 2>&1
 )"
 
-# Verify both decisions landed in the log.
-if ! grep -q 'pid=12345 in_proc=100,200,981 target_gid=981 action=skip reason=already-has-group' "$T1_DECISION_LOG"; then
-  smoke_fail "T1: decision log did not capture skip/already-has-group case; got:$(printf '\n')$(cat "$T1_DECISION_LOG")"
+# r2 codex r1 CONTRACT MISMATCH #1246: assertion now includes on_disk
+# between pid and in_proc. Brief contract:
+#   pid=<P> on_disk=<GIDs> in_proc=<GIDs> target_gid=<G> action=<A> reason=<R>
+if ! grep -q 'pid=12345 on_disk=100,200,981,777 in_proc=100,200,981 target_gid=981 action=skip reason=already-has-group' "$T1_DECISION_LOG"; then
+  smoke_fail "T1: decision log did not capture skip/already-has-group case with on_disk + in_proc; got:$(printf '\n')$(cat "$T1_DECISION_LOG")"
 fi
-if ! grep -q 'pid=12345 in_proc=100,200,981 target_gid=999 action=refresh reason=missing-from-supp-set' "$T1_DECISION_LOG"; then
-  smoke_fail "T1: decision log did not capture refresh/missing-from-supp-set case; got:$(printf '\n')$(cat "$T1_DECISION_LOG")"
+if ! grep -q 'pid=12345 on_disk=100,200,981,777 in_proc=100,200,981 target_gid=999 action=refresh reason=missing-from-supp-set' "$T1_DECISION_LOG"; then
+  smoke_fail "T1: decision log did not capture refresh/missing-from-supp-set case with on_disk + in_proc; got:$(printf '\n')$(cat "$T1_DECISION_LOG")"
 fi
 if [[ "$T1_OUT" != *"rc_a=0"* ]] || [[ "$T1_OUT" != *"rc_b=1"* ]]; then
   smoke_fail "T1: predicate return codes wrong; expected rc_a=0 rc_b=1, got: $T1_OUT"
 fi
-smoke_log "T1 PASS — predicate emits structured decision-evidence + correct rc"
+smoke_log "T1 PASS — predicate emits structured decision-evidence (on_disk + in_proc) + correct rc"
 
 # ---------------------------------------------------------------------
 # T2: agent create flow synchronously invokes bridge_agent_state_dir_self_heal.
@@ -248,15 +306,23 @@ smoke_log "T3 PASS — bridge_agent_state_dir_self_heal creates dir + idempotent
 # ---------------------------------------------------------------------
 smoke_log "T4: bridge_write_idle_ready_agents emits [nudge-skip] structured line on state-dir-missing"
 
-# Assert the structured prefix appears in the self-heal branch.
-if ! grep -q '\[nudge-skip\] agent=\$agent task=- reason=state-dir-missing evidence=\$_idle_dir' "$CHANNELS_LIB"; then
-  smoke_fail "T4: lib/bridge-channels.sh does not emit the structured '[nudge-skip] agent=<a> task=- reason=state-dir-missing evidence=<dir>' line — #1252 silent-drop class regressed"
+# r2 codex r1 BLOCKING #1252: contract is `task=none` at this call site
+# (no task id in scope on the idle-marker writer loop), NOT `task=-`.
+# Earlier R1 hard-coded `task=-`; T11 below also covers the daemon-side
+# emitters that should cite `task=<digits>` when an id IS in scope.
+if ! grep -q '\[nudge-skip\] agent=\$agent task=none reason=state-dir-missing evidence=\$_idle_dir' "$CHANNELS_LIB"; then
+  smoke_fail "T4: lib/bridge-channels.sh does not emit '[nudge-skip] agent=<a> task=none reason=state-dir-missing evidence=<dir>' (r2 codex r1 BLOCKING: contract is task=none, NOT task=-; R1 hard-coded task=-)"
+fi
+# Explicit regression-of-the-wrong-contract guard: NO `task=-` literal
+# may exist in the state-dir-missing emitter line.
+if grep -q '\[nudge-skip\] agent=\$agent task=- ' "$CHANNELS_LIB"; then
+  smoke_fail "T4: lib/bridge-channels.sh STILL emits 'task=-' at the state-dir-missing site — r2 codex r1 BLOCKING #1252 contract violation"
 fi
 # Also assert the audit_log emit path is in place.
 if ! grep -q 'bridge_audit_log daemon nudge_skip' "$CHANNELS_LIB"; then
   smoke_fail "T4: lib/bridge-channels.sh does not emit bridge_audit_log daemon nudge_skip — the audit row anchor for #1252 is missing"
 fi
-smoke_log "T4 PASS — bridge_write_idle_ready_agents emits structured [nudge-skip] line + audit row"
+smoke_log "T4 PASS — bridge_write_idle_ready_agents emits structured [nudge-skip] task=none line + audit row"
 
 # ---------------------------------------------------------------------
 # T5: predicate emits decision-evidence on EVERY call site (not just
@@ -292,8 +358,11 @@ T6_PATCHED_LIB="$SMOKE_TMP_ROOT/predicate-patched.sh"
   printf '%s\n' '#!/usr/bin/env bash'
   printf '%s\n' 'set -uo pipefail'
   printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
-  # Keep proc_groups + has_gid as-is, but override the emit helper to no-op.
+  # Keep proc_groups + has_gid + on_disk_groups as-is, but override the
+  # emit helper to no-op. r2 codex r1: on_disk helper needs to exist or
+  # has_gid's call site would unbound-variable.
   awk '/^_bridge_daemon_control_proc_groups\(\) \{/,/^\}/' "$DAEMON_CONTROL_LIB"
+  awk '/^_bridge_daemon_control_proc_owner_on_disk_groups\(\) \{/,/^\}/' "$DAEMON_CONTROL_LIB"
   awk '/^_bridge_daemon_control_daemon_has_gid\(\) \{/,/^\}/' "$DAEMON_CONTROL_LIB"
   # Now define a NO-OP emit helper that does NOT write to the log file —
   # simulates the pre-fix predicate (silent on every code path).
@@ -308,6 +377,9 @@ T6_DRIVER="$SMOKE_TMP_ROOT/t6-driver.sh"
   printf '%s\n' "source \"$T6_PATCHED_LIB\""
   printf '%s\n' 'bridge_daemon_pid() { printf "12345"; }'
   printf '%s\n' '_bridge_daemon_control_proc_groups() { printf "100\n200\n981\n"; }'
+  # r2 codex r1: also stub the on_disk helper so the predicate does not
+  # invoke the real /proc lookup during the teeth-check.
+  printf '%s\n' '_bridge_daemon_control_proc_owner_on_disk_groups() { printf "100,200,981"; }'
   printf '%s\n' '_bridge_daemon_control_daemon_has_gid 981 >/dev/null 2>&1 || true'
 } >"$T6_DRIVER"
 chmod +x "$T6_DRIVER"
@@ -346,4 +418,298 @@ fi
 smoke_log "T7 PASS — teeth-check works: removing the synchronous self-heal call DOES break T2's assertion (operator would see create:ok for an agent that silently drops nudges, #1252)"
 
 # ---------------------------------------------------------------------
-smoke_log "all tests PASS — A12-beta3 #1246 + #1252 verified at current main"
+# T8 (r2 codex r1 BLOCKING #1252): pre-existing-dir self-heal verifies
+#     mode + group, and AUTO-REPAIRS via chmod / chgrp when divergent.
+# ---------------------------------------------------------------------
+smoke_log "T8: bridge_agent_state_dir_self_heal verifies mode 2770 on pre-existing dirs"
+
+T8_DRIVER="$SMOKE_TMP_ROOT/t8-driver.sh"
+: >"$T8_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' "BRIDGE_ACTIVE_AGENT_DIR=\"$SMOKE_TMP_ROOT/t8-state-agents\""
+  printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR"'
+  printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
+  printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s/%s" "$BRIDGE_ACTIVE_AGENT_DIR" "$1"; }'
+  # Resolver returns empty → fall through to mode-only verifier (legacy
+  # install path). T10 covers the empty-resolver-fail-loud case under
+  # the v2 path.
+  awk '/^bridge_agent_state_dir_self_heal\(\) \{/,/^\}/' "$STATE_LIB" >>"$T8_DRIVER"
+  printf '\n%s\n' '# Pre-create the dir at mode 0700 — divergent from canonical 2770.'
+  printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t8"'
+  printf '%s\n' 'chmod 0700 "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t8"'
+  printf '%s\n' 'pre_mode="$(stat -c %a "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t8" 2>/dev/null || stat -f %Lp "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t8" 2>/dev/null)"'
+  printf '%s\n' 'printf "pre_mode=%s\n" "$pre_mode"'
+  printf '%s\n' 'bridge_agent_state_dir_self_heal test_a12_t8; rc=$?'
+  printf '%s\n' 'post_mode="$(stat -c %a "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t8" 2>/dev/null || stat -f %Lp "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t8" 2>/dev/null)"'
+  printf '%s\n' 'printf "rc=%s post_mode=%s\n" "$rc" "$post_mode"'
+} >>"$T8_DRIVER"
+chmod +x "$T8_DRIVER"
+
+T8_OUT="$(/usr/bin/env bash "$T8_DRIVER" 2>&1)"
+# Acceptable behavior per brief:
+#   - rc=0 with dir now mode 2770 (auto-repaired), OR
+#   - rc!=0 with structured reason citing chmod failure
+# Both prove the verifier checks mode; what R1 did (rc=0 with mode 700)
+# is now NOT acceptable.
+T8_OK=0
+if [[ "$T8_OUT" == *"rc=0"* ]] && { [[ "$T8_OUT" == *"post_mode=2770"* ]] || [[ "$T8_OUT" == *"post_mode=770"* ]]; }; then
+  T8_OK=1
+elif [[ "$T8_OUT" != *"rc=0"* ]] && [[ "$T8_OUT" == *"state_dir_chmod"* ]]; then
+  T8_OK=1
+fi
+if (( T8_OK == 0 )); then
+  smoke_fail "T8 (r2 codex r1 BLOCKING #1252): self-heal on pre-existing mode=0700 dir did not auto-repair to 2770 AND did not fail-loud with structured reason; got: $T8_OUT"
+fi
+# Strict regression guard: rc=0 with mode 700 is EXACTLY what R1 did.
+if [[ "$T8_OUT" == *"rc=0"* ]] && [[ "$T8_OUT" == *"post_mode=700"* ]]; then
+  smoke_fail "T8 (r2 codex r1 BLOCKING #1252): self-heal returned rc=0 for a pre-existing dir at mode 0700 WITHOUT repairing it — R1 false-positive regressed"
+fi
+smoke_log "T8 PASS — self-heal on pre-existing wrong-mode dir auto-repairs or fail-louds"
+
+# ---------------------------------------------------------------------
+# T9 (r2 codex r1 BLOCKING #1252): new-create branch propagates chgrp
+#     failure instead of silently ignoring it.
+# ---------------------------------------------------------------------
+smoke_log "T9: bridge_agent_state_dir_self_heal new-create chgrp failure propagates"
+
+T9_DRIVER="$SMOKE_TMP_ROOT/t9-driver.sh"
+: >"$T9_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' "BRIDGE_ACTIVE_AGENT_DIR=\"$SMOKE_TMP_ROOT/t9-state-agents\""
+  printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR"'
+  printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
+  printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s/%s" "$BRIDGE_ACTIVE_AGENT_DIR" "$1"; }'
+  # Stub the v2 group-name resolver to return a non-empty group so the
+  # chgrp branch is entered.
+  printf '%s\n' 'bridge_isolation_v2_agent_group_name() { printf "ab-agent-test_a12_t9"; }'
+  # Override `chgrp` as a function to force failure — exercises the
+  # propagation path. This shadows the binary inside this subshell.
+  printf '%s\n' 'chgrp() { return 1; }'
+  awk '/^bridge_agent_state_dir_self_heal\(\) \{/,/^\}/' "$STATE_LIB" >>"$T9_DRIVER"
+  printf '\n%s\n' 'bridge_agent_state_dir_self_heal test_a12_t9; rc=$?'
+  printf '%s\n' 'printf "rc=%s\n" "$rc"'
+} >>"$T9_DRIVER"
+chmod +x "$T9_DRIVER"
+
+T9_OUT="$(/usr/bin/env bash "$T9_DRIVER" 2>&1 || true)"
+# rc must be non-zero (chgrp failed → self-heal must NOT return success).
+if [[ "$T9_OUT" == *"rc=0"* ]]; then
+  smoke_fail "T9 (r2 codex r1 BLOCKING #1252): self-heal returned rc=0 despite chgrp failure — R1 ignored chgrp non-zero and silently dropped the canonical-group contract; got: $T9_OUT"
+fi
+# Structured reason must mention the chgrp failure surface (either
+# chgrp_failed or chgrp_verify_failed — both prove the path was checked).
+if [[ "$T9_OUT" != *"state_dir_chgrp"* ]]; then
+  smoke_fail "T9 (r2 codex r1 BLOCKING #1252): self-heal failed but did not emit a structured chgrp reason; got: $T9_OUT"
+fi
+smoke_log "T9 PASS — self-heal propagates chgrp failure with structured reason"
+
+# ---------------------------------------------------------------------
+# T10 (r2 codex r1 BLOCKING #1252): empty group-resolver fails loud
+#      with reason=state_dir_group_resolver_empty.
+# ---------------------------------------------------------------------
+smoke_log "T10: bridge_agent_state_dir_self_heal fails loud on empty group-resolver"
+
+T10_DRIVER="$SMOKE_TMP_ROOT/t10-driver.sh"
+: >"$T10_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' "BRIDGE_ACTIVE_AGENT_DIR=\"$SMOKE_TMP_ROOT/t10-state-agents\""
+  printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR"'
+  printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
+  printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s/%s" "$BRIDGE_ACTIVE_AGENT_DIR" "$1"; }'
+  # Stub the v2 resolver to return EMPTY — codex r1 direct repro.
+  printf '%s\n' 'bridge_isolation_v2_agent_group_name() { printf ""; }'
+  awk '/^bridge_agent_state_dir_self_heal\(\) \{/,/^\}/' "$STATE_LIB" >>"$T10_DRIVER"
+  printf '\n%s\n' 'bridge_agent_state_dir_self_heal test_a12_t10; rc=$?'
+  printf '%s\n' 'printf "rc=%s\n" "$rc"'
+} >>"$T10_DRIVER"
+chmod +x "$T10_DRIVER"
+
+T10_OUT="$(/usr/bin/env bash "$T10_DRIVER" 2>&1 || true)"
+if [[ "$T10_OUT" == *"rc=0"* ]]; then
+  smoke_fail "T10 (r2 codex r1 BLOCKING #1252): self-heal returned rc=0 with EMPTY group resolver — R1 silently no-op'd chgrp and left the dir with the controller's primary group (e.g. agentbridge), and daemon writes still wedged; got: $T10_OUT"
+fi
+if [[ "$T10_OUT" != *"state_dir_group_resolver_empty"* ]]; then
+  smoke_fail "T10 (r2 codex r1 BLOCKING #1252): self-heal failed but did not emit reason=state_dir_group_resolver_empty; got: $T10_OUT"
+fi
+smoke_log "T10 PASS — self-heal fails loud on empty group resolver with structured reason"
+
+# ---------------------------------------------------------------------
+# T11 (r2 codex r1 BLOCKING #1252): all four new [nudge-skip] emitters
+#      cite `task=<digits>` or `task=none`, NEVER `task=-`.
+# ---------------------------------------------------------------------
+smoke_log "T11: all new [nudge-skip] emitters honor the task=<id|none> contract (no task=- literals)"
+
+# Strict regression-of-wrong-contract guard: NO `[nudge-skip] ... task=- `
+# string may appear in the four files that the R1 commit touched. The
+# fixed shape is either `task=<digits>` or `task=none`.
+T11_VIOLATIONS=""
+for src in "$DAEMON_SH" "$CHANNELS_LIB"; do
+  if grep -n '\[nudge-skip\][^"]*task=- ' "$src" 2>/dev/null; then
+    T11_VIOLATIONS="$T11_VIOLATIONS $src"
+  fi
+done
+if [[ -n "$T11_VIOLATIONS" ]]; then
+  smoke_fail "T11 (r2 codex r1 BLOCKING #1252): [nudge-skip] emitters STILL hard-code 'task=-' instead of task=<id|none> in:$T11_VIOLATIONS"
+fi
+
+# Positive assertion: each of the 4 new emit sites must contain either
+# `task=none ` or a variable-expansion `task=$...` / `task=${...}` shape.
+# bridge-daemon.sh:
+#   - live-queued-empty → task=none
+#   - age-gate-failed   → task=${_agf_skip_task_id} (digits or 'none')
+#   - dedup-cooldown    → task=${_dd_skip_task_id}  (digits or 'none')
+# lib/bridge-channels.sh:
+#   - state-dir-missing → task=none
+if ! grep -q 'reason=live-queued-empty' "$DAEMON_SH" || ! grep -q 'task=none reason=live-queued-empty' "$DAEMON_SH"; then
+  smoke_fail "T11: bridge-daemon.sh live-queued-empty emitter does not cite task=none (r2 codex r1 finding 1)"
+fi
+if ! grep -q 'reason=age-gate-failed' "$DAEMON_SH" || ! grep -q 'task=\${_agf_skip_task_id}' "$DAEMON_SH"; then
+  smoke_fail "T11: bridge-daemon.sh age-gate-failed emitter does not cite task=\${_agf_skip_task_id} (r2 codex r1 finding 1)"
+fi
+if ! grep -q 'reason=dedup-cooldown' "$DAEMON_SH" || ! grep -q 'task=\${_dd_skip_task_id}' "$DAEMON_SH"; then
+  smoke_fail "T11: bridge-daemon.sh dedup-cooldown emitter does not cite task=\${_dd_skip_task_id} (r2 codex r1 finding 1)"
+fi
+if ! grep -q 'task=none reason=state-dir-missing' "$CHANNELS_LIB"; then
+  smoke_fail "T11: lib/bridge-channels.sh state-dir-missing emitter does not cite task=none (r2 codex r1 finding 1)"
+fi
+smoke_log "T11 PASS — [nudge-skip] emitters honor task=<id|none> contract"
+
+# ---------------------------------------------------------------------
+# T12 (r2 codex r1 CONTRACT MISMATCH #1246): on_disk field is present
+#      in the decision-evidence emit helper signature + every call site.
+# ---------------------------------------------------------------------
+smoke_log "T12: decision-evidence emit helper includes on_disk between pid and in_proc"
+
+# The emit helper printf format string must contain `on_disk=%s` BEFORE
+# `in_proc=%s`. Single static-source grep against the literal printf.
+if ! grep -q 'pid=%s on_disk=%s in_proc=%s target_gid=%s action=%s reason=%s' "$DAEMON_CONTROL_LIB"; then
+  smoke_fail "T12 (r2 codex r1 CONTRACT MISMATCH #1246): decision-evidence printf format string does not include 'on_disk=%s' between 'pid=%s' and 'in_proc=%s' — operator cannot see on-disk supp groups for diagnostic"
+fi
+# The on_disk resolver helper must exist.
+if ! grep -q '_bridge_daemon_control_proc_owner_on_disk_groups()' "$DAEMON_CONTROL_LIB"; then
+  smoke_fail "T12 (r2 codex r1 CONTRACT MISMATCH #1246): _bridge_daemon_control_proc_owner_on_disk_groups resolver missing"
+fi
+# Every call site of the emit helper must pass 6 args (pid, on_disk,
+# in_proc, target_gid, action, reason). Count fields by line: each call
+# spans 2 lines (`_bridge_daemon_control_emit_decision_log \` followed
+# by the args). Count emit helper invocations:
+EMIT_CALLS="$(grep -cE '_bridge_daemon_control_emit_decision_log[[:space:]]*\\$' "$DAEMON_CONTROL_LIB" || true)"
+if (( EMIT_CALLS < 4 )); then
+  smoke_fail "T12 (r2 codex r1 CONTRACT MISMATCH #1246): expected >=4 calls to _bridge_daemon_control_emit_decision_log (one per outcome path), got $EMIT_CALLS"
+fi
+# Each call must include the on_disk slot. The simplest static check:
+# count tokens on the args-line of each invocation. Strip out command
+# substitutions ($(...)) first so nested quoted strings do not inflate
+# the count. After stripping, each top-level arg is a single quoted
+# string — count them and require >= 6.
+T12_BAD_CALLS="$(
+  awk '
+    /_bridge_daemon_control_emit_decision_log[[:space:]]*\\$/ {
+      getline next_line
+      # Strip $(...) command-substitutions (non-nested) so inner
+      # quoted strings dont inflate the arg count.
+      gsub(/\$\([^)]*\)/, "X", next_line)
+      n = gsub(/"[^"]*"/, "&", next_line)
+      if (n != 6) print FILENAME ":" FNR ": (n=" n ") " next_line
+    }
+  ' "$DAEMON_CONTROL_LIB"
+)"
+if [[ -n "$T12_BAD_CALLS" ]]; then
+  smoke_fail "T12 (r2 codex r1 CONTRACT MISMATCH #1246): emit-helper call sites do not pass 6 args (pid + on_disk + in_proc + target_gid + action + reason):$(printf '\n')$T12_BAD_CALLS"
+fi
+smoke_log "T12 PASS — on_disk field present in emit helper + all call sites pass it"
+
+# ---------------------------------------------------------------------
+# T13 (teeth, r2 codex r1 finding 1): revert task-contract fix back to
+#      task=- → assert T11 fails loudly.
+# ---------------------------------------------------------------------
+smoke_log "T13 (teeth): teeth-check on T11 — reverting nudge-skip task-contract fix back to task=- must FAIL T11"
+
+T13_PATCHED_DAEMON="$SMOKE_TMP_ROOT/bridge-daemon-T13.sh"
+# Revert: replace the new `task=none` / `task=${...}` shapes back to
+# the R1 `task=-` literal. Surgical sed replacement.
+sed -E \
+  -e 's/task=none reason=live-queued-empty/task=- reason=live-queued-empty/' \
+  -e 's/task=\$\{_agf_skip_task_id\} reason=age-gate-failed/task=- reason=age-gate-failed/' \
+  -e 's/task=\$\{_dd_skip_task_id\} reason=dedup-cooldown/task=- reason=dedup-cooldown/' \
+  "$DAEMON_SH" >"$T13_PATCHED_DAEMON"
+
+# Re-run the T11 strict regression guard against the patched copy.
+if ! grep -q '\[nudge-skip\][^"]*task=- ' "$T13_PATCHED_DAEMON"; then
+  smoke_fail "T13 (teeth): teeth-check sed-revert did NOT reintroduce task=- in patched bridge-daemon.sh — teeth fixture is broken"
+fi
+smoke_log "T13 PASS — teeth-check works: reverting the contract fix to task=- IS detected by T11's regression guard"
+
+# ---------------------------------------------------------------------
+# T14 (teeth, r2 codex r1 finding 3): revert on_disk evidence field →
+#      T1 + T12 fail loudly.
+# ---------------------------------------------------------------------
+smoke_log "T14 (teeth): teeth-check on T1/T12 — reverting on_disk evidence field must FAIL T12"
+
+T14_PATCHED_DC="$SMOKE_TMP_ROOT/bridge-daemon-control-T14.sh"
+# Revert: replace the new printf with the R1 in_proc-only printf.
+sed -E \
+  -e 's/pid=%s on_disk=%s in_proc=%s target_gid=%s action=%s reason=%s/pid=%s in_proc=%s target_gid=%s action=%s reason=%s/' \
+  "$DAEMON_CONTROL_LIB" >"$T14_PATCHED_DC"
+
+if grep -q 'pid=%s on_disk=%s in_proc=%s target_gid=%s action=%s reason=%s' "$T14_PATCHED_DC"; then
+  smoke_fail "T14 (teeth): teeth-check sed-revert did NOT remove on_disk=%s from patched printf — teeth fixture is broken"
+fi
+# Also confirm the R1 (pre-fix) shape returned.
+if ! grep -q 'pid=%s in_proc=%s target_gid=%s action=%s reason=%s' "$T14_PATCHED_DC"; then
+  smoke_fail "T14 (teeth): teeth-check sed-revert did not restore the R1 (pre-fix) in_proc-only printf shape"
+fi
+smoke_log "T14 PASS — teeth-check works: reverting the on_disk field IS detected by T12's assertion"
+
+# ---------------------------------------------------------------------
+# T15 (teeth, r2 codex r1 finding 2): revert self-heal mode-verify on
+#      pre-existing dir → T8 fails loudly.
+# ---------------------------------------------------------------------
+smoke_log "T15 (teeth): teeth-check on T8 — reverting self-heal mode-verify (rc=0 for any pre-existing dir) must FAIL T8"
+
+T15_DRIVER="$SMOKE_TMP_ROOT/t15-driver.sh"
+: >"$T15_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' "BRIDGE_ACTIVE_AGENT_DIR=\"$SMOKE_TMP_ROOT/t15-state-agents\""
+  printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR"'
+  printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
+  printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s/%s" "$BRIDGE_ACTIVE_AGENT_DIR" "$1"; }'
+  # T15 = the R1 (pre-r2) helper shape: rc=0 for any pre-existing dir
+  # regardless of mode/group. Inline a minimal R1-shape function so the
+  # teeth-check is hermetic.
+  printf '%s\n' 'bridge_agent_state_dir_self_heal_R1() {'
+  printf '%s\n' '  local agent="$1"; [[ -n "$agent" ]] || return 1'
+  printf '%s\n' '  local dir; dir="$(bridge_agent_idle_marker_dir "$agent")"'
+  printf '%s\n' '  if [[ -d "$dir" ]]; then return 0; fi   # <-- R1 bug: rc=0 without checking mode'
+  printf '%s\n' '  mkdir -m 2770 -p "$dir" 2>/dev/null && return 0'
+  printf '%s\n' '  return 1'
+  printf '%s\n' '}'
+  printf '%s\n' '# Pre-create the dir at mode 0700 — the R1 helper returns rc=0 anyway.'
+  printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t15"'
+  printf '%s\n' 'chmod 0700 "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t15"'
+  printf '%s\n' 'bridge_agent_state_dir_self_heal_R1 test_a12_t15; rc=$?'
+  printf '%s\n' 'post_mode="$(stat -c %a "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t15" 2>/dev/null || stat -f %Lp "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t15" 2>/dev/null)"'
+  printf '%s\n' 'printf "rc=%s post_mode=%s\n" "$rc" "$post_mode"'
+} >>"$T15_DRIVER"
+chmod +x "$T15_DRIVER"
+
+T15_OUT="$(/usr/bin/env bash "$T15_DRIVER" 2>&1 || true)"
+# This is what R1 produced: rc=0 with mode 700. If T8's regression guard
+# is working, the R1 shape would fail T8's assertion. We assert here
+# that the R1 shape DOES produce that exact output (so a reviewer can
+# see the regression demonstration).
+if [[ "$T15_OUT" != *"rc=0"* ]] || [[ "$T15_OUT" != *"post_mode=700"* ]]; then
+  smoke_fail "T15 (teeth): the R1-shape helper did NOT reproduce the codex r1 finding 2 false-positive (expected rc=0 post_mode=700); got: $T15_OUT — teeth fixture is broken"
+fi
+smoke_log "T15 PASS — teeth-check works: the R1 false-positive (rc=0 with mode 700) IS the regression T8 catches"
+
+# ---------------------------------------------------------------------
+smoke_log "all tests PASS — A12-beta3 #1246 + #1252 verified at current main (r2: codex r1 BLOCKING + CONTRACT MISMATCH closed)"

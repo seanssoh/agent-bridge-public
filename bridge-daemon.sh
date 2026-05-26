@@ -3962,7 +3962,10 @@ nudge_agent_session() {
       --detail queued_live="$live_queued" \
       --detail claimed_live="$live_claimed"
     # #1252: structured audit log so silent-skip never repeats undetected.
-    daemon_info "[nudge-skip] agent=${agent} task=- reason=live-queued-empty evidence=snapshot_queued=${queued},live_queued=${live_queued}"
+    # r2 codex r1 BLOCKING: emit task=none (NOT task=-) — live-queued is
+    # empty, so there is no specific task id to cite; `none` is the
+    # canonical sentinel per the [nudge-skip] task=<id|none> contract.
+    daemon_info "[nudge-skip] agent=${agent} task=none reason=live-queued-empty evidence=snapshot_queued=${queued},live_queued=${live_queued}"
     daemon_info "skipped stale nudge for ${agent} (snapshot queued=${queued}, live queued=${live_queued})"
     return 0
   fi
@@ -4010,7 +4013,16 @@ nudge_agent_session() {
           --detail redelivery_seconds="$redelivery_seconds" \
           --detail live_nudge_key="${live_nudge_key:-$nudge_key}"
         # #1252: structured audit log so silent-skip never repeats undetected.
-        daemon_info "[nudge-skip] agent=${agent} task=- reason=age-gate-failed evidence=live_queued=${live_queued},redelivery=${redelivery_seconds}s"
+        # r2 codex r1 BLOCKING: emit task=<id> for the first eligible
+        # queued task in live_nudge_key (CSV from cmd_nudge_live_state).
+        # The aged task that triggered emission was claimed/done; the
+        # remaining live queue is fresh-only — we cite the first remaining
+        # queued id so the operator can correlate the skip to a concrete
+        # row, NOT task=-. Falls back to `none` if the csv is empty (which
+        # would itself indicate an upstream race, since live_queued > 0).
+        local _agf_skip_task_id="${live_nudge_key%%,*}"
+        [[ -n "$_agf_skip_task_id" ]] || _agf_skip_task_id="none"
+        daemon_info "[nudge-skip] agent=${agent} task=${_agf_skip_task_id} reason=age-gate-failed evidence=live_queued=${live_queued},redelivery=${redelivery_seconds}s"
         daemon_info "skipped stale nudge for ${agent} (live recheck found no age-eligible tasks; live queued=${live_queued}, redelivery=${redelivery_seconds}s)"
         return 0
       fi
@@ -4042,7 +4054,16 @@ nudge_agent_session() {
       --detail claimed="$live_claimed" \
       --detail redelivery_seconds="${BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS:-60}"
     # #1252: structured audit log so silent-skip never repeats undetected.
-    daemon_info "[nudge-skip] agent=${agent} task=- reason=dedup-cooldown evidence=fingerprint=${nudge_fingerprint:0:8},queued=${live_queued}"
+    # r2 codex r1 BLOCKING: emit task=<id> for the first queued task in
+    # live_nudge_key (the same csv consumed by the fingerprint helper
+    # above). The dedup is keyed by the fingerprint of the full set, but
+    # the per-skip log line cites the first queued id so the operator can
+    # correlate the skip to a concrete row, NOT task=-. Falls back to
+    # `none` if the csv is empty (would not normally occur on the dedup
+    # path, since live_queued > 0).
+    local _dd_skip_task_id="${live_nudge_key%%,*}"
+    [[ -n "$_dd_skip_task_id" ]] || _dd_skip_task_id="none"
+    daemon_info "[nudge-skip] agent=${agent} task=${_dd_skip_task_id} reason=dedup-cooldown evidence=fingerprint=${nudge_fingerprint:0:8},queued=${live_queued}"
     daemon_info "skipped duplicate nudge for ${agent} (fingerprint=${nudge_fingerprint:0:8}, queued=${live_queued})"
     return 0
   fi
