@@ -6084,6 +6084,48 @@ process_on_demand_agents() {
         fi
       fi
       if ((( always_on == 1 ))) && ! bridge_agent_is_active "$agent"; then
+        # Issue #1234 (Lane δ, v0.15.0-beta2): operator-declared `hold`
+        # start-policy unconditionally suppresses the warm autostart loop.
+        # Skip the start attempt, do NOT write a backoff state file, and
+        # do NOT emit log noise on every tick — the operator is configuring
+        # the agent and the daemon should stay out of the way. The agent
+        # only starts via an explicit `agent-bridge agent start <agent>`
+        # (which clears any prior backoff state) or after the operator
+        # flips back to `--start-policy auto`. NO bridge_start.sh
+        # invocation = NO restart loop.
+        local _start_policy
+        _start_policy="$(bridge_agent_start_policy "$agent" 2>/dev/null || printf '%s' "auto")"
+        if [[ "$_start_policy" == "hold" ]]; then
+          # Clear any stale backoff state so a flip back to auto starts
+          # immediately rather than waiting on a leftover retry window.
+          bridge_daemon_clear_autostart_failure "$agent"
+          unset _start_policy
+          continue
+        fi
+        unset _start_policy
+        # Issue #1234 (Lane δ): auto-hold when channel-required validation
+        # reports a miss. The operator-visible reason ("setup incomplete,
+        # run `setup teams`") never gets stuck behind an opaque
+        # `start-command-failed` line. Skip the bridge-start.sh invocation
+        # entirely — bridge-start.sh would only re-fail at the same
+        # validator — and record the actionable reason in the backoff
+        # state so the next-retry window suppresses log spam. The miss
+        # status itself is already surfaced by `agent show` /
+        # `restart_readiness`; this loop just stops adding to the noise.
+        local _channel_status _channel_reason
+        _channel_status="$(bridge_agent_channel_status "$agent" 2>/dev/null || printf '%s' "-")"
+        if [[ "$_channel_status" == "miss" ]]; then
+          _channel_reason="$(bridge_agent_channel_status_reason "$agent" 2>/dev/null || printf '')"
+          [[ -n "$_channel_reason" ]] || _channel_reason="setup incomplete"
+          # First-class reason string the operator can act on. Persists
+          # via the backoff state file so subsequent ticks honor the
+          # backoff window and the daemon log doesn't spam.
+          bridge_daemon_note_autostart_failure "$agent" \
+            "channel-required-validator-miss: ${_channel_reason}"
+          unset _channel_status _channel_reason
+          continue
+        fi
+        unset _channel_status _channel_reason
         # Engine-binary preflight: if the agent's engine CLI is absent
         # from PATH, every restart attempt will exit 127 within
         # milliseconds and the daemon would spam
@@ -6116,6 +6158,18 @@ process_on_demand_agents() {
           bridge_warn "always-on auto-start failed: ${agent}"
         fi
       elif [[ "$queued" =~ ^[0-9]+$ ]] && (( queued > 0 )) && ! bridge_agent_is_active "$agent"; then
+        # Issue #1234 (Lane δ): same hold gate as the always-on branch.
+        # On-demand wake is still an auto-start; honoring hold here means
+        # the operator's "configuring this agent" affordance applies to
+        # queued-work wakes too, not just warm restart.
+        local _start_policy_od
+        _start_policy_od="$(bridge_agent_start_policy "$agent" 2>/dev/null || printf '%s' "auto")"
+        if [[ "$_start_policy_od" == "hold" ]]; then
+          bridge_daemon_clear_autostart_failure "$agent"
+          unset _start_policy_od
+          continue
+        fi
+        unset _start_policy_od
         if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
           session="$(bridge_agent_session "$agent")"
           timeout="$(bridge_agent_idle_timeout "$agent")"

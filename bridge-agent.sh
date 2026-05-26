@@ -94,6 +94,11 @@ override) — same trust model as 'agent-bridge config set'. Repeatable.
   --idle-timeout <seconds>             set BRIDGE_AGENT_IDLE_TIMEOUT (integer ≥0; 0 = always on)
   --always-on yes                      sugar for --idle-timeout 0 (records expressed_intent=always_on_yes)
   --always-on no                       requires --idle-timeout <positive>; records expressed_intent=always_on_no
+  --start-policy hold|auto             daemon auto-start policy (issue #1234, Lane δ);
+                                       "hold" suppresses the warm always-on autostart loop until
+                                       the operator runs 'agent start <agent>' (use while channel
+                                       setup is intentionally incomplete). "auto" (default)
+                                       restores warm always-on semantics.
   --json                               emit JSON envelope
   --dry-run                            do not mutate; emit planned diff
 
@@ -999,6 +1004,12 @@ bridge_write_role_block() {
   # (which sets always_on=1) and `--idle-timeout 0` produce the same byte
   # emission, and `--idle-timeout 300` writes the literal `"300"`.
   local idle_timeout_value="${21:-}"
+  # Issue #1234 (Lane δ): optional positional 22 carries an explicit
+  # BRIDGE_AGENT_START_POLICY value (hold|auto). Empty means "do not emit
+  # the line" — bridge_agent_start_policy's "auto" fallback covers absence.
+  # When non-empty, the writer emits the explicit assignment so a future
+  # roster reload restores the persisted value.
+  local start_policy_value="${22:-}"
 
   bridge_agent_manage_python \
     "$BRIDGE_ROSTER_LOCAL_FILE" \
@@ -1022,7 +1033,8 @@ bridge_write_role_block() {
     "$replace_existing" \
     "$agent_class" \
     "$loop_explicit_off" \
-    "$idle_timeout_value" <<'PY'
+    "$idle_timeout_value" \
+    "$start_policy_value" <<'PY'
 from pathlib import Path
 import shlex
 import sys
@@ -1051,6 +1063,7 @@ import re
     agent_class,
     loop_explicit_off,
     idle_timeout_value,
+    start_policy_value,
 ) = sys.argv[1:]
 
 path = Path(path_str)
@@ -1115,6 +1128,14 @@ if idle_timeout_value:
     lines.append(f'BRIDGE_AGENT_IDLE_TIMEOUT["{agent}"]="{idle_timeout_value}"')
 elif always_on == "1":
     lines.append(f'BRIDGE_AGENT_IDLE_TIMEOUT["{agent}"]="0"')
+# Issue #1234 (Lane δ): emit BRIDGE_AGENT_START_POLICY only when the caller
+# supplied an explicit value (`agent update --start-policy ...`). Default
+# "auto" reading lives in bridge_agent_start_policy's fallback, so omitting
+# the line is byte-identical to pre-#1234 emission for every legacy create /
+# reclassify caller. The closed value space (hold|auto) is enforced upstream
+# at the parse layer; the writer does not re-validate.
+if start_policy_value:
+    lines.append(f'BRIDGE_AGENT_START_POLICY["{agent}"]="{start_policy_value}"')
 if isolation_mode:
     # Emit the isolation mode verbatim (including "shared") so roster
     # round-trips preserve explicit configuration. Downstream tooling that
@@ -3838,6 +3859,14 @@ run_update() {
   # --channels-add / --channels-remove auto-qualify path (set -u safe).
   local _channels_normalized=""
   local _channels_token=""
+  # Issue #1234 (Lane δ): explicit daemon auto-start policy. Operator picks
+  # "hold" to suppress the warm always-on autostart loop while channel setup
+  # is intentionally incomplete; "auto" restores default behavior. Persisted
+  # to BRIDGE_AGENT_START_POLICY (associative array — never scalar, refs
+  # #1213). Tri-state presence + value mirrors the other typed flags so the
+  # writer only emits when the operator actually touched the policy.
+  local start_policy_present=0
+  local start_policy_value=""
 
   add_launch_cmd_op() {
     launch_cmd_ops+="$1"$'\t'"$2"$'\n'
@@ -4088,6 +4117,22 @@ run_update() {
         mutation_present=1
         shift 2
         ;;
+      --start-policy)
+        # Issue #1234 (Lane δ): daemon auto-start policy. Closed value
+        # space (hold|auto); the daemon's always-on autostart loop reads
+        # via bridge_agent_start_policy which normalizes unset/unknown to
+        # "auto", so the writer only emits when the operator explicitly
+        # set the value. Validate at parse time so a bad write never lands.
+        [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
+        case "$2" in
+          hold|auto) ;;
+          *) bridge_die "--start-policy 는 hold|auto 만 가능합니다: $2" ;;
+        esac
+        start_policy_present=1
+        start_policy_value="$2"
+        mutation_present=1
+        shift 2
+        ;;
       --class)
         # Closed value space matches bridge_validate_agent_classes
         # (lib/bridge-agents.sh:413). Operator-supplied values that
@@ -4226,6 +4271,12 @@ run_update() {
           always_on_yes) printf 'always_on=yes\n' ;;
           always_on_no)  printf 'always_on=no\n' ;;
         esac
+      fi
+      # Issue #1234 (Lane δ): surface --start-policy hold|auto verbatim so
+      # audit-log readers see policy-flip events without joining on the
+      # before/after fields.
+      if [[ $start_policy_present -eq 1 ]]; then
+        printf 'start_policy=%s\n' "$start_policy_value"
       fi
     } | tr '\n' ',' | sed 's/,$//'
   )"
@@ -4377,6 +4428,7 @@ PY
   # below recognises a repeated `--idle-timeout` as `changed=false`.
   local before_desc before_engine before_workdir before_loop before_continue before_class
   local before_idle_timeout
+  local before_start_policy
   before_desc="$(bridge_agent_desc "$agent")"
   before_engine="$(bridge_agent_engine "$agent")"
   before_workdir="$(bridge_agent_workdir "$agent")"
@@ -4384,6 +4436,11 @@ PY
   before_continue="$(bridge_agent_continue "$agent")"
   before_class="$(bridge_agent_class "$agent")"
   before_idle_timeout="$(bridge_agent_idle_timeout "$agent")"
+  # Issue #1234 (Lane δ): capture pre-mutation start_policy value so the
+  # change-detection and audit row reflect the policy delta. The reader
+  # defaults to "auto" for unset agents so a first-time --start-policy hold
+  # write always trips `changed=true`.
+  before_start_policy="$(bridge_agent_start_policy "$agent")"
   # Issue #1093: detect real configured-ness from the roster FILE rather
   # than the in-memory map. bridge-state.sh:1236 backfills
   # BRIDGE_AGENT_IDLE_TIMEOUT for every loaded agent to the default 0, so
@@ -4401,6 +4458,15 @@ PY
   if [[ -f "$roster_path" ]] && grep -qF "BRIDGE_AGENT_IDLE_TIMEOUT[\"${agent}\"]=" "$roster_path"; then
     before_idle_timeout_configured=1
   fi
+  # Issue #1234 (Lane δ): same file-grep pattern for the start_policy line so
+  # the writer/audit/no-op short-circuit can distinguish "default (auto via
+  # reader fallback)" from "explicitly persisted auto". A first-time write
+  # to --start-policy hold trips configured=0→1, which the writer needs to
+  # emit the new BRIDGE_AGENT_START_POLICY assignment line.
+  local before_start_policy_configured=0
+  if [[ -f "$roster_path" ]] && grep -qF "BRIDGE_AGENT_START_POLICY[\"${agent}\"]=" "$roster_path"; then
+    before_start_policy_configured=1
+  fi
 
   local new_desc="$before_desc"
   local new_engine="$before_engine"
@@ -4410,6 +4476,8 @@ PY
   local new_class="$before_class"
   local new_idle_timeout="$before_idle_timeout"
   local new_idle_timeout_configured="$before_idle_timeout_configured"
+  local new_start_policy="$before_start_policy"
+  local new_start_policy_configured="$before_start_policy_configured"
   [[ $desc_present -eq 1 ]]         && new_desc="$desc_value"
   [[ $engine_present -eq 1 ]]       && new_engine="$engine_value"
   [[ $workdir_present -eq 1 ]]      && new_workdir="$workdir_value"
@@ -4419,6 +4487,10 @@ PY
   if [[ $idle_timeout_present -eq 1 ]]; then
     new_idle_timeout="$idle_timeout_value"
     new_idle_timeout_configured=1
+  fi
+  if [[ $start_policy_present -eq 1 ]]; then
+    new_start_policy="$start_policy_value"
+    new_start_policy_configured=1
   fi
 
   local changed=0
@@ -4431,7 +4503,9 @@ PY
         || "$new_continue" != "$before_continue" \
         || "$new_class" != "$before_class" \
         || "$new_idle_timeout" != "$before_idle_timeout" \
-        || "$new_idle_timeout_configured" != "$before_idle_timeout_configured" ]]; then
+        || "$new_idle_timeout_configured" != "$before_idle_timeout_configured" \
+        || "$new_start_policy" != "$before_start_policy" \
+        || "$new_start_policy_configured" != "$before_start_policy_configured" ]]; then
     changed=1
   fi
 
@@ -4493,6 +4567,16 @@ PY
     if [[ "$new_idle_timeout_configured" == "1" ]]; then
       idle_timeout_writer_arg="$new_idle_timeout"
     fi
+    # Issue #1234 (Lane δ): positional 22 carries the post-mutation
+    # start_policy value. Empty → writer omits the BRIDGE_AGENT_START_POLICY
+    # line (preserves byte-identical emission for updates that don't touch
+    # the policy). Configured-bit drives the explicit-emit decision so the
+    # default "auto" reading is implicit (line absent) and the persisted
+    # "auto" reading is explicit (line present, value "auto").
+    local start_policy_writer_arg=""
+    if [[ "$new_start_policy_configured" == "1" ]]; then
+      start_policy_writer_arg="$new_start_policy"
+    fi
     bridge_write_role_block \
       "$agent" \
       "$new_desc" \
@@ -4514,7 +4598,8 @@ PY
       "1" \
       "$new_class" \
       "$loop_explicit_off_arg" \
-      "$idle_timeout_writer_arg" >/dev/null
+      "$idle_timeout_writer_arg" \
+      "$start_policy_writer_arg" >/dev/null
     after_sha="$(bridge_agent_update_file_sha256 "$roster_path")"
 
     # Issue #989: bridge_write_role_block just rewrote the roster file —
@@ -4632,6 +4717,13 @@ PY
   if [[ -n "$audit_before_loop" || -n "$audit_after_loop" ]]; then
     printf 'before_loop: %s\n' "$audit_before_loop"
     printf 'after_loop: %s\n' "$audit_after_loop"
+  fi
+  # Issue #1234 (Lane δ): surface start_policy delta in plain-text output
+  # when the mutation touched it. Same suppression rule as idle_timeout /
+  # loop: lines stay absent when the policy was not part of this update.
+  if [[ $start_policy_present -eq 1 || "$new_start_policy" != "$before_start_policy" ]]; then
+    printf 'before_start_policy: %s\n' "$before_start_policy"
+    printf 'after_start_policy: %s\n' "$new_start_policy"
   fi
   printf 'before_sha: %s\n' "$before_sha"
   printf 'after_sha: %s\n' "$after_sha"
