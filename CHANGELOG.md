@@ -6,6 +6,46 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.0-beta2] — 2026-05-26
+
+### Highlight — 7-lane parallel OOTB closure (#1231–#1238 + #6607)
+
+Operator-cued 2026-05-26 ~13:00 KST verbatim: "니가 만든 15.0 베타 1 버전 쓰레긴데? ... 에이로 다시 해서 빨리 쉽 해!" Patch's fresh-install + fresh `agent create --isolate --channels plugin:teams,plugin:ms365,plugin:cosmax-*` surfaced 8 OOTB-failing issues that beta1's regression check on existing iso agents missed. **Methodology fix going forward**: every future beta requires a fresh-install + fresh-iso-agent-create OOTB verify gate (regression check ≠ acceptance test).
+
+`-beta2` prerelease, matching tag `v0.15.0-beta2`, GitHub release marked **Pre-release**.
+
+### Fixed — iso v2 scaffold ownership + bridge-auth file-as-argv (#1238, Lane α PR #1239)
+
+`agent create --isolate` left `<iso-agent>/home/` and credentials with stale controller ownership → the iso UID could not read its own home. `lib/bridge-agents.sh:4157-4179` adds a chown handoff for `"$workdir"` + `"$_v2_agent_root/home"` (scope-limited; credentials + runtime/logs/requests/responses still controller-owned). `bridge-auth.sh:218-233` previously routed `python3 - <<'PY'` through `bridge_auth_run_privileged` → wrapper's first-attempt-then-sudo retry consumed the heredoc on first invocation, leaving sudo fallback with EOF. Extracted to `lib/upgrade-helpers/auth-legacy-claude-config-env.py` (file-as-argv; mode 0700) per the same footgun #11 pattern that produced v0.13.7-v0.13.9 helpers. Counter-proof T3c in `scripts/smoke/1238-iso-scaffold-ownership.sh` simulates the wrapper retry-fallback and would fail loudly on any future revert to heredoc-stdin.
+
+### Fixed — fresh init seeds bundled plugin catalog + verifier-gated sudoers status (#1231 + #1236-sudoers, Lane β PR #1242)
+
+`agb agent create --isolate --channels plugin:teams,plugin:ms365` on a fresh v2 install `bridge_die`'d with "plugins-cache is not populated" because Claude never wrote `installed_plugins.json` there and the operator had to discover `agb plugins seed` from the error. Two-layer fix per codex r1 spec: (1) `bridge-init.sh` runs idempotent `<live-cli> plugins seed` (bundled marketplace) after host-profile resolution, gated on `bridge_isolation_v2_active`; non-fatal on failure. (2) `bridge_linux_share_plugin_catalog` in `lib/bridge-agents.sh:2624-2667` detects empty-cache + declared-plugin and runs the same seed via subprocess before failing. Same path: `bridge-init.sh:688-730` + `agent-bridge:582-624` no longer emit contradictory `[init] daemon-refresh sudoers: installed` + `daemon_group_refresh_sudoers=missing|invalid` on adjacent lines; gates the success line on `bridge_daemon_control_check_sudoers` returning `ok`, otherwise emits `manual-required: daemon_group_refresh_sudoers=<reason>` with remediation. 6-test smoke + ci-select registration in 4 sites (r2).
+
+### Fixed — setup-teams target-scope + agent update --channels alias + launch_cmd reconcile + agent update --help short-circuit (#1232 + #1235 + #1236, Lane γ PR #1244)
+
+`bridge-setup.sh` channel wizards (`setup-teams|discord|telegram|ms365`) wrote managed-CLAUDE-block plugin lines into the operator's home but not into iso v2 agents' isolated home → `agent create --channels plugin:teams` later failed. New helper `bridge_setup_ensure_claude_channel_plugin_for_needle` wired into all 4 run_* entry points + iso v2 target-scoping. `agent update --channels foo,bar` now accepts the new alias and `bridge_normalize_channels_csv` canonicalizes through the same canonical-table from beta1 Lane G. `launch_cmd` dev-channel reconcile on `agent update` so updated channels actually propagate to the running launch_cmd. `agent update --help` short-circuits BEFORE the bind path so it never spawns a sudo prompt to discover the help text. 1117-cli-help-universal-gate prunes `agent update` from KNOWN_BROKEN_VERBS (145 assertions). New 9-test smoke + ci-select registration in 3 sites (r2).
+
+### Fixed — daemon `--start-policy hold|auto` + channel-miss auto-hold parity across 3 wake paths (#1234, Lane δ PR #1245)
+
+`agent update --start-policy hold|auto` lets operators explicitly suppress autostart while channel setup is intentionally incomplete. Persisted as `BRIDGE_AGENT_START_POLICY[<agent>]` (associative array — never scalar, refs #1213). `bridge_daemon_check_channel_status_or_hold` helper (`bridge-daemon.sh:3753-3768`) records `channel-required-validator-miss:<channel> <path>` and sets policy=hold instead of the opaque `start-command-failed`. Helper wired into all THREE wake paths: (a) `process_on_demand_agents` always-on branch; (b) `process_on_demand_agents` queued on-demand branch (codex r1); (c) `bridge_daemon_cron_dispatch_wake` (codex r2 — third bypass surfaced in r3 cycle). Smoke T5/T6 extract production functions verbatim via `awk` and assert source-anchor pins; teeth-verified counter-proofs catch any future revert. New 6-test smoke + ci-select registration in 2 sites (r2/r3).
+
+### Added — watchdog rescan verb + engine-native codex AGENTS.md contract (#1233 + #1237, Lane ε PR #1240)
+
+Codex now has an engine-native required-file contract: `CODEX_REQUIRED_FILES = ("AGENTS.md",)` in `bridge-watchdog.py`. Claude-only drift signals (managed-CLAUDE-block, onboarding state) ignored for codex; codex still errors on missing `AGENTS.md`. Engines with no implemented contract surface `unsupported_engine_contract` instead of silent OK. `agent-bridge watchdog rescan [--agent <a>] [--json] [--apply]` is the explicit operator verb (writes `<bridge_home>/shared/watchdog/latest.md`); `scan` remains stdout-only. Daemon cooldown preserved on tick path.
+
+### Added — plugins list / marketplaces read-only verbs with --json (#1236-plugins, Lane ζ PR #1241)
+
+`agb plugins list [--json]` and `agb plugins marketplaces [--json]` provide structured read-only inspection of the bundled marketplace + cache state. Four file-as-argv helpers under `lib/upgrade-helpers/plugins-{list,marketplaces}-{json,pretty}.py`. Smoke covers empty/populated cache + JSON shape + `show --json` sentinel. ci-select registration in 3 sites (r2).
+
+### Fixed — patch hook anchored admin bridge-verb allowlist with shape-deny + audit (#6607, Lane η PR #1243)
+
+`hooks/tool-policy.py` previously left admin `agent-bridge|agb auth claude-token add|sync|rotate` + `escalate question` + `a2a send --body-file` shapes wedged under credential/env-dump and protected-path denies. **Anchored verb allowlist** (NOT full admin bypass — codex r1 rejected that as broad-injection risk) inserted in the policy chain: credential/env-dump → protected-path → wrapper → roster/queue → **anchored verb allowlist** → peer/shared. `_extract_flag_value()` distinguishes `_FLAG_ABSENT` from `_FLAG_MALFORMED` (codex r2 finding); a2a allowlist DENIES malformed shapes (`--body-file` alone, `--body-file --to peer`, duplicate `--body-file` with traversal). Distinct audit row `tool_policy_admin_bridge_verb_denied_shape` for shape-rejected. 25-test smoke + ci-select registration in 2 sites (r2).
+
+### Internal — ci-select-smoke.sh registration discipline
+
+Codex caught registration gaps in 5 of 6 lane R1 reviews (β/γ/δ/η/ζ). Future wave briefs should pre-emptively include ci-select registration as an explicit fixer responsibility — the systemic gap added ~30min per lane to the wave cycle.
+
 ## [0.15.0-beta1] — 2026-05-26
 
 ### Highlight — minor bump for 4-lane backlog closure (G + F + H + I)
