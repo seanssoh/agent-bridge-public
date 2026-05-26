@@ -4577,6 +4577,20 @@ PY
     if [[ "$new_start_policy_configured" == "1" ]]; then
       start_policy_writer_arg="$new_start_policy"
     fi
+    # Issue #1251 codex r1 finding 1: capture the LAST-KNOWN-GOOD
+    # managed block BEFORE the writer mutates the roster. The snapshot
+    # lives at `state/agents/<a>/restart.snapshot.pre-update.<ts>` and
+    # is consumed by a subsequent `agent restart` whose post-mutation
+    # launch fails — without it, `run_restart`'s at-entry snapshot
+    # would capture the ALREADY-FAILING config (the mutation already
+    # landed) and the rollback would restore the broken config in place
+    # of the broken config. Best-effort: a snapshot failure does NOT
+    # abort the update — the prior behavior (no snapshot at all) was
+    # the baseline and the worst case is the rollback path falls back
+    # to the at-entry snapshot.
+    if command -v bridge_agent_restart_snapshot_pre_update >/dev/null 2>&1; then
+      bridge_agent_restart_snapshot_pre_update "$agent" >/dev/null 2>&1 || true
+    fi
     bridge_write_role_block \
       "$agent" \
       "$new_desc" \
@@ -5701,6 +5715,20 @@ run_restart() {
     bridge_die "$(bridge_agent_restart_preflight_guidance "$agent" "$preflight_reason")"
   fi
 
+  # Issue #1251 Phase 1: full pre-flight runs BEFORE the kill so any
+  # "cannot start with current config" failure leaves the running
+  # session intact. This covers the issue trace's case (unseeded plugin
+  # spec in BRIDGE_AGENT_CHANNELS): without this gate, the legacy
+  # preflight passes (channels-runtime-status check), the kill fires,
+  # `bridge-start.sh` reaches `bridge_ensure_claude_plugin_enabled`, the
+  # iso-v2 manifest guard fires `bridge_die`, the new launch never
+  # happens, and the agent ends up stopped.
+  local full_preflight_reason=""
+  full_preflight_reason="$(bridge_agent_restart_preflight_full_reason "$agent")"
+  if [[ -n "$full_preflight_reason" ]]; then
+    bridge_die "$(bridge_agent_restart_preflight_full_guidance "$agent" "$full_preflight_reason")"
+  fi
+
   # #256 Gap 2: clear the rapid-fail quarantine marker only after the
   # dry-run short-circuit (handled above) and the preflight guidance
   # check have both allowed the restart to proceed. An aborted restart
@@ -5724,6 +5752,31 @@ run_restart() {
   local resume_session_snapshot=""
   resume_session_snapshot="$(bridge_agent_session_id "$agent" 2>/dev/null || true)"
 
+  # Issue #1251 Phase 2 entry: pick the rollback snapshot + write the
+  # in-progress marker BEFORE the kill. The marker is the Lane C2
+  # (#1254) contract for watchdog drift suppression; the snapshot is the
+  # rollback target. Both artifacts live under state/agents/<a>/.
+  #
+  # Snapshot selection (codex r1 finding 1): prefer a `pre-update`
+  # snapshot captured by `run_update` before the roster mutation — that
+  # is the LAST-KNOWN-GOOD config. Production ordering is operator runs
+  # `agent update --channels-add <new>` (which writes the pre-update
+  # snapshot + mutates the roster), THEN runs `agent restart`. By the
+  # time we enter `run_restart` the roster already holds the failing
+  # update — an at-entry snapshot would capture that failing state and
+  # the rollback would restore broken-over-broken. Fall back to the
+  # at-entry snapshot only when no pre-update one is available (e.g.
+  # operator hit restart directly without a prior update, in which case
+  # the at-entry snapshot IS the last-known-good).
+  local restart_snapshot=""
+  restart_snapshot="$(bridge_agent_restart_find_pre_update_snapshot "$agent" 2>/dev/null || true)"
+  if [[ -z "$restart_snapshot" ]]; then
+    restart_snapshot="$(bridge_agent_restart_snapshot_managed_block "$agent" 2>/dev/null || true)"
+  fi
+  bridge_agent_restart_marker_write "$agent" "$$" \
+    "${BRIDGE_AGENT_RESTART_MARKER_TTL:-60}" "in_progress" "" \
+    >/dev/null 2>&1 || true
+
   if bridge_tmux_session_exists "$session"; then
     bridge_kill_agent_session "$agent"
     bridge_refresh_runtime_state
@@ -5733,6 +5786,10 @@ run_restart() {
   fi
 
   if [[ $attach_mode -eq 1 ]]; then
+    # Attach mode hands off to bridge-start.sh via exec; clear marker
+    # before the handoff because we can no longer manage its lifecycle
+    # from this PID after exec. The operator's terminal owns the result.
+    bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
     exec "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --replace "${start_args[@]}"
   fi
 
@@ -5740,11 +5797,68 @@ run_restart() {
     "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" --replace "${start_args[@]}"
   }
 
+  # Issue #1251 Phase 2 rollback helper. Invoked when a post-kill launch
+  # step fails. Restores the managed block from snapshot, attempts a
+  # second `restart_once` against the (now-restored) prior config, and
+  # records the outcome in the marker so Lane C2 (#1254) + the operator
+  # can audit what happened.
+  #
+  # Args:
+  #   $1 — reason fragment (e.g. "launch-failed", "verify-failed")
+  #   $2 — detail string for the marker reason field
+  # Returns 0 when rollback succeeded and re-launched on prior config,
+  # 1 when the rollback itself failed (agent left stopped).
+  restart_rollback() {
+    local rb_kind="${1:-launch-failed}"
+    local rb_detail="${2:-restart failed mid-flight}"
+
+    # Mark the marker with rolled_back state up-front so a watchdog tick
+    # that races the rollback's restart_once sees the terminal state
+    # instead of the still-in-progress flag. The reason field carries
+    # both the kind (machine-readable) and detail (operator-readable).
+    bridge_agent_restart_marker_write "$agent" "$$" \
+      "${BRIDGE_AGENT_RESTART_MARKER_TTL:-60}" "rolled_back" \
+      "$rb_kind: $rb_detail" \
+      >/dev/null 2>&1 || true
+
+    if [[ -z "$restart_snapshot" || ! -f "$restart_snapshot" ]]; then
+      bridge_warn "[restart] no snapshot available for '$agent' — agent left stopped (rollback target unknown). Underlying failure: $rb_kind: $rb_detail"
+      return 1
+    fi
+
+    if ! bridge_agent_restart_restore_managed_block "$agent" "$restart_snapshot" 2>/dev/null; then
+      bridge_warn "[restart] rollback failed for '$agent' — managed block could not be restored from snapshot ($restart_snapshot). Agent left stopped. Underlying failure: $rb_kind: $rb_detail"
+      return 1
+    fi
+
+    # Re-load roster + clear the in-memory caches so the second
+    # restart_once sees the restored config.
+    bridge_load_roster >/dev/null 2>&1 || true
+
+    bridge_warn "[restart] failed and rolled back to prior config for '$agent' — see $rb_kind: $rb_detail"
+
+    if ! restart_once; then
+      bridge_warn "[restart] rollback re-launch also failed for '$agent' — agent left stopped. Underlying failure: $rb_kind: $rb_detail"
+      return 1
+    fi
+
+    # Rollback path success — leave the marker in place with state=
+    # rolled_back so the audit trail survives. The snapshot itself is
+    # removed (it has served its purpose) but the marker persists until
+    # the next successful restart calls marker_clear.
+    rm -f "$restart_snapshot" 2>/dev/null || true
+    return 0
+  }
+
   if ! restart_once; then
+    restart_rollback "launch-failed" "bridge-start.sh exited non-zero" || true
     return 1
   fi
 
   if [[ "$engine" != "claude" ]]; then
+    # Issue #1251: success path — clear the marker + snapshot so Lane C2
+    # (#1254 watchdog) does not treat a stale marker as an active restart.
+    bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
     return 0
   fi
 
@@ -5759,6 +5873,10 @@ run_restart() {
   # during incident triage (issue #542).
   if [[ "${BRIDGE_SKIP_RESTART_PLUGIN_LIVENESS:-0}" == "1" ]]; then
     bridge_warn "BRIDGE_SKIP_RESTART_PLUGIN_LIVENESS=1; skipping restart-internal plugin MCP liveness verifier for '$agent'."
+    # Issue #1251: kill-switch path is still "restart completed from the
+    # operator's perspective" — clear the marker so a watchdog tick does
+    # not enqueue drift on a no-verify happy path.
+    bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
     return 0
   fi
 
@@ -5770,6 +5888,8 @@ run_restart() {
   # every plugin bun was alive. Align with the daemon's steady-state
   # liveness check so the two signals no longer disagree.
   if bridge_tmux_wait_for_claude_plugin_mcp_alive "$agent" "$verify_timeout"; then
+    # Issue #1251: success path — clear the marker + snapshot.
+    bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
     return 0
   fi
 
@@ -5797,14 +5917,30 @@ run_restart() {
       fi
     fi
     if ! restart_once; then
+      # Issue #1251: launch failed during the verify-retry loop, AFTER the
+      # in-loop kill above. Attempt rollback to the snapshot so the agent
+      # is not left stopped on a transient verify-then-launch failure.
+      restart_rollback "verify-retry-launch-failed" "restart_once exited non-zero during verify retry attempt $verify_attempts/$verify_max_attempts" || true
       return 1
     fi
     if bridge_tmux_wait_for_claude_plugin_mcp_alive "$agent" "$verify_timeout"; then
+      # Issue #1251: success path on a verify-retry — clear the marker.
+      bridge_agent_restart_marker_clear "$agent" 2>/dev/null || true
       return 0
     fi
   done
 
   bridge_warn "Claude plugin MCP liveness still missing after ${verify_max_attempts} attempts for '$agent'. Leaving the session alive so the daemon's next cycle can re-check (avoids the plugin-port death loop from issue #69)."
+  # Issue #1251: verify exhausted but session is alive — record the
+  # outcome as rolled_back state on the marker so Lane C2 can surface
+  # the structured cause instead of falling through to a generic drift.
+  # Do NOT call restart_rollback here: the session IS running (just
+  # without MCP liveness), so restoring a snapshot would unnecessarily
+  # restart the agent again. The marker write is the audit breadcrumb.
+  bridge_agent_restart_marker_write "$agent" "$$" \
+    "${BRIDGE_AGENT_RESTART_MARKER_TTL:-60}" "rolled_back" \
+    "verify-failed: plugin MCP liveness missing after $verify_max_attempts attempts (session left alive — see issue #69)" \
+    >/dev/null 2>&1 || true
   return 1
 }
 
