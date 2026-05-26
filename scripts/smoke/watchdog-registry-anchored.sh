@@ -276,18 +276,23 @@ assert rows["baz"]["status"] == "error", rows["baz"]
 assert payload["problem_count"] == 1, f"expected 1 problem (baz drift), got {payload['problem_count']}"
 PY
 
-# --- C8: engine-aware profile check for codex agents (#905) -------------
-# Refs issue #905: the watchdog used to assert CLAUDE.md / SOUL.md / etc.
-# on every agent regardless of engine, so codex agents (which don't read
-# any of those files) surfaced as `status=error` with every Claude
-# profile file marked missing. With the engine-aware required-file
-# selector, codex agents with no Claude profile files classify as `ok`
-# and do NOT contribute to problem_count — so the daemon no longer emits
-# admin-inbox profile-drift tasks for codex agents.
-smoke_log "C8: codex agent without Claude-profile files classifies ok (#905)"
+# --- C8: engine-native Codex contract (#905 → #1237) --------------------
+# Pre-#905: the watchdog used to assert CLAUDE.md / SOUL.md / etc. on
+# every agent regardless of engine, so codex agents (which don't read
+# any of those files) surfaced as `status=error`.
+# Pre-#1237 (v0.15.0-beta1): codex was on a silent-OK allowlist —
+# present-but-bare codex agents classified as `ok` with no validation.
+# #1237 (v0.15.0-beta2 lane ε): codex has an engine-native contract:
+# AGENTS.md is required (the file the Codex CLI actually reads). A codex
+# agent that has AGENTS.md classifies as `ok` and does NOT assert any
+# Claude-profile files; a codex agent missing AGENTS.md surfaces as
+# error (see C8b below).
+smoke_log "C8: codex agent with AGENTS.md classifies ok (#1237)"
 C8_ROOT="$SMOKE_TMP_ROOT/c8-agents"
 mkdir -p "$C8_ROOT/codex-only"
-# Intentionally bare — no CLAUDE.md / SOUL.md / SESSION-TYPE.md / etc.
+: >"$C8_ROOT/codex-only/AGENTS.md"
+# Intentionally NO CLAUDE.md / SOUL.md / SESSION-TYPE.md — codex must
+# never assert those (the #905 fix).
 C8_REGISTRY="$SMOKE_TMP_ROOT/c8-registry.json"
 cat >"$C8_REGISTRY" <<'EOF'
 [
@@ -306,6 +311,30 @@ assert row["missing_files"] == [], f"codex must not assert Claude profile files:
 assert row["missing_managed_claude_block"] is False, row
 assert row["status"] == "ok", f"codex agent should classify ok, got {row['status']}"
 assert payload["problem_count"] == 0, payload["problem_count"]
+PY
+
+# --- C8b: codex agent missing AGENTS.md classifies error (#1237) --------
+# The Codex contract is fail-loud just like Claude's. A static codex
+# agent that is genuinely missing its required AGENTS.md surfaces.
+smoke_log "C8b: codex agent missing AGENTS.md classifies error (#1237)"
+C8B_ROOT="$SMOKE_TMP_ROOT/c8b-agents"
+mkdir -p "$C8B_ROOT/codex-bare"
+C8B_REGISTRY="$SMOKE_TMP_ROOT/c8b-registry.json"
+cat >"$C8B_REGISTRY" <<'EOF'
+[
+  {"id": "codex-bare", "class": "static", "agent_source": "static", "engine": "codex"}
+]
+EOF
+C8B_JSON="$(run_watchdog scan --json --agent-home-root "$C8B_ROOT" --agent-registry-json "$C8B_REGISTRY")"
+"$PY_BIN" - "$C8B_JSON" <<'PY'
+import json, sys
+payload = json.loads(sys.argv[1])
+rows = {row["agent"]: row for row in payload["agents"]}
+row = rows["codex-bare"]
+assert row["engine"] == "codex", row
+assert row["missing_files"] == ["AGENTS.md"], f"codex must assert AGENTS.md: {row['missing_files']}"
+assert row["status"] == "error", f"codex bare agent should classify error, got {row['status']}"
+assert payload["problem_count"] == 1, payload["problem_count"]
 PY
 
 # --- C9: dynamic-agent fresh-state suppression (#907) -------------------

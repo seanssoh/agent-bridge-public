@@ -36,6 +36,23 @@ MANAGED_END = "<!-- END AGENT BRIDGE DOC MIGRATION -->"
 CLAUDE_REQUIRED_FILES = ("CLAUDE.md", "SOUL.md", "MEMORY-SCHEMA.md", "MEMORY.md", "SESSION-TYPE.md")
 # Backward-compat alias: legacy callers / tests reference REQUIRED_FILES.
 REQUIRED_FILES = CLAUDE_REQUIRED_FILES
+# #1237: Codex-runtime profile contract. Codex CLI reads ``AGENTS.md`` at
+# the agent home root; it has no SOUL.md / MEMORY*.md / SESSION-TYPE.md
+# equivalent (those are Claude-only conventions). ``.codex/hooks.json`` is
+# the engine's hook-policy file when present, used as an *optional* probe
+# below (a missing hooks.json is not drift — codex agents may legitimately
+# run without hooks configured).
+CODEX_REQUIRED_FILES = ("AGENTS.md",)
+CODEX_OPTIONAL_PROBES = (".codex/hooks.json",)
+# Known engine ids the watchdog has an explicit contract for. An engine
+# string outside this set is a *truly unknown* engine — the scanner emits
+# ``status="unsupported_engine_contract"`` for those rather than silently
+# classifying them ``ok`` (the old NON_CONTRACT_ENGINES allowlist behavior
+# for codex/antigravity). #1237 r1: "If no Codex-specific check is
+# implemented yet, status must say `unsupported_engine_contract` rather
+# than silently OK." The same principle applies to any future new engine
+# until a contract is added here.
+KNOWN_ENGINE_CONTRACTS = frozenset({"claude", "codex"})
 
 
 @dataclass
@@ -433,14 +450,36 @@ def heartbeat_age_seconds(agent_dir: Path) -> tuple[bool, int | None]:
 NON_ONBOARDING_SESSION_TYPES = frozenset({"dynamic", "cron"})
 
 
-# Engines with no Claude-runtime profile contract at the agent home root
-# — none of these CLIs read CLAUDE.md / SOUL.md / SESSION-TYPE.md, so the
-# watchdog must not assert profile drift on them. This is an explicit
-# allowlist, NOT "anything that isn't claude": a genuinely unknown engine
-# string stays under the conservative Claude-default contract so a new
-# engine surfaces as drift (prompting a watchdog update) instead of
-# silently skipping the check. Add a new exempt engine here.
-NON_CONTRACT_ENGINES = frozenset({"codex", "antigravity"})
+# #1237: Legacy alias for the "engines that get no required-file check
+# under the Claude-default path." Pre-#1237 this set was
+# ``frozenset({"codex", "antigravity"})``; codex has moved to its own
+# engine-native contract and antigravity now surfaces as
+# ``unsupported_engine_contract`` (see ``has_known_engine_contract``).
+# Kept as an empty allowlist so any downstream import keeps resolving
+# without behaviorally bringing back the silent-OK path.
+NON_CONTRACT_ENGINES: frozenset[str] = frozenset()
+
+
+def is_claude_engine(engine: str) -> bool:
+    """True when the engine string maps to the Claude contract (Claude or
+    the conservative empty-string default kept for legacy registry rows).
+    """
+    return engine in ("", "claude")
+
+
+def is_codex_engine(engine: str) -> bool:
+    """True when the engine string maps to the Codex contract (#1237)."""
+    return engine == "codex"
+
+
+def has_known_engine_contract(engine: str) -> bool:
+    """True when the watchdog has an implemented engine-native contract for
+    ``engine``. Engines outside this set are classified as
+    ``unsupported_engine_contract`` in :func:`classify_status` rather than
+    being silently held to the Claude default or silently classified ``ok``
+    (#1237 r1).
+    """
+    return is_claude_engine(engine) or is_codex_engine(engine)
 
 
 def has_home_profile_contract(engine: str, agent_source: str) -> bool:
@@ -448,21 +487,15 @@ def has_home_profile_contract(engine: str, agent_source: str) -> bool:
     home-profile contract: the ``CLAUDE_REQUIRED_FILES`` set, the managed
     ``CLAUDE.md`` block, and the ``SESSION-TYPE.md`` onboarding state.
 
-    Issues #905 / #907 each special-cased one slice of this — codex was
-    exempted from required files, the managed block, and onboarding;
-    dynamic agents were exempted from the managed block. A third engine
-    (``antigravity``, v0.14.5) then fell through to the Claude default and
-    surfaced as a false ``status=error`` on every scan, because none of
-    those three call sites knew about it. This predicate is the single
-    gate so a known exempt engine is exempt by construction.
+    Issues #905 / #907 each special-cased one slice of this. #1237 split
+    the Codex case out into its own engine-native contract (see
+    :func:`has_codex_profile_contract`) instead of leaving codex as a
+    silent-OK allowlist entry. ``has_home_profile_contract`` now means
+    *Claude-specific* contract.
 
     The contract holds for:
 
       - Claude agents, static or unknown-source.
-      - Any *unknown* engine string, static or unknown-source — the
-        conservative legacy default (#905). An unknown engine is held to
-        the contract so it surfaces as drift; the fix is to add it to
-        ``NON_CONTRACT_ENGINES`` once the watchdog is taught about it.
 
     The contract is waived for:
 
@@ -472,25 +505,45 @@ def has_home_profile_contract(engine: str, agent_source: str) -> bool:
         ``bridge_scaffold_agent_home``, so legitimately have no profile
         files, no managed block, and no SESSION-TYPE.md. The watchdog has
         no finer "scaffolded vs ad-hoc" signal than ``agent_source``.
-      - The known non-Claude engines in ``NON_CONTRACT_ENGINES``.
+      - Any non-Claude engine (codex has its own contract; unknown
+        engines surface as ``unsupported_engine_contract`` and do not
+        get the Claude-profile drift check overlaid on top).
     """
     if agent_source == "dynamic":
         return False
-    return engine not in NON_CONTRACT_ENGINES
+    return is_claude_engine(engine)
+
+
+def has_codex_profile_contract(engine: str, agent_source: str) -> bool:
+    """Whether the watchdog should hold this agent to the Codex contract
+    (``CODEX_REQUIRED_FILES``). Mirrors ``has_home_profile_contract`` but
+    gates on the codex engine string. Dynamic agents still get a full
+    exemption — they may legitimately be bare ad-hoc spawns (#907).
+    """
+    if agent_source == "dynamic":
+        return False
+    return is_codex_engine(engine)
 
 
 def required_profile_files(engine: str, agent_source: str = "") -> tuple[str, ...]:
     """Required profile-file set for an agent.
 
-    Returns ``CLAUDE_REQUIRED_FILES`` only for agents under the
-    home-profile contract (see :func:`has_home_profile_contract`); every
-    other agent returns an empty tuple so the missing-files check is a
-    no-op. ``agent_source`` defaults to ``""`` so a legacy positional
+    Returns the engine-appropriate required-file tuple:
+
+      - Claude under the home-profile contract → ``CLAUDE_REQUIRED_FILES``
+      - Codex under the engine-native contract (#1237) →
+        ``CODEX_REQUIRED_FILES``
+      - Anything else (dynamic source, unknown engine, antigravity) →
+        empty tuple so the missing-files check is a no-op.
+
+    ``agent_source`` defaults to ``""`` so a legacy positional
     ``required_profile_files(engine)`` call keeps the conservative
     Claude-default behavior for an unknown source.
     """
     if has_home_profile_contract(engine, agent_source):
         return CLAUDE_REQUIRED_FILES
+    if has_codex_profile_contract(engine, agent_source):
+        return CODEX_REQUIRED_FILES
     return ()
 
 
@@ -503,27 +556,38 @@ def classify_status(
     agent_source: str = "",
     engine: str = "claude",
 ) -> str:
-    # All three drift signals — missing required files, managed-block,
-    # onboarding staleness — are gated on the home-profile contract (see
-    # has_home_profile_contract). Known non-Claude engines have no
-    # SESSION-TYPE.md / managed-CLAUDE.md / required-file contract (#905,
-    # originally codex only — now also antigravity), and dynamic agents
-    # are ad-hoc spawns that legitimately land with
-    # `missing_managed_claude_block=yes` and `onboarding_state=pending`
-    # until their first run; flagging any of these is admin alert-fatigue
-    # for a condition admin cannot resolve (#907, #303/#304/#343
-    # anti-pattern). missing_files is gated here too so classify_status is
-    # internally consistent and does not depend on the caller having
-    # pre-emptied `required` via required_profile_files.
-    contract = has_home_profile_contract(engine, agent_source)
-    if missing_files and contract:
+    # Engine routing:
+    #   - Claude under contract: required files + managed block +
+    #     onboarding staleness drive error/warn (#905 / #907 gates apply).
+    #   - Codex under contract (#1237): required Codex files drive error;
+    #     managed-CLAUDE-block and onboarding signals are not part of the
+    #     Codex contract and are ignored.
+    #   - Dynamic source (any engine): the contract is waived (#907).
+    #     Broken links still surface as warn — that is real drift, not a
+    #     fresh-provision default.
+    #   - Unknown engines with no implemented contract (e.g. antigravity
+    #     until a contract is added): return ``unsupported_engine_contract``
+    #     so the operator sees the row instead of a silent ok (#1237 r1).
+    #     A dynamic agent on an unknown engine is still reported under
+    #     ``unsupported_engine_contract`` — its mere presence is the
+    #     watchdog signal here, not a per-file drift result.
+    claude_contract = has_home_profile_contract(engine, agent_source)
+    codex_contract = has_codex_profile_contract(engine, agent_source)
+    if not has_known_engine_contract(engine):
+        # Surface broken-link drift even on unknown-engine rows; that
+        # signal is engine-agnostic and never lies.
+        if broken_links:
+            return "warn"
+        return "unsupported_engine_contract"
+    if missing_files and (claude_contract or codex_contract):
         return "error"
+    # Claude-only signals: managed block + onboarding staleness.
     onboarding_stale = (
-        contract
+        claude_contract
         and onboarding_state in {"pending", "missing"}
         and session_type not in NON_ONBOARDING_SESSION_TYPES
     )
-    effective_missing_block = missing_block if contract else False
+    effective_missing_block = missing_block if claude_contract else False
     if broken_links or effective_missing_block or onboarding_stale:
         return "warn"
     return "ok"
@@ -563,15 +627,14 @@ def scan_agent(
         required = required_profile_files(engine, agent_source)
         missing_files = [name for name in required if not (agent_dir / name).exists()]
         # The `missing_managed_claude_block` FIELD records actual file
-        # state, so it is gated on engine alone, NOT the contract: any
-        # engine that could own a CLAUDE.md (Claude + unknown engines —
-        # same conservative set as the contract) gets a truthful field;
-        # the known non-Claude engines in NON_CONTRACT_ENGINES definitively
-        # don't own one. A dynamic Claude agent still gets an accurate
+        # state for engines that own a CLAUDE.md. Pre-#1237 this gated on
+        # the legacy ``NON_CONTRACT_ENGINES`` allowlist; with the codex
+        # contract now engine-native, the check is gated on the Claude
+        # engine directly. A dynamic Claude agent still gets an accurate
         # field — #907 keeps the field truthful and suppresses only the
-        # classification *signal*, which classify_status gates through
-        # has_home_profile_contract.
-        if engine not in NON_CONTRACT_ENGINES:
+        # classification *signal*, which ``classify_status`` gates through
+        # ``has_home_profile_contract``.
+        if is_claude_engine(engine):
             claude_text = read_text(agent_dir / "CLAUDE.md") if (agent_dir / "CLAUDE.md").exists() else ""
             missing_block = MANAGED_START not in claude_text or MANAGED_END not in claude_text
         else:
@@ -702,11 +765,35 @@ def render_markdown(
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("scan",))
+    # #1233: ``rescan`` is the operator-facing on-demand verb. Both
+    # commands run the same registry-anchored scanner; ``rescan`` adds
+    # report-file write-back so ``shared/watchdog/latest.md`` refreshes
+    # immediately (the daemon cooldown is in ``bridge-daemon.sh``'s
+    # ``process_watchdog_report`` and is therefore bypassed by construction
+    # when the operator drives the scanner directly). ``--agent <a>`` and
+    # ``--json`` work for both. ``scan`` is preserved as compatibility for
+    # the daemon tick + legacy ``watchdog scan <agent>`` callers.
+    parser.add_argument("command", choices=("scan", "rescan"))
     parser.add_argument("agents", nargs="*")
+    parser.add_argument(
+        "--agent",
+        action="append",
+        default=[],
+        dest="agent_flag",
+        help="scope the scan to a specific agent (repeatable; #1233)",
+    )
     parser.add_argument("--bridge-home", default=os.environ.get("BRIDGE_HOME", str(Path.home() / ".agent-bridge")))
     parser.add_argument("--agent-home-root", default=None)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        default=None,
+        help=(
+            "write the rendered report to <bridge_home>/shared/watchdog/latest.md "
+            "(default: true for rescan, false for scan)"
+        ),
+    )
     # Refs queue #4796: registry-anchored enumeration is the default. Orphan
     # directories under $BRIDGE_AGENT_HOME_ROOT no longer drive profile_drift
     # warns; they surface in the separate `orphan_directories` bucket. Pass
@@ -736,6 +823,22 @@ def main() -> int:
         help="path to a JSON file with the registry payload (test injection)",
     )
     args = parser.parse_args()
+
+    # #1233: ``--agent <name>`` (repeatable) is an alias for the existing
+    # positional ``agents`` selector. Merging here keeps the rest of the
+    # pipeline single-source (``args.agents``) without reshuffling the
+    # registry-anchored filter logic below.
+    if args.agent_flag:
+        args.agents = list(args.agents) + list(args.agent_flag)
+
+    # #1233: ``--apply`` defaults to True for ``rescan`` (the operator
+    # verb whose contract is "refresh latest.md right now"), and False for
+    # ``scan`` (the daemon-tick caller that already redirects stdout to
+    # the report file itself). An explicit ``--apply`` always wins.
+    if args.apply is None:
+        apply_to_report_file = args.command == "rescan"
+    else:
+        apply_to_report_file = bool(args.apply)
 
     bridge_home = Path(args.bridge_home).expanduser()
     agent_root = Path(args.agent_home_root).expanduser() if args.agent_home_root else bridge_home / "agents"
@@ -843,10 +946,31 @@ def main() -> int:
         "orphan_directories": orphan_directories,
         "agents": [asdict(item) for item in records],
     }
+    rendered_markdown = render_markdown(records, bridge_home, orphan_directories)
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print(render_markdown(records, bridge_home, orphan_directories), end="")
+        print(rendered_markdown, end="")
+    # #1233: write the markdown report to the canonical
+    # ``<bridge_home>/shared/watchdog/latest.md`` location so the operator
+    # who typed ``agent-bridge watchdog rescan`` sees the refresh
+    # immediately, without waiting for the next daemon tick. The daemon
+    # tick path (``bridge-daemon.sh:process_watchdog_report``) keeps
+    # writing the same file via stdout redirect, so steady-state behavior
+    # is unchanged. Existence of the parent directory is ensured here so
+    # the verb works on a fresh BRIDGE_HOME where the daemon has never
+    # ticked.
+    if apply_to_report_file:
+        report_path = bridge_home / "shared" / "watchdog" / "latest.md"
+        try:
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report_path.write_text(rendered_markdown, encoding="utf-8")
+        except OSError as exc:
+            print(
+                f"[bridge-watchdog] failed to write report file {report_path}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
     return 0
 
 
