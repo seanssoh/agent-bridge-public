@@ -2085,11 +2085,22 @@ bridge_agent_idle_marker_dir() {
 # failure on newly-created dirs. Both branches now fail-loud with a
 # structured reason when the canonical mode+group cannot be reached.
 #
+# r3 codex r2 BLOCKING #1252: the ab-agent-<a> group enforcement is
+# gated on `bridge_agent_linux_user_isolation_effective <agent>`. When
+# the predicate is FALSE (legacy install, non-Linux host, roster
+# `linux_user_isolation` not set, shared isolation) the verifier still
+# creates/verifies the dir at mode 2770 but does NOT chgrp to
+# ab-agent-<a> (which is not a real OS group on those installs).
+# Without this gate, r2 broke ordinary `agent create` for every non-
+# isolated agent (pillar smoke `1136-always-on-no` T7 regression).
+#
 # Returns:
-#   0 — dir exists with mode 2770 + correct group (auto-repaired if
-#       needed)
-#   1 — cannot reach canonical mode+group; structured reason emitted
-#       via bridge_warn + bridge_audit_log (where loaded). The caller
+#   0 — dir exists with mode 2770 (auto-repaired if needed). Group is
+#       ab-agent-<a> when iso-v2 is effective; otherwise the dir
+#       retains the controller's primary group.
+#   1 — cannot reach canonical mode (always) or canonical group (iso-
+#       v2 effective branch only); structured reason emitted via
+#       bridge_warn + bridge_audit_log (where loaded). The caller
 #       (agent-create gate, daemon nudge tick) MUST NOT treat this as
 #       success.
 #
@@ -2118,11 +2129,33 @@ bridge_agent_state_dir_self_heal() {
   # matches the spec: the matrix apply at agent-create is the canonical
   # owner-fixer on v2; on legacy installs there is no `ab-agent-<X>`
   # group to begin with.
+  #
+  # r3 codex r2 BLOCKING: gate ab-agent enforcement on the
+  # iso-v2-effective predicate, not on mere resolver presence. The
+  # resolver (`bridge_isolation_v2_agent_group_name`) is sourced from
+  # `lib/bridge-isolation-v2.sh` on every install and returns a composed
+  # `ab-agent-<a>` name regardless of platform / roster `os_user` /
+  # shared-isolation mode. r2 (`_resolver_present`) gating therefore
+  # forced ordinary non-iso `agent create` to chgrp a group that does
+  # not exist, breaking `bridge-agent.sh:3551-3554` pre-create-ok gate
+  # for any non-iso/non-Linux agent (pillar smoke `1136-always-on-no`
+  # T7 regression).
+  #
+  # The effective predicate (`bridge_agent_linux_user_isolation_effective`)
+  # short-circuits on:
+  #   - roster `linux_user_isolation` not requested
+  #   - host platform != Linux
+  #   - resolved `os_user` empty (shared / fallback)
+  # which is exactly the set where ab-agent-<a> is NOT a real OS group
+  # and chgrp would fail.
   local _agent_grp=""
-  local _resolver_present=0
-  if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
-    _resolver_present=1
-    _agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+  local _iso_effective=0
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    _iso_effective=1
+    if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+      _agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+    fi
   fi
 
   # Helper: structured failure reporter. Single shape across both
@@ -2175,8 +2208,11 @@ bridge_agent_state_dir_self_heal() {
       fi
     fi
 
-    # Group check (only when resolver present AND returned non-empty).
-    if (( _resolver_present == 1 )); then
+    # Group check — only when iso-v2 is EFFECTIVE for this agent
+    # (r3 codex r2 BLOCKING: legacy / non-iso / non-Linux / shared
+    # paths must NOT chgrp to ab-agent-<a> since that group does not
+    # exist; pre-existing dir keeps its operator/install-default group).
+    if (( _iso_effective == 1 )); then
       if [[ -z "$_agent_grp" ]]; then
         _state_dir_self_heal_fail "state_dir_group_resolver_empty" "resolver=bridge_isolation_v2_agent_group_name"
         return $?
@@ -2208,11 +2244,20 @@ bridge_agent_state_dir_self_heal() {
     return $?
   fi
 
-  # chgrp + verify when resolver is present. r2 codex r1 BLOCKING:
-  # empty resolver → fail-loud. Earlier R1 silently no-op'd, which
-  # left the dir owned by the controller's primary group (e.g.
-  # `agentbridge`) and daemon writes still wedged.
-  if (( _resolver_present == 1 )); then
+  # chgrp + verify ONLY when iso-v2 is EFFECTIVE for this agent.
+  # r3 codex r2 BLOCKING: r2 gated on `_resolver_present`, but the
+  # resolver is globally loaded — that forced ordinary non-iso creates
+  # to chgrp to an ab-agent group that does not exist, breaking the
+  # pre-create-ok gate in `bridge-agent.sh:3551-3554`. The effective
+  # predicate is the contract: iso-v2 effective → enforce the canonical
+  # group; otherwise the dir keeps the controller's primary group
+  # (legacy / non-Linux / shared isolation), which is correct for those
+  # installs because there is no per-agent group at all.
+  # r2 codex r1 BLOCKING (still applies under iso-v2 path): empty
+  # resolver → fail-loud. Pre-r1 silently no-op'd, which left the dir
+  # owned by the controller's primary group and daemon writes still
+  # wedged.
+  if (( _iso_effective == 1 )); then
     if [[ -z "$_agent_grp" ]]; then
       _state_dir_self_heal_fail "state_dir_group_resolver_empty" "resolver=bridge_isolation_v2_agent_group_name"
       return $?

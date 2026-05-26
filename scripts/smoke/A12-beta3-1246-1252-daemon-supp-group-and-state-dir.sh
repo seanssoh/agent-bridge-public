@@ -84,17 +84,24 @@
 #       call self-heal: expect rc=0 with dir now mode 2770 (auto-repair)
 #       OR rc!=0 with structured reason citing chmod failure. R1
 #       returned success for ANY pre-existing dir without checking
-#       mode/group.
+#       mode/group. r3 codex r2: T8/T9/T10 now stub
+#       `bridge_agent_linux_user_isolation_effective` to return 0 (true)
+#       so the iso-v2 enforcement branch is exercised; the production
+#       gate added at r3 keeps non-iso agents on a no-chgrp path that
+#       T16 + T17 cover separately.
 #
 #   T9 (r2 codex r1 BLOCKING #1252): new-create branch's chgrp failure
 #       propagates instead of being silently ignored. Stub chgrp to fail
 #       (via PATH override), call self-heal on a missing dir: expect
-#       rc!=0 with structured reason `state_dir_chgrp_failed`.
+#       rc!=0 with structured reason `state_dir_chgrp_failed`. r3 codex
+#       r2: also stubs the iso-v2-effective predicate to true.
 #
 #   T10 (r2 codex r1 BLOCKING #1252): empty group-resolver fail-loud.
 #        Stub `bridge_isolation_v2_agent_group_name` to return empty,
 #        call self-heal on a missing dir: expect rc!=0 with structured
-#        reason `state_dir_group_resolver_empty`.
+#        reason `state_dir_group_resolver_empty`. r3 codex r2: also
+#        stubs the iso-v2-effective predicate to true (empty resolver
+#        under iso-v2 is the failure surface this asserts).
 #
 #   T11 (r2 codex r1 BLOCKING #1252 nudge-skip task contract): all four
 #        new `[nudge-skip]` emitters cite either `task=<digits>` (when
@@ -116,6 +123,24 @@
 #
 #   T15 (teeth, r2 codex r1 finding 2): revert the self-heal
 #        mode-verify on a pre-existing dir — assert T8 fails loudly.
+#
+#   T16 (r3 codex r2 BLOCKING): non-iso agent path — stub
+#        `bridge_agent_linux_user_isolation_effective` to return 1
+#        (false), call self-heal on a missing dir: expect rc=0, dir
+#        created, NO chgrp attempted, NO failure on missing/empty
+#        group resolver. This is the regression r2 introduced and r3
+#        closes: ordinary `agent create` on a non-iso install (macOS,
+#        roster without `linux_user_isolation`, shared mode) MUST not
+#        fail on the pre-create-ok gate.
+#
+#   T17 (teeth, r3 codex r2 BLOCKING regression): revert the iso-v2
+#        predicate gate (re-enforce ab-agent unconditionally), then call
+#        self-heal under a STUBBED `linux_user_isolation_effective=false`
+#        agent with a chgrp that fails (group does not exist). Expect
+#        rc!=0 with `state_dir_chgrp_failed`. Without the r3 gate, this
+#        is the exact wedge the r2 fixer produced — ordinary non-iso
+#        creates failing at `bridge-agent.sh:3551-3554` with
+#        `state_dir_chgrp_failed target=ab-agent-<a> post_mkdir`.
 #
 # Footgun #11 (heredoc-stdin subprocess deadlock class): every
 # assertion uses `grep -n` against the source files OR builds harness
@@ -432,9 +457,13 @@ T8_DRIVER="$SMOKE_TMP_ROOT/t8-driver.sh"
   printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR"'
   printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
   printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s/%s" "$BRIDGE_ACTIVE_AGENT_DIR" "$1"; }'
-  # Resolver returns empty → fall through to mode-only verifier (legacy
-  # install path). T10 covers the empty-resolver-fail-loud case under
-  # the v2 path.
+  # r3 codex r2: T8 exercises the mode-verify branch (non-iso /
+  # legacy install). Predicate `bridge_agent_linux_user_isolation_
+  # effective` is unstubbed → not in PATH / function-not-defined →
+  # `command -v` returns false → the production helper takes the
+  # mode-only path (no chgrp, no group resolver). That is the legacy
+  # behavior T8 originally pinned (rc=0 with auto-repaired mode 2770,
+  # or rc!=0 with structured chmod-reason).
   awk '/^bridge_agent_state_dir_self_heal\(\) \{/,/^\}/' "$STATE_LIB" >>"$T8_DRIVER"
   printf '\n%s\n' '# Pre-create the dir at mode 0700 — divergent from canonical 2770.'
   printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t8"'
@@ -483,6 +512,11 @@ T9_DRIVER="$SMOKE_TMP_ROOT/t9-driver.sh"
   printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR"'
   printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
   printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s/%s" "$BRIDGE_ACTIVE_AGENT_DIR" "$1"; }'
+  # r3 codex r2: stub iso-v2-effective predicate true so the production
+  # helper enters the chgrp branch this test targets. Without the stub
+  # the r3 gate routes to mode-only (legacy) and chgrp is never called
+  # — making the failure-propagation assertion trivially vacuous.
+  printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }'
   # Stub the v2 group-name resolver to return a non-empty group so the
   # chgrp branch is entered.
   printf '%s\n' 'bridge_isolation_v2_agent_group_name() { printf "ab-agent-test_a12_t9"; }'
@@ -522,6 +556,11 @@ T10_DRIVER="$SMOKE_TMP_ROOT/t10-driver.sh"
   printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR"'
   printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
   printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s/%s" "$BRIDGE_ACTIVE_AGENT_DIR" "$1"; }'
+  # r3 codex r2: stub iso-v2-effective predicate true so the empty-
+  # resolver fail-loud branch is exercised. Without the stub the r3
+  # gate routes to mode-only (legacy) and the empty resolver is
+  # never consulted.
+  printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 0; }'
   # Stub the v2 resolver to return EMPTY — codex r1 direct repro.
   printf '%s\n' 'bridge_isolation_v2_agent_group_name() { printf ""; }'
   awk '/^bridge_agent_state_dir_self_heal\(\) \{/,/^\}/' "$STATE_LIB" >>"$T10_DRIVER"
@@ -712,4 +751,134 @@ fi
 smoke_log "T15 PASS — teeth-check works: the R1 false-positive (rc=0 with mode 700) IS the regression T8 catches"
 
 # ---------------------------------------------------------------------
-smoke_log "all tests PASS — A12-beta3 #1246 + #1252 verified at current main (r2: codex r1 BLOCKING + CONTRACT MISMATCH closed)"
+# T16 (r3 codex r2 BLOCKING): non-iso agent path — self-heal MUST not
+#      chgrp to ab-agent-<a>, MUST not fail on empty/missing group.
+#      Stub `bridge_agent_linux_user_isolation_effective` to return 1
+#      (false), call self-heal on a missing dir with chgrp stubbed to
+#      fail and resolver stubbed to a fake group: expect rc=0 (the gate
+#      added at r3 routes around the group enforcement for non-iso
+#      agents). This is the regression r2 introduced: ordinary
+#      `agent create` on macOS / non-Linux / shared-iso installs failed
+#      at the pre-create-ok gate.
+# ---------------------------------------------------------------------
+smoke_log "T16: bridge_agent_state_dir_self_heal skips ab-agent enforcement on non-iso agents (r3 codex r2 regression closed)"
+
+T16_DRIVER="$SMOKE_TMP_ROOT/t16-driver.sh"
+: >"$T16_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' "BRIDGE_ACTIVE_AGENT_DIR=\"$SMOKE_TMP_ROOT/t16-state-agents\""
+  printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR"'
+  printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
+  printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s/%s" "$BRIDGE_ACTIVE_AGENT_DIR" "$1"; }'
+  # r3 codex r2 BLOCKING: predicate returns 1 (non-iso). Even with the
+  # resolver returning a fake group and chgrp guaranteed to fail, the
+  # production helper MUST short-circuit those branches and return rc=0.
+  printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 1; }'
+  printf '%s\n' 'bridge_isolation_v2_agent_group_name() { printf "ab-agent-test_a12_t16"; }'
+  printf '%s\n' 'chgrp() { return 1; }   # explicit fail — gate must prevent this from being reached'
+  awk '/^bridge_agent_state_dir_self_heal\(\) \{/,/^\}/' "$STATE_LIB" >>"$T16_DRIVER"
+  printf '\n%s\n' '# Case A: non-iso new-create. Dir absent → mkdir + no chgrp.'
+  printf '%s\n' 'bridge_agent_state_dir_self_heal test_a12_t16; rc=$?'
+  printf '%s\n' '[[ -d "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t16" ]] || { echo "T16a: dir not created"; exit 1; }'
+  printf '%s\n' 'post_grp="$(stat -c %G "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t16" 2>/dev/null || stat -f %Sg "$BRIDGE_ACTIVE_AGENT_DIR/test_a12_t16" 2>/dev/null)"'
+  printf '%s\n' 'printf "rc=%s post_grp=%s\n" "$rc" "$post_grp"'
+  printf '\n%s\n' '# Case B: non-iso idempotent re-call.'
+  printf '%s\n' 'bridge_agent_state_dir_self_heal test_a12_t16; rc_b=$?'
+  printf '%s\n' 'printf "rc_b=%s\n" "$rc_b"'
+} >>"$T16_DRIVER"
+chmod +x "$T16_DRIVER"
+
+T16_OUT="$(/usr/bin/env bash "$T16_DRIVER" 2>&1 || true)"
+# Hard contract: rc=0 in BOTH calls (create + idempotent). If r3 gate
+# is reverted, chgrp() stub returns 1 → helper would fail-loud with
+# state_dir_chgrp_failed and rc!=0.
+if [[ "$T16_OUT" != *"rc=0"* ]]; then
+  smoke_fail "T16 (r3 codex r2 BLOCKING): non-iso self-heal returned rc!=0 — r3 predicate gate is missing or broken; got: $T16_OUT"
+fi
+if [[ "$T16_OUT" != *"rc_b=0"* ]]; then
+  smoke_fail "T16 (r3 codex r2 BLOCKING): non-iso self-heal re-call (idempotent) returned rc!=0; got: $T16_OUT"
+fi
+# Strict regression guard: the chgrp/group_resolver_empty reasons MUST
+# NOT have been emitted on the non-iso path.
+if [[ "$T16_OUT" == *"state_dir_chgrp"* ]]; then
+  smoke_fail "T16 (r3 codex r2 BLOCKING): non-iso self-heal emitted state_dir_chgrp* reason — gate is not preventing chgrp; got: $T16_OUT"
+fi
+if [[ "$T16_OUT" == *"state_dir_group_resolver_empty"* ]]; then
+  smoke_fail "T16 (r3 codex r2 BLOCKING): non-iso self-heal emitted state_dir_group_resolver_empty — gate is not preventing resolver-check; got: $T16_OUT"
+fi
+smoke_log "T16 PASS — non-iso self-heal skips ab-agent enforcement (gate works; ordinary agent create no longer wedged)"
+
+# ---------------------------------------------------------------------
+# T17 (teeth, r3 codex r2 BLOCKING regression): demonstrate that
+#      reverting the r3 predicate gate reproduces the codex r2
+#      regression — ordinary non-iso agent create fails at the
+#      pre-create-ok gate with state_dir_chgrp_failed.
+#
+#      Implementation: inline a copy of the production self-heal that
+#      uses the r2 `_resolver_present` gate (= the bug). Drive it under
+#      the same non-iso fixture as T16 and assert it FAILS exactly the
+#      way codex r2 captured: rc!=0 with state_dir_chgrp_failed
+#      target=ab-agent-<a> post_mkdir.
+# ---------------------------------------------------------------------
+smoke_log "T17 (teeth): reverting the r3 iso-v2 gate must reproduce codex r2 regression (ordinary non-iso create fails on missing ab-agent group)"
+
+T17_DRIVER="$SMOKE_TMP_ROOT/t17-driver.sh"
+: >"$T17_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' "BRIDGE_ACTIVE_AGENT_DIR=\"$SMOKE_TMP_ROOT/t17-state-agents\""
+  printf '%s\n' 'mkdir -p "$BRIDGE_ACTIVE_AGENT_DIR"'
+  printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
+  printf '%s\n' 'bridge_agent_idle_marker_dir() { printf "%s/%s" "$BRIDGE_ACTIVE_AGENT_DIR" "$1"; }'
+  # Same non-iso fixture as T16 — predicate would return 1 if asked.
+  # But this driver uses the R2-shape helper (resolver-presence gate)
+  # so the predicate is never consulted.
+  printf '%s\n' 'bridge_agent_linux_user_isolation_effective() { return 1; }'
+  printf '%s\n' 'bridge_isolation_v2_agent_group_name() { printf "ab-agent-test_a12_t17"; }'
+  printf '%s\n' 'chgrp() { return 1; }'
+  # R2-shape helper (the regression). Mirrors the production function
+  # body PRIOR to the r3 gate: chgrp branch entered whenever the
+  # resolver is present, regardless of iso effectiveness.
+  printf '%s\n' 'bridge_agent_state_dir_self_heal_R2() {'
+  printf '%s\n' '  local agent="$1"; [[ -n "$agent" ]] || return 1'
+  printf '%s\n' '  local dir; dir="$(bridge_agent_idle_marker_dir "$agent")"'
+  printf '%s\n' '  local _agent_grp=""'
+  printf '%s\n' '  local _resolver_present=0'
+  printf '%s\n' '  if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then'
+  printf '%s\n' '    _resolver_present=1'
+  printf '%s\n' '    _agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"'
+  printf '%s\n' '  fi'
+  printf '%s\n' '  if [[ ! -d "$dir" ]]; then'
+  printf '%s\n' '    mkdir -m 2770 -p "$dir" 2>/dev/null || return 1'
+  printf '%s\n' '    if (( _resolver_present == 1 )); then'
+  printf '%s\n' '      [[ -n "$_agent_grp" ]] || { bridge_warn "state_dir_group_resolver_empty"; return 1; }'
+  printf '%s\n' '      chgrp "$_agent_grp" "$dir" 2>/dev/null || { bridge_warn "state_dir_chgrp_failed target=$_agent_grp post_mkdir"; return 1; }'
+  printf '%s\n' '    fi'
+  printf '%s\n' '  fi'
+  printf '%s\n' '  return 0'
+  printf '%s\n' '}'
+  printf '%s\n' 'bridge_agent_state_dir_self_heal_R2 test_a12_t17 2>&1; rc=$?'
+  printf '%s\n' 'printf "rc=%s\n" "$rc"'
+} >>"$T17_DRIVER"
+chmod +x "$T17_DRIVER"
+
+T17_OUT="$(/usr/bin/env bash "$T17_DRIVER" 2>&1 || true)"
+# Teeth assertion: the R2-shape helper MUST fail under the non-iso
+# fixture — that is the regression the r3 gate closes. If T17 ever
+# passes the R2 shape, the teeth fixture is broken.
+if [[ "$T17_OUT" == *"rc=0"* ]]; then
+  smoke_fail "T17 (teeth): R2-shape helper unexpectedly returned rc=0 under non-iso fixture — teeth fixture is broken (codex r2 regression should reproduce here)"
+fi
+if [[ "$T17_OUT" != *"state_dir_chgrp_failed"* ]]; then
+  smoke_fail "T17 (teeth): R2-shape helper failed but did not cite state_dir_chgrp_failed — teeth fixture does not match codex r2 captured shape; got: $T17_OUT"
+fi
+if [[ "$T17_OUT" != *"target=ab-agent-test_a12_t17"* ]]; then
+  smoke_fail "T17 (teeth): R2-shape helper did not cite target=ab-agent-<a> in chgrp_failed detail — teeth fixture does not match codex r2 captured shape; got: $T17_OUT"
+fi
+smoke_log "T17 PASS — teeth-check works: R2-shape (no iso-v2 gate) reproduces the codex r2 regression (state_dir_chgrp_failed target=ab-agent-<a> post_mkdir)"
+
+# ---------------------------------------------------------------------
+smoke_log "all tests PASS — A12-beta3 #1246 + #1252 verified at current main (r3: codex r2 BLOCKING regression closed via iso-v2 effective-predicate gate)"
