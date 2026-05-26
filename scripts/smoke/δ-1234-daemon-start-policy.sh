@@ -666,10 +666,193 @@ step_t5_ondemand_production_branch_channel_miss_parity() {
   smoke_log "T5 PASS — production on-demand branch parity confirmed (channel-miss reason recorded, not start-command-failed)"
 }
 
+# ---------------------------------------------------------------------------
+# T6 — Production cron-dispatch wake branch parity (codex r2 BLOCKING finding).
+#
+# Background: r2 added the channel-miss auto-hold to both branches of
+# `process_on_demand_agents`, but `bridge_daemon_cron_dispatch_wake`
+# (bridge-daemon.sh ~5540-5627) is a SEPARATE code path that fires when
+# a queued cron-dispatch row targets a stopped static agent. Without
+# the same gate there, a static agent with `channel_status=miss` would
+# have `bridge_daemon_cron_dispatch_wake` invoke `bridge-start.sh`,
+# which re-fails at the validator, and the autostart backoff state file
+# would record the opaque `cron-dispatch-wake-failed` reason — the same
+# operator-visible regression the always-on / on-demand branches now
+# avoid.
+#
+# This test exercises the REAL production `bridge_daemon_cron_dispatch_wake`
+# function (extracted verbatim from bridge-daemon.sh — not a re-implemented
+# driver) for a stopped static agent with missing channel validator. It
+# asserts:
+#   * `bridge-start.sh` would NOT be invoked (helper short-circuits before
+#     reaching `BRIDGE_BASH_BIN`)
+#   * the autostart backoff state file's `AUTO_START_LAST_REASON` contains
+#     `channel-required-validator-miss:` — NOT `cron-dispatch-wake-failed`
+#
+# This pins codex r2 finding #1: a future refactor that removes the
+# channel-status gate from the cron-dispatch wake path fails this smoke.
+# ---------------------------------------------------------------------------
+step_t6_crondispatch_wake_channel_miss_parity() {
+  smoke_log "T6: production cron-dispatch wake branch records actionable channel-miss reason"
+
+  local state_dir="$SMOKE_TMP_ROOT/t6-state"
+  mkdir -p "$state_dir/daemon-autostart" "$state_dir/cron-dispatch-wake"
+  local daemon_log="$SMOKE_TMP_ROOT/t6-daemon.log"
+  : >"$daemon_log"
+
+  # Extract the entire production `bridge_daemon_cron_dispatch_wake`
+  # function + the channel-status helper + state-file helpers from
+  # bridge-daemon.sh. The brief calls for the production code path —
+  # if a future refactor removes the gate, this extraction-driven smoke
+  # fails at the source-anchor assertion below.
+  local prod_funcs="$SMOKE_TMP_ROOT/t6-prod-funcs.sh"
+  {
+    awk '
+      /^bridge_daemon_cron_dispatch_wake\(\) \{/                  { capture=1 }
+      /^bridge_daemon_cron_dispatch_wake_state_file\(\) \{/       { capture=1 }
+      /^bridge_daemon_autostart_state_file\(\) \{/                { capture=1 }
+      /^bridge_daemon_note_autostart_failure\(\) \{/              { capture=1 }
+      /^bridge_daemon_clear_autostart_failure\(\) \{/             { capture=1 }
+      /^bridge_daemon_check_channel_status_or_hold\(\) \{/        { capture=1 }
+      capture { print }
+      capture && /^}[[:space:]]*$/ { capture=0; print "" }
+    ' "$REPO_ROOT/bridge-daemon.sh"
+  } >"$prod_funcs"
+
+  # Pin: every expected function MUST be present in the extraction so a
+  # future rename / split fails loudly here rather than producing a
+  # silent test-skipped result.
+  for fn in bridge_daemon_cron_dispatch_wake \
+            bridge_daemon_cron_dispatch_wake_state_file \
+            bridge_daemon_autostart_state_file \
+            bridge_daemon_note_autostart_failure \
+            bridge_daemon_clear_autostart_failure \
+            bridge_daemon_check_channel_status_or_hold; do
+    if ! grep -q "^${fn}() {" "$prod_funcs"; then
+      smoke_fail "T6: production function $fn missing from bridge-daemon.sh extraction — check for rename"
+    fi
+  done
+
+  # Source-anchor pin for codex r2 finding: the cron-dispatch wake function
+  # body MUST contain the channel-status gate. Without this, a future PR
+  # could quietly remove the call to bridge_daemon_check_channel_status_or_hold
+  # from inside bridge_daemon_cron_dispatch_wake and the assertion below
+  # would still pass (because the helper is still defined, just not called
+  # on this path). Anchor on the production source itself.
+  local crondispatch_block
+  crondispatch_block="$(awk '
+    /^bridge_daemon_cron_dispatch_wake\(\) \{/ { capture=1 }
+    capture { print }
+    capture && /^}[[:space:]]*$/ { capture=0; exit }
+  ' "$REPO_ROOT/bridge-daemon.sh")"
+  smoke_assert_contains "$crondispatch_block" "bridge_daemon_check_channel_status_or_hold" \
+    "T6: codex r2 finding — bridge_daemon_cron_dispatch_wake MUST call bridge_daemon_check_channel_status_or_hold"
+
+  local driver="$SMOKE_TMP_ROOT/t6-driver.sh"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'BRIDGE_STATE_DIR="$1"\n'
+    printf 'DAEMON_LOG="$2"\n'
+    printf 'AGENT="$3"\n'
+    printf 'TASK_ID="$4"\n'
+    printf 'FAMILY="$5"\n'
+    printf 'CHANNEL_STATUS="$6"\n'
+    printf 'CHANNEL_REASON="$7"\n'
+    # Force-fail any bridge-start.sh invocation by pointing the bash
+    # interpreter at a nonexistent path. If the channel-miss helper
+    # short-circuits, this path is never reached. If the gate regresses,
+    # the missing path produces rc=127 + the opaque cron-dispatch-wake-failed
+    # reason which the assertion below catches.
+    printf 'BRIDGE_BASH_BIN="/bin/false-not-invoked"\n'
+    printf 'SCRIPT_DIR="/nonexistent-script-dir"\n'
+    # ---- Stub dependencies for the cron-dispatch wake function.
+    printf 'bridge_agent_exists() { return 0; }\n'
+    printf 'bridge_agent_is_active() { return 1; }\n'
+    printf 'bridge_agent_source() { printf "%%s" "static"; }\n'
+    printf 'bridge_agent_loop() { printf "%%s" "1"; }\n'
+    printf 'bridge_agent_manual_stop_active() { return 1; }\n'
+    printf 'bridge_agent_broken_launch_file() { printf "%%s" "/nonexistent/broken-launch/$AGENT"; }\n'
+    printf 'bridge_daemon_autostart_allowed() { return 0; }\n'
+    # Channel status helpers — driven by argv to flip miss/ok.
+    printf 'bridge_agent_channel_status() { printf "%%s" "$CHANNEL_STATUS"; }\n'
+    printf 'bridge_agent_channel_status_reason() { printf "%%s" "$CHANNEL_REASON"; }\n'
+    # Audit + warn + info stubs.
+    printf 'daemon_info() { printf "info: %%s\\n" "$*" >>"$DAEMON_LOG"; }\n'
+    printf 'bridge_warn() { printf "warn: %%s\\n" "$*" >>"$DAEMON_LOG"; }\n'
+    printf 'bridge_audit_log() { :; }\n'
+    # ---- Source production functions on top of stubs.
+    printf 'source "%s"\n' "$prod_funcs"
+    printf '\n'
+    printf 'bridge_daemon_cron_dispatch_wake "$AGENT" "$TASK_ID" "$FAMILY" || true\n'
+  } >"$driver"
+
+  # T6.a — Drive cron-dispatch wake with channel-status=miss; helper must
+  # short-circuit. Autostart backoff state file must carry the actionable
+  # `channel-required-validator-miss:` token; the opaque
+  # `cron-dispatch-wake-failed` reason MUST NOT appear.
+  local agent="crondispatch-miss-agent"
+  local channel_reason="plugin:teams /opt/agent-bridge/.teams/access.json"
+  local driver_out="$SMOKE_TMP_ROOT/t6-driver-stdout.log"
+  : >"$driver_out"
+  "$BRIDGE_BASH" "$driver" "$state_dir" "$daemon_log" \
+    "$agent" "999" "follow-up:test" "miss" "$channel_reason" >>"$driver_out" 2>&1
+
+  local state_file="$state_dir/daemon-autostart/$agent.env"
+  [[ -f "$state_file" ]] || \
+    smoke_fail "T6.a: autostart backoff state file missing — channel-miss helper did not run inside cron-dispatch wake (state_dir=$state_dir, driver_out=$(cat "$driver_out"))"
+
+  local last_reason
+  last_reason="$(grep '^AUTO_START_LAST_REASON=' "$state_file" | head -n 1 | sed 's/^AUTO_START_LAST_REASON=//')"
+  smoke_assert_contains "$last_reason" "channel-required-validator-miss" \
+    "T6.a: cron-dispatch wake backoff reason must name validator miss (got: $last_reason)"
+  smoke_assert_contains "$last_reason" "plugin:teams" \
+    "T6.a: cron-dispatch wake reason must carry channel spec (got: $last_reason)"
+  smoke_assert_not_contains "$last_reason" "cron-dispatch-wake-failed" \
+    "T6.a: cron-dispatch wake reason must NOT be opaque cron-dispatch-wake-failed (got: $last_reason)"
+  smoke_assert_not_contains "$last_reason" "start_command_failed" \
+    "T6.a: cron-dispatch wake reason must NOT carry an opaque start-command-failed token (got: $last_reason)"
+
+  # T6.b — Cron-dispatch throttle window state file MUST NOT be written
+  # for a held channel-miss tick. The throttle window is a real-wake
+  # rate-limit; a held wake should not consume a throttle slot, otherwise
+  # the next tick (after the operator finishes channel setup) would be
+  # incorrectly throttled.
+  local throttle_file="$state_dir/cron-dispatch-wake/$agent.ts"
+  if [[ -f "$throttle_file" ]]; then
+    smoke_fail "T6.b: cron-dispatch throttle state file written despite channel-miss hold (path: $throttle_file)"
+  fi
+
+  # T6.c — Control: with channel-status=ok, the cron-dispatch wake path
+  # falls through to the start invocation. Because BRIDGE_BASH_BIN points
+  # at a nonexistent path, `bridge-start.sh` invocation fails (rc=127)
+  # and the natural fallthrough records `cron-dispatch-wake-failed` on
+  # the autostart backoff state file. Confirms the channel-miss gate is
+  # the load-bearing reason for the held branch, not a universally-applied
+  # state-file write.
+  rm -f "$state_dir/daemon-autostart"/*.env
+  rm -f "$state_dir/cron-dispatch-wake"/*.ts
+  "$BRIDGE_BASH" "$driver" "$state_dir" "$daemon_log" \
+    "$agent" "1000" "follow-up:test" "ok" "" >>"$driver_out" 2>&1 || true
+  state_file="$state_dir/daemon-autostart/$agent.env"
+  if [[ -f "$state_file" ]]; then
+    last_reason="$(grep '^AUTO_START_LAST_REASON=' "$state_file" | head -n 1 | sed 's/^AUTO_START_LAST_REASON=//')"
+    smoke_assert_not_contains "$last_reason" "channel-required-validator-miss" \
+      "T6.c: status=ok must NOT take the channel-miss branch (got: $last_reason)"
+    smoke_assert_contains "$last_reason" "cron-dispatch-wake-failed" \
+      "T6.c: status=ok with failing bridge-start.sh stub must record cron-dispatch-wake-failed (got: $last_reason)"
+  else
+    smoke_fail "T6.c: autostart backoff state file missing under status=ok control path — fallthrough did not record the start-command failure"
+  fi
+
+  smoke_log "T6 PASS — production cron-dispatch wake branch parity confirmed (channel-miss reason recorded, not cron-dispatch-wake-failed)"
+}
+
 step_t1_start_policy_persists
 step_t2_start_policy_reader
 step_t3_daemon_hold_gate
 step_t4_validator_miss_reason
 step_t5_ondemand_production_branch_channel_miss_parity
+step_t6_crondispatch_wake_channel_miss_parity
 
 smoke_log "PASS: δ-1234-daemon-start-policy (refs #1234, v0.15.0-beta2 Lane δ)"

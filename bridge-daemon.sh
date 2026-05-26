@@ -5589,6 +5589,30 @@ bridge_daemon_cron_dispatch_wake() {
     return 1
   fi
 
+  # Issue #1234 (Lane δ, v0.15.0-beta2) — codex r2 BLOCKING parity:
+  # mirror process_on_demand_agents' channel-required validator-miss
+  # auto-hold. Without this gate, a stopped static agent with required
+  # channel metadata (e.g. Teams) but no `.teams/access.json` would have
+  # the cron-dispatch path invoke `bridge-start.sh`, which re-fails at
+  # the same validator and surfaces the opaque `cron-dispatch-wake-failed`
+  # reason. The helper persists the actionable
+  # `channel-required-validator-miss:<channel> <path>` reason via the
+  # shared autostart backoff state instead, so the operator sees the
+  # same first-class reason regardless of which start path drove the
+  # attempt. Refuse to call `bridge-start.sh`, do NOT touch the
+  # cron-dispatch throttle window state file (held wakes shouldn't
+  # consume the throttle slot), and surface the refusal as a gate row
+  # in the audit log. The row stays queued for the next tick; the
+  # caller treats rc=1 as "skip this row this pass".
+  if bridge_daemon_check_channel_status_or_hold "$agent"; then
+    bridge_warn "cron-dispatch wake held ${agent} (reason=channel_required_validator_miss, task=#${task_id})"
+    bridge_audit_log daemon cron_dispatch_wake_refused "$agent" \
+      --detail task_id="$task_id" \
+      --detail family="$family" \
+      --detail reason=channel_required_validator_miss 2>/dev/null || true
+    return 1
+  fi
+
   now_ts="$(date +%s 2>/dev/null || echo 0)"
   state_file="$(bridge_daemon_cron_dispatch_wake_state_file "$agent")"
   if [[ -f "$state_file" ]]; then
