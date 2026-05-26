@@ -7306,6 +7306,429 @@ bridge_agent_restart_preflight_guidance() {
   printf "\n%s" "$(bridge_agent_channel_setup_guidance "$agent" "$reason")"
 }
 
+# --------------------------------------------------------------------------
+# Issue #1251 — restart marker + snapshot + auto-rollback (v0.15.0-beta3
+# Track C1). The marker file under `state/agents/<a>/restart.in-progress`
+# is the contract Lane C2 (#1254 watchdog drift suppression) consumes, so
+# the schema below is the SSOT — coordinate any field shape change with
+# the next lane in the track.
+#
+# Marker schema (key=value lines):
+#   pid=<orchestrator-pid>       # process that started the restart; Lane C2
+#                                # uses `kill -0` for liveness gating.
+#   started=<unix-ts>            # seconds since epoch, captured at marker
+#                                # write time (Phase 2 entry).
+#   ttl=<seconds>                # operator-tunable, default 60. Lane C2's
+#                                # drift skip is gated on `now < started+ttl`.
+#   state=in_progress|rolled_back|completed
+#                                # in_progress = mid-Phase-2; rolled_back =
+#                                # restart failed and the auto-rollback path
+#                                # restored the snapshot; completed is set
+#                                # only briefly before marker_clear() removes
+#                                # the file on success (callers should treat
+#                                # missing marker == completed).
+#   reason=<structured>          # populated only on state=rolled_back. Free-
+#                                # form but should start with a stable tag
+#                                # (e.g. `launch-failed:`, `verify-failed:`)
+#                                # so the watchdog can quote it back to the
+#                                # operator without re-deriving the cause.
+# --------------------------------------------------------------------------
+
+# Default marker TTL in seconds. Issue body specifies 60s; the operator
+# can override via the env var below for slow / cold-cache hosts where
+# `claude` first-launch routinely exceeds the default.
+: "${BRIDGE_AGENT_RESTART_MARKER_TTL:=60}"
+
+# State directory for per-agent restart artifacts. Mirrors the v2 layout
+# already established by `state/agents/<a>/` (see
+# lib/bridge-isolation-v2-reconcile.sh's state-agent-leaf scaffold).
+# Returns the path on stdout; caller is responsible for mkdir -p.
+bridge_agent_restart_state_dir() {
+  local agent="$1"
+  local state_root=""
+  state_root="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  printf '%s/agents/%s' "$state_root" "$agent"
+}
+
+bridge_agent_restart_marker_path() {
+  local agent="$1"
+  printf '%s/restart.in-progress' "$(bridge_agent_restart_state_dir "$agent")"
+}
+
+# Snapshot path. We embed the unix timestamp so a second restart attempt
+# while a stale snapshot lingers does not collide with an existing file
+# (the cleanup path on success removes all `restart.snapshot.*` for the
+# agent, not just the timestamp this run created).
+bridge_agent_restart_snapshot_path() {
+  local agent="$1"
+  local ts="${2:-$(date +%s)}"
+  printf '%s/restart.snapshot.%s' "$(bridge_agent_restart_state_dir "$agent")" "$ts"
+}
+
+# Write the marker file at Phase 2 entry. Always overwrites any existing
+# marker — a stale file from a crashed prior restart should not block a
+# clean retry (the TTL check is the operator's signal, not file presence).
+#
+# Args:
+#   $1 — agent id
+#   $2 — pid (defaults to $$)
+#   $3 — ttl seconds (defaults to BRIDGE_AGENT_RESTART_MARKER_TTL)
+#   $4 — state (defaults to in_progress)
+#   $5 — reason (optional; only set on rolled_back state)
+bridge_agent_restart_marker_write() {
+  local agent="$1"
+  local pid="${2:-$$}"
+  local ttl="${3:-$BRIDGE_AGENT_RESTART_MARKER_TTL}"
+  local state="${4:-in_progress}"
+  local reason="${5:-}"
+  local state_dir=""
+  local marker=""
+  local started=""
+
+  state_dir="$(bridge_agent_restart_state_dir "$agent")"
+  marker="$(bridge_agent_restart_marker_path "$agent")"
+  started="$(date +%s)"
+
+  mkdir -p "$state_dir" 2>/dev/null || return 1
+
+  # Atomic write via temp + rename so an interrupted writer does not leave
+  # a half-formed marker that the watchdog might mis-parse. We deliberately
+  # do NOT mktemp under /tmp — the marker must live next to its final
+  # location so the rename is on the same filesystem.
+  #
+  # Note on the trailing `:` (true): the block's exit code is the LAST
+  # command's exit code. When reason="" the `[[ -n "$reason" ]] && ...`
+  # short-circuits to rc=1, which would mis-trigger the `|| { rm; return 1; }`
+  # cleanup even though every printf wrote successfully. Anchoring the
+  # block with `:` keeps the exit code at 0 for the empty-reason case.
+  local tmp="${marker}.tmp.$$"
+  {
+    printf 'pid=%s\n' "$pid"
+    printf 'started=%s\n' "$started"
+    printf 'ttl=%s\n' "$ttl"
+    printf 'state=%s\n' "$state"
+    [[ -n "$reason" ]] && printf 'reason=%s\n' "$reason"
+    :
+  } >"$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$marker" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# Read a single field from the marker. Returns empty string + rc=0 when
+# the marker is absent or the field is not set (callers gate on stdout
+# content, not rc).
+bridge_agent_restart_marker_read_field() {
+  local agent="$1"
+  local field="$2"
+  local marker=""
+  marker="$(bridge_agent_restart_marker_path "$agent")"
+  [[ -f "$marker" ]] || {
+    printf '%s' ""
+    return 0
+  }
+  awk -F'=' -v k="$field" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$marker" 2>/dev/null || printf '%s' ""
+}
+
+# TTL check helper. Returns rc=0 when the marker is present AND not
+# expired (started+ttl >= now); rc=1 otherwise. Lane C2 consumes this
+# predicate when deciding whether to skip drift task enqueue.
+bridge_agent_restart_marker_active() {
+  local agent="$1"
+  local started=""
+  local ttl=""
+  local state=""
+  local now=""
+
+  started="$(bridge_agent_restart_marker_read_field "$agent" started)"
+  ttl="$(bridge_agent_restart_marker_read_field "$agent" ttl)"
+  state="$(bridge_agent_restart_marker_read_field "$agent" state)"
+  [[ -n "$started" && -n "$ttl" ]] || return 1
+  # rolled_back markers persist past the in-flight window so the operator
+  # can audit them, but they are NOT "active restart" — Lane C2 treats
+  # them as terminal markers, not drift-suppression signals.
+  [[ "$state" == "in_progress" ]] || return 1
+  now="$(date +%s)"
+  # Guard against non-numeric values (corrupted marker) — awk above would
+  # have stripped the key prefix, but a tampered file could still leak a
+  # non-digit value through.
+  [[ "$started" =~ ^[0-9]+$ && "$ttl" =~ ^[0-9]+$ ]] || return 1
+  (( now < started + ttl )) || return 1
+  return 0
+}
+
+# Remove the marker + any leftover snapshot files. Called on the happy
+# path after a successful restart, and on the rollback path's restore
+# success (the rollback writer re-creates a fresh marker with state=
+# rolled_back AFTER the restore — keeping the marker is the audit
+# breadcrumb for Lane C2 / operator drift telemetry).
+bridge_agent_restart_marker_clear() {
+  local agent="$1"
+  local state_dir=""
+  local marker=""
+  state_dir="$(bridge_agent_restart_state_dir "$agent")"
+  marker="$(bridge_agent_restart_marker_path "$agent")"
+  rm -f "$marker" 2>/dev/null || true
+  # Clean up any snapshot leftovers from this and prior attempts. The
+  # glob is intentionally broad so a crashed restart that did not reach
+  # the cleanup hook still gets swept on the next successful one.
+  if [[ -d "$state_dir" ]]; then
+    rm -f "$state_dir"/restart.snapshot.* 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Snapshot the agent's managed block from the local roster file so the
+# rollback path can restore the pre-restart configuration if launch
+# fails after the kill. The snapshot captures the whole `# BEGIN AGENT
+# BRIDGE MANAGED ROLE: <agent>` ... `# END ...` block verbatim — that
+# block is the SSOT for BRIDGE_AGENT_CHANNELS / BRIDGE_AGENT_LAUNCH_CMD
+# and every other per-agent assignment (see bridge-agent.sh's role-block
+# writer at the bridge_write_role_block helper).
+#
+# Returns the snapshot file path on stdout (rc=0) when written; empty
+# string + rc=0 when the roster does not carry a managed block for this
+# agent (e.g. dynamic agent that was never persisted to roster.local).
+bridge_agent_restart_snapshot_managed_block() {
+  local agent="$1"
+  local roster=""
+  local state_dir=""
+  local ts=""
+  local snapshot=""
+
+  roster="${BRIDGE_ROSTER_LOCAL_FILE:-${BRIDGE_HOME:-$HOME/.agent-bridge}/agent-roster.local.sh}"
+  [[ -f "$roster" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  # Extract the managed block. We use awk over sed because the block
+  # may legitimately contain `$` and `/` that trip sed's regex parser
+  # under -E. Range pattern is on full-line anchors so a stray substring
+  # inside an arg cannot mis-trigger capture.
+  local block
+  block="$(awk -v a="$agent" '
+    $0 == "# BEGIN AGENT BRIDGE MANAGED ROLE: "a { capture=1 }
+    capture { print }
+    capture && $0 == "# END AGENT BRIDGE MANAGED ROLE: "a { capture=0 }
+  ' "$roster" 2>/dev/null)"
+  [[ -n "$block" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  state_dir="$(bridge_agent_restart_state_dir "$agent")"
+  mkdir -p "$state_dir" 2>/dev/null || return 1
+  ts="$(date +%s)"
+  snapshot="$(bridge_agent_restart_snapshot_path "$agent" "$ts")"
+  printf '%s\n' "$block" >"$snapshot" || return 1
+  printf '%s' "$snapshot"
+  return 0
+}
+
+# Restore the managed block from a snapshot file. Used by the rollback
+# path when restart fails post-kill. Atomic via temp file + rename so a
+# crashed restore does not corrupt the roster.
+#
+# Args:
+#   $1 — agent id
+#   $2 — snapshot file path (from bridge_agent_restart_snapshot_managed_block)
+bridge_agent_restart_restore_managed_block() {
+  local agent="$1"
+  local snapshot="$2"
+  local roster=""
+
+  roster="${BRIDGE_ROSTER_LOCAL_FILE:-${BRIDGE_HOME:-$HOME/.agent-bridge}/agent-roster.local.sh}"
+  [[ -f "$snapshot" ]] || return 1
+  [[ -f "$roster" ]] || return 1
+
+  local tmp="${roster}.restore.$$"
+  awk -v a="$agent" -v snap="$snapshot" '
+    BEGIN {
+      inserted = 0
+    }
+    $0 == "# BEGIN AGENT BRIDGE MANAGED ROLE: "a {
+      # Skip the existing block (which is the failed-launch config) and
+      # emit the snapshot in its place.
+      skip = 1
+      while ((getline line < snap) > 0) print line
+      close(snap)
+      inserted = 1
+      next
+    }
+    skip && $0 == "# END AGENT BRIDGE MANAGED ROLE: "a {
+      skip = 0
+      next
+    }
+    !skip { print }
+    END {
+      # If the existing roster no longer carried the managed block (e.g.
+      # operator manually removed it between snapshot and rollback), do
+      # NOT silently re-add — that would resurrect a possibly-stale
+      # config without operator intent. Leave the file as-is and let
+      # the caller decide whether to append.
+    }
+  ' "$roster" >"$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
+  mv -f "$tmp" "$roster" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+  return 0
+}
+
+# Full pre-flight check for `agent restart`. Runs BEFORE the prior tmux
+# session is killed so any "cannot start the new config" failure leaves
+# the running session intact. Returns empty string + rc=0 when every
+# check passes; structured failure reason + rc=0 when any check fails
+# (rc remains 0 so the caller can branch on stdout content without
+# wrapping in `|| true`).
+#
+# Checks (composed; the first failing check is what the caller sees):
+#   1. Channel-spec canonical resolution: every channel item in the
+#      current BRIDGE_AGENT_CHANNELS list must be a recognized shape
+#      (`plugin:<name>@<marketplace>` or a non-plugin transport token).
+#      Lane G beta1 wired the canonicalizer; we re-use it here so a
+#      typo like `plugin:teasms` is caught before the kill.
+#   2. Per-channel plugin manifest declaration: for every `plugin:*@*`
+#      item, the bridge-owned plugin manifest (per-UID +
+#      shared/plugins-cache) must declare the spec. This is the issue
+#      trace's smoking gun — `cosmax-crm@cosmax-marketplace` was
+#      unseeded, the launch reached `bridge_ensure_claude_plugin_enabled`
+#      post-kill, and bridge_die fired with the agent already stopped.
+#      Pulling the manifest check forward into pre-flight means the
+#      restart aborts with the agent still running.
+#   3. Engine binary exists on the controller's PATH (the same probe
+#      bridge_resolve_engine_binary uses). A missing `claude` / `codex`
+#      executable would have nuked the launch with an opaque exit-127
+#      otherwise.
+#
+# (Daemon supp-group + session-id consistency checks are co-owned with
+# Lane A12 / A3 of v0.15.0-beta3. Those lanes land their own predicates
+# and this helper composes any that are present at runtime — see the
+# end-of-function `if declare -f ... >/dev/null` guards below.)
+bridge_agent_restart_preflight_full_reason() {
+  local agent="$1"
+  local channels_csv=""
+  local item=""
+  local plugin_status=""
+  local engine=""
+  local engine_bin=""
+  local fragment=""
+  local -a items=()
+
+  [[ -n "$agent" ]] || {
+    printf 'missing agent id'
+    return 0
+  }
+
+  engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+  channels_csv="$(bridge_agent_channels_csv "$agent" 2>/dev/null || true)"
+
+  # Check 1+2: channel-spec resolution + per-plugin manifest declaration.
+  # We iterate over the raw CSV rather than going through the channel-
+  # status reason path because the issue's case (`cosmax-crm@cosmax-
+  # marketplace`) is a plugin-manifest miss, not a token / spec error.
+  # That helper's failure mode is downstream of seed; we want the seed
+  # failure surfaced FIRST with the actionable `agb plugins seed` hint.
+  if [[ -n "$channels_csv" ]]; then
+    IFS=',' read -r -a items <<<"$channels_csv"
+    local qualified=""
+    for item in "${items[@]}"; do
+      # bridge_trim_whitespace lives in bridge-core.sh and is sourced
+      # before us; defensive `|| true` so a missing helper does not
+      # crash the pre-flight (still better to fall back to raw item).
+      item="$(bridge_trim_whitespace "$item" 2>/dev/null || printf '%s' "$item")"
+      [[ -n "$item" ]] || continue
+
+      qualified="$(bridge_qualify_channel_item "$item" 2>/dev/null || printf '%s' "$item")"
+
+      # Check 1: must be either a `plugin:...@...` shape or a non-plugin
+      # transport token (no `plugin:` prefix at all). A bare `plugin:foo`
+      # that the canonicalizer could not resolve to a marketplace is a
+      # typo / unknown plugin — abort before the kill.
+      if [[ "$qualified" == plugin:* && "$qualified" != *@* ]]; then
+        printf 'channel-spec-unresolved: %s (canonical marketplace suffix could not be derived — typo or unknown plugin?)' "$qualified"
+        return 0
+      fi
+
+      # Check 2: plugin-manifest declaration. Only applies to engine=claude
+      # under linux-user isolation; other engines / shared-mode agents
+      # skip this branch because they do not consume the bridge-owned
+      # plugin cache.
+      if [[ "$qualified" == plugin:*@* && "$engine" == "claude" ]] \
+          && ! bridge_isolation_disabled_by_env 2>/dev/null \
+          && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+        plugin_status="$(bridge_claude_plugin_status "$qualified" "$agent" 2>/dev/null || printf 'missing')"
+        if [[ "$plugin_status" == "missing" ]]; then
+          local marketplace="${qualified#*@}"
+          local seed_hint="agb plugins seed"
+          if [[ -n "$marketplace" && "$marketplace" != "agent-bridge" && "$marketplace" != "claude-plugins-official" ]]; then
+            seed_hint="agb plugins seed --marketplace-root <path-to-${marketplace}-source>"
+          fi
+          printf 'manifest-incomplete: %s (bridge-owned plugin manifest does not declare this spec; run: %s)' "$qualified" "$seed_hint"
+          return 0
+        fi
+      fi
+    done
+  fi
+
+  # Check 3: engine binary resolves. We do not require it for non-claude/
+  # codex engines — bridge_resolve_engine_binary returns rc=1 for unknown
+  # engines, which is indistinguishable from "binary missing"; honor the
+  # existing two-engine surface and skip the probe for anything else.
+  case "$engine" in
+    claude|codex)
+      engine_bin="$(bridge_resolve_engine_binary "$engine" 2>/dev/null || true)"
+      if [[ -z "$engine_bin" ]]; then
+        printf 'engine-binary-missing: %s not on controller PATH (install or update PATH before retrying)' "$engine"
+        return 0
+      fi
+      ;;
+  esac
+
+  # Daemon supp-group hint (Lane A12 v0.15.0-beta3 concurrent lane).
+  # Only consult the predicate when it exists — if Lane A12 has not yet
+  # landed in this branch, skip silently rather than emit a misleading
+  # "no such function" reason.
+  if declare -f bridge_daemon_supp_groups_includes_agent >/dev/null 2>&1; then
+    if ! bridge_daemon_supp_groups_includes_agent "$agent" 2>/dev/null; then
+      fragment="$(bridge_daemon_supp_groups_remediation "$agent" 2>/dev/null || true)"
+      [[ -n "$fragment" ]] || fragment="daemon supp-group set missing ab-agent-$agent — refresh daemon supp-groups before restart"
+      printf 'daemon-supp-group-missing: %s' "$fragment"
+      return 0
+    fi
+  fi
+
+  # Session-id consistency (Lane A3 v0.15.0-beta3 concurrent lane).
+  # Same opt-in pattern as the supp-group check above.
+  if declare -f bridge_agent_session_id_state_consistent >/dev/null 2>&1; then
+    if ! bridge_agent_session_id_state_consistent "$agent" 2>/dev/null; then
+      printf 'session-id-state-inconsistent: %s session_id pointer disagrees with on-disk transcript (Lane A3 reconcile required)' "$agent"
+      return 0
+    fi
+  fi
+
+  printf '%s' ""
+  return 0
+}
+
+# Compose an operator-facing block from a pre-flight reason string. Used
+# by `run_restart` in bridge-agent.sh to die with a structured, multi-line
+# error rather than a bare reason fragment. Output convention mirrors
+# the existing bridge_agent_restart_preflight_guidance shape so the
+# operator sees the same "session was left intact" closing line.
+bridge_agent_restart_preflight_full_guidance() {
+  local agent="$1"
+  local reason="${2:-$(bridge_agent_restart_preflight_full_reason "$agent")}"
+
+  [[ -n "$reason" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  printf 'restart_aborted=%s\n' "$(printf '%s' "$reason" | awk -F':' '{print $1}')"
+  printf 'agent=%s\n' "$agent"
+  printf 'detail=%s\n' "$reason"
+  printf 'prior_session_preserved=yes\n'
+  printf 'remediation=fix the underlying cause above and re-run: agent-bridge agent restart %s' "$agent"
+}
+
 bridge_agent_channel_status() {
   local agent="$1"
   local required=""
