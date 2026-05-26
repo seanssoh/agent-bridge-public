@@ -635,6 +635,44 @@ if [[ $dry_run -eq 0 ]]; then
   # any failure is logged without blocking init.
   bridge_init_provision_admin_codex_pair "$host_profile_cli" "$admin_agent" "$host_profile_chosen" || true
 
+  # Issue #1231: idempotent bundled-marketplace seed for the v2 shared
+  # plugin catalog. Without this, `agb agent create --isolate --channels
+  # plugin:teams,plugin:ms365` on a fresh install bridge_die's with
+  # "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is
+  # not populated" because Claude never wrote installed_plugins.json
+  # there. `bridge-plugins.sh seed` is the de-facto post-fresh-install
+  # step; we make it part of init so the operator does not have to know
+  # about it.
+  #
+  # Contract:
+  #   * Idempotent — re-running over a populated catalog is a no-op
+  #     (the sync helper short-circuits when manifest entries already
+  #     match the marketplace.json declarations).
+  #   * Non-fatal on failure — init proceeds with a warning; the
+  #     agent-create fallback in lib/bridge-agents.sh
+  #     (bridge_linux_share_plugin_catalog) takes over as the
+  #     fail-closed second chance.
+  #   * Gated on v2 active — legacy installs do not have a shared
+  #     plugin catalog contract.
+  #   * Gated on the live CLI being present at $BRIDGE_HOME/agent-bridge
+  #     (bridge_init_ensure_live_cli ran above); we use the live CLI so
+  #     the seed runs against the operator-facing surface, not the
+  #     source checkout (in case those paths diverge).
+  if command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+     && bridge_isolation_v2_active 2>/dev/null \
+     && [[ -x "$host_profile_cli" ]]; then
+    _init_seed_output=""
+    _init_seed_rc=0
+    _init_seed_output="$("$BRIDGE_BASH_BIN" "$host_profile_cli" plugins seed 2>&1)" \
+      || _init_seed_rc=$?
+    if (( _init_seed_rc == 0 )); then
+      printf '[init] plugins seed: shared catalog populated (bundled agent-bridge marketplace)\n'
+    else
+      [[ -n "$_init_seed_output" ]] && printf '%s\n' "$_init_seed_output" >&2
+      bridge_init_append_warning "plugins seed failed (rc=$_init_seed_rc) — \$BRIDGE_SHARED_ROOT/plugins-cache may be empty. Re-run: agent-bridge plugins seed. \`agent create --isolate --channels plugin:*\` will attempt to self-heal via fallback seed; if that also fails, the create call will surface an actionable error."
+    fi
+  fi
+
   # Beta20 L2 Variant 3A — install the daemon-refresh sudoers drop-in on
   # Linux server hosts so subsequent `agent create --linux-user` calls
   # can automatically refresh the daemon's supplementary groups. The
@@ -647,16 +685,49 @@ if [[ $dry_run -eq 0 ]]; then
      && [[ "$(uname -s 2>/dev/null)" == "Linux" ]] \
      && [[ $dry_run -eq 0 ]] \
      && command -v bridge_daemon_control_install_sudoers >/dev/null 2>&1; then
+    # Issue #1236: gate the "installed: <path>" success line on the
+    # verifier (`bridge_daemon_control_check_sudoers` via
+    # `bridge_daemon_control_preflight_row`) actually accepting the
+    # rendered drop-in. Previously the installer wrote the file and we
+    # printed "installed at <path>" unconditionally, then the very next
+    # line emitted `daemon_group_refresh_sudoers=missing|invalid|...`
+    # when sudo/PAM refused to refresh groups (or visudo rejected the
+    # content, or the rendered + on-disk bytes diverged). Operators saw
+    # both "installed" AND "missing/invalid" in the same init output and
+    # filed #1236. The fix: capture the installer result, then probe the
+    # verifier, then print ONE line — either the success row or the
+    # `manual-required` remediation row, never both.
     _init_sudoers_path=""
+    _init_sudoers_install_rc=0
     _init_sudoers_install_ok=0
     _init_sudoers_path="$(bridge_daemon_control_install_sudoers 2>&1)" \
-      && { printf '[init] daemon-refresh sudoers: installed at %s\n' "$_init_sudoers_path"; _init_sudoers_install_ok=1; } \
-      || bridge_init_append_warning "daemon-refresh sudoers install failed — automatic supp-groups refresh will fall back to manual-required. Re-run: agent-bridge init sudoers daemon-refresh --apply"
-    # Emit the preflight diagnostic row so operators see auto-refresh
-    # status in init output without an extra step.
-    if command -v bridge_daemon_control_preflight_row >/dev/null 2>&1; then
-      printf '[init] '
-      bridge_daemon_control_preflight_row || true
+      || _init_sudoers_install_rc=$?
+    _init_sudoers_status=""
+    if command -v bridge_daemon_control_check_sudoers >/dev/null 2>&1; then
+      _init_sudoers_status="$(bridge_daemon_control_check_sudoers 2>/dev/null || true)"
+    fi
+    if (( _init_sudoers_install_rc == 0 )) && [[ "$_init_sudoers_status" == "ok" ]]; then
+      printf '[init] daemon-refresh sudoers: installed at %s (verifier=ok)\n' "$_init_sudoers_path"
+      printf '[init] daemon_group_refresh_sudoers=ok\n'
+      _init_sudoers_install_ok=1
+    else
+      # Either install failed, or install succeeded but verifier rejected
+      # the result. Surface manual-required + actionable remediation.
+      # Do NOT emit an "installed" line — that is the #1236 contradiction.
+      _init_sudoers_reason="$_init_sudoers_status"
+      [[ -z "$_init_sudoers_reason" ]] && _init_sudoers_reason="missing"
+      if (( _init_sudoers_install_rc != 0 )); then
+        # Installer itself failed — surface its output for the operator.
+        [[ -n "$_init_sudoers_path" ]] && printf '[init] daemon-refresh sudoers installer output: %s\n' "$_init_sudoers_path" >&2
+        bridge_init_append_warning "daemon-refresh sudoers: manual-required (installer rc=$_init_sudoers_install_rc, verifier=$_init_sudoers_reason). Re-run: agent-bridge init sudoers daemon-refresh --apply"
+      else
+        # Install returned 0 but verifier disagrees — render+visudo mismatch
+        # or sudo/PAM refused the probe. Record the path so the operator
+        # can inspect it, but do NOT call it "installed".
+        bridge_init_append_warning "daemon-refresh sudoers: manual-required (verifier=$_init_sudoers_reason at $_init_sudoers_path). Re-run: agent-bridge init sudoers daemon-refresh --apply (Linux+visudo required) — the daemon will fall back to queue-only-fallback for supp-groups refresh until this clears."
+      fi
+      printf '[init] daemon-refresh sudoers: manual-required (verifier=%s)\n' "$_init_sudoers_reason"
+      printf '[init] daemon_group_refresh_sudoers=%s\n' "$_init_sudoers_reason"
     fi
 
     # Beta20 L2 Variant 3A r4 — when the daemon-refresh sudoers landed,
