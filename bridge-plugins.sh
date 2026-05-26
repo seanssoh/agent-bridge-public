@@ -28,6 +28,8 @@ usage() {
   printf 'Usage:\n'
   printf '  %s seed [--marketplace-root <path>] [--channels <csv>] [--dry-run] [--no-iso-chmod]\n' "$prog"
   printf '  %s show [--json]\n' "$prog"
+  printf '  %s list [--json]\n' "$prog"
+  printf '  %s marketplaces [--json]\n' "$prog"
   printf '\n'
   printf 'Seed populates the v2 shared plugin catalog at\n'
   printf '$BRIDGE_SHARED_ROOT/plugins-cache/ from the in-repo agent-bridge\n'
@@ -35,6 +37,14 @@ usage() {
   printf '\n'
   printf 'Show prints the resolved shared-catalog state (root path, populated\n'
   printf 'status, manifest plugin count).\n'
+  printf '\n'
+  printf 'List enumerates installed plugins from\n'
+  printf '$BRIDGE_SHARED_ROOT/plugins-cache/installed_plugins.json\n'
+  printf '(name@marketplace, version, install path). Empty catalog → empty list.\n'
+  printf '\n'
+  printf 'Marketplaces enumerates known marketplaces from\n'
+  printf '$BRIDGE_SHARED_ROOT/plugins-cache/known_marketplaces.json\n'
+  printf '(id, source.kind, source.path). Empty catalog → empty list.\n'
   printf '\n'
   printf 'Requires BRIDGE_LAYOUT=v2 with BRIDGE_DATA_ROOT + BRIDGE_SHARED_ROOT\n'
   printf 'resolved by the layout resolver.\n'
@@ -48,6 +58,10 @@ usage() {
   printf '\n'
   printf '  # Inspect current shared-catalog state\n'
   printf '  %s show --json\n' "$prog"
+  printf '\n'
+  printf '  # Enumerate installed plugins / known marketplaces\n'
+  printf '  %s list --json\n' "$prog"
+  printf '  %s marketplaces --json\n' "$prog"
 }
 
 bridge_plugins_require_v2() {
@@ -828,6 +842,108 @@ _bridge_plugins_seed_channels_csv_uses_marketplace() {
   return 1
 }
 
+bridge_plugins_cmd_list() {
+  # Read-only enumeration of installed plugins from the v2 shared
+  # plugins-cache manifest. Empty catalog (missing manifest) → empty
+  # list, exit 0 — operators querying a freshly-resolved layout
+  # before `agb plugins seed` should get an empty list, not an error.
+  # `show` continues to be the status / populated-flag surface.
+  #
+  # Pre-scan for `-h|--help` BEFORE `bridge_plugins_require_v2` so the
+  # help contract holds on hosts where v2 has not been resolved yet
+  # (mirrors the #1114 fix for daemon verbs — help must never depend
+  # on bridge config).
+  local _a
+  for _a in "$@"; do
+    case "$_a" in
+      -h|--help) usage; return 0 ;;
+    esac
+  done
+
+  bridge_plugins_require_v2
+  bridge_require_python
+
+  local json_output=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json_output=1; shift ;;
+      *) bridge_die "지원하지 않는 plugins list 옵션입니다: $1" ;;
+    esac
+  done
+
+  local plugins_cache="$BRIDGE_SHARED_ROOT/plugins-cache"
+  local manifest="$plugins_cache/installed_plugins.json"
+
+  if (( json_output == 1 )); then
+    # File-as-argv per footgun #11; see lib/upgrade-helpers/plugins-list-json.py.
+    python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-list-json.py" \
+      "$plugins_cache" "$manifest"
+    return 0
+  fi
+
+  printf 'plugins_cache: %s\n' "$plugins_cache"
+  if [[ ! -f "$manifest" ]]; then
+    printf 'installed_plugins.json: <missing>\n'
+    printf 'plugin_count: 0\n'
+    return 0
+  fi
+  printf 'installed_plugins.json: %s\n' "$manifest"
+  # Reuse the json helper for the enumeration, then pretty-print via
+  # python3 so the human-readable output stays consistent with the
+  # JSON shape (id/spec/version/installPath).
+  python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-list-json.py" \
+    "$plugins_cache" "$manifest" \
+    | python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-list-pretty.py"
+}
+
+bridge_plugins_cmd_marketplaces() {
+  # Read-only enumeration of known marketplaces from the v2 shared
+  # plugins-cache catalog. Empty catalog (missing file) → empty list,
+  # exit 0. Same operator-affordance as `plugins list`.
+  #
+  # Pre-scan for `-h|--help` before `bridge_plugins_require_v2` (see
+  # comment in bridge_plugins_cmd_list for rationale).
+  local _a
+  for _a in "$@"; do
+    case "$_a" in
+      -h|--help) usage; return 0 ;;
+    esac
+  done
+
+  bridge_plugins_require_v2
+  bridge_require_python
+
+  local json_output=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json_output=1; shift ;;
+      *) bridge_die "지원하지 않는 plugins marketplaces 옵션입니다: $1" ;;
+    esac
+  done
+
+  local plugins_cache="$BRIDGE_SHARED_ROOT/plugins-cache"
+  local known="$plugins_cache/known_marketplaces.json"
+
+  if (( json_output == 1 )); then
+    # File-as-argv per footgun #11; see
+    # lib/upgrade-helpers/plugins-marketplaces-json.py.
+    python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-marketplaces-json.py" \
+      "$plugins_cache" "$known"
+    return 0
+  fi
+
+  printf 'plugins_cache: %s\n' "$plugins_cache"
+  if [[ ! -f "$known" ]]; then
+    printf 'known_marketplaces.json: <missing>\n'
+    printf 'marketplace_count: 0\n'
+    return 0
+  fi
+  printf 'known_marketplaces.json: %s\n' "$known"
+  python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-marketplaces-json.py" \
+    "$plugins_cache" "$known" \
+    | python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-marketplaces-pretty.py"
+}
+
 bridge_plugins_cmd_show() {
   bridge_plugins_require_v2
   bridge_require_python
@@ -890,6 +1006,14 @@ if [[ "${BRIDGE_PLUGINS_LIB_ONLY:-0}" != "1" ]]; then
     show)
       shift
       bridge_plugins_cmd_show "$@"
+      ;;
+    list)
+      shift
+      bridge_plugins_cmd_list "$@"
+      ;;
+    marketplaces)
+      shift
+      bridge_plugins_cmd_marketplaces "$@"
       ;;
     *)
       bridge_warn "지원하지 않는 plugins 명령입니다: $1"
