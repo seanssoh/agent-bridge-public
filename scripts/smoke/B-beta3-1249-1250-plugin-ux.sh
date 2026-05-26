@@ -317,10 +317,16 @@ smoke_assert_contains "$T5_OUT" "isolation-v2" \
 # T6 (teeth): if #1250's fail-loud branch were absent, a failing
 # auto-install would silently ride through. We force the install to
 # fail by staging a NEGATIVE-RC stub bun and asserting seed STILL
-# exits non-zero (proving the fail-loud branch fires, not the silent
-# ride-through that beta2 had).
+# exits non-zero AND emits the documented structured tokens
+# (codex r1 BLOCKING): `seed_status=incomplete`,
+# `node_modules=install_failed`, `criticality=channel-required`.
+# Without these tokens, operators + CI cannot grep the output to
+# distinguish the fail-loud branch from an unrelated bridge_die.
+# Teeth: revert the new token emission → T6 fails with EXACT message
+# "Lane B r1 finding 1 — seed_status=incomplete missing on auto-install
+# failure".
 # ----------------------------------------------------------------------------
-smoke_log "T6 (teeth #1250): failing auto-install must fail-loud (not silent)"
+smoke_log "T6 (teeth #1250): failing auto-install must fail-loud with structured tokens (codex r1)"
 
 FAILING_BIN_DIR="$SMOKE_TMP_ROOT/failbin"
 mkdir -p "$FAILING_BIN_DIR"
@@ -344,6 +350,20 @@ T6_OUT="$(PATH="$FAILING_BIN_DIR:$PATH" "$BRIDGE_BASH" "$REPO_ROOT/bridge-plugin
   || smoke_fail "T6: failing bun install MUST cause seed to fail-loud (got rc=0: $T6_OUT)"
 smoke_assert_contains "$T6_OUT" "auto-install" \
   "T6 fail message references the auto-install pass"
+# codex r1 BLOCKING — assert the documented structured token contract.
+# These three lines on the same output were absent at PR head ae39b18
+# despite the smoke header lines 13-17 documenting the contract; r2
+# emits them via _bridge_plugins_emit_seed_failure_tokens at every
+# fail-loud die site.
+if ! printf '%s\n' "$T6_OUT" | grep -q "seed_status=incomplete"; then
+  smoke_fail "T6: Lane B r1 finding 1 — seed_status=incomplete missing on auto-install failure. T6_OUT=$T6_OUT"
+fi
+if ! printf '%s\n' "$T6_OUT" | grep -q "node_modules=install_failed"; then
+  smoke_fail "T6: Lane B r1 finding 1 — node_modules=install_failed token missing on auto-install failure. T6_OUT=$T6_OUT"
+fi
+if ! printf '%s\n' "$T6_OUT" | grep -q "criticality=channel-required"; then
+  smoke_fail "T6: Lane B r1 finding 1 — criticality=channel-required token missing on auto-install failure (contract is criticality-conditional). T6_OUT=$T6_OUT"
+fi
 
 # ----------------------------------------------------------------------------
 # T7 (teeth): if add-marketplace verb were absent from the dispatcher,

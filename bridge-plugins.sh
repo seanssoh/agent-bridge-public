@@ -294,16 +294,36 @@ bridge_plugins_cmd_seed() {
   # has node_modules=missing after the install pass; warn + continue
   # for criticality=optional. --no-auto-install opts out entirely.
   if (( no_auto_install == 0 )); then
+    local _auto_install_rc=0
     bridge_plugins_seed_auto_install_node_modules \
       "$marketplace_root" "$plugins_cache" "$cache_root" "$channels_csv" \
       "$output" \
-      || bridge_die "agb plugins seed: node_modules auto-install pass failed — see output above. Re-run with --no-auto-install to skip the auto-install step (operator must then resolve deps manually), or fix the underlying error (bun not on PATH, dep resolution failure, missing lockfile) and re-run."
+      || _auto_install_rc=$?
+    if (( _auto_install_rc != 0 )); then
+      # codex r1 BLOCKING: emit summary structured token BEFORE die so
+      # operators + CI grep see the contract documented in the smoke
+      # B-beta3-1249-1250-plugin-ux.sh header (seed_status=incomplete +
+      # node_modules=install_failed + criticality=channel-required).
+      # The inner function already emitted per-plugin tokens; this is
+      # the aggregate summary at the wrapper die-site.
+      _bridge_plugins_emit_seed_failure_tokens "auto-install" "channel-required" "$_auto_install_rc"
+      bridge_die "agb plugins seed: node_modules auto-install pass failed — see output above. Re-run with --no-auto-install to skip the auto-install step (operator must then resolve deps manually), or fix the underlying error (bun not on PATH, dep resolution failure, missing lockfile) and re-run."
+    fi
   else
     # When --no-auto-install is set, still fail-loud on channel-required
     # plugins whose node_modules is missing — operators must know about
     # the gap. The check parses the same sync output.
+    local _no_auto_rc=0
     bridge_plugins_seed_check_no_auto_install_gap "$output" \
-      || bridge_die "agb plugins seed: --no-auto-install set, but one or more channel-required plugins have node_modules=missing. See output above. Resolve manually (e.g. \`cd <plugin_dir> && bun install\`) then re-run \`agb plugins seed --marketplace-root $marketplace_root\`."
+      || _no_auto_rc=$?
+    if (( _no_auto_rc != 0 )); then
+      # codex r1 BLOCKING (mirror): the --no-auto-install gap path is
+      # the same fail-loud contract — emit structured tokens before
+      # die. The inner check itself does not have per-plugin context
+      # at this layer; the aggregate summary suffices.
+      _bridge_plugins_emit_seed_failure_tokens "no-auto-install-gap" "channel-required" "$_no_auto_rc"
+      bridge_die "agb plugins seed: --no-auto-install set, but one or more channel-required plugins have node_modules=missing. See output above. Resolve manually (e.g. \`cd <plugin_dir> && bun install\`) then re-run \`agb plugins seed --marketplace-root $marketplace_root\`."
+    fi
   fi
 
   # ----- L1 wave 2 propagation steps (beta20, 2026-05-25) -----
@@ -418,6 +438,23 @@ bridge_plugins_cmd_seed() {
   printf '[ok] seeded %s (installed_plugins.json present)\n' "$plugins_cache"
 }
 
+# #1250 (beta3, codex r1 BLOCKING): emit a single structured failure
+# token line that operators and CI can grep for. Documented contract in
+# the smoke `B-beta3-1249-1250-plugin-ux.sh` header lines 13-17.
+# Shape (single line, space-separated tokens):
+#   seed_status=incomplete node_modules=install_failed \
+#     plugin=<name> criticality=<channel-required|optional> rc=<N>
+# Emitted BEFORE every bridge_die in the auto-install pass + caller
+# wrapper. The per-plugin loop emits one line per failing plugin; the
+# caller die emits a summary line with plugin=<aggregate-or-unknown>.
+_bridge_plugins_emit_seed_failure_tokens() {
+  local plugin="${1:-unknown}"
+  local criticality="${2:-channel-required}"
+  local rc="${3:-1}"
+  printf '%s\n' \
+    "seed_status=incomplete node_modules=install_failed plugin=$plugin criticality=$criticality rc=$rc"
+}
+
 # #1250 (beta3): inspect bridge-dev-plugin-cache.py sync output, identify
 # plugins whose status verified BUT node_modules=missing AND the plugin
 # source declares deps (package.json with dependencies / lockfile), then
@@ -484,16 +521,21 @@ bridge_plugins_seed_auto_install_node_modules() {
   if [[ -z "$bun_bin" && -z "$npm_bin" ]]; then
     # Anything channel-required → fail. Optional-only → warn + continue.
     local has_required=0
+    local _required_plugin=""
     local _row plugin criticality src cache
     while IFS=$'\t' read -r plugin criticality src cache; do
       [[ -n "$plugin" ]] || continue
       if [[ "$criticality" == "channel-required" ]]; then
         has_required=1
+        _required_plugin="$plugin"
         break
       fi
     done <"$_rows_tmp"
     if (( has_required == 1 )); then
       bridge_warn "[plugins-seed] auto-install: bun/npm not on PATH but a channel-required plugin needs node_modules. Install bun (curl -fsSL https://bun.sh/install | bash) or pass --no-auto-install."
+      # codex r1 BLOCKING: emit structured token before returning 1 so
+      # the caller die path sees a greppable line in output too.
+      _bridge_plugins_emit_seed_failure_tokens "$_required_plugin" "channel-required" "127"
       rm -f "$_rows_tmp" 2>/dev/null || true
       return 1
     fi
@@ -513,7 +555,10 @@ bridge_plugins_seed_auto_install_node_modules() {
     [[ -n "$plugin" ]] || continue
     [[ -d "$src" ]] || {
       bridge_warn "[plugins-seed] auto-install: source dir missing for $plugin: $src — skipping"
-      [[ "$criticality" == "channel-required" ]] && overall_install_failed_required=1
+      if [[ "$criticality" == "channel-required" ]]; then
+        _bridge_plugins_emit_seed_failure_tokens "$plugin" "$criticality" "127"
+        overall_install_failed_required=1
+      fi
       continue
     }
     bridge_info "[plugins-seed] auto-install: node_modules missing for $plugin (criticality=$criticality); auto-installing via ${bun_bin:+bun}${bun_bin:-${npm_bin:+npm}}"
@@ -529,6 +574,10 @@ bridge_plugins_seed_auto_install_node_modules() {
     fi
     if (( install_rc != 0 )); then
       bridge_warn "[plugins-seed] auto-install: $plugin install failed (rc=$install_rc)"
+      # codex r1 BLOCKING: emit structured token BEFORE deciding fail-loud
+      # so even optional-failure paths surface a greppable line. The
+      # caller wrapper still emits its own summary line at die-time.
+      _bridge_plugins_emit_seed_failure_tokens "$plugin" "$criticality" "$install_rc"
       [[ "$criticality" == "channel-required" ]] && overall_install_failed_required=1
       continue
     fi
@@ -592,6 +641,10 @@ bridge_plugins_seed_auto_install_node_modules() {
     [[ -n "$plugin" ]] || continue
     if [[ "$criticality" == "channel-required" ]]; then
       bridge_warn "[plugins-seed] auto-install: $plugin still reports node_modules=missing after auto-install (seed_status=incomplete)"
+      # codex r1 BLOCKING: also emit structured token line for the
+      # post-resync still-missing branch so the contract is uniform
+      # across all failure paths.
+      _bridge_plugins_emit_seed_failure_tokens "$plugin" "$criticality" "1"
       still_failed_required=1
     else
       bridge_warn "[plugins-seed] auto-install: optional plugin $plugin still has node_modules=missing (seed_status=incomplete, criticality=optional — continuing)"
