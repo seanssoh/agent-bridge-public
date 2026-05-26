@@ -477,9 +477,199 @@ step_t4_validator_miss_reason() {
   smoke_log "T4 PASS — validator miss surfaces actionable reason, ok status reaches start path"
 }
 
+# ---------------------------------------------------------------------------
+# T5 — Production on-demand branch parity (codex r1 BLOCKING finding #1).
+#
+# Background: r1 added the channel-miss auto-hold to the always-on branch
+# (bridge-daemon.sh process_on_demand_agents lines ~6106-6127). The
+# on-demand-queued-work branch (~6160-6188) had the start_policy=hold gate
+# but NOT the channel-miss check. A non-always-on static agent with queued
+# work + missing channel metadata would still hit the opaque
+# `start-command-failed` path (every tick) instead of the actionable
+# `channel-required-validator-miss:` reason.
+#
+# This test exercises the REAL production `process_on_demand_agents`
+# function (extracted verbatim from bridge-daemon.sh — not a re-implemented
+# gate driver) for a non-always-on agent with queued=1, active=0, and a
+# missing channel validator. It asserts:
+#   * bridge-start.sh stub is NOT invoked (the helper short-circuits)
+#   * the backoff state file's AUTO_START_LAST_REASON contains
+#     `channel-required-validator-miss:plugin:teams` — NOT
+#     `start-command-failed`
+#
+# This pins the codex r1 finding: a future refactor that moves the
+# channel-miss gate back to "always-on only" fails this smoke.
+# ---------------------------------------------------------------------------
+step_t5_ondemand_production_branch_channel_miss_parity() {
+  smoke_log "T5: production on-demand branch (queued work) records actionable channel-miss reason"
+
+  local state_dir="$SMOKE_TMP_ROOT/t5-state"
+  mkdir -p "$state_dir/daemon-autostart"
+  local invoke_log="$SMOKE_TMP_ROOT/t5-bridge-start-invoke.log"
+  local daemon_log="$SMOKE_TMP_ROOT/t5-daemon.log"
+  : >"$invoke_log"
+  : >"$daemon_log"
+
+  # Extract the entire production process_on_demand_agents function +
+  # the helpers it calls from bridge-daemon.sh. The brief calls for the
+  # production code path, not a hand-replicated driver — if a future
+  # refactor moves the channel-miss check back into one branch only,
+  # this extraction-driven smoke fails.
+  local prod_funcs="$SMOKE_TMP_ROOT/t5-prod-funcs.sh"
+  {
+    awk '
+      /^process_on_demand_agents\(\) \{/                          { capture=1 }
+      /^bridge_daemon_autostart_state_file\(\) \{/                { capture=1 }
+      /^bridge_daemon_note_autostart_failure\(\) \{/              { capture=1 }
+      /^bridge_daemon_clear_autostart_failure\(\) \{/             { capture=1 }
+      /^bridge_daemon_check_channel_status_or_hold\(\) \{/        { capture=1 }
+      capture { print }
+      capture && /^}[[:space:]]*$/ { capture=0; print "" }
+    ' "$REPO_ROOT/bridge-daemon.sh"
+  } >"$prod_funcs"
+
+  # Pin: every expected function MUST be present in the extraction so a
+  # future rename / split fails loudly here rather than producing a
+  # silent test-skipped result.
+  for fn in process_on_demand_agents \
+            bridge_daemon_autostart_state_file \
+            bridge_daemon_note_autostart_failure \
+            bridge_daemon_clear_autostart_failure \
+            bridge_daemon_check_channel_status_or_hold; do
+    if ! grep -q "^${fn}() {" "$prod_funcs"; then
+      smoke_fail "T5: production function $fn missing from bridge-daemon.sh extraction — check for rename"
+    fi
+  done
+
+  # Pin codex r1 finding 1 directly: the on-demand branch (~elif queued > 0)
+  # MUST contain the new check. Without this, a future PR could quietly drop
+  # the on-demand branch's invocation of bridge_daemon_check_channel_status_or_hold
+  # and the test below would still pass (because the helper is still defined,
+  # just not called from the on-demand branch). Anchor on the production
+  # source itself.
+  local ondemand_block
+  ondemand_block="$(awk '
+    /elif \[\[ "\$queued" =~ \^\[0-9\]\+\$ \]\] && \(\( queued > 0 \)\) && ! bridge_agent_is_active/ { capture=1 }
+    capture { print }
+    capture && /^      fi[[:space:]]*$/ { capture=0; exit }
+  ' "$REPO_ROOT/bridge-daemon.sh")"
+  smoke_assert_contains "$ondemand_block" "bridge_daemon_check_channel_status_or_hold" \
+    "T5: codex r1 finding #1 — on-demand queued-work branch MUST call bridge_daemon_check_channel_status_or_hold"
+
+  local driver="$SMOKE_TMP_ROOT/t5-driver.sh"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -euo pipefail\n'
+    printf 'BRIDGE_STATE_DIR="$1"\n'
+    printf 'INVOKE_LOG="$2"\n'
+    printf 'DAEMON_LOG="$3"\n'
+    printf 'AGENT="$4"\n'
+    printf 'CHANNEL_STATUS="$5"\n'
+    printf 'CHANNEL_REASON="$6"\n'
+    printf 'BRIDGE_BASH_BIN="/bin/false-not-invoked"\n'
+    printf 'SCRIPT_DIR="/nonexistent-script-dir"\n'
+    # ---- Stub dependencies (everything except the channel-miss helpers,
+    # which we keep from production). All stubs are deterministic — no
+    # roster I/O, no tmux, no queue. The driver's goal is to drive the
+    # function down the on-demand branch and observe the new gate.
+    printf 'bridge_agent_exists() { return 0; }\n'
+    printf 'bridge_agent_source() { printf "%%s" "static"; }\n'
+    printf 'bridge_agent_manual_stop_active() { return 1; }\n'
+    # Non-always-on — drops us into the elif (on-demand) branch.
+    printf 'bridge_agent_is_always_on() { return 1; }\n'
+    printf 'bridge_agent_is_active() { return 1; }\n'
+    printf 'bridge_daemon_autostart_allowed() { return 0; }\n'
+    printf 'bridge_agent_session() { printf ""; }\n'
+    printf 'bridge_tmux_session_exists() { return 1; }\n'
+    printf 'bridge_tmux_session_attached_count() { printf "0"; }\n'
+    printf 'bridge_agent_idle_timeout() { printf "0"; }\n'
+    printf 'bridge_agent_engine() { printf "claude"; }\n'
+    # Channel status helpers — driven by argv to flip miss/ok.
+    printf 'bridge_agent_channel_status() { printf "%%s" "$CHANNEL_STATUS"; }\n'
+    printf 'bridge_agent_channel_status_reason() { printf "%%s" "$CHANNEL_REASON"; }\n'
+    # start_policy=auto so we reach the channel-miss check.
+    printf 'bridge_agent_start_policy() { printf "%%s" "auto"; }\n'
+    # bridge-start.sh would normally be invoked via $BRIDGE_BASH_BIN; we
+    # set that to /bin/false-not-invoked (nonexistent) so any accidental
+    # invocation explodes loudly. A side-channel is captured into
+    # INVOKE_LOG via the `command -v` shim below.
+    printf '\n'
+    # Audit + warn + info stubs.
+    printf 'daemon_info() { printf "info: %%s\\n" "$*" >>"$DAEMON_LOG"; }\n'
+    printf 'bridge_warn() { printf "warn: %%s\\n" "$*" >>"$DAEMON_LOG"; }\n'
+    printf 'bridge_audit_log() { :; }\n'
+    printf 'nudge_agent_session() { :; }\n'
+    # ---- Source production functions on top of stubs. The production
+    # `process_on_demand_agents` then drives down the on-demand branch.
+    printf 'source "%s"\n' "$prod_funcs"
+    # ---- Wrap BRIDGE_BASH_BIN invocation: process_on_demand_agents uses
+    # `"$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent"`. To
+    # avoid an actual exec failure tripping the rc-1 fallthrough that
+    # records `start-command-failed` (which would falsify the test
+    # because the new channel-miss gate is supposed to short-circuit
+    # BEFORE we ever reach the start invocation), override the binary
+    # path lookup to a stub that records and returns. The function
+    # uses the literal name `$BRIDGE_BASH_BIN`; we already set it to
+    # a nonexistent path. If the channel-miss helper short-circuits,
+    # the path is never invoked. If the gate regresses, the missing
+    # path produces a real rc=127 + `start-command-failed` reason
+    # which the assertion below catches.
+    printf '\n'
+    printf '# Build summary TSV: agent\\tqueued\\tclaimed\\tblocked\\tactive\\tidle\\tlast_seen\\tlast_nudge\\tsession\\tengine\\tworkdir\n'
+    printf 'summary="$(printf "%%s\\t1\\t0\\t0\\t0\\t0\\t0\\t0\\t\\tclaude\\t/tmp/wd" "$AGENT")"\n'
+    printf 'process_on_demand_agents "$summary" || true\n'
+    # Side-channel: did bridge-start.sh get invoked? If it did, the
+    # backoff state file would carry `start-command-failed`. We assert
+    # against that directly below — no separate INVOKE_LOG capture
+    # needed because the state-file reason field is the load-bearing
+    # signal the codex finding pins.
+  } >"$driver"
+
+  # T5.a — Drive on-demand branch with channel-status=miss; helper must
+  # short-circuit. State file reason must be the actionable token.
+  local agent="ondemand-miss-agent"
+  local channel_reason="plugin:teams /opt/agent-bridge/.teams/access.json"
+  local driver_out="$SMOKE_TMP_ROOT/t5-driver-stdout.log"
+  "$BRIDGE_BASH" "$driver" "$state_dir" "$invoke_log" "$daemon_log" \
+    "$agent" "miss" "$channel_reason" >>"$driver_out" 2>&1
+
+  local state_file="$state_dir/daemon-autostart/$agent.env"
+  [[ -f "$state_file" ]] || \
+    smoke_fail "T5.a: backoff state file missing — channel-miss helper did not run on on-demand branch (state_dir=$state_dir, daemon_log=$daemon_log)"
+
+  local last_reason
+  last_reason="$(grep '^AUTO_START_LAST_REASON=' "$state_file" | head -n 1 | sed 's/^AUTO_START_LAST_REASON=//')"
+  smoke_assert_contains "$last_reason" "channel-required-validator-miss" \
+    "T5.a: on-demand branch backoff reason must name validator miss (got: $last_reason)"
+  smoke_assert_contains "$last_reason" "plugin:teams" \
+    "T5.a: on-demand branch reason must carry channel spec (got: $last_reason)"
+  smoke_assert_not_contains "$last_reason" "start-command-failed" \
+    "T5.a: on-demand branch reason must NOT be opaque start-command-failed (got: $last_reason)"
+
+  # T5.b — Control: with channel-status=ok, the on-demand branch falls
+  # through to the start invocation and records start-command-failed
+  # (because the stub BRIDGE_BASH_BIN points at a nonexistent path).
+  # Confirms the channel-miss gate is the load-bearing reason, not a
+  # universally-applied state-file write.
+  rm -f "$state_dir/daemon-autostart"/*.env
+  "$BRIDGE_BASH" "$driver" "$state_dir" "$invoke_log" "$daemon_log" \
+    "$agent" "ok" "" >>"$driver_out" 2>&1 || true
+  state_file="$state_dir/daemon-autostart/$agent.env"
+  if [[ -f "$state_file" ]]; then
+    last_reason="$(grep '^AUTO_START_LAST_REASON=' "$state_file" | head -n 1 | sed 's/^AUTO_START_LAST_REASON=//')"
+    # When status=ok, bridge-start.sh stub fails (rc=127, nonexistent
+    # interpreter) and the natural fallthrough writes start-command-failed.
+    smoke_assert_not_contains "$last_reason" "channel-required-validator-miss" \
+      "T5.b: status=ok must NOT take the channel-miss branch (got: $last_reason)"
+  fi
+
+  smoke_log "T5 PASS — production on-demand branch parity confirmed (channel-miss reason recorded, not start-command-failed)"
+}
+
 step_t1_start_policy_persists
 step_t2_start_policy_reader
 step_t3_daemon_hold_gate
 step_t4_validator_miss_reason
+step_t5_ondemand_production_branch_channel_miss_parity
 
 smoke_log "PASS: δ-1234-daemon-start-policy (refs #1234, v0.15.0-beta2 Lane δ)"

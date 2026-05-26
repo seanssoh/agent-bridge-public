@@ -3738,6 +3738,35 @@ bridge_daemon_clear_autostart_failure() {
   rm -f "$(bridge_daemon_autostart_state_file "$agent")"
 }
 
+# Issue #1234 (Lane δ, v0.15.0-beta2) — codex r1 BLOCKING parity fix:
+# Detect channel-required validator miss and record an actionable
+# backoff reason instead of letting the daemon spam
+# `start-command-failed` on every tick. Used by BOTH the always-on
+# branch and the on-demand-queued-work branch in
+# `process_on_demand_agents` so the operator-visible reason
+# (`channel-required-validator-miss: <actual reason>`) is identical
+# regardless of which loop triggered the wake attempt.
+#
+# Returns 0 when the gate held (caller MUST `continue` past the
+# start-command invocation); returns 1 when the channel status is
+# anything other than `miss` (caller proceeds with `bridge-start.sh`).
+bridge_daemon_check_channel_status_or_hold() {
+  local agent="$1"
+  local _channel_status _channel_reason
+  _channel_status="$(bridge_agent_channel_status "$agent" 2>/dev/null || printf '%s' "-")"
+  if [[ "$_channel_status" == "miss" ]]; then
+    _channel_reason="$(bridge_agent_channel_status_reason "$agent" 2>/dev/null || printf '')"
+    [[ -n "$_channel_reason" ]] || _channel_reason="setup incomplete"
+    # First-class reason string the operator can act on. Persists via
+    # the backoff state file so subsequent ticks honor the backoff
+    # window and the daemon log doesn't spam.
+    bridge_daemon_note_autostart_failure "$agent" \
+      "channel-required-validator-miss: ${_channel_reason}"
+    return 0
+  fi
+  return 1
+}
+
 # Issue #4795: sweep orphan auto-start backoff state files. When an agent
 # is removed from the roster (`agent delete` / `agent retire`) the daemon's
 # per-agent `daemon-autostart/<agent>.env` file is left behind. The
@@ -6112,20 +6141,9 @@ process_on_demand_agents() {
         # state so the next-retry window suppresses log spam. The miss
         # status itself is already surfaced by `agent show` /
         # `restart_readiness`; this loop just stops adding to the noise.
-        local _channel_status _channel_reason
-        _channel_status="$(bridge_agent_channel_status "$agent" 2>/dev/null || printf '%s' "-")"
-        if [[ "$_channel_status" == "miss" ]]; then
-          _channel_reason="$(bridge_agent_channel_status_reason "$agent" 2>/dev/null || printf '')"
-          [[ -n "$_channel_reason" ]] || _channel_reason="setup incomplete"
-          # First-class reason string the operator can act on. Persists
-          # via the backoff state file so subsequent ticks honor the
-          # backoff window and the daemon log doesn't spam.
-          bridge_daemon_note_autostart_failure "$agent" \
-            "channel-required-validator-miss: ${_channel_reason}"
-          unset _channel_status _channel_reason
+        if bridge_daemon_check_channel_status_or_hold "$agent"; then
           continue
         fi
-        unset _channel_status _channel_reason
         # Engine-binary preflight: if the agent's engine CLI is absent
         # from PATH, every restart attempt will exit 127 within
         # milliseconds and the daemon would spam
@@ -6170,6 +6188,21 @@ process_on_demand_agents() {
           continue
         fi
         unset _start_policy_od
+        # Issue #1234 (Lane δ, v0.15.0-beta2) — codex r1 BLOCKING parity:
+        # mirror the always-on branch's channel-required validator-miss
+        # auto-hold so a queued-on-demand wake against an agent whose
+        # required channel metadata is absent records the actionable
+        # `channel-required-validator-miss:<channel> <path>` reason
+        # rather than the opaque `start-command-failed` (the prior
+        # behavior here, before this guard, exactly mirrored the bug
+        # the always-on branch fixed in r1: bridge-start.sh would have
+        # been invoked, failed inside the same validator, and the
+        # daemon log would spam `start-command-failed` on every tick).
+        # Refuses to call bridge-start.sh on miss — bridge-start.sh
+        # would only re-fail at the same validator.
+        if bridge_daemon_check_channel_status_or_hold "$agent"; then
+          continue
+        fi
         if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
           session="$(bridge_agent_session "$agent")"
           timeout="$(bridge_agent_idle_timeout "$agent")"
