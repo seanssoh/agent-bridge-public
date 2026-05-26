@@ -6,6 +6,82 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.14.5-beta27] — 2026-05-26
+
+### Highlight — 5-track backlog closure via 3-lane parallel dispatch
+
+Operator-cued 2026-05-26 01:58 KST verbatim "일단 저 백로그들 다 꼼꼼히 개발해서 새 베타버전 쉽 하라고 전달해줘". 5 backlog items shipped via 3-lane parallel fixer dispatch (Sean's earlier engineering question about parallel stability handled with lane-bundling to avoid same-file conflicts: Lane 1 = A, Lane 2 = B+C ms365 bundle, Lane 3 = D+E hooks bundle). 3 PRs (#1217 + #1219 + #1220) merged sequentially with codex pair-review per lane.
+
+`-beta27` prerelease; matching tag `v0.14.5-beta27`, GitHub release marked **Pre-release**. Stay on beta per Sean's standing rule. Track F (daemon supp-groups self-refresh) deferred to v0.15.0 dedicated wave.
+
+### Removed — #1204 D1 TEAMS_DELIVERY_MODE 완전 제거 (Lane 1, PR #1217)
+
+Sean's directive verbatim 2026-05-25 17:22 UTC: "지워버려 필요 없는 모드잖아."
+
+Full removal from `plugins/teams/server.ts`:
+- `resolveDeliveryMode()` + supporting `DeliveryMode` type + warning at `:171-190`
+- `handleActivity` bridge/both branching at `:1133-1227` replaced with unconditional `await mcp.notification(...)` (direct MCP push) + existing retry-on-failure
+- Legacy `TEAMS_BRIDGE_MODE/AGENT` warning at `:171-174`
+- Dead `deliverViaBridgeQueue()`, `truncateForTitle()`, `buildChannelMeta()` removed
+- Dead Node imports removed: `mkdtempSync`, `rmdirSync`, `tmpdir`
+
+`plugins/teams/README.md:156-168` Delivery Mode section replaced with one-liner "Inbound delivery via direct MCP push — no configuration required."
+
+`scripts/smoke/launch-dev-channels-injection.sh` updated: removed `assert_explicit_teams_delivery_mode_is_preserved`, added `assert_teams_delivery_mode_source_grep_gate` that enforces `git grep -i 'TEAMS_DELIVERY_MODE'` is empty outside CHANGELOG. Latent bug bonus: `scripts/smoke-test.sh` stale `assert_contains "ignoring deprecated TEAMS_BRIDGE_MODE"` (string source never shipped) replaced with two anti-presence checks.
+
+Net deletion: +57 / -243 across 4 files.
+
+### Fixed — #1209 MS365 redirect URI fail-loud + setup wizard (Lane 2, PR #1220)
+
+**Root cause**: `plugins/ms365/server.ts` defaulted `REDIRECT_URI` to `http://localhost:3978/auth/callback`. Any non-localhost deployment hit `AADSTS50011` at first OAuth click. No setup wizard prompted for the correct URI.
+
+- **`plugins/ms365/server.ts`** — new `resolveRedirectUri()` priority: explicit non-localhost → returned; explicit localhost + `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` → returned (local-dev escape hatch); else fail-loud throw naming `agent-bridge setup ms365 <agent>`. `startAuthCode` now takes redirectUri as parameter (defense in depth). Both `pair_start` and `exchangeAuthCode` call the resolver.
+- **`bridge-setup.py`** — new `inspect_ms365_dir()`, `derive_ms365_redirect_uri()`, `print_ms365_result()`, `cmd_ms365()`, `ms365_parser`. Wizard resolves redirect URI from 5 sources in priority: explicit `--redirect-uri`, `--messaging-endpoint`, `.teams/state.json.validation.messaging_endpoint` (per codex's data-source correction — runtime `TEAMS_MESSAGING_ENDPOINT` env is not propagated), interactive prompt, existing `.ms365/.env`. Uses `_isolation_aware_mkdir(mode=0o2770)` + `_isolation_aware_save_text(mode=0o600)` per beta26 #1208/#1215 lessons.
+- **R2 narrow fix** (codex r1 BLOCKING): setup wizard rerun must preserve `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` line. `inspect_ms365_dir()` reads the flag; `cmd_ms365()` reconstructs with strict-eq "1" match (aligns with runtime `=== '1'`); env_lines reconstruction appends the flag immediately after `MS365_REDIRECT_URI=`. Plus optional `--allow-localhost` CLI flag for cleaner first-time setup.
+- **`bridge-setup.sh`** — `run_ms365()` mirroring `run_teams()` shape; usage block, sub-command help, dispatch case, suggestion list.
+
+Migration impact: existing agents with unset or localhost `MS365_REDIRECT_URI` will fail-loud at next `pair_start`. Recovery: `agent-bridge setup ms365 <agent>` (Track B wizard) or manual `.ms365/.env` edit or `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` for local dev.
+
+### Fixed — #1210 MS365 scope quote normalization (Lane 2, PR #1220)
+
+**Root cause**: `plugins/ms365/server.ts` `pair_start` passed `String(args.scopes ?? DEFAULT_SCOPES)` directly into `URLSearchParams`. Quoted env/arg values flowed through and became `%22...%22` in `authorize_url`, triggering `AADSTS70011: scope ... is not valid` on Azure.
+
+- New `normalizeScopes(raw: string): string` helper trims whitespace, strips one matching outer quote pair (single or double), splits on whitespace, rejoins with single space. Applied at pair_start handler before URLSearchParams.
+
+Per codex's r1 KEY FINDING: this was NOT a URLSearchParams swap (beta26 already used URLSearchParams correctly). The bug was input-side normalization.
+
+### Fixed — `BRIDGE_AGENT_INJECT_TIMESTAMP` assoc-array/scalar collision (Lane 3, PR #1219)
+
+**Root cause**: same class of bug as beta26 #1213. `bridge-run.sh:212-228` exported `BRIDGE_AGENT_INJECT_TIMESTAMP` as a scalar after `lib/bridge-core.sh` had already declared it as `declare -g -A` (associative array). Bash silently writes to `NAME[0]` and refuses to export the assoc array. Child claude env had no `BRIDGE_AGENT_INJECT_TIMESTAMP` entry. The inject-timestamp feature defaulted to enabled (silent fail-open) regardless of operator's set value.
+
+- **`bridge-run.sh`** — added `export BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED="$(bridge_agent_inject_timestamp "$AGENT")"` alongside the existing silent-no-op bare export. Matches the existing `BRIDGE_AGENT_CLASS_FOR_HOOK` scalar-alias pattern. Stale "deferred" comment updated.
+- **`hooks/bridge_hook_common.py`** — `agent_timestamp_enabled()` reads `BRIDGE_AGENT_INJECT_TIMESTAMP_RESOLVED` first, falls back to bare `BRIDGE_AGENT_INJECT_TIMESTAMP` for manual/non-bridge launches.
+- Assoc array at `lib/bridge-core.sh:829, 867` NOT renamed or unset (breaking downstream array readers would re-introduce #1213-class regression).
+
+### Added — hook PermissionError audit telemetry (Lane 3, PR #1219)
+
+Adjacent fail-open audit for 2 marker writer sites in the hook tree (patch-dev #1205 deep-dive carryover):
+
+- **`hooks/pre-compact.py:_write_started_marker()`** — wraps marker write sequence with `try/except (PermissionError, OSError)` BEFORE the existing outer `except Exception`. Under `under_isolated_uid()` → emits `write_audit("hook_permission_fail_open.precompact.started_marker", ...)` + returns. Else re-raises (caught by outer swallow → existing exit-0 behavior preserved).
+- **`hooks/session_start.py:_write_compact_completed_marker()`** — same pattern with audit name `hook_permission_fail_open.session_start.completed_marker`.
+
+Codex r1 adjudicated interpretation (a): preserve outer silent-swallow + add iso-only audit telemetry. Smaller blast radius, matches hook UX goal. Smoke verifies controller side emits NO audit (proving inner re-raise path taken) while function still returns cleanly.
+
+### Added — 4 new regression smokes
+
+- `scripts/smoke/1209-ms365-redirect-resolver.sh` — **16 tests** (12 base + 4 R2 ALLOW_LOCALHOST preservation): resolver priority table, Python wizard derivation from all 5 sources, bash wrapper help, `.ms365` dir mode 02770 + file mode 0600 regression, ALLOW preservation on rerun, CLI flag, strict-eq matching.
+- `scripts/smoke/1210-ms365-scope-normalize.sh` — 8 tests: quoted env, single-quoted env, whitespace collapse, plain round-trip, args.scopes path, full authorize_url shape (no `"` / no `%22`).
+- `scripts/smoke/beta27-D-inject-timestamp-resolved.sh` — 13 tests: assoc-array no-op reproducer, RESOLVED scalar propagation, fallback for manual context, RESOLVED=0 makes `agent_timestamp_enabled()` False.
+- `scripts/smoke/beta27-E-hook-permission-fail-open-markers.sh` — 5 tests: iso UID + force PermissionError → exit 0, no traceback, audit event recorded; controller UID → exit 0, no traceback (outer swallow), NO audit event.
+
+All 4 registered in path-arm triggers AND `add_all_required_static`.
+
+### Notes
+
+- **Track F (daemon supp-groups self-refresh)** — deferred to v0.15.0 dedicated wave. Medium-high risk (touches OS state: sudoers OR systemd-user unit + daemon SIGHUP handler). Beta26 already added a "daemon_group_refresh: manual-required-systemd-unit-stale" warning so operators know what to do meanwhile.
+- **`BRIDGE_AGENT_OS_USER`** — same-class assoc-array/scalar collision as fixed Track D, but codex grep confirmed no Python hook consumer exists (shell code reads the assoc array directly). Left in place; not a runtime issue.
+- v0.14.5 GA promotion remains a separate operator-cued decision (durable rule).
+
 ## [0.14.5-beta26] — 2026-05-26
 
 ### Highlight — 4-track OOTB clean closure
