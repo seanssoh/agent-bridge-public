@@ -26,14 +26,21 @@ usage() {
   local prog
   prog="$(basename "$0")"
   printf 'Usage:\n'
-  printf '  %s seed [--marketplace-root <path>] [--channels <csv>] [--dry-run] [--no-iso-chmod]\n' "$prog"
+  printf '  %s seed [--marketplace-root <path>] [--channels <csv>] [--dry-run] [--no-iso-chmod] [--no-auto-install]\n' "$prog"
+  printf '  %s add-marketplace <repo-url-or-path> [--channels <csv>] [--no-iso-chmod] [--no-auto-install]\n' "$prog"
   printf '  %s show [--json]\n' "$prog"
   printf '  %s list [--json]\n' "$prog"
   printf '  %s marketplaces [--json]\n' "$prog"
+  printf '  %s help [install]\n' "$prog"
   printf '\n'
   printf 'Seed populates the v2 shared plugin catalog at\n'
   printf '$BRIDGE_SHARED_ROOT/plugins-cache/ from the in-repo agent-bridge\n'
   printf 'marketplace (or --marketplace-root <path> for an external marketplace).\n'
+  printf '\n'
+  printf 'Add-marketplace is an integrated verb that clones (URL) or\n'
+  printf 'registers (path) an external marketplace, runs seed, and applies\n'
+  printf 'the iso v2 shared-cache chmod (mode 2770 + chgrp ab-shared). One\n'
+  printf 'command replaces the 5-step claude+agb dance for iso v2 agents.\n'
   printf '\n'
   printf 'Show prints the resolved shared-catalog state (root path, populated\n'
   printf 'status, manifest plugin count).\n'
@@ -46,6 +53,15 @@ usage() {
   printf '$BRIDGE_SHARED_ROOT/plugins-cache/known_marketplaces.json\n'
   printf '(id, source.kind, source.path). Empty catalog → empty list.\n'
   printf '\n'
+  printf 'Help renders an advisory for `claude plugin install` users (the\n'
+  printf 'controller-side install does NOT propagate to iso v2 agents — use\n'
+  printf '`agb plugins seed` or `agb plugins add-marketplace` to mirror).\n'
+  printf '\n'
+  printf '%s\n' '--no-auto-install opts seed/add-marketplace out of the automatic'
+  printf '%s\n' '`bun install` pass that resolves a plugin'"'"'s node_modules when its'
+  printf '%s\n' 'package.json declares deps but the dir is missing. Use for'
+  printf '%s\n' 'air-gapped environments where the operator manages deps manually.'
+  printf '\n'
   printf 'Requires BRIDGE_LAYOUT=v2 with BRIDGE_DATA_ROOT + BRIDGE_SHARED_ROOT\n'
   printf 'resolved by the layout resolver.\n'
   printf '\n'
@@ -55,6 +71,10 @@ usage() {
   printf '\n'
   printf '  # Seed a specific subset of plugins\n'
   printf '  %s seed --channels plugin:teams@agent-bridge,plugin:ms365@agent-bridge\n' "$prog"
+  printf '\n'
+  printf '  # Add a new external marketplace (clone+register+seed+chmod)\n'
+  printf '  %s add-marketplace https://github.com/me/my-marketplace --channels plugin:cosmax-crm,plugin:cosmax-ep-approval\n' "$prog"
+  printf '  %s add-marketplace /path/to/local/marketplace\n' "$prog"
   printf '\n'
   printf '  # Inspect current shared-catalog state\n'
   printf '  %s show --json\n' "$prog"
@@ -136,6 +156,7 @@ bridge_plugins_cmd_seed() {
   local channels_csv=""
   local dry_run=0
   local no_iso_chmod=0
+  local no_auto_install=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --marketplace-root)
@@ -159,6 +180,17 @@ bridge_plugins_cmd_seed() {
         # then needs an alternative read path (named-user ACL or a
         # symlink under $BRIDGE_HOME/plugins owned by the controller).
         no_iso_chmod=1
+        shift
+        ;;
+      --no-auto-install)
+        # #1250 (beta3): opt out of the automatic `bun install` pass that
+        # resolves a plugin's node_modules when its package.json declares
+        # deps but node_modules is missing. Air-gapped environments
+        # where the operator pre-stages node_modules out-of-band use
+        # this flag. When set, a missing node_modules + declared deps
+        # still produces seed_status=incomplete on channel-required
+        # plugins (fail-loud), but the auto-install step is skipped.
+        no_auto_install=1
         shift
         ;;
       -h|--help)
@@ -244,6 +276,54 @@ bridge_plugins_cmd_seed() {
 
   if [[ ! -f "$plugins_cache/installed_plugins.json" ]]; then
     bridge_die "agb plugins seed: sync completed but $plugins_cache/installed_plugins.json was not written. This usually means every channel was filtered out (check --channels CSV) or the marketplace at $marketplace_root has no resolvable plugins."
+  fi
+
+  # ----- #1250 (beta3): node_modules auto-install --------------------------
+  # The sync output enumerates per-plugin status lines that include
+  # `node_modules=<status>` + `criticality=<channel-required|optional>`.
+  # When a plugin declares deps (package.json with `dependencies` /
+  # `peerDependencies`, or a bun.lock / package-lock.json present) but
+  # node_modules is missing, the sync silently leaves the cache in an
+  # incomplete state — operators see a passing seed but the iso UID's
+  # MCP spawn fails at first start with "Cannot find module ...".
+  #
+  # Default behavior: run `bun install` (or `npm install` fallback) in the
+  # plugin's SOURCE dir, then re-run the sync for the affected channels
+  # so the cache picks up the freshly-installed node_modules. Failure
+  # mode: fail-loud (bridge_die) when any channel-required plugin still
+  # has node_modules=missing after the install pass; warn + continue
+  # for criticality=optional. --no-auto-install opts out entirely.
+  if (( no_auto_install == 0 )); then
+    local _auto_install_rc=0
+    bridge_plugins_seed_auto_install_node_modules \
+      "$marketplace_root" "$plugins_cache" "$cache_root" "$channels_csv" \
+      "$output" \
+      || _auto_install_rc=$?
+    if (( _auto_install_rc != 0 )); then
+      # codex r1 BLOCKING: emit summary structured token BEFORE die so
+      # operators + CI grep see the contract documented in the smoke
+      # B-beta3-1249-1250-plugin-ux.sh header (seed_status=incomplete +
+      # node_modules=install_failed + criticality=channel-required).
+      # The inner function already emitted per-plugin tokens; this is
+      # the aggregate summary at the wrapper die-site.
+      _bridge_plugins_emit_seed_failure_tokens "auto-install" "channel-required" "$_auto_install_rc"
+      bridge_die "agb plugins seed: node_modules auto-install pass failed — see output above. Re-run with --no-auto-install to skip the auto-install step (operator must then resolve deps manually), or fix the underlying error (bun not on PATH, dep resolution failure, missing lockfile) and re-run."
+    fi
+  else
+    # When --no-auto-install is set, still fail-loud on channel-required
+    # plugins whose node_modules is missing — operators must know about
+    # the gap. The check parses the same sync output.
+    local _no_auto_rc=0
+    bridge_plugins_seed_check_no_auto_install_gap "$output" \
+      || _no_auto_rc=$?
+    if (( _no_auto_rc != 0 )); then
+      # codex r1 BLOCKING (mirror): the --no-auto-install gap path is
+      # the same fail-loud contract — emit structured tokens before
+      # die. The inner check itself does not have per-plugin context
+      # at this layer; the aggregate summary suffices.
+      _bridge_plugins_emit_seed_failure_tokens "no-auto-install-gap" "channel-required" "$_no_auto_rc"
+      bridge_die "agb plugins seed: --no-auto-install set, but one or more channel-required plugins have node_modules=missing. See output above. Resolve manually (e.g. \`cd <plugin_dir> && bun install\`) then re-run \`agb plugins seed --marketplace-root $marketplace_root\`."
+    fi
   fi
 
   # ----- L1 wave 2 propagation steps (beta20, 2026-05-25) -----
@@ -356,6 +436,264 @@ bridge_plugins_cmd_seed() {
     || bridge_warn "[plugins seed] iso known_marketplaces.json propagation: non-fatal failure (continuing)"
 
   printf '[ok] seeded %s (installed_plugins.json present)\n' "$plugins_cache"
+}
+
+# #1250 (beta3, codex r1 BLOCKING): emit a single structured failure
+# token line that operators and CI can grep for. Documented contract in
+# the smoke `B-beta3-1249-1250-plugin-ux.sh` header lines 13-17.
+# Shape (single line, space-separated tokens):
+#   seed_status=incomplete node_modules=install_failed \
+#     plugin=<name> criticality=<channel-required|optional> rc=<N>
+# Emitted BEFORE every bridge_die in the auto-install pass + caller
+# wrapper. The per-plugin loop emits one line per failing plugin; the
+# caller die emits a summary line with plugin=<aggregate-or-unknown>.
+_bridge_plugins_emit_seed_failure_tokens() {
+  local plugin="${1:-unknown}"
+  local criticality="${2:-channel-required}"
+  local rc="${3:-1}"
+  printf '%s\n' \
+    "seed_status=incomplete node_modules=install_failed plugin=$plugin criticality=$criticality rc=$rc"
+}
+
+# #1250 (beta3): inspect bridge-dev-plugin-cache.py sync output, identify
+# plugins whose status verified BUT node_modules=missing AND the plugin
+# source declares deps (package.json with dependencies / lockfile), then
+# run `bun install` in the source dir, then re-sync the affected channels
+# so the cache refresh picks up node_modules.
+#
+# Args:
+#   $1 — marketplace_root (canonicalized absolute path)
+#   $2 — plugins_cache ($BRIDGE_SHARED_ROOT/plugins-cache)
+#   $3 — cache_root ($plugins_cache/cache)
+#   $4 — channels_csv used in the original seed pass
+#   $5 — the sync output text (full stdout+stderr) from the first sync
+#
+# Return: 0 on success (including the no-op case where nothing needs
+#         install); non-zero when one or more channel-required plugins
+#         still have node_modules=missing after the install pass, or
+#         when bun is not on PATH but a channel-required plugin needs
+#         install. Caller turns non-zero into `bridge_die`.
+bridge_plugins_seed_auto_install_node_modules() {
+  local marketplace_root="$1"
+  local plugins_cache="$2"
+  local cache_root="$3"
+  local channels_csv="$4"
+  local sync_output="$5"
+
+  local _output_tmp
+  _output_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-seed-sync-out.XXXXXX")" \
+    || { bridge_warn "[plugins-seed] auto-install: mktemp failed"; return 1; }
+  printf '%s' "$sync_output" >"$_output_tmp"
+
+  local _rows_tmp
+  _rows_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-seed-needs-install.XXXXXX")" \
+    || { rm -f "$_output_tmp"; bridge_warn "[plugins-seed] auto-install: mktemp failed"; return 1; }
+
+  # File-as-argv per footgun #11 — the helper reads the sync output
+  # from disk, not stdin. The output is TSV: plugin\tcriticality\tsource\tcache
+  if ! python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-seed-parse-sync-output.py" \
+        "$_output_tmp" >"$_rows_tmp" 2>/dev/null; then
+    bridge_warn "[plugins-seed] auto-install: parser helper failed — skipping auto-install (re-run with --no-auto-install if expected)"
+    rm -f "$_output_tmp" "$_rows_tmp" 2>/dev/null || true
+    return 0
+  fi
+  rm -f "$_output_tmp" 2>/dev/null || true
+
+  if [[ ! -s "$_rows_tmp" ]]; then
+    # No plugins need install — fast path.
+    rm -f "$_rows_tmp" 2>/dev/null || true
+    return 0
+  fi
+
+  # Resolve bun (or npm fallback). When neither is available and at least
+  # one channel-required plugin needs install, fail-loud.
+  local bun_bin="" npm_bin=""
+  if command -v bridge_resolve_bun_executable >/dev/null 2>&1; then
+    bun_bin="$(bridge_resolve_bun_executable 2>/dev/null || true)"
+  fi
+  if [[ -z "$bun_bin" ]]; then
+    bun_bin="$(command -v bun 2>/dev/null || true)"
+  fi
+  if [[ -z "$bun_bin" ]]; then
+    npm_bin="$(command -v npm 2>/dev/null || true)"
+  fi
+
+  if [[ -z "$bun_bin" && -z "$npm_bin" ]]; then
+    # Anything channel-required → fail. Optional-only → warn + continue.
+    local has_required=0
+    local _required_plugin=""
+    local _row plugin criticality src cache
+    while IFS=$'\t' read -r plugin criticality src cache; do
+      [[ -n "$plugin" ]] || continue
+      if [[ "$criticality" == "channel-required" ]]; then
+        has_required=1
+        _required_plugin="$plugin"
+        break
+      fi
+    done <"$_rows_tmp"
+    if (( has_required == 1 )); then
+      bridge_warn "[plugins-seed] auto-install: bun/npm not on PATH but a channel-required plugin needs node_modules. Install bun (curl -fsSL https://bun.sh/install | bash) or pass --no-auto-install."
+      # codex r1 BLOCKING: emit structured token before returning 1 so
+      # the caller die path sees a greppable line in output too.
+      _bridge_plugins_emit_seed_failure_tokens "$_required_plugin" "channel-required" "127"
+      rm -f "$_rows_tmp" 2>/dev/null || true
+      return 1
+    fi
+    bridge_warn "[plugins-seed] auto-install: bun/npm not on PATH; skipping install for optional plugins. Re-run with bun installed when you want full deps."
+    rm -f "$_rows_tmp" 2>/dev/null || true
+    return 0
+  fi
+
+  # Run the install pass. Collect the list of affected channels so we
+  # can re-sync once afterwards (single re-sync, not per-plugin, to
+  # keep the audit log compact and avoid N round-trips into the
+  # dev-plugin-cache helper).
+  local -a affected_channels=()
+  local _row plugin criticality src cache install_rc=0
+  local overall_install_failed_required=0
+  while IFS=$'\t' read -r plugin criticality src cache; do
+    [[ -n "$plugin" ]] || continue
+    [[ -d "$src" ]] || {
+      bridge_warn "[plugins-seed] auto-install: source dir missing for $plugin: $src — skipping"
+      if [[ "$criticality" == "channel-required" ]]; then
+        _bridge_plugins_emit_seed_failure_tokens "$plugin" "$criticality" "127"
+        overall_install_failed_required=1
+      fi
+      continue
+    }
+    bridge_info "[plugins-seed] auto-install: node_modules missing for $plugin (criticality=$criticality); auto-installing via ${bun_bin:+bun}${bun_bin:-${npm_bin:+npm}}"
+    install_rc=0
+    if [[ -n "$bun_bin" ]]; then
+      if [[ -f "$src/bun.lock" || -f "$src/bun.lockb" ]]; then
+        ( cd "$src" && "$bun_bin" install --frozen-lockfile --no-summary >&2 ) || install_rc=$?
+      else
+        ( cd "$src" && "$bun_bin" install --no-summary >&2 ) || install_rc=$?
+      fi
+    else
+      ( cd "$src" && "$npm_bin" install --no-audit --no-fund >&2 ) || install_rc=$?
+    fi
+    if (( install_rc != 0 )); then
+      bridge_warn "[plugins-seed] auto-install: $plugin install failed (rc=$install_rc)"
+      # codex r1 BLOCKING: emit structured token BEFORE deciding fail-loud
+      # so even optional-failure paths surface a greppable line. The
+      # caller wrapper still emits its own summary line at die-time.
+      _bridge_plugins_emit_seed_failure_tokens "$plugin" "$criticality" "$install_rc"
+      [[ "$criticality" == "channel-required" ]] && overall_install_failed_required=1
+      continue
+    fi
+    # Widen so iso UIDs can read via the controller-side mirror copy.
+    chmod -R go+rX "$src/node_modules" 2>/dev/null \
+      || bridge_warn "[plugins-seed] auto-install: chmod -R go+rX $src/node_modules failed (non-fatal)"
+    # Plugin's matching channel reference uses `<plugin>@<marketplace>`.
+    affected_channels+=("$plugin")
+  done <"$_rows_tmp"
+  rm -f "$_rows_tmp" 2>/dev/null || true
+
+  if (( overall_install_failed_required == 1 )); then
+    bridge_warn "[plugins-seed] auto-install: one or more channel-required plugins failed install — pass --no-auto-install to skip, or fix bun/dep resolution and re-run \`agb plugins seed\`."
+    return 1
+  fi
+
+  if (( ${#affected_channels[@]} == 0 )); then
+    # All install attempts failed but they were all optional — non-fatal.
+    return 0
+  fi
+
+  # Re-sync the channels we just installed. We pass the FULL original
+  # channels_csv (not just the affected subset) so the post-sync output
+  # remains an accurate snapshot of the whole catalog.
+  local _resync_rc=0
+  local _resync_output=""
+  _resync_output="$(BRIDGE_CLAUDE_PLUGINS_ROOT="$plugins_cache" \
+            BRIDGE_CLAUDE_PLUGIN_CACHE_ROOT="$cache_root" \
+            python3 "$SCRIPT_DIR/bridge-dev-plugin-cache.py" sync \
+              --channels "$channels_csv" \
+              --required-channels "$channels_csv" \
+              --root "$marketplace_root" \
+              --agent "seed-autoinstall" \
+              2>&1)" || _resync_rc=$?
+  if [[ -n "$_resync_output" ]]; then
+    printf '%s\n' "$_resync_output"
+  fi
+  if (( _resync_rc != 0 )); then
+    bridge_warn "[plugins-seed] auto-install: post-install re-sync failed (rc=$_resync_rc)"
+    return 1
+  fi
+
+  # Re-apply canonical modes so the freshly-cached node_modules trees
+  # land at 2750 dirs / 0640 files under ab-shared.
+  bridge_plugins_apply_canonical_modes "$plugins_cache" || true
+
+  # Final verification: parse the re-sync output and confirm no
+  # channel-required plugin still reports node_modules=missing with
+  # declared deps. Optional plugins that still fail leave a warning but
+  # do not turn the overall pass into a failure.
+  local _verify_tmp _verify_rows
+  _verify_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-seed-verify.XXXXXX")"
+  printf '%s' "$_resync_output" >"$_verify_tmp"
+  _verify_rows="$(mktemp "${TMPDIR:-/tmp}/agb-seed-verify-rows.XXXXXX")"
+  python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-seed-parse-sync-output.py" \
+    "$_verify_tmp" >"$_verify_rows" 2>/dev/null || true
+  rm -f "$_verify_tmp" 2>/dev/null || true
+
+  local still_failed_required=0
+  while IFS=$'\t' read -r plugin criticality src cache; do
+    [[ -n "$plugin" ]] || continue
+    if [[ "$criticality" == "channel-required" ]]; then
+      bridge_warn "[plugins-seed] auto-install: $plugin still reports node_modules=missing after auto-install (seed_status=incomplete)"
+      # codex r1 BLOCKING: also emit structured token line for the
+      # post-resync still-missing branch so the contract is uniform
+      # across all failure paths.
+      _bridge_plugins_emit_seed_failure_tokens "$plugin" "$criticality" "1"
+      still_failed_required=1
+    else
+      bridge_warn "[plugins-seed] auto-install: optional plugin $plugin still has node_modules=missing (seed_status=incomplete, criticality=optional — continuing)"
+    fi
+  done <"$_verify_rows"
+  rm -f "$_verify_rows" 2>/dev/null || true
+
+  if (( still_failed_required == 1 )); then
+    return 1
+  fi
+  return 0
+}
+
+# #1250 (beta3): when --no-auto-install is set, the operator opted out
+# of the install pass. We MUST still fail-loud on a channel-required
+# plugin with node_modules=missing — silent ride-through is the bug the
+# issue is fixing. Same parser as the auto-install branch; rc=non-zero
+# when at least one channel-required row remains.
+bridge_plugins_seed_check_no_auto_install_gap() {
+  local sync_output="$1"
+
+  local _output_tmp _rows_tmp
+  _output_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-seed-noauto-out.XXXXXX")" \
+    || { bridge_warn "[plugins-seed] no-auto-install check: mktemp failed"; return 0; }
+  printf '%s' "$sync_output" >"$_output_tmp"
+  _rows_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-seed-noauto-rows.XXXXXX")" \
+    || { rm -f "$_output_tmp"; return 0; }
+
+  if ! python3 "$SCRIPT_DIR/lib/upgrade-helpers/plugins-seed-parse-sync-output.py" \
+        "$_output_tmp" >"$_rows_tmp" 2>/dev/null; then
+    rm -f "$_output_tmp" "$_rows_tmp" 2>/dev/null || true
+    return 0
+  fi
+  rm -f "$_output_tmp" 2>/dev/null || true
+
+  local plugin criticality src cache has_required=0
+  while IFS=$'\t' read -r plugin criticality src cache; do
+    [[ -n "$plugin" ]] || continue
+    if [[ "$criticality" == "channel-required" ]]; then
+      bridge_warn "[plugins-seed] --no-auto-install: $plugin has node_modules=missing + declared deps (criticality=channel-required, seed_status=incomplete). Resolve manually: cd $src && bun install"
+      has_required=1
+    fi
+  done <"$_rows_tmp"
+  rm -f "$_rows_tmp" 2>/dev/null || true
+
+  if (( has_required == 1 )); then
+    return 1
+  fi
+  return 0
 }
 
 # D4 (#1201): mirror an external directory-source marketplace tree into
@@ -987,6 +1325,214 @@ bridge_plugins_cmd_show() {
   fi
 }
 
+# #1249 (beta3): integrated `add-marketplace` verb. Replaces the 5-step
+# `claude plugin marketplace add` + `claude plugin install` + manual
+# `agb plugins seed` dance for operators provisioning a new marketplace
+# on an iso v2 install. Single command:
+#
+#   1. Resolve <url-or-path> to a directory:
+#      - URL (http(s)://, git@, ssh://): clone to a controller-owned dir
+#        under $BRIDGE_SHARED_ROOT/plugins-cache/_clones/<safe-id>/ (or
+#        re-use existing clone via `git pull --ff-only`).
+#      - Local path: canonicalize.
+#   2. Verify `.claude-plugin/marketplace.json` exists.
+#   3. Delegate to `bridge_plugins_cmd_seed` with `--marketplace-root
+#      <resolved>` (and pass-through flags `--channels`, `--no-iso-chmod`,
+#      `--no-auto-install`). seed already does the D1/D2/D3/D4
+#      propagation, mirror creation, canonical chmod, and `bun install`
+#      pass — we just front it with a friendlier "given a URL, do the
+#      right thing" verb.
+#
+# Idempotency: re-running with the same URL refreshes the clone via
+# `git pull --ff-only`; re-running with the same path is a no-op clone
+# step + identical seed pass (seed is itself idempotent).
+bridge_plugins_cmd_add_marketplace() {
+  bridge_plugins_require_v2
+  bridge_require_python
+
+  local target=""
+  local -a seed_args=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --channels)
+        [[ $# -ge 2 ]] || bridge_die "--channels requires a value"
+        seed_args+=(--channels "$2")
+        shift 2
+        ;;
+      --no-iso-chmod)
+        seed_args+=(--no-iso-chmod)
+        shift
+        ;;
+      --no-auto-install)
+        seed_args+=(--no-auto-install)
+        shift
+        ;;
+      --dry-run)
+        seed_args+=(--dry-run)
+        shift
+        ;;
+      -h|--help)
+        usage
+        return 0
+        ;;
+      -*)
+        bridge_die "지원하지 않는 plugins add-marketplace 옵션입니다: $1"
+        ;;
+      *)
+        if [[ -n "$target" ]]; then
+          bridge_die "add-marketplace accepts a single positional <url-or-path> (got extra: $1)"
+        fi
+        target="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [[ -n "$target" ]] || bridge_die "add-marketplace requires <repo-url-or-path>. Example: agb plugins add-marketplace https://github.com/me/my-marketplace --channels plugin:my-plugin"
+
+  local resolved_root=""
+  # URL pattern detection. Accept http(s)://, ssh://, git@host:owner/repo,
+  # and `git+...://` forms.
+  case "$target" in
+    http://*|https://*|ssh://*|git+*://*|git://*)
+      resolved_root="$(bridge_plugins_add_marketplace_clone_url "$target")" \
+        || bridge_die "add-marketplace: failed to clone $target"
+      ;;
+    git@*)
+      resolved_root="$(bridge_plugins_add_marketplace_clone_url "$target")" \
+        || bridge_die "add-marketplace: failed to clone $target"
+      ;;
+    *)
+      # Path. Refuse on non-existence — operator most likely typo'd the URL.
+      if [[ ! -d "$target" ]]; then
+        bridge_die "add-marketplace: $target is not an existing directory and does not look like a clonable URL. Pass a URL (http(s)://, ssh://, git@host:owner/repo) or a local marketplace path."
+      fi
+      resolved_root="$(cd -P "$target" 2>/dev/null && pwd -P)" \
+        || bridge_die "add-marketplace: cannot canonicalize $target"
+      ;;
+  esac
+
+  if [[ ! -f "$resolved_root/.claude-plugin/marketplace.json" ]]; then
+    bridge_die "add-marketplace: $resolved_root does not contain .claude-plugin/marketplace.json. The resolved directory must be an Agent Bridge-format plugin marketplace (see docs/plugin-authoring-iso-v2.md)."
+  fi
+
+  bridge_info "[plugins add-marketplace] resolved: $resolved_root"
+  bridge_info "[plugins add-marketplace] delegating to \`plugins seed --marketplace-root $resolved_root\` ${seed_args[*]}"
+
+  bridge_plugins_cmd_seed --marketplace-root "$resolved_root" "${seed_args[@]}"
+}
+
+# #1249 (beta3): URL clone helper. Maintains a controller-owned clone
+# directory under $BRIDGE_SHARED_ROOT/plugins-cache/_clones/<safe-id>/.
+# Re-clones with `git pull --ff-only` when the dir already exists.
+#
+# Stdout: the absolute path of the resulting clone dir (single line).
+# Return: 0 on success, non-zero on failure (clone or pull error).
+bridge_plugins_add_marketplace_clone_url() {
+  local url="$1"
+  [[ -n "$url" ]] || { bridge_warn "clone_url: empty URL"; return 1; }
+  if ! command -v git >/dev/null 2>&1; then
+    bridge_warn "clone_url: git not on PATH — cannot clone $url. Install git and retry."
+    return 1
+  fi
+
+  # Derive a safe id from the URL's last path component (strip .git).
+  # `safe-id` ↔ /[A-Za-z0-9._-]+/ — anything else is replaced with `_`.
+  local last="${url##*/}"
+  last="${last%.git}"
+  local safe_id=""
+  safe_id="$(printf '%s' "$last" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')"
+  [[ -n "$safe_id" ]] || { bridge_warn "clone_url: could not derive safe id from URL $url"; return 1; }
+
+  local clones_parent="$BRIDGE_SHARED_ROOT/plugins-cache/_clones"
+  local clone_dir="$clones_parent/$safe_id"
+
+  _bridge_isolation_v2_run_root_or_sudo mkdir -p "$clones_parent" \
+    || { bridge_warn "clone_url: mkdir -p $clones_parent failed"; return 1; }
+
+  if [[ -d "$clone_dir/.git" ]]; then
+    # Idempotent path — refresh via git pull --ff-only.
+    bridge_info "[plugins add-marketplace] clone exists at $clone_dir — refreshing with git pull --ff-only"
+    if ! ( cd "$clone_dir" && git pull --ff-only >&2 ); then
+      bridge_warn "clone_url: git pull --ff-only in $clone_dir failed — leaving existing clone in place"
+      # Non-fatal: existing clone may still be usable. Caller will
+      # validate marketplace.json next.
+    fi
+  else
+    bridge_info "[plugins add-marketplace] cloning $url → $clone_dir"
+    if ! git clone --depth 1 -- "$url" "$clone_dir" >&2; then
+      bridge_warn "clone_url: git clone $url → $clone_dir failed"
+      return 1
+    fi
+  fi
+
+  printf '%s\n' "$clone_dir"
+  return 0
+}
+
+# #1249 (beta3): `agb plugins help [install]` — informational verb. Prints
+# the iso v2 advisory text for operators who just ran (or are about to
+# run) `claude plugin install <plugin>@<marketplace>` against a host
+# where the bridge owns the plugin catalog. controller-side install does
+# NOT propagate to iso v2 agents; operator must run `agb plugins seed`
+# or `agb plugins add-marketplace` to mirror.
+#
+# This is the user-facing surface of the #1249 "banner" requirement.
+# A true `claude plugin install` wrapper-hook would require shimming
+# Claude Code's CLI; that is out of scope for a single-PR fix. Instead
+# we ship the advisory in an `agb plugins help install` page that the
+# operator runs (and that `agb plugins` with no args points at via
+# the usage block).
+bridge_plugins_cmd_help() {
+  local topic="${1:-install}"
+  case "$topic" in
+    install)
+      printf '%s\n' \
+        "agb plugins — claude plugin install advisory" \
+        "" \
+        "Note: when running on a host with isolation-v2 agents (linux-user" \
+        "isolation enabled at install time), \`claude plugin install" \
+        "<plugin>@<marketplace>\` only updates the controller-side Claude" \
+        "plugin registry. Iso v2 agents read from the bridge-owned plugin" \
+        "catalog at \$BRIDGE_SHARED_ROOT/plugins-cache/ instead, which is" \
+        "intentionally separate by design — the iso UID cannot read the" \
+        "operator's \$HOME/.claude/plugins/ tree without escalation." \
+        "" \
+        "To make a plugin available to iso v2 agents you must either:" \
+        "" \
+        "  agb plugins seed --channels plugin:<name>@<marketplace>" \
+        "" \
+        "    Re-runs the v2 plugin seed against the bundled or already-" \
+        "    registered marketplace, mirrors the plugin into" \
+        "    \$BRIDGE_SHARED_ROOT/plugins-cache/, applies the iso v2 ACL" \
+        "    chmod (mode 2770 + chgrp ab-shared), and propagates the" \
+        "    marketplace entry to every iso UID's known_marketplaces.json." \
+        "" \
+        "  agb plugins add-marketplace <url-or-path> --channels plugin:<name>" \
+        "" \
+        "    Integrated verb that clones (URL) or registers (path) a new" \
+        "    marketplace + runs the seed in one call. Use this when the" \
+        "    plugin lives in a marketplace the bridge has never seen." \
+        "" \
+        "After either command, restart the iso agent (\`agb agent restart" \
+        "<agent>\`) so the v2 plugin loader picks up the new manifest." \
+        "" \
+        "See: docs/plugin-authoring-iso-v2.md for the full iso v2 plugin" \
+        "contract."
+      return 0
+      ;;
+    -h|--help|"")
+      usage
+      return 0
+      ;;
+    *)
+      printf '%s\n' "Unknown help topic: $topic" >&2
+      printf '%s\n' "Available topics: install" >&2
+      return 2
+      ;;
+  esac
+}
+
 # Smoke / library callers that want the helpers without dispatching the
 # CLI can source this file with `BRIDGE_PLUGINS_LIB_ONLY=1`. The standard
 # `agb plugins` CLI entrypoint (`agb`, `agent-bridge`) sets nothing, so
@@ -994,14 +1540,25 @@ bridge_plugins_cmd_show() {
 # scripts to make smoke harnesses portable. (#1201 + #1202 smoke.)
 if [[ "${BRIDGE_PLUGINS_LIB_ONLY:-0}" != "1" ]]; then
   case "${1:-}" in
-    ""|-h|--help|help)
+    "")
       usage
-      [[ "${1:-}" == "" ]] && exit 1
+      exit 1
+      ;;
+    -h|--help)
+      usage
       exit 0
+      ;;
+    help)
+      shift
+      bridge_plugins_cmd_help "$@"
       ;;
     seed)
       shift
       bridge_plugins_cmd_seed "$@"
+      ;;
+    add-marketplace)
+      shift
+      bridge_plugins_cmd_add_marketplace "$@"
       ;;
     show)
       shift
