@@ -92,12 +92,27 @@ source "$SCRIPT_DIR/scripts/_common.sh"
 # in a guard so a stripped install (or smoke harness that uses a
 # minimal $BRIDGE_HOME tree) can still run the non-iso path —
 # `_BRIDGE_ISO_HELPERS_LOADED` records whether the helper is available.
+#
+# IMPORTANT (codex r1 BLOCKING finding): merely sourcing bridge-lib.sh
+# does NOT populate the per-agent assoc arrays
+# (`BRIDGE_AGENT_ISOLATION_MODE`, `BRIDGE_AGENT_OS_USER`, …) that
+# `bridge_agent_linux_user_isolation_effective` reads. The roster files
+# (`$BRIDGE_HOME/agent-roster.sh` + `agent-roster.local.sh`) are loaded
+# by `bridge_load_roster` from `lib/bridge-state.sh`, which then drives
+# the arrays. Without that call, every iso v2 agent's predicate returns
+# 1 ("not isolated") in the bootstrap shell and `step_rebuild_one`
+# falls back to the legacy controller-direct path — which is exactly
+# the codepath that hits `rm: Permission denied` on `2770 ab-agent-*`
+# memory/ trees (#1222). So: source, verify helpers AND the roster
+# loader are present, then actually load. Helpers-only is a bug.
 _BRIDGE_ISO_HELPERS_LOADED=0
 if [[ -r "$SCRIPT_DIR/bridge-lib.sh" ]]; then
   # shellcheck disable=SC1091
   source "$SCRIPT_DIR/bridge-lib.sh" || true
   if declare -F bridge_isolation_run_as_agent_user_via_bash >/dev/null 2>&1 \
-      && declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then
+      && declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && declare -F bridge_load_roster >/dev/null 2>&1 \
+      && bridge_load_roster >/dev/null 2>&1; then
     _BRIDGE_ISO_HELPERS_LOADED=1
   fi
 fi

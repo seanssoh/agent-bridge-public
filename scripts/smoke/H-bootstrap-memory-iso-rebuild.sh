@@ -242,6 +242,155 @@ fi
 smoke_log "ok: T7 no broad 'rm' op added to bridge_iso_run"
 
 # ---------------------------------------------------------------------
+# T7.1 — bootstrap calls bridge_load_roster after sourcing
+#        bridge-lib.sh. Codex r1 BLOCKING: just sourcing bridge-lib.sh
+#        does NOT populate `BRIDGE_AGENT_ISOLATION_MODE` /
+#        `BRIDGE_AGENT_OS_USER` — those arrays are filled by
+#        `bridge_load_roster` from `lib/bridge-state.sh`. Without that
+#        call, `bridge_agent_linux_user_isolation_effective` returns 1
+#        for every agent (the gate becomes dead-code) and iso v2
+#        agents fall through to the controller-direct legacy path —
+#        which is the exact `rm: Permission denied` shape this PR is
+#        meant to fix.
+#
+#        Assert (a) bridge_load_roster appears in the bootstrap source,
+#        (b) it appears AFTER the `source $SCRIPT_DIR/bridge-lib.sh`
+#        line, and (c) it is gated inside the
+#        `_BRIDGE_ISO_HELPERS_LOADED` guard so the loader is invoked
+#        on every install where the helper is wired up.
+# ---------------------------------------------------------------------
+# Strip comment lines first so a `# by bridge_load_roster …` docstring
+# does not satisfy the assertion. The actual invocation must follow
+# `source $SCRIPT_DIR/bridge-lib.sh`.
+T7_1_NO_COMMENTS="$SMOKE_TMP_ROOT/bootstrap-no-comments.txt"
+grep -nv '^[[:space:]]*#' "$BOOTSTRAP" >"$T7_1_NO_COMMENTS"
+grep -q "bridge_load_roster" "$T7_1_NO_COMMENTS" \
+  || smoke_fail "T7.1 bridge_load_roster not called in bootstrap (predicate gate would always fail in the bootstrap shell)"
+{
+  source_line="$(grep "source[[:space:]]\+\"\\\$SCRIPT_DIR/bridge-lib.sh\"" "$T7_1_NO_COMMENTS" | head -1 | cut -d: -f1)"
+  loader_line="$(grep "bridge_load_roster" "$T7_1_NO_COMMENTS" | head -1 | cut -d: -f1)"
+  if [[ -z "$source_line" || -z "$loader_line" ]] || (( loader_line <= source_line )); then
+    smoke_fail "T7.1 bridge_load_roster (non-comment) does not appear after source bridge-lib.sh (source_line=$source_line, loader_line=$loader_line)"
+  fi
+}
+smoke_log "ok: T7.1 bootstrap calls bridge_load_roster after sourcing bridge-lib.sh"
+
+# ---------------------------------------------------------------------
+# T7.2 — runtime predicate-true proof. Without this, T1..T7.1 only
+#        prove source-structure presence; a future refactor that moves
+#        bridge_load_roster behind a flag that defaults OFF, or
+#        accidentally guards it on a condition that's always false in
+#        the bootstrap shell, would still pass T1..T7.1 but break the
+#        fix. Stand up a synthetic BRIDGE_HOME with a tracked roster
+#        that declares an iso v2 agent, replay the exact bootstrap
+#        load sequence (source _common.sh + source bridge-lib.sh +
+#        bridge_load_roster), force the host platform to Linux via
+#        BRIDGE_HOST_PLATFORM_OVERRIDE, then assert the predicate
+#        returns 0 for the test agent. Pre-fix (no bridge_load_roster
+#        call), this fails with the predicate returning 1.
+# ---------------------------------------------------------------------
+T7_2_HOME="$SMOKE_TMP_ROOT/bridge-home-t7_2"
+mkdir -p "$T7_2_HOME/state"
+# Layout marker so the resolver classifies as v2 without trying to upgrade.
+cat >"$T7_2_HOME/state/layout-marker.sh" <<EOF
+BRIDGE_LAYOUT=v2
+BRIDGE_DATA_ROOT=$T7_2_HOME/data
+EOF
+mkdir -p "$T7_2_HOME/data/agents" "$T7_2_HOME/data/shared" "$T7_2_HOME/data/state"
+
+# Synthetic roster: one iso v2 agent. Pattern mirrors the canonical
+# writer (lib/bridge-agents.sh:3422-3445) — only the fields the
+# predicate touches are required.
+T7_2_ROSTER="$T7_2_HOME/agent-roster.sh"
+cat >"$T7_2_ROSTER" <<'EOF'
+#!/usr/bin/env bash
+# shellcheck shell=bash disable=SC2034
+bridge_add_agent_id_if_missing test_iso_h
+BRIDGE_AGENT_DESC['test_iso_h']='H smoke iso v2 fixture'
+BRIDGE_AGENT_ENGINE['test_iso_h']='claude'
+BRIDGE_AGENT_SESSION['test_iso_h']='test_iso_h'
+BRIDGE_AGENT_SOURCE['test_iso_h']='static'
+BRIDGE_AGENT_ISOLATION_MODE['test_iso_h']='linux-user'
+BRIDGE_AGENT_OS_USER['test_iso_h']='agent-bridge-test_iso_h'
+EOF
+T7_2_ROSTER_LOCAL="$T7_2_HOME/agent-roster.local.sh"
+: >"$T7_2_ROSTER_LOCAL"  # empty local roster, mode 0600 implicit by umask
+
+# Run the predicate replay in an isolated child shell so the parent's
+# bridge state is not polluted. Stage the driver as a file (no
+# heredoc-stdin into bash -c — footgun #11).
+T7_2_DRIVER="$SMOKE_TMP_ROOT/t7_2-predicate.sh"
+: >"$T7_2_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' 'export BRIDGE_HOME="$1"'
+  printf '%s\n' 'export BRIDGE_ROSTER_FILE="$BRIDGE_HOME/agent-roster.sh"'
+  printf '%s\n' 'export BRIDGE_ROSTER_LOCAL_FILE="$BRIDGE_HOME/agent-roster.local.sh"'
+  printf '%s\n' 'export BRIDGE_LAYOUT_MARKER_DIR="$BRIDGE_HOME/state"'
+  # Force Linux so bridge_agent_linux_user_isolation_effective's
+  # second predicate (`bridge_host_platform == Linux`) is satisfied
+  # on a macOS test host. The first predicate (linux-user requested)
+  # and the third (os_user non-empty) come from the synthetic roster.
+  printf '%s\n' 'export BRIDGE_HOST_PLATFORM_OVERRIDE="Linux"'
+  # Disable the per-process memo so the driver always re-loads.
+  printf '%s\n' 'export BRIDGE_ROSTER_CACHE_DISABLE=1'
+  printf '%s\n' 'export BRIDGE_LAYOUT_RESOLVER_BYPASS="fresh-install:smoke-h-t7_2"'
+  printf '%s\n' 'export BRIDGE_LAYOUT_RESOLVER_BYPASS_OWNER_PID=$$'
+  printf '%s\n' 'REPO_ROOT="$2"'
+  # shellcheck disable=SC2016
+  printf '%s\n' '# shellcheck disable=SC1091'
+  # shellcheck disable=SC2016
+  printf '%s\n' 'source "$REPO_ROOT/bridge-lib.sh"'
+  printf '%s\n' 'if ! declare -F bridge_load_roster >/dev/null 2>&1; then'
+  printf '%s\n' '  echo "ERR no bridge_load_roster after source bridge-lib.sh"; exit 11'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'if ! declare -F bridge_agent_linux_user_isolation_effective >/dev/null 2>&1; then'
+  printf '%s\n' '  echo "ERR no bridge_agent_linux_user_isolation_effective after source"; exit 12'
+  printf '%s\n' 'fi'
+  # Negative control FIRST: with the roster file present but
+  # bridge_load_roster NOT yet called, the predicate must return 1
+  # for our test agent. This proves the predicate genuinely depends
+  # on the loader call — i.e. a future refactor that auto-loads the
+  # roster from `source bridge-lib.sh` (making T7.1 a no-op) would
+  # flip this control to 0 and the smoke catches it.
+  printf '%s\n' 'if bridge_agent_linux_user_isolation_effective test_iso_h 2>/dev/null; then'
+  printf '%s\n' '  echo "ERR negative control failed: predicate returned 0 before bridge_load_roster (roster auto-loaded?)"; exit 13'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'bridge_load_roster >/dev/null 2>&1 || { echo "ERR bridge_load_roster failed rc=$?"; exit 14; }'
+  # Positive: predicate must now return 0 for the test agent.
+  printf '%s\n' 'if ! bridge_agent_linux_user_isolation_effective test_iso_h 2>/dev/null; then'
+  printf '%s\n' '  echo "ERR predicate returned 1 even after bridge_load_roster (BLOCKING bug re-introduced)"; exit 15'
+  printf '%s\n' 'fi'
+  printf '%s\n' 'echo OK'
+  printf '%s\n' 'exit 0'
+} >"$T7_2_DRIVER"
+chmod +x "$T7_2_DRIVER"
+
+T7_2_OUT="$SMOKE_TMP_ROOT/t7_2-out.txt"
+T7_2_RC=0
+# Resolve a Bash 4+ runner. /opt/homebrew/bin/bash on macOS smoke hosts;
+# falls back to /usr/local/bin/bash, then to `bash` on Linux. The driver
+# itself uses `set -uo pipefail` + 4.x associative arrays via the
+# sourced library, so a 3.2 /bin/bash would fail before T7.2 can run.
+T7_2_BASH=""
+for _cand in /opt/homebrew/bin/bash /usr/local/bin/bash "$HOME/.local/bin/bash" "$(command -v bash 2>/dev/null || true)"; do
+  if [[ -n "$_cand" && -x "$_cand" ]] && "$_cand" -c '[[ ${BASH_VERSINFO[0]:-0} -ge 4 ]]' >/dev/null 2>&1; then
+    T7_2_BASH="$_cand"
+    break
+  fi
+done
+[[ -n "$T7_2_BASH" ]] || smoke_fail "T7.2 no Bash 4+ available to run the driver"
+"$T7_2_BASH" "$T7_2_DRIVER" "$T7_2_HOME" "$REPO_ROOT" >"$T7_2_OUT" 2>&1 \
+  || T7_2_RC=$?
+if [[ "$T7_2_RC" -ne 0 ]] || ! grep -q "^OK$" "$T7_2_OUT"; then
+  printf '[T7.2] driver rc=%s output:\n' "$T7_2_RC" >&2
+  sed -n '1,40p' "$T7_2_OUT" >&2
+  smoke_fail "T7.2 predicate-true proof failed — bridge_agent_linux_user_isolation_effective did not return 0 for an iso v2 fixture after bridge_load_roster"
+fi
+smoke_log "ok: T7.2 predicate returns true for iso v2 fixture after bridge_load_roster"
+
+# ---------------------------------------------------------------------
 # T8 — Real iso reproducer. Linux + sudo + useradd required. Skipped
 #      otherwise.
 # ---------------------------------------------------------------------
