@@ -185,6 +185,10 @@ upgrade 시 다음 advisory 가 **한 번만** 출력된다 (auto-action 없음,
 
 권장 페어가 등록된 호스트에서 admin 의 `CLAUDE.md` 에 pair-programming SOP (plan brief → `plan-ok` → implement → code review → `implement-ok`) 를 직접 작성해 둔다. 자동 주입은 더 이상 동작하지 않으므로 운영자 자율로 관리한다.
 
+### Agent description convention
+
+페어가 등록된 다음에는 `BRIDGE_AGENT_DESC` 한 줄을 admin / pair / system 역할별로 채워 둔다. 이 줄은 IDENTITY 이고 `BRIDGE_AGENT_CLASS` 가 AUTHORIZATION 이다 — 둘은 별개 역할을 한다. 권장 문구, 안티패턴, `agent describe <name>` 사용법은 [`admin-agent-convention.md`](admin-agent-convention.md) 참고. v0.15.0-beta1 부터 `bridge-init.sh` 가 admin agent 의 기본 description 을 useful 한 문장으로 채우므로 fresh install 은 별도 편집 없이도 컨벤션을 따른다.
+
 ## Bootstrap for a new server / new install
 
 새 서버에 Agent Bridge를 처음 설치할 때 admin이 수행할 순서:

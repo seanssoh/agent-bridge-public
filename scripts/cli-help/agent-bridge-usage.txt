@@ -26,7 +26,7 @@ Usage:
   __CLI_NAME__ wave <dispatch|list|show|templates|close-issue> ...
   __CLI_NAME__ plugins <seed|show> ...
   __CLI_NAME__ a2a <send|outbox|inbox-dedupe|peers|deliver|daemon> ...
-  __CLI_NAME__ agent <create|update|delete|retire|list|registry|show|reclassify|doctor|rerender-settings|start|safe-mode|stop|restart|ack-crash|forget-session|attach|compact|handoff> ...
+  __CLI_NAME__ agent <create|update|delete|retire|list|registry|show|describe|reclassify|doctor|rerender-settings|start|safe-mode|stop|restart|ack-crash|forget-session|attach|compact|handoff> ...
   __CLI_NAME__ kill <number|all>
   __CLI_NAME__ attach [number|name]
   __CLI_NAME__ urgent <agent> "<message>" [--wait <seconds>]
@@ -88,6 +88,7 @@ Usage:
   __CLI_NAME__ agent list [--json]
   __CLI_NAME__ agent registry [--json]
   __CLI_NAME__ agent show <agent> [--json]
+  __CLI_NAME__ agent describe <agent>
   __CLI_NAME__ agent reclassify [--agent <agent>] [--apply] [--json]
   __CLI_NAME__ agent start <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
   __CLI_NAME__ agent safe-mode <agent> [--attach|--no-attach] [--replace] [--continue|--no-continue] [--dry-run]
@@ -172,6 +173,7 @@ Examples:
   __CLI_NAME__ agent list --json
   __CLI_NAME__ agent registry --json
   __CLI_NAME__ agent show reviewer --json
+  __CLI_NAME__ agent describe reviewer
   __CLI_NAME__ agent reclassify --apply
   __CLI_NAME__ agent start reviewer --dry-run
   __CLI_NAME__ agent restart reviewer --attach

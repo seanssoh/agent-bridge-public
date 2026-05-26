@@ -520,7 +520,13 @@ if [[ $dry_run -eq 0 ]]; then
 fi
 
 session="${session:-$admin_agent}"
-description="${description:-$admin_agent admin role}"
+# v0.15.0-beta1 Lane I: replace the terse "<name> admin role" default with a
+# concrete role description so downstream agents reading the roster on a fresh
+# install see a useful sentence (issue: cosmax-* installs landed empty/terse
+# desc → downstream agent autonomy regressed). The example roster
+# (agent-roster.local.example.sh) carries the same boilerplate so operators
+# can lift it verbatim. See docs/agent-runtime/admin-agent-convention.md.
+description="${description:-Agent Bridge admin/coordinator for this install. Owns onboarding, roster/queue triage, upgrade/release waves, and operator-facing decisions.}"
 display_name="${display_name:-$admin_agent}"
 channels="$(bridge_normalize_channels_csv "$channels")"
 

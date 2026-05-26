@@ -34,6 +34,7 @@ Subcommands:
   list               List registered agents.
   registry           Read-only JSON inventory of registered agents.
   show               Show one agent's roster + runtime state.
+  describe           Print BRIDGE_AGENT_DESC[<agent>] (read-only getter).
   reclassify         Promote a runtime-detected admin to a static role.
   doctor             Run a 7-step CRUD self-check (create/update/registry/
                      show/reclassify/retire/delete) against an isolated fixture.
@@ -55,6 +56,7 @@ Examples:
   $(basename "$0") list --json
   $(basename "$0") registry --json
   $(basename "$0") show reviewer --json
+  $(basename "$0") describe reviewer
   $(basename "$0") reclassify --apply
   $(basename "$0") rerender-settings --apply
   $(basename "$0") start reviewer --dry-run
@@ -2040,7 +2042,17 @@ run_show() {
     admin="${_fields[29]}"
     [[ "$row_agent" == "agent" ]] && continue
     printf 'agent: %s\n' "$row_agent"
-    printf 'description: %s\n' "$description"
+    # v0.15.0-beta1 Lane I: emit a self-contained hint when the operator
+    # has not set BRIDGE_AGENT_DESC for this agent. The JSON record stays
+    # raw (empty string) so downstream scripts can distinguish "unset"
+    # from "placeholder text"; the text mode line stays present so
+    # operators piping `agent show` through grep/awk still see a stable
+    # row, just with an actionable hint instead of a blank value.
+    if [[ -z "$description" ]]; then
+      printf 'description: [no description set; edit BRIDGE_AGENT_DESC["%s"] in agent-roster.local.sh]\n' "$row_agent"
+    else
+      printf 'description: %s\n' "$description"
+    fi
     printf 'engine: %s\n' "$engine"
     printf 'source: %s\n' "$source"
     printf 'admin: %s\n' "$admin"
@@ -2091,6 +2103,78 @@ run_show() {
     printf 'session_health:\n'
     bridge_agent_session_guidance_text "$agent" | sed 's/^/  /'
   done <<<"$output"
+}
+
+# v0.15.0-beta1 Lane I: read-only `agent describe <agent>` getter.
+#
+# Contract (codex r1):
+#   - With `-h`/`--help`: print short usage to stdout, exit 0. The flag is
+#     checked BEFORE `bridge_require_agent` so the universal --help gate
+#     (scripts/smoke/1117-cli-help-universal-gate.sh) sees a clean stdout
+#     without the "등록된 에이전트:" error marker.
+#   - With a registered agent that has a non-empty BRIDGE_AGENT_DESC entry:
+#     print the description + newline to stdout, exit 0.
+#   - With a registered agent whose BRIDGE_AGENT_DESC entry is unset/empty:
+#     print no stdout, exit non-zero, write a hint to stderr pointing the
+#     operator at the roster file.
+#   - With an unregistered agent: standard bridge_require_agent failure
+#     (registry list to stdout/stderr, bridge_die exit 1).
+#
+# No write path in beta1 — the source of truth is the roster file. See
+# docs/agent-runtime/admin-agent-convention.md.
+run_describe() {
+  # Honor `-h`/`--help` before any argument validation, so the universal
+  # --help gate (issue #1117) sees a clean rc=0 + non-empty stdout regardless
+  # of whether an agent id is also present on the command line.
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -h|--help)
+        cat <<EOF
+Usage:
+  $(basename "$0") describe <agent>
+
+Read-only getter for the BRIDGE_AGENT_DESC[<agent>] string.
+
+  - Set       → prints the description + newline, exit 0.
+  - Unset     → no stdout, exit non-zero, stderr hint points to
+                BRIDGE_AGENT_DESC["<agent>"] in agent-roster.local.sh.
+
+The description is operator-curated; the source of truth is the roster
+file. To change a description, edit \$BRIDGE_HOME/agent-roster.local.sh
+directly. See docs/agent-runtime/admin-agent-convention.md for the
+convention and per-role recommended one-liners.
+EOF
+        return 0
+        ;;
+    esac
+  done
+
+  local agent="${1:-}"
+  [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") describe <agent>"
+  shift || true
+
+  # Reject any extra positional or flag arguments — `describe` is a
+  # single-purpose getter, not a multi-flag operation. Matches the shape
+  # of similar read-only verbs (issue #163 intent-recovery hint surface).
+  if [[ $# -gt 0 ]]; then
+    bridge_die "지원하지 않는 agent describe 옵션입니다: $1"
+  fi
+
+  bridge_require_agent "$agent"
+
+  local description
+  description="$(bridge_agent_desc "$agent")"
+  if [[ -z "$description" ]]; then
+    # No stdout when unset (so callers piping the value into another
+    # command see an empty string, not a placeholder). Hint to stderr
+    # so an interactive operator running `agb agent describe foo` still
+    # sees the actionable next step.
+    bridge_warn "agent '$agent' has no description set. Edit BRIDGE_AGENT_DESC[\"$agent\"] in agent-roster.local.sh (see docs/agent-runtime/admin-agent-convention.md)."
+    return 1
+  fi
+
+  printf '%s\n' "$description"
 }
 
 run_reclassify() {
@@ -5869,6 +5953,11 @@ case "$subcommand" in
   show)
     run_show "$@"
     ;;
+  describe)
+    # v0.15.0-beta1 Lane I: read-only getter for BRIDGE_AGENT_DESC[<agent>].
+    # See docs/agent-runtime/admin-agent-convention.md.
+    run_describe "$@"
+    ;;
   reclassify)
     run_reclassify "$@"
     ;;
@@ -5911,7 +6000,7 @@ case "$subcommand" in
   *)
     # Issue #163 Phase 2: surface an intent-recovery hint before dying.
     _hint="$(bridge_suggest_subcommand "$subcommand" \
-      "create update delete retire list registry show reclassify doctor rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
+      "create update delete retire list registry show describe reclassify doctor rerender-settings start safe-mode stop restart ack-crash forget-session attach compact handoff")"
     [[ -n "$_hint" ]] && bridge_warn "$_hint"
     bridge_die "지원하지 않는 agent 명령입니다: $subcommand"
     ;;

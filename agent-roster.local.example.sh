@@ -14,6 +14,27 @@ BRIDGE_AGENT_DESC["developer"]="Development role (Claude Code)"
 BRIDGE_AGENT_DESC["codex-tester"]="Test role (Codex)"
 BRIDGE_AGENT_DESC["codex-developer"]="Development role (Codex)"
 
+# Admin/system role description examples (v0.15.0-beta1 Lane I).
+#
+# BRIDGE_AGENT_DESC is the human-readable IDENTITY of each agent. Downstream
+# agents (cosmax-* installs, A2A peers, etc.) read this string from
+# `agent show <name>` / `agent describe <name>` to decide how to address the
+# agent and what kind of work to route. A one-line role+ownership sentence is
+# the sweet spot — terse enough to be queue-renderable, concrete enough that a
+# stranger reading the roster knows who owns onboarding vs who reviews PRs.
+#
+# Note: BRIDGE_AGENT_DESC is IDENTITY, not AUTHORIZATION. The privilege
+# boundary lives in BRIDGE_AGENT_CLASS (see further down this file). A
+# `librarian` agent class=system describes its job here; the class line
+# downstream is the access boundary.
+#
+# Recommended one-liners per role family:
+#
+# BRIDGE_AGENT_DESC["patch"]="Agent Bridge admin/coordinator for this install. Owns onboarding, roster/queue triage, upgrade/release waves, and operator-facing decisions."
+# BRIDGE_AGENT_DESC["patch-dev"]="Codex dev/review pair for patch. Reviews PRs, proposes code changes, and verifies smoke/runtime checks assigned through Agent Bridge."
+# BRIDGE_AGENT_DESC["patch-agy"]="Antigravity/alternate-engine pair for patch. Handles cross-engine implementation or UI/runtime verification tasks assigned through Agent Bridge."
+# BRIDGE_AGENT_DESC["librarian"]="Memory ingestion/supervisory role. Harvests every agent's memory tree into the shared wiki (access boundary set via BRIDGE_AGENT_CLASS=system)."
+
 BRIDGE_AGENT_ENGINE["tester"]="claude"
 BRIDGE_AGENT_ENGINE["developer"]="claude"
 BRIDGE_AGENT_ENGINE["codex-tester"]="codex"
