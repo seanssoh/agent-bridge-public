@@ -2621,7 +2621,51 @@ bridge_linux_share_plugin_catalog() {
         && [[ -z "$_v2_pcg_plugins" ]]; then
       return 0
     fi
-    bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) but agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries. Run \`agb plugins seed\` to populate the shared plugin catalog from the bundled agent-bridge marketplace, then retry. (For an external marketplace: \`agb plugins seed --marketplace-root <path>\`.)"
+    # Issue #1231 fail-closed fallback: install/init is the primary
+    # path that seeds the shared catalog (bridge-init.sh runs `agb
+    # plugins seed` after host-profile resolution). If we reach this
+    # branch the operator either skipped init seed, blew away
+    # plugins-cache by hand, or upgraded from a pre-#1231 release that
+    # did not seed on init. Rather than fail straight to bridge_die,
+    # attempt one in-flight bundled-marketplace seed using the same
+    # subprocess surface; only fail if THAT also fails. This covers
+    # fresh install, upgrades, partial installs, and manual cache
+    # deletion. The seed call is bounded to the bundled marketplace
+    # (no --marketplace-root / --channels args) — we never widen the
+    # operator's external marketplace surface from the agent-create
+    # fallback path; if the operator wanted an external marketplace,
+    # they need to run `agb plugins seed --marketplace-root <path>`
+    # explicitly.
+    local _v2_seed_cli=""
+    if [[ -n "${BRIDGE_HOME:-}" ]] && [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+      _v2_seed_cli="$BRIDGE_HOME/agent-bridge"
+    elif [[ -n "${BRIDGE_SCRIPT_DIR:-}" ]] && [[ -x "$BRIDGE_SCRIPT_DIR/agent-bridge" ]]; then
+      _v2_seed_cli="$BRIDGE_SCRIPT_DIR/agent-bridge"
+    fi
+    if [[ -n "$_v2_seed_cli" ]]; then
+      bridge_warn "isolation v2 plugin catalog: shared catalog at \$BRIDGE_SHARED_ROOT/plugins-cache is empty for agent '$agent' (plugin: channels declared) — attempting fallback seed via '$_v2_seed_cli plugins seed' (bundled agent-bridge marketplace)"
+      local _v2_seed_fallback_output=""
+      local _v2_seed_fallback_rc=0
+      local _v2_seed_bash="${BRIDGE_BASH_BIN:-bash}"
+      _v2_seed_fallback_output="$("$_v2_seed_bash" "$_v2_seed_cli" plugins seed 2>&1)" \
+        || _v2_seed_fallback_rc=$?
+      if (( _v2_seed_fallback_rc == 0 )) \
+         && bridge_isolation_v2_shared_plugins_root_populated 2>/dev/null; then
+        # Re-resolve controller_plugins now that the cache is populated;
+        # callers below depend on it.
+        controller_plugins="$(bridge_isolation_v2_shared_plugins_root 2>/dev/null)" || {
+          bridge_die "isolation v2 plugin catalog: fallback seed reported success but plugins root could not be resolved afterwards. Re-run \`agb plugins seed\` manually and retry \`agb agent create --isolate ...\`."
+        }
+      else
+        # Fallback seed failed — emit its output for the operator and
+        # then fail with the original actionable error (extended with
+        # the fallback rc).
+        [[ -n "$_v2_seed_fallback_output" ]] && printf '%s\n' "$_v2_seed_fallback_output" >&2
+        bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) and the in-flight fallback seed via '$_v2_seed_cli plugins seed' failed (rc=$_v2_seed_fallback_rc). Agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries — both require the shared catalog. Run \`agb plugins seed\` manually to populate from the bundled agent-bridge marketplace and inspect the error above, then retry. (For an external marketplace: \`agb plugins seed --marketplace-root <path>\`.)"
+      fi
+    else
+      bridge_die "isolation v2 plugin catalog: \$BRIDGE_SHARED_ROOT/plugins-cache is not populated (no installed_plugins.json) but agent '$agent' declares plugin: channels or BRIDGE_AGENT_PLUGINS allowlist entries, and the fallback seed CLI was not locatable (\$BRIDGE_HOME/agent-bridge missing). Run \`agb plugins seed\` to populate the shared plugin catalog from the bundled agent-bridge marketplace, then retry. (For an external marketplace: \`agb plugins seed --marketplace-root <path>\`.)"
+    fi
   fi
 
   local isolated_plugins="$user_home/.claude/plugins"

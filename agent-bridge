@@ -579,27 +579,50 @@ EOF
         fi
         case "$_SUDO_REFRESH_MODE" in
           apply)
+            # Issue #1236: gate the "installed: <path>" success line on
+            # the verifier accepting the rendered drop-in. Previously
+            # we printed "installed: <path>" before the
+            # `bridge_daemon_control_check_sudoers` probe, so on a host
+            # where visudo accepts the file but sudo/PAM refuses
+            # NOPASSWD or refuses to refresh supplementary groups the
+            # operator saw both "installed: ..." AND
+            # `daemon_group_refresh_sudoers=missing|invalid|sudo-refresh-no-gid`
+            # in the same output. We now print ONE line — either the
+            # success row or the `manual-required` remediation row,
+            # never both.
             _INSTALL_PATH=""
-            _INSTALL_PATH="$(bridge_daemon_control_install_sudoers 2>&1)" || {
-              echo "[error] sudoers install failed:" >&2
-              printf '%s\n' "$_INSTALL_PATH" >&2
-              exit 1
-            }
-            printf 'installed: %s\n' "$_INSTALL_PATH"
-            # Verify + probe after install so the operator sees the
-            # diagnostic in one shot.
+            _INSTALL_RC=0
+            _INSTALL_PATH="$(bridge_daemon_control_install_sudoers 2>&1)" \
+              || _INSTALL_RC=$?
             _CHECK_STATUS=""
             _CHECK_STATUS="$(bridge_daemon_control_check_sudoers 2>/dev/null || true)"
-            printf 'daemon_group_refresh_sudoers=%s\n' "${_CHECK_STATUS:-invalid}"
-            case "$_CHECK_STATUS" in
-              ok) exit 0 ;;
+            if (( _INSTALL_RC == 0 )) && [[ "$_CHECK_STATUS" == "ok" ]]; then
+              printf 'installed: %s (verifier=ok)\n' "$_INSTALL_PATH"
+              printf 'daemon_group_refresh_sudoers=ok\n'
+              exit 0
+            fi
+            # Either install failed or verifier rejected the result.
+            # Surface manual-required + actionable remediation, never
+            # "installed".
+            _REASON="${_CHECK_STATUS:-missing}"
+            if (( _INSTALL_RC != 0 )); then
+              echo "[error] sudoers install failed (rc=$_INSTALL_RC):" >&2
+              [[ -n "$_INSTALL_PATH" ]] && printf '%s\n' "$_INSTALL_PATH" >&2
+            elif [[ -n "$_INSTALL_PATH" ]]; then
+              # Installer returned 0 but verifier disagrees — render+visudo
+              # mismatch or sudo/PAM refused the probe. Record path so
+              # the operator can inspect.
+              echo "[warning] sudoers drop-in landed at $_INSTALL_PATH but verifier rejected it (reason=$_REASON)." >&2
+            fi
+            case "$_REASON" in
               sudo-refresh-no-gid)
                 echo "[warning] sudo invoke succeeded but PAM did NOT refresh supplementary groups." >&2
                 echo "          Verify with: sudo -n -u \"$(id -un)\" -H -- bash -c 'id -G'" >&2
-                exit 1
                 ;;
-              *) exit 1 ;;
             esac
+            printf 'manual-required: daemon_group_refresh_sudoers=%s — re-run: agent-bridge init sudoers daemon-refresh --apply\n' "$_REASON" >&2
+            printf 'daemon_group_refresh_sudoers=%s\n' "$_REASON"
+            exit 1
             ;;
           check)
             _CHECK_STATUS="$(bridge_daemon_control_check_sudoers 2>/dev/null || true)"
