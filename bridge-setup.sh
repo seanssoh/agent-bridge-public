@@ -14,7 +14,7 @@ Usage:
   $(basename "$0") discord <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--channel <id>]... [--allow-from <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") telegram <agent> [--token <token>] [--channel-account <account>] [--runtime-config <path>] [--allow-from <id>]... [--default-chat <id>] [--test-chat <id>] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
   $(basename "$0") teams <agent> [--app-id <id>] [--app-password-file <path>] [--tenant-id <id>] [--channel-account <account>] [--runtime-config <path>] [--messaging-endpoint <url>] [--webhook-host <host>] [--webhook-port <port>] [--ingress-port <port>] [--allow-from <id>]... [--conversation <id>]... [--require-mention] [--skip-validate] [--skip-send-test] [--yes] [--dry-run]
-  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--yes] [--dry-run]
+  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run]
   $(basename "$0") agent <agent> [--skip-discord] [--skip-telegram] [--skip-teams] [--test-start] [setup options...]
   $(basename "$0") admin <agent>
 
@@ -55,7 +55,7 @@ EOF
     ms365)
       cat <<EOF
 Usage:
-  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--yes] [--dry-run]
+  $(basename "$0") ms365 <agent> [--redirect-uri <url>] [--messaging-endpoint <url>] [--tenant-id <id>] [--client-id <id>] [--client-secret <secret>] [--client-secret-file <path>] [--default-upn <upn>] [--default-scopes <scopes>] [--allow-localhost] [--yes] [--dry-run]
 EOF
       ;;
     agent)
@@ -719,7 +719,9 @@ run_ms365() {
         py_args+=("$1" "$2")
         shift 2
         ;;
-      --yes|--dry-run)
+      --allow-localhost|--yes|--dry-run)
+        # PR #1220 codex r1: --allow-localhost is a value-less flag
+        # that the Python wizard records as MS365_REDIRECT_URI_ALLOW_LOCALHOST=1.
         [[ "$1" == "--dry-run" ]] && dry_run=1
         py_args+=("$1")
         shift

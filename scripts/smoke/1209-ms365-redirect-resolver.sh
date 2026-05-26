@@ -264,6 +264,116 @@ else
   _fail "T12" "main usage missing ms365; output: $T12_OUT"
 fi
 
+# ---------------------------------------------------------------------------
+# T13 — PR #1220 codex r1: `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1`
+# survives an `agent-bridge setup ms365` rerun. The documented
+# local-dev escape hatch in `plugins/ms365/server.ts:resolveRedirectUri`
+# is destroyed if the wizard rewrites `.ms365/.env` without preserving
+# it. The codex repro from the review: seed `.ms365/.env` with
+# `localhost + allow=1`, rerun the wizard with no flags, verify both
+# the redirect URI AND the allow flag survive.
+# ---------------------------------------------------------------------------
+T13_DIR="$SMOKE_DIR/t13/.ms365"
+mkdir -p "$T13_DIR"
+printf '%s\n' \
+  'MS365_REDIRECT_URI=http://localhost:3978/auth/callback' \
+  'MS365_REDIRECT_URI_ALLOW_LOCALHOST=1' \
+  'MS365_TENANT_ID=T' \
+  'MS365_CLIENT_ID=C' \
+  'MS365_CLIENT_SECRET=S' >"$T13_DIR/.env"
+python3 "$BRIDGE_SETUP_PY" ms365 \
+  --agent testagent \
+  --ms365-dir "$T13_DIR" \
+  --yes >"$SMOKE_DIR/t13.log" 2>&1 || true
+T13_ERRORS=""
+if ! grep -E "^MS365_REDIRECT_URI=http://localhost:3978/auth/callback$" "$T13_DIR/.env" >/dev/null 2>&1; then
+  T13_ERRORS+="MS365_REDIRECT_URI not preserved; "
+fi
+if ! grep -E "^MS365_REDIRECT_URI_ALLOW_LOCALHOST=1$" "$T13_DIR/.env" >/dev/null 2>&1; then
+  T13_ERRORS+="MS365_REDIRECT_URI_ALLOW_LOCALHOST=1 dropped on rerun (codex BLOCKING); "
+fi
+# Cross-check on the surfaced wizard output line so a future regression
+# that silently drops the flag (but keeps the print) is also caught.
+if ! grep -E "allow_localhost: yes" "$SMOKE_DIR/t13.log" >/dev/null 2>&1; then
+  T13_ERRORS+="wizard did not surface allow_localhost in output; "
+fi
+if [[ -z "$T13_ERRORS" ]]; then
+  _pass "T13: MS365_REDIRECT_URI_ALLOW_LOCALHOST=1 survives bridge-setup.py ms365 rerun (PR #1220 codex r1)"
+else
+  _fail "T13" "$T13_ERRORS (.env: $(cat "$T13_DIR/.env" 2>/dev/null | tr '\n' '|'))"
+fi
+
+# ---------------------------------------------------------------------------
+# T14 — PR #1220 codex r1: `--allow-localhost` CLI flag persists the
+# allow value on first-time setup (when the .env file did not yet
+# carry it). Together with T13 this proves both the "preserve" and
+# "introduce" paths.
+# ---------------------------------------------------------------------------
+T14_DIR="$SMOKE_DIR/t14/.ms365"
+python3 "$BRIDGE_SETUP_PY" ms365 \
+  --agent testagent \
+  --ms365-dir "$T14_DIR" \
+  --redirect-uri http://localhost:3978/auth/callback \
+  --tenant-id T --client-id C --client-secret S \
+  --allow-localhost \
+  --yes >"$SMOKE_DIR/t14.log" 2>&1 || true
+if [[ -f "$T14_DIR/.env" ]] && grep -E "^MS365_REDIRECT_URI_ALLOW_LOCALHOST=1$" "$T14_DIR/.env" >/dev/null 2>&1; then
+  _pass "T14: --allow-localhost CLI flag writes MS365_REDIRECT_URI_ALLOW_LOCALHOST=1"
+else
+  _fail "T14" ".env missing or ALLOW_LOCALHOST=1 not present; .env: $(cat "$T14_DIR/.env" 2>/dev/null | tr '\n' '|')"
+fi
+
+# ---------------------------------------------------------------------------
+# T15 — PR #1220 codex r1: the wizard does NOT introduce the allow
+# flag when no flag was set on the existing file AND no
+# `--allow-localhost` was passed. Negative-path coverage so a future
+# change that always-writes the flag is caught.
+# ---------------------------------------------------------------------------
+T15_DIR="$SMOKE_DIR/t15/.ms365"
+mkdir -p "$T15_DIR"
+printf '%s\n' \
+  'MS365_REDIRECT_URI=https://bot.example.com/auth/callback' \
+  'MS365_TENANT_ID=T' \
+  'MS365_CLIENT_ID=C' \
+  'MS365_CLIENT_SECRET=S' >"$T15_DIR/.env"
+python3 "$BRIDGE_SETUP_PY" ms365 \
+  --agent testagent \
+  --ms365-dir "$T15_DIR" \
+  --yes >"$SMOKE_DIR/t15.log" 2>&1 || true
+if grep -E "^MS365_REDIRECT_URI_ALLOW_LOCALHOST=" "$T15_DIR/.env" >/dev/null 2>&1; then
+  _fail "T15" "wizard introduced MS365_REDIRECT_URI_ALLOW_LOCALHOST on a file that did not have it; .env: $(cat "$T15_DIR/.env" 2>/dev/null | tr '\n' '|')"
+else
+  _pass "T15: wizard does not introduce ALLOW_LOCALHOST on a file that didn't have it (negative)"
+fi
+
+# ---------------------------------------------------------------------------
+# T16 — PR #1220 codex r1: non-"1" allow values are dropped on rerun
+# (matches the runtime's strict `=== '1'` check in
+# plugins/ms365/server.ts). A pre-existing
+# `MS365_REDIRECT_URI_ALLOW_LOCALHOST=true` would NOT be honored at
+# runtime, so the wizard rewriting it as absent is correct — and the
+# rewrite produces a cleaner file. This test prevents a future patch
+# from "lenient" preservation (accepting any truthy-looking value)
+# that would diverge from the runtime contract.
+# ---------------------------------------------------------------------------
+T16_DIR="$SMOKE_DIR/t16/.ms365"
+mkdir -p "$T16_DIR"
+printf '%s\n' \
+  'MS365_REDIRECT_URI=http://localhost:3978/auth/callback' \
+  'MS365_REDIRECT_URI_ALLOW_LOCALHOST=true' \
+  'MS365_TENANT_ID=T' \
+  'MS365_CLIENT_ID=C' \
+  'MS365_CLIENT_SECRET=S' >"$T16_DIR/.env"
+python3 "$BRIDGE_SETUP_PY" ms365 \
+  --agent testagent \
+  --ms365-dir "$T16_DIR" \
+  --yes >"$SMOKE_DIR/t16.log" 2>&1 || true
+if grep -E "^MS365_REDIRECT_URI_ALLOW_LOCALHOST=" "$T16_DIR/.env" >/dev/null 2>&1; then
+  _fail "T16" "non-'1' allow value preserved (lenient — diverges from runtime strict-eq)"
+else
+  _pass "T16: non-'1' allow value dropped on rewrite (matches runtime strict-eq)"
+fi
+
 printf '[%s] %d/%d passed (FAILS=%d)\n' "$(basename "$0")" "$((TOTAL - FAILS))" "$TOTAL" "$FAILS"
 if [[ $FAILS -ne 0 ]]; then
   exit 1

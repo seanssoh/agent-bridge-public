@@ -716,6 +716,14 @@ def inspect_ms365_dir(ms365_dir: Path) -> dict[str, Any]:
     Same isolation-aware probe shape as `inspect_teams_dir`: route
     through `_safe_read_env` which sudo-escalates to the isolated
     UID's view when the controller cannot directly read the file.
+
+    PR #1220 codex r1 (#1209 follow-up): `allow_localhost` is also
+    inspected so `cmd_ms365` can preserve the documented local-dev
+    escape hatch (`MS365_REDIRECT_URI_ALLOW_LOCALHOST=1`) across
+    reruns. Without this, an operator who set the allow flag once
+    would have it silently dropped on the next
+    `agent-bridge setup ms365 <agent>` invocation, breaking the
+    next `pair_start` call.
     """
     env_path = ms365_dir / ".env"
     env = _safe_read_env(env_path)
@@ -727,6 +735,7 @@ def inspect_ms365_dir(ms365_dir: Path) -> dict[str, Any]:
         "default_upn": env.get("MS365_DEFAULT_UPN", "").strip(),
         "redirect_uri": env.get("MS365_REDIRECT_URI", "").strip(),
         "default_scopes": env.get("MS365_DEFAULT_SCOPES", "").strip(),
+        "allow_localhost": env.get("MS365_REDIRECT_URI_ALLOW_LOCALHOST", "").strip(),
     }
 
 
@@ -1669,6 +1678,11 @@ def print_ms365_result(result: dict[str, Any], *, stream: Any = sys.stdout) -> N
         print(f"client_id: {result['client_id']}", file=stream)
     if result.get("default_upn"):
         print(f"default_upn: {result['default_upn']}", file=stream)
+    # PR #1220 codex r1: surface the allow-localhost state so an
+    # operator who set the local-dev escape hatch can see at a glance
+    # that the wizard preserved it on rerun.
+    if result.get("allow_localhost") == "1":
+        print("allow_localhost: yes (MS365_REDIRECT_URI_ALLOW_LOCALHOST=1)", file=stream)
     print(f"write_status: {result['write_status']}", file=stream)
     for warning in result.get("warnings") or []:
         print(f"warning: {warning}", file=stream)
@@ -1703,6 +1717,7 @@ def cmd_ms365(args: argparse.Namespace) -> int:
         "tenant_id": "",
         "client_id": "",
         "default_upn": "",
+        "allow_localhost": "",
         "write_status": "pending",
         "warnings": warnings,
     }
@@ -1769,6 +1784,10 @@ def cmd_ms365(args: argparse.Namespace) -> int:
                 "MS365_REDIRECT_URI uses plain http on a non-localhost host. "
                 "Entra app registrations require https for public redirect URIs."
             )
+        # Note: the allow-localhost effective value is computed below
+        # (after credential merge); the warning here is harmless when
+        # the allow flag IS set because it just restates the local-dev
+        # opt-in contract. Operators get one clear line either way.
         if parsed.hostname in {"localhost", "127.0.0.1"}:
             warnings.append(
                 "MS365_REDIRECT_URI points at localhost. The MS365 plugin will reject "
@@ -1790,11 +1809,28 @@ def cmd_ms365(args: argparse.Namespace) -> int:
         default_upn = (args.default_upn or inspected["default_upn"]).strip()
         default_scopes = (args.default_scopes or inspected["default_scopes"]).strip()
 
+        # PR #1220 codex r1: preserve the local-dev escape hatch
+        # `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` across reruns.
+        # CLI flag `--allow-localhost` takes priority (writes "1");
+        # otherwise the existing value (if any) survives. Runtime
+        # check in plugins/ms365/server.ts is strict `=== '1'` so we
+        # only persist "1" — any truthy-looking pre-existing value is
+        # treated as enabled and re-normalized to "1" on write.
+        if args.allow_localhost:
+            allow_localhost = "1"
+        else:
+            existing_allow = inspected["allow_localhost"]
+            # Strict equality with the runtime check: only "1" is
+            # honored. Any other pre-existing value is dropped on
+            # rewrite (would not have been honored at runtime anyway).
+            allow_localhost = "1" if existing_allow == "1" else ""
+
         result["redirect_uri"] = redirect_uri
         result["redirect_uri_source"] = redirect_uri_source
         result["tenant_id"] = tenant_id
         result["client_id"] = client_id
         result["default_upn"] = default_upn
+        result["allow_localhost"] = allow_localhost
 
         if not tenant_id:
             warnings.append(
@@ -1826,6 +1862,13 @@ def cmd_ms365(args: argparse.Namespace) -> int:
         # channel-state-dir contract (see discord_dir / teams_dir).
         _isolation_aware_mkdir(ms365_dir, mode=0o2770, agent=args.agent)
         env_lines = [f"MS365_REDIRECT_URI={redirect_uri}"]
+        # PR #1220 codex r1: write the allow-localhost flag IMMEDIATELY
+        # after MS365_REDIRECT_URI so the env file's localhost pair is
+        # visually together for the operator inspecting the file by
+        # hand. Only persisted when "1" — any other value would not be
+        # honored by the runtime check anyway.
+        if allow_localhost == "1":
+            env_lines.append("MS365_REDIRECT_URI_ALLOW_LOCALHOST=1")
         if tenant_id:
             env_lines.append(f"MS365_TENANT_ID={tenant_id}")
         if client_id:
@@ -2146,6 +2189,15 @@ def build_parser() -> argparse.ArgumentParser:
     ms365_parser.add_argument("--client-secret-file", default="")
     ms365_parser.add_argument("--default-upn", default="")
     ms365_parser.add_argument("--default-scopes", default="")
+    # PR #1220 codex r1: explicit opt-in for local-dev redirect URIs.
+    # When set, persists `MS365_REDIRECT_URI_ALLOW_LOCALHOST=1` to
+    # `.ms365/.env`. Without this flag, the wizard preserves any
+    # pre-existing allow value but does not introduce one.
+    ms365_parser.add_argument(
+        "--allow-localhost",
+        action="store_true",
+        help="Persist MS365_REDIRECT_URI_ALLOW_LOCALHOST=1 (local-dev opt-in; the runtime plugin rejects localhost redirect URIs without this flag).",
+    )
     ms365_parser.add_argument("--yes", action="store_true")
     ms365_parser.add_argument("--dry-run", action="store_true")
     ms365_parser.set_defaults(handler=cmd_ms365)
