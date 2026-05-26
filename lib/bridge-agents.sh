@@ -5011,9 +5011,43 @@ bridge_merge_channels_csv() {
   printf '%s' "$merged"
 }
 
+# Canonical marketplace suffix for an un-suffixed built-in plugin name.
+# Returns the marketplace slug (e.g. `agent-bridge`, `claude-plugins-official`)
+# without the leading `@`, or empty string when the name has no canonical home.
+#
+# Issue #1221: `agent create --channels "plugin:teams,plugin:ms365"` regressed
+# in v0.14.5-beta27 because `bridge_qualify_channel_item` only auto-suffixed
+# `teams|discord|telegram`. `ms365` and `mattermost` (also shipped from the
+# agent-bridge marketplace, see `.claude-plugin/marketplace.json`) stayed
+# un-suffixed and downstream `setup ms365` / `agent start` failed the
+# bridge-owned-plugin-manifest gate. Centralising the lookup here means every
+# caller of `bridge_qualify_channel_item` (the central normalizer, explicit
+# roster channels, dev-channel filtering, launch diagnostics) gets the same
+# canonical resolution for the full built-in set without a per-callsite case.
+#
+# Explicit suffixes (e.g. `plugin:teams@cosmax-marketplace`) are never
+# rewritten — `bridge_qualify_channel_item` only consults this table for names
+# that arrive without `@<marketplace>`.
+bridge_builtin_plugin_marketplace() {
+  local plugin_name="${1-}"
+
+  case "$plugin_name" in
+    discord|telegram)
+      printf '%s' "claude-plugins-official"
+      ;;
+    teams|ms365|mattermost)
+      printf '%s' "agent-bridge"
+      ;;
+    *)
+      printf '%s' ""
+      ;;
+  esac
+}
+
 bridge_qualify_channel_item() {
   local item="${1-}"
   local plugin_name=""
+  local marketplace=""
 
   item="$(bridge_trim_whitespace "$item")"
   [[ -n "$item" ]] || {
@@ -5021,25 +5055,13 @@ bridge_qualify_channel_item() {
     return 0
   }
 
-  case "$item" in
-    plugin:discord@claude-plugins-official|plugin:telegram@claude-plugins-official)
-      printf '%s' "$item"
-      return 0
-      ;;
-  esac
-
   if [[ "$item" == plugin:* && "$item" != *@* ]]; then
     plugin_name="${item#plugin:}"
-    case "$plugin_name" in
-      telegram|discord)
-        printf 'plugin:%s@claude-plugins-official' "$plugin_name"
-        return 0
-        ;;
-      teams)
-        printf 'plugin:%s@agent-bridge' "$plugin_name"
-        return 0
-        ;;
-    esac
+    marketplace="$(bridge_builtin_plugin_marketplace "$plugin_name")"
+    if [[ -n "$marketplace" ]]; then
+      printf 'plugin:%s@%s' "$plugin_name" "$marketplace"
+      return 0
+    fi
   fi
 
   printf '%s' "$item"
