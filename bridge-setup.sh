@@ -429,6 +429,56 @@ bridge_setup_replace_agent_telegram_channel() {
   BRIDGE_AGENT_CHANNELS["$agent"]="$merged"
 }
 
+# Issue #1232: per-channel setup verbs (setup teams / discord / telegram /
+# ms365) used to call `bridge_ensure_claude_channel_plugins "$agent"` which
+# walks EVERY entry on BRIDGE_AGENT_CHANNELS[<agent>] and fails the whole
+# verb if any unrelated channel resolves to a marketplace whose source
+# isn't seeded in the bridge-owned plugin manifest. That made a successful
+# `setup teams` look like a failure when an unrelated `plugin:foo@private`
+# marketplace was on the same agent's channel list.
+#
+# This helper restricts the readiness pass to the channel the verb owns:
+# select only the matching item(s) from the agent's CSV (canonicalised
+# via `bridge_qualify_channel_item`), then run the existing
+# `bridge_ensure_claude_channel_plugins_for_csv` walker on that subset.
+#
+# Callers pass the un-suffixed plugin selector (e.g. `plugin:teams`); the
+# function matches `plugin:teams@<any-marketplace>` so an operator that
+# explicitly pinned a non-default marketplace for the channel still gets
+# the readiness pass on their selection. Unrelated channels are
+# untouched — `agent start` already enforces full channel readiness at
+# launch time, which is the correct fail-fast gate for the cross-channel
+# manifest contract.
+bridge_setup_ensure_claude_channel_plugin_for_needle() {
+  local agent="$1"
+  local needle="$2"
+  local current=""
+  local item=""
+  local filtered=""
+  local -a items=()
+
+  [[ -n "$agent" && -n "$needle" ]] || return 0
+  [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 0
+
+  current="$(bridge_agent_channels_csv "$agent")"
+  [[ -n "$current" ]] || return 0
+
+  IFS=',' read -r -a items <<<"$current"
+  for item in "${items[@]}"; do
+    item="$(bridge_trim_whitespace "$item")"
+    [[ -n "$item" ]] || continue
+    item="$(bridge_qualify_channel_item "$item")"
+    case "$item" in
+      "$needle"|"$needle"@*)
+        filtered="$(bridge_append_csv_unique "$filtered" "$item")"
+        ;;
+    esac
+  done
+
+  [[ -n "$filtered" ]] || return 0
+  bridge_ensure_claude_channel_plugins_for_csv "$filtered" "$agent"
+}
+
 bridge_setup_ensure_development_channels_launch_flag() {
   local agent="$1"
   local current=""
@@ -523,7 +573,11 @@ run_discord() {
       bridge_setup_sync_runtime_account "$runtime_config" "$compat_config" "discord" "$channel_account"
       bridge_setup_write_local_assoc "BRIDGE_AGENT_NOTIFY_ACCOUNT" "$agent" "$channel_account" >/dev/null
     fi
-    bridge_ensure_claude_channel_plugins "$agent"
+    # Issue #1232: scope plugin readiness to the channel this verb owns
+    # (plugin:discord). Unrelated channels are validated at `agent start`
+    # time, not here, so a foreign-marketplace channel cannot make
+    # `setup discord` exit non-zero even though Discord was provisioned.
+    bridge_setup_ensure_claude_channel_plugin_for_needle "$agent" "plugin:discord"
     # Issue #989: bridge_setup_add_agent_channel rewrote BRIDGE_AGENT_CHANNELS
     # in agent-roster.local.sh — refresh the isolated agent's cached
     # runtime/agent-env.sh so its launch cmd cannot keep a pre-v2 channel
@@ -595,7 +649,8 @@ run_telegram() {
       bridge_setup_sync_runtime_account "$runtime_config" "$compat_config" "telegram" "$channel_account"
       bridge_setup_write_local_assoc "BRIDGE_AGENT_NOTIFY_ACCOUNT" "$agent" "$channel_account" >/dev/null
     fi
-    bridge_ensure_claude_channel_plugins "$agent"
+    # Issue #1232: scope plugin readiness to plugin:telegram only.
+    bridge_setup_ensure_claude_channel_plugin_for_needle "$agent" "plugin:telegram"
     # Issue #989: bridge_setup_replace_agent_telegram_channel rewrote
     # BRIDGE_AGENT_CHANNELS in agent-roster.local.sh — refresh the isolated
     # agent's cached runtime/agent-env.sh. NO-OP for non-isolated agents.
@@ -678,7 +733,10 @@ run_teams() {
       bridge_setup_sync_runtime_account "$runtime_config" "$compat_config" "teams" "$channel_account"
       bridge_setup_write_local_assoc "BRIDGE_AGENT_NOTIFY_ACCOUNT" "$agent" "$channel_account" >/dev/null
     fi
-    bridge_ensure_claude_channel_plugins "$agent"
+    # Issue #1232: scope plugin readiness to plugin:teams only — a foreign
+    # marketplace declared on the same agent must not make `setup teams`
+    # exit non-zero. `agent start` enforces full channel readiness.
+    bridge_setup_ensure_claude_channel_plugin_for_needle "$agent" "plugin:teams"
     # Issue #989: setup teams rewrote BOTH BRIDGE_AGENT_CHANNELS
     # (bridge_setup_add_agent_channel) AND BRIDGE_AGENT_LAUNCH_CMD
     # (bridge_setup_ensure_development_channels_launch_flag) in
@@ -751,7 +809,8 @@ run_ms365() {
     else
       bridge_info "[info] $agent launch already allows development channels: $(bridge_agent_dev_channels_csv "$agent")"
     fi
-    bridge_ensure_claude_channel_plugins "$agent"
+    # Issue #1232: scope plugin readiness to plugin:ms365 only.
+    bridge_setup_ensure_claude_channel_plugin_for_needle "$agent" "plugin:ms365"
     # Issue #989 (same as teams): refresh the isolated agent's cached
     # runtime/agent-env.sh AFTER writes so the regenerated launch cmd
     # reflects the channel add and the dev-channel launch flag.

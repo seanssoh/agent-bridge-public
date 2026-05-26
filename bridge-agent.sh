@@ -79,7 +79,10 @@ override) — same trust model as 'agent-bridge config set'. Repeatable.
   --launch-cmd-remove-env KEY          remove every KEY=... env-prefix token
   --launch-cmd-add-dev-channel <spec>  append --dangerously-load-development-channels <spec>
   --launch-cmd-remove-dev-channel <spec>
+  --channels <csv>                     alias for --channels-set (matches create-side flag, #1235)
   --channels-set <csv>                 full replace of BRIDGE_AGENT_CHANNELS
+                                       (auto-suffix shorthand + auto-reconcile
+                                       launch_cmd dev-channels per #1235)
   --channels-add <token>               append unique CSV token
   --channels-remove <token>            remove matching CSV token
   --desc <text>                        set BRIDGE_AGENT_DESC
@@ -3770,6 +3773,20 @@ report and reap test-fixture agents per their pattern."
 run_update() {
   local agent="${1:-}"
   shift || true
+
+  # Issue #1236: short-circuit `--help`/`-h`/`help` BEFORE the positional
+  # <agent> binding so `agent-bridge agent update --help` prints usage
+  # instead of treating `--help` as the agent id and falling into the
+  # registry-list error path (universal help gate KNOWN_BROKEN_VERBS row
+  # for "agent update"). Mirrors run_create's pre-bind short-circuit
+  # (issue #526).
+  case "$agent" in
+    -h|--help|help)
+      usage
+      return 0
+      ;;
+  esac
+
   [[ -n "$agent" ]] || bridge_die "Usage: $(basename "$0") update <agent> [...]"
   bridge_require_agent "$agent"
 
@@ -3817,6 +3834,10 @@ run_update() {
   # produces a searchable audit receipt).
   local always_on_intent=""
   local always_on_no_present=0
+  # Issue #1235 scratchpads for the --channels / --channels-set /
+  # --channels-add / --channels-remove auto-qualify path (set -u safe).
+  local _channels_normalized=""
+  local _channels_token=""
 
   add_launch_cmd_op() {
     launch_cmd_ops+="$1"$'\t'"$2"$'\n'
@@ -3893,27 +3914,46 @@ run_update() {
         add_launch_cmd_op "remove-dev-channel" "$2"
         shift 2
         ;;
-      --channels-set)
+      --channels|--channels-set)
+        # Issue #1235 gap (1): `agent create` accepts `--channels`; the
+        # update parser only accepted `--channels-set`. Operators trip on
+        # the asymmetry during routine "trim channels on this agent"
+        # flows. Accept `--channels` as an alias for `--channels-set` so
+        # both verbs share the same flag surface.
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        # Per-token plugin:NAME@SPEC validation on the CSV (codex r1
-        # finding 4). Allow trailing-comma tolerance and skip empty
-        # entries, but reject any non-empty token that fails the shape.
-        bridge_agent_update_validate_channels_csv "--channels-set" "$2"
+        # Issue #1235 gap (2): `agent create --channels` auto-suffixes
+        # un-qualified shorthand (per #1221) via bridge_normalize_channels_csv,
+        # but the update-side `--channels-set` ran token-shape validation
+        # against the RAW input — `plugin:teams` (no `@SPEC`) hit
+        # `bridge_die "token invalid"` instead of resolving to
+        # `plugin:teams@agent-bridge` via the canonical builtin table.
+        # Normalize FIRST through the same helper create uses, then run
+        # the shape validator on the normalized form. Trailing-comma
+        # tolerance + per-token whitespace stripping is preserved by the
+        # normalizer (it skips empty chunks).
+        _channels_normalized="$(bridge_normalize_channels_csv "$2")"
+        bridge_agent_update_validate_channels_csv "$1" "$_channels_normalized"
         channels_set_present=1
-        channels_set_value="$2"
-        add_channels_op "channels-set" "$2"
+        channels_set_value="$_channels_normalized"
+        add_channels_op "channels-set" "$_channels_normalized"
         shift 2
         ;;
       --channels-add)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        bridge_agent_update_validate_channel_token "--channels-add" "$2"
-        add_channels_op "channels-add" "$2"
+        # Issue #1235 gap (2) for single-token forms: qualify the token
+        # via bridge_qualify_channel_item so the shorthand `plugin:teams`
+        # resolves to `plugin:teams@agent-bridge` before validation, matching
+        # the create-side semantics.
+        _channels_token="$(bridge_qualify_channel_item "$2")"
+        bridge_agent_update_validate_channel_token "--channels-add" "$_channels_token"
+        add_channels_op "channels-add" "$_channels_token"
         shift 2
         ;;
       --channels-remove)
         [[ $# -ge 2 ]] || bridge_die "옵션 값이 필요합니다: $1"
-        bridge_agent_update_validate_channel_token "--channels-remove" "$2"
-        add_channels_op "channels-remove" "$2"
+        _channels_token="$(bridge_qualify_channel_item "$2")"
+        bridge_agent_update_validate_channel_token "--channels-remove" "$_channels_token"
+        add_channels_op "channels-remove" "$_channels_token"
         shift 2
         ;;
       --json)
@@ -4246,17 +4286,9 @@ run_update() {
     bridge_die "deny: $deny_reason"
   fi
 
-  # Compute the new launch_cmd value.
-  local new_launch_cmd="$before_launch_cmd"
-  local launch_actions_json="[]"
-  if [[ -n "$launch_cmd_ops" ]]; then
-    local lc_output
-    lc_output="$(printf '%s' "$launch_cmd_ops" | bridge_agent_update_apply_launch_cmd "$before_launch_cmd")"
-    new_launch_cmd="$(printf '%s\n' "$lc_output" | sed -n '1p')"
-    launch_actions_json="$(printf '%s\n' "$lc_output" | sed -n '2p')"
-  fi
-
-  # Compute the new channels CSV value.
+  # Compute the new channels CSV value FIRST so the launch_cmd
+  # reconciliation pass below can derive the dev-channel diff against
+  # the post-mutation channel set.
   local new_channels="$before_channels"
   local channels_actions_json="[]"
   if [[ -n "$channels_ops" ]]; then
@@ -4264,6 +4296,66 @@ run_update() {
     ch_output="$(printf '%s' "$channels_ops" | bridge_agent_update_apply_channels "$before_channels")"
     new_channels="$(printf '%s\n' "$ch_output" | sed -n '1p')"
     channels_actions_json="$(printf '%s\n' "$ch_output" | sed -n '2p')"
+  fi
+
+  # Issue #1235 gap (3): when the operator mutates the channel set via
+  # `--channels` / `--channels-set` / `--channels-add` / `--channels-remove`,
+  # any dev-channel CSV flags (`--dangerously-load-development-channels`)
+  # in the existing launch_cmd that correspond to dropped channels become
+  # orphans — the next `agent start` would silently re-load the removed
+  # channels via the CLI flag and defeat the channel-set update. The
+  # operator previously had to chase each orphan with a second
+  # `agent update --launch-cmd-remove-dev-channel <spec>` pass.
+  #
+  # Reconcile automatically by computing the dev-channel diff between
+  # `before_channels` and `new_channels` (both filtered to non-official
+  # plugin channels via bridge_filter_development_channels_csv) and
+  # appending the corresponding `remove-dev-channel <spec>` /
+  # `add-dev-channel <spec>` ops to the launch_cmd op stream. The
+  # applier already enforces idempotency, so if the operator also passed
+  # an explicit `--launch-cmd-add-dev-channel` for one of these specs
+  # (e.g. a channel they declared via --channels), the reconciliation
+  # add will no-op.
+  if [[ -n "$channels_ops" ]]; then
+    local _before_dev _after_dev _dev_item
+    _before_dev="$(bridge_filter_development_channels_csv "$before_channels")"
+    _after_dev="$(bridge_filter_development_channels_csv "$new_channels")"
+    # Removed dev channels (present before, absent after) → emit remove ops.
+    if [[ -n "$_before_dev" ]]; then
+      local -a _before_dev_items=()
+      IFS=',' read -r -a _before_dev_items <<<"$_before_dev"
+      for _dev_item in "${_before_dev_items[@]}"; do
+        _dev_item="$(bridge_trim_whitespace "$_dev_item")"
+        [[ -n "$_dev_item" ]] || continue
+        if ! bridge_channel_csv_contains "$_after_dev" "$_dev_item"; then
+          add_launch_cmd_op "remove-dev-channel" "$_dev_item"
+        fi
+      done
+    fi
+    # Added dev channels (absent before, present after) → emit add ops.
+    if [[ -n "$_after_dev" ]]; then
+      local -a _after_dev_items=()
+      IFS=',' read -r -a _after_dev_items <<<"$_after_dev"
+      for _dev_item in "${_after_dev_items[@]}"; do
+        _dev_item="$(bridge_trim_whitespace "$_dev_item")"
+        [[ -n "$_dev_item" ]] || continue
+        if ! bridge_channel_csv_contains "$_before_dev" "$_dev_item"; then
+          add_launch_cmd_op "add-dev-channel" "$_dev_item"
+        fi
+      done
+    fi
+  fi
+
+  # Compute the new launch_cmd value (now reflects both the operator's
+  # explicit launch_cmd mutations AND the auto-reconciliation ops queued
+  # above).
+  local new_launch_cmd="$before_launch_cmd"
+  local launch_actions_json="[]"
+  if [[ -n "$launch_cmd_ops" ]]; then
+    local lc_output
+    lc_output="$(printf '%s' "$launch_cmd_ops" | bridge_agent_update_apply_launch_cmd "$before_launch_cmd")"
+    new_launch_cmd="$(printf '%s\n' "$lc_output" | sed -n '1p')"
+    launch_actions_json="$(printf '%s\n' "$lc_output" | sed -n '2p')"
   fi
 
   # Merge actions arrays for the result envelope + audit row.
