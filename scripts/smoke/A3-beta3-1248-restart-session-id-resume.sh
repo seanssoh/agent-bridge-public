@@ -49,6 +49,20 @@
 #       T4's contract no longer holds. Asserts the structured remediation
 #       text is present in bridge-run.sh — if removed, fails citing
 #       #1248.
+#   T8 (r2, codex r1 BLOCKING): `bridge-start.sh`'s post-startup
+#       `bridge_refresh_agent_session_id` call must NOT swallow stderr or
+#       use `|| true`. The function `bridge_die`s on persist-write
+#       failure; the prior shape `>/dev/null 2>&1 || true` redirected the
+#       structured reason to /dev/null AND could not intercept the
+#       process-exiting `bridge_die`, so bridge-start.sh died silently
+#       after tmux creation. Asserts (a) the broken shape (re-introduced
+#       via a stubbed `f(){ exit 1; }`) reproduces the silent-death
+#       symptom and (b) the post-r2 shape lets the structured stderr
+#       reach the parent.
+#   T9 (teeth, r2): grep-asserts bridge-start.sh does NOT contain the
+#       `>/dev/null 2>&1 ... || true` swallow on the
+#       `bridge_refresh_agent_session_id` call site — if a future PR
+#       re-introduces it, this smoke fails citing codex r1 finding.
 #
 # Isolation: temp BRIDGE_HOME with v2 layout via smoke_setup_bridge_home;
 # the smoke never reads or writes the operator's live runtime.
@@ -404,6 +418,126 @@ test_teeth_layer3_gate_present() {
   fi
 }
 
+# ---------------------------------------------------------------------
+# T8 (r2, codex r1 BLOCKING) — bridge-start.sh's
+# bridge_refresh_agent_session_id call must NOT swallow stderr or `|| true`
+# the process-exiting `bridge_die`. The broken pre-r2 shape was
+# `>/dev/null 2>&1 || true`, which (a) redirected the structured reason
+# to /dev/null and (b) could not intercept `bridge_die`'s `exit 1` — so
+# bridge-start.sh died silently after tmux creation, swallowing
+# `state_dir_write_failed:session_id`.
+#
+# We don't invoke the real bridge-start.sh (it requires tmux + a real
+# session). Instead we exercise the exact bash behavior the codex finding
+# names: a stubbed `f(){ ... exit 1; }` (mimicking bridge_die) called under
+# both the broken and fixed shape, in a child bash with `set -e` to mirror
+# bridge-start.sh's runtime. This is the same probe codex used in the
+# brief.
+# ---------------------------------------------------------------------
+test_bridge_start_no_swallow_on_exit() {
+  local broken_out="$SMOKE_TMP_ROOT/t8-broken.out"
+  local broken_err="$SMOKE_TMP_ROOT/t8-broken.err"
+  local broken_rc=0
+  # Broken pre-r2 shape: stderr redirected to /dev/null AND `|| true` cannot
+  # intercept exit 1. The "survived" echo line must NOT execute (proves
+  # bridge-start.sh died silently), AND the structured reason must NOT
+  # appear in stderr (proves the swallow was hiding it).
+  set +e
+  bash -c '
+    set -euo pipefail
+    f(){ echo "state_dir_write_failed:session_id agent=t8 path=/p rc=1" >&2; exit 1; }
+    f >/dev/null 2>&1 || true
+    echo "survived" >&2
+  ' >"$broken_out" 2>"$broken_err"
+  broken_rc=$?
+  set -e
+  local broken_err_body=""
+  broken_err_body="$(cat "$broken_err" 2>/dev/null || true)"
+  if (( broken_rc == 0 )); then
+    smoke_fail "T8 broken shape rc=0 — expected the stub bash to inherit the exit and die"
+  fi
+  smoke_assert_not_contains "$broken_err_body" "survived" \
+    "T8 broken shape: 'survived' must not execute (bridge_die exit cannot be intercepted)"
+  smoke_assert_not_contains "$broken_err_body" "state_dir_write_failed:session_id" \
+    "T8 broken shape: structured reason swallowed by 2>&1 (this is the codex r1 symptom)"
+
+  # Fixed post-r2 shape: drop `2>&1` and `|| true`. Stderr is preserved;
+  # bridge_die's structured reason reaches the parent. The parent still
+  # dies (bridge_die's exit propagates) but loud, with the structured
+  # reason visible to the operator.
+  local fixed_out="$SMOKE_TMP_ROOT/t8-fixed.out"
+  local fixed_err="$SMOKE_TMP_ROOT/t8-fixed.err"
+  local fixed_rc=0
+  set +e
+  bash -c '
+    set -euo pipefail
+    f(){ echo "state_dir_write_failed:session_id agent=t8 path=/p rc=1" >&2; exit 1; }
+    f >/dev/null
+    echo "survived" >&2
+  ' >"$fixed_out" 2>"$fixed_err"
+  fixed_rc=$?
+  set -e
+  local fixed_err_body=""
+  fixed_err_body="$(cat "$fixed_err" 2>/dev/null || true)"
+  if (( fixed_rc == 0 )); then
+    smoke_fail "T8 fixed shape rc=0 — bridge_die's exit must still propagate"
+  fi
+  smoke_assert_contains "$fixed_err_body" "state_dir_write_failed:session_id" \
+    "T8 fixed shape: structured reason now reaches stderr (codex r1 BLOCKING closed)"
+  smoke_assert_not_contains "$fixed_err_body" "survived" \
+    "T8 fixed shape: bridge_die's exit still propagates (no silent continuation)"
+}
+
+# ---------------------------------------------------------------------
+# T9 (teeth, r2) — grep-asserts bridge-start.sh's call site does NOT
+# re-introduce the `>/dev/null 2>&1 ... || true` swallow on
+# bridge_refresh_agent_session_id. If a future PR adds the swallow back,
+# this smoke fails citing the codex r1 finding on PR #1259.
+# ---------------------------------------------------------------------
+test_teeth_bridge_start_no_swallow() {
+  local start_sh="$REPO_ROOT/bridge-start.sh"
+  smoke_assert_file_exists "$start_sh" \
+    "T9 teeth: bridge-start.sh exists"
+
+  # Find every NON-COMMENT line that calls bridge_refresh_agent_session_id
+  # in bridge-start.sh. There should currently be exactly one such call
+  # site (post-launch session_id capture). Each line must NOT contain the
+  # combined `2>&1` + `|| true` swallow shape, and must not redirect
+  # stderr to /dev/null.
+  #
+  # The grep filter strips `LINENO:` prefix first and skips lines whose
+  # post-LINENO content starts with `#` (comments). Without the strip,
+  # the r2-added explanatory comment in bridge-start.sh that documents
+  # the OLD broken shape would false-positive this check.
+  local call_lines=""
+  call_lines="$(
+    grep -n 'bridge_refresh_agent_session_id' "$start_sh" \
+      | awk -F: '{
+          ln=$1; sub(/^[^:]*:/, "", $0);
+          # $0 is now the line content; ltrim and skip comments.
+          s=$0; sub(/^[[:space:]]+/, "", s);
+          if (s ~ /^#/) next;
+          print ln ":" $0;
+        }' \
+      || true
+  )"
+  if [[ -z "$call_lines" ]]; then
+    smoke_fail "T9 teeth: bridge-start.sh has no non-comment bridge_refresh_agent_session_id call — issue #1248 regressed (call removed?)"
+  fi
+
+  # Inspect each call line for the swallow shape.
+  local line=""
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" == *"2>&1"* && "$line" == *"|| true"* ]]; then
+      smoke_fail "T9 teeth: bridge-start.sh re-introduced the '2>&1 ... || true' swallow on bridge_refresh_agent_session_id (codex r1 BLOCKING on PR #1259): $line"
+    fi
+    if [[ "$line" == *">/dev/null 2>&1"* ]]; then
+      smoke_fail "T9 teeth: bridge-start.sh redirects bridge_refresh_agent_session_id stderr to /dev/null — structured 'state_dir_write_failed:session_id' would be hidden: $line"
+    fi
+  done <<<"$call_lines"
+}
+
 smoke_run "T1 persist-write failure fails loud"               test_persist_failure_fails_loud
 smoke_run "T2 successful persist emits [session-id]"          test_success_emits_breadcrumb
 smoke_run "T3 continue=1 + sid present -> --resume verb"      test_continue1_with_session_id_emits_resume
@@ -411,5 +545,7 @@ smoke_run "T4 continue=1 + sid empty -> fail-loud + remediation" test_continue1_
 smoke_run "T5 continue=0 / --no-continue -> no resume verb"   test_continue0_emits_no_resume_verb
 smoke_run "T6 teeth: Layer-2 fail-loud fix present"           test_teeth_layer2_fix_present
 smoke_run "T7 teeth: Layer-3 reconcile gate present"          test_teeth_layer3_gate_present
+smoke_run "T8 bridge-start.sh stderr no longer swallowed"     test_bridge_start_no_swallow_on_exit
+smoke_run "T9 teeth: bridge-start.sh has no 2>&1+|| true swallow" test_teeth_bridge_start_no_swallow
 
 smoke_log "all checks passed"
