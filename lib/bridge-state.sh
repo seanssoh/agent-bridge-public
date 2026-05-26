@@ -2071,6 +2071,64 @@ bridge_agent_idle_marker_dir() {
   printf '%s/%s' "$BRIDGE_ACTIVE_AGENT_DIR" "$agent"
 }
 
+# #1252: best-effort self-heal for the per-agent state leaf
+# `state/agents/<agent>/`. The directory MUST be created at
+# `agent create` time (lib/bridge-agents.sh -> matrix apply ->
+# state-agent-dir row), but if for any reason it is absent at runtime
+# (e.g. operator-side rm -rf, partial restore from backup, fresh-install
+# OOTB race) every daemon write into it fails with `Permission denied`
+# and the nudge path silently drops.
+#
+# Returns 0 on existing-or-created, 1 on creation failure. Never side-
+# effects beyond `mkdir -m 2770` + best-effort chgrp. Callers that need
+# the canonical 2770/ab-agent-<X> ownership should still rely on the
+# matrix apply at agent-create time — this helper is the "catch absurd
+# absence" floor, not a substitute for the matrix.
+#
+# Idempotent. Safe to call from every nudge tick (cost = one stat).
+bridge_agent_state_dir_self_heal() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+  local dir
+  dir="$(bridge_agent_idle_marker_dir "$agent")"
+  if [[ -d "$dir" ]]; then
+    return 0
+  fi
+  # Try a plain `mkdir -m 2770` first — the parent state/agents/ root is
+  # 0711 (others --x; see lib/bridge-isolation-v2.sh::state-agents-root
+  # row) so the controller can create children there as itself. If the
+  # mkdir fails (parent missing, EACCES because state/agents/ was hand-
+  # mutated, etc.), surface a structured warning so the operator can
+  # find the failed self-heal in the daemon log.
+  # shellcheck disable=SC2174  # only the leaf needs 2770 — parent state/agents/ is created by isolation-v2 matrix apply (state-agents-root row, mode 0711)
+  if mkdir -m 2770 -p "$dir" 2>/dev/null; then
+    # Best-effort chgrp to ab-agent-<agent> when the helper is loaded
+    # and the group resolves. Non-fatal on any failure — the matrix
+    # apply at agent-create time is the canonical owner-fixer; this is
+    # purely a floor against silent-drop.
+    if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+      local _agent_grp
+      _agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+      if [[ -n "$_agent_grp" ]]; then
+        chgrp "$_agent_grp" "$dir" 2>/dev/null || true
+      fi
+    fi
+    # Silent on success — emitting a warn here pollutes `--json` output
+    # surfaces (bridge-agent.sh create --json) where stderr and stdout
+    # are merged by callers. The audit-log row (when bridge_audit_log
+    # is loaded) records the self-heal for operator forensics without
+    # polluting CLI output.
+    if command -v bridge_audit_log >/dev/null 2>&1; then
+      bridge_audit_log daemon state_dir_self_heal "$agent" \
+        --detail dir="$dir" \
+        --detail outcome=created 2>/dev/null || true
+    fi
+    return 0
+  fi
+  bridge_warn "bridge_agent_state_dir_self_heal: cannot create '$dir' for agent='$agent' (mkdir failed); writes will continue to fail until \`agent-bridge isolation reconcile --apply --agent $agent\` runs"
+  return 1
+}
+
 bridge_agent_runtime_state_dir() {
   local agent="$1"
   if bridge_isolation_v2_active && [[ -n "${BRIDGE_AGENT_ROOT_V2:-}" && -n "$agent" ]]; then

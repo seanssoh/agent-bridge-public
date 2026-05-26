@@ -100,18 +100,78 @@ _bridge_daemon_control_resolve_gid() {
 # the target GID in its /proc/<pid>/status Groups line; rc=1 otherwise.
 # rc=2 if the daemon is not running or its /proc/<pid>/status cannot be
 # read (so callers can distinguish "no daemon" from "wrong groups").
+#
+# #1246: When BRIDGE_DAEMON_CONTROL_DECISION_LOG is set, this helper
+# ALSO emits a single structured decision-evidence line to that file
+# path so the operator can see *which* PID was probed, *what* groups
+# were observed, and *which* outcome was returned. Without that the
+# pre-check at lines 348/383 below could silently false-positive
+# (return 0 with stale on-disk cache) and the systemd-user auto-restart
+# branch at lines 404+ never fires.
+#
+# Format (single line, no trailing newline beyond the literal \n):
+#   [daemon-control] supp-group check: pid=<P> in_proc=<G1,G2,...> target_gid=<G> action=<refresh|skip> reason=<rationale>
 _bridge_daemon_control_daemon_has_gid() {
   local target_gid="$1"
   [[ -n "$target_gid" ]] || return 2
   local pid
   pid="$(bridge_daemon_pid 2>/dev/null || true)"
-  [[ -n "$pid" ]] || return 2
+  [[ -n "$pid" ]] || {
+    _bridge_daemon_control_emit_decision_log \
+      "" "" "$target_gid" "skip" "daemon-not-running"
+    return 2
+  }
   local groups_output
-  groups_output="$(_bridge_daemon_control_proc_groups "$pid" 2>/dev/null)" || return 2
+  groups_output="$(_bridge_daemon_control_proc_groups "$pid" 2>/dev/null)" || {
+    _bridge_daemon_control_emit_decision_log \
+      "$pid" "" "$target_gid" "skip" "proc-status-unreadable"
+    return 2
+  }
+  # Normalize for the decision log: space-or-newline separated → comma.
+  # Use `tr -s` to squeeze runs of whitespace, then tr space→comma; this
+  # is portable across BSD/GNU sed (sed `\+` is a GNU-only extension).
+  local _flat_groups
+  _flat_groups="$(printf '%s' "$groups_output" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //; s/ $//' | tr ' ' ',')"
   if printf '%s\n' "$groups_output" | grep -Fxq -- "$target_gid"; then
+    _bridge_daemon_control_emit_decision_log \
+      "$pid" "$_flat_groups" "$target_gid" "skip" "already-has-group"
     return 0
   fi
+  _bridge_daemon_control_emit_decision_log \
+    "$pid" "$_flat_groups" "$target_gid" "refresh" "missing-from-supp-set"
   return 1
+}
+
+# #1246: emit the structured decision-evidence line. Writes to
+# BRIDGE_DAEMON_CONTROL_DECISION_LOG when set; otherwise emits to the
+# daemon log via daemon_info when that helper is loaded; otherwise
+# silently no-ops. Single-line, fixed-shape so log scrapers can grep
+# the fixed prefix and parse the fields without parsing variable text.
+_bridge_daemon_control_emit_decision_log() {
+  local pid="$1"
+  local in_proc="$2"
+  local target_gid="$3"
+  local action="$4"
+  local reason="$5"
+  local line
+  line="$(printf '[daemon-control] supp-group check: pid=%s in_proc=%s target_gid=%s action=%s reason=%s' \
+    "${pid:-}" "${in_proc:-}" "${target_gid:-}" "${action:-}" "${reason:-}")"
+  if [[ -n "${BRIDGE_DAEMON_CONTROL_DECISION_LOG:-}" ]]; then
+    # Best-effort append; never fail the caller on log-write errors.
+    printf '%s\n' "$line" >>"$BRIDGE_DAEMON_CONTROL_DECISION_LOG" 2>/dev/null || true
+    return 0
+  fi
+  if command -v daemon_info >/dev/null 2>&1; then
+    daemon_info "$line" 2>/dev/null || true
+    return 0
+  fi
+  if command -v bridge_warn >/dev/null 2>&1; then
+    # bridge_warn is the only logger guaranteed to exist when this lib
+    # is sourced standalone (test fixtures). Route through it so the
+    # evidence still lands somewhere the operator can find.
+    bridge_warn "$line" 2>/dev/null || true
+  fi
+  return 0
 }
 
 # Sanitize a free-form reason string to the codex r3 §3 character class.

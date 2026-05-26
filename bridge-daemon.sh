@@ -3961,6 +3961,8 @@ nudge_agent_session() {
       --detail claimed_snapshot="$claimed" \
       --detail queued_live="$live_queued" \
       --detail claimed_live="$live_claimed"
+    # #1252: structured audit log so silent-skip never repeats undetected.
+    daemon_info "[nudge-skip] agent=${agent} task=- reason=live-queued-empty evidence=snapshot_queued=${queued},live_queued=${live_queued}"
     daemon_info "skipped stale nudge for ${agent} (snapshot queued=${queued}, live queued=${live_queued})"
     return 0
   fi
@@ -4007,6 +4009,8 @@ nudge_agent_session() {
           --detail reason=live_recheck_no_eligible_tasks \
           --detail redelivery_seconds="$redelivery_seconds" \
           --detail live_nudge_key="${live_nudge_key:-$nudge_key}"
+        # #1252: structured audit log so silent-skip never repeats undetected.
+        daemon_info "[nudge-skip] agent=${agent} task=- reason=age-gate-failed evidence=live_queued=${live_queued},redelivery=${redelivery_seconds}s"
         daemon_info "skipped stale nudge for ${agent} (live recheck found no age-eligible tasks; live queued=${live_queued}, redelivery=${redelivery_seconds}s)"
         return 0
       fi
@@ -4037,6 +4041,8 @@ nudge_agent_session() {
       --detail queued="$live_queued" \
       --detail claimed="$live_claimed" \
       --detail redelivery_seconds="${BRIDGE_DAEMON_NUDGE_REDELIVERY_SECONDS:-60}"
+    # #1252: structured audit log so silent-skip never repeats undetected.
+    daemon_info "[nudge-skip] agent=${agent} task=- reason=dedup-cooldown evidence=fingerprint=${nudge_fingerprint:0:8},queued=${live_queued}"
     daemon_info "skipped duplicate nudge for ${agent} (fingerprint=${nudge_fingerprint:0:8}, queued=${live_queued})"
     return 0
   fi
