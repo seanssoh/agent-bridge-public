@@ -11497,6 +11497,16 @@ bash "$REPO_ROOT/scripts/smoke/bridge-daemon-cron-no-deadlock.sh"
 log "running daemon-tick-guards-l2-l4 smoke (refs #946 L2+L4, PR #952)"
 bash "$REPO_ROOT/scripts/smoke/daemon-tick-guards-l2-l4.sh"
 
+# Issue #1234 (v0.15.0-beta2 Lane δ) — daemon auto-start loops on agents
+# with intentionally incomplete channel setup. `agent update --start-policy
+# hold|auto` adds an explicit operator affordance; the daemon also
+# auto-holds when channel_status==miss and names the actual blocker
+# (`channel-required-validator-miss: <reason>`) instead of the opaque
+# `start-command-failed`. Smoke pins the hold gate + reader normalisation +
+# validator-miss reason at the function level.
+log "running δ-1234-daemon-start-policy smoke (issue #1234, v0.15.0-beta2 Lane δ)"
+bash "$REPO_ROOT/scripts/smoke/δ-1234-daemon-start-policy.sh"
+
 # bridge-watchdog-silence.py previously truncated captured daemon
 # stop/start output to the last line, so every wedge from 2026-05-15
 # onward surfaced the same v0.8.0 ACL background sentence in the

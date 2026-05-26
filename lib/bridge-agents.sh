@@ -3445,6 +3445,10 @@ declare -g -A BRIDGE_AGENT_HISTORY_KEY=()
 declare -g -A BRIDGE_AGENT_CREATED_AT=()
 declare -g -A BRIDGE_AGENT_UPDATED_AT=()
 declare -g -A BRIDGE_AGENT_IDLE_TIMEOUT=()
+# Issue #1234 (Lane δ): per-agent daemon auto-start policy mirrored into the
+# isolated agent-env snapshot so a scoped roster load preserves "hold" when
+# operating from the iso side. Assoc array (never scalar — refs #1213).
+declare -g -A BRIDGE_AGENT_START_POLICY=()
 declare -g -A BRIDGE_AGENT_NOTIFY_KIND=()
 declare -g -A BRIDGE_AGENT_NOTIFY_TARGET=()
 declare -g -A BRIDGE_AGENT_NOTIFY_ACCOUNT=()
@@ -8092,6 +8096,27 @@ bridge_agent_is_always_on() {
   timeout="$(bridge_agent_idle_timeout "$agent")"
   [[ "$timeout" =~ ^[0-9]+$ ]] || return 1
   (( timeout == 0 ))
+}
+
+# Issue #1234 (Lane δ): per-agent daemon auto-start policy reader. Operator
+# sets via `agent update --start-policy hold|auto`; the daemon's always-on
+# autostart loop consults this before invoking bridge-start.sh. Unset / blank
+# / unknown values default to "auto" so existing agents keep their warm
+# always-on semantics. Stored in BRIDGE_AGENT_START_POLICY (associative
+# array) so subprocess env-export never collapses it to a scalar — refs
+# #1213 collision class.
+bridge_agent_start_policy() {
+  local agent="$1"
+  local value="${BRIDGE_AGENT_START_POLICY[$agent]-}"
+  case "$value" in
+    hold|auto) printf '%s' "$value" ;;
+    *)         printf '%s' "auto" ;;
+  esac
+}
+
+bridge_agent_start_policy_configured() {
+  local agent="$1"
+  [[ -v "BRIDGE_AGENT_START_POLICY[$agent]" ]]
 }
 
 bridge_agent_memory_daily_refresh_enabled() {
