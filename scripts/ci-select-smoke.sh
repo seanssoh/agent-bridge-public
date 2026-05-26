@@ -1120,7 +1120,15 @@ select_for_path() {
       # false-positive-reporting `missing_files: CLAUDE.md, SOUL.md, …`
       # on every cron tick. Pull 1108-watchdog-v2-workdir on every
       # watchdog move so the dual-tree confusion class stays caught.
-      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill queue
+      # v0.15.0-beta2 lane ε: #1233 adds the `watchdog rescan` verb
+      # (writes latest.md immediately, bypasses the daemon cooldown by
+      # construction); #1237 adds the engine-native Codex contract
+      # (validates AGENTS.md) and re-routes engines with no implemented
+      # contract to `unsupported_engine_contract` instead of silent OK.
+      # Pull ε-watchdog-rescan-codex on every watchdog move so a future
+      # PR cannot regress either contract or accidentally re-introduce
+      # the silent-codex / silent-unknown-engine path.
+      add_required watchdog-profile-contract watchdog-registry-anchored watchdog-silence-stderr-capture 1108-watchdog-v2-workdir 1119-watchdog-perm-error 1113-watchdog-legacy-backfill ε-watchdog-rescan-codex queue
       add_integration integration-minimal
       ;;
 

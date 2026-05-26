@@ -10,6 +10,15 @@
 # signals it gates. The regression of record is the antigravity engine
 # (v0.14.5) surfacing as a false status=error, plus the guard that a Claude
 # static agent with missing files must still classify as error.
+#
+# #1237 (v0.15.0-beta2 lane ε): Codex now has its own engine-native
+# contract — has_codex_profile_contract returns True for codex+static and
+# the required-file set is CODEX_REQUIRED_FILES (AGENTS.md). Engines that
+# have NO implemented contract (antigravity, any future engine string)
+# classify as ``unsupported_engine_contract`` instead of the pre-#1237
+# silent-OK or conservative-Claude-default behaviors — codex r1 directive:
+# "Unknown engines should remain conservative … status must say
+# `unsupported_engine_contract` rather than silently OK".
 
 import importlib.util
 import pathlib
@@ -32,9 +41,11 @@ def main() -> int:
     spec.loader.exec_module(module)
 
     has_contract = module.has_home_profile_contract
+    has_codex_contract = module.has_codex_profile_contract
     required_profile_files = module.required_profile_files
     classify_status = module.classify_status
     claude_required = module.CLAUDE_REQUIRED_FILES
+    codex_required = module.CODEX_REQUIRED_FILES
 
     failures: list[str] = []
 
@@ -44,21 +55,38 @@ def main() -> int:
         else:
             print(f"  PASS  {label} = {got!r}")
 
-    # --- has_home_profile_contract --------------------------------------
+    # --- has_home_profile_contract (Claude only post-#1237) -------------
     check("contract: claude+static", has_contract("claude", "static"), True)
     check("contract: claude+unknown-source", has_contract("claude", ""), True)
     check("contract: claude+dynamic", has_contract("claude", "dynamic"), False)
-    check("contract: codex+static", has_contract("codex", "static"), False)
-    check("contract: codex+dynamic", has_contract("codex", "dynamic"), False)
-    # The antigravity regression: a *known* newer engine must be exempt
-    # by construction (it is in NON_CONTRACT_ENGINES).
+    # has_home_profile_contract is the *Claude*-specific predicate. Codex
+    # under #1237 has its own engine-native contract (see
+    # has_codex_profile_contract below); it MUST return False from the
+    # Claude predicate so a codex agent does not get the Claude-profile
+    # drift overlay applied on top of its Codex check.
+    check("contract: codex+static (claude-side)", has_contract("codex", "static"), False)
+    check("contract: codex+dynamic (claude-side)", has_contract("codex", "dynamic"), False)
+    # antigravity and any future-unknown engine: not Claude — same path
+    # as codex from the Claude-predicate's POV. They differ in
+    # classify_status (codex has a contract; antigravity / future-engine
+    # surface as `unsupported_engine_contract`).
     check("contract: antigravity+static", has_contract("antigravity", "static"), False)
     check("contract: antigravity+dynamic", has_contract("antigravity", "dynamic"), False)
-    # An *unknown* engine string is NOT exempted — it stays under the
-    # conservative Claude-default contract so a new engine surfaces as
-    # drift instead of silently skipping the check.
-    check("contract: unknown-engine+static", has_contract("future-engine", "static"), True)
+    check("contract: unknown-engine+static", has_contract("future-engine", "static"), False)
     check("contract: unknown-engine+dynamic", has_contract("future-engine", "dynamic"), False)
+
+    # --- has_codex_profile_contract (#1237) ------------------------------
+    check("codex-contract: codex+static", has_codex_contract("codex", "static"), True)
+    check("codex-contract: codex+unknown-source", has_codex_contract("codex", ""), True)
+    # Dynamic codex is still waived (#907 fresh-provision rule applies
+    # regardless of engine).
+    check("codex-contract: codex+dynamic", has_codex_contract("codex", "dynamic"), False)
+    check("codex-contract: claude+static", has_codex_contract("claude", "static"), False)
+    check(
+        "codex-contract: antigravity+static",
+        has_codex_contract("antigravity", "static"),
+        False,
+    )
 
     # --- required_profile_files -----------------------------------------
     check(
@@ -71,7 +99,17 @@ def main() -> int:
         required_profile_files("claude"),
         claude_required,
     )
-    check("required: codex+static -> ()", required_profile_files("codex", "static"), ())
+    # #1237: codex now has its own required-file set.
+    check(
+        "required: codex+static -> CODEX_REQUIRED_FILES",
+        required_profile_files("codex", "static"),
+        codex_required,
+    )
+    check(
+        "required: codex+dynamic -> ()",
+        required_profile_files("codex", "dynamic"),
+        (),
+    )
     check(
         "required: antigravity+static -> ()",
         required_profile_files("antigravity", "static"),
@@ -82,11 +120,13 @@ def main() -> int:
         required_profile_files("claude", "dynamic"),
         (),
     )
-    # An unknown engine stays under the conservative contract.
+    # An unknown engine has no required-file set — it surfaces as
+    # `unsupported_engine_contract` in classify_status rather than being
+    # held to a conservative Claude default it has no business satisfying.
     check(
-        "required: unknown-engine+static -> CLAUDE_REQUIRED_FILES",
+        "required: unknown-engine+static -> ()",
         required_profile_files("future-engine", "static"),
-        claude_required,
+        (),
     )
 
     # --- classify_status: regression guard ------------------------------
@@ -99,27 +139,30 @@ def main() -> int:
         ),
         "error",
     )
-    # An unknown engine is held to the conservative contract: missing
-    # files still escalate to error.
+    # #1237: a codex static agent missing its Codex-required file must
+    # error. Pre-#1237 codex was a silent-OK allowlist entry; the
+    # engine-native contract means a real missing AGENTS.md now surfaces.
     check(
-        "classify: unknown-engine+static+missing-files -> error",
+        "classify: codex+static+missing-files -> error",
         classify_status(
-            ["CLAUDE.md"], [], "complete", False,
-            session_type="", agent_source="static", engine="future-engine",
+            ["AGENTS.md"], [], "missing", False,
+            session_type="unknown", agent_source="static", engine="codex",
         ),
         "error",
     )
-    # classify_status gates missing_files through the predicate too: a
-    # non-contract agent with missing_files passed in must not error,
-    # independent of whether the caller pre-emptied `required`.
+    # #1237: a codex static agent with no missing required files
+    # classifies ok. Claude-only signals (missing managed block, pending
+    # onboarding) are explicitly ignored for codex.
     check(
-        "classify: codex+static+missing-files -> ok",
+        "classify: codex+static+missing-block -> ok (claude-only signal)",
         classify_status(
-            ["CLAUDE.md"], [], "missing", False,
+            [], [], "missing", True,
             session_type="unknown", agent_source="static", engine="codex",
         ),
         "ok",
     )
+    # Dynamic agent of any engine: contract is fully waived (#907),
+    # caller-supplied missing_files passed in MUST NOT escalate.
     check(
         "classify: claude+dynamic+missing-files -> ok",
         classify_status(
@@ -128,18 +171,47 @@ def main() -> int:
         ),
         "ok",
     )
-
-    # --- classify_status: antigravity exemptions (the fix) --------------
-    # antigravity static with no profile files reported (required is now
-    # empty so missing_files is []), missing managed block, pending
-    # onboarding -> ok, not warn/error.
     check(
-        "classify: antigravity+static+missing-block -> ok",
+        "classify: codex+dynamic+missing-files -> ok",
+        classify_status(
+            ["AGENTS.md"], [], "pending", False,
+            session_type="dynamic", agent_source="dynamic", engine="codex",
+        ),
+        "ok",
+    )
+
+    # --- classify_status: unsupported-engine path (#1237 r1) -------------
+    # An engine with no implemented contract MUST classify as
+    # `unsupported_engine_contract` rather than silently OK or as an
+    # error against a contract it has no business being held to. The two
+    # call sites of record: antigravity (known but no contract yet) and
+    # any future-unknown engine.
+    check(
+        "classify: antigravity+static+missing-block -> unsupported_engine_contract",
         classify_status(
             [], [], "missing", True,
             session_type="unknown", agent_source="static", engine="antigravity",
         ),
-        "ok",
+        "unsupported_engine_contract",
+    )
+    check(
+        "classify: unknown-engine+static -> unsupported_engine_contract",
+        classify_status(
+            [], [], "complete", False,
+            session_type="", agent_source="static", engine="future-engine",
+        ),
+        "unsupported_engine_contract",
+    )
+    # Broken links are an engine-agnostic drift signal — even on an
+    # unsupported engine they surface as warn so a real misconfig is
+    # never silently dropped.
+    check(
+        "classify: antigravity+static+broken-links -> warn",
+        classify_status(
+            [], ["MEMORY.md -> missing"], "missing", False,
+            session_type="unknown", agent_source="static", engine="antigravity",
+        ),
+        "warn",
     )
 
     # --- classify_status: claude contract still enforced ----------------
@@ -160,7 +232,7 @@ def main() -> int:
         "warn",
     )
 
-    # --- classify_status: dynamic / codex exemptions (no regression) ----
+    # --- classify_status: dynamic exemptions (no regression) -------------
     check(
         "classify: claude+dynamic+missing-block -> ok",
         classify_status(
@@ -168,25 +240,6 @@ def main() -> int:
             session_type="dynamic", agent_source="dynamic", engine="claude",
         ),
         "ok",
-    )
-    check(
-        "classify: codex+static+missing-block -> ok",
-        classify_status(
-            [], [], "missing", True,
-            session_type="unknown", agent_source="static", engine="codex",
-        ),
-        "ok",
-    )
-
-    # broken_links is not gated by the contract — a genuine drift signal
-    # for any agent.
-    check(
-        "classify: antigravity+static+broken-links -> warn",
-        classify_status(
-            [], ["MEMORY.md -> missing"], "missing", False,
-            session_type="unknown", agent_source="static", engine="antigravity",
-        ),
-        "warn",
     )
 
     if failures:
