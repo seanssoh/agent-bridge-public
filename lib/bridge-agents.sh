@@ -4155,6 +4155,28 @@ bridge_linux_prepare_agent_isolation() {
   bridge_linux_sudo_root mkdir -p "$memory_daily_agent_dir" "$memory_daily_shared_aggregate_dir"
 
   bridge_linux_sudo_root chown -R "$os_user" "$workdir"
+  # Issue #1238: the scaffold (`bridge_scaffold_agent_home`) runs as the
+  # controller and writes `SOUL.md` / `CLAUDE.md` / `MEMORY*.md` /
+  # `SESSION-TYPE.md` / `TOOLS.md` / `.claude/` / `memory/` / `raw/` /
+  # `skills/` / `users/` into `$_v2_agent_root/home/` under controller
+  # `umask 077` (mode 0600 / 0700). The top-level `chown $os_user
+  # $_v2_agent_root/home` in the subdir loop above (4121-4126) only
+  # touches the directory itself, not its contents — so on a fresh
+  # `agent create --isolate`, the iso UID could traverse `home/` (group
+  # 2770) but could not read any of its own identity files (0600
+  # controller-owner). Claude session boot was structurally impossible
+  # because the iso process could not read `SOUL.md` / `CLAUDE.md` /
+  # `.claude/.credentials.json`.
+  #
+  # Hand `home/` recursively to the iso UID (mirrors the `$workdir`
+  # treatment above). Modes 0600 / 0700 stay — iso UID is now the owner,
+  # so they grant the right access. The per-agent root, `credentials/`,
+  # `runtime/`, `logs/`, `requests/`, and `responses/` are intentionally
+  # NOT included: per the v2 contract documented at 4031-4053,
+  # `credentials/` stays controller-owned and the per-agent root stays
+  # `root:ab-agent-<a> 2750`. Only the read-write content subtrees
+  # (`home/` and `workdir/`) transfer to the iso UID.
+  bridge_linux_sudo_root chown -R "$os_user" "$_v2_agent_root/home"
   bridge_linux_sudo_root chown -R "$os_user" "$runtime_state_dir" "$log_dir"
   bridge_linux_sudo_root chown "$os_user" "$audit_file" "$history_file"
 

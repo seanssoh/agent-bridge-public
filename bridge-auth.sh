@@ -190,48 +190,47 @@ bridge_auth_update_legacy_claude_config_env() {
       return 1
     }
   fi
-  python3 - "$file" "$config_dir" <<'PY'
-import os
-import sys
-import tempfile
-from pathlib import Path
-
-path = Path(sys.argv[1])
-config_dir = sys.argv[2]
-key = "CLAUDE_CODE_OAUTH_TOKEN="
-config_key = "CLAUDE_CONFIG_DIR="
-lines = path.read_text(encoding="utf-8", errors="ignore").splitlines() if path.exists() else []
-filtered = [
-    line
-    for line in lines
-    if not line.strip().startswith(key)
-    and not line.strip().startswith(config_key)
-]
-if "'" in config_dir:
-    raise SystemExit("CLAUDE_CONFIG_DIR path cannot contain single quote")
-filtered.append(f"CLAUDE_CONFIG_DIR='{config_dir}'")
-text = "\n".join(filtered)
-if text:
-    text += "\n"
-fd = -1
-tmp_name = ""
-try:
-    fd, tmp_name = tempfile.mkstemp(prefix=".launch-secrets.", suffix=".tmp", dir=str(path.parent))
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fd = -1
-        fh.write(text)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp_name, path)
-finally:
-    if fd >= 0:
-        os.close(fd)
-    if tmp_name:
-        try:
-            os.unlink(tmp_name)
-        except FileNotFoundError:
-            pass
-PY
+  # Issue #1238 companion bug: on iso v2 fresh installs, the controller
+  # may transiently lack supplementary-group membership for
+  # `ab-agent-<a>` (KNOWN_ISSUES §28 — login-cached group set) and the
+  # plain `python3 - "$file" "$config_dir" <<'PY'` invocation that used
+  # to live here ran as the un-refreshed controller. The Python child's
+  # first `path.exists()` then raised `PermissionError: [Errno 13]
+  # Permission denied: .../credentials/launch-secrets.env` (parent
+  # traversal needs group membership). The unhandled exception aborted
+  # `bridge_auth_sync_agents` mid-walk, so registering a setup token
+  # only ever populated `patch` (the controller-shared agent) and every
+  # iso agent — and every reviewer after the first iso failure — was
+  # silently skipped.
+  #
+  # Catching `PermissionError` and returning `False` would be wrong:
+  # that converts an inaccessible existing secret into "absent" and
+  # would let the subsequent `path.write_text(...)` clobber a
+  # controller-owned credential file. Instead route the read/write
+  # through `bridge_auth_run_privileged`, which mirrors the privileged
+  # path used by `bridge_auth_sync_agent_python` (:353-355) — direct
+  # first (works on non-isolated dev installs and on hosts where the
+  # controller already has the group), passwordless sudo otherwise.
+  # `bridge_auth_fix_legacy_secret_file_mode` (called below) then
+  # normalizes the final ownership / mode regardless of which branch
+  # wrote the file.
+  #
+  # Codex r1 BLOCKING on PR #1239: the original r1 fix used
+  # `bridge_auth_run_privileged python3 - "$file" "$config_dir" <<'PY'`,
+  # which is unsafe because `bridge_auth_run_privileged` retries on
+  # failure (direct first, then `sudo -n`). With heredoc-stdin the
+  # FIRST Python child consumes the heredoc fd before raising
+  # `PermissionError`; the sudo fallback then reads EOF and silently
+  # exits 0 with no script side effect — the wrapper reports success
+  # without executing the privileged update. The Python body was
+  # therefore extracted to `lib/upgrade-helpers/auth-legacy-claude-
+  # config-env.py` and invoked with file-as-argv (no stdin), mirroring
+  # the v0.13.9 footgun #11 extraction pattern. Every retry by the
+  # wrapper re-reads the script from disk, so the privileged fallback
+  # runs the same code as the direct attempt.
+  bridge_auth_run_privileged python3 \
+      "$SCRIPT_DIR/lib/upgrade-helpers/auth-legacy-claude-config-env.py" \
+      "$file" "$config_dir"
   bridge_auth_fix_legacy_secret_file_mode "$agent" "$file"
 }
 
