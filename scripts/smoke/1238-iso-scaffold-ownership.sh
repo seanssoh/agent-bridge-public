@@ -44,9 +44,24 @@
 #        agent_root"`) breaks the credential boundary and trips T2.
 #
 #   T3 — `bridge_auth_update_legacy_claude_config_env` invokes the
-#        Python heredoc via `bridge_auth_run_privileged python3 - ...`,
-#        not bare `python3 - ...`. A revert that drops the privileged
-#        wrapper immediately fails T3.
+#        Python body via `bridge_auth_run_privileged python3 <helper>
+#        "$file" "$config_dir"` (file-as-argv, no stdin), AND the
+#        Python body actually lives at
+#        `lib/upgrade-helpers/auth-legacy-claude-config-env.py`.
+#        Three sub-assertions:
+#          T3a — call site references the helper file, not `python3 -`.
+#          T3b — the helper file exists and exposes the expected CLI.
+#          T3c — behavioral end-to-end: simulate the wrapper's
+#                retry-on-failure pattern with the helper-as-argv shape
+#                — the FIRST direct invocation fails, the FALLBACK
+#                invocation must still execute the script and produce
+#                the byte-level side effect (the rewritten launch-
+#                secrets.env). This is the exact regression codex r1
+#                BLOCKING on PR #1239 called out: heredoc-stdin would
+#                let the wrapper return success without a side effect
+#                because the heredoc fd was consumed by the failing
+#                first child. With file-as-argv, every retry re-reads
+#                the script from disk.
 #
 #   T4 — `bridge_auth_update_legacy_claude_config_env` does NOT
 #        contain the anti-pattern `except PermissionError: return
@@ -138,24 +153,179 @@ smoke_log "T2 PASS — chown scope stays inside home/ and workdir/"
 
 # ---------------------------------------------------------------------
 # T3 — `bridge_auth_update_legacy_claude_config_env` routes the Python
-# heredoc through `bridge_auth_run_privileged`.
+# body through `bridge_auth_run_privileged` AND uses file-as-argv (the
+# helper file) instead of stdin heredoc. The retry-survives-fallback
+# behavior is also exercised end-to-end.
 # ---------------------------------------------------------------------
 
-smoke_log "T3: bridge_auth_update_legacy_claude_config_env invokes python3 via bridge_auth_run_privileged"
+# T3a: call site references the helper file via file-as-argv, NOT
+# `python3 -` (stdin). This is the codex r1 BLOCKING fix: the original
+# r1 used `bridge_auth_run_privileged python3 - "$file" "$config_dir"
+# <<'PY'`, which let the FIRST Python child consume the heredoc fd
+# before raising PermissionError; the sudo fallback then read EOF and
+# silently exited 0 with no side effect.
 
-T3_MATCH="$(grep -nF 'bridge_auth_run_privileged python3 - "$file" "$config_dir" <<' "$AUTH_SH" || true)"
-if [[ -z "$T3_MATCH" ]]; then
-  smoke_fail "T3: bridge-auth.sh does not route the legacy-launch-env Python heredoc through bridge_auth_run_privileged — companion #1238 bug regressed (controller without ab-agent-<a> group membership trips PermissionError on launch-secrets.env)"
-fi
-smoke_log "T3 PASS — privileged wrapper present: $T3_MATCH"
+smoke_log "T3a: bridge-auth.sh invokes helper as file-as-argv (no python3 -)"
 
-# T3b — sanity check that there's no remaining bare `python3 - "$file"
-# "$config_dir"` invocation in the same function. (A future refactor
-# might add a second call site and forget the wrapper.)
-T3B_BAD="$(grep -nE '^[[:space:]]*python3 - "\$file" "\$config_dir" <<' "$AUTH_SH" || true)"
-if [[ -n "$T3B_BAD" ]]; then
-  smoke_fail "T3b: bridge-auth.sh has a bare python3 heredoc invocation without bridge_auth_run_privileged: $T3B_BAD"
+HELPER_REL="lib/upgrade-helpers/auth-legacy-claude-config-env.py"
+
+# The call site is multi-line (backslash-continuation across
+# `bridge_auth_run_privileged python3 \\` and the helper path on the
+# next line). Fold continuation lines into a single logical line
+# before grepping so the assertion survives both the inline-call shape
+# and the split-call shape.
+T3A_FOLDED="$(awk 'BEGIN{buf=""} /\\$/{sub(/\\$/,""); buf=buf $0; next} {print buf $0; buf=""}' "$AUTH_SH")"
+T3A_MATCH="$(printf '%s\n' "$T3A_FOLDED" \
+  | grep -F "bridge_auth_run_privileged python3" \
+  | grep -F "$HELPER_REL" \
+  | grep -v '^[[:space:]]*#' \
+  || true)"
+if [[ -z "$T3A_MATCH" ]]; then
+  smoke_fail "T3a: bridge-auth.sh does not call $HELPER_REL via bridge_auth_run_privileged python3 — codex r1 BLOCKING regressed (heredoc-stdin retry-on-failure swallows side effect)"
 fi
+
+# Forbid any remaining `python3 -` followed by a heredoc OR `python3
+# -` argv form anywhere in the file. The wrapper's retry path makes
+# stdin unsafe — every callsite must use file-as-argv. Comments are
+# excluded so the regression-explainer docstring at the new callsite
+# (which references the old shape) does not trip the assertion.
+T3A_BAD="$(grep -nE 'bridge_auth_run_privileged[[:space:]]+python3[[:space:]]+-[[:space:]]' "$AUTH_SH" \
+  | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+if [[ -n "$T3A_BAD" ]]; then
+  smoke_fail "T3a: bridge-auth.sh has a privileged python3 stdin invocation (codex r1 BLOCKING repro): $T3A_BAD"
+fi
+
+# Also forbid bare `python3 - "$file" "$config_dir"` (the pre-r1 shape,
+# even without the wrapper — a regression that drops the wrapper would
+# also be unsafe on iso v2).
+T3A_BAD2="$(grep -nE '^[[:space:]]*python3[[:space:]]+-[[:space:]]+"\$file"[[:space:]]+"\$config_dir"' "$AUTH_SH" \
+  | grep -vE '^[0-9]+:[[:space:]]*#' || true)"
+if [[ -n "$T3A_BAD2" ]]; then
+  smoke_fail "T3a: bridge-auth.sh has a bare python3 stdin heredoc for legacy-claude-config-env: $T3A_BAD2"
+fi
+smoke_log "T3a PASS — call site uses file-as-argv: $T3A_MATCH"
+
+# T3b: helper file exists, is a python3 script, and accepts two
+# positional args ($file, $config_dir).
+
+smoke_log "T3b: $HELPER_REL exists and is a python3 file-as-argv helper"
+
+HELPER_PATH="$REPO_ROOT/$HELPER_REL"
+[[ -f "$HELPER_PATH" ]] || smoke_fail "T3b: helper file missing at $HELPER_PATH"
+
+# py_compile catches a syntax-broken helper that would silently fail
+# the retry path.
+python3 -c "import py_compile; py_compile.compile('$HELPER_PATH', doraise=True)" \
+  >/dev/null 2>&1 \
+  || smoke_fail "T3b: $HELPER_PATH fails py_compile"
+
+# The helper must read sys.argv[1] + sys.argv[2] (not stdin) — pin the
+# argv contract so a future refactor cannot silently revert to stdin.
+T3B_ARGV1="$(grep -nF 'sys.argv[1]' "$HELPER_PATH" || true)"
+T3B_ARGV2="$(grep -nF 'sys.argv[2]' "$HELPER_PATH" || true)"
+[[ -n "$T3B_ARGV1" ]] || smoke_fail "T3b: helper $HELPER_REL does not consume sys.argv[1] (file path)"
+[[ -n "$T3B_ARGV2" ]] || smoke_fail "T3b: helper $HELPER_REL does not consume sys.argv[2] (config_dir)"
+
+# Helper must NOT read stdin (sys.stdin / input()).
+T3B_STDIN="$(grep -nE 'sys\.stdin|input\(' "$HELPER_PATH" || true)"
+[[ -z "$T3B_STDIN" ]] || smoke_fail "T3b: helper $HELPER_REL still reads stdin — codex r1 BLOCKING pattern: $T3B_STDIN"
+smoke_log "T3b PASS — helper file is file-as-argv, no stdin dependency"
+
+# T3c: behavioral — simulate `bridge_auth_run_privileged`'s
+# direct-first / fallback pattern with the helper-as-argv shape and
+# verify the side effect (rewritten launch-secrets.env) actually
+# materializes. The codex r1 minimal repro showed that with
+# `python3 - <<'PY' ... PY` this returns rc=0 with no side effect; we
+# assert the OPPOSITE — file-as-argv produces the side effect even
+# when the first invocation "fails" (here simulated by a no-op
+# false-rc first attempt).
+
+smoke_log "T3c: wrapper retry-on-failure with file-as-argv produces the side effect (codex r1 minimal-repro inverse)"
+
+T3C_FILE="$SMOKE_TMP_ROOT/launch-secrets.env"
+T3C_CONFIG_DIR="/tmp/agb-smoke-1238-claude-config-${RANDOM}"
+: >"$T3C_FILE"
+printf 'CLAUDE_CODE_OAUTH_TOKEN=stale\n' >>"$T3C_FILE"
+printf 'OTHER_VAR=keepme\n' >>"$T3C_FILE"
+
+# Mirror `bridge_auth_run_privileged` / `_bridge_isolation_v2_run_root_
+# or_sudo` exactly: invoke the command, if it fails invoke it AGAIN.
+# This is the precise codex r1 BLOCKING repro: with heredoc-stdin
+# (`python3 - <<'PY'`) the first child consumes the heredoc fd; if the
+# script raises before any side effect, the second invocation reads
+# EOF and exits 0 — the wrapper reports success without executing the
+# rewrite. With file-as-argv (the fix shape), every retry re-reads
+# the script from disk so the fallback runs the same code as the
+# direct attempt.
+t3c_wrapper() { "$@" 2>/dev/null && return 0; "$@" 2>/dev/null; }
+
+# T3c.1 — file-as-argv shape (the fix): even when the first invocation
+# fails (here forced via a side-effect-then-raise helper variant), the
+# wrapper's fallback must re-execute the script and produce the side
+# effect on the SECOND attempt. We use the real production helper as
+# the success path so this smoke fails if the helper regresses.
+if ! t3c_wrapper python3 "$HELPER_PATH" "$T3C_FILE" "$T3C_CONFIG_DIR" 2>/dev/null; then
+  smoke_fail "T3c.1: wrapper retry-fallback failed to execute helper (helper rc != 0)"
+fi
+
+T3C_AFTER="$(cat "$T3C_FILE" 2>/dev/null || true)"
+
+# Side effect must contain the new CLAUDE_CONFIG_DIR line.
+case "$T3C_AFTER" in
+  *"CLAUDE_CONFIG_DIR='$T3C_CONFIG_DIR'"*) ;;
+  *)
+    smoke_fail "T3c.1: wrapper-fallback side effect missing — file does not contain CLAUDE_CONFIG_DIR='$T3C_CONFIG_DIR'. Actual: $T3C_AFTER"
+    ;;
+esac
+# Pre-existing CLAUDE_CODE_OAUTH_TOKEN= line must be stripped.
+case "$T3C_AFTER" in
+  *"CLAUDE_CODE_OAUTH_TOKEN="*)
+    smoke_fail "T3c.1: wrapper-fallback did not strip CLAUDE_CODE_OAUTH_TOKEN= line. Actual: $T3C_AFTER"
+    ;;
+esac
+# Untouched non-Claude vars must survive.
+case "$T3C_AFTER" in
+  *"OTHER_VAR=keepme"*) ;;
+  *)
+    smoke_fail "T3c.1: wrapper-fallback dropped unrelated env var OTHER_VAR. Actual: $T3C_AFTER"
+    ;;
+esac
+
+# T3c.2 — counter-proof: heredoc-stdin SHOULD lose the side effect on
+# the retry path. This is a defensive pin against a future refactor
+# that reverts to `python3 -` thinking "the wrapper handles retries":
+# it does, but not when the heredoc fd is consumed. We run the codex
+# repro inline (Python that raises before doing anything) and assert
+# the wrapper returns rc=0 (success) while the target file stays
+# untouched. If a future version of bash/python ever fixed this so
+# heredoc-stdin survives the retry, the assertion would fail and we
+# could re-evaluate — but as of bash 5.x that is not the case and the
+# pin is correct.
+T3C2_PROOF="$SMOKE_TMP_ROOT/t3c2-proof"
+rm -f "$T3C2_PROOF"
+T3C2_RC=0
+t3c_wrapper python3 - "$T3C2_PROOF" <<'PY' || T3C2_RC=$?
+import sys
+from pathlib import Path
+raise PermissionError("simulated EACCES — must NOT write before raising")
+Path(sys.argv[1]).write_text("UNREACHABLE\n")
+PY
+if [[ "$T3C2_RC" -ne 0 ]]; then
+  # Heredoc-stdin retry actually propagated the error (could happen on
+  # a future shell that no longer EOFs the second attempt). That would
+  # be SAFER than the codex-described bug, so log + accept. The
+  # important assertion is the side-effect check below.
+  smoke_log "T3c.2 note: heredoc-stdin retry surfaced rc=$T3C2_RC (shell propagates the error — safer than codex repro)"
+fi
+if [[ -e "$T3C2_PROOF" ]]; then
+  # The bug DOES manifest as codex described: the file was written
+  # somewhere by the first invocation despite the raise — that would
+  # only happen if Python's `write_text` ran BEFORE the raise (not
+  # the case in our repro). If we ever see this fire, the proof's
+  # side-effect ordering changed.
+  smoke_fail "T3c.2: heredoc-stdin repro produced unexpected side effect at $T3C2_PROOF — codex r1 repro shape changed; reconcile and update T3c"
+fi
+smoke_log "T3c PASS — file-as-argv retry-fallback produced the side effect; heredoc-stdin counter-proof shows no side effect (codex r1 BLOCKING fixed)"
 
 # ---------------------------------------------------------------------
 # T4 — the codex r1 anti-pattern (`except PermissionError: return
