@@ -7411,6 +7411,40 @@ bridge_agent_restart_marker_write() {
     :
   } >"$tmp" || { rm -f "$tmp" 2>/dev/null; return 1; }
   mv -f "$tmp" "$marker" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+
+  # Issue #1251 codex r1 finding 3: marker file mode 0640 + chgrp
+  # ab-agent-<agent> for v2-isolated agents so the iso UID (member of
+  # that group) can read the marker. Default umask-dependent permissions
+  # would leave mode=600 / group=user-default and an iso-side reader
+  # (Lane C2 watchdog probe, operator triage) would get EACCES.
+  #
+  # Controller (owner) writes; watchdog (controller-side) reads via
+  # owner; iso UID reads via group. 0640 (not 0660) — the iso side has
+  # no business writing to the marker.
+  #
+  # Skip for non-isolated agents (shared-mode controllers): umask-default
+  # behavior is correct there and an unconditional chgrp would fail
+  # opaquely on hosts without the ab-agent-<agent> group.
+  if [[ "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]] \
+      && command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    local _marker_grp=""
+    _marker_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+    if [[ -n "$_marker_grp" ]]; then
+      # Best-effort: a chmod/chgrp failure does NOT fail the write —
+      # the marker contents already landed. The worst case is the iso
+      # UID falls back to the watchdog's controller-side path, which
+      # still works for Lane C2 (#1254). bridge_linux_sudo_root is
+      # used because the marker may have been written under a parent
+      # dir whose group ownership requires elevation to reset.
+      chgrp "$_marker_grp" "$marker" 2>/dev/null \
+        || bridge_linux_sudo_root chgrp "$_marker_grp" "$marker" 2>/dev/null \
+        || true
+      chmod 0640 "$marker" 2>/dev/null \
+        || bridge_linux_sudo_root chmod 0640 "$marker" 2>/dev/null \
+        || true
+    fi
+  fi
   return 0
 }
 
@@ -7429,16 +7463,25 @@ bridge_agent_restart_marker_read_field() {
   awk -F'=' -v k="$field" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$marker" 2>/dev/null || printf '%s' ""
 }
 
-# TTL check helper. Returns rc=0 when the marker is present AND not
-# expired (started+ttl >= now); rc=1 otherwise. Lane C2 consumes this
+# TTL + PID liveness check. Returns rc=0 when the marker is present,
+# `state=in_progress`, `kill -0 <pid>` succeeds (orchestrator still alive)
+# AND `now < started + ttl`; rc=1 otherwise. Lane C2 consumes this
 # predicate when deciding whether to skip drift task enqueue.
+#
+# Issue #1251 codex r1 finding 2: the PID liveness check is REQUIRED. A
+# crashed orchestrator (e.g. operator's `agent restart` shell killed mid-
+# flight) used to leave a marker that suppressed the watchdog for the full
+# TTL window, even though no rollback would ever fire. Treating a dead-PID
+# marker as INACTIVE lets Lane C2 (#1254) take over and recover instead.
 bridge_agent_restart_marker_active() {
   local agent="$1"
+  local pid=""
   local started=""
   local ttl=""
   local state=""
   local now=""
 
+  pid="$(bridge_agent_restart_marker_read_field "$agent" pid)"
   started="$(bridge_agent_restart_marker_read_field "$agent" started)"
   ttl="$(bridge_agent_restart_marker_read_field "$agent" ttl)"
   state="$(bridge_agent_restart_marker_read_field "$agent" state)"
@@ -7447,12 +7490,38 @@ bridge_agent_restart_marker_active() {
   # can audit them, but they are NOT "active restart" — Lane C2 treats
   # them as terminal markers, not drift-suppression signals.
   [[ "$state" == "in_progress" ]] || return 1
+  # PID liveness gate (r1 finding 2). Empty / non-numeric pid → treat as
+  # dead. `kill -0` returns 0 when the process exists AND the caller has
+  # permission to signal it; for the watchdog use case the controller and
+  # the marker writer share a UID, so a "permission denied" return here
+  # would itself signal a malformed marker (PID reused by another UID's
+  # process) and we correctly reject it.
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
   now="$(date +%s)"
   # Guard against non-numeric values (corrupted marker) — awk above would
   # have stripped the key prefix, but a tampered file could still leak a
   # non-digit value through.
   [[ "$started" =~ ^[0-9]+$ && "$ttl" =~ ^[0-9]+$ ]] || return 1
   (( now < started + ttl )) || return 1
+  return 0
+}
+
+# Diagnostics helper: returns rc=0 when the marker carries a PID that is
+# no longer alive (or unreadable) AND `state=in_progress`. Used by smoke
+# tests and operator triage to distinguish "watchdog correctly skipped"
+# from "stale marker held the watchdog hostage". Returns rc=1 when the
+# marker is absent, the PID is alive, or the state is terminal.
+bridge_agent_restart_marker_stale_pid() {
+  local agent="$1"
+  local pid=""
+  local state=""
+  pid="$(bridge_agent_restart_marker_read_field "$agent" pid)"
+  state="$(bridge_agent_restart_marker_read_field "$agent" state)"
+  [[ "$state" == "in_progress" ]] || return 1
+  [[ -n "$pid" ]] || return 0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  kill -0 "$pid" 2>/dev/null && return 1
   return 0
 }
 
@@ -7522,6 +7591,103 @@ bridge_agent_restart_snapshot_managed_block() {
   snapshot="$(bridge_agent_restart_snapshot_path "$agent" "$ts")"
   printf '%s\n' "$block" >"$snapshot" || return 1
   printf '%s' "$snapshot"
+  return 0
+}
+
+# Issue #1251 codex r1 finding 1: capture a "last-known-good" snapshot
+# BEFORE the roster mutation lands. Called from `run_update` immediately
+# before `bridge_write_role_block`, so the snapshot represents the PRIOR
+# (working) config — not the post-update (possibly failing) config that
+# the inside-`run_restart` snapshot would capture.
+#
+# Path layout: `state/agents/<a>/restart.snapshot.pre-update.<ts>`. The
+# `pre-update.` infix is what `run_restart` uses to discriminate this
+# class of snapshot from the (post-mutation) one taken at restart entry.
+# `marker_clear`'s glob (`restart.snapshot.*`) still matches and sweeps
+# these on the success path — so a clean restart leaves no leftovers.
+#
+# Returns the snapshot file path on stdout (rc=0); empty + rc=0 when the
+# roster does not carry a managed block (e.g. agent-create's first call
+# before any block has been written).
+bridge_agent_restart_snapshot_pre_update() {
+  local agent="$1"
+  local roster=""
+  local state_dir=""
+  local ts=""
+  local snapshot=""
+
+  roster="${BRIDGE_ROSTER_LOCAL_FILE:-${BRIDGE_HOME:-$HOME/.agent-bridge}/agent-roster.local.sh}"
+  [[ -f "$roster" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  local block
+  block="$(awk -v a="$agent" '
+    $0 == "# BEGIN AGENT BRIDGE MANAGED ROLE: "a { capture=1 }
+    capture { print }
+    capture && $0 == "# END AGENT BRIDGE MANAGED ROLE: "a { capture=0 }
+  ' "$roster" 2>/dev/null)"
+  [[ -n "$block" ]] || {
+    printf '%s' ""
+    return 0
+  }
+
+  state_dir="$(bridge_agent_restart_state_dir "$agent")"
+  mkdir -p "$state_dir" 2>/dev/null || return 1
+  ts="$(date +%s)"
+  snapshot="${state_dir}/restart.snapshot.pre-update.${ts}"
+  printf '%s\n' "$block" >"$snapshot" || return 1
+  printf '%s' "$snapshot"
+  return 0
+}
+
+# Find the most recent pre-update snapshot for `<agent>` that is still
+# within the operator-tunable freshness window (default 600s = 10 min).
+# Returns the path on stdout (rc=0) when one exists and is fresh; empty
+# + rc=0 otherwise. Used by `run_restart` to pick the LAST-KNOWN-GOOD
+# rollback target when the operator's flow was `agent update` → `agent
+# restart` (the production path codex r1 finding 1 calls out).
+#
+# Freshness gate: if the operator updated 30 minutes ago and only just
+# now hits restart, the pre-update snapshot is likely stale (other
+# mutations may have intervened) and we fall back to the at-entry
+# snapshot. Tunable via BRIDGE_AGENT_RESTART_PRE_UPDATE_WINDOW.
+bridge_agent_restart_find_pre_update_snapshot() {
+  local agent="$1"
+  local window="${BRIDGE_AGENT_RESTART_PRE_UPDATE_WINDOW:-600}"
+  local state_dir=""
+  state_dir="$(bridge_agent_restart_state_dir "$agent")"
+  [[ -d "$state_dir" ]] || {
+    printf '%s' ""
+    return 0
+  }
+  local newest=""
+  local newest_ts=0
+  local f ts
+  shopt -s nullglob
+  for f in "$state_dir"/restart.snapshot.pre-update.*; do
+    [[ -f "$f" ]] || continue
+    ts="${f##*.pre-update.}"
+    [[ "$ts" =~ ^[0-9]+$ ]] || continue
+    if (( ts > newest_ts )); then
+      newest_ts=$ts
+      newest=$f
+    fi
+  done
+  shopt -u nullglob
+  [[ -n "$newest" ]] || {
+    printf '%s' ""
+    return 0
+  }
+  local now
+  now="$(date +%s)"
+  [[ "$window" =~ ^[0-9]+$ ]] || window=600
+  if (( now - newest_ts > window )); then
+    printf '%s' ""
+    return 0
+  fi
+  printf '%s' "$newest"
   return 0
 }
 

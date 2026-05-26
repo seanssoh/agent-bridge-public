@@ -4577,6 +4577,20 @@ PY
     if [[ "$new_start_policy_configured" == "1" ]]; then
       start_policy_writer_arg="$new_start_policy"
     fi
+    # Issue #1251 codex r1 finding 1: capture the LAST-KNOWN-GOOD
+    # managed block BEFORE the writer mutates the roster. The snapshot
+    # lives at `state/agents/<a>/restart.snapshot.pre-update.<ts>` and
+    # is consumed by a subsequent `agent restart` whose post-mutation
+    # launch fails — without it, `run_restart`'s at-entry snapshot
+    # would capture the ALREADY-FAILING config (the mutation already
+    # landed) and the rollback would restore the broken config in place
+    # of the broken config. Best-effort: a snapshot failure does NOT
+    # abort the update — the prior behavior (no snapshot at all) was
+    # the baseline and the worst case is the rollback path falls back
+    # to the at-entry snapshot.
+    if command -v bridge_agent_restart_snapshot_pre_update >/dev/null 2>&1; then
+      bridge_agent_restart_snapshot_pre_update "$agent" >/dev/null 2>&1 || true
+    fi
     bridge_write_role_block \
       "$agent" \
       "$new_desc" \
@@ -5738,16 +5752,27 @@ run_restart() {
   local resume_session_snapshot=""
   resume_session_snapshot="$(bridge_agent_session_id "$agent" 2>/dev/null || true)"
 
-  # Issue #1251 Phase 2 entry: snapshot the roster managed block and
-  # write the in-progress marker BEFORE the kill. The snapshot is the
-  # rollback target; the marker is the Lane C2 (#1254) contract for
-  # watchdog drift suppression. Both artifacts live under
-  # state/agents/<a>/. The snapshot may be empty when the agent is
-  # dynamic-only (no managed block in roster.local); that just means the
-  # rollback path will have nothing to restore from, which is fine — the
-  # marker still serves its drift-suppression purpose.
+  # Issue #1251 Phase 2 entry: pick the rollback snapshot + write the
+  # in-progress marker BEFORE the kill. The marker is the Lane C2
+  # (#1254) contract for watchdog drift suppression; the snapshot is the
+  # rollback target. Both artifacts live under state/agents/<a>/.
+  #
+  # Snapshot selection (codex r1 finding 1): prefer a `pre-update`
+  # snapshot captured by `run_update` before the roster mutation — that
+  # is the LAST-KNOWN-GOOD config. Production ordering is operator runs
+  # `agent update --channels-add <new>` (which writes the pre-update
+  # snapshot + mutates the roster), THEN runs `agent restart`. By the
+  # time we enter `run_restart` the roster already holds the failing
+  # update — an at-entry snapshot would capture that failing state and
+  # the rollback would restore broken-over-broken. Fall back to the
+  # at-entry snapshot only when no pre-update one is available (e.g.
+  # operator hit restart directly without a prior update, in which case
+  # the at-entry snapshot IS the last-known-good).
   local restart_snapshot=""
-  restart_snapshot="$(bridge_agent_restart_snapshot_managed_block "$agent" 2>/dev/null || true)"
+  restart_snapshot="$(bridge_agent_restart_find_pre_update_snapshot "$agent" 2>/dev/null || true)"
+  if [[ -z "$restart_snapshot" ]]; then
+    restart_snapshot="$(bridge_agent_restart_snapshot_managed_block "$agent" 2>/dev/null || true)"
+  fi
   bridge_agent_restart_marker_write "$agent" "$$" \
     "${BRIDGE_AGENT_RESTART_MARKER_TTL:-60}" "in_progress" "" \
     >/dev/null 2>&1 || true
