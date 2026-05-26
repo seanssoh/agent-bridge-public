@@ -6,6 +6,75 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.0-beta1] — 2026-05-26
+
+### Highlight — minor bump for 4-lane backlog closure (G + F + H + I)
+
+Operator-cued 2026-05-26 ~04:42 UTC verbatim: "저것까지도 다 해 + 병렬 처리로 해서 싹다 하라고 해" — full backlog closure via parallel dispatch. **Minor version bump (0.14.5 → 0.15.0)** chosen over beta28 because Track F touches OS state (sudoers/systemd daemon refresh, autonomous detection in poll loop) — mixing into the v0.14.5 beta-series would muddy risk profile.
+
+`-beta1` prerelease; matching tag `v0.15.0-beta1`, GitHub release marked **Pre-release**. Stay on beta per Sean's standing rule. v0.14.5 GA promotion remains a separate operator-cued decision (durable rule).
+
+### Fixed — channel-spec canonical resolution (#1221, Lane G PR #1223)
+
+`agent create --channels "plugin:teams,plugin:ms365"` had inconsistent suffix-resolution: `plugin:teams` auto-resolved to `@agent-bridge`, but `plugin:ms365` stayed un-suffixed → silently dropped from `launch_cmd` → `agent start` aborted with `Claude plugin 'ms365' is not declared`.
+
+- **`lib/bridge-agents.sh`** — new `bridge_builtin_plugin_marketplace` canonical-table helper, refactored `bridge_qualify_channel_item` (`:5014-5046`) to consult it.
+- **Canonical mapping** (codex r1 A-prime, NOT "all to @agent-bridge"):
+  - `teams`, `ms365`, `mattermost` → `@agent-bridge`
+  - `discord`, `telegram` → `@claude-plugins-official`
+- Explicit `@<marketplace>` suffixes preserved verbatim (incl. `plugin:teams@cosmax-marketplace`).
+- Removed redundant early-return at `:4720-4725` — explicit-suffix forms now fall through to tail return.
+- 16-test smoke `scripts/smoke/G-channel-spec-resolution.sh` covers positive/negative/regression/cross-builtins.
+
+### Fixed — `bootstrap-memory-system.sh` iso v2 PermissionError (#1222, Lane H PR #1225)
+
+Post-upgrade `bootstrap-memory-system.sh --apply` aborted with `rm: Permission denied` on iso v2 agents' `workdir/memory/index.sqlite.rebuilding-<STAMP>` because controller (`awfmanager`) cannot write into iso-owned `2770 ab-agent-*` per the no-group-relax contract.
+
+- **`bootstrap-memory-system.sh`** — sources `bridge-lib.sh` + calls `bridge_load_roster` BEFORE setting `_BRIDGE_ISO_HELPERS_LOADED=1` (codex r1 BLOCKING fix: without `bridge_load_roster` the isolation predicate always returned 0 in bootstrap shell → fall-through to legacy controller-direct path → bug unchanged). `step_rebuild_one` apply path detects iso v2 via `bridge_agent_linux_user_isolation_effective` and runs the ENTIRE rebuild/publish block (stale-tmp rm + `bridge-memory.py rebuild-index` + sqlite validate + `mkdir -p memory/` + `mv -f tmp_db db`) under iso UID via `bridge_isolation_run_as_agent_user_via_bash`.
+- **Approach H.2 picked** — NO new broad `bridge_iso_run --op rm` added (security risk avoided). Whole rebuild block under iso UID, not just `rm`.
+- Distinct drift signatures via exit codes ≥ 10: `rebuild-failed` (10), `validate-failed` (11), `stale-tmp-unlink-failed-as-iso-uid` (12), `memory-mkdir-failed-as-iso-uid` (13), `mv-into-place-failed-as-iso-uid` (14), `validate-harness-mktemp-failed` (15).
+- Smoke `scripts/smoke/H-bootstrap-memory-iso-rebuild.sh` — T1-T7 host-agnostic source-structure assertions + T7.1 `bridge_load_roster`-called-after-source guard + T7.2 runtime predicate-true proof with **negative-control-first** pattern (catches future "auto-loader" refactors that would break this contract) + T8 Linux+sudo opt-in real reproducer.
+
+### Added — daemon supplementary-group autonomous self-refresh (Lane F PR #1224)
+
+Closes KNOWN_ISSUES §28 daemon staleness class. Pre-fix: every `agent create` emitted `[경고] supplementary group cache does not include the freshly created 'ab-agent-<slug>' ... daemon_group_refresh: manual-required-systemd-unit-stale`. Operator had to manually `agent-bridge init sudoers daemon-refresh --apply` + `bash scripts/install-daemon-systemd.sh --apply --enable` + `systemctl --user restart agent-bridge-daemon.service`.
+
+- **F.B-prime picked**, NOT F.A: SIGHUP/setgroups cannot refresh supplementary groups of a running process. The daemon's existing HUP trap correctly just exits; the proper boundary is PAM/initgroups via process restart (already encapsulated in `bridge_daemon_refresh_after_group_membership_change` at `lib/bridge-daemon-control.sh:293-604`).
+- **`bridge-daemon.sh`** — refactored `bridge_daemon_warn_if_supp_groups_stale` (`:64-128`) into a pure data helper (`bridge_daemon_detect_stale_supp_groups`) + presentation wrapper. Added 5 new helpers + `cmd_supp_refresh_worker`. `bridge_daemon_supp_groups_poll_and_dispatch` wired near top of main poll loop (`:7293-7324`), before `cmd_sync_cycle`/queue gateway/spawn work.
+- **Detached refresh worker dispatch** — daemon dispatches an external `bridge-daemon.sh supp-refresh-worker` process via the existing sudo-self systemd unit (NOT a synchronous helper call that would kill its own parent). Guarded via existing lock at `lib/bridge-daemon-control.sh:360-374`. One missing group per refresh attempt (avoids restart storms). Throttle state under `state/daemon.supp-refresh.state` with atomic write.
+- **`KillMode=process`** at `scripts/install-daemon-systemd.sh:232-246` already limits restart impact to the daemon process — agent tmux + plugin children unaffected. Brief interrupt expected on queue gateway socket listener, sync cycle, idle nudges (one cycle).
+- Sudoers contract clarified: `agent-bridge init sudoers daemon-refresh --apply` template at `scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template:46-47` authorizes ONLY daemon `restart --force --internal-reason=group-refresh` + daemon `run`. Group mutation itself runs via `bridge_isolation_v2_ensure_user_in_group` (`lib/bridge-isolation-v2.sh:625-654`).
+- Smokes (two layers): `F-daemon-supp-groups-mock.sh` (12 host-agnostic tests, stubs id/getent/pid/systemd, asserts detection + classification + throttle + NO SIGHUP path); `F-daemon-supp-groups-real.sh` (Linux + sudo gated, opt-in via `BRIDGE_SMOKE_F_REAL_OPT_IN=1`, creates transient `ab-agent-smoke-*` group + verifies `/proc/<pid>/status` Groups updates).
+
+### Added — agent description defaults + `agent describe` CLI + admin convention docs (Lane I PR #1227, Sean mid-flight addition)
+
+Downstream agents reading their roster could not identify the admin/system agent's role — the `BRIDGE_AGENT_DESC` schema existed but defaults were terse (`"$admin_agent admin role"`) and there was no read-only CLI getter, so operators on downstream installs (cosmax-* server etc.) inherited empty/useless descriptions. Cross-host agents had to guess role from contextual issue-comment signatures.
+
+- **`bridge-init.sh:522-540`** — admin default upgraded to: "Agent Bridge admin/coordinator for this install. Owns onboarding, roster/queue triage, upgrade/release waves, and operator-facing decisions."
+- **`agent-roster.local.example.sh:17-36`** — 4 role exemplars (admin / codex pair / antigravity pair / system) near the existing desc block.
+- **`bridge-agent.sh:2108-2180`** — new `agent describe <agent>` read-only CLI: stdout = description + newline on set + exit 0; unset = no stdout + stderr hint pointing to `BRIDGE_AGENT_DESC["<agent>"]` in `agent-roster.local.sh` + exit non-zero. `-h/--help` from day one (avoids #1114/#1117 help-drift class). NO `describe set` write path in beta1.
+- **`bridge-agent.sh:2045-2055`** — `agent show` text-mode unset hint added (JSON keeps raw empty string for unset/placeholder distinguishability).
+- **`docs/agent-runtime/admin-agent-convention.md`** — new doc namespace; covers description convention + distinction from `BRIDGE_AGENT_CLASS` (authorization vs identity). Linked from `docs/agent-runtime/admin-protocol.md:188-190`.
+- **Schema fidelity** (codex r1 critical correction): uses existing `BRIDGE_AGENT_DESC` assoc array, NOT a duplicate `BRIDGE_AGENT_DESCRIPTION` (which would re-introduce the #1213 assoc-array/scalar collision class). Existing schema infrastructure at `lib/bridge-core.sh:821-839`, `lib/bridge-agents.sh:852-855`, `bridge-agent.sh:1065-1069, :1517-1549, :1587-1592, :2011-2044` preserved.
+- Smoke `scripts/smoke/I-agent-description-roster.sh` (8 assertions): set/unset display in text + JSON + list, describe success/fail, `declare -p` confirms `declare -A`, env has NO scalar `BRIDGE_AGENT_DESC` export.
+- `scripts/smoke/1117-cli-help-universal-gate.sh` picks up the new `describe` verb (now 144 assertions, was 143).
+
+### Added — `docs/agent-runtime/plugin-authoring-iso-v2.md` (PR #1218)
+
+Standalone docs PR landed ahead of the v0.15.0-beta1 wave: contract for plugin authors targeting linux-user installs. +349/-0.
+
+### Fixed — `scripts/iso-helper-ratchet.sh` baseline drift (release commit)
+
+Pre-existing drift from beta27 ms365 setup wizard work (PR #1220): `bridge-setup.py` 22→30 + `scripts/smoke/1209-ms365-redirect-resolver.sh` 0→21. Plus Lane I removed one boundary callsite in `bridge-init.sh` (3→2). Baseline regenerated to clear `oss-preflight` failure. Net delta = beta27 surface that legitimately routed through the controller-side path (operator-supplied credential files, setup wizard env writers).
+
+### Notes
+
+- **#219 verify-and-close** (MS365 redirect URI for test_iso_v23) — patch operates post-ship per coordination: either `agent-bridge setup ms365 test_iso_v23 --redirect-uri ...` (now possible per Lane B/C beta27 + Lane G beta1) or `agent retire test_iso_v23 --quarantine`.
+- v0.14.5 GA promotion — separate operator-cued decision.
+- `BRIDGE_AGENT_OS_USER` same-class collision — no Python hook consumer confirmed; shell array readers only. Left alone (was deferred from beta27).
+- `scripts/smoke/1115-cli-usage-drift.sh` T1 `iso-run missing from _top_valid` — pre-existing on stabilize, NOT introduced by any lane in this wave. Separate fix needed in `agent-bridge` to add `iso-run` to `_top_valid` array.
+- Pre-existing `scripts/smoke/1121-agent-delete-os-purge.sh` C5 Linux flake (failing across beta22-25 series) — still not addressed.
+
 ## [0.14.5-beta27] — 2026-05-26
 
 ### Highlight — 5-track backlog closure via 3-lane parallel dispatch
