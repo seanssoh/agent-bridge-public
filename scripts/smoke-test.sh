@@ -11363,6 +11363,18 @@ bash "$REPO_ROOT/scripts/smoke/dynamic-agent-shared-mode-workdir.sh"
 log "running v2-scaffold-home-and-workdir smoke (issue #686)"
 bash "$REPO_ROOT/scripts/smoke/v2-scaffold-home-and-workdir.sh"
 
+# Issue #1238 — v0.15.0-beta1 fresh `agent create --isolate` scaffolded
+# the per-agent home tree (`SOUL.md`, `CLAUDE.md`, `.claude/`, etc.)
+# under the controller's umask and `bridge_linux_prepare_agent_isolation`
+# never recursive-chowned the `home/` subtree to the iso UID. Result:
+# claude session under the iso UID could not read its own identity
+# files — boot was structurally impossible. Companion bug: `bridge_auth_
+# update_legacy_claude_config_env` ran a bare `python3 - <<PY` heredoc
+# as the un-refreshed controller and tripped `PermissionError` on
+# `path.exists()` for `<v2-root>/credentials/launch-secrets.env`.
+log "running 1238-iso-scaffold-ownership smoke (issue #1238)"
+bash "$REPO_ROOT/scripts/smoke/1238-iso-scaffold-ownership.sh"
+
 # Task #4813 — `agent-bridge --claude --name <new-dynamic> --no-attach`
 # from a project that already hosts a static role (e.g. `patch`) was
 # silently redirecting to that static role in non-TTY mode. The

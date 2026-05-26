@@ -190,7 +190,30 @@ bridge_auth_update_legacy_claude_config_env() {
       return 1
     }
   fi
-  python3 - "$file" "$config_dir" <<'PY'
+  # Issue #1238 companion bug: on iso v2 fresh installs, the controller
+  # may transiently lack supplementary-group membership for
+  # `ab-agent-<a>` (KNOWN_ISSUES §28 — login-cached group set) and the
+  # plain `python3 - "$file" "$config_dir" <<'PY'` invocation below ran
+  # as the un-refreshed controller. The Python child's first
+  # `path.exists()` then raised `PermissionError: [Errno 13] Permission
+  # denied: .../credentials/launch-secrets.env` (parent traversal needs
+  # group membership). The unhandled exception aborted `bridge_auth_sync_
+  # agents` mid-walk, so registering a setup token only ever populated
+  # `patch` (the controller-shared agent) and every iso agent — and
+  # every reviewer after the first iso failure — was silently skipped.
+  #
+  # Catching `PermissionError` and returning `False` would be wrong:
+  # that converts an inaccessible existing secret into "absent" and
+  # would let the subsequent `path.write_text(...)` clobber a
+  # controller-owned credential file. Instead route the read/write
+  # through `bridge_auth_run_privileged`, which mirrors the privileged
+  # path used by `bridge_auth_sync_agent_python` (:353-355) — direct
+  # first (works on non-isolated dev installs and on hosts where the
+  # controller already has the group), passwordless sudo otherwise.
+  # `bridge_auth_fix_legacy_secret_file_mode` (called below) then
+  # normalizes the final ownership / mode regardless of which branch
+  # wrote the file.
+  bridge_auth_run_privileged python3 - "$file" "$config_dir" <<'PY'
 import os
 import sys
 import tempfile
