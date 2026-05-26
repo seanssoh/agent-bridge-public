@@ -159,6 +159,34 @@ export function resolveRedirectUri(): string {
   )
 }
 
+// Issue #1210: normalize the scope string before handing it to
+// URLSearchParams. The bug was an input artifact, not a serializer
+// flaw — `MS365_DEFAULT_SCOPES` is a STRING, and when an operator's
+// .env had `MS365_DEFAULT_SCOPES="openid profile offline_access ..."`
+// the literal double-quotes flowed all the way into the authorize_url
+// as `scope=%22openid...%22`, tripping AADSTS70011 "scope is not
+// valid". URLSearchParams correctly percent-encoded the quotes — they
+// just shouldn't have been there.
+//
+// Contract:
+//   - Trim outer whitespace.
+//   - Strip ONE matching outer quote pair (`"..."` or `'...'`). Inner
+//     quotes are not OAuth scope characters and would already break
+//     scope parsing, so the surface bug is the outer wrap.
+//   - Split on any whitespace, drop empties, rejoin with single space.
+//   - Plain unquoted input round-trips unchanged.
+export function normalizeScopes(raw: unknown): string {
+  let s = String(raw ?? '').trim()
+  if (s.length >= 2) {
+    const first = s.charAt(0)
+    const last = s.charAt(s.length - 1)
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      s = s.slice(1, -1).trim()
+    }
+  }
+  return s.split(/\s+/).filter(Boolean).join(' ')
+}
+
 if (!TENANT_ID || !CLIENT_ID || !CLIENT_SECRET) {
   process.stderr.write(
     `ms365: MS365_TENANT_ID, MS365_CLIENT_ID, and MS365_CLIENT_SECRET are required\n` +
@@ -527,7 +555,12 @@ const tools: ToolDef[] = [
     },
     handler: async args => {
       const upn = resolveUpn(args.upn)
-      const scopes = String(args.scopes ?? DEFAULT_SCOPES)
+      // Issue #1210: normalize the scope string (strip accidental
+      // wrapping quotes, collapse whitespace) before passing to
+      // URLSearchParams. Without this the literal `"openid ..."` in
+      // an operator's .env became `%22openid...%22` in authorize_url
+      // and Microsoft Identity Platform rejected with AADSTS70011.
+      const scopes = normalizeScopes(args.scopes ?? DEFAULT_SCOPES)
       // Issue #1209: resolve the redirect URI at pair_start time so
       // any misconfiguration surfaces as a clear, actionable error
       // here (with a pointer to `agent-bridge setup ms365`) instead
