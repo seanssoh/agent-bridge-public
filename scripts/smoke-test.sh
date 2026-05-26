@@ -6167,7 +6167,11 @@ PY
   assert_contains "$(cat "$TEAMS_PLUGIN_CONFLICT_LOG")" "teams channel: http listen failed on 0.0.0.0:$TEAMS_SMOKE_PORT"
   assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "agent-bridge urgent"
   assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "spawnSync(agb, ['urgent'"
-  assert_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "ignoring deprecated TEAMS_BRIDGE_MODE"
+  # Issue #1204: TEAMS_DELIVERY_MODE was removed entirely. Lock the removal in
+  # by asserting both the env-var token and the prior delivery-mode resolver
+  # are gone from the shipped server.ts.
+  assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "TEAMS_DELIVERY_MODE"
+  assert_not_contains "$(cat "$REPO_ROOT/plugins/teams/server.ts")" "deliverViaBridgeQueue"
   TEAMS_CHANNEL_META_OUTPUT="$(cd "$REPO_ROOT/plugins/teams" && TEAMS_STATE_DIR="$BRIDGE_AGENT_HOME_ROOT/$CREATED_AGENT/.teams" bun server.ts _smoke-channel-meta)"
   python3 "$REPO_ROOT/scripts/smoke/teams-channel-meta-assert.py" "$TEAMS_CHANNEL_META_OUTPUT"
   TEAMS_DEDUPE_OUTPUT="$(cd "$REPO_ROOT/plugins/teams" && bun -e 'import { createRecentMessageDeduper } from "./dedupe.ts"; const dedupe = createRecentMessageDeduper(2); console.log(JSON.stringify([dedupe.seen("1775901127484"), dedupe.seen("1775901127484"), dedupe.seen("1775901127485"), dedupe.seen("1775901127486"), dedupe.seen("1775901127484")]))')"

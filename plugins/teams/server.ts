@@ -27,16 +27,14 @@ import {
   existsSync,
   lstatSync,
   mkdirSync,
-  mkdtempSync,
   readFileSync,
   realpathSync,
   renameSync,
-  rmdirSync,
   statSync,
   unlinkSync,
   writeFileSync,
 } from 'fs'
-import { homedir, tmpdir } from 'os'
+import { homedir } from 'os'
 import { basename, isAbsolute as pathIsAbsolute, join, resolve as pathResolve } from 'path'
 import { createRecentMessageDeduper, storedRowMatchesIncoming } from './dedupe.ts'
 
@@ -167,27 +165,6 @@ try {
 const HOST = process.env.TEAMS_WEBHOOK_HOST ?? '127.0.0.1'
 const PORT = Number(process.env.TEAMS_WEBHOOK_PORT ?? '3978')
 const STATIC = process.env.TEAMS_ACCESS_MODE === 'static'
-
-if (process.env.TEAMS_BRIDGE_MODE === '1' || process.env.TEAMS_BRIDGE_AGENT) {
-  process.stderr.write(
-    'teams channel: legacy TEAMS_BRIDGE_MODE/TEAMS_BRIDGE_AGENT env vars are ignored; use TEAMS_DELIVERY_MODE=bridge instead\n',
-  )
-}
-
-type DeliveryMode = 'channel' | 'bridge' | 'both'
-
-// Resolve once at module load so an invalid value warns once on boot rather
-// than per inbound message. The resolved mode is reused by every
-// handleActivity call.
-const DELIVERY_MODE: DeliveryMode = (() => {
-  const raw = String(process.env.TEAMS_DELIVERY_MODE ?? '').trim().toLowerCase()
-  if (!raw) return 'channel'
-  if (raw === 'channel' || raw === 'bridge' || raw === 'both') return raw
-  process.stderr.write(
-    `teams channel: unsupported TEAMS_DELIVERY_MODE=${raw}; falling back to channel\n`,
-  )
-  return 'channel'
-})()
 
 const APP_ID = process.env.TEAMS_APP_ID ?? process.env.MicrosoftAppId
 const APP_PASSWORD = process.env.TEAMS_APP_PASSWORD ?? process.env.MicrosoftAppPassword
@@ -1042,46 +1019,6 @@ function runPromptGuard(command: 'scan' | 'sanitize', text: string): Record<stri
   }
 }
 
-/**
- * Build the rich Teams metadata used by bridge-mode queue task bodies and
- * local replay/audit paths. Keep notifications/claude/channel on the scalar
- * projection below: Claude Code channel delivery has silently dropped some
- * notifications when nested arrays/objects are present in params.meta.
- */
-function buildChannelMeta(
-  activity: Activity,
-  stored: StoredMessage,
-  attachments: StoredAttachment[],
-): Record<string, unknown> {
-  return {
-    source: 'teams',
-    chat_id: stored.chat_id,
-    conversation_id: stored.chat_id,
-    message_id: stored.message_id,
-    user: stored.user,
-    user_id: stored.user_id,
-    aad_object_id: stored.aad_object_id,
-    tenant_id: String((activity.channelData as any)?.tenant?.id ?? TENANT_ID),
-    service_url: String(activity.serviceUrl ?? ''),
-    text: stored.text,
-    ts: stored.ts,
-    ...(stored.revision ? { revision: stored.revision } : {}),
-    ...(attachments.length > 0
-      ? {
-          attachment_count: String(attachments.length),
-          attachments: attachments.map(att => ({
-            name: att.name,
-            content_type: att.content_type,
-            download_status: att.download_status,
-            ...(att.local_path ? { local_path: att.local_path } : {}),
-            ...(att.size_bytes !== undefined ? { size_bytes: att.size_bytes } : {}),
-            ...(att.download_error ? { download_error: att.download_error } : {}),
-          })),
-        }
-      : {}),
-  }
-}
-
 function compactMetaList(values: Array<string | undefined>): string {
   const cleaned = values
     .map(value => String(value ?? '').trim())
@@ -1090,10 +1027,9 @@ function compactMetaList(values: Array<string | undefined>): string {
 }
 
 /**
- * Claude channel notification metadata must stay flat and string-only. Rich
- * attachment details remain available in buildChannelMeta for bridge-mode and
- * fetch/replay flows; this projection keeps direct channel injection from
- * depending on nested JSON support in Claude Code's notification handler.
+ * Claude channel notification metadata stays flat and string-only because
+ * Claude Code's MCP notification handler has silently dropped notifications
+ * when nested arrays/objects are present in params.meta.
  */
 function buildChannelNotificationMeta(
   activity: Activity,
@@ -1128,102 +1064,6 @@ function buildChannelNotificationMeta(
     if (downloadErrors) meta.attachment_download_errors = downloadErrors
   }
   return meta
-}
-
-/**
- * Bridge-mode delivery (issue #959): enqueue the inbound Teams message as an
- * Agent Bridge queue task via `bridge-task.sh create`. Used when
- * TEAMS_DELIVERY_MODE is `bridge` or `both`. The daemon then wakes the agent
- * through the standard inbox path, sidestepping the channel-only failure
- * mode where `await mcp.notification()` resolves but Claude Code's MCP
- * notification handler never injects the message into the session.
- *
- * Best-effort: misconfiguration or queue failure logs to stderr but never
- * throws. Throwing would force a Teams webhook retry, which the channel-mode
- * path already covers when caller selected `both`; in `bridge`-only mode the
- * operator has opted into queue-only delivery and silent loss is preferable
- * to retry storms when the queue itself is unhealthy.
- */
-function truncateForTitle(s: string, maxCodepoints: number): string {
-  // String.slice operates on UTF-16 code units, which splits surrogate pairs
-  // (any non-BMP character — most emoji, CJK extensions, etc.) and leaves a
-  // lone surrogate. Spread iterates by Unicode codepoint, so the slice
-  // boundary always falls on a complete character.
-  const codepoints = [...s]
-  if (codepoints.length <= maxCodepoints) return s
-  return codepoints.slice(0, maxCodepoints - 1).join('') + '…'
-}
-
-function deliverViaBridgeQueue(
-  activity: Activity,
-  stored: StoredMessage,
-  attachments: StoredAttachment[],
-): void {
-  const agent = String(process.env.BRIDGE_AGENT_ID ?? '').trim()
-  if (!agent) {
-    process.stderr.write(`teams channel: bridge-mode delivery skipped — BRIDGE_AGENT_ID unset, message_id=${stored.message_id}\n`)
-    return
-  }
-  const taskScript = join(BRIDGE_HOME, 'bridge-task.sh')
-  if (!existsSync(taskScript)) {
-    process.stderr.write(`teams channel: bridge-mode delivery skipped — bridge-task.sh not found at ${taskScript}, message_id=${stored.message_id}\n`)
-    return
-  }
-
-  const body = JSON.stringify(buildChannelMeta(activity, stored, attachments), null, 2)
-
-  // Tempfile delivery dodges argv length limits and shell-escaping of the
-  // arbitrary user-supplied body. mkdtemp guarantees a fresh unique directory
-  // even on same-ms collisions; opening the file with 'wx' fails fast if an
-  // attacker pre-created the path. 0o600 keeps the JSON payload (which may
-  // contain user PII / message text) off any group-readable tmp.
-  const safeMid = stored.message_id.replace(/[^A-Za-z0-9._-]+/g, '_').slice(0, 80) || 'msg'
-  let bodyDir: string
-  try {
-    bodyDir = mkdtempSync(join(tmpdir(), 'teams-bridge-'))
-  } catch (err) {
-    process.stderr.write(`teams channel: bridge-mode delivery skipped — could not create body dir: ${err}, message_id=${stored.message_id}\n`)
-    return
-  }
-  const bodyFile = join(bodyDir, `${safeMid}.json`)
-  try {
-    writeFileSync(bodyFile, body, { mode: 0o600, flag: 'wx' })
-  } catch (err) {
-    process.stderr.write(`teams channel: bridge-mode delivery skipped — could not write body file: ${err}, message_id=${stored.message_id}\n`)
-    // Mirror the success-path finally: drop the file (may exist as a partial
-    // write) before rmdir so a non-empty dir doesn't leak both artifacts.
-    try { unlinkSync(bodyFile) } catch {}
-    try { rmdirSync(bodyDir) } catch {}
-    return
-  }
-
-  // Title budget: cap WHOLE title (prefix + user + text) to TITLE_MAX so a
-  // long Teams display name can't push the user-visible text off the inbox
-  // row. Single ellipsis at the end keeps the truncation obvious.
-  const TITLE_MAX = 120
-  const rawTitle = `[teams] ${stored.user || 'user'}: ${stored.text || '(attachment)'}`
-  const title = truncateForTitle(rawTitle, TITLE_MAX)
-  try {
-    const r = spawnSync(
-      'bash',
-      [
-        taskScript,
-        'create',
-        '--to', agent,
-        '--from', 'teams-channel',
-        '--title', title,
-        '--body-file', bodyFile,
-      ],
-      { stdio: ['ignore', 'pipe', 'pipe'] },
-    )
-    if (r.status !== 0) {
-      const stderrTail = r.stderr ? r.stderr.toString().slice(0, 200) : ''
-      process.stderr.write(`teams channel: bridge-mode enqueue failed rc=${r.status}, message_id=${stored.message_id}: ${stderrTail}\n`)
-    }
-  } finally {
-    try { unlinkSync(bodyFile) } catch {}
-    try { rmdirSync(bodyDir) } catch {}
-  }
 }
 
 function recentMessages(chatId: string, limit: number): StoredMessage[] {
@@ -2154,51 +1994,31 @@ async function handleActivity(context: TurnContext): Promise<void> {
     ...(revision ? { revision } : {}),
     ...(attachments.length > 0 ? { attachments } : {}),
   }
-  // Channel delivery and local log append are split: a channel-mode delivery
-  // failure must surface as a non-2xx so Teams retries, but a successful
-  // delivery followed by a failed log append (disk full, EACCES, …) should
-  // NOT cause Teams to retry — the message is already in the active Claude
-  // session. The only observable consequence of a log-append failure is that
-  // fetch_messages can't replay this entry from the local audit log.
+  // Channel delivery and local log append are split: a delivery failure must
+  // surface as a non-2xx so Teams retries, but a successful delivery followed
+  // by a failed log append (disk full, EACCES, …) should NOT cause Teams to
+  // retry — the message is already in the active Claude session. The only
+  // observable consequence of a log-append failure is that fetch_messages
+  // can't replay this entry from the local audit log.
   //
-  // TEAMS_DELIVERY_MODE (issue #959): `channel` (default) preserves the
-  // existing notifications/claude/channel path; `bridge` enqueues a queue
-  // task instead (sidesteps Claude Code's silent notification-handler drop);
-  // `both` fires both for defense in depth (accepting possible duplicate
-  // delivery).
-  const mode = DELIVERY_MODE
-  let channelDelivered = false
-  let channelError: unknown = null
-  if (mode === 'channel' || mode === 'both') {
-    try {
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          content: text || (attachments.length > 0 ? '(attachment)' : ''),
-          meta: buildChannelNotificationMeta(activity, stored, attachments),
-        },
-      })
-      channelDelivered = true
-    } catch (err) {
-      channelError = err
-      process.stderr.write(`teams channel: failed to deliver inbound message_id=${messageId} via channel: ${err}\n`)
-    }
-  }
-
-  if (mode === 'bridge' || mode === 'both') {
-    // Bridge-mode failures log but do not throw — operators choosing bridge
-    // or both have accepted best-effort enqueue. See deliverViaBridgeQueue.
-    deliverViaBridgeQueue(activity, stored, attachments)
-  }
-
-  // Channel-mode (and both-mode) failure surfaces to Teams so it retries; in
-  // both-mode we re-throw on channel failure even though bridge may have
-  // succeeded, so Teams's at-least-once channel delivery contract holds.
-  // Bridge-only mode never throws here — its delivery is best-effort by
-  // design.
-  if ((mode === 'channel' || mode === 'both') && !channelDelivered) {
+  // Inbound messages are delivered exclusively via the MCP channel
+  // notification (issue #1204): the prior bridge-queue delivery workaround
+  // was removed because it silently dropped messages when BRIDGE_AGENT_ID
+  // was unset in the plugin's environment, masking the very bug it claimed
+  // to work around. A channel-delivery failure is re-thrown so Teams
+  // retries the webhook.
+  try {
+    await mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content: text || (attachments.length > 0 ? '(attachment)' : ''),
+        meta: buildChannelNotificationMeta(activity, stored, attachments),
+      },
+    })
+  } catch (err) {
+    process.stderr.write(`teams channel: failed to deliver inbound message_id=${messageId} via channel: ${err}\n`)
     recentMessageIds.forget(dedupeKey(chatId, messageId, revision))
-    throw channelError
+    throw err
   }
 
   try {
