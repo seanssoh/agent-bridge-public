@@ -2366,7 +2366,7 @@ process_a2a_outbox_stuck_scan_tick() {
   # piping via $() — footgun #11 (Bash 5.3.9 here-string / heredoc-stdin
   # wedge) recommends file-as-argv for any subprocess that may emit
   # large output.
-  local list_tmp emit_tmp
+  local list_tmp emit_tmp ack_tmp
   list_tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-stuck-list.XXXXXX" 2>/dev/null)" || {
     daemon_warn "[a2a_stuck_scan] mktemp failed; skipping"
     return 1
@@ -2376,13 +2376,24 @@ process_a2a_outbox_stuck_scan_tick() {
     daemon_warn "[a2a_stuck_scan] mktemp failed; skipping"
     return 1
   }
+  # v0.15.0-beta4 Lane I r2 (codex r1 BLOCKING): ack-keys file —
+  # successful task-create message_ids are appended here. The helper
+  # ``a2a-stuck-ack`` stamps the ledger ONLY for these keys (and
+  # prunes outbox-absent entries). Failed task-create paths skip the
+  # append, so the reemit cooldown is not started for an alert that
+  # never reached the operator.
+  ack_tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-stuck-ack.XXXXXX" 2>/dev/null)" || {
+    rm -f "$list_tmp" "$emit_tmp"
+    daemon_warn "[a2a_stuck_scan] mktemp failed; skipping"
+    return 1
+  }
 
   local list_rc=0
   bridge_with_timeout 30 a2a_outbox_list \
     python3 "$SCRIPT_DIR/bridge-a2a.py" outbox list --json >"$list_tmp" 2>/dev/null || list_rc=$?
   if (( list_rc != 0 )); then
     daemon_warn "[a2a_stuck_scan] outbox list rc=$list_rc; skipping this tick"
-    rm -f "$list_tmp" "$emit_tmp"
+    rm -f "$list_tmp" "$emit_tmp" "$ack_tmp"
     printf 'A2A_STUCK_SCAN_LAST_TS=%s\nA2A_STUCK_SCAN_NEXT_TS=%s\nA2A_STUCK_SCAN_LAST_EMITTED=0\n' \
       "$now" "$((now + interval))" >"$tick_state" 2>/dev/null || true
     return 0
@@ -2392,9 +2403,10 @@ process_a2a_outbox_stuck_scan_tick() {
   # keep cleanly in bash. The helper writes one TSV row per row that
   # needs an admin task:
   #   message_id\tpeer\ttarget_agent\tstatus\tattempts\tage_seconds\tlast_error
-  # and rewrites the ledger file to reflect the new last-alerted-ts for
-  # each emitted row. Pass JSON via --outbox-json-file (path) rather
-  # than stdin — same footgun #11 reasoning.
+  # v0.15.0-beta4 Lane I r2 (codex r1 BLOCKING): decide is now pure
+  # read — it does NOT modify the ledger. The ledger is stamped only
+  # after a successful admin-task create, via ``a2a-stuck-ack`` below.
+  # Pass JSON via path (footgun #11 reasoning).
   bridge_with_timeout 10 a2a_stuck_decide \
     python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" a2a-stuck-decide \
       "$now" "$stuck_secs" "$reemit_secs" "$ledger_file" "$list_tmp" \
@@ -2438,6 +2450,10 @@ process_a2a_outbox_stuck_scan_tick() {
          --title "[A2A] outbox stuck: ${peer}:${target_agent} (${message_id:0:8})" \
          --body-file "$body_file" >/dev/null 2>&1; then
       emitted=$((emitted + 1))
+      # Codex r1 BLOCKING fix: stamp the ledger via ack helper at the
+      # end of the loop, ONLY for rows whose admin task we actually
+      # filed. Record the message_id here for that ack pass.
+      printf '%s\n' "$message_id" >>"$ack_tmp" 2>/dev/null || true
       bridge_audit_log daemon a2a_outbox_stuck_alert_emitted "$admin" \
         --detail message_id="$message_id" \
         --detail peer="$peer" \
@@ -2446,19 +2462,32 @@ process_a2a_outbox_stuck_scan_tick() {
         --detail attempts="$attempts" \
         --detail age_seconds="$age_seconds" >/dev/null 2>&1 || true
     else
-      daemon_warn "[a2a_stuck_scan] failed to file admin task for stuck $message_id"
+      # Codex r1 BLOCKING fix: do NOT advance the reemit cooldown
+      # ledger when task create fails. The next scan will re-evaluate
+      # this row and try again.
+      daemon_warn "[a2a_stuck_scan] task-create failed for stuck $message_id; ledger preserved, will retry next scan"
     fi
     rm -f "$body_file" 2>/dev/null || true
   done <"$emit_tmp"
 
-  rm -f "$list_tmp" "$emit_tmp" 2>/dev/null || true
+  # Stamp ledger for successful task-create rows (if any) and prune
+  # entries whose message_id is no longer in the outbox. Call the ack
+  # helper unconditionally so pruning runs even on quiet ticks; an
+  # empty ack_tmp is a legal no-op-stamp + prune pass.
+  bridge_with_timeout 10 a2a_stuck_ack \
+    python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" a2a-stuck-ack \
+      "$now" "$ledger_file" "$ack_tmp" "$list_tmp" \
+      >/dev/null 2>&1 || true
+
+  rm -f "$list_tmp" "$emit_tmp" "$ack_tmp" 2>/dev/null || true
 
   if (( emitted > 0 )); then
     daemon_log_event "[a2a_stuck_scan] emitted $emitted stuck-outbox admin task(s)"
   fi
 
-  # Persist throttle state. The helper has already rewritten the ledger
-  # with the new last-alerted-ts entries.
+  # Persist throttle state. The ack helper has already rewritten the
+  # ledger with the new last-alerted-ts entries for successful task
+  # creates (and pruned outbox-absent message_ids).
   printf 'A2A_STUCK_SCAN_LAST_TS=%s\nA2A_STUCK_SCAN_NEXT_TS=%s\nA2A_STUCK_SCAN_LAST_EMITTED=%s\n' \
     "$now" "$((now + interval))" "$emitted" >"$tick_state" 2>/dev/null || true
   return 0

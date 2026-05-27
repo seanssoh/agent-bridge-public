@@ -598,9 +598,18 @@ def cmd_a2a_stuck_decide(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh process_a2a_outbox_stuck_scan_tick.
 
     Issue #1262 Gap 3 (v0.15.0-beta4 Lane I, 2026-05-27).
+    Codex r1 BLOCKING (v0.15.0-beta4 Lane I r2, 2026-05-27): split
+    decide vs ack/stamp so the ledger is only updated AFTER the admin
+    task has been filed successfully. Otherwise a transient
+    bridge-task.sh failure starts the reemit cooldown without any
+    admin task existing — the operator never learns about the stuck
+    row.
 
     Decide which outbox rows have been stuck long enough to deserve an
     admin task, honoring the per-message re-emit cooldown ledger.
+    Pure read — does NOT modify the ledger; the daemon shell calls
+    ``a2a-stuck-ack`` AFTER successfully creating the admin task to
+    stamp the ledger atomically.
 
     Input:
       now            — current epoch seconds (int)
@@ -612,11 +621,6 @@ def cmd_a2a_stuck_decide(args: argparse.Namespace) -> int:
     Output (stdout, one TSV row per row to alert):
       message_id \\t peer \\t target_agent \\t status \\t attempts \\t
       age_seconds \\t last_error
-
-    Side effect: rewrites `ledger_path` with the updated
-    last-emitted-ts for each row we just decided to alert on. Rows
-    that no longer appear in the outbox (peer drop, gc) are pruned so
-    the ledger does not grow unboundedly.
 
     Errors are swallowed (return 0 with no output) — the daemon tick
     must not crash on a malformed ledger or JSON parse failure;
@@ -703,14 +707,106 @@ def cmd_a2a_stuck_decide(args: argparse.Namespace) -> int:
             f"{r['status']}\t{r['attempts']}\t{r['age_seconds']}\t{r['last_error']}"
         )
 
-    # Update ledger: stamp emitted rows, prune entries for message_ids
-    # no longer in the outbox (peer-drop or gc).
-    new_ledger = {}
-    for k, v in ledger.items():
-        if k in seen_ids:
-            new_ledger[k] = v
-    for r in emitted_now:
-        new_ledger[str(r["message_id"])] = now
+    # NOTE (r2 split, codex r1 BLOCKING): we DO NOT modify the ledger
+    # here. The daemon shell calls ``a2a-stuck-ack`` after each
+    # successful admin task create. Ledger stamping + pruning lives
+    # in ``cmd_a2a_stuck_ack``.
+
+    return 0
+
+
+def cmd_a2a_stuck_ack(args: argparse.Namespace) -> int:
+    """Original site: bridge-daemon.sh process_a2a_outbox_stuck_scan_tick.
+
+    Issue #1262 Gap 3 / v0.15.0-beta4 Lane I r2 (codex r1 BLOCKING).
+
+    Stamp the stuck-alert ledger ONLY for outbox rows whose admin task
+    was successfully filed by the daemon shell. Without this split, a
+    transient `bridge-task.sh create` failure would advance the
+    re-emit cooldown for a row that never produced an admin task —
+    the operator silently loses the alert until the cooldown lapses.
+
+    Input (positional):
+      now              — current epoch seconds (int)
+      ledger_path      — JSON file: { message_id: last_emitted_ts }
+      row_keys_file    — UTF-8 text file with one message_id per
+                         non-empty line. The shell writes successful
+                         task-create message_ids here; empty file is
+                         legal (no rows to stamp, but pruning still
+                         runs).
+      outbox_json_path — JSON array from `agb a2a outbox list --json`
+                         used for ledger pruning (entries whose
+                         message_id is no longer in the outbox are
+                         dropped so the ledger does not grow
+                         unboundedly).
+
+    Atomic rewrite via tempfile + os.replace. Errors are swallowed —
+    worst case is a duplicate alert next tick.
+
+    rc=0 on every path so the daemon loop never crashes on a
+    malformed ledger / row-keys file.
+    """
+    try:
+        now = int(args.now)
+    except Exception:
+        return 0
+
+    ledger_path = args.ledger_path
+    row_keys_file = args.row_keys_file
+    outbox_json_path = args.outbox_json_path
+
+    ledger: dict = {}
+    try:
+        with open(ledger_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                try:
+                    ledger[str(k)] = int(v)
+                except Exception:
+                    continue
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        ledger = {}
+
+    # Successful task-create keys (one per line, blank lines skipped).
+    ack_keys: list = []
+    try:
+        with open(row_keys_file, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                key = raw.strip()
+                if key:
+                    ack_keys.append(key)
+    except (FileNotFoundError, OSError):
+        ack_keys = []
+
+    # Current outbox for pruning. Missing/malformed → skip prune (keep
+    # ledger as-is) rather than wipe entries we still care about.
+    seen_ids: set = set()
+    prune_known = False
+    try:
+        with open(outbox_json_path, "r", encoding="utf-8") as fh:
+            rows = json.load(fh)
+        if isinstance(rows, list):
+            prune_known = True
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                message_id = str(row.get("message_id") or "")
+                if message_id:
+                    seen_ids.add(message_id)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        prune_known = False
+
+    new_ledger: dict = {}
+    if prune_known:
+        for k, v in ledger.items():
+            if k in seen_ids:
+                new_ledger[k] = v
+    else:
+        new_ledger = dict(ledger)
+
+    for key in ack_keys:
+        new_ledger[str(key)] = now
 
     # Atomic rewrite — tmp-write + os.replace so a crash mid-write
     # cannot leave the ledger in a half-state.
@@ -850,6 +946,25 @@ SUBCOMMANDS = {
             ("outbox_json_path", "JSON file containing `agb a2a outbox list --json` output"),
         ],
         "One tab-separated row per stuck row that crossed the threshold and cooldown.",
+    ),
+    # Issue #1262 Gap 3 / v0.15.0-beta4 Lane I r2 (codex r1 BLOCKING):
+    # stamp the ledger ONLY after the daemon shell successfully filed
+    # the admin task. See cmd_a2a_stuck_ack.
+    "a2a-stuck-ack": (
+        cmd_a2a_stuck_ack,
+        [
+            ("now", "current epoch seconds (int)"),
+            ("ledger_path", "JSON file recording last-emitted-ts per message_id"),
+            (
+                "row_keys_file",
+                "UTF-8 text file with one successful-task-create message_id per line",
+            ),
+            (
+                "outbox_json_path",
+                "JSON file containing `agb a2a outbox list --json` output (for prune)",
+            ),
+        ],
+        "Stamp ledger for successful task-create rows + prune entries missing from outbox.",
     ),
 }
 

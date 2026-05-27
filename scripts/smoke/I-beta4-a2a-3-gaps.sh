@@ -291,18 +291,31 @@ if printf '%s' "$T5_OUT1" | grep -F 'msg-dead-004' >/dev/null; then
   smoke_fail "T5a: helper incorrectly emitted dead row"
 fi
 
-# T5b — ledger updated with last-emit timestamp.
-if ! grep -F '"msg-stuck-001": 1000000' "$T5_LEDGER" >/dev/null; then
-  smoke_fail "T5b: ledger missing emit ts for msg-stuck-001 (ledger: $(cat "$T5_LEDGER"))"
+# v0.15.0-beta4 Lane I r2 (codex r1 BLOCKING): decide is now pure
+# read — does NOT modify ledger. Confirm that property before we run
+# ack.
+if grep -F 'msg-stuck-001' "$T5_LEDGER" >/dev/null; then
+  smoke_fail "T5a-purity: decide unexpectedly stamped ledger (ledger: $(cat "$T5_LEDGER"))"
 fi
 
-# T5c — second call within cooldown (60s later, cooldown is 3600s): no emit.
+# T5b — daemon shell now follows up with a-stuck-ack ONLY for rows
+# whose admin task was filed successfully. Simulate the all-success
+# path: feed every emitted message_id back to ack.
+T5_ACK_KEYS="$SMOKE_TMP_ROOT/ack-keys-t5.txt"
+printf '%s' "$T5_OUT1" | awk -F'\t' 'NF{print $1}' >"$T5_ACK_KEYS"
+python3 "$HELPERS_PY" a2a-stuck-ack 1000000 "$T5_LEDGER" "$T5_ACK_KEYS" "$T5_OUTBOX" >/dev/null 2>&1 || true
+if ! grep -F '"msg-stuck-001": 1000000' "$T5_LEDGER" >/dev/null; then
+  smoke_fail "T5b: ack did not stamp ledger for msg-stuck-001 (ledger: $(cat "$T5_LEDGER"))"
+fi
+
+# T5c — second decide within cooldown (60s later, cooldown is 3600s):
+# no emit, regardless of whether shell calls ack again.
 T5_OUT2="$(python3 "$HELPERS_PY" a2a-stuck-decide 1000060 600 3600 "$T5_LEDGER" "$T5_OUTBOX" 2>&1 || true)"
 if [[ -n "$T5_OUT2" ]]; then
   smoke_fail "T5c: helper emitted within cooldown (output: $T5_OUT2)"
 fi
 
-smoke_log "T5 PASS — stuck row emitted, fresh/acked/dead suppressed, cooldown honored"
+smoke_log "T5 PASS — stuck row emitted, fresh/acked/dead suppressed, cooldown honored, ack stamps only on follow-up"
 
 # ---------------------------------------------------------------------
 # T6 — Gap 3 teeth: cooldown expiry re-emits; ledger pruning.
@@ -317,20 +330,28 @@ T6_OUT1="$(python3 "$HELPERS_PY" a2a-stuck-decide 1003700 600 3600 "$T5_LEDGER" 
 if ! printf '%s' "$T6_OUT1" | grep -F 'msg-stuck-001' >/dev/null; then
   T6_FAILS+="cooldown-expiry re-emit failed (output: $T6_OUT1); "
 fi
-# Ledger should be re-stamped to 1003700.
+# v0.15.0-beta4 Lane I r2 (codex r1 BLOCKING): decide does NOT stamp
+# the ledger. Simulate successful follow-up ack and verify re-stamp.
+T6_ACK_KEYS="$SMOKE_TMP_ROOT/ack-keys-t6.txt"
+printf '%s' "$T6_OUT1" | awk -F'\t' 'NF{print $1}' >"$T6_ACK_KEYS"
+python3 "$HELPERS_PY" a2a-stuck-ack 1003700 "$T5_LEDGER" "$T6_ACK_KEYS" "$T5_OUTBOX" >/dev/null 2>&1 || true
 if ! grep -F '"msg-stuck-001": 1003700' "$T5_LEDGER" >/dev/null; then
-  T6_FAILS+="ledger not re-stamped after cooldown re-emit; "
+  T6_FAILS+="ledger not re-stamped after cooldown re-emit + ack; "
 fi
 
 # T6b — ledger pruning. Construct a smaller outbox (msg-stuck-001 gone)
-# and confirm the ledger entry is pruned on next decide call.
+# and confirm the ledger entry is pruned on next ack call (decide is
+# pure read; pruning now lives in ack).
 T6_OUTBOX_DROP="$SMOKE_TMP_ROOT/outbox-dropped.json"
 cat >"$T6_OUTBOX_DROP" <<'JSON'
 [
   {"message_id": "msg-fresh-002", "peer": "bridge-b", "target_agent": "reviewer", "priority": "normal", "status": "pending", "attempts": 0, "next_attempt_ts": 0, "last_error": null, "acked_remote_task_id": null, "created_ts": 999000, "updated_ts": 999000, "lease_expires_ts": 0, "age_seconds": 30, "due_for_seconds": 30, "next_attempt_in_seconds": null, "lease_stale_seconds": null}
 ]
 JSON
-python3 "$HELPERS_PY" a2a-stuck-decide 1010000 600 3600 "$T5_LEDGER" "$T6_OUTBOX_DROP" >/dev/null 2>&1 || true
+# Empty ack-keys file — ack is still called every tick for pruning.
+T6_ACK_EMPTY="$SMOKE_TMP_ROOT/ack-keys-empty.txt"
+: >"$T6_ACK_EMPTY"
+python3 "$HELPERS_PY" a2a-stuck-ack 1010000 "$T5_LEDGER" "$T6_ACK_EMPTY" "$T6_OUTBOX_DROP" >/dev/null 2>&1 || true
 if grep -F 'msg-stuck-001' "$T5_LEDGER" >/dev/null; then
   T6_FAILS+="ledger did not prune msg-stuck-001 after it dropped from outbox; "
 fi
@@ -353,12 +374,98 @@ fi
 if ! grep -F '"$target_bridge" task create' "$DAEMON_SH" >/dev/null; then
   T6_FAILS+="stuck scan does not create admin task via target_bridge; "
 fi
+# T6f — v0.15.0-beta4 Lane I r2 (codex r1 BLOCKING) wiring: daemon
+# follows up with a2a-stuck-ack helper after the task-create loop,
+# and that helper is registered in bridge-daemon-helpers.py.
+if ! grep -F 'a2a-stuck-ack' "$DAEMON_SH" >/dev/null; then
+  T6_FAILS+="daemon does not call a2a-stuck-ack helper; "
+fi
+if ! grep -F 'a2a-stuck-ack' "$HELPERS_PY" >/dev/null; then
+  T6_FAILS+="bridge-daemon-helpers.py missing a2a-stuck-ack subcommand; "
+fi
+if ! grep -nE '^def cmd_a2a_stuck_ack\(' "$HELPERS_PY" >/dev/null; then
+  T6_FAILS+="cmd_a2a_stuck_ack handler missing in helpers; "
+fi
 
 if [[ -n "$T6_FAILS" ]]; then
   smoke_fail "T6: $T6_FAILS"
 fi
 
-smoke_log "T6 PASS — cooldown expiry re-emits, ledger prunes dropped rows, daemon wiring intact"
+smoke_log "T6 PASS — cooldown expiry re-emits, ledger prunes dropped rows, decide+ack split wired"
+
+# ---------------------------------------------------------------------
+# T_stuck_task_create_failure_preserves_ledger — v0.15.0-beta4 Lane I
+# r2 (codex r1 BLOCKING).
+#
+# Contract: if `$target_bridge task create` fails (transient), the
+# daemon shell must NOT advance the reemit cooldown for that row.
+# Otherwise the operator silently loses the alert until cooldown
+# lapses. The split is enforced by:
+#   - cmd_a2a_stuck_decide: pure read, no ledger writes
+#   - daemon shell loop: append message_id to ack-keys only on
+#     task-create success (skip on failure)
+#   - cmd_a2a_stuck_ack: stamp ledger only for keys in ack-keys file
+#
+# We exercise the failure path by:
+#   - calling decide (no ledger write)
+#   - simulating task-create failure: do NOT add message_id to ack
+#     keys
+#   - calling ack with empty (or no-msg) ack-keys
+#   - asserting ledger does not contain msg-stuck-001
+#   - asserting next decide call (within cooldown) re-emits the same
+#     row (since cooldown was never advanced)
+# ---------------------------------------------------------------------
+
+smoke_log "T_stuck_task_create_failure_preserves_ledger: failed task-create keeps ledger pristine"
+
+TFAIL_OUTBOX="$SMOKE_TMP_ROOT/outbox-tcfail.json"
+TFAIL_LEDGER="$SMOKE_TMP_ROOT/stuck-alerts-tcfail.json"
+TFAIL_ACK="$SMOKE_TMP_ROOT/ack-keys-tcfail.txt"
+cat >"$TFAIL_OUTBOX" <<'JSON'
+[
+  {"message_id": "msg-stuck-fail-001", "peer": "bridge-b", "target_agent": "reviewer", "priority": "normal", "status": "retry", "attempts": 3, "next_attempt_ts": 0, "last_error": "transport: peer unreachable", "acked_remote_task_id": null, "created_ts": 1000, "updated_ts": 1100, "lease_expires_ts": 0, "age_seconds": 10000, "due_for_seconds": 9000, "next_attempt_in_seconds": null, "lease_stale_seconds": null}
+]
+JSON
+printf '{}\n' >"$TFAIL_LEDGER"
+
+# Step 1 — decide. Should emit row. Ledger must remain {}.
+TFAIL_OUT1="$(python3 "$HELPERS_PY" a2a-stuck-decide 2000000 600 3600 "$TFAIL_LEDGER" "$TFAIL_OUTBOX" 2>&1 || true)"
+if ! printf '%s' "$TFAIL_OUT1" | grep -F 'msg-stuck-fail-001' >/dev/null; then
+  smoke_fail "T_stuck_task_create_failure: decide did not emit candidate row (output: $TFAIL_OUT1)"
+fi
+if grep -F 'msg-stuck-fail-001' "$TFAIL_LEDGER" >/dev/null; then
+  smoke_fail "T_stuck_task_create_failure: decide stamped ledger (regression — must be pure read)"
+fi
+
+# Step 2 — simulate task-create failure: ack-keys file stays empty.
+: >"$TFAIL_ACK"
+python3 "$HELPERS_PY" a2a-stuck-ack 2000000 "$TFAIL_LEDGER" "$TFAIL_ACK" "$TFAIL_OUTBOX" >/dev/null 2>&1 || true
+
+# Step 3 — ledger MUST NOT carry an entry for msg-stuck-fail-001.
+if grep -F 'msg-stuck-fail-001' "$TFAIL_LEDGER" >/dev/null; then
+  smoke_fail "T_stuck_task_create_failure: ack stamped ledger despite failed task-create (ledger: $(cat "$TFAIL_LEDGER"))"
+fi
+
+# Step 4 — next decide call within cooldown re-emits the same row,
+# proving the cooldown was never started.
+TFAIL_OUT2="$(python3 "$HELPERS_PY" a2a-stuck-decide 2000060 600 3600 "$TFAIL_LEDGER" "$TFAIL_OUTBOX" 2>&1 || true)"
+if ! printf '%s' "$TFAIL_OUT2" | grep -F 'msg-stuck-fail-001' >/dev/null; then
+  smoke_fail "T_stuck_task_create_failure: next scan did not re-emit (alert lost!); ledger=$(cat "$TFAIL_LEDGER") output=$TFAIL_OUT2"
+fi
+
+# Teeth — synthetic regression: simulate the broken old contract where
+# decide stamped the ledger directly. Inject the entry by hand and
+# confirm the next decide call SKIPS the row (which is what the old
+# bug looked like to the operator). This proves our new assertion
+# bites — the test must fail if someone reverts the split.
+TFAIL_LEDGER_REVERT="$SMOKE_TMP_ROOT/stuck-alerts-tcfail-revert.json"
+printf '{"msg-stuck-fail-001": 2000000}\n' >"$TFAIL_LEDGER_REVERT"
+TFAIL_OUT_REVERT="$(python3 "$HELPERS_PY" a2a-stuck-decide 2000060 600 3600 "$TFAIL_LEDGER_REVERT" "$TFAIL_OUTBOX" 2>&1 || true)"
+if printf '%s' "$TFAIL_OUT_REVERT" | grep -F 'msg-stuck-fail-001' >/dev/null; then
+  smoke_fail "T_stuck_task_create_failure teeth: with pre-stamped ledger, decide should suppress within cooldown (cooldown not honored)"
+fi
+
+smoke_log "T_stuck_task_create_failure_preserves_ledger PASS — failed task-create preserves ledger, next scan retries, teeth bites"
 
 # ---------------------------------------------------------------------
 # Teeth — verify the helper truly fails to emit when key field is wrong.
