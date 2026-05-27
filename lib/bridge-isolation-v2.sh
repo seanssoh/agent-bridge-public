@@ -677,6 +677,142 @@ _bridge_isolation_v2_run_root_or_sudo() {
   return 1
 }
 
+# _bridge_isolation_v2_realpath <path>
+#
+# Portable canonical path resolution. GNU coreutils `realpath` (Linux
+# default) supports `-m` for non-existent leaves; BSD `realpath` (macOS
+# default) does not even support `-m`. Both will resolve every existing
+# component. When neither flavor produces output (e.g. a missing leaf
+# under a missing parent on BSD), fall back to Python's `os.path.realpath`
+# which handles non-existent leaves uniformly across platforms.
+#
+# Emits the canonical path on stdout; returns 0 even when resolution
+# yields a best-effort result. Returns 1 only when no resolver is
+# available at all (no realpath binary AND no python3 — defensively
+# impossible on supported hosts but kept for safety).
+_bridge_isolation_v2_realpath() {
+  local p="$1"
+  local out=""
+  if command -v realpath >/dev/null 2>&1; then
+    # Try GNU `-m` first (handles non-existent leaves). On BSD realpath
+    # this errors; fall through to bare realpath which works on existing
+    # paths and most one-level-missing-leaf cases via parent resolution.
+    out="$(realpath -m -- "$p" 2>/dev/null || true)"
+    if [[ -z "$out" ]]; then
+      out="$(realpath -- "$p" 2>/dev/null || true)"
+    fi
+  fi
+  if [[ -z "$out" ]] && command -v python3 >/dev/null 2>&1; then
+    # NOTE: do not insert ``--`` between ``-c '<script>'`` and the
+    # argument — ``python3 -c`` does NOT honor ``--`` as an end-of-options
+    # marker. ``sys.argv[1]`` would then be the literal string ``--`` and
+    # the real path would be silently dropped. Pass the path directly.
+    out="$(python3 -c 'import os, sys; sys.stdout.write(os.path.realpath(sys.argv[1]))' "$p" 2>/dev/null || true)"
+  fi
+  if [[ -n "$out" ]]; then
+    printf '%s' "$out"
+    return 0
+  fi
+  # Last-resort fallback: emit the input unchanged. Callers that compare
+  # canonical-against-canonical will treat a "no resolver available" host
+  # as failing the canonical check (different paths compare unequal),
+  # which is the safe direction — refuse the mutation.
+  printf '%s' "$p"
+  return 1
+}
+
+# _bridge_isolation_v2_assert_no_symlink_in_path <leaf> <workdir>
+#
+# Refuse any symlink along the path from $workdir (inclusive of children,
+# exclusive of $workdir itself) up to and including $leaf. Also refuse
+# when the canonical resolution of $leaf escapes the canonical of
+# $workdir.
+#
+# Codex r1 BLOCKING (PR #1335 r1): the previous leaf-only `[[ -L $file ]]`
+# guard in `chown_file_iso_uid` and `chgrp_dir_iso_group` only rejected
+# the LEAF as a symlink. If an ANCESTOR was a symlink (e.g.
+# ``.claude/plugins -> /tmp/outside``), the leaf
+# (``/tmp/outside/known_marketplaces.json``) was a regular file — and the
+# chmod/chgrp/chown calls mutated the EXTERNAL target while logging
+# "refusing to follow symlink" on the leaf check (which passed because
+# the leaf itself was not a symlink). This violated the symlink_refusal
+# contract and created side effects outside the workdir.
+#
+# Per Sean's quality directive (2026-05-28): "refuse all symlinks in
+# path" — do NOT follow even within-workdir symlinks. The contract is
+# simpler and impossible to bypass with symlink-chain trickery.
+#
+# Returns:
+#   0 — path is safe (no symlinks anywhere from workdir/* to leaf, AND
+#       canonical leaf is under canonical workdir).
+#   1 — refuse (caller should bridge_warn and return WITHOUT mutating).
+#
+# Edge cases handled:
+#   * Symlink chains (.../a -> /b -> /c -> outside): every level
+#     is checked individually via `-L`; any link in chain → refuse.
+#   * Relative symlinks (.claude/plugins -> ../../../etc): canonical
+#     resolution catches the escape; ancestor walk catches the symlink
+#     itself.
+#   * Workdir itself contains symlinks (operator-set): canonical check
+#     compares resolved-leaf prefix against resolved-workdir; a workdir
+#     under /var/folders/X-symlinked-to-/private/var/folders/X (macOS)
+#     resolves consistently on both sides → safe.
+#   * Symlink to within-workdir (.claude/plugins -> .claude/cache):
+#     ancestor walk sees `.claude/plugins` IS a symlink → REFUSE. This
+#     is the deliberate-stricter contract per Sean's directive.
+#   * Non-existent leaf under existing parent: `-L $leaf` returns false
+#     (no entry), so leaf check passes; ancestor walk still inspects all
+#     existing parent components.
+#
+# Caller contract: $leaf is an absolute path under $workdir; $workdir is
+# an absolute path. Both arguments are required.
+_bridge_isolation_v2_assert_no_symlink_in_path() {
+  local leaf="$1"
+  local workdir="$2"
+  [[ -n "$leaf" && -n "$workdir" ]] || return 1
+
+  # Canonical containment check. Resolve both ends; the canonical leaf
+  # MUST sit under the canonical workdir + '/'. Use the realpath helper
+  # which falls through to Python when neither GNU `-m` nor BSD bare
+  # realpath produces output (missing-leaf-under-missing-parent on BSD).
+  local can_leaf can_workdir
+  can_leaf="$(_bridge_isolation_v2_realpath "$leaf" || printf '%s' "$leaf")"
+  can_workdir="$(_bridge_isolation_v2_realpath "$workdir" || printf '%s' "$workdir")"
+  # The canonical workdir + '/' prefix match (NOT a substring match) so
+  # `/var/agent-bridge` does not match `/var/agent-bridge-other/...`.
+  case "$can_leaf" in
+    "$can_workdir"|"$can_workdir"/*) : ;;
+    *)
+      bridge_warn "iso-v2: refusing — canonical path escapes workdir (leaf='$leaf' canonical='$can_leaf' workdir='$workdir' canonical_workdir='$can_workdir')"
+      return 1
+      ;;
+  esac
+
+  # Ancestor symlink walk. Inspect every node from $leaf upward, stopping
+  # ONE level above $workdir (we do not inspect $workdir itself — operator
+  # may legitimately have a symlinked workdir root and the canonical check
+  # above already proved no path-escape). Each `-L $current` test runs
+  # under the controller UID so it sees the real fs view.
+  local current="$leaf"
+  local guard=0
+  while [[ "$current" != "$workdir" && "$current" != "/" && "$current" != "." ]]; do
+    if [[ -L "$current" ]]; then
+      bridge_warn "iso-v2: refusing — symlink in ancestor path (component='$current' leaf='$leaf' workdir='$workdir')"
+      return 1
+    fi
+    current="$(dirname -- "$current")"
+    # Hard guard against pathological recursion (symlink loops via
+    # dirname are not possible, but defensive against truncated paths).
+    guard=$((guard + 1))
+    if (( guard > 4096 )); then
+      bridge_warn "iso-v2: refusing — ancestor walk exceeded depth guard for '$leaf' (workdir='$workdir')"
+      return 1
+    fi
+  done
+
+  return 0
+}
+
 bridge_isolation_v2_chgrp_setgid_dir() {
   # Apply group ownership + setgid bit + mode to a single directory.
   # Idempotent. Honors mode argument (e.g. 2750 for shared, 2770 for
@@ -703,7 +839,7 @@ bridge_isolation_v2_chgrp_setgid_dir() {
   _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$dir" || return 1
 }
 
-# bridge_isolation_v2_chgrp_file_iso_group <agent> <file> [mode]
+# bridge_isolation_v2_chgrp_file_iso_group <agent> <file> [mode] [workdir]
 #
 # Normalize a single per-agent file's group + mode to the per-agent
 # isolation group (``ab-agent-<a>``) at mode ``0660`` (operator-overridable
@@ -731,6 +867,20 @@ bridge_isolation_v2_chgrp_setgid_dir() {
 #     stat pattern (GNU ``-c`` vs BSD ``-f``); mode strings are compared
 #     octal-to-octal via ``printf %o`` so ``0660`` vs ``660`` parses the
 #     same way.
+#   * Defensive symlink refusal: refuse ANY symlink in the ancestor path
+#     from ``$workdir`` to ``$file`` (inclusive of leaf), and refuse when
+#     the canonical resolution of ``$file`` escapes ``$workdir``. PR #1335
+#     r3 (codex r2 BLOCKING): the leaf-only ``[[ -L $file ]]`` guard
+#     pattern that r2 closed in the sibling chown/chgrp_dir helpers was
+#     still missing here. Direct codex r2 repro: ``work/CLAUDE.md ->
+#     /tmp/out/CLAUDE.md`` (leaf-as-symlink to external target), pre-r3
+#     normalize mutated the external target to ``staff:660`` because the
+#     materialize-fileset loop fed the path here WITHOUT a workdir and
+#     the helper had no ancestor-walk gate at all. The fourth ``$workdir``
+#     argument is REQUIRED to engage the ancestor walk; calling without
+#     it logs a bridge_warn and falls back to the legacy leaf-only check
+#     (no behavior change for legacy callers, but they are now visible in
+#     logs).
 #   * Returns 0 when there is no work to do (file missing, agent group
 #     cannot be resolved, or platform discriminator says non-Linux).
 #     Only an explicit chgrp/chmod failure returns 1.
@@ -738,6 +888,7 @@ bridge_isolation_v2_chgrp_file_iso_group() {
   local agent="$1"
   local file="$2"
   local mode="${3:-0660}"
+  local workdir="${4:-}"
   [[ -n "$agent" && -n "$file" ]] || {
     bridge_warn "chgrp_file_iso_group: agent and file required"
     return 1
@@ -746,6 +897,27 @@ bridge_isolation_v2_chgrp_file_iso_group() {
   # way bridge_isolation_v2_chgrp_setgid_dir gates. Returning 0 keeps
   # the caller's happy path simple.
   bridge_isolation_v2_enforce || return 0
+  # Ancestor symlink walk + canonical containment (PR #1335 r3, codex r2
+  # BLOCKING). When the caller passes ``$workdir`` (current behavior for
+  # ``bridge_isolation_v2_normalize_workdir_profile_group``), refuse if
+  # ANY component along $workdir → $file is a symlink, OR if the
+  # canonical resolved $file escapes $workdir. This closes the
+  # ``work/CLAUDE.md -> /tmp/out/CLAUDE.md`` bypass where the external
+  # target got mutated despite no symlink gate at all. Legacy callers
+  # (no workdir) fall back to the leaf-only check with a deprecation
+  # warning — same pattern as chown_file_iso_uid / chgrp_dir_iso_group.
+  if [[ -n "$workdir" ]]; then
+    if ! _bridge_isolation_v2_assert_no_symlink_in_path "$file" "$workdir"; then
+      bridge_warn "chgrp_file_iso_group: refusing $file under workdir=$workdir (symlink-in-path or canonical-escape; operator must repair the symlink chain before re-running)"
+      return 0
+    fi
+  else
+    bridge_warn "chgrp_file_iso_group: legacy leaf-only symlink check (no workdir argument) at $file — pass workdir to engage ancestor-walk protection"
+    if [[ -L "$file" ]]; then
+      bridge_warn "chgrp_file_iso_group: refusing to follow symlink at $file"
+      return 0
+    fi
+  fi
   [[ -f "$file" ]] || return 0
   local agent_grp=""
   agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
@@ -781,6 +953,266 @@ bridge_isolation_v2_chgrp_file_iso_group() {
   return 0
 }
 
+# bridge_isolation_v2_chgrp_dir_iso_group <agent> <dir> [mode] [workdir]
+#
+# Normalize a single per-agent DIRECTORY's group + mode to the per-agent
+# isolation group (``ab-agent-<a>``) at mode ``2770`` (operator-overridable
+# via the third arg). Issue #1316 (v0.15.0-beta5-2 Lane θ): the legacy
+# `mkdir -p "$workdir/.claude"` in bridge-agent.sh ran under the controller
+# umask and left ``.claude/`` at ``0700 controller:controller`` (or
+# ``0700 iso-uid:controller-gid`` after Step A chowned the parent). On
+# the upgrade path that directory is never re-normalized — and the
+# controller (a member of ``ab-agent-<a>`` but NOT the iso UID's primary
+# group) cannot traverse it, so ``bridge-start.sh``'s pre-launch grep on
+# ``$workdir/.claude/settings.json`` fails with EACCES.
+#
+# Mirrors ``bridge_isolation_v2_chgrp_file_iso_group`` semantics:
+#   * Linux v2 isolation only (gated via ``bridge_isolation_v2_enforce``).
+#   * Idempotent — stat-skip on already-correct ``%G:%a`` short-circuits
+#     to zero syscalls.
+#   * Defensive symlink refusal: refuse ANY symlink in the ancestor path
+#     from ``$workdir`` to ``$dir`` (inclusive of leaf), and refuse when
+#     the canonical resolution of ``$dir`` escapes ``$workdir``. PR #1335
+#     r2 (codex r1 BLOCKING): the leaf-only ``[[ -L $dir ]]`` guard
+#     allowed an ancestor symlink (``.claude/plugins -> /tmp/outside``)
+#     to bypass the refusal because the leaf was a regular file in the
+#     external target — the chmod/chgrp then mutated the external tree.
+#     Per Sean's quality directive (2026-05-28): refuse all symlinks in
+#     path. The fourth ``$workdir`` argument is REQUIRED to engage the
+#     ancestor walk; calling without it logs a bridge_warn and falls
+#     back to the legacy leaf-only check (no behavior change for
+#     legacy callers, but they are now visible in logs).
+#   * Failure on chgrp/chmod returns 1; "target missing" returns 0.
+#
+# Default mode 2770 = group rwx + setgid bit so newly-created child
+# files/dirs inherit ``ab-agent-<a>``. The setgid bit is essential here:
+# files Claude writes under ``.claude/`` (settings.local.json, cache
+# entries, ...) must land at ``ab-agent-<a>`` group, otherwise the
+# controller loses read access on every fresh write.
+bridge_isolation_v2_chgrp_dir_iso_group() {
+  local agent="$1"
+  local dir="$2"
+  local mode="${3:-2770}"
+  local workdir="${4:-}"
+  [[ -n "$agent" && -n "$dir" ]] || {
+    bridge_warn "chgrp_dir_iso_group: agent and dir required"
+    return 1
+  }
+  # Platform discriminator gate (S3): no-op on non-Linux hosts the same
+  # way the sibling helpers gate. Returning 0 keeps the caller's happy
+  # path simple.
+  bridge_isolation_v2_enforce || return 0
+  # Ancestor symlink walk + canonical containment (PR #1335 r2, codex r1
+  # BLOCKING). When the caller passes ``$workdir`` (current behavior for
+  # ``bridge_isolation_v2_normalize_workdir_profile_group``), refuse the
+  # mutation if ANY component along $workdir → $dir is a symlink, OR if
+  # the canonical resolved $dir escapes $workdir. This closes the
+  # ``.claude/plugins -> /tmp/outside`` bypass that left the legacy
+  # leaf-only check passing while the external target got mutated.
+  if [[ -n "$workdir" ]]; then
+    if ! _bridge_isolation_v2_assert_no_symlink_in_path "$dir" "$workdir"; then
+      bridge_warn "chgrp_dir_iso_group: refusing $dir under workdir=$workdir (symlink-in-path or canonical-escape; operator must repair the symlink chain before re-running)"
+      return 0
+    fi
+  else
+    # Legacy direct-caller path (no workdir): leaf-only symlink check.
+    # Future code must pass workdir to get full ancestor-walk protection.
+    bridge_warn "chgrp_dir_iso_group: legacy leaf-only symlink check (no workdir argument) at $dir — pass workdir to engage ancestor-walk protection"
+    if [[ -L "$dir" ]]; then
+      bridge_warn "chgrp_dir_iso_group: refusing to follow symlink at $dir (operator must remove the symlink before re-running)"
+      return 0
+    fi
+  fi
+  [[ -d "$dir" ]] || return 0
+  local agent_grp=""
+  agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+  [[ -n "$agent_grp" ]] || return 0
+  # Idempotent stat-skip — mirrors the chgrp_file_iso_group pattern. A
+  # back-fill pass over an already-normalized .claude/ tree must perform
+  # zero ``chgrp`` / ``chmod`` syscalls. Mode comparison normalizes both
+  # sides to printf %o so ``2770`` vs ``02770`` parses the same.
+  #
+  # macOS-setgid-strip note: when the caller-requested mode includes the
+  # setgid bit (e.g. 2770) and the host is macOS owning the dir with its
+  # primary group, BSD silently strips the setgid bit on chmod — leaving
+  # the on-disk mode at 0770. A naive equality check would force a
+  # re-chmod on every pass even though the kernel WILL strip it again,
+  # producing an infinite-non-idempotent loop. Treat a mode-without-
+  # setgid as a match for a setgid-requested mode on macOS so the
+  # stat-skip engages.
+  local cur=""
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    cur="$(stat -f '%Sg:%Lp' "$dir" 2>/dev/null || printf '')"
+  else
+    cur="$(stat -c '%G:%a' "$dir" 2>/dev/null || printf '')"
+  fi
+  if [[ -n "$cur" ]]; then
+    local cur_grp="${cur%%:*}"
+    local cur_mode_raw="${cur##*:}"
+    local cur_mode_norm="" want_mode_norm=""
+    cur_mode_norm="$(printf '%o' "$((8#${cur_mode_raw#0}))" 2>/dev/null || printf '%s' "$cur_mode_raw")"
+    want_mode_norm="$(printf '%o' "$((8#${mode#0}))" 2>/dev/null || printf '%s' "$mode")"
+    if [[ "$cur_grp" == "$agent_grp" && "$cur_mode_norm" == "$want_mode_norm" ]]; then
+      return 0
+    fi
+    # macOS setgid-strip tolerance: on Darwin, when the requested mode
+    # carries the setgid bit (numeric value >= 2000 octal) but the dir
+    # mode bits sans setgid already match the request, treat as
+    # already-normalized. The kernel will keep stripping setgid on every
+    # chmod-attempt, so re-firing the chmod is a guaranteed no-op +
+    # wasted syscall.
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+      local want_low cur_low
+      want_low="$(printf '%o' "$(( 8#${want_mode_norm} & 8#0777 ))" 2>/dev/null || printf '')"
+      cur_low="$(printf '%o' "$(( 8#${cur_mode_norm} & 8#0777 ))" 2>/dev/null || printf '')"
+      local want_has_setgid=0
+      if (( 8#${want_mode_norm} >= 8#2000 )); then
+        want_has_setgid=1
+      fi
+      if [[ "$cur_grp" == "$agent_grp" \
+            && "$want_has_setgid" == "1" \
+            && -n "$want_low" && "$want_low" == "$cur_low" ]]; then
+        return 0
+      fi
+    fi
+  fi
+  _bridge_isolation_v2_run_root_or_sudo chgrp "$agent_grp" "$dir" || return 1
+  _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$dir" || return 1
+  return 0
+}
+
+# bridge_isolation_v2_chown_file_iso_uid <agent> <file> [mode] [workdir]
+#
+# Normalize a single per-agent FILE owned by ``root`` (or any non-iso
+# UID) to ``agent-bridge-<a>:ab-agent-<a> 0660`` (operator-overridable
+# via the third arg). Issue #1315 (v0.15.0-beta5-2 Lane θ): on the
+# upgrade path the legacy ``known_marketplaces.json`` was seeded as
+# ``root:ab-agent-<a> 640`` by ``bridge_write_isolated_known_marketplaces_catalog``.
+# Issue #1278 (Lane H beta4) fixed the create-path to write
+# ``iso-uid:ab-agent-<a> 0660`` so the iso UID's
+# ``bridge-dev-plugin-cache.py:update_known_marketplaces`` rename
+# (``tmp.write_text`` + ``os.replace``) succeeds. But the upgrade
+# back-fill loop never re-owned the legacy file; first agent start fails
+# silently with EPERM on rename.
+#
+# This helper is the upgrade-side mirror of the create-path
+# chown+chgrp+chmod chain at ``bridge_write_isolated_known_marketplaces_catalog:2251-2253``.
+# It uses ``bridge_linux_sudo_root chown`` because the controller UID
+# typically cannot chown a root-owned file directly.
+#
+# Mirrors ``bridge_isolation_v2_chgrp_file_iso_group`` semantics:
+#   * Linux v2 isolation only (gated via ``bridge_isolation_v2_enforce``).
+#   * Idempotent — stat-skip on already-correct ``%U:%G:%a`` short-circuits
+#     to zero syscalls.
+#   * Defensive symlink refusal: refuse ANY symlink in the ancestor path
+#     from ``$workdir`` to ``$file`` (inclusive of leaf), and refuse
+#     when the canonical resolution of ``$file`` escapes ``$workdir``.
+#     PR #1335 r2 (codex r1 BLOCKING): direct repro showed
+#     ``.claude/plugins -> /tmp/outside`` +
+#     ``/tmp/outside/known_marketplaces.json mode 0640 wheel:wheel`` →
+#     normalize logged "refusing symlink" on the leaf check (which
+#     passed because the leaf itself was not a symlink) BUT still
+#     mutated the external target to mode 0660. The fourth
+#     ``$workdir`` arg is REQUIRED to engage the ancestor walk;
+#     calling without it logs a bridge_warn and falls back to the
+#     legacy leaf-only check.
+#   * Failure on chown/chgrp/chmod returns 1; "target missing" returns 0.
+#   * Requires ``bridge_agent_os_user`` to resolve the iso UID. When the
+#     resolver returns empty (shared-mode agent or fresh non-iso install)
+#     this helper returns 0 — no-op, not failure.
+bridge_isolation_v2_chown_file_iso_uid() {
+  local agent="$1"
+  local file="$2"
+  local mode="${3:-0660}"
+  local workdir="${4:-}"
+  [[ -n "$agent" && -n "$file" ]] || {
+    bridge_warn "chown_file_iso_uid: agent and file required"
+    return 1
+  }
+  bridge_isolation_v2_enforce || return 0
+  # Ancestor symlink walk + canonical containment (PR #1335 r2, codex r1
+  # BLOCKING). When the caller passes ``$workdir`` (current behavior for
+  # ``bridge_isolation_v2_normalize_workdir_profile_group``), refuse if
+  # ANY component along $workdir → $file is a symlink, OR if the
+  # canonical resolved $file escapes $workdir. This closes the
+  # ``.claude/plugins -> /tmp/outside`` bypass where the external
+  # target got mutated despite the leaf-only "refusing symlink" log.
+  if [[ -n "$workdir" ]]; then
+    if ! _bridge_isolation_v2_assert_no_symlink_in_path "$file" "$workdir"; then
+      bridge_warn "chown_file_iso_uid: refusing $file under workdir=$workdir (symlink-in-path or canonical-escape; operator must repair the symlink chain before re-running)"
+      return 0
+    fi
+  else
+    bridge_warn "chown_file_iso_uid: legacy leaf-only symlink check (no workdir argument) at $file — pass workdir to engage ancestor-walk protection"
+    if [[ -L "$file" ]]; then
+      bridge_warn "chown_file_iso_uid: refusing to follow symlink at $file"
+      return 0
+    fi
+  fi
+  [[ -f "$file" ]] || return 0
+  local agent_grp=""
+  agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+  [[ -n "$agent_grp" ]] || return 0
+  local os_user=""
+  if command -v bridge_agent_os_user >/dev/null 2>&1; then
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+  fi
+  # No iso UID resolvable → shared-mode agent or pre-v2 install. Fall
+  # back to the file-iso-group helper which handles chgrp+chmod without
+  # chown. This keeps the helper safe to call across mixed-mode agents.
+  # Thread $workdir so the fallback also engages the ancestor walk (we
+  # already validated $file is safe above, so this is defense-in-depth /
+  # contract consistency — the fallback helper's own check is a no-op
+  # repeat in the happy path).
+  if [[ -z "$os_user" ]]; then
+    bridge_isolation_v2_chgrp_file_iso_group "$agent" "$file" "$mode" "$workdir"
+    return $?
+  fi
+  # Idempotent stat-skip — short-circuit if ``%U:%G:%a`` already matches
+  # ``$os_user:$agent_grp:$mode``. Same numeric-mode normalization as
+  # the sibling helpers.
+  local cur=""
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    cur="$(stat -f '%Su:%Sg:%Lp' "$file" 2>/dev/null || printf '')"
+  else
+    cur="$(stat -c '%U:%G:%a' "$file" 2>/dev/null || printf '')"
+  fi
+  if [[ -n "$cur" ]]; then
+    local cur_uid="${cur%%:*}"
+    local cur_rest="${cur#*:}"
+    local cur_grp="${cur_rest%%:*}"
+    local cur_mode_raw="${cur_rest##*:}"
+    local cur_mode_norm="" want_mode_norm=""
+    cur_mode_norm="$(printf '%o' "$((8#${cur_mode_raw#0}))" 2>/dev/null || printf '%s' "$cur_mode_raw")"
+    want_mode_norm="$(printf '%o' "$((8#${mode#0}))" 2>/dev/null || printf '%s' "$mode")"
+    if [[ "$cur_uid" == "$os_user" && "$cur_grp" == "$agent_grp" && "$cur_mode_norm" == "$want_mode_norm" ]]; then
+      return 0
+    fi
+  fi
+  # Use bridge_linux_sudo_root for the chown — controller UID cannot
+  # chown root-owned files. The chgrp + chmod could in principle run via
+  # the direct-first helper (POSIX permits chown-to-own-group for
+  # already-owned files), but the chown above transfers ownership to
+  # the iso UID which the controller is NOT, so subsequent chmod/chgrp
+  # from the controller would fail. Drive all three through
+  # bridge_linux_sudo_root for consistency.
+  if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+    bridge_linux_sudo_root chown "$os_user:$agent_grp" "$file" 2>/dev/null \
+      || _bridge_isolation_v2_run_root_or_sudo chown "$os_user:$agent_grp" "$file" \
+      || return 1
+    bridge_linux_sudo_root chmod "$mode" "$file" 2>/dev/null \
+      || _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$file" \
+      || return 1
+  else
+    # No sudo-root helper available (shouldn't happen on Linux v2 but
+    # guard for unit-test pathways). Best-effort direct chown which
+    # only succeeds when caller is root.
+    _bridge_isolation_v2_run_root_or_sudo chown "$os_user:$agent_grp" "$file" || return 1
+    _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$file" || return 1
+  fi
+  return 0
+}
+
 # bridge_isolation_v2_normalize_workdir_profile_group <agent> <workdir>
 #
 # Issue #1270 (v0.15.0-beta4 Lane G): after the v2 workdir materialize
@@ -799,12 +1231,44 @@ bridge_isolation_v2_chgrp_file_iso_group() {
 # added to ``_iso_profile_files`` below so the controller-side reads
 # stay coherent.
 #
+# Issue #1316 (v0.15.0-beta5-2 Lane θ C10): the original implementation
+# walked FILES only. The ``.claude/`` directory inside ``$workdir`` —
+# created by ``bridge-agent.sh:bridge_ensure_auto_memory_isolation``
+# under the controller umask — stays at ``0700 controller:controller``
+# (or ``0700 iso-uid:controller-gid`` after Step A chowns the parent).
+# ``bridge-start.sh``'s pre-launch grep on ``$workdir/.claude/settings.json``
+# then fails EACCES because the controller cannot traverse a 0700 dir
+# owned by a different UID. Extend the normalize to also walk the
+# canonical ``.claude/`` dir tree (``.claude/``, ``.claude/plugins/``,
+# ``.claude/session-env/``) and chgrp+chmod each to
+# ``ab-agent-<a>:2770``.
+#
+# Issue #1315 (v0.15.0-beta5-2 Lane θ C9): the legacy
+# ``$workdir/.claude/plugins/known_marketplaces.json`` was seeded by
+# the controller as ``root:ab-agent-<a> 0640`` on installs predating
+# #1278 (Lane H beta4). On agent first-start, the iso UID's
+# ``bridge-dev-plugin-cache.py:update_known_marketplaces`` does
+# ``tmp.write_text + os.replace(tmp, path)`` which requires the rename
+# target to be owned by the iso UID — and silently fails EPERM
+# otherwise. Normalize this single file alongside the directory tree:
+# chown to ``iso-uid:ab-agent-<a> 0660`` so the rename succeeds.
+#
 # Contract:
 #   * Linux v2 isolation only (gated via ``bridge_isolation_v2_enforce``).
-#   * Idempotent.
-#   * Failure on any single file is non-fatal — a warning is emitted via
-#     the per-file helper and the loop continues so a partial chgrp does
-#     not block the rest of ``agent create``.
+#   * Idempotent: the file/dir helpers each carry stat-skip and
+#     short-circuit when ``%U:%G:%a`` already matches the target. A
+#     re-run on an already-normalized workdir performs zero
+#     ``chown`` / ``chgrp`` / ``chmod`` syscalls.
+#   * Failure on any single entry is non-fatal — a warning is emitted
+#     via the per-entry helper and the loop continues so a partial
+#     normalize does not block the rest of ``agent create`` (or the
+#     upgrade backfill loop).
+#   * Symlinks at any of the directory or known_marketplaces.json
+#     locations are refused (see ``chgrp_dir_iso_group`` /
+#     ``chown_file_iso_uid``); operator must remove the symlink before
+#     re-running.
+#   * Fresh-install no-op: when the file or directory is missing the
+#     per-entry helpers return 0 silently.
 bridge_isolation_v2_normalize_workdir_profile_group() {
   local agent="$1"
   local workdir="$2"
@@ -825,9 +1289,62 @@ bridge_isolation_v2_normalize_workdir_profile_group() {
   local name=""
   for name in "${_iso_profile_files[@]}"; do
     [[ -f "$workdir/$name" ]] || continue
-    bridge_isolation_v2_chgrp_file_iso_group "$agent" "$workdir/$name" 0660 \
+    # PR #1335 r3 (codex r2 BLOCKING): pass $workdir as the fourth arg to
+    # engage the ancestor symlink walk + canonical containment check in
+    # chgrp_file_iso_group. Direct codex r2 repro: ``work/CLAUDE.md ->
+    # /tmp/out/CLAUDE.md`` (leaf-as-symlink to external target) — without
+    # the workdir-threaded ancestor walk, the chgrp+chmod mutated the
+    # external target to staff:660. r2 fixed the sibling chown/chgrp_dir
+    # helpers but missed the materialize-fileset helper here.
+    bridge_isolation_v2_chgrp_file_iso_group "$agent" "$workdir/$name" 0660 "$workdir" \
       || bridge_warn "chgrp_file_iso_group failed for $workdir/$name (non-fatal)"
   done
+
+  # Issue #1316 (C10): normalize the ``.claude/`` directory tree the
+  # controller-umask mkdir left at 0700. Order matters — parent before
+  # child — so a re-run on a half-normalized tree advances each level
+  # without leaving a hole the controller cannot traverse. Each helper
+  # call is independently idempotent (stat-skip), non-fatal on failure
+  # (warning emitted, loop continues), and a no-op when the directory
+  # is missing entirely (fresh install before any settings render).
+  local _iso_profile_dirs=(
+    ".claude"
+    ".claude/plugins"
+    ".claude/session-env"
+  )
+  local dname=""
+  for dname in "${_iso_profile_dirs[@]}"; do
+    [[ -d "$workdir/$dname" ]] || continue
+    # PR #1335 r2 (codex r1 BLOCKING): pass $workdir as the fourth arg
+    # to engage the ancestor symlink walk + canonical containment check
+    # in chgrp_dir_iso_group. Without this, an ancestor symlink (e.g.
+    # ``.claude/plugins -> /tmp/outside``) would let the helper mutate
+    # an external tree even though the leaf was a regular file.
+    bridge_isolation_v2_chgrp_dir_iso_group "$agent" "$workdir/$dname" 2770 "$workdir" \
+      || bridge_warn "chgrp_dir_iso_group failed for $workdir/$dname (non-fatal)"
+  done
+
+  # Issue #1315 (C9): normalize ``known_marketplaces.json`` ownership +
+  # mode to ``iso-uid:ab-agent-<a> 0660`` so the iso UID's plugin-cache
+  # rename succeeds on first start. Uses ``chown_file_iso_uid`` (not
+  # ``chgrp_file_iso_group``) because the legacy file is root-owned and
+  # plain chgrp would leave it un-rename-able by the iso UID. The helper
+  # short-circuits to ``chgrp_file_iso_group`` semantics when the iso UID
+  # is not resolvable (shared-mode / non-iso install), so a mixed-mode
+  # caller stays safe.
+  #
+  # PR #1335 r2 (codex r1 BLOCKING): pass $workdir as the fourth arg so
+  # the ancestor-symlink walk catches the codex-r1 repro
+  # (``.claude/plugins -> /tmp/outside``, leaf is a regular file in the
+  # external target tree, leaf-only `-L` check passes, chmod mutates
+  # external file). Note: the wrapper `-f` test below ALSO follows
+  # symlinks (it is `-f`, not `-L`), but the helper's ancestor walk
+  # refuses before any syscall so the wrapper-test side effect is moot.
+  if [[ -f "$workdir/.claude/plugins/known_marketplaces.json" ]]; then
+    bridge_isolation_v2_chown_file_iso_uid \
+      "$agent" "$workdir/.claude/plugins/known_marketplaces.json" 0660 "$workdir" \
+      || bridge_warn "chown_file_iso_uid failed for $workdir/.claude/plugins/known_marketplaces.json (non-fatal)"
+  fi
   return 0
 }
 
