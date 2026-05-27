@@ -229,6 +229,30 @@ def cmd_watchdog_problem_count(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_watchdog_fresh_install_only(args: argparse.Namespace) -> int:
+    """v0.15.0-beta4 Lane G #1266: emit ``1`` when every effective
+    problem row in the watchdog report is a fresh-install candidate
+    (``fresh_install=true``), ``0`` otherwise.
+
+    The daemon's ``process_watchdog_report`` reads this token to decide
+    whether to enqueue the drift task at priority=low (fresh-install
+    only) or priority=high (the existing path). Parse error / missing
+    field defaults to ``0`` so a malformed report cannot accidentally
+    downgrade real drift to low.
+    """
+    try:
+        payload = json.loads(args.report_json)
+        # ``fresh_install_only`` is True only when there is at least one
+        # effective problem AND every effective problem is fresh-install.
+        # An empty problem set (problem_count=0) reports False here; the
+        # bash side already short-circuits on problem_count=0 before
+        # reading this token.
+        print(1 if bool(payload.get("fresh_install_only", False)) else 0)
+    except Exception:
+        print(0)
+    return 0
+
+
 def cmd_nudge_live_state(args: argparse.Namespace) -> int:
     """Original site: bridge-daemon.sh:2728 (nudge_agent_session).
 
@@ -609,6 +633,11 @@ SUBCOMMANDS = {
         cmd_watchdog_problem_count,
         [("report_json", "JSON envelope from bridge-watchdog.sh scan --json")],
         "Single integer line (problem_count), defaulting to 0 on parse error.",
+    ),
+    "watchdog-fresh-install-only": (
+        cmd_watchdog_fresh_install_only,
+        [("report_json", "JSON envelope from bridge-watchdog.sh scan --json")],
+        "Single integer line (1 = every effective problem is fresh-install; 0 otherwise).",
     ),
     "nudge-live-state": (
         cmd_nudge_live_state,

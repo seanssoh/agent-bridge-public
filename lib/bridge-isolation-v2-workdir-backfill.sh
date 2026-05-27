@@ -223,6 +223,21 @@ bridge_isolation_v2_backfill_workdir_identity() {
       fi
     fi
 
+    # #1270 (v0.15.0-beta4 Lane G): backfilled markers landed via the
+    # sudo'd write helper (agent-bridge-<a>:agent-bridge-<a> mode 0644)
+    # or via controller-side `cp -p` (controller-primary-group mode
+    # 0600). Neither matches the iso v2 contract (group=ab-agent-<a>,
+    # mode 0660 for files under workdir/). Normalize the group + mode
+    # here so the operator does not need a separate
+    # `isolation reconcile --apply` pass. The helper short-circuits on
+    # non-Linux hosts and on shared-mode agents, so the call stays a
+    # no-op outside the iso v2 contract.
+    if (( ${#writes_for_agent[@]} > 0 )) \
+        && declare -F bridge_isolation_v2_normalize_workdir_profile_group >/dev/null 2>&1; then
+      bridge_isolation_v2_normalize_workdir_profile_group "$agent" "$workspace_dir" \
+        >/dev/null 2>&1 || true
+    fi
+
     if (( emit_json == 1 )); then
       per_agent_rows+=(
         "$(_bridge_isolation_v2_backfill_emit_agent_row "$agent" \

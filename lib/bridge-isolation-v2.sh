@@ -703,6 +703,102 @@ bridge_isolation_v2_chgrp_setgid_dir() {
   _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$dir" || return 1
 }
 
+# bridge_isolation_v2_chgrp_file_iso_group <agent> <file> [mode]
+#
+# Normalize a single per-agent file's group + mode to the per-agent
+# isolation group (``ab-agent-<a>``) at mode ``0660`` (operator-overridable
+# via the third arg). Issue #1270 (v0.15.0-beta4 Lane G): the
+# ``CLAUDE.md`` that ``bridge_layout_materialize_identity`` materializes
+# into the v2 ``workdir/`` inherits the controller's primary group and
+# mode 0600 from the ``cp -f`` source. Every OTHER iso workdir file
+# (.teams/.env, channel-state .env etc.) is grouped to ``ab-agent-<a>``
+# at mode 0660 so the controller — a member of that group — can grep /
+# read the file. Without this normalization, ``agent start``'s
+# controller-side grep on ``$workdir/CLAUDE.md`` emits a cosmetic
+# ``Permission denied`` warning on every start.
+#
+# Contract:
+#   * Linux v2 isolation only. ``bridge_isolation_v2_enforce`` skips the
+#     call on non-Linux hosts (macOS no-op) and when the agent is in
+#     shared isolation mode. The caller is responsible for gating on
+#     ``bridge_agent_linux_user_isolation_effective`` BEFORE this call;
+#     calling it for a shared-mode agent silently returns 0.
+#   * Idempotent: re-running the chgrp/chmod on an already-normalized
+#     file is a no-op.
+#   * Returns 0 when there is no work to do (file missing, agent group
+#     cannot be resolved, or platform discriminator says non-Linux).
+#     Only an explicit chgrp/chmod failure returns 1.
+bridge_isolation_v2_chgrp_file_iso_group() {
+  local agent="$1"
+  local file="$2"
+  local mode="${3:-0660}"
+  [[ -n "$agent" && -n "$file" ]] || {
+    bridge_warn "chgrp_file_iso_group: agent and file required"
+    return 1
+  }
+  # Platform discriminator gate (S3): no-op on non-Linux hosts the same
+  # way bridge_isolation_v2_chgrp_setgid_dir gates. Returning 0 keeps
+  # the caller's happy path simple.
+  bridge_isolation_v2_enforce || return 0
+  [[ -f "$file" ]] || return 0
+  local agent_grp=""
+  agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+  [[ -n "$agent_grp" ]] || return 0
+  _bridge_isolation_v2_run_root_or_sudo chgrp "$agent_grp" "$file" || return 1
+  _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$file" || return 1
+  return 0
+}
+
+# bridge_isolation_v2_normalize_workdir_profile_group <agent> <workdir>
+#
+# Issue #1270 (v0.15.0-beta4 Lane G): after the v2 workdir materialize
+# step copies CLAUDE.md (and the rest of the Claude/Codex profile fileset)
+# from the identity source into the runtime workdir, those files inherit
+# the controller's primary group and mode 0600. Walk the canonical
+# materialize set and chgrp each to the per-agent isolation group at mode
+# 0660 so the controller — a member of that group — can read them
+# without sudo.
+#
+# This mirrors the materialize fileset in
+# ``lib/bridge-agent-layout.sh:bridge_layout_materialize_identity`` (the
+# CLAUDE / SOUL / SESSION-TYPE / MEMORY / MEMORY-SCHEMA / HEARTBEAT /
+# CHANGE-POLICY / TOOLS list, plus the engine-native entrypoint and the
+# Claude-compat copy). Any future file the materializer adds should be
+# added to ``_iso_profile_files`` below so the controller-side reads
+# stay coherent.
+#
+# Contract:
+#   * Linux v2 isolation only (gated via ``bridge_isolation_v2_enforce``).
+#   * Idempotent.
+#   * Failure on any single file is non-fatal — a warning is emitted via
+#     the per-file helper and the loop continues so a partial chgrp does
+#     not block the rest of ``agent create``.
+bridge_isolation_v2_normalize_workdir_profile_group() {
+  local agent="$1"
+  local workdir="$2"
+  [[ -n "$agent" && -n "$workdir" ]] || return 0
+  bridge_isolation_v2_enforce || return 0
+  [[ -d "$workdir" ]] || return 0
+  local _iso_profile_files=(
+    "CLAUDE.md"
+    "AGENTS.md"
+    "SOUL.md"
+    "SESSION-TYPE.md"
+    "MEMORY.md"
+    "MEMORY-SCHEMA.md"
+    "HEARTBEAT.md"
+    "CHANGE-POLICY.md"
+    "TOOLS.md"
+  )
+  local name=""
+  for name in "${_iso_profile_files[@]}"; do
+    [[ -f "$workdir/$name" ]] || continue
+    bridge_isolation_v2_chgrp_file_iso_group "$agent" "$workdir/$name" 0660 \
+      || bridge_warn "chgrp_file_iso_group failed for $workdir/$name (non-fatal)"
+  done
+  return 0
+}
+
 bridge_isolation_v2_chgrp_setgid_recursive() {
   # Apply group + mode to a tree. Directories get the dir-mode (with
   # setgid bit), files get the file-mode (without setgid). The dir-mode

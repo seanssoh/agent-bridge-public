@@ -44,9 +44,16 @@ def main() -> int:
             # fields stay in the watchdog JSON output (so consumers can read
             # them when populated); only the dedup signature ignores them
             # when empty.
-            for empty_field in ("error_kind", "error_path"):
+            for empty_field in ("error_kind", "error_path", "error_category"):
                 if stable.get(empty_field, "") == "":
                     stable.pop(empty_field, None)
+            # v0.15.0-beta4 Lane G (#1266 / #1254): drop ``fresh_install``
+            # and ``restart_in_progress`` when False so the dedup signature
+            # of an unchanged drift row matches pre/post-beta4 — only the
+            # presence of an *active* transient flag should bust the cache.
+            for flag in ("fresh_install", "restart_in_progress"):
+                if stable.get(flag, False) is False:
+                    stable.pop(flag, None)
             agents.append(stable)
         else:
             agents.append(item)

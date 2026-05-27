@@ -3397,6 +3397,28 @@ report and reap test-fixture agents per their pattern."
       else
         bridge_layout_materialize_identity "$agent" "$engine" "$workdir"
       fi
+      # #1270 (v0.15.0-beta4 Lane G): the materializer's ``cp -f`` carried
+      # the controller's primary group + mode 0600 into the workdir's
+      # CLAUDE.md / SOUL.md / SESSION-TYPE.md / MEMORY*.md / engine
+      # entrypoint files. Every OTHER iso workdir file (.teams/.env,
+      # channel-state .env) lands at group=``ab-agent-<a>`` mode 0660 —
+      # the controller (a member of that group) reads them via group
+      # permission. Without the normalization below, controller-side
+      # grep on the materialized profile files emits ``Permission
+      # denied`` because the file's group is the controller's primary
+      # group AND mode 0600 strips the group read bit. Mirror the
+      # convention to the materialize fileset so the iso UID still owns
+      # the files but the controller can group-read them.
+      #
+      # NO-OP contract: the helper internally gates on
+      # ``bridge_isolation_v2_enforce`` (Linux only) and on a resolvable
+      # per-agent group; a shared-mode / non-linux-user agent skips
+      # silently.
+      if [[ "$isolation_mode" == "linux-user" ]] \
+          && declare -F bridge_isolation_v2_normalize_workdir_profile_group >/dev/null 2>&1; then
+        bridge_isolation_v2_normalize_workdir_profile_group "$agent" "$workdir" \
+          >/dev/null 2>&1 || true
+      fi
     fi
     if [[ "$engine" == "claude" ]]; then
       # Issue #1151: thread $agent so the v2-isolation guard polarity fix
