@@ -1191,13 +1191,34 @@ bridge_tmux_send_and_submit() {
     bridge_agent_note_prompt_ready "$spool_agent" send-path 2>/dev/null || true
   fi
   if bridge_tmux_session_inject_busy "$session" "$engine" "$inject_grace"; then
-    if bridge_tmux_spool_enabled "$spool_agent"; then
-      bridge_tmux_pending_attention_append "$spool_agent" "$text"
-      bridge_tmux_session_ring_bell "$session"
-      return 0
+    # Issue #1312 (Lane ε edge-case 5): busy→idle transition mid-call. The
+    # first probe can land while the operator's pending input was already
+    # cleared on the next keystroke. Re-check once with a short delay before
+    # treating as definitely-busy; this keeps the gate sticky against true
+    # contention but avoids unnecessary deferral on a transitioning agent.
+    local recheck_delay="${BRIDGE_TMUX_INJECT_BUSY_RECHECK_SECONDS:-0.2}"
+    sleep "$recheck_delay" 2>/dev/null || true
+    if bridge_tmux_session_inject_busy "$session" "$engine" "$inject_grace"; then
+      if bridge_tmux_spool_enabled "$spool_agent"; then
+        bridge_tmux_pending_attention_append "$spool_agent" "$text"
+        bridge_tmux_session_ring_bell "$session"
+        return 0
+      fi
+      # Issue #1312 (Lane ε): the spool-disabled busy branch used to return
+      # 1 with only a warn — the daemon caller (#4451) ignores rc=1 and
+      # treats the dispatch as successful, dropping the message permanently.
+      # Emit an audit row so the rc=1 has operator-visible evidence even on
+      # the explicit-FORCE escape hatch. The audit detail names the reason
+      # so KNOWN_ISSUES.md §"tmux_inject_dropped_spool_disabled" can be
+      # grep-found.
+      bridge_audit_log daemon tmux_inject_dropped_spool_disabled \
+        "${spool_agent:-$session}" \
+        --detail session="$session" \
+        --detail engine="$engine" \
+        --detail reason=busy_spool_disabled 2>/dev/null || true
+      bridge_warn "session busy and spool disabled; dropping send to '$session' (message lost — see KNOWN_ISSUES.md §tmux_inject_dropped_spool_disabled)"
+      return 1
     fi
-    bridge_warn "session busy; deferring send to '$session'"
-    return 1
   fi
 
   case "$engine" in
@@ -1227,10 +1248,40 @@ bridge_tmux_send_and_submit() {
 # ---------------------------------------------------------------------------
 
 bridge_tmux_spool_enabled() {
+  # Issue #1312 (v0.15.0-beta5-2 Lane ε): the spool is the only thing that
+  # keeps a daemon-initiated inject from being permanently dropped when the
+  # agent is busy at inject time. Operator-explicit
+  # BRIDGE_TMUX_INJECT_SPOOL_ENABLED=0 in an iso-v2 install therefore
+  # silently re-enables the data-loss class the spool was built to close.
+  # Refuse to honor `=0` when iso v2 is active unless the operator also
+  # sets BRIDGE_TMUX_INJECT_SPOOL_DISABLE_FORCE=1 (documented escape hatch
+  # — last-resort, unsafe). Non-iso installs keep legacy behavior so
+  # `=0` remains a no-op-style toggle for them. Per Sean's
+  # [[feedback-root-vs-symptom-framing]] directive: prefer refuse over
+  # silent failure recovery.
   local agent="$1"
   [[ -n "$agent" ]] || return 1
-  [[ "${BRIDGE_TMUX_INJECT_SPOOL_ENABLED:-1}" == "1" ]] || return 1
-  return 0
+  local raw="${BRIDGE_TMUX_INJECT_SPOOL_ENABLED:-1}"
+  if [[ "$raw" == "1" ]]; then
+    return 0
+  fi
+  # Operator-explicit `=0` (or anything not "1"). Decide whether to honor.
+  if [[ "${BRIDGE_TMUX_INJECT_SPOOL_DISABLE_FORCE:-0}" == "1" ]]; then
+    if [[ "${_BRIDGE_TMUX_SPOOL_FORCE_WARN_EMITTED:-0}" != "1" ]]; then
+      bridge_warn "BRIDGE_TMUX_INJECT_SPOOL_ENABLED=0 honored via FORCE=1 — daemon nudges may be silently dropped when '${agent}' is busy. Unset BRIDGE_TMUX_INJECT_SPOOL_DISABLE_FORCE to restore spool."
+      export _BRIDGE_TMUX_SPOOL_FORCE_WARN_EMITTED=1
+    fi
+    return 1
+  fi
+  if command -v bridge_isolation_v2_active >/dev/null 2>&1 \
+       && bridge_isolation_v2_active 2>/dev/null; then
+    if [[ "${_BRIDGE_TMUX_SPOOL_REFUSE_WARN_EMITTED:-0}" != "1" ]]; then
+      bridge_warn "refusing BRIDGE_TMUX_INJECT_SPOOL_ENABLED=0 on iso v2 install (spool is the only data-loss guard for busy injects). Set BRIDGE_TMUX_INJECT_SPOOL_DISABLE_FORCE=1 to override (unsafe, see KNOWN_ISSUES.md)."
+      export _BRIDGE_TMUX_SPOOL_REFUSE_WARN_EMITTED=1
+    fi
+    return 0
+  fi
+  return 1
 }
 
 bridge_tmux_pending_attention_escape() {
