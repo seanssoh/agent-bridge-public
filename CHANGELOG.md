@@ -6,6 +6,124 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.0-beta4] — 2026-05-28
+
+### Highlight — Full backlog closure, 11 lanes / 3 sub-waves, 30 issues
+
+Operator-cued autonomous beta loop directive 2026-05-27: "베타 4를 위해서 싹다 제대로 수정하자. 웨이브 스킬 사용해서 멀티 에이전트로 빠르게 처리 해줘." Wave-orchestration skill applied: 11 parallel lanes across 3 sub-waves, 30 issues closed (wave plan named 28; Lane H also closes cross-check pair #1208 + #1215 with full fixes for the lock-file ownership + .ms365 directory mode), ~28 codex review rounds total, plus integration review + QA gate (15/15 lane smokes PASS under bash 5.3.9). `-beta4` prerelease, tag `v0.15.0-beta4`, GitHub release marked **Pre-release**.
+
+Lane → PR map: A #1286 / B #1285 / C #1284 / D #1287 / E #1288 / F #1290 / G #1291 / H #1289 / I #1292 / J #1293 / K #1294, plus integration fix-up #1295.
+
+### Fixed — iso v2 path resolution + sanitized metadata access root (#1272 + #1277 + #1279 + #1213, Lane A PR #1286)
+
+Path A0 of iso v2 metadata access was broken on Lane A: `session_id` capture wrote to controller's `~/.claude/...` instead of iso UID's home, `audit.jsonl` was emitted empty when controller couldn't traverse iso workdir, and `BRIDGE_AGENT_ISOLATION_MODE` scalar export silently failed (assoc array collision with same name).
+
+- **`bridge-lib.sh`** — new `bridge_load_sanitized_agent_metadata` reads `state/agents/<a>/agent-meta.env` (0640 group=ab-agent-<a>, NO secrets) with iso-UID-scoped prefix guard + 2-stage user-match (snippet peek `BRIDGE_AGENT_OS_USER` + `id -un` compare, prefix-independent).
+- **`lib/bridge-agents.sh`** — `bridge_agent_claude_config_dir` returns iso UID's home via `getent passwd <iso-uid> | cut -d: -f6` on Linux iso v2 agents; same getent-based resolver in `bridge_agent_os_user` / `bridge_agent_default_os_user` (honor `--os-user` override).
+- **`lib/bridge-state.sh`** — `bridge_agent_audit_dir` analog resolver; canonical resolver shared with `bridge_agent_state_dir_self_heal`.
+- **`lib/bridge-isolation-v2.sh`** — sanitized metadata write site on `agent create` + reapply paths; mode `2770`/`0640` enforced.
+- **`bridge-init.sh`** — install-time scaffold for sanitized metadata snippet.
+- Smoke: `scripts/smoke/A-beta4-iso-path-resolution.sh` T1-T_canonical + 2-stage user-match teeth + R4 audit_dir_ensure + R5 session_id_detect_empty audit emit.
+
+### Added — teams + ms365 interactive setup wizard with reachability probes (#1268 + #1271, Lane B PR #1285)
+
+`agent-bridge channel setup` for `plugin:teams` / `plugin:ms365` was a manual edit of `.teams/.env` or `.ms365/.env`. R3 added an interactive wizard that drives the operator through the same fields PLUS three reachability probes (teams local-bind, teams messaging endpoint, ms365 redirect) with die-by-default on probe failure and `--allow-probe-failure` escape hatch.
+
+- **`lib/bridge-setup-wizard.sh`** (new) — `bridge_setup_wizard_teams` / `bridge_setup_wizard_ms365` interactive flows.
+- **`bridge-init.sh`** — wizard invocation on `agent create --channels plugin:teams,plugin:ms365` opt-in.
+- Smoke: `scripts/smoke/B-beta4-setup-wizard.sh` T1-T10 + probe-failure teeth.
+
+### Fixed — bridge_info → stderr + manifest spec `plugin:` prefix strip + restart preflight (#1273 + #1274, Lane C PR #1284)
+
+`bridge_info` log lines were leaking into stdout, polluting `--json` callers. Manifest spec parsing didn't strip the `plugin:` prefix so identity comparison missed for `--channels plugin:teams` vs `teams`. `agent restart` preflight didn't verify channel manifest spec consistency before stop+start, leaving a stale-config window.
+
+- **`lib/bridge-core.sh`** — `bridge_info` routes to stderr unconditionally (was stdout when `BRIDGE_VERBOSE=1`).
+- **`lib/bridge-plugins.sh`** + **`scripts/python-helpers/claude-plugin-manifest-has-spec.py`** — strip `plugin:` prefix before identity match.
+- **`lib/bridge-agents.sh`** — `agent restart` preflight now diffs sanitized manifest before stop; rolls back on drift.
+- Smoke: `scripts/smoke/C-beta4-logger-and-spec.sh` T1-T7 + caller-align over R1 manifest migration.
+
+### Fixed — daemon singleton spawn guard via `flock` + atomic PID + audit emit (#1276, Lane D PR #1287)
+
+Two daemons could race-spawn on a fresh-install first-wake with no existing PID file; `daemon-already-running` check raced against the PID write.
+
+- **`lib/bridge-daemon-control.sh`** — `bridge_daemon_ensure_singleton` uses `flock -n` (non-blocking) on lifetime-hold lock; atomic PID write under lock; emits `daemon_started` audit row with the new lock-acquisition decision evidence. Fail-closed: if flock returns busy AND existing PID is alive, abort with structured stderr + bridge-task admin alert.
+- **`bridge-daemon.sh`** — entry-point invocations of singleton guard wired in.
+- Smoke: `scripts/smoke/D-beta4-daemon-lifecycle.sh` T1-T7 including T2b race-window cover + T2c alert-task creation.
+
+### Fixed — fresh-install first-wake reconcile gate + daemon wake state-dir self-heal (#1265 + #1269, Lane E PR #1288)
+
+`agent-bridge` fresh-install first wake on iso v2 hit Lane A3's reconcile gate (no `state/agents/<a>/launch.history` → continue=1 + session_id empty → `bridge_die` "session-id missing"), even though the agent had never been launched. Also: daemon's three wake sites lacked `bridge_agent_state_dir_self_heal` calls so a fresh-install always-on agent spun on `start-command-failed`.
+
+- **`bridge-run.sh`** (R1 + R2 + R3) — fresh-state branch: `launch.history` absent → fresh state → proceed without `--resume`, info log, audit emit, touch marker. R3 canonical path: `_gate_launch_history="$(bridge_agent_idle_marker_dir "$AGENT")/launch.history"` — same helper as `bridge_agent_state_dir_self_heal` (canonical `BRIDGE_STATE_DIR` per-agent, not hardcoded `BRIDGE_HOME/state`).
+- **`bridge-daemon.sh`** — three wake sites wired `bridge_agent_state_dir_self_heal` (`always_on_wake`, `on_demand_wake`, `cron_dispatch_wake`); per-site `trigger=` audit-detail markers.
+- Smoke: `scripts/smoke/E-beta4-fresh-install-gate-state-dir.sh` 9 tests including T_state_dir_relocated (`BRIDGE_HOME` ≠ `BRIDGE_STATE_DIR`) + T_dry_run_seq production real-launch invocation (engine=shell + LAUNCH_CMD=true).
+
+### Fixed — OAuth controller-fallback aliveness propagation + sudoers glob + bootstrap JSON-to-stderr (#1261 + #1228 + #1230, Lane F PR #1290)
+
+`agent-bridge auth status` aliveness was invisible (wrapper discarded helper stdout); install-daemon-systemd's `probe_sudo_self_refresh` checked the wrong command shape (no `-u $controller_user` runas → didn't mirror the sudoers template's `({{controller_user}})` runas or the rendered ExecStart's `-u $CONTROLLER_USER -H`); `bridge-bootstrap.sh` printed `[init]` info to stdout causing `bridge-init.sh --json` to fail JSON parse.
+
+- **`bridge-auth.py`** — schema migrated `alive/near-expiry` → `fresh/near_expiry`; full JSON propagation.
+- **`bridge-auth.sh`** — wrapper forwards JSON instead of swallowing.
+- **`scripts/install-daemon-systemd.sh`** (R2 + R3) — `probe_sudo_self_refresh` uses `sudo -n -u "$controller_user" -ln` mirroring sudoers + ExecStart. `BRIDGE_INSTALL_DAEMON_TEST_SUDO_PROBE_JSON` deterministic test seam (file-as-argv per footgun #11).
+- **`bridge-init.sh`** + **`bridge-bootstrap.sh`** — `[init]` / OAT advisory log lines routed to stderr; JSON contract holds end-to-end.
+- Smoke: `scripts/smoke/F-beta4-oauth-bootstrap.sh` T1-T12 + T_probe_runas_mismatch_fallback + T_probe_runas_match_sudo_self + T_execstart_runas_grep + teeth.
+
+### Fixed — watchdog quiet-by-default + scan_error iso UID readability probe + CLAUDE.md group fix (#1266 + #1270 + #1254, Lane G PR #1291)
+
+`bridge-watchdog.py:detect_fresh_install` returned `fresh_install=True` permanently after admin's `onboarding-pending` marker existed (no completion writer; no age window). `_scan_error_category` misclassified workdir/file permission corruption as `controller-cache-stale`. `lib/bridge-isolation-v2.sh` set up CLAUDE.md with wrong group on iso v2 admin paths.
+
+- **`bridge-watchdog.py`** (R2 + R3) — `detect_fresh_install` 3-stage precedence: `onboarding-complete` marker > SESSION-TYPE.md "complete" > `onboarding-pending` marker + 24h TTL. R3 Option A: home-mtime fallthrough removed entirely → quiet-by-default ("fresh install" requires explicit positive signal). `_scan_error_category` runs iso UID readability probe (`sudo -n -u <iso-user> -- test -r <path>` via canonical `bridge_iso_paths.sudo_run_as`) → split `controller-cache-stale` (iso readable, controller not) vs `iso-uid-side` (iso also can't read).
+- **`bridge-init.sh`** — `bridge_init_write_onboarding_complete_marker` + `bridge_init_remove_onboarding_pending_marker` (mode 0600, schema agent/written/reason).
+- **`lib/bridge-isolation-v2.sh`** — `bridge_isolation_v2_normalize_workdir_profile_group` enforces CLAUDE.md group=ab-agent-<a> mode 0660.
+- Smoke: `scripts/smoke/G-beta4-watchdog-noise.sh` 10 tests + T_no_marker_no_session_recent_home + T_malformed_pending (Cases A-G coverage) + T6/T6b 3-way scan_error split.
+
+### Fixed — iso v2 ownership audit script + known_marketplaces.json ownership (#1278 + #1208 + #1215, Lane H PR #1289)
+
+First boot abort on Linux iso v2 fresh install was masked by a silent retry; root cause was `known_marketplaces.json` seeded root:640 instead of `agent-bridge-<a>:ab-agent-<a> 0660`. Also surfaced: `known_marketplaces.json.lock` root:600 ownership gap, `.ms365` directory missing exec bit.
+
+- **`lib/bridge-isolation-v2.sh`** + **`bridge-plugins.sh`** — chown after seed; lock file ownership; `.ms365` dir mode 2770.
+- **`scripts/audit/iso-v2-ownership-audit.sh`** (new, R3 hardened) — workdir-root triple-check (owner+group+mode 2770/2750) + canonical `bridge_agent_workdir` resolver + `.env` triple-check (owner+group+mode 0600) + `bridge_reset_roster_maps` call (closes pre-existing assoc-array no-op bug) + `BRIDGE_AUDIT_TEST_FORCE_LINUX` seam for macOS smoke hosts.
+- Smoke: `scripts/smoke/H-beta4-iso-ownership.sh` T1-T_canonical + T_audit_executes_against_bad_fixture + teeth.
+
+### Fixed — A2A 3 gaps: systemd template + outbox retry verify + stuck alert ack-after-success (#1262, Lane I PR #1292)
+
+A2A cross-bridge had three gaps preventing first-class operator use on fresh installs: handoff daemon systemd unit was manual-install; outbox retry semantics were intact (per beta22 commit 06b84c1) but unverified; outbox stuck rows had no admin alert path.
+
+- **Gap 1**: `bridge-init.sh --enable-a2a` flag + `bridge_init_scaffold_a2a` helper + new `scripts/install-handoffd-systemd.sh` renders systemd-user unit; bootstrap advisory prints `systemctl enable --now agb-handoffd` activation guidance.
+- **Gap 2**: smoke T3/T4 pin retry primitive (exponential backoff verified).
+- **Gap 3** (R2 + R3): `bridge-daemon-helpers.py` split `cmd_a2a_stuck_decide` (pure read) vs new `cmd_a2a_stuck_ack` (atomic ledger stamp). `bridge-daemon.sh::process_a2a_outbox_stuck_scan_tick` calls `a2a-stuck-ack` ONLY for successful `task create` rows — failed creates preserve ledger for next-scan re-emit. R3 smoke driver `scripts/smoke/I-beta4-helpers/run-stuck-scan-tick.sh` extracts function body verbatim from `bridge-daemon.sh` via `awk`, mocks `$BRIDGE_HOME/agent-bridge` rc=1 then rc=0 → asserts warning + ledger unstamped → next scan stamps.
+- Smoke: `scripts/smoke/I-beta4-a2a-3-gaps.sh` T1-T6 + T_stuck_task_create_failure_preserves_ledger + T_daemon_scan_tick_handles_create_failure + teeth.
+
+### Fixed — workflow + iso v2 docs + release downgrade audit + wiki-graph default-off (#1280 + #1281 + #1267 + #1263, Lane J PR #1293)
+
+Iso UID couldn't read controller-owned 0600 body file when called via `agb a2a send --body-file`. Docs (CLAUDE.md / developer-handover / OPERATIONS.md) lacked iso v2 agent constraint section. Daemon emitted release-downgrade notification redundantly when `installed >= target`. Wiki-graph + librarian default-on caused unexpected automation on fresh installs.
+
+- **`bridge-queue.py`** + **`bridge-a2a.py`** (R2 + R3) — `_sudo_read_body_file` / `_sudo_read_text` sudo-wrap body file read; emit `body_file_sudo_fallback` audit row with canonical schema (`iso_uid` field, `exception` + `exception_type` when applicable).
+- **`bridge-release.py`** + **`bridge-daemon-helpers.py`** (R3) — full SemVer 2.0.0 prerelease comparator with undotted normalization (`betaN`→`beta.N`, `rcN`→`rc.N`); installed-prerelease vs latest-stable same-core upgrade detected correctly; `release_notification_downgrade_skip` audit row emitted only for true downgrades.
+- **`CLAUDE.md`** + **`docs/developer-handover.md`** + **`OPERATIONS.md`** — "Working with isolated agents (iso v2)" section in all three.
+- **`bootstrap-memory-system.sh`** + **`bridge-bootstrap.sh`** — `BRIDGE_WIKI_GRAPH_ENABLED` gate; fresh installs default false; activation advisory printed.
+- Smoke: `scripts/smoke/J-beta4-workflow-docs.sh` T1-T10 + T9d (semver: alpha<beta<rc<final, beta9 vs beta10, beta2 vs beta10, rc1 vs rc10) + T10d (audit row schema iso_uid + exception/exception_type) + teeth.
+
+### Fixed — 5 nits batch (#1282 + #1283 + #1247 + #1253 + #1255, Lane K PR #1294)
+
+- **#1282** `bridge-run.sh` filters `absent path=` / `unchanged path=` log noise.
+- **#1283** `bridge-diagnose.sh acl` retired (deprecation shim only); iso v2 group/UID diagnostics intact.
+- **#1247** new `agent-bridge admin set --auto-restart on|off` CLI surface (writes admin agent config via `scripts/python-helpers/admin-set-config.py` file-as-argv).
+- **#1253** `agb claim --note <text>` + `--note-file <path>` propagation through `bridge-queue.py::emit_event(claim_note=...)`.
+- **#1255** (R2 + R3 + R4) `hooks/tool-policy.py` flipped admin roster carve-out from blacklist (`_bash_command_has_no_write_intent`) to whitelist (`_bash_command_has_read_intent` → delegates to canonical `_is_read_intent_bash`). Added `_FIND_MUTATION_FLAGS` frozenset (`-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`, `-fprint`, `-fprint0`, `-fprintf`, `-fls`) so admin can run `find <roster> -name '*.sh'` (read) but NOT `find <roster> -delete` / `-exec mutator {}` / `-fls /tmp/leak` (mutation/exec/exfil).
+- Smoke: `scripts/smoke/K-beta4-nits.sh` 7 tests including T6 (admin carve-out 20+12 cases) + T7 (find mutation flag filter, classifier + gate + teeth).
+
+### Fixed — integration cleanup (#1295)
+
+`scripts/ci-select-smoke.sh:110` master `__ALL__` required list omitted `D-beta4-daemon-lifecycle` during the wave's additive merges. Single-line registration restored.
+
+### Notes
+
+- **Pre-existing under macOS bash 3.2**: `scripts/smoke/G-beta4-watchdog-noise.sh` T3 (`bridge_isolation_v2_normalize_workdir_profile_group` chgrp/chmod) requires bash 4+ assoc arrays loaded via `bridge-lib.sh`; passes under Homebrew bash 5.3.9. Not a beta4 regression — same behavior at `1504047` baseline. Document in operator-host install advisory.
+- **Pre-existing under shellcheck --severity=warning**: `scripts/smoke/queue.sh:445-447` from commit `2283221c`; present unchanged in base `1504047`. Not counted as beta4 regression.
+- **Convergence rounds**: ~28+ codex review rounds total across 11 lanes plus integration review. Lane K alone hit r4 (operator-escalation cliff edge).
+- **Wave-orchestration skill applied**: 3-sub-wave parallel dispatch + per-PR convergence + Phase 5 integration review + QA gate (15/15 lane smokes PASS under bash 5.3.9). Operator-cued release per [[feedback-release-requires-explicit-permission]] + [[feedback-autonomous-beta-release-loop]].
+
 ## [0.15.0-beta3] — 2026-05-27
 
 ### Highlight — Wave-1 OOTB blocker closure (#1246 / #1248 / #1249 / #1250 / #1251 / #1252) + Lane B plugin UX
