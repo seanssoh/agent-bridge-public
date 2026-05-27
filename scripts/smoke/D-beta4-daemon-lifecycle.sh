@@ -17,11 +17,12 @@
 #
 # Fix shape (this smoke pins):
 #   - `bridge_daemon_ensure_singleton` (lib/bridge-daemon-control.sh):
-#     flock-guarded singleton entry. Acquires exclusive flock on
+#     flock-guarded singleton entry. NON-BLOCKING `flock -n` on
 #     ${BRIDGE_DAEMON_PID_FILE}.lock, evicts stale-but-living
 #     bridge-daemon (TERM + 10s + KILL), atomic PID-file write,
 #     emits canonical `daemon_started` audit row with pid +
-#     parent_pid + wrapper + sudo_self fields.
+#     parent_pid + wrapper + sudo_self fields. r2: lock fd held for
+#     the holder's process lifetime — competitors abort, never evict.
 #   - cmd_run (bridge-daemon.sh) calls ensure_singleton at the very
 #     top so EVERY spawn path crosses it (cmd_start fork, direct
 #     `bridge-daemon.sh run`, sudo-wrapped, systemd ExecStart).
@@ -31,7 +32,9 @@
 #   - `bridge_daemon_self_check` (lib/bridge-daemon-control.sh) called
 #     from cmd_run's main loop on each heartbeat boundary — compares
 #     $$ against the latest `daemon_started` audit pid; mismatch ->
-#     `daemon_pid_mismatch` audit row + warn.
+#     `daemon_pid_mismatch` audit row + bridge_warn + HIGH-priority
+#     operator alert task pushed to the admin agent via bridge-task.sh
+#     (r2 BLOCKING #1 — audit-only was not operator-visible).
 #
 # Tests (host-agnostic — extract the helper into an isolated harness +
 # drive with stubs; do NOT spawn the real bridge-daemon.sh, that needs
@@ -41,8 +44,17 @@
 #       emits `daemon_started` audit row with pid + parent_pid + wrapper
 #       + sudo_self fields.
 #
-#   T2: second spawn (concurrent) — second ensure_singleton call returns
-#       non-zero (lock busy), emits `daemon_spawn_lock_busy` audit row.
+#   T2: second spawn (concurrent, mid-critical-section) — second
+#       ensure_singleton call returns non-zero, emits
+#       `daemon_spawn_lock_busy` audit row with lock_mode=flock_n.
+#
+#   T2b (r2): second spawn AFTER first spawn completes + holder still
+#       running — competitor must abort (process-lifetime lock hold).
+#       PID file unchanged, healthy holder NOT evicted.
+#
+#   T2c (r2): proof of process-lifetime lock fd hold — after holder
+#       returns from ensure_singleton, the lockfile is in the holder
+#       process's open-fd set (/proc/<pid>/fd or lsof).
 #
 #   T3: first daemon dead (PID file stale) — second ensure_singleton on
 #       a freed lock succeeds; no TERM/KILL sent (existing pid is dead).
@@ -74,6 +86,7 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/smoke/lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
+# shellcheck disable=SC2329  # invoked via trap (next line), not a direct call.
 cleanup() {
   smoke_cleanup_temp_root
 }
@@ -190,13 +203,16 @@ fi
 smoke_log "T1 PASS — first ensure_singleton emits daemon_started with pid + parent_pid + wrapper + sudo_self"
 
 # ---------------------------------------------------------------------
-# T2: concurrent second spawn during the critical section → lock busy.
-# The lock is critical-section-only (released on return), so to force a
-# real contention window we pre-stage a living bridge-daemon-shaped
-# process in the PID file. The holder enters ensure_singleton, hits the
-# TERM-and-wait branch (which holds the lock for up to 10s while the
-# fake daemon refuses to exit), and the competitor with a 1s lock
-# timeout sees `daemon_spawn_lock_busy`.
+# T2: concurrent second spawn during the critical section → lock busy
+# (in-flight ensure_singleton case).
+#
+# r2 semantics: the lock is non-blocking `flock -n` and held for the
+# holder's process lifetime. To force a real contention window we
+# pre-stage a living bridge-daemon-shaped process in the PID file. The
+# holder enters ensure_singleton, hits the TERM-and-wait branch (which
+# holds the lock for up to 10s while the fake daemon refuses to exit),
+# and the competitor sees `daemon_spawn_lock_busy` immediately via
+# `flock -n` (no wait). Note: lock_mode=flock_n on the audit row.
 # ---------------------------------------------------------------------
 smoke_log "T2: second concurrent ensure_singleton returns rc!=0 + emits daemon_spawn_lock_busy"
 
@@ -256,9 +272,8 @@ T2_COMPETITOR="$SMOKE_TMP_ROOT/t2-competitor.sh"
   printf '%s\n' '#!/usr/bin/env bash'
   printf '%s\n' 'set -uo pipefail'
   printf '%s\n' "source \"$SINGLETON_LIB\""
-  # Short lock timeout so the competitor sees `lock busy` while the
-  # holder is still waiting for SIGTERM to take effect on the victim.
-  printf '%s\n' 'export BRIDGE_DAEMON_SINGLETON_LOCK_TIMEOUT_SECONDS=1'
+  # r2: non-blocking `flock -n` — the competitor returns immediately
+  # without waiting. No timeout env needed.
   printf '%s\n' 'bridge_daemon_ensure_singleton; rc=$?'
   printf '%s\n' 'printf "rc=%s\n" "$rc"'
 } >>"$T2_COMPETITOR"
@@ -279,7 +294,237 @@ fi
 if ! grep -q 'action=daemon_spawn_lock_busy' "$BRIDGE_AUDIT_LOG"; then
   smoke_fail "T2: daemon_spawn_lock_busy audit row not emitted; audit log: $(cat "$BRIDGE_AUDIT_LOG")"
 fi
-smoke_log "T2 PASS — concurrent ensure_singleton during critical section refuses + emits daemon_spawn_lock_busy"
+# r2 non-blocking marker: `lock_mode=flock_n` on flock backend (Linux),
+# `lock_mode=non_blocking` on mkdir fallback (macOS dev hosts without
+# util-linux flock). Either is a valid r2 contract proof.
+if ! grep -qE 'lock_mode=(flock_n|non_blocking)' "$BRIDGE_AUDIT_LOG"; then
+  smoke_fail "T2: daemon_spawn_lock_busy audit row missing r2 non-blocking marker (lock_mode=flock_n or lock_mode=non_blocking); audit log: $(cat "$BRIDGE_AUDIT_LOG")"
+fi
+smoke_log "T2 PASS — concurrent ensure_singleton during critical section refuses + emits daemon_spawn_lock_busy (r2 non-blocking marker present)"
+
+# ---------------------------------------------------------------------
+# T2b (r2 BLOCKING #2 — common case): first spawn COMPLETES + still
+# running. Process-lifetime lock-hold means a second ensure_singleton
+# while the first daemon process is alive must abort with
+# `daemon_spawn_lock_busy` (does NOT evict the healthy first daemon).
+#
+# Shape: long-running holder script sources the singleton lib, calls
+# ensure_singleton (completes normally), then sleeps to keep the lock
+# fd open. While the holder is sleeping, a competitor invocation must
+# see `flock -n` busy + emit `daemon_spawn_lock_busy`. PID file
+# content must remain the holder's PID (no eviction).
+# ---------------------------------------------------------------------
+smoke_log "T2b: first spawn done + still running → competitor ensure_singleton aborts (process-lifetime lock)"
+
+: >"$BRIDGE_AUDIT_LOG"
+rm -f "$BRIDGE_DAEMON_PID_FILE" "$BRIDGE_DAEMON_PID_FILE.lock"
+
+T2B_HOLDER_DONE_MARK="$SMOKE_TMP_ROOT/t2b-holder-done.mark"
+T2B_HOLDER_PID_RECORD="$SMOKE_TMP_ROOT/t2b-holder.pid"
+rm -f "$T2B_HOLDER_DONE_MARK" "$T2B_HOLDER_PID_RECORD" 2>/dev/null || true
+
+T2B_HOLDER="$SMOKE_TMP_ROOT/t2b-holder.sh"
+: >"$T2B_HOLDER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' "source \"$SINGLETON_LIB\""
+  printf '%s\n' 'bridge_daemon_ensure_singleton; rc=$?'
+  printf '%s\n' "printf '%s\\n' \"\$\$\" >\"$T2B_HOLDER_PID_RECORD\""
+  printf '%s\n' "printf 'rc=%s\\n' \"\$rc\" >\"$T2B_HOLDER_DONE_MARK\""
+  # Keep the process alive so the kernel keeps the flock held. Sleep
+  # generously; the test cleanup kills it.
+  printf '%s\n' 'sleep 60'
+} >>"$T2B_HOLDER"
+chmod +x "$T2B_HOLDER"
+
+/usr/bin/env bash "$T2B_HOLDER" >/dev/null 2>&1 &
+T2B_HOLDER_BG_PID=$!
+
+# Wait for the holder to finish ensure_singleton (mark file present).
+T2B_WAITED=0
+while [[ ! -f "$T2B_HOLDER_DONE_MARK" ]] && (( T2B_WAITED < 10 )); do
+  sleep 1
+  T2B_WAITED=$(( T2B_WAITED + 1 ))
+done
+if [[ ! -f "$T2B_HOLDER_DONE_MARK" ]]; then
+  kill -KILL "$T2B_HOLDER_BG_PID" 2>/dev/null || true
+  wait "$T2B_HOLDER_BG_PID" 2>/dev/null || true
+  smoke_fail "T2b: holder ensure_singleton did not complete within 10s"
+fi
+T2B_HOLDER_RC="$(awk -F= '/^rc=/ {print $2}' "$T2B_HOLDER_DONE_MARK")"
+if [[ "$T2B_HOLDER_RC" != "0" ]]; then
+  kill -KILL "$T2B_HOLDER_BG_PID" 2>/dev/null || true
+  wait "$T2B_HOLDER_BG_PID" 2>/dev/null || true
+  smoke_fail "T2b: holder ensure_singleton returned rc=$T2B_HOLDER_RC (expected 0)"
+fi
+T2B_HOLDER_PID="$(tr -dc '0-9' <"$T2B_HOLDER_PID_RECORD" 2>/dev/null || true)"
+if [[ -z "$T2B_HOLDER_PID" ]]; then
+  kill -KILL "$T2B_HOLDER_BG_PID" 2>/dev/null || true
+  wait "$T2B_HOLDER_BG_PID" 2>/dev/null || true
+  smoke_fail "T2b: could not read holder pid record"
+fi
+# Sanity: the PID file should now hold the holder's PID.
+T2B_PIDFILE_VAL="$(cat "$BRIDGE_DAEMON_PID_FILE" 2>/dev/null | tr -dc '0-9')"
+if [[ "$T2B_PIDFILE_VAL" != "$T2B_HOLDER_PID" ]]; then
+  kill -KILL "$T2B_HOLDER_BG_PID" 2>/dev/null || true
+  wait "$T2B_HOLDER_BG_PID" 2>/dev/null || true
+  smoke_fail "T2b: PID file holds $T2B_PIDFILE_VAL but holder PID is $T2B_HOLDER_PID"
+fi
+
+# Now run a competitor — holder is sleeping, lock still held.
+T2B_COMPETITOR="$SMOKE_TMP_ROOT/t2b-competitor.sh"
+: >"$T2B_COMPETITOR"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' "source \"$SINGLETON_LIB\""
+  printf '%s\n' 'bridge_daemon_ensure_singleton; rc=$?'
+  printf '%s\n' 'printf "rc=%s\n" "$rc"'
+} >>"$T2B_COMPETITOR"
+chmod +x "$T2B_COMPETITOR"
+
+T2B_COMPETITOR_OUT="$(/usr/bin/env bash "$T2B_COMPETITOR" 2>&1)"
+T2B_COMPETITOR_RC="$(printf '%s\n' "$T2B_COMPETITOR_OUT" | awk -F= '/^rc=/ {print $2}')"
+
+# Verify holder is still alive and PID file unchanged (no eviction).
+T2B_HOLDER_STILL_ALIVE=0
+if kill -0 "$T2B_HOLDER_PID" 2>/dev/null; then
+  T2B_HOLDER_STILL_ALIVE=1
+fi
+T2B_PIDFILE_AFTER="$(cat "$BRIDGE_DAEMON_PID_FILE" 2>/dev/null | tr -dc '0-9')"
+
+# Cleanup holder.
+kill -KILL "$T2B_HOLDER_BG_PID" 2>/dev/null || true
+wait "$T2B_HOLDER_BG_PID" 2>/dev/null || true
+
+if [[ "$T2B_COMPETITOR_RC" == "0" ]]; then
+  smoke_fail "T2b: competitor ensure_singleton returned rc=0 (expected non-zero — process-lifetime lock should be held). Out: $T2B_COMPETITOR_OUT"
+fi
+if (( T2B_HOLDER_STILL_ALIVE != 1 )); then
+  smoke_fail "T2b: holder PID $T2B_HOLDER_PID died — competitor must NOT evict a healthy holder under r2 contract"
+fi
+if [[ "$T2B_PIDFILE_AFTER" != "$T2B_HOLDER_PID" ]]; then
+  smoke_fail "T2b: PID file mutated from $T2B_HOLDER_PID to $T2B_PIDFILE_AFTER — competitor must not rewrite a healthy holder's PID slot"
+fi
+if ! grep -q 'action=daemon_spawn_lock_busy' "$BRIDGE_AUDIT_LOG"; then
+  smoke_fail "T2b: daemon_spawn_lock_busy audit row not emitted; audit log: $(cat "$BRIDGE_AUDIT_LOG")"
+fi
+if ! grep -qE 'lock_mode=(flock_n|non_blocking)' "$BRIDGE_AUDIT_LOG"; then
+  smoke_fail "T2b: daemon_spawn_lock_busy missing r2 non-blocking marker (lock_mode=flock_n or non_blocking); audit log: $(cat "$BRIDGE_AUDIT_LOG")"
+fi
+smoke_log "T2b PASS — common-case process-lifetime lock holds; competitor aborts cleanly without evicting healthy holder"
+
+# ---------------------------------------------------------------------
+# T2c (r2 BLOCKING #2 — process-lifetime lock verify): after a
+# successful ensure_singleton, the holder process must keep the lock
+# resource held. Backend-aware proof:
+#   - flock backend (Linux + util-linux flock): lockfile fd in the
+#     holder's open-fd set (/proc/<pid>/fd or lsof). We do not require
+#     a specific fd number (the helper uses `exec {lock_fd}>` which
+#     kernel-assigns).
+#   - mkdir backend (macOS dev hosts without flock): the lockdir
+#     ($LOCKFILE.d) must still exist (it is only removed on explicit
+#     `_bridge_daemon_singleton_release_lock`, which we don't call on
+#     the success path) AND owner.pid inside must match the holder.
+# ---------------------------------------------------------------------
+smoke_log "T2c: lock resource held for holder process lifetime (backend-aware)"
+
+: >"$BRIDGE_AUDIT_LOG"
+rm -f "$BRIDGE_DAEMON_PID_FILE" "$BRIDGE_DAEMON_PID_FILE.lock"
+
+T2C_HOLDER_DONE_MARK="$SMOKE_TMP_ROOT/t2c-holder-done.mark"
+T2C_HOLDER_PID_RECORD="$SMOKE_TMP_ROOT/t2c-holder.pid"
+rm -f "$T2C_HOLDER_DONE_MARK" "$T2C_HOLDER_PID_RECORD" 2>/dev/null || true
+
+T2C_HOLDER="$SMOKE_TMP_ROOT/t2c-holder.sh"
+: >"$T2C_HOLDER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' "source \"$SINGLETON_LIB\""
+  printf '%s\n' 'bridge_daemon_ensure_singleton; rc=$?'
+  printf '%s\n' "printf '%s\\n' \"\$\$\" >\"$T2C_HOLDER_PID_RECORD\""
+  printf '%s\n' "printf 'rc=%s\\n' \"\$rc\" >\"$T2C_HOLDER_DONE_MARK\""
+  printf '%s\n' 'sleep 30'
+} >>"$T2C_HOLDER"
+chmod +x "$T2C_HOLDER"
+
+/usr/bin/env bash "$T2C_HOLDER" >/dev/null 2>&1 &
+T2C_HOLDER_BG_PID=$!
+
+T2C_WAITED=0
+while [[ ! -f "$T2C_HOLDER_DONE_MARK" ]] && (( T2C_WAITED < 10 )); do
+  sleep 1
+  T2C_WAITED=$(( T2C_WAITED + 1 ))
+done
+if [[ ! -f "$T2C_HOLDER_DONE_MARK" ]]; then
+  kill -KILL "$T2C_HOLDER_BG_PID" 2>/dev/null || true
+  wait "$T2C_HOLDER_BG_PID" 2>/dev/null || true
+  smoke_fail "T2c: holder ensure_singleton did not complete within 10s"
+fi
+T2C_HOLDER_PID="$(tr -dc '0-9' <"$T2C_HOLDER_PID_RECORD" 2>/dev/null || true)"
+if [[ -z "$T2C_HOLDER_PID" ]]; then
+  kill -KILL "$T2C_HOLDER_BG_PID" 2>/dev/null || true
+  wait "$T2C_HOLDER_BG_PID" 2>/dev/null || true
+  smoke_fail "T2c: could not read holder pid record"
+fi
+
+# Backend-aware proof of process-lifetime lock hold.
+LOCK_FILE_REAL="${BRIDGE_DAEMON_PID_FILE}.lock"
+LOCK_DIR_REAL="${LOCK_FILE_REAL}.d"
+LOCK_HELD=0
+LOCK_PROBE_BACKEND=""
+
+# Try flock backend proof first (fd-scan).
+if command -v flock >/dev/null 2>&1; then
+  if [[ -d "/proc/$T2C_HOLDER_PID/fd" ]]; then
+    LOCK_PROBE_BACKEND="flock+proc"
+    for fd_link in "/proc/$T2C_HOLDER_PID/fd"/*; do
+      [[ -L "$fd_link" ]] || continue
+      target="$(readlink -- "$fd_link" 2>/dev/null || true)"
+      if [[ "$target" == "$LOCK_FILE_REAL" ]]; then
+        LOCK_HELD=1
+        break
+      fi
+    done
+  elif command -v lsof >/dev/null 2>&1; then
+    LOCK_PROBE_BACKEND="flock+lsof"
+    if lsof -p "$T2C_HOLDER_PID" 2>/dev/null | awk '{print $NF}' | grep -Fxq -- "$LOCK_FILE_REAL"; then
+      LOCK_HELD=1
+    fi
+  fi
+fi
+
+# If flock backend probe didn't find the fd, the install may have
+# fallen back to mkdir-as-lock (macOS dev path). Verify the lockdir.
+if (( LOCK_HELD != 1 )) && [[ -d "$LOCK_DIR_REAL" ]]; then
+  LOCK_PROBE_BACKEND="${LOCK_PROBE_BACKEND:+$LOCK_PROBE_BACKEND,}mkdir"
+  owner_pid_val=""
+  if [[ -r "$LOCK_DIR_REAL/owner.pid" ]]; then
+    owner_pid_val="$(tr -dc '0-9' <"$LOCK_DIR_REAL/owner.pid" 2>/dev/null || true)"
+  fi
+  if [[ "$owner_pid_val" == "$T2C_HOLDER_PID" ]]; then
+    LOCK_HELD=1
+  fi
+fi
+
+# Fallback: no /proc, no lsof, no lockdir — host-agnostic skip so we
+# don't fail on barebones containers.
+if (( LOCK_HELD != 1 )) && [[ -z "$LOCK_PROBE_BACKEND" ]]; then
+  smoke_log "T2c: no /proc/<pid>/fd, no lsof, no lockdir — process-lifetime verify skipped on this host"
+  LOCK_HELD=1
+  LOCK_PROBE_BACKEND="skipped"
+fi
+
+# Cleanup holder.
+kill -KILL "$T2C_HOLDER_BG_PID" 2>/dev/null || true
+wait "$T2C_HOLDER_BG_PID" 2>/dev/null || true
+
+if (( LOCK_HELD != 1 )); then
+  smoke_fail "T2c: holder PID $T2C_HOLDER_PID did not retain lock resource (backend=$LOCK_PROBE_BACKEND, lock_file=$LOCK_FILE_REAL, lock_dir=$LOCK_DIR_REAL) — process-lifetime hold contract broken"
+fi
+smoke_log "T2c PASS — holder retained lock resource across return from ensure_singleton (backend=$LOCK_PROBE_BACKEND)"
 
 # ---------------------------------------------------------------------
 # T3: first daemon dead (stale PID file) → new ensure_singleton claims
