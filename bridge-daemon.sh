@@ -4258,6 +4258,279 @@ bridge_daemon_record_nudge() {
   mv "$tmp" "$file"
 }
 
+# v0.15.0-beta5-2 Lane δ (#1311): per-(agent, task_id) deferred-nudge state.
+#
+# Pre-fix, the nudge fanout loop at the top of `nudge_agents` silently
+# dropped any nudge candidate row whose `$session` field was empty (or whose
+# tmux session no longer existed) with a bare `continue` — no audit row, no
+# retry, no escalation. A task assigned to an agent that was momentarily
+# between sessions (mid-restart, late session-id detect, fresh boot) would
+# stay queued forever even though the daemon had emitted it as a nudge
+# candidate. Patch audit #1311 classified this as a CRITICAL data-loss
+# class because the silence held indefinitely.
+#
+# These helpers track per-(agent, task_id) consecutive deferred counts on
+# disk so:
+#  1. Every deferred tick emits a structured `nudge_deferred` audit row
+#     (operator-visible, never silent).
+#  2. Recovery (next tick with a valid session) clears the counter so a
+#     long-running healthy agent doesn't accumulate stale state.
+#  3. After M consecutive deferrals (default 10; env
+#     `BRIDGE_NUDGE_SESSION_EMPTY_ESCALATE_AFTER`) we file an admin task
+#     so an operator-visible signal exists before the task ages past any
+#     downstream lease/timeout window.
+#
+# State layout: `$BRIDGE_STATE_DIR/daemon-nudge-deferred/<agent>.env`
+# holds N independent counters keyed by task_id, plus a single
+# `ESCALATED_<task_id>=1` marker so the admin task is filed at-most-once
+# per (agent, task_id) pair. Per-task keying prevents one stuck task from
+# suppressing escalations for sibling tasks (edge case #4 in the brief).
+bridge_daemon_nudge_deferred_state_file() {
+  local agent="$1"
+  local dir="$BRIDGE_STATE_DIR/daemon-nudge-deferred"
+  mkdir -p "$dir" 2>/dev/null || true
+  printf '%s' "$dir/${agent}.env"
+}
+
+# Load the per-agent counter file via `source`. Sets globals
+# _NUDGE_DEFERRED_COUNT_<task_id> and _NUDGE_DEFERRED_ESCALATED_<task_id>.
+# Caller is responsible for sanitizing inherited values; we name-mangle
+# task_id into the var so adjacent task ids cannot leak across iterations.
+bridge_daemon_nudge_deferred_load() {
+  local agent="$1"
+  local file
+  file="$(bridge_daemon_nudge_deferred_state_file "$agent")"
+  [[ -f "$file" ]] || return 0
+  # shellcheck source=/dev/null
+  source "$file" 2>/dev/null || true
+}
+
+# Atomic re-write of the per-agent counter file. Reads all
+# _NUDGE_DEFERRED_COUNT_* / _NUDGE_DEFERRED_ESCALATED_* env vars currently
+# in scope and writes them out; the caller is expected to set the new
+# value(s) before invoking this helper.
+bridge_daemon_nudge_deferred_save() {
+  local agent="$1"
+  local file tmp var
+  file="$(bridge_daemon_nudge_deferred_state_file "$agent")"
+  tmp="$(mktemp "${file}.XXXXXX")" || return 1
+  {
+    for var in $(compgen -v _NUDGE_DEFERRED_COUNT_ 2>/dev/null); do
+      printf '%s=%q\n' "$var" "${!var}"
+    done
+    for var in $(compgen -v _NUDGE_DEFERRED_ESCALATED_ 2>/dev/null); do
+      printf '%s=%q\n' "$var" "${!var}"
+    done
+  } > "$tmp"
+  mv "$tmp" "$file"
+}
+
+# Clear all deferred state for an agent. Called from inside
+# `nudge_agent_session` after a successful nudge so a long-lived agent
+# doesn't accumulate stale counters. Also called from the orphan/manual-
+# stop fast paths so a deleted/stopped agent doesn't leave residue.
+bridge_daemon_nudge_deferred_clear() {
+  local agent="$1"
+  local file
+  file="$(bridge_daemon_nudge_deferred_state_file "$agent")"
+  [[ -f "$file" ]] || return 0
+  rm -f "$file" >/dev/null 2>&1 || true
+  # Also drop the in-scope mangled vars so a subsequent load on the same
+  # agent in the same loop doesn't see ghost values.
+  local var
+  for var in $(compgen -v _NUDGE_DEFERRED_COUNT_ 2>/dev/null); do
+    unset "$var"
+  done
+  for var in $(compgen -v _NUDGE_DEFERRED_ESCALATED_ 2>/dev/null); do
+    unset "$var"
+  done
+}
+
+# Sanitize the in-scope _NUDGE_DEFERRED_* vars. Mirror of
+# bridge_daemon_nudge_deferred_clear's unset block but does NOT remove
+# the on-disk state file; called at the top of each loop iteration so an
+# earlier agent's counters cannot leak into the current iteration's load.
+bridge_daemon_nudge_deferred_reset_scope() {
+  local var
+  for var in $(compgen -v _NUDGE_DEFERRED_COUNT_ 2>/dev/null); do
+    unset "$var"
+  done
+  for var in $(compgen -v _NUDGE_DEFERRED_ESCALATED_ 2>/dev/null); do
+    unset "$var"
+  done
+}
+
+# Build the mangled var name for a task counter. task_id is expected to
+# be numeric (sqlite rowid) so the substitution-safe form is a plain
+# concat — but defensively replace any non-[A-Za-z0-9_] char with '_'
+# to avoid generating a name that bash refuses to assign.
+bridge_daemon_nudge_deferred_var_name() {
+  local prefix="$1"
+  local task_id="$2"
+  local sanitized
+  # shellcheck disable=SC2001  # bash parameter expansion lacks regex class
+  sanitized="$(printf '%s' "$task_id" | sed 's/[^A-Za-z0-9_]/_/g')"
+  printf '%s%s' "$prefix" "$sanitized"
+}
+
+# Defer-and-maybe-escalate. Increments the per-(agent, task_id) counter,
+# emits the structured `nudge_deferred` audit row, and — when the counter
+# crosses the escalation threshold AND the (agent, task_id) pair has not
+# already been escalated — files an admin task and emits a
+# `nudge_session_empty_escalated` row. Always returns 0; failures in the
+# admin-task dispatch never propagate back to the daemon main loop.
+#
+# task_id="" means the candidate row had no concrete first queued id
+# (live_nudge_key empty). We still increment a counter keyed on the
+# sentinel "none" so the deferred signal is visible; escalation also
+# files under task=none which the operator can correlate via audit.
+bridge_daemon_nudge_defer_and_maybe_escalate() {
+  local agent="$1"
+  local task_id="${2:-none}"
+  local reason="${3:-session_empty}"
+  local queued="${4:-0}"
+  local nudge_key="${5:-}"
+
+  [[ -n "$agent" ]] || return 0
+
+  local threshold="${BRIDGE_NUDGE_SESSION_EMPTY_ESCALATE_AFTER:-10}"
+  [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=10
+  (( threshold > 0 )) || threshold=10
+
+  bridge_daemon_nudge_deferred_reset_scope
+  bridge_daemon_nudge_deferred_load "$agent"
+
+  local count_var escalated_var
+  count_var="$(bridge_daemon_nudge_deferred_var_name _NUDGE_DEFERRED_COUNT_ "$task_id")"
+  escalated_var="$(bridge_daemon_nudge_deferred_var_name _NUDGE_DEFERRED_ESCALATED_ "$task_id")"
+
+  local prev_count="${!count_var:-0}"
+  [[ "$prev_count" =~ ^[0-9]+$ ]] || prev_count=0
+  local new_count=$(( prev_count + 1 ))
+  # shellcheck disable=SC2229,SC1083  # dynamic assignment via printf -v
+  printf -v "$count_var" '%s' "$new_count"
+  bridge_daemon_nudge_deferred_save "$agent" || true
+
+  # Always emit the deferred audit row so the silent-skip can never repeat
+  # undetected. The detail fields mirror the existing nudge_skip /
+  # nudge_dropped_stale rows so log readers don't need a new schema.
+  bridge_audit_log daemon nudge_deferred "$agent" \
+    --detail reason="$reason" \
+    --detail task_id="${task_id:-none}" \
+    --detail consecutive="$new_count" \
+    --detail threshold="$threshold" \
+    --detail queued="$queued" \
+    --detail nudge_key="${nudge_key:-}" \
+    2>/dev/null || true
+
+  daemon_warn "nudge deferred for ${agent} (task=${task_id:-none}, reason=${reason}, consecutive=${new_count}/${threshold})"
+
+  # Escalate exactly once per (agent, task_id) pair, after the counter
+  # crosses the threshold. The brief allows 2-3 ticks of grace for a
+  # legit startup, which the default threshold=10 (10 ticks ≈ 50s at the
+  # 5s default cadence) comfortably absorbs.
+  local already_escalated="${!escalated_var:-0}"
+  [[ "$already_escalated" =~ ^[0-9]+$ ]] || already_escalated=0
+  if (( new_count >= threshold )) && (( already_escalated == 0 )); then
+    # shellcheck disable=SC2229,SC1083
+    printf -v "$escalated_var" '%s' "1"
+    bridge_daemon_nudge_deferred_save "$agent" || true
+    bridge_daemon_nudge_emit_session_empty_admin_task \
+      "$agent" "$task_id" "$reason" "$new_count" "$threshold" "$queued" "$nudge_key" || true
+    bridge_audit_log daemon nudge_session_empty_escalated "$agent" \
+      --detail task_id="${task_id:-none}" \
+      --detail reason="$reason" \
+      --detail consecutive="$new_count" \
+      --detail threshold="$threshold" \
+      --detail queued="$queued" \
+      2>/dev/null || true
+  fi
+  return 0
+}
+
+# Best-effort admin notification for a sustained session-empty deferral.
+# No-op when BRIDGE_ADMIN_AGENT_ID is unset, the live CLI isn't reachable,
+# or the admin agent itself is the one wedged (avoid feedback loop).
+bridge_daemon_nudge_emit_session_empty_admin_task() {
+  local agent="$1"
+  local task_id="${2:-none}"
+  local reason="${3:-session_empty}"
+  local consecutive="${4:-0}"
+  local threshold="${5:-10}"
+  local queued="${6:-0}"
+  local nudge_key="${7:-}"
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  local target_bridge=""
+  local body_file=""
+  local hostname_short=""
+
+  [[ -n "$admin" ]] || return 0
+  # Avoid feedback loop: if the admin agent itself is the one whose
+  # session went empty, filing a task TO that admin would just add
+  # another queued row the daemon would defer on the next tick. Skip the
+  # admin task in that case — the audit row already captures the signal.
+  [[ "$agent" != "$admin" ]] || return 0
+
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  else
+    return 0
+  fi
+
+  hostname_short="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo host)"
+  body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-nudge-deferred.md.XXXXXX")"
+  cat >"$body_file" <<EOF
+# Nudge deferred ${consecutive}× for ${agent}
+
+The daemon has deferred nudging \`${agent}\` for ${consecutive} consecutive
+ticks (threshold ${threshold}). The candidate task remains queued on the
+queue side but the daemon cannot resolve a usable tmux session for the
+agent.
+
+- agent: ${agent}
+- task id: ${task_id}
+- reason: ${reason}
+- consecutive deferrals: ${consecutive}
+- queued (live): ${queued}
+- nudge_key (live): ${nudge_key:-<empty>}
+- host: ${hostname_short}
+
+Likely causes (in order of frequency):
+
+1. The agent never finished launching (check \`agent-bridge status\` and
+   \`bridge-daemon.sh status\`).
+2. The agent's tmux session died and the roster row hasn't refreshed
+   yet (\`bridge-daemon.sh sync\` to force a reconciliation pass).
+3. The session-id detect helpers raced and persisted an empty value
+   (see KNOWN_ISSUES.md §"session-id detect race" and beta5-1 fix).
+4. The agent was deleted from the roster while a task remained queued
+   under its name (orphan — the queued task needs reassignment).
+
+Next steps:
+
+- \`agent-bridge status\` — confirm \`${agent}\` is in the roster and active.
+- \`bridge-daemon.sh status\` — confirm the daemon is healthy.
+- If the agent should be running: \`agent-bridge agent start ${agent}\`.
+- If the agent should be stopped permanently: \`agent-bridge task reassign\`
+  on task #${task_id} (or close it).
+
+This is the operator-visible audit signal for issue #1311. The structured
+\`nudge_deferred\` audit rows trail every deferred tick if a deeper
+investigation is needed (\`agent-bridge audit follow --action nudge_deferred\`).
+EOF
+
+  if ! "$target_bridge" task create \
+       --to "$admin" --priority high --from daemon \
+       --title "[nudge-deferred:${reason}] ${agent} stuck (${consecutive}× deferral) on ${hostname_short}" \
+       --body-file "$body_file" >/dev/null 2>&1; then
+    daemon_warn "failed to file [nudge-deferred:${reason}] task to admin=${admin}; check the admin id and try again"
+  fi
+  rm -f "$body_file" >/dev/null 2>&1 || true
+  return 0
+}
+
 nudge_agent_session() {
   local agent="$1"
   local _session="$2"
@@ -4504,6 +4777,14 @@ nudge_agent_session() {
     --detail title="$title" \
     --detail fingerprint="$nudge_fingerprint"
   daemon_info "nudged ${agent} (queued=${live_queued}, claimed=${live_claimed}, idle=${idle}s)"
+
+  # v0.15.0-beta5-2 Lane δ (#1311): clear any deferred-counter state on a
+  # verified successful send. A long-lived healthy agent that recovered
+  # from a transient session-empty window must not carry stale counters
+  # forward — otherwise a future single deferral could spuriously trip
+  # the escalation threshold. Always best-effort; failures here do not
+  # break the success path.
+  bridge_daemon_nudge_deferred_clear "$agent" || true
 }
 
 reconcile_prompt_ready_latches() {
@@ -7944,8 +8225,69 @@ cmd_sync_cycle() {
   BRIDGE_DAEMON_LAST_STEP="nudge_agents"
   printf '%s\n' "$nudge_output" > "$_nudge_tmp"
   while IFS=$'\t' read -r agent session queued claimed idle nudge_key; do
-    [[ -z "$agent" || -z "$session" ]] && continue
+    # v0.15.0-beta5-2 Lane δ (#1311): the prior implementation silently
+    # `continue`d when $session was empty or the tmux session no longer
+    # existed. That dropped the nudge candidate with no audit row, no
+    # retry signal, and no escalation — the queued task remained queued
+    # indefinitely. Replace the silent skip with a defer-and-escalate
+    # path that emits a structured `nudge_deferred` audit row each tick
+    # and, after BRIDGE_NUDGE_SESSION_EMPTY_ESCALATE_AFTER (default 10)
+    # consecutive deferrals, files an admin task. Recovery (next tick
+    # with a valid session) clears the counter via the success branch
+    # in `nudge_agent_session`.
+    #
+    # Edge cases (#1311 brief enumeration):
+    #   - Empty $agent: defensive bail — empty agent indicates a
+    #     daemon-step output bug, not a per-agent stuck condition.
+    #     No audit (would tag target=daemon with no useful info), no
+    #     defer counter (no key to track under).
+    #   - Manual-stop marker present: quiet skip. Agent was stopped on
+    #     purpose; nudge fanout is the wrong layer to surface that.
+    #     Clear any residual deferred state so a future restart starts
+    #     from zero.
+    #   - Agent not in roster (orphan task): quiet skip with one-time
+    #     audit. The task's `assigned_to` references a deleted agent;
+    #     reassignment is an operator decision, not a daemon retry loop.
+    #   - $session empty OR tmux session missing: increment deferred
+    #     counter, emit nudge_deferred audit, escalate after threshold.
+    if [[ -z "$agent" ]]; then
+      continue
+    fi
+    if command -v bridge_agent_manual_stop_active >/dev/null 2>&1 \
+        && bridge_agent_manual_stop_active "$agent" 2>/dev/null; then
+      bridge_daemon_nudge_deferred_clear "$agent" >/dev/null 2>&1 || true
+      continue
+    fi
+    if command -v bridge_agent_exists >/dev/null 2>&1 \
+        && ! bridge_agent_exists "$agent" 2>/dev/null; then
+      # Orphan task. Best-effort one-time audit per (orphan agent)
+      # via the deferred state file's existence as the dedup marker:
+      # if no state file exists yet, emit; if it does, the prior
+      # emit already happened. Always-clear at the end keeps a stale
+      # state file from persisting after the operator reassigns.
+      local _ngd_orphan_marker
+      _ngd_orphan_marker="$(bridge_daemon_nudge_deferred_state_file "$agent")"
+      if [[ ! -f "$_ngd_orphan_marker" ]]; then
+        : >"$_ngd_orphan_marker" 2>/dev/null || true
+        bridge_audit_log daemon nudge_deferred "$agent" \
+          --detail reason=orphan_task \
+          --detail task_id="${nudge_key%%,*}" \
+          --detail consecutive=1 \
+          --detail queued="$queued" \
+          --detail nudge_key="${nudge_key:-}" \
+          2>/dev/null || true
+        daemon_warn "nudge candidate ${agent} not in roster (orphan task=#${nudge_key%%,*}); reassign or close task"
+      fi
+      continue
+    fi
+    if [[ -z "$session" ]]; then
+      bridge_daemon_nudge_defer_and_maybe_escalate \
+        "$agent" "${nudge_key%%,*}" session_empty "$queued" "$nudge_key" || true
+      continue
+    fi
     if ! bridge_tmux_session_exists "$session"; then
+      bridge_daemon_nudge_defer_and_maybe_escalate \
+        "$agent" "${nudge_key%%,*}" session_dead "$queued" "$nudge_key" || true
       continue
     fi
 
