@@ -191,6 +191,58 @@ bridge_init_ensure_live_cli() {
   bridge_init_run_step "live install deploy" "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/deploy-live-install.sh" --target "$BRIDGE_HOME"
 }
 
+# #1266 (v0.15.0-beta4 Lane G): write an ``onboarding-pending`` marker
+# under ``$BRIDGE_STATE_DIR/agents/<admin>`` so the watchdog's
+# ``detect_fresh_install`` helper recognizes this first watchdog tick as
+# a fresh-install scan and lowers the drift-task priority from ``high``
+# to ``low``. Without this, the daemon's very first scan after init
+# enqueues a high-priority ``agent profile drift`` task into the admin
+# inbox — the operator's actual first impression — because the admin
+# template ships with ``Onboarding State: pending`` by design (the
+# admin role needs to walk the operator through onboarding before
+# flipping to ``complete``).
+#
+# Contract:
+#   * Idempotent: re-running init writes the marker again with a fresh
+#     timestamp. The admin agent's onboarding completion path
+#     (``bridge-agent.sh:run_show`` / ``run_session_type``) is the only
+#     authoritative writer of the sibling ``onboarding-complete`` marker.
+#   * Skipped on ``--dry-run`` (mutation-free contract).
+#   * Skipped when the admin agent already existed before this init pass
+#     (``created=1`` is set only when this run authored the admin); a
+#     re-init over an existing admin must not regress an
+#     already-completed onboarding back to a "fresh-install" drift class.
+#   * Failure is non-fatal: a warning is appended and init continues.
+#     The marker is a hint, not a contract — without it the watchdog
+#     falls back to the agent-home mtime branch.
+bridge_init_write_onboarding_marker() {
+  local admin="$1"
+  local created="$2"
+  local dry_run_arg="$3"
+
+  [[ "$dry_run_arg" == "0" ]] || return 0
+  [[ "$created" == "1" ]] || return 0
+  [[ -n "$admin" ]] || return 0
+
+  local state_root="${BRIDGE_STATE_DIR:-${BRIDGE_HOME:-$HOME/.agent-bridge}/state}"
+  local agent_state_dir="$state_root/agents/$admin"
+  local marker="$agent_state_dir/onboarding-pending"
+
+  if ! mkdir -p "$agent_state_dir" 2>/dev/null; then
+    bridge_init_append_warning "could not create $agent_state_dir for the onboarding-pending marker; watchdog will fall back to mtime-based fresh-install detection"
+    return 0
+  fi
+  {
+    printf 'agent=%s\n' "$admin"
+    printf 'written=%s\n' "$(date +%s)"
+    printf 'reason=fresh-install\n'
+  } >"$marker" 2>/dev/null || {
+    bridge_init_append_warning "could not write $marker (watchdog will fall back to mtime-based fresh-install detection)"
+    return 0
+  }
+  chmod 0600 "$marker" 2>/dev/null || true
+}
+
 bridge_init_warnings_json() {
   bridge_require_python
   python3 - "${WARNINGS[@]}" <<'PY'
@@ -569,6 +621,12 @@ else
   # rather than serve cached state from the earlier load above.
   bridge_roster_cache_invalidate
   bridge_load_roster
+  # #1266 (v0.15.0-beta4 Lane G): now that the admin agent's SESSION-TYPE.md
+  # exists with the template-default ``Onboarding State: pending``, drop a
+  # ``state/agents/<admin>/onboarding-pending`` marker so the next watchdog
+  # tick treats this fresh-install's drift as priority=low instead of high.
+  # See ``bridge-watchdog.py:detect_fresh_install`` (Lane G).
+  bridge_init_write_onboarding_marker "$admin_agent" "$created" "$dry_run"
 fi
 
 # Issue #1052 (reconsiders #4769, which reverted #517): the `<admin>-dev`

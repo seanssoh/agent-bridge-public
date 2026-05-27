@@ -3450,6 +3450,7 @@ process_watchdog_report() {
   local report_file=""
   local report_json=""
   local problem_count=0
+  local fresh_only=0
   local existing_id=""
   local current_key=""
   local last_key=""
@@ -3457,6 +3458,7 @@ process_watchdog_report() {
   local cooldown=0
   local now_ts=0
   local reported=0
+  local drift_priority="high"
 
   [[ "${BRIDGE_WATCHDOG_ENABLED:-1}" == "1" ]] || return 1
   [[ -n "$admin_agent" ]] || return 1
@@ -3475,6 +3477,18 @@ process_watchdog_report() {
   # bridge_with_timeout (5s — single int extraction, no IO).
   problem_count="$(bridge_with_timeout 5 watchdog_problem_count python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" watchdog-problem-count "$report_json")"
   [[ "$problem_count" =~ ^[0-9]+$ ]] || problem_count=0
+  # #1266 (v0.15.0-beta4 Lane G): the watchdog payload now carries a
+  # ``fresh_install_only`` boolean that is True exactly when every
+  # effective (non-restart-in-progress) problem row was authored by a
+  # fresh install. We downgrade the drift-task priority to ``low`` in
+  # that case so first-run operators do not see a high-priority alert
+  # for a normal install-pending state. Real drift (any mix of
+  # non-fresh problems) keeps the original ``high`` priority.
+  fresh_only="$(bridge_with_timeout 5 watchdog_fresh_install_only python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" watchdog-fresh-install-only "$report_json")"
+  [[ "$fresh_only" =~ ^[0-1]$ ]] || fresh_only=0
+  if (( fresh_only == 1 )); then
+    drift_priority="low"
+  fi
   current_key="$(bridge_watchdog_problem_key "$report_json")"
   cooldown="${BRIDGE_WATCHDOG_COOLDOWN_SECONDS:-86400}"
   [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=86400
@@ -3493,19 +3507,21 @@ process_watchdog_report() {
   existing_id="$(bridge_queue_cli find-open --agent "$admin_agent" --title-prefix "$title_prefix" 2>/dev/null || true)"
   if [[ "$existing_id" =~ ^[0-9]+$ ]]; then
     if [[ "$current_key" != "$last_key" ]]; then
-      bridge_queue_cli update "$existing_id" --actor "daemon" --title "$title" --priority high --body-file "$report_file" >/dev/null 2>&1 && reported=1
+      bridge_queue_cli update "$existing_id" --actor "daemon" --title "$title" --priority "$drift_priority" --body-file "$report_file" >/dev/null 2>&1 && reported=1
     fi
   elif [[ "$current_key" != "$last_key" || $(( now_ts - last_report_ts )) -ge "$cooldown" ]]; then
-    bridge_queue_cli create --to "$admin_agent" --from "daemon" --priority high --title "$title" --body-file "$report_file" >/dev/null 2>&1 && reported=1
+    bridge_queue_cli create --to "$admin_agent" --from "daemon" --priority "$drift_priority" --title "$title" --body-file "$report_file" >/dev/null 2>&1 && reported=1
   fi
 
   if (( reported == 1 )); then
     bridge_audit_log daemon watchdog_report "$admin_agent" \
       --detail agent="$admin_agent" \
       --detail problem_count="$problem_count" \
+      --detail priority="$drift_priority" \
+      --detail fresh_install_only="$fresh_only" \
       --detail report_file="$report_file"
     bridge_note_watchdog_scan "$current_key" "$now_ts"
-    daemon_info "watchdog reported ${problem_count} agent profile issue(s)"
+    daemon_info "watchdog reported ${problem_count} agent profile issue(s) at priority=${drift_priority}"
     return 0
   fi
 

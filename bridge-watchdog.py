@@ -88,6 +88,38 @@ class AgentWatch:
     # crashing on one isolated agent.
     error_kind: str = ""
     error_path: str = ""
+    # #1254 (v0.15.0-beta4 Lane G): split the scan_error path into two
+    # operator-actionable categories so the librarian-watchdog cron can
+    # distinguish a transient controller-side cache miss (operator runs
+    # `sg ab-agent-<a> -- $SHELL`, resolves itself on the next tick) from
+    # a real iso-UID-side filesystem failure (operator must restore the
+    # agent's workdir / re-apply isolation v2). Empty on healthy rows.
+    # Values:
+    #   - "controller-cache-stale": controller process credentials don't
+    #     include the per-agent ab-agent-<a> supplementary group (the
+    #     supp-group cache is stale on this shell). The iso UID owns the
+    #     workdir mode 2770/ab-agent-<a> and a fresh shell would read it
+    #     fine — no admin action required, operator runs `sg` or restarts
+    #     the controller shell.
+    #   - "iso-uid-side": the iso UID itself cannot read its own workdir
+    #     (mode/ownership corruption, broken ACL, missing setgid bit).
+    #     Genuine drift; admin action required.
+    error_category: str = ""
+    # #1266 (v0.15.0-beta4 Lane G): fresh-install detection. True when the
+    # admin onboarding marker `state/agents/<a>/onboarding-pending` exists
+    # OR the agent's home directory is younger than
+    # BRIDGE_WATCHDOG_FRESH_INSTALL_WINDOW_SECS (default 600s = 10 min) and
+    # no `onboarding-complete` marker is present. The daemon drift-task
+    # writer (process_watchdog_report) lowers the task priority to `low`
+    # when every problem row is fresh_install=True so first-run admins do
+    # not see a "high priority drift" alert as their first impression.
+    fresh_install: bool = False
+    # #1254 (v0.15.0-beta4 Lane G): set when a `state/agents/<a>/restart.
+    # in-progress` marker is active (state=in_progress, PID alive, within
+    # TTL). The daemon drops drift tasks for these rows so an agent that
+    # is currently mid-restart does not trigger a high-priority drift
+    # alert that the next tick (60s later) will obsolete anyway.
+    restart_in_progress: bool = False
 
 
 def read_text(path: Path) -> str:
@@ -449,6 +481,198 @@ def heartbeat_age_seconds(agent_dir: Path) -> tuple[bool, int | None]:
 # flagging them as `warn` creates alert-fatigue on every scan.
 NON_ONBOARDING_SESSION_TYPES = frozenset({"dynamic", "cron"})
 
+# #1266 (v0.15.0-beta4 Lane G): static session types ship with the
+# template-default ``Onboarding State: complete`` (see
+# ``agents/_template/session-types/static-claude.md``) and therefore have
+# no operator-actionable onboarding signal of their own. The markdown
+# render suppresses the ``onboarding_state:`` line for these rows so the
+# operator's eyes are not pulled to a field that will always say
+# ``complete`` (or, in the SESSION-TYPE-missing edge case, ``missing`` —
+# which is then surfaced via the missing_files / managed-block paths,
+# NOT via a phantom ``onboarding_state: missing`` line). The JSON payload
+# still carries the parsed value so downstream consumers (alert rules,
+# audit) can read it.
+STATIC_SESSION_TYPES = frozenset({"static", "static-claude", "static-codex"})
+
+
+# #1266 (v0.15.0-beta4 Lane G): fresh-install detection window. The
+# daemon's drift-task writer lowers the priority to `low` when every
+# problem row carries `fresh_install=True`, so the first watchdog tick
+# after an `agent-bridge init` does NOT enqueue a high-priority drift
+# alert as the operator's first install impression. Tunable via env.
+DEFAULT_FRESH_INSTALL_WINDOW_SECS = 600
+
+
+def fresh_install_window_secs() -> int:
+    """Resolve the fresh-install age window from the env, with a safe
+    fall-through to ``DEFAULT_FRESH_INSTALL_WINDOW_SECS``. A
+    non-integer / non-positive override is treated as the default so
+    operator typos cannot disarm the gate entirely."""
+    raw = os.environ.get("BRIDGE_WATCHDOG_FRESH_INSTALL_WINDOW_SECS", "")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_FRESH_INSTALL_WINDOW_SECS
+    if parsed <= 0:
+        return DEFAULT_FRESH_INSTALL_WINDOW_SECS
+    return parsed
+
+
+def detect_fresh_install(
+    state_dir: Path | None,
+    agent_name: str,
+    agent_home_dir: Path,
+) -> bool:
+    """Return True when this agent looks like a fresh-install candidate
+    (Lane G #1266).
+
+    Decision matrix (any branch positive ⇒ True):
+
+      1. ``state/agents/<a>/onboarding-pending`` marker file exists.
+         (Authored by ``bridge-init.sh``'s fresh-install admin scaffold —
+         see ``bridge_init_write_onboarding_marker``.)
+      2. ``state/agents/<a>/onboarding-complete`` marker is ABSENT and
+         the agent home directory's mtime is within
+         ``fresh_install_window_secs()`` (default 600s = 10 min). This
+         covers the case where ``bridge-init.sh`` did not write the
+         marker (older install path, dry-run partial recovery) but the
+         agent was clearly created in the last few minutes.
+
+    Returns False when the state_dir is unknown (``None`` — caller could
+    not resolve ``$BRIDGE_HOME/state``) so the detection is conservative:
+    a missing state dir falls back to the legacy "every drift is high
+    priority" behavior rather than silently downgrading every drift.
+    """
+    if state_dir is None:
+        return False
+    agent_state_dir = state_dir / "agents" / agent_name
+    try:
+        if (agent_state_dir / "onboarding-pending").is_file():
+            return True
+        if (agent_state_dir / "onboarding-complete").is_file():
+            return False
+    except (PermissionError, OSError):
+        # Controller cannot reach the state dir for this agent — the
+        # markerless mtime branch below is the fallback signal.
+        pass
+    try:
+        home_mtime = agent_home_dir.stat().st_mtime
+    except (PermissionError, FileNotFoundError, OSError):
+        return False
+    now_ts = datetime.now(timezone.utc).timestamp()
+    age = int(now_ts - home_mtime)
+    if age < 0:
+        # Clock skew defense: a future mtime is treated as "not fresh"
+        # rather than the alternative ("always fresh forever") so a
+        # mis-set clock cannot disarm every drift task indefinitely.
+        return False
+    return age <= fresh_install_window_secs()
+
+
+def detect_restart_in_progress(
+    state_dir: Path | None,
+    agent_name: str,
+) -> bool:
+    """Return True when ``state/agents/<a>/restart.in-progress`` is
+    currently active (Lane G #1254, reusing the Lane C1 marker contract
+    from ``lib/bridge-agents.sh:bridge_agent_restart_marker_active``).
+
+    Marker schema (see ``lib/bridge-agents.sh`` §"Issue #1251"):
+      pid=<orchestrator-pid>
+      started=<unix-ts>
+      ttl=<seconds>
+      state=in_progress|rolled_back|completed
+      reason=<structured>     # populated only on state=rolled_back
+
+    Active = ``state=in_progress`` AND ``kill -0 <pid>`` succeeds AND
+    ``now < started + ttl``. A terminal marker (state=rolled_back) is
+    NOT active — the operator audit trail persists, but the drift-skip
+    window has already closed and the watchdog should re-engage.
+
+    Conservative on resolution failures: a missing state_dir, an
+    unreadable marker file, or a malformed field returns False so the
+    real drift signal is never suppressed by a false marker reading.
+    """
+    if state_dir is None:
+        return False
+    marker = state_dir / "agents" / agent_name / "restart.in-progress"
+    try:
+        if not marker.is_file():
+            return False
+        text = marker.read_text(encoding="utf-8", errors="ignore")
+    except (PermissionError, FileNotFoundError, OSError):
+        return False
+    fields: dict[str, str] = {}
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        fields[key.strip()] = value.strip()
+    if fields.get("state") != "in_progress":
+        return False
+    pid_raw = fields.get("pid", "")
+    started_raw = fields.get("started", "")
+    ttl_raw = fields.get("ttl", "")
+    if not (pid_raw.isdigit() and started_raw.isdigit() and ttl_raw.isdigit()):
+        return False
+    pid = int(pid_raw)
+    started = int(started_raw)
+    ttl = int(ttl_raw)
+    # PID liveness gate — mirror lib/bridge-agents.sh marker_active r1
+    # finding 2: a crashed orchestrator should not hold the watchdog
+    # hostage for the full TTL window.
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    return now_ts < started + ttl
+
+
+def classify_scan_error_category(
+    error_kind: str,
+    error_path: str,
+    workdir: Path | None,
+) -> str:
+    """Split the scan_error rows into operator-actionable buckets
+    (Lane G #1254).
+
+    Rules:
+      * Empty ``error_kind`` (= no error) → empty string.
+      * ``error_kind != "permission_denied"`` (e.g. ``not_found`` /
+        ``os_error``) → "iso-uid-side". Those are genuine filesystem
+        failures the operator must investigate; lumping them into the
+        cache-stale bucket would mask real drift.
+      * ``error_kind == "permission_denied"`` AND the controller can
+        still ``stat`` the workdir's parent (i.e. the directory exists
+        and is traversable) → "controller-cache-stale". This is the
+        #1246 shape: the workdir was chgrp'd to ab-agent-<a> mode 2770
+        but the controller process's supplementary-group cache does not
+        include that group. A fresh shell would read it fine.
+      * ``error_kind == "permission_denied"`` AND the controller cannot
+        even ``stat`` the workdir / its parent → "iso-uid-side". The
+        denial is structural (e.g. parent mode 0000, missing ancestor)
+        and not something a supp-group refresh will fix.
+    """
+    if not error_kind:
+        return ""
+    if error_kind != "permission_denied":
+        return "iso-uid-side"
+    if workdir is None:
+        return "iso-uid-side"
+    try:
+        # Can the controller see the workdir itself exist? `exists()`
+        # walks ancestor x-bits, so a workdir under a 0000-mode parent
+        # raises PermissionError or returns False — both signal
+        # iso-uid-side. A True here means the workdir is present, the
+        # parent is traversable, and the inability to read inside is
+        # the controller-side group cache.
+        if not workdir.exists():
+            return "iso-uid-side"
+    except (PermissionError, OSError):
+        return "iso-uid-side"
+    return "controller-cache-stale"
+
 
 # #1237: Legacy alias for the "engines that get no required-file check
 # under the Claude-default path." Pre-#1237 this set was
@@ -598,6 +822,8 @@ def scan_agent(
     engine: str = "claude",
     agent_source: str = "",
     agent_name: str | None = None,
+    state_dir: Path | None = None,
+    fresh_install_home_dir: Path | None = None,
 ) -> AgentWatch:
     # `agent_name` (#1108) is the registry id, threaded through
     # explicitly because on v2 layouts ``agent_dir`` resolves to
@@ -607,6 +833,15 @@ def scan_agent(
     # ``watchdog scan <agent>`` ad-hoc invocations that pass a Path
     # directly) unchanged.
     resolved_name = agent_name if agent_name is not None else agent_dir.name
+    # #1266 / #1254 (Lane G): probe the state-dir markers ONCE per agent
+    # so both the success path and the structured scan_error path below
+    # carry the same fresh_install / restart_in_progress signal. A
+    # restart-in-progress agent with a passing scan still has the marker
+    # — the daemon's task writer uses the flag to skip the drift task
+    # enqueue regardless of which row branch we took.
+    fresh_install_dir = fresh_install_home_dir if fresh_install_home_dir is not None else agent_dir
+    is_fresh = detect_fresh_install(state_dir, resolved_name, fresh_install_dir)
+    is_restarting = detect_restart_in_progress(state_dir, resolved_name)
     # v0.8.8 #715-B / #694: linux-user-isolated agents own
     # `agents/<name>/CLAUDE.md` as `agent-bridge-<name>:<group> 0640`.
     # When the controller process credentials don't include the new
@@ -663,6 +898,8 @@ def scan_agent(
             heartbeat_age_seconds=heartbeat_age,
             engine=engine or "claude",
             agent_source=agent_source,
+            fresh_install=is_fresh,
+            restart_in_progress=is_restarting,
         )
     except (PermissionError, FileNotFoundError, OSError) as exc:
         # #1119 r2: even when the outer `resolve_scan_path` sudo probe
@@ -685,6 +922,9 @@ def scan_agent(
             f"path={error_path}",
             file=sys.stderr,
         )
+        error_category = classify_scan_error_category(
+            error_kind, str(error_path), agent_dir
+        )
         return AgentWatch(
             agent=resolved_name,
             session_type="unknown",
@@ -699,6 +939,9 @@ def scan_agent(
             agent_source=agent_source,
             error_kind=error_kind,
             error_path=str(error_path),
+            error_category=error_category,
+            fresh_install=is_fresh,
+            restart_in_progress=is_restarting,
         )
 
 
@@ -739,7 +982,14 @@ def render_markdown(
         if item.agent_source:
             lines.append(f"- agent_source: {item.agent_source}")
         lines.append(f"- session_type: {item.session_type}")
-        lines.append(f"- onboarding_state: {item.onboarding_state}")
+        # #1266 (v0.15.0-beta4 Lane G): suppress the onboarding_state line
+        # for static session types in the markdown render. Static-claude /
+        # static-codex ship with the template-default
+        # ``Onboarding State: complete``; surfacing the field here adds
+        # noise without operator signal. The JSON payload still carries
+        # the parsed value so downstream consumers can read it.
+        if item.session_type not in STATIC_SESSION_TYPES:
+            lines.append(f"- onboarding_state: {item.onboarding_state}")
         lines.append(f"- heartbeat_present: {'yes' if item.heartbeat_present else 'no'}")
         if item.heartbeat_age_seconds is not None:
             lines.append(f"- heartbeat_age_seconds: {item.heartbeat_age_seconds}")
@@ -755,8 +1005,21 @@ def render_markdown(
         # feeds the operator) names what went wrong and which path raised.
         if item.error_kind:
             lines.append(f"- error_kind: {item.error_kind}")
+        # #1254 (Lane G): the operator-actionable error_category split.
+        # Only emit when populated (= status=scan_error rows).
+        if item.error_category:
+            lines.append(f"- error_category: {item.error_category}")
         if item.error_path:
             lines.append(f"- error_path: {item.error_path}")
+        # #1266 / #1254 (Lane G): emit fresh_install and restart_in_progress
+        # only when true so a healthy row stays compact. The daemon's
+        # process_watchdog_report consumes these via the JSON payload, not
+        # the markdown body, so a missing line on a healthy row carries no
+        # semantic difference for downstream automation.
+        if item.fresh_install:
+            lines.append("- fresh_install: yes")
+        if item.restart_in_progress:
+            lines.append("- restart_in_progress: yes")
         if item.status == "ok":
             lines.append("- issues: none")
         lines.append("")
@@ -784,6 +1047,19 @@ def main() -> int:
     )
     parser.add_argument("--bridge-home", default=os.environ.get("BRIDGE_HOME", str(Path.home() / ".agent-bridge")))
     parser.add_argument("--agent-home-root", default=None)
+    # #1266 / #1254 (Lane G): the state directory holds the per-agent
+    # ``onboarding-pending`` / ``onboarding-complete`` markers and the
+    # ``restart.in-progress`` marker. Default to ``<bridge_home>/state``
+    # which matches ``$BRIDGE_STATE_DIR`` in ``bridge-lib.sh``; the env
+    # var override lets a CI smoke pin a fixture dir.
+    parser.add_argument(
+        "--state-dir",
+        default=os.environ.get("BRIDGE_STATE_DIR", ""),
+        help=(
+            "state directory holding state/agents/<a>/{onboarding-*,restart.in-progress} "
+            "markers (default: $BRIDGE_HOME/state; #1266 / #1254)"
+        ),
+    )
     parser.add_argument("--json", action="store_true")
     parser.add_argument(
         "--apply",
@@ -842,6 +1118,22 @@ def main() -> int:
 
     bridge_home = Path(args.bridge_home).expanduser()
     agent_root = Path(args.agent_home_root).expanduser() if args.agent_home_root else bridge_home / "agents"
+    # #1266 / #1254 (Lane G): resolve the state-dir marker root once and
+    # pass it into each scan_agent. ``--state-dir`` (or
+    # ``$BRIDGE_STATE_DIR``) wins; default is ``<bridge_home>/state`` to
+    # match bridge-lib.sh's runtime layout. A non-existent state dir
+    # falls through to ``None`` so the detection helpers stay
+    # conservative (no false-positive fresh_install on a torn-down
+    # install).
+    state_dir: Path | None = None
+    if args.state_dir:
+        candidate = Path(args.state_dir).expanduser()
+        if candidate.is_dir():
+            state_dir = candidate
+    else:
+        candidate = bridge_home / "state"
+        if candidate.is_dir():
+            state_dir = candidate
     registry_ids: set[str] | None = None
     registry_meta: RegistryMeta = {}
     if args.registry_anchored:
@@ -892,6 +1184,19 @@ def main() -> int:
                     engine=engine,
                     agent_source=agent_source,
                     agent_name=agent_name,
+                    state_dir=state_dir,
+                    # The tracked-tree dir (`path`) is the most stable
+                    # fresh-install signal: on v2 it is created during
+                    # `bridge_scaffold_agent_home`, then the workdir
+                    # materialization step writes the runtime profile
+                    # into the v2 workdir. Both are touched in the same
+                    # `agent create` call, but `path`'s mtime is
+                    # preserved across watchdog ticks (the runtime
+                    # workdir can be re-touched by hooks). Pass `path`
+                    # explicitly so the fresh-install age window is
+                    # measured against the scaffold mtime, not the
+                    # potentially-younger materialize target.
+                    fresh_install_home_dir=path,
                 )
             )
         except (PermissionError, FileNotFoundError, OSError) as exc:
@@ -919,6 +1224,25 @@ def main() -> int:
                 f"the rest of the roster (#1119)",
                 file=sys.stderr,
             )
+            # #1254 (Lane G): classify the outer scan_error too. The
+            # workdir candidate we hand to ``classify_scan_error_category``
+            # is whichever of the registry workdir / on-disk path the
+            # caller has — neither is guaranteed reachable, so the
+            # helper itself is exception-tolerant. ``state_dir``
+            # markers are probed the same way as the success path so
+            # an agent that's mid-restart (or fresh-installed) still
+            # gets the matching flags on its scan_error row.
+            workdir_candidate: Path | None
+            workdir_str_for_check = agent_meta.get("workdir", "")
+            if workdir_str_for_check:
+                workdir_candidate = Path(workdir_str_for_check).expanduser()
+            else:
+                workdir_candidate = path
+            error_category = classify_scan_error_category(
+                error_kind, error_path, workdir_candidate
+            )
+            is_fresh = detect_fresh_install(state_dir, agent_name, path)
+            is_restarting = detect_restart_in_progress(state_dir, agent_name)
             records.append(
                 AgentWatch(
                     agent=agent_name,
@@ -934,14 +1258,39 @@ def main() -> int:
                     agent_source=agent_source,
                     error_kind=error_kind,
                     error_path=error_path,
+                    error_category=error_category,
+                    fresh_install=is_fresh,
+                    restart_in_progress=is_restarting,
                 )
             )
+    # #1254 (Lane G): an agent whose `restart.in-progress` marker is
+    # active is intentionally mid-restart — the snapshot+marker contract
+    # from #1251 expects the next watchdog tick (after the TTL window) to
+    # see the fresh state. Suppress those rows from the problem count
+    # entirely so the daemon's process_watchdog_report does NOT enqueue
+    # a drift task for a transient mid-restart window. ``problem_count``
+    # remains the authoritative signal the daemon reads.
+    #
+    # #1266 (Lane G): the ``fresh_install_only`` derived flag tells the
+    # daemon "every problem row in this report is a fresh-install
+    # candidate — file at priority=low instead of high". When mixed
+    # (some fresh, some not), the high-priority path is preserved.
+    effective_problems = [
+        item for item in records
+        if item.status != "ok" and not item.restart_in_progress
+    ]
     payload = {
         "generated_at": datetime.now().astimezone().isoformat(),
         "bridge_home": str(bridge_home),
         "agent_home_root": str(agent_root),
         "agent_count": len(records),
-        "problem_count": sum(1 for item in records if item.status != "ok"),
+        "problem_count": len(effective_problems),
+        "fresh_install_only": bool(effective_problems) and all(
+            item.fresh_install for item in effective_problems
+        ),
+        "restart_in_progress_count": sum(
+            1 for item in records if item.restart_in_progress
+        ),
         "orphan_directory_count": len(orphan_directories),
         "orphan_directories": orphan_directories,
         "agents": [asdict(item) for item in records],
