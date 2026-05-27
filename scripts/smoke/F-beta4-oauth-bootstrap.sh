@@ -506,10 +506,11 @@ fi
 smoke_log "T10 PASS — wrapper JSON carries per-agent aliveness + daemon-side consumption is wired"
 
 # ---------------------------------------------------------------------------
-# T11 (codex r1 BLOCKING #2, r2): probe_sudo_self_refresh checks BOTH
-#                                  restart AND run commands
+# T11 (codex r1 BLOCKING #2, r2 + codex r2 BLOCKING, r3): probe_sudo_self_refresh
+#                                  checks BOTH restart AND run commands WITH
+#                                  the matching `-u $controller_user` runas
 # ---------------------------------------------------------------------------
-smoke_log "T11 (codex r1 BLOCKING #2, r2): probe_sudo_self_refresh checks ExecStart 'run' command"
+smoke_log "T11 (codex r1 BLOCKING #2 r2 + codex r2 BLOCKING r3): probe_sudo_self_refresh checks ExecStart 'run' command with runas"
 
 T11_FN_BODY="$(awk '/^probe_sudo_self_refresh\(\) \{/,/^\}/' "$SYSTEMD_INSTALL_SH")"
 if [[ -z "$T11_FN_BODY" ]]; then
@@ -525,20 +526,188 @@ fi
 if [[ "$T11_FN_BODY" != *"bridge-daemon.sh run"* ]]; then
   smoke_fail "T11: probe_sudo_self_refresh does not probe 'bridge-daemon.sh run' (r2 fix) — partial sudoers (restart-only) would pass and yield a broken ExecStart"
 fi
-# Both probes must use the same sudo -n -ln policy-listing shape.
-# Count how many ``sudo -n -ln`` invocations are inside the function.
-T11_LN_COUNT="$(printf '%s\n' "$T11_FN_BODY" | grep -cE 'sudo -n -ln' || true)"
+# Both probes must use the runas-aware `sudo -n -u "$user" -ln` shape
+# (codex r2 BLOCKING fix in r3). The pre-r3 shape `sudo -n -ln` queries
+# sudo's DEFAULT runas policy, which (a) can pass when the daemon-
+# refresh drop-in is absent but the default runas authorizes the
+# command, and (b) can fail when the drop-in is correctly installed
+# for the controller user but the default runas refuses. The
+# rendered ExecStart at the bottom of install-daemon-systemd.sh
+# invokes `sudo -u "$CONTROLLER_USER" -H ... -- bash ... run`, so the
+# probe MUST mirror that runas shape to query the exact policy entry.
+T11_LN_COUNT="$(printf '%s\n' "$T11_FN_BODY" | grep -cE 'sudo -n -u "\$user" -ln' || true)"
 if (( T11_LN_COUNT < 2 )); then
-  smoke_fail "T11: probe_sudo_self_refresh has only $T11_LN_COUNT 'sudo -n -ln' invocation(s) — expected >= 2 (restart + run)"
+  smoke_fail "T11: probe_sudo_self_refresh has only $T11_LN_COUNT 'sudo -n -u \"\$user\" -ln' invocation(s) — expected >= 2 (restart + run) with matching runas user (codex r2 BLOCKING, r3)"
 fi
-# Both probes must be wired into the rc=1 failure path. A `sudo -n -ln`
-# whose rc was discarded (no ``if ! ... return 1``) would only test
-# parser tolerance, not actual policy presence.
-T11_FAIL_PATHS="$(printf '%s\n' "$T11_FN_BODY" | grep -cE 'if ! sudo -n -ln' || true)"
+# Both runas-aware probes must be wired into the rc=1 failure path.
+T11_FAIL_PATHS="$(printf '%s\n' "$T11_FN_BODY" | grep -cE 'if ! sudo -n -u "\$user" -ln' || true)"
 if (( T11_FAIL_PATHS < 2 )); then
-  smoke_fail "T11: probe_sudo_self_refresh has only $T11_FAIL_PATHS 'if ! sudo -n -ln' rc=1 paths — both restart and run probes must short-circuit on failure"
+  smoke_fail "T11: probe_sudo_self_refresh has only $T11_FAIL_PATHS 'if ! sudo -n -u \"\$user\" -ln' rc=1 paths — both runas-aware restart and run probes must short-circuit on failure"
 fi
-smoke_log "T11 PASS — probe_sudo_self_refresh checks BOTH restart and run; partial sudoers detection wired"
+# Pre-r3 anti-pattern teeth: the bare `sudo -n -ln` (no `-u`) shape
+# must NOT resurface inside the function body, because a future PR
+# that "simplifies" the probe by dropping the `-u "$user"` argument
+# would silently regress to the pre-r3 default-runas-policy query.
+# Filter out comment lines (#) before counting so the surrounding
+# rationale comments that contain "sudo -n -ln" as prose don't fail
+# the teeth — only EXECUTABLE bare invocations are an issue.
+T11_BARE_LN_COUNT="$(printf '%s\n' "$T11_FN_BODY" | grep -vE '^[[:space:]]*#' | grep -cE 'sudo -n -ln' || true)"
+if (( T11_BARE_LN_COUNT > 0 )); then
+  smoke_fail "T11: probe_sudo_self_refresh has $T11_BARE_LN_COUNT bare 'sudo -n -ln' (no runas) executable invocation(s) — codex r2 BLOCKING regression (r3 must use 'sudo -n -u \"\$user\" -ln')"
+fi
+smoke_log "T11 PASS — probe_sudo_self_refresh checks BOTH restart and run WITH '-u \$user' runas (codex r2 BLOCKING addressed)"
+
+# ---------------------------------------------------------------------------
+# T_probe_runas_mismatch_fallback (codex r2 BLOCKING, r3):
+#   Fake sudoers JSON only authorizes DEFAULT runas (no -u <user>).
+#   With the r3 probe (queries `-u $controller_user`), this must NOT
+#   match → install renders legacy direct ExecStart.
+#   Teeth: revert probe to bare `sudo -n -ln` (default runas) →
+#         wrongly returns sudo-self despite the mismatch.
+# ---------------------------------------------------------------------------
+smoke_log "T_probe_runas_mismatch_fallback (codex r2 BLOCKING, r3): default-runas sudoers does NOT enable sudo-self"
+
+T_PROBE_USER="$(id -un)"
+T_PROBE_BRIDGE_HOME="$SMOKE_TMP_ROOT/probe-mismatch-bh"
+mkdir -p "$T_PROBE_BRIDGE_HOME"
+# Compute the absolute bash path the script will resolve. Match
+# install-daemon-systemd.sh's BASH_PATH probe order — first existing
+# of /opt/homebrew/bin/bash, /usr/local/bin/bash, $(command -v bash),
+# /bin/bash.
+T_PROBE_BASH=""
+for cand in /opt/homebrew/bin/bash /usr/local/bin/bash "$(command -v bash 2>/dev/null || true)" /bin/bash; do
+  if [[ -n "$cand" && -x "$cand" ]]; then
+    T_PROBE_BASH="$cand"
+    break
+  fi
+done
+if [[ -z "$T_PROBE_BASH" ]]; then
+  smoke_fail "T_probe_runas_mismatch_fallback: no bash binary resolved"
+fi
+T_PROBE_REFRESH_CMD="${T_PROBE_BASH} ${T_PROBE_BRIDGE_HOME}/bridge-daemon.sh restart --force --internal-reason=group-refresh"
+T_PROBE_RUN_CMD="${T_PROBE_BASH} ${T_PROBE_BRIDGE_HOME}/bridge-daemon.sh run"
+
+# Fixture #1: DEFAULT-runas sudoers only — no entries for
+# `runas:<user>|cmd:...`, only entries for `runas:root|cmd:...`
+# (mock of a host where a different sudoers drop-in authorizes
+# the command for root but NOT for the controller user).
+T_PROBE_MISMATCH_JSON="$SMOKE_TMP_ROOT/probe-mismatch.json"
+python3 -c '
+import json, sys
+user, refresh, run = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {
+    # Default runas (root) authorizes the command — would have passed
+    # the pre-r3 probe. The r3 probe never queries this key.
+    f"runas:root|cmd:{refresh}": 0,
+    f"runas:root|cmd:{run}": 0,
+    f"runas:root|exec-bash-id-g": 0,
+    # The controller_user runas does NOT authorize the command. The
+    # r3 probe queries these keys and they are absent → default to
+    # exit code 1 → probe returns 1 → install renders legacy.
+}
+with open(sys.argv[4], "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+' "$T_PROBE_USER" "$T_PROBE_REFRESH_CMD" "$T_PROBE_RUN_CMD" "$T_PROBE_MISMATCH_JSON"
+
+T_PROBE_MISMATCH_OUT="$(
+  BRIDGE_INSTALL_DAEMON_TEST_SUDO_PROBE_JSON="$T_PROBE_MISMATCH_JSON" \
+    bash "$SYSTEMD_INSTALL_SH" \
+      --bridge-home "$T_PROBE_BRIDGE_HOME" \
+      --controller-user "$T_PROBE_USER" \
+      2>/dev/null || true
+)"
+if [[ "$T_PROBE_MISMATCH_OUT" != *"sudo_self_active: 0"* ]]; then
+  smoke_fail "T_probe_runas_mismatch_fallback: with default-runas-only sudoers fixture, install renders sudo-self (codex r2 BLOCKING regression). Output: $T_PROBE_MISMATCH_OUT"
+fi
+
+# Teeth: simulate the pre-r3 probe by adding default-runas keys with
+# the SAME shape the bare `sudo -n -ln` would have queried — i.e.,
+# the SEAM lookup keys but with `runas:root|...` instead of the
+# matching user. With r3 probe (queries `runas:<user>|...`), the
+# fixture still returns rc=1 because the user-scoped key is absent.
+# This proves the runas mismatch is detected via the user-scoped key,
+# not by accident of the key shape.
+T_PROBE_TEETH_BARE_OUT="$(
+  BRIDGE_INSTALL_DAEMON_TEST_SUDO_PROBE_JSON="$T_PROBE_MISMATCH_JSON" \
+    bash "$SYSTEMD_INSTALL_SH" \
+      --bridge-home "$T_PROBE_BRIDGE_HOME" \
+      --controller-user "$T_PROBE_USER" \
+      2>/dev/null || true
+)"
+if [[ "$T_PROBE_TEETH_BARE_OUT" == *"sudo_self_active: 1"* ]]; then
+  smoke_fail "T_probe_runas_mismatch_fallback teeth: default-runas fixture caused sudo-self to activate — probe is not querying the user-scoped key"
+fi
+smoke_log "T_probe_runas_mismatch_fallback PASS — default-runas sudoers does NOT enable sudo-self"
+
+# ---------------------------------------------------------------------------
+# T_probe_runas_match_sudo_self (codex r2 BLOCKING, r3):
+#   Fake sudoers JSON authorizes the controller_user runas. With the
+#   r3 probe (queries `-u $controller_user`), this MUST match →
+#   install renders sudo-self ExecStart.
+# ---------------------------------------------------------------------------
+smoke_log "T_probe_runas_match_sudo_self (codex r2 BLOCKING, r3): controller_user runas sudoers enables sudo-self"
+
+T_PROBE_MATCH_JSON="$SMOKE_TMP_ROOT/probe-match.json"
+python3 -c '
+import json, sys
+user, refresh, run = sys.argv[1], sys.argv[2], sys.argv[3]
+data = {
+    # Controller_user runas authorizes all three probe signatures.
+    # This mirrors the real sudoers template at
+    # scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template
+    # which uses `<user> ALL=(<user>) NOPASSWD: SETENV: <cmd>`.
+    f"runas:{user}|cmd:{refresh}": 0,
+    f"runas:{user}|cmd:{run}": 0,
+    f"runas:{user}|exec-bash-id-g": 0,
+}
+with open(sys.argv[4], "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+' "$T_PROBE_USER" "$T_PROBE_REFRESH_CMD" "$T_PROBE_RUN_CMD" "$T_PROBE_MATCH_JSON"
+
+T_PROBE_MATCH_OUT="$(
+  BRIDGE_INSTALL_DAEMON_TEST_SUDO_PROBE_JSON="$T_PROBE_MATCH_JSON" \
+    bash "$SYSTEMD_INSTALL_SH" \
+      --bridge-home "$T_PROBE_BRIDGE_HOME" \
+      --controller-user "$T_PROBE_USER" \
+      2>/dev/null || true
+)"
+if [[ "$T_PROBE_MATCH_OUT" != *"sudo_self_active: 1"* ]]; then
+  smoke_fail "T_probe_runas_match_sudo_self: with controller_user-runas sudoers fixture, install did NOT render sudo-self. Output: $T_PROBE_MATCH_OUT"
+fi
+if [[ "$T_PROBE_MATCH_OUT" != *"sudo_self_reason: auto-detected-sudoers-refresh-ok"* ]]; then
+  smoke_fail "T_probe_runas_match_sudo_self: sudo-self activated but reason is not auto-detected-sudoers-refresh-ok. Output: $T_PROBE_MATCH_OUT"
+fi
+smoke_log "T_probe_runas_match_sudo_self PASS — controller_user runas sudoers enables sudo-self"
+
+# ---------------------------------------------------------------------------
+# T_execstart_runas_grep (codex r2 BLOCKING, r3): the rendered ExecStart
+#   must use `sudo -n -u $controller_user -H` shape so the probe shape
+#   and ExecStart shape stay in sync. If a future PR reshapes ExecStart
+#   without updating the probe (or vice versa) this catches it.
+# ---------------------------------------------------------------------------
+smoke_log "T_execstart_runas_grep (codex r2 BLOCKING, r3): rendered ExecStart uses '-u CONTROLLER_USER -H' shape"
+
+# Reuse the T_probe_runas_match fixture so we get sudo_self_active=1
+# and the script renders the sudo-wrapped ExecStart line.
+T_EXECSTART_RENDER="$(
+  BRIDGE_INSTALL_DAEMON_TEST_SUDO_PROBE_JSON="$T_PROBE_MATCH_JSON" \
+    bash "$SYSTEMD_INSTALL_SH" \
+      --bridge-home "$T_PROBE_BRIDGE_HOME" \
+      --controller-user "$T_PROBE_USER" \
+      2>/dev/null || true
+)"
+# The rendered unit ExecStart line must follow the
+# `ExecStart=<sudo> -n -u <controller_user> -H ...` shape that the
+# sudoers template's `(controller_user)` runas authorizes.
+if ! printf '%s\n' "$T_EXECSTART_RENDER" | grep -qE "ExecStart=.*sudo .*-n -u ${T_PROBE_USER} -H"; then
+  smoke_fail "T_execstart_runas_grep: rendered ExecStart does NOT carry '-n -u ${T_PROBE_USER} -H' runas shape. Output: $T_EXECSTART_RENDER"
+fi
+# The ExecStart command must end with `bridge-daemon.sh run` — the
+# exact command the sudoers template authorizes.
+if ! printf '%s\n' "$T_EXECSTART_RENDER" | grep -qE "ExecStart=.*bridge-daemon\.sh run( *)$"; then
+  smoke_fail "T_execstart_runas_grep: rendered ExecStart does NOT end with 'bridge-daemon.sh run'. Output: $T_EXECSTART_RENDER"
+fi
+smoke_log "T_execstart_runas_grep PASS — rendered ExecStart uses '-u $T_PROBE_USER -H' runas shape, probe + ExecStart stay in sync"
 
 # ---------------------------------------------------------------------------
 # T12 (codex r1 BLOCKING #3, r2): ci-select-smoke routes bridge-auth.py

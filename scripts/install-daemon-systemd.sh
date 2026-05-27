@@ -132,6 +132,49 @@ SUDO_SELF_ACTIVE=0
 SUDO_SELF_REASON=""
 [[ -n "$CONTROLLER_USER" ]] || CONTROLLER_USER="${USER:-$(id -un 2>/dev/null || true)}"
 
+# Test-seam dispatcher (v0.15.0-beta4 Lane F r3, 2026-05-27). Consulted
+# by probe_sudo_self_refresh when BRIDGE_INSTALL_DAEMON_TEST_SUDO_PROBE_JSON
+# names a readable JSON file. The JSON shape is a flat map of signature
+# strings → integer exit codes:
+#
+#   {
+#     "runas:alice|cmd:/bin/bash /home/alice/.agent-bridge/bridge-daemon.sh restart --force --internal-reason=group-refresh": 0,
+#     "runas:alice|cmd:/bin/bash /home/alice/.agent-bridge/bridge-daemon.sh run": 0,
+#     "runas:alice|exec-bash-id-g": 0
+#   }
+#
+# Three signatures are consulted, mirroring the three real-sudo calls
+# inside probe_sudo_self_refresh:
+#   1. restart policy probe       → "runas:<user>|cmd:<refresh_cmd>"
+#   2. run policy probe           → "runas:<user>|cmd:<run_cmd>"
+#   3. PAM refresh execute probe  → "runas:<user>|exec-bash-id-g"
+# A missing key defaults to exit code 1 (refuse). Any non-zero short-
+# circuits the probe (matching real-sudo behavior). Implementation
+# uses python3 with -c for portable JSON parsing (no heredoc-stdin into
+# command substitution — see footgun #11).
+_probe_sudo_self_refresh_seam_lookup() {
+  # rc=0 iff the JSON map at $1 contains key $2 with integer value 0.
+  # All other states (missing key, parse failure, non-zero value) → rc=1.
+  local map="$1"
+  local key="$2"
+  python3 -c 'import json, sys; d=json.load(open(sys.argv[1])); sys.exit(0 if int(d.get(sys.argv[2], 1)) == 0 else 1)' \
+    "$map" "$key" >/dev/null 2>&1
+}
+
+_probe_sudo_self_refresh_via_seam() {
+  local user="$1"
+  local bash="$2"
+  local refresh_cmd="$3"
+  local run_cmd="$4"
+  local map="${BRIDGE_INSTALL_DAEMON_TEST_SUDO_PROBE_JSON:-}"
+  [[ -n "$map" && -r "$map" ]] || return 1
+
+  _probe_sudo_self_refresh_seam_lookup "$map" "runas:${user}|cmd:${refresh_cmd}" || return 1
+  _probe_sudo_self_refresh_seam_lookup "$map" "runas:${user}|cmd:${run_cmd}"     || return 1
+  _probe_sudo_self_refresh_seam_lookup "$map" "runas:${user}|exec-bash-id-g"     || return 1
+  return 0
+}
+
 probe_sudo_self_refresh() {
   # rc=0 → sudo+PAM refresh works AND the daemon-refresh sudoers
   # drop-in authorizes this exact command. rc!=0 → sudoers absent /
@@ -155,6 +198,18 @@ probe_sudo_self_refresh() {
   # because generic "sudo to self" trivially works) is addressed by
   # listing a SPECIFIC fully-qualified command rather than the bare
   # user — generic sudo-to-self does not match this command listing.
+  #
+  # Test seam (v0.15.0-beta4 Lane F r3, 2026-05-27): when
+  # BRIDGE_INSTALL_DAEMON_TEST_SUDO_PROBE_JSON is set to a path that
+  # exists, the function consults that JSON map instead of executing
+  # real sudo. The map keys are signatures of shape
+  # ``runas:<user>|cmd:<resolved-command-string>`` and the values are
+  # integer exit codes. This makes the probe testable on non-Linux
+  # hosts (no real sudoers tree) and is the substrate the
+  # F-beta4-oauth-bootstrap smoke uses to assert the r3 runas
+  # alignment WITHOUT depending on a privileged install. The seam is
+  # only consulted when the env var is set AND points to a readable
+  # file, so it cannot accidentally short-circuit a production probe.
   local user="$1"
   local bash="$2"
   [[ -n "$user" && -n "$bash" ]] || return 1
@@ -166,10 +221,44 @@ probe_sudo_self_refresh() {
   # so the probe must list the same string — anything else (e.g. a
   # different BRIDGE_HOME path) is correctly treated as "drop-in not
   # installed for this install" and falls back to the legacy ExecStart.
+  #
+  # Codex r2 BLOCKING (v0.15.0-beta4 Lane F r3, 2026-05-27): the sudoers
+  # template authorizes commands with a SPECIFIC runas user — the
+  # `{{controller_user}} ALL=({{controller_user}})` clause means the
+  # command is only listable when sudo is asked about it WITH the
+  # matching `-u <controller_user>` runas. The pre-r3 probe asked sudo's
+  # default runas policy (no `-u`), which (a) could pass on a host that
+  # authorizes the same command for the default runas user (root) while
+  # the daemon-refresh drop-in is absent or installed for a different
+  # user — wrongly returning sudo-self — and (b) could fail on a host
+  # where the drop-in is correctly installed for the controller user
+  # but the default runas policy refuses — wrongly returning legacy.
+  # The rendered ExecStart at the bottom of this file likewise invokes
+  # `sudo -u "$CONTROLLER_USER" -H --preserve-env=... -- bash <daemon> run`,
+  # so the probe MUST mirror the same runas shape to query the EXACT
+  # policy entry the ExecStart will hit at boot.
+  #
+  # Fix: insert `-u "$user"` after `-n` on every `sudo -n -ln` probe so
+  # the policy listing is scoped to the same runas user as the
+  # ExecStart's `-u ${CONTROLLER_USER}`. The `-ln` flag still asks sudo
+  # to list the policy entry rather than execute it (no side effect).
   local bridge_home="${BRIDGE_HOME_TARGET:-${BRIDGE_HOME:-$HOME/.agent-bridge}}"
   local refresh_cmd="${bash} ${bridge_home}/bridge-daemon.sh restart --force --internal-reason=group-refresh"
+  local run_cmd="${bash} ${bridge_home}/bridge-daemon.sh run"
+
+  # Test seam dispatch: when the JSON map env var is set, route all
+  # three probes (restart policy / run policy / PAM refresh) through
+  # the mock helper instead of executing real sudo. Keeps the smoke
+  # portable on non-Linux hosts where no controllable sudoers tree
+  # exists. See the test-seam comment block above.
+  if [[ -n "${BRIDGE_INSTALL_DAEMON_TEST_SUDO_PROBE_JSON:-}" \
+        && -r "${BRIDGE_INSTALL_DAEMON_TEST_SUDO_PROBE_JSON}" ]]; then
+    _probe_sudo_self_refresh_via_seam "$user" "$bash" "$refresh_cmd" "$run_cmd"
+    return $?
+  fi
+
   # shellcheck disable=SC2086  # intentional command-as-args expansion
-  if ! sudo -n -ln $refresh_cmd >/dev/null 2>&1; then
+  if ! sudo -n -u "$user" -ln $refresh_cmd >/dev/null 2>&1; then
     return 1
   fi
 
@@ -190,9 +279,11 @@ probe_sudo_self_refresh() {
   # falls back to legacy direct-bash ExecStart so the operator gets
   # the documented [warn] message at line ~248 instead of a silently-
   # broken unit.
-  local run_cmd="${bash} ${bridge_home}/bridge-daemon.sh run"
+  #
+  # r3 (codex r2 BLOCKING): same `-u "$user"` runas alignment — see
+  # comment block above the restart probe for full rationale.
   # shellcheck disable=SC2086  # intentional command-as-args expansion
-  if ! sudo -n -ln $run_cmd >/dev/null 2>&1; then
+  if ! sudo -n -u "$user" -ln $run_cmd >/dev/null 2>&1; then
     return 1
   fi
 
