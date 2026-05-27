@@ -187,7 +187,14 @@ bridge_build_resume_launch_cmd() {
 bridge_clear_agent_session_id() {
   local agent="$1"
   BRIDGE_AGENT_SESSION_ID["$agent"]=""
-  bridge_persist_agent_state "$agent"
+  # Issue #1304: bypass the empty-detect no-op guard in
+  # bridge_persist_agent_state. This entry point is the *explicit* clear
+  # path (resolver rc=1 stale, operator forget-session indirect),
+  # not the iso v2 race overwrite the guard exists to block. Without
+  # this bypass the guard would refuse to flush the clear to disk,
+  # stranding a stale id in history.env.
+  BRIDGE_SKIP_EMPTY_SESSION_ID_PERSIST_GUARD=1 \
+    bridge_persist_agent_state "$agent"
 }
 
 # bridge_set_agent_session_id — the symmetric inverse of bridge_clear_agent_
@@ -3304,17 +3311,149 @@ bridge_persist_agent_state() {
   local agent="$1"
   local _rc=0
 
-  if [[ "$(bridge_agent_source "$agent")" == "dynamic" ]]; then
-    # Issue #1248 Lane A3: propagate dynamic-file write rc so
-    # bridge_refresh_agent_session_id can fail loud on persistence
-    # failure (the #1248 symptom: silent write failure left session_id
-    # empty and every restart spawned a fresh Claude session).
-    bridge_write_dynamic_agent_file "$agent" || _rc=$?
-    if (( _rc != 0 )); then
-      return "$_rc"
+  # Issue #1304 (v0.15.0-beta5-1): empty-detect no-op guard. When the
+  # in-memory session_id was just transiently cleared (iso v2 race / non-
+  # sudo fallthrough / `bridge_resolve_resume_session_id` rc=1 on a 0600
+  # jsonl that the controller cannot read because
+  # `bridge_resolve_agent_iso_sudo_user` returned empty at this PID), the
+  # naked write below would otherwise overwrite a previously-successful
+  # AGENT_SESSION_ID on disk with the empty string. Patch's
+  # cm-prod-agentworkflow-vm01 trace 2026-05-27:
+  #     20:08:16  PID 2830345  session_id_persisted    54f1742e (sudo path)
+  #     20:08:27  PID 2838856  session_id_detect_empty (non-sudo path)
+  #     end-state history.env  AGENT_SESSION_ID=''     (overwritten)
+  # The detect's empty result is "nothing detected this tick", not
+  # "session_id is empty". REHYDRATE the in-memory value from the on-disk
+  # source-of-truth before letting the write proceed (so created_at /
+  # updated_at and other fields still flush), and emit an audit row so
+  # operators can grep for how often the race fires.
+  #
+  # Defense-in-depth: even if every detect call site threads `os_user`
+  # correctly, this guard blocks the empty-overwrite at the *write* layer.
+  #
+  # Only fires when:
+  #   - in-memory map says empty
+  #   - AND the on-disk file currently has a non-empty AGENT_SESSION_ID
+  # Explicit clears (forget-session, bridge_clear_agent_session_id) set
+  # BRIDGE_SKIP_EMPTY_SESSION_ID_PERSIST_GUARD=1 to bypass the rehydrate
+  # so the clear actually lands on disk.
+  #
+  # PR #1305 r2 (codex r1 BLOCKING): the guard-read + write sequence MUST
+  # run under the per-agent `bridge_agent_session_lock_file` so a sibling
+  # PID cannot persist a non-empty session_id BETWEEN our guard-read and
+  # our subsequent write. Without the lock, the codex repro is:
+  #     1. We read persisted=empty (no-existing-id branch chosen).
+  #     2. Sibling PID persists 54f1742e to history.env under its own
+  #        unsynchronised write.
+  #     3. We flush our empty in-memory value → clobbers 54f1742e.
+  # With the lock, the sibling's write either lands before us (we observe
+  # non-empty at the re-check and rehydrate) or after us (we serialise our
+  # write first and the sibling either rehydrates from us or overwrites
+  # us with a non-empty id — never a regression).
+  #
+  # The same lock is already used by `bridge_clear_persisted_session_id`
+  # (lib/bridge-state.sh:2046+) — reuse it so forget-session and the
+  # daemon persist path serialise against each other too.
+  local _lock_file=""
+  local _lock_dir=""
+  _lock_file="$(bridge_agent_session_lock_file "$agent")"
+  _lock_dir="$(dirname "$_lock_file")"
+  mkdir -p "$_lock_dir" 2>/dev/null || true
+
+  # _bridge_persist_agent_state_locked — the critical section. Re-checks
+  # the persisted id under the lock IMMEDIATELY before the final write so
+  # a sibling that won the race observes non-empty + rehydrates instead
+  # of clobbering. Body intentionally inlined as a local function so the
+  # flock + mkdir-fallback dispatch below stays a thin wrapper.
+  _bridge_persist_agent_state_locked() {
+    local _inner_rc=0
+
+    if [[ "${BRIDGE_SKIP_EMPTY_SESSION_ID_PERSIST_GUARD:-0}" != "1" ]]; then
+      local _in_mem_sid=""
+      _in_mem_sid="${BRIDGE_AGENT_SESSION_ID[$agent]-}"
+      if [[ -z "$_in_mem_sid" ]]; then
+        local _existing_sid=""
+        if declare -f bridge_agent_persisted_session_id >/dev/null 2>&1; then
+          # Re-read under lock IMMEDIATELY before the write. A sibling
+          # that also enters this critical section will have already
+          # released the lock — its persisted id (if any) is visible to
+          # us here, so we rehydrate instead of overwriting.
+          _existing_sid="$(bridge_agent_persisted_session_id "$agent" 2>/dev/null || true)"
+        fi
+        if [[ -n "$_existing_sid" ]]; then
+          # Rehydrate the in-memory map so bridge_write_agent_state_file
+          # serialises the surviving id back to disk instead of "" .
+          # shellcheck disable=SC2034
+          BRIDGE_AGENT_SESSION_ID["$agent"]="$_existing_sid"
+          local _existing_short="${_existing_sid:0:7}"
+          # PR #1305 r2: with the per-agent session lock wrapping the
+          # guard, every rehydrate is by construction "caught under the
+          # lock" — either a sibling persisted ahead of our entry, or
+          # the in-process empty detect raced our own write. Both reduce
+          # to the same observable: in-memory empty + on-disk non-empty.
+          # The `interleave_caught_under_lock` reason matches the codex
+          # r1 BLOCKING ask and makes the audit grep-able for the race.
+          bridge_audit_log state session_id_detect_empty_persist_skipped "$agent" \
+            --detail existing="$_existing_short" \
+            --detail reason=interleave_caught_under_lock \
+            2>/dev/null || true
+        fi
+      fi
     fi
+
+    if [[ "$(bridge_agent_source "$agent")" == "dynamic" ]]; then
+      # Issue #1248 Lane A3: propagate dynamic-file write rc so
+      # bridge_refresh_agent_session_id can fail loud on persistence
+      # failure (the #1248 symptom: silent write failure left session_id
+      # empty and every restart spawned a fresh Claude session).
+      bridge_write_dynamic_agent_file "$agent" || _inner_rc=$?
+      if (( _inner_rc != 0 )); then
+        return "$_inner_rc"
+      fi
+    fi
+    bridge_write_agent_state_file "$agent" "$(bridge_history_file_for_agent "$agent")"
+  }
+
+  if command -v flock >/dev/null 2>&1; then
+    # Bounded wait: 30s matches bridge_clear_persisted_session_id. On
+    # contention timeout, emit a structured warn + return 1 so the caller
+    # (bridge_refresh_agent_session_id, daemon tick) sees the failure
+    # instead of silently bypassing the lock. We do NOT blindly write
+    # without the lock — that would re-open the codex-repro race.
+    {
+      if ! flock -w 30 9; then
+        bridge_warn "bridge_persist_agent_state: session lock contention (>30s) for '$agent'; refusing persist to avoid clobbering a concurrent write"
+        _rc=1
+      else
+        _bridge_persist_agent_state_locked || _rc=$?
+      fi
+    } 9>"$_lock_file"
+  else
+    # Portable fallback when flock is missing (older macOS hosts, minimal
+    # busybox containers). `mkdir` is atomic on POSIX — same pattern as
+    # bridge_clear_persisted_session_id. Retry with 1s backoff up to 30
+    # times before giving up.
+    local _lock_dir_path="${_lock_file}.d"
+    local _attempt=0
+    while ! mkdir "$_lock_dir_path" 2>/dev/null; do
+      _attempt=$(( _attempt + 1 ))
+      if (( _attempt >= 30 )); then
+        bridge_warn "bridge_persist_agent_state: mkdir-based session lock busy after 30 retries for '$agent'; refusing persist to avoid clobbering a concurrent write"
+        unset -f _bridge_persist_agent_state_locked 2>/dev/null || true
+        return 1
+      fi
+      sleep 1
+    done
+    _bridge_persist_agent_state_locked || _rc=$?
+    rmdir "$_lock_dir_path" 2>/dev/null || true
   fi
-  bridge_write_agent_state_file "$agent" "$(bridge_history_file_for_agent "$agent")"
+
+  # Don't leak the helper into the global namespace — keep it scoped to
+  # this invocation so a future redefinition (e.g. a smoke override of
+  # bridge_write_agent_state_file) does not shadow the next call.
+  unset -f _bridge_persist_agent_state_locked 2>/dev/null || true
+
+  return "$_rc"
 }
 
 # Issue #1015: resolve the Claude config dir to hand the session-id
@@ -3376,6 +3515,17 @@ bridge_detect_claude_session_id() {
   # hosts / smokes. Callers should resolve via
   # `bridge_resolve_agent_iso_sudo_user`.
   local os_user="${5:-}"
+
+  # Issue #1304: opt-in test seam for the smoke that asserts every call
+  # site threads `os_user` when iso v2 is effective. Off in production
+  # (the env var is unset by default; the audit_log path costs a python
+  # spawn). Smoke sets BRIDGE_TEST_TRACE_DETECT_CALLERS=1 and reads the
+  # caller=<fn> os_user=<value> lines from the captured stderr.
+  if [[ "${BRIDGE_TEST_TRACE_DETECT_CALLERS:-0}" == "1" ]]; then
+    local _caller="${FUNCNAME[1]:-<unknown>}"
+    printf '[detect-trace] fn=bridge_detect_claude_session_id caller=%s os_user=%s\n' \
+      "$_caller" "${os_user:-<empty>}" >&2
+  fi
 
   # #946 L1 (r2): substitution-safe guard. This helper is called
   # exclusively from `$(...)` substitutions (callers parse stdout).
@@ -3596,6 +3746,13 @@ bridge_detect_session_id() {
   # session JSON / jsonl files via sudo-as-user. Ignored for codex (codex
   # transcripts at `~/.codex/sessions/**/*.jsonl` are controller-owned).
   local os_user="${6:-}"
+
+  # Issue #1304: opt-in test seam (see bridge_detect_claude_session_id).
+  if [[ "${BRIDGE_TEST_TRACE_DETECT_CALLERS:-0}" == "1" ]]; then
+    local _caller="${FUNCNAME[1]:-<unknown>}"
+    printf '[detect-trace] fn=bridge_detect_session_id caller=%s engine=%s os_user=%s\n' \
+      "$_caller" "$engine" "${os_user:-<empty>}" >&2
+  fi
 
   case "$engine" in
     codex)
