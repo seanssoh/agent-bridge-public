@@ -781,6 +781,215 @@ bridge_isolation_v2_chgrp_file_iso_group() {
   return 0
 }
 
+# bridge_isolation_v2_chgrp_dir_iso_group <agent> <dir> [mode]
+#
+# Normalize a single per-agent DIRECTORY's group + mode to the per-agent
+# isolation group (``ab-agent-<a>``) at mode ``2770`` (operator-overridable
+# via the third arg). Issue #1316 (v0.15.0-beta5-2 Lane θ): the legacy
+# `mkdir -p "$workdir/.claude"` in bridge-agent.sh ran under the controller
+# umask and left ``.claude/`` at ``0700 controller:controller`` (or
+# ``0700 iso-uid:controller-gid`` after Step A chowned the parent). On
+# the upgrade path that directory is never re-normalized — and the
+# controller (a member of ``ab-agent-<a>`` but NOT the iso UID's primary
+# group) cannot traverse it, so ``bridge-start.sh``'s pre-launch grep on
+# ``$workdir/.claude/settings.json`` fails with EACCES.
+#
+# Mirrors ``bridge_isolation_v2_chgrp_file_iso_group`` semantics:
+#   * Linux v2 isolation only (gated via ``bridge_isolation_v2_enforce``).
+#   * Idempotent — stat-skip on already-correct ``%G:%a`` short-circuits
+#     to zero syscalls.
+#   * Defensive symlink refusal: if the path is a symlink we do NOT
+#     follow into the target tree (chgrp/chmod would mutate the wrong
+#     node). Skip and return 0 — the caller must repair the symlink
+#     manually. A bridge_warn surfaces the situation.
+#   * Failure on chgrp/chmod returns 1; "target missing" returns 0.
+#
+# Default mode 2770 = group rwx + setgid bit so newly-created child
+# files/dirs inherit ``ab-agent-<a>``. The setgid bit is essential here:
+# files Claude writes under ``.claude/`` (settings.local.json, cache
+# entries, ...) must land at ``ab-agent-<a>`` group, otherwise the
+# controller loses read access on every fresh write.
+bridge_isolation_v2_chgrp_dir_iso_group() {
+  local agent="$1"
+  local dir="$2"
+  local mode="${3:-2770}"
+  [[ -n "$agent" && -n "$dir" ]] || {
+    bridge_warn "chgrp_dir_iso_group: agent and dir required"
+    return 1
+  }
+  # Platform discriminator gate (S3): no-op on non-Linux hosts the same
+  # way the sibling helpers gate. Returning 0 keeps the caller's happy
+  # path simple.
+  bridge_isolation_v2_enforce || return 0
+  # Symlink refusal — symlinks at the .claude/ level are not part of the
+  # v2 contract and traversing them would chgrp the wrong node. Operator
+  # must repair manually before this helper engages. `[[ -L $x ]]` runs
+  # under the controller UID so it sees the real fs view (the iso UID
+  # might have a different view if a hostile rebind is in progress, but
+  # the rebind itself requires write access to a parent we own).
+  if [[ -L "$dir" ]]; then
+    bridge_warn "chgrp_dir_iso_group: refusing to follow symlink at $dir (operator must remove the symlink before re-running)"
+    return 0
+  fi
+  [[ -d "$dir" ]] || return 0
+  local agent_grp=""
+  agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+  [[ -n "$agent_grp" ]] || return 0
+  # Idempotent stat-skip — mirrors the chgrp_file_iso_group pattern. A
+  # back-fill pass over an already-normalized .claude/ tree must perform
+  # zero ``chgrp`` / ``chmod`` syscalls. Mode comparison normalizes both
+  # sides to printf %o so ``2770`` vs ``02770`` parses the same.
+  #
+  # macOS-setgid-strip note: when the caller-requested mode includes the
+  # setgid bit (e.g. 2770) and the host is macOS owning the dir with its
+  # primary group, BSD silently strips the setgid bit on chmod — leaving
+  # the on-disk mode at 0770. A naive equality check would force a
+  # re-chmod on every pass even though the kernel WILL strip it again,
+  # producing an infinite-non-idempotent loop. Treat a mode-without-
+  # setgid as a match for a setgid-requested mode on macOS so the
+  # stat-skip engages.
+  local cur=""
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    cur="$(stat -f '%Sg:%Lp' "$dir" 2>/dev/null || printf '')"
+  else
+    cur="$(stat -c '%G:%a' "$dir" 2>/dev/null || printf '')"
+  fi
+  if [[ -n "$cur" ]]; then
+    local cur_grp="${cur%%:*}"
+    local cur_mode_raw="${cur##*:}"
+    local cur_mode_norm="" want_mode_norm=""
+    cur_mode_norm="$(printf '%o' "$((8#${cur_mode_raw#0}))" 2>/dev/null || printf '%s' "$cur_mode_raw")"
+    want_mode_norm="$(printf '%o' "$((8#${mode#0}))" 2>/dev/null || printf '%s' "$mode")"
+    if [[ "$cur_grp" == "$agent_grp" && "$cur_mode_norm" == "$want_mode_norm" ]]; then
+      return 0
+    fi
+    # macOS setgid-strip tolerance: on Darwin, when the requested mode
+    # carries the setgid bit (numeric value >= 2000 octal) but the dir
+    # mode bits sans setgid already match the request, treat as
+    # already-normalized. The kernel will keep stripping setgid on every
+    # chmod-attempt, so re-firing the chmod is a guaranteed no-op +
+    # wasted syscall.
+    if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+      local want_low cur_low
+      want_low="$(printf '%o' "$(( 8#${want_mode_norm} & 8#0777 ))" 2>/dev/null || printf '')"
+      cur_low="$(printf '%o' "$(( 8#${cur_mode_norm} & 8#0777 ))" 2>/dev/null || printf '')"
+      local want_has_setgid=0
+      if (( 8#${want_mode_norm} >= 8#2000 )); then
+        want_has_setgid=1
+      fi
+      if [[ "$cur_grp" == "$agent_grp" \
+            && "$want_has_setgid" == "1" \
+            && -n "$want_low" && "$want_low" == "$cur_low" ]]; then
+        return 0
+      fi
+    fi
+  fi
+  _bridge_isolation_v2_run_root_or_sudo chgrp "$agent_grp" "$dir" || return 1
+  _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$dir" || return 1
+  return 0
+}
+
+# bridge_isolation_v2_chown_file_iso_uid <agent> <file> [mode]
+#
+# Normalize a single per-agent FILE owned by ``root`` (or any non-iso
+# UID) to ``agent-bridge-<a>:ab-agent-<a> 0660`` (operator-overridable
+# via the third arg). Issue #1315 (v0.15.0-beta5-2 Lane θ): on the
+# upgrade path the legacy ``known_marketplaces.json`` was seeded as
+# ``root:ab-agent-<a> 640`` by ``bridge_write_isolated_known_marketplaces_catalog``.
+# Issue #1278 (Lane H beta4) fixed the create-path to write
+# ``iso-uid:ab-agent-<a> 0660`` so the iso UID's
+# ``bridge-dev-plugin-cache.py:update_known_marketplaces`` rename
+# (``tmp.write_text`` + ``os.replace``) succeeds. But the upgrade
+# back-fill loop never re-owned the legacy file; first agent start fails
+# silently with EPERM on rename.
+#
+# This helper is the upgrade-side mirror of the create-path
+# chown+chgrp+chmod chain at ``bridge_write_isolated_known_marketplaces_catalog:2251-2253``.
+# It uses ``bridge_linux_sudo_root chown`` because the controller UID
+# typically cannot chown a root-owned file directly.
+#
+# Mirrors ``bridge_isolation_v2_chgrp_file_iso_group`` semantics:
+#   * Linux v2 isolation only (gated via ``bridge_isolation_v2_enforce``).
+#   * Idempotent — stat-skip on already-correct ``%U:%G:%a`` short-circuits
+#     to zero syscalls.
+#   * Symlink refusal: if the path is a symlink we do NOT follow.
+#   * Failure on chown/chgrp/chmod returns 1; "target missing" returns 0.
+#   * Requires ``bridge_agent_os_user`` to resolve the iso UID. When the
+#     resolver returns empty (shared-mode agent or fresh non-iso install)
+#     this helper returns 0 — no-op, not failure.
+bridge_isolation_v2_chown_file_iso_uid() {
+  local agent="$1"
+  local file="$2"
+  local mode="${3:-0660}"
+  [[ -n "$agent" && -n "$file" ]] || {
+    bridge_warn "chown_file_iso_uid: agent and file required"
+    return 1
+  }
+  bridge_isolation_v2_enforce || return 0
+  if [[ -L "$file" ]]; then
+    bridge_warn "chown_file_iso_uid: refusing to follow symlink at $file"
+    return 0
+  fi
+  [[ -f "$file" ]] || return 0
+  local agent_grp=""
+  agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
+  [[ -n "$agent_grp" ]] || return 0
+  local os_user=""
+  if command -v bridge_agent_os_user >/dev/null 2>&1; then
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || printf '')"
+  fi
+  # No iso UID resolvable → shared-mode agent or pre-v2 install. Fall
+  # back to the file-iso-group helper which handles chgrp+chmod without
+  # chown. This keeps the helper safe to call across mixed-mode agents.
+  if [[ -z "$os_user" ]]; then
+    bridge_isolation_v2_chgrp_file_iso_group "$agent" "$file" "$mode"
+    return $?
+  fi
+  # Idempotent stat-skip — short-circuit if ``%U:%G:%a`` already matches
+  # ``$os_user:$agent_grp:$mode``. Same numeric-mode normalization as
+  # the sibling helpers.
+  local cur=""
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    cur="$(stat -f '%Su:%Sg:%Lp' "$file" 2>/dev/null || printf '')"
+  else
+    cur="$(stat -c '%U:%G:%a' "$file" 2>/dev/null || printf '')"
+  fi
+  if [[ -n "$cur" ]]; then
+    local cur_uid="${cur%%:*}"
+    local cur_rest="${cur#*:}"
+    local cur_grp="${cur_rest%%:*}"
+    local cur_mode_raw="${cur_rest##*:}"
+    local cur_mode_norm="" want_mode_norm=""
+    cur_mode_norm="$(printf '%o' "$((8#${cur_mode_raw#0}))" 2>/dev/null || printf '%s' "$cur_mode_raw")"
+    want_mode_norm="$(printf '%o' "$((8#${mode#0}))" 2>/dev/null || printf '%s' "$mode")"
+    if [[ "$cur_uid" == "$os_user" && "$cur_grp" == "$agent_grp" && "$cur_mode_norm" == "$want_mode_norm" ]]; then
+      return 0
+    fi
+  fi
+  # Use bridge_linux_sudo_root for the chown — controller UID cannot
+  # chown root-owned files. The chgrp + chmod could in principle run via
+  # the direct-first helper (POSIX permits chown-to-own-group for
+  # already-owned files), but the chown above transfers ownership to
+  # the iso UID which the controller is NOT, so subsequent chmod/chgrp
+  # from the controller would fail. Drive all three through
+  # bridge_linux_sudo_root for consistency.
+  if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+    bridge_linux_sudo_root chown "$os_user:$agent_grp" "$file" 2>/dev/null \
+      || _bridge_isolation_v2_run_root_or_sudo chown "$os_user:$agent_grp" "$file" \
+      || return 1
+    bridge_linux_sudo_root chmod "$mode" "$file" 2>/dev/null \
+      || _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$file" \
+      || return 1
+  else
+    # No sudo-root helper available (shouldn't happen on Linux v2 but
+    # guard for unit-test pathways). Best-effort direct chown which
+    # only succeeds when caller is root.
+    _bridge_isolation_v2_run_root_or_sudo chown "$os_user:$agent_grp" "$file" || return 1
+    _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$file" || return 1
+  fi
+  return 0
+}
+
 # bridge_isolation_v2_normalize_workdir_profile_group <agent> <workdir>
 #
 # Issue #1270 (v0.15.0-beta4 Lane G): after the v2 workdir materialize
@@ -799,12 +1008,44 @@ bridge_isolation_v2_chgrp_file_iso_group() {
 # added to ``_iso_profile_files`` below so the controller-side reads
 # stay coherent.
 #
+# Issue #1316 (v0.15.0-beta5-2 Lane θ C10): the original implementation
+# walked FILES only. The ``.claude/`` directory inside ``$workdir`` —
+# created by ``bridge-agent.sh:bridge_ensure_auto_memory_isolation``
+# under the controller umask — stays at ``0700 controller:controller``
+# (or ``0700 iso-uid:controller-gid`` after Step A chowns the parent).
+# ``bridge-start.sh``'s pre-launch grep on ``$workdir/.claude/settings.json``
+# then fails EACCES because the controller cannot traverse a 0700 dir
+# owned by a different UID. Extend the normalize to also walk the
+# canonical ``.claude/`` dir tree (``.claude/``, ``.claude/plugins/``,
+# ``.claude/session-env/``) and chgrp+chmod each to
+# ``ab-agent-<a>:2770``.
+#
+# Issue #1315 (v0.15.0-beta5-2 Lane θ C9): the legacy
+# ``$workdir/.claude/plugins/known_marketplaces.json`` was seeded by
+# the controller as ``root:ab-agent-<a> 0640`` on installs predating
+# #1278 (Lane H beta4). On agent first-start, the iso UID's
+# ``bridge-dev-plugin-cache.py:update_known_marketplaces`` does
+# ``tmp.write_text + os.replace(tmp, path)`` which requires the rename
+# target to be owned by the iso UID — and silently fails EPERM
+# otherwise. Normalize this single file alongside the directory tree:
+# chown to ``iso-uid:ab-agent-<a> 0660`` so the rename succeeds.
+#
 # Contract:
 #   * Linux v2 isolation only (gated via ``bridge_isolation_v2_enforce``).
-#   * Idempotent.
-#   * Failure on any single file is non-fatal — a warning is emitted via
-#     the per-file helper and the loop continues so a partial chgrp does
-#     not block the rest of ``agent create``.
+#   * Idempotent: the file/dir helpers each carry stat-skip and
+#     short-circuit when ``%U:%G:%a`` already matches the target. A
+#     re-run on an already-normalized workdir performs zero
+#     ``chown`` / ``chgrp`` / ``chmod`` syscalls.
+#   * Failure on any single entry is non-fatal — a warning is emitted
+#     via the per-entry helper and the loop continues so a partial
+#     normalize does not block the rest of ``agent create`` (or the
+#     upgrade backfill loop).
+#   * Symlinks at any of the directory or known_marketplaces.json
+#     locations are refused (see ``chgrp_dir_iso_group`` /
+#     ``chown_file_iso_uid``); operator must remove the symlink before
+#     re-running.
+#   * Fresh-install no-op: when the file or directory is missing the
+#     per-entry helpers return 0 silently.
 bridge_isolation_v2_normalize_workdir_profile_group() {
   local agent="$1"
   local workdir="$2"
@@ -828,6 +1069,39 @@ bridge_isolation_v2_normalize_workdir_profile_group() {
     bridge_isolation_v2_chgrp_file_iso_group "$agent" "$workdir/$name" 0660 \
       || bridge_warn "chgrp_file_iso_group failed for $workdir/$name (non-fatal)"
   done
+
+  # Issue #1316 (C10): normalize the ``.claude/`` directory tree the
+  # controller-umask mkdir left at 0700. Order matters — parent before
+  # child — so a re-run on a half-normalized tree advances each level
+  # without leaving a hole the controller cannot traverse. Each helper
+  # call is independently idempotent (stat-skip), non-fatal on failure
+  # (warning emitted, loop continues), and a no-op when the directory
+  # is missing entirely (fresh install before any settings render).
+  local _iso_profile_dirs=(
+    ".claude"
+    ".claude/plugins"
+    ".claude/session-env"
+  )
+  local dname=""
+  for dname in "${_iso_profile_dirs[@]}"; do
+    [[ -d "$workdir/$dname" ]] || continue
+    bridge_isolation_v2_chgrp_dir_iso_group "$agent" "$workdir/$dname" 2770 \
+      || bridge_warn "chgrp_dir_iso_group failed for $workdir/$dname (non-fatal)"
+  done
+
+  # Issue #1315 (C9): normalize ``known_marketplaces.json`` ownership +
+  # mode to ``iso-uid:ab-agent-<a> 0660`` so the iso UID's plugin-cache
+  # rename succeeds on first start. Uses ``chown_file_iso_uid`` (not
+  # ``chgrp_file_iso_group``) because the legacy file is root-owned and
+  # plain chgrp would leave it un-rename-able by the iso UID. The helper
+  # short-circuits to ``chgrp_file_iso_group`` semantics when the iso UID
+  # is not resolvable (shared-mode / non-iso install), so a mixed-mode
+  # caller stays safe.
+  if [[ -f "$workdir/.claude/plugins/known_marketplaces.json" ]]; then
+    bridge_isolation_v2_chown_file_iso_uid \
+      "$agent" "$workdir/.claude/plugins/known_marketplaces.json" 0660 \
+      || bridge_warn "chown_file_iso_uid failed for $workdir/.claude/plugins/known_marketplaces.json (non-fatal)"
+  fi
   return 0
 }
 
