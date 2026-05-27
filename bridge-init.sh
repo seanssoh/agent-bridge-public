@@ -666,7 +666,13 @@ if [[ $dry_run -eq 0 ]]; then
     _init_seed_output="$("$BRIDGE_BASH_BIN" "$host_profile_cli" plugins seed 2>&1)" \
       || _init_seed_rc=$?
     if (( _init_seed_rc == 0 )); then
-      printf '[init] plugins seed: shared catalog populated (bundled agent-bridge marketplace)\n'
+      # #1230 (v0.15.0-beta4): logger output goes to stderr so the
+      # `--json` mode contract (stdout = data only) holds end-to-end.
+      # Matches the #1273 convention applied to `bridge_info` in
+      # lib/bridge-core.sh — log lines are diagnostics, not return-channel
+      # producers. `bridge-bootstrap.sh` captures stdout via `$()` and
+      # parses it as JSON; any log line on stdout poisons the parse.
+      printf '[init] plugins seed: shared catalog populated (bundled agent-bridge marketplace)\n' >&2
     else
       [[ -n "$_init_seed_output" ]] && printf '%s\n' "$_init_seed_output" >&2
       bridge_init_append_warning "plugins seed failed (rc=$_init_seed_rc) — \$BRIDGE_SHARED_ROOT/plugins-cache may be empty. Re-run: agent-bridge plugins seed. \`agent create --isolate --channels plugin:*\` will attempt to self-heal via fallback seed; if that also fails, the create call will surface an actionable error."
@@ -707,8 +713,10 @@ if [[ $dry_run -eq 0 ]]; then
       _init_sudoers_status="$(bridge_daemon_control_check_sudoers 2>/dev/null || true)"
     fi
     if (( _init_sudoers_install_rc == 0 )) && [[ "$_init_sudoers_status" == "ok" ]]; then
-      printf '[init] daemon-refresh sudoers: installed at %s (verifier=ok)\n' "$_init_sudoers_path"
-      printf '[init] daemon_group_refresh_sudoers=ok\n'
+      # #1230 (v0.15.0-beta4): logger output goes to stderr — see comment
+      # at the plugins-seed printf above for the full rationale.
+      printf '[init] daemon-refresh sudoers: installed at %s (verifier=ok)\n' "$_init_sudoers_path" >&2
+      printf '[init] daemon_group_refresh_sudoers=ok\n' >&2
       _init_sudoers_install_ok=1
     else
       # Either install failed, or install succeeded but verifier rejected
@@ -726,8 +734,9 @@ if [[ $dry_run -eq 0 ]]; then
         # can inspect it, but do NOT call it "installed".
         bridge_init_append_warning "daemon-refresh sudoers: manual-required (verifier=$_init_sudoers_reason at $_init_sudoers_path). Re-run: agent-bridge init sudoers daemon-refresh --apply (Linux+visudo required) — the daemon will fall back to queue-only-fallback for supp-groups refresh until this clears."
       fi
-      printf '[init] daemon-refresh sudoers: manual-required (verifier=%s)\n' "$_init_sudoers_reason"
-      printf '[init] daemon_group_refresh_sudoers=%s\n' "$_init_sudoers_reason"
+      # #1230 (v0.15.0-beta4): logger output goes to stderr.
+      printf '[init] daemon-refresh sudoers: manual-required (verifier=%s)\n' "$_init_sudoers_reason" >&2
+      printf '[init] daemon_group_refresh_sudoers=%s\n' "$_init_sudoers_reason" >&2
     fi
 
     # Beta20 L2 Variant 3A r4 — when the daemon-refresh sudoers landed,
@@ -744,17 +753,47 @@ if [[ $dry_run -eq 0 ]]; then
     if (( _init_sudoers_install_ok == 1 )) \
        && command -v systemctl >/dev/null 2>&1; then
       _init_systemd_rc=0
+      _init_systemd_stderr=""
+      _init_systemd_stderr_file=""
+      _init_systemd_stderr_file="$(mktemp "${TMPDIR:-/tmp}/agb-init-systemd.XXXXXX" 2>/dev/null || printf '%s' "/tmp/agb-init-systemd.$$.$RANDOM")"
       "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/install-daemon-systemd.sh" \
         --bridge-home "$BRIDGE_HOME" --apply \
+        2>"$_init_systemd_stderr_file" \
         || _init_systemd_rc=$?
+      _init_systemd_stderr="$(cat "$_init_systemd_stderr_file" 2>/dev/null || printf '')"
+      # Forward captured stderr to operator-visible stderr so warnings
+      # from the helper script aren't swallowed. The mode= grep below
+      # uses the same captured buffer.
+      [[ -n "$_init_systemd_stderr" ]] && printf '%s\n' "$_init_systemd_stderr" >&2
+      rm -f "$_init_systemd_stderr_file" 2>/dev/null || true
+      # #1228 (v0.15.0-beta4): parse the machine-readable `mode=` line
+      # the helper emits so the operator-facing message reflects what
+      # was ACTUALLY written, not what we wished was written. Prior
+      # init unconditionally claimed "regenerated (sudo-self) and
+      # restarted" even when probe_sudo_self_refresh dropped the unit
+      # back to legacy ExecStart — that lie was the operator-confusion
+      # vector documented in KNOWN_ISSUES.md §28.
+      _init_systemd_mode="$(printf '%s\n' "$_init_systemd_stderr" | sed -n 's/^mode=//p' | tail -n 1)"
       if (( _init_systemd_rc == 0 )); then
         if systemctl --user is-active --quiet agent-bridge-daemon.service 2>/dev/null; then
           systemctl --user daemon-reload || true
           systemctl --user restart agent-bridge-daemon.service \
             || bridge_init_append_warning "systemctl --user restart agent-bridge-daemon.service failed after unit regen — retry manually with: systemctl --user restart agent-bridge-daemon.service"
-          printf '[init] systemd-user unit regenerated (sudo-self) and restarted\n'
+          # #1228 + #1230 (v0.15.0-beta4): logger output to stderr,
+          # message reflects the actual mode= the helper reported.
+          if [[ "$_init_systemd_mode" == "sudo-self" ]]; then
+            printf '[init] systemd-user unit regenerated (mode=sudo-self) and restarted\n' >&2
+          else
+            printf '[init] systemd-user unit regenerated (mode=%s) and restarted — supplementary-group refresh will NOT cross PAM\n' "${_init_systemd_mode:-unknown}" >&2
+            bridge_init_append_warning "systemd-user unit landed in mode=${_init_systemd_mode:-unknown} (not sudo-self) — daemon supp-group refresh will not auto-recover after \`agent create --linux-user\`. Run: agent-bridge init sudoers daemon-refresh --apply"
+          fi
         else
-          printf '[init] systemd-user unit regenerated (sudo-self) — service not active, will pick up on next start\n'
+          if [[ "$_init_systemd_mode" == "sudo-self" ]]; then
+            printf '[init] systemd-user unit regenerated (mode=sudo-self) — service not active, will pick up on next start\n' >&2
+          else
+            printf '[init] systemd-user unit regenerated (mode=%s) — service not active\n' "${_init_systemd_mode:-unknown}" >&2
+            bridge_init_append_warning "systemd-user unit landed in mode=${_init_systemd_mode:-unknown} (not sudo-self). Run: agent-bridge init sudoers daemon-refresh --apply"
+          fi
         fi
       else
         bridge_init_append_warning "install-daemon-systemd.sh --apply returned rc=$_init_systemd_rc — unit may still carry legacy ExecStart. Re-run: $BRIDGE_HOME/scripts/install-daemon-systemd.sh --bridge-home $BRIDGE_HOME --apply"

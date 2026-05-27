@@ -1100,6 +1100,84 @@ def write_claude_credentials_payload(
     )
 
 
+# #1261 (v0.15.0-beta4): minimum remaining lifetime, in milliseconds,
+# under which the controller-credentials fallback refuses to propagate
+# the token. Claude CLI lazily refreshes the controller credentials —
+# only when the controller itself makes an API call. If the daemon
+# propagates a token within 5 minutes of expiry, agents inherit it,
+# start running, and 401 a few minutes later. 30 minutes is a balance
+# between "long enough that the operator can do something about it"
+# and "short enough that the propagation isn't blocked unnecessarily".
+# Operators can override via ``BRIDGE_CONTROLLER_CRED_MIN_TTL_MS`` for
+# CI / test fixtures.
+CONTROLLER_CRED_MIN_TTL_MS = 30 * 60 * 1000  # 30 minutes
+
+
+def _controller_credentials_min_ttl_ms() -> int:
+    raw = os.environ.get("BRIDGE_CONTROLLER_CRED_MIN_TTL_MS", "").strip()
+    if not raw:
+        return CONTROLLER_CRED_MIN_TTL_MS
+    try:
+        value = int(raw)
+    except ValueError:
+        return CONTROLLER_CRED_MIN_TTL_MS
+    return value if value >= 0 else CONTROLLER_CRED_MIN_TTL_MS
+
+
+def controller_credentials_aliveness(
+    payload: dict[str, Any],
+    *,
+    now_ms: int | None = None,
+) -> tuple[str, int]:
+    """Return ``(status, remaining_ms)`` for the controller token.
+
+    Status values:
+      - ``"alive"``           — ``expiresAt`` is in the future by at least
+                                ``_controller_credentials_min_ttl_ms()``.
+                                Propagation is safe.
+      - ``"expired"``         — ``expiresAt`` is at or before ``now_ms``.
+                                The token will 401 the moment any agent
+                                tries to use it.
+      - ``"near-expiry"``     — ``expiresAt`` is in the future but within
+                                the minimum-TTL window. Propagating it is
+                                a single-point-of-failure: agents will all
+                                401 within the remaining lifetime.
+      - ``"no-expires-at"``   — payload lacks an ``expiresAt`` field. We
+                                cannot prove aliveness, so we defer to
+                                the caller's policy (currently: propagate
+                                with a warning — Claude CLI's own format
+                                always carries expiresAt today, so this
+                                branch is a backstop, not the common path).
+
+    Issue #1261: this is the daemon-side aliveness gate the
+    controller-credentials fallback was missing. Claude CLI refreshes the
+    controller token LAZILY (only when the controller itself makes an API
+    call). On hosts where the operator's day-to-day work happens INSIDE
+    agents (the typical agent-bridge deployment), the controller is idle
+    and its token expires unnoticed. The daemon's periodic sync then
+    propagated the stale token to every agent, and all agents 401'd at
+    once after a single idle window.
+    """
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return ("no-expires-at", 0)
+    expires_raw = oauth.get("expiresAt")
+    if expires_raw is None:
+        return ("no-expires-at", 0)
+    try:
+        expires_at_ms = int(expires_raw)
+    except (TypeError, ValueError):
+        return ("no-expires-at", 0)
+    remaining_ms = expires_at_ms - now_ms
+    if remaining_ms <= 0:
+        return ("expired", remaining_ms)
+    if remaining_ms < _controller_credentials_min_ttl_ms():
+        return ("near-expiry", remaining_ms)
+    return ("alive", remaining_ms)
+
+
 def read_controller_claude_credentials_payload(path: Path) -> dict[str, Any]:
     """Read and validate the controller's ``~/.claude/.credentials.json``.
 
@@ -1327,6 +1405,13 @@ def ensure_claude_settings_file(
 
 def cmd_sync_agent(args: argparse.Namespace) -> int:
     json_mode = bool(args.json)
+    # #1261 (v0.15.0-beta4): track the controller-credentials aliveness
+    # so the JSON payload carries a structured signal. Daemon-side
+    # callers (bridge-daemon.sh periodic sync tick) emit this into
+    # audit.jsonl alongside ``sync_status`` so the operator's log shows
+    # WHY a sync ended up propagating a near-expiry token.
+    aliveness = ""
+    remaining_ms = 0
     try:
         registry = load_registry(Path(args.registry).expanduser())
         active_id = str(registry.get("active_token_id") or "")
@@ -1365,6 +1450,70 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
             controller_payload = read_controller_claude_credentials_payload(
                 controller_path
             )
+            # #1261 (v0.15.0-beta4): aliveness gate. The prior
+            # controller-credentials fallback unconditionally propagated
+            # whatever the controller had on disk — including a long-
+            # expired token. Claude CLI refreshes controller credentials
+            # LAZILY (only when the controller itself makes an API call),
+            # so on hosts where the operator's day-to-day work happens
+            # inside agents the controller token sits stale and every
+            # daemon-driven sync silently distributed an expired token.
+            # Outcome: all agents 401'd at once after a single idle
+            # window (~8h on a Max plan). The probe is offline-cheap —
+            # we already have ``expiresAt`` on the parsed payload.
+            #
+            # On the "expired" branch we refuse to propagate and surface
+            # a structured error so the daemon's audit row records the
+            # cause; the operator's `agent-bridge status` row will then
+            # flag the controller as the single-point-of-failure rather
+            # than the agent inheriting a bad credential and failing on
+            # its first /tokens use.
+            #
+            # Codex r1 / patch r2 comment angle 4: the prior fallback's
+            # silent propagation meant the iso-UID agent then saw a
+            # "Please run /login" banner — that banner is misleading
+            # because the agent CANNOT fix the problem from inside its
+            # own session. The right surface is the controller's
+            # ``claude /login``, surfaced via the audit row + the
+            # operator-facing status. We keep the agent-side error
+            # specific so KNOWN_ISSUES.md can link the audit reason to
+            # the operator action.
+            #
+            # Aliveness tuple is captured into the enclosing-scope
+            # ``aliveness`` / ``remaining_ms`` (declared at the top of
+            # cmd_sync_agent) so the final JSON payload below carries
+            # the structured signal.
+            (aliveness, remaining_ms) = controller_credentials_aliveness(
+                controller_payload
+            )
+            if aliveness == "expired":
+                raise ValueError(
+                    "controller token expired "
+                    f"({-remaining_ms}ms past expiry at {controller_path}). "
+                    "Run `claude /login` on the controller host, OR register a "
+                    "Claude OAuth Setup Token via `bridge-auth.sh claude-token "
+                    "add --id <id> --stdin --activate --sync --agents all "
+                    "--enable-auto-rotate` to avoid the lazy-refresh dependency."
+                )
+            # near-expiry / no-expires-at: emit a structured warning to
+            # stderr so the audit row at the daemon side records the
+            # near-expiry signal alongside the sync_status. We still
+            # propagate (the token is technically valid right now) but
+            # the operator gets a loud heads-up. JSON callers see the
+            # warning on stderr; the JSON payload below carries the
+            # ``aliveness`` field so structured consumers can branch.
+            if aliveness in ("near-expiry", "no-expires-at"):
+                ttl_min = _controller_credentials_min_ttl_ms() // 60000
+                print(
+                    f"warning: controller token {aliveness} "
+                    f"(remaining_ms={remaining_ms}, min_ttl_ms_threshold="
+                    f"{_controller_credentials_min_ttl_ms()}). All agents "
+                    f"using the controller-credentials fallback will 401 "
+                    f"within ~{ttl_min} minutes. Run `claude /login` on the "
+                    f"controller host or register a Claude OAT (bridge-auth.sh "
+                    f"claude-token add ...) to break the single-point-of-failure.",
+                    file=sys.stderr,
+                )
             write_claude_credentials_payload(
                 credential_file,
                 controller_payload,
@@ -1410,6 +1559,12 @@ def cmd_sync_agent(args: argparse.Namespace) -> int:
         "active_token_id": active_id,
         "source": source,
         "fingerprint": fingerprint,
+        # #1261 (v0.15.0-beta4): structured aliveness signal for
+        # daemon-side audit. Empty for the claude_token_registry source
+        # (the OAT path has its own aliveness handling via recover-due);
+        # populated for the controller_credentials fallback.
+        "aliveness": aliveness,
+        "remaining_ms": remaining_ms,
     }
     if json_mode:
         json_dump(payload)

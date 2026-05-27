@@ -134,29 +134,49 @@ SUDO_SELF_REASON=""
 
 probe_sudo_self_refresh() {
   # rc=0 → sudo+PAM refresh works AND the daemon-refresh sudoers
-  # drop-in is installed. rc!=0 → sudoers absent / refusing the named
-  # user / sudo binary missing.
+  # drop-in authorizes this exact command. rc!=0 → sudoers absent /
+  # refusing the named user / sudo binary missing.
   #
-  # The drop-in existence check is required because `sudo -n -u <self>`
-  # trivially succeeds for any user sudoing to themselves on most
-  # configurations (no policy rule needed). Without the file check we'd
-  # auto-enable sudo-self ExecStart even on hosts that explicitly
-  # haven't run `agent-bridge init sudoers daemon-refresh --apply`,
-  # producing a sudoers-policy mismatch at runtime when the unit's
-  # exact authorized command isn't whitelisted.
+  # #1228 (v0.15.0-beta4): the prior implementation tried to confirm
+  # the drop-in existence via `set -- /etc/sudoers.d/<glob>; [[ -e $1 ]]`.
+  # On Debian / Ubuntu / RHEL the controller user cannot `opendir(3)`
+  # /etc/sudoers.d/ (mode 750 root:root), so the glob never expanded
+  # and the probe returned 1 even when the file objectively existed.
+  # Downstream the systemd unit silently shipped with the legacy
+  # direct-bash ExecStart, Lane F auto-recovery was effectively dead,
+  # and the operator-facing "regenerated (sudo-self) and restarted"
+  # message lied about what was actually written.
+  #
+  # Replacement: ask sudo's policy resolver directly via
+  # `sudo -n -ln <exact-command>`. That returns rc=0 iff the user has
+  # a matching NOPASSWD policy entry for the EXACT command path + args
+  # we plan to run; it does not require readable /etc/sudoers.d/. The
+  # original false-positive concern (auto-enabling sudo-self ExecStart
+  # because generic "sudo to self" trivially works) is addressed by
+  # listing a SPECIFIC fully-qualified command rather than the bare
+  # user — generic sudo-to-self does not match this command listing.
   local user="$1"
   local bash="$2"
   [[ -n "$user" && -n "$bash" ]] || return 1
-  # Drop-in basename matches the bridge_daemon_control_sudoers_path
-  # contract: agent-bridge-daemon-refresh-<user>-<runtime-id>. We don't
-  # need to know the runtime-id here — any matching basename means the
-  # operator ran the bridge installer at least once for this user.
-  local sudoers_glob="/etc/sudoers.d/agent-bridge-daemon-refresh-${user}-*"
-  # shellcheck disable=SC2086  # intentional glob expansion
-  set -- $sudoers_glob
-  if [[ ! -e "$1" ]]; then
+
+  # Resolve the bridge_home the daemon-refresh sudoers drop-in was
+  # rendered for. The sudoers template (see
+  # scripts/sudoers-templates/agent-bridge-daemon-refresh.sudo.template)
+  # authorizes a specific bash + bridge_home + bridge-daemon.sh path,
+  # so the probe must list the same string — anything else (e.g. a
+  # different BRIDGE_HOME path) is correctly treated as "drop-in not
+  # installed for this install" and falls back to the legacy ExecStart.
+  local bridge_home="${BRIDGE_HOME_TARGET:-${BRIDGE_HOME:-$HOME/.agent-bridge}}"
+  local refresh_cmd="${bash} ${bridge_home}/bridge-daemon.sh restart --force --internal-reason=group-refresh"
+  # shellcheck disable=SC2086  # intentional command-as-args expansion
+  if ! sudo -n -ln $refresh_cmd >/dev/null 2>&1; then
     return 1
   fi
+
+  # Defense-in-depth: confirm sudo actually executes a child as the
+  # named user (PAM refresh probe). Catches edge cases where the
+  # policy is listed but the underlying mechanism is broken
+  # (e.g. PAM module misconfigured, audit-only authorization).
   local out=""
   if ! out="$(sudo -n -u "$user" -H -- "$bash" -c 'id -G' 2>/dev/null)"; then
     return 1
@@ -270,11 +290,31 @@ fi
 
 mkdir -p "$(dirname "$SERVICE_PATH")" "$(dirname "$LOG_PATH")"
 printf '%s\n' "$UNIT_CONTENT" >"$SERVICE_PATH"
-echo "[info] wrote systemd user unit: $SERVICE_PATH"
+# #1230 (v0.15.0-beta4): logger output goes to stderr — bridge-init.sh
+# captures this script's stdout when forwarding through `--json`, and
+# log lines on stdout poison bridge-bootstrap.sh's JSON parser. Same
+# convention as the bridge_info → stderr fix (#1273) for lib/bridge-core.sh.
+echo "[info] wrote systemd user unit: $SERVICE_PATH" >&2
 if [[ $SUDO_SELF_ACTIVE -eq 1 ]]; then
-  echo "[info] sudo-self ExecStart active (reason=${SUDO_SELF_REASON} user=${CONTROLLER_USER})"
+  echo "[info] sudo-self ExecStart active (reason=${SUDO_SELF_REASON} user=${CONTROLLER_USER})" >&2
 else
-  echo "[info] sudo-self ExecStart NOT active (reason=${SUDO_SELF_REASON})"
+  # #1228 (v0.15.0-beta4): when the install drops back to legacy direct
+  # ExecStart (sudoers drop-in absent, probe failed, or operator opted
+  # out), emit a loud warning + audit row so operators see the structural
+  # state instead of the prior silent fallback. The probe fix above
+  # eliminates the false-negative on hosts with root-only /etc/sudoers.d/,
+  # but legitimate legacy installs (no sudoers drop-in installed) still
+  # land here — and they deserve a clear signal that supp-group refresh
+  # won't auto-recover.
+  echo "[warn] sudo-self ExecStart NOT active (reason=${SUDO_SELF_REASON}) — daemon supplementary-group refresh will NOT cross PAM on restart. Run 'agent-bridge init sudoers daemon-refresh --apply' to enable auto-refresh." >&2
+  # Best-effort audit emit — non-fatal on hosts where the audit helper
+  # is unavailable (e.g. install-daemon-systemd.sh invoked standalone).
+  if command -v bridge_audit_log >/dev/null 2>&1; then
+    bridge_audit_log install systemd_unit_legacy_fallback "${CONTROLLER_USER:-unknown}" \
+      --detail reason="$SUDO_SELF_REASON" \
+      --detail service_path="$SERVICE_PATH" \
+      2>/dev/null || true
+  fi
 fi
 
 if [[ $ENABLE -eq 1 ]]; then
@@ -292,12 +332,24 @@ if [[ $ENABLE -eq 1 ]]; then
   systemctl --user enable --now "$UNIT_NAME"
   if systemctl --user is-active --quiet "$UNIT_NAME"; then
     systemctl --user restart "$UNIT_NAME"
-    echo "[info] restarted active systemd user unit to pick up new ExecStart"
+    echo "[info] restarted active systemd user unit to pick up new ExecStart" >&2
   fi
-  echo "[info] enabled systemd user unit: $UNIT_NAME"
-  echo "[info] inspect with: systemctl --user status $UNIT_NAME"
+  echo "[info] enabled systemd user unit: $UNIT_NAME" >&2
+  echo "[info] inspect with: systemctl --user status $UNIT_NAME" >&2
 fi
 
-echo "[info] bridge_home: $BRIDGE_HOME_TARGET"
-echo "[info] log_path: $LOG_PATH"
-echo "[info] service_path: $SERVICE_PATH"
+echo "[info] bridge_home: $BRIDGE_HOME_TARGET" >&2
+echo "[info] log_path: $LOG_PATH" >&2
+echo "[info] service_path: $SERVICE_PATH" >&2
+
+# #1228 (v0.15.0-beta4): emit a machine-parseable mode keyword so
+# bridge-init.sh can render the operator-facing message accurately
+# (sudo-self vs legacy) instead of unconditionally printing
+# "regenerated (sudo-self) and restarted" — which lied on every install
+# where probe_sudo_self_refresh returned 1 (essentially every Debian /
+# Ubuntu / RHEL host before the glob fix above).
+if [[ $SUDO_SELF_ACTIVE -eq 1 ]]; then
+  echo "mode=sudo-self" >&2
+else
+  echo "mode=legacy" >&2
+fi
