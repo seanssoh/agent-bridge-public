@@ -232,8 +232,25 @@ bridge_isolation_v2_backfill_workdir_identity() {
     # `isolation reconcile --apply` pass. The helper short-circuits on
     # non-Linux hosts and on shared-mode agents, so the call stays a
     # no-op outside the iso v2 contract.
-    if (( ${#writes_for_agent[@]} > 0 )) \
-        && declare -F bridge_isolation_v2_normalize_workdir_profile_group >/dev/null 2>&1; then
+    #
+    # #1297 (v0.15.0-beta5 Lane α): the normalize call must run for
+    # EVERY iso v2 agent on every backfill pass, NOT only when this
+    # pass copied at least one new marker. The beta3 → beta4 upgrade
+    # surface was: workdir profile files already existed (written by
+    # agent sessions on beta3 at `0600 iso-uid:controller-gid`), so the
+    # copy loop above performed zero writes — and the normalize was
+    # skipped behind the writes-this-pass gate. Existing files stayed
+    # at 0600 → bridge-start.sh's grep on CLAUDE.md failed EACCES on
+    # `agent restart` → restart + rollback both failed → agent stopped.
+    #
+    # The normalize helper is itself idempotent: it gates on
+    # `bridge_isolation_v2_enforce` (Linux-iso-v2 only) and on the
+    # agent-group resolver returning a non-empty group; once files are
+    # at `0660 iso-uid:ab-agent-<a>` a re-run is a no-op chgrp/chmod
+    # to the same target. Pull the call out of the writes-this-pass
+    # gate so existing-files-only agents are also fixed at upgrade
+    # time without a manual `isolation reconcile --apply` pass.
+    if declare -F bridge_isolation_v2_normalize_workdir_profile_group >/dev/null 2>&1; then
       bridge_isolation_v2_normalize_workdir_profile_group "$agent" "$workspace_dir" \
         >/dev/null 2>&1 || true
     fi
