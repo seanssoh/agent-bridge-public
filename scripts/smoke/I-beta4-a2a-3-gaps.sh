@@ -468,6 +468,185 @@ fi
 smoke_log "T_stuck_task_create_failure_preserves_ledger PASS — failed task-create preserves ledger, next scan retries, teeth bites"
 
 # ---------------------------------------------------------------------
+# T_daemon_scan_tick_handles_create_failure — v0.15.0-beta4 Lane I r3
+# (codex r2 TEST GAP).
+#
+# Contract: exercise the actual production `process_a2a_outbox_stuck_scan_tick`
+# shell function from bridge-daemon.sh — not just the python helpers —
+# under a controlled `task create` failure, then re-run under success.
+#
+# Mocks:
+#   - `bridge-a2a.py outbox list --json` → fixture file (driver overrides
+#     `bridge_with_timeout` for label `a2a_outbox_list`).
+#   - `$BRIDGE_HOME/agent-bridge task create` → wrapper shim whose rc
+#     reads from `BRIDGE_A2A_TEST_TASK_CREATE_RC` (0/1) per tick. Daemon
+#     prefers `$BRIDGE_HOME/agent-bridge` over `$SCRIPT_DIR/agent-bridge`
+#     (bridge-daemon.sh:2342-2349), so the shim wins.
+#
+# Acceptance (r3 codex r2 TEST GAP closure):
+#   1. tick #1 with task_create rc=1:
+#        - decide emits the stuck row
+#        - daemon's task-create branch fails
+#        - daemon_warn at bridge-daemon.sh:2468 fires
+#          ("task-create failed for stuck …")
+#        - ack helper runs with EMPTY ack-keys (production line 2456
+#          appends ONLY inside the success branch) → ledger remains
+#          unstamped for the stuck message_id
+#        - throttle: next scan must NOT be skipped (we manually clear
+#          tick_state between runs to keep the test deterministic)
+#   2. tick #2 with task_create rc=0 (mock toggled, throttle state
+#      cleared, retry-after window honored implicitly since we control
+#      `BRIDGE_A2A_STUCK_ALERT_SCAN_INTERVAL_SECONDS=0` would skip the
+#      tick — instead we remove the tick_state file between runs):
+#        - decide emits the same stuck row (ledger never stamped)
+#        - daemon's task-create branch succeeds
+#        - ack helper stamps the ledger
+#        - ledger NOW carries `"msg-stuck-real-001"`
+#
+# Teeth (regression vectors documented + exercised by tick #1):
+#   V1. Move bridge-daemon.sh:2456 (`printf '%s\n' "$message_id" >>
+#       "$ack_tmp"`) OUTSIDE the success branch (i.e. unconditionally
+#       after the if-else). The smoke will then see ledger stamped on
+#       failure → tick #2's pre-condition `ledger empty` fails →
+#       assertion fires.
+#   V2. Reorder helper calls so `a2a-stuck-ack` runs BEFORE the
+#       task-create loop (or the loop appends to ack_tmp before the
+#       success rc is known). Same shape — ledger stamped on failure
+#       → assertion fires.
+#
+# Both vectors fail the same assertion: tick #1 must leave the ledger
+# empty for `msg-stuck-real-001`.
+# ---------------------------------------------------------------------
+
+smoke_log "T_daemon_scan_tick_handles_create_failure: daemon function with mocked task-create"
+
+DAEMON_TEST_HOME="$SMOKE_TMP_ROOT/daemon-test"
+mkdir -p "$DAEMON_TEST_HOME/state/handoff"
+DAEMON_TEST_CONFIG="$DAEMON_TEST_HOME/handoff.local.json"
+# Daemon function gates on existence of handoff.local.json (production
+# behavior — see bridge-daemon.sh:2301-2302). Content not parsed by this
+# function; a stub object is fine.
+printf '{"version":1,"peers":[]}\n' >"$DAEMON_TEST_CONFIG"
+
+# Outbox fixture: one row that is stuck (status=retry, age over threshold).
+DAEMON_TEST_OUTBOX="$SMOKE_TMP_ROOT/daemon-test-outbox.json"
+cat >"$DAEMON_TEST_OUTBOX" <<'JSON'
+[
+  {"message_id": "msg-stuck-real-001", "peer": "bridge-b", "target_agent": "reviewer", "priority": "normal", "status": "retry", "attempts": 3, "next_attempt_ts": 0, "last_error": "transport: peer unreachable", "acked_remote_task_id": null, "created_ts": 1000, "updated_ts": 1100, "lease_expires_ts": 0, "age_seconds": 10000, "due_for_seconds": 9000, "next_attempt_in_seconds": null, "lease_stale_seconds": null}
+]
+JSON
+
+# Mock agent-bridge shim. Daemon prefers $BRIDGE_HOME/agent-bridge over
+# $SCRIPT_DIR/agent-bridge (see daemon function, lines 2342-2349). Reads
+# rc from $BRIDGE_A2A_TEST_TASK_CREATE_RC.
+DAEMON_TEST_AGB_SHIM="$DAEMON_TEST_HOME/agent-bridge"
+cat >"$DAEMON_TEST_AGB_SHIM" <<'SHIM'
+#!/usr/bin/env bash
+# Mock for v0.15.0-beta4 Lane I r3 smoke. Returns rc from env var.
+rc="${BRIDGE_A2A_TEST_TASK_CREATE_RC:-0}"
+case "${1:-}" in
+  task)
+    if [[ "$rc" == "1" ]]; then
+      printf 'mock-agent-bridge: task create failed (BRIDGE_A2A_TEST_TASK_CREATE_RC=1)\n' >&2
+      exit 1
+    fi
+    exit 0
+    ;;
+  *)
+    # Any other subcommand: no-op success.
+    exit 0
+    ;;
+esac
+SHIM
+chmod +x "$DAEMON_TEST_AGB_SHIM"
+
+DAEMON_TEST_WARN_LOG="$SMOKE_TMP_ROOT/daemon-test-warn.log"
+DAEMON_TEST_EVENT_LOG="$SMOKE_TMP_ROOT/daemon-test-event.log"
+: >"$DAEMON_TEST_WARN_LOG"
+: >"$DAEMON_TEST_EVENT_LOG"
+
+DAEMON_TEST_LEDGER="$DAEMON_TEST_HOME/state/handoff/stuck-alerts.json"
+DAEMON_TEST_TICK="$DAEMON_TEST_HOME/state/handoff/stuck-scan-tick.env"
+
+# Driver script — invokes the actual production
+# process_a2a_outbox_stuck_scan_tick function from bridge-daemon.sh
+# with mocks for `bridge-a2a.py outbox list --json` and `agent-bridge
+# task create`. See run-stuck-scan-tick.sh for the mock contract.
+DAEMON_TEST_DRIVER="$REPO_ROOT/scripts/smoke/I-beta4-helpers/run-stuck-scan-tick.sh"
+if [[ ! -x "$DAEMON_TEST_DRIVER" ]]; then
+  smoke_fail "T_daemon_scan_tick_handles_create_failure: missing driver $DAEMON_TEST_DRIVER"
+fi
+
+# Tick #1 — task_create rc=1 (failure path).
+rm -f "$DAEMON_TEST_TICK" "$DAEMON_TEST_LEDGER"
+env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
+  SCRIPT_DIR="$REPO_ROOT" \
+  BRIDGE_HOME="$DAEMON_TEST_HOME" \
+  BRIDGE_STATE_DIR="$DAEMON_TEST_HOME/state" \
+  BRIDGE_A2A_CONFIG="$DAEMON_TEST_CONFIG" \
+  BRIDGE_ADMIN_AGENT_ID="patch-test" \
+  BRIDGE_A2A_STUCK_ALERT_SCAN_INTERVAL_SECONDS=300 \
+  BRIDGE_A2A_STUCK_ALERT_SECS=600 \
+  BRIDGE_A2A_STUCK_ALERT_REEMIT_SECS=3600 \
+  BRIDGE_A2A_TEST_OUTBOX_JSON="$DAEMON_TEST_OUTBOX" \
+  BRIDGE_A2A_TEST_TASK_CREATE_RC=1 \
+  BRIDGE_A2A_TEST_WARN_LOG="$DAEMON_TEST_WARN_LOG" \
+  BRIDGE_A2A_TEST_EVENT_LOG="$DAEMON_TEST_EVENT_LOG" \
+  bash "$DAEMON_TEST_DRIVER" \
+    >"$SMOKE_TMP_ROOT/daemon-test-tick1.out" 2>"$SMOKE_TMP_ROOT/daemon-test-tick1.err" || true
+
+# Assert 1: daemon_warn at bridge-daemon.sh:2468 fired ("task-create failed").
+if ! grep -F '[a2a_stuck_scan] task-create failed for stuck msg-stuck-real-001' \
+     "$DAEMON_TEST_WARN_LOG" >/dev/null; then
+  smoke_fail "T_daemon_scan_tick_handles_create_failure: tick #1 did not emit task-create-failed warn (warn log: $(cat "$DAEMON_TEST_WARN_LOG"); stderr: $(cat "$SMOKE_TMP_ROOT/daemon-test-tick1.err"))"
+fi
+
+# Assert 2: ledger unstamped for msg-stuck-real-001 (production code path:
+# line 2456 only appends to ack_tmp inside the success branch).
+if [[ ! -f "$DAEMON_TEST_LEDGER" ]]; then
+  smoke_fail "T_daemon_scan_tick_handles_create_failure: tick #1 did not create ledger file"
+fi
+if grep -F 'msg-stuck-real-001' "$DAEMON_TEST_LEDGER" >/dev/null; then
+  smoke_fail "T_daemon_scan_tick_handles_create_failure: tick #1 stamped ledger despite task-create failure — regression of bridge-daemon.sh:2456 ack_tmp-append-on-success contract (ledger: $(cat "$DAEMON_TEST_LEDGER"))"
+fi
+
+smoke_log "T_daemon_scan_tick_handles_create_failure tick #1 PASS — warn emitted, ledger unstamped on rc=1"
+
+# Tick #2 — task_create rc=0 (success path). Clear throttle so the
+# function runs again rather than gating on `now < next`.
+rm -f "$DAEMON_TEST_TICK"
+env -i HOME="$HOME" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}" \
+  SCRIPT_DIR="$REPO_ROOT" \
+  BRIDGE_HOME="$DAEMON_TEST_HOME" \
+  BRIDGE_STATE_DIR="$DAEMON_TEST_HOME/state" \
+  BRIDGE_A2A_CONFIG="$DAEMON_TEST_CONFIG" \
+  BRIDGE_ADMIN_AGENT_ID="patch-test" \
+  BRIDGE_A2A_STUCK_ALERT_SCAN_INTERVAL_SECONDS=300 \
+  BRIDGE_A2A_STUCK_ALERT_SECS=600 \
+  BRIDGE_A2A_STUCK_ALERT_REEMIT_SECS=3600 \
+  BRIDGE_A2A_TEST_OUTBOX_JSON="$DAEMON_TEST_OUTBOX" \
+  BRIDGE_A2A_TEST_TASK_CREATE_RC=0 \
+  BRIDGE_A2A_TEST_WARN_LOG="$DAEMON_TEST_WARN_LOG" \
+  BRIDGE_A2A_TEST_EVENT_LOG="$DAEMON_TEST_EVENT_LOG" \
+  bash "$DAEMON_TEST_DRIVER" \
+    >"$SMOKE_TMP_ROOT/daemon-test-tick2.out" 2>"$SMOKE_TMP_ROOT/daemon-test-tick2.err" || true
+
+# Assert 3: ledger NOW stamped for msg-stuck-real-001 (success branch
+# ran ack_tmp append → ack helper stamped ledger).
+if ! grep -F 'msg-stuck-real-001' "$DAEMON_TEST_LEDGER" >/dev/null; then
+  smoke_fail "T_daemon_scan_tick_handles_create_failure: tick #2 did NOT stamp ledger after rc=0 — regression of success-branch ack contract (ledger: $(cat "$DAEMON_TEST_LEDGER"); event log: $(cat "$DAEMON_TEST_EVENT_LOG"); stderr: $(cat "$SMOKE_TMP_ROOT/daemon-test-tick2.err"))"
+fi
+
+# Assert 4: event log shows the daemon's emitted-count line — confirms
+# task-create success path ran end-to-end.
+if ! grep -F '[a2a_stuck_scan] emitted 1 stuck-outbox admin task' "$DAEMON_TEST_EVENT_LOG" >/dev/null; then
+  smoke_fail "T_daemon_scan_tick_handles_create_failure: tick #2 did not log success emission (event log: $(cat "$DAEMON_TEST_EVENT_LOG"))"
+fi
+
+smoke_log "T_daemon_scan_tick_handles_create_failure tick #2 PASS — ledger stamped on rc=0 follow-up"
+smoke_log "T_daemon_scan_tick_handles_create_failure PASS — daemon scan-tick honors task-create rc on success-branch-only ack-append contract"
+
+# ---------------------------------------------------------------------
 # Teeth — verify the helper truly fails to emit when key field is wrong.
 # ---------------------------------------------------------------------
 
