@@ -199,7 +199,23 @@ def _sudo_read_text(path: Path) -> str | None:
 def cmd_send(args: argparse.Namespace) -> int:
     try:
         cfg = a2a.load_config()
+        # #1331: fail-closed at send time too — surface the empty-secret
+        # misconfiguration immediately, not only when the delivery runner
+        # dead-letters the row. The peer-pair-narrow check below (after
+        # `find_peer`) catches the more specific "this peer has no secret"
+        # case so the operator sees the actionable error against the peer
+        # they're trying to send to. The paired insecure-bind env vars are
+        # honored — the helper itself enforces the paired flag.
+        a2a.validate_config_peer_secrets(cfg, side="sender")
         peer = a2a.find_peer(cfg, args.peer)
+        # Narrow check against the destination peer (covers the case
+        # where ONLY this peer is missing a secret and the global check
+        # was overridden by the test-bypass env pair).
+        try:
+            a2a.peer_send_secret(peer)
+        except a2a.A2AError:
+            if not a2a._allow_insecure_no_secret():
+                raise
     except a2a.A2AError as exc:
         return die(str(exc)) or 1
 
@@ -719,6 +735,12 @@ def _mark_dead(conn, message_id: str, reason: str) -> None:
 def cmd_deliver(args: argparse.Namespace) -> int:
     try:
         cfg = a2a.load_config()
+        # #1331: refuse to drain the outbox if any peer is unprovisioned
+        # (paired test-bypass env vars still respected). Without this,
+        # rows targeted at the unprovisioned peer would dead-letter on
+        # the first attempt with no operator-visible warning until they
+        # ran `agb a2a outbox list`.
+        a2a.validate_config_peer_secrets(cfg, side="sender")
     except a2a.A2AError as exc:
         return die(str(exc)) or 1
 

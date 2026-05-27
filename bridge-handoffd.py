@@ -430,6 +430,21 @@ class HandoffHandler(BaseHTTPRequestHandler):
             return
 
         skew = int(cfg.get("timestamp_skew_seconds", a2a.DEFAULT_TIMESTAMP_SKEW_SECONDS))
+        # #1326: timestamps inside (skew, grace_skew] are treated as
+        # transient clock drift (503 + Retry-After). Beyond grace_skew the
+        # request is too old to be drift and is rejected as a permanent
+        # 401 (likely replay of a stale captured payload). The grace
+        # ceiling is configurable; the default is a conservative 1 hour
+        # which is wide enough to absorb DST / NTP step-corrections without
+        # accepting indefinitely-stale captures.
+        grace_skew = int(cfg.get(
+            "timestamp_skew_grace_seconds",
+            a2a.DEFAULT_TIMESTAMP_SKEW_GRACE_SECONDS,
+        ))
+        # Enforce a sane floor: grace cannot be less than skew (otherwise
+        # the transient band would be empty).
+        if grace_skew < skew:
+            grace_skew = skew
         receiver_now = a2a.now_ts()
         try:
             req_ts = int(timestamp)
@@ -437,13 +452,48 @@ class HandoffHandler(BaseHTTPRequestHandler):
             audit("reject_bad_timestamp", peer=peer_id, client=client_ip, security=True)
             self._reply(401, {"ok": False, "error": "bad timestamp"})
             return
-        if abs(receiver_now - req_ts) > skew:
-            audit("reject_clock_skew", peer=peer_id, client=client_ip,
-                  request_ts=req_ts, receiver_ts=receiver_now, skew_limit=skew,
-                  security=True)
+        ts_delta = abs(receiver_now - req_ts)
+        if ts_delta > grace_skew:
+            # Too old to be clock drift — keep edge-case 1 closed: a
+            # malicious replay of a long-stale capture still maps to 401
+            # (permanent, dead-letter on sender). The audit row records
+            # the security=True flag for SIEM filters.
+            audit("reject_clock_skew_permanent",
+                  peer=peer_id, client=client_ip,
+                  request_ts=req_ts, receiver_ts=receiver_now,
+                  skew_limit=skew, grace_skew=grace_skew,
+                  delta_seconds=ts_delta, security=True)
             self._reply(401, {"ok": False,
-                              "error": "timestamp outside skew window",
-                              "receiver_ts": receiver_now})
+                              "error": ("timestamp far outside skew window — "
+                                        "rejected as permanent (possible "
+                                        "stale capture / replay)"),
+                              "receiver_ts": receiver_now,
+                              "skew_limit_seconds": skew,
+                              "grace_skew_seconds": grace_skew})
+            return
+        if ts_delta > skew:
+            # Narrow drift band: 503 transient so the sender retries
+            # after clock-sync rather than dead-lettering.
+            audit("reject_clock_skew_transient",
+                  peer=peer_id, client=client_ip,
+                  request_ts=req_ts, receiver_ts=receiver_now,
+                  skew_limit=skew, grace_skew=grace_skew,
+                  delta_seconds=ts_delta)
+            self._reply(
+                503,
+                {"ok": False,
+                 "error": ("timestamp outside skew window — retry after "
+                           "clock-sync (receiver_ts gives current server "
+                           "time)"),
+                 "receiver_ts": receiver_now,
+                 "skew_limit_seconds": skew,
+                 "grace_skew_seconds": grace_skew},
+                # Retry-After matches the configured skew so the sender
+                # waits at least that long before the next attempt — by
+                # then the operator has either NTP-synced or the drift
+                # has stayed put and the next attempt will still 503.
+                extra_headers={"Retry-After": str(max(1, skew))},
+            )
             return
 
         canonical = a2a.canonical_string(
@@ -627,6 +677,16 @@ class HandoffHandler(BaseHTTPRequestHandler):
 def cmd_preflight(args: argparse.Namespace) -> int:
     try:
         cfg = a2a.load_config(Path(args.config) if args.config else None)
+        # #1331: refuse to certify a config carrying an unprovisioned peer.
+        # Audited so the operator sees the bypass when test-mode is on.
+        try:
+            a2a.validate_config_peer_secrets(cfg, side="receiver")
+        except a2a.A2AError as exc:
+            audit("startup_fail", code=exc.code, detail=str(exc)[:300])
+            raise
+        if a2a._allow_insecure_no_secret():
+            audit("insecure_secret_bypass", side="receiver", phase="preflight",
+                  security=True)
         bind, port = resolve_bind(cfg)
     except a2a.A2AError as exc:
         print(f"[handoffd][preflight] FAIL: {exc} ({exc.code})", file=sys.stderr)
@@ -674,6 +734,17 @@ def _detach_into_own_session() -> None:
 def cmd_serve(args: argparse.Namespace) -> int:
     try:
         cfg = a2a.load_config(Path(args.config) if args.config else None)
+        # #1331: refuse to start the daemon if any peer has no secret —
+        # the per-request `reject_no_secret` 403 path covers an empty
+        # secret slipping past load, but a startup gate makes the
+        # misconfiguration visible BEFORE the daemon starts accepting
+        # untrusted remote traffic. The paired BRIDGE_A2A_DEV_INSECURE_BIND
+        # + BRIDGE_A2A_ALLOW_TEST_BIND escape hatch is the only way to
+        # silence the gate; we audit that bypass so it cannot be quiet.
+        a2a.validate_config_peer_secrets(cfg, side="receiver")
+        if a2a._allow_insecure_no_secret():
+            audit("insecure_secret_bypass", side="receiver", phase="serve",
+                  security=True)
         bind, port = resolve_bind(cfg)
     except a2a.A2AError as exc:
         log(f"FATAL: {exc} ({exc.code})")

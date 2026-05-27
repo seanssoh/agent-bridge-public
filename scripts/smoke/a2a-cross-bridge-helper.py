@@ -171,6 +171,15 @@ def main(argv: list[str]) -> int:
         env = envelope("bridge-a:skew-1", "reviewer", "stale", "x")
         status, text = post(url=url, path=path, peer_id=peer_id, secret=secret,
                              envelope=env, timestamp_override="100")
+    elif scenario == "skew-drift":
+        # #1326: timestamp inside the narrow drift band (>skew, <=grace)
+        # → 503 transient. Default skew=300, grace=3600, so 900s in the
+        # past sits cleanly in the band on any host.
+        import time as _t
+        drift_ts = str(int(_t.time()) - 900)
+        env = envelope("bridge-a:skew-drift-1", "reviewer", "drift", "x")
+        status, text = post(url=url, path=path, peer_id=peer_id, secret=secret,
+                             envelope=env, timestamp_override=drift_ts)
     else:
         print(f"unknown scenario: {scenario}", file=sys.stderr)
         return 2
