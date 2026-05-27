@@ -2261,6 +2261,209 @@ process_a2a_deliver_tick() {
   return 0
 }
 
+# Issue #1262 Gap 3 (v0.15.0-beta4 Lane I, 2026-05-27): outbox stuck alerting.
+#
+# `process_a2a_deliver_tick` keeps the runner ticking, and the existing
+# `_schedule_retry` exponential-backoff path moves bad rows toward
+# `status='dead'` after `delivery_max_attempts`. What is still missing
+# is operator visibility for the "valid config, valid peer, but the
+# peer just is not reachable for a while" case: the runner keeps
+# retrying with growing backoff, and the row legitimately stays in
+# `status='retry'` for hours. The operator doesn't see anything go
+# wrong until they manually `agb a2a outbox list` — by then the
+# downstream peer might have lost context for what the message was
+# about.
+#
+# This tick scans the outbox once per
+# `BRIDGE_A2A_STUCK_ALERT_SCAN_INTERVAL_SECONDS` (default 300 = 5 min)
+# for rows that have been pending+retry-stuck longer than
+# `BRIDGE_A2A_STUCK_ALERT_SECS` (default 600 = 10 min, anchored on
+# `created_ts`). For each row that crosses the threshold, a task is
+# created for the admin agent. A per-message reemit guard
+# (`BRIDGE_A2A_STUCK_ALERT_REEMIT_SECS`, default 3600 = 1 h) prevents
+# the same row from re-emitting on every scan.
+#
+# No-ops silently when handoff.local.json is absent (no A2A install).
+# State (last scan + per-message last-alerted-ts ledger) lives under
+# `$BRIDGE_STATE_DIR/handoff/stuck-alerts.json` so the daemon can
+# survive restarts without re-spamming.
+process_a2a_outbox_stuck_scan_tick() {
+  local interval_str="${BRIDGE_A2A_STUCK_ALERT_SCAN_INTERVAL_SECONDS:-300}"
+  local interval
+  if [[ "$interval_str" =~ ^[0-9]+$ ]]; then
+    interval="$interval_str"
+  else
+    daemon_warn "[a2a_stuck_scan] invalid BRIDGE_A2A_STUCK_ALERT_SCAN_INTERVAL_SECONDS=$interval_str (must be a non-negative integer); skipping"
+    return 1
+  fi
+  (( interval == 0 )) && return 1
+
+  local config="${BRIDGE_A2A_CONFIG:-${BRIDGE_HOME:-$HOME/.agent-bridge}/handoff.local.json}"
+  [[ -f "$config" ]] || return 1
+
+  local stuck_secs="${BRIDGE_A2A_STUCK_ALERT_SECS:-600}"
+  local reemit_secs="${BRIDGE_A2A_STUCK_ALERT_REEMIT_SECS:-3600}"
+  if ! [[ "$stuck_secs" =~ ^[0-9]+$ ]]; then
+    daemon_warn "[a2a_stuck_scan] invalid BRIDGE_A2A_STUCK_ALERT_SECS=$stuck_secs; skipping"
+    return 1
+  fi
+  if ! [[ "$reemit_secs" =~ ^[0-9]+$ ]]; then
+    daemon_warn "[a2a_stuck_scan] invalid BRIDGE_A2A_STUCK_ALERT_REEMIT_SECS=$reemit_secs; skipping"
+    return 1
+  fi
+
+  local handoff_dir="$BRIDGE_STATE_DIR/handoff"
+  mkdir -p "$handoff_dir" 2>/dev/null || true
+  local tick_state="$handoff_dir/stuck-scan-tick.env"
+  local now next=0
+  now="$(date +%s)"
+  if [[ -f "$tick_state" ]]; then
+    # shellcheck source=/dev/null
+    # shellcheck disable=SC1090
+    source "$tick_state" 2>/dev/null || true
+    next="${A2A_STUCK_SCAN_NEXT_TS:-0}"
+  fi
+  if [[ "$next" =~ ^[0-9]+$ ]] && (( now < next )); then
+    return 1
+  fi
+
+  # Admin agent — the queue task target. If unset (init not yet
+  # completed), skip silently; the deliver tick already covers the case
+  # where A2A is half-configured.
+  local admin="${BRIDGE_ADMIN_AGENT_ID:-}"
+  if [[ -z "$admin" ]]; then
+    # Persist throttle state so the no-admin scan doesn't busy-spin.
+    printf 'A2A_STUCK_SCAN_LAST_TS=%s\nA2A_STUCK_SCAN_NEXT_TS=%s\nA2A_STUCK_SCAN_LAST_EMITTED=0\n' \
+      "$now" "$((now + interval))" >"$tick_state" 2>/dev/null || true
+    return 1
+  fi
+
+  # Live install's CLI preferred — see process_daily_backup_failure_task.
+  local target_bridge=""
+  if [[ -x "$BRIDGE_HOME/agent-bridge" ]]; then
+    target_bridge="$BRIDGE_HOME/agent-bridge"
+  elif [[ -x "$SCRIPT_DIR/agent-bridge" ]]; then
+    target_bridge="$SCRIPT_DIR/agent-bridge"
+  else
+    return 1
+  fi
+
+  # Ledger of last-alerted timestamps per message_id (JSON dict). A bash
+  # associative array would be ideal but we'd lose it across daemon
+  # restarts; the ledger file gives us durability.
+  local ledger_file="$handoff_dir/stuck-alerts.json"
+  if [[ ! -f "$ledger_file" ]]; then
+    printf '{}\n' >"$ledger_file" 2>/dev/null || true
+    chmod 0600 "$ledger_file" 2>/dev/null || true
+  fi
+
+  # Pull the outbox listing as JSON — this is the same `agb a2a outbox
+  # list --json` path the operator uses, so the row shape is the
+  # canonical one declared by bridge_a2a_common.py's _OUTBOX_SCHEMA +
+  # the cmd_outbox enrichment (age_seconds / due_for_seconds /
+  # next_attempt_in_seconds). Wrap with bridge_with_timeout so a hung
+  # SQLite cannot wedge the daemon. Write JSON to a tmp file rather than
+  # piping via $() — footgun #11 (Bash 5.3.9 here-string / heredoc-stdin
+  # wedge) recommends file-as-argv for any subprocess that may emit
+  # large output.
+  local list_tmp emit_tmp
+  list_tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-stuck-list.XXXXXX" 2>/dev/null)" || {
+    daemon_warn "[a2a_stuck_scan] mktemp failed; skipping"
+    return 1
+  }
+  emit_tmp="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-stuck-emit.XXXXXX" 2>/dev/null)" || {
+    rm -f "$list_tmp"
+    daemon_warn "[a2a_stuck_scan] mktemp failed; skipping"
+    return 1
+  }
+
+  local list_rc=0
+  bridge_with_timeout 30 a2a_outbox_list \
+    python3 "$SCRIPT_DIR/bridge-a2a.py" outbox list --json >"$list_tmp" 2>/dev/null || list_rc=$?
+  if (( list_rc != 0 )); then
+    daemon_warn "[a2a_stuck_scan] outbox list rc=$list_rc; skipping this tick"
+    rm -f "$list_tmp" "$emit_tmp"
+    printf 'A2A_STUCK_SCAN_LAST_TS=%s\nA2A_STUCK_SCAN_NEXT_TS=%s\nA2A_STUCK_SCAN_LAST_EMITTED=0\n' \
+      "$now" "$((now + interval))" >"$tick_state" 2>/dev/null || true
+    return 0
+  fi
+
+  # Parse + emit decisions in python3 — too much JSON+ledger logic to
+  # keep cleanly in bash. The helper writes one TSV row per row that
+  # needs an admin task:
+  #   message_id\tpeer\ttarget_agent\tstatus\tattempts\tage_seconds\tlast_error
+  # and rewrites the ledger file to reflect the new last-alerted-ts for
+  # each emitted row. Pass JSON via --outbox-json-file (path) rather
+  # than stdin — same footgun #11 reasoning.
+  bridge_with_timeout 10 a2a_stuck_decide \
+    python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" a2a-stuck-decide \
+      "$now" "$stuck_secs" "$reemit_secs" "$ledger_file" "$list_tmp" \
+      >"$emit_tmp" 2>/dev/null || true
+
+  # Each non-empty TSV line is one admin task to file. Iterate via file
+  # redirect (avoids `done <<<` heredoc_write wedge).
+  local emitted=0
+  while IFS=$'\t' read -r message_id peer target_agent status attempts age_seconds last_error; do
+    [[ -z "$message_id" ]] && continue
+    local body_file
+    body_file="$(mktemp "${TMPDIR:-/tmp}/bridge-a2a-stuck.md.XXXXXX" 2>/dev/null || printf '%s' "/tmp/bridge-a2a-stuck.$$.$RANDOM")"
+    {
+      printf '# A2A outbox entry stuck\n\n'
+      printf 'An outbound handoff has been waiting in the A2A outbox\n'
+      printf 'longer than the configured threshold without being\n'
+      printf 'acknowledged by the destination peer.\n\n'
+      printf '## Entry\n\n'
+      printf '- message_id: `%s`\n' "$message_id"
+      printf '- peer: `%s`\n' "$peer"
+      printf '- target_agent: `%s`\n' "$target_agent"
+      printf '- status: `%s`\n' "$status"
+      printf '- attempts: %s\n' "$attempts"
+      printf '- age: %ss\n' "$age_seconds"
+      if [[ -n "$last_error" ]]; then
+        printf '- last_error: `%s`\n' "$last_error"
+      fi
+      printf '\n## Next steps\n\n'
+      printf '1. Check `agb a2a outbox list` for context.\n'
+      printf '2. Run `agb a2a peers test %s` to probe reachability.\n' "$peer"
+      printf '3. If the peer is intentionally offline, drop the entry:\n'
+      printf '   `agb a2a outbox drop %s`.\n' "$message_id"
+      printf '4. Otherwise, requeue once the peer is back:\n'
+      printf '   `agb a2a outbox retry %s`.\n' "$message_id"
+      printf '\nThis alert will not re-emit for this entry within\n'
+      printf '`BRIDGE_A2A_STUCK_ALERT_REEMIT_SECS` (default 1h).\n'
+    } >"$body_file"
+
+    if "$target_bridge" task create \
+         --to "$admin" --priority high --from daemon \
+         --title "[A2A] outbox stuck: ${peer}:${target_agent} (${message_id:0:8})" \
+         --body-file "$body_file" >/dev/null 2>&1; then
+      emitted=$((emitted + 1))
+      bridge_audit_log daemon a2a_outbox_stuck_alert_emitted "$admin" \
+        --detail message_id="$message_id" \
+        --detail peer="$peer" \
+        --detail target_agent="$target_agent" \
+        --detail status="$status" \
+        --detail attempts="$attempts" \
+        --detail age_seconds="$age_seconds" >/dev/null 2>&1 || true
+    else
+      daemon_warn "[a2a_stuck_scan] failed to file admin task for stuck $message_id"
+    fi
+    rm -f "$body_file" 2>/dev/null || true
+  done <"$emit_tmp"
+
+  rm -f "$list_tmp" "$emit_tmp" 2>/dev/null || true
+
+  if (( emitted > 0 )); then
+    daemon_log_event "[a2a_stuck_scan] emitted $emitted stuck-outbox admin task(s)"
+  fi
+
+  # Persist throttle state. The helper has already rewritten the ledger
+  # with the new last-alerted-ts entries.
+  printf 'A2A_STUCK_SCAN_LAST_TS=%s\nA2A_STUCK_SCAN_NEXT_TS=%s\nA2A_STUCK_SCAN_LAST_EMITTED=%s\n' \
+    "$now" "$((now + interval))" "$emitted" >"$tick_state" 2>/dev/null || true
+  return 0
+}
+
 process_release_monitor() {
   local admin_agent="${BRIDGE_ADMIN_AGENT_ID:-}"
   local monitor_json=""
@@ -7247,6 +7450,15 @@ cmd_sync_cycle() {
   # done) and before nudge_agents (the cycle's last big external fanout).
   BRIDGE_DAEMON_LAST_STEP="a2a_deliver_tick"
   process_a2a_deliver_tick || true
+
+  # Issue #1262 Gap 3 (v0.15.0-beta4 Lane I): A2A outbox stuck-alert
+  # scan. Pairs with the deliver tick above — when a row stays in
+  # pending/retry past BRIDGE_A2A_STUCK_ALERT_SECS (default 600s), we
+  # file an admin task so the operator sees the stall without polling
+  # `agb a2a outbox list`. Throttled by
+  # BRIDGE_A2A_STUCK_ALERT_SCAN_INTERVAL_SECONDS (default 300s).
+  BRIDGE_DAEMON_LAST_STEP="a2a_stuck_scan_tick"
+  process_a2a_outbox_stuck_scan_tick || true
 
   BRIDGE_DAEMON_LAST_STEP="nudge_agents"
   printf '%s\n' "$nudge_output" > "$_nudge_tmp"

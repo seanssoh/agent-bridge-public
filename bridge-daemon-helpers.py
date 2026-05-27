@@ -594,6 +594,146 @@ def cmd_sync_aliveness_parse(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_a2a_stuck_decide(args: argparse.Namespace) -> int:
+    """Original site: bridge-daemon.sh process_a2a_outbox_stuck_scan_tick.
+
+    Issue #1262 Gap 3 (v0.15.0-beta4 Lane I, 2026-05-27).
+
+    Decide which outbox rows have been stuck long enough to deserve an
+    admin task, honoring the per-message re-emit cooldown ledger.
+
+    Input:
+      now            — current epoch seconds (int)
+      stuck_secs     — threshold (row.age_seconds > this → candidate)
+      reemit_secs    — re-emit cooldown per message_id
+      ledger_path    — JSON file: { message_id: last_emitted_ts }
+      outbox_json_path — JSON array from `agb a2a outbox list --json`
+
+    Output (stdout, one TSV row per row to alert):
+      message_id \\t peer \\t target_agent \\t status \\t attempts \\t
+      age_seconds \\t last_error
+
+    Side effect: rewrites `ledger_path` with the updated
+    last-emitted-ts for each row we just decided to alert on. Rows
+    that no longer appear in the outbox (peer drop, gc) are pruned so
+    the ledger does not grow unboundedly.
+
+    Errors are swallowed (return 0 with no output) — the daemon tick
+    must not crash on a malformed ledger or JSON parse failure;
+    operator visibility through audit + log is the recovery path.
+    """
+    try:
+        now = int(args.now)
+        stuck_secs = int(args.stuck_secs)
+        reemit_secs = int(args.reemit_secs)
+    except Exception:
+        return 0
+
+    ledger_path = args.ledger_path
+    outbox_json_path = args.outbox_json_path
+
+    ledger: dict = {}
+    try:
+        with open(ledger_path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict):
+            for k, v in data.items():
+                try:
+                    ledger[str(k)] = int(v)
+                except Exception:
+                    continue
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        ledger = {}
+
+    try:
+        with open(outbox_json_path, "r", encoding="utf-8") as fh:
+            rows = json.load(fh)
+        if not isinstance(rows, list):
+            rows = []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        rows = []
+
+    # `age_seconds` is enriched by bridge-a2a.py cmd_outbox already; we
+    # fall back to (now - created_ts) when the field is absent so the
+    # helper stays robust to upstream shape drift.
+    seen_ids = set()
+    emitted_now = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        message_id = str(row.get("message_id") or "")
+        if not message_id:
+            continue
+        seen_ids.add(message_id)
+        status = str(row.get("status") or "")
+        # Only pending/retry rows are alert-worthy. acked = success,
+        # sending = currently being attempted, dead = the retry loop
+        # already gave up — separate signal not to confuse with stuck.
+        if status not in ("pending", "retry"):
+            continue
+        try:
+            age = int(row.get("age_seconds") or 0)
+        except Exception:
+            age = 0
+        if age <= 0:
+            try:
+                created_ts = int(row.get("created_ts") or 0)
+            except Exception:
+                created_ts = 0
+            if created_ts > 0:
+                age = max(0, now - created_ts)
+        if age < stuck_secs:
+            continue
+        last_emit = ledger.get(message_id, 0)
+        if last_emit and (now - last_emit) < reemit_secs:
+            continue
+        emitted_now.append({
+            "message_id": message_id,
+            "peer": str(row.get("peer") or ""),
+            "target_agent": str(row.get("target_agent") or ""),
+            "status": status,
+            "attempts": int(row.get("attempts") or 0),
+            "age_seconds": age,
+            "last_error": str(row.get("last_error") or "").replace("\t", " ").replace("\n", " "),
+        })
+
+    for r in emitted_now:
+        print(
+            f"{r['message_id']}\t{r['peer']}\t{r['target_agent']}\t"
+            f"{r['status']}\t{r['attempts']}\t{r['age_seconds']}\t{r['last_error']}"
+        )
+
+    # Update ledger: stamp emitted rows, prune entries for message_ids
+    # no longer in the outbox (peer-drop or gc).
+    new_ledger = {}
+    for k, v in ledger.items():
+        if k in seen_ids:
+            new_ledger[k] = v
+    for r in emitted_now:
+        new_ledger[str(r["message_id"])] = now
+
+    # Atomic rewrite — tmp-write + os.replace so a crash mid-write
+    # cannot leave the ledger in a half-state.
+    try:
+        import os
+        import tempfile
+        ledger_dir = os.path.dirname(ledger_path) or "."
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=ledger_dir,
+            prefix=".stuck-alerts.", suffix=".tmp", delete=False,
+        ) as tmp:
+            json.dump(new_ledger, tmp, ensure_ascii=False)
+            tmp_path = tmp.name
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, ledger_path)
+    except OSError:
+        # Ledger update failure is non-fatal — worst case is a
+        # duplicate alert next tick (cooldown not respected once).
+        pass
+
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # CLI plumbing.
 # ---------------------------------------------------------------------------
@@ -697,6 +837,19 @@ SUBCOMMANDS = {
         cmd_sync_aliveness_parse,
         [("sync_json", "JSON envelope from bridge-auth.sh claude-token sync --json")],
         "Per-agent aliveness/remaining_ms (3 tab-separated cols / row). Empty on parse failure.",
+    ),
+    # Issue #1262 Gap 3 (v0.15.0-beta4 Lane I): outbox stuck-alert
+    # decision helper. See cmd_a2a_stuck_decide.
+    "a2a-stuck-decide": (
+        cmd_a2a_stuck_decide,
+        [
+            ("now", "current epoch seconds (int)"),
+            ("stuck_secs", "row.age_seconds threshold above which the row is candidate"),
+            ("reemit_secs", "per-message re-emit cooldown in seconds"),
+            ("ledger_path", "JSON file recording last-emitted-ts per message_id"),
+            ("outbox_json_path", "JSON file containing `agb a2a outbox list --json` output"),
+        ],
+        "One tab-separated row per stuck row that crossed the threshold and cooldown.",
     ),
 }
 
