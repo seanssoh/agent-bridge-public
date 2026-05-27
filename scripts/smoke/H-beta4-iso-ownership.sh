@@ -530,4 +530,279 @@ else
   smoke_log "T_canonical runtime: skipped — non-Linux host (canonical helpers' Linux branch is what --all runs against on the operator host)"
 fi
 
-smoke_log "all tests PASS — Lane H (#1278 + #1208 + #1215 cross-check + r2 canonical helpers) verified at current source"
+# ---------------------------------------------------------------------
+# T_audit_executes_against_bad_fixture — codex r2 BLOCKING.
+#
+# The prior R1/R2 only validated audit script existence + syntax + grep
+# path-name refs. Codex r2 reproduced the actual silent-OK bug by
+# constructing a fixture workdir with `root:wrong 0700` root and
+# `.ms365/.env root:wrong 0600` then running the audit — it returned
+# rc=0 stderr "OK" because no code path stats the workdir root, and the
+# .env check only compared mode.
+#
+# This T_audit_executes_against_bad_fixture sub-test re-creates that
+# exact fixture and runs the patched audit against it, asserting:
+#
+#   - audit exits rc=1
+#   - violation row emitted for the workdir root (wrong owner + wrong
+#     mode 0700, expected 2770)
+#   - violation row emitted for the .env (wrong owner, even at 0600)
+#
+# Seam: a temp bin dir with fake `sudo`, `getent`, and `stat` shims is
+# prepended to PATH. The fake `sudo` consults a JSON map of
+# path-to-`owner:group:mode` for stat queries, falls through to real
+# filesystem for `test -d` / `test -e`, and forwards everything else.
+# The fake `getent passwd <user>` reads from a local passwd file the
+# smoke writes. The fake `stat` shim supports `-c '%a'` and
+# `-c '%U:%G'`. `BRIDGE_AUDIT_TEST_FORCE_LINUX=1` keeps the audit's
+# `uname -s` early-exit from short-circuiting on macOS dev hosts.
+# ---------------------------------------------------------------------
+
+smoke_log "T_audit_executes_against_bad_fixture: audit detects bad workdir root + .env on synthetic fixture (codex r2 BLOCKING)"
+
+FIXTURE_ROOT="$SMOKE_TMP_ROOT/audit-fixture"
+FIXTURE_BIN="$FIXTURE_ROOT/bin"
+FIXTURE_BRIDGE_HOME="$FIXTURE_ROOT/bridge-home"
+FIXTURE_DATA_ROOT="$FIXTURE_ROOT/data"
+FIXTURE_AGENT="testagent"
+FIXTURE_ISO_USER="agent-bridge-${FIXTURE_AGENT}"
+FIXTURE_AGENT_GROUP="ab-agent-${FIXTURE_AGENT}"
+FIXTURE_WORKDIR="$FIXTURE_DATA_ROOT/agents/$FIXTURE_AGENT/workdir"
+FIXTURE_MS365_DIR="$FIXTURE_WORKDIR/.ms365"
+FIXTURE_ENV_FILE="$FIXTURE_MS365_DIR/.env"
+FIXTURE_STAT_JSON="$FIXTURE_ROOT/stat-map.json"
+FIXTURE_PASSWD="$FIXTURE_ROOT/passwd"
+FIXTURE_AUDIT_LOG="$FIXTURE_ROOT/audit-output.log"
+
+mkdir -p "$FIXTURE_BIN" "$FIXTURE_BRIDGE_HOME" "$FIXTURE_DATA_ROOT" "$FIXTURE_MS365_DIR"
+printf 'TOKEN=x\n' > "$FIXTURE_ENV_FILE"
+chmod 0700 "$FIXTURE_WORKDIR"   # wrong mode for root (canonical is 2770)
+chmod 0600 "$FIXTURE_ENV_FILE"  # correct mode for .env, but owner will be wrong
+
+# Stat map: workdir root reports root:wrong 0700 (no setgid, wrong owner
+# + group). .ms365 reports correct iso_user:agent_group 2770 so the
+# audit doesn't trip on the channel-dir check (we want the workdir-root
+# + .env violations to be the ones surfaced). .env reports root:wrong
+# 0600 — mode is "correct" but owner+group are wrong (the bug class).
+cat > "$FIXTURE_STAT_JSON" <<EOF_STAT
+{
+  "$FIXTURE_WORKDIR": "root:wrong:700",
+  "$FIXTURE_MS365_DIR": "$FIXTURE_ISO_USER:$FIXTURE_AGENT_GROUP:2770",
+  "$FIXTURE_ENV_FILE": "root:wrong:600"
+}
+EOF_STAT
+
+# Fake passwd line so `getent passwd <iso_user>` resolves with HOME
+# pointing into the fixture (audit walks $HOME/.claude/plugins/ which
+# we leave absent — audit gracefully skips that subtree).
+printf '%s:x:9999:9999:%s test:%s/home:/bin/bash\n' \
+  "$FIXTURE_ISO_USER" "$FIXTURE_ISO_USER" "$FIXTURE_ROOT" > "$FIXTURE_PASSWD"
+
+# Fake `sudo` — handles `sudo -n stat -c <fmt> <path>` from a JSON map,
+# `sudo -n test -d <path>` / `sudo -n test -e <path>` from the real
+# filesystem, and refuses everything else with rc=1 (so the audit can't
+# silently fall back to a real privileged op).
+#
+# Footgun #11 (Bash 5.3.9 heredoc-stdin deadlock): the python lookup
+# helper is a separate file, NOT a `python3 - <<EOF` inside a `$(...)`
+# command substitution. The python script is created once next to the
+# sudo shim and invoked with file-as-argv.
+FIXTURE_STAT_LOOKUP_PY="$FIXTURE_BIN/_stat-lookup.py"
+cat > "$FIXTURE_STAT_LOOKUP_PY" <<'EOF_STAT_LOOKUP_PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        m = json.load(f)
+    print(m.get(sys.argv[2], ""))
+except Exception:
+    sys.exit(1)
+EOF_STAT_LOOKUP_PY
+chmod +x "$FIXTURE_STAT_LOOKUP_PY"
+
+cat > "$FIXTURE_BIN/sudo" <<'EOF_SUDO'
+#!/usr/bin/env bash
+# Fake sudo for T_audit_executes_against_bad_fixture. Strips a leading
+# -n flag, then dispatches stat/test to deterministic helpers.
+_self_dir="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+if [[ "${1:-}" == "-n" ]]; then shift; fi
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  stat)
+    fmt=""
+    if [[ "${1:-}" == "-c" ]]; then
+      shift
+      fmt="${1:-}"; shift
+    fi
+    path="${1:-}"
+    json="${BRIDGE_AUDIT_TEST_STAT_JSON:-}"
+    [[ -f "$json" ]] || exit 1
+    # Lookup the path key. Footgun #11: invoke python3 with file-as-argv
+    # (NOT `python3 - <<EOF` inside `$(...)`).
+    entry="$(python3 "$_self_dir/_stat-lookup.py" "$json" "$path" 2>/dev/null)"
+    [[ -n "$entry" ]] || exit 1
+    owner="${entry%%:*}"; rest="${entry#*:}"
+    group="${rest%%:*}"; mode="${rest#*:}"
+    case "$fmt" in
+      '%a') printf '%s\n' "$mode" ;;
+      '%U:%G') printf '%s:%s\n' "$owner" "$group" ;;
+      *) exit 1 ;;
+    esac
+    ;;
+  test)
+    # test -d <path> / test -e <path>. Defer to real filesystem.
+    /bin/test "$@"
+    ;;
+  *)
+    # Refuse any other privileged op — the audit must not depend on
+    # arbitrary sudo execution in test mode.
+    exit 1
+    ;;
+esac
+EOF_SUDO
+chmod +x "$FIXTURE_BIN/sudo"
+
+# Fake `getent` — only handles `getent passwd <name>` from our fixture
+# passwd file.
+cat > "$FIXTURE_BIN/getent" <<EOF_GETENT
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "passwd" && -n "\${2:-}" ]]; then
+  grep -E "^\${2}:" "$FIXTURE_PASSWD" || exit 2
+  exit 0
+fi
+exit 2
+EOF_GETENT
+chmod +x "$FIXTURE_BIN/getent"
+
+# Run the audit against the fixture. Use a subshell to scope PATH +
+# BRIDGE_* env without leaking into subsequent smoke phases.
+(
+  export PATH="$FIXTURE_BIN:$PATH"
+  export BRIDGE_AUDIT_TEST_FORCE_LINUX=1
+  export BRIDGE_AUDIT_TEST_STAT_JSON="$FIXTURE_STAT_JSON"
+  export BRIDGE_HOME="$FIXTURE_BRIDGE_HOME"
+  export BRIDGE_DATA_ROOT="$FIXTURE_DATA_ROOT"
+  export BRIDGE_AGENT_ROOT_V2="$FIXTURE_DATA_ROOT/agents"
+  export BRIDGE_LAYOUT=v2
+  bash "$AUDIT_SH" "$FIXTURE_AGENT"
+) > "$FIXTURE_AUDIT_LOG" 2>&1
+audit_rc=$?
+
+if [[ $audit_rc -eq 0 ]]; then
+  smoke_log "T_audit_executes_against_bad_fixture: audit output:"
+  cat "$FIXTURE_AUDIT_LOG" >&2 || true
+  smoke_fail "T_audit_executes_against_bad_fixture: audit exited rc=0 against fixture with bad workdir root + bad .env — silent false negative (codex r2 BLOCKING regressed)"
+fi
+
+if ! grep -F "$FIXTURE_WORKDIR" "$FIXTURE_AUDIT_LOG" | grep -F "workdir-root" >/dev/null; then
+  smoke_log "T_audit_executes_against_bad_fixture: audit output:"
+  cat "$FIXTURE_AUDIT_LOG" >&2 || true
+  smoke_fail "T_audit_executes_against_bad_fixture: audit did not emit workdir-root violation row for bad fixture workdir root"
+fi
+
+if ! grep -F "$FIXTURE_ENV_FILE" "$FIXTURE_AUDIT_LOG" | grep -F "channel-env-file" >/dev/null; then
+  smoke_log "T_audit_executes_against_bad_fixture: audit output:"
+  cat "$FIXTURE_AUDIT_LOG" >&2 || true
+  smoke_fail "T_audit_executes_against_bad_fixture: audit did not emit channel-env-file violation row for root:wrong 0600 .env"
+fi
+
+smoke_log "T_audit_executes_against_bad_fixture PASS — audit rc=$audit_rc + workdir-root + .env violations emitted"
+
+# Teeth — revert the workdir-root stat block (write a copy of the audit
+# script without the workdir-root branch) and confirm the fixture test
+# would fail to catch the bad workdir root. Same for the .env owner/group
+# triple check.
+#
+# We don't mutate the real audit file; we run a temp copy with the
+# offending block stripped (sed -E delete-range) and assert rc=0 (silent
+# OK on the bad fixture).
+TEETH_AUDIT_NO_WORKDIR_ROOT="$SMOKE_TMP_ROOT/teeth-audit-no-workdir-root.sh"
+
+# Strip the workdir-root stat block: from the "# ------ workdir root +
+# channel state dirs ------" header through the matching "fi" before the
+# channel loop. The simplest way is to delete every line between two
+# markers we can grep for. Use awk to suppress the workdir-root block
+# specifically: lines starting at "# Codex r2 BLOCKING: validate the
+# workdir root itself" through the corresponding `fi` that closes the
+# workdir-root if/else. Look for the next blank line followed by
+# "local channel" as the end marker.
+awk '
+  /# Codex r2 BLOCKING: validate the workdir root itself/ { skip=1; next }
+  skip && /^[[:space:]]+local channel$/ { skip=0; print; next }
+  skip { next }
+  { print }
+' "$AUDIT_SH" > "$TEETH_AUDIT_NO_WORKDIR_ROOT"
+
+# Confirm the strip actually happened.
+if grep -F "workdir-root" "$TEETH_AUDIT_NO_WORKDIR_ROOT" >/dev/null; then
+  smoke_fail "teeth: workdir-root revert did not actually remove the workdir-root block (sed/awk pattern broke) — teeth setup broken"
+fi
+if ! grep -F "workdir-root" "$AUDIT_SH" >/dev/null; then
+  smoke_fail "teeth: real audit script does not contain the workdir-root literal — assertion would not bite on real script"
+fi
+chmod +x "$TEETH_AUDIT_NO_WORKDIR_ROOT"
+
+(
+  export PATH="$FIXTURE_BIN:$PATH"
+  export BRIDGE_AUDIT_TEST_FORCE_LINUX=1
+  export BRIDGE_AUDIT_TEST_STAT_JSON="$FIXTURE_STAT_JSON"
+  export BRIDGE_HOME="$FIXTURE_BRIDGE_HOME"
+  export BRIDGE_DATA_ROOT="$FIXTURE_DATA_ROOT"
+  export BRIDGE_AGENT_ROOT_V2="$FIXTURE_DATA_ROOT/agents"
+  export BRIDGE_LAYOUT=v2
+  bash "$TEETH_AUDIT_NO_WORKDIR_ROOT" "$FIXTURE_AGENT"
+) > "$FIXTURE_ROOT/teeth-no-workdir-root.log" 2>&1
+teeth_no_root_rc=$?
+
+# .env is still root:wrong 0600 — but the audit only reports rc=1 if
+# the .env triple-check ALSO bites. So we expect teeth_no_root_rc=1
+# (because .env still violates owner). To prove the workdir-root block
+# is load-bearing, assert that the workdir-root violation row is GONE
+# from the teeth output even though we ran against the bad fixture.
+if grep -F "$FIXTURE_WORKDIR" "$FIXTURE_ROOT/teeth-no-workdir-root.log" | grep -F "workdir-root" >/dev/null; then
+  smoke_fail "teeth: stripped audit still emits workdir-root violation row (strip did not work)"
+fi
+
+# Now teeth #2: revert the .env triple-check (drop the owner+group
+# comparison, keep only mode). Use awk for portability — BSD sed handles
+# the `||` operator differently from GNU sed, so a sed substitution that
+# works on Linux can RE-error on macOS. awk with literal-string match +
+# print is portable across BSD/GNU.
+TEETH_AUDIT_ENV_MODE_ONLY="$SMOKE_TMP_ROOT/teeth-audit-env-mode-only.sh"
+awk '
+  /if \[\[ "\$mode" != "600" \|\| "\$owner_group" != "\$iso_user:\$agent_group" \]\]; then/ {
+    # Replace the line with the mode-only form.
+    sub(/if \[\[ "\$mode" != "600" \|\| "\$owner_group" != "\$iso_user:\$agent_group" \]\]; then/, "if [[ \"$mode\" != \"600\" ]]; then")
+  }
+  { print }
+' "$AUDIT_SH" > "$TEETH_AUDIT_ENV_MODE_ONLY"
+
+if ! grep -F 'if [[ "$mode" != "600" ]]; then' "$TEETH_AUDIT_ENV_MODE_ONLY" >/dev/null; then
+  smoke_fail "teeth: .env triple-check revert did not produce the mode-only form — awk pattern mismatch"
+fi
+if grep -F 'if [[ "$mode" != "600" || "$owner_group" != "$iso_user:$agent_group" ]]; then' "$TEETH_AUDIT_ENV_MODE_ONLY" >/dev/null; then
+  smoke_fail "teeth: .env triple-check revert did not remove the triple-check (awk picked the wrong line)"
+fi
+chmod +x "$TEETH_AUDIT_ENV_MODE_ONLY"
+
+(
+  export PATH="$FIXTURE_BIN:$PATH"
+  export BRIDGE_AUDIT_TEST_FORCE_LINUX=1
+  export BRIDGE_AUDIT_TEST_STAT_JSON="$FIXTURE_STAT_JSON"
+  export BRIDGE_HOME="$FIXTURE_BRIDGE_HOME"
+  export BRIDGE_DATA_ROOT="$FIXTURE_DATA_ROOT"
+  export BRIDGE_AGENT_ROOT_V2="$FIXTURE_DATA_ROOT/agents"
+  export BRIDGE_LAYOUT=v2
+  bash "$TEETH_AUDIT_ENV_MODE_ONLY" "$FIXTURE_AGENT"
+) > "$FIXTURE_ROOT/teeth-env-mode-only.log" 2>&1
+
+# In the mode-only variant, the .env at mode 600 (but root:wrong) reports
+# OK silently. Workdir-root violation still bites (because we kept that
+# block), so rc=1 from workdir-root alone. But the channel-env-file row
+# must be ABSENT.
+if grep -F "$FIXTURE_ENV_FILE" "$FIXTURE_ROOT/teeth-env-mode-only.log" | grep -F "channel-env-file" >/dev/null; then
+  smoke_fail "teeth: stripped audit (.env mode-only) still emits channel-env-file violation row for root:wrong 0600 — triple-check is not load-bearing"
+fi
+
+smoke_log "Teeth PASS — reverting workdir-root block silences workdir-root rows; reverting .env triple-check silences .env owner/group rows"
+
+smoke_log "all tests PASS — Lane H (#1278 + #1208 + #1215 cross-check + r2 canonical helpers + r3 workdir-root/.env/canonical-workdir + fixture-run) verified at current source"

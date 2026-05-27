@@ -76,6 +76,19 @@ fi
 # shellcheck source=/dev/null
 source "$REPO_ROOT/bridge-lib.sh"
 
+# Initialize the roster assoc arrays (BRIDGE_AGENT_WORKDIR,
+# BRIDGE_AGENT_OS_USER, etc.) so `set -uo pipefail` later in this script
+# doesn't trip on `${BRIDGE_AGENT_WORKDIR[$agent]-}` inside
+# `bridge_agent_workdir`. bridge-agents.sh's `declare -g -A` lines live
+# inside a heredoc (lib/bridge-agents.sh:3450+) and are emitted to the
+# runtime env file at agent-write time, NOT executed at source time, so
+# the arrays are undeclared until `bridge_reset_roster_maps` runs.
+# That helper is the canonical roster-init entry point and is
+# idempotent (unset → re-declare).
+if declare -F bridge_reset_roster_maps >/dev/null 2>&1; then
+  bridge_reset_roster_maps
+fi
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -104,7 +117,7 @@ die() {
   exit 2
 }
 
-if [[ "$(uname -s 2>/dev/null)" != "Linux" ]]; then
+if [[ "$(uname -s 2>/dev/null)" != "Linux" && -z "${BRIDGE_AUDIT_TEST_FORCE_LINUX:-}" ]]; then
   printf 'audit: skipping — Linux only (iso v2 contract is Linux-specific)\n' >&2
   exit 0
 fi
@@ -171,25 +184,32 @@ resolve_agent_home() {
   printf '%s\n' "$pw" | awk -F: '{print $6}'
 }
 
-# resolve_agent_workdir <agent> — read from the live runtime. Best
-# effort; fall back to the canonical layout.
+# resolve_agent_workdir <agent> — canonical resolver. Codex r2 BLOCKING:
+# the prior r2 hardcoded `$BRIDGE_HOME/data/agents/$agent/workdir` instead
+# of going through `bridge_agent_workdir` (lib/bridge-agents.sh:5050).
+# That helper is what the runtime itself uses, and it honors:
+#
+#   * `BRIDGE_AGENT_WORKDIR[<agent>]` explicit override (static roster)
+#   * `BRIDGE_AGENT_ROOT_V2/<agent>/workdir` when isolation is linux-user
+#   * shared-mode dynamic agents' captured cwd
+#   * the `bridge_agent_isolation_mode` branch added in v0.13.10 (#895)
+#
+# Using anything else risks the audit walking the wrong path on agents
+# with custom workdirs (static rosters), shared-mode dynamic agents, or
+# operator hosts where `BRIDGE_DATA_ROOT` was relocated.
 resolve_agent_workdir() {
   local agent="$1"
-  local bridge_home="${BRIDGE_HOME:-${HOME}/.agent-bridge}"
-  # Lane A (#1213) canonical iso v2 path:
-  # ~awfmanager/.agent-bridge/data/agents/<agent>/workdir
-  local controller_data="$bridge_home/data/agents/$agent/workdir"
-  if sudo -n test -d "$controller_data" 2>/dev/null; then
-    printf '%s' "$controller_data"
-    return 0
+  local resolved
+  resolved="$(bridge_agent_workdir "$agent" 2>/dev/null || printf '')"
+  if [[ -z "$resolved" ]]; then
+    return 1
   fi
-  # Legacy fallback: shared mode runs under the controller's home.
-  local legacy="$bridge_home/agents/$agent/workdir"
-  if sudo -n test -d "$legacy" 2>/dev/null; then
-    printf '%s' "$legacy"
-    return 0
+  # sudo -n test handles the case where the audit runs as the controller
+  # but the workdir is iso-UID-owned with 2770/group-traversal only.
+  if ! sudo -n test -d "$resolved" 2>/dev/null; then
+    return 1
   fi
-  return 1
+  printf '%s' "$resolved"
 }
 
 # ---------------------------------------------------------------------------
@@ -284,8 +304,34 @@ audit_agent() {
     fi
   fi
 
-  # ------ workdir + channel state dirs ------
+  # ------ workdir root + channel state dirs ------
   if [[ -n "$workdir" ]]; then
+    # Codex r2 BLOCKING: validate the workdir root itself BEFORE walking
+    # channel children. The v2 writer (lib/bridge-isolation-v2.sh, ASCII
+    # layout @ lines 50-51) emits the root as
+    # `agent-bridge-<name>:ab-agent-<name> 2770`. If the root is wrong-
+    # owner/wrong-group/wrong-mode, every traversal beneath it is broken
+    # and the prior audit silently reported "OK". Triple-check
+    # (owner+group+mode) just like every other stat in this function.
+    local root_mode root_owner_group
+    if ! sudo -n test -d "$workdir" 2>/dev/null; then
+      emit_row "$workdir" "MISSING" "MISSING" "$iso_user:$agent_group 2770" "workdir-root"
+      violations=$((violations + 1))
+    else
+      root_mode="$(stat_mode "$workdir")"
+      root_owner_group="$(stat_owner_group "$workdir")"
+      # Accept 2770 (canonical) or 2750 (controller-only-traversal — still
+      # valid because the iso UID owns the root with rwx). Reject anything
+      # else, including 0700 / 0770 (no setgid) and root:wrong 0700.
+      if [[ "$root_mode" != "2770" && "$root_mode" != "2750" ]]; then
+        emit_row "$workdir" "$root_owner_group" "$root_mode" "$iso_user:$agent_group 2770" "workdir-root"
+        violations=$((violations + 1))
+      elif [[ "$root_owner_group" != "$iso_user:$agent_group" ]]; then
+        emit_row "$workdir" "$root_owner_group" "$root_mode" "$iso_user:$agent_group 2770" "workdir-root"
+        violations=$((violations + 1))
+      fi
+    fi
+
     local channel
     for channel in .discord .telegram .teams .ms365 .mattermost; do
       local cdir="$workdir/$channel"
@@ -304,11 +350,17 @@ audit_agent() {
           violations=$((violations + 1))
         fi
         # .env file: 0600 owned by iso UID (secret file mode contract).
+        # Codex r2 BLOCKING: the prior r2 only compared `mode != 600` and
+        # never checked owner/group. A root:wrong 0600 .env reported OK,
+        # even though the emit-row text would have advertised
+        # `$iso_user:$agent_group 0600` — a silent contract violation that
+        # ships secret-reading rights to the wrong UID. Triple-check
+        # (owner+group+mode) to match the rest of the audit.
         local env_file="$cdir/.env"
         if sudo -n test -e "$env_file" 2>/dev/null; then
           mode="$(stat_mode "$env_file")"
           owner_group="$(stat_owner_group "$env_file")"
-          if [[ "$mode" != "600" ]]; then
+          if [[ "$mode" != "600" || "$owner_group" != "$iso_user:$agent_group" ]]; then
             emit_row "$env_file" "$owner_group" "$mode" "$iso_user:$agent_group 0600" "channel-env-file"
             violations=$((violations + 1))
           fi
