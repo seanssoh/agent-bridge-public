@@ -410,7 +410,14 @@ bridge_warn() {
 }
 
 bridge_info() {
-  echo -e "${CYAN}$*${NC}"
+  # #1273 (v0.15.0-beta4): bridge_info is a logger, not a return-channel
+  # producer. Emit to stderr so `$(funcname)` callers (e.g.
+  # `bridge_plugins_add_marketplace_clone_url`) do not have their
+  # captured return value contaminated by diagnostic lines.
+  # bridge_warn was already stderr-routed; this aligns bridge_info with
+  # the rest of the logger family. bridge_die exits the process so
+  # capture-contamination is impossible there.
+  echo -e "${CYAN}$*${NC}" >&2
 }
 
 bridge_version() {

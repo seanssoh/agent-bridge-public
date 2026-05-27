@@ -1452,14 +1452,19 @@ bridge_plugins_add_marketplace_clone_url() {
 
   if [[ -d "$clone_dir/.git" ]]; then
     # Idempotent path — refresh via git pull --ff-only.
-    bridge_info "[plugins add-marketplace] clone exists at $clone_dir — refreshing with git pull --ff-only"
+    # #1273 defense-in-depth: explicit `>&2` on bridge_info even though
+    # bridge_info itself now routes to stderr (lib/bridge-core.sh:412).
+    # If a future patch (or a callsite override) restores stdout output,
+    # the caller's `resolved_root="$(...)"` capture must NOT pick this
+    # diagnostic up as part of the returned path.
+    bridge_info "[plugins add-marketplace] clone exists at $clone_dir — refreshing with git pull --ff-only" >&2
     if ! ( cd "$clone_dir" && git pull --ff-only >&2 ); then
       bridge_warn "clone_url: git pull --ff-only in $clone_dir failed — leaving existing clone in place"
       # Non-fatal: existing clone may still be usable. Caller will
       # validate marketplace.json next.
     fi
   else
-    bridge_info "[plugins add-marketplace] cloning $url → $clone_dir"
+    bridge_info "[plugins add-marketplace] cloning $url → $clone_dir" >&2
     if ! git clone --depth 1 -- "$url" "$clone_dir" >&2; then
       bridge_warn "clone_url: git clone $url → $clone_dir failed"
       return 1

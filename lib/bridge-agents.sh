@@ -7820,7 +7820,21 @@ bridge_agent_restart_preflight_full_reason() {
       if [[ "$qualified" == plugin:*@* && "$engine" == "claude" ]] \
           && ! bridge_isolation_disabled_by_env 2>/dev/null \
           && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
-        plugin_status="$(bridge_claude_plugin_status "$qualified" "$agent" 2>/dev/null || printf 'missing')"
+        # #1274 (v0.15.0-beta4): align the status-probe spec form with
+        # the rest of the codebase. `bridge_claude_plugin_status` and
+        # all downstream manifest predicates key by the BARE
+        # `<name>@<marketplace>` form (see `plugin_spec="${item#plugin:}"`
+        # at 6281 / 8406 and the manifest writer at 2470-2492). The
+        # qualified `plugin:...` form leaks here from
+        # `bridge_qualify_channel_item` because the v0.15.0-beta3 Lane C1
+        # preflight forgot to strip; passing it through produced a false
+        # `absent` and aborted every restart for iso v2 + plugin agents.
+        # Strip here so the operator-facing reason still names the
+        # qualified spec, while the predicate sees the canonical bare
+        # key. The helper boundary (claude-plugin-manifest-has-spec.py)
+        # also strips defensively, so both layers are now resilient.
+        local _plugin_spec_bare="${qualified#plugin:}"
+        plugin_status="$(bridge_claude_plugin_status "$_plugin_spec_bare" "$agent" 2>/dev/null || printf 'missing')"
         if [[ "$plugin_status" == "missing" ]]; then
           local marketplace="${qualified#*@}"
           local seed_hint="agb plugins seed"
@@ -8025,6 +8039,12 @@ from pathlib import Path
 
 path = Path(sys.argv[1])
 spec = sys.argv[2]
+# #1274 (v0.15.0-beta4): match the helper-boundary normalization in
+# scripts/python-helpers/claude-plugin-manifest-has-spec.py. Manifests
+# key by the bare `<name>@<marketplace>` form; strip a `plugin:` prefix
+# so this test-path probe is symmetric with the production path.
+if spec.startswith("plugin:"):
+    spec = spec[len("plugin:"):]
 try:
     payload = json.loads(path.read_text(encoding="utf-8"))
 except Exception:
