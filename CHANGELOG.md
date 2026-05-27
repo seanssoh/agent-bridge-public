@@ -8,9 +8,9 @@ version bumps via the `VERSION` file.
 
 ## [0.15.0-beta4] — 2026-05-28
 
-### Highlight — Full backlog closure, 11 lanes / 3 sub-waves, 28 issues
+### Highlight — Full backlog closure, 11 lanes / 3 sub-waves, 30 issues
 
-Operator-cued autonomous beta loop directive 2026-05-27: "베타 4를 위해서 싹다 제대로 수정하자. 웨이브 스킬 사용해서 멀티 에이전트로 빠르게 처리 해줘." Wave-orchestration skill applied: 11 parallel lanes across 3 sub-waves, 28 issues closed, ~28 codex review rounds total, plus integration review + QA gate (15/15 lane smokes PASS under bash 5.3.9). `-beta4` prerelease, tag `v0.15.0-beta4`, GitHub release marked **Pre-release**.
+Operator-cued autonomous beta loop directive 2026-05-27: "베타 4를 위해서 싹다 제대로 수정하자. 웨이브 스킬 사용해서 멀티 에이전트로 빠르게 처리 해줘." Wave-orchestration skill applied: 11 parallel lanes across 3 sub-waves, 30 issues closed (wave plan named 28; Lane H also closes cross-check pair #1208 + #1215 with full fixes for the lock-file ownership + .ms365 directory mode), ~28 codex review rounds total, plus integration review + QA gate (15/15 lane smokes PASS under bash 5.3.9). `-beta4` prerelease, tag `v0.15.0-beta4`, GitHub release marked **Pre-release**.
 
 Lane → PR map: A #1286 / B #1285 / C #1284 / D #1287 / E #1288 / F #1290 / G #1291 / H #1289 / I #1292 / J #1293 / K #1294, plus integration fix-up #1295.
 
