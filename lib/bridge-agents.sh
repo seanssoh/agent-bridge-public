@@ -3986,8 +3986,34 @@ bridge_linux_normalize_isolated_home_contract() {
   # Linux-only — no-op success elsewhere.
   [[ "$(bridge_host_platform)" == "Linux" ]] || return 0
 
+  # Emit probe-failure status lines for all four target sub-paths so
+  # callers (the reconciler row dispatcher) can distinguish "no status
+  # line emitted" (helper bug) from "row says X" (helper-reported probe
+  # outcome). Used by every early-return path below where the helper
+  # cannot reach the per-target normalize loop. Status word convention:
+  #   denied — runtime probe failure (sudo refused, session running,
+  #            anchor mismatch). NOT a state drift; operator action ≠ apply.
+  #   error  — invariant violation (bad args, unresolved group). NOT a
+  #            state drift; operator must fix configuration before retry.
+  # The four targets here MUST stay in sync with the per-target
+  # normalize loop below (target_home / target_claude / target_plugins /
+  # target_session_env). #1298.
+  _bridge_linux_home_contract_emit_probe_failure() {
+    local _status="$1" _user_home="$2"
+    [[ -n "$_user_home" ]] || return 0
+    printf '%s\t%s\t-\t-\n' "$_user_home"                       "$_status"
+    printf '%s\t%s\t-\t-\n' "$_user_home/.claude"               "$_status"
+    printf '%s\t%s\t-\t-\n' "$_user_home/.claude/plugins"       "$_status"
+    printf '%s\t%s\t-\t-\n' "$_user_home/.claude/session-env"   "$_status"
+  }
+
   [[ -n "$agent" && -n "$os_user" && -n "$user_home" ]] || {
     bridge_warn "normalize_isolated_home_contract: agent/os_user/user_home all required (got agent='$agent' os_user='$os_user' user_home='$user_home')"
+    # If user_home is empty here we cannot emit per-path probe lines;
+    # the caller will fall through to the "no helper line" case which
+    # already treats helper_rc=1 + empty output as a probe failure.
+    _bridge_linux_home_contract_emit_probe_failure "error" "$user_home"
+    unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
     return 1
   }
 
@@ -3998,6 +4024,8 @@ bridge_linux_normalize_isolated_home_contract() {
   agent_group="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
   [[ -n "$agent_group" ]] || {
     bridge_warn "normalize_isolated_home_contract: cannot resolve agent group for '$agent'"
+    _bridge_linux_home_contract_emit_probe_failure "error" "$user_home"
+    unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
     return 1
   }
 
@@ -4007,12 +4035,16 @@ bridge_linux_normalize_isolated_home_contract() {
   # caller should not be able to chmod arbitrary paths via this helper).
   if [[ -z "${BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT:-}" ]]; then
     bridge_warn "normalize_isolated_home_contract: BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT unset; declining (cannot validate user_home anchor)"
+    _bridge_linux_home_contract_emit_probe_failure "error" "$user_home"
+    unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
     return 1
   fi
   case "$user_home" in
     "$BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT"/*) : ;;
     *)
       bridge_warn "normalize_isolated_home_contract: user_home '$user_home' not under '$BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT' — refusing"
+      _bridge_linux_home_contract_emit_probe_failure "error" "$user_home"
+      unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
       return 1
       ;;
   esac
@@ -4032,8 +4064,14 @@ bridge_linux_normalize_isolated_home_contract() {
       # called from the restart reverter mid-rerender. Bail soft so the
       # caller's audit log surfaces the skip rather than killing the
       # process. The matrix reconciler row will surface this as a
-      # `failed` row to the operator.
+      # `denied` row (probe failure, NOT drift) so the operator can tell
+      # "agent was running during reconcile" from "actual file mode drift".
+      # #1298 Gap A — root cause of the beta3→beta4 upgrade-reconcile 4-row
+      # [failed] symptom: upgrade reconcile runs while agents are live and
+      # this guard returned silently.
       bridge_warn "normalize_isolated_home_contract: tmux session '$_quiesce_session' is alive — refusing (set BRIDGE_PREPARE_ISOLATION_ALLOW_RUNNING=1 for smoke fixtures, or stop the agent first)"
+      _bridge_linux_home_contract_emit_probe_failure "denied" "$user_home"
+      unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
       return 1
     fi
   fi
@@ -4066,11 +4104,20 @@ bridge_linux_normalize_isolated_home_contract() {
   # bridge_linux_sudo_root so the controller sees the real fs (the
   # isolated UID's view may differ if a hostile rebind is in progress).
   local target overall_rc=0
+  local -a _bad_targets=()
   for target in "$target_home" "$target_claude" "$target_plugins" "$target_session_env"; do
     if bridge_linux_sudo_root test -L "$target" 2>/dev/null; then
-      printf '%s\tfailed\t-\t-\n' "$target"
+      # #1298 Gap A r2 — symlink target is a malformed-state probe failure
+      # (anti-race / anti-redirect refusal), NOT filesystem drift the
+      # operator can repair by re-running apply. Emit `error` so the
+      # reconciler's denied|error arm classifies as degraded/rc=0.
+      # Operator remediation: stop the agent, inspect the symlink, then
+      # remove it before retrying — not a re-apply.
+      printf '%s\terror\t-\t-\n' "$target"
       bridge_warn "normalize_isolated_home_contract: refusing — '$target' is a symlink (anti-race / anti-redirect)"
       overall_rc=1
+      _bad_targets+=("$target")
+      continue
     fi
     # `-e && ! -d` = exists but is not a directory (regular file, fifo,
     # etc.). Refuse before mutation so we don't chmod a regular file
@@ -4078,12 +4125,34 @@ bridge_linux_normalize_isolated_home_contract() {
     if bridge_linux_sudo_root test -e "$target" 2>/dev/null \
         && ! bridge_linux_sudo_root test -d "$target" 2>/dev/null \
         && ! bridge_linux_sudo_root test -L "$target" 2>/dev/null; then
-      printf '%s\tfailed\t-\t-\n' "$target"
+      # #1298 Gap A r2 — non-directory target is also a malformed-state
+      # probe failure; emit `error` (same classification as symlink) so
+      # the reconciler degrades rather than reports drift.
+      printf '%s\terror\t-\t-\n' "$target"
       bridge_warn "normalize_isolated_home_contract: refusing — '$target' exists but is not a directory"
       overall_rc=1
+      _bad_targets+=("$target")
     fi
   done
   if (( overall_rc != 0 )); then
+    # Emit status lines for the targets we did NOT inspect so the caller
+    # can distinguish "no helper line for this row" (helper bug) from
+    # "row was skipped because a sibling was malformed" (probe denied,
+    # operator action ≠ mutate that row's fs state). #1298 Gap A.
+    local _t _is_bad
+    for target in "$target_home" "$target_claude" "$target_plugins" "$target_session_env"; do
+      _is_bad=0
+      for _t in "${_bad_targets[@]+"${_bad_targets[@]}"}"; do
+        if [[ "$_t" == "$target" ]]; then
+          _is_bad=1
+          break
+        fi
+      done
+      if (( _is_bad == 0 )); then
+        printf '%s\tdenied\t-\t-\n' "$target"
+      fi
+    done
+    unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
     return 1
   fi
 
@@ -4145,6 +4214,7 @@ bridge_linux_normalize_isolated_home_contract() {
   _bridge_normalize_one "$target_session_env" "root"     "$agent_group" "$claude_mode" || overall_rc=1
 
   unset -f _bridge_normalize_one 2>/dev/null || true
+  unset -f _bridge_linux_home_contract_emit_probe_failure 2>/dev/null || true
   return "$overall_rc"
 }
 
