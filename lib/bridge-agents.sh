@@ -4357,6 +4357,21 @@ bridge_linux_prepare_agent_isolation() {
       bridge_warn "bridge_linux_prepare_agent_isolation: install-tree reconciler reported drift for agent=$agent (non-fatal; run: agent-bridge isolation reconcile --apply --agent $agent)"
     fi
   fi
+
+  # Lane A (v0.15.0-beta4): write the sanitized per-agent metadata
+  # snippet (`state/agents/<a>/agent-meta.env`, 0640 controller:
+  # ab-agent-<a>) so the iso UID context can resolve its own
+  # `BRIDGE_AGENT_OS_USER` / `BRIDGE_AGENT_ISOLATION_MODE` / etc.
+  # without read access to the protected `agent-roster.local.sh`.
+  # Closes the precondition gap for #1272 (Path A0) and the
+  # ISOLATION_MODE bash-side surface from #1213. Non-fatal — the lane
+  # also adds a `getent`-based fallback in `bridge_agent_claude_home_dir`,
+  # so a write failure here degrades to the existing roster-array path
+  # rather than wedging.
+  if command -v bridge_isolation_v2_write_agent_metadata >/dev/null 2>&1; then
+    bridge_isolation_v2_write_agent_metadata "$agent" \
+      || bridge_warn "bridge_linux_prepare_agent_isolation: agent-meta.env write failed for agent=$agent (non-fatal; iso UID will fall back to getent-based config_dir resolution)"
+  fi
 }
 bridge_linux_install_isolated_channel_symlink() {
   # Plant a root-owned symlink at $user_home/.claude/channels/<channel>
@@ -4544,8 +4559,66 @@ bridge_agent_claude_home_dir() {
   bridge_agent_default_home "$agent"
 }
 
+# Lane A (v0.15.0-beta4): iso-v2 agents' Claude config dir must
+# resolve to the iso UID's actual Linux home (`/home/agent-bridge-<a>/
+# .claude`), not the controller view path
+# (`$BRIDGE_AGENT_HOME_ROOT/<a>/.claude` /
+# `$BRIDGE_AGENT_ROOT_V2/<a>/home/.claude`). The controller view does
+# not exist on disk for iso v2 — Claude writes session JSONL into the
+# iso UID's HOME — so the `[[ -d $config_dir ]]` gate in
+# `bridge_resolve_agent_claude_config_dir` rejected the controller-view
+# path and detect_claude_session_id fell back to the daemon's HOME,
+# never finding the agent's sessions. Closes #1277.
+#
+# Two-stage resolution:
+#   1) If `bridge_agent_os_user` returns non-empty, use the existing
+#      `bridge_agent_claude_home_dir` -> `bridge_agent_linux_user_home`
+#      path (controller context with populated roster array).
+#   2) If `bridge_agent_os_user` is empty (iso UID context where the
+#      assoc array hasn't been populated yet AND the agent-meta.env
+#      snippet hasn't fired) but iso v2 is structurally active for the
+#      agent (mode requested or `linux_user_isolation` recorded), fall
+#      back to a `getent passwd <os_user_prefix><agent>` lookup. The
+#      iso UID prefix is conventionally `agent-bridge-` and can be
+#      overridden by `BRIDGE_AGENT_OS_USER_PREFIX` (existing project
+#      convention; `BRIDGE_OS_USER_PREFIX` was a typo introduced at r2).
+#   3) Otherwise, non-iso path — daemon HOME (caller's view).
 bridge_agent_claude_config_dir() {
   local agent="$1"
+  local home_dir=""
+  local os_user=""
+  local pwent_home=""
+
+  # Fast-path: roster array populated.
+  if ! bridge_isolation_disabled_by_env 2>/dev/null \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+    if [[ -n "$os_user" ]]; then
+      home_dir="$(bridge_agent_linux_user_home "$os_user")"
+      printf '%s/.claude' "$home_dir"
+      return 0
+    fi
+    # Roster array empty (iso UID context, agent-meta.env didn't fire
+    # for any reason). Fall back to a passwd-database lookup so the
+    # caller (`bridge_resolve_agent_claude_config_dir`) gets a real
+    # directory that exists on disk.
+    if command -v getent >/dev/null 2>&1; then
+      # Align with existing project convention used at
+      # lib/bridge-isolation-v2.sh:1437,2323,2420 — the prefix value
+      # itself carries the trailing dash (default `agent-bridge-`).
+      local prefix="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}"
+      local probe_user="${prefix}${agent}"
+      pwent_home="$(getent passwd "$probe_user" 2>/dev/null | cut -d: -f6)"
+      if [[ -n "$pwent_home" ]]; then
+        printf '%s/.claude' "$pwent_home"
+        return 0
+      fi
+    fi
+  fi
+
+  # Non-iso path or all iso-resolution attempts failed: print the
+  # legacy controller-view path. Callers gate on `[[ -d ]]`, so a
+  # non-existent path falls through to the daemon-HOME default.
   printf '%s/.claude' "$(bridge_agent_claude_home_dir "$agent")"
 }
 

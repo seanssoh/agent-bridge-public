@@ -1384,6 +1384,23 @@ bridge_audit_log() {
   if ! bridge_resolve_script_dir_check; then
     return 1
   fi
+  # Lane A (v0.15.0-beta4) — #1279: defense-in-depth for per-agent
+  # audit dir. When `BRIDGE_AUDIT_LOG` points into an iso v2 per-agent
+  # `data/agents/<a>/logs/audit.jsonl` (set by the scoped
+  # `runtime/agent-env.sh` snapshot), the parent dir must exist for
+  # the python writer to append. The matrix-grant path creates it at
+  # create/prepare time, but a runtime mkdir gap (rm -rf, partial
+  # restore) would otherwise silently drop the emit. Best-effort: only
+  # fire when target is the iso v2 per-agent path AND
+  # BRIDGE_AGENT_ID is set.
+  if [[ -n "${BRIDGE_AGENT_ID:-}" && -n "${BRIDGE_AUDIT_LOG:-}" ]] \
+      && command -v bridge_agent_audit_dir_ensure >/dev/null 2>&1; then
+    local _audit_parent
+    _audit_parent="$(dirname "$BRIDGE_AUDIT_LOG" 2>/dev/null || printf '')"
+    if [[ -n "$_audit_parent" && ! -d "$_audit_parent" ]]; then
+      bridge_agent_audit_dir_ensure "$BRIDGE_AGENT_ID" 2>/dev/null || true
+    fi
+  fi
   python3 "$BRIDGE_SCRIPT_DIR/bridge-audit.py" write --file "$BRIDGE_AUDIT_LOG" --actor "$actor" --action "$action" --target "$target" "$@" >/dev/null
 }
 
@@ -2484,6 +2501,73 @@ bridge_agent_audit_log_file() {
   printf '%s/audit.jsonl' "$(bridge_agent_log_dir "$agent")"
 }
 
+# Lane A (v0.15.0-beta4) — #1279: audit dir resolver iso-aware.
+#
+# Ensures the per-agent log dir (controller-rooted in legacy
+# `logs/agents/<a>/`; data-rooted under `data/agents/<a>/logs` for iso
+# v2) exists and is readable by the iso UID. The existing
+# `bridge_linux_prepare_agent_isolation` chain creates the dir + chown
+# at agent create time (`bridge_linux_sudo_root mkdir -p
+# "$runtime_state_dir" "$log_dir" ...`) and the matrix-grant codifies
+# the contract. This helper is a defense-in-depth for the cases where
+# (a) the controller daemon emits audit BEFORE the prepare matrix has
+# fully completed (race during create), or (b) operator-side `rm -rf`
+# / partial restore leaves the dir absent at runtime.
+#
+# Returns 0 on success (dir exists + readable), non-zero otherwise.
+# Non-fatal callers should pair with `|| true` — audit emit failure
+# would otherwise fail the surrounding mutation.
+bridge_agent_audit_dir_ensure() {
+  local agent="$1"
+  [[ -n "$agent" ]] || return 1
+
+  local log_dir=""
+  log_dir="$(bridge_agent_log_dir "$agent" 2>/dev/null || true)"
+  [[ -n "$log_dir" ]] || return 1
+
+  if [[ -d "$log_dir" ]]; then
+    return 0
+  fi
+
+  # Direct mkdir — succeeds when the controller is also the
+  # path-owner (legacy `logs/agents/<a>/`) OR is a member of the
+  # path's setgid'd group (iso v2 `data/agents/<a>/logs/`). If
+  # neither holds, sudo-escalate (the iso v2 path needs this on
+  # fresh installs before the controller's supplementary groups have
+  # refreshed — KNOWN_ISSUES §28).
+  if mkdir -p "$log_dir" 2>/dev/null; then
+    chmod 2770 "$log_dir" 2>/dev/null || true
+    return 0
+  fi
+
+  if command -v bridge_linux_sudo_root >/dev/null 2>&1; then
+    if bridge_linux_sudo_root mkdir -p "$log_dir" 2>/dev/null; then
+      bridge_linux_sudo_root chmod 2770 "$log_dir" 2>/dev/null || true
+      # In iso v2 mode, the dir is owned by the iso UID + ab-agent-<a>
+      # group; the controller (group member) can read via the group
+      # bit. Apply the canonical chown when iso v2 effective.
+      if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+          && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+        local _iso_user
+        _iso_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+        if [[ -n "$_iso_user" ]]; then
+          bridge_linux_sudo_root chown "$_iso_user" "$log_dir" 2>/dev/null || true
+        fi
+        local _agent_grp
+        if command -v bridge_isolation_v2_agent_group_name >/dev/null 2>&1; then
+          _agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+          if [[ -n "$_agent_grp" ]]; then
+            bridge_linux_sudo_root chgrp "$_agent_grp" "$log_dir" 2>/dev/null || true
+          fi
+        fi
+      fi
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
 bridge_agent_idle_since_file() {
   local agent="$1"
   printf '%s/idle-since' "$(bridge_agent_idle_marker_dir "$agent")"
@@ -3565,6 +3649,36 @@ bridge_refresh_agent_session_id() {
 
     sleep "$sleep_seconds"
   done
+
+  # Lane A (v0.15.0-beta4) — #1279 R2: detect ran the full retry loop
+  # and never returned a session id. Pre-R3 (config_dir fix), this was
+  # the silent-skip path that masked the iso v2 mismatch — neither
+  # #1248 (persist-failed) nor #1265 (fresh-state) cover detect-stage
+  # empty results, so the controller dropped the call with no
+  # breadcrumb anywhere. Emit a single audit row capturing the
+  # resolution evidence so a future regression that re-introduces the
+  # mismatch (or a new iso-mode variant) cannot hide.
+  #
+  # Post-R3 (`bridge_agent_claude_config_dir` getent-based), this row
+  # should only fire when there genuinely is no transcript yet
+  # (fresh-state first wake before Claude has written anything) —
+  # making it a safety-net visibility hook, not an error.
+  local _iso_effective="0"
+  if command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 \
+      && bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null; then
+    _iso_effective="1"
+  fi
+  local _detect_expected_config_dir=""
+  if command -v bridge_resolve_agent_claude_config_dir >/dev/null 2>&1; then
+    _detect_expected_config_dir="$(bridge_resolve_agent_claude_config_dir "$agent" 2>/dev/null || true)"
+  fi
+  bridge_audit_log state session_id_detect_empty "$agent" \
+    --detail reason=detect_returned_empty_after_all_attempts \
+    --detail attempts="$attempts" \
+    --detail iso_effective="$_iso_effective" \
+    --detail expected_config_dir="${_detect_expected_config_dir:-<unresolved>}" \
+    --detail engine="$(bridge_agent_engine "$agent" 2>/dev/null || printf '<unknown>')" \
+    2>/dev/null || true
 
   return 1
 }

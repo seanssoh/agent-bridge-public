@@ -3063,6 +3063,178 @@ bridge_isolation_v2_write_agent_state_marker() {
 }
 
 # ---------------------------------------------------------------------------
+# 6b. sanitized per-agent metadata snippet (Lane A beta4)
+# ---------------------------------------------------------------------------
+#
+# `state/agents/<agent>/agent-meta.env` is a small secret-free key=value
+# file the iso UID context can read to populate just the iso-relevant
+# fields (`os_user`, `isolation_mode`, `engine`, etc.) without needing to
+# read the controller-protected `agent-roster.local.sh` (0600 owner=
+# controller). It is a SEPARATE file from the full scoped
+# `runtime/agent-env.sh` (sourced by `bridge_load_roster` at agent
+# launch time) — that file lives under `data/agents/<a>/runtime/` which
+# is gated by `ab-agent-<a>` membership + setgid, and reaching it from a
+# raw hook subprocess that has not had `BRIDGE_AGENT_ROOT_V2` exported
+# is brittle (the env can drop between agent stop and the next hook
+# call). `agent-meta.env` lives at a stable controller-rooted path
+# (`$BRIDGE_HOME/state/agents/<a>/`) that the iso UID can always
+# resolve via the early defaults in bridge-lib.sh.
+#
+# Contents (key=value lines, NO secrets, NO command bodies):
+#   BRIDGE_AGENT_OS_USER=agent-bridge-<a>
+#   BRIDGE_AGENT_ISOLATION_MODE=linux-user
+#   BRIDGE_AGENT_ENGINE=claude
+#   BRIDGE_AGENT_HOME=/home/agent-bridge-<a>
+#   BRIDGE_AGENT_CLAUDE_CONFIG_DIR=/home/agent-bridge-<a>/.claude
+#   BRIDGE_AGENT_AUDIT_DIR=<controller-rooted logs dir for this agent>
+#
+# Scope (codex r1 NEEDS-CLARIFY, PR #1286 r2): this snippet carries
+# STATIC agent properties ONLY — where the agent lives (home /
+# config_dir), under which OS user, with which engine, under which
+# isolation mode, and where its audit dir is. It does NOT carry
+# dynamic / lifecycle state. In particular, the Lane E (#1265 + #1269)
+# fresh-state detection contract is OUT OF SCOPE for this writer —
+# Lane E owns a separate marker (e.g. `state/agents/<a>/launch.history`
+# touched on first wake) so write responsibilities stay disjoint.
+# Future readers needing fresh-state must not extend this snippet with
+# launch-history fields; they must use the Lane E marker contract.
+#
+# Permissions: 0640, owner=controller, group=ab-agent-<a>. Iso UID
+# (group member) + controller (owner) both read; world has no access.
+#
+# The reader lives in `bridge-lib.sh` (post-module-source) and parses
+# the file via `read -r` line-by-line (no `source`) so the assoc-array
+# vs scalar collision documented in #1213 cannot fire.
+#
+# This writer is iso-v2 only. Non-iso agents skip — their controller
+# already has direct roster access and the iso UID context does not
+# exist.
+bridge_isolation_v2_write_agent_metadata() {
+  local agent="$1"
+  [[ -n "$agent" ]] || {
+    bridge_warn "write_agent_metadata: agent required"
+    return 1
+  }
+
+  # Linux-only: the writer is a no-op on macOS dev hosts (consistent
+  # with the rest of the iso-v2 sudo handoff path).
+  [[ "$(bridge_host_platform 2>/dev/null || printf '')" == "Linux" ]] || return 0
+
+  # Only write for iso-v2 agents. Non-iso agents in a v2-active install
+  # legitimately use the regular roster.
+  command -v bridge_agent_linux_user_isolation_effective >/dev/null 2>&1 || return 0
+  bridge_agent_linux_user_isolation_effective "$agent" 2>/dev/null || return 0
+
+  local os_user=""
+  local isolation_mode=""
+  local engine=""
+  local user_home=""
+  local claude_config_dir=""
+  local audit_dir=""
+  local agent_grp=""
+  local controller_user=""
+  local meta_dir=""
+  local meta_file=""
+
+  os_user="$(bridge_agent_os_user "$agent" 2>/dev/null || true)"
+  isolation_mode="$(bridge_agent_isolation_mode "$agent" 2>/dev/null || true)"
+  engine="$(bridge_agent_engine "$agent" 2>/dev/null || true)"
+  [[ -n "$os_user" ]] || {
+    bridge_warn "write_agent_metadata: bridge_agent_os_user('$agent') returned empty; cannot write metadata snippet"
+    return 1
+  }
+
+  user_home="$(bridge_agent_linux_user_home "$os_user")"
+  claude_config_dir="$user_home/.claude"
+  audit_dir="$(bridge_agent_log_dir "$agent" 2>/dev/null || true)"
+  agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || true)"
+  controller_user="$(bridge_current_user 2>/dev/null || true)"
+  meta_dir="$BRIDGE_ACTIVE_AGENT_DIR/$agent"
+  meta_file="$meta_dir/agent-meta.env"
+
+  # Ensure the controller-owned parent dir exists. The matrix apply path
+  # (state-agent-dir row) does this too, but call it idempotently here
+  # so the metadata writer is callable from `bridge-init.sh` /
+  # standalone repair contexts that do not transit the full matrix.
+  if [[ ! -d "$meta_dir" ]]; then
+    mkdir -p "$meta_dir" 2>/dev/null \
+      || _bridge_isolation_v2_run_root_or_sudo mkdir -p "$meta_dir" \
+      || {
+        bridge_warn "write_agent_metadata: cannot create $meta_dir"
+        return 1
+      }
+  fi
+
+  # Build atomically in a controller-owned temp under the same dir so
+  # the rename is on the same filesystem. The temp file inherits
+  # controller umask 077; we relax mode + chgrp after content is
+  # written.
+  local tmp_meta=""
+  tmp_meta="$(mktemp "$meta_dir/.agent-meta.env.XXXXXX" 2>/dev/null)" || {
+    # The parent dir may be group-writable but not controller-writable
+    # in odd repair states. Fall back to TMPDIR + sudo-mv.
+    tmp_meta="$(mktemp "${TMPDIR:-/tmp}/agent-meta.env.XXXXXX")" || {
+      bridge_warn "write_agent_metadata: mktemp failed for $agent"
+      return 1
+    }
+  }
+
+  {
+    printf '# Sanitized iso-UID-readable metadata snippet for agent=%s\n' "$agent"
+    printf '# Managed by agent-bridge. Regenerated on each prepare/reapply.\n'
+    printf '# Format: key=value, one per line. NOT sourced — parsed by bridge-lib.sh.\n'
+    printf '# Permissions: 0640 controller:%s — iso UID + controller both read.\n' "${agent_grp:-ab-agent-$agent}"
+    printf 'BRIDGE_AGENT_OS_USER=%s\n' "$os_user"
+    printf 'BRIDGE_AGENT_ISOLATION_MODE=%s\n' "${isolation_mode:-linux-user}"
+    printf 'BRIDGE_AGENT_ENGINE=%s\n' "${engine:-claude}"
+    printf 'BRIDGE_AGENT_HOME=%s\n' "$user_home"
+    printf 'BRIDGE_AGENT_CLAUDE_CONFIG_DIR=%s\n' "$claude_config_dir"
+    printf 'BRIDGE_AGENT_AUDIT_DIR=%s\n' "${audit_dir:-}"
+  } >"$tmp_meta" || {
+    rm -f "$tmp_meta" 2>/dev/null || true
+    bridge_warn "write_agent_metadata: cannot write content to $tmp_meta"
+    return 1
+  }
+
+  # Mode 0640 — controller (owner) rw, agent group r, world none.
+  chmod 0640 "$tmp_meta" 2>/dev/null || {
+    rm -f "$tmp_meta" 2>/dev/null || true
+    bridge_warn "write_agent_metadata: chmod 0640 failed for $tmp_meta"
+    return 1
+  }
+
+  # Group ownership. The controller is already a member of
+  # `ab-agent-<a>` (joined at prepare time), but the file is created
+  # under the controller's primary group — switch it. Best-effort
+  # (non-fatal): a chgrp failure here only narrows the read audience
+  # to the file owner; the iso UID would lose access, which is what
+  # the lane is fixing — so escalate to sudo if the direct chgrp
+  # fails.
+  if [[ -n "$agent_grp" ]]; then
+    if ! chgrp "$agent_grp" "$tmp_meta" 2>/dev/null; then
+      if ! _bridge_isolation_v2_run_root_or_sudo chgrp "$agent_grp" "$tmp_meta" 2>/dev/null; then
+        rm -f "$tmp_meta" 2>/dev/null || true
+        bridge_warn "write_agent_metadata: chgrp $agent_grp failed for $tmp_meta"
+        return 1
+      fi
+    fi
+  fi
+
+  # Atomic rename. If the parent dir is not controller-writable (some
+  # repair states), fall back to sudo mv.
+  if ! mv -f "$tmp_meta" "$meta_file" 2>/dev/null; then
+    if ! _bridge_isolation_v2_run_root_or_sudo mv -f "$tmp_meta" "$meta_file" 2>/dev/null; then
+      rm -f "$tmp_meta" 2>/dev/null \
+        || _bridge_isolation_v2_run_root_or_sudo rm -f "$tmp_meta" 2>/dev/null || true
+      bridge_warn "write_agent_metadata: rename failed: $tmp_meta -> $meta_file"
+      return 1
+    fi
+  fi
+
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # 7. exports
 # ---------------------------------------------------------------------------
 
