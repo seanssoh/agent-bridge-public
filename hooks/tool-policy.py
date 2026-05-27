@@ -652,23 +652,35 @@ _SAFE_REDIRECT_RE = re.compile(
 _NUMERIC_FD_WRITE_RE = re.compile(r"^[0-9]+>>?")
 
 
-# Issue #1255 r3 — `find` mutation/exec primitive filter.
+# Issue #1255 r3/r4 — `find` mutation/exec primitive filter.
 #
 # `find` is on `_READ_INTENT_BASH_COMMANDS` because the common operator
 # diagnostics (`find <roster> -name "*.sh"`, `find <roster> -type f`)
 # are pure reads. But find has built-in mutation and exec primitives
 # that the bare leader check does not see — `find -delete` removes
 # matches in place, and `find -exec` / `-execdir` / `-ok` / `-okdir`
-# spawn arbitrary subprocesses against each match. The `-fprint` /
-# `-fprint0` / `-fprintf` flags write matches to a file the operator
-# names, which is a roster-exfil channel even though no `>` token
-# appears in the command (codex PR #1294 r2 finding).
+# spawn arbitrary subprocesses against each match. The GNU-find file
+# actions `-fprint` / `-fprint0` / `-fprintf` / `-fls` write matches
+# (or `-ls`-style listings) to a file the operator names, which is a
+# roster-exfil channel even though no `>` token appears in the command
+# (codex PR #1294 r2 first surfaced `-fprint*`; r3 added `-fls`).
 #
 # Treat these flags as write-intent: when `find` is the stage leader
 # and any of them appears in argv, the stage falls out of the read-
 # intent classification. The output-redirection guard above already
 # catches `find -ls > somefile`; we do not need to enumerate that form
 # here.
+#
+# Comprehensive audit pass (codex PR #1294 r3, GNU find(1) actions):
+#   - `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir` — covered.
+#   - `-fprint`, `-fprint0`, `-fprintf` — covered.
+#   - `-fls` — covered (this commit).
+#   - `-ls`, `-print`, `-print0`, `-printf`, `-quit` — write stdout
+#     only; the output-redirection guard catches `> file` rebinding.
+#   - `-prune` — pure traversal control, no I/O.
+# No other GNU find action writes to a named file or spawns a child
+# without `>` redirect; the frozenset is now exhaustive for the file-
+# action + child-spawn classes.
 _FIND_MUTATION_FLAGS = frozenset(
     {
         "-delete",
@@ -679,6 +691,7 @@ _FIND_MUTATION_FLAGS = frozenset(
         "-fprint",
         "-fprint0",
         "-fprintf",
+        "-fls",
     }
 )
 
