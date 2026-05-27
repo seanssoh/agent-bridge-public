@@ -345,3 +345,31 @@ echo "1. Close the temporary installer session."
 echo "2. If you are staying in this terminal, run: $reload_command"
 echo "3. Run: $next_command"
 echo "4. Let the admin agent guide the rest of the onboarding."
+echo
+# #1261 (v0.15.0-beta4): OAT registration advisory. The
+# controller-credentials fallback (issue #1075) is the default on a
+# fresh install and works fine for short demo sessions, but it depends
+# on Claude CLI lazy-refreshing the controller's credential file —
+# which only happens when the CONTROLLER itself makes an API call. On
+# production agent-bridge deployments where the operator's day-to-day
+# work happens inside agents (the normal mode), the controller is idle
+# and its token expires after the next idle window, propagating a
+# stale credential to every agent and 401'ing them all at once
+# (~8h on a Max plan). Registering a Claude OAT (setup token) breaks
+# the single-point-of-failure: bridge-auth.sh's recover-due + sync
+# paths actively check OAT aliveness via /v1/messages ping and refresh
+# proactively. The aliveness gate in bridge-auth.py refuses to
+# propagate an expired controller credential (#1261), but a fresh
+# operator install will still hit the symptom on day 2 unless they
+# register the OAT. Flag it now while the operator is still in the
+# install loop.
+echo "Recommended next step — register a Claude OAuth Setup Token (OAT):"
+echo "  bash \"\$BRIDGE_HOME/bridge-auth.sh\" claude-token add \\"
+echo "      --id main --stdin --activate --sync --agents all --enable-auto-rotate"
+echo
+echo "Without an OAT, agent-bridge falls back to copying the controller's"
+# shellcheck disable=SC2088  # literal path documentation, not a path that needs expansion
+echo "~/.claude/.credentials.json once per hour. Claude CLI only refreshes"
+echo "that file when the controller itself makes an API call, so a controller"
+echo "idle while agents run will silently propagate an expired token to every"
+echo "agent on the next sync. See #1261 / #1075 for the full failure mode."

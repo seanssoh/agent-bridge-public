@@ -420,6 +420,21 @@ bridge_auth_sync_agents() {
   local -a agents=()
   local -a synced=()
   local -a failed=()
+  # Codex r1 BLOCKING #1 (2026-05-27): per-agent aliveness/remaining_ms
+  # propagation. Inner ``bridge_auth_sync_agent_python`` (-> bridge-auth.py
+  # cmd_sync_agent) emits a JSON envelope on stdout carrying
+  # ``aliveness`` + ``remaining_ms`` fields (alongside ``status`` /
+  # ``agent`` / ``fingerprint`` etc.). The pre-r2 wrapper captured
+  # stdout+stderr into ``output`` and DISCARDED it on the success branch,
+  # so the daemon's periodic-sync tick (bridge-daemon.sh:1944-1959) only
+  # saw the wrapper's top-level ``status`` field and could not audit
+  # which agents were synced with a near-expiry token. We now carry the
+  # per-agent payload through into the final wrapper JSON so structured
+  # consumers can branch on the per-agent ``aliveness`` value. Stderr
+  # ``warning:`` lines (the near-expiry banner emitted by cmd_sync_agent)
+  # are forwarded verbatim to OUR stderr so the operator sees them via
+  # the daemon's log capture rather than being swallowed.
+  local -a synced_payloads=()
 
   selection_error="$(mktemp "${TMPDIR:-/tmp}/agb-auth-select.XXXXXX" 2>/dev/null || printf '%s' "/tmp/agb-auth-select.$$.$RANDOM")"
   if ! selection_output="$(bridge_auth_selected_agents "$spec" 2>"$selection_error")"; then
@@ -466,11 +481,39 @@ PY
       rc=1
       continue
     fi
-    if ! output="$(bridge_auth_sync_agent_python "$agent" "$registry" "$file" 2>&1)"; then
-      failed+=("$agent:$output")
+    # Codex r1 BLOCKING #1: split stdout (JSON payload) from stderr
+    # (operator-visible warnings). Stderr lines that begin with
+    # ``warning:`` are the near-expiry banner from cmd_sync_agent — we
+    # forward them to OUR stderr so the daemon's log capture preserves
+    # them; everything else stays attached to the failure path for the
+    # ``$agent:error`` row.
+    local stderr_tmp=""
+    stderr_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-auth-sync.XXXXXX" 2>/dev/null || printf '%s' "/tmp/agb-auth-sync.$$.$RANDOM")"
+    if ! output="$(bridge_auth_sync_agent_python "$agent" "$registry" "$file" 2>"$stderr_tmp")"; then
+      local stderr_body=""
+      stderr_body="$(cat "$stderr_tmp" 2>/dev/null || printf '')"
+      rm -f "$stderr_tmp"
+      # Stitch stderr into the failure row so the original ``$agent:error``
+      # contract carries the underlying message. Newlines are flattened
+      # into ' | ' so the colon-separated row stays single-line.
+      local combined=""
+      if [[ -n "$stderr_body" ]]; then
+        combined="${output:+$output | }${stderr_body//$'\n'/ | }"
+      else
+        combined="$output"
+      fi
+      failed+=("$agent:${combined:-failed}")
       rc=1
       continue
     fi
+    # Forward operator-visible warnings (near-expiry banner from
+    # cmd_sync_agent) to our stderr so they remain visible to the daemon
+    # log capture; without this the warning is invisible to anything
+    # downstream of the wrapper.
+    if [[ -s "$stderr_tmp" ]]; then
+      cat "$stderr_tmp" >&2 || true
+    fi
+    rm -f "$stderr_tmp"
     # PR #799 r3 codex finding 1 — Python's ``write_private_file_atomic``
     # writes the tempfile, chmod/chown's it (when --owner-uid/--owner-gid
     # are passed) BEFORE ``os.replace``, so .credentials.json / .claude.json
@@ -490,18 +533,82 @@ PY
       continue
     fi
     synced+=("$agent")
+    # Codex r1 BLOCKING #1: capture the inner JSON so the wrapper can
+    # surface per-agent aliveness/remaining_ms to the daemon-side audit
+    # consumer (bridge-daemon.sh sync-aliveness-parse). Empty / non-JSON
+    # is tolerated — wrapper falls back to ``aliveness=""`` for that row.
+    synced_payloads+=("${output:-}")
     [[ "$json_mode" == "1" ]] || printf 'synced: %s -> %s\n' "$agent" "$file"
   done
 
   if [[ "$json_mode" == "1" ]]; then
-    python3 - "${synced[@]}" -- "${failed[@]}" <<'PY'
+    # Codex r1 BLOCKING #1 (2026-05-27): wrapper JSON now carries
+    # per-agent ``aliveness`` + ``remaining_ms`` so the daemon's
+    # periodic-sync tick can audit token freshness per row. The argv
+    # contract is:
+    #
+    #   argv[1..N-1] = synced rows; each row is ``agent\tpayload_json``
+    #                  (tab-separated). Empty / unparseable payload is
+    #                  tolerated — fields fall back to ``""``.
+    #   argv[N]     = literal ``--``
+    #   argv[N+1..] = failed rows in ``agent:error`` shape (unchanged).
+    #
+    # The python helper splits on the tab so the embedded JSON cannot
+    # collide with the row separator (the JSON itself contains commas
+    # but never tab characters — pretty-printed by cmd_sync_agent with
+    # indent=2 but no leading whitespace before the keys).
+    local -a synced_args=()
+    local idx=0
+    for ((idx = 0; idx < ${#synced[@]}; idx++)); do
+      # Flatten newlines so the row stays single-line; the helper's
+      # json.loads handles internal whitespace before the call.
+      local row_payload="${synced_payloads[idx]:-}"
+      row_payload="${row_payload//$'\n'/ }"
+      synced_args+=("${synced[idx]}"$'\t'"$row_payload")
+    done
+    if (( ${#synced_args[@]} == 0 )); then
+      synced_args=()
+    fi
+    python3 - "${synced_args[@]}" -- "${failed[@]}" <<'PY'
 import json
 import sys
 
 items = sys.argv[1:]
 sep = items.index("--") if "--" in items else len(items)
-synced = items[:sep]
+synced_raw = items[:sep]
 failed_raw = items[sep + 1 :]
+
+# Per-agent rows now carry the inner cmd_sync_agent JSON so the daemon
+# can audit aliveness/remaining_ms. Tab-separated to avoid collision
+# with the agent name (which is the ``--name`` slug, no whitespace).
+agents = []
+synced_names = []
+for row in synced_raw:
+    if "\t" in row:
+        agent, payload_text = row.split("\t", 1)
+    else:
+        agent, payload_text = row, ""
+    inner = {}
+    aliveness = ""
+    remaining_ms = 0
+    if payload_text.strip():
+        try:
+            inner = json.loads(payload_text)
+        except Exception:
+            inner = {}
+    if isinstance(inner, dict):
+        aliveness = str(inner.get("aliveness", "") or "")
+        try:
+            remaining_ms = int(inner.get("remaining_ms", 0) or 0)
+        except (TypeError, ValueError):
+            remaining_ms = 0
+    synced_names.append(agent)
+    agents.append({
+        "agent": agent,
+        "aliveness": aliveness,
+        "remaining_ms": remaining_ms,
+    })
+
 failed = []
 for row in failed_raw:
     if ":" in row:
@@ -509,8 +616,19 @@ for row in failed_raw:
     else:
         agent, error = row, "failed"
     failed.append({"agent": agent, "error": error})
-status = "ok" if not failed else ("failed" if not synced else "partial")
-print(json.dumps({"status": status, "agents": synced, "failed": failed}, ensure_ascii=True, indent=2))
+status = "ok" if not failed else ("failed" if not synced_names else "partial")
+# Backward-compatible: ``agents`` was previously a list[str] of synced
+# names. v0.15.0-beta4 Lane F r2 promotes it to list[dict] so per-agent
+# aliveness can ride along; consumers that only need the names should
+# pull from ``agent_names`` instead. The legacy daemon-helpers
+# ``sync-status-parse`` reads ``status`` (top-level) so its contract
+# stays intact.
+print(json.dumps({
+    "status": status,
+    "agents": agents,
+    "agent_names": synced_names,
+    "failed": failed,
+}, ensure_ascii=True, indent=2))
 PY
   fi
   return "$rc"

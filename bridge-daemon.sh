@@ -1903,6 +1903,79 @@ bridge_daemon_periodic_token_sync_state_file() {
   printf '%s/daemon/last-token-sync' "$BRIDGE_STATE_DIR"
 }
 
+# Codex r1 BLOCKING #1 (v0.15.0-beta4 Lane F r2, 2026-05-27).
+#
+# Parse per-agent ``aliveness`` + ``remaining_ms`` from a bridge-auth.sh
+# claude-token sync --json envelope and emit:
+#
+#   1. ``controller_credentials_aliveness`` audit row per agent — so the
+#      operator can correlate "which static agent received a near_expiry
+#      token at this tick" with the originating sync.
+#   2. ``daemon_warn`` for any agent with ``aliveness=near_expiry`` so
+#      the daemon log carries the warning without requiring audit.jsonl
+#      inspection. ``aliveness=expired`` cannot reach this path (the
+#      Python writer raises and the wrapper marks the row failed) but
+#      we still surface it loudly if it ever does.
+#
+# Empty JSON / skipped sync / non-aliveness wrapper shapes are tolerated
+# — the inner helper prints nothing and we audit nothing.
+#
+# Args:
+#   $1 — sync_json (wrapper JSON envelope from bridge-auth.sh)
+#   $2 — target agent id (for the audit row's `target` field; usually
+#        BRIDGE_ADMIN_AGENT_ID).
+#   $3 — trigger label (``periodic`` or ``recovery``) so the audit row
+#        records WHICH sync path produced the aliveness signal.
+bridge_daemon_audit_periodic_sync_aliveness() {
+  local sync_json="${1:-}"
+  local target="${2:-daemon}"
+  local trigger="${3:-periodic}"
+  local rows=""
+  local agent=""
+  local aliveness=""
+  local remaining_ms=""
+
+  [[ -n "$sync_json" ]] || return 0
+
+  # 5s ceiling — pure JSON parse + per-row print; rc=124|137 leaves
+  # ``rows`` empty and we audit nothing. Mirrors the timeout pattern
+  # used by sync-status-parse.
+  rows="$(bridge_with_timeout 5 sync_aliveness_parse python3 \
+    "$SCRIPT_DIR/bridge-daemon-helpers.py" sync-aliveness-parse "$sync_json" \
+    2>/dev/null || printf '')"
+
+  [[ -n "$rows" ]] || return 0
+
+  # Footgun #11: `done <<<"$rows"` would re-introduce the
+  # heredoc_write deadlock class. Walk the rows out of a tempfile
+  # instead (mirrors the pattern used by process_usage_alerts at
+  # ~lines 1782-1812 and 1869).
+  local _aliveness_tmp=""
+  _aliveness_tmp="$(mktemp "${TMPDIR:-/tmp}/agb-daemon-aliveness.XXXXXX" 2>/dev/null || printf '%s' "/tmp/agb-daemon-aliveness.$$.$RANDOM")"
+  printf '%s\n' "$rows" > "$_aliveness_tmp"
+
+  while IFS=$'\t' read -r agent aliveness remaining_ms; do
+    [[ -n "$agent" ]] || continue
+    bridge_audit_log daemon controller_credentials_aliveness "$target" \
+      --detail agent="$agent" \
+      --detail aliveness="${aliveness:-unknown}" \
+      --detail remaining_ms="${remaining_ms:-0}" \
+      --detail trigger="$trigger" \
+      2>/dev/null || true
+    if [[ "$aliveness" == "near_expiry" ]]; then
+      daemon_warn "claude token near_expiry for agent=$agent remaining_ms=${remaining_ms:-0} trigger=$trigger — run 'claude /login' on the controller or register a Claude OAT to avoid imminent 401s"
+    elif [[ "$aliveness" == "expired" ]]; then
+      # Should not happen — the inner writer raises before the sync row
+      # lands here — but if a future change ever stops raising, the
+      # operator MUST see it loudly.
+      daemon_warn "claude token expired for agent=$agent remaining_ms=${remaining_ms:-0} trigger=$trigger — controller credential was propagated despite being past expiry; investigate the aliveness gate"
+    fi
+  done < "$_aliveness_tmp"
+
+  rm -f "$_aliveness_tmp" 2>/dev/null || true
+  return 0
+}
+
 bridge_daemon_periodic_token_sync_due() {
   local interval="${BRIDGE_CLAUDE_TOKEN_SYNC_INTERVAL_SECONDS:-3600}"
   local file=""
@@ -1961,6 +2034,15 @@ bridge_daemon_periodic_token_sync_tick() {
       --detail agent_scope="$agent_scope" \
       --detail interval_seconds="$interval" \
       2>/dev/null || true
+    # Codex r1 BLOCKING #1 (v0.15.0-beta4 Lane F r2): per-agent
+    # aliveness audit. The wrapper JSON now carries
+    # ``agents: [{agent, aliveness, remaining_ms}, ...]``; for each row
+    # we emit a ``controller_credentials_aliveness`` audit detail line so
+    # the operator can correlate which static agent received a
+    # near-expiry token in the periodic tick. ``near_expiry`` rows are
+    # also emitted at info level so they show up in the daemon log
+    # without needing audit.jsonl inspection.
+    bridge_daemon_audit_periodic_sync_aliveness "$sync_json" "$target" "periodic" || true
     daemon_info "claude token periodic sync: status=${sync_status:-unknown} agents=$agent_scope interval=${interval}s"
     return 0
   fi
@@ -2037,6 +2119,13 @@ process_claude_token_recovery() {
     # so the operator sees the gap alongside the daemon_subprocess_timeout
     # row.
     sync_status="$(bridge_with_timeout 5 sync_status_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" sync-status-parse "$sync_json" || true)"
+    # Codex r1 BLOCKING #1 (v0.15.0-beta4 Lane F r2): per-agent
+    # aliveness audit on the recovery-driven sync as well. Same shape /
+    # contract as the periodic-sync tick — the recovery path is the
+    # other consumer that propagated the controller credential to
+    # static agents, so it must also surface the per-agent aliveness
+    # signal in audit.jsonl.
+    bridge_daemon_audit_periodic_sync_aliveness "$sync_json" "$target" "recovery" || true
   fi
 
   if [[ "$status" != "skipped" || "${checked_count:-0}" != "0" ]]; then
