@@ -113,6 +113,43 @@ EOF
 }
 
 # ---------------------------------------------------------------------
+# R3 (codex r2 BLOCKING): roster fixture that exercises the production
+# real-launch path end-to-end. The smoke can't spawn `claude` /
+# `codex` (no engine binary, no tmux), but it CAN drive the launch
+# loop with engine=shell + LAUNCH_CMD=true so the entire bridge-run.sh
+# path through the deferred-marker write (lines 326-331) and the
+# `--once` loop exit runs as production code.
+#
+# Why a non-claude/non-codex engine: every claude-specific setup block
+# in bridge-run.sh is gated on `[[ "$ENGINE" == "claude" ]]`
+# (`bridge_run_sync_dev_plugin_cache`, `bridge_run_prune_legacy_teams_mcp`,
+# `bridge_run_ensure_claude_launch_channel_plugins`,
+# `bridge_run_schedule_dev_channels_accept`,
+# `bridge_run_schedule_idle_marker_and_inbox_bootstrap`). engine=shell
+# routes through `bridge_agent_launch_cmd` fallback that returns the
+# raw BRIDGE_AGENT_LAUNCH_CMD entry, so we run `true` via
+# `bash -lc "true"` at line 1069, EXIT_CODE=0, --once exits 0.
+# ---------------------------------------------------------------------
+write_real_launch_roster() {
+  local agent="$1"
+  local continue_mode="$2"
+  local session_id="$3"
+  local workdir="$BRIDGE_AGENT_HOME_ROOT/$agent"
+  mkdir -p "$workdir"
+  cat >"$BRIDGE_ROSTER_LOCAL_FILE" <<EOF
+bridge_add_agent_id_if_missing "$agent"
+BRIDGE_AGENT_DESC["$agent"]="$agent smoke real-launch fixture"
+BRIDGE_AGENT_ENGINE["$agent"]="shell"
+BRIDGE_AGENT_SESSION["$agent"]="$agent"
+BRIDGE_AGENT_WORKDIR["$agent"]="$workdir"
+BRIDGE_AGENT_LAUNCH_CMD["$agent"]="true"
+BRIDGE_AGENT_LOOP["$agent"]=0
+BRIDGE_AGENT_CONTINUE["$agent"]=$continue_mode
+BRIDGE_AGENT_SESSION_ID["$agent"]="$session_id"
+EOF
+}
+
+# ---------------------------------------------------------------------
 # T1 — fresh agent (no launch.history) + continue=1 + session_id=""
 #      -> fresh-state branch fires. The dry-run must NOT die, must NOT
 #      emit a `--resume` verb (no session id to resume).
@@ -393,19 +430,44 @@ test_dry_run_sequence_side_effect_free() {
     smoke_fail "T_dry_run_seq step 2: marker MUST STILL NOT exist after second dry-run; found at $marker (R2 regression: dry-run is no longer side-effect-free)"
   fi
 
-  # Step 3: simulate a real launch reaching the post-dry-run real-launch
-  # block — that block touches the marker once. The smoke can't spawn
-  # claude; we simulate the marker write inline, exactly as the
-  # production block does.
-  mkdir -p "$(dirname "$marker")" 2>/dev/null || true
-  : >"$marker"
+  # Step 3 (R3 codex r2 BLOCKING): invoke the production real-launch
+  # path (no --dry-run, --once) with engine=shell + LAUNCH_CMD=true so
+  # the marker write at bridge-run.sh:326-331 runs as production code
+  # — NOT a manual inline `: >$marker` simulation. Step 3's prior shape
+  # (touch the BRIDGE_STATE_DIR path by hand) hid the codex r2 mismatch
+  # bug because it short-circuited the bridge-run path-construction
+  # logic entirely. The real bug: `_gate_launch_history` was built from
+  # `$BRIDGE_HOME/state/...` instead of the canonical
+  # `bridge_agent_idle_marker_dir <agent>` (=> `$BRIDGE_ACTIVE_AGENT_DIR/<a>`),
+  # so on a relocated state root they pointed to different trees. The
+  # real-launch invocation here exercises that exact code path under a
+  # canonical (BRIDGE_HOME-aligned) layout; T_state_dir_relocated below
+  # exercises it under the relocated layout (codex r2 direct repro).
+  #
+  # Re-write the roster as the real-launch fixture (engine=shell,
+  # LAUNCH_CMD=true) — the dry-run roster's `claude` engine would
+  # trigger the channel-plugin / Teams-prune setup blocks under a
+  # missing CLI which we don't want exercised here.
+  write_real_launch_roster "$agent" 1 ""
+
+  local out3=""
+  local rc3=0
+  set +e
+  out3="$(bash "$REPO_ROOT/bridge-run.sh" "$agent" --continue --once 2>&1)"
+  rc3=$?
+  set -e
+  smoke_assert_eq "0" "$rc3" \
+    "T_dry_run_seq step 3: real launch (engine=shell LAUNCH_CMD=true --once) exits 0 (out=$out3)"
   smoke_assert_file_exists "$marker" \
-    "T_dry_run_seq step 3: simulated real launch creates marker"
+    "T_dry_run_seq step 3: production real-launch path created the canonical marker at $marker"
 
   # Step 4: post-launch dry-run with empty session_id => lost-state die.
   # Same gate path as T2, but exercised on the same agent's lifecycle so
   # the whole sequence (fresh -> fresh -> launched -> lost) is covered
-  # end-to-end.
+  # end-to-end. Switch back to the dry-run roster (engine=claude) so
+  # this path matches T2's setup.
+  write_dryrun_roster "$agent" 1 ""
+
   local out4=""
   local rc4=0
   set +e
@@ -417,6 +479,103 @@ test_dry_run_sequence_side_effect_free() {
   fi
   smoke_assert_contains "$out4" "session_id missing" \
     "T_dry_run_seq step 4: lost-state die fires once marker is present (#1248 gate preserved)"
+}
+
+# ---------------------------------------------------------------------
+# T_state_dir_relocated — R3 (codex r2 BLOCKING) direct repro.
+#
+# When `BRIDGE_HOME` and `BRIDGE_STATE_DIR` are relocated independently
+# (operator override layout, isolated state-tree), the gate at
+# bridge-run.sh:257 used to compose `_gate_launch_history` from
+# `${BRIDGE_HOME:-$HOME/.agent-bridge}/state/agents/<a>/launch.history`
+# — i.e. it always anchored on `BRIDGE_HOME/state`, ignoring
+# `BRIDGE_STATE_DIR`. The real-launch self-heal block at lines 326-331
+# targeted the canonical `bridge_agent_state_dir_self_heal` directory
+# which composes from `BRIDGE_ACTIVE_AGENT_DIR` (=> `BRIDGE_STATE_DIR/agents`),
+# so the marker WRITE landed under BRIDGE_HOME/state but the daemon's
+# canonical-path read landed under BRIDGE_STATE_DIR/agents — they
+# silently disagreed and the next empty-sid gate never saw the marker.
+#
+# Codex r2 direct repro:
+#   BRIDGE_HOME=/tmp/.../home  (separate path)
+#   BRIDGE_STATE_DIR=/tmp/.../state (different path, also separate)
+#   => pre-R3: marker landed under BRIDGE_HOME/state/agents/<a>/
+#              while the canonical dir under BRIDGE_STATE_DIR/agents/<a>/
+#              stayed marker-less
+#   => post-R3: marker lands under BRIDGE_STATE_DIR/agents/<a>/ (canonical)
+#              AND nothing under BRIDGE_HOME/state/ (which is just the
+#              top-level layout root)
+#
+# Teeth: revert bridge-run.sh:257 to the BRIDGE_HOME-anchored shape and
+# this test fails (canonical marker absent, home marker present).
+# ---------------------------------------------------------------------
+test_state_dir_relocated_marker_canonical() {
+  local agent="e-Tcanon-relocated"
+
+  # Lay out a relocated-state-dir bridge home: BRIDGE_STATE_DIR points
+  # to a sibling tree that is NOT `$BRIDGE_HOME/state`. Everything else
+  # in smoke_setup_bridge_home stays aligned with the default tree —
+  # we override only the state-root pair on the subprocess env.
+  local relocated_state="$SMOKE_TMP_ROOT/relocated-state"
+  local relocated_active_agent_dir="$relocated_state/agents"
+  local relocated_history_dir="$relocated_state/history"
+  local relocated_layout_marker_dir="$relocated_state"
+  local relocated_cron_state_dir="$relocated_state/cron"
+  local relocated_task_db="$relocated_state/tasks.db"
+  mkdir -p \
+    "$relocated_state" \
+    "$relocated_active_agent_dir" \
+    "$relocated_history_dir" \
+    "$relocated_cron_state_dir"
+  # Mirror the layout-marker the default smoke setup writes under
+  # BRIDGE_STATE_DIR — the v2 resolver expects to find one under the
+  # active BRIDGE_STATE_DIR / BRIDGE_LAYOUT_MARKER_DIR.
+  cat >"$relocated_state/layout-marker.sh" <<EOF
+BRIDGE_LAYOUT=v2
+BRIDGE_DATA_ROOT=$BRIDGE_DATA_ROOT
+EOF
+  chmod 0644 "$relocated_state/layout-marker.sh"
+
+  write_real_launch_roster "$agent" 1 ""
+
+  local home_path_marker="$BRIDGE_HOME/state/agents/$agent/launch.history"
+  local canonical_path_marker="$relocated_active_agent_dir/$agent/launch.history"
+
+  # Belt + suspenders: pre-clear both candidate paths so a stale file
+  # from a prior smoke iteration cannot fake-pass either assertion.
+  # SC2115: guard against the `${var:?}/...` rm -rf expansion footgun
+  # — if either anchor is somehow unset the `:?` aborts with a
+  # diagnostic, never expands to a bare `/`.
+  rm -rf "${BRIDGE_HOME:?}/state/agents/$agent" "${relocated_active_agent_dir:?}/$agent" 2>/dev/null || true
+
+  local out=""
+  local rc=0
+  set +e
+  out="$(
+    BRIDGE_STATE_DIR="$relocated_state" \
+    BRIDGE_ACTIVE_AGENT_DIR="$relocated_active_agent_dir" \
+    BRIDGE_HISTORY_DIR="$relocated_history_dir" \
+    BRIDGE_LAYOUT_MARKER_DIR="$relocated_layout_marker_dir" \
+    BRIDGE_CRON_STATE_DIR="$relocated_cron_state_dir" \
+    BRIDGE_TASK_DB="$relocated_task_db" \
+    bash "$REPO_ROOT/bridge-run.sh" "$agent" --continue --once 2>&1
+  )"
+  rc=$?
+  set -e
+
+  smoke_assert_eq "0" "$rc" \
+    "T_state_dir_relocated: real launch exits 0 on relocated state root (out=$out)"
+
+  # Canonical marker MUST be present at the BRIDGE_STATE_DIR-anchored path.
+  if [[ ! -f "$canonical_path_marker" ]]; then
+    smoke_fail "T_state_dir_relocated: canonical marker MISSING at $canonical_path_marker — codex r2 BLOCKING repro: bridge-run.sh built _gate_launch_history off BRIDGE_HOME instead of canonical bridge_agent_idle_marker_dir/BRIDGE_STATE_DIR"
+  fi
+
+  # The wrong (BRIDGE_HOME-anchored) marker path MUST NOT exist —
+  # if it does, the gate is still writing to the legacy hardcoded path.
+  if [[ -f "$home_path_marker" ]]; then
+    smoke_fail "T_state_dir_relocated: BRIDGE_HOME-anchored marker present at $home_path_marker — codex r2 BLOCKING regression: gate path still hardcoded to \$BRIDGE_HOME/state/agents"
+  fi
 }
 
 # ---------------------------------------------------------------------
@@ -470,3 +629,4 @@ smoke_run "T5 teeth: bridge-run.sh fresh-state branch present"       test_teeth_
 smoke_run "T6 teeth: bridge-daemon.sh self-heal sites all present"   test_teeth_daemon_self_heal_sites_present
 smoke_run "T_dry_run_seq: dry-run side-effect-free across 2 runs (R2)" test_dry_run_sequence_side_effect_free
 smoke_run "T_neg_dry_run_marker: in-gate marker creation absent (R2)"  test_teeth_dry_run_marker_deferred
+smoke_run "T_state_dir_relocated: marker on canonical BRIDGE_STATE_DIR path (R3)" test_state_dir_relocated_marker_canonical

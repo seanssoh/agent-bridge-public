@@ -254,7 +254,21 @@ if [[ "$_resume_gate_enabled" == "1" && $SAFE_MODE -eq 0 ]]; then
     # to the lost-state die branch. We capture intent in a flag here
     # and the real-launch path (after the dry-run early-exit) creates
     # the marker exactly once, right before the launch loop.
-    _gate_launch_history="${BRIDGE_HOME:-$HOME/.agent-bridge}/state/agents/$AGENT/launch.history"
+    #
+    # R3 (codex r2 BLOCKING — canonical state-dir path): the marker
+    # path MUST anchor on the canonical per-agent state leaf
+    # (`bridge_agent_idle_marker_dir <agent>` => `$BRIDGE_ACTIVE_AGENT_DIR/<a>`,
+    # which composes from `$BRIDGE_STATE_DIR/agents`), not on the
+    # hardcoded `$BRIDGE_HOME/state/agents/<a>` path. On hosts where
+    # `BRIDGE_STATE_DIR` is relocated independently of `BRIDGE_HOME`
+    # (operator override, isolated test layout) the two diverge and the
+    # gate would write the marker into one tree while the
+    # `bridge_agent_state_dir_self_heal` helper used by the real-launch
+    # block (and the daemon wake paths) targets the canonical tree —
+    # they would silently disagree and the next empty-sid gate would
+    # never see the marker, breaking the #1248 lost-state -> die
+    # contract on relocated layouts.
+    _gate_launch_history="$(bridge_agent_idle_marker_dir "$AGENT")/launch.history"
     if [[ ! -f "$_gate_launch_history" ]]; then
       bridge_info "[run] fresh first-wake (no session yet) — launching new session (agent=$AGENT)"
       bridge_audit_log run fresh_first_wake "$AGENT" \
