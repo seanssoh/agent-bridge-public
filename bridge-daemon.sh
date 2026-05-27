@@ -5654,6 +5654,22 @@ bridge_daemon_cron_dispatch_wake() {
   mkdir -p "$(dirname "$state_file")"
   printf '%s' "$now_ts" >"$state_file"
 
+  # Issue #1269 (v0.15.0-beta4 Lane E): cron-dispatch wake is also an
+  # auto-start; self-heal the per-agent state leaf before invoking
+  # bridge-start.sh so a fresh-install agent does not fail to come up
+  # purely because `state/agents/<a>/` is absent. Mirrors the always-on
+  # + queued-on-demand branches in `process_on_demand_agents`.
+  if command -v bridge_agent_state_dir_self_heal >/dev/null 2>&1; then
+    if ! bridge_agent_state_dir_self_heal "$agent" >/dev/null 2>&1; then
+      bridge_daemon_note_autostart_failure "$agent" "state-dir-self-heal-failed"
+      bridge_audit_log daemon state_dir_self_heal_failed "$agent" \
+        --detail trigger=cron_dispatch_wake \
+        --detail task_id="$task_id" \
+        --detail family="$family" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
   if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
     daemon_info "auto-waked ${agent} (trigger=cron-dispatch #${task_id} family=${family})"
     bridge_audit_log daemon cron_dispatch_wake "$agent" \
@@ -6212,6 +6228,25 @@ process_on_demand_agents() {
           continue
         fi
         unset _agent_engine
+        # Issue #1269 (v0.15.0-beta4 Lane E): self-heal the per-agent
+        # `state/agents/<a>/` leaf before each daemon-driven wake. This
+        # mirrors the `agent create` / `agent start` path (#1252 Lane A12)
+        # so the daemon also auto-repairs missing/permission-broken state
+        # dirs that would otherwise force the operator to manually run
+        # `agent-bridge agent start <a>` after every fresh-install or
+        # VM-reboot. The helper is iso-v2-aware (gated on
+        # `bridge_agent_linux_user_isolation_effective`); on non-iso
+        # installs it creates the dir at mode 2770 without chgrp. Failure
+        # records a structured backoff reason and skips this tick so the
+        # next pass retries within the existing backoff cap.
+        if command -v bridge_agent_state_dir_self_heal >/dev/null 2>&1; then
+          if ! bridge_agent_state_dir_self_heal "$agent" >/dev/null 2>&1; then
+            bridge_daemon_note_autostart_failure "$agent" "state-dir-self-heal-failed"
+            bridge_audit_log daemon state_dir_self_heal_failed "$agent" \
+              --detail trigger=always_on_wake 2>/dev/null || true
+            continue
+          fi
+        fi
         if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
           session="$(bridge_agent_session "$agent")"
           sleep 1
@@ -6253,6 +6288,19 @@ process_on_demand_agents() {
         # would only re-fail at the same validator.
         if bridge_daemon_check_channel_status_or_hold "$agent"; then
           continue
+        fi
+        # Issue #1269 (v0.15.0-beta4 Lane E): state-dir self-heal parity
+        # with the always-on branch. Queued on-demand wake is still an
+        # auto-start, so the same auto-recovery contract applies (the
+        # agent should come up without an explicit `agent start` after
+        # a fresh install or daemon restart).
+        if command -v bridge_agent_state_dir_self_heal >/dev/null 2>&1; then
+          if ! bridge_agent_state_dir_self_heal "$agent" >/dev/null 2>&1; then
+            bridge_daemon_note_autostart_failure "$agent" "state-dir-self-heal-failed"
+            bridge_audit_log daemon state_dir_self_heal_failed "$agent" \
+              --detail trigger=on_demand_wake 2>/dev/null || true
+            continue
+          fi
         fi
         if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-start.sh" "$agent" >/dev/null 2>&1; then
           session="$(bridge_agent_session "$agent")"
