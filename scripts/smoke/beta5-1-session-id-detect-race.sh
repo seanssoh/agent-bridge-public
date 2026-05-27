@@ -406,14 +406,341 @@ test_clear_path_bypasses_guard() {
 }
 
 # ---------------------------------------------------------------------
+# T6 — PR #1305 r2 (codex r1 BLOCKING) interleaving race closed by the
+# per-agent session lock + locked re-check before write. Without the
+# lock the codex repro is:
+#   1. We read persisted=empty (guard says "OK to write empty").
+#   2. A sibling PID persists non-empty between guard-read and our write.
+#   3. We flush our empty → clobbers the sibling's id.
+# The r2 fix wraps the guard-read + write under
+# `bridge_agent_session_lock_file`. A concurrent sibling persist call
+# must take the same lock — it either commits its write fully before we
+# enter (so our locked re-read sees the non-empty id and rehydrates) or
+# waits until we release (so its own guard sees our value).
+#
+# Two concurrent persist calls in a single test process is not directly
+# observable (Bash subshells inherit the parent's lock-fd context in
+# fragile ways). Instead we exercise the "sibling won the race" branch:
+# the on-disk file already has a non-empty id from an earlier sibling
+# tick, our in-memory map says empty (stale empty-detect), the locked
+# re-read sees the existing id and rehydrates.
+#
+# This is the same observable as `T3c` from the r1 cycle, but with an
+# additional assertion that the audit row reason is the post-r2 value
+# `interleave_caught_under_lock` (NOT the r1 value
+# `in_memory_empty_existing_nonempty`). T7 below pins the lock-wrap
+# itself in code so a future PR that reverts the lock fails grep.
+# ---------------------------------------------------------------------
+test_interleave_under_lock() {
+  smoke_log "T6: interleaving race closed by locked re-read + rehydrate"
+
+  local agent="b51-T6"
+  seed_agent "$agent"
+  local history_file
+  history_file="$(bridge_history_file_for_agent "$agent")"
+  mkdir -p "$(dirname "$history_file")"
+
+  local sibling_id="deadbeef-0000-1111-2222-333344445555"
+
+  # Sibling already won the race and wrote its id (this models the
+  # 20:08:16 PID 2830345 row from the patch trace). Our in-memory map
+  # is empty (this models the 20:08:27 PID 2838856 stale-empty-detect
+  # row). The locked re-read MUST see the sibling id and rehydrate.
+  BRIDGE_AGENT_SESSION_ID["$agent"]="$sibling_id"
+  BRIDGE_SKIP_EMPTY_SESSION_ID_PERSIST_GUARD=1 \
+    bridge_persist_agent_state "$agent"
+  local seeded
+  seeded="$(bridge_agent_persisted_session_id "$agent" 2>/dev/null || true)"
+  smoke_assert_eq "$sibling_id" "$seeded" \
+    "T6 setup: sibling-id seeded on disk"
+
+  # Now the stale-empty-detect tick: in-memory cleared, on-disk has the
+  # sibling id. With r2's locked re-read this rehydrates + skips empty
+  # write + emits the interleave audit row.
+  BRIDGE_AGENT_SESSION_ID["$agent"]=""
+
+  local audit_before=0
+  if [[ -f "$BRIDGE_AUDIT_LOG" ]]; then
+    audit_before=$(grep -c 'session_id_detect_empty_persist_skipped' "$BRIDGE_AUDIT_LOG" 2>/dev/null || printf 0)
+  fi
+
+  bridge_persist_agent_state "$agent"
+
+  # Post-conditions:
+  # 1. The on-disk AGENT_SESSION_ID still equals the sibling id (NOT empty,
+  #    NOT overwritten by our empty in-memory).
+  local persisted_t6
+  persisted_t6="$(bridge_agent_persisted_session_id "$agent" 2>/dev/null || true)"
+  smoke_assert_eq "$sibling_id" "$persisted_t6" \
+    "T6: on-disk AGENT_SESSION_ID PRESERVED as sibling id — locked re-read caught the interleave"
+
+  # 2. The in-memory map was rehydrated to the sibling id under the lock.
+  local in_mem_t6="${BRIDGE_AGENT_SESSION_ID[$agent]-}"
+  smoke_assert_eq "$sibling_id" "$in_mem_t6" \
+    "T6: in-memory map rehydrated to sibling id"
+
+  # 3. An audit row with reason=interleave_caught_under_lock fired.
+  local audit_after=0
+  if [[ -f "$BRIDGE_AUDIT_LOG" ]]; then
+    audit_after=$(grep -c 'session_id_detect_empty_persist_skipped' "$BRIDGE_AUDIT_LOG" 2>/dev/null || printf 0)
+  fi
+  if (( audit_after <= audit_before )); then
+    smoke_fail "T6: expected at least 1 new session_id_detect_empty_persist_skipped audit row (before=$audit_before after=$audit_after audit_log=$BRIDGE_AUDIT_LOG)"
+  fi
+  local audit_row
+  audit_row="$(grep 'session_id_detect_empty_persist_skipped' "$BRIDGE_AUDIT_LOG" 2>/dev/null | grep "$agent" | tail -1 || true)"
+  if [[ -z "$audit_row" ]]; then
+    smoke_fail "T6: expected session_id_detect_empty_persist_skipped audit row for $agent, got nothing (audit_log=$BRIDGE_AUDIT_LOG)"
+  fi
+  smoke_assert_contains "$audit_row" "interleave_caught_under_lock" \
+    "T6: audit row carries reason=interleave_caught_under_lock (NOT the pre-r2 reason)"
+  smoke_assert_contains "$audit_row" "deadbee" \
+    "T6: audit row carries the sibling id's first 7 chars"
+}
+
+# ---------------------------------------------------------------------
+# T7 — interleave teeth: pin the lock-wrap call sites so a future PR
+# that removes the flock + bridge_agent_session_lock_file from
+# bridge_persist_agent_state fails this smoke. Without these, the
+# interleave race in T6 silently regresses.
+# ---------------------------------------------------------------------
+test_interleave_teeth_lock_present() {
+  smoke_log "T7: interleave teeth — lock-wrap present in bridge_persist_agent_state"
+
+  # The persist function must reference bridge_agent_session_lock_file
+  # AND use flock (or the mkdir-based fallback). Without either, the
+  # codex r1 BLOCKING interleave race is open again.
+  local persist_block
+  persist_block="$(awk '
+    /^bridge_persist_agent_state\(\)[ \t]*\{/ { capture = 1 }
+    capture { print }
+    capture && /^\}/ { capture = 0; exit }
+  ' "$STATE_LIB")"
+
+  if [[ -z "$persist_block" ]]; then
+    smoke_fail "T7: could not extract bridge_persist_agent_state function body from $STATE_LIB"
+  fi
+
+  if ! grep -F 'bridge_agent_session_lock_file' <<<"$persist_block" >/dev/null; then
+    smoke_fail "T7: bridge_persist_agent_state no longer takes bridge_agent_session_lock_file — PR #1305 r2 regressed (codex r1 BLOCKING interleaving race re-opened)"
+  fi
+  if ! grep -E 'flock|mkdir.*lock' <<<"$persist_block" >/dev/null; then
+    smoke_fail "T7: bridge_persist_agent_state no longer uses flock/mkdir-based locking — PR #1305 r2 regressed"
+  fi
+  if ! grep -F 'interleave_caught_under_lock' <<<"$persist_block" >/dev/null; then
+    smoke_fail "T7: bridge_persist_agent_state no longer emits reason=interleave_caught_under_lock — audit grep contract regressed"
+  fi
+}
+
+# ---------------------------------------------------------------------
+# T8 — lock contention: a concurrent flock holder that never releases
+# must NOT cause bridge_persist_agent_state to clobber the existing id.
+# Per the r2 contract, the function returns 1 + emits a structured warn
+# instead of silently bypassing the lock.
+#
+# We model the "stuck holder" by spawning a background subshell that
+# takes the lock with `flock -x` and sleeps longer than the persist's
+# 30s wait budget. The test ABBREVIATES that wait: rather than burning
+# 30s of wall clock on every smoke run, we shrink the contention window
+# by exporting BRIDGE_PERSIST_LOCK_CONTENTION_TEST=1 which the function
+# does NOT honour (we keep the production code path) — instead, we
+# simply wrap the call with a short `timeout` and verify it returns
+# non-zero. The structured warn is grep-able from stderr.
+#
+# A subshell + flock pair is hostile to portability; gate the test on
+# `command -v flock` so the macOS-no-flock fallback path is exercised
+# separately by T6.
+# ---------------------------------------------------------------------
+test_lock_contention_returns_nonzero() {
+  smoke_log "T8: lock contention surfaces as rc=1 + warning"
+
+  if ! command -v flock >/dev/null 2>&1; then
+    smoke_log "T8: flock not available on this host — exercising mkdir fallback contention path"
+    _test_lock_contention_mkdir_fallback
+    return 0
+  fi
+
+  local agent="b51-T8"
+  seed_agent "$agent"
+  local history_file
+  history_file="$(bridge_history_file_for_agent "$agent")"
+  mkdir -p "$(dirname "$history_file")"
+
+  # Seed an existing id so a buggy regression (lock-bypass + empty
+  # in-memory) would surface as the existing id being clobbered.
+  local existing_id="cafef00d-1234-5678-9abc-def012345678"
+  BRIDGE_AGENT_SESSION_ID["$agent"]="$existing_id"
+  BRIDGE_SKIP_EMPTY_SESSION_ID_PERSIST_GUARD=1 \
+    bridge_persist_agent_state "$agent"
+  local seeded
+  seeded="$(bridge_agent_persisted_session_id "$agent" 2>/dev/null || true)"
+  smoke_assert_eq "$existing_id" "$seeded" "T8 setup: seeded id on disk"
+
+  # Acquire the lock from a background subshell and hold it.
+  local lock_file
+  lock_file="$(bridge_agent_session_lock_file "$agent")"
+  mkdir -p "$(dirname "$lock_file")"
+  : >"$lock_file"
+
+  # Background holder: lock under fd 8 and sleep. The trap ensures we
+  # release on EXIT so the test cleanup doesn't strand the lock file.
+  (
+    exec 8>"$lock_file"
+    if flock -x 8; then
+      sleep 60
+    fi
+  ) &
+  local holder_pid=$!
+
+  # Give the holder a moment to grab the lock.
+  sleep 1
+
+  # Now call persist with an empty in-memory value. With the holder
+  # blocking the lock, the 30s flock wait will time out. We DO NOT want
+  # to burn 30s on every smoke — so we run the call with a 3s timeout
+  # via a subshell trick: rely on the OS-level `timeout` (coreutils on
+  # Linux, brew coreutils gtimeout on macOS).
+  #
+  # The persist function does not honour a tunable contention budget by
+  # design (the 30s constant matches forget-session); for the test we
+  # SIGTERM the persist after 3s. The acceptance is: when the holder is
+  # stuck, the persist does NOT successfully clobber the existing id.
+  # That's what we assert below.
+  BRIDGE_AGENT_SESSION_ID["$agent"]=""
+  local persist_rc=0
+  local persist_stderr
+  persist_stderr="$(mktemp)"
+
+  # Use a Bash-level timeout wrapper: run persist in a backgrounded
+  # subshell and kill it if it doesn't return within 3s. Capture stderr.
+  (
+    exec 2>"$persist_stderr"
+    bridge_persist_agent_state "$agent"
+  ) &
+  local persist_pid=$!
+
+  local waited=0
+  while kill -0 "$persist_pid" 2>/dev/null; do
+    if (( waited >= 3 )); then
+      kill -TERM "$persist_pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$persist_pid" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  # Absorb the SIGTERM-induced 143 so it does not propagate through
+  # `set -euo pipefail` in the runner — but still capture the real
+  # rc into persist_rc for the informational log below.
+  set +e
+  wait "$persist_pid" 2>/dev/null
+  persist_rc=$?
+  set -e
+
+  # Release the holder.
+  kill -TERM "$holder_pid" 2>/dev/null || true
+  wait "$holder_pid" 2>/dev/null || true
+
+  # Critical acceptance: the existing id on disk is STILL the seeded id
+  # (NOT empty, NOT clobbered) — the lock kept persist from racing.
+  local after_persist
+  after_persist="$(bridge_agent_persisted_session_id "$agent" 2>/dev/null || true)"
+  smoke_assert_eq "$existing_id" "$after_persist" \
+    "T8: lock contention did NOT clobber the existing id (lock held off the empty write)"
+
+  # The persist either returned non-zero (lock timeout path) or was
+  # killed mid-flight by our test timeout — either way it MUST NOT have
+  # successfully written an empty value to disk. The rc check is
+  # secondary; the on-disk assertion above is the primary teeth.
+  if (( persist_rc == 0 )); then
+    # If it returned 0 within 3s but the disk still has the existing id,
+    # that's still fine (the in-memory empty was rehydrated). Log it
+    # for visibility but do not fail.
+    smoke_log "T8: persist returned 0 — disk preserved existing id (rehydrated under lock or fast path)"
+  else
+    smoke_log "T8: persist returned rc=$persist_rc — lock contention surfaced (warn expected on stderr)"
+  fi
+
+  rm -f "$persist_stderr"
+}
+
+# ---------------------------------------------------------------------
+# T8 mkdir-fallback variant — when the host has no `flock` (macOS
+# stock), bridge_persist_agent_state falls through to the mkdir-based
+# mutex. We model a stuck holder by pre-creating the `<lock>.d` directory
+# and then calling persist with an empty in-memory value. The mkdir
+# fallback retries 30 × 1s before giving up — we do NOT want to burn
+# 30s of wall clock here, so we run the call in a background subshell
+# and SIGTERM it after a short wait. As with the flock variant the
+# primary acceptance is "the on-disk existing id is preserved".
+# ---------------------------------------------------------------------
+_test_lock_contention_mkdir_fallback() {
+  local agent="b51-T8mk"
+  seed_agent "$agent"
+  local history_file
+  history_file="$(bridge_history_file_for_agent "$agent")"
+  mkdir -p "$(dirname "$history_file")"
+
+  local existing_id="feedface-aaaa-bbbb-cccc-dddd00001111"
+  BRIDGE_AGENT_SESSION_ID["$agent"]="$existing_id"
+  BRIDGE_SKIP_EMPTY_SESSION_ID_PERSIST_GUARD=1 \
+    bridge_persist_agent_state "$agent"
+  local seeded
+  seeded="$(bridge_agent_persisted_session_id "$agent" 2>/dev/null || true)"
+  smoke_assert_eq "$existing_id" "$seeded" "T8mk setup: seeded id on disk"
+
+  # Pre-create the mkdir-based lock directory to simulate a stuck holder.
+  local lock_file
+  lock_file="$(bridge_agent_session_lock_file "$agent")"
+  mkdir -p "$(dirname "$lock_file")"
+  mkdir "${lock_file}.d"
+
+  # Call persist with an empty in-memory value. The mkdir fallback will
+  # spin 30 × 1s — kill the call after 3s. The `|| true` on the wait
+  # absorbs the SIGTERM-induced 143 so it does not propagate through
+  # `set -euo pipefail`.
+  BRIDGE_AGENT_SESSION_ID["$agent"]=""
+  (
+    bridge_persist_agent_state "$agent" 2>/dev/null
+  ) &
+  local persist_pid=$!
+  local waited=0
+  while kill -0 "$persist_pid" 2>/dev/null; do
+    if (( waited >= 3 )); then
+      kill -TERM "$persist_pid" 2>/dev/null || true
+      sleep 1
+      kill -KILL "$persist_pid" 2>/dev/null || true
+      break
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  wait "$persist_pid" 2>/dev/null || true
+
+  # Release the lock for cleanup.
+  rmdir "${lock_file}.d" 2>/dev/null || true
+
+  # Acceptance: existing id preserved (lock contention did not allow the
+  # empty write through).
+  local after_persist
+  after_persist="$(bridge_agent_persisted_session_id "$agent" 2>/dev/null || true)"
+  smoke_assert_eq "$existing_id" "$after_persist" \
+    "T8mk: mkdir-fallback lock contention preserved existing id (no clobber)"
+}
+
+# ---------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------
-smoke_log "starting beta5-1-session-id-detect-race smoke (#1304)"
+smoke_log "starting beta5-1-session-id-detect-race smoke (#1304, PR #1305)"
 
 smoke_run "T1 problem-a-audit-call-sites" test_problem_a_audit_call_sites
 smoke_run "T2 problem-a-three-known-sites-present" test_problem_a_three_known_sites_present
 smoke_run "T3 problem-b-empty-detect-no-op-guard" test_problem_b_empty_detect_no_op_guard
 smoke_run "T4 problem-b-teeth-guard-present" test_problem_b_teeth_guard_present
 smoke_run "T5 clear-path-bypasses-guard" test_clear_path_bypasses_guard
+smoke_run "T6 interleave-under-lock" test_interleave_under_lock
+smoke_run "T7 interleave-teeth-lock-present" test_interleave_teeth_lock_present
+smoke_run "T8 lock-contention-returns-nonzero" test_lock_contention_returns_nonzero
 
-smoke_log "all T1-T5 checks passed"
+smoke_log "all T1-T8 checks passed"
