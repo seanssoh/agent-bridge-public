@@ -4775,6 +4775,30 @@ bridge_clear_plugin_liveness_state() {
   rm -f "$(bridge_plugin_liveness_state_file "$agent")"
 }
 
+# Issue #1307 (v0.15.0-beta5-1 Lane 3) — defense-in-depth: when an agent
+# has MCP-liveness giveup armed, the silent-clear paths in
+# bridge_report_plugin_liveness_miss must NOT delete the state file,
+# because that would wipe GIVEUP/GIVEUP_TS before
+# process_mcp_liveness_giveup_recovery can emit
+# `plugin_mcp_liveness_recovered`. The primary close is the daemon
+# main-loop re-ordering (recovery runs before plugin_liveness); this
+# helper is the belt-and-suspenders guard so a future re-ordering or a
+# new silent-clear call site can't silently re-open the bypass.
+#
+# When giveup is active, the giveup ledger has already short-circuited
+# bridge_report_plugin_liveness_miss above the silent-clear branches in
+# practice (channel-status / session / missing-CSV transitions usually
+# happen alongside the same agent normalisation that triggered
+# recovery). The guard exists to make that contract explicit at the
+# clear call sites rather than implicit in tick ordering.
+bridge_clear_plugin_liveness_state_if_no_giveup() {
+  local agent="$1"
+  if bridge_agent_mcp_giveup_active "$agent"; then
+    return 0
+  fi
+  bridge_clear_plugin_liveness_state "$agent"
+}
+
 bridge_note_plugin_liveness_state() {
   local agent="$1"
   local last_key="$2"
@@ -4788,12 +4812,156 @@ bridge_note_plugin_liveness_state() {
   [[ "$restart_attempts" =~ ^[0-9]+$ ]] || restart_attempts=0
   state_file="$(bridge_plugin_liveness_state_file "$agent")"
   mkdir -p "$(dirname "$state_file")"
-  cat >"$state_file" <<EOF
-LAST_KEY=$(printf '%q' "$last_key")
-LAST_DETECTED_TS=$(printf '%q' "$last_detected_ts")
-LAST_RESTART_TS=$(printf '%q' "$last_restart_ts")
-RESTART_ATTEMPTS=$(printf '%q' "$restart_attempts")
-EOF
+  # Preserve giveup + activity-state observer fields across this write.
+  # The base note path (called by bridge_report_plugin_liveness_miss every
+  # tick) must not clobber the giveup ledger that
+  # bridge_agent_mcp_giveup_arm wrote, nor the LAST_ACTIVITY_STATE that
+  # process_mcp_liveness_giveup_recovery uses to detect transitions.
+  # Issue #1307 (v0.15.0-beta5-1 Lane 3).
+  local _carry_giveup=""
+  local _carry_giveup_ts=""
+  local _carry_last_activity_state=""
+  if [[ -f "$state_file" ]]; then
+    local GIVEUP="" GIVEUP_TS="" LAST_ACTIVITY_STATE=""
+    daemon_source_state_file "$state_file" "plugin-liveness/$agent" 0 "" \
+        "GIVEUP GIVEUP_TS LAST_ACTIVITY_STATE" || true
+    _carry_giveup="${GIVEUP:-}"
+    _carry_giveup_ts="${GIVEUP_TS:-}"
+    _carry_last_activity_state="${LAST_ACTIVITY_STATE:-}"
+  fi
+  {
+    printf 'LAST_KEY=%s\n' "$(printf '%q' "$last_key")"
+    printf 'LAST_DETECTED_TS=%s\n' "$(printf '%q' "$last_detected_ts")"
+    printf 'LAST_RESTART_TS=%s\n' "$(printf '%q' "$last_restart_ts")"
+    printf 'RESTART_ATTEMPTS=%s\n' "$(printf '%q' "$restart_attempts")"
+    [[ -n "$_carry_giveup" ]] && printf 'GIVEUP=%s\n' "$(printf '%q' "$_carry_giveup")"
+    [[ -n "$_carry_giveup_ts" ]] && printf 'GIVEUP_TS=%s\n' "$(printf '%q' "$_carry_giveup_ts")"
+    [[ -n "$_carry_last_activity_state" ]] && printf 'LAST_ACTIVITY_STATE=%s\n' "$(printf '%q' "$_carry_last_activity_state")"
+  } >"$state_file"
+}
+
+# Issue #1307 (v0.15.0-beta5-1 Lane 3) — MCP-liveness giveup ledger helpers.
+#
+# After 5 failed restart attempts (RESTART_ATTEMPTS >= max_restarts), the
+# liveness loop emits `plugin_mcp_liveness_giveup` and stops restarting the
+# agent. Without this ledger, the giveup state was sticky-for-life — the
+# daemon had no way to know "agent has recovered, retry MCP liveness now".
+# These helpers persist the giveup flag + timestamp, expose query
+# primitives, and bound the auto-clear surface to the giveup-arm path.
+
+bridge_agent_mcp_giveup_arm() {
+  local agent="$1"
+  local now_ts="${2:-$(date +%s)}"
+  local state_file=""
+  local LAST_KEY="" LAST_DETECTED_TS="" LAST_RESTART_TS="" RESTART_ATTEMPTS="" \
+      GIVEUP="" GIVEUP_TS="" LAST_ACTIVITY_STATE=""
+
+  [[ "$now_ts" =~ ^[0-9]+$ ]] || now_ts="$(date +%s)"
+  state_file="$(bridge_plugin_liveness_state_file "$agent")"
+  mkdir -p "$(dirname "$state_file")"
+  if [[ -f "$state_file" ]]; then
+    daemon_source_state_file "$state_file" "plugin-liveness/$agent" 0 "" \
+        "LAST_KEY LAST_DETECTED_TS LAST_RESTART_TS RESTART_ATTEMPTS GIVEUP GIVEUP_TS LAST_ACTIVITY_STATE" || true
+  fi
+  {
+    [[ -n "$LAST_KEY" ]] && printf 'LAST_KEY=%s\n' "$(printf '%q' "$LAST_KEY")"
+    [[ -n "$LAST_DETECTED_TS" ]] && printf 'LAST_DETECTED_TS=%s\n' "$(printf '%q' "$LAST_DETECTED_TS")"
+    [[ -n "$LAST_RESTART_TS" ]] && printf 'LAST_RESTART_TS=%s\n' "$(printf '%q' "$LAST_RESTART_TS")"
+    [[ -n "$RESTART_ATTEMPTS" ]] && printf 'RESTART_ATTEMPTS=%s\n' "$(printf '%q' "$RESTART_ATTEMPTS")"
+    printf 'GIVEUP=%s\n' "$(printf '%q' '1')"
+    printf 'GIVEUP_TS=%s\n' "$(printf '%q' "$now_ts")"
+    [[ -n "$LAST_ACTIVITY_STATE" ]] && printf 'LAST_ACTIVITY_STATE=%s\n' "$(printf '%q' "$LAST_ACTIVITY_STATE")"
+  } >"$state_file"
+}
+
+bridge_agent_mcp_giveup_active() {
+  local agent="$1"
+  local state_file=""
+  local GIVEUP=""
+
+  state_file="$(bridge_plugin_liveness_state_file "$agent")"
+  [[ -f "$state_file" ]] || return 1
+  daemon_source_state_file "$state_file" "plugin-liveness/$agent" 0 "" \
+      "GIVEUP" || return 1
+  [[ "${GIVEUP:-}" == "1" ]]
+}
+
+bridge_agent_mcp_giveup_ts() {
+  local agent="$1"
+  local state_file=""
+  local GIVEUP_TS=""
+
+  state_file="$(bridge_plugin_liveness_state_file "$agent")"
+  [[ -f "$state_file" ]] || { printf '0'; return 1; }
+  daemon_source_state_file "$state_file" "plugin-liveness/$agent" 0 "" \
+      "GIVEUP_TS" || { printf '0'; return 1; }
+  if [[ "${GIVEUP_TS:-}" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$GIVEUP_TS"
+  else
+    printf '0'
+  fi
+}
+
+bridge_agent_mcp_giveup_clear() {
+  local agent="$1"
+  local state_file=""
+  local LAST_ACTIVITY_STATE=""
+
+  state_file="$(bridge_plugin_liveness_state_file "$agent")"
+  if [[ -f "$state_file" ]]; then
+    # Preserve LAST_ACTIVITY_STATE across the clear so the next observer
+    # tick still has the "previous state" anchor to compute transitions
+    # against. RESTART_ATTEMPTS resets to 0 — that's the whole point of
+    # the clear, give the agent a fresh restart budget on its next miss.
+    daemon_source_state_file "$state_file" "plugin-liveness/$agent" 0 "" \
+        "LAST_ACTIVITY_STATE" || true
+  fi
+  {
+    [[ -n "$LAST_ACTIVITY_STATE" ]] && printf 'LAST_ACTIVITY_STATE=%s\n' "$(printf '%q' "$LAST_ACTIVITY_STATE")"
+  } >"$state_file"
+}
+
+# Note the observed activity_state for an agent. Used by the observer tick
+# to detect non-idle → idle transitions across iterations without losing
+# the giveup ledger fields.
+bridge_agent_mcp_note_activity_state() {
+  local agent="$1"
+  local state="$2"
+  local state_file=""
+  local LAST_KEY="" LAST_DETECTED_TS="" LAST_RESTART_TS="" RESTART_ATTEMPTS="" \
+      GIVEUP="" GIVEUP_TS=""
+
+  state_file="$(bridge_plugin_liveness_state_file "$agent")"
+  mkdir -p "$(dirname "$state_file")"
+  if [[ -f "$state_file" ]]; then
+    daemon_source_state_file "$state_file" "plugin-liveness/$agent" 0 "" \
+        "LAST_KEY LAST_DETECTED_TS LAST_RESTART_TS RESTART_ATTEMPTS GIVEUP GIVEUP_TS" || true
+  fi
+  {
+    [[ -n "$LAST_KEY" ]] && printf 'LAST_KEY=%s\n' "$(printf '%q' "$LAST_KEY")"
+    [[ -n "$LAST_DETECTED_TS" ]] && printf 'LAST_DETECTED_TS=%s\n' "$(printf '%q' "$LAST_DETECTED_TS")"
+    [[ -n "$LAST_RESTART_TS" ]] && printf 'LAST_RESTART_TS=%s\n' "$(printf '%q' "$LAST_RESTART_TS")"
+    [[ -n "$RESTART_ATTEMPTS" ]] && printf 'RESTART_ATTEMPTS=%s\n' "$(printf '%q' "$RESTART_ATTEMPTS")"
+    [[ -n "$GIVEUP" ]] && printf 'GIVEUP=%s\n' "$(printf '%q' "$GIVEUP")"
+    [[ -n "$GIVEUP_TS" ]] && printf 'GIVEUP_TS=%s\n' "$(printf '%q' "$GIVEUP_TS")"
+    printf 'LAST_ACTIVITY_STATE=%s\n' "$(printf '%q' "$state")"
+  } >"$state_file"
+}
+
+# Probe MCP-liveness for one agent. Returns 0 if no probable MCP channels
+# are missing (recovery achieved), non-zero otherwise. Mirrors the missing-
+# CSV probe inside bridge_report_plugin_liveness_miss but without the
+# restart logic — strictly read-only.
+bridge_recheck_mcp_liveness() {
+  local agent="$1"
+  local missing=""
+
+  [[ -n "$agent" ]] || return 2
+  [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 2
+  # bridge_agent_missing_plugin_mcp_channels_csv returns the CSV of
+  # probeable channels still missing. Empty string == recovered.
+  missing="$(bridge_agent_missing_plugin_mcp_channels_csv "$agent" 2>/dev/null || true)"
+  [[ -z "$missing" ]]
 }
 
 bridge_report_plugin_liveness_miss() {
@@ -4824,29 +4992,35 @@ bridge_report_plugin_liveness_miss() {
   [[ "$(bridge_agent_source "$agent")" == "static" ]] || return 0
   [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 0
   [[ "$(bridge_agent_channel_status "$agent")" == "ok" ]] || {
-    bridge_clear_plugin_liveness_state "$agent"
+    bridge_clear_plugin_liveness_state_if_no_giveup "$agent"
     return 0
   }
 
   session="$(bridge_agent_session "$agent")"
   [[ -n "$session" ]] || {
-    bridge_clear_plugin_liveness_state "$agent"
+    bridge_clear_plugin_liveness_state_if_no_giveup "$agent"
     return 0
   }
   bridge_tmux_session_exists "$session" || {
-    bridge_clear_plugin_liveness_state "$agent"
+    bridge_clear_plugin_liveness_state_if_no_giveup "$agent"
     return 0
   }
 
   required="$(bridge_agent_effective_launch_plugin_channels_csv "$agent")"
   [[ -n "$required" ]] || {
-    bridge_clear_plugin_liveness_state "$agent"
+    bridge_clear_plugin_liveness_state_if_no_giveup "$agent"
     return 0
   }
 
   missing="$(bridge_agent_missing_plugin_mcp_channels_csv "$agent" || true)"
   if [[ -z "$missing" ]]; then
-    bridge_clear_plugin_liveness_state "$agent"
+    # Issue #1307 (v0.15.0-beta5-1 Lane 3) — the critical bypass site
+    # codex r1 caught. If giveup is active, do NOT silently delete the
+    # ledger; the daemon-loop's earlier process_mcp_liveness_giveup_recovery
+    # tick already had its chance to emit `plugin_mcp_liveness_recovered`,
+    # and on the next tick the recovery will run again and clear the
+    # ledger via the audit path.
+    bridge_clear_plugin_liveness_state_if_no_giveup "$agent"
     return 0
   fi
 
@@ -4901,6 +5075,13 @@ bridge_report_plugin_liveness_miss() {
         --detail session="$session"
       daemon_info "plugin MCP liveness restart limit reached for ${agent} (${missing}); skipping until channel CSV changes"
       restart_attempts=$((max_restarts + 1))
+      # Issue #1307 (v0.15.0-beta5-1 Lane 3) — persist the giveup ledger
+      # AFTER bumping restart_attempts so the writer reflects the sentinel.
+      # The arm helper updates GIVEUP=1 + GIVEUP_TS=now while preserving
+      # the other state fields the next bridge_note_plugin_liveness_state
+      # call will overwrite. Both writes coexist because the note helper
+      # preserves giveup fields and the arm helper preserves the rest.
+      bridge_agent_mcp_giveup_arm "$agent" "$now_ts"
     fi
     bridge_note_plugin_liveness_state "$agent" "$key" "$now_ts" "$last_restart_ts" "$restart_attempts"
     return 0
@@ -4952,6 +5133,122 @@ process_plugin_liveness() {
   for agent in "${BRIDGE_AGENT_IDS[@]}"; do
     [[ -z "$agent" ]] && continue
     bridge_report_plugin_liveness_miss "$agent" || true
+  done
+}
+
+# Issue #1307 (v0.15.0-beta5-1 Lane 3) — MCP-liveness giveup auto-clear.
+#
+# After `plugin_mcp_liveness_giveup` fires, the daemon stops restarting
+# the agent and stops re-checking MCP. Without this recovery tick, the
+# giveup state is permanent until the missing-channel CSV changes (or
+# the operator manually restarts the agent). That class is the silent-
+# message-drop class — Teams messages stop being delivered the moment
+# giveup fires, even after the agent normalizes (picker unblocked,
+# transient MCP outage cleared, etc.).
+#
+# Two triggers fire the auto-clear:
+#
+#   1. **activity_state observer** (primary / root). When an agent
+#      transitions from a non-idle state (`picker_block`, `starting`,
+#      `working`, `crashed`, etc.) to `idle`, the daemon attempts one
+#      liveness re-check. This is the "agent recovered, retry now"
+#      signal — strictly event-driven.
+#
+#   2. **fallback timer** (safety net). If the daemon misses the
+#      transition event (agent reached idle between ticks; daemon was
+#      restarted; activity_state never went through a non-idle
+#      intermediate), an unconditional re-check fires
+#      `BRIDGE_MCP_LIVENESS_GIVEUP_FALLBACK_SECS` (default 300s) after
+#      the giveup arm. Re-arming on failure slides the window — the
+#      agent will get rechecked again 5 min later.
+#
+# Outcomes per recheck:
+#   - **success** (no missing MCP channels): audit
+#     `plugin_mcp_liveness_recovered`, clear giveup ledger, reset
+#     RESTART_ATTEMPTS to 0 so the next miss gets a full restart budget.
+#   - **still failed**: audit `plugin_mcp_liveness_recheck_still_failed`,
+#     bump GIVEUP_TS to now (re-arm fallback window).
+process_mcp_liveness_giveup_recovery() {
+  local agent
+  local prev_state=""
+  local cur_state=""
+  local giveup_ts=0
+  local now_ts=0
+  local fallback_secs=300
+  local trigger=""
+  local missing=""
+
+  # Configurable knob — operator can tune the fallback cadence. The
+  # default 5 min mirrors the original Option A timer in the brief and
+  # matches the existing cooldown order of magnitude. Validate as digits
+  # before use so a malformed export cannot accidentally suppress the
+  # tick (very-large value would mean "never").
+  fallback_secs="${BRIDGE_MCP_LIVENESS_GIVEUP_FALLBACK_SECS:-300}"
+  [[ "$fallback_secs" =~ ^[0-9]+$ ]] || fallback_secs=300
+
+  now_ts="$(date +%s)"
+
+  for agent in "${BRIDGE_AGENT_IDS[@]}"; do
+    [[ -z "$agent" ]] && continue
+
+    # Observe current activity_state regardless of giveup status. The
+    # observer needs to keep LAST_ACTIVITY_STATE fresh so non-giveup
+    # agents that later DO hit giveup have a correct "previous state"
+    # anchor on the very next tick.
+    cur_state="$(bridge_agent_heartbeat_activity_state "$agent" 2>/dev/null || printf 'unknown')"
+    prev_state=""
+    if [[ -f "$(bridge_plugin_liveness_state_file "$agent")" ]]; then
+      local LAST_ACTIVITY_STATE=""
+      daemon_source_state_file "$(bridge_plugin_liveness_state_file "$agent")" \
+          "plugin-liveness/$agent" 0 "" "LAST_ACTIVITY_STATE" || true
+      prev_state="${LAST_ACTIVITY_STATE:-}"
+    fi
+
+    # Update LAST_ACTIVITY_STATE for next tick BEFORE the recheck path —
+    # so even if recheck wedges or clears the state, the observer has a
+    # fresh anchor for the next iteration's transition compute.
+    bridge_agent_mcp_note_activity_state "$agent" "$cur_state"
+
+    # Fast path — no giveup ledger for this agent. The activity-state
+    # note above is the only side effect.
+    if ! bridge_agent_mcp_giveup_active "$agent"; then
+      continue
+    fi
+
+    # Trigger 1: activity_state transition to idle from a non-idle prev.
+    # Trigger 2: fallback timer expired.
+    trigger=""
+    if [[ "$cur_state" == "idle" && -n "$prev_state" && "$prev_state" != "idle" ]]; then
+      trigger="activity_idle"
+    else
+      giveup_ts="$(bridge_agent_mcp_giveup_ts "$agent" || printf '0')"
+      [[ "$giveup_ts" =~ ^[0-9]+$ ]] || giveup_ts=0
+      if (( giveup_ts > 0 )) && (( now_ts - giveup_ts >= fallback_secs )); then
+        trigger="fallback_timer"
+      fi
+    fi
+
+    [[ -n "$trigger" ]] || continue
+
+    # Re-check liveness. On success: clear ledger + audit. On failure:
+    # re-arm the timer window (bumps GIVEUP_TS) + audit so the operator
+    # can see the re-arm cadence in the audit log.
+    if bridge_recheck_mcp_liveness "$agent"; then
+      bridge_audit_log daemon plugin_mcp_liveness_recovered "$agent" \
+        --detail trigger="$trigger" \
+        --detail prev_activity_state="${prev_state:-unknown}" \
+        --detail activity_state="$cur_state"
+      bridge_agent_mcp_giveup_clear "$agent"
+      daemon_info "plugin MCP liveness recovered for ${agent} (trigger=${trigger}); cleared giveup, restored restart budget"
+    else
+      missing="$(bridge_agent_missing_plugin_mcp_channels_csv "$agent" 2>/dev/null || printf '')"
+      bridge_audit_log daemon plugin_mcp_liveness_recheck_still_failed "$agent" \
+        --detail trigger="$trigger" \
+        --detail missing_channels="$missing" \
+        --detail prev_activity_state="${prev_state:-unknown}" \
+        --detail activity_state="$cur_state"
+      bridge_agent_mcp_giveup_arm "$agent" "$now_ts"
+    fi
   done
 }
 
@@ -7435,6 +7732,30 @@ cmd_sync_cycle() {
   flush_pending_attention_spools || true
   BRIDGE_DAEMON_LAST_STEP="channel_health"
   process_channel_health || true
+  # Issue #1307 (v0.15.0-beta5-1 Lane 3) — auto-clear MCP-liveness giveup
+  # on agent recovery. Runs BEFORE process_plugin_liveness because
+  # process_plugin_liveness's silent-clear path
+  # (bridge_clear_plugin_liveness_state — rm -f the state file) would
+  # otherwise wipe the GIVEUP/GIVEUP_TS ledger BEFORE this recovery tick
+  # gets to emit `plugin_mcp_liveness_recovered`. Production-order codex
+  # repro on R1 of this PR (audit log empty after seeded giveup + healthy
+  # MCP). Defense-in-depth: bridge_report_plugin_liveness_miss also
+  # gates the silent clear on bridge_agent_mcp_giveup_active so a future
+  # re-ordering can't silently re-open the bypass.
+  #
+  # The recovery tick drives the activity_state observer
+  # (LAST_ACTIVITY_STATE in the plugin-liveness state file) for ALL
+  # agents regardless of giveup status, so the prev-state anchor is
+  # correct when a future giveup arms.
+  #
+  # First-arm same-tick case: if process_plugin_liveness arms giveup
+  # this tick, recovery has already returned for the agent (giveup not
+  # active yet), so the fresh GIVEUP_TS is left intact and the NEXT
+  # tick's recovery evaluates the fallback timer against an accurate
+  # anchor.
+  BRIDGE_DAEMON_LAST_STEP="mcp_liveness_giveup_recovery"
+  process_mcp_liveness_giveup_recovery || true
+
   BRIDGE_DAEMON_LAST_STEP="plugin_liveness"
   process_plugin_liveness || true
 
