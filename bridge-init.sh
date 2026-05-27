@@ -37,7 +37,7 @@ source "$SCRIPT_DIR/lib/bridge-init-codex-pair.sh"
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") [--admin <agent>] [--engine claude|codex] [--session <name>] [--workdir <path>] [--user <id[:display-name]>]... [--channels <csv>] [--discord-channel <id>]... [--allow-from <id>]... [--default-chat <id>] [--teams-app-id <id>] [--teams-app-password-file <path>] [--teams-tenant-id <id>] [--teams-allow-from <id>]... [--teams-conversation <id>]... [--channel-account <account>] [--runtime-config <path>] [--api-base-url <url>] [--profile server|dev] [--reconfigure] [--skip-validate] [--skip-send-test] [--skip-channel-setup] [--test-start] [--dry-run] [--json]
+  $(basename "$0") [--admin <agent>] [--engine claude|codex] [--session <name>] [--workdir <path>] [--user <id[:display-name]>]... [--channels <csv>] [--discord-channel <id>]... [--allow-from <id>]... [--default-chat <id>] [--teams-app-id <id>] [--teams-app-password-file <path>] [--teams-tenant-id <id>] [--teams-allow-from <id>]... [--teams-conversation <id>]... [--channel-account <account>] [--runtime-config <path>] [--api-base-url <url>] [--profile server|dev] [--reconfigure] [--skip-validate] [--skip-send-test] [--skip-channel-setup] [--test-start] [--enable-a2a] [--dry-run] [--json]
 
   The Teams client secret may also be supplied via the BRIDGE_TEAMS_APP_PASSWORD
   environment variable. --teams-app-password <secret> is still accepted but
@@ -61,13 +61,18 @@ bridge_init_emit_json() {
   local admin_saved="$9"
   local dry_run="${10}"
   local warnings_json="${11}"
+  # Issue #1262 Gap 1: A2A scaffold status — emitted as a top-level
+  # field so bridge-bootstrap.sh / orchestrator JSON consumers can branch
+  # on whether the receiver template was rendered. Defaults to "skipped"
+  # when --enable-a2a wasn't passed.
+  local a2a_status="${12:-skipped}"
 
   bridge_require_python
-  python3 - "$admin" "$engine" "$session" "$workdir" "$channels" "$created" "$channel_setup" "$preflight" "$admin_saved" "$dry_run" "$warnings_json" <<'PY'
+  python3 - "$admin" "$engine" "$session" "$workdir" "$channels" "$created" "$channel_setup" "$preflight" "$admin_saved" "$dry_run" "$warnings_json" "$a2a_status" <<'PY'
 import json
 import sys
 
-admin, engine, session, workdir, channels, created, channel_setup, preflight, admin_saved, dry_run, warnings_json = sys.argv[1:]
+admin, engine, session, workdir, channels, created, channel_setup, preflight, admin_saved, dry_run, warnings_json, a2a_status = sys.argv[1:]
 payload = {
     "admin": admin,
     "engine": engine,
@@ -80,6 +85,7 @@ payload = {
     "admin_saved": admin_saved == "1",
     "dry_run": dry_run == "1",
     "warnings": json.loads(warnings_json),
+    "a2a_status": a2a_status,
     "next_command": "agb admin" if admin_saved == "1" else "",
     "handoff_steps": [
         "Close the temporary installer session.",
@@ -339,6 +345,94 @@ print(json.dumps(sys.argv[1:], ensure_ascii=False))
 PY
 }
 
+# Issue #1262 Gap 1 (v0.15.0-beta4 Lane I, 2026-05-27): scaffold A2A
+# cross-bridge handoff at install time when --enable-a2a is set.
+#
+# Behavior:
+#   1. Write $BRIDGE_HOME/handoff.local.json from
+#      $SCRIPT_DIR/handoff.local.example.json (mode 0600) IF the file is
+#      absent. Existing config is preserved — the operator may already
+#      have a tuned config, and clobbering it would be hostile.
+#   2. On Linux, render the agb-handoffd.service systemd-user unit by
+#      invoking scripts/install-handoffd-systemd.sh (without --apply, so
+#      the operator can review before activation). The actual `systemctl
+#      enable --now` is deferred to the operator's explicit action so
+#      that a config without configured peers + secret doesn't bind a
+#      service in a fail-closed state on every boot.
+#   3. Emit a stderr advisory naming the next operator action.
+#   4. Honors --dry-run (no writes) and routes log lines to stderr only
+#      (matches the #1230 stdout-is-JSON-only convention).
+#
+# Sets the global `a2a_status` to one of:
+#   skipped              — --enable-a2a not set
+#   ok                   — stub config + systemd template rendered
+#   ok-existing-config   — config already present; only systemd template rendered
+#   dry-run              — --enable-a2a + --dry-run
+#   error                — write/render failed (warning appended)
+bridge_init_scaffold_a2a() {
+  local config_path="$BRIDGE_HOME/handoff.local.json"
+  local example_path="$SCRIPT_DIR/handoff.local.example.json"
+  local config_existed=0
+  local os_name
+  os_name="$(uname -s 2>/dev/null || printf 'unknown')"
+
+  if [[ $dry_run -eq 1 ]]; then
+    a2a_status="dry-run"
+    echo "[init] --enable-a2a: would scaffold $config_path + systemd unit (skipped: --dry-run)" >&2
+    return 0
+  fi
+
+  if [[ ! -f "$example_path" ]]; then
+    a2a_status="error"
+    bridge_init_append_warning "--enable-a2a: example config not found at $example_path"
+    return 0
+  fi
+
+  if [[ -f "$config_path" ]]; then
+    config_existed=1
+    echo "[init] --enable-a2a: $config_path already exists; not overwriting" >&2
+  else
+    # Copy with mode 0600 — config carries peer HMAC secrets.
+    if ! cp "$example_path" "$config_path" 2>/dev/null; then
+      a2a_status="error"
+      bridge_init_append_warning "--enable-a2a: failed to copy example config to $config_path"
+      return 0
+    fi
+    chmod 0600 "$config_path" 2>/dev/null || true
+    echo "[init] --enable-a2a: wrote $config_path (mode 0600)" >&2
+    echo "[init] --enable-a2a: edit it to set bridge_id, listen.address (tailnet IP), and peers (with secrets). See docs/a2a-cross-bridge.md." >&2
+    # BRIDGE_A2A_TAILSCALE_CLI advisory — only required if tailscale CLI
+    # lives outside the default $PATH (e.g. /Applications/Tailscale.app/...
+    # on macOS, or a custom install path on Linux).
+    echo "[init] --enable-a2a: BRIDGE_A2A_TAILSCALE_CLI env override is optional (only set if your tailscale CLI is in a non-default location)." >&2
+  fi
+
+  # Linux: render systemd-user unit (no --apply; operator activates manually).
+  if [[ "$os_name" == "Linux" ]] && [[ -x "$SCRIPT_DIR/scripts/install-handoffd-systemd.sh" ]]; then
+    local unit_preview_file="$BRIDGE_HOME/handoff/agb-handoffd.service.preview"
+    mkdir -p "$BRIDGE_HOME/handoff" 2>/dev/null || true
+    if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/scripts/install-handoffd-systemd.sh" \
+         --bridge-home "$BRIDGE_HOME" \
+         --source-dir "$SCRIPT_DIR" \
+         >"$unit_preview_file" 2>/dev/null; then
+      chmod 0644 "$unit_preview_file" 2>/dev/null || true
+      echo "[init] --enable-a2a: systemd unit preview rendered at $unit_preview_file" >&2
+      echo "[init] --enable-a2a: to activate: bash $SCRIPT_DIR/scripts/install-handoffd-systemd.sh --bridge-home $BRIDGE_HOME --source-dir $SCRIPT_DIR --enable" >&2
+    else
+      bridge_init_append_warning "--enable-a2a: rendering systemd-user unit preview failed; run scripts/install-handoffd-systemd.sh manually"
+    fi
+  else
+    echo "[init] --enable-a2a: non-Linux host ($os_name) — no systemd unit emitted. Use 'bash $SCRIPT_DIR/bridge-handoff-daemon.sh start' or wire into your service manager." >&2
+  fi
+
+  if [[ $config_existed -eq 1 ]]; then
+    a2a_status="ok-existing-config"
+  else
+    a2a_status="ok"
+  fi
+  return 0
+}
+
 admin_agent="${BRIDGE_ADMIN_AGENT_ID:-patch}"
 engine="claude"
 session=""
@@ -383,6 +477,13 @@ user_specs=()
 host_profile_reconfigure=0
 host_profile_override=""
 host_profile_chosen=""
+# Issue #1262 Gap 1 (v0.15.0-beta4 Lane I): opt-in scaffolding for the
+# A2A cross-bridge receiver. When --enable-a2a is set, init writes a
+# handoff.local.json stub (if absent) and emits an advisory pointing the
+# operator at the systemd-user template (Linux) or the manual `agb a2a`
+# lifecycle (macOS). Opt-out by default — most installs don't run A2A.
+enable_a2a=0
+a2a_status="skipped"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -569,6 +670,11 @@ while [[ $# -gt 0 ]]; do
       ;;
     --json)
       json_mode=1
+      shift
+      ;;
+    --enable-a2a)
+      # Issue #1262 Gap 1 (v0.15.0-beta4 Lane I): opt-in A2A scaffold.
+      enable_a2a=1
       shift
       ;;
     -h|--help|help)
@@ -1066,6 +1172,12 @@ bridge_init_ensure_live_cli
 # Mattermost setup steps. host_profile_chosen is already populated by that
 # call (or empty on --dry-run).
 
+# Issue #1262 Gap 1 (v0.15.0-beta4 Lane I): optional A2A scaffolding.
+# Only runs when --enable-a2a is set; otherwise a2a_status stays "skipped".
+if [[ $enable_a2a -eq 1 ]]; then
+  bridge_init_scaffold_a2a
+fi
+
 warnings_json="$(bridge_init_warnings_json)"
 
 if [[ $json_mode -eq 1 ]]; then
@@ -1080,7 +1192,8 @@ if [[ $json_mode -eq 1 ]]; then
     "$preflight_status" \
     "$admin_saved" \
     "$dry_run" \
-    "$warnings_json"
+    "$warnings_json" \
+    "$a2a_status"
   exit 0
 fi
 
@@ -1102,6 +1215,7 @@ printf 'created: %s\n' "$([[ $created -eq 1 ]] && echo yes || echo no)"
 printf 'channel_setup: %s\n' "$channel_setup_status"
 printf 'preflight: %s\n' "$preflight_status"
 printf 'admin_saved: %s\n' "$([[ $admin_saved -eq 1 ]] && echo yes || echo no)"
+printf 'a2a: %s\n' "$a2a_status"
 if [[ -n "$host_profile_chosen" ]]; then
   printf 'host_profile: %s\n' "$host_profile_chosen"
 fi
