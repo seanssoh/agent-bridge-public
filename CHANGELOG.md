@@ -6,6 +6,54 @@ version bumps via the `VERSION` file.
 
 ## [Unreleased]
 
+## [0.15.0-beta5] — 2026-05-28
+
+### Highlight — beta4 patch-verify follow-up (3 lanes, 3 issues)
+
+Patch's beta4 OOTB verify on `cm-prod-agentworkflow-vm01` surfaced 3 follow-up issues (#1297 / #1298 / #1299). Lane parallel dispatch, ~2 codex review rounds per lane, ~30 min wall-clock from issue file to merge. All 3 merged + 18/18 lane smokes PASS (3 beta5 + 11 beta4 + 4 beta3) under bash 5.3.9. `-beta5` prerelease, tag `v0.15.0-beta5`, GitHub release marked **Pre-release**.
+
+Lane → PR map: α #1302 / β #1300 / γ #1301.
+
+### Fixed — beta3→beta4 upgrade backfill iso v2 workdir profile group normalize (#1297, Lane α PR #1302)
+
+`agent-bridge upgrade --apply` left existing beta3 workdir profile files (`CLAUDE.md`, `SOUL.md`, etc.) at `0600 iso-uid:controller-gid`. Controller couldn't grep CLAUDE.md → `agent restart` failed + rollback also failed → agent stopped. Lane G PR #1291 (#1270, beta4) introduced `bridge_isolation_v2_normalize_workdir_profile_group` but only fired on `agent create`, not upgrade backfill.
+
+- **`lib/bridge-isolation-v2-workdir-backfill.sh`** — normalize runs unconditionally per iso v2 agent on every backfill pass.
+- **`lib/bridge-isolation-v2.sh`** R2 — `bridge_isolation_v2_chgrp_file_iso_group` adds portable stat-skip (GNU `stat -c '%G:%a'` / BSD `stat -f '%Sg:%Lp'`) so already-correct files are no-op. Empty stat falls through to mutation path. Owner intentionally unchecked (helper normalizes group+mode only).
+- Smoke: `scripts/smoke/α-beta5-upgrade-backfill-normalize.sh` T1-T4 + `T_idempotent_no_mutation_on_correct` (override counter on `_bridge_isolation_v2_run_root_or_sudo`; assert 0 invocations on already-correct files).
+
+### Fixed — iso v2 session_id detect controller-can't-read 0600 jsonl (#1299, Lane β PR #1300)
+
+beta4 Lane A PR #1286 (#1277) fixed path resolution to iso UID's `/home/agent-bridge-<a>/.claude/`. But Claude Code wrote session jsonl as `0600 iso-uid:ab-agent-<a>`. Controller (`awfmanager`) was in `ab-agent-<a>` group but `0600` has no group-read bit → `detect-claude-session-id.py` returned empty → no session resume on iso v2.
+
+Per [[feedback-root-vs-symptom-framing]]: do NOT relax jsonl mode; elevate the reader instead.
+
+- **`lib/bridge-agents.sh`** — new `bridge_linux_sudo_as_user` + `bridge_resolve_agent_iso_sudo_user` helpers.
+- **`lib/bridge-state.sh`** — `bridge_detect_claude_session_id` 5th arg `os_user`, `bridge_resolve_resume_session_id` self-resolves + wraps, `bridge_detect_session_id` 6th-arg passthrough. 2 caller updates: `bridge_claude_resume_session_id_for_agent`, `bridge_refresh_agent_session_id`.
+- **`bridge-sync.sh`** — `refresh_missing_session_ids` passes os_user.
+- Sudo wrap shape: `sudo -n -u <iso-uid> bash -c 'exec python3 "$@"' bash <args>` to satisfy `bridge_migration_sudoers_entry` template ("tmux + bash only; Python spawned as a child of bash -c").
+- Smoke: `scripts/smoke/Beta-beta5-session-id-detect-sudo.sh` T1-T10 + R2 portable `SMOKE_BASH_BIN` resolver (works on ubuntu-latest CI, macOS Homebrew bash 5.3.9, and macOS `/bin/bash` 3.2 re-exec).
+
+### Fixed — upgrade reconcile structured helper status + manual mode parity (#1298, Lane γ PR #1301)
+
+`agent-bridge upgrade --apply` iso-reconcile logged 4 `[failed]` rows per iso v2 agent ("helper emitted no status line for ..."). Conflated 3 distinct conditions (path missing / permission denied / helper error) into a single `failed` signal. Manual `agent-bridge isolation reconcile --apply` skipped agent-home-contract → false-OK.
+
+- **`lib/bridge-agents.sh`** — `bridge_linux_normalize_isolated_home_contract` emits structured per-target status lines (`denied`/`error`) at every early-return path. Symlink + non-dir targets emit `error` (not `failed` — that's reserved for genuine apply-time failures: mkdir/chown/chmod refused).
+- **`lib/bridge-isolation-v2-reconcile.sh`** R2/R3 — classifier distinguishes:
+  - `missing` → `MISSING`/rc=1 (drift)
+  - `denied`/`error` → `DEGRADED`/rc=0 (probe failure, WARN, NOT drift)
+  - `failed` → `FAILED`/rc=1 (legitimate apply failure)
+  - Apply-mode symlink preempt removed (helper is single source of truth).
+  - Check-mode: symlink + exists-but-not-dir → `DEGRADED`/rc=0; genuinely-absent → `MISSING`/rc=1.
+- **Manual mode parity** — `bridge_isolation_v2_apply_install_tree_matrix` with `reason=manual` + no `--agent` + no `--all-agents` ⇒ implicit `--all-agents`. Operator-driven manual reconcile now checks agent-home-contract by default (Option 2a).
+- Smoke: `scripts/smoke/gamma-beta5-reconcile-helper-status.sh` T1-T11 + 5 teeth (helper revert / preempt resurrect / r2-shape regression). Real fixture coverage: symlink target (T8) + regular-file target (T9) + check-mode regular-file (T11).
+
+### Notes
+
+- Convergence rounds: Lane α (r1→r2, codex 2 rounds + orchestrator rebase); Lane β (r1→r2, codex 2 rounds — bash hardcode portability); Lane γ (r1→r2→r3, codex 3 rounds — symlink/non-dir contract + check-mode parity + orchestrator rebase).
+- Wave-orchestration parallel dispatch hit the `.git/refs/stash` shared-state footgun mid-wave ([[feedback-worktree-stash-shared-git-dir]]): Lane β's WIP was visible to Lane α + Lane γ worktrees. Both fixers correctly recovered (Lane α restored polluted files + re-applied only own delta; Lane β recovered via `git fsck --lost-found`). Lane γ + Lane α both required orchestrator-driven rebase to drop Lane β cross-contamination revert at merge time.
+- Patch reported manual workaround applied for #1297 on `cm-prod-agentworkflow-vm01`. beta5 closes the regression — upgrade backfill normalize on next `agent-bridge upgrade --apply`.
+
 ## [0.15.0-beta4] — 2026-05-28
 
 ### Highlight — Full backlog closure, 11 lanes / 3 sub-waves, 30 issues
