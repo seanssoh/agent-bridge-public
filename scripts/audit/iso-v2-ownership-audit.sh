@@ -42,7 +42,8 @@
 #
 # Footgun #11: no heredoc-stdin to a subprocess. All embedded python is
 # file-as-argv via mktemp helpers, and shell output uses pipe-to-while
-# only against named files (never `<<<` here-string).
+# only against named files (never `<<<` here-string, never `done < <(...)`
+# process substitution).
 
 set -uo pipefail
 
@@ -57,6 +58,23 @@ REPO_ROOT="$(cd -P "$SCRIPT_DIR/../.." && pwd -P)"
 if [[ -n "${AGENT_BRIDGE_SOURCE_DIR:-}" && -d "${AGENT_BRIDGE_SOURCE_DIR}" ]]; then
   REPO_ROOT="${AGENT_BRIDGE_SOURCE_DIR}"
 fi
+
+# Source bridge-lib.sh so the canonical identity + roster helpers
+# (`bridge_isolation_v2_agent_group_name`, `bridge_agent_os_user`,
+# `bridge_agent_default_os_user`, `bridge_load_roster`, plus the
+# `BRIDGE_AGENT_IDS` / `BRIDGE_AGENT_OS_USER` arrays) are available.
+# Codex r1 BLOCKING: the prior r1 derived identities inline (lowercase +
+# underscore→hyphen + char-strip) and disagreed with the canonical
+# helpers — false skips on `h_smoke` (underscore preserved by canonical)
+# and false violations on agents that hash-truncate past Linux's
+# 32-char groupadd limit. Source-the-canonical-helpers is the only way
+# to guarantee the audit and the runtime use the same identity rules.
+if [[ ! -f "$REPO_ROOT/bridge-lib.sh" ]]; then
+  printf 'audit: cannot locate bridge-lib.sh under %s (set AGENT_BRIDGE_SOURCE_DIR or run from the source checkout)\n' "$REPO_ROOT" >&2
+  exit 2
+fi
+# shellcheck source=/dev/null
+source "$REPO_ROOT/bridge-lib.sh"
 
 usage() {
   cat <<'EOF'
@@ -120,24 +138,28 @@ emit_row() {
   printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5"
 }
 
-# v2_agent_group <agent> — returns ab-agent-<slug>. Mirrors
-# bridge_isolation_v2_agent_group_name's canonicalization rule
-# (lowercase + `-` for `_`). Conservative: keep alnum + `-` only.
+# v2_agent_group <agent> — canonical group name via the same helper the
+# v2 grant/check paths use (lib/bridge-isolation-v2.sh:406). Handles
+# underscore-bearing agent names, custom `BRIDGE_AGENT_GROUP_PREFIX`,
+# and the Linux 32-char hash-truncation policy.
 v2_agent_group() {
-  local a="$1"
-  local norm
-  norm="$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
-  norm="$(printf '%s' "$norm" | tr -cd 'a-z0-9-')"
-  printf 'ab-agent-%s' "$norm"
+  bridge_isolation_v2_agent_group_name "$1"
 }
 
-# iso_user_for_agent <agent> — agent-bridge-<slug> (same canonical rule).
+# iso_user_for_agent <agent> — canonical iso UID via roster lookup first,
+# falling back to `bridge_agent_default_os_user` (lib/bridge-agents.sh:990)
+# when the roster has no explicit per-agent value. The roster path picks
+# up `--os-user manual` overrides (bridge-agent.sh:3000-3002/3259) without
+# this script having to re-implement the operator-override rule.
 iso_user_for_agent() {
   local a="$1"
-  local norm
-  norm="$(printf '%s' "$a" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
-  norm="$(printf '%s' "$norm" | tr -cd 'a-z0-9-')"
-  printf 'agent-bridge-%s' "$norm"
+  local user
+  user="$(bridge_agent_os_user "$a" 2>/dev/null || printf '')"
+  if [[ -n "$user" ]]; then
+    printf '%s' "$user"
+    return 0
+  fi
+  bridge_agent_default_os_user "$a"
 }
 
 # resolve_agent_home <iso_user> — getent passwd lookup for HOME.
@@ -310,29 +332,31 @@ audit_agent() {
 declare -a agents=()
 
 if [[ "$ARG" == "--all" ]]; then
-  # Walk the roster — best-effort. We need to source the live runtime
-  # roster, which is at $BRIDGE_HOME/agent-roster.local.sh, fallback to
-  # agent-roster.sh in the source tree.
-  bridge_home="${BRIDGE_HOME:-${HOME}/.agent-bridge}"
-  roster_file=""
-  if [[ -f "$bridge_home/agent-roster.local.sh" ]]; then
-    roster_file="$bridge_home/agent-roster.local.sh"
-  elif [[ -f "$REPO_ROOT/agent-roster.sh" ]]; then
-    roster_file="$REPO_ROOT/agent-roster.sh"
+  # Codex r1 BLOCKING: the prior r1 grepped for `bridge_register_agent` /
+  # `AGENT_NAMES+=` patterns that do not exist anywhere in the current
+  # source. Live rosters populate `BRIDGE_AGENT_IDS` via the canonical
+  # `bridge_add_agent_id_if_missing` registration helper
+  # (lib/bridge-core.sh:928), which `bridge_load_roster`
+  # (lib/bridge-state.sh:1024) drives by sourcing both the public roster
+  # and the protected `agent-roster.local.sh`. Reading the array after
+  # the loader returns is the only source-of-truth that matches the
+  # runtime's view of the roster — anything else risks the silent-no-op
+  # mode codex flagged on the live install.
+  bridge_load_roster
+
+  if ! declare -p BRIDGE_AGENT_IDS >/dev/null 2>&1; then
+    die "--all requested but BRIDGE_AGENT_IDS not declared after bridge_load_roster (bridge-lib.sh source path broken?)"
   fi
-  if [[ -z "$roster_file" ]]; then
-    die "--all requested but no roster file resolved (looked at $bridge_home/agent-roster.local.sh and $REPO_ROOT/agent-roster.sh)"
-  fi
-  # Extract agent names — names appear as "AGENT_NAMES+=(<name>)" or
-  # "bridge_register_agent <name> ...". Use a defensive grep that
-  # accepts both shapes.
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && agents+=("$line")
-  done < <(grep -hE '^[[:space:]]*(bridge_register_agent|AGENT_NAMES\+=)' "$roster_file" 2>/dev/null \
-    | sed -E 's/^[[:space:]]*bridge_register_agent[[:space:]]+([A-Za-z0-9_-]+).*/\1/; s/^[[:space:]]*AGENT_NAMES\+=\(([A-Za-z0-9_-]+)\).*/\1/' \
-    | sort -u || true)
+
+  _iter_agent=""
+  for _iter_agent in "${BRIDGE_AGENT_IDS[@]}"; do
+    [[ -n "$_iter_agent" ]] || continue
+    agents+=("$_iter_agent")
+  done
+  unset _iter_agent
+
   if (( ${#agents[@]} == 0 )); then
-    printf '# audit: no agents found in roster %s\n' "$roster_file" >&2
+    printf '# audit: no agents found in roster (BRIDGE_AGENT_IDS empty after bridge_load_roster — set BRIDGE_HOME?)\n' >&2
     exit 0
   fi
 else

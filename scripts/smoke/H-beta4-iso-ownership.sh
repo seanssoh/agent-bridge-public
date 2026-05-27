@@ -286,4 +286,248 @@ fi
 
 smoke_log "Teeth PASS — synthetic regression of T1 chown/chmod produces the OLD pattern (T1/T6 would catch it)"
 
-smoke_log "all tests PASS — Lane H (#1278 + #1208 + #1215 cross-check) verified at current source"
+# ---------------------------------------------------------------------
+# T_canonical — codex r2 BLOCKING: audit must use canonical identity
+# helpers (bridge_isolation_v2_agent_group_name, bridge_agent_os_user,
+# bridge_agent_default_os_user) instead of inline lowercase + underscore
+# →hyphen + char-strip + prefix-compose. Also: --all driver must use
+# bridge_load_roster + BRIDGE_AGENT_IDS instead of the dead
+# bridge_register_agent / AGENT_NAMES+= grep. Plus the named-file read
+# replacement for the process-substitution self-contract violation.
+#
+# All checks are static-source greps because the audit script exits 0
+# early on non-Linux (so we can't directly run it on the macOS dev box
+# this smoke runs from). A Linux-host behavioral test of the canonical
+# path lives in Phase E operator-host verification.
+# ---------------------------------------------------------------------
+
+smoke_log "T_canonical: audit uses canonical helpers + sourced roster + named-file read (codex r1 BLOCKING)"
+
+T_CANONICAL_FAILS=""
+
+# T_canonical_a: audit sources bridge-lib.sh so the canonical helpers
+# resolve at runtime (instead of being re-implemented inline).
+if ! grep -F 'source "$REPO_ROOT/bridge-lib.sh"' "$AUDIT_SH" >/dev/null; then
+  T_CANONICAL_FAILS+="audit does not source bridge-lib.sh; "
+fi
+
+# T_canonical_b: v2_agent_group calls bridge_isolation_v2_agent_group_name
+# (lib/bridge-isolation-v2.sh:406). This is the canonical group name
+# helper that preserves underscores in agent names and hash-truncates
+# past Linux's 32-char groupadd cap. The prior r1 lowercased +
+# tr '_' '-' which produced `ab-agent-h-smoke` for the operator-host
+# agent `h_smoke` instead of the canonical `ab-agent-h_smoke` — false
+# violations on every audit row.
+if ! grep -F 'bridge_isolation_v2_agent_group_name' "$AUDIT_SH" >/dev/null; then
+  T_CANONICAL_FAILS+="audit does not call bridge_isolation_v2_agent_group_name; "
+fi
+
+# T_canonical_c: iso_user_for_agent calls bridge_agent_os_user
+# (lib/bridge-agents.sh:969) first — picks up explicit `--os-user manual`
+# overrides from the roster (bridge-agent.sh:3000-3002/3259) — and falls
+# back to bridge_agent_default_os_user (lib/bridge-agents.sh:990) which
+# is the canonical default derivation. The prior r1 hardcoded
+# `agent-bridge-${slug}` and disagreed with the operator-override path.
+if ! grep -F 'bridge_agent_os_user' "$AUDIT_SH" >/dev/null; then
+  T_CANONICAL_FAILS+="audit does not call bridge_agent_os_user; "
+fi
+if ! grep -F 'bridge_agent_default_os_user' "$AUDIT_SH" >/dev/null; then
+  T_CANONICAL_FAILS+="audit does not call bridge_agent_default_os_user; "
+fi
+
+# T_canonical_d: --all driver uses bridge_load_roster + BRIDGE_AGENT_IDS
+# (lib/bridge-state.sh:1024 + lib/bridge-core.sh:844/928). The prior r1
+# grepped for `bridge_register_agent` / `AGENT_NAMES+=` patterns that do
+# not exist anywhere in the current source — silent no-op on every live
+# install. The canonical loader is what the runtime itself uses.
+if ! grep -F 'bridge_load_roster' "$AUDIT_SH" >/dev/null; then
+  T_CANONICAL_FAILS+="audit --all does not call bridge_load_roster; "
+fi
+if ! grep -F 'BRIDGE_AGENT_IDS' "$AUDIT_SH" >/dev/null; then
+  T_CANONICAL_FAILS+="audit --all does not iterate BRIDGE_AGENT_IDS; "
+fi
+
+# T_canonical_e: the dead grep patterns from the r1 implementation are
+# gone from executable code (comments referencing them are fine, since
+# this file's history will keep mentioning the prior shape). The
+# "line starts with optional whitespace then `#`" filter is done as a
+# second grep so the comment-stripping anchor works correctly (a single
+# bash regex anchoring "first non-whitespace char is not `#`" is
+# surprisingly fragile under .* greediness).
+if grep -nE 'bridge_register_agent' "$AUDIT_SH" | grep -vE '^[0-9]+:[[:space:]]*#' >/dev/null; then
+  T_CANONICAL_FAILS+="audit still has live (non-comment) bridge_register_agent grep; "
+fi
+if grep -nE 'AGENT_NAMES\+=' "$AUDIT_SH" | grep -vE '^[0-9]+:[[:space:]]*#' >/dev/null; then
+  T_CANONICAL_FAILS+="audit still has live (non-comment) AGENT_NAMES+= grep; "
+fi
+
+# T_canonical_f: no `done < <(...)` process-substitution in executable
+# code. The audit file's own ban-list comment at the top of the file
+# explicitly forbids this idiom; the r1 implementation violated its own
+# contract at line 331. Allow the comment reference (the ban-list line)
+# but reject any executable code that uses it.
+if grep -nE 'done[[:space:]]*<[[:space:]]*<\(' "$AUDIT_SH" | grep -vE '^[0-9]+:[[:space:]]*#' >/dev/null; then
+  T_CANONICAL_FAILS+="audit still has live (non-comment) done < <(...) process-substitution; "
+fi
+
+if [[ -n "$T_CANONICAL_FAILS" ]]; then
+  smoke_fail "T_canonical: canonical helper / roster enumeration / named-file regressions: $T_CANONICAL_FAILS"
+fi
+
+smoke_log "T_canonical PASS — audit uses bridge_isolation_v2_agent_group_name + bridge_agent_os_user + bridge_load_roster + BRIDGE_AGENT_IDS, no inline derivation, no process-substitution"
+
+# ---------------------------------------------------------------------
+# T_canonical teeth — verify the assertions actually bite by injecting
+# the prior r1 shapes into copies of the audit script in a temp file.
+#
+# We don't mutate the real audit file. Instead we synthesize three
+# fixture files in $SMOKE_TMP_ROOT that each carry one of the dead
+# patterns the assertions look for; the helper used by T1 teeth is too
+# tightly tied to the AGENTS_LIB function body, so we roll a thin
+# inline grep harness here.
+# ---------------------------------------------------------------------
+
+smoke_log "T_canonical teeth: verify each canonical-check bites on a synthetic regression"
+
+TEETH_AUDIT_NO_HELPERS="$SMOKE_TMP_ROOT/teeth-audit-no-helpers.sh"
+TEETH_AUDIT_DEAD_GREP="$SMOKE_TMP_ROOT/teeth-audit-dead-grep.sh"
+TEETH_AUDIT_PROC_SUB="$SMOKE_TMP_ROOT/teeth-audit-proc-sub.sh"
+
+# Fixture #1 — audit that derives inline (no canonical helpers, no
+# bridge-lib source). Should fail T_canonical_a/b/c.
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'norm=$(printf %%s "$1" | tr -cd "a-z0-9-")\n'
+  printf 'printf "ab-agent-%%s" "$norm"\n'
+} > "$TEETH_AUDIT_NO_HELPERS"
+
+if grep -F 'source "$REPO_ROOT/bridge-lib.sh"' "$TEETH_AUDIT_NO_HELPERS" >/dev/null; then
+  smoke_fail "T_canonical teeth #1: fixture unexpectedly contains the bridge-lib source line (assertion would not bite)"
+fi
+if grep -F 'bridge_isolation_v2_agent_group_name' "$TEETH_AUDIT_NO_HELPERS" >/dev/null; then
+  smoke_fail "T_canonical teeth #1: fixture unexpectedly contains the canonical group helper (assertion would not bite)"
+fi
+
+# Fixture #2 — audit with the dead bridge_register_agent grep restored
+# in executable code. Should fail T_canonical_e.
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'grep -hE "bridge_register_agent" "$roster_file"\n'
+} > "$TEETH_AUDIT_DEAD_GREP"
+
+if ! grep -nE 'bridge_register_agent' "$TEETH_AUDIT_DEAD_GREP" | grep -vE '^[0-9]+:[[:space:]]*#' >/dev/null; then
+  smoke_fail "T_canonical teeth #2: fixture does not actually expose the live bridge_register_agent grep — teeth setup broken"
+fi
+
+# Fixture #3 — audit with `done < <(...)` restored in executable code.
+# Should fail T_canonical_f.
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'while IFS= read -r line; do printf "%%s\\n" "$line"; done < <(grep foo bar)\n'
+} > "$TEETH_AUDIT_PROC_SUB"
+
+if ! grep -nE 'done[[:space:]]*<[[:space:]]*<\(' "$TEETH_AUDIT_PROC_SUB" | grep -vE '^[0-9]+:[[:space:]]*#' >/dev/null; then
+  smoke_fail "T_canonical teeth #3: fixture does not actually expose the live process-substitution — teeth setup broken"
+fi
+
+smoke_log "T_canonical teeth PASS — every canonical-check assertion would catch a regression to the r1 shape"
+
+# ---------------------------------------------------------------------
+# T_canonical runtime (Linux-only) — source bridge-lib.sh, register a
+# fake roster with three pathological agents, then probe the canonical
+# helpers the audit now uses:
+#
+#   - agent `h_smoke` (underscore in name) → canonical group keeps the
+#     underscore (`ab-agent-h_smoke`), canonical default user keeps the
+#     underscore too (`agent-bridge-h_smoke`); the r1 shape mangled
+#     both to `-`.
+#   - agent `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` (32 chars) → canonical
+#     group hash-truncates per the 32-char Linux groupadd cap.
+#   - agent `manual_explicit` with `BRIDGE_AGENT_OS_USER[manual_explicit]
+#     =manual-name` → `bridge_agent_os_user` returns `manual-name`
+#     (the explicit operator override).
+#
+# Skipped on non-Linux because `bridge_isolation_v2_agent_group_name`
+# branches on uname; the Linux branch is what the audit's --all path
+# will actually run against on the operator host.
+# ---------------------------------------------------------------------
+
+if smoke_is_linux; then
+  smoke_log "T_canonical runtime: probe canonical helpers via bridge-lib.sh source (Linux only)"
+
+  T_CANONICAL_RUNTIME_LOG="$SMOKE_TMP_ROOT/t_canonical-runtime.log"
+  T_CANONICAL_RUNTIME_DRIVER="$SMOKE_TMP_ROOT/t_canonical-runtime-driver.sh"
+  # Driver: source bridge-lib.sh + audit script. Audit script sources
+  # bridge-lib.sh itself (idempotent under BRIDGE_ROSTER_CACHE_LOADED).
+  # Set up three fake agents in BRIDGE_AGENT_OS_USER + BRIDGE_AGENT_IDS,
+  # then echo the canonical group / iso user values for each.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -uo pipefail\n'
+    printf 'export BRIDGE_ROSTER_CACHE_DISABLE=1\n'
+    printf 'source "%s/bridge-lib.sh"\n' "$REPO_ROOT"
+    printf 'BRIDGE_AGENT_IDS+=(h_smoke aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa manual_explicit)\n'
+    printf 'BRIDGE_AGENT_OS_USER[h_smoke]=""\n'
+    printf 'BRIDGE_AGENT_OS_USER[aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]=""\n'
+    printf 'BRIDGE_AGENT_OS_USER[manual_explicit]="manual-name"\n'
+    printf '# Probe canonical helpers.\n'
+    printf 'printf "h_smoke.group=%%s\\n"           "$(bridge_isolation_v2_agent_group_name h_smoke)"\n'
+    printf 'printf "h_smoke.user_default=%%s\\n"   "$(bridge_agent_default_os_user h_smoke)"\n'
+    printf 'printf "h_smoke.user_explicit=%%s\\n"  "$(bridge_agent_os_user h_smoke)"\n'
+    printf 'printf "longname.group=%%s\\n"         "$(bridge_isolation_v2_agent_group_name aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)"\n'
+    printf 'printf "manual.user_explicit=%%s\\n"   "$(bridge_agent_os_user manual_explicit)"\n'
+  } > "$T_CANONICAL_RUNTIME_DRIVER"
+  chmod +x "$T_CANONICAL_RUNTIME_DRIVER"
+
+  if ! bash "$T_CANONICAL_RUNTIME_DRIVER" > "$T_CANONICAL_RUNTIME_LOG" 2>&1; then
+    smoke_log "T_canonical runtime: driver output:"
+    cat "$T_CANONICAL_RUNTIME_LOG" >&2 || true
+    smoke_fail "T_canonical runtime: driver bash exited non-zero"
+  fi
+
+  # h_smoke: canonical group preserves the underscore.
+  if ! grep -F 'h_smoke.group=ab-agent-h_smoke' "$T_CANONICAL_RUNTIME_LOG" >/dev/null; then
+    smoke_log "T_canonical runtime log:"
+    cat "$T_CANONICAL_RUNTIME_LOG" >&2 || true
+    smoke_fail "T_canonical runtime: bridge_isolation_v2_agent_group_name(h_smoke) did not return ab-agent-h_smoke (canonical preserves underscore)"
+  fi
+
+  # h_smoke: canonical default user preserves the underscore too.
+  if ! grep -F 'h_smoke.user_default=agent-bridge-h_smoke' "$T_CANONICAL_RUNTIME_LOG" >/dev/null; then
+    smoke_log "T_canonical runtime log:"
+    cat "$T_CANONICAL_RUNTIME_LOG" >&2 || true
+    smoke_fail "T_canonical runtime: bridge_agent_default_os_user(h_smoke) did not return agent-bridge-h_smoke (canonical preserves underscore)"
+  fi
+
+  # h_smoke: explicit os_user lookup is empty (no override).
+  if ! grep -F 'h_smoke.user_explicit=' "$T_CANONICAL_RUNTIME_LOG" >/dev/null; then
+    smoke_fail "T_canonical runtime: bridge_agent_os_user(h_smoke) did not return empty (no explicit override)"
+  fi
+  if grep -E '^h_smoke.user_explicit=.+' "$T_CANONICAL_RUNTIME_LOG" >/dev/null; then
+    smoke_fail "T_canonical runtime: bridge_agent_os_user(h_smoke) unexpectedly returned a value (should be empty)"
+  fi
+
+  # long agent: canonical group must hash-truncate past 32 chars. The
+  # prefix `ab-agent-` is 9 chars; total must be <=32. Therefore the
+  # output is `ab-agent-<head>-<7hex>` with head length = 32-9-1-7 = 15.
+  if ! grep -E 'longname.group=ab-agent-a{15}-[0-9a-f]{7}$' "$T_CANONICAL_RUNTIME_LOG" >/dev/null; then
+    smoke_log "T_canonical runtime log:"
+    cat "$T_CANONICAL_RUNTIME_LOG" >&2 || true
+    smoke_fail "T_canonical runtime: bridge_isolation_v2_agent_group_name(<32-char name>) did not hash-truncate to the 32-char Linux limit"
+  fi
+
+  # manual: explicit os_user lookup returns the operator-provided value
+  # (the canonical override path; the audit picks this up instead of
+  # re-deriving `agent-bridge-manual_explicit`).
+  if ! grep -F 'manual.user_explicit=manual-name' "$T_CANONICAL_RUNTIME_LOG" >/dev/null; then
+    smoke_log "T_canonical runtime log:"
+    cat "$T_CANONICAL_RUNTIME_LOG" >&2 || true
+    smoke_fail "T_canonical runtime: bridge_agent_os_user(manual_explicit) did not return manual-name (explicit --os-user override path broken)"
+  fi
+
+  smoke_log "T_canonical runtime PASS — canonical helpers preserve underscores, hash-truncate long names, and honor explicit --os-user overrides"
+else
+  smoke_log "T_canonical runtime: skipped — non-Linux host (canonical helpers' Linux branch is what --all runs against on the operator host)"
+fi
+
+smoke_log "all tests PASS — Lane H (#1278 + #1208 + #1215 cross-check + r2 canonical helpers) verified at current source"
