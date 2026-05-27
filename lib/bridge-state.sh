@@ -240,7 +240,13 @@ bridge_claude_resume_session_id_for_agent() {
   # helper keeps its daemon-HOME fallback.
   local _claude_config_dir=""
   _claude_config_dir="$(bridge_resolve_agent_claude_config_dir "$agent")"
-  detected="$(bridge_detect_claude_session_id "$workdir" "$_since_ms" "$_quarantine_csv" "$_claude_config_dir" 2>/dev/null || true)"
+  # Issue #1299 (v0.15.0-beta5 Lane β): pass the agent's iso v2 os_user so
+  # the detect helper can read `0600 <iso-uid>:ab-agent-<a>` jsonl files
+  # via sudo-as-user. Resolver returns empty when iso v2 is not in play
+  # (non-isolated agent, unregistered, no sudo).
+  local _iso_sudo_user=""
+  _iso_sudo_user="$(bridge_resolve_agent_iso_sudo_user "$agent" 2>/dev/null || true)"
+  detected="$(bridge_detect_claude_session_id "$workdir" "$_since_ms" "$_quarantine_csv" "$_claude_config_dir" "$_iso_sudo_user" 2>/dev/null || true)"
   [[ -n "$detected" ]] || return 1
   # Belt-and-suspenders: round-trip through the resolver so a missed slug or
   # detection-side regression cannot reintroduce a stale id past this point.
@@ -3360,13 +3366,41 @@ bridge_detect_claude_session_id() {
   # `~/.claude/`. Passed through to the helper as a trailing arg; empty
   # keeps the pre-#1015 daemon-HOME fallback for non-isolated callers.
   local claude_config_dir="${4:-}"
+  # Issue #1299 (v0.15.0-beta5 Lane β): optional iso v2 os_user. Claude
+  # Code writes session JSON / transcripts as `0600 <iso-uid>:ab-agent-<a>`
+  # — the group bit is unset so even a group-member controller cannot read
+  # directly. When set, the python detect helper runs under
+  # `sudo -n -u <os_user> -- bash -c 'exec "$@"' bash python3 ...` so the
+  # `os.kill`/`open` operations execute as the iso UID. Empty preserves the
+  # legacy direct-as-controller invocation for non-isolated callers / dev
+  # hosts / smokes. Callers should resolve via
+  # `bridge_resolve_agent_iso_sudo_user`.
+  local os_user="${5:-}"
 
   # #946 L1 (r2): substitution-safe guard. This helper is called
   # exclusively from `$(...)` substitutions (callers parse stdout).
   if ! bridge_resolve_script_dir_check; then
     return 1
   fi
-  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/detect-claude-session-id.py" \
+
+  local _detect_py="$BRIDGE_SCRIPT_DIR/scripts/python-helpers/detect-claude-session-id.py"
+
+  if [[ -n "$os_user" ]] \
+      && command -v bridge_linux_sudo_as_user >/dev/null 2>&1; then
+    # `bash -c 'exec python3 "$@"' bash <args...>` shape: keeps sudo's
+    # whitelist seeing only `bash` on its argv (matches the per-agent
+    # sudoers entry from bridge_migration_sudoers_entry which permits
+    # `bash` + `tmux` ONLY; a bare `sudo -n -u <user> python3 ...` would
+    # be rejected by that policy). The literal arg-zero is "bash" so
+    # `$0` inside the inline script matches the legacy heredoc spawn.
+    local _bash_bin="${BRIDGE_BASH_BIN:-$(command -v bash 2>/dev/null || printf '/bin/bash')}"
+    bridge_linux_sudo_as_user "$os_user" \
+      "$_bash_bin" -c 'exec python3 "$@"' bash \
+      "$_detect_py" "$workdir" "$since_ms" "$exclude_csv" "$claude_config_dir"
+    return $?
+  fi
+
+  python3 "$_detect_py" \
     "$workdir" "$since_ms" "$exclude_csv" "$claude_config_dir"
 }
 
@@ -3431,7 +3465,28 @@ bridge_resolve_resume_session_id() {
   local claude_config_dir=""
   claude_config_dir="$(bridge_resolve_agent_claude_config_dir "$agent")"
 
-  python3 "$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-claude-resume-session-id.py" \
+  # Issue #1299 (v0.15.0-beta5 Lane β): iso v2 0600-jsonl read elevation.
+  # When the agent is iso-v2-effective AND the controller can sudo to its
+  # os_user, drop privilege via `sudo -n -u <os_user> -- bash -c 'exec
+  # python3 ...'` so the resolver's `open()` / `getsize()` / `getmtime()`
+  # calls execute as the iso UID. Empty user → legacy direct-as-controller
+  # invocation (back-compat for non-iso and dev hosts).
+  local _resolve_py="$BRIDGE_SCRIPT_DIR/scripts/python-helpers/resolve-claude-resume-session-id.py"
+  local _iso_sudo_user=""
+  if command -v bridge_resolve_agent_iso_sudo_user >/dev/null 2>&1; then
+    _iso_sudo_user="$(bridge_resolve_agent_iso_sudo_user "$agent" 2>/dev/null || true)"
+  fi
+  if [[ -n "$_iso_sudo_user" ]] \
+      && command -v bridge_linux_sudo_as_user >/dev/null 2>&1; then
+    local _bash_bin="${BRIDGE_BASH_BIN:-$(command -v bash 2>/dev/null || printf '/bin/bash')}"
+    bridge_linux_sudo_as_user "$_iso_sudo_user" \
+      "$_bash_bin" -c 'exec python3 "$@"' bash \
+      "$_resolve_py" "$workdir" "$candidate" "$max_age_hours" "$agent" \
+      "$exclude_csv" "$claude_config_dir"
+    return $?
+  fi
+
+  python3 "$_resolve_py" \
     "$workdir" "$candidate" "$max_age_hours" "$agent" "$exclude_csv" \
     "$claude_config_dir"
 }
@@ -3536,6 +3591,11 @@ bridge_detect_session_id() {
   # so isolation-v2 agents resolve their own `<agent-home>/.claude/` rather
   # than the daemon's `~/.claude/`. Ignored for codex; empty is harmless.
   local claude_config_dir="${5:-}"
+  # Issue #1299 (v0.15.0-beta5 Lane β): optional iso v2 os_user, threaded
+  # to the claude branch so the detect helper can read `0600 <iso-uid>`
+  # session JSON / jsonl files via sudo-as-user. Ignored for codex (codex
+  # transcripts at `~/.codex/sessions/**/*.jsonl` are controller-owned).
+  local os_user="${6:-}"
 
   case "$engine" in
     codex)
@@ -3543,7 +3603,7 @@ bridge_detect_session_id() {
       ;;
     claude)
       bridge_detect_claude_session_id "$workdir" "$since_hint" "$exclude_csv" \
-        "$claude_config_dir"
+        "$claude_config_dir" "$os_user"
       ;;
     *)
       printf '%s' ""
@@ -3605,12 +3665,19 @@ bridge_refresh_agent_session_id() {
     # for unregistered / non-isolated agents (daemon-HOME fallback kept).
     local _claude_config_dir=""
     _claude_config_dir="$(bridge_resolve_agent_claude_config_dir "$agent")"
+    # Issue #1299 (v0.15.0-beta5 Lane β): thread the agent's iso v2
+    # os_user so the detect helper can read `0600 <iso-uid>` jsonl files
+    # via sudo-as-user. Empty for non-isolated/unregistered agents (the
+    # direct-as-controller invocation is the back-compat path).
+    local _iso_sudo_user=""
+    _iso_sudo_user="$(bridge_resolve_agent_iso_sudo_user "$agent" 2>/dev/null || true)"
     detected="$(bridge_detect_session_id \
       "$(bridge_agent_engine "$agent")" \
       "$(bridge_agent_workdir "$agent")" \
       "$since_hint" \
       "$exclude_csv" \
-      "$_claude_config_dir")"
+      "$_claude_config_dir" \
+      "$_iso_sudo_user")"
 
     if [[ -n "$detected" ]]; then
       BRIDGE_AGENT_SESSION_ID["$agent"]="$detected"
