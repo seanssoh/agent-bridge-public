@@ -6499,6 +6499,10 @@ cmd_run_cron_worker() {
   local CRON_PROMPT_FILE=""
   local CRON_NEEDS_HUMAN_FOLLOWUP=""
   local CRON_FAILURE_CLASS=""
+  # Issue #1314 (beta5-2 Lane η): payload_kind surfaced via
+  # bridge_cron_load_run_shell so the dispatch site can gate shell-cron runs
+  # on `bridge_cron_uid_drop_preflight`.
+  local CRON_PAYLOAD_KIND=""
 
   [[ "$task_id" =~ ^[0-9]+$ ]] || bridge_die "Usage: bash $SCRIPT_DIR/bridge-daemon.sh run-cron-worker <task-id>"
 
@@ -6533,13 +6537,51 @@ cmd_run_cron_worker() {
   source <(bridge_cron_load_run_shell "$run_id")
 
   if [[ "$CRON_RUN_STATE" != "success" || ! -f "$CRON_RESULT_FILE" ]]; then
-    if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-cron.sh" run-subagent "$run_id" >/dev/null 2>&1; then
-      subagent_status=0
-    else
-      subagent_status=$?
+    # Issue #1314 (beta5-2 Lane η, CRITICAL/security): pre-flight UID-drop
+    # validation BEFORE invoking the runner. The runner's
+    # `shell_command_for_execution` RuntimeError (bridge-cron-runner.py:481)
+    # is the last-resort seal; pre-flight here gives the operator an
+    # actionable `cron_dispatch_refused` audit row + admin task instead of
+    # an opaque runner-exit traceback.
+    #
+    # Scope (mirrors brief edge cases):
+    #   - shell-cron only — `payload_kind=="shell"` is the only path that
+    #     hits the runner's UID-drop construction. agentTurn payloads go
+    #     through `cmd_run` → engine-specific exec which has its own UID-
+    #     drop wrap upstream (bridge-cron-runner.py:2589+).
+    #   - iso v2 effective only — `bridge_cron_uid_drop_preflight` is a
+    #     no-op (rc=0) on non-iso, non-Linux, or roster-empty agents, so
+    #     non-iso shell-cron continues to dispatch normally.
+    #   - rc 0 → proceed with dispatch; rc 1 → refuse + audit + admin task.
+    local preflight_rc=0
+    if [[ "$CRON_PAYLOAD_KIND" == "shell" && -n "$CRON_TARGET_AGENT" ]] \
+        && declare -F bridge_cron_uid_drop_preflight >/dev/null 2>&1; then
+      bridge_cron_uid_drop_preflight "$CRON_TARGET_AGENT" || preflight_rc=$?
     fi
-    # shellcheck disable=SC1090
-    source <(bridge_cron_load_run_shell "$run_id")
+    if [[ "$preflight_rc" -ne 0 ]]; then
+      bridge_warn "cron dispatch refused for ${CRON_TARGET_AGENT} (reason=iso_uid_drop_unavailable run_id=${run_id})"
+      bridge_audit_log daemon cron_dispatch_refused "$CRON_TARGET_AGENT" \
+        --detail run_id="$run_id" \
+        --detail job_name="${CRON_JOB_NAME:-$run_id}" \
+        --detail family="${CRON_FAMILY:-}" \
+        --detail slot="${CRON_SLOT:-}" \
+        --detail payload_kind="${CRON_PAYLOAD_KIND:-}" \
+        --detail reason=iso_uid_drop_unavailable 2>/dev/null || true
+      subagent_status=1
+      CRON_NEEDS_HUMAN_FOLLOWUP="1"
+      CRON_RUN_STATE="error"
+      CRON_RESULT_STATUS="error"
+      CRON_RESULT_SUMMARY="cron_dispatch_refused: iso v2 UID drop unavailable for ${CRON_TARGET_AGENT} (sudo/setpriv misconfigured)"
+      CRON_FAILURE_CLASS="human-config"
+    else
+      if "$BRIDGE_BASH_BIN" "$SCRIPT_DIR/bridge-cron.sh" run-subagent "$run_id" >/dev/null 2>&1; then
+        subagent_status=0
+      else
+        subagent_status=$?
+      fi
+      # shellcheck disable=SC1090
+      source <(bridge_cron_load_run_shell "$run_id")
+    fi
   fi
 
   # Issue #385: distinguish failure-followups (transient API noise) from

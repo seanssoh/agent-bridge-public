@@ -461,6 +461,23 @@ def shell_payload_env(payload: dict[str, Any]) -> dict[str, str]:
 
 
 def shell_command_for_execution(execution: dict[str, Any], env: dict[str, str], script: str, args: list[str]) -> list[str]:
+    # Issue #1314 (CRITICAL/security, beta5-2 Lane η): two-layer defense.
+    #
+    # Layer 1 (PRE-FLIGHT, NEW): `bridge_cron_uid_drop_preflight` in
+    # lib/bridge-cron.sh runs at the daemon dispatch site and refuses to
+    # invoke the runner when an iso v2 agent's UID drop is unavailable
+    # (sudo/setpriv misconfigured). The daemon emits a
+    # `cron_dispatch_refused reason=iso_uid_drop_unavailable` audit row
+    # AND a high-priority admin task with an actionable repro instead of
+    # producing the opaque RuntimeError traceback below.
+    #
+    # Layer 2 (RUNNER-INTERNAL SEAL, BELOW): the RuntimeError remains as
+    # the last-resort security boundary. If pre-flight is bypassed (custom
+    # runner invocation, dispatch from a code path that does not gate on
+    # pre-flight, race between pre-flight cache TTL and a sudoers repair
+    # rollback), this seal still prevents a silent controller-UID
+    # fallthrough — which would be the iso v2 security boundary bypass.
+    # DO NOT downgrade this to a warning; it is intentional fail-closed.
     os_user = str(execution.get("os_user") or "")
     uid = int(execution.get("uid"))
     gid = int(execution.get("gid"))

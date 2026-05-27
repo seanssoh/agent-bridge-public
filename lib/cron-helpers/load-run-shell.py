@@ -50,6 +50,13 @@ def main() -> int:
         "CRON_SLOT": request.get("slot", ""),
         "CRON_TARGET_AGENT": request.get("target_agent", ""),
         "CRON_TARGET_ENGINE": request.get("target_engine", ""),
+        # Issue #1314 (beta5-2 Lane η): surface payload_kind so the daemon
+        # dispatch site can route shell-cron runs through the iso v2 UID-
+        # drop pre-flight (`bridge_cron_uid_drop_preflight`). The pre-flight
+        # only fires when payload_kind=="shell" — agentTurn dispatches do
+        # not hit `shell_command_for_execution` so the RuntimeError class
+        # there is not their failure mode.
+        "CRON_PAYLOAD_KIND": str(request.get("payload_kind") or "").strip(),
         "CRON_RESULT_STATUS": result.get("status", ""),
         "CRON_RESULT_SUMMARY": result.get("summary", ""),
         "CRON_RUN_STATE": status.get("state", ""),
