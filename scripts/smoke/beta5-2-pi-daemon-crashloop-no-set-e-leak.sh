@@ -368,7 +368,7 @@ REQUIRED_SUBSHELL_SITES=(
   "( start_cron_dispatch_workers ) || true"
   "( process_a2a_deliver_tick ) || true"
   "( process_a2a_outbox_stuck_scan_tick ) || true"
-  "( process_memory_daily_orphan_sweep ) || true"
+  "( process_memory_daily_orphan_sweep ) 2>/dev/null || daemon_warn \"memory-daily orphan sweep failed\""
   "( bridge_dashboard_post_if_changed \"\$summary_output\" ) || true"
 )
 
