@@ -213,27 +213,62 @@ if "$PY_BIN" -c "from pathlib import Path; import sys; sys.exit(0 if Path('$BLOC
   exit 0
 fi
 
-# Agent 5: scan_error with controller-cache-stale shape — workdir
-# exists and parent is traversable, but the file beneath is unreadable.
-# Emulate the supp-group-stale shape by setting the workdir to mode
-# 0700 owned by a different uid would require sudo, so use mode 0000
-# on workdir itself (parent traversable, workdir not stat-able from
-# inside) — but that drives PermissionError on is_dir() which returns
-# iso-uid-side. Instead we set workdir mode 0700 OWNED BY US but mode
-# 0000 on the CLAUDE.md inside, so the resolve_scan_path's is_dir()
-# succeeds (controller-cache-stale shape) and the inner read fails
-# inside scan_agent's catch — which still categorizes as
-# controller-cache-stale because the workdir itself was statable.
-CACHE_STALE_AGENT="agent_cache_stale"
-CACHE_STALE_PARENT="$BRIDGE_AGENT_ROOT_V2/$CACHE_STALE_AGENT"
-mkdir -p "$CACHE_STALE_PARENT/workdir"
-mkdir -p "$BRIDGE_AGENT_HOME_ROOT/$CACHE_STALE_AGENT"
-# Place a 0000-mode CLAUDE.md so the inner read raises PermissionError
-# but the workdir itself remains statable from the controller.
-: >"$CACHE_STALE_PARENT/workdir/CLAUDE.md"
-chmod 0000 "$CACHE_STALE_PARENT/workdir/CLAUDE.md"
+# Agent 5: scan_error with iso-uid-side shape (CLAUDE.md mode 0000) —
+# r2 recategorization (codex r1 BLOCKING #2). Workdir is statable
+# (parent traversable, workdir 0700 owned by us) BUT CLAUDE.md inside
+# is mode 0000 → neither the controller nor the iso UID can read it.
+# Pre-r2 this was misclassified as controller-cache-stale (any
+# statable workdir + permission_denied → cache-stale, no iso UID
+# readability check). r2 fixes the classification to iso-uid-side by
+# probing the iso UID. We use the BRIDGE_WATCHDOG_TEST_ISO_PROBE_JSON
+# test seam to stub the probe answer because real isolated-uid
+# sudo is unavailable on macOS / OSS dev hosts.
+ISO_BROKEN_AGENT="agent_iso_broken"
+ISO_BROKEN_PARENT="$BRIDGE_AGENT_ROOT_V2/$ISO_BROKEN_AGENT"
+mkdir -p "$ISO_BROKEN_PARENT/workdir"
+mkdir -p "$BRIDGE_AGENT_HOME_ROOT/$ISO_BROKEN_AGENT"
+: >"$ISO_BROKEN_PARENT/workdir/CLAUDE.md"
+chmod 0000 "$ISO_BROKEN_PARENT/workdir/CLAUDE.md"
+ISO_BROKEN_FILE="$ISO_BROKEN_PARENT/workdir/CLAUDE.md"
 
-# Registry that exercises all five agents.
+# Agent 6 (T6b — new, codex r1 BLOCKING #2): real controller-cache-
+# stale shape. Workdir + file are present and statable; the supp-group
+# cache miss is mocked via the test seam ("iso UID can read this
+# path"). Pre-r2 the smoke could not distinguish T6 (real iso-side
+# corruption) from T6b (real supp-group cache stale) because both
+# produced identical classification. r2 makes the classifier
+# definitive: file mode 0000 vs. mocked-readable-by-iso-UID yields
+# distinct buckets.
+ISO_CACHE_AGENT="agent_iso_cache"
+ISO_CACHE_PARENT="$BRIDGE_AGENT_ROOT_V2/$ISO_CACHE_AGENT"
+mkdir -p "$ISO_CACHE_PARENT/workdir"
+mkdir -p "$BRIDGE_AGENT_HOME_ROOT/$ISO_CACHE_AGENT"
+# Place a mode 0000 CLAUDE.md so the controller's read raises
+# PermissionError (driving the scan into the classify branch). The
+# test seam below tells the classifier "iso UID CAN read this path"
+# — exactly the production controller-cache-stale shape.
+: >"$ISO_CACHE_PARENT/workdir/CLAUDE.md"
+chmod 0000 "$ISO_CACHE_PARENT/workdir/CLAUDE.md"
+ISO_CACHE_FILE="$ISO_CACHE_PARENT/workdir/CLAUDE.md"
+
+# Test seam: BRIDGE_WATCHDOG_TEST_ISO_PROBE_JSON tells the classifier
+# what the iso UID readability probe would return for each absolute
+# path. Keys are absolute paths; values are "readable" or "denied".
+# Used by classify_scan_error_category as a portable substitute for
+# the real `sudo -n -u <iso> test -r <path>` probe (which only works
+# on a Linux v2-isolation install).
+ISO_PROBE_JSON="$SMOKE_TMP_ROOT/iso-probe.json"
+"$PY_BIN" -c "
+import json, sys
+data = {
+    sys.argv[1]: 'denied',     # iso-broken: iso UID also can't read
+    sys.argv[2]: 'readable',   # cache-stale: iso UID CAN read
+}
+with open(sys.argv[3], 'w', encoding='utf-8') as h:
+    json.dump(data, h)
+" "$ISO_BROKEN_FILE" "$ISO_CACHE_FILE" "$ISO_PROBE_JSON"
+
+# Registry that exercises all six agents.
 REGISTRY_JSON="$SMOKE_TMP_ROOT/registry.json"
 cat >"$REGISTRY_JSON" <<EOF
 [
@@ -241,12 +276,17 @@ cat >"$REGISTRY_JSON" <<EOF
   {"id": "$STATIC_AGENT", "class": "static", "agent_source": "static", "engine": "claude"},
   {"id": "$RESTART_AGENT", "class": "static", "agent_source": "static", "engine": "claude"},
   {"id": "$BLOCKED_AGENT", "class": "static", "agent_source": "static", "engine": "claude", "workdir": "$BLOCKED_PARENT/workdir"},
-  {"id": "$CACHE_STALE_AGENT", "class": "static", "agent_source": "static", "engine": "claude", "workdir": "$CACHE_STALE_PARENT/workdir"}
+  {"id": "$ISO_BROKEN_AGENT", "class": "static", "agent_source": "static", "engine": "claude", "workdir": "$ISO_BROKEN_PARENT/workdir"},
+  {"id": "$ISO_CACHE_AGENT", "class": "static", "agent_source": "static", "engine": "claude", "workdir": "$ISO_CACHE_PARENT/workdir"}
 ]
 EOF
 
 # Drive a watchdog scan against the fixture and persist the JSON +
-# markdown render for the assertion helpers below.
+# markdown render for the assertion helpers below. Export the iso
+# probe test seam so classify_scan_error_category honors the mocked
+# readability answers.
+export BRIDGE_WATCHDOG_TEST_ISO_PROBE_JSON="$ISO_PROBE_JSON"
+
 JSON_OUT="$SMOKE_TMP_ROOT/watchdog.json"
 MD_OUT="$SMOKE_TMP_ROOT/watchdog.md"
 "$PY_BIN" "$REPO_ROOT/bridge-watchdog.py" scan --json \
@@ -395,12 +435,21 @@ smoke_log "T3-teeth PASS — empty agent-group resolver short-circuits the chgrp
 smoke_log "T5 PASS — restart-in-progress agent excluded from drift problem_count"
 
 # ---------------------------------------------------------------------
-# T6 — scan_error category split (controller-cache-stale vs iso-uid-side)
+# T6 / T6b — scan_error category split (iso-uid-side vs
+# controller-cache-stale), now driven by the iso UID readability probe
+# (r2 codex r1 BLOCKING #2 fix).
 # ---------------------------------------------------------------------
+# T6: BLOCKED_AGENT — workdir parent mode 0000 → iso-uid-side (workdir
+#     itself not statable).
+# T6 r2 (renamed): ISO_BROKEN_AGENT — workdir statable + CLAUDE.md
+#     mode 0000 + test seam reports "denied" for iso UID →
+#     iso-uid-side. Pre-r2 this was misclassified as cache-stale.
+# T6b: ISO_CACHE_AGENT — workdir statable + CLAUDE.md mode 0000 + test
+#     seam reports "readable" for iso UID → controller-cache-stale.
 "$PY_BIN" "$HELPER_DIR/assert-scan-error-categories.py" \
-  "$JSON_OUT" "$BLOCKED_AGENT" "$CACHE_STALE_AGENT" \
+  "$JSON_OUT" "$BLOCKED_AGENT" "$ISO_BROKEN_AGENT" "$ISO_CACHE_AGENT" \
   || smoke_fail "T6 FAIL — scan_error category split broken"
-smoke_log "T6 PASS — scan_error split: iso-uid-side vs controller-cache-stale"
+smoke_log "T6 PASS — scan_error 3-way split (parent-0000 / iso-broken / cache-stale)"
 
 # ---------------------------------------------------------------------
 # T7 — bridge_init_write_onboarding_marker writes the expected schema
@@ -452,4 +501,72 @@ T7_RC=$?
   || smoke_fail "T7 FAIL — bridge_init_write_onboarding_marker schema regression"
 smoke_log "T7 PASS — onboarding-pending marker schema + dry-run-skip honored"
 
-smoke_log "all 7 tests + 2 teeth PASS (#1266 + #1270 + #1254 v0.15.0-beta4 Lane G)"
+# ---------------------------------------------------------------------
+# T8 / T9 (r2 codex r1 BLOCKING #1): detect_fresh_install precedence +
+# pending-marker TTL. The fresh-install signal must NOT stick after
+# onboarding completes, and a stale pending marker (24h+ old by
+# default; 1h for this test via env override) must expire so a paused
+# install does not stay at priority=low forever.
+# ---------------------------------------------------------------------
+T8_STATE_DIR="$SMOKE_TMP_ROOT/t8-state"
+T8_HOME_ROOT="$SMOKE_TMP_ROOT/t8-home-root"
+mkdir -p "$T8_STATE_DIR" "$T8_HOME_ROOT"
+"$PY_BIN" "$HELPER_DIR/assert-detect-fresh-install.py" \
+  "$REPO_ROOT" "$T8_STATE_DIR" "$T8_HOME_ROOT" \
+  || smoke_fail "T8/T9 FAIL — detect_fresh_install precedence or TTL regression"
+smoke_log "T8 + T9 PASS — fresh_install precedence + TTL across 5 cases"
+
+# ---------------------------------------------------------------------
+# T10 (r2 codex r1 BLOCKING #1): bridge_init_write_onboarding_complete_
+# marker writes the schema, sets mode 0600, and removes the sibling
+# onboarding-pending marker.
+# ---------------------------------------------------------------------
+T10_HOME="$SMOKE_TMP_ROOT/t10-bridge-home"
+T10_AGENT="patch_t10"
+mkdir -p "$T10_HOME/state/agents/$T10_AGENT"
+# Pre-seed an existing pending marker so we can verify the writer
+# cleans it up.
+cat >"$T10_HOME/state/agents/$T10_AGENT/onboarding-pending" <<EOF
+agent=$T10_AGENT
+written=$(date +%s)
+reason=fresh-install
+EOF
+
+T10_FN_SRC="$SMOKE_TMP_ROOT/t10-fn.sh"
+# Extract bridge_init_write_onboarding_complete_marker — same awk
+# pattern as T7 so the smoke fails fast if the function is renamed
+# or moved.
+awk '/^bridge_init_write_onboarding_complete_marker\(\)/{flag=1} flag{print; if (/^}$/) exit}' \
+  "$REPO_ROOT/bridge-init.sh" >"$T10_FN_SRC"
+[[ -s "$T10_FN_SRC" ]] \
+  || smoke_fail "T10 FAIL — could not extract bridge_init_write_onboarding_complete_marker from bridge-init.sh"
+
+T10_LOG="$SMOKE_TMP_ROOT/t10.log"
+(
+  set +e
+  export BRIDGE_HOME="$T10_HOME"
+  export BRIDGE_STATE_DIR="$T10_HOME/state"
+  WARNINGS=()
+  # shellcheck disable=SC2329
+  bridge_init_append_warning() { WARNINGS+=("$1"); }
+  # shellcheck disable=SC1090
+  source "$T10_FN_SRC"
+  bridge_init_write_onboarding_complete_marker "$T10_AGENT" "0"
+  # Idempotent re-invocation must not error.
+  bridge_init_write_onboarding_complete_marker "$T10_AGENT" "0"
+  # dry_run=1 must skip the write entirely.
+  T10_DRYRUN_HOME="$SMOKE_TMP_ROOT/t10-dryrun"
+  BRIDGE_HOME="$T10_DRYRUN_HOME" BRIDGE_STATE_DIR="$T10_DRYRUN_HOME/state" \
+    bridge_init_write_onboarding_complete_marker "${T10_AGENT}_dry" "1"
+  [[ ! -e "$T10_DRYRUN_HOME/state/agents/${T10_AGENT}_dry/onboarding-complete" ]] \
+    || { printf 'T10 dry-run skip FAIL\n' >&2; exit 1; }
+) >"$T10_LOG" 2>&1
+T10_RC=$?
+(( T10_RC == 0 )) || smoke_fail "T10 helper run failed (rc=$T10_RC, log at $T10_LOG)"
+
+"$PY_BIN" "$HELPER_DIR/assert-complete-marker.py" \
+  "$T10_HOME/state/agents/$T10_AGENT" "$T10_AGENT" \
+  || smoke_fail "T10 FAIL — bridge_init_write_onboarding_complete_marker schema or pending cleanup regression"
+smoke_log "T10 PASS — complete marker schema + pending sibling cleanup + dry-run-skip"
+
+smoke_log "all 10 tests + 2 teeth PASS (#1266 + #1270 + #1254 v0.15.0-beta4 Lane G r2)"

@@ -502,6 +502,14 @@ STATIC_SESSION_TYPES = frozenset({"static", "static-claude", "static-codex"})
 # alert as the operator's first install impression. Tunable via env.
 DEFAULT_FRESH_INSTALL_WINDOW_SECS = 600
 
+# #1266 r2: pending-marker TTL. After `bridge-init.sh` drops the
+# ``onboarding-pending`` marker, the watchdog treats every subsequent
+# drift as fresh-install (priority=low) WHILE the marker is still within
+# this window from its `written` timestamp. Past the TTL the marker is
+# stale and fresh_install=False so a long-paused install that never
+# completed onboarding is not held at priority=low forever. Default 24h.
+DEFAULT_FRESH_INSTALL_PENDING_TTL_SECS = 86400
+
 
 def fresh_install_window_secs() -> int:
     """Resolve the fresh-install age window from the env, with a safe
@@ -518,25 +526,87 @@ def fresh_install_window_secs() -> int:
     return parsed
 
 
+def fresh_install_pending_ttl_secs() -> int:
+    """Resolve the pending-marker TTL from the env, with safe fall-through
+    to ``DEFAULT_FRESH_INSTALL_PENDING_TTL_SECS`` (24h). Non-integer or
+    non-positive overrides are treated as the default so operator typos
+    cannot disarm the gate entirely. See ``detect_fresh_install`` for
+    the precedence rules."""
+    raw = os.environ.get("BRIDGE_WATCHDOG_FRESH_INSTALL_PENDING_TTL_SECS", "")
+    try:
+        parsed = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_FRESH_INSTALL_PENDING_TTL_SECS
+    if parsed <= 0:
+        return DEFAULT_FRESH_INSTALL_PENDING_TTL_SECS
+    return parsed
+
+
+def _read_marker_written_ts(marker_path: Path) -> int | None:
+    """Parse the ``written=<unix-ts>`` field from a marker file. Returns
+    the int timestamp on success, or ``None`` when the file is
+    unreadable, malformed, or the field is missing / non-integer.
+
+    Conservative on every error: a marker we cannot parse must NOT be
+    treated as ``written=0`` (instantly stale, suppresses fresh-install
+    signal entirely) or as ``written=now`` (eternally fresh). The
+    ``None`` return lets the caller fall through to a definitive
+    decision tree (see ``detect_fresh_install``).
+    """
+    try:
+        text = marker_path.read_text(encoding="utf-8", errors="ignore")
+    except (PermissionError, FileNotFoundError, OSError):
+        return None
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip() != "written":
+            continue
+        value = value.strip()
+        if not value.isdigit():
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 def detect_fresh_install(
     state_dir: Path | None,
     agent_name: str,
     agent_home_dir: Path,
+    session_type_search_dirs: list[Path] | None = None,
 ) -> bool:
     """Return True when this agent looks like a fresh-install candidate
-    (Lane G #1266).
+    (Lane G #1266 + r2).
 
-    Decision matrix (any branch positive ⇒ True):
+    Decision matrix (evaluated in order; the first matching branch
+    decides):
 
-      1. ``state/agents/<a>/onboarding-pending`` marker file exists.
-         (Authored by ``bridge-init.sh``'s fresh-install admin scaffold —
-         see ``bridge_init_write_onboarding_marker``.)
-      2. ``state/agents/<a>/onboarding-complete`` marker is ABSENT and
-         the agent home directory's mtime is within
-         ``fresh_install_window_secs()`` (default 600s = 10 min). This
-         covers the case where ``bridge-init.sh`` did not write the
-         marker (older install path, dry-run partial recovery) but the
-         agent was clearly created in the last few minutes.
+      1. ``state/agents/<a>/onboarding-complete`` marker EXISTS →
+         fresh_install=False. Completion takes precedence over every
+         other signal (a previously-fresh install that has since
+         completed onboarding must not regress to priority=low drift).
+         This marker is authored by the admin agent's onboarding
+         completion path (``agb onboarding done`` /
+         ``bridge_agent_mark_onboarding_complete``) as the explicit
+         "fresh install is over" handshake. A SESSION-TYPE.md
+         ``Onboarding State: complete`` reading is honored as a
+         fallback signal — if the controller can read the file and it
+         reports ``complete``, we treat the install as past the
+         fresh-install window even without an explicit complete marker.
+      2. ``state/agents/<a>/onboarding-pending`` marker EXISTS AND the
+         marker's ``written`` timestamp is within
+         ``fresh_install_pending_ttl_secs()`` (default 24h) →
+         fresh_install=True. An expired pending marker is treated as
+         "fresh install never finished — operator probably abandoned the
+         onboarding"; falls through to the mtime branch.
+      3. No marker, no SESSION-TYPE.md signal → fall back to the agent
+         home directory's mtime. Within
+         ``fresh_install_window_secs()`` (default 600s = 10 min) →
+         fresh_install=True; otherwise False.
 
     Returns False when the state_dir is unknown (``None`` — caller could
     not resolve ``$BRIDGE_HOME/state``) so the detection is conservative:
@@ -546,14 +616,51 @@ def detect_fresh_install(
     if state_dir is None:
         return False
     agent_state_dir = state_dir / "agents" / agent_name
+    complete_marker = agent_state_dir / "onboarding-complete"
+    pending_marker = agent_state_dir / "onboarding-pending"
     try:
-        if (agent_state_dir / "onboarding-pending").is_file():
-            return True
-        if (agent_state_dir / "onboarding-complete").is_file():
+        if complete_marker.is_file():
+            # Branch 1: explicit completion marker → never fresh again.
             return False
     except (PermissionError, OSError):
-        # Controller cannot reach the state dir for this agent — the
-        # markerless mtime branch below is the fallback signal.
+        # Controller cannot reach the state dir — fall through. The
+        # SESSION-TYPE.md probe + mtime branch below is the safety net.
+        pass
+    # SESSION-TYPE.md "Onboarding State: complete" is the equivalent
+    # signal: the admin has flipped the template to complete but a
+    # dedicated marker writer hasn't run yet. Honor it as a completion
+    # signal so the fresh-install window cannot get stuck after a
+    # successful onboarding even if the state-dir marker file is
+    # missing (older installs / dry-run recovery / iso-side workdir
+    # ownership preventing the controller from writing the marker).
+    # ``session_type_search_dirs`` lets the caller add additional
+    # candidates (typically the resolved scan path on a v2 install
+    # where SESSION-TYPE.md lives under
+    # ``<v2-root>/<a>/workdir/`` rather than under the tracked-tree
+    # home root).
+    if _onboarding_state_is_complete(agent_home_dir, session_type_search_dirs):
+        return False
+    try:
+        if pending_marker.is_file():
+            # Branch 2: pending marker present. TTL gate from the
+            # marker's `written` field.
+            written_ts = _read_marker_written_ts(pending_marker)
+            if written_ts is None:
+                # Malformed marker — fall through to the mtime branch
+                # rather than trusting a parse failure as "fresh".
+                pass
+            else:
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                age = now_ts - written_ts
+                # Clock skew defense (mirrors the mtime branch below):
+                # a future timestamp is treated as "do not trust"
+                # rather than "eternally fresh".
+                if 0 <= age <= fresh_install_pending_ttl_secs():
+                    return True
+                # Expired or skewed pending marker → fall through.
+    except (PermissionError, OSError):
+        # Controller cannot reach the pending marker — fall through to
+        # the mtime branch which is the catch-all signal.
         pass
     try:
         home_mtime = agent_home_dir.stat().st_mtime
@@ -567,6 +674,64 @@ def detect_fresh_install(
         # mis-set clock cannot disarm every drift task indefinitely.
         return False
     return age <= fresh_install_window_secs()
+
+
+_ONBOARDING_STATE_RE = re.compile(
+    r"^\s*-\s*Onboarding\s+State\s*:\s*([A-Za-z0-9._-]+)",
+    re.IGNORECASE,
+)
+
+
+def _onboarding_state_is_complete(
+    agent_home_dir: Path,
+    extra_search_dirs: list[Path] | None = None,
+) -> bool:
+    """Return True when the agent's ``SESSION-TYPE.md`` (under either
+    the workdir or the home root) reports ``Onboarding State:
+    complete``.
+
+    Used by :func:`detect_fresh_install` as a completion-marker
+    fallback so the watchdog cannot get stuck reporting
+    ``fresh_install=True`` for an agent whose operator has actually
+    finished onboarding but where the dedicated state-dir completion
+    marker is missing (older install, dry-run recovery, iso-side
+    workdir ownership preventing the controller from writing the
+    marker).
+
+    ``extra_search_dirs`` lets the caller add additional candidate
+    parent directories — typically the resolved scan path on a v2
+    install where SESSION-TYPE.md lives under
+    ``<v2-root>/<a>/workdir/`` and the legacy
+    ``<home-root>/<a>/SESSION-TYPE.md`` candidate misses.
+
+    Conservative on every error: an unreadable / missing
+    SESSION-TYPE.md returns False so the function never claims
+    completion based on a signal it could not actually read.
+    """
+    candidates: list[Path] = [
+        agent_home_dir / "workdir" / "SESSION-TYPE.md",
+        agent_home_dir / "SESSION-TYPE.md",
+    ]
+    if extra_search_dirs:
+        for extra in extra_search_dirs:
+            candidates.append(extra / "SESSION-TYPE.md")
+            candidates.append(extra / "workdir" / "SESSION-TYPE.md")
+    for candidate in candidates:
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+        for line in text.splitlines():
+            match = _ONBOARDING_STATE_RE.match(line)
+            if match:
+                if match.group(1).strip().lower() == "complete":
+                    return True
+                # Found the line but it's not complete — keep walking
+                # the candidate list (workdir may have it, then home
+                # may say something different — honor the first
+                # definitive read).
+                return False
+    return False
 
 
 def detect_restart_in_progress(
@@ -633,9 +798,10 @@ def classify_scan_error_category(
     error_kind: str,
     error_path: str,
     workdir: Path | None,
+    iso_user: str | None = None,
 ) -> str:
     """Split the scan_error rows into operator-actionable buckets
-    (Lane G #1254).
+    (Lane G #1254 + r2).
 
     Rules:
       * Empty ``error_kind`` (= no error) → empty string.
@@ -643,16 +809,39 @@ def classify_scan_error_category(
         ``os_error``) → "iso-uid-side". Those are genuine filesystem
         failures the operator must investigate; lumping them into the
         cache-stale bucket would mask real drift.
-      * ``error_kind == "permission_denied"`` AND the controller can
-        still ``stat`` the workdir's parent (i.e. the directory exists
-        and is traversable) → "controller-cache-stale". This is the
-        #1246 shape: the workdir was chgrp'd to ab-agent-<a> mode 2770
-        but the controller process's supplementary-group cache does not
-        include that group. A fresh shell would read it fine.
       * ``error_kind == "permission_denied"`` AND the controller cannot
         even ``stat`` the workdir / its parent → "iso-uid-side". The
         denial is structural (e.g. parent mode 0000, missing ancestor)
         and not something a supp-group refresh will fix.
+      * ``error_kind == "permission_denied"``, workdir IS statable, AND
+        the iso UID can read the failing ``error_path`` →
+        "controller-cache-stale". This is the #1246 shape: the workdir
+        + file are chmod'd ab-agent-<a> mode 0660 but the controller
+        process's supplementary-group cache does not include that
+        group. A fresh shell would read it fine.
+      * ``error_kind == "permission_denied"``, workdir IS statable, AND
+        the iso UID ALSO cannot read the failing path → "iso-uid-side".
+        Real file-permission corruption (mode 0000, broken ownership,
+        ACL drift). A supp-group refresh will NOT fix it; admin must
+        re-apply isolation v2 on this agent.
+
+    The iso UID probe (r2 fix for codex r1 BLOCKING #2): we call
+    ``sudo -n -u <iso_user> -- test -r <error_path>`` and read the
+    exit code:
+      * rc == 0   → iso UID can read → controller-cache-stale.
+      * rc != 0   → iso UID also can't read → iso-uid-side.
+      * rc is None (sudo missing / no iso owner resolvable / probe
+        unreachable) → fall back to "controller-cache-stale" so we do
+        not regress installs without sudo-helper coverage. The previous
+        Lane G shape already treated "workdir statable + permission
+        denied inside" as controller-cache-stale; the iso UID probe
+        only DOWNGRADES that to iso-uid-side when it has a definitive
+        "iso also can't read" signal.
+
+    The ``iso_user`` parameter is the OS-account name (e.g.
+    ``agent-bridge-patch_g``) resolved from the workdir owner by the
+    caller. Passing ``None`` skips the iso UID probe and keeps the
+    legacy behavior (statable workdir → controller-cache-stale).
     """
     if not error_kind:
         return ""
@@ -664,14 +853,83 @@ def classify_scan_error_category(
         # Can the controller see the workdir itself exist? `exists()`
         # walks ancestor x-bits, so a workdir under a 0000-mode parent
         # raises PermissionError or returns False — both signal
-        # iso-uid-side. A True here means the workdir is present, the
-        # parent is traversable, and the inability to read inside is
-        # the controller-side group cache.
+        # iso-uid-side. A True here means the workdir is present and
+        # the parent is traversable.
         if not workdir.exists():
             return "iso-uid-side"
     except (PermissionError, OSError):
         return "iso-uid-side"
+    # Workdir statable + permission_denied. Use the iso UID readability
+    # probe to disambiguate "controller's supp-group cache is stale"
+    # (iso readable, controller not) from "real iso-side file permission
+    # corruption" (neither can read).
+    #
+    # Test seam: ``BRIDGE_WATCHDOG_TEST_ISO_PROBE_JSON`` points to a
+    # JSON file mapping ``{"<error-path>": "<readable|denied>", ...}``
+    # plus an optional ``"_iso_owner_default"`` key to stub the iso
+    # owner name. Smoke tests use this on macOS / non-Linux dev hosts
+    # where the real ``isolated_workdir_owner`` returns None and
+    # ``sudo -n -u <user>`` cannot run. The seam ONLY engages when the
+    # env var is set; production paths use the live owner+sudo probe.
+    probe = _iso_probe_test_override(error_path)
+    if probe == "readable":
+        return "controller-cache-stale"
+    if probe == "denied":
+        return "iso-uid-side"
+    iso_owner = iso_user
+    if iso_owner is None and _isolated_workdir_owner_canonical is not None:
+        try:
+            iso_owner = _isolated_workdir_owner(workdir)
+        except (PermissionError, OSError):
+            iso_owner = None
+    if iso_owner and error_path and _sudo_run_as_canonical is not None:
+        probe_rc = _sudo_test(iso_owner, "-r", Path(error_path))
+        if probe_rc == 0:
+            return "controller-cache-stale"
+        if probe_rc is not None:
+            # iso UID definitively cannot read either — real file
+            # permission corruption on the iso side.
+            return "iso-uid-side"
+        # probe_rc is None: sudo missing / canonical helper unavailable
+        # → fall through to the legacy default below.
+    # Legacy default (pre-r2): statable workdir + permission_denied
+    # inside, no iso UID probe answer available → controller-cache-
+    # stale. This keeps macOS / non-sudo dev hosts at the same
+    # behavior as v0.15.0-beta4 r1.
     return "controller-cache-stale"
+
+
+def _iso_probe_test_override(error_path: str) -> str | None:
+    """Read the ``BRIDGE_WATCHDOG_TEST_ISO_PROBE_JSON`` test seam (r2 Lane
+    G smoke support). Returns ``"readable"`` / ``"denied"`` when the
+    seam is active and the path is mapped; ``None`` otherwise (which
+    means the live probe path is used).
+
+    Schema (JSON object):
+      {
+        "<absolute-error-path>": "readable" | "denied",
+        ...
+      }
+
+    Any other value (or a missing path) returns ``None``. The seam is
+    deliberately conservative: a malformed JSON / unreadable file
+    returns ``None`` so a misconfigured test environment never
+    silently downgrades / upgrades the real production classification.
+    """
+    override = os.environ.get("BRIDGE_WATCHDOG_TEST_ISO_PROBE_JSON", "")
+    if not override or not error_path:
+        return None
+    try:
+        with open(override, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get(error_path)
+    if value in ("readable", "denied"):
+        return value
+    return None
 
 
 # #1237: Legacy alias for the "engines that get no required-file check
@@ -840,7 +1098,19 @@ def scan_agent(
     # — the daemon's task writer uses the flag to skip the drift task
     # enqueue regardless of which row branch we took.
     fresh_install_dir = fresh_install_home_dir if fresh_install_home_dir is not None else agent_dir
-    is_fresh = detect_fresh_install(state_dir, resolved_name, fresh_install_dir)
+    # On v2 installs ``agent_dir`` is ``<v2-root>/<a>/workdir`` (the
+    # resolved scan path), while ``fresh_install_dir`` is the
+    # tracked-tree home root used for the mtime fallback. The
+    # SESSION-TYPE.md auto-detect needs both candidates so an iso v2
+    # workdir's ``Onboarding State: complete`` reading is honored
+    # even when the home root does not carry a sibling
+    # SESSION-TYPE.md copy.
+    is_fresh = detect_fresh_install(
+        state_dir,
+        resolved_name,
+        fresh_install_dir,
+        session_type_search_dirs=[agent_dir] if agent_dir != fresh_install_dir else None,
+    )
     is_restarting = detect_restart_in_progress(state_dir, resolved_name)
     # v0.8.8 #715-B / #694: linux-user-isolated agents own
     # `agents/<name>/CLAUDE.md` as `agent-bridge-<name>:<group> 0640`.
@@ -1241,7 +1511,19 @@ def main() -> int:
             error_category = classify_scan_error_category(
                 error_kind, error_path, workdir_candidate
             )
-            is_fresh = detect_fresh_install(state_dir, agent_name, path)
+            # Pass the registry's workdir candidate as an extra SESSION-
+            # TYPE.md search dir so the auto-detect honors an iso-v2
+            # workdir SESSION-TYPE.md (under
+            # ``<v2-root>/<a>/workdir/``) even when the home root
+            # carries no sibling copy. The probe is exception-tolerant,
+            # so an unreachable workdir simply contributes nothing.
+            extra_dirs: list[Path] | None = None
+            if workdir_candidate is not None and workdir_candidate != path:
+                extra_dirs = [workdir_candidate]
+            is_fresh = detect_fresh_install(
+                state_dir, agent_name, path,
+                session_type_search_dirs=extra_dirs,
+            )
             is_restarting = detect_restart_in_progress(state_dir, agent_name)
             records.append(
                 AgentWatch(
