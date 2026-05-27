@@ -756,6 +756,109 @@ def _is_read_intent_bash(command: str) -> bool:
     return True
 
 
+# Issue #1255 — softening the roster *read* gate. The default
+# `_is_read_intent_bash` is a *whitelist*: every stage's leading command
+# must be in `_READ_INTENT_BASH_COMMANDS`. That is the correct posture
+# for the credential / queue-DB gates (false-positive cost is low — the
+# operator can fall back to `agb` / `claude auth status`). For the
+# roster read path the cost is higher: the same data is already
+# exposed via `agent-bridge agent show --json` and `agent-bridge config
+# get`, so a too-conservative whitelist forces operators into N round-
+# trips through the structured-read surfaces.
+#
+# This *softer* classifier is a write-intent BLACKLIST: it returns True
+# (i.e. "safe enough to allow a read against the roster path") iff
+#  * no stage opens an output redirection (`>`, `>>`, `&>`, `2>file`,
+#    numeric-fd write `1>file` / `99>>log`), and
+#  * no stage leader is in `_WRITE_INTENT_BASH_COMMANDS`, and
+#  * no `sed -i` / `awk -i inplace` form appears.
+#
+# We do NOT exempt the queue DB or any credential file with this
+# classifier — those paths keep the strict whitelist. The only consumer
+# is `_bash_argv_references_path(text, roster_local_path())`.
+_WRITE_INTENT_BASH_COMMANDS = frozenset(
+    {
+        # File-mutating utilities. Any of these as a stage leader means
+        # we cannot prove the command does not modify the roster.
+        "tee",
+        "dd",
+        "truncate",
+        "shred",
+        "rm",
+        "cp",
+        "mv",
+        "ln",
+        "install",
+        "chmod",
+        "chown",
+        "chgrp",
+        "setfacl",
+        "touch",
+        # Editor / IDE invocation forms.
+        "vi",
+        "vim",
+        "nvim",
+        "nano",
+        "emacs",
+        "ed",
+        "ex",
+        "sponge",
+        # In-place transform tools.
+        "patch",
+    }
+)
+
+
+def _bash_command_has_no_write_intent(command: str) -> bool:
+    """Return True iff *command* has no detectable write-intent token.
+
+    Softer than :func:`_is_read_intent_bash` — does NOT require every
+    stage leader to be in the explicit read-intent whitelist. Used only
+    by the roster path read-block softening (issue #1255). Conservative
+    in the same direction (false on any unbalanced quote, output
+    redirection, or known-mutating tool), but tolerant of unknown
+    custom commands that happen to also reference the roster path.
+    """
+    if not command.strip():
+        return False
+    sanitized = _SAFE_REDIRECT_RE.sub(" ", command)
+    stages, balanced = _split_command_stages(sanitized)
+    # Same fail-closed posture on an unbalanced quote — see #1054 codex r1.
+    if not balanced:
+        return False
+    for stage in stages:
+        stage_stripped = stage.strip()
+        if not stage_stripped:
+            continue
+        # Output redirection of any form disqualifies — identical rule
+        # to `_is_read_intent_bash` because writes to *any* path could
+        # be writes to the roster path (e.g. `cat > $roster`).
+        for tok in stage_stripped.split():
+            if tok in _SAFE_REDIRECT_PATTERNS:
+                continue
+            for prefix in ("&>", "2>", ">>", ">"):
+                if tok.startswith(prefix):
+                    return False
+            if _NUMERIC_FD_WRITE_RE.match(tok):
+                return False
+        first = _stage_first_token(stage_stripped)
+        if not first:
+            continue
+        leaf = first.rsplit("/", 1)[-1]
+        if leaf in _WRITE_INTENT_BASH_COMMANDS:
+            return False
+        # `sed -i` / `awk -i inplace` are read-tool families but mutate
+        # in-place; mirror the disqualifier from `_is_read_intent_bash`.
+        stage_tokens = stage_stripped.split()
+        if leaf == "sed" and any(
+            t == "-i" or t.startswith("-i") for t in stage_tokens[1:]
+        ):
+            return False
+        if leaf == "awk" and "-i" in stage_tokens[1:]:
+            return False
+    return True
+
+
 def _is_read_intent_tool(tool_name: str, tool_input: dict[str, Any]) -> bool:
     """Return True iff a tool call is read-intent against any path.
 
@@ -2316,6 +2419,21 @@ def protected_alias_reason(
         return None
     if _bash_argv_references_path(text, roster_local_path()):
         if read_intent:
+            return None
+        # Issue #1255 — softened ADMIN-only roster read gate. The same
+        # data is already reachable via `agent-bridge agent show --json`
+        # and `agent-bridge config get`, so the strict read-intent
+        # whitelist (cat/grep/head/tail/...) costs more than it
+        # protects for the admin shell. Accept any admin-issued Bash
+        # command that has no detectable write-intent token (no output
+        # redirection, no `tee`/`sed -i`/`awk -i inplace`/known
+        # mutators). The non-admin path stays unchanged — for those
+        # agents `git commit -F <roster>`, `xxd <roster>`, etc. still
+        # block because the roster carries shared secrets the non-
+        # admin class should not get to dump into commit messages or
+        # audit logs. Write paths still flow through the
+        # `agent-bridge config set` wrapper carve-out above.
+        if admin and _bash_command_has_no_write_intent(text):
             return None
         # Admin no longer bypasses the roster path (codex r1 #341 CP2);
         # mutations route through `agent-bridge config set`.

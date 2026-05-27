@@ -433,6 +433,84 @@ if [[ $# -gt 0 ]]; then
     admin)
       shift
       ADMIN_AGENT="$(bridge_require_admin_agent)"
+
+      # Issue #1247 — `agb admin set <key>=<value>` CLI surface.
+      # Phase 1: persist a `auto_restart_on_membership_change` flag (on |
+      # off) into `state/admin-config.json`. Future PRs wire this flag
+      # into the post-`agent create` admin-set restart automation
+      # described in #1247's "Desired behavior" section. Keeping the
+      # flag here (not in `agent-roster.local.sh`) avoids touching the
+      # protected-mutation surface and means operators can flip it
+      # without going through `agent-bridge config set`.
+      if [[ "${1:-}" == "set" ]]; then
+        shift
+        admin_set_auto_restart=""
+        while [[ $# -gt 0 ]]; do
+          case "$1" in
+            --auto-restart)
+              [[ $# -lt 2 ]] && bridge_die "--auto-restart 뒤에 on|off를 지정하세요."
+              admin_set_auto_restart="$2"
+              shift 2
+              ;;
+            --auto-restart=*)
+              admin_set_auto_restart="${1#--auto-restart=}"
+              shift
+              ;;
+            -h|--help)
+              cat <<'ADMINSET'
+Usage:
+  agent-bridge admin set --auto-restart on|off
+
+Persist admin-set lifecycle flags. Currently exposes:
+
+  --auto-restart on|off
+      Toggle `auto_restart_on_membership_change`. When `on`, future
+      `agent create --isolate` runs will queue an admin-set restart
+      (admin + codex pair) after the daemon refresh so the new
+      `ab-agent-<new>` group lands in their supplementary set without
+      operator intervention. When `off` (default), the operator
+      restarts the admin set manually.
+
+  See issue #1247 for the desired admin-set restart sequence
+  (resume-id-carrying, sequential, single-line status per admin).
+ADMINSET
+              exit 0
+              ;;
+            *)
+              bridge_die "admin set: 알 수 없는 인자: $1"
+              ;;
+          esac
+        done
+
+        if [[ -z "$admin_set_auto_restart" ]]; then
+          bridge_die "admin set: --auto-restart on|off가 필요합니다."
+        fi
+        case "$admin_set_auto_restart" in
+          on|off) ;;
+          *)
+            bridge_die "admin set: --auto-restart 값은 on|off 중 하나여야 합니다 ('$admin_set_auto_restart' 거부)."
+            ;;
+        esac
+
+        admin_config_dir="${BRIDGE_STATE_DIR:-$BRIDGE_HOME/state}"
+        admin_config_path="$admin_config_dir/admin-config.json"
+
+        mkdir -p "$admin_config_dir" 2>/dev/null || \
+          bridge_die "admin set: state directory를 만들 수 없습니다: $admin_config_dir"
+
+        # File-as-argv per footgun #11: invoke the standalone helper
+        # with explicit flags rather than piping a heredoc into a
+        # subprocess. Keeps the bash layer thin and the JSON-write
+        # logic auditable in one place.
+        python3 "$SCRIPT_DIR/scripts/python-helpers/admin-set-config.py" \
+          set-auto-restart \
+          --admin "$ADMIN_AGENT" \
+          --config "$admin_config_path" \
+          --value "$admin_set_auto_restart" \
+          || bridge_die "admin set: admin-config.json 갱신 실패."
+        exit 0
+      fi
+
       ADMIN_ENGINE="$(bridge_agent_engine "$ADMIN_AGENT")"
       ADMIN_WORKDIR="$(bridge_agent_workdir "$ADMIN_AGENT")"
       ADMIN_SAFE_MODE=0

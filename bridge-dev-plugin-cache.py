@@ -672,6 +672,50 @@ def overlay_source_to_cache(
     return changed
 
 
+# Issue #1282 (Surface B) — conservative heuristic that mirrors the one
+# in `lib/upgrade-helpers/plugins-seed-parse-sync-output.py`. Used to
+# distinguish `node_modules=missing` from `node_modules=not-required`
+# so `.mjs` proxy plugins that ship without a `package.json` (e.g.
+# `cosmax-ep-approval`'s `ep-mcp-proxy.mjs` — inline-deps) do not paint
+# the seed output with cosmetic noise. Returns True when the plugin's
+# source ANY of:
+#   * declares non-empty `dependencies` / `peerDependencies` in package.json
+#   * ships a sibling lockfile (bun.lock, bun.lockb, package-lock.json,
+#     yarn.lock)
+# Any I/O error → False (steady-state benign — caller stays on the
+# legacy `missing` label so a real install gap is still surfaced).
+def _plugin_source_declares_deps(source_path: Path) -> bool:
+    try:
+        if not source_path.is_dir():
+            return False
+    except OSError:
+        return False
+    for lock in ("bun.lock", "bun.lockb", "package-lock.json", "yarn.lock"):
+        try:
+            if (source_path / lock).is_file():
+                return True
+        except OSError:
+            continue
+    pkg = source_path / "package.json"
+    try:
+        if not pkg.is_file():
+            return False
+    except OSError:
+        return False
+    try:
+        with pkg.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    for key in ("dependencies", "peerDependencies"):
+        deps = data.get(key)
+        if isinstance(deps, dict) and deps:
+            return True
+    return False
+
+
 def link_source_node_modules(source_path: Path, cache_version_path: Path) -> tuple[str, str]:
     source_node_modules = source_path / "node_modules"
     cache_node_modules = cache_version_path / "node_modules"
@@ -937,6 +981,16 @@ def sync_plugin_cache(root: Path, channel: str) -> dict[str, str]:
     elif cache_node_modules.exists():
         node_modules_status = "not-directory"
         node_modules_target = str(cache_node_modules)
+    elif not _plugin_source_declares_deps(source_path):
+        # Issue #1282 (Surface B) — `.mjs` proxy plugins (e.g.
+        # `cosmax-ep-approval`'s `ep-mcp-proxy.mjs`) use Node.js inline
+        # deps and ship without a `package.json`/lockfile. The seed
+        # used to emit `node_modules=missing` for these, which painted
+        # the operator dashboard with cosmetic false-positive noise.
+        # Mark the field honestly: this plugin's source does not
+        # declare deps, so no `node_modules` directory is expected.
+        node_modules_status = "not-required"
+        node_modules_target = ""
     else:
         node_modules_status = "missing"
         node_modules_target = ""

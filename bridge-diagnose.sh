@@ -3,262 +3,47 @@
 #
 # Agent Bridge health / hygiene scanners. `agent-bridge diagnose <subcommand>`.
 #
-# Currently exposes:
-#   agent-bridge diagnose acl    — scan `/`, `/home`, the operator's home,
-#                                  BRIDGE_HOME and BRIDGE_AGENT_HOME_ROOT for
-#                                  stale named-user ACL entries that isolate
-#                                  may have left behind (issue #233). Outputs
-#                                  the exact `setfacl -x` command the operator
-#                                  can run to drain each one.
+# Historical note (issue #1283): the `acl` subcommand was retired in
+# v0.15.0-beta4. ACL-based cross-UID grants are no longer the recommended
+# isolation mechanism — `linux-user isolation` (iso v2) uses group-based
+# permissions instead. The scanner that walked /, /home, BRIDGE_HOME and
+# BRIDGE_AGENT_HOME_ROOT for named-user ACL residue is removed; any
+# remaining residue should be cleaned via the iso v2 reconcile path
+# (`agent-bridge isolation reconcile --apply --agent <agent>`).
 #
-# Everything here is read-only — no ACL mutation, no root sudo — so the
-# scanner is safe to run from the same shell the operator uses for
-# normal work.
+# This shim preserves the `agent-bridge diagnose` verb entry point so
+# operator muscle-memory still gets a useful pointer instead of "command
+# not found", and emits a non-zero exit so scripts that branched on the
+# old verb fail loudly.
 
 set -euo pipefail
-
-BRIDGE_DIAGNOSE_SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-# shellcheck source=bridge-lib.sh
-source "$BRIDGE_DIAGNOSE_SCRIPT_DIR/bridge-lib.sh"
 
 bridge_diagnose_usage() {
   cat <<'USAGE'
 Usage:
-  agent-bridge diagnose acl [--json]
+  agent-bridge diagnose [help]
 
-Scan for stale Agent Bridge named-user ACL entries on shared roots.
-Reads only — does not modify any ACL. Lists `setfacl -x` commands the
-operator can run to drain any entry that shouldn't still be there.
+The `acl` subcommand was retired in v0.15.0-beta4 (issue #1283).
+ACL-based cross-UID grants are no longer the recommended isolation
+mechanism. Use `agent-bridge isolation reconcile --apply --agent <agent>`
+to drain residue, and `agent-bridge isolation status --agent <agent>`
+to inspect the current group/UID layout.
 
-Linux only. macOS installs don't use POSIX ACLs for this path and
-always report "[ok]".
+No other diagnose subcommands are currently published.
 USAGE
 }
 
-bridge_diagnose_acl_is_suspicious() {
-  local entry_user="$1"
-  local controller="$2"
+bridge_diagnose_acl_deprecation_notice() {
+  cat >&2 <<'NOTICE'
+[deprecated] `agent-bridge diagnose acl` was retired in v0.15.0-beta4
+(issue #1283). ACL-based cross-UID grants are no longer the recommended
+isolation mechanism — `linux-user isolation` (iso v2) uses group-based
+permissions instead.
 
-  [[ -n "$entry_user" ]] || return 1
-  case "$entry_user" in
-    agent-bridge-*)
-      return 0
-      ;;
-  esac
-  if [[ -n "$controller" && "$entry_user" == "$controller" ]]; then
-    return 0
-  fi
-  return 1
-}
-
-bridge_diagnose_acl_scan_path() {
-  # Emit one `[<path>]` header + lines per suspicious entry. No output if
-  # the path is missing or clean. Writes to stdout; returns 0 unless
-  # getfacl itself fails.
-  local path="$1"
-  local controller="$2"
-  local json_mode="${3:-0}"
-  local output=""
-  local entries=""
-  local entry=""
-  local entry_user=""
-  local kind="access"
-  local any=0
-
-  [[ -e "$path" ]] || return 0
-  command -v getfacl >/dev/null 2>&1 || return 0
-  output="$(getfacl -p "$path" 2>/dev/null)" || return 0
-  # `user:<name>:...` lines carry named entries. `user::...` is the base
-  # owner entry and is never suspicious. `default:user:<name>:...` is
-  # the inherited-default ACL; classify it separately so the operator
-  # can see which setfacl -x flag (access vs. default) to use.
-  entries="$(printf '%s\n' "$output" \
-    | grep -E '^(default:)?user:[^:]+:' \
-    | grep -vE '^(default:)?user::' || true)"
-  [[ -n "$entries" ]] || return 0
-
-  while IFS= read -r entry; do
-    [[ -n "$entry" ]] || continue
-    if [[ "$entry" == default:* ]]; then
-      kind="default"
-      entry_user="${entry#default:user:}"
-    else
-      kind="access"
-      entry_user="${entry#user:}"
-    fi
-    entry_user="${entry_user%%:*}"
-    bridge_diagnose_acl_is_suspicious "$entry_user" "$controller" || continue
-    if (( any == 0 )); then
-      if [[ "$json_mode" != "1" ]]; then
-        printf '[%s]\n' "$path"
-      fi
-      any=1
-    fi
-    if [[ "$json_mode" == "1" ]]; then
-      printf '{"path":%s,"user":%s,"kind":%s,"raw":%s}\n' \
-        "$(bridge_diagnose_json_str "$path")" \
-        "$(bridge_diagnose_json_str "$entry_user")" \
-        "$(bridge_diagnose_json_str "$kind")" \
-        "$(bridge_diagnose_json_str "$entry")"
-    else
-      local flag=""
-      if [[ "$kind" == "default" ]]; then
-        flag="-d "
-      fi
-      printf '  suspicious (%s): %s\n' "$kind" "$entry"
-      printf '  fix: sudo setfacl %s-x u:%s %s\n' "$flag" "$entry_user" "$path"
-    fi
-  done <<<"$entries"
-
-  return 0
-}
-
-bridge_diagnose_json_str() {
-  # Emit a JSON-encoded string using python3 so weird paths (spaces,
-  # quotes, UTF-8) don't break the output. getfacl output is already
-  # UTF-8 in practice.
-  bridge_require_python
-  python3 - "$1" <<'PY'
-import json
-import sys
-print(json.dumps(sys.argv[1]))
-PY
-}
-
-bridge_diagnose_acl_targets() {
-  # Build the canonical scan target list. `/` and `/home` are always in
-  # scope because they're the two paths #233's isolate regression most
-  # commonly poisoned. The controller's home is checked separately
-  # because named-user entries there also strip operator access. Any
-  # agent-bridge-specific roots that exist on the host get scanned too.
-  local controller_user="$1"
-  local controller_home=""
-
-  printf '/\n'
-  printf '/home\n'
-
-  controller_home="$(getent passwd "$controller_user" 2>/dev/null | cut -d: -f6 || true)"
-  if [[ -n "$controller_home" && -d "$controller_home" && "$controller_home" != "/" ]]; then
-    printf '%s\n' "$controller_home"
-  fi
-
-  if [[ -n "${BRIDGE_HOME:-}" && -d "$BRIDGE_HOME" ]]; then
-    printf '%s\n' "$BRIDGE_HOME"
-  fi
-  if [[ -n "${BRIDGE_AGENT_HOME_ROOT:-}" && -d "$BRIDGE_AGENT_HOME_ROOT" ]]; then
-    printf '%s\n' "$BRIDGE_AGENT_HOME_ROOT"
-  fi
-  if [[ -n "${BRIDGE_STATE_DIR:-}" && -d "$BRIDGE_STATE_DIR" ]]; then
-    printf '%s\n' "$BRIDGE_STATE_DIR"
-  fi
-}
-
-bridge_diagnose_acl_main() {
-  local json_mode=0
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --json)
-        json_mode=1
-        shift
-        ;;
-      -h|--help)
-        bridge_diagnose_usage
-        return 0
-        ;;
-      *)
-        printf 'unknown argument: %s\n' "$1" >&2
-        bridge_diagnose_usage >&2
-        return 2
-        ;;
-    esac
-  done
-
-  if [[ "$(uname -s 2>/dev/null || printf '')" != "Linux" ]]; then
-    if [[ "$json_mode" == "1" ]]; then
-      printf '{"platform":"non-linux","findings":[]}\n'
-    else
-      printf '[ok] non-linux host — POSIX ACL scanner does not apply\n'
-    fi
-    return 0
-  fi
-  if ! command -v getfacl >/dev/null 2>&1; then
-    # The skip banner has to land on stdout in both modes: callers
-    # (including the smoke harness) capture stdout, so writing to
-    # stderr would leave them with an empty string that looked like
-    # success on a host that actually can't scan. JSON mode still has
-    # to emit a parseable payload even in the "skipped" case.
-    if [[ "$json_mode" == "1" ]]; then
-      printf '{"platform":"linux","skipped":"getfacl-missing","findings":[]}\n'
-    else
-      printf '[skip] getfacl not installed — install the acl package to scan\n'
-    fi
-    return 0
-  fi
-
-  local controller_user=""
-  controller_user="$(bridge_current_user 2>/dev/null || id -un 2>/dev/null || printf '')"
-
-  local targets=()
-  while IFS= read -r target; do
-    [[ -n "$target" ]] && targets+=("$target")
-  done < <(bridge_diagnose_acl_targets "$controller_user")
-
-  # Aggregate JSON findings through a bash array so cross-target results
-  # keep their per-finding boundary. Command substitution strips trailing
-  # newlines, so concatenating stdout from two scan_path calls used to
-  # yield `{a}\n{b}{c}\n{d}` — invalid JSON as soon as a second target
-  # added anything. Feeding scan_path's stdout through `while read` into
-  # an array preserves the one-finding-per-element contract.
-  local any=0
-  local -a json_findings=()
-  local result=""
-  local target=""
-
-  for target in "${targets[@]}"; do
-    if [[ "$json_mode" == "1" ]]; then
-      while IFS= read -r result; do
-        [[ -n "$result" ]] || continue
-        json_findings+=("$result")
-        any=1
-      done < <(bridge_diagnose_acl_scan_path "$target" "$controller_user" "$json_mode" || true)
-    else
-      result="$(bridge_diagnose_acl_scan_path "$target" "$controller_user" "$json_mode" || true)"
-      [[ -n "$result" ]] || continue
-      if (( any == 1 )); then
-        printf '\n'
-      fi
-      printf '%s' "$result"
-      any=1
-    fi
-  done
-
-  if [[ "$json_mode" == "1" ]]; then
-    local joined=""
-    if (( ${#json_findings[@]} > 0 )); then
-      local _old_ifs="$IFS"
-      IFS=','
-      joined="${json_findings[*]}"
-      IFS="$_old_ifs"
-    fi
-    printf '{"platform":"linux","controller":%s,"findings":[%s]}\n' \
-      "$(bridge_diagnose_json_str "$controller_user")" \
-      "$joined"
-    return 0
-  fi
-
-  if (( any == 0 )); then
-    printf '[ok] no suspicious named-user ACL entries found on %s\n' "${targets[*]}"
-    return 0
-  fi
-
-  cat <<EOF
-
-[note] each "fix:" line above removes exactly one stale entry.
-       You can apply them directly, or run:
-         agent-bridge unisolate <agent>
-       for every previously-isolated agent to let the shipped
-       cleanup (PR #235) drain the residue in one shot.
-EOF
+To inspect / repair an isolated agent's group + UID layout, use:
+  agent-bridge isolation status   --agent <agent>
+  agent-bridge isolation reconcile --apply --agent <agent>
+NOTICE
 }
 
 bridge_diagnose_cli() {
@@ -267,7 +52,8 @@ bridge_diagnose_cli() {
 
   case "$subcommand" in
     acl)
-      bridge_diagnose_acl_main "$@"
+      bridge_diagnose_acl_deprecation_notice
+      return 2
       ;;
     ""|-h|--help|help)
       bridge_diagnose_usage
