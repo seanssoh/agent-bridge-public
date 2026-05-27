@@ -724,7 +724,13 @@ bridge_isolation_v2_chgrp_setgid_dir() {
 #     ``bridge_agent_linux_user_isolation_effective`` BEFORE this call;
 #     calling it for a shared-mode agent silently returns 0.
 #   * Idempotent: re-running the chgrp/chmod on an already-normalized
-#     file is a no-op.
+#     file is a no-op — the stat-skip below short-circuits the mutation
+#     entirely so a Lane α back-fill pass over an already-normalized
+#     workdir performs zero ``chgrp`` / ``chmod`` syscalls (codex r1
+#     BLOCKING on PR #1302). ``%G:%a`` is read with the existing portable
+#     stat pattern (GNU ``-c`` vs BSD ``-f``); mode strings are compared
+#     octal-to-octal via ``printf %o`` so ``0660`` vs ``660`` parses the
+#     same way.
 #   * Returns 0 when there is no work to do (file missing, agent group
 #     cannot be resolved, or platform discriminator says non-Linux).
 #     Only an explicit chgrp/chmod failure returns 1.
@@ -744,6 +750,32 @@ bridge_isolation_v2_chgrp_file_iso_group() {
   local agent_grp=""
   agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
   [[ -n "$agent_grp" ]] || return 0
+  # Idempotent stat-skip (codex r1 BLOCKING on PR #1302). Already-correct
+  # files must not produce chgrp/chmod syscalls — the Lane α back-fill
+  # loop calls this helper for every materialize-fileset entry on every
+  # upgrade pass, and unconditional mutations are observable to the smoke
+  # via the T_idempotent_no_mutation counter. Cross-platform stat: GNU
+  # ``-c '%G:%a'`` vs BSD ``-f '%Sg:%Lp'``. Mode normalization handles
+  # both `0660` (caller arg) and `660` (stat output) by reducing to
+  # printf %o on both sides. Empty cur (stat failed — e.g. permission
+  # denied on a file the controller cannot stat directly) falls through
+  # to the mutation path which retries via sudo.
+  local cur=""
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    cur="$(stat -f '%Sg:%Lp' "$file" 2>/dev/null || printf '')"
+  else
+    cur="$(stat -c '%G:%a' "$file" 2>/dev/null || printf '')"
+  fi
+  if [[ -n "$cur" ]]; then
+    local cur_grp="${cur%%:*}"
+    local cur_mode_raw="${cur##*:}"
+    local cur_mode_norm="" want_mode_norm=""
+    cur_mode_norm="$(printf '%o' "$((8#${cur_mode_raw#0}))" 2>/dev/null || printf '%s' "$cur_mode_raw")"
+    want_mode_norm="$(printf '%o' "$((8#${mode#0}))" 2>/dev/null || printf '%s' "$mode")"
+    if [[ "$cur_grp" == "$agent_grp" && "$cur_mode_norm" == "$want_mode_norm" ]]; then
+      return 0
+    fi
+  fi
   _bridge_isolation_v2_run_root_or_sudo chgrp "$agent_grp" "$file" || return 1
   _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$file" || return 1
   return 0

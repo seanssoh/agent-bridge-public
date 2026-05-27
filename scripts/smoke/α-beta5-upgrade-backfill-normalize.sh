@@ -329,6 +329,67 @@ fi
 smoke_log "T4 PASS — controller-side grep on normalized CLAUDE.md succeeds"
 
 # ---------------------------------------------------------------------
+# T_idempotent_no_mutation_on_correct — codex r1 BLOCKING on PR #1302.
+# After T2 every materialize-fileset file is already
+# ``<operator_group>:0660`` (the helper's idempotent steady state).
+# A subsequent normalize call MUST short-circuit via the helper's
+# stat-skip: zero chgrp / chmod syscalls. We prove this by overriding
+# ``_bridge_isolation_v2_run_root_or_sudo`` to a function that appends a
+# line to a counter file on every invocation, then asserting the counter
+# stays at 0.
+#
+# Mechanism mirrors the function-override technique used by the other
+# T-cases above (bridge_isolation_v2_enforce + agent_group_name stubs):
+# load the libs, replace the helper by name, drive the normalize, count.
+#
+# Teeth (verified by hand by the fixer, documented for re-runs): revert
+# the stat-skip in lib/bridge-isolation-v2.sh:bridge_isolation_v2_chgrp_file_iso_group
+# → counter > 0 → this assertion fails. Codex r1 confirmed the
+# pre-stat-skip behavior emits one chgrp+chmod pair per file (so the
+# regression signal is 2 * fileset_size = 18 calls minimum).
+# ---------------------------------------------------------------------
+NOMUT_DRIVER="$SMOKE_TMP_ROOT/run-nomut.sh"
+NOMUT_COUNTER="$SMOKE_TMP_ROOT/nomut-counter.log"
+: >"$NOMUT_COUNTER"
+: >"$NOMUT_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' 'REPO_ROOT="$1"'
+  printf '%s\n' 'OPERATOR_GROUP="$2"'
+  printf '%s\n' 'WORKDIR="$3"'
+  printf '%s\n' 'COUNTER="$4"'
+  printf '%s\n' '# shellcheck disable=SC1091'
+  printf '%s\n' 'source "$REPO_ROOT/bridge-lib.sh"'
+  printf '%s\n' 'bridge_isolation_v2_enforce() { return 0; }'
+  printf '%s\n' 'bridge_isolation_v2_agent_group_name() { printf "%s" "$OPERATOR_GROUP"; }'
+  printf '%s\n' '# Counter-shim. Every invocation appends a line carrying the'
+  printf '%s\n' '# full argv so a regression is debuggable from the counter file.'
+  printf '%s\n' '# Returns 0 so the surrounding `|| return 1` does not fire and'
+  printf '%s\n' '# obscure the assertion below.'
+  printf '%s\n' '_bridge_isolation_v2_run_root_or_sudo() {'
+  printf '%s\n' '  printf "%s\\n" "$*" >>"$COUNTER" 2>/dev/null || true'
+  printf '%s\n' '  return 0'
+  printf '%s\n' '}'
+  printf '%s\n' 'bridge_isolation_v2_normalize_workdir_profile_group nomut "$WORKDIR" || true'
+} >"$NOMUT_DRIVER"
+chmod +x "$NOMUT_DRIVER"
+
+"$BRIDGE_BASH" "$NOMUT_DRIVER" "$REPO_ROOT" "$OPERATOR_GROUP" \
+  "$V2_WORKSPACE_DIR" "$NOMUT_COUNTER" \
+  2>"$SMOKE_TMP_ROOT/nomut.stderr" \
+  || smoke_fail "T_idempotent_no_mutation: driver exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/nomut.stderr"))"
+
+nomut_calls=0
+if [[ -s "$NOMUT_COUNTER" ]]; then
+  nomut_calls="$(wc -l <"$NOMUT_COUNTER" | tr -d '[:space:]')"
+fi
+if [[ "$nomut_calls" -ne 0 ]]; then
+  smoke_fail "T_idempotent_no_mutation FAIL — expected 0 chgrp/chmod calls on already-correct files, got $nomut_calls. Counter log: $(cat "$NOMUT_COUNTER")"
+fi
+smoke_log "T_idempotent_no_mutation PASS — zero chgrp/chmod calls on already-correct files (codex r1 BLOCKING resolved)"
+
+# ---------------------------------------------------------------------
 # T_revert_teeth (gated on SMOKE_TEETH=1).
 # Re-seed the T1 workspace at 0600, run the back-fill with the
 # normalize function stubbed to a no-op, and assert the files stay at
