@@ -82,6 +82,19 @@
 #       stays at 0640. Also asserts the loop continues past the refused
 #       entry (sibling `.claude/session-env` still gets normalized).
 #
+#   T7. Leaf-symlink refusal on materialize-fileset profile file (PR #1335
+#       r3, codex r2 BLOCKING). Direct codex r2 repro: `work/CLAUDE.md ->
+#       $SMOKE_TMP_ROOT/t7-outside/CLAUDE.md` (leaf-as-symlink to external
+#       target file). Pre-r3 behavior: the materialize-fileset loop fed
+#       `$workdir/CLAUDE.md` to `chgrp_file_iso_group` WITHOUT a workdir
+#       fourth arg, AND the helper had no symlink gate at all — chgrp+chmod
+#       silently mutated the external target from `<op-group>:0640` to
+#       `<op-group>:0660`. Post-r3: workdir is threaded, the ancestor walk
+#       sees the leaf is a symlink, refuses BEFORE any syscall; external
+#       target stays at 0640. Also asserts a non-symlink sibling profile
+#       file (`AGENTS.md`) still gets normalized to confirm the loop
+#       continues past the refused entry.
+#
 #   T_teeth (gated on `SMOKE_TEETH=1`). Revert proof — temporarily
 #       restore the old files-only normalize body (via function override)
 #       and assert the `.claude/` dir stays at 0700. The smoke catches
@@ -92,6 +105,12 @@
 #       always-permit and assert the external target NOW gets mutated.
 #       Confirms the smoke catches a regression that removes or weakens
 #       the ancestor walk.
+#
+#   T7t (gated on `SMOKE_TEETH=1`). Profile-file ancestor-walk regression
+#       proof — same override pattern as T6t but driving the
+#       materialize-fileset path (leaf-symlink CLAUDE.md → external). Confirms
+#       the smoke catches a regression that removes or weakens the new r3
+#       walk in `chgrp_file_iso_group`.
 #
 # Edge cases also exercised in the helper code paths (not separate
 # smoke cases — verified by code review + the helpers' own contract):
@@ -521,6 +540,93 @@ assert_dir_grp_mode "T6 .claude"              "$T6_WORKDIR/.claude"             
 smoke_log "T6 PASS — ancestor-symlink path refused; external target unmutated; loop continued past refusal"
 
 # ---------------------------------------------------------------------
+# T7 — Leaf-symlink refusal on materialize-fileset profile file
+# (PR #1335 r3, codex r2 BLOCKING).
+#
+# Direct codex r2 repro: `work/CLAUDE.md -> $SMOKE_TMP_ROOT/t7-outside/CLAUDE.md`.
+# Pre-r3: the materialize-fileset loop in
+# `bridge_isolation_v2_normalize_workdir_profile_group` fed
+# `$workdir/CLAUDE.md` to `chgrp_file_iso_group` WITHOUT a workdir
+# fourth arg, AND `chgrp_file_iso_group` had no symlink gate at all
+# (only `[[ -f $file ]]` which FOLLOWS symlinks). The chgrp+chmod
+# mutated the external target from `<op-group>:0640` to
+# `<op-group>:0660`.
+#
+# Post-r3:
+#   * `normalize_workdir_profile_group` threads $workdir;
+#   * `chgrp_file_iso_group` runs the ancestor walk, sees the LEAF is
+#     a symlink, refuses BEFORE any syscall;
+#   * external target file stays at `<op-group>:0640`;
+#   * the symlink entry stays a symlink (not silently replaced);
+#   * a non-symlink sibling profile file (`AGENTS.md`) still gets
+#     normalized to confirm the loop continues past the refused entry.
+# ---------------------------------------------------------------------
+T7_AGENT="theta_leaf_sym"
+T7_WORKDIR="$BRIDGE_AGENT_ROOT_V2/$T7_AGENT/workdir"
+mkdir -p "$T7_WORKDIR"
+chmod 0700 "$T7_WORKDIR"
+
+# External target file outside the workdir at 0640. Pre-populate so a
+# regression mutating it to 0660 is visible.
+T7_EXTERNAL="$SMOKE_TMP_ROOT/t7-outside"
+mkdir -p "$T7_EXTERNAL"
+chmod 0700 "$T7_EXTERNAL"
+T7_EXTERNAL_CLAUDE="$T7_EXTERNAL/CLAUDE.md"
+printf 'leaf-symlink-attack target\n' >"$T7_EXTERNAL_CLAUDE"
+chmod 0640 "$T7_EXTERNAL_CLAUDE"
+
+# Record the external target's pre-mutation state.
+if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+  T7_EXTERNAL_PRE="$(stat -f '%Sg:%Lp' "$T7_EXTERNAL_CLAUDE" 2>/dev/null || printf '')"
+else
+  T7_EXTERNAL_PRE="$(stat -c '%G:%a' "$T7_EXTERNAL_CLAUDE" 2>/dev/null || printf '')"
+fi
+[[ -n "$T7_EXTERNAL_PRE" ]] || smoke_fail "T7: could not stat external target pre-mutation"
+
+# The leaf-symlink trap: $workdir/CLAUDE.md → external file.
+# `-f $workdir/CLAUDE.md` follows the symlink and returns true; the
+# pre-r3 helper had no symlink gate at all and chmod'd the external
+# target.
+ln -s "$T7_EXTERNAL_CLAUDE" "$T7_WORKDIR/CLAUDE.md"
+
+# Seed a non-symlink sibling profile file so we can confirm the loop
+# continues past the refused entry. AGENTS.md is in the canonical
+# materialize fileset (see _iso_profile_files in
+# bridge_isolation_v2_normalize_workdir_profile_group).
+printf 'agents-sibling\n' >"$T7_WORKDIR/AGENTS.md"
+chmod 0640 "$T7_WORKDIR/AGENTS.md"
+
+AGENT="$T7_AGENT" V2_WORKSPACE_DIR="$T7_WORKDIR" run_normalize 0 \
+  || smoke_fail "T7: normalize driver exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/normalize.stderr"))"
+
+# Assertion 1: external target file is UNCHANGED.
+if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+  T7_EXTERNAL_POST="$(stat -f '%Sg:%Lp' "$T7_EXTERNAL_CLAUDE" 2>/dev/null || printf '')"
+else
+  T7_EXTERNAL_POST="$(stat -c '%G:%a' "$T7_EXTERNAL_CLAUDE" 2>/dev/null || printf '')"
+fi
+if [[ "$T7_EXTERNAL_PRE" != "$T7_EXTERNAL_POST" ]]; then
+  smoke_fail "T7 FAIL — external target MUTATED through leaf symlink. Pre='$T7_EXTERNAL_PRE' Post='$T7_EXTERNAL_POST' at $T7_EXTERNAL_CLAUDE (codex r2 BLOCKING regression)"
+fi
+
+# Assertion 2: the symlink entry itself is NOT replaced or chmod'd.
+# `-L` confirms the entry is still a symlink (not silently replaced).
+if [[ ! -L "$T7_WORKDIR/CLAUDE.md" ]]; then
+  smoke_fail "T7 FAIL — $T7_WORKDIR/CLAUDE.md is no longer a symlink (normalize incorrectly mutated the leaf)"
+fi
+
+# Assertion 3: a refusal warning was emitted to stderr.
+if ! grep -q "refusing" "$SMOKE_TMP_ROOT/normalize.stderr" 2>/dev/null; then
+  smoke_log "T7 NOTE — no refusal warning in stderr (warning text drift?). stderr was: $(cat "$SMOKE_TMP_ROOT/normalize.stderr")"
+fi
+
+# Assertion 4: the non-symlink sibling AGENTS.md DID get normalized to
+# confirm the loop continues past the refused entry.
+assert_file_grp_mode "T7 AGENTS.md sibling" "$T7_WORKDIR/AGENTS.md" "$OPERATOR_GROUP" "0660"
+
+smoke_log "T7 PASS — leaf-symlink CLAUDE.md refused; external target unmutated; sibling AGENTS.md still normalized"
+
+# ---------------------------------------------------------------------
 # T6t — Ancestor-symlink teeth (gated on SMOKE_TEETH=1).
 # Override `_bridge_isolation_v2_assert_no_symlink_in_path` to always
 # return success (simulates "ancestor walk reverted to leaf-only check")
@@ -584,6 +690,71 @@ if [[ "${SMOKE_TEETH:-0}" == "1" ]]; then
     smoke_fail "T6t FAIL — ancestor-walk-reverted stub did NOT mutate external target (teeth ineffective). External post-state: $T6T_POST"
   fi
   smoke_log "T6t PASS — ancestor-walk regression demonstrably mutates external target ($T6T_POST → smoke catches the bypass)"
+fi
+
+# ---------------------------------------------------------------------
+# T7t — Profile-file ancestor-walk teeth (gated on SMOKE_TEETH=1).
+# Same override pattern as T6t but driving the materialize-fileset
+# path: a leaf-symlink CLAUDE.md → external file. With the ancestor
+# walk neutered, the new r3 gate in chgrp_file_iso_group disappears
+# and the external target gets mutated. Confirms the T7 case has
+# real teeth.
+# ---------------------------------------------------------------------
+if [[ "${SMOKE_TEETH:-0}" == "1" ]]; then
+  T7T_AGENT="theta_leaf_sym_teeth"
+  T7T_WORKDIR="$BRIDGE_AGENT_ROOT_V2/$T7T_AGENT/workdir"
+  mkdir -p "$T7T_WORKDIR"
+  chmod 0700 "$T7T_WORKDIR"
+  T7T_EXTERNAL="$SMOKE_TMP_ROOT/t7t-outside"
+  mkdir -p "$T7T_EXTERNAL"
+  chmod 0700 "$T7T_EXTERNAL"
+  T7T_EXTERNAL_CLAUDE="$T7T_EXTERNAL/CLAUDE.md"
+  printf 'teeth-target\n' >"$T7T_EXTERNAL_CLAUDE"
+  chmod 0640 "$T7T_EXTERNAL_CLAUDE"
+  ln -s "$T7T_EXTERNAL_CLAUDE" "$T7T_WORKDIR/CLAUDE.md"
+
+  T7T_DRIVER="$SMOKE_TMP_ROOT/run-t7t.sh"
+  : >"$T7T_DRIVER"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'set -uo pipefail'
+    printf '%s\n' 'REPO_ROOT="$1"'
+    printf '%s\n' 'OPERATOR_GROUP="$2"'
+    printf '%s\n' 'AGENT="$3"'
+    printf '%s\n' 'WORKDIR="$4"'
+    printf '%s\n' '# shellcheck disable=SC1091'
+    printf '%s\n' 'source "$REPO_ROOT/bridge-lib.sh"'
+    printf '%s\n' 'bridge_isolation_v2_enforce() { return 0; }'
+    printf '%s\n' 'bridge_isolation_v2_agent_group_name() { printf "%s" "$OPERATOR_GROUP"; }'
+    printf '%s\n' 'bridge_agent_os_user() { printf ""; }'
+    printf '%s\n' '# Teeth: neuter the ancestor walk. With r3 reverted,'
+    printf '%s\n' '# chgrp_file_iso_group falls back to no symlink gate at'
+    printf '%s\n' '# all (pre-r3 state) and chmod mutates the external target.'
+    printf '%s\n' '_bridge_isolation_v2_assert_no_symlink_in_path() { return 0; }'
+    printf '%s\n' 'bridge_isolation_v2_normalize_workdir_profile_group "$AGENT" "$WORKDIR" || exit 1'
+    printf '%s\n' 'echo ok'
+  } >"$T7T_DRIVER"
+  chmod +x "$T7T_DRIVER"
+
+  "$BRIDGE_BASH" "$T7T_DRIVER" "$REPO_ROOT" "$OPERATOR_GROUP" \
+    "$T7T_AGENT" "$T7T_WORKDIR" \
+    >"$SMOKE_TMP_ROOT/t7t.stdout" 2>"$SMOKE_TMP_ROOT/t7t.stderr" \
+    || smoke_fail "T7t: teeth driver exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/t7t.stderr"))"
+
+  # With the ancestor walk reverted, the external target should now be
+  # mutated. If it stays 0640 the teeth are broken.
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    T7T_POST="$(stat -f '%Sg:%Lp' "$T7T_EXTERNAL_CLAUDE" 2>/dev/null || printf '')"
+  else
+    T7T_POST="$(stat -c '%G:%a' "$T7T_EXTERNAL_CLAUDE" 2>/dev/null || printf '')"
+  fi
+  T7T_POST_GRP="${T7T_POST%%:*}"
+  T7T_POST_MODE="${T7T_POST##*:}"
+  T7T_POST_NORM="$(printf '%o' "$((8#${T7T_POST_MODE#0}))" 2>/dev/null || printf '%s' "$T7T_POST_MODE")"
+  if [[ "$T7T_POST_GRP" != "$OPERATOR_GROUP" || "$T7T_POST_NORM" != "660" ]]; then
+    smoke_fail "T7t FAIL — ancestor-walk-reverted stub did NOT mutate external CLAUDE.md target (teeth ineffective). External post-state: $T7T_POST"
+  fi
+  smoke_log "T7t PASS — leaf-symlink ancestor-walk regression demonstrably mutates external target ($T7T_POST → smoke catches the bypass)"
 fi
 
 # ---------------------------------------------------------------------

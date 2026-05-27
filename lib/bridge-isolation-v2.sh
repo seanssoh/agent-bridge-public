@@ -839,7 +839,7 @@ bridge_isolation_v2_chgrp_setgid_dir() {
   _bridge_isolation_v2_run_root_or_sudo chmod "$mode" "$dir" || return 1
 }
 
-# bridge_isolation_v2_chgrp_file_iso_group <agent> <file> [mode]
+# bridge_isolation_v2_chgrp_file_iso_group <agent> <file> [mode] [workdir]
 #
 # Normalize a single per-agent file's group + mode to the per-agent
 # isolation group (``ab-agent-<a>``) at mode ``0660`` (operator-overridable
@@ -867,6 +867,20 @@ bridge_isolation_v2_chgrp_setgid_dir() {
 #     stat pattern (GNU ``-c`` vs BSD ``-f``); mode strings are compared
 #     octal-to-octal via ``printf %o`` so ``0660`` vs ``660`` parses the
 #     same way.
+#   * Defensive symlink refusal: refuse ANY symlink in the ancestor path
+#     from ``$workdir`` to ``$file`` (inclusive of leaf), and refuse when
+#     the canonical resolution of ``$file`` escapes ``$workdir``. PR #1335
+#     r3 (codex r2 BLOCKING): the leaf-only ``[[ -L $file ]]`` guard
+#     pattern that r2 closed in the sibling chown/chgrp_dir helpers was
+#     still missing here. Direct codex r2 repro: ``work/CLAUDE.md ->
+#     /tmp/out/CLAUDE.md`` (leaf-as-symlink to external target), pre-r3
+#     normalize mutated the external target to ``staff:660`` because the
+#     materialize-fileset loop fed the path here WITHOUT a workdir and
+#     the helper had no ancestor-walk gate at all. The fourth ``$workdir``
+#     argument is REQUIRED to engage the ancestor walk; calling without
+#     it logs a bridge_warn and falls back to the legacy leaf-only check
+#     (no behavior change for legacy callers, but they are now visible in
+#     logs).
 #   * Returns 0 when there is no work to do (file missing, agent group
 #     cannot be resolved, or platform discriminator says non-Linux).
 #     Only an explicit chgrp/chmod failure returns 1.
@@ -874,6 +888,7 @@ bridge_isolation_v2_chgrp_file_iso_group() {
   local agent="$1"
   local file="$2"
   local mode="${3:-0660}"
+  local workdir="${4:-}"
   [[ -n "$agent" && -n "$file" ]] || {
     bridge_warn "chgrp_file_iso_group: agent and file required"
     return 1
@@ -882,6 +897,27 @@ bridge_isolation_v2_chgrp_file_iso_group() {
   # way bridge_isolation_v2_chgrp_setgid_dir gates. Returning 0 keeps
   # the caller's happy path simple.
   bridge_isolation_v2_enforce || return 0
+  # Ancestor symlink walk + canonical containment (PR #1335 r3, codex r2
+  # BLOCKING). When the caller passes ``$workdir`` (current behavior for
+  # ``bridge_isolation_v2_normalize_workdir_profile_group``), refuse if
+  # ANY component along $workdir → $file is a symlink, OR if the
+  # canonical resolved $file escapes $workdir. This closes the
+  # ``work/CLAUDE.md -> /tmp/out/CLAUDE.md`` bypass where the external
+  # target got mutated despite no symlink gate at all. Legacy callers
+  # (no workdir) fall back to the leaf-only check with a deprecation
+  # warning — same pattern as chown_file_iso_uid / chgrp_dir_iso_group.
+  if [[ -n "$workdir" ]]; then
+    if ! _bridge_isolation_v2_assert_no_symlink_in_path "$file" "$workdir"; then
+      bridge_warn "chgrp_file_iso_group: refusing $file under workdir=$workdir (symlink-in-path or canonical-escape; operator must repair the symlink chain before re-running)"
+      return 0
+    fi
+  else
+    bridge_warn "chgrp_file_iso_group: legacy leaf-only symlink check (no workdir argument) at $file — pass workdir to engage ancestor-walk protection"
+    if [[ -L "$file" ]]; then
+      bridge_warn "chgrp_file_iso_group: refusing to follow symlink at $file"
+      return 0
+    fi
+  fi
   [[ -f "$file" ]] || return 0
   local agent_grp=""
   agent_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')"
@@ -1124,8 +1160,12 @@ bridge_isolation_v2_chown_file_iso_uid() {
   # No iso UID resolvable → shared-mode agent or pre-v2 install. Fall
   # back to the file-iso-group helper which handles chgrp+chmod without
   # chown. This keeps the helper safe to call across mixed-mode agents.
+  # Thread $workdir so the fallback also engages the ancestor walk (we
+  # already validated $file is safe above, so this is defense-in-depth /
+  # contract consistency — the fallback helper's own check is a no-op
+  # repeat in the happy path).
   if [[ -z "$os_user" ]]; then
-    bridge_isolation_v2_chgrp_file_iso_group "$agent" "$file" "$mode"
+    bridge_isolation_v2_chgrp_file_iso_group "$agent" "$file" "$mode" "$workdir"
     return $?
   fi
   # Idempotent stat-skip — short-circuit if ``%U:%G:%a`` already matches
@@ -1249,7 +1289,14 @@ bridge_isolation_v2_normalize_workdir_profile_group() {
   local name=""
   for name in "${_iso_profile_files[@]}"; do
     [[ -f "$workdir/$name" ]] || continue
-    bridge_isolation_v2_chgrp_file_iso_group "$agent" "$workdir/$name" 0660 \
+    # PR #1335 r3 (codex r2 BLOCKING): pass $workdir as the fourth arg to
+    # engage the ancestor symlink walk + canonical containment check in
+    # chgrp_file_iso_group. Direct codex r2 repro: ``work/CLAUDE.md ->
+    # /tmp/out/CLAUDE.md`` (leaf-as-symlink to external target) — without
+    # the workdir-threaded ancestor walk, the chgrp+chmod mutated the
+    # external target to staff:660. r2 fixed the sibling chown/chgrp_dir
+    # helpers but missed the materialize-fileset helper here.
+    bridge_isolation_v2_chgrp_file_iso_group "$agent" "$workdir/$name" 0660 "$workdir" \
       || bridge_warn "chgrp_file_iso_group failed for $workdir/$name (non-fatal)"
   done
 
