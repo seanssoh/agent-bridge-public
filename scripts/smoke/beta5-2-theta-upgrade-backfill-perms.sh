@@ -72,15 +72,43 @@
 #       install before any settings render / catalog write), normalize
 #       returns 0 silently and performs zero syscalls on those targets.
 #
+#   T6. Ancestor-symlink refusal (PR #1335 r2, codex r1 BLOCKING). Direct
+#       repro: `work/.claude/plugins -> $SMOKE_TMP_ROOT/outside`, with
+#       `outside/known_marketplaces.json mode 0640 <op-group>`. Pre-r2
+#       behavior: leaf-only `[[ -L $file ]]` check passes (leaf is a
+#       regular file in the external target), chmod mutates external
+#       target to 0660. Post-r2: ancestor walk catches the symlink at
+#       `.claude/plugins`, refuses BEFORE any syscall; external target
+#       stays at 0640. Also asserts the loop continues past the refused
+#       entry (sibling `.claude/session-env` still gets normalized).
+#
 #   T_teeth (gated on `SMOKE_TEETH=1`). Revert proof — temporarily
 #       restore the old files-only normalize body (via function override)
 #       and assert the `.claude/` dir stays at 0700. The smoke catches
 #       a regression that removes the directory walk.
 #
+#   T6t (gated on `SMOKE_TEETH=1`). Ancestor-walk regression proof —
+#       override `_bridge_isolation_v2_assert_no_symlink_in_path` to
+#       always-permit and assert the external target NOW gets mutated.
+#       Confirms the smoke catches a regression that removes or weakens
+#       the ancestor walk.
+#
 # Edge cases also exercised in the helper code paths (not separate
 # smoke cases — verified by code review + the helpers' own contract):
-#   * Symlink refusal at `.claude` / `.claude/plugins` /
-#     `.claude/session-env` (each helper emits bridge_warn and skips).
+#   * Symlink refusal at the LEAF for legacy callers (no $workdir
+#     fourth-arg): the legacy `[[ -L $x ]]` check still runs with a
+#     deprecation warning so any new caller that forgets to thread
+#     workdir is loud in logs.
+#   * Symlink-chain refusal: each component in the walk is `-L`-tested
+#     individually, so a chain `.claude/plugins -> /a -> /b -> outside`
+#     trips on the first link.
+#   * Relative-target symlinks: canonical resolution via
+#     `_bridge_isolation_v2_realpath` collapses `../../../outside` to
+#     its absolute form and the canonical-containment check catches the
+#     escape.
+#   * Symlink-to-within-workdir: refused by the ancestor walk (Sean's
+#     "refuse all symlinks in path" directive — simpler contract than
+#     "allow if canonical inside").
 #   * `bridge_isolation_v2_enforce` no-op on non-Linux hosts — gated
 #     identically to the sibling helpers.
 #   * Concurrent upgrade safety — upgrade convention requires agents
@@ -409,6 +437,154 @@ if [[ -e "$FRESH_WORKDIR/.claude" ]]; then
   smoke_fail "T5 FAIL — normalize created .claude/ on fresh install (must be no-op when missing)"
 fi
 smoke_log "T5 PASS — fresh-install no-op (no .claude/, no known_marketplaces.json)"
+
+# ---------------------------------------------------------------------
+# T6 — Ancestor symlink refusal (PR #1335 r2, codex r1 BLOCKING).
+#
+# Direct repro of codex r1 finding: `.claude/plugins -> /tmp/outside`,
+# with `/tmp/outside/known_marketplaces.json mode 0640 <op-group>`.
+# Without the ancestor-walk fix, normalize logs "refusing symlink"
+# at the leaf check (passes because leaf is regular file) BUT still
+# chmods the external target to 0660. Post-fix:
+#   * .claude/plugins (the symlink itself) is NOT chmod'd
+#   * the external target file is NOT chmod'd (stays 0640)
+#   * .claude/session-env (a non-symlink sibling) DOES get normalized
+#     to confirm the loop continues past a refused entry.
+#
+# Sean's directive: "refuse all symlinks in path" — even symlinks to
+# within-workdir are refused, simplest contract.
+# ---------------------------------------------------------------------
+T6_AGENT="theta_anc"
+T6_WORKDIR="$BRIDGE_AGENT_ROOT_V2/$T6_AGENT/workdir"
+mkdir -p "$T6_WORKDIR/.claude/session-env"
+chmod 0700 "$T6_WORKDIR/.claude" "$T6_WORKDIR/.claude/session-env"
+
+# External target outside the workdir. Use SMOKE_TMP_ROOT (isolated
+# tempdir managed by lib.sh — never live host state). Pre-populate the
+# external file at 0640 so a regression mutating it to 0660 is visible.
+T6_EXTERNAL="$SMOKE_TMP_ROOT/t6-outside"
+mkdir -p "$T6_EXTERNAL"
+chmod 0700 "$T6_EXTERNAL"
+T6_EXTERNAL_KM="$T6_EXTERNAL/known_marketplaces.json"
+printf '{\n  "ancestor_symlink_attack": true\n}\n' >"$T6_EXTERNAL_KM"
+chmod 0640 "$T6_EXTERNAL_KM"
+
+# Record the pre-mutation mode + group of the external file for
+# post-normalize comparison.
+if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+  T6_EXTERNAL_PRE="$(stat -f '%Sg:%Lp' "$T6_EXTERNAL_KM" 2>/dev/null || printf '')"
+else
+  T6_EXTERNAL_PRE="$(stat -c '%G:%a' "$T6_EXTERNAL_KM" 2>/dev/null || printf '')"
+fi
+[[ -n "$T6_EXTERNAL_PRE" ]] || smoke_fail "T6: could not stat external target pre-mutation"
+
+# The ancestor-symlink trap: .claude/plugins → /tmp/outside.
+# After this, `$T6_WORKDIR/.claude/plugins/known_marketplaces.json`
+# resolves to `$T6_EXTERNAL/known_marketplaces.json` via the symlink
+# in the parent. Codex r1 path: `-f $path` follows the symlink and
+# returns true, leaf-only `-L $path` returns false (leaf is regular
+# file in external tree), chmod runs and mutates external target.
+ln -s "$T6_EXTERNAL" "$T6_WORKDIR/.claude/plugins"
+
+AGENT="$T6_AGENT" V2_WORKSPACE_DIR="$T6_WORKDIR" run_normalize 0 \
+  || smoke_fail "T6: normalize driver exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/normalize.stderr"))"
+
+# Assertion 1: external target file is UNCHANGED.
+if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+  T6_EXTERNAL_POST="$(stat -f '%Sg:%Lp' "$T6_EXTERNAL_KM" 2>/dev/null || printf '')"
+else
+  T6_EXTERNAL_POST="$(stat -c '%G:%a' "$T6_EXTERNAL_KM" 2>/dev/null || printf '')"
+fi
+if [[ "$T6_EXTERNAL_PRE" != "$T6_EXTERNAL_POST" ]]; then
+  smoke_fail "T6 FAIL — external target MUTATED through ancestor symlink. Pre='$T6_EXTERNAL_PRE' Post='$T6_EXTERNAL_POST' at $T6_EXTERNAL_KM (codex r1 BLOCKING regression)"
+fi
+
+# Assertion 2: the symlink itself is NOT replaced or chmod'd to 2770.
+# `-L` confirms the entry is still a symlink (not silently replaced).
+if [[ ! -L "$T6_WORKDIR/.claude/plugins" ]]; then
+  smoke_fail "T6 FAIL — .claude/plugins is no longer a symlink (normalize incorrectly mutated the ancestor)"
+fi
+
+# Assertion 3: a refusal warning was emitted to stderr.
+if ! grep -q "refusing" "$SMOKE_TMP_ROOT/normalize.stderr" 2>/dev/null; then
+  smoke_log "T6 NOTE — no refusal warning in stderr (warning text drift?). stderr was: $(cat "$SMOKE_TMP_ROOT/normalize.stderr")"
+fi
+
+# Assertion 4: the non-symlink sibling `.claude/session-env` DID get
+# normalized to confirm the loop continues past the refused entry.
+assert_dir_grp_mode "T6 .claude/session-env"  "$T6_WORKDIR/.claude/session-env"  "$OPERATOR_GROUP" "$EFFECTIVE_DIR_MODE"
+
+# Assertion 5: the `.claude` parent (a regular dir, no symlink in its
+# path) DID get normalized.
+assert_dir_grp_mode "T6 .claude"              "$T6_WORKDIR/.claude"              "$OPERATOR_GROUP" "$EFFECTIVE_DIR_MODE"
+
+smoke_log "T6 PASS — ancestor-symlink path refused; external target unmutated; loop continued past refusal"
+
+# ---------------------------------------------------------------------
+# T6t — Ancestor-symlink teeth (gated on SMOKE_TEETH=1).
+# Override `_bridge_isolation_v2_assert_no_symlink_in_path` to always
+# return success (simulates "ancestor walk reverted to leaf-only check")
+# and assert the external target NOW gets mutated. The smoke catches a
+# regression that removes or weakens the ancestor walk.
+# ---------------------------------------------------------------------
+if [[ "${SMOKE_TEETH:-0}" == "1" ]]; then
+  T6T_AGENT="theta_anc_teeth"
+  T6T_WORKDIR="$BRIDGE_AGENT_ROOT_V2/$T6T_AGENT/workdir"
+  mkdir -p "$T6T_WORKDIR/.claude/session-env"
+  chmod 0700 "$T6T_WORKDIR/.claude" "$T6T_WORKDIR/.claude/session-env"
+  T6T_EXTERNAL="$SMOKE_TMP_ROOT/t6t-outside"
+  mkdir -p "$T6T_EXTERNAL"
+  chmod 0700 "$T6T_EXTERNAL"
+  T6T_EXTERNAL_KM="$T6T_EXTERNAL/known_marketplaces.json"
+  printf '{\n}\n' >"$T6T_EXTERNAL_KM"
+  chmod 0640 "$T6T_EXTERNAL_KM"
+  ln -s "$T6T_EXTERNAL" "$T6T_WORKDIR/.claude/plugins"
+
+  T6T_DRIVER="$SMOKE_TMP_ROOT/run-t6t.sh"
+  : >"$T6T_DRIVER"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'set -uo pipefail'
+    printf '%s\n' 'REPO_ROOT="$1"'
+    printf '%s\n' 'OPERATOR_GROUP="$2"'
+    printf '%s\n' 'AGENT="$3"'
+    printf '%s\n' 'WORKDIR="$4"'
+    printf '%s\n' '# shellcheck disable=SC1091'
+    printf '%s\n' 'source "$REPO_ROOT/bridge-lib.sh"'
+    printf '%s\n' 'bridge_isolation_v2_enforce() { return 0; }'
+    printf '%s\n' 'bridge_isolation_v2_agent_group_name() { printf "%s" "$OPERATOR_GROUP"; }'
+    printf '%s\n' 'bridge_agent_os_user() { printf ""; }'
+    printf '%s\n' '# Teeth: revert the ancestor-walk check to always-permit.'
+    printf '%s\n' '# This simulates the codex r1 BLOCKING regression where the'
+    printf '%s\n' '# leaf-only [[ -L $file ]] check passes because the leaf is'
+    printf '%s\n' '# a regular file in the symlink-target tree.'
+    printf '%s\n' '_bridge_isolation_v2_assert_no_symlink_in_path() { return 0; }'
+    printf '%s\n' 'bridge_isolation_v2_normalize_workdir_profile_group "$AGENT" "$WORKDIR" || exit 1'
+    printf '%s\n' 'echo ok'
+  } >"$T6T_DRIVER"
+  chmod +x "$T6T_DRIVER"
+
+  "$BRIDGE_BASH" "$T6T_DRIVER" "$REPO_ROOT" "$OPERATOR_GROUP" \
+    "$T6T_AGENT" "$T6T_WORKDIR" \
+    >"$SMOKE_TMP_ROOT/t6t.stdout" 2>"$SMOKE_TMP_ROOT/t6t.stderr" \
+    || smoke_fail "T6t: teeth driver exited non-zero (stderr: $(cat "$SMOKE_TMP_ROOT/t6t.stderr"))"
+
+  # With the ancestor walk reverted, the external target should now be
+  # mutated (mode 0660 / OPERATOR_GROUP). If it stays 0640 the teeth
+  # are broken — the smoke would never catch the regression.
+  if [[ "$(uname -s 2>/dev/null)" == "Darwin" ]]; then
+    T6T_POST="$(stat -f '%Sg:%Lp' "$T6T_EXTERNAL_KM" 2>/dev/null || printf '')"
+  else
+    T6T_POST="$(stat -c '%G:%a' "$T6T_EXTERNAL_KM" 2>/dev/null || printf '')"
+  fi
+  T6T_POST_GRP="${T6T_POST%%:*}"
+  T6T_POST_MODE="${T6T_POST##*:}"
+  T6T_POST_NORM="$(printf '%o' "$((8#${T6T_POST_MODE#0}))" 2>/dev/null || printf '%s' "$T6T_POST_MODE")"
+  if [[ "$T6T_POST_GRP" != "$OPERATOR_GROUP" || "$T6T_POST_NORM" != "660" ]]; then
+    smoke_fail "T6t FAIL — ancestor-walk-reverted stub did NOT mutate external target (teeth ineffective). External post-state: $T6T_POST"
+  fi
+  smoke_log "T6t PASS — ancestor-walk regression demonstrably mutates external target ($T6T_POST → smoke catches the bypass)"
+fi
 
 # ---------------------------------------------------------------------
 # T_teeth (gated on SMOKE_TEETH=1).
