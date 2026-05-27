@@ -1160,6 +1160,11 @@ def cmd_claim(args: argparse.Namespace) -> int:
     lease_seconds = int(args.lease_seconds)
     current_ts = now_ts()
     lease_until_ts = current_ts + lease_seconds
+    # Issue #1253 — optional --note / --note-file mirror `done` / `update`
+    # so claim-time audit context lands in the task_events log alongside
+    # the canonical `event_type=claimed` row.
+    note_text = getattr(args, "note", None)
+    note_path = normalize_path(getattr(args, "note_file", None))
 
     with closing(connect()) as conn, conn:
         task = require_task(conn, args.task_id)
@@ -1189,10 +1194,27 @@ def cmd_claim(args: argparse.Namespace) -> int:
             """,
             (agent, current_ts, lease_until_ts, current_ts, args.task_id),
         )
-        emit_event(conn, args.task_id, event_type="claimed", actor=agent, created_ts=current_ts, to_agent=agent)
+        emit_event(
+            conn,
+            args.task_id,
+            event_type="claimed",
+            actor=agent,
+            created_ts=current_ts,
+            note_text=note_text,
+            note_path=note_path,
+            to_agent=agent,
+        )
         touch_agent_activity(conn, agent, current_ts)
 
-    print(f"claimed task #{args.task_id} as {agent} (lease={lease_seconds}s)")
+    # Echo a short `claim_note=<n-chars>` summary on stdout so scripts /
+    # operator-readable transcripts can confirm the note actually landed
+    # in the event log (per #1253 acceptance criteria).
+    note_summary = ""
+    if note_text is not None:
+        note_summary = f" claim_note={len(note_text)}c"
+    elif note_path:
+        note_summary = f" claim_note=file:{note_path}"
+    print(f"claimed task #{args.task_id} as {agent} (lease={lease_seconds}s){note_summary}")
     return 0
 
 
@@ -2597,6 +2619,12 @@ def build_parser() -> argparse.ArgumentParser:
     claim_parser.add_argument("task_id", type=int)
     claim_parser.add_argument("--agent", required=True)
     claim_parser.add_argument("--lease-seconds", default=os.environ.get("BRIDGE_TASK_LEASE_SECONDS", "900"))
+    # Issue #1253 — symmetric with `done` / `update`. --note and --note-file
+    # are mutually exclusive so the operator never accidentally double-
+    # specifies the audit text.
+    claim_note_group = claim_parser.add_mutually_exclusive_group()
+    claim_note_group.add_argument("--note")
+    claim_note_group.add_argument("--note-file")
     claim_parser.set_defaults(handler=cmd_claim)
 
     done_parser = subparsers.add_parser("done", allow_abbrev=False)

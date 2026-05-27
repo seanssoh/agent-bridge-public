@@ -34,7 +34,7 @@ Usage:
   bash $SCRIPT_DIR/bridge-task.sh create --to <agent> --title <title> [--body <text> | --body-file <path>] [--allow-empty-body] [--from <agent>] [--priority low|normal|high|urgent]
   bash $SCRIPT_DIR/bridge-task.sh inbox [agent] [--all]
   bash $SCRIPT_DIR/bridge-task.sh show <task-id>
-  bash $SCRIPT_DIR/bridge-task.sh claim <task-id> [--agent <agent>] [--lease <seconds>]
+  bash $SCRIPT_DIR/bridge-task.sh claim <task-id> [--agent <agent>] [--lease <seconds>] [--note <text> | --note-file <path>]
   bash $SCRIPT_DIR/bridge-task.sh done <task-id> [--agent <agent>] [--note <text> | --note-file <path>]
   bash $SCRIPT_DIR/bridge-task.sh cancel <task-id> [--actor <name>] [--note <text> | --note-file <path>]
   bash $SCRIPT_DIR/bridge-task.sh update <task-id> [--status queued|claimed|blocked|in_progress] [--priority ...] [--title ...] [--note ...]
@@ -545,6 +545,8 @@ cmd_claim() {
   local task_id=""
   local agent=""
   local lease=""
+  local note=""
+  local note_file=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -556,6 +558,20 @@ cmd_claim() {
       --lease)
         [[ $# -lt 2 ]] && bridge_die "--lease 뒤에 초 단위를 지정하세요."
         lease="$2"
+        shift 2
+        ;;
+      --note)
+        # Issue #1253 — symmetric with `agb done` / `agb update`. Lets
+        # operators record claim-time audit context (e.g. "claim during
+        # onboarding; will close after onboarding completes") without
+        # having to fall back to `agb update --status claimed --note ...`.
+        [[ $# -lt 2 ]] && bridge_die "--note 뒤에 텍스트를 지정하세요."
+        note="$2"
+        shift 2
+        ;;
+      --note-file)
+        [[ $# -lt 2 ]] && bridge_die "--note-file 뒤에 파일 경로를 지정하세요."
+        note_file="$2"
         shift 2
         ;;
       -h|--help)
@@ -581,6 +597,12 @@ cmd_claim() {
   args=(claim "$task_id" --agent "$agent")
   if [[ -n "$lease" ]]; then
     args+=(--lease-seconds "$lease")
+  fi
+  if [[ -n "$note" ]]; then
+    args+=(--note "$note")
+  fi
+  if [[ -n "$note_file" ]]; then
+    args+=(--note-file "$note_file")
   fi
   bridge_queue_cli "${args[@]}"
 }

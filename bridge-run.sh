@@ -808,8 +808,20 @@ bridge_run_prune_legacy_teams_mcp() {
     --agent-root "$BRIDGE_AGENT_HOME_ROOT/$AGENT" \
     2>&1)" || rc=$?
 
+  # Issue #1282 (Surface A) — `absent path=…` is the steady-state output
+  # on a healthy install (legacy mcpServers.teams entry was already
+  # cleaned up or never existed). Logging it on every Claude run paints
+  # the operator's audit tail with cosmetic noise that masks real
+  # actions. Suppress `absent`/`unchanged` rows; keep `pruned`/`failed`/
+  # `skipped` rows because those reflect a real state change or a
+  # condition the operator may need to act on.
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
+    case "$line" in
+      "absent path="*|"unchanged path="*)
+        continue
+        ;;
+    esac
     log_line "[legacy-teams-mcp] $line"
   done <<<"$output"
 

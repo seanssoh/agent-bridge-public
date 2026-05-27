@@ -2747,20 +2747,20 @@ assert clear_idx_agent > dry_run_idx_agent, (
 print("[ok] broken-launch clear guarded behind dry-run + preflight in both entry points")
 PY
 
-log "diagnose acl reports clean on macOS (non-Linux host)"
-DIAGNOSE_OUTPUT="$("$REPO_ROOT/agent-bridge" diagnose acl)"
-if [[ "$(uname -s)" == "Linux" ]]; then
-  # On Linux getfacl may or may not be installed; either way the
-  # scanner exits 0 with an "[ok]" or "[skip]" banner. The only thing
-  # smoke needs to assert is that it did not explode.
-  assert_contains "$DIAGNOSE_OUTPUT" "["
-else
-  assert_contains "$DIAGNOSE_OUTPUT" "non-linux"
-fi
-DIAGNOSE_JSON_OUTPUT="$("$REPO_ROOT/agent-bridge" diagnose acl --json)"
-assert_contains "$DIAGNOSE_JSON_OUTPUT" "\"findings\""
+log "diagnose acl retired in v0.15.0-beta4 (#1283) — verb now emits deprecation"
+# `agent-bridge diagnose acl` was retired in v0.15.0-beta4 (#1283).
+# ACL-based cross-UID grants are no longer the recommended isolation
+# mechanism (iso v2 uses group-based perms). The verb now exits
+# non-zero AND points operators at the iso v2 replacement.
+DIAGNOSE_ACL_RC=0
+DIAGNOSE_OUTPUT="$("$REPO_ROOT/agent-bridge" diagnose acl 2>&1)" || DIAGNOSE_ACL_RC=$?
+[[ "$DIAGNOSE_ACL_RC" -ne 0 ]] || die "diagnose acl must exit non-zero post-#1283 (got rc=0)"
+assert_contains "$DIAGNOSE_OUTPUT" "deprecated"
+assert_contains "$DIAGNOSE_OUTPUT" "isolation reconcile"
 DIAGNOSE_HELP="$("$REPO_ROOT/agent-bridge" diagnose 2>&1 || true)"
-assert_contains "$DIAGNOSE_HELP" "diagnose acl"
+# The usage banner still mentions the retirement so operators with
+# stale muscle memory find the replacement.
+assert_contains "$DIAGNOSE_HELP" "retired"
 
 log "apply-channel-policy.sh writes overlay disabling singleton channel plugins (#244)"
 CHANNEL_POLICY_HOME="$TMP_ROOT/channel-policy-home"

@@ -652,6 +652,73 @@ _SAFE_REDIRECT_RE = re.compile(
 _NUMERIC_FD_WRITE_RE = re.compile(r"^[0-9]+>>?")
 
 
+# Issue #1255 r3/r4 — `find` mutation/exec primitive filter.
+#
+# `find` is on `_READ_INTENT_BASH_COMMANDS` because the common operator
+# diagnostics (`find <roster> -name "*.sh"`, `find <roster> -type f`)
+# are pure reads. But find has built-in mutation and exec primitives
+# that the bare leader check does not see — `find -delete` removes
+# matches in place, and `find -exec` / `-execdir` / `-ok` / `-okdir`
+# spawn arbitrary subprocesses against each match. The GNU-find file
+# actions `-fprint` / `-fprint0` / `-fprintf` / `-fls` write matches
+# (or `-ls`-style listings) to a file the operator names, which is a
+# roster-exfil channel even though no `>` token appears in the command
+# (codex PR #1294 r2 first surfaced `-fprint*`; r3 added `-fls`).
+#
+# Treat these flags as write-intent: when `find` is the stage leader
+# and any of them appears in argv, the stage falls out of the read-
+# intent classification. The output-redirection guard above already
+# catches `find -ls > somefile`; we do not need to enumerate that form
+# here.
+#
+# Comprehensive audit pass (codex PR #1294 r3, GNU find(1) actions):
+#   - `-delete`, `-exec`, `-execdir`, `-ok`, `-okdir` — covered.
+#   - `-fprint`, `-fprint0`, `-fprintf` — covered.
+#   - `-fls` — covered (this commit).
+#   - `-ls`, `-print`, `-print0`, `-printf`, `-quit` — write stdout
+#     only; the output-redirection guard catches `> file` rebinding.
+#   - `-prune` — pure traversal control, no I/O.
+# No other GNU find action writes to a named file or spawns a child
+# without `>` redirect; the frozenset is now exhaustive for the file-
+# action + child-spawn classes.
+_FIND_MUTATION_FLAGS = frozenset(
+    {
+        "-delete",
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-fprint",
+        "-fprint0",
+        "-fprintf",
+        "-fls",
+    }
+)
+
+
+def _find_is_read_only(stage_tokens: list[str]) -> bool:
+    """Return True iff a `find` invocation is free of mutation/exec flags.
+
+    *stage_tokens* is the whitespace-split argv of a single pipeline
+    stage whose leader has already been confirmed to be `find` (or a
+    pathy equivalent like `/usr/bin/find`). Returns False as soon as
+    any token equals one of :data:`_FIND_MUTATION_FLAGS` so the caller
+    can drop the read-intent classification.
+
+    The check is exact-match per token: `-delete` matches but
+    `-deleted-files` does not, and `-delete` is rejected even when it
+    appears mid-argv (`find <path> -type f -delete`). This is the
+    flag shape `find` itself enforces — none of the mutation primitives
+    take an inline value glued to the flag (find takes them as separate
+    argv elements). See codex PR #1294 r2 for the BLOCKING-class repro
+    that motivated the filter.
+    """
+    for token in stage_tokens[1:]:  # skip the leading 'find'
+        if token in _FIND_MUTATION_FLAGS:
+            return False
+    return True
+
+
 def _is_read_intent_bash(command: str) -> bool:
     """Return True iff *command* is purely read-intent.
 
@@ -738,6 +805,16 @@ def _is_read_intent_bash(command: str) -> bool:
                 return False
             if leaf == "awk" and "-i" in stage_tokens[1:]:
                 return False
+            # `find` is whitelisted for diagnostics (`find <roster>
+            # -name "*.sh"`), but it has mutation/exec primitives
+            # (`-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`,
+            # `-fprint`, `-fprint0`, `-fprintf`) that the leader check
+            # alone does not see. Codex PR #1294 r2 demonstrated that
+            # without this filter an admin could `find <roster>
+            # -delete` or `find <roster> -exec python3
+            # /tmp/mutator.py {} \;` through the roster carve-out.
+            if leaf == "find" and not _find_is_read_only(stage_tokens):
+                return False
             continue
         # `agent-bridge config get …` / `agb config get …` are read-intent.
         if leaf in {"agent-bridge", "agb"}:
@@ -754,6 +831,54 @@ def _is_read_intent_bash(command: str) -> bool:
             return False
         return False
     return True
+
+
+# Issue #1255 r2 — admin roster carve-out is a strict whitelist.
+#
+# History: r1 shipped this as a write-intent *blacklist*
+# (`_bash_command_has_no_write_intent`) that tolerated unknown stage
+# leaders. Codex r1 review showed that posture lets an admin agent run
+# `python3 /tmp/mutator.py <roster>`, `my-mutator <roster>`, or
+# `git commit -F <roster>` — paths that bypass the
+# `agent-bridge config set` wrapper's audit chain and can leak or
+# rewrite roster secrets outside the sanctioned mutation surface.
+#
+# r2 flips the classifier to a whitelist: only the canonical read-only
+# shapes already enumerated in :data:`_READ_INTENT_BASH_COMMANDS` are
+# admitted, plus `agent-bridge config get` / `agb config get`. Unknown
+# leaders default-deny, matching the credential / queue-DB / system-
+# config gates. The whole point of #1255 unblocks operator diagnostics
+# (`cat $roster`, `grep BRIDGE $roster`, `head -10 $roster`); none of
+# those needed a blacklist — they're already on the read-intent
+# whitelist.
+#
+# The function is a thin wrapper around :func:`_is_read_intent_bash`
+# rather than a parallel implementation. That ties the admin carve-out
+# to the same write-redirection / `sed -i` / unbalanced-quote /
+# numeric-fd guards used everywhere else, so future hardening of the
+# write-detection surface flows to the admin path automatically — no
+# divergence to drift into the blacklist gap the r1 review caught.
+
+
+def _bash_command_has_read_intent(command: str) -> bool:
+    """Return True iff *command* is purely read-intent (whitelist).
+
+    Issue #1255 r2 — the admin roster carve-out at
+    :func:`protected_alias_reason` consults this function. A True
+    return means "every pipeline stage's leading command is a known
+    read-only tool (cat / grep / head / awk-no-`-i` / sed-no-`-i` /
+    `agent-bridge config get` / …) and no stage opens an output
+    redirection". False means the carve-out falls through to the
+    non-admin deny — including unknown stage leaders like
+    `python3 /tmp/mutator.py`, `my-mutator`, or `git commit -F`,
+    which the r1 blacklist incorrectly tolerated.
+
+    Delegating to :func:`_is_read_intent_bash` keeps the admin carve-
+    out and the credential/queue-DB/system-config gates aligned on the
+    same write-detection surface; we no longer maintain a parallel
+    blacklist that can drift.
+    """
+    return _is_read_intent_bash(command)
 
 
 def _is_read_intent_tool(tool_name: str, tool_input: dict[str, Any]) -> bool:
@@ -2316,6 +2441,22 @@ def protected_alias_reason(
         return None
     if _bash_argv_references_path(text, roster_local_path()):
         if read_intent:
+            return None
+        # Issue #1255 r2 — admin roster read carve-out is a strict
+        # read-intent whitelist (cat / grep / head / `agent-bridge
+        # config get` / …). r1 used a write-intent blacklist that
+        # tolerated unknown stage leaders; codex r1 review showed that
+        # let `python3 /tmp/mutator.py <roster>`, `my-mutator
+        # <roster>`, and `git commit -F <roster>` slip past as
+        # "non-write" while in fact mutating or leaking the roster
+        # outside the `agent-bridge config set` audit chain. The
+        # whitelist captures every shape #1255 was meant to unblock
+        # (operator diagnostics: `cat $roster`, `grep BRIDGE $roster`,
+        # `head -10 $roster`) without exposing arbitrary admin
+        # binaries that happen to take the roster as an argv element.
+        # Write paths still flow through the `agent-bridge config
+        # set` wrapper carve-out above.
+        if admin and _bash_command_has_read_intent(text):
             return None
         # Admin no longer bypasses the roster path (codex r1 #341 CP2);
         # mutations route through `agent-bridge config set`.
