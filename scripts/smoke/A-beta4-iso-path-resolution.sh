@@ -233,8 +233,14 @@ fi
 if [[ "$T3_FN_BODY" != *"getent passwd"* ]]; then
   smoke_fail "T3: bridge_agent_claude_config_dir lacks getent passwd fallback — iso UID context with empty roster array will resolve to controller-view path that does not exist (#1277 regression)"
 fi
-if [[ "$T3_FN_BODY" != *"BRIDGE_OS_USER_PREFIX"* ]]; then
-  smoke_fail "T3: bridge_agent_claude_config_dir lacks BRIDGE_OS_USER_PREFIX override hook — operator-customized iso UID prefixes won't resolve"
+if [[ "$T3_FN_BODY" != *"BRIDGE_AGENT_OS_USER_PREFIX"* ]]; then
+  smoke_fail "T3: bridge_agent_claude_config_dir lacks BRIDGE_AGENT_OS_USER_PREFIX override hook (existing project convention used at lib/bridge-isolation-v2.sh:1437,2323,2420) — operator-customized iso UID prefixes won't resolve"
+fi
+# Negative: r2 introduced a typo'd alias BRIDGE_OS_USER_PREFIX (no
+# AGENT_) that diverged from the existing project convention. r3 must
+# not retain the typo'd variant anywhere in this function body.
+if [[ "$T3_FN_BODY" == *"BRIDGE_OS_USER_PREFIX"* ]] && [[ "$T3_FN_BODY" != *"BRIDGE_AGENT_OS_USER_PREFIX"* ]]; then
+  smoke_fail "T3: bridge_agent_claude_config_dir uses typo'd BRIDGE_OS_USER_PREFIX (r2 regression) instead of existing BRIDGE_AGENT_OS_USER_PREFIX convention"
 fi
 if [[ "$T3_FN_BODY" != *"/.claude"* ]]; then
   smoke_fail "T3: bridge_agent_claude_config_dir does not append /.claude — caller's [[ -d \"\$config_dir\" ]] gate will reject"
@@ -459,16 +465,212 @@ smoke_assert_contains "$T_NEG_OUT" "OS_USER=EMPTY" "T_neg: BRIDGE_AGENT_OS_USER 
 smoke_assert_contains "$T_NEG_OUT" "ISOLATION=EMPTY" "T_neg: BRIDGE_AGENT_ISOLATION_MODE not populated from controller context"
 smoke_assert_contains "$T_NEG_OUT" "IN_IDS=0"      "T_neg: BRIDGE_AGENT_IDS not extended from controller context"
 
-# Static-source assertion: the reader body must contain the iso UID
-# guard. This catches future refactors that drop the guard.
+# Static-source assertion: the reader body must contain the 2-stage
+# user-match guard (codex r2 BLOCKING). This catches future refactors
+# that drop the guard or revert to a prefix-only form (which would
+# miss custom-prefix + explicit per-agent installs).
 T_NEG_READER_BODY="$(awk '/^bridge_load_sanitized_agent_metadata\(\) \{/,/^\}/' "$BRIDGE_LIB")"
 if [[ "$T_NEG_READER_BODY" != *'id -un'* ]]; then
   smoke_fail "T_neg: reader body does not call id -un — iso UID scope guard missing (codex r1 BLOCKING #2)"
 fi
-if [[ "$T_NEG_READER_BODY" != *'BRIDGE_OS_USER_PREFIX'* ]]; then
-  smoke_fail "T_neg: reader body does not reference BRIDGE_OS_USER_PREFIX — operator-customized iso UID prefix override missing"
+# Stage A: must peek BRIDGE_AGENT_OS_USER from the snippet (no source,
+# no prefix coupling).
+if [[ "$T_NEG_READER_BODY" != *'BRIDGE_AGENT_OS_USER'* ]] \
+   || [[ "$T_NEG_READER_BODY" != *'awk'* ]]; then
+  smoke_fail "T_neg: reader body does not awk-peek BRIDGE_AGENT_OS_USER — 2-stage user-match guard (codex r2 BLOCKING) missing"
 fi
-smoke_log "T_neg PASS — iso UID guard rejects controller context, arrays unchanged, guard logic present in source"
+# Negative: r3 must NOT key off a prefix-only guard. The r2 form
+# (prefix match against `id -un`) silently skipped custom-prefix +
+# explicit per-agent installs. A re-introduction of any prefix-only
+# case statement against `id -un` would re-open the codex r2 BLOCKING.
+if [[ "$T_NEG_READER_BODY" == *'BRIDGE_OS_USER_PREFIX'* ]] \
+   && [[ "$T_NEG_READER_BODY" != *'BRIDGE_AGENT_OS_USER_PREFIX'* ]]; then
+  smoke_fail "T_neg: reader body retains typo'd BRIDGE_OS_USER_PREFIX (r2 regression) — should not key on a prefix variable at all under r3"
+fi
+smoke_log "T_neg PASS — iso UID guard rejects controller context, arrays unchanged, 2-stage user-match guard logic present in source"
+
+# ---------------------------------------------------------------------
+# T_neg2 (codex r2 BLOCKING — custom-prefix iso UID): when the
+# operator runs the install with `BRIDGE_AGENT_OS_USER_PREFIX=custom-`
+# (the existing project convention used at lib/bridge-isolation-v2.sh
+# :1437,2323,2420), the agent's iso UID is e.g. `custom-<agent>`. The
+# r2 reader keyed its guard off a typo'd `BRIDGE_OS_USER_PREFIX` and
+# default `agent-bridge`, so iso UID code paths under a custom prefix
+# returned rc=1 with empty arrays even when running AS the agent's
+# OS user — the iso-UID guard was effectively unreachable.
+#
+# r3 fix uses Stage A awk-peek of the snippet's BRIDGE_AGENT_OS_USER
+# + Stage B `id -un` match, so the guard is prefix-independent. We
+# simulate the iso UID context by writing the snippet's
+# BRIDGE_AGENT_OS_USER to the operator's current `id -un` (the only
+# value we can match without actually swapping UIDs). The snippet
+# wears a custom prefix that bears no relation to `agent-bridge-` —
+# the test passes regardless because Stage B is prefix-agnostic.
+# ---------------------------------------------------------------------
+smoke_log "T_neg2 (codex r2 BLOCKING — custom-prefix iso UID): reader fires when current user matches snippet, regardless of prefix"
+
+T_NEG2_AGENT="agent_t_neg2"
+T_NEG2_META_DIR="$BRIDGE_ACTIVE_AGENT_DIR/$T_NEG2_AGENT"
+T_NEG2_META_FILE="$T_NEG2_META_DIR/agent-meta.env"
+mkdir -p "$T_NEG2_META_DIR"
+# Use the operator's current user as the snippet's expected OS user,
+# but spelled with a "custom-" prefix shape (`custom-<id-un>`). We
+# cannot actually swap UIDs in a smoke harness — instead we set the
+# snippet to the current user verbatim so Stage B can match, and rely
+# on the fact that the guard logic is prefix-agnostic.
+T_NEG2_CURRENT_USER="$(id -un 2>/dev/null)"
+[[ -n "$T_NEG2_CURRENT_USER" ]] || smoke_fail "T_neg2: id -un returned empty — host environment cannot drive this test"
+{
+  printf '# T_neg2 synthetic snippet — custom-prefix iso UID context\n'
+  printf 'BRIDGE_AGENT_OS_USER=%s\n' "$T_NEG2_CURRENT_USER"
+  printf 'BRIDGE_AGENT_ISOLATION_MODE=linux-user\n'
+  printf 'BRIDGE_AGENT_ENGINE=claude\n'
+} >"$T_NEG2_META_FILE"
+chmod 0640 "$T_NEG2_META_FILE"
+
+T_NEG2_DRIVER="$SMOKE_TMP_ROOT/t-neg2-driver.sh"
+: >"$T_NEG2_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -o pipefail'
+  printf '%s\n' "agent=\"$T_NEG2_AGENT\""
+  awk '/^bridge_load_sanitized_agent_metadata\(\) \{/,/^\}/' "$BRIDGE_LIB"
+  printf '\n'
+  printf '%s\n' 'rc=0'
+  # NOTE: NO BRIDGE_SANITIZED_METADATA_SKIP_GUARD — exercise the real
+  # 2-stage guard. With snippet matching `id -un`, the guard must let
+  # the load through (rc=0).
+  printf '%s\n' 'bridge_load_sanitized_agent_metadata || rc=$?'
+  printf '%s\n' 'printf "rc=%s\n" "$rc"'
+  printf '%s\n' 'printf "OS_USER=%s\n" "${BRIDGE_AGENT_OS_USER[$agent]:-EMPTY}"'
+  printf '%s\n' 'printf "ISOLATION=%s\n" "${BRIDGE_AGENT_ISOLATION_MODE[$agent]:-EMPTY}"'
+} >>"$T_NEG2_DRIVER"
+chmod +x "$T_NEG2_DRIVER"
+
+# Set a custom prefix to prove the guard does NOT key off the prefix
+# at all — the snippet's BRIDGE_AGENT_OS_USER (=current user) is the
+# sole input Stage A/B care about.
+T_NEG2_OUT="$(
+  BRIDGE_AGENT_ID="$T_NEG2_AGENT" \
+  BRIDGE_ACTIVE_AGENT_DIR="$BRIDGE_ACTIVE_AGENT_DIR" \
+  BRIDGE_HOME="$BRIDGE_HOME" \
+  BRIDGE_AGENT_OS_USER_PREFIX="custom-" \
+    /usr/bin/env bash "$T_NEG2_DRIVER" 2>&1
+)"
+
+smoke_assert_contains "$T_NEG2_OUT" "rc=0" "T_neg2: reader rc=0 when snippet's BRIDGE_AGENT_OS_USER matches id -un (custom-prefix install)"
+smoke_assert_contains "$T_NEG2_OUT" "OS_USER=$T_NEG2_CURRENT_USER" "T_neg2: BRIDGE_AGENT_OS_USER array populated under custom prefix"
+smoke_assert_contains "$T_NEG2_OUT" "ISOLATION=linux-user" "T_neg2: BRIDGE_AGENT_ISOLATION_MODE array populated under custom prefix"
+smoke_log "T_neg2 PASS — custom-prefix iso UID context loads metadata (prefix-independent Stage A/B guard)"
+
+# ---------------------------------------------------------------------
+# T_neg3 (codex r2 BLOCKING — explicit per-agent --os-user): when the
+# operator passes `bridge-agent.sh --os-user manual-name`, the agent's
+# OS user bears NO syntactic relation to any prefix at all. The r2
+# prefix-only guard skipped this case entirely. r3 must still load
+# the snippet when the current user matches the snippet's value.
+# ---------------------------------------------------------------------
+smoke_log "T_neg3 (codex r2 BLOCKING — explicit per-agent --os-user): reader fires when snippet matches id -un"
+
+T_NEG3_AGENT="agent_t_neg3"
+T_NEG3_META_DIR="$BRIDGE_ACTIVE_AGENT_DIR/$T_NEG3_AGENT"
+T_NEG3_META_FILE="$T_NEG3_META_DIR/agent-meta.env"
+mkdir -p "$T_NEG3_META_DIR"
+T_NEG3_CURRENT_USER="$(id -un 2>/dev/null)"
+[[ -n "$T_NEG3_CURRENT_USER" ]] || smoke_fail "T_neg3: id -un returned empty — host environment cannot drive this test"
+# The snippet's BRIDGE_AGENT_OS_USER is just the current user — no
+# prefix at all. This is exactly the shape produced by an explicit
+# `--os-user <current-user>` override.
+{
+  printf '# T_neg3 synthetic snippet — explicit per-agent override\n'
+  printf 'BRIDGE_AGENT_OS_USER=%s\n' "$T_NEG3_CURRENT_USER"
+  printf 'BRIDGE_AGENT_ISOLATION_MODE=linux-user\n'
+  printf 'BRIDGE_AGENT_ENGINE=claude\n'
+} >"$T_NEG3_META_FILE"
+chmod 0640 "$T_NEG3_META_FILE"
+
+T_NEG3_DRIVER="$SMOKE_TMP_ROOT/t-neg3-driver.sh"
+: >"$T_NEG3_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -o pipefail'
+  printf '%s\n' "agent=\"$T_NEG3_AGENT\""
+  awk '/^bridge_load_sanitized_agent_metadata\(\) \{/,/^\}/' "$BRIDGE_LIB"
+  printf '\n'
+  printf '%s\n' 'rc=0'
+  printf '%s\n' 'bridge_load_sanitized_agent_metadata || rc=$?'
+  printf '%s\n' 'printf "rc=%s\n" "$rc"'
+  printf '%s\n' 'printf "OS_USER=%s\n" "${BRIDGE_AGENT_OS_USER[$agent]:-EMPTY}"'
+  printf '%s\n' 'printf "ENGINE=%s\n" "${BRIDGE_AGENT_ENGINE[$agent]:-EMPTY}"'
+} >>"$T_NEG3_DRIVER"
+chmod +x "$T_NEG3_DRIVER"
+
+# No BRIDGE_AGENT_OS_USER_PREFIX export — verifies the guard does not
+# *require* a prefix env to be set at all for explicit-per-agent.
+T_NEG3_OUT="$(
+  BRIDGE_AGENT_ID="$T_NEG3_AGENT" \
+  BRIDGE_ACTIVE_AGENT_DIR="$BRIDGE_ACTIVE_AGENT_DIR" \
+  BRIDGE_HOME="$BRIDGE_HOME" \
+    /usr/bin/env bash "$T_NEG3_DRIVER" 2>&1
+)"
+
+smoke_assert_contains "$T_NEG3_OUT" "rc=0" "T_neg3: reader rc=0 when snippet's BRIDGE_AGENT_OS_USER matches id -un (explicit per-agent --os-user)"
+smoke_assert_contains "$T_NEG3_OUT" "OS_USER=$T_NEG3_CURRENT_USER" "T_neg3: BRIDGE_AGENT_OS_USER array populated under explicit per-agent override"
+smoke_assert_contains "$T_NEG3_OUT" "ENGINE=claude" "T_neg3: BRIDGE_AGENT_ENGINE array populated under explicit per-agent override"
+smoke_log "T_neg3 PASS — explicit per-agent --os-user loads metadata (no prefix dependency)"
+
+# ---------------------------------------------------------------------
+# T_neg4 (codex r2 BLOCKING — controller context with explicit per-
+# agent shape): even when the snippet wears an explicit-per-agent
+# style value (no prefix relation), if the current user does NOT
+# match it the reader must still return rc=1. Asserts Stage B
+# rejection works under explicit-per-agent naming too.
+# ---------------------------------------------------------------------
+smoke_log "T_neg4 (codex r2 BLOCKING — controller context with explicit per-agent shape): reader rejects mismatch"
+
+T_NEG4_AGENT="agent_t_neg4"
+T_NEG4_META_DIR="$BRIDGE_ACTIVE_AGENT_DIR/$T_NEG4_AGENT"
+T_NEG4_META_FILE="$T_NEG4_META_DIR/agent-meta.env"
+mkdir -p "$T_NEG4_META_DIR"
+# Use a value that cannot equal the operator's `id -un`. UNIX
+# usernames cannot begin with a leading hyphen or contain spaces, so
+# this synthetic value will never match any real user.
+T_NEG4_NEVER_MATCHES="manual-name-zz-$$-never-matches-any-real-user"
+{
+  printf '# T_neg4 synthetic snippet — explicit per-agent shape\n'
+  printf 'BRIDGE_AGENT_OS_USER=%s\n' "$T_NEG4_NEVER_MATCHES"
+  printf 'BRIDGE_AGENT_ISOLATION_MODE=linux-user\n'
+  printf 'BRIDGE_AGENT_ENGINE=claude\n'
+} >"$T_NEG4_META_FILE"
+chmod 0640 "$T_NEG4_META_FILE"
+
+T_NEG4_DRIVER="$SMOKE_TMP_ROOT/t-neg4-driver.sh"
+: >"$T_NEG4_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -o pipefail'
+  printf '%s\n' "agent=\"$T_NEG4_AGENT\""
+  awk '/^bridge_load_sanitized_agent_metadata\(\) \{/,/^\}/' "$BRIDGE_LIB"
+  printf '\n'
+  printf '%s\n' 'rc=0'
+  printf '%s\n' 'bridge_load_sanitized_agent_metadata || rc=$?'
+  printf '%s\n' 'printf "rc=%s\n" "$rc"'
+  printf '%s\n' 'printf "OS_USER=%s\n" "${BRIDGE_AGENT_OS_USER[$agent]:-EMPTY}"'
+  printf '%s\n' 'printf "ISOLATION=%s\n" "${BRIDGE_AGENT_ISOLATION_MODE[$agent]:-EMPTY}"'
+} >>"$T_NEG4_DRIVER"
+chmod +x "$T_NEG4_DRIVER"
+
+T_NEG4_OUT="$(
+  BRIDGE_AGENT_ID="$T_NEG4_AGENT" \
+  BRIDGE_ACTIVE_AGENT_DIR="$BRIDGE_ACTIVE_AGENT_DIR" \
+  BRIDGE_HOME="$BRIDGE_HOME" \
+    /usr/bin/env bash "$T_NEG4_DRIVER" 2>&1
+)"
+
+smoke_assert_contains "$T_NEG4_OUT" "rc=1" "T_neg4: reader rc=1 when snippet's BRIDGE_AGENT_OS_USER (explicit per-agent shape) does not match id -un"
+smoke_assert_contains "$T_NEG4_OUT" "OS_USER=EMPTY" "T_neg4: BRIDGE_AGENT_OS_USER not populated when Stage B mismatches"
+smoke_assert_contains "$T_NEG4_OUT" "ISOLATION=EMPTY" "T_neg4: BRIDGE_AGENT_ISOLATION_MODE not populated when Stage B mismatches"
+smoke_log "T_neg4 PASS — controller context rejects explicit per-agent shape when id -un mismatches"
 
 # ---------------------------------------------------------------------
 # Bonus assertions: R4 (audit_dir_ensure wired) + R5
@@ -487,4 +689,4 @@ if ! grep -nF 'session_id_detect_empty' "$STATE_LIB" >/dev/null; then
 fi
 smoke_log "Bonus PASS — R4 + R5 wired"
 
-smoke_log "ALL TESTS PASS — Lane A beta4 iso v2 path resolution + metadata access root closed (#1272 + #1277 + #1279 + #1213) + iso UID scope guard (codex r1 BLOCKING #2)"
+smoke_log "ALL TESTS PASS — Lane A beta4 iso v2 path resolution + metadata access root closed (#1272 + #1277 + #1279 + #1213) + iso UID scope guard (codex r1 BLOCKING #2) + prefix-independent 2-stage user-match guard (codex r2 BLOCKING)"

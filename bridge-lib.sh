@@ -471,35 +471,64 @@ bridge_source_module "bridge-agent-update.sh"
 # the stable location. Empty / missing BRIDGE_AGENT_ID is the
 # controller-side path, which always uses the full roster.
 bridge_load_sanitized_agent_metadata() {
-  # iso UID scope guard (codex r1 BLOCKING #2, PR #1286 r2):
+  # iso UID scope guard (codex r2 BLOCKING, PR #1286 r3):
   # This reader is only meaningful in an iso UID context (sub-shell
-  # running as `agent-bridge-<X>` or operator-configured prefix). The
-  # controller (operator user) has read access to the full
-  # `agent-roster.local.sh` via `bridge_load_roster`, so populating
-  # arrays from the sanitized snippet would (a) duplicate work and
-  # (b) risk preferring stale snippet contents over the live roster.
+  # running as the agent's OS user). The controller (operator user)
+  # has read access to the full `agent-roster.local.sh` via
+  # `bridge_load_roster`, so populating arrays from the sanitized
+  # snippet would (a) duplicate work and (b) risk preferring stale
+  # snippet contents over the live roster.
   #
-  # Returns 1 (not 0) when the current user is NOT an iso UID — the
-  # call site at module-end uses `|| true` so this does not propagate
-  # under `set -e`. Tests that need to drive the reader from a
-  # controller context set BRIDGE_SANITIZED_METADATA_SKIP_GUARD=1 to
-  # bypass the guard (documented in scripts/smoke/lib.sh; never set
-  # in production code paths).
-  if [[ "${BRIDGE_SANITIZED_METADATA_SKIP_GUARD:-0}" != "1" ]]; then
-    local _cur_user
-    _cur_user="$(id -un 2>/dev/null)" || return 1
-    local _iso_prefix="${BRIDGE_OS_USER_PREFIX:-agent-bridge}"
-    case "$_cur_user" in
-      "${_iso_prefix}-"*) ;;        # iso UID — proceed
-      *) return 1 ;;                # controller / non-iso — skip sanitized read
-    esac
-  fi
+  # Prefix-independent 2-stage user-match guard — covers all three
+  # supported iso UID naming cases:
+  #   - default prefix (agent-bridge-<agent>)
+  #   - custom prefix via `BRIDGE_AGENT_OS_USER_PREFIX=<pfx>`
+  #   - explicit per-agent override via `bridge-agent.sh --os-user <user>`
+  #     (the snippet's BRIDGE_AGENT_OS_USER may bear no syntactic
+  #     relation to any prefix at all)
+  #
+  # Stage A peeks the snippet's BRIDGE_AGENT_OS_USER without sourcing
+  # the file (avoids the #1213 assoc/scalar collision class). Stage B
+  # compares `id -un` against that expected value. Match → load.
+  # Mismatch → return 1.
+  #
+  # Returns 1 (not 0) when the current user is NOT the iso UID for
+  # this agent — the call site at module-end uses `|| true` so this
+  # does not propagate under `set -e`. Tests that need to drive the
+  # reader from a controller context set
+  # BRIDGE_SANITIZED_METADATA_SKIP_GUARD=1 to bypass the guard
+  # (documented in scripts/smoke/lib.sh; never set in production
+  # code paths).
 
   local agent="${BRIDGE_AGENT_ID:-}"
   [[ -n "$agent" ]] || return 1
 
   local meta_file="${BRIDGE_ACTIVE_AGENT_DIR:-$BRIDGE_HOME/state/agents}/$agent/agent-meta.env"
   [[ -r "$meta_file" ]] || return 1
+
+  if [[ "${BRIDGE_SANITIZED_METADATA_SKIP_GUARD:-0}" != "1" ]]; then
+    # Stage A: extract the snippet's BRIDGE_AGENT_OS_USER value via
+    # awk peek — no `source`, no sub-shell variable bleed. Strip
+    # surrounding double or single quotes if present.
+    local _expected_os_user
+    _expected_os_user="$(awk -F= '
+      $1 == "BRIDGE_AGENT_OS_USER" {
+        v = $0
+        sub(/^BRIDGE_AGENT_OS_USER=/, "", v)
+        gsub(/^"|"$/, "", v)
+        gsub(/^'\''|'\''$/, "", v)
+        print v
+        exit
+      }
+    ' "$meta_file" 2>/dev/null)"
+    [[ -n "$_expected_os_user" ]] || return 1
+
+    # Stage B: match current user against the snippet's expected
+    # owner. Mismatch → controller context or wrong agent → skip.
+    local _cur_user
+    _cur_user="$(id -un 2>/dev/null)" || return 1
+    [[ "$_cur_user" == "$_expected_os_user" ]] || return 1
+  fi
 
   # Ensure the assoc arrays exist (bridge-core.sh declares them inside
   # `bridge_reset_roster_maps`, which fires inside `bridge_load_roster`).

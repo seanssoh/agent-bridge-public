@@ -4578,9 +4578,10 @@ bridge_agent_claude_home_dir() {
 #      assoc array hasn't been populated yet AND the agent-meta.env
 #      snippet hasn't fired) but iso v2 is structurally active for the
 #      agent (mode requested or `linux_user_isolation` recorded), fall
-#      back to a `getent passwd <os_user_prefix>-<agent>` lookup. The
+#      back to a `getent passwd <os_user_prefix><agent>` lookup. The
 #      iso UID prefix is conventionally `agent-bridge-` and can be
-#      overridden by `BRIDGE_OS_USER_PREFIX`.
+#      overridden by `BRIDGE_AGENT_OS_USER_PREFIX` (existing project
+#      convention; `BRIDGE_OS_USER_PREFIX` was a typo introduced at r2).
 #   3) Otherwise, non-iso path — daemon HOME (caller's view).
 bridge_agent_claude_config_dir() {
   local agent="$1"
@@ -4602,8 +4603,11 @@ bridge_agent_claude_config_dir() {
     # caller (`bridge_resolve_agent_claude_config_dir`) gets a real
     # directory that exists on disk.
     if command -v getent >/dev/null 2>&1; then
-      local prefix="${BRIDGE_OS_USER_PREFIX:-agent-bridge}"
-      local probe_user="${prefix}-${agent}"
+      # Align with existing project convention used at
+      # lib/bridge-isolation-v2.sh:1437,2323,2420 — the prefix value
+      # itself carries the trailing dash (default `agent-bridge-`).
+      local prefix="${BRIDGE_AGENT_OS_USER_PREFIX:-agent-bridge-}"
+      local probe_user="${prefix}${agent}"
       pwent_home="$(getent passwd "$probe_user" 2>/dev/null | cut -d: -f6)"
       if [[ -n "$pwent_home" ]]; then
         printf '%s/.claude' "$pwent_home"
