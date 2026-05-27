@@ -40,6 +40,21 @@ def main() -> int:
     manifest_path = Path(sys.argv[1])
     spec = sys.argv[2]
 
+    # #1274 (v0.15.0-beta4): canonicalize the spec form on the helper
+    # boundary. The Claude `installed_plugins.json` family always keys by
+    # the BARE `<name>@<marketplace>` form — both the per-UID writer
+    # (`bridge_write_isolated_installed_plugins_manifest`) and the shared
+    # plugins-cache writer strip `plugin:` before keying. Most call sites
+    # of `bridge_claude_plugin_status` already strip `plugin:` themselves
+    # (e.g. `plugin_spec="${item#plugin:}"`); the v0.15.0-beta3 Lane C1
+    # restart preflight forgot that step and passed the qualified
+    # `plugin:teams@agent-bridge` form straight through, producing a
+    # false `absent`. Strip at the boundary so the helper is robust to
+    # both forms — present + absent semantics now hold regardless of
+    # whether the caller already stripped.
+    if spec.startswith("plugin:"):
+        spec = spec[len("plugin:"):]
+
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
