@@ -1096,17 +1096,32 @@ bridge_plugins_seed_propagate_iso_known_marketplaces() {
       ((failed++)) || true
       continue
     fi
-    # root:ab-agent-<a> mode 0640 — matches the contract that
-    # bridge_write_isolated_known_marketplaces_catalog applies to
-    # the same file on the canonical per-agent prepare path.
-    if [[ -n "$agent_group" ]]; then
+    # Issue #1278 (Lane H beta4): match
+    # bridge_write_isolated_known_marketplaces_catalog's new contract —
+    # owner = iso UID `agent-bridge-<a>`, group = `ab-agent-<a>`, mode
+    # 0660. The iso UID's `bridge-dev-plugin-cache.py:update_known_
+    # marketplaces` merges directory-marketplace entries here at agent
+    # start; with the prior `root:ab-agent-<a> 0640` shape, the
+    # preserved file mode propagated by the tmp+replace pattern would
+    # leave the iso UID unable to perform a fallback in-place rewrite
+    # if any future caller used `open(path, 'r+')`.
+    local iso_os_user=""
+    iso_os_user="$os_user"
+    if [[ -n "$agent_group" && -n "$iso_os_user" ]]; then
+      bridge_linux_sudo_root chown "$iso_os_user:$agent_group" "$iso_known" >/dev/null 2>&1 \
+        || bridge_warn "[plugins seed] D2: chown $iso_os_user:$agent_group $iso_known failed (agent '$agent')"
+    elif [[ -n "$agent_group" ]]; then
+      # No iso UID resolved (degraded path) — keep group ownership so
+      # `update_known_marketplaces` can still flock the sidecar via
+      # group-write. Mode 0660 keeps the iso UID covered through the
+      # group (it is a member of `ab-agent-<a>` by the v2 contract).
       bridge_linux_sudo_root chown "root:$agent_group" "$iso_known" >/dev/null 2>&1 \
         || bridge_warn "[plugins seed] D2: chown root:$agent_group $iso_known failed (agent '$agent')"
     else
       bridge_linux_sudo_root chown root:root "$iso_known" >/dev/null 2>&1 || true
     fi
-    bridge_linux_sudo_root chmod 0640 "$iso_known" >/dev/null 2>&1 \
-      || bridge_warn "[plugins seed] D2: chmod 0640 $iso_known failed (agent '$agent')"
+    bridge_linux_sudo_root chmod 0660 "$iso_known" >/dev/null 2>&1 \
+      || bridge_warn "[plugins seed] D2: chmod 0660 $iso_known failed (agent '$agent')"
 
     # Issue #1208 self-heal: normalize any pre-existing lock files
     # owned by `root:root 0600` (left behind by beta24 OOTB installs

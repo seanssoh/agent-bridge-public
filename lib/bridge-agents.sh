@@ -2109,21 +2109,44 @@ PY
     bridge_die "bridge_write_isolated_known_marketplaces_catalog: refused to write per-UID catalog for $os_user (see [bridge-isolate] errors above)"
   fi
 
-  bridge_linux_sudo_root chown root:root "$catalog_tmp"
-  bridge_linux_sudo_root chmod 0640 "$catalog_tmp"
-  if [[ -n "$agent" ]]; then
-    local _v2_grp
-    _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
-      || _v2_grp=""
-    if [[ -n "$_v2_grp" ]]; then
-      bridge_linux_sudo_root chgrp "$_v2_grp" "$catalog_tmp" \
-        || bridge_die "isolation v2: chgrp '$_v2_grp' on marketplace catalog '$catalog_tmp' failed"
-    else
-      bridge_die "isolation v2: cannot resolve agent group for marketplace catalog '$catalog_tmp'"
-    fi
-  else
+  # Issue #1278 (Lane H beta4): own the catalog to the iso UID +
+  # `ab-agent-<a>` group at mode 0660. The iso UID's
+  # `bridge-dev-plugin-cache.py:update_known_marketplaces` (run at agent
+  # start under that UID) merges new directory-marketplace entries into
+  # this file via `tmp.write_text + os.replace`. The rename succeeds
+  # because the parent dir is mode 02770 (group-write), BUT the python
+  # writer ALSO does `os.chmod(tmp, existing_mode)` which preserves
+  # whatever mode the prior file carried. With the legacy `root:ab-agent
+  # 0640` shape, a subsequent direct-write fallback (or a future caller
+  # that re-opens the file with `open(path, 'r+')` instead of the tmp+
+  # replace pattern) would EACCES. Ownership=iso UID also lets the
+  # isolated agent's `bridge-dev-plugin-cache.py` perform a true
+  # in-place rewrite without traversing the rename indirection — the
+  # contract for the iso UID is "owner of own per-UID catalog".
+  #
+  # Security boundary preserved: alias validation (refusal of unsafe
+  # marketplace names / collisions / reserved aliases) ran above this
+  # block at controller-root level; the iso UID can only mutate
+  # ENTRIES of its own per-UID catalog (not the controller's shared
+  # `known_marketplaces.json`) and every subsequent merge in
+  # `update_known_marketplaces` itself goes through
+  # `_require_safe_path_component` validation before payload write.
+  if [[ -z "$agent" ]]; then
     bridge_die "isolation v2: bridge_write_isolated_known_marketplaces_catalog requires agent id"
   fi
+  local _v2_grp
+  _v2_grp="$(bridge_isolation_v2_agent_group_name "$agent" 2>/dev/null || printf '')" \
+    || _v2_grp=""
+  if [[ -z "$_v2_grp" ]]; then
+    bridge_die "isolation v2: cannot resolve agent group for marketplace catalog '$catalog_tmp'"
+  fi
+  if [[ -z "$os_user" ]]; then
+    bridge_die "isolation v2: bridge_write_isolated_known_marketplaces_catalog requires os_user"
+  fi
+  bridge_linux_sudo_root chown "$os_user:$_v2_grp" "$catalog_tmp" \
+    || bridge_die "isolation v2: chown '$os_user:$_v2_grp' on marketplace catalog '$catalog_tmp' failed"
+  bridge_linux_sudo_root chmod 0660 "$catalog_tmp" \
+    || bridge_die "isolation v2: chmod 0660 on marketplace catalog '$catalog_tmp' failed"
   bridge_linux_sudo_root mv "$catalog_tmp" "$catalog"
 }
 
