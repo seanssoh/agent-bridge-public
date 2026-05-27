@@ -240,19 +240,85 @@ bridge_start_schedule_dev_channels_accept() {
         fi
         sleep "$poll_seconds"
       done
-      # Picker-text-trigger short-circuits the secondary foreground gate
-      # inside bridge_tmux_claude_advance_blocker (lib/bridge-tmux.sh:677).
-      # The picker text IS the direct signal — Claude has drawn the
-      # dev-channels prompt, so requiring an additional foreground match
-      # on top would just resurrect the bug this commit closes. The
-      # legacy gate is preserved for the non-picker trigger path so other
-      # callers (and non-dev-channels callers) are unaffected.
+      # Issue #1306: daemon auto-recovery via --no-attach was observed
+      # leaving the dev-channels picker hung for 23+ minutes on iso v2
+      # agents. The watcher armed and logged "controller-side Claude
+      # development-channels auto-accept armed" but the picker key was
+      # never sent. The tmux session existed and the picker text was
+      # drawn, but the chain of
+      # bridge_tmux_wait_for_prompt -> bridge_tmux_claude_advance_blocker
+      # -> bridge_tmux_wait_for_claude_foreground carries a foreground
+      # process-name gate that false-negatives in the unattended /
+      # background-daemon-spawned tmux session shape (the pane_pid
+      # comm does not reliably match the claude regex even after the
+      # picker is fully drawn). The previous fix (#825) bypassed that
+      # gate via env var only on the picker_seen path, but the indirect
+      # chain still tripped intermittently because wait_for_prompt
+      # own polling iterates bridge_tmux_session_has_prompt AND
+      # bridge_tmux_claude_blocker_state again. A transient race
+      # between picker text presence and blocker-state detection (e.g.
+      # picker drawn, but the 80-line capture window slid past the
+      # WARNING line in the brief moment between watcher poll and
+      # wait_for_prompt poll) was enough to leave the picker hanging.
+      #
+      # Root fix (per feedback-root-vs-symptom-framing): drop the
+      # foreground/attach gate entirely on the picker-text trigger path
+      # and send Enter DIRECTLY to the tmux pane the moment the picker
+      # text is observed. The picker text -- WARNING: Loading
+      # development channels + I am using this for local development
+      # -- is unique to this prompt shape and the cursor glyph is
+      # already parked on option 1, so Enter selects it. No process-tree
+      # walk, no foreground basename check, no wait_for_prompt
+      # indirection; just session-exists + picker-text-detected. This
+      # is the only auto-accept invocation contract daemon-auto-recovery
+      # (--no-attach) actually needs.
+      #
+      # The legacy foreground-trigger path is preserved verbatim for
+      # callers that reach it (Claude entered the foreground but picker
+      # has not been drawn yet). It still routes through
+      # bridge_tmux_wait_for_prompt so other blocker states the
+      # session may transition through (trust, summary) keep their
+      # existing handling.
       if (( picker_seen == 1 )); then
+        # Settle delay: capture race with the picker draw cycle. A
+        # short pause lets Claude finish painting option 1 before we
+        # send. 200ms keeps the unattended-recovery path snappy while
+        # still allowing the render to settle.
+        sleep 0.2
+        # Re-verify session existence; a session that died between
+        # picker detection and send (e.g. parent bridge-run.sh crashed
+        # on a follow-up plugin-cache error) should not be logged as
+        # "completed".
+        if bridge_tmux_session_exists "$session" \
+           && bridge_tmux_pane_has_dev_channels_picker "$session"; then
+          # Direct send — no attach gate, no foreground gate, no
+          # wait_for_prompt indirection. bridge_tmux_send_keys_with_timeout
+          # wraps tmux send-keys with the daemon-wide 10s watchdog
+          # (#265); it does NOT require an attached client.
+          if bridge_tmux_send_keys_with_timeout tmux_send_dev_channels_picker_direct \
+              -t "$(bridge_tmux_pane_target "$session")" C-m; then
+            printf "[%s] [info] controller auto-accept dev-channels completed (picker-text trigger, direct send) on session=%s agent=%s\n" \
+              "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
+            exit 0
+          else
+            printf "[%s] [warn] controller auto-accept dev-channels direct send failed on session=%s agent=%s; falling back to wait_for_prompt\n" \
+              "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" >&2
+          fi
+        else
+          printf "[%s] [warn] controller auto-accept dev-channels picker cleared between detect and send on session=%s agent=%s; skipping send\n" \
+            "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent" >&2
+          exit 0
+        fi
+        # Direct-send fallback path (rare): keep the legacy env-var
+        # bypass + wait_for_prompt route in case the direct send
+        # itself raises (e.g. tmux IPC failure inside the 10s
+        # watchdog). The wait_for_prompt retry loop handles up to 12
+        # Enter presses with its own picker re-detection.
         export BRIDGE_TMUX_DEV_CHANNELS_REQUIRE_CLAUDE_FOREGROUND=0
       fi
       if bridge_tmux_wait_for_prompt "$session" claude "$accept_timeout" 1; then
         if (( picker_seen == 1 )); then
-          printf "[%s] [info] controller auto-accept dev-channels completed (picker-text trigger) on session=%s agent=%s\n" \
+          printf "[%s] [info] controller auto-accept dev-channels completed (picker-text trigger, wait_for_prompt fallback) on session=%s agent=%s\n" \
             "$(date "+%Y-%m-%d %H:%M:%S")" "$session" "$agent"
         else
           printf "[%s] [info] controller auto-accept dev-channels completed (foreground trigger) on session=%s agent=%s\n" \
