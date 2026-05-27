@@ -48,6 +48,22 @@
 #         the canonical read-intent whitelist. Non-admin class still
 #         hits the original deny.
 #
+#   #1255 r3: r2's whitelist still contained write-capable leaders.
+#         `find` is legitimately useful for diagnostics (`find
+#         <roster> -name "*.sh"`) but has mutation/exec primitives
+#         that the bare leader check did not see — `-delete` removes
+#         matches in place; `-exec` / `-execdir` / `-ok` / `-okdir`
+#         spawn arbitrary subprocesses against each match; `-fprint`
+#         / `-fprint0` / `-fprintf` write matches to a file without
+#         appearing as a `>` token. Codex PR #1294 r2 demonstrated
+#         that an admin could `find <roster> -delete` or `find
+#         <roster> -exec python3 /tmp/mutator.py {} \;` through the
+#         read-intent classifier. r3 adds a `_find_is_read_only`
+#         flag filter: when the stage leader is `find` and any of
+#         the mutation flags appears in argv, the stage falls out of
+#         the read-intent classification and the roster carve-out
+#         defaults to the non-admin deny.
+#
 # Test plan:
 #   T1  (#1282 A): `bridge_run_prune_legacy_teams_mcp` line filter
 #                  drops `absent path=…` rows from the audit log.
@@ -88,6 +104,21 @@
 #                  <roster>` and `git commit -F <roster>` through —
 #                  proving the strict whitelist is what closes the
 #                  codex r1 BLOCKING gap.
+#   T7  (#1255 r3): `find` mutation/exec flag filter. `find
+#                  <roster> -delete`, `-exec`, `-execdir`, `-ok`,
+#                  `-okdir`, `-fprint`, `-fprint0`, `-fprintf` are
+#                  rejected by `_is_read_intent_bash` even though
+#                  `find` is on the read-intent whitelist. `find
+#                  <roster> -name "*.sh"` and `find <roster> -type
+#                  f` still classify as read-intent. End-to-end gate
+#                  check via `protected_alias_reason` confirms admin
+#                  mutator/exec forms are denied while read-only
+#                  diagnostics pass.
+#   T7t (#1255 r3 teeth): reverting the `_find_is_read_only` filter
+#                  (here simulated by `lambda _: True`) lets admin
+#                  `find <roster> -delete` and `find <roster> -exec
+#                  ...` through — proves the flag filter is what
+#                  closes the codex PR #1294 r2 BLOCKING gap.
 #
 # Footgun #11: no `<<EOF` to subprocess, no `<<<` here-strings into
 # command substitutions, no inline Python heredoc-to-stdin. Helpers
@@ -658,5 +689,224 @@ smoke_assert_contains "$T6T_OUT" "stub_mutator=None" \
 smoke_assert_contains "$T6T_OUT" "stub_leak=None" \
   "T6 teeth: stubbed-True classifier wrongly admits admin git commit -F leak (r1 regression demo)"
 
-smoke_log "K-beta4-nits: all 6 tests + teeth passed"
+# ---------------------------------------------------------------------------
+# T7 (#1255 r3): `find` mutation/exec flag filter (codex PR #1294 r2 BLOCKING).
+#
+# r2's whitelist contained `find` so operator diagnostics like `find
+# <roster> -name "*.sh"` keep working. Codex r2 showed that without an
+# argv-level filter, `find <roster> -delete` and `find <roster> -exec
+# python3 /tmp/mutator.py {} \;` slip through as read-intent — the
+# stage leader check sees only `find`, not the mutation primitive that
+# follows. r3 adds `_find_is_read_only(argv)` and wires it into
+# `_is_read_intent_bash` so any mutation/exec flag drops the
+# classification, while leaving `-name` / `-type` / `-size` reads alone.
+# ---------------------------------------------------------------------------
+smoke_log "T7: find mutation/exec flag filter (#1255 r3 — codex PR #1294 r2 BLOCKING)"
+
+T7_PROBE="$SMOKE_TMP_ROOT/t7-probe.py"
+{
+  printf '#!/usr/bin/env python3\n'
+  printf 'import os, importlib.util, sys, tempfile\n'
+  printf 'bridge_home = tempfile.mkdtemp(prefix="t7-bridge-home-")\n'
+  printf 'os.environ["BRIDGE_HOME"] = bridge_home\n'
+  printf 'os.environ["BRIDGE_ADMIN_AGENT_ID"] = "admin-test"\n'
+  printf 'spec = importlib.util.spec_from_file_location("tp", "%s")\n' "$TOOL_POLICY_PY"
+  printf 'm = importlib.util.module_from_spec(spec)\n'
+  printf 'spec.loader.exec_module(m)\n'
+  printf 'roster_path = m.roster_local_path()\n'
+  printf 'roster_path.parent.mkdir(parents=True, exist_ok=True)\n'
+  printf 'roster_path.write_text("# fixture roster\\n")\n'
+  printf 'rp = str(roster_path)\n'
+  # Classifier cases — _is_read_intent_bash on `find` shapes.
+  printf 'classifier_cases = [\n'
+  # Mutation/exec flags — all must drop the classification.
+  printf "    ('find-delete', 'find ' + rp + ' -delete', False),\n"
+  printf "    ('find-exec', 'find ' + rp + ' -exec python3 /tmp/m.py {} ;', False),\n"
+  printf "    ('find-execdir', 'find ' + rp + ' -execdir /bin/cat {} +', False),\n"
+  printf "    ('find-ok', 'find ' + rp + ' -ok rm {} ;', False),\n"
+  printf "    ('find-okdir', 'find ' + rp + ' -okdir ls {} ;', False),\n"
+  printf "    ('find-fprint', 'find ' + rp + ' -fprint /tmp/leak', False),\n"
+  printf "    ('find-fprint0', 'find ' + rp + ' -fprint0 /tmp/leak', False),\n"
+  printf "    ('find-fprintf', 'find ' + rp + ' -fprintf /tmp/leak %%p', False),\n"
+  # Mid-argv -delete (e.g. `-type f -delete`).
+  printf "    ('find-mid-delete', 'find ' + rp + ' -type f -delete', False),\n"
+  # Pathy leader (`/usr/bin/find -delete`).
+  printf "    ('find-path-leader', '/usr/bin/find ' + rp + ' -exec ls {} ;', False),\n"
+  # Read-only forms — must still classify as read.
+  printf "    ('find-name', 'find ' + rp + ' -name *.sh', True),\n"
+  printf "    ('find-type', 'find ' + rp + ' -type f', True),\n"
+  printf "    ('find-size', 'find ' + rp + ' -size +1c', True),\n"
+  printf "    ('find-multi-read', 'find ' + rp + ' -type f -size +1c -name *.sh', True),\n"
+  # Token-boundary: a similar-looking but distinct token must NOT match.
+  printf "    ('find-pseudo-match', 'find ' + rp + ' -name -deleted-files', True),\n"
+  printf ']\n'
+  printf 'failed = False\n'
+  printf 'for label, cmd, expected in classifier_cases:\n'
+  printf '    got = m._is_read_intent_bash(cmd)\n'
+  printf '    if got == expected:\n'
+  printf '        print("OK classifier " + label + " got=" + str(got))\n'
+  printf '    else:\n'
+  printf '        failed = True\n'
+  printf '        print("FAIL classifier " + label + " got=" + str(got) + " expected=" + str(expected) + " cmd=" + repr(cmd))\n'
+  # End-to-end gate cases via protected_alias_reason.
+  printf 'gate_cases = [\n'
+  # Admin mutator/exec vectors → DENIED (roster carve-out falls
+  # through to ROSTER_LOCAL_DENY_REASON because read_intent is now False).
+  printf "    ('admin-find-delete', 'admin-test', 'find ' + rp + ' -delete', 'protected system config path'),\n"
+  printf "    ('admin-find-exec', 'admin-test', 'find ' + rp + ' -exec python3 /tmp/m.py {} ;', 'protected system config path'),\n"
+  printf "    ('admin-find-execdir', 'admin-test', 'find ' + rp + ' -execdir cat {} +', 'protected system config path'),\n"
+  printf "    ('admin-find-ok', 'admin-test', 'find ' + rp + ' -ok rm {} ;', 'protected system config path'),\n"
+  printf "    ('admin-find-fprintf', 'admin-test', 'find ' + rp + ' -fprintf /tmp/leak %%p', 'protected system config path'),\n"
+  # Admin read-only diagnostics → allowed.
+  printf "    ('admin-find-name', 'admin-test', 'find ' + rp + ' -name *.sh', None),\n"
+  printf "    ('admin-find-type', 'admin-test', 'find ' + rp + ' -type f', None),\n"
+  # Non-admin parity: mutator denied with the shared-roster wording;
+  # read-only still allowed via the general read_intent branch.
+  printf "    ('non-admin-find-delete', 'self', 'find ' + rp + ' -delete', 'shared roster secrets'),\n"
+  printf "    ('non-admin-find-exec', 'self', 'find ' + rp + ' -exec python3 /tmp/m.py {} ;', 'shared roster secrets'),\n"
+  printf "    ('non-admin-find-name', 'self', 'find ' + rp + ' -name *.sh', None),\n"
+  printf ']\n'
+  printf 'for label, agent, cmd, expected in gate_cases:\n'
+  printf '    got = m.protected_alias_reason(cmd, agent)\n'
+  printf '    if expected is None:\n'
+  printf '        if got is None:\n'
+  printf '            print("OK gate " + label + " allowed")\n'
+  printf '        else:\n'
+  printf '            failed = True\n'
+  printf '            print("FAIL gate " + label + " expected=allow got=" + repr(got))\n'
+  printf '    else:\n'
+  printf '        if got is not None and expected in str(got):\n'
+  printf '            print("OK gate " + label + " denied containing=" + expected)\n'
+  printf '        else:\n'
+  printf '            failed = True\n'
+  printf '            print("FAIL gate " + label + " expected_contains=" + expected + " got=" + repr(got))\n'
+  printf 'sys.exit(1 if failed else 0)\n'
+} >"$T7_PROBE"
+
+python3 "$T7_PROBE" >"$SMOKE_TMP_ROOT/t7.out" 2>&1 \
+  || smoke_fail "T7: probe failed:
+$(cat "$SMOKE_TMP_ROOT/t7.out")"
+T7_OUT="$(cat "$SMOKE_TMP_ROOT/t7.out")"
+
+# Classifier — mutation/exec flags drop the read-intent classification.
+smoke_assert_contains "$T7_OUT" "OK classifier find-delete" \
+  "T7: find -delete refused by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-exec" \
+  "T7: find -exec refused by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-execdir" \
+  "T7: find -execdir refused by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-ok" \
+  "T7: find -ok refused by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-okdir" \
+  "T7: find -okdir refused by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-fprint" \
+  "T7: find -fprint refused by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-fprint0" \
+  "T7: find -fprint0 refused by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-fprintf" \
+  "T7: find -fprintf refused by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-mid-delete" \
+  "T7: -delete mid-argv refused by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-path-leader" \
+  "T7: /usr/bin/find -exec refused by classifier"
+
+# Classifier — read-only flag forms still admitted.
+smoke_assert_contains "$T7_OUT" "OK classifier find-name" \
+  "T7: find -name admitted by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-type" \
+  "T7: find -type admitted by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-size" \
+  "T7: find -size admitted by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-multi-read" \
+  "T7: multiple read flags admitted by classifier"
+smoke_assert_contains "$T7_OUT" "OK classifier find-pseudo-match" \
+  "T7: pseudo-match token (-deleted-files) does not trigger the filter"
+
+# End-to-end gate — admin mutator/exec vectors denied.
+smoke_assert_contains "$T7_OUT" "OK gate admin-find-delete" \
+  "T7 gate: admin find <roster> -delete → DENIED"
+smoke_assert_contains "$T7_OUT" "OK gate admin-find-exec" \
+  "T7 gate: admin find <roster> -exec ... → DENIED"
+smoke_assert_contains "$T7_OUT" "OK gate admin-find-execdir" \
+  "T7 gate: admin find <roster> -execdir ... → DENIED"
+smoke_assert_contains "$T7_OUT" "OK gate admin-find-ok" \
+  "T7 gate: admin find <roster> -ok ... → DENIED"
+smoke_assert_contains "$T7_OUT" "OK gate admin-find-fprintf" \
+  "T7 gate: admin find <roster> -fprintf ... → DENIED"
+smoke_assert_contains "$T7_OUT" "OK gate admin-find-name" \
+  "T7 gate: admin find <roster> -name → allowed (#1255 unblock preserved)"
+smoke_assert_contains "$T7_OUT" "OK gate admin-find-type" \
+  "T7 gate: admin find <roster> -type → allowed"
+
+# Non-admin parity.
+smoke_assert_contains "$T7_OUT" "OK gate non-admin-find-delete" \
+  "T7 gate: non-admin find -delete → still DENIED"
+smoke_assert_contains "$T7_OUT" "OK gate non-admin-find-exec" \
+  "T7 gate: non-admin find -exec → still DENIED"
+smoke_assert_contains "$T7_OUT" "OK gate non-admin-find-name" \
+  "T7 gate: non-admin find -name → allowed (preserves #383)"
+
+smoke_assert_not_contains "$T7_OUT" "FAIL " \
+  "T7: every classifier + gate case must pass"
+
+# T7 teeth: prove the flag filter is what closes the gap. Stub
+# `_find_is_read_only` to always return True (i.e. the pre-r3
+# behavior where find was a bare whitelist entry) and confirm admin
+# `find -delete` is then allowed by protected_alias_reason. Restore
+# the real function and confirm the same command is denied.
+smoke_log "T7 teeth: stubbing _find_is_read_only → True admits admin find -delete (proves filter is the seal)"
+T7T_PROBE="$SMOKE_TMP_ROOT/t7-teeth.py"
+{
+  printf '#!/usr/bin/env python3\n'
+  printf 'import os, importlib.util, sys, tempfile\n'
+  printf 'bridge_home = tempfile.mkdtemp(prefix="t7-teeth-bridge-home-")\n'
+  printf 'os.environ["BRIDGE_HOME"] = bridge_home\n'
+  printf 'os.environ["BRIDGE_ADMIN_AGENT_ID"] = "admin-test"\n'
+  printf 'spec = importlib.util.spec_from_file_location("tp", "%s")\n' "$TOOL_POLICY_PY"
+  printf 'm = importlib.util.module_from_spec(spec)\n'
+  printf 'spec.loader.exec_module(m)\n'
+  printf 'roster_path = m.roster_local_path()\n'
+  printf 'roster_path.parent.mkdir(parents=True, exist_ok=True)\n'
+  printf 'roster_path.write_text("# fixture roster\\n")\n'
+  printf 'rp = str(roster_path)\n'
+  printf 'admin_delete = "find " + rp + " -delete"\n'
+  printf 'admin_exec = "find " + rp + " -exec python3 /tmp/m.py {} ;"\n'
+  printf 'admin_read = "find " + rp + " -name *.sh"\n'
+  # Real filter denies the mutator/exec.
+  printf 'real_delete = m.protected_alias_reason(admin_delete, "admin-test")\n'
+  printf 'real_exec = m.protected_alias_reason(admin_exec, "admin-test")\n'
+  printf 'real_read = m.protected_alias_reason(admin_read, "admin-test")\n'
+  # Stub _find_is_read_only to always return True — simulates pre-r3.
+  printf 'orig = m._find_is_read_only\n'
+  printf 'm._find_is_read_only = lambda _argv: True\n'
+  printf 'stub_delete = m.protected_alias_reason(admin_delete, "admin-test")\n'
+  printf 'stub_exec = m.protected_alias_reason(admin_exec, "admin-test")\n'
+  printf 'm._find_is_read_only = orig\n'
+  printf 'print("real_delete=" + repr(real_delete))\n'
+  printf 'print("real_exec=" + repr(real_exec))\n'
+  printf 'print("real_read=" + repr(real_read))\n'
+  printf 'print("stub_delete=" + repr(stub_delete))\n'
+  printf 'print("stub_exec=" + repr(stub_exec))\n'
+  printf 'ok = (real_delete is not None\n'
+  printf '      and real_exec is not None\n'
+  printf '      and real_read is None\n'
+  printf '      and stub_delete is None\n'
+  printf '      and stub_exec is None)\n'
+  printf 'sys.exit(0 if ok else 1)\n'
+} >"$T7T_PROBE"
+T7T_OUT="$(python3 "$T7T_PROBE" 2>&1)" \
+  || smoke_fail "T7 teeth: flag-filter seal not observed:
+$T7T_OUT"
+smoke_assert_contains "$T7T_OUT" "real_delete='" \
+  "T7 teeth: real filter denies admin find -delete"
+smoke_assert_contains "$T7T_OUT" "real_exec='" \
+  "T7 teeth: real filter denies admin find -exec"
+smoke_assert_contains "$T7T_OUT" "real_read=None" \
+  "T7 teeth: real filter still allows admin find -name diagnostic"
+smoke_assert_contains "$T7T_OUT" "stub_delete=None" \
+  "T7 teeth: stubbed-True filter wrongly admits admin find -delete (pre-r3 demo)"
+smoke_assert_contains "$T7T_OUT" "stub_exec=None" \
+  "T7 teeth: stubbed-True filter wrongly admits admin find -exec (pre-r3 demo)"
+
+smoke_log "K-beta4-nits: all 7 tests + teeth passed"
 exit 0

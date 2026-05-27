@@ -652,6 +652,60 @@ _SAFE_REDIRECT_RE = re.compile(
 _NUMERIC_FD_WRITE_RE = re.compile(r"^[0-9]+>>?")
 
 
+# Issue #1255 r3 — `find` mutation/exec primitive filter.
+#
+# `find` is on `_READ_INTENT_BASH_COMMANDS` because the common operator
+# diagnostics (`find <roster> -name "*.sh"`, `find <roster> -type f`)
+# are pure reads. But find has built-in mutation and exec primitives
+# that the bare leader check does not see — `find -delete` removes
+# matches in place, and `find -exec` / `-execdir` / `-ok` / `-okdir`
+# spawn arbitrary subprocesses against each match. The `-fprint` /
+# `-fprint0` / `-fprintf` flags write matches to a file the operator
+# names, which is a roster-exfil channel even though no `>` token
+# appears in the command (codex PR #1294 r2 finding).
+#
+# Treat these flags as write-intent: when `find` is the stage leader
+# and any of them appears in argv, the stage falls out of the read-
+# intent classification. The output-redirection guard above already
+# catches `find -ls > somefile`; we do not need to enumerate that form
+# here.
+_FIND_MUTATION_FLAGS = frozenset(
+    {
+        "-delete",
+        "-exec",
+        "-execdir",
+        "-ok",
+        "-okdir",
+        "-fprint",
+        "-fprint0",
+        "-fprintf",
+    }
+)
+
+
+def _find_is_read_only(stage_tokens: list[str]) -> bool:
+    """Return True iff a `find` invocation is free of mutation/exec flags.
+
+    *stage_tokens* is the whitespace-split argv of a single pipeline
+    stage whose leader has already been confirmed to be `find` (or a
+    pathy equivalent like `/usr/bin/find`). Returns False as soon as
+    any token equals one of :data:`_FIND_MUTATION_FLAGS` so the caller
+    can drop the read-intent classification.
+
+    The check is exact-match per token: `-delete` matches but
+    `-deleted-files` does not, and `-delete` is rejected even when it
+    appears mid-argv (`find <path> -type f -delete`). This is the
+    flag shape `find` itself enforces — none of the mutation primitives
+    take an inline value glued to the flag (find takes them as separate
+    argv elements). See codex PR #1294 r2 for the BLOCKING-class repro
+    that motivated the filter.
+    """
+    for token in stage_tokens[1:]:  # skip the leading 'find'
+        if token in _FIND_MUTATION_FLAGS:
+            return False
+    return True
+
+
 def _is_read_intent_bash(command: str) -> bool:
     """Return True iff *command* is purely read-intent.
 
@@ -737,6 +791,16 @@ def _is_read_intent_bash(command: str) -> bool:
             if leaf == "sed" and any(t == "-i" or t.startswith("-i") for t in stage_tokens[1:]):
                 return False
             if leaf == "awk" and "-i" in stage_tokens[1:]:
+                return False
+            # `find` is whitelisted for diagnostics (`find <roster>
+            # -name "*.sh"`), but it has mutation/exec primitives
+            # (`-delete`, `-exec`, `-execdir`, `-ok`, `-okdir`,
+            # `-fprint`, `-fprint0`, `-fprintf`) that the leader check
+            # alone does not see. Codex PR #1294 r2 demonstrated that
+            # without this filter an admin could `find <roster>
+            # -delete` or `find <roster> -exec python3
+            # /tmp/mutator.py {} \;` through the roster carve-out.
+            if leaf == "find" and not _find_is_read_only(stage_tokens):
                 return False
             continue
         # `agent-bridge config get …` / `agb config get …` are read-intent.
