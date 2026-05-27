@@ -227,8 +227,10 @@ if [[ "$_resume_gate_enabled" == "1" && $SAFE_MODE -eq 0 ]]; then
     # Heuristic: `state/agents/<a>/launch.history` is the marker that
     # the agent has been launched at least once. Absent => fresh
     # first-wake (proceed without --resume, emit a structured info
-    # log + audit row, and touch the marker so the NEXT empty-sid
-    # condition correctly falls into the lost-state die branch).
+    # log + audit row, and defer marker creation to the real-launch
+    # path so dry-run inspection stays side-effect-free; the NEXT
+    # empty-sid condition after a real launch correctly falls into
+    # the lost-state die branch).
     # Present => the agent has launched before; an empty session_id
     # now is the genuine #1248 lost-state and the die path is correct.
     #
@@ -242,6 +244,16 @@ if [[ "$_resume_gate_enabled" == "1" && $SAFE_MODE -eq 0 ]]; then
     # exists but the helper short-circuits. Touch failure is
     # non-fatal: we still proceed (the gate has decided the launch is
     # legitimate) -- a future tick will retry.
+    #
+    # R2 (codex r1 BLOCKING — dry-run poisoning): the marker MUST NOT
+    # be created in this gate, because `bridge-run.sh --dry-run` is an
+    # advertised inspection mode and reaching the gate is not the same
+    # as "actually launched". Creating the marker here would flip a
+    # never-launched agent into "launched before" state, so the next
+    # real first launch (or even a second dry-run) would fall through
+    # to the lost-state die branch. We capture intent in a flag here
+    # and the real-launch path (after the dry-run early-exit) creates
+    # the marker exactly once, right before the launch loop.
     _gate_launch_history="${BRIDGE_HOME:-$HOME/.agent-bridge}/state/agents/$AGENT/launch.history"
     if [[ ! -f "$_gate_launch_history" ]]; then
       bridge_info "[run] fresh first-wake (no session yet) — launching new session (agent=$AGENT)"
@@ -249,11 +261,11 @@ if [[ "$_resume_gate_enabled" == "1" && $SAFE_MODE -eq 0 ]]; then
         --detail continue_mode="$_gate_continue" \
         --detail reason=fresh_install_no_launch_history \
         2>/dev/null || true
-      if command -v bridge_agent_state_dir_self_heal >/dev/null 2>&1; then
-        bridge_agent_state_dir_self_heal "$AGENT" >/dev/null 2>&1 || true
-      fi
-      mkdir -p "$(dirname "$_gate_launch_history")" 2>/dev/null || true
-      : >"$_gate_launch_history" 2>/dev/null || true
+      # Defer marker creation to the real-launch path (see post-dry-run
+      # block below). The gate has decided the launch is legitimate;
+      # the marker becomes truth-on-disk only when an actual launch is
+      # attempted, NOT when --dry-run is inspecting the resolution.
+      BRIDGE_RUN_PENDING_FRESH_MARKER="$_gate_launch_history"
       unset _gate_launch_history
     else
       unset _gate_launch_history
@@ -292,7 +304,32 @@ if [[ $DRY_RUN -eq 1 ]]; then
   echo "channels=$(bridge_agent_channels_csv "$AGENT")"
   echo "channel_status=$(bridge_agent_channel_status "$AGENT")"
   echo "launch=$(bridge_redact_inline_env_secrets "$LAUNCH_CMD")"
+  # R2 (codex r1 BLOCKING — dry-run poisoning): dry-run must NEVER
+  # create the launch.history marker. Unset the deferred-marker hint
+  # captured by the resume gate so a subsequent real launch in this
+  # process (none today, but defensive) cannot accidentally touch it
+  # via leaked global state.
+  unset BRIDGE_RUN_PENDING_FRESH_MARKER
   exit 0
+fi
+
+# R2 (codex r1 BLOCKING — dry-run poisoning, fresh first-wake real
+# launch path): the resume gate above captured a deferred marker hint
+# (BRIDGE_RUN_PENDING_FRESH_MARKER) when it observed continue=1 +
+# session_id="" + launch.history absent. Now that we have cleared the
+# dry-run early-exit, this IS a real launch — create the marker once,
+# right before the launch loop starts, so the NEXT empty-sid condition
+# (next process invocation) correctly falls into the lost-state die
+# branch (#1248). Marker creation failure stays non-fatal (the gate
+# has already decided the launch is legitimate) — a future tick will
+# retry.
+if [[ -n "${BRIDGE_RUN_PENDING_FRESH_MARKER:-}" ]]; then
+  if command -v bridge_agent_state_dir_self_heal >/dev/null 2>&1; then
+    bridge_agent_state_dir_self_heal "$AGENT" >/dev/null 2>&1 || true
+  fi
+  mkdir -p "$(dirname "$BRIDGE_RUN_PENDING_FRESH_MARKER")" 2>/dev/null || true
+  : >"$BRIDGE_RUN_PENDING_FRESH_MARKER" 2>/dev/null || true
+  unset BRIDGE_RUN_PENDING_FRESH_MARKER
 fi
 
 export PATH="$HOME/.local/bin:$HOME/.nix-profile/bin:/usr/local/bin:$PATH"

@@ -115,9 +115,14 @@ EOF
 # ---------------------------------------------------------------------
 # T1 — fresh agent (no launch.history) + continue=1 + session_id=""
 #      -> fresh-state branch fires. The dry-run must NOT die, must NOT
-#      emit a `--resume` verb (no session id to resume), and the
-#      `state/agents/<a>/launch.history` marker file must exist after
-#      the run.
+#      emit a `--resume` verb (no session id to resume).
+#
+#      R2 (codex r1 BLOCKING — dry-run poisoning): dry-run must be
+#      side-effect-free. The launch.history marker MUST NOT be created
+#      by a dry-run inspection — otherwise a never-launched agent
+#      flips to "launched before" state and the next real first launch
+#      (or a second dry-run) dies on the lost-state path. The marker
+#      is now deferred to the real-launch path (post-dry-run-exit).
 # ---------------------------------------------------------------------
 test_fresh_first_wake_no_die() {
   local agent="e-T1-fresh"
@@ -147,10 +152,15 @@ test_fresh_first_wake_no_die() {
   smoke_assert_contains "$out" "fresh first-wake" \
     "T1 dry-run emits the structured fresh-first-wake info breadcrumb"
 
-  # Marker file must exist after the run.
+  # R2 (codex r1 BLOCKING — dry-run poisoning): marker MUST NOT exist
+  # after a dry-run inspection. dry-run is advertised as side-effect-free;
+  # creating the marker here would flip never-launched -> launched-before
+  # state and poison the next real first launch / second dry-run into the
+  # lost-state die branch.
   local marker="$BRIDGE_STATE_DIR/agents/$agent/launch.history"
-  smoke_assert_file_exists "$marker" \
-    "T1 launch.history marker created on fresh first-wake"
+  if [[ -f "$marker" ]]; then
+    smoke_fail "T1 R2: launch.history marker MUST NOT be created by dry-run inspection — found at $marker (codex r1 BLOCKING: dry-run poisons next real first launch / second dry-run)"
+  fi
 }
 
 # ---------------------------------------------------------------------
@@ -312,9 +322,151 @@ test_teeth_daemon_self_heal_sites_present() {
   done
 }
 
-smoke_run "T1 fresh first-wake skips die + touches launch.history"   test_fresh_first_wake_no_die
+# ---------------------------------------------------------------------
+# T_dry_run_seq — R2 (codex r1 BLOCKING): dry-run side-effect-free
+#                 sequence reproduction.
+#
+# Codex r1 BLOCKING repro:
+#   - first  `bridge-run.sh <a> --continue --dry-run` => marker created
+#     by the resume gate (PRE-R2 bug)
+#   - second `bridge-run.sh <a> --continue --dry-run` => marker now
+#     exists, so the gate falls through to the lost-state die branch
+#     with rc=1 + "session_id missing", even though no real launch
+#     ever happened
+#
+# Post-R2 contract:
+#   step 1: first dry-run                => rc=0, marker NOT created
+#   step 2: second dry-run (same agent)  => rc=0, fresh-state preserved,
+#                                            marker still NOT created
+#   step 3: simulated real launch        => marker created (touch
+#                                            simulates the post-dry-run
+#                                            real-launch block)
+#   step 4: post-launch dry-run with     => rc != 0, lost-state die
+#           empty session_id                (#1248 gate path preserved)
+#
+# Step 3 simulates the real-launch marker write rather than spawning
+# claude (the smoke does not have an engine). Step 4 covers the
+# already-implemented T2 contract from the same agent's lifecycle so
+# we prove the whole sequence end-to-end.
+# ---------------------------------------------------------------------
+test_dry_run_sequence_side_effect_free() {
+  local agent="e-Tseq-dryrun"
+  write_dryrun_roster "$agent" 1 ""
+
+  local agent_state_dir="$BRIDGE_STATE_DIR/agents/$agent"
+  rm -rf "$agent_state_dir" 2>/dev/null || true
+
+  local marker="$BRIDGE_STATE_DIR/agents/$agent/launch.history"
+
+  # Step 1: first dry-run.
+  local out1=""
+  local rc1=0
+  set +e
+  out1="$(bash "$REPO_ROOT/bridge-run.sh" "$agent" --continue --dry-run 2>&1)"
+  rc1=$?
+  set -e
+  smoke_assert_eq "0" "$rc1" \
+    "T_dry_run_seq step 1: first dry-run exits 0"
+  smoke_assert_contains "$out1" "fresh first-wake" \
+    "T_dry_run_seq step 1: fresh-first-wake info breadcrumb fires"
+  smoke_assert_not_contains "$out1" "session_id missing" \
+    "T_dry_run_seq step 1: no lost-state die on first dry-run"
+  if [[ -f "$marker" ]]; then
+    smoke_fail "T_dry_run_seq step 1: marker MUST NOT exist after first dry-run (codex r1 BLOCKING: dry-run poisons fresh-install state); found at $marker"
+  fi
+
+  # Step 2: second dry-run on the same agent — must still be fresh state,
+  # NOT lost-state. This is the codex r1 direct repro.
+  local out2=""
+  local rc2=0
+  set +e
+  out2="$(bash "$REPO_ROOT/bridge-run.sh" "$agent" --continue --dry-run 2>&1)"
+  rc2=$?
+  set -e
+  smoke_assert_eq "0" "$rc2" \
+    "T_dry_run_seq step 2: SECOND dry-run still exits 0 (no die from poisoned marker)"
+  smoke_assert_contains "$out2" "fresh first-wake" \
+    "T_dry_run_seq step 2: fresh-first-wake breadcrumb still fires (fresh state preserved)"
+  smoke_assert_not_contains "$out2" "session_id missing" \
+    "T_dry_run_seq step 2: second dry-run does NOT trip lost-state die (codex r1 BLOCKING repro)"
+  if [[ -f "$marker" ]]; then
+    smoke_fail "T_dry_run_seq step 2: marker MUST STILL NOT exist after second dry-run; found at $marker (R2 regression: dry-run is no longer side-effect-free)"
+  fi
+
+  # Step 3: simulate a real launch reaching the post-dry-run real-launch
+  # block — that block touches the marker once. The smoke can't spawn
+  # claude; we simulate the marker write inline, exactly as the
+  # production block does.
+  mkdir -p "$(dirname "$marker")" 2>/dev/null || true
+  : >"$marker"
+  smoke_assert_file_exists "$marker" \
+    "T_dry_run_seq step 3: simulated real launch creates marker"
+
+  # Step 4: post-launch dry-run with empty session_id => lost-state die.
+  # Same gate path as T2, but exercised on the same agent's lifecycle so
+  # the whole sequence (fresh -> fresh -> launched -> lost) is covered
+  # end-to-end.
+  local out4=""
+  local rc4=0
+  set +e
+  out4="$(bash "$REPO_ROOT/bridge-run.sh" "$agent" --continue --dry-run 2>&1)"
+  rc4=$?
+  set -e
+  if (( rc4 == 0 )); then
+    smoke_fail "T_dry_run_seq step 4: expected non-zero rc from post-launch lost-state dry-run, got rc=0; out=$out4"
+  fi
+  smoke_assert_contains "$out4" "session_id missing" \
+    "T_dry_run_seq step 4: lost-state die fires once marker is present (#1248 gate preserved)"
+}
+
+# ---------------------------------------------------------------------
+# T_neg_dry_run_marker — R2 teeth: marker creation must NOT live
+# inside the resume gate, and must NOT live inside the dry-run echo
+# block. If a future PR re-introduces in-gate marker creation, the
+# dry-run-poisoning bug returns. Grep-based regression catcher.
+# ---------------------------------------------------------------------
+test_teeth_dry_run_marker_deferred() {
+  local runner="$REPO_ROOT/bridge-run.sh"
+  smoke_assert_file_exists "$runner" \
+    "T_neg_dry_run_marker: bridge-run.sh exists"
+
+  # Must reference the deferred-marker hint variable, proving the gate
+  # captures intent and a downstream block consumes it.
+  local hit=""
+  hit="$(grep -F 'BRIDGE_RUN_PENDING_FRESH_MARKER' "$runner" || true)"
+  if [[ -z "$hit" ]]; then
+    smoke_fail "T_neg_dry_run_marker: BRIDGE_RUN_PENDING_FRESH_MARKER deferred-marker hint missing — R2 fix regressed (codex r1 BLOCKING)"
+  fi
+
+  # Must mention the codex r1 BLOCKING context so a future hand cannot
+  # delete the deferral without seeing why it exists.
+  hit="$(grep -F 'dry-run poisoning' "$runner" || true)"
+  if [[ -z "$hit" ]]; then
+    smoke_fail "T_neg_dry_run_marker: 'dry-run poisoning' rationale comment missing in bridge-run.sh — R2 fix regressed"
+  fi
+
+  # The resume gate must NOT contain the touch/echo-into-marker call
+  # any more. Search the gate-only line range for ': >"$_gate_launch_history"'
+  # and assert no hit. (Awk over the file to scope: from the gate
+  # entry to the closing `fi` two stanzas down.)
+  local gate_section=""
+  gate_section="$(awk '/_resume_gate_enabled="\$\{BRIDGE_AGENT_RESUME_GATE_ENABLED:-1\}"/,/unset _resume_gate_enabled/' "$runner")"
+  if [[ -z "$gate_section" ]]; then
+    smoke_fail "T_neg_dry_run_marker: unable to extract resume-gate section from bridge-run.sh — file shape changed unexpectedly"
+  fi
+  if echo "$gate_section" | grep -F ': >"$_gate_launch_history"' >/dev/null 2>&1; then
+    smoke_fail "T_neg_dry_run_marker: in-gate marker touch re-introduced (': >\"\$_gate_launch_history\"') — codex r1 BLOCKING dry-run poisoning regressed"
+  fi
+  if echo "$gate_section" | grep -F 'mkdir -p "$(dirname "$_gate_launch_history")"' >/dev/null 2>&1; then
+    smoke_fail "T_neg_dry_run_marker: in-gate marker parent mkdir re-introduced — codex r1 BLOCKING dry-run poisoning regressed"
+  fi
+}
+
+smoke_run "T1 fresh first-wake skips die + dry-run leaves no marker (R2)" test_fresh_first_wake_no_die
 smoke_run "T2 lost-state still fails loud with (a)/(b)/(c)"          test_lost_state_still_fails_loud
 smoke_run "T3 continue=0 / --no-continue gate not entered"           test_continue0_unchanged
 smoke_run "T4 daemon wake self_heal wired at all 3 sites"            test_daemon_wake_self_heal_grep
 smoke_run "T5 teeth: bridge-run.sh fresh-state branch present"       test_teeth_fresh_state_branch_present
 smoke_run "T6 teeth: bridge-daemon.sh self-heal sites all present"   test_teeth_daemon_self_heal_sites_present
+smoke_run "T_dry_run_seq: dry-run side-effect-free across 2 runs (R2)" test_dry_run_sequence_side_effect_free
+smoke_run "T_neg_dry_run_marker: in-gate marker creation absent (R2)"  test_teeth_dry_run_marker_deferred
