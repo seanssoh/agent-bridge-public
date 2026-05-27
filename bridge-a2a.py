@@ -48,6 +48,73 @@ def die(msg: str, code: int = 1) -> "Optional[int]":
     return code
 
 
+def _audit_body_file_sudo_fallback(
+    body_path: Path,
+    owner: str,
+    success: bool,
+    rc: "int | None",
+    call_site: str,
+) -> None:
+    """Emit a ``body_file_sudo_fallback`` audit row (Lane J r2 SHOULD-FIX).
+
+    Mirrors ``bridge-queue.py:_audit_body_file_sudo_fallback`` for the
+    A2A send path. See that helper for the rationale; this exists as a
+    parallel copy because ``bridge-a2a.py`` does not import
+    ``bridge-queue`` (and we deliberately avoid coupling the two CLIs
+    through a shared module just for one audit hook). Best-effort: any
+    failure to emit is swallowed silently.
+    """
+    import subprocess as _subprocess
+    audit_path = (
+        os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+        or os.path.expanduser(os.path.join(
+            os.environ.get("BRIDGE_HOME", "").strip() or "~/.agent-bridge",
+            "logs",
+            "audit.jsonl",
+        ))
+    )
+    detail = {
+        "file_path": str(body_path),
+        "owner": owner,
+        "fallback_method": "sudo-read",
+        "success": success,
+        "rc": rc if rc is not None else "",
+        "call_site": call_site,
+    }
+    audit_script = Path(__file__).resolve().with_name("bridge-audit.py")
+    if not audit_script.is_file():
+        return
+    cmd = [
+        sys.executable,
+        str(audit_script),
+        "write",
+        "--file",
+        audit_path,
+        "--actor",
+        "bridge-a2a",
+        "--action",
+        "body_file_sudo_fallback",
+        "--target",
+        str(body_path),
+        "--detail-json",
+        json.dumps(detail, ensure_ascii=True, sort_keys=True),
+    ]
+    try:
+        Path(audit_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    try:
+        _subprocess.run(
+            cmd,
+            stdin=_subprocess.DEVNULL,
+            stdout=_subprocess.DEVNULL,
+            stderr=_subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, _subprocess.TimeoutExpired):
+        pass
+
+
 def _sudo_read_text(path: Path) -> str | None:
     """v0.15.0-beta4 Lane J (#1280): sudo-fallback body-file reader.
 
@@ -92,9 +159,21 @@ def _sudo_read_text(path: Path) -> str | None:
             timeout=10,
         )
     except (OSError, _subprocess.TimeoutExpired):
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=None,
+            call_site="bridge-a2a.cmd_send",
+        )
         return None
     if result.returncode != 0:
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=result.returncode,
+            call_site="bridge-a2a.cmd_send",
+        )
         return None
+    _audit_body_file_sudo_fallback(
+        path, owner, success=True, rc=0,
+        call_site="bridge-a2a.cmd_send",
+    )
     try:
         return result.stdout.decode("utf-8")
     except UnicodeDecodeError:

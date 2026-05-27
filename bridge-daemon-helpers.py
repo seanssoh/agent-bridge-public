@@ -158,25 +158,74 @@ def cmd_release_downgrade_classify(args: argparse.Namespace) -> int:
     latest = str(release.get("latest_version") or "").strip()
     if not installed or not latest:
         return 0
-    # Reuse the prerelease-tolerant core parser from bridge-release.py.
-    # We re-implement inline here so this helper has no import-side
-    # dependency on bridge-release.py (which is the producer; importing
-    # consumer-side risks a circular load order via subprocess invocation).
+    # Issue #1267 (Lane J r2 BLOCKING from codex r1): use full semver
+    # 2.0.0 comparison including prerelease ordering. The r1 fix used
+    # core-only compare, which classified ``0.14.5-beta1`` vs
+    # ``0.14.5`` (a legitimate beta→stable upgrade) as
+    # ``installed_core >= latest_core`` → emitted
+    # ``release_notification_downgrade_skip`` and silently swallowed
+    # the upgrade prompt. Per semver 2.0.0 §11 a prerelease has LOWER
+    # precedence than the corresponding final, so the same-core
+    # beta→stable case MUST classify as "real upgrade", not downgrade.
+    #
+    # We re-implement the parser inline here so this helper has no
+    # import-side dependency on bridge-release.py (which is the
+    # producer; importing consumer-side risks a circular load order via
+    # subprocess invocation).
     import re as _re
-    _core_re = _re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:[-+].+)?$")
+    _full_re = _re.compile(
+        r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+    )
 
-    def _core(text: str) -> tuple[int, int, int] | None:
-        match = _core_re.fullmatch(text)
+    def _full(text: str):
+        match = _full_re.fullmatch(text)
         if not match:
             return None
-        return tuple(int(part) for part in match.groups())
+        major, minor, patch = (int(match.group(i)) for i in (1, 2, 3))
+        return ((major, minor, patch), match.group(4) or "")
 
-    installed_core = _core(installed)
-    latest_core = _core(latest)
-    if installed_core is None or latest_core is None:
+    def _cmp_pre(a: str, b: str) -> int:
+        a_parts = a.split(".") if a else []
+        b_parts = b.split(".") if b else []
+        for ai, bi in zip(a_parts, b_parts):
+            a_num = ai.isdigit()
+            b_num = bi.isdigit()
+            if a_num and b_num:
+                an, bn = int(ai), int(bi)
+                if an != bn:
+                    return -1 if an < bn else 1
+                continue
+            if a_num and not b_num:
+                return -1
+            if not a_num and b_num:
+                return 1
+            if ai != bi:
+                return -1 if ai < bi else 1
+        if len(a_parts) == len(b_parts):
+            return 0
+        return -1 if len(a_parts) < len(b_parts) else 1
+
+    def _cmp(installed_v, latest_v) -> int:
+        if installed_v[0] != latest_v[0]:
+            return -1 if installed_v[0] < latest_v[0] else 1
+        ip, lp = installed_v[1], latest_v[1]
+        if ip == lp:
+            return 0
+        if not ip and lp:
+            return 1  # installed final > latest prerelease
+        if ip and not lp:
+            return -1  # installed prerelease < latest final (beta→stable upgrade)
+        return _cmp_pre(ip, lp)
+
+    installed_full = _full(installed)
+    latest_full = _full(latest)
+    if installed_full is None or latest_full is None:
         return 0
-    if installed_core >= latest_core:
+    if _cmp(installed_full, latest_full) >= 0:
         # Downgrade or no-op case — emit the classification row.
+        # NOTE: same-core beta→stable (e.g. 0.14.5-beta1 vs 0.14.5)
+        # returns -1 from _cmp and FALLS THROUGH to silence here, which
+        # is correct: that pair is a real upgrade, not a downgrade.
         print(f"{installed}\t{latest}")
     return 0
 

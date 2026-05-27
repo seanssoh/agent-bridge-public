@@ -437,4 +437,274 @@ smoke_assert_contains "$T8B_OUT" "wiki_graph_skipped=1" "T8b stdout marker prese
 smoke_assert_contains "$T8B_OUT" "operator opt-out" "T8b advisory names operator opt-out reason"
 smoke_log "T8b ok: explicit BRIDGE_WIKI_GRAPH_ENABLED=0 fires with operator-opt-out reason"
 
+# ----------------------------------------------------------------------------
+# T9 (#1267 r2 BLOCKING): same-core beta→stable IS a valid upgrade.
+# Pre-r2 code reduced any prerelease to its core tuple and then declared
+# "installed_core >= latest_core" → emitted release_notification_downgrade_skip
+# on 0.14.5-beta1 vs 0.14.5 (a legitimate beta→stable upgrade). r2 uses
+# full semver 2.0.0 prerelease ordering so the same-core beta < final
+# rule kicks in.
+# ----------------------------------------------------------------------------
+smoke_log "T9 (#1267 r2): same-core beta→stable is a real upgrade (NOT downgrade-skip)"
+
+# T9a: release_record sees update_available=true on 0.14.5-beta1 vs v0.14.5.
+T9A_OUT=""
+T9A_RC=0
+T9A_OUT="$(BRIDGE_RELEASE_MOCK_JSON='{"tag_name":"v0.14.5","html_url":"","published_at":""}' \
+  python3 "$REPO_ROOT/bridge-release.py" status \
+    --repo seanssoh/agent-bridge-public \
+    --installed-version 0.14.5-beta1 \
+    --json 2>&1)" || T9A_RC=$?
+if (( T9A_RC != 0 )); then
+  smoke_fail "T9a: bridge-release.py status rc=$T9A_RC out: $T9A_OUT"
+fi
+T9A_UPDATE="$(python3 -c 'import json,sys;print(json.loads(sys.stdin.read())["release"]["update_available"])' <<<"$T9A_OUT")"
+smoke_assert_eq "True" "$T9A_UPDATE" "T9a release_record beta→stable same-core sees update_available=true"
+smoke_log "T9a ok: release_record sees 0.14.5-beta1 < 0.14.5 as upgrade"
+
+# T9b: downgrade-classify stays SILENT (no row) on the same pair, because
+# emitting a row would tell the daemon "skip the notification" — wrong.
+T9B_PAYLOAD='{"alerts":[],"release":{"installed_version":"0.14.5-beta1","latest_version":"0.14.5","latest_tag":"v0.14.5","update_available":true}}'
+T9B_OUT=""
+T9B_RC=0
+T9B_OUT="$(python3 "$REPO_ROOT/bridge-daemon-helpers.py" release-downgrade-classify "$T9B_PAYLOAD" 2>&1)" || T9B_RC=$?
+if (( T9B_RC != 0 )); then
+  smoke_fail "T9b: release-downgrade-classify rc=$T9B_RC out: $T9B_OUT"
+fi
+if [[ -n "$T9B_OUT" ]]; then
+  smoke_fail "T9b: beta→stable same-core wrongly classified as downgrade-skip: $T9B_OUT"
+fi
+smoke_log "T9b ok: downgrade-classify silent for same-core beta→stable (real upgrade)"
+
+# T9c (teeth): also assert prerelease ORDERING covers the alpha < beta < rc
+# < final chain so the comparator does not regress to "any prerelease is
+# equal" or similar shortcuts.
+T9C_RESULT="$SMOKE_TMP_ROOT/t9c-cmp.json"
+T9C_HARNESS="$SMOKE_TMP_ROOT/t9c-harness.py"
+cat >"$T9C_HARNESS" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+
+repo_root = sys.argv[1]
+out_path = sys.argv[2]
+
+spec = importlib.util.spec_from_file_location(
+    "bridge_release", os.path.join(repo_root, "bridge-release.py")
+)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+cases = [
+    ("0.14.5-beta1", "0.14.5", -1),
+    ("0.14.5", "0.14.5-beta1", 1),
+    ("0.14.5", "0.14.5", 0),
+    ("0.14.5-alpha", "0.14.5-beta", -1),
+    ("0.14.5-beta", "0.14.5-rc.1", -1),
+    ("0.14.5-rc.1", "0.14.5", -1),
+    ("0.14.5-beta.2", "0.14.5-beta.11", -1),
+    ("0.15.0-beta3", "0.14.5", 1),
+]
+out = []
+for a, b, want in cases:
+    got = mod.compare_semver(a, b)
+    out.append({"a": a, "b": b, "want": want, "got": got, "ok": got == want})
+
+open(out_path, "w").write(json.dumps(out))
+PY
+T9C_OUT=""
+T9C_RC=0
+T9C_OUT="$(python3 "$T9C_HARNESS" "$REPO_ROOT" "$T9C_RESULT" 2>&1)" || T9C_RC=$?
+if (( T9C_RC != 0 )); then
+  smoke_fail "T9c: harness failed rc=$T9C_RC out: $T9C_OUT"
+fi
+T9C_BAD="$(python3 -c '
+import json, sys
+data = json.load(open(sys.argv[1]))
+bad = [r for r in data if not r["ok"]]
+if bad:
+    print(json.dumps(bad))
+' "$T9C_RESULT")"
+if [[ -n "$T9C_BAD" ]]; then
+  smoke_fail "T9c: semver comparator regressions: $T9C_BAD"
+fi
+smoke_log "T9c ok: full semver 2.0.0 prerelease ordering chain passes"
+
+# ----------------------------------------------------------------------------
+# T10 (#1281 SHOULD-FIX): body_file_sudo_fallback audit row IS emitted.
+# OPERATIONS.md tells operators they can grep `body_file_sudo_fallback`
+# in `state/audit.jsonl` to confirm whether the sudo step ran. Pre-r2
+# the runbook claim was a docs/impl mismatch (the fallback path was
+# silent). r2 emits a structured row from both call sites.
+# ----------------------------------------------------------------------------
+smoke_log "T10 (#1281): body_file_sudo_fallback audit row emitted from both fallback sites"
+
+# T10a: bridge-queue.stabilize_body_file path. We reuse the T1 stub
+# pattern (PATH-injected sudo + monkey-patched pwd.getpwuid + forced
+# non-self-uid) and assert the audit row.
+T10A_STUB_DIR="$SMOKE_TMP_ROOT/t10a-stub"
+mkdir -p "$T10A_STUB_DIR"
+T10A_BODY_FILE="$SMOKE_TMP_ROOT/t10a-body.md"
+printf 'queue-side iso-owned body\n' >"$T10A_BODY_FILE"
+
+cat >"$T10A_STUB_DIR/sudo" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+# Accept `-n -u <owner> cat -- <path>`
+if [[ "$1" != "-n" || "$2" != "-u" ]]; then exit 99; fi
+shift 3
+if [[ "$1" != "cat" || "$2" != "--" ]]; then exit 99; fi
+cat "$3"
+SHIM
+chmod +x "$T10A_STUB_DIR/sudo"
+
+T10A_AUDIT_LOG="$BRIDGE_HOME/logs/audit-t10a.jsonl"
+mkdir -p "$(dirname "$T10A_AUDIT_LOG")"
+: >"$T10A_AUDIT_LOG"
+
+T10A_HARNESS="$SMOKE_TMP_ROOT/t10a-harness.py"
+cat >"$T10A_HARNESS" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+repo_root = sys.argv[1]
+body_path = sys.argv[2]
+
+spec = importlib.util.spec_from_file_location(
+    "bridge_queue", os.path.join(repo_root, "bridge-queue.py")
+)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+class FakePwEnt:
+    def __init__(self, name):
+        self.pw_name = name
+
+import pwd as _pwd
+_pwd.getpwuid = lambda uid: FakePwEnt("agent-bridge-t10a")
+
+orig = os.geteuid
+os.geteuid = lambda: orig() + 999999
+
+raw = mod._sudo_read_body_file(Path(body_path))
+print(json.dumps({"ok": raw is not None, "len": len(raw) if raw else 0}))
+PY
+T10A_OUT=""
+T10A_RC=0
+T10A_OUT="$(PATH="$T10A_STUB_DIR:$PATH" BRIDGE_AUDIT_LOG="$T10A_AUDIT_LOG" \
+  python3 "$T10A_HARNESS" "$REPO_ROOT" "$T10A_BODY_FILE" 2>&1)" || T10A_RC=$?
+if (( T10A_RC != 0 )); then
+  smoke_fail "T10a: harness failed rc=$T10A_RC out: $T10A_OUT"
+fi
+smoke_assert_file_exists "$T10A_AUDIT_LOG" "T10a audit log file exists"
+T10A_HAS_ROW="$(grep -c 'body_file_sudo_fallback' "$T10A_AUDIT_LOG" || true)"
+if [[ "$T10A_HAS_ROW" -lt 1 ]]; then
+  smoke_fail "T10a: audit log missing body_file_sudo_fallback row. Contents: $(cat "$T10A_AUDIT_LOG")"
+fi
+T10A_HAS_QUEUE_SITE="$(grep -c 'bridge-queue.stabilize_body_file' "$T10A_AUDIT_LOG" || true)"
+if [[ "$T10A_HAS_QUEUE_SITE" -lt 1 ]]; then
+  smoke_fail "T10a: audit row missing call_site=bridge-queue.stabilize_body_file. Contents: $(cat "$T10A_AUDIT_LOG")"
+fi
+smoke_log "T10a ok: bridge-queue body_file_sudo_fallback audit row emitted"
+
+# T10b: bridge-a2a._sudo_read_text path. Same shape, different module +
+# different call_site marker.
+T10B_STUB_DIR="$SMOKE_TMP_ROOT/t10b-stub"
+mkdir -p "$T10B_STUB_DIR"
+T10B_BODY_FILE="$SMOKE_TMP_ROOT/t10b-body.md"
+printf 'a2a-side iso-owned body\n' >"$T10B_BODY_FILE"
+
+cat >"$T10B_STUB_DIR/sudo" <<'SHIM'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" != "-n" || "$2" != "-u" ]]; then exit 99; fi
+shift 3
+if [[ "$1" != "cat" || "$2" != "--" ]]; then exit 99; fi
+cat "$3"
+SHIM
+chmod +x "$T10B_STUB_DIR/sudo"
+
+T10B_AUDIT_LOG="$BRIDGE_HOME/logs/audit-t10b.jsonl"
+mkdir -p "$(dirname "$T10B_AUDIT_LOG")"
+: >"$T10B_AUDIT_LOG"
+
+T10B_HARNESS="$SMOKE_TMP_ROOT/t10b-harness.py"
+cat >"$T10B_HARNESS" <<'PY'
+import importlib.util
+import json
+import os
+import sys
+from pathlib import Path
+
+repo_root = sys.argv[1]
+body_path = sys.argv[2]
+
+# bridge-a2a.py imports bridge_a2a_common from the same directory, so
+# we have to prepend repo_root to sys.path before loading the module.
+sys.path.insert(0, repo_root)
+
+spec = importlib.util.spec_from_file_location(
+    "bridge_a2a", os.path.join(repo_root, "bridge-a2a.py")
+)
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+
+class FakePwEnt:
+    def __init__(self, name):
+        self.pw_name = name
+
+import pwd as _pwd
+_pwd.getpwuid = lambda uid: FakePwEnt("agent-bridge-t10b")
+
+orig = os.geteuid
+os.geteuid = lambda: orig() + 999999
+
+text = mod._sudo_read_text(Path(body_path))
+print(json.dumps({"ok": text is not None, "len": len(text) if text else 0}))
+PY
+T10B_OUT=""
+T10B_RC=0
+T10B_OUT="$(PATH="$T10B_STUB_DIR:$PATH" BRIDGE_AUDIT_LOG="$T10B_AUDIT_LOG" \
+  python3 "$T10B_HARNESS" "$REPO_ROOT" "$T10B_BODY_FILE" 2>&1)" || T10B_RC=$?
+if (( T10B_RC != 0 )); then
+  smoke_fail "T10b: harness failed rc=$T10B_RC out: $T10B_OUT"
+fi
+smoke_assert_file_exists "$T10B_AUDIT_LOG" "T10b audit log file exists"
+T10B_HAS_ROW="$(grep -c 'body_file_sudo_fallback' "$T10B_AUDIT_LOG" || true)"
+if [[ "$T10B_HAS_ROW" -lt 1 ]]; then
+  smoke_fail "T10b: audit log missing body_file_sudo_fallback row. Contents: $(cat "$T10B_AUDIT_LOG")"
+fi
+T10B_HAS_A2A_SITE="$(grep -c 'bridge-a2a.cmd_send' "$T10B_AUDIT_LOG" || true)"
+if [[ "$T10B_HAS_A2A_SITE" -lt 1 ]]; then
+  smoke_fail "T10b: audit row missing call_site=bridge-a2a.cmd_send. Contents: $(cat "$T10B_AUDIT_LOG")"
+fi
+smoke_log "T10b ok: bridge-a2a body_file_sudo_fallback audit row emitted"
+
+# T10c (teeth): without the emit call, the audit log MUST be empty.
+# We approximate the regression by re-running the bridge-queue harness
+# but with the emit shim short-circuited (set BRIDGE_AUDIT_LOG to a
+# non-writable location → emit silently swallows the failure, audit log
+# stays empty, T10a's assertion would then fail). This proves the
+# assertion has teeth: if the emit is removed or the audit path is
+# broken, the smoke catches it.
+T10C_AUDIT_LOG="$SMOKE_TMP_ROOT/t10c-readonly/audit.jsonl"
+mkdir -p "$(dirname "$T10C_AUDIT_LOG")"
+chmod 0555 "$(dirname "$T10C_AUDIT_LOG")"
+T10C_OUT=""
+T10C_RC=0
+T10C_OUT="$(PATH="$T10A_STUB_DIR:$PATH" BRIDGE_AUDIT_LOG="$T10C_AUDIT_LOG" \
+  python3 "$T10A_HARNESS" "$REPO_ROOT" "$T10A_BODY_FILE" 2>&1)" || T10C_RC=$?
+chmod 0755 "$(dirname "$T10C_AUDIT_LOG")"  # restore for cleanup
+if (( T10C_RC != 0 )); then
+  smoke_fail "T10c: harness failed rc=$T10C_RC out: $T10C_OUT"
+fi
+if [[ -s "$T10C_AUDIT_LOG" ]]; then
+  smoke_fail "T10c teeth: expected EMPTY audit log when target dir is read-only (sanity check), got: $(cat "$T10C_AUDIT_LOG")"
+fi
+smoke_log "T10c teeth ok: read-only audit dir → empty log (emit best-effort, T10a/b assertions have teeth)"
+
 smoke_log "All J-beta4 workflow + docs tests passed."

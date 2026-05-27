@@ -361,6 +361,79 @@ def is_ephemeral_body_path(path: Path) -> bool:
     return False
 
 
+def _audit_body_file_sudo_fallback(
+    body_path: Path,
+    owner: str,
+    success: bool,
+    rc: int | None,
+    call_site: str,
+) -> None:
+    """Emit a ``body_file_sudo_fallback`` audit row (Lane J r2 SHOULD-FIX).
+
+    OPERATIONS.md §"Iso v2 agent troubleshooting" promises operators
+    that the sudo-fallback path is observable via
+    ``grep body_file_sudo_fallback state/audit.jsonl``. Before this
+    commit the read path was silent; the runbook claim was a
+    docs/impl mismatch (codex r1 SHOULD-FIX on PR #1293). We emit
+    here so a follow-up "but did the fallback actually run?"
+    question has a structured answer.
+
+    Best-effort: any failure to emit (missing bridge-audit.py, missing
+    python interpreter, locked log file) is swallowed silently. The
+    caller path is not gated on audit success — surfacing the audit
+    write as an error would defeat the resilience the fallback is
+    trying to provide in the first place.
+    """
+    audit_path = (
+        os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+        or os.path.expanduser(os.path.join(
+            os.environ.get("BRIDGE_HOME", "").strip() or "~/.agent-bridge",
+            "logs",
+            "audit.jsonl",
+        ))
+    )
+    detail = {
+        "file_path": str(body_path),
+        "owner": owner,
+        "fallback_method": "sudo-read",
+        "success": success,
+        "rc": rc if rc is not None else "",
+        "call_site": call_site,
+    }
+    audit_script = Path(__file__).resolve().with_name("bridge-audit.py")
+    if not audit_script.is_file():
+        return
+    cmd = [
+        sys.executable,
+        str(audit_script),
+        "write",
+        "--file",
+        audit_path,
+        "--actor",
+        "bridge-queue",
+        "--action",
+        "body_file_sudo_fallback",
+        "--target",
+        str(body_path),
+        "--detail-json",
+        json.dumps(detail, ensure_ascii=True, sort_keys=True),
+    ]
+    try:
+        Path(audit_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    try:
+        subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _sudo_read_body_file(path: Path) -> bytes | None:
     """v0.15.0-beta4 Lane J (#1280): sudo-fallback body-file reader.
 
@@ -420,9 +493,20 @@ def _sudo_read_body_file(path: Path) -> bytes | None:
             timeout=10,
         )
     except (OSError, subprocess.TimeoutExpired):
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=None, call_site="bridge-queue.stabilize_body_file",
+        )
         return None
     if result.returncode != 0:
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=result.returncode,
+            call_site="bridge-queue.stabilize_body_file",
+        )
         return None
+    _audit_body_file_sudo_fallback(
+        path, owner, success=True, rc=0,
+        call_site="bridge-queue.stabilize_body_file",
+    )
     return result.stdout
 
 
