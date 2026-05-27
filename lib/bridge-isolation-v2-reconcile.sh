@@ -766,19 +766,26 @@ _bridge_iso_reconcile_row_agent_home_contract() {
     return 0
   fi
 
-  # Refuse on symlinks BEFORE any mutation. This duplicates the helper's
-  # guard so check-mode never accidentally widens an attacker-planted
-  # symlink.
-  if [[ -L "$path" ]]; then
-    _bridge_iso_reconcile_emit_row "$row_name" \
-      "$BRIDGE_ISO_RECONCILE_STATUS_FAILED" "$path" \
-      "$owner_resolved:$group_resolved $dir_mode" "(symlink rejected)" \
-      "$notes (refuses symlink at path; investigate before retry)"
-    return 1
-  fi
+  # #1298 Gap A r2 — symlink refusal lives in the helper (apply-mode) and
+  # in the check-mode branch below. We DO NOT preempt here for apply mode
+  # because the helper now emits `error` for symlink targets and the
+  # `denied|error` arm degrades them. Preempting and emitting `failed`
+  # would short-circuit that classification and re-introduce the drift
+  # signal the brief explicitly forbids.
 
   # check mode — stat + compare, no helper call.
   if [[ "$mode" == "check" ]]; then
+    # Refuse on symlinks in check mode so we never silently widen an
+    # attacker-planted symlink via a stat probe. Surfaces as degraded
+    # (probe failure, NOT drift) — same classification the helper-side
+    # emits for apply mode.
+    if [[ -L "$path" ]]; then
+      _bridge_iso_reconcile_emit_row "$row_name" \
+        "$BRIDGE_ISO_RECONCILE_STATUS_DEGRADED" "$path" \
+        "$owner_resolved:$group_resolved $dir_mode" "(symlink rejected)" \
+        "$notes (refuses symlink at path; investigate before retry — NOT drift)"
+      return 0
+    fi
     if [[ ! -d "$path" ]]; then
       _bridge_iso_reconcile_emit_row "$row_name" \
         "$BRIDGE_ISO_RECONCILE_STATUS_MISSING" "$path" \
@@ -900,6 +907,21 @@ _bridge_iso_reconcile_row_agent_home_contract() {
         "$path" "$owner_resolved:$group_resolved $dir_mode" \
         "(helper status: missing)" \
         "$notes (helper rc=$helper_rc; path absent — re-run apply after addressing prerequisites)"
+      return 1
+      ;;
+    failed)
+      # #1298 Gap A r2 — `failed` is now reserved for legitimate apply-
+      # time failures (mkdir / chown / chmod refused by the kernel even
+      # with root privileges). This IS drift the operator should see:
+      # the helper tried to normalize the path and the operation itself
+      # failed. Surface as failed/rc=1. Malformed-state probe failures
+      # (symlink target, non-directory target) emit `error` in r2 and
+      # land in the `denied|error` arm above.
+      _bridge_iso_reconcile_emit_row "$row_name" \
+        "$BRIDGE_ISO_RECONCILE_STATUS_FAILED" \
+        "$path" "$owner_resolved:$group_resolved $dir_mode" \
+        "${_howner_grp:-?} ${_hmode:-?} (helper status: failed — apply failure)" \
+        "$notes (helper rc=$helper_rc; mkdir/chown/chmod refused — investigate underlying fs / sudoers / kernel state)"
       return 1
       ;;
     *)

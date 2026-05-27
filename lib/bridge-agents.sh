@@ -4107,7 +4107,13 @@ bridge_linux_normalize_isolated_home_contract() {
   local -a _bad_targets=()
   for target in "$target_home" "$target_claude" "$target_plugins" "$target_session_env"; do
     if bridge_linux_sudo_root test -L "$target" 2>/dev/null; then
-      printf '%s\tfailed\t-\t-\n' "$target"
+      # #1298 Gap A r2 — symlink target is a malformed-state probe failure
+      # (anti-race / anti-redirect refusal), NOT filesystem drift the
+      # operator can repair by re-running apply. Emit `error` so the
+      # reconciler's denied|error arm classifies as degraded/rc=0.
+      # Operator remediation: stop the agent, inspect the symlink, then
+      # remove it before retrying — not a re-apply.
+      printf '%s\terror\t-\t-\n' "$target"
       bridge_warn "normalize_isolated_home_contract: refusing — '$target' is a symlink (anti-race / anti-redirect)"
       overall_rc=1
       _bad_targets+=("$target")
@@ -4119,7 +4125,10 @@ bridge_linux_normalize_isolated_home_contract() {
     if bridge_linux_sudo_root test -e "$target" 2>/dev/null \
         && ! bridge_linux_sudo_root test -d "$target" 2>/dev/null \
         && ! bridge_linux_sudo_root test -L "$target" 2>/dev/null; then
-      printf '%s\tfailed\t-\t-\n' "$target"
+      # #1298 Gap A r2 — non-directory target is also a malformed-state
+      # probe failure; emit `error` (same classification as symlink) so
+      # the reconciler degrades rather than reports drift.
+      printf '%s\terror\t-\t-\n' "$target"
       bridge_warn "normalize_isolated_home_contract: refusing — '$target' exists but is not a directory"
       overall_rc=1
       _bad_targets+=("$target")

@@ -475,5 +475,290 @@ fi
 
 smoke_log "T7 PASS — helper carries probe-failure emitter on tmux-alive path"
 
+# ---------------------------------------------------------------------
+# T8 (r2): actual symlink fixture — helper emits `error` (NOT `failed`)
+# for symlink target, reconciler classifies degraded + rc=0.
+#
+# r1 BLOCKING (codex): the malformed-state branches at
+# lib/bridge-agents.sh:4004-4018 still emitted `failed` after the
+# beta5 r1 fix. The PR's T2 sub-tests only stubbed the helper's status
+# output (controlled `denied|error|missing|ok`), so the broken `failed`
+# branch on a real symlink target never got executed. T8 closes the gap
+# by creating an actual on-disk symlink and running the helper against
+# it through a minimal-stub harness.
+# ---------------------------------------------------------------------
+smoke_log "T8 (r2): real symlink fixture -> helper emits error, reconciler -> degraded/rc=0"
+
+# Build the on-disk fixture. We make $T8_USER_HOME a symlink pointing to
+# a non-existent target. The helper's anti-redirect guard inspects only
+# the symlink-ness of the path (not the target), so an absent target is
+# sufficient to trigger the symlink branch.
+T8_FIXTURE_ROOT="$SMOKE_TMP_ROOT/t8-fixture"
+mkdir -p "$T8_FIXTURE_ROOT"
+T8_USER_HOME="$T8_FIXTURE_ROOT/agent-bridge-test-agent"
+ln -s "$T8_FIXTURE_ROOT/elsewhere" "$T8_USER_HOME"
+
+# Build the helper harness. We:
+#   - stub bridge_linux_sudo_root to run "$@" directly (so test -L
+#     against the fixture reflects the real on-disk state),
+#   - stub tmux-alive to NOT fire (return 1) so we reach the iteration
+#     loop instead of the tmux early-return,
+#   - extract just the helper function from bridge-agents.sh.
+T8_DRIVER="$SMOKE_TMP_ROOT/t8-driver.sh"
+: >"$T8_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
+  printf '%s\n' 'bridge_host_platform() { printf "Linux\n"; }'
+  printf '%s\n' 'bridge_isolation_v2_agent_group_name() { printf "ab-agent-%s\n" "$1"; }'
+  # Session NOT alive -> skip tmux early return, reach the loop.
+  printf '%s\n' 'bridge_agent_session() { printf ""; }'
+  printf '%s\n' 'bridge_tmux_session_exists() { return 1; }'
+  # bridge_linux_sudo_root must run the command as the controller (no
+  # actual sudo) so test -L sees the real fs we just built.
+  printf '%s\n' 'bridge_linux_sudo_root() { "$@"; }'
+  # Anchor must contain the fixture root so the helper accepts user_home.
+  printf '%s\n' "BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT=\"$T8_FIXTURE_ROOT\""
+  printf '%s\n' 'export BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT'
+  printf '%s\n' "source \"$SMOKE_TMP_ROOT/helper-extract.sh\""
+  printf '%s\n' "bridge_linux_normalize_isolated_home_contract test-agent test-os-user \"$T8_USER_HOME\"; rc=\$?"
+  printf '%s\n' 'printf "rc=%s\n" "$rc"'
+} >>"$T8_DRIVER"
+chmod +x "$T8_DRIVER"
+
+T8_OUT="$("$T1_BASH" "$T8_DRIVER" 2>/dev/null || true)"
+T8_RC="$(printf '%s\n' "$T8_OUT" | awk -F= '/^rc=/ {print $2}')"
+
+if [[ "$T8_RC" != "1" ]]; then
+  smoke_fail "T8: helper rc=$T8_RC (expected 1 for malformed symlink target). Out: $T8_OUT"
+fi
+
+# The fixture path MUST appear with status=error, NOT failed.
+if ! printf '%s\n' "$T8_OUT" | grep -Fq "$(printf '%s\terror\t-\t-' "$T8_USER_HOME")"; then
+  smoke_fail "T8: expected helper line '$T8_USER_HOME<TAB>error<TAB>-<TAB>-' not found. Out: $T8_OUT"
+fi
+
+# And explicitly verify the malformed-state branch did NOT regress to `failed`.
+if printf '%s\n' "$T8_OUT" | grep -Fq "$(printf '%s\tfailed' "$T8_USER_HOME")"; then
+  smoke_fail "T8: helper regressed to emitting 'failed' for symlink target (codex r1 BLOCKING). Out: $T8_OUT"
+fi
+
+smoke_log "T8a PASS — helper emits 'error' for real symlink target"
+
+# Now exercise the row dispatcher against the same fixture path with the
+# helper stubbed to emit `error` (matching what T8a just proved the real
+# helper does). Assert: row dispatcher -> status=degraded + rc=0.
+T8B_DRIVER="$(build_t2_driver error "$T8_USER_HOME")"
+T8B_OUT="$("$T1_BASH" "$T8B_DRIVER" 2>&1 || true)"
+if ! printf '%s\n' "$T8B_OUT" | grep -Fq "status=degraded"; then
+  smoke_fail "T8b: reconciler did not classify error->degraded for symlink-derived path. Out: $T8B_OUT"
+fi
+T8B_RC="$(printf '%s\n' "$T8B_OUT" | awk -F= '/^rc=/ {print $2}')"
+[[ "$T8B_RC" == "0" ]] || smoke_fail "T8b: error -> degraded should return rc=0 (NOT drift). rc=$T8B_RC. Out: $T8B_OUT"
+
+smoke_log "T8b PASS — reconciler classifies error (symlink-derived) -> degraded/rc=0"
+
+# T8t teeth — revert the helper's symlink branch to emit `failed` and
+# confirm the reconciler then reports drift (failed/rc=1). This proves
+# the helper-side fix is the required source of the contract change;
+# without it, the reconciler's denied|error arm never fires for symlinks.
+T8T_DRIVER="$(build_t2_driver failed "$T8_USER_HOME")"
+T8T_OUT="$("$T1_BASH" "$T8T_DRIVER" 2>&1 || true)"
+if ! printf '%s\n' "$T8T_OUT" | grep -Fq "status=failed"; then
+  smoke_fail "T8t (teeth): reverted-helper simulation should result in failed row. Out: $T8T_OUT"
+fi
+T8T_RC="$(printf '%s\n' "$T8T_OUT" | awk -F= '/^rc=/ {print $2}')"
+[[ "$T8T_RC" == "1" ]] || smoke_fail "T8t (teeth): failed row must return rc=1 (drift). rc=$T8T_RC. Out: $T8T_OUT"
+
+smoke_log "T8t PASS — teeth: 'failed' helper status correctly reports drift (teeth fire if helper regresses)"
+
+# ---------------------------------------------------------------------
+# T9 (r2): actual regular-file fixture — helper emits `error` (NOT
+# `failed`) for non-directory target, reconciler classifies degraded + rc=0.
+#
+# Same r1 BLOCKING gap as T8: the `-e && ! -d` non-directory branch at
+# lib/bridge-agents.sh:4014-4018 emitted `failed`. The pre-r2 T2 stubs
+# never exercised the actual `-e && ! -d` code path.
+# ---------------------------------------------------------------------
+smoke_log "T9 (r2): real regular-file fixture -> helper emits error, reconciler -> degraded/rc=0"
+
+T9_FIXTURE_ROOT="$SMOKE_TMP_ROOT/t9-fixture"
+mkdir -p "$T9_FIXTURE_ROOT"
+T9_USER_HOME="$T9_FIXTURE_ROOT/agent-bridge-test-agent"
+# Touch as a regular file, NOT a directory.
+: >"$T9_USER_HOME"
+
+T9_DRIVER="$SMOKE_TMP_ROOT/t9-driver.sh"
+: >"$T9_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' 'bridge_warn() { printf "[warn] %s\n" "$*" >&2; }'
+  printf '%s\n' 'bridge_host_platform() { printf "Linux\n"; }'
+  printf '%s\n' 'bridge_isolation_v2_agent_group_name() { printf "ab-agent-%s\n" "$1"; }'
+  printf '%s\n' 'bridge_agent_session() { printf ""; }'
+  printf '%s\n' 'bridge_tmux_session_exists() { return 1; }'
+  printf '%s\n' 'bridge_linux_sudo_root() { "$@"; }'
+  printf '%s\n' "BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT=\"$T9_FIXTURE_ROOT\""
+  printf '%s\n' 'export BRIDGE_LINUX_ISOLATED_USER_HOME_ROOT'
+  printf '%s\n' "source \"$SMOKE_TMP_ROOT/helper-extract.sh\""
+  printf '%s\n' "bridge_linux_normalize_isolated_home_contract test-agent test-os-user \"$T9_USER_HOME\"; rc=\$?"
+  printf '%s\n' 'printf "rc=%s\n" "$rc"'
+} >>"$T9_DRIVER"
+chmod +x "$T9_DRIVER"
+
+T9_OUT="$("$T1_BASH" "$T9_DRIVER" 2>/dev/null || true)"
+T9_RC="$(printf '%s\n' "$T9_OUT" | awk -F= '/^rc=/ {print $2}')"
+
+if [[ "$T9_RC" != "1" ]]; then
+  smoke_fail "T9: helper rc=$T9_RC (expected 1 for malformed non-directory target). Out: $T9_OUT"
+fi
+
+if ! printf '%s\n' "$T9_OUT" | grep -Fq "$(printf '%s\terror\t-\t-' "$T9_USER_HOME")"; then
+  smoke_fail "T9: expected helper line '$T9_USER_HOME<TAB>error<TAB>-<TAB>-' not found. Out: $T9_OUT"
+fi
+
+if printf '%s\n' "$T9_OUT" | grep -Fq "$(printf '%s\tfailed' "$T9_USER_HOME")"; then
+  smoke_fail "T9: helper regressed to emitting 'failed' for non-directory target (codex r1 BLOCKING). Out: $T9_OUT"
+fi
+
+smoke_log "T9a PASS — helper emits 'error' for real regular-file (non-directory) target"
+
+# T9b — reconciler must classify error -> degraded + rc=0 for the
+# regular-file-derived path. Same dispatcher as T8b; covered by T2b but
+# repeated here with the actual fixture path so a path-shape regression
+# at the dispatcher's row-emit layer is also caught.
+T9B_DRIVER="$(build_t2_driver error "$T9_USER_HOME")"
+T9B_OUT="$("$T1_BASH" "$T9B_DRIVER" 2>&1 || true)"
+if ! printf '%s\n' "$T9B_OUT" | grep -Fq "status=degraded"; then
+  smoke_fail "T9b: reconciler did not classify error->degraded for non-directory-derived path. Out: $T9B_OUT"
+fi
+T9B_RC="$(printf '%s\n' "$T9B_OUT" | awk -F= '/^rc=/ {print $2}')"
+[[ "$T9B_RC" == "0" ]] || smoke_fail "T9b: error -> degraded should return rc=0. rc=$T9B_RC. Out: $T9B_OUT"
+
+smoke_log "T9b PASS — reconciler classifies error (non-dir-derived) -> degraded/rc=0"
+
+# T9t teeth — revert the reconciler's symlink/non-dir preempt removal:
+# simulate the OLD reconciler that preempted with FAILED+rc=1 before
+# even calling the helper. We do this by building a custom row
+# dispatcher harness that re-introduces the preempt block on the actual
+# symlink fixture from T8 (the preempt was symlink-only) and asserting
+# the resurrected preempt fails the smoke (proves the preempt removal
+# is the safety net, not just the helper-side classification).
+T9T_DRIVER="$SMOKE_TMP_ROOT/t9t-driver.sh"
+: >"$T9T_DRIVER"
+{
+  printf '%s\n' '#!/usr/bin/env bash'
+  printf '%s\n' 'set -uo pipefail'
+  printf '%s\n' 'bridge_warn() { :; }'
+  printf '%s\n' '_bridge_iso_reconcile_log() { :; }'
+  printf '%s\n' '_bridge_iso_reconcile_path_is_protected() { return 1; }'
+  printf '%s\n' 'bridge_agent_os_user() { printf "test-os-user\n"; }'
+  printf '%s\n' 'bridge_agent_linux_user_home() { printf "/home/test-os-user\n"; }'
+  printf '%s\n' '_bridge_iso_reconcile_stat_mode() { printf "2750\n"; }'
+  printf '%s\n' '_bridge_iso_reconcile_stat_owner_group() { printf "test-os-user:ab-agent-test-agent\n"; }'
+  printf '%s\n' '_bridge_iso_reconcile_normalize_mode() { printf "%s\n" "${1:-0}"; }'
+  printf '%s\n' '_bridge_isolation_v2_run_root_or_sudo() { "$@"; }'
+  printf '%s\n' 'BRIDGE_ISO_RECONCILE_STATUS_OK="ok"'
+  printf '%s\n' 'BRIDGE_ISO_RECONCILE_STATUS_CHANGED="changed"'
+  printf '%s\n' 'BRIDGE_ISO_RECONCILE_STATUS_SKIPPED="skipped"'
+  printf '%s\n' 'BRIDGE_ISO_RECONCILE_STATUS_MISSING="missing"'
+  printf '%s\n' 'BRIDGE_ISO_RECONCILE_STATUS_MISMATCH="mismatch"'
+  printf '%s\n' 'BRIDGE_ISO_RECONCILE_STATUS_DEGRADED="degraded"'
+  printf '%s\n' 'BRIDGE_ISO_RECONCILE_STATUS_FAILED="failed"'
+  printf '%s\n' '_bridge_iso_reconcile_emit_row() {'
+  printf '%s\n' '  printf "row=%s status=%s path=%s\n" "$1" "$2" "$3"'
+  printf '%s\n' '}'
+  # Resurrected preempt — the OLD code from r1 that the r2 fix removed.
+  # If this block fires (which it would on a real symlink), the row
+  # comes out as FAILED/rc=1 -> teeth fire (smoke fails on the assertion
+  # that the path was reported as degraded).
+  printf '%s\n' '_bridge_iso_reconcile_row_agent_home_contract() {'
+  printf '%s\n' '  local mode="$1" row_name="$2" path="$3"; shift 3 || true'
+  printf '%s\n' '  local owner_resolved="$1" group_resolved="$2" dir_mode="$3" notes="$4"'
+  printf '%s\n' '  if [[ -L "$path" ]]; then'
+  printf '%s\n' '    _bridge_iso_reconcile_emit_row "$row_name" failed "$path" "" "" ""'
+  printf '%s\n' '    return 1'
+  printf '%s\n' '  fi'
+  printf '%s\n' '  _bridge_iso_reconcile_emit_row "$row_name" ok "$path" "" "" ""'
+  printf '%s\n' '  return 0'
+  printf '%s\n' '}'
+  # Run against the real T8 symlink fixture.
+  printf '%s\n' "_bridge_iso_reconcile_row_agent_home_contract apply agent-home-contract-home \"$T8_USER_HOME\" test-agent test-os-user ab-agent-test-agent 2750 test-notes; rc=\$?"
+  printf '%s\n' 'printf "rc=%s\n" "$rc"'
+} >>"$T9T_DRIVER"
+chmod +x "$T9T_DRIVER"
+
+T9T_OUT="$("$T1_BASH" "$T9T_DRIVER" 2>&1 || true)"
+# Teeth must fire — the resurrected preempt should emit failed/rc=1.
+# If this teeth assertion DOESN'T see failed, the teeth themselves are
+# broken (the smoke would then pass even if the real production code
+# regressed). Verify the simulated revert behaves as the OLD r1 code did.
+if ! printf '%s\n' "$T9T_OUT" | grep -Fq "status=failed"; then
+  smoke_fail "T9t (teeth): resurrected preempt should emit failed (proves the preempt removal is what protects production). Out: $T9T_OUT"
+fi
+T9T_RC="$(printf '%s\n' "$T9T_OUT" | awk -F= '/^rc=/ {print $2}')"
+[[ "$T9T_RC" == "1" ]] || smoke_fail "T9t (teeth): resurrected preempt must return rc=1. rc=$T9T_RC. Out: $T9T_OUT"
+
+smoke_log "T9t PASS — teeth: resurrected preempt fires drift signal (confirms production preempt-removal is necessary)"
+
+# Final cross-check: the actual production reconciler MUST NOT carry
+# the symlink preempt anymore. Static-grep the source for any
+# `if [[ -L "$path" ]]` block that emits FAILED in apply mode. The
+# check-mode symlink guard at the top of the check branch is allowed
+# (it emits DEGRADED, not FAILED).
+smoke_log "T9c (static): production reconciler does not carry an apply-mode symlink->FAILED preempt"
+
+if awk '/^_bridge_iso_reconcile_row_agent_home_contract\(\) \{/,/^\}/' "$RECONCILE_LIB" \
+      | awk '/if \[\[ -L "\$path" \]\]; then/,/return 1/' \
+      | grep -Fq 'BRIDGE_ISO_RECONCILE_STATUS_FAILED'; then
+  smoke_fail "T9c (static): production reconciler still carries a symlink->FAILED preempt. The r2 fix must remove it (helper-side error classification is the single source of truth)."
+fi
+
+smoke_log "T9c PASS — production reconciler symlink branch never emits FAILED"
+
+# ---------------------------------------------------------------------
+# T10 (r2 static): production helper does not emit `failed` for the
+# malformed-state branches (symlink target / non-directory target).
+# The malformed-state branches MUST emit `error` so the reconciler's
+# `denied|error` arm degrades them.
+# ---------------------------------------------------------------------
+smoke_log "T10 (static r2): production helper emits 'error' (not 'failed') for symlink + non-dir targets"
+
+# Pin the exact symlink-branch emit line.
+if ! awk '/refusing — '"'"'\$target'"'"' is a symlink/{flag=1; next} flag && /printf.*\\t.*\\t-\\t-\\n/{print; exit}' "$AGENTS_LIB" \
+      | grep -Fq 'printf '\''%s\terror\t-\t-\n'\'''; then
+  # Awk match is finicky across bash quoting. Fall back to a simpler
+  # window check that confirms the right printf shape lives near the
+  # symlink bridge_warn anchor.
+  if ! awk '/is a symlink \(anti-race/,/anti-redirect\)/' "$AGENTS_LIB" >/dev/null 2>&1; then
+    smoke_fail "T10: cannot locate symlink-branch anchor in $AGENTS_LIB"
+  fi
+  # Two-line window before the bridge_warn — that's where the printf lives.
+  if ! grep -B2 "refusing — '\$target' is a symlink" "$AGENTS_LIB" \
+        | grep -Fq "printf '%s\\terror\\t-\\t-\\n'"; then
+    smoke_fail "T10: symlink branch in $AGENTS_LIB must emit 'error' status (codex r1 BLOCKING)"
+  fi
+fi
+
+# Pin the exact non-directory branch emit line.
+if ! grep -B2 "refusing — '\$target' exists but is not a directory" "$AGENTS_LIB" \
+      | grep -Fq "printf '%s\\terror\\t-\\t-\\n'"; then
+  smoke_fail "T10: non-directory branch in $AGENTS_LIB must emit 'error' status (codex r1 BLOCKING)"
+fi
+
+# And — explicitly — neither branch must carry a `\tfailed\t-\t-` printf.
+if grep -B2 "refusing — '\$target' is a symlink" "$AGENTS_LIB" \
+      | grep -Fq "printf '%s\\tfailed\\t-\\t-\\n'"; then
+  smoke_fail "T10: symlink branch in $AGENTS_LIB still emits 'failed' (must be 'error' per r2)"
+fi
+if grep -B2 "refusing — '\$target' exists but is not a directory" "$AGENTS_LIB" \
+      | grep -Fq "printf '%s\\tfailed\\t-\\t-\\n'"; then
+  smoke_fail "T10: non-directory branch in $AGENTS_LIB still emits 'failed' (must be 'error' per r2)"
+fi
+
+smoke_log "T10 PASS — production helper emits 'error' for both malformed-state branches"
+
 smoke_log "$SMOKE_NAME — all tests PASS"
 exit 0
