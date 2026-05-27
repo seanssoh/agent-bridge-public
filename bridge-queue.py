@@ -361,6 +361,168 @@ def is_ephemeral_body_path(path: Path) -> bool:
     return False
 
 
+def _audit_body_file_sudo_fallback(
+    body_path: Path,
+    iso_uid: str,
+    success: bool,
+    rc: int | None,
+    call_site: str,
+    exception: BaseException | None = None,
+) -> None:
+    """Emit a ``body_file_sudo_fallback`` audit row (Lane J r2 SHOULD-FIX
+    + r3 schema alignment).
+
+    OPERATIONS.md §"Iso v2 agent troubleshooting" promises operators
+    that the sudo-fallback path is observable via
+    ``grep body_file_sudo_fallback state/audit.jsonl``. Before this
+    commit the read path was silent; the runbook claim was a
+    docs/impl mismatch (codex r1 SHOULD-FIX on PR #1293). We emit
+    here so a follow-up "but did the fallback actually run?"
+    question has a structured answer.
+
+    Lane J r3 (codex r2 SHOULD-FIX): align the row schema with the
+    brief — the per-agent OS user field is named ``iso_uid`` (not
+    ``owner``) and exception branches log ``exception`` +
+    ``exception_type`` so the operator sees WHY the fallback failed,
+    not just an empty ``rc``.
+
+    Best-effort: any failure to emit (missing bridge-audit.py, missing
+    python interpreter, locked log file) is swallowed silently. The
+    caller path is not gated on audit success — surfacing the audit
+    write as an error would defeat the resilience the fallback is
+    trying to provide in the first place.
+    """
+    audit_path = (
+        os.environ.get("BRIDGE_AUDIT_LOG", "").strip()
+        or os.path.expanduser(os.path.join(
+            os.environ.get("BRIDGE_HOME", "").strip() or "~/.agent-bridge",
+            "logs",
+            "audit.jsonl",
+        ))
+    )
+    detail = {
+        "file_path": str(body_path),
+        "iso_uid": iso_uid,
+        "fallback_method": "sudo-read",
+        "success": success,
+        "rc": rc if rc is not None else "",
+        "call_site": call_site,
+    }
+    if exception is not None:
+        detail["exception"] = str(exception)
+        detail["exception_type"] = type(exception).__name__
+    audit_script = Path(__file__).resolve().with_name("bridge-audit.py")
+    if not audit_script.is_file():
+        return
+    cmd = [
+        sys.executable,
+        str(audit_script),
+        "write",
+        "--file",
+        audit_path,
+        "--actor",
+        "bridge-queue",
+        "--action",
+        "body_file_sudo_fallback",
+        "--target",
+        str(body_path),
+        "--detail-json",
+        json.dumps(detail, ensure_ascii=True, sort_keys=True),
+    ]
+    try:
+        Path(audit_path).expanduser().parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    try:
+        subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _sudo_read_body_file(path: Path) -> bytes | None:
+    """v0.15.0-beta4 Lane J (#1280): sudo-fallback body-file reader.
+
+    On iso v2 hosts the body file may be owned by an isolated UID
+    (``agent-bridge-<a>``, mode 0660 ``ab-agent-<a>``) while the
+    controller's bridge-queue.py process runs as the controller UID
+    without group membership. Direct ``source.read_bytes()`` then
+    raises ``PermissionError``. The pre-existing controller<->iso
+    boundary is ``sudo -n -u <owner> cat <path>`` (see
+    ``lib/bridge-isolation-helpers.sh``): the controller has
+    passwordless sudo to drop to ``agent-bridge-*`` for read-only
+    helper ops on iso v2 hosts.
+
+    Returns the file bytes on success, ``None`` on any failure
+    (sudo missing, file owner not in the ``agent-bridge-*`` namespace,
+    stat refuses, subprocess errors). Caller falls back to the original
+    ``PermissionError`` surface so the operator sees a clear failure
+    rather than a silent empty body.
+    """
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    try:
+        import pwd as _pwd  # POSIX only; not present on Windows
+        ent = _pwd.getpwuid(st.st_uid)
+    except (KeyError, ImportError, OSError):
+        return None
+    owner = ent.pw_name
+    # Only attempt the fallback when the owner is an isolated agent UID.
+    # The prefix is configurable via BRIDGE_AGENT_OS_USER_PREFIX but
+    # defaults to ``agent-bridge-`` everywhere else in the codebase.
+    prefix = os.environ.get("BRIDGE_AGENT_OS_USER_PREFIX", "agent-bridge-")
+    if not owner.startswith(prefix):
+        return None
+    # Refuse to attempt sudo when we already are that UID — direct read
+    # should have worked; if it didn't, sudo will not save us.
+    try:
+        if os.geteuid() == st.st_uid:
+            return None
+    except OSError:
+        return None
+    # Resolve sudo via PATH first so smoke harnesses can stub the binary
+    # without permission to write under /usr/bin. Falls back to the
+    # canonical /usr/bin/sudo when PATH lookup fails (e.g. cron context
+    # with a minimal PATH).
+    import shutil
+    sudo_bin = shutil.which("sudo") or "/usr/bin/sudo"
+    if not Path(sudo_bin).is_file():
+        return None
+    try:
+        result = subprocess.run(
+            [sudo_bin, "-n", "-u", owner, "cat", "--", str(path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=None,
+            call_site="bridge-queue.stabilize_body_file",
+            exception=exc,
+        )
+        return None
+    if result.returncode != 0:
+        _audit_body_file_sudo_fallback(
+            path, owner, success=False, rc=result.returncode,
+            call_site="bridge-queue.stabilize_body_file",
+        )
+        return None
+    _audit_body_file_sudo_fallback(
+        path, owner, success=True, rc=0,
+        call_site="bridge-queue.stabilize_body_file",
+    )
+    return result.stdout
+
+
 def stabilize_body_file(original: str | None) -> tuple[str | None, str | None]:
     if not original:
         return None, None
@@ -370,6 +532,20 @@ def stabilize_body_file(original: str | None) -> tuple[str | None, str | None]:
         raw = source.read_bytes()
     except FileNotFoundError as exc:
         raise SystemExit(f"body file disappeared before read: {original}") from exc
+    except PermissionError as exc:
+        # Issue #1280 (v0.15.0-beta4 Lane J): iso UID-owned body file
+        # at mode 0660 cannot be read directly by the controller
+        # because group membership is not enough on some POSIX hosts
+        # (the controller UID is in ``ab-agent-<a>`` for some agents
+        # but not all). Try the sudo-as-owner fallback before failing.
+        fallback = _sudo_read_body_file(source)
+        if fallback is None:
+            raise SystemExit(
+                f"failed to read body file {original}: {exc} "
+                f"(iso UID may own this file; chmod 0644 or run "
+                f"`sudo -u <owner> cat {original}` to verify access)"
+            ) from exc
+        raw = fallback
     except OSError as exc:
         raise SystemExit(f"failed to read body file {original}: {exc}") from exc
 

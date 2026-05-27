@@ -2529,7 +2529,29 @@ process_release_monitor() {
   alert_row="$(bridge_with_timeout 5 release_alert_parse python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" release-alert-parse "$monitor_json")"
 
   bridge_note_release_poll
-  [[ -n "$alert_row" ]] || return 1
+  if [[ -z "$alert_row" ]]; then
+    # Issue #1267 (v0.15.0-beta4 Lane J): when the monitor returns no
+    # alert AND the installed version is ahead of (or equal to) the
+    # latest stable, emit a structured `release_notification_downgrade_skip`
+    # audit row so operators can confirm via the audit log that the
+    # downgrade prompt was intentionally suppressed. The
+    # `release-downgrade-classify` helper inspects the monitor payload
+    # and returns one row when the suppression matches (installed_core
+    # >= latest), empty otherwise. Failure to classify is non-fatal —
+    # the original `return 1` path is preserved.
+    local _downgrade_row=""
+    _downgrade_row="$(bridge_with_timeout 5 release_downgrade_classify python3 "$SCRIPT_DIR/bridge-daemon-helpers.py" release-downgrade-classify "$monitor_json" 2>/dev/null || true)"
+    if [[ -n "$_downgrade_row" ]]; then
+      local _dg_installed="" _dg_latest=""
+      IFS=$'\t' read -r _dg_installed _dg_latest <<<"$_downgrade_row"
+      if [[ -n "$_dg_installed" && -n "$_dg_latest" ]]; then
+        bridge_audit_log daemon release_notification_downgrade_skip "$admin_agent" \
+          --detail installed="$_dg_installed" \
+          --detail latest="$_dg_latest"
+      fi
+    fi
+    return 1
+  fi
   IFS=$'\t' read -r tag version release_name published_at release_url <<<"$alert_row"
   [[ -n "$tag" ]] || return 1
 

@@ -98,6 +98,48 @@ machine-local 값은 `agent-roster.local.sh` 같은 local runtime 쪽에 둔다.
 이 프로젝트에서 수정해야 하는 대상은 대체로 tracked script, tracked docs,
 tracked templates다.
 
+### 3.1 Working with isolated agents (iso v2)
+
+Linux 호스트에서 linux-user 격리(v0.8.0+ iso v2 스택)가 켜진 에이전트는
+전용 OS user `agent-bridge-<a>` + primary group `ab-agent-<a>`로 동작한다.
+컨트롤러(운영자 shell)는 의도적으로 그 그룹의 member가 아니다 — 그 경계가
+agent 간 자격증명/runtime 분리를 보장한다. 대신 "shared-mode 에이전트처럼
+다뤘다가 permission denied"하는 함정이 몇 가지 있다. iso 에이전트와 작업할
+때는 다음 규칙을 기억하라.
+
+- **iso UID 내부에서 read 불가한 경로.** 격리 에이전트는 컨트롤러의
+  `~/.agent-bridge/state/active-roster.md`, `HEARTBEAT.md`, 다른 에이전트의
+  home, 다른 iso UID의 runtime 파일을 직접 read 못 한다. CLAUDE.md/handover의
+  "active-roster.md를 참조해서…" 가이드는 bridge CLI verb(`agb agent list`,
+  `agb status`)를 통해야 한다.
+- **shared 파일의 권한 dance.** Cross-class state 파일(per-agent metadata,
+  shared marketplaces)은 controller-published 패턴이다: 컨트롤러가 root로
+  쓰고 `chgrp -h ab-agent-<a>`, mode 2770 dir / 0660 file로 publish.
+  Controller→iso 경계의 read/write는 `bridge_iso_run` /
+  `agent-bridge iso-run` helper 한 곳을 거쳐야 한다(KNOWN_ISSUES.md
+  §"iso v2 boundary"). 컨트롤러 코드가 iso UID 소유 path를 직접
+  touch하지 말 것.
+- **Body file도 같은 경계를 통과한다.** iso UID가 mode 0660 + owner
+  `agent-bridge-<a>`로 쓴 body file은 컨트롤러 UID가 `ab-agent-<a>`의
+  member가 아닌 한 직접 read 못 한다. v0.15.0-beta4 부터
+  `bridge-task.sh create --body-file <path>`와 `agb a2a send --body-file <path>`
+  는 `PermissionError` 시 `sudo -n -u <owner> cat <path>`로 자동
+  fallback한다(Issue #1280). fallback도 실패하면 운영자가
+  `sudo chmod 0644 <path>` 후 재시도.
+- **iso 에이전트의 권장 흐름.** Agent 간 작업은 queue(`agb task create`)를,
+  cross-bridge handoff는 `agb a2a`를 사용한다. iso UID 내부에서
+  다른 agent의 branch에 `git checkout`하지 말 것, 다른 agent의 home의
+  파일을 편집하지 말 것, sudo를 가정하지 말 것(default로 sudoers entry 없음).
+- **알려진 제약 요약.**
+  - 컨트롤러 HOME state 파일 직접 read 불가(active-roster.md, HEARTBEAT.md).
+  - 다른 agent의 home / workdir에 직접 write 불가.
+  - 운영자의 primary checkout에서 `git checkout <other-branch>` 금지.
+  - iso UID에서 sudo 호출 금지(운영자가 명시적으로 sudoers grant한 경우 제외).
+
+설계 의도에 대한 자세한 내용은 [CLAUDE.md](../CLAUDE.md) §"Working with isolated
+agents (iso v2)"와 [OPERATIONS.md](../OPERATIONS.md) §"Iso v2 agent
+troubleshooting"을 참조.
+
 ## 4. 저장소 구조를 이렇게 보면 된다
 
 ### 루트 엔트리포인트
