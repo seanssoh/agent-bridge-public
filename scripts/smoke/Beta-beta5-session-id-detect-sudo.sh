@@ -121,6 +121,23 @@ SCRIPT_DIR="$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck source=scripts/smoke/lib.sh
 source "$SCRIPT_DIR/lib.sh"
 
+# Resolved at runtime — works on ubuntu CI (apt bash 5.x at /usr/bin/bash),
+# macOS Homebrew (bash 5.3.9 at /opt/homebrew/bin/bash or /usr/local/bin/bash),
+# and any other host where the re-exec preamble above landed us in bash 4+.
+# The preamble guarantees this script is now running under bash 4+, so
+# `$BASH` is a path to a bash 4+ interpreter — that's the one we want for
+# every driver / `bash -c` subshell below. Fallback to `command -v bash`
+# in the (extremely unlikely) event that `$BASH` is unset, and finally to
+# the literal `bash` (PATH-resolved).
+if [[ -n "${BASH:-}" && -x "$BASH" ]]; then
+  SMOKE_BASH_BIN="$BASH"
+elif SMOKE_BASH_BIN_LOOKUP="$(command -v bash 2>/dev/null)" && [[ -n "$SMOKE_BASH_BIN_LOOKUP" ]]; then
+  SMOKE_BASH_BIN="$SMOKE_BASH_BIN_LOOKUP"
+else
+  SMOKE_BASH_BIN="bash"
+fi
+smoke_log "resolved SMOKE_BASH_BIN=$SMOKE_BASH_BIN (BASH_VERSION=${BASH_VERSION:-unknown})"
+
 cleanup() {
   smoke_cleanup_temp_root
 }
@@ -156,7 +173,7 @@ fi
 # 'Darwin' so we exercise the macOS path without depending on the host.
 T1_OUT="$(
   BRIDGE_HOST_PLATFORM_OVERRIDE=Darwin \
-  /opt/homebrew/bin/bash -c '
+  "$SMOKE_BASH_BIN" -c '
     set -uo pipefail
     source "'"$REPO_ROOT"'/bridge-lib.sh" >/dev/null 2>&1 || true
     # Smoke driver invokes the helper directly; the wrapped command
@@ -174,7 +191,7 @@ smoke_log "T1 PASS — bridge_linux_sudo_as_user defined + macOS dev-host fall-t
 smoke_log "T2: bridge_resolve_agent_iso_sudo_user returns empty for unregistered agent"
 
 T2_OUT="$(
-  /opt/homebrew/bin/bash -c '
+  "$SMOKE_BASH_BIN" -c '
     set -uo pipefail
     source "'"$REPO_ROOT"'/bridge-lib.sh" >/dev/null 2>&1 || true
     out="$(bridge_resolve_agent_iso_sudo_user "no-such-agent" 2>/dev/null)" || true
@@ -214,7 +231,7 @@ T3_DRIVER="$SMOKE_TMP_ROOT/t3-driver.sh"
 } >"$T3_DRIVER"
 chmod +x "$T3_DRIVER"
 
-T3_OUT="$(/opt/homebrew/bin/bash "$T3_DRIVER" 2>&1)"
+T3_OUT="$("$SMOKE_BASH_BIN" "$T3_DRIVER" 2>&1)"
 smoke_assert_contains "$T3_OUT" "OUT=[]" \
   "T3: resolver returns empty for registered non-iso agent (legacy behavior preserved)"
 smoke_log "T3 PASS — resolver scopes to genuinely iso-v2-effective agents only"
@@ -300,7 +317,7 @@ T6_DRIVER="$SMOKE_TMP_ROOT/t6-driver.sh"
 } >"$T6_DRIVER"
 chmod +x "$T6_DRIVER"
 
-T6_OUT="$(/opt/homebrew/bin/bash "$T6_DRIVER" 2>&1)"
+T6_OUT="$("$SMOKE_BASH_BIN" "$T6_DRIVER" 2>&1)"
 smoke_assert_contains "$T6_OUT" "DETECTED=[$T6_SESSION_ID]" \
   "T6: empty os_user → direct python invocation finds the session_id"
 smoke_log "T6 PASS — non-iso back-compat preserved"
@@ -325,7 +342,7 @@ T7_ARGV_LOG="$SMOKE_TMP_ROOT/t7-argv.log"
 } >"$T7_DRIVER"
 chmod +x "$T7_DRIVER"
 
-T7_OUT="$(/opt/homebrew/bin/bash "$T7_DRIVER" 2>&1)"
+T7_OUT="$("$SMOKE_BASH_BIN" "$T7_DRIVER" 2>&1)"
 smoke_assert_contains "$T7_OUT" "OUT=[WRAP_FIRED=1]" \
   "T7: the sudo wrap fires (stub captured the invocation) when os_user is set"
 if [[ ! -f "$T7_ARGV_LOG" ]]; then
