@@ -4775,6 +4775,30 @@ bridge_clear_plugin_liveness_state() {
   rm -f "$(bridge_plugin_liveness_state_file "$agent")"
 }
 
+# Issue #1307 (v0.15.0-beta5-1 Lane 3) — defense-in-depth: when an agent
+# has MCP-liveness giveup armed, the silent-clear paths in
+# bridge_report_plugin_liveness_miss must NOT delete the state file,
+# because that would wipe GIVEUP/GIVEUP_TS before
+# process_mcp_liveness_giveup_recovery can emit
+# `plugin_mcp_liveness_recovered`. The primary close is the daemon
+# main-loop re-ordering (recovery runs before plugin_liveness); this
+# helper is the belt-and-suspenders guard so a future re-ordering or a
+# new silent-clear call site can't silently re-open the bypass.
+#
+# When giveup is active, the giveup ledger has already short-circuited
+# bridge_report_plugin_liveness_miss above the silent-clear branches in
+# practice (channel-status / session / missing-CSV transitions usually
+# happen alongside the same agent normalisation that triggered
+# recovery). The guard exists to make that contract explicit at the
+# clear call sites rather than implicit in tick ordering.
+bridge_clear_plugin_liveness_state_if_no_giveup() {
+  local agent="$1"
+  if bridge_agent_mcp_giveup_active "$agent"; then
+    return 0
+  fi
+  bridge_clear_plugin_liveness_state "$agent"
+}
+
 bridge_note_plugin_liveness_state() {
   local agent="$1"
   local last_key="$2"
@@ -4968,29 +4992,35 @@ bridge_report_plugin_liveness_miss() {
   [[ "$(bridge_agent_source "$agent")" == "static" ]] || return 0
   [[ "$(bridge_agent_engine "$agent")" == "claude" ]] || return 0
   [[ "$(bridge_agent_channel_status "$agent")" == "ok" ]] || {
-    bridge_clear_plugin_liveness_state "$agent"
+    bridge_clear_plugin_liveness_state_if_no_giveup "$agent"
     return 0
   }
 
   session="$(bridge_agent_session "$agent")"
   [[ -n "$session" ]] || {
-    bridge_clear_plugin_liveness_state "$agent"
+    bridge_clear_plugin_liveness_state_if_no_giveup "$agent"
     return 0
   }
   bridge_tmux_session_exists "$session" || {
-    bridge_clear_plugin_liveness_state "$agent"
+    bridge_clear_plugin_liveness_state_if_no_giveup "$agent"
     return 0
   }
 
   required="$(bridge_agent_effective_launch_plugin_channels_csv "$agent")"
   [[ -n "$required" ]] || {
-    bridge_clear_plugin_liveness_state "$agent"
+    bridge_clear_plugin_liveness_state_if_no_giveup "$agent"
     return 0
   }
 
   missing="$(bridge_agent_missing_plugin_mcp_channels_csv "$agent" || true)"
   if [[ -z "$missing" ]]; then
-    bridge_clear_plugin_liveness_state "$agent"
+    # Issue #1307 (v0.15.0-beta5-1 Lane 3) — the critical bypass site
+    # codex r1 caught. If giveup is active, do NOT silently delete the
+    # ledger; the daemon-loop's earlier process_mcp_liveness_giveup_recovery
+    # tick already had its chance to emit `plugin_mcp_liveness_recovered`,
+    # and on the next tick the recovery will run again and clear the
+    # ledger via the audit path.
+    bridge_clear_plugin_liveness_state_if_no_giveup "$agent"
     return 0
   fi
 
@@ -7702,20 +7732,32 @@ cmd_sync_cycle() {
   flush_pending_attention_spools || true
   BRIDGE_DAEMON_LAST_STEP="channel_health"
   process_channel_health || true
-  BRIDGE_DAEMON_LAST_STEP="plugin_liveness"
-  process_plugin_liveness || true
-
   # Issue #1307 (v0.15.0-beta5-1 Lane 3) — auto-clear MCP-liveness giveup
-  # on agent recovery. Runs AFTER process_plugin_liveness so a fresh
-  # giveup just emitted in this same tick still has its GIVEUP_TS arm
-  # noted, and the recovery tick on the NEXT loop iteration evaluates
-  # the fallback timer against an accurate anchor. The recovery tick
-  # also drives the activity_state observer (LAST_ACTIVITY_STATE in the
-  # plugin-liveness state file) for ALL agents regardless of giveup
-  # status, so the prev-state anchor is correct when a future giveup
-  # arms.
+  # on agent recovery. Runs BEFORE process_plugin_liveness because
+  # process_plugin_liveness's silent-clear path
+  # (bridge_clear_plugin_liveness_state — rm -f the state file) would
+  # otherwise wipe the GIVEUP/GIVEUP_TS ledger BEFORE this recovery tick
+  # gets to emit `plugin_mcp_liveness_recovered`. Production-order codex
+  # repro on R1 of this PR (audit log empty after seeded giveup + healthy
+  # MCP). Defense-in-depth: bridge_report_plugin_liveness_miss also
+  # gates the silent clear on bridge_agent_mcp_giveup_active so a future
+  # re-ordering can't silently re-open the bypass.
+  #
+  # The recovery tick drives the activity_state observer
+  # (LAST_ACTIVITY_STATE in the plugin-liveness state file) for ALL
+  # agents regardless of giveup status, so the prev-state anchor is
+  # correct when a future giveup arms.
+  #
+  # First-arm same-tick case: if process_plugin_liveness arms giveup
+  # this tick, recovery has already returned for the agent (giveup not
+  # active yet), so the fresh GIVEUP_TS is left intact and the NEXT
+  # tick's recovery evaluates the fallback timer against an accurate
+  # anchor.
   BRIDGE_DAEMON_LAST_STEP="mcp_liveness_giveup_recovery"
   process_mcp_liveness_giveup_recovery || true
+
+  BRIDGE_DAEMON_LAST_STEP="plugin_liveness"
+  process_plugin_liveness || true
 
   BRIDGE_DAEMON_LAST_STEP="nudge_scan"
   snapshot_file="$(mktemp)"

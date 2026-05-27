@@ -57,6 +57,24 @@
 #       recheck stub called, no audit row emitted) — only the
 #       activity_state observer updates LAST_ACTIVITY_STATE.
 #
+#   T_production_order. End-to-end ordering test (codex r1 BLOCKING
+#       repro). Seed giveup ledger + a non-idle prev LAST_ACTIVITY_STATE.
+#       Stub missing-MCP-CSV probe to "" (recovered) AND stub
+#       bridge_recheck_mcp_liveness to success. Run the FULL daemon
+#       tick steps in production order
+#       (`process_mcp_liveness_giveup_recovery`, then
+#       `process_plugin_liveness`). Assert
+#       `plugin_mcp_liveness_recovered` audit row was emitted BEFORE
+#       the silent-clear path in `bridge_report_plugin_liveness_miss`
+#       could wipe the ledger. This catches the r1 bypass class.
+#
+#   T_production_order_teeth (opt-in SMOKE_TEETH=1). Revert ordering
+#       proof: run `process_plugin_liveness` FIRST (the pre-r2 order).
+#       Assert the silent clear deletes GIVEUP/GIVEUP_TS BEFORE
+#       recovery can emit the audit row — proving the smoke catches
+#       the regression. Without the guard helper in r2, the silent
+#       clear deletes the ledger and the audit log is empty.
+#
 # Footgun #11 mitigation: zero heredoc-stdin into a subprocess —
 # helper bodies are extracted with awk + emitted via printf-to-file.
 
@@ -118,12 +136,15 @@ HELPERS_FUNCS="$SMOKE_TMP_ROOT/helpers.sh"
   awk '
     /^bridge_plugin_liveness_state_file\(\) \{/      { capture=1 }
     /^bridge_clear_plugin_liveness_state\(\) \{/      { capture=1 }
+    /^bridge_clear_plugin_liveness_state_if_no_giveup\(\) \{/ { capture=1 }
     /^bridge_note_plugin_liveness_state\(\) \{/       { capture=1 }
     /^bridge_agent_mcp_giveup_arm\(\) \{/             { capture=1 }
     /^bridge_agent_mcp_giveup_active\(\) \{/          { capture=1 }
     /^bridge_agent_mcp_giveup_ts\(\) \{/              { capture=1 }
     /^bridge_agent_mcp_giveup_clear\(\) \{/           { capture=1 }
     /^bridge_agent_mcp_note_activity_state\(\) \{/    { capture=1 }
+    /^bridge_report_plugin_liveness_miss\(\) \{/      { capture=1 }
+    /^process_plugin_liveness\(\) \{/                 { capture=1 }
     /^process_mcp_liveness_giveup_recovery\(\) \{/    { capture=1 }
     /^daemon_source_state_file\(\) \{/                { capture=1 }
     capture { print }
@@ -133,12 +154,15 @@ HELPERS_FUNCS="$SMOKE_TMP_ROOT/helpers.sh"
 
 for fn in bridge_plugin_liveness_state_file \
           bridge_clear_plugin_liveness_state \
+          bridge_clear_plugin_liveness_state_if_no_giveup \
           bridge_note_plugin_liveness_state \
           bridge_agent_mcp_giveup_arm \
           bridge_agent_mcp_giveup_active \
           bridge_agent_mcp_giveup_ts \
           bridge_agent_mcp_giveup_clear \
           bridge_agent_mcp_note_activity_state \
+          bridge_report_plugin_liveness_miss \
+          process_plugin_liveness \
           process_mcp_liveness_giveup_recovery \
           daemon_source_state_file; do
   if ! grep -q "^${fn}() {" "$HELPERS_FUNCS"; then
@@ -195,6 +219,80 @@ build_driver() {
       printf 'process_mcp_liveness_giveup_recovery() { :; }\n'
     fi
     printf 'process_mcp_liveness_giveup_recovery\n'
+  } >"$driver_path"
+}
+
+# build_driver_production_order <driver_path> <recheck-rc> <cur-activity-state> <reorder>
+#   Wraps the FULL production sequence: process_mcp_liveness_giveup_recovery
+#   then process_plugin_liveness (when reorder=1 — r2 fix order), or
+#   process_plugin_liveness then process_mcp_liveness_giveup_recovery
+#   (when reorder=0 — pre-r2 order, used for the teeth test).
+#
+#   recheck-rc: 0 = MCP probe recovered, 1 = still missing.
+#   cur-activity-state: idle | working | picker_block | ...
+#   reorder: 1 = recovery-first (r2 production order)
+#            0 = liveness-first (pre-r2 order — teeth)
+#
+# Stubs bridge_report_plugin_liveness_miss's dependencies so the
+# function reaches the "missing CSV empty" silent-clear branch (the
+# specific branch codex r1 used to wipe the giveup ledger).
+build_driver_production_order() {
+  local driver_path="$1"
+  local recheck_rc="$2"
+  local cur_state="$3"
+  local reorder="${4:-1}"
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -uo pipefail\n'
+    printf 'export BRIDGE_STATE_DIR="%s"\n' "$BRIDGE_STATE_DIR"
+    printf 'export BRIDGE_AUDIT_LOG="%s/audit.jsonl"\n' "$SMOKE_TMP_ROOT"
+    printf 'bridge_audit_log() {\n'
+    printf '  local actor="$1"; local action="$2"; local target="$3"; shift 3\n'
+    printf '  local details=""\n'
+    printf '  while (( $# > 0 )); do\n'
+    printf '    case "$1" in\n'
+    printf '      --detail) details="${details} $2"; shift 2;;\n'
+    printf '      *) shift;;\n'
+    printf '    esac\n'
+    printf '  done\n'
+    printf '  printf "actor=%%s action=%%s target=%%s%%s\\n" \\\n'
+    printf '    "$actor" "$action" "$target" "$details" \\\n'
+    printf '    >>"$BRIDGE_AUDIT_LOG"\n'
+    printf '}\n'
+    printf 'daemon_info() { :; }\n'
+    printf 'daemon_warn() { :; }\n'
+    printf 'bridge_require_python() { :; }\n'
+    # Stubs for bridge_report_plugin_liveness_miss prerequisites — all
+    # return the "agent is healthy, has a session, has required CSV"
+    # path so the function reaches the missing-CSV silent-clear branch.
+    printf 'bridge_agent_source() { printf "static"; }\n'
+    printf 'bridge_agent_engine() { printf "claude"; }\n'
+    printf 'bridge_agent_channel_status() { printf "ok"; }\n'
+    printf 'bridge_agent_session() { printf "test-session"; }\n'
+    printf 'bridge_tmux_session_exists() { return 0; }\n'
+    printf 'bridge_agent_effective_launch_plugin_channels_csv() { printf "plugin:teams@agent-bridge"; }\n'
+    # CRITICAL — empty missing CSV reaches the silent-clear branch.
+    printf 'bridge_agent_missing_plugin_mcp_channels_csv() { printf ""; }\n'
+    printf 'bridge_sha1() { printf "deadbeef"; }\n'
+    printf 'bridge_with_timeout() { shift; "$@"; }\n'
+    printf 'daemon_agent_restart_mcp() { return 0; }\n'
+    printf 'bridge_trim_whitespace() { printf "%%s" "$1"; }\n'
+    printf 'bridge_tmux_session_attached_count() { printf "0"; }\n'
+    # Recovery-tick probes.
+    printf 'bridge_agent_heartbeat_activity_state() { printf "%%s" "%s"; }\n' "$cur_state"
+    printf 'bridge_recheck_mcp_liveness() { return %s; }\n' "$recheck_rc"
+    printf 'declare -ga BRIDGE_AGENT_IDS=("%s")\n' "$AGENT"
+    printf 'source "%s"\n' "$HELPERS_FUNCS"
+    # Production order — recovery FIRST when reorder=1 (r2 fix),
+    # liveness FIRST when reorder=0 (pre-r2 teeth proof).
+    if [[ "$reorder" == "1" ]]; then
+      printf 'process_mcp_liveness_giveup_recovery\n'
+      printf 'process_plugin_liveness\n'
+    else
+      printf 'process_plugin_liveness\n'
+      printf 'process_mcp_liveness_giveup_recovery\n'
+    fi
   } >"$driver_path"
 }
 
@@ -349,6 +447,127 @@ audit_t5b="$(audit_grep "plugin_mcp_liveness_recheck_still_failed")"
 assert_state_field "LAST_ACTIVITY_STATE" "idle" \
   "T5: LAST_ACTIVITY_STATE written even when no giveup is active"
 smoke_log "T5 PASS — no-giveup baseline writes activity-state anchor only"
+
+# ---------------------------------------------------------------------------
+# T_production_order — codex r1 BLOCKING repro. End-to-end ordering test:
+# with giveup armed AND a recovered MCP probe, the FULL daemon tick
+# (recovery first → plugin_liveness second) must emit the
+# `plugin_mcp_liveness_recovered` audit row BEFORE the silent-clear path
+# in bridge_report_plugin_liveness_miss can wipe the ledger.
+# ---------------------------------------------------------------------------
+smoke_log "T_production_order: r2 order (recovery→liveness) emits audit before silent-clear can wipe ledger"
+seed_giveup 1700000000 "picker_block"
+reset_audit
+DRIVER_TP="$SMOKE_TMP_ROOT/tp-driver.sh"
+build_driver_production_order "$DRIVER_TP" 0 "idle" 1
+"$BRIDGE_BASH" "$DRIVER_TP" \
+  || smoke_fail "T_production_order: driver exited non-zero"
+
+audit_tp="$(audit_grep "plugin_mcp_liveness_recovered")"
+[[ -n "$audit_tp" ]] || smoke_fail "T_production_order: no plugin_mcp_liveness_recovered audit row — silent-clear bypass not closed"
+smoke_assert_contains "$audit_tp" "trigger=activity_idle" \
+  "T_production_order: recovered audit row carries trigger=activity_idle"
+smoke_assert_contains "$audit_tp" "prev_activity_state=picker_block" \
+  "T_production_order: recovered audit row records prev activity_state"
+# After the full tick, giveup is cleared (recovery's giveup_clear plus
+# liveness's silent clear both ran). State file may or may not exist
+# depending on which path ran last — what matters is GIVEUP is gone.
+assert_state_field_missing "GIVEUP" "T_production_order: GIVEUP cleared after full tick"
+assert_state_field_missing "GIVEUP_TS" "T_production_order: GIVEUP_TS cleared after full tick"
+smoke_log "T_production_order PASS — recovery emits audit before silent-clear"
+
+# ---------------------------------------------------------------------------
+# T_production_order_teeth — revert ordering proof. With the pre-r2
+# order (plugin_liveness first → recovery second), the silent-clear path
+# wipes GIVEUP/GIVEUP_TS BEFORE recovery can read them. Without the
+# bridge_clear_plugin_liveness_state_if_no_giveup guard, the ledger is
+# gone, recovery sees giveup_active=false, and the audit row is NEVER
+# emitted. Only runs when SMOKE_TEETH=1 so the main flow stays clean.
+# ---------------------------------------------------------------------------
+if [[ "${SMOKE_TEETH:-0}" == "1" ]]; then
+  # Two teeth tests:
+  #   (a) Guard intact + pre-r2 order. The guard alone preserves the
+  #       ledger so the recovery tick (running second) still sees
+  #       GIVEUP=1 and emits the audit row. Asserts the defense-in-
+  #       depth guard alone is sufficient.
+  #   (b) Guard reverted (silent clear bypasses the guard) + pre-r2
+  #       order. Both fixes are gone; the silent clear deletes the
+  #       ledger before recovery can run. Asserts the audit row is
+  #       MISSING — this is the codex r1 BLOCKING repro.
+  smoke_log "T_production_order_teeth (a): pre-r2 order + guard intact → audit still emitted"
+  seed_giveup 1700000000 "picker_block"
+  reset_audit
+  DRIVER_TP_TEETH_A="$SMOKE_TMP_ROOT/tp-teeth-a-driver.sh"
+  build_driver_production_order "$DRIVER_TP_TEETH_A" 0 "idle" 0
+  "$BRIDGE_BASH" "$DRIVER_TP_TEETH_A" \
+    || smoke_fail "T_production_order_teeth (a): driver exited non-zero"
+  audit_tp_teeth_a="$(audit_grep "plugin_mcp_liveness_recovered")"
+  [[ -n "$audit_tp_teeth_a" ]] || smoke_fail \
+    "T_production_order_teeth (a): with guard helper, pre-r2 order should STILL emit recovered audit row"
+  smoke_log "T_production_order_teeth (a) PASS — guard alone preserves ledger under reverted ordering"
+
+  smoke_log "T_production_order_teeth (b): pre-r2 order + guard REVERTED → audit MUST be missing (codex r1 BLOCKING repro)"
+  seed_giveup 1700000000 "picker_block"
+  reset_audit
+  DRIVER_TP_TEETH_B="$SMOKE_TMP_ROOT/tp-teeth-b-driver.sh"
+  # Build a fresh driver that runs in pre-r2 order WITH the guard helper
+  # overridden to the unguarded clear — both fixes simultaneously
+  # reverted. Use the build_driver_production_order primitive but
+  # append the guard override AFTER the function calls would have run
+  # — wait, that won't work because Bash function defs are early-bound.
+  # Solution: build the driver manually with the same stubs and the
+  # guard override BEFORE the function calls.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'set -uo pipefail\n'
+    printf 'export BRIDGE_STATE_DIR="%s"\n' "$BRIDGE_STATE_DIR"
+    printf 'export BRIDGE_AUDIT_LOG="%s/audit.jsonl"\n' "$SMOKE_TMP_ROOT"
+    printf 'bridge_audit_log() {\n'
+    printf '  local actor="$1"; local action="$2"; local target="$3"; shift 3\n'
+    printf '  local details=""\n'
+    printf '  while (( $# > 0 )); do\n'
+    printf '    case "$1" in\n'
+    printf '      --detail) details="${details} $2"; shift 2;;\n'
+    printf '      *) shift;;\n'
+    printf '    esac\n'
+    printf '  done\n'
+    printf '  printf "actor=%%s action=%%s target=%%s%%s\\n" \\\n'
+    printf '    "$actor" "$action" "$target" "$details" \\\n'
+    printf '    >>"$BRIDGE_AUDIT_LOG"\n'
+    printf '}\n'
+    printf 'daemon_info() { :; }\n'
+    printf 'daemon_warn() { :; }\n'
+    printf 'bridge_require_python() { :; }\n'
+    printf 'bridge_agent_source() { printf "static"; }\n'
+    printf 'bridge_agent_engine() { printf "claude"; }\n'
+    printf 'bridge_agent_channel_status() { printf "ok"; }\n'
+    printf 'bridge_agent_session() { printf "test-session"; }\n'
+    printf 'bridge_tmux_session_exists() { return 0; }\n'
+    printf 'bridge_agent_effective_launch_plugin_channels_csv() { printf "plugin:teams@agent-bridge"; }\n'
+    printf 'bridge_agent_missing_plugin_mcp_channels_csv() { printf ""; }\n'
+    printf 'bridge_sha1() { printf "deadbeef"; }\n'
+    printf 'bridge_with_timeout() { shift; "$@"; }\n'
+    printf 'daemon_agent_restart_mcp() { return 0; }\n'
+    printf 'bridge_trim_whitespace() { printf "%%s" "$1"; }\n'
+    printf 'bridge_tmux_session_attached_count() { printf "0"; }\n'
+    printf 'bridge_agent_heartbeat_activity_state() { printf "idle"; }\n'
+    printf 'bridge_recheck_mcp_liveness() { return 0; }\n'
+    printf 'declare -ga BRIDGE_AGENT_IDS=("%s")\n' "$AGENT"
+    printf 'source "%s"\n' "$HELPERS_FUNCS"
+    # Override the guard back to the unguarded clear — Bash late binds
+    # function names, so a later redefinition shadows the earlier one.
+    printf 'bridge_clear_plugin_liveness_state_if_no_giveup() { bridge_clear_plugin_liveness_state "$1"; }\n'
+    # Pre-r2 order — liveness first, recovery second.
+    printf 'process_plugin_liveness\n'
+    printf 'process_mcp_liveness_giveup_recovery\n'
+  } >"$DRIVER_TP_TEETH_B"
+  "$BRIDGE_BASH" "$DRIVER_TP_TEETH_B" \
+    || smoke_fail "T_production_order_teeth (b): driver exited non-zero"
+  audit_tp_teeth_b="$(audit_grep "plugin_mcp_liveness_recovered")"
+  [[ -z "$audit_tp_teeth_b" ]] || smoke_fail \
+    "T_production_order_teeth (b): audit row was emitted when BOTH fixes reverted; smoke does NOT catch the regression: $audit_tp_teeth_b"
+  smoke_log "T_production_order_teeth (b) PASS — audit MISSING when both fixes reverted (smoke would catch the regression)"
+fi
 
 # ---------------------------------------------------------------------------
 # T_teeth — revert proof (opt-in via SMOKE_TEETH=1).
